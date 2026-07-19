@@ -43,7 +43,18 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
         return;
     }
     auto& W = it->second;
-    // 1) GPU dispatch (cuBLAS for F32/F16/BF16, fused kernel for Q8_0).
+    // 1) GPU dispatch. Prefer the F32 fast-path buffer (upload_dequantized_f32)
+    //    when present — cuBLAS SGEMV instead of W's original quant type's fused
+    //    per-block kernel, which has no GEMV specialization and is
+    //    disproportionately slow at S=1 decode (attn_output's Q5_K case, see
+    //    CLAUDE.md). Falls through to the original device_ptr/meta.type path
+    //    (fused kernel for K-quants/IQ, cuBLAS for F32/F16/BF16/Q8_0) when no
+    //    fast-path buffer was built for this weight (not attempted, or didn't
+    //    fit in the VRAM budget at load time).
+    if (!cpu_only_mode() && engine.gpu && W.gpu_fast_ptr &&
+        engine.gpu->dense_matmul_host(GGUFType::F32, W.gpu_fast_ptr, x, y, S, I, O)) {
+        return;
+    }
     if (!cpu_only_mode() && engine.gpu && W.device_ptr &&
         engine.gpu->dense_matmul_host(W.meta.type, W.device_ptr, x, y, S, I, O)) {
         return;

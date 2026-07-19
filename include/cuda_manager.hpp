@@ -7,6 +7,7 @@
 #include "perf_timer.hpp"
 #include "gpu_topology.hpp"
 #include "cublas_matmul.hpp"
+#include "kquant_dequant.hpp"  // dequant_tensor_f32, for upload_dequantized_f32
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <iostream>
@@ -208,6 +209,55 @@ public:
         return true;
     }
 
+    // Dequantize a static per-layer dense weight to F32 ONCE (host-side, via
+    // the same ggml reference dequant_row used by the CPU fallback) and
+    // upload the result to its OWN standalone cudaMalloc buffer (deliberately
+    // NOT a dense_pool suballocation, so this can be called independent of
+    // pool sizing/lifetime) — qt.gpu_fast_ptr. dense_proj then dispatches
+    // through cuBLAS (fast SGEMV) instead of qt's original-quant-type fused
+    // kernel (Q2_K..Q6_K/IQ2*/IQ3_XXS), which has no GEMV specialization and
+    // is disproportionately slow at S=1 decode — see attn_output's ~623ms/
+    // token cost in CLAUDE.md, the motivating case. host_ptr/device_ptr/
+    // meta.type are untouched, so the CPU fallback stays correct regardless.
+    //
+    // Best-effort: returns false (leaving gpu_fast_ptr null, caller keeps
+    // using the existing slower path) if the F32 expansion doesn't fit in
+    // max_bytes, the shape is malformed, or the quant type has no CPU
+    // reference dequant. F32 is ~5-6x the size of a K-quant/IQ original (e.g.
+    // Q5_K), so this is capacity-checked per call rather than assumed to fit
+    // — callers should pass real remaining VRAM headroom, not the tensor's
+    // own original size.
+    bool upload_dequantized_f32(QuantizedTensor& qt, size_t max_bytes) {
+        if (qt.gpu_fast_ptr) return true;  // already converted
+        if (!qt.host_ptr || qt.meta.shape.size() < 2) return false;
+        int O = (int)qt.meta.shape[0];
+        int I = (int)qt.meta.shape[1];
+        if (O <= 0 || I <= 0) return false;
+        size_t n = (size_t)O * (size_t)I;
+        size_t f32_bytes = n * sizeof(float);
+        if (f32_bytes > max_bytes) return false;
+
+        std::vector<float> host_f32(n);
+        if (!dequant_tensor_f32(qt.meta.type, qt.host_ptr, O, I, host_f32.data())) {
+            LOG_WARN("[CUDA] Fast-path F32 dequant unsupported for type=%u — "
+                     "keeping original quantized GPU path\n", (unsigned)qt.meta.type);
+            return false;
+        }
+
+        cudaSetDevice(device_id);
+        cudaError_t err = cudaMalloc((void**)&qt.gpu_fast_ptr, f32_bytes);
+        if (err != cudaSuccess) {
+            LOG_ERROR("[CUDA] Fast-path F32 upload failed (%.2f MB): %s — "
+                      "keeping original quantized GPU path\n",
+                      f32_bytes / 1e6, cudaGetErrorString(err));
+            qt.gpu_fast_ptr = nullptr;
+            return false;
+        }
+        cudaMemcpy(qt.gpu_fast_ptr, host_f32.data(), f32_bytes, cudaMemcpyHostToDevice);
+        perf().bytes_gpu_uploaded.fetch_add(f32_bytes, std::memory_order_relaxed);
+        return true;
+    }
+
     // Allocate expert VRAM cache on vault GPU(s) based on model geometry
     void setup_expert_cache(size_t expert_slab_bytes, int n_experts) {
         topology.allocate_expert_cache(expert_slab_bytes, n_experts);
@@ -298,8 +348,19 @@ public:
         size_t y_bytes = (size_t)S * O * sizeof(float);
         ensure_buffers(x_bytes, y_bytes);
         cudaSetDevice(device_id);
-        cudaMemcpy(d_x, x_host, x_bytes, cudaMemcpyHostToDevice);
 
+        // Phase split -- added after attn_output's dense_proj call (which
+        // routes through here) was found costing ~623ms/token, ~5x its
+        // qproj sibling calls, with zero CPU fallback logged (so it IS
+        // successfully GPU-dispatching every time) -- this pins down
+        // whether the cost is the H2D copy, the kernel itself, or the D2H
+        // copy, same method that found the real expert-FFN GPU issue
+        // earlier this session.
+        PERF_START(dense_up);
+        cudaMemcpy(d_x, x_host, x_bytes, cudaMemcpyHostToDevice);
+        PERF_END(dense_up, t_dense_gpu_up);
+
+        PERF_START(dense_cmp);
         bool ok = false;
         switch (wtype) {
             case GGUFType::F32:
@@ -354,8 +415,21 @@ public:
                 ok = false;
                 break;
         }
+        // Kernel launches (and dense_matmul's cuBLAS call) are async -- an
+        // explicit sync here is required for the timing window to capture
+        // real device execution time, not just launch overhead. The
+        // downstream D2H cudaMemcpy below would implicitly wait for this
+        // anyway (default-stream blocking semantics), but that would fold
+        // compute time into t_dense_gpu_down instead of attributing it
+        // correctly.
+        cudaStreamSynchronize(0);
+        PERF_END(dense_cmp, t_dense_gpu_compute);
         if (!ok) return false;
+
+        PERF_START(dense_dn);
         cudaMemcpy(y_host, d_y, y_bytes, cudaMemcpyDeviceToHost);
+        PERF_END(dense_dn, t_dense_gpu_down);
+        perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 

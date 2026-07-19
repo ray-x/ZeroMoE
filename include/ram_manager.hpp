@@ -2,6 +2,7 @@
 #include "engine.hpp"
 #include "perf_timer.hpp"
 #include "gpu_topology.hpp"
+#include "async_prefetcher.hpp"  // LockFreePrefetcher (consume_staged in the miss path)
 #include "logger.hpp"
 #include "kquant_dequant.hpp"  // gpu_type_supported
 #include <iostream>
@@ -22,6 +23,15 @@ public:
     int slots_per_layer = 0;
     uint64_t global_clock = 0;
     GpuTopology* vram_cache = nullptr;  // GPU expert VRAM cache (optional, set by CudaManager)
+    // Topology-enabled prefetcher whose staging pool the cache-MISS path
+    // consumes (Phase A "PIPE" overlap). Set by main.cpp alongside vram_cache.
+    // nullptr = miss path always falls back to synchronous load_expert_slab.
+    LockFreePrefetcher* prefetcher = nullptr;
+
+    // Pin a VRAM-resident expert's slot once its re-hit count crosses this
+    // threshold, so a burst of one-off cold experts can't evict it (Phase A
+    // "stop evicting hot experts within a conversation"). 0 disables pinning.
+    uint32_t pin_threshold = 8;
 
     // Explicit host RAM (DDR) budget for the MoE expert cache, in GB.
     // Set from EngineConfig::host_ram_gb (TOML `host_ram_gb` or --ram CLI flag).
@@ -184,12 +194,24 @@ public:
                 bool gpu_capable = gpu_type_supported(slot.gate_proj.meta.type)
                                  && gpu_type_supported(slot.up_proj.meta.type)
                                  && gpu_type_supported(slot.down_proj.meta.type);
-                if (vram_cache && slot.slab_buffer && gpu_capable
-                    && slot.hit_count >= promote_hit_threshold
-                    && !vram_cache->find_expert(layer, expert_id)) {
-                    LOG_DEBUG("[MOE-VRAM]  PROMOTE layer=%d expert=%d hit_count=%u -> async H2D upload (%.2f MB)\n",
-                              layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
-                    vram_cache->upload_expert_async(layer, expert_id, slot.slab_buffer, slot.slab_capacity);
+                if (vram_cache && slot.slab_buffer && gpu_capable && slot.hit_count >= promote_hit_threshold) {
+                    // find_expert has side effects (bumps the VRAM slot's own
+                    // hit_count/last_used_clock), so call it once and branch
+                    // on the result rather than calling it again below.
+                    ExpertLocation* resident = vram_cache->find_expert(layer, expert_id);
+                    if (!resident) {
+                        LOG_DEBUG("[MOE-VRAM]  PROMOTE layer=%d expert=%d hit_count=%u -> async H2D upload (%.2f MB)\n",
+                                  layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
+                        vram_cache->upload_expert_async(layer, expert_id, slot.slab_buffer, slot.slab_capacity);
+                    } else if (pin_threshold > 0 && slot.hit_count >= pin_threshold) {
+                        // Already VRAM-resident AND proven hot enough within
+                        // THIS conversation (no cross-prompt profile needed)
+                        // -- pin it so evict_lru never reactively kicks it
+                        // out for a one-hit-wonder later in the same
+                        // generation. Phase A colibri-port: "stop evicting
+                        // hot experts within a conversation".
+                        vram_cache->pin_expert(layer, expert_id);
+                    }
                 }
                 return &slot;
             }
@@ -224,15 +246,43 @@ public:
             }
         }
 
+        // Phase A "PIPE" overlap: try to serve this miss from the
+        // prefetcher's staging pool (already pread by the worker thread
+        // while a previous layer computed) before falling back to a
+        // synchronous pread on THIS (the decode) thread. The prefetcher
+        // only ever produces the packed-format layout, so this path is
+        // skipped for legacy per-expert-tensor models (packed_slab_geometry
+        // returns false) or if `prefetcher` isn't wired (nullptr).
         PERF_START(expert_disk_load);
-        engine.load_expert_slab(layer, expert_id, victim);
+        bool served_from_pipe = false;
+        if (prefetcher) {
+            size_t gb, ub, db;
+            const GGUFTensor *gM, *uM, *dM;
+            if (engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
+                size_t total = gb + ub + db;
+                engine.ensure_slab_capacity(victim, total);
+                PERF_START(consume);
+                size_t got_bytes = 0;
+                bool ok = prefetcher->consume_staged(layer, expert_id, victim.slab_buffer, victim.slab_capacity, &got_bytes);
+                PERF_END(consume, t_consume_staged);
+                if (ok && got_bytes == total) {
+                    engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
+                    served_from_pipe = true;
+                    perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!served_from_pipe) {
+            engine.load_expert_slab(layer, expert_id, victim);
+        }
         double load_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - _perf_expert_disk_load).count();
         victim.last_used_clock = ++global_clock;
         victim.hit_count = 0;  // fresh identity in this slot, reset frequency signal
 
-        LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%d evicted=%d loaded_from_disk=%.2fms (%.2f MB, %.2f GB/s)\n",
+        LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%d evicted=%d loaded_from_disk=%.2fms via=%s (%.2f MB, %.2f GB/s)\n",
                   layer, expert_id, lru_idx, evicted_expert_id, load_ms,
+                  served_from_pipe ? "PIPE" : "pread",
                   victim.slab_capacity / 1e6,
                   load_ms > 0 ? (victim.slab_capacity / 1e9) / (load_ms / 1000.0) : 0.0);
 

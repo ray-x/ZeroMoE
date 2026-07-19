@@ -564,6 +564,13 @@ void moe_forward_gguf(
             scratch.tok_topk_weights[s * topk + k] = w;
             scratch.tok_topk_ids[s * topk + k] = id;
             scratch.expert_freq[id]++;
+            // Phase A colibri-port: accumulate the cross-conversation
+            // routing-frequency histogram (engine.route_freq), dumped to a
+            // usage file at shutdown and read back at the NEXT process
+            // startup to preload the measured hot set into VRAM. This is
+            // the true demand signal (what the router actually picked),
+            // not a cache-hit proxy -- matches colibri's STATS signal.
+            engine.bump_route_freq(layer_idx, id);
             sum_w += w;
         }
         if (c.expert_weights_norm) {

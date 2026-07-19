@@ -38,6 +38,8 @@ void print_usage() {
               << "  --drop-pages     Drop expert pages from page cache after use\n"
               << "  --verbose-moe    Log every MoE host-cache hit (high volume, debug only)\n"
               << "  --promote-threshold <N>  Number of host re-hits before async H2D promote (default: 1)\n"
+              << "  --pin-threshold <N>  VRAM-resident hit_count before pinning (never evicted; default: 8, 0=off)\n"
+              << "  --pin-file <file>  Usage-frequency file for VRAM hot-set preload (default: .moestream_usage)\n"
               << "  --log-path <file>  Redirect logging to a file instead of stderr\n"
               << "  --log-level <lvl>  VERBOSE | DEBUG | INFO (default) | WARN | ERROR\n"
               << "  --help           Show this help interface\n";
@@ -57,6 +59,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     engine.drop_expert_pages = config.drop_pages;
     ram_mgr.configured_ram_gb = config.host_ram_gb;
     ram_mgr.promote_hit_threshold = (uint32_t)config.promote_hit_threshold;
+    ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
     ram_mgr.verbose_cache_log = config.verbose_moe_log;
     if (config.dense_gpu_idx >= 0)
         gpu.device_id = config.gpus[config.dense_gpu_idx].device_id;
@@ -102,6 +105,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     if (!GGUFGraphInitializer::build_model_graph(engine, max_ctx)) {
         return std::unexpected("Failure triggered during topological model graph initialization pass");
     }
+    // Phase A colibri-port: n_layers/n_experts are known now -- size the
+    // routing-frequency histogram so moe_forward_gguf's bump_route_freq
+    // calls (once generation starts) have somewhere to accumulate into.
+    engine.init_route_freq();
 
     // --- Multi-GPU memory planning (from optimize.md) ---
     auto& cfg = engine.model_file.architecture_config;
@@ -127,6 +134,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
     // Connect VRAM expert cache to the RAM manager for LRU integration
     ram_mgr.vram_cache = &gpu.topology;
+    // Phase A colibri-port: the SAME topology-enabled prefetcher (started
+    // below with &gpu.topology) is what get_expert's consume_staged
+    // miss-path draws from -- previously generate_text created its OWN
+    // separate, topology-less LockFreePrefetcher per request, so the real
+    // prefetcher here (which does receive pilot hints via layers_forward_gguf)
+    // was wired to nothing that ever consumed its staged reads.
+    ram_mgr.prefetcher = &prefetcher;
 
     // Offload dense tensors to core GPU VRAM — via a single pool allocation
     // (see CudaManager::init_dense_pool/offload_tensor_to_pool) rather than
@@ -163,15 +177,73 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                name == "output_norm.weight";
     };
 
-    // Pass 1: collect candidates and total the pool size needed (256-byte
-    // aligned per tensor, matching offload_tensor_to_pool's own alignment —
-    // must agree or the pool could report "fits" here but reject tensors
-    // during the actual suballocation pass below).
+    // attn_output fast-path: this weight is a STATIC per-layer matrix (same
+    // every token, like attn_k_b/attn_v_b) that's large enough (~69 MB in
+    // Q5_K for this project's GLM-5.2 target) to hit dense_matmul_host's
+    // fused per-block dequant+matmul kernel, which has no GEMV specialization
+    // and is disproportionately slow at S=1 decode — measured ~623ms/token
+    // for this one weight alone, ~5x its similarly-staged qproj calls (see
+    // CLAUDE.md). Fix: dequantize once to F32 and use cuBLAS instead, same
+    // pattern as the attn_k_b/attn_v_b host-side cache. Unlike those (small,
+    // low-rank MLA-only matrices), attn_output is full [n_heads*v_head,
+    // hidden] — F32 is ~5-6x the Q5_K size, so applying this unconditionally
+    // to every layer could be ~15-30 GB across a real model's full depth,
+    // easily enough to blow the (usually smaller) CoreEngine GPU's budget.
+    // So: convert greedily, budget-checked against whatever's ACTUALLY left
+    // after reserving space for every OTHER dense tensor (which already
+    // works today at its original quant size and must not regress) — layers
+    // that don't fit just keep using the existing (slower but correct) fused
+    // Q5_K/K-quant/IQ kernel path, exactly like today.
+    auto is_attn_output = [](const std::string& name) {
+        return name.find("attn_output.weight") != std::string::npos;
+    };
     constexpr size_t POOL_ALIGN = 256;
+    std::vector<QuantizedTensor*> attn_output_candidates;
+    size_t non_attn_output_pool_bytes = 0;
+    for (auto& [name, tensor] : engine.resident_layers) {
+        if (!tensor.host_ptr || !is_dense_offload_candidate(name)) continue;
+        if (is_attn_output(name)) {
+            attn_output_candidates.push_back(&tensor);
+            continue;
+        }
+        non_attn_output_pool_bytes = (non_attn_output_pool_bytes + POOL_ALIGN - 1) & ~(POOL_ALIGN - 1);
+        non_attn_output_pool_bytes += tensor.meta.size_bytes;
+    }
+
+    constexpr size_t FAST_PATH_SAFETY_MARGIN = (size_t)1 << 30;  // 1 GB, matches the dense-pool backoff's own margin style
+    size_t free_before_fast_path = gpu.core_free_vram_bytes();
+    size_t fast_path_budget =
+        (free_before_fast_path > non_attn_output_pool_bytes + FAST_PATH_SAFETY_MARGIN)
+        ? (free_before_fast_path - non_attn_output_pool_bytes - FAST_PATH_SAFETY_MARGIN)
+        : 0;
+
+    int fast_converted = 0, fast_skipped = 0;
+    size_t fast_bytes_used = 0;
+    for (QuantizedTensor* qt : attn_output_candidates) {
+        size_t remaining = (fast_path_budget > fast_bytes_used) ? (fast_path_budget - fast_bytes_used) : 0;
+        if (gpu.upload_dequantized_f32(*qt, remaining)) {
+            ++fast_converted;
+            fast_bytes_used += (size_t)qt->meta.shape[0] * (size_t)qt->meta.shape[1] * sizeof(float);
+        } else {
+            ++fast_skipped;
+        }
+    }
+    LOG_STREAM_INFO() << "[CUDA] attn_output fast-path (F32 dequant + cuBLAS): "
+              << fast_converted << " layer(s) converted (" << fast_bytes_used / 1e9
+              << " GB), " << fast_skipped << " layer(s) kept on the slower fused kernel"
+              << " (budget was " << fast_path_budget / 1e9 << " GB).\n";
+
+    // Pass 1: collect the REMAINING candidates (fast-path attn_output layers
+    // excluded — they don't need a quantized VRAM copy anymore) and total the
+    // pool size needed (256-byte aligned per tensor, matching
+    // offload_tensor_to_pool's own alignment — must agree or the pool could
+    // report "fits" here but reject tensors during the actual suballocation
+    // pass below).
     std::vector<QuantizedTensor*> dense_candidates;
     size_t pool_bytes_needed = 0;
     for (auto& [name, tensor] : engine.resident_layers) {
         if (!tensor.host_ptr || !is_dense_offload_candidate(name)) continue;
+        if (tensor.gpu_fast_ptr) continue;  // already fast-path converted above
         dense_candidates.push_back(&tensor);
         pool_bytes_needed = (pool_bytes_needed + POOL_ALIGN - 1) & ~(POOL_ALIGN - 1);
         pool_bytes_needed += tensor.meta.size_bytes;
@@ -233,6 +305,61 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     LOG_STREAM_INFO() << "[I/O] Spinning up asynchronous lock-free SPSC prefetch threads...\n";
     prefetcher.start(&engine, &gpu.topology);
 
+    // Phase A colibri-port: cross-conversation VRAM residency. Read the
+    // usage file written by a PREVIOUS run's dump_usage() at shutdown, and
+    // preload the top pin_topk_per_layer hottest experts per layer into
+    // VRAM, pinned so evict_lru never reactively kicks them out. First-ever
+    // run (no usage file yet) is a silent no-op -- VRAM fills reactively
+    // via the existing cold-start warm-up + promote-on-hit path exactly as
+    // before this feature existed. This is a one-time startup cost (real
+    // disk reads for however many experts get preloaded), not a per-token
+    // one, matching colibri's "profile once, hold it" design.
+    if (!config.pin_file.empty() && ram_mgr.vram_cache && ram_mgr.vram_cache->expert_vram_cache_cap > 0) {
+        auto [entries, maxc] = StreamingEngine::load_usage(config.pin_file);
+        if (entries.empty()) {
+            LOG_STREAM_INFO() << "[PIN] No usage file at " << config.pin_file
+                      << " yet (first run) -- VRAM cache will fill reactively.\n";
+        } else {
+            std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> by_layer;
+            for (auto& e : entries) by_layer[e.layer].push_back(e);
+            for (auto& [layer, v] : by_layer) {
+                std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+            }
+
+            int topk = config.pin_topk_per_layer;
+            if (topk <= 0) {
+                // Auto-size from the REAL slot count (expert_vram_cache_cap)
+                // -- moe_cache_gb in the TOML is advisory only,
+                // allocate_expert_cache always uses (total_vram - 1GB) per
+                // vault GPU regardless of that budget, so sizing off the
+                // config value here could over- or under-preload relative to
+                // what actually fits.
+                int moe_layers = std::max(1, (int)by_layer.size());
+                topk = std::max(1, (int)(ram_mgr.vram_cache->expert_vram_cache_cap / (size_t)moe_layers));
+            }
+
+            LOG_STREAM_INFO() << "[PIN] Preloading top-" << topk << "/layer hot set from "
+                      << config.pin_file << " (" << entries.size() << " known experts, max count "
+                      << maxc << ")...\n";
+            int preloaded = 0, attempted = 0;
+            for (auto& [layer, v] : by_layer) {
+                for (int i = 0; i < (int)v.size() && i < topk; ++i) {
+                    ++attempted;
+                    MoEExpertBlock scratch{};
+                    engine.load_expert_slab(v[i].layer, v[i].expert, scratch);
+                    if (scratch.slab_buffer && scratch.slab_capacity > 0) {
+                        ExpertLocation* loc = gpu.topology.upload_expert(
+                            v[i].layer, v[i].expert, scratch.slab_buffer, scratch.slab_capacity);
+                        if (loc && gpu.topology.pin_expert(v[i].layer, v[i].expert)) ++preloaded;
+                    }
+                    if (scratch.slab_buffer) free(scratch.slab_buffer);
+                }
+            }
+            LOG_STREAM_INFO() << "[PIN] Preloaded " << preloaded << "/" << attempted
+                      << " hot experts into VRAM (pinned).\n";
+        }
+    }
+
     std::cout << "----------------------------------------\n";
     std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
     std::cout << "Use ':q' to exit execution loop cleanly.\n\n";
@@ -284,13 +411,18 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         }
 
         std::cout << "\n  MoEStream * ";
-        generate_text(engine, ram_mgr, tokenizer, prompt_tokens, max_new_tokens, tokenizer.eos_token_id,
+        generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens, max_new_tokens, tokenizer.eos_token_id,
                       config.temperature, config.top_p);
 
         std::cout << "\n";
     }
 
     prefetcher.stop();
+    // Phase A colibri-port: write this run's routing-frequency histogram so
+    // the NEXT run's startup preload (above) has real data to work from.
+    // Best-effort, matches dump_usage's own contract (a failed write just
+    // logs and continues -- not worth failing shutdown over).
+    engine.dump_usage(config.pin_file);
     perf().dump_report();
     return {};
 }
@@ -303,6 +435,8 @@ int main(int argc, char* argv[]) {
     std::string gen_config_path = "";
     double ram_budget_gb = 0.0;
     int promote_threshold_cli = -1;
+    int pin_threshold_cli = -1;
+    std::string pin_file_cli;
     int max_ctx = 4096;
     int max_new_tokens = 1024;
     int gpu_id = 0;
@@ -326,6 +460,8 @@ int main(int argc, char* argv[]) {
         else if (arg == "--drop-pages") drop_pages = true;
         else if (arg == "--verbose-moe") verbose_moe = true;
         else if (arg == "--promote-threshold" && i + 1 < argc) promote_threshold_cli = std::stoi(argv[++i]);
+        else if (arg == "--pin-threshold" && i + 1 < argc) pin_threshold_cli = std::stoi(argv[++i]);
+        else if (arg == "--pin-file" && i + 1 < argc) pin_file_cli = argv[++i];
         else if (arg == "--log-path" && i + 1 < argc) log_path_cli = argv[++i];
         else if (arg == "--log-level" && i + 1 < argc) log_level_cli = argv[++i];
         else if (arg == "--temp" && i + 1 < argc) temp_cli = std::stof(argv[++i]);
@@ -371,6 +507,8 @@ int main(int argc, char* argv[]) {
     if (ram_budget_gb > 0) config.host_ram_gb = ram_budget_gb;
     if (verbose_moe) config.verbose_moe_log = true;
     if (promote_threshold_cli > 0) config.promote_hit_threshold = promote_threshold_cli;
+    if (pin_threshold_cli >= 0) config.pin_threshold = pin_threshold_cli;
+    if (!pin_file_cli.empty()) config.pin_file = pin_file_cli;
     if (!log_path_cli.empty()) config.log_path = log_path_cli;
     if (!log_level_cli.empty()) config.log_level = log_level_cli;
     if (temp_cli >= 0.0f) config.temperature = temp_cli;

@@ -53,6 +53,22 @@ struct EngineConfig {
     // higher values reduce unnecessary PCIe traffic.
     int promote_hit_threshold = 1;
 
+    // Phase A colibri-port: pin a VRAM-resident expert (never evict it via
+    // evict_lru) once its host-cache hit_count crosses this threshold --
+    // "stop evicting hot experts within a conversation", no cross-prompt
+    // profile needed. 0 disables pinning entirely (pure reactive LRU).
+    int pin_threshold = 8;
+
+    // Cross-conversation VRAM residency: at startup, read this usage file
+    // (written by StreamingEngine::dump_usage at the end of a previous run)
+    // and preload the top pin_topk_per_layer hottest experts per layer into
+    // VRAM, pinned. Empty path disables preload (a usage file is still
+    // written at shutdown for a future run). pin_topk_per_layer=0 auto-sizes
+    // to fill available VRAM expert-cache capacity instead of a fixed
+    // per-layer count.
+    std::string pin_file = ".moestream_usage";
+    int pin_topk_per_layer = 0;
+
     // Logging. Empty log_path (default) keeps everything on stderr, matching
     // prior behavior. log_level filters by severity: VERBOSE shows
     // high-volume structural traces (e.g. per-layer hidden-state norms
@@ -236,6 +252,9 @@ inline bool EngineConfig::load(const std::string& path) {
     host_ram_gb      = doc.root.get_double("host_ram_gb", host_ram_gb);
     verbose_moe_log  = doc.root.get_bool("verbose_moe_log", verbose_moe_log);
     promote_hit_threshold = doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
+    pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
+    pin_file         = doc.root.get_str("pin_file", pin_file);
+    pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
     log_path         = doc.root.get_str("log_path", log_path);
     log_level        = doc.root.get_str("log_level", log_level);
 
@@ -345,6 +364,11 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Host RAM (DDR) budget: "
               << (host_ram_gb > 0 ? std::to_string(host_ram_gb) + " GB (explicit)" : "auto-detect") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Promote H2D threshold: " << promote_hit_threshold << " hits\n";
+    LOG_STREAM_INFO() << "[CONFIG] Pin threshold: " << pin_threshold
+              << (pin_threshold > 0 ? " hits" : " (pinning disabled)") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Pin file: " << (pin_file.empty() ? "(preload disabled)" : pin_file)
+              << " | top-" << (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto"))
+              << "/layer\n";
     LOG_STREAM_INFO() << "[CONFIG] Verbose MoE cache logging: " << (verbose_moe_log ? "on" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level
                << " | Log path: " << (log_path.empty() ? "(stderr)" : log_path) << "\n";
@@ -381,6 +405,19 @@ drop_pages     = false    # true = evict expert pages from OS cache after use
 host_ram_gb    = 0
 verbose_moe_log = false
 promote_hit_threshold = 1
+
+# Phase A colibri-port: VRAM expert residency, not reactive-only eviction.
+# pin_threshold: once a VRAM-resident expert's host-cache hit_count crosses
+# this, it's pinned (never evicted) for the rest of the process -- stops
+# thrashing hot experts out within one conversation. 0 disables pinning.
+pin_threshold = 8
+# pin_file: usage-frequency file (written at shutdown, read at next startup)
+# used to preload the measured hot set into VRAM before the first prompt.
+# Empty string disables preload (a usage file is still written at shutdown).
+pin_file = ".moestream_usage"
+# pin_topk_per_layer: how many of each layer's hottest experts to preload.
+# 0 = auto-size to fill available VRAM expert-cache capacity.
+pin_topk_per_layer = 0
 
 # Logging. Empty log_path (default) keeps everything on stderr.
 # log_level: "VERBOSE" | "DEBUG" | "INFO" (default) | "WARN" | "ERROR"

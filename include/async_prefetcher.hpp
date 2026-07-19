@@ -4,6 +4,7 @@
 #include "kquant_dequant.hpp"  // gpu_type_supported
 #include <atomic>
 #include <thread>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -45,6 +46,15 @@ private:
     // Pinned double-buffer pool for active prefetch
     PrefetchSlot staging[NUM_STAGING_SLOTS];
     std::atomic<int> staging_write_idx{0};  // next slot to write into
+    // Guards all mutation of a staging slot's identity (layer_idx/expert_id),
+    // ready/on_device flags, AND the pinned_buf lifecycle (acquire_staging_slot
+    // recycle/regrow vs consume_staged's memcpy-out). Without it the decode
+    // thread's consume_staged could memcpy from a pinned_buf the worker thread
+    // is concurrently cudaFreeHost-ing via acquire_staging_slot, and could read
+    // a half-written (layer,expert) identity. finish_prefetch publishes
+    // identity+ready under this lock; consume_staged + acquire_staging_slot take
+    // it to read/recycle consistently.
+    std::mutex staging_mutex;
 
 public:
     void start(StreamingEngine* eng, GpuTopology* topo = nullptr) {
@@ -82,21 +92,39 @@ public:
         head.store(current_head + 1, std::memory_order_release);
     }
 
-    // Check if an expert was pre-loaded into pinned staging.
-    // Returns pointer to pinned buffer if ready, nullptr otherwise.
-    // Caller must copy out before the slot is recycled.
-    uint8_t* check_staged(int layer_idx, int expert_id, size_t* out_bytes) {
+    // Consume a prefetched slab: memcpy the staged bytes into the caller's
+    // buffer under staging_mutex (so the worker can't recycle/free the pinned
+    // slot mid-copy), then release the staging slot for reuse. Returns false
+    // (no-op) if no ready staged slab matches this (layer, expert).
+    //
+    // This is the Phase A "PIPE" overlap path: a hit here serves a cache miss
+    // WITHOUT a synchronous pread on the decode thread, because the prefetcher
+    // worker already pread the bytes while a previous layer computed. The
+    // previous check_staged() returned a raw pointer into the recycling pool
+    // and was dead code anyway; this copy-out-under-lock is the safe, live
+    // replacement. Caller is responsible for then setting up the per-projection
+    // host_ptr/meta from `dst` (see StreamingEngine::populate_slab_from_buffer).
+    bool consume_staged(int layer_idx, int expert_id, uint8_t* dst, size_t dst_cap, size_t* out_bytes) {
+        if (!dst) return false;
+        std::lock_guard<std::mutex> lock(staging_mutex);
         for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
             if (staging[i].layer_idx == layer_idx &&
                 staging[i].expert_id == expert_id &&
                 staging[i].ready.load(std::memory_order_acquire)) {
-                if (out_bytes) *out_bytes = staging[i].loaded_bytes;
-                staging[i].ready.store(false, std::memory_order_release); // consume
+                size_t bytes = staging[i].loaded_bytes;
+                if (dst_cap < bytes) return false;  // caller buffer too small -> caller falls back to load_expert_slab
+                std::memcpy(dst, staging[i].pinned_buf, bytes);
+                if (out_bytes) *out_bytes = bytes;
+                // Release the staging slot for reuse. (We do NOT touch the VRAM
+                // copy's completion -- that is tracked independently by
+                // GpuTopology via the slot's upload_event in find_expert.)
+                staging[i].ready.store(false, std::memory_order_release);
                 staging[i].layer_idx = -1;
-                return staging[i].pinned_buf;
+                staging[i].expert_id = -1;
+                return true;
             }
         }
-        return nullptr;
+        return false;
     }
 
 private:
@@ -126,10 +154,14 @@ private:
     void active_prefetch(int layer_idx, int expert_id) {
         if (!engine) return;
 
-        // Check if already staged
-        for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
-            if (staging[i].layer_idx == layer_idx &&
-                staging[i].expert_id == expert_id) return; // already in flight
+        // Check if already staged (under the same lock that publish/consume
+        // use, so we never read a half-written identity).
+        {
+            std::lock_guard<std::mutex> lock(staging_mutex);
+            for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
+                if (staging[i].layer_idx == layer_idx &&
+                    staging[i].expert_id == expert_id) return; // already in flight
+            }
         }
 
         std::string base = "blk." + std::to_string(layer_idx) + ".";
@@ -211,9 +243,12 @@ private:
         }
     }
 
-    // Round-robin staging slot, grown to `needed_bytes` if too small.
+    // Round-robin staging slot, grown to `needed_bytes` if too small. Takes
+    // staging_mutex so the regrow (which can cudaFreeHost the pinned_buf) can't
+    // race a concurrent consume_staged memcpy-out of the same slot.
     PrefetchSlot& acquire_staging_slot(size_t needed_bytes) {
         int slot_idx = staging_write_idx.fetch_add(1, std::memory_order_relaxed) % NUM_STAGING_SLOTS;
+        std::lock_guard<std::mutex> lock(staging_mutex);
         PrefetchSlot& slot = staging[slot_idx];
         if (slot.capacity < needed_bytes) {
             if (slot.pinned_buf) cudaFreeHost(slot.pinned_buf);
@@ -223,21 +258,31 @@ private:
         return slot;
     }
 
-    // Mark the staging slot ready and, if a VRAM vault is configured, fire
-    // the async H2D promotion through GpuTopology's own mutexed claim path.
+    // Fire the async H2D promotion FIRST (if a VRAM vault is configured), THEN
+    // publish identity+ready under staging_mutex. Ordering matters: if
+    // identity were published before the upload fired, a racing consume_staged
+    // could clear the slot before the upload stamped it. The upload itself
+    // goes through GpuTopology's own mutexed claim path (cache_mutex), so it
+    // is safe to call outside staging_mutex; only the slot-state publish is
+    // locked here.
     void finish_prefetch(PrefetchSlot& slot, int layer_idx, int expert_id, size_t total_bytes) {
         slot.loaded_bytes = total_bytes;
-        slot.layer_idx = layer_idx;
-        slot.expert_id = expert_id;
-        slot.ready.store(true, std::memory_order_release);
 
+        ExpertLocation* vram_slot = nullptr;
         if (gpu_topo) {
-            ExpertLocation* vram_slot = gpu_topo->upload_expert_async(
+            vram_slot = gpu_topo->upload_expert_async(
                 layer_idx, expert_id, slot.pinned_buf, slot.loaded_bytes);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(staging_mutex);
+            slot.layer_idx = layer_idx;
+            slot.expert_id = expert_id;
             if (vram_slot) {
                 slot.device_ptr = vram_slot->device_ptr;
                 slot.on_device.store(true, std::memory_order_release);
             }
+            slot.ready.store(true, std::memory_order_release);
         }
     }
 

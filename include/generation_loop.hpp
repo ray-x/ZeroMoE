@@ -185,7 +185,20 @@ public:
     }
 };
 
+// `prefetcher` is now caller-owned (main.cpp starts it ONCE for the whole
+// session with the real VRAM topology, alongside ram_mgr.vram_cache/
+// ram_mgr.prefetcher) instead of generate_text creating and starting its
+// OWN local, topology-less instance per request. That local instance was a
+// real structural bug (Phase A colibri-port investigation): it received
+// pilot-prefetch hints and did real disk I/O, but with gpu_topo=nullptr its
+// finish_prefetch() could never fire an async VRAM promotion -- and
+// meanwhile main.cpp's OWN topology-enabled prefetcher instance sat idle,
+// receiving zero hints. Net effect: speculative disk reads whose result was
+// consumed by no one. Passing the SAME instance everywhere (this function,
+// ram_mgr.prefetcher for the consume_staged miss-path) makes hints,
+// staging, and VRAM promotion all flow through one prefetcher.
 void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFTokenizer& tokenizer,
+                   LockFreePrefetcher& prefetcher,
                    const std::vector<int>& prompt_ids, int max_new_tokens, int eos_id,
                    float temperature = 0.7f, float top_p = 0.90f) {
     int max_ctx = prompt_ids.size() + max_new_tokens;
@@ -195,10 +208,6 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // request finishes (see bottom of function).
     auto request_snap_start = perf().snapshot();
     auto request_wall_start = std::chrono::high_resolution_clock::now();
-
-    // Set up prefetcher for speculative I/O
-    LockFreePrefetcher prefetcher;
-    prefetcher.start(&engine, nullptr);  // generation-local prefetcher (no VRAM topology)
 
     std::vector<int> sequence = prompt_ids;
     Sampler sampler;
@@ -219,7 +228,6 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         }
     } else {
         LOG_STREAM_WARN() << "[WARN] token_embd.weight not loaded — cannot embed tokens.\n";
-        prefetcher.stop();
         return;
     }
     // Definitively answers "is embedding the source" -- if this is clean,
@@ -229,7 +237,6 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
     if (D == 0 || V == 0) {
         LOG_STREAM_WARN() << "[WARN] Architecture not configured (D=" << D << " V=" << V << ") — aborting generation.\n";
-        prefetcher.stop();
         return;
     }
 
@@ -253,8 +260,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // seconds (CPU-bound expert FFN with no cancellation point inside
         // it), so this is the earliest point a Ctrl-C from the previous
         // step can actually be noticed. Breaking here flows into the exact
-        // same prefetcher.stop() / report cleanup below as a normal EOS
-        // stop, so callers don't need special-casing.
+        // same report cleanup below as a normal EOS stop, so callers don't
+        // need special-casing. (The prefetcher itself is caller-owned now --
+        // see the header comment above -- so there's nothing to stop here.)
         if (g_shutdown_requested.load(std::memory_order_relaxed)) {
             std::cout << "\n[Interrupted]\n";
             break;
@@ -401,7 +409,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         std::memcpy(hidden_states.data(), decode_hidden.data(), D * sizeof(float));
     }
     
-    prefetcher.stop();
+    // prefetcher is caller-owned (started once for the whole session by
+    // main.cpp) -- not stopped here.
     if (reasoning.think_tokens > 0) {
         std::cout << "\n[Reasoning: " << reasoning.think_tokens << " tokens | Output: "
                   << reasoning.output_tokens << " tokens]\n";

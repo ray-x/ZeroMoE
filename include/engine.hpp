@@ -27,6 +27,15 @@ struct QuantizedTensor {
     GGUFTensor meta;
     uint8_t* device_ptr = nullptr;
     uint8_t* host_ptr = nullptr;
+    // Optional F32-dequantized VRAM copy of this tensor, own cudaMalloc (NOT
+    // a dense_pool suballocation). Set by CudaManager::upload_dequantized_f32
+    // for static per-layer weights whose fused GPU kernel (Q5_K etc.) has no
+    // GEMV specialization and is disproportionately slow at S=1 decode (see
+    // attn_output in CLAUDE.md). When set, dense_proj dispatches through this
+    // via cuBLAS instead of device_ptr's original-quant-type fused kernel.
+    // meta.type/host_ptr/device_ptr are untouched so the CPU fallback path
+    // and existing pool bookkeeping stay correct either way.
+    uint8_t* gpu_fast_ptr = nullptr;
 };
 
 // Q4_0 KV cache block: 32 values in 18 bytes (4.5 bits/value effective)
@@ -53,7 +62,14 @@ public:
     GGUFFile dense_model_file;      // separate dense GGUF (config.dense_model_path); optional
     bool has_dense_model = false;
     std::unordered_map<std::string, QuantizedTensor> resident_layers;
-    std::vector<std::vector<MoEExpertBlock>> layers_experts; 
+    std::vector<std::vector<MoEExpertBlock>> layers_experts;
+
+    // Router-selection frequency histogram, [n_layers * n_experts], accumulated
+    // across a run and dumped to the usage file at shutdown (Phase A colibri-
+    // port: the "learned hot set" signal that drives VRAM preloading on the
+    // NEXT run). Atomic so the (future) batched/router-parallel path can bump
+    // it without locking; today moe_forward_gguf bumps it single-threaded.
+    std::vector<std::atomic<uint64_t>> route_freq;
     std::vector<float*> Lc;   // Host KV latent cache [n_layers+1][max_t * kv_lora]
     std::vector<float*> Rc;   // Host KV rope cache [n_layers+1][max_t * qk_rope]
 
@@ -109,6 +125,10 @@ public:
         for (auto& [name, qt] : resident_layers) {
             if (qt.host_ptr) free(qt.host_ptr);
             if (have_gpu && qt.device_ptr) cudaFree(qt.device_ptr);
+            // Unlike device_ptr (may be a dense_pool suballocation), gpu_fast_ptr
+            // is always its own standalone cudaMalloc — always safe/correct to
+            // cudaFree individually.
+            if (have_gpu && qt.gpu_fast_ptr) cudaFree(qt.gpu_fast_ptr);
         }
         for (auto& layer_slots : layers_experts) {
             for (auto& slot : layer_slots) {
@@ -174,6 +194,68 @@ public:
                  perf().t_dense_load > 0 ? (total_loaded / 1e9) / perf().t_dense_load.load() : 0.0);
     }
 
+    // Resolve the packed-slab geometry for a layer: per-projection byte sizes
+    // (gb/ub/db) and the source tensor metas (which carry each projection's
+    // own quant type + shape). Returns false if this layer has no packed
+    // ffn_{gate,up,down}_exps.weight tensors (dense layer or legacy per-expert
+    // layout). Shared by load_expert_slab's pread path and the consume_staged
+    // (PIPE) path so the two can never disagree on slab layout.
+    bool packed_slab_geometry(int layer_idx, size_t& gb, size_t& ub, size_t& db,
+                              const GGUFTensor*& gM, const GGUFTensor*& uM, const GGUFTensor*& dM) const {
+        std::string base = "blk." + std::to_string(layer_idx) + ".";
+        int n_exp = model_file.architecture_config.n_experts;
+        if (n_exp <= 0) return false;
+        auto gE = model_file.tensors.find(base + "ffn_gate_exps.weight");
+        auto uE = model_file.tensors.find(base + "ffn_up_exps.weight");
+        auto dE = model_file.tensors.find(base + "ffn_down_exps.weight");
+        if (gE == model_file.tensors.end() || uE == model_file.tensors.end() || dE == model_file.tensors.end())
+            return false;
+        gb = gE->second.size_bytes / n_exp;
+        ub = uE->second.size_bytes / n_exp;
+        db = dE->second.size_bytes / n_exp;
+        gM = &gE->second; uM = &uE->second; dM = &dE->second;
+        return true;
+    }
+
+    // Ensure target_slot.slab_buffer can hold `total` bytes (grow-only, like
+    // load_expert_slab). Used by both the pread path and the consume_staged
+    // path so the destination buffer is sized before the bytes arrive.
+    void ensure_slab_capacity(MoEExpertBlock& slot, size_t total) {
+        PERF_START(alloc);
+        if (slot.slab_capacity < total) {
+            if (slot.slab_buffer) free(slot.slab_buffer);
+            posix_memalign((void**)&slot.slab_buffer, 4096, total);
+            slot.slab_capacity = total;
+        }
+        PERF_END(alloc, t_host_alloc);
+    }
+
+    // Set up a MoEExpertBlock's three projection host_ptr/meta from an already-
+    // populated packed slab_buffer (gate|up|down at offsets 0, gb, gb+ub).
+    // Shared by the pread path and the consume_staged (PIPE) path -- the
+    // prefetcher's active_prefetch produces a byte-identical packed layout, so
+    // the same projection setup applies whether the bytes came from pread or
+    // from the staging pool. Offsets are slab-relative so expert_ffn's
+    // (up_meta.offset - gate_meta.offset) delta resolves correctly.
+    void populate_packed_slab(MoEExpertBlock& slot, int expert_id,
+                              size_t gb, size_t ub, size_t db,
+                              const GGUFTensor& gM, const GGUFTensor& uM, const GGUFTensor& dM) {
+        uint8_t* base = slot.slab_buffer;
+        slot.gate_proj.host_ptr = base;
+        slot.gate_proj.meta = gM;
+        slot.gate_proj.meta.offset = 0;
+        slot.gate_proj.meta.size_bytes = gb;
+        slot.up_proj.host_ptr = base + gb;
+        slot.up_proj.meta = uM;
+        slot.up_proj.meta.offset = gb;
+        slot.up_proj.meta.size_bytes = ub;
+        slot.down_proj.host_ptr = base + gb + ub;
+        slot.down_proj.meta = dM;
+        slot.down_proj.meta.offset = gb + ub;
+        slot.down_proj.meta.size_bytes = db;
+        slot.expert_id = expert_id;
+    }
+
     void load_expert_slab(int layer_idx, int expert_id, MoEExpertBlock& target_slot) {
         std::string base = "blk." + std::to_string(layer_idx) + ".";
         int n_exp = model_file.architecture_config.n_experts;
@@ -184,23 +266,11 @@ public:
         // [E*per_exp, (E+1)*per_exp). ne0 is the input dim, so the slice is
         // already the [O,I] row-major weight the matmul expects — no shuffle.
         // (GLM-5.2 UD ships this way: gate/up = Q2_K, down = Q3_K, packed.)
-        auto gE = model_file.tensors.find(base + "ffn_gate_exps.weight");
-        auto uE = model_file.tensors.find(base + "ffn_up_exps.weight");
-        auto dE = model_file.tensors.find(base + "ffn_down_exps.weight");
-        if (n_exp > 0 && gE != model_file.tensors.end() &&
-            uE != model_file.tensors.end() && dE != model_file.tensors.end()) {
-            const size_t gb = gE->second.size_bytes / n_exp;
-            const size_t ub = uE->second.size_bytes / n_exp;
-            const size_t db = dE->second.size_bytes / n_exp;
+        size_t gb, ub, db;
+        const GGUFTensor *gM, *uM, *dM;
+        if (packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) {
             const size_t total = gb + ub + db;
-
-            PERF_START(alloc);
-            if (target_slot.slab_capacity < total) {
-                if (target_slot.slab_buffer) free(target_slot.slab_buffer);
-                posix_memalign((void**)&target_slot.slab_buffer, 4096, total);
-                target_slot.slab_capacity = total;
-            }
-            PERF_END(alloc, t_host_alloc);
+            ensure_slab_capacity(target_slot, total);
 
             uint8_t* dst_gate = target_slot.slab_buffer;
             uint8_t* dst_up   = target_slot.slab_buffer + gb;
@@ -213,33 +283,18 @@ public:
                 if (r < 0 || (size_t)r != bytes)
                     LOG_WARN("[WARN] packed expert short read L%d E%d: %zd/%zu\n", l, e, r, bytes);
             };
-            read_slice(gE->second, (size_t)expert_id * gb, gb, dst_gate, layer_idx, expert_id);
-            read_slice(uE->second, (size_t)expert_id * ub, ub, dst_up,   layer_idx, expert_id);
-            read_slice(dE->second, (size_t)expert_id * db, db, dst_down, layer_idx, expert_id);
+            read_slice(*gM, (size_t)expert_id * gb, gb, dst_gate, layer_idx, expert_id);
+            read_slice(*uM, (size_t)expert_id * ub, ub, dst_up,   layer_idx, expert_id);
+            read_slice(*dM, (size_t)expert_id * db, db, dst_down, layer_idx, expert_id);
             PERF_END(disk, t_disk_read);
             perf().bytes_disk_read.fetch_add(total, std::memory_order_relaxed);
 
             if (drop_expert_pages) {
-                posix_fadvise(model_file.fd_for_tensor(gE->second),
-                              gE->second.offset, gE->second.size_bytes, POSIX_FADV_DONTNEED);
+                posix_fadvise(model_file.fd_for_tensor(*gM),
+                              gM->offset, gM->size_bytes, POSIX_FADV_DONTNEED);
             }
 
-            // Per-projection metas: offset is slab-relative so expert_ffn's
-            // (up_meta.offset - gate_meta.offset) delta resolves correctly, and
-            // each projection carries its OWN type (Q2_K vs Q3_K) for dispatch.
-            target_slot.gate_proj.host_ptr = dst_gate;
-            target_slot.gate_proj.meta = gE->second;
-            target_slot.gate_proj.meta.offset = 0;
-            target_slot.gate_proj.meta.size_bytes = gb;
-            target_slot.up_proj.host_ptr = dst_up;
-            target_slot.up_proj.meta = uE->second;
-            target_slot.up_proj.meta.offset = gb;
-            target_slot.up_proj.meta.size_bytes = ub;
-            target_slot.down_proj.host_ptr = dst_down;
-            target_slot.down_proj.meta = dE->second;
-            target_slot.down_proj.meta.offset = gb + ub;
-            target_slot.down_proj.meta.size_bytes = db;
-            target_slot.expert_id = expert_id;
+            populate_packed_slab(target_slot, expert_id, gb, ub, db, *gM, *uM, *dM);
             return;
         }
 
@@ -332,5 +387,66 @@ public:
                 posix_fadvise(model_file.fd_for_tensor(it->second), it->second.offset, it->second.size_bytes * 3, POSIX_FADV_WILLNEED);
             }
         }
+    }
+
+    // ---- Learned hot-set profiling (Phase A colibri-port) ----
+    // route_freq is [n_layers * n_experts]; call once layers/n_experts are known
+    // (after build_model_graph). Idempotent.
+    void init_route_freq() {
+        int nl = model_file.architecture_config.n_layers;
+        int ne = model_file.architecture_config.n_experts;
+        if (nl <= 0 || ne <= 0) return;
+        size_t n = (size_t)nl * (size_t)ne;
+        if (route_freq.size() != n) {
+            route_freq = std::vector<std::atomic<uint64_t>>(n);
+        }
+    }
+    inline void bump_route_freq(int layer, int expert) {
+        if (route_freq.empty()) return;
+        int ne = model_file.architecture_config.n_experts;
+        if (layer < 0 || expert < 0 || ne <= 0) return;
+        size_t idx = (size_t)layer * (size_t)ne + (size_t)expert;
+        if (idx < route_freq.size())
+            route_freq[idx].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Write "layer expert count" lines for every (layer,expert) ever selected.
+    // Mirrors colibri's .coli_usage format so a future cross-engine diff is
+    // trivial. Best-effort: a failed open/write just logs and continues.
+    void dump_usage(const std::string& path) const {
+        if (path.empty() || route_freq.empty()) return;
+        FILE* f = std::fopen(path.c_str(), "w");
+        if (!f) { LOG_WARN("[USAGE] could not write %s\n", path.c_str()); return; }
+        int ne = model_file.architecture_config.n_experts;
+        for (size_t i = 0; i < route_freq.size(); ++i) {
+            uint64_t c = route_freq[i].load(std::memory_order_relaxed);
+            if (c == 0) continue;
+            std::fprintf(f, "%zu %zu %llu\n", i / (size_t)ne, i % (size_t)ne, (unsigned long long)c);
+        }
+        std::fclose(f);
+        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s\n", path.c_str());
+    }
+
+    // Read a usage file written by dump_usage. Returns one UsageEntry per
+    // (layer,expert) row plus the max count seen (for relative thresholds).
+    // Malformed lines are skipped silently; a missing file (first run) returns
+    // an empty vector with maxc=0 -- not an error.
+    struct UsageEntry { int layer; int expert; uint64_t count; };
+    static std::pair<std::vector<UsageEntry>, uint64_t> load_usage(const std::string& path) {
+        std::vector<UsageEntry> out;
+        uint64_t maxc = 0;
+        if (path.empty()) return {out, maxc};
+        FILE* f = std::fopen(path.c_str(), "r");
+        if (!f) return {out, maxc};
+        char line[128];
+        while (std::fgets(line, sizeof(line), f)) {
+            int layer, expert; unsigned long long cnt;
+            if (std::sscanf(line, "%d %d %llu", &layer, &expert, &cnt) == 3) {
+                out.push_back({layer, expert, (uint64_t)cnt});
+                if (cnt > maxc) maxc = cnt;
+            }
+        }
+        std::fclose(f);
+        return {out, maxc};
     }
 };

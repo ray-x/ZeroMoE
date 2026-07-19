@@ -263,6 +263,23 @@ inline bool dequant_row(GGUFType type, const uint8_t* ptr, float* out, int n) {
     }
 }
 
+// Dequantize an entire [O,I] row-major tensor to F32, parallel over rows.
+// One-time cost (called at load, not per-token) — backs the dense-tensor
+// "fast path" upgrade (CudaManager::upload_dequantized_f32) for static
+// per-layer weights whose fused GPU kernel has no GEMV specialization and is
+// disproportionately slow at S=1 decode (e.g. attn_output, see CLAUDE.md).
+// Returns false if the type isn't supported by dequant_row (out is left
+// zero-filled for any unsupported row, same convention as dequant_row).
+inline bool dequant_tensor_f32(GGUFType type, const uint8_t* W, int O, int I, float* out) {
+    int rb = row_bytes(type, I);
+    int unsup = 0;
+    #pragma omp parallel for schedule(static) reduction(|:unsup)
+    for (int o = 0; o < O; ++o) {
+        if (!dequant_row(type, W + (int64_t)o * rb, out + (int64_t)o * I, I)) unsup = 1;
+    }
+    return unsup == 0;
+}
+
 // Dequantize one row of a QuantizedTensor (used by MLA v_b absorption).
 inline bool dequant_v_b_row(const QuantizedTensor& t, int row, float* out) {
     int I = (int)t.meta.shape[1];

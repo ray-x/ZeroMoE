@@ -57,6 +57,14 @@ struct ExpertLocation {
     bool upload_ready = true;
     cudaEvent_t upload_event = nullptr;
 
+    // Phase A colibri-port: a pinned slot is never chosen as an eviction
+    // victim, regardless of eviction_score. Set once a RAM-cache expert's
+    // hit_count crosses RAMSafetyManager::pin_threshold (proven-hot within
+    // this conversation), or at startup for the pre-loaded hot set from a
+    // usage-file profile (cross-conversation). Only mutated under
+    // cache_mutex, same as every other field here.
+    bool pinned = false;
+
     // Blended recency+frequency score used for eviction: a frequently-hit
     // expert resists eviction even after a burst of newer accesses touches
     // other slots (plain LRU would evict a hot-but-not-most-recent expert).
@@ -248,6 +256,28 @@ public:
         return nullptr;
     }
 
+    // Mark a currently VRAM-resident expert's slot as pinned (never chosen
+    // as an eviction victim by evict_lru). No-op (returns false) if the
+    // expert isn't resident -- caller must upload it first. Used both by
+    // RAMSafetyManager::get_expert's within-conversation promotion (a host
+    // slot's hit_count crosses pin_threshold) and main.cpp's startup
+    // hot-set preload from a usage-file profile (cross-conversation).
+    // Deliberately does NOT bump hit_count/last_used_clock the way
+    // find_expert does -- pinning is a policy action, not a real access.
+    bool pin_expert(int layer, int expert_id) {
+        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        for (auto& loc : expert_vram_cache) {
+            if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr) {
+                if (!loc.pinned) {
+                    loc.pinned = true;
+                    perf().n_pinned_resident.fetch_add(1, std::memory_order_relaxed);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Evict lowest recency+frequency score and return a free slot for a new
     // expert upload. The slot's device_ptr is pre-assigned (slab offset),
     // ready for cudaMemcpy.
@@ -257,6 +287,19 @@ public:
         ExpertLocation* victim = nullptr;
         for (auto& loc : expert_vram_cache) {
             if (loc.layer_idx == -1) { victim = &loc; break; } // empty slot preferred
+            // Never evict a pinned (proven-hot, Phase A colibri-port) slot.
+            // Also never evict a slot whose async upload is still in flight
+            // -- this second part is a real correctness fix, not just
+            // policy: before this, an in-flight cudaMemcpyAsync into a
+            // not-yet-ready slot could be chosen as ANOTHER eviction's
+            // victim and overwritten mid-copy (the old code only checked
+            // eviction_score, which a fresh in-flight slot satisfies same
+            // as any other -- last_used_clock/hit_count don't reflect
+            // "copy not done yet").
+            if (loc.pinned || !loc.upload_ready) {
+                if (loc.pinned) perf().n_pinned_eviction_skips.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             if (!victim || loc.eviction_score() < victim->eviction_score()) victim = &loc;
         }
         if (victim) {
@@ -265,6 +308,7 @@ public:
             victim->last_used_clock = 0;
             victim->hit_count = 0;
             victim->upload_ready = true;
+            victim->pinned = false;  // defensive: a freed slot must never carry a stale pin
         }
         return victim;
     }

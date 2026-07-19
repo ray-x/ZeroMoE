@@ -76,10 +76,29 @@ struct PerfCounters {
     std::atomic<double> t_attn_absorb{0};   // attn_k_b/attn_v_b cache lookup-or-fill (should be ~0 after layer's first call)
     std::atomic<double> t_attn_score{0};    // the absorbed score/softmax/value-aggregation loop
     std::atomic<double> t_attn_outproj{0};  // attn_output dense_proj
+
+    // Phase split for CudaManager::dense_matmul_host -- ALL dense_proj GPU
+    // calls share these (not just attention's), added after confirming
+    // attn_output's dense_proj call *does* successfully GPU-dispatch every
+    // time (zero "[DENSE] ... CPU dequant-matmul fallback" lines logged)
+    // yet still costs ~623ms/token, dwarfing the qproj dense_proj calls
+    // (~120ms combined for two calls) -- this splits WHERE inside that
+    // successful GPU call the time actually goes, same method that found
+    // the real issue in the expert-FFN GPU path earlier this session.
+    std::atomic<double> t_dense_gpu_up{0};
+    std::atomic<double> t_dense_gpu_compute{0};
+    std::atomic<double> t_dense_gpu_down{0};
+    std::atomic<uint64_t> n_dense_gpu_calls{0};
     std::atomic<double> t_moe_route{0};     // Router + top-k selection
     std::atomic<double> t_moe_expert{0};    // Expert FFN computation
     std::atomic<double> t_prefetch{0};      // fadvise/prefetch overhead
     std::atomic<double> t_dense_load{0};    // Initial resident tensor loading
+    std::atomic<double> t_consume_staged{0};// Time in consume_staged (memcpy a
+                                             // prefetched slab out of the staging
+                                             // pool into the cache slot) -- the
+                                             // Phase A "PIPE" overlap path. Near-
+                                             // zero means the prefetcher isn't
+                                             // feeding the miss path yet.
 
     // Counters
     std::atomic<uint64_t> n_expert_cache_hit{0};
@@ -90,6 +109,10 @@ struct PerfCounters {
     std::atomic<uint64_t> n_expert_cpu_calls{0};  // expert_ffn calls that took the CPU fallback path
     std::atomic<int64_t> bytes_disk_read{0};
     std::atomic<int64_t> bytes_gpu_uploaded{0};
+    // Phase A (colibri-port) counters:
+    std::atomic<uint64_t> n_pipe_hits{0};          // cache misses served from the prefetcher's staging pool (no pread) -- the higher this is vs n_expert_cache_miss, the more disk I/O was hidden behind compute
+    std::atomic<uint64_t> n_pinned_eviction_skips{0}; // times evict_lru skipped a pinned/in-flight slot -- non-zero under pressure proves the pinning policy is protecting the hot set
+    std::atomic<uint64_t> n_pinned_resident{0};    // experts currently held as non-evictable VRAM residents (pinned). Gauge-ish: incremented on pin, decremented on unpin.
 
     // Plain-value point-in-time copy of the cumulative counters above, so
     // callers can diff two snapshots to get a per-token or per-request
@@ -99,10 +122,12 @@ struct PerfCounters {
         double t_cpu_dequant=0, t_cpu_dot=0;
         double t_attn=0;
         double t_attn_norm=0, t_attn_qproj=0, t_attn_kvproj=0, t_attn_absorb=0, t_attn_score=0, t_attn_outproj=0;
-        double t_moe_route=0, t_moe_expert=0, t_prefetch=0, t_dense_load=0;
+        double t_dense_gpu_up=0, t_dense_gpu_compute=0, t_dense_gpu_down=0;
+        double t_moe_route=0, t_moe_expert=0, t_prefetch=0, t_dense_load=0, t_consume_staged=0;
         uint64_t n_expert_cache_hit=0, n_expert_cache_miss=0, n_expert_promote=0, n_tokens_generated=0;
-        uint64_t n_expert_gpu_calls=0, n_expert_cpu_calls=0;
+        uint64_t n_expert_gpu_calls=0, n_expert_cpu_calls=0, n_dense_gpu_calls=0;
         int64_t bytes_disk_read=0, bytes_gpu_uploaded=0;
+        uint64_t n_pipe_hits=0, n_pinned_eviction_skips=0, n_pinned_resident=0;
 
         Snapshot operator-(const Snapshot& b) const {
             return Snapshot{
@@ -114,17 +139,23 @@ struct PerfCounters {
                 t_attn_norm - b.t_attn_norm, t_attn_qproj - b.t_attn_qproj,
                 t_attn_kvproj - b.t_attn_kvproj, t_attn_absorb - b.t_attn_absorb,
                 t_attn_score - b.t_attn_score, t_attn_outproj - b.t_attn_outproj,
+                t_dense_gpu_up - b.t_dense_gpu_up, t_dense_gpu_compute - b.t_dense_gpu_compute,
+                t_dense_gpu_down - b.t_dense_gpu_down,
                 t_moe_route - b.t_moe_route,
                 t_moe_expert - b.t_moe_expert, t_prefetch - b.t_prefetch,
-                t_dense_load - b.t_dense_load,
+                t_dense_load - b.t_dense_load, t_consume_staged - b.t_consume_staged,
                     n_expert_cache_hit - b.n_expert_cache_hit,
                     n_expert_cache_miss - b.n_expert_cache_miss,
                     n_expert_promote - b.n_expert_promote,
                     n_tokens_generated - b.n_tokens_generated,
                     n_expert_gpu_calls - b.n_expert_gpu_calls,
                     n_expert_cpu_calls - b.n_expert_cpu_calls,
+                    n_dense_gpu_calls - b.n_dense_gpu_calls,
                     bytes_disk_read - b.bytes_disk_read,
-                    bytes_gpu_uploaded - b.bytes_gpu_uploaded
+                    bytes_gpu_uploaded - b.bytes_gpu_uploaded,
+                    n_pipe_hits - b.n_pipe_hits,
+                    n_pinned_eviction_skips - b.n_pinned_eviction_skips,
+                    n_pinned_resident - b.n_pinned_resident
             };
         }
     };
@@ -137,10 +168,12 @@ struct PerfCounters {
             t_attn.load(),
             t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
             t_attn_absorb.load(), t_attn_score.load(), t_attn_outproj.load(),
-            t_moe_route.load(), t_moe_expert.load(), t_prefetch.load(), t_dense_load.load(),
+            t_dense_gpu_up.load(), t_dense_gpu_compute.load(), t_dense_gpu_down.load(),
+            t_moe_route.load(), t_moe_expert.load(), t_prefetch.load(), t_dense_load.load(), t_consume_staged.load(),
             n_expert_cache_hit.load(), n_expert_cache_miss.load(), n_expert_promote.load(), n_tokens_generated.load(),
-            n_expert_gpu_calls.load(), n_expert_cpu_calls.load(),
-            bytes_disk_read.load(), bytes_gpu_uploaded.load()
+            n_expert_gpu_calls.load(), n_expert_cpu_calls.load(), n_dense_gpu_calls.load(),
+            bytes_disk_read.load(), bytes_gpu_uploaded.load(),
+            n_pipe_hits.load(), n_pinned_eviction_skips.load(), n_pinned_resident.load()
         };
     }
 
@@ -167,17 +200,24 @@ struct PerfCounters {
             "[%s] wall=%8.2fms  attn=%7.2fms [norm=%6.2f qproj=%6.2f kvproj=%6.2f absorb=%6.2f "
             "score=%6.2f outproj=%6.2f] route=%6.2fms expert=%7.2fms "
             "gpu_up=%6.2fms gpu_dn=%6.2fms gpu_cmp=%6.2fms cpu_exp=%7.2fms (dequant=%6.2fms dot=%6.2fms) "
-            "disk=%6.2fms  cache=%lluH/%lluM (%.0f%%) gpu_calls=%llu cpu_calls=%llu\n",
+            "dense_gpu[up=%6.2f cmp=%6.2f dn=%6.2f calls=%llu] "
+            "disk=%6.2fms  cache=%lluH/%lluM (%.0f%%) gpu_calls=%llu cpu_calls=%llu "
+            "pipe=%llu pin_skip=%llu pin=%llu\n",
             label, wall_ms,
             d.t_attn * 1000.0,
             d.t_attn_norm * 1000.0, d.t_attn_qproj * 1000.0, d.t_attn_kvproj * 1000.0,
             d.t_attn_absorb * 1000.0, d.t_attn_score * 1000.0, d.t_attn_outproj * 1000.0,
             d.t_moe_route * 1000.0, d.t_moe_expert * 1000.0,
             d.t_gpu_upload * 1000.0, d.t_gpu_download * 1000.0, d.t_gpu_compute * 1000.0,
-            d.t_cpu_expert * 1000.0, d.t_cpu_dequant * 1000.0, d.t_cpu_dot * 1000.0, d.t_disk_read * 1000.0,
+            d.t_cpu_expert * 1000.0, d.t_cpu_dequant * 1000.0, d.t_cpu_dot * 1000.0,
+            d.t_dense_gpu_up * 1000.0, d.t_dense_gpu_compute * 1000.0, d.t_dense_gpu_down * 1000.0,
+            (unsigned long long)d.n_dense_gpu_calls,
+            d.t_disk_read * 1000.0,
             (unsigned long long)hits, (unsigned long long)misses,
             (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0,
-            (unsigned long long)d.n_expert_gpu_calls, (unsigned long long)d.n_expert_cpu_calls);
+            (unsigned long long)d.n_expert_gpu_calls, (unsigned long long)d.n_expert_cpu_calls,
+            (unsigned long long)d.n_pipe_hits, (unsigned long long)d.n_pinned_eviction_skips,
+            (unsigned long long)d.n_pinned_resident);
     }
 
     // Concise INFO-level summary for one finished request (prompt + all
@@ -192,20 +232,27 @@ struct PerfCounters {
         uint64_t hits = d.n_expert_cache_hit, misses = d.n_expert_cache_miss;
         uint64_t gcalls = d.n_expert_gpu_calls, ccalls = d.n_expert_cpu_calls;
         double tok_s = wall_ms > 0 ? n_tokens / (wall_ms / 1000.0) : 0.0;
+        double dense_gpu_total = d.t_dense_gpu_up + d.t_dense_gpu_compute + d.t_dense_gpu_down;
         LOG_INFO(
             "[%s] %d tokens in %.2fs (%.2f tok/s)  attn=%.2fs [norm=%.2f qproj=%.2f kvproj=%.2f "
             "absorb=%.2f score=%.2f outproj=%.2f] route=%.2fs "
             "expert=%.2fs (gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs] cpu=%.2fs [dequant=%.2fs dot=%.2fs]) "
-            "disk=%.2fs  cache=%.0f%% hit  expert_calls=%lluGPU/%lluCPU\n",
+            "dense_gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs calls=%llu] "
+            "disk=%.2fs  cache=%.0f%% hit  expert_calls=%lluGPU/%lluCPU "
+            "pipe=%llu(pin_skip=%llu pin=%llu)\n",
             label, n_tokens, wall_ms / 1000.0, tok_s,
             d.t_attn,
             d.t_attn_norm, d.t_attn_qproj, d.t_attn_kvproj, d.t_attn_absorb, d.t_attn_score, d.t_attn_outproj,
             d.t_moe_route, d.t_moe_expert,
             gpu_round_trip, d.t_gpu_upload, d.t_gpu_compute, d.t_gpu_download, d.t_cpu_expert,
             d.t_cpu_dequant, d.t_cpu_dot,
+            dense_gpu_total, d.t_dense_gpu_up, d.t_dense_gpu_compute, d.t_dense_gpu_down,
+            (unsigned long long)d.n_dense_gpu_calls,
             d.t_disk_read,
             (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0,
-            (unsigned long long)gcalls, (unsigned long long)ccalls);
+            (unsigned long long)gcalls, (unsigned long long)ccalls,
+            (unsigned long long)d.n_pipe_hits, (unsigned long long)d.n_pinned_eviction_skips,
+            (unsigned long long)d.n_pinned_resident);
     }
 
     void dump_report() const {
@@ -234,6 +281,13 @@ struct PerfCounters {
         LOG_INFO("Attention (MLA):     %8.3f s  (norm=%.3f qproj=%.3f kvproj=%.3f absorb=%.3f score=%.3f outproj=%.3f)\n",
                  t_attn.load(), t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
                  t_attn_absorb.load(), t_attn_score.load(), t_attn_outproj.load());
+        LOG_INFO("Dense GPU dispatch:  %8.3f s  (up=%.3f cmp=%.3f dn=%.3f, %lu calls, %.3fms/call avg)\n",
+                 t_dense_gpu_up.load() + t_dense_gpu_compute.load() + t_dense_gpu_down.load(),
+                 t_dense_gpu_up.load(), t_dense_gpu_compute.load(), t_dense_gpu_down.load(),
+                 (unsigned long)n_dense_gpu_calls.load(),
+                 n_dense_gpu_calls > 0
+                     ? 1000.0 * (t_dense_gpu_up.load() + t_dense_gpu_compute.load() + t_dense_gpu_down.load()) / n_dense_gpu_calls.load()
+                     : 0.0);
         LOG_INFO("MoE routing:         %8.3f s\n", t_moe_route.load());
         LOG_INFO("MoE expert FFN:      %8.3f s\n", t_moe_expert.load());
         LOG_INFO("Prefetch overhead:   %8.3f s\n", t_prefetch.load());
@@ -253,6 +307,12 @@ struct PerfCounters {
         LOG_INFO("Expert cache:        %lu hit / %lu miss (%.1f%% hit rate)\n",
                  (unsigned long)hits, (unsigned long)misses,
                  (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0);
+        LOG_INFO("Prefetch (PIPE):     %lu misses served from staging / %lu total misses (%.1f%% served)\n",
+                 (unsigned long)n_pipe_hits.load(), (unsigned long)misses,
+                 misses > 0 ? 100.0 * n_pipe_hits.load() / misses : 0.0);
+        LOG_INFO("Pinned residents:    %lu current / %lu eviction-skips\n",
+                 (unsigned long)n_pinned_resident.load(),
+                 (unsigned long)n_pinned_eviction_skips.load());
         LOG_INFO("Tokens generated:    %lu\n", (unsigned long)n_tokens_generated.load());
         if (n_tokens_generated > 0 && total > 0) {
             LOG_INFO("Throughput:          %.2f tok/s\n",
