@@ -29,6 +29,7 @@ extern "C" void launch_iq2_xxs_matmul(float* y, const float* x, const void* weig
 extern "C" void launch_iq2_xs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq2_s_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq3_xxs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+extern "C" void launch_iq4_xs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_tq1_matmul(float* y, const float* x, const void* weights, const void* scales, int S, int I, int O);
 extern "C" void launch_iq1s_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq1m_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
@@ -135,6 +136,7 @@ static bool gpu_matmul_dispatch(GGUFType type, float* y, const float* x, const v
         case GGUFType::IQ2_XS:  launch_iq2_xs_matmul(y, x, w, S, I, O);  return true;
         case GGUFType::IQ2_S:   launch_iq2_s_matmul(y, x, w, S, I, O);   return true;
         case GGUFType::IQ3_XXS: launch_iq3_xxs_matmul(y, x, w, S, I, O); return true;
+        case GGUFType::IQ4_XS:  launch_iq4_xs_matmul(y, x, w, S, I, O);  return true;
         default: return false;
     }
 }
@@ -161,6 +163,12 @@ struct PendingGpuExpert {
     int k = -1;
     MoEExpertBlock* exp = nullptr;
     const ExpertLocation* loc = nullptr;
+    // True iff expert_ffn_resolve_gpu_loc took a temporary
+    // hold_for_compute() on `loc` (the decode-time cold-miss branch) that
+    // must be released once this expert's kernels are confirmed done --
+    // see expert_ffn_gpu_finish. False for the pre-existing S>=4 cold-batch
+    // path and the already-VRAM-resident case, neither of which take a hold.
+    bool needs_release = false;
 };
 
 struct LayerScratch {
@@ -256,12 +264,23 @@ struct LayerScratch {
 static constexpr int GPU_COLD_BATCH_THRESHOLD = 4;  // amortizes a cold upload
 
 // Decides GPU vs CPU for one expert and, for the GPU case, resolves VRAM
-// residency (including the synchronous cold-batch upload for large S).
-// Returns nullptr if the CPU path should be taken.
+// residency (including the synchronous cold-batch upload for large S, or
+// the decode-time cold-miss synchronous upload below). Returns nullptr if
+// the CPU path should be taken. *out_needs_release is set true iff this
+// call took a temporary hold_for_compute() on the returned slot that the
+// caller MUST match with exactly one GpuTopology::release_hold() once its
+// GPU kernels are confirmed done reading that slot (see
+// expert_ffn_gpu_finish) -- true for EVERY path that returns a non-null
+// location (already-VRAM-resident, the S>=4 cold-batch upload, and the
+// decode-time cold-miss upload alike, see the hold_for_compute() call at
+// the end of this function). Was previously true ONLY for the decode-time
+// branch, which was a real bug -- see that call site's own comment.
 static const ExpertLocation* expert_ffn_resolve_gpu_loc(
     const ExpertGpuContext* gpu_ctx, int S,
-    const GGUFTensor& gate_meta, const GGUFTensor& up_meta, const GGUFTensor& down_meta
+    const GGUFTensor& gate_meta, const GGUFTensor& up_meta, const GGUFTensor& down_meta,
+    bool* out_needs_release
 ) {
+    *out_needs_release = false;
     const ExpertLocation* loc = gpu_ctx ? gpu_ctx->loc : nullptr;
     bool vram_resident = loc && loc->device_ptr && loc->layer_idx >= 0;
     if (cpu_only_mode()) vram_resident = false;  // diagnostic: force CPU expert path
@@ -275,6 +294,45 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
                                             gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
         vram_resident = loc && loc->device_ptr;
     }
+
+    // Decode-time cold miss (S < GPU_COLD_BATCH_THRESHOLD, in practice
+    // always S==1): closes the "miss pays CPU too" gap -- previously a
+    // decode-time miss ALWAYS fell to the ~9ms CPU dequant-matmul fallback,
+    // even when the expert's quant type has a GPU kernel that would cost
+    // ~2ms, because promotion only ever happened in the BACKGROUND after a
+    // LATER hit proved the expert hot. A prior attempt at this exact fix
+    // used an ASYNC upload ordered via stream-0 launch order alone, which
+    // caused real memory corruption (see CLAUDE.md's "Decode-time cache-
+    // miss GPU dispatch: attempted, reverted" section) -- the async copy's
+    // completion event fired as soon as the COPY landed, well before the
+    // kernels reading that data had actually finished executing, so a
+    // DIFFERENT thread's background eviction could steal the slot mid-
+    // compute. This version is different in kind, not degree: (1) uses the
+    // SYNCHRONOUS upload_expert() (same call the S>=4 branch above already
+    // uses safely) so there is no copy-vs-kernel-launch race to reason
+    // about at all -- by the time this call returns, the data is
+    // unconditionally present; (2) additionally holds the slot via
+    // hold_for_compute() (reference-counted, evict_lru-respected) for the
+    // ENTIRE issue-to-finish window, released only after
+    // expert_ffn_gpu_finish's cudaStreamSynchronize(0) confirms the
+    // asynchronous kernel EXECUTION (not just the copy) is actually done --
+    // closing the race the previous attempt missed. Type support is
+    // checked FIRST, before spending the synchronous upload's real latency
+    // on a type that could never dispatch anyway.
+    if (!vram_resident && gpu_ctx && gpu_ctx->topo && gpu_ctx->slab_buffer
+        && gpu_ctx->slab_capacity > 0 && S < GPU_COLD_BATCH_THRESHOLD
+        && gpu_type_supported(gate_meta.type) && gpu_type_supported(up_meta.type)
+        && gpu_type_supported(down_meta.type)) {
+        loc = gpu_ctx->topo->upload_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
+                                            gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
+        vram_resident = loc && loc->device_ptr;
+        if (vram_resident) {
+            LOG_DEBUG("[MOE-VRAM]  COLD-GPU layer=%d expert=%d -> synchronous H2D upload on decode-time "
+                      "miss (avoids CPU dequant-matmul fallback)\n",
+                      gpu_ctx->layer_idx, gpu_ctx->expert_id);
+        }
+    }
+
     if (!vram_resident) return nullptr;
 
     if (!gpu_type_supported(gate_meta.type) || !gpu_type_supported(up_meta.type) ||
@@ -301,6 +359,45 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
                       gpu_ctx ? gpu_ctx->layer_idx : -1, gpu_ctx ? gpu_ctx->expert_id : -1, why.c_str());
         }
         return nullptr;
+    }
+
+    // FIX (real bug, found by re-reading this function after reports of
+    // non-deterministic NaN that came and went independent of any single
+    // recent code change -- exactly the signature of a race, not a per-
+    // kernel logic bug): hold_for_compute() used to be called ONLY inside
+    // the decode-time-cold-miss branch above, meaning EVERY OTHER path
+    // that reaches this point with a valid `loc` -- an expert that was
+    // ALREADY VRAM-resident before this function was even called (the
+    // MOST COMMON case, and more so now with this session's more
+    // aggressive pin_threshold/promote_hit_threshold settings keeping more
+    // experts resident longer), or the S>=GPU_COLD_BATCH_THRESHOLD cold-
+    // batch upload above -- returned completely UNPROTECTED. Nothing
+    // stopped evict_lru (called from the prefetcher thread's own
+    // background promotions, or even a LATER k in this SAME Pass A loop
+    // needing a free slot) from picking this exact slot as an eviction
+    // victim and overwriting it mid-flight while Pass B's kernels (issued
+    // via expert_ffn_gpu_issue, potentially many other experts' worth of
+    // time earlier in Pass A, and not confirmed done until
+    // expert_ffn_gpu_finish's cudaStreamSynchronize) were still reading
+    // it -- silent corruption, not a crash, exactly the "fluent but wrong"
+    // signature this project has hit before. Held uniformly here now,
+    // regardless of which branch above resolved `loc`, so every path that
+    // returns a non-null location gets equal protection for the entire
+    // issue-to-finish window. If the hold fails (slot identity changed in
+    // the narrow window between the residency check and this call), treat
+    // as a miss rather than trust a possibly-stale pointer -- same
+    // reasoning the decode-time branch already used, just applied
+    // everywhere now instead of only there.
+    if (gpu_ctx && gpu_ctx->topo) {
+        bool held = gpu_ctx->topo->hold_for_compute(gpu_ctx->layer_idx, gpu_ctx->expert_id);
+        if (!held) {
+            LOG_WARN("[MOE-VRAM]  layer=%d expert=%d: hold_for_compute failed for an apparently-"
+                     "resident slot -- identity changed underneath us; falling back to CPU for this "
+                     "call rather than trust a possibly-stale pointer\n",
+                     gpu_ctx->layer_idx, gpu_ctx->expert_id);
+            return nullptr;
+        }
+        *out_needs_release = true;
     }
     return loc;
 }
@@ -340,7 +437,8 @@ static void expert_ffn_gpu_finish(
     float* gate_buf, float* up_buf, float* output,
     const GGUFTensor& gate_meta, const GGUFTensor& down_meta,
     int layer_idx, int expert_id,
-    int S, int D, int moe_inter
+    int S, int D, int moe_inter,
+    GpuTopology* topo, bool needs_release
 ) {
     // Each in-flight expert's issue() may have run on a different vault GPU
     // (multi-GPU config) and left a different device "current" on this
@@ -371,6 +469,15 @@ static void expert_ffn_gpu_finish(
     gpu_matmul_dispatch(down_meta.type, gpu_scratch.d_down, gpu_scratch.d_prod, down_dev, S, moe_inter, D);
     cudaStreamSynchronize(0);
     PERF_END(gexp_cmp2, t_gpu_compute);
+
+    // This sync just confirmed EVERY kernel that reads this slab (gate, up,
+    // AND down -- the last of the three) has actually finished executing,
+    // not just that their launches completed -- so it's safe to release
+    // the temporary hold taken in expert_ffn_resolve_gpu_loc's decode-time
+    // cold-miss branch now, exactly here and not any earlier. Releasing
+    // before this point would reopen the exact eviction-during-compute
+    // race the hold exists to prevent.
+    if (needs_release && topo) topo->release_hold(layer_idx, expert_id);
 
     PERF_START(gexp_dn2);
     cudaMemcpy(output, gpu_scratch.d_down, (size_t)S * D * sizeof(float), cudaMemcpyDeviceToHost);
@@ -654,10 +761,17 @@ void moe_forward_gguf(
         float* token_output = output + s * D;
 
         // --- Load all needed experts (LRU cache handles hits/misses; most
-        // will already be warm here thanks to Phase 1/2 above) ---
-        for (int k = 0; k < topk; ++k) {
-            scratch.expert_ptrs[k] = ram_mgr.get_expert(engine, layer_idx, scratch.tok_topk_ids[s * topk + k]);
-        }
+        // will already be warm here thanks to Phase 1/2 above). Batched:
+        // get_experts_batch parallelizes the disk reads for whichever of
+        // this layer's topk picks are genuine misses (not already staged
+        // via PIPE), instead of the old one-pread-at-a-time sequential
+        // loop -- validated via colibri's iobench.c showing ~8.5x real
+        // throughput scaling available on this hardware that the old
+        // strictly-sequential loop never touched. tok_topk_ids[s*topk ..
+        // s*topk+topk) is contiguous, so it's passed directly as the batch's
+        // expert_ids array. ---
+        ram_mgr.get_experts_batch(engine, layer_idx, &scratch.tok_topk_ids[s * topk], topk,
+                                   scratch.expert_ptrs.data());
 
         // Weighted accumulation + VERBOSE trace, shared by both the CPU path
         // (Pass A, accumulates immediately) and the GPU path (Pass B,
@@ -727,14 +841,15 @@ void moe_forward_gguf(
             gpu_ctx.slab_capacity = exp->slab_capacity;
             gpu_ctx.loc = ram_mgr.vram_cache ? ram_mgr.vram_cache->find_expert(layer_idx, exp->expert_id) : nullptr;
 
+            bool needs_release = false;
             const ExpertLocation* resolved = expert_ffn_resolve_gpu_loc(
-                &gpu_ctx, 1, exp->gate_proj.meta, exp->up_proj.meta, exp->down_proj.meta);
+                &gpu_ctx, 1, exp->gate_proj.meta, exp->up_proj.meta, exp->down_proj.meta, &needs_release);
 
             if (resolved) {
                 GpuExpertScratch& gs = scratch.gpu_pool[scratch.pending_gpu.size()];
                 expert_ffn_gpu_issue(gs, resolved, token_hidden, exp->gate_proj.meta, exp->up_proj.meta,
                                       1, D, moe_inter);
-                scratch.pending_gpu.push_back({k, exp, resolved});
+                scratch.pending_gpu.push_back({k, exp, resolved, needs_release});
             } else {
                 expert_ffn_cpu(
                     token_hidden, scratch.down_buf.data(),
@@ -758,7 +873,8 @@ void moe_forward_gguf(
                 gs, p.loc,
                 scratch.gate_buf.data(), scratch.up_buf.data(), scratch.down_buf.data(),
                 p.exp->gate_proj.meta, p.exp->down_proj.meta,
-                layer_idx, p.exp->expert_id, 1, D, moe_inter);
+                layer_idx, p.exp->expert_id, 1, D, moe_inter,
+                ram_mgr.vram_cache, p.needs_release);
             accumulate(p.k, p.exp, scratch.down_buf.data());
         }
 
@@ -918,6 +1034,20 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                 dense_proj(engine, router_key,
                            scratch.pilot_nrm.data(), scratch.pilot_logits.data(), 1, D, c.n_experts);
 
+                // Layer l+1's active host-cache slots -- checked below so a
+                // hint is never pushed for an expert that's ALREADY resident.
+                // Such an expert is a guaranteed instant hit needing no read
+                // at all once actually reached, so speculatively prefetching
+                // it anyway only steals scarce worker-thread I/O bandwidth
+                // from hints that genuinely need a disk read. Bounded to the
+                // REAL active cap (ram_mgr.slots_per_layer), matching
+                // RAMSafetyManager::get_expert's own bound -- slots past that
+                // cap are never populated, so scanning them would be wasted
+                // work, not a correctness issue either way.
+                auto& next_slots = engine.layers_experts[l + 1];
+                size_t next_cap = next_slots.empty() ? 0
+                    : std::min(next_slots.size(), (size_t)std::max(1, ram_mgr.slots_per_layer));
+
                 int pilot_k = std::min(8, c.topk);
                 for (int k = 0; k < pilot_k; ++k) {
                     int best_exp = 0;
@@ -925,7 +1055,16 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                         if (scratch.pilot_logits[e] > scratch.pilot_logits[best_exp]) best_exp = e;
                     }
                     scratch.pilot_logits[best_exp] = -2e30f;
-                    async_io_queue.push_hint(l + 1, best_exp);
+
+                    bool already_resident = false;
+                    for (size_t si = 0; si < next_cap; ++si) {
+                        if (next_slots[si].expert_id == best_exp) { already_resident = true; break; }
+                    }
+                    if (already_resident) {
+                        perf().n_pilot_hints_skipped.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        async_io_queue.push_hint(l + 1, best_exp);
+                    }
                 }
             }
             PERF_END(pilot, t_prefetch);

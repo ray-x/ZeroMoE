@@ -10,6 +10,21 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+// macOS doesn't have posix_fadvise; provide a no-op stub. Guarded by the SAME
+// symbol (POSIX_FADV_WILLNEED) engine.hpp's own stub uses, and the function
+// definition lives INSIDE that guard (not after it, unconditionally) -- this
+// file and engine.hpp always land in the same translation unit (engine.hpp
+// includes this file first), so whichever is processed first fully defines
+// constants+function and the other's #ifndef skips cleanly.
+#ifndef POSIX_FADV_WILLNEED
+#define POSIX_FADV_WILLNEED 3
+#define POSIX_FADV_DONTNEED 4
+#define POSIX_FADV_RANDOM 1
+static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
+#endif
+#endif
+
 // GGML / GGUF tensor type IDs. These values MUST match the raw `type` field
 // stored in the GGUF tensor table (see ggml.h). calculate_size() below switches
 // on the integer value, so these names exist only for readable dispatch — but
@@ -275,6 +290,25 @@ private:
 
         int fd = open(shard_path.c_str(), O_RDONLY);
         if (fd < 0) return false;
+
+        // Tell the kernel this fd's access pattern is NOT sequential: expert
+        // slabs are read by jumping to whatever offset the router picked
+        // this token (effectively random across a 100+GB file), which is
+        // the opposite of what Linux's default readahead heuristic assumes.
+        // Left as the default (no hint), the kernel can spend real I/O
+        // bandwidth speculatively reading pages after each request that
+        // this workload will never touch, and/or repeatedly shrink/reset
+        // its readahead window on each detected "random" jump -- both pure
+        // overhead for this access pattern. POSIX_FADV_RANDOM (offset=0,
+        // len=0 = whole file) disables that heuristic outright. Zero
+        // correctness risk (a kernel hint, not a behavior change) and zero
+        // concurrency risk -- a pure candidate fix for the measured low
+        // (~1.17 GB/s) aggregate disk throughput, cheaper to test than
+        // re-sharding the model file the way colibri does (colibri's
+        // per-shard files likely get a similar practical effect: each
+        // smaller file's own access pattern reads as more "local" to the
+        // kernel's readahead heuristic without needing an explicit hint).
+        posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
 
         // Compute data_start for this shard and adjust tensor offsets
         uint64_t alignment = 32;

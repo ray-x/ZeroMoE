@@ -92,6 +92,16 @@ extern "C" int ggml_quantize_row_ref(uint32_t type, const float* src, void* dst,
             ggml_quantize_init(GGML_TYPE_IQ3_XXS);
             quantize_row_iq3_xxs_ref(src, (block_iq3_xxs*)dst, n);
             return 1;
+        // IQ4_XS: a fixed 16-entry lookup table (kvalues_iq4nl) + per-block
+        // linear scale, NOT the harder IQ2/IQ3 variable-codebook family --
+        // ggml exposes a real single-row _ref quantizer (no imatrix
+        // needed), same shape as the Q2_K..Q6_K cases above. Added
+        // specifically to unblock benchmarking this type's CPU dequant
+        // throughput (it was previously the only routed-expert-relevant
+        // type this bridge couldn't encode test data for).
+        case 23:
+            quantize_row_iq4_xs_ref(src, (block_iq4_xs*)dst, n);
+            return 1;
         default: return 0;
     }
 }

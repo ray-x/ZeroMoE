@@ -12,9 +12,38 @@
 #include <unistd.h>
 #include <cuda_runtime.h>
 
+// Any staging_mutex acquisition wait, or any staging-slot regrow, exceeding
+// this is logged individually (tagged [SLOW-MUTEX-WAIT] / [SLOW-STAGING-
+// REGROW]) -- added to root-cause a real, reproducible multi-second (up to
+// 7.5s observed) single-miss stall that a per-miss latency histogram showed
+// was NOT explained by raw disk throughput (p50/p90 were completely normal,
+// only a handful of outlier calls were catastrophic). 50ms is already ~3x a
+// normal ~15ms expert-slab read, so anything over this is unambiguously
+// anomalous, not ordinary variance.
+constexpr double SLOW_MUTEX_WAIT_MS = 50.0;
+
+// How long a hint may sit in the queue before the worker thread actually
+// starts processing it (pickup delay) before it's logged as anomalous
+// ([SLOW-PICKUP]). Set higher than SLOW_MUTEX_WAIT_MS deliberately: even a
+// perfectly healthy worker processes hints strictly sequentially, and the
+// pilot pushes up to 8 hints per layer -- at a normal ~15ms/expert read,
+// the LAST hint in one layer's batch can legitimately wait ~100ms+ just
+// from the worker churning through the ones ahead of it, with zero
+// contention or backlog involved. 250ms gives real margin above that
+// benign case while still catching genuine backlog/starvation well before
+// it reaches the multi-second severity seen in the SLOW-PREAD investigation.
+// Added specifically to distinguish "the worker thread can't get scheduled
+// promptly" (CPU contention with OMP dequant threads) from "the worker
+// thread is scheduled fine but can't drain hints as fast as they're
+// produced" (pure throughput/concurrency ceiling) -- the two point at very
+// different fixes (nothing to do with thread count in the first case,
+// more I/O parallelism in the second).
+constexpr double SLOW_PICKUP_MS = 250.0;
+
 struct PrefetchHint {
     int layer_idx;
     int expert_id;
+    std::chrono::high_resolution_clock::time_point pushed_at;
 };
 
 // Staging slot: pinned host memory for an expert slab ready for async GPU upload
@@ -88,7 +117,7 @@ public:
             return;
         }
 
-        queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id};
+        queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now()};
         head.store(current_head + 1, std::memory_order_release);
     }
 
@@ -106,7 +135,16 @@ public:
     // host_ptr/meta from `dst` (see StreamingEngine::populate_slab_from_buffer).
     bool consume_staged(int layer_idx, int expert_id, uint8_t* dst, size_t dst_cap, size_t* out_bytes) {
         if (!dst) return false;
+        auto _wait_t0 = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(staging_mutex);
+        double _wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - _wait_t0).count();
+        PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
+        if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
+            LOG_WARN("[SLOW-MUTEX-WAIT] consume_staged blocked %.2fms acquiring staging_mutex "
+                     "(layer=%d expert=%d) -- worker thread likely holding it, check for a nearby "
+                     "[SLOW-STAGING-REGROW] line\n", _wait_ms, layer_idx, expert_id);
+        }
         for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
             if (staging[i].layer_idx == layer_idx &&
                 staging[i].expert_id == expert_id &&
@@ -141,7 +179,29 @@ private:
             }
 
             PrefetchHint hint = queue[current_tail & (QUEUE_SIZE - 1)];
+            // Backlog depth AT the moment of pickup (includes the hint just
+            // popped) -- a direct, independent signal for "is the worker
+            // falling behind hint production", complementing the pickup-
+            // delay measurement below (a growing backlog and a growing
+            // delay should move together; if they don't, that itself is
+            // informative -- e.g. a big backlog with small delay would mean
+            // hints are being produced in a sudden burst but still drained
+            // fast once picked up).
+            unsigned int backlog = current_head - current_tail;
             tail.store(current_tail + 1, std::memory_order_release);
+
+            double pickup_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - hint.pushed_at).count();
+            PerfCounters::atomic_add(perf().t_prefetch_pickup_delay, pickup_ms / 1000.0);
+            perf().n_prefetch_hints_processed.fetch_add(1, std::memory_order_relaxed);
+            PerfCounters::atomic_max(perf().n_prefetch_backlog_peak, (uint64_t)backlog);
+            if (pickup_ms > SLOW_PICKUP_MS) {
+                LOG_WARN("[SLOW-PICKUP] layer=%d expert=%d waited %.2fms in queue before the worker "
+                         "thread picked it up (queue backlog at pickup: %u hints) -- worker is falling "
+                         "behind hint production, either CPU-starved or I/O-throughput-bound\n",
+                         hint.layer_idx, hint.expert_id, pickup_ms, backlog);
+            }
+
             active_prefetch(hint.layer_idx, hint.expert_id);
         }
     }
@@ -157,7 +217,15 @@ private:
         // Check if already staged (under the same lock that publish/consume
         // use, so we never read a half-written identity).
         {
+            auto _wait_t0 = std::chrono::high_resolution_clock::now();
             std::lock_guard<std::mutex> lock(staging_mutex);
+            double _wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - _wait_t0).count();
+            PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
+            if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
+                LOG_WARN("[SLOW-MUTEX-WAIT] active_prefetch blocked %.2fms acquiring staging_mutex "
+                         "(layer=%d expert=%d)\n", _wait_ms, layer_idx, expert_id);
+            }
             for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
                 if (staging[i].layer_idx == layer_idx &&
                     staging[i].expert_id == expert_id) return; // already in flight
@@ -248,11 +316,43 @@ private:
     // race a concurrent consume_staged memcpy-out of the same slot.
     PrefetchSlot& acquire_staging_slot(size_t needed_bytes) {
         int slot_idx = staging_write_idx.fetch_add(1, std::memory_order_relaxed) % NUM_STAGING_SLOTS;
+        auto _wait_t0 = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(staging_mutex);
+        double _wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - _wait_t0).count();
+        PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
+        if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
+            LOG_WARN("[SLOW-MUTEX-WAIT] acquire_staging_slot blocked %.2fms acquiring staging_mutex (slot=%d)\n",
+                     _wait_ms, slot_idx);
+        }
         PrefetchSlot& slot = staging[slot_idx];
         if (slot.capacity < needed_bytes) {
+            // PRIME SUSPECT for the multi-second single-miss stall: pinned
+            // (page-locked) host memory alloc/free is a documented-slow CUDA
+            // driver operation (can run tens to thousands of ms, especially
+            // under memory pressure or fragmentation) -- and this whole pair
+            // runs WHILE HOLDING staging_mutex, so any concurrent
+            // consume_staged() call on the decode thread blocks for the full
+            // duration. A fixed pool of only NUM_STAGING_SLOTS=16 slots
+            // rotating round-robin across MoE layers whose packed slab size
+            // can differ layer-to-layer (different quant types e.g. IQ4_XS
+            // vs IQ3_XXS down-projections) means this regrow can trigger far
+            // more often than "only once at startup" -- every time the
+            // round-robin lands on a slot last sized for a DIFFERENT layer's
+            // (smaller) slab.
+            auto _regrow_t0 = std::chrono::high_resolution_clock::now();
             if (slot.pinned_buf) cudaFreeHost(slot.pinned_buf);
             cudaMallocHost((void**)&slot.pinned_buf, needed_bytes);
+            double _regrow_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - _regrow_t0).count();
+            PerfCounters::atomic_add(perf().t_staging_regrow, _regrow_ms / 1000.0);
+            perf().n_staging_regrow.fetch_add(1, std::memory_order_relaxed);
+            if (_regrow_ms > SLOW_MUTEX_WAIT_MS) {
+                LOG_WARN("[SLOW-STAGING-REGROW] slot=%d cudaFreeHost+cudaMallocHost took %.2fms "
+                         "(old_capacity=%.2fMB new=%.2fMB) -- held staging_mutex for the whole "
+                         "duration, blocking any concurrent consume_staged\n",
+                         slot_idx, slot.capacity / 1e6, needed_bytes / 1e6, _regrow_ms);
+            }
             slot.capacity = needed_bytes;
         }
         return slot;
@@ -275,7 +375,15 @@ private:
         }
 
         {
+            auto _wait_t0 = std::chrono::high_resolution_clock::now();
             std::lock_guard<std::mutex> lock(staging_mutex);
+            double _wait_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - _wait_t0).count();
+            PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
+            if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
+                LOG_WARN("[SLOW-MUTEX-WAIT] finish_prefetch blocked %.2fms acquiring staging_mutex "
+                         "(layer=%d expert=%d)\n", _wait_ms, layer_idx, expert_id);
+            }
             slot.layer_idx = layer_idx;
             slot.expert_id = expert_id;
             if (vram_slot) {

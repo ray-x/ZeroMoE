@@ -26,6 +26,7 @@ extern "C" void launch_iq2_xxs_matmul(float* y, const float* x, const void* weig
 extern "C" void launch_iq2_xs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq2_s_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq3_xxs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+extern "C" void launch_iq4_xs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_rmsnorm(float* y, const float* x, const float* w, int S, int D, float eps);
 
 class CudaManager {
@@ -220,6 +221,17 @@ public:
     // token cost in CLAUDE.md, the motivating case. host_ptr/device_ptr/
     // meta.type are untouched, so the CPU fallback stays correct regardless.
     //
+    // REVERTED FROM BF16 (see CLAUDE.md): a bf16 variant of this function
+    // (upload_dequantized_bf16, using CUDA_R_16BF via cublas_dense_matmul)
+    // produced real NaN corruption on real hardware (hidden_states 6144/6144
+    // NaN by layer 74/75, traced back to a non-finite router weight fed by
+    // an upstream attn_output GPU call). No coding bug was found on static
+    // review of the bf16 rounding math itself; leading unconfirmed suspicion
+    // is cublasGemmEx with mismatched input types (BF16 weight, F32
+    // activations) not being a genuinely correct combination for that entry
+    // point. Reverted to this known-good F32-only version pending real-
+    // hardware investigation.
+    //
     // Best-effort: returns false (leaving gpu_fast_ptr null, caller keeps
     // using the existing slower path) if the F32 expansion doesn't fit in
     // max_bytes, the shape is malformed, or the quant type has no CPU
@@ -406,6 +418,10 @@ public:
                 break;
             case GGUFType::IQ3_XXS:
                 launch_iq3_xxs_matmul(d_y, d_x, d_W, S, I, O);
+                ok = true;
+                break;
+            case GGUFType::IQ4_XS:
+                launch_iq4_xs_matmul(d_y, d_x, d_W, S, I, O);
                 ok = true;
                 break;
             // IQ1_* / IQ2_M : no GPU fused kernel — CPU dequant (libggml) handles

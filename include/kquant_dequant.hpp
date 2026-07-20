@@ -46,11 +46,29 @@ inline bool gpu_type_supported(GGUFType type) {
         // routed-expert compute was CPU-only until this landed.
         case GGUFType::IQ3_XXS:
             return true;
+        // IQ4_XS: RE-ENABLED. Two prior incidents (layer=40, then layer=7)
+        // both produced NaN with this enabled despite Test 5's isolated
+        // kernel test passing -- but the real root cause, found by
+        // re-reading expert_ffn_resolve_gpu_loc (src/execution_layer.cpp)
+        // after the NaN was reported as non-deterministic/code-version-
+        // independent, was a genuine RACE CONDITION shared by EVERY
+        // GPU-dispatched expert of ANY quant type, not anything specific
+        // to IQ4_XS: hold_for_compute() was only ever called for the
+        // decode-time-cold-miss path, leaving the (far more common)
+        // already-VRAM-resident and S>=4 cold-batch-upload paths
+        // completely unprotected against concurrent eviction mid-compute.
+        // IQ4_XS was never uniquely at fault -- just an expert type like
+        // any other, sitting in the same unprotected state as everything
+        // else. See CLAUDE.md for the full incident writeup and the fix
+        // (hold_for_compute() now called uniformly for every path that
+        // resolves a GPU location). Re-enabled now that this is fixed;
+        // still verify with a real run and watch "Temp-pin skips" in
+        // dump_report() before trusting further.
+        case GGUFType::IQ4_XS:
+            return true;
         // No GPU kernel implemented anywhere in cuda/*.cu for these: IQ3_S,
-        // IQ4_NL, IQ4_XS, TQ1_0, TQ2_0, IQ2_M. See gpu_unsupported_reason()
-        // for why each specific one isn't supported yet — they're NOT all
-        // the same difficulty (IQ4_NL/XS in particular are much simpler
-        // than IQ3_S, structurally close to the already-supported K-quants).
+        // IQ4_NL, TQ1_0, TQ2_0, IQ2_M. See gpu_unsupported_reason() for why
+        // each specific one isn't supported yet.
         default: return false;
     }
 }
@@ -134,9 +152,11 @@ inline double gpu_type_bits_per_weight(GGUFType type) {
 //   - IQ4_NL/IQ4_XS: dequantize_row_iq4_nl/_xs BOTH just index a single
 //     FIXED 16-entry table (kvalues_iq4nl, identical for every block) times
 //     a per-block linear scale — structurally close to the ALREADY-SUPPORTED
-//     K-quants (Q4_K/Q5_K/Q6_K), not the IQ2/IQ3 grid family. Likely the
-//     EASIEST of the currently-unimplemented types to add a kernel for, not
-//     "same difficulty as IQ3_S".
+//     K-quants (Q4_K/Q5_K/Q6_K), not the IQ2/IQ3 grid family. IQ4_XS has a
+//     kernel again (cuda/iq4xs_matmul.cu's launch_iq4_xs_matmul,
+//     re-enabled after the real bug — a shared eviction race, not this
+//     kernel — was found and fixed; see gpu_type_supported()'s own comment
+//     and CLAUDE.md); IQ4_NL is the one still genuinely missing.
 inline const char* gpu_unsupported_reason(GGUFType type) {
     if (gpu_type_supported(type)) return "supported";
     switch (type) {
@@ -147,12 +167,16 @@ inline const char* gpu_unsupported_reason(GGUFType type) {
                    "fused CUDA kernel written for THIS specific format yet. "
                    "Not a fundamental bit-width limit; it's unimplemented, "
                    "not unimplementable.";
-        case GGUFType::IQ4_NL: case GGUFType::IQ4_XS:
+        // IQ4_XS moved to gpu_type_supported()'s TRUE case above (re-
+        // enabled) -- this reason string only applies to IQ4_NL now, since
+        // gpu_unsupported_reason() already returns early with "supported"
+        // for anything gpu_type_supported() accepts.
+        case GGUFType::IQ4_NL:
             return "fixed 16-entry lookup table (kvalues_iq4nl) + per-block "
                    "linear scale -- structurally close to the ALREADY-SUPPORTED "
-                   "Q4_K/Q5_K/Q6_K kernels, NOT the harder IQ2/IQ3 variable-grid "
-                   "family, despite being named similarly. No fused CUDA kernel "
-                   "written yet, but likely the easiest gap here to close.";
+                   "Q4_K/Q5_K/Q6_K/IQ4_XS kernels. No fused CUDA kernel written "
+                   "yet for THIS specific block layout (IQ4_NL's is smaller, "
+                   "32 elements/block vs IQ4_XS's 256).";
         case GGUFType::IQ1_S: case GGUFType::IQ1_M: case GGUFType::TQ1_0:
             return "1-2 bit ternary/codebook format -- CUDA kernels for these "
                    "actually EXIST (cuda/iq1_dequant.cu: launch_iq1s_matmul / "
@@ -173,6 +197,25 @@ static inline float bf16_to_fp32(uint16_t b) {
     uint32_t u = ((uint32_t)b) << 16;  // bf16 = top 16 bits of fp32
     float f; std::memcpy(&f, &u, sizeof(f));
     return f;
+}
+
+// Round-to-nearest-even truncation of an f32 to bf16 (top 16 bits, with the
+// standard "round half to even" bias added before truncating rather than a
+// flat chop). NOT currently wired into the live fast-path: was used by a
+// bf16 variant of CudaManager::upload_dequantized_f32 to halve the
+// attn_output fast-path's VRAM cost, but that variant produced real NaN
+// corruption on real hardware and was reverted (see CLAUDE.md and
+// upload_dequantized_f32's own comment). The rounding math itself was NOT
+// identified as the cause on static review -- now exercised directly by
+// src/main_test.cpp's Test 9 (test_bf16_cublas_dense_matmul), which tests
+// cublasGemmEx's BF16-weight/F32-activation path in isolation. Do not wire
+// this back into the live fast-path until Test 9 has actually been run and
+// confirmed passing on real Linux/CUDA hardware.
+static inline uint16_t fp32_to_bf16(float f) {
+    uint32_t u; std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);  // NaN: keep quiet
+    uint32_t rounding_bias = 0x00007fffu + ((u >> 16) & 1u);  // round-to-nearest-even
+    return (uint16_t)((u + rounding_bias) >> 16);
 }
 
 // Bytes occupied by one row of I elements for a packed weight [O,I].
@@ -254,6 +297,9 @@ inline bool dequant_row(GGUFType type, const uint8_t* ptr, float* out, int n) {
             return true;
         case GGUFType::IQ3_XXS:
             dequantize_row_iq3_xxs_avx512(ptr, out, n);
+            return true;
+        case GGUFType::IQ2_S:
+            dequantize_row_iq2_s_avx512(ptr, out, n);
             return true;
         default: {
             int ok = ggml_dequant_row((uint32_t)type, ptr, out, n);

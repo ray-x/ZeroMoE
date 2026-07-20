@@ -14,4 +14,5 @@ const void* ms_grid_iq2s()         { return iq2s_grid;     } // uint64_t[1024]
 const void* ms_grid_ksigns_iq2xs() { return ksigns_iq2xs;  } // uint8_t[128]
 const void* ms_grid_kmask_iq2xs()  { return kmask_iq2xs;   } // uint8_t[8]
 const void* ms_grid_iq3xxs()       { return iq3xxs_grid;   } // uint32_t[256]
+const void* ms_grid_kvalues_iq4nl() { return kvalues_iq4nl; } // int8_t[16] -- fixed non-linear lookup table shared by IQ4_NL/IQ4_XS
 }

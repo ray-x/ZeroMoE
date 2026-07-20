@@ -78,3 +78,15 @@ void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k);
 // uint16 (66B/block); IQ3_XXS = d(2) + qs[96] (98B/block).
 void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k);
 void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k);
+// IQ2_S: verbatim port of cuda/iq2_matmul.cu's dequant_iq2_s_block. `block`
+// layout: d(2) + qs[64] + qh[8] + scales[8] = 82B/block (2.5625 bits/weight).
+void dequantize_row_iq2_s_avx512(const uint8_t* block, float* y, int64_t k);
+
+// EXPERIMENTAL widened (512-bit/16-lane, vs the above's 256-bit/8-lane)
+// siblings -- NOT wired into dequant_row()'s dispatch, see kernels_cpu.cpp's
+// header comment above their definitions for why. Exposed here only so
+// main_test.cpp's Test 8 benchmark can call them directly for a throughput
+// comparison against the 8-wide versions.
+void dequantize_row_iq2_xxs_avx512_wide(const uint8_t* block, float* y, int64_t k);
+void dequantize_row_iq3_xxs_avx512_wide(const uint8_t* block, float* y, int64_t k);
+void dequantize_row_iq2_s_avx512_wide(const uint8_t* block, float* y, int64_t k);

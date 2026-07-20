@@ -100,6 +100,29 @@ struct PerfCounters {
                                              // zero means the prefetcher isn't
                                              // feeding the miss path yet.
 
+    // Added to root-cause a real, reproducible multi-second-per-token stall
+    // (up to 7.5s for a SINGLE cache-miss service call, confirmed via a
+    // per-miss loaded_from_disk= latency histogram showing normal p50/p90
+    // but extreme outliers) that could NOT be explained by raw disk
+    // throughput (median/p90 individual reads were completely normal --
+    // only a handful of calls were catastrophically slow, which rules out
+    // "the drive is slow" and points at something blocking intermittently).
+    // These isolate the two most likely culprits: (1) cudaMallocHost/
+    // cudaFreeHost inside the prefetcher's staging-slot regrow, which is a
+    // documented-slow CUDA operation (pinned/page-locked memory allocation)
+    // that this codebase was calling WHILE HOLDING staging_mutex -- so any
+    // concurrent consume_staged() call (the decode thread servicing a cache
+    // miss) would block for the full regrow duration; and (2) generic
+    // cross-thread contention on GpuTopology::cache_mutex, shared between
+    // the main decode thread's inline hit-triggered promotions
+    // (RAMSafetyManager::get_expert Step 1, especially aggressive when
+    // promote_hit_threshold is low) and the prefetcher worker thread's own
+    // background promotions/evictions.
+    std::atomic<double> t_staging_regrow{0};      // time inside acquire_staging_slot's cudaFreeHost+cudaMallocHost pair, held under staging_mutex
+    std::atomic<uint64_t> n_staging_regrow{0};    // how many times a staging slot needed to grow (different layers' slab sizes rotating through a small fixed pool of slots is the expected trigger)
+    std::atomic<double> t_staging_mutex_wait{0};  // total time ANY caller (consume_staged/acquire_staging_slot/finish_prefetch) spent BLOCKED acquiring staging_mutex -- high values here directly prove cross-thread contention on this lock, separate from time spent doing real work once held
+    std::atomic<double> t_cache_mutex_wait{0};    // total time ANY caller spent BLOCKED acquiring GpuTopology::cache_mutex (find_expert/pin_expert/evict_lru/has_free_slot/upload_expert/upload_expert_async)
+
     // Counters
     std::atomic<uint64_t> n_expert_cache_hit{0};
     std::atomic<uint64_t> n_expert_cache_miss{0};
@@ -112,7 +135,26 @@ struct PerfCounters {
     // Phase A (colibri-port) counters:
     std::atomic<uint64_t> n_pipe_hits{0};          // cache misses served from the prefetcher's staging pool (no pread) -- the higher this is vs n_expert_cache_miss, the more disk I/O was hidden behind compute
     std::atomic<uint64_t> n_pinned_eviction_skips{0}; // times evict_lru skipped a pinned/in-flight slot -- non-zero under pressure proves the pinning policy is protecting the hot set
+    std::atomic<uint64_t> n_temp_pin_eviction_skips{0}; // times evict_lru skipped a slot TEMPORARILY held for an in-flight decode-time GPU dispatch (ExpertLocation::temp_pin_count > 0) -- distinct from n_pinned_eviction_skips (permanent pins); nonzero proves the compute-in-flight protection is actually engaging
     std::atomic<uint64_t> n_pinned_resident{0};    // experts currently held as non-evictable VRAM residents (pinned). Gauge-ish: incremented on pin, decremented on unpin.
+    std::atomic<uint64_t> n_pilot_hints_skipped{0}; // speculative pilot-prefetch hints skipped because the expert was ALREADY host-cache-resident (a guaranteed instant hit needing no read) -- measures how much prefetch-worker bandwidth this avoids wasting; compare against n_pipe_hits/n_expert_cache_miss before/after to see the effect
+
+    // Hint-push-to-pickup delay: how long a prefetch hint sits in the
+    // queue before the worker thread actually starts processing it.
+    // Added to distinguish two very different explanations for low PIPE
+    // coverage (only 10.1% of misses served from staging in a real
+    // measured run): (a) the worker thread isn't getting scheduled
+    // promptly, i.e. CPU-starved by the OMP-parallelized dequant work
+    // saturating all cores -- fixed by nothing thread-count-related, needs
+    // CPU headroom instead; vs (b) the worker IS scheduled fine but simply
+    // can't drain hints as fast as they're produced -- a genuine
+    // concurrency/throughput ceiling, where more worker threads (or faster
+    // per-read completion, e.g. O_DIRECT) would actually help. A large
+    // t_prefetch_pickup_delay with a small n_prefetch_backlog_peak would
+    // suggest (a); a large backlog growing over time suggests (b).
+    std::atomic<double> t_prefetch_pickup_delay{0};
+    std::atomic<uint64_t> n_prefetch_hints_processed{0};
+    std::atomic<uint64_t> n_prefetch_backlog_peak{0};  // max (head - tail) ever observed at pickup time -- a gauge/high-water-mark, not cumulative
 
     // Plain-value point-in-time copy of the cumulative counters above, so
     // callers can diff two snapshots to get a per-token or per-request
@@ -124,10 +166,11 @@ struct PerfCounters {
         double t_attn_norm=0, t_attn_qproj=0, t_attn_kvproj=0, t_attn_absorb=0, t_attn_score=0, t_attn_outproj=0;
         double t_dense_gpu_up=0, t_dense_gpu_compute=0, t_dense_gpu_down=0;
         double t_moe_route=0, t_moe_expert=0, t_prefetch=0, t_dense_load=0, t_consume_staged=0;
+        double t_staging_regrow=0, t_staging_mutex_wait=0, t_cache_mutex_wait=0;
         uint64_t n_expert_cache_hit=0, n_expert_cache_miss=0, n_expert_promote=0, n_tokens_generated=0;
         uint64_t n_expert_gpu_calls=0, n_expert_cpu_calls=0, n_dense_gpu_calls=0;
         int64_t bytes_disk_read=0, bytes_gpu_uploaded=0;
-        uint64_t n_pipe_hits=0, n_pinned_eviction_skips=0, n_pinned_resident=0;
+        uint64_t n_pipe_hits=0, n_pinned_eviction_skips=0, n_pinned_resident=0, n_staging_regrow=0;
 
         Snapshot operator-(const Snapshot& b) const {
             return Snapshot{
@@ -144,6 +187,9 @@ struct PerfCounters {
                 t_moe_route - b.t_moe_route,
                 t_moe_expert - b.t_moe_expert, t_prefetch - b.t_prefetch,
                 t_dense_load - b.t_dense_load, t_consume_staged - b.t_consume_staged,
+                t_staging_regrow - b.t_staging_regrow,
+                t_staging_mutex_wait - b.t_staging_mutex_wait,
+                t_cache_mutex_wait - b.t_cache_mutex_wait,
                     n_expert_cache_hit - b.n_expert_cache_hit,
                     n_expert_cache_miss - b.n_expert_cache_miss,
                     n_expert_promote - b.n_expert_promote,
@@ -155,7 +201,8 @@ struct PerfCounters {
                     bytes_gpu_uploaded - b.bytes_gpu_uploaded,
                     n_pipe_hits - b.n_pipe_hits,
                     n_pinned_eviction_skips - b.n_pinned_eviction_skips,
-                    n_pinned_resident - b.n_pinned_resident
+                    n_pinned_resident - b.n_pinned_resident,
+                    n_staging_regrow - b.n_staging_regrow
             };
         }
     };
@@ -170,10 +217,12 @@ struct PerfCounters {
             t_attn_absorb.load(), t_attn_score.load(), t_attn_outproj.load(),
             t_dense_gpu_up.load(), t_dense_gpu_compute.load(), t_dense_gpu_down.load(),
             t_moe_route.load(), t_moe_expert.load(), t_prefetch.load(), t_dense_load.load(), t_consume_staged.load(),
+            t_staging_regrow.load(), t_staging_mutex_wait.load(), t_cache_mutex_wait.load(),
             n_expert_cache_hit.load(), n_expert_cache_miss.load(), n_expert_promote.load(), n_tokens_generated.load(),
             n_expert_gpu_calls.load(), n_expert_cpu_calls.load(), n_dense_gpu_calls.load(),
             bytes_disk_read.load(), bytes_gpu_uploaded.load(),
-            n_pipe_hits.load(), n_pinned_eviction_skips.load(), n_pinned_resident.load()
+            n_pipe_hits.load(), n_pinned_eviction_skips.load(), n_pinned_resident.load(),
+            n_staging_regrow.load()
         };
     }
 
@@ -183,6 +232,15 @@ struct PerfCounters {
     static void atomic_add(std::atomic<double>& target, double v) {
         double old = target.load(std::memory_order_relaxed);
         while (!target.compare_exchange_weak(old, old + v,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {}
+    }
+
+    // CAS-loop max update for atomic<uint64_t> -- tracks a high-water-mark
+    // (e.g. n_prefetch_backlog_peak) rather than a running total. Only
+    // writes if v is actually greater than the current value.
+    static void atomic_max(std::atomic<uint64_t>& target, uint64_t v) {
+        uint64_t old = target.load(std::memory_order_relaxed);
+        while (v > old && !target.compare_exchange_weak(old, v,
                     std::memory_order_relaxed, std::memory_order_relaxed)) {}
     }
 
@@ -255,9 +313,24 @@ struct PerfCounters {
             (unsigned long long)d.n_pinned_resident);
     }
 
-    void dump_report() const {
-        double total = t_disk_read + t_host_alloc + t_gpu_upload + t_gpu_compute +
-                       t_attn + t_moe_route + t_moe_expert;
+    // session_elapsed_s: REAL wall-clock seconds from "engine ready to
+    // accept prompts" to shutdown (see main.cpp's call site) -- used ONLY
+    // for the final Throughput line. Deliberately NOT derived from summing
+    // individual perf counters (t_disk_read + t_gpu_upload + ... etc.):
+    // that was this function's ORIGINAL approach, and it quietly became
+    // wrong as concurrency was added to this codebase (4-thread parallel
+    // expert fetch, GPU/CPU Pass A/B overlap, PIPE async prefetch all
+    // running concurrently with compute) -- summing durations that
+    // genuinely overlap in real time systematically OVER-counts elapsed
+    // time (confirmed on a real run: the old summed "total" came out to
+    // 244.8s for a request whose ACTUAL wall-clock duration, per the
+    // `[REQUEST]` line's own wall_ms-based calculation, was 118.08s -- more
+    // than 2x inflated), which silently made every "Throughput: X tok/s"
+    // line this session under-report real speed by a growing margin as
+    // more overlap was added. 0 is a valid default (e.g. a test harness
+    // that never calls generate_text) -- Tokens/Throughput lines simply
+    // don't print in that case, same as the old total>0 guard did.
+    void dump_report(double session_elapsed_s = 0.0) const {
         double gpu_round_trip = t_gpu_upload + t_gpu_compute + t_gpu_download;
         LOG_INFO("\n========== MoEStream Performance Report ==========\n");
         LOG_INFO("Dense load (init):   %8.3f s\n", t_dense_load.load());
@@ -310,13 +383,32 @@ struct PerfCounters {
         LOG_INFO("Prefetch (PIPE):     %lu misses served from staging / %lu total misses (%.1f%% served)\n",
                  (unsigned long)n_pipe_hits.load(), (unsigned long)misses,
                  misses > 0 ? 100.0 * n_pipe_hits.load() / misses : 0.0);
+        LOG_INFO("Pilot hints skipped: %lu (already host-cache-resident -- avoided wasting prefetch bandwidth)\n",
+                 (unsigned long)n_pilot_hints_skipped.load());
+        LOG_INFO("Prefetch pickup:     avg %.2fms over %lu hints, peak queue backlog %lu "
+                 "(large delay + small backlog => worker CPU-starved; growing backlog => worker throughput-bound)\n",
+                 n_prefetch_hints_processed > 0
+                     ? 1000.0 * t_prefetch_pickup_delay.load() / n_prefetch_hints_processed.load() : 0.0,
+                 (unsigned long)n_prefetch_hints_processed.load(),
+                 (unsigned long)n_prefetch_backlog_peak.load());
         LOG_INFO("Pinned residents:    %lu current / %lu eviction-skips\n",
                  (unsigned long)n_pinned_resident.load(),
                  (unsigned long)n_pinned_eviction_skips.load());
+        LOG_INFO("Temp-pin skips:      %lu (decode-time cold-GPU-dispatch slots protected mid-compute)\n",
+                 (unsigned long)n_temp_pin_eviction_skips.load());
+        LOG_INFO("Staging mutex wait:  %8.3f s  (staging slot regrow: %lu events, %.3f s -- "
+                 "cudaMallocHost/cudaFreeHost held under the SAME lock, see [SLOW-STAGING-REGROW])\n",
+                 t_staging_mutex_wait.load(), (unsigned long)n_staging_regrow.load(), t_staging_regrow.load());
+        LOG_INFO("Cache mutex wait:    %8.3f s  (GpuTopology::cache_mutex, shared between the decode "
+                 "thread's hit-triggered promotions and the prefetcher worker thread)\n",
+                 t_cache_mutex_wait.load());
         LOG_INFO("Tokens generated:    %lu\n", (unsigned long)n_tokens_generated.load());
-        if (n_tokens_generated > 0 && total > 0) {
-            LOG_INFO("Throughput:          %.2f tok/s\n",
-                     n_tokens_generated.load() / total);
+        if (n_tokens_generated > 0 && session_elapsed_s > 0) {
+            LOG_INFO("Throughput:          %.2f tok/s  (%.2fs real wall-clock, engine-ready to shutdown, "
+                     "ALL turns in this session -- mixes prefill+decode; see the per-request [REQUEST] "
+                     "line for a single turn's own wall-clock rate, or per-token [TOKEN N] DEBUG lines "
+                     "excluding token 0 for a decode-only rate)\n",
+                     n_tokens_generated.load() / session_elapsed_s, session_elapsed_s);
         }
         LOG_INFO("RSS:                 %.2f GB\n", rss_gb());
         LOG_INFO("===================================================\n\n");

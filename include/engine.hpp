@@ -13,15 +13,35 @@
 #include <unordered_map>
 
 #ifdef __APPLE__
-// macOS doesn't have posix_fadvise; provide no-op stubs
+// macOS doesn't have posix_fadvise; provide no-op stubs. The function
+// definition must live INSIDE the same #ifndef as the constants (not after
+// it, unconditionally) -- gguf_loader.hpp (included above, transitively via
+// this file being included first almost everywhere) carries an identical
+// stub under the same POSIX_FADV_WILLNEED guard so the two can coexist in
+// one translation unit; leaving this one unconditional caused a duplicate-
+// definition build error the moment both headers landed together.
 #ifndef POSIX_FADV_WILLNEED
 #define POSIX_FADV_WILLNEED 3
 #define POSIX_FADV_DONTNEED 4
-#endif
 static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
+#endif
 #endif
 
 class CudaManager;  // forward decl — defined in cuda_manager.hpp; engine holds a pointer
+
+// Any single expert-slab pread(), or a single posix_memalign call in
+// ensure_slab_capacity, exceeding this is logged individually (tagged
+// [SLOW-PREAD] / [SLOW-HOST-ALLOC]). ~15ms is a normal full expert-slab
+// read at typical measured throughput, so 200ms is already >10x normal --
+// unambiguously anomalous, not routine variance. Added alongside
+// gpu_topology.hpp's SLOW_CACHE_MUTEX_WAIT_MS and async_prefetcher.hpp's
+// SLOW_MUTEX_WAIT_MS to root-cause a real multi-second single-cache-miss
+// stall (see RAMSafetyManager::get_expert's loaded_from_disk= log) whose
+// per-miss latency histogram had normal p50/p90 but extreme outliers --
+// ruling out general disk throughput and pointing at something blocking
+// intermittently. These three instrumentation points cover every place
+// that stall's ~40s could plausibly be hiding.
+constexpr double SLOW_PREAD_MS = 200.0;
 
 struct QuantizedTensor {
     GGUFTensor meta;
@@ -223,8 +243,15 @@ public:
     void ensure_slab_capacity(MoEExpertBlock& slot, size_t total) {
         PERF_START(alloc);
         if (slot.slab_capacity < total) {
+            auto t0 = std::chrono::high_resolution_clock::now();
             if (slot.slab_buffer) free(slot.slab_buffer);
             posix_memalign((void**)&slot.slab_buffer, 4096, total);
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            if (ms > 50.0) {
+                LOG_WARN("[SLOW-HOST-ALLOC] posix_memalign(%.2fMB) took %.2fms (old_capacity=%.2fMB)\n",
+                         total / 1e6, ms, slot.slab_capacity / 1e6);
+            }
             slot.slab_capacity = total;
         }
         PERF_END(alloc, t_host_alloc);
@@ -277,15 +304,31 @@ public:
             uint8_t* dst_down = target_slot.slab_buffer + gb + ub;
 
             PERF_START(disk);
-            auto read_slice = [this](const GGUFTensor& m, size_t rel_off, size_t bytes, uint8_t* dst, int l, int e) {
+            // Per-call timing + a [SLOW-PREAD] log for any individual read
+            // beyond SLOW_PREAD_MS -- added alongside the cache_mutex/
+            // staging_mutex instrumentation to root-cause a real multi-
+            // second single-miss stall. A genuinely slow pread() call would
+            // show up here explicitly (with layer/expert/proj/bytes/offset),
+            // ruling in or out "the raw disk read itself" as distinct from
+            // lock contention elsewhere in the miss-servicing path.
+            auto read_slice = [this](const GGUFTensor& m, size_t rel_off, size_t bytes, uint8_t* dst, int l, int e, const char* which) {
+                auto t0 = std::chrono::high_resolution_clock::now();
                 int fd = model_file.fd_for_tensor(m);
                 ssize_t r = pread(fd, dst, bytes, m.offset + rel_off);
+                double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
                 if (r < 0 || (size_t)r != bytes)
                     LOG_WARN("[WARN] packed expert short read L%d E%d: %zd/%zu\n", l, e, r, bytes);
+                if (ms > SLOW_PREAD_MS) {
+                    LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=%s bytes=%.2fMB offset=%llu "
+                             "took=%.2fms (%.2f MB/s)\n",
+                             l, e, which, bytes / 1e6, (unsigned long long)(m.offset + rel_off), ms,
+                             ms > 0 ? (bytes / 1e6) / (ms / 1000.0) : 0.0);
+                }
             };
-            read_slice(*gM, (size_t)expert_id * gb, gb, dst_gate, layer_idx, expert_id);
-            read_slice(*uM, (size_t)expert_id * ub, ub, dst_up,   layer_idx, expert_id);
-            read_slice(*dM, (size_t)expert_id * db, db, dst_down, layer_idx, expert_id);
+            read_slice(*gM, (size_t)expert_id * gb, gb, dst_gate, layer_idx, expert_id, "gate");
+            read_slice(*uM, (size_t)expert_id * ub, ub, dst_up,   layer_idx, expert_id, "up");
+            read_slice(*dM, (size_t)expert_id * db, db, dst_down, layer_idx, expert_id, "down");
             PERF_END(disk, t_disk_read);
             perf().bytes_disk_read.fetch_add(total, std::memory_order_relaxed);
 
@@ -326,11 +369,20 @@ public:
         PERF_END(alloc, t_host_alloc);
 
         PERF_START(disk);
+        auto _pread_t0 = std::chrono::high_resolution_clock::now();
         int slab_fd = model_file.fd_for_tensor(gate);
         ssize_t read_bytes = pread(slab_fd, target_slot.slab_buffer, total_chunk_size, gate.offset);
+        double _pread_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - _pread_t0).count();
         if (read_bytes < 0 || (size_t)read_bytes != total_chunk_size) {
             LOG_WARN("[WARN] Expert slab short read L%d E%d: %zd / %zu\n",
                      layer_idx, expert_id, read_bytes, total_chunk_size);
+        }
+        if (_pread_ms > SLOW_PREAD_MS) {
+            LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=legacy-slab bytes=%.2fMB offset=%llu "
+                     "took=%.2fms (%.2f MB/s)\n",
+                     layer_idx, expert_id, total_chunk_size / 1e6, (unsigned long long)gate.offset,
+                     _pread_ms, _pread_ms > 0 ? (total_chunk_size / 1e6) / (_pread_ms / 1000.0) : 0.0);
         }
         PERF_END(disk, t_disk_read);
         perf().bytes_disk_read.fetch_add(total_chunk_size, std::memory_order_relaxed);

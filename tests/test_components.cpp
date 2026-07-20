@@ -10,6 +10,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <random>
+#include <limits>
 #include "rope.hpp"   // the REAL, unit-tested RoPE (no CUDA / no AVX-512 deps)
 
 // ============================================================
@@ -806,6 +807,400 @@ static void test_iq2xxs_iq3xxs_dequant_logic() {
     std::cout << " PASSED\n";
 }
 
+// IQ2_S: block = d(2) + qs[64] + qh[8] + scales[8] = 82B/block. Same
+// methodology/caveat as test_iq2xxs_iq3xxs_dequant_logic above: synthetic
+// grid table (real ggml table data isn't available on this darwin machine),
+// verifies the bit-unpacking/indexing bookkeeping (grid-index assembly from
+// qs+qh, per-ib32 4-bit-pair scale split, sign-byte-overlaps-back-half-of-
+// qs layout) against an independently-written oracle -- not the real table
+// content, and can't cover the AVX-512 intrinsics (apply_grid_group8)
+// themselves, but does cover the higher-risk part.
+static void test_iq2s_dequant_logic() {
+    std::cout << "[TEST] IQ2_S dequant logic (oracle vs AVX-512 algorithm, scalar form)..." << std::flush;
+
+    uint64_t grid[1024];
+    for (int i = 0; i < 1024; ++i) {
+        uint64_t v = 0;
+        for (int b = 0; b < 8; ++b) v |= (uint64_t)(uint8_t)((i * 7 + b * 13 + 3) & 0xFF) << (8 * b);
+        grid[i] = v;
+    }
+    uint8_t kmask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+    auto oracle_iq2_s = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 82;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs = base + 2;
+            const uint8_t* qh = base + 2 + 64;
+            const uint8_t* scales = base + 2 + 64 + 8;
+            const uint8_t* signs = qs + 32;
+            float* yy = y + (size_t)i * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const float db0 = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+                const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    const float dl = (l / 2 == 0) ? db0 : db1;
+                    const uint32_t idx = qs[4 * ib32 + l] | (((uint32_t)qh[ib32] << (8 - 2 * l)) & 0x300);
+                    uint64_t g = grid[idx];
+                    const uint8_t* gb = (const uint8_t*)&g;
+                    uint8_t sg = signs[4 * ib32 + l];
+                    for (int j = 0; j < 8; ++j)
+                        yy[ib32 * 32 + l * 8 + j] = dl * (float)gb[j] * ((sg & kmask[j]) ? -1.f : 1.f);
+                }
+            }
+        }
+    };
+
+    auto candidate_iq2_s = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 82;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs     = base + 2;
+            const uint8_t* qh     = base + 2 + 64;
+            const uint8_t* scales = base + 2 + 64 + 8;
+            const uint8_t* signs  = qs + 32;
+            float* yy = y + (size_t)i * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;
+                const float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
+                const uint8_t* qs_ib = qs + 4 * ib32;
+                const uint8_t* signs_ib = signs + 4 * ib32;
+                for (int l = 0; l < 4; ++l) {
+                    const float dl = (l / 2 == 0) ? db0 : db1;
+                    const uint32_t idx = qs_ib[l] | (((uint32_t)qh[ib32] << (8 - 2 * l)) & 0x300);
+                    uint64_t g = grid[idx];
+                    uint8_t gb[8]; std::memcpy(gb, &g, 8);
+                    uint8_t sg = signs_ib[l];
+                    for (int j = 0; j < 8; ++j)
+                        yy[ib32 * 32 + l * 8 + j] = dl * (float)gb[j] * ((sg & kmask[j]) ? -1.f : 1.f);
+                }
+            }
+        }
+    };
+
+    std::mt19937 rng(9797);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    for (int elements : {256, 512, 1024}) {
+        int nb = elements / 256;
+        std::vector<uint8_t> bytes((size_t)nb * 82);
+        for (auto& b : bytes) b = (uint8_t)byte_dist(rng);
+        std::vector<float> y_oracle(elements), y_cand(elements);
+        oracle_iq2_s(bytes.data(), y_oracle.data(), elements);
+        candidate_iq2_s(bytes.data(), y_cand.data(), elements);
+        for (int i = 0; i < elements; ++i) {
+            assert(std::fabs(y_oracle[i] - y_cand[i]) < 1e-5f && "IQ2_S logic mismatch");
+        }
+    }
+
+    std::cout << " PASSED\n";
+}
+
+// Verifies the EXPERIMENTAL 16-wide dequant functions' pairing logic
+// (src/kernels_cpu.cpp's dequantize_row_iq{2_xxs,3_xxs,2_s}_avx512_wide):
+// that batching two 8-element groups into one 16-wide op produces IDENTICAL
+// output to doing them as two separate 8-element ops. Same methodology as
+// the other dequant logic tests above (synthetic grid table, scalar
+// oracle-vs-independently-written-candidate, can't cover the actual AVX-512
+// intrinsics on this darwin machine) -- "narrow" here mirrors the ALREADY-
+// tested 8-wide bookkeeping from the tests above; "wide" mirrors the NEW
+// paired bookkeeping, scalar form. A mismatch here would mean the pairing
+// itself (which l's go together, which db/signs apply to which half) is
+// wrong, independent of whether the real AVX-512 intrinsics are correct.
+static void test_iq2_wide_dequant_logic() {
+    std::cout << "[TEST] IQ2_XXS/IQ3_XXS/IQ2_S 16-wide pairing logic (narrow vs wide, scalar form)..." << std::flush;
+
+    uint64_t grid2[256], grid2s[1024];
+    uint32_t grid3[256];
+    for (int i = 0; i < 256; ++i) {
+        uint64_t v = 0;
+        for (int b = 0; b < 8; ++b) v |= (uint64_t)(uint8_t)((i * 7 + b * 13 + 3) & 0xFF) << (8 * b);
+        grid2[i] = v; grid3[i] = (uint32_t)v;
+    }
+    for (int i = 0; i < 1024; ++i) {
+        uint64_t v = 0;
+        for (int b = 0; b < 8; ++b) v |= (uint64_t)(uint8_t)((i * 11 + b * 17 + 5) & 0xFF) << (8 * b);
+        grid2s[i] = v;
+    }
+    uint8_t ksigns[128];
+    for (int i = 0; i < 128; ++i) ksigns[i] = (uint8_t)(i * 31 + 7);
+    uint8_t kmask[8] = {1, 2, 4, 8, 16, 32, 64, 128};
+
+    auto apply8 = [&](uint64_t g, uint8_t signs, float db, float* out) {
+        const uint8_t* gb = (const uint8_t*)&g;
+        for (int j = 0; j < 8; ++j) out[j] = db * (float)gb[j] * ((signs & kmask[j]) ? -1.f : 1.f);
+    };
+
+    // ---- IQ2_XXS: narrow (4 separate 8-wide calls) vs wide (2 paired 16-wide calls) ----
+    auto narrow_iq2_xxs = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 66;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs_bytes = base + 2;
+            float* yy = y + (size_t)i * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                uint16_t q0, q1, q2, q3;
+                std::memcpy(&q0, qs_bytes + (size_t)(4*ib32+0)*2, 2); std::memcpy(&q1, qs_bytes + (size_t)(4*ib32+1)*2, 2);
+                std::memcpy(&q2, qs_bytes + (size_t)(4*ib32+2)*2, 2); std::memcpy(&q3, qs_bytes + (size_t)(4*ib32+3)*2, 2);
+                uint32_t a0 = (uint32_t)q0 | ((uint32_t)q1 << 16), a1 = (uint32_t)q2 | ((uint32_t)q3 << 16);
+                uint8_t aux8[4]; std::memcpy(aux8, &a0, 4);
+                const float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    uint8_t signs = ksigns[(a1 >> (7 * l)) & 127];
+                    apply8(grid2[aux8[l]], signs, db, yy + ib32 * 32 + l * 8);
+                }
+            }
+        }
+    };
+    auto wide_iq2_xxs = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 66;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs_bytes = base + 2;
+            float* yy = y + (size_t)i * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                uint16_t q0, q1, q2, q3;
+                std::memcpy(&q0, qs_bytes + (size_t)(4*ib32+0)*2, 2); std::memcpy(&q1, qs_bytes + (size_t)(4*ib32+1)*2, 2);
+                std::memcpy(&q2, qs_bytes + (size_t)(4*ib32+2)*2, 2); std::memcpy(&q3, qs_bytes + (size_t)(4*ib32+3)*2, 2);
+                uint32_t a0 = (uint32_t)q0 | ((uint32_t)q1 << 16), a1 = (uint32_t)q2 | ((uint32_t)q3 << 16);
+                uint8_t aux8[4]; std::memcpy(aux8, &a0, 4);
+                const float db = d * (0.5f + (float)(a1 >> 28)) * 0.25f;
+                for (int pair = 0; pair < 2; ++pair) {
+                    int l0 = pair * 2, l1 = pair * 2 + 1;
+                    uint8_t s0 = ksigns[(a1 >> (7 * l0)) & 127], s1 = ksigns[(a1 >> (7 * l1)) & 127];
+                    apply8(grid2[aux8[l0]], s0, db, yy + ib32 * 32 + l0 * 8);
+                    apply8(grid2[aux8[l1]], s1, db, yy + ib32 * 32 + l1 * 8);
+                }
+            }
+        }
+    };
+
+    // ---- IQ3_XXS ----
+    auto narrow_iq3_xxs = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 98;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs = base + 2;
+            const uint8_t* sas0 = qs + 64;
+            float* yy = y + (size_t)i * 256;
+            const uint8_t* qptr = qs;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint8_t* sas = sas0 + 4 * ib32;
+                uint32_t aux32 = (uint32_t)sas[0] | ((uint32_t)sas[1] << 8) | ((uint32_t)sas[2] << 16) | ((uint32_t)sas[3] << 24);
+                const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+                for (int l = 0; l < 4; ++l) {
+                    uint8_t signs = ksigns[(aux32 >> (7 * l)) & 127];
+                    uint8_t comb[8];
+                    uint32_t g1 = grid3[qptr[2*l+0]], g2 = grid3[qptr[2*l+1]];
+                    std::memcpy(comb, &g1, 4); std::memcpy(comb + 4, &g2, 4);
+                    uint64_t g; std::memcpy(&g, comb, 8);
+                    apply8(g, signs, db, yy + ib32 * 32 + l * 8);
+                }
+                qptr += 8;
+            }
+        }
+    };
+    auto wide_iq3_xxs = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 98;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs = base + 2;
+            const uint8_t* sas0 = qs + 64;
+            float* yy = y + (size_t)i * 256;
+            const uint8_t* qptr = qs;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const uint8_t* sas = sas0 + 4 * ib32;
+                uint32_t aux32 = (uint32_t)sas[0] | ((uint32_t)sas[1] << 8) | ((uint32_t)sas[2] << 16) | ((uint32_t)sas[3] << 24);
+                const float db = d * (0.5f + (aux32 >> 28)) * 0.5f;
+                for (int pair = 0; pair < 2; ++pair) {
+                    int l0 = pair * 2, l1 = pair * 2 + 1;
+                    uint8_t s0 = ksigns[(aux32 >> (7 * l0)) & 127], s1 = ksigns[(aux32 >> (7 * l1)) & 127];
+                    uint8_t comb0[8], comb1[8];
+                    uint32_t g0a = grid3[qptr[2*l0+0]], g0b = grid3[qptr[2*l0+1]];
+                    uint32_t g1a = grid3[qptr[2*l1+0]], g1b = grid3[qptr[2*l1+1]];
+                    std::memcpy(comb0, &g0a, 4); std::memcpy(comb0 + 4, &g0b, 4);
+                    std::memcpy(comb1, &g1a, 4); std::memcpy(comb1 + 4, &g1b, 4);
+                    uint64_t gg0, gg1; std::memcpy(&gg0, comb0, 8); std::memcpy(&gg1, comb1, 8);
+                    apply8(gg0, s0, db, yy + ib32 * 32 + l0 * 8);
+                    apply8(gg1, s1, db, yy + ib32 * 32 + l1 * 8);
+                }
+                qptr += 8;
+            }
+        }
+    };
+
+    // ---- IQ2_S ----
+    auto narrow_iq2_s = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 82;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs = base + 2, *qh = base + 2 + 64, *scales = base + 2 + 64 + 8, *signs = qs + 32;
+            float* yy = y + (size_t)i * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const float db0 = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+                const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+                for (int l = 0; l < 4; ++l) {
+                    const float dl = (l / 2 == 0) ? db0 : db1;
+                    const uint32_t idx = qs[4*ib32+l] | (((uint32_t)qh[ib32] << (8 - 2*l)) & 0x300);
+                    apply8(grid2s[idx], signs[4*ib32+l], dl, yy + ib32 * 32 + l * 8);
+                }
+            }
+        }
+    };
+    auto wide_iq2_s = [&](const uint8_t* block, float* y, int64_t k) {
+        const int nb = (int)(k / 256);
+        for (int i = 0; i < nb; ++i) {
+            const uint8_t* base = block + (size_t)i * 82;
+            uint16_t dh; std::memcpy(&dh, base, 2);
+            float d = f16_bits_to_f32(dh);
+            const uint8_t* qs = base + 2, *qh = base + 2 + 64, *scales = base + 2 + 64 + 8, *signs = qs + 32;
+            float* yy = y + (size_t)i * 256;
+            for (int ib32 = 0; ib32 < 8; ++ib32) {
+                const float db0 = d * (0.5f + (scales[ib32] & 0xf)) * 0.25f;
+                const float db1 = d * (0.5f + (scales[ib32] >> 4)) * 0.25f;
+                for (int pair = 0; pair < 2; ++pair) {
+                    int l0 = pair * 2, l1 = pair * 2 + 1;
+                    const float dbp = (pair == 0) ? db0 : db1;
+                    const uint32_t idx0 = qs[4*ib32+l0] | (((uint32_t)qh[ib32] << (8 - 2*l0)) & 0x300);
+                    const uint32_t idx1 = qs[4*ib32+l1] | (((uint32_t)qh[ib32] << (8 - 2*l1)) & 0x300);
+                    apply8(grid2s[idx0], signs[4*ib32+l0], dbp, yy + ib32 * 32 + l0 * 8);
+                    apply8(grid2s[idx1], signs[4*ib32+l1], dbp, yy + ib32 * 32 + l1 * 8);
+                }
+            }
+        }
+    };
+
+    std::mt19937 rng(31337);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    for (int elements : {256, 512, 1024}) {
+        int nb = elements / 256;
+        std::vector<float> y_n(elements), y_w(elements);
+
+        std::vector<uint8_t> b2((size_t)nb * 66);
+        for (auto& b : b2) b = (uint8_t)byte_dist(rng);
+        narrow_iq2_xxs(b2.data(), y_n.data(), elements);
+        wide_iq2_xxs(b2.data(), y_w.data(), elements);
+        for (int i = 0; i < elements; ++i) assert(y_n[i] == y_w[i] && "IQ2_XXS wide pairing mismatch");
+
+        std::vector<uint8_t> b3((size_t)nb * 98);
+        for (auto& b : b3) b = (uint8_t)byte_dist(rng);
+        narrow_iq3_xxs(b3.data(), y_n.data(), elements);
+        wide_iq3_xxs(b3.data(), y_w.data(), elements);
+        for (int i = 0; i < elements; ++i) assert(y_n[i] == y_w[i] && "IQ3_XXS wide pairing mismatch");
+
+        std::vector<uint8_t> b2s((size_t)nb * 82);
+        for (auto& b : b2s) b = (uint8_t)byte_dist(rng);
+        narrow_iq2_s(b2s.data(), y_n.data(), elements);
+        wide_iq2_s(b2s.data(), y_w.data(), elements);
+        for (int i = 0; i < elements; ++i) assert(y_n[i] == y_w[i] && "IQ2_S wide pairing mismatch");
+    }
+
+    std::cout << " PASSED\n";
+}
+
+// ============================================================
+// Test 8: fp32_to_bf16 / bf16_to_fp32 round-trip (kquant_dequant.hpp)
+// ============================================================
+// Minimal inline copy (kquant_dequant.hpp itself pulls in <cuda_runtime.h>,
+// unavailable on this darwin dev machine -- same "re-implement the logic
+// under test inline" pattern as every other test in this file). Added as
+// part of a careful, test-gated retry of the attn_output BF16 fast-path
+// after a real run produced NaN corruption on real hardware (see
+// CLAUDE.md's incident writeup) -- the actual GPU-side suspect there was
+// cublasGemmEx's mismatched-type dispatch (covered by src/main_test.cpp's
+// Test 9, which needs real CUDA), but this rounding math is the one piece
+// of that feature that's fully portable and verifiable right here, so no
+// reason to leave it merely "reviewed, not run" when it can genuinely be
+// run.
+static inline float test_bf16_to_fp32(uint16_t b) {
+    uint32_t u = ((uint32_t)b) << 16;
+    float f; std::memcpy(&f, &u, sizeof(f));
+    return f;
+}
+static inline uint16_t test_fp32_to_bf16(float f) {
+    uint32_t u; std::memcpy(&u, &f, sizeof(u));
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);  // NaN: keep quiet
+    uint32_t rounding_bias = 0x00007fffu + ((u >> 16) & 1u);
+    return (uint16_t)((u + rounding_bias) >> 16);
+}
+
+void test_bf16_roundtrip_logic() {
+    std::cout << "[TEST] fp32_to_bf16/bf16_to_fp32 round-trip logic..." << std::flush;
+
+    // Exact-in-bf16 values (powers of two, zero) must round-trip bit-exact.
+    for (float exact : {0.0f, 1.0f, -1.0f, 2.0f, 0.5f, -0.5f, 128.0f, -128.0f}) {
+        uint16_t b = test_fp32_to_bf16(exact);
+        float back = test_bf16_to_fp32(b);
+        assert(back == exact && "exact power-of-two value did not round-trip bit-exact");
+    }
+    // -0.0f: sign bit must survive (distinguishable from +0.0f via memcmp,
+    // even though -0.0f == 0.0f numerically).
+    {
+        uint16_t b = test_fp32_to_bf16(-0.0f);
+        float back = test_bf16_to_fp32(b);
+        uint32_t back_bits; std::memcpy(&back_bits, &back, sizeof(back_bits));
+        assert(back_bits == 0x80000000u && "-0.0f lost its sign bit");
+    }
+
+    // Idempotence: re-encoding an already-bf16-representable value (i.e.
+    // one that came FROM a bf16_to_fp32 call) must reproduce the exact same
+    // bf16 bits -- this is the real correctness property upload_dequantized
+    // needs (only ever encodes fresh f32 values, but if the pair weren't
+    // mutually consistent, a real dequant bug could hide behind it).
+    std::mt19937 rng(2024);
+    std::uniform_real_distribution<float> dist(-1000.0f, 1000.0f);
+    for (int i = 0; i < 100000; ++i) {
+        float f = dist(rng);
+        uint16_t b1 = test_fp32_to_bf16(f);
+        float back = test_bf16_to_fp32(b1);
+        uint16_t b2 = test_fp32_to_bf16(back);
+        assert(b1 == b2 && "re-encoding a bf16-rounded value changed its bits (not idempotent)");
+
+        // Rounding error bound: bf16 has 8 bits of significant precision
+        // (1 implicit + 7 explicit mantissa), so relative error must be
+        // within 2^-8 (one full mantissa ULP), generously bounded here.
+        if (f != 0.0f) {
+            float rel_err = std::abs((double)back - (double)f) / std::abs((double)f);
+            assert(rel_err < (1.0f / 256.0f) && "bf16 rounding error exceeded one mantissa ULP");
+        }
+    }
+
+    // NaN in -> NaN out (quiet), never silently becomes a finite garbage value.
+    {
+        float nan_in = std::numeric_limits<float>::quiet_NaN();
+        uint16_t b = test_fp32_to_bf16(nan_in);
+        float back = test_bf16_to_fp32(b);
+        assert(std::isnan(back) && "NaN input did not round-trip to NaN");
+    }
+
+    // Round-half-to-even: a value exactly halfway between two representable
+    // bf16 values must round to the EVEN one, not always up or always down.
+    // 1.0f's bf16 mantissa is all-zero (even); construct a value whose low
+    // 16 bits are exactly 0x8000 (the halfway point) relative to 1.0f and
+    // confirm it rounds back down to 1.0f (already-even), not up.
+    {
+        uint32_t half_bits = 0x3f800000u | 0x8000u;  // 1.0f with the low 16 bits set to the halfway pattern
+        float half; std::memcpy(&half, &half_bits, sizeof(half));
+        uint16_t b = test_fp32_to_bf16(half);
+        assert(b == 0x3f80u && "round-half-to-even did not round a halfway value to the even mantissa");
+    }
+
+    std::cout << " PASSED\n";
+}
+
 int main() {
     std::cout << "=== MoEStream Component Tests ===\n";
     test_reasoning_parser();
@@ -817,6 +1212,9 @@ int main() {
     test_toml_parser();
     test_q2k_q3k_dequant_logic();
     test_iq2xxs_iq3xxs_dequant_logic();
+    test_iq2s_dequant_logic();
+    test_iq2_wide_dequant_logic();
+    test_bf16_roundtrip_logic();
     std::cout << "\nAll tests PASSED.\n";
     return 0;
 }

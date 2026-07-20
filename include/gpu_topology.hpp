@@ -10,8 +10,42 @@
 #include <iomanip>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
+#include <utility>
 #include "perf_timer.hpp"
 #include "logger.hpp"
+
+// Any wait to acquire cache_mutex exceeding this is logged individually
+// (tagged [SLOW-CACHE-MUTEX-WAIT]) -- companion to async_prefetcher.hpp's
+// SLOW_MUTEX_WAIT_MS for staging_mutex. Both added together to root-cause a
+// real, reproducible multi-second (up to 7.5s observed) single-cache-miss
+// stall whose per-miss latency histogram ruled out raw disk throughput as
+// the cause (median/p90 were completely normal -- only a handful of calls
+// were catastrophic, the signature of blocking on contention, not slow I/O).
+// cache_mutex is shared between the main decode thread's inline hit-
+// triggered promotions (RAMSafetyManager::get_expert Step 1 -- fires on
+// nearly every hit when promote_hit_threshold is low) and the async
+// prefetcher worker thread's own background promotions/evictions.
+constexpr double SLOW_CACHE_MUTEX_WAIT_MS = 50.0;
+
+// Acquire cache_mutex into `varname` while timing how long the acquisition
+// itself blocked -- logs + accumulates into perf().t_cache_mutex_wait on a
+// slow wait. A wait here (as opposed to slow work AFTER acquiring) directly
+// proves cross-thread contention, since cache_mutex is recursive (same-
+// thread re-entry, e.g. upload_expert calling find_expert internally, is
+// always near-instant and won't trip the threshold).
+#define GPU_TOPO_TIMED_LOCK(varname) \
+    auto _lock_wait_t0_##varname = std::chrono::high_resolution_clock::now(); \
+    std::lock_guard<std::recursive_mutex> varname(cache_mutex); \
+    do { \
+        double _wait_ms = std::chrono::duration<double, std::milli>( \
+            std::chrono::high_resolution_clock::now() - _lock_wait_t0_##varname).count(); \
+        PerfCounters::atomic_add(perf().t_cache_mutex_wait, _wait_ms / 1000.0); \
+        if (_wait_ms > SLOW_CACHE_MUTEX_WAIT_MS) { \
+            LOG_WARN("[SLOW-CACHE-MUTEX-WAIT] %s blocked %.2fms acquiring cache_mutex\n", \
+                     __func__, _wait_ms); \
+        } \
+    } while (0)
 
 enum class GpuRole {
     CoreEngine,   // Dense layers + KV cache + activation state (newest arch / lower VRAM)
@@ -62,8 +96,23 @@ struct ExpertLocation {
     // hit_count crosses RAMSafetyManager::pin_threshold (proven-hot within
     // this conversation), or at startup for the pre-loaded hot set from a
     // usage-file profile (cross-conversation). Only mutated under
-    // cache_mutex, same as every other field here.
+    // cache_mutex, same as every other field here. PERMANENT -- never
+    // cleared once set (except defensively when a slot is freed/reused).
     bool pinned = false;
+
+    // Reference-counted, TEMPORARY eviction protection -- distinct from
+    // `pinned` above, which is permanent. Held for the scope of exactly one
+    // decode-time GPU dispatch (see expert_ffn_resolve_gpu_loc's cold-miss
+    // branch in execution_layer.cpp): incremented right after a synchronous
+    // upload_expert() call confirms this slot's data is present, decremented
+    // only after expert_ffn_gpu_finish's cudaStreamSynchronize(0) confirms
+    // every kernel reading this slot (gate/up/down) has actually finished.
+    // Reference-counted rather than a boolean so it can never incorrectly
+    // un-protect a slot that's ALSO independently, permanently `pinned`, and
+    // so nothing breaks if this is ever called re-entrantly for the same
+    // slot. A slot with temp_pin_count > 0 must never be chosen as an
+    // eviction victim, same as `pinned` -- see evict_lru.
+    int temp_pin_count = 0;
 
     // Blended recency+frequency score used for eviction: a frequently-hit
     // expert resists eviction even after a burst of newer accesses touches
@@ -100,6 +149,22 @@ public:
     // upload_expert()/upload_expert_async() call find_expert()/evict_lru()
     // internally on the same thread while already holding the lock.
     mutable std::recursive_mutex cache_mutex;
+
+    // Cache-churn diagnostics: per-(layer,expert) swap in/out counts for the
+    // VRAM tier, so a shutdown report can answer "which experts are being
+    // repeatedly evicted and reloaded, and are they pinned or not" -- the
+    // question colibri's own profile-driven pinned tier is designed to
+    // avoid paying for at all. Keyed dynamically (not a dense n_layers*
+    // n_experts array like StreamingEngine::route_freq) since GpuTopology
+    // doesn't know those dimensions itself. Mutated only from evict_lru/
+    // upload_expert/upload_expert_async, all of which already hold
+    // cache_mutex for their whole body (GPU_TOPO_TIMED_LOCK), so no
+    // additional synchronization is needed here.
+    struct SwapStats { uint64_t swap_in = 0; uint64_t swap_out = 0; };
+    std::unordered_map<uint64_t, SwapStats> vram_swap_stats;
+    static uint64_t swap_key(int layer, int expert_id) {
+        return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert_id;
+    }
 
     // Pinned host buffer for cross-device transfers
     float* h_xfer_pinned = nullptr;
@@ -223,7 +288,7 @@ public:
     // nullptr — including when a background async promotion is still in
     // flight (so callers never read a partially-copied slab).
     ExpertLocation* find_expert(int layer, int expert_id) {
-        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        GPU_TOPO_TIMED_LOCK(lock);
         for (auto& loc : expert_vram_cache) {
             if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr) {
                 if (!loc.upload_ready) {
@@ -265,7 +330,7 @@ public:
     // Deliberately does NOT bump hit_count/last_used_clock the way
     // find_expert does -- pinning is a policy action, not a real access.
     bool pin_expert(int layer, int expert_id) {
-        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        GPU_TOPO_TIMED_LOCK(lock);
         for (auto& loc : expert_vram_cache) {
             if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr) {
                 if (!loc.pinned) {
@@ -278,11 +343,52 @@ public:
         return false;
     }
 
+    // TEMPORARY eviction protection for the scope of one decode-time GPU
+    // dispatch -- see ExpertLocation::temp_pin_count's comment for the full
+    // reasoning (distinct from pin_expert's PERMANENT pinning above;
+    // reference-counted so the two can never incorrectly interfere).
+    // Caller contract: hold_for_compute() must be called only after a
+    // synchronous upload_expert() (not the _async variant) has confirmed
+    // this slot's data is actually present -- this function does not upload
+    // anything itself, it only marks an ALREADY-resident slot un-evictable.
+    // Returns false if the expert isn't resident (caller error -- upload
+    // first). Every successful hold_for_compute() must be matched by
+    // exactly one release_hold() once the caller's GPU kernels are
+    // confirmed done reading this slot (cudaStreamSynchronize), or the slot
+    // leaks as permanently un-evictable.
+    bool hold_for_compute(int layer, int expert_id) {
+        GPU_TOPO_TIMED_LOCK(lock);
+        for (auto& loc : expert_vram_cache) {
+            if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr) {
+                loc.temp_pin_count++;
+                return true;
+            }
+        }
+        return false;
+    }
+    void release_hold(int layer, int expert_id) {
+        GPU_TOPO_TIMED_LOCK(lock);
+        for (auto& loc : expert_vram_cache) {
+            if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr) {
+                if (loc.temp_pin_count > 0) loc.temp_pin_count--;
+                return;
+            }
+        }
+        // No match: the slot's identity changed between hold and release,
+        // which should be IMPOSSIBLE by construction (evict_lru must never
+        // pick a temp_pin_count > 0 slot as a victim -- see below). Loud,
+        // not silent, since a mismatched hold/release is exactly the class
+        // of bug this mechanism exists to prevent.
+        LOG_ERROR("[MOE-VRAM]  release_hold found no matching resident slot for layer=%d expert=%d "
+                  "-- a temp-pinned slot's identity changed while held, which should never happen\n",
+                  layer, expert_id);
+    }
+
     // Evict lowest recency+frequency score and return a free slot for a new
     // expert upload. The slot's device_ptr is pre-assigned (slab offset),
     // ready for cudaMemcpy.
     ExpertLocation* evict_lru(size_t needed_bytes) {
-        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        GPU_TOPO_TIMED_LOCK(lock);
         (void)needed_bytes; // All slots are fixed-size in slab allocator
         ExpertLocation* victim = nullptr;
         for (auto& loc : expert_vram_cache) {
@@ -296,19 +402,31 @@ public:
             // eviction_score, which a fresh in-flight slot satisfies same
             // as any other -- last_used_clock/hit_count don't reflect
             // "copy not done yet").
-            if (loc.pinned || !loc.upload_ready) {
+            // Never evict a permanently pinned slot, a TEMPORARILY held one
+            // (decode-time GPU dispatch with kernels still in flight --
+            // see ExpertLocation::temp_pin_count), or one whose async
+            // upload is still in flight.
+            if (loc.pinned || loc.temp_pin_count > 0 || !loc.upload_ready) {
                 if (loc.pinned) perf().n_pinned_eviction_skips.fetch_add(1, std::memory_order_relaxed);
+                if (loc.temp_pin_count > 0) perf().n_temp_pin_eviction_skips.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             if (!victim || loc.eviction_score() < victim->eviction_score()) victim = &loc;
         }
         if (victim) {
+            // Record the swap-out BEFORE clearing identity below -- an empty
+            // slot being claimed (layer_idx == -1) isn't a real eviction of
+            // anything, so it's deliberately excluded from churn stats.
+            if (victim->layer_idx != -1) {
+                vram_swap_stats[swap_key(victim->layer_idx, victim->expert_id)].swap_out++;
+            }
             victim->layer_idx = -1;
             victim->expert_id = -1;
             victim->last_used_clock = 0;
             victim->hit_count = 0;
             victim->upload_ready = true;
-            victim->pinned = false;  // defensive: a freed slot must never carry a stale pin
+            victim->pinned = false;       // defensive: a freed slot must never carry a stale pin
+            victim->temp_pin_count = 0;   // defensive: same for the temporary hold count
         }
         return victim;
     }
@@ -325,7 +443,7 @@ public:
     // free (no eviction), unlike promoting into a full cache which always
     // costs displacing some other expert.
     bool has_free_slot() const {
-        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        GPU_TOPO_TIMED_LOCK(lock);
         for (const auto& loc : expert_vram_cache) {
             if (loc.layer_idx == -1) return true;
         }
@@ -337,7 +455,7 @@ public:
     ExpertLocation* upload_expert(int layer, int expert_id,
                                    const uint8_t* host_data, size_t bytes) {
         if (expert_vram_cache_cap == 0 || !host_data || bytes == 0) return nullptr;
-        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        GPU_TOPO_TIMED_LOCK(lock);
 
         // Check if already cached
         ExpertLocation* existing = find_expert(layer, expert_id);
@@ -361,6 +479,7 @@ public:
         slot->layer_idx = layer;
         slot->expert_id = expert_id;
         slot->last_used_clock = ++cache_clock;
+        vram_swap_stats[swap_key(layer, expert_id)].swap_in++;
         return slot;
     }
 
@@ -373,7 +492,7 @@ public:
     ExpertLocation* upload_expert_async(int layer, int expert_id,
                                          const uint8_t* host_data, size_t bytes) {
         if (expert_vram_cache_cap == 0 || !host_data || bytes == 0) return nullptr;
-        std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+        GPU_TOPO_TIMED_LOCK(lock);
 
         ExpertLocation* existing = find_expert(layer, expert_id);
         if (existing) return existing;
@@ -395,6 +514,7 @@ public:
         slot->layer_idx = layer;
         slot->expert_id = expert_id;
         slot->last_used_clock = ++cache_clock;
+        vram_swap_stats[swap_key(layer, expert_id)].swap_in++;
         return slot;
     }
 
@@ -503,7 +623,7 @@ public:
         std::vector<int> resident_count(n_layers, 0);
         std::vector<uint64_t> hit_sum(n_layers, 0);
         {
-            std::lock_guard<std::recursive_mutex> lock(cache_mutex);
+            GPU_TOPO_TIMED_LOCK(lock);
             for (const auto& loc : expert_vram_cache) {
                 if (loc.layer_idx < 0 || loc.layer_idx >= n_layers) continue;
                 resident_count[loc.layer_idx]++;
@@ -523,5 +643,55 @@ public:
         }
         os << "\n";
         LOG_DEBUG("%s", os.str().c_str());
+    }
+
+    // Shutdown-time summary of VRAM-tier cache churn: which experts were
+    // swapped in/out the most, and -- the actionable part -- which of those
+    // are NOT currently pinned, i.e. paying repeated H2D/eviction cost with
+    // no protection. This is the direct counterpart to colibri's own
+    // profile-driven pinned tier, which by design never pays this cost more
+    // than once per expert (upload at startup, never evicted). A high-churn,
+    // unpinned entry here is a concrete candidate for a lower pin_threshold
+    // or a larger pin_topk_per_layer preload. Call once at shutdown, after
+    // generation has finished (no locking -- nothing else is touching
+    // expert_vram_cache/vram_swap_stats by then).
+    void report_cache_churn(int top_n = 15) const {
+        if (vram_swap_stats.empty()) {
+            LOG_STREAM_INFO() << "[CACHE-CHURN] VRAM tier: no swap activity recorded.\n";
+            return;
+        }
+        uint64_t total_in = 0, total_out = 0;
+        for (const auto& kv : vram_swap_stats) { total_in += kv.second.swap_in; total_out += kv.second.swap_out; }
+        LOG_STREAM_INFO() << "[CACHE-CHURN] VRAM tier: " << vram_swap_stats.size()
+                           << " distinct experts touched, " << total_in << " swap-ins / "
+                           << total_out << " swap-outs this session.\n";
+
+        std::vector<std::pair<uint64_t, SwapStats>> sorted(vram_swap_stats.begin(), vram_swap_stats.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return (a.second.swap_in + a.second.swap_out) > (b.second.swap_in + b.second.swap_out);
+        });
+
+        LOG_STREAM_INFO() << "[CACHE-CHURN] Top " << top_n
+                           << " most-churned VRAM experts NOT currently pinned "
+                              "(paying repeated swap cost with no protection):\n";
+        int shown = 0;
+        for (const auto& kv : sorted) {
+            if (shown >= top_n) break;
+            int layer = (int)(kv.first >> 32), expert_id = (int)(kv.first & 0xFFFFFFFFu);
+            bool resident_now = false, pinned_now = false;
+            for (const auto& loc : expert_vram_cache) {
+                if (loc.layer_idx == layer && loc.expert_id == expert_id) {
+                    resident_now = true; pinned_now = loc.pinned; break;
+                }
+            }
+            if (pinned_now) continue;  // already protected -- not an actionable entry
+            LOG_STREAM_INFO() << "  layer=" << layer << " expert=" << expert_id
+                               << ": swap_in=" << kv.second.swap_in << " swap_out=" << kv.second.swap_out
+                               << (resident_now ? " (resident now, unpinned)" : " (not resident now)") << "\n";
+            shown++;
+        }
+        if (shown == 0) {
+            LOG_STREAM_INFO() << "  (every high-churn expert is already pinned)\n";
+        }
     }
 };

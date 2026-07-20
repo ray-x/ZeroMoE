@@ -304,6 +304,7 @@ void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k) {
 extern "C" {
     const void* ms_grid_iq2xxs();
     const void* ms_grid_iq3xxs();
+    const void* ms_grid_iq2s();
     const void* ms_grid_ksigns_iq2xs();
     const void* ms_grid_kmask_iq2xs();
 }
@@ -314,6 +315,10 @@ static const uint64_t* iq2xxs_grid_ptr() {
 }
 static const uint32_t* iq3xxs_grid_ptr() {
     static const uint32_t* p = (const uint32_t*)ms_grid_iq3xxs(); // [256]
+    return p;
+}
+static const uint64_t* iq2s_grid_ptr() {
+    static const uint64_t* p = (const uint64_t*)ms_grid_iq2s(); // [1024]
     return p;
 }
 static const uint8_t* ksigns_iq2xs_ptr() {
@@ -446,6 +451,281 @@ void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
                 apply_grid_group8(combined, signs, kmask_vec, db, yy + ib32 * 32 + l * 8);
             }
             qptr += 8;
+        }
+    }
+}
+
+// Verbatim port of cuda/iq2_matmul.cu's dequant_iq2_s_block (itself a
+// verbatim port of ggml's dequantize_row_iq2_s), cross-checked against that
+// already-verified, already-running CUDA kernel rather than derived fresh
+// from ggml's source -- same methodology as the IQ2_XXS/IQ3_XXS ports
+// above. Reuses apply_grid_group8 unchanged for the actual vectorized
+// grid-lookup + sign-flip application; only the per-l grid-index and
+// sign-byte computation differs from IQ2_XXS (IQ2_S packs its qh "high
+// bits" and per-ib32 4-bit-pair scales in separate arrays, and its sign
+// bytes overlap the BACK half of its own qs array rather than being folded
+// into an aux32 word like IQ2_XXS -- see block_iq2_s_cu's field layout in
+// the CUDA file for the exact byte offsets this mirrors: d(2) + qs[64] +
+// qh[8] + scales[8] = 82 bytes/block, matching IQ2_S's 2.5625 bits/weight).
+// Added specifically because a direct throughput benchmark (main_test.cpp's
+// bench_cpu_dequant_matmul) measured this type's PREVIOUS scalar fallback
+// (ggml_dequant_row) at roughly 11x slower per byte than the already-
+// vectorized IQ2_XXS/IQ3_XXS types on the same hardware.
+void dequantize_row_iq2_s_avx512(const uint8_t* block, float* y, int64_t k) {
+    static std::atomic<bool> logged{false};
+    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_s_avx512 is live\n");
+
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 82; // d(2) + qs[64] + qh[8] + scales[8]
+    const int64_t nb = k / QK_K;
+
+    const uint64_t* grid_tbl = iq2s_grid_ptr(); // [1024]
+    __m256i kmask_vec = kmask_iq2xs_vec32();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* base = block + (size_t)i * BLOCK_BYTES;
+        uint16_t d_half; std::memcpy(&d_half, base, 2);
+        const float d = fp16_to_fp32(d_half);
+        const uint8_t* qs     = base + 2;        // [64]
+        const uint8_t* qh     = base + 2 + 64;   // [8]
+        const uint8_t* scales = base + 2 + 64 + 8; // [8]
+        const uint8_t* signs  = qs + 32;         // back half of qs (ggml's overlap layout)
+
+        float* yy = y + (size_t)i * QK_K;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;
+            const float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
+            const uint8_t* qs_ib = qs + 4 * ib32;
+            const uint8_t* signs_ib = signs + 4 * ib32;
+
+            for (int l = 0; l < 4; ++l) {
+                const float dl = (l / 2 == 0) ? db0 : db1;
+                const uint32_t idx = qs_ib[l] | (((uint32_t)qh[ib32] << (8 - 2 * l)) & 0x300);
+                uint64_t g = grid_tbl[idx];
+                uint8_t grid_bytes[8];
+                std::memcpy(grid_bytes, &g, 8);
+                apply_grid_group8(grid_bytes, signs_ib[l], kmask_vec, dl, yy + ib32 * 32 + l * 8);
+            }
+        }
+    }
+}
+
+// ============================================================
+// EXPERIMENTAL: real 512-bit (16-lane) widened siblings of
+// apply_grid_group8/dequantize_row_iq{2_xxs,3_xxs,2_s}_avx512.
+//
+// apply_grid_group8 processes one 8-element grid group using __m256 (256-
+// bit AVX2 width) -- CLAUDE.md's original justification was "the dominant
+// cost is the data-dependent grid/sign table loads, not raw ALU
+// throughput," so 8-wide was assumed sufficient. Revisited after a direct
+// throughput benchmark (main_test.cpp Test 8) found the ALREADY-vectorized
+// IQ2_XXS/IQ3_XXS/IQ2_S types only reach ~1-3 GB/s on the target machine,
+// vs colibri's own measured 6-23 GB/s for its (structurally simpler, plain
+// int4) format -- a gap too large to keep assuming ALU width is a non-
+// factor without actually testing it.
+//
+// Deliberately NOT wired into dequant_row()'s dispatch and does NOT modify
+// apply_grid_group8 or the three existing dequantize_row_iq*_avx512
+// functions above in any way -- those stay exactly as they are, already
+// verified on real hardware. These are NEW, ADDITIVE functions specifically
+// so they can be independently throughput-benchmarked (added to Test 8)
+// and correctness-verified (a new local logic test, same methodology as
+// every other dequant addition this session) BEFORE ever being considered
+// for the real dispatch path. Do not wire these into dequant_row() until
+// both (a) the local logic test passes and (b) Test 8 shows this actually
+// beats the 8-wide version on real hardware -- if it doesn't, the original
+// "ALU width isn't the bottleneck" assumption was right after all, and
+// these should simply not be used.
+// ============================================================
+
+// Widened kmask: the same 8-entry table, duplicated across both 8-lane
+// halves of one 16-lane register -- built once, cached, exactly mirroring
+// kmask_iq2xs_vec32()'s own caching pattern.
+static __m512i kmask_iq2xs_vec32_16() {
+    static __m512i v = [] {
+        const uint8_t* kmask8 = (const uint8_t*)ms_grid_kmask_iq2xs();
+        int32_t tmp[16];
+        for (int j = 0; j < 8; ++j) { tmp[j] = (int32_t)kmask8[j]; tmp[j + 8] = (int32_t)kmask8[j]; }
+        return _mm512_loadu_si512((const void*)tmp);
+    }();
+    return v;
+}
+
+// Applies a per-lane sign flip + scale to TWO 8-byte grid entries (16
+// output floats) in ONE 512-bit operation, instead of two separate 8-wide
+// apply_grid_group8 calls. db_lo/db_hi let the two halves use DIFFERENT
+// scale factors (needed for IQ2_S/IQ2_XS's db0/db1 alternation every 2
+// groups within a super-block; pass the same value twice for IQ2_XXS/
+// IQ3_XXS, which use one scale across all 4 groups). Same algorithm as
+// apply_grid_group8, just doubled in width -- zero-extend bytes to i32
+// lanes BEFORE any shift/compare (same reasoning as the existing Q2_K/Q3_K
+// AVX-512 unpack: never operate on tightly-packed bytes directly, or a
+// shift can bleed bits in from a neighboring byte).
+static inline void apply_grid_group16(const uint8_t* grid16, uint8_t signs_lo, uint8_t signs_hi,
+                                       __m512i kmask_vec32_16, float db_lo, float db_hi, float* out) {
+    __m128i g = _mm_loadu_si128((const __m128i*)grid16);        // 16 bytes
+    __m512i gi32 = _mm512_cvtepu8_epi32(g);                     // 16 x i32, zero-extended
+    __m512 gf = _mm512_cvtepi32_ps(gi32);                       // 16 x float
+
+    __m256i signs_lo_bcast = _mm256_set1_epi32((int32_t)signs_lo);
+    __m256i signs_hi_bcast = _mm256_set1_epi32((int32_t)signs_hi);
+    __m512i signs_bcast = _mm512_inserti32x8(_mm512_castsi256_si512(signs_lo_bcast), signs_hi_bcast, 1);
+
+    __m512i andres = _mm512_and_si512(signs_bcast, kmask_vec32_16);
+    __mmask16 bit_clear = _mm512_cmpeq_epi32_mask(andres, _mm512_setzero_si512()); // 1 where bit CLEAR (positive case)
+
+    __m256 db_lo_bcast = _mm256_set1_ps(db_lo);
+    __m256 db_hi_bcast = _mm256_set1_ps(db_hi);
+    __m512 db_vec = _mm512_insertf32x8(_mm512_castps256_ps512(db_lo_bcast), db_hi_bcast, 1);
+
+    __m512 pos = _mm512_mul_ps(db_vec, gf);
+    __m512 neg = _mm512_sub_ps(_mm512_setzero_ps(), pos);
+    __m512 res = _mm512_mask_blend_ps(bit_clear, neg, pos); // bit_clear(1) -> pos, else -> neg
+    _mm512_storeu_ps(out, res);
+}
+
+void dequantize_row_iq2_xxs_avx512_wide(const uint8_t* block, float* y, int64_t k) {
+    static std::atomic<bool> logged{false};
+    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_xxs_avx512_wide is live\n");
+
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 66;
+    const int64_t nb = k / QK_K;
+
+    const uint64_t* grid_tbl = iq2xxs_grid_ptr();
+    const uint8_t* ksigns = ksigns_iq2xs_ptr();
+    __m512i kmask_vec16 = kmask_iq2xs_vec32_16();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* base = block + (size_t)i * BLOCK_BYTES;
+        uint16_t d_half; std::memcpy(&d_half, base, 2);
+        const float d = fp16_to_fp32(d_half);
+        const uint8_t* qs_bytes = base + 2;
+
+        float* yy = y + (size_t)i * QK_K;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            uint16_t q0, q1, q2, q3;
+            std::memcpy(&q0, qs_bytes + (size_t)(4 * ib32 + 0) * 2, 2);
+            std::memcpy(&q1, qs_bytes + (size_t)(4 * ib32 + 1) * 2, 2);
+            std::memcpy(&q2, qs_bytes + (size_t)(4 * ib32 + 2) * 2, 2);
+            std::memcpy(&q3, qs_bytes + (size_t)(4 * ib32 + 3) * 2, 2);
+            uint32_t aux32_0 = (uint32_t)q0 | ((uint32_t)q1 << 16);
+            uint32_t aux32_1 = (uint32_t)q2 | ((uint32_t)q3 << 16);
+            uint8_t aux8[4];
+            std::memcpy(aux8, &aux32_0, 4);
+            const float db = d * (0.5f + (float)(aux32_1 >> 28)) * 0.25f;
+
+            // All 4 l-groups in this ib32 share the SAME db -- pair
+            // l=(0,1) and l=(2,3) into two 16-wide ops instead of four
+            // 8-wide ones.
+            for (int pair = 0; pair < 2; ++pair) {
+                int l0 = pair * 2, l1 = pair * 2 + 1;
+                uint64_t g0 = grid_tbl[aux8[l0]];
+                uint64_t g1 = grid_tbl[aux8[l1]];
+                uint8_t grid16[16];
+                std::memcpy(grid16, &g0, 8);
+                std::memcpy(grid16 + 8, &g1, 8);
+                uint8_t signs0 = ksigns[(aux32_1 >> (7 * l0)) & 127];
+                uint8_t signs1 = ksigns[(aux32_1 >> (7 * l1)) & 127];
+                apply_grid_group16(grid16, signs0, signs1, kmask_vec16, db, db, yy + ib32 * 32 + l0 * 8);
+            }
+        }
+    }
+}
+
+void dequantize_row_iq3_xxs_avx512_wide(const uint8_t* block, float* y, int64_t k) {
+    static std::atomic<bool> logged{false};
+    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq3_xxs_avx512_wide is live\n");
+
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 98;
+    const int64_t nb = k / QK_K;
+
+    const uint32_t* grid_tbl = iq3xxs_grid_ptr();
+    const uint8_t* ksigns = ksigns_iq2xs_ptr();
+    __m512i kmask_vec16 = kmask_iq2xs_vec32_16();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* base = block + (size_t)i * BLOCK_BYTES;
+        uint16_t d_half; std::memcpy(&d_half, base, 2);
+        const float d = fp16_to_fp32(d_half);
+        const uint8_t* qs = base + 2;
+        const uint8_t* scales_and_signs = qs + 64;
+
+        float* yy = y + (size_t)i * QK_K;
+        const uint8_t* qptr = qs;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const uint8_t* sas = scales_and_signs + 4 * ib32;
+            uint32_t aux32 = (uint32_t)sas[0] | ((uint32_t)sas[1] << 8) |
+                             ((uint32_t)sas[2] << 16) | ((uint32_t)sas[3] << 24);
+            const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+
+            // Each l-group is itself two 4-byte grid entries (grid1/grid2,
+            // output[0..3]/[4..7]) -- combine BOTH l-groups of a pair into
+            // one 16-wide op: l0's grid1+grid2 (8 bytes) + l1's grid1+grid2
+            // (8 bytes) = 16 bytes, same db for both (all 4 l's share db).
+            for (int pair = 0; pair < 2; ++pair) {
+                int l0 = pair * 2, l1 = pair * 2 + 1;
+                uint32_t g0a = grid_tbl[qptr[2 * l0 + 0]], g0b = grid_tbl[qptr[2 * l0 + 1]];
+                uint32_t g1a = grid_tbl[qptr[2 * l1 + 0]], g1b = grid_tbl[qptr[2 * l1 + 1]];
+                uint8_t grid16[16];
+                std::memcpy(grid16 + 0, &g0a, 4);
+                std::memcpy(grid16 + 4, &g0b, 4);
+                std::memcpy(grid16 + 8, &g1a, 4);
+                std::memcpy(grid16 + 12, &g1b, 4);
+                uint8_t signs0 = ksigns[(aux32 >> (7 * l0)) & 127];
+                uint8_t signs1 = ksigns[(aux32 >> (7 * l1)) & 127];
+                apply_grid_group16(grid16, signs0, signs1, kmask_vec16, db, db, yy + ib32 * 32 + l0 * 8);
+            }
+            qptr += 8;
+        }
+    }
+}
+
+void dequantize_row_iq2_s_avx512_wide(const uint8_t* block, float* y, int64_t k) {
+    static std::atomic<bool> logged{false};
+    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_s_avx512_wide is live\n");
+
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 82;
+    const int64_t nb = k / QK_K;
+
+    const uint64_t* grid_tbl = iq2s_grid_ptr();
+    __m512i kmask_vec16 = kmask_iq2xs_vec32_16();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* base = block + (size_t)i * BLOCK_BYTES;
+        uint16_t d_half; std::memcpy(&d_half, base, 2);
+        const float d = fp16_to_fp32(d_half);
+        const uint8_t* qs     = base + 2;
+        const uint8_t* qh     = base + 2 + 64;
+        const uint8_t* scales = base + 2 + 64 + 8;
+        const uint8_t* signs  = qs + 32;
+
+        float* yy = y + (size_t)i * QK_K;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const float db0 = d * (0.5f + (float)(scales[ib32] & 0xf)) * 0.25f;
+            const float db1 = d * (0.5f + (float)(scales[ib32] >> 4)) * 0.25f;
+            const uint8_t* qs_ib = qs + 4 * ib32;
+            const uint8_t* signs_ib = signs + 4 * ib32;
+
+            // l=(0,1) both use db0, l=(2,3) both use db1 -- this pairing
+            // is exactly the natural db0/db1 split, so each 16-wide op
+            // needs only ONE scale value (db_lo==db_hi), same as the other
+            // two types above, just for a different structural reason.
+            for (int pair = 0; pair < 2; ++pair) {
+                int l0 = pair * 2, l1 = pair * 2 + 1;
+                const float dbp = (pair == 0) ? db0 : db1;
+                const uint32_t idx0 = qs_ib[l0] | (((uint32_t)qh[ib32] << (8 - 2 * l0)) & 0x300);
+                const uint32_t idx1 = qs_ib[l1] | (((uint32_t)qh[ib32] << (8 - 2 * l1)) & 0x300);
+                uint64_t g0 = grid_tbl[idx0];
+                uint64_t g1 = grid_tbl[idx1];
+                uint8_t grid16[16];
+                std::memcpy(grid16, &g0, 8);
+                std::memcpy(grid16 + 8, &g1, 8);
+                apply_grid_group16(grid16, signs_ib[l0], signs_ib[l1], kmask_vec16, dbp, dbp,
+                                    yy + ib32 * 32 + l0 * 8);
+            }
         }
     }
 }

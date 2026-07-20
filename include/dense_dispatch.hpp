@@ -51,6 +51,18 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
     //    (fused kernel for K-quants/IQ, cuBLAS for F32/F16/BF16/Q8_0) when no
     //    fast-path buffer was built for this weight (not attempted, or didn't
     //    fit in the VRAM budget at load time).
+    //
+    //    REVERTED FROM BF16 (see CLAUDE.md): a real run produced garbage
+    //    output ("Hello! I'm the GLM model behind[PAD154879]..." repeating)
+    //    after switching this to GGUFType::BF16. No coding bug was found on
+    //    static review of the conversion math or dispatch routing; leading
+    //    unconfirmed suspicion is cublasGemmEx with mismatched input types
+    //    (Atype=CUDA_R_16BF weight, Btype=CUDA_R_32F activations) not being a
+    //    genuinely correct/supported combination for this entry point.
+    //    Reverted to the known-good F32 path pending real-hardware
+    //    investigation -- do not re-enable BF16 here without first
+    //    confirming (on Linux/CUDA) that cublas_dense_matmul's BF16 branch
+    //    alone produces correct output on a synthetic, non-degenerate test.
     if (!cpu_only_mode() && engine.gpu && W.gpu_fast_ptr &&
         engine.gpu->dense_matmul_host(GGUFType::F32, W.gpu_fast_ptr, x, y, S, I, O)) {
         return;

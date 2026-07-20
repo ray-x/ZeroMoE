@@ -69,6 +69,19 @@ struct EngineConfig {
     std::string pin_file = ".moestream_usage";
     int pin_topk_per_layer = 0;
 
+    // How many OMP threads RAMSafetyManager::get_experts_batch uses to
+    // parallelize the disk reads for one token's genuine (non-PIPE-served)
+    // host-cache misses within a single layer's topk selection. Default 4,
+    // chosen from a direct empirical measurement on the target machine
+    // (colibri's iobench.c microbenchmark against the real model file):
+    // buffered reads scaled ~8.5x from 1->4 threads (1.53 -> 13.12 GB/s)
+    // then flattened (8 threads: 12.30 GB/s, no further gain) -- 4 captures
+    // essentially the full available win on this hardware's real queue
+    // depth without over-provisioning threads that would only add
+    // contention against the OMP-parallel CPU dequant path running
+    // elsewhere. Re-run iobench.c on a different machine/drive to re-tune.
+    int expert_fetch_threads = 4;
+
     // Logging. Empty log_path (default) keeps everything on stderr, matching
     // prior behavior. log_level filters by severity: VERBOSE shows
     // high-volume structural traces (e.g. per-layer hidden-state norms
@@ -255,6 +268,7 @@ inline bool EngineConfig::load(const std::string& path) {
     pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
     pin_file         = doc.root.get_str("pin_file", pin_file);
     pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
+    expert_fetch_threads = doc.root.get_int("expert_fetch_threads", expert_fetch_threads);
     log_path         = doc.root.get_str("log_path", log_path);
     log_level        = doc.root.get_str("log_level", log_level);
 
@@ -369,6 +383,7 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Pin file: " << (pin_file.empty() ? "(preload disabled)" : pin_file)
               << " | top-" << (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto"))
               << "/layer\n";
+    LOG_STREAM_INFO() << "[CONFIG] Expert fetch threads: " << expert_fetch_threads << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Verbose MoE cache logging: " << (verbose_moe_log ? "on" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level
                << " | Log path: " << (log_path.empty() ? "(stderr)" : log_path) << "\n";
@@ -418,6 +433,13 @@ pin_file = ".moestream_usage"
 # pin_topk_per_layer: how many of each layer's hottest experts to preload.
 # 0 = auto-size to fill available VRAM expert-cache capacity.
 pin_topk_per_layer = 0
+
+# expert_fetch_threads: OMP threads used to parallelize disk reads for one
+# token's genuine (non-PIPE-served) cache misses within a layer's topk
+# selection. Default 4 -- tune with colibri's iobench.c microbenchmark
+# against your own model file/drive (buffered reads, increasing thread
+# count until throughput stops scaling) rather than assuming this value.
+expert_fetch_threads = 4
 
 # Logging. Empty log_path (default) keeps everything on stderr.
 # log_level: "VERBOSE" | "DEBUG" | "INFO" (default) | "WARN" | "ERROR"

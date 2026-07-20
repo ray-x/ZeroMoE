@@ -15,6 +15,7 @@
 #include <vector>
 #include <algorithm>
 #include <expected>
+#include <chrono>
 
 class GGUFGraphInitializer {
 public:
@@ -40,6 +41,7 @@ void print_usage() {
               << "  --promote-threshold <N>  Number of host re-hits before async H2D promote (default: 1)\n"
               << "  --pin-threshold <N>  VRAM-resident hit_count before pinning (never evicted; default: 8, 0=off)\n"
               << "  --pin-file <file>  Usage-frequency file for VRAM hot-set preload (default: .moestream_usage)\n"
+              << "  --expert-fetch-threads <N>  OMP threads for parallel disk reads of a layer's topk cache misses (default: 4)\n"
               << "  --log-path <file>  Redirect logging to a file instead of stderr\n"
               << "  --log-level <lvl>  VERBOSE | DEBUG | INFO (default) | WARN | ERROR\n"
               << "  --help           Show this help interface\n";
@@ -61,6 +63,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     ram_mgr.promote_hit_threshold = (uint32_t)config.promote_hit_threshold;
     ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
     ram_mgr.verbose_cache_log = config.verbose_moe_log;
+    ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
     if (config.dense_gpu_idx >= 0)
         gpu.device_id = config.gpus[config.dense_gpu_idx].device_id;
     if (!gpu.initialize()) {
@@ -194,36 +197,77 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // works today at its original quant size and must not regress) — layers
     // that don't fit just keep using the existing (slower but correct) fused
     // Q5_K/K-quant/IQ kernel path, exactly like today.
+    //
+    // (A BF16 variant of this was tried and REVERTED -- see CLAUDE.md and
+    // upload_dequantized_f32's own comment in cuda_manager.hpp: it produced
+    // real NaN corruption on real hardware. Back to F32-only pending
+    // real-hardware root-causing of the BF16 path.)
     auto is_attn_output = [](const std::string& name) {
         return name.find("attn_output.weight") != std::string::npos;
     };
     constexpr size_t POOL_ALIGN = 256;
     std::vector<QuantizedTensor*> attn_output_candidates;
     size_t non_attn_output_pool_bytes = 0;
+    // Worst-case reservation: what the regular dense pool would need if NONE
+    // of attn_output converts (every candidate stays at its original
+    // quantized size) -- computed with the SAME aligned-accumulation as
+    // non_attn_output_pool_bytes / the real pool_bytes_needed below, so this
+    // reservation and the real pool sizing agree on what "fits" means.
+    size_t attn_output_quantized_total = 0;
     for (auto& [name, tensor] : engine.resident_layers) {
         if (!tensor.host_ptr || !is_dense_offload_candidate(name)) continue;
         if (is_attn_output(name)) {
             attn_output_candidates.push_back(&tensor);
+            attn_output_quantized_total = (attn_output_quantized_total + POOL_ALIGN - 1) & ~(POOL_ALIGN - 1);
+            attn_output_quantized_total += tensor.meta.size_bytes;
             continue;
         }
         non_attn_output_pool_bytes = (non_attn_output_pool_bytes + POOL_ALIGN - 1) & ~(POOL_ALIGN - 1);
         non_attn_output_pool_bytes += tensor.meta.size_bytes;
     }
 
+    // BUG FIXED: this budget used to be sized against non_attn_output_pool_bytes
+    // ALONE -- i.e. it implicitly assumed every attn_output layer would end up
+    // converted (needing zero room in the regular pool), when in practice the
+    // greedy loop below only converts as many as fit. The ones left behind
+    // still need their full quantized bytes in the regular dense pool later,
+    // but that need was never reserved for here -- so the regular pool
+    // allocation could (and on a real run, did: "requested 13.58 GB" against
+    // ~10GB actually free) come up short, spilling hundreds of tensors to the
+    // CPU fallback. Fixed by reserving the WORST CASE (nothing converts) up
+    // front, then spending only each conversion's NET extra cost (F32 bytes
+    // minus the quantized bytes it frees from that worst-case reservation) --
+    // see the loop below. This guarantees pool_bytes_needed (computed later)
+    // plus every fast-path F32 allocation together can never exceed
+    // free_before_fast_path - FAST_PATH_SAFETY_MARGIN, regardless of how many
+    // layers convert.
+    size_t worst_case_pool_bytes = non_attn_output_pool_bytes + attn_output_quantized_total;
     constexpr size_t FAST_PATH_SAFETY_MARGIN = (size_t)1 << 30;  // 1 GB, matches the dense-pool backoff's own margin style
     size_t free_before_fast_path = gpu.core_free_vram_bytes();
     size_t fast_path_budget =
-        (free_before_fast_path > non_attn_output_pool_bytes + FAST_PATH_SAFETY_MARGIN)
-        ? (free_before_fast_path - non_attn_output_pool_bytes - FAST_PATH_SAFETY_MARGIN)
+        (free_before_fast_path > worst_case_pool_bytes + FAST_PATH_SAFETY_MARGIN)
+        ? (free_before_fast_path - worst_case_pool_bytes - FAST_PATH_SAFETY_MARGIN)
         : 0;
 
     int fast_converted = 0, fast_skipped = 0;
-    size_t fast_bytes_used = 0;
+    size_t fast_bytes_used = 0;    // gross F32 bytes actually allocated (for the log line only)
+    size_t budget_spent = 0;       // NET budget consumed: sum of (f32_bytes - quant_bytes) over converted layers
     for (QuantizedTensor* qt : attn_output_candidates) {
-        size_t remaining = (fast_path_budget > fast_bytes_used) ? (fast_path_budget - fast_bytes_used) : 0;
-        if (gpu.upload_dequantized_f32(*qt, remaining)) {
+        size_t quant_bytes = qt->meta.size_bytes;
+        size_t f32_bytes_estimate = (size_t)qt->meta.shape[0] * (size_t)qt->meta.shape[1] * sizeof(float);
+        size_t net_cost = (f32_bytes_estimate > quant_bytes) ? (f32_bytes_estimate - quant_bytes) : 0;
+        size_t remaining_net_budget = (fast_path_budget > budget_spent) ? (fast_path_budget - budget_spent) : 0;
+        if (net_cost > remaining_net_budget) { ++fast_skipped; continue; }
+        // upload_dequantized_f32 itself checks the GROSS f32 size against
+        // whatever's passed here -- pass the real remaining free VRAM (ground
+        // truth), not the net-budget figure, since the two are different
+        // units (net_cost already accounts for the pool-side saving that
+        // ground-truth free VRAM doesn't know about).
+        size_t remaining_free_vram = gpu.core_free_vram_bytes();
+        if (gpu.upload_dequantized_f32(*qt, remaining_free_vram)) {
             ++fast_converted;
-            fast_bytes_used += (size_t)qt->meta.shape[0] * (size_t)qt->meta.shape[1] * sizeof(float);
+            fast_bytes_used += f32_bytes_estimate;
+            budget_spent += net_cost;
         } else {
             ++fast_skipped;
         }
@@ -231,7 +275,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     LOG_STREAM_INFO() << "[CUDA] attn_output fast-path (F32 dequant + cuBLAS): "
               << fast_converted << " layer(s) converted (" << fast_bytes_used / 1e9
               << " GB), " << fast_skipped << " layer(s) kept on the slower fused kernel"
-              << " (budget was " << fast_path_budget / 1e9 << " GB).\n";
+              << " (net budget was " << fast_path_budget / 1e9 << " GB, worst-case pool reservation "
+              << worst_case_pool_bytes / 1e9 << " GB).\n";
 
     // Pass 1: collect the REMAINING candidates (fast-path attn_output layers
     // excluded — they don't need a quantized VRAM copy anymore) and total the
@@ -364,6 +409,14 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
     std::cout << "Use ':q' to exit execution loop cleanly.\n\n";
 
+    // Real wall-clock anchor for perf().dump_report()'s final Throughput
+    // line -- spans every turn in this session (not just one request),
+    // starting AFTER model load (reported separately as "Dense load
+    // (init)") so it isolates generation time specifically. See
+    // dump_report()'s own comment for why this replaced a broken
+    // summed-perf-counter calculation that double-counted concurrent work.
+    auto session_start = std::chrono::high_resolution_clock::now();
+
     std::string user_input;
     while (true) {
         if (g_shutdown_requested.load(std::memory_order_relaxed)) break;
@@ -423,7 +476,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // Best-effort, matches dump_usage's own contract (a failed write just
     // logs and continues -- not worth failing shutdown over).
     engine.dump_usage(config.pin_file);
-    perf().dump_report();
+
+    // Cache-churn summary for both tiers: which experts were swapped in/out
+    // the most, and (VRAM only, since that's the only tier with a pinning
+    // mechanism) which of those are still unpinned -- the direct, per-
+    // expert answer to "which of colibri's advantages are we not getting".
+    // Safe without locking here: prefetcher.stop() above has already joined
+    // the worker thread, so nothing else touches these structures now.
+    ram_mgr.report_cache_churn();
+    gpu.topology.report_cache_churn();
+
+    double session_elapsed_s = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - session_start).count();
+    perf().dump_report(session_elapsed_s);
     return {};
 }
 
@@ -437,6 +502,7 @@ int main(int argc, char* argv[]) {
     int promote_threshold_cli = -1;
     int pin_threshold_cli = -1;
     std::string pin_file_cli;
+    int expert_fetch_threads_cli = -1;
     int max_ctx = 4096;
     int max_new_tokens = 1024;
     int gpu_id = 0;
@@ -462,6 +528,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--promote-threshold" && i + 1 < argc) promote_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-threshold" && i + 1 < argc) pin_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-file" && i + 1 < argc) pin_file_cli = argv[++i];
+        else if (arg == "--expert-fetch-threads" && i + 1 < argc) expert_fetch_threads_cli = std::stoi(argv[++i]);
         else if (arg == "--log-path" && i + 1 < argc) log_path_cli = argv[++i];
         else if (arg == "--log-level" && i + 1 < argc) log_level_cli = argv[++i];
         else if (arg == "--temp" && i + 1 < argc) temp_cli = std::stof(argv[++i]);
@@ -509,6 +576,7 @@ int main(int argc, char* argv[]) {
     if (promote_threshold_cli > 0) config.promote_hit_threshold = promote_threshold_cli;
     if (pin_threshold_cli >= 0) config.pin_threshold = pin_threshold_cli;
     if (!pin_file_cli.empty()) config.pin_file = pin_file_cli;
+    if (expert_fetch_threads_cli > 0) config.expert_fetch_threads = expert_fetch_threads_cli;
     if (!log_path_cli.empty()) config.log_path = log_path_cli;
     if (!log_level_cli.empty()) config.log_level = log_level_cli;
     if (temp_cli >= 0.0f) config.temperature = temp_cli;

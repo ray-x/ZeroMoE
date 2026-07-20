@@ -11,6 +11,9 @@
 #include <vector>
 #include <string>
 #include <cmath>
+#include <algorithm>  // std::find (get_experts_batch's claimed_this_batch guard)
+#include <unordered_map>
+#include <utility>
 #include <fcntl.h>
 #include <unistd.h>
 #ifdef __APPLE__
@@ -47,12 +50,33 @@ public:
     // into the VRAM expert cache. Default 1 (promote on first re-hit).
     uint32_t promote_hit_threshold = 1;
 
+    // OMP thread count for get_experts_batch's parallel disk-read phase.
+    // Tuned empirically via colibri's iobench.c against the real model file
+    // on the target machine: buffered reads scaled ~8.5x from 1->4 threads,
+    // then flattened (8 threads: no further gain) -- see engine_config.hpp's
+    // expert_fetch_threads field for the full measurement.
+    int expert_fetch_threads = 4;
+
     // Frequency-aware eviction: blend recency with hit_count so a
     // power-law "always hot" expert survives bursts of cold accesses to
     // other experts. Decayed periodically to avoid permanent stickiness.
     static constexpr uint64_t FREQ_BONUS_TICKS = 64;
     static constexpr uint32_t HIT_DECAY_INTERVAL = 4096;
     uint64_t hits_since_decay = 0;
+
+    // Cache-churn diagnostics: per-(layer,expert) swap in (disk load) / out
+    // (eviction) counts for the host RAM tier -- the counterpart to
+    // GpuTopology::vram_swap_stats. Unlike the VRAM tier, this tier has no
+    // pinning mechanism at all (RAMSafetyManager never protects a slot from
+    // eviction), so the report below is churn-only, not an "unpinned"
+    // callout. Mutated only from get_expert/get_experts_batch, both called
+    // exclusively from the single decode thread (src/execution_layer.cpp)
+    // -- never the prefetcher worker thread -- so no lock is needed.
+    struct SwapStats { uint64_t swap_in = 0; uint64_t swap_out = 0; };
+    std::unordered_map<uint64_t, SwapStats> ram_swap_stats;
+    static uint64_t swap_key(int layer, int expert_id) {
+        return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert_id;
+    }
 
     static uint64_t eviction_score(const MoEExpertBlock& b) {
         return b.last_used_clock + (uint64_t)b.hit_count * FREQ_BONUS_TICKS;
@@ -233,6 +257,9 @@ public:
 
         MoEExpertBlock& victim = layer_slots[lru_idx];
         int evicted_expert_id = victim.expert_id;
+        if (evicted_expert_id != -1) {
+            ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
+        }
 
         if (victim.expert_id != -1 && engine.drop_expert_pages) {
             std::string base = "blk." + std::to_string(layer) + ".";
@@ -279,6 +306,7 @@ public:
             std::chrono::high_resolution_clock::now() - _perf_expert_disk_load).count();
         victim.last_used_clock = ++global_clock;
         victim.hit_count = 0;  // fresh identity in this slot, reset frequency signal
+        ram_swap_stats[swap_key(layer, expert_id)].swap_in++;
 
         LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%d evicted=%d loaded_from_disk=%.2fms via=%s (%.2f MB, %.2f GB/s)\n",
                   layer, expert_id, lru_idx, evicted_expert_id, load_ms,
@@ -290,6 +318,218 @@ public:
         // hot yet (hit_count starts at 0). It will be promoted asynchronously
         // by Step 1 above once it's actually re-hit (PROMOTE_HIT_THRESHOLD).
         return &victim;
+    }
+
+    // Batched sibling of get_expert(), for fetching one token's ENTIRE topk
+    // selection within a single layer at once. Motivated by a direct
+    // measurement (colibri's iobench.c against the real model file on the
+    // real target machine): buffered reads scale ~8.5x from 1->4 concurrent
+    // threads on this hardware (1.53 -> 13.12 GB/s), which single-expert
+    // get_expert()'s strictly-sequential one-pread-at-a-time loop (the
+    // caller's original `for (k) get_expert(...)`) never exploits — every
+    // miss pays its full read latency before the next one even starts.
+    //
+    // Split into two phases:
+    //   Phase A (sequential): for each k, either service a host-cache HIT
+    //     (identical logic to get_expert's Step 1 — no I/O, must stay
+    //     single-threaded since it's the only part touching shared LRU
+    //     state) or CLAIM a victim slot for a miss (Step 3's eviction pick
+    //     + identity/recency stamp, moved BEFORE the actual read) and try
+    //     the PIPE staged-consume fast path (a mutex+memcpy, not a real
+    //     disk read, so it stays sequential too — cheap either way).
+    //   Phase B (parallel): for whatever PIPE didn't already have staged,
+    //     run the actual pread via engine.load_expert_slab across
+    //     expert_fetch_threads OMP threads. Safe with ZERO extra
+    //     synchronization because Phase A already gave each miss its OWN,
+    //     explicitly-distinct slot (see claimed_this_batch below) before
+    //     any thread starts reading — same reasoning colibri's own PIPE
+    //     pool uses (claim identity serially, then load in parallel with
+    //     no further per-job locking).
+    //
+    // out[k] is valid (non-null, correct identity) the moment this call
+    // returns for every k — Phase B has already completed by then, so
+    // callers see the exact same synchronous-completion contract
+    // get_expert() has always had, just serviced faster.
+    void get_experts_batch(StreamingEngine& engine, int layer, const int* expert_ids, int topk,
+                           MoEExpertBlock** out) {
+        auto& layer_slots = engine.layers_experts[layer];
+        size_t cap = layer_slots.empty() ? 0
+            : std::min(layer_slots.size(), (size_t)std::max(1, slots_per_layer));
+
+        struct PendingLoad { size_t slot_idx; int expert_id; int evicted_expert_id; int k; double load_ms; };
+        std::vector<PendingLoad> pending;
+        pending.reserve(topk);
+        // Slots this batch has already claimed as a miss's victim -- an
+        // EXPLICIT correctness guard (not just probabilistic) against two
+        // misses in the same batch landing on the same slot. In practice
+        // this is already astronomically unlikely on its own: claiming
+        // stamps last_used_clock to a fresh ++global_clock immediately, so
+        // a just-claimed slot's eviction_score becomes the local maximum
+        // and won't be picked again by a later k's scan. But two Phase-B
+        // threads writing the same slab_buffer concurrently would silently
+        // corrupt data with no crash to catch it, so this is enforced
+        // directly rather than relied upon.
+        std::vector<size_t> claimed_this_batch;
+        claimed_this_batch.reserve(topk);
+
+        // --- Phase A: sequential hit-check + miss-claim (+ PIPE attempt) ---
+        for (int k = 0; k < topk; ++k) {
+            int expert_id = expert_ids[k];
+            bool found = false;
+            for (size_t si = 0; si < cap; ++si) {
+                auto& slot = layer_slots[si];
+                if (slot.expert_id == expert_id) {
+                    // -- identical to get_expert's Step 1 --
+                    slot.last_used_clock = ++global_clock;
+                    if (slot.hit_count < UINT32_MAX) slot.hit_count++;
+                    if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts(engine);
+                    perf().n_expert_cache_hit.fetch_add(1, std::memory_order_relaxed);
+                    if (verbose_cache_log) {
+                        LOG_DEBUG("[MOE-CACHE] HIT   layer=%d expert=%d hit_count=%u\n",
+                                  layer, expert_id, slot.hit_count);
+                    }
+                    bool gpu_capable = gpu_type_supported(slot.gate_proj.meta.type)
+                                     && gpu_type_supported(slot.up_proj.meta.type)
+                                     && gpu_type_supported(slot.down_proj.meta.type);
+                    if (vram_cache && slot.slab_buffer && gpu_capable && slot.hit_count >= promote_hit_threshold) {
+                        ExpertLocation* resident = vram_cache->find_expert(layer, expert_id);
+                        if (!resident) {
+                            LOG_DEBUG("[MOE-VRAM]  PROMOTE layer=%d expert=%d hit_count=%u -> async H2D upload (%.2f MB)\n",
+                                      layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
+                            vram_cache->upload_expert_async(layer, expert_id, slot.slab_buffer, slot.slab_capacity);
+                        } else if (pin_threshold > 0 && slot.hit_count >= pin_threshold) {
+                            vram_cache->pin_expert(layer, expert_id);
+                        }
+                    }
+                    out[k] = &slot;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) continue;
+
+            // -- miss: claim a victim slot (Step 3's eviction pick, minus
+            // an already-claimed-this-batch exclusion), same as get_expert
+            // but WITHOUT the actual read yet --
+            perf().n_expert_cache_miss.fetch_add(1, std::memory_order_relaxed);
+
+            int lru_idx = -1;
+            for (size_t i = 0; i < cap; ++i) {
+                if (std::find(claimed_this_batch.begin(), claimed_this_batch.end(), i) != claimed_this_batch.end())
+                    continue;
+                if (lru_idx < 0 || eviction_score(layer_slots[i]) < eviction_score(layer_slots[lru_idx])) lru_idx = i;
+            }
+            if (lru_idx < 0) {
+                // cap < remaining misses this batch -- every active slot for
+                // this layer is already claimed by an EARLIER k in the SAME
+                // batch. Only possible if slots_per_layer < topk (an
+                // extremely small RAM budget), never expected in normal
+                // operation. Falls back to slot 0, which means this k WILL
+                // collide with whichever earlier k also claimed slot 0 --
+                // logged loudly since that's a real correctness-relevant
+                // event worth knowing about if it ever fires, not silently
+                // swallowed the way get_expert's own single-expert path
+                // (which has no equivalent "already claimed" concept at all)
+                // would never surface it.
+                LOG_WARN("[BATCH-FETCH] layer=%d: ran out of distinct cache slots mid-batch "
+                         "(slots_per_layer=%d < topk=%d) -- falling back to slot 0, which may "
+                         "collide with an earlier pick in this same batch\n",
+                         layer, slots_per_layer, topk);
+                lru_idx = 0;
+            }
+            claimed_this_batch.push_back((size_t)lru_idx);
+
+            MoEExpertBlock& victim = layer_slots[lru_idx];
+            int evicted_expert_id = victim.expert_id;
+            if (evicted_expert_id != -1) {
+                ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
+            }
+
+            if (victim.expert_id != -1 && engine.drop_expert_pages) {
+                std::string base = "blk." + std::to_string(layer) + ".";
+                std::string gate_name = base + "ffn_gate." + std::to_string(victim.expert_id) + ".weight";
+                std::string down_name = base + "ffn_down." + std::to_string(victim.expert_id) + ".weight";
+                auto git = engine.model_file.tensors.find(gate_name);
+                auto dit = engine.model_file.tensors.find(down_name);
+                if (git != engine.model_file.tensors.end() && dit != engine.model_file.tensors.end()) {
+                    size_t total_chunk = (dit->second.offset + dit->second.size_bytes) - git->second.offset;
+                    posix_fadvise(engine.model_file.fd_for_tensor(git->second), git->second.offset, total_chunk, POSIX_FADV_DONTNEED);
+                }
+            }
+
+            // Claim identity + freshen recency IMMEDIATELY (not after the
+            // read) -- this is what makes it safe for a LATER k in this
+            // batch to scan past this slot without re-picking it (belt-
+            // and-suspenders alongside claimed_this_batch above).
+            victim.expert_id = expert_id;
+            victim.last_used_clock = ++global_clock;
+            victim.hit_count = 0;
+
+            PERF_START(expert_disk_load);
+            bool served_from_pipe = false;
+            if (prefetcher) {
+                size_t gb, ub, db;
+                const GGUFTensor *gM, *uM, *dM;
+                if (engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
+                    size_t total = gb + ub + db;
+                    engine.ensure_slab_capacity(victim, total);
+                    PERF_START(consume);
+                    size_t got_bytes = 0;
+                    bool ok = prefetcher->consume_staged(layer, expert_id, victim.slab_buffer, victim.slab_capacity, &got_bytes);
+                    PERF_END(consume, t_consume_staged);
+                    if (ok && got_bytes == total) {
+                        engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
+                        served_from_pipe = true;
+                        perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            out[k] = &victim;
+            if (served_from_pipe) {
+                ram_swap_stats[swap_key(layer, expert_id)].swap_in++;
+                double load_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - _perf_expert_disk_load).count();
+                LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%d evicted=%d loaded_from_disk=%.2fms via=PIPE (%.2f MB, %.2f GB/s)\n",
+                          layer, expert_id, lru_idx, evicted_expert_id, load_ms,
+                          victim.slab_capacity / 1e6,
+                          load_ms > 0 ? (victim.slab_capacity / 1e9) / (load_ms / 1000.0) : 0.0);
+            } else {
+                pending.push_back({(size_t)lru_idx, expert_id, evicted_expert_id, k, 0.0});
+            }
+        }
+
+        // --- Phase B: parallel disk reads for whatever PIPE didn't already
+        // have staged. Each pending entry owns a DISTINCT, already-claimed
+        // slot (guaranteed by claimed_this_batch above), so this is safe
+        // with no additional synchronization. ---
+        int n_pending = (int)pending.size();
+        if (n_pending > 0) {
+            int nthreads = std::max(1, std::min(expert_fetch_threads, n_pending));
+            #pragma omp parallel for num_threads(nthreads) schedule(dynamic, 1)
+            for (int i = 0; i < n_pending; ++i) {
+                PendingLoad& pl = pending[i];
+                MoEExpertBlock& victim = layer_slots[pl.slot_idx];
+                auto t0 = std::chrono::high_resolution_clock::now();
+                engine.load_expert_slab(layer, pl.expert_id, victim);
+                pl.load_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+            }
+            // Logging (and swap-in accounting -- ram_swap_stats is a plain
+            // unordered_map, unsafe to mutate from the parallel region above)
+            // stays sequential, outside the parallel region.
+            for (int i = 0; i < n_pending; ++i) {
+                PendingLoad& pl = pending[i];
+                MoEExpertBlock& victim = layer_slots[pl.slot_idx];
+                ram_swap_stats[swap_key(layer, pl.expert_id)].swap_in++;
+                LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%zu evicted=%d loaded_from_disk=%.2fms via=pread "
+                          "(%.2f MB, %.2f GB/s) [batch=%d/%d]\n",
+                          layer, pl.expert_id, pl.slot_idx, pl.evicted_expert_id, pl.load_ms,
+                          victim.slab_capacity / 1e6,
+                          pl.load_ms > 0 ? (victim.slab_capacity / 1e9) / (pl.load_ms / 1000.0) : 0.0,
+                          i + 1, n_pending);
+            }
+        }
     }
 
     // Text heatmap of the HOST RAM expert cache's logical fill state, per
@@ -329,5 +569,39 @@ public:
         }
         os << "\n";
         LOG_DEBUG("%s", os.str().c_str());
+    }
+
+    // Shutdown-time summary of host-RAM-tier cache churn: which experts were
+    // loaded from disk and evicted again the most. Unlike GpuTopology's
+    // report_cache_churn, there's no "pinned" qualifier to check here -- this
+    // tier has no pinning mechanism at all, so every entry is inherently
+    // unprotected. A high count here represents real, repeated disk-read
+    // cost (each swap-in past the first is a re-fetch of data this process
+    // already read once before). Call once at shutdown; no locking needed
+    // (single decode thread only, see ram_swap_stats' own comment).
+    void report_cache_churn(int top_n = 15) const {
+        if (ram_swap_stats.empty()) {
+            LOG_STREAM_INFO() << "[CACHE-CHURN] Host RAM tier: no swap activity recorded.\n";
+            return;
+        }
+        uint64_t total_in = 0, total_out = 0;
+        for (const auto& kv : ram_swap_stats) { total_in += kv.second.swap_in; total_out += kv.second.swap_out; }
+        LOG_STREAM_INFO() << "[CACHE-CHURN] Host RAM tier: " << ram_swap_stats.size()
+                           << " distinct experts touched, " << total_in << " loads / "
+                           << total_out << " evictions this session (no pinning exists for this tier).\n";
+
+        std::vector<std::pair<uint64_t, SwapStats>> sorted(ram_swap_stats.begin(), ram_swap_stats.end());
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return (a.second.swap_in + a.second.swap_out) > (b.second.swap_in + b.second.swap_out);
+        });
+
+        LOG_STREAM_INFO() << "[CACHE-CHURN] Top " << std::min((size_t)top_n, sorted.size())
+                           << " most-churned host-RAM experts:\n";
+        for (int i = 0; i < top_n && i < (int)sorted.size(); ++i) {
+            int layer = (int)(sorted[i].first >> 32), expert_id = (int)(sorted[i].first & 0xFFFFFFFFu);
+            LOG_STREAM_INFO() << "  layer=" << layer << " expert=" << expert_id
+                               << ": loaded=" << sorted[i].second.swap_in
+                               << " evicted=" << sorted[i].second.swap_out << "\n";
+        }
     }
 };
