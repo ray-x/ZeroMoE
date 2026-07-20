@@ -13,7 +13,7 @@
 // DeepSeek-V2/V3). Confirmed two ways:
 //   - llama.cpp src/llama-model.cpp: rope_type for GLM_DSA and CHATGLM is
 //     LLAMA_ROPE_TYPE_NORM; rope_norm (ggml) is the interleaved variant.
-//   - rope_interleave pairs (2j, 2j+1).
+//   - colibri (a working GLM-5.2 engine) rope_interleave pairs (2j, 2j+1).
 // The previous implementation here used NeoX rotate-half (pairs (k, k+half) =
 // LLAMA_ROPE_TYPE_NEOX), which scrambled the decoupled-rope positional encoding
 // on every MLA layer and was the root cause of "always random text" output.

@@ -40,6 +40,13 @@ public:
     // project has no way to verify against the real checkpoint. -1 if absent.
     int gmask_id = -1, sop_id = -1, user_id = -1, assistant_id = -1;
     // GLM-5.2's real HF config.json has THREE stop tokens in eos_token_id
+    // (an ARRAY: endoftext, user, observation -- confirmed via colibri, a
+    // working GLM-5.2 engine that reads the raw HF config directly). A
+    // single scalar tokenizer.ggml.eos_token_id (bos_token_id/eos_token_id
+    // below) only captures one of them -- generation would run past the
+    // model's real turn-boundary markers into undefined continuation
+    // territory. Detected by literal vocab lookup, same pattern as the chat
+    // template tokens above, and merged with eos_token_id into stop_ids.
     std::vector<int> stop_ids;
     int observation_id = -1;
 
@@ -136,12 +143,13 @@ public:
         observation_id = find("<|observation|>");
 
         // GLM-5.2's real HF config.json has THREE eos_token_id entries:
-        // <|endoftext|>, <|user|>, <|observation|> 
+        // <|endoftext|>, <|user|>, <|observation|> (confirmed via colibri,
+        // a working GLM-5.2 engine reading the raw HF config directly).
         // <|user|>/<|observation|> mark "the model handed the turn back" --
         // treating them as generation-stop points too, not just the primary
         // <|endoftext|>, matters because generating past them runs into
         // undefined continuation territory the model was never trained to
-        // produce 
+        // produce (colibri's own comment: "5-10x wasted/garbage tokens").
         auto add_stop = [&](int id) {
             if (id < 0) return;
             for (int s : stop_ids) if (s == id) return;

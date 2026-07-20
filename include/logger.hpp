@@ -16,8 +16,6 @@
 #include <string>
 #include <mutex>
 #include <sstream>
-#include <chrono>
-#include <ctime>
 
 // VERBOSE sits below DEBUG: even more granular than the existing per-token/
 // per-expert DEBUG diagnostics (cache hits/misses, VRAM promotions) --
@@ -67,9 +65,6 @@ public:
         if (lvl < threshold_) return;
         std::lock_guard<std::mutex> lock(mutex_);
         FILE* out = file_ ? file_ : stderr;
-        char ts[16];
-        format_timestamp(ts, sizeof(ts));
-        std::fprintf(out, "[%s] ", ts);
         std::fputs(level_prefix(lvl), out);
         va_list args;
         va_start(args, fmt);
@@ -89,22 +84,6 @@ private:
     Logger() = default;
     Logger(const Logger&) = delete;
     Logger& operator=(const Logger&) = delete;
-
-    // Wall-clock HH:MM:SS.sss, local time -- added so log lines (this
-    // codebase's file/stderr diagnostics) can be lined up against external
-    // captures (nvidia-smi dmon, a redirected/tee'd copy of the REPL's own
-    // stdout) that have their own independent timestamps, instead of having
-    // to infer phase boundaries from patterns alone. buf must be >= 13 bytes.
-    static void format_timestamp(char* buf, size_t buf_size) {
-        using namespace std::chrono;
-        auto now = system_clock::now();
-        std::time_t now_c = system_clock::to_time_t(now);
-        auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
-        std::tm tm_buf;
-        localtime_r(&now_c, &tm_buf);  // POSIX thread-safe variant -- fine on the Linux target
-        std::snprintf(buf, buf_size, "%02d:%02d:%02d.%03d",
-                      tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, (int)ms.count());
-    }
 
     static const char* level_prefix(LogLevel lvl) {
         switch (lvl) {

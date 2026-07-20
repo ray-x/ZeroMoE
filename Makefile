@@ -5,7 +5,7 @@ BUILD_DIR  ?= build
 BUILD_TYPE ?= Release
 JOBS       := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-.PHONY: all build test check clean configure test-components bench-io gguf-tool
+.PHONY: all build test check clean configure
 
 all: build
 
@@ -40,29 +40,6 @@ test: build
 	./$(BUILD_DIR)/moestream_tests
 
 check: test
-
-# CPU-only component tests (tests/test_components.cpp) -- deliberately NOT
-# routed through CMake/CUDA, so this target runs on macOS too (the workflow:
-# test a SUBSET here, run the full `make test` CUDA suite on Linux). Compiles
-# the single translation unit with the system C++ compiler in seconds.
-# Optional substring filters: make test-components ARGS="rope dequant".
-test-components:
-	tests/run_components.sh $(ARGS)
-
-# gguf_tool (tools/gguf_tool.cpp + gguf_pack/io/verify.cpp) -- cross-platform
-# (macOS + Linux), no CMake/CUDA. One binary, three subcommands: pack, io,
-# verify. Pass the subcommand + its args via ARGS, e.g.
-#   make gguf-tool ARGS="verify ./repacked"
-#   make gguf-tool ARGS="pack model.gguf ./repacked --verify-all"
-gguf-tool:
-	tools/run_gguf_tool.sh $(ARGS)
-
-# I/O benchmark, repurposed onto gguf_tool's `io` subcommand -- A/Bs
-# per-expert read pattern: original packed layout vs repacked tight layout.
-# Pass orig + repacked paths (and optional --reads/--seed/--direct) via ARGS,
-# e.g. make bench-io ARGS="model.gguf ./repacked --reads 5000".
-bench-io:
-	tools/run_gguf_tool.sh io $(ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)

@@ -7,7 +7,6 @@
 #include <string>
 #include <unordered_map>
 #include <cstdint>
-#include <algorithm>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -128,12 +127,6 @@ public:
     std::vector<int> shard_fds;
     std::vector<std::string> shard_paths;
 
-    // O_DIRECT state, one entry per shard_fds -- see enable_direct_io()
-    // below. Empty (all false) until a caller explicitly opts in;
-    // fd_for_tensor()/reads are completely unaffected until then.
-    std::vector<bool> shard_direct_io;
-    uint64_t direct_io_alignment = 4096;
-
     // KV metadata extracted during header parsing
     std::unordered_map<std::string, uint64_t> kv_uint;
     std::unordered_map<std::string, int64_t> kv_int;
@@ -144,84 +137,6 @@ public:
         if (t.shard_idx < (int)shard_fds.size())
             return shard_fds[t.shard_idx];
         return file_fd;
-    }
-
-    bool direct_io_active_for(const GGUFTensor& t) const {
-        return t.shard_idx >= 0 && (size_t)t.shard_idx < shard_direct_io.size()
-               && shard_direct_io[t.shard_idx];
-    }
-
-    // Opt-in: reopen every shard's fd with O_DIRECT, one shard at a time,
-    // ONLY if (a) this platform supports O_DIRECT at all (Linux; this
-    // project's only supported build target per CLAUDE.md, but guarded
-    // anyway rather than assumed) and (b) this file's own
-    // general.alignment KV value (written by tools/gguf_tool pack,
-    // defaults to 32 for any file that was never repacked) is at least
-    // `min_alignment` -- a plain, un-repacked GGUF has 32-byte tensor
-    // offsets, which can never satisfy O_DIRECT's block-alignment
-    // requirement, so direct I/O is refused outright for such a file
-    // rather than silently attempting misaligned reads. Even when the
-    // alignment check passes, each shard gets a real test read (not just
-    // a successful open()) before being trusted -- some filesystems
-    // (network mounts, some overlay/container filesystems, tmpfs) accept
-    // O_DIRECT at open() but reject the actual read with EINVAL; a shard
-    // that fails either step keeps its ORIGINAL buffered fd untouched
-    // and is simply left out of shard_direct_io, never a hard error --
-    // this feature is a pure performance opt-in, never something a
-    // caller should have to work around if it doesn't pan out for a
-    // given filesystem. Returns the number of shards that ended up with
-    // real O_DIRECT active.
-    int enable_direct_io(uint64_t min_alignment = 4096) {
-        shard_direct_io.assign(shard_fds.size(), false);
-#ifndef __linux__
-        (void)min_alignment;  // only referenced in the Linux branch below
-        LOG_STREAM_WARN() << "[DIRECT-IO] Not supported on this platform (Linux-only) -- "
-                              "all reads stay buffered.\n";
-        return 0;
-#else
-        auto it = kv_uint.find("general.alignment");
-        uint64_t file_alignment = (it != kv_uint.end()) ? it->second : 32;
-        if (file_alignment < min_alignment) {
-            LOG_STREAM_WARN() << "[DIRECT-IO] This model's general.alignment=" << file_alignment
-                      << " is below the required " << min_alignment << " bytes -- this file was "
-                         "never repacked with tools/gguf_tool pack (or used a smaller --align). "
-                         "Direct I/O disabled, all reads stay buffered.\n";
-            return 0;
-        }
-        direct_io_alignment = file_alignment;
-
-        void* test_buf = nullptr;
-        if (posix_memalign(&test_buf, (size_t)direct_io_alignment, (size_t)direct_io_alignment) != 0)
-            test_buf = nullptr;
-
-        int n_enabled = 0;
-        for (size_t i = 0; i < shard_fds.size(); ++i) {
-            int new_fd = open(shard_paths[i].c_str(), O_RDONLY | O_DIRECT);
-            bool ok = new_fd >= 0;
-            if (ok && test_buf) {
-                ssize_t r = pread(new_fd, test_buf, (size_t)direct_io_alignment, 0);
-                ok = (r >= 0);
-            } else if (ok && !test_buf) {
-                ok = false;  // couldn't allocate the test buffer -- don't trust an unverified open()
-            }
-            if (ok) {
-                close(shard_fds[i]);
-                shard_fds[i] = new_fd;
-                shard_direct_io[i] = true;
-                n_enabled++;
-            } else {
-                if (new_fd >= 0) close(new_fd);
-                LOG_STREAM_WARN() << "[DIRECT-IO] Shard " << i << " (" << shard_paths[i]
-                          << ") does not support O_DIRECT on this filesystem -- "
-                             "falling back to buffered reads for this shard only.\n";
-            }
-        }
-        if (test_buf) free(test_buf);
-        if (file_fd >= 0 && !shard_fds.empty()) file_fd = shard_fds[0];
-        LOG_STREAM_INFO() << "[DIRECT-IO] Enabled on " << n_enabled << "/" << shard_fds.size()
-                  << " shard(s) (alignment=" << direct_io_alignment << " bytes).\n";
-        return n_enabled;
-#endif
     }
 
     // Extract integer config value from KV metadata, trying multiple key patterns
@@ -389,26 +304,14 @@ private:
         // correctness risk (a kernel hint, not a behavior change) and zero
         // concurrency risk -- a pure candidate fix for the measured low
         // (~1.17 GB/s) aggregate disk throughput, cheaper to test than
-        // re-sharding the model file.
+        // re-sharding the model file the way colibri does (colibri's
+        // per-shard files likely get a similar practical effect: each
+        // smaller file's own access pattern reads as more "local" to the
+        // kernel's readahead heuristic without needing an explicit hint).
         posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
 
-        // Compute data_start for this shard and adjust tensor offsets.
-        // general.alignment (GGUF spec, default 32 if absent) governs this --
-        // previously hardcoded to 32 unconditionally, silently ignoring the
-        // KV key entirely. Harmless for every file encountered so far (32 is
-        // ggml's own writer default, so virtually all real-world GGUF files
-        // use it) but a real, necessary fix for a repack tool that
-        // deliberately writes a LARGER alignment (4096, for O_DIRECT-eligible
-        // per-expert offsets) -- without this, this loader would compute the
-        // wrong data_start for such a file (assume 32-aligned when the file
-        // is actually 4096-aligned) and silently misinterpret every tensor
-        // offset as a result. Read from kv_uint first (already populated by
-        // this SAME shard's own KV loop above, and/or an earlier shard's, if
-        // general.alignment is only present once -- see tools/gguf_tool pack
-        // for why the repack tool writes it into every shard defensively
-        // rather than relying on load order).
-        auto align_it = kv_uint.find("general.alignment");
-        uint64_t alignment = (align_it != kv_uint.end() && align_it->second > 0) ? align_it->second : 32;
+        // Compute data_start for this shard and adjust tensor offsets
+        uint64_t alignment = 32;
         uint64_t data_start = (current_pos + alignment - 1) & ~(alignment - 1);
         for (auto& [name, t] : tensors) {
             if (t.shard_idx == shard_idx) {

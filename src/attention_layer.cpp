@@ -47,7 +47,7 @@ static bool check_finite_attn(const char* label, int layer_idx, const float* dat
 // CONVENTION: interleaved rotation -- pairs (2j, 2j+1) -- REQUIRED by every MLA
 // target this project runs (glm-dsa / ChatGLM / DeepSeek-V2/V3); confirmed
 // against llama.cpp (rope_type = LLAMA_ROPE_TYPE_NORM for GLM_DSA/CHATGLM) and
-// rope_interleave. The previous implementation here used NeoX
+// colibri (rope_interleave). The previous implementation here used NeoX
 // rotate-half (pairs (k, k+half)) which scrambled positional encoding on every
 // MLA layer and produced "always random text" -- see test_rope's known-answer
 // case for the exact failure mode.
@@ -108,7 +108,6 @@ void mla_attention_absorbed_gguf(
     float* out_context
 ) {
     PERF_SCOPE(t_attn);
-    PERF_START(attn_preamble);
     const auto& c = engine.model_file.architecture_config;
     int H = c.n_heads;
     int D = c.hidden;
@@ -119,7 +118,6 @@ void mla_attention_absorbed_gguf(
     int qh = nope + rope;
     std::string p = "blk." + std::to_string(layer_idx) + ".";
     float rope_theta = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
-    PERF_END(attn_preamble, t_attn_preamble);
 
     // ---- 1. attention input norm (F32 rmsnorm on GPU) ----
     PERF_START(attn_norm);
@@ -137,11 +135,9 @@ void mla_attention_absorbed_gguf(
     std::vector<float> Q((size_t)S * H * qh, 0.0f);
     {
         std::vector<float> ql_buf((size_t)S * q_lora);
-        { NamedTimerScope _t("attn_q_a");
-          dense_proj(engine, p + "attn_q_a.weight", normed.data(), ql_buf.data(), S, D, q_lora); }
+        dense_proj(engine, p + "attn_q_a.weight", normed.data(), ql_buf.data(), S, D, q_lora);
         rmsnorm_proj(engine, p + "attn_q_a_norm.weight", ql_buf.data(), ql_buf.data(), S, q_lora, c.eps);
-        { NamedTimerScope _t("attn_q_b");
-          dense_proj(engine, p + "attn_q_b.weight", ql_buf.data(), Q.data(), S, q_lora, H * qh); }
+        dense_proj(engine, p + "attn_q_b.weight", ql_buf.data(), Q.data(), S, q_lora, H * qh);
     }
     check_finite_attn("Q (post attn_q_a/q_a_norm/q_b projection, pre-RoPE)", layer_idx, Q.data(), Q.size());
 
@@ -164,8 +160,7 @@ void mla_attention_absorbed_gguf(
     {
         int kv_dim = kvl + rope;
         std::vector<float> kv((size_t)S * kv_dim);
-        { NamedTimerScope _t("attn_kv_a_mqa");
-          dense_proj(engine, p + "attn_kv_a_mqa.weight", normed.data(), kv.data(), S, D, kv_dim); }
+        dense_proj(engine, p + "attn_kv_a_mqa.weight", normed.data(), kv.data(), S, D, kv_dim);
         check_finite_attn("kv (post attn_kv_a_mqa projection, pre-norm/RoPE)", layer_idx, kv.data(), kv.size());
         auto kvn = engine.resident_layers.find(p + "attn_kv_a_norm.weight");
         const float* kvn_w = (kvn != engine.resident_layers.end() && kvn->second.host_ptr)

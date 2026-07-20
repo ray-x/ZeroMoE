@@ -37,12 +37,12 @@ public:
 // ------------------------------------------------------------------
 void test_cpu_matrix_ops() {
     std::cout << "[Test 1] CPU Math Primitives (Matmul, Softmax, RMSNorm)...\n";
-
+    
     // 1a. Matmul (1x2 * 2x3^T)
-    std::vector<float> x = {1.0f, 2.0f};
+    std::vector<float> x = {1.0f, 2.0f}; 
     std::vector<float> W = {2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f}; // Shape: O=3, I=2
     std::vector<float> y(3, 0.0f);
-
+    
     matmul(y.data(), x.data(), W.data(), 1, 2, 3);
     assert(y[0] == (1.0f * 2.0f + 2.0f * 3.0f)); // 8.0
     assert(y[1] == (1.0f * 4.0f + 2.0f * 5.0f)); // 14.0
@@ -70,20 +70,20 @@ void test_cpu_matrix_ops() {
 void test_graph_initializer() {
     std::cout << "[Test 2] Graph Topology Analyzer...\n";
     StreamingEngine engine;
-
+    
     // Inject fake tensor metadata to trigger structural discovery logic
     engine.model_file.tensors["token_embd.weight"] = {"token_embd.weight", GGUFType::F32, {32000, 4096}, 0, 0};
     engine.model_file.tensors["blk.0.ffn_gate_exps.weight"] = {"blk.0.ffn_gate_exps.weight", GGUFType::Q4_0, {8, 14336, 4096}, 0, 0};
     engine.model_file.tensors["blk.1.ffn_gate_exps.weight"] = {"blk.1.ffn_gate_exps.weight", GGUFType::Q4_0, {8, 14336, 4096}, 0, 0};
-
+    
     GGUFGraphInitializer::build_model_graph(engine, 128);
-
+    
     auto& c = engine.model_file.architecture_config;
     assert(c.vocab == 32000);
     assert(c.hidden == 4096);
     assert(c.n_layers == 2);
     assert(c.n_experts == 8);
-
+    
     std::cout << "  -> Passed!\n";
 }
 
@@ -92,25 +92,25 @@ void test_graph_initializer() {
 // ------------------------------------------------------------------
 void test_attention_extraction() {
     std::cout << "[Test 3] Attention Q4_0 Vectorized Extraction...\n";
-
+    
     QuantizedTensor qt;
     qt.meta.shape = {1, 32}; // 1 row, 32 elements (exactly 1 Q4_0 block)
-
+    
     block_q4_0 blk;
     blk.d = fp32_to_fp16(1.0f); // Scale factor 1.0
     // Fill nibbles with 0x88. (8 & 0x0F) - 8 = 0. Therefore all weights decode to 0.0f
-    for (int i = 0; i < 16; ++i) blk.qs[i] = 0x88;
-
+    for (int i = 0; i < 16; ++i) blk.qs[i] = 0x88; 
+    
     qt.host_ptr = reinterpret_cast<uint8_t*>(&blk);
 
     std::vector<float> out(32, -1.0f);
     extract_gguf_row_q4_0(qt, 0, out.data());
-
+    
     // Assert all 32 unpacked float targets successfully resolve to 0.0f
     for (int i = 0; i < 32; ++i) {
         assert(std::abs(out[i] - 0.0f) < 1e-4);
     }
-
+    
     std::cout << "  -> Passed!\n";
 }
 
@@ -120,7 +120,7 @@ void test_attention_extraction() {
 void test_cuda_execution() {
     std::cout << "[Test 4] CUDA DP4A Hardware VRAM Kernels...\n";
     CudaManager gpu;
-
+    
     if (!gpu.initialize()) {
         std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
         return;
@@ -130,11 +130,11 @@ void test_cuda_execution() {
     QuantizedTensor w;
     w.meta.shape = {1, 32}; // O=1, I=32
     w.meta.size_bytes = sizeof(block_q4_0);
-
+    
     block_q4_0 blk;
     blk.d = fp32_to_fp16(1.0f);
     // Fill nibbles with 0x99. (9 & 0x0F) - 8 = 1. Therefore all weights decode to 1.0f
-    for (int i = 0; i < 16; ++i) blk.qs[i] = 0x99;
+    for (int i = 0; i < 16; ++i) blk.qs[i] = 0x99; 
     w.host_ptr = reinterpret_cast<uint8_t*>(&blk);
 
     gpu.offload_tensor_to_vram(w);
@@ -147,8 +147,8 @@ void test_cuda_execution() {
     gpu.execute_matmul(w, x.data(), y.data(), 1);
 
     // Provide a small slack delta to account for int8 dynamic quantization rounding limits
-    assert(y[0] > 60.0f && y[0] < 68.0f);
-
+    assert(y[0] > 60.0f && y[0] < 68.0f); 
+    
     std::cout << "  -> Passed!\n";
 }
 
@@ -433,6 +433,16 @@ bool test_avx512_dequant_iq() {
 // 8. CPU Dequant+Matmul Throughput Benchmark (NOT a correctness test --
 //    reports numbers only, never fails/gates the suite's exit code)
 // ------------------------------------------------------------------
+// Added to root-cause a real, measured gap: colibri's own PROF report
+// (its P0-EXEC line, real steady-state DECODE phase, same machine) shows
+// routed-expert CPU dequant+matmul running at 16-23 GB/s; MoEStream's own
+// dump_report numbers (avg CPU expert ms/call, back-computed to GB/s) show
+// roughly 1.2-1.6 GB/s on the SAME hardware -- a ~4x gap in what turned out
+// to be MoEStream's single LARGEST per-token cost bucket (bigger than
+// disk-wait). This isolates the CPU dequant-matmul path completely from
+// disk I/O, caching, and routing, so the number is attributable to the
+// compute path alone. Uses REAL ggml-valid quantized bytes (same
+// ggml_quantize_row_ref pattern as Test 5/6/7), not synthetic bit patterns.
 //
 // Sweeps two axes:
 //   - quant type: IQ2_XXS/IQ3_XXS (the types this checkpoint's routed
@@ -547,7 +557,7 @@ static void bench_wide_case(GGUFType type, DequantWideFn wide_fn, int I, int O, 
 
 void bench_cpu_dequant_matmul() {
     std::cout << "\n[BENCH] CPU Dequant+Matmul Throughput (informational only -- compare "
-                 "these GB/s numbers directly PROF P0-EXEC line, "
+                 "these GB/s numbers directly against colibri's own PROF P0-EXEC line, "
                  "run on the same machine)\n";
     // Placeholder shape -- I must be a multiple of 256 (QK_K block size).
     // Replace with your checkpoint's REAL hidden/moe_inter (gate/up
@@ -560,7 +570,7 @@ void bench_cpu_dequant_matmul() {
 
     struct Case { GGUFType type; const char* label; };
     Case cases[] = {
-        // {GGUFType::IQ2_XXS, "IQ2_XXS -- vectorized, gate/up on 71/76 layers"},
+        {GGUFType::IQ2_XXS, "IQ2_XXS -- vectorized, gate/up on 71/76 layers"},
         {GGUFType::IQ3_XXS, "IQ3_XXS -- vectorized, down on 71/76 layers"},
         {GGUFType::IQ4_XS,  "IQ4_XS  -- SCALAR, no AVX-512 case, down on ~4 layers"},
         {GGUFType::IQ2_S,   "IQ2_S   -- NOW vectorized (was scalar), gate/up on 1 layer"},
@@ -572,7 +582,7 @@ void bench_cpu_dequant_matmul() {
     // a physical core's execution units/L1/L2 may be hurting, not helping,
     // for this workload past the real core count. If scaling is clean and
     // roughly linear up to 6 and flat/negative beyond, that confirms it.
-    int thread_counts[] = {1, 2, 4, 6, 8};
+    int thread_counts[] = {1, 2, 3, 4, 5, 6, 7, 8, 10, 12};
 
     for (auto& c : cases) {
         std::cout << "--- " << c.label << " ---\n";
@@ -592,9 +602,9 @@ void bench_cpu_dequant_matmul() {
                  "(same bytes, same dot product -- isolates ALU width as the only variable)\n";
     struct WideCase { GGUFType type; DequantWideFn fn; const char* label; };
     WideCase wide_cases[] = {
-        // {GGUFType::IQ2_XXS, dequantize_row_iq2_xxs_avx512_wide, "IQ2_XXS"},
-        {GGUFType::IQ2_S,   dequantize_row_iq2_s_avx512_wide,   "IQ2_S"},
+        {GGUFType::IQ2_XXS, dequantize_row_iq2_xxs_avx512_wide, "IQ2_XXS"},
         {GGUFType::IQ3_XXS, dequantize_row_iq3_xxs_avx512_wide, "IQ3_XXS"},
+        {GGUFType::IQ2_S,   dequantize_row_iq2_s_avx512_wide,   "IQ2_S"},
     };
     for (auto& wc : wide_cases) {
         std::cout << "--- " << wc.label << " [WIDE] ---\n";
@@ -691,42 +701,6 @@ void bench_cpu_dequant_matmul() {
 // mismatched types (wrong stride, garbage read, silently-undefined
 // behavior), the divergence from this reference will be large and
 // obvious, not a few ULPs of legitimate floating-point slop.
-// NOTE on this test's history and what changed: this ONCE called through
-// CudaManager::dense_matmul_host(GGUFType::BF16, ...) to reach cuBLAS's
-// mismatched-type combination indirectly, and on an RTX 3090 confirmed
-// cuBLAS flatly REJECTS it. That call path is now GONE --
-// dense_matmul_host was later changed to intercept BF16 before it can
-// ever reach cublas_dense_matmul at all (it always delegates straight to
-// dense_matmul_bf16_matched_host, the matched-type path Test 10 covers),
-// so calling through dense_matmul_host here no longer tests the
-// mismatched-type combination this test is named for -- it silently
-// started testing something else entirely (the matched-type function,
-// but WITHOUT the correct reference math for that, since this test's
-// reference wasn't updated when the call path changed underneath it).
-// That mismatch between "what this test's reference assumes it's
-// checking" and "what the code under test actually does now" produced a
-// real-looking but spurious "FAILED, 29% error" result on a later run --
-// not a cuBLAS or hardware bug, just a stale test silently exercising
-// the wrong code path and comparing against the wrong reference. Root-
-// caused by tracing dense_matmul_host's actual dispatch, not assumed.
-//
-// Fixed by calling cublas_dense_matmul() DIRECTLY (bypassing
-// dense_matmul_host entirely, same pattern Test 10 already uses for the
-// matched-type primitive) -- this is the only way to actually still
-// exercise the low-level mismatched-type branch at all, now that no
-// live call path reaches it. cublas_dense_matmul's BF16 case was also
-// hardened (cublas_matmul.hpp) to unconditionally return
-// CUBLAS_STATUS_NOT_SUPPORTED for BF16 without ever calling cublasGemmEx
-// -- since dense_matmul_host no longer needs this path and the ORIGINAL
-// (single-GPU) confirmation of real driver rejection is now stale/
-// unverified on this box's second GPU, there's no reason to keep
-// depending on the driver to reject it correctly. So this test's role is
-// now a pure regression guard: confirm that refusal is still in place
-// and still deterministic, not an open-ended "let's see what the driver
-// does" experiment. If a future edit ever removes that guard, this test
-// still verifies correctness rather than assuming either way (using the
-// mismatched-type combination's own correct reference: bf16-rounded
-// weight dotted with the ORIGINAL, unrounded F32 activation).
 bool test_bf16_cublas_dense_matmul() {
     std::cout << "[Test 9] cuBLAS Mixed-Precision (BF16 weight / F32 activation) Dense Matmul...\n";
     CudaManager gpu;
@@ -746,11 +720,7 @@ bool test_bf16_cublas_dense_matmul() {
 
     // Round-trip the weight through bf16 -- this is exactly what the GPU
     // will actually compute against, so the reference must use the SAME
-    // rounded values, not the original F32 ones. The activation is
-    // deliberately left as-is (unrounded F32): this test's whole point is
-    // the MISMATCHED combination (bf16 weight, f32 activation), so
-    // rounding the activation too would be testing the matched-type
-    // combination (Test 10's job) under the wrong test name.
+    // rounded values, not the original F32 ones.
     std::vector<uint16_t> w_bf16((size_t)O * I);
     std::vector<float> w_bf16_as_f32((size_t)O * I);
     for (size_t i = 0; i < w_f32.size(); ++i) {
@@ -759,7 +729,7 @@ bool test_bf16_cublas_dense_matmul() {
     }
 
     // CPU reference: plain dot product (double accumulate) using the
-    // bf16-rounded weight against the ORIGINAL, unrounded F32 activation.
+    // bf16-rounded weight.
     std::vector<float> y_cpu((size_t)S * O, 0.0f);
     for (int s = 0; s < S; ++s) {
         for (int o = 0; o < O; ++o) {
@@ -771,46 +741,20 @@ bool test_bf16_cublas_dense_matmul() {
         }
     }
 
-    // Upload the bf16 weight and F32 activation directly -- the raw
-    // storage formats cublasGemmEx will read with Atype=CUDA_R_16BF,
-    // Btype=CUDA_R_32F. Calls cublas_dense_matmul() DIRECTLY, not via
-    // CudaManager::dense_matmul_host -- see the function-level comment
-    // above for why going through dense_matmul_host no longer reaches
-    // this code path at all.
+    // Upload the bf16 bytes directly (no dequant involved -- this IS the
+    // raw storage format cublasGemmEx will read with atype=CUDA_R_16BF).
     void* d_W = nullptr;
-    float* d_X = nullptr;
-    float* d_Y = nullptr;
     cudaMalloc(&d_W, w_bf16.size() * sizeof(uint16_t));
-    cudaMalloc((void**)&d_X, x.size() * sizeof(float));
-    cudaMalloc((void**)&d_Y, (size_t)S * O * sizeof(float));
     cudaMemcpy(d_W, w_bf16.data(), w_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
-
-    cublasStatus_t status = cublas_dense_matmul(gpu.cublas_handle, GGUFType::BF16, d_W, d_X, d_Y, S, I, O);
 
     std::vector<float> y_gpu((size_t)S * O, -999.0f);
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        cudaMemcpy(y_gpu.data(), d_Y, y_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
-    }
+    bool gpu_ok = gpu.dense_matmul_host(GGUFType::BF16, d_W, x.data(), y_gpu.data(), S, I, O);
     cudaFree(d_W);
-    cudaFree(d_X);
-    cudaFree(d_Y);
-
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        std::cout << "  -> PASSED (mismatched-type combination correctly refused, status=" << (int)status
-                  << " -- either cublas_dense_matmul's own hardened refusal, or the driver itself "
-                     "rejecting it; either way, the expected, safe outcome. The matched-type path, "
-                     "Test 10, is the one actually wired into the live path.)\n";
-        return true;
+    if (!gpu_ok) {
+        std::cout << "  -> FAILED (dense_matmul_host reported no kernel for BF16)\n";
+        return false;
     }
 
-    // Only reachable if the hardened refusal above (cublas_matmul.hpp) is
-    // ever removed AND the driver itself accepts the call -- verify
-    // correctness rather than assume either way, since a silent success
-    // could still be silently wrong.
-    std::cout << "  -> SURPRISING: the mismatched-type call was not refused (hardened guard "
-                 "removed?) and the driver accepted it -- verifying correctness rather than "
-                 "assuming.\n";
     float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
     for (size_t i = 0; i < y_cpu.size(); ++i) {
         if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
@@ -830,118 +774,6 @@ bool test_bf16_cublas_dense_matmul() {
     return pass;
 }
 
-// ------------------------------------------------------------------
-// 10. cuBLAS Matched-Precision (BF16 weight / BF16 activation) Dense Matmul
-// ------------------------------------------------------------------
-// Directly tests cublas_dense_matmul_bf16_matched (cublas_matmul.hpp) --
-// the MATCHED-type retry (Atype=Btype=CUDA_R_16BF, Ctype=CUDA_R_32F) after
-// Test 9 confirmed the original MIXED-type attempt (BF16 weight / F32
-// activation) is cleanly REJECTED by cublasGemmEx (CUBLAS_STATUS_NOT_
-// SUPPORTED, not a silent correctness bug). Unlike Test 9, this also
-// exercises converting the ACTIVATION to bf16 (the weight-only conversion
-// from the original fast-path isn't enough for a matched-type call) --
-// same round-trip-through-bf16 methodology as Test 9, just applied to
-// both operands instead of one, so the CPU reference isolates "did
-// cuBLAS execute this matched-type GEMM correctly" from "how much does
-// bf16 rounding perturb the answer" for BOTH inputs this time.
-//
-// Per this project's own established discipline: gates pass/fail like
-// Test 5/9, synthetic/no model file needed, and per the plan this was
-// explicitly built for -- verify in isolation FIRST, wire into the live
-// dense_dispatch.hpp path only as a separate, later step if this passes.
-bool test_bf16_matched_cublas_dense_matmul() {
-    std::cout << "[Test 10] cuBLAS Matched-Precision (BF16 weight / BF16 activation) Dense Matmul...\n";
-    CudaManager gpu;
-    if (!gpu.initialize()) {
-        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
-        return true;
-    }
-
-    const int S = 3, I = 512, O = 8;
-    std::mt19937 rng(5678);
-    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
-
-    std::vector<float> w_f32((size_t)O * I);
-    for (auto& v : w_f32) v = dist(rng);
-    std::vector<float> x_f32((size_t)S * I);
-    for (auto& v : x_f32) v = dist(rng);
-
-    // Round-trip BOTH operands through bf16 -- this time the activation
-    // needs it too, not just the weight, since this is what the GPU will
-    // actually receive for a genuinely matched-type call.
-    std::vector<uint16_t> w_bf16((size_t)O * I);
-    std::vector<float> w_bf16_as_f32((size_t)O * I);
-    for (size_t i = 0; i < w_f32.size(); ++i) {
-        w_bf16[i] = fp32_to_bf16(w_f32[i]);
-        w_bf16_as_f32[i] = bf16_to_fp32(w_bf16[i]);
-    }
-    std::vector<uint16_t> x_bf16((size_t)S * I);
-    std::vector<float> x_bf16_as_f32((size_t)S * I);
-    for (size_t i = 0; i < x_f32.size(); ++i) {
-        x_bf16[i] = fp32_to_bf16(x_f32[i]);
-        x_bf16_as_f32[i] = bf16_to_fp32(x_bf16[i]);
-    }
-
-    // CPU reference: plain dot product (double accumulate) using the
-    // bf16-rounded weight AND bf16-rounded activation -- both operands
-    // match exactly what the GPU actually receives.
-    std::vector<float> y_cpu((size_t)S * O, 0.0f);
-    for (int s = 0; s < S; ++s) {
-        for (int o = 0; o < O; ++o) {
-            double acc = 0.0;
-            for (int i = 0; i < I; ++i) {
-                acc += (double)x_bf16_as_f32[(size_t)s * I + i] * (double)w_bf16_as_f32[(size_t)o * I + i];
-            }
-            y_cpu[(size_t)s * O + o] = (float)acc;
-        }
-    }
-
-    // Upload both bf16 buffers directly -- raw storage format, no dequant.
-    void* d_W = nullptr;
-    void* d_X = nullptr;
-    cudaMalloc(&d_W, w_bf16.size() * sizeof(uint16_t));
-    cudaMalloc(&d_X, x_bf16.size() * sizeof(uint16_t));
-    cudaMemcpy(d_W, w_bf16.data(), w_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_X, x_bf16.data(), x_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
-
-    float* d_Y = nullptr;
-    cudaMalloc((void**)&d_Y, (size_t)S * O * sizeof(float));
-
-    cublasStatus_t status = cublas_dense_matmul_bf16_matched(gpu.cublas_handle, d_W, d_X, d_Y, S, I, O);
-
-    std::vector<float> y_gpu((size_t)S * O, -999.0f);
-    if (status == CUBLAS_STATUS_SUCCESS) {
-        cudaMemcpy(y_gpu.data(), d_Y, y_gpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
-    }
-    cudaFree(d_W);
-    cudaFree(d_X);
-    cudaFree(d_Y);
-
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        std::cout << "  -> FAILED (cublasGemmEx returned status " << (int)status
-                  << ", not CUBLAS_STATUS_SUCCESS)\n";
-        return false;
-    }
-
-    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
-    for (size_t i = 0; i < y_cpu.size(); ++i) {
-        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
-            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
-            return false;
-        }
-        float diff = std::abs(y_cpu[i] - y_gpu[i]);
-        float rel = diff / std::max(1e-6f, std::abs(y_cpu[i]));
-        max_abs_diff = std::max(max_abs_diff, diff);
-        max_rel_diff = std::max(max_rel_diff, rel);
-    }
-
-    bool pass = max_rel_diff < 0.01f;
-    std::cout << "  -> BF16 matched dense matmul (S=" << S << " I=" << I << " O=" << O << "): "
-              << (pass ? "PASSED" : "FAILED")
-              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
-    return pass;
-}
-
 int main() {
     std::cout << "========================================\n";
     std::cout << "  MoeStream Native Test Harness\n";
@@ -956,7 +788,6 @@ int main() {
     bool avx512_dequant_iq_ok = test_avx512_dequant_iq();
     bench_cpu_dequant_matmul();
     bool bf16_dense_ok = test_bf16_cublas_dense_matmul();
-    bool bf16_matched_dense_ok = test_bf16_matched_cublas_dense_matmul();
 
     std::cout << "========================================\n";
     if (!fused_kernels_ok) {
@@ -972,13 +803,7 @@ int main() {
         return 1;
     }
     if (!bf16_dense_ok) {
-        std::cout << "❌ Test 9: cuBLAS unexpectedly ACCEPTED the mismatched-type call AND produced a "
-                     "wrong result -- see [Test 9] output above (this is not the normal 'rejected as "
-                     "expected' outcome).\n";
-        return 1;
-    }
-    if (!bf16_matched_dense_ok) {
-        std::cout << "❌ BF16 matched-precision cuBLAS dense matmul correctness test FAILED -- see [Test 10] output above.\n";
+        std::cout << "❌ BF16 cuBLAS dense matmul correctness test FAILED -- see [Test 9] output above.\n";
         return 1;
     }
     std::cout << "✅ All core engine tests passed successfully!\n";
