@@ -56,6 +56,7 @@ add_executable(moestream
     cuda/kquant_matmul.cu
     cuda/iq2_matmul.cu
     cuda/iq3_matmul.cu
+    cuda/iq4xs_matmul.cu
     cuda/rmsnorm.cu
     cuda/iq2m_dequant.cu
     cuda/iq1_dequant.cu
@@ -104,6 +105,7 @@ add_executable(moestream_tests
     cuda/kquant_matmul.cu
     cuda/iq2_matmul.cu
     cuda/iq3_matmul.cu
+    cuda/iq4xs_matmul.cu
     cuda/rmsnorm.cu
     cuda/iq2m_dequant.cu
     cuda/iq1_dequant.cu

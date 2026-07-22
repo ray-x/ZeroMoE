@@ -145,10 +145,27 @@ public:
                      "(layer=%d expert=%d) -- worker thread likely holding it, check for a nearby "
                      "[SLOW-STAGING-REGROW] line\n", _wait_ms, layer_idx, expert_id);
         }
+        // Failure-reason split (n_pipe_miss_no_match / n_pipe_miss_not_ready,
+        // perf_timer.hpp) -- added to diagnose a real run where Prefetch
+        // (PIPE) served collapsed to 0.1%: matching on identity FIRST,
+        // independent of ready, lets a caller distinguish "the pilot never
+        // predicted this expert (or the slot got recycled before this miss
+        // arrived)" from "the pilot predicted correctly but the read simply
+        // hadn't finished yet" -- two different root causes needing two
+        // different fixes. Behavior change from before: previously, a slot
+        // with a matching identity but ready==false was silently skipped
+        // and the scan continued (in case some OTHER slot also matched,
+        // extremely unlikely in practice since round-robin write assignment
+        // means at most one slot should ever hold a given identity at a
+        // time); now the first identity match returns immediately either
+        // way. Correctness-neutral either way -- ready==false still always
+        // falls back to a synchronous load, exactly as before.
         for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
-            if (staging[i].layer_idx == layer_idx &&
-                staging[i].expert_id == expert_id &&
-                staging[i].ready.load(std::memory_order_acquire)) {
+            if (staging[i].layer_idx == layer_idx && staging[i].expert_id == expert_id) {
+                if (!staging[i].ready.load(std::memory_order_acquire)) {
+                    perf().n_pipe_miss_not_ready.fetch_add(1, std::memory_order_relaxed);
+                    return false;  // predicted right, but the read isn't done -- caller falls back
+                }
                 size_t bytes = staging[i].loaded_bytes;
                 if (dst_cap < bytes) return false;  // caller buffer too small -> caller falls back to load_expert_slab
                 std::memcpy(dst, staging[i].pinned_buf, bytes);
@@ -162,6 +179,7 @@ public:
                 return true;
             }
         }
+        perf().n_pipe_miss_no_match.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 

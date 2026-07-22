@@ -4,6 +4,10 @@
 #include <cstdio>
 #include <cstdint>
 #include <atomic>
+#include <map>
+#include <string>
+#include <vector>
+#include <algorithm>
 
 #ifdef __APPLE__
 #include <mach/mach.h>
@@ -59,6 +63,18 @@ struct PerfCounters {
                                              // product (dot_f32_avx512), summed
                                              // across OMP worker threads.
     std::atomic<double> t_attn{0};          // MLA attention forward (total)
+    // Untimed setup before the first named sub-phase (arch-config reads,
+    // rope_theta lookup via get_config_float, string prefix build) -- added
+    // after the six phases below plus t_attn itself failed to fully
+    // reconcile (sub-phases summed to only ~35-40% of t_attn across
+    // multiple real runs, even with WUK/WUV's one-time cost -- see absorb's
+    // own comment -- confirmed via a same-process two-request test to be
+    // warm on the second call). Static review of every line in this
+    // preamble suggested it should be microseconds, not the tens of
+    // seconds needed to explain the gap -- this timer stayed near-zero on
+    // every real run, correctly ruling this out as the explanation (see
+    // t_prefill_total below for the real one).
+    std::atomic<double> t_attn_preamble{0};
     // Per-phase breakdown of t_attn, added to root-cause an intermittent
     // severe stall (~90s in one token) that showed the CPU idle/cool at the
     // time (ruled out: thermal throttling, memory pressure, other
@@ -134,10 +150,68 @@ struct PerfCounters {
     std::atomic<int64_t> bytes_gpu_uploaded{0};
     // Phase A (colibri-port) counters:
     std::atomic<uint64_t> n_pipe_hits{0};          // cache misses served from the prefetcher's staging pool (no pread) -- the higher this is vs n_expert_cache_miss, the more disk I/O was hidden behind compute
-    std::atomic<uint64_t> n_pinned_eviction_skips{0}; // times evict_lru skipped a pinned/in-flight slot -- non-zero under pressure proves the pinning policy is protecting the hot set
+    std::atomic<uint64_t> n_pinned_eviction_skips{0}; // MEANING CHANGED once GpuTopology::unpinned_slot_indices landed: evict_lru no longer visits permanently-pinned slots at all (they're excluded from the scan at the source), so this now only increments on the DEFENSIVE fallback check -- should read 0 on a healthy run; nonzero means unpinned_slot_indices desynced from the real `pinned` flags somewhere (see gpu_topology.hpp's evict_lru). Previously (before that optimization) this counted every pinned slot skipped during a normal scan, and nonzero was the EXPECTED/healthy signal -- the polarity of "what a nonzero value means" flipped with that change.
     std::atomic<uint64_t> n_temp_pin_eviction_skips{0}; // times evict_lru skipped a slot TEMPORARILY held for an in-flight decode-time GPU dispatch (ExpertLocation::temp_pin_count > 0) -- distinct from n_pinned_eviction_skips (permanent pins); nonzero proves the compute-in-flight protection is actually engaging
+    std::atomic<uint64_t> n_upload_pending_eviction_skips{0}; // times evict_lru skipped a slot whose async H2D upload was CONFIRMED still genuinely in flight (re-polled via cudaEventQuery, not just trusting a stale flag) -- the real "must not evict" count
+    std::atomic<uint64_t> n_stale_upload_ready_reclaimed{0}; // times evict_lru found upload_ready==false but the event had ACTUALLY already completed (a speculative pilot-prefetch promotion that was never subsequently confirmed via find_expert) and flipped it back to true itself -- nonzero proves real cache capacity was being silently leaked before this fix; see gpu_topology.hpp's evict_lru comment
+    std::atomic<uint64_t> n_stale_expert_index_hits{0}; // times find_expert's O(1) expert_index pointed at a slot that didn't actually match the requested (layer,expert_id) -- should be ALWAYS ZERO by construction (evict_lru/upload_expert/upload_expert_async are the only mutation sites, all under cache_mutex); nonzero means the index and expert_vram_cache have desynced somewhere and find_expert is safely falling back to its linear scan, but the root cause needs investigating
     std::atomic<uint64_t> n_pinned_resident{0};    // experts currently held as non-evictable VRAM residents (pinned). Gauge-ish: incremented on pin, decremented on unpin.
     std::atomic<uint64_t> n_pilot_hints_skipped{0}; // speculative pilot-prefetch hints skipped because the expert was ALREADY host-cache-resident (a guaranteed instant hit needing no read) -- measures how much prefetch-worker bandwidth this avoids wasting; compare against n_pipe_hits/n_expert_cache_miss before/after to see the effect
+    std::atomic<uint64_t> n_vram_evict_demoted{0};  // VRAM evictions salvaged into the RAM tier via a D2H copy instead of being dropped outright (vram_evict_demote_to_ram=true) -- nonzero proves the salvage path is engaging; compare against Expert cache's disk-miss count for the real win (a demoted expert re-hit later serves from RAM, no disk read at all)
+    std::atomic<uint64_t> n_vram_evict_demote_skipped{0}; // demote attempts that declined for a benign reason (already RAM-resident, or the layer uses the legacy per-expert-tensor format with no packed_slab_geometry) -- not an error, just nothing to do
+    std::atomic<uint64_t> n_vram_evict_demote_failed{0};  // demote attempts that hit a real problem (cudaMemcpy D2H failure, size mismatch) -- should stay at/near 0; a nonzero count is worth investigating but never corrupts anything, since a failed demote just leaves the RAM slot empty rather than half-populated
+    // PIPE consume_staged failure-reason split -- added after a real run
+    // showed Prefetch (PIPE) served collapse to 0.1% (16/11247 misses),
+    // far below this project's own previously-documented ~24-25% baseline,
+    // with no obvious code regression found on inspection. These two
+    // counters separate two very different root causes that n_pipe_hits
+    // alone can't distinguish, so the next real run's data (not more
+    // guessing) can determine which fix actually applies:
+    std::atomic<uint64_t> n_pipe_miss_no_match{0};    // consume_staged found NO staging slot at all for this (layer,expert) -- either the pilot never predicted this exact expert, or it did but the slot was already round-robin-recycled for a later hint before this miss arrived. Points at PREDICTION ACCURACY / staging POOL SIZE as the lever, not raw read speed.
+    std::atomic<uint64_t> n_pipe_miss_not_ready{0};    // consume_staged found a matching (layer,expert) slot but its pread hadn't finished yet -- the pilot's prediction was CORRECT, this was purely a timing loss. Points at making the staged read start earlier / finish faster (or growing NUM_STAGING_SLOTS so more predictions survive the wait) as the lever, not prediction accuracy.
+
+    // Sum of every request's OWN measured wall time (request_wall_ms from
+    // generate_text, the same number the [REQUEST] line itself prints),
+    // accumulated across the whole session. Deliberately NOT the same as
+    // session_elapsed_s (engine-ready-to-shutdown wall-clock) -- that
+    // figure silently includes any idle time between turns (REPL waiting
+    // on the next prompt, a script pausing between requests), which isn't
+    // processing time at all. Found via a real run whose aggregate
+    // "Throughput" line implied a ~415s stall that turned out to be pure
+    // idle time between one finished request and the next -- the true
+    // per-request numbers were fine throughout. This is the correct
+    // denominator for a "how fast is generation, only counting actual
+    // work" throughput figure; session_elapsed_s remains useful too, but
+    // strictly as "how long did the whole process run," not as a speed
+    // metric on its own.
+    std::atomic<double> t_active_processing{0};
+    std::atomic<uint64_t> n_requests{0};
+
+    // Whole-request prefill pass duration (all 78 layers, one call to
+    // layers_forward_gguf covering attention + MoE routing + MoE expert FFN
+    // + everything else for the full prompt) -- ROOT CAUSE of the
+    // "sub-phases summed to only ~35-40% of t_attn" mystery documented on
+    // t_attn_preamble above. generation_loop.hpp used to feed this entire
+    // duration into t_attn itself (`PERF_END(prefill, t_attn)`, comment:
+    // "counts as part of attention/compute time") -- which double-counted
+    // attention's own real contribution (mla_attention_absorbed_gguf's own
+    // per-layer PERF_SCOPE(t_attn) already captures that correctly, called
+    // from within this same layers_forward_gguf pass) AND, far more
+    // significantly, folded in everything else the prefill pass does that
+    // has NOTHING to do with attention -- MoE routing, MoE expert FFN
+    // (routinely the single largest cost bucket in this project), and any
+    // cold-cache disk-bound expert loading triggered by the FIRST-ever
+    // visit to every layer. On a cold-cache run (thin/absent
+    // .moestream_usage history) that one prefill call can be dominated by
+    // disk I/O across all 78 layers -- exactly the kind of large, real,
+    // non-attention cost that was silently inflating "Attention (MLA)" in
+    // dump_report() and made a genuine, still-partially-open GPU-stall
+    // investigation earlier this session harder to pin down than it needed
+    // to be. Given its own standalone counter (not folded into t_attn,
+    // and deliberately NOT part of the Snapshot/operator-/snapshot()
+    // triple below -- this is a once-per-request total, not a per-token
+    // delta, same reasoning as t_active_processing above).
+    std::atomic<double> t_prefill_total{0};
 
     // Hint-push-to-pickup delay: how long a prefetch hint sits in the
     // queue before the worker thread actually starts processing it.
@@ -163,6 +237,7 @@ struct PerfCounters {
         double t_disk_read=0, t_host_alloc=0, t_gpu_upload=0, t_gpu_download=0, t_gpu_compute=0, t_cpu_expert=0;
         double t_cpu_dequant=0, t_cpu_dot=0;
         double t_attn=0;
+        double t_attn_preamble=0;
         double t_attn_norm=0, t_attn_qproj=0, t_attn_kvproj=0, t_attn_absorb=0, t_attn_score=0, t_attn_outproj=0;
         double t_dense_gpu_up=0, t_dense_gpu_compute=0, t_dense_gpu_down=0;
         double t_moe_route=0, t_moe_expert=0, t_prefetch=0, t_dense_load=0, t_consume_staged=0;
@@ -179,6 +254,7 @@ struct PerfCounters {
                 t_gpu_compute - b.t_gpu_compute, t_cpu_expert - b.t_cpu_expert,
                 t_cpu_dequant - b.t_cpu_dequant, t_cpu_dot - b.t_cpu_dot,
                 t_attn - b.t_attn,
+                t_attn_preamble - b.t_attn_preamble,
                 t_attn_norm - b.t_attn_norm, t_attn_qproj - b.t_attn_qproj,
                 t_attn_kvproj - b.t_attn_kvproj, t_attn_absorb - b.t_attn_absorb,
                 t_attn_score - b.t_attn_score, t_attn_outproj - b.t_attn_outproj,
@@ -213,6 +289,7 @@ struct PerfCounters {
             t_gpu_compute.load(), t_cpu_expert.load(),
             t_cpu_dequant.load(), t_cpu_dot.load(),
             t_attn.load(),
+            t_attn_preamble.load(),
             t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
             t_attn_absorb.load(), t_attn_score.load(), t_attn_outproj.load(),
             t_dense_gpu_up.load(), t_dense_gpu_compute.load(), t_dense_gpu_down.load(),
@@ -255,7 +332,7 @@ struct PerfCounters {
     static void print_delta(const char* label, double wall_ms, const Snapshot& d) {
         uint64_t hits = d.n_expert_cache_hit, misses = d.n_expert_cache_miss;
         LOG_DEBUG(
-            "[%s] wall=%8.2fms  attn=%7.2fms [norm=%6.2f qproj=%6.2f kvproj=%6.2f absorb=%6.2f "
+            "[%s] wall=%8.2fms  attn=%7.2fms [preamble=%6.2f norm=%6.2f qproj=%6.2f kvproj=%6.2f absorb=%6.2f "
             "score=%6.2f outproj=%6.2f] route=%6.2fms expert=%7.2fms "
             "gpu_up=%6.2fms gpu_dn=%6.2fms gpu_cmp=%6.2fms cpu_exp=%7.2fms (dequant=%6.2fms dot=%6.2fms) "
             "dense_gpu[up=%6.2f cmp=%6.2f dn=%6.2f calls=%llu] "
@@ -263,6 +340,7 @@ struct PerfCounters {
             "pipe=%llu pin_skip=%llu pin=%llu\n",
             label, wall_ms,
             d.t_attn * 1000.0,
+            d.t_attn_preamble * 1000.0,
             d.t_attn_norm * 1000.0, d.t_attn_qproj * 1000.0, d.t_attn_kvproj * 1000.0,
             d.t_attn_absorb * 1000.0, d.t_attn_score * 1000.0, d.t_attn_outproj * 1000.0,
             d.t_moe_route * 1000.0, d.t_moe_expert * 1000.0,
@@ -292,7 +370,7 @@ struct PerfCounters {
         double tok_s = wall_ms > 0 ? n_tokens / (wall_ms / 1000.0) : 0.0;
         double dense_gpu_total = d.t_dense_gpu_up + d.t_dense_gpu_compute + d.t_dense_gpu_down;
         LOG_INFO(
-            "[%s] %d tokens in %.2fs (%.2f tok/s)  attn=%.2fs [norm=%.2f qproj=%.2f kvproj=%.2f "
+            "[%s] %d tokens in %.2fs (%.2f tok/s)  attn=%.2fs [preamble=%.2f norm=%.2f qproj=%.2f kvproj=%.2f "
             "absorb=%.2f score=%.2f outproj=%.2f] route=%.2fs "
             "expert=%.2fs (gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs] cpu=%.2fs [dequant=%.2fs dot=%.2fs]) "
             "dense_gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs calls=%llu] "
@@ -300,6 +378,7 @@ struct PerfCounters {
             "pipe=%llu(pin_skip=%llu pin=%llu)\n",
             label, n_tokens, wall_ms / 1000.0, tok_s,
             d.t_attn,
+            d.t_attn_preamble,
             d.t_attn_norm, d.t_attn_qproj, d.t_attn_kvproj, d.t_attn_absorb, d.t_attn_score, d.t_attn_outproj,
             d.t_moe_route, d.t_moe_expert,
             gpu_round_trip, d.t_gpu_upload, d.t_gpu_compute, d.t_gpu_download, d.t_cpu_expert,
@@ -351,9 +430,14 @@ struct PerfCounters {
         LOG_INFO("GPU round-trip total:%8.3f s  (upload+compute+download, expert_ffn only)\n", gpu_round_trip);
         LOG_INFO("CPU expert (fallback):%7.3f s  (dequant=%.3fs dot=%.3fs)\n",
                  t_cpu_expert.load(), t_cpu_dequant.load(), t_cpu_dot.load());
-        LOG_INFO("Attention (MLA):     %8.3f s  (norm=%.3f qproj=%.3f kvproj=%.3f absorb=%.3f score=%.3f outproj=%.3f)\n",
-                 t_attn.load(), t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
+        LOG_INFO("Attention (MLA):     %8.3f s  (preamble=%.3f norm=%.3f qproj=%.3f kvproj=%.3f absorb=%.3f score=%.3f outproj=%.3f)\n",
+                 t_attn.load(), t_attn_preamble.load(), t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
                  t_attn_absorb.load(), t_attn_score.load(), t_attn_outproj.load());
+        LOG_INFO("Prefill (whole pass):%8.3f s  (ALL layers' attention+MoE routing+MoE FFN combined, one call per "
+                 "request -- was previously double-counted into Attention (MLA) above; see t_prefill_total's own "
+                 "comment. If Attention (MLA) still doesn't reconcile against its own sub-phases after subtracting "
+                 "prefill's own attention share, that's a genuinely separate gap worth investigating.)\n",
+                 t_prefill_total.load());
         LOG_INFO("Dense GPU dispatch:  %8.3f s  (up=%.3f cmp=%.3f dn=%.3f, %lu calls, %.3fms/call avg)\n",
                  t_dense_gpu_up.load() + t_dense_gpu_compute.load() + t_dense_gpu_down.load(),
                  t_dense_gpu_up.load(), t_dense_gpu_compute.load(), t_dense_gpu_down.load(),
@@ -380,22 +464,42 @@ struct PerfCounters {
         LOG_INFO("Expert cache:        %lu hit / %lu miss (%.1f%% hit rate)\n",
                  (unsigned long)hits, (unsigned long)misses,
                  (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0);
-        LOG_INFO("Prefetch (PIPE):     %lu misses served from staging / %lu total misses (%.1f%% served)\n",
+        LOG_INFO("Prefetch (PIPE):     %lu misses served from staging / %lu total misses (%.1f%% served) "
+                 "-- of the unserved: %lu no matching staged slot (wrong/stale prediction) / "
+                 "%lu matched but pread not finished yet (pure timing loss)\n",
                  (unsigned long)n_pipe_hits.load(), (unsigned long)misses,
-                 misses > 0 ? 100.0 * n_pipe_hits.load() / misses : 0.0);
+                 misses > 0 ? 100.0 * n_pipe_hits.load() / misses : 0.0,
+                 (unsigned long)n_pipe_miss_no_match.load(), (unsigned long)n_pipe_miss_not_ready.load());
         LOG_INFO("Pilot hints skipped: %lu (already host-cache-resident -- avoided wasting prefetch bandwidth)\n",
                  (unsigned long)n_pilot_hints_skipped.load());
+        LOG_INFO("VRAM->RAM demote:    %lu salvaged / %lu skipped (benign) / %lu failed "
+                 "(vram_evict_demote_to_ram: instead of dropping an evicted expert's bytes, D2H "
+                 "copy them back into the RAM tier before the VRAM slot is overwritten)\n",
+                 (unsigned long)n_vram_evict_demoted.load(),
+                 (unsigned long)n_vram_evict_demote_skipped.load(),
+                 (unsigned long)n_vram_evict_demote_failed.load());
         LOG_INFO("Prefetch pickup:     avg %.2fms over %lu hints, peak queue backlog %lu "
                  "(large delay + small backlog => worker CPU-starved; growing backlog => worker throughput-bound)\n",
                  n_prefetch_hints_processed > 0
                      ? 1000.0 * t_prefetch_pickup_delay.load() / n_prefetch_hints_processed.load() : 0.0,
                  (unsigned long)n_prefetch_hints_processed.load(),
                  (unsigned long)n_prefetch_backlog_peak.load());
-        LOG_INFO("Pinned residents:    %lu current / %lu eviction-skips\n",
+        LOG_INFO("Pinned residents:    %lu current / %lu desync-detected "
+                 "(evict_lru no longer scans pinned slots at all -- this should read 0; "
+                 "nonzero means unpinned_slot_indices desynced from the real pinned flags)\n",
                  (unsigned long)n_pinned_resident.load(),
                  (unsigned long)n_pinned_eviction_skips.load());
         LOG_INFO("Temp-pin skips:      %lu (decode-time cold-GPU-dispatch slots protected mid-compute)\n",
                  (unsigned long)n_temp_pin_eviction_skips.load());
+        LOG_INFO("Upload-pending skips: %lu genuinely-in-flight (confirmed via re-poll) / "
+                 "%lu stale-flag reclaimed (a speculative promotion's copy had actually "
+                 "finished but was never re-confirmed -- see gpu_topology.hpp's evict_lru fix)\n",
+                 (unsigned long)n_upload_pending_eviction_skips.load(),
+                 (unsigned long)n_stale_upload_ready_reclaimed.load());
+        LOG_INFO("Stale index hits:    %lu (find_expert's O(1) expert_index disagreed with "
+                 "expert_vram_cache's real contents -- should always be 0; nonzero means the "
+                 "index/array desynced somewhere, see gpu_topology.hpp)\n",
+                 (unsigned long)n_stale_expert_index_hits.load());
         LOG_INFO("Staging mutex wait:  %8.3f s  (staging slot regrow: %lu events, %.3f s -- "
                  "cudaMallocHost/cudaFreeHost held under the SAME lock, see [SLOW-STAGING-REGROW])\n",
                  t_staging_mutex_wait.load(), (unsigned long)n_staging_regrow.load(), t_staging_regrow.load());
@@ -403,11 +507,20 @@ struct PerfCounters {
                  "thread's hit-triggered promotions and the prefetcher worker thread)\n",
                  t_cache_mutex_wait.load());
         LOG_INFO("Tokens generated:    %lu\n", (unsigned long)n_tokens_generated.load());
+        double active_s = t_active_processing.load();
+        if (n_tokens_generated > 0 && active_s > 0) {
+            LOG_INFO("Throughput:          %.2f tok/s  (%.2fs active processing across %lu request(s) -- "
+                     "sum of each [REQUEST] line's own wall time, EXCLUDING any idle time between "
+                     "prompts/turns -- this is the real generation-speed number, mixes prefill+decode; "
+                     "see the per-request [REQUEST] line for a single turn's own rate, or per-token "
+                     "[TOKEN N] DEBUG lines excluding token 0 for a decode-only rate)\n",
+                     n_tokens_generated.load() / active_s, active_s, (unsigned long)n_requests.load());
+        }
         if (n_tokens_generated > 0 && session_elapsed_s > 0) {
-            LOG_INFO("Throughput:          %.2f tok/s  (%.2fs real wall-clock, engine-ready to shutdown, "
-                     "ALL turns in this session -- mixes prefill+decode; see the per-request [REQUEST] "
-                     "line for a single turn's own wall-clock rate, or per-token [TOKEN N] DEBUG lines "
-                     "excluding token 0 for a decode-only rate)\n",
+            LOG_INFO("Session wall-clock:  %.2f tok/s  (%.2fs engine-ready to shutdown -- INCLUDES any "
+                     "idle time between turns, e.g. a REPL waiting on the next prompt; use the "
+                     "Throughput line above for real generation speed. A large gap between these two "
+                     "numbers means the process sat idle, not that generation was slow.)\n",
                      n_tokens_generated.load() / session_elapsed_s, session_elapsed_s);
         }
         LOG_INFO("RSS:                 %.2f GB\n", rss_gb());
@@ -463,3 +576,63 @@ inline PerfCounters& perf() {
     while (!perf().counter.compare_exchange_weak(_old, _old + _elapsed, \
                 std::memory_order_relaxed, std::memory_order_relaxed)) {} \
 } while(0)
+
+// ---- Diagnostic-only, per-tensor-name dense_proj timing ----
+// Added to check whether specific attention projection weights
+// (attn_q_a/attn_q_b/attn_kv_a_mqa) cost enough through their fused
+// K-quant/IQ kernel to justify a BF16 fast-path extension -- the same
+// question attn_output's ~623ms/token profiling answered for that tensor,
+// but attn_q_a/q_b/kv_a_mqa are individually much smaller and share
+// attention_layer.cpp's existing t_attn_qproj/t_attn_kvproj buckets with
+// each other AND with non-matmul work (RoPE), so those buckets alone can't
+// isolate any one tensor's own cost.
+//
+// Deliberately independent of PerfCounters' Snapshot/operator-/snapshot()
+// triple above -- every field added there requires updating three
+// positions in lockstep (a mismatch already caused a real narrowing-
+// conversion build break once this session, see CLAUDE.md). This is a
+// narrower, possibly-temporary investigation, not a permanent session-wide
+// counter, so it gets its own much simpler single-threaded accumulator
+// instead: safe because dense_proj/attention are only ever called from the
+// single main decode thread (same assumption this project already relies
+// on elsewhere, e.g. the wuk_cache/wuv_cache static caches).
+struct NamedTimerStats { double total_ms = 0.0; uint64_t calls = 0; };
+
+inline std::map<std::string, NamedTimerStats>& named_timer_stats() {
+    static std::map<std::string, NamedTimerStats> stats;
+    return stats;
+}
+
+// RAII scope timer: construct at the top of the block being measured,
+// destructor records elapsed ms under `name`. e.g.:
+//   { NamedTimerScope _t("attn_q_a"); dense_proj(engine, p + "attn_q_a.weight", ...); }
+struct NamedTimerScope {
+    std::string name;
+    std::chrono::high_resolution_clock::time_point t0;
+    explicit NamedTimerScope(std::string n)
+        : name(std::move(n)), t0(std::chrono::high_resolution_clock::now()) {}
+    ~NamedTimerScope() {
+        double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count();
+        auto& s = named_timer_stats()[name];
+        s.total_ms += ms;
+        s.calls += 1;
+    }
+};
+
+// Call once at shutdown (mirrors report_cache_churn()'s placement/style).
+// Largest-total-first so the dominant contributor is obvious at a glance.
+inline void report_named_timers() {
+    auto& stats = named_timer_stats();
+    if (stats.empty()) return;
+    std::vector<std::pair<std::string, NamedTimerStats>> sorted(stats.begin(), stats.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second.total_ms > b.second.total_ms; });
+    LOG_INFO("[NAMED-TIMING] Per-tensor-name dense_proj cost (diagnostic -- "
+             "added to evaluate BF16 fast-path candidates):\n");
+    for (auto& [name, s] : sorted) {
+        LOG_INFO("  %-20s total=%.2f ms  calls=%llu  avg=%.4f ms/call\n",
+                 name.c_str(), s.total_ms, (unsigned long long)s.calls,
+                 s.calls ? s.total_ms / (double)s.calls : 0.0);
+    }
+}

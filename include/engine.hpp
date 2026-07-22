@@ -74,6 +74,39 @@ struct MoEExpertBlock {
     size_t slab_capacity = 0;
     uint64_t last_used_clock = 0;
     uint32_t hit_count = 0;  // frequency signal for eviction scoring (power-law routing)
+
+    // True for a lightweight "shadow" block populated by
+    // StreamingEngine::populate_vram_shadow (execution_layer.cpp's
+    // moe_forward_gguf) instead of a real disk-backed RAM-tier load --
+    // gate_proj.meta/up_proj.meta/down_proj.meta are valid (type + the
+    // packed slab's uniform per-layer relative offsets), but host_ptr is
+    // deliberately null and slab_buffer/slab_capacity are unset, since
+    // the fast path this exists for (an expert already confirmed VRAM-
+    // resident) never reads them -- GPU dispatch reads weight bytes from
+    // ExpertLocation::device_ptr, never from here. Callers MUST check
+    // this flag before touching host_ptr; see moe_forward_gguf's Pass A
+    // loop for the required emergency-reload fallback if GPU dispatch
+    // unexpectedly fails for a shadowed expert.
+    bool vram_shadow = false;
+
+    // True once RAMSafetyManager::get_expert/get_experts_batch has
+    // CONFIRMED (via GpuTopology::find_expert, which itself polls
+    // upload_ready before returning non-null -- never set from the
+    // moment an async promotion is merely ISSUED, which would race the
+    // in-flight cudaMemcpyAsync still reading this slot's slab_buffer)
+    // that this same (layer, expert_id) is ALSO resident and ready in the
+    // VRAM tier. A slot with this set is genuinely redundant capacity --
+    // the RAM eviction-victim scan (get_expert/get_experts_batch's Step 3)
+    // treats it as the lowest-priority ("evict first") candidate
+    // regardless of its own recency/hit_count, so double-stored capacity
+    // gets reclaimed promptly instead of lingering until unrelated LRU
+    // pressure happens to pick it (see CLAUDE.md's TIER-OVERLAP finding).
+    // Reset to false whenever a slot is claimed for a different expert --
+    // the new occupant isn't known to be VRAM-redundant. Deliberately
+    // never proactively un-set if the VRAM copy is later evicted: worst
+    // case a slightly-too-eagerly-marked slot causes one extra disk read
+    // on its next miss, a performance cost only, never a correctness one.
+    bool also_in_vram = false;
 };
 
 class StreamingEngine {
@@ -281,6 +314,46 @@ public:
         slot.down_proj.meta.offset = gb + ub;
         slot.down_proj.meta.size_bytes = db;
         slot.expert_id = expert_id;
+        slot.vram_shadow = false;
+    }
+
+    // Metadata-only counterpart to load_expert_slab/populate_packed_slab --
+    // ZERO disk I/O, zero RAM-slot involvement. Fixes the real, measured
+    // "[TIER-OVERLAP]" finding (see CLAUDE.md): moe_forward_gguf's per-
+    // token dispatch used to call RAMSafetyManager::get_experts_batch
+    // UNCONDITIONALLY for every routed expert, even ones already GPU-
+    // resident, wasting a real disk read and a real RAM slot on data whose
+    // BYTES the GPU-dispatch path never actually reads (it reads the
+    // packed base tensor's TYPE, uniform across every expert in a layer,
+    // and the weight bytes from ExpertLocation::device_ptr -- never from
+    // a RAM copy). This fills in exactly that metadata (type + the
+    // packed slab's uniform per-expert relative offsets: gate=0, up=gb,
+    // down=gb+ub) from packed_slab_geometry, which is a pure tensor-table
+    // lookup already parsed at GGUF load time -- same source
+    // load_expert_slab itself uses before it ever touches disk. host_ptr
+    // is deliberately left null; slot.vram_shadow=true is the required
+    // signal callers must check before touching it (see MoEExpertBlock's
+    // own comment). Returns false (slot untouched) if this layer has no
+    // packed expert tensors at all (e.g. a non-MoE layer).
+    bool populate_vram_shadow(MoEExpertBlock& slot, int layer_idx, int expert_id) const {
+        size_t gb = 0, ub = 0, db = 0;
+        const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
+        slot.gate_proj.host_ptr = nullptr;
+        slot.gate_proj.meta = *gM;
+        slot.gate_proj.meta.offset = 0;
+        slot.gate_proj.meta.size_bytes = gb;
+        slot.up_proj.host_ptr = nullptr;
+        slot.up_proj.meta = *uM;
+        slot.up_proj.meta.offset = gb;
+        slot.up_proj.meta.size_bytes = ub;
+        slot.down_proj.host_ptr = nullptr;
+        slot.down_proj.meta = *dM;
+        slot.down_proj.meta.offset = gb + ub;
+        slot.down_proj.meta.size_bytes = db;
+        slot.expert_id = expert_id;
+        slot.vram_shadow = true;
+        return true;
     }
 
     void load_expert_slab(int layer_idx, int expert_id, MoEExpertBlock& target_slot) {
@@ -465,18 +538,46 @@ public:
     // Write "layer expert count" lines for every (layer,expert) ever selected.
     // Mirrors colibri's .coli_usage format so a future cross-engine diff is
     // trivial. Best-effort: a failed open/write just logs and continues.
+    //
+    // Accumulates on top of whatever a PREVIOUS run already wrote here,
+    // rather than overwriting it -- this file is meant to mature across many
+    // sessions the way colibri's own .coli_usage does (per this project's
+    // colibri comparison in CLAUDE.md: colibri's AUTOPIN mechanism won't
+    // even engage below 5,000 accumulated selections and doesn't reach its
+    // full budget until 200,000). The original implementation opened the
+    // file in plain "w" mode and wrote only THIS session's in-memory
+    // route_freq -- since route_freq itself is zero-initialized fresh at
+    // every process start (init_route_freq) and is never seeded FROM the
+    // file, every run's shutdown was silently discarding all prior history
+    // and replacing it with just that one run's counts (observed: the
+    // [PIN] log's "max count" stayed stuck around 24-25 across an entire
+    // session's worth of runs -- it was never actually accumulating).
+    // Fixed by reading whatever's already on disk first and summing counts
+    // per (layer,expert) before writing back out. A user who wants a clean
+    // slate (checkpoint swap, or if a matured/pinned profile ever starts
+    // hurting instead of helping -- see the pin_vram_lru_fraction/
+    // pin_ram_fraction regression writeup) can just delete the file; the
+    // next run's load_usage() already treats a missing file as "first run",
+    // no separate reset flag needed.
     void dump_usage(const std::string& path) const {
         if (path.empty() || route_freq.empty()) return;
+        int ne = model_file.architecture_config.n_experts;
+        auto [prior, prior_maxc] = load_usage(path);
+        (void)prior_maxc;
+        std::vector<uint64_t> merged(route_freq.size(), 0);
+        for (auto& e : prior) {
+            size_t idx = (size_t)e.layer * (size_t)ne + (size_t)e.expert;
+            if (idx < merged.size()) merged[idx] = e.count;
+        }
         FILE* f = std::fopen(path.c_str(), "w");
         if (!f) { LOG_WARN("[USAGE] could not write %s\n", path.c_str()); return; }
-        int ne = model_file.architecture_config.n_experts;
         for (size_t i = 0; i < route_freq.size(); ++i) {
-            uint64_t c = route_freq[i].load(std::memory_order_relaxed);
+            uint64_t c = merged[i] + route_freq[i].load(std::memory_order_relaxed);
             if (c == 0) continue;
             std::fprintf(f, "%zu %zu %llu\n", i / (size_t)ne, i % (size_t)ne, (unsigned long long)c);
         }
         std::fclose(f);
-        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s\n", path.c_str());
+        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s (accumulated across sessions)\n", path.c_str());
     }
 
     // Read a usage file written by dump_usage. Returns one UsageEntry per

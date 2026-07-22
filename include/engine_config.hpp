@@ -69,6 +69,90 @@ struct EngineConfig {
     std::string pin_file = ".moestream_usage";
     int pin_topk_per_layer = 0;
 
+    // Multi-tier startup preload, extending the single top-K-pinned tier
+    // above into a graduated scheme driven by the SAME usage file (which
+    // already records every expert ever routed to, not just the top-K --
+    // StreamingEngine::route_freq/dump_usage cover the full histogram).
+    // Per layer, ranked by historical selection count, AFTER the
+    // pin_topk_per_layer-sized pinned prefix:
+    //   next round(pin_vram_lru_fraction * avg_vram_slots_per_layer) ranks
+    //     -> VRAM, but NOT pinned -- a regular reactively-evictable slot,
+    //     just pre-warmed instead of starting cold;
+    //   next round(pin_ram_fraction * ram_mgr.slots_per_layer) ranks ->
+    //     host RAM tier, preloaded (a genuinely new capability -- the RAM
+    //     tier previously always started completely cold, filling only
+    //     reactively during real generation).
+    // Fraction of that TIER's OWN real per-layer capacity (VRAM: the same
+    // expert_vram_cache_cap/moe_layers average main.cpp's pin_topk_per_layer
+    // "auto" mode already uses; RAM: ram_mgr.slots_per_layer, the real
+    // RAM-budget-derived cap) -- not a fixed count, so it scales with
+    // whatever VRAM/RAM budget a given deployment actually has, and reads
+    // as a directly comparable "preload N% of this tier" knob across
+    // hardware. 0.0 = fully disabled (the ORIGINAL pre-multi-tier
+    // behavior -- only the top-K-pinned tier runs, matching the single-
+    // tier design colibri itself uses, see CLAUDE.md's colibri comparison:
+    // colibri deliberately NEVER preloads its own equivalent streaming-LRU
+    // tier, precisely because a preload into anything subject to ordinary
+    // eviction pressure is an unrecouped-disk-read gamble, not a guaranteed
+    // win the way preloading a PINNED tier is). Real measurement on this
+    // project's own hardware found the >0 defaults this feature originally
+    // shipped with (a fixed 5/layer each) made a real run slower (83.65 GB
+    // disk read vs. a tight 77.8-77.9 GB cluster across three 0-preload
+    // runs) -- defaulted to 0.0 (disabled) here specifically so out-of-
+    // the-box behavior matches the proven-good pre-feature baseline; A/B
+    // test explicit values (0.1, 0.2, 0.3, ...) against your own real
+    // workload before trusting any nonzero default. If 0.0 wins outright
+    // across real testing, this whole tier-2/3 code path (main.cpp's
+    // preload loops, this pair of fields) is a clean, self-contained
+    // removal -- no other code depends on it.
+    double pin_vram_lru_fraction = 0.0;
+    double pin_ram_fraction = 0.0;
+
+    // When a VRAM cache slot is evicted (GpuTopology::evict_lru, via
+    // upload_expert), salvage the outgoing expert's bytes into the RAM
+    // tier with a D2H copy instead of letting them be silently dropped.
+    // Previously a VRAM-evicted expert not ALSO already RAM-resident went
+    // fully cold -- its next use always paid a full disk read even though
+    // the identical bytes existed in VRAM a moment earlier. A PCIe D2H
+    // copy of one expert slab costs roughly a millisecond vs. a 15-50ms+
+    // NVMe re-read (this project's own measured [MOE-CACHE] MISS timings),
+    // so this is a real, asymmetric win on paper -- but it's new,
+    // untested on real hardware, and touches the same VRAM-eviction/
+    // cross-thread-reuse territory that has produced multiple real
+    // silent-corruption incidents earlier in this project's history (see
+    // CLAUDE.md). Scoped deliberately narrow to avoid the worst of that
+    // risk: only wired into upload_expert (decode-thread-only), never
+    // upload_expert_async (the prefetcher thread's own promotion path),
+    // so RAMSafetyManager::layers_experts keeps its existing
+    // single-writer-thread invariant with no new locking required -- see
+    // gpu_topology.hpp's on_vram_evict and ram_manager.hpp's
+    // demote_from_vram for the full reasoning. Default false: opt-in only,
+    // A/B test against a run with this disabled before trusting it (watch
+    // dump_report()'s "VRAM->RAM demote:" line and Expert cache hit
+    // rate/disk-read totals for the real effect).
+    bool vram_evict_demote_to_ram = false;
+
+    // Redistributes RAMSafetyManager's fixed total RAM-tier budget
+    // (uniform slots_per_layer * n_layers) across layers proportional to
+    // each layer's real historical need instead of splitting it evenly.
+    // Motivated by direct measurement on this project's own accumulated
+    // .moestream_usage file (75 layers, 672 selections/layer after
+    // several sessions): the most routing-concentrated layer needed only
+    // 31 of its own top-ranked experts to cover 80% of its traffic, the
+    // flattest needed 92 -- a ~3x range the uniform per-layer split
+    // ignores, while the RAM tier was simultaneously observed 100% full
+    // (a real, binding constraint) in every real run this session.
+    // Default false: opt-in, A/B test against the uniform baseline before
+    // trusting it -- see ram_manager.hpp's apply_layer_adaptive_capacity
+    // for the full algorithm and its budget-safety guarantees (the
+    // redistributed total can never exceed what calculate_safe_cache_
+    // capacity already determined is safe, by construction). Uses the
+    // SAME `pin_file` usage history as the [PIN] preload block -- no
+    // separate file/config needed. First-ever run (no usage history yet)
+    // is a complete no-op, identical to leaving this false, since there's
+    // no real signal yet to redistribute by.
+    bool ram_cache_layer_adaptive = false;
+
     // How many OMP threads RAMSafetyManager::get_experts_batch uses to
     // parallelize the disk reads for one token's genuine (non-PIPE-served)
     // host-cache misses within a single layer's topk selection. Default 4,
@@ -81,6 +165,21 @@ struct EngineConfig {
     // contention against the OMP-parallel CPU dequant path running
     // elsewhere. Re-run iobench.c on a different machine/drive to re-tune.
     int expert_fetch_threads = 4;
+
+    // When true, main.cpp's REPL feeds stdin content to the tokenizer
+    // VERBATIM -- skips the GLM-3/4-style chat-template wrap
+    // ([gMASK]<sop><|user|>\n{msg}<|assistant|>\n) it would otherwise apply
+    // whenever the tokenizer detects chat-template tokens in the vocab.
+    // Two real uses: (1) fair prefill-time benchmarking against another
+    // engine on an identical token count, since the wrap alone can more
+    // than double a short prompt's token count; (2) required for
+    // api/api_server.py, which already builds its own <|role|>content-
+    // style prompt before ever reaching this engine -- without this flag
+    // that pre-formatted text gets wrapped a SECOND time, producing
+    // nested/duplicated special tokens (a real correctness bug, not just
+    // extra tokens -- see CLAUDE.md). Default false: the REPL's own
+    // template-detection behavior is unchanged for normal interactive use.
+    bool raw_prompt = false;
 
     // Logging. Empty log_path (default) keeps everything on stderr, matching
     // prior behavior. log_level filters by severity: VERBOSE shows
@@ -268,7 +367,12 @@ inline bool EngineConfig::load(const std::string& path) {
     pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
     pin_file         = doc.root.get_str("pin_file", pin_file);
     pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
+    pin_vram_lru_fraction = doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
+    pin_ram_fraction      = doc.root.get_double("pin_ram_fraction", pin_ram_fraction);
+    vram_evict_demote_to_ram = doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
+    ram_cache_layer_adaptive = doc.root.get_bool("ram_cache_layer_adaptive", ram_cache_layer_adaptive);
     expert_fetch_threads = doc.root.get_int("expert_fetch_threads", expert_fetch_threads);
+    raw_prompt           = doc.root.get_bool("raw_prompt", raw_prompt);
     log_path         = doc.root.get_str("log_path", log_path);
     log_level        = doc.root.get_str("log_level", log_level);
 
@@ -382,8 +486,17 @@ inline void EngineConfig::print() const {
               << (pin_threshold > 0 ? " hits" : " (pinning disabled)") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Pin file: " << (pin_file.empty() ? "(preload disabled)" : pin_file)
               << " | top-" << (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto"))
-              << "/layer\n";
+              << "/layer pinned"
+              << ", next " << (pin_vram_lru_fraction * 100.0) << "% of VRAM tier capacity (unpinned)"
+              << ", next " << (pin_ram_fraction * 100.0) << "% of RAM tier capacity\n";
+    LOG_STREAM_INFO() << "[CONFIG] VRAM evict -> RAM demote: "
+              << (vram_evict_demote_to_ram ? "ON (D2H-salvage evicted experts into the RAM tier)" : "off") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] RAM cache layer-adaptive: "
+              << (ram_cache_layer_adaptive ? "ON (per-layer capacity by historical need, not uniform)" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Expert fetch threads: " << expert_fetch_threads << "\n";
+    if (raw_prompt)
+        LOG_STREAM_INFO() << "[CONFIG] Raw prompt mode: ON -- REPL will NOT apply the chat "
+                              "template, stdin content is tokenized verbatim\n";
     LOG_STREAM_INFO() << "[CONFIG] Verbose MoE cache logging: " << (verbose_moe_log ? "on" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level
                << " | Log path: " << (log_path.empty() ? "(stderr)" : log_path) << "\n";
@@ -433,6 +546,32 @@ pin_file = ".moestream_usage"
 # pin_topk_per_layer: how many of each layer's hottest experts to preload.
 # 0 = auto-size to fill available VRAM expert-cache capacity.
 pin_topk_per_layer = 0
+# pin_vram_lru_fraction: preload the next-hottest experts (ranked just below
+# pin_topk_per_layer) into VRAM but leave UNPINNED -- a normal reactively-
+# evictable slot, just pre-warmed instead of starting cold. Fraction of the
+# VRAM tier's own real per-layer capacity, e.g. 0.1 = 10%, 0.3 = 30%.
+# 0.0 = disabled (default -- real testing found nonzero defaults here made
+# a short benchmark run SLOWER, more disk read, not less; A/B test your
+# own workload before enabling -- see the field's own comment for the
+# measured regression and why colibri's own design never does this).
+pin_vram_lru_fraction = 0.0
+# pin_ram_fraction: same idea, next tier down, preloaded into the host RAM
+# tier (previously always started completely cold). Fraction of
+# ram_mgr.slots_per_layer. 0.0 = disabled (default, same reasoning as above).
+pin_ram_fraction = 0.0
+
+# vram_evict_demote_to_ram: when a VRAM cache slot is evicted, salvage its
+# bytes into the RAM tier via a D2H copy instead of dropping them (so a
+# later re-request serves from RAM instead of paying a full disk read
+# again). New, untested on real hardware, opt-in only -- default false.
+vram_evict_demote_to_ram = false
+
+# ram_cache_layer_adaptive: give layers with flatter/less-predictable
+# routing more RAM-tier cache slots and concentrated layers fewer, instead
+# of splitting the total budget evenly -- uses the same pin_file usage
+# history as the [PIN] preload above. No-op until that history exists.
+# New, untested on real hardware, opt-in only -- default false.
+ram_cache_layer_adaptive = false
 
 # expert_fetch_threads: OMP threads used to parallelize disk reads for one
 # token's genuine (non-PIPE-served) cache misses within a layer's topk

@@ -12,10 +12,15 @@
 #include <string>
 #include <cmath>
 #include <algorithm>  // std::find (get_experts_batch's claimed_this_batch guard)
+#include <functional>  // std::greater (apply_layer_adaptive_capacity's per-layer sort)
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cuda_runtime.h>  // demote_from_vram's D2H salvage copy; already transitively
+                           // pulled in via gpu_topology.hpp, included directly here too
+                           // so the dependency isn't implicit
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <sys/sysctl.h>
@@ -24,6 +29,11 @@
 class RAMSafetyManager {
 public:
     int slots_per_layer = 0;
+    // Per-layer override for the uniform slots_per_layer cap above --
+    // populated by apply_layer_adaptive_capacity (ram_cache_layer_adaptive
+    // config flag) when real usage history exists; empty otherwise. Never
+    // read directly -- always go through cap_for_layer(layer).
+    std::vector<int> slots_per_layer_by_layer;
     uint64_t global_clock = 0;
     GpuTopology* vram_cache = nullptr;  // GPU expert VRAM cache (optional, set by CudaManager)
     // Topology-enabled prefetcher whose staging pool the cache-MISS path
@@ -167,6 +177,236 @@ public:
         LOG_STREAM_INFO() << "[RAM] LRU Cache sized to " << slots_per_layer << " experts per layer.\n";
     }
 
+    // ram_cache_layer_adaptive: redistributes the FIXED total RAM-tier
+    // budget (slots_per_layer * total_layers, already computed above and
+    // never grown by this function -- this only reshapes how it's split)
+    // across layers proportional to each layer's real historical need,
+    // instead of the uniform per-layer split every other RAM-tier code
+    // path used before this. "Need" for layer L = how many of L's own
+    // historically-ranked experts (by selection count, from the SAME
+    // per-layer-independent ranking main.cpp's [PIN] block already
+    // computes from the usage file) are required to cover
+    // `coverage_target` of L's total recorded selections -- a concentrated
+    // layer (few experts dominate) needs few slots to capture most of its
+    // value; a flat layer (traffic spread near-evenly over many experts)
+    // needs proportionally more for the same coverage. Real numbers from
+    // this project's own accumulated usage file motivated this (75 layers,
+    // 672 selections/layer after several accumulated sessions): the most
+    // concentrated layer needed only 31 ranked experts for 80% coverage,
+    // the flattest needed 92 -- a ~3x range the uniform 40/layer split
+    // used until now doesn't account for at all, while RAM-SLOTS was
+    // simultaneously reporting 100% full (a real, binding constraint, not
+    // a hypothetical one).
+    //
+    // Budget-safety is the hard requirement here, not distribution
+    // precision -- this function must NEVER let the redistributed total
+    // exceed what calculate_safe_cache_capacity already determined is
+    // safe, since that function's whole purpose is preventing the kind of
+    // unbounded RAM growth this project had a real, severe incident with
+    // before (see CLAUDE.md). Three passes: (1) raw proportional shares
+    // for layers with usage data; (2) clamp each to
+    // [min_slots_per_layer, n_experts] -- a soft floor/ceiling that can
+    // shift the sum away from the pool; (3) an UNCONDITIONAL rescale if
+    // the clamped sum still exceeds the pool, which may push some layers
+    // below the soft floor in pathological all-near-floor cases -- budget
+    // safety intentionally wins over the floor guarantee. Layers with NO
+    // usage data (never routed to yet, or the usage file predates them)
+    // are left at the uniform `slots_per_layer` default, contributing
+    // exactly their normal uniform share to the total either way, outside
+    // the redistribution pool. First-ever run (no usage file, or an
+    // empty/all-zero one) leaves slots_per_layer_by_layer empty entirely
+    // -- cap_for_layer() then falls back to the plain uniform
+    // `slots_per_layer` scalar for every layer, IDENTICAL to this
+    // feature's disabled behavior, by construction (safe default: no
+    // history yet means no redistribution decision can be trusted yet).
+    void apply_layer_adaptive_capacity(const std::string& usage_file, int total_layers, int n_experts,
+                                        double coverage_target = 0.8, int min_slots_per_layer = 8) {
+        slots_per_layer_by_layer.clear();
+        if (usage_file.empty() || slots_per_layer <= 0 || total_layers <= 0) return;
+        auto [entries, maxc] = StreamingEngine::load_usage(usage_file);
+        (void)maxc;
+        if (entries.empty()) return;
+
+        std::unordered_map<int, std::vector<uint64_t>> by_layer;
+        for (auto& e : entries) {
+            if (e.layer < 0 || e.layer >= total_layers) continue;
+            by_layer[e.layer].push_back(e.count);
+        }
+        if (by_layer.empty()) return;
+
+        std::vector<double> need(total_layers, 0.0);
+        double need_sum = 0.0;
+        for (auto& [l, v] : by_layer) {
+            std::sort(v.begin(), v.end(), std::greater<uint64_t>());
+            uint64_t total = 0;
+            for (auto c : v) total += c;
+            if (total == 0) continue;
+            uint64_t cum = 0;
+            double rank = 0;
+            for (auto c : v) {
+                cum += c; rank += 1.0;
+                if ((double)cum >= coverage_target * (double)total) break;
+            }
+            need[l] = rank;
+            need_sum += rank;
+        }
+        if (need_sum <= 0.0) return;
+
+        int n_with_data = (int)by_layer.size();
+        double pool = (double)slots_per_layer * n_with_data;
+
+        slots_per_layer_by_layer.assign(total_layers, slots_per_layer);
+        std::vector<double> clamped(total_layers, 0.0);
+        double clamped_sum = 0.0;
+        for (int l = 0; l < total_layers; ++l) {
+            if (need[l] <= 0.0) continue;
+            double raw = need[l] / need_sum * pool;
+            clamped[l] = std::min((double)n_experts, std::max((double)min_slots_per_layer, raw));
+            clamped_sum += clamped[l];
+        }
+        if (clamped_sum > pool && clamped_sum > 0.0) {
+            double scale = pool / clamped_sum;
+            for (int l = 0; l < total_layers; ++l) {
+                if (need[l] <= 0.0) continue;
+                clamped[l] *= scale;  // may go below min_slots_per_layer -- budget safety wins
+            }
+        }
+        int lo = -1, hi = -1;
+        for (int l = 0; l < total_layers; ++l) {
+            if (need[l] <= 0.0) continue;
+            int v = std::max(1, (int)std::lround(clamped[l]));
+            slots_per_layer_by_layer[l] = v;
+            if (lo == -1 || v < lo) lo = v;
+            if (hi == -1 || v > hi) hi = v;
+        }
+
+        LOG_STREAM_INFO() << "[RAM] Layer-adaptive capacity: redistributed " << (long long)pool
+                  << " slots across " << n_with_data << " layer(s) with usage history by need "
+                  << "(coverage target " << (coverage_target * 100.0) << "%), range [" << lo << ", "
+                  << hi << "] slots/layer (uniform default was " << slots_per_layer << "/layer)\n";
+    }
+
+    // Real per-layer active cap: slots_per_layer_by_layer[layer] if
+    // apply_layer_adaptive_capacity populated it for this layer, else the
+    // uniform slots_per_layer scalar -- every RAM-tier code path that used
+    // to read `slots_per_layer` directly as a per-layer cap now goes
+    // through this instead, so the adaptive/uniform choice lives in
+    // exactly one place.
+    int cap_for_layer(int layer) const {
+        if (layer >= 0 && layer < (int)slots_per_layer_by_layer.size() && slots_per_layer_by_layer[layer] > 0)
+            return slots_per_layer_by_layer[layer];
+        return slots_per_layer;
+    }
+
+    // vram_evict_demote_to_ram: called (via GpuTopology::on_vram_evict) right
+    // before a VRAM slot's outgoing expert is overwritten by an incoming
+    // H2D upload. Salvages the outgoing bytes into a RAM-tier slot via a
+    // D2H copy instead of letting evict_lru drop them outright -- before
+    // this, a VRAM-evicted expert not ALSO already RAM-resident went fully
+    // cold, so its next use always paid a full disk read even though the
+    // identical bytes existed in VRAM a moment earlier. A PCIe D2H copy of
+    // one expert slab (tens of MB) costs on the order of a millisecond;
+    // the NVMe read it can save on reuse costs 15-50ms+ per this project's
+    // own measured [MOE-CACHE] MISS timings -- asymmetric enough to be
+    // worth the extra bandwidth even though not every salvaged expert will
+    // actually be reused before its own turn to be evicted from RAM too.
+    //
+    // Only ever called from GpuTopology::upload_expert, which (per
+    // on_vram_evict's own comment in gpu_topology.hpp) only ever runs on
+    // the decode thread -- so this can safely mutate
+    // engine.layers_experts[layer] with no new locking, preserving that
+    // structure's existing "single-writer-thread" invariant (see
+    // ram_swap_stats's own comment above) instead of requiring a new mutex
+    // across the whole RAM tier. NOT wired into upload_expert_async (the
+    // prefetcher thread's own promotion path) for exactly that reason --
+    // see gpu_topology.hpp for the full explanation.
+    void demote_from_vram(StreamingEngine& engine, int layer, int expert_id,
+                           const uint8_t* device_ptr, size_t bytes, int gpu_id) {
+        auto& layer_slots = engine.layers_experts[layer];
+        if (layer_slots.empty()) {
+            perf().n_vram_evict_demote_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        size_t cap = std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
+
+        // Skip if already RAM-resident -- nothing to gain from a duplicate,
+        // and it would just waste a D2H copy plus displace some OTHER
+        // expert's RAM slot for no benefit.
+        for (size_t si = 0; si < cap; ++si) {
+            if (layer_slots[si].expert_id == expert_id) {
+                perf().n_vram_evict_demote_skipped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+
+        // Only the packed-slab (ffn_*_exps) layout is supported -- mirrors
+        // the same guard the PIPE consume_staged path already uses. A
+        // legacy per-expert-tensor model has no single (gb,ub,db) geometry
+        // to reconstruct host_ptr/meta offsets from, so demotion is a
+        // silent (counted, not logged) no-op for it, matching how the PIPE
+        // fast path already degrades for that case.
+        size_t gb, ub, db;
+        const GGUFTensor *gM, *uM, *dM;
+        if (!engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
+            perf().n_vram_evict_demote_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        size_t total = gb + ub + db;
+        if (total != bytes) {
+            // Should be unreachable -- both the VRAM slab and the RAM
+            // packed slab are sized from this SAME geometry function. A
+            // mismatch means something upstream is out of sync; refuse
+            // rather than risk copying a partial/overrunning slab.
+            LOG_WARN("[MOE-RAM] demote_from_vram: size mismatch layer=%d expert=%d vram_bytes=%zu geometry_bytes=%zu -- skipped\n",
+                      layer, expert_id, bytes, total);
+            perf().n_vram_evict_demote_failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        // Pick an eviction victim in THIS layer's RAM tier -- same
+        // also_in_vram-aware scoring as Step 3 below. The slot being
+        // filled here is, by definition, about to become
+        // also_in_vram==false (its data just left VRAM, this D2H copy is
+        // now the only one), so it's never short-circuited to score 0 by
+        // that same rule on this call.
+        size_t victim_idx = 0;
+        uint64_t victim_score = layer_slots[0].also_in_vram ? 0 : eviction_score(layer_slots[0]);
+        for (size_t i = 1; i < cap; ++i) {
+            uint64_t score = layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]);
+            if (score < victim_score) { victim_score = score; victim_idx = i; }
+        }
+        MoEExpertBlock& victim = layer_slots[victim_idx];
+        int displaced = victim.expert_id;
+
+        cudaSetDevice(gpu_id);
+        engine.ensure_slab_capacity(victim, total);
+        cudaError_t err = cudaMemcpy(victim.slab_buffer, device_ptr, total, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            LOG_WARN("[MOE-RAM] demote_from_vram: cudaMemcpy D2H failed layer=%d expert=%d (%s) -- slot left empty\n",
+                      layer, expert_id, cudaGetErrorString(err));
+            // Leave the slot genuinely empty rather than half-populated --
+            // this project's standing discipline (see MoEExpertBlock's own
+            // also_in_vram comment, the cudaMalloc-failure-checking fix
+            // elsewhere in this codebase): a failed operation must never
+            // leave state that looks valid but isn't.
+            victim.expert_id = -1;
+            victim.also_in_vram = false;
+            perf().n_vram_evict_demote_failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        if (displaced != -1) ram_swap_stats[swap_key(layer, displaced)].swap_out++;
+        engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
+        victim.also_in_vram = false;  // it just left VRAM -- this RAM copy is the only one now
+        victim.last_used_clock = ++global_clock;
+        victim.hit_count = 0;
+        ram_swap_stats[swap_key(layer, expert_id)].swap_in++;
+        perf().n_vram_evict_demoted.fetch_add(1, std::memory_order_relaxed);
+
+        LOG_DEBUG("[MOE-RAM] DEMOTE layer=%d expert=%d slot=%zu displaced=%d (%.2f MB salvaged from VRAM via D2H)\n",
+                  layer, expert_id, victim_idx, displaced, total / 1e6);
+    }
+
     MoEExpertBlock* get_expert(StreamingEngine& engine, int layer, int expert_id) {
         auto& layer_slots = engine.layers_experts[layer];
 
@@ -183,7 +423,7 @@ public:
         // escalating per-token slowdown / OS-level swapping this was added
         // to diagnose, not any single compute kernel being slow.
         size_t cap = layer_slots.empty() ? 0
-            : std::min(layer_slots.size(), (size_t)std::max(1, slots_per_layer));
+            : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
 
         // --- Step 1: Check host RAM LRU cache ---
         for (size_t si = 0; si < cap; ++si) {
@@ -227,14 +467,30 @@ public:
                         LOG_DEBUG("[MOE-VRAM]  PROMOTE layer=%d expert=%d hit_count=%u -> async H2D upload (%.2f MB)\n",
                                   layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
                         vram_cache->upload_expert_async(layer, expert_id, slot.slab_buffer, slot.slab_capacity);
-                    } else if (pin_threshold > 0 && slot.hit_count >= pin_threshold) {
-                        // Already VRAM-resident AND proven hot enough within
-                        // THIS conversation (no cross-prompt profile needed)
-                        // -- pin it so evict_lru never reactively kicks it
-                        // out for a one-hit-wonder later in the same
-                        // generation. Phase A colibri-port: "stop evicting
-                        // hot experts within a conversation".
-                        vram_cache->pin_expert(layer, expert_id);
+                    } else {
+                        // find_expert only ever returns non-null after
+                        // confirming (polling upload_ready/cudaEventQuery
+                        // internally) the H2D copy has genuinely completed
+                        // -- so this is the safe, confirmed point to mark
+                        // this RAM slot as redundant capacity (Point 1 fix:
+                        // reclaim double-stored capacity promptly instead of
+                        // waiting for unrelated LRU pressure -- see
+                        // MoEExpertBlock::also_in_vram's own comment).
+                        // Deliberately NOT set in the upload_expert_async
+                        // branch above: that copy may still be in flight,
+                        // and this slot's slab_buffer is its own source --
+                        // marking it redundant before the copy finishes
+                        // would be unsafe once anything acts on the flag.
+                        slot.also_in_vram = true;
+                        if (pin_threshold > 0 && slot.hit_count >= pin_threshold) {
+                            // Already VRAM-resident AND proven hot enough within
+                            // THIS conversation (no cross-prompt profile needed)
+                            // -- pin it so evict_lru never reactively kicks it
+                            // out for a one-hit-wonder later in the same
+                            // generation. Phase A colibri-port: "stop evicting
+                            // hot experts within a conversation".
+                            vram_cache->pin_expert(layer, expert_id);
+                        }
                     }
                 }
                 return &slot;
@@ -250,9 +506,15 @@ public:
         perf().n_expert_cache_miss.fetch_add(1, std::memory_order_relaxed);
 
         // --- Step 3: Evict lowest recency+frequency score and load from disk ---
+        // A slot confirmed also_in_vram (Point 1 fix) is treated as the
+        // lowest-priority ("evict first") candidate regardless of its own
+        // recency/hit_count -- its data is genuinely redundant capacity,
+        // already safely resident and dispatch-ready in the VRAM tier.
         int lru_idx = 0;
+        uint64_t lru_score = layer_slots[0].also_in_vram ? 0 : eviction_score(layer_slots[0]);
         for (size_t i = 1; i < cap; ++i) {
-            if (eviction_score(layer_slots[i]) < eviction_score(layer_slots[lru_idx])) lru_idx = i;
+            uint64_t score = layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]);
+            if (score < lru_score) { lru_score = score; lru_idx = (int)i; }
         }
 
         MoEExpertBlock& victim = layer_slots[lru_idx];
@@ -260,6 +522,7 @@ public:
         if (evicted_expert_id != -1) {
             ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
         }
+        victim.also_in_vram = false;  // fresh identity in this slot momentarily
 
         if (victim.expert_id != -1 && engine.drop_expert_pages) {
             std::string base = "blk." + std::to_string(layer) + ".";
@@ -354,7 +617,7 @@ public:
                            MoEExpertBlock** out) {
         auto& layer_slots = engine.layers_experts[layer];
         size_t cap = layer_slots.empty() ? 0
-            : std::min(layer_slots.size(), (size_t)std::max(1, slots_per_layer));
+            : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
 
         struct PendingLoad { size_t slot_idx; int expert_id; int evicted_expert_id; int k; double load_ms; };
         std::vector<PendingLoad> pending;
@@ -397,8 +660,14 @@ public:
                             LOG_DEBUG("[MOE-VRAM]  PROMOTE layer=%d expert=%d hit_count=%u -> async H2D upload (%.2f MB)\n",
                                       layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
                             vram_cache->upload_expert_async(layer, expert_id, slot.slab_buffer, slot.slab_capacity);
-                        } else if (pin_threshold > 0 && slot.hit_count >= pin_threshold) {
-                            vram_cache->pin_expert(layer, expert_id);
+                        } else {
+                            // Same "confirmed, not just issued" reasoning as
+                            // get_expert's Step 1 -- see also_in_vram's own
+                            // comment on MoEExpertBlock.
+                            slot.also_in_vram = true;
+                            if (pin_threshold > 0 && slot.hit_count >= pin_threshold) {
+                                vram_cache->pin_expert(layer, expert_id);
+                            }
                         }
                     }
                     out[k] = &slot;
@@ -414,10 +683,14 @@ public:
             perf().n_expert_cache_miss.fetch_add(1, std::memory_order_relaxed);
 
             int lru_idx = -1;
+            uint64_t lru_score = 0;
             for (size_t i = 0; i < cap; ++i) {
                 if (std::find(claimed_this_batch.begin(), claimed_this_batch.end(), i) != claimed_this_batch.end())
                     continue;
-                if (lru_idx < 0 || eviction_score(layer_slots[i]) < eviction_score(layer_slots[lru_idx])) lru_idx = i;
+                // Same also_in_vram-first eviction preference as get_expert's
+                // Step 3 -- see MoEExpertBlock::also_in_vram's own comment.
+                uint64_t score = layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]);
+                if (lru_idx < 0 || score < lru_score) { lru_score = score; lru_idx = (int)i; }
             }
             if (lru_idx < 0) {
                 // cap < remaining misses this batch -- every active slot for
@@ -444,6 +717,7 @@ public:
             if (evicted_expert_id != -1) {
                 ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
             }
+            victim.also_in_vram = false;  // fresh identity in this slot momentarily
 
             if (victim.expert_id != -1 && engine.drop_expert_pages) {
                 std::string base = "blk." + std::to_string(layer) + ".";
@@ -549,7 +823,7 @@ public:
         std::vector<uint64_t> hit_sum(n_layers, 0);
         for (int l = 0; l < n_layers; ++l) {
             auto& slots = layers_experts[l];
-            size_t cap = slots.empty() ? 0 : std::min(slots.size(), (size_t)std::max(1, slots_per_layer));
+            size_t cap = slots.empty() ? 0 : std::min(slots.size(), (size_t)std::max(1, cap_for_layer(l)));
             for (size_t i = 0; i < cap; ++i) {
                 if (slots[i].expert_id < 0) continue;
                 resident_count[l]++;
@@ -602,6 +876,135 @@ public:
             LOG_STREAM_INFO() << "  layer=" << layer << " expert=" << expert_id
                                << ": loaded=" << sorted[i].second.swap_in
                                << " evicted=" << sorted[i].second.swap_out << "\n";
+        }
+    }
+
+    // How many host-RAM LRU slots are ACTUALLY holding an expert right
+    // now, vs. total capacity (slots_per_layer * n_layers -- the REAL
+    // active cap from the RAM-budget fix, not engine.layers_experts[l]'s
+    // raw pre-allocated size, which is always n_experts for slot-address
+    // stability but mostly unused beyond slots_per_layer -- see
+    // get_expert()'s own comment on this). Companion to GpuTopology::
+    // report_slot_summary; together they answer "how many MoE experts do
+    // we have loaded" for both tiers, comparable to colibri's own
+    // resident-set report (see colibri's CLAUDE.md).
+    void report_slot_summary(StreamingEngine& engine) const {
+        size_t filled = 0, capacity = 0, bytes_used = 0;
+        for (int l = 0; l < (int)engine.layers_experts.size(); ++l) {
+            auto& layer_slots = engine.layers_experts[l];
+            size_t cap = layer_slots.empty() ? 0
+                : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(l)));
+            capacity += cap;
+            for (size_t i = 0; i < cap; ++i) {
+                if (layer_slots[i].expert_id != -1) {
+                    ++filled;
+                    bytes_used += layer_slots[i].slab_capacity;
+                }
+            }
+        }
+        // "slots_per_layer cap" in the log line reflects the UNIFORM default
+        // either way -- with ram_cache_layer_adaptive on, `capacity` above
+        // (the real sum used for the filled/capacity ratio) already
+        // reflects the true per-layer redistribution; this trailing number
+        // is just the fallback baseline, not claiming to be every layer's
+        // actual cap anymore.
+        LOG_STREAM_INFO() << "[RAM-SLOTS] " << filled << " / " << capacity
+                           << " slots filled (" << bytes_used / 1e9 << " GB of experts resident), "
+                           << slots_per_layer << " slots/layer cap (uniform default"
+                           << (slots_per_layer_by_layer.empty() ? "" : ", layer-adaptive active") << ")\n";
+        report_tier_overlap(engine);
+    }
+
+    // How many (layer, expert) pairs are resident in BOTH the RAM LRU tier
+    // and the VRAM cache simultaneously, right now. Unlike colibri (whose
+    // VRAM-pinned tier and RAM-LRU tier are architecturally exclusive --
+    // CUDA_RELEASE_HOST frees an expert's host copy once it's VRAM-
+    // uploaded), MoEStream's tiers are NOT exclusive by design:
+    // moe_forward_gguf's per-token dispatch calls
+    // RAMSafetyManager::get_experts_batch UNCONDITIONALLY for every routed
+    // expert (execution_layer.cpp) to obtain its MoEExpertBlock metadata/
+    // host_ptr, REGARDLESS of whether that same expert is also
+    // GPU-dispatched via a separate vram_cache->find_expert lookup -- so
+    // any actively-used expert ends up resident in RAM as a side effect of
+    // simply being routed to, whether or not it's ALSO VRAM-resident. This
+    // means the naive "VRAM GB + RAM GB" sum overstates how much DISTINCT
+    // expert data is actually cached -- overlapping bytes are paid for
+    // twice. Read-only: iterates expert_vram_cache's public fields
+    // directly (NOT vram_cache->find_expert, which mutates hit_count/
+    // last_used_clock/cache_clock as a side effect -- calling it here
+    // would corrupt real eviction-scoring state for a mere report).
+    void report_tier_overlap(StreamingEngine& engine) const {
+        if (!vram_cache) return;
+        std::unordered_set<uint64_t> vram_resident;
+        vram_resident.reserve(vram_cache->expert_vram_cache.size());
+        for (auto& loc : vram_cache->expert_vram_cache) {
+            if (loc.layer_idx == -1) continue;
+            vram_resident.insert(((uint64_t)(uint32_t)loc.layer_idx << 32) | (uint32_t)loc.expert_id);
+        }
+        size_t overlap = 0, overlap_bytes = 0;
+        for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
+            auto& layer_slots = engine.layers_experts[layer];
+            size_t cap = layer_slots.empty() ? 0
+                : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
+            for (size_t i = 0; i < cap; ++i) {
+                if (layer_slots[i].expert_id == -1) continue;
+                uint64_t key = ((uint64_t)(uint32_t)layer << 32) | (uint32_t)layer_slots[i].expert_id;
+                if (vram_resident.count(key)) {
+                    ++overlap;
+                    overlap_bytes += layer_slots[i].slab_capacity;
+                }
+            }
+        }
+        LOG_STREAM_INFO() << "[TIER-OVERLAP] " << overlap << " expert(s) resident in BOTH RAM and VRAM "
+                           << "simultaneously (" << overlap_bytes / 1e9 << " GB double-counted -- "
+                           << "paid for in both tiers' totals above, not genuinely distinct capacity)\n";
+    }
+
+    // Per-layer VRAM / RAM-only / cold expert-tier breakdown -- the
+    // compact, actionable middle ground between the whole-cache aggregate
+    // totals (report_slot_summary/report_tier_overlap above) and a
+    // literal full per-expert dump (n_experts * n_layers entries -- 19968
+    // for a 256-expert/78-layer checkpoint, too much raw data to be
+    // useful as text). For each MoE layer: `vram` = currently VRAM-
+    // resident (device_ptr set, ready for GPU dispatch with zero I/O);
+    // `ram_only` = RAM-resident but NOT also VRAM-resident (would need
+    // only an H2D copy, not a disk read, if promoted); `cold` = resident
+    // nowhere -- would need a real disk read if routed to right now.
+    // Same read-only construction as report_tier_overlap (direct field
+    // reads, not find_expert, so this doesn't perturb real hit_count/
+    // last_used_clock eviction-scoring state just by reporting on it).
+    void report_tier_map(StreamingEngine& engine) const {
+        if (!vram_cache) return;
+        int n_experts = engine.model_file.architecture_config.n_experts;
+        if (n_experts <= 0) return;
+
+        std::unordered_map<int, int> vram_count_by_layer;
+        std::unordered_set<uint64_t> vram_resident;
+        vram_resident.reserve(vram_cache->expert_vram_cache.size());
+        for (auto& loc : vram_cache->expert_vram_cache) {
+            if (loc.layer_idx == -1) continue;
+            vram_resident.insert(((uint64_t)(uint32_t)loc.layer_idx << 32) | (uint32_t)loc.expert_id);
+            vram_count_by_layer[loc.layer_idx]++;
+        }
+
+        LOG_STREAM_INFO() << "[EXPERT-TIER-MAP] per-layer expert location (of " << n_experts
+                           << " experts/layer): vram / ram-only / cold (would need a disk read)\n";
+        for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
+            auto& layer_slots = engine.layers_experts[layer];
+            if (layer_slots.empty()) continue;  // not a MoE layer (leading dense)
+            size_t cap = std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
+
+            int vram_n = vram_count_by_layer.count(layer) ? vram_count_by_layer[layer] : 0;
+            int ram_only_n = 0;
+            for (size_t i = 0; i < cap; ++i) {
+                if (layer_slots[i].expert_id == -1) continue;
+                uint64_t key = ((uint64_t)(uint32_t)layer << 32) | (uint32_t)layer_slots[i].expert_id;
+                if (!vram_resident.count(key)) ++ram_only_n;
+            }
+            int cold_n = n_experts - vram_n - ram_only_n;
+            LOG_STREAM_INFO() << "  layer=" << layer << "  vram=" << vram_n
+                               << "  ram_only=" << ram_only_n
+                               << "  cold=" << (cold_n > 0 ? cold_n : 0) << "\n";
         }
     }
 };

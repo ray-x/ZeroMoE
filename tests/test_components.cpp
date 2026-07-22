@@ -1201,6 +1201,153 @@ void test_bf16_roundtrip_logic() {
     std::cout << " PASSED\n";
 }
 
+// ============================================================
+// Test: GpuTopology::expert_index (O(1) find_expert) logic
+// ============================================================
+// include/gpu_topology.hpp's GpuTopology can't be instantiated on this
+// darwin dev machine at all (deeply CUDA-entangled: cudaEvent_t members,
+// cudaSetDevice/cudaEventQuery calls) -- so this is a minimal, CUDA-free
+// reimplementation of exactly the identity-resolution logic under test
+// (the expert_index map + find_expert's index-hit/validate/fallback/
+// self-heal path + evict_lru's index-erase-on-real-eviction + upload's
+// index-insert), mirroring the real code's structure/invariants but with
+// every cudaXxx call and GPU-specific field stripped out. This is the
+// same "portable oracle for the CUDA-adjacent logic" pattern already
+// used by test_q2k_q3k_dequant_logic / test_iq2xxs_iq3xxs_dequant_logic
+// / test_bf16_roundtrip_logic elsewhere in this file.
+struct TestExpertSlot {
+    int layer_idx = -1;
+    int expert_id = -1;
+    bool has_device_ptr = false; // stands in for the real device_ptr != nullptr check
+};
+struct TestExpertVramCacheSim {
+    std::vector<TestExpertSlot> slots;
+    std::unordered_map<uint64_t, size_t> expert_index;
+    int stale_index_hits = 0; // mirrors perf().n_stale_expert_index_hits
+
+    static uint64_t key(int layer, int expert_id) {
+        return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert_id;
+    }
+
+    // Mirrors GpuTopology::find_expert's index-first, validate-or-fallback
+    // structure exactly (minus the upload_ready/cudaEventQuery piece,
+    // which is orthogonal to identity resolution).
+    int find_expert(int layer, int expert_id) {
+        uint64_t k = key(layer, expert_id);
+        auto it = expert_index.find(k);
+        if (it != expert_index.end()) {
+            size_t idx = it->second;
+            if (idx < slots.size()) {
+                TestExpertSlot& s = slots[idx];
+                if (s.layer_idx == layer && s.expert_id == expert_id && s.has_device_ptr) {
+                    return (int)idx; // validated index hit
+                }
+            }
+            // Stale entry -- log-and-fallback, same as the real code.
+            stale_index_hits++;
+            expert_index.erase(it);
+        }
+        for (size_t i = 0; i < slots.size(); ++i) {
+            TestExpertSlot& s = slots[i];
+            if (s.layer_idx == layer && s.expert_id == expert_id && s.has_device_ptr) {
+                expert_index[k] = i; // opportunistic self-heal
+                return (int)i;
+            }
+        }
+        return -1;
+    }
+
+    // Mirrors evict_lru's index-erase-on-real-eviction: only erase when a
+    // slot with a REAL prior identity is being reclaimed, never for an
+    // already-empty slot (mirrors the real code's `if (victim->layer_idx
+    // != -1)` guard around both the swap-out stat and the index erase).
+    void evict(size_t idx) {
+        TestExpertSlot& s = slots[idx];
+        if (s.layer_idx != -1) {
+            expert_index.erase(key(s.layer_idx, s.expert_id));
+        }
+        s.layer_idx = -1;
+        s.expert_id = -1;
+        s.has_device_ptr = false;
+    }
+
+    // Mirrors upload_expert's index-insert-on-assign.
+    void upload(size_t idx, int layer, int expert_id) {
+        slots[idx].layer_idx = layer;
+        slots[idx].expert_id = expert_id;
+        slots[idx].has_device_ptr = true;
+        expert_index[key(layer, expert_id)] = idx;
+    }
+};
+
+void test_expert_vram_index_logic() {
+    std::cout << "[TEST] GpuTopology expert_index (O(1) find_expert) logic..." << std::flush;
+
+    TestExpertVramCacheSim sim;
+    sim.slots.resize(4);
+
+    // 1. Fresh insert is found by index lookup, at the right slot.
+    sim.upload(0, /*layer=*/3, /*expert_id=*/7);
+    sim.upload(1, /*layer=*/5, /*expert_id=*/12);
+    assert(sim.find_expert(3, 7) == 0);
+    assert(sim.find_expert(5, 12) == 1);
+    assert(sim.stale_index_hits == 0);
+
+    // 2. A never-inserted identity is a clean miss, not a false hit.
+    assert(sim.find_expert(3, 8) == -1);
+    assert(sim.find_expert(99, 99) == -1);
+
+    // 3. Eviction removes the OLD identity's index entry -- a lookup for
+    // the evicted (layer, expert_id) must miss cleanly, not resolve to
+    // whatever the slot holds next (this is the exact bug class the
+    // real evict_lru fix targets: a stale index pointing a slot's index
+    // at data that's no longer there).
+    sim.evict(0);
+    assert(sim.find_expert(3, 7) == -1 && "evicted identity must not still resolve via the index");
+    assert(sim.stale_index_hits == 0 && "a clean index miss after erase should not count as stale");
+
+    // 4. Reusing slot 0 for a DIFFERENT expert must resolve the NEW
+    // identity correctly, and must never accidentally still answer for
+    // the OLD identity that used to live there (the core correctness
+    // property: same slot, different expert over time, index always
+    // reflects only the CURRENT occupant).
+    sim.upload(0, /*layer=*/9, /*expert_id=*/1);
+    assert(sim.find_expert(9, 1) == 0);
+    assert(sim.find_expert(3, 7) == -1);
+    assert(sim.find_expert(5, 12) == 1 && "unrelated slot 1 must be unaffected by slot 0 churn");
+
+    // 5. Safety net: simulate the index/array desyncing (something this
+    // should never happen by construction in the real code, but the
+    // fallback path exists specifically to make even a maintenance-site
+    // bug non-catastrophic) -- point the index at a slot whose real
+    // contents don't match, and confirm find_expert detects the mismatch
+    // (logs it as stale) and still finds the CORRECT answer via the
+    // linear-scan fallback rather than returning wrong data or nothing.
+    sim.upload(2, /*layer=*/20, /*expert_id=*/4);
+    sim.expert_index[TestExpertVramCacheSim::key(20, 4)] = 1; // deliberately wrong index
+    int before = sim.stale_index_hits;
+    int result = sim.find_expert(20, 4);
+    assert(result == 2 && "stale index entry must fall back to the linear scan and find the REAL slot");
+    assert(sim.stale_index_hits == before + 1 && "a validated mismatch must increment the stale-hit counter");
+    // Self-healed: a second lookup for the same identity should now hit
+    // the index directly again (no additional stale count).
+    int before2 = sim.stale_index_hits;
+    assert(sim.find_expert(20, 4) == 2);
+    assert(sim.stale_index_hits == before2 && "a self-healed index entry must not re-trigger a stale hit");
+
+    // 6. An empty-slot claim (no prior identity) must NOT erase any
+    // index entry -- mirrors evict_lru's `if (victim->layer_idx != -1)`
+    // guard. Evicting an already-empty slot 3 must leave every other
+    // slot's index entries untouched.
+    assert(sim.slots[3].layer_idx == -1);
+    sim.evict(3); // no-op identity-wise, must not touch expert_index at all
+    assert(sim.find_expert(9, 1) == 0);
+    assert(sim.find_expert(5, 12) == 1);
+    assert(sim.find_expert(20, 4) == 2);
+
+    std::cout << " PASSED\n";
+}
+
 int main() {
     std::cout << "=== MoEStream Component Tests ===\n";
     test_reasoning_parser();
@@ -1215,6 +1362,7 @@ int main() {
     test_iq2s_dequant_logic();
     test_iq2_wide_dequant_logic();
     test_bf16_roundtrip_logic();
+    test_expert_vram_index_logic();
     std::cout << "\nAll tests PASSED.\n";
     return 0;
 }
