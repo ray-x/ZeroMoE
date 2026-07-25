@@ -39,6 +39,14 @@ void print_usage() {
               << "  --top_p <F>      Nucleus sampling top-p threshold (default: 0.90)\n"
               << "  --gpu <ID>       CUDA device ID for single-GPU mode (default: 0)\n"
               << "  --drop-pages     Drop expert pages from page cache after use\n"
+              << "  --direct-io      O_DIRECT expert-slab reads (Linux only; requires a model\n"
+              << "                   repacked with tools/gguf_tool pack -- falls back to buffered\n"
+              << "                   reads automatically if unsupported/unaligned)\n"
+              << "  --io-uring       Batch the async prefetcher's per-expert reads through io_uring\n"
+              << "                   (Linux only, kernel >= 5.6; independent of --direct-io -- falls\n"
+              << "                   back to sequential preads automatically if unsupported)\n"
+              << "  --prefetch-threads <N>  Concurrent async prefetcher worker threads (default: 2)\n"
+              << "  --prefetch-staging-slots <N>  Pinned-host staging slots for the async prefetcher (default: 128)\n"
               << "  --verbose-moe    Log every MoE host-cache hit (high volume, debug only)\n"
               << "  --promote-threshold <N>  Number of host re-hits before async H2D promote (default: 1)\n"
               << "  --pin-threshold <N>  VRAM-resident hit_count before pinning (never evicted; default: 8, 0=off)\n"
@@ -69,6 +77,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
     ram_mgr.verbose_cache_log = config.verbose_moe_log;
     ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
+    ram_mgr.move_on_promotion = config.move_on_promotion;
+    gpu.topology.active_layer_promote_threshold = std::max(1, config.active_layer_promote_hit_threshold);
     if (config.dense_gpu_idx >= 0)
         gpu.device_id = config.gpus[config.dense_gpu_idx].device_id;
     if (!gpu.initialize()) {
@@ -86,6 +96,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     if (!engine.model_file.load_header(model_path)) {
         return std::unexpected("Failed to parse GGUF file or map descriptor tree structure");
     }
+    // Opt-in only (config.direct_io, default false) -- see GGUFFile::
+    // enable_direct_io's own comment for the alignment check + per-shard
+    // test-read verification this does before trusting O_DIRECT on any
+    // shard. Called right after load_header (all shard fds + KV metadata
+    // are populated by then) and before anything starts reading experts.
+    if (config.direct_io) engine.model_file.enable_direct_io();
 
     // Optional separate dense GGUF: dense/preloaded tensors read from here, routed
     // experts still stream from model_path. Enables a dense(IQ4_XS)+expert(IQ2_*)
@@ -95,6 +111,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             return std::unexpected("Failed to parse dense GGUF (dense_model_path)");
         }
         engine.has_dense_model = true;
+        if (config.direct_io) engine.dense_model_file.enable_direct_io();
     }
 
     const std::string& gguf_path = engine.model_file.resolved_file_path;
@@ -113,9 +130,6 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     if (!GGUFGraphInitializer::build_model_graph(engine, max_ctx)) {
         return std::unexpected("Failure triggered during topological model graph initialization pass");
     }
-    // Phase A colibri-port: n_layers/n_experts are known now -- size the
-    // routing-frequency histogram so moe_forward_gguf's bump_route_freq
-    // calls (once generation starts) have somewhere to accumulate into.
     engine.init_route_freq();
 
     // --- Multi-GPU memory planning (from optimize.md) ---
@@ -137,17 +151,11 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             expert_slab_bytes = std::max(expert_slab_bytes, engine.compute_expert_slab_bytes(l));
         }
     }
-    gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts);
+    gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, config);
     gpu.report_vram_usage("after expert cache setup");
 
     // Connect VRAM expert cache to the RAM manager for LRU integration
     ram_mgr.vram_cache = &gpu.topology;
-    // Phase A colibri-port: the SAME topology-enabled prefetcher (started
-    // below with &gpu.topology) is what get_expert's consume_staged
-    // miss-path draws from -- previously generate_text created its OWN
-    // separate, topology-less LockFreePrefetcher per request, so the real
-    // prefetcher here (which does receive pilot hints via layers_forward_gguf)
-    // was wired to nothing that ever consumed its staged reads.
     ram_mgr.prefetcher = &prefetcher;
 
     // Offload dense tensors to core GPU VRAM — via a single pool allocation
@@ -519,9 +527,14 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     }
 
     LOG_STREAM_INFO() << "[I/O] Spinning up asynchronous lock-free SPSC prefetch threads...\n";
-    prefetcher.start(&engine, &gpu.topology);
+    prefetcher.start(&engine, &gpu.topology, config.io_uring, config.prefetch_worker_threads,
+                      config.prefetch_staging_slots);
+    // Decode thread's OWN io_uring ring for RAMSafetyManager::get_experts_batch's
+    // Phase B (the synchronous miss path -- see ram_manager.hpp's decode_uring_ring
+    // comment for why this is a separate scope from the prefetcher's rings above).
+    ram_mgr.init_decode_uring(config.io_uring);
 
-    // Phase A colibri-port, extended to a graduated 3-tier scheme (was:
+    // extended to a graduated 3-tier scheme (was:
     // a single top-K-pinned VRAM tier only). Read the usage file written
     // by a PREVIOUS run's dump_usage() at shutdown -- this already records
     // EVERY expert ever routed to (StreamingEngine::route_freq is a full
@@ -609,6 +622,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // what actually fits.
                 topk = std::max(1, (int)avg_vram_slots_per_layer);
             }
+
+            // Three-tier caching: Use explicit pinned_vram_capacity instead of
+            // implicit pin_topk_per_layer calculation. This allows precise control
+            // over the pinned tier (targeting 1024 experts vs. current ~600).
+            int max_pinned_total = config.pinned_vram_capacity;
+            if (max_pinned_total > 0) {
+                // Adjust topk per layer to respect the global pinned cap
+                topk = std::min(topk, max_pinned_total / moe_layers);
+                LOG_STREAM_INFO() << "[PIN] Three-tier: capped per-layer topk to " << topk
+                          << " (global cap: " << max_pinned_total << " experts across "
+                          << moe_layers << " layers)\n";
+            }
+
             int vram_lru_n = std::max(0, (int)std::lround(
                 config.pin_vram_lru_fraction * avg_vram_slots_per_layer));
             int ram_n = std::max(0, (int)std::lround(
@@ -619,16 +645,26 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                       << "/layer VRAM-pinned, next " << vram_lru_n << "/layer VRAM-unpinned, next "
                       << ram_n << "/layer RAM...\n";
             int pinned = 0, vram_lru = 0, ram_preloaded = 0, attempted = 0;
+            int total_pinned = 0;  // Three-tier: track total pinned count
             for (auto& [layer, v] : by_layer) {
                 int n = (int)v.size();
-                for (int i = 0; i < n && i < topk; ++i) {
+                // Three-tier: enforce global pinned capacity per layer
+                int layer_max = topk;
+                if (max_pinned_total > 0) {
+                    layer_max = std::min({topk, (int)v.size(),
+                                         max_pinned_total - total_pinned});
+                }
+                for (int i = 0; i < n && i < layer_max; ++i) {
                     ++attempted;
                     MoEExpertBlock scratch{};
                     engine.load_expert_slab(v[i].layer, v[i].expert, scratch);
                     if (scratch.slab_buffer && scratch.slab_capacity > 0) {
                         ExpertLocation* loc = gpu.topology.upload_expert(
                             v[i].layer, v[i].expert, scratch.slab_buffer, scratch.slab_capacity);
-                        if (loc && gpu.topology.pin_expert(v[i].layer, v[i].expert)) ++pinned;
+                        if (loc && gpu.topology.pin_expert(v[i].layer, v[i].expert)) {
+                            ++pinned;
+                            ++total_pinned;  // Three-tier: track global pinned count
+                        }
                     }
                     if (scratch.slab_buffer) free(scratch.slab_buffer);
                 }
@@ -671,6 +707,14 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             LOG_STREAM_INFO() << "[PIN] Preloaded " << pinned << " VRAM-pinned + " << vram_lru
                       << " VRAM-unpinned + " << ram_preloaded << " RAM (of " << attempted
                       << " attempted).\n";
+
+            // Three-tier caching: Log final pinned count
+            if (max_pinned_total > 0) {
+                LOG_STREAM_INFO() << "[PIN] Three-tier: " << total_pinned << " experts pinned (target: "
+                          << max_pinned_total << ") across " << moe_layers << " layers ("
+                          << (total_pinned >= max_pinned_total ? "target met" : "below target")
+                          << ")\n";
+            }
         }
     }
 
@@ -740,7 +784,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     }
 
     prefetcher.stop();
-    // Phase A colibri-port: write this run's routing-frequency histogram so
+    // Phase A write this run's routing-frequency histogram so
     // the NEXT run's startup preload (above) has real data to work from.
     // Best-effort, matches dump_usage's own contract (a failed write just
     // logs and continues -- not worth failing shutdown over).
@@ -748,8 +792,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
     // Cache-churn summary for both tiers: which experts were swapped in/out
     // the most, and (VRAM only, since that's the only tier with a pinning
-    // mechanism) which of those are still unpinned -- the direct, per-
-    // expert answer to "which of colibri's advantages are we not getting".
+    // mechanism) which of those are still unpinned 
     // Safe without locking here: prefetcher.stop() above has already joined
     // the worker thread, so nothing else touches these structures now.
     ram_mgr.report_cache_churn();
@@ -776,10 +819,27 @@ int main(int argc, char* argv[]) {
     int pin_threshold_cli = -1;
     std::string pin_file_cli;
     int expert_fetch_threads_cli = -1;
+    int prefetch_worker_threads_cli = -1;
+    int prefetch_staging_slots_cli = -1;
     int max_ctx = 4096;
     int max_new_tokens = 1024;
     int gpu_id = 0;
     bool drop_pages = false;
+    bool direct_io_cli = false;
+    bool io_uring_cli = false;
+    // ctx_cli_given/ngen_cli_given: real bug found via a real test --
+    // --ctx (and --ngen) were parsed but only ever applied to
+    // config.context_size/max_new_tokens in the legacy --model-only
+    // startup branch below; the "CLI overrides always apply" block right
+    // after config-file loading never included them, so --ctx silently
+    // did nothing whenever --config was used (which is every TOML-based
+    // run this whole session). max_ctx/max_new_tokens keep their
+    // legacy-mode defaults (4096/1024) either way -- these bools track
+    // ONLY whether the flag was explicitly passed, so the override below
+    // doesn't clobber a --config file's own context_size/max_new_tokens
+    // with an unrequested default.
+    bool ctx_cli_given = false;
+    bool ngen_cli_given = false;
     bool verbose_moe = false;
     bool raw_prompt_cli = false;
     std::string log_path_cli;
@@ -794,16 +854,20 @@ int main(int argc, char* argv[]) {
         }
         else if (arg == "--model" && i + 1 < argc) model_path = argv[++i];
         else if (arg == "--ram" && i + 1 < argc) ram_budget_gb = std::stod(argv[++i]);
-        else if (arg == "--ctx" && i + 1 < argc) max_ctx = std::stoi(argv[++i]);
-        else if (arg == "--ngen" && i + 1 < argc) max_new_tokens = std::stoi(argv[++i]);
+        else if (arg == "--ctx" && i + 1 < argc) { max_ctx = std::stoi(argv[++i]); ctx_cli_given = true; }
+        else if (arg == "--ngen" && i + 1 < argc) { max_new_tokens = std::stoi(argv[++i]); ngen_cli_given = true; }
         else if (arg == "--gpu" && i + 1 < argc) gpu_id = std::stoi(argv[++i]);
         else if (arg == "--drop-pages") drop_pages = true;
+        else if (arg == "--direct-io") direct_io_cli = true;
+        else if (arg == "--io-uring") io_uring_cli = true;
         else if (arg == "--verbose-moe") verbose_moe = true;
         else if (arg == "--raw-prompt") raw_prompt_cli = true;
         else if (arg == "--promote-threshold" && i + 1 < argc) promote_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-threshold" && i + 1 < argc) pin_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-file" && i + 1 < argc) pin_file_cli = argv[++i];
         else if (arg == "--expert-fetch-threads" && i + 1 < argc) expert_fetch_threads_cli = std::stoi(argv[++i]);
+        else if (arg == "--prefetch-threads" && i + 1 < argc) prefetch_worker_threads_cli = std::stoi(argv[++i]);
+        else if (arg == "--prefetch-staging-slots" && i + 1 < argc) prefetch_staging_slots_cli = std::stoi(argv[++i]);
         else if (arg == "--log-path" && i + 1 < argc) log_path_cli = argv[++i];
         else if (arg == "--log-level" && i + 1 < argc) log_level_cli = argv[++i];
         else if (arg == "--temp" && i + 1 < argc) temp_cli = std::stof(argv[++i]);
@@ -832,6 +896,8 @@ int main(int argc, char* argv[]) {
         config.context_size = max_ctx;
         config.max_new_tokens = max_new_tokens;
         config.drop_pages = drop_pages;
+        config.direct_io = direct_io_cli;
+        config.io_uring = io_uring_cli;
 
         GpuConfig gc;
         gc.device_id = gpu_id;
@@ -849,10 +915,20 @@ int main(int argc, char* argv[]) {
     if (ram_budget_gb > 0) config.host_ram_gb = ram_budget_gb;
     if (verbose_moe) config.verbose_moe_log = true;
     if (raw_prompt_cli) config.raw_prompt = true;
+    if (drop_pages) config.drop_pages = true;
+    if (direct_io_cli) config.direct_io = true;
+    if (io_uring_cli) config.io_uring = true;
+    // ctx_cli_given/ngen_cli_given: see their own declaration comment --
+    // these were completely missing from this override block before,
+    // meaning --ctx/--ngen had zero effect whenever --config was used.
+    if (ctx_cli_given) config.context_size = max_ctx;
+    if (ngen_cli_given) config.max_new_tokens = max_new_tokens;
     if (promote_threshold_cli > 0) config.promote_hit_threshold = promote_threshold_cli;
     if (pin_threshold_cli >= 0) config.pin_threshold = pin_threshold_cli;
     if (!pin_file_cli.empty()) config.pin_file = pin_file_cli;
     if (expert_fetch_threads_cli > 0) config.expert_fetch_threads = expert_fetch_threads_cli;
+    if (prefetch_worker_threads_cli > 0) config.prefetch_worker_threads = prefetch_worker_threads_cli;
+    if (prefetch_staging_slots_cli > 0) config.prefetch_staging_slots = prefetch_staging_slots_cli;
     if (!log_path_cli.empty()) config.log_path = log_path_cli;
     if (!log_level_cli.empty()) config.log_level = log_level_cli;
     if (temp_cli >= 0.0f) config.temperature = temp_cli;

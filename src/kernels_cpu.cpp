@@ -520,7 +520,7 @@ void dequantize_row_iq2_s_avx512(const uint8_t* block, float* y, int64_t k) {
 // throughput," so 8-wide was assumed sufficient. Revisited after a direct
 // throughput benchmark (main_test.cpp Test 8) found the ALREADY-vectorized
 // IQ2_XXS/IQ3_XXS/IQ2_S types only reach ~1-3 GB/s on the target machine,
-// vs colibri's own measured 6-23 GB/s for its (structurally simpler, plain
+// vs DMA 6-23 GB/s for its (structurally simpler, plain
 // int4) format -- a gap too large to keep assuming ALU width is a non-
 // factor without actually testing it.
 //

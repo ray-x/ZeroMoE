@@ -20,7 +20,33 @@ struct PerfCounters {
     // Cumulative timings (seconds)
     std::atomic<double> t_disk_read{0};     // Expert slab pread from disk
     std::atomic<double> t_host_alloc{0};    // posix_memalign + setup
-    std::atomic<double> t_gpu_upload{0};    // cudaMemcpy H2D
+    std::atomic<double> t_gpu_upload{0};    // cudaMemcpy H2D -- shared by expert cache
+                                             // PROMOTION uploads (GpuTopology::upload_expert,
+                                             // whole ~12-15MB slabs) AND dense_proj's own
+                                             // one-time startup dense-tensor-offload uploads.
+                                             // Deliberately NOT touched by expert_ffn's own
+                                             // per-call activation upload anymore -- see
+                                             // t_expert_gpu_upload below for why that was split
+                                             // out.
+    std::atomic<double> t_expert_gpu_upload{0};  // cudaMemcpy H2D of the small activation
+                                             // vector before an expert's gate/up/down kernels
+                                             // (execution_layer.cpp's expert_ffn_gpu_issue) --
+                                             // split OUT of t_gpu_upload after a real
+                                             // investigation found "avg GPU round-trip: up=X ms/call" in
+                                             // dump_report()/the [REQUEST] line's "gpu=...
+                                             // [up=...]" breakdown was computing
+                                             // t_gpu_upload/gcalls where t_gpu_upload ALSO
+                                             // included cache-PROMOTION slab uploads (12553 of
+                                             // them in one real run, ~2ms each) sharing the same
+                                             // counter as expert_ffn's own much-smaller per-call
+                                             // activation upload (a few KB) -- i.e. the reported
+                                             // per-call "up" figure was silently dominated by an
+                                             // unrelated bucket, not a genuine measurement of
+                                             // expert_ffn's own GPU dispatch overhead. This is
+                                             // the SAME class of attribution bug as the earlier
+                                             // Attention-vs-Prefill and summed-Throughput fixes
+                                             // in this project's history -- fix the counter
+                                             // before trusting conclusions drawn from it.
     std::atomic<double> t_gpu_download{0};  // cudaMemcpy D2H -- was bundled into
                                              // whatever counter happened to wrap the
                                              // next call (usually none, since
@@ -136,6 +162,20 @@ struct PerfCounters {
     // background promotions/evictions.
     std::atomic<double> t_staging_regrow{0};      // time inside acquire_staging_slot's cudaFreeHost+cudaMallocHost pair, held under staging_mutex
     std::atomic<uint64_t> n_staging_regrow{0};    // how many times a staging slot needed to grow (different layers' slab sizes rotating through a small fixed pool of slots is the expected trigger)
+    // A slot round-robin-recycled (acquire_staging_slot) while STILL
+    // ready==true and holding a real, never-consumed (layer,expert)
+    // identity -- i.e. a correctly-predicted, correctly-read, correctly-
+    // staged expert that simply never matched a miss before its slot got
+    // reused. Added specifically to separate "pool thrashing" from other
+    // explanations for the gap between Pilot recall (prediction accuracy
+    // alone, see n_pilot_recall_hits) and Prefetch (PIPE) served %
+    // (n_pipe_hits) -- a high count here means the pool genuinely needs
+    // to be bigger (or predictions need to happen closer to time-of-use);
+    // a low count here despite a large recall/served gap means the
+    // explanation is something else entirely (e.g. the predicted expert
+    // quietly became a cache HIT via some other path before the miss
+    // check ever ran, so consume_staged was never even called for it).
+    std::atomic<uint64_t> n_staged_evicted_unused{0};
     std::atomic<double> t_staging_mutex_wait{0};  // total time ANY caller (consume_staged/acquire_staging_slot/finish_prefetch) spent BLOCKED acquiring staging_mutex -- high values here directly prove cross-thread contention on this lock, separate from time spent doing real work once held
     std::atomic<double> t_cache_mutex_wait{0};    // total time ANY caller spent BLOCKED acquiring GpuTopology::cache_mutex (find_expert/pin_expert/evict_lru/has_free_slot/upload_expert/upload_expert_async)
 
@@ -148,7 +188,7 @@ struct PerfCounters {
     std::atomic<uint64_t> n_expert_cpu_calls{0};  // expert_ffn calls that took the CPU fallback path
     std::atomic<int64_t> bytes_disk_read{0};
     std::atomic<int64_t> bytes_gpu_uploaded{0};
-    // Phase A (colibri-port) counters:
+    // Phase A () counters:
     std::atomic<uint64_t> n_pipe_hits{0};          // cache misses served from the prefetcher's staging pool (no pread) -- the higher this is vs n_expert_cache_miss, the more disk I/O was hidden behind compute
     std::atomic<uint64_t> n_pinned_eviction_skips{0}; // MEANING CHANGED once GpuTopology::unpinned_slot_indices landed: evict_lru no longer visits permanently-pinned slots at all (they're excluded from the scan at the source), so this now only increments on the DEFENSIVE fallback check -- should read 0 on a healthy run; nonzero means unpinned_slot_indices desynced from the real `pinned` flags somewhere (see gpu_topology.hpp's evict_lru). Previously (before that optimization) this counted every pinned slot skipped during a normal scan, and nonzero was the EXPECTED/healthy signal -- the polarity of "what a nonzero value means" flipped with that change.
     std::atomic<uint64_t> n_temp_pin_eviction_skips{0}; // times evict_lru skipped a slot TEMPORARILY held for an in-flight decode-time GPU dispatch (ExpertLocation::temp_pin_count > 0) -- distinct from n_pinned_eviction_skips (permanent pins); nonzero proves the compute-in-flight protection is actually engaging
@@ -157,6 +197,22 @@ struct PerfCounters {
     std::atomic<uint64_t> n_stale_expert_index_hits{0}; // times find_expert's O(1) expert_index pointed at a slot that didn't actually match the requested (layer,expert_id) -- should be ALWAYS ZERO by construction (evict_lru/upload_expert/upload_expert_async are the only mutation sites, all under cache_mutex); nonzero means the index and expert_vram_cache have desynced somewhere and find_expert is safely falling back to its linear scan, but the root cause needs investigating
     std::atomic<uint64_t> n_pinned_resident{0};    // experts currently held as non-evictable VRAM residents (pinned). Gauge-ish: incremented on pin, decremented on unpin.
     std::atomic<uint64_t> n_pilot_hints_skipped{0}; // speculative pilot-prefetch hints skipped because the expert was ALREADY host-cache-resident (a guaranteed instant hit needing no read) -- measures how much prefetch-worker bandwidth this avoids wasting; compare against n_pipe_hits/n_expert_cache_miss before/after to see the effect
+
+    // Pure PREDICTION-ACCURACY recall: overlap between the pilot's
+    // predicted top-K (LayerScratch::pilot_pred_ids, captured before any
+    // already-resident filtering) and the REAL router's top-K when that
+    // same layer's moe_forward_gguf actually runs, at the same "last
+    // token" position both sides use. Deliberately measured completely
+    // separately from "Prefetch (PIPE) served %" -- that number also
+    // depends on worker-thread speed and staging-pool size (both already
+    // tested this session with little effect), so it can't tell you
+    // whether the REMAINING gap is prediction accuracy or something else
+    // downstream. This can. n_pilot_recall_hits / (n_pilot_recall_checks *
+    // topk) is the recall fraction, directly comparable to a reference
+    // implementation's own reported recall number.
+    std::atomic<uint64_t> n_pilot_recall_hits{0};
+    std::atomic<uint64_t> n_pilot_recall_checks{0};   // number of (layer, "last token") comparisons made
+    std::atomic<uint64_t> n_pilot_recall_topk_sum{0}; // sum of topk across those checks (denominator, since topk could vary in principle)
     std::atomic<uint64_t> n_vram_evict_demoted{0};  // VRAM evictions salvaged into the RAM tier via a D2H copy instead of being dropped outright (vram_evict_demote_to_ram=true) -- nonzero proves the salvage path is engaging; compare against Expert cache's disk-miss count for the real win (a demoted expert re-hit later serves from RAM, no disk read at all)
     std::atomic<uint64_t> n_vram_evict_demote_skipped{0}; // demote attempts that declined for a benign reason (already RAM-resident, or the layer uses the legacy per-expert-tensor format with no packed_slab_geometry) -- not an error, just nothing to do
     std::atomic<uint64_t> n_vram_evict_demote_failed{0};  // demote attempts that hit a real problem (cudaMemcpy D2H failure, size mismatch) -- should stay at/near 0; a nonzero count is worth investigating but never corrupts anything, since a failed demote just leaves the RAM slot empty rather than half-populated
@@ -168,7 +224,51 @@ struct PerfCounters {
     // alone can't distinguish, so the next real run's data (not more
     // guessing) can determine which fix actually applies:
     std::atomic<uint64_t> n_pipe_miss_no_match{0};    // consume_staged found NO staging slot at all for this (layer,expert) -- either the pilot never predicted this exact expert, or it did but the slot was already round-robin-recycled for a later hint before this miss arrived. Points at PREDICTION ACCURACY / staging POOL SIZE as the lever, not raw read speed.
-    std::atomic<uint64_t> n_pipe_miss_not_ready{0};    // consume_staged found a matching (layer,expert) slot but its pread hadn't finished yet -- the pilot's prediction was CORRECT, this was purely a timing loss. Points at making the staged read start earlier / finish faster (or growing NUM_STAGING_SLOTS so more predictions survive the wait) as the lever, not prediction accuracy.
+    std::atomic<uint64_t> n_pipe_miss_not_ready{0};    // consume_staged found a matching (layer,expert) slot but its pread hadn't finished yet -- the pilot's prediction was CORRECT, this was purely a timing loss. Points at making the staged read start earlier / finish faster (or growing prefetch_staging_slots so more predictions survive the wait) as the lever, not prediction accuracy.
+
+    // Three-tier caching performance counters
+    std::atomic<uint64_t> n_active_layer_uploads{0};    // uploads to active layer area (temporary workspace)
+    std::atomic<uint64_t> n_active_layer_hits{0};      // cache hits served from active layer area
+    std::atomic<uint64_t> n_active_layer_cleanup{0};    // active layer slots reclaimed after layer completion
+    std::atomic<uint64_t> n_active_layer_promoted{0};   // active-layer experts promoted into the real VRAM LRU cache (hit_count crossed active_layer_promote_threshold), vs. just freed at cleanup
+    std::atomic<uint64_t> n_move_on_promotion{0};       // RAM→VRAM promotions that used MOVE (freed RAM slot) instead of COPY
+    std::atomic<uint64_t> n_copy_on_promotion{0};       // RAM→VRAM promotions that used COPY (left RAM slot occupied)
+
+    // Prefill-vs-decode split of the same hit/miss counts above. Added to
+    // test a specific hypothesis: the pilot predicts from only the LAST
+    // token's hidden state, which can't cover prefill's full per-layer
+    // expert fan-out across ALL prompt tokens at once -- so an aggregate
+    // PIPE-served rate near 0% could mean "decode is fine, prefill just
+    // structurally can't be helped" rather than "the whole mechanism is
+    // broken." Compare n_pipe_hits_decode/n_expert_cache_miss_decode
+    // against the aggregate rate to see if decode alone looks any better.
+    std::atomic<uint64_t> n_expert_cache_miss_prefill{0};
+    std::atomic<uint64_t> n_expert_cache_miss_decode{0};
+    std::atomic<uint64_t> n_pipe_hits_prefill{0};
+    std::atomic<uint64_t> n_pipe_hits_decode{0};
+
+    // Of n_pipe_miss_no_match above, how many still had a hint for this
+    // EXACT (layer,expert) sitting unpopped in the prefetcher's SPSC queue
+    // at the moment of the miss (LockFreePrefetcher::has_pending_hint) --
+    // i.e. the pilot predicted correctly, but the single worker thread
+    // hadn't even STARTED that read yet. A high fraction here points at a
+    // worker-thread throughput/scheduling bottleneck (N hints queued per
+    // layer transition, one thread servicing them one at a time) as the
+    // fix, not prediction accuracy or staging pool size.
+    std::atomic<uint64_t> n_pipe_miss_still_queued{0};
+
+    // io_uring batch outcome, per active_prefetch() call that attempted it
+    // (io_uring=true AND Ring::available()). Added because the fallback-on-
+    // any-failure design (io_uring_backend.hpp) is deliberately silent at
+    // the per-call level -- without this, there is NO way to tell from a
+    // real run's numbers whether io_uring is actually doing anything or
+    // quietly failing every single batch and always taking the sequential
+    // pread path. n_uring_batch_ok + n_uring_batch_fallback == every
+    // attempted batch; a near-0 ok fraction despite [IO-URING] Enabled at
+    // startup means Ring::init() succeeded but real reads are failing --
+    // worth a closer look, not a "it's just not helping" shrug.
+    std::atomic<uint64_t> n_uring_batch_ok{0};
+    std::atomic<uint64_t> n_uring_batch_fallback{0};
 
     // Sum of every request's OWN measured wall time (request_wall_ms from
     // generate_text, the same number the [REQUEST] line itself prints),
@@ -234,7 +334,7 @@ struct PerfCounters {
     // callers can diff two snapshots to get a per-token or per-request
     // breakdown without disturbing the global running totals.
     struct Snapshot {
-        double t_disk_read=0, t_host_alloc=0, t_gpu_upload=0, t_gpu_download=0, t_gpu_compute=0, t_cpu_expert=0;
+        double t_disk_read=0, t_host_alloc=0, t_gpu_upload=0, t_expert_gpu_upload=0, t_gpu_download=0, t_gpu_compute=0, t_cpu_expert=0;
         double t_cpu_dequant=0, t_cpu_dot=0;
         double t_attn=0;
         double t_attn_preamble=0;
@@ -250,7 +350,8 @@ struct PerfCounters {
         Snapshot operator-(const Snapshot& b) const {
             return Snapshot{
                 t_disk_read - b.t_disk_read, t_host_alloc - b.t_host_alloc,
-                t_gpu_upload - b.t_gpu_upload, t_gpu_download - b.t_gpu_download,
+                t_gpu_upload - b.t_gpu_upload, t_expert_gpu_upload - b.t_expert_gpu_upload,
+                t_gpu_download - b.t_gpu_download,
                 t_gpu_compute - b.t_gpu_compute, t_cpu_expert - b.t_cpu_expert,
                 t_cpu_dequant - b.t_cpu_dequant, t_cpu_dot - b.t_cpu_dot,
                 t_attn - b.t_attn,
@@ -285,7 +386,8 @@ struct PerfCounters {
 
     Snapshot snapshot() const {
         return Snapshot{
-            t_disk_read.load(), t_host_alloc.load(), t_gpu_upload.load(), t_gpu_download.load(),
+            t_disk_read.load(), t_host_alloc.load(), t_gpu_upload.load(), t_expert_gpu_upload.load(),
+            t_gpu_download.load(),
             t_gpu_compute.load(), t_cpu_expert.load(),
             t_cpu_dequant.load(), t_cpu_dot.load(),
             t_attn.load(),
@@ -364,7 +466,11 @@ struct PerfCounters {
     // never reach, and which mixes every request together over the whole
     // program lifetime rather than isolating this one).
     static void print_summary(const char* label, double wall_ms, int n_tokens, const Snapshot& d) {
-        double gpu_round_trip = d.t_gpu_upload + d.t_gpu_compute + d.t_gpu_download;
+        // t_expert_gpu_upload (NOT t_gpu_upload -- see that counter's own
+        // comment) so this "gpu=... [up=...]" breakdown reflects
+        // expert_ffn's own per-call GPU round trip, not cache-promotion
+        // slab uploads bleeding in from a shared bucket.
+        double gpu_round_trip = d.t_expert_gpu_upload + d.t_gpu_compute + d.t_gpu_download;
         uint64_t hits = d.n_expert_cache_hit, misses = d.n_expert_cache_miss;
         uint64_t gcalls = d.n_expert_gpu_calls, ccalls = d.n_expert_cpu_calls;
         double tok_s = wall_ms > 0 ? n_tokens / (wall_ms / 1000.0) : 0.0;
@@ -381,7 +487,7 @@ struct PerfCounters {
             d.t_attn_preamble,
             d.t_attn_norm, d.t_attn_qproj, d.t_attn_kvproj, d.t_attn_absorb, d.t_attn_score, d.t_attn_outproj,
             d.t_moe_route, d.t_moe_expert,
-            gpu_round_trip, d.t_gpu_upload, d.t_gpu_compute, d.t_gpu_download, d.t_cpu_expert,
+            gpu_round_trip, d.t_expert_gpu_upload, d.t_gpu_compute, d.t_gpu_download, d.t_cpu_expert,
             d.t_cpu_dequant, d.t_cpu_dot,
             dense_gpu_total, d.t_dense_gpu_up, d.t_dense_gpu_compute, d.t_dense_gpu_down,
             (unsigned long long)d.n_dense_gpu_calls,
@@ -410,7 +516,11 @@ struct PerfCounters {
     // that never calls generate_text) -- Tokens/Throughput lines simply
     // don't print in that case, same as the old total>0 guard did.
     void dump_report(double session_elapsed_s = 0.0) const {
-        double gpu_round_trip = t_gpu_upload + t_gpu_compute + t_gpu_download;
+        // t_expert_gpu_upload, NOT t_gpu_upload -- see t_expert_gpu_upload's
+        // own comment for the real conflation bug this split fixes (cache-
+        // promotion slab uploads were bleeding into this "expert_ffn only"
+        // total, inflating the reported per-call GPU upload figure).
+        double gpu_round_trip = t_expert_gpu_upload + t_gpu_compute + t_gpu_download;
         LOG_INFO("\n========== MoEStream Performance Report ==========\n");
         LOG_INFO("Dense load (init):   %8.3f s\n", t_dense_load.load());
         LOG_INFO("Disk read (expert):  %8.3f s  (%6.2f GB/s, %.2f GB total)\n",
@@ -418,13 +528,19 @@ struct PerfCounters {
                  t_disk_read > 0 ? (bytes_disk_read / 1e9) / t_disk_read : 0.0,
                  bytes_disk_read / 1e9);
         LOG_INFO("Host alloc/setup:    %8.3f s\n", t_host_alloc.load());
-        LOG_INFO("GPU upload (H2D):    %8.3f s  (%6.2f GB/s, %.2f GB total)\n",
+        LOG_INFO("GPU upload (H2D):    %8.3f s  (%6.2f GB/s, %.2f GB total) -- cache PROMOTION "
+                 "slab uploads only (RAM->VRAM); expert_ffn's own small per-call activation "
+                 "upload is now tracked separately, see 'GPU round-trip total' below\n",
                  t_gpu_upload.load(),
                  t_gpu_upload > 0 ? (bytes_gpu_uploaded / 1e9) / t_gpu_upload : 0.0,
                  bytes_gpu_uploaded / 1e9);
         LOG_INFO("Promotions (H2D):    %lu uploads / %.2f GB total\n",
             (unsigned long)n_expert_promote.load(),
             bytes_gpu_uploaded.load() / 1e9);
+        LOG_INFO("Expert activation upload (H2D): %8.3f s  (expert_ffn's own per-call upload, "
+                 "isolated from cache-promotion uploads above -- %llu calls, %.4f ms/call avg)\n",
+                 t_expert_gpu_upload.load(), (unsigned long long)n_expert_gpu_calls.load(),
+                 n_expert_gpu_calls > 0 ? 1000.0 * t_expert_gpu_upload / n_expert_gpu_calls : 0.0);
         LOG_INFO("GPU compute:         %8.3f s\n", t_gpu_compute.load());
         LOG_INFO("GPU download (D2H):  %8.3f s\n", t_gpu_download.load());
         LOG_INFO("GPU round-trip total:%8.3f s  (upload+compute+download, expert_ffn only)\n", gpu_round_trip);
@@ -456,7 +572,7 @@ struct PerfCounters {
         if (gcalls > 0)
             LOG_INFO("  avg GPU round-trip: %6.3f ms/call (up=%.3f cmp=%.3f dn=%.3f)\n",
                      1000.0 * gpu_round_trip / gcalls,
-                     1000.0 * t_gpu_upload / gcalls, 1000.0 * t_gpu_compute / gcalls,
+                     1000.0 * t_expert_gpu_upload / gcalls, 1000.0 * t_gpu_compute / gcalls,
                      1000.0 * t_gpu_download / gcalls);
         if (ccalls > 0)
             LOG_INFO("  avg CPU expert:     %6.3f ms/call\n", 1000.0 * t_cpu_expert / ccalls);
@@ -470,20 +586,67 @@ struct PerfCounters {
                  (unsigned long)n_pipe_hits.load(), (unsigned long)misses,
                  misses > 0 ? 100.0 * n_pipe_hits.load() / misses : 0.0,
                  (unsigned long)n_pipe_miss_no_match.load(), (unsigned long)n_pipe_miss_not_ready.load());
+        {
+            uint64_t pf_miss = n_expert_cache_miss_prefill.load(), dc_miss = n_expert_cache_miss_decode.load();
+            uint64_t pf_hit = n_pipe_hits_prefill.load(), dc_hit = n_pipe_hits_decode.load();
+            if (pf_miss + dc_miss > 0) {
+                LOG_INFO("  PIPE by phase:     prefill %lu/%lu served (%.1f%%)  |  decode %lu/%lu served (%.1f%%) "
+                         "-- decode-only rate isolates whether the single-token pilot design can help at all here\n",
+                         (unsigned long)pf_hit, (unsigned long)pf_miss,
+                         pf_miss > 0 ? 100.0 * pf_hit / pf_miss : 0.0,
+                         (unsigned long)dc_hit, (unsigned long)dc_miss,
+                         dc_miss > 0 ? 100.0 * dc_hit / dc_miss : 0.0);
+            }
+            uint64_t still_queued = n_pipe_miss_still_queued.load();
+            uint64_t no_match = n_pipe_miss_no_match.load();
+            if (no_match > 0) {
+                LOG_INFO("  no-match detail:   %lu/%lu still had a hint waiting unpopped in the prefetch queue "
+                         "(worker-thread throughput gap) vs %lu with no trace at all (prediction/pool-size gap)\n",
+                         (unsigned long)still_queued, (unsigned long)no_match,
+                         (unsigned long)(no_match - std::min(no_match, still_queued)));
+            }
+        }
         LOG_INFO("Pilot hints skipped: %lu (already host-cache-resident -- avoided wasting prefetch bandwidth)\n",
                  (unsigned long)n_pilot_hints_skipped.load());
+        {
+            uint64_t rhits = n_pilot_recall_hits.load(), rchecks = n_pilot_recall_checks.load();
+            uint64_t rdenom = n_pilot_recall_topk_sum.load();
+            if (rchecks > 0) {
+                LOG_INFO("Pilot recall:        %lu/%lu (%.1f%%) predicted-top-K overlap with the REAL "
+                         "router's top-K, over %lu (layer, last-token) checks -- independent of worker "
+                         "speed/staging pool size, measures prediction accuracy alone\n",
+                         (unsigned long)rhits, (unsigned long)rdenom,
+                         rdenom > 0 ? 100.0 * rhits / rdenom : 0.0, (unsigned long)rchecks);
+            }
+        }
         LOG_INFO("VRAM->RAM demote:    %lu salvaged / %lu skipped (benign) / %lu failed "
                  "(vram_evict_demote_to_ram: instead of dropping an evicted expert's bytes, D2H "
                  "copy them back into the RAM tier before the VRAM slot is overwritten)\n",
                  (unsigned long)n_vram_evict_demoted.load(),
                  (unsigned long)n_vram_evict_demote_skipped.load(),
                  (unsigned long)n_vram_evict_demote_failed.load());
+        LOG_INFO("Three-tier caching:  %lu active-layer uploads / %lu active-layer hits / %lu cleanups / "
+                 "%lu promoted-to-main (MOVE vs COPY: %lu promotions freed RAM slots vs %lu left occupied)\n",
+                 (unsigned long)n_active_layer_uploads.load(),
+                 (unsigned long)n_active_layer_hits.load(),
+                 (unsigned long)n_active_layer_cleanup.load(),
+                 (unsigned long)n_active_layer_promoted.load(),
+                 (unsigned long)n_move_on_promotion.load(),
+                 (unsigned long)n_copy_on_promotion.load());
         LOG_INFO("Prefetch pickup:     avg %.2fms over %lu hints, peak queue backlog %lu "
                  "(large delay + small backlog => worker CPU-starved; growing backlog => worker throughput-bound)\n",
                  n_prefetch_hints_processed > 0
                      ? 1000.0 * t_prefetch_pickup_delay.load() / n_prefetch_hints_processed.load() : 0.0,
                  (unsigned long)n_prefetch_hints_processed.load(),
                  (unsigned long)n_prefetch_backlog_peak.load());
+        {
+            uint64_t uok = n_uring_batch_ok.load(), ufb = n_uring_batch_fallback.load();
+            if (uok + ufb > 0) {
+                LOG_INFO("io_uring batches:    %lu batched / %lu fell back to sequential preads (%.1f%% batched)\n",
+                         (unsigned long)uok, (unsigned long)ufb,
+                         100.0 * uok / (uok + ufb));
+            }
+        }
         LOG_INFO("Pinned residents:    %lu current / %lu desync-detected "
                  "(evict_lru no longer scans pinned slots at all -- this should read 0; "
                  "nonzero means unpinned_slot_indices desynced from the real pinned flags)\n",
@@ -503,6 +666,11 @@ struct PerfCounters {
         LOG_INFO("Staging mutex wait:  %8.3f s  (staging slot regrow: %lu events, %.3f s -- "
                  "cudaMallocHost/cudaFreeHost held under the SAME lock, see [SLOW-STAGING-REGROW])\n",
                  t_staging_mutex_wait.load(), (unsigned long)n_staging_regrow.load(), t_staging_regrow.load());
+        LOG_INFO("Staged-unused evict: %lu (correctly predicted+read+staged experts recycled by round-robin "
+                 "before any miss consumed them -- high means the staging pool is genuinely too small; low "
+                 "despite a recall/served gap points elsewhere, e.g. the expert became a cache hit via "
+                 "another path before ever reaching the miss check)\n",
+                 (unsigned long)n_staged_evicted_unused.load());
         LOG_INFO("Cache mutex wait:    %8.3f s  (GpuTopology::cache_mutex, shared between the decode "
                  "thread's hit-triggered promotions and the prefetcher worker thread)\n",
                  t_cache_mutex_wait.load());

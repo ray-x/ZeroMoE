@@ -92,7 +92,7 @@ struct ExpertLocation {
     bool upload_ready = true;
     cudaEvent_t upload_event = nullptr;
 
-    // Phase A colibri-port: a pinned slot is never chosen as an eviction
+    // Phase A a pinned slot is never chosen as an eviction
     // victim, regardless of eviction_score. Set once a RAM-cache expert's
     // hit_count crosses RAMSafetyManager::pin_threshold (proven-hot within
     // this conversation), or at startup for the pre-loaded hot set from a
@@ -137,6 +137,25 @@ public:
     size_t expert_slab_size = 0;       // bytes per expert slot
     uint64_t cache_clock = 0;
 
+    // ========== Three-tier caching: Active layer area ==========
+    // Active layer area: temporary workspace for current-layer experts
+    // Reclaimed-per-request, never participates in LRU eviction
+    uint8_t* active_layer_pool = nullptr;
+    size_t active_layer_capacity = 0;     // Maximum experts active layer can hold
+    std::vector<ExpertLocation> active_layer_slots;  // Pre-allocated slot metadata
+
+    // Hit count (while resident in the active layer area) at which an
+    // expert gets promoted into the real VRAM LRU cache (device-to-device
+    // copy, see promote_active_to_main) instead of just being freed once
+    // it's no longer this pass's current layer. Set from EngineConfig::
+    // active_layer_promote_hit_threshold in main.cpp. Default 1 (promote on
+    // ANY repeat access) rather than mirroring RAMSafetyManager's
+    // promote_hit_threshold=1-8 range: the active layer area only holds
+    // decode-time cold misses for the CURRENT layer, a much narrower window
+    // than the RAM tier's whole-conversation lifetime, so a repeat hit here
+    // is already a comparatively strong signal.
+    int active_layer_promote_threshold = 1;
+
     // Periodic decay of hit_count so a once-hot expert doesn't stay
     // permanently sticky after routing patterns shift (e.g. topic change).
     static constexpr uint32_t HIT_DECAY_INTERVAL = 4096;
@@ -153,9 +172,8 @@ public:
 
     // Cache-churn diagnostics: per-(layer,expert) swap in/out counts for the
     // VRAM tier, so a shutdown report can answer "which experts are being
-    // repeatedly evicted and reloaded, and are they pinned or not" -- the
-    // question colibri's own profile-driven pinned tier is designed to
-    // avoid paying for at all. Keyed dynamically (not a dense n_layers*
+    // repeatedly evicted and reloaded, and are they pinned or not".
+    // Keyed dynamically (not a dense n_layers*
     // n_experts array like StreamingEngine::route_freq) since GpuTopology
     // doesn't know those dimensions itself. Mutated only from evict_lru/
     // upload_expert/upload_expert_async, all of which already hold
@@ -337,6 +355,7 @@ public:
             if (dev.expert_cache_pool) { cudaSetDevice(dev.id); cudaFree(dev.expert_cache_pool); }
         }
         if (h_xfer_pinned) cudaFreeHost(h_xfer_pinned);
+        if (active_layer_pool) { cudaSetDevice(active_layer_slots.front().gpu_id); cudaFree(active_layer_pool); }
     }
 
     // Allocate expert VRAM cache on vault GPUs
@@ -849,6 +868,44 @@ public:
         return slot;
     }
 
+    // ========== Three-Tier Caching: Active Layer Area ==========
+
+    // Allocate active layer area for temporary current-layer expert storage
+    // Returns true if successful, false on allocation failure
+    bool allocate_active_layer_area(size_t expert_slab_bytes, int max_experts_per_layer);
+
+    // Upload expert to active layer area (temporary, never cached)
+    // Returns slot pointer or nullptr if area is full/allocation failed
+    // This is decode-thread-only and never participates in LRU eviction
+    ExpertLocation* upload_expert_active(int layer, int expert_id,
+                                        const uint8_t* host_data, size_t bytes);
+
+    // Cleanup active layer area after processing a layer's experts
+    // Called from moe_forward_gguf after each layer completion
+    void cleanup_active_layer_area(int current_layer_idx);
+
+    // Look up (layer, expert_id) in the active layer area. On a hit, bumps
+    // hit_count/last_used_clock (like find_expert's finish_expert_hit) and
+    // counts n_active_layer_hits; if hit_count then meets
+    // active_layer_promote_threshold, immediately promotes the expert into
+    // the real VRAM LRU cache (promote_active_to_main) and frees this
+    // active-layer slot (MOVE semantics, mirroring RAMSafetyManager's
+    // move_on_promotion) so it's available for a new cold upload right
+    // away rather than waiting for the next cleanup_active_layer_area call.
+    // Returns nullptr on a miss.
+    ExpertLocation* find_active_expert(int layer, int expert_id);
+
+    // Promote an expert already resident in the active layer area (VRAM)
+    // into the real VRAM LRU cache via a device-to-device copy -- same
+    // victim-selection/salvage path as upload_expert(), just sourcing from
+    // device memory instead of a host buffer. Used by find_active_expert
+    // (on-hit promotion) and cleanup_active_layer_area (end-of-layer
+    // promotion for anything not caught by an inline hit first). Returns
+    // the new main-cache slot, or nullptr if the main cache is unavailable/
+    // the copy fails.
+    ExpertLocation* promote_active_to_main(int layer, int expert_id,
+                                            const uint8_t* device_src, size_t bytes);
+
     // Transfer a small result vector between GPUs (e.g., expert output → core)
     void cross_device_transfer(float* dst, int dst_device,
                                const float* src, int src_device,
@@ -979,8 +1036,7 @@ public:
     // Shutdown-time summary of VRAM-tier cache churn: which experts were
     // swapped in/out the most, and -- the actionable part -- which of those
     // are NOT currently pinned, i.e. paying repeated H2D/eviction cost with
-    // no protection. This is the direct counterpart to colibri's own
-    // profile-driven pinned tier, which by design never pays this cost more
+    // no protection. pinned tier, which by design never pays this cost more
     // than once per expert (upload at startup, never evicted). A high-churn,
     // unpinned entry here is a concrete candidate for a lower pin_threshold
     // or a larger pin_topk_per_layer preload. Call once at shutdown, after
@@ -1030,10 +1086,7 @@ public:
     // vs. total capacity -- distinct from expert_vram_cache_cap (capacity)
     // and from report_cache_churn's cumulative swap-activity counters
     // (which say nothing about current occupancy). Added specifically to
-    // answer "how many MoE experts do we have loaded" with a real number,
-    // comparable to colibri's own "[CUDA] resident set: N tensors, X GB
-    // VRAM" report (see colibri's CLAUDE.md) -- MoEStream had no
-    // equivalent single-line summary before this.
+    // answer "how many MoE experts do we have loaded" with a real number
     void report_slot_summary() const {
         size_t filled = 0, pinned_n = 0, mid_upload = 0;
         for (const auto& loc : expert_vram_cache) {

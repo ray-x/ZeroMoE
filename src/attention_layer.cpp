@@ -47,7 +47,7 @@ static bool check_finite_attn(const char* label, int layer_idx, const float* dat
 // CONVENTION: interleaved rotation -- pairs (2j, 2j+1) -- REQUIRED by every MLA
 // target this project runs (glm-dsa / ChatGLM / DeepSeek-V2/V3); confirmed
 // against llama.cpp (rope_type = LLAMA_ROPE_TYPE_NORM for GLM_DSA/CHATGLM) and
-// colibri (rope_interleave). The previous implementation here used NeoX
+// rope_interleave. The previous implementation here used NeoX
 // rotate-half (pairs (k, k+half)) which scrambled positional encoding on every
 // MLA layer and produced "always random text" -- see test_rope's known-answer
 // case for the exact failure mode.

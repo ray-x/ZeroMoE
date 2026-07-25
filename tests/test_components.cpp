@@ -12,6 +12,7 @@
 #include <random>
 #include <limits>
 #include "rope.hpp"   // the REAL, unit-tested RoPE (no CUDA / no AVX-512 deps)
+#include "direct_io.hpp"  // the REAL O_DIRECT alignment-window arithmetic (no CUDA deps)
 
 // ============================================================
 // Test 1: ReasoningParser state machine
@@ -1348,21 +1349,148 @@ void test_expert_vram_index_logic() {
     std::cout << " PASSED\n";
 }
 
-int main() {
+// ============================================================
+// Test: direct_io::compute_aligned_window (O_DIRECT alignment arithmetic)
+// ============================================================
+// This is the REAL function used by include/direct_io.hpp's
+// pread_direct_aware -- unlike the O_DIRECT syscall behavior itself
+// (which this darwin dev machine cannot exercise at all, and which
+// tests/main_test.cpp's own CUDA-dependent tests can't reach either
+// since O_DIRECT isn't GPU-related), this is pure, dependency-free
+// arithmetic, so it's tested directly rather than via a reimplemented
+// stand-in -- there's no "portable oracle" gap to bridge here the way
+// there is for CUDA-entangled code elsewhere in this file.
+void test_direct_io_aligned_window_logic() {
+    std::cout << "[TEST] direct_io::compute_aligned_window arithmetic..." << std::flush;
+
+    auto check_invariants = [](uint64_t offset, uint64_t len, uint64_t alignment) {
+        auto w = direct_io::compute_aligned_window(offset, len, alignment);
+        assert(w.aligned_offset <= offset && "aligned_offset must not start after the real offset");
+        assert(w.aligned_offset % alignment == 0 && "aligned_offset must be alignment-aligned");
+        assert(w.aligned_len % alignment == 0 && "aligned_len must be a multiple of alignment");
+        assert(w.aligned_offset + w.aligned_len >= offset + len &&
+               "aligned window must fully cover [offset, offset+len)");
+        assert(w.front_slack == offset - w.aligned_offset && "front_slack must equal offset - aligned_offset");
+        assert(w.front_slack < alignment && "front_slack must be smaller than one alignment unit");
+        // The window shouldn't overshoot by more than one alignment unit on
+        // either side beyond what's strictly required to cover the range --
+        // catches a rounding-direction bug that would silently over-read by
+        // a large, wrong amount instead of the expected "at most alignment-1
+        // bytes of slack on each end".
+        assert(offset - w.aligned_offset < alignment);
+        assert((w.aligned_offset + w.aligned_len) - (offset + len) < alignment);
+    };
+
+    // Already-aligned offset, already-aligned length: no padding needed at all.
+    {
+        auto w = direct_io::compute_aligned_window(4096, 8192, 4096);
+        assert(w.aligned_offset == 4096 && w.aligned_len == 8192 && w.front_slack == 0);
+    }
+    // Already-aligned offset, length NOT a multiple of alignment: only the
+    // tail needs padding.
+    {
+        auto w = direct_io::compute_aligned_window(4096, 100, 4096);
+        assert(w.aligned_offset == 4096 && w.front_slack == 0);
+        assert(w.aligned_len == 4096 && "100 bytes should round up to exactly one alignment unit");
+    }
+    // Offset 0 edge case.
+    {
+        auto w = direct_io::compute_aligned_window(0, 1, 4096);
+        assert(w.aligned_offset == 0 && w.front_slack == 0 && w.aligned_len == 4096);
+    }
+    // Misaligned offset (the "general case" this project's real GGUF
+    // tensors should never hit after gguf_tool pack --align 4096, but the
+    // code must still handle correctly rather than assume away).
+    {
+        auto w = direct_io::compute_aligned_window(4200, 1000, 4096);
+        assert(w.aligned_offset == 4096 && w.front_slack == 104);
+        // real range ends at 5200 -> next 4096 boundary is 8192
+        assert(w.aligned_len == 8192 - 4096);
+    }
+    // A real per-expert-sized read at a realistic large file offset
+    // (tens of GB in, matching the scale this feature exists for).
+    {
+        uint64_t offset = 37ULL * 1000 * 1000 * 1000 + 123;  // ~37GB in, deliberately unaligned
+        uint64_t len = 3 * 1024 * 1024 + 777;                // ~3MB expert slab, deliberately not block-sized
+        check_invariants(offset, len, 4096);
+    }
+    // Exhaustive-ish sweep across small offsets/lengths (covers every
+    // possible front_slack value for this alignment) plus a randomized
+    // sweep across the full 64-bit-realistic range.
+    for (uint64_t off = 0; off < 4096 * 3; off += 37) {
+        for (uint64_t len : {1ULL, 4095ULL, 4096ULL, 4097ULL, 9000ULL}) {
+            check_invariants(off, len, 4096);
+        }
+    }
+    std::mt19937_64 rng(99);
+    std::uniform_int_distribution<uint64_t> big_offset(0, 200ULL * 1000 * 1000 * 1000);
+    std::uniform_int_distribution<uint64_t> real_len(1, 8ULL * 1024 * 1024);
+    for (int i = 0; i < 20000; ++i) {
+        check_invariants(big_offset(rng), real_len(rng), 4096);
+    }
+    // Alignment values other than 4096 (e.g. a filesystem with a smaller
+    // logical block size) must also hold.
+    for (uint64_t alignment : {512ULL, 1024ULL, 4096ULL}) {
+        for (int i = 0; i < 2000; ++i) {
+            check_invariants(big_offset(rng), real_len(rng), alignment);
+        }
+    }
+
+    std::cout << " PASSED\n";
+}
+
+// Optional substring filtering via argv, so a subset can be exercised without
+// recompiling -- the workflow this file exists for: run the CPU-only component
+// tests on a box where the full CUDA harness (main_test.cpp) can't build at
+// all (e.g. macOS). A test runs iff its name contains ANY argv token (no
+// match logic, just std::string::find); no args = run everything (the
+// original behavior, so `make test` / CI that pass no args are unaffected).
+//
+//   ./test_components               -> all 14 component tests
+//   ./test_components rope          -> just test_rope
+//   ./test_components dequant       -> every *dequant* test
+//   ./test_components rope dequant  -> rope OR any dequant test
+int main(int argc, char** argv) {
     std::cout << "=== MoEStream Component Tests ===\n";
-    test_reasoning_parser();
-    test_rope();
-    test_topk_selection();
-    test_softmax_routing();
-    test_calculate_size();
-    test_spsc_ring();
-    test_toml_parser();
-    test_q2k_q3k_dequant_logic();
-    test_iq2xxs_iq3xxs_dequant_logic();
-    test_iq2s_dequant_logic();
-    test_iq2_wide_dequant_logic();
-    test_bf16_roundtrip_logic();
-    test_expert_vram_index_logic();
-    std::cout << "\nAll tests PASSED.\n";
+    struct TestEntry { const char* name; void (*fn)(); };
+    const TestEntry tests[] = {
+        {"reasoning_parser",         test_reasoning_parser},
+        {"rope",                     test_rope},
+        {"topk_selection",           test_topk_selection},
+        {"softmax_routing",          test_softmax_routing},
+        {"calculate_size",           test_calculate_size},
+        {"spsc_ring",                test_spsc_ring},
+        {"toml_parser",              test_toml_parser},
+        {"q2k_q3k_dequant",          test_q2k_q3k_dequant_logic},
+        {"iq2xxs_iq3xxs_dequant",    test_iq2xxs_iq3xxs_dequant_logic},
+        {"iq2s_dequant",             test_iq2s_dequant_logic},
+        {"iq2_wide",                 test_iq2_wide_dequant_logic},
+        {"bf16_roundtrip",           test_bf16_roundtrip_logic},
+        {"expert_vram_index",        test_expert_vram_index_logic},
+        {"direct_io_aligned_window", test_direct_io_aligned_window_logic},
+    };
+    const bool filtered = argc > 1;
+    auto matches = [&](const char* name) {
+        if (!filtered) return true;
+        std::string n(name);
+        for (int i = 1; i < argc; ++i)
+            if (n.find(argv[i]) != std::string::npos) return true;
+        return false;
+    };
+    int run = 0;
+    for (const auto& t : tests) {
+        if (!matches(t.name)) continue;
+        if (filtered) std::cout << "[run] " << t.name << "\n";
+        t.fn();
+        ++run;
+    }
+    if (run == 0) {
+        std::cout << "No tests matched filter:";
+        for (int i = 1; i < argc; ++i) std::cout << " " << argv[i];
+        std::cout << "\n";
+        return 2;
+    }
+    std::cout << "\n" << run << " test(s) "
+              << (filtered ? "ran (filtered), all" : "") << " PASSED.\n";
     return 0;
 }

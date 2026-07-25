@@ -195,7 +195,7 @@ public:
 // session with the real VRAM topology, alongside ram_mgr.vram_cache/
 // ram_mgr.prefetcher) instead of generate_text creating and starting its
 // OWN local, topology-less instance per request. That local instance was a
-// real structural bug (Phase A colibri-port investigation): it received
+// real structural bug (Phase A  investigation): it received
 // pilot-prefetch hints and did real disk I/O, but with gpu_topo=nullptr its
 // finish_prefetch() could never fire an async VRAM promotion -- and
 // meanwhile main.cpp's OWN topology-enabled prefetcher instance sat idle,
@@ -401,8 +401,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // GLM-5.2's real eos_token_id is a 3-entry array (<|endoftext|>,
         // <|user|>, <|observation|>) -- checking only the single `eos_id`
         // param means generation runs past the model's real turn-boundary
-        // markers into undefined continuation territory (confirmed against
-        // colibri, a working GLM-5.2 engine reading the raw HF config).
+        // markers into undefined continuation territory
         // tokenizer.is_stop_token covers all of them; the `eos_id` check
         // stays as a redundant safety net.
         if (next_token == eos_id || tokenizer.is_stop_token(next_token)) break;

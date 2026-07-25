@@ -433,16 +433,6 @@ bool test_avx512_dequant_iq() {
 // 8. CPU Dequant+Matmul Throughput Benchmark (NOT a correctness test --
 //    reports numbers only, never fails/gates the suite's exit code)
 // ------------------------------------------------------------------
-// Added to root-cause a real, measured gap: colibri's own PROF report
-// (its P0-EXEC line, real steady-state DECODE phase, same machine) shows
-// routed-expert CPU dequant+matmul running at 16-23 GB/s; MoEStream's own
-// dump_report numbers (avg CPU expert ms/call, back-computed to GB/s) show
-// roughly 1.2-1.6 GB/s on the SAME hardware -- a ~4x gap in what turned out
-// to be MoEStream's single LARGEST per-token cost bucket (bigger than
-// disk-wait). This isolates the CPU dequant-matmul path completely from
-// disk I/O, caching, and routing, so the number is attributable to the
-// compute path alone. Uses REAL ggml-valid quantized bytes (same
-// ggml_quantize_row_ref pattern as Test 5/6/7), not synthetic bit patterns.
 //
 // Sweeps two axes:
 //   - quant type: IQ2_XXS/IQ3_XXS (the types this checkpoint's routed
@@ -557,7 +547,7 @@ static void bench_wide_case(GGUFType type, DequantWideFn wide_fn, int I, int O, 
 
 void bench_cpu_dequant_matmul() {
     std::cout << "\n[BENCH] CPU Dequant+Matmul Throughput (informational only -- compare "
-                 "these GB/s numbers directly against colibri's own PROF P0-EXEC line, "
+                 "these GB/s numbers directly PROF P0-EXEC line, "
                  "run on the same machine)\n";
     // Placeholder shape -- I must be a multiple of 256 (QK_K block size).
     // Replace with your checkpoint's REAL hidden/moe_inter (gate/up

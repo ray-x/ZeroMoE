@@ -4,6 +4,7 @@
 //   GPU 1+ (ExpertVault): MoE expert LRU cache in VRAM
 #pragma once
 #include "engine.hpp"
+#include "engine_config.hpp"
 #include "perf_timer.hpp"
 #include "gpu_topology.hpp"
 #include "cublas_matmul.hpp"
@@ -426,8 +427,21 @@ public:
     }
 
     // Allocate expert VRAM cache on vault GPU(s) based on model geometry
-    void setup_expert_cache(size_t expert_slab_bytes, int n_experts) {
+    void setup_expert_cache(size_t expert_slab_bytes, int n_experts, const EngineConfig& config) {
         topology.allocate_expert_cache(expert_slab_bytes, n_experts);
+
+        // Three-tier caching: Allocate active layer area for temporary expert storage
+        // This provides a workspace for current-layer experts without evicting LRU residents
+        if (config.use_active_layer_area) {
+            if (!topology.allocate_active_layer_area(expert_slab_bytes, config.active_layer_capacity)) {
+                LOG_STREAM_WARN() << "[GPU] Active layer area allocation failed - "
+                                   "three-tier caching will fall back to standard LRU behavior\n";
+            } else {
+                LOG_STREAM_INFO() << "[GPU] Three-tier: active layer area enabled for temporary expert storage\n";
+            }
+        } else {
+            LOG_STREAM_INFO() << "[GPU] Three-tier: active layer area disabled by configuration\n";
+        }
     }
 
     // Grow-only persistent device buffers for matmul I/O. Returns false if

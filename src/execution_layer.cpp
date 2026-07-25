@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <immintrin.h>
 #include <vector>
+#include <array>
 #include <algorithm>
 #include <thread>
 #include <cstring>
@@ -279,6 +280,21 @@ struct LayerScratch {
     std::vector<float> tok_topk_weights; // [S * topk]
     std::vector<int> expert_freq;       // [n_experts]
 
+    // Pilot RECALL instrumentation (diagnostic only, no behavior change):
+    // the pilot's full predicted top-K for pilot_pred_layer, captured
+    // BEFORE the already-resident skip filter so this measures pure
+    // prediction accuracy -- completely independent of the downstream
+    // serving pipeline (worker thread speed, staging pool size) that
+    // "Prefetch (PIPE) served %" conflates together. Consumed (and reset
+    // to -1) the next time moe_forward_gguf runs for pilot_pred_layer, at
+    // the same s==S-1 "last token" position the pilot itself predicted
+    // from -- an apples-to-apples comparison for both decode (S=1, the
+    // only token) and prefill (S>1, same last-token position both sides
+    // use). -1 = no prediction currently pending for any layer.
+    std::array<int, 8> pilot_pred_ids{};
+    int pilot_pred_count = 0;
+    int pilot_pred_layer = -1;
+
     void resize(int S, int D, int n_experts, int moe_inter, int topk, int n_expert_shared = 0, int dense_inter = 0) {
         attn_out.resize(S * D);
         moe_out.resize(S * D);
@@ -387,24 +403,54 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
     // uses safely) so there is no copy-vs-kernel-launch race to reason
     // about at all -- by the time this call returns, the data is
     // unconditionally present; (2) additionally holds the slot via
-    // hold_for_compute() (reference-counted, evict_lru-respected) for the
+    // hold_for_compute() (reference-counted, evictlru-respected) for the
     // ENTIRE issue-to-finish window, released only after
     // expert_ffn_gpu_finish's cudaStreamSynchronize(0) confirms the
     // asynchronous kernel EXECUTION (not just the copy) is actually done --
     // closing the race the previous attempt missed. Type support is
     // checked FIRST, before spending the synchronous upload's real latency
     // on a type that could never dispatch anyway.
+
+    // Three-tier caching: Try active layer area first for temporary storage
+    // This avoids evicting valuable LRU residents for current-layer experts
     if (!vram_resident && gpu_ctx && gpu_ctx->topo && gpu_ctx->slab_buffer
         && gpu_ctx->slab_capacity > 0 && S < GPU_COLD_BATCH_THRESHOLD
         && gpu_type_supported(gate_meta.type) && gpu_type_supported(up_meta.type)
         && gpu_type_supported(down_meta.type)) {
-        loc = gpu_ctx->topo->upload_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
-                                            gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
+
+        // Check for an existing active-layer resident FIRST -- a real hit
+        // (this expert was already uploaded here for an earlier token still
+        // within this layer's window). find_active_expert bumps hit_count
+        // and, if it crosses active_layer_promote_threshold, promotes this
+        // expert into the real VRAM LRU cache right away (freeing this
+        // active-layer slot) instead of waiting for cleanup_active_layer_area
+        // at the next layer transition.
+        loc = gpu_ctx->topo->find_active_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id);
         vram_resident = loc && loc->device_ptr;
         if (vram_resident) {
-            LOG_DEBUG("[MOE-VRAM]  COLD-GPU layer=%d expert=%d -> synchronous H2D upload on decode-time "
-                      "miss (avoids CPU dequant-matmul fallback)\n",
-                      gpu_ctx->layer_idx, gpu_ctx->expert_id);
+            LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER HIT layer=%d expert=%d hit_count=%u\n",
+                      gpu_ctx->layer_idx, gpu_ctx->expert_id, loc->hit_count);
+        } else {
+            // First touch this layer-window -- try active layer area (decode-
+            // thread-only, no eviction of the main LRU cache)
+            loc = gpu_ctx->topo->upload_expert_active(gpu_ctx->layer_idx, gpu_ctx->expert_id,
+                                                       gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
+            vram_resident = loc && loc->device_ptr;
+
+            if (vram_resident) {
+                LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER layer=%d expert=%d -> temporary upload (no LRU eviction)\n",
+                          gpu_ctx->layer_idx, gpu_ctx->expert_id);
+            } else {
+                // Fallback: cold-miss synchronous upload to regular VRAM cache
+                loc = gpu_ctx->topo->upload_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
+                                                    gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
+                vram_resident = loc && loc->device_ptr;
+                if (vram_resident) {
+                    LOG_DEBUG("[MOE-VRAM]  COLD-GPU layer=%d expert=%d -> synchronous H2D upload on decode-time "
+                              "miss (avoids CPU dequant-matmul fallback)\n",
+                              gpu_ctx->layer_idx, gpu_ctx->expert_id);
+                }
+            }
         }
     }
 
@@ -499,7 +545,7 @@ static bool expert_ffn_gpu_issue(
 
     PERF_START(gexp_up1);
     cudaMemcpy(gpu_scratch.d_x, input, (size_t)S * D * sizeof(float), cudaMemcpyHostToDevice);
-    PERF_END(gexp_up1, t_gpu_upload);
+    PERF_END(gexp_up1, t_expert_gpu_upload);
 
     gpu_matmul_dispatch(gate_meta.type, gpu_scratch.d_gate, gpu_scratch.d_x, gate_dev, S, D, moe_inter);
     gpu_matmul_dispatch(up_meta.type,   gpu_scratch.d_up,   gpu_scratch.d_x, up_dev,   S, D, moe_inter);
@@ -542,7 +588,7 @@ static void expert_ffn_gpu_finish(
 
     PERF_START(gexp_up2);
     cudaMemcpy(gpu_scratch.d_prod, gate_buf, (size_t)S * moe_inter * sizeof(float), cudaMemcpyHostToDevice);
-    PERF_END(gexp_up2, t_gpu_upload);
+    PERF_END(gexp_up2, t_expert_gpu_upload);
 
     PERF_START(gexp_cmp2);
     gpu_matmul_dispatch(down_meta.type, gpu_scratch.d_down, gpu_scratch.d_prod, down_dev, S, moe_inter, D);
@@ -650,7 +696,7 @@ void moe_forward_gguf(
             check_finite("ffn_norm.weight (raw, pre-rmsnorm)", layer_idx, -1,
                          reinterpret_cast<float*>(norm_it->second.host_ptr), (size_t)D);
             // ROOT CAUSE (found by tracing per-expert output norms against
-            // colibri): rmsnorm_row normalizes exactly ONE row (D floats).
+            // DMA): rmsnorm_row normalizes exactly ONE row (D floats).
             // This used to be called ONCE, unconditionally, regardless of S
             // -- correct only for S==1 (decode). During prefill (S>1) every
             // token past s=0 read whatever was already sitting in
@@ -750,12 +796,12 @@ void moe_forward_gguf(
             scratch.tok_topk_weights[s * topk + k] = w;
             scratch.tok_topk_ids[s * topk + k] = id;
             scratch.expert_freq[id]++;
-            // Phase A colibri-port: accumulate the cross-conversation
+            // Phase A accumulate the cross-conversation
             // routing-frequency histogram (engine.route_freq), dumped to a
             // usage file at shutdown and read back at the NEXT process
             // startup to preload the measured hot set into VRAM. This is
             // the true demand signal (what the router actually picked),
-            // not a cache-hit proxy -- matches colibri's STATS signal.
+            // not a cache-hit proxy
             engine.bump_route_freq(layer_idx, id);
             sum_w += w;
         }
@@ -783,6 +829,27 @@ void moe_forward_gguf(
                    << "(w=" << scratch.tok_topk_weights[s * topk + k] << ")";
             }
             ls << "\n";
+        }
+
+        // Pilot RECALL check (always on, independent of log level -- a
+        // perf counter, not a log line): if the pilot predicted THIS exact
+        // layer's routing one iteration ago (LayerScratch::pilot_pred_ids),
+        // compare its predicted set against what the router really just
+        // picked for the same "last token" position, then consume/reset
+        // the pending prediction either way so a stale value never lingers
+        // into a later layer's unrelated comparison.
+        if (s == S - 1 && scratch.pilot_pred_layer == layer_idx) {
+            int overlap = 0;
+            for (int pk = 0; pk < scratch.pilot_pred_count; ++pk) {
+                int pred_id = scratch.pilot_pred_ids[pk];
+                for (int k = 0; k < topk; ++k) {
+                    if (scratch.tok_topk_ids[s * topk + k] == pred_id) { ++overlap; break; }
+                }
+            }
+            perf().n_pilot_recall_hits.fetch_add((uint64_t)overlap, std::memory_order_relaxed);
+            perf().n_pilot_recall_checks.fetch_add(1, std::memory_order_relaxed);
+            perf().n_pilot_recall_topk_sum.fetch_add((uint64_t)topk, std::memory_order_relaxed);
+            scratch.pilot_pred_layer = -1;
         }
     }
 
@@ -844,9 +911,7 @@ void moe_forward_gguf(
         // get_experts_batch parallelizes the disk reads for whichever of
         // this layer's topk picks are genuine misses (not already staged
         // via PIPE), instead of the old one-pread-at-a-time sequential
-        // loop -- validated via colibri's iobench.c showing ~8.5x real
-        // throughput scaling available on this hardware that the old
-        // strictly-sequential loop never touched.
+        // loop 
         //
         // FIX (real, measured "[TIER-OVERLAP]" bug -- see CLAUDE.md): this
         // used to call get_experts_batch UNCONDITIONALLY for the entire
@@ -919,7 +984,7 @@ void moe_forward_gguf(
             // the weighted accumulation below never applied it" -- check_finite
             // only catches NaN/Inf, never a suspiciously-exact zero, which is
             // exactly the symptom under investigation (moe_out|=0 every MoE
-            // layer during prefill, colibri shows nonzero).
+            // layer during prefill)
             if (Logger::instance().would_log(LogLevel::VERBOSE)) {
                 double ss = 0.0; for (int d = 0; d < D; ++d) ss += (double)down_buf_ptr[d] * down_buf_ptr[d];
                 LOG_STREAM_VERBOSE() << "[TRACE l=" << layer_idx << "] expert k=" << k
@@ -1101,6 +1166,12 @@ void moe_forward_gguf(
             check_finite("token_output (post shared expert)", layer_idx, -1, token_output, (size_t)D);
         }
     }
+
+    // Three-tier caching: Cleanup active layer area after processing this layer
+    // This reclaims temporary workspace used for current-layer experts
+    if (ram_mgr.vram_cache && ram_mgr.vram_cache->active_layer_pool) {
+        ram_mgr.vram_cache->cleanup_active_layer_area(layer_idx);
+    }
 }
 
 // ============================================================
@@ -1185,14 +1256,15 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
     auto& c = engine.model_file.architecture_config;
     int D = c.hidden;
 
+    // S > 1 = prefill (whole prompt in one pass), S == 1 = decode (one
+    // token at a time) -- see RAMSafetyManager::in_prefill's own comment
+    // for why the PIPE miss path needs this split.
+    ram_mgr.in_prefill = (S > 1);
+
     LayerScratch& scratch = g_layer_scratch;
     scratch.resize(S, D, c.n_experts, c.moe_inter, c.topk, c.n_expert_shared, c.dense_inter);
 
-    // Diagnostic: L2 norm of the LAST TOKEN's hidden state (D floats, not the
-    // whole S*D prefill batch -- matches colibri's identical trace exactly,
-    // see colibri_trace.log comparison, so the two are directly comparable
-    // without a sqrt(S) skew). EVERY layer now (not just a 5-point spread):
-    // that spread showed MoEStream's growth compounding to ~30x colibri's by
+    // Diagnostic: L2 norm of the LAST TOKEN's hidden state
     // the last few layers while starting within ~2x at layer 0, meaning the
     // excess accumulates gradually across many layers rather than in one bad
     // layer -- full resolution is needed to see exactly where it accelerates.
@@ -1233,14 +1305,56 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
         if (trace) LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-attn |attn_out|=" << l2norm(scratch.attn_out.data() + (size_t)(S - 1) * D, D)
                                       << " |hidden|=" << l2norm(last_tok, D) << "\n";
 
+        // --- FFN: leading dense layers (l < first_dense) use a plain dense
+        // FFN — no router, no expert cache. Applies to both GLM-5.2's leading
+        // dense layers and, since Hunyuan/Hy-V3 share the same first_dense
+        // convention, to any dense layers there too. ---
+        {
+            PERF_SCOPE(t_moe_expert);
+            if (l < c.first_dense) {
+                dense_ffn_gguf(engine, l, hidden_states, S, scratch.moe_out.data(), scratch);
+            } else {
+                moe_forward_gguf(engine, ram_mgr, l, hidden_states, S, scratch.moe_out.data(), scratch);
+            }
+        }
+
+        // Residual add
+        i = 0;
+        for (; i + 16 <= n; i += 16) {
+            __m512 h = _mm512_loadu_ps(hidden_states + i);
+            __m512 m = _mm512_loadu_ps(scratch.moe_out.data() + i);
+            _mm512_storeu_ps(hidden_states + i, _mm512_add_ps(h, m));
+        }
+        for (; i < n; ++i) hidden_states[i] += scratch.moe_out[i];
+
+        check_finite("hidden_states (post FFN/MoE residual)", l, -1, hidden_states, (size_t)n);
+        if (trace) LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-ffn  |moe_out|=" << l2norm(scratch.moe_out.data() + (size_t)(S - 1) * D, D)
+                                      << " |hidden|=" << l2norm(last_tok, D) << "\n";
+
         // --- Speculative pilot prefetch for next layer's experts ---
+        // Deliberately placed HERE -- AFTER this layer's own FFN/MoE
+        // residual has been added -- not right after the attention
+        // residual. hidden_states at this point is EXACTLY what layer
+        // l+1's real router will see when the loop reaches it next
+        // iteration. Predicting from the pre-FFN hidden_states (the old
+        // position, right after the attention residual above) meant the
+        // pilot's router pass ran on a vector missing this layer's own
+        // MoE FFN contribution entirely -- routinely the single largest
+        // per-layer compute cost in this model -- so its guessed top-8
+        // experts had no reason to match what the real router at l+1
+        // would actually select. Real-run PIPE instrumentation
+        // (n_pipe_hits_prefill/decode, n_pipe_miss_still_queued) showed
+        // 0% served in BOTH prefill and decode with 0/N misses even
+        // finding a leftover trace of a hint -- exactly what stale-input
+        // misprediction looks like (a timing/pool-size problem would
+        // still show occasional lucky matches, not a clean zero).
         if (l + 1 < c.n_layers && c.n_experts > 0) {
             PERF_START(pilot);
             std::string norm_key = "blk." + std::to_string(l + 1) + ".ffn_norm.weight";
             std::string router_key = "blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight";
             auto norm_it = engine.resident_layers.find(norm_key);
             auto router_it = engine.resident_layers.find(router_key);
-            
+
             if (norm_it != engine.resident_layers.end() && router_it != engine.resident_layers.end()
                 && norm_it->second.host_ptr && router_it->second.host_ptr) {
                 // Use only last token for pilot prediction (saves compute)
@@ -1250,6 +1364,46 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
 
                 dense_proj(engine, router_key,
                            scratch.pilot_nrm.data(), scratch.pilot_logits.data(), 1, D, c.n_experts);
+
+                // Rank by EXACTLY the same "selection_probs" the real router
+                // uses (moe_forward_gguf above: gate_func(logits) + bias),
+                // not raw dense_proj output. Missing this was a second,
+                // independent misprediction source on top of the residual-
+                // timing fix above -- confirmed by comparing against
+                // colibri's own pilot (glm.c), which predicts from the SAME
+                // "post-attention, pre-FFN" state we used to use (a strictly
+                // WORSE input than what we now use) but still measures 71.6%
+                // recall, because it correctly applies sigmoid+bias before
+                // ranking. GLM-5.2/DeepSeek-V3's exp_probs_b.bias exists
+                // specifically to shift WHICH experts get selected for
+                // load-balancing (auxiliary-loss-free routing) -- ranking on
+                // the un-biased score means the pilot's top-k has no reason
+                // to match the real, bias-corrected top-k the router
+                // actually dispatches, independent of how accurate the input
+                // hidden_states is.
+                for (int e = 0; e < c.n_experts; ++e) {
+                    float& v = scratch.pilot_logits[e];
+                    v = c.use_sigmoid_gate ? 1.0f / (1.0f + std::exp(-v)) : v;
+                }
+                if (!c.use_sigmoid_gate) {
+                    float max_l = scratch.pilot_logits[0];
+                    for (int e = 1; e < c.n_experts; ++e) max_l = std::max(max_l, scratch.pilot_logits[e]);
+                    float sum = 0.0f;
+                    for (int e = 0; e < c.n_experts; ++e) {
+                        scratch.pilot_logits[e] = std::exp(scratch.pilot_logits[e] - max_l);
+                        sum += scratch.pilot_logits[e];
+                    }
+                    float inv = 1.0f / sum;
+                    for (int e = 0; e < c.n_experts; ++e) scratch.pilot_logits[e] *= inv;
+                }
+                {
+                    std::string bias_key = "blk." + std::to_string(l + 1) + ".exp_probs_b.bias";
+                    auto bias_it = engine.resident_layers.find(bias_key);
+                    if (bias_it != engine.resident_layers.end() && bias_it->second.host_ptr) {
+                        const float* bias_row = reinterpret_cast<float*>(bias_it->second.host_ptr);
+                        for (int e = 0; e < c.n_experts; ++e) scratch.pilot_logits[e] += bias_row[e];
+                    }
+                }
 
                 // Layer l+1's active host-cache slots -- checked below so a
                 // hint is never pushed for an expert that's ALREADY resident.
@@ -1266,12 +1420,21 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     : std::min(next_slots.size(), (size_t)std::max(1, ram_mgr.cap_for_layer(l + 1)));
 
                 int pilot_k = std::min(8, c.topk);
+                // Recall instrumentation: capture the full predicted set
+                // BEFORE the already-resident skip below, so this measures
+                // pure prediction accuracy against the real router's later
+                // selection -- see LayerScratch::pilot_pred_ids's own
+                // comment. moe_forward_gguf compares and resets this the
+                // next time layer l+1 actually runs.
+                scratch.pilot_pred_count = pilot_k;
+                scratch.pilot_pred_layer = l + 1;
                 for (int k = 0; k < pilot_k; ++k) {
                     int best_exp = 0;
                     for (int e = 1; e < c.n_experts; ++e) {
                         if (scratch.pilot_logits[e] > scratch.pilot_logits[best_exp]) best_exp = e;
                     }
                     scratch.pilot_logits[best_exp] = -2e30f;
+                    scratch.pilot_pred_ids[k] = best_exp;
 
                     bool already_resident = false;
                     for (size_t si = 0; si < next_cap; ++si) {
@@ -1313,31 +1476,5 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
             }
             PERF_END(pilot, t_prefetch);
         }
-
-        // --- FFN: leading dense layers (l < first_dense) use a plain dense
-        // FFN — no router, no expert cache. Applies to both GLM-5.2's leading
-        // dense layers and, since Hunyuan/Hy-V3 share the same first_dense
-        // convention, to any dense layers there too. ---
-        {
-            PERF_SCOPE(t_moe_expert);
-            if (l < c.first_dense) {
-                dense_ffn_gguf(engine, l, hidden_states, S, scratch.moe_out.data(), scratch);
-            } else {
-                moe_forward_gguf(engine, ram_mgr, l, hidden_states, S, scratch.moe_out.data(), scratch);
-            }
-        }
-
-        // Residual add
-        i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m512 h = _mm512_loadu_ps(hidden_states + i);
-            __m512 m = _mm512_loadu_ps(scratch.moe_out.data() + i);
-            _mm512_storeu_ps(hidden_states + i, _mm512_add_ps(h, m));
-        }
-        for (; i < n; ++i) hidden_states[i] += scratch.moe_out[i];
-
-        check_finite("hidden_states (post FFN/MoE residual)", l, -1, hidden_states, (size_t)n);
-        if (trace) LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-ffn  |moe_out|=" << l2norm(scratch.moe_out.data() + (size_t)(S - 1) * D, D)
-                                      << " |hidden|=" << l2norm(last_tok, D) << "\n";
     }
 }

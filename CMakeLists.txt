@@ -45,6 +45,7 @@ add_executable(moestream
     src/main.cpp
     src/execution_layer.cpp
     src/attention_layer.cpp
+    src/gpu_topology.cpp
     src/graph_initializer.cpp
     src/kernels_cpu.cpp
     src/ggml_dequant.cpp
@@ -94,6 +95,7 @@ add_executable(moestream_tests
     src/main_test.cpp
     src/execution_layer.cpp
     src/attention_layer.cpp
+    src/gpu_topology.cpp
     src/graph_initializer.cpp
     src/kernels_cpu.cpp
     src/ggml_dequant.cpp
@@ -130,6 +132,22 @@ target_link_libraries(moestream_tests PRIVATE
 )
 
 add_test(NAME native_test_harness COMMAND moestream_tests)
+
+# ---- Offline GGUF tool (tools/gguf_tool.cpp + gguf_pack/io/verify.cpp) ----
+# Deliberately independent of the CUDA/ggml build above: pure file I/O and
+# GGUF metadata manipulation, no CUDA, no ggml, no OpenMP needed. This
+# means it also builds and runs on machines without a GPU/CUDA toolkit --
+# confirmed by actually compiling and running it against a synthetic GGUF
+# file on a plain darwin/clang machine during development (see CLAUDE.md).
+# Single binary, three subcommands: pack (align/unpack shards for O_DIRECT),
+# io (A/B read-throughput bench), verify (completeness + byte-compare gate).
+add_executable(gguf_tool
+    tools/gguf_tool.cpp
+    tools/gguf_pack.cpp
+    tools/gguf_io.cpp
+    tools/gguf_verify.cpp
+)
+target_include_directories(gguf_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 message(STATUS "MoEStream Build Configuration:")
 message(STATUS "  -> Host C++ Standard: C++23 Enabled")
