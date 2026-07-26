@@ -43,28 +43,31 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
         return;
     }
     auto& W = it->second;
-    // 1) GPU dispatch. Prefer the F32 fast-path buffer (upload_dequantized_f32)
-    //    when present — cuBLAS SGEMV instead of W's original quant type's fused
-    //    per-block kernel, which has no GEMV specialization and is
-    //    disproportionately slow at S=1 decode (attn_output's Q5_K case, see
-    //    CLAUDE.md). Falls through to the original device_ptr/meta.type path
-    //    (fused kernel for K-quants/IQ, cuBLAS for F32/F16/BF16/Q8_0) when no
-    //    fast-path buffer was built for this weight (not attempted, or didn't
-    //    fit in the VRAM budget at load time).
+    // 1) GPU dispatch. Prefer the BF16-matched fast-path buffer
+    //    (upload_dequantized_bf16, cuda_manager.hpp) when present — cuBLAS
+    //    GEMV (matched BF16 weight/BF16 activation, F32 accumulate/output)
+    //    instead of W's original quant type's fused per-block kernel, which
+    //    has no GEMV specialization and is disproportionately slow at S=1
+    //    decode (attn_output's Q5_K case, see CLAUDE.md). Falls through to
+    //    the original device_ptr/meta.type path (fused kernel for
+    //    K-quants/IQ, cuBLAS for F32/F16/BF16/Q8_0) when no fast-path
+    //    buffer was built for this weight (not attempted, or didn't fit in
+    //    the VRAM budget at load time).
     //
-    //    REVERTED FROM BF16 (see CLAUDE.md): a real run produced garbage
-    //    output ("Hello! I'm the GLM model behind[PAD154879]..." repeating)
-    //    after switching this to GGUFType::BF16. No coding bug was found on
-    //    static review of the conversion math or dispatch routing; leading
-    //    unconfirmed suspicion is cublasGemmEx with mismatched input types
-    //    (Atype=CUDA_R_16BF weight, Btype=CUDA_R_32F activations) not being a
-    //    genuinely correct/supported combination for this entry point.
-    //    Reverted to the known-good F32 path pending real-hardware
-    //    investigation -- do not re-enable BF16 here without first
-    //    confirming (on Linux/CUDA) that cublas_dense_matmul's BF16 branch
-    //    alone produces correct output on a synthetic, non-degenerate test.
+    //    Third attempt at this fast-path, per CLAUDE.md's full history: an
+    //    F32 version worked but covered too few layers within budget; a
+    //    BF16 version using MISMATCHED types (BF16 weight / F32 activation)
+    //    caused real NaN corruption, was reverted, and was later confirmed
+    //    (Test 9, main_test.cpp, real hardware) to be cleanly REJECTED by
+    //    cublasGemmEx regardless — a dead end independent of the earlier
+    //    corruption, which was separately root-caused to an unrelated
+    //    concurrency race (now fixed) and never actually caused by BF16.
+    //    This version uses the MATCHED-type combination (BF16 weight AND
+    //    BF16 activation, dense_matmul_bf16_matched_host), verified correct
+    //    in isolation via Test 10 (real hardware) before being wired in
+    //    here.
     if (!cpu_only_mode() && engine.gpu && W.gpu_fast_ptr &&
-        engine.gpu->dense_matmul_host(GGUFType::F32, W.gpu_fast_ptr, x, y, S, I, O)) {
+        engine.gpu->dense_matmul_bf16_matched_host(W.gpu_fast_ptr, x, y, S, I, O)) {
         return;
     }
     if (!cpu_only_mode() && engine.gpu && W.device_ptr &&

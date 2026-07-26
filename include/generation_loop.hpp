@@ -37,6 +37,12 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
 }
 extern void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                                 LockFreePrefetcher& async_io_queue, float* hidden_states, int S, int pos_base);
+// Frees the expert-FFN GPU scratch pool's device buffers back to empty --
+// see execution_layer.cpp's definition for why this reclaims little in
+// practice (expert dispatch is always S=1) but is kept for consistency
+// with CudaManager::shrink_dense_scratch, the one that matters (see
+// CLAUDE.md's "prefill scratch reclaim" note).
+extern void shrink_moe_gpu_scratch();
 
 // Embeds one token: dequantizes token_embd.weight's row `tok` into out[0..D).
 // ROOT CAUSE (found this session): both call sites below used to
@@ -189,7 +195,7 @@ public:
 // session with the real VRAM topology, alongside ram_mgr.vram_cache/
 // ram_mgr.prefetcher) instead of generate_text creating and starting its
 // OWN local, topology-less instance per request. That local instance was a
-// real structural bug (Phase A colibri-port investigation): it received
+// real structural bug (Phase A  investigation): it received
 // pilot-prefetch hints and did real disk I/O, but with gpu_topo=nullptr its
 // finish_prefetch() could never fire an async VRAM promotion -- and
 // meanwhile main.cpp's OWN topology-enabled prefetcher instance sat idle,
@@ -243,8 +249,31 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
     PERF_START(prefill);
     layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), prompt_ids.size(), 0);
-    PERF_END(prefill, t_attn);  // counts as part of attention/compute time
+    // Was `PERF_END(prefill, t_attn)` -- dumped this WHOLE prefill pass's
+    // wall-clock (attention + MoE routing + MoE expert FFN + cold-cache
+    // disk I/O across all 78 layers) into the attention-only t_attn
+    // counter, corrupting dump_report()'s "Attention (MLA)" breakdown and
+    // masking real attention cost behind unrelated prefill overhead -- see
+    // t_prefill_total's comment in perf_timer.hpp for the full story. Own
+    // counter now; mla_attention_absorbed_gguf's own per-layer
+    // PERF_SCOPE(t_attn) already correctly captures attention's real
+    // contribution during this same call, so nothing here needs to also
+    // feed t_attn.
+    PERF_END(prefill, t_prefill_total);
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
+
+    // Reclaim GPU scratch grown to fit this prefill's full S -- decode
+    // (below) only ever calls with S=1 from here on, so anything grown
+    // above that is dead weight for the rest of this request. Real,
+    // measured impact on CudaManager's dense-projection scratch (~120 MB
+    // at S=1000, ~240 MB at S=2000 for this project's GLM-5.2 dims) given
+    // how little free VRAM the CoreEngine GPU can be left with; the
+    // expert-FFN scratch shrink reclaims far less in practice (that path
+    // is always called with S=1 even during prefill) but costs nothing to
+    // include. See CLAUDE.md's "prefill scratch reclaim" note.
+    if (engine.gpu) engine.gpu->shrink_dense_scratch();
+    shrink_moe_gpu_scratch();
+
     std::cout << " Done.\n\nOutput: ";
 
     // Pre-allocate decode buffers (single token at a time)
@@ -372,8 +401,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // GLM-5.2's real eos_token_id is a 3-entry array (<|endoftext|>,
         // <|user|>, <|observation|>) -- checking only the single `eos_id`
         // param means generation runs past the model's real turn-boundary
-        // markers into undefined continuation territory (confirmed against
-        // colibri, a working GLM-5.2 engine reading the raw HF config).
+        // markers into undefined continuation territory
         // tokenizer.is_stop_token covers all of them; the `eos_id` check
         // stays as a redundant safety net.
         if (next_token == eos_id || tokenizer.is_stop_token(next_token)) break;
@@ -425,6 +453,14 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     auto request_snap_end = perf().snapshot();
     auto request_delta = request_snap_end - request_snap_start;
     PerfCounters::print_summary("REQUEST", request_wall_ms, (int)request_delta.n_tokens_generated, request_delta);
+
+    // Accumulate this request's own wall time into the session-wide
+    // active-processing total -- deliberately separate from wall-clock
+    // session_elapsed_s (main.cpp), which would otherwise silently include
+    // idle time between requests (REPL waiting on the next prompt) as if
+    // it were processing time. See t_active_processing's declaration.
+    PerfCounters::atomic_add(perf().t_active_processing, request_wall_ms / 1000.0);
+    perf().n_requests.fetch_add(1, std::memory_order_relaxed);
 
     // Per-layer cache heatmaps -- once per request (not per token, to avoid
     // flooding), showing which layers ended up hot in VRAM vs host RAM.

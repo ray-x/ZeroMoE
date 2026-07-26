@@ -2,10 +2,12 @@
 #include "engine.hpp"
 #include "gpu_topology.hpp"
 #include "kquant_dequant.hpp"  // gpu_type_supported
+#include "io_uring_backend.hpp"
 #include <atomic>
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <memory>
 #include <string>
 #include <cstring>
 #include <fcntl.h>
@@ -37,7 +39,14 @@ constexpr double SLOW_MUTEX_WAIT_MS = 50.0;
 // thread is scheduled fine but can't drain hints as fast as they're
 // produced" (pure throughput/concurrency ceiling) -- the two point at very
 // different fixes (nothing to do with thread count in the first case,
-// more I/O parallelism in the second).
+// more I/O parallelism in the second). NOTE: the "~100ms+ legitimate
+// wait" baseline above assumed exactly ONE worker thread serializing all
+// 8 hints; with prefetch_worker_threads > 1 (async_prefetcher's
+// worker_loop, config prefetch_worker_threads) that worst case shrinks
+// roughly proportionally, so this threshold is correspondingly more
+// conservative (looser, not tighter) than strictly necessary when
+// multiple workers are configured -- left as-is since a looser threshold
+// only risks under-, not over-, reporting SLOW-PICKUP.
 constexpr double SLOW_PICKUP_MS = 250.0;
 
 struct PrefetchHint {
@@ -61,19 +70,57 @@ struct PrefetchSlot {
 class LockFreePrefetcher {
 private:
     static constexpr size_t QUEUE_SIZE = 4096;
-    static constexpr int NUM_STAGING_SLOTS = 16;  // double-buffer pool
+    // Was a compile-time constant (16, then bumped to 64 to test a specific
+    // hypothesis: with pilot_k=8 hints pushed per layer transition and
+    // multiple worker threads completing reads concurrently, a small
+    // round-robin pool cycles fast enough that a correctly-predicted,
+    // successfully-staged expert can get evicted before the corresponding
+    // miss arrives -- i.e. pool THRASHING, not misprediction, as the
+    // binding constraint on PIPE-served rate; confirmed by real-run
+    // n_staged_evicted_unused counts). Now a runtime value (config
+    // prefetch_staging_slots, engine_config.hpp), set once in start() before
+    // `staging` is allocated and never changed after -- PrefetchSlot holds
+    // std::atomic<bool> members (ready/on_device) that are neither copyable
+    // nor movable, so this can't be a std::vector (which needs move-safety
+    // to resize/reallocate), but a fixed-size-at-allocation-time
+    // std::unique_ptr<PrefetchSlot[]> has no such requirement.
+    int num_staging_slots = 64;
 
     PrefetchHint queue[QUEUE_SIZE];
-    std::atomic<unsigned int> head{0}; 
-    std::atomic<unsigned int> tail{0}; 
-    
-    std::thread worker_thread;
+    std::atomic<unsigned int> head{0};
+    std::atomic<unsigned int> tail{0};
+
+    // Multiple worker threads pulling from the SAME queue -- see
+    // worker_loop's CAS-based tail claim for why a plain load+store
+    // advance (correct for exactly one consumer) is not safe once more
+    // than one thread can race to claim the same slot.
+    std::vector<std::thread> worker_threads;
     std::atomic<bool> running{false};
     StreamingEngine* engine = nullptr;
     GpuTopology* gpu_topo = nullptr;  // For async VRAM uploads
 
-    // Pinned double-buffer pool for active prefetch
-    PrefetchSlot staging[NUM_STAGING_SLOTS];
+    // One io_uring ring PER WORKER THREAD -- a Ring is explicitly not
+    // shareable across threads (io_uring_backend.hpp), so with N worker
+    // threads each needs its own SQ/CQ. unique_ptr, not a plain Ring, so
+    // growing this vector never needs Ring (or its AlignedScratch[]
+    // member) to be copy/move-safe -- Ring owns a raw fd + several mmap'd
+    // regions with no move constructor defined, and a vector<Ring> would
+    // risk a double-close/double-munmap the moment resize() reallocates.
+    // Sized to worker_threads.size() in start(); worker_loop(i) uses
+    // *uring_rings[i] exclusively, so no locking is needed around any
+    // individual ring. use_io_uring tracks whether io_uring was requested
+    // AND at least one ring actually initialized (Linux + supported
+    // kernel) -- purely for the startup log line; the per-ring
+    // availability check inside try_uring_batch is what actually gates
+    // behavior; a ring that individually failed to init just always takes
+    // the sequential-pread fallback on its thread.
+    std::vector<std::unique_ptr<io_uring_backend::Ring>> uring_rings;
+    bool use_io_uring = false;
+
+    // Pinned double-buffer pool for active prefetch. Allocated once in
+    // start() (sized num_staging_slots) before any worker thread runs;
+    // never resized afterward.
+    std::unique_ptr<PrefetchSlot[]> staging;
     std::atomic<int> staging_write_idx{0};  // next slot to write into
     // Guards all mutation of a staging slot's identity (layer_idx/expert_id),
     // ready/on_device flags, AND the pinned_buf lifecycle (acquire_staging_slot
@@ -86,25 +133,50 @@ private:
     std::mutex staging_mutex;
 
 public:
-    void start(StreamingEngine* eng, GpuTopology* topo = nullptr) {
+    void start(StreamingEngine* eng, GpuTopology* topo = nullptr, bool enable_io_uring = false,
+               int n_worker_threads = 1, int n_staging_slots = 64) {
         engine = eng;
         gpu_topo = topo;
+        if (n_worker_threads < 1) n_worker_threads = 1;
+        if (n_staging_slots < 1) n_staging_slots = 1;
+        num_staging_slots = n_staging_slots;
+        staging = std::make_unique<PrefetchSlot[]>(num_staging_slots);
         // Async H2D promotion goes through GpuTopology::upload_expert_async,
         // which uses the vault GPU's own dedicated copy_stream (see
         // gpu_topology.hpp) — no separate stream needed here.
+        uring_rings.resize(n_worker_threads);
+        for (auto& r : uring_rings) r = std::make_unique<io_uring_backend::Ring>();
+        if (enable_io_uring) {
+            int ok_count = 0;
+            for (auto& r : uring_rings) if (r->init()) ok_count++;
+            use_io_uring = (ok_count > 0);
+            if (use_io_uring) {
+                LOG_STREAM_INFO() << "[IO-URING] Enabled on " << ok_count << "/" << n_worker_threads
+                                   << " prefetch worker ring(s) -- batching per-expert reads through io_uring.\n";
+            } else {
+                LOG_STREAM_WARN() << "[IO-URING] io_uring=true requested but Ring::init() failed on all "
+                                   << n_worker_threads << " worker ring(s) (old kernel, non-Linux, or "
+                                      "sandboxed environment) -- falling back to sequential preads.\n";
+            }
+        }
         running.store(true, std::memory_order_release);
-        worker_thread = std::thread(&LockFreePrefetcher::worker_loop, this);
+        worker_threads.reserve(n_worker_threads);
+        for (int i = 0; i < n_worker_threads; ++i) {
+            worker_threads.emplace_back(&LockFreePrefetcher::worker_loop, this, i);
+        }
+        LOG_STREAM_INFO() << "[I/O] Prefetcher: " << n_worker_threads << " worker thread(s).\n";
     }
 
     void stop() {
         running.store(false, std::memory_order_release);
-        if (worker_thread.joinable()) {
-            worker_thread.join();
+        for (auto& t : worker_threads) {
+            if (t.joinable()) t.join();
         }
     }
 
     ~LockFreePrefetcher() {
-        for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
+        if (!staging) return;  // start() never called (or failed before allocating)
+        for (int i = 0; i < num_staging_slots; ++i) {
             if (staging[i].pinned_buf) cudaFreeHost(staging[i].pinned_buf);
         }
     }
@@ -119,6 +191,29 @@ public:
 
         queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now()};
         head.store(current_head + 1, std::memory_order_release);
+    }
+
+    // Diagnostic only (no locking, benign race with the workers' own
+    // tail claims -- this is a "roughly right now" snapshot, not a
+    // linearizable check): is there a hint for (layer_idx, expert_id)
+    // still sitting in the queue, not yet claimed by any worker_loop
+    // thread? Distinguishes, for a PIPE miss that found no staged slot,
+    // "no worker has even started this read yet" (a scheduling/
+    // throughput gap -- N hints queued per layer transition, serviced by
+    // however many worker threads are configured) from "nothing was ever
+    // predicted, or it was predicted+staged+already evicted by round-
+    // robin before use" (a prediction-accuracy or pool-size gap).
+    // Different root causes need different fixes; see
+    // RAMSafetyManager::in_prefill's comment for the other half of this
+    // same investigation.
+    bool has_pending_hint(int layer_idx, int expert_id) const {
+        unsigned int h = head.load(std::memory_order_acquire);
+        unsigned int t = tail.load(std::memory_order_relaxed);
+        for (unsigned int i = t; i != h; ++i) {
+            const PrefetchHint& hint = queue[i & (QUEUE_SIZE - 1)];
+            if (hint.layer_idx == layer_idx && hint.expert_id == expert_id) return true;
+        }
+        return false;
     }
 
     // Consume a prefetched slab: memcpy the staged bytes into the caller's
@@ -145,10 +240,27 @@ public:
                      "(layer=%d expert=%d) -- worker thread likely holding it, check for a nearby "
                      "[SLOW-STAGING-REGROW] line\n", _wait_ms, layer_idx, expert_id);
         }
-        for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
-            if (staging[i].layer_idx == layer_idx &&
-                staging[i].expert_id == expert_id &&
-                staging[i].ready.load(std::memory_order_acquire)) {
+        // Failure-reason split (n_pipe_miss_no_match / n_pipe_miss_not_ready,
+        // perf_timer.hpp) -- added to diagnose a real run where Prefetch
+        // (PIPE) served collapsed to 0.1%: matching on identity FIRST,
+        // independent of ready, lets a caller distinguish "the pilot never
+        // predicted this expert (or the slot got recycled before this miss
+        // arrived)" from "the pilot predicted correctly but the read simply
+        // hadn't finished yet" -- two different root causes needing two
+        // different fixes. Behavior change from before: previously, a slot
+        // with a matching identity but ready==false was silently skipped
+        // and the scan continued (in case some OTHER slot also matched,
+        // extremely unlikely in practice since round-robin write assignment
+        // means at most one slot should ever hold a given identity at a
+        // time); now the first identity match returns immediately either
+        // way. Correctness-neutral either way -- ready==false still always
+        // falls back to a synchronous load, exactly as before.
+        for (int i = 0; i < num_staging_slots; ++i) {
+            if (staging[i].layer_idx == layer_idx && staging[i].expert_id == expert_id) {
+                if (!staging[i].ready.load(std::memory_order_acquire)) {
+                    perf().n_pipe_miss_not_ready.fetch_add(1, std::memory_order_relaxed);
+                    return false;  // predicted right, but the read isn't done -- caller falls back
+                }
                 size_t bytes = staging[i].loaded_bytes;
                 if (dst_cap < bytes) return false;  // caller buffer too small -> caller falls back to load_expert_slab
                 std::memcpy(dst, staging[i].pinned_buf, bytes);
@@ -162,19 +274,39 @@ public:
                 return true;
             }
         }
+        perf().n_pipe_miss_no_match.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
 private:
-    void worker_loop() {
-        while (running.load(std::memory_order_acquire) || 
+    // thread_idx selects this worker's own io_uring ring (uring_rings[thread_idx]).
+    void worker_loop(int thread_idx) {
+        io_uring_backend::Ring& my_ring = *uring_rings[thread_idx];
+        while (running.load(std::memory_order_acquire) ||
                head.load(std::memory_order_acquire) != tail.load(std::memory_order_relaxed)) {
-            
+
             unsigned int current_tail = tail.load(std::memory_order_relaxed);
             unsigned int current_head = head.load(std::memory_order_acquire);
 
             if (current_tail == current_head) {
                 usleep(200);
+                continue;
+            }
+
+            // Multiple worker threads share this queue -- CAS-claim a
+            // unique slot instead of the old single-consumer load+store.
+            // A plain store here would let a thread that read a stale
+            // current_tail (e.g. preempted between the load above and
+            // this point, while OTHER workers advanced tail further)
+            // overwrite tail BACKWARD, causing hints to be reprocessed
+            // and push_hint's overflow check to think the queue is
+            // fuller than it really is. compare_exchange_weak only
+            // succeeds if tail still equals what we just read; on
+            // failure (another worker claimed this slot, or advanced
+            // tail some other way) current_tail is updated to the real
+            // value and we retry from the top with fresh head/tail reads.
+            if (!tail.compare_exchange_weak(current_tail, current_tail + 1,
+                                             std::memory_order_acq_rel, std::memory_order_relaxed)) {
                 continue;
             }
 
@@ -188,7 +320,6 @@ private:
             // hints are being produced in a sudden burst but still drained
             // fast once picked up).
             unsigned int backlog = current_head - current_tail;
-            tail.store(current_tail + 1, std::memory_order_release);
 
             double pickup_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - hint.pushed_at).count();
@@ -202,8 +333,38 @@ private:
                          hint.layer_idx, hint.expert_id, pickup_ms, backlog);
             }
 
-            active_prefetch(hint.layer_idx, hint.expert_id);
+            active_prefetch(hint.layer_idx, hint.expert_id, my_ring);
         }
+    }
+
+    // Tries to service up to 3 reads (gate/up/down) as ONE io_uring batch
+    // instead of sequential preads. All-or-nothing: returns false (no
+    // partial application, no bytes written anywhere) unless io_uring is
+    // enabled+available AND every single request came back with exactly
+    // its requested length -- any short read/error on any leg falls
+    // through to the caller's existing sequential pread_direct_aware path,
+    // which simply redoes all `n` reads. Prefetch failures are rare enough
+    // that the occasional wasted re-read costs nothing next to keeping
+    // this a single unconditional correctness contract.
+    //
+    // Records n_uring_batch_ok/n_uring_batch_fallback ONLY for genuine
+    // attempts (io_uring enabled AND the ring initialized) -- see those
+    // counters' own comment in perf_timer.hpp for why: the fallback path
+    // here is silent by design, so without this counter there's no way to
+    // tell "io_uring is on but every batch is failing" from "io_uring is
+    // helping" purely from a run's throughput numbers.
+    bool try_uring_batch(const io_uring_backend::ReadRequest* reqs, int n, io_uring_backend::Ring& my_ring) {
+        if (!my_ring.available()) return false;
+        ssize_t results[3];
+        bool ok = my_ring.submit_and_wait(reqs, n, results);
+        if (ok) {
+            for (int i = 0; i < n; ++i) {
+                if (results[i] != (ssize_t)reqs[i].len) { ok = false; break; }
+            }
+        }
+        if (ok) perf().n_uring_batch_ok.fetch_add(1, std::memory_order_relaxed);
+        else perf().n_uring_batch_fallback.fetch_add(1, std::memory_order_relaxed);
+        return ok;
     }
 
     // Active prefetch: pread into pinned host memory (not just fadvise), then
@@ -211,7 +372,9 @@ private:
     // GpuTopology::upload_expert_async for the actual H2D copy — that
     // function owns the slot-claim + stamp + memcpy sequence under
     // cache_mutex, so this never races the main thread's own promotions.
-    void active_prefetch(int layer_idx, int expert_id) {
+    // my_ring is the CALLING worker thread's own io_uring ring (see
+    // worker_loop) -- never shared across threads.
+    void active_prefetch(int layer_idx, int expert_id, io_uring_backend::Ring& my_ring) {
         if (!engine) return;
 
         // Check if already staged (under the same lock that publish/consume
@@ -226,7 +389,7 @@ private:
                 LOG_WARN("[SLOW-MUTEX-WAIT] active_prefetch blocked %.2fms acquiring staging_mutex "
                          "(layer=%d expert=%d)\n", _wait_ms, layer_idx, expert_id);
             }
-            for (int i = 0; i < NUM_STAGING_SLOTS; ++i) {
+            for (int i = 0; i < num_staging_slots; ++i) {
                 if (staging[i].layer_idx == layer_idx &&
                     staging[i].expert_id == expert_id) return; // already in flight
             }
@@ -273,11 +436,36 @@ private:
             int gfd = engine->model_file.fd_for_tensor(gE->second);
             int ufd = engine->model_file.fd_for_tensor(uE->second);
             int dfd = engine->model_file.fd_for_tensor(dE->second);
-            ssize_t rg = pread(gfd, slot.pinned_buf,          gb, gE->second.offset + (size_t)expert_id * gb);
-            ssize_t ru = pread(ufd, slot.pinned_buf + gb,     ub, uE->second.offset + (size_t)expert_id * ub);
-            ssize_t rd = pread(dfd, slot.pinned_buf + gb + ub, db, dE->second.offset + (size_t)expert_id * db);
+            uint64_t align = engine->model_file.direct_io_alignment;
 
-            if (rg == (ssize_t)gb && ru == (ssize_t)ub && rd == (ssize_t)db) {
+            // All three projections are scattered (packed-format experts
+            // are 3 separate on-disk slices by construction) -- exactly the
+            // case io_uring's batching helps: submit all 3 as one call
+            // instead of 3 sequential blocking preads. Falls through to the
+            // existing sequential path on any failure.
+            io_uring_backend::ReadRequest reqs[3] = {
+                {gfd, engine->model_file.direct_io_active_for(gE->second), align,
+                 slot.pinned_buf, gb, gE->second.offset + (size_t)expert_id * gb},
+                {ufd, engine->model_file.direct_io_active_for(uE->second), align,
+                 slot.pinned_buf + gb, ub, uE->second.offset + (size_t)expert_id * ub},
+                {dfd, engine->model_file.direct_io_active_for(dE->second), align,
+                 slot.pinned_buf + gb + ub, db, dE->second.offset + (size_t)expert_id * db},
+            };
+            bool ok = try_uring_batch(reqs, 3, my_ring);
+            if (!ok) {
+                ssize_t rg = direct_io::pread_direct_aware(
+                    gfd, engine->model_file.direct_io_active_for(gE->second), align,
+                    slot.pinned_buf, gb, gE->second.offset + (size_t)expert_id * gb);
+                ssize_t ru = direct_io::pread_direct_aware(
+                    ufd, engine->model_file.direct_io_active_for(uE->second), align,
+                    slot.pinned_buf + gb, ub, uE->second.offset + (size_t)expert_id * ub);
+                ssize_t rd = direct_io::pread_direct_aware(
+                    dfd, engine->model_file.direct_io_active_for(dE->second), align,
+                    slot.pinned_buf + gb + ub, db, dE->second.offset + (size_t)expert_id * db);
+                ok = (rg == (ssize_t)gb && ru == (ssize_t)ub && rd == (ssize_t)db);
+            }
+
+            if (ok) {
                 finish_prefetch(slot, layer_idx, expert_id, total);
             } else {
                 issue_fadvise_fallback(layer_idx, expert_id);
@@ -285,8 +473,19 @@ private:
             return;
         }
 
-        // ---- Legacy per-expert format: ffn_{gate,up,down}.E.weight ----
+        // ---- Per-expert format: ffn_{gate,up,down}.E.weight ----
+        // Read each projection INDEPENDENTLY into a TIGHT gate|up|down staging
+        // buffer (gate@0, up@gb, down@gb+ub), mirroring StreamingEngine::
+        // load_expert_slab's per-expert path EXACTLY so the bytes uploaded to
+        // VRAM here match the slab-relative meta deltas the GPU dispatch
+        // indexes by (expert_ffn_gpu_issue: up@gb, down@gb+ub). Layout-agnostic:
+        // no assumption about the relative file offsets. The old single-combined
+        // pread over [gate.offset, down.end) underflowed size_t (down<gate<up
+        // after a lexicographic repack sort) -> acquire_staging_slot(SIZE_MAX)
+        // -> cudaMallocHost failed -> silent fadvise fallback, so per-expert
+        // experts were never promoted to VRAM at all.
         std::string gate_name = base + "ffn_gate." + std::to_string(expert_id) + ".weight";
+        std::string up_name   = base + "ffn_up."   + std::to_string(expert_id) + ".weight";
         std::string down_name = base + "ffn_down." + std::to_string(expert_id) + ".weight";
         auto git = engine->model_file.tensors.find(gate_name);
         auto dit = engine->model_file.tensors.find(down_name);
@@ -294,17 +493,67 @@ private:
             issue_fadvise_fallback(layer_idx, expert_id);
             return;
         }
-        auto& gate = git->second;
-        auto& down = dit->second;
-        size_t total = (down.offset + down.size_bytes) - gate.offset;
+        const GGUFTensor& gate = git->second;
+        const GGUFTensor& down = dit->second;
+        auto uit = engine->model_file.tensors.find(up_name);
+        const GGUFTensor* up = (uit != engine->model_file.tensors.end()) ? &uit->second : nullptr;
+
+        const size_t gb = gate.size_bytes;
+        const size_t ub = up ? up->size_bytes : 0;
+        const size_t db = down.size_bytes;
+        const size_t total = gb + ub + db;
 
         PrefetchSlot& slot = acquire_staging_slot(total);
         if (!slot.pinned_buf) { issue_fadvise_fallback(layer_idx, expert_id); return; }
 
-        int fd = engine->model_file.fd_for_tensor(gate);
-        ssize_t bytes_read = pread(fd, slot.pinned_buf, total, gate.offset);
+        uint64_t align = engine->model_file.direct_io_alignment;
+        // Single-read fast path (mirrors load_expert_slab): if the three
+        // projections are packed tight in one same-shard expert block, fetch the whole expert with ONE
+        // pread into the tight staging buffer instead of three.
+        int gate_fd = engine->model_file.fd_for_tensor(gate);
+        bool tight = up
+            && engine->model_file.fd_for_tensor(*up) == gate_fd
+            && engine->model_file.fd_for_tensor(down) == gate_fd
+            && up->offset == gate.offset + gb
+            && down.offset == up->offset + ub;
+        bool ok;
+        if (tight) {
+            ssize_t r = direct_io::pread_direct_aware(
+                gate_fd, engine->model_file.direct_io_active_for(gate), align,
+                slot.pinned_buf, total, gate.offset);
+            ok = (r == (ssize_t)total);
+        } else {
+            // Scattered projections (not same-shard/tight) -- same
+            // io_uring batching opportunity as the packed-format branch
+            // above. `up` can be absent (ub=0), so the batch is 2 or 3
+            // requests depending on the model.
+            io_uring_backend::ReadRequest reqs[3];
+            int n = 0;
+            reqs[n++] = {engine->model_file.fd_for_tensor(gate), engine->model_file.direct_io_active_for(gate),
+                         align, slot.pinned_buf, gb, gate.offset};
+            if (up) {
+                reqs[n++] = {engine->model_file.fd_for_tensor(*up), engine->model_file.direct_io_active_for(*up),
+                             align, slot.pinned_buf + gb, ub, up->offset};
+            }
+            reqs[n++] = {engine->model_file.fd_for_tensor(down), engine->model_file.direct_io_active_for(down),
+                         align, slot.pinned_buf + gb + ub, db, down.offset};
+            ok = try_uring_batch(reqs, n, my_ring);
+            if (!ok) {
+                ssize_t rg = direct_io::pread_direct_aware(
+                    engine->model_file.fd_for_tensor(gate), engine->model_file.direct_io_active_for(gate), align,
+                    slot.pinned_buf, gb, gate.offset);
+                ssize_t ru = 0;
+                if (up) ru = direct_io::pread_direct_aware(
+                    engine->model_file.fd_for_tensor(*up), engine->model_file.direct_io_active_for(*up), align,
+                    slot.pinned_buf + gb, ub, up->offset);
+                ssize_t rd = direct_io::pread_direct_aware(
+                    engine->model_file.fd_for_tensor(down), engine->model_file.direct_io_active_for(down), align,
+                    slot.pinned_buf + gb + ub, db, down.offset);
+                ok = (rg == (ssize_t)gb && (!up || ru == (ssize_t)ub) && rd == (ssize_t)db);
+            }
+        }
 
-        if (bytes_read == (ssize_t)total) {
+        if (ok) {
             finish_prefetch(slot, layer_idx, expert_id, total);
         } else {
             issue_fadvise_fallback(layer_idx, expert_id);
@@ -315,7 +564,7 @@ private:
     // staging_mutex so the regrow (which can cudaFreeHost the pinned_buf) can't
     // race a concurrent consume_staged memcpy-out of the same slot.
     PrefetchSlot& acquire_staging_slot(size_t needed_bytes) {
-        int slot_idx = staging_write_idx.fetch_add(1, std::memory_order_relaxed) % NUM_STAGING_SLOTS;
+        int slot_idx = staging_write_idx.fetch_add(1, std::memory_order_relaxed) % num_staging_slots;
         auto _wait_t0 = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(staging_mutex);
         double _wait_ms = std::chrono::duration<double, std::milli>(
@@ -326,6 +575,22 @@ private:
                      _wait_ms, slot_idx);
         }
         PrefetchSlot& slot = staging[slot_idx];
+        // Diagnostic: are we about to overwrite a slot that was
+        // successfully staged (ready==true) but NEVER consumed? A
+        // successful consume_staged() resets layer_idx/expert_id to -1 on
+        // its way out (see its own body below), so ready==true with a
+        // still-real (layer,expert) identity here means this exact
+        // prediction was correctly made, correctly read, correctly
+        // staged -- and simply never matched a miss before round-robin
+        // rotation came back around to recycle its slot. Distinguishes
+        // "pool thrashing" from other explanations for the gap between
+        // Pilot recall (prediction accuracy alone) and Prefetch (PIPE)
+        // served % (the full pipeline) -- safe to read here since we
+        // already hold staging_mutex, the same lock consume_staged uses
+        // to mutate these same fields.
+        if (slot.ready.load(std::memory_order_relaxed) && slot.layer_idx != -1) {
+            perf().n_staged_evicted_unused.fetch_add(1, std::memory_order_relaxed);
+        }
         if (slot.capacity < needed_bytes) {
             // PRIME SUSPECT for the multi-second single-miss stall: pinned
             // (page-locked) host memory alloc/free is a documented-slow CUDA
@@ -333,13 +598,13 @@ private:
             // under memory pressure or fragmentation) -- and this whole pair
             // runs WHILE HOLDING staging_mutex, so any concurrent
             // consume_staged() call on the decode thread blocks for the full
-            // duration. A fixed pool of only NUM_STAGING_SLOTS=16 slots
-            // rotating round-robin across MoE layers whose packed slab size
-            // can differ layer-to-layer (different quant types e.g. IQ4_XS
-            // vs IQ3_XXS down-projections) means this regrow can trigger far
-            // more often than "only once at startup" -- every time the
-            // round-robin lands on a slot last sized for a DIFFERENT layer's
-            // (smaller) slab.
+            // duration. A too-small pool (num_staging_slots, config
+            // prefetch_staging_slots) rotating round-robin across MoE layers
+            // whose packed slab size can differ layer-to-layer (different
+            // quant types e.g. IQ4_XS vs IQ3_XXS down-projections) means this
+            // regrow can trigger far more often than "only once at startup"
+            // -- every time the round-robin lands on a slot last sized for a
+            // DIFFERENT layer's (smaller) slab.
             auto _regrow_t0 = std::chrono::high_resolution_clock::now();
             if (slot.pinned_buf) cudaFreeHost(slot.pinned_buf);
             cudaMallocHost((void**)&slot.pinned_buf, needed_bytes);
@@ -395,11 +660,17 @@ private:
     }
 
     void issue_fadvise_fallback(int layer_idx, int expert_id) {
-        std::string gate_name = "blk." + std::to_string(layer_idx) + ".ffn_gate." + std::to_string(expert_id) + ".weight";
-        auto it = engine->model_file.tensors.find(gate_name);
-        if (it != engine->model_file.tensors.end()) {
-            auto& t_meta = it->second;
-            posix_fadvise(engine->model_file.fd_for_tensor(t_meta), t_meta.offset, t_meta.size_bytes * 3, POSIX_FADV_WILLNEED);
+        // Prefetch each projection by name. The old (gate.offset, gate.size*3)
+        // hint assumed up/down follow gate contiguously AND share its size --
+        // neither holds for a repacked (down<gate<up) or mixed-quant layout.
+        std::string base = "blk." + std::to_string(layer_idx) + ".";
+        std::string es = std::to_string(expert_id);
+        for (const char* proj : {"ffn_gate", "ffn_up", "ffn_down"}) {
+            auto it = engine->model_file.tensors.find(base + proj + "." + es + ".weight");
+            if (it != engine->model_file.tensors.end()) {
+                posix_fadvise(engine->model_file.fd_for_tensor(it->second),
+                              it->second.offset, it->second.size_bytes, POSIX_FADV_WILLNEED);
+            }
         }
     }
 };

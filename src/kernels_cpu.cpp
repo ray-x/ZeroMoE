@@ -175,7 +175,7 @@ void dequantize_row_q2_K_avx512(const uint8_t* block, float* y, int64_t k) {
     // would silently miss that file entirely, which is itself indistinguishable
     // from "this code isn't running" without checking log_path first.
     static std::atomic<bool> logged_q2k{false};
-    if (should_log_once(logged_q2k)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_q2_K_avx512 is live\n");
+    if (should_log_once(logged_q2k)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_q2_K_avx512 is live\n");
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 84; // scales[16] qs[64] d(2) dmin(2)
     const int64_t nb = k / QK_K;
@@ -235,7 +235,7 @@ static inline void dequant_q3k_group16(const uint8_t* q, const uint8_t* hm, uint
 
 void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged_q3k{false};
-    if (should_log_once(logged_q3k)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_q3_K_avx512 is live\n");
+    if (should_log_once(logged_q3k)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_q3_K_avx512 is live\n");
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 110; // hmask[32] qs[64] scales[12] d(2)
     const int64_t nb = k / QK_K;
@@ -362,7 +362,7 @@ static inline void apply_grid_group8(const uint8_t* grid8, uint8_t signs, __m256
 
 void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
-    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_xxs_avx512 is live\n");
+    if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq2_xxs_avx512 is live\n");
 
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 66; // d(2) + qs[32] uint16 (64 bytes)
@@ -411,7 +411,7 @@ void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
 
 void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
-    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq3_xxs_avx512 is live\n");
+    if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq3_xxs_avx512 is live\n");
 
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 98; // d(2) + qs[96]
@@ -473,7 +473,7 @@ void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
 // vectorized IQ2_XXS/IQ3_XXS types on the same hardware.
 void dequantize_row_iq2_s_avx512(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
-    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_s_avx512 is live\n");
+    if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq2_s_avx512 is live\n");
 
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 82; // d(2) + qs[64] + qh[8] + scales[8]
@@ -520,7 +520,7 @@ void dequantize_row_iq2_s_avx512(const uint8_t* block, float* y, int64_t k) {
 // throughput," so 8-wide was assumed sufficient. Revisited after a direct
 // throughput benchmark (main_test.cpp Test 8) found the ALREADY-vectorized
 // IQ2_XXS/IQ3_XXS/IQ2_S types only reach ~1-3 GB/s on the target machine,
-// vs colibri's own measured 6-23 GB/s for its (structurally simpler, plain
+// vs DMA 6-23 GB/s for its (structurally simpler, plain
 // int4) format -- a gap too large to keep assuming ALU width is a non-
 // factor without actually testing it.
 //
@@ -586,7 +586,7 @@ static inline void apply_grid_group16(const uint8_t* grid16, uint8_t signs_lo, u
 
 void dequantize_row_iq2_xxs_avx512_wide(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
-    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_xxs_avx512_wide is live\n");
+    if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq2_xxs_avx512_wide is live\n");
 
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 66;
@@ -635,7 +635,7 @@ void dequantize_row_iq2_xxs_avx512_wide(const uint8_t* block, float* y, int64_t 
 
 void dequantize_row_iq3_xxs_avx512_wide(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
-    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq3_xxs_avx512_wide is live\n");
+    if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq3_xxs_avx512_wide is live\n");
 
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 98;
@@ -684,7 +684,7 @@ void dequantize_row_iq3_xxs_avx512_wide(const uint8_t* block, float* y, int64_t 
 
 void dequantize_row_iq2_s_avx512_wide(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
-    if (should_log_once(logged)) LOG_ERROR("[AVX512-DEQUANT] dequantize_row_iq2_s_avx512_wide is live\n");
+    if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq2_s_avx512_wide is live\n");
 
     constexpr int QK_K = 256;
     constexpr size_t BLOCK_BYTES = 82;

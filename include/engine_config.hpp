@@ -38,6 +38,64 @@ struct EngineConfig {
     float top_p = 0.90f;
     bool drop_pages = false;         // fadvise DONTNEED after expert read
     bool cpu_only = false;           // force ALL compute to CPU (no GPU dispatch)
+    // O_DIRECT expert-slab reads (Linux only). Opt-in, requires the model
+    // to have been repacked with tools/gguf_tool pack (or otherwise have
+    // general.alignment >= 4096) -- see GGUFFile::enable_direct_io. A
+    // plain/un-repacked GGUF silently falls back to buffered reads with a
+    // logged warning, never a hard failure.
+    bool direct_io = false;
+
+    // Batch the async prefetcher's per-expert reads (up to 3: gate/up/down)
+    // through io_uring instead of sequential blocking preads (Linux only,
+    // kernel >= 5.6 for IORING_OP_READ). Opt-in, independent of direct_io --
+    // composes with it either way (see io_uring_backend.hpp). Falls back to
+    // the existing sequential path with a logged warning on any failure
+    // (old kernel, io_uring disabled by seccomp/container policy, etc.),
+    // never a hard failure. Prefetcher-only: does not touch the synchronous
+    // decode-thread miss path (StreamingEngine::load_expert_slab).
+    bool io_uring = false;
+
+    // Number of concurrent async prefetcher worker threads pulling hints
+    // off the SPSC queue and servicing them (disk read + optional async
+    // H2D promotion). Was hardcoded to 1 -- real-run PIPE instrumentation
+    // (n_pipe_miss_still_queued) showed a real, measurable fraction of
+    // otherwise-correctly-predicted misses failing to be served purely
+    // because a single worker thread hadn't even STARTED that hint's read
+    // yet (pilot_k=8 hints pushed per layer transition, one thread
+    // servicing them strictly one at a time). Each thread gets its own
+    // io_uring ring when io_uring=true (a Ring is not shareable across
+    // threads); the staging pool (prefetch_staging_slots, below) is still
+    // shared and mutex-protected, so this doesn't change staging pool
+    // capacity, only how fast hints get started. Kept modest by default --
+    // these threads mostly block on
+    // I/O rather than compute, but more of them means more concurrent
+    // cudaMallocHost/staging_mutex contention too.
+    int prefetch_worker_threads = 2;
+
+    // Number of round-robin pinned-host staging slots the async prefetcher
+    // holds prefetched-but-not-yet-consumed expert slabs in
+    // (LockFreePrefetcher::staging, async_prefetcher.hpp). Was a hardcoded
+    // compile-time constant (16, then bumped to 64) because PrefetchSlot
+    // holds std::atomic<bool> members that aren't move-safe for a
+    // std::vector -- now a runtime-sized array allocated once in
+    // LockFreePrefetcher::start(), so this is a real knob. Real-run
+    // instrumentation (n_staged_evicted_unused, "Staged-unused evict" in the
+    // perf report) showed a fixed pool round-robin-evicting a correctly-
+    // predicted, successfully-staged expert before the corresponding cache
+    // miss ever consumed it -- i.e. the pool cycling faster than misses
+    // arrive, not misprediction (Pilot recall stayed ~85% the whole time).
+    // First bumped 64->128; a longer real run (32k context, 50 decode
+    // tokens) showed hint volume grows with workload size roughly as fast
+    // as the pool does, so 128 was STILL only good enough to keep ~2% of
+    // staged experts alive to be consumed (Staged-unused evict 11387 of
+    // 11671 hints processed) -- essentially unchanged from 64's ratio.
+    // Raised again to 256. Each slot costs one pinned-host allocation sized
+    // to the largest expert slab seen so far (grows lazily, see
+    // acquire_staging_slot) -- budget roughly slots x largest-slab-size of
+    // page-locked host RAM (a few GB at 256 slots for this project's expert
+    // sizes), separate from and additional to moe_cache_gb/host_ram_gb --
+    // watch total system memory if you raise this further.
+    int prefetch_staging_slots = 256;
 
     // Host RAM (DDR) budget for the MoE expert LRU cache, in GB.
     // 0 = auto-detect (88% of currently-available system memory).
@@ -53,7 +111,7 @@ struct EngineConfig {
     // higher values reduce unnecessary PCIe traffic.
     int promote_hit_threshold = 1;
 
-    // Phase A colibri-port: pin a VRAM-resident expert (never evict it via
+    // Phase A: pin a VRAM-resident expert (never evict it via
     // evict_lru) once its host-cache hit_count crosses this threshold --
     // "stop evicting hot experts within a conversation", no cross-prompt
     // profile needed. 0 disables pinning entirely (pure reactive LRU).
@@ -69,11 +127,95 @@ struct EngineConfig {
     std::string pin_file = ".moestream_usage";
     int pin_topk_per_layer = 0;
 
+    // Multi-tier startup preload, extending the single top-K-pinned tier
+    // above into a graduated scheme driven by the SAME usage file (which
+    // already records every expert ever routed to, not just the top-K --
+    // StreamingEngine::route_freq/dump_usage cover the full histogram).
+    // Per layer, ranked by historical selection count, AFTER the
+    // pin_topk_per_layer-sized pinned prefix:
+    //   next round(pin_vram_lru_fraction * avg_vram_slots_per_layer) ranks
+    //     -> VRAM, but NOT pinned -- a regular reactively-evictable slot,
+    //     just pre-warmed instead of starting cold;
+    //   next round(pin_ram_fraction * ram_mgr.slots_per_layer) ranks ->
+    //     host RAM tier, preloaded (a genuinely new capability -- the RAM
+    //     tier previously always started completely cold, filling only
+    //     reactively during real generation).
+    double pin_vram_lru_fraction = 0.0;
+    double pin_ram_fraction = 0.0;
+
+    // Three-tier VRAM caching configuration
+    // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion
+    bool move_on_promotion = true;
+    // Maximum number of permanently pinned experts (was ~600, targeting 1024)
+    int pinned_vram_capacity = 1024;
+    // Active layer area: temporary workspace for current-layer experts
+    int active_layer_capacity = 256;
+    bool use_active_layer_area = true;
+    // Hit count (while resident in the active layer area, i.e. re-accessed
+    // before this layer's window closes) at which an active-layer expert
+    // gets promoted into the real VRAM LRU cache (GpuTopology::
+    // promote_active_to_main, a device-to-device copy) instead of just
+    // being freed once its layer finishes. Previously this whole promotion
+    // path didn't exist at all -- the active layer area only ever held a
+    // temporary hold-and-discard buffer with no way for a proven-hot
+    // expert to escape into the real cache, and no hit-counting to know
+    // "proven hot" in the first place (n_active_layer_hits was declared but
+    // never incremented anywhere). Default 1 (promote on any repeat access)
+    // -- much lower than RAMSafetyManager::promote_hit_threshold because
+    // the active layer area's window (one layer, current token) is far
+    // narrower than the RAM tier's whole-conversation lifetime, so a repeat
+    // hit here is already a comparatively strong signal.
+    int active_layer_promote_hit_threshold = 1;
+
+    // When a VRAM cache slot is evicted (GpuTopology::evict_lru, via
+    // upload_expert), salvage the outgoing expert's bytes into the RAM
+    // tier with a D2H copy instead of letting them be silently dropped.
+    // Previously a VRAM-evicted expert not ALSO already RAM-resident went
+    // fully cold -- its next use always paid a full disk read even though
+    // the identical bytes existed in VRAM a moment earlier. A PCIe D2H
+    // copy of one expert slab costs roughly a millisecond vs. a 15-50ms+
+    // NVMe re-read (this project's own measured [MOE-CACHE] MISS timings),
+    // so this is a real, asymmetric win on paper -- but it's new,
+    // untested on real hardware, and touches the same VRAM-eviction/
+    // cross-thread-reuse territory that has produced multiple real
+    // silent-corruption incidents earlier in this project's history (see
+    // CLAUDE.md). Scoped deliberately narrow to avoid the worst of that
+    // risk: only wired into upload_expert (decode-thread-only), never
+    // upload_expert_async (the prefetcher thread's own promotion path),
+    // so RAMSafetyManager::layers_experts keeps its existing
+    // single-writer-thread invariant with no new locking required -- see
+    // gpu_topology.hpp's on_vram_evict and ram_manager.hpp's
+    // demote_from_vram for the full reasoning. Default false: opt-in only,
+    // A/B test against a run with this disabled before trusting it (watch
+    // dump_report()'s "VRAM->RAM demote:" line and Expert cache hit
+    // rate/disk-read totals for the real effect).
+    bool vram_evict_demote_to_ram = false;
+
+    // Redistributes RAMSafetyManager's fixed total RAM-tier budget
+    // (uniform slots_per_layer * n_layers) across layers proportional to
+    // each layer's real historical need instead of splitting it evenly.
+    // Motivated by direct measurement on this project's own accumulated
+    // .moestream_usage file (75 layers, 672 selections/layer after
+    // several sessions): the most routing-concentrated layer needed only
+    // 31 of its own top-ranked experts to cover 80% of its traffic, the
+    // flattest needed 92 -- a ~3x range the uniform per-layer split
+    // ignores, while the RAM tier was simultaneously observed 100% full
+    // (a real, binding constraint) in every real run this session.
+    // Default false: opt-in, A/B test against the uniform baseline before
+    // trusting it -- see ram_manager.hpp's apply_layer_adaptive_capacity
+    // for the full algorithm and its budget-safety guarantees (the
+    // redistributed total can never exceed what calculate_safe_cache_
+    // capacity already determined is safe, by construction). Uses the
+    // SAME `pin_file` usage history as the [PIN] preload block -- no
+    // separate file/config needed. First-ever run (no usage history yet)
+    // is a complete no-op, identical to leaving this false, since there's
+    // no real signal yet to redistribute by.
+    bool ram_cache_layer_adaptive = false;
+
     // How many OMP threads RAMSafetyManager::get_experts_batch uses to
     // parallelize the disk reads for one token's genuine (non-PIPE-served)
     // host-cache misses within a single layer's topk selection. Default 4,
     // chosen from a direct empirical measurement on the target machine
-    // (colibri's iobench.c microbenchmark against the real model file):
     // buffered reads scaled ~8.5x from 1->4 threads (1.53 -> 13.12 GB/s)
     // then flattened (8 threads: 12.30 GB/s, no further gain) -- 4 captures
     // essentially the full available win on this hardware's real queue
@@ -81,6 +223,51 @@ struct EngineConfig {
     // contention against the OMP-parallel CPU dequant path running
     // elsewhere. Re-run iobench.c on a different machine/drive to re-tune.
     int expert_fetch_threads = 4;
+
+    // Process-wide default OpenMP team size for EVERY parallel region that
+    // does NOT specify its own num_threads(...) clause. Was previously
+    // unset entirely -- expert_fetch_threads above only caps ONE specific
+    // region (ram_manager.hpp's Phase B disk-read loop, the only one with
+    // an explicit num_threads()); every other #pragma omp parallel for in
+    // the codebase (attention_layer.cpp's dense/attention matmuls,
+    // kernels_cpu.cpp's CPU expert-fallback dequant+dot path, kquant_
+    // dequant.hpp's reference dequant) silently defaulted to OpenMP's own
+    // runtime default (all available cores), with nothing to stop several
+    // of these regions running concurrently and oversubscribing the
+    // machine. A real run showed the OS itself become unresponsive to
+    // other commands -- traced to the CPU expert-fallback path
+    // specifically: expert_ffn_cpu calls cpu_quant_matmul three times per
+    // call (gate/up/down), each hitting one of these uncapped regions, and
+    // this path's call volume had grown to ~2000+/run (from ~1000 a few
+    // sessions earlier) as a direct, deliberate side effect of raising
+    // pinned_vram_capacity -- more pinning means more "just promoted, not
+    // yet GPU-usable" experts falling back to CPU (see perf_timer.hpp's
+    // n_cpu_fallback_just_promoted), each burst spinning up to every core,
+    // three times, completely uncoordinated with whatever else was
+    // running. 0 = auto (hardware_concurrency() - 2, floor 1) -- leaves
+    // headroom for the OS and any other process by default rather than
+    // requiring every deployment to work out its own safe number; set
+    // explicitly to override. Applied once via omp_set_num_threads() at
+    // the very start of run_engine(), before any parallel region can run
+    // -- explicit num_threads() clauses (like expert_fetch_threads' own)
+    // still override this default locally, so raising expert_fetch_threads
+    // above this value is still honored for that one region specifically.
+    int omp_max_threads = 0;
+
+    // When true, main.cpp's REPL feeds stdin content to the tokenizer
+    // VERBATIM -- skips the GLM-3/4-style chat-template wrap
+    // ([gMASK]<sop><|user|>\n{msg}<|assistant|>\n) it would otherwise apply
+    // whenever the tokenizer detects chat-template tokens in the vocab.
+    // Two real uses: (1) fair prefill-time benchmarking against another
+    // engine on an identical token count, since the wrap alone can more
+    // than double a short prompt's token count; (2) required for
+    // api/api_server.py, which already builds its own <|role|>content-
+    // style prompt before ever reaching this engine -- without this flag
+    // that pre-formatted text gets wrapped a SECOND time, producing
+    // nested/duplicated special tokens (a real correctness bug, not just
+    // extra tokens -- see CLAUDE.md). Default false: the REPL's own
+    // template-detection behavior is unchanged for normal interactive use.
+    bool raw_prompt = false;
 
     // Logging. Empty log_path (default) keeps everything on stderr, matching
     // prior behavior. log_level filters by severity: VERBOSE shows
@@ -262,13 +449,36 @@ inline bool EngineConfig::load(const std::string& path) {
     top_p            = doc.root.get_float("top_p", top_p);
     drop_pages       = doc.root.get_bool("drop_pages", drop_pages);
     cpu_only         = doc.root.get_bool("cpu_only", cpu_only);
+    direct_io        = doc.root.get_bool("direct_io", direct_io);
+    io_uring         = doc.root.get_bool("io_uring", io_uring);
+    prefetch_worker_threads = doc.root.get_int("prefetch_worker_threads", prefetch_worker_threads);
+    prefetch_staging_slots = doc.root.get_int("prefetch_staging_slots", prefetch_staging_slots);
     host_ram_gb      = doc.root.get_double("host_ram_gb", host_ram_gb);
     verbose_moe_log  = doc.root.get_bool("verbose_moe_log", verbose_moe_log);
     promote_hit_threshold = doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
     pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
     pin_file         = doc.root.get_str("pin_file", pin_file);
     pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
+    pin_vram_lru_fraction = doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
+    pin_ram_fraction      = doc.root.get_double("pin_ram_fraction", pin_ram_fraction);
+    vram_evict_demote_to_ram = doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
+    ram_cache_layer_adaptive = doc.root.get_bool("ram_cache_layer_adaptive", ram_cache_layer_adaptive);
     expert_fetch_threads = doc.root.get_int("expert_fetch_threads", expert_fetch_threads);
+    omp_max_threads = doc.root.get_int("omp_max_threads", omp_max_threads);
+    // NOTE: these four were previously missing from parsing entirely --
+    // every configs/*.toml's `pinned_vram_capacity`/`move_on_promotion`/
+    // `active_layer_capacity`/`use_active_layer_area` lines were silently
+    // no-ops, only "working" because each one happened to match its
+    // compiled default (1024/true/256/true). Any run that tried to
+    // actually CHANGE one of these via TOML got the default instead, with
+    // no warning.
+    pinned_vram_capacity = doc.root.get_int("pinned_vram_capacity", pinned_vram_capacity);
+    move_on_promotion    = doc.root.get_bool("move_on_promotion", move_on_promotion);
+    active_layer_capacity = doc.root.get_int("active_layer_capacity", active_layer_capacity);
+    use_active_layer_area = doc.root.get_bool("use_active_layer_area", use_active_layer_area);
+    active_layer_promote_hit_threshold = doc.root.get_int("active_layer_promote_hit_threshold",
+                                                            active_layer_promote_hit_threshold);
+    raw_prompt           = doc.root.get_bool("raw_prompt", raw_prompt);
     log_path         = doc.root.get_str("log_path", log_path);
     log_level        = doc.root.get_str("log_level", log_level);
 
@@ -374,6 +584,12 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Context: " << context_size << " tokens | Max gen: " << max_new_tokens << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Temperature: " << temperature << " | Top-p: " << top_p << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Drop pages: " << (drop_pages ? "yes" : "no") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Direct I/O (O_DIRECT expert reads): " << (direct_io ? "requested" : "off")
+              << (direct_io ? " (falls back to buffered per-shard if unsupported/unaligned -- see [DIRECT-IO] log)" : "") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] io_uring (batched prefetcher reads): " << (io_uring ? "requested" : "off")
+              << (io_uring ? " (falls back to sequential preads if unsupported -- see [IO-URING] log)" : "") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Prefetch worker threads: " << prefetch_worker_threads << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Prefetch staging slots: " << prefetch_staging_slots << "\n";
     if (cpu_only) LOG_STREAM_INFO() << "[CONFIG] CPU-only mode: ON (all GPU dispatch disabled)\n";
     LOG_STREAM_INFO() << "[CONFIG] Host RAM (DDR) budget: "
               << (host_ram_gb > 0 ? std::to_string(host_ram_gb) + " GB (explicit)" : "auto-detect") << "\n";
@@ -382,8 +598,26 @@ inline void EngineConfig::print() const {
               << (pin_threshold > 0 ? " hits" : " (pinning disabled)") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Pin file: " << (pin_file.empty() ? "(preload disabled)" : pin_file)
               << " | top-" << (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto"))
-              << "/layer\n";
+              << "/layer pinned"
+              << ", next " << (pin_vram_lru_fraction * 100.0) << "% of VRAM tier capacity (unpinned)"
+              << ", next " << (pin_ram_fraction * 100.0) << "% of RAM tier capacity\n";
+    LOG_STREAM_INFO() << "[CONFIG] VRAM evict -> RAM demote: "
+              << (vram_evict_demote_to_ram ? "ON (D2H-salvage evicted experts into the RAM tier)" : "off") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] RAM cache layer-adaptive: "
+              << (ram_cache_layer_adaptive ? "ON (per-layer capacity by historical need, not uniform)" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Expert fetch threads: " << expert_fetch_threads << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] OMP max threads (process-wide default): "
+              << (omp_max_threads > 0 ? std::to_string(omp_max_threads) : std::string("auto"))
+              << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Pinned VRAM capacity: " << pinned_vram_capacity
+              << " | move_on_promotion: " << (move_on_promotion ? "MOVE" : "COPY") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Active layer area: "
+              << (use_active_layer_area ? std::to_string(active_layer_capacity) + " slots, promote at "
+                                           + std::to_string(active_layer_promote_hit_threshold) + " hit(s)"
+                                         : "disabled") << "\n";
+    if (raw_prompt)
+        LOG_STREAM_INFO() << "[CONFIG] Raw prompt mode: ON -- REPL will NOT apply the chat "
+                              "template, stdin content is tokenized verbatim\n";
     LOG_STREAM_INFO() << "[CONFIG] Verbose MoE cache logging: " << (verbose_moe_log ? "on" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level
                << " | Log path: " << (log_path.empty() ? "(stderr)" : log_path) << "\n";
@@ -415,13 +649,56 @@ temperature    = 0.7
 top_p          = 0.95
 drop_pages     = false    # true = evict expert pages from OS cache after use
 
+# direct_io: read routed-expert slabs with O_DIRECT instead of buffered
+# reads (Linux only). Requires the model to have been repacked with
+# tools/gguf_tool pack (general.alignment >= 4096) -- a plain/un-repacked
+# GGUF logs a warning and falls back to buffered reads automatically,
+# never a hard failure. See tools/README.md for the repack workflow.
+direct_io      = false
+
+# io_uring: batch the async prefetcher's per-expert reads (up to 3:
+# gate/up/down) through one io_uring submission instead of sequential
+# blocking preads (Linux only, kernel >= 5.6). Opt-in, independent of
+# direct_io -- combine both for O_DIRECT reads batched via io_uring, or use
+# either alone. Falls back to sequential preads automatically on any
+# failure (old kernel, sandboxed/container environment, etc.), never a hard
+# failure. Only affects the background prefetcher, not the synchronous
+# decode-thread miss path.
+io_uring       = false
+
+# prefetch_worker_threads: number of concurrent worker threads servicing
+# the async prefetcher's hint queue (disk read + optional async H2D
+# promotion). Default 2. Each gets its own io_uring ring when io_uring=true.
+# More threads means hints get STARTED sooner (fixes a real "worker hadn't
+# even begun this read yet" gap seen in PIPE instrumentation), at the cost
+# of more concurrent contention on the staging pool (see
+# prefetch_staging_slots below).
+prefetch_worker_threads = 2
+
+# prefetch_staging_slots: number of pinned-host round-robin slots the async
+# prefetcher holds prefetched expert slabs in before a cache miss consumes
+# them. Default 256 (was a hardcoded compile-time 64, then 128). Too small
+# and a correctly-predicted, successfully-staged expert gets round-robin-
+# evicted before the matching miss arrives -- see "Staged-unused evict" in
+# the perf report; a high count there (as a fraction of total hints
+# processed) means this is undersized relative to how many hints are in
+# flight between pilot_k per-layer predictions and worker throughput. Hint
+# volume scales with workload size (context length, tokens generated), so
+# re-check this ratio after any change to those and raise further if it's
+# still high. Each slot lazily grows its pinned allocation to the largest
+# expert slab it has held, so cost scales with slot count x max slab size --
+# a few GB of page-locked host RAM at 256 slots, separate from and
+# additional to moe_cache_gb/host_ram_gb; watch total system memory if you
+# raise this further.
+prefetch_staging_slots = 256
+
 # Host RAM (DDR) budget for the MoE expert LRU cache, in GB.
 # 0 = auto-detect (88% of currently-available system memory).
 host_ram_gb    = 0
 verbose_moe_log = false
 promote_hit_threshold = 1
 
-# Phase A colibri-port: VRAM expert residency, not reactive-only eviction.
+# Phase A VRAM expert residency, not reactive-only eviction.
 # pin_threshold: once a VRAM-resident expert's host-cache hit_count crosses
 # this, it's pinned (never evicted) for the rest of the process -- stops
 # thrashing hot experts out within one conversation. 0 disables pinning.
@@ -433,13 +710,85 @@ pin_file = ".moestream_usage"
 # pin_topk_per_layer: how many of each layer's hottest experts to preload.
 # 0 = auto-size to fill available VRAM expert-cache capacity.
 pin_topk_per_layer = 0
+# pin_vram_lru_fraction: preload the next-hottest experts (ranked just below
+# pin_topk_per_layer) into VRAM but leave UNPINNED -- a normal reactively-
+# evictable slot, just pre-warmed instead of starting cold. Fraction of the
+# VRAM tier's own real per-layer capacity, e.g. 0.1 = 10%, 0.3 = 30%.
+# 0.0 = disabled (default -- real testing found nonzero defaults here made
+# a short benchmark run SLOWER, more disk read, not less; A/B test your
+# own workload before enabling
+pin_vram_lru_fraction = 0.0
+# pin_ram_fraction: same idea, next tier down, preloaded into the host RAM
+# tier (previously always started completely cold). Fraction of
+# ram_mgr.slots_per_layer. 0.0 = disabled (default, same reasoning as above).
+pin_ram_fraction = 0.0
+
+# vram_evict_demote_to_ram: when a VRAM cache slot is evicted, salvage its
+# bytes into the RAM tier via a D2H copy instead of dropping them (so a
+# later re-request serves from RAM instead of paying a full disk read
+# again). New, untested on real hardware, opt-in only -- default false.
+vram_evict_demote_to_ram = false
+
+# ram_cache_layer_adaptive: give layers with flatter/less-predictable
+# routing more RAM-tier cache slots and concentrated layers fewer, instead
+# of splitting the total budget evenly -- uses the same pin_file usage
+# history as the [PIN] preload above. No-op until that history exists.
+# New, untested on real hardware, opt-in only -- default false.
+ram_cache_layer_adaptive = false
 
 # expert_fetch_threads: OMP threads used to parallelize disk reads for one
 # token's genuine (non-PIPE-served) cache misses within a layer's topk
-# selection. Default 4 -- tune with colibri's iobench.c microbenchmark
+# selection. Default 4
 # against your own model file/drive (buffered reads, increasing thread
 # count until throughput stops scaling) rather than assuming this value.
 expert_fetch_threads = 4
+
+# omp_max_threads: process-wide default OpenMP team size for every
+# parallel region that doesn't set its OWN num_threads(...) -- previously
+# unset entirely, so attention/dense matmuls, the CPU expert-fallback
+# dequant+dot path, and the reference dequant path all defaulted to
+# OpenMP's own runtime default (every available core), with nothing
+# stopping several of them running concurrently and oversubscribing the
+# machine. A real run showed the OS itself become unresponsive to other
+# commands from exactly this -- the CPU expert-fallback path alone can
+# fire thousands of times per run, each call spinning up to every core,
+# three times (gate/up/down), fully uncoordinated with anything else
+# running. 0 = auto (hardware_concurrency() - 2, floor 1) -- leaves
+# headroom for the OS/other processes by default; set explicitly to
+# override. expert_fetch_threads above still applies to its own one
+# region regardless of this value (explicit num_threads() always wins
+# over the process default).
+omp_max_threads = 0
+
+# Three-tier VRAM caching. pinned_vram_capacity is a global ceiling on
+# permanently-pinned experts (see pin_topk_per_layer above -- the effective
+# per-layer pin count is min(pin_topk_per_layer, floor(pinned_vram_capacity
+# / total_layers)), uniform across layers with no remainder distribution,
+# so exact round numbers aren't always reachable). move_on_promotion frees
+# the RAM slot immediately on a RAM->VRAM promotion instead of leaving the
+# expert double-resident in both tiers (see [TIER-OVERLAP] in the perf
+# report if this regresses).
+pinned_vram_capacity = 1024
+move_on_promotion = true
+
+# Active layer area: a small dedicated VRAM buffer holding the CURRENT
+# layer's decode-time cold-miss experts, so a not-yet-proven-hot expert can
+# still get a GPU dispatch without evicting a real LRU resident for it.
+# active_layer_capacity slots, each sized to one expert slab -- costs
+# roughly active_layer_capacity x largest-expert-slab-size of VRAM,
+# additional to and separate from each GPU's own moe_cache_gb; make sure
+# the vault GPU has that much genuinely free or allocation silently fails
+# and this whole feature falls back to plain LRU behavior (see the
+# "[GPU] Active layer area allocation failed" log line -- also check
+# [GPU] Active layer area allocated for the actual GB requested).
+# active_layer_promote_hit_threshold: hit count (repeat access from a LATER
+# token while still resident) at which an active-layer expert is promoted
+# into the real VRAM LRU cache instead of being freed once its layer's
+# window closes -- default 1 since this window is much narrower than the
+# RAM tier's whole-conversation lifetime.
+use_active_layer_area = true
+active_layer_capacity = 256
+active_layer_promote_hit_threshold = 1
 
 # Logging. Empty log_path (default) keeps everything on stderr.
 # log_level: "VERBOSE" | "DEBUG" | "INFO" (default) | "WARN" | "ERROR"

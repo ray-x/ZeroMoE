@@ -1,5 +1,7 @@
 #pragma once
 #include "gguf_loader.hpp"
+#include "direct_io.hpp"
+#include "io_uring_backend.hpp"
 #include "perf_timer.hpp"
 #include "logger.hpp"
 #include <cuda_runtime.h>
@@ -74,6 +76,79 @@ struct MoEExpertBlock {
     size_t slab_capacity = 0;
     uint64_t last_used_clock = 0;
     uint32_t hit_count = 0;  // frequency signal for eviction scoring (power-law routing)
+
+    // True for a lightweight "shadow" block populated by
+    // StreamingEngine::populate_vram_shadow (execution_layer.cpp's
+    // moe_forward_gguf) instead of a real disk-backed RAM-tier load --
+    // gate_proj.meta/up_proj.meta/down_proj.meta are valid (type + the
+    // packed slab's uniform per-layer relative offsets), but host_ptr is
+    // deliberately null and slab_buffer/slab_capacity are unset, since
+    // the fast path this exists for (an expert already confirmed VRAM-
+    // resident) never reads them -- GPU dispatch reads weight bytes from
+    // ExpertLocation::device_ptr, never from here. Callers MUST check
+    // this flag before touching host_ptr; see moe_forward_gguf's Pass A
+    // loop for the required emergency-reload fallback if GPU dispatch
+    // unexpectedly fails for a shadowed expert.
+    bool vram_shadow = false;
+
+    // True once RAMSafetyManager::get_expert/get_experts_batch has
+    // CONFIRMED (via GpuTopology::find_expert, which itself polls
+    // upload_ready before returning non-null -- never set from the
+    // moment an async promotion is merely ISSUED, which would race the
+    // in-flight cudaMemcpyAsync still reading this slot's slab_buffer)
+    // that this same (layer, expert_id) is ALSO resident and ready in the
+    // VRAM tier. A slot with this set is genuinely redundant capacity --
+    // the RAM eviction-victim scan (get_expert/get_experts_batch's Step 3)
+    // treats it as the lowest-priority ("evict first") candidate
+    // regardless of its own recency/hit_count, so double-stored capacity
+    // gets reclaimed promptly instead of lingering until unrelated LRU
+    // pressure happens to pick it (see CLAUDE.md's TIER-OVERLAP finding).
+    // Reset to false whenever a slot is claimed for a different expert --
+    // the new occupant isn't known to be VRAM-redundant. Deliberately
+    // never proactively un-set if the VRAM copy is later evicted: worst
+    // case a slightly-too-eagerly-marked slot causes one extra disk read
+    // on its next miss, a performance cost only, never a correctness one.
+    bool also_in_vram = false;
+
+    // Non-owning reference to the destination VRAM slot's OWN upload_event
+    // (GpuTopology::ExpertLocation::upload_event), set the moment
+    // move_on_promotion fires an async H2D copy FROM this slot's
+    // slab_buffer and immediately clears this slot's identity/capacity
+    // for reuse -- the exact race also_in_vram's own comment above already
+    // warns about ("never set from the moment an async promotion is
+    // merely ISSUED, which would race the in-flight cudaMemcpyAsync still
+    // reading this slot's slab_buffer"), just via a different field
+    // (slab_capacity/expert_id instead of also_in_vram). Without this, a
+    // LATER miss's eviction scan can pick this exact slot and overwrite
+    // (or free+realloc, see ensure_slab_capacity) slab_buffer while the
+    // GPU copy engine is still reading the OLD bytes from it -- a genuine
+    // use-after-free/WAR hazard, not just a capacity-accounting one. Every
+    // RAM-slot victim-selection site (get_expert Step 3, get_experts_batch
+    // Phase A/B, demote_from_vram) must check copy_still_pending() before
+    // treating this slot as reusable. GpuTopology owns the event's actual
+    // lifetime (destroyed only at process teardown, long after RAM-tier
+    // operations stop), so holding a bare non-owning pointer here is safe;
+    // re-recording on the SAME destination slot for a later, unrelated
+    // promotion is also safe to observe here (stream-ordered execution on
+    // the same copy_stream guarantees our earlier copy already completed
+    // before a later one can even be enqueued), just conservative -- it
+    // can make this check report "still pending" slightly longer than
+    // strictly necessary, never the reverse.
+    cudaEvent_t pending_copy_event = nullptr;
+
+    // Self-healing: true if a previously-issued async H2D copy FROM this
+    // slot's slab_buffer may still be reading it. Same "poll before trust"
+    // pattern find_expert/evict_lru already use for the VRAM side's
+    // upload_ready -- clears the flag the first time it's confirmed done,
+    // so this never re-queries a completed event twice.
+    bool copy_still_pending() {
+        if (!pending_copy_event) return false;
+        if (cudaEventQuery(pending_copy_event) == cudaSuccess) {
+            pending_copy_event = nullptr;
+            return false;
+        }
+        return true;
+    }
 };
 
 class StreamingEngine {
@@ -85,8 +160,8 @@ public:
     std::vector<std::vector<MoEExpertBlock>> layers_experts;
 
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
-    // across a run and dumped to the usage file at shutdown (Phase A colibri-
-    // port: the "learned hot set" signal that drives VRAM preloading on the
+    // across a run and dumped to the usage file at shutdown (Phase A 
+    // the "learned hot set" signal that drives VRAM preloading on the
     // NEXT run). Atomic so the (future) batched/router-parallel path can bump
     // it without locking; today moe_forward_gguf bumps it single-threaded.
     std::vector<std::atomic<uint64_t>> route_freq;
@@ -127,7 +202,7 @@ public:
     int gpu_device_id = -1;
 
     // Configuration: page cache policy for expert slabs after reading
-    // false = leave pages in OS page cache (free L2 for hot experts, colibri's default)
+    // false = leave pages in OS page cache 
     // true = POSIX_FADV_DONTNEED after read (reduces memory pressure under tight RAM)
     bool drop_expert_pages = false;
 
@@ -184,7 +259,9 @@ public:
 
             posix_memalign((void**)&qt.host_ptr, 4096, t_meta.size_bytes);
             int tensor_fd = src.fd_for_tensor(t_meta);
-            ssize_t bytes_read = pread(tensor_fd, qt.host_ptr, t_meta.size_bytes, t_meta.offset);
+            ssize_t bytes_read = direct_io::pread_direct_aware(
+                tensor_fd, src.direct_io_active_for(t_meta), src.direct_io_alignment,
+                qt.host_ptr, t_meta.size_bytes, t_meta.offset);
             if (bytes_read <= 0 || (uint64_t)bytes_read != t_meta.size_bytes) {
                 LOG_WARN("[WARN] Short read for %s (shard %d, offset %lu): got %zd / %lu\n",
                          name.c_str(), t_meta.shard_idx, (unsigned long)t_meta.offset,
@@ -281,6 +358,100 @@ public:
         slot.down_proj.meta.offset = gb + ub;
         slot.down_proj.meta.size_bytes = db;
         slot.expert_id = expert_id;
+        slot.vram_shadow = false;
+    }
+
+    // Metadata-only counterpart to load_expert_slab/populate_packed_slab --
+    // ZERO disk I/O, zero RAM-slot involvement. Fixes the real, measured
+    // "[TIER-OVERLAP]" finding (see CLAUDE.md): moe_forward_gguf's per-
+    // token dispatch used to call RAMSafetyManager::get_experts_batch
+    // UNCONDITIONALLY for every routed expert, even ones already GPU-
+    // resident, wasting a real disk read and a real RAM slot on data whose
+    // BYTES the GPU-dispatch path never actually reads (it reads the
+    // packed base tensor's TYPE, uniform across every expert in a layer,
+    // and the weight bytes from ExpertLocation::device_ptr -- never from
+    // a RAM copy). This fills in exactly that metadata (type + the
+    // packed slab's uniform per-expert relative offsets: gate=0, up=gb,
+    // down=gb+ub) from packed_slab_geometry, which is a pure tensor-table
+    // lookup already parsed at GGUF load time -- same source
+    // load_expert_slab itself uses before it ever touches disk. host_ptr
+    // is deliberately left null; slot.vram_shadow=true is the required
+    // signal callers must check before touching it (see MoEExpertBlock's
+    // own comment). Returns false (slot untouched) if this layer has no
+    // packed expert tensors at all (e.g. a non-MoE layer).
+    bool populate_vram_shadow(MoEExpertBlock& slot, int layer_idx, int expert_id) const {
+        size_t gb = 0, ub = 0, db = 0;
+        const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
+        slot.gate_proj.host_ptr = nullptr;
+        slot.gate_proj.meta = *gM;
+        slot.gate_proj.meta.offset = 0;
+        slot.gate_proj.meta.size_bytes = gb;
+        slot.up_proj.host_ptr = nullptr;
+        slot.up_proj.meta = *uM;
+        slot.up_proj.meta.offset = gb;
+        slot.up_proj.meta.size_bytes = ub;
+        slot.down_proj.host_ptr = nullptr;
+        slot.down_proj.meta = *dM;
+        slot.down_proj.meta.offset = gb + ub;
+        slot.down_proj.meta.size_bytes = db;
+        slot.expert_id = expert_id;
+        slot.vram_shadow = true;
+        return true;
+    }
+
+    // Builds the (up to 3) io_uring read requests needed to load ONE
+    // packed-format expert's slab -- but does NOT perform any reads
+    // itself. Deliberately kept separate from load_expert_slab (which
+    // remains completely unchanged as the proven, correctness-critical
+    // fallback for this exact same read) rather than refactored to share
+    // code: this lets a batch caller (RAMSafetyManager's Phase B) collect
+    // MANY experts' requests into ONE big io_uring submission, reap them
+    // all, THEN populate every slab only once every single read in the
+    // whole batch has succeeded -- all-or-nothing, so a failure anywhere
+    // in the batch can never leave one expert's slab half-populated while
+    // its siblings look fine. Reuses the SAME packed_slab_geometry/
+    // ensure_slab_capacity/populate_packed_slab helpers load_expert_slab
+    // itself uses, so the two paths can never disagree about slab layout.
+    //
+    // Legacy per-expert format is deliberately NOT supported here (returns
+    // false) -- it's already documented as the engine's cold/slow path
+    // elsewhere (io_uring_backend.hpp, CLAUDE.md), not worth the added
+    // complexity for a first cut; callers fall back to load_expert_slab
+    // for it exactly as Phase B always has.
+    //
+    // Always issues 3 separate reads per expert (gate/up/down), even when
+    // they're contiguous on disk -- unlike load_expert_slab's own single-
+    // shard coalescing optimization. Simpler, and the coalescing win
+    // matters less here: io_uring's real benefit (kernel-managed deep
+    // queue depth across the WHOLE batch's reads at once) applies
+    // regardless of whether any one expert's 3 reads happen to be
+    // contiguous.
+    bool build_packed_expert_read_requests(int layer_idx, int expert_id,
+                                            MoEExpertBlock& target_slot,
+                                            io_uring_backend::ReadRequest* out_reqs,
+                                            int& out_n, size_t& out_total) {
+        size_t gb, ub, db;
+        const GGUFTensor *gM, *uM, *dM;
+        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
+        out_total = gb + ub + db;
+        ensure_slab_capacity(target_slot, out_total);
+
+        uint8_t* dst_gate = target_slot.slab_buffer;
+        uint8_t* dst_up   = target_slot.slab_buffer + gb;
+        uint8_t* dst_down = target_slot.slab_buffer + gb + ub;
+        uint64_t gate_off = gM->offset + (uint64_t)expert_id * gb;
+        uint64_t up_off   = uM->offset + (uint64_t)expert_id * ub;
+        uint64_t down_off = dM->offset + (uint64_t)expert_id * db;
+
+        out_n = 0;
+        out_reqs[out_n++] = {model_file.fd_for_tensor(*gM), model_file.direct_io_active_for(*gM),
+                              model_file.direct_io_alignment, dst_gate, gb, gate_off};
+        out_reqs[out_n++] = {model_file.fd_for_tensor(*uM), model_file.direct_io_active_for(*uM),
+                              model_file.direct_io_alignment, dst_up, ub, up_off};
+        out_reqs[out_n++] = {model_file.fd_for_tensor(*dM), model_file.direct_io_active_for(*dM),
+                              model_file.direct_io_alignment, dst_down, db, down_off};
+        return true;
     }
 
     void load_expert_slab(int layer_idx, int expert_id, MoEExpertBlock& target_slot) {
@@ -304,31 +475,62 @@ public:
             uint8_t* dst_down = target_slot.slab_buffer + gb + ub;
 
             PERF_START(disk);
-            // Per-call timing + a [SLOW-PREAD] log for any individual read
-            // beyond SLOW_PREAD_MS -- added alongside the cache_mutex/
-            // staging_mutex instrumentation to root-cause a real multi-
-            // second single-miss stall. A genuinely slow pread() call would
-            // show up here explicitly (with layer/expert/proj/bytes/offset),
-            // ruling in or out "the raw disk read itself" as distinct from
-            // lock contention elsewhere in the miss-servicing path.
-            auto read_slice = [this](const GGUFTensor& m, size_t rel_off, size_t bytes, uint8_t* dst, int l, int e, const char* which) {
+
+            // Check for interleaved per-expert layout: if gate+up+down are
+            // contiguous on disk (the layout produced by repacked GGUF with
+            // interleaved experts), use a single coalesced pread instead of 3.
+            // This is the key optimization: one large aligned request saturates
+            // NVMe queue depth far better than 3 scattered smaller requests.
+            uint64_t gate_expert_offset = gM->offset + (uint64_t)expert_id * gb;
+            uint64_t up_expert_offset   = uM->offset + (uint64_t)expert_id * ub;
+            uint64_t down_expert_offset = dM->offset + (uint64_t)expert_id * db;
+            
+            bool is_interleaved = (up_expert_offset == gate_expert_offset + gb) &&
+                                  (down_expert_offset == up_expert_offset + ub);
+
+            if (is_interleaved && model_file.fd_for_tensor(*gM) == model_file.fd_for_tensor(*uM) &&
+                model_file.fd_for_tensor(*uM) == model_file.fd_for_tensor(*dM)) {
+                // Fast Path: Single coalesced pread for the entire expert slab
+                // (gate, up, down packed tightly). This fires on repacked GGUFs
+                // where tools/gguf_tool pack writes experts in interleaved order.
                 auto t0 = std::chrono::high_resolution_clock::now();
-                int fd = model_file.fd_for_tensor(m);
-                ssize_t r = pread(fd, dst, bytes, m.offset + rel_off);
+                int fd = model_file.fd_for_tensor(*gM);
+                ssize_t r = direct_io::pread_direct_aware(
+                    fd, model_file.direct_io_active_for(*gM), model_file.direct_io_alignment,
+                    dst_gate, total, gate_expert_offset);
                 double ms = std::chrono::duration<double, std::milli>(
                     std::chrono::high_resolution_clock::now() - t0).count();
-                if (r < 0 || (size_t)r != bytes)
-                    LOG_WARN("[WARN] packed expert short read L%d E%d: %zd/%zu\n", l, e, r, bytes);
-                if (ms > SLOW_PREAD_MS) {
-                    LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=%s bytes=%.2fMB offset=%llu "
-                             "took=%.2fms (%.2f MB/s)\n",
-                             l, e, which, bytes / 1e6, (unsigned long long)(m.offset + rel_off), ms,
-                             ms > 0 ? (bytes / 1e6) / (ms / 1000.0) : 0.0);
+                if (r < 0 || (size_t)r != total) {
+                    LOG_WARN("[WARN] interleaved expert coalesced read short: L%d E%d %zd/%zu\n",
+                             layer_idx, expert_id, r, total);
+                } else if (ms > SLOW_PREAD_MS) {
+                    LOG_WARN("[SLOW-PREAD] coalesced L%d E%d: %.2fMB @ %llu took %.2fms (%.2f MB/s)\n",
+                             layer_idx, expert_id, total / 1e6, (unsigned long long)gate_expert_offset, ms,
+                             ms > 0 ? (total / 1e6) / (ms / 1000.0) : 0.0);
                 }
-            };
-            read_slice(*gM, (size_t)expert_id * gb, gb, dst_gate, layer_idx, expert_id, "gate");
-            read_slice(*uM, (size_t)expert_id * ub, ub, dst_up,   layer_idx, expert_id, "up");
-            read_slice(*dM, (size_t)expert_id * db, db, dst_down, layer_idx, expert_id, "down");
+            } else {
+                // Fallback: 3 separate reads (original format or tensors on different fds)
+                auto read_slice = [this](const GGUFTensor& m, size_t rel_off, size_t bytes, uint8_t* dst, int l, int e, const char* which) {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    int fd = model_file.fd_for_tensor(m);
+                    ssize_t r = direct_io::pread_direct_aware(
+                        fd, model_file.direct_io_active_for(m), model_file.direct_io_alignment,
+                        dst, bytes, m.offset + rel_off);
+                    double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - t0).count();
+                    if (r < 0 || (size_t)r != bytes)
+                        LOG_WARN("[WARN] packed expert short read L%d E%d: %zd/%zu\n", l, e, r, bytes);
+                    if (ms > SLOW_PREAD_MS) {
+                        LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=%s bytes=%.2fMB offset=%llu "
+                                 "took=%.2fms (%.2f MB/s)\n",
+                                 l, e, which, bytes / 1e6, (unsigned long long)(m.offset + rel_off), ms,
+                                 ms > 0 ? (bytes / 1e6) / (ms / 1000.0) : 0.0);
+                    }
+                };
+                read_slice(*gM, (size_t)expert_id * gb, gb, dst_gate, layer_idx, expert_id, "gate");
+                read_slice(*uM, (size_t)expert_id * ub, ub, dst_up,   layer_idx, expert_id, "up");
+                read_slice(*dM, (size_t)expert_id * db, db, dst_down, layer_idx, expert_id, "down");
+            }
             PERF_END(disk, t_disk_read);
             perf().bytes_disk_read.fetch_add(total, std::memory_order_relaxed);
 
@@ -359,48 +561,121 @@ public:
         }
         auto& down = down_it->second;
 
-        size_t total_chunk_size = (down.offset + down.size_bytes) - gate.offset;
-        PERF_START(alloc);
-        if (target_slot.slab_capacity < total_chunk_size) {
-            if (target_slot.slab_buffer) free(target_slot.slab_buffer);
-            posix_memalign((void**)&target_slot.slab_buffer, 4096, total_chunk_size);
-            target_slot.slab_capacity = total_chunk_size;
+        // Read each projection INDEPENDENTLY into a TIGHT gate|up|down slab
+        // (gate@0, up@gb, down@gb+ub) and assign SLAB-RELATIVE offsets, so the
+        // downstream VRAM upload + GPU dispatch (which index gate/up/down by
+        // (proj.offset - gate.offset) deltas -- see expert_ffn_gpu_issue /
+        // expert_ffn_gpu_finish) work identically to the packed path's slab.
+        // This is LAYOUT-AGNOSTIC: it makes no assumption about the relative
+        // file offsets of the three projections. The previous variant did ONE
+        // combined pread over [gate.offset, down.end) -- correct only when the
+        // file lays the three out contiguously as gate<=up<=down, and a real
+        // size_t underflow (posix_memalign(SIZE_MAX) -> NULL -> the
+        // "missing gate_proj.host_ptr" skip at execution_layer.cpp's Pass A)
+        // otherwise -- exactly what a lexicographic tensor sort produces
+        // (tools/gguf_tool pack orders them down<gate<up). Reading 3 slices
+        // works for any ordering; a contiguous repack (gate/up/down adjacent
+        // per expert) lets the kernel coalesce them back toward a single read.
+        const size_t gb_pe = gate.size_bytes;
+        const GGUFTensor* up_t = nullptr;
+        size_t ub_pe = 0;
+        auto up_it = model_file.tensors.find(up_name);
+        if (up_it != model_file.tensors.end()) {
+            up_t = &up_it->second;
+            ub_pe = up_t->size_bytes;
         }
-        PERF_END(alloc, t_host_alloc);
+        const size_t db_pe = down.size_bytes;
+        const size_t total = gb_pe + ub_pe + db_pe;
+        ensure_slab_capacity(target_slot, total);
+
+        uint8_t* dst_gate = target_slot.slab_buffer;
+        uint8_t* dst_up   = target_slot.slab_buffer + gb_pe;
+        uint8_t* dst_down = target_slot.slab_buffer + gb_pe + ub_pe;
+
+        auto read_proj = [&](const GGUFTensor& m, size_t bytes, uint8_t* dst, const char* which) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            int fd = model_file.fd_for_tensor(m);
+            ssize_t r = direct_io::pread_direct_aware(
+                fd, model_file.direct_io_active_for(m), model_file.direct_io_alignment,
+                dst, bytes, m.offset);
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            if (r < 0 || (size_t)r != bytes)
+                LOG_WARN("[WARN] expert short read L%d E%d %s: %zd/%zu\n",
+                         layer_idx, expert_id, which, r, bytes);
+            if (ms > SLOW_PREAD_MS) {
+                LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=%s bytes=%.2fMB offset=%llu "
+                         "took=%.2fms (%.2f MB/s)\n",
+                         layer_idx, expert_id, which, bytes / 1e6, (unsigned long long)m.offset, ms,
+                         ms > 0 ? (bytes / 1e6) / (ms / 1000.0) : 0.0);
+            }
+        };
 
         PERF_START(disk);
-        auto _pread_t0 = std::chrono::high_resolution_clock::now();
-        int slab_fd = model_file.fd_for_tensor(gate);
-        ssize_t read_bytes = pread(slab_fd, target_slot.slab_buffer, total_chunk_size, gate.offset);
-        double _pread_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - _pread_t0).count();
-        if (read_bytes < 0 || (size_t)read_bytes != total_chunk_size) {
-            LOG_WARN("[WARN] Expert slab short read L%d E%d: %zd / %zu\n",
-                     layer_idx, expert_id, read_bytes, total_chunk_size);
-        }
-        if (_pread_ms > SLOW_PREAD_MS) {
-            LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=legacy-slab bytes=%.2fMB offset=%llu "
-                     "took=%.2fms (%.2f MB/s)\n",
-                     layer_idx, expert_id, total_chunk_size / 1e6, (unsigned long long)gate.offset,
-                     _pread_ms, _pread_ms > 0 ? (total_chunk_size / 1e6) / (_pread_ms / 1000.0) : 0.0);
+        // Single-read fast path: if up follows gate TIGHTLY and down follows up
+        // TIGHTLY, and all three share one shard fd, fetch the WHOLE expert in
+        // ONE pread
+        // writes (each expert block packed tight, gate/up/down adjacent). One
+        // sequential ~total-byte read saturates NVMe far better than three
+        // scattered ones, and disk is the bottleneck here. Guarded so it ONLY
+        // fires for genuinely tight, same-shard layouts: a scattered legacy
+        // layout, OR an expert whose projections got split across two output
+        // shards (different fds), fails the guard and falls through to the
+        // always-correct 3-independent-read path below.
+        const int gate_fd = model_file.fd_for_tensor(gate);
+        const bool tight = up_t
+            && model_file.fd_for_tensor(*up_t) == gate_fd
+            && model_file.fd_for_tensor(down) == gate_fd
+            && up_t->offset == gate.offset + gb_pe
+            && down.offset == up_t->offset + ub_pe;
+        if (tight) {
+            auto t0 = std::chrono::high_resolution_clock::now();
+            ssize_t r = direct_io::pread_direct_aware(
+                gate_fd, model_file.direct_io_active_for(gate), model_file.direct_io_alignment,
+                target_slot.slab_buffer, total, gate.offset);
+            double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            if (r < 0 || (size_t)r != total)
+                LOG_WARN("[WARN] expert slab short read L%d E%d: %zd/%zu\n",
+                         layer_idx, expert_id, r, total);
+            if (ms > SLOW_PREAD_MS) {
+                LOG_WARN("[SLOW-PREAD] layer=%d expert=%d proj=expert-slab bytes=%.2fMB offset=%llu "
+                         "took=%.2fms (%.2f MB/s)\n",
+                         layer_idx, expert_id, total / 1e6, (unsigned long long)gate.offset, ms,
+                         ms > 0 ? (total / 1e6) / (ms / 1000.0) : 0.0);
+            }
+        } else {
+            read_proj(gate, gb_pe, dst_gate, "gate");
+            if (up_t) read_proj(*up_t, ub_pe, dst_up, "up");
+            read_proj(down, db_pe, dst_down, "down");
         }
         PERF_END(disk, t_disk_read);
-        perf().bytes_disk_read.fetch_add(total_chunk_size, std::memory_order_relaxed);
+        perf().bytes_disk_read.fetch_add(total, std::memory_order_relaxed);
 
         if (drop_expert_pages) {
-            posix_fadvise(slab_fd, gate.offset, total_chunk_size, POSIX_FADV_DONTNEED);
+            posix_fadvise(model_file.fd_for_tensor(gate), gate.offset, gb_pe, POSIX_FADV_DONTNEED);
+            if (up_t) posix_fadvise(model_file.fd_for_tensor(*up_t), up_t->offset, ub_pe, POSIX_FADV_DONTNEED);
+            posix_fadvise(model_file.fd_for_tensor(down), down.offset, db_pe, POSIX_FADV_DONTNEED);
         }
 
         target_slot.gate_proj.host_ptr = target_slot.slab_buffer;
         target_slot.gate_proj.meta = gate;
-        if (model_file.tensors.count(up_name)) {
-            auto& up = model_file.tensors[up_name];
-            target_slot.up_proj.host_ptr = target_slot.slab_buffer + (up.offset - gate.offset);
-            target_slot.up_proj.meta = up;
+        target_slot.gate_proj.meta.offset = 0;
+        target_slot.gate_proj.meta.size_bytes = gb_pe;
+        if (up_t) {
+            target_slot.up_proj.host_ptr = target_slot.slab_buffer + gb_pe;
+            target_slot.up_proj.meta = *up_t;
+            target_slot.up_proj.meta.offset = gb_pe;
+            target_slot.up_proj.meta.size_bytes = ub_pe;
+        } else {
+            target_slot.up_proj.host_ptr = nullptr;
         }
-        target_slot.down_proj.host_ptr = target_slot.slab_buffer + (down.offset - gate.offset);
+        target_slot.down_proj.host_ptr = target_slot.slab_buffer + gb_pe + ub_pe;
         target_slot.down_proj.meta = down;
+        target_slot.down_proj.meta.offset = gb_pe + ub_pe;
+        target_slot.down_proj.meta.size_bytes = db_pe;
         target_slot.expert_id = expert_id;
+        target_slot.vram_shadow = false;
     }
 
     // True per-expert slab size in bytes, accounting for each projection's own
@@ -423,25 +698,45 @@ public:
         }
 
         auto git = model_file.tensors.find(base + "ffn_gate.0.weight");
+        auto uit = model_file.tensors.find(base + "ffn_up.0.weight");
         auto dit = model_file.tensors.find(base + "ffn_down.0.weight");
-        if (git != model_file.tensors.end() && dit != model_file.tensors.end())
-            return (dit->second.offset + dit->second.size_bytes) - git->second.offset;
+        if (git != model_file.tensors.end() && dit != model_file.tensors.end()) {
+            // Sum each projection's OWN size -- layout-agnostic. The earlier
+            // (down.end - gate.offset) form assumed gate's file offset was the
+            // lowest of the three and underflowed size_t on a scattered repack
+            // layout (down<gate<up), handing VRAM-cache/prefetch sizing a
+            // ~SIZE_MAX value. Mirrors load_expert_slab's tight-slab total
+            // (gb + ub + db) exactly.
+            size_t total = git->second.size_bytes + dit->second.size_bytes;
+            if (uit != model_file.tensors.end()) total += uit->second.size_bytes;
+            return total;
+        }
 
         return 0;
     }
 
     void issue_prefetch(int layer_idx, const std::vector<int>& predicted_expert_ids) {
         PERF_SCOPE(t_prefetch);
+        std::string base = "blk." + std::to_string(layer_idx) + ".";
         for (int exp_id : predicted_expert_ids) {
-            std::string gate_name = "blk." + std::to_string(layer_idx) + ".ffn_gate." + std::to_string(exp_id) + ".weight";
-            auto it = model_file.tensors.find(gate_name);
-            if (it != model_file.tensors.end()) {
-                posix_fadvise(model_file.fd_for_tensor(it->second), it->second.offset, it->second.size_bytes * 3, POSIX_FADV_WILLNEED);
+            std::string es = std::to_string(exp_id);
+            // Prefetch each projection by name rather than (gate.offset,
+            // gate.size*3): the old hint assumed up/down immediately follow
+            // gate contiguously AND share gate's per-expert size -- neither
+            // holds for a repacked layout (down<gate<up) nor for mixed-quant
+            // experts (gate/up=Q2_K, down=Q3_K). Per-projection is correct for
+            // any layout.
+            for (const char* proj : {"ffn_gate", "ffn_up", "ffn_down"}) {
+                auto it = model_file.tensors.find(base + proj + "." + es + ".weight");
+                if (it != model_file.tensors.end()) {
+                    posix_fadvise(model_file.fd_for_tensor(it->second),
+                                  it->second.offset, it->second.size_bytes, POSIX_FADV_WILLNEED);
+                }
             }
         }
     }
 
-    // ---- Learned hot-set profiling (Phase A colibri-port) ----
+    // ---- Learned hot-set profiling (Phase A ) ----
     // route_freq is [n_layers * n_experts]; call once layers/n_experts are known
     // (after build_model_graph). Idempotent.
     void init_route_freq() {
@@ -463,20 +758,43 @@ public:
     }
 
     // Write "layer expert count" lines for every (layer,expert) ever selected.
-    // Mirrors colibri's .coli_usage format so a future cross-engine diff is
-    // trivial. Best-effort: a failed open/write just logs and continues.
+    // Accumulates on top of whatever a PREVIOUS run already wrote here,
+    // rather than overwriting it
+    // even engage below 5,000 accumulated selections and doesn't reach its
+    // full budget until 200,000). The original implementation opened the
+    // file in plain "w" mode and wrote only THIS session's in-memory
+    // route_freq -- since route_freq itself is zero-initialized fresh at
+    // every process start (init_route_freq) and is never seeded FROM the
+    // file, every run's shutdown was silently discarding all prior history
+    // and replacing it with just that one run's counts (observed: the
+    // [PIN] log's "max count" stayed stuck around 24-25 across an entire
+    // session's worth of runs -- it was never actually accumulating).
+    // Fixed by reading whatever's already on disk first and summing counts
+    // per (layer,expert) before writing back out. A user who wants a clean
+    // slate (checkpoint swap, or if a matured/pinned profile ever starts
+    // hurting instead of helping -- see the pin_vram_lru_fraction/
+    // pin_ram_fraction regression writeup) can just delete the file; the
+    // next run's load_usage() already treats a missing file as "first run",
+    // no separate reset flag needed.
     void dump_usage(const std::string& path) const {
         if (path.empty() || route_freq.empty()) return;
+        int ne = model_file.architecture_config.n_experts;
+        auto [prior, prior_maxc] = load_usage(path);
+        (void)prior_maxc;
+        std::vector<uint64_t> merged(route_freq.size(), 0);
+        for (auto& e : prior) {
+            size_t idx = (size_t)e.layer * (size_t)ne + (size_t)e.expert;
+            if (idx < merged.size()) merged[idx] = e.count;
+        }
         FILE* f = std::fopen(path.c_str(), "w");
         if (!f) { LOG_WARN("[USAGE] could not write %s\n", path.c_str()); return; }
-        int ne = model_file.architecture_config.n_experts;
         for (size_t i = 0; i < route_freq.size(); ++i) {
-            uint64_t c = route_freq[i].load(std::memory_order_relaxed);
+            uint64_t c = merged[i] + route_freq[i].load(std::memory_order_relaxed);
             if (c == 0) continue;
             std::fprintf(f, "%zu %zu %llu\n", i / (size_t)ne, i % (size_t)ne, (unsigned long long)c);
         }
         std::fclose(f);
-        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s\n", path.c_str());
+        LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s (accumulated across sessions)\n", path.c_str());
     }
 
     // Read a usage file written by dump_usage. Returns one UsageEntry per

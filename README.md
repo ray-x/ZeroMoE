@@ -60,9 +60,9 @@ Alternatively, to build or modify individual target configurations manually via 
 ```bash
 mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc) 2. Interactive Terminal Generation
+make -j$(nproc) 
 ```
-
+2. Interactive Terminal Generation
 Launch the standalone engine directly by passing the destination to your local GGUF model along with your system memory allocation caps:
 
 ```bash
@@ -91,6 +91,73 @@ curl -X POST http://localhost:8000/v1/messages \
 ]
 }'
 ```
+
+## Testing
+
+MoeStream ships two test harnesses, split by what hardware they need.
+
+### Full engine suite (Linux + CUDA + AVX-512)
+
+`src/main_test.cpp` exercises the real CUDA DP4A / fused kernels, AVX-512
+dequantization against a reference, and cuBLAS BF16 dense matmul
+(`[Test 1]`–`[Test 10]`). It cannot build on macOS (hard CUDA / AVX-512 deps).
+
+```bash
+make test
+```
+
+### CPU-only component tests (macOS and Linux)
+
+`tests/test_components.cpp` is a single CPU-only translation unit covering the
+pure-logic components — RoPE, routing/topk, GGUF size math, the SPSC ring, the
+TOML parser, dequant oracles, BF16 round-trip, and O_DIRECT alignment-window
+arithmetic. It builds with the system C++ compiler (no CMake, no CUDA), so it
+runs on Apple Silicon too. This is the fast inner loop for changes that touch
+CPU-testable code.
+
+```bash
+make test-components                       # all component tests
+make test-components ARGS="rope"           # one test, by substring
+make test-components ARGS="rope dequant"   # several (substring OR)
+./tests/run_components.sh direct_io        # build+run the script directly
+```
+
+Filters are substring matches on the test name (`dequant` hits all four
+dequant tests, `iq` hits the IQ-quant ones, etc.). Exit code `0` = pass,
+`2` = no test matched the filter. Override the compiler with `CXX=g++` if
+`c++` isn't the one you want.
+
+### I/O benchmark (macOS and Linux)
+
+`gguf_tool io` (`tools/gguf_io.cpp`) measures the streaming-layout improvement
+from `gguf_tool pack` (`tools/gguf_pack.cpp`): it A/Bs the per-expert read
+pattern — **3 scattered `pread`s** per expert on the original Unsloth packed
+`*_exps` layout vs **1 tight `pread`** per expert on the repacked layout.
+Cross-platform (no CMake / CUDA), with cache bypass handled inside the tool
+(`F_NOCACHE` on macOS, `posix_fadvise(FADV_RANDOM)` on Linux). The original
+model always reads plain-buffered; pass `--direct` to additionally re-read the
+repacked shard through `O_DIRECT`/DMA (Linux only) so the real DMA benefit
+shows up as a third line, not just the read-pattern delta.
+
+```bash
+# repack your model first (see tools/README.md), then:
+make bench-io ARGS="/path/to/model.gguf ./repacked --reads 5000"
+# or directly:
+./tools/run_gguf_tool.sh io /path/to/model.gguf ./repacked --reads 5000 --direct
+```
+
+Use a **large real model** so reads hit disk — on a small fixture everything is
+cached and the ratio is noise.
+
+### Suggested workflow
+
+Iterate on macOS with `make test-components ARGS="…"` for the CPU-testable
+parts and `make bench-io ARGS="…"` to check the repack layout/read pattern,
+then run the full `make test` on Linux before considering a change done.
+Run `gguf_tool verify` on any repacked model directory before pointing the
+engine at it — it's the pre-flight completeness gate (see `tools/README.md`).
+
+---
 
 ⚙️ Advanced 2-Bit Quantization (IQ2_M)
 MoeStream includes dedicated lookup vectors built explicitly to unlock and execute heavily compressed 2-bit IQ2_M model variations.
