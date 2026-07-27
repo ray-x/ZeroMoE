@@ -139,13 +139,15 @@ add_test(NAME native_test_harness COMMAND moestream_tests)
 # means it also builds and runs on machines without a GPU/CUDA toolkit --
 # confirmed by actually compiling and running it against a synthetic GGUF
 # file on a plain darwin/clang machine during development (see CLAUDE.md).
-# Single binary, three subcommands: pack (align/unpack shards for O_DIRECT),
-# io (A/B read-throughput bench), verify (completeness + byte-compare gate).
+# Single binary, four subcommands: pack (align/unpack shards for O_DIRECT),
+# io (A/B read-throughput bench), verify (completeness + byte-compare gate),
+# plan (dense/MoE/system sizing advisor).
 add_executable(gguf_tool
     tools/gguf_tool.cpp
     tools/gguf_pack.cpp
     tools/gguf_io.cpp
     tools/gguf_verify.cpp
+    tools/gguf_plan.cpp
 )
 target_include_directories(gguf_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

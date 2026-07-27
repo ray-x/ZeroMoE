@@ -127,6 +127,43 @@ struct EngineConfig {
     std::string pin_file = ".moestream_usage";
     int pin_topk_per_layer = 0;
 
+    // How the pinned_vram_capacity budget gets DISTRIBUTED across layers at
+    // startup preload. Two options, both driven by the same pin_file usage
+    // history -- this only changes which (layer,expert) entries win a
+    // pinned slot, not how many total slots exist:
+    //   "per_layer_topk" (default): every layer gets the SAME topk count
+    //     (pin_topk_per_layer, or pinned_vram_capacity/n_layers if that's
+    //     smaller) -- the long-standing behavior, unchanged. Safe default:
+    //     never leaves any layer with zero protection, at the cost of
+    //     wasting pin slots on layers whose routing is close to uniform
+    //     (see the [PIN-CONCENTRATION] log -- a layer near the low end of
+    //     that coverage metric gains almost nothing from a fixed top-K).
+    //   "global_topn": pool EVERY (layer,expert,count) triple across ALL
+    //     layers into one ranking, sorted by raw count descending, and pin
+    //     greedily in that order until pinned_vram_capacity is spent --
+    //     valid specifically because every layer sees the same number of
+    //     routing decisions per token in this engine (one top-k selection
+    //     per layer per token), so raw counts genuinely are comparable
+    //     across layers, unlike e.g. comparing byte sizes of differently-
+    //     shaped tensors. Concentrates the budget on genuinely hot experts
+    //     (whichever layer they're in) instead of spreading it evenly, but
+    //     a layer whose historical traffic is flat can end up with FEWER
+    //     than pin_global_floor_per_layer pins purely because its top
+    //     experts never out-rank other layers' hotter ones globally.
+    // Kept switchable (not a hard replacement) because a different model,
+    // or a very different prompt distribution than whatever wrote the
+    // current pin_file, could have a flatter or more skewed routing profile
+    // than what motivated adding "global_topn" -- see CLAUDE.md.
+    std::string pin_strategy = "per_layer_topk";
+    // Only used when pin_strategy=="global_topn": every layer with at least
+    // this many known (layer,expert) entries in pin_file is GUARANTEED at
+    // least this many pinned slots, taken off the top of pinned_vram_capacity
+    // before the remainder is spent on the global ranking -- so a flat
+    // layer never drops to fully-zero protection just because none of its
+    // experts out-rank other layers' hottest ones. 0 disables the floor
+    // (a pure global ranking, some layers may get zero pins).
+    int pin_global_floor_per_layer = 1;
+
     // Multi-tier startup preload, extending the single top-K-pinned tier
     // above into a graduated scheme driven by the SAME usage file (which
     // already records every expert ever routed to, not just the top-K --
@@ -459,6 +496,8 @@ inline bool EngineConfig::load(const std::string& path) {
     pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
     pin_file         = doc.root.get_str("pin_file", pin_file);
     pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
+    pin_strategy = doc.root.get_str("pin_strategy", pin_strategy);
+    pin_global_floor_per_layer = doc.root.get_int("pin_global_floor_per_layer", pin_global_floor_per_layer);
     pin_vram_lru_fraction = doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
     pin_ram_fraction      = doc.root.get_double("pin_ram_fraction", pin_ram_fraction);
     vram_evict_demote_to_ram = doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
@@ -573,6 +612,13 @@ inline bool EngineConfig::validate() {
         }
     }
 
+    if (pin_strategy != "per_layer_topk" && pin_strategy != "global_topn") {
+        std::cerr << "[CONFIG] Unknown pin_strategy '" << pin_strategy
+                  << "' (expected \"per_layer_topk\" or \"global_topn\") -- "
+                  << "falling back to \"per_layer_topk\".\n";
+        pin_strategy = "per_layer_topk";
+    }
+
     return true;
 }
 
@@ -597,8 +643,10 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Pin threshold: " << pin_threshold
               << (pin_threshold > 0 ? " hits" : " (pinning disabled)") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Pin file: " << (pin_file.empty() ? "(preload disabled)" : pin_file)
-              << " | top-" << (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto"))
-              << "/layer pinned"
+              << " | strategy=" << pin_strategy
+              << (pin_strategy == "global_topn"
+                      ? (" (floor " + std::to_string(pin_global_floor_per_layer) + "/layer, remainder ranked globally)")
+                      : (" (top-" + (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto")) + "/layer)"))
               << ", next " << (pin_vram_lru_fraction * 100.0) << "% of VRAM tier capacity (unpinned)"
               << ", next " << (pin_ram_fraction * 100.0) << "% of RAM tier capacity\n";
     LOG_STREAM_INFO() << "[CONFIG] VRAM evict -> RAM demote: "
@@ -708,8 +756,33 @@ pin_threshold = 8
 # Empty string disables preload (a usage file is still written at shutdown).
 pin_file = ".moestream_usage"
 # pin_topk_per_layer: how many of each layer's hottest experts to preload.
-# 0 = auto-size to fill available VRAM expert-cache capacity.
+# 0 = auto-size to fill available VRAM expert-cache capacity. Only used when
+# pin_strategy="per_layer_topk" below.
 pin_topk_per_layer = 0
+# pin_strategy: how pinned_vram_capacity gets DISTRIBUTED across layers.
+#   "per_layer_topk" (default): every layer gets the same topk count
+#     (pin_topk_per_layer above). Safe -- no layer ever gets zero pins --
+#     but wastes budget on layers whose routing is close to uniform (see
+#     the [PIN-CONCENTRATION] log line for whether that's actually your
+#     model/workload).
+#   "global_topn": pool every (layer,expert,count) triple across ALL layers
+#     and pin the globally-hottest ones first, until pinned_vram_capacity is
+#     spent -- concentrates the budget where concentration is real, at the
+#     cost of a flat layer possibly getting fewer than
+#     pin_global_floor_per_layer pins. Valid because every layer sees the
+#     same number of routing decisions per token in this engine, so raw
+#     counts ARE comparable across layers.
+# Switchable, not a hard replacement -- a different model or a very
+# different prompt distribution than whatever wrote pin_file could have a
+# flatter or more skewed profile than whichever strategy was tuned for. See
+# CLAUDE.md.
+pin_strategy = "per_layer_topk"
+# pin_global_floor_per_layer: only used when pin_strategy="global_topn".
+# Every layer with known usage history is guaranteed at least this many
+# pinned slots (taken off the top of pinned_vram_capacity) before the
+# remainder is spent on the global ranking -- prevents a flat layer from
+# dropping to fully-zero protection. 0 = pure global ranking, no floor.
+pin_global_floor_per_layer = 1
 # pin_vram_lru_fraction: preload the next-hottest experts (ranked just below
 # pin_topk_per_layer) into VRAM but leave UNPINNED -- a normal reactively-
 # evictable slot, just pre-warmed instead of starting cold. Fraction of the

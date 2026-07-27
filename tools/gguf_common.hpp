@@ -1,9 +1,10 @@
 // tools/gguf_common.hpp
 //
 // Shared declarations + tiny inline helpers for the unified gguf_tool binary
-// (pack / io / verify subcommands). Kept deliberately small: each subcommand
-// lives in its own .cpp (gguf_pack.cpp / gguf_io.cpp / gguf_verify.cpp) and
-// this header only carries what's genuinely shared across them — the common
+// (pack / io / verify / plan subcommands). Kept deliberately small: each
+// subcommand lives in its own .cpp (gguf_pack.cpp / gguf_io.cpp /
+// gguf_verify.cpp / gguf_plan.cpp) and this header only carries what's
+// genuinely shared across them — the common
 // includes and the cmd_* entry points that gguf_tool.cpp's main() dispatches
 // to. Subcommand-specific helpers (the raw KV reader, the bench loops, the
 // completeness checker) stay file-local in their own .cpp.
@@ -11,7 +12,7 @@
 // Build (no CMake / no CUDA -- runs on macOS AND Linux, same as the old
 // standalone tools):
 //   c++ -std=c++23 -O2 -Iinclude tools/gguf_tool.cpp tools/gguf_pack.cpp \
-//       tools/gguf_io.cpp tools/gguf_verify.cpp -o build/gguf_tool
+//       tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp -o build/gguf_tool
 #pragma once
 
 #include "gguf_loader.hpp"
@@ -30,6 +31,7 @@ namespace gguf_tool {
 int cmd_pack(int argc, char **argv);
 int cmd_io(int argc, char **argv);
 int cmd_verify(int argc, char **argv);
+int cmd_plan(int argc, char **argv);
 
 // ---- inline helpers shared by more than one subcommand ----
 

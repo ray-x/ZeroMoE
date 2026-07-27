@@ -9,7 +9,7 @@
 //
 // Build (no CMake / no CUDA -- macOS and Linux):
 //   c++ -std=c++23 -O2 -Iinclude tools/gguf_tool.cpp tools/gguf_pack.cpp \
-//       tools/gguf_io.cpp tools/gguf_verify.cpp -o build/gguf_tool
+//       tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp -o build/gguf_tool
 #include "gguf_common.hpp"
 #include <cstdio>
 #include <cstring>
@@ -33,6 +33,12 @@ int usage(const char *prog) {
           "attention/norm tensor present in\n"
           "          all layers) + optional exhaustive byte-compare "
           "against another model.\n"
+          "  plan    <model_file_or_dir> [--usage-file <path>]\n"
+          "          Read-only sizing advisor: dense/MoE VRAM requirement, "
+          "detected GPU/RAM, and a\n"
+          "          .moestream_usage summary -- for picking dense_gb / "
+          "moe_cache_gb / pinned_vram_capacity\n"
+          "          on a new model without trial-and-error real runs.\n"
           "\n"
           "Run '%s <subcommand>' with no further args for that "
           "subcommand's full usage.\n",
@@ -56,6 +62,8 @@ int main(int argc, char **argv) {
     return gguf_tool::cmd_io(argc - 1, argv + 1);
   if (sub == "verify")
     return gguf_tool::cmd_verify(argc - 1, argv + 1);
+  if (sub == "plan")
+    return gguf_tool::cmd_plan(argc - 1, argv + 1);
   if (sub == "-h" || sub == "--help") {
     usage(argv[0]);
     return 0;

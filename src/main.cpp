@@ -358,12 +358,48 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // plus every fast-path F32 allocation together can never exceed
     // free_before_fast_path - FAST_PATH_SAFETY_MARGIN, regardless of how many
     // layers convert.
+    // Reserve room for a same-device dual-role CoreEngine expert-cache slice
+    // (add_dual_role_expert_cache, further below) BEFORE computing the
+    // attn_output BF16 budget. That slice is deliberately sized from
+    // GROUND-TRUTH free VRAM measured AFTER this fast-path loop and the
+    // regular dense pool have already run (see its own comment) -- which
+    // means, without this reservation, BF16 (itself ground-truth-free-VRAM
+    // greedy by design) claims 100% of whatever headroom exists and the
+    // slice gets whatever rounding error is left over, regardless of its
+    // configured moe_cache_gb value. Confirmed on a real run: 3090 as
+    // dense+moe with moe_cache_gb=8.5-9.5 requested, only 0.39 GB actually
+    // allocated, because BF16 converted all 78 attn_output layers (15.7 GB)
+    // first. This is a target reservation, not a hard guarantee --
+    // add_dual_role_expert_cache still re-checks ground-truth free VRAM
+    // itself later and may end up with less if something else also grew in
+    // the meantime, but BF16 can no longer be the reason it gets nothing.
+    // Only reserve for the LATER add_dual_role_expert_cache path, which
+    // applies solely to a CoreEngine-only device (role="dense" with a
+    // supplementary moe_cache_gb slice). A genuine single-GPU role=
+    // "dense+moe" device is already in vault_gpus by this point (assign_roles
+    // put it there) and already had its FULL moe_cache_gb cudaMalloc'd by the
+    // main allocate_expert_cache() pass before this function even started --
+    // that's already subtracted out of core_free_vram_bytes() below, so
+    // reserving for it AGAIN here would double-count and needlessly shrink
+    // BF16's real budget.
+    bool already_primary_vault_for_reservation =
+        std::find(gpu.topology.vault_gpus.begin(), gpu.topology.vault_gpus.end(), gpu.topology.core_gpu)
+        != gpu.topology.vault_gpus.end();
+    double core_moe_cache_gb_for_reservation = 0.0;
+    if (!already_primary_vault_for_reservation) {
+        for (auto& gc : config.gpus) {
+            if (gc.device_id == gpu.device_id) { core_moe_cache_gb_for_reservation = gc.moe_cache_gb; break; }
+        }
+    }
+    size_t dual_role_slice_reservation = (size_t)(core_moe_cache_gb_for_reservation * 1e9);
+
     size_t worst_case_pool_bytes = non_attn_output_pool_bytes + attn_output_quantized_total;
     constexpr size_t FAST_PATH_SAFETY_MARGIN = (size_t)1 << 30;  // 1 GB, matches the dense-pool backoff's own margin style
     size_t free_before_fast_path = gpu.core_free_vram_bytes();
+    size_t fast_path_reserved = worst_case_pool_bytes + FAST_PATH_SAFETY_MARGIN + dual_role_slice_reservation;
     size_t fast_path_budget =
-        (free_before_fast_path > worst_case_pool_bytes + FAST_PATH_SAFETY_MARGIN)
-        ? (free_before_fast_path - worst_case_pool_bytes - FAST_PATH_SAFETY_MARGIN)
+        (free_before_fast_path > fast_path_reserved)
+        ? (free_before_fast_path - fast_path_reserved)
         : 0;
 
     int fast_converted = 0, fast_skipped = 0;
@@ -540,11 +576,24 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // OOM bug -- see CLAUDE.md). Must run BEFORE prefetcher.start() below:
     // add_dual_role_expert_cache's reindex is only safe before anything
     // begins actually using expert_vram_cache.
+    // Skip entirely if this device is already a primary vault (role=
+    // "dense+moe" on a genuine single-GPU box: assign_roles() puts it in
+    // BOTH dense_gpu_idx and vault_gpus, and the main allocate_expert_cache()
+    // pass already gave it its full configured moe_cache_gb, FIRST, before
+    // any of the BF16/dense-offload logic above ever ran). Without this
+    // guard, add_dual_role_expert_cache would attempt a SECOND, separate
+    // cudaMalloc for the same configured GB on top of the pool that already
+    // exists -- harmless in practice (it just fails the cap_bytes >=
+    // expert_slab_bytes check below once real free VRAM is near zero and
+    // logs a confusing "skipped" line right after the real pool's own
+    // success line), but pointless and misleading to leave in.
+    bool already_primary_vault = std::find(gpu.topology.vault_gpus.begin(), gpu.topology.vault_gpus.end(),
+                                            gpu.topology.core_gpu) != gpu.topology.vault_gpus.end();
     double core_moe_cache_gb_cfg = 0.0;
     for (auto& gc : config.gpus) {
         if (gc.device_id == gpu.device_id) { core_moe_cache_gb_cfg = gc.moe_cache_gb; break; }
     }
-    if (core_moe_cache_gb_cfg > 0.0 && expert_slab_bytes > 0) {
+    if (!already_primary_vault && core_moe_cache_gb_cfg > 0.0 && expert_slab_bytes > 0) {
         // Same 1 GB margin style as FAST_PATH_SAFETY_MARGIN above -- leaves
         // room for CUDA context growth, cuBLAS workspace, and prefill-time
         // scratch buffer growth (d_x/d_y/d_x_bf16) that hasn't happened yet
@@ -668,7 +717,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             // implicit pin_topk_per_layer calculation. This allows precise control
             // over the pinned tier (targeting 1024 experts vs. current ~600).
             int max_pinned_total = config.pinned_vram_capacity;
-            if (max_pinned_total > 0) {
+            bool global_topn = (config.pin_strategy == "global_topn");
+            if (max_pinned_total > 0 && !global_topn) {
                 // Adjust topk per layer to respect the global pinned cap
                 topk = std::min(topk, max_pinned_total / moe_layers);
                 LOG_STREAM_INFO() << "[PIN] Three-tier: capped per-layer topk to " << topk
@@ -680,6 +730,63 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 config.pin_vram_lru_fraction * avg_vram_slots_per_layer));
             int ram_n = std::max(0, (int)std::lround(
                 config.pin_ram_fraction * ram_mgr.slots_per_layer));
+
+            // pin_strategy=="global_topn": replace the uniform per-layer topk
+            // above with a per-layer pin count derived from a SINGLE ranking
+            // across every layer's historical counts, not just this layer's
+            // own. Every layer first gets a guaranteed floor
+            // (pin_global_floor_per_layer, so a flat layer never drops to
+            // zero protection), then whatever's left of pinned_vram_capacity
+            // is spent on the globally-hottest remaining entries, wherever
+            // they happen to live. Valid because every layer sees the same
+            // number of routing decisions per token in this engine (one
+            // top-k selection per layer per token) -- raw counts really are
+            // comparable across layers, unlike e.g. differently-shaped
+            // tensor byte sizes. Each layer's own list is already sorted
+            // descending (see above), so a layer's globally-ranked share is
+            // always a CONTIGUOUS prefix starting right after its floor --
+            // a higher-count entry in the same layer can never lose the
+            // global ranking to a lower-count one from another layer while
+            // that lower one wins, so this never leaves a "hole" in the
+            // middle of a layer's own sorted list. That's what lets the
+            // existing per-layer "first N by rank" loop below stay
+            // unchanged -- only N itself becomes per-layer instead of a
+            // single shared topk.
+            std::unordered_map<int, int> layer_pin_count;
+            if (global_topn) {
+                int floor_n = std::max(0, config.pin_global_floor_per_layer);
+                int floor_total = 0;
+                for (auto& [layer, v] : by_layer) {
+                    int f = std::min(floor_n, (int)v.size());
+                    layer_pin_count[layer] = f;
+                    floor_total += f;
+                }
+                struct GlobalCand { int layer; uint64_t count; };
+                std::vector<GlobalCand> remainder;
+                for (auto& [layer, v] : by_layer) {
+                    int f = layer_pin_count[layer];
+                    for (int i = f; i < (int)v.size(); ++i)
+                        remainder.push_back({layer, v[i].count});
+                }
+                std::sort(remainder.begin(), remainder.end(),
+                          [](const GlobalCand& a, const GlobalCand& b) { return a.count > b.count; });
+                // If pinned_vram_capacity isn't set, fall back to the REAL VRAM
+                // pool size (same quantity the per_layer_topk path's own "auto"
+                // topk sizing uses: avg_vram_slots_per_layer * moe_layers) --
+                // NOT "take everything remaining", which could try to pin every
+                // expert ever routed to and blow far past physical VRAM capacity.
+                int effective_cap = (max_pinned_total > 0)
+                    ? max_pinned_total
+                    : (int)(avg_vram_slots_per_layer * moe_layers);
+                int remaining_budget = std::max(0, effective_cap - floor_total);
+                int take = std::min((int)remainder.size(), remaining_budget);
+                for (int i = 0; i < take; ++i) layer_pin_count[remainder[i].layer]++;
+                LOG_STREAM_INFO() << "[PIN] global_topn: floor " << floor_n << "/layer (" << floor_total
+                          << " total) + " << take << " globally-ranked -> " << (floor_total + take)
+                          << "/" << effective_cap
+                          << (max_pinned_total > 0 ? "" : " (pinned_vram_capacity unset -- capped to real VRAM pool size instead)")
+                          << " target pins across " << moe_layers << " layer(s)\n";
+            }
 
             // Concentration diagnostic: pinning a FIXED top-K per layer only
             // helps future (unseen) prompts to the extent that layer's
@@ -708,7 +815,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     for (auto& e : v) layer_total += e.count;
                     if (layer_total == 0) continue;
                     uint64_t topk_sum = 0;
-                    int k = std::min(topk, (int)v.size());
+                    int k = global_topn ? std::min(layer_pin_count[layer], (int)v.size())
+                                        : std::min(topk, (int)v.size());
                     for (int i = 0; i < k; ++i) topk_sum += v[i].count;
                     double coverage = (double)topk_sum / (double)layer_total;
                     coverage_sum += coverage;
@@ -721,7 +829,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                               << " total historical selections\n";
                 }
                 if (coverage_n > 0) {
-                    LOG_STREAM_INFO() << "[PIN] Top-" << topk << "/layer concentration: avg "
+                    LOG_STREAM_INFO() << "[PIN] "
+                              << (global_topn ? "global_topn (per-layer K varies, see above)"
+                                              : ("Top-" + std::to_string(topk) + "/layer"))
+                              << " concentration: avg "
                               << (coverage_sum / coverage_n * 100.0) << "% of each layer's historical "
                               << "traffic covered by its pinned set -- most concentrated: layer "
                               << layer_max << " (" << (coverage_max * 100.0) << "%), most uniform: layer "
@@ -734,8 +845,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             }
 
             LOG_STREAM_INFO() << "[PIN] Preloading from " << config.pin_file << " (" << entries.size()
-                      << " known experts, max count " << maxc << "): top-" << topk
-                      << "/layer VRAM-pinned, next " << vram_lru_n << "/layer VRAM-unpinned, next "
+                      << " known experts, max count " << maxc << "): "
+                      << (global_topn ? "global_topn ranking (see above)"
+                                      : ("top-" + std::to_string(topk) + "/layer VRAM-pinned"))
+                      << ", next " << vram_lru_n << "/layer VRAM-unpinned, next "
                       << ram_n << "/layer RAM...\n";
             int pinned = 0, vram_lru = 0, ram_preloaded = 0, attempted = 0;
             // Previously, a preload attempt failing anywhere in this loop
@@ -751,12 +864,26 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             int total_pinned = 0;  // Three-tier: track total pinned count
             for (auto& [layer, v] : by_layer) {
                 int n = (int)v.size();
-                // Three-tier: enforce global pinned capacity per layer
-                int layer_max = topk;
-                if (max_pinned_total > 0) {
-                    layer_max = std::min({topk, (int)v.size(),
-                                         max_pinned_total - total_pinned});
+                // Three-tier: enforce global pinned capacity per layer.
+                // global_topn already computed a final per-layer count
+                // (floor + its share of the global ranking) up front; the
+                // default per_layer_topk path keeps its EXACT original
+                // running-total cap, unchanged.
+                int layer_max;
+                if (global_topn) {
+                    layer_max = layer_pin_count[layer];
+                } else {
+                    layer_max = topk;
+                    if (max_pinned_total > 0) {
+                        layer_max = std::min({topk, (int)v.size(),
+                                             max_pinned_total - total_pinned});
+                    }
                 }
+                // Tier 2/3 start right after however many THIS layer got
+                // pinned -- for per_layer_topk that's always exactly topk
+                // (identical to the original code), but for global_topn it
+                // varies per layer, so it can't be the shared topk anymore.
+                int tier2_start = global_topn ? layer_max : topk;
                 for (int i = 0; i < n && i < layer_max; ++i) {
                     ++attempted;
                     MoEExpertBlock scratch{};
@@ -779,7 +906,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // a normal reactively-evictable slot, just pre-warmed
                 // instead of starting cold. Reuses the exact same
                 // upload_expert() call as Tier 1, just skips pin_expert().
-                for (int i = topk; i < n && i < topk + vram_lru_n; ++i) {
+                for (int i = tier2_start; i < n && i < tier2_start + vram_lru_n; ++i) {
                     ++attempted;
                     MoEExpertBlock scratch{};
                     engine.load_expert_slab(v[i].layer, v[i].expert, scratch);
@@ -804,7 +931,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 int ram_cap = std::min({ram_n, ram_mgr.cap_for_layer(layer),
                                          (int)engine.layers_experts[layer].size()});
                 int slot_idx = 0;
-                for (int i = topk + vram_lru_n; i < n && slot_idx < ram_cap; ++i, ++slot_idx) {
+                for (int i = tier2_start + vram_lru_n; i < n && slot_idx < ram_cap; ++i, ++slot_idx) {
                     ++attempted;
                     MoEExpertBlock& slot = engine.layers_experts[layer][slot_idx];
                     engine.load_expert_slab(v[i].layer, v[i].expert, slot);
