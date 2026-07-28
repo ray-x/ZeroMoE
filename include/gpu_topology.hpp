@@ -268,15 +268,23 @@ public:
     // sync with real occupancy (inserted on upload_expert/
     // upload_expert_async, erased on evict_lru claiming a real victim).
     //
-    // Scope: this is step one of converting expert_vram_cache's linear
-    // scans to O(1) lookups -- only find_expert (the highest-traffic read
-    // site: called on every routed-expert dispatch) is converted so far.
-    // pin_expert/hold_for_compute/release_hold/decay_hit_counts still do
-    // their own linear scans; a later pass can convert them once this one
-    // is proven correct on real hardware. evict_lru's own job (find the
-    // MINIMUM eviction_score across all slots) is a different access
-    // pattern this index doesn't help at all -- it stays a linear scan
-    // regardless of any future index work.
+    // Scope: converting expert_vram_cache's linear scans to O(1) lookups.
+    // find_expert (the highest-traffic read site) was converted first;
+    // hold_for_compute/release_hold were converted next, once find_expert's
+    // pattern was proven correct on real hardware -- a real run found their
+    // OWN unconverted O(n) scans (2x per GPU-dispatched expert, ~63K scans
+    // of a 1322-slot vector in one 40-token request) were the dominant
+    // remaining cause of a large expert=/gpu=+cpu= timing gap, entirely
+    // invisible to lock-contention timers since this is uncontended
+    // CPU work done WHILE holding the lock, not time spent waiting for it
+    // -- see their own comments for the real numbers. pin_expert/
+    // decay_hit_counts still do their own linear scans -- both are much
+    // lower-frequency (pin_expert only on a promotion-to-pin event,
+    // decay_hit_counts only every HIT_DECAY_INTERVAL hits), so converting
+    // them is lower priority; do so if they're ever shown to matter the
+    // same way. evict_lru's own job (find the MINIMUM eviction_score across
+    // all slots) is a different access pattern this index doesn't help at
+    // all -- it stays a linear scan regardless of any future index work.
     //
     // Safety design: find_expert NEVER trusts an index hit blindly -- it
     // re-validates the resolved slot's actual (layer_idx, expert_id,
@@ -769,16 +777,71 @@ public:
     // while a kernel is still reading it. The two pools' backing memory
     // (expert_cache_pool vs active_layer_pool, separate cudaMalloc
     // regions) never overlaps, so device_ptr equality is an unambiguous
-    // disambiguator. Checks expert_vram_cache first, then active_layer_slots.
-    bool hold_for_compute(int layer, int expert_id, const uint8_t* device_ptr) {
+    // disambiguator. `from_active_layer` (see below) tells us which ONE
+    // pool to check -- no need to also scan the other, since a device_ptr
+    // can only ever belong to the pool it was actually allocated from.
+    // BUG FIXED, TAKE 1 (insufficient on its own -- see TAKE 2 below): this
+    // used to be an unconditional O(n) linear scan of expert_vram_cache (up
+    // to 1322 slots in a real run) on EVERY call, even though find_expert
+    // already solved this exact problem with the expert_index O(1) map.
+    // Adding the same index lookup here was a real fix for calls resolved
+    // via the main cache -- but a real re-test showed ZERO measurable
+    // improvement (expert= still ~101s, untimed= unchanged) because on this
+    // workload the DOMINANT resolution path is upload_expert_active/
+    // find_active_expert (the active-layer pool, confirmed by
+    // untimed=17.36s being almost entirely active_up=16.80s) -- and
+    // expert_index only ever maps expert_vram_cache entries, so for an
+    // active-layer-resident expert the index lookup ALWAYS misses, meaning
+    // every call still fell through to the full O(1322) linear scan of
+    // expert_vram_cache (which was NEVER going to find it there), THEN the
+    // active_layer_slots scan that actually finds it. Net effect: paying
+    // for BOTH the pointless O(1322) scan-to-nothing AND the real O(256)
+    // scan, on every hold AND every release, for the dominant case --
+    // strictly worse than doing nothing extra.
+    //
+    // BUG FIXED, TAKE 2 (the actual fix): the caller (expert_ffn_resolve_
+    // gpu_loc, execution_layer.cpp) already knows UNAMBIGUOUSLY which pool
+    // `loc` came from at the exact moment it calls this function -- it's
+    // whichever branch just resolved `loc` (gpu_ctx->loc/upload_expert =
+    // main cache; find_active_expert/upload_expert_active = active layer).
+    // Since the two pools' backing memory (expert_cache_pool vs
+    // active_layer_pool, separate cudaMalloc regions) never overlaps, a
+    // GIVEN device_ptr value can only ever be found in exactly the ONE pool
+    // it actually belongs to -- so once the caller tells us which pool that
+    // is, there is no need to guess-scan the other pool at all, not even as
+    // a fallback (barring the identity-changed-race case this function
+    // already defensively returns false for). from_active_layer is a
+    // REQUIRED parameter (no default) so every call site has to make this
+    // choice deliberately rather than silently falling back to the slow
+    // dual-scan path. expert_index (O(1)) is still used for the main-cache
+    // case; active_layer_slots has no index of its own (capped at
+    // active_layer_capacity, typically 256 -- small enough that a linear
+    // scan of ONLY that pool, with the O(1322) main-cache scan skipped
+    // entirely, is cheap).
+    bool hold_for_compute(int layer, int expert_id, const uint8_t* device_ptr, bool from_active_layer) {
         GPU_TOPO_TIMED_LOCK(lock);
-        for (auto& loc : expert_vram_cache) {
-            if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
-                loc.temp_pin_count++;
-                return true;
+        if (from_active_layer) {
+            for (auto& loc : active_layer_slots) {
+                if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
+                    loc.temp_pin_count++;
+                    return true;
+                }
+            }
+            return false;
+        }
+        uint64_t key = swap_key(layer, expert_id);
+        auto it = expert_index.find(key);
+        if (it != expert_index.end()) {
+            size_t idx = it->second;
+            if (idx < expert_vram_cache.size()) {
+                ExpertLocation& loc = expert_vram_cache[idx];
+                if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
+                    loc.temp_pin_count++;
+                    return true;
+                }
             }
         }
-        for (auto& loc : active_layer_slots) {
+        for (auto& loc : expert_vram_cache) {
             if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
                 loc.temp_pin_count++;
                 return true;
@@ -786,26 +849,43 @@ public:
         }
         return false;
     }
-    void release_hold(int layer, int expert_id, const uint8_t* device_ptr) {
+    void release_hold(int layer, int expert_id, const uint8_t* device_ptr, bool from_active_layer) {
         GPU_TOPO_TIMED_LOCK(lock);
+        if (from_active_layer) {
+            for (auto& loc : active_layer_slots) {
+                if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
+                    if (loc.temp_pin_count > 0) loc.temp_pin_count--;
+                    return;
+                }
+            }
+            LOG_ERROR("[MOE-VRAM]  release_hold (active-layer) found no matching resident slot for "
+                      "layer=%d expert=%d -- a temp-pinned slot's identity changed while held, which "
+                      "should never happen\n", layer, expert_id);
+            return;
+        }
+        uint64_t key = swap_key(layer, expert_id);
+        auto it = expert_index.find(key);
+        if (it != expert_index.end()) {
+            size_t idx = it->second;
+            if (idx < expert_vram_cache.size()) {
+                ExpertLocation& loc = expert_vram_cache[idx];
+                if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
+                    if (loc.temp_pin_count > 0) loc.temp_pin_count--;
+                    return;
+                }
+            }
+        }
         for (auto& loc : expert_vram_cache) {
             if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
                 if (loc.temp_pin_count > 0) loc.temp_pin_count--;
                 return;
             }
         }
-        for (auto& loc : active_layer_slots) {
-            if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
-                if (loc.temp_pin_count > 0) loc.temp_pin_count--;
-                return;
-            }
-        }
-        // No match in either pool: the slot's identity changed between hold
-        // and release, which should be IMPOSSIBLE by construction (evict_lru,
-        // upload_expert_active's victim picker, and cleanup_active_layer_area
-        // must all never pick/clear a temp_pin_count > 0 slot -- see their
-        // own guards). Loud, not silent, since a mismatched hold/release is
-        // exactly the class of bug this mechanism exists to prevent.
+        // No match: the slot's identity changed between hold and release,
+        // which should be IMPOSSIBLE by construction (evict_lru must never
+        // pick/clear a temp_pin_count > 0 slot -- see its own guard). Loud,
+        // not silent, since a mismatched hold/release is exactly the class
+        // of bug this mechanism exists to prevent.
         LOG_ERROR("[MOE-VRAM]  release_hold found no matching resident slot for layer=%d expert=%d "
                   "-- a temp-pinned slot's identity changed while held, which should never happen\n",
                   layer, expert_id);

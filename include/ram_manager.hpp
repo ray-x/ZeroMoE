@@ -466,9 +466,22 @@ public:
             victim.pending_copy_event = nullptr;
         }
 
+        // Previously completely untimed -- see t_vram_demote_copy's own
+        // comment in perf_timer.hpp. Called from GpuTopology's on_vram_evict
+        // callback, itself invoked from inside evict_lru while
+        // GpuTopology::cache_mutex is held by the caller (upload_expert,
+        // upload_expert_async, or promote_active_to_main) -- so this D2H
+        // copy's time also directly extends every other thread's
+        // t_cache_mutex_wait, not just this call's own latency.
+        // ensure_slab_capacity is NOT included in this timer: it's a
+        // possible posix_memalign/free pair, a different (and separately
+        // worth investigating, if this timer turns out small) cost from the
+        // cudaMemcpy itself.
         cudaSetDevice(gpu_id);
         engine.ensure_slab_capacity(victim, total);
+        PERF_START(vram_demote_copy);
         cudaError_t err = cudaMemcpy(victim.slab_buffer, device_ptr, total, cudaMemcpyDeviceToHost);
+        PERF_END(vram_demote_copy, t_vram_demote_copy);
         if (err != cudaSuccess) {
             LOG_WARN("[MOE-RAM] demote_from_vram: cudaMemcpy D2H failed layer=%d expert=%d (%s) -- slot left empty\n",
                       layer, expert_id, cudaGetErrorString(err));

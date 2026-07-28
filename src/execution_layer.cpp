@@ -222,6 +222,13 @@ struct PendingGpuExpert {
     // see expert_ffn_gpu_finish. False for the pre-existing S>=4 cold-batch
     // path and the already-VRAM-resident case, neither of which take a hold.
     bool needs_release = false;
+    // Which pool `loc` resolved from, threaded through so the eventual
+    // release_hold() call (expert_ffn_gpu_finish, possibly much later than
+    // the matching hold_for_compute) can search only that one pool instead
+    // of guess-scanning both -- see hold_for_compute/release_hold's own
+    // comments in gpu_topology.hpp. Only meaningful when needs_release is
+    // true.
+    bool loc_from_active_layer = false;
 };
 
 struct LayerScratch {
@@ -369,12 +376,20 @@ static constexpr int GPU_COLD_BATCH_THRESHOLD = 4;  // amortizes a cold upload
 static const ExpertLocation* expert_ffn_resolve_gpu_loc(
     const ExpertGpuContext* gpu_ctx, int S,
     const GGUFTensor& gate_meta, const GGUFTensor& up_meta, const GGUFTensor& down_meta,
-    bool* out_needs_release
+    bool* out_needs_release, bool* out_loc_from_active_layer
 ) {
     *out_needs_release = false;
     const ExpertLocation* loc = gpu_ctx ? gpu_ctx->loc : nullptr;
     bool vram_resident = loc && loc->device_ptr && loc->layer_idx >= 0;
     if (cpu_only_mode()) vram_resident = false;  // diagnostic: force CPU expert path
+    // Tracks which pool `loc` most recently resolved from, so hold_for_compute/
+    // release_hold (called once this function settles on a final `loc`) can
+    // search ONLY that pool instead of guess-scanning both -- see their own
+    // comments in gpu_topology.hpp for the real cost this avoids. Every
+    // assignment to `loc` below must keep this in sync: false for anything
+    // resolved via the main expert_vram_cache (gpu_ctx->loc, upload_expert),
+    // true for anything resolved via find_active_expert/upload_expert_active.
+    bool loc_from_active_layer = false;
 
     // Batch large enough to amortize a cold upload: fetch synchronously now,
     // since (unlike background promotion) this call needs the data
@@ -428,6 +443,7 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
         loc = gpu_ctx->topo->find_active_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id);
         vram_resident = loc && loc->device_ptr;
         if (vram_resident) {
+            loc_from_active_layer = true;
             LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER HIT layer=%d expert=%d hit_count=%u\n",
                       gpu_ctx->layer_idx, gpu_ctx->expert_id, loc->hit_count);
         } else {
@@ -438,6 +454,7 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
             vram_resident = loc && loc->device_ptr;
 
             if (vram_resident) {
+                loc_from_active_layer = true;
                 LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER layer=%d expert=%d -> temporary upload (no LRU eviction)\n",
                           gpu_ctx->layer_idx, gpu_ctx->expert_id);
             } else {
@@ -445,6 +462,7 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
                 loc = gpu_ctx->topo->upload_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
                                                     gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
                 vram_resident = loc && loc->device_ptr;
+                loc_from_active_layer = false;  // main cache, even though the active-layer branches above ran first
                 if (vram_resident) {
                     LOG_DEBUG("[MOE-VRAM]  COLD-GPU layer=%d expert=%d -> synchronous H2D upload on decode-time "
                               "miss (avoids CPU dequant-matmul fallback)\n",
@@ -567,7 +585,8 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
     // reasoning the decode-time branch already used, just applied
     // everywhere now instead of only there.
     if (gpu_ctx && gpu_ctx->topo) {
-        bool held = gpu_ctx->topo->hold_for_compute(gpu_ctx->layer_idx, gpu_ctx->expert_id, loc->device_ptr);
+        bool held = gpu_ctx->topo->hold_for_compute(gpu_ctx->layer_idx, gpu_ctx->expert_id, loc->device_ptr,
+                                                     loc_from_active_layer);
         if (!held) {
             perf().n_hold_for_compute_fail.fetch_add(1, std::memory_order_relaxed);
             LOG_WARN("[MOE-VRAM]  layer=%d expert=%d: hold_for_compute failed for an apparently-"
@@ -577,6 +596,7 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
             return nullptr;
         }
         *out_needs_release = true;
+        *out_loc_from_active_layer = loc_from_active_layer;
     }
     return loc;
 }
@@ -621,7 +641,7 @@ static void expert_ffn_gpu_finish(
     const GGUFTensor& gate_meta, const GGUFTensor& down_meta,
     int layer_idx, int expert_id,
     int S, int D, int moe_inter,
-    GpuTopology* topo, bool needs_release
+    GpuTopology* topo, bool needs_release, bool loc_from_active_layer
 ) {
     // Each in-flight expert's issue() may have run on a different vault GPU
     // (multi-GPU config) and left a different device "current" on this
@@ -660,7 +680,7 @@ static void expert_ffn_gpu_finish(
     // cold-miss branch now, exactly here and not any earlier. Releasing
     // before this point would reopen the exact eviction-during-compute
     // race the hold exists to prevent.
-    if (needs_release && topo) topo->release_hold(layer_idx, expert_id, loc->device_ptr);
+    if (needs_release && topo) topo->release_hold(layer_idx, expert_id, loc->device_ptr, loc_from_active_layer);
 
     PERF_START(gexp_dn2);
     cudaMemcpy(output, gpu_scratch.d_down, (size_t)S * D * sizeof(float), cudaMemcpyDeviceToHost);
@@ -1119,8 +1139,10 @@ void moe_forward_gguf(
                 : (ram_mgr.vram_cache ? ram_mgr.vram_cache->find_expert(layer_idx, exp->expert_id) : nullptr);
 
             bool needs_release = false;
+            bool loc_from_active_layer = false;
             const ExpertLocation* resolved = expert_ffn_resolve_gpu_loc(
-                &gpu_ctx, 1, exp->gate_proj.meta, exp->up_proj.meta, exp->down_proj.meta, &needs_release);
+                &gpu_ctx, 1, exp->gate_proj.meta, exp->up_proj.meta, exp->down_proj.meta,
+                &needs_release, &loc_from_active_layer);
 
             bool gpu_issued = false;
             if (resolved) {
@@ -1129,7 +1151,7 @@ void moe_forward_gguf(
                                                    exp->gate_proj.meta, exp->up_proj.meta,
                                                    1, D, moe_inter);
                 if (gpu_issued) {
-                    scratch.pending_gpu.push_back({k, exp, resolved, needs_release});
+                    scratch.pending_gpu.push_back({k, exp, resolved, needs_release, loc_from_active_layer});
                 } else {
                     // gpu_scratch.ensure's cudaMalloc genuinely failed (VRAM
                     // exhaustion) -- this expert never got Pass B queued, so
@@ -1139,7 +1161,8 @@ void moe_forward_gguf(
                     // expert). Falls through to the CPU path below like any
                     // other GPU-dispatch failure.
                     if (needs_release && gpu_ctx.topo) {
-                        gpu_ctx.topo->release_hold(layer_idx, exp->expert_id, resolved->device_ptr);
+                        gpu_ctx.topo->release_hold(layer_idx, exp->expert_id, resolved->device_ptr,
+                                                    loc_from_active_layer);
                     }
                     LOG_ERROR("[EXPERT-GPU] layer=%d expert=%d: GPU issue failed (scratch buffer "
                               "grow), falling back to CPU for this call\n", layer_idx, exp->expert_id);
@@ -1194,7 +1217,7 @@ void moe_forward_gguf(
                 scratch.gate_buf.data(), scratch.up_buf.data(), scratch.down_buf.data(),
                 p.exp->gate_proj.meta, p.exp->down_proj.meta,
                 layer_idx, p.exp->expert_id, 1, D, moe_inter,
-                ram_mgr.vram_cache, p.needs_release);
+                ram_mgr.vram_cache, p.needs_release, p.loc_from_active_layer);
             accumulate(p.k, p.exp, scratch.down_buf.data());
         }
 

@@ -179,6 +179,20 @@ struct PerfCounters {
     std::atomic<double> t_staging_mutex_wait{0};  // total time ANY caller (consume_staged/acquire_staging_slot/finish_prefetch) spent BLOCKED acquiring staging_mutex -- high values here directly prove cross-thread contention on this lock, separate from time spent doing real work once held
     std::atomic<double> t_cache_mutex_wait{0};    // total time ANY caller spent BLOCKED acquiring GpuTopology::cache_mutex (find_expert/pin_expert/evict_lru/has_free_slot/upload_expert/upload_expert_async)
 
+    // Three previously COMPLETELY UNTIMED cudaMemcpy calls on the decode-time
+    // hot path, added after a real investigation found expert=101.90s in a
+    // [REQUEST] line but gpu=+cpu= (the only two sub-timers previously
+    // printed) summed to only 16.28s -- an 84% gap with no instrumentation
+    // to explain it. All three run while GpuTopology::cache_mutex is HELD
+    // (see GPU_TOPO_TIMED_LOCK at each call site), so a slow one of these
+    // doesn't just cost its own thread time -- it directly extends
+    // t_cache_mutex_wait for every OTHER thread (the background prefetcher,
+    // primarily) blocked on the same lock. Diagnostic-only: adding these
+    // does not change behavior, only visibility.
+    std::atomic<double> t_active_layer_upload{0};       // GpuTopology::upload_expert_active's H2D cudaMemcpy (decode-time active-layer hot path, gpu_topology.cpp)
+    std::atomic<double> t_active_layer_promote_copy{0}; // GpuTopology::promote_active_to_main's D2D cudaMemcpy (active-layer -> main VRAM cache promotion, gpu_topology.cpp)
+    std::atomic<double> t_vram_demote_copy{0};          // RAMSafetyManager::demote_from_vram's D2H cudaMemcpy (VRAM-evict-to-RAM salvage, ram_manager.hpp) -- fires on ANY eviction when vram_evict_demote_to_ram=true, including ones triggered mid-promotion via the on_vram_evict callback inside promote_active_to_main's own critical section
+
     // Counters
     std::atomic<uint64_t> n_expert_cache_hit{0};
     std::atomic<uint64_t> n_expert_cache_miss{0};
@@ -420,6 +434,7 @@ struct PerfCounters {
         double t_dense_gpu_up=0, t_dense_gpu_compute=0, t_dense_gpu_down=0;
         double t_moe_route=0, t_moe_expert=0, t_prefetch=0, t_dense_load=0, t_consume_staged=0;
         double t_staging_regrow=0, t_staging_mutex_wait=0, t_cache_mutex_wait=0;
+        double t_active_layer_upload=0, t_active_layer_promote_copy=0, t_vram_demote_copy=0;
         uint64_t n_expert_cache_hit=0, n_expert_cache_miss=0, n_expert_promote=0, n_tokens_generated=0;
         uint64_t n_expert_gpu_calls=0, n_expert_cpu_calls=0, n_dense_gpu_calls=0;
         int64_t bytes_disk_read=0, bytes_gpu_uploaded=0;
@@ -445,6 +460,9 @@ struct PerfCounters {
                 t_staging_regrow - b.t_staging_regrow,
                 t_staging_mutex_wait - b.t_staging_mutex_wait,
                 t_cache_mutex_wait - b.t_cache_mutex_wait,
+                t_active_layer_upload - b.t_active_layer_upload,
+                t_active_layer_promote_copy - b.t_active_layer_promote_copy,
+                t_vram_demote_copy - b.t_vram_demote_copy,
                     n_expert_cache_hit - b.n_expert_cache_hit,
                     n_expert_cache_miss - b.n_expert_cache_miss,
                     n_expert_promote - b.n_expert_promote,
@@ -475,6 +493,7 @@ struct PerfCounters {
             t_dense_gpu_up.load(), t_dense_gpu_compute.load(), t_dense_gpu_down.load(),
             t_moe_route.load(), t_moe_expert.load(), t_prefetch.load(), t_dense_load.load(), t_consume_staged.load(),
             t_staging_regrow.load(), t_staging_mutex_wait.load(), t_cache_mutex_wait.load(),
+            t_active_layer_upload.load(), t_active_layer_promote_copy.load(), t_vram_demote_copy.load(),
             n_expert_cache_hit.load(), n_expert_cache_miss.load(), n_expert_promote.load(), n_tokens_generated.load(),
             n_expert_gpu_calls.load(), n_expert_cpu_calls.load(), n_dense_gpu_calls.load(),
             bytes_disk_read.load(), bytes_gpu_uploaded.load(),
@@ -549,6 +568,16 @@ struct PerfCounters {
         // expert_ffn's own per-call GPU round trip, not cache-promotion
         // slab uploads bleeding in from a shared bucket.
         double gpu_round_trip = d.t_expert_gpu_upload + d.t_gpu_compute + d.t_gpu_download;
+        // Diagnostic addition (see t_active_layer_upload's own comment): these
+        // three previously had ZERO instrumentation, and were the leading
+        // hypothesis for why expert= vastly exceeded gpu=+cpu= in every prior
+        // [REQUEST] line. lock_wait (t_cache_mutex_wait) is separate from
+        // "untimed" -- it's SEPARATELY instrumented already, just never
+        // printed here before; surfaced alongside so a large "untimed" total
+        // caused by lock contention (as opposed to genuinely necessary copy
+        // time) is visible in the SAME line instead of requiring a
+        // shutdown-only dump_report() correlation.
+        double untimed_total = d.t_active_layer_upload + d.t_active_layer_promote_copy + d.t_vram_demote_copy;
         uint64_t hits = d.n_expert_cache_hit, misses = d.n_expert_cache_miss;
         uint64_t gcalls = d.n_expert_gpu_calls, ccalls = d.n_expert_cpu_calls;
         double tok_s = wall_ms > 0 ? n_tokens / (wall_ms / 1000.0) : 0.0;
@@ -556,7 +585,8 @@ struct PerfCounters {
         LOG_INFO(
             "[%s] %d tokens in %.2fs (%.2f tok/s)  attn=%.2fs [preamble=%.2f norm=%.2f qproj=%.2f kvproj=%.2f "
             "absorb=%.2f score=%.2f outproj=%.2f] route=%.2fs "
-            "expert=%.2fs (gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs] cpu=%.2fs [dequant=%.2fs dot=%.2fs]) "
+            "expert=%.2fs (gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs] cpu=%.2fs [dequant=%.2fs dot=%.2fs] "
+            "untimed=%.2fs [active_up=%.2fs promote_copy=%.2fs vram_demote=%.2fs] lock_wait=%.2fs) "
             "dense_gpu=%.2fs [up=%.2fs cmp=%.2fs dn=%.2fs calls=%llu] "
             "disk=%.2fs  cache=%.0f%% hit  expert_calls=%lluGPU/%lluCPU "
             "pipe=%llu(pin_skip=%llu pin=%llu)\n",
@@ -567,6 +597,8 @@ struct PerfCounters {
             d.t_moe_route, d.t_moe_expert,
             gpu_round_trip, d.t_expert_gpu_upload, d.t_gpu_compute, d.t_gpu_download, d.t_cpu_expert,
             d.t_cpu_dequant, d.t_cpu_dot,
+            untimed_total, d.t_active_layer_upload, d.t_active_layer_promote_copy, d.t_vram_demote_copy,
+            d.t_cache_mutex_wait,
             dense_gpu_total, d.t_dense_gpu_up, d.t_dense_gpu_compute, d.t_dense_gpu_down,
             (unsigned long long)d.n_dense_gpu_calls,
             d.t_disk_read,

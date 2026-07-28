@@ -103,11 +103,18 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
         return nullptr;
     }
 
-    // Synchronous upload (decode-thread-only, no async needed)
+    // Synchronous upload (decode-thread-only, no async needed). Previously
+    // completely untimed -- see t_active_layer_upload's own comment in
+    // perf_timer.hpp for why this specific call was the leading suspect for
+    // the expert=/gpu=+cpu= gap. This runs while cache_mutex (held by the
+    // GPU_TOPO_TIMED_LOCK above) is locked, so a slow copy here also directly
+    // extends every OTHER thread's t_cache_mutex_wait, not just this one.
     size_t copy_bytes = std::min(bytes, victim->size);
     cudaSetDevice(victim->gpu_id);
+    PERF_START(active_layer_upload);
     cudaError_t err = cudaMemcpy(victim->device_ptr, host_data, copy_bytes,
                                 cudaMemcpyHostToDevice);
+    PERF_END(active_layer_upload, t_active_layer_upload);
     if (err != cudaSuccess) {
         LOG_STREAM_ERROR() << "[GPU] Failed to upload expert to active layer: "
                            << cudaGetErrorString(err) << "\n";
@@ -237,9 +244,17 @@ ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,
         on_vram_evict(old_layer, old_expert, slot->device_ptr, slot->size, slot->gpu_id);
     }
 
+    // Previously completely untimed -- see t_active_layer_promote_copy's own
+    // comment in perf_timer.hpp. Also note on_vram_evict above (when the
+    // victim slot needed eviction) may ALSO have just run a synchronous D2H
+    // cudaMemcpy inside demote_from_vram, itself now timed separately into
+    // t_vram_demote_copy -- both can fire in the same call, both under this
+    // same held cache_mutex.
     size_t copy_bytes = std::min(bytes, slot->size);
     cudaSetDevice(slot->gpu_id);
+    PERF_START(active_layer_promote_copy);
     cudaError_t err = cudaMemcpy(slot->device_ptr, device_src, copy_bytes, cudaMemcpyDeviceToDevice);
+    PERF_END(active_layer_promote_copy, t_active_layer_promote_copy);
     if (err != cudaSuccess) {
         LOG_STREAM_ERROR() << "[GPU] Active-layer promotion D2D copy failed: "
                            << cudaGetErrorString(err) << "\n";

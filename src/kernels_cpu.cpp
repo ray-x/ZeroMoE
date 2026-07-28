@@ -400,11 +400,12 @@ void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k) {
         for (int n = 0; n < QK_K; n += 128) {
             int shift = 0;
             for (int j = 0; j < 4; ++j) {
-                float dl0 = d_all * (scales[is++] - 32);
+                // Q3_K scales are transposed: group 1 uses is+j, group 2 uses is+j+4
+                float dl0 = d_all * (scales[is + j] - 32);
                 dequant_q3k_group16(q, hm, m, shift, dl0, yy);
                 yy += 16;
 
-                float dl1 = d_all * (scales[is++] - 32);
+                float dl1 = d_all * (scales[is + j + 4] - 32);
                 dequant_q3k_group16(q + 16, hm + 16, m, shift, dl1, yy);
                 yy += 16;
 
@@ -412,6 +413,7 @@ void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k) {
                 m = (uint8_t)(m << 1);
             }
             q += 32;
+            is += 8; // Advance scale block for the next 128 elements
         }
     }
 }
