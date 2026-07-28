@@ -26,9 +26,8 @@ __constant__ float d_iq2m_grid[4] = {-1.0f, -0.333f, 0.333f, 1.0f};
 __global__ void kernel_dequant_iq2m(
     float* __restrict__ output,
     const uint8_t* __restrict__ weights,
-    int n_blocks  // number of 256-element super-blocks
+    int n_blocks 
 ) {
-    // Shared memory codebook (loaded once per block)
     __shared__ float s_grid[4];
     if (threadIdx.x < 4) {
         s_grid[threadIdx.x] = d_iq2m_grid[threadIdx.x];
@@ -38,30 +37,24 @@ __global__ void kernel_dequant_iq2m(
     int block_idx = blockIdx.x;
     if (block_idx >= n_blocks) return;
 
-    int tid = threadIdx.x;  // 0..255, one per output element
+    int tid = threadIdx.x;  
     if (tid >= 256) return;
 
-    // Pointer to this super-block (84 bytes each)
     const uint8_t* blk = weights + (size_t)block_idx * 84;
     
-    // Extract the super-block scale (stored as FP16)
     uint16_t scale_u16 = *(const uint16_t*)blk;
     float scale = __half2float(*(const half*)&scale_u16);
 
-    // Extract 2-bit quantized value for element tid
-    // qs layout: 4 values per byte, 64 bytes = 256 values
     int byte_idx = tid / 4;
     int shift = (tid % 4) * 2;
-    uint8_t q_byte = blk[2 + byte_idx];  // skip 2-byte scale
+    uint8_t q_byte = blk[2 + byte_idx];  
     int q_val = (q_byte >> shift) & 0x03;
 
-    // Extract sign bit
     int sign_byte_idx = tid / 8;
     int sign_bit_idx = tid % 8;
-    uint8_t sign_byte = blk[66 + sign_byte_idx];  // after scale(2) + qs(64)
+    uint8_t sign_byte = blk[66 + sign_byte_idx];  
     float sign = (sign_byte >> sign_bit_idx) & 1 ? -1.0f : 1.0f;
 
-    // Codebook lookup + scale application
     float value = s_grid[q_val] * sign * scale;
     output[(size_t)block_idx * 256 + tid] = value;
 }
@@ -79,67 +72,51 @@ __global__ void kernel_iq2m_matmul(
     if (threadIdx.x < 4) s_grid[threadIdx.x] = d_iq2m_grid[threadIdx.x];
     __syncthreads();
 
-    int o = blockIdx.x;  // output column
-    int s = blockIdx.y;  // sequence position
-    int tid = threadIdx.x;
+    int o = blockIdx.x;  
+    int s = blockIdx.y;  
+    int tid = threadIdx.x; // 0..255 (One thread per super-block element)
 
     if (o >= O || s >= S) return;
 
-    // Each row of W is I elements = I/256 super-blocks, each 84 bytes
     int blocks_per_row = I / 256;
     const uint8_t* w_row = weights + (size_t)o * blocks_per_row * 84;
     const float* x_row = x + (size_t)s * I;
 
     float partial_sum = 0.0f;
 
-    // Each thread handles multiple super-blocks strided by blockDim.x
-    for (int blk_start = tid; blk_start < blocks_per_row; blk_start += blockDim.x) {
-        const uint8_t* blk = w_row + (size_t)blk_start * 84;
-        float scale = __half2float(*(const half*)blk);
+    for (int b = 0; b < blocks_per_row; ++b) {
+        const uint8_t* blk = w_row + (size_t)b * 84;
         
-        // Dequant and dot-product for all 256 elements in this block
-        float block_dot = 0.0f;
-        const float* x_blk = x_row + blk_start * 256;
+        // Coalesced Scale Fetch
+        uint16_t scale_u16 = *(const uint16_t*)blk;
+        float scale = __half2float(*(const half*)&scale_u16);
+        
+        // Coalesced Grid/Sign Fetch
+        int byte_idx = tid / 4;
+        int shift = (tid % 4) * 2;
+        uint8_t q_byte = blk[2 + byte_idx];
+        int q_val = (q_byte >> shift) & 0x03;
 
-        for (int i = 0; i < 256; i += 4) {
-            int byte_idx = i / 4;
-            uint8_t q_byte = blk[2 + byte_idx];
-            int sign_byte_idx = i / 8;
-            uint8_t sign_byte = blk[66 + sign_byte_idx];
-
-            for (int j = 0; j < 4; ++j) {
-                int idx = i + j;
-                int q_val = (q_byte >> (j * 2)) & 0x03;
-                float sign = ((sign_byte >> (idx % 8)) & 1) ? -1.0f : 1.0f;
-                float w_val = s_grid[q_val] * sign * scale;
-                block_dot += x_blk[idx] * w_val;
-            }
-        }
-        partial_sum += block_dot;
+        int sign_byte_idx = tid / 8;
+        int sign_bit_idx = tid % 8;
+        uint8_t sign_byte = blk[66 + sign_byte_idx];
+        float sign = ((sign_byte >> sign_bit_idx) & 1) ? -1.0f : 1.0f;
+        
+        float w_val = s_grid[q_val] * sign * scale;
+        partial_sum += x_row[b * 256 + tid] * w_val;
     }
 
-    // Warp reduction
-    unsigned mask = 0xffffffff;
-    for (int offset = 16; offset > 0; offset /= 2) {
-        partial_sum += __shfl_down_sync(mask, partial_sum, offset);
-    }
-
-    // Block reduction via shared memory
-    __shared__ float s_sum[32];
-    int lane = tid % 32;
-    int warp = tid / 32;
-    if (lane == 0) s_sum[warp] = partial_sum;
+    // Standard block reduction
+    __shared__ float sm[256];
+    sm[tid] = partial_sum;
     __syncthreads();
 
-    if (warp == 0) {
-        partial_sum = (lane < (blockDim.x / 32)) ? s_sum[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2) {
-            partial_sum += __shfl_down_sync(mask, partial_sum, offset);
-        }
-        if (lane == 0) {
-            y[(size_t)s * O + o] = partial_sum;
-        }
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) sm[tid] += sm[tid + stride];
+        __syncthreads();
     }
+
+    if (tid == 0) y[(size_t)s * O + o] = sm[0];
 }
 
 // Host-callable launchers

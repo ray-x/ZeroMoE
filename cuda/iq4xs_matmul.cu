@@ -12,34 +12,16 @@
 // d(2) + scales_h(2) + scales_l[4] + qs[128] = 136 bytes/256 elems
 // (4.25 bits/weight, matches this project's own row_bytes() table).
 //
-// Added because a direct throughput benchmark (main_test.cpp Test 8) found
-// this checkpoint's ~4-5 CPU-bound layers (down=IQ4_XS, confirmed via the
-// [QUANT] startup report) can NEVER dispatch to GPU regardless of caching/
-// pinning -- a fixed floor cost paid every token on every one of those
-// layers. Kernel structure (grid(O,S), 256 threads, thread-0 verbatim
-// dequant into shared mem, 256-way dot + tree-reduce) is identical to
-// kquant_matmul.cu's KQUANT_MATMUL_KERNEL macro, reused here rather than
-// duplicated by name (this file doesn't share a translation unit with that
-// one, and this project has no relocatable device code / -rdc=true, so a
-// standalone macro instantiation here is consistent with how iq3_matmul.cu
-// already keeps its own copy rather than sharing iq2_matmul.cu's).
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
 #define QK_K 256
 
-// Field order matches ggml's real block_iq4_xs (ggml-common.h) EXACTLY --
-// d, scales_h, scales_l, qs, in that order. Getting this wrong (as
-// happened once before with block_q3_K's field order, see
-// kquant_matmul.cu's own comment on that bug) compiles fine but silently
-// reinterprets every field at the wrong byte offset.
-struct block_iq4_xs_cu { __half d; uint16_t scales_h; uint8_t scales_l[QK_K/64]; uint8_t qs[QK_K/2]; }; // 2+2+4+128=136
+// Field order matches ggml's real block_iq4_xs exactly
+struct block_iq4_xs_cu { __half d; uint16_t scales_h; uint8_t scales_l[QK_K/64]; uint8_t qs[QK_K/2]; }; // 136 bytes
 
-// Fixed 16-entry non-linear lookup table (ggml's kvalues_iq4nl), copied
-// once into constant memory. Host data comes from src/ggml_grids.cpp's
-// ms_grid_kvalues_iq4nl() accessor -- the actual table VALUES are never
-// duplicated/hand-transcribed here, only referenced via that host pointer.
 __constant__ int8_t c_kvalues_iq4nl[16];
 
 extern "C" {
@@ -53,60 +35,90 @@ static void init_iq4xs_table() {
     iq4xs_table_ready = true;
 }
 
-// Verbatim port of ggml's dequantize_row_iq4_xs. Per 32-element sub-block
-// (8 per 256-element super-block): a 6-bit scale index `ls` is assembled
-// from a shared nibble in scales_l (2 sub-blocks share one byte) plus 2
-// high bits from scales_h (one uint16 covering all 8 sub-blocks, 2 bits
-// each) -- `dl = d * (ls - 32)` is the resulting per-sub-block scale. Each
-// of the 16 packed bytes in qs then yields TWO output elements via the
-// fixed lookup table: low nibble -> y[j+0], high nibble -> y[j+16] -- note
-// this is NOT simple sequential unpacking, the low-nibble half fills
-// positions 0-15 and the high-nibble half fills 16-31, not interleaved
-// per-byte.
-__device__ void dequant_iq4_xs_block(const block_iq4_xs_cu* xb, float* y) {
-    const uint8_t* qs = xb->qs;
-    const float d = __half2float(xb->d);
-    for (int ib = 0; ib < QK_K / 32; ++ib) {
-        const int ls = ((xb->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) |
-                        (((xb->scales_h >> (2 * ib)) & 3) << 4);
-        const float dl = d * (float)(ls - 32);
-        for (int j = 0; j < 16; ++j) {
-            y[j +  0] = dl * (float)c_kvalues_iq4nl[qs[j] & 0xf];
-            y[j + 16] = dl * (float)c_kvalues_iq4nl[qs[j] >>  4];
-        }
-        y  += 32;
-        qs += 16;
-    }
-}
-
-// ---- fused matmul: thread-0 verbatim dequant of a super-block + 256-way dot ----
-// Identical structure to kquant_matmul.cu's KQUANT_MATMUL_KERNEL macro,
-// instantiated directly here (not shared across translation units -- see
-// this file's header comment).
+// ---- fused matmul (cooperative parallel dequant + warp-level dot reduction) ----
 __global__ void iq4_xs_matmul_kernel(
     float* __restrict__ y, const float* __restrict__ x, const block_iq4_xs_cu* __restrict__ W,
     int S, int I, int O)
 {
-    int o = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
+    int o = blockIdx.x;
+    int s = blockIdx.y;
+    int tid = threadIdx.x;
+    
     if (o >= O || s >= S) return;
-    int bpr = I / 256;
+    
+    int bpr = I / QK_K;
     const block_iq4_xs_cu* w_row = W + (size_t)o * bpr;
     const float* x_row = x + (size_t)s * I;
-    __shared__ float yq[256];
+
+    // Pre-compute mathematical thread-mappings for cooperative dequantization
+    // tid ranges from 0 to 255. 
+    // There are 8 sub-blocks of 32 elements.
+    const int ib = tid >> 5;                  // 0..7 (sub-block index)
+    const int local_tid = tid & 31;           // 0..31 (index within sub-block)
+    const int j = local_tid & 15;             // 0..15 (byte index within qs)
+    const int is_high = local_tid >> 4;       // 0 or 1 (low nibble or high nibble)
+    
+    // Pre-compute scale shifts
+    const int scales_l_idx = ib >> 1;
+    const int scales_l_shift = (ib & 1) << 2; // 0 or 4
+    const int scales_h_shift = ib << 1;       // 0, 2, 4, ... 14
+
     float acc = 0.0f;
+
     for (int b = 0; b < bpr; ++b) {
-        if (tid == 0) dequant_iq4_xs_block(&w_row[b], yq);
-        __syncthreads();
-        if (tid < 256) acc += x_row[b * 256 + tid] * yq[tid];
-        __syncthreads();
+        // Cooperative Dequantization: each thread computes exactly 1 weight directly in-register
+        const float d = __half2float(w_row[b].d);
+        
+        // Extract 6-bit scale index `ls`
+        const uint8_t scales_l_val = w_row[b].scales_l[scales_l_idx];
+        const uint16_t scales_h_val = w_row[b].scales_h;
+        
+        const int ls = ((scales_l_val >> scales_l_shift) & 0xf) |
+                       (((scales_h_val >> scales_h_shift) & 3) << 4);
+                       
+        const float dl = d * (float)(ls - 32);
+        
+        // Extract the correct nibble for this specific thread
+        const uint8_t qs_byte = w_row[b].qs[(ib << 4) + j];
+        const int nibble = (qs_byte >> (is_high << 2)) & 0xf;
+        
+        // Lookup non-linear value and apply scale
+        const float w_val = dl * (float)c_kvalues_iq4nl[nibble];
+        
+        // Immediate FMA without shared memory staging
+        acc += x_row[(b * QK_K) + tid] * w_val;
     }
-    __shared__ float sm[256];
-    sm[tid] = acc; __syncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) sm[tid] += sm[tid + stride];
-        __syncthreads();
+
+    // Warp-level shuffle reduction (far faster than block-wide shared memory tree)
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
     }
-    if (tid == 0) y[(size_t)s * O + o] = sm[0];
+
+    // Collect warp sums into shared memory
+    __shared__ float warp_sums[8];
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
+
+    if (lane_id == 0) {
+        warp_sums[warp_id] = acc;
+    }
+    __syncthreads();
+
+    // Final reduction of the 8 warp sums by the first warp
+    if (warp_id == 0) {
+        float sum = (lane_id < 8) ? warp_sums[lane_id] : 0.0f;
+        
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            sum += __shfl_down_sync(0x000000ff, sum, offset);
+        }
+        
+        // Thread 0 writes the final dot product for this (s, o) pair
+        if (tid == 0) {
+            y[(size_t)s * O + o] = sum;
+        }
+    }
 }
 
 extern "C" void launch_iq4_xs_matmul(float* y, const float* x, const void* w, int S, int I, int O) {

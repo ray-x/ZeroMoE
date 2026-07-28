@@ -1,25 +1,21 @@
 // kv_quant.cu — 4-bit KV cache quantization and dequantization kernels
-// Compresses KV cache entries from FP32 to Q4_0 on write (saves 8x VRAM),
-// dequantizes on-the-fly during attention score computation.
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
-// Q4_0 block: 32 values packed into 18 bytes (2-byte scale + 16-byte data)
+// Q4_0 block: 32 values packed into 18 bytes
 struct BlockQ4_KV {
-    half d;           // Block scale factor
-    uint8_t qs[16];   // 32 x 4-bit values, 2 per byte
+    half d;           
+    uint8_t qs[16];   
 };
 
 // ============================================================
-// Quantize FP32 → Q4_0: called when writing to KV cache
-// Each thread block quantizes 32 elements (one Q4_0 block).
-// Grid: (num_blocks), Block: (32) threads
+// Quantize FP32 → Q4_0 (Optimized: Single Global Read)
 // ============================================================
 __global__ void kv_quantize_q4_kernel(
     BlockQ4_KV* __restrict__ output,
     const float* __restrict__ input,
-    int n_elements  // must be multiple of 32
+    int n_elements  
 ) {
     int block_idx = blockIdx.x;
     int tid = threadIdx.x;  // 0..31
@@ -27,88 +23,86 @@ __global__ void kv_quantize_q4_kernel(
 
     if (base + 31 >= n_elements) return;
 
-    // Load and find absmax (warp-level reduction)
+    // 1. Load exactly once from global memory and cache
     float val = input[base + tid];
+    __shared__ float s_vals[32];
+    s_vals[tid] = val;
+    __syncthreads(); 
+
     float abs_val = fabsf(val);
 
-    // Warp reduction for max
+    // 2. Warp reduction for max
+    #pragma unroll
     for (int offset = 16; offset > 0; offset /= 2) {
         abs_val = fmaxf(abs_val, __shfl_down_sync(0xffffffff, abs_val, offset));
     }
+    
+    // Broadcast amax to all threads in the warp directly
+    float amax = __shfl_sync(0xffffffff, abs_val, 0);
 
-    __shared__ float s_amax;
-    if (tid == 0) s_amax = abs_val;
-    __syncthreads();
-    float amax = s_amax;
-
-    // Compute scale
-    float scale = amax / 7.0f;  // Q4_0 range: [-8, 7], but asymmetric offset
+    float scale = amax / 7.0f;  
     if (scale < 1e-12f) scale = 1e-12f;
     float inv_scale = 1.0f / scale;
 
-    // Quantize: map to [0, 15] unsigned with bias 8
-    int q_val = __float2int_rn(val * inv_scale) + 8;
-    q_val = max(0, min(15, q_val));
-
-    // Pack pairs of 4-bit values into bytes
-    // Thread tid and tid+16 share a byte (tid in low nibble, tid+16 in high)
-    __shared__ uint8_t s_packed[16];
+    // 3. Threads 0-15 pack the values (coalesced write)
     if (tid < 16) {
-        // Low nibble from thread tid, high nibble from thread tid+16
-        int q_lo = __float2int_rn(input[base + tid * 2] * inv_scale) + 8;
-        int q_hi = __float2int_rn(input[base + tid * 2 + 1] * inv_scale) + 8;
+        int q_lo = __float2int_rn(s_vals[tid * 2] * inv_scale) + 8;
+        int q_hi = __float2int_rn(s_vals[tid * 2 + 1] * inv_scale) + 8;
         q_lo = max(0, min(15, q_lo));
         q_hi = max(0, min(15, q_hi));
-        s_packed[tid] = (uint8_t)((q_hi << 4) | q_lo);
-    }
-    __syncthreads();
-
-    // Thread 0 writes the block
-    if (tid == 0) {
-        output[block_idx].d = __float2half(scale);
-        for (int i = 0; i < 16; ++i) {
-            output[block_idx].qs[i] = s_packed[i];
+        
+        output[block_idx].qs[tid] = (uint8_t)((q_hi << 4) | q_lo);
+        
+        if (tid == 0) {
+            output[block_idx].d = __float2half(scale);
         }
     }
 }
 
 // ============================================================
-// Dequantize Q4_0 → FP32: called during attention to unpack KV
-// Each thread block handles one Q4_0 block (32 output floats).
+// Dequantize Q4_0 → FP32 (Optimized: Cooperative Load)
 // ============================================================
 __global__ void kv_dequantize_q4_kernel(
     float* __restrict__ output,
     const BlockQ4_KV* __restrict__ input,
     int n_blocks
 ) {
-    int block_idx = blockIdx.x * blockDim.x / 32 + threadIdx.x / 32;
+    int block_idx = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
     int lane = threadIdx.x % 32;
     if (block_idx >= n_blocks) return;
 
     float scale = __half2float(input[block_idx].d);
-    int byte_idx = lane / 2;
-    uint8_t packed = input[block_idx].qs[byte_idx];
+    
+    // Threads 0-15 cleanly read the 16 bytes (no duplicated access)
+    uint8_t my_byte = 0;
+    if (lane < 16) {
+        my_byte = input[block_idx].qs[lane];
+    }
+    
+    // Broadcast byte `k` to threads `k*2` and `k*2+1`
+    uint8_t packed = __shfl_sync(0xffffffff, my_byte, lane / 2);
+    
     int q_val = (lane % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
-    float value = ((float)q_val - 8.0f) * scale;
-
-    output[block_idx * 32 + lane] = value;
+    output[block_idx * 32 + lane] = ((float)q_val - 8.0f) * scale;
 }
 
 // ============================================================
-// Fused: Dot product of query vector against Q4_0-quantized KV cache row
-// Avoids materializing the full dequantized row.
-// One block per (head, time_step) pair.
+// Fused Dot Product (Optimized: 1 Warp = 1 Block)
 // ============================================================
 __global__ void kv_q4_dot_kernel(
-    float* __restrict__ scores,       // [n_queries, context_len]
-    const float* __restrict__ queries, // [n_queries, dim]
-    const BlockQ4_KV* __restrict__ kv_cache, // [context_len, dim/32] blocks
+    float* __restrict__ scores,       
+    const float* __restrict__ queries, 
+    const BlockQ4_KV* __restrict__ kv_cache, 
     int n_queries, int dim, int context_len,
     float scale_factor
 ) {
     int q_idx = blockIdx.y;
     int t_idx = blockIdx.x;
     int tid = threadIdx.x;
+    int lane = tid % 32;
+    int warp = tid / 32;
+    int num_warps = blockDim.x / 32;
+
     if (q_idx >= n_queries || t_idx >= context_len) return;
 
     int blocks_per_entry = dim / 32;
@@ -116,35 +110,48 @@ __global__ void kv_q4_dot_kernel(
     const BlockQ4_KV* kv_row = kv_cache + (int64_t)t_idx * blocks_per_entry;
 
     float partial_sum = 0.0f;
-    for (int b = tid; b < blocks_per_entry; b += blockDim.x) {
-        float kv_scale = __half2float(kv_row[b].d);
-        const float* q_block = q + b * 32;
 
-        float block_dot = 0.0f;
-        for (int i = 0; i < 16; ++i) {
-            uint8_t packed = kv_row[b].qs[i];
-            float v0 = ((float)(packed & 0x0F) - 8.0f) * kv_scale;
-            float v1 = ((float)(packed >> 4) - 8.0f) * kv_scale;
-            block_dot += q_block[i * 2] * v0 + q_block[i * 2 + 1] * v1;
+    // Warp cooperatively processes Q4_0 blocks
+    for (int b = warp; b < blocks_per_entry; b += num_warps) {
+        float kv_scale = __half2float(kv_row[b].d);
+        
+        // Cooperative coalesced read of 16-byte quantized data
+        uint8_t my_byte = 0;
+        if (lane < 16) {
+            my_byte = kv_row[b].qs[lane];
         }
-        partial_sum += block_dot;
+        uint8_t packed = __shfl_sync(0xffffffff, my_byte, lane / 2);
+        
+        int q_val = (lane % 2 == 0) ? (packed & 0x0F) : (packed >> 4);
+        float kv_val = ((float)q_val - 8.0f) * kv_scale;
+
+        // Perfectly coalesced 32-float read for queries
+        float q_val_f = q[b * 32 + lane];
+        
+        partial_sum += q_val_f * kv_val;
     }
 
-    // Warp reduction
-    for (int offset = 16; offset > 0; offset /= 2)
+    // Fast Warp Reduction
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
         partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+    }
 
+    // Collect warp sums and reduce across the block
     __shared__ float s_sum[32];
-    int lane = tid % 32, warp = tid / 32;
     if (lane == 0) s_sum[warp] = partial_sum;
     __syncthreads();
 
     if (warp == 0) {
-        partial_sum = (lane < blockDim.x / 32) ? s_sum[lane] : 0.0f;
-        for (int offset = 16; offset > 0; offset /= 2)
-            partial_sum += __shfl_down_sync(0xffffffff, partial_sum, offset);
+        float block_sum = (lane < num_warps) ? s_sum[lane] : 0.0f;
+        
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            block_sum += __shfl_down_sync(0xffffffff, block_sum, offset);
+        }
+        
         if (lane == 0) {
-            scores[(int64_t)q_idx * context_len + t_idx] = partial_sum * scale_factor;
+            scores[(int64_t)q_idx * context_len + t_idx] = block_sum * scale_factor;
         }
     }
 }
@@ -167,7 +174,7 @@ extern "C" void launch_kv_dequantize_q4(float* output, const void* input, int n_
 extern "C" void launch_kv_q4_dot(float* scores, const float* queries, const void* kv_cache,
                                   int n_queries, int dim, int context_len, float scale) {
     dim3 grid(context_len, n_queries);
-    dim3 block(128);
+    dim3 block(128); // Safely sets 4 warps per block
     kv_q4_dot_kernel<<<grid, block>>>(scores, queries, (const BlockQ4_KV*)kv_cache,
                                        n_queries, dim, context_len, scale);
 }

@@ -12,31 +12,19 @@
 // super-block into shared mem (verbatim port), all 256 threads dot one element
 // each, accumulate per-thread, then tree-reduce. Correctness-first; the
 // serial dequant by thread 0 is an optimization target (parallelize elementwise).
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
 #define QK_K 256
 
-struct block_q2_K_cu { uint8_t scales[16]; uint8_t qs[64]; __half d; __half dmin; };          // 84
-struct block_q4_K_cu { __half d; __half dmin; uint8_t scales[12]; uint8_t qs[128]; };          // 144
-struct block_q5_K_cu { __half d; __half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; }; // 176
-struct block_q6_K_cu { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; __half d; };        // 210
-// Field order matches ggml's real block_q3_K (ggml-common.h) EXACTLY --
-// hmask, qs, scales, d, in that order. An earlier version of this struct had
-// the fields in a different order (d first), which compiles fine (same
-// total size, 110 bytes) but silently reinterprets every field at the wrong
-// byte offset -- e.g. xb->d would read bytes that are actually the start of
-// hmask, producing a garbage fp16 "scale" that can itself be NaN/Inf, or a
-// huge finite value that overflows downstream. Caught by src/main_test.cpp's
-// Test 5 (CUDA fused kernel vs CPU reference on real ggml-quantized bytes),
-// which is exactly the class of bug that test exists to catch: this
-// compiled and ran without crashing, it just silently produced wrong (NaN)
-// numbers -- structurally identical to the row_bytes() stride bug that
-// caused an actual SIGSEGV earlier in Q3_K's sibling IQ3_XXS kernel.
-struct block_q3_K_cu { uint8_t hmask[QK_K/8]; uint8_t qs[QK_K/4]; uint8_t scales[12]; __half d; }; // 110
+struct block_q2_K_cu { uint8_t scales[16]; uint8_t qs[64]; __half d; __half dmin; };          
+struct block_q4_K_cu { __half d; __half dmin; uint8_t scales[12]; uint8_t qs[128]; };          
+struct block_q5_K_cu { __half d; __half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; }; 
+struct block_q6_K_cu { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; __half d; };        
+struct block_q3_K_cu { uint8_t hmask[QK_K/8]; uint8_t qs[QK_K/4]; uint8_t scales[12]; __half d; }; 
 
-// ---- dequant ports (from ggml-quants.c) ----
 __device__ inline void get_scale_min_k4_d(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
     if (j < 4) {
         *d = q[j] & 63; *m = q[j + 4] & 63;
@@ -46,123 +34,140 @@ __device__ inline void get_scale_min_k4_d(int j, const uint8_t* q, uint8_t* d, u
     }
 }
 
-__device__ void dequant_q2_K_block(const block_q2_K_cu* xb, float* y) {
+// ----------------------------------------------------------------------------
+// COOPERATIVE DEQUANTIZATION
+// Each thread computes exactly one float output based on its `tid` (0 to 255).
+// ----------------------------------------------------------------------------
+
+__device__ void dequant_q2_K_block_coop(const block_q2_K_cu* xb, float* y, int tid) {
     const float d   = __half2float(xb->d);
     const float min = __half2float(xb->dmin);
-    const uint8_t* q = xb->qs;
-    int is = 0;
-    float dl, ml;
-    for (int n = 0; n < QK_K; n += 128) {
-        int shift = 0;
-        for (int j = 0; j < 4; ++j) {
-            uint8_t sc = xb->scales[is++];
-            dl = d * (sc & 0xF); ml = min * (sc >> 4);
-            for (int l = 0; l < 16; ++l) y[n + j*32 + l] = dl * ((int8_t)((q[l] >> shift) & 3)) - ml;
-            sc = xb->scales[is++];
-            dl = d * (sc & 0xF); ml = min * (sc >> 4);
-            for (int l = 0; l < 16; ++l) y[n + j*32 + 16 + l] = dl * ((int8_t)((q[l+16] >> shift) & 3)) - ml;
-            shift += 2;
-        }
-        q += 32;
+    
+    int n_idx = tid / 128;            // 0 or 1
+    int j = (tid % 128) / 32;         // 0..3
+    int l = tid % 32;                 // 0..31
+
+    int is = n_idx * 8 + j * 2;
+    int shift = j * 2;
+    const uint8_t* q_chunk = xb->qs + n_idx * 32;
+
+    uint8_t sc = (l < 16) ? xb->scales[is] : xb->scales[is + 1];
+    float dl = d * (sc & 0xF);
+    float ml = min * (sc >> 4);
+    
+    y[tid] = dl * ((int8_t)((q_chunk[l] >> shift) & 3)) - ml;
+}
+
+__device__ void dequant_q4_K_block_coop(const block_q4_K_cu* xb, float* y, int tid) {
+    const float d   = __half2float(xb->d);
+    const float min = __half2float(xb->dmin);
+
+    int chunk = tid / 64;             // 0..3
+    int l = tid % 64;                 // 0..63
+    int is = chunk * 2;
+    const uint8_t* q_chunk = xb->qs + chunk * 32;
+
+    uint8_t sc0, m0, sc1, m1;
+    get_scale_min_k4_d(is + 0, xb->scales, &sc0, &m0);
+    get_scale_min_k4_d(is + 1, xb->scales, &sc1, &m1);
+
+    if (l < 32) {
+        y[tid] = (d * sc0) * (q_chunk[l] & 0xF) - (min * m0);
+    } else {
+        y[tid] = (d * sc1) * (q_chunk[l - 32] >> 4) - (min * m1);
     }
 }
 
-// Verbatim port of ggml's dequantize_row_q4_K (ggml/src/ggml-quants.c) —
-// structurally identical to dequant_q5_K_block below minus the high-bit qh
-// array: 4-bit values read directly from qs's low/high nibbles, same
-// get_scale_min_k4_d scale/min unpacking scheme shared with Q5_K.
-__device__ void dequant_q4_K_block(const block_q4_K_cu* xb, float* y) {
-    const uint8_t* q = xb->qs;
+__device__ void dequant_q5_K_block_coop(const block_q5_K_cu* xb, float* y, int tid) {
     const float d   = __half2float(xb->d);
     const float min = __half2float(xb->dmin);
-    int is = 0; uint8_t sc, m;
-    for (int j = 0; j < QK_K; j += 64) {
-        get_scale_min_k4_d(is + 0, xb->scales, &sc, &m); float d1 = d * sc, m1 = min * m;
-        get_scale_min_k4_d(is + 1, xb->scales, &sc, &m); float d2 = d * sc, m2 = min * m;
-        for (int l = 0; l < 32; ++l) y[j + l]      = d1 * (q[l] & 0xF) - m1;
-        for (int l = 0; l < 32; ++l) y[j + 32 + l] = d2 * (q[l] >>  4) - m2;
-        q += 32; is += 2;
-    }
-}
 
-__device__ void dequant_q5_K_block(const block_q5_K_cu* xb, float* y) {
-    const uint8_t* ql = xb->qs;
+    int chunk = tid / 64;             // 0..3
+    int l = tid % 64;                 // 0..63
+    int is = chunk * 2;
+    
+    const uint8_t* ql_chunk = xb->qs + chunk * 32;
     const uint8_t* qh = xb->qh;
-    const float d   = __half2float(xb->d);
-    const float min = __half2float(xb->dmin);
-    int is = 0; uint8_t sc, m; uint8_t u1 = 1, u2 = 2;
-    for (int j = 0; j < QK_K; j += 64) {
-        get_scale_min_k4_d(is + 0, xb->scales, &sc, &m); float d1 = d * sc, m1 = min * m;
-        get_scale_min_k4_d(is + 1, xb->scales, &sc, &m); float d2 = d * sc, m2 = min * m;
-        for (int l = 0; l < 32; ++l) y[j + l]        = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
-        for (int l = 0; l < 32; ++l) y[j + 32 + l]   = d2 * ((ql[l] >> 4)  + (qh[l] & u2 ? 16 : 0)) - m2;
-        ql += 32; is += 2; u1 <<= 2; u2 <<= 2;
+    
+    uint8_t u1 = 1 << (chunk * 2);
+    uint8_t u2 = 1 << (chunk * 2 + 1);
+
+    uint8_t sc0, m0, sc1, m1;
+    get_scale_min_k4_d(is + 0, xb->scales, &sc0, &m0);
+    get_scale_min_k4_d(is + 1, xb->scales, &sc1, &m1);
+
+    if (l < 32) {
+        y[tid] = (d * sc0) * ((ql_chunk[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - (min * m0);
+    } else {
+        y[tid] = (d * sc1) * ((ql_chunk[l - 32] >> 4) + (qh[l - 32] & u2 ? 16 : 0)) - (min * m1);
     }
 }
 
-__device__ void dequant_q6_K_block(const block_q6_K_cu* xb, float* y) {
+__device__ void dequant_q6_K_block_coop(const block_q6_K_cu* xb, float* y, int tid) {
     const float d = __half2float(xb->d);
-    const uint8_t* ql = xb->ql;
-    const uint8_t* qh = xb->qh;
-    const int8_t*  sc = xb->scales;
-    for (int n = 0; n < QK_K; n += 128) {
-        for (int l = 0; l < 32; ++l) {
-            int is = l / 16;
-            int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-            int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-            int8_t q3 = (int8_t)((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
-            int8_t q4 = (int8_t)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
-            y[n + l +  0] = d * sc[is + 0] * q1;
-            y[n + l + 32] = d * sc[is + 2] * q2;
-            y[n + l + 64] = d * sc[is + 4] * q3;
-            y[n + l + 96] = d * sc[is + 6] * q4;
-        }
-        ql += 64; qh += 32; sc += 8;
+    int n_idx = tid / 128;            // 0 or 1
+    int group = (tid % 128) / 32;     // 0, 1, 2, or 3
+    int l = tid % 32;                 // 0..31
+
+    const uint8_t* ql = xb->ql + n_idx * 64;
+    const uint8_t* qh = xb->qh + n_idx * 32;
+    const int8_t*  sc = xb->scales + n_idx * 8;
+
+    int is = l / 16;
+    int8_t q_val;
+    float sc_val;
+
+    if (group == 0) {
+        q_val = (int8_t)((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+        sc_val = sc[is + 0];
+    } else if (group == 1) {
+        q_val = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+        sc_val = sc[is + 2];
+    } else if (group == 2) {
+        q_val = (int8_t)((ql[l + 0] >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+        sc_val = sc[is + 4];
+    } else {
+        q_val = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+        sc_val = sc[is + 6];
     }
+
+    y[tid] = d * sc_val * q_val;
 }
 
-// Q3_K (110 B / 256). Verbatim port of ggml dequantize_row_q3_K. 3-bit values
-// with a per-bit sign mask (hmask) and 16 6-bit scales unpacked from 12 bytes.
-__device__ void dequant_q3_K_block(const block_q3_K_cu* xb, float* y) {
+__device__ void dequant_q3_K_block_coop(const block_q3_K_cu* xb, float* y, int tid) {
     const float d_all = __half2float(*reinterpret_cast<const __half*>(&xb->d));
-    const uint8_t* q  = xb->qs;
-    const uint8_t* hm = xb->hmask;
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
 
-    // Unpack the 16 6-bit scales from scales[12] into aux[4] (16 int8).
+    // Fast redundant register evaluation instead of synced shared memory
     uint32_t aux[4];
-    aux[0] = (uint32_t)xb->scales[0]  | ((uint32_t)xb->scales[1]  << 8) |
-             ((uint32_t)xb->scales[2]  << 16) | ((uint32_t)xb->scales[3]  << 24);
-    aux[1] = (uint32_t)xb->scales[4]  | ((uint32_t)xb->scales[5]  << 8) |
-             ((uint32_t)xb->scales[6]  << 16) | ((uint32_t)xb->scales[7]  << 24);
-    uint32_t tmp = (uint32_t)xb->scales[8]  | ((uint32_t)xb->scales[9]  << 8) |
-                   ((uint32_t)xb->scales[10] << 16) | ((uint32_t)xb->scales[11] << 24);
+    aux[0] = (uint32_t)xb->scales[0] | ((uint32_t)xb->scales[1] << 8) | ((uint32_t)xb->scales[2] << 16) | ((uint32_t)xb->scales[3] << 24);
+    aux[1] = (uint32_t)xb->scales[4] | ((uint32_t)xb->scales[5] << 8) | ((uint32_t)xb->scales[6] << 16) | ((uint32_t)xb->scales[7] << 24);
+    uint32_t tmp = (uint32_t)xb->scales[8] | ((uint32_t)xb->scales[9] << 8) | ((uint32_t)xb->scales[10] << 16) | ((uint32_t)xb->scales[11] << 24);
     aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
     aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
     aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
     aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
     const int8_t* scales = (const int8_t*)aux;
 
-    uint8_t m = 1;   // persists across n iterations — 8 distinct masks total
-    int is = 0;
-    for (int n = 0; n < QK_K; n += 128) {
-        int shift = 0;
-        for (int j = 0; j < 4; ++j) {
-            float dl = d_all * (scales[is++] - 32);
-            for (int l = 0; l < 16; ++l)
-                y[n + j*32 + l] = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-            dl = d_all * (scales[is++] - 32);
-            for (int l = 0; l < 16; ++l)
-                y[n + j*32 + 16 + l] = dl * ((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
-            shift += 2;
-            m <<= 1;
-        }
-        q += 32;
-    }
+    int n_idx = tid / 128;            // 0 or 1
+    int j = (tid % 128) / 32;         // 0..3
+    int l = tid % 32;                 // 0..31
+    
+    int is = n_idx * 8 + j * 2;
+    int shift = j * 2;
+    uint8_t m = 1 << (n_idx * 4 + j); 
+    
+    const uint8_t* q_chunk = xb->qs + n_idx * 32;
+    const uint8_t* hm_chunk = xb->hmask + n_idx * 16;
+
+    int scale_idx = (l < 16) ? is : is + 1;
+    float dl = d_all * (scales[scale_idx] - 32);
+    
+    y[tid] = dl * ((int8_t)((q_chunk[l] >> shift) & 3) - ((hm_chunk[l] & m) ? 0 : 4));
 }
 
-// ---- fused matmul: thread-0 verbatim dequant of a super-block + 256-way dot ----
+// ---- fused matmul: cooperative dequant of a super-block + 256-way dot ----
 #define KQUANT_MATMUL_KERNEL(NAME, BLOCKT, DEQUANT) \
 __global__ void NAME##_kquant_matmul_kernel( \
     float* __restrict__ y, const float* __restrict__ x, const BLOCKT* __restrict__ W, \
@@ -176,13 +181,14 @@ __global__ void NAME##_kquant_matmul_kernel( \
     __shared__ float yq[256]; \
     float acc = 0.0f; \
     for (int b = 0; b < bpr; ++b) { \
-        if (tid == 0) DEQUANT(&w_row[b], yq); \
+        DEQUANT(&w_row[b], yq, tid); \
         __syncthreads(); \
-        if (tid < 256) acc += x_row[b * 256 + tid] * yq[tid]; \
+        acc += x_row[b * 256 + tid] * yq[tid]; \
         __syncthreads(); \
     } \
     __shared__ float sm[256]; \
-    sm[tid] = acc; __syncthreads(); \
+    sm[tid] = acc; \
+    __syncthreads(); \
     for (int stride = 128; stride > 0; stride >>= 1) { \
         if (tid < stride) sm[tid] += sm[tid + stride]; \
         __syncthreads(); \
@@ -190,11 +196,11 @@ __global__ void NAME##_kquant_matmul_kernel( \
     if (tid == 0) y[(size_t)s * O + o] = sm[0]; \
 }
 
-KQUANT_MATMUL_KERNEL(q2_K, block_q2_K_cu, dequant_q2_K_block)
-KQUANT_MATMUL_KERNEL(q3_K, block_q3_K_cu, dequant_q3_K_block)
-KQUANT_MATMUL_KERNEL(q4_K, block_q4_K_cu, dequant_q4_K_block)
-KQUANT_MATMUL_KERNEL(q5_K, block_q5_K_cu, dequant_q5_K_block)
-KQUANT_MATMUL_KERNEL(q6_K, block_q6_K_cu, dequant_q6_K_block)
+KQUANT_MATMUL_KERNEL(q2_K, block_q2_K_cu, dequant_q2_K_block_coop)
+KQUANT_MATMUL_KERNEL(q3_K, block_q3_K_cu, dequant_q3_K_block_coop)
+KQUANT_MATMUL_KERNEL(q4_K, block_q4_K_cu, dequant_q4_K_block_coop)
+KQUANT_MATMUL_KERNEL(q5_K, block_q5_K_cu, dequant_q5_K_block_coop)
+KQUANT_MATMUL_KERNEL(q6_K, block_q6_K_cu, dequant_q6_K_block_coop)
 
 extern "C" void launch_q2_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
     q2_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q2_K_cu*)w, S, I, O);

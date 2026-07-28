@@ -338,6 +338,62 @@ inline bool dequant_v_b_row(const QuantizedTensor& t, int row, float* out) {
 // dequant_row handles; rows of unsupported types are zeroed (returns false).
 inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
                              const float* x, float* y, int S, int I, int O) {
+                             
+    // ----------------------------------------------------
+    // 1. FAST PATH: Fused AVX-512 In-Register Matmuls
+    // Bypasses intermediate FP32 allocation and OMP row-loops
+    // ----------------------------------------------------
+
+
+
+    
+    if (type == GGUFType::IQ2_XXS) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        matmul_iq2_xxs_fused(y, x, W, S, I, O);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+        return true;
+    }
+
+    if (type == GGUFType::IQ3_XXS) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        matmul_iq3_xxs_fused(y, x, W, S, I, O);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+        return true;
+    }
+
+    if (type == GGUFType::Q5_K) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        matmul_q5_k_fused(y, x, W, S, I, O);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+        return true;
+    }
+    if (type == GGUFType::Q6_K) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        matmul_q6_k_fused(y, x, W, S, I, O);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+        return true;
+    }
+    if (type == GGUFType::Q8_0) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        matmul_q8_0_fused(y, x, W, S, I, O);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+        return true;
+    }
+    if (type == GGUFType::F32) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        matmul_f32_avx512(y, x, (const float*)W, S, I, O);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+        return true;
+    }
+    // ----------------------------------------------------
+    // 2. STANDARD PATH: Temporary Buffer Dequant + Dot
+    // ----------------------------------------------------
     int rb = row_bytes(type, I);
     int unsup = 0;
     // Per-thread accumulation via OMP reduction (summed once when the
@@ -349,6 +405,7 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
     // dequant dominates, the dot-product vectorization had limited effect
     // and dequant itself is the real next target.
     double dequant_total = 0.0, dot_total = 0.0;
+
     #pragma omp parallel for schedule(static) reduction(|:unsup) reduction(+:dequant_total,dot_total)
     for (int o = 0; o < O; ++o) {
         thread_local static std::vector<float> wrow;
@@ -367,8 +424,10 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
             dot_total += std::chrono::duration<double>(t3 - t2).count();
         }
     }
+
     PerfCounters::atomic_add(perf().t_cpu_dequant, dequant_total);
     PerfCounters::atomic_add(perf().t_cpu_dot, dot_total);
+
     if (unsup) {
         LOG_ERROR("[DEQUANT] type=%u unsupported by ggml — rows zeroed\n",
                   (unsigned)type);

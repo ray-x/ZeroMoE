@@ -17,31 +17,29 @@
 // no relocatable device code (-rdc=true) is configured in this project, so
 // __constant__ memory can't be shared across .cu translation units anyway;
 // iq3_matmul.cu has its own copies.
+
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
 #define QK_K 256
 
-// Block structs (match ggml block_iq2_xxs/xs/s field order & sizes).
-struct block_iq2_xxs_cu { uint16_t d; uint16_t qs[QK_K/8]; };                         // 66
-struct block_iq2_xs_cu  { uint16_t d; uint16_t qs[QK_K/8]; uint8_t scales[QK_K/32]; }; // 74
-struct block_iq2_s_cu   { uint16_t d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32]; uint8_t scales[QK_K/32]; }; // 82
+struct block_iq2_xxs_cu { uint16_t d; uint16_t qs[QK_K/8]; };
+struct block_iq2_xs_cu  { uint16_t d; uint16_t qs[QK_K/8]; uint8_t scales[QK_K/32]; };
+struct block_iq2_s_cu   { uint16_t d; uint8_t qs[QK_K/4]; uint8_t qh[QK_K/32]; uint8_t scales[QK_K/32]; };
 
-// Grids in constant memory (populated once by init_iq2_grids).
 __constant__ uint64_t c_iq2xxs_grid[256];
 __constant__ uint64_t c_iq2xs_grid[512];
 __constant__ uint64_t c_iq2s_grid[1024];
 __constant__ uint8_t  c_ksigns_iq2xs[128];
 __constant__ uint8_t  c_kmask_iq2xs[8];
 
-// Host grid pointers (src/ggml_grids.cpp, backed by libggml tables).
 extern "C" {
-const void* ms_grid_iq2xxs();
-const void* ms_grid_iq2xs();
-const void* ms_grid_iq2s();
-const void* ms_grid_ksigns_iq2xs();
-const void* ms_grid_kmask_iq2xs();
+    const void* ms_grid_iq2xxs();
+    const void* ms_grid_iq2xs();
+    const void* ms_grid_iq2s();
+    const void* ms_grid_ksigns_iq2xs();
+    const void* ms_grid_kmask_iq2xs();
 }
 
 static bool iq2_grids_ready = false;
@@ -59,64 +57,65 @@ __device__ __forceinline__ float hf_to_f(const void* p) {
     return __half2float(*reinterpret_cast<const __half*>(p));
 }
 
-// ---- verbatim ports of ggml dequantize_row_iq2_* (grids read from __constant__) ----
-__device__ void dequant_iq2_xxs_block(const block_iq2_xxs_cu* xb, float* y) {
+// Cooperative Dequantization: Thread `tid` unpacks exactly 1 weight value.
+__device__ __forceinline__ float dequant_iq2_xxs_coop(const block_iq2_xxs_cu* xb, int tid) {
     const float d = hf_to_f(&xb->d);
-    uint32_t aux32[2];
-    const uint8_t* aux8 = (const uint8_t*)aux32;
-    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
-        const uint16_t* q16 = xb->qs + 4*ib32;
-        aux32[0] = (uint32_t)q16[0] | ((uint32_t)q16[1] << 16);
-        aux32[1] = (uint32_t)q16[2] | ((uint32_t)q16[3] << 16);
-        const float db = d * (0.5f + (aux32[1] >> 28)) * 0.25f;
-        for (int l = 0; l < 4; ++l) {
-            uint64_t g = c_iq2xxs_grid[aux8[l]];
-            const uint8_t* grid = (const uint8_t*)&g;
-            const uint8_t signs = c_ksigns_iq2xs[(aux32[1] >> 7*l) & 127];
-            for (int j = 0; j < 8; ++j)
-                y[ib32*32 + l*8 + j] = db * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.f : 1.f);
-        }
-    }
+    int ib32 = tid / 32;
+    int l = (tid % 32) / 8;
+    int j = tid % 8;
+
+    const uint16_t* q16 = xb->qs + 4 * ib32;
+    uint32_t aux32_1 = (uint32_t)q16[2] | ((uint32_t)q16[3] << 16);
+    const float db = d * (0.5f + (aux32_1 >> 28)) * 0.25f;
+
+    uint32_t aux32_0 = (uint32_t)q16[0] | ((uint32_t)q16[1] << 16);
+    uint8_t aux8_l = ((const uint8_t*)&aux32_0)[l];
+
+    uint64_t g = c_iq2xxs_grid[aux8_l];
+    uint8_t grid_j = ((const uint8_t*)&g)[j];
+    uint8_t signs = c_ksigns_iq2xs[(aux32_1 >> 7*l) & 127];
+
+    return db * (float)grid_j * ((signs & c_kmask_iq2xs[j]) ? -1.f : 1.f);
 }
 
-__device__ void dequant_iq2_xs_block(const block_iq2_xs_cu* xb, float* y) {
+__device__ __forceinline__ float dequant_iq2_xs_coop(const block_iq2_xs_cu* xb, int tid) {
     const float d = hf_to_f(&xb->d);
-    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
-        const float db0 = d * (0.5f + (xb->scales[ib32] & 0xf)) * 0.25f;
-        const float db1 = d * (0.5f + (xb->scales[ib32] >>  4)) * 0.25f;
-        for (int l = 0; l < 4; ++l) {
-            const uint16_t q = xb->qs[4*ib32 + l];
-            uint64_t g = c_iq2xs_grid[q & 511];
-            const uint8_t* grid = (const uint8_t*)&g;
-            const uint8_t signs = c_ksigns_iq2xs[q >> 9];
-            const float dl = (l/2 == 0) ? db0 : db1;
-            for (int j = 0; j < 8; ++j)
-                y[ib32*32 + l*8 + j] = dl * (float)grid[j] * ((signs & c_kmask_iq2xs[j]) ? -1.f : 1.f);
-        }
-    }
+    int ib32 = tid / 32;
+    int l = (tid % 32) / 8;
+    int j = tid % 8;
+
+    const float db0 = d * (0.5f + (xb->scales[ib32] & 0xf)) * 0.25f;
+    const float db1 = d * (0.5f + (xb->scales[ib32] >>  4)) * 0.25f;
+    const float dl = (l < 2) ? db0 : db1;
+
+    const uint16_t q = xb->qs[4 * ib32 + l];
+    uint64_t g = c_iq2xs_grid[q & 511];
+    uint8_t grid_j = ((const uint8_t*)&g)[j];
+    uint8_t signs = c_ksigns_iq2xs[q >> 9];
+
+    return dl * (float)grid_j * ((signs & c_kmask_iq2xs[j]) ? -1.f : 1.f);
 }
 
-__device__ void dequant_iq2_s_block(const block_iq2_s_cu* xb, float* y) {
+__device__ __forceinline__ float dequant_iq2_s_coop(const block_iq2_s_cu* xb, int tid) {
     const float d = hf_to_f(&xb->d);
-    const uint8_t* qs    = xb->qs;
-    const uint8_t* qh    = xb->qh;
-    const uint8_t* signs = xb->qs + QK_K/8;  // signs overlap the back half of qs
-    for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
-        const float db0 = d * (0.5f + (xb->scales[ib32] & 0xf)) * 0.25f;
-        const float db1 = d * (0.5f + (xb->scales[ib32] >>  4)) * 0.25f;
-        for (int l = 0; l < 4; ++l) {
-            const float dl = (l/2 == 0) ? db0 : db1;
-            const uint32_t idx = qs[l] | ((qh[ib32] << (8 - 2*l)) & 0x300);
-            uint64_t g = c_iq2s_grid[idx];
-            const uint8_t* grid = (const uint8_t*)&g;
-            for (int j = 0; j < 8; ++j)
-                y[ib32*32 + l*8 + j] = dl * (float)grid[j] * ((signs[l] & c_kmask_iq2xs[j]) ? -1.f : 1.f);
-        }
-        qs += 4; signs += 4;
-    }
+    int ib32 = tid / 32;
+    int l = (tid % 32) / 8;
+    int j = tid % 8;
+
+    const float db0 = d * (0.5f + (xb->scales[ib32] & 0xf)) * 0.25f;
+    const float db1 = d * (0.5f + (xb->scales[ib32] >>  4)) * 0.25f;
+    const float dl = (l < 2) ? db0 : db1;
+
+    const uint8_t* qs = xb->qs + ib32 * 4;
+    const uint8_t* signs = xb->qs + QK_K/8 + ib32 * 4;
+
+    const uint32_t idx = qs[l] | ((xb->qh[ib32] << (8 - 2*l)) & 0x300);
+    uint64_t g = c_iq2s_grid[idx];
+    uint8_t grid_j = ((const uint8_t*)&g)[j];
+
+    return dl * (float)grid_j * ((signs[l] & c_kmask_iq2xs[j]) ? -1.f : 1.f);
 }
 
-// ---- fused matmul (thread-0 verbatim dequant of a super-block + 256-way dot) ----
 #define IQ2_MATMUL_KERNEL(NAME, BLOCKT, DEQUANT) \
 __global__ void NAME##_iq2_matmul_kernel( \
     float* __restrict__ y, const float* __restrict__ x, const BLOCKT* __restrict__ W, \
@@ -127,16 +126,14 @@ __global__ void NAME##_iq2_matmul_kernel( \
     int bpr = I / 256; \
     const BLOCKT* w_row = W + (size_t)o * bpr; \
     const float* x_row = x + (size_t)s * I; \
-    __shared__ float yq[256]; \
     float acc = 0.0f; \
     for (int b = 0; b < bpr; ++b) { \
-        if (tid == 0) DEQUANT(&w_row[b], yq); \
-        __syncthreads(); \
-        if (tid < 256) acc += x_row[b * 256 + tid] * yq[tid]; \
-        __syncthreads(); \
+        float w_val = DEQUANT(&w_row[b], tid); \
+        acc += x_row[b * 256 + tid] * w_val; \
     } \
     __shared__ float sm[256]; \
-    sm[tid] = acc; __syncthreads(); \
+    sm[tid] = acc; \
+    __syncthreads(); \
     for (int stride = 128; stride > 0; stride >>= 1) { \
         if (tid < stride) sm[tid] += sm[tid + stride]; \
         __syncthreads(); \
@@ -144,9 +141,9 @@ __global__ void NAME##_iq2_matmul_kernel( \
     if (tid == 0) y[(size_t)s * O + o] = sm[0]; \
 }
 
-IQ2_MATMUL_KERNEL(iq2_xxs, block_iq2_xxs_cu, dequant_iq2_xxs_block)
-IQ2_MATMUL_KERNEL(iq2_xs,  block_iq2_xs_cu,  dequant_iq2_xs_block)
-IQ2_MATMUL_KERNEL(iq2_s,   block_iq2_s_cu,   dequant_iq2_s_block)
+IQ2_MATMUL_KERNEL(iq2_xxs, block_iq2_xxs_cu, dequant_iq2_xxs_coop)
+IQ2_MATMUL_KERNEL(iq2_xs,  block_iq2_xs_cu,  dequant_iq2_xs_coop)
+IQ2_MATMUL_KERNEL(iq2_s,   block_iq2_s_cu,   dequant_iq2_s_coop)
 
 extern "C" void launch_iq2_xxs_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
     init_iq2_grids();

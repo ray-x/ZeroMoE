@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cstring>
 #include <atomic>
+#include <omp.h>
+#include <vector>
+#include <cstdint>
 
 // Thread-safe "log this exactly once" -- cpu_quant_matmul's OMP parallel
 // region can call dequant_row from many threads concurrently, so a plain
@@ -35,28 +38,82 @@ void matmul(float* y, const float* x, const float* W, int S, int I, int O) {
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; ++o) {
         const float* w = W + (int64_t)o * I;
+        
         for (int s = 0; s < S; ++s) {
             const float* xs = x + (int64_t)s * I;
-            __m512 acc = _mm512_setzero_ps();
+            
+            __m512 acc0 = _mm512_setzero_ps();
+            __m512 acc1 = _mm512_setzero_ps();
+            __m512 acc2 = _mm512_setzero_ps();
+            __m512 acc3 = _mm512_setzero_ps();
+
             int i = 0;
-            for (; i + 16 <= I; i += 16) {
-                acc = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i), _mm512_loadu_ps(w + i), acc);
+            // 4-way unrolled inner loop (64 floats / 256 bytes per step)
+            for (; i + 64 <= I; i += 64) {
+                // Prefetch memory for the next unrolled step
+                _mm_prefetch((const char*)(xs + i + 128), _MM_HINT_T0);
+                _mm_prefetch((const char*)(w  + i + 128), _MM_HINT_T0);
+
+                acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i),      _mm512_loadu_ps(w + i),      acc0);
+                acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i + 16), _mm512_loadu_ps(w + i + 16), acc1);
+                acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i + 32), _mm512_loadu_ps(w + i + 32), acc2);
+                acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i + 48), _mm512_loadu_ps(w + i + 48), acc3);
             }
-            float sum = _mm512_reduce_add_ps(acc);
-            for (; i < I; ++i) sum += xs[i] * w[i];
+
+            // Combine tree-style
+            __m512 acc01 = _mm512_add_ps(acc0, acc1);
+            __m512 acc23 = _mm512_add_ps(acc2, acc3);
+            __m512 acc_total = _mm512_add_ps(acc01, acc23);
+
+            // Vector tail (16 floats per step)
+            for (; i + 16 <= I; i += 16) {
+                acc_total = _mm512_fmadd_ps(_mm512_loadu_ps(xs + i), _mm512_loadu_ps(w + i), acc_total);
+            }
+
+            float sum = _mm512_reduce_add_ps(acc_total);
+
+            // Scalar cleanup tail
+            for (; i < I; ++i) {
+                sum += xs[i] * w[i];
+            }
+
             y[(int64_t)s * O + o] = sum;
         }
     }
 }
 
 float dot_f32_avx512(const float* a, const float* b, int n) {
-    __m512 acc = _mm512_setzero_ps();
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
+
     int i = 0;
-    for (; i + 16 <= n; i += 16) {
-        acc = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc);
+    // Main loop: 4 vectors = 64 floats per iteration
+    for (; i + 64 <= n; i += 64) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i),      _mm512_loadu_ps(b + i),      acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), acc1);
+        acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32), acc2);
+        acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48), acc3);
     }
-    float sum = _mm512_reduce_add_ps(acc);
-    for (; i < n; ++i) sum += a[i] * b[i];
+
+    // Combine accumulators tree-style
+    __m512 acc01 = _mm512_add_ps(acc0, acc1);
+    __m512 acc23 = _mm512_add_ps(acc2, acc3);
+    __m512 acc_total = _mm512_add_ps(acc01, acc23);
+
+    // Single vector tail loop (16 floats per step)
+    for (; i + 16 <= n; i += 16) {
+        acc_total = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc_total);
+    }
+
+    float sum = _mm512_reduce_add_ps(acc_total);
+
+    // Scalar cleanup tail
+    for (; i < n; ++i) {
+        sum += a[i] * b[i];
+    }
+
     return sum;
 }
 
@@ -95,21 +152,95 @@ void softmax_row(float* x, int size) {
     }
 }
 
-// SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+// Helper: Vectorized exp(-x) approximation for x >= 0 using 512-bit AVX-512.
+// Computes e^(-x) using Base-2 range reduction: e^(-x) = 2^(-x * log2(e))
+static inline __m512 _mm512_exp_neg_ps(__m512 vx) {
+    vx = _mm512_max_ps(vx, _mm512_set1_ps(-88.0f));
+    vx = _mm512_min_ps(vx, _mm512_set1_ps(88.0f));
+
+    // Conversion factor to Base-2
+    const __m512 log2e = _mm512_set1_ps(1.4426950408889634f);
+    
+    // True Base-2 Polynomial coefficients for 2^(-f) on [-0.5, 0.5]
+    // Derived from the Taylor series of 2^(-f) = e^(-f * ln(2))
+    const __m512 p0 = _mm512_set1_ps(1.0f);
+    const __m512 p1 = _mm512_set1_ps(-0.69314718f); // -ln(2)
+    const __m512 p2 = _mm512_set1_ps(0.24022650f);  // ln(2)^2 / 2
+    const __m512 p3 = _mm512_set1_ps(-0.05550410f); // -ln(2)^3 / 6
+    const __m512 p4 = _mm512_set1_ps(0.00961812f);  // ln(2)^4 / 24
+    const __m512 p5 = _mm512_set1_ps(-0.00133251f); // -ln(2)^5 / 120
+
+    // 1. Calculate z = x * log2(e)
+    __m512 z = _mm512_mul_ps(vx, log2e);
+    
+    // 2. n = floor(z + 0.5) (Extract integer exponent)
+    __m512 n = _mm512_floor_ps(_mm512_add_ps(z, _mm512_set1_ps(0.5f)));
+
+    // 3. f = z - n (Extract fractional remainder, strictly between -0.5 and 0.5)
+    __m512 f = _mm512_sub_ps(z, n);
+
+    // 4. Evaluate polynomial approximation: P(f) approx 2^(-f)
+    __m512 p = _mm512_fmadd_ps(p5, f, p4);
+    p = _mm512_fmadd_ps(p, f, p3);
+    p = _mm512_fmadd_ps(p, f, p2);
+    p = _mm512_fmadd_ps(p, f, p1);
+    p = _mm512_fmadd_ps(p, f, p0);
+
+    // 5. Scale by 2^(-n) via exponent bias adjustment in integer domain
+    __m512i i_n = _mm512_cvtps_epi32(n);
+    __m512i bias_n = _mm512_sub_epi32(_mm512_set1_epi32(127), i_n);
+    __m512 pow2_neg_n = _mm512_castsi512_ps(_mm512_slli_epi32(bias_n, 23));
+
+    // Final result: 2^(-f) * 2^(-n) = 2^(-z) = e^(-x)
+    return _mm512_mul_ps(p, pow2_neg_n);
+}
+
+// Vectorized SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+// Unrolled 2-way (32 elements per iteration) to hide FMA and division latencies.
 void silu_inplace(float* x, int n) {
+    const __m512 v_one = _mm512_set1_ps(1.0f);
     int i = 0;
+
+    // Process 32 elements per iteration (2x AVX-512 registers)
+    for (; i + 32 <= n; i += 32) {
+        __m512 v0 = _mm512_loadu_ps(x + i);
+        __m512 v1 = _mm512_loadu_ps(x + i + 16);
+
+        // Pass raw v0/v1. The helper natively computes exp(-x)
+        __m512 exp_neg0 = _mm512_exp_neg_ps(v0);
+        __m512 exp_neg1 = _mm512_exp_neg_ps(v1);
+
+        // denom = 1.0 + exp(-x)
+        __m512 denom0 = _mm512_add_ps(v_one, exp_neg0);
+        __m512 denom1 = _mm512_add_ps(v_one, exp_neg1);
+
+        // Fast reciprocal: approx_inv = 1 / denom
+        __m512 inv0 = _mm512_rcp14_ps(denom0);
+        __m512 inv1 = _mm512_rcp14_ps(denom1);
+
+        // One step of Newton-Raphson refinement for single-precision accuracy:
+        inv0 = _mm512_mul_ps(inv0, _mm512_fnmadd_ps(denom0, inv0, _mm512_set1_ps(2.0f)));
+        inv1 = _mm512_mul_ps(inv1, _mm512_fnmadd_ps(denom1, inv1, _mm512_set1_ps(2.0f)));
+
+        // silu = v * sigmoid(v)
+        _mm512_storeu_ps(x + i,      _mm512_mul_ps(v0, inv0));
+        _mm512_storeu_ps(x + i + 16, _mm512_mul_ps(v1, inv1));
+    }
+
+    // Single 16-element vector tail
     for (; i + 16 <= n; i += 16) {
         __m512 v = _mm512_loadu_ps(x + i);
         __m512 neg_v = _mm512_sub_ps(_mm512_setzero_ps(), v);
-        // exp(-x) approximated via _mm512_exp2a23_ps for speed, or use the stdlib path
-        // Use precise path: sigmoid = 1/(1+exp(-x))
-        // Store intermediate to avoid calling exp in SIMD (no native _mm512_exp_ps in all compilers)
-        float tmp[16];
-        _mm512_storeu_ps(tmp, neg_v);
-        for (int j = 0; j < 16; ++j) tmp[j] = 1.0f / (1.0f + std::exp(tmp[j]));
-        __m512 sig = _mm512_loadu_ps(tmp);
-        _mm512_storeu_ps(x + i, _mm512_mul_ps(v, sig));
+        __m512 exp_neg = _mm512_exp_neg_ps(neg_v);
+        __m512 denom = _mm512_add_ps(v_one, exp_neg);
+        
+        __m512 inv = _mm512_rcp14_ps(denom);
+        inv = _mm512_mul_ps(inv, _mm512_fnmadd_ps(denom, inv, _mm512_set1_ps(2.0f)));
+
+        _mm512_storeu_ps(x + i, _mm512_mul_ps(v, inv));
     }
+
+    // Scalar fallback tail
     for (; i < n; ++i) {
         x[i] = x[i] / (1.0f + std::exp(-x[i]));
     }
@@ -309,6 +440,23 @@ extern "C" {
     const void* ms_grid_kmask_iq2xs();
 }
 
+static inline float fp16_to_fp32_fused(uint16_t h) {
+    return _cvtsh_ss(h);
+}
+
+// Widened kmask (8 x int32 duplicated across 16 lanes)
+static inline __m512i kmask_iq2xs_vec32_16_fused() {
+    static __m512i v = [] {
+        const uint8_t* kmask8 = (const uint8_t*)ms_grid_kmask_iq2xs();
+        int32_t tmp[16];
+        for (int j = 0; j < 8; ++j) { 
+            tmp[j] = (int32_t)kmask8[j]; 
+            tmp[j + 8] = (int32_t)kmask8[j]; 
+        }
+        return _mm512_loadu_si512((const void*)tmp);
+    }();
+    return v;
+}
 static const uint64_t* iq2xxs_grid_ptr() {
     static const uint64_t* p = (const uint64_t*)ms_grid_iq2xxs(); // [256]
     return p;
@@ -337,29 +485,139 @@ static __m256i kmask_iq2xs_vec32() {
     }();
     return v;
 }
+// In-register Dequantization + Accumulation into 512-bit register
+static inline void dequant_and_fmadd_16(uint64_t grid64_lo, uint64_t grid64_hi,
+                                         uint8_t signs_lo, uint8_t signs_hi,
+                                         __m512i kmask_vec16, float db,
+                                         const float* x_ptr, __m512& acc) {
+    // 1. Direct register load of grid indices into 16 x int32
+    __m128i g = _mm_set_epi64x((int64_t)grid64_hi, (int64_t)grid64_lo);
+    __m512i gi32 = _mm512_cvtepu8_epi32(g);
+    __m512 gf = _mm512_cvtepi32_ps(gi32);
+
+    // 2. AVX-512 Native Masking for sign bits
+    __m256i signs_lo_bcast = _mm256_set1_epi32((int32_t)signs_lo);
+    __m256i signs_hi_bcast = _mm256_set1_epi32((int32_t)signs_hi);
+    __m512i signs_bcast = _mm512_inserti32x8(_mm512_castsi256_si512(signs_lo_bcast), signs_hi_bcast, 1);
+
+    __m512i andres = _mm512_and_si512(signs_bcast, kmask_vec16);
+    __mmask16 bit_set_mask = _mm512_cmpneq_epi32_mask(andres, _mm512_setzero_si512());
+
+    // 3. Construct 0x80000000 sign-bit register and XOR
+    __m512 sign_bit = _mm512_castsi512_ps(
+        _mm512_mask_set1_epi32(_mm512_setzero_si512(), bit_set_mask, (int32_t)0x80000000)
+    );
+
+    __m512 pos = _mm512_mul_ps(_mm512_set1_ps(db), gf);
+    __m512 weights_v = _mm512_xor_ps(pos, sign_bit); // Final 16 unpacked weights in register
+
+    // 4. Immediate FMA with Activation Vector x (NO intermediate store to RAM)
+    __m512 x_v = _mm512_loadu_ps(x_ptr);
+    acc = _mm512_fmadd_ps(weights_v, x_v, acc);
+}
+
+// Direct fused kernel: computes dot product of IQ2_XXS block weights with float activation x
+float dot_iq2_xxs_f32_avx512(const uint8_t* block, const float* x, int64_t k) {
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 66; // d(2) + qs[32] uint16 (64 bytes)
+    const int64_t nb = k / QK_K;
+
+    const uint64_t* grid_tbl = (const uint64_t*)ms_grid_iq2xxs();
+    const uint8_t* ksigns = (const uint8_t*)ms_grid_ksigns_iq2xs();
+    __m512i kmask_vec16 = kmask_iq2xs_vec32_16_fused();
+
+    // 4 parallel accumulators to maximize ILP across CPU FMA pipelines
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps();
+    __m512 acc3 = _mm512_setzero_ps();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* base = block + (size_t)i * BLOCK_BYTES;
+        uint16_t d_half; 
+        std::memcpy(&d_half, base, 2);
+        const float d = fp16_to_fp32_fused(d_half);
+        const uint8_t* qs_bytes = base + 2;
+
+        const float* x_block = x + (size_t)i * QK_K;
+
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            // --- First 32 weights (feeds acc0, acc1) ---
+            uint32_t aux32_0, aux32_1;
+            std::memcpy(&aux32_0, qs_bytes + ib32 * 8 + 0, 4); 
+            std::memcpy(&aux32_1, qs_bytes + ib32 * 8 + 4, 4); 
+
+            const uint8_t* aux8 = (const uint8_t*)&aux32_0;
+            const float db = d * (0.5f + (float)(aux32_1 >> 28)) * 0.25f;
+
+            dequant_and_fmadd_16(grid_tbl[aux8[0]], grid_tbl[aux8[1]], 
+                                 ksigns[(aux32_1 >> 0) & 127], ksigns[(aux32_1 >> 7) & 127], 
+                                 kmask_vec16, db, x_block + ib32 * 32 + 0, acc0);
+
+            dequant_and_fmadd_16(grid_tbl[aux8[2]], grid_tbl[aux8[3]], 
+                                 ksigns[(aux32_1 >> 14) & 127], ksigns[(aux32_1 >> 21) & 127], 
+                                 kmask_vec16, db, x_block + ib32 * 32 + 16, acc1);
+
+            // --- Next 32 weights (feeds acc2, acc3) ---
+            int ib32_next = ib32 + 1;
+            uint32_t aux32_0_next, aux32_1_next;
+            std::memcpy(&aux32_0_next, qs_bytes + ib32_next * 8 + 0, 4);
+            std::memcpy(&aux32_1_next, qs_bytes + ib32_next * 8 + 4, 4);
+
+            const uint8_t* aux8_next = (const uint8_t*)&aux32_0_next;
+            const float db_next = d * (0.5f + (float)(aux32_1_next >> 28)) * 0.25f;
+
+            dequant_and_fmadd_16(grid_tbl[aux8_next[0]], grid_tbl[aux8_next[1]], 
+                                 ksigns[(aux32_1_next >> 0) & 127], ksigns[(aux32_1_next >> 7) & 127], 
+                                 kmask_vec16, db_next, x_block + ib32_next * 32 + 0, acc2);
+
+            dequant_and_fmadd_16(grid_tbl[aux8_next[2]], grid_tbl[aux8_next[3]], 
+                                 ksigns[(aux32_1_next >> 14) & 127], ksigns[(aux32_1_next >> 21) & 127], 
+                                 kmask_vec16, db_next, x_block + ib32_next * 32 + 16, acc3);
+        }
+    }
+
+    // Combine accumulators tree-style
+    __m512 acc01 = _mm512_add_ps(acc0, acc1);
+    __m512 acc23 = _mm512_add_ps(acc2, acc3);
+    __m512 acc_total = _mm512_add_ps(acc01, acc23);
+
+    return _mm512_reduce_add_ps(acc_total);
+}
 
 // Applies a per-lane sign flip + scale to one 8-byte grid entry, producing 8
 // output floats: out[j] = db * grid8[j] * ((signs & kmask[j]) ? -1 : 1).
 // Fully vectorized (no scalar loop over j) -- kmask_vec32 is the same 8
 // lanes every call, so the AND/compare/blend below replaces what would
 // otherwise be 8 scalar branches.
-static inline void apply_grid_group8(const uint8_t* grid8, uint8_t signs, __m256i kmask_vec32,
-                                      float db, float* out) {
-    __m128i g = _mm_loadl_epi64((const __m128i*)grid8);      // low 8 bytes
-    __m256i gi32 = _mm256_cvtepu8_epi32(g);                  // 8 x i32, zero-extended
-    __m256 gf = _mm256_cvtepi32_ps(gi32);                    // 8 x float
+// Applies per-lane sign flip + scale to one 8-byte grid entry (8 output floats).
+// Uses AVX-512 bitmask intrinsics (__mmask8) for native sign handling.
+static inline void apply_grid_group8(uint64_t grid64, uint8_t signs, 
+                                                       __m256i kmask_vec32, float db, float* out) {
+    // 1. Direct register load: uint64_t -> low 64 bits of XMM register -> zero-extend to 8 x int32
+    __m128i g = _mm_cvtsi64_si128(grid64);
+    __m256i gi32 = _mm256_cvtepu8_epi32(g);
+    __m256 gf = _mm256_cvtepi32_ps(gi32);
 
+    // 2. AVX-512 Native Bitmask Testing:
+    // Test (signs & kmask) > 0 directly into an 8-bit AVX-512 k-register mask (__mmask8)
     __m256i signs_bcast = _mm256_set1_epi32((int32_t)signs);
     __m256i andres = _mm256_and_si256(signs_bcast, kmask_vec32);
-    __m256i bit_clear = _mm256_cmpeq_epi32(andres, _mm256_setzero_si256()); // all-1s where bit CLEAR (positive case)
+    __mmask8 bit_set_mask = _mm256_cmpneq_epi32_mask(andres, _mm256_setzero_si256());
 
+    // 3. Construct 256-bit sign vector (0x80000000 where mask bit is 1, 0x00000000 where 0)
+    __m256 sign_bit = _mm256_castsi256_ps(
+        _mm256_mask_set1_epi32(_mm256_setzero_si256(), bit_set_mask, (int32_t)0x80000000)
+    );
+
+    // 4. Calculate scaled magnitudes
     __m256 pos = _mm256_mul_ps(_mm256_set1_ps(db), gf);
-    __m256 neg = _mm256_sub_ps(_mm256_setzero_ps(), pos);
-    __m256 sel = _mm256_castsi256_ps(bit_clear);
-    __m256 res = _mm256_blendv_ps(neg, pos, sel); // bit_clear (MSB set) -> pos, else -> neg
+
+    // 5. Apply sign flips via 1-cycle float bitwise XOR
+    __m256 res = _mm256_xor_ps(pos, sign_bit);
+
     _mm256_storeu_ps(out, res);
 }
-
 void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
     static std::atomic<bool> logged{false};
     if (should_log_once(logged)) LOG_INFO("[AVX512-DEQUANT] dequantize_row_iq2_xxs_avx512 is live\n");
@@ -400,10 +658,8 @@ void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
 
             for (int l = 0; l < 4; ++l) {
                 uint64_t g = grid_tbl[aux8[l]];
-                uint8_t grid_bytes[8];
-                std::memcpy(grid_bytes, &g, 8);
                 uint8_t signs = ksigns[(aux32_1 >> (7 * l)) & 127];
-                apply_grid_group8(grid_bytes, signs, kmask_vec, db, yy + ib32 * 32 + l * 8);
+                apply_grid_group8(g, signs, kmask_vec, db, yy + ib32 * 32 + l * 8);
             }
         }
     }
@@ -445,10 +701,8 @@ void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k) {
                 // loops (j+0 from grid1, j+4 from grid2) as one 8-wide op.
                 uint32_t g1 = grid_tbl[qptr[2 * l + 0]];
                 uint32_t g2 = grid_tbl[qptr[2 * l + 1]];
-                uint8_t combined[8];
-                std::memcpy(combined, &g1, 4);
-                std::memcpy(combined + 4, &g2, 4);
-                apply_grid_group8(combined, signs, kmask_vec, db, yy + ib32 * 32 + l * 8);
+                uint64_t g_comb = (uint64_t)g1 | ((uint64_t)g2 << 32);
+                apply_grid_group8(g_comb, signs, kmask_vec, db, yy + ib32 * 32 + l * 8);
             }
             qptr += 8;
         }
@@ -502,9 +756,8 @@ void dequantize_row_iq2_s_avx512(const uint8_t* block, float* y, int64_t k) {
                 const float dl = (l / 2 == 0) ? db0 : db1;
                 const uint32_t idx = qs_ib[l] | (((uint32_t)qh[ib32] << (8 - 2 * l)) & 0x300);
                 uint64_t g = grid_tbl[idx];
-                uint8_t grid_bytes[8];
-                std::memcpy(grid_bytes, &g, 8);
-                apply_grid_group8(grid_bytes, signs_ib[l], kmask_vec, dl, yy + ib32 * 32 + l * 8);
+                // Pass `g` directly, no memcpy needed
+                apply_grid_group8(g, signs_ib[l], kmask_vec, dl, yy + ib32 * 32 + l * 8);
             }
         }
     }
@@ -551,6 +804,7 @@ static __m512i kmask_iq2xs_vec32_16() {
     return v;
 }
 
+
 // Applies a per-lane sign flip + scale to TWO 8-byte grid entries (16
 // output floats) in ONE 512-bit operation, instead of two separate 8-wide
 // apply_grid_group8 calls. db_lo/db_hi let the two halves use DIFFERENT
@@ -561,26 +815,37 @@ static __m512i kmask_iq2xs_vec32_16() {
 // lanes BEFORE any shift/compare (same reasoning as the existing Q2_K/Q3_K
 // AVX-512 unpack: never operate on tightly-packed bytes directly, or a
 // shift can bleed bits in from a neighboring byte).
-static inline void apply_grid_group16(const uint8_t* grid16, uint8_t signs_lo, uint8_t signs_hi,
-                                       __m512i kmask_vec32_16, float db_lo, float db_hi, float* out) {
-    __m128i g = _mm_loadu_si128((const __m128i*)grid16);        // 16 bytes
-    __m512i gi32 = _mm512_cvtepu8_epi32(g);                     // 16 x i32, zero-extended
-    __m512 gf = _mm512_cvtepi32_ps(gi32);                       // 16 x float
+// Applies per-lane sign flip + scale to TWO 8-byte grid entries (16 output floats) in ONE 512-bit op.
+static inline void apply_grid_group16(uint64_t grid64_lo, uint64_t grid64_hi, 
+                                                 uint8_t signs_lo, uint8_t signs_hi,
+                                                 __m512i kmask_vec32_16, 
+                                                 float db_lo, float db_hi, float* out) {
+    // 1. Pack grid64_lo and grid64_hi directly into a single 128-bit register (16 bytes)
+    __m128i g = _mm_set_epi64x((int64_t)grid64_hi, (int64_t)grid64_lo); // [lo: 8 bytes, hi: 8 bytes]
+    __m512i gi32 = _mm512_cvtepu8_epi32(g);                               // 16 x i32, zero-extended
+    __m512 gf = _mm512_cvtepi32_ps(gi32);                                 // 16 x float
 
+    // 2. Broadcast signs for lo and hi halves
     __m256i signs_lo_bcast = _mm256_set1_epi32((int32_t)signs_lo);
     __m256i signs_hi_bcast = _mm256_set1_epi32((int32_t)signs_hi);
     __m512i signs_bcast = _mm512_inserti32x8(_mm512_castsi256_si512(signs_lo_bcast), signs_hi_bcast, 1);
 
+    // 3. Test bit masks: produce 16-bit AVX-512 mask where bits are SET
     __m512i andres = _mm512_and_si512(signs_bcast, kmask_vec32_16);
-    __mmask16 bit_clear = _mm512_cmpeq_epi32_mask(andres, _mm512_setzero_si512()); // 1 where bit CLEAR (positive case)
+    __mmask16 bit_set_mask = _mm512_cmpneq_epi32_mask(andres, _mm512_setzero_si512());
 
+    // 4. Construct sign bit mask register (0x80000000 where bit is set, 0x00000000 where clear)
+    __m512 sign_bit = _mm512_castsi512_ps(_mm512_mask_set1_epi32(_mm512_setzero_si512(), bit_set_mask, (int32_t)0x80000000));
+
+    // 5. Build scale vector
     __m256 db_lo_bcast = _mm256_set1_ps(db_lo);
     __m256 db_hi_bcast = _mm256_set1_ps(db_hi);
     __m512 db_vec = _mm512_insertf32x8(_mm512_castps256_ps512(db_lo_bcast), db_hi_bcast, 1);
 
+    // 6. Multiply magnitude and perform 1-cycle sign flip
     __m512 pos = _mm512_mul_ps(db_vec, gf);
-    __m512 neg = _mm512_sub_ps(_mm512_setzero_ps(), pos);
-    __m512 res = _mm512_mask_blend_ps(bit_clear, neg, pos); // bit_clear(1) -> pos, else -> neg
+    __m512 res = _mm512_xor_ps(pos, sign_bit);
+
     _mm512_storeu_ps(out, res);
 }
 
@@ -622,12 +887,10 @@ void dequantize_row_iq2_xxs_avx512_wide(const uint8_t* block, float* y, int64_t 
                 int l0 = pair * 2, l1 = pair * 2 + 1;
                 uint64_t g0 = grid_tbl[aux8[l0]];
                 uint64_t g1 = grid_tbl[aux8[l1]];
-                uint8_t grid16[16];
-                std::memcpy(grid16, &g0, 8);
-                std::memcpy(grid16 + 8, &g1, 8);
                 uint8_t signs0 = ksigns[(aux32_1 >> (7 * l0)) & 127];
                 uint8_t signs1 = ksigns[(aux32_1 >> (7 * l1)) & 127];
-                apply_grid_group16(grid16, signs0, signs1, kmask_vec16, db, db, yy + ib32 * 32 + l0 * 8);
+                
+                apply_grid_group16(g0, g1, signs0, signs1, kmask_vec16, db, db, yy + ib32 * 32 + l0 * 8);
             }
         }
     }
@@ -668,14 +931,11 @@ void dequantize_row_iq3_xxs_avx512_wide(const uint8_t* block, float* y, int64_t 
                 int l0 = pair * 2, l1 = pair * 2 + 1;
                 uint32_t g0a = grid_tbl[qptr[2 * l0 + 0]], g0b = grid_tbl[qptr[2 * l0 + 1]];
                 uint32_t g1a = grid_tbl[qptr[2 * l1 + 0]], g1b = grid_tbl[qptr[2 * l1 + 1]];
-                uint8_t grid16[16];
-                std::memcpy(grid16 + 0, &g0a, 4);
-                std::memcpy(grid16 + 4, &g0b, 4);
-                std::memcpy(grid16 + 8, &g1a, 4);
-                std::memcpy(grid16 + 12, &g1b, 4);
                 uint8_t signs0 = ksigns[(aux32 >> (7 * l0)) & 127];
                 uint8_t signs1 = ksigns[(aux32 >> (7 * l1)) & 127];
-                apply_grid_group16(grid16, signs0, signs1, kmask_vec16, db, db, yy + ib32 * 32 + l0 * 8);
+                uint64_t g0 = (uint64_t)g0a | ((uint64_t)g0b << 32);
+                uint64_t g1 = (uint64_t)g1a | ((uint64_t)g1b << 32);
+                apply_grid_group16(g0, g1, signs0, signs1, kmask_vec16, db, db, yy + ib32 * 32 + l0 * 8);
             }
             qptr += 8;
         }
@@ -720,24 +980,75 @@ void dequantize_row_iq2_s_avx512_wide(const uint8_t* block, float* y, int64_t k)
                 const uint32_t idx1 = qs_ib[l1] | (((uint32_t)qh[ib32] << (8 - 2 * l1)) & 0x300);
                 uint64_t g0 = grid_tbl[idx0];
                 uint64_t g1 = grid_tbl[idx1];
-                uint8_t grid16[16];
-                std::memcpy(grid16, &g0, 8);
-                std::memcpy(grid16 + 8, &g1, 8);
-                apply_grid_group16(grid16, signs_ib[l0], signs_ib[l1], kmask_vec16, dbp, dbp,
+
+                // Pass `g0` and `g1` directly as the first two parameters
+                apply_grid_group16(g0, g1, signs_ib[l0], signs_ib[l1], kmask_vec16, dbp, dbp,
                                     yy + ib32 * 32 + l0 * 8);
             }
         }
     }
 }
 
+
+// Offline weight quantization: Quantizes to int8, then offsets by +128 to map to uint8
+float qrow_w_u8_offset(const float* w_in, uint8_t* w_out, int I) {
+    __m512 v_amax = _mm512_setzero_ps();
+    int i = 0;
+    
+    for (; i + 16 <= I; i += 16) {
+        v_amax = _mm512_max_ps(v_amax, _mm512_abs_ps(_mm512_loadu_ps(w_in + i)));
+    }
+    float amax = _mm512_reduce_max_ps(v_amax);
+    for (; i < I; ++i) { float a = std::abs(w_in[i]); if (a > amax) amax = a; }
+    
+    float s = amax / 127.0f;
+    if (s < 1e-12f) s = 1e-12f;
+    float inv = 1.0f / s;
+    
+    i = 0;
+    __m512 v_inv = _mm512_set1_ps(inv);
+    const __m512i offset_128 = _mm512_set1_epi8((char)128);
+
+    // Unrolled 64-element block
+    for (; i + 64 <= I; i += 64) {
+        __m512i i0 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(w_in + i), v_inv));
+        __m512i i1 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(w_in + i + 16), v_inv));
+        __m512i i2 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(w_in + i + 32), v_inv));
+        __m512i i3 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(w_in + i + 48), v_inv));
+
+        __m256i s16_0 = _mm512_cvtepi32_epi16(i0);
+        __m256i s16_1 = _mm512_cvtepi32_epi16(i1);
+        __m256i s16_2 = _mm512_cvtepi32_epi16(i2);
+        __m256i s16_3 = _mm512_cvtepi32_epi16(i3);
+
+        __m512i comb_16_01 = _mm512_inserti64x4(_mm512_castsi256_si512(s16_0), s16_1, 1);
+        __m512i comb_16_23 = _mm512_inserti64x4(_mm512_castsi256_si512(s16_2), s16_3, 1);
+
+        __m256i s8_01 = _mm512_cvtepi16_epi8(comb_16_01);
+        __m256i s8_23 = _mm512_cvtepi16_epi8(comb_16_23);
+
+        __m512i final_s8 = _mm512_inserti64x4(_mm512_castsi256_si512(s8_01), s8_23, 1);
+        
+        // Add 128 to shift from [-127, 127] to [1, 255]
+        __m512i final_u8 = _mm512_add_epi8(final_s8, offset_128);
+        _mm512_storeu_si512((void*)(w_out + i), final_u8);
+    }
+    
+    // Scalar tail
+    for (; i < I; ++i) {
+        w_out[i] = (uint8_t)(std::max(-127, std::min(127, (int)lrintf(w_in[i] * inv))) + 128);
+    }
+    return s;
+}
+
 // ============================================================
 // IDOT (Integer Dot Product) Kernels — the biggest single win
 // ============================================================
-// Quantize one row of activations to int8 symmetric, return the scale.
+// Quantize one row of activations to int8 symmetric, 64-way unrolled return the scale.
 float qrow_i8(const float* x, int8_t* q, int I) {
-    // Find absmax using AVX-512
     __m512 v_amax = _mm512_setzero_ps();
     int i = 0;
+    
     for (; i + 16 <= I; i += 16) {
         v_amax = _mm512_max_ps(v_amax, _mm512_abs_ps(_mm512_loadu_ps(x + i)));
     }
@@ -748,44 +1059,72 @@ float qrow_i8(const float* x, int8_t* q, int I) {
     if (s < 1e-12f) s = 1e-12f;
     float inv = 1.0f / s;
     
-    // Quantize using AVX-512 conversion
     i = 0;
     __m512 v_inv = _mm512_set1_ps(inv);
-    for (; i + 16 <= I; i += 16) {
-        __m512 vx = _mm512_mul_ps(_mm512_loadu_ps(x + i), v_inv);
-        __m512i vi32 = _mm512_cvtps_epi32(vx);
-        // Pack 32-bit -> 16-bit -> 8-bit
-        __m256i vi16 = _mm512_cvtepi32_epi16(vi32);
-        __m128i vi8 = _mm256_cvtepi16_epi8(vi16);
-        _mm_storeu_si128((__m128i*)(q + i), vi8);
+    
+    for (; i + 64 <= I; i += 64) {
+        __m512i i0 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x + i), v_inv));
+        __m512i i1 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x + i + 16), v_inv));
+        __m512i i2 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x + i + 32), v_inv));
+        __m512i i3 = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_loadu_ps(x + i + 48), v_inv));
+
+        __m256i s16_0 = _mm512_cvtepi32_epi16(i0);
+        __m256i s16_1 = _mm512_cvtepi32_epi16(i1);
+        __m256i s16_2 = _mm512_cvtepi32_epi16(i2);
+        __m256i s16_3 = _mm512_cvtepi32_epi16(i3);
+
+        __m512i comb_16_01 = _mm512_inserti64x4(_mm512_castsi256_si512(s16_0), s16_1, 1);
+        __m512i comb_16_23 = _mm512_inserti64x4(_mm512_castsi256_si512(s16_2), s16_3, 1);
+
+        __m256i s8_01 = _mm512_cvtepi16_epi8(comb_16_01);
+        __m256i s8_23 = _mm512_cvtepi16_epi8(comb_16_23);
+
+        __m512i final_s8 = _mm512_inserti64x4(_mm512_castsi256_si512(s8_01), s8_23, 1);
+        _mm512_storeu_si512((void*)(q + i), final_s8);
     }
+    
     for (; i < I; ++i) {
         q[i] = (int8_t)lrintf(x[i] * inv);
     }
     return s;
 }
 
-// int8×int8 dot product using AVX-512 VNNI (vpdpbusd: unsigned×signed→int32)
-// Uses the sign trick: |w| as unsigned, fold sign of w into x.
-// Safe: each vpdpbusd lane accumulates 4 products ≤ 128*127 = 16256, fits s32 up to I=16384.
-int32_t dot_i8i8_avx512(const int8_t* w, const int8_t* x, int I) {
+// uint8 x int8 VNNI dot product
+int32_t dot_u8s8_avx512(const uint8_t* w, const int8_t* x, int I) {
     int32_t sum = 0;
     int i = 0;
 
 #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
-    __m512i acc = _mm512_setzero_si512();
+    __m512i acc_dp = _mm512_setzero_si512();
+    __m512i acc_x  = _mm512_setzero_si512();
+    
+    const __m512i ones_8  = _mm512_set1_epi8(1);
+    const __m512i ones_16 = _mm512_set1_epi16(1);
+
     for (; i + 64 <= I; i += 64) {
-        __m512i wv = _mm512_loadu_si512((const void*)(w + i));
-        __m512i xv = _mm512_loadu_si512((const void*)(x + i));
-        // Sign trick: where w is negative, negate x; use |w| as unsigned operand
-        __mmask64 neg = _mm512_movepi8_mask(wv);  // mask of negative w bytes
-        __m512i xs = _mm512_mask_sub_epi8(xv, neg, _mm512_setzero_si512(), xv);
-        acc = _mm512_dpbusd_epi32(acc, _mm512_abs_epi8(wv), xs);
+        __m512i wv = _mm512_loadu_si512((const void*)(w + i)); // natively u8
+        __m512i xv = _mm512_loadu_si512((const void*)(x + i)); // natively s8
+        
+        // 1. Direct hardware VNNI
+        acc_dp = _mm512_dpbusd_epi32(acc_dp, wv, xv);
+        
+        // 2. Accumulate sum(x) using maddubs (u8 x s8 -> s16)
+        __m512i sum_x_s16 = _mm512_maddubs_epi16(ones_8, xv);
+        acc_x = _mm512_add_epi32(acc_x, _mm512_madd_epi16(sum_x_s16, ones_16));
     }
-    sum = _mm512_reduce_add_epi32(acc);
+    
+    int32_t raw_dot = _mm512_reduce_add_epi32(acc_dp);
+    int32_t sum_x_total = _mm512_reduce_add_epi32(acc_x);
+    
+    // Reverse the +128 offset mathematically: 
+    // sum((w + 128) * x) = sum(w * x) + 128 * sum(x)
+    sum = raw_dot - (sum_x_total * 128);
 #endif
+    
     // Scalar tail
-    for (; i < I; ++i) sum += (int32_t)w[i] * x[i];
+    for (; i < I; ++i) {
+        sum += ((int)w[i] - 128) * x[i];
+    }
     return sum;
 }
 
@@ -826,49 +1165,89 @@ int32_t dot_i4i8_avx512(const uint8_t* w4, const int8_t* x, int I) {
     return sum;
 }
 
-// IDOT matmul: quantize activations to int8, then integer dot product
-// y[S,O] = x[S,I] @ W^T, W = int8 per-row quantized with scale[O]
-void matmul_q8_idot(float* y, const float* x, const int8_t* q, const float* scale, int S, int I, int O) {
-    // Quantize all activation rows first
-    int8_t* xq = (int8_t*)malloc((size_t)S * I);
-    float* sx = (float*)malloc((size_t)S * sizeof(float));
+// Thread-local scratch storage to completely avoid malloc/free overhead on every call.
+struct ThreadScratch {
+    std::vector<int8_t> xq;
+    std::vector<float> sx;
+
+    void ensure_size(size_t S, size_t I) {
+        if (xq.size() < S * I) xq.resize(S * I);
+        if (sx.size() < S) sx.resize(S);
+    }
+};
+
+static thread_local ThreadScratch g_scratch;
+
+// IDOT matmul: y[S,O] = x[S,I] @ W^T
+// W is now unsigned uint8_t (pre-offset by +128)
+void matmul_u8_idot(float* y, const float* x, const uint8_t* W_u8, const float* scale, int S, int I, int O) {
+    g_scratch.ensure_size(S, I);
+    int8_t* xq = g_scratch.xq.data();
+    float* sx = g_scratch.sx.data();
+
+    #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; ++s) {
         sx[s] = qrow_i8(x + (int64_t)s * I, xq + (int64_t)s * I, I);
     }
     
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; ++o) {
-        const int8_t* w = q + (int64_t)o * I;
+        const uint8_t* w = W_u8 + (int64_t)o * I;
         float sc = scale[o];
+
+        if (o + 1 < O) {
+            _mm_prefetch((const char*)(W_u8 + (int64_t)(o + 1) * I), _MM_HINT_T0);
+        }
+
         for (int s = 0; s < S; ++s) {
-            y[(int64_t)s * O + o] = (float)dot_i8i8_avx512(w, xq + (int64_t)s * I, I) * sc * sx[s];
+            const int8_t* xs = xq + (int64_t)s * I;
+            int32_t dot = dot_u8s8_avx512(w, xs, I);
+            y[(int64_t)s * O + o] = (float)dot * sc * sx[s];
         }
     }
-    
-    free(xq);
-    free(sx);
 }
+
+// IDOT matmul: quantize activations to int8, then integer dot product
+// y[S,O] = x[S,I] @ W^T, W = int8 per-row quantized with scale[O]
+// deprecated, use matmul_u8_idot
+void matmul_q8_idot(float* y, const float* x, const int8_t* q, const float* scale, int S, int I, int O) {
+    // 1. Thread-safe, non-allocating memory reuse
+    matmul_u8_idot(y, x, (const uint8_t*)q, scale, S, I, O);
+}
+
 
 // IDOT matmul for int4 packed: y[S,O] = x[S,I] @ W^T, W = int4-packed with scale[O]
 void matmul_i4_idot(float* y, const float* x, const uint8_t* q4, const float* scale, int S, int I, int O) {
     int rb = (I + 1) / 2;  // row bytes for int4 packed
-    int8_t* xq = (int8_t*)malloc((size_t)S * I);
-    float* sx = (float*)malloc((size_t)S * sizeof(float));
+
+    // 1. Thread-safe, non-allocating memory reuse
+    g_scratch.ensure_size(S, I);
+    int8_t* xq = g_scratch.xq.data();
+    float* sx = g_scratch.sx.data();
+
+    // 2. Parallelize activation quantization across rows
+    #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; ++s) {
         sx[s] = qrow_i8(x + (int64_t)s * I, xq + (int64_t)s * I, I);
     }
     
+    // 3. Optimized parallel matrix multiplication loop
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; ++o) {
         const uint8_t* w = q4 + (int64_t)o * rb;
         float sc = scale[o];
+
+        // Prefetch next row's weight vector into L1/L2 cache
+        if (o + 1 < O) {
+            _mm_prefetch((const char*)(q4 + (int64_t)(o + 1) * rb), _MM_HINT_T0);
+        }
+
         for (int s = 0; s < S; ++s) {
-            y[(int64_t)s * O + o] = (float)dot_i4i8_avx512(w, xq + (int64_t)s * I, I) * sc * sx[s];
+            const int8_t* xs = xq + (int64_t)s * I;
+            int32_t dot = dot_i4i8_avx512(w, xs, I);
+            y[(int64_t)s * O + o] = (float)dot * sc * sx[s];
         }
     }
-    
-    free(xq);
-    free(sx);
 }
 
 // ----------------------------------------------------
@@ -944,5 +1323,496 @@ void quantize_activations_q8_0(const float* __restrict__ x, block_q8_0* __restri
         
         __m512i combined = _mm512_inserti64x4(_mm512_castsi256_si512(packed16_0), packed16_1, 1);
         _mm256_storeu_si256((__m256i*)(y[b].qs), _mm512_cvtepi16_epi8(combined));
+    }
+}
+
+// Fused Matrix Multiplication Wrapper for IQ2_XXS:
+// Calculates y[S, O] = x[S, I] @ W^T where W is IQ2_XXS quantized.
+// Bypasses temporary dequantization memory buffers completely!
+void matmul_iq2_xxs_fused(float* y, const float* x, const uint8_t* W_quantized, int S, int I, int O) {
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 66; // 66 bytes per 256 weights in IQ2_XXS
+    const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
+
+    // Outer loop over sequence length S
+    for (int s = 0; s < S; ++s) {
+        const float* xs = x + (int64_t)s * I;
+        float* ys = y + (int64_t)s * O;
+
+        // Parallelize over output rows O using OpenMP
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; ++o) {
+            const uint8_t* row_w = W_quantized + (size_t)o * row_bytes;
+
+            // Software Prefetch next row's weight vector into L1/L2 cache
+            if (o + 1 < O) {
+                _mm_prefetch((const char*)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+            }
+
+            // Execute in-register fused dequantization + dot product
+            ys[o] = dot_iq2_xxs_f32_avx512(row_w, xs, I);
+        }
+    }
+}
+
+
+// Direct fused kernel: computes dot product of IQ3_XXS block weights with FP32 activation vector x
+float dot_iq3_xxs_f32_avx512(const uint8_t* block, const float* x, int64_t k) {
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 98; // d(2) + qs[96]
+    const int64_t nb = k / QK_K;
+
+    const uint32_t* grid_tbl = (const uint32_t*)ms_grid_iq3xxs(); // 4-byte entries
+    const uint8_t* ksigns = (const uint8_t*)ms_grid_ksigns_iq2xs();
+    __m512i kmask_vec16 = kmask_iq2xs_vec32_16_fused();
+
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* base = block + (size_t)i * BLOCK_BYTES;
+        uint16_t d_half; 
+        std::memcpy(&d_half, base, 2);
+        const float d = fp16_to_fp32_fused(d_half);
+
+        const uint8_t* qs = base + 2;                // [96]
+        const uint8_t* scales_and_signs = qs + 64;   // [32]
+        const float* x_block = x + (size_t)i * QK_K;
+
+        const uint8_t* qptr = qs;
+        for (int ib32 = 0; ib32 < QK_K / 32; ++ib32) {
+            const uint8_t* sas = scales_and_signs + 4 * ib32;
+            uint32_t aux32 = (uint32_t)sas[0] | ((uint32_t)sas[1] << 8) |
+                             ((uint32_t)sas[2] << 16) | ((uint32_t)sas[3] << 24);
+            const float db = d * (0.5f + (float)(aux32 >> 28)) * 0.5f;
+
+            // Process two 8-element sub-groups at a time (16 weights per iteration)
+            for (int pair = 0; pair < 2; ++pair) {
+                int l0 = pair * 2, l1 = pair * 2 + 1;
+                
+                uint32_t g0a = grid_tbl[qptr[2 * l0 + 0]], g0b = grid_tbl[qptr[2 * l0 + 1]];
+                uint32_t g1a = grid_tbl[qptr[2 * l1 + 0]], g1b = grid_tbl[qptr[2 * l1 + 1]];
+                
+                uint64_t g0 = (uint64_t)g0a | ((uint64_t)g0b << 32);
+                uint64_t g1 = (uint64_t)g1a | ((uint64_t)g1b << 32);
+
+                uint8_t signs0 = ksigns[(aux32 >> (7 * l0)) & 127];
+                uint8_t signs1 = ksigns[(aux32 >> (7 * l1)) & 127];
+
+                dequant_and_fmadd_16(g0, g1, signs0, signs1, kmask_vec16, db, 
+                                     x_block + ib32 * 32 + l0 * 8, (pair == 0 ? acc0 : acc1));
+            }
+            qptr += 8;
+        }
+    }
+
+    return _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+}
+
+// OpenMP wrapper bypassing intermediate allocation
+void matmul_iq3_xxs_fused(float* y, const float* x, const uint8_t* W_quantized, int S, int I, int O) {
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 98;
+    const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
+
+    for (int s = 0; s < S; ++s) {
+        const float* xs = x + (int64_t)s * I;
+        float* ys = y + (int64_t)s * O;
+
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; ++o) {
+            const uint8_t* row_w = W_quantized + (size_t)o * row_bytes;
+            if (o + 1 < O) {
+                _mm_prefetch((const char*)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+            }
+            ys[o] = dot_iq3_xxs_f32_avx512(row_w, xs, I);
+        }
+    }
+}
+
+// Fast AVX-512 dequantization helper for Q5_K 16-element sub-groups
+// Corrected AVX-512 dequantization helper for Q5_K 16-element sub-groups
+static inline void dequant_q5k_group16(const uint8_t* q, const uint8_t* qh, int shift_qh, 
+                                        int shift_qs, float dl, float ml, float* out) {
+    // 1. Extract 4-bit low nibbles
+    __m128i raw_q = _mm_loadu_si128((const __m128i*)q);
+    __m256i wide_q = _mm256_cvtepu8_epi16(raw_q);
+    __m256i lo_nibbles = _mm256_and_si256(_mm256_srli_epi16(wide_q, shift_qs), _mm256_set1_epi16(0x0F));
+    __m512i v_lo = _mm512_cvtepi16_epi32(lo_nibbles);
+
+    // 2. Extract 5th high bit from qh mask plane
+    __m128i v_qh = _mm_loadu_si128((const __m128i*)qh);
+    
+    // Isolate the specific bit for this sub-block across all 16 bytes
+    __m128i bit_mask = _mm_set1_epi8(1 << shift_qh);
+    __m128i masked = _mm_and_si128(v_qh, bit_mask);
+    
+    // Create a 0xFF byte mask where the bit was set, 0x00 where clear
+    __m128i cmp = _mm_cmpeq_epi8(masked, bit_mask);
+    
+    // Extract the top bit of each byte into a native AVX-512 16-bit k-mask
+    __mmask16 hbit_mask = _mm_movemask_epi8(cmp);
+
+
+    // 3. Add 16 to elements where 5th bit is set
+    __m512i v_q5 = _mm512_mask_add_epi32(v_lo, hbit_mask, v_lo, _mm512_set1_epi32(16));
+
+    // 4. Transform to FP32 float: y = dl * q5 - ml
+    __m512 vf = _mm512_cvtepi32_ps(v_q5);
+    __m512 res = _mm512_sub_ps(_mm512_mul_ps(_mm512_set1_ps(dl), vf), _mm512_set1_ps(ml));
+    _mm512_storeu_ps(out, res);
+}
+
+// Helper to extract scale and min for Q5_K (ported directly from CUDA kernels)
+static inline void get_scale_min_k4_d(int j, const uint8_t* scales, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = scales[j] & 63; 
+        *m = scales[j + 4] & 63;
+    } else {
+        *d = (scales[j + 4] & 0x0F) | ((scales[j - 4] >> 6) << 4);
+        *m = (scales[j + 4] >> 4)  | ((scales[j - 0] >> 6) << 4);
+    }
+}
+
+// ----------------------------------------------------
+// Fused Q5_K Matmul
+// ----------------------------------------------------
+void matmul_q5_k_fused(float* y, const float* x, const uint8_t* W_quantized, int S, int I, int O) {
+    constexpr int QK_K = 256;
+    constexpr size_t BLOCK_BYTES = 176;
+    const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
+
+    for (int s = 0; s < S; ++s) {
+        const float* xs = x + (int64_t)s * I;
+        float* ys = y + (int64_t)s * O;
+
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < O; ++o) {
+            const uint8_t* row_w = W_quantized + (size_t)o * row_bytes;
+            if (o + 1 < O) {
+                _mm_prefetch((const char*)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+            }
+            
+            float sum = 0.0f;
+            float yq[256];
+            
+            for (int b = 0; b < I / QK_K; ++b) {
+                const uint8_t* base = row_w + b * BLOCK_BYTES;
+                uint16_t d_half, dmin_half;
+                std::memcpy(&d_half, base, 2);
+                std::memcpy(&dmin_half, base + 2, 2);
+                const float d = fp16_to_fp32(d_half);
+                const float min = fp16_to_fp32(dmin_half);
+
+                const uint8_t* scales = base + 4;
+                const uint8_t* qh = base + 16;
+                const uint8_t* qs = base + 48;
+
+                int is = 0;
+                int shift_qh1 = 0;
+                int shift_qh2 = 1;
+                
+                for (int j = 0; j < QK_K; j += 64) {
+                    uint8_t sc1, m1, sc2, m2;
+                    get_scale_min_k4_d(is + 0, scales, &sc1, &m1);
+                    get_scale_min_k4_d(is + 1, scales, &sc2, &m2);
+                    
+                    float dl1 = d * sc1, ml1 = min * m1;
+                    float dl2 = d * sc2, ml2 = min * m2;
+                    
+                    // Lower 32 elements of the 64-element block
+                    dequant_q5k_group16(qs,      qh,      shift_qh1, 0, dl1, ml1, yq + j);
+                    dequant_q5k_group16(qs + 16, qh + 16, shift_qh1, 0, dl1, ml1, yq + j + 16);
+                    
+                    // Upper 32 elements of the 64-element block
+                    dequant_q5k_group16(qs,      qh,      shift_qh2, 4, dl2, ml2, yq + j + 32);
+                    dequant_q5k_group16(qs + 16, qh + 16, shift_qh2, 4, dl2, ml2, yq + j + 48);
+
+                    qs += 32;
+                    is += 2;
+                    shift_qh1 += 2;
+                    shift_qh2 += 2;
+                }
+                
+                // Dot product for this 256-element block
+                sum += dot_f32_avx512(yq, xs + b * 256, 256);
+            }
+            ys[o] = sum;
+        }
+    }
+}
+
+inline void quantize_activations_q6_k(const float* x, block_xq_q6* xq, int I) {
+    int num_blocks = I / 256;
+    for (int b = 0; b < num_blocks; ++b) {
+        for (int i = 0; i < 16; ++i) { // 16 sub-blocks of 16 elements
+            float max_val = 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                max_val = std::max(max_val, std::abs(x[b * 256 + i * 16 + j]));
+            }
+            float scale = max_val / 127.0f;
+            float inv_scale = scale > 0 ? 1.0f / scale : 0.0f;
+            
+            float sum = 0.0f;
+            for (int j = 0; j < 16; ++j) {
+                float v = x[b * 256 + i * 16 + j];
+                int8_t q = (int8_t)std::round(v * inv_scale);
+                xq[b].qs[i * 16 + j] = q;
+                sum += q; // Cache the sum of x for the VNNI offset trick
+            }
+            xq[b].scales[i] = scale;
+            xq[b].sums[i] = sum;
+        }
+    }
+}
+
+
+// ----------------------------------------------------
+// Fused Q6_K Matmul (VNNI Integer Math)
+// ----------------------------------------------------
+void matmul_q6_k_fused(float* y, const float* x, const uint8_t* W_quantized, int S, int I, int O) {
+    constexpr int QK6_K = 256;
+    constexpr size_t BLOCK_BYTES = 210; // 128 (ql) + 64 (qh) + 16 (scales) + 2 (d)
+    const int num_blocks = I / QK6_K;
+    
+    // Thread-safe activation buffer matched to Q6_K layout
+    static thread_local std::vector<block_xq_q6> g_xq_q6;
+    if (g_xq_q6.size() < (size_t)(S * num_blocks)) {
+        g_xq_q6.resize(S * num_blocks);
+    }
+    
+    #pragma omp parallel for schedule(static)
+    for (int s = 0; s < S; ++s) {
+        quantize_activations_q6_k(x + (int64_t)s * I, g_xq_q6.data() + (int64_t)s * num_blocks, I);
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; ++o) {
+        const uint8_t* row_w = W_quantized + (size_t)o * num_blocks * BLOCK_BYTES;
+        
+        for (int s = 0; s < S; ++s) {
+            const block_xq_q6* xq = g_xq_q6.data() + (int64_t)s * num_blocks;
+            float sum_f32 = 0.0f;
+            
+            for (int b = 0; b < num_blocks; ++b) {
+                const block_q6_K* bw = (const block_q6_K*)(row_w + b * BLOCK_BYTES);
+                float block_d = fp16_to_fp32(bw->d);
+                
+                #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                // Process in chunks of 64 elements (4 sub-blocks of 16)
+                for (int chunk = 0; chunk < 4; ++chunk) {
+                    // 1. Extract 64 Q6_K weights into uint8 (0-63 range)
+                    // (Simplified extraction mapping for standard contiguous processing)
+                    uint8_t w_expanded[64];
+                    for (int i = 0; i < 64; ++i) {
+                        int idx = chunk * 64 + i;
+                        // Low 4 bits
+                        uint8_t l = (bw->ql[idx % 128] >> ((idx / 128) * 4)) & 0x0F;
+                        // High 2 bits
+                        uint8_t h = (bw->qh[idx % 64] >> ((idx / 64) * 2)) & 0x03;
+                        w_expanded[i] = l | (h << 4); // natively unsigned 0..63
+                    }
+                    
+                    __m512i vw = _mm512_loadu_si512((const void*)w_expanded);
+                    __m512i vx = _mm512_loadu_si512((const void*)(xq[b].qs + chunk * 64));
+                    
+                    // 2. Hardware VNNI dot product (uint8 * int8)
+                    // Yields sixteen 32-bit integers. Each int32 is the sum of 4 elements.
+                    __m512i acc_dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), vw, vx);
+                    
+                    // 3. Extract four 16-element sub-block sums from the AVX register
+                    // We horizontally add the 32-bit lanes to group them by 16 elements.
+                    alignas(64) int32_t dp_lanes[16];
+                    _mm512_store_si512(dp_lanes, acc_dp);
+                    
+                    for (int sub = 0; sub < 4; ++sub) {
+                        int sb_idx = chunk * 4 + sub;
+                        
+                        // Horizontally sum 4 lanes of dp_lanes to get a 16-element dot product
+                        int32_t true_dot_16 = dp_lanes[sub * 4 + 0] + 
+                                              dp_lanes[sub * 4 + 1] + 
+                                              dp_lanes[sub * 4 + 2] + 
+                                              dp_lanes[sub * 4 + 3];
+                                              
+                        // 4. Apply the -32 Offset Trick mathematically
+                        // sum(w_true * x) = sum(w_u8 * x) - 32 * sum(x)
+                        float dot_adjusted = (float)true_dot_16 - (32.0f * xq[b].sums[sb_idx]);
+                        
+                        // 5. Multiply by scales and accumulate
+                        sum_f32 += dot_adjusted * (float)bw->scales[sb_idx] * xq[b].scales[sb_idx] * block_d;
+                    }
+                }
+                #else
+                // Scalar Fallback
+                for (int i = 0; i < 16; ++i) { // 16 sub-blocks
+                    int32_t sub_dot = 0;
+                    for (int j = 0; j < 16; ++j) {
+                        int idx = i * 16 + j;
+                        uint8_t l = (bw->ql[idx % 128] >> ((idx / 128) * 4)) & 0x0F;
+                        uint8_t h = (bw->qh[idx % 64] >> ((idx / 64) * 2)) & 0x03;
+                        int8_t w_val = (int8_t)(l | (h << 4)) - 32; // signed mapping
+                        
+                        sub_dot += w_val * xq[b].qs[idx];
+                    }
+                    sum_f32 += sub_dot * (float)bw->scales[i] * xq[b].scales[i] * block_d;
+                }
+                #endif
+            }
+            y[(int64_t)s * O + o] = sum_f32;
+        }
+    }
+}
+
+// ----------------------------------------------------
+// Fused Q8_0 Matmul (VNNI Integer Math)
+// ----------------------------------------------------
+void matmul_q8_0_fused(float* y, const float* x, const uint8_t* W_quantized, int S, int I, int O) {
+    constexpr int QK8_0 = 32;
+    constexpr size_t BLOCK_BYTES = 34; // 2 bytes scale + 32 bytes qs
+    const int num_blocks = I / QK8_0;
+    const size_t row_bytes = (size_t)num_blocks * BLOCK_BYTES;
+
+    // 1. Thread-safe activation quantization buffer
+    static thread_local std::vector<block_q8_0> g_xq_q8;
+    if (g_xq_q8.size() < (size_t)(S * num_blocks)) {
+        g_xq_q8.resize(S * num_blocks);
+    }
+    
+    // 2. Parallelize activation quantization across sequence length S
+    #pragma omp parallel for schedule(static)
+    for (int s = 0; s < S; ++s) {
+        quantize_activations_q8_0(x + (int64_t)s * I, g_xq_q8.data() + (int64_t)s * num_blocks, I);
+    }
+
+    // 3. Optimized parallel matrix multiplication loop using VNNI
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; ++o) {
+        const uint8_t* row_w = W_quantized + (size_t)o * row_bytes;
+        if (o + 1 < O) {
+            _mm_prefetch((const char*)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+        }
+        
+        for (int s = 0; s < S; ++s) {
+            const block_q8_0* xq = g_xq_q8.data() + (int64_t)s * num_blocks;
+            
+            #if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+            __m512 f_acc = _mm512_setzero_ps();
+            const __m512i offset_128 = _mm512_set1_epi8((char)128);
+            const __m512i ones_8  = _mm512_set1_epi8(1);
+            const __m512i ones_16 = _mm512_set1_epi16(1);
+
+            int b = 0;
+            // Pack and process 2 blocks (64 bytes/elements) per AVX-512 iteration
+            for (; b + 1 < num_blocks; b += 2) {
+                const uint8_t* base_w0 = row_w + b * BLOCK_BYTES;
+                const uint8_t* base_w1 = row_w + (b + 1) * BLOCK_BYTES;
+                
+                uint16_t d_w0; std::memcpy(&d_w0, base_w0, 2);
+                uint16_t d_w1; std::memcpy(&d_w1, base_w1, 2);
+                
+                // Precalculate merged scale for both blocks
+                float scale0 = fp16_to_fp32(d_w0) * fp16_to_fp32(xq[b].d);
+                float scale1 = fp16_to_fp32(d_w1) * fp16_to_fp32(xq[b + 1].d);
+                __m256 vscale0 = _mm256_set1_ps(scale0);
+                __m256 vscale1 = _mm256_set1_ps(scale1);
+                __m512 vscale = _mm512_insertf32x8(_mm512_castps256_ps512(vscale0), vscale1, 1);
+
+                // Load weights into 512-bit register
+                __m256i w0 = _mm256_loadu_si256((const __m256i*)(base_w0 + 2));
+                __m256i w1 = _mm256_loadu_si256((const __m256i*)(base_w1 + 2));
+                __m512i vw = _mm512_inserti64x4(_mm512_castsi256_si512(w0), w1, 1);
+
+                // Load quantized activations into 512-bit register
+                __m256i x0 = _mm256_loadu_si256((const __m256i*)xq[b].qs);
+                __m256i x1 = _mm256_loadu_si256((const __m256i*)xq[b + 1].qs);
+                __m512i vx = _mm512_inserti64x4(_mm512_castsi256_si512(x0), x1, 1);
+
+                // Shift weights to unsigned domain for VNNI compatibility
+                __m512i vw_u8 = _mm512_add_epi8(vw, offset_128);
+                
+                // Execute hardware dot product
+                __m512i acc_dp = _mm512_dpbusd_epi32(_mm512_setzero_si512(), vw_u8, vx);
+                
+                // Reverse the +128 offset bias mathematically
+                __m512i sum_x_s16 = _mm512_maddubs_epi16(ones_8, vx);
+                __m512i acc_x = _mm512_madd_epi16(sum_x_s16, ones_16);
+                __m512i true_dot = _mm512_sub_epi32(acc_dp, _mm512_slli_epi32(acc_x, 7));
+                
+                // Convert finalized int32 to float, multiply by scales, and accumulate
+                f_acc = _mm512_fmadd_ps(_mm512_cvtepi32_ps(true_dot), vscale, f_acc);
+            }
+
+            float sum_f32 = _mm512_reduce_add_ps(f_acc);
+            
+            // Clean up any remaining odd block (Scalar fallback)
+            for (; b < num_blocks; ++b) {
+                const uint8_t* base_w = row_w + b * BLOCK_BYTES;
+                uint16_t d_w; std::memcpy(&d_w, base_w, 2);
+                float scale = fp16_to_fp32(d_w) * fp16_to_fp32(xq[b].d);
+                
+                const int8_t* qs_w = (const int8_t*)(base_w + 2);
+                const int8_t* qs_x = xq[b].qs;
+                int32_t dot = 0;
+                
+                for(int j = 0; j < 32; ++j) dot += qs_w[j] * qs_x[j];
+                sum_f32 += dot * scale;
+            }
+            #else
+            // Safe fallback if compiled without VNNI architecture targeting
+            float sum_f32 = 0.0f;
+            for (int b = 0; b < num_blocks; ++b) {
+                const uint8_t* base_w = row_w + b * BLOCK_BYTES;
+                uint16_t d_w; std::memcpy(&d_w, base_w, 2);
+                float scale = fp16_to_fp32(d_w) * fp16_to_fp32(xq[b].d);
+                const int8_t* qs_w = (const int8_t*)(base_w + 2);
+                const int8_t* qs_x = xq[b].qs;
+                
+                int32_t dot = 0;
+                for(int j = 0; j < 32; ++j) dot += qs_w[j] * qs_x[j];
+                sum_f32 += dot * scale;
+            }
+            #endif
+            
+            y[(int64_t)s * O + o] = sum_f32;
+        }
+    }
+}
+
+
+// ----------------------------------------------------
+// Standard F32 Matmul (AVX-512 FMA)
+// ----------------------------------------------------
+void matmul_f32_avx512(float* y, const float* x, const float* w, int S, int I, int O) {
+    #pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; ++o) {
+        const float* row_w = w + (size_t)o * I;
+        
+        for (int s = 0; s < S; ++s) {
+            const float* row_x = x + (int64_t)s * I;
+            float sum = 0.0f;
+            int i = 0;
+
+            #if defined(__AVX512F__)
+            __m512 acc = _mm512_setzero_ps();
+            
+            // Process 16 floats (512 bits) per iteration
+            for (; i + 16 <= I; i += 16) {
+                __m512 vx = _mm512_loadu_ps(row_x + i);
+                __m512 vw = _mm512_loadu_ps(row_w + i);
+                // acc = (vx * vw) + acc
+                acc = _mm512_fmadd_ps(vx, vw, acc);
+            }
+            
+            // Horizontally sum the 16 lanes of the AVX register
+            sum = _mm512_reduce_add_ps(acc);
+            #endif
+            
+            // Scalar tail for remaining elements
+            for (; i < I; ++i) {
+                sum += row_x[i] * row_w[i];
+            }
+            
+            y[(int64_t)s * O + o] = sum;
+        }
     }
 }
