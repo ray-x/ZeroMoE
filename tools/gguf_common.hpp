@@ -32,6 +32,7 @@ int cmd_pack(int argc, char **argv);
 int cmd_io(int argc, char **argv);
 int cmd_verify(int argc, char **argv);
 int cmd_plan(int argc, char **argv);
+int cmd_dma(int argc, char **argv);
 
 // ---- inline helpers shared by more than one subcommand ----
 

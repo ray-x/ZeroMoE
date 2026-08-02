@@ -39,6 +39,14 @@ int usage(const char *prog) {
           "          .moestream_usage summary -- for picking dense_gb / "
           "moe_cache_gb / pinned_vram_capacity\n"
           "          on a new model without trial-and-error real runs.\n"
+          "  dma     <model.gguf|dir> [<model2> ...] [--experts N[,N2,...]] "
+          "[--submissions M]\n"
+          "          A/B of the REAL production io_uring/O_DIRECT read path: "
+          "1 combined DMA read\n"
+          "          per expert vs 3 separate DMA reads (gate/up/down) at "
+          "the same file offsets --\n"
+          "          random access across every layer. Linux-only for a "
+          "real run.\n"
           "\n"
           "Run '%s <subcommand>' with no further args for that "
           "subcommand's full usage.\n",
@@ -64,6 +72,8 @@ int main(int argc, char **argv) {
     return gguf_tool::cmd_verify(argc - 1, argv + 1);
   if (sub == "plan")
     return gguf_tool::cmd_plan(argc - 1, argv + 1);
+  if (sub == "dma")
+    return gguf_tool::cmd_dma(argc - 1, argv + 1);
   if (sub == "-h" || sub == "--help") {
     usage(argv[0]);
     return 0;
