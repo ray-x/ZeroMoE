@@ -203,6 +203,16 @@ struct ExpertGpuContext {
     int expert_id = -1;
     const uint8_t* slab_buffer = nullptr;
     size_t slab_capacity = 0;
+    // Non-owning pointer to the RAM-tier MoEExpertBlock slab_buffer/
+    // slab_capacity above were copied out of. Added to close two of the
+    // "[TIER-OVERLAP]" leaks documented in CLAUDE.md ("Cold-Miss GPU
+    // Dispatch Never Frees the RAM Slot"): expert_ffn_resolve_gpu_loc's
+    // own synchronous upload_expert/upload_expert_active calls promote
+    // this RAM data into VRAM but, without this pointer, had no way to
+    // tell the RAM tier its copy is now redundant. Null is safe (no
+    // marking attempted) for any future caller that doesn't have a RAM-
+    // tier block to reference.
+    MoEExpertBlock* exp = nullptr;
 };
 
 struct ExpertScore { int id; float score; };
@@ -229,6 +239,18 @@ struct PendingGpuExpert {
     // comments in gpu_topology.hpp. Only meaningful when needs_release is
     // true.
     bool loc_from_active_layer = false;
+    // Captured from gpu_ctx.expert_id at Pass A issue time, BEFORE
+    // expert_ffn_resolve_gpu_loc runs (which can promote this exact `exp`
+    // into the main VRAM cache and, on a real RAM-tier reclaim, clear
+    // exp->expert_id to -1). Pass B's expert_ffn_gpu_finish call and this
+    // struct's own release_hold rollback path both need the REAL identity
+    // to find the right VRAM slot -- previously both read exp->expert_id
+    // FRESH at their own (much later) call time instead of using a
+    // captured value, which is exactly what let a same-dispatch RAM-tier
+    // reclaim corrupt release_hold's lookup (a real, observed crash: see
+    // CLAUDE.md's active-reclaim entries). This field exists so Pass B
+    // never needs to trust exp's mutable state again for this one purpose.
+    int expert_id = -1;
 };
 
 struct LayerScratch {
@@ -376,10 +398,26 @@ static constexpr int GPU_COLD_BATCH_THRESHOLD = 4;  // amortizes a cold upload
 static const ExpertLocation* expert_ffn_resolve_gpu_loc(
     const ExpertGpuContext* gpu_ctx, int S,
     const GGUFTensor& gate_meta, const GGUFTensor& up_meta, const GGUFTensor& down_meta,
-    bool* out_needs_release, bool* out_loc_from_active_layer
+    bool* out_needs_release, bool* out_loc_from_active_layer,
+    RAMSafetyManager& ram_mgr
 ) {
     *out_needs_release = false;
     const ExpertLocation* loc = gpu_ctx ? gpu_ctx->loc : nullptr;
+    // cpu_affinity_layers (config): this specific layer is pinned to CPU --
+    // a genuine early return, NOT the same trick cpu_only_mode() uses just
+    // below (forcing vram_resident=false alone would NOT be enough here:
+    // the cold-batch/decode-miss/active-layer upload branches further down
+    // all key on `!vram_resident`, so forcing it false would actually
+    // TRIGGER an upload attempt rather than prevent one -- confirmed by
+    // reading through to those branches before writing this). Returning
+    // here, before any of those branches run, guarantees no
+    // upload_expert/upload_expert_active call is ever reached for this
+    // layer from this function, matching the config's contract ("never
+    // DMA into VRAM for these layers").
+    if (gpu_ctx && is_cpu_affinity_layer(gpu_ctx->layer_idx)) {
+        perf().n_cpu_fallback_affinity_layer.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     bool vram_resident = loc && loc->device_ptr && loc->layer_idx >= 0;
     if (cpu_only_mode()) vram_resident = false;  // diagnostic: force CPU expert path
     // Tracks which pool `loc` most recently resolved from, so hold_for_compute/
@@ -399,6 +437,22 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
         loc = gpu_ctx->topo->upload_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
                                             gpu_ctx->slab_buffer, gpu_ctx->slab_capacity);
         vram_resident = loc && loc->device_ptr;
+        // FIX ("[TIER-OVERLAP]" leak, see CLAUDE.md): upload_expert is
+        // SYNCHRONOUS -- by the time it returns, the H2D copy is
+        // unconditionally complete, so (unlike an async promotion) it's
+        // immediately safe to reclaim the source RAM block, same
+        // safe-confirmed-point reasoning get_expert's own MOVE branch
+        // already uses. This is the S>=GPU_COLD_BATCH_THRESHOLD cold-batch
+        // path -- gpu_ctx->exp is the real RAM-tier block slab_buffer came
+        // from (null only for a shadow, which never reaches here).
+        // Upgraded from also_in_vram-only marking to finish_sync_promotion
+        // (active reclaim) once PendingGpuExpert started capturing
+        // expert_id at issue time (see that struct's own comment) -- that
+        // fix closed the Pass A->B/rollback identity-read-late hazard for
+        // EVERY synchronous-upload site in this function, not just
+        // find_active_expert's, so this site no longer needs to avoid an
+        // active MOVE either.
+        if (vram_resident && gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, gpu_ctx->layer_idx, gpu_ctx->expert_id);
     }
 
     // Decode-time cold miss (S < GPU_COLD_BATCH_THRESHOLD, in practice
@@ -440,12 +494,58 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
         // expert into the real VRAM LRU cache right away (freeing this
         // active-layer slot) instead of waiting for cleanup_active_layer_area
         // at the next layer transition.
-        loc = gpu_ctx->topo->find_active_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id);
+        //
+        // FIX (real bug, found while chasing [TIER-OVERLAP]): a promoted hit
+        // returns a pointer into the MAIN expert_vram_cache, NOT the active-
+        // layer pool -- but loc_from_active_layer was previously set `true`
+        // unconditionally for every non-null return here, regardless of
+        // which pool it actually came from. That mislabeling made every
+        // SUBSEQUENT hold_for_compute() call for this dispatch search ONLY
+        // active_layer_slots for a device_ptr that actually lives in the
+        // separate expert_cache_pool allocation -- guaranteed not found,
+        // silently forcing a CPU fallback for a genuinely VRAM-resident
+        // expert every time a promotion happened via this path. promoted_to_main
+        // (set by find_active_expert's on_promoted callback, which fires
+        // exactly when the returned loc is main-cache) fixes this.
+        //
+        // REGRESSION, FOUND AND ROOT-CAUSE-FIXED ON REAL HARDWARE (two
+        // rounds): this callback previously called
+        // ram_mgr.finish_sync_promotion(*gpu_ctx->exp, ...) here (an active
+        // MOVE, clearing gpu_ctx->exp->expert_id=-1 immediately) to close
+        // the separate [TIER-OVERLAP] leak. A real run hit this
+        // immediately: "[ERROR] [MOE-VRAM] release_hold found no matching
+        // resident slot for layer=X expert=-1" right after the corresponding
+        // "ACTIVE-LAYER HIT ... (promoted to main cache)" line for the SAME
+        // expert. Root cause: gpu_ctx->exp is the SAME MoEExpertBlock
+        // currently being dispatched for THIS k, about to be pushed into
+        // scratch.pending_gpu (see dispatch_expert_k below) for Pass B to
+        // process later -- and Pass B used to read p.exp->expert_id FRESH
+        // at release time (not a captured value) to call release_hold().
+        // Per release_hold's own failure-path consequence (see CLAUDE.md's
+        // ram_temp_pin_count entry), every occurrence permanently leaked
+        // the real VRAM slot as un-evictable, measurably tanking that run
+        // (cache hit rate down to 47%, disk back up to 97s/230GB,
+        // throughput down to 0.21 tok/s). ROUND 1 fix reverted to
+        // marking-only here (safe, but leaves [TIER-OVERLAP] barely
+        // improved on the dominant promotion path). ROUND 2 (this version):
+        // fixed the ACTUAL root cause instead of avoiding it -- PendingGpuExpert
+        // now captures expert_id at Pass A issue time, BEFORE this callback
+        // can ever run, so Pass B (and this function's own immediate-
+        // rollback release_hold call below, same bug) no longer depend on
+        // exp's mutable state at all. With that dependency gone, actively
+        // reclaiming the RAM slot here is safe again -- re-enabled.
+        bool promoted_to_main = false;
+        loc = gpu_ctx->topo->find_active_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
+            [&](int layer, int expert_id) {
+                promoted_to_main = true;
+                if (gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, layer, expert_id);
+            });
         vram_resident = loc && loc->device_ptr;
         if (vram_resident) {
-            loc_from_active_layer = true;
-            LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER HIT layer=%d expert=%d hit_count=%u\n",
-                      gpu_ctx->layer_idx, gpu_ctx->expert_id, loc->hit_count);
+            loc_from_active_layer = !promoted_to_main;
+            LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER HIT layer=%d expert=%d hit_count=%u%s\n",
+                      gpu_ctx->layer_idx, gpu_ctx->expert_id, loc->hit_count,
+                      promoted_to_main ? " (promoted to main cache)" : "");
         } else {
             // First touch this layer-window -- try active layer area (decode-
             // thread-only, no eviction of the main LRU cache)
@@ -455,6 +555,44 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
 
             if (vram_resident) {
                 loc_from_active_layer = true;
+                // REVERTED (real, measured regression -- see CLAUDE.md):
+                // this branch used to also set gpu_ctx->exp->also_in_vram =
+                // true here, on the theory that it's "the same synchronous-
+                // therefore-safe reasoning as the cold-batch branch above."
+                // That reasoning doesn't hold for the ACTIVE LAYER
+                // specifically: it's an explicitly TEMPORARY pool (~90% of
+                // uploads are freed at the next layer transition WITHOUT
+                // ever being promoted to the durable main cache -- a real
+                // run showed 17546 active-layer uploads vs only 1795
+                // promoted). Marking the RAM source "redundant, evict
+                // first" at UPLOAD time -- before any hit even confirms
+                // this expert will survive past this token's layer window
+                // -- means the RAM tier aggressively evicted slots whose
+                // VRAM backing had ALREADY vanished by the time anything
+                // tried to reuse the freed capacity, forcing an unnecessary
+                // disk reload on the very next real need. Measured
+                // fallout: RAM-tier hit rate collapsed from the usual
+                // 42-49% to 28.5%, and RAM-tier fill dropped from 99.9% to
+                // 71.2% (slots churning empty faster than being kept
+                // useful). The cold-batch and decode-miss-fallback
+                // upload_expert sites (this function's OTHER two
+                // also_in_vram markings) do NOT have this problem -- they
+                // promote into the MAIN cache, a durable LRU pool where a
+                // resident genuinely stays until legitimately evicted by
+                // score, matching the assumption get_expert's own COPY
+                // branch already relies on safely. This revert only stopped
+                // the regression -- it deliberately did NOT mark also_in_vram
+                // here (upload time, temporary residency, unsafe) nor attempt
+                // to notify the RAM tier once a promotion to the durable main
+                // cache actually happens later. That correct notification is
+                // now wired up separately, at the point it's actually safe:
+                // see the find_active_expert call above (its on_promoted
+                // callback + the also_in_vram marking inside it) and
+                // cleanup_active_layer_area's call in moe_forward_gguf, both
+                // of which fire only once promote_active_to_main's
+                // synchronous D2D copy has genuinely landed in the main
+                // cache -- closing the "[TIER-OVERLAP]" leak this comment
+                // used to describe as still-open (see CLAUDE.md).
                 LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER layer=%d expert=%d -> temporary upload (no LRU eviction)\n",
                           gpu_ctx->layer_idx, gpu_ctx->expert_id);
             } else {
@@ -464,6 +602,11 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
                 vram_resident = loc && loc->device_ptr;
                 loc_from_active_layer = false;  // main cache, even though the active-layer branches above ran first
                 if (vram_resident) {
+                    // FIX ("[TIER-OVERLAP]" leak, see CLAUDE.md): third of
+                    // three synchronous-upload sites in this function.
+                    // Upgraded to active reclaim -- see the cold-batch
+                    // site's own comment above for why this is now safe.
+                    if (gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, gpu_ctx->layer_idx, gpu_ctx->expert_id);
                     LOG_DEBUG("[MOE-VRAM]  COLD-GPU layer=%d expert=%d -> synchronous H2D upload on decode-time "
                               "miss (avoids CPU dequant-matmul fallback)\n",
                               gpu_ctx->layer_idx, gpu_ctx->expert_id);
@@ -718,6 +861,7 @@ static void expert_ffn_cpu(
 void moe_forward_gguf(
     StreamingEngine& engine,
     RAMSafetyManager& ram_mgr,
+    LockFreePrefetcher& async_io_queue,
     int layer_idx,
     const float* hidden_states,
     int S,
@@ -881,6 +1025,12 @@ void moe_forward_gguf(
             // the true demand signal (what the router actually picked),
             // not a cache-hit proxy
             engine.bump_route_freq(layer_idx, id);
+            // Additionally track prefill-only selections in their own
+            // histogram (route_freq_prefill) -- see that field's own
+            // comment for why decode's higher routing volume would
+            // otherwise crowd out prefill's signal in the combined one.
+            // Never a replacement for the line above, purely additive.
+            if (S > 1) engine.bump_route_freq_prefill(layer_idx, id);
             sum_w += w;
         }
         if (c.expert_weights_norm) {
@@ -941,7 +1091,8 @@ void moe_forward_gguf(
     // eviction). Once the cache is full, fall back to the steady-state
     // hotness-gated promotion in RAMSafetyManager::get_expert() — same as
     // an OS reverting to LRU swap-out once the cache is warm.
-    if (S > 1 && ram_mgr.vram_cache) {
+    if (S > 1 && ram_mgr.vram_cache && !is_cpu_affinity_layer(layer_idx)) {
+        PERF_START(prefill_warm);
         std::vector<int> candidates;
         candidates.reserve(n_experts);
         for (int e = 0; e < n_experts; ++e) if (scratch.expert_freq[e] > 0) candidates.push_back(e);
@@ -949,10 +1100,42 @@ void moe_forward_gguf(
             return scratch.expert_freq[a] > scratch.expert_freq[b];
         });
 
+        // prefill_warm_via_prefetcher=true needs a GPU-type-capability check
+        // WITHOUT ever calling ram_mgr.get_expert() -- that synchronous
+        // RAM/disk fetch is exactly the blocking cost this mode exists to
+        // avoid. expert_layer_geometry is a pure tensor-table lookup (same
+        // expert-0-representative convention Phase 3's own shadow-check
+        // uses below), computed once per layer rather than per candidate.
+        bool hint_mode_gpu_capable = true;
+        if (engine.prefill_warm_via_prefetcher) {
+            size_t p2_gb = 0, p2_ub = 0, p2_db = 0;
+            const GGUFTensor *p2_gM = nullptr, *p2_uM = nullptr, *p2_dM = nullptr;
+            hint_mode_gpu_capable = engine.expert_layer_geometry(layer_idx, p2_gb, p2_ub, p2_db,
+                                                                   p2_gM, p2_uM, p2_dM)
+                && gpu_type_supported(p2_gM->type) && gpu_type_supported(p2_uM->type)
+                && gpu_type_supported(p2_dM->type);
+        }
+
         for (int expert_id : candidates) {
             if (!ram_mgr.vram_cache->has_free_slot()) break; // cache warm now — stop preloading
             if (ram_mgr.vram_cache->find_expert(layer_idx, expert_id)) continue; // already resident
 
+            if (engine.prefill_warm_via_prefetcher) {
+                // Async path (config prefill_warm_via_prefetcher=true): push
+                // a hint to the SAME queue/worker-thread pipeline decode's
+                // own PILOT prediction already uses, instead of loading
+                // synchronously right here. Trade-off documented on the
+                // config field itself -- this legitimately might not finish
+                // in time for THIS layer's own Phase 3 dispatch a moment
+                // later, falling through to the ordinary (already-correct)
+                // miss path for this call; never a correctness issue.
+                if (!hint_mode_gpu_capable) continue;
+                async_io_queue.push_hint(layer_idx, expert_id);
+                perf().n_prefill_hint_pushed.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            // ---- Legacy synchronous path (default, unchanged behavior) ----
             MoEExpertBlock* blk = ram_mgr.get_expert(engine, layer_idx, expert_id);
             if (!blk || !blk->slab_buffer) continue;
 
@@ -969,8 +1152,21 @@ void moe_forward_gguf(
 
             LOG_DEBUG("[MOE-VRAM]  WARM    layer=%d expert=%d freq=%d/%d tokens (cold-start prefill, free slot)\n",
                       layer_idx, expert_id, scratch.expert_freq[expert_id], S);
-            ram_mgr.vram_cache->upload_expert_async(layer_idx, expert_id, blk->slab_buffer, blk->slab_capacity);
+            // FIX (real, measured "[TIER-OVERLAP]" leak -- see CLAUDE.md's
+            // "third, independent tier-overlap source" entry): this call
+            // used to bypass get_expert's own MOVE-vs-COPY promotion
+            // bookkeeping entirely, since it's a direct external
+            // upload_expert_async call, not a hit routed through
+            // get_expert's internal Step-1 branch. apply_promotion_
+            // bookkeeping mirrors that same logic for this call site.
+            perf().n_prefill_warm_attempted.fetch_add(1, std::memory_order_relaxed);
+            ExpertLocation* promoted =
+                ram_mgr.vram_cache->upload_expert_async(layer_idx, expert_id, blk->slab_buffer, blk->slab_capacity);
+            if (promoted) perf().n_prefill_warm_succeeded.fetch_add(1, std::memory_order_relaxed);
+            else perf().n_prefill_warm_failed.fetch_add(1, std::memory_order_relaxed);
+            ram_mgr.apply_promotion_bookkeeping(*blk, layer_idx, expert_id, promoted);
         }
+        PERF_END(prefill_warm, t_prefill_warm_time);
     }
 
     // --- Phase 3: execute each token's already-selected experts ---
@@ -984,78 +1180,12 @@ void moe_forward_gguf(
         const float* token_hidden = scratch.normed.data() + s * D;
         float* token_output = output + s * D;
 
-        // --- Load all needed experts (LRU cache handles hits/misses; most
-        // will already be warm here thanks to Phase 1/2 above). Batched:
-        // get_experts_batch parallelizes the disk reads for whichever of
-        // this layer's topk picks are genuine misses (not already staged
-        // via PIPE), instead of the old one-pread-at-a-time sequential
-        // loop 
-        //
-        // FIX (real, measured "[TIER-OVERLAP]" bug -- see CLAUDE.md): this
-        // used to call get_experts_batch UNCONDITIONALLY for the entire
-        // topk list, even for experts already GPU-resident -- wasting a
-        // real disk read and a real RAM slot on data whose BYTES the GPU
-        // path never reads (it reads weight bytes from
-        // ExpertLocation::device_ptr, and the per-projection TYPE from the
-        // packed base tensor, uniform across every expert in a layer --
-        // neither needs a RAM copy). A real run showed 66% of everything
-        // VRAM-resident was ALSO RAM-resident as a direct result, 12+ GB
-        // double-counted. Fixed by checking VRAM residency first (a real
-        // find_expert lookup, same one Pass A below already does for its
-        // own purposes) and building a metadata-only "shadow" block
-        // (populate_vram_shadow, zero I/O) for anything already resident +
-        // GPU-type-supported, instead of loading it into RAM at all. Only
-        // the remainder -- not yet VRAM-resident, or an unsupported type --
-        // still goes through the real get_experts_batch path below,
-        // batched exactly as before.
-        {
-            size_t shadow_gb = 0, shadow_ub = 0, shadow_db = 0;
-            const GGUFTensor *shadow_gM = nullptr, *shadow_uM = nullptr, *shadow_dM = nullptr;
-            bool layer_gpu_capable = !cpu_only_mode() && ram_mgr.vram_cache &&
-                engine.packed_slab_geometry(layer_idx, shadow_gb, shadow_ub, shadow_db,
-                                             shadow_gM, shadow_uM, shadow_dM) &&
-                gpu_type_supported(shadow_gM->type) && gpu_type_supported(shadow_uM->type) &&
-                gpu_type_supported(shadow_dM->type);
-
-            static thread_local std::vector<int> ram_needed_ids;
-            static thread_local std::vector<int> ram_needed_k;
-            static thread_local std::vector<MoEExpertBlock*> ram_needed_ptrs;
-            ram_needed_ids.clear(); ram_needed_k.clear();
-            ram_needed_ids.reserve(topk); ram_needed_k.reserve(topk);
-
-            for (int k = 0; k < topk; ++k) {
-                int expert_id = scratch.tok_topk_ids[s * topk + k];
-                bool shadowed = false;
-                scratch.vram_loc_hint[k] = nullptr;  // explicit every layer/token -- resize()'s
-                                                      // one-time clear only covers the FIRST call
-                if (layer_gpu_capable) {
-                    const ExpertLocation* loc = ram_mgr.vram_cache->find_expert(layer_idx, expert_id);
-                    if (loc && loc->device_ptr) {
-                        MoEExpertBlock& shadow = scratch.vram_shadow_blocks[k];
-                        engine.populate_vram_shadow(shadow, layer_idx, expert_id);
-                        scratch.expert_ptrs[k] = &shadow;
-                        scratch.vram_loc_hint[k] = loc;
-                        shadowed = true;
-                    }
-                }
-                if (!shadowed) {
-                    ram_needed_ids.push_back(expert_id);
-                    ram_needed_k.push_back(k);
-                }
-            }
-            if (!ram_needed_ids.empty()) {
-                ram_needed_ptrs.resize(ram_needed_ids.size());
-                ram_mgr.get_experts_batch(engine, layer_idx, ram_needed_ids.data(),
-                                           (int)ram_needed_ids.size(), ram_needed_ptrs.data());
-                for (size_t i = 0; i < ram_needed_ids.size(); ++i)
-                    scratch.expert_ptrs[ram_needed_k[i]] = ram_needed_ptrs[i];
-            }
-        }
-
         // Weighted accumulation + VERBOSE trace, shared by both the CPU path
-        // (Pass A, accumulates immediately) and the GPU path (Pass B,
-        // accumulates after finish()) -- same logic either way, just called
-        // at a different point in the pipeline depending on path.
+        // (dispatch_expert_k's own synchronous fallback) and the GPU path
+        // (Pass B, accumulates after finish()) -- same logic either way, just
+        // called at a different point in the pipeline depending on path.
+        // Moved up (was previously defined between the loading block and the
+        // old Pass A loop) so dispatch_expert_k below can capture it.
         auto accumulate = [&](int k, MoEExpertBlock* exp, const float* down_buf_ptr) {
             // Per-expert output norm, VERBOSE-gated: distinguishes "expert_ffn
             // itself computed all-zero" from "it computed something real but
@@ -1089,15 +1219,20 @@ void moe_forward_gguf(
             for (; i < D; ++i) token_output[i] += w * down_buf_ptr[i];
         };
 
-        // --- Pass A: issue every GPU-path expert's gate/up kernels (async,
-        // no sync), then immediately run each CPU-path expert synchronously
-        // -- the GPU chews through its queued kernels in the background
-        // while the CPU does this unrelated work, instead of the two never
-        // overlapping. See the expert_ffn_gpu_issue/_finish header comment. ---
-        scratch.pending_gpu.clear();
-        for (int k = 0; k < topk; ++k) {
+        // Issues expert k's GPU kernels (async, no sync) against whatever
+        // scratch.expert_ptrs[k] already holds, falling back to synchronous
+        // CPU compute if GPU dispatch isn't possible. Pulled out of the old
+        // single "Pass A" loop (which used to run only AFTER get_experts_
+        // batch) so it can also be called INLINE for shadowed (already
+        // VRAM-resident) experts below, BEFORE get_experts_batch's blocking
+        // disk read for this layer's genuine misses -- expert_ffn_gpu_issue
+        // never syncs, so those kernels execute on the GPU stream WHILE this
+        // thread blocks on io_uring for the rest of the batch, instead of
+        // the two running strictly back-to-back as before (real compute/IO
+        // overlap, not just async-within-GPU overlap).
+        auto dispatch_expert_k = [&](int k) {
             MoEExpertBlock* exp = scratch.expert_ptrs[k];
-            // A shadow block (see the loading loop above) legitimately has
+            // A shadow block (see the loading loop below) legitimately has
             // null host_ptr by design -- it's metadata-only, GPU dispatch
             // reads weight bytes from ExpertLocation::device_ptr, never
             // from here. Only a REAL (non-shadow) block missing host_ptr
@@ -1115,7 +1250,7 @@ void moe_forward_gguf(
                           !exp ? "NULL" : (!exp->gate_proj.host_ptr ? "missing gate_proj.host_ptr"
                                                                      : "missing down_proj.host_ptr"),
                           (void*)exp);
-                continue;
+                return;
             }
 
             ExpertGpuContext gpu_ctx;
@@ -1124,6 +1259,13 @@ void moe_forward_gguf(
             gpu_ctx.expert_id = exp->expert_id;
             gpu_ctx.slab_buffer = exp->slab_buffer;
             gpu_ctx.slab_capacity = exp->slab_capacity;
+            // Null for a shadow block (exp->vram_shadow) -- correct: a
+            // shadow's slab_buffer is already null too, so none of the
+            // synchronous-upload branches below (which all require
+            // gpu_ctx->slab_buffer) can ever fire for it anyway; also_in_vram
+            // marking is only relevant for a REAL RAM-tier block being
+            // promoted, never a metadata-only shadow.
+            gpu_ctx.exp = exp;
             // Reuse the shadow pre-check's find_expert() result instead of
             // calling it a second time -- a real, measured cost (Cache
             // mutex wait roughly doubled, 4.185s vs 1.4-2.0s, from this
@@ -1142,7 +1284,7 @@ void moe_forward_gguf(
             bool loc_from_active_layer = false;
             const ExpertLocation* resolved = expert_ffn_resolve_gpu_loc(
                 &gpu_ctx, 1, exp->gate_proj.meta, exp->up_proj.meta, exp->down_proj.meta,
-                &needs_release, &loc_from_active_layer);
+                &needs_release, &loc_from_active_layer, ram_mgr);
 
             bool gpu_issued = false;
             if (resolved) {
@@ -1151,7 +1293,17 @@ void moe_forward_gguf(
                                                    exp->gate_proj.meta, exp->up_proj.meta,
                                                    1, D, moe_inter);
                 if (gpu_issued) {
-                    scratch.pending_gpu.push_back({k, exp, resolved, needs_release, loc_from_active_layer});
+                    scratch.pending_gpu.push_back({k, exp, resolved, needs_release, loc_from_active_layer,
+                                                    gpu_ctx.expert_id});
+                    // Protect this RAM slot from being reclaimed by ANY
+                    // RAM-tier victim-selection (get_expert/get_experts_
+                    // batch/demote_from_vram) until Pass B below has
+                    // finished with this k -- see MoEExpertBlock::
+                    // ram_temp_pin_count's own comment for the real
+                    // release_hold-identity-mismatch bug this closes.
+                    // Harmless no-op if exp is a shadow scratch block
+                    // (never a RAM-tier victim-selection candidate).
+                    exp->ram_temp_pin_count++;
                 } else {
                     // gpu_scratch.ensure's cudaMalloc genuinely failed (VRAM
                     // exhaustion) -- this expert never got Pass B queued, so
@@ -1160,17 +1312,25 @@ void moe_forward_gguf(
                     // other place that releases it, will never run for this
                     // expert). Falls through to the CPU path below like any
                     // other GPU-dispatch failure.
+                    //
+                    // Uses gpu_ctx.expert_id (captured before
+                    // expert_ffn_resolve_gpu_loc ran), NOT exp->expert_id --
+                    // that call can promote this exact `exp` into the main
+                    // VRAM cache and, on a RAM-tier reclaim, clear
+                    // exp->expert_id to -1 before we ever get here. Same
+                    // "capture, don't re-read late" fix as PendingGpuExpert's
+                    // own expert_id field.
                     if (needs_release && gpu_ctx.topo) {
-                        gpu_ctx.topo->release_hold(layer_idx, exp->expert_id, resolved->device_ptr,
+                        gpu_ctx.topo->release_hold(layer_idx, gpu_ctx.expert_id, resolved->device_ptr,
                                                     loc_from_active_layer);
                     }
                     LOG_ERROR("[EXPERT-GPU] layer=%d expert=%d: GPU issue failed (scratch buffer "
-                              "grow), falling back to CPU for this call\n", layer_idx, exp->expert_id);
+                              "grow), falling back to CPU for this call\n", layer_idx, gpu_ctx.expert_id);
                 }
             }
             if (!gpu_issued && exp->vram_shadow) {
                 // Rare: a shadow-fast-pathed expert (confirmed VRAM-resident
-                // moments ago, in the loading loop above) failed to actually
+                // moments ago, in the loading loop below) failed to actually
                 // dispatch on GPU after all -- either a genuine race
                 // (evicted in the narrow window between that check and
                 // here) or expert_ffn_gpu_issue's scratch buffer grow
@@ -1190,7 +1350,7 @@ void moe_forward_gguf(
                               "RAM reload also failed -- skipping this expert's contribution "
                               "entirely rather than read a null/stale pointer\n",
                               layer_idx, exp->expert_id);
-                    continue;
+                    return;
                 }
             }
             if (!gpu_issued) {
@@ -1202,6 +1362,188 @@ void moe_forward_gguf(
                     scratch.gate_buf.data(), scratch.up_buf.data(),
                     1, D, moe_inter);
                 accumulate(k, exp, scratch.down_buf.data());
+            }
+        };
+        scratch.pending_gpu.clear();
+
+        // --- Load all needed experts (LRU cache handles hits/misses; most
+        // will already be warm here thanks to Phase 1/2 above). Batched:
+        // get_experts_batch parallelizes the disk reads for whichever of
+        // this layer's topk picks are genuine misses (not already staged
+        // via PIPE), instead of the old one-pread-at-a-time sequential
+        // loop 
+        //
+        // FIX (real, measured "[TIER-OVERLAP]" bug -- see CLAUDE.md): this
+        // used to call get_experts_batch UNCONDITIONALLY for the entire
+        // topk list, even for experts already GPU-resident -- wasting a
+        // real disk read and a real RAM slot on data whose BYTES the GPU
+        // path never reads (it reads weight bytes from
+        // ExpertLocation::device_ptr, and the per-projection TYPE from the
+        // packed base tensor, uniform across every expert in a layer --
+        // neither needs a RAM copy). A real run showed 66% of everything
+        // VRAM-resident was ALSO RAM-resident as a direct result, 12+ GB
+        // double-counted. Fixed by checking VRAM residency first (a real
+        // find_expert lookup, same one dispatch_expert_k above already does
+        // for its own purposes) and building a metadata-only "shadow" block
+        // (populate_vram_shadow, zero I/O) for anything already resident +
+        // GPU-type-supported, instead of loading it into RAM at all. Only
+        // the remainder -- not yet VRAM-resident, or an unsupported type --
+        // still goes through the real get_experts_batch path below,
+        // batched exactly as before.
+        //
+        // COMPUTE/IO OVERLAP: a shadowed expert's kernels are issued via
+        // dispatch_expert_k IMMEDIATELY below, inline in this same k-loop --
+        // NOT deferred until after get_experts_batch runs, as they used to
+        // be -- so they run on the GPU stream while this thread goes on to
+        // block on this layer's disk-bound misses instead of the two
+        // running strictly sequentially.
+        {
+            size_t shadow_gb = 0, shadow_ub = 0, shadow_db = 0;
+            const GGUFTensor *shadow_gM = nullptr, *shadow_uM = nullptr, *shadow_dM = nullptr;
+            // FIX (real, high-impact bug found while chasing a persistent
+            // [TIER-OVERLAP] baseline that didn't respond to any promotion-
+            // reclaim fix): this used to call engine.packed_slab_geometry(...)
+            // here, which only recognizes the PACKED tensor convention. For
+            // an unpacked_expert_format=true model (this project's own
+            // recommended format for the single-DMA-per-expert read path),
+            // packed_slab_geometry returns false for EVERY layer -- meaning
+            // layer_gpu_capable was false everywhere, the entire shadow-
+            // fast-path below (the mechanism whose whole job is "skip the
+            // RAM-tier lookup for anything already VRAM-resident") never
+            // fired even once, and EVERY routed expert on EVERY token --
+            // including all of pinned_vram_capacity's PERMANENTLY VRAM-
+            // resident experts, which never go through any promotion event
+            // and therefore have no other path to ever getting their RAM
+            // copy reclaimed -- fell through to the unconditional RAM-tier
+            // load below. This is almost certainly why [TIER-OVERLAP]
+            // stayed flat (~520-720) across four rounds of active-layer-
+            // promotion-reclaim fixes: those fixes only address experts
+            // freshly PROMOTED into VRAM, never the much larger set that's
+            // ALREADY VRAM-resident (pinned or otherwise) and gets
+            // redundantly RAM-loaded anyway because this gate never lets
+            // them skip that load. The fix already exists a few lines
+            // below for a DIFFERENT feature (cuFile eligibility) that hit
+            // the exact same packed-only limitation and was updated to use
+            // expert_layer_geometry (the unified dispatcher supporting
+            // both formats) -- that fix was never carried back to this
+            // older variable. Now uses the same unified dispatcher here too.
+            bool layer_gpu_capable = !cpu_only_mode() && !is_cpu_affinity_layer(layer_idx) && ram_mgr.vram_cache &&
+                engine.expert_layer_geometry(layer_idx, shadow_gb, shadow_ub, shadow_db,
+                                              shadow_gM, shadow_uM, shadow_dM) &&
+                gpu_type_supported(shadow_gM->type) && gpu_type_supported(shadow_uM->type) &&
+                gpu_type_supported(shadow_dM->type);
+
+            // cuFile (GPUDirect Storage) direct disk->VRAM eligibility for
+            // this layer -- kept as a SEPARATE check from layer_gpu_capable
+            // above (not merged into one, even though both now use
+            // expert_layer_geometry) since the two conditions are otherwise
+            // independent (cuFile also needs cuda_cufile_active) and
+            // merging them would make a future change to one silently
+            // affect the other. Layer-level pre-filter only (cheap,
+            // tensor-table lookups) -- the actual per-expert absolute file
+            // offset is resolved again inside the k-loop below, where the
+            // specific expert_id is known.
+            bool cufile_layer_eligible = engine.cuda_cufile_active && !is_cpu_affinity_layer(layer_idx)
+                && ram_mgr.vram_cache;
+            if (cufile_layer_eligible) {
+                size_t cf_gb = 0, cf_ub = 0, cf_db = 0;
+                const GGUFTensor *cf_gM = nullptr, *cf_uM = nullptr, *cf_dM = nullptr;
+                cufile_layer_eligible = engine.expert_layer_geometry(layer_idx, cf_gb, cf_ub, cf_db,
+                                                                       cf_gM, cf_uM, cf_dM)
+                    && gpu_type_supported(cf_gM->type) && gpu_type_supported(cf_uM->type)
+                    && gpu_type_supported(cf_dM->type);
+            }
+
+            static thread_local std::vector<int> ram_needed_ids;
+            static thread_local std::vector<int> ram_needed_k;
+            static thread_local std::vector<MoEExpertBlock*> ram_needed_ptrs;
+            ram_needed_ids.clear(); ram_needed_k.clear();
+            ram_needed_ids.reserve(topk); ram_needed_k.reserve(topk);
+
+            for (int k = 0; k < topk; ++k) {
+                int expert_id = scratch.tok_topk_ids[s * topk + k];
+                bool shadowed = false;
+                scratch.vram_loc_hint[k] = nullptr;  // explicit every layer/token -- resize()'s
+                                                      // one-time clear only covers the FIRST call
+                if (layer_gpu_capable) {
+                    const ExpertLocation* loc = ram_mgr.vram_cache->find_expert(layer_idx, expert_id);
+                    if (loc && loc->device_ptr) {
+                        MoEExpertBlock& shadow = scratch.vram_shadow_blocks[k];
+                        engine.populate_vram_shadow(shadow, layer_idx, expert_id);
+                        scratch.expert_ptrs[k] = &shadow;
+                        scratch.vram_loc_hint[k] = loc;
+                        shadowed = true;
+                    }
+                }
+                // cuFile direct disk->VRAM: only ever for a GENUINE double
+                // miss (not shadowed above -- i.e. not already VRAM-
+                // resident -- AND not already RAM-resident). Re-reading
+                // from disk via cuFile when a perfectly good copy already
+                // sits in host RAM would waste real NVMe bandwidth for a
+                // slower net result than the existing RAM->VRAM promotion
+                // path, which is exactly what this check exists to prevent
+                // -- see RAMSafetyManager::is_ram_resident's own comment.
+                if (!shadowed && cufile_layer_eligible) {
+                    if (ram_mgr.is_ram_resident(layer_idx, expert_id)) {
+                        perf().n_cufile_skipped_ram_resident.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        // Resolve THIS expert's absolute file offsets --
+                        // packed format needs expert_id*per_expert_size
+                        // added to the shared _exps tensor's base offset;
+                        // unpacked format's per-expert tensor offset IS
+                        // already absolute (mirrors build_expert_read_
+                        // requests' identical packed-vs-unpacked branching).
+                        size_t eg = 0, eu = 0, ed = 0;
+                        const GGUFTensor *egM = nullptr, *euM = nullptr, *edM = nullptr;
+                        bool have_geom = engine.unpacked_expert_format
+                            ? engine.unpacked_expert_geometry(layer_idx, expert_id, eg, eu, ed, egM, euM, edM)
+                            : engine.packed_slab_geometry(layer_idx, eg, eu, ed, egM, euM, edM);
+                        if (have_geom) {
+                            uint64_t gate_off = egM->offset
+                                + (engine.unpacked_expert_format ? 0 : (uint64_t)expert_id * eg);
+                            uint64_t up_off = euM->offset
+                                + (engine.unpacked_expert_format ? 0 : (uint64_t)expert_id * eu);
+                            uint64_t down_off = edM->offset
+                                + (engine.unpacked_expert_format ? 0 : (uint64_t)expert_id * ed);
+                            const cufile_io::FileHandle* h = engine.model_file.cufile_handle_for_tensor(*egM);
+                            if (h && h->valid) {
+                                const ExpertLocation* cf_loc = ram_mgr.vram_cache->upload_expert_cufile(
+                                    layer_idx, expert_id, *h, gate_off, eg, up_off, eu, down_off, ed);
+                                if (cf_loc) {
+                                    MoEExpertBlock& shadow = scratch.vram_shadow_blocks[k];
+                                    engine.populate_vram_shadow(shadow, layer_idx, expert_id);
+                                    scratch.expert_ptrs[k] = &shadow;
+                                    scratch.vram_loc_hint[k] = cf_loc;
+                                    shadowed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (!shadowed) {
+                    ram_needed_ids.push_back(expert_id);
+                    ram_needed_k.push_back(k);
+                } else {
+                    // Already VRAM-resident (or cuFile-loaded moments ago
+                    // above) -- issue its GPU kernels now instead of waiting
+                    // for the blocking get_experts_batch call below, so they
+                    // run on the GPU stream concurrently with that call's
+                    // disk I/O for this layer's genuine misses.
+                    dispatch_expert_k(k);
+                }
+            }
+            if (!ram_needed_ids.empty()) {
+                ram_needed_ptrs.resize(ram_needed_ids.size());
+                ram_mgr.get_experts_batch(engine, layer_idx, ram_needed_ids.data(),
+                                           (int)ram_needed_ids.size(), ram_needed_ptrs.data());
+                for (size_t i = 0; i < ram_needed_ids.size(); ++i)
+                    scratch.expert_ptrs[ram_needed_k[i]] = ram_needed_ptrs[i];
+                // Dispatch whatever get_experts_batch just resolved. The
+                // shadowed experts above already had their kernels issued
+                // inline, before this blocking call ran -- only the genuine
+                // misses are dispatched here, after their data is ready.
+                for (size_t i = 0; i < ram_needed_k.size(); ++i)
+                    dispatch_expert_k(ram_needed_k[i]);
             }
         }
 
@@ -1216,8 +1558,17 @@ void moe_forward_gguf(
                 gs, p.loc,
                 scratch.gate_buf.data(), scratch.up_buf.data(), scratch.down_buf.data(),
                 p.exp->gate_proj.meta, p.exp->down_proj.meta,
-                layer_idx, p.exp->expert_id, 1, D, moe_inter,
+                layer_idx, p.expert_id, 1, D, moe_inter,
                 ram_mgr.vram_cache, p.needs_release, p.loc_from_active_layer);
+            // Matches Pass A's increment -- release the RAM-tier protection
+            // now that expert_ffn_gpu_finish's own release_hold() call
+            // (which uses p.expert_id, captured at Pass A issue time -- see
+            // PendingGpuExpert's own comment for why NOT p.exp->expert_id)
+            // has already happened. Must be the LAST thing done with
+            // p.exp's identity in this iteration; this slot becomes a valid
+            // victim-selection candidate again immediately after this
+            // decrement.
+            if (p.exp->ram_temp_pin_count > 0) p.exp->ram_temp_pin_count--;
             accumulate(p.k, p.exp, scratch.down_buf.data());
         }
 
@@ -1253,7 +1604,22 @@ void moe_forward_gguf(
     // Three-tier caching: Cleanup active layer area after processing this layer
     // This reclaims temporary workspace used for current-layer experts
     if (ram_mgr.vram_cache && ram_mgr.vram_cache->active_layer_pool) {
-        ram_mgr.vram_cache->cleanup_active_layer_area(layer_idx);
+        // FIX ("[TIER-OVERLAP]" leak, see CLAUDE.md): the rare end-of-layer
+        // promotion path (a slot that crossed active_layer_promote_threshold
+        // but couldn't promote inline via find_active_expert, e.g. because
+        // it was still held mid-compute at that moment) has the same
+        // durable-main-cache-now-exists fact to report as the inline hit
+        // path does -- but unlike that call site, there's no single
+        // MoEExpertBlock* in scope here (this is a sweep over up to
+        // active_layer_capacity slots, not one dispatch's gpu_ctx), so this
+        // goes through RAMSafetyManager::finish_sync_promotion's lookup
+        // overload (a real RAM-tier lookup by (layer, expert_id)) rather
+        // than gpu_ctx->exp directly -- see that function's own comment in
+        // ram_manager.hpp for why this reclaims the slot immediately rather
+        // than just marking it (a real run showed marking-only barely moves
+        // [TIER-OVERLAP] within a short test).
+        ram_mgr.vram_cache->cleanup_active_layer_area(layer_idx,
+            [&](int l, int eid) { ram_mgr.finish_sync_promotion(engine, l, eid); });
     }
 }
 
@@ -1397,7 +1763,7 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
             if (l < c.first_dense) {
                 dense_ffn_gguf(engine, l, hidden_states, S, scratch.moe_out.data(), scratch);
             } else {
-                moe_forward_gguf(engine, ram_mgr, l, hidden_states, S, scratch.moe_out.data(), scratch);
+                moe_forward_gguf(engine, ram_mgr, async_io_queue, l, hidden_states, S, scratch.moe_out.data(), scratch);
             }
         }
 

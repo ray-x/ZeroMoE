@@ -262,6 +262,19 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     PERF_END(prefill, t_prefill_total);
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
 
+    // Snapshot VRAM slot occupancy RIGHT HERE, at the exact prefill/decode
+    // boundary -- directly comparable against the SAME [VRAM-SLOTS] line
+    // printed again at shutdown (report_slot_summary, gpu_topology.hpp),
+    // to see how much filling happened during prefill (startup preload +
+    // Phase 2's warm-up) vs. during decode's own reactive promotions
+    // afterward. Previously the only way to see prefill's own contribution
+    // was to infer it indirectly.
+    if (ram_mgr.vram_cache) {
+        LOG_STREAM_INFO() << "[PREFILL-DONE] VRAM slot occupancy immediately after prefill (before any decode "
+                              "token) -- compare against the same [VRAM-SLOTS] line at shutdown:\n";
+        ram_mgr.vram_cache->report_slot_summary();
+    }
+
     // Reclaim GPU scratch grown to fit this prefill's full S -- decode
     // (below) only ever calls with S=1 from here on, so anything grown
     // above that is dead weight for the rest of this request. Real,

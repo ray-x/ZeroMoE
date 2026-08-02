@@ -136,7 +136,8 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
     return victim;
 }
 
-void GpuTopology::cleanup_active_layer_area(int current_layer_idx) {
+void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
+                                             const std::function<void(int, int)>& on_promoted) {
     if (active_layer_pool == nullptr) {
         return;  // Not allocated, nothing to cleanup
     }
@@ -162,7 +163,7 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx) {
             // is exactly "swap out the one not used": just free it.
             if (slot.hit_count >= active_layer_promote_threshold) {
                 promote_active_to_main(slot.layer_idx, slot.expert_id,
-                                       slot.device_ptr, slot.size);
+                                       slot.device_ptr, slot.size, on_promoted);
             }
             // Clear slot regardless of whether promotion happened above --
             // promote_active_to_main only copies the bytes elsewhere, it
@@ -185,9 +186,11 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx) {
     }
 }
 
-ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id) {
+ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id,
+                                                 const std::function<void(int, int)>& on_promoted) {
     if (active_layer_pool == nullptr) return nullptr;
     GPU_TOPO_TIMED_LOCK(lock);
+    PERF_SCOPE(t_find_active_expert);
 
     for (auto& slot : active_layer_slots) {
         if (slot.layer_idx == layer && slot.expert_id == expert_id) {
@@ -206,6 +209,17 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id) {
                 // active-layer-resident under its EXISTING identity (still
                 // safe to serve this same expert) and a later hit or
                 // cleanup call will retry the free once the hold clears.
+                // Deliberately NOT forwarding on_promoted into this call --
+                // promote_active_to_main would fire it as soon as its OWN
+                // copy succeeds, before the temp_pin_count check just below
+                // decides whether this slot can actually be cleared and
+                // `promoted` actually returned. If that check fails (a hold
+                // is outstanding right now), this function falls through to
+                // returning `&slot` (still active-layer!) a few lines down --
+                // firing the callback here unconditionally would tell the
+                // caller "loc is now main-cache" for a `loc` that's actually
+                // still the active-layer slot. Fired manually below, only in
+                // the branch that actually commits to returning `promoted`.
                 ExpertLocation* promoted = promote_active_to_main(layer, expert_id,
                                                                    slot.device_ptr, slot.size);
                 if (promoted && slot.temp_pin_count == 0) {
@@ -214,6 +228,7 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id) {
                     slot.last_used_clock = 0;
                     slot.hit_count = 0;
                     slot.upload_ready = true;
+                    if (on_promoted) on_promoted(layer, expert_id);
                     return promoted;
                 }
                 // Main cache unavailable/copy failed, or this slot is still
@@ -227,12 +242,20 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id) {
 }
 
 ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,
-                                                     const uint8_t* device_src, size_t bytes) {
+                                                     const uint8_t* device_src, size_t bytes,
+                                                     const std::function<void(int, int)>& on_promoted) {
     if (expert_vram_cache_cap == 0 || !device_src || bytes == 0) return nullptr;
     GPU_TOPO_TIMED_LOCK(lock);
 
     ExpertLocation* existing = find_expert(layer, expert_id);
-    if (existing) return existing;  // already resident via some other path
+    if (existing) {
+        // Already durably main-cache-resident via some OTHER path (e.g. a
+        // cold-batch/decode-miss upload raced ahead of this promotion) --
+        // still fire on_promoted: the RAM tier still needs to know a
+        // durable VRAM copy exists, regardless of which path put it there.
+        if (on_promoted) on_promoted(layer, expert_id);
+        return existing;
+    }
 
     int old_layer = -1, old_expert = -1;
     ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert);
@@ -268,5 +291,6 @@ ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,
     slot->last_used_clock = ++cache_clock;
     vram_swap_stats[swap_key(layer, expert_id)].swap_in++;
     expert_index[swap_key(layer, expert_id)] = (size_t)(slot - expert_vram_cache.data());
+    if (on_promoted) on_promoted(layer, expert_id);
     return slot;
 }

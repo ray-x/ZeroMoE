@@ -13,6 +13,7 @@
 #include <vector>
 #include <memory>
 #include <unordered_map>
+#include <algorithm>
 
 #ifdef __APPLE__
 // macOS doesn't have posix_fadvise; provide no-op stubs. The function
@@ -136,6 +137,46 @@ struct MoEExpertBlock {
     // strictly necessary, never the reverse.
     cudaEvent_t pending_copy_event = nullptr;
 
+    // TEMPORARY protection for a RAM-tier slot referenced by a raw
+    // MoEExpertBlock* held across moe_forward_gguf's Pass A -> Pass B gap
+    // (execution_layer.cpp's PendingGpuExpert::exp) -- reference-counted,
+    // same discipline as GpuTopology::ExpertLocation::temp_pin_count on the
+    // VRAM side. Real, measured bug this closes: Pass A resolves `exp`,
+    // takes a VRAM hold_for_compute() keyed on the expert_id AT THAT TIME,
+    // and queues Pass B to release it later -- but Pass B reads
+    // `p.exp->expert_id` FRESH at release time, not a value captured at
+    // Pass A. If ANY RAM-tier victim-selection scan (demote_from_vram's
+    // VRAM-eviction salvage being the one actually observed firing --
+    // config vram_evict_demote_to_ram=true makes this reachable from
+    // WITHIN Pass A itself, since an earlier k's synchronous VRAM upload
+    // can trigger on_vram_evict/demote_from_vram before this k's Pass B
+    // ever runs) reclaims this exact slot for a DIFFERENT expert in that
+    // gap, Pass B's release_hold() call ends up searching for the WRONG
+    // (new) identity -- "release_hold found no matching resident slot,
+    // which should never happen" is the resulting symptom. Worse than a
+    // log line: the REAL VRAM slot that was actually held NEVER gets its
+    // temp_pin_count decremented when this happens, permanently leaking it
+    // as un-evictable -- every occurrence shrinks the usable VRAM cache by
+    // one slot for the rest of the process, a real cumulative cause of
+    // throughput degrading over a long run. Every RAM-slot victim-
+    // selection site (get_expert Step 3, get_experts_batch Phase A,
+    // demote_from_vram) must check this alongside copy_still_pending(),
+    // same "never pick, no matter how attractive otherwise" priority.
+    int ram_temp_pin_count = 0;
+
+    // True when this slot's bytes were served via LockFreePrefetcher::
+    // consume_staged (a RAM-tier miss the pilot correctly predicted and
+    // staged ahead of time) rather than a synchronous disk pread. Exists
+    // solely to make the effect of removing finish_prefetch's old
+    // unconditional VRAM-promotion call (async_prefetcher.hpp) directly
+    // observable: n_pipe_staged_later_promoted (perf_timer.hpp) counts how
+    // many of these later cross promote_hit_threshold and get promoted via
+    // the normal hit-count-gated path, proving prefetched experts still
+    // reach VRAM -- just only once a real subsequent access confirms it,
+    // never on unconfirmed speculation. Reset to false whenever a slot is
+    // claimed for a different expert, same lifecycle as also_in_vram.
+    bool from_pipe_prefetch = false;
+
     // Self-healing: true if a previously-issued async H2D copy FROM this
     // slot's slab_buffer may still be reading it. Same "poll before trust"
     // pattern find_expert/evict_lru already use for the VRAM side's
@@ -165,6 +206,20 @@ public:
     // NEXT run). Atomic so the (future) batched/router-parallel path can bump
     // it without locking; today moe_forward_gguf bumps it single-threaded.
     std::vector<std::atomic<uint64_t>> route_freq;
+    // Parallel histogram, same [n_layers * n_experts] shape, but ONLY ever
+    // bumped for selections made during prefill (S > 1) -- see
+    // bump_route_freq_prefill. route_freq itself keeps accumulating BOTH
+    // phases combined, unchanged, for anything that already relies on the
+    // combined signal; this is purely additive. Motivated by a real,
+    // measured problem: decode contributes far more routing VOLUME per
+    // request than prefill does (e.g. 40 decode tokens' worth of top-k
+    // selections vs. 11 prefill tokens'), so in the COMBINED histogram a
+    // decode-favored expert can outrank a prefill-favored one purely on
+    // count, even though prefill needs it every single run -- starving
+    // startup [PIN] preload of prefill's own signal. Dumped to a SEPARATE
+    // file (EngineConfig::prefill_pin_file) so preload can consult it
+    // specifically. See CLAUDE.md.
+    std::vector<std::atomic<uint64_t>> route_freq_prefill;
     std::vector<float*> Lc;   // Host KV latent cache [n_layers+1][max_t * kv_lora]
     std::vector<float*> Rc;   // Host KV rope cache [n_layers+1][max_t * qk_rope]
 
@@ -202,9 +257,36 @@ public:
     int gpu_device_id = -1;
 
     // Configuration: page cache policy for expert slabs after reading
-    // false = leave pages in OS page cache 
+    // false = leave pages in OS page cache
     // true = POSIX_FADV_DONTNEED after read (reduces memory pressure under tight RAM)
     bool drop_expert_pages = false;
+
+    // Set from EngineConfig::unpacked_expert_format at startup (main.cpp),
+    // before sanity_check_unpacked_format() is called. See that config
+    // field's own comment for the full contract: true means this model
+    // directory was produced by `gguf_tool pack --unpack` (per-expert
+    // tensors, physically tight gate/up/down per expert) rather than the
+    // default packed _exps format, and every fast-path geometry lookup
+    // below (expert_layer_geometry, build_expert_read_requests) should
+    // resolve against the per-expert tensor convention instead.
+    bool unpacked_expert_format = false;
+
+    // Set from EngineConfig::cuda_cufile at startup (main.cpp), AFTER
+    // confirming GGUFFile::enable_cufile() actually registered at least one
+    // shard AND GpuTopology's expert cache pool(s) registered successfully
+    // (cufile_io::available() plus real per-shard/per-device registration
+    // results) -- this is the single "is cuFile genuinely usable right
+    // now" flag execution_layer.cpp's Phase 3 loading loop checks, distinct
+    // from config.cuda_cufile (the raw request) the same way direct_io/
+    // io_uring already distinguish "requested" from "actually active".
+    bool cuda_cufile_active = false;
+
+    // Set from EngineConfig::prefill_warm_via_prefetcher at startup
+    // (main.cpp). See that config field's own comment: routes Phase 2's
+    // (moe_forward_gguf's S>1 cold-start VRAM warm-up) candidate loads
+    // through the background prefetcher instead of loading them
+    // synchronously in the critical path.
+    bool prefill_warm_via_prefetcher = false;
 
     // Frees every buffer this class allocated directly: host-side
     // posix_memalign'd tensors (resident dense weights, KV cache, expert
@@ -314,6 +396,189 @@ public:
         return true;
     }
 
+    // Per-(layer,expert) geometry for the `unpacked_expert_format` layout
+    // (gguf_tool pack --unpack): unlike packed_slab_geometry, there is no
+    // single shared _exps tensor to slice by expert index -- gate/up/down
+    // are THREE SEPARATE tensors per expert, named blk.N.ffn_{gate,up,
+    // down}.E.weight. Returns false if any of the three are missing for
+    // this exact (layer_idx, expert_id) pair. Pure tensor-table lookup, no
+    // I/O -- same cost class as packed_slab_geometry.
+    bool unpacked_expert_geometry(int layer_idx, int expert_id, size_t& gb, size_t& ub, size_t& db,
+                                   const GGUFTensor*& gM, const GGUFTensor*& uM, const GGUFTensor*& dM) const {
+        std::string base = "blk." + std::to_string(layer_idx) + ".";
+        std::string es = std::to_string(expert_id);
+        auto gIt = model_file.tensors.find(base + "ffn_gate." + es + ".weight");
+        auto uIt = model_file.tensors.find(base + "ffn_up." + es + ".weight");
+        auto dIt = model_file.tensors.find(base + "ffn_down." + es + ".weight");
+        if (gIt == model_file.tensors.end() || uIt == model_file.tensors.end() || dIt == model_file.tensors.end())
+            return false;
+        gM = &gIt->second; uM = &uIt->second; dM = &dIt->second;
+        gb = gM->size_bytes; ub = uM->size_bytes; db = dM->size_bytes;
+        return true;
+    }
+
+    // True only if gM/uM/dM are on the SAME fd and physically back-to-back
+    // with no gap (up starts exactly where gate ends, down exactly where up
+    // ends) -- the precondition for reading all three with ONE combined DMA
+    // request instead of three scattered ones. tools/gguf_pack.cpp's
+    // --unpack layout pass produces exactly this for every expert (see its
+    // own Step 4 comment); sanity_check_unpacked_format validates it holds
+    // for the WHOLE model at startup, and build_expert_read_requests
+    // re-checks it defensively at read time (belt-and-suspenders -- the
+    // tensor table is static after load_header, so this should never
+    // disagree with the startup check, but a mismatch here means "refuse
+    // to read across an unknown gap", never "guess and read garbage").
+    bool unpacked_expert_is_tight(const GGUFTensor& gM, const GGUFTensor& uM, const GGUFTensor& dM) const {
+        int fd = model_file.fd_for_tensor(gM);
+        return model_file.fd_for_tensor(uM) == fd && model_file.fd_for_tensor(dM) == fd
+            && uM.offset == gM.offset + gM.size_bytes
+            && dM.offset == uM.offset + uM.size_bytes;
+    }
+
+    // Unified layer-level geometry: dispatches to packed_slab_geometry (the
+    // default format) or, when unpacked_expert_format is set, to
+    // unpacked_expert_geometry using expert 0 as the layer's representative
+    // (sanity_check_unpacked_format guarantees every expert in a layer
+    // shares the same gb/ub/db before the engine ever starts real work, so
+    // expert 0 is exactly as valid as any other expert for TYPE/SIZE
+    // purposes -- callers needing a SPECIFIC expert's own tensors for a
+    // real read still call unpacked_expert_geometry directly, see
+    // build_expert_read_requests). Existing callers that only need
+    // layer-level sizing/type info (populate_vram_shadow,
+    // compute_expert_slab_bytes) gain unpacked-format support through this
+    // one switch point with no other change.
+    bool expert_layer_geometry(int layer_idx, size_t& gb, size_t& ub, size_t& db,
+                                const GGUFTensor*& gM, const GGUFTensor*& uM, const GGUFTensor*& dM) const {
+        if (unpacked_expert_format)
+            return unpacked_expert_geometry(layer_idx, 0, gb, ub, db, gM, uM, dM);
+        return packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM);
+    }
+
+    // Full-model startup validation for unpacked_expert_format=true. Called
+    // once from main.cpp right after the model graph is built (so
+    // architecture_config.n_layers/n_experts are known), BEFORE any real
+    // generation work starts. Confirms, for every layer that has experts:
+    // every expert 0..n_experts-1 has all three tensors present, every
+    // expert's projection sizes match the layer's own expert 0 (the
+    // uniformity expert_layer_geometry's single-representative-expert
+    // shortcut depends on), and every expert is physically tight
+    // (unpacked_expert_is_tight) -- the precondition for
+    // build_expert_read_requests' single-DMA path. Any violation prints a
+    // FATAL line to stderr and returns false immediately (does not keep
+    // scanning past the first failure) -- this flag is an explicit
+    // performance contract from whoever set it (the whole point of
+    // --unpack + this flag is "faster than the default packed format", see
+    // CLAUDE.md), so a violation must stop the run rather than silently
+    // degrade to the slow per-projection path the flag exists to avoid.
+    // A layer with ZERO experts present (a leading dense-only layer, e.g.
+    // GLM-5.2's first_dense layers) is legitimate and skipped, not an
+    // error; a layer with SOME but not all experts present is a real,
+    // fatal incomplete-repack signature (mirrors gguf_tool verify's own
+    // completeness check, but enforced by the engine itself at load time
+    // for this specific format instead of left to a separate offline step).
+    bool sanity_check_unpacked_format() const {
+        int n_layers = model_file.architecture_config.n_layers;
+        int n_exp = model_file.architecture_config.n_experts;
+        if (n_layers <= 0 || n_exp <= 0) {
+            fprintf(stderr, "[FATAL] unpacked_expert_format=true but architecture_config has "
+                            "n_layers=%d n_experts=%d -- cannot validate, refusing to run\n",
+                    n_layers, n_exp);
+            return false;
+        }
+        for (int l = 0; l < n_layers; ++l) {
+            size_t layer_gb = 0, layer_ub = 0, layer_db = 0;
+            bool have_layer_size = false;
+            int found = 0;
+            for (int e = 0; e < n_exp; ++e) {
+                size_t gb, ub, db;
+                const GGUFTensor *gM, *uM, *dM;
+                if (!unpacked_expert_geometry(l, e, gb, ub, db, gM, uM, dM)) {
+                    if (found == 0) break;  // no experts in this layer at all -- fine, e.g. a dense-only layer
+                    fprintf(stderr, "[FATAL] unpacked_expert_format=true: layer %d expert %d is missing "
+                                    "one or more of ffn_{gate,up,down}.%d.weight (found %d/%d experts for "
+                                    "this layer before this gap) -- incomplete repack, not a valid "
+                                    "'aligned unpacked' model. Stopping before any real read.\n",
+                            l, e, e, found, n_exp);
+                    return false;
+                }
+                found++;
+                if (!have_layer_size) {
+                    layer_gb = gb; layer_ub = ub; layer_db = db;
+                    have_layer_size = true;
+                } else if (gb != layer_gb || ub != layer_ub || db != layer_db) {
+                    fprintf(stderr, "[FATAL] unpacked_expert_format=true: layer %d expert %d has "
+                                    "projection sizes (%zu,%zu,%zu) bytes but this layer's expert 0 had "
+                                    "(%zu,%zu,%zu) -- non-uniform per-expert sizes within one layer are "
+                                    "not supported by the single-DMA fast path. Stopping.\n",
+                            l, e, gb, ub, db, layer_gb, layer_ub, layer_db);
+                    return false;
+                }
+                if (!unpacked_expert_is_tight(*gM, *uM, *dM)) {
+                    fprintf(stderr, "[FATAL] unpacked_expert_format=true: layer %d expert %d's "
+                                    "gate/up/down are not physically contiguous on one file (likely split "
+                                    "across a repack output-shard boundary) -- the single-DMA fast path "
+                                    "requires every expert to be tight. Re-run gguf_tool pack --unpack "
+                                    "with a larger --max-shard-gb so no expert straddles a shard boundary, "
+                                    "or set unpacked_expert_format=false and use the default --align-only "
+                                    "packed format instead. Stopping before any real read.\n",
+                            l, e);
+                    return false;
+                }
+            }
+            if (found > 0 && found != n_exp) {
+                fprintf(stderr, "[FATAL] unpacked_expert_format=true: layer %d has only %d/%d experts "
+                                "present -- incomplete repack. Stopping.\n",
+                        l, found, n_exp);
+                return false;
+            }
+        }
+        LOG_INFO("[UNPACKED] sanity check passed: every MoE layer's experts are complete, uniformly "
+                 "sized, and physically tight -- single-DMA reads enabled.\n");
+        return true;
+    }
+
+    // Detects the specific mismatch that caused a real, measured slowdown:
+    // a model genuinely IS in the per-expert ("unpacked") tensor-naming
+    // convention (gguf_tool verify would report "Expert format: per-expert"
+    // for it), but unpacked_expert_format wasn't set to tell the engine
+    // that -- which silently disables BOTH io_uring Phase B batching and
+    // the VRAM-shadow bypass fast path for the ENTIRE run (packed_slab_
+    // geometry, the shared gate for both, finds none of the packed _exps
+    // tensors it looks for), forcing every dispatch through the slow,
+    // unbatched fallback with zero visible error. A real run showed this
+    // exact signature: 100% "layer-not-packed" on every decode-thread
+    // io_uring batch attempt, `disk=` time exceeding its own containing
+    // `expert=` wall-clock window (the thread-summed-OMP-fallback tell),
+    // and no [CONFIG] indication anything was wrong.
+    //
+    // Pure tensor-table lookups only (packed_slab_geometry/
+    // unpacked_expert_geometry), no I/O -- cheap enough to run
+    // unconditionally at startup. Deliberately conservative: returns true
+    // ONLY if EVERY MoE layer is missing packed tensors AND has per-expert
+    // ones -- the moment even one layer has packed tensors, this returns
+    // false immediately, since a MIXED result means something else is
+    // wrong (an incomplete/partial repack) that's gguf_tool verify's job
+    // to catch, not this check's. Intentionally warn-only at the call
+    // site, not a hard refusal like sanity_check_unpacked_format's own --
+    // the model may still run correctly here, just slowly, and there's no
+    // equivalent contract violation to refuse over.
+    bool looks_like_unpacked_format() const {
+        int n_layers = model_file.architecture_config.n_layers;
+        int first_dense = std::max(0, model_file.architecture_config.first_dense);
+        if (n_layers <= 0 || first_dense >= n_layers) return false;
+        int total_moe_layers = 0, unpacked_signature = 0;
+        for (int l = first_dense; l < n_layers; ++l) {
+            ++total_moe_layers;
+            size_t gb, ub, db;
+            const GGUFTensor *gM, *uM, *dM;
+            if (packed_slab_geometry(l, gb, ub, db, gM, uM, dM)) {
+                return false; // at least one layer IS packed -- not this scenario
+            }
+            if (unpacked_expert_geometry(l, 0, gb, ub, db, gM, uM, dM)) ++unpacked_signature;
+        }
+        return total_moe_layers > 0 && unpacked_signature == total_moe_layers;
+    }
+
     // Ensure target_slot.slab_buffer can hold `total` bytes (grow-only, like
     // load_expert_slab). Used by both the pread path and the consume_staged
     // path so the destination buffer is sized before the bytes arrive.
@@ -372,7 +637,7 @@ public:
     // and the weight bytes from ExpertLocation::device_ptr -- never from
     // a RAM copy). This fills in exactly that metadata (type + the
     // packed slab's uniform per-expert relative offsets: gate=0, up=gb,
-    // down=gb+ub) from packed_slab_geometry, which is a pure tensor-table
+    // down=gb+ub) from expert_layer_geometry, which is a pure tensor-table
     // lookup already parsed at GGUF load time -- same source
     // load_expert_slab itself uses before it ever touches disk. host_ptr
     // is deliberately left null; slot.vram_shadow=true is the required
@@ -382,7 +647,7 @@ public:
     bool populate_vram_shadow(MoEExpertBlock& slot, int layer_idx, int expert_id) const {
         size_t gb = 0, ub = 0, db = 0;
         const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
-        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
+        if (!expert_layer_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
         slot.gate_proj.host_ptr = nullptr;
         slot.gate_proj.meta = *gM;
         slot.gate_proj.meta.offset = 0;
@@ -400,10 +665,11 @@ public:
         return true;
     }
 
-    // Builds the (up to 3) io_uring read requests needed to load ONE
-    // packed-format expert's slab -- but does NOT perform any reads
-    // itself. Deliberately kept separate from load_expert_slab (which
-    // remains completely unchanged as the proven, correctness-critical
+    // Builds the io_uring read request(s) needed to load ONE expert's
+    // slab (3 for packed format, exactly 1 for unpacked_expert_format --
+    // see below) -- but does NOT perform any reads itself. Deliberately
+    // kept separate from load_expert_slab (which remains completely
+    // unchanged as the proven, correctness-critical
     // fallback for this exact same read) rather than refactored to share
     // code: this lets a batch caller (RAMSafetyManager's Phase B) collect
     // MANY experts' requests into ONE big io_uring submission, reap them
@@ -414,23 +680,53 @@ public:
     // ensure_slab_capacity/populate_packed_slab helpers load_expert_slab
     // itself uses, so the two paths can never disagree about slab layout.
     //
-    // Legacy per-expert format is deliberately NOT supported here (returns
-    // false) -- it's already documented as the engine's cold/slow path
-    // elsewhere (io_uring_backend.hpp, CLAUDE.md), not worth the added
-    // complexity for a first cut; callers fall back to load_expert_slab
-    // for it exactly as Phase B always has.
+    // A per-expert-tensor (legacy) model with NO unpacked_expert_format
+    // guarantee is deliberately NOT supported here (returns false) -- it's
+    // already documented as the engine's cold/slow path elsewhere
+    // (io_uring_backend.hpp, CLAUDE.md), not worth the added complexity for
+    // an unvalidated layout; callers fall back to load_expert_slab for it
+    // exactly as Phase B always has.
     //
-    // Always issues 3 separate reads per expert (gate/up/down), even when
-    // they're contiguous on disk -- unlike load_expert_slab's own single-
-    // shard coalescing optimization. Simpler, and the coalescing win
-    // matters less here: io_uring's real benefit (kernel-managed deep
-    // queue depth across the WHOLE batch's reads at once) applies
-    // regardless of whether any one expert's 3 reads happen to be
-    // contiguous.
-    bool build_packed_expert_read_requests(int layer_idx, int expert_id,
-                                            MoEExpertBlock& target_slot,
-                                            io_uring_backend::ReadRequest* out_reqs,
-                                            int& out_n, size_t& out_total) {
+    // Packed format: always issues 3 separate reads per expert
+    // (gate/up/down), even when they're contiguous on disk -- unlike
+    // load_expert_slab's own single-shard coalescing optimization. Simpler,
+    // and the coalescing win matters less here: io_uring's real benefit
+    // (kernel-managed deep queue depth across the WHOLE batch's reads at
+    // once) applies regardless of whether any one expert's 3 reads happen
+    // to be contiguous.
+    //
+    // unpacked_expert_format: issues exactly ONE combined read spanning
+    // gate+up+down for this expert -- the "single DMA request transfers
+    // all three tensors" this format exists for. Safe only because
+    // sanity_check_unpacked_format already confirmed EVERY expert in the
+    // model is tight at startup; unpacked_expert_is_tight is re-checked
+    // here anyway (cheap, pure metadata) as defense-in-depth -- a mismatch
+    // here means something is wrong that startup validation didn't catch
+    // (should never happen against a static tensor table), and the correct
+    // response is "refuse this one read", not "guess and read garbage
+    // across an unknown gap".
+    bool build_expert_read_requests(int layer_idx, int expert_id,
+                                     MoEExpertBlock& target_slot,
+                                     io_uring_backend::ReadRequest* out_reqs,
+                                     int& out_n, size_t& out_total) {
+        if (unpacked_expert_format) {
+            size_t gb, ub, db;
+            const GGUFTensor *gM, *uM, *dM;
+            if (!unpacked_expert_geometry(layer_idx, expert_id, gb, ub, db, gM, uM, dM)) return false;
+            if (!unpacked_expert_is_tight(*gM, *uM, *dM)) {
+                LOG_WARN("[WARN] unpacked expert L%d E%d failed the tightness re-check at read time "
+                         "despite passing startup sanity -- refusing single-DMA read (falling back)\n",
+                         layer_idx, expert_id);
+                return false;
+            }
+            out_total = gb + ub + db;
+            ensure_slab_capacity(target_slot, out_total);
+            out_n = 0;
+            out_reqs[out_n++] = {model_file.fd_for_tensor(*gM), model_file.direct_io_active_for(*gM),
+                                  model_file.direct_io_alignment, target_slot.slab_buffer, out_total, gM->offset};
+            return true;
+        }
+
         size_t gb, ub, db;
         const GGUFTensor *gM, *uM, *dM;
         if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
@@ -747,6 +1043,9 @@ public:
         if (route_freq.size() != n) {
             route_freq = std::vector<std::atomic<uint64_t>>(n);
         }
+        if (route_freq_prefill.size() != n) {
+            route_freq_prefill = std::vector<std::atomic<uint64_t>>(n);
+        }
     }
     inline void bump_route_freq(int layer, int expert) {
         if (route_freq.empty()) return;
@@ -755,6 +1054,18 @@ public:
         size_t idx = (size_t)layer * (size_t)ne + (size_t)expert;
         if (idx < route_freq.size())
             route_freq[idx].fetch_add(1, std::memory_order_relaxed);
+    }
+    // Called ADDITIONALLY (never instead of) bump_route_freq, only when the
+    // caller knows this selection happened during prefill (S > 1) -- see
+    // route_freq_prefill's own comment for why this needs to be tracked
+    // separately from the combined histogram.
+    inline void bump_route_freq_prefill(int layer, int expert) {
+        if (route_freq_prefill.empty()) return;
+        int ne = model_file.architecture_config.n_experts;
+        if (layer < 0 || expert < 0 || ne <= 0) return;
+        size_t idx = (size_t)layer * (size_t)ne + (size_t)expert;
+        if (idx < route_freq_prefill.size())
+            route_freq_prefill[idx].fetch_add(1, std::memory_order_relaxed);
     }
 
     // Write "layer expert count" lines for every (layer,expert) ever selected.
@@ -777,25 +1088,44 @@ public:
     // next run's load_usage() already treats a missing file as "first run",
     // no separate reset flag needed.
     void dump_usage(const std::string& path) const {
-        if (path.empty() || route_freq.empty()) return;
+        dump_usage_histogram(path, route_freq);
+    }
+    // Separate output file for the prefill-only histogram -- see
+    // route_freq_prefill's own comment. Same accumulate-across-sessions
+    // semantics as dump_usage, just a different source vector and
+    // (typically) a different path (EngineConfig::prefill_pin_file).
+    void dump_usage_prefill(const std::string& path) const {
+        dump_usage_histogram(path, route_freq_prefill);
+    }
+
+private:
+    // Shared body for dump_usage/dump_usage_prefill -- identical
+    // accumulate-with-whatever's-already-on-disk logic, just parameterized
+    // on WHICH histogram to write, so this non-trivial merge logic exists
+    // in exactly one place for both.
+    void dump_usage_histogram(const std::string& path,
+                               const std::vector<std::atomic<uint64_t>>& histogram) const {
+        if (path.empty() || histogram.empty()) return;
         int ne = model_file.architecture_config.n_experts;
         auto [prior, prior_maxc] = load_usage(path);
         (void)prior_maxc;
-        std::vector<uint64_t> merged(route_freq.size(), 0);
+        std::vector<uint64_t> merged(histogram.size(), 0);
         for (auto& e : prior) {
             size_t idx = (size_t)e.layer * (size_t)ne + (size_t)e.expert;
             if (idx < merged.size()) merged[idx] = e.count;
         }
         FILE* f = std::fopen(path.c_str(), "w");
         if (!f) { LOG_WARN("[USAGE] could not write %s\n", path.c_str()); return; }
-        for (size_t i = 0; i < route_freq.size(); ++i) {
-            uint64_t c = merged[i] + route_freq[i].load(std::memory_order_relaxed);
+        for (size_t i = 0; i < histogram.size(); ++i) {
+            uint64_t c = merged[i] + histogram[i].load(std::memory_order_relaxed);
             if (c == 0) continue;
             std::fprintf(f, "%zu %zu %llu\n", i / (size_t)ne, i % (size_t)ne, (unsigned long long)c);
         }
         std::fclose(f);
         LOG_INFO("[USAGE] wrote routing-frequency histogram -> %s (accumulated across sessions)\n", path.c_str());
     }
+
+public:
 
     // Read a usage file written by dump_usage. Returns one UsageEntry per
     // (layer,expert) row plus the max count seen (for relative thresholds).

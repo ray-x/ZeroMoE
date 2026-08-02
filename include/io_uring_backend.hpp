@@ -75,6 +75,9 @@ inline int raw_setup(unsigned entries, struct io_uring_params* p) {
 inline int raw_enter(int fd, unsigned to_submit, unsigned min_complete, unsigned flags) {
     return (int)syscall(__NR_io_uring_enter, fd, to_submit, min_complete, flags, nullptr, 0);
 }
+inline int raw_register(int fd, unsigned opcode, void* arg, unsigned nr_args) {
+    return (int)syscall(__NR_io_uring_register, fd, opcode, arg, nr_args);
+}
 
 class Ring {
 public:
@@ -152,6 +155,32 @@ public:
 
     bool available() const { return ready; }
 
+    // Bounds this ring's own io-wq worker pool (IORING_REGISTER_IOWQ_MAX_
+    // WORKERS: [0]=bounded workers for regular files/block devices, [1]=
+    // unbounded workers for other fd types -- we only ever read plain
+    // files, so both are set to the same `count`). Mirrors colibri's own
+    // coli_uring_set_workers (uring.h/glm.c, PIPE_WORKERS default 8) --
+    // found by direct comparison with that reference implementation.
+    // Meaningful ONLY once IOSQE_ASYNC is actually forcing reads onto
+    // io-wq (see submit_and_wait): before that fix, this call would have
+    // sized a worker pool that inline-completing reads never used. Safe
+    // to call on kernels that don't support this opcode -- returns false,
+    // caller treats it as "kernel default io-wq sizing applies," never a
+    // hard failure (same fallback-never-fails discipline as init()).
+    bool register_iowq_workers(unsigned count) {
+#ifdef IORING_REGISTER_IOWQ_MAX_WORKERS
+        if (!ready || count == 0) return false;
+        unsigned limits[2] = {count, count};
+        return raw_register(ring_fd, IORING_REGISTER_IOWQ_MAX_WORKERS, limits, 2) >= 0;
+#else
+        // This build's <linux/io_uring.h> predates the opcode (kernel
+        // headers older than the 5.15-era addition) -- no-op, same
+        // "kernel default sizing applies" fallback as a runtime failure.
+        (void)count;
+        return false;
+#endif
+    }
+
     // Submit `n` (<= CAPACITY) reads and block until every one of them has
     // completed (successfully or not). `results[i]` receives the same
     // signal a pread() would for reqs[i]: >=0 = bytes actually read (after
@@ -196,6 +225,21 @@ public:
             // as "this request failed" -- so an unsupported opcode fails
             // safe (falls back), it never corrupts anything.
             sqe->opcode = IORING_OP_READ;
+            // Found by direct comparison with colibri's own uring.h (a
+            // reference implementation of the same idea): without this,
+            // the kernel is allowed to execute a submitted read INLINE,
+            // synchronously, inside the io_uring_enter() call below --
+            // unless the file/filesystem natively supports true
+            // nonblocking completion -- which would silently defeat the
+            // entire point of batching N reads into one submission (the
+            // block layer/NVMe queue never actually sees them
+            // concurrently; the kernel just processes them one at a time
+            // inside the syscall). IOSQE_ASYNC forces every read onto
+            // io-wq instead, so N submitted reads genuinely overlap on
+            // the device. See register_iowq_workers's own comment for
+            // the other half of this fix -- sizing the pool this now
+            // actually dispatches to.
+            sqe->flags = IOSQE_ASYNC;
             sqe->fd = reqs[i].fd;
             sqe->off = reqs[i].is_direct ? windows[i].aligned_offset : reqs[i].offset;
             sqe->addr = reinterpret_cast<uint64_t>(targets[i]);
@@ -291,6 +335,7 @@ class Ring {
 public:
     bool init() { return false; }
     bool available() const { return false; }
+    bool register_iowq_workers(unsigned) { return false; }
     bool submit_and_wait(const ReadRequest*, int, ssize_t*) { return false; }
 };
 

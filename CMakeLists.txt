@@ -25,6 +25,27 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math -Xcompiler -O3")
 find_package(OpenMP REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
+# ---- Optional: NVIDIA cuFile (GPUDirect Storage) ----
+# NOT part of the base CUDA Toolkit (it ships with the separate GDS package,
+# needs the nvidia-fs kernel module) -- unlike CUDA::cudart/CUDA::cublas
+# above, this must NEVER be REQUIRED, or a perfectly good existing build
+# would break the moment CMake re-runs on a machine that never installed
+# GDS. Detected, not assumed: if headers/lib aren't found, the build
+# proceeds identically to today with cuFile compiled out entirely (see
+# include/cufile_io.hpp's stub namespace) -- config's `cuda_cufile=true`
+# then just logs a warning and falls back to the existing RAM-mediated
+# upload path at runtime, same graceful-degradation contract as
+# direct_io/io_uring already use for their own optional kernel features.
+find_path(CUFILE_INCLUDE_DIR cufile.h
+    HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/local/cuda/include /usr/local/cuda/targets/x86_64-linux/include)
+find_library(CUFILE_LIBRARY cufile
+    HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib)
+if (CUFILE_INCLUDE_DIR AND CUFILE_LIBRARY)
+    set(MOESTREAM_HAVE_CUFILE ON)
+else()
+    set(MOESTREAM_HAVE_CUFILE OFF)
+endif()
+
 # ---- Import ggml (sibling llama.cpp checkout) for its reference dequantize_row_* ----
 # We LINK libggml for the K-quant/IQ dequant instead of copying that code. Built
 # CPU-only: MoEStream provides its own CUDA kernels, so ggml's CUDA/BLAS backends
@@ -81,6 +102,12 @@ target_link_libraries(moestream PRIVATE
     ggml
 )
 
+if (MOESTREAM_HAVE_CUFILE)
+    target_include_directories(moestream PRIVATE ${CUFILE_INCLUDE_DIR})
+    target_compile_definitions(moestream PRIVATE MOESTREAM_HAVE_CUFILE=1)
+    target_link_libraries(moestream PRIVATE ${CUFILE_LIBRARY})
+endif()
+
 # ---- Native Test Harness (src/main_test.cpp) ----
 # Links against the REAL kernels/graph code (not a re-implementation), so it
 # needs the same .cpp/.cu sources as the `moestream` binary above, minus
@@ -131,6 +158,12 @@ target_link_libraries(moestream_tests PRIVATE
     ggml
 )
 
+if (MOESTREAM_HAVE_CUFILE)
+    target_include_directories(moestream_tests PRIVATE ${CUFILE_INCLUDE_DIR})
+    target_compile_definitions(moestream_tests PRIVATE MOESTREAM_HAVE_CUFILE=1)
+    target_link_libraries(moestream_tests PRIVATE ${CUFILE_LIBRARY})
+endif()
+
 add_test(NAME native_test_harness COMMAND moestream_tests)
 
 # ---- Offline GGUF tool (tools/gguf_tool.cpp + gguf_pack/io/verify.cpp) ----
@@ -158,3 +191,8 @@ message(STATUS "  -> CPU Vectorization: AVX-512 / VNNI Enabled")
 message(STATUS "  -> GPU Architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 message(STATUS "  -> Multi-GPU: Topology auto-detection enabled")
 message(STATUS "  -> OpenMP Threading: Enabled")
+if (MOESTREAM_HAVE_CUFILE)
+    message(STATUS "  -> cuFile (GPUDirect Storage): FOUND -- compiled in (still requires cuda_cufile=true at runtime, and GDS/nvidia-fs actually installed, to activate)")
+else()
+    message(STATUS "  -> cuFile (GPUDirect Storage): NOT FOUND -- compiled out, cuda_cufile config option will log a warning and fall back at runtime")
+endif()

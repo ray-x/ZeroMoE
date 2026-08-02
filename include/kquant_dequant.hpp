@@ -213,9 +213,35 @@ static inline float bf16_to_fp32(uint16_t b) {
 // confirmed passing on real Linux/CUDA hardware.
 static inline uint16_t fp32_to_bf16(float f) {
     uint32_t u; std::memcpy(&u, &f, sizeof(u));
-    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);  // NaN: keep quiet
+    uint32_t abs_bits = u & 0x7fffffffu;
+    if (abs_bits > 0x7f800000u) return (uint16_t)((u >> 16) | 0x0040u);  // NaN: keep quiet
+    if (abs_bits == 0x7f800000u) return (uint16_t)(u >> 16);  // +-Inf already: exact, no rounding needed
     uint32_t rounding_bias = 0x00007fffu + ((u >> 16) & 1u);  // round-to-nearest-even
-    return (uint16_t)((u + rounding_bias) >> 16);
+    uint32_t rounded = u + rounding_bias;
+    // OVERFLOW-ON-ROUND GUARD: `f` was just verified finite above, but
+    // adding the rounding bias can carry out of the kept mantissa bits and
+    // into the exponent field -- if the input's exponent was already the
+    // maximum finite value (|f| within the top ULP-band just below
+    // FLT_MAX, ~3.4e38), that carry pushes BF16's exponent field to all-1s
+    // (0xFF), its reserved Inf/NaN pattern, silently turning a genuinely
+    // finite number into +-Infinity. This is technically IEEE-754-
+    // correct rounding behavior for a narrowing conversion, but this
+    // project's standing discipline (see dense_dispatch.hpp's own header
+    // comment: never silently let a numeric edge case propagate as
+    // "the silent-garbage bug this project is eliminating") is to make
+    // this loud and safe rather than let an Inf weight/activation
+    // silently poison every downstream cuBLAS output. Clamp to the
+    // largest finite BF16 magnitude (same sign) instead, and count it
+    // (perf().n_bf16_overflow_clamped) -- should be essentially
+    // unreachable for real LLM weights/activations, so a nonzero count
+    // is a genuine, actionable signal (a runaway value upstream), not
+    // routine rounding noise.
+    if (((rounded >> 16) & 0x7f80u) == 0x7f80u) {
+        perf().n_bf16_overflow_clamped.fetch_add(1, std::memory_order_relaxed);
+        uint16_t sign = (uint16_t)((u >> 16) & 0x8000u);
+        return (uint16_t)(sign | 0x7f7fu);  // largest finite BF16 magnitude, same sign
+    }
+    return (uint16_t)(rounded >> 16);
 }
 
 // Bytes occupied by one row of I elements for a packed weight [O,I].

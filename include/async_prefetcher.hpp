@@ -1,8 +1,9 @@
 #pragma once
 #include "engine.hpp"
 #include "gpu_topology.hpp"
-#include "kquant_dequant.hpp"  // gpu_type_supported
+#include "kquant_dequant.hpp"  // (kept: shared quant-type helpers used elsewhere in this header's includers)
 #include "io_uring_backend.hpp"
+#include "dense_dispatch.hpp"  // (no longer calls is_cpu_affinity_layer directly -- see finish_prefetch's comment on why the VRAM-promotion call, and its cpu_affinity gate, were removed; kept in case a future confirmed-use VRAM hook needs it again)
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -55,17 +56,23 @@ struct PrefetchHint {
     std::chrono::high_resolution_clock::time_point pushed_at;
 };
 
-// Staging slot: pinned host memory for an expert slab ready for async GPU upload
+// Staging slot: pinned host memory for an expert slab, consumed by
+// RAMSafetyManager::get_experts_batch's consume_staged() to serve a genuine
+// RAM-tier cache miss without a synchronous decode-thread pread. No longer
+// carries a device_ptr/on_device pair -- finish_prefetch used to also fire
+// an unconditional, unconfirmed VRAM promotion for every staged read (see
+// its own comment for why that was removed); VRAM residency for a
+// prefetched expert is now decided exclusively by the normal hit-count-
+// gated promotion path once a real access confirms it's actually needed.
 struct PrefetchSlot {
     uint8_t* pinned_buf = nullptr;  // cudaMallocHost'd buffer
-    uint8_t* device_ptr = nullptr;  // GPU destination (if upload fired)
     size_t capacity = 0;
     size_t loaded_bytes = 0;
     int layer_idx = -1;
     int expert_id = -1;
     std::atomic<bool> ready{false};      // true when pread is complete
-    std::atomic<bool> on_device{false};  // true when async upload to GPU is done
 };
+
 
 class LockFreePrefetcher {
 private:
@@ -80,7 +87,7 @@ private:
     // n_staged_evicted_unused counts). Now a runtime value (config
     // prefetch_staging_slots, engine_config.hpp), set once in start() before
     // `staging` is allocated and never changed after -- PrefetchSlot holds
-    // std::atomic<bool> members (ready/on_device) that are neither copyable
+    // an std::atomic<bool> member (ready) that is neither copyable
     // nor movable, so this can't be a std::vector (which needs move-safety
     // to resize/reallocate), but a fixed-size-at-allocation-time
     // std::unique_ptr<PrefetchSlot[]> has no such requirement.
@@ -97,7 +104,11 @@ private:
     std::vector<std::thread> worker_threads;
     std::atomic<bool> running{false};
     StreamingEngine* engine = nullptr;
-    GpuTopology* gpu_topo = nullptr;  // For async VRAM uploads
+    // No longer read anywhere in this file (finish_prefetch's own comment
+    // explains why the direct VRAM-promotion call was removed) -- kept as a
+    // member/start() parameter only for call-site/API stability in case a
+    // future, CONFIRMED-use-based VRAM hook is added here again.
+    GpuTopology* gpu_topo = nullptr;
 
     // One io_uring ring PER WORKER THREAD -- a Ring is explicitly not
     // shareable across threads (io_uring_backend.hpp), so with N worker
@@ -123,7 +134,7 @@ private:
     std::unique_ptr<PrefetchSlot[]> staging;
     std::atomic<int> staging_write_idx{0};  // next slot to write into
     // Guards all mutation of a staging slot's identity (layer_idx/expert_id),
-    // ready/on_device flags, AND the pinned_buf lifecycle (acquire_staging_slot
+    // ready flag, AND the pinned_buf lifecycle (acquire_staging_slot
     // recycle/regrow vs consume_staged's memcpy-out). Without it the decode
     // thread's consume_staged could memcpy from a pinned_buf the worker thread
     // is concurrently cudaFreeHost-ing via acquire_staging_slot, and could read
@@ -137,7 +148,27 @@ public:
                int n_worker_threads = 1, int n_staging_slots = 64) {
         engine = eng;
         gpu_topo = topo;
-        if (n_worker_threads < 1) n_worker_threads = 1;
+        // BUG FIX: this used to clamp UP to a minimum of 1, silently making
+        // prefetch_worker_threads=0 impossible to actually test -- a real
+        // investigation into whether the prefetcher's speculative reads
+        // were competing with the decode thread's own critical-path reads
+        // for scarce NVMe bandwidth (Pilot recall was a healthy 84%, but
+        // Staged-unused evict showed ~98% of correctly-staged predictions
+        // discarded before use) needed a genuine zero-worker baseline to
+        // A/B against, and every attempt kept showing an active prefetcher
+        // (Prefetch pickup: N hints processed, N>0) no matter what the
+        // config said. Only clamp NEGATIVE values (a config typo) up to 0
+        // -- 0 itself is now a real, honored "no prefetcher at all" state.
+        // Every downstream use already tolerates zero cleanly:
+        // uring_rings.resize(0) and worker_threads.reserve(0)/the spawn
+        // loop below are no-ops, stop()/the destructor iterate empty
+        // containers harmlessly, and callers already null-check-equivalent
+        // (RAMSafetyManager::prefetcher stays a valid, non-null pointer to
+        // this object either way, but consume_staged/has_pending_hint will
+        // just always report nothing staged/pending -- correctness-neutral,
+        // identical to how a normal cache miss with prefetching disabled
+        // has always been handled).
+        if (n_worker_threads < 0) n_worker_threads = 0;
         if (n_staging_slots < 1) n_staging_slots = 1;
         num_staging_slots = n_staging_slots;
         staging = std::make_unique<PrefetchSlot[]>(num_staging_slots);
@@ -148,7 +179,19 @@ public:
         for (auto& r : uring_rings) r = std::make_unique<io_uring_backend::Ring>();
         if (enable_io_uring) {
             int ok_count = 0;
-            for (auto& r : uring_rings) if (r->init()) ok_count++;
+            for (auto& r : uring_rings) {
+                if (r->init()) {
+                    // 3 = every active_prefetch() submission is exactly one
+                    // hint's gate/up/down projections (io_uring_backend.hpp
+                    // try_uring_batch calls), never more -- unlike the
+                    // decode thread's own ring (see init_decode_uring),
+                    // there's no larger batch size to size this pool for.
+                    // Only meaningful once IOSQE_ASYNC actually forces
+                    // these onto io-wq; see that flag's own comment.
+                    r->register_iowq_workers(3);
+                    ok_count++;
+                }
+            }
             use_io_uring = (ok_count > 0);
             if (use_io_uring) {
                 LOG_STREAM_INFO() << "[IO-URING] Enabled on " << ok_count << "/" << n_worker_threads
@@ -411,20 +454,18 @@ private:
         auto dE = engine->model_file.tensors.find(base + "ffn_down_exps.weight");
         if (n_exp > 0 && gE != engine->model_file.tensors.end() &&
             uE != engine->model_file.tensors.end() && dE != engine->model_file.tensors.end()) {
-            // This entire prefetch cycle (disk pread + pinned staging) exists
-            // ONLY to feed the async VRAM promotion below (check_staged()'s
-            // staging buffer has no other consumer anywhere in the codebase)
-            // — so when a VRAM vault is configured but this layer's expert
-            // quant types can never dispatch to GPU (all three projections
-            // must be supported; a Dynamic-quant model can have this true for
-            // every expert in every layer), skip it entirely rather than
-            // burning disk I/O + pinned memory for a promotion that would
-            // never fire anyway.
-            if (gpu_topo && !(gpu_type_supported(gE->second.type) &&
-                               gpu_type_supported(uE->second.type) &&
-                               gpu_type_supported(dE->second.type))) {
-                return;
-            }
+            // NOTE: this used to also skip here whenever gpu_topo was set
+            // but this layer's quant types couldn't dispatch to GPU --
+            // reasoning at the time was "this whole prefetch cycle exists
+            // only to feed the async VRAM promotion below." That VRAM
+            // promotion has since been REMOVED from finish_prefetch (see
+            // its own comment): every genuine consumer of a staged read is
+            // now RAMSafetyManager::get_experts_batch's consume_staged
+            // call, which benefits a RAM-tier miss regardless of whether
+            // the expert is GPU-dispatchable or CPU-fallback-dispatched --
+            // so skipping GPU-incapable experts here would wrongly disable
+            // prefetch for exactly the (CPU-fallback) experts that still
+            // pay a real synchronous disk-read cost on the decode thread.
             const size_t gb = gE->second.size_bytes / n_exp;
             const size_t ub = uE->second.size_bytes / n_exp;
             const size_t db = dE->second.size_bytes / n_exp;
@@ -623,40 +664,69 @@ private:
         return slot;
     }
 
-    // Fire the async H2D promotion FIRST (if a VRAM vault is configured), THEN
-    // publish identity+ready under staging_mutex. Ordering matters: if
-    // identity were published before the upload fired, a racing consume_staged
-    // could clear the slot before the upload stamped it. The upload itself
-    // goes through GpuTopology's own mutexed claim path (cache_mutex), so it
-    // is safe to call outside staging_mutex; only the slot-state publish is
-    // locked here.
+    // Publish identity+ready under staging_mutex.
+    //
+    // REAL BUG FOUND AND FIXED (root cause of near-total PIPE waste): this
+    // used to ALSO fire an unconditional, unconfirmed speculative
+    // gpu_topo->upload_expert_async(...) promotion here, on EVERY
+    // successfully-staged read, before publishing identity. Two compounding
+    // problems, found by reading this function together with
+    // execution_layer.cpp's shadow pre-check and RAMSafetyManager::
+    // get_experts_batch's consume_staged call:
+    //
+    // 1) upload_expert_async claims a REAL VRAM cache slot via evict_lru --
+    //    i.e. every prefetch read, correct prediction or not, evicted an
+    //    ALREADY-VRAM-RESIDENT (possibly genuinely useful) expert to make
+    //    room for a merely-speculative one. A wrong prediction (Pilot
+    //    recall was only 84%, so ~16% of pushed hints are already wrong on
+    //    prediction accuracy alone) didn't just waste a staging slot -- it
+    //    also evicted something real for nothing. This is a second,
+    //    independent, previously-undocumented waste mechanism on top of the
+    //    RAM-staging-pool churn CLAUDE.md's history already covered.
+    // 2) When the speculative promotion DID land (async H2D completed)
+    //    before decode reached this layer, execution_layer.cpp's shadow
+    //    pre-check (find_expert) found the expert ALREADY VRAM-resident and
+    //    dispatched it via the shadow fast path -- which never calls
+    //    get_experts_batch/consume_staged at all for a shadowed expert. So
+    //    the RAM pinned buffer this whole prefetch cycle just filled was
+    //    never read by anyone: not a timing loss, not a misprediction, but
+    //    the SAME staged data being "used" via a different path than the
+    //    one the Staged-unused-evict counter was measuring, which is why a
+    //    healthy-looking Pilot recall (84%) coexisted with ~98.5%
+    //    Staged-unused-evict and ~0.1% PIPE-served in every real run this
+    //    was measured on. The unconfirmed-promotion side effect is also the
+    //    documented root cause behind gpu_topology.hpp's own
+    //    n_stale_upload_ready_reclaimed counter (37.7% of VRAM slots found
+    //    permanently stuck mid-upload in one real run) -- that fix only
+    //    mitigated the symptom (evict_lru self-healing a stale flag), it
+    //    never removed the unconfirmed speculative promotion causing it.
+    //
+    // Fix: this function now ONLY stages into the pinned RAM buffer and
+    // feeds consume_staged -- it no longer touches VRAM at all. VRAM
+    // promotion for a prefetched expert now happens exactly the same way
+    // as for any other RAM-tier resident: via the existing hit-count-gated
+    // path in get_expert/get_experts_batch (promote_hit_threshold), which
+    // only fires once a real subsequent access CONFIRMS the expert is
+    // actually being used -- never on unconfirmed speculation. This also
+    // means the shadow pre-check can no longer be prematurely satisfied by
+    // a prefetch that hasn't been consumed yet, so a genuine RAM-tier miss
+    // for a correctly-predicted expert now actually reaches consume_staged
+    // and gets served from it, instead of being raced out from under it.
     void finish_prefetch(PrefetchSlot& slot, int layer_idx, int expert_id, size_t total_bytes) {
         slot.loaded_bytes = total_bytes;
 
-        ExpertLocation* vram_slot = nullptr;
-        if (gpu_topo) {
-            vram_slot = gpu_topo->upload_expert_async(
-                layer_idx, expert_id, slot.pinned_buf, slot.loaded_bytes);
+        auto _wait_t0 = std::chrono::high_resolution_clock::now();
+        std::lock_guard<std::mutex> lock(staging_mutex);
+        double _wait_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - _wait_t0).count();
+        PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
+        if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
+            LOG_WARN("[SLOW-MUTEX-WAIT] finish_prefetch blocked %.2fms acquiring staging_mutex "
+                     "(layer=%d expert=%d)\n", _wait_ms, layer_idx, expert_id);
         }
-
-        {
-            auto _wait_t0 = std::chrono::high_resolution_clock::now();
-            std::lock_guard<std::mutex> lock(staging_mutex);
-            double _wait_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::high_resolution_clock::now() - _wait_t0).count();
-            PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
-            if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
-                LOG_WARN("[SLOW-MUTEX-WAIT] finish_prefetch blocked %.2fms acquiring staging_mutex "
-                         "(layer=%d expert=%d)\n", _wait_ms, layer_idx, expert_id);
-            }
-            slot.layer_idx = layer_idx;
-            slot.expert_id = expert_id;
-            if (vram_slot) {
-                slot.device_ptr = vram_slot->device_ptr;
-                slot.on_device.store(true, std::memory_order_release);
-            }
-            slot.ready.store(true, std::memory_order_release);
-        }
+        slot.layer_idx = layer_idx;
+        slot.expert_id = expert_id;
+        slot.ready.store(true, std::memory_order_release);
     }
 
     void issue_fadvise_fallback(int layer_idx, int expert_id) {

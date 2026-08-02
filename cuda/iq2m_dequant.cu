@@ -127,7 +127,21 @@ extern "C" void launch_iq2m_dequant(float* output, const uint8_t* weights, int n
 
 extern "C" void launch_iq2m_matmul(float* y, const float* x, const void* weights,
                                     int S, int I, int O) {
+    // FIX (real bug, found during a review sweep -- currently dead code, not
+    // yet wired to any live GPU dispatch path, per cuda_manager.hpp's own
+    // "IQ2_M has no GPU fused kernel" comment, so this never fired in
+    // practice): was launched with 128 threads, but kernel_iq2m_matmul's own
+    // logic unconditionally assumes 256 (`tid` 0..255 per the kernel's own
+    // comment, `__shared__ float sm[256]`, reduction starting at
+    // stride=128 which requires sm[128..255] already populated). With only
+    // 128 threads, only the first half of each 256-element super-block was
+    // ever read/accumulated, AND the reduction's first iteration read
+    // sm[128..255] -- memory NEVER WRITTEN by any thread -- corrupting the
+    // result with garbage from whatever was previously in that shared
+    // memory bank. The sibling function below (launch_iq2m_dequant) already
+    // launches kernel_dequant_iq2m with the correct 256 threads; this was a
+    // leftover/mismatched value in just this one launcher.
     dim3 grid(O, S);
-    dim3 block(128);  // 128 threads per output element
+    dim3 block(256);
     kernel_iq2m_matmul<<<grid, block>>>(y, x, (const uint8_t*)weights, S, I, O);
 }

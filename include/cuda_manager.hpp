@@ -337,6 +337,22 @@ public:
     // pass real remaining VRAM headroom, not the tensor's own original size.
     bool upload_dequantized_bf16(QuantizedTensor& qt, size_t max_bytes) {
         if (qt.gpu_fast_ptr) return true;  // already converted
+        // HARD TYPE GATE: only genuinely lossless-relative-to-storage F32
+        // source data may be rounded to BF16 here. Every call site (gate_inp,
+        // attn_output) matches by tensor NAME only, never by qt.meta.type --
+        // without this gate, any quantized tensor matching those name
+        // patterns (Q5_K/Q6_K/Q8_0/IQ2_*/IQ3_XXS, whatever this checkpoint
+        // happens to use) would silently get dequantized to F32 then rounded
+        // to BF16 here, discarding that quant format's own encoding entirely
+        // -- a real precision/behavior change the user explicitly does NOT
+        // want for anything already quantized. F32 is the only case where
+        // "round to BF16" is the ONLY loss involved (halves storage, no
+        // format switch); for every other type, the CPU-fallback dequant
+        // reference distinguishes cleanly between quant formats and this
+        // fast-path must not collapse that distinction. Gated here (the
+        // single choke point both call sites route through) rather than at
+        // each call site, so no future caller can bypass it either.
+        if (qt.meta.type != GGUFType::F32) return false;
         if (!qt.host_ptr || qt.meta.shape.size() < 2) return false;
         int O = (int)qt.meta.shape[0];
         int I = (int)qt.meta.shape[1];

@@ -1,5 +1,6 @@
 #pragma once
 #include "logger.hpp"
+#include "cufile_io.hpp"
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -134,6 +135,11 @@ public:
     std::vector<bool> shard_direct_io;
     uint64_t direct_io_alignment = 4096;
 
+    // One cuFile handle per shard_fds, registered by enable_cufile() below
+    // (empty/all-invalid until then). Index-matched to shard_fds/
+    // shard_direct_io, same convention as everything else per-shard here.
+    std::vector<cufile_io::FileHandle> shard_cufile_handles;
+
     // KV metadata extracted during header parsing
     std::unordered_map<std::string, uint64_t> kv_uint;
     std::unordered_map<std::string, int64_t> kv_int;
@@ -149,6 +155,19 @@ public:
     bool direct_io_active_for(const GGUFTensor& t) const {
         return t.shard_idx >= 0 && (size_t)t.shard_idx < shard_direct_io.size()
                && shard_direct_io[t.shard_idx];
+    }
+
+    // Returns a pointer to the registered cuFile handle for this tensor's
+    // shard, or nullptr if cuFile was never enabled (or failed) for that
+    // specific shard -- callers (GpuTopology::upload_expert_cufile) must
+    // check for null AND h->valid before using it, exactly like
+    // direct_io_active_for's own per-shard granularity (one shard failing
+    // O_DIRECT/cuFile registration doesn't disable it for every OTHER
+    // shard that succeeded).
+    const cufile_io::FileHandle* cufile_handle_for_tensor(const GGUFTensor& t) const {
+        if (t.shard_idx >= 0 && (size_t)t.shard_idx < shard_cufile_handles.size())
+            return &shard_cufile_handles[t.shard_idx];
+        return nullptr;
     }
 
     // Opt-in: reopen every shard's fd with O_DIRECT, one shard at a time,
@@ -222,6 +241,50 @@ public:
                   << " shard(s) (alignment=" << direct_io_alignment << " bytes).\n";
         return n_enabled;
 #endif
+    }
+
+    // Opt-in: register every O_DIRECT-active shard's fd with the cuFile
+    // driver (see cufile_io.hpp). MUST be called AFTER enable_direct_io()
+    // has already run and actually enabled O_DIRECT on at least one shard
+    // -- cuFile needs the SAME O_DIRECT fd, not a fresh buffered one (see
+    // EngineConfig's own cuda_cufile-requires-direct_io validation, which
+    // is the higher-level guard; this function additionally re-checks per
+    // shard since direct_io can partially fail per-shard even when the
+    // config flag is on). Per-shard granularity mirrors enable_direct_io
+    // exactly: a shard that isn't O_DIRECT-active, or whose cuFile
+    // registration itself fails, is simply left with an invalid handle
+    // (cufile_handle_for_tensor returns valid=false for it) rather than
+    // disabling the feature for every other shard. Returns the number of
+    // shards that ended up with a real registered handle.
+    int enable_cufile() {
+        shard_cufile_handles.assign(shard_fds.size(), cufile_io::FileHandle{});
+        if (!cufile_io::available()) {
+            LOG_STREAM_WARN() << "[CUFILE] Not compiled in (cufile.h/libcufile not found at build "
+                                  "time -- see CMakeLists.txt) or driver unavailable -- falling back "
+                                  "to the RAM-mediated upload path for every shard.\n";
+            return 0;
+        }
+        int n_enabled = 0;
+        for (size_t i = 0; i < shard_fds.size(); ++i) {
+            if (i >= shard_direct_io.size() || !shard_direct_io[i]) {
+                LOG_STREAM_WARN() << "[CUFILE] Shard " << i << " (" << shard_paths[i]
+                          << ") is not O_DIRECT-active -- skipping cuFile registration for this "
+                             "shard (falls back to RAM-mediated upload for its tensors).\n";
+                continue;
+            }
+            cufile_io::FileHandle h = cufile_io::register_file(shard_fds[i]);
+            if (h.valid) {
+                shard_cufile_handles[i] = h;
+                n_enabled++;
+            } else {
+                LOG_STREAM_WARN() << "[CUFILE] Shard " << i << " (" << shard_paths[i]
+                          << ") failed cuFile handle registration -- falling back to RAM-mediated "
+                             "upload for this shard's tensors.\n";
+            }
+        }
+        LOG_STREAM_INFO() << "[CUFILE] Registered " << n_enabled << "/" << shard_fds.size()
+                  << " shard(s) with the cuFile driver.\n";
+        return n_enabled;
     }
 
     // Extract integer config value from KV metadata, trying multiple key patterns
@@ -318,6 +381,11 @@ public:
     }
 
     ~GGUFFile() {
+        // Deregister BEFORE closing the underlying fd -- cuFile's own
+        // handle owns a reference tied to that fd staying open/valid.
+        for (auto& h : shard_cufile_handles) {
+            cufile_io::deregister_file(h);
+        }
         for (int fd : shard_fds) {
             if (fd >= 0) close(fd);
         }

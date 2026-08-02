@@ -5,6 +5,7 @@
 #include "async_prefetcher.hpp"  // LockFreePrefetcher (consume_staged in the miss path)
 #include "logger.hpp"
 #include "kquant_dequant.hpp"  // gpu_type_supported
+#include "dense_dispatch.hpp"  // is_cpu_affinity_layer (cpu_affinity_layers config)
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -59,10 +60,28 @@ public:
     io_uring_backend::Ring decode_uring_ring;
     bool use_decode_uring = false;
 
-    void init_decode_uring(bool enable) {
+    void init_decode_uring(bool enable, int io_uring_workers = 8) {
         if (!enable) return;
         use_decode_uring = decode_uring_ring.init();
         if (use_decode_uring) {
+            // io_uring_workers (config, EngineConfig -- default 8, matching
+            // colibri's own field-tested PIPE_WORKERS default) bounds the
+            // io-wq kernel worker pool this ring dispatches to. Only
+            // meaningful now that IOSQE_ASYNC (io_uring_backend.hpp)
+            // actually forces reads onto io-wq instead of letting them
+            // complete inline -- this is what lets a submission's reads
+            // genuinely overlap on the device. Deliberately sized to real
+            // NVMe queue-depth saturation (~4-16 concurrent requests for
+            // reads this size), not to Phase B's own max batch shape
+            // (topk*3, commonly ~24) -- more workers than the device can
+            // actually service concurrently doesn't help throughput, it
+            // just adds idle-but-real OS threads competing with everything
+            // else this process runs (omp_max_threads, expert_fetch_
+            // threads, prefetch_worker_threads). Best-effort: a no-op on
+            // kernels that don't support the opcode, same fallback-never-
+            // fails discipline as every other io_uring call in this
+            // codebase.
+            decode_uring_ring.register_iowq_workers((unsigned)std::max(1, io_uring_workers));
             LOG_STREAM_INFO() << "[IO-URING] Enabled on the decode thread's own ring -- "
                                   "batching Phase B's per-layer miss set through io_uring.\n";
         } else {
@@ -134,6 +153,241 @@ public:
     std::unordered_map<uint64_t, SwapStats> ram_swap_stats;
     static uint64_t swap_key(int layer, int expert_id) {
         return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert_id;
+    }
+
+    // O(1) identity -> slot-index lookup for the RAM tier, mirroring
+    // GpuTopology::expert_index exactly (same key encoding via swap_key).
+    // Added after a real run showed get_experts_batch alone costing 59.74s
+    // of a 104.40s expert= total (t_ram_get_experts_batch), traced to
+    // Step 1/Phase A's per-lookup UNINDEXED linear scan over layer_slots
+    // (up to `cap` MoEExpertBlock entries -- a much larger, more cache-
+    // unfriendly struct than GpuTopology::ExpertLocation) run on EVERY
+    // topk lookup, hit or miss, with misses paying for a SECOND full scan
+    // during victim selection on top.
+    //
+    // TAKE 1 (measured insufficient -- a real lesson from this exact file's
+    // history repeating): the first version of find_ram_slot fell back to a
+    // full linear scan whenever the index had no entry at all, mirroring
+    // GpuTopology::find_expert's own fallback-on-miss behavior. A real
+    // re-run showed ZERO measurable improvement (get_batch=60.65s vs
+    // 59.74s before) -- because ~56% of lookups are genuine misses, and a
+    // miss NEEDS the "confirm not present" check on every single call; only
+    // the ~44% hit case became O(1), while both the miss confirmation AND
+    // the (always-linear, unchanged) victim-selection scan kept paying full
+    // O(cap) either way. Root cause of why the fallback existed at all:
+    // main.cpp's Tier-3 startup RAM preload writes directly into
+    // engine.layers_experts via engine.load_expert_slab, bypassing
+    // RAMSafetyManager entirely -- so trusting a miss as genuine absence
+    // would have been WRONG for any of the ~1575 preloaded experts on
+    // their first real lookup (index has no entry for them despite being
+    // genuinely resident). Fixed by making main.cpp's preload loop insert
+    // into ram_expert_index too (the actual missing mutation site -- see
+    // that call site's own comment), which makes the index a COMPLETE,
+    // authoritative record of RAM-tier residency, letting a genuine index
+    // miss be trusted as genuine absence with no scan at all. This is the
+    // TAKE 2 fix below.
+    //
+    // Mutated at every site that changes a RAM slot's expert_id identity:
+    // get_expert (Step 1's MOVE-on-promotion clear, Step 3's evict+load),
+    // get_experts_batch (Phase A's MOVE-on-promotion clear, miss-claim+
+    // load), demote_from_vram (VRAM-eviction salvage write), and main.cpp's
+    // Tier-3 startup preload (see above). Verified via full-codebase grep
+    // that these are the ONLY sites that ever write engine.layers_experts[
+    // layer][*].expert_id -- graph_initializer.cpp's startup zero-init sets
+    // it to -1 (empty, never needs an index entry) and execution_layer.cpp's
+    // pilot-prefetch "already resident" check is read-only.
+    std::unordered_map<uint64_t, size_t> ram_expert_index;
+
+    // Shared lookup used by every RAM-tier hit-check site (get_expert Step
+    // 1, get_experts_batch Phase A, demote_from_vram's already-resident
+    // pre-check). TAKE 2: an index MISS is now trusted as genuine absence
+    // (O(1), no scan) -- safe only because ram_expert_index is a COMPLETE
+    // record of residency (see its own comment for the full mutation-site
+    // list, including the main.cpp preload fix this required). An index
+    // HIT is still re-validated against the slot's real contents before
+    // being trusted, and falls back to a defensive linear scan (self-
+    // healing the index) only in that case -- should be unreachable by
+    // construction, but a maintenance-site bug is exactly the failure
+    // class this project has been burned by before (see CLAUDE.md), and
+    // that specific case can't safely trust a lookup that already proved
+    // itself wrong once. Returns the slot index within layer_slots
+    // (bounded by cap) or -1 if genuinely not resident.
+    ssize_t find_ram_slot(std::vector<MoEExpertBlock>& layer_slots, size_t cap, int layer, int expert_id) {
+        uint64_t key = swap_key(layer, expert_id);
+        auto it = ram_expert_index.find(key);
+        if (it == ram_expert_index.end()) {
+            return -1;  // trusted absence -- see this function's own comment
+        }
+        size_t idx = it->second;
+        if (idx < cap && layer_slots[idx].expert_id == expert_id) {
+            return (ssize_t)idx;
+        }
+        // Stale entry -- should be unreachable by construction given every
+        // mutation site is covered, but treat it as a real bug signal, not
+        // a silent no-op: fall back to a linear scan (this ONE case still
+        // needs it, since idx already proved untrustworthy) and self-heal.
+        ram_expert_index.erase(it);
+        for (size_t si = 0; si < cap; ++si) {
+            if (layer_slots[si].expert_id == expert_id) {
+                ram_expert_index[key] = si; // opportunistic self-heal
+                return (ssize_t)si;
+            }
+        }
+        return -1;
+    }
+
+    // Side-effect-free RAM-tier residency peek -- unlike find_ram_slot
+    // (used by the actual hit-servicing paths, which bump hit_count/
+    // recency as part of "using" the hit), this exists purely so a CALLER
+    // can decide which read strategy to use BEFORE committing to one: the
+    // cuFile direct-disk-to-VRAM path (GpuTopology::upload_expert_cufile,
+    // via execution_layer.cpp's Phase 3 loading loop) must only ever be
+    // attempted for a genuine double miss (not VRAM-resident AND not
+    // RAM-resident) -- re-reading from disk via cuFile when a perfectly
+    // good copy already sits in host RAM would waste real NVMe bandwidth
+    // for no benefit. Trusts ram_expert_index exactly as find_ram_slot's
+    // own index-hit fast path does (an index miss is genuine absence, an
+    // index hit is real residency -- see that function's own comment for
+    // why this index is a complete, self-healing record) but deliberately
+    // skips the stale-entry re-validation/linear-scan fallback: a false
+    // positive here (index says resident but the slot turns out stale) just
+    // means the caller takes the slower RAM-mediated path instead of
+    // cuFile for that one call -- get_experts_batch's own find_ram_slot
+    // will re-validate for real and correctly re-fetch if needed, so this
+    // peek being occasionally too conservative is safe, never wrong.
+    bool is_ram_resident(int layer, int expert_id) const {
+        return ram_expert_index.count(swap_key(layer, expert_id)) > 0;
+    }
+
+    // ACTIVE reclaim for a caller that just confirmed (via some OTHER path,
+    // e.g. GpuTopology::promote_active_to_main's on_promoted callback) that
+    // a durable VRAM copy now exists for this exact (layer, expert_id) --
+    // closes the "still-open gap" documented in CLAUDE.md's "Cold-Miss GPU
+    // Dispatch Never Freed the RAM Slot" entry. FIRST fix here (superseded,
+    // history kept for context) only marked also_in_vram=true (an eviction-
+    // PRIORITY hint, not an active free) -- a real run confirmed this fix
+    // does correctly fire (hundreds of "(promoted to main cache)" DEBUG
+    // lines) but [TIER-OVERLAP] barely moved (608 vs a 614-720 baseline on
+    // a matching config), because "evict first" only matters the NEXT time
+    // that layer's RAM tier actually needs to evict something -- with a
+    // generous host_ram_gb and layer-adaptive capacity, a short run may
+    // never put real eviction pressure on the specific layers involved, so
+    // the marked-redundant slot just sits there, correctly deprioritized
+    // but never picked as a victim. This version reclaims the slot RIGHT
+    // NOW instead of waiting for eviction pressure that may never come.
+    //
+    // Mirrors apply_promotion_bookkeeping's MOVE-vs-COPY split (same
+    // move_on_promotion config, same counters) but is NOT a call to that
+    // function: apply_promotion_bookkeeping exists for an ASYNC upload
+    // (upload_expert_async) whose completion isn't yet certain, so its MOVE
+    // branch has to carry `promoted->upload_event` forward as
+    // pending_copy_event so a later reader can defensively wait/poll. Our
+    // caller's copy (GpuTopology::promote_active_to_main's D2D memcpy) is
+    // SYNCHRONOUS and has already returned successfully by the time
+    // on_promoted fires -- there is no pending-copy race to protect
+    // against, and `promoted`'s own upload_event (if any) would be a STALE
+    // value left over from whatever THIS SPECIFIC SLOT was previously used
+    // for, unrelated to the transfer that just happened -- borrowing it
+    // here would be wrong, not just unnecessary. pending_copy_event is left
+    // untouched. COPY branch (move_on_promotion=false) sets also_in_vram
+    // immediately, unlike apply_promotion_bookkeeping's own COPY branch --
+    // that one can't (its caller has no confirmation the copy landed); ours
+    // just did.
+    //
+    // Two overloads: the direct one for a caller that already holds the
+    // MoEExpertBlock& (currently only the lookup overload below actually
+    // calls this one -- see that overload's own comment; kept as a direct
+    // entry point in case a future caller has a block in hand already,
+    // matching apply_promotion_bookkeeping's own shape); the lookup one for
+    // a caller that only has (layer, expert_id) (moe_forward_gguf's
+    // cleanup_active_layer_area call site, a sweep with no single block in
+    // scope). No-op if the expert isn't currently RAM-resident (may have
+    // already been evicted/reused by the time this fires -- benign).
+    //
+    // ram_temp_pin_count guard, added after a real crash: this used to also
+    // be called directly from execution_layer.cpp's find_active_expert
+    // callback, on gpu_ctx->exp -- the SAME MoEExpertBlock currently being
+    // dispatched for the in-flight k, about to be pushed into
+    // scratch.pending_gpu for Pass B to read p.exp->expert_id fresh later.
+    // Clearing expert_id here raced that read and produced a real, observed
+    // "release_hold found no matching resident slot ... expert=-1" error
+    // (see execution_layer.cpp's own comment at that reverted call site for
+    // the full incident) -- the exact same "identity read late, not
+    // captured" shape ram_temp_pin_count exists to prevent for RAM-tier
+    // victim-selection SCANS, but this function bypasses that check
+    // entirely since it's a direct field clear, not a scan. That call site
+    // was reverted to marking-only (safe: also_in_vram=true doesn't destroy
+    // identity). The remaining caller (cleanup_active_layer_area, which
+    // only runs after a layer's Pass A/B are fully drained) has never shown
+    // this failure mode in practice, but checking ram_temp_pin_count here
+    // too costs nothing and closes the same category of gap defensively
+    // rather than relying on "this call site happens not to be reachable
+    // mid-flight" holding forever -- same discipline this project already
+    // applies everywhere else a slot's identity can be cleared.
+    void finish_sync_promotion(MoEExpertBlock& blk, int layer, int expert_id) {
+        if (move_on_promotion && blk.ram_temp_pin_count <= 0) {
+            blk.expert_id = -1;
+            ram_expert_index.erase(swap_key(layer, expert_id));
+            blk.last_used_clock = 0;
+            blk.hit_count = 0;
+            blk.also_in_vram = false;
+            blk.slab_capacity = 0;
+            perf().n_move_on_promotion.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            blk.also_in_vram = true;
+            perf().n_copy_on_promotion.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    void finish_sync_promotion(StreamingEngine& engine, int layer, int expert_id) {
+        if (layer < 0 || layer >= (int)engine.layers_experts.size()) return;
+        auto& layer_slots = engine.layers_experts[layer];
+        size_t cap = layer_slots.empty() ? 0
+            : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
+        ssize_t idx = find_ram_slot(layer_slots, cap, layer, expert_id);
+        if (idx >= 0) finish_sync_promotion(layer_slots[idx], layer, expert_id);
+    }
+
+    // Shared MOVE-vs-COPY promotion bookkeeping for a RAM->VRAM async
+    // upload issued OUTSIDE get_expert/get_experts_batch's own internal
+    // reactive-hit branches (which each already inline this same logic
+    // themselves -- see their own comments). Added to close the "third,
+    // independent tier-overlap source" documented in CLAUDE.md:
+    // moe_forward_gguf's Phase 2 prefill cold-start VRAM warm-up
+    // (execution_layer.cpp) calls upload_expert_async directly on a
+    // freshly-loaded RAM block, entirely bypassing get_expert's own
+    // promotion path -- so neither also_in_vram nor MOVE-freeing ever
+    // happened for it, silently leaving a genuine RAM/VRAM double-
+    // residency with no way for either tier's eviction scoring to know.
+    // MOVE branch mirrors get_expert's Step 1 exactly (including the
+    // ram_expert_index erase this session's RAM-tier indexing made a
+    // real invariant -- see that member's own comment); COPY branch
+    // deliberately does NOT set also_in_vram here (unlike get_expert's
+    // own COPY branch, which only sets it after find_expert POLLS AND
+    // CONFIRMS the copy landed) -- this caller has no such confirmation
+    // point, and also_in_vram's own contract requires the copy be
+    // genuinely done, not merely issued, before it's safe to mark. Given
+    // move_on_promotion defaults true throughout this project's configs,
+    // the COPY branch is the narrow, less-common case; it still gets a
+    // correct swap-stat/counter update, just not the also_in_vram
+    // optimization -- a real but small residual gap, not a correctness
+    // issue (worst case: this slot is evicted slightly later than
+    // strictly necessary, same "harmless, perf-only" tradeoff already
+    // accepted elsewhere for also_in_vram).
+    void apply_promotion_bookkeeping(MoEExpertBlock& blk, int layer, int expert_id,
+                                      ExpertLocation* promoted) {
+        if (move_on_promotion) {
+            blk.expert_id = -1;
+            ram_expert_index.erase(swap_key(layer, expert_id));
+            blk.last_used_clock = 0;
+            blk.hit_count = 0;
+            blk.also_in_vram = false;
+            blk.slab_capacity = 0;
+            blk.pending_copy_event = promoted ? promoted->upload_event : nullptr;
+            perf().n_move_on_promotion.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            perf().n_copy_on_promotion.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     static uint64_t eviction_score(const MoEExpertBlock& b) {
@@ -380,22 +634,21 @@ public:
         // Skip if already RAM-resident -- nothing to gain from a duplicate,
         // and it would just waste a D2H copy plus displace some OTHER
         // expert's RAM slot for no benefit.
-        for (size_t si = 0; si < cap; ++si) {
-            if (layer_slots[si].expert_id == expert_id) {
-                perf().n_vram_evict_demote_skipped.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
+        if (find_ram_slot(layer_slots, cap, layer, expert_id) >= 0) {
+            perf().n_vram_evict_demote_skipped.fetch_add(1, std::memory_order_relaxed);
+            return;
         }
 
-        // Only the packed-slab (ffn_*_exps) layout is supported -- mirrors
-        // the same guard the PIPE consume_staged path already uses. A
-        // legacy per-expert-tensor model has no single (gb,ub,db) geometry
-        // to reconstruct host_ptr/meta offsets from, so demotion is a
-        // silent (counted, not logged) no-op for it, matching how the PIPE
-        // fast path already degrades for that case.
+        // Packed format or a validated unpacked_expert_format model both
+        // have a well-defined per-layer (gb,ub,db) geometry via
+        // expert_layer_geometry -- an UNvalidated legacy per-expert model
+        // (unpacked_expert_format=false but per-expert tensor names present
+        // anyway) has no single geometry to reconstruct host_ptr/meta
+        // offsets from, so demotion is a silent (counted, not logged) no-op
+        // for that case, matching how the PIPE fast path already degrades.
         size_t gb, ub, db;
         const GGUFTensor *gM, *uM, *dM;
-        if (!engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
+        if (!engine.expert_layer_geometry(layer, gb, ub, db, gM, uM, dM)) {
             perf().n_vram_evict_demote_skipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -438,23 +691,31 @@ public:
         // filled here is, by definition, about to become
         // also_in_vram==false (its data just left VRAM, this D2H copy is
         // now the only one), so it's never short-circuited to score 0 by
-        // that same rule on this call. copy_still_pending() takes priority
-        // over both: a slot with an unconfirmed async H2D copy still
-        // reading its OLD slab_buffer must never be picked (see
-        // MoEExpertBlock::pending_copy_event) -- scored as UINT64_MAX so
-        // it's only ever chosen if literally every candidate has this
-        // problem, an extremely rare case the defensive sync below still
-        // handles safely.
+        // that same rule on this call. copy_still_pending() and
+        // ram_temp_pin_count > 0 both take priority over both: a slot with
+        // an unconfirmed async H2D copy still reading its OLD slab_buffer
+        // (MoEExpertBlock::pending_copy_event), OR one a raw pointer is
+        // currently held across moe_forward_gguf's Pass A -> Pass B gap
+        // (MoEExpertBlock::ram_temp_pin_count -- see its own comment for
+        // the real release_hold-identity-mismatch bug this closes), must
+        // never be picked -- scored as UINT64_MAX so either is only ever
+        // chosen if literally every candidate has one of these problems.
         size_t victim_idx = 0;
-        uint64_t victim_score = layer_slots[0].copy_still_pending() ? UINT64_MAX
-            : (layer_slots[0].also_in_vram ? 0 : eviction_score(layer_slots[0]));
+        uint64_t victim_score = (layer_slots[0].copy_still_pending() || layer_slots[0].ram_temp_pin_count > 0)
+            ? UINT64_MAX : (layer_slots[0].also_in_vram ? 0 : eviction_score(layer_slots[0]));
         for (size_t i = 1; i < cap; ++i) {
-            uint64_t score = layer_slots[i].copy_still_pending() ? UINT64_MAX
-                : (layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]));
+            uint64_t score = (layer_slots[i].copy_still_pending() || layer_slots[i].ram_temp_pin_count > 0)
+                ? UINT64_MAX : (layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]));
             if (score < victim_score) { victim_score = score; victim_idx = i; }
         }
         MoEExpertBlock& victim = layer_slots[victim_idx];
         int displaced = victim.expert_id;
+        // Erase the outgoing identity's index entry now -- this slot is
+        // committed to being overwritten by `expert_id` from here on,
+        // whether the D2H copy below ultimately succeeds or fails (see the
+        // failure branch further down, which also leaves the slot with a
+        // NEW, empty identity rather than the old `displaced` one).
+        if (displaced != -1) ram_expert_index.erase(swap_key(layer, displaced));
 
         // Defensive last resort: only actually blocks if EVERY candidate
         // above scored UINT64_MAX (all pending) and this one still got
@@ -492,6 +753,7 @@ public:
             // leave state that looks valid but isn't.
             victim.expert_id = -1;
             victim.also_in_vram = false;
+            victim.from_pipe_prefetch = false;
             perf().n_vram_evict_demote_failed.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -499,9 +761,11 @@ public:
         if (displaced != -1) ram_swap_stats[swap_key(layer, displaced)].swap_out++;
         engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
         victim.also_in_vram = false;  // it just left VRAM -- this RAM copy is the only one now
+        victim.from_pipe_prefetch = false;  // fresh identity, not PIPE-served
         victim.last_used_clock = ++global_clock;
         victim.hit_count = 0;
         ram_swap_stats[swap_key(layer, expert_id)].swap_in++;
+        ram_expert_index[swap_key(layer, expert_id)] = victim_idx;
         perf().n_vram_evict_demoted.fetch_add(1, std::memory_order_relaxed);
 
         LOG_DEBUG("[MOE-RAM] DEMOTE layer=%d expert=%d slot=%zu displaced=%d (%.2f MB salvaged from VRAM via D2H)\n",
@@ -509,6 +773,19 @@ public:
     }
 
     MoEExpertBlock* get_expert(StreamingEngine& engine, int layer, int expert_id) {
+        // Whole-function cost -- only expert_disk_load (the raw pread) and
+        // consume (staged-slab memcpy) were ever separately timed inside
+        // this function; the RAM-tier hit/miss scan, victim-selection scan,
+        // hit_count/MOVE-promotion bookkeeping, and ensure_slab_capacity's
+        // possible free+realloc were not. Added alongside t_ram_get_experts_
+        // batch after find_expert/evict_lru/upload_expert_async (GpuTopology)
+        // and hold_for_compute/release_hold/find_active_expert were all
+        // directly measured and found small, yet expert= still exceeded its
+        // accounted-for sub-timers by ~65-70s across three separate real
+        // runs -- the RAM tier (this function and its batched sibling) is
+        // the largest remaining scope in the whole decode-time hot path with
+        // no overall timer at all.
+        PERF_SCOPE(t_ram_get_expert);
         auto& layer_slots = engine.layers_experts[layer];
 
         // graph_initializer.cpp always allocates n_experts (e.g. 256) slots
@@ -527,9 +804,10 @@ public:
             : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
 
         // --- Step 1: Check host RAM LRU cache ---
-        for (size_t si = 0; si < cap; ++si) {
-            auto& slot = layer_slots[si];
-            if (slot.expert_id == expert_id) {
+        {
+            ssize_t hit_idx = find_ram_slot(layer_slots, cap, layer, expert_id);
+            if (hit_idx >= 0) {
+                auto& slot = layer_slots[hit_idx];
                 slot.last_used_clock = ++global_clock;
                 if (slot.hit_count < UINT32_MAX) slot.hit_count++;
                 if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts(engine);
@@ -559,7 +837,15 @@ public:
                 bool gpu_capable = gpu_type_supported(slot.gate_proj.meta.type)
                                  && gpu_type_supported(slot.up_proj.meta.type)
                                  && gpu_type_supported(slot.down_proj.meta.type);
-                if (vram_cache && slot.slab_buffer && gpu_capable && slot.hit_count >= promote_hit_threshold) {
+                // cpu_affinity_layers (config): never promote a repeat-hit
+                // expert from this layer into VRAM, no matter how hot it
+                // gets -- matches execution_layer.cpp's own early return in
+                // expert_ffn_resolve_gpu_loc for the SAME layers. Without
+                // this, a layer explicitly marked "never DMA into VRAM"
+                // would still get promoted here on a proven-hot repeat hit,
+                // silently defeating the whole point of the config.
+                if (vram_cache && slot.slab_buffer && gpu_capable && slot.hit_count >= promote_hit_threshold
+                    && !is_cpu_affinity_layer(layer)) {
                     // find_expert has side effects (bumps the VRAM slot's own
                     // hit_count/last_used_clock), so call it once and branch
                     // on the result rather than calling it again below.
@@ -569,12 +855,16 @@ public:
                                   layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
                         ExpertLocation* promoted = vram_cache->upload_expert_async(
                             layer, expert_id, slot.slab_buffer, slot.slab_capacity);
+                        if (promoted && slot.from_pipe_prefetch) {
+                            perf().n_pipe_staged_later_promoted.fetch_add(1, std::memory_order_relaxed);
+                        }
 
                         // FIX: Three-tier caching - MOVE instead of COPY
                         // Immediately free RAM slot after VRAM promotion starts
                         // This eliminates the 7.7GB tier overlap waste
                         if (move_on_promotion) {
                             slot.expert_id = -1;  // Mark RAM slot as free
+                            ram_expert_index.erase(swap_key(layer, expert_id));
                             slot.last_used_clock = 0;
                             slot.hit_count = 0;
                             slot.also_in_vram = false;
@@ -647,18 +937,20 @@ public:
         // lowest-priority ("evict first") candidate regardless of its own
         // recency/hit_count -- its data is genuinely redundant capacity,
         // already safely resident and dispatch-ready in the VRAM tier.
-        // copy_still_pending() takes priority over also_in_vram: a slot
-        // with an unconfirmed async H2D copy still reading its OLD
-        // slab_buffer must never be picked (see MoEExpertBlock::
-        // pending_copy_event) -- scored as UINT64_MAX, only chosen if
-        // every candidate has this problem, which the defensive sync
-        // below still handles safely.
+        // copy_still_pending() and ram_temp_pin_count > 0 both take
+        // priority over also_in_vram: a slot with an unconfirmed async H2D
+        // copy still reading its OLD slab_buffer (MoEExpertBlock::
+        // pending_copy_event), OR one a raw pointer is currently held
+        // across moe_forward_gguf's Pass A -> Pass B gap (MoEExpertBlock::
+        // ram_temp_pin_count), must never be picked -- scored as
+        // UINT64_MAX, only chosen if every candidate has one of these
+        // problems, which the defensive sync below still handles safely.
         int lru_idx = 0;
-        uint64_t lru_score = layer_slots[0].copy_still_pending() ? UINT64_MAX
-            : (layer_slots[0].also_in_vram ? 0 : eviction_score(layer_slots[0]));
+        uint64_t lru_score = (layer_slots[0].copy_still_pending() || layer_slots[0].ram_temp_pin_count > 0)
+            ? UINT64_MAX : (layer_slots[0].also_in_vram ? 0 : eviction_score(layer_slots[0]));
         for (size_t i = 1; i < cap; ++i) {
-            uint64_t score = layer_slots[i].copy_still_pending() ? UINT64_MAX
-                : (layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]));
+            uint64_t score = (layer_slots[i].copy_still_pending() || layer_slots[i].ram_temp_pin_count > 0)
+                ? UINT64_MAX : (layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]));
             if (score < lru_score) { lru_score = score; lru_idx = (int)i; }
         }
 
@@ -666,8 +958,10 @@ public:
         int evicted_expert_id = victim.expert_id;
         if (evicted_expert_id != -1) {
             ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
+            ram_expert_index.erase(swap_key(layer, evicted_expert_id));
         }
         victim.also_in_vram = false;  // fresh identity in this slot momentarily
+        victim.from_pipe_prefetch = false;  // reset; set true below only if actually PIPE-served
         // Defensive last resort (see demote_from_vram's identical comment
         // above) -- only actually blocks if every candidate was pending.
         if (victim.pending_copy_event) {
@@ -693,12 +987,18 @@ public:
         // prefetcher's staging pool (already pread by the worker thread
         // while a previous layer computed) before falling back to a
         // synchronous pread on THIS (the decode) thread. The prefetcher
-        // only ever produces the packed-format layout, so this path is
-        // skipped for legacy per-expert-tensor models (packed_slab_geometry
-        // returns false) or if `prefetcher` isn't wired (nullptr).
+        // (async_prefetcher.hpp) only ever BUILDS packed-format read
+        // requests -- it has no unpacked_expert_format awareness of its
+        // own -- so this stays gated on packed_slab_geometry specifically
+        // (not the unified expert_layer_geometry) even when
+        // unpacked_expert_format=true: PIPE is out of scope for that flag,
+        // every unpacked-format miss falls through to load_expert_slab /
+        // the io_uring Phase B batch below instead, both of which DO
+        // support it. Also skipped entirely if `prefetcher` isn't wired
+        // (nullptr).
         PERF_START(expert_disk_load);
         bool served_from_pipe = false;
-        if (prefetcher) {
+        if (prefetcher && !engine.unpacked_expert_format) {
             size_t gb, ub, db;
             const GGUFTensor *gM, *uM, *dM;
             if (engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
@@ -711,6 +1011,7 @@ public:
                 if (ok && got_bytes == total) {
                     engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
                     served_from_pipe = true;
+                    victim.from_pipe_prefetch = true;
                     perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
                     if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
                     else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
@@ -727,6 +1028,10 @@ public:
         victim.last_used_clock = ++global_clock;
         victim.hit_count = 0;  // fresh identity in this slot, reset frequency signal
         ram_swap_stats[swap_key(layer, expert_id)].swap_in++;
+        // victim.expert_id was set to `expert_id` inside populate_packed_slab
+        // above (either the PIPE branch's direct call, or transitively via
+        // load_expert_slab -> populate_packed_slab) -- safe to index now.
+        ram_expert_index[swap_key(layer, expert_id)] = (size_t)lru_idx;
 
         LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%d evicted=%d loaded_from_disk=%.2fms via=%s (%.2f MB, %.2f GB/s)\n",
                   layer, expert_id, lru_idx, evicted_expert_id, load_ms,
@@ -771,6 +1076,11 @@ public:
     // get_expert() has always had, just serviced faster.
     void get_experts_batch(StreamingEngine& engine, int layer, const int* expert_ids, int topk,
                            MoEExpertBlock** out) {
+        // See get_expert's own comment on t_ram_get_expert -- same rationale,
+        // this is get_expert's batched sibling and the higher-traffic of the
+        // two on the real decode-time call path (called once per non-shadowed
+        // subset per token/layer, vs get_expert's per-expert calls elsewhere).
+        PERF_SCOPE(t_ram_get_experts_batch);
         auto& layer_slots = engine.layers_experts[layer];
         size_t cap = layer_slots.empty() ? 0
             : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
@@ -795,9 +1105,11 @@ public:
         for (int k = 0; k < topk; ++k) {
             int expert_id = expert_ids[k];
             bool found = false;
-            for (size_t si = 0; si < cap; ++si) {
-                auto& slot = layer_slots[si];
-                if (slot.expert_id == expert_id) {
+            {
+                ssize_t hit_idx = find_ram_slot(layer_slots, cap, layer, expert_id);
+                if (hit_idx >= 0) {
+                    auto& slot = layer_slots[hit_idx];
+                    size_t si = (size_t)hit_idx;
                     // -- identical to get_expert's Step 1 --
                     slot.last_used_clock = ++global_clock;
                     if (slot.hit_count < UINT32_MAX) slot.hit_count++;
@@ -810,13 +1122,19 @@ public:
                     bool gpu_capable = gpu_type_supported(slot.gate_proj.meta.type)
                                      && gpu_type_supported(slot.up_proj.meta.type)
                                      && gpu_type_supported(slot.down_proj.meta.type);
-                    if (vram_cache && slot.slab_buffer && gpu_capable && slot.hit_count >= promote_hit_threshold) {
+                    // cpu_affinity_layers -- same reasoning as get_expert's
+                    // identical Step 1 guard above.
+                    if (vram_cache && slot.slab_buffer && gpu_capable && slot.hit_count >= promote_hit_threshold
+                        && !is_cpu_affinity_layer(layer)) {
                         ExpertLocation* resident = vram_cache->find_expert(layer, expert_id);
                         if (!resident) {
                             LOG_DEBUG("[MOE-VRAM]  PROMOTE layer=%d expert=%d hit_count=%u -> async H2D upload (%.2f MB)\n",
                                       layer, expert_id, slot.hit_count, slot.slab_capacity / 1e6);
                             ExpertLocation* promoted = vram_cache->upload_expert_async(
                                 layer, expert_id, slot.slab_buffer, slot.slab_capacity);
+                            if (promoted && slot.from_pipe_prefetch) {
+                                perf().n_pipe_staged_later_promoted.fetch_add(1, std::memory_order_relaxed);
+                            }
 
                             // Same MOVE-vs-COPY fix as get_expert's Step 1 above --
                             // this batched hit path was missing it entirely, which
@@ -830,6 +1148,7 @@ public:
                             // [TIER-OVERLAP] in the perf report.
                             if (move_on_promotion) {
                                 slot.expert_id = -1;
+                                ram_expert_index.erase(swap_key(layer, expert_id));
                                 slot.last_used_clock = 0;
                                 slot.hit_count = 0;
                                 slot.also_in_vram = false;
@@ -883,7 +1202,6 @@ public:
                     }
                     out[k] = &slot;
                     found = true;
-                    break;
                 }
             }
             if (found) continue;
@@ -902,11 +1220,14 @@ public:
                     continue;
                 // Same also_in_vram-first eviction preference as get_expert's
                 // Step 3 -- see MoEExpertBlock::also_in_vram's own comment.
-                // copy_still_pending() takes priority over both: never pick
-                // a slot whose async H2D copy hasn't been confirmed done yet
-                // (see MoEExpertBlock::pending_copy_event).
-                uint64_t score = layer_slots[i].copy_still_pending() ? UINT64_MAX
-                    : (layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]));
+                // copy_still_pending() and ram_temp_pin_count > 0 both take
+                // priority over both: never pick a slot whose async H2D
+                // copy hasn't been confirmed done yet (MoEExpertBlock::
+                // pending_copy_event), or one a raw pointer is currently
+                // held across moe_forward_gguf's Pass A -> Pass B gap
+                // (MoEExpertBlock::ram_temp_pin_count).
+                uint64_t score = (layer_slots[i].copy_still_pending() || layer_slots[i].ram_temp_pin_count > 0)
+                    ? UINT64_MAX : (layer_slots[i].also_in_vram ? 0 : eviction_score(layer_slots[i]));
                 if (lru_idx < 0 || score < lru_score) { lru_score = score; lru_idx = (int)i; }
             }
             if (lru_idx < 0) {
@@ -933,8 +1254,10 @@ public:
             int evicted_expert_id = victim.expert_id;
             if (evicted_expert_id != -1) {
                 ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
+                ram_expert_index.erase(swap_key(layer, evicted_expert_id));
             }
             victim.also_in_vram = false;  // fresh identity in this slot momentarily
+            victim.from_pipe_prefetch = false;  // reset; set true below only if actually PIPE-served
             // Defensive last resort (see get_expert Step 3's identical
             // comment) -- only actually blocks if every candidate was
             // pending. Must run before ensure_slab_capacity below, which
@@ -963,12 +1286,18 @@ public:
             // batch to scan past this slot without re-picking it (belt-
             // and-suspenders alongside claimed_this_batch above).
             victim.expert_id = expert_id;
+            ram_expert_index[swap_key(layer, expert_id)] = (size_t)lru_idx;
             victim.last_used_clock = ++global_clock;
             victim.hit_count = 0;
 
             PERF_START(expert_disk_load);
             bool served_from_pipe = false;
-            if (prefetcher) {
+            // PIPE stays packed-format-only regardless of
+            // unpacked_expert_format -- see get_expert Step 3's identical
+            // comment above (the prefetcher itself has no unpacked-format
+            // read-building of its own). Unpacked misses fall through to
+            // Phase B's io_uring batch / the OMP fallback below.
+            if (prefetcher && !engine.unpacked_expert_format) {
                 size_t gb, ub, db;
                 const GGUFTensor *gM, *uM, *dM;
                 if (engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
@@ -981,6 +1310,7 @@ public:
                     if (ok && got_bytes == total) {
                         engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
                         served_from_pipe = true;
+                        victim.from_pipe_prefetch = true;
                         perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
                         if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
                         else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
@@ -1030,6 +1360,16 @@ public:
         int n_pending = (int)pending.size();
         if (n_pending > 0) {
             bool uring_ok = false;
+            // Root-cause-attributed outcome of THIS batch's uring attempt --
+            // see perf_timer.hpp's n_decode_uring_* comment for why this was
+            // added (a real run showed the ring initialize successfully at
+            // startup, yet get_batch=/disk= differed by ~3.7x, the
+            // signature of the OMP-fallback thread-summing firing far more
+            // than expected -- this makes the actual per-batch outcome
+            // directly visible instead of inferred from that ratio).
+            if (!(use_decode_uring && decode_uring_ring.available())) {
+                perf().n_decode_uring_not_available.fetch_add(1, std::memory_order_relaxed);
+            }
             if (use_decode_uring && decode_uring_ring.available()) {
                 std::vector<io_uring_backend::ReadRequest> reqs;
                 reqs.reserve((size_t)n_pending * 3);
@@ -1038,12 +1378,21 @@ public:
                     io_uring_backend::ReadRequest tmp[3];
                     int cnt = 0; size_t total = 0;
                     MoEExpertBlock& victim = layer_slots[pending[i].slot_idx];
-                    if (!engine.build_packed_expert_read_requests(layer, pending[i].expert_id, victim,
-                                                                    tmp, cnt, total)) {
+                    if (!engine.build_expert_read_requests(layer, pending[i].expert_id, victim,
+                                                             tmp, cnt, total)) {
                         all_packed = false;
                         break;
                     }
                     for (int j = 0; j < cnt; ++j) reqs.push_back(tmp[j]);
+                }
+                if (!all_packed) {
+                    perf().n_decode_uring_not_packed.fetch_add(1, std::memory_order_relaxed);
+                } else if (reqs.empty()) {
+                    // Should be unreachable (n_pending > 0 implies at least
+                    // one request), but if it ever happens, don't silently
+                    // miscount it as any of the other buckets.
+                } else if (reqs.size() > io_uring_backend::Ring::CAPACITY) {
+                    perf().n_decode_uring_too_large.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (all_packed && !reqs.empty() && reqs.size() <= io_uring_backend::Ring::CAPACITY) {
                     std::vector<ssize_t> results(reqs.size());
@@ -1051,18 +1400,41 @@ public:
                     bool submitted = decode_uring_ring.submit_and_wait(reqs.data(), (int)reqs.size(), results.data());
                     double batch_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t0).count();
+                    // Previously completely untimed -- batch_ms existed only
+                    // for the LOG_DEBUG line below, never fed into
+                    // t_disk_read the way the OMP-fallback path's
+                    // load_expert_slab (engine.hpp) already does internally.
+                    // Since this whole submit_and_wait call sits inside
+                    // get_experts_batch's own PERF_SCOPE(t_ram_get_experts_
+                    // batch), the real disk I/O cost was silently being
+                    // attributed to "scanning" (ram_scan=/get_batch= in the
+                    // [REQUEST] line) instead of "disk=" -- discovered after
+                    // two separate scan-focused index fixes to
+                    // get_experts_batch produced ZERO measurable change to
+                    // get_batch= across three real runs, which should have
+                    // been the tell that the dominant cost wasn't the scan
+                    // at all. Added unconditionally (matching load_expert_
+                    // slab's own PERF_END, which fires regardless of a
+                    // short/failed read) since a failed or partial uring
+                    // attempt still consumed real wall-clock time.
+                    PerfCounters::atomic_add(perf().t_disk_read, batch_ms / 1000.0);
                     bool all_ok = submitted;
                     if (submitted) {
                         for (size_t r = 0; r < reqs.size(); ++r) {
                             if (results[r] != (ssize_t)reqs[r].len) { all_ok = false; break; }
                         }
                     }
+                    if (!submitted) {
+                        perf().n_decode_uring_submit_failed.fetch_add(1, std::memory_order_relaxed);
+                    } else if (!all_ok) {
+                        perf().n_decode_uring_short_read.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (all_ok) {
                         size_t total_bytes = 0;
                         for (int i = 0; i < n_pending; ++i) {
                             size_t gb, ub, db;
                             const GGUFTensor *gM, *uM, *dM;
-                            engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM);
+                            engine.expert_layer_geometry(layer, gb, ub, db, gM, uM, dM);
                             MoEExpertBlock& victim = layer_slots[pending[i].slot_idx];
                             engine.populate_packed_slab(victim, pending[i].expert_id, gb, ub, db, *gM, *uM, *dM);
                             pending[i].load_ms = batch_ms; // shared batch time; per-expert split isn't meaningful here
@@ -1071,6 +1443,7 @@ public:
                         }
                         perf().bytes_disk_read.fetch_add(total_bytes, std::memory_order_relaxed);
                         uring_ok = true;
+                        perf().n_decode_uring_ok.fetch_add(1, std::memory_order_relaxed);
                         LOG_DEBUG("[MOE-CACHE] MISS  layer=%d batch=%d experts via=io_uring took=%.2fms "
                                   "(%.2f MB, %.2f GB/s)\n",
                                   layer, n_pending, batch_ms, total_bytes / 1e6,

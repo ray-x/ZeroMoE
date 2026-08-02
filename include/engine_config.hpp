@@ -38,12 +38,95 @@ struct EngineConfig {
     float top_p = 0.90f;
     bool drop_pages = false;         // fadvise DONTNEED after expert read
     bool cpu_only = false;           // force ALL compute to CPU (no GPU dispatch)
+
+    // Phase 2 (moe_forward_gguf's S>1 cold-start VRAM warm-up) currently
+    // loads each candidate expert SYNCHRONOUSLY, one at a time, inside the
+    // per-layer critical path -- ram_mgr.get_expert() (which can trigger a
+    // real, blocking disk read) followed by upload_expert_async. Measured
+    // on a real run: 325 such warm-ups for an 11-token prompt, entirely
+    // serialized into "Prefill (whole pass)"'s own wall-clock time. When
+    // true, Phase 2 instead pushes a hint per candidate to the SAME
+    // async_io_queue (LockFreePrefetcher) PILOT prediction already uses
+    // for decode -- a cheap, non-blocking lock-free queue push -- and lets
+    // the prefetcher's background worker thread(s) do the actual read +
+    // promote, overlapped with whatever this layer/the next layer computes
+    // next, instead of blocking this thread on it. Trade-off, not a strict
+    // win: the legacy synchronous path GUARANTEES the expert is resident by
+    // the time THIS layer's own Phase 3 dispatch runs a moment later; the
+    // async version might not finish in time for that, falling through to
+    // the ordinary (already-correct) miss path for this specific layer --
+    // never a correctness issue, only a question of whether the aggregate
+    // "stop blocking" win outweighs the lost same-layer guarantee. Default
+    // false (unchanged legacy behavior) -- A/B test via t_prefill_warm_time
+    // (should collapse toward ~0 when this is on) and overall Prefill
+    // wall-clock before trusting it. See CLAUDE.md.
+    bool prefill_warm_via_prefetcher = false;
+
+    // Per-layer version of cpu_only: these specific MoE layers never
+    // dispatch on GPU and their routed experts are never uploaded/promoted
+    // into VRAM (no shadow-fast-path, no cold-batch/decode-miss synchronous
+    // upload, no RAM-tier reactive-hit promotion, no startup VRAM pin/
+    // preload) -- experts for these layers load into host RAM only and
+    // always compute on CPU. Intended for layers whose expert set is so
+    // large/flat that a real run spends far more wall-clock time on the
+    // disk read than the matmul itself: for those layers a VRAM upload buys
+    // nothing (the bottleneck never moves) while it costs real VRAM cache
+    // capacity that layers where GPU residency DOES help could otherwise
+    // use, plus real PCIe/DMA time that's pure overhead when compute was
+    // always going to be I/O-bound. Empty (default) = no layers affected,
+    // identical to today's behavior. See CLAUDE.md.
+    std::vector<int> cpu_affinity_layers;
     // O_DIRECT expert-slab reads (Linux only). Opt-in, requires the model
     // to have been repacked with tools/gguf_tool pack (or otherwise have
     // general.alignment >= 4096) -- see GGUFFile::enable_direct_io. A
     // plain/un-repacked GGUF silently falls back to buffered reads with a
     // logged warning, never a hard failure.
     bool direct_io = false;
+
+    // NVIDIA cuFile (GPUDirect Storage): DMA a genuine "double miss" expert
+    // (not VRAM-resident AND not host-RAM-resident -- see
+    // RAMSafetyManager::is_ram_resident) straight from NVMe into a VRAM
+    // cache slot, skipping the host-RAM hop entirely. Requires direct_io=true
+    // (cuFile needs the SAME O_DIRECT file descriptor direct_io already
+    // opens -- validated below, not silently assumed) AND the machine
+    // actually having NVIDIA GPUDirect Storage + the nvidia-fs kernel module
+    // installed (a SEPARATE install from the base CUDA Toolkit -- see
+    // CMakeLists.txt's MOESTREAM_HAVE_CUFILE detection). Requesting this
+    // without GDS installed (or on a non-Linux/no-cuFile build) logs a
+    // warning and silently falls back to the existing RAM-mediated upload
+    // path -- never a hard failure, same contract as direct_io/io_uring.
+    // If an expert IS already RAM-resident, this is never used for it
+    // regardless of this setting -- cuFile only ever replaces a disk read
+    // that would otherwise happen anyway, never a RAM->VRAM promotion of
+    // data already in host memory. See CLAUDE.md.
+    bool cuda_cufile = false;
+
+    // The model directory was produced by `gguf_tool pack --unpack`: every
+    // routed expert's gate/up/down are three SEPARATE tensors
+    // (blk.N.ffn_{gate,up,down}.E.weight) instead of one shared packed
+    // _exps tensor per layer, but laid out physically TIGHT and
+    // CONTIGUOUS per expert (gate immediately followed by up immediately
+    // followed by down, no padding -- see tools/gguf_pack.cpp's own
+    // layout pass) so the whole expert can be read with ONE combined DMA
+    // request instead of three scattered ones. This is NOT auto-detected
+    // from the tensor names alone -- a plain, non-repacked per-expert GGUF
+    // uses the exact same tensor-naming convention but has no contiguity
+    // or alignment guarantee at all, so treating it as this fast layout
+    // would read garbage across whatever gap actually exists between
+    // projections. Setting this true makes the engine ASSUME the
+    // contiguous-and-aligned invariant holds and validate it explicitly at
+    // startup (StreamingEngine::sanity_check_unpacked_format, called right
+    // after the model graph is built) -- any violation is a FATAL error
+    // printed to stderr and the run refuses to start, rather than silently
+    // falling back to the slow per-projection path. Independent of
+    // direct_io/io_uring (compose with either); has no effect at all on a
+    // model using the default packed _exps format (--align-only, the
+    // recommended default) -- leave this false for that format. See
+    // CLAUDE.md's "Offline GGUF Tool" section for why --unpack alone,
+    // without this flag, previously made performance WORSE rather than
+    // better (it silently disabled both the VRAM-shadow fast path and
+    // io_uring batching, which are gated by the packed _exps tensor name).
+    bool unpacked_expert_format = false;
 
     // Batch the async prefetcher's per-expert reads (up to 3: gate/up/down)
     // through io_uring instead of sequential blocking preads (Linux only,
@@ -54,6 +137,27 @@ struct EngineConfig {
     // never a hard failure. Prefetcher-only: does not touch the synchronous
     // decode-thread miss path (StreamingEngine::load_expert_slab).
     bool io_uring = false;
+
+    // Bounds the io-wq kernel worker pool each io_uring Ring registers
+    // (IORING_REGISTER_IOWQ_MAX_WORKERS, io_uring_backend.hpp::Ring::
+    // register_iowq_workers) -- only meaningful together with IOSQE_ASYNC
+    // (unconditionally set on every submitted read; see that flag's own
+    // comment), which is what actually forces reads onto io-wq instead of
+    // letting them execute inline inside io_uring_enter(). This is a real
+    // OS thread count, not free: colibri's own reference implementation
+    // (a separate engine, c/uring.h/glm.c) defaults to 8 (PIPE_WORKERS),
+    // reflecting where most consumer/prosumer NVMe drives reach near-peak
+    // throughput for reads this size (~4-13MB) -- going much higher rarely
+    // helps further and starts competing for CPU with everything else this
+    // process already runs (omp_max_threads' own OMP team, expert_fetch_
+    // threads, prefetch_worker_threads) since io-wq workers are a SEPARATE
+    // kernel-managed pool, not counted against omp_max_threads' budget.
+    // Applied to the decode thread's own ring (RAMSafetyManager::
+    // init_decode_uring) directly; each prefetch worker's own ring stays
+    // fixed at 3 (every active_prefetch() submission is exactly one
+    // hint's gate/up/down, never more, so more workers there than 3
+    // couldn't parallelize anything further regardless of this setting).
+    int io_uring_workers = 8;
 
     // Number of concurrent async prefetcher worker threads pulling hints
     // off the SPSC queue and servicing them (disk read + optional async
@@ -126,6 +230,18 @@ struct EngineConfig {
     // per-layer count.
     std::string pin_file = ".moestream_usage";
     int pin_topk_per_layer = 0;
+
+    // Separate usage file tracking ONLY prefill-phase (S > 1) routing
+    // selections -- see StreamingEngine::route_freq_prefill's own comment
+    // for why decode's higher routing volume can crowd out prefill's own
+    // needs in the combined pin_file histogram. Empty (default) = not
+    // used; startup preload falls back entirely to pin_file's ranking for
+    // every layer. When set, preload prefers this file's ranking for any
+    // layer it has data for, falling back to pin_file only for layers this
+    // file has no entries for (e.g. its very first run, before any
+    // prefill has been recorded into it yet). Written at shutdown
+    // alongside pin_file, same accumulate-across-sessions semantics.
+    std::string prefill_pin_file;
 
     // How the pinned_vram_capacity budget gets DISTRIBUTED across layers at
     // startup preload. Two options, both driven by the same pin_file usage
@@ -360,7 +476,8 @@ struct Value {
     std::string str;
     double num = 0;
     bool boolean = false;
-    enum Type { String, Number, Bool } type = String;
+    std::vector<int> int_array;  // only populated when type == IntArray
+    enum Type { String, Number, Bool, IntArray } type = String;
 };
 
 struct Table {
@@ -387,6 +504,14 @@ struct Table {
         auto it = values.find(key);
         return (it != values.end() && it->second.type == Value::Bool) ? it->second.boolean : def;
     }
+    // e.g. `cpu_affinity_layers = [4, 5, 7]`. Missing key or wrong type
+    // (not a bracketed array) returns an empty vector, same "def" spirit
+    // as the other get_*'s -- callers treat empty as "no layers affected".
+    std::vector<int> get_int_array(const std::string& key) const {
+        auto it = values.find(key);
+        return (it != values.end() && it->second.type == Value::IntArray) ? it->second.int_array
+                                                                            : std::vector<int>{};
+    }
 };
 
 struct Document {
@@ -410,6 +535,29 @@ inline Value parse_value(const std::string& raw) {
         v.type = Value::Bool;
         v.boolean = (s == "true");
         v.str = s;
+        return v;
+    }
+    // Integer array: `[4, 5, 7]`. Deliberately simple (no nested arrays, no
+    // floats, no multi-line arrays) -- the only current consumer
+    // (cpu_affinity_layers) is a short flat list of layer indices, and this
+    // parser is documented as "the subset we need", not general TOML.
+    if (s.front() == '[' && s.back() == ']') {
+        v.type = Value::IntArray;
+        v.str = s;
+        std::string inner = s.substr(1, s.size() - 2);
+        std::istringstream elems(inner);
+        std::string tok;
+        while (std::getline(elems, tok, ',')) {
+            std::string t = trim(tok);
+            if (t.empty()) continue;
+            try {
+                v.int_array.push_back(std::stoi(t));
+            } catch (...) {
+                // Malformed element -- skip it rather than abort the whole
+                // config load; a missing layer index just means that layer
+                // isn't CPU-pinned, never a correctness/crash risk.
+            }
+        }
         return v;
     }
     // Number
@@ -486,8 +634,13 @@ inline bool EngineConfig::load(const std::string& path) {
     top_p            = doc.root.get_float("top_p", top_p);
     drop_pages       = doc.root.get_bool("drop_pages", drop_pages);
     cpu_only         = doc.root.get_bool("cpu_only", cpu_only);
+    cpu_affinity_layers = doc.root.get_int_array("cpu_affinity_layers");
     direct_io        = doc.root.get_bool("direct_io", direct_io);
+    cuda_cufile      = doc.root.get_bool("cuda_cufile", cuda_cufile);
+    prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher", prefill_warm_via_prefetcher);
+    unpacked_expert_format = doc.root.get_bool("unpacked_expert_format", unpacked_expert_format);
     io_uring         = doc.root.get_bool("io_uring", io_uring);
+    io_uring_workers = doc.root.get_int("io_uring_workers", io_uring_workers);
     prefetch_worker_threads = doc.root.get_int("prefetch_worker_threads", prefetch_worker_threads);
     prefetch_staging_slots = doc.root.get_int("prefetch_staging_slots", prefetch_staging_slots);
     host_ram_gb      = doc.root.get_double("host_ram_gb", host_ram_gb);
@@ -495,6 +648,7 @@ inline bool EngineConfig::load(const std::string& path) {
     promote_hit_threshold = doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
     pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
     pin_file         = doc.root.get_str("pin_file", pin_file);
+    prefill_pin_file = doc.root.get_str("prefill_pin_file", prefill_pin_file);
     pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
     pin_strategy = doc.root.get_str("pin_strategy", pin_strategy);
     pin_global_floor_per_layer = doc.root.get_int("pin_global_floor_per_layer", pin_global_floor_per_layer);
@@ -612,6 +766,13 @@ inline bool EngineConfig::validate() {
         }
     }
 
+    if (cuda_cufile && !direct_io) {
+        std::cerr << "[CONFIG] cuda_cufile=true requires direct_io=true (cuFile registers the SAME "
+                  << "O_DIRECT file descriptor direct_io opens -- see GGUFFile::enable_cufile) -- "
+                  << "disabling cuda_cufile for this run. Set direct_io=true as well to actually use it.\n";
+        cuda_cufile = false;
+    }
+
     if (pin_strategy != "per_layer_topk" && pin_strategy != "global_topn") {
         std::cerr << "[CONFIG] Unknown pin_strategy '" << pin_strategy
                   << "' (expected \"per_layer_topk\" or \"global_topn\") -- "
@@ -632,16 +793,36 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Drop pages: " << (drop_pages ? "yes" : "no") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Direct I/O (O_DIRECT expert reads): " << (direct_io ? "requested" : "off")
               << (direct_io ? " (falls back to buffered per-shard if unsupported/unaligned -- see [DIRECT-IO] log)" : "") << "\n";
+    if (unpacked_expert_format)
+        LOG_STREAM_INFO() << "[CONFIG] Unpacked expert format: ON (single combined DMA per expert; "
+                              "startup sanity check will FATAL if the model isn't actually tight/aligned)\n";
+    LOG_STREAM_INFO() << "[CONFIG] cuFile (GPUDirect Storage direct disk->VRAM): " << (cuda_cufile ? "requested" : "off")
+              << (cuda_cufile ? " (falls back to RAM-mediated upload if GDS/nvidia-fs unavailable -- see [CUFILE] log)" : "") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Prefill warm-up via prefetcher: " << (prefill_warm_via_prefetcher ? "ON" : "off (legacy synchronous)")
+              << "\n";
     LOG_STREAM_INFO() << "[CONFIG] io_uring (batched prefetcher reads): " << (io_uring ? "requested" : "off")
               << (io_uring ? " (falls back to sequential preads if unsupported -- see [IO-URING] log)" : "") << "\n";
+    if (io_uring) {
+        LOG_STREAM_INFO() << "[CONFIG] io_uring workers (decode-thread ring's io-wq pool): " << io_uring_workers << "\n";
+    }
     LOG_STREAM_INFO() << "[CONFIG] Prefetch worker threads: " << prefetch_worker_threads << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch staging slots: " << prefetch_staging_slots << "\n";
     if (cpu_only) LOG_STREAM_INFO() << "[CONFIG] CPU-only mode: ON (all GPU dispatch disabled)\n";
+    if (!cpu_affinity_layers.empty()) {
+        LOG_STREAM_INFO() << "[CONFIG] CPU-affinity layers (never GPU-dispatched or VRAM-uploaded): ";
+        for (size_t i = 0; i < cpu_affinity_layers.size(); ++i)
+            LOG_STREAM_INFO() << (i > 0 ? ", " : "") << cpu_affinity_layers[i];
+        LOG_STREAM_INFO() << "\n";
+    }
     LOG_STREAM_INFO() << "[CONFIG] Host RAM (DDR) budget: "
               << (host_ram_gb > 0 ? std::to_string(host_ram_gb) + " GB (explicit)" : "auto-detect") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Promote H2D threshold: " << promote_hit_threshold << " hits\n";
     LOG_STREAM_INFO() << "[CONFIG] Pin threshold: " << pin_threshold
               << (pin_threshold > 0 ? " hits" : " (pinning disabled)") << "\n";
+    if (!prefill_pin_file.empty())
+        LOG_STREAM_INFO() << "[CONFIG] Prefill pin file: " << prefill_pin_file
+                  << " (preferred for prefill-time preload ranking; falls back to pin_file per-layer "
+                     "where this has no data)\n";
     LOG_STREAM_INFO() << "[CONFIG] Pin file: " << (pin_file.empty() ? "(preload disabled)" : pin_file)
               << " | strategy=" << pin_strategy
               << (pin_strategy == "global_topn"
@@ -697,12 +878,64 @@ temperature    = 0.7
 top_p          = 0.95
 drop_pages     = false    # true = evict expert pages from OS cache after use
 
+# cpu_affinity_layers: MoE layer indices that should NEVER dispatch on GPU
+# or have their experts uploaded/promoted into VRAM -- experts for these
+# layers load into host RAM only and always compute on CPU. Use this for
+# layers whose I/O time dominates their compute time (a real run's own
+# per-layer expert=/disk= breakdown tells you which -- a layer where disk
+# read time already exceeds what a GPU matmul would save isn't worth a VRAM
+# upload, and that upload just steals cache capacity from layers where it
+# DOES help). Empty (default) = no layers affected.
+# cpu_affinity_layers = [4, 5, 7]
+
 # direct_io: read routed-expert slabs with O_DIRECT instead of buffered
 # reads (Linux only). Requires the model to have been repacked with
 # tools/gguf_tool pack (general.alignment >= 4096) -- a plain/un-repacked
 # GGUF logs a warning and falls back to buffered reads automatically,
 # never a hard failure. See tools/README.md for the repack workflow.
 direct_io      = false
+
+# cuda_cufile: NVIDIA cuFile (GPUDirect Storage) -- DMA a genuine "double
+# miss" expert (not VRAM-resident AND not already in the host RAM tier)
+# straight from NVMe into a VRAM cache slot, skipping the host-RAM hop
+# entirely. Requires direct_io=true above (cuFile registers the SAME
+# O_DIRECT file descriptor) AND GPUDirect Storage + the nvidia-fs kernel
+# module actually installed on this machine (a separate install from the
+# base CUDA Toolkit -- see CMakeLists.txt's cuFile detection at configure
+# time, and the `-> cuFile (GPUDirect Storage):` build-summary line). Never
+# used when an expert is already RAM-resident, regardless of this setting --
+# only ever replaces a disk read that would happen anyway. Falls back to the
+# existing RAM-mediated upload path on any failure (GDS not installed,
+# driver/handle/buffer registration failure) -- never a hard failure.
+cuda_cufile    = false
+
+# prefill_warm_via_prefetcher: Phase 2 (prefill's cold-start VRAM warm-up)
+# normally loads candidates synchronously, one at a time, blocking inside
+# the per-layer critical path (a real run showed 325 such warm-ups for an
+# 11-token prompt, entirely serialized into the reported prefill time).
+# When true, it instead pushes hints to the same background prefetcher
+# decode's own PILOT prediction already uses, so the actual read+promote
+# work happens on a worker thread instead of blocking here. Trade-off, not
+# a strict win -- see EngineConfig's own comment. Default false (unchanged
+# legacy behavior); A/B via t_prefill_warm_time / overall Prefill wall time
+# before trusting it.
+prefill_warm_via_prefetcher = false
+
+# unpacked_expert_format: set true ONLY for a model directory produced by
+# `gguf_tool pack --unpack` (per-expert tensors, gate/up/down laid out
+# physically tight and contiguous per expert -- NOT the default
+# --align-only packed format). Enables a single combined DMA read per
+# expert (gate+up+down in one request) on both the decode thread's
+# io_uring batching AND the VRAM-shadow bypass fast path -- without this
+# flag, an --unpack'd model silently loses BOTH of those (they're gated by
+# the packed _exps tensor name, which --unpack removes) and runs slower
+# than the default format, not faster. A startup sanity check validates
+# every layer's every expert is complete, uniformly sized, and physically
+# tight before any generation starts -- any violation is a FATAL error to
+# stderr and the run refuses to start (never a silent slow fallback for
+# this specific flag). Leave false for the default/recommended
+# --align-only packed format.
+unpacked_expert_format = false
 
 # io_uring: batch the async prefetcher's per-expert reads (up to 3:
 # gate/up/down) through one io_uring submission instead of sequential
@@ -713,6 +946,19 @@ direct_io      = false
 # failure. Only affects the background prefetcher, not the synchronous
 # decode-thread miss path.
 io_uring       = false
+
+# io_uring_workers: caps the io-wq kernel worker pool the decode thread's
+# own io_uring ring registers (IORING_REGISTER_IOWQ_MAX_WORKERS) -- only
+# meaningful together with io_uring=true. This is a real OS thread count,
+# not free: default 8 matches where most consumer/prosumer NVMe drives
+# reach near-peak throughput for reads this size (~4-13MB); going much
+# higher rarely helps further and starts competing for CPU with everything
+# else this process runs (omp_max_threads, expert_fetch_threads,
+# prefetch_worker_threads), since io-wq workers are a separate kernel-
+# managed pool not counted against omp_max_threads' own budget. No-op
+# (falls back to kernel default sizing) on kernels whose headers predate
+# this opcode, never a hard failure.
+io_uring_workers = 8
 
 # prefetch_worker_threads: number of concurrent worker threads servicing
 # the async prefetcher's hint queue (disk read + optional async H2D
@@ -755,6 +1001,14 @@ pin_threshold = 8
 # used to preload the measured hot set into VRAM before the first prompt.
 # Empty string disables preload (a usage file is still written at shutdown).
 pin_file = ".moestream_usage"
+# prefill_pin_file: separate usage file tracking ONLY prefill-phase routing
+# selections, not decode's. Decode contributes far more routing volume per
+# request than prefill does, so in the combined pin_file histogram a
+# decode-favored expert can outrank one prefill genuinely needs every run --
+# this file, when set, is preferred for prefill's own preload ranking
+# (falling back to pin_file per-layer where this file has no data yet).
+# Empty (default) = not used, falls back entirely to pin_file.
+# prefill_pin_file = ".moestream_usage_prefill"
 # pin_topk_per_layer: how many of each layer's hottest experts to preload.
 # 0 = auto-size to fill available VRAM expert-cache capacity. Only used when
 # pin_strategy="per_layer_topk" below.

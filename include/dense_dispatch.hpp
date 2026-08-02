@@ -17,6 +17,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <vector>
+#include <algorithm>
 
 // Diagnostic kill-switch: forces every dense matmul, norm, and expert FFN onto
 // the CPU reference path (libggml dequant + f32 matmul), bypassing ALL GPU
@@ -33,6 +35,38 @@ inline bool& cpu_only_flag() {
 }
 inline bool cpu_only_mode() { return cpu_only_flag(); }
 inline void enable_cpu_only_mode() { cpu_only_flag() = true; }
+
+// Per-layer version of the same idea: `cpu_affinity_layers` (config) names
+// specific MoE layers whose routed experts should NEVER be dispatched on
+// GPU or promoted/uploaded into VRAM at all -- unlike cpu_only_mode() this
+// is scoped to just those layers, everything else still dispatches
+// normally. Motivated by layers whose expert set is so large/flat that a
+// real run spends far more wall-clock time on the disk read than the
+// matmul itself (see CLAUDE.md) -- for those layers, paying for a VRAM
+// upload buys nothing (the bottleneck never moves) while it DOES cost real
+// VRAM cache capacity taken away from layers where GPU residency actually
+// helps, plus real PCIe/DMA time that's pure overhead if the compute was
+// going to be I/O-bound either way. Backed by a flat bool vector (not a
+// set) for an O(1), branch-predictable check on the hottest possible path
+// (once per routed expert per token) -- set once at startup
+// (set_cpu_affinity_layers, main.cpp, from EngineConfig::cpu_affinity_layers)
+// before any dispatch can run, never mutated afterward, so no locking is
+// needed despite being read from multiple threads (prefetcher, decode).
+inline std::vector<bool>& cpu_affinity_layer_flags() {
+    static std::vector<bool> v;
+    return v;
+}
+inline void set_cpu_affinity_layers(const std::vector<int>& layers, int n_layers) {
+    std::vector<bool> v(std::max(0, n_layers), false);
+    for (int l : layers) {
+        if (l >= 0 && l < (int)v.size()) v[(size_t)l] = true;
+    }
+    cpu_affinity_layer_flags() = std::move(v);
+}
+inline bool is_cpu_affinity_layer(int layer_idx) {
+    const auto& v = cpu_affinity_layer_flags();
+    return layer_idx >= 0 && layer_idx < (int)v.size() && v[(size_t)layer_idx];
+}
 
 inline void dense_proj(StreamingEngine& engine, const std::string& wname,
                        const float* x, float* y, int S, int I, int O) {

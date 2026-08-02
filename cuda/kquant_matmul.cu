@@ -8,10 +8,21 @@
 // layouts match ggml's byte sizes (Q2_K=84, Q3_K=110, Q4_K=144, Q5_K=176,
 // Q6_K=210 per 256 elems).
 //
-// Kernel: grid(O, S), 256 threads per (o,s). Thread 0 dequants one 256-elem
-// super-block into shared mem (verbatim port), all 256 threads dot one element
-// each, accumulate per-thread, then tree-reduce. Correctness-first; the
-// serial dequant by thread 0 is an optimization target (parallelize elementwise).
+// Kernel: grid(O, S), 256 threads per (o,s). Each thread dequantizes exactly
+// its own element (indexed purely by `tid`, no cross-thread dependency) and
+// accumulates directly into a register, then a final cross-warp reduction
+// combines all 256 threads' partial sums. FIX (real perf issue, found during
+// a review sweep): this used to route each dequantized value through a
+// `__shared__ yq[256]` array (DEQUANT wrote `yq[tid]`, the caller then read
+// it straight back) bracketed by two `__syncthreads()` per super-block
+// iteration -- entirely unnecessary, since every dequant function below only
+// ever touches `y[tid]`/index `tid`, never another thread's slot, so nothing
+// was actually being shared. That cost 2*bpr full block barriers per (o,s)
+// dispatch for no reason (e.g. bpr=24 for I=6144 -> 48 syncs). The IQ2/IQ3/
+// IQ4_XS sibling kernels (cuda/iq2_matmul.cu etc.) already accumulate
+// straight into a register with no shared-memory round-trip; this file now
+// matches that pattern -- DEQUANT returns a float by value instead of
+// writing through a pointer.
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -39,10 +50,10 @@ __device__ inline void get_scale_min_k4_d(int j, const uint8_t* q, uint8_t* d, u
 // Each thread computes exactly one float output based on its `tid` (0 to 255).
 // ----------------------------------------------------------------------------
 
-__device__ void dequant_q2_K_block_coop(const block_q2_K_cu* xb, float* y, int tid) {
+__device__ float dequant_q2_K_block_coop(const block_q2_K_cu* xb, int tid) {
     const float d   = __half2float(xb->d);
     const float min = __half2float(xb->dmin);
-    
+
     int n_idx = tid / 128;            // 0 or 1
     int j = (tid % 128) / 32;         // 0..3
     int l = tid % 32;                 // 0..31
@@ -54,11 +65,11 @@ __device__ void dequant_q2_K_block_coop(const block_q2_K_cu* xb, float* y, int t
     uint8_t sc = (l < 16) ? xb->scales[is] : xb->scales[is + 1];
     float dl = d * (sc & 0xF);
     float ml = min * (sc >> 4);
-    
-    y[tid] = dl * ((int8_t)((q_chunk[l] >> shift) & 3)) - ml;
+
+    return dl * ((int8_t)((q_chunk[l] >> shift) & 3)) - ml;
 }
 
-__device__ void dequant_q4_K_block_coop(const block_q4_K_cu* xb, float* y, int tid) {
+__device__ float dequant_q4_K_block_coop(const block_q4_K_cu* xb, int tid) {
     const float d   = __half2float(xb->d);
     const float min = __half2float(xb->dmin);
 
@@ -72,23 +83,23 @@ __device__ void dequant_q4_K_block_coop(const block_q4_K_cu* xb, float* y, int t
     get_scale_min_k4_d(is + 1, xb->scales, &sc1, &m1);
 
     if (l < 32) {
-        y[tid] = (d * sc0) * (q_chunk[l] & 0xF) - (min * m0);
+        return (d * sc0) * (q_chunk[l] & 0xF) - (min * m0);
     } else {
-        y[tid] = (d * sc1) * (q_chunk[l - 32] >> 4) - (min * m1);
+        return (d * sc1) * (q_chunk[l - 32] >> 4) - (min * m1);
     }
 }
 
-__device__ void dequant_q5_K_block_coop(const block_q5_K_cu* xb, float* y, int tid) {
+__device__ float dequant_q5_K_block_coop(const block_q5_K_cu* xb, int tid) {
     const float d   = __half2float(xb->d);
     const float min = __half2float(xb->dmin);
 
     int chunk = tid / 64;             // 0..3
     int l = tid % 64;                 // 0..63
     int is = chunk * 2;
-    
+
     const uint8_t* ql_chunk = xb->qs + chunk * 32;
     const uint8_t* qh = xb->qh;
-    
+
     uint8_t u1 = 1 << (chunk * 2);
     uint8_t u2 = 1 << (chunk * 2 + 1);
 
@@ -97,13 +108,13 @@ __device__ void dequant_q5_K_block_coop(const block_q5_K_cu* xb, float* y, int t
     get_scale_min_k4_d(is + 1, xb->scales, &sc1, &m1);
 
     if (l < 32) {
-        y[tid] = (d * sc0) * ((ql_chunk[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - (min * m0);
+        return (d * sc0) * ((ql_chunk[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - (min * m0);
     } else {
-        y[tid] = (d * sc1) * ((ql_chunk[l - 32] >> 4) + (qh[l - 32] & u2 ? 16 : 0)) - (min * m1);
+        return (d * sc1) * ((ql_chunk[l - 32] >> 4) + (qh[l - 32] & u2 ? 16 : 0)) - (min * m1);
     }
 }
 
-__device__ void dequant_q6_K_block_coop(const block_q6_K_cu* xb, float* y, int tid) {
+__device__ float dequant_q6_K_block_coop(const block_q6_K_cu* xb, int tid) {
     const float d = __half2float(xb->d);
     int n_idx = tid / 128;            // 0 or 1
     int group = (tid % 128) / 32;     // 0, 1, 2, or 3
@@ -131,10 +142,10 @@ __device__ void dequant_q6_K_block_coop(const block_q6_K_cu* xb, float* y, int t
         sc_val = sc[is + 6];
     }
 
-    y[tid] = d * sc_val * q_val;
+    return d * sc_val * q_val;
 }
 
-__device__ void dequant_q3_K_block_coop(const block_q3_K_cu* xb, float* y, int tid) {
+__device__ float dequant_q3_K_block_coop(const block_q3_K_cu* xb, int tid) {
     const float d_all = __half2float(*reinterpret_cast<const __half*>(&xb->d));
     const uint32_t kmask1 = 0x03030303;
     const uint32_t kmask2 = 0x0f0f0f0f;
@@ -163,8 +174,8 @@ __device__ void dequant_q3_K_block_coop(const block_q3_K_cu* xb, float* y, int t
 
     int scale_idx = (l < 16) ? is : is + 1;
     float dl = d_all * (scales[scale_idx] - 32);
-    
-    y[tid] = dl * ((int8_t)((q_chunk[l] >> shift) & 3) - ((hm_chunk[l] & m) ? 0 : 4));
+
+    return dl * ((int8_t)((q_chunk[l] >> shift) & 3) - ((hm_chunk[l] & m) ? 0 : 4));
 }
 
 // ---- fused matmul: cooperative dequant of a super-block + 256-way dot ----
@@ -178,13 +189,10 @@ __global__ void NAME##_kquant_matmul_kernel( \
     int bpr = I / 256; \
     const BLOCKT* w_row = W + (size_t)o * bpr; \
     const float* x_row = x + (size_t)s * I; \
-    __shared__ float yq[256]; \
     float acc = 0.0f; \
     for (int b = 0; b < bpr; ++b) { \
-        DEQUANT(&w_row[b], yq, tid); \
-        __syncthreads(); \
-        acc += x_row[b * 256 + tid] * yq[tid]; \
-        __syncthreads(); \
+        float wv = DEQUANT(&w_row[b], tid); \
+        acc += x_row[b * 256 + tid] * wv; \
     } \
     __shared__ float sm[256]; \
     sm[tid] = acc; \

@@ -271,6 +271,12 @@ struct OutTensor {
   // therefore key on (layer, expert, projection-rank); everything else keys
   // on its name. See the sort below.
   std::string sort_key;
+  // Shard-splitting constraint (Step 4, below): the layer this per-expert
+  // tensor belongs to, or -1 for passthrough tensors (no grouping
+  // constraint of their own). Set directly from the same layer_num already
+  // computed when this OutTensor was created, rather than re-parsed out of
+  // sort_key later -- avoids a second, error-prone string-parsing pass.
+  int layer_for_grouping = -1;
 };
 
 // Processes exactly ONE source shard file: the full pipeline (load,
@@ -482,6 +488,7 @@ int process_one_shard(const std::string &input_path,
       ot.size_bytes = per_expert_bytes;
       ot.sort_key =
           "P" + pad_sort(layer_num) + "." + pad_sort(e) + "." + proj_rank;
+      ot.layer_for_grouping = layer_num;
       out_tensors.push_back(std::move(ot));
     }
   }
@@ -537,25 +544,64 @@ int process_one_shard(const std::string &input_path,
               return a.sort_key < b.sort_key;
             });
 
-  // ---- Step 4: assign tensors to output shards by a size threshold. ----
+  // ---- Step 4: assign tensors to output shards by a size threshold --
+  // EXCEPT a shard boundary must never fall INSIDE a per-expert layer's own
+  // run of tensors (out_tensors is already sorted by sort_key, which groups
+  // per-expert tensors by (layer, expert, proj-rank) -- see OutTensor's own
+  // comment -- so one layer's tensors are always contiguous in this list).
+  // Splitting mid-layer risks splitting mid-EXPERT (one expert's gate/up/
+  // down landing in two different output files), which
+  // sanity_check_unpacked_format (engine.hpp) correctly refuses to trust at
+  // load time rather than read across an unknown gap -- a real incident
+  // this fix closes at the source instead of just detecting downstream.
+  // max_shard_bytes becomes a soft target once inside a layer: a single
+  // layer's total size can legitimately exceed it (logged below, not
+  // silent) -- better one oversized shard than a corrupted split expert.
+  // Passthrough tensors (layer_for_grouping == -1) carry no such
+  // constraint and split exactly as before. ----
   std::vector<std::vector<size_t>> shard_tensor_idx; // indices into out_tensors
   shard_tensor_idx.push_back({});
   uint64_t cur_shard_bytes = 0;
+  int cur_shard_layer = -1; // which layer (if any) the OPEN shard has already committed to
+  // Counts TENSORS (not distinct layers -- a layer that ends up oversized
+  // will increment this once per tensor added after the budget was
+  // crossed, not once total) for which a would-be split was deferred to
+  // avoid landing mid-layer. Purely a "did this ever happen" signal for
+  // the printf below, not an exact layer count.
+  int deferred_split_events = 0;
   for (size_t i = 0; i < out_tensors.size(); ++i) {
-    uint64_t padded = align_up(out_tensors[i].size_bytes, alignment);
-    if (cur_shard_bytes > 0 && cur_shard_bytes + padded > max_shard_bytes) {
+    OutTensor &t = out_tensors[i];
+    uint64_t padded = align_up(t.size_bytes, alignment);
+    bool has_layer_constraint = (t.layer_for_grouping >= 0);
+    bool same_layer_as_open_shard =
+        has_layer_constraint && cur_shard_layer == t.layer_for_grouping;
+    bool over_budget = cur_shard_bytes > 0 && cur_shard_bytes + padded > max_shard_bytes;
+    if (over_budget && same_layer_as_open_shard) {
+      ++deferred_split_events;
+    }
+    if (over_budget && !same_layer_as_open_shard) {
       shard_tensor_idx.push_back({});
       cur_shard_bytes = 0;
+      cur_shard_layer = -1;
     }
     int shard_idx = (int)shard_tensor_idx.size() - 1;
-    out_tensors[i].out_shard_idx = shard_idx;
+    t.out_shard_idx = shard_idx;
     shard_tensor_idx[shard_idx].push_back(i);
     cur_shard_bytes += padded;
+    if (has_layer_constraint) cur_shard_layer = t.layer_for_grouping;
   }
   int n_out_shards = (int)shard_tensor_idx.size();
   printf(
       "[pack] Output will be %d shard(s) (max ~%.1f GB/shard, align=%llu)\n",
       n_out_shards, max_shard_bytes / 1e9, (unsigned long long)alignment);
+  if (deferred_split_events > 0) {
+    printf("[pack] NOTE: %d tensor(s) landed past --max-shard-gb because "
+           "splitting there would have landed inside a per-expert layer "
+           "(never allowed -- see Step 4's own comment). At least one output "
+           "shard is larger than requested as a result; this is expected "
+           "and safe, not an error.\n",
+           deferred_split_events);
+  }
 
   // Per-shard offsets, computed in the SAME order tensors will actually
   // be written -- so the write pass below can just write sequentially
@@ -582,6 +628,66 @@ int process_one_shard(const std::string &input_path,
       }
       out_tensors[i].out_offset = off;
       off += out_tensors[i].size_bytes;
+    }
+  }
+
+  // --unpack's fast path requires every expert's gate/up/down tensors to
+  // stay in ONE output shard and remain physically tight there. The engine's
+  // startup sanity check already rejects a model that violates this, but the
+  // pack tool can diagnose it earlier and more locally: shard planning above
+  // is size-threshold-based per tensor, so a too-small --max-shard-gb can
+  // otherwise split an expert block across shard boundaries even though the
+  // bytes are still individually correct. Treat that as a pack-time fatal and
+  // tell the caller to raise --max-shard-gb, rather than producing output the
+  // unpacked_expert_format fast path can never legally consume.
+  if (unpack) {
+    for (size_t i = 0; i < out_tensors.size();) {
+      if (out_tensors[i].sort_key.empty() || out_tensors[i].sort_key[0] != 'P') {
+        ++i;
+        continue;
+      }
+      if (i + 2 >= out_tensors.size()) {
+        fprintf(stderr,
+                "[pack] FATAL: unpacked expert tensor group starting at %s is incomplete in the output plan\n",
+                out_tensors[i].name.c_str());
+        return 1;
+      }
+
+      const OutTensor &gate = out_tensors[i];
+      const OutTensor &up = out_tensors[i + 1];
+      const OutTensor &down = out_tensors[i + 2];
+      std::string key_prefix = gate.sort_key.substr(0, gate.sort_key.size() - 1);
+      bool same_group = up.sort_key.size() == gate.sort_key.size()
+          && down.sort_key.size() == gate.sort_key.size()
+          && up.sort_key.substr(0, up.sort_key.size() - 1) == key_prefix
+          && down.sort_key.substr(0, down.sort_key.size() - 1) == key_prefix
+          && gate.sort_key.back() == '0'
+          && up.sort_key.back() == '1'
+          && down.sort_key.back() == '2';
+      if (!same_group) {
+        fprintf(stderr,
+                "[pack] FATAL: unpacked expert tensor ordering broke around %s / %s / %s -- expected gate->up->down adjacency\n",
+                gate.name.c_str(), up.name.c_str(), down.name.c_str());
+        return 1;
+      }
+
+      bool tight_same_shard = gate.out_shard_idx == up.out_shard_idx
+          && gate.out_shard_idx == down.out_shard_idx
+          && up.out_offset == gate.out_offset + gate.size_bytes
+          && down.out_offset == up.out_offset + up.size_bytes;
+      if (!tight_same_shard) {
+        fprintf(stderr,
+                "[pack] FATAL: --unpack would place expert block %s / %s / %s across shard boundaries or with gaps "
+                "(shards %d/%d/%d, offsets %llu/%llu/%llu). Increase --max-shard-gb so each expert's gate/up/down "
+                "fits contiguously inside one output shard.\n",
+                gate.name.c_str(), up.name.c_str(), down.name.c_str(),
+                gate.out_shard_idx, up.out_shard_idx, down.out_shard_idx,
+                (unsigned long long)gate.out_offset,
+                (unsigned long long)up.out_offset,
+                (unsigned long long)down.out_offset);
+        return 1;
+      }
+      i += 3;
     }
   }
 

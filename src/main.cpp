@@ -44,6 +44,8 @@ void print_usage() {
               << "  --direct-io      O_DIRECT expert-slab reads (Linux only; requires a model\n"
               << "                   repacked with tools/gguf_tool pack -- falls back to buffered\n"
               << "                   reads automatically if unsupported/unaligned)\n"
+              << "                   (unpacked_expert_format and cuda_cufile are TOML-config-only; "
+                 "see --config)\n"
               << "  --io-uring       Batch the async prefetcher's per-expert reads through io_uring\n"
               << "                   (Linux only, kernel >= 5.6; independent of --direct-io -- falls\n"
               << "                   back to sequential preads automatically if unsupported)\n"
@@ -88,6 +90,28 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                   << "\n";
     }
 
+    // Declared BEFORE engine/gpu below (destructor runs in REVERSE
+    // declaration order) so cuFileDriverClose() only ever fires AFTER
+    // GpuTopology's own destructor has already deregistered every VRAM
+    // pool/file handle it registered -- deregistering after the driver is
+    // closed would be invalid. Fires on ANY exit path from run_engine
+    // (normal completion or an early std::unexpected return), same
+    // guarantee engine/gpu/ram_mgr already get for free as stack locals.
+    struct CuFileDriverGuard {
+        bool opened = false;
+        ~CuFileDriverGuard() { if (opened) cufile_io::driver_close(); }
+    } cufile_driver_guard;
+    if (config.cuda_cufile) {
+        cufile_driver_guard.opened = cufile_io::driver_open();
+        if (cufile_driver_guard.opened) {
+            LOG_STREAM_INFO() << "[CUFILE] Driver opened.\n";
+        } else {
+            LOG_STREAM_WARN() << "[CUFILE] Driver open failed (GDS/nvidia-fs not installed, or "
+                                  "cuFile not compiled in) -- cuda_cufile falls back to the "
+                                  "RAM-mediated upload path for this entire run.\n";
+        }
+    }
+
     StreamingEngine engine;
     RAMSafetyManager ram_mgr;
     GGUFTokenizer tokenizer;
@@ -99,6 +123,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     int max_new_tokens = config.max_new_tokens;
 
     engine.drop_expert_pages = config.drop_pages;
+    engine.unpacked_expert_format = config.unpacked_expert_format;
+    engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;
     ram_mgr.configured_ram_gb = config.host_ram_gb;
     ram_mgr.promote_hit_threshold = (uint32_t)config.promote_hit_threshold;
     ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
@@ -144,6 +170,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // are populated by then) and before anything starts reading experts.
     if (config.direct_io) engine.model_file.enable_direct_io();
 
+    // Opt-in, only reachable when the driver actually opened above (config.
+    // cuda_cufile alone doesn't guarantee that -- see cufile_driver_guard).
+    // EngineConfig::validate() already refused cuda_cufile=true without
+    // direct_io=true, so direct_io has already run by this point whenever
+    // this branch is live. engine.cuda_cufile_active (the flag execution_
+    // layer.cpp's Phase 3 loop actually checks) is only set true if at
+    // least one shard genuinely registered -- "requested" vs "actually
+    // active", same distinction direct_io/io_uring already draw.
+    if (config.cuda_cufile && cufile_driver_guard.opened) {
+        int n = engine.model_file.enable_cufile();
+        engine.cuda_cufile_active = (n > 0);
+    }
+
     // Optional separate dense GGUF: dense/preloaded tensors read from here, routed
     // experts still stream from model_path. Enables a dense(IQ4_XS)+expert(IQ2_*)
     // mix across two files.
@@ -172,6 +211,52 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         return std::unexpected("Failure triggered during topological model graph initialization pass");
     }
     engine.init_route_freq();
+
+    // cpu_affinity_layers (config): must be set before ANYTHING below can
+    // dispatch an expert or preload VRAM -- expert_ffn_resolve_gpu_loc,
+    // RAMSafetyManager's reactive-hit promotion, Phase 2's prefill warm-up,
+    // and the [PIN] preload block right below all consult
+    // is_cpu_affinity_layer() (dense_dispatch.hpp). architecture_config.
+    // n_layers is only known as of build_model_graph above, so (like the
+    // unpacked-format sanity check right below) this is the earliest point
+    // it can be set.
+    if (!config.cpu_affinity_layers.empty()) {
+        set_cpu_affinity_layers(config.cpu_affinity_layers, engine.model_file.architecture_config.n_layers);
+    }
+
+    // unpacked_expert_format is an explicit performance contract (single
+    // combined DMA per expert) -- validate it holds for the WHOLE model
+    // now, before any real generation work (or any expert data read) ever
+    // starts, rather than let it fail unpredictably mid-run or silently
+    // degrade. architecture_config.n_layers/n_experts is only populated as
+    // of build_model_graph above, so this is the earliest point the check
+    // can run. See StreamingEngine::sanity_check_unpacked_format for what
+    // gets validated and why a violation is fatal rather than a fallback.
+    if (engine.unpacked_expert_format && !engine.sanity_check_unpacked_format()) {
+        return std::unexpected("unpacked_expert_format=true but the model failed the aligned-unpacked "
+                                "sanity check -- see the [FATAL] line(s) above for exactly which "
+                                "layer/expert failed and why. Refusing to start rather than silently "
+                                "fall back to the slow path this flag exists to avoid.");
+    }
+    // The other direction of the same mismatch: unpacked_expert_format is
+    // OFF, but the model itself is genuinely in the per-expert layout --
+    // a real, measured incident (see CLAUDE.md): this silently disables
+    // BOTH io_uring Phase B batching and the VRAM-shadow bypass fast path
+    // for the entire run with zero visible error, showing up only as 100%
+    // "layer-not-packed" on the (easy-to-miss) Decode-thread io_uring
+    // batches shutdown line and a disk= figure that exceeds its own
+    // containing expert= wall-clock window. Warn-only, not a hard refusal
+    // like the block above -- the run can still complete correctly here,
+    // just slowly, so there's no contract violation to refuse over.
+    if (!engine.unpacked_expert_format && engine.looks_like_unpacked_format()) {
+        LOG_STREAM_WARN() << "[WARN] This model appears to be in the per-expert (\"unpacked\") tensor "
+                              "format (gguf_tool verify would report 'Expert format: per-expert' for "
+                              "it), but unpacked_expert_format is not set -- io_uring batching and the "
+                              "VRAM-shadow bypass fast path will BOTH be silently disabled for this "
+                              "entire run, forcing every dispatch through the slow, unbatched fallback "
+                              "path. Set unpacked_expert_format=true in your config to use the "
+                              "single-DMA fast path this format is built for. See CLAUDE.md.\n";
+    }
 
     // --- Multi-GPU memory planning (from optimize.md) ---
     auto& cfg = engine.model_file.architecture_config;
@@ -622,7 +707,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // Decode thread's OWN io_uring ring for RAMSafetyManager::get_experts_batch's
     // Phase B (the synchronous miss path -- see ram_manager.hpp's decode_uring_ring
     // comment for why this is a separate scope from the prefetcher's rings above).
-    ram_mgr.init_decode_uring(config.io_uring);
+    ram_mgr.init_decode_uring(config.io_uring, config.io_uring_workers);
 
     // extended to a graduated 3-tier scheme (was:
     // a single top-K-pinned VRAM tier only). Read the usage file written
@@ -690,6 +775,38 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             for (auto& e : entries) by_layer[e.layer].push_back(e);
             for (auto& [layer, v] : by_layer) {
                 std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+            }
+
+            // prefill_pin_file: prefer ITS ranking for any layer it has data
+            // for, since decode's higher routing volume can otherwise
+            // outrank prefill's own needs in the combined pin_file above
+            // (see StreamingEngine::route_freq_prefill's own comment).
+            // Per-layer, not a blanket switch -- a layer this file has no
+            // entries for (e.g. its very first run, before any prefill has
+            // been recorded into it yet) keeps falling back to the general
+            // pin_file's ranking for that specific layer, exactly as if
+            // prefill_pin_file weren't configured at all.
+            int prefill_layers_overridden = 0;
+            if (!config.prefill_pin_file.empty()) {
+                auto [pf_entries, pf_maxc] = StreamingEngine::load_usage(config.prefill_pin_file);
+                (void)pf_maxc;
+                if (pf_entries.empty()) {
+                    LOG_STREAM_INFO() << "[PIN] prefill_pin_file (" << config.prefill_pin_file
+                              << ") has no data yet -- every layer falls back to the general pin_file "
+                                 "ranking for this run.\n";
+                } else {
+                    std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> pf_by_layer;
+                    for (auto& e : pf_entries) pf_by_layer[e.layer].push_back(e);
+                    for (auto& [layer, v] : pf_by_layer) {
+                        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+                        by_layer[layer] = std::move(v);  // override this layer only
+                        ++prefill_layers_overridden;
+                    }
+                    LOG_STREAM_INFO() << "[PIN] prefill_pin_file (" << config.prefill_pin_file << ", "
+                              << pf_entries.size() << " known experts): overriding ranking for "
+                              << prefill_layers_overridden << " layer(s); remaining layers use the "
+                                 "general pin_file ranking.\n";
+                }
             }
 
             // Real per-layer capacity for each tier -- used both by
@@ -864,13 +981,27 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             int total_pinned = 0;  // Three-tier: track total pinned count
             for (auto& [layer, v] : by_layer) {
                 int n = (int)v.size();
+                // cpu_affinity_layers (config): never pin or pre-warm VRAM
+                // for these layers -- Tier 1/2 below both call
+                // gpu.topology.upload_expert, so forcing layer_max=0 and
+                // this layer's own vram_lru budget to 0 skips both loop
+                // bodies entirely (their bounds become empty ranges) while
+                // leaving Tier 3 (host RAM preload) untouched below --
+                // that's the "MoE load into host DDR instead of DMA into
+                // VRAM" contract for this layer. Also starts Tier 3 at rank
+                // 0 (the layer's OWN hottest experts) instead of after a
+                // pinned/vram_lru prefix that never happened for this layer.
+                bool cpu_affinity = is_cpu_affinity_layer(layer);
+                int layer_vram_lru_n = cpu_affinity ? 0 : vram_lru_n;
                 // Three-tier: enforce global pinned capacity per layer.
                 // global_topn already computed a final per-layer count
                 // (floor + its share of the global ranking) up front; the
                 // default per_layer_topk path keeps its EXACT original
                 // running-total cap, unchanged.
                 int layer_max;
-                if (global_topn) {
+                if (cpu_affinity) {
+                    layer_max = 0;
+                } else if (global_topn) {
                     layer_max = layer_pin_count[layer];
                 } else {
                     layer_max = topk;
@@ -883,7 +1014,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // pinned -- for per_layer_topk that's always exactly topk
                 // (identical to the original code), but for global_topn it
                 // varies per layer, so it can't be the shared topk anymore.
-                int tier2_start = global_topn ? layer_max : topk;
+                // A cpu_affinity layer's layer_max is already 0, so
+                // tier2_start correctly comes out to 0 too via the
+                // global_topn branch (layer_max) regardless of topk.
+                int tier2_start = (cpu_affinity || global_topn) ? layer_max : topk;
                 for (int i = 0; i < n && i < layer_max; ++i) {
                     ++attempted;
                     MoEExpertBlock scratch{};
@@ -906,7 +1040,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // a normal reactively-evictable slot, just pre-warmed
                 // instead of starting cold. Reuses the exact same
                 // upload_expert() call as Tier 1, just skips pin_expert().
-                for (int i = tier2_start; i < n && i < tier2_start + vram_lru_n; ++i) {
+                for (int i = tier2_start; i < n && i < tier2_start + layer_vram_lru_n; ++i) {
                     ++attempted;
                     MoEExpertBlock scratch{};
                     engine.load_expert_slab(v[i].layer, v[i].expert, scratch);
@@ -931,7 +1065,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 int ram_cap = std::min({ram_n, ram_mgr.cap_for_layer(layer),
                                          (int)engine.layers_experts[layer].size()});
                 int slot_idx = 0;
-                for (int i = tier2_start + vram_lru_n; i < n && slot_idx < ram_cap; ++i, ++slot_idx) {
+                for (int i = tier2_start + layer_vram_lru_n; i < n && slot_idx < ram_cap; ++i, ++slot_idx) {
                     ++attempted;
                     MoEExpertBlock& slot = engine.layers_experts[layer][slot_idx];
                     engine.load_expert_slab(v[i].layer, v[i].expert, slot);
@@ -939,6 +1073,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         slot.last_used_clock = ++ram_mgr.global_clock;
                         slot.hit_count = 0;
                         ++ram_preloaded;
+                        // Writes directly into layers_experts, bypassing
+                        // RAMSafetyManager::get_expert/get_experts_batch
+                        // entirely -- so ram_expert_index (added to fix
+                        // get_experts_batch's O(cap) hit-check scan, see
+                        // CLAUDE.md) never gets an entry for a Tier-3-
+                        // preloaded expert unless this is added explicitly.
+                        // Without this, EVERY preloaded expert's first
+                        // runtime lookup would look like a genuine index
+                        // miss, which is indistinguishable from "really not
+                        // resident" once find_ram_slot stops falling back to
+                        // a linear scan on absence (see that function's own
+                        // comment for why the fallback-on-miss had to go).
+                        ram_mgr.ram_expert_index[RAMSafetyManager::swap_key(v[i].layer, v[i].expert)]
+                            = (size_t)slot_idx;
                     }
                 }
             }
@@ -1035,6 +1183,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // Best-effort, matches dump_usage's own contract (a failed write just
     // logs and continues -- not worth failing shutdown over).
     engine.dump_usage(config.pin_file);
+    // Prefill-only histogram -- see route_freq_prefill's own comment.
+    // No-op (dump_usage_histogram's own empty-path guard) if
+    // prefill_pin_file isn't configured.
+    engine.dump_usage_prefill(config.prefill_pin_file);
 
     // Cache-churn summary for both tiers: which experts were swapped in/out
     // the most, and (VRAM only, since that's the only tier with a pinning
