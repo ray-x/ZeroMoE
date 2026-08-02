@@ -177,6 +177,18 @@ struct MoEExpertBlock {
     // claimed for a different expert, same lifecycle as also_in_vram.
     bool from_pipe_prefetch = false;
 
+    // True when this slot was claimed by Phase B's speculative disk-batch
+    // padding (RAMSafetyManager::get_experts_batch, disk_batch_padding
+    // config -- a route_freq-ranked, historically hot but not currently
+    // resident expert, loaded to pad queue depth on an already-necessary
+    // io_uring submission, not because THIS token actually routed to it).
+    // One-shot: cleared the first time this slot is genuinely hit (n_pad_
+    // reads_hit_later, perf_timer.hpp) -- deliberately NOT persistent like
+    // from_pipe_prefetch above (which tracks promotion eligibility, not a
+    // single did-this-pay-off event). Also reset to false whenever a slot
+    // is claimed for a different expert, same lifecycle as also_in_vram.
+    bool from_padding = false;
+
     // Self-healing: true if a previously-issued async H2D copy FROM this
     // slot's slab_buffer may still be reading it. Same "poll before trust"
     // pattern find_expert/evict_lru already use for the VRAM side's

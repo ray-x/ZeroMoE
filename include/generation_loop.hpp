@@ -260,6 +260,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // contribution during this same call, so nothing here needs to also
     // feed t_attn.
     PERF_END(prefill, t_prefill_total);
+    perf().n_prompt_tokens.fetch_add(prompt_ids.size(), std::memory_order_relaxed);
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
 
     // Snapshot VRAM slot occupancy RIGHT HERE, at the exact prefill/decode

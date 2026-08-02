@@ -159,6 +159,36 @@ struct EngineConfig {
     // couldn't parallelize anything further regardless of this setting).
     int io_uring_workers = 8;
 
+    // Pad Phase B's real cache-miss submission (RAMSafetyManager::
+    // get_experts_batch) with speculative reads of historically-hot but
+    // not-currently-resident experts for the SAME layer, riding the SAME
+    // already-necessary io_uring submission real misses trigger -- a real
+    // hardware benchmark (tools/gguf_dma.cpp) measured disk throughput
+    // climbing from ~2.1 GB/s at 1 concurrent request-group to ~2.5-2.6
+    // GB/s at 8-16, while real production logs show the actual batch size
+    // reaching Phase B averages only ~2.7 experts/call -- this pads toward
+    // disk_batch_padding_target without the bandwidth contention a
+    // SEPARATE competing prefetcher thread already caused (see CLAUDE.md's
+    // prefetcher investigation). Requires io_uring=true (validated below).
+    // NEVER fires when there's no real cache miss this call (n_pending==0)
+    // -- only ever enlarges an already-necessary disk trip, never creates
+    // a new one purely for speculation. V1 only ever claims genuinely FREE
+    // RAM slots (expert_id==-1) -- it never evicts a real resident, so it
+    // carries zero cache-quality regression risk, at the cost of likely
+    // engaging mostly during a run's early ramp-up window before the RAM
+    // tier saturates (see n_pad_no_free_slot in the shutdown report).
+    // Default false (opt-in, unverified on real hardware).
+    bool disk_batch_padding = false;
+
+    // Target TOTAL experts (real+speculative) per Phase B submission.
+    // Clamped in validate() to [1,21] -- 21 = floor(io_uring_backend::
+    // Ring::CAPACITY(64) / 3), the worst-case (packed-format, 3 requests
+    // per expert) bound that keeps total requests within the ring's hard
+    // capacity regardless of packed/unpacked format -- the same constant
+    // tools/gguf_dma.cpp's own --experts sweep clamp uses, for the
+    // identical reason.
+    int disk_batch_padding_target = 8;
+
     // Number of concurrent async prefetcher worker threads pulling hints
     // off the SPSC queue and servicing them (disk read + optional async
     // H2D promotion). Was hardcoded to 1 -- real-run PIPE instrumentation
@@ -641,6 +671,8 @@ inline bool EngineConfig::load(const std::string& path) {
     unpacked_expert_format = doc.root.get_bool("unpacked_expert_format", unpacked_expert_format);
     io_uring         = doc.root.get_bool("io_uring", io_uring);
     io_uring_workers = doc.root.get_int("io_uring_workers", io_uring_workers);
+    disk_batch_padding        = doc.root.get_bool("disk_batch_padding", disk_batch_padding);
+    disk_batch_padding_target = doc.root.get_int("disk_batch_padding_target", disk_batch_padding_target);
     prefetch_worker_threads = doc.root.get_int("prefetch_worker_threads", prefetch_worker_threads);
     prefetch_staging_slots = doc.root.get_int("prefetch_staging_slots", prefetch_staging_slots);
     host_ram_gb      = doc.root.get_double("host_ram_gb", host_ram_gb);
@@ -780,6 +812,14 @@ inline bool EngineConfig::validate() {
         pin_strategy = "per_layer_topk";
     }
 
+    if (disk_batch_padding && !io_uring) {
+        std::cerr << "[CONFIG] disk_batch_padding=true requires io_uring=true (padding rides the "
+                  << "decode thread's own io_uring ring, RAMSafetyManager::decode_uring_ring) -- "
+                  << "disabling disk_batch_padding for this run.\n";
+        disk_batch_padding = false;
+    }
+    disk_batch_padding_target = std::max(1, std::min(21, disk_batch_padding_target));
+
     return true;
 }
 
@@ -805,6 +845,9 @@ inline void EngineConfig::print() const {
     if (io_uring) {
         LOG_STREAM_INFO() << "[CONFIG] io_uring workers (decode-thread ring's io-wq pool): " << io_uring_workers << "\n";
     }
+    if (disk_batch_padding)
+        LOG_STREAM_INFO() << "[CONFIG] Disk batch padding: ON (target " << disk_batch_padding_target
+                           << " experts/submission, speculative reads from route_freq)\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch worker threads: " << prefetch_worker_threads << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch staging slots: " << prefetch_staging_slots << "\n";
     if (cpu_only) LOG_STREAM_INFO() << "[CONFIG] CPU-only mode: ON (all GPU dispatch disabled)\n";
@@ -959,6 +1002,29 @@ io_uring       = false
 # (falls back to kernel default sizing) on kernels whose headers predate
 # this opcode, never a hard failure.
 io_uring_workers = 8
+
+# disk_batch_padding: pad Phase B's real cache-miss submission
+# (RAMSafetyManager::get_experts_batch) with speculative reads of
+# historically-hot but not-currently-resident experts for the SAME layer,
+# riding the SAME already-necessary io_uring submission real misses
+# trigger. Requires io_uring=true. A real benchmark (tools/gguf_dma.cpp)
+# measured disk throughput climbing from ~2.1 GB/s at 1 concurrent
+# request-group to ~2.5-2.6 GB/s at 8-16, while production's real Phase B
+# batch size averages only ~2.7 experts/call -- this tries to close that
+# gap without the bandwidth contention a separate competing prefetcher
+# thread already caused (see CLAUDE.md). V1 only ever claims genuinely
+# FREE RAM slots -- it never evicts a real resident, so it's zero risk to
+# cache quality, at the cost of likely engaging mostly during a run's
+# early ramp-up window before the RAM tier saturates (watch
+# n_pad_no_free_slot in the shutdown report). Default false, unverified on
+# real hardware -- A/B against disk_batch_padding=false before trusting it.
+disk_batch_padding = false
+
+# disk_batch_padding_target: target TOTAL experts (real+speculative) per
+# Phase B submission. Clamped to [1,21] -- 21 = floor(Ring::CAPACITY(64)/3),
+# the worst-case (packed-format, 3 requests/expert) bound that keeps total
+# requests within the ring's hard capacity regardless of format.
+disk_batch_padding_target = 8
 
 # prefetch_worker_threads: number of concurrent worker threads servicing
 # the async prefetcher's hint queue (disk read + optional async H2D

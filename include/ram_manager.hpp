@@ -127,6 +127,39 @@ public:
     // eliminating the 7.7GB tier overlap waste.
     bool move_on_promotion = true;
 
+    // Pad Phase B's real cache-miss submission with speculative reads of
+    // historically-hot, not-currently-resident experts for the SAME layer
+    // -- see EngineConfig::disk_batch_padding's own comment for the full
+    // rationale/mechanism/known-limitation. Mirrored here (set from
+    // main.cpp) rather than reaching into EngineConfig directly, matching
+    // this class's existing pattern for every other config-derived field
+    // above (pin_threshold, promote_hit_threshold, move_on_promotion, ...).
+    bool disk_batch_padding = false;
+    int disk_batch_padding_target = 8;
+
+    // Per-layer, pre-sorted-descending-by-historical-count expert ID
+    // ranking, used as disk_batch_padding's candidate source. Populated
+    // ONCE at startup by main.cpp from the SAME .moestream_usage-derived
+    // `by_layer` ranking [PIN] preload itself already computes and trusts
+    // (including its prefill_pin_file per-layer override, if configured) --
+    // deliberately NOT StreamingEngine::route_freq, which is zero-
+    // initialized every process start and only reflects THIS run's own
+    // routing so far. That live signal turned out self-defeating on a real
+    // run: an expert only earns a nonzero live count once routed to a few
+    // times, by which point it's almost always already RAM/VRAM-resident
+    // via the normal miss->promotion path -- exactly what padding's own
+    // residency filters exclude -- so the "hot but not yet cached"
+    // candidate pool it offered was nearly empty by construction, and
+    // padding never issued a single speculative read for a whole real run
+    // (see CLAUDE.md). This persisted, cross-run ranking has real
+    // historical depth from token 1, independent of how much THIS run has
+    // routed so far -- the same property that makes it right for [PIN]
+    // preload's identical "find genuinely hot experts" purpose. Empty (no
+    // entry for a given layer, or the whole map empty) is a normal,
+    // graceful degradation -- padding simply finds no candidates for that
+    // layer and does nothing, same as running with pin_file unset.
+    std::unordered_map<int, std::vector<int>> route_rank_by_layer;
+
     // OMP thread count for get_experts_batch's parallel disk-read phase.
     // Tuned empirically against the real model file
     // on the target machine: buffered reads scaled ~8.5x from 1->4 threads,
@@ -257,6 +290,26 @@ public:
     // peek being occasionally too conservative is safe, never wrong.
     bool is_ram_resident(int layer, int expert_id) const {
         return ram_expert_index.count(swap_key(layer, expert_id)) > 0;
+    }
+
+    // Undo a Phase B speculative-padding claim (disk_batch_padding) whose
+    // geometry lookup or actual read failed -- no existing equivalent:
+    // every OTHER RAM-tier failure path in this file falls back to "redo
+    // the whole batch via the OMP loop," never a per-item revert, because
+    // a real miss's failure always retries via that fallback. A padding
+    // candidate has no such retry (it's optional, speculative), so a
+    // failed one must be returned to genuinely-free (expert_id=-1) rather
+    // than left half-claimed with garbage/unpopulated slab bytes -- a
+    // half-claimed slot would make a LATER real hit trust is_ram_resident/
+    // find_ram_slot's claim of residency and read uninitialized data into
+    // a matmul, exactly the "fluent but wrong" failure class this
+    // project's own history has been burned by before.
+    void revert_padding_claim(MoEExpertBlock& slot, int layer, int expert_id) {
+        slot.expert_id = -1;
+        ram_expert_index.erase(swap_key(layer, expert_id));
+        slot.last_used_clock = 0;
+        slot.hit_count = 0;
+        slot.from_padding = false;
     }
 
     // ACTIVE reclaim for a caller that just confirmed (via some OTHER path,
@@ -810,6 +863,10 @@ public:
                 auto& slot = layer_slots[hit_idx];
                 slot.last_used_clock = ++global_clock;
                 if (slot.hit_count < UINT32_MAX) slot.hit_count++;
+                if (slot.from_padding) {
+                    perf().n_pad_reads_hit_later.fetch_add(1, std::memory_order_relaxed);
+                    slot.from_padding = false;
+                }
                 if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts(engine);
                 perf().n_expert_cache_hit.fetch_add(1, std::memory_order_relaxed);
 
@@ -1113,6 +1170,10 @@ public:
                     // -- identical to get_expert's Step 1 --
                     slot.last_used_clock = ++global_clock;
                     if (slot.hit_count < UINT32_MAX) slot.hit_count++;
+                    if (slot.from_padding) {
+                        perf().n_pad_reads_hit_later.fetch_add(1, std::memory_order_relaxed);
+                        slot.from_padding = false;
+                    }
                     if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts(engine);
                     perf().n_expert_cache_hit.fetch_add(1, std::memory_order_relaxed);
                     if (verbose_cache_log) {
@@ -1385,6 +1446,152 @@ public:
                     }
                     for (int j = 0; j < cnt; ++j) reqs.push_back(tmp[j]);
                 }
+
+                // --- Speculative Phase B padding (disk_batch_padding) ---
+                // Rides THIS already-necessary io_uring submission with extra
+                // reads of historically-hot, not-currently-resident experts
+                // for the SAME layer, pushing queue depth toward disk_batch_
+                // padding_target -- see EngineConfig::disk_batch_padding's own
+                // comment for the measured queue-depth effect this exists to
+                // capture, and the known ramp-up-only limitation of this V1
+                // (free-slots-only, never evicts a resident). Only attempted
+                // when the REAL portion is already structurally sound and
+                // about to proceed to uring on its own -- never spent on a
+                // batch that's falling back to OMP anyway.
+                size_t real_reqs_count = reqs.size();
+                std::vector<int> pad_ids;
+                std::vector<size_t> pad_slots;
+                std::vector<int> pad_req_counts;
+                // Independent, non-short-circuited term-by-term visibility
+                // into the padding gate below -- see n_pad_dbg_calls' own
+                // comment (perf_timer.hpp) for why this was added. Cheap:
+                // 6 relaxed atomic increments per real Phase B call.
+                perf().n_pad_dbg_calls.fetch_add(1, std::memory_order_relaxed);
+                if (!disk_batch_padding) perf().n_pad_dbg_padding_false.fetch_add(1, std::memory_order_relaxed);
+                if (!all_packed) perf().n_pad_dbg_not_all_packed.fetch_add(1, std::memory_order_relaxed);
+                if (reqs.empty()) perf().n_pad_dbg_reqs_empty.fetch_add(1, std::memory_order_relaxed);
+                if (in_prefill) perf().n_pad_dbg_in_prefill.fetch_add(1, std::memory_order_relaxed);
+                if (n_pending >= disk_batch_padding_target) perf().n_pad_dbg_target_not_reached.fetch_add(1, std::memory_order_relaxed);
+                if (disk_batch_padding && all_packed && !reqs.empty() && !in_prefill
+                    && n_pending < disk_batch_padding_target) {
+                    perf().n_pad_gate_entered.fetch_add(1, std::memory_order_relaxed);
+                    int want = disk_batch_padding_target - n_pending;
+                    auto rr_it = route_rank_by_layer.find(layer);
+                    if (want > 0 && rr_it == route_rank_by_layer.end()) {
+                        perf().n_pad_no_ranking_for_layer.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (want > 0 && rr_it != route_rank_by_layer.end()) {
+                        // Walk the persisted, pre-sorted-by-historical-count
+                        // ranking (see route_rank_by_layer's own comment for
+                        // why this is used instead of live route_freq),
+                        // filtering out: this token's OWN real routed set
+                        // (without this exclusion a real miss could ALSO be
+                        // picked as a "candidate" and double-claimed into a
+                        // SECOND RAM slot, corrupting ram_expert_index's
+                        // one-slot-per-key invariant), anything already
+                        // RAM-resident, and anything already VRAM-resident
+                        // (pinned or reactively cached -- the ranking's top
+                        // entries are exactly the kind of expert most likely
+                        // to already be VRAM-pinned, since pinning uses this
+                        // SAME data; without this check padding would
+                        // routinely load an already-VRAM-resident expert
+                        // into RAM too: zero new benefit, pure duplicated
+                        // capacity, a real [TIER-OVERLAP] source). Already
+                        // sorted descending, so taking the first `want`
+                        // survivors needs no separate sort/resize step.
+                        std::vector<int> ranked;
+                        ranked.reserve((size_t)want);
+                        for (int e : rr_it->second) {
+                            if ((int)ranked.size() >= want) break;
+                            bool is_this_tokens_own = false;
+                            for (int kk = 0; kk < topk; ++kk) {
+                                if (expert_ids[kk] == e) { is_this_tokens_own = true; break; }
+                            }
+                            if (is_this_tokens_own) continue;
+                            if (is_ram_resident(layer, e)) continue;
+                            if (vram_cache && vram_cache->find_expert(layer, e)) continue;
+                            ranked.push_back(e);
+                        }
+                        if (ranked.empty()) {
+                            perf().n_pad_no_candidates_after_filter.fetch_add(1, std::memory_order_relaxed);
+                        }
+
+                        // Free (expert_id==-1), not-already-claimed-this-batch
+                        // slots only -- V1 NEVER evicts a real resident.
+                        std::vector<size_t> free_slots;
+                        free_slots.reserve(ranked.size());
+                        for (size_t i = 0; i < cap && free_slots.size() < ranked.size(); ++i) {
+                            if (layer_slots[i].expert_id != -1) continue;
+                            if (std::find(claimed_this_batch.begin(), claimed_this_batch.end(), i)
+                                != claimed_this_batch.end()) continue;
+                            free_slots.push_back(i);
+                        }
+                        if (free_slots.size() < ranked.size()) {
+                            perf().n_pad_no_free_slot.fetch_add(ranked.size() - free_slots.size(),
+                                                                 std::memory_order_relaxed);
+                        }
+
+                        size_t n_pad = std::min(ranked.size(), free_slots.size());
+                        for (size_t p = 0; p < n_pad; ++p) {
+                            int candidate_id = ranked[p];
+                            size_t slot_idx = free_slots[p];
+                            MoEExpertBlock& pv = layer_slots[slot_idx];
+
+                            // Claim exactly like a real miss's own claim
+                            // sequence above -- mostly a no-op for a
+                            // genuinely-free slot (no evicted identity, no
+                            // pending copy), mirrored verbatim for
+                            // consistency/future-proofing.
+                            claimed_this_batch.push_back(slot_idx);
+                            pv.also_in_vram = false;
+                            pv.from_pipe_prefetch = false;
+                            if (pv.pending_copy_event) {
+                                cudaEventSynchronize(pv.pending_copy_event);
+                                pv.pending_copy_event = nullptr;
+                            }
+                            pv.expert_id = candidate_id;
+                            ram_expert_index[swap_key(layer, candidate_id)] = slot_idx;
+                            pv.last_used_clock = ++global_clock;
+                            pv.hit_count = 0;
+                            pv.from_padding = true;
+
+                            io_uring_backend::ReadRequest ptmp[3];
+                            int pcnt = 0; size_t ptotal = 0;
+                            if (!engine.build_expert_read_requests(layer, candidate_id, pv,
+                                                                     ptmp, pcnt, ptotal)) {
+                                revert_padding_claim(pv, layer, candidate_id);
+                                continue;
+                            }
+                            for (int j = 0; j < pcnt; ++j) reqs.push_back(ptmp[j]);
+                            pad_ids.push_back(candidate_id);
+                            pad_slots.push_back(slot_idx);
+                            pad_req_counts.push_back(pcnt);
+                            perf().n_pad_reads_issued.fetch_add(1, std::memory_order_relaxed);
+                        }
+
+                        // Defense-in-depth: should be provably unreachable --
+                        // disk_batch_padding_target is clamped to [1,21] in
+                        // EngineConfig::validate() specifically so n_pending+
+                        // want <= 21, keeping total requests <= 21*3=63 <=
+                        // Ring::CAPACITY(64) regardless of packed(3x)/
+                        // unpacked(1x) format -- but padding must NEVER be
+                        // the reason a real batch that would otherwise have
+                        // fit gets pushed into the OMP fallback, so this is
+                        // enforced directly rather than only trusted.
+                        while (reqs.size() > io_uring_backend::Ring::CAPACITY && !pad_ids.empty()) {
+                            int drop_id = pad_ids.back();
+                            size_t drop_slot = pad_slots.back();
+                            int drop_cnt = pad_req_counts.back();
+                            pad_ids.pop_back();
+                            pad_slots.pop_back();
+                            pad_req_counts.pop_back();
+                            reqs.resize(reqs.size() - (size_t)drop_cnt);
+                            revert_padding_claim(layer_slots[drop_slot], layer, drop_id);
+                            perf().n_pad_reads_issued.fetch_sub(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
                 if (!all_packed) {
                     perf().n_decode_uring_not_packed.fetch_add(1, std::memory_order_relaxed);
                 } else if (reqs.empty()) {
@@ -1418,9 +1625,16 @@ public:
                     // short/failed read) since a failed or partial uring
                     // attempt still consumed real wall-clock time.
                     PerfCounters::atomic_add(perf().t_disk_read, batch_ms / 1000.0);
+                    // Narrowed to [0, real_reqs_count) -- see the padding
+                    // block above. When padding contributed nothing,
+                    // real_reqs_count == reqs.size(), so this is byte-
+                    // identical to checking the whole array, exactly as
+                    // before. This is what stops a padding-request failure
+                    // from wastefully triggering a full OMP re-read of
+                    // already-successfully-read real data.
                     bool all_ok = submitted;
                     if (submitted) {
-                        for (size_t r = 0; r < reqs.size(); ++r) {
+                        for (size_t r = 0; r < real_reqs_count; ++r) {
                             if (results[r] != (ssize_t)reqs[r].len) { all_ok = false; break; }
                         }
                     }
@@ -1429,6 +1643,55 @@ public:
                     } else if (!all_ok) {
                         perf().n_decode_uring_short_read.fetch_add(1, std::memory_order_relaxed);
                     }
+
+                    // --- Padding outcome, independent of the real portion's
+                    // all_ok (a padding failure must never cause the real,
+                    // already-successfully-read misses to be wastefully
+                    // redone via the OMP fallback below) ---
+                    if (!pad_ids.empty()) {
+                        if (!submitted) {
+                            // io_uring_enter itself failed -- nothing was
+                            // read at all (Ring::submit_and_wait's own
+                            // contract: either every request is submitted
+                            // and every result written, or nothing is).
+                            // Revert every padding claim; the OMP fallback
+                            // below correctly services pending[] alone.
+                            for (size_t p = 0; p < pad_ids.size(); ++p) {
+                                revert_padding_claim(layer_slots[pad_slots[p]], layer, pad_ids[p]);
+                            }
+                        } else {
+                            size_t r = real_reqs_count;
+                            uint64_t pad_bytes = 0;
+                            for (size_t p = 0; p < pad_ids.size(); ++p) {
+                                int cand_cnt = pad_req_counts[p];
+                                bool cand_ok = true;
+                                for (int j = 0; j < cand_cnt; ++j) {
+                                    if (results[r + (size_t)j] != (ssize_t)reqs[r + (size_t)j].len) {
+                                        cand_ok = false;
+                                        break;
+                                    }
+                                }
+                                MoEExpertBlock& pv = layer_slots[pad_slots[p]];
+                                if (cand_ok) {
+                                    size_t gb, ub, db;
+                                    const GGUFTensor *gM, *uM, *dM;
+                                    engine.expert_layer_geometry(layer, gb, ub, db, gM, uM, dM);
+                                    engine.populate_packed_slab(pv, pad_ids[p], gb, ub, db, *gM, *uM, *dM);
+                                    pad_bytes += gb + ub + db;
+                                    perf().n_pad_reads_ok.fetch_add(1, std::memory_order_relaxed);
+                                } else {
+                                    revert_padding_claim(pv, layer, pad_ids[p]);
+                                    perf().n_pad_reads_failed.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                r += (size_t)cand_cnt;
+                            }
+                            if (pad_bytes > 0) {
+                                perf().bytes_disk_read_speculative.fetch_add((int64_t)pad_bytes,
+                                                                              std::memory_order_relaxed);
+                            }
+                        }
+                    }
+
                     if (all_ok) {
                         size_t total_bytes = 0;
                         for (int i = 0; i < n_pending; ++i) {

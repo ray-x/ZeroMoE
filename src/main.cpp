@@ -131,6 +131,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     ram_mgr.verbose_cache_log = config.verbose_moe_log;
     ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
     ram_mgr.move_on_promotion = config.move_on_promotion;
+    ram_mgr.disk_batch_padding = config.disk_batch_padding;
+    ram_mgr.disk_batch_padding_target = config.disk_batch_padding_target;
     gpu.topology.active_layer_promote_threshold = std::max(1, config.active_layer_promote_hit_threshold);
     if (config.dense_gpu_idx >= 0) {
         gpu.device_id = config.gpus[config.dense_gpu_idx].device_id;
@@ -807,6 +809,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                               << prefill_layers_overridden << " layer(s); remaining layers use the "
                                  "general pin_file ranking.\n";
                 }
+            }
+
+            // Persist this SAME final ranking (post prefill_pin_file
+            // override) for RAMSafetyManager's runtime disk_batch_padding
+            // to use as its candidate source -- see that member's own
+            // comment (ram_manager.hpp) for why the persisted, cross-run
+            // .moestream_usage signal is used here instead of live
+            // StreamingEngine::route_freq. Cheap: at most a few thousand
+            // ints total, copied once at startup, never touched again.
+            for (auto& [layer, v] : by_layer) {
+                auto& dst = ram_mgr.route_rank_by_layer[layer];
+                dst.reserve(v.size());
+                for (auto& e : v) dst.push_back(e.expert);
             }
 
             // Real per-layer capacity for each tier -- used both by

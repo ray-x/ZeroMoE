@@ -251,6 +251,11 @@ struct PerfCounters {
     std::atomic<uint64_t> n_expert_cache_miss{0};
     std::atomic<uint64_t> n_expert_promote{0};
     std::atomic<uint64_t> n_tokens_generated{0};
+    // Sum of prompt_ids.size() across every request this session -- the
+    // missing piece for a real prefill-only tok/s figure (t_prefill_total
+    // already exists but had no matching token count to divide by). See
+    // dump_report()'s "Rates:" line.
+    std::atomic<uint64_t> n_prompt_tokens{0};
     std::atomic<uint64_t> n_expert_gpu_calls{0};  // expert_ffn calls that took the GPU-resident path
     std::atomic<uint64_t> n_expert_cpu_calls{0};  // expert_ffn calls that took the CPU fallback path
     std::atomic<int64_t> bytes_disk_read{0};
@@ -554,6 +559,83 @@ struct PerfCounters {
     std::atomic<uint64_t> n_decode_uring_too_large{0};
     std::atomic<uint64_t> n_decode_uring_submit_failed{0};
     std::atomic<uint64_t> n_decode_uring_short_read{0};
+
+    // Phase B speculative-padding counters (disk_batch_padding config,
+    // RAMSafetyManager::get_experts_batch) -- see that config field's own
+    // comment for the mechanism. Each has a specific diagnostic meaning:
+    //   issued:        a candidate was claimed (RAM slot stamped, request
+    //                  appended) and submitted as part of this batch.
+    //   ok:            that candidate's read came back the right length --
+    //                  its slot is now genuinely, correctly resident.
+    //   failed:        that candidate's read failed (short read / I/O
+    //                  error) -- the claim was reverted (revert_padding_
+    //                  claim), the slot is back to genuinely free. Should
+    //                  be rare; a real, individual read failure, not a
+    //                  padding-logic bug.
+    //   hit_later:      a padded slot was genuinely routed to by a LATER
+    //                  real token before being reclaimed for something
+    //                  else -- the actual payoff this feature exists for.
+    //                  hit_later/issued is the real win-rate to watch.
+    //   no_free_slot:  padding WANTED a candidate this call but found no
+    //                  genuinely-free RAM slot to claim it into (V1 never
+    //                  evicts a resident). Watch this ratio closely in
+    //                  steady state: this project's own real [RAM-SLOTS]
+    //                  history shows the RAM tier saturates to ~100% full
+    //                  within the first handful of decode tokens and stays
+    //                  there -- a high ratio here means padding is mostly
+    //                  only engaging during each run's brief ramp-up
+    //                  window, not the full run (see CLAUDE.md).
+    std::atomic<uint64_t> n_pad_reads_issued{0};
+    std::atomic<uint64_t> n_pad_reads_ok{0};
+    std::atomic<uint64_t> n_pad_reads_failed{0};
+    std::atomic<uint64_t> n_pad_reads_hit_later{0};
+    std::atomic<uint64_t> n_pad_no_free_slot{0};
+    // Diagnostic pair added specifically because a real run showed BOTH
+    // n_pad_reads_issued AND n_pad_no_free_slot stay at exactly 0 for a
+    // whole 40-token run despite route_rank_by_layer confirmed populated
+    // (100+ entries/layer in .moestream_usage) -- meaning the candidate
+    // list (`ranked`) itself was empty every single call, not just short
+    // of free slots. These two counters distinguish the two ways that can
+    // happen: no_ranking_for_layer fires if route_rank_by_layer had NO
+    // entry at all for that layer (population bug, or a layer-numbering
+    // mismatch between .moestream_usage and get_experts_batch's own
+    // `layer` parameter); no_candidates_after_filter fires if the ranking
+    // DID exist but every single entry got excluded (this-token's-own-set
+    // / RAM-resident / VRAM-resident) before `want` candidates were found.
+    std::atomic<uint64_t> n_pad_no_ranking_for_layer{0};
+    std::atomic<uint64_t> n_pad_no_candidates_after_filter{0};
+    // Bumped the moment the OUTER gate (disk_batch_padding && all_packed &&
+    // !reqs.empty() && !in_prefill && n_pending<target) passes, before any
+    // candidate-selection logic runs -- if THIS stays 0 across a whole run
+    // despite disk_batch_padding=true, the bug is in the outer gate itself
+    // (or this Phase B branch never runs at all), not in candidate
+    // selection -- separates that failure class from the two counters
+    // above, which only fire once the outer gate has already passed.
+    std::atomic<uint64_t> n_pad_gate_entered{0};
+    // Independent, non-short-circuited visibility into EACH term of the
+    // padding gate (disk_batch_padding && all_packed && !reqs.empty() &&
+    // !in_prefill && n_pending<target) -- added after n_pad_gate_entered
+    // itself stayed at 0 across a whole real run despite the ENCLOSING
+    // use_decode_uring/Ring::available() branch confirmed running 3400/
+    // 3400 times successfully (Decode-thread io_uring batches: 100%
+    // batched). Every other explanation (reference-vs-copy on ram_mgr,
+    // config.load()/validate() ordering relative to run_engine(), a
+    // duplicate/shadowed member) was directly traced through the real
+    // call chain and ruled out -- these five counters exist to show which
+    // SPECIFIC term is false, since the combined && expression alone gives
+    // no way to tell without them.
+    std::atomic<uint64_t> n_pad_dbg_calls{0};            // total times checked (denominator)
+    std::atomic<uint64_t> n_pad_dbg_padding_false{0};
+    std::atomic<uint64_t> n_pad_dbg_not_all_packed{0};
+    std::atomic<uint64_t> n_pad_dbg_reqs_empty{0};
+    std::atomic<uint64_t> n_pad_dbg_in_prefill{0};
+    std::atomic<uint64_t> n_pad_dbg_target_not_reached{0};  // n_pending >= disk_batch_padding_target
+
+    // Bytes read by padding's speculative requests specifically -- kept
+    // SEPARATE from bytes_disk_read (the real-miss total) so bandwidth
+    // attribution between "real demand" and "speculation" stays visible,
+    // rather than silently inflating the existing real-traffic number.
+    std::atomic<int64_t> bytes_disk_read_speculative{0};
 
     // Sum of every request's OWN measured wall time (request_wall_ms from
     // generate_text, the same number the [REQUEST] line itself prints),
@@ -1048,6 +1130,42 @@ struct PerfCounters {
                          (unsigned long)dsf, (unsigned long)dsr);
             }
         }
+        {
+            // Gated on ANY of these being nonzero, not just issued>0 -- a
+            // run where padding is enabled but never issues a single read
+            // is exactly the "why didn't this help" case these diagnostics
+            // exist for; gating only on issued>0 would hide every counter
+            // that explains why, precisely when they're most needed.
+            uint64_t pi = n_pad_reads_issued.load();
+            uint64_t pns = n_pad_no_free_slot.load();
+            uint64_t pge = n_pad_gate_entered.load();
+            uint64_t pnr = n_pad_no_ranking_for_layer.load();
+            uint64_t pnc = n_pad_no_candidates_after_filter.load();
+            if (pi > 0 || pns > 0 || pge > 0 || pnr > 0 || pnc > 0) {
+                LOG_INFO("Disk-batch padding:  %lu issued (%lu ok / %lu failed), %lu later genuinely "
+                         "hit (%.1f%% payoff), %.2f GB speculative bytes read, %lu no-free-slot skips\n",
+                         (unsigned long)pi, (unsigned long)n_pad_reads_ok.load(),
+                         (unsigned long)n_pad_reads_failed.load(), (unsigned long)n_pad_reads_hit_later.load(),
+                         pi > 0 ? 100.0 * n_pad_reads_hit_later.load() / pi : 0.0,
+                         bytes_disk_read_speculative.load() / 1e9,
+                         (unsigned long)pns);
+                LOG_INFO("Disk-batch padding diag: %lu gate-entered, %lu layer-had-no-ranking, "
+                         "%lu ranking-had-zero-survivors-after-filter\n",
+                         (unsigned long)pge, (unsigned long)pnr, (unsigned long)pnc);
+            }
+            uint64_t pdc = n_pad_dbg_calls.load();
+            if (pdc > 0) {
+                LOG_INFO("Disk-batch padding gate terms (of %lu real Phase B calls): "
+                         "%lu disk_batch_padding=false, %lu !all_packed, %lu reqs.empty(), "
+                         "%lu in_prefill, %lu n_pending>=target\n",
+                         (unsigned long)pdc,
+                         (unsigned long)n_pad_dbg_padding_false.load(),
+                         (unsigned long)n_pad_dbg_not_all_packed.load(),
+                         (unsigned long)n_pad_dbg_reqs_empty.load(),
+                         (unsigned long)n_pad_dbg_in_prefill.load(),
+                         (unsigned long)n_pad_dbg_target_not_reached.load());
+            }
+        }
         LOG_INFO("Pinned residents:    %lu current / %lu desync-detected "
                  "(evict_lru no longer scans pinned slots at all -- this should read 0; "
                  "nonzero means unpinned_slot_indices desynced from the real pinned flags)\n",
@@ -1139,6 +1257,28 @@ struct PerfCounters {
                      "see the per-request [REQUEST] line for a single turn's own rate, or per-token "
                      "[TOKEN N] DEBUG lines excluding token 0 for a decode-only rate)\n",
                      n_tokens_generated.load() / active_s, active_s, (unsigned long)n_requests.load());
+        }
+        // Explicit overall/decode/prefill split -- the Throughput line above
+        // mixes prefill+decode into one denominator (see its own comment),
+        // which understates real steady-state decode speed and gives no way
+        // to directly compare prefill-only cost across runs/config changes
+        // without manually subtracting t_prefill_total by hand each time.
+        // decode = generated tokens over wall time EXCLUDING prefill;
+        // prefill = prompt tokens over prefill's own wall time (both derived
+        // from counters that already existed independently -- n_prompt_
+        // tokens is the only new one, added specifically to complete this
+        // line).
+        {
+            double decode_s = active_s - t_prefill_total.load();
+            double overall_rate = active_s > 0 ? n_tokens_generated.load() / active_s : 0.0;
+            double decode_rate = decode_s > 0 ? n_tokens_generated.load() / decode_s : 0.0;
+            double prefill_rate = t_prefill_total > 0 ? n_prompt_tokens.load() / t_prefill_total.load() : 0.0;
+            if (n_tokens_generated > 0 && active_s > 0) {
+                LOG_INFO("Rates:               overall=%.2f tok/s | decode=%.2f tok/s (%lu tokens / %.2fs) | "
+                         "prefill=%.2f tok/s (%lu tokens / %.2fs)\n",
+                         overall_rate, decode_rate, (unsigned long)n_tokens_generated.load(), decode_s,
+                         prefill_rate, (unsigned long)n_prompt_tokens.load(), t_prefill_total.load());
+            }
         }
         if (n_tokens_generated > 0 && session_elapsed_s > 0) {
             LOG_INFO("Session wall-clock:  %.2f tok/s  (%.2fs engine-ready to shutdown -- INCLUDES any "
