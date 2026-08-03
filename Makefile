@@ -1,11 +1,25 @@
 # Top-level convenience wrapper around the CMake build (see CLAUDE.md /
-# setup.sh for the full manual recipe). Requires Linux + CUDA + AVX-512 --
-# this will not configure or build on macOS.
-BUILD_DIR  ?= build
+# setup.sh for the full manual recipe).
+#
+# On Linux with the NVIDIA CUDA Toolkit, this builds the full engine and the
+# native CUDA test harness.  On macOS the root CMakeLists.txt automatically
+# switches to MOESTREAM_CPU_ONLY=ON and builds the tools plus the CPU-only
+# component tests (no CUDA required).  The CPU-only path also works on Linux
+# by passing MOESTREAM_CPU_ONLY=ON to CMake manually.
 BUILD_TYPE ?= Release
 JOBS       := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-.PHONY: all build test check clean configure test-components bench-io gguf-tool
+# Use separate build directories for the two supported host platforms so that
+# switching between a Linux+CUDA machine and a macOS machine (or sharing the
+# same checkout across both) never mixes incompatible CMake caches.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    BUILD_DIR ?= build-macos
+else
+    BUILD_DIR ?= build
+endif
+
+.PHONY: all build test check clean clean-all configure reconfigure test-components bench-io gguf-tool
 
 all: build
 
@@ -17,27 +31,31 @@ $(BUILD_DIR)/CMakeCache.txt: CMakeLists.txt
 
 configure: $(BUILD_DIR)/CMakeCache.txt
 
-# Main engine binary: ./build/moestream
-build: configure
-	cmake --build $(BUILD_DIR) --target moestream -j$(JOBS)
+# Remove the current platform's build dir and reconfigure from scratch. Useful
+# after switching branches, CMake options, or host platforms.
+reconfigure: clean
+	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 
-# Native test harness (src/main_test.cpp): builds moestream_tests and runs it
-# directly so every [Test N] line prints regardless of pass/fail (ctest's
-# default swallows stdout on success). Exit code propagates, so `make test`
-# fails the same way any other failing recipe does.
-#
-# Depends on `build` (not just `configure`) so `make test` also rebuilds the
-# actual engine binary, ./build/moestream -- moestream and moestream_tests
-# are separate CMake targets built from mostly-shared sources, and this
-# target used to only build moestream_tests. That let the test harness
-# report a change as verified-correct while ./build/moestream, the binary
-# real generation runs actually use, silently stayed stale: a real
-# AVX-512 dequant fix passed Test 6 here but the unrebuilt ./build/moestream
-# still showed the old (slow) behavior in production runs, with nothing in
-# `make test`'s own output to suggest why.
+# Default build: all targets CMake knows about for this platform.
+# On Linux+CUDA that is moestream + moestream_tests + gguf_tool.
+# On macOS that is test_components + gguf_tool.
+build: configure
+	cmake --build $(BUILD_DIR) -j$(JOBS)
+
+# Native test harness: builds and runs whichever test binary CMake produced
+# for this platform. On Linux+CUDA that is moestream_tests; on macOS/CPU-only
+# that is test_components. Exit code propagates, so `make test` fails the same
+# way any other failing recipe does.
 test: build
-	cmake --build $(BUILD_DIR) --target moestream_tests -j$(JOBS)
-	./$(BUILD_DIR)/moestream_tests
+	@if [ -f "$(BUILD_DIR)/moestream_tests" ]; then \
+		cmake --build $(BUILD_DIR) --target moestream_tests -j$(JOBS); \
+		./$(BUILD_DIR)/moestream_tests; \
+	elif [ -f "$(BUILD_DIR)/test_components" ]; then \
+		cmake --build $(BUILD_DIR) --target test_components -j$(JOBS); \
+		./$(BUILD_DIR)/test_components; \
+	else \
+		echo "No test binary found in $(BUILD_DIR)"; exit 1; \
+	fi
 
 check: test
 
@@ -66,3 +84,6 @@ bench-io:
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+clean-all:
+	rm -rf build build-macos build-*

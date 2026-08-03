@@ -71,6 +71,11 @@ struct PrefetchSlot {
     int layer_idx = -1;
     int expert_id = -1;
     std::atomic<bool> ready{false};      // true when pread is complete
+    // Stamped by record_fetch_start() the moment a worker claims this slot
+    // for a real read -- lets a decode-thread consume_staged() call that
+    // finds a matching-but-not-ready slot report how long the read has
+    // been running, for the [PIPE-MISS-TIMING] diagnostic (ram_manager.hpp).
+    std::chrono::high_resolution_clock::time_point fetch_start_at{};
 };
 
 
@@ -144,6 +149,25 @@ private:
     std::mutex staging_mutex;
 
 public:
+    // Live gauge (not a perf() cumulative counter): how many real fetches
+    // are currently between record_fetch_start and record_fetch_end.
+    // Read directly by RAMSafetyManager for the [PIPE-MISS-TIMING]
+    // diagnostic's "in_flight=" field -- a cheap, always-current number,
+    // no scan needed. Public (unlike most internal state here) precisely
+    // because that external read is the point of tracking it.
+    std::atomic<int> n_fetches_in_flight{0};
+
+    // avg ms per completed real fetch so far this run -- used to estimate
+    // "how much longer" an in-flight, not-yet-ready fetch likely needs.
+    // t_pipe_read_ms_sum is a sum across possibly-concurrent worker
+    // threads (see its own comment in perf_timer.hpp) but dividing by a
+    // count of completed fetches still yields a valid mean duration per
+    // fetch -- it's only invalid to read the sum as a wall-clock total.
+    double avg_fetch_ms() const {
+        uint64_t completed = perf().n_pipe_fetch_completed.load(std::memory_order_relaxed);
+        return completed > 0 ? perf().t_pipe_read_ms_sum.load(std::memory_order_relaxed) / (double)completed : 0.0;
+    }
+
     void start(StreamingEngine* eng, GpuTopology* topo = nullptr, bool enable_io_uring = false,
                int n_worker_threads = 1, int n_staging_slots = 64) {
         engine = eng;
@@ -271,7 +295,15 @@ public:
     // and was dead code anyway; this copy-out-under-lock is the safe, live
     // replacement. Caller is responsible for then setting up the per-projection
     // host_ptr/meta from `dst` (see StreamingEngine::populate_slab_from_buffer).
-    bool consume_staged(int layer_idx, int expert_id, uint8_t* dst, size_t dst_cap, size_t* out_bytes) {
+    // out_not_ready_elapsed_ms (optional): when the return is false because
+    // a matching slot exists but isn't ready yet, populated with how long
+    // (ms) that fetch has been running -- lets the caller log real timing
+    // context instead of just "not ready" (see ram_manager.hpp's
+    // [PIPE-MISS-TIMING] diagnostic). Left untouched (caller's initial
+    // value preserved) for every other return path, so a caller can use a
+    // sentinel like -1.0 to mean "not this reason."
+    bool consume_staged(int layer_idx, int expert_id, uint8_t* dst, size_t dst_cap, size_t* out_bytes,
+                         double* out_not_ready_elapsed_ms = nullptr) {
         if (!dst) return false;
         auto _wait_t0 = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(staging_mutex);
@@ -302,6 +334,10 @@ public:
             if (staging[i].layer_idx == layer_idx && staging[i].expert_id == expert_id) {
                 if (!staging[i].ready.load(std::memory_order_acquire)) {
                     perf().n_pipe_miss_not_ready.fetch_add(1, std::memory_order_relaxed);
+                    if (out_not_ready_elapsed_ms) {
+                        *out_not_ready_elapsed_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - staging[i].fetch_start_at).count();
+                    }
                     return false;  // predicted right, but the read isn't done -- caller falls back
                 }
                 size_t bytes = staging[i].loaded_bytes;
@@ -410,6 +446,32 @@ private:
         return ok;
     }
 
+    // Real-fetch bookkeeping (diagnostics only -- see perf_timer.hpp's
+    // n_pipe_fetch_* group). Deliberately factored out of active_prefetch's
+    // two format branches (packed / per-expert) rather than duplicated --
+    // both branches call acquire_staging_slot then later either
+    // finish_prefetch or issue_fadvise_fallback, so a single pair of
+    // start/end calls at each branch's own two touch points covers both.
+    std::chrono::high_resolution_clock::time_point record_fetch_start(PrefetchSlot& slot) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        slot.fetch_start_at = t0;
+        perf().n_pipe_fetch_issued.fetch_add(1, std::memory_order_relaxed);
+        n_fetches_in_flight.fetch_add(1, std::memory_order_relaxed);
+        return t0;
+    }
+    void record_fetch_end(std::chrono::high_resolution_clock::time_point t0, size_t bytes, bool ok) {
+        n_fetches_in_flight.fetch_sub(1, std::memory_order_relaxed);
+        if (ok) {
+            double dt_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - t0).count();
+            perf().n_pipe_fetch_completed.fetch_add(1, std::memory_order_relaxed);
+            perf().bytes_pipe_prefetched.fetch_add(bytes, std::memory_order_relaxed);
+            PerfCounters::atomic_add(perf().t_pipe_read_ms_sum, dt_ms);
+        } else {
+            perf().n_pipe_fetch_failed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     // Active prefetch: pread into pinned host memory (not just fadvise), then
     // (if a VRAM vault is configured) hand the pinned buffer to
     // GpuTopology::upload_expert_async for the actual H2D copy — that
@@ -473,6 +535,7 @@ private:
 
             PrefetchSlot& slot = acquire_staging_slot(total);
             if (!slot.pinned_buf) { issue_fadvise_fallback(layer_idx, expert_id); return; }
+            auto fetch_t0 = record_fetch_start(slot);
 
             int gfd = engine->model_file.fd_for_tensor(gE->second);
             int ufd = engine->model_file.fd_for_tensor(uE->second);
@@ -506,6 +569,7 @@ private:
                 ok = (rg == (ssize_t)gb && ru == (ssize_t)ub && rd == (ssize_t)db);
             }
 
+            record_fetch_end(fetch_t0, total, ok);
             if (ok) {
                 finish_prefetch(slot, layer_idx, expert_id, total);
             } else {
@@ -546,6 +610,7 @@ private:
 
         PrefetchSlot& slot = acquire_staging_slot(total);
         if (!slot.pinned_buf) { issue_fadvise_fallback(layer_idx, expert_id); return; }
+        auto fetch_t0 = record_fetch_start(slot);
 
         uint64_t align = engine->model_file.direct_io_alignment;
         // Single-read fast path (mirrors load_expert_slab): if the three
@@ -594,6 +659,7 @@ private:
             }
         }
 
+        record_fetch_end(fetch_t0, total, ok);
         if (ok) {
             finish_prefetch(slot, layer_idx, expert_id, total);
         } else {

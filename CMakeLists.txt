@@ -1,198 +1,238 @@
-cmake_minimum_required(VERSION 3.23)
-project(MoEStream LANGUAGES CXX CUDA)
+cmake_minimum_required(VERSION 3.25)
+project(MoEStream CXX)
 
-# Force Host C++ Compiler to C++23 (Enables std::expected)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Force NVIDIA NVCC Compiler to C++17 (NVCC lacks C++23 support)
-set(CMAKE_CUDA_STANDARD 17)
-set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+# ---------------------------------------------------------------------------
+# Build options
+# ---------------------------------------------------------------------------
+option(MOESTREAM_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
+option(MOESTREAM_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels" OFF)
+option(MOESTREAM_USE_LLAMA_CPP "Deprecated alias for MOESTREAM_USE_GGML" OFF)
+option(MOESTREAM_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
 
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    # Optimized compilation flags with unrolling and native vectorization targets
-    add_compile_options(-O3 -march=native -mavx512f -mavx512vnni -funroll-loops -Wall -Wextra)
+# macOS has no NVIDIA CUDA SDK, so the full engine cannot build there.
+if(APPLE)
+    set(MOESTREAM_CPU_ONLY ON CACHE BOOL "macOS has no CUDA SDK; force CPU-only build" FORCE)
+    message(STATUS "MoEStream: Apple platform detected — forcing MOESTREAM_CPU_ONLY=ON")
 endif()
 
-# Multi-architecture: Ampere (3090), Ada (4090), Hopper, Blackwell (5060 Ti)
-# Older CUDA toolkits will ignore unsupported architectures
-set(CMAKE_CUDA_ARCHITECTURES "86;89")
-if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL "12.8")
-    list(APPEND CMAKE_CUDA_ARCHITECTURES "100" "120")
+# The full engine links ggml for reference dequantizers.  If you already have
+# a ggml install somewhere else, point CMake to it and set this OFF; otherwise
+# setting this ON fetches a stable llama.cpp release and builds ggml in-tree.
+if(MOESTREAM_USE_LLAMA_CPP AND NOT MOESTREAM_USE_GGML)
+    set(MOESTREAM_USE_GGML ON CACHE BOOL "" FORCE)
+    message(WARNING "MOESTREAM_USE_LLAMA_CPP is deprecated; use MOESTREAM_USE_GGML=ON")
 endif()
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 --use_fast_math -Xcompiler -O3")
+if(NOT MOESTREAM_CPU_ONLY AND NOT MOESTREAM_USE_GGML)
+    message(FATAL_ERROR
+        "Full engine builds require ggml. Either set MOESTREAM_USE_GGML=ON "
+        "to fetch ggml automatically, or provide your own ggml and link it.")
+endif()
 
-find_package(OpenMP REQUIRED)
-find_package(CUDAToolkit REQUIRED)
-
-# ---- Optional: NVIDIA cuFile (GPUDirect Storage) ----
-# NOT part of the base CUDA Toolkit (it ships with the separate GDS package,
-# needs the nvidia-fs kernel module) -- unlike CUDA::cudart/CUDA::cublas
-# above, this must NEVER be REQUIRED, or a perfectly good existing build
-# would break the moment CMake re-runs on a machine that never installed
-# GDS. Detected, not assumed: if headers/lib aren't found, the build
-# proceeds identically to today with cuFile compiled out entirely (see
-# include/cufile_io.hpp's stub namespace) -- config's `cuda_cufile=true`
-# then just logs a warning and falls back to the existing RAM-mediated
-# upload path at runtime, same graceful-degradation contract as
-# direct_io/io_uring already use for their own optional kernel features.
-find_path(CUFILE_INCLUDE_DIR cufile.h
-    HINTS ${CUDAToolkit_INCLUDE_DIRS} /usr/local/cuda/include /usr/local/cuda/targets/x86_64-linux/include)
-find_library(CUFILE_LIBRARY cufile
-    HINTS ${CUDAToolkit_LIBRARY_DIR} /usr/local/cuda/lib64 /usr/local/cuda/targets/x86_64-linux/lib)
-if (CUFILE_INCLUDE_DIR AND CUFILE_LIBRARY)
-    set(MOESTREAM_HAVE_CUFILE ON)
+# Detect Apple Silicon (M1/M2/M3/M4/M5 all share arm64; M3+ specific flags are
+# applied below when the compiler supports them).
+if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
+    set(MOESTREAM_APPLE_SILICON ON)
+    message(STATUS "MoEStream: Apple Silicon (arm64) detected")
 else()
-    set(MOESTREAM_HAVE_CUFILE OFF)
+    set(MOESTREAM_APPLE_SILICON OFF)
 endif()
 
-# ---- Import ggml (sibling llama.cpp checkout) for its reference dequantize_row_* ----
-# We LINK libggml for the K-quant/IQ dequant instead of copying that code. Built
-# CPU-only: MoEStream provides its own CUDA kernels, so ggml's CUDA/BLAS backends
-# are disabled to avoid nvcc/arch conflicts. Only src/ggml_dequant.cpp includes
-# ggml headers; the rest of the code is isolated from ggml's type names.
-set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../llama.cpp/ggml" CACHE PATH "Path to ggml sources")
-set(GGML_STANDALONE     OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA           OFF CACHE BOOL "" FORCE)
-set(GGML_CUDA_F16       OFF CACHE BOOL "" FORCE)
-set(GGML_BLAS           OFF CACHE BOOL "" FORCE)
-set(GGML_OPENMP         OFF CACHE BOOL "" FORCE)  # MoEStream links its own OpenMP
-set(GGML_METAL          OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory(${GGML_DIR} ${CMAKE_BINARY_DIR}/ggml-build EXCLUDE_FROM_ALL)
+# ---------------------------------------------------------------------------
+# OpenMP (used by CPU kernels and some reference loops)
+# ---------------------------------------------------------------------------
+find_package(OpenMP)
 
-add_executable(moestream
-    src/main.cpp
-    src/execution_layer.cpp
-    src/attention_layer.cpp
-    src/gpu_topology.cpp
-    src/graph_initializer.cpp
-    src/kernels_cpu.cpp
-    src/ggml_dequant.cpp
-    src/ggml_grids.cpp
-    models/model_factory.cpp
-    cuda/gguf_cuda.cu
-    cuda/matmul.cu
-    cuda/q8_0_matmul.cu
-    cuda/kquant_matmul.cu
-    cuda/iq2_matmul.cu
-    cuda/iq3_matmul.cu
-    cuda/iq4xs_matmul.cu
-    cuda/rmsnorm.cu
-    cuda/iq2m_dequant.cu
-    cuda/iq1_dequant.cu
-    cuda/mla_attention.cu
-    cuda/kv_quant.cu
-)
+# ---------------------------------------------------------------------------
+# ggml integration (optional)
+# ---------------------------------------------------------------------------
+if(MOESTREAM_USE_GGML)
+    set(MOESTREAM_GGML_TAG "b3923" CACHE STRING "ggml git tag to fetch")
+    set(MOESTREAM_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (uses FetchContent if empty)")
 
-target_include_directories(moestream PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/models
-    ${CMAKE_CURRENT_SOURCE_DIR}/cuda
-    ${GGML_DIR}/include
-    ${GGML_DIR}/src
-    ${CUDA_INCLUDE_DIRS}
-)
+    # Provide a deprecated alias for configs that still set it.
+    if(MOESTREAM_LLAMA_CPP_ROOT AND NOT MOESTREAM_GGML_ROOT)
+        set(MOESTREAM_GGML_ROOT "${MOESTREAM_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
+        message(WARNING "MOESTREAM_LLAMA_CPP_ROOT is deprecated; use MOESTREAM_GGML_ROOT")
+    endif()
+    if(MOESTREAM_LLAMA_CPP_TAG AND MOESTREAM_GGML_TAG STREQUAL "b3923")
+        set(MOESTREAM_GGML_TAG "${MOESTREAM_LLAMA_CPP_TAG}" CACHE STRING "" FORCE)
+        message(WARNING "MOESTREAM_LLAMA_CPP_TAG is deprecated; use MOESTREAM_GGML_TAG")
+    endif()
 
-target_link_libraries(moestream PRIVATE
-    OpenMP::OpenMP_CXX
-    CUDA::cudart
-    CUDA::cublas
-    ggml
-)
+    # Disable everything we do not need for a CPU decode assistant.
+    # These must be set BEFORE the subproject is configured.
+    set(GGML_CUDA        OFF CACHE BOOL "" FORCE)
+    set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
+    set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
+    set(GGML_SYCL        OFF CACHE BOOL "" FORCE)
+    set(GGML_OPENMP      ${OpenMP_CXX_FOUND} CACHE BOOL "" FORCE)
 
-if (MOESTREAM_HAVE_CUFILE)
-    target_include_directories(moestream PRIVATE ${CUFILE_INCLUDE_DIR})
-    target_compile_definitions(moestream PRIVATE MOESTREAM_HAVE_CUFILE=1)
-    target_link_libraries(moestream PRIVATE ${CUFILE_LIBRARY})
+    if(MOESTREAM_METAL AND APPLE)
+        set(GGML_METAL ON CACHE BOOL "" FORCE)
+    else()
+        set(GGML_METAL OFF CACHE BOOL "" FORCE)
+    endif()
+
+    if(MOESTREAM_GGML_ROOT)
+        add_subdirectory("${MOESTREAM_GGML_ROOT}" ggml-build)
+        message(STATUS "MoEStream: using local ggml at ${MOESTREAM_GGML_ROOT}")
+    else()
+        include(FetchContent)
+        FetchContent_Declare(
+            ggml
+            GIT_REPOSITORY https://github.com/ggerganov/ggml.git
+            GIT_TAG        ${MOESTREAM_GGML_TAG}
+            GIT_SHALLOW    TRUE
+            GIT_SUBMODULES ""   # avoid fragile recursive submodule handling in restricted envs
+        )
+        FetchContent_MakeAvailable(ggml)
+        message(STATUS "MoEStream: ggml fetched and available")
+    endif()
 endif()
 
-# ---- Native Test Harness (src/main_test.cpp) ----
-# Links against the REAL kernels/graph code (not a re-implementation), so it
-# needs the same .cpp/.cu sources as the `moestream` binary above, minus
-# src/main.cpp (which defines its own main() and would collide with
-# main_test.cpp's). No global state from main.cpp is referenced by any other
-# translation unit, so this split is safe. Self-skips CUDA-dependent cases at
-# runtime when no device is present (see CudaManager::initialize() call
-# sites in main_test.cpp).
-enable_testing()
+# ---------------------------------------------------------------------------
+# Common include path
+# ---------------------------------------------------------------------------
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 
-add_executable(moestream_tests
-    src/main_test.cpp
-    src/execution_layer.cpp
-    src/attention_layer.cpp
-    src/gpu_topology.cpp
-    src/graph_initializer.cpp
-    src/kernels_cpu.cpp
-    src/ggml_dequant.cpp
-    src/ggml_grids.cpp
-    models/model_factory.cpp
-    cuda/gguf_cuda.cu
-    cuda/matmul.cu
-    cuda/q8_0_matmul.cu
-    cuda/kquant_matmul.cu
-    cuda/iq2_matmul.cu
-    cuda/iq3_matmul.cu
-    cuda/iq4xs_matmul.cu
-    cuda/rmsnorm.cu
-    cuda/iq2m_dequant.cu
-    cuda/iq1_dequant.cu
-    cuda/mla_attention.cu
-    cuda/kv_quant.cu
-)
+# ---------------------------------------------------------------------------
+# Full engine build (Linux + CUDA Toolkit)
+# ---------------------------------------------------------------------------
+if(NOT MOESTREAM_CPU_ONLY)
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
-target_include_directories(moestream_tests PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/models
-    ${CMAKE_CURRENT_SOURCE_DIR}/cuda
-    ${GGML_DIR}/include
-    ${GGML_DIR}/src
-    ${CUDA_INCLUDE_DIRS}
-)
+    find_package(CUDAToolkit REQUIRED)
 
-target_link_libraries(moestream_tests PRIVATE
-    OpenMP::OpenMP_CXX
-    CUDA::cudart
-    CUDA::cublas
-    ggml
-)
+    # Engine executable
+    add_executable(moestream
+        src/main.cpp
+        src/execution_layer.cpp
+        src/attention_layer.cpp
+        src/graph_initializer.cpp
+        src/gpu_topology.cpp
+        src/ggml_dequant.cpp
+        src/ggml_grids.cpp
+        src/kernels_cpu.cpp
+        models/model_factory.cpp
+    )
+    target_include_directories(moestream PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/models
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+    )
+    set_target_properties(moestream PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES 86        # Ampere; adjust via -DCMAKE_CUDA_ARCHITECTURES
+    )
+    target_link_libraries(moestream PRIVATE
+        CUDA::cudart
+        CUDA::cublas
+        CUDA::cublasLt
+    )
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(moestream PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    if(MOESTREAM_USE_GGML)
+        target_link_libraries(moestream PRIVATE ggml)
+        target_compile_definitions(moestream PRIVATE MOESTREAM_USE_GGML=1)
+    endif()
 
-if (MOESTREAM_HAVE_CUFILE)
-    target_include_directories(moestream_tests PRIVATE ${CUFILE_INCLUDE_DIR})
-    target_compile_definitions(moestream_tests PRIVATE MOESTREAM_HAVE_CUFILE=1)
-    target_link_libraries(moestream_tests PRIVATE ${CUFILE_LIBRARY})
-endif()
+    # Native test harness
+    add_executable(moestream_tests
+        src/main_test.cpp
+        src/execution_layer.cpp
+        src/attention_layer.cpp
+        src/graph_initializer.cpp
+        src/gpu_topology.cpp
+        src/ggml_dequant.cpp
+        src/ggml_grids.cpp
+        src/kernels_cpu.cpp
+        models/model_factory.cpp
+    )
+    target_include_directories(moestream_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/models
+        ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+    )
+    set_target_properties(moestream_tests PROPERTIES
+        CUDA_SEPARABLE_COMPILATION OFF
+        CUDA_ARCHITECTURES 86
+    )
+    target_link_libraries(moestream_tests PRIVATE
+        CUDA::cudart
+        CUDA::cublas
+        CUDA::cublasLt
+    )
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(moestream_tests PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    if(MOESTREAM_USE_GGML)
+        target_link_libraries(moestream_tests PRIVATE ggml)
+        target_compile_definitions(moestream_tests PRIVATE MOESTREAM_USE_GGML=1)
+    endif()
 
-add_test(NAME native_test_harness COMMAND moestream_tests)
+    # Tools are built by the subdirectory CMakeLists as well, but ensure the
+    # root can also drive them.
+    add_subdirectory(tools)
 
-# ---- Offline GGUF tool (tools/gguf_tool.cpp + gguf_pack/io/verify.cpp) ----
-# Deliberately independent of the CUDA/ggml build above: pure file I/O and
-# GGUF metadata manipulation, no CUDA, no ggml, no OpenMP needed. This
-# means it also builds and runs on machines without a GPU/CUDA toolkit --
-# confirmed by actually compiling and running it against a synthetic GGUF
-# file on a plain darwin/clang machine during development (see CLAUDE.md).
-# Single binary, four subcommands: pack (align/unpack shards for O_DIRECT),
-# io (A/B read-throughput bench), verify (completeness + byte-compare gate),
-# plan (dense/MoE/system sizing advisor).
-add_executable(gguf_tool
-    tools/gguf_tool.cpp
-    tools/gguf_pack.cpp
-    tools/gguf_io.cpp
-    tools/gguf_verify.cpp
-    tools/gguf_plan.cpp
-)
-target_include_directories(gguf_tool PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-message(STATUS "MoEStream Build Configuration:")
-message(STATUS "  -> Host C++ Standard: C++23 Enabled")
-message(STATUS "  -> Device CUDA Standard: C++17 Enabled")
-message(STATUS "  -> CPU Vectorization: AVX-512 / VNNI Enabled")
-message(STATUS "  -> GPU Architectures: ${CMAKE_CUDA_ARCHITECTURES}")
-message(STATUS "  -> Multi-GPU: Topology auto-detection enabled")
-message(STATUS "  -> OpenMP Threading: Enabled")
-if (MOESTREAM_HAVE_CUFILE)
-    message(STATUS "  -> cuFile (GPUDirect Storage): FOUND -- compiled in (still requires cuda_cufile=true at runtime, and GDS/nvidia-fs actually installed, to activate)")
+# ---------------------------------------------------------------------------
+# CPU-only build (macOS, or Linux without CUDA)
+# ---------------------------------------------------------------------------
 else()
-    message(STATUS "  -> cuFile (GPUDirect Storage): NOT FOUND -- compiled out, cuda_cufile config option will log a warning and fall back at runtime")
+    message(STATUS "MoEStream: CPU-only build path selected")
+
+    # Choose the right CPU kernel backend.
+    set(MOESTREAM_CPU_KERNEL_SRCS)
+    if(MOESTREAM_APPLE_SILICON)
+        list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/kernels_cpu_neon.cpp)
+        message(STATUS "MoEStream: using ARM NEON CPU kernel backend")
+    else()
+        list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/kernels_cpu.cpp)
+        message(STATUS "MoEStream: using x86 AVX-512 CPU kernel backend")
+    endif()
+
+    add_library(kernels_cpu STATIC ${MOESTREAM_CPU_KERNEL_SRCS})
+    target_include_directories(kernels_cpu PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/models
+    )
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(kernels_cpu PUBLIC OpenMP::OpenMP_CXX)
+    endif()
+
+    # Apple Silicon tuning: prefer the Apple-specific CPU tuning when the
+    # toolchain supports it.  This benefits M3/M4/M5 (and is harmless on M1/M2).
+    if(MOESTREAM_APPLE_SILICON)
+        include(CheckCXXCompilerFlag)
+        check_cxx_compiler_flag("-mcpu=apple-m3" MOESTREAM_HAS_APPLE_M3_FLAG)
+        if(MOESTREAM_HAS_APPLE_M3_FLAG)
+            target_compile_options(kernels_cpu PRIVATE -mcpu=apple-m3)
+            message(STATUS "MoEStream: applied -mcpu=apple-m3 to CPU kernels")
+        endif()
+        target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_ARM_NEON=1)
+    endif()
+
+    if(MOESTREAM_USE_GGML)
+        target_sources(kernels_cpu PRIVATE src/ggml_dequant.cpp)
+        target_link_libraries(kernels_cpu PUBLIC ggml)
+        target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_USE_GGML=1)
+    endif()
+
+    # CPU-only component tests (cross-platform, no CUDA)
+    add_executable(test_components tests/test_components.cpp)
+    target_link_libraries(test_components PRIVATE kernels_cpu)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(test_components PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+
+    # Tools
+    add_subdirectory(tools)
 endif()
+
+message(STATUS "MoEStream: configure done")

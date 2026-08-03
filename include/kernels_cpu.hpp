@@ -1,6 +1,18 @@
 #pragma once
 #include <cstdint>
 
+// Platform backend selection:
+//   * On x86-64 with AVX-512F, src/kernels_cpu.cpp provides these symbols.
+//   * On Apple Silicon / ARM64, src/kernels_cpu_neon.cpp provides the same
+//     symbols so that callers do not need platform #ifdefs.  The historical
+//     "_avx512" suffixes are therefore a misnomer on ARM; they are kept as a
+//     compatibility shim while the codebase is being modernized.
+//
+// CMake controls which implementation file is compiled:
+//   - MOESTREAM_CPU_ONLY=ON forces the CPU-only path (auto-set on macOS).
+//   - On arm64 Apple, kernels_cpu_neon.cpp is selected.
+//   - Otherwise kernels_cpu.cpp (AVX-512) is selected.
+
 struct block_q4_0 {
   uint16_t d;
   uint8_t qs[16];
@@ -132,3 +144,16 @@ void matmul_q8_0_fused(float *y, const float *x, const uint8_t *W_quantized,
 
 void matmul_f32_avx512(float *y, const float *x, const float *w, int S, int I,
                        int O);
+
+// ----------------------------------------------------------------------------
+// Platform-neutral aliases for new / modernized code.
+// Older call sites still use the historical names above; these aliases let new
+// code avoid the misleading "avx512" suffix.
+// ----------------------------------------------------------------------------
+inline float dot_f32(const float *a, const float *b, int n) {
+  return dot_f32_avx512(a, b, n);
+}
+inline void matmul_f32(float *y, const float *x, const float *w, int S, int I,
+                       int O) {
+  matmul(y, x, w, S, I, O);
+}

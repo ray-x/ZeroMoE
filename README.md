@@ -37,7 +37,8 @@ MoeStream/
 │   ├── execution_layer.cpp        # Layer forward lookahead orchestration
 │   ├── attention_layer.cpp        # Absorbed attention matrix calculation
 │   ├── graph_initializer.cpp      # Topological parameter mapping core
-│   └── kernels_cpu.cpp            # CPU register math vectorizations
+│   ├── kernels_cpu.cpp            # x86 AVX-512 CPU kernel backend
+│   └── kernels_cpu_neon.cpp       # Apple Silicon ARM NEON CPU kernel backend
 ├── cuda/                          # GPU Optimization Stack
 │   └── gguf_cuda.cu               # Ampere __dp4a dynamic quantization kernels
 └── api/                           # Production Network Gateways
@@ -47,20 +48,55 @@ MoeStream/
 
 ## Build and Installation Pipeline
 
-1. Execute System Compilation
-   Run the automated environment setup tool. This script validates your system compilers (gcc, nvcc), prepares an isolated Python virtual environment shell, installs required ASGI gateway dependencies, and runs CMake to generate your target binary:
+### Linux + CUDA (full engine)
+
+Run the automated environment setup tool. This script validates your system
+compilers (`g++`, `nvcc`), prepares an isolated Python virtual environment,
+installs ASGI gateway dependencies, and runs CMake to build the full engine:
 
 ```bash
 chmod +x setup.sh
 ./setup.sh
 ```
 
-Alternatively, to build or modify individual target configurations manually via CMake, utilize standard terminal construction tracks:
+Or manually:
 
 ```bash
-mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc) 
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+### macOS / CPU-only build
+
+The main `moestream` engine requires NVIDIA CUDA and cannot build on macOS.
+However, the root `CMakeLists.txt` automatically detects Apple platforms and
+switches to a CPU-only build that compiles:
+
+* `gguf_tool` — pack / verify / io-bench utility (cross-platform)
+* `test_components` — CPU-only component and kernel tests
+
+```bash
+make build                       # configures into build-macos on Apple platforms
+make test                        # run the CPU kernel / component tests
+./build-macos/gguf_tool --help   # use the GGUF utility
+```
+
+Or, equivalently, with CMake directly:
+
+```bash
+cmake -S . -B build-macos -DCMAKE_BUILD_TYPE=Release
+cmake --build build-macos -j$(sysctl -n hw.ncpu)
+./build-macos/test_components
+./build-macos/gguf_tool --help
+```
+
+On Apple Silicon (M1/M2/M3/M4/M5) the CPU kernel backend uses ARM NEON +
+SDOT for the f32 and integer-dot-product paths.  For optimized quantized
+(MOE) expert decoding on macOS, build with ggml integration:
+
+```bash
+cmake -S . -B build -DMOESTREAM_USE_GGML=ON -DMOESTREAM_GGML_TAG=b3923
+cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 2. Interactive Terminal Generation
 Launch the standalone engine directly by passing the destination to your local GGUF model along with your system memory allocation caps:

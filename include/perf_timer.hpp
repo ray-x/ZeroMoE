@@ -285,6 +285,45 @@ struct PerfCounters {
     std::atomic<uint64_t> n_pilot_recall_hits{0};
     std::atomic<uint64_t> n_pilot_recall_checks{0};   // number of (layer, "last token") comparisons made
     std::atomic<uint64_t> n_pilot_recall_topk_sum{0}; // sum of topk across those checks (denominator, since topk could vary in principle)
+
+    // Prediction-quality benchmarking (always measured, independent of
+    // prefetch_worker_threads -- the pilot loop runs unconditionally
+    // today). Classifies each pilot top-K pick, at prediction time, into
+    // exactly one of four buckets: already VRAM-pinned, already
+    // VRAM-LRU/reactive, already RAM-resident, or genuinely "needs a
+    // fetch" (the only bucket that ever calls push_hint). The raw
+    // n_pilot_recall_hits/checks/topk_sum above measure accuracy over the
+    // FULL top-K including already-cached picks, which is the wrong
+    // denominator for "is prefetch worth enabling" -- an already-cached
+    // pick is correctly skipped regardless of whether it was predicted
+    // right, so its correctness doesn't matter to that question. These
+    // two counters instead measure accuracy restricted to the
+    // needs_fetch subset only -- the number that actually determines
+    // whether enabling prefetch can help a given model.
+    std::atomic<uint64_t> n_pilot_pred_already_ram{0};
+    std::atomic<uint64_t> n_pilot_pred_already_vram_pinned{0};
+    std::atomic<uint64_t> n_pilot_pred_already_vram_lru{0};
+    std::atomic<uint64_t> n_pilot_pred_needs_fetch{0};
+    std::atomic<uint64_t> n_pilot_recall_hint_hits{0};        // of the needs_fetch subset, how many matched the real router's later choice
+    std::atomic<uint64_t> n_pilot_recall_hint_checks_denom{0}; // denominator for the above (sum of needs_fetch picks actually checked against a real routing decision)
+
+    // Real prefetch-worker fetch stats (only nonzero once
+    // prefetch_worker_threads > 0 and a worker actually starts a read --
+    // separate from n_pilot_pred_needs_fetch above, which counts hints
+    // PUSHED to the queue regardless of whether any worker ever picks
+    // them up). n_pipe_hits (existing counter, below) is reused as-is for
+    // "consumed" -- it already counts exactly "staged reads later matched
+    // and used by a real miss". t_pipe_read_ms_sum is a SUM across
+    // possibly-concurrent worker threads -- valid only for computing an
+    // average ms/fetch, NOT a wall-clock GB/s figure (see this project's
+    // own documented OMP-thread-sum-vs-wall-clock lesson for t_cpu_dequant
+    // and the original t_disk_read uring-timing investigation).
+    std::atomic<uint64_t> n_pipe_fetch_issued{0};
+    std::atomic<uint64_t> n_pipe_fetch_completed{0};
+    std::atomic<uint64_t> n_pipe_fetch_failed{0};
+    std::atomic<uint64_t> bytes_pipe_prefetched{0};
+    std::atomic<double>   t_pipe_read_ms_sum{0};
+
     std::atomic<uint64_t> n_vram_evict_demoted{0};  // VRAM evictions salvaged into the RAM tier via a D2H copy instead of being dropped outright (vram_evict_demote_to_ram=true) -- nonzero proves the salvage path is engaging; compare against Expert cache's disk-miss count for the real win (a demoted expert re-hit later serves from RAM, no disk read at all)
     std::atomic<uint64_t> n_vram_evict_demote_skipped{0}; // demote attempts that declined for a benign reason (already RAM-resident, or the layer uses the legacy per-expert-tensor format with no packed_slab_geometry) -- not an error, just nothing to do
     std::atomic<uint64_t> n_vram_evict_demote_failed{0};  // demote attempts that hit a real problem (cudaMemcpy D2H failure, size mismatch) -- should stay at/near 0; a nonzero count is worth investigating but never corrupts anything, since a failed demote just leaves the RAM slot empty rather than half-populated
@@ -1082,6 +1121,35 @@ struct PerfCounters {
                          "speed/staging pool size, measures prediction accuracy alone\n",
                          (unsigned long)rhits, (unsigned long)rdenom,
                          rdenom > 0 ? 100.0 * rhits / rdenom : 0.0, (unsigned long)rchecks);
+                uint64_t already_ram = n_pilot_pred_already_ram.load();
+                uint64_t already_pin = n_pilot_pred_already_vram_pinned.load();
+                uint64_t already_lru = n_pilot_pred_already_vram_lru.load();
+                uint64_t needs_fetch = n_pilot_pred_needs_fetch.load();
+                uint64_t total_pred = already_ram + already_pin + already_lru + needs_fetch;
+                LOG_INFO("Pilot prediction coverage: %lu/%lu top-K picks needed a fetch (already cached: "
+                         "%lu vram-pin + %lu vram-lru + %lu ram)\n",
+                         (unsigned long)needs_fetch, (unsigned long)total_pred,
+                         (unsigned long)already_pin, (unsigned long)already_lru, (unsigned long)already_ram);
+                uint64_t hhits = n_pilot_recall_hint_hits.load(), hdenom = n_pilot_recall_hint_checks_denom.load();
+                LOG_INFO("Pilot accuracy (fetch-worthy only): %lu/%lu (%.1f%%) -- the number that actually "
+                         "determines whether enabling prefetch can help this model\n",
+                         (unsigned long)hhits, (unsigned long)hdenom,
+                         hdenom > 0 ? 100.0 * hhits / hdenom : 0.0);
+            }
+        }
+        {
+            uint64_t issued = n_pipe_fetch_issued.load();
+            if (issued > 0) {
+                uint64_t completed = n_pipe_fetch_completed.load();
+                uint64_t failed = n_pipe_fetch_failed.load();
+                uint64_t consumed = n_pipe_hits.load();
+                double mb = bytes_pipe_prefetched.load() / 1e6;
+                double avg_ms = completed > 0 ? t_pipe_read_ms_sum.load() / completed : 0.0;
+                LOG_INFO("Prefetch real fetches: %lu issued, %lu completed / %lu failed, %lu/%lu (%.1f%%) "
+                         "later actually used | %.2f MB read, avg %.2f ms/fetch\n",
+                         (unsigned long)issued, (unsigned long)completed, (unsigned long)failed,
+                         (unsigned long)consumed, (unsigned long)completed,
+                         completed > 0 ? 100.0 * consumed / completed : 0.0, mb, avg_ms);
             }
         }
         LOG_INFO("VRAM->RAM demote:    %lu salvaged / %lu skipped (benign) / %lu failed "

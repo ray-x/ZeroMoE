@@ -1063,7 +1063,9 @@ public:
                 engine.ensure_slab_capacity(victim, total);
                 PERF_START(consume);
                 size_t got_bytes = 0;
-                bool ok = prefetcher->consume_staged(layer, expert_id, victim.slab_buffer, victim.slab_capacity, &got_bytes);
+                double not_ready_ms = -1.0;
+                bool ok = prefetcher->consume_staged(layer, expert_id, victim.slab_buffer, victim.slab_capacity,
+                                                       &got_bytes, &not_ready_ms);
                 PERF_END(consume, t_consume_staged);
                 if (ok && got_bytes == total) {
                     engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
@@ -1072,8 +1074,22 @@ public:
                     perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
                     if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
                     else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
-                } else if (!ok && prefetcher->has_pending_hint(layer, expert_id)) {
-                    perf().n_pipe_miss_still_queued.fetch_add(1, std::memory_order_relaxed);
+                } else if (!ok) {
+                    bool still_queued = prefetcher->has_pending_hint(layer, expert_id);
+                    if (still_queued) perf().n_pipe_miss_still_queued.fetch_add(1, std::memory_order_relaxed);
+                    // Diagnostic only (LOG_DEBUG, same verbosity tier as the
+                    // adjacent [MOE-CACHE] MISS line below) -- directly
+                    // answers "did the prefetcher arrive too late, and by
+                    // how much" per-miss instead of inferring it from
+                    // aggregate counters after the fact.
+                    const char* reason = not_ready_ms >= 0.0 ? "in_flight_not_ready"
+                                        : still_queued        ? "still_queued"
+                                                               : "no_trace";
+                    LOG_DEBUG("[PIPE-MISS-TIMING] layer=%d expert=%d reason=%s elapsed_ms=%.1f est_remaining_ms=%.1f in_flight=%d\n",
+                              layer, expert_id, reason,
+                              not_ready_ms >= 0.0 ? not_ready_ms : 0.0,
+                              not_ready_ms >= 0.0 ? std::max(0.0, prefetcher->avg_fetch_ms() - not_ready_ms) : 0.0,
+                              prefetcher->n_fetches_in_flight.load(std::memory_order_relaxed));
                 }
             }
         }
@@ -1366,7 +1382,9 @@ public:
                     engine.ensure_slab_capacity(victim, total);
                     PERF_START(consume);
                     size_t got_bytes = 0;
-                    bool ok = prefetcher->consume_staged(layer, expert_id, victim.slab_buffer, victim.slab_capacity, &got_bytes);
+                    double not_ready_ms = -1.0;
+                    bool ok = prefetcher->consume_staged(layer, expert_id, victim.slab_buffer, victim.slab_capacity,
+                                                           &got_bytes, &not_ready_ms);
                     PERF_END(consume, t_consume_staged);
                     if (ok && got_bytes == total) {
                         engine.populate_packed_slab(victim, expert_id, gb, ub, db, *gM, *uM, *dM);
@@ -1375,14 +1393,23 @@ public:
                         perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
                         if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
                         else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
-                    } else if (!ok && prefetcher->has_pending_hint(layer, expert_id)) {
+                    } else if (!ok) {
                         // consume_staged found no matching slot (its own
                         // n_pipe_miss_no_match already fired internally) --
                         // check whether the pilot DID predict this exact
                         // expert and the hint is simply still sitting unpopped
                         // in the SPSC queue, vs no trace of it anywhere. See
                         // n_pipe_miss_still_queued's own comment.
-                        perf().n_pipe_miss_still_queued.fetch_add(1, std::memory_order_relaxed);
+                        bool still_queued = prefetcher->has_pending_hint(layer, expert_id);
+                        if (still_queued) perf().n_pipe_miss_still_queued.fetch_add(1, std::memory_order_relaxed);
+                        const char* reason = not_ready_ms >= 0.0 ? "in_flight_not_ready"
+                                            : still_queued        ? "still_queued"
+                                                                   : "no_trace";
+                        LOG_DEBUG("[PIPE-MISS-TIMING] layer=%d expert=%d reason=%s elapsed_ms=%.1f est_remaining_ms=%.1f in_flight=%d\n",
+                                  layer, expert_id, reason,
+                                  not_ready_ms >= 0.0 ? not_ready_ms : 0.0,
+                                  not_ready_ms >= 0.0 ? std::max(0.0, prefetcher->avg_fetch_ms() - not_ready_ms) : 0.0,
+                                  prefetcher->n_fetches_in_flight.load(std::memory_order_relaxed));
                     }
                 }
             }

@@ -323,6 +323,15 @@ struct LayerScratch {
     std::array<int, 8> pilot_pred_ids{};
     int pilot_pred_count = 0;
     int pilot_pred_layer = -1;
+    // Parallel to pilot_pred_ids: whether pilot_pred_ids[k] was actually
+    // "fetch-worthy" (not already cached anywhere) at prediction time, and
+    // so was actually pushed as a hint. Lets the recall-check site below
+    // compute a SECOND accuracy figure restricted to the subset of
+    // predictions that would actually trigger a real fetch -- the number
+    // that determines whether prefetch is worth enabling, as opposed to
+    // pilot_recall's raw top-K accuracy (which includes already-cached
+    // picks whose correctness doesn't matter to that question).
+    std::array<bool, 8> pilot_pred_was_hint{};
 
     void resize(int S, int D, int n_experts, int moe_inter, int topk, int n_expert_shared = 0, int dense_inter = 0) {
         attn_out.resize(S * D);
@@ -1068,15 +1077,29 @@ void moe_forward_gguf(
         // into a later layer's unrelated comparison.
         if (s == S - 1 && scratch.pilot_pred_layer == layer_idx) {
             int overlap = 0;
+            int hint_overlap = 0, hint_denom = 0;
             for (int pk = 0; pk < scratch.pilot_pred_count; ++pk) {
                 int pred_id = scratch.pilot_pred_ids[pk];
+                bool matched = false;
                 for (int k = 0; k < topk; ++k) {
-                    if (scratch.tok_topk_ids[s * topk + k] == pred_id) { ++overlap; break; }
+                    if (scratch.tok_topk_ids[s * topk + k] == pred_id) { matched = true; break; }
+                }
+                if (matched) ++overlap;
+                // Restricted tally: of the picks that were actually
+                // fetch-worthy (not already cached, so a real hint got
+                // pushed for them), how many turned out correct? This is
+                // the decision-relevant number -- see
+                // n_pilot_recall_hint_hits's own comment in perf_timer.hpp.
+                if (scratch.pilot_pred_was_hint[pk]) {
+                    ++hint_denom;
+                    if (matched) ++hint_overlap;
                 }
             }
             perf().n_pilot_recall_hits.fetch_add((uint64_t)overlap, std::memory_order_relaxed);
             perf().n_pilot_recall_checks.fetch_add(1, std::memory_order_relaxed);
             perf().n_pilot_recall_topk_sum.fetch_add((uint64_t)topk, std::memory_order_relaxed);
+            perf().n_pilot_recall_hint_hits.fetch_add((uint64_t)hint_overlap, std::memory_order_relaxed);
+            perf().n_pilot_recall_hint_checks_denom.fetch_add((uint64_t)hint_denom, std::memory_order_relaxed);
             scratch.pilot_pred_layer = -1;
         }
     }
@@ -1885,9 +1908,9 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     scratch.pilot_logits[best_exp] = -2e30f;
                     scratch.pilot_pred_ids[k] = best_exp;
 
-                    bool already_resident = false;
+                    bool already_ram = false;
                     for (size_t si = 0; si < next_cap; ++si) {
-                        if (next_slots[si].expert_id == best_exp) { already_resident = true; break; }
+                        if (next_slots[si].expert_id == best_exp) { already_ram = true; break; }
                     }
                     // FIX: this used to only check the RAM tier. Before the
                     // [TIER-OVERLAP] fix, a VRAM-resident expert was almost
@@ -1908,18 +1931,36 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     // a speculative "is it worth hinting" check on the NEXT
                     // layer, not a genuine use yet, same non-mutating style
                     // the RAM-tier check above already uses).
-                    if (!already_resident && ram_mgr.vram_cache) {
+                    bool already_vram = false, vram_pinned = false;
+                    if (!already_ram && ram_mgr.vram_cache) {
                         for (const auto& loc : ram_mgr.vram_cache->expert_vram_cache) {
                             if (loc.layer_idx == l + 1 && loc.expert_id == best_exp) {
-                                already_resident = true;
+                                already_vram = true;
+                                vram_pinned = loc.pinned;
                                 break;
                             }
                         }
                     }
-                    if (already_resident) {
-                        perf().n_pilot_hints_skipped.fetch_add(1, std::memory_order_relaxed);
+                    // Classify into exactly one bucket for the "Pilot
+                    // prediction coverage" diagnostic (perf_timer.hpp) --
+                    // pure bookkeeping alongside the pre-existing
+                    // skip/push decision below, doesn't change which
+                    // branch fires.
+                    bool is_hint_worthy = !already_ram && !already_vram;
+                    if (already_ram) {
+                        perf().n_pilot_pred_already_ram.fetch_add(1, std::memory_order_relaxed);
+                    } else if (already_vram && vram_pinned) {
+                        perf().n_pilot_pred_already_vram_pinned.fetch_add(1, std::memory_order_relaxed);
+                    } else if (already_vram) {
+                        perf().n_pilot_pred_already_vram_lru.fetch_add(1, std::memory_order_relaxed);
                     } else {
+                        perf().n_pilot_pred_needs_fetch.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    scratch.pilot_pred_was_hint[k] = is_hint_worthy;
+                    if (is_hint_worthy) {
                         async_io_queue.push_hint(l + 1, best_exp);
+                    } else {
+                        perf().n_pilot_hints_skipped.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
             }
