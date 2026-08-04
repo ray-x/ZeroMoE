@@ -76,6 +76,33 @@ struct EngineConfig {
     // always going to be I/O-bound. Empty (default) = no layers affected,
     // identical to today's behavior. See CLAUDE.md.
     std::vector<int> cpu_affinity_layers;
+
+    // How many candidate experts the Phase 1 pilot router pushes as
+    // speculative prefetch hints per layer transition (execution_layer.cpp's
+    // pilot loop -- was a hardcoded `std::min(8, c.topk)`). Global default;
+    // see prefetch_pilot_k_per_layer below for a per-layer override. Lower
+    // this if [PREFETCH-LAYER]'s per-layer report shows a layer's pushed
+    // hints are mostly evicted unused (staging pool churn) or mostly
+    // already-resident (n_pilot_pred_already_* -- no read needed at all) --
+    // in both cases the hint bought nothing but still cost a worker-thread
+    // read + a staging slot that a DIFFERENT layer's genuinely useful hint
+    // could have used instead.
+    int prefetch_pilot_k = 8;
+
+    // Per-layer override for the above, one entry per layer index (e.g.
+    // `prefetch_pilot_k_per_layer = [8,8,8,0,0,4,...]`), reusing the same
+    // `[int]`-array TOML parser cpu_affinity_layers uses. A layer whose
+    // index is out of range, or whose entry is negative, falls back to
+    // prefetch_pilot_k; entries past the model's real layer count are
+    // ignored. Empty (default) = every layer uses prefetch_pilot_k
+    // uniformly, identical to today's behavior. Intended for layers whose
+    // [PREFETCH-LAYER] report shows the pilot's hints there are rarely
+    // "really required" (see that report's hint-outcome line) -- set those
+    // layers lower (or 0, disabling prefetch for them entirely) to free up
+    // staging-slot and worker-thread bandwidth for layers where prefetch
+    // actually pays off, without needing a single global value that fits
+    // every layer's very different routing concentration equally badly.
+    std::vector<int> prefetch_pilot_k_per_layer;
     // O_DIRECT expert-slab reads (Linux only). Opt-in, requires the model
     // to have been repacked with tools/gguf_tool pack (or otherwise have
     // general.alignment >= 4096) -- see GGUFFile::enable_direct_io. A
@@ -665,6 +692,8 @@ inline bool EngineConfig::load(const std::string& path) {
     drop_pages       = doc.root.get_bool("drop_pages", drop_pages);
     cpu_only         = doc.root.get_bool("cpu_only", cpu_only);
     cpu_affinity_layers = doc.root.get_int_array("cpu_affinity_layers");
+    prefetch_pilot_k    = doc.root.get_int("prefetch_pilot_k", prefetch_pilot_k);
+    prefetch_pilot_k_per_layer = doc.root.get_int_array("prefetch_pilot_k_per_layer");
     direct_io        = doc.root.get_bool("direct_io", direct_io);
     cuda_cufile      = doc.root.get_bool("cuda_cufile", cuda_cufile);
     prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher", prefill_warm_via_prefetcher);
@@ -850,6 +879,10 @@ inline void EngineConfig::print() const {
                            << " experts/submission, speculative reads from route_freq)\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch worker threads: " << prefetch_worker_threads << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch staging slots: " << prefetch_staging_slots << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Prefetch pilot_k (hints/layer transition): default=" << prefetch_pilot_k
+                       << (prefetch_pilot_k_per_layer.empty() ? "" : ", " + std::to_string(prefetch_pilot_k_per_layer.size())
+                           + " layer override value(s) set (see [PREFETCH-LAYER] report)")
+                       << "\n";
     if (cpu_only) LOG_STREAM_INFO() << "[CONFIG] CPU-only mode: ON (all GPU dispatch disabled)\n";
     if (!cpu_affinity_layers.empty()) {
         LOG_STREAM_INFO() << "[CONFIG] CPU-affinity layers (never GPU-dispatched or VRAM-uploaded): ";
@@ -1051,6 +1084,26 @@ prefetch_worker_threads = 2
 # additional to moe_cache_gb/host_ram_gb; watch total system memory if you
 # raise this further.
 prefetch_staging_slots = 256
+
+# prefetch_pilot_k: how many candidate experts the pilot router pushes as
+# speculative prefetch hints per layer transition. Default 8 (was a
+# hardcoded std::min(8, topk)). Lower this (globally or per-layer, see
+# prefetch_pilot_k_per_layer below) if the [PREFETCH-LAYER] shutdown report
+# shows a layer's hints are rarely "really required" -- each unneeded hint
+# still costs a worker-thread read and a staging slot that a genuinely
+# useful hint (this layer's or another's) could have used instead.
+prefetch_pilot_k = 8
+
+# prefetch_pilot_k_per_layer: per-layer override for prefetch_pilot_k, one
+# value per layer index (e.g. [8,8,8,0,0,4] disables prefetch for layers 3
+# and 4 and halves it for layer 5). Missing/negative entries fall back to
+# prefetch_pilot_k. Default empty = every layer uses prefetch_pilot_k
+# uniformly. Different layers have very different routing concentration
+# (see [PIN-CONCENTRATION] at startup) -- a flat layer's pilot prediction
+# is little better than a guess, so hints there are disproportionately
+# likely to be wasted; this lets you turn those down without touching
+# layers where prediction is genuinely good.
+# prefetch_pilot_k_per_layer = [8, 8, 8, 0, 0, 4]
 
 # Host RAM (DDR) budget for the MoE expert LRU cache, in GB.
 # 0 = auto-detect (88% of currently-available system memory).

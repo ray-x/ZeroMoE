@@ -243,8 +243,7 @@ void silu_inplace(float *x, int n) {
   // Single 16-element vector tail
   for (; i + 16 <= n; i += 16) {
     __m512 v = _mm512_loadu_ps(x + i);
-    __m512 neg_v = _mm512_sub_ps(_mm512_setzero_ps(), v);
-    __m512 exp_neg = _mm512_exp_neg_ps(neg_v);
+    __m512 exp_neg = _mm512_exp_neg_ps(v);
     __m512 denom = _mm512_add_ps(v_one, exp_neg);
 
     __m512 inv = _mm512_rcp14_ps(denom);
@@ -1385,9 +1384,25 @@ float dot_q4_0_q8_0_avx512(const block_q4_0 *w, const block_q8_0 *x,
         _mm512_inserti64x4(_mm512_castsi256_si512(lo_nibbles), hi_nibbles, 1);
     __m512i v_x = _mm512_loadu_si512((const void *)x[i].qs);
     __m512i acc_dp = _mm512_setzero_si512();
-    acc_dp = _mm512_dpbusd_epi32(acc_dp, v_w, v_x);
     __m512i ones_8 = _mm512_set1_epi8(1);
     __m512i ones_16 = _mm512_set1_epi16(1);
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    acc_dp = _mm512_dpbusd_epi32(acc_dp, v_w, v_x);
+#else
+    // Portable fallback for AVX-512 hosts without VNNI (e.g. early
+    // Skylake-X/Cascade Lake, which have the rest of the AVX-512 baseline
+    // this file needs but not VNNI specifically): madd(maddubs(u8,s8),
+    // ones16) computes the same per-int32-lane sum of 4 byte-products
+    // _mm512_dpbusd_epi32 would, just via two AVX512BW instructions
+    // instead of one VNNI instruction -- the same equivalence already
+    // used for the sum_x correction term just below, and the same
+    // guard+fallback pattern dot_u8s8_avx512/dot_i4i8_avx512 already use
+    // elsewhere in this file (this call site was the one place that
+    // equivalent guard was missing, surfaced by a real build on a host
+    // whose GCC treats an unguarded VNNI intrinsic as a hard error rather
+    // than silently miscompiling).
+    acc_dp = _mm512_madd_epi16(_mm512_maddubs_epi16(v_w, v_x), ones_16);
+#endif
 
     __m512i sum_x = _mm512_maddubs_epi16(ones_8, v_x);
     sum_x = _mm512_madd_epi16(sum_x, ones_16);

@@ -763,6 +763,15 @@ public:
         }
         MoEExpertBlock& victim = layer_slots[victim_idx];
         int displaced = victim.expert_id;
+        // Measurement only (pilot_confirmed_set.hpp) -- see
+        // GpuTopology::evict_lru's identical check for the full
+        // explanation of what this counts and why. This D2H-salvage path
+        // is a RAM-tier victim selection exactly like get_expert's Step 3
+        // below, just triggered by an incoming VRAM eviction instead of a
+        // RAM-tier miss.
+        if (displaced != -1 && was_pilot_confirmed_resident(layer, displaced)) {
+            perf().n_evicted_was_pilot_confirmed_ram.fetch_add(1, std::memory_order_relaxed);
+        }
         // Erase the outgoing identity's index entry now -- this slot is
         // committed to being overwritten by `expert_id` from here on,
         // whether the D2H copy below ultimately succeeds or fails (see the
@@ -869,6 +878,11 @@ public:
                 }
                 if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts(engine);
                 perf().n_expert_cache_hit.fetch_add(1, std::memory_order_relaxed);
+                // Measurement only (expert_fetch_tracker.hpp) -- this is a
+                // genuine RAM-tier HIT, resolved WITHOUT ever calling
+                // consume_staged. Was this exact expert ALSO recently
+                // touched by the async prefetcher?
+                record_hit_if_recently_fetched(layer, expert_id, /*is_vram_tier=*/false);
 
                 if (verbose_cache_log) {
                     LOG_DEBUG("[MOE-CACHE] HIT   layer=%d expert=%d hit_count=%u\n",
@@ -1014,6 +1028,12 @@ public:
         MoEExpertBlock& victim = layer_slots[lru_idx];
         int evicted_expert_id = victim.expert_id;
         if (evicted_expert_id != -1) {
+            // Measurement only (pilot_confirmed_set.hpp) -- see
+            // GpuTopology::evict_lru's identical check for the full
+            // explanation of what this counts and why.
+            if (was_pilot_confirmed_resident(layer, evicted_expert_id)) {
+                perf().n_evicted_was_pilot_confirmed_ram.fetch_add(1, std::memory_order_relaxed);
+            }
             ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
             ram_expert_index.erase(swap_key(layer, evicted_expert_id));
         }
@@ -1075,8 +1095,18 @@ public:
                     if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
                     else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
                 } else if (!ok) {
-                    bool still_queued = prefetcher->has_pending_hint(layer, expert_id);
+                    double queued_ms = -1.0;
+                    bool still_queued = prefetcher->has_pending_hint(layer, expert_id, &queued_ms);
                     if (still_queued) perf().n_pipe_miss_still_queued.fetch_add(1, std::memory_order_relaxed);
+                    // Unconditional lateness accumulation (see
+                    // t_pipe_not_ready_elapsed_ms_sum's own comment,
+                    // perf_timer.hpp) -- always visible in the shutdown
+                    // report, not just when log_level=DEBUG.
+                    if (not_ready_ms >= 0.0) {
+                        PerfCounters::atomic_add(perf().t_pipe_not_ready_elapsed_ms_sum, not_ready_ms);
+                    } else if (still_queued) {
+                        PerfCounters::atomic_add(perf().t_pipe_still_queued_elapsed_ms_sum, queued_ms);
+                    }
                     // Diagnostic only (LOG_DEBUG, same verbosity tier as the
                     // adjacent [MOE-CACHE] MISS line below) -- directly
                     // answers "did the prefetcher arrive too late, and by
@@ -1087,13 +1117,14 @@ public:
                                                                : "no_trace";
                     LOG_DEBUG("[PIPE-MISS-TIMING] layer=%d expert=%d reason=%s elapsed_ms=%.1f est_remaining_ms=%.1f in_flight=%d\n",
                               layer, expert_id, reason,
-                              not_ready_ms >= 0.0 ? not_ready_ms : 0.0,
+                              not_ready_ms >= 0.0 ? not_ready_ms : queued_ms >= 0.0 ? queued_ms : 0.0,
                               not_ready_ms >= 0.0 ? std::max(0.0, prefetcher->avg_fetch_ms() - not_ready_ms) : 0.0,
                               prefetcher->n_fetches_in_flight.load(std::memory_order_relaxed));
                 }
             }
         }
         if (!served_from_pipe) {
+            trace_ram_load_if_recently_fetched(layer, expert_id, "single_miss_pread");
             engine.load_expert_slab(layer, expert_id, victim);
         }
         double load_ms = std::chrono::duration<double, std::milli>(
@@ -1158,7 +1189,18 @@ public:
         size_t cap = layer_slots.empty() ? 0
             : std::min(layer_slots.size(), (size_t)std::max(1, cap_for_layer(layer)));
 
-        struct PendingLoad { size_t slot_idx; int expert_id; int evicted_expert_id; int k; double load_ms; };
+        struct PendingLoad {
+            size_t slot_idx; int expert_id; int evicted_expert_id; int k; double load_ms;
+            // steady_now_us() at the exact moment THIS expert's own Phase A
+            // consume_staged check failed -- lets Phase B's trace_phase_gap_
+            // if_staged_after_check (expert_fetch_tracker.hpp) later prove,
+            // per-event, whether a StagedReady copy found at Phase-B time
+            // arrived DURING this Phase-A -> Phase-B gap (expected ordering
+            // cost) or existed before Phase A even checked (a genuine
+            // anomaly). See that function's own comment for the full
+            // reasoning.
+            uint64_t phase_a_check_at_us;
+        };
         std::vector<PendingLoad> pending;
         pending.reserve(topk);
         // Slots this batch has already claimed as a miss's victim -- an
@@ -1192,6 +1234,10 @@ public:
                     }
                     if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts(engine);
                     perf().n_expert_cache_hit.fetch_add(1, std::memory_order_relaxed);
+                    // Measurement only (expert_fetch_tracker.hpp) -- see
+                    // get_expert's Step 1 identical check for the full
+                    // explanation.
+                    record_hit_if_recently_fetched(layer, expert_id, /*is_vram_tier=*/false);
                     if (verbose_cache_log) {
                         LOG_DEBUG("[MOE-CACHE] HIT   layer=%d expert=%d hit_count=%u\n",
                                   layer, expert_id, slot.hit_count);
@@ -1330,6 +1376,12 @@ public:
             MoEExpertBlock& victim = layer_slots[lru_idx];
             int evicted_expert_id = victim.expert_id;
             if (evicted_expert_id != -1) {
+                // Measurement only (pilot_confirmed_set.hpp) -- see
+                // GpuTopology::evict_lru's identical check for the full
+                // explanation of what this counts and why.
+                if (was_pilot_confirmed_resident(layer, evicted_expert_id)) {
+                    perf().n_evicted_was_pilot_confirmed_ram.fetch_add(1, std::memory_order_relaxed);
+                }
                 ram_swap_stats[swap_key(layer, evicted_expert_id)].swap_out++;
                 ram_expert_index.erase(swap_key(layer, evicted_expert_id));
             }
@@ -1400,14 +1452,24 @@ public:
                         // expert and the hint is simply still sitting unpopped
                         // in the SPSC queue, vs no trace of it anywhere. See
                         // n_pipe_miss_still_queued's own comment.
-                        bool still_queued = prefetcher->has_pending_hint(layer, expert_id);
+                        double queued_ms = -1.0;
+                        bool still_queued = prefetcher->has_pending_hint(layer, expert_id, &queued_ms);
                         if (still_queued) perf().n_pipe_miss_still_queued.fetch_add(1, std::memory_order_relaxed);
+                        // Unconditional lateness accumulation (see
+                        // t_pipe_not_ready_elapsed_ms_sum's own comment,
+                        // perf_timer.hpp) -- always visible in the shutdown
+                        // report, not just when log_level=DEBUG.
+                        if (not_ready_ms >= 0.0) {
+                            PerfCounters::atomic_add(perf().t_pipe_not_ready_elapsed_ms_sum, not_ready_ms);
+                        } else if (still_queued) {
+                            PerfCounters::atomic_add(perf().t_pipe_still_queued_elapsed_ms_sum, queued_ms);
+                        }
                         const char* reason = not_ready_ms >= 0.0 ? "in_flight_not_ready"
                                             : still_queued        ? "still_queued"
                                                                    : "no_trace";
                         LOG_DEBUG("[PIPE-MISS-TIMING] layer=%d expert=%d reason=%s elapsed_ms=%.1f est_remaining_ms=%.1f in_flight=%d\n",
                                   layer, expert_id, reason,
-                                  not_ready_ms >= 0.0 ? not_ready_ms : 0.0,
+                                  not_ready_ms >= 0.0 ? not_ready_ms : queued_ms >= 0.0 ? queued_ms : 0.0,
                                   not_ready_ms >= 0.0 ? std::max(0.0, prefetcher->avg_fetch_ms() - not_ready_ms) : 0.0,
                                   prefetcher->n_fetches_in_flight.load(std::memory_order_relaxed));
                     }
@@ -1424,7 +1486,7 @@ public:
                           victim.slab_capacity / 1e6,
                           load_ms > 0 ? (victim.slab_capacity / 1e9) / (load_ms / 1000.0) : 0.0);
             } else {
-                pending.push_back({(size_t)lru_idx, expert_id, evicted_expert_id, k, 0.0});
+                pending.push_back({(size_t)lru_idx, expert_id, evicted_expert_id, k, 0.0, steady_now_us()});
             }
         }
 
@@ -1447,6 +1509,33 @@ public:
         // additional synchronization.
         int n_pending = (int)pending.size();
         if (n_pending > 0) {
+            // REVERTED: a pre-batch consume_staged filter pass used to run
+            // here (checking every pending expert again, right before the
+            // io_uring path builds its request list). Real-run evidence
+            // showed it was a net negative, not a fix:
+            //  1) Near-zero benefit -- 1-3 rescues out of ~9700-9800
+            //     attempts across two separate runs (~0.01-0.03%). The
+            //     ~9ms Phase-A/Phase-B gap this was meant to catch (see
+            //     trace_phase_gap_if_staged_after_check) happens DURING
+            //     io_uring's own submit_and_wait call, not in the brief
+            //     window between Phase A finishing and this filter running
+            //     -- so the filter was checking almost as early as Phase A
+            //     itself, missing the window entirely.
+            //  2) A real, confirmed regression: consume_staged increments
+            //     n_pipe_miss_no_match internally on every failed call.
+            //     Calling it a second time for the same expert (Phase A's
+            //     original check + this filter's re-check) double-counted
+            //     that shared counter for nearly every pending expert,
+            //     inflating the "Prefetch (PIPE) ... no matching staged
+            //     slot" report line to ~2.0x its correct value (confirmed
+            //     precisely across two runs: 19581/9810 and 19480/9760,
+            //     both ~1.996x -- vs a clean ~1.00x ratio on the pre-fix
+            //     baseline run).
+            // The OMP-parallel fallback's OWN per-item recheck (below)
+            // shares this same structural risk in principle, but is
+            // currently inert on this system (Decode-thread io_uring
+            // batches: 100% every run observed) and was left in place
+            // pending a separate decision.
             bool uring_ok = false;
             // Root-cause-attributed outcome of THIS batch's uring attempt --
             // see perf_timer.hpp's n_decode_uring_* comment for why this was
@@ -1703,6 +1792,7 @@ public:
                                     size_t gb, ub, db;
                                     const GGUFTensor *gM, *uM, *dM;
                                     engine.expert_layer_geometry(layer, gb, ub, db, gM, uM, dM);
+                                    trace_ram_load_if_recently_fetched(layer, pad_ids[p], "disk_batch_padding");
                                     engine.populate_packed_slab(pv, pad_ids[p], gb, ub, db, *gM, *uM, *dM);
                                     pad_bytes += gb + ub + db;
                                     perf().n_pad_reads_ok.fetch_add(1, std::memory_order_relaxed);
@@ -1726,6 +1816,8 @@ public:
                             const GGUFTensor *gM, *uM, *dM;
                             engine.expert_layer_geometry(layer, gb, ub, db, gM, uM, dM);
                             MoEExpertBlock& victim = layer_slots[pending[i].slot_idx];
+                            trace_ram_load_if_recently_fetched(layer, pending[i].expert_id, "batch_miss_io_uring");
+                            trace_phase_gap_if_staged_after_check(layer, pending[i].expert_id, pending[i].phase_a_check_at_us);
                             engine.populate_packed_slab(victim, pending[i].expert_id, gb, ub, db, *gM, *uM, *dM);
                             pending[i].load_ms = batch_ms; // shared batch time; per-expert split isn't meaningful here
                             total_bytes += gb + ub + db;
@@ -1747,8 +1839,56 @@ public:
                 for (int i = 0; i < n_pending; ++i) {
                     PendingLoad& pl = pending[i];
                     MoEExpertBlock& victim = layer_slots[pl.slot_idx];
+                    // Safe to call from multiple OMP threads concurrently:
+                    // expert_fetch_tracker's query is lock-free atomics,
+                    // and Logger (LOG_DEBUG) holds its own internal mutex.
+                    trace_ram_load_if_recently_fetched(layer, pl.expert_id, "batch_miss_pread");
+                    trace_phase_gap_if_staged_after_check(layer, pl.expert_id, pl.phase_a_check_at_us);
+
+                    // THE FIX for the Phase-A/Phase-B gap the two traces
+                    // above measure: Phase A's consume_staged check for
+                    // this expert is now stale by construction (real time
+                    // has passed -- see phase_a_check_at_us) -- a real run
+                    // showed 97.8% of the time a staged copy is found
+                    // AFTER that check, not before, with an avg 9.38ms
+                    // gap. Retry consume_staged ONE more time, right here,
+                    // immediately before the synchronous read it would
+                    // otherwise unconditionally pay for -- consume_staged
+                    // itself is cheap (a bounded staging_mutex scan, no
+                    // disk I/O) relative to the ~11ms disk read it can
+                    // avoid entirely on a hit. Mirrors get_expert Step 3 /
+                    // get_experts_batch Phase A's own consume_staged
+                    // pattern exactly (same geometry lookup, same
+                    // populate_packed_slab call), just gated the same way
+                    // (prefetcher present, packed format) and placed at
+                    // the LAST possible moment before the real read.
                     auto t0 = std::chrono::high_resolution_clock::now();
-                    engine.load_expert_slab(layer, pl.expert_id, victim);
+                    bool rescued = false;
+                    if (prefetcher && !engine.unpacked_expert_format) {
+                        size_t gb, ub, db;
+                        const GGUFTensor *gM, *uM, *dM;
+                        if (engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
+                            size_t total = gb + ub + db;
+                            engine.ensure_slab_capacity(victim, total);
+                            size_t got_bytes = 0;
+                            double not_ready_ms = -1.0;
+                            perf().n_phase_b_recheck_attempts.fetch_add(1, std::memory_order_relaxed);
+                            bool ok = prefetcher->consume_staged(layer, pl.expert_id, victim.slab_buffer,
+                                                                  victim.slab_capacity, &got_bytes, &not_ready_ms);
+                            if (ok && got_bytes == total) {
+                                engine.populate_packed_slab(victim, pl.expert_id, gb, ub, db, *gM, *uM, *dM);
+                                victim.from_pipe_prefetch = true;
+                                rescued = true;
+                                perf().n_phase_b_recheck_hits.fetch_add(1, std::memory_order_relaxed);
+                                perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
+                                if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
+                                else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                    if (!rescued) {
+                        engine.load_expert_slab(layer, pl.expert_id, victim);
+                    }
                     pl.load_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t0).count();
                 }
@@ -1759,9 +1899,14 @@ public:
                     PendingLoad& pl = pending[i];
                     MoEExpertBlock& victim = layer_slots[pl.slot_idx];
                     ram_swap_stats[swap_key(layer, pl.expert_id)].swap_in++;
-                    LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%zu evicted=%d loaded_from_disk=%.2fms via=pread "
+                    // from_pipe_prefetch was reset false at this slot's
+                    // Phase-A claim time and only ever set true by THIS
+                    // expert's own rescue above, so it's a safe, correct
+                    // signal here for which path actually served it.
+                    LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%zu evicted=%d loaded_from_disk=%.2fms via=%s "
                               "(%.2f MB, %.2f GB/s) [batch=%d/%d]\n",
                               layer, pl.expert_id, pl.slot_idx, pl.evicted_expert_id, pl.load_ms,
+                              victim.from_pipe_prefetch ? "PIPE(phase_b_recheck)" : "pread",
                               victim.slab_capacity / 1e6,
                               pl.load_ms > 0 ? (victim.slab_capacity / 1e9) / (pl.load_ms / 1000.0) : 0.0,
                               i + 1, n_pending);

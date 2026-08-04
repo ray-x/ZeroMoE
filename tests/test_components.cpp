@@ -4,6 +4,7 @@
 #include "direct_io.hpp" // the REAL O_DIRECT alignment-window arithmetic (no CUDA deps)
 #include "kernels_cpu.hpp" // CPU kernel backend (AVX-512 or NEON, selected by build script)
 #include "rope.hpp" // the REAL, unit-tested RoPE (no CUDA / no AVX-512 deps)
+#include "route_usage.hpp" // CUDA-free routing histogram used by CPU and GPU paths
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -1672,6 +1673,36 @@ void test_cpu_matmul_f32() {
   std::cout << " PASSED\n";
 }
 
+void test_cpu_matmul_f32_large() {
+  std::cout << "[TEST] CPU f32 matmul (large, exercises Metal if enabled)..."
+            << std::flush;
+  // Size above the 256 KFLOP Metal threshold so a Metal-enabled build
+  // actually exercises the MPS path.  On non-Metal builds this just runs
+  // the NEON/scalar fallback.
+  const int S = 64, I = 256, O = 256;
+  std::vector<float> x(static_cast<size_t>(S) * I);
+  std::vector<float> W(static_cast<size_t>(O) * I);
+  std::vector<float> y(static_cast<size_t>(S) * O, 0.0f);
+  for (size_t i = 0; i < x.size(); ++i)
+    x[i] = static_cast<float>((i * 17 + 3) % 100) * 0.01f;
+  for (size_t i = 0; i < W.size(); ++i)
+    W[i] = static_cast<float>((i * 31 + 7) % 100) * 0.01f;
+
+  matmul(y.data(), x.data(), W.data(), S, I, O);
+
+  // Reference computation using the same convention as matmul:
+  // y[s,o] = sum_i x[s,i] * W[o,i]
+  for (int s = 0; s < S; ++s) {
+    for (int o = 0; o < O; ++o) {
+      double acc = 0.0;
+      for (int i = 0; i < I; ++i)
+        acc += static_cast<double>(x[s * I + i]) * W[o * I + i];
+      assert(std::fabs(y[s * O + o] - static_cast<float>(acc)) < 1e-3f);
+    }
+  }
+  std::cout << " PASSED\n";
+}
+
 void test_cpu_dot_f32() {
   std::cout << "[TEST] CPU f32 dot product..." << std::flush;
   const float a[8] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
@@ -1721,6 +1752,59 @@ void test_cpu_elem_mul() {
   std::cout << " PASSED\n";
 }
 
+// ============================================================
+// Test: RouteUsage histogram (CUDA-free pin-file component)
+// ============================================================
+void test_route_usage() {
+  std::cout << "[TEST] RouteUsage histogram load/bump/dump/pin_set..."
+            << std::flush;
+
+  RouteUsage usage;
+  usage.bump(0, 5);
+  usage.bump(0, 5);
+  usage.bump(0, 7);
+  usage.bump(1, 3);
+  usage.bump(1, 3);
+  usage.bump(1, 3);
+  usage.bump(1, 9);
+
+  // topk_for_layer returns experts sorted by count desc.
+  auto top0 = usage.topk_for_layer(0, 2);
+  assert(top0.size() == 2u);
+  assert(top0[0] == 5);
+  assert(top0[1] == 7);
+
+  auto top1 = usage.topk_for_layer(1, 1);
+  assert(top1.size() == 1u);
+  assert(top1[0] == 3);
+
+  // pin_set: threshold=2, topk=1 -> layer0 expert5, layer1 expert3.
+  auto pins = usage.pin_set(1, 2);
+  assert(pins.size() == 2u);
+  assert(pins.count((0ull << 32) | 5u) == 1u);
+  assert(pins.count((1ull << 32) | 3u) == 1u);
+
+  // Dump/load round-trip with merge.
+  std::string tmp = "/tmp/moestream_test_usage.txt";
+  assert(usage.dump(tmp));
+
+  RouteUsage loaded;
+  assert(loaded.load(tmp));
+  loaded.bump(0, 5);     // merge with existing count
+  loaded.bump(2, 1, 10); // merge explicit delta
+
+  auto top0_reload = loaded.topk_for_layer(0, 1);
+  assert(top0_reload.size() == 1u);
+  assert(top0_reload[0] == 5); // 2+1 = 3, still top
+
+  auto top2 = loaded.topk_for_layer(2, 1);
+  assert(top2.size() == 1u);
+  assert(top2[0] == 1);
+
+  std::remove(tmp.c_str());
+  std::cout << " PASSED\n";
+}
+
 // Optional substring filtering via argv, so a subset can be exercised without
 // recompiling -- the workflow this file exists for: run the CPU-only
 // component tests on a box where the full CUDA harness (main_test.cpp) can't
@@ -1754,10 +1838,12 @@ int main(int argc, char **argv) {
       {"expert_vram_index", test_expert_vram_index_logic},
       {"direct_io_aligned_window", test_direct_io_aligned_window_logic},
       {"cpu_matmul_f32", test_cpu_matmul_f32},
+      {"cpu_matmul_f32_large", test_cpu_matmul_f32_large},
       {"cpu_dot_f32", test_cpu_dot_f32},
       {"cpu_rmsnorm", test_cpu_rmsnorm},
       {"cpu_silu", test_cpu_silu},
       {"cpu_elem_mul", test_cpu_elem_mul},
+      {"route_usage", test_route_usage},
   };
   const bool filtered = argc > 1;
   auto matches = [&](const char *name) {

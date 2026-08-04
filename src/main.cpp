@@ -225,6 +225,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     if (!config.cpu_affinity_layers.empty()) {
         set_cpu_affinity_layers(config.cpu_affinity_layers, engine.model_file.architecture_config.n_layers);
     }
+    // Same set-once-before-any-dispatch timing as cpu_affinity_layers above
+    // -- execution_layer.cpp's pilot loop reads pilot_k_for_layer() on
+    // every layer transition starting with the very first prefill token.
+    set_prefetch_pilot_k(config.prefetch_pilot_k_per_layer, config.prefetch_pilot_k);
 
     // unpacked_expert_format is an explicit performance contract (single
     // combined DMA per expert) -- validate it holds for the WHOLE model
@@ -1213,6 +1217,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     ram_mgr.report_slot_summary(engine);
     gpu.topology.report_slot_summary();
     ram_mgr.report_tier_map(engine);
+    prefetcher.log_per_layer_report();  // [PREFETCH-LAYER]: per-layer prefetch hint/fetch/outcome breakdown
     report_named_timers();  // attn_q_a/attn_q_b/attn_kv_a_mqa fast-path investigation, see CLAUDE.md
 
     double session_elapsed_s = std::chrono::duration<double>(

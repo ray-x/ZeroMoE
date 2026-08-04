@@ -13,12 +13,14 @@
 #include "kernels_cpu.hpp"        // matmul
 #include "kquant_dequant.hpp"     // cpu_quant_matmul (CPU fallback)
 #include "logger.hpp"
+#include "pilot_confirmed_set.hpp"  // publish_pilot_confirmed_resident -- execution_layer.cpp's pilot loop writes here
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <mutex>
 
 // Diagnostic kill-switch: forces every dense matmul, norm, and expert FFN onto
 // the CPU reference path (libggml dequant + f32 matmul), bypassing ALL GPU
@@ -66,6 +68,33 @@ inline void set_cpu_affinity_layers(const std::vector<int>& layers, int n_layers
 inline bool is_cpu_affinity_layer(int layer_idx) {
     const auto& v = cpu_affinity_layer_flags();
     return layer_idx >= 0 && layer_idx < (int)v.size() && v[(size_t)layer_idx];
+}
+
+// Per-layer override for the pilot router's prefetch hint count
+// (EngineConfig::prefetch_pilot_k / prefetch_pilot_k_per_layer). Same
+// set-once-at-startup, read-from-multiple-threads-without-locking idiom as
+// cpu_affinity_layer_flags() above (set_prefetch_pilot_k, main.cpp; read
+// from execution_layer.cpp's pilot loop, decode thread only in practice but
+// no different in principle from the cpu_affinity flags' own read pattern).
+// A missing or negative per-layer entry means "no override for this
+// layer" -- falls back to the global default, not to 0 -- distinguishing
+// "not configured" from "the user explicitly asked for 0 hints here".
+inline std::vector<int>& pilot_k_per_layer_overrides() {
+    static std::vector<int> v;
+    return v;
+}
+inline int& pilot_k_default_value() {
+    static int v = 8;
+    return v;
+}
+inline void set_prefetch_pilot_k(const std::vector<int>& per_layer, int default_k) {
+    pilot_k_per_layer_overrides() = per_layer;
+    pilot_k_default_value() = default_k;
+}
+inline int pilot_k_for_layer(int layer_idx) {
+    const auto& v = pilot_k_per_layer_overrides();
+    if (layer_idx >= 0 && layer_idx < (int)v.size() && v[(size_t)layer_idx] >= 0) return v[(size_t)layer_idx];
+    return pilot_k_default_value();
 }
 
 inline void dense_proj(StreamingEngine& engine, const std::string& wname,

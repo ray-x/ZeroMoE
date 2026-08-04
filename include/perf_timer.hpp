@@ -304,6 +304,129 @@ struct PerfCounters {
     std::atomic<uint64_t> n_pilot_pred_already_vram_pinned{0};
     std::atomic<uint64_t> n_pilot_pred_already_vram_lru{0};
     std::atomic<uint64_t> n_pilot_pred_needs_fetch{0};
+
+    // Measurement for the "evict what the pilot just confirmed is safe"
+    // race (dense_dispatch.hpp's was_pilot_confirmed_resident). Nonzero
+    // here is direct evidence eviction_score()'s pure recency+frequency
+    // scoring is undoing the pilot's own already-cached determination --
+    // the expert was correctly judged safe moments ago, then evicted by
+    // ordinary LRU pressure before its real dispatch ever consumed it,
+    // forcing exactly the synchronous re-read the pilot's skip-fetch
+    // decision assumed wouldn't be needed. Split by tier since VRAM
+    // eviction with vram_evict_demote_to_ram=on is cheaper (salvaged into
+    // RAM, not necessarily a disk re-read) than a genuine RAM-tier
+    // eviction (which always means a real disk read next time).
+    std::atomic<uint64_t> n_evicted_was_pilot_confirmed_vram{0};
+    std::atomic<uint64_t> n_evicted_was_pilot_confirmed_ram{0};
+
+    // Measurement for a DIFFERENT question than the pilot-confirm-evict
+    // pair above: when a real dispatch resolves an expert via an
+    // INDEPENDENT cache hit -- RAM-tier LRU (ram_manager.hpp's get_expert/
+    // get_experts_batch Step 1/Phase A) or the VRAM shadow-fast-path
+    // (execution_layer.cpp) -- BYPASSING consume_staged entirely, had that
+    // exact (layer,expert) ALSO been recently touched by the async
+    // prefetcher (expert_fetch_tracker.hpp)? Split by which cache tier won
+    // the race AND by what state the prefetch was caught in:
+    //   *_had_staged_fetch  -- the CLEANEST signal: the fetch had fully
+    //     SUCCEEDED and was still sitting ready, unconsumed, in staging --
+    //     pure redundancy, nothing to do with pool size or timing, an
+    //     entirely independent cache hit just resolved the dispatch first.
+    //   *_had_inflight_fetch -- a worker was still actively reading this
+    //     expert's bytes when the independent hit resolved the dispatch;
+    //     the fetch (once it finishes) will be wasted the same way.
+    //   *_had_evicted_fetch -- the fetch had ALREADY been evicted from
+    //     staging by the time this hit happened -- both mechanisms
+    //     (pool churn AND cache-path redundancy) compounded on this one.
+    // This is the direct answer to "of the ~98% of correct predictions
+    // that go unused, how much is explained by an independent cache hit
+    // beating the prefetcher to the dispatch" -- see CLAUDE.md/session
+    // history for the investigation this closes.
+    std::atomic<uint64_t> n_vram_hit_had_inflight_fetch{0};
+    std::atomic<uint64_t> n_vram_hit_had_staged_fetch{0};
+    std::atomic<uint64_t> n_vram_hit_had_evicted_fetch{0};
+    std::atomic<uint64_t> n_ram_hit_had_inflight_fetch{0};
+    std::atomic<uint64_t> n_ram_hit_had_staged_fetch{0};
+    std::atomic<uint64_t> n_ram_hit_had_evicted_fetch{0};
+
+    // trace_ram_load_if_recently_fetched (expert_fetch_tracker.hpp) --
+    // fires at a GENUINE cache-MISS disk-read site (single-expert pread,
+    // batch io_uring, batch OMP pread fallback, disk-batch-padding), NOT
+    // a cache hit. Answers a different question than the n_*_hit_had_*
+    // pairs above: is THIS SPECIFIC disk read duplicating work the
+    // prefetcher also did/is doing for the exact same expert. _inflight
+    // is the most direct "concurrent duplicate I/O" signal (a worker is
+    // reading the same bytes RIGHT NOW); _staged means consume_staged was
+    // just tried and failed even though a ready copy existed (should be
+    // rare -- worth investigating if this is ever meaningfully nonzero);
+    // _evicted/_consumed mean an EARLIER, now-resolved prefetch touched
+    // this same expert, and it's cold again regardless. See the
+    // [RAM-LOAD-VS-PREFETCH] LOG_DEBUG trace for the per-event detail
+    // (exact trigger, layer, expert, timing) these counters summarize.
+    std::atomic<uint64_t> n_ram_load_had_prefetch_inflight{0};
+    std::atomic<uint64_t> n_ram_load_had_prefetch_staged{0};
+    std::atomic<uint64_t> n_ram_load_had_prefetch_evicted{0};
+    std::atomic<uint64_t> n_ram_load_had_prefetch_consumed{0};
+
+    // trace_phase_gap_if_staged_after_check (expert_fetch_tracker.hpp) --
+    // precise resolution of WHY n_ram_load_had_prefetch_staged (above) is
+    // so large: does the prefetcher finish staging a batch-pending expert
+    // DURING the real gap between get_experts_batch's Phase A (checks
+    // consume_staged for the whole batch) and Phase B (does the actual
+    // reads for whatever Phase A couldn't serve) -- the expected,
+    // benign-but-costly ordering mechanism -- or was the expert already
+    // staged BEFORE Phase A's own check ran, meaning consume_staged
+    // failed for some genuinely different reason (an anomaly, NOT this
+    // mechanism)? n_phase_gap_staged_after_check large relative to
+    // n_phase_gap_staged_before_check_anomaly confirms the former;
+    // t_phase_gap_ms_sum / n_phase_gap_staged_after_check gives the
+    // average size of that gap in milliseconds.
+    std::atomic<uint64_t> n_phase_gap_staged_after_check{0};
+    std::atomic<uint64_t> n_phase_gap_staged_before_check_anomaly{0};
+    std::atomic<double> t_phase_gap_ms_sum{0};
+
+    // The actual FIX for the Phase-A/Phase-B gap measured above: the OMP-
+    // parallel pread fallback in RAMSafetyManager::get_experts_batch now
+    // retries consume_staged ONE more time, immediately before its own
+    // synchronous load_expert_slab call, instead of trusting only Phase
+    // A's earlier one-time check. n_phase_b_recheck_attempts is the
+    // denominator (every pending expert this fallback path processes);
+    // n_phase_b_recheck_hits is how many of those were rescued by the
+    // second check -- avoiding a real disk read entirely. A rescue also
+    // feeds the EXISTING n_pipe_hits/n_pipe_hits_prefill/n_pipe_hits_decode
+    // counters (it genuinely IS a PIPE hit, just discovered later), so
+    // the "Prefetch (PIPE) served" report line directly reflects this
+    // fix's real effect on overall utilization, not just a side stat.
+    std::atomic<uint64_t> n_phase_b_recheck_attempts{0};
+    std::atomic<uint64_t> n_phase_b_recheck_hits{0};
+    // Elapsed time (microseconds) sums for the *_had_staged_fetch buckets
+    // specifically -- how long the fetch had been sitting ready before an
+    // independent hit beat it to the dispatch. (in-flight/evicted buckets
+    // don't need this to answer the core question, kept lean.)
+    std::atomic<double> t_vram_hit_staged_fetch_elapsed_us_sum{0};
+    std::atomic<double> t_ram_hit_staged_fetch_elapsed_us_sum{0};
+
+    // Hypothesis test (expert_fetch_tracker.hpp's current_token_step): of
+    // the n_{vram,ram}_hit_had_{staged,evicted}_fetch events above, how
+    // many happened during the SAME token's own forward pass as the fetch
+    // that produced them (step_delta==0, consistent with a genuine
+    // same-transition race) vs a LATER, unrelated token's hit
+    // rediscovering an EARLIER token's now-stale, never-consumed fetch
+    // record (step_delta>0)? The *_same_step counters are subsets of the
+    // corresponding n_*_hit_had_*_fetch totals above; the
+    // *_step_delta_sum values (divided by the relevant total count) give
+    // the average number of token-steps back a match was found, across
+    // ALL matches (not just the same-step subset) -- large values here
+    // directly confirm the "stale record" hypothesis, near-zero values
+    // would instead confirm a same-transition race.
+    std::atomic<uint64_t> n_vram_staged_fetch_same_step{0};
+    std::atomic<uint64_t> n_vram_evicted_fetch_same_step{0};
+    std::atomic<uint64_t> n_ram_staged_fetch_same_step{0};
+    std::atomic<uint64_t> n_ram_evicted_fetch_same_step{0};
+    std::atomic<double> t_vram_staged_fetch_step_delta_sum{0};
+    std::atomic<double> t_ram_staged_fetch_step_delta_sum{0};
+    std::atomic<double> t_vram_evicted_fetch_step_delta_sum{0};
+    std::atomic<double> t_ram_evicted_fetch_step_delta_sum{0};
+
     std::atomic<uint64_t> n_pilot_recall_hint_hits{0};        // of the needs_fetch subset, how many matched the real router's later choice
     std::atomic<uint64_t> n_pilot_recall_hint_checks_denom{0}; // denominator for the above (sum of needs_fetch picks actually checked against a real routing decision)
 
@@ -336,6 +459,48 @@ struct PerfCounters {
     // guessing) can determine which fix actually applies:
     std::atomic<uint64_t> n_pipe_miss_no_match{0};    // consume_staged found NO staging slot at all for this (layer,expert) -- either the pilot never predicted this exact expert, or it did but the slot was already round-robin-recycled for a later hint before this miss arrived. Points at PREDICTION ACCURACY / staging POOL SIZE as the lever, not raw read speed.
     std::atomic<uint64_t> n_pipe_miss_not_ready{0};    // consume_staged found a matching (layer,expert) slot but its pread hadn't finished yet -- the pilot's prediction was CORRECT, this was purely a timing loss. Points at making the staged read start earlier / finish faster (or growing prefetch_staging_slots so more predictions survive the wait) as the lever, not prediction accuracy.
+    // Unconditional (not log-level-gated, unlike the per-miss
+    // [PIPE-MISS-TIMING] LOG_DEBUG line these mirror) sums so "how late,
+    // on average" is always visible in the shutdown report even at
+    // log_level=INFO -- answers "how many times did the decode thread have
+    // to fall back and re-read the expert itself because the prefetcher
+    // wasn't fast enough" and by how much, without needing full DEBUG
+    // logging (thousands of lines/run) just to see the aggregate picture.
+    std::atomic<double> t_pipe_not_ready_elapsed_ms_sum{0};   // sum, over n_pipe_miss_not_ready events, of how long the in-flight read had already been running when the miss needed it (not_ready_ms, ram_manager.hpp)
+    std::atomic<double> t_pipe_still_queued_elapsed_ms_sum{0}; // sum, over n_pipe_miss_still_queued events, of how long the hint had been sitting in the queue, un-started by any worker, when the miss needed it
+
+    // acquire_staging_slot (async_prefetcher.hpp) prefers reclaiming a
+    // PROVABLY stale slot over blind round-robin write order, so a
+    // genuinely still-useful staged hint doesn't get evicted just because
+    // the write pointer happened to land on it first. "Provably stale" is
+    // now the OR of two independent signals (see acquire_staging_slot's
+    // own comment for the full reasoning):
+    //   1. layer_idx < current_decode_layer -- dead within THIS token.
+    //   2. expert_fetch_tracker step_delta > 0 -- dead across a token
+    //      boundary (signal 1 alone MISSED this routinely: a prior run's
+    //      diagnostic found 62% of round-robin-fallback events had
+    //      genuinely-dead-by-token-step capacity -- avg 71.7 of 128 slots
+    //      -- sitting in the pool that signal 1 couldn't see, because
+    //      current_decode_layer resets to ~first_dense every new token).
+    // n_staging_stale_reclaimed is the TOTAL successful reclaims via
+    // EITHER signal; n_staging_cross_token_stale_reclaimed is the subset
+    // that specifically NEEDED signal 2 (signal 1 alone would have missed
+    // them) -- a nonzero, ideally large fraction of the total here is
+    // direct confirmation the fix is engaging and closing the gap signal
+    // 1 alone left open. Zero for BOTH counters would mean the scan never
+    // finds a stale candidate by any measure, worth checking
+    // advance_to_layer/advance_token_step are actually being called
+    // (moe_forward_gguf, execution_layer.cpp).
+    std::atomic<uint64_t> n_staging_stale_reclaimed{0};
+    std::atomic<uint64_t> n_staging_cross_token_stale_reclaimed{0};
+
+    // How often BOTH staleness signals above fail for every slot in the
+    // pool, forcing a genuine blind-round-robin pick. Expected to be rare
+    // (analogous to the pre-fix "fallback" rate, ~3.4% of acquisitions in
+    // one real run) and, unlike before the fix, should now mean the pool
+    // genuinely has no dead capacity at that moment by EITHER measure --
+    // not just an artifact of one signal's own blind spot.
+    std::atomic<uint64_t> n_staging_fallback_events{0};
 
     // Added when finish_prefetch's unconditional, unconfirmed VRAM
     // promotion (async_prefetcher.hpp) was removed -- that call used to
@@ -1094,6 +1259,28 @@ struct PerfCounters {
                          (unsigned long)still_queued, (unsigned long)no_match,
                          (unsigned long)(no_match - std::min(no_match, still_queued)));
             }
+            // Directly answers "how many times did the prefetcher have a
+            // hint in flight for this exact expert, yet the decode thread
+            // still had to fall back and re-read the expert itself because
+            // it wasn't fast enough" -- and by how much. no_trace (the
+            // remainder of no_match above) is a DIFFERENT failure mode
+            // (misprediction, or a correct prediction already evicted
+            // unused -- see [PREFETCH-LAYER]'s staged-slot lifetime) and is
+            // NOT lateness: there was nothing running to be "too slow".
+            uint64_t not_ready = n_pipe_miss_not_ready.load();
+            uint64_t late_total = not_ready + still_queued;
+            if (late_total > 0) {
+                double not_ready_avg = not_ready > 0
+                    ? t_pipe_not_ready_elapsed_ms_sum.load() / (double)not_ready : 0.0;
+                double still_queued_avg = still_queued > 0
+                    ? t_pipe_still_queued_elapsed_ms_sum.load() / (double)still_queued : 0.0;
+                LOG_INFO("  Prefetch lateness: %lu genuinely too slow (decode had to re-read the expert itself "
+                         "despite a hint already in progress) -- %lu in-flight-but-unfinished (avg %.1fms already "
+                         "spent reading when the miss arrived) + %lu still-queued-unstarted (avg %.1fms sitting "
+                         "in queue, no worker had even begun the read yet)\n",
+                         (unsigned long)late_total, (unsigned long)not_ready, not_ready_avg,
+                         (unsigned long)still_queued, still_queued_avg);
+            }
         }
         LOG_INFO("Pilot hints skipped: %lu (already host-cache-resident -- avoided wasting prefetch bandwidth)\n",
                  (unsigned long)n_pilot_hints_skipped.load());
@@ -1313,6 +1500,142 @@ struct PerfCounters {
                  "despite a recall/served gap points elsewhere, e.g. the expert became a cache hit via "
                  "another path before ever reaching the miss check)\n",
                  (unsigned long)n_staged_evicted_unused.load());
+        {
+            uint64_t evicted = n_staged_evicted_unused.load();
+            uint64_t stale_reclaimed = n_staging_stale_reclaimed.load();
+            uint64_t cross_token = n_staging_cross_token_stale_reclaimed.load();
+            uint64_t fb_events = n_staging_fallback_events.load();
+            LOG_INFO("Stale-slot reclaim:  %lu/%lu (%.1f%%) evictions targeted a PROVABLY dead slot "
+                     "instead of blind round-robin write order -- %lu of those (%.1f%% of stale "
+                     "reclaims) specifically NEEDED the cross-token signal (expert_fetch_tracker "
+                     "step_delta>0, i.e. dead since an EARLIER token) because the same-token layer-"
+                     "cursor signal alone (layer_idx < current_decode_layer) missed them -- this is the "
+                     "fix for the token-wraparound gap a prior diagnostic quantified (62%% of fallback "
+                     "events had genuinely-dead capacity the layer-only check couldn't see). %lu genuine "
+                     "round-robin fallbacks remain (both signals failed for every slot -- expected to be "
+                     "rare and, unlike before the fix, should mean no dead capacity existed at all, not "
+                     "just a blind spot).\n",
+                     (unsigned long)stale_reclaimed, (unsigned long)evicted,
+                     evicted > 0 ? 100.0 * stale_reclaimed / evicted : 0.0,
+                     (unsigned long)cross_token,
+                     stale_reclaimed > 0 ? 100.0 * cross_token / stale_reclaimed : 0.0,
+                     (unsigned long)fb_events);
+        }
+        {
+            uint64_t vram_race = n_evicted_was_pilot_confirmed_vram.load();
+            uint64_t ram_race = n_evicted_was_pilot_confirmed_ram.load();
+            LOG_INFO("Pilot-confirm evict: %lu VRAM / %lu RAM -- experts the pilot's most recent skip-fetch "
+                     "decision had JUST confirmed already-resident (RAM or VRAM-unpinned), then ordinary LRU "
+                     "eviction picked as a victim anyway before decode's real dispatch reached them (see "
+                     "was_pilot_confirmed_resident, pilot_confirmed_set.hpp). Nonzero here is direct evidence "
+                     "eviction_score()'s pure recency+frequency scoring undoes the pilot's own already-cached "
+                     "determination, forcing a synchronous re-read the pilot assumed wouldn't be needed -- "
+                     "measurement only, does not yet change eviction behavior.\n",
+                     (unsigned long)vram_race, (unsigned long)ram_race);
+        }
+        {
+            uint64_t v_if = n_vram_hit_had_inflight_fetch.load(), v_st = n_vram_hit_had_staged_fetch.load();
+            uint64_t v_ev = n_vram_hit_had_evicted_fetch.load();
+            uint64_t r_if = n_ram_hit_had_inflight_fetch.load(), r_st = n_ram_hit_had_staged_fetch.load();
+            uint64_t r_ev = n_ram_hit_had_evicted_fetch.load();
+            uint64_t total = v_if + v_st + v_ev + r_if + r_st + r_ev;
+            if (total > 0) {
+                double v_st_avg_ms = v_st > 0 ? t_vram_hit_staged_fetch_elapsed_us_sum.load() / 1000.0 / (double)v_st : 0.0;
+                double r_st_avg_ms = r_st > 0 ? t_ram_hit_staged_fetch_elapsed_us_sum.load() / 1000.0 / (double)r_st : 0.0;
+                LOG_INFO("Cache-hit-beat-fetch: %lu total -- of every INDEPENDENT cache hit (bypassed "
+                         "consume_staged entirely) whose expert had ALSO been recently touched by the "
+                         "prefetcher: VRAM tier: %lu in-flight / %lu still-staged-unconsumed (avg %.1fms old, "
+                         "the CLEANEST redundancy signal -- the fetch fully succeeded and was still sitting "
+                         "there) / %lu already-evicted | RAM tier: %lu in-flight / %lu still-staged-unconsumed "
+                         "(avg %.1fms old) / %lu already-evicted -- this is the direct measurement of why "
+                         "correctly-predicted fetches go unused: an independent cache hit resolved the "
+                         "dispatch before the prefetched copy was ever consulted.\n",
+                         (unsigned long)total, (unsigned long)v_if, (unsigned long)v_st, v_st_avg_ms,
+                         (unsigned long)v_ev, (unsigned long)r_if, (unsigned long)r_st, r_st_avg_ms,
+                         (unsigned long)r_ev);
+
+                // Hypothesis test: was the above a SAME-TOKEN race, or an
+                // earlier token's abandoned fetch being rediscovered by a
+                // later, unrelated token's own hit? step_delta==0 across
+                // (nearly) all matches would mean same-token race; a large
+                // average step_delta with same_step near 0 would confirm
+                // the stale-record hypothesis instead.
+                uint64_t v_st_same = n_vram_staged_fetch_same_step.load(), v_ev_same = n_vram_evicted_fetch_same_step.load();
+                uint64_t r_st_same = n_ram_staged_fetch_same_step.load(), r_ev_same = n_ram_evicted_fetch_same_step.load();
+                double v_st_step_avg = v_st > 0 ? t_vram_staged_fetch_step_delta_sum.load() / (double)v_st : 0.0;
+                double v_ev_step_avg = v_ev > 0 ? t_vram_evicted_fetch_step_delta_sum.load() / (double)v_ev : 0.0;
+                double r_st_step_avg = r_st > 0 ? t_ram_staged_fetch_step_delta_sum.load() / (double)r_st : 0.0;
+                double r_ev_step_avg = r_ev > 0 ? t_ram_evicted_fetch_step_delta_sum.load() / (double)r_ev : 0.0;
+                LOG_INFO("Cache-hit-beat-fetch token-step test: same-token-step (race within one layer "
+                         "transition) vs cross-token-step (an earlier token's fetch, never consumed, "
+                         "rediscovered later by an unrelated token's own hit) -- VRAM staged: %lu/%lu "
+                         "same-step, avg %.1f steps back | VRAM evicted: %lu/%lu same-step, avg %.1f steps "
+                         "back | RAM staged: %lu/%lu same-step, avg %.1f steps back | RAM evicted: %lu/%lu "
+                         "same-step, avg %.1f steps back -- near-zero same-step counts + large avg steps-back "
+                         "confirms the stale-record hypothesis; same-step counts close to the total would "
+                         "instead mean a genuine same-transition race.\n",
+                         (unsigned long)v_st_same, (unsigned long)v_st, v_st_step_avg,
+                         (unsigned long)v_ev_same, (unsigned long)v_ev, v_ev_step_avg,
+                         (unsigned long)r_st_same, (unsigned long)r_st, r_st_step_avg,
+                         (unsigned long)r_ev_same, (unsigned long)r_ev, r_ev_step_avg);
+            }
+        }
+        {
+            uint64_t rl_if = n_ram_load_had_prefetch_inflight.load();
+            uint64_t rl_st = n_ram_load_had_prefetch_staged.load();
+            uint64_t rl_ev = n_ram_load_had_prefetch_evicted.load();
+            uint64_t rl_co = n_ram_load_had_prefetch_consumed.load();
+            uint64_t rl_total = rl_if + rl_st + rl_ev + rl_co;
+            if (rl_total > 0) {
+                LOG_INFO("RAM-load-vs-prefetch: %lu genuine disk-read RAM loads (single_miss_pread/"
+                         "batch_miss_io_uring/batch_miss_pread/disk_batch_padding) happened for an expert "
+                         "the prefetcher ALSO touched -- %lu concurrent (a worker was reading the SAME "
+                         "bytes RIGHT NOW: genuine duplicate I/O in flight at once) / %lu found a STILL-"
+                         "staged unconsumed copy despite consume_staged just failing (see the "
+                         "Phase-A/Phase-B gap test right below for why this is usually NOT an anomaly) / "
+                         "%lu evicted-earlier / %lu consumed-earlier (this expert cooled off and needed a "
+                         "fresh read regardless of the past prefetch). See [RAM-LOAD-VS-PREFETCH] "
+                         "(log_level=DEBUG) for the exact per-event layer/expert/trigger/timing behind "
+                         "these totals.\n",
+                         (unsigned long)rl_total, (unsigned long)rl_if, (unsigned long)rl_st,
+                         (unsigned long)rl_ev, (unsigned long)rl_co);
+            }
+        }
+        {
+            uint64_t after = n_phase_gap_staged_after_check.load();
+            uint64_t anomaly = n_phase_gap_staged_before_check_anomaly.load();
+            uint64_t pg_total = after + anomaly;
+            if (pg_total > 0) {
+                double avg_gap_ms = after > 0 ? t_phase_gap_ms_sum.load() / (double)after : 0.0;
+                LOG_INFO("Phase-A/Phase-B gap:  %lu/%lu (%.1f%%) of RAM-load-vs-prefetch's STAGED cases "
+                         "are PROVEN to be the ordering-gap mechanism: the prefetcher finished staging "
+                         "this exact expert AFTER get_experts_batch's own Phase A already checked "
+                         "consume_staged and failed for it (avg gap %.2fms between the check and the "
+                         "staging completing) -- Phase B's later disk read was already unavoidable by the "
+                         "time that happened, since Phase A's per-batch decision was already locked in. "
+                         "%lu/%lu (%.1f%%) are genuine anomalies instead (already staged BEFORE Phase A's "
+                         "own check ran, yet it still failed) -- worth separate investigation if nonzero.\n",
+                         (unsigned long)after, (unsigned long)pg_total,
+                         pg_total > 0 ? 100.0 * after / pg_total : 0.0, avg_gap_ms,
+                         (unsigned long)anomaly, (unsigned long)pg_total,
+                         pg_total > 0 ? 100.0 * anomaly / pg_total : 0.0);
+            }
+        }
+        {
+            uint64_t rc_attempts = n_phase_b_recheck_attempts.load();
+            uint64_t rc_hits = n_phase_b_recheck_hits.load();
+            if (rc_attempts > 0) {
+                LOG_INFO("Phase-B recheck fix: %lu/%lu (%.1f%%) of the OMP-fallback pending experts were "
+                         "rescued by re-trying consume_staged immediately before their own synchronous "
+                         "read, instead of trusting only Phase A's earlier (by then stale) check -- each "
+                         "rescue avoided a real disk read entirely and counts as a genuine PIPE hit (also "
+                         "folded into Prefetch (PIPE) served above). This is the direct fix for the "
+                         "Phase-A/Phase-B gap measured just above; compare this run's 'really required' "
+                         "percentage against a pre-fix run to see the real effect on overall utilization.\n",
+                         (unsigned long)rc_hits, (unsigned long)rc_attempts,
+                         rc_attempts > 0 ? 100.0 * rc_hits / rc_attempts : 0.0);
+            }
+        }
         LOG_INFO("Cache mutex wait:    %8.3f s  (GpuTopology::cache_mutex, shared between the decode "
                  "thread's hit-triggered promotions and the prefetcher worker thread)\n",
                  t_cache_mutex_wait.load());

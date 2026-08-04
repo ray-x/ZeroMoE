@@ -883,6 +883,14 @@ void moe_forward_gguf(
     int n_experts = c.n_experts;
     int moe_inter = c.moe_inter;
 
+    // Publish the cursor BEFORE this layer's own dispatch runs (below),
+    // not after -- acquire_staging_slot's stale-reclaim scan uses strict
+    // less-than specifically because a slot for THIS layer isn't
+    // guaranteed dead yet at this point in the call. Once per layer per
+    // token (prefill's S>1 pass counts as one call here too, same as
+    // decode), covering every real forward pass through this function.
+    async_io_queue.advance_to_layer(layer_idx);
+
     if (n_experts <= 0 || moe_inter <= 0) {
         std::fill(output, output + S * D, 0.0f);
         return;
@@ -1491,6 +1499,12 @@ void moe_forward_gguf(
                 if (layer_gpu_capable) {
                     const ExpertLocation* loc = ram_mgr.vram_cache->find_expert(layer_idx, expert_id);
                     if (loc && loc->device_ptr) {
+                        // Measurement only (expert_fetch_tracker.hpp) -- this
+                        // is a genuine VRAM-tier HIT via the shadow fast
+                        // path, resolved WITHOUT ever calling consume_staged.
+                        // Was this exact expert ALSO recently touched by the
+                        // async prefetcher?
+                        record_hit_if_recently_fetched(layer_idx, expert_id, /*is_vram_tier=*/true);
                         MoEExpertBlock& shadow = scratch.vram_shadow_blocks[k];
                         engine.populate_vram_shadow(shadow, layer_idx, expert_id);
                         scratch.expert_ptrs[k] = &shadow;
@@ -1733,6 +1747,14 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
     // for why the PIPE miss path needs this split.
     ram_mgr.in_prefill = (S > 1);
 
+    // Measurement only (expert_fetch_tracker.hpp) -- one call to this
+    // function IS one token's worth of processing (prefill's single S>1
+    // call, or one decode step's S=1 call), so this is the exact right
+    // place to advance the token-step counter record_hit_if_recently_
+    // fetched uses to distinguish a same-token race from a much later,
+    // unrelated token rediscovering an earlier token's stale fetch record.
+    advance_token_step();
+
     LayerScratch& scratch = g_layer_scratch;
     scratch.resize(S, D, c.n_experts, c.moe_inter, c.topk, c.n_expert_shared, c.dense_inter);
 
@@ -1891,7 +1913,7 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                 size_t next_cap = next_slots.empty() ? 0
                     : std::min(next_slots.size(), (size_t)std::max(1, ram_mgr.cap_for_layer(l + 1)));
 
-                int pilot_k = std::min(8, c.topk);
+                int pilot_k = std::min(pilot_k_for_layer(l + 1), c.topk);
                 // Recall instrumentation: capture the full predicted set
                 // BEFORE the already-resident skip below, so this measures
                 // pure prediction accuracy against the real router's later
@@ -1900,6 +1922,16 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                 // next time layer l+1 actually runs.
                 scratch.pilot_pred_count = pilot_k;
                 scratch.pilot_pred_layer = l + 1;
+                // Collected below, published once after the k-loop --
+                // feeds was_pilot_confirmed_resident's eviction-race
+                // measurement (dense_dispatch.hpp). Only RAM-tier and
+                // VRAM-UNPINNED-LRU picks are worth tracking here: a
+                // pinned VRAM slot can never be chosen as an evict_lru
+                // victim in the first place (see that function's pinned
+                // check), so including it would just waste the fixed-size
+                // buffer on something that could never match.
+                PilotConfirmedEntry confirmed_resident_this_transition[PILOT_CONFIRMED_CAP];
+                int confirmed_resident_count = 0;
                 for (int k = 0; k < pilot_k; ++k) {
                     int best_exp = 0;
                     for (int e = 1; e < c.n_experts; ++e) {
@@ -1949,10 +1981,17 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     bool is_hint_worthy = !already_ram && !already_vram;
                     if (already_ram) {
                         perf().n_pilot_pred_already_ram.fetch_add(1, std::memory_order_relaxed);
+                        if (confirmed_resident_count < PILOT_CONFIRMED_CAP)
+                            confirmed_resident_this_transition[confirmed_resident_count++] = {l + 1, best_exp};
                     } else if (already_vram && vram_pinned) {
                         perf().n_pilot_pred_already_vram_pinned.fetch_add(1, std::memory_order_relaxed);
+                        // Deliberately NOT added to confirmed_resident_this_transition
+                        // -- a pinned slot can never be an evict_lru victim, see
+                        // that buffer's own comment above.
                     } else if (already_vram) {
                         perf().n_pilot_pred_already_vram_lru.fetch_add(1, std::memory_order_relaxed);
+                        if (confirmed_resident_count < PILOT_CONFIRMED_CAP)
+                            confirmed_resident_this_transition[confirmed_resident_count++] = {l + 1, best_exp};
                     } else {
                         perf().n_pilot_pred_needs_fetch.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -1963,6 +2002,15 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                         perf().n_pilot_hints_skipped.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
+                // Publish AFTER the full k-loop (not per-pick) so a reader
+                // (evict_lru/RAM-tier eviction, running on the decode
+                // thread same as this loop but conceptually racy in
+                // principle) always sees a complete, internally-consistent
+                // set for this transition rather than a partially-filled
+                // one -- see was_pilot_confirmed_resident's own comment on
+                // why this is measurement-only, not a hard correctness
+                // dependency either way.
+                publish_pilot_confirmed_resident(confirmed_resident_this_transition, confirmed_resident_count);
             }
             PERF_END(pilot, t_prefetch);
         }

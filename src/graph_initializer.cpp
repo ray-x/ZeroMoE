@@ -411,6 +411,16 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   }
   c.n_heads = file.get_config_int("attention.head_count", 0);
   c.vocab = file.get_config_int("vocab_size", 0);
+  if (c.vocab <= 0) {
+    // Some models (e.g. Qwen3.6-35B-A3B-UD) store vocab size as the token
+    // embedding/output tensor's leading dimension rather than a numeric KV.
+    auto it = file.tensors.find("token_embd.weight");
+    if (it == file.tensors.end())
+      it = file.tensors.find("output.weight");
+    if (it != file.tensors.end() && !it->second.shape.empty()) {
+      c.vocab = static_cast<int>(it->second.shape[0]);
+    }
+  }
   c.n_experts = file.get_config_int("expert_count", 0);
   c.topk = file.get_config_int("expert_used_count", 8);
   c.kv_lora = file.get_config_int("attention.kv_lora_rank", 512);

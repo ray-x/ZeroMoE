@@ -17,6 +17,7 @@
 #include "perf_timer.hpp"
 #include "logger.hpp"
 #include "engine_config.hpp"  // GpuConfig -- allocate_expert_cache's real per-vault-GPU cap
+#include "pilot_confirmed_set.hpp"  // was_pilot_confirmed_resident -- evict_lru race measurement, see that function's comment
 #include "cufile_io.hpp"  // upload_expert_cufile's direct disk->VRAM read path
 
 // Any wait to acquire cache_mutex exceeding this is logged individually
@@ -1127,6 +1128,15 @@ public:
             if (victim->layer_idx != -1) {
                 if (out_old_layer) *out_old_layer = victim->layer_idx;
                 if (out_old_expert) *out_old_expert = victim->expert_id;
+                // Measurement only (pilot_confirmed_set.hpp) -- was this
+                // EXACT (layer, expert) confirmed already-resident by the
+                // pilot's most recent skip-fetch decision, moments before
+                // ordinary LRU pressure evicted it anyway? Checked here,
+                // not folded into eviction_score() above -- this counts
+                // the race, it doesn't (yet) prevent it.
+                if (was_pilot_confirmed_resident(victim->layer_idx, victim->expert_id)) {
+                    perf().n_evicted_was_pilot_confirmed_vram.fetch_add(1, std::memory_order_relaxed);
+                }
                 vram_swap_stats[swap_key(victim->layer_idx, victim->expert_id)].swap_out++;
                 // Drop the index entry for the identity being evicted --
                 // without this, expert_index would keep pointing this

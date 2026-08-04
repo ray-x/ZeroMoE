@@ -4,6 +4,7 @@
 #include "kquant_dequant.hpp"  // (kept: shared quant-type helpers used elsewhere in this header's includers)
 #include "io_uring_backend.hpp"
 #include "dense_dispatch.hpp"  // (no longer calls is_cpu_affinity_layer directly -- see finish_prefetch's comment on why the VRAM-promotion call, and its cpu_affinity gate, were removed; kept in case a future confirmed-use VRAM hook needs it again)
+#include "expert_fetch_tracker.hpp"  // per-(layer,expert) fetch-state record -- read from ram_manager.hpp/execution_layer.cpp's independent cache-hit sites
 #include <atomic>
 #include <thread>
 #include <mutex>
@@ -76,6 +77,41 @@ struct PrefetchSlot {
     // finds a matching-but-not-ready slot report how long the read has
     // been running, for the [PIPE-MISS-TIMING] diagnostic (ram_manager.hpp).
     std::chrono::high_resolution_clock::time_point fetch_start_at{};
+    // Stamped by finish_prefetch() the moment this slot becomes ready
+    // (identity published, bytes fully loaded). There is no time-based
+    // expiry anywhere in this pipeline -- a staged slot is only ever
+    // invalidated when acquire_staging_slot's round-robin write pointer
+    // comes back around to it, regardless of how long it's been sitting
+    // ready. This timestamp lets consume_staged (used) and
+    // acquire_staging_slot (evicted-unused) both measure "how long did
+    // this actually survive", making that round-robin-only invalidation
+    // rule concrete instead of implicit -- see [PREFETCH-LAYER] report.
+    std::chrono::high_resolution_clock::time_point ready_at{};
+};
+
+// Per-layer prefetch activity, sized to the model's layer count once in
+// LockFreePrefetcher::start() and never resized after -- the process-wide
+// totals in perf_timer.hpp (Prefetch (PIPE), Staged-unused evict, etc.)
+// can't tell you WHICH layers the prefetcher actually helps vs wastes
+// bandwidth on; this answers that per-layer via LockFreePrefetcher::
+// log_per_layer_report(). Plain std::atomic<uint64_t> members (movable
+// concerns don't apply here the way they do for PrefetchSlot::ready --
+// this struct is only ever allocated as an array once via
+// std::unique_ptr<LayerPrefetchStats[]>, never resized, so no move/copy is
+// ever required, but keeping the same unique_ptr<T[]> idiom as
+// PrefetchSlot for consistency).
+struct LayerPrefetchStats {
+    std::atomic<uint64_t> hints_pushed{0};           // push_hint calls for this layer
+    std::atomic<uint64_t> fetches_issued{0};         // real disk reads actually started (active_prefetch)
+    std::atomic<uint64_t> fetches_completed{0};      // ...and finished successfully
+    std::atomic<uint64_t> fetches_failed{0};         // ...and finished with a short-read/error
+    std::atomic<uint64_t> pipe_served{0};            // consume_staged: a genuine cache miss consumed this layer's staged data (really required)
+    std::atomic<uint64_t> pipe_no_match{0};          // consume_staged: no staged slot at all for this (layer,expert) -- wrong/stale prediction or already recycled
+    std::atomic<uint64_t> pipe_not_ready{0};         // consume_staged: found a match, but the read hadn't finished yet
+    std::atomic<uint64_t> staged_evicted_unused{0};  // acquire_staging_slot recycled a ready-but-never-consumed slot holding this layer's prediction
+    std::atomic<uint64_t> fetch_us_sum{0};           // sum of completed-fetch durations (microseconds) -- for this layer's avg_ms
+    std::atomic<uint64_t> used_lifetime_us_sum{0};   // sum of ready_at -> successful-consume elapsed time, this layer
+    std::atomic<uint64_t> evicted_lifetime_us_sum{0}; // sum of ready_at -> round-robin-eviction elapsed time, this layer
 };
 
 
@@ -138,6 +174,18 @@ private:
     // never resized afterward.
     std::unique_ptr<PrefetchSlot[]> staging;
     std::atomic<int> staging_write_idx{0};  // next slot to write into
+
+    // Per-layer prefetch activity (see LayerPrefetchStats's own comment).
+    // Allocated once in start() from the model's layer count, never
+    // resized -- layer_stat() bounds-checks every access so an
+    // out-of-range layer_idx (shouldn't happen) is silently ignored
+    // rather than crashing.
+    std::unique_ptr<LayerPrefetchStats[]> layer_stats;
+    int n_layers_tracked = 0;
+    LayerPrefetchStats* layer_stat(int layer_idx) {
+        return (layer_stats && layer_idx >= 0 && layer_idx < n_layers_tracked)
+            ? &layer_stats[layer_idx] : nullptr;
+    }
     // Guards all mutation of a staging slot's identity (layer_idx/expert_id),
     // ready flag, AND the pinned_buf lifecycle (acquire_staging_slot
     // recycle/regrow vs consume_staged's memcpy-out). Without it the decode
@@ -157,6 +205,31 @@ public:
     // because that external read is the point of tracking it.
     std::atomic<int> n_fetches_in_flight{0};
 
+    // Decode's current layer, published once per moe_forward_gguf call
+    // (execution_layer.cpp) via advance_to_layer() below. The model
+    // processes layers strictly in order (0..n_layers-1) once per token,
+    // so a staged hint whose OWN layer_idx is behind this cursor is
+    // PROVABLY dead: nothing will ever consume_staged() for that exact
+    // (layer, expert) again until the pilot re-predicts it on some FUTURE
+    // token's pass through that layer -- by which point acquire_staging_slot
+    // would have long since had reason to reclaim the slot anyway. This is
+    // a structural fact, not a heuristic ("has this expert historically
+    // been useless") -- see acquire_staging_slot's use of this cursor for
+    // why that distinction matters (it lets eviction target GUARANTEED-
+    // stale slots first, instead of blind round-robin write order, which
+    // measured an average 1.5s evicted-unused lifetime -- these slots
+    // weren't dying of old age, they were being out-competed by unrelated
+    // later hints while a genuinely still-useful hint got evicted instead).
+    // -1 = no layer executed yet (startup). Relaxed is enough -- this is a
+    // best-effort "is this obviously stale" hint, not a correctness gate;
+    // acquire_staging_slot still falls back to round-robin when nothing
+    // qualifies, so a stale/racy read here only costs a missed optimization
+    // opportunity, never incorrect behavior.
+    std::atomic<int> current_decode_layer{-1};
+    void advance_to_layer(int layer_idx) {
+        current_decode_layer.store(layer_idx, std::memory_order_relaxed);
+    }
+
     // avg ms per completed real fetch so far this run -- used to estimate
     // "how much longer" an in-flight, not-yet-ready fetch likely needs.
     // t_pipe_read_ms_sum is a sum across possibly-concurrent worker
@@ -166,6 +239,81 @@ public:
     double avg_fetch_ms() const {
         uint64_t completed = perf().n_pipe_fetch_completed.load(std::memory_order_relaxed);
         return completed > 0 ? perf().t_pipe_read_ms_sum.load(std::memory_order_relaxed) / (double)completed : 0.0;
+    }
+
+    // Per-layer prefetch report, printed at shutdown (main.cpp, after
+    // prefetcher.stop()) alongside the rest of the perf report. The
+    // process-wide totals in perf_timer.hpp (Prefetch (PIPE), Staged-unused
+    // evict, etc.) can't answer "which LAYERS is the prefetcher actually
+    // helping vs wasting bandwidth on" -- this does, one line per layer that
+    // ever saw any prefetch activity (a layer that never touched the
+    // prefetcher at all -- e.g. cpu_affinity_layers, or one whose experts
+    // were always already RAM/VRAM-resident per n_pilot_pred_already_* --
+    // is skipped rather than padding the log with an all-zero row). Also
+    // answers "how many of what's in the fetch pipeline were really
+    // required" (ask #3): the hint-outcome line at the end splits every
+    // real fetch into really-required (consumed by a genuine cache miss),
+    // evicted-unused (round-robin-recycled before any miss arrived), or
+    // still-staged-unresolved (leftover at shutdown, an edge effect of the
+    // run ending mid-flight). And makes the invalidation rule itself
+    // explicit (ask #2): there is no timeout/deadline anywhere in this
+    // pipeline, ONLY acquire_staging_slot's round-robin write pointer
+    // coming back around -- the staged-slot-lifetime line shows how long
+    // data typically survives under that rule in each outcome.
+    void log_per_layer_report() const {
+        if (!layer_stats || n_layers_tracked == 0) return;
+        LOG_STREAM_INFO() << "[PREFETCH-LAYER] per-layer prefetch activity (of " << n_layers_tracked
+                           << " layer(s); hints=pushed to queue, issued/done/fail=real disk reads "
+                              "attempted/completed/failed, served=consumed by a real cache miss (really "
+                              "required), no_match/not_ready=a miss found nothing staged / found it but "
+                              "not done yet, evicted=round-robin-recycled before any miss consumed it, "
+                              "avg_ms=mean completed-fetch duration):\n";
+        for (int l = 0; l < n_layers_tracked; ++l) {
+            const LayerPrefetchStats& s = layer_stats[l];
+            uint64_t hints = s.hints_pushed.load(std::memory_order_relaxed);
+            uint64_t issued = s.fetches_issued.load(std::memory_order_relaxed);
+            if (hints == 0 && issued == 0) continue;
+            uint64_t completed = s.fetches_completed.load(std::memory_order_relaxed);
+            uint64_t failed = s.fetches_failed.load(std::memory_order_relaxed);
+            uint64_t served = s.pipe_served.load(std::memory_order_relaxed);
+            uint64_t no_match = s.pipe_no_match.load(std::memory_order_relaxed);
+            uint64_t not_ready = s.pipe_not_ready.load(std::memory_order_relaxed);
+            uint64_t evicted = s.staged_evicted_unused.load(std::memory_order_relaxed);
+            double avg_ms = completed > 0
+                ? (double)s.fetch_us_sum.load(std::memory_order_relaxed) / 1000.0 / (double)completed : 0.0;
+            LOG_STREAM_INFO() << "[PREFETCH-LAYER]   layer=" << l << "  hints=" << hints
+                               << " issued=" << issued << " done=" << completed << " fail=" << failed
+                               << " served=" << served << " no_match=" << no_match
+                               << " not_ready=" << not_ready << " evicted=" << evicted
+                               << " avg_ms=" << avg_ms << "\n";
+        }
+
+        uint64_t used_n = 0, evicted_n = 0, used_us = 0, evicted_us = 0;
+        for (int l = 0; l < n_layers_tracked; ++l) {
+            used_n += layer_stats[l].pipe_served.load(std::memory_order_relaxed);
+            evicted_n += layer_stats[l].staged_evicted_unused.load(std::memory_order_relaxed);
+            used_us += layer_stats[l].used_lifetime_us_sum.load(std::memory_order_relaxed);
+            evicted_us += layer_stats[l].evicted_lifetime_us_sum.load(std::memory_order_relaxed);
+        }
+        int leftover = 0;
+        for (int i = 0; i < num_staging_slots; ++i) {
+            if (staging[i].ready.load(std::memory_order_relaxed) && staging[i].layer_idx != -1) ++leftover;
+        }
+        uint64_t issued_total = perf().n_pipe_fetch_issued.load(std::memory_order_relaxed);
+        LOG_STREAM_INFO() << "[PREFETCH-LAYER] staged-slot lifetime (NO time-based deadline exists -- a "
+                              "slot is only invalidated when acquire_staging_slot's round-robin write "
+                              "pointer comes back around to it): used avg="
+                           << (used_n > 0 ? (double)used_us / 1000.0 / (double)used_n : 0.0)
+                           << "ms (n=" << used_n << ") | evicted-unused avg="
+                           << (evicted_n > 0 ? (double)evicted_us / 1000.0 / (double)evicted_n : 0.0)
+                           << "ms (n=" << evicted_n << ")\n";
+        LOG_STREAM_INFO() << "[PREFETCH-LAYER] hint outcome: of " << issued_total << " real fetch(es) issued, "
+                           << used_n << " ("
+                           << (issued_total > 0 ? 100.0 * (double)used_n / (double)issued_total : 0.0)
+                           << "%) were really required (consumed by a genuine cache miss), " << evicted_n
+                           << " (" << (issued_total > 0 ? 100.0 * (double)evicted_n / (double)issued_total : 0.0)
+                           << "%) were evicted unused before any miss arrived, " << leftover
+                           << " still staged-but-never-touched at shutdown\n";
     }
 
     void start(StreamingEngine* eng, GpuTopology* topo = nullptr, bool enable_io_uring = false,
@@ -196,6 +344,11 @@ public:
         if (n_staging_slots < 1) n_staging_slots = 1;
         num_staging_slots = n_staging_slots;
         staging = std::make_unique<PrefetchSlot[]>(num_staging_slots);
+        n_layers_tracked = eng ? eng->model_file.architecture_config.n_layers : 0;
+        if (n_layers_tracked > 0) layer_stats = std::make_unique<LayerPrefetchStats[]>(n_layers_tracked);
+        if (n_layers_tracked > 0 && eng) {
+            expert_fetch_tracker().init(n_layers_tracked, eng->model_file.architecture_config.n_experts);
+        }
         // Async H2D promotion goes through GpuTopology::upload_expert_async,
         // which uses the vault GPU's own dedicated copy_stream (see
         // gpu_topology.hpp) — no separate stream needed here.
@@ -258,6 +411,7 @@ public:
 
         queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now()};
         head.store(current_head + 1, std::memory_order_release);
+        if (auto* s = layer_stat(layer_idx)) s->hints_pushed.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Diagnostic only (no locking, benign race with the workers' own
@@ -273,12 +427,24 @@ public:
     // Different root causes need different fixes; see
     // RAMSafetyManager::in_prefill's comment for the other half of this
     // same investigation.
-    bool has_pending_hint(int layer_idx, int expert_id) const {
+    // out_queued_ms (optional): when a match is found, populated with how
+    // long (ms) the hint has been sitting in the queue since push_hint --
+    // i.e. how much of a head start the prefetcher had before the decode
+    // thread needed this expert, versus how much it actually got (zero
+    // worker attention at all). Left untouched when no match is found, so
+    // callers can use a sentinel like -1.0 to mean "not this reason."
+    bool has_pending_hint(int layer_idx, int expert_id, double* out_queued_ms = nullptr) const {
         unsigned int h = head.load(std::memory_order_acquire);
         unsigned int t = tail.load(std::memory_order_relaxed);
         for (unsigned int i = t; i != h; ++i) {
             const PrefetchHint& hint = queue[i & (QUEUE_SIZE - 1)];
-            if (hint.layer_idx == layer_idx && hint.expert_id == expert_id) return true;
+            if (hint.layer_idx == layer_idx && hint.expert_id == expert_id) {
+                if (out_queued_ms) {
+                    *out_queued_ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - hint.pushed_at).count();
+                }
+                return true;
+            }
         }
         return false;
     }
@@ -334,6 +500,7 @@ public:
             if (staging[i].layer_idx == layer_idx && staging[i].expert_id == expert_id) {
                 if (!staging[i].ready.load(std::memory_order_acquire)) {
                     perf().n_pipe_miss_not_ready.fetch_add(1, std::memory_order_relaxed);
+                    if (auto* s = layer_stat(layer_idx)) s->pipe_not_ready.fetch_add(1, std::memory_order_relaxed);
                     if (out_not_ready_elapsed_ms) {
                         *out_not_ready_elapsed_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::high_resolution_clock::now() - staging[i].fetch_start_at).count();
@@ -344,6 +511,21 @@ public:
                 if (dst_cap < bytes) return false;  // caller buffer too small -> caller falls back to load_expert_slab
                 std::memcpy(dst, staging[i].pinned_buf, bytes);
                 if (out_bytes) *out_bytes = bytes;
+                // This IS the "really required" case (ask #3 in the
+                // instrumentation request): a genuine cache miss actually
+                // consumed what was staged, as opposed to it sitting unused
+                // until round-robin evicted it (see acquire_staging_slot).
+                double lifetime_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - staging[i].ready_at).count();
+                if (auto* s = layer_stat(layer_idx)) {
+                    s->pipe_served.fetch_add(1, std::memory_order_relaxed);
+                    s->used_lifetime_us_sum.fetch_add((uint64_t)(lifetime_ms * 1000.0), std::memory_order_relaxed);
+                }
+                // Measurement only (expert_fetch_tracker.hpp) -- the
+                // intended-use case, tracked mainly for completeness so a
+                // later query at an independent hit site can distinguish
+                // "already consumed via PIPE" from "still staged"/"evicted".
+                expert_fetch_tracker().mark(layer_idx, expert_id, ExpertFetchState::Consumed);
                 // Release the staging slot for reuse. (We do NOT touch the VRAM
                 // copy's completion -- that is tracked independently by
                 // GpuTopology via the slot's upload_event in find_expert.)
@@ -354,6 +536,7 @@ public:
             }
         }
         perf().n_pipe_miss_no_match.fetch_add(1, std::memory_order_relaxed);
+        if (auto* s = layer_stat(layer_idx)) s->pipe_no_match.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 
@@ -452,14 +635,21 @@ private:
     // both branches call acquire_staging_slot then later either
     // finish_prefetch or issue_fadvise_fallback, so a single pair of
     // start/end calls at each branch's own two touch points covers both.
-    std::chrono::high_resolution_clock::time_point record_fetch_start(PrefetchSlot& slot) {
+    std::chrono::high_resolution_clock::time_point record_fetch_start(PrefetchSlot& slot, int layer_idx, int expert_id) {
         auto t0 = std::chrono::high_resolution_clock::now();
         slot.fetch_start_at = t0;
         perf().n_pipe_fetch_issued.fetch_add(1, std::memory_order_relaxed);
+        if (auto* s = layer_stat(layer_idx)) s->fetches_issued.fetch_add(1, std::memory_order_relaxed);
         n_fetches_in_flight.fetch_add(1, std::memory_order_relaxed);
+        // Measurement only (expert_fetch_tracker.hpp) -- marks the read as
+        // actively in progress, so an independent cache hit that resolves
+        // this exact (layer,expert) in the next few ms can be attributed to
+        // "beaten a fetch that was still running", not "no prefetch
+        // activity at all".
+        expert_fetch_tracker().mark(layer_idx, expert_id, ExpertFetchState::InFlight);
         return t0;
     }
-    void record_fetch_end(std::chrono::high_resolution_clock::time_point t0, size_t bytes, bool ok) {
+    void record_fetch_end(std::chrono::high_resolution_clock::time_point t0, size_t bytes, bool ok, int layer_idx) {
         n_fetches_in_flight.fetch_sub(1, std::memory_order_relaxed);
         if (ok) {
             double dt_ms = std::chrono::duration<double, std::milli>(
@@ -467,8 +657,13 @@ private:
             perf().n_pipe_fetch_completed.fetch_add(1, std::memory_order_relaxed);
             perf().bytes_pipe_prefetched.fetch_add(bytes, std::memory_order_relaxed);
             PerfCounters::atomic_add(perf().t_pipe_read_ms_sum, dt_ms);
+            if (auto* s = layer_stat(layer_idx)) {
+                s->fetches_completed.fetch_add(1, std::memory_order_relaxed);
+                s->fetch_us_sum.fetch_add((uint64_t)(dt_ms * 1000.0), std::memory_order_relaxed);
+            }
         } else {
             perf().n_pipe_fetch_failed.fetch_add(1, std::memory_order_relaxed);
+            if (auto* s = layer_stat(layer_idx)) s->fetches_failed.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -535,7 +730,7 @@ private:
 
             PrefetchSlot& slot = acquire_staging_slot(total);
             if (!slot.pinned_buf) { issue_fadvise_fallback(layer_idx, expert_id); return; }
-            auto fetch_t0 = record_fetch_start(slot);
+            auto fetch_t0 = record_fetch_start(slot, layer_idx, expert_id);
 
             int gfd = engine->model_file.fd_for_tensor(gE->second);
             int ufd = engine->model_file.fd_for_tensor(uE->second);
@@ -569,7 +764,7 @@ private:
                 ok = (rg == (ssize_t)gb && ru == (ssize_t)ub && rd == (ssize_t)db);
             }
 
-            record_fetch_end(fetch_t0, total, ok);
+            record_fetch_end(fetch_t0, total, ok, layer_idx);
             if (ok) {
                 finish_prefetch(slot, layer_idx, expert_id, total);
             } else {
@@ -610,7 +805,7 @@ private:
 
         PrefetchSlot& slot = acquire_staging_slot(total);
         if (!slot.pinned_buf) { issue_fadvise_fallback(layer_idx, expert_id); return; }
-        auto fetch_t0 = record_fetch_start(slot);
+        auto fetch_t0 = record_fetch_start(slot, layer_idx, expert_id);
 
         uint64_t align = engine->model_file.direct_io_alignment;
         // Single-read fast path (mirrors load_expert_slab): if the three
@@ -659,7 +854,7 @@ private:
             }
         }
 
-        record_fetch_end(fetch_t0, total, ok);
+        record_fetch_end(fetch_t0, total, ok, layer_idx);
         if (ok) {
             finish_prefetch(slot, layer_idx, expert_id, total);
         } else {
@@ -667,16 +862,84 @@ private:
         }
     }
 
-    // Round-robin staging slot, grown to `needed_bytes` if too small. Takes
+    // Staging slot acquisition, grown to `needed_bytes` if too small. Takes
     // staging_mutex so the regrow (which can cudaFreeHost the pinned_buf) can't
     // race a concurrent consume_staged memcpy-out of the same slot.
+    //
+    // Prefers a PROVABLY stale slot over the blind round-robin write
+    // pointer, using TWO independent staleness signals (a slot is
+    // reclaimable if EITHER holds):
+    //   1. layer_idx < current_decode_layer -- provably dead WITHIN THIS
+    //      SAME TOKEN (that layer's own moe_forward_gguf call for this
+    //      token has already returned). Strictly less-than: the CURRENT
+    //      layer may still be mid-dispatch (advance_to_layer(cursor) is
+    //      called before that layer's own dispatch runs, not after -- see
+    //      that function's call site), so it's not provably dead yet.
+    //   2. expert_fetch_tracker's step_delta > 0 for this slot's own
+    //      (layer, expert) -- provably dead ACROSS A TOKEN BOUNDARY: the
+    //      tracker's per-slot step counter (current_token_step) never
+    //      resets, unlike current_decode_layer which resets to
+    //      ~first_dense at the start of EVERY new token. Real
+    //      instrumentation (a prior run's "Wraparound-missed stale" line)
+    //      confirmed signal 1 ALONE misses this case routinely -- 62% of
+    //      that run's round-robin-fallback events had genuinely-dead-by-
+    //      token-step capacity sitting in the pool (avg 71.7 of 128
+    //      slots!) that signal 1 couldn't see, because a slot left over
+    //      from a LATE layer of the PREVIOUS token reads as "not yet
+    //      passed this token" under signal 1 alone, even though that
+    //      whole earlier token's pass finished long ago. Checking both in
+    //      one pass closes that gap directly instead of only detecting it
+    //      after the fact in the fallback branch.
+    // The scan below is O(num_staging_slots) (128 by default) under a lock
+    // already being taken for the regrow check right below -- cheap
+    // relative to the disk read this slot is about to be used for; the
+    // tracker query (signal 2) is a handful of atomic loads, only paid for
+    // slots that fail signal 1, so the common case (an early same-token-
+    // stale hit) doesn't pay for it at all.
     PrefetchSlot& acquire_staging_slot(size_t needed_bytes) {
-        int slot_idx = staging_write_idx.fetch_add(1, std::memory_order_relaxed) % num_staging_slots;
         auto _wait_t0 = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(staging_mutex);
         double _wait_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - _wait_t0).count();
         PerfCounters::atomic_add(perf().t_staging_mutex_wait, _wait_ms / 1000.0);
+
+        int slot_idx = -1;
+        int cursor = current_decode_layer.load(std::memory_order_relaxed);
+        for (int i = 0; i < num_staging_slots; ++i) {
+            if (!staging[i].ready.load(std::memory_order_relaxed) || staging[i].layer_idx == -1) continue;
+            bool same_token_stale = (cursor >= 0 && staging[i].layer_idx < cursor);
+            bool cross_token_stale = false;
+            if (!same_token_stale) {
+                uint64_t elapsed_us = 0, step_delta = 0;
+                expert_fetch_tracker().query(staging[i].layer_idx, staging[i].expert_id, elapsed_us, step_delta);
+                cross_token_stale = (step_delta > 0);
+            }
+            if (same_token_stale || cross_token_stale) {
+                slot_idx = i;
+                perf().n_staging_stale_reclaimed.fetch_add(1, std::memory_order_relaxed);
+                if (cross_token_stale) perf().n_staging_cross_token_stale_reclaimed.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+        if (slot_idx < 0) {
+            // Genuinely no dead capacity anywhere in the pool by EITHER
+            // measure -- every slot is either empty (shouldn't reach here;
+            // the loop above already treats an empty slot as available...
+            // actually see note below) or plausibly still relevant. Kept
+            // as a real counter (not expected to be near-zero the way the
+            // old single-signal version was) so a regression in either
+            // staleness signal is still visible.
+            //
+            // NOTE: a slot with layer_idx == -1 (never used, or already
+            // reclaimed and not yet rewritten) is skipped by `continue`
+            // above, not treated as an immediate free pick -- this
+            // preserves the original round-robin-fallback's own behavior
+            // of always advancing staging_write_idx, so an all-empty pool
+            // (e.g. right after startup) still distributes writes evenly
+            // across slots instead of piling onto slot 0 every time.
+            perf().n_staging_fallback_events.fetch_add(1, std::memory_order_relaxed);
+            slot_idx = staging_write_idx.fetch_add(1, std::memory_order_relaxed) % num_staging_slots;
+        }
         if (_wait_ms > SLOW_MUTEX_WAIT_MS) {
             LOG_WARN("[SLOW-MUTEX-WAIT] acquire_staging_slot blocked %.2fms acquiring staging_mutex (slot=%d)\n",
                      _wait_ms, slot_idx);
@@ -697,6 +960,24 @@ private:
         // to mutate these same fields.
         if (slot.ready.load(std::memory_order_relaxed) && slot.layer_idx != -1) {
             perf().n_staged_evicted_unused.fetch_add(1, std::memory_order_relaxed);
+            // This is the moment a staged prefetch is decided "no longer
+            // valid" -- there is no deadline/timeout anywhere in this
+            // pipeline, ONLY this round-robin write pointer coming back
+            // around. Attribute the waste to the layer whose prediction
+            // is being thrown away (slot.layer_idx, NOT the new request
+            // that's about to overwrite it), and measure how long it sat
+            // ready-but-unconsumed -- see ready_at's own comment.
+            double lifetime_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - slot.ready_at).count();
+            if (auto* s = layer_stat(slot.layer_idx)) {
+                s->staged_evicted_unused.fetch_add(1, std::memory_order_relaxed);
+                s->evicted_lifetime_us_sum.fetch_add((uint64_t)(lifetime_ms * 1000.0), std::memory_order_relaxed);
+            }
+            // Measurement only (expert_fetch_tracker.hpp) -- records the
+            // OUTGOING identity (slot.layer_idx/expert_id) as evicted, not
+            // the new fetch about to claim this slot. Must run before those
+            // fields get overwritten below/in finish_prefetch.
+            expert_fetch_tracker().mark(slot.layer_idx, slot.expert_id, ExpertFetchState::EvictedUnused);
         }
         if (slot.capacity < needed_bytes) {
             // PRIME SUSPECT for the multi-second single-miss stall: pinned
@@ -792,7 +1073,13 @@ private:
         }
         slot.layer_idx = layer_idx;
         slot.expert_id = expert_id;
+        slot.ready_at = std::chrono::high_resolution_clock::now();
         slot.ready.store(true, std::memory_order_release);
+        // Measurement only (expert_fetch_tracker.hpp) -- this fetch fully
+        // succeeded and is now sitting ready, unconsumed. Marked AFTER the
+        // slot fields above so a query racing in from another thread never
+        // observes StagedReady before ready_at/identity are actually valid.
+        expert_fetch_tracker().mark(layer_idx, expert_id, ExpertFetchState::StagedReady);
     }
 
     void issue_fadvise_fallback(int layer_idx, int expert_id) {
