@@ -223,97 +223,15 @@ inline void record_hit_if_recently_fetched(int layer, int expert, bool is_vram_t
     }
 }
 
-// Traces a GENUINE disk-read RAM-tier population -- any real cache-MISS
-// load site (a synchronous pread/io_uring read that actually happens, NOT
-// a cache hit) -- against the SAME expert's prefetch-tracker record, if
-// any. Complements record_hit_if_recently_fetched above: that function
-// fires on a HIT that bypasses consume_staged entirely; this one fires at
-// a genuine MISS-driven disk read, directly answering "is this specific
-// disk read duplicating work the prefetcher also did (or is still doing)
-// for the exact same bytes, and which code path triggered this load."
-//
-// `trigger` is a short, human-readable label identifying the call site
-// (e.g. "single_miss_pread", "batch_miss_io_uring", "batch_miss_pread",
-// "disk_batch_padding") -- included directly in the LOG_DEBUG trace line
-// so grepping for [RAM-LOAD-VS-PREFETCH] shows exactly which path caused
-// each traced load, not just that one happened. No-op (returns
-// immediately, nothing logged or counted) when the tracker has no record
-// at all for this (layer, expert) -- the common case, a "pure" miss with
-// no prefetch involvement, not interesting for this specific trace.
-inline void trace_ram_load_if_recently_fetched(int layer, int expert, const char* trigger) {
-    uint64_t elapsed_us = 0, step_delta = 0;
-    ExpertFetchState st = expert_fetch_tracker().query(layer, expert, elapsed_us, step_delta);
-    if (st == ExpertFetchState::None) return;
-    const char* state_name =
-        st == ExpertFetchState::InFlight ? "IN_FLIGHT(prefetch worker reading the SAME bytes RIGHT NOW)" :
-        st == ExpertFetchState::StagedReady ? "STAGED_READY(a completed, unconsumed fetch exists for this exact expert)" :
-        st == ExpertFetchState::EvictedUnused ? "EVICTED_UNUSED(was fetched, never consumed, already recycled)" :
-        "CONSUMED(was fetched and genuinely used earlier, now needed again)";
-    LOG_DEBUG("[RAM-LOAD-VS-PREFETCH] layer=%d expert=%d trigger=%s prefetch_state=%s "
-              "elapsed_since_mark=%.1fms steps_back=%llu -- this RAM-tier disk load is happening for an "
-              "expert the prefetcher ALSO touched; steps_back>0 means that touch was during an EARLIER "
-              "token, not concurrent with this exact load\n",
-              layer, expert, trigger, state_name, elapsed_us / 1000.0, (unsigned long long)step_delta);
-    switch (st) {
-        case ExpertFetchState::InFlight:
-            perf().n_ram_load_had_prefetch_inflight.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case ExpertFetchState::StagedReady:
-            perf().n_ram_load_had_prefetch_staged.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case ExpertFetchState::EvictedUnused:
-            perf().n_ram_load_had_prefetch_evicted.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case ExpertFetchState::Consumed:
-            perf().n_ram_load_had_prefetch_consumed.fetch_add(1, std::memory_order_relaxed);
-            break;
-        default:
-            break;
-    }
-}
-
-// Precise test for the Phase-A/Phase-B pipeline-ordering-gap hypothesis
-// (RAMSafetyManager::get_experts_batch): Phase A checks consume_staged for
-// every pending expert FIRST, across the whole batch, and only afterward
-// does Phase B actually perform the real disk reads for whatever Phase A
-// couldn't serve from staging. A real run's RAM-load-vs-prefetch trace
-// found 86% of Phase-B loads that intersected with prefetch activity were
-// in StagedReady state -- i.e. consume_staged had JUST failed, yet a
-// ready copy existed moments later. Two explanations are possible: (a)
-// the prefetcher's own worker thread finished staging this exact expert
-// DURING the Phase A -> Phase B gap, arriving too late for Phase A's
-// already-locked-in decision (the expected, benign mechanism -- not a
-// bug, just a real ordering cost of checking staging once per batch
-// instead of once per expert right before its own read), or (b) the data
-// was ALREADY staged when Phase A's own check ran, and consume_staged
-// still failed for some OTHER reason (a genuine anomaly worth separate
-// investigation -- NOT the ordering-gap mechanism).
-//
-// `phase_a_check_at_us` is the caller's OWN timestamp (steady_now_us(),
-// captured at the exact moment ITS Phase A consume_staged call for this
-// expert returned false) -- compared here against the tracker's raw mark
-// timestamp for the SAME expert to settle which explanation applies,
-// definitively, per event: mark_at_us > phase_a_check_at_us proves (a);
-// mark_at_us <= phase_a_check_at_us proves (b).
-inline void trace_phase_gap_if_staged_after_check(int layer, int expert, uint64_t phase_a_check_at_us) {
-    if (phase_a_check_at_us == 0) return;  // caller has no valid timestamp to compare against
-    uint64_t mark_at_us = 0;
-    ExpertFetchState st = expert_fetch_tracker().query_raw_mark_time(layer, expert, mark_at_us);
-    if (st != ExpertFetchState::StagedReady || mark_at_us == 0) return;  // only meaningful for this exact state
-    bool staged_after_check = mark_at_us > phase_a_check_at_us;
-    double gap_ms = (double)(staged_after_check ? (mark_at_us - phase_a_check_at_us)
-                                                 : (phase_a_check_at_us - mark_at_us)) / 1000.0;
-    LOG_DEBUG("[PHASE-GAP] layer=%d expert=%d staged_after_phase_a_check=%s gap=%.2fms -- %s\n",
-              layer, expert, staged_after_check ? "YES" : "NO", gap_ms,
-              staged_after_check
-                  ? "CONFIRMS the ordering-gap hypothesis: the prefetcher finished staging this exact "
-                    "expert AFTER Phase A's own consume_staged check already failed for it"
-                  : "ANOMALY: this expert was already staged BEFORE Phase A's own check ran, yet that "
-                    "check still failed -- NOT the ordering-gap mechanism, worth separate investigation");
-    if (staged_after_check) {
-        perf().n_phase_gap_staged_after_check.fetch_add(1, std::memory_order_relaxed);
-        PerfCounters::atomic_add(perf().t_phase_gap_ms_sum, gap_ms);
-    } else {
-        perf().n_phase_gap_staged_before_check_anomaly.fetch_add(1, std::memory_order_relaxed);
-    }
-}
+// REMOVED: trace_ram_load_if_recently_fetched and
+// trace_phase_gap_if_staged_after_check used to live here -- both measured
+// races against LockFreePrefetcher's old separate staging pool (a genuine
+// RAM-tier disk read happening for an expert the prefetcher ALSO touched;
+// whether a Phase-B read raced a staging completion). Both mechanisms they
+// measured are now structurally impossible: prefetch and the decode
+// thread's own miss-handling claim/populate/publish through the SAME
+// locked slot table (RAMSafetyManager::claim_or_wait, ram_manager.hpp), so
+// there is no longer a separate staging pool or a Phase-A/Phase-B ordering
+// gap for either function to detect. See ram_manager.hpp's claim_or_wait
+// and perf_timer.hpp's "Unified RAM claim"/"Unified RAM wait" report lines
+// for the replacement instrumentation.

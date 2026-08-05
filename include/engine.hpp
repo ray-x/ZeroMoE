@@ -68,6 +68,18 @@ struct BlockQ4_KV {
     uint8_t  qs[16];  // 32 x 4-bit values packed (16 bytes)
 };
 
+// Which side is calling RAMSafetyManager::claim_or_wait (ram_manager.hpp) -- the
+// decode thread's own miss-handling, or a LockFreePrefetcher worker thread's
+// speculative claim. Gating behavior on this is a hard correctness requirement, not
+// a style choice: claim_or_wait's Hit branch may only run its VRAM-promotion side
+// effects (which take GpuTopology::cache_mutex) for Decode -- a PrefetchWorker
+// caller must never touch GpuTopology/cache_mutex at all, or a cross-thread AB-BA
+// deadlock against the decode thread's own cache_mutex-then-ram_mutex nesting
+// (demote_from_vram/finish_sync_promotion, both reached from GpuTopology callbacks
+// fired while cache_mutex is still held) becomes reachable. See ram_manager.hpp's
+// claim_or_wait for the full reasoning.
+enum class RamClaimCaller { Decode, PrefetchWorker };
+
 struct MoEExpertBlock {
     int expert_id;
     QuantizedTensor gate_proj;
@@ -164,18 +176,55 @@ struct MoEExpertBlock {
     // same "never pick, no matter how attractive otherwise" priority.
     int ram_temp_pin_count = 0;
 
-    // True when this slot's bytes were served via LockFreePrefetcher::
-    // consume_staged (a RAM-tier miss the pilot correctly predicted and
-    // staged ahead of time) rather than a synchronous disk pread. Exists
-    // solely to make the effect of removing finish_prefetch's old
-    // unconditional VRAM-promotion call (async_prefetcher.hpp) directly
-    // observable: n_pipe_staged_later_promoted (perf_timer.hpp) counts how
-    // many of these later cross promote_hit_threshold and get promoted via
-    // the normal hit-count-gated path, proving prefetched experts still
-    // reach VRAM -- just only once a real subsequent access confirms it,
-    // never on unconfirmed speculation. Reset to false whenever a slot is
-    // claimed for a different expert, same lifecycle as also_in_vram.
-    bool from_pipe_prefetch = false;
+    // Unified RAM-tier claim state (RAMSafetyManager::claim_or_wait,
+    // ram_manager.hpp): true from the moment a caller (decode thread's own miss
+    // path, OR a LockFreePrefetcher worker thread) claims this slot for
+    // `expert_id` until that same caller's disk read completes and publishes the
+    // result. Combined with `expert_id`, this gives the RAM tier's three real
+    // states with no new type: expert_id==-1 -> Empty; expert_id==target &&
+    // ram_loading -> Loading (claimed, read in progress, slab_buffer/gate_proj/
+    // up_proj/down_proj not yet valid); expert_id==target && !ram_loading ->
+    // Ready (today's ordinary hit-path semantics, unchanged).
+    //
+    // Field-ownership rule, the thing that makes the unlocked disk read fast and
+    // safe at the same time: ram_loading, expert_id, last_used_clock, hit_count,
+    // also_in_vram, ram_temp_pin_count, pending_copy_event are only ever read or
+    // written under RAMSafetyManager::ram_mutex. slab_buffer/slab_capacity/
+    // gate_proj/up_proj/down_proj are the exclusive claim-owner's PRIVATE
+    // territory from the moment claim_or_wait returns Claimed until that same
+    // owner publishes (ram_loading=false) -- touched WITHOUT the lock, and no
+    // other thread may read or write them meanwhile (a slot can only ever have
+    // one claim-owner at a time, enforced by the Empty->Loading transition being
+    // the sole mutex-protected decision point). Do not add a diagnostic or scan
+    // that reads slab_capacity/slab_buffer without checking Ready first -- that
+    // would violate this invariant even if it "only reads".
+    //
+    // Included in the SAME "never pick this as an eviction victim, score
+    // UINT64_MAX" guard as copy_still_pending()/ram_temp_pin_count>0 at all 3
+    // RAM-tier victim-selection sites (get_expert Step 3, get_experts_batch Phase
+    // A miss-claim, demote_from_vram) -- a slot mid-claim must never be reused
+    // for a different expert out from under its owner.
+    bool ram_loading = false;
+
+    // True when this slot's bytes were populated by a LockFreePrefetcher worker
+    // thread's own claim (RamClaimCaller::PrefetchWorker) rather than the decode
+    // thread's own miss-handling claim. Renamed from the pre-unification
+    // from_pipe_prefetch (which meant "served via the old separate staging
+    // pool's consume_staged") -- under the unified claim/publish design there is
+    // no separate staging pool, so this now just means "who populated this
+    // slot", used for two things: (1) n_pipe_staged_later_promoted (perf_timer.
+    // hpp) still counts how many prefetch-loaded slots later cross
+    // promote_hit_threshold and get promoted to VRAM via the normal hit-count-
+    // gated path, proving prefetched experts still reach VRAM only once a real
+    // access confirms it; (2) the new n_ram_prefetch_loaded_evicted_unused
+    // signal (a RAM-tier victim-selection site reclaiming a slot with
+    // loaded_by_prefetch==true and hit_count==0 means prefetch loaded it and it
+    // was evicted before any real hit ever touched it -- the unified design's
+    // replacement for the old staging-pool-based "wasted prefetch" measurement,
+    // now grounded in the real cache's real LRU pressure instead of an
+    // artificial round-robin pool). Reset to false whenever a slot is claimed
+    // for a different expert, same lifecycle as also_in_vram.
+    bool loaded_by_prefetch = false;
 
     // True when this slot was claimed by Phase B's speculative disk-batch
     // padding (RAMSafetyManager::get_experts_batch, disk_batch_padding
@@ -184,7 +233,7 @@ struct MoEExpertBlock {
     // io_uring submission, not because THIS token actually routed to it).
     // One-shot: cleared the first time this slot is genuinely hit (n_pad_
     // reads_hit_later, perf_timer.hpp) -- deliberately NOT persistent like
-    // from_pipe_prefetch above (which tracks promotion eligibility, not a
+    // loaded_by_prefetch above (which tracks promotion eligibility, not a
     // single did-this-pay-off event). Also reset to false whenever a slot
     // is claimed for a different expert, same lifecycle as also_in_vram.
     bool from_padding = false;

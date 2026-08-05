@@ -883,14 +883,6 @@ void moe_forward_gguf(
     int n_experts = c.n_experts;
     int moe_inter = c.moe_inter;
 
-    // Publish the cursor BEFORE this layer's own dispatch runs (below),
-    // not after -- acquire_staging_slot's stale-reclaim scan uses strict
-    // less-than specifically because a slot for THIS layer isn't
-    // guaranteed dead yet at this point in the call. Once per layer per
-    // token (prefill's S>1 pass counts as one call here too, same as
-    // decode), covering every real forward pass through this function.
-    async_io_queue.advance_to_layer(layer_idx);
-
     if (n_experts <= 0 || moe_inter <= 0) {
         std::fill(output, output + S * D, 0.0f);
         return;
@@ -1333,8 +1325,14 @@ void moe_forward_gguf(
                     // ram_temp_pin_count's own comment for the real
                     // release_hold-identity-mismatch bug this closes.
                     // Harmless no-op if exp is a shadow scratch block
-                    // (never a RAM-tier victim-selection candidate).
-                    exp->ram_temp_pin_count++;
+                    // (never a RAM-tier victim-selection candidate). Goes
+                    // through RAMSafetyManager::ram_pin (not a direct field
+                    // increment) -- a LockFreePrefetcher worker thread's own
+                    // claim_or_wait victim-selection scan now reads this
+                    // exact field too, under ram_mutex; an unlocked write
+                    // here would race that locked read. See ram_pin's own
+                    // comment (ram_manager.hpp).
+                    ram_mgr.ram_pin(*exp);
                 } else {
                     // gpu_scratch.ensure's cudaMalloc genuinely failed (VRAM
                     // exhaustion) -- this expert never got Pass B queued, so
@@ -1604,8 +1602,10 @@ void moe_forward_gguf(
             // has already happened. Must be the LAST thing done with
             // p.exp's identity in this iteration; this slot becomes a valid
             // victim-selection candidate again immediately after this
-            // decrement.
-            if (p.exp->ram_temp_pin_count > 0) p.exp->ram_temp_pin_count--;
+            // decrement. Goes through RAMSafetyManager::ram_unpin -- see
+            // Pass A's matching ram_pin call for why this is no longer a
+            // direct field decrement.
+            ram_mgr.ram_unpin(*p.exp);
             accumulate(p.k, p.exp, scratch.down_buf.data());
         }
 
@@ -1899,20 +1899,6 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     }
                 }
 
-                // Layer l+1's active host-cache slots -- checked below so a
-                // hint is never pushed for an expert that's ALREADY resident.
-                // Such an expert is a guaranteed instant hit needing no read
-                // at all once actually reached, so speculatively prefetching
-                // it anyway only steals scarce worker-thread I/O bandwidth
-                // from hints that genuinely need a disk read. Bounded to the
-                // REAL active cap (ram_mgr.slots_per_layer), matching
-                // RAMSafetyManager::get_expert's own bound -- slots past that
-                // cap are never populated, so scanning them would be wasted
-                // work, not a correctness issue either way.
-                auto& next_slots = engine.layers_experts[l + 1];
-                size_t next_cap = next_slots.empty() ? 0
-                    : std::min(next_slots.size(), (size_t)std::max(1, ram_mgr.cap_for_layer(l + 1)));
-
                 int pilot_k = std::min(pilot_k_for_layer(l + 1), c.topk);
                 // Recall instrumentation: capture the full predicted set
                 // BEFORE the already-resident skip below, so this measures
@@ -1940,10 +1926,19 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     scratch.pilot_logits[best_exp] = -2e30f;
                     scratch.pilot_pred_ids[k] = best_exp;
 
-                    bool already_ram = false;
-                    for (size_t si = 0; si < next_cap; ++si) {
-                        if (next_slots[si].expert_id == best_exp) { already_ram = true; break; }
-                    }
+                    // Checked so a hint is never pushed for an expert that's
+                    // ALREADY resident -- a guaranteed instant hit needing no
+                    // read at all once actually reached, so speculatively
+                    // prefetching it anyway only steals scarce worker-thread
+                    // I/O bandwidth from hints that genuinely need a disk
+                    // read. Routed through RAMSafetyManager::is_ram_resident
+                    // (locked internally) rather than a raw scan of
+                    // engine.layers_experts[l+1] -- a LockFreePrefetcher
+                    // worker thread can now concurrently claim/evict slots
+                    // in that exact array via claim_or_wait, so an unlocked
+                    // read of expert_id here would be a real data race, not
+                    // just an occasionally-stale peek.
+                    bool already_ram = ram_mgr.is_ram_resident(l + 1, best_exp);
                     // FIX: this used to only check the RAM tier. Before the
                     // [TIER-OVERLAP] fix, a VRAM-resident expert was almost
                     // always ALSO RAM-resident (moe_forward_gguf loaded

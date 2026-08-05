@@ -225,38 +225,28 @@ struct EngineConfig {
     // yet (pilot_k=8 hints pushed per layer transition, one thread
     // servicing them strictly one at a time). Each thread gets its own
     // io_uring ring when io_uring=true (a Ring is not shareable across
-    // threads); the staging pool (prefetch_staging_slots, below) is still
-    // shared and mutex-protected, so this doesn't change staging pool
-    // capacity, only how fast hints get started. Kept modest by default --
-    // these threads mostly block on
-    // I/O rather than compute, but more of them means more concurrent
-    // cudaMallocHost/staging_mutex contention too.
+    // threads). Each worker claims/populates/publishes real RAM-tier slots
+    // directly via RAMSafetyManager::claim_or_wait (see async_prefetcher.
+    // hpp's active_prefetch) -- there is no separate staging pool anymore
+    // (see below), so this only controls how many concurrent speculative
+    // reads can be in flight at once, not any pool-sizing tradeoff. Kept
+    // modest by default -- these threads mostly block on I/O rather than
+    // compute, but more of them means more concurrent ram_mutex/cache_mutex
+    // contention too.
     int prefetch_worker_threads = 2;
 
-    // Number of round-robin pinned-host staging slots the async prefetcher
-    // holds prefetched-but-not-yet-consumed expert slabs in
-    // (LockFreePrefetcher::staging, async_prefetcher.hpp). Was a hardcoded
-    // compile-time constant (16, then bumped to 64) because PrefetchSlot
-    // holds std::atomic<bool> members that aren't move-safe for a
-    // std::vector -- now a runtime-sized array allocated once in
-    // LockFreePrefetcher::start(), so this is a real knob. Real-run
-    // instrumentation (n_staged_evicted_unused, "Staged-unused evict" in the
-    // perf report) showed a fixed pool round-robin-evicting a correctly-
-    // predicted, successfully-staged expert before the corresponding cache
-    // miss ever consumed it -- i.e. the pool cycling faster than misses
-    // arrive, not misprediction (Pilot recall stayed ~85% the whole time).
-    // First bumped 64->128; a longer real run (32k context, 50 decode
-    // tokens) showed hint volume grows with workload size roughly as fast
-    // as the pool does, so 128 was STILL only good enough to keep ~2% of
-    // staged experts alive to be consumed (Staged-unused evict 11387 of
-    // 11671 hints processed) -- essentially unchanged from 64's ratio.
-    // Raised again to 256. Each slot costs one pinned-host allocation sized
-    // to the largest expert slab seen so far (grows lazily, see
-    // acquire_staging_slot) -- budget roughly slots x largest-slab-size of
-    // page-locked host RAM (a few GB at 256 slots for this project's expert
-    // sizes), separate from and additional to moe_cache_gb/host_ram_gb --
-    // watch total system memory if you raise this further.
-    int prefetch_staging_slots = 256;
+    // NOTE: this used to also have a `prefetch_staging_slots` knob sizing a
+    // separate pinned-host round-robin staging pool the prefetcher held
+    // prefetched-but-not-yet-consumed expert slabs in. That whole pool was
+    // removed when the prefetcher was unified with the RAM-tier cache
+    // (RAMSafetyManager::claim_or_wait) -- a prefetch worker now writes
+    // straight into a real RAM-tier slot, the exact same structure the
+    // decode thread's own cache hits read from, so there is no second pool
+    // left to size. See CLAUDE.md for the investigation that motivated the
+    // unification (the old pool's own round-robin eviction was shown to be
+    // a secondary, structural waste source independent of prediction
+    // accuracy) and ram_manager.hpp's claim_or_wait for the design that
+    // replaced it.
 
     // Host RAM (DDR) budget for the MoE expert LRU cache, in GB.
     // 0 = auto-detect (88% of currently-available system memory).
@@ -703,7 +693,6 @@ inline bool EngineConfig::load(const std::string& path) {
     disk_batch_padding        = doc.root.get_bool("disk_batch_padding", disk_batch_padding);
     disk_batch_padding_target = doc.root.get_int("disk_batch_padding_target", disk_batch_padding_target);
     prefetch_worker_threads = doc.root.get_int("prefetch_worker_threads", prefetch_worker_threads);
-    prefetch_staging_slots = doc.root.get_int("prefetch_staging_slots", prefetch_staging_slots);
     host_ram_gb      = doc.root.get_double("host_ram_gb", host_ram_gb);
     verbose_moe_log  = doc.root.get_bool("verbose_moe_log", verbose_moe_log);
     promote_hit_threshold = doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
@@ -878,7 +867,6 @@ inline void EngineConfig::print() const {
         LOG_STREAM_INFO() << "[CONFIG] Disk batch padding: ON (target " << disk_batch_padding_target
                            << " experts/submission, speculative reads from route_freq)\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch worker threads: " << prefetch_worker_threads << "\n";
-    LOG_STREAM_INFO() << "[CONFIG] Prefetch staging slots: " << prefetch_staging_slots << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch pilot_k (hints/layer transition): default=" << prefetch_pilot_k
                        << (prefetch_pilot_k_per_layer.empty() ? "" : ", " + std::to_string(prefetch_pilot_k_per_layer.size())
                            + " layer override value(s) set (see [PREFETCH-LAYER] report)")
@@ -1064,26 +1052,14 @@ disk_batch_padding_target = 8
 # promotion). Default 2. Each gets its own io_uring ring when io_uring=true.
 # More threads means hints get STARTED sooner (fixes a real "worker hadn't
 # even begun this read yet" gap seen in PIPE instrumentation), at the cost
-# of more concurrent contention on the staging pool (see
-# prefetch_staging_slots below).
+# of more concurrent contention on ram_mutex/cache_mutex. (There used to
+# also be a prefetch_staging_slots knob here, sizing a separate pinned-host
+# staging pool the prefetcher held prefetched-but-not-yet-consumed slabs
+# in -- removed when the prefetcher was unified with the RAM-tier cache: a
+# worker now writes straight into a real cache slot via
+# RAMSafetyManager::claim_or_wait, the same structure the decode thread's
+# own cache hits read from, so there is no second pool left to size.)
 prefetch_worker_threads = 2
-
-# prefetch_staging_slots: number of pinned-host round-robin slots the async
-# prefetcher holds prefetched expert slabs in before a cache miss consumes
-# them. Default 256 (was a hardcoded compile-time 64, then 128). Too small
-# and a correctly-predicted, successfully-staged expert gets round-robin-
-# evicted before the matching miss arrives -- see "Staged-unused evict" in
-# the perf report; a high count there (as a fraction of total hints
-# processed) means this is undersized relative to how many hints are in
-# flight between pilot_k per-layer predictions and worker throughput. Hint
-# volume scales with workload size (context length, tokens generated), so
-# re-check this ratio after any change to those and raise further if it's
-# still high. Each slot lazily grows its pinned allocation to the largest
-# expert slab it has held, so cost scales with slot count x max slab size --
-# a few GB of page-locked host RAM at 256 slots, separate from and
-# additional to moe_cache_gb/host_ram_gb; watch total system memory if you
-# raise this further.
-prefetch_staging_slots = 256
 
 # prefetch_pilot_k: how many candidate experts the pilot router pushes as
 # speculative prefetch hints per layer transition. Default 8 (was a

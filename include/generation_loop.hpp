@@ -191,18 +191,21 @@ public:
     }
 };
 
-// `prefetcher` is now caller-owned (main.cpp starts it ONCE for the whole
-// session with the real VRAM topology, alongside ram_mgr.vram_cache/
-// ram_mgr.prefetcher) instead of generate_text creating and starting its
-// OWN local, topology-less instance per request. That local instance was a
-// real structural bug (Phase A  investigation): it received
-// pilot-prefetch hints and did real disk I/O, but with gpu_topo=nullptr its
-// finish_prefetch() could never fire an async VRAM promotion -- and
-// meanwhile main.cpp's OWN topology-enabled prefetcher instance sat idle,
-// receiving zero hints. Net effect: speculative disk reads whose result was
-// consumed by no one. Passing the SAME instance everywhere (this function,
-// ram_mgr.prefetcher for the consume_staged miss-path) makes hints,
-// staging, and VRAM promotion all flow through one prefetcher.
+// `prefetcher` is caller-owned (main.cpp starts it ONCE for the whole
+// session with the real VRAM topology and a pointer back to ram_mgr --
+// prefetcher.ram_mgr, set right after prefetcher.start() -- see main.cpp's
+// own comment on that assignment) instead of generate_text creating and
+// starting its OWN local, topology-less instance per request. That local
+// instance was a real structural bug (an earlier investigation): it
+// received pilot-prefetch hints and did real disk I/O, but with
+// gpu_topo=nullptr its (since-removed) finish_prefetch() could never fire
+// an async VRAM promotion -- and meanwhile main.cpp's OWN topology-enabled
+// prefetcher instance sat idle, receiving zero hints. Net effect:
+// speculative disk reads whose result was consumed by no one. Passing the
+// SAME instance everywhere (this function, and prefetcher.ram_mgr for
+// LockFreePrefetcher::active_prefetch's own claim_or_wait calls into the
+// RAM tier) makes hints and claims all flow through one prefetcher talking
+// to one RAM tier.
 void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFTokenizer& tokenizer,
                    LockFreePrefetcher& prefetcher,
                    const std::vector<int>& prompt_ids, int max_new_tokens, int eos_id,

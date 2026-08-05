@@ -50,7 +50,6 @@ void print_usage() {
               << "                   (Linux only, kernel >= 5.6; independent of --direct-io -- falls\n"
               << "                   back to sequential preads automatically if unsupported)\n"
               << "  --prefetch-threads <N>  Concurrent async prefetcher worker threads (default: 2)\n"
-              << "  --prefetch-staging-slots <N>  Pinned-host staging slots for the async prefetcher (default: 128)\n"
               << "  --verbose-moe    Log every MoE host-cache hit (high volume, debug only)\n"
               << "  --promote-threshold <N>  Number of host re-hits before async H2D promote (default: 1)\n"
               << "  --pin-threshold <N>  VRAM-resident hit_count before pinning (never evicted; default: 8, 0=off)\n"
@@ -288,7 +287,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
     // Connect VRAM expert cache to the RAM manager for LRU integration
     ram_mgr.vram_cache = &gpu.topology;
-    ram_mgr.prefetcher = &prefetcher;
+    // NOTE: the reverse pointer (RAMSafetyManager -> LockFreePrefetcher) no
+    // longer exists -- under the unified claim/publish design the
+    // prefetcher calls INTO RAMSafetyManager::claim_or_wait, not the other
+    // way around, so ram_mgr itself never needs to reach the prefetcher.
+    // See prefetcher.ram_mgr's own assignment further down (after the Tier-3
+    // RAM preload block) for the one remaining pointer, in the opposite
+    // direction.
 
     // Offload dense tensors to core GPU VRAM — via a single pool allocation
     // (see CudaManager::init_dense_pool/offload_tensor_to_pool) rather than
@@ -707,12 +712,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         }
     }
 
-    LOG_STREAM_INFO() << "[I/O] Spinning up asynchronous lock-free SPSC prefetch threads...\n";
-    prefetcher.start(&engine, &gpu.topology, config.io_uring, config.prefetch_worker_threads,
-                      config.prefetch_staging_slots);
+    // prefetcher.start() moved to AFTER the [PIN] preload block below (see
+    // that block's own closing comment for why) -- the worker threads it
+    // spawns now claim/populate/publish directly into engine.layers_experts
+    // via RAMSafetyManager::claim_or_wait, and [PIN]'s Tier-3 preload writes
+    // into that exact same structure; starting the threads only once that
+    // preload has fully finished removes any need to reason about ordering
+    // between them.
+    //
     // Decode thread's OWN io_uring ring for RAMSafetyManager::get_experts_batch's
     // Phase B (the synchronous miss path -- see ram_manager.hpp's decode_uring_ring
-    // comment for why this is a separate scope from the prefetcher's rings above).
+    // comment for why this is a separate scope from the prefetcher's rings).
+    // Unaffected by the prefetcher.start() move -- [PIN] preload never uses
+    // this ring, only engine.load_expert_slab's plain synchronous pread.
     ram_mgr.init_decode_uring(config.io_uring, config.io_uring_workers);
 
     // extended to a graduated 3-tier scheme (was:
@@ -1089,23 +1101,23 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     MoEExpertBlock& slot = engine.layers_experts[layer][slot_idx];
                     engine.load_expert_slab(v[i].layer, v[i].expert, slot);
                     if (slot.slab_buffer && slot.slab_capacity > 0) {
-                        slot.last_used_clock = ++ram_mgr.global_clock;
-                        slot.hit_count = 0;
                         ++ram_preloaded;
-                        // Writes directly into layers_experts, bypassing
-                        // RAMSafetyManager::get_expert/get_experts_batch
-                        // entirely -- so ram_expert_index (added to fix
-                        // get_experts_batch's O(cap) hit-check scan, see
-                        // CLAUDE.md) never gets an entry for a Tier-3-
-                        // preloaded expert unless this is added explicitly.
-                        // Without this, EVERY preloaded expert's first
-                        // runtime lookup would look like a genuine index
-                        // miss, which is indistinguishable from "really not
-                        // resident" once find_ram_slot stops falling back to
-                        // a linear scan on absence (see that function's own
-                        // comment for why the fallback-on-miss had to go).
-                        ram_mgr.ram_expert_index[RAMSafetyManager::swap_key(v[i].layer, v[i].expert)]
-                            = (size_t)slot_idx;
+                        // Goes through RAMSafetyManager::preload_ram_slot
+                        // (takes ram_mutex internally) rather than poking
+                        // last_used_clock/hit_count/ram_expert_index
+                        // directly -- closes a real gap: this used to be
+                        // safe only because LockFreePrefetcher's worker
+                        // threads happened to not exist yet at this exact
+                        // point in startup (prefetcher.start() is now called
+                        // AFTER this whole [PIN] block finishes, specifically
+                        // so that timing argument becomes unnecessary rather
+                        // than load-bearing). preload_ram_slot also inserts
+                        // the ram_expert_index entry this write needs --
+                        // without it, every preloaded expert's first runtime
+                        // lookup would look like a genuine index miss
+                        // (indistinguishable from "really not resident"),
+                        // see that function's own comment.
+                        ram_mgr.preload_ram_slot(engine, v[i].layer, v[i].expert, (size_t)slot_idx);
                     }
                 }
             }
@@ -1130,6 +1142,25 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             }
         }
     }
+
+    // Spun up here, AFTER the [PIN] block above has fully finished writing
+    // into engine.layers_experts (Tier-3 RAM preload) and gpu.topology
+    // (Tier-1/Tier-2 VRAM preload) -- worker threads claim/populate/publish
+    // directly into that same RAM-tier structure via RAMSafetyManager::
+    // claim_or_wait (see async_prefetcher.hpp's active_prefetch), so
+    // starting them only once startup preload is done removes any need to
+    // reason about ordering between the two, rather than relying on "no
+    // push_hint call happens until the decode loop starts" as an implicit
+    // timing argument.
+    LOG_STREAM_INFO() << "[I/O] Spinning up asynchronous lock-free SPSC prefetch threads...\n";
+    prefetcher.start(&engine, &gpu.topology, config.io_uring, config.prefetch_worker_threads);
+    // Unified claim/publish design: the prefetcher calls INTO
+    // RAMSafetyManager::claim_or_wait, so it needs a pointer back to it --
+    // the reverse of the old (now-removed) RAMSafetyManager::prefetcher
+    // field. Raw, non-owning: ram_mgr outlives prefetcher for the whole
+    // process lifetime (both are stack-local to main(), ram_mgr declared
+    // first).
+    prefetcher.ram_mgr = &ram_mgr;
 
     std::cout << "----------------------------------------\n";
     std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
@@ -1238,7 +1269,6 @@ int main(int argc, char* argv[]) {
     std::string pin_file_cli;
     int expert_fetch_threads_cli = -1;
     int prefetch_worker_threads_cli = -1;
-    int prefetch_staging_slots_cli = -1;
     int max_ctx = 4096;
     int max_new_tokens = 1024;
     int gpu_id = 0;
@@ -1285,7 +1315,6 @@ int main(int argc, char* argv[]) {
         else if (arg == "--pin-file" && i + 1 < argc) pin_file_cli = argv[++i];
         else if (arg == "--expert-fetch-threads" && i + 1 < argc) expert_fetch_threads_cli = std::stoi(argv[++i]);
         else if (arg == "--prefetch-threads" && i + 1 < argc) prefetch_worker_threads_cli = std::stoi(argv[++i]);
-        else if (arg == "--prefetch-staging-slots" && i + 1 < argc) prefetch_staging_slots_cli = std::stoi(argv[++i]);
         else if (arg == "--log-path" && i + 1 < argc) log_path_cli = argv[++i];
         else if (arg == "--log-level" && i + 1 < argc) log_level_cli = argv[++i];
         else if (arg == "--temp" && i + 1 < argc) temp_cli = std::stof(argv[++i]);
@@ -1346,7 +1375,6 @@ int main(int argc, char* argv[]) {
     if (!pin_file_cli.empty()) config.pin_file = pin_file_cli;
     if (expert_fetch_threads_cli > 0) config.expert_fetch_threads = expert_fetch_threads_cli;
     if (prefetch_worker_threads_cli > 0) config.prefetch_worker_threads = prefetch_worker_threads_cli;
-    if (prefetch_staging_slots_cli > 0) config.prefetch_staging_slots = prefetch_staging_slots_cli;
     if (!log_path_cli.empty()) config.log_path = log_path_cli;
     if (!log_level_cli.empty()) config.log_level = log_level_cli;
     if (temp_cli >= 0.0f) config.temperature = temp_cli;
