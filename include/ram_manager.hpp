@@ -1844,51 +1844,27 @@ public:
                     // and Logger (LOG_DEBUG) holds its own internal mutex.
                     trace_ram_load_if_recently_fetched(layer, pl.expert_id, "batch_miss_pread");
                     trace_phase_gap_if_staged_after_check(layer, pl.expert_id, pl.phase_a_check_at_us);
-
-                    // THE FIX for the Phase-A/Phase-B gap the two traces
-                    // above measure: Phase A's consume_staged check for
-                    // this expert is now stale by construction (real time
-                    // has passed -- see phase_a_check_at_us) -- a real run
-                    // showed 97.8% of the time a staged copy is found
-                    // AFTER that check, not before, with an avg 9.38ms
-                    // gap. Retry consume_staged ONE more time, right here,
-                    // immediately before the synchronous read it would
-                    // otherwise unconditionally pay for -- consume_staged
-                    // itself is cheap (a bounded staging_mutex scan, no
-                    // disk I/O) relative to the ~11ms disk read it can
-                    // avoid entirely on a hit. Mirrors get_expert Step 3 /
-                    // get_experts_batch Phase A's own consume_staged
-                    // pattern exactly (same geometry lookup, same
-                    // populate_packed_slab call), just gated the same way
-                    // (prefetcher present, packed format) and placed at
-                    // the LAST possible moment before the real read.
+                    // REVERTED: a per-item consume_staged recheck used to run
+                    // here, right before load_expert_slab. Never actually
+                    // exercised on this system (this branch only runs when
+                    // io_uring's batch path fails, which has been 0% of the
+                    // time across every observed run) -- but the io_uring-
+                    // path version of the SAME idea, which WAS exercised,
+                    // proved to be a net negative for reasons that apply
+                    // here too: the recheck runs essentially immediately
+                    // after Phase A (no disk I/O happens in between), so it
+                    // can't span the ~9ms window during which staging
+                    // typically completes (see trace_phase_gap_if_staged_
+                    // after_check's own measurements), AND consume_staged
+                    // increments n_pipe_miss_no_match on every failed call,
+                    // so a second failed call per expert would double-count
+                    // that shared counter the same way it did on the
+                    // io_uring path (confirmed there: ~2.0x inflation of
+                    // the "no matching staged slot" report line). Reverted
+                    // for consistency rather than leaving an unverified,
+                    // likely-broken-when-it-wakes-up code path in place.
                     auto t0 = std::chrono::high_resolution_clock::now();
-                    bool rescued = false;
-                    if (prefetcher && !engine.unpacked_expert_format) {
-                        size_t gb, ub, db;
-                        const GGUFTensor *gM, *uM, *dM;
-                        if (engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
-                            size_t total = gb + ub + db;
-                            engine.ensure_slab_capacity(victim, total);
-                            size_t got_bytes = 0;
-                            double not_ready_ms = -1.0;
-                            perf().n_phase_b_recheck_attempts.fetch_add(1, std::memory_order_relaxed);
-                            bool ok = prefetcher->consume_staged(layer, pl.expert_id, victim.slab_buffer,
-                                                                  victim.slab_capacity, &got_bytes, &not_ready_ms);
-                            if (ok && got_bytes == total) {
-                                engine.populate_packed_slab(victim, pl.expert_id, gb, ub, db, *gM, *uM, *dM);
-                                victim.from_pipe_prefetch = true;
-                                rescued = true;
-                                perf().n_phase_b_recheck_hits.fetch_add(1, std::memory_order_relaxed);
-                                perf().n_pipe_hits.fetch_add(1, std::memory_order_relaxed);
-                                if (in_prefill) perf().n_pipe_hits_prefill.fetch_add(1, std::memory_order_relaxed);
-                                else perf().n_pipe_hits_decode.fetch_add(1, std::memory_order_relaxed);
-                            }
-                        }
-                    }
-                    if (!rescued) {
-                        engine.load_expert_slab(layer, pl.expert_id, victim);
-                    }
+                    engine.load_expert_slab(layer, pl.expert_id, victim);
                     pl.load_ms = std::chrono::duration<double, std::milli>(
                         std::chrono::high_resolution_clock::now() - t0).count();
                 }
@@ -1899,14 +1875,9 @@ public:
                     PendingLoad& pl = pending[i];
                     MoEExpertBlock& victim = layer_slots[pl.slot_idx];
                     ram_swap_stats[swap_key(layer, pl.expert_id)].swap_in++;
-                    // from_pipe_prefetch was reset false at this slot's
-                    // Phase-A claim time and only ever set true by THIS
-                    // expert's own rescue above, so it's a safe, correct
-                    // signal here for which path actually served it.
-                    LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%zu evicted=%d loaded_from_disk=%.2fms via=%s "
+                    LOG_DEBUG("[MOE-CACHE] MISS  layer=%d expert=%d slot=%zu evicted=%d loaded_from_disk=%.2fms via=pread "
                               "(%.2f MB, %.2f GB/s) [batch=%d/%d]\n",
                               layer, pl.expert_id, pl.slot_idx, pl.evicted_expert_id, pl.load_ms,
-                              victim.from_pipe_prefetch ? "PIPE(phase_b_recheck)" : "pread",
                               victim.slab_capacity / 1e6,
                               pl.load_ms > 0 ? (victim.slab_capacity / 1e9) / (pl.load_ms / 1000.0) : 0.0,
                               i + 1, n_pending);

@@ -384,20 +384,17 @@ struct PerfCounters {
     std::atomic<uint64_t> n_phase_gap_staged_before_check_anomaly{0};
     std::atomic<double> t_phase_gap_ms_sum{0};
 
-    // The actual FIX for the Phase-A/Phase-B gap measured above: the OMP-
-    // parallel pread fallback in RAMSafetyManager::get_experts_batch now
-    // retries consume_staged ONE more time, immediately before its own
-    // synchronous load_expert_slab call, instead of trusting only Phase
-    // A's earlier one-time check. n_phase_b_recheck_attempts is the
-    // denominator (every pending expert this fallback path processes);
-    // n_phase_b_recheck_hits is how many of those were rescued by the
-    // second check -- avoiding a real disk read entirely. A rescue also
-    // feeds the EXISTING n_pipe_hits/n_pipe_hits_prefill/n_pipe_hits_decode
-    // counters (it genuinely IS a PIPE hit, just discovered later), so
-    // the "Prefetch (PIPE) served" report line directly reflects this
-    // fix's real effect on overall utilization, not just a side stat.
-    std::atomic<uint64_t> n_phase_b_recheck_attempts{0};
-    std::atomic<uint64_t> n_phase_b_recheck_hits{0};
+    // A "recheck consume_staged right before the real read" fix was tried
+    // at both Phase-B call sites (io_uring batch path and this OMP
+    // fallback) and reverted from both -- real-run evidence showed
+    // near-zero benefit (the recheck can't span the ~9ms window
+    // t_phase_gap_ms_sum measures, since it runs almost immediately after
+    // Phase A with no disk I/O in between) plus a genuine regression
+    // (consume_staged increments n_pipe_miss_no_match on every failed
+    // call, so a second failed call per expert doubled that counter,
+    // confirmed at ~2.0x inflation of the "no matching staged slot"
+    // report line on a real run). See ram_manager.hpp's get_experts_batch
+    // for the full removal rationale at both former call sites.
     // Elapsed time (microseconds) sums for the *_had_staged_fetch buckets
     // specifically -- how long the fetch had been sitting ready before an
     // independent hit beat it to the dispatch. (in-flight/evicted buckets
@@ -1619,21 +1616,6 @@ struct PerfCounters {
                          pg_total > 0 ? 100.0 * after / pg_total : 0.0, avg_gap_ms,
                          (unsigned long)anomaly, (unsigned long)pg_total,
                          pg_total > 0 ? 100.0 * anomaly / pg_total : 0.0);
-            }
-        }
-        {
-            uint64_t rc_attempts = n_phase_b_recheck_attempts.load();
-            uint64_t rc_hits = n_phase_b_recheck_hits.load();
-            if (rc_attempts > 0) {
-                LOG_INFO("Phase-B recheck fix: %lu/%lu (%.1f%%) of the OMP-fallback pending experts were "
-                         "rescued by re-trying consume_staged immediately before their own synchronous "
-                         "read, instead of trusting only Phase A's earlier (by then stale) check -- each "
-                         "rescue avoided a real disk read entirely and counts as a genuine PIPE hit (also "
-                         "folded into Prefetch (PIPE) served above). This is the direct fix for the "
-                         "Phase-A/Phase-B gap measured just above; compare this run's 'really required' "
-                         "percentage against a pre-fix run to see the real effect on overall utilization.\n",
-                         (unsigned long)rc_hits, (unsigned long)rc_attempts,
-                         rc_attempts > 0 ? 100.0 * rc_hits / rc_attempts : 0.0);
             }
         }
         LOG_INFO("Cache mutex wait:    %8.3f s  (GpuTopology::cache_mutex, shared between the decode "
