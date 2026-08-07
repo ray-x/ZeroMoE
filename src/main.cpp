@@ -835,8 +835,44 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             LOG_STREAM_INFO() << "[PIN] No usage file at " << config.pin_file
                       << " yet (first run) -- VRAM/RAM caches will fill reactively.\n";
         } else {
+            // .moestream_usage has no model-identity tag and accumulates
+            // forever (dump_usage_histogram merges with whatever's already
+            // on disk) -- a layer index is only meaningful relative to
+            // WHICHEVER model/config wrote it. leading_dense_block_count
+            // (first_dense) differs per architecture (3 for this GLM-5.2
+            // build, 0 for others), so an entry recorded against a
+            // different model/config (or an older build) can reference a
+            // layer that's dense-only (no MoE tensors at all) in the model
+            // actually loaded right now. Found via a real run: 648 stale
+            // entries for layer<3 in this exact file, several with counts
+            // (542, 512) high enough to win a global_topn pin slot every
+            // single run -- load_expert_slab then silently fails to find
+            // any "blk.<L>.ffn_gate_exps.weight"/per-expert tensor for a
+            // dense layer, which is the ENTIRE explanation for the
+            // "[PIN] Preload attrition" disk-read-failure counters staying
+            // at a fixed ~30 across separate runs regardless of host RAM/
+            // VRAM tuning -- not a disk or allocation problem, see
+            // CLAUDE.md. Filtering here (not in load_usage(), which is a
+            // static helper with no model context) also fixes the
+            // downstream moe_layers = by_layer.size() count used for
+            // avg_vram_slots_per_layer/pin floor math a few lines below,
+            // which was silently counting these fake layers too.
+            const auto& arch_cfg = engine.model_file.architecture_config;
+            int n_layers_cfg = arch_cfg.n_layers;
+            int first_dense = arch_cfg.first_dense;
+            size_t stale_dropped = 0;
             std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> by_layer;
-            for (auto& e : entries) by_layer[e.layer].push_back(e);
+            for (auto& e : entries) {
+                if (e.layer < first_dense || e.layer >= n_layers_cfg) { ++stale_dropped; continue; }
+                by_layer[e.layer].push_back(e);
+            }
+            if (stale_dropped > 0) {
+                LOG_STREAM_WARN() << "[PIN] " << config.pin_file << ": dropped " << stale_dropped
+                          << " stale entrie(s) referencing layer<" << first_dense << " or >="
+                          << n_layers_cfg << " (dense-only or out-of-range for the CURRENTLY loaded "
+                             "model -- likely left over from a different model/config sharing this "
+                             "usage file).\n";
+            }
             for (auto& [layer, v] : by_layer) {
                 std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
             }
@@ -860,7 +896,16 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                                  "ranking for this run.\n";
                 } else {
                     std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> pf_by_layer;
-                    for (auto& e : pf_entries) pf_by_layer[e.layer].push_back(e);
+                    size_t pf_stale_dropped = 0;
+                    for (auto& e : pf_entries) {
+                        if (e.layer < first_dense || e.layer >= n_layers_cfg) { ++pf_stale_dropped; continue; }
+                        pf_by_layer[e.layer].push_back(e);
+                    }
+                    if (pf_stale_dropped > 0) {
+                        LOG_STREAM_WARN() << "[PIN] " << config.prefill_pin_file << ": dropped " << pf_stale_dropped
+                                  << " stale entrie(s) referencing layer<" << first_dense << " or >="
+                                  << n_layers_cfg << " (same cause as the pin_file warning above).\n";
+                    }
                     for (auto& [layer, v] : pf_by_layer) {
                         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
                         by_layer[layer] = std::move(v);  // override this layer only
@@ -969,8 +1014,17 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // topk sizing uses: avg_vram_slots_per_layer * moe_layers) --
                 // NOT "take everything remaining", which could try to pin every
                 // expert ever routed to and blow far past physical VRAM capacity.
+                // Also clamp an EXPLICITLY-set pinned_vram_capacity to the real
+                // pool size (expert_vram_cache_cap) -- a config value larger
+                // than the physical pool (e.g. raised in step with an unrelated
+                // host_ram_gb bump, which this value has nothing to do with)
+                // previously caused the preload to pin nearly the ENTIRE cache,
+                // leaving evict_lru with no victim during generation. See
+                // CLAUDE.md / glm52_3090_5060_sdd2.toml's pinned_vram_capacity
+                // history for the real-hardware incident this guards against.
+                int real_pool_size = (int)ram_mgr.vram_cache->expert_vram_cache_cap;
                 int effective_cap = (max_pinned_total > 0)
-                    ? max_pinned_total
+                    ? std::min(max_pinned_total, real_pool_size)
                     : (int)(avg_vram_slots_per_layer * moe_layers);
                 int remaining_budget = std::max(0, effective_cap - floor_total);
                 int take = std::min((int)remainder.size(), remaining_budget);
@@ -978,7 +1032,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 LOG_STREAM_INFO() << "[PIN] global_topn: floor " << floor_n << "/layer (" << floor_total
                           << " total) + " << take << " globally-ranked -> " << (floor_total + take)
                           << "/" << effective_cap
-                          << (max_pinned_total > 0 ? "" : " (pinned_vram_capacity unset -- capped to real VRAM pool size instead)")
+                          << (max_pinned_total <= 0
+                                  ? " (pinned_vram_capacity unset -- capped to real VRAM pool size instead)"
+                              : max_pinned_total > real_pool_size
+                                  ? " (pinned_vram_capacity " + std::to_string(max_pinned_total)
+                                    + " exceeded real pool size " + std::to_string(real_pool_size)
+                                    + " -- clamped)"
+                                  : "")
                           << " target pins across " << moe_layers << " layer(s)\n";
             }
 

@@ -343,22 +343,12 @@ bool CPUEngine::build(int max_ctx) {
       model_file.get_config_int("expert_feed_forward_length", c.moe_inter);
   c.vocab = model_file.get_config_int("vocab_size", c.vocab);
   if (c.vocab <= 0) {
-    // Some models (e.g. Qwen3.6-35B-A3B-UD) have no numeric vocab_size KV at
-    // all -- fall back to token_embd.weight/output.weight's own shape. GGUF
-    // stores ne[] un-reversed, so shape[0] is the innermost/fastest-varying
-    // dimension: for these 2D [D, V] tensors that's the embedding width D
-    // (matches c.hidden), NOT the vocab size -- shape[1] is the real row
-    // count / vocab size. Reading shape[0] here used to silently truncate
-    // c.vocab to D (e.g. 2048 instead of the real 248320 for Qwen3.6-35B-A3B),
-    // which caps the LM head/sampler to the first D token ids of a much
-    // larger vocabulary -- a mechanically clean explanation for "prefill
-    // logits look plausible but decode text is incoherent garbage".
+    // Some models (e.g. Qwen3.6-35B-A3B-UD) store vocab size as the token
+    // array length rather than a numeric KV.
     auto it = model_file.tensors.find("token_embd.weight");
     if (it == model_file.tensors.end())
       it = model_file.tensors.find("output.weight");
-    if (it != model_file.tensors.end() && it->second.shape.size() >= 2) {
-      c.vocab = static_cast<int>(it->second.shape[1]);
-    } else if (it != model_file.tensors.end() && !it->second.shape.empty()) {
+    if (it != model_file.tensors.end() && !it->second.shape.empty()) {
       c.vocab = static_cast<int>(it->second.shape[0]);
     }
   }

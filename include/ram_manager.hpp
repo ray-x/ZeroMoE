@@ -923,7 +923,16 @@ public:
         // worth investigating, if this timer turns out small) cost from the
         // cudaMemcpy itself.
         cudaSetDevice(gpu_id);
-        engine.ensure_slab_capacity(victim, total);
+        if (!engine.ensure_slab_capacity(victim, total)) {
+            LOG_WARN("[MOE-RAM] demote_from_vram: host alloc failed layer=%d expert=%d (%.2f MB) -- "
+                      "slot left empty\n", layer, expert_id, total / 1e6);
+            victim.expert_id = -1;
+            victim.also_in_vram = false;
+            victim.loaded_by_prefetch = false;
+            victim.ram_loading = false;
+            perf().n_vram_evict_demote_failed.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         PERF_START(vram_demote_copy);
         cudaError_t err = cudaMemcpy(victim.slab_buffer, device_ptr, total, cudaMemcpyDeviceToHost);
         PERF_END(vram_demote_copy, t_vram_demote_copy);
