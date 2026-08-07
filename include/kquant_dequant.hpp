@@ -66,6 +66,18 @@ inline bool gpu_type_supported(GGUFType type) {
         // dump_report() before trusting further.
         case GGUFType::IQ4_XS:
             return true;
+        // MXFP4: cuda/mxfp4_matmul.cu's launch_mxfp4_matmul (verbatim port
+        // of ggml's dequantize_row_mxfp4, warp-per-32-element-block design)
+        // — RE-ENABLED after passing src/main_test.cpp's Test 5 case on
+        // real Linux/CUDA hardware (RTX 3090 + RTX 5060 Ti): all 3 shapes
+        // (I=512/O=8/S=3, I=4096/O=4/S=2, and the real production shape
+        // I=2048/O=6144/S=1 matching DeepSeek-V4-Flash's actual
+        // blk.42.ffn_down_exps.weight) PASSED with float-noise-level
+        // max_rel_diff (2.7e-6, 9.9e-7, 1.8e-4). Per the IQ4_XS incident's
+        // own lesson, this was deliberately left disabled until that real
+        // pass — see CLAUDE.md and this change's plan file for the writeup.
+        case GGUFType::MXFP4:
+            return true;
         // No GPU kernel implemented anywhere in cuda/*.cu for these: IQ3_S,
         // IQ4_NL, TQ1_0, TQ2_0, IQ2_M. See gpu_unsupported_reason() for why
         // each specific one isn't supported yet.
@@ -105,6 +117,11 @@ inline const char* gpu_type_name(GGUFType type) {
         case GGUFType::TQ1_0:   return "TQ1_0";
         case GGUFType::TQ2_0:   return "TQ2_0";
         case GGUFType::IQ2_M:   return "IQ2_M";
+        // Naming this independent of gpu_type_supported()'s decision — logs
+        // should say "MXFP4", not "UNKNOWN", even while GPU dispatch for it
+        // is still dormant (see gpu_type_supported()'s own comment above).
+        case GGUFType::MXFP4:   return "MXFP4";
+        case GGUFType::NVFP4:   return "NVFP4";
         default:                return "UNKNOWN";
     }
 }
@@ -133,6 +150,8 @@ inline double gpu_type_bits_per_weight(GGUFType type) {
         case GGUFType::IQ1_M:   return 1.75;
         case GGUFType::TQ1_0:   return 1.6875;
         case GGUFType::IQ1_S:   return 1.5625;
+        case GGUFType::MXFP4:   return 4.25;   // 17 bytes * 8 / 32 elements
+        case GGUFType::NVFP4:   return 4.5;    // 36 bytes * 8 / 64 elements
         default:                return 0.0;  // unknown — don't claim a number
     }
 }
@@ -188,6 +207,11 @@ inline const char* gpu_unsupported_reason(GGUFType type) {
             return "codebook quantization -- no ggml CPU dequant export exists "
                    "either (see kquant_dequant.hpp's dequant_row), so this type "
                    "is unsupported on BOTH paths, not just GPU.";
+        // MXFP4 moved to gpu_type_supported()'s TRUE case above (re-enabled
+        // after a real-hardware Test 5 pass) -- this switch is unreachable
+        // for it now, since gpu_unsupported_reason() already returns early
+        // with "supported" for anything gpu_type_supported() accepts. Same
+        // pattern as IQ4_XS's own case just above.
         default:
             return "no fused CUDA kernel implemented for this type.";
     }
@@ -277,6 +301,18 @@ inline int row_bytes(GGUFType type, int I) {
         case GGUFType::TQ1_0:    return (I / 256) * 54;
         case GGUFType::TQ2_0:    return (I / 256) * 66;
         case GGUFType::IQ4_NL:   return (I / 32)  * 18;  // block size 32, not 256 — like Q4_0
+        // Missing exactly like the IQ3_XXS/IQ3_S/IQ4_XS gap above (same
+        // failure mode: cpu_quant_matmul walks W+o*rb with a bogus stride,
+        // NaN/garbage rather than a clean crash for a real DeepSeek-V4-Flash
+        // MXFP4 tensor -- see gguf_loader.hpp's calculate_size(), which
+        // needed the identical addition; both tables are independent, this
+        // one wasn't caught by that earlier fix). Sizes verified against
+        // ggml's block struct static_asserts (ggml-common.h): block_mxfp4
+        // = 1(e) + QK_MXFP4/2(16) = 17 bytes per 32-element block;
+        // block_nvfp4 = QK_NVFP4/QK_NVFP4_SUB(4) + QK_NVFP4/2(32) = 36
+        // bytes per 64-element block.
+        case GGUFType::MXFP4:    return (I / 32)  * 17;
+        case GGUFType::NVFP4:    return (I / 64)  * 36;
         default:
             LOG_ERROR("[ROW_BYTES] type=%u has no known row size — "
                       "this WILL misalign cpu_quant_matmul and can crash. "

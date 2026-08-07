@@ -23,6 +23,13 @@ enum class ModelFamily {
   GLM4_MOE,    // GLM-4.5 with standard attention + MoE
   Hunyuan,     // HunyuanMoE family (V1/V2/V3) — dense QKV + MoE
   DeepSeek_V3, // DeepSeek-V3 with MLA + MoE (similar to GLM-DSA)
+  DeepSeek_V4, // DeepSeek-V4/V4-Flash: no-absorption MLA + attention sinks +
+               // grouped output projection + Hyper-Connections + sqrtsoftplus
+               // MoE gating. Structurally distinct from DeepSeek_V3 despite
+               // the shared name -- see models/family_ops.cpp's resolve_
+               // family_ops table and CLAUDE.md's DeepSeek-V4 plan writeup.
+               // Phase 1 only: correct within each layer's local SWA window;
+               // CSA/HCA/Lightning-Indexer long-context tiers are future work.
   Llama,       // Llama-family (dense FFN, standard attention)
   Qwen, // Qwen MoE family (Qwen3.6-35B-A3B and later) — hybrid SSM + DenseQKV
         // + MoE
@@ -48,6 +55,8 @@ inline ModelFamily detect_model_family(const GGUFFile &model_file) {
     return ModelFamily::Hunyuan;
   if (arch == "deepseek2")
     return ModelFamily::DeepSeek_V3;
+  if (arch == "deepseek4")
+    return ModelFamily::DeepSeek_V4;
   if (arch == "llama")
     return ModelFamily::Llama;
   if (arch == "qwen" || arch == "qwen2" || arch == "qwen2moe" ||

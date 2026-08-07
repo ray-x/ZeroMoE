@@ -424,12 +424,25 @@ void dequantize_row_q3_K_avx512(const uint8_t *block, float *y, int64_t k) {
     for (int n = 0; n < QK_K; n += 128) {
       int shift = 0;
       for (int j = 0; j < 4; ++j) {
-        // Q3_K scales are transposed: group 1 uses is+j, group 2 uses is+j+4
-        float dl0 = d_all * (scales[is + j] - 32);
+        // FIX: this used to read scales[is+j] / scales[is+j+4] with a single
+        // `is += 8` once per n ("Q3_K scales are transposed" per the old
+        // comment here) -- that claim was WRONG, found by direct comparison
+        // against ggml's real dequantize_row_q3_K (ggml/src/ggml-quants.c),
+        // which uses a plain SEQUENTIAL post-increment `scales[is++]` for
+        // BOTH groups of every j (order 0,1,2,3,4,5,6,7 per n-block), not a
+        // "transposed" 0,4,1,5,2,6,3,7 pattern. Confirmed as the root cause
+        // of a real Test 5 failure (max_rel_diff=33.5, values far outside
+        // the [-1,1] input range) -- wrong scale applied to the wrong
+        // 16-element group, not an out-of-bounds access (both old and new
+        // indexing stay within scales[0..15], so this was a pure VALUE bug,
+        // not a memory-safety one).
+        float dl0 = d_all * (scales[is] - 32);
+        is++;
         dequant_q3k_group16(q, hm, m, shift, dl0, yy);
         yy += 16;
 
-        float dl1 = d_all * (scales[is + j + 4] - 32);
+        float dl1 = d_all * (scales[is] - 32);
+        is++;
         dequant_q3k_group16(q + 16, hm + 16, m, shift, dl1, yy);
         yy += 16;
 
@@ -437,7 +450,6 @@ void dequantize_row_q3_K_avx512(const uint8_t *block, float *y, int64_t k) {
         m = (uint8_t)(m << 1);
       }
       q += 32;
-      is += 8; // Advance scale block for the next 128 elements
     }
   }
 }
@@ -1724,8 +1736,22 @@ void matmul_q6_k_fused(float *y, const float *x, const uint8_t *W_quantized,
       210; // 128 (ql) + 64 (qh) + 16 (scales) + 2 (d)
   const int num_blocks = I / QK6_K;
 
-  // Thread-safe activation buffer matched to Q6_K layout
-  static thread_local std::vector<block_xq_q6> g_xq_q6;
+  // FIX: was `static thread_local` -- resized here on the CALLING thread,
+  // then written to from inside the `#pragma omp parallel for` region
+  // below. OpenMP worker threads are a SEPARATE thread pool from the
+  // calling thread; a `thread_local` variable does not travel with the
+  // parallel region -- each worker thread that actually executes an
+  // iteration sees its OWN, never-resized (size-0) copy of this vector.
+  // `quantize_activations_q6_k` then wrote through `g_xq_q6.data()` on that
+  // empty vector -- an invalid-pointer write, the real cause of a real
+  // SIGSEGV crash inside this function's outlined omp-for body (confirmed
+  // via a real gdb backtrace: `matmul_q6_k_fused(...) [clone ._omp_fn.0]`).
+  // Plain `static` (shared across every thread) is correct instead: the
+  // buffer is fully written by one call before this function returns, this
+  // function is only ever invoked serially from the single decode thread
+  // (never concurrently from two callers), and each omp iteration writes
+  // only to its own disjoint `s`-indexed sub-range -- no data race.
+  static std::vector<block_xq_q6> g_xq_q6;
   if (g_xq_q6.size() < (size_t)(S * num_blocks)) {
     g_xq_q6.resize(S * num_blocks);
   }
@@ -1752,14 +1778,32 @@ void matmul_q6_k_fused(float *y, const float *x, const uint8_t *W_quantized,
         // Process in chunks of 64 elements (4 sub-blocks of 16)
         for (int chunk = 0; chunk < 4; ++chunk) {
           // 1. Extract 64 Q6_K weights into uint8 (0-63 range)
-          // (Simplified extraction mapping for standard contiguous processing)
+          // FIX: the old "idx % 128" / "idx % 64" formula here was a real,
+          // confirmed bug (found via a real Test 5 FAILED result + direct
+          // hand-tracing against ggml's actual dequantize_row_q6_K,
+          // ggml/src/ggml-quants.c) -- it only happened to be correct for
+          // the FIRST 32-element group of each 128-element half; every
+          // other group read the wrong ql byte/nibble and the wrong qh
+          // byte/shift entirely. ggml's real layout: for output position
+          // idx, n_half=idx/128 selects which half (ql/qh/scales each
+          // advance by 64/32/8 bytes between halves); within a half,
+          // group=(idx%128)/32 selects which of the 4 q1..q4 sub-ranges
+          // (LOW nibble of ql[..] for group 0/1, HIGH nibble for group
+          // 2/3; ql byte offset +32 for group 1/3 vs 0/2); lpos=idx%32 is
+          // the position shared by ALL FOUR groups' qh[lpos] byte, with
+          // the 2-bit field selected by shift=group*2 (0,2,4,6) -- ql and
+          // qh are indexed completely differently (byte offset vs bit
+          // shift), which the old "idx % 128" / "idx % 64" pair conflated
+          // into one wrong formula.
           uint8_t w_expanded[64];
           for (int i = 0; i < 64; ++i) {
             int idx = chunk * 64 + i;
-            // Low 4 bits
-            uint8_t l = (bw->ql[idx % 128] >> ((idx / 128) * 4)) & 0x0F;
-            // High 2 bits
-            uint8_t h = (bw->qh[idx % 64] >> ((idx / 64) * 2)) & 0x03;
+            int n_half = idx / 128;
+            int grp = (idx % 128) / 32;
+            int lpos = idx % 32;
+            uint8_t ql_byte = bw->ql[n_half * 64 + lpos + 32 * (grp & 1)];
+            uint8_t l = (grp < 2) ? (ql_byte & 0x0F) : (ql_byte >> 4);
+            uint8_t h = (bw->qh[n_half * 32 + lpos] >> (grp * 2)) & 0x03;
             w_expanded[i] = l | (h << 4); // natively unsigned 0..63
           }
 
@@ -1798,12 +1842,21 @@ void matmul_q6_k_fused(float *y, const float *x, const uint8_t *W_quantized,
         }
 #else
         // Scalar Fallback
+        // FIX: same real bug as the VNNI branch's w_expanded extraction
+        // above (see that comment for the full derivation against ggml's
+        // real dequantize_row_q6_K) -- the old "idx % 128" / "idx % 64"
+        // formula only happened to be correct for the first 32-element
+        // group of each 128-element half.
         for (int i = 0; i < 16; ++i) { // 16 sub-blocks
           int32_t sub_dot = 0;
           for (int j = 0; j < 16; ++j) {
             int idx = i * 16 + j;
-            uint8_t l = (bw->ql[idx % 128] >> ((idx / 128) * 4)) & 0x0F;
-            uint8_t h = (bw->qh[idx % 64] >> ((idx / 64) * 2)) & 0x03;
+            int n_half = idx / 128;
+            int grp = (idx % 128) / 32;
+            int lpos = idx % 32;
+            uint8_t ql_byte = bw->ql[n_half * 64 + lpos + 32 * (grp & 1)];
+            uint8_t l = (grp < 2) ? (ql_byte & 0x0F) : (ql_byte >> 4);
+            uint8_t h = (bw->qh[n_half * 32 + lpos] >> (grp * 2)) & 0x03;
             int8_t w_val = (int8_t)(l | (h << 4)) - 32; // signed mapping
 
             sub_dot += w_val * xq[b].qs[idx];
@@ -1827,8 +1880,17 @@ void matmul_q8_0_fused(float *y, const float *x, const uint8_t *W_quantized,
   const int num_blocks = I / QK8_0;
   const size_t row_bytes = (size_t)num_blocks * BLOCK_BYTES;
 
-  // 1. Thread-safe activation quantization buffer
-  static thread_local std::vector<block_q8_0> g_xq_q8;
+  // FIX: same real bug as matmul_q6_k_fused's g_xq_q6 above (see that
+  // comment for the full explanation) -- `thread_local` here meant every
+  // OpenMP worker thread saw its own never-resized, empty copy of this
+  // vector inside the `#pragma omp parallel for` regions below, an
+  // invalid-pointer write waiting to happen the first time this path
+  // actually ran (Q6_K crashed first since it's tested first; this
+  // function was never reached in that same run, but has the identical
+  // defect). Plain `static` is correct: single decode-thread-only caller,
+  // fully written before return, disjoint per-`s` sub-ranges across
+  // worker threads.
+  static std::vector<block_q8_0> g_xq_q8;
   if (g_xq_q8.size() < (size_t)(S * num_blocks)) {
     g_xq_q8.resize(S * num_blocks);
   }

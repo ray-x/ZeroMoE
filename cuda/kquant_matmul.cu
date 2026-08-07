@@ -170,7 +170,18 @@ __device__ float dequant_q3_K_block_coop(const block_q3_K_cu* xb, int tid) {
     uint8_t m = 1 << (n_idx * 4 + j); 
     
     const uint8_t* q_chunk = xb->qs + n_idx * 32;
-    const uint8_t* hm_chunk = xb->hmask + n_idx * 16;
+    // FIX: was `xb->hmask + n_idx * 16` -- ggml's real reference
+    // (dequantize_row_q3_K, ggml/src/ggml-quants.c) NEVER advances its `hm`
+    // pointer; the same 32 hmask bytes are reused for all 8 bit-planes
+    // across the whole 256-element block (the `m` bitmask below, already
+    // correct, is what selects which BIT of each byte to read -- not which
+    // byte range). The old `+ n_idx * 16` offset made every n_idx=1 lane
+    // with l>=16 read hmask[32..47], spilling past hmask's real 32-byte
+    // extent into the immediately-adjacent `qs` field (still inside the
+    // same 110-byte block struct, so no crash -- just silently wrong values
+    // for the whole second half of every block). Confirmed via direct
+    // line-by-line comparison against ggml's source, not assumed.
+    const uint8_t* hm_chunk = xb->hmask;
 
     int scale_idx = (l < 16) ? is : is + 1;
     float dl = d_all * (scales[scale_idx] - 32);

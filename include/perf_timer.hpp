@@ -146,7 +146,7 @@ struct PerfCounters {
     std::atomic<double> t_consume_staged{0};// Time in consume_staged (memcpy a
                                              // prefetched slab out of the staging
                                              // pool into the cache slot) -- the
-                                             // Phase A "PIPE" overlap path. Near-
+                                             // Phase A "prefetch" overlap path. Near-
                                              // zero means the prefetcher isn't
                                              // feeding the miss path yet.
 
@@ -176,8 +176,8 @@ struct PerfCounters {
     // staged expert that simply never matched a miss before its slot got
     // reused. Added specifically to separate "pool thrashing" from other
     // explanations for the gap between Pilot recall (prediction accuracy
-    // alone, see n_pilot_recall_hits) and Prefetch (PIPE) served %
-    // (n_pipe_hits) -- a high count here means the pool genuinely needs
+    // alone, see n_pilot_recall_hits) and Prefetch served %
+    // (n_prefetch_hits) -- a high count here means the pool genuinely needs
     // to be bigger (or predictions need to happen closer to time-of-use);
     // a low count here despite a large recall/served gap means the
     // explanation is something else entirely (e.g. the predicted expert
@@ -188,7 +188,7 @@ struct PerfCounters {
 
     // Unified RAM-tier claim/publish state machine (RAMSafetyManager::
     // claim_or_wait, ram_manager.hpp) -- replaces the old staging-pool-based
-    // PIPE counters above (n_pipe_hits/n_pipe_miss_*/n_staged_evicted_unused/
+    // prefetch counters above (n_prefetch_hits/n_prefetch_miss_*/n_staged_evicted_unused/
     // n_staging_*/t_staging_*) now that prefetch and the decode thread's own
     // miss-handling claim/populate/publish through the SAME locked slot table
     // instead of two disconnected systems. See ram_manager.hpp's ram_mutex and
@@ -277,21 +277,21 @@ struct PerfCounters {
     std::atomic<int64_t> bytes_disk_read{0};
     std::atomic<int64_t> bytes_gpu_uploaded{0};
     // Phase A () counters:
-    std::atomic<uint64_t> n_pipe_hits{0};          // cache misses served from the prefetcher's staging pool (no pread) -- the higher this is vs n_expert_cache_miss, the more disk I/O was hidden behind compute
+    std::atomic<uint64_t> n_prefetch_hits{0};          // cache misses served from the prefetcher's staging pool (no pread) -- the higher this is vs n_expert_cache_miss, the more disk I/O was hidden behind compute
     std::atomic<uint64_t> n_pinned_eviction_skips{0}; // MEANING CHANGED once GpuTopology::unpinned_slot_indices landed: evict_lru no longer visits permanently-pinned slots at all (they're excluded from the scan at the source), so this now only increments on the DEFENSIVE fallback check -- should read 0 on a healthy run; nonzero means unpinned_slot_indices desynced from the real `pinned` flags somewhere (see gpu_topology.hpp's evict_lru). Previously (before that optimization) this counted every pinned slot skipped during a normal scan, and nonzero was the EXPECTED/healthy signal -- the polarity of "what a nonzero value means" flipped with that change.
     std::atomic<uint64_t> n_temp_pin_eviction_skips{0}; // times evict_lru skipped a slot TEMPORARILY held for an in-flight decode-time GPU dispatch (ExpertLocation::temp_pin_count > 0) -- distinct from n_pinned_eviction_skips (permanent pins); nonzero proves the compute-in-flight protection is actually engaging
     std::atomic<uint64_t> n_upload_pending_eviction_skips{0}; // times evict_lru skipped a slot whose async H2D upload was CONFIRMED still genuinely in flight (re-polled via cudaEventQuery, not just trusting a stale flag) -- the real "must not evict" count
     std::atomic<uint64_t> n_stale_upload_ready_reclaimed{0}; // times evict_lru found upload_ready==false but the event had ACTUALLY already completed (a speculative pilot-prefetch promotion that was never subsequently confirmed via find_expert) and flipped it back to true itself -- nonzero proves real cache capacity was being silently leaked before this fix; see gpu_topology.hpp's evict_lru comment
     std::atomic<uint64_t> n_stale_expert_index_hits{0}; // times find_expert's O(1) expert_index pointed at a slot that didn't actually match the requested (layer,expert_id) -- should be ALWAYS ZERO by construction (evict_lru/upload_expert/upload_expert_async are the only mutation sites, all under cache_mutex); nonzero means the index and expert_vram_cache have desynced somewhere and find_expert is safely falling back to its linear scan, but the root cause needs investigating
     std::atomic<uint64_t> n_pinned_resident{0};    // experts currently held as non-evictable VRAM residents (pinned). Gauge-ish: incremented on pin, decremented on unpin.
-    std::atomic<uint64_t> n_pilot_hints_skipped{0}; // speculative pilot-prefetch hints skipped because the expert was ALREADY host-cache-resident (a guaranteed instant hit needing no read) -- measures how much prefetch-worker bandwidth this avoids wasting; compare against n_pipe_hits/n_expert_cache_miss before/after to see the effect
+    std::atomic<uint64_t> n_pilot_hints_skipped{0}; // speculative pilot-prefetch hints skipped because the expert was ALREADY host-cache-resident (a guaranteed instant hit needing no read) -- measures how much prefetch-worker bandwidth this avoids wasting; compare against n_prefetch_hits/n_expert_cache_miss before/after to see the effect
 
     // Pure PREDICTION-ACCURACY recall: overlap between the pilot's
     // predicted top-K (LayerScratch::pilot_pred_ids, captured before any
     // already-resident filtering) and the REAL router's top-K when that
     // same layer's moe_forward_gguf actually runs, at the same "last
     // token" position both sides use. Deliberately measured completely
-    // separately from "Prefetch (PIPE) served %" -- that number also
+    // separately from "Prefetch served %" -- that number also
     // depends on worker-thread speed and staging-pool size (both already
     // tested this session with little effect), so it can't tell you
     // whether the REMAINING gap is prediction accuracy or something else
@@ -413,24 +413,24 @@ struct PerfCounters {
     // prefetch_worker_threads > 0 and a worker actually starts a read --
     // separate from n_pilot_pred_needs_fetch above, which counts hints
     // PUSHED to the queue regardless of whether any worker ever picks
-    // them up). n_pipe_hits (existing counter, below) is reused as-is for
+    // them up). n_prefetch_hits (existing counter, below) is reused as-is for
     // "consumed" -- it already counts exactly "staged reads later matched
-    // and used by a real miss". t_pipe_read_ms_sum is a SUM across
+    // and used by a real miss". t_prefetch_read_ms_sum is a SUM across
     // possibly-concurrent worker threads -- valid only for computing an
     // average ms/fetch, NOT a wall-clock GB/s figure (see this project's
     // own documented OMP-thread-sum-vs-wall-clock lesson for t_cpu_dequant
     // and the original t_disk_read uring-timing investigation).
-    std::atomic<uint64_t> n_pipe_fetch_issued{0};
-    std::atomic<uint64_t> n_pipe_fetch_completed{0};
-    std::atomic<uint64_t> n_pipe_fetch_failed{0};
-    std::atomic<uint64_t> bytes_pipe_prefetched{0};
-    std::atomic<double>   t_pipe_read_ms_sum{0};
+    std::atomic<uint64_t> n_prefetch_issued{0};
+    std::atomic<uint64_t> n_prefetch_completed{0};
+    std::atomic<uint64_t> n_prefetch_failed{0};
+    std::atomic<uint64_t> bytes_prefetched{0};
+    std::atomic<double>   t_prefetch_read_ms_sum{0};
 
     std::atomic<uint64_t> n_vram_evict_demoted{0};  // VRAM evictions salvaged into the RAM tier via a D2H copy instead of being dropped outright (vram_evict_demote_to_ram=true) -- nonzero proves the salvage path is engaging; compare against Expert cache's disk-miss count for the real win (a demoted expert re-hit later serves from RAM, no disk read at all)
     std::atomic<uint64_t> n_vram_evict_demote_skipped{0}; // demote attempts that declined for a benign reason (already RAM-resident, or the layer uses the legacy per-expert-tensor format with no packed_slab_geometry) -- not an error, just nothing to do
     std::atomic<uint64_t> n_vram_evict_demote_failed{0};  // demote attempts that hit a real problem (cudaMemcpy D2H failure, size mismatch) -- should stay at/near 0; a nonzero count is worth investigating but never corrupts anything, since a failed demote just leaves the RAM slot empty rather than half-populated
-    // REMOVED: n_pipe_miss_no_match/not_ready/still_queued and
-    // t_pipe_not_ready_elapsed_ms_sum/t_pipe_still_queued_elapsed_ms_sum
+    // REMOVED: n_prefetch_miss_no_match/not_ready/still_queued and
+    // t_prefetch_not_ready_elapsed_ms_sum/t_prefetch_still_queued_elapsed_ms_sum
     // used to live here -- a consume_staged failure-reason split for the
     // old separate staging pool, which no longer exists (see the "Unified
     // RAM-tier claim/publish state machine" comment further down).
@@ -454,10 +454,10 @@ struct PerfCounters {
     // access confirms it. This counter is the direct evidence that path
     // still works for prefetch-origin experts post-fix -- nonzero proves
     // prefetched experts do still reach VRAM, just on confirmed reuse
-    // rather than blind speculation. Compare against n_pipe_hits: a
-    // healthy run should show a meaningful fraction of PIPE hits
+    // rather than blind speculation. Compare against n_prefetch_hits: a
+    // healthy run should show a meaningful fraction of prefetch hits
     // eventually promoted, not zero.
-    std::atomic<uint64_t> n_pipe_staged_later_promoted{0};
+    std::atomic<uint64_t> n_prefetch_staged_later_promoted{0};
 
 
     // Three-tier caching performance counters
@@ -591,7 +591,7 @@ struct PerfCounters {
     // test a specific hypothesis: the pilot predicts from only the LAST
     // token's hidden state, which can't cover prefill's full per-layer
     // expert fan-out across ALL prompt tokens at once. (This split used to
-    // also feed an n_pipe_hits_prefill/decode pair for the old separate
+    // also feed an n_prefetch_hits_prefill/decode pair for the old separate
     // staging pool's own hit rate -- removed along with that pool; these
     // two miss counters themselves are still live, now fed by claim_or_wait,
     // ram_manager.hpp.)
@@ -628,7 +628,7 @@ struct PerfCounters {
     // same queue/worker pipeline the pilot's own hints already use, so
     // their eventual claim outcome shows up in the "Unified RAM claim"
     // report line, not a dedicated counter of their own. (There used to
-    // also be an n_pipe_miss_still_queued counter here, measuring the old
+    // also be an n_prefetch_miss_still_queued counter here, measuring the old
     // separate staging pool's own miss-vs-queue-state split -- removed
     // along with that pool; LockFreePrefetcher::has_pending_hint itself is
     // still a valid diagnostic peek at the SPSC queue, just no longer fed
@@ -821,7 +821,7 @@ struct PerfCounters {
 
     // Hint-push-to-pickup delay: how long a prefetch hint sits in the
     // queue before the worker thread actually starts processing it.
-    // Added to distinguish two very different explanations for low PIPE
+    // Added to distinguish two very different explanations for low prefetch
     // coverage (only 10.1% of misses served from staging in a real
     // measured run): (a) the worker thread isn't getting scheduled
     // promptly, i.e. CPU-starved by the OMP-parallelized dequant work
@@ -855,7 +855,7 @@ struct PerfCounters {
         uint64_t n_expert_cache_hit=0, n_expert_cache_miss=0, n_expert_promote=0, n_tokens_generated=0;
         uint64_t n_expert_gpu_calls=0, n_expert_cpu_calls=0, n_dense_gpu_calls=0;
         int64_t bytes_disk_read=0, bytes_gpu_uploaded=0;
-        uint64_t n_pipe_hits=0, n_pinned_eviction_skips=0, n_pinned_resident=0, n_staging_regrow=0;
+        uint64_t n_prefetch_hits=0, n_pinned_eviction_skips=0, n_pinned_resident=0, n_staging_regrow=0;
 
         Snapshot operator-(const Snapshot& b) const {
             return Snapshot{
@@ -897,7 +897,7 @@ struct PerfCounters {
                     n_dense_gpu_calls - b.n_dense_gpu_calls,
                     bytes_disk_read - b.bytes_disk_read,
                     bytes_gpu_uploaded - b.bytes_gpu_uploaded,
-                    n_pipe_hits - b.n_pipe_hits,
+                    n_prefetch_hits - b.n_prefetch_hits,
                     n_pinned_eviction_skips - b.n_pinned_eviction_skips,
                     n_pinned_resident - b.n_pinned_resident,
                     n_staging_regrow - b.n_staging_regrow
@@ -925,7 +925,7 @@ struct PerfCounters {
             n_expert_cache_hit.load(), n_expert_cache_miss.load(), n_expert_promote.load(), n_tokens_generated.load(),
             n_expert_gpu_calls.load(), n_expert_cpu_calls.load(), n_dense_gpu_calls.load(),
             bytes_disk_read.load(), bytes_gpu_uploaded.load(),
-            n_pipe_hits.load(), n_pinned_eviction_skips.load(), n_pinned_resident.load(),
+            n_prefetch_hits.load(), n_pinned_eviction_skips.load(), n_pinned_resident.load(),
             n_staging_regrow.load()
         };
     }
@@ -979,7 +979,7 @@ struct PerfCounters {
             (unsigned long long)hits, (unsigned long long)misses,
             (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0,
             (unsigned long long)d.n_expert_gpu_calls, (unsigned long long)d.n_expert_cpu_calls,
-            (unsigned long long)d.n_pipe_hits, (unsigned long long)d.n_pinned_eviction_skips,
+            (unsigned long long)d.n_prefetch_hits, (unsigned long long)d.n_pinned_eviction_skips,
             (unsigned long long)d.n_pinned_resident);
     }
 
@@ -1076,7 +1076,7 @@ struct PerfCounters {
             d.t_disk_read,
             (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0,
             (unsigned long long)gcalls, (unsigned long long)ccalls,
-            (unsigned long long)d.n_pipe_hits, (unsigned long long)d.n_pinned_eviction_skips,
+            (unsigned long long)d.n_prefetch_hits, (unsigned long long)d.n_pinned_eviction_skips,
             (unsigned long long)d.n_pinned_resident);
     }
 
@@ -1086,7 +1086,7 @@ struct PerfCounters {
     // individual perf counters (t_disk_read + t_gpu_upload + ... etc.):
     // that was this function's ORIGINAL approach, and it quietly became
     // wrong as concurrency was added to this codebase (4-thread parallel
-    // expert fetch, GPU/CPU Pass A/B overlap, PIPE async prefetch all
+    // expert fetch, GPU/CPU Pass A/B overlap, async prefetch all
     // running concurrently with compute) -- summing durations that
     // genuinely overlap in real time systematically OVER-counts elapsed
     // time (confirmed on a real run: the old summed "total" came out to
@@ -1162,16 +1162,16 @@ struct PerfCounters {
         LOG_INFO("Expert cache:        %lu hit / %lu miss (%.1f%% hit rate)\n",
                  (unsigned long)hits, (unsigned long)misses,
                  (hits + misses) > 0 ? 100.0 * hits / (hits + misses) : 0.0);
-        // REMOVED: "Prefetch (PIPE)" report block used to live here
-        // (n_pipe_hits/n_pipe_miss_*/n_pipe_hits_prefill/decode/
-        // t_pipe_not_ready_elapsed_ms_sum/t_pipe_still_queued_elapsed_ms_sum)
+        // REMOVED: "Prefetch" report block used to live here
+        // (n_prefetch_hits/n_prefetch_miss_*/n_prefetch_hits_prefill/decode/
+        // t_prefetch_not_ready_elapsed_ms_sum/t_prefetch_still_queued_elapsed_ms_sum)
         // -- all measured the old separate staging pool's own consume/miss
         // bookkeeping, which no longer exists under the unified claim/
         // publish design (RAMSafetyManager::claim_or_wait, ram_manager.hpp).
         // See "Unified RAM claim"/"Unified RAM wait" further down for the
-        // replacement instrumentation. n_pipe_staged_later_promoted is still
+        // replacement instrumentation. n_prefetch_staged_later_promoted is still
         // real (see MoEExpertBlock::loaded_by_prefetch's own comment) but no
-        // longer has a meaningful "of how many PIPE hits" denominator to
+        // longer has a meaningful "of how many prefetch hits" denominator to
         // report a percentage against, so it's not printed as its own line
         // here anymore -- read it directly from a raw counter dump if
         // needed.
@@ -1187,7 +1187,7 @@ struct PerfCounters {
                          "(Phase 2's cold-start VRAM fill -- synchronous path; only fires when "
                          "prefill_warm_via_prefetcher=false) / %lu hint(s) pushed to the prefetcher "
                          "instead (prefill_warm_via_prefetcher=true -- served/miss visible via the "
-                         "Pilot recall/PIPE lines above, since these share the same queue)\n",
+                         "Pilot recall/prefetch lines above, since these share the same queue)\n",
                          (unsigned long)pw_att, (unsigned long)pw_ok, (unsigned long)pw_fail,
                          t_prefill_warm_time.load(), (unsigned long)pw_hint);
             }
@@ -1218,14 +1218,14 @@ struct PerfCounters {
             }
         }
         {
-            uint64_t issued = n_pipe_fetch_issued.load();
+            uint64_t issued = n_prefetch_issued.load();
             if (issued > 0) {
-                uint64_t completed = n_pipe_fetch_completed.load();
-                uint64_t failed = n_pipe_fetch_failed.load();
-                double mb = bytes_pipe_prefetched.load() / 1e6;
-                double avg_ms = completed > 0 ? t_pipe_read_ms_sum.load() / completed : 0.0;
+                uint64_t completed = n_prefetch_completed.load();
+                uint64_t failed = n_prefetch_failed.load();
+                double mb = bytes_prefetched.load() / 1e6;
+                double avg_ms = completed > 0 ? t_prefetch_read_ms_sum.load() / completed : 0.0;
                 // NOTE: this used to also report a "later actually used"
-                // fraction here, computed from n_pipe_hits -- that counter
+                // fraction here, computed from n_prefetch_hits -- that counter
                 // fed the old separate staging pool's own consume-tracking
                 // and is now permanently 0 (nothing increments it under the
                 // unified claim/publish design), which would make this line

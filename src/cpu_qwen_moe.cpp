@@ -2,6 +2,7 @@
 #include "cpu_qwen_moe.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -9,6 +10,31 @@
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+// Opt-in per-layer hidden-state tracing (set MOESTREAM_DEBUG_LAYERS=1) to
+// localize where a numerical/permutation bug first shows up, without
+// touching normal-run performance or log volume. Reports the RMS and first
+// few values of the LAST sequence position only -- during prefill that's
+// the position the LM head actually reads, and during decode S is always 1
+// anyway, so this is the one row worth watching every call.
+static bool debug_layers_enabled() {
+  static bool enabled = std::getenv("MOESTREAM_DEBUG_LAYERS") != nullptr;
+  return enabled;
+}
+
+static void debug_print_norm(const char *tag, int layer_idx, const float *x,
+                             int S, int D) {
+  if (!debug_layers_enabled())
+    return;
+  const float *row = x + (size_t)(S - 1) * D;
+  double ss = 0.0;
+  for (int i = 0; i < D; ++i)
+    ss += static_cast<double>(row[i]) * row[i];
+  double rms = std::sqrt(ss / D);
+  std::cerr << "[CPU-QWEN-DEBUG] " << tag << " layer=" << layer_idx
+            << " rms=" << rms << " first3=[" << row[0] << "," << row[1]
+            << "," << row[2] << "]\n";
+}
 
 static inline float *tensor_f32(CPUQuantizedTensor *qt) {
   return (qt && qt->host_ptr) ? reinterpret_cast<float *>(qt->host_ptr)
@@ -53,6 +79,11 @@ void CPUQwenMoEBackend::forward_layer(CPUEngine &engine, int layer_idx,
                                       float *hidden_states, int S,
                                       int pos_base) {
   CPULayerType lt = layer_type(layer_idx);
+  int D = engine.model_file.architecture_config.hidden;
+  const char *kind = lt == CPULayerType::LinearAttention ? "linear" : "dense";
+
+  debug_print_norm((std::string("pre-attn(") + kind + ")").c_str(), layer_idx,
+                   hidden_states, S, D);
 
   if (lt == CPULayerType::LinearAttention) {
     forward_linear_attention(engine, layer_idx, hidden_states, S, pos_base);
@@ -60,8 +91,12 @@ void CPUQwenMoEBackend::forward_layer(CPUEngine &engine, int layer_idx,
     forward_dense_attention(engine, layer_idx, hidden_states, S, pos_base);
   }
 
+  debug_print_norm("post-attn", layer_idx, hidden_states, S, D);
+
   // Both layer types are followed by the same routed MoE FFN + residual.
   forward_moe_ffn(engine, layer_idx, hidden_states, S);
+
+  debug_print_norm("post-ffn", layer_idx, hidden_states, S, D);
 }
 
 bool CPUQwenMoEBackend::lm_head(CPUEngine &engine, const float *hidden,
@@ -357,20 +392,58 @@ void CPUQwenMoEBackend::dense_attention(CPUEngine &engine, int layer_idx,
 
 void CPUQwenMoEBackend::causal_conv1d(const float *x, const float *w,
                                       float *out, int S, int channels,
-                                      int kernel) {
+                                      int kernel, float *history) {
   // x/out: [S, channels]
   // w: [channels, kernel] row-major (matches the GGUF layout of
   // ssm_conv1d.weight, which stores one kernel-size vector per channel).
+  // history: [channels, kernel-1] row-major, persistent across calls -- the
+  // last (kernel-1) samples per channel from the previous call (zero at
+  // sequence start). Updated in place to hold the last (kernel-1) samples of
+  // this call for the NEXT call.
+  //
+  // Two things had to match llama.cpp's ggml_ssm_conv exactly (confirmed by
+  // reading ggml_compute_forward_ssm_conv_f32, ggml/src/ggml-cpu/ops.cpp, and
+  // build_conv_state, src/models/delta-net-base.cpp):
+  //  1. Kernel-index direction: w[k] applies to virtual time offset
+  //     s-(kernel-1)+k, i.e. k=0 is the OLDEST tap and k=kernel-1 is the
+  //     CURRENT sample -- this file previously did the opposite (idx = s-k,
+  //     k=0 = current), silently applying every trained conv weight to the
+  //     wrong relative time offset (these are real trained weights, not a
+  //     symmetric kernel, so this corrupted every call including prefill).
+  //  2. Cross-call state: without `history`, every decode call (S=1, see
+  //     cpu_main.cpp's decode loop) would only ever see the single new
+  //     sample, since idx<0 was simply skipped -- silently truncating the
+  //     receptive field to 1/kernel of its intended size for every decode
+  //     step (prefill's S>1 batch happened to look fine since same-call
+  //     history was still visible within that one call).
+  int hist = kernel - 1;
   for (int c = 0; c < channels; ++c) {
+    const float *h = history + (size_t)c * hist;
+    const float *wc = w + (size_t)c * kernel;
     for (int s = 0; s < S; ++s) {
       float acc = 0.0f;
       for (int k = 0; k < kernel; ++k) {
-        int idx = s - k;
-        if (idx >= 0)
-          acc += x[idx * channels + c] * w[c * kernel + k];
+        int j = s + k; // position in the virtual [history ++ x] window
+        float val = (j < hist) ? h[j] : x[(size_t)(j - hist) * channels + c];
+        acc += val * wc[k];
       }
-      out[s * channels + c] = silu_f(acc);
+      out[(size_t)s * channels + c] = silu_f(acc);
     }
+  }
+  // Roll the history forward: keep the last `hist` samples of the virtual
+  // [history ++ x] window (length hist+S) for the next call.
+  if (hist > 0) {
+    std::vector<float> new_hist((size_t)channels * hist);
+    for (int c = 0; c < channels; ++c) {
+      const float *h = history + (size_t)c * hist;
+      for (int j = 0; j < hist; ++j) {
+        int pos = S + j;
+        new_hist[(size_t)c * hist + j] =
+            (pos < hist) ? h[pos] : x[(size_t)(pos - hist) * channels + c];
+      }
+    }
+    std::memcpy(history, new_hist.data(),
+                (size_t)channels * hist * sizeof(float));
   }
 }
 
@@ -508,9 +581,17 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
   matmul(b.data(), normed.data(), tensor_f32(beta_t), S, D, n_v_h);
 
   // 3. Causal conv1d over mixed QKV (groups=channels, silu activation).
+  // History must persist across calls (decode calls this function once per
+  // token, S=1 each time) -- see causal_conv1d's own comment.
+  int conv_hist = conv_k - 1;
+  if (conv_history.size() <= (size_t)layer_idx)
+    conv_history.resize(layer_idx + 1);
+  if ((int)conv_history[layer_idx].size() != qkv_total * conv_hist)
+    conv_history[layer_idx].assign((size_t)qkv_total * conv_hist, 0.0f);
+
   std::vector<float> conv_out((size_t)S * qkv_total);
   causal_conv1d(mixed_qkv.data(), tensor_f32(conv_w), conv_out.data(), S,
-                qkv_total, conv_k);
+                qkv_total, conv_k, conv_history[layer_idx].data());
 
   // 4. Split into Q, K, V and reshape to [S, heads, head_dim].
   std::vector<float> Q((size_t)S * n_k_h * k_dim);
@@ -546,22 +627,42 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
   }
 
   // 6. Repeat key heads to match value-head count (n_v_h / n_k_h times).
+  //
+  // MUST match ggml_repeat_4d's own broadcast convention (confirmed by
+  // reading ggml_compute_forward_repeat_f32, ggml/src/ggml-cpu/ops.cpp):
+  // dst index j along the repeated dim maps to src index (j % src_extent) --
+  // i.e. the WHOLE [0..n_k_h) block is tiled `rep` times in sequence
+  // (TILE / cyclic: dst = [h0,h1,...,h_{n_k_h-1], h0,h1,...]), NOT each
+  // source head replicated `rep` times contiguously (BLOCK / repeat_interleave:
+  // dst = [h0,h0,...,h1,h1,...]). This file used to build dst_h = h*rep+r
+  // (BLOCK), which for n_k_h=16/n_v_h=32 pairs value-head 1 with key-head 0
+  // instead of the real key-head 1 -- every odd-indexed value head across all
+  // 30 Gated-DeltaNet layers received a scrambled K/Q source, more than
+  // enough on its own to produce fluent-looking-per-token but incoherent
+  // decode output despite finite/plausible prefill logits.
   int rep = n_v_h / n_k_h;
   std::vector<float> Qrep((size_t)S * n_v_h * k_dim);
   std::vector<float> Krep((size_t)S * n_v_h * k_dim);
   for (int s = 0; s < S; ++s) {
-    for (int h = 0; h < n_k_h; ++h) {
+    for (int dst_h = 0; dst_h < n_v_h; ++dst_h) {
+      int h = dst_h % n_k_h; // TILE, matches ggml_repeat_4d
       const float *q_src = Q.data() + ((size_t)s * n_k_h + h) * k_dim;
       const float *k_src = K.data() + ((size_t)s * n_k_h + h) * k_dim;
-      for (int r = 0; r < rep; ++r) {
-        int dst_h = h * rep + r;
-        std::memcpy(Qrep.data() + ((size_t)s * n_v_h + dst_h) * k_dim, q_src,
-                    (size_t)k_dim * sizeof(float));
-        std::memcpy(Krep.data() + ((size_t)s * n_v_h + dst_h) * k_dim, k_src,
-                    (size_t)k_dim * sizeof(float));
-      }
+      std::memcpy(Qrep.data() + ((size_t)s * n_v_h + dst_h) * k_dim, q_src,
+                  (size_t)k_dim * sizeof(float));
+      std::memcpy(Krep.data() + ((size_t)s * n_v_h + dst_h) * k_dim, k_src,
+                  (size_t)k_dim * sizeof(float));
     }
   }
+  (void)rep; // retained for the comment's math / potential future asserts
+
+  // Cross-check points against llama.cpp's eval-callback trace (see
+  // build_layer_attn_linear's cb() calls for "q_conv_predelta"/
+  // "k_conv_predelta"/"v_conv_predelta" -- captured post L2-norm/repeat for
+  // Q/K, pre-anything for V, exactly matching Qrep/Krep/Vraw here).
+  debug_print_norm("q_conv_predelta", layer_idx, Qrep.data(), S, n_v_h * k_dim);
+  debug_print_norm("k_conv_predelta", layer_idx, Krep.data(), S, n_v_h * k_dim);
+  debug_print_norm("v_conv_predelta", layer_idx, Vraw.data(), S, n_v_h * v_dim);
 
   // 7. Compute log decay per head: g = A * softplus(a + dt_bias).
   //    The ssm_a tensor stores A = -exp(A_log) (continuous-time decay),
@@ -570,6 +671,9 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
   std::vector<float> g_log_decay((size_t)S * n_v_h);
   for (int i = 0; i < (int)b.size(); ++i)
     b[i] = 1.0f / (1.0f + std::exp(-b[i]));
+
+  // Cross-check against llama.cpp's "beta_sigmoid" cb() tensor.
+  debug_print_norm("beta_sigmoid", layer_idx, b.data(), S, n_v_h);
 
   const float *A_param = tensor_f32(ssm_a);
   const float *dt_bias = tensor_f32(ssm_dt_bias);
@@ -580,6 +684,10 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
       g_log_decay[s * n_v_h + h] = A_param[h] * sp;
     }
   }
+
+  // Cross-check against llama.cpp's "gate" cb() tensor (pre-exp log-decay,
+  // i.e. alpha_softplus * ssm_a -- NOT yet exponentiated).
+  debug_print_norm("gate", layer_idx, g_log_decay.data(), S, n_v_h);
 
   // 8. Ensure persistent recurrent state exists for this layer.
   // Cap at a sane size to catch corrupt dimensions before malloc traps.

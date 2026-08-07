@@ -106,7 +106,7 @@ public:
     // glm.c's pipe_dispatch/URING_REQ_MAX) instead of N OS threads each
     // blocking on their own pread -- this is the SYNCHRONOUS,
     // decode-critical path that handles the large majority of every real
-    // run's misses (the prefetcher's PIPE only ever serves a small
+    // run's misses (the prefetcher only ever serves a small
     // fraction of them), so it's where the actual disk-throughput ceiling
     // lives, unlike the earlier (Prefetcher-only, deliberately lower-risk)
     // io_uring scope. init_decode_uring() sets this up; falls back to the
@@ -148,12 +148,12 @@ public:
     }
 
     // Set by layers_forward_gguf at the top of every call (S > 1 = prefill,
-    // S == 1 = decode) purely so the miss path below can split its PIPE
+    // S == 1 = decode) purely so the miss path below can split its prefetch
     // hit/miss counters by phase -- diagnostic only, changes no behavior.
     // Added to test a specific hypothesis: the pilot prefetcher predicts
     // from only the LAST token's hidden state (execution_layer.cpp), which
     // structurally can't cover prefill's full per-layer expert fan-out
-    // across ALL prompt tokens, so a near-zero aggregate PIPE-served rate
+    // across ALL prompt tokens, so a near-zero aggregate prefetch-served rate
     // could be "prefill can't be helped by this design at all" rather than
     // "decode isn't benefiting either" -- this split is how the next real
     // run tells those apart instead of guessing from the aggregate number.
@@ -815,7 +815,7 @@ public:
         // (unpacked_expert_format=false but per-expert tensor names present
         // anyway) has no single geometry to reconstruct host_ptr/meta
         // offsets from, so demotion is a silent (counted, not logged) no-op
-        // for that case, matching how the PIPE fast path already degrades.
+        // for that case, matching how the prefetch fast path already degrades.
         size_t gb, ub, db;
         const GGUFTensor *gM, *uM, *dM;
         if (!engine.expert_layer_geometry(layer, gb, ub, db, gM, uM, dM)) {
@@ -1068,7 +1068,7 @@ public:
                     ExpertLocation* promoted = vram_cache->upload_expert_async(
                         layer, expert_id, slot.slab_buffer, slot.slab_capacity);
                     if (promoted && slot.loaded_by_prefetch) {
-                        perf().n_pipe_staged_later_promoted.fetch_add(1, std::memory_order_relaxed);
+                        perf().n_prefetch_staged_later_promoted.fetch_add(1, std::memory_order_relaxed);
                     }
                     if (move_on_promotion) {
                         slot.expert_id = -1;
@@ -1258,7 +1258,7 @@ public:
     }
 
     // Rewritten for the unified claim/publish design: the old Step 1 (hit
-    // scan)/Step 2/Step 3 (victim-selection) logic, and the separate PIPE
+    // scan)/Step 2/Step 3 (victim-selection) logic, and the separate prefetch
     // staged-consume branch, all now live inside claim_or_wait (shared with
     // get_experts_batch and LockFreePrefetcher's active_prefetch) -- there is
     // no more separate staging pool to consult here, so a genuine miss after

@@ -218,8 +218,8 @@ struct EngineConfig {
 
     // Number of concurrent async prefetcher worker threads pulling hints
     // off the SPSC queue and servicing them (disk read + optional async
-    // H2D promotion). Was hardcoded to 1 -- real-run PIPE instrumentation
-    // (n_pipe_miss_still_queued) showed a real, measurable fraction of
+    // H2D promotion). Was hardcoded to 1 -- real-run prefetch instrumentation
+    // (n_prefetch_miss_still_queued) showed a real, measurable fraction of
     // otherwise-correctly-predicted misses failing to be served purely
     // because a single worker thread hadn't even STARTED that hint's read
     // yet (pilot_k=8 hints pushed per layer transition, one thread
@@ -413,7 +413,7 @@ struct EngineConfig {
     bool ram_cache_layer_adaptive = false;
 
     // How many OMP threads RAMSafetyManager::get_experts_batch uses to
-    // parallelize the disk reads for one token's genuine (non-PIPE-served)
+    // parallelize the disk reads for one token's genuine (non-prefetch-served)
     // host-cache misses within a single layer's topk selection. Default 4,
     // chosen from a direct empirical measurement on the target machine
     // buffered reads scaled ~8.5x from 1->4 threads (1.53 -> 13.12 GB/s)
@@ -1051,7 +1051,7 @@ disk_batch_padding_target = 8
 # the async prefetcher's hint queue (disk read + optional async H2D
 # promotion). Default 2. Each gets its own io_uring ring when io_uring=true.
 # More threads means hints get STARTED sooner (fixes a real "worker hadn't
-# even begun this read yet" gap seen in PIPE instrumentation), at the cost
+# even begun this read yet" gap seen in prefetch instrumentation), at the cost
 # of more concurrent contention on ram_mutex/cache_mutex. (There used to
 # also be a prefetch_staging_slots knob here, sizing a separate pinned-host
 # staging pool the prefetcher held prefetched-but-not-yet-consumed slabs
@@ -1159,7 +1159,7 @@ vram_evict_demote_to_ram = false
 ram_cache_layer_adaptive = false
 
 # expert_fetch_threads: OMP threads used to parallelize disk reads for one
-# token's genuine (non-PIPE-served) cache misses within a layer's topk
+# token's genuine (non-prefetch-served) cache misses within a layer's topk
 # selection. Default 4
 # against your own model file/drive (buffered reads, increasing thread
 # count until throughput stops scaling) rather than assuming this value.

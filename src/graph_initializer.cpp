@@ -83,8 +83,10 @@ static void verify_float_reinterpret_tensors(const StreamingEngine &engine) {
 static void verify_tensor_dimensions(StreamingEngine &engine) {
   auto &file = engine.model_file;
   auto &c = file.architecture_config;
-  if (!c.is_mla)
-    return; // this tensor set is MLA-specific (GLM-5.2/DeepSeek-style)
+  if (c.cache_shape != CacheShape::MLAAbsorbed)
+    return; // this tensor set (attn_k_b/attn_v_b absorption) is specific to
+            // the absorbed-MLA cache shape (GLM-5.2/DeepSeek-V3) -- DeepSeek-
+            // V4's MLARawSWA has no absorption tensors to check here at all.
 
   int mismatches = 0;
   auto check = [&](const std::string &name, uint64_t expected) {
@@ -412,13 +414,43 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   c.n_heads = file.get_config_int("attention.head_count", 0);
   c.vocab = file.get_config_int("vocab_size", 0);
   if (c.vocab <= 0) {
-    // Some models (e.g. Qwen3.6-35B-A3B-UD) store vocab size as the token
-    // embedding/output tensor's leading dimension rather than a numeric KV.
+    // FIX (found investigating a real DeepSeek-V4-Flash fluent-but-garbage
+    // generation run): this used to read shape[0], not shape[1] -- WRONG.
+    // Confirmed directly against llama.cpp's real tensor-creation calls
+    // (checked 5 different architectures' model-loading code -- apertus.cpp,
+    // baichuan.cpp, afmoe.cpp, and others -- all identical):
+    // `create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0)`.
+    // GGUF's on-disk tensor-shape encoding is ggml's native ne[] order
+    // (dimensions[0] = fastest-varying), and this file's OWN raw parser
+    // above reads it byte-for-byte in that same order (t.shape[0] ==
+    // ne[0]) -- also independently confirmed by this exact file's
+    // check_orient() helper a few lines up, whose own comment documents
+    // shape[0]=ne[0] as the contiguous dimension. So for token_embd.weight,
+    // shape[0] is ALWAYS n_embd (hidden size), never n_vocab.
+    // Real-world impact of the old bug: for any GGUF missing an explicit
+    // vocab_size-style KV (this DeepSeek-V4-Flash file has none under any
+    // prefix get_config_int tries -- common; most real GGUFs rely on
+    // tokenizer.ggml.tokens's array length instead of a redundant scalar),
+    // c.vocab silently became EQUAL TO c.hidden (confirmed on a real run:
+    // "Vocab: 4096" logged identically to "Hidden: 4096", vs. the
+    // tokenizer's own independently-loaded "Loaded 129280 tokens."). This
+    // corrupted the prefill embed loop's bounds check
+    // (generation_loop.hpp's `if (tok >= 0 && tok < V)`) into silently
+    // skipping embed_token for any real content token id above ~4096,
+    // leaving that row at hidden_states' zero-initialized default --
+    // finite, not NaN, invisible to check_finite/check_hidden_finite --
+    // and truncated `logits`/lm_head output to the same wrong width,
+    // producing fluent-but-garbage generation. The old comment here
+    // ("some models... store vocab size as the leading dimension") was
+    // simply wrong; kept the "no numeric KV" fallback need but fixed the
+    // index. (Worth noting for anyone revisiting Qwen3.6 support: this
+    // exact same bug may have been silently affecting it too, unverified
+    // either way here.)
     auto it = file.tensors.find("token_embd.weight");
     if (it == file.tensors.end())
       it = file.tensors.find("output.weight");
-    if (it != file.tensors.end() && !it->second.shape.empty()) {
-      c.vocab = static_cast<int>(it->second.shape[0]);
+    if (it != file.tensors.end() && it->second.shape.size() >= 2) {
+      c.vocab = static_cast<int>(it->second.shape[1]);
     }
   }
   c.n_experts = file.get_config_int("expert_count", 0);
@@ -440,10 +472,34 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   // hidden_states 100% NaN from layer 0 of every single generation run.
   // (attention.value_length_mla, by contrast, IS used directly with no
   // subtraction in the reference loader -- confirmed correct, left as-is.)
+  // FIX (found investigating a real DeepSeek-V4-Flash NaN-corruption run):
+  // DeepSeek-V4 GGUFs don't set "attention.key_length_mla" at all -- the
+  // SAME "combined nope+rope width" concept V3 calls key_length_mla is
+  // just called "attention.key_length" for V4 (confirmed against a real
+  // checkpoint's metadata dump: deepseek4.attention.key_length=512, no
+  // key_length_mla key anywhere). Without this, key_length_mla read as 0,
+  // so qk_nope silently fell all the way to the hardcoded 128 default --
+  // c.qk_rope correctly read 64 (rope.dimension_count), so qh = qk_nope +
+  // qk_rope came out as 192 instead of the real 512 (confirmed three
+  // independent ways: key_length itself, attn_kv.weight's real shape
+  // [4096,512], and attn_q_b.weight's 32768/64=512) -- every width
+  // dsv4_attention_gguf computes from qh (Q, KV latent, output context,
+  // the grouped-output-projection's group_in) was wrong by this margin.
+  // Try key_length_mla first (V3), THEN the plain combined key_length
+  // (V4) minus rope, THEN an explicit key_length_nope key, THEN the
+  // hardcoded 128 as an absolute last resort. Safe for dense families:
+  // they never read qk_nope at all, and c.head_dim's own SEPARATE
+  // "attention.key_length" read (below, dense-only) is unaffected since
+  // it's a different ArchitectureConfig field entirely.
   int key_length_mla = file.get_config_int("attention.key_length_mla", 0);
-  c.qk_nope = (key_length_mla > 0)
-                  ? (key_length_mla - c.qk_rope)
-                  : file.get_config_int("attention.key_length_nope", 128);
+  if (key_length_mla > 0) {
+    c.qk_nope = key_length_mla - c.qk_rope;
+  } else {
+    int key_length_combined = file.get_config_int("attention.key_length", 0);
+    c.qk_nope = (key_length_combined > c.qk_rope)
+                    ? (key_length_combined - c.qk_rope)
+                    : file.get_config_int("attention.key_length_nope", 128);
+  }
   c.v_head =
       file.get_config_int("attention.value_length_mla",
                           file.get_config_int("attention.value_length", 128));
@@ -463,7 +519,17 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   std::string arch0 = file.kv_string.count("general.architecture")
                           ? file.kv_string["general.architecture"]
                           : "";
-  c.is_mla = (arch0 == "glm-dsa" || arch0 == "deepseek2");
+
+  // ---------- Resolve the per-family dispatch table ----------
+  // Single source of truth for "which family is this file" is
+  // detect_model_family() (model_family.hpp) -- NOT another arch0=="..."
+  // comparison here. engine.family_ops is what layers_forward_gguf
+  // (execution_layer.cpp) and the cache-allocation/preload-manifest code
+  // below now read instead of the old scattered is_mla-bool checks. See
+  // family_ops.hpp for the full rationale.
+  ModelFamily fam = detect_model_family(file);
+  engine.family_ops = resolve_family_ops(fam, c);
+  c.cache_shape = engine.family_ops.cache_shape;
 
   // ---------- MoE router config: gating function, selection bias/scale/norm
   // ---------- See llama.cpp's build_moe_ffn (llama-graph.cpp) for the
@@ -473,14 +539,26 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   c.expert_weights_norm = file.get_config_int("expert_weights_norm", 1) != 0;
   {
     // GGUF encoding (llama.cpp llama_expert_gating_func_type):
-    // 0 = none/unset, 1 = softmax, 2 = sigmoid.
+    // 0 = none/unset, 1 = softmax, 2 = sigmoid, 4 = sqrtsoftplus
+    // (DeepSeek-V4; see llama-hparams.h's LLAMA_EXPERT_GATING_FUNC_TYPE_
+    // SQRT_SOFTPLUS). A value the file doesn't set (0) falls back to this
+    // family's own default (engine.family_ops.default_gating) rather than
+    // the old hardcoded arch0=="glm-dsa"||"hy_v3" fallback -- note that old
+    // fallback compared against "hy_v3" (missing the hyphen; the real
+    // family string everywhere else in this codebase is "hy-v3"), so it
+    // silently never actually fired for real Hy-V3 files. family_ops.cpp's
+    // resolve_family_ops carries that ACTUAL prior behavior forward
+    // unchanged (Hunyuan's default_gating is Softmax, not Sigmoid) --
+    // fixing the typo is a separate decision from this refactor.
     int gating = file.get_config_int("expert_gating_func", 0);
     if (gating == 2)
-      c.use_sigmoid_gate = true;
+      c.gating_func = GatingFunc::Sigmoid;
     else if (gating == 1)
-      c.use_sigmoid_gate = false;
+      c.gating_func = GatingFunc::Softmax;
+    else if (gating == 4)
+      c.gating_func = GatingFunc::SqrtSoftplus;
     else
-      c.use_sigmoid_gate = (arch0 == "glm-dsa" || arch0 == "hy_v3");
+      c.gating_func = engine.family_ops.default_gating;
   }
   // Original HunyuanMoE ropes Q/K before QK-norm; Hy-V3/GLM-5.2 norm first.
   c.rope_before_norm = (arch0 == "hunyuan-moe");
@@ -507,6 +585,19 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     c.rope_n_ctx_orig =
         file.get_config_int("rope.scaling.original_context_length",
                             file.get_config_int("context_length", max_ctx));
+    // DeepSeek-V4 drops V3's rope_yarn_log_mul mscale-adjustment term from
+    // its YaRN attn-factor formula entirely (confirmed against llama.cpp's
+    // deepseek4.cpp: dsv4_rope_attn_factor() has no log_mul term at all,
+    // unlike deepseek2.cpp's attn_factor_org*(1+0.1*rope_yarn_log_mul*
+    // log(1/freq_scale))) -- forced to 0 here regardless of what the file
+    // itself sets, rather than trusting a key DeepSeek-V4 checkpoints
+    // shouldn't be setting in the first place. rope.hpp's own formula
+    // already multiplies this coefficient through to exactly zero
+    // contribution when it's 0, so no new RoPE code is needed for this --
+    // only this one override.
+    if (fam == ModelFamily::DeepSeek_V4)
+      c.rope_yarn_log_mul = 0.0f;
+
     LOG_STREAM_INFO() << "[ROPE] scaling.type=\"" << scaling_type
                       << "\" ext_factor=" << c.rope_ext_factor
                       << " freq_scale=" << c.rope_freq_scale
@@ -516,6 +607,48 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
                       << " -- ext_factor=0 means plain RoPE, attn_scale "
                          "reduces to 1/sqrt(qk_head) "
                          "nonzero means the YaRN branch is live.\n";
+  }
+
+  // ---------- DeepSeek-V4 (Hyper-Connections, grouped output projection,
+  // attention sinks, SWA) ---------- Phase 1 only (correctness within each
+  // layer's local sliding window) -- see CLAUDE.md's DeepSeek-V4 plan
+  // writeup. Every field defaults to "feature inactive"
+  // (ArchitectureConfig's own defaults), so this block is a strict no-op
+  // for every other family -- populated unconditionally (not gated on
+  // `fam == DeepSeek_V4`) for the same reason every other hparam above is:
+  // a non-DeepSeek-V4 file simply won't have these GGUF keys, and
+  // get_config_int/float/array all already default to "inactive" when a
+  // key is absent.
+  {
+    c.hc_mult = file.get_config_int("hyper_connection.count", 1);
+    c.hc_sinkhorn_iters =
+        file.get_config_int("hyper_connection.sinkhorn_iterations", 0);
+    c.hc_eps = file.get_config_float("hyper_connection.epsilon", 1e-6f);
+    c.o_group_count = file.get_config_int("attention.output_group_count", 0);
+    c.o_lora_rank = file.get_config_int("attention.output_lora_rank", 0);
+    c.hash_layer_count = file.get_config_int("hash_layer_count", 0);
+    c.sliding_window = file.get_config_int("attention.sliding_window", 0);
+    // Per-layer arrays (read_kv_array/get_config_float_array, gguf_loader.
+    // hpp) -- empty vector (not a size-n_layers vector of the scalar
+    // default) when the file doesn't set them; FFN call sites (Project B's
+    // SwiGLU-clamp step) check .empty() rather than assuming a specific
+    // size, so a file that sets these for fewer than n_layers layers fails
+    // safe (out-of-range layers just don't get clamped) rather than
+    // out-of-bounds reading.
+    c.swiglu_clamp_exp = file.get_config_float_array("swiglu_clamp_exp");
+    c.swiglu_clamp_shexp = file.get_config_float_array("swiglu_clamp_shexp");
+    if (fam == ModelFamily::DeepSeek_V4) {
+      LOG_STREAM_INFO() << "[DSV4] hc_mult=" << c.hc_mult
+                        << " hc_sinkhorn_iters=" << c.hc_sinkhorn_iters
+                        << " hc_eps=" << c.hc_eps
+                        << " o_group_count=" << c.o_group_count
+                        << " o_lora_rank=" << c.o_lora_rank
+                        << " hash_layer_count=" << c.hash_layer_count
+                        << " sliding_window=" << c.sliding_window
+                        << " swiglu_clamp_exp.size()=" << c.swiglu_clamp_exp.size()
+                        << " swiglu_clamp_shexp.size()=" << c.swiglu_clamp_shexp.size()
+                        << "\n";
+    }
   }
 
   // Fallback: detect from tensor shapes if KV didn't provide values
@@ -529,9 +662,24 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         if (layer_idx > max_layer_found)
           max_layer_found = layer_idx;
       }
-      if (c.hidden == 0 && name == "token_embd.weight") {
-        c.vocab = tensor.shape[0];
-        c.hidden = tensor.shape[1];
+      // FIX: same real bug as the vocab_size-KV-absent fallback above (see
+      // that comment for the full derivation against llama.cpp's real
+      // {n_embd, n_vocab} create_tensor convention) -- this was reading
+      // shape[0]/shape[1] exactly TRANSPOSED (vocab from shape[0], hidden
+      // from shape[1], when shape[0]=n_embd/shape[1]=n_vocab is the real
+      // order). Only reachable when embedding_length is ALSO absent from
+      // KV (narrower gate than the vocab-only fallback above, so this
+      // specific block wasn't what corrupted the real DeepSeek-V4-Flash
+      // run -- c.hidden was correctly read from KV there -- but it's the
+      // identical class of bug and would have silently hit any file
+      // missing both KVs). Added a size() guard: this loop iterates every
+      // tensor in the file, not just 2D weight matrices, so indexing
+      // shape[1] unconditionally would be undefined behavior the moment a
+      // 1D tensor happened to be named "token_embd.weight".
+      if (c.hidden == 0 && name == "token_embd.weight" &&
+          tensor.shape.size() >= 2) {
+        c.vocab = tensor.shape[1];
+        c.hidden = tensor.shape[0];
       }
       // Detect hidden from any attn weight shape
       if (c.hidden == 0 &&
@@ -541,6 +689,42 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     }
     if (c.n_layers == 0)
       c.n_layers = max_layer_found + 1;
+  }
+
+  // Loud, UNGATED sanity check on the final c.vocab/c.hidden values against
+  // token_embd.weight's real numel -- added directly alongside the two
+  // shape[0]/shape[1] bugs just fixed above, specifically because THIS
+  // exact drift (c.vocab silently == c.hidden) went completely undetected
+  // until a real generation run produced garbage output and a multi-step
+  // investigation traced it back. verify_tensor_dimensions()'s own
+  // check()/check_orient() machinery (this same file, near the top) could
+  // have caught it via the same numel-mismatch technique, but that
+  // function EARLY-RETURNS for any cache_shape other than MLAAbsorbed --
+  // i.e. it never runs at all for DeepSeek-V4 (MLARawSWA), which is
+  // exactly the family this bug was found on. This check is architecture-
+  // agnostic (token_embd.weight's numel must equal vocab*hidden regardless
+  // of attention/cache family) so it runs for every family, unconditionally.
+  {
+    auto it = file.tensors.find("token_embd.weight");
+    if (it != file.tensors.end() && !it->second.shape.empty()) {
+      uint64_t real_numel = 1;
+      for (auto d : it->second.shape) real_numel *= d;
+      uint64_t expected_numel = (uint64_t)c.vocab * (uint64_t)c.hidden;
+      if (real_numel != expected_numel) {
+        std::string shape_str;
+        for (auto d : it->second.shape) shape_str += std::to_string(d) + ",";
+        LOG_ERROR(
+            "[VOCAB-CHECK] token_embd.weight real numel=%llu (shape=[%s]) != "
+            "vocab(%d)*hidden(%d)=%llu -- ArchitectureConfig::vocab is WRONG. "
+            "The prefill embed loop's bounds check (generation_loop.hpp) will "
+            "silently skip embedding any real token id >= vocab, leaving that "
+            "row zero and producing fluent-but-garbage generation with no "
+            "NaN/Inf anywhere to catch it. Check vocab_size-style KV keys and "
+            "the shape[0]/shape[1] fallback logic just above in this file.\n",
+            (unsigned long long)real_numel, shape_str.c_str(), c.vocab,
+            c.hidden, (unsigned long long)expected_numel);
+      }
+    }
   }
 
   // Detect experts from packed expert tensors
@@ -580,75 +764,27 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   LOG_STREAM_INFO() << "  -> First dense layers: " << first_dense << "\n";
 
   // ---------- Allocate KV cache (host + attempt GPU) ----------
+  // Delegates to engine.family_ops.alloc_cache_fn -- each CacheShape's own
+  // allocator (family_ops.cpp) now owns the field sizing AND its own log
+  // line, rather than this function switching on is_mla and inlining both
+  // bodies. A new CacheShape (e.g. DeepSeek-V4's MLARawSWA) is a new
+  // alloc_*_cache function pointed to from resolve_family_ops's table, not a
+  // new branch here.
   engine.max_t = max_ctx;
-  size_t total_kv_bytes = 0;
-  if (c.is_mla) {
-    engine.Lc.resize(c.n_layers + 1, nullptr);
-    engine.Rc.resize(c.n_layers + 1, nullptr);
-    engine.d_Lc.resize(c.n_layers + 1, nullptr);
-    engine.d_Rc.resize(c.n_layers + 1, nullptr);
-    for (int i = 0; i <= c.n_layers; ++i) {
-      size_t lc_bytes = (size_t)max_ctx * c.kv_lora * sizeof(float);
-      size_t rc_bytes = (size_t)max_ctx * c.qk_rope * sizeof(float);
-      posix_memalign((void **)&engine.Lc[i], 4096, lc_bytes);
-      posix_memalign((void **)&engine.Rc[i], 4096, rc_bytes);
-      std::memset(engine.Lc[i], 0, lc_bytes);
-      std::memset(engine.Rc[i], 0, rc_bytes);
-      total_kv_bytes += lc_bytes + rc_bytes;
-    }
-  } else {
-    // Dense K/V cache (Hunyuan/Llama): [max_t, n_head_kv*head_dim] per layer.
-    int kvd = std::max(1, c.n_head_kv) * std::max(1, c.head_dim);
-    engine.Kc.resize(c.n_layers, nullptr);
-    engine.Vc.resize(c.n_layers, nullptr);
-    size_t kv_bytes = (size_t)max_ctx * kvd * sizeof(float);
-    for (int i = 0; i < c.n_layers; ++i) {
-      posix_memalign((void **)&engine.Kc[i], 4096, kv_bytes);
-      posix_memalign((void **)&engine.Vc[i], 4096, kv_bytes);
-      std::memset(engine.Kc[i], 0, kv_bytes);
-      std::memset(engine.Vc[i], 0, kv_bytes);
-    }
-    total_kv_bytes = 2 * kv_bytes * c.n_layers;
-    LOG_STREAM_INFO() << "[GRAPH] Dense KV cache: " << total_kv_bytes / 1e9
-                      << " GB (" << c.n_head_kv << " kv heads x " << c.head_dim
-                      << ")\n";
-  }
-
-  // NOTE: this used to also mirror the latent/rope KV cache into VRAM here
-  // (d_Lc/d_Rc/d_Lc_q4/d_Rc_q4, "Q4 then FP32" attempt). Removed: the live
-  // MLA attention path (mla_attention_absorbed_gguf, src/attention_layer.cpp)
-  // reads and writes ONLY engine.Lc[layer_idx]/engine.Rc[layer_idx] — plain
-  // host pointers, via AVX-512 SIMD — and never touches d_Lc/d_Rc/d_Lc_q4/
-  // d_Rc_q4 at all. There IS a real GPU kernel for this
-  // (cuda/mla_attention.cu's launch_mla_attention, with
-  // mla_score_kernel/mla_softmax_kernel/ mla_value_aggregate_kernel behind it)
-  // but it is never called from anywhere in the codebase, and the
-  // kv_on_device/kv_quantized flags that would gate using it are set here but
-  // never read anywhere either. So this was allocating and zeroing up to ~0.85
-  // GB (Q4) or ~6 GB (FP32 fallback) of VRAM on the core GPU for a buffer that
-  // had zero effect on compute — the exact same class of bug as the
-  // d_hidden/d_scratch dead allocation removed earlier from gpu_topology.hpp.
-  // If launch_mla_attention is ever wired up, this allocation (and the fields,
-  // still present on StreamingEngine) can come back.
-  if (c.is_mla) {
-    LOG_STREAM_INFO() << "[GRAPH] KV cache: host-only (" << total_kv_bytes / 1e9
-                      << " GB) — GPU KV mirror unused by the live attention "
-                         "path, not allocated\n";
-  }
+  engine.family_ops.alloc_cache_fn(engine, c, max_ctx);
 
   // ---------- Build dense preload manifest with correct GGUF tensor names
   // ----------
   std::vector<std::string> dense_preload_manifest;
   engine.layers_experts.resize(c.n_layers);
 
-  // MLA (absorbed) vs dense Q/K/V attention, by architecture string.
-  std::string arch = file.kv_string.count("general.architecture")
-                         ? file.kv_string["general.architecture"]
-                         : "";
-  const bool is_mla = c.is_mla;
   LOG_STREAM_INFO() << "[GRAPH] Attention type: "
-                    << (is_mla ? "MLA (absorbed)" : "dense Q/K/V")
-                    << "  (arch=\"" << arch << "\")\n";
+                    << (c.cache_shape == CacheShape::MLAAbsorbed
+                            ? "MLA (absorbed)"
+                        : c.cache_shape == CacheShape::MLARawSWA
+                            ? "MLA (raw, SWA)"
+                            : "dense Q/K/V")
+                    << "  (arch=\"" << arch0 << "\")\n";
 
   for (int l = 0; l < c.n_layers; ++l) {
     std::string p = "blk." + std::to_string(l) + ".";
@@ -657,7 +793,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     dense_preload_manifest.push_back(p + "attn_norm.weight");
     dense_preload_manifest.push_back(p + "ffn_norm.weight");
 
-    if (is_mla) {
+    if (c.cache_shape == CacheShape::MLAAbsorbed) {
       // MLA absorbed attention (GLM-5.2 / DeepSeek-V3)
       dense_preload_manifest.push_back(p + "attn_q_a.weight");
       dense_preload_manifest.push_back(p + "attn_q_a_norm.weight");
@@ -666,6 +802,23 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       dense_preload_manifest.push_back(p + "attn_kv_a_norm.weight");
       dense_preload_manifest.push_back(p + "attn_k_b.weight");
       dense_preload_manifest.push_back(p + "attn_v_b.weight");
+      dense_preload_manifest.push_back(p + "attn_output.weight");
+    } else if (c.cache_shape == CacheShape::MLARawSWA) {
+      // MLA raw/SWA attention (DeepSeek-V4) -- no absorption tensors
+      // (attn_k_b/attn_v_b/kv_lora-sized attn_kv_a_mqa): wkv already
+      // produces a per-head-sized latent, attended to directly as MQA. See
+      // dsv4_attention_gguf (attention_layer.cpp, Project B).
+      dense_preload_manifest.push_back(p + "attn_q_a.weight");
+      dense_preload_manifest.push_back(p + "attn_q_a_norm.weight");
+      dense_preload_manifest.push_back(p + "attn_q_b.weight");
+      dense_preload_manifest.push_back(p + "attn_kv.weight");
+      // Real name is attn_kv_a_norm (reused from V3's naming), not
+      // attn_kv_norm -- see attention_layer.cpp's matching fix comment.
+      dense_preload_manifest.push_back(p + "attn_kv_a_norm.weight");
+      dense_preload_manifest.push_back(p + "attn_sinks.weight");
+      // Grouped low-rank output projection replaces the single attn_output.
+      dense_preload_manifest.push_back(p + "attn_output_a.weight");
+      dense_preload_manifest.push_back(p + "attn_output_b.weight");
     } else {
       // Dense Q/K/V attention (Hunyuan / Llama / GLM-4)
       dense_preload_manifest.push_back(p + "attn_q.weight");
@@ -674,26 +827,67 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       dense_preload_manifest.push_back(p +
                                        "attn_q_norm.weight"); // HY-V3 QK-norm
       dense_preload_manifest.push_back(p + "attn_k_norm.weight");
+      dense_preload_manifest.push_back(p + "attn_output.weight");
     }
-    dense_preload_manifest.push_back(p + "attn_output.weight");
+
+    // Hyper-Connections (DeepSeek-V4): one set of mixing-coefficient
+    // tensors per sub-block (attention, FFN/MoE), every layer. Inactive
+    // (c.hc_mult<=1, the default for every other family) means these
+    // tensor names are simply never added to the manifest.
+    if (c.hc_mult > 1) {
+      dense_preload_manifest.push_back(p + "hc_attn_fn.weight");
+      dense_preload_manifest.push_back(p + "hc_attn_base.weight");
+      dense_preload_manifest.push_back(p + "hc_attn_scale.weight");
+      dense_preload_manifest.push_back(p + "hc_ffn_fn.weight");
+      dense_preload_manifest.push_back(p + "hc_ffn_base.weight");
+      dense_preload_manifest.push_back(p + "hc_ffn_scale.weight");
+    }
 
     bool is_moe = (c.n_experts > 0 && l >= first_dense);
     if (is_moe) {
-      // Router
+      // Hash-routed layers (DeepSeek-V4, first c.hash_layer_count layers):
+      // expert SELECTION is a direct token-id -> expert-id lookup via
+      // ffn_gate_tid2eid instead of top-k over router probs. FIX: this used
+      // to ALSO skip ffn_gate_inp.weight entirely for these layers, under
+      // the assumption that hash-routed layers need no learned router at
+      // all -- WRONG, confirmed against llama.cpp's real DeepSeek-V4
+      // implementation (src/models/deepseek4.cpp + llama-graph.cpp's
+      // build_moe_ffn): the router's logits/probs are computed
+      // UNCONDITIONALLY for every layer, hash-routed or not -- they still
+      // supply the WEIGHTS for whichever experts end up selected. Only the
+      // SELECTION step (which experts) is overridden for hash-routed
+      // layers; the bias tensor (exp_probs_b) genuinely doesn't apply there
+      // (selection isn't argsort-over-biased-probs any more), so that part
+      // stays conditional. Omitting ffn_gate_inp.weight here meant
+      // moe_forward_gguf's own router lookup (execution_layer.cpp) could
+      // never find it for these layers and SILENTLY ZERO-FILLED the entire
+      // MoE output for every hash-routed layer, on every token -- finite
+      // (not NaN), so invisible to check_finite. This was the actual root
+      // cause of a real fluent-but-garbage generation run, not "falls back
+      // to the wrong router" as the old comment here (and
+      // execution_layer.cpp's warning) claimed.
+      bool hash_routed = (l < c.hash_layer_count);
+      // Router: needed by EVERY MoE layer, hash-routed or not (see above).
       dense_preload_manifest.push_back(p + "ffn_gate_inp.weight");
-      // Selection-bias tensor (DeepSeek-V3/GLM-5.2 style). GGUF name is
-      // "blk.N.exp_probs_b.bias" — llama.cpp's tn(LLM_TENSOR_FFN_EXP_PROBS_B,
-      // "bias", N) resolves LLM_TENSOR_FFN_EXP_PROBS_B's pattern
-      // "blk.%d.exp_probs_b" then appends ".bias" (confirmed against
-      // llama-arch.cpp:407 + LLM_TN_IMPL::str()). This used to look for
-      // "ffn_gate_inp.e_score_correction_bias" — a name that doesn't
-      // exist in any real GGUF, so this tensor was NEVER actually
-      // loaded (explains the "1106/1182 tensors found" gap — 76
-      // missing = exactly the MoE layer count). The router code
-      // already handles the bias tensor being absent gracefully (falls
-      // back to unbiased selection), so this wasn't a crash, just
-      // silently wrong/incomplete routing for models that do ship it.
-      dense_preload_manifest.push_back(p + "exp_probs_b.bias");
+      if (hash_routed) {
+        dense_preload_manifest.push_back(p + "ffn_gate_tid2eid.weight");
+      } else {
+        // Selection-bias tensor (DeepSeek-V3/GLM-5.2 style). GGUF name is
+        // "blk.N.exp_probs_b.bias" — llama.cpp's tn(LLM_TENSOR_FFN_EXP_PROBS_B,
+        // "bias", N) resolves LLM_TENSOR_FFN_EXP_PROBS_B's pattern
+        // "blk.%d.exp_probs_b" then appends ".bias" (confirmed against
+        // llama-arch.cpp:407 + LLM_TN_IMPL::str()). This used to look for
+        // "ffn_gate_inp.e_score_correction_bias" — a name that doesn't
+        // exist in any real GGUF, so this tensor was NEVER actually
+        // loaded (explains the "1106/1182 tensors found" gap — 76
+        // missing = exactly the MoE layer count). The router code
+        // already handles the bias tensor being absent gracefully (falls
+        // back to unbiased selection), so this wasn't a crash, just
+        // silently wrong/incomplete routing for models that do ship it.
+        // Not loaded for hash-routed layers -- selection bias doesn't
+        // apply when selection is a direct lookup, not argsort.
+        dense_preload_manifest.push_back(p + "exp_probs_b.bias");
+      }
       // Shared expert
       dense_preload_manifest.push_back(p + "ffn_gate_shexp.weight");
       dense_preload_manifest.push_back(p + "ffn_up_shexp.weight");
@@ -719,6 +913,16 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   dense_preload_manifest.push_back("token_embd.weight");
   dense_preload_manifest.push_back("output_norm.weight");
   dense_preload_manifest.push_back("output.weight");
+  // Hyper-Connections (DeepSeek-V4): the top-level "collapse hc_mult
+  // streams back to one" weights, used once at model output (hc_collapse_
+  // output, hyper_connections.cpp) -- distinct from the per-layer
+  // hc_attn_*/hc_ffn_* tensors pushed above. Inactive (c.hc_mult<=1) means
+  // these names are simply never added.
+  if (c.hc_mult > 1) {
+    dense_preload_manifest.push_back("output_hc_fn.weight");
+    dense_preload_manifest.push_back("output_hc_base.weight");
+    dense_preload_manifest.push_back("output_hc_scale.weight");
+  }
 
   // Report and load
   int found = 0;

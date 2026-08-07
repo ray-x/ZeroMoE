@@ -52,8 +52,17 @@ static bool parse_blk_suffix(const std::string &name, int &L,
 }
 
 static bool is_attention_or_norm(const std::string &suffix) {
+  // hc_ catches DeepSeek-V4's per-layer Hyper-Connections weights
+  // (hc_attn_fn/base/scale, hc_ffn_fn/base/scale) -- hc_attn_* already
+  // matched the "attn" substring below by accident, but hc_ffn_* matched
+  // neither "attn" nor "norm" and was silently NOT hard-required per
+  // layer, exactly the class of gap this check exists to catch (a shard
+  // that dropped one of these residual-stream-critical weights on some
+  // layer would have passed verify clean). See src/main.cpp's
+  // is_dense_offload_candidate for the same "hc_" rationale.
   return suffix.find("attn") != std::string::npos ||
-         suffix.find("norm") != std::string::npos;
+         suffix.find("norm") != std::string::npos ||
+         suffix.find("hc_") != std::string::npos;
 }
 
 int cmd_verify(int argc, char **argv) {

@@ -62,10 +62,20 @@ namespace {
 // with main.cpp if the engine's own categorization ever changes. ----
 
 bool is_dense_offload_candidate(const std::string &name) {
+  // attn_output_a (DeepSeek-V4's grouped output projection, first stage)
+  // gets the SAME treatment as attn_k_b/attn_v_b in the real engine
+  // (dsv4_attention_gguf, attention_layer.cpp): dequant_row'd once into a
+  // static per-layer cache and consumed via raw CPU matmul(), never
+  // through dense_proj/device_ptr -- excluded for the identical reason.
   if (name.find("attn_k_b.weight") != std::string::npos ||
-      name.find("attn_v_b.weight") != std::string::npos) {
+      name.find("attn_v_b.weight") != std::string::npos ||
+      name.find("attn_output_a.weight") != std::string::npos) {
     return false;
   }
+  // hc_ catches DeepSeek-V4's Hyper-Connections weights (6 per-layer +
+  // 3 global output_hc_*) -- see src/main.cpp's own comment on this same
+  // predicate for the full rationale.
+  if (name.find("hc_") != std::string::npos) return true;
   return name.find("attn") != std::string::npos ||
          name.find("norm") != std::string::npos ||
          name.find("gate_inp") != std::string::npos ||
@@ -78,12 +88,19 @@ bool is_dense_offload_candidate(const std::string &name) {
 }
 
 bool is_attn_output(const std::string &name) {
-  return name.find("attn_output.weight") != std::string::npos;
+  // attn_output_b is V4's second-stage (single dense matmul) analog of
+  // attn_output.weight -- attn_output_a never reaches this check (excluded
+  // above).
+  return name.find("attn_output.weight") != std::string::npos ||
+         name.find("attn_output_b.weight") != std::string::npos;
 }
 
 const char *categorize_dense_tensor(const std::string &name) {
-  if (name.find("attn_output.weight") != std::string::npos)
+  if (name.find("attn_output.weight") != std::string::npos ||
+      name.find("attn_output_b.weight") != std::string::npos)
     return "attn_output";
+  if (name.find("hc_") != std::string::npos)
+    return "hyper_connections (hc_*)";
   if (name.find("shexp") != std::string::npos)
     return "shared_expert (shexp)";
   if (name.find("ffn_gate.weight") != std::string::npos ||

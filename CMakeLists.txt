@@ -215,6 +215,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         cuda/kv_quant.cu
         cuda/matmul.cu
         cuda/mla_attention.cu
+        cuda/mxfp4_matmul.cu
         cuda/q8_0_matmul.cu
         cuda/rmsnorm.cu
     )
@@ -224,12 +225,14 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/execution_layer.cpp
         src/attention_layer.cpp
         src/graph_initializer.cpp
+        src/hyper_connections.cpp
         src/gpu_topology.cpp
         src/ggml_dequant.cpp
         src/ggml_grids.cpp
         src/kernels_cpu.cpp
         src/qwen_moe.cpp
         models/model_factory.cpp
+        models/family_ops.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
     target_include_directories(moestream PRIVATE
@@ -262,12 +265,14 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/execution_layer.cpp
         src/attention_layer.cpp
         src/graph_initializer.cpp
+        src/hyper_connections.cpp
         src/gpu_topology.cpp
         src/ggml_dequant.cpp
         src/ggml_grids.cpp
         src/kernels_cpu.cpp
         src/qwen_moe.cpp
         models/model_factory.cpp
+        models/family_ops.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
     target_include_directories(moestream_tests PRIVATE

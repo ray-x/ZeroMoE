@@ -196,10 +196,18 @@ private:
                         float *state, float *out, int S, int n_v_heads,
                         int k_dim, int v_dim);
   void causal_conv1d(const float *x, const float *w, float *out, int S,
-                     int channels, int kernel);
+                     int channels, int kernel, float *history);
 
   // Per-layer recurrent state for linear attention, persisted across tokens.
   std::vector<std::vector<float>> linear_attn_states;
+
+  // Per-layer causal-conv1d history: the last (kernel-1) samples per channel
+  // from the previous forward_linear_attention call, persisted across tokens
+  // exactly like linear_attn_states above. Required because decode calls this
+  // backend one token at a time (S=1) -- without carrying this state forward,
+  // every decode step's conv1d would only ever see the single current sample
+  // and silently lose the other (kernel-1) taps of its receptive field.
+  std::vector<std::vector<float>> conv_history;
 
   // Quantized matmul helper for MoE experts.
   void dequant_matmul(GGUFType type, const uint8_t *w, size_t w_bytes,

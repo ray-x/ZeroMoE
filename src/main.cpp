@@ -327,10 +327,35 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         // since they'd otherwise match the broad "attn" substring below --
         // found while investigating what the "other_attention" VRAM bucket
         // (CLAUDE.md's dense-pool-composition breakdown) actually contains.
+        //
+        // attn_output_a (DeepSeek-V4's grouped output projection, first
+        // stage) gets EXACTLY this same treatment in dsv4_attention_gguf
+        // (attention_layer.cpp): dequant_row'd ONCE into a static per-layer
+        // cache (woa_cache) and consumed via raw CPU matmul() per group,
+        // never through dense_proj/device_ptr -- excluded for the identical
+        // reason as attn_k_b/attn_v_b. attn_output_b (the second, single
+        // dense matmul stage) is NOT excluded -- it genuinely goes through
+        // dense_proj, see is_attn_output below.
         if (name.find("attn_k_b.weight") != std::string::npos ||
-            name.find("attn_v_b.weight") != std::string::npos) {
+            name.find("attn_v_b.weight") != std::string::npos ||
+            name.find("attn_output_a.weight") != std::string::npos) {
             return false;
         }
+        // hc_ catches DeepSeek-V4's Hyper-Connections weights: the two
+        // per-layer mixing matmuls (hc_attn_fn/hc_ffn_fn -- these DO route
+        // through dense_proj, hyper_connections.cpp's hc_pre_collapse) plus
+        // their small bias/scale companions (hc_{attn,ffn}_{base,scale},
+        // read via a raw host_ptr lookup, no GPU dispatch -- including them
+        // here is harmless over-inclusion, not a correctness issue, given
+        // their negligible size) and the global output_hc_{fn,base,scale}
+        // (hc_collapse_output). All contain the literal substring "hc_" and
+        // nothing else in this codebase's tensor vocabulary does. Previously
+        // missing entirely -- hc_attn_* happened to already match the loose
+        // "attn" substring below, but hc_ffn_*/output_hc_* matched NOTHING,
+        // silently dropping them from the dense VRAM total on a real
+        // DeepSeek-V4 model (found auditing tools/gguf_plan.cpp, which
+        // mirrors this exact function, against the newly-added tensor set).
+        if (name.find("hc_") != std::string::npos) return true;
         return name.find("attn") != std::string::npos ||
                name.find("norm") != std::string::npos ||
                name.find("gate_inp") != std::string::npos ||
@@ -372,7 +397,16 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // MATCHED types (BF16 weight AND BF16 activation), verified correct in
     // isolation via Test 10 before being wired in here — see CLAUDE.md.)
     auto is_attn_output = [](const std::string& name) {
-        return name.find("attn_output.weight") != std::string::npos;
+        // attn_output_b (DeepSeek-V4's grouped output projection, SECOND
+        // stage -- a single genuine dense_proj matmul, unlike attn_output_a
+        // above) is the direct V4 analog of attn_output.weight here: same
+        // "large per-layer static matrix, same kind of dense_proj call,
+        // same reason the BF16 fast-path helps" reasoning applies
+        // unchanged. attn_output_a is EXCLUDED from candidacy entirely
+        // (is_dense_offload_candidate above), so it never reaches this
+        // check regardless.
+        return name.find("attn_output.weight") != std::string::npos ||
+               name.find("attn_output_b.weight") != std::string::npos;
     };
 
     // gate_inp (MoE router) BF16 fast-path -- converted BEFORE the regular
@@ -557,8 +591,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     struct DenseCategoryTotal { size_t bytes = 0; int count = 0; };
     std::map<std::string, DenseCategoryTotal> category_totals;
     auto categorize_dense_tensor = [](const std::string& name) -> const char* {
-        if (name.find("attn_output.weight") != std::string::npos)
+        // attn_output_a never reaches this function at all (excluded by
+        // is_dense_offload_candidate above) -- only attn_output_b (V4) or
+        // attn_output (V3/dense) land in this bucket.
+        if (name.find("attn_output.weight") != std::string::npos ||
+            name.find("attn_output_b.weight") != std::string::npos)
             return "attn_output (unconverted -- no BF16 fast-path budget left)";
+        // DeepSeek-V4 Hyper-Connections weights -- see is_dense_offload_
+        // candidate's own comment on why "hc_" catches all 9 (6 per-layer +
+        // 3 global) of these. Checked before "attn" below since hc_attn_*
+        // would otherwise fall into the misleading "other_attention"
+        // bucket (they're residual-stream mixing weights, not attention
+        // projections).
+        if (name.find("hc_") != std::string::npos)
+            return "hyper_connections (hc_*)";
         if (name.find("shexp") != std::string::npos)
             return "shared_expert (shexp)";
         if (name.find("ffn_gate.weight") != std::string::npos ||

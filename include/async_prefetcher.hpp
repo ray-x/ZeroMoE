@@ -46,8 +46,8 @@ struct PrefetchHint {
 // totals in perf_timer.hpp can't tell you WHICH layers the prefetcher
 // actually helps vs wastes bandwidth on; this answers that per-layer via
 // LockFreePrefetcher::log_per_layer_report(). Rewritten for the unified
-// claim/publish design (RAMSafetyManager::claim_or_wait): the old pipe_
-// served/pipe_no_match/pipe_not_ready/staged_evicted_unused/used_lifetime_
+// claim/publish design (RAMSafetyManager::claim_or_wait): the old prefetch_
+// served/prefetch_no_match/prefetch_not_ready/staged_evicted_unused/used_lifetime_
 // us_sum/evicted_lifetime_us_sum fields described a separate staging pool
 // that no longer exists -- claims_beaten_by_decode is the new, directly
 // analogous signal (a prefetch worker's OWN claim attempt for this layer
@@ -132,13 +132,13 @@ public:
     RAMSafetyManager* ram_mgr = nullptr;
 
     // avg ms per completed real fetch so far this run.
-    // t_pipe_read_ms_sum is a sum across possibly-concurrent worker
+    // t_prefetch_read_ms_sum is a sum across possibly-concurrent worker
     // threads (see its own comment in perf_timer.hpp) but dividing by a
     // count of completed fetches still yields a valid mean duration per
     // fetch -- it's only invalid to read the sum as a wall-clock total.
     double avg_fetch_ms() const {
-        uint64_t completed = perf().n_pipe_fetch_completed.load(std::memory_order_relaxed);
-        return completed > 0 ? perf().t_pipe_read_ms_sum.load(std::memory_order_relaxed) / (double)completed : 0.0;
+        uint64_t completed = perf().n_prefetch_completed.load(std::memory_order_relaxed);
+        return completed > 0 ? perf().t_prefetch_read_ms_sum.load(std::memory_order_relaxed) / (double)completed : 0.0;
     }
 
     // Per-layer prefetch report, printed at shutdown (main.cpp, after
@@ -281,7 +281,7 @@ public:
     // tail claims -- this is a "roughly right now" snapshot, not a
     // linearizable check): is there a hint for (layer_idx, expert_id)
     // still sitting in the queue, not yet claimed by any worker_loop
-    // thread? Distinguishes, for a PIPE miss that found no staged slot,
+    // thread? Distinguishes, for a prefetch miss that found no staged slot,
     // "no worker has even started this read yet" (a scheduling/
     // throughput gap -- N hints queued per layer transition, serviced by
     // however many worker threads are configured) from "nothing was ever
@@ -463,7 +463,7 @@ private:
         RamClaimGuard guard{ram_mgr, layer_idx, &slot};
 
         auto t0 = std::chrono::high_resolution_clock::now();
-        perf().n_pipe_fetch_issued.fetch_add(1, std::memory_order_relaxed);
+        perf().n_prefetch_issued.fetch_add(1, std::memory_order_relaxed);
         if (auto* s = layer_stat(layer_idx)) s->fetches_issued.fetch_add(1, std::memory_order_relaxed);
         n_fetches_in_flight.fetch_add(1, std::memory_order_relaxed);
         // Measurement only (expert_fetch_tracker.hpp) -- kept for the
@@ -493,9 +493,9 @@ private:
         if (ok) {
             double dt_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
-            perf().n_pipe_fetch_completed.fetch_add(1, std::memory_order_relaxed);
-            perf().bytes_pipe_prefetched.fetch_add(total, std::memory_order_relaxed);
-            PerfCounters::atomic_add(perf().t_pipe_read_ms_sum, dt_ms);
+            perf().n_prefetch_completed.fetch_add(1, std::memory_order_relaxed);
+            perf().bytes_prefetched.fetch_add(total, std::memory_order_relaxed);
+            PerfCounters::atomic_add(perf().t_prefetch_read_ms_sum, dt_ms);
             if (auto* s = layer_stat(layer_idx)) {
                 s->fetches_completed.fetch_add(1, std::memory_order_relaxed);
                 s->fetch_us_sum.fetch_add((uint64_t)(dt_ms * 1000.0), std::memory_order_relaxed);
@@ -522,7 +522,7 @@ private:
             // unpopulated slot.
         }
 
-        perf().n_pipe_fetch_failed.fetch_add(1, std::memory_order_relaxed);
+        perf().n_prefetch_failed.fetch_add(1, std::memory_order_relaxed);
         if (auto* s = layer_stat(layer_idx)) s->fetches_failed.fetch_add(1, std::memory_order_relaxed);
         issue_fadvise_fallback(layer_idx, expert_id);
         // guard stays armed -- its destructor reverts the claim to Empty.

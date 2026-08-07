@@ -28,6 +28,10 @@ extern "C" void launch_iq2_xs_matmul(float* y, const float* x, const void* weigh
 extern "C" void launch_iq2_s_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq3_xxs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq4_xs_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+// MXFP4: dormant kernel (see kquant_dequant.hpp's gpu_type_supported()) --
+// wired here for Test 5 harness parity even though this switch is only
+// reached once gpu_type_supported() itself has already gated the type.
+extern "C" void launch_mxfp4_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_rmsnorm(float* y, const float* x, const float* w, int S, int D, float eps);
 
 class CudaManager {
@@ -680,6 +684,14 @@ public:
                 break;
             case GGUFType::IQ4_XS:
                 launch_iq4_xs_matmul(d_y, d_x, d_W, S, I, O);
+                ok = true;
+                break;
+            // MXFP4: reachable here (dense_matmul_host is called directly by
+            // src/main_test.cpp's Test 5 harness, bypassing gpu_type_supported()'s
+            // gate) so the kernel can be validated on real hardware BEFORE
+            // gpu_type_supported() flips it on for the live expert-FFN path.
+            case GGUFType::MXFP4:
+                launch_mxfp4_matmul(d_y, d_x, d_W, S, I, O);
                 ok = true;
                 break;
             // IQ1_* / IQ2_M : no GPU fused kernel — CPU dequant (libggml) handles

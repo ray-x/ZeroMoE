@@ -298,6 +298,23 @@ bool test_cuda_fused_kernels() {
     // block-index or grid-dimension range) that the earlier, smaller test
     // shapes were never able to catch.
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_XS,  2048, 6144, 1);
+    // MXFP4: NEW, currently DORMANT kernel (cuda/mxfp4_matmul.cu) -- see
+    // kquant_dequant.hpp's gpu_type_supported() comment. This IS the
+    // real-hardware verification gate that must pass BEFORE that function
+    // is flipped to enable live GPU dispatch for this type. Fixed 16-entry
+    // table (kvalues_mxfp4) + one E8M0 scale/block, 32 elements/block --
+    // smaller and simpler than IQ4_XS's 256-element superblock, so a
+    // single-block case (I=256... but block=32, so I=256 is 8 blocks) plus
+    // a multi-warp-stride case (I>256*8=2048, to exercise the kernel's
+    // warp-striding loop past one full round of all 8 warps) are the two
+    // shapes worth distinguishing here.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::MXFP4,   512, 8, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::MXFP4,   4096, 4, 2);
+    // Real production shape for this checkpoint's down-projection (same
+    // I=moe_inter, O=hidden, S=1 rationale as the IQ4_XS large-O case
+    // above) -- DeepSeek-V4-Flash's blk.42.ffn_down_exps.weight is the
+    // actual MXFP4 tensor that motivated this kernel.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::MXFP4,   2048, 6144, 1);
 
     std::cout << "  -> " << (all_pass ? "All fused kernels agree with CPU reference within tolerance."
                                        : "One or more CUDA fused kernels disagreed with the CPU reference -- see FAILED lines above.")

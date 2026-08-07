@@ -4,6 +4,7 @@
 #include "io_uring_backend.hpp"
 #include "perf_timer.hpp"
 #include "logger.hpp"
+#include "family_ops.hpp" // FamilyOps -- see StreamingEngine::family_ops below
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -212,7 +213,7 @@ struct MoEExpertBlock {
     // from_pipe_prefetch (which meant "served via the old separate staging
     // pool's consume_staged") -- under the unified claim/publish design there is
     // no separate staging pool, so this now just means "who populated this
-    // slot", used for two things: (1) n_pipe_staged_later_promoted (perf_timer.
+    // slot", used for two things: (1) n_prefetch_staged_later_promoted (perf_timer.
     // hpp) still counts how many prefetch-loaded slots later cross
     // promote_hit_threshold and get promoted to VRAM via the normal hit-count-
     // gated path, proving prefetched experts still reach VRAM only once a real
@@ -258,6 +259,15 @@ public:
     GGUFFile model_file;
     GGUFFile dense_model_file;      // separate dense GGUF (config.dense_model_path); optional
     bool has_dense_model = false;
+
+    // Resolved ONCE from ModelFamily (detect_model_family(model_file)) in
+    // graph_initializer.cpp, right after architecture_config's other fields
+    // are populated -- the single per-family dispatch table layers_forward_
+    // gguf (execution_layer.cpp) and the cache-allocation code below read
+    // from instead of the old scattered is_mla-bool/arch-string-literal
+    // checks. See family_ops.hpp for the full rationale.
+    FamilyOps family_ops;
+
     std::unordered_map<std::string, QuantizedTensor> resident_layers;
     std::vector<std::vector<MoEExpertBlock>> layers_experts;
 
@@ -287,6 +297,40 @@ public:
     // Dense KV cache for non-MLA arches (Hunyuan/Llama): [n_layers][max_t * n_head_kv * head_dim]
     std::vector<float*> Kc;
     std::vector<float*> Vc;
+
+    // Raw/SWA MLA KV cache (DeepSeek-V4, CacheShape::MLARawSWA): per-layer
+    // ring buffer [sliding_window * n_embd_head], NOT [max_t * ...] --
+    // sized by the sliding window, not the full context, which is the
+    // actual memory win SWA is for. Ring index is `pos % sliding_window`,
+    // applied consistently on every read AND write (dsv4_attention_gguf,
+    // attention_layer.cpp) -- unlike Lc/Rc (CacheShape::MLAAbsorbed), there
+    // is no separate rope-half cache here: DeepSeek-V4's wkv already
+    // produces one per-head-sized latent with the rope slice embedded, so
+    // one buffer per layer is enough. sliding_window mirrors
+    // ArchitectureConfig::sliding_window (kept on the engine too so the
+    // attention function's ring-index math doesn't need to thread
+    // ArchitectureConfig through every call for just this one int).
+    std::vector<float*> KVc;
+    int sliding_window = 0;
+
+    // Hyper-Connections multi-stream residual (DeepSeek-V4, hc_mult > 1
+    // only -- empty/unused for every other family, per family_ops.hpp's own
+    // "hc_mult==1 is the degenerate case" design). Layout is PRIVATE to
+    // hyper_connections.cpp -- nothing outside that file indexes into this
+    // buffer directly (layers_forward_gguf and every attention/FFN function
+    // still only ever see the plain, single-stream [S,D] hidden_states/
+    // scratch buffers). Sized [S * hc_mult * D] floats, resized once per
+    // layers_forward_gguf call (S can change between prefill and decode).
+    std::vector<float> hc_stream_buf;
+    // Post-gate/comb-matrix scratch: computed once by hc_pre_collapse
+    // (hyper_connections.cpp) and consumed by the LATER hc_post_combine
+    // call for the SAME layer/sub_block, after the sub-block itself has run
+    // in between -- these two calls aren't adjacent, so the values can't
+    // just be locals. Sized [S*hc_mult] / [S*hc_mult*hc_mult]; resized
+    // (harmlessly re-resized to the same size) on every hc_pre_collapse
+    // call.
+    std::vector<float> hc_post_gate_scratch;
+    std::vector<float> hc_comb_scratch;
 
     // GPU-resident KV cache (allocated when VRAM available)
     std::vector<float*> d_Lc;  // Device pointers for latent cache (FP32)
@@ -377,6 +421,7 @@ public:
         for (float* p : Rc) if (p) free(p);
         for (float* p : Kc) if (p) free(p);
         for (float* p : Vc) if (p) free(p);
+        for (float* p : KVc) if (p) free(p);
 
         if (have_gpu) {
             for (float* p : d_Lc) if (p) cudaFree(p);
@@ -439,7 +484,7 @@ public:
     // own quant type + shape). Returns false if this layer has no packed
     // ffn_{gate,up,down}_exps.weight tensors (dense layer or legacy per-expert
     // layout). Shared by load_expert_slab's pread path and the consume_staged
-    // (PIPE) path so the two can never disagree on slab layout.
+    // (prefetch) path so the two can never disagree on slab layout.
     bool packed_slab_geometry(int layer_idx, size_t& gb, size_t& ub, size_t& db,
                               const GGUFTensor*& gM, const GGUFTensor*& uM, const GGUFTensor*& dM) const {
         std::string base = "blk." + std::to_string(layer_idx) + ".";
@@ -662,7 +707,7 @@ public:
 
     // Set up a MoEExpertBlock's three projection host_ptr/meta from an already-
     // populated packed slab_buffer (gate|up|down at offsets 0, gb, gb+ub).
-    // Shared by the pread path and the consume_staged (PIPE) path -- the
+    // Shared by the pread path and the consume_staged (prefetch) path -- the
     // prefetcher's active_prefetch produces a byte-identical packed layout, so
     // the same projection setup applies whether the bytes came from pread or
     // from the staging pool. Offsets are slab-relative so expert_ffn's

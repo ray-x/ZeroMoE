@@ -492,7 +492,22 @@ int process_one_shard(const std::string &input_path,
       out_tensors.push_back(std::move(ot));
     }
   }
-  if (packed_tensors_found == 0) {
+  if (!unpack) {
+    // align-only mode never ran the detection loop above at all (it
+    // `break`s out immediately, per that loop's own first line) -- so
+    // "found none" would be a claim this code path never actually
+    // checked. Every tensor, packed *_exps included, passes through the
+    // SAME generic realign-and-copy loop below regardless of what it is;
+    // there's nothing align-only mode needs to identify a packed tensor
+    // FOR. Previously printed the misleading "[pack] No packed expert
+    // tensors found in this file" here -- accurate wording only for
+    // --unpack mode (below), where the detection loop genuinely runs and
+    // an empty result genuinely means "none present."
+    printf("[pack] align-only: packed *_exps tensors (if any are present in "
+           "this file) are realigned in place below along with everything "
+           "else -- no separate identification step is needed for this "
+           "mode.\n");
+  } else if (packed_tensors_found == 0) {
     printf("[pack] No packed expert tensors found in this file -- nothing to "
            "unpack here "
            "(a dense-only or metadata-only shard is completely normal). Every "

@@ -56,13 +56,90 @@ enum class GGUFType : uint32_t {
   IQ3_S = 21,
   IQ2_S = 22,
   IQ4_XS = 23,
-  IQ1_M = 24,
-  BF16 = 25,
-  // 26,27,28 = removed Q4_0_4_4 / Q4_0_4_8 / Q4_1_4_4 (ND-packed, not in the
-  // wild for our targets)
-  TQ1_0 = 29,
-  TQ2_0 = 30,
-  IQ2_M = 31, // FIX: was incorrectly 16 here. 16 is IQ2_XXS; real IQ2_M is 31.
+  // I32 (raw 32-bit integer tensor, ggml's real numbering -- confirmed
+  // against build-metal/_deps/ggml-src/include/ggml.h): NOT a weight quant
+  // format, never dequantized through dequant_row/ggml_dequant_row -- added
+  // specifically for DeepSeek-V4's ffn_gate_tid2eid.weight (hash-routed MoE
+  // layers' per-token-id -> expert-id lookup table), which is raw int32
+  // index data, read directly as int32_t* rather than dequantized like
+  // every other tensor type in this enum. calculate_size() below has a
+  // matching case; row_bytes()/dequant_row() deliberately do NOT, since
+  // this tensor is never routed through the generic dense-matmul dequant
+  // path.
+  I32 = 26,
+  // I64 (raw 64-bit integer tensor, ggml numbering, confirmed against
+  // build-metal/_deps/ggml-src/include/ggml.h: GGML_TYPE_I64=27) -- added
+  // as a defensive gap-fill while investigating a real run where EVERY
+  // ffn_gate_tid2eid lookup failed its bounds check (see that lookup's own
+  // comment in execution_layer.cpp): if the on-disk tid2eid tensor ever
+  // turns out to be I64 rather than I32 (a real, ggml-legal encoding for
+  // an integer index tensor), calculate_size() would previously fall
+  // through to the `return numel;` 1-byte/element fallback -- an 8x
+  // undersized read that truncates the tensor and leaves its tail as
+  // uninitialized posix_memalign() heap garbage, which would reinterpret
+  // as exactly the kind of uniformly-out-of-range int32 noise that
+  // symptom showed. Not confirmed as the actual root cause (that requires
+  // the type-check log added at the tid2eid call site, real hardware
+  // only) -- added regardless since it is a genuine, previously-missing
+  // gap independent of whether it's THIS bug's cause.
+  I64 = 27,
+  // FIX (found investigating a real DeepSeek-V4-Flash run's dequant
+  // failures): every value from here on was off by 5 against the ACTUAL
+  // ggml_type enum currently linked into this project (confirmed directly
+  // against build-metal/_deps/ggml-src/include/ggml.h, not assumed) --
+  // upstream ggml inserted I8/I16/I32/I64/F64 (integer/double tensor
+  // types, never used as weight quant formats in this codebase -- I32 is
+  // the one exception, see below) between IQ4_XS and IQ1_M at some point
+  // after this enum was originally written, silently shifting IQ1_M
+  // 24->29, BF16 25->30, TQ1_0 29->34, TQ2_0 30->35. The old values meant
+  // a real file's BF16 tensor (raw type tag 30) matched NEITHER this
+  // enum's old BF16(25) NOR anything else meaningful -- it fell through
+  // to whatever the old numbering called type 30 (TQ2_0), silently
+  // dequantizing real BF16 bytes as if they were TQ2_0-quantized blocks.
+  // Renumbered to match the real, current values exactly; holes left
+  // where upstream ggml itself has holes (removed ND-packed/4-wide repack
+  // variants) so a FUTURE upstream insertion is easier to diff against
+  // ggml.h directly instead of silently drifting again.
+  IQ1_M = 29,
+  BF16 = 30,
+  // 31,32,33 = removed Q4_0_4_4 / Q4_0_4_8 / Q4_0_8_8 (ND-packed repack
+  // variants, GGUF support removed upstream)
+  TQ1_0 = 34,
+  TQ2_0 = 35,
+  // 36,37,38 = removed IQ4_NL_4_4 / IQ4_NL_4_8 / IQ4_NL_8_8 (ditto)
+  MXFP4 = 39, // MXFP4 (1 block) -- DeepSeek-V4-Flash UD-IQ2_M uses this;
+              // ggml_dequant_row (ggml_dequant.cpp) previously had no case
+              // for it at all ("[GGML-DEQUANT] Unsupported ggml type 39"
+              // on a real run) since it postdates when that switch was
+              // written, independent of the renumbering above.
+  NVFP4 = 40, // NVFP4 (4 blocks, E4M3 scale) -- not observed yet, added
+              // alongside MXFP4 since both are new in the same ggml
+              // version and the dequant function already exists.
+  // IQ2_M: confirmed (against BOTH the linked ggml AND a full check of
+  // /Users/rayxu/github/llama.cpp's own source, not just this project's
+  // vendored copy) that this is NOT a real per-tensor GGML_TYPE_* value
+  // anywhere -- "IQ2_M" is a FILE-LEVEL label (llama.h's
+  // LLAMA_FTYPE_MOSTLY_IQ2_M = 29, a `llama_ftype`, describing the
+  // overall quant RECIPE a tool like Unsloth used) that llama.cpp's own
+  // quantizer (llama-quant.cpp:837, `case LLAMA_FTYPE_MOSTLY_IQ2_M:
+  // return GGML_TYPE_IQ2_S;`) resolves to GGML_TYPE_IQ2_S (already
+  // supported here, case 22) for the predominant per-TENSOR type, mixed
+  // with ordinary K-quants/other IQ types for the rest -- never one
+  // monolithic "IQ2_M" wire format applied tensor-by-tensor. This
+  // project's OWN kquant_dequant.hpp already documented this independently
+  // (gpu_unsupported_reason's IQ2_M case: "no ggml CPU dequant export
+  // exists either... unsupported on BOTH paths") -- GGUFType::IQ2_M exists
+  // purely as a DIAGNOSTIC label (name string, bits-per-weight display,
+  // that reason string) for a tensor that happens to carry this raw type
+  // tag; it is never actually dequantized through any real code path
+  // either way. Restored (removing it broke the build -- 5 real call
+  // sites in kquant_dequant.hpp/graph_initializer.cpp reference it) at
+  // slot 31, one of the genuinely-retired ggml holes (Q4_0_4_4, GGUF
+  // support removed upstream) -- safe precisely because no real modern
+  // file can ever legitimately carry raw type tag 31 for anything, so
+  // this can never collide with an actual type this enum is also trying
+  // to represent.
+  IQ2_M = 31,
 };
 
 struct GGUFTensor {
@@ -72,6 +149,28 @@ struct GGUFTensor {
   uint64_t offset;
   uint64_t size_bytes;
   int shard_idx = 0; // which shard this tensor lives in (for split GGUF)
+};
+
+// How the per-layer attention cache is shaped/allocated, and which MoE
+// gating activation a family uses by default. Defined HERE (rather than in
+// models/family_ops.hpp, where the rest of the per-family dispatch table
+// lives) specifically to avoid a circular include: ArchitectureConfig below
+// needs these as native field types, but family_ops.hpp -> model_family.hpp
+// -> gguf_loader.hpp is already the dependency direction, so gguf_loader.hpp
+// cannot include family_ops.hpp back. family_ops.hpp reuses these same two
+// enums via its own (pre-existing) transitive include of this header.
+enum class CacheShape {
+  DenseKV,     // Kc/Vc: per-layer [max_t, n_head_kv*head_dim] (Hunyuan/Llama)
+  MLAAbsorbed, // Lc/Rc: per-layer [max_t, kv_lora] + [max_t, qk_rope]
+               // (GLM-5.2/DeepSeek-V3, absorbed WUK/WUV)
+  MLARawSWA,   // KVc: per-layer [sliding_window, n_embd_head] ring buffer,
+               // no absorption matrices (DeepSeek-V4).
+};
+
+enum class GatingFunc {
+  Softmax,
+  Sigmoid,
+  SqrtSoftplus, // sqrt(softplus(x)) -- DeepSeek-V4
 };
 
 struct ArchitectureConfig {
@@ -90,7 +189,13 @@ struct ArchitectureConfig {
   // Dense Q/K/V attention (Hunyuan / Llama / GLM-4); unused for MLA arches.
   int n_head_kv = 0;   // GQA kv-head count (defaults to n_heads)
   int head_dim = 0;    // per-head dim (= attention.key_length)
-  bool is_mla = false; // MLA (absorbed) vs dense Q/K/V attention
+  // Set once in graph_initializer.cpp from engine.family_ops.cache_shape,
+  // right after family_ops itself is resolved -- replaces the old bare
+  // `bool is_mla`. graph_initializer.cpp's cache-allocation code and
+  // dense_preload_manifest builder switch on this; layers_forward_gguf
+  // (execution_layer.cpp) no longer checks attention shape directly at all
+  // (it calls through engine.family_ops.attention_fn instead).
+  CacheShape cache_shape = CacheShape::DenseKV;
   float eps = 1e-5f;
 
   // Dense (non-MoE) FFN intermediate width — used for leading dense layers
@@ -103,7 +208,12 @@ struct ArchitectureConfig {
   int n_expert_shared = 0;           // 0 = no shared expert
   float expert_weights_scale = 0.0f; // 0 = no scale applied
   bool expert_weights_norm = true;   // normalize top-k weights to sum to 1
-  bool use_sigmoid_gate = false;     // sigmoid vs softmax router activation
+  // Router activation. Defaults to engine.family_ops.default_gating,
+  // overridden by the GGUF file's own expert_gating_func key when it sets
+  // one -- same precedence the old use_sigmoid_gate fallback already had.
+  // Replaces that bare bool now that a third value (SqrtSoftplus,
+  // DeepSeek-V4) exists.
+  GatingFunc gating_func = GatingFunc::Softmax;
   // HunyuanMoE (original, pre-Hy-V3) ropes Q/K before applying QK-norm;
   // every other supported arch (Hy-V3, GLM-5.2) norms first, then ropes.
   bool rope_before_norm = false;
@@ -116,6 +226,22 @@ struct ArchitectureConfig {
   float rope_attn_factor = 1.0f;
   float rope_yarn_log_mul = 0.0f;
   int rope_n_ctx_orig = 0;
+
+  // ---- DeepSeek-V4 (Hyper-Connections, grouped output projection,
+  // attention sinks, SWA). Phase 1 (correctness within each layer's local
+  // sliding window) only -- see models/family_ops.cpp's DeepSeek_V4 table
+  // entry and CLAUDE.md's DeepSeek-V4 plan writeup. Every field here
+  // defaults to "feature inactive" so populating them is a strict no-op for
+  // every other family.
+  int hc_mult = 1;              // hyper_connection.count; 1 = inactive
+  int hc_sinkhorn_iters = 0;    // hyper_connection.sinkhorn_iterations
+  float hc_eps = 1e-6f;         // hyper_connection.epsilon
+  int o_group_count = 0;        // attention.output_group_count; 0 = plain wo
+  int o_lora_rank = 0;          // attention.output_lora_rank
+  int hash_layer_count = 0;     // hash_layer_count; 0 = no hash-routed layers
+  int sliding_window = 0;       // attention.sliding_window; 0 = SWA inactive
+  std::vector<float> swiglu_clamp_exp;   // per-layer, size n_layers when set
+  std::vector<float> swiglu_clamp_shexp; // per-layer, size n_layers when set
 };
 
 class GGUFFile {
@@ -146,6 +272,14 @@ public:
   std::unordered_map<std::string, int64_t> kv_int;
   std::unordered_map<std::string, float> kv_float;
   std::unordered_map<std::string, std::string> kv_string;
+  // GGUF array-typed KV (type 9) with a numeric element sub-type -- e.g.
+  // DeepSeek-V4's per-layer swiglu_clamp_exp/shexp. Added alongside the
+  // scalar maps above rather than replacing read_kv_value's prior "skip
+  // arrays, too complex to store generically" behavior for non-numeric
+  // sub-types (string/nested-array elements), which no known hparam in this
+  // codebase needs -- see read_kv_array's own comment.
+  std::unordered_map<std::string, std::vector<int64_t>> kv_arr_int;
+  std::unordered_map<std::string, std::vector<float>> kv_arr_float;
 
   int fd_for_tensor(const GGUFTensor &t) const {
     if (t.shard_idx < (int)shard_fds.size())
@@ -384,6 +518,60 @@ public:
     return fallback;
   }
 
+  // Array-typed counterparts of get_config_int/float above, same arch-
+  // prefix-then-fixed-list-then-bare-suffix search order, reading from
+  // kv_arr_int/kv_arr_float (read_kv_array's storage) instead of the scalar
+  // maps. Added for DeepSeek-V4's per-layer swiglu_clamp_exp/shexp; generic
+  // enough for any future per-layer array hparam, not DeepSeek-V4-specific
+  // plumbing. Returns an empty vector (not `fallback` -- there's no single
+  // sensible scalar fallback for a missing array) when the key isn't found
+  // under any prefix; callers should treat empty as "feature inactive."
+  std::vector<int64_t> get_config_int_array(const std::string &suffix) const {
+    std::string arch_prefix;
+    auto arch_it = kv_string.find("general.architecture");
+    if (arch_it != kv_string.end())
+      arch_prefix = arch_it->second + ".";
+
+    std::vector<std::string> prefixes;
+    if (!arch_prefix.empty())
+      prefixes.push_back(arch_prefix);
+    for (const auto &p :
+         {"qwen35moe.", "qwen3moe.", "qwen2moe.", "qwen.", "glm-dsa.", "glm.",
+          "glm4.", "llama.", "deepseek2.", ""})
+      prefixes.push_back(p);
+
+    for (const auto &prefix : prefixes) {
+      std::string key = prefix + suffix;
+      auto it = kv_arr_int.find(key);
+      if (it != kv_arr_int.end())
+        return it->second;
+    }
+    return {};
+  }
+
+  std::vector<float> get_config_float_array(const std::string &suffix) const {
+    std::string arch_prefix;
+    auto arch_it = kv_string.find("general.architecture");
+    if (arch_it != kv_string.end())
+      arch_prefix = arch_it->second + ".";
+
+    std::vector<std::string> prefixes;
+    if (!arch_prefix.empty())
+      prefixes.push_back(arch_prefix);
+    for (const auto &p :
+         {"qwen35moe.", "qwen3moe.", "qwen2moe.", "qwen.", "glm-dsa.", "glm.",
+          "glm4.", "llama.", "deepseek2.", ""})
+      prefixes.push_back(p);
+
+    for (const auto &prefix : prefixes) {
+      std::string key = prefix + suffix;
+      auto it = kv_arr_float.find(key);
+      if (it != kv_arr_float.end())
+        return it->second;
+    }
+    return {};
+  }
+
   bool load_header(const std::string &path) {
     std::vector<std::string> gguf_files;
 
@@ -613,9 +801,7 @@ private:
       f.read(reinterpret_cast<char *>(&sub_type), 4);
       uint64_t arr_len;
       f.read(reinterpret_cast<char *>(&arr_len), 8);
-      // Arrays: skip elements (too complex to store generically)
-      for (uint64_t j = 0; j < arr_len; ++j)
-        skip_kv_value(f, sub_type);
+      read_kv_array(f, key, sub_type, arr_len);
       break;
     }
     case 10: {
@@ -637,6 +823,94 @@ private:
       break;
     }
     default:
+      break;
+    }
+  }
+
+  // GGUF array-typed KV (case 9 above). sub_type uses the SAME numbering as
+  // read_kv_value's own `type` param (0=UINT8 .. 12=FLOAT64). Only numeric
+  // sub-types are stored -- into kv_arr_int (every integer/bool width,
+  // sign-extended/widened to int64_t) or kv_arr_float (float32 and float64,
+  // narrowed to float) -- mirroring how the scalar kv_uint/kv_int/kv_float
+  // maps already collapse multiple GGUF widths into one C++ type. A
+  // string-element or nested-array-element sub_type is skipped element-by-
+  // element via the existing skip_kv_value, exactly matching this function's
+  // prior "skip entirely" behavior for arrays -- no known hparam in this
+  // codebase needs a string or nested array, so there's nothing to widen the
+  // storage for yet; get_config_int_array/get_config_float_array (below)
+  // are the read side of the two cases this DOES store.
+  void read_kv_array(std::ifstream &f, const std::string &key,
+                     uint32_t sub_type, uint64_t arr_len) {
+    switch (sub_type) {
+    case 0: case 1: case 7: { // uint8 / int8 / bool
+      std::vector<int64_t> v;
+      v.reserve(arr_len);
+      for (uint64_t j = 0; j < arr_len; ++j) {
+        uint8_t x;
+        f.read(reinterpret_cast<char *>(&x), 1);
+        v.push_back((int64_t)x);
+      }
+      kv_arr_int[key] = std::move(v);
+      break;
+    }
+    case 2: case 3: { // uint16 / int16
+      std::vector<int64_t> v;
+      v.reserve(arr_len);
+      for (uint64_t j = 0; j < arr_len; ++j) {
+        int16_t x;
+        f.read(reinterpret_cast<char *>(&x), 2);
+        v.push_back((int64_t)x);
+      }
+      kv_arr_int[key] = std::move(v);
+      break;
+    }
+    case 4: case 5: { // uint32 / int32
+      std::vector<int64_t> v;
+      v.reserve(arr_len);
+      for (uint64_t j = 0; j < arr_len; ++j) {
+        int32_t x;
+        f.read(reinterpret_cast<char *>(&x), 4);
+        v.push_back((int64_t)x);
+      }
+      kv_arr_int[key] = std::move(v);
+      break;
+    }
+    case 6: { // float32
+      std::vector<float> v;
+      v.reserve(arr_len);
+      for (uint64_t j = 0; j < arr_len; ++j) {
+        float x;
+        f.read(reinterpret_cast<char *>(&x), 4);
+        v.push_back(x);
+      }
+      kv_arr_float[key] = std::move(v);
+      break;
+    }
+    case 10: case 11: { // uint64 / int64
+      std::vector<int64_t> v;
+      v.reserve(arr_len);
+      for (uint64_t j = 0; j < arr_len; ++j) {
+        int64_t x;
+        f.read(reinterpret_cast<char *>(&x), 8);
+        v.push_back(x);
+      }
+      kv_arr_int[key] = std::move(v);
+      break;
+    }
+    case 12: { // float64
+      std::vector<float> v;
+      v.reserve(arr_len);
+      for (uint64_t j = 0; j < arr_len; ++j) {
+        double x;
+        f.read(reinterpret_cast<char *>(&x), 8);
+        v.push_back((float)x);
+      }
+      kv_arr_float[key] = std::move(v);
+      break;
+    }
+    default: // string (8) or nested array (9) elements -- not stored today
+      for (uint64_t j = 0; j < arr_len; ++j)
+        skip_kv_value(f, sub_type);
       break;
     }
   }
@@ -722,16 +996,40 @@ private:
       return (numel / 256) * 82; // IQ2_S
     if (t == 23)
       return (numel / 256) * 136; // IQ4_XS
-    if (t == 24)
-      return (numel / 256) * 56; // IQ1_M
-    if (t == 25)
-      return numel * 2; // BF16
+    if (t == 26)
+      return numel * 4; // I32 -- raw 32-bit ints, 4 bytes/element, no block
+                        // packing. Needed for DeepSeek-V4's
+                        // ffn_gate_tid2eid.weight (hash-routed MoE
+                        // token-id->expert-id lookup table) -- without this
+                        // case it fell through to the `return numel;`
+                        // fallback below (1 byte/element, 4x too small),
+                        // which would have both truncated this tensor's own
+                        // read AND corrupted every subsequent tensor's
+                        // sequential offset in the same shard.
+    if (t == 27)
+      return numel * 8; // I64 -- see the enum's own comment for why this
+                        // case exists defensively alongside I32.
+    // FIX: these 4 cases used the SAME stale numbering the GGUFType enum
+    // itself just got corrected for (see that enum's own comment) -- t==24/
+    // 25/29/30 matched real ggml's I8/I16/IQ1_M/BF16, not IQ1_M/BF16/
+    // TQ1_0/TQ2_0. Real values now (confirmed against build-metal/_deps/
+    // ggml-src/include/ggml.h directly): IQ1_M=29, BF16=30, TQ1_0=34,
+    // TQ2_0=35. The per-element byte formulas themselves are unchanged --
+    // only which raw type id triggers each one.
     if (t == 29)
-      return (numel / 256) * 54; // TQ1_0
+      return (numel / 256) * 56; // IQ1_M
     if (t == 30)
+      return numel * 2; // BF16
+    if (t == 34)
+      return (numel / 256) * 54; // TQ1_0
+    if (t == 35)
       return (numel / 256) * 66; // TQ2_0
-    if (t == 31)
-      return (numel / 256) * 84; // IQ2_M
+    if (t == 39)
+      return (numel / 32) * 17; // MXFP4: block=32 elements, 1(e)+16(qs) bytes
+    if (t == 40)
+      return (numel / 64) * 36; // NVFP4: block=64 elements, 4(d)+32(qs) bytes
+    // IQ2_M: no real GGML_TYPE_* slot in the currently-linked ggml at all
+    // (see the enum's own comment) -- no formula to assign a number to.
     return numel;                // fallback: 1 byte per element
   }
 };

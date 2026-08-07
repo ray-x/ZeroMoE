@@ -35,8 +35,23 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
                   label, nan_count, n, inf_count, n);
     }
 }
+// token_ids: the S current input token ids that produced hidden_states'
+// S rows (one per row, same order) -- needed by DeepSeek-V4 hash-routed MoE
+// layers (moe_forward_gguf's ffn_gate_tid2eid lookup, per-token, per-layer
+// direct token-id->expert-id table). nullptr/ignored for every other
+// family and for non-hash-routed layers within a DeepSeek-V4 file.
 extern void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
-                                LockFreePrefetcher& async_io_queue, float* hidden_states, int S, int pos_base);
+                                LockFreePrefetcher& async_io_queue, float* hidden_states, int S, int pos_base,
+                                const int* token_ids);
+// Hyper-Connections (DeepSeek-V4, hyper_connections.cpp) model-level hooks --
+// bracket EVERY layers_forward_gguf call, converting the caller's plain
+// single-stream hidden_states into engine.hc_stream_buf's multi-stream form
+// before the call and back after, so the multi-stream shape never leaks
+// past this pair of call sites (see hyper_connections.cpp's own header
+// comment). Gated on architecture_config.hc_mult > 1 at each call site --
+// a strict no-op (not even called) for every other family.
+extern void hc_expand_embedding(StreamingEngine& engine, const float* hidden_states, int S, int D);
+extern void hc_collapse_output(StreamingEngine& engine, float* hidden_states, int S, int D);
 // Frees the expert-FFN GPU scratch pool's device buffers back to empty --
 // see execution_layer.cpp's definition for why this reclaims little in
 // practice (expert dispatch is always S=1) but is kept for consistency
@@ -251,7 +266,15 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
     std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
     PERF_START(prefill);
-    layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), prompt_ids.size(), 0);
+    // Hyper-Connections (DeepSeek-V4): expand into engine.hc_stream_buf
+    // before, collapse back into hidden_states after -- see
+    // hc_expand_embedding/hc_collapse_output's own declarations above.
+    bool hc_active = engine.model_file.architecture_config.hc_mult > 1;
+    if (hc_active)
+        hc_expand_embedding(engine, hidden_states.data(), (int)prompt_ids.size(), D);
+    layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), prompt_ids.size(), 0, prompt_ids.data());
+    if (hc_active)
+        hc_collapse_output(engine, hidden_states.data(), (int)prompt_ids.size(), D);
     // Was `PERF_END(prefill, t_attn)` -- dumped this WHOLE prefill pass's
     // wall-clock (attention + MoE routing + MoE expert FFN + cold-cache
     // disk I/O across all 78 layers) into the attention-only t_attn
@@ -435,7 +458,14 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // the cumulative run total.
         auto token_snap_before = perf().snapshot();
         auto token_wall_start = std::chrono::high_resolution_clock::now();
-        layers_forward_gguf(engine, ram_mgr, prefetcher, decode_hidden.data(), 1, pos);
+        // Hyper-Connections (DeepSeek-V4): same expand/collapse bracket as
+        // the prefill call site above -- hc_active computed once outside
+        // this loop.
+        if (hc_active)
+            hc_expand_embedding(engine, decode_hidden.data(), 1, D);
+        layers_forward_gguf(engine, ram_mgr, prefetcher, decode_hidden.data(), 1, pos, &next_token);
+        if (hc_active)
+            hc_collapse_output(engine, decode_hidden.data(), 1, D);
         double token_wall_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - token_wall_start).count();
         auto token_snap_after = perf().snapshot();

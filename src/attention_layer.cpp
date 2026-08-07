@@ -337,6 +337,244 @@ void mla_attention_absorbed_gguf(
 }
 
 // ============================================================
+// DeepSeek-V4 raw/SWA MLA attention (Phase 1: correctness within each
+// layer's local sliding window; CSA/HCA compressed-attention tiers are
+// Project C, not implemented here -- every layer is treated as if its
+// compress_ratio were 0, i.e. plain SWA). Structured like
+// mla_attention_absorbed_gguf above (same attn_norm -> q_a/q_a_norm/q_b ->
+// RoPE-on-rope-half Q projection, reused verbatim), but the KV side has NO
+// absorption: attn_kv.weight produces one per-head-sized latent directly
+// (no wk_b/wv_b, no separate kv_lora_rank), used as BOTH K and V (MQA-
+// style attention over the raw cached latent, not a compress/decompress
+// round trip). New pieces V3 doesn't have: attention sinks, a de-rope step
+// on the attention output, and a grouped low-rank output projection
+// (attn_output_a/attn_output_b) replacing the single attn_output matmul.
+//
+// UNVERIFIED ON REAL HARDWARE, and several specific choices below are
+// best-effort interpretations of DeepSeek-V4's architecture (reconstructed
+// from reading llama.cpp's deepseek4.cpp, not a byte-exact transcription
+// held side-by-side during implementation) rather than confirmed facts --
+// each flagged inline where the uncertainty is real: (a) whether
+// attn_kv_norm applies to the WHOLE qh-wide latent before splitting into
+// nope/rope, or only the nope portion (V3 precedent argues for nope-only;
+// implemented here as whole-latent, matching the literal "wkv -> kv_norm ->
+// split -> rope" ordering in the research this was built from); (b) the
+// exact on-disk byte layout of the grouped attn_output_a tensor's
+// {H*qh/o_groups, o_lora_rank, o_groups} shape, needed to slice it
+// correctly per group.
+// ============================================================
+void dsv4_attention_gguf(
+    StreamingEngine& engine,
+    int layer_idx,
+    const float* hidden_states,
+    int S,
+    int pos_base,
+    float* out_context
+) {
+    PERF_SCOPE(t_attn);
+    const auto& c = engine.model_file.architecture_config;
+    int H = c.n_heads;
+    int D = c.hidden;
+    int nope = c.qk_nope;
+    int rope = c.qk_rope;
+    int qh = nope + rope; // per-head latent width, K==V, no separate v_head
+    std::string p = "blk." + std::to_string(layer_idx) + ".";
+    float rope_theta = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
+    int window = engine.sliding_window > 0 ? engine.sliding_window : engine.max_t;
+
+    // ---- 1. attention input norm (same as V3) ----
+    std::vector<float> normed((size_t)S * D);
+    rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(), S, D, c.eps);
+    check_finite_attn("normed (post attn_norm rmsnorm)", layer_idx, normed.data(), (size_t)S * D);
+
+    // ---- 2. project Q: q_a -> q_a_norm -> q_b => Q[S, H*qh], RoPE on the
+    // rope-half only. Identical code shape to mla_attention_absorbed_gguf's
+    // own step 2/2b -- V4 keeps the same low-rank Q decompose pattern. ----
+    int q_lora = engine.model_file.get_config_int("attention.q_lora_rank", 2048);
+    std::vector<float> Q((size_t)S * H * qh, 0.0f);
+    {
+        std::vector<float> ql_buf((size_t)S * q_lora);
+        dense_proj(engine, p + "attn_q_a.weight", normed.data(), ql_buf.data(), S, D, q_lora);
+        rmsnorm_proj(engine, p + "attn_q_a_norm.weight", ql_buf.data(), ql_buf.data(), S, q_lora, c.eps);
+        dense_proj(engine, p + "attn_q_b.weight", ql_buf.data(), Q.data(), S, q_lora, H * qh);
+    }
+    // FIX: this was the one stage in this function without a check (every
+    // other stage already has one -- confirmed via a real audit) -- the
+    // matching V3 path (mla_attention_absorbed_gguf, this file, line 146)
+    // already checks its equivalent Q projection output pre-RoPE; this one
+    // didn't, so a NaN introduced by attn_q_a/attn_q_a_norm/attn_q_b here
+    // would only surface (if at all) at the post-RoPE check below, one
+    // stage later than necessary.
+    check_finite_attn("Q (post attn_q_a/q_a_norm/q_b projection, pre-RoPE)", layer_idx, Q.data(), Q.size());
+    for (int s = 0; s < S; ++s) {
+        int pos = pos_base + s;
+        for (int h = 0; h < H; ++h) {
+            float* q_rope = Q.data() + ((size_t)s * H + h) * qh + nope;
+            rope_yarn_inplace(q_rope, rope, pos, rope_theta, c.rope_ext_factor,
+                              c.rope_freq_scale, c.rope_attn_factor, c.rope_yarn_log_mul,
+                              c.rope_n_ctx_orig, /*dsv4_mscale=*/true);
+        }
+    }
+    check_finite_attn("Q (post RoPE)", layer_idx, Q.data(), Q.size());
+
+    // ---- 3. project KV (single wkv, no absorption) and write the SWA ring
+    // cache at pos % window. ----
+    {
+        std::vector<float> kv((size_t)S * qh);
+        dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D, qh);
+        check_finite_attn("kv (post attn_kv projection, pre-norm/RoPE)", layer_idx, kv.data(), kv.size());
+        // (a) whole-latent norm -- see this function's own header comment.
+        // Real tensor name is attn_kv_a_norm (reused from V3's kv_a_norm
+        // naming convention, confirmed against llama-arch.cpp's
+        // LLM_TENSOR_ATTN_KV_NORM pattern) -- NOT attn_kv_norm. Found via a
+        // real "missing weight blk.N.attn_kv_norm.weight -- passing input
+        // through" warning spam on every layer of a real DeepSeek-V4-Flash
+        // run; confirmed against this file's own earlier research notes,
+        // which had the name right all along -- this was a transcription
+        // slip introducing the bug during implementation, not a genuine
+        // naming ambiguity.
+        rmsnorm_proj(engine, p + "attn_kv_a_norm.weight", kv.data(), kv.data(), S, qh, c.eps);
+        for (int s = 0; s < S; ++s) {
+            int pos = pos_base + s;
+            int slot = pos % window;
+            float* kv_row = kv.data() + (size_t)s * qh;
+            float* k_rope = kv_row + nope;
+            rope_yarn_inplace(k_rope, rope, pos, rope_theta, c.rope_ext_factor,
+                              c.rope_freq_scale, c.rope_attn_factor, c.rope_yarn_log_mul,
+                              c.rope_n_ctx_orig, /*dsv4_mscale=*/true);
+            std::memcpy(engine.KVc[layer_idx] + (int64_t)slot * qh, kv_row,
+                        (size_t)qh * sizeof(float));
+        }
+    }
+    check_finite_attn("KVc (post write)", layer_idx, engine.KVc[layer_idx], (size_t)window * qh);
+
+    // ---- 4. MQA attention over the raw cached latent (K==V, no
+    // absorption), windowed to the last `window` positions, plus a
+    // per-head attention-sink logit. ----
+    auto sinks_it = engine.resident_layers.find(p + "attn_sinks.weight");
+    const float* sinks = (sinks_it != engine.resident_layers.end() && sinks_it->second.host_ptr)
+                         ? reinterpret_cast<float*>(sinks_it->second.host_ptr) : nullptr;
+
+    std::vector<float> head_contexts((size_t)S * H * qh, 0.0f);
+    // (c) FURTHER UNVERIFIED: reuses V3's kq_scale formula as-is (reduces
+    // to plain 1/sqrt(qh) when ext_factor==0, the common non-YaRN case) --
+    // no separate research confirmed whether V4's attention-score
+    // temperature scale is genuinely identical to V3's here, or whether it
+    // should use its own dsv4-specific derivation the way the RoPE mscale
+    // above does (rope_yarn_inplace's dsv4_mscale branch). Distinct open
+    // item from the RoPE mscale fix earlier in this file -- flag
+    // separately if a real DeepSeek-V4 run shows YaRN-active long-context
+    // attention scores looking wrong while short-context (ext_factor==0,
+    // where this reduces to the uncontroversial 1/sqrt(qh)) looks fine.
+    float attn_scale = compute_yarn_kq_scale(c, qh);
+
+    #pragma omp parallel for collapse(2) schedule(dynamic, 1)
+    for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < H; ++h) {
+            int current_pos = pos_base + s;
+            // SWA window: the last `window` positions ending at current_pos
+            // (inclusive), never reaching further back than position 0.
+            int past_context_len = std::min(current_pos + 1, window);
+
+            const float* head_q = Q.data() + ((size_t)s * H + h) * qh;
+
+            std::vector<float> attn_scores(past_context_len + (sinks ? 1 : 0));
+            const float* layer_kv_cache = engine.KVc[layer_idx];
+
+            for (int t = 0; t < past_context_len; ++t) {
+                // t=0 is the OLDEST position still in-window
+                // (current_pos - past_context_len + 1); ring slot for the
+                // absolute position current_pos-past_context_len+1+t.
+                int abs_pos = current_pos - past_context_len + 1 + t;
+                int slot = abs_pos % window;
+                const float* cached = layer_kv_cache + (int64_t)slot * qh;
+
+                float score = 0.0f;
+                __m512 v_score = _mm512_setzero_ps();
+                for (int i = 0; i + 16 <= qh; i += 16)
+                    v_score = _mm512_fmadd_ps(_mm512_loadu_ps(head_q + i), _mm512_loadu_ps(cached + i), v_score);
+                score = _mm512_reduce_add_ps(v_score);
+                for (int i = (qh / 16) * 16; i < qh; ++i) score += head_q[i] * cached[i];
+
+                attn_scores[t] = score * attn_scale;
+            }
+            // Attention sink: an extra always-present logit, no
+            // corresponding value contribution -- contributes to the
+            // softmax denominator only, damping every real weight.
+            if (sinks) attn_scores[past_context_len] = sinks[h];
+
+            softmax_row(attn_scores.data(), (int)attn_scores.size());
+
+            float* head_out_dest = head_contexts.data() + ((size_t)s * H + h) * qh;
+            for (int t = 0; t < past_context_len; ++t) {
+                int abs_pos = current_pos - past_context_len + 1 + t;
+                int slot = abs_pos % window;
+                const float* cached = layer_kv_cache + (int64_t)slot * qh;
+                float w = attn_scores[t];
+                for (int i = 0; i < qh; ++i) head_out_dest[i] += w * cached[i];
+            }
+            // sink's own softmax mass has no value vector to blend in --
+            // it just shrinks the real weights above, already applied.
+
+            // De-rope: undo the rope-half's positional rotation on the
+            // AGGREGATED (multi-position-blended) output -- see this
+            // function's own header comment on why this is needed here but
+            // not in V3 (no absorption to keep rope-space and output-space
+            // separate). Same theta/position/mscale as the forward
+            // rotation applied to K above, transpose semantics (rope.hpp's
+            // own comment): mscale is NOT inverted, matching
+            // ggml_rope_ext_back.
+            rope_yarn_inplace_inverse(head_out_dest + nope, rope, current_pos, rope_theta,
+                                      c.rope_ext_factor, c.rope_freq_scale, c.rope_attn_factor,
+                                      c.rope_yarn_log_mul, c.rope_n_ctx_orig, /*dsv4_mscale=*/true);
+        }
+    }
+    check_finite_attn("head_contexts (post MQA + de-rope)", layer_idx,
+                       head_contexts.data(), head_contexts.size());
+
+    // ---- 5. grouped low-rank output projection: attn_output_a (per
+    // group) -> concat -> attn_output_b (single dense matmul). ----
+    int o_groups = std::max(1, c.o_group_count);
+    int o_rank = c.o_lora_rank;
+    int group_in = (H * qh) / o_groups;
+
+    auto woa_it = engine.resident_layers.find(p + "attn_output_a.weight");
+    if (woa_it == engine.resident_layers.end() || !woa_it->second.host_ptr) {
+        LOG_ERROR("[DSV4] layer %d missing attn_output_a -- zeroing attention\n", layer_idx);
+        std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+        return;
+    }
+    // Dequantize once per layer, cached -- same pattern as V3's WUK/WUV
+    // (attn_output_a is a static model weight, identical on every call for
+    // this layer_idx). (b) layout interpretation -- see this function's
+    // own header comment: treated as o_groups contiguous blocks, each
+    // [o_rank, group_in] row-major (matmul()'s W[O,I] convention), block g
+    // starting at g*o_rank*group_in.
+    static std::vector<std::vector<float>> woa_cache;
+    if ((int)woa_cache.size() <= layer_idx) woa_cache.resize(c.n_layers);
+    std::vector<float>& WOA = woa_cache[layer_idx];
+    if (WOA.empty()) {
+        WOA.resize((size_t)o_groups * o_rank * group_in);
+        dequant_row(woa_it->second.meta.type, woa_it->second.host_ptr, WOA.data(), (int)WOA.size());
+        check_finite_attn("WOA (attn_output_a dequant)", layer_idx, WOA.data(), WOA.size());
+    }
+
+    std::vector<float> grouped_out((size_t)S * o_groups * o_rank);
+    for (int s = 0; s < S; ++s) {
+        const float* in_row = head_contexts.data() + (size_t)s * H * qh;
+        for (int g = 0; g < o_groups; ++g) {
+            const float* in_group = in_row + (size_t)g * group_in;
+            float* out_group = grouped_out.data() + ((size_t)s * o_groups + g) * o_rank;
+            matmul(out_group, in_group, WOA.data() + (size_t)g * o_rank * group_in, 1, group_in, o_rank);
+        }
+    }
+    check_finite_attn("grouped_out (post attn_output_a)", layer_idx, grouped_out.data(), grouped_out.size());
+
+    dense_proj(engine, p + "attn_output_b.weight", grouped_out.data(), out_context, S, o_groups * o_rank, D);
+    check_finite_attn("out_context (post attn_output_b projection)", layer_idx, out_context, (size_t)S * D);
+}
+
+// ============================================================
 // Standard GQA causal attention with a real dense KV cache (Kc/Vc), for
 // non-MLA architectures (Hunyuan/Hy-V3/Llama-style). Structured like
 // mla_attention_absorbed_gguf: norm -> QKV projection -> QK-norm -> RoPE ->

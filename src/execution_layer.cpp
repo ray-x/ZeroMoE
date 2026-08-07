@@ -34,6 +34,9 @@ extern "C" void launch_iq4_xs_matmul(float* y, const float* x, const void* weigh
 extern "C" void launch_tq1_matmul(float* y, const float* x, const void* weights, const void* scales, int S, int I, int O);
 extern "C" void launch_iq1s_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_iq1m_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+// MXFP4: dormant kernel, wired in but not yet dispatched to -- see
+// kquant_dequant.hpp's gpu_type_supported() comment.
+extern "C" void launch_mxfp4_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 
 // ============================================================
 // Scratch buffers: pre-allocated once, reused every layer to
@@ -190,6 +193,11 @@ static bool gpu_matmul_dispatch(GGUFType type, float* y, const float* x, const v
         case GGUFType::IQ2_S:   launch_iq2_s_matmul(y, x, w, S, I, O);   return true;
         case GGUFType::IQ3_XXS: launch_iq3_xxs_matmul(y, x, w, S, I, O); return true;
         case GGUFType::IQ4_XS:  launch_iq4_xs_matmul(y, x, w, S, I, O);  return true;
+        // MXFP4: dead code until kquant_dequant.hpp's gpu_type_supported()
+        // flips MXFP4 to true (post real-hardware Test 5 pass) -- wired
+        // here now so that flip is a genuine one-line change with nothing
+        // else left to plumb.
+        case GGUFType::MXFP4:   launch_mxfp4_matmul(y, x, w, S, I, O);   return true;
         default: return false;
     }
 }
@@ -314,7 +322,7 @@ struct LayerScratch {
     // BEFORE the already-resident skip filter so this measures pure
     // prediction accuracy -- completely independent of the downstream
     // serving pipeline (worker thread speed, staging pool size) that
-    // "Prefetch (PIPE) served %" conflates together. Consumed (and reset
+    // "Prefetch served %" conflates together. Consumed (and reset
     // to -1) the next time moe_forward_gguf runs for pilot_pred_layer, at
     // the same s==S-1 "last token" position the pilot itself predicted
     // from -- an apples-to-apples comparison for both decode (S=1, the
@@ -782,6 +790,19 @@ static bool expert_ffn_gpu_issue(
     return true;
 }
 
+// DeepSeek-V4 per-layer SwiGLU clamp (ArchitectureConfig::swiglu_clamp_exp/
+// shexp, gguf_loader.hpp): bounds the SwiGLU activation (post SiLU*up, pre
+// down-proj) to [-clamp, clamp]. clamp<=0 is "inactive" (empty vector at
+// this layer, or the file doesn't set one) -- a strict no-op, matching
+// every other DeepSeek-V4 field's "absent = feature off" default. Shared
+// by the routed-expert (GPU/CPU) and shared-expert SwiGLU sites below --
+// deliberately factored out once rather than copy-pasted at each of the 3
+// call sites.
+static inline void swiglu_clamp_inplace(float* x, int n, float clamp) {
+    if (clamp <= 0.0f) return;
+    for (int i = 0; i < n; ++i) x[i] = std::max(-clamp, std::min(clamp, x[i]));
+}
+
 // Phase B: sync the gate/up kernels issued earlier, download, SiLU+mul on
 // CPU, then upload/launch/sync/download the down projection. Called after
 // the caller has (ideally) already spent enough time on other work that the
@@ -793,7 +814,8 @@ static void expert_ffn_gpu_finish(
     const GGUFTensor& gate_meta, const GGUFTensor& down_meta,
     int layer_idx, int expert_id,
     int S, int D, int moe_inter,
-    GpuTopology* topo, bool needs_release, bool loc_from_active_layer
+    GpuTopology* topo, bool needs_release, bool loc_from_active_layer,
+    float swiglu_clamp
 ) {
     // Each in-flight expert's issue() may have run on a different vault GPU
     // (multi-GPU config) and left a different device "current" on this
@@ -815,6 +837,7 @@ static void expert_ffn_gpu_finish(
     check_finite("up_buf   (post gate+up matmul)", layer_idx, expert_id, up_buf,   (size_t)S * moe_inter);
     silu_inplace(gate_buf, S * moe_inter);
     elem_mul(gate_buf, gate_buf, up_buf, S * moe_inter);
+    swiglu_clamp_inplace(gate_buf, S * moe_inter, swiglu_clamp);
 
     PERF_START(gexp_up2);
     cudaMemcpy(gpu_scratch.d_prod, gate_buf, (size_t)S * moe_inter * sizeof(float), cudaMemcpyHostToDevice);
@@ -851,16 +874,61 @@ static void expert_ffn_cpu(
     const uint8_t* up_data, const GGUFTensor& up_meta,
     const uint8_t* down_data, const GGUFTensor& down_meta,
     float* gate_buf, float* up_buf,
-    int S, int D, int moe_inter
+    int S, int D, int moe_inter,
+    float swiglu_clamp
 ) {
     PERF_START(cexp);
     cpu_quant_matmul(gate_meta.type, gate_data, input, gate_buf, S, D, moe_inter);
     cpu_quant_matmul(up_meta.type,   up_data,   input, up_buf,   S, D, moe_inter);
     silu_inplace(gate_buf, S * moe_inter);
     elem_mul(gate_buf, gate_buf, up_buf, S * moe_inter);
+    swiglu_clamp_inplace(gate_buf, S * moe_inter, swiglu_clamp);
     cpu_quant_matmul(down_meta.type, down_data, gate_buf, output, S, moe_inter, D);
     PERF_END(cexp, t_cpu_expert);
     perf().n_expert_cpu_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Gating activation: turns one row of raw router logits into probs
+// in-place, per ArchitectureConfig::gating_func (GatingFunc, gguf_loader.
+// hpp). Shared by moe_forward_gguf's real router (below) AND the pilot
+// router's own prediction ranking (layers_forward_gguf's "second,
+// independent misprediction source" fix, this file) -- deliberately ONE
+// function, not two independently-maintained copies of this switch, since
+// the pilot's whole reason for existing is to rank experts the SAME way the
+// real router will; a gating formula that drifts out of sync between the
+// two sites silently degrades prefetch accuracy without ever crashing, the
+// exact bug class both sites' own inline comments already warn about.
+static void apply_gating_activation(GatingFunc func, float* row, int n) {
+    switch (func) {
+    case GatingFunc::Sigmoid:
+        for (int e = 0; e < n; ++e) row[e] = 1.0f / (1.0f + std::exp(-row[e]));
+        break;
+    case GatingFunc::SqrtSoftplus:
+        // sqrt(softplus(x)), softplus(x) = log(1+exp(x)) -- DeepSeek-V4's
+        // hard-required router activation (see llama.cpp's
+        // LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS). Naive log1p(exp(x))
+        // overflows exp() for large positive x; softplus(x) = x +
+        // log1p(exp(-x)) for x > 0 is the standard numerically-stable form
+        // (exp(-x) -> 0 as x grows, so this never overflows, and reduces to
+        // the direct log1p(exp(x)) for x <= 0 where THAT form is safe).
+        for (int e = 0; e < n; ++e) {
+            float x = row[e];
+            float softplus = (x > 0.0f) ? (x + std::log1p(std::exp(-x)))
+                                         : std::log1p(std::exp(x));
+            row[e] = std::sqrt(softplus);
+        }
+        break;
+    case GatingFunc::Softmax:
+    default: {
+        float max_l = row[0];
+        for (int e = 1; e < n; ++e) max_l = std::max(max_l, row[e]);
+        float sum = 0.0f;
+        for (int e = 0; e < n; ++e) { row[e] = std::exp(row[e] - max_l); sum += row[e]; }
+        float inv = 1.0f / sum;
+        for (int e = 0; e < n; ++e) row[e] *= inv;
+        break;
+    }
+    }
 }
 
 // ============================================================
@@ -875,7 +943,8 @@ void moe_forward_gguf(
     const float* hidden_states,
     int S,
     float* output,
-    LayerScratch& scratch
+    LayerScratch& scratch,
+    const int* token_ids
 ) {
     auto& c = engine.model_file.architecture_config;
     int D = c.hidden;
@@ -888,9 +957,97 @@ void moe_forward_gguf(
         return;
     }
 
+    // DeepSeek-V4 per-layer SwiGLU clamp (swiglu_clamp_inplace's own
+    // comment) -- resolved once here, passed to both the routed-expert
+    // (CPU/GPU) and shared-expert SwiGLU sites below. 0.0f ("inactive") for
+    // any layer index the file's clamp array doesn't cover, matching
+    // ArchitectureConfig::swiglu_clamp_exp/shexp's own "empty = off"
+    // default for every non-DeepSeek-V4 file.
+    float clamp_exp = (layer_idx < (int)c.swiglu_clamp_exp.size())
+                           ? c.swiglu_clamp_exp[layer_idx] : 0.0f;
+    float clamp_shexp = (layer_idx < (int)c.swiglu_clamp_shexp.size())
+                             ? c.swiglu_clamp_shexp[layer_idx] : 0.0f;
+
+    // DeepSeek-V4 hash-routed layers (first c.hash_layer_count layers):
+    // expert SELECTION is a direct token-id -> expert-id lookup via
+    // ffn_gate_tid2eid.weight (one row of `topk` int32 expert ids per
+    // vocab token, indexed by token id -- ggml's real ggml_get_rows(
+    // tid2eid, token_id) semantics, no runtime hash computation despite
+    // the tensor's name; verified against llama.cpp's real DeepSeek-V4
+    // implementation, src/models/deepseek4.cpp + llama-graph.cpp's
+    // build_moe_ffn). The router's own logits/probs (computed
+    // unconditionally below, every layer -- see graph_initializer.cpp's
+    // preload-manifest fix) still supply the WEIGHTS for whichever
+    // experts this resolves to; only the selection step branches, in the
+    // per-token loop further down.
+    const int32_t* tid2eid = nullptr;
+    if (layer_idx < c.hash_layer_count) {
+        std::string tid2eid_key = "blk." + std::to_string(layer_idx) + ".ffn_gate_tid2eid.weight";
+        auto tid2eid_it = engine.resident_layers.find(tid2eid_key);
+        // Validate the on-disk type/shape BEFORE reinterpreting host_ptr as
+        // int32_t* -- added after a real run showed EVERY hash-route lookup
+        // failing its bounds check (100% of tokens, all hash layers), which
+        // is far more consistent with reading the wrong bytes entirely
+        // (e.g. the tensor's real ggml type isn't I32, so calculate_size()
+        // undersized the read and left the tail as uninitialized heap
+        // garbage -- see GGUFType::I64's own comment) than with a subtle
+        // per-token routing quirk. Previously this reinterpret_cast was
+        // unconditional on host_ptr alone, so a type/width mismatch would
+        // silently produce garbage ids instead of a diagnosable error.
+        const GGUFTensor* meta_ptr = (tid2eid_it != engine.resident_layers.end())
+                                          ? &tid2eid_it->second.meta : nullptr;
+        bool shape_ok = meta_ptr && !meta_ptr->shape.empty() &&
+                        (int64_t)meta_ptr->shape[0] == (int64_t)topk;
+        if (meta_ptr && tid2eid_it->second.host_ptr &&
+            meta_ptr->type == GGUFType::I32 && shape_ok) {
+            tid2eid = reinterpret_cast<const int32_t*>(tid2eid_it->second.host_ptr);
+        } else if (meta_ptr && tid2eid_it->second.host_ptr) {
+            // Tensor loaded, but its type or row width doesn't match what
+            // this raw-int32 read path assumes -- loud, PER-LAYER (see
+            // below), and named specifically so a real run pinpoints
+            // exactly which assumption broke instead of just seeing every
+            // token's row fail the downstream bounds check with no clue why.
+            static std::vector<bool> tid2eid_shape_warned_per_layer;
+            if ((int)tid2eid_shape_warned_per_layer.size() <= layer_idx)
+                tid2eid_shape_warned_per_layer.resize(layer_idx + 1, false);
+            if (!tid2eid_shape_warned_per_layer[layer_idx]) {
+                LOG_ERROR("[MOE-ROUTE] layer=%d ffn_gate_tid2eid.weight loaded but type/shape "
+                          "mismatch (type=%u expected I32=%u, shape[0]=%llu expected topk=%d) -- "
+                          "falling back to the normal learned-router top-k for this layer.\n",
+                          layer_idx, (unsigned)meta_ptr->type, (unsigned)GGUFType::I32,
+                          meta_ptr->shape.empty() ? 0ull : (unsigned long long)meta_ptr->shape[0], topk);
+                tid2eid_shape_warned_per_layer[layer_idx] = true;
+            }
+        } else {
+            // Loud, PER-LAYER warning -- FIX: the old version of this
+            // warning was a single function-static bool SHARED across
+            // every hash-routed layer, so only the very first one to hit
+            // this path ever logged anything; every other hash-routed
+            // layer's identical failure was completely silent. Falls back
+            // to the normal argsort-over-learned-router-probs path below
+            // for this layer -- a REAL, working fallback now that
+            // ffn_gate_inp.weight is unconditionally loaded (see the
+            // preload-manifest fix), unlike the previous bug where the
+            // router itself was also missing and this whole layer's MoE
+            // output was silently zero-filled instead of falling back to
+            // anything.
+            static std::vector<bool> tid2eid_warned_per_layer;
+            if ((int)tid2eid_warned_per_layer.size() <= layer_idx)
+                tid2eid_warned_per_layer.resize(layer_idx + 1, false);
+            if (!tid2eid_warned_per_layer[layer_idx]) {
+                LOG_ERROR("[MOE-ROUTE] layer=%d is hash-routed (hash_layer_count=%d) but "
+                          "ffn_gate_tid2eid.weight failed to load (missing/short-read) -- "
+                          "falling back to the normal learned-router top-k for this layer, "
+                          "which will select DIFFERENT experts than the real hash table would.\n",
+                          layer_idx, c.hash_layer_count);
+                tid2eid_warned_per_layer[layer_idx] = true;
+            }
+        }
+    }
+
     // --- Router: compute expert probs and select top-k. Reference algorithm
     // ported from llama.cpp's build_moe_ffn (llama-graph.cpp):
-    //   1) probs = gate_func(logits)     [sigmoid or softmax, per c.use_sigmoid_gate]
+    //   1) probs = gate_func(logits)     [sigmoid/softmax/sqrtsoftplus, per c.gating_func -- see apply_gating_activation above]
     //   2) selection_probs = probs + bias  [bias only shifts WHICH experts get
     //      picked — the DeepSeek-V3/GLM-5.2 e_score_correction_bias tensor]
     //   3) top-k selected BY selection_probs (biased)
@@ -963,16 +1120,7 @@ void moe_forward_gguf(
         // the UNBIASED values later gathered as expert weights.
         for (int s = 0; s < S; ++s) {
             float* row = scratch.router_logits.data() + (size_t)s * n_experts;
-            if (c.use_sigmoid_gate) {
-                for (int e = 0; e < n_experts; ++e) row[e] = 1.0f / (1.0f + std::exp(-row[e]));
-            } else {
-                float max_l = row[0];
-                for (int e = 1; e < n_experts; ++e) max_l = std::max(max_l, row[e]);
-                float sum = 0.0f;
-                for (int e = 0; e < n_experts; ++e) { row[e] = std::exp(row[e] - max_l); sum += row[e]; }
-                float inv = 1.0f / sum;
-                for (int e = 0; e < n_experts; ++e) row[e] *= inv;
-            }
+            apply_gating_activation(c.gating_func, row, n_experts);
         }
         // No prior diagnostic covered this: expert_ffn's GPU-resident branch
         // only checks each expert's gate/up/down buffers AFTER routing has
@@ -1012,18 +1160,16 @@ void moe_forward_gguf(
     std::fill(scratch.expert_freq.begin(), scratch.expert_freq.end(), 0);
     for (int s = 0; s < S; ++s) {
         float* token_probs = scratch.router_logits.data() + s * n_experts;
-
-        for (int e = 0; e < n_experts; ++e) {
-            float sel = token_probs[e] + (bias_row ? bias_row[e] : 0.0f);
-            scratch.scores[e] = {e, sel};
-        }
-        std::partial_sort(scratch.scores.begin(), scratch.scores.begin() + topk, scratch.scores.begin() + n_experts,
-                         [](const ExpertScore& a, const ExpertScore& b) { return a.score > b.score; });
-
         float sum_w = 0.0f;
-        for (int k = 0; k < topk; ++k) {
-            int id = scratch.scores[k].id;
-            float w = token_probs[id];  // unbiased weight
+
+        // Records one (expert_id, weight) pick into scratch's per-token
+        // arrays and the routing-frequency histograms -- shared by both
+        // the hash-routed and normal argsort selection branches below, so
+        // the two paths can never diverge in what bookkeeping happens once
+        // an expert is actually picked (weight is always the UNBIASED
+        // token_probs[id], same convention either way).
+        auto record_pick = [&](int k, int id) {
+            float w = token_probs[id];
             scratch.tok_topk_weights[s * topk + k] = w;
             scratch.tok_topk_ids[s * topk + k] = id;
             scratch.expert_freq[id]++;
@@ -1041,6 +1187,45 @@ void moe_forward_gguf(
             // Never a replacement for the line above, purely additive.
             if (S > 1) engine.bump_route_freq_prefill(layer_idx, id);
             sum_w += w;
+        };
+
+        // Hash-routed SELECTION: direct token-id -> expert-id lookup,
+        // bypassing argsort entirely for this token. Every guard here is
+        // defensive (this is a brand-new raw-int32 read path with no prior
+        // real-hardware mileage): token_ids may legitimately be null (a
+        // caller that doesn't have per-token ids), an out-of-range token
+        // id would read past the tensor's real extent, and a corrupt/
+        // garbage row would hand a downstream expert-array access an
+        // out-of-bounds id -- any of these falls through to the normal
+        // argsort path below for just this token, never crashes.
+        bool used_hash_route = false;
+        if (tid2eid && token_ids) {
+            int tok = token_ids[s];
+            if (tok >= 0 && tok < c.vocab) {
+                const int32_t* row = tid2eid + (size_t)tok * topk;
+                bool ids_valid = true;
+                for (int k = 0; k < topk; ++k) {
+                    if (row[k] < 0 || row[k] >= n_experts) { ids_valid = false; break; }
+                }
+                if (ids_valid) {
+                    for (int k = 0; k < topk; ++k) record_pick(k, row[k]);
+                    used_hash_route = true;
+                } else {
+                    LOG_ERROR("[MOE-ROUTE] layer=%d token_id=%d: ffn_gate_tid2eid row contains "
+                              "an out-of-range expert id (n_experts=%d) -- falling back to the "
+                              "learned router's top-k for this token only.\n",
+                              layer_idx, tok, n_experts);
+                }
+            }
+        }
+        if (!used_hash_route) {
+            for (int e = 0; e < n_experts; ++e) {
+                float sel = token_probs[e] + (bias_row ? bias_row[e] : 0.0f);
+                scratch.scores[e] = {e, sel};
+            }
+            std::partial_sort(scratch.scores.begin(), scratch.scores.begin() + topk, scratch.scores.begin() + n_experts,
+                             [](const ExpertScore& a, const ExpertScore& b) { return a.score > b.score; });
+            for (int k = 0; k < topk; ++k) record_pick(k, scratch.scores[k].id);
         }
         if (c.expert_weights_norm) {
             float inv_sum = 1.0f / std::max(sum_w, 6.103515625e-5f);
@@ -1389,7 +1574,7 @@ void moe_forward_gguf(
                     exp->up_proj.host_ptr, exp->up_proj.meta,
                     exp->down_proj.host_ptr, exp->down_proj.meta,
                     scratch.gate_buf.data(), scratch.up_buf.data(),
-                    1, D, moe_inter);
+                    1, D, moe_inter, clamp_exp);
                 accumulate(k, exp, scratch.down_buf.data());
             }
         };
@@ -1399,7 +1584,7 @@ void moe_forward_gguf(
         // will already be warm here thanks to Phase 1/2 above). Batched:
         // get_experts_batch parallelizes the disk reads for whichever of
         // this layer's topk picks are genuine misses (not already staged
-        // via PIPE), instead of the old one-pread-at-a-time sequential
+        // via prefetch), instead of the old one-pread-at-a-time sequential
         // loop 
         //
         // FIX (real, measured "[TIER-OVERLAP]" bug -- see CLAUDE.md): this
@@ -1594,7 +1779,7 @@ void moe_forward_gguf(
                 scratch.gate_buf.data(), scratch.up_buf.data(), scratch.down_buf.data(),
                 p.exp->gate_proj.meta, p.exp->down_proj.meta,
                 layer_idx, p.expert_id, 1, D, moe_inter,
-                ram_mgr.vram_cache, p.needs_release, p.loc_from_active_layer);
+                ram_mgr.vram_cache, p.needs_release, p.loc_from_active_layer, clamp_exp);
             // Matches Pass A's increment -- release the RAM-tier protection
             // now that expert_ffn_gpu_finish's own release_hold() call
             // (which uses p.expert_id, captured at Pass A issue time -- see
@@ -1625,6 +1810,7 @@ void moe_forward_gguf(
             dense_proj(engine, sp + "ffn_up_shexp.weight",   token_hidden, scratch.up_buf.data(),   1, D, shared_inter);
             silu_inplace(scratch.gate_buf.data(), shared_inter);
             elem_mul(scratch.gate_buf.data(), scratch.gate_buf.data(), scratch.up_buf.data(), shared_inter);
+            swiglu_clamp_inplace(scratch.gate_buf.data(), shared_inter, clamp_shexp);
             dense_proj(engine, sp + "ffn_down_shexp.weight", scratch.gate_buf.data(), scratch.down_buf.data(), 1, shared_inter, D);
             // Previously completely uninstrumented -- the shared-expert path
             // has no equivalent of expert_ffn's check_finite calls, so a bug
@@ -1738,13 +1924,14 @@ void shrink_moe_gpu_scratch() {
 // speculative pilot prefetch, and performance instrumentation.
 // ============================================================
 void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
-                         LockFreePrefetcher& async_io_queue, float* hidden_states, int S, int pos_base) {
+                         LockFreePrefetcher& async_io_queue, float* hidden_states, int S, int pos_base,
+                         const int* token_ids) {
     auto& c = engine.model_file.architecture_config;
     int D = c.hidden;
 
     // S > 1 = prefill (whole prompt in one pass), S == 1 = decode (one
     // token at a time) -- see RAMSafetyManager::in_prefill's own comment
-    // for why the PIPE miss path needs this split.
+    // for why the prefetch miss path needs this split.
     ram_mgr.in_prefill = (S > 1);
 
     // Measurement only (expert_fetch_tracker.hpp) -- one call to this
@@ -1771,23 +1958,20 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
     for (int l = 0; l < c.n_layers; ++l) {
         const float* last_tok = hidden_states + (size_t)(S - 1) * D;  // hidden_states is mutated in place below, not reallocated -- always valid
         if (trace) LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] in      |hidden|=" << l2norm(last_tok, D) << "\n";
-        // --- Attention: MLA (GLM-5.2/DeepSeek-style, absorbed + latent KV
-        // cache) vs dense GQA causal attention (Hunyuan/Hy-V3/Llama-style,
-        // real Kc/Vc cache) ---
-        if (c.is_mla) {
-            mla_attention_absorbed_gguf(engine, l, hidden_states, S, pos_base, scratch.attn_out.data());
-        } else {
-            dense_attention_gguf(engine, l, hidden_states, S, pos_base, scratch.attn_out.data());
-        }
-
-        // Residual add
-        int i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m512 h = _mm512_loadu_ps(hidden_states + i);
-            __m512 a = _mm512_loadu_ps(scratch.attn_out.data() + i);
-            _mm512_storeu_ps(hidden_states + i, _mm512_add_ps(h, a));
-        }
-        for (; i < n; ++i) hidden_states[i] += scratch.attn_out[i];
+        // --- Attention: dispatched through engine.family_ops.attention_fn
+        // (models/family_ops.hpp) -- MLA absorbed (GLM-5.2/DeepSeek-V3), MLA
+        // raw/SWA (DeepSeek-V4), or dense GQA causal (Hunyuan/Hy-V3/Llama),
+        // depending on which family this file resolved to at load time. The
+        // hc_pre_fn/hc_post_fn bracket is the hyper-connection pre-collapse/
+        // post-combine hook (DeepSeek-V4); for every other family it's the
+        // shared no-op / plain residual-add (hc_pre_noop/hc_post_plain_add,
+        // family_ops.cpp) -- bit-for-bit the same two operations this loop
+        // used to inline directly, just reachable through one function
+        // pointer instead of a bool check with no third option. ---
+        auto& fo = engine.family_ops;
+        fo.hc_pre_fn(engine, l, /*sub_block=*/0, hidden_states, S, D);
+        fo.attention_fn(engine, l, hidden_states, S, pos_base, scratch.attn_out.data());
+        fo.hc_post_fn(engine, l, /*sub_block=*/0, hidden_states, scratch.attn_out.data(), S, D);
 
         // Per-layer, per-stage checkpoint: pinpoints the FIRST layer/stage
         // where hidden_states goes non-finite, instead of only learning
@@ -1802,24 +1986,22 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
         // --- FFN: leading dense layers (l < first_dense) use a plain dense
         // FFN — no router, no expert cache. Applies to both GLM-5.2's leading
         // dense layers and, since Hunyuan/Hy-V3 share the same first_dense
-        // convention, to any dense layers there too. ---
+        // convention, to any dense layers there too. dense_ffn_gguf/
+        // moe_forward_gguf are unchanged by the FamilyOps refactor -- they
+        // still read/write plain [S,D] hidden_states/scratch.moe_out
+        // regardless of family; only the hc_pre_fn/hc_post_fn bracket around
+        // them (sub_block=1, matching attention's sub_block=0 above) knows
+        // about hyper-connections. ---
+        fo.hc_pre_fn(engine, l, /*sub_block=*/1, hidden_states, S, D);
         {
             PERF_SCOPE(t_moe_expert);
             if (l < c.first_dense) {
                 dense_ffn_gguf(engine, l, hidden_states, S, scratch.moe_out.data(), scratch);
             } else {
-                moe_forward_gguf(engine, ram_mgr, async_io_queue, l, hidden_states, S, scratch.moe_out.data(), scratch);
+                moe_forward_gguf(engine, ram_mgr, async_io_queue, l, hidden_states, S, scratch.moe_out.data(), scratch, token_ids);
             }
         }
-
-        // Residual add
-        i = 0;
-        for (; i + 16 <= n; i += 16) {
-            __m512 h = _mm512_loadu_ps(hidden_states + i);
-            __m512 m = _mm512_loadu_ps(scratch.moe_out.data() + i);
-            _mm512_storeu_ps(hidden_states + i, _mm512_add_ps(h, m));
-        }
-        for (; i < n; ++i) hidden_states[i] += scratch.moe_out[i];
+        fo.hc_post_fn(engine, l, /*sub_block=*/1, hidden_states, scratch.moe_out.data(), S, D);
 
         check_finite("hidden_states (post FFN/MoE residual)", l, -1, hidden_states, (size_t)n);
         if (trace) LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-ffn  |moe_out|=" << l2norm(scratch.moe_out.data() + (size_t)(S - 1) * D, D)
@@ -1836,8 +2018,8 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
         // MoE FFN contribution entirely -- routinely the single largest
         // per-layer compute cost in this model -- so its guessed top-8
         // experts had no reason to match what the real router at l+1
-        // would actually select. Real-run PIPE instrumentation
-        // (n_pipe_hits_prefill/decode, n_pipe_miss_still_queued) showed
+        // would actually select. Real-run prefetch instrumentation
+        // (n_prefetch_hits_prefill/decode, n_prefetch_miss_still_queued) showed
         // 0% served in BOTH prefill and decode with 0/N misses even
         // finding a leftover trace of a hint -- exactly what stale-input
         // misprediction looks like (a timing/pool-size problem would
@@ -1875,21 +2057,7 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                 // to match the real, bias-corrected top-k the router
                 // actually dispatches, independent of how accurate the input
                 // hidden_states is.
-                for (int e = 0; e < c.n_experts; ++e) {
-                    float& v = scratch.pilot_logits[e];
-                    v = c.use_sigmoid_gate ? 1.0f / (1.0f + std::exp(-v)) : v;
-                }
-                if (!c.use_sigmoid_gate) {
-                    float max_l = scratch.pilot_logits[0];
-                    for (int e = 1; e < c.n_experts; ++e) max_l = std::max(max_l, scratch.pilot_logits[e]);
-                    float sum = 0.0f;
-                    for (int e = 0; e < c.n_experts; ++e) {
-                        scratch.pilot_logits[e] = std::exp(scratch.pilot_logits[e] - max_l);
-                        sum += scratch.pilot_logits[e];
-                    }
-                    float inv = 1.0f / sum;
-                    for (int e = 0; e < c.n_experts; ++e) scratch.pilot_logits[e] *= inv;
-                }
+                apply_gating_activation(c.gating_func, scratch.pilot_logits.data(), c.n_experts);
                 {
                     std::string bias_key = "blk." + std::to_string(l + 1) + ".exp_probs_b.bias";
                     auto bias_it = engine.resident_layers.find(bias_key);
@@ -1946,7 +2114,7 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                     // incidentally caught most VRAM-resident cases too. Now
                     // that VRAM-resident-but-NOT-RAM-resident is the common
                     // case (the fast path skips the RAM load entirely), this
-                    // check was missing it -- a real run showed PIPE-served
+                    // check was missing it -- a real run showed prefetch-served
                     // misses collapse from ~24-25% to 0.5% as a direct
                     // result: hints kept getting pushed for experts that,
                     // once reached, never touch the staging pool at all
