@@ -15,7 +15,6 @@
 #include <memory>
 #include <unordered_map>
 #include <algorithm>
-#include <cstring>
 
 #ifdef __APPLE__
 // macOS doesn't have posix_fadvise; provide no-op stubs. The function
@@ -689,53 +688,21 @@ public:
     // Ensure target_slot.slab_buffer can hold `total` bytes (grow-only, like
     // load_expert_slab). Used by both the pread path and the consume_staged
     // path so the destination buffer is sized before the bytes arrive.
-    // Returns false on allocation failure. Callers MUST check this -- for a
-    // freshly-constructed scratch block slab_buffer starts null anyway, but
-    // for a REUSED slot (a RAM-tier eviction victim, or any slot previously
-    // holding a different expert) the old buffer has already been freed by
-    // the time posix_memalign is attempted; posix_memalign leaves *memptr
-    // untouched on failure, which used to leave slab_buffer pointing at that
-    // just-freed block while slab_capacity was still set to the new (larger)
-    // `total` as if the allocation had succeeded -- a dangling pointer that
-    // looked valid to every downstream `slab_buffer && slab_capacity > 0`
-    // check. Found while tracing the "[PIN] Preload attrition" disk-read-
-    // failure counters (main.cpp): those never happen for GLM-5.2's packed
-    // format via a real short read (that path logs its own [WARN] and still
-    // populates the slab), so an unchecked posix_memalign failure was the
-    // only other way to reach that counter -- and the SAME failure, on a
-    // reused slot instead of preload's fresh scratch one, silently produces
-    // a genuine use-after-free (e.g. ram_manager.hpp's demote_from_vram
-    // cudaMemcpy'ing into it, or an io_uring read landing on it).
-    // Proactively nulls the slot to "empty" up front (not just on failure)
-    // so any concurrent reader between the free() and the retry always sees
-    // a consistent invalid state, matching this project's standing
-    // discipline that a failed operation must never leave state that looks
-    // valid but isn't (see demote_from_vram's own cudaMemcpy-failure comment).
-    bool ensure_slab_capacity(MoEExpertBlock& slot, size_t total) {
+    void ensure_slab_capacity(MoEExpertBlock& slot, size_t total) {
         PERF_START(alloc);
         if (slot.slab_capacity < total) {
-            size_t old_capacity = slot.slab_capacity;
             auto t0 = std::chrono::high_resolution_clock::now();
             if (slot.slab_buffer) free(slot.slab_buffer);
-            slot.slab_buffer = nullptr;
-            slot.slab_capacity = 0;
-            int rc = posix_memalign((void**)&slot.slab_buffer, 4096, total);
+            posix_memalign((void**)&slot.slab_buffer, 4096, total);
             double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
-            if (rc != 0) {
-                LOG_WARN("[HOST-ALLOC] posix_memalign(%.2fMB) failed: %s -- slot left empty, "
-                         "caller must treat this as a failed load\n", total / 1e6, strerror(rc));
-                PERF_END(alloc, t_host_alloc);
-                return false;
-            }
             if (ms > 50.0) {
                 LOG_WARN("[SLOW-HOST-ALLOC] posix_memalign(%.2fMB) took %.2fms (old_capacity=%.2fMB)\n",
-                         total / 1e6, ms, old_capacity / 1e6);
+                         total / 1e6, ms, slot.slab_capacity / 1e6);
             }
             slot.slab_capacity = total;
         }
         PERF_END(alloc, t_host_alloc);
-        return true;
     }
 
     // Set up a MoEExpertBlock's three projection host_ptr/meta from an already-
@@ -859,7 +826,7 @@ public:
                 return false;
             }
             out_total = gb + ub + db;
-            if (!ensure_slab_capacity(target_slot, out_total)) return false;
+            ensure_slab_capacity(target_slot, out_total);
             out_n = 0;
             out_reqs[out_n++] = {model_file.fd_for_tensor(*gM), model_file.direct_io_active_for(*gM),
                                   model_file.direct_io_alignment, target_slot.slab_buffer, out_total, gM->offset};
@@ -870,7 +837,7 @@ public:
         const GGUFTensor *gM, *uM, *dM;
         if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
         out_total = gb + ub + db;
-        if (!ensure_slab_capacity(target_slot, out_total)) return false;
+        ensure_slab_capacity(target_slot, out_total);
 
         uint8_t* dst_gate = target_slot.slab_buffer;
         uint8_t* dst_up   = target_slot.slab_buffer + gb;
@@ -903,10 +870,7 @@ public:
         const GGUFTensor *gM, *uM, *dM;
         if (packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) {
             const size_t total = gb + ub + db;
-            if (!ensure_slab_capacity(target_slot, total)) {
-                target_slot.expert_id = expert_id;  // failed alloc -- leave empty, caller treats as a miss
-                return;
-            }
+            ensure_slab_capacity(target_slot, total);
 
             uint8_t* dst_gate = target_slot.slab_buffer;
             uint8_t* dst_up   = target_slot.slab_buffer + gb;
@@ -1024,10 +988,7 @@ public:
         }
         const size_t db_pe = down.size_bytes;
         const size_t total = gb_pe + ub_pe + db_pe;
-        if (!ensure_slab_capacity(target_slot, total)) {
-            target_slot.expert_id = expert_id;  // failed alloc -- leave empty, caller treats as a miss
-            return;
-        }
+        ensure_slab_capacity(target_slot, total);
 
         uint8_t* dst_gate = target_slot.slab_buffer;
         uint8_t* dst_up   = target_slot.slab_buffer + gb_pe;

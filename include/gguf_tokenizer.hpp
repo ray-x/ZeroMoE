@@ -32,6 +32,22 @@ public:
   std::string model_type; // tokenizer.ggml.model, e.g. "gpt2", "llama"
   int bos_token_id = 1;
   int eos_token_id = 2;
+  // tokenizer.ggml.add_bos_token: whether the model's OWN tokenizer config
+  // wants a leading BOS prepended at all. Defaults to true (matching the
+  // convention most GGUFs rely on when the key is absent), but MUST be
+  // respected when present -- confirmed via a real bug: Qwen3.6-35B-A3B's
+  // GGUF carries `tokenizer.ggml.add_bos_token = False`, which llama.cpp
+  // reads via llama_vocab_get_add_bos() and honors (a real llama.cpp run
+  // logged "number of input tokens = 1" for the prompt "hi", i.e. no BOS).
+  // Before this field existed, cpu_main.cpp/main.cpp unconditionally pushed
+  // bos_token_id regardless of this key, silently feeding the model a
+  // 2-token prompt (phantom BOS + "hi") it never saw start a sequence
+  // during training/inference elsewhere -- this corrupted every windowed op
+  // (causal_conv1d's receptive field) from the very first forward pass and
+  // permanently poisoned the recurrent linear-attention state for the rest
+  // of generation, which is believed to be the root cause of incoherent
+  // decode output for this model.
+  bool add_bos_token = true;
   // GLM-3/4/GLMEdge-style chat special tokens, populated (if present) by
   // detect_chat_special_tokens() after the vocab loads -- confirmed
   // against llama.cpp's actual chat-template source (llama-chat.cpp,
@@ -43,10 +59,34 @@ public:
   // GLM-5.2's real HF config.json has THREE stop tokens in eos_token_id
   std::vector<int> stop_ids;
   int observation_id = -1;
+  // DeepSeek-V3/V4-style chat special tokens -- confirmed against the real
+  // HF chat template (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja
+  // in the llama.cpp checkout): "{bos}<｜User｜>{msg}<｜Assistant｜></think>".
+  // NOTE these use FULLWIDTH VERTICAL LINE (｜ U+FF5C), not ASCII '|' -- a
+  // plain "<|user|>" lookup (the GLM check above) will never match DeepSeek's
+  // vocab, which is exactly the bug this was added to fix: without this,
+  // has_chat_template() was false for every DeepSeek checkpoint and prompts
+  // fell through to raw BOS+text, feeding an instruction/reasoning-tuned
+  // model a completion-style prompt it was never trained to see -- observed
+  // on a real DeepSeek-V4-Flash run as confident, fluent, but completely
+  // off-topic/multilingual-garbage decode output for the plain prompt "hi",
+  // with every tensor-math stage (attention, hyper-connections, hash-
+  // routing, weight-gathering, embedding) independently reviewed and found
+  // correct -- the corruption was in prompt construction, not the model.
+  // -1 if absent. ds_think_end_id ("</think>") is appended after the
+  // assistant tag to select the template's default non-reasoning path
+  // (thinking=false in the jinja source); this project has no "thinking"
+  // toggle so always requesting the non-reasoning branch is the correct
+  // default absent one.
+  int ds_user_id = -1, ds_assistant_id = -1, ds_think_start_id = -1,
+      ds_think_end_id = -1;
 
   GGUFTokenizer() { init_byte_unicode(); }
 
   bool has_chat_template() const { return user_id >= 0 && assistant_id >= 0; }
+  bool has_deepseek_chat_template() const {
+    return ds_user_id >= 0 && ds_assistant_id >= 0;
+  }
 
   bool is_stop_token(int id) const {
     for (int s : stop_ids)
@@ -133,7 +173,11 @@ public:
       } else {
         if (key == "tokenizer.ggml.bos_token_id")
           f.read(reinterpret_cast<char *>(&bos_token_id), 4);
-        else if (key == "tokenizer.ggml.eos_token_id") {
+        else if (key == "tokenizer.ggml.add_bos_token" && value_type == 7) {
+          uint8_t v = 0;
+          f.read(reinterpret_cast<char *>(&v), 1);
+          add_bos_token = (v != 0);
+        } else if (key == "tokenizer.ggml.eos_token_id") {
           f.read(reinterpret_cast<char *>(&eos_token_id), 4);
           stop_ids.push_back(eos_token_id);
         } else if (key == "tokenizer.ggml.model" && value_type == 8)
@@ -152,8 +196,14 @@ public:
                         << " <|user|>=" << user_id
                         << " <|assistant|>=" << assistant_id
                         << " -- will wrap prompts GLM-chat-style.\n";
+    } else if (has_deepseek_chat_template()) {
+      LOG_STREAM_INFO() << "[Tokenizer] Chat template detected: <｜User｜>="
+                        << ds_user_id << " <｜Assistant｜>=" << ds_assistant_id
+                        << " </think>=" << ds_think_end_id
+                        << " -- will wrap prompts DeepSeek-chat-style.\n";
     } else {
-      LOG_STREAM_WARN() << "[Tokenizer] No <|user|>/<|assistant|> chat tokens "
+      LOG_STREAM_WARN() << "[Tokenizer] No <|user|>/<|assistant|> or "
+                           "<｜User｜>/<｜Assistant｜> chat tokens "
                            "found in vocab -- "
                            "prompts will be sent as raw BOS+text. If this is "
                            "an instruction-tuned "
@@ -173,6 +223,10 @@ public:
     user_id = find("<|user|>");
     assistant_id = find("<|assistant|>");
     observation_id = find("<|observation|>");
+    ds_user_id = find("<｜User｜>");
+    ds_assistant_id = find("<｜Assistant｜>");
+    ds_think_start_id = find("<think>");
+    ds_think_end_id = find("</think>");
 
     // GLM-5.2's real HF config.json has THREE eos_token_id entries:
     // <|endoftext|>, <|user|>, <|observation|>
@@ -192,6 +246,13 @@ public:
     add_stop(find("<|endoftext|>"));
     add_stop(user_id);
     add_stop(observation_id);
+    // DeepSeek's real turn-end marker (fullwidth-pipe, distinct from the
+    // ASCII <|endoftext|> checked above) -- see ds_user_id's comment for the
+    // Unicode-token-family context. tokenizer.ggml.eos_token_id from the
+    // GGUF metadata should already point here in a well-formed checkpoint,
+    // but add_stop dedups, so this is a harmless extra safety net rather
+    // than a behavior change when that's already true.
+    add_stop(find("<｜end▁of▁sentence｜>"));
 
     if (!stop_ids.empty()) {
       LogStream ls(LogLevel::INFO);

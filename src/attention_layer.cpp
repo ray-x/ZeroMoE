@@ -19,7 +19,19 @@ extern void softmax_row(float* x, int size);
 // bisect its internal stages the same way execution_layer.cpp's check_finite
 // bisects expert_ffn/moe_forward_gguf. Local copy rather than sharing that
 // one (file-local static there) to avoid cross-TU plumbing for a diagnostic.
-static bool check_finite_attn(const char* label, int layer_idx, const float* data, size_t n) {
+//
+// Also emits a VERBOSE-gated L2 norm of the LAST TOKEN's slice (row S-1 of
+// an [S, row_width] buffer), added while bisecting a real DeepSeek-V4-Flash
+// run's ~25x hidden-state norm jump across a single layer's attention block
+// (generation_loop.hpp's [TRACE l=...] post-attn line) -- that trace only
+// sees the combined pre/post-attention hidden norm, not which internal
+// stage of dsv4_attention_gguf (Q/RoPE, KV/MQA blend, or the grouped
+// attn_output_a/b projection -- the latter's on-disk layout is explicitly
+// unverified per this file's own dsv4_attention_gguf header comment) is
+// where the magnitude actually inflates. row_width=0 skips the per-row norm
+// (used for buffers, like the whole KVc ring, that aren't one-row-per-token).
+static bool check_finite_attn(const char* label, int layer_idx, const float* data, size_t n,
+                              int row_width = 0) {
     int nan_count = 0, inf_count = 0;
     for (size_t i = 0; i < n; ++i) {
         if (std::isnan(data[i])) ++nan_count;
@@ -28,6 +40,13 @@ static bool check_finite_attn(const char* label, int layer_idx, const float* dat
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[MLA] %s layer=%d: %d/%zu NaN, %d/%zu Inf.\n", label, layer_idx, nan_count, n, inf_count, n);
         return false;
+    }
+    if (row_width > 0 && Logger::instance().would_log(LogLevel::VERBOSE)) {
+        const float* last_row = data + (n - (size_t)row_width);
+        double sq = 0.0;
+        for (int i = 0; i < row_width; ++i) sq += (double)last_row[i] * last_row[i];
+        LOG_STREAM_VERBOSE() << "[MLA-TRACE l=" << layer_idx << "] " << label
+                             << " |last_row|=" << std::sqrt(sq) << "\n";
     }
     return true;
 }
@@ -66,6 +85,20 @@ static inline void apply_rope_yarn(float* v, int dim, int pos, float theta_base,
 static inline float compute_yarn_kq_scale(const ArchitectureConfig& c, int qh) {
     return yarn_kq_scale(c.rope_ext_factor, c.rope_freq_scale, c.rope_attn_factor,
                          c.rope_yarn_log_mul, qh);
+}
+
+// Weightless per-head RMSNorm (no learned weight tensor) matching llama.cpp's
+// `q = ggml_rms_norm(ctx0, q, norm_rms_eps)` in deepseek4.cpp's
+// build_attention_impl -- applied to the FULL [qh] Q vector right after the
+// attn_q_b projection, before the nope/rope split and before RoPE. Confirmed
+// by direct read of deepseek4.cpp: this call has no corresponding weight
+// tensor multiply (unlike attn_q_a_norm/attn_kv_a_norm elsewhere in this
+// file, which ARE weighted). Was missing entirely from dsv4_attention_gguf.
+static inline void rmsnorm_inplace_noweight(float* v, int dim, float eps) {
+    double ss = 0.0;
+    for (int i = 0; i < dim; ++i) ss += (double)v[i] * v[i];
+    float r = 1.0f / std::sqrt((float)(ss / dim) + eps);
+    for (int i = 0; i < dim; ++i) v[i] *= r;
 }
 
 void extract_gguf_row_q4_0(const QuantizedTensor& tensor, int row_idx, float* __restrict__ out_f32) {
@@ -350,18 +383,37 @@ void mla_attention_absorbed_gguf(
 // on the attention output, and a grouped low-rank output projection
 // (attn_output_a/attn_output_b) replacing the single attn_output matmul.
 //
-// UNVERIFIED ON REAL HARDWARE, and several specific choices below are
-// best-effort interpretations of DeepSeek-V4's architecture (reconstructed
-// from reading llama.cpp's deepseek4.cpp, not a byte-exact transcription
-// held side-by-side during implementation) rather than confirmed facts --
-// each flagged inline where the uncertainty is real: (a) whether
-// attn_kv_norm applies to the WHOLE qh-wide latent before splitting into
-// nope/rope, or only the nope portion (V3 precedent argues for nope-only;
-// implemented here as whole-latent, matching the literal "wkv -> kv_norm ->
-// split -> rope" ordering in the research this was built from); (b) the
-// exact on-disk byte layout of the grouped attn_output_a tensor's
-// {H*qh/o_groups, o_lora_rank, o_groups} shape, needed to slice it
-// correctly per group.
+// UNVERIFIED ON REAL HARDWARE end-to-end, but two real bugs found and fixed
+// via a direct line-by-line comparison against llama.cpp's real
+// deepseek4.cpp (not just paraphrase/research notes) after real-hardware
+// generation produced coherent-looking-but-garbage output even after a
+// separate, unrelated tid2eid on-disk corruption bug was fixed:
+//   1. This function was feeding the model-global c.rope_ext_factor/
+//      c.rope_freq_scale (correct for V2/V3/GLM's mla_attention_absorbed_gguf,
+//      which applies YaRN uniformly per the model's rope.scaling.type
+//      metadata) into RoPE and the attention kq_scale here too. Confirmed
+//      against deepseek4.cpp's build_attention_impl: V4 only ever enables
+//      ext_factor/freq_scale for HCA "compress-rope" layers
+//      (dsv4_compress_ratios[il] != 0, a feature not implemented here --
+//      every layer is treated as compress_ratio==0, see below); for every
+//      ordinary layer it forces ext_factor=0/freq_scale=1/attn_factor=1
+//      UNCONDITIONALLY, and the softmax scale is hardcoded plain
+//      1/sqrt(n_embd_head) at every build_attn_mha call site -- no mscale
+//      term at all, regardless of the checkpoint's global YaRN metadata.
+//      Fixed by hardcoding plain values at all 4 RoPE/scale call sites in
+//      this function instead of threading through c.rope_ext_factor.
+//   2. Missing a weightless (no learned weight tensor) per-head RMSNorm on
+//      the full [qh] Q vector immediately after the attn_q_b projection,
+//      before the nope/rope split and before RoPE -- confirmed present in
+//      deepseek4.cpp as `q = ggml_rms_norm(ctx0, q, norm_rms_eps)`, entirely
+//      separate from the WEIGHTED attn_q_a_norm applied earlier in the
+//      q_a->q_a_norm->q_b decompose. Added as rmsnorm_inplace_noweight.
+// (a) attn_kv_norm applying to the WHOLE qh-wide latent before splitting
+// nope/rope (not nope-only) is CONFIRMED correct as implemented here,
+// matching deepseek4.cpp's own "wkv -> kv_norm -> split -> rope" ordering
+// exactly. (b) the exact on-disk byte layout of the grouped attn_output_a
+// tensor's {H*qh/o_groups, o_lora_rank, o_groups} shape is still unverified
+// on real hardware.
 // ============================================================
 void dsv4_attention_gguf(
     StreamingEngine& engine,
@@ -381,6 +433,24 @@ void dsv4_attention_gguf(
     std::string p = "blk." + std::to_string(layer_idx) + ".";
     float rope_theta = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
     int window = engine.sliding_window > 0 ? engine.sliding_window : engine.max_t;
+
+    // TEMP DEBUG: unconditional (not gated by log level), fires once, to
+    // confirm this function is actually reached for this checkpoint and
+    // to surface whether YaRN (rope_ext_factor != 0) is active -- remove
+    // once the garbage-output investigation concludes.
+    {
+        static bool dsv4_debug_once = false;
+        if (!dsv4_debug_once) {
+            dsv4_debug_once = true;
+            fprintf(stderr,
+                "[DSV4-DEBUG] dsv4_attention_gguf reached: layer=%d H=%d nope=%d rope=%d "
+                "qh=%d rope_ext_factor=%.6f rope_freq_scale=%.6f rope_theta=%.1f window=%d "
+                "q_lora=%d o_group_count=%d o_lora_rank=%d\n",
+                layer_idx, H, nope, rope, qh, c.rope_ext_factor, c.rope_freq_scale,
+                rope_theta, window, engine.model_file.get_config_int("attention.q_lora_rank", 2048),
+                c.o_group_count, c.o_lora_rank);
+        }
+    }
 
     // ---- 1. attention input norm (same as V3) ----
     std::vector<float> normed((size_t)S * D);
@@ -405,24 +475,48 @@ void dsv4_attention_gguf(
     // didn't, so a NaN introduced by attn_q_a/attn_q_a_norm/attn_q_b here
     // would only surface (if at all) at the post-RoPE check below, one
     // stage later than necessary.
-    check_finite_attn("Q (post attn_q_a/q_a_norm/q_b projection, pre-RoPE)", layer_idx, Q.data(), Q.size());
+    check_finite_attn("Q (post attn_q_a/q_a_norm/q_b projection, pre-RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
+    // Weightless per-head RMSNorm on the full [qh] Q vector -- see
+    // rmsnorm_inplace_noweight's own comment above. Must run BEFORE the
+    // RoPE loop below, matching deepseek4.cpp's ordering (norm, then split
+    // nope/pe, then RoPE on the pe half only).
+    for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < H; ++h) {
+            rmsnorm_inplace_noweight(Q.data() + ((size_t)s * H + h) * qh, qh, c.eps);
+        }
+    }
+    check_finite_attn("Q (post per-head RMSNorm, pre-RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
+    // V4 doesn't implement HCA/compress-rope layers (see this function's
+    // own header comment) -- confirmed against llama.cpp's real
+    // build_attention_impl (deepseek4.cpp): use_compress_rope is false for
+    // every layer this function handles, which forces
+    // ext_factor_l=0/freq_scale_l=1/attn_factor_l=1 there UNCONDITIONALLY,
+    // regardless of the model's global rope.scaling.type GGUF metadata.
+    // The model-global c.rope_ext_factor (used correctly by
+    // mla_attention_absorbed_gguf for V2/V3/GLM, which DOES apply YaRN
+    // uniformly) does NOT apply to V4's ordinary layers -- they are always
+    // plain RoPE, even on a long-context checkpoint that sets
+    // rope.scaling.type=yarn globally. Previously this used
+    // c.rope_ext_factor/c.rope_freq_scale directly with dsv4_mscale=true,
+    // which incorrectly engaged YaRN's ramp+mscale math whenever the
+    // checkpoint declared YaRN scaling.
     for (int s = 0; s < S; ++s) {
         int pos = pos_base + s;
         for (int h = 0; h < H; ++h) {
             float* q_rope = Q.data() + ((size_t)s * H + h) * qh + nope;
-            rope_yarn_inplace(q_rope, rope, pos, rope_theta, c.rope_ext_factor,
-                              c.rope_freq_scale, c.rope_attn_factor, c.rope_yarn_log_mul,
-                              c.rope_n_ctx_orig, /*dsv4_mscale=*/true);
+            rope_yarn_inplace(q_rope, rope, pos, rope_theta, /*rope_ext_factor=*/0.0f,
+                              /*rope_freq_scale=*/1.0f, /*rope_attn_factor=*/1.0f,
+                              c.rope_yarn_log_mul, c.rope_n_ctx_orig, /*dsv4_mscale=*/false);
         }
     }
-    check_finite_attn("Q (post RoPE)", layer_idx, Q.data(), Q.size());
+    check_finite_attn("Q (post RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
 
     // ---- 3. project KV (single wkv, no absorption) and write the SWA ring
     // cache at pos % window. ----
     {
         std::vector<float> kv((size_t)S * qh);
         dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D, qh);
-        check_finite_attn("kv (post attn_kv projection, pre-norm/RoPE)", layer_idx, kv.data(), kv.size());
+        check_finite_attn("kv (post attn_kv projection, pre-norm/RoPE)", layer_idx, kv.data(), kv.size(), qh);
         // (a) whole-latent norm -- see this function's own header comment.
         // Real tensor name is attn_kv_a_norm (reused from V3's kv_a_norm
         // naming convention, confirmed against llama-arch.cpp's
@@ -439,14 +533,56 @@ void dsv4_attention_gguf(
             int slot = pos % window;
             float* kv_row = kv.data() + (size_t)s * qh;
             float* k_rope = kv_row + nope;
-            rope_yarn_inplace(k_rope, rope, pos, rope_theta, c.rope_ext_factor,
-                              c.rope_freq_scale, c.rope_attn_factor, c.rope_yarn_log_mul,
-                              c.rope_n_ctx_orig, /*dsv4_mscale=*/true);
+            // Plain RoPE for V4's ordinary layers -- see the matching
+            // comment on the Q-side RoPE call above.
+            rope_yarn_inplace(k_rope, rope, pos, rope_theta, /*rope_ext_factor=*/0.0f,
+                              /*rope_freq_scale=*/1.0f, /*rope_attn_factor=*/1.0f,
+                              c.rope_yarn_log_mul, c.rope_n_ctx_orig, /*dsv4_mscale=*/false);
+            // Per-row norm of THIS token's cache row, right after norm+RoPE
+            // and right before it becomes one of the vectors the softmax in
+            // step 4 actually blends -- the earlier "kv (post attn_kv
+            // projection, pre-norm/RoPE)" trace above measures a DIFFERENT,
+            // pre-norm/pre-RoPE buffer, so it is not a valid stand-in for
+            // "the norm of what gets blended" when checking the softmax
+            // convex-combination bound against head_contexts below. Only
+            // the newest row (s==S-1) is logged, matching every other
+            // VERBOSE trace in this function's "last token" convention.
+            if (s == S - 1 && Logger::instance().would_log(LogLevel::VERBOSE)) {
+                double sq = 0.0;
+                for (int i = 0; i < qh; ++i) sq += (double)kv_row[i] * kv_row[i];
+                LOG_STREAM_VERBOSE() << "[MLA-TRACE l=" << layer_idx
+                                     << "] kv_row (post norm+RoPE, pre-cache-write) |last_row|="
+                                     << std::sqrt(sq) << "\n";
+            }
             std::memcpy(engine.KVc[layer_idx] + (int64_t)slot * qh, kv_row,
                         (size_t)qh * sizeof(float));
         }
     }
     check_finite_attn("KVc (post write)", layer_idx, engine.KVc[layer_idx], (size_t)window * qh);
+    // Max per-row norm across every cache row actually in-window for the
+    // newest token (s==S-1) -- the real quantity the softmax convex-
+    // combination bound (head_contexts <= max over blended rows) must be
+    // checked against, since head_contexts blends up to `window` distinct
+    // historical rows, not just the just-written one traced above. A single
+    // large-magnitude row anywhere in that window is enough for softmax to
+    // legitimately land close to it and still respect the bound.
+    if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+        int current_pos = pos_base + (S - 1);
+        int past_context_len = std::min(current_pos + 1, window);
+        double max_sq = 0.0;
+        int max_t = -1;
+        for (int t = 0; t < past_context_len; ++t) {
+            int abs_pos = current_pos - past_context_len + 1 + t;
+            int slot = abs_pos % window;
+            const float* cached = engine.KVc[layer_idx] + (int64_t)slot * qh;
+            double sq = 0.0;
+            for (int i = 0; i < qh; ++i) sq += (double)cached[i] * cached[i];
+            if (sq > max_sq) { max_sq = sq; max_t = t; }
+        }
+        LOG_STREAM_VERBOSE() << "[MLA-TRACE l=" << layer_idx
+                             << "] KVc window max |row|=" << std::sqrt(max_sq)
+                             << " (t=" << max_t << "/" << past_context_len << ")\n";
+    }
 
     // ---- 4. MQA attention over the raw cached latent (K==V, no
     // absorption), windowed to the last `window` positions, plus a
@@ -456,17 +592,17 @@ void dsv4_attention_gguf(
                          ? reinterpret_cast<float*>(sinks_it->second.host_ptr) : nullptr;
 
     std::vector<float> head_contexts((size_t)S * H * qh, 0.0f);
-    // (c) FURTHER UNVERIFIED: reuses V3's kq_scale formula as-is (reduces
-    // to plain 1/sqrt(qh) when ext_factor==0, the common non-YaRN case) --
-    // no separate research confirmed whether V4's attention-score
-    // temperature scale is genuinely identical to V3's here, or whether it
-    // should use its own dsv4-specific derivation the way the RoPE mscale
-    // above does (rope_yarn_inplace's dsv4_mscale branch). Distinct open
-    // item from the RoPE mscale fix earlier in this file -- flag
-    // separately if a real DeepSeek-V4 run shows YaRN-active long-context
-    // attention scores looking wrong while short-context (ext_factor==0,
-    // where this reduces to the uncontroversial 1/sqrt(qh)) looks fine.
-    float attn_scale = compute_yarn_kq_scale(c, qh);
+    // CONFIRMED against llama.cpp's build_attention_impl (deepseek4.cpp):
+    // every build_attn_mha call site there hardcodes plain
+    // 1.0f/sqrtf(n_embd_head) -- no mscale multiplier at all, for any
+    // layer this function handles (HCA/compress-rope layers aren't
+    // implemented here, see this function's header comment). The earlier
+    // "reuse V3's kq_scale formula" approach was wrong whenever the
+    // checkpoint's global rope.scaling.type=yarn -- V4 never uses that
+    // term outside HCA layers. Passing ext_factor=0 makes this reduce to
+    // the correct plain 1/sqrt(qh) unconditionally.
+    float attn_scale = yarn_kq_scale(/*rope_ext_factor=*/0.0f, /*rope_freq_scale=*/1.0f,
+                                     /*rope_attn_factor=*/1.0f, c.rope_yarn_log_mul, qh);
 
     #pragma omp parallel for collapse(2) schedule(dynamic, 1)
     for (int s = 0; s < S; ++s) {
@@ -520,17 +656,45 @@ void dsv4_attention_gguf(
             // AGGREGATED (multi-position-blended) output -- see this
             // function's own header comment on why this is needed here but
             // not in V3 (no absorption to keep rope-space and output-space
-            // separate). Same theta/position/mscale as the forward
-            // rotation applied to K above, transpose semantics (rope.hpp's
-            // own comment): mscale is NOT inverted, matching
-            // ggml_rope_ext_back.
+            // separate). Same theta/position/(plain, mscale=1) params as
+            // the forward rotation applied to K above -- see the matching
+            // comment on the Q-side RoPE call earlier in this function for
+            // why ext_factor/freq_scale/attn_factor are forced plain here
+            // rather than using the model-global c.rope_ext_factor.
             rope_yarn_inplace_inverse(head_out_dest + nope, rope, current_pos, rope_theta,
-                                      c.rope_ext_factor, c.rope_freq_scale, c.rope_attn_factor,
-                                      c.rope_yarn_log_mul, c.rope_n_ctx_orig, /*dsv4_mscale=*/true);
+                                      /*rope_ext_factor=*/0.0f, /*rope_freq_scale=*/1.0f,
+                                      /*rope_attn_factor=*/1.0f, c.rope_yarn_log_mul,
+                                      c.rope_n_ctx_orig, /*dsv4_mscale=*/false);
         }
     }
     check_finite_attn("head_contexts (post MQA + de-rope)", layer_idx,
-                       head_contexts.data(), head_contexts.size());
+                       head_contexts.data(), head_contexts.size(), H * qh);
+    // The row_width=H*qh check above measures the norm of ALL H heads
+    // concatenated for the last token -- NOT comparable to "KVc window max
+    // |row|" above, which is a single qh-sized row. Concatenating H
+    // independently-bounded heads can legitimately scale the combined norm
+    // up to sqrt(H) times a single head's, even when every individual head
+    // respects the softmax convex-combination bound (each head's own
+    // weights sum to 1, so each head's own qh-sized output is bounded by
+    // the max qh-sized cached row it blended) -- the same category of
+    // mismatch already found in the Q per-head-RMSNorm trace above. This is
+    // the genuine apples-to-apples check: max norm of any SINGLE head's
+    // qh-sized segment for the last token, to test the per-head bound
+    // directly against "KVc window max |row|".
+    if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+        double max_sq = 0.0;
+        int max_h = -1;
+        const float* last_tok = head_contexts.data() + (size_t)(S - 1) * H * qh;
+        for (int h = 0; h < H; ++h) {
+            const float* seg = last_tok + (size_t)h * qh;
+            double sq = 0.0;
+            for (int i = 0; i < qh; ++i) sq += (double)seg[i] * seg[i];
+            if (sq > max_sq) { max_sq = sq; max_h = h; }
+        }
+        LOG_STREAM_VERBOSE() << "[MLA-TRACE l=" << layer_idx
+                             << "] head_contexts per-head max |head|=" << std::sqrt(max_sq)
+                             << " (h=" << max_h << "/" << H << ")\n";
+    }
 
     // ---- 5. grouped low-rank output projection: attn_output_a (per
     // group) -> concat -> attn_output_b (single dense matmul). ----
@@ -568,10 +732,10 @@ void dsv4_attention_gguf(
             matmul(out_group, in_group, WOA.data() + (size_t)g * o_rank * group_in, 1, group_in, o_rank);
         }
     }
-    check_finite_attn("grouped_out (post attn_output_a)", layer_idx, grouped_out.data(), grouped_out.size());
+    check_finite_attn("grouped_out (post attn_output_a)", layer_idx, grouped_out.data(), grouped_out.size(), o_groups * o_rank);
 
     dense_proj(engine, p + "attn_output_b.weight", grouped_out.data(), out_context, S, o_groups * o_rank, D);
-    check_finite_attn("out_context (post attn_output_b projection)", layer_idx, out_context, (size_t)S * D);
+    check_finite_attn("out_context (post attn_output_b projection)", layer_idx, out_context, (size_t)S * D, D);
 }
 
 // ============================================================

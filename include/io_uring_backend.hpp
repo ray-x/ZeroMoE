@@ -333,6 +333,10 @@ private:
 // no #ifdefs needed in async_prefetcher.hpp.
 class Ring {
 public:
+    // Mirrors the real Linux Ring::CAPACITY so callers (e.g. ram_manager.hpp's
+    // disk_batch_padding) can reference it unconditionally without #ifdefs --
+    // this stub is always unavailable, so the value itself is never load-bearing.
+    static constexpr unsigned CAPACITY = 64;
     bool init() { return false; }
     bool available() const { return false; }
     bool register_iowq_workers(unsigned) { return false; }

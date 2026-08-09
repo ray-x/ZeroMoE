@@ -28,11 +28,24 @@ extern "C" {
 const void* ms_grid_kvalues_iq4nl();
 }
 
-static bool iq4xs_table_ready = false;
+// __constant__ memory is per-device: cudaMemcpyToSymbol only ever populates
+// the CURRENTLY-ACTIVE device's copy. A single process-wide bool here would
+// let the first GPU touched in a run latch this true globally, silently
+// skipping initialization (all-zero lookup table, all-zero dequantized
+// weights) for every OTHER GPU in a multi-GPU config -- this was a real,
+// confirmed bug (see CLAUDE.md's [SILU-TRACE-GPU] investigation, same
+// pattern as cuda/iq2_matmul.cu and cuda/iq3_matmul.cu). Tracked per-device
+// instead; MAX_CUDA_DEVICES is a generous static bound (no dynamic
+// allocation needed for any realistic consumer multi-GPU setup).
+#define MAX_CUDA_DEVICES 16
+static bool iq4xs_table_ready[MAX_CUDA_DEVICES] = {false};
 static void init_iq4xs_table() {
-    if (iq4xs_table_ready) return;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= MAX_CUDA_DEVICES) dev = 0;
+    if (iq4xs_table_ready[dev]) return;
     cudaMemcpyToSymbol(c_kvalues_iq4nl, ms_grid_kvalues_iq4nl(), 16 * sizeof(int8_t));
-    iq4xs_table_ready = true;
+    iq4xs_table_ready[dev] = true;
 }
 
 // ---- fused matmul (cooperative parallel dequant + warp-level dot reduction) ----

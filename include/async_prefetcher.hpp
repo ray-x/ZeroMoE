@@ -35,10 +35,23 @@
 // under-, not over-, reporting SLOW-PICKUP.
 constexpr double SLOW_PICKUP_MS = 250.0;
 
+// Which pilot fired this hint -- exists purely to split the shared queue's
+// real disk-cost counters (bytes/time/issued/completed/failed/claims_
+// beaten, perf_timer.hpp) by source, so DEPTH-2's actual marginal disk-I/O
+// cost (EngineConfig::prefetch_pilot_depth=2, execution_layer.cpp's l+2
+// block) is a measured number instead of an estimate extrapolated from
+// recall stats alone. Depth2 = l+2 pilot hints. Other = everything else
+// that shares this same queue (l+1's own pilot hints, and Phase 2's
+// prefill_warm_via_prefetcher hints) -- NOT split further, since isolating
+// depth-2's cost is this split's only purpose; "Other" is not a synonym
+// for "depth-1 pilot only".
+enum class PilotSource : uint8_t { Other, Depth2 };
+
 struct PrefetchHint {
     int layer_idx;
     int expert_id;
     std::chrono::high_resolution_clock::time_point pushed_at;
+    PilotSource source = PilotSource::Other;
 };
 
 // Per-layer prefetch activity, sized to the model's layer count once in
@@ -264,7 +277,7 @@ public:
         }
     }
 
-    void push_hint(int layer_idx, int expert_id) {
+    void push_hint(int layer_idx, int expert_id, PilotSource source = PilotSource::Other) {
         unsigned int current_head = head.load(std::memory_order_relaxed);
         unsigned int current_tail = tail.load(std::memory_order_acquire);
 
@@ -272,7 +285,7 @@ public:
             return;
         }
 
-        queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now()};
+        queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now(), source};
         head.store(current_head + 1, std::memory_order_release);
         if (auto* s = layer_stat(layer_idx)) s->hints_pushed.fetch_add(1, std::memory_order_relaxed);
     }
@@ -367,7 +380,7 @@ private:
                          hint.layer_idx, hint.expert_id, pickup_ms, backlog);
             }
 
-            active_prefetch(hint.layer_idx, hint.expert_id, my_ring);
+            active_prefetch(hint.layer_idx, hint.expert_id, my_ring, hint.source);
         }
     }
 
@@ -447,8 +460,10 @@ private:
     //
     // my_ring is the CALLING worker thread's own io_uring ring (see
     // worker_loop) -- never shared across threads.
-    void active_prefetch(int layer_idx, int expert_id, io_uring_backend::Ring& my_ring) {
+    void active_prefetch(int layer_idx, int expert_id, io_uring_backend::Ring& my_ring,
+                          PilotSource source = PilotSource::Other) {
         if (!engine || !ram_mgr) return;
+        bool is_depth2 = (source == PilotSource::Depth2);
 
         RamClaimResult result = ram_mgr->claim_or_wait(*engine, layer_idx, expert_id, RamClaimCaller::PrefetchWorker);
         if (result.status != RamClaimStatus::Claimed) {
@@ -456,6 +471,7 @@ private:
             // else (Loading, owned by the decode thread or another prefetch
             // worker) -- structurally cannot duplicate a fetch here.
             if (auto* s = layer_stat(layer_idx)) s->claims_beaten_by_decode.fetch_add(1, std::memory_order_relaxed);
+            if (is_depth2) perf().n_prefetch_claims_beaten_depth2.fetch_add(1, std::memory_order_relaxed);
             return;
         }
 
@@ -464,6 +480,7 @@ private:
 
         auto t0 = std::chrono::high_resolution_clock::now();
         perf().n_prefetch_issued.fetch_add(1, std::memory_order_relaxed);
+        if (is_depth2) perf().n_prefetch_issued_depth2.fetch_add(1, std::memory_order_relaxed);
         if (auto* s = layer_stat(layer_idx)) s->fetches_issued.fetch_add(1, std::memory_order_relaxed);
         n_fetches_in_flight.fetch_add(1, std::memory_order_relaxed);
         // Measurement only (expert_fetch_tracker.hpp) -- kept for the
@@ -496,6 +513,11 @@ private:
             perf().n_prefetch_completed.fetch_add(1, std::memory_order_relaxed);
             perf().bytes_prefetched.fetch_add(total, std::memory_order_relaxed);
             PerfCounters::atomic_add(perf().t_prefetch_read_ms_sum, dt_ms);
+            if (is_depth2) {
+                perf().n_prefetch_completed_depth2.fetch_add(1, std::memory_order_relaxed);
+                perf().bytes_prefetched_depth2.fetch_add(total, std::memory_order_relaxed);
+                PerfCounters::atomic_add(perf().t_prefetch_read_ms_sum_depth2, dt_ms);
+            }
             if (auto* s = layer_stat(layer_idx)) {
                 s->fetches_completed.fetch_add(1, std::memory_order_relaxed);
                 s->fetch_us_sum.fetch_add((uint64_t)(dt_ms * 1000.0), std::memory_order_relaxed);
@@ -523,6 +545,7 @@ private:
         }
 
         perf().n_prefetch_failed.fetch_add(1, std::memory_order_relaxed);
+        if (is_depth2) perf().n_prefetch_failed_depth2.fetch_add(1, std::memory_order_relaxed);
         if (auto* s = layer_stat(layer_idx)) s->fetches_failed.fetch_add(1, std::memory_order_relaxed);
         issue_fadvise_fallback(layer_idx, expert_id);
         // guard stays armed -- its destructor reverts the claim to Empty.

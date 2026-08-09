@@ -192,6 +192,21 @@ struct CPUConfig {
 
   // Tokenizer / chat template behavior.
   bool raw_prompt = false;
+  // Optional system-role message, prepended ahead of the user turn when a
+  // chat template is in use (see GGUFTokenizer::has_chat_template /
+  // has_deepseek_chat_template). Empty by default -- MoEStream never
+  // synthesizes a system prompt on its own, matching what the real
+  // DeepSeek-V4 jinja template produces when no "system" message is passed
+  // in (confirmed byte-for-byte against
+  // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real
+  // llama.cpp checkout: no system role -> ns.system_prompt stays "" ->
+  // {bos}<｜User｜>{msg}<｜Assistant｜></think>, exactly what this engine
+  // already sent). A base model with no language-steering instruction will
+  // happily answer an ambiguous/short English prompt in Chinese -- this is
+  // normal, well-documented behavior for DeepSeek/Qwen/GLM-family models,
+  // not evidence of a missing/broken template. Set this (or --system-prompt)
+  // to add one, e.g. "Respond in English unless asked otherwise."
+  std::string system_prompt;
   std::string log_level = "INFO";
   std::string log_path;
 
@@ -216,6 +231,7 @@ struct CPUConfig {
         doc.root.get_int("expert_fetch_threads", expert_fetch_threads);
     omp_max_threads = doc.root.get_int("omp_max_threads", omp_max_threads);
     raw_prompt = doc.root.get_bool("raw_prompt", raw_prompt);
+    system_prompt = doc.root.get_str("system_prompt", system_prompt);
     log_level = doc.root.get_str("log_level", log_level);
     log_path = doc.root.get_str("log_path", log_path);
 

@@ -58,6 +58,10 @@ void print_usage() {
               << "  --raw-prompt     Skip the chat-template wrap; tokenize stdin verbatim (needed by\n"
               << "                   api_server.py, which already applies its own formatting; also\n"
               << "                   useful for token-count-fair benchmarking against other engines)\n"
+              << "  --system-prompt <text>  Prepend a system-role message ahead of the user turn\n"
+              << "                   (chat-template modes only; ignored with --raw-prompt). Empty by\n"
+              << "                   default -- MoEStream never invents one on its own; e.g. use this\n"
+              << "                   to steer response language: --system-prompt \"Respond in English.\"\n"
               << "  --log-path <file>  Redirect logging to a file instead of stderr\n"
               << "  --log-level <lvl>  VERBOSE | DEBUG | INFO (default) | WARN | ERROR\n"
               << "  --help           Show this help interface\n";
@@ -228,6 +232,9 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // -- execution_layer.cpp's pilot loop reads pilot_k_for_layer() on
     // every layer transition starting with the very first prefill token.
     set_prefetch_pilot_k(config.prefetch_pilot_k_per_layer, config.prefetch_pilot_k);
+    // Same timing/reasoning as the pilot_k call directly above, for
+    // EngineConfig::prefetch_pilot_depth / prefetch_pilot_k_depth2.
+    set_prefetch_pilot_depth(config.prefetch_pilot_depth, config.prefetch_pilot_k_depth2);
 
     // unpacked_expert_format is an explicit performance contract (single
     // combined DMA per expert) -- validate it holds for the WHOLE model
@@ -835,44 +842,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             LOG_STREAM_INFO() << "[PIN] No usage file at " << config.pin_file
                       << " yet (first run) -- VRAM/RAM caches will fill reactively.\n";
         } else {
-            // .moestream_usage has no model-identity tag and accumulates
-            // forever (dump_usage_histogram merges with whatever's already
-            // on disk) -- a layer index is only meaningful relative to
-            // WHICHEVER model/config wrote it. leading_dense_block_count
-            // (first_dense) differs per architecture (3 for this GLM-5.2
-            // build, 0 for others), so an entry recorded against a
-            // different model/config (or an older build) can reference a
-            // layer that's dense-only (no MoE tensors at all) in the model
-            // actually loaded right now. Found via a real run: 648 stale
-            // entries for layer<3 in this exact file, several with counts
-            // (542, 512) high enough to win a global_topn pin slot every
-            // single run -- load_expert_slab then silently fails to find
-            // any "blk.<L>.ffn_gate_exps.weight"/per-expert tensor for a
-            // dense layer, which is the ENTIRE explanation for the
-            // "[PIN] Preload attrition" disk-read-failure counters staying
-            // at a fixed ~30 across separate runs regardless of host RAM/
-            // VRAM tuning -- not a disk or allocation problem, see
-            // CLAUDE.md. Filtering here (not in load_usage(), which is a
-            // static helper with no model context) also fixes the
-            // downstream moe_layers = by_layer.size() count used for
-            // avg_vram_slots_per_layer/pin floor math a few lines below,
-            // which was silently counting these fake layers too.
-            const auto& arch_cfg = engine.model_file.architecture_config;
-            int n_layers_cfg = arch_cfg.n_layers;
-            int first_dense = arch_cfg.first_dense;
-            size_t stale_dropped = 0;
             std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> by_layer;
-            for (auto& e : entries) {
-                if (e.layer < first_dense || e.layer >= n_layers_cfg) { ++stale_dropped; continue; }
-                by_layer[e.layer].push_back(e);
-            }
-            if (stale_dropped > 0) {
-                LOG_STREAM_WARN() << "[PIN] " << config.pin_file << ": dropped " << stale_dropped
-                          << " stale entrie(s) referencing layer<" << first_dense << " or >="
-                          << n_layers_cfg << " (dense-only or out-of-range for the CURRENTLY loaded "
-                             "model -- likely left over from a different model/config sharing this "
-                             "usage file).\n";
-            }
+            for (auto& e : entries) by_layer[e.layer].push_back(e);
             for (auto& [layer, v] : by_layer) {
                 std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
             }
@@ -896,16 +867,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                                  "ranking for this run.\n";
                 } else {
                     std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> pf_by_layer;
-                    size_t pf_stale_dropped = 0;
-                    for (auto& e : pf_entries) {
-                        if (e.layer < first_dense || e.layer >= n_layers_cfg) { ++pf_stale_dropped; continue; }
-                        pf_by_layer[e.layer].push_back(e);
-                    }
-                    if (pf_stale_dropped > 0) {
-                        LOG_STREAM_WARN() << "[PIN] " << config.prefill_pin_file << ": dropped " << pf_stale_dropped
-                                  << " stale entrie(s) referencing layer<" << first_dense << " or >="
-                                  << n_layers_cfg << " (same cause as the pin_file warning above).\n";
-                    }
+                    for (auto& e : pf_entries) pf_by_layer[e.layer].push_back(e);
                     for (auto& [layer, v] : pf_by_layer) {
                         std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
                         by_layer[layer] = std::move(v);  // override this layer only
@@ -1014,17 +976,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // topk sizing uses: avg_vram_slots_per_layer * moe_layers) --
                 // NOT "take everything remaining", which could try to pin every
                 // expert ever routed to and blow far past physical VRAM capacity.
-                // Also clamp an EXPLICITLY-set pinned_vram_capacity to the real
-                // pool size (expert_vram_cache_cap) -- a config value larger
-                // than the physical pool (e.g. raised in step with an unrelated
-                // host_ram_gb bump, which this value has nothing to do with)
-                // previously caused the preload to pin nearly the ENTIRE cache,
-                // leaving evict_lru with no victim during generation. See
-                // CLAUDE.md / glm52_3090_5060_sdd2.toml's pinned_vram_capacity
-                // history for the real-hardware incident this guards against.
-                int real_pool_size = (int)ram_mgr.vram_cache->expert_vram_cache_cap;
                 int effective_cap = (max_pinned_total > 0)
-                    ? std::min(max_pinned_total, real_pool_size)
+                    ? max_pinned_total
                     : (int)(avg_vram_slots_per_layer * moe_layers);
                 int remaining_budget = std::max(0, effective_cap - floor_total);
                 int take = std::min((int)remainder.size(), remaining_budget);
@@ -1032,13 +985,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 LOG_STREAM_INFO() << "[PIN] global_topn: floor " << floor_n << "/layer (" << floor_total
                           << " total) + " << take << " globally-ranked -> " << (floor_total + take)
                           << "/" << effective_cap
-                          << (max_pinned_total <= 0
-                                  ? " (pinned_vram_capacity unset -- capped to real VRAM pool size instead)"
-                              : max_pinned_total > real_pool_size
-                                  ? " (pinned_vram_capacity " + std::to_string(max_pinned_total)
-                                    + " exceeded real pool size " + std::to_string(real_pool_size)
-                                    + " -- clamped)"
-                                  : "")
+                          << (max_pinned_total > 0 ? "" : " (pinned_vram_capacity unset -- capped to real VRAM pool size instead)")
                           << " target pins across " << moe_layers << " layer(s)\n";
             }
 
@@ -1314,14 +1261,52 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             // isn't verified against this).
             if (tokenizer.gmask_id >= 0) prompt_tokens.push_back(tokenizer.gmask_id);
             if (tokenizer.sop_id >= 0) prompt_tokens.push_back(tokenizer.sop_id);
+            // Real GLM-4 template renders EVERY message (including "system")
+            // as <|{role}|>\n{content} in turn order, ahead of the user
+            // turn -- see llama.cpp's LLM_CHAT_TEMPLATE_CHATGLM_4. There's
+            // no reserved single-token id for "<|system|>" the way
+            // user_id/assistant_id have, so it's sent as literal text.
+            if (!config.system_prompt.empty()) {
+                std::vector<int> sys = tokenizer.encode("<|system|>\n" + config.system_prompt);
+                prompt_tokens.insert(prompt_tokens.end(), sys.begin(), sys.end());
+            }
             prompt_tokens.push_back(tokenizer.user_id);
             std::vector<int> body = tokenizer.encode("\n" + user_input);
             prompt_tokens.insert(prompt_tokens.end(), body.begin(), body.end());
             prompt_tokens.push_back(tokenizer.assistant_id);
             std::vector<int> tail = tokenizer.encode("\n");
             prompt_tokens.insert(prompt_tokens.end(), tail.begin(), tail.end());
+        } else if (!config.raw_prompt && tokenizer.has_deepseek_chat_template()) {
+            // DeepSeek-V3/V4-style: {bos}<｜User｜>{msg}<｜Assistant｜></think>
+            // (see GGUFTokenizer::ds_user_id for the reference source --
+            // this is what fixed confidently-wrong, off-topic decode output
+            // for a plain unwrapped prompt on DeepSeek-V4-Flash). No literal
+            // "\n" padding around the tags, unlike the GLM branch above --
+            // the real jinja template concatenates directly.
+            if (tokenizer.add_bos_token)
+                prompt_tokens.push_back(tokenizer.bos_token_id);
+            // Matches the real jinja template exactly: system-role content
+            // is concatenated as raw text directly after {bos_token} and
+            // before <｜User｜>, with no wrapping tag at all (see
+            // ns.system_prompt / {{- ns.system_prompt -}} in
+            // models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja).
+            if (!config.system_prompt.empty()) {
+                std::vector<int> sys = tokenizer.encode(config.system_prompt);
+                prompt_tokens.insert(prompt_tokens.end(), sys.begin(), sys.end());
+            }
+            prompt_tokens.push_back(tokenizer.ds_user_id);
+            std::vector<int> body = tokenizer.encode(user_input);
+            prompt_tokens.insert(prompt_tokens.end(), body.begin(), body.end());
+            prompt_tokens.push_back(tokenizer.ds_assistant_id);
+            if (tokenizer.ds_think_end_id >= 0)
+                prompt_tokens.push_back(tokenizer.ds_think_end_id);
         } else {
-            prompt_tokens.push_back(tokenizer.bos_token_id);
+            // Respect tokenizer.ggml.add_bos_token -- see
+            // GGUFTokenizer::add_bos_token for why unconditionally pushing
+            // BOS here is a real, confirmed bug for models (e.g.
+            // Qwen3.6-35B-A3B) whose GGUF sets this to False.
+            if (tokenizer.add_bos_token)
+                prompt_tokens.push_back(tokenizer.bos_token_id);
             std::vector<int> encoded = tokenizer.encode(user_input);
             prompt_tokens.insert(prompt_tokens.end(), encoded.begin(), encoded.end());
         }
@@ -1396,6 +1381,7 @@ int main(int argc, char* argv[]) {
     bool ngen_cli_given = false;
     bool verbose_moe = false;
     bool raw_prompt_cli = false;
+    std::string system_prompt_cli;
     std::string log_path_cli;
     std::string log_level_cli;
     float temp_cli = -1.0f, top_p_cli = -1.0f;  // -1 sentinel = "not given" (0.0 is a valid greedy-decode value)
@@ -1416,6 +1402,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--io-uring") io_uring_cli = true;
         else if (arg == "--verbose-moe") verbose_moe = true;
         else if (arg == "--raw-prompt") raw_prompt_cli = true;
+        else if (arg == "--system-prompt" && i + 1 < argc) system_prompt_cli = argv[++i];
         else if (arg == "--promote-threshold" && i + 1 < argc) promote_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-threshold" && i + 1 < argc) pin_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-file" && i + 1 < argc) pin_file_cli = argv[++i];
@@ -1468,6 +1455,7 @@ int main(int argc, char* argv[]) {
     if (ram_budget_gb > 0) config.host_ram_gb = ram_budget_gb;
     if (verbose_moe) config.verbose_moe_log = true;
     if (raw_prompt_cli) config.raw_prompt = true;
+    if (!system_prompt_cli.empty()) config.system_prompt = system_prompt_cli;
     if (drop_pages) config.drop_pages = true;
     if (direct_io_cli) config.direct_io = true;
     if (io_uring_cli) config.io_uring = true;

@@ -42,15 +42,27 @@ extern "C" {
     const void* ms_grid_kmask_iq2xs();
 }
 
-static bool iq2_grids_ready = false;
+// __constant__ memory is per-device: cudaMemcpyToSymbol only ever populates
+// the CURRENTLY-ACTIVE device's copy. A single process-wide bool here would
+// let the first GPU touched in a run latch this true globally, silently
+// skipping initialization (all-zero grid/sign/mask tables, all-zero
+// dequantized weights) for every OTHER GPU in a multi-GPU config -- this
+// was a real, confirmed bug (see CLAUDE.md's [SILU-TRACE-GPU] investigation).
+// Tracked per-device instead; MAX_CUDA_DEVICES is a generous static bound
+// (no dynamic allocation needed for any realistic consumer multi-GPU setup).
+#define MAX_CUDA_DEVICES 16
+static bool iq2_grids_ready[MAX_CUDA_DEVICES] = {false};
 static void init_iq2_grids() {
-    if (iq2_grids_ready) return;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= MAX_CUDA_DEVICES) dev = 0;
+    if (iq2_grids_ready[dev]) return;
     cudaMemcpyToSymbol(c_iq2xxs_grid,    ms_grid_iq2xxs(),       256 * sizeof(uint64_t));
     cudaMemcpyToSymbol(c_iq2xs_grid,     ms_grid_iq2xs(),        512 * sizeof(uint64_t));
     cudaMemcpyToSymbol(c_iq2s_grid,      ms_grid_iq2s(),        1024 * sizeof(uint64_t));
     cudaMemcpyToSymbol(c_ksigns_iq2xs,   ms_grid_ksigns_iq2xs(), 128);
     cudaMemcpyToSymbol(c_kmask_iq2xs,    ms_grid_kmask_iq2xs(),    8);
-    iq2_grids_ready = true;
+    iq2_grids_ready[dev] = true;
 }
 
 __device__ __forceinline__ float hf_to_f(const void* p) {

@@ -7,15 +7,20 @@
 // -- no engine/CUDA/AVX-512 headers -- so it compiles in the plain CPU test
 // harness on any platform.
 //
-// UNVERIFIED ON REAL HARDWARE, and more tentative than most of this
-// project's "unverified" work: the exact Sinkhorn procedure and mixing-
-// coefficient layout below are a best-effort reconstruction from reading
-// llama.cpp's deepseek4.cpp (build_hc_pre/build_hc_sinkhorn/build_hc_post),
-// not a byte-exact transcription with that source held side-by-side during
-// implementation. Treat every formula/layout choice here as a hypothesis to
-// confirm against real DeepSeek-V4 output, not an established fact the way
-// e.g. rope.hpp's interleaved-vs-NeoX convention already was (that one WAS
-// confirmed against llama.cpp source directly, twice, per its own comment).
+// UPDATE 2026-08-08: held directly side-by-side against llama.cpp's real
+// deepseek4.cpp (build_hc_pre/build_hc_sinkhorn/build_hc_post/build_hc_head,
+// commit 1269cb1 as of that checkout) after a real-hardware run confirmed a
+// separate multi-GPU __constant__-memory bug's fix did NOT resolve
+// DeepSeek-V4-Flash's garbled output -- meaning a second, independent bug
+// was still active, and this file's own "more tentative than most of this
+// project's unverified work" self-assessment made it the top suspect. Found
+// and fixed two real discrepancies from that comparison (see
+// sinkhorn_normalize_comb's own comment for the Sinkhorn one); the mixing-
+// coefficient layout (pre-gate/post-gate/comb order in mix_dim) and the
+// pre-collapse/post-combine formulas below WERE confirmed correct as
+// originally reconstructed. STILL UNVERIFIED ON REAL HARDWARE (no rebuild/
+// rerun yet since this fix) -- source-comparison-confirmed, not yet
+// hardware-confirmed.
 //
 // Reference (per the research this was built from): DeepSeek-V4's
 // "Hyper-Connections" (https://arxiv.org/pdf/2512.24880) replace the
@@ -23,17 +28,25 @@
 // sub-block (attention and FFN each get their own call):
 //   1. RMS-norm the flattened [hc_mult*D] multi-stream vector (per token).
 //   2. ONE matmul (hc_{attn,ffn}_fn weight, shape {hc_mult*D, hc_mix_dim}
-//      where hc_mix_dim = (2+hc_mult)*hc_mult) + bias (hc_{attn,ffn}_base)
-//      produces ALL mixing coefficients in one shot: pre-gate (hc_mult
-//      values), post-gate (hc_mult values), comb matrix (hc_mult*hc_mult
-//      values), laid out in that order in the mix_dim output.
-//   3. pre-gate -> sigmoid; used to collapse the hc_mult streams into ONE
-//      input vector for the sub-block via a weighted sum.
-//   4. post-gate -> sigmoid*2; used after the sub-block runs, to scale how
-//      much of ITS output writes back into each stream.
-//   5. comb -> Sinkhorn-normalized (this header's sinkhorn_normalize_comb):
-//      initial softmax over the dst axis + eps, then hc_sinkhorn_iters
-//      rounds of alternating column-then-row normalization.
+//      where hc_mix_dim = (2+hc_mult)*hc_mult) + a learned per-coordinate
+//      affine (hc_{attn,ffn}_scale, hc_{attn,ffn}_base -- CONFIRMED present
+//      in the real tensor list, applied to each of the 3 groups below
+//      BEFORE their activation) produces ALL mixing coefficients in one
+//      shot: pre-gate (hc_mult values), post-gate (hc_mult values), comb
+//      matrix (hc_mult*hc_mult values), laid out in that order.
+//   3. pre-gate -> affine -> sigmoid -> +eps (CONFIRMED: real code adds eps
+//      AFTER sigmoid here, via ggml_scale_bias); used to collapse the
+//      hc_mult streams into ONE input vector for the sub-block via a
+//      weighted sum.
+//   4. post-gate -> affine -> sigmoid*2 (no +eps here, confirmed -- only
+//      pre-gate and the final head/output-collapse gate get it); used after
+//      the sub-block runs, to scale how much of ITS output writes back into
+//      each stream.
+//   5. comb -> affine -> Sinkhorn-normalized (this header's
+//      sinkhorn_normalize_comb): softmax over the dst axis + eps, then ONE
+//      unconditional row-normalize, then hc_sinkhorn_iters-1 rounds of
+//      column-then-row normalization (see that function's own comment --
+//      this exact structure was the discrepancy found+fixed 2026-08-08).
 //   6. new_stream[dst] = sub_block_out * post_gate[dst]
 //                       + sum_src comb[dst][src] * old_stream[src]
 #pragma once
@@ -45,21 +58,32 @@ inline float hc_sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 // Sinkhorn-normalizes an hc x hc matrix IN PLACE, row-major
 // (comb[dst*hc + src]).
 //
-// Step 1 (interpretation of "initial softmax over dst, +eps"): for each
-// FIXED src (column), softmax the hc dst-values in that column, then add a
-// small additive eps to every entry (smoothing so no entry is ever exactly
-// zero going into the iterative normalization below -- avoids a 0/0 on a
-// degenerate all-zero row/column during Step 2).
+// CONFIRMED against llama.cpp's real deepseek4.cpp (build_hc_sinkhorn),
+// 2026-08-08 -- this superseded an earlier reconstruction that ran `iters`
+// full column+row rounds with no unconditional leading step; the real
+// sequence is: softmax+eps, then exactly ONE unconditional "row" round
+// (their norm_cols(), which sums over src for each dst -- our naming calls
+// this normalize_rows, see below), THEN `iters-1` rounds of column-then-row.
+// With small iters (2-3, typical) the old version produced a measurably
+// different, non-converged doubly-stochastic matrix -- and this matrix
+// directly weights the residual-stream mixing on every single layer, so the
+// error compounded layer-over-layer. This is suspected as a real
+// contributor to the still-unresolved DeepSeek-V4-Flash garbled-output bug.
 //
-// Step 2: `iters` rounds of alternating column-normalize (each column of hc
-// dst-values divided by its own sum, so every column sums to 1) then row-
-// normalize (each row of hc src-values divided by its own sum, so every row
-// sums to 1) -- the standard Sinkhorn-Knopp iteration toward a doubly-
-// stochastic matrix. iters==0 leaves the matrix as the raw (softmax+eps)
-// result from Step 1, not further normalized -- matches
-// ArchitectureConfig::hc_sinkhorn_iters defaulting to 0 (feature off) for
-// every non-DeepSeek-V4 file, though this whole function is only ever
-// called when hc_mult>1 in the first place.
+// Step 1: for each FIXED src (column), softmax the hc dst-values in that
+// column (matches ggml_soft_max operating over the dst axis), then add a
+// small additive eps to every entry (matches deepseek4.cpp's
+// `ggml_add(comb, eps)` immediately after the softmax).
+//
+// Step 2 naming note: llama.cpp's own "norm_cols"/"norm_rows" names refer to
+// ggml's [dst,src,nt] axis layout and read backwards relative to the
+// row-major dst*hc+src indexing used here -- to avoid propagating that
+// confusion, this file names each helper by WHAT it makes true instead:
+// normalize_rows() makes each dst's row (fixed dst, varying src) sum to 1;
+// normalize_columns() makes each src's column (fixed src, varying dst) sum
+// to 1. The real call sequence, translated: normalize_rows() once
+// (unconditional, runs even if iters==0 or 1), then `iters-1` rounds of
+// (normalize_columns(), normalize_rows()).
 //
 // Testable property (tests/test_components.cpp): after Step 2, every row
 // AND every column sums to ~1 (the defining property of a doubly-stochastic
@@ -84,21 +108,29 @@ inline void sinkhorn_normalize_comb(float* comb, int hc, int iters, float eps) {
             comb[dst * hc + src] = comb[dst * hc + src] * inv + eps;
     }
 
-    // Step 2: alternating column/row normalization.
-    for (int it = 0; it < iters; ++it) {
-        // Normalize columns: for each src, sum over dst == 1.
-        for (int src = 0; src < hc; ++src) {
-            float sum = 0.0f;
-            for (int dst = 0; dst < hc; ++dst) sum += comb[dst * hc + src];
-            float inv = 1.0f / std::max(1e-12f, sum);
-            for (int dst = 0; dst < hc; ++dst) comb[dst * hc + src] *= inv;
-        }
-        // Normalize rows: for each dst, sum over src == 1.
+    // Step 2: one unconditional row-normalize, then (iters-1) rounds of
+    // column-then-row -- matches deepseek4.cpp's build_hc_sinkhorn exactly
+    // (its norm_cols() once, then `for i=1;i<iters` of norm_rows()+norm_cols()).
+    auto normalize_rows = [&]() {
         for (int dst = 0; dst < hc; ++dst) {
             float sum = 0.0f;
             for (int src = 0; src < hc; ++src) sum += comb[dst * hc + src];
-            float inv = 1.0f / std::max(1e-12f, sum);
+            float inv = 1.0f / (sum + eps);
             for (int src = 0; src < hc; ++src) comb[dst * hc + src] *= inv;
         }
+    };
+    auto normalize_columns = [&]() {
+        for (int src = 0; src < hc; ++src) {
+            float sum = 0.0f;
+            for (int dst = 0; dst < hc; ++dst) sum += comb[dst * hc + src];
+            float inv = 1.0f / (sum + eps);
+            for (int dst = 0; dst < hc; ++dst) comb[dst * hc + src] *= inv;
+        }
+    };
+
+    normalize_rows();
+    for (int it = 1; it < iters; ++it) {
+        normalize_columns();
+        normalize_rows();
     }
 }

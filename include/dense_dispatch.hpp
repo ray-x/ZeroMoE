@@ -97,6 +97,37 @@ inline int pilot_k_for_layer(int layer_idx) {
     return pilot_k_default_value();
 }
 
+// Same set-once-at-startup / read-everywhere idiom as pilot_k_for_layer
+// above, for EngineConfig::prefetch_pilot_depth / prefetch_pilot_k_depth2
+// (set_prefetch_pilot_depth, main.cpp; read from execution_layer.cpp's
+// pilot loop). No per-layer override for depth-2's k yet (unlike l+1's
+// pilot_k_per_layer_overrides) -- pilot_k2_for_layer keeps the same
+// per-layer function SHAPE anyway, so one can be added later without
+// changing every call site, mirroring pilot_k_for_layer's own signature.
+inline int& pilot_depth_value() {
+    static int v = 1;
+    return v;
+}
+inline int& pilot_k2_default_value() {
+    static int v = 8;
+    return v;
+}
+inline void set_prefetch_pilot_depth(int depth, int k2_default) {
+    pilot_depth_value() = depth;
+    pilot_k2_default_value() = k2_default;
+}
+// Whether the pilot should predict+push real depth-2 (l+2) hints, as
+// opposed to depth-2 measurement continuing to run for free either way
+// (see execution_layer.cpp's pilot loop -- the recall counters are always
+// live regardless of this).
+inline bool prefetch_pilot_depth2_enabled() {
+    return pilot_depth_value() == 2;
+}
+inline int pilot_k2_for_layer(int layer_idx) {
+    (void)layer_idx;  // no per-layer override yet -- see this block's own comment
+    return pilot_k2_default_value();
+}
+
 inline void dense_proj(StreamingEngine& engine, const std::string& wname,
                        const float* x, float* y, int S, int I, int O) {
     auto it = engine.resident_layers.find(wname);

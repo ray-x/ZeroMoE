@@ -98,13 +98,50 @@ SDOT for the f32 and integer-dot-product paths.  For optimized quantized
 cmake -S . -B build -DMOESTREAM_USE_GGML=ON -DMOESTREAM_GGML_TAG=b3923
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
-2. Interactive Terminal Generation
-Launch the standalone engine directly by passing the destination to your local GGUF model along with your system memory allocation caps:
+
+### Interactive Terminal Generation
+
+Launch the standalone engine directly by pointing it at your local GGUF model, either via a TOML config (preferred) or legacy CLI flags:
 
 ```bash
-./build/moestream --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx 4096 3. Deploying the Anthropic-Compatible API
-MoeStream includes a production-grade FastAPI wrapper that maps external HTTP network streams straight into your local executable's stdin/stdout pipe channels. It matches the native Anthropic /v1/messages format scheme, serving Server-Sent Events (SSE) token chunks asynchronously.
+./build/moestream --config configs/single_gpu.toml
+# or, legacy CLI flags:
+./build/moestream --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx 4096
 ```
+
+#### Command-Line Arguments
+
+| Flag | Description |
+| --- | --- |
+| `--config <file>` | Load engine config from a TOML file (preferred over legacy CLI flags). |
+| `--gen-config [output.toml]` | Generate a sample config file (default `moestream_config.toml`) and exit. |
+| `--model <path>` | Path to a GGUF model file or directory (legacy CLI mode, used without `--config`). |
+| `--ram <GB>` | Strict RAM budget in GB (default: auto-detect 88% of free system memory). |
+| `--ctx <N>` | Maximum context size / token window (default: 4096). |
+| `--ngen <N>` | Maximum new tokens to generate per response (default: 1024). |
+| `--temp <F>` | Sampling temperature; `0.0` for greedy decode (default: 0.7). |
+| `--top_p <F>` | Nucleus sampling top-p threshold (default: 0.90). |
+| `--gpu <ID>` | CUDA device ID for single-GPU mode (default: 0). |
+| `--drop-pages` | Drop expert pages from the OS page cache after use. |
+| `--direct-io` | `O_DIRECT` expert-slab reads (Linux only; requires a model repacked with `tools/gguf_tool pack`). Falls back to buffered reads automatically if unsupported/unaligned. (`unpacked_expert_format` and `cuda_cufile` are TOML-config-only — see `--config`.) |
+| `--io-uring` | Batch the async prefetcher's per-expert reads through `io_uring` (Linux only, kernel ≥ 5.6; independent of `--direct-io`). Falls back to sequential `pread`s automatically if unsupported. |
+| `--prefetch-threads <N>` | Concurrent async prefetcher worker threads (default: 2). |
+| `--verbose-moe` | Log every MoE host-cache hit (high volume, debug only). |
+| `--promote-threshold <N>` | Number of host re-hits before an async host→device (H2D) promote (default: 1). |
+| `--pin-threshold <N>` | VRAM-resident hit-count before permanently pinning an expert (never evicted; default: 8, `0` = off). |
+| `--pin-file <file>` | Usage-frequency file for VRAM hot-set preload at startup (default: `.moestream_usage`). |
+| `--expert-fetch-threads <N>` | OMP threads for parallel disk reads of a layer's top-k cache misses (default: 4). |
+| `--raw-prompt` | Skip the chat-template wrap; tokenize stdin verbatim. Needed by `api_server.py` (which already applies its own formatting) and useful for token-count-fair benchmarking against other engines. |
+| `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — MoEStream never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
+| `--log-path <file>` | Redirect logging to a file instead of stderr. |
+| `--log-level <lvl>` | `VERBOSE` \| `DEBUG` \| `INFO` (default) \| `WARN` \| `ERROR`. |
+| `--help`, `-h` | Show the CLI help interface. |
+
+> Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `cuda_cufile`, `pin_strategy`) that have no CLI-flag equivalent.
+
+### Deploying the Anthropic-Compatible API
+
+MoeStream includes a production-grade FastAPI wrapper that maps external HTTP network streams straight into your local executable's stdin/stdout pipe channels. It matches the native Anthropic `/v1/messages` format scheme, serving Server-Sent Events (SSE) token chunks asynchronously.
 
 To spin up the network gateway, activate your virtual workspace environment and run the application server:
 

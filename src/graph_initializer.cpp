@@ -528,6 +528,79 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   // below now read instead of the old scattered is_mla-bool checks. See
   // family_ops.hpp for the full rationale.
   ModelFamily fam = detect_model_family(file);
+
+  // ---------- DeepSeek-V4 (Hyper-Connections, grouped output projection,
+  // attention sinks, SWA) ---------- Phase 1 only (correctness within each
+  // layer's local sliding window) -- see CLAUDE.md's DeepSeek-V4 plan
+  // writeup. Every field defaults to "feature inactive" (ArchitectureConfig's
+  // own defaults), so this block is a strict no-op for every other family --
+  // populated unconditionally (not gated on `fam == DeepSeek_V4`) for the
+  // same reason every other hparam above is: a non-DeepSeek-V4 file simply
+  // won't have these GGUF keys, and get_config_int/float/array all already
+  // default to "inactive" when a key is absent.
+  //
+  // MOVED HERE 2026-08-09 (was originally right after the YaRN block,
+  // several dozen lines below `resolve_family_ops`): c.hc_mult MUST be
+  // populated from the real GGUF value BEFORE resolve_family_ops(fam, c)
+  // runs, since that call reads c.hc_mult to decide whether to wire
+  // hc_pre_fn/hc_post_fn to the real hc_pre_collapse/hc_post_combine or
+  // leave them at the shared hc_pre_noop/hc_post_plain_add default
+  // (family_ops.hpp). With the old ordering, resolve_family_ops always saw
+  // ArchitectureConfig's default-constructed c.hc_mult (0, not >1) --
+  // meaning DeepSeek-V4's per-layer Hyper-Connections hooks NEVER actually
+  // ran, for every load, silently. hc_expand_embedding/hc_collapse_output
+  // (generation_loop.hpp) re-read c.hc_mult fresh at generation time (long
+  // after this function returns) so THEY correctly saw hc_mult=4 and ran --
+  // meaning hc_stream_buf got expanded from the embedding at the start of
+  // every forward pass and then collapsed back at the end, but was NEVER
+  // updated by any layer in between (hc_post_plain_add just does
+  // hidden_states += sub_block_out directly, never touching hc_stream_buf).
+  // The result: hc_collapse_output's final hidden_states was a gated blend
+  // of the STALE, untouched-since-embedding hc_stream_buf, discarding the
+  // entire 78-layer transformer computation that had (correctly, via plain
+  // residual add) been accumulating in hidden_states the whole time. This
+  // silently replaces the real forward-pass output with something close to
+  // a gated function of the raw token embedding -- a very plausible
+  // explanation for coherent-looking-per-token-but-context-blind "word
+  // salad" output, and identical on CPU and GPU dispatch (this is a
+  // config-resolution/control-flow bug, not a kernel bug). Found by adding
+  // real [HC-TRACE] telemetry to hyper_connections.cpp and observing ZERO
+  // per-layer hc_pre_collapse/hc_post_combine trace lines in a real VERBOSE
+  // capture despite the hooks being unconditionally called every layer in
+  // execution_layer.cpp -- traced back to this ordering bug by inspection,
+  // not yet re-verified on hardware after this fix.
+  {
+    c.hc_mult = file.get_config_int("hyper_connection.count", 1);
+    c.hc_sinkhorn_iters =
+        file.get_config_int("hyper_connection.sinkhorn_iterations", 0);
+    c.hc_eps = file.get_config_float("hyper_connection.epsilon", 1e-6f);
+    c.o_group_count = file.get_config_int("attention.output_group_count", 0);
+    c.o_lora_rank = file.get_config_int("attention.output_lora_rank", 0);
+    c.hash_layer_count = file.get_config_int("hash_layer_count", 0);
+    c.sliding_window = file.get_config_int("attention.sliding_window", 0);
+    // Per-layer arrays (read_kv_array/get_config_float_array, gguf_loader.
+    // hpp) -- empty vector (not a size-n_layers vector of the scalar
+    // default) when the file doesn't set them; FFN call sites (Project B's
+    // SwiGLU-clamp step) check .empty() rather than assuming a specific
+    // size, so a file that sets these for fewer than n_layers layers fails
+    // safe (out-of-range layers just don't get clamped) rather than
+    // out-of-bounds reading.
+    c.swiglu_clamp_exp = file.get_config_float_array("swiglu_clamp_exp");
+    c.swiglu_clamp_shexp = file.get_config_float_array("swiglu_clamp_shexp");
+    if (fam == ModelFamily::DeepSeek_V4) {
+      LOG_STREAM_INFO() << "[DSV4] hc_mult=" << c.hc_mult
+                        << " hc_sinkhorn_iters=" << c.hc_sinkhorn_iters
+                        << " hc_eps=" << c.hc_eps
+                        << " o_group_count=" << c.o_group_count
+                        << " o_lora_rank=" << c.o_lora_rank
+                        << " hash_layer_count=" << c.hash_layer_count
+                        << " sliding_window=" << c.sliding_window
+                        << " swiglu_clamp_exp.size()=" << c.swiglu_clamp_exp.size()
+                        << " swiglu_clamp_shexp.size()=" << c.swiglu_clamp_shexp.size()
+                        << "\n";
+    }
+  }
+
   engine.family_ops = resolve_family_ops(fam, c);
   c.cache_shape = engine.family_ops.cache_shape;
 
@@ -609,47 +682,10 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
                          "nonzero means the YaRN branch is live.\n";
   }
 
-  // ---------- DeepSeek-V4 (Hyper-Connections, grouped output projection,
-  // attention sinks, SWA) ---------- Phase 1 only (correctness within each
-  // layer's local sliding window) -- see CLAUDE.md's DeepSeek-V4 plan
-  // writeup. Every field defaults to "feature inactive"
-  // (ArchitectureConfig's own defaults), so this block is a strict no-op
-  // for every other family -- populated unconditionally (not gated on
-  // `fam == DeepSeek_V4`) for the same reason every other hparam above is:
-  // a non-DeepSeek-V4 file simply won't have these GGUF keys, and
-  // get_config_int/float/array all already default to "inactive" when a
-  // key is absent.
-  {
-    c.hc_mult = file.get_config_int("hyper_connection.count", 1);
-    c.hc_sinkhorn_iters =
-        file.get_config_int("hyper_connection.sinkhorn_iterations", 0);
-    c.hc_eps = file.get_config_float("hyper_connection.epsilon", 1e-6f);
-    c.o_group_count = file.get_config_int("attention.output_group_count", 0);
-    c.o_lora_rank = file.get_config_int("attention.output_lora_rank", 0);
-    c.hash_layer_count = file.get_config_int("hash_layer_count", 0);
-    c.sliding_window = file.get_config_int("attention.sliding_window", 0);
-    // Per-layer arrays (read_kv_array/get_config_float_array, gguf_loader.
-    // hpp) -- empty vector (not a size-n_layers vector of the scalar
-    // default) when the file doesn't set them; FFN call sites (Project B's
-    // SwiGLU-clamp step) check .empty() rather than assuming a specific
-    // size, so a file that sets these for fewer than n_layers layers fails
-    // safe (out-of-range layers just don't get clamped) rather than
-    // out-of-bounds reading.
-    c.swiglu_clamp_exp = file.get_config_float_array("swiglu_clamp_exp");
-    c.swiglu_clamp_shexp = file.get_config_float_array("swiglu_clamp_shexp");
-    if (fam == ModelFamily::DeepSeek_V4) {
-      LOG_STREAM_INFO() << "[DSV4] hc_mult=" << c.hc_mult
-                        << " hc_sinkhorn_iters=" << c.hc_sinkhorn_iters
-                        << " hc_eps=" << c.hc_eps
-                        << " o_group_count=" << c.o_group_count
-                        << " o_lora_rank=" << c.o_lora_rank
-                        << " hash_layer_count=" << c.hash_layer_count
-                        << " sliding_window=" << c.sliding_window
-                        << " swiglu_clamp_exp.size()=" << c.swiglu_clamp_exp.size()
-                        << " swiglu_clamp_shexp.size()=" << c.swiglu_clamp_shexp.size()
-                        << "\n";
-    }
-  }
+  // (DeepSeek-V4 Hyper-Connections/SWA/grouped-output-projection hparam
+  // block MOVED above, right after `ModelFamily fam = detect_model_family`
+  // and before `resolve_family_ops(fam, c)` -- see the comment there for
+  // why the original position here was a real ordering bug.)
 
   // Fallback: detect from tensor shapes if KV didn't provide values
   if (c.hidden == 0 || c.n_layers == 0) {

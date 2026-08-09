@@ -114,6 +114,11 @@ void dequantize_row_q3_K_avx512(const uint8_t *block, float *y, int64_t k);
 // uint16 (66B/block); IQ3_XXS = d(2) + qs[96] (98B/block).
 void dequantize_row_iq2_xxs_avx512(const uint8_t *block, float *y, int64_t k);
 void dequantize_row_iq3_xxs_avx512(const uint8_t *block, float *y, int64_t k);
+// IQ2_XS: verbatim port of cuda/iq2_matmul.cu's dequant_iq2_xs_coop. `block`
+// layout: d(2) + qs[32] uint16 (64B) + scales[8] = 74B/block (2.3125
+// bits/weight). Grid/sign index both come from one qs[] entry per l (& 511,
+// >> 9) -- simpler than IQ2_S below, no separate qh array.
+void dequantize_row_iq2_xs_avx512(const uint8_t *block, float *y, int64_t k);
 // IQ2_S: verbatim port of cuda/iq2_matmul.cu's dequant_iq2_s_block. `block`
 // layout: d(2) + qs[64] + qh[8] + scales[8] = 82B/block (2.5625 bits/weight).
 void dequantize_row_iq2_s_avx512(const uint8_t *block, float *y, int64_t k);

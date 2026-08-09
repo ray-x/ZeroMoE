@@ -39,7 +39,16 @@ namespace {
 // attention_layer.cpp's check_finite_attn -- same per-translation-unit
 // local-helper pattern already established in both of those files rather
 // than a shared header (this project's own convention).
-static bool check_finite_hc(const char* label, int layer_idx, const float* data, size_t n) {
+// row_width mirrors attention_layer.cpp's check_finite_attn: when >0 and
+// VERBOSE logging is enabled, also emits the L2 norm of the LAST token's
+// row (n - row_width .. n) so real magnitude/scale data is visible even
+// when nothing is NaN/Inf -- this file had NO such visibility before
+// 2026-08-09 (only the NaN/Inf branch ever logged anything), which is
+// exactly why a real garbled-output run showed zero [HC] lines: silence
+// here means "no NaN/Inf", not "HC didn't run" or "HC is producing sane
+// values" -- those are two different, previously indistinguishable claims.
+static bool check_finite_hc(const char* label, int layer_idx, const float* data, size_t n,
+                            int row_width = 0) {
     int nan_count = 0, inf_count = 0;
     for (size_t i = 0; i < n; ++i) {
         if (std::isnan(data[i])) ++nan_count;
@@ -48,6 +57,13 @@ static bool check_finite_hc(const char* label, int layer_idx, const float* data,
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[HC] %s layer=%d: %d/%zu NaN, %d/%zu Inf.\n", label, layer_idx, nan_count, n, inf_count, n);
         return false;
+    }
+    if (row_width > 0 && Logger::instance().would_log(LogLevel::VERBOSE)) {
+        const float* last_row = data + (n - (size_t)row_width);
+        double sq = 0.0;
+        for (int i = 0; i < row_width; ++i) sq += (double)last_row[i] * last_row[i];
+        LOG_STREAM_VERBOSE() << "[HC-TRACE l=" << layer_idx << "] " << label
+                             << " |last_row|=" << std::sqrt(sq) << "\n";
     }
     return true;
 }
@@ -126,11 +142,16 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
     float *pg = engine.hc_post_gate_scratch.data() + (size_t)s * HC;
     float *cb = engine.hc_comb_scratch.data() + (size_t)s * HC * HC;
 
-    // pre-gate: mix[0..HC), sigmoid.
+    // pre-gate: mix[0..HC), sigmoid, +eps. The +eps AFTER sigmoid is
+    // confirmed against deepseek4.cpp's build_hc_pre (ggml_scale_bias(pre,
+    // 1.0f, hc_eps) right after ggml_sigmoid) -- found missing here
+    // 2026-08-08 during the post-[SILU-TRACE-GPU]-fix garbled-output
+    // re-investigation; post-gate does NOT get this (confirmed, no
+    // ggml_scale_bias call on that branch in the real source).
     std::vector<float> pre_gate(HC);
     for (int h = 0; h < HC; ++h) {
       float b = base ? base[h] : 0.0f;
-      pre_gate[h] = hc_sigmoid(row[h] * scale_pre + b);
+      pre_gate[h] = hc_sigmoid(row[h] * scale_pre + b) + c.hc_eps;
     }
     // post-gate: mix[HC..2HC), sigmoid*2.
     for (int h = 0; h < HC; ++h) {
@@ -145,6 +166,36 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
     }
     sinkhorn_normalize_comb(cb, HC, c.hc_sinkhorn_iters, c.hc_eps);
 
+    // Real telemetry for the LAST token only (added 2026-08-09 -- this file
+    // previously had zero visibility into pre_gate/post_gate/comb beyond
+    // "not NaN"). pre_gate/post_gate are expected roughly in (eps,1+eps)/
+    // (0,2); a doubly-stochastic comb should show every row AND column
+    // summing to ~1 regardless of hc_sinkhorn_iters -- if either sum is
+    // wildly off from 1 here, the Sinkhorn normalization (or the
+    // dst/src indexing feeding it) is still wrong despite passing the
+    // pure-math unit test, since the unit test can't catch a
+    // caller-side transposition of a matrix that's ALREADY symmetric-ish.
+    if (s == S - 1 && Logger::instance().would_log(LogLevel::VERBOSE)) {
+      auto &&os = LOG_STREAM_VERBOSE();
+      os << "[HC-TRACE l=" << layer_idx << "] " << prefix << "pre_gate=[";
+      for (int h = 0; h < HC; ++h) os << (h ? "," : "") << pre_gate[h];
+      os << "] post_gate=[";
+      for (int h = 0; h < HC; ++h) os << (h ? "," : "") << pg[h];
+      os << "] comb_row_sums=[";
+      for (int dst = 0; dst < HC; ++dst) {
+        float rs = 0.0f;
+        for (int src = 0; src < HC; ++src) rs += cb[dst * HC + src];
+        os << (dst ? "," : "") << rs;
+      }
+      os << "] comb_col_sums=[";
+      for (int src = 0; src < HC; ++src) {
+        float cs = 0.0f;
+        for (int dst = 0; dst < HC; ++dst) cs += cb[dst * HC + src];
+        os << (src ? "," : "") << cs;
+      }
+      os << "]\n";
+    }
+
     // Collapse: hidden_states[s][d] = sum_h pre_gate[h] * stream[s][h][d].
     float *out = hidden_states + (size_t)s * D;
     const float *streams = engine.hc_stream_buf.data() + (size_t)s * HC * D;
@@ -155,7 +206,7 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
       for (int d = 0; d < D; ++d) out[d] += w * stream_h[d];
     }
   }
-  check_finite_hc("hidden_states (post hc_pre_collapse)", layer_idx, hidden_states, (size_t)S * D);
+  check_finite_hc("hidden_states (post hc_pre_collapse)", layer_idx, hidden_states, (size_t)S * D, D);
 }
 
 void hc_post_combine(StreamingEngine &engine, int layer_idx, int /*sub_block*/,
@@ -191,7 +242,7 @@ void hc_post_combine(StreamingEngine &engine, int layer_idx, int /*sub_block*/,
     }
   }
   check_finite_hc("new_streams (post hc_post_combine, pre-move into hc_stream_buf)",
-                  layer_idx, new_streams.data(), (size_t)S * HC * D);
+                  layer_idx, new_streams.data(), (size_t)S * HC * D, HC * D);
   engine.hc_stream_buf = std::move(new_streams);
 
   // hidden_states is left holding the collapsed single-stream value the
@@ -231,7 +282,7 @@ void hc_expand_embedding(StreamingEngine &engine, const float *hidden_states,
     }
   }
   check_finite_hc("hc_stream_buf (post hc_expand_embedding)", -1,
-                  engine.hc_stream_buf.data(), (size_t)S * HC * D);
+                  engine.hc_stream_buf.data(), (size_t)S * HC * D, HC * D);
 }
 
 void hc_collapse_output(StreamingEngine &engine, float *hidden_states, int S,
@@ -260,10 +311,21 @@ void hc_collapse_output(StreamingEngine &engine, float *hidden_states, int S,
     std::memset(out, 0, (size_t)D * sizeof(float));
     for (int h = 0; h < HC; ++h) {
       float b = base ? base[h] : 0.0f;
-      float w = hc_sigmoid(row[h] * scale_v + b);
+      // +eps after sigmoid, same as hc_pre_collapse's pre-gate -- confirmed
+      // against deepseek4.cpp's build_hc_head (identical ggml_scale_bias
+      // call after ggml_sigmoid). Found missing here 2026-08-08 alongside
+      // the same bug in hc_pre_collapse.
+      float w = hc_sigmoid(row[h] * scale_v + b) + c.hc_eps;
       const float *stream_h = streams + (size_t)h * D;
       for (int d = 0; d < D; ++d) out[d] += w * stream_h[d];
     }
   }
-  check_finite_hc("hidden_states (post hc_collapse_output)", -1, hidden_states, (size_t)S * D);
+  check_finite_hc("hidden_states (post hc_collapse_output)", -1, hidden_states, (size_t)S * D, D);
+  if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+    const float *row = gate_logits.data() + (size_t)(S - 1) * HC;
+    auto &&os = LOG_STREAM_VERBOSE();
+    os << "[HC-TRACE] output_hc gate_logits(last token)=[";
+    for (int h = 0; h < HC; ++h) os << (h ? "," : "") << row[h];
+    os << "]\n";
+  }
 }

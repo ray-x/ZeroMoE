@@ -9,6 +9,8 @@
 #include <cmath>
 #include <vector>
 #include <cstring>
+#include <cstdlib>
+#include <fstream>
 #include <random>
 #include <algorithm>
 #include <chrono>
@@ -234,7 +236,23 @@ static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O,
     // few ULPs scaled by term count. This threshold is about catching REAL
     // bugs (wrong grid index, wrong scale/min, wrong stride), not chasing
     // bit-exactness.
-    bool pass = max_rel_diff < 0.01f;
+    //
+    // Q6_K and Q8_0 are a different case, not just more float noise:
+    // cpu_quant_matmul's fused path for these two (matmul_q6_k_fused /
+    // matmul_q8_0_fused, src/kernels_cpu.cpp) quantizes the ACTIVATIONS to
+    // int8 per 16-element group to drive a VNNI integer dot product -- a
+    // genuinely different, lossy computation from the GPU kernel's exact f32
+    // dequant+dot, not summation-order noise. Every other type's CPU
+    // reference (Q2_K/Q3_K/Q4_K/Q5_K's plain dequant+f32-dot, IQ2/IQ3_XXS's
+    // float-grid dequant+f32-dot) stays exact-vs-exact and keeps the tight
+    // 0.01 bar; loosening it globally would have masked a real dequant bug
+    // in one of those. Confirmed via direct derivation against ggml's
+    // dequantize_row_q6_K that cuda/kquant_matmul.cu's own dequant math is
+    // correct -- this tolerance covers real int8-activation-quant error on
+    // small I (few super-blocks -> one outlier group dominates), not a
+    // kernel bug.
+    const float tol = (type == GGUFType::Q6_K || type == GGUFType::Q8_0) ? 0.10f : 0.01f;
+    bool pass = max_rel_diff < tol;
     std::cout << "  -> " << name << " (I=" << I << " O=" << O << " S=" << S << "): "
               << (pass ? "PASSED" : "FAILED")
               << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
@@ -343,6 +361,7 @@ bool test_cuda_fused_kernels() {
 extern void dequantize_row_q2_K_avx512(const uint8_t* block, float* y, int64_t k);
 extern void dequantize_row_q3_K_avx512(const uint8_t* block, float* y, int64_t k);
 extern void dequantize_row_iq2_xxs_avx512(const uint8_t* block, float* y, int64_t k);
+extern void dequantize_row_iq2_xs_avx512(const uint8_t* block, float* y, int64_t k);
 extern void dequantize_row_iq3_xxs_avx512(const uint8_t* block, float* y, int64_t k);
 
 static bool run_dequant_case(GGUFType type, int elements_per_row, int n_rows) {
@@ -373,6 +392,7 @@ static bool run_dequant_case(GGUFType type, int elements_per_row, int n_rows) {
             case GGUFType::Q2_K:    dequantize_row_q2_K_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             case GGUFType::Q3_K:    dequantize_row_q3_K_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             case GGUFType::IQ2_XXS: dequantize_row_iq2_xxs_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
+            case GGUFType::IQ2_XS:  dequantize_row_iq2_xs_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             case GGUFType::IQ3_XXS: dequantize_row_iq3_xxs_avx512(w_bytes.data(), y_avx.data(), elements_per_row); break;
             default: assert(false && "run_dequant_case: unhandled type"); break;
         }
@@ -433,12 +453,18 @@ bool test_avx512_dequant() {
 // multiply), and it's this test, not Test 6, that actually matters for this
 // checkpoint's performance.
 bool test_avx512_dequant_iq() {
-    std::cout << "[Test 7] AVX-512 IQ2_XXS/IQ3_XXS Dequant vs ggml Reference...\n";
+    std::cout << "[Test 7] AVX-512 IQ2_XXS/IQ2_XS/IQ3_XXS Dequant vs ggml Reference...\n";
     bool all_pass = true;
     all_pass &= run_dequant_case(GGUFType::IQ2_XXS, 256, 5);
     all_pass &= run_dequant_case(GGUFType::IQ3_XXS, 256, 5);
     all_pass &= run_dequant_case(GGUFType::IQ2_XXS, 2048, 4);
     all_pass &= run_dequant_case(GGUFType::IQ3_XXS, 2048, 4);
+    // IQ2_XS: real "UD-Q2_K_XL" checkpoints use this type for some tensors
+    // (unlike IQ2_XXS/IQ3_XXS above, which target the older UD-IQ2_M
+    // checkpoint family) -- see dequantize_row_iq2_xs_avx512's header
+    // comment (kernels_cpu.cpp) for the algorithm this checks against.
+    all_pass &= run_dequant_case(GGUFType::IQ2_XS, 256, 5);
+    all_pass &= run_dequant_case(GGUFType::IQ2_XS, 2048, 4);
 
     std::cout << "  -> " << (all_pass ? "AVX-512 IQ dequant agrees with ggml's reference."
                                        : "AVX-512 IQ dequant DISAGREED with ggml's reference -- see MISMATCH lines above.")
@@ -581,6 +607,7 @@ void bench_cpu_dequant_matmul() {
         {GGUFType::IQ3_XXS, "IQ3_XXS -- vectorized, down on 71/76 layers"},
         {GGUFType::IQ4_XS,  "IQ4_XS  -- SCALAR, no AVX-512 case, down on ~4 layers"},
         {GGUFType::IQ2_S,   "IQ2_S   -- NOW vectorized (was scalar), gate/up on 1 layer"},
+        {GGUFType::IQ2_XS,  "IQ2_XS  -- NOW vectorized (was scalar), used by UD-Q2_K_XL checkpoints"},
     };
     // Fine-grained around the likely physical-core boundary (Xeon W-2235 =
     // 6 physical cores / 12 threads via hyperthreading) -- added after the
@@ -959,6 +986,205 @@ bool test_bf16_matched_cublas_dense_matmul() {
     return pass;
 }
 
+// ------------------------------------------------------------------
+// 11. Real-Data IQ2_XXS Dequant Consistency (GPU kernel vs CPU reference,
+//     on ACTUAL model bytes -- not Test 5's synthetic ggml_quantize_row_ref
+//     data)
+// ------------------------------------------------------------------
+// Test 5 already compares GPU vs CPU dequant+matmul for IQ2_XXS and PASSES
+// -- but only on randomly-generated float weights re-quantized via ggml's
+// own reference quantizer. A live VERBOSE trace on a real DeepSeek-V4-Flash
+// decode run showed specific (layer, expert) gate_proj weights producing an
+// exactly-all-zero 2048-wide GPU output ([SILU-TRACE-GPU] pre-SiLU gate
+// range=[0, 0]), fully deterministic across two independent full-process
+// restarts of the identical prompt (ruling out a race). Critically, that
+// same block's own dequant scale `d` sampled as a normal ~0.0003-0.0006 --
+// the SAME order of magnitude as experts that DON'T zero out -- which
+// argues against "this expert's weights are just legitimately near-zero"
+// (a genuinely small-magnitude block would get its OWN correspondingly
+// small `d` from the quantizer, chosen independently per block). That
+// leaves a real, open question: does the actual trained-and-quantized byte
+// pattern for this expert decode to all-zero on BOTH independent
+// implementations (a genuine data property), or only on the GPU kernel (a
+// data-dependent bug Test 5's random data never happens to trigger)?
+//
+// A runtime cpu_only=true comparison can't answer this cleanly -- it adds
+// routing/caching/cpu_only_mode's own documented dispatch-gating gaps as
+// confounds, and produced no usable output in practice. This test instead
+// pulls the exact real bytes for a known-bad expert out via
+// tools/dump_expert_bytes.cpp (reusing the same GGUFFile/fd_for_tensor
+// tensor-offset math load_expert_slab uses in production, so the extraction
+// itself isn't a new source of bugs) and runs them through cpu_quant_matmul
+// and CudaManager::dense_matmul_host directly -- no engine, no router, no
+// cache, just the dequant+matmul step in total isolation.
+//
+// Deliberately NOT gated behind assert() alone for the same reason as Test
+// 5: this project's documented build is -DCMAKE_BUILD_TYPE=Release
+// (NDEBUG, every assert() compiled out), so the verdict has to survive a
+// Release build via an explicit bool return, checked directly in main().
+bool test_real_expert_iq2xxs_dequant() {
+    std::cout << "[Test 11] Real-Data IQ2_XXS Dequant: GPU vs CPU on actual suspect expert bytes...\n";
+
+    const char* path = std::getenv("MOESTREAM_REAL_EXPERT_BIN");
+    if (!path) {
+        std::cout << "  -> SKIPPED (set MOESTREAM_REAL_EXPERT_BIN to a raw-bytes dump produced by "
+                     "tools/dump_expert_bytes.cpp, e.g.:\n"
+                     "       g++ -std=c++23 -O2 -Iinclude tools/dump_expert_bytes.cpp -o /tmp/dump_expert_bytes\n"
+                     "       /tmp/dump_expert_bytes model.gguf 0 199 gate /tmp/e199_gate.bin\n"
+                     "       MOESTREAM_REAL_EXPERT_BIN=/tmp/e199_gate.bin MOESTREAM_REAL_EXPERT_D=4096 "
+                     "MOESTREAM_REAL_EXPERT_O=2048 ./build/moestream_test\n"
+                     "     to run this test. Additionally set MOESTREAM_REAL_ACTIVATION_BIN (a raw D-float "
+                     "capture from a real run, see execution_layer.cpp's [ACTIVATION-DUMP] instrumentation, "
+                     "env vars MOESTREAM_DUMP_ACTIVATION_LAYER/_EXPERT/_OUT) to test against the REAL "
+                     "activation instead of a synthetic random vector)\n";
+        return true;
+    }
+    const char* d_env = std::getenv("MOESTREAM_REAL_EXPERT_D");
+    const char* o_env = std::getenv("MOESTREAM_REAL_EXPERT_O");
+    // Defaults match this investigation's own model: blk.0.ffn_gate_exps.weight [4096, 2048, 256].
+    const int D = d_env ? std::atoi(d_env) : 4096;
+    const int moe_inter = o_env ? std::atoi(o_env) : 2048;
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f.good()) {
+        std::cout << "  -> FAILED (couldn't open MOESTREAM_REAL_EXPERT_BIN=" << path << ")\n";
+        return false;
+    }
+    std::vector<uint8_t> w_bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+
+    // IQ2_XXS: 66 bytes/block (2-byte fp16 scale + 64 bytes qs), 256 elements/block.
+    const size_t expected_bytes = (size_t)moe_inter * D / 256 * 66;
+    if (w_bytes.size() != expected_bytes) {
+        std::cout << "  -> FAILED (dump is " << w_bytes.size() << " bytes, expected " << expected_bytes
+                  << " for D=" << D << " O=" << moe_inter << " IQ2_XXS -- wrong expert/tensor, or set "
+                     "MOESTREAM_REAL_EXPERT_D/_O to match the real shape)\n";
+        return false;
+    }
+
+    // x defaults to a synthetic random vector (this test's original mode --
+    // proves/disproves an UNCONDITIONAL dequant bug, independent of any
+    // particular activation). Set MOESTREAM_REAL_ACTIVATION_BIN to instead
+    // load the ACTUAL runtime activation vector captured at the real
+    // all-zero decode step (via execution_layer.cpp's [ACTIVATION-DUMP]
+    // instrumentation -- see MOESTREAM_DUMP_ACTIVATION_LAYER/_EXPERT/_OUT
+    // there), closing the gap the synthetic vector can't: if THIS run comes
+    // back nonzero on both CPU and GPU while the live decode trace showed
+    // all-zero, that's strong evidence of a caching/pipeline bug feeding
+    // stale/wrong bytes during real decode, not a genuine data property.
+    const char* real_x_path = std::getenv("MOESTREAM_REAL_ACTIVATION_BIN");
+    std::vector<float> x(D);
+    bool using_real_x = false;
+    if (real_x_path) {
+        std::ifstream xf(real_x_path, std::ios::binary);
+        if (!xf.good()) {
+            std::cout << "  -> FAILED (couldn't open MOESTREAM_REAL_ACTIVATION_BIN=" << real_x_path << ")\n";
+            return false;
+        }
+        xf.read(reinterpret_cast<char*>(x.data()), (std::streamsize)(x.size() * sizeof(float)));
+        if ((size_t)xf.gcount() != x.size() * sizeof(float)) {
+            std::cout << "  -> FAILED (MOESTREAM_REAL_ACTIVATION_BIN=" << real_x_path << " is "
+                      << xf.gcount() << " bytes, expected " << x.size() * sizeof(float)
+                      << " for D=" << D << " -- wrong capture, or set MOESTREAM_REAL_EXPERT_D to match)\n";
+            return false;
+        }
+        using_real_x = true;
+        std::cout << "  -> using REAL activation vector from " << real_x_path << "\n";
+    } else {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& v : x) v = dist(rng);
+    }
+
+    std::vector<float> y_cpu((size_t)moe_inter, -999.0f);
+    bool cpu_ok = cpu_quant_matmul(GGUFType::IQ2_XXS, w_bytes.data(), x.data(), y_cpu.data(), 1, D, moe_inter);
+    if (!cpu_ok) {
+        std::cout << "  -> FAILED (cpu_quant_matmul reported no support for IQ2_XXS)\n";
+        return false;
+    }
+
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    QuantizedTensor qt;
+    qt.meta.type = GGUFType::IQ2_XXS;
+    qt.meta.shape = {(uint64_t)moe_inter, (uint64_t)D};
+    qt.meta.size_bytes = w_bytes.size();
+    qt.host_ptr = w_bytes.data();
+    if (!gpu.offload_tensor_to_vram(qt)) {
+        std::cout << "  -> SKIPPED (VRAM offload failed -- out of memory?)\n";
+        return true;
+    }
+
+    std::vector<float> y_gpu((size_t)moe_inter, -999.0f);
+    bool gpu_ok = gpu.dense_matmul_host(GGUFType::IQ2_XXS, qt.device_ptr, x.data(), y_gpu.data(), 1, D, moe_inter);
+    cudaFree(qt.device_ptr);
+    if (!gpu_ok) {
+        std::cout << "  -> FAILED (dense_matmul_host reported no kernel for IQ2_XXS)\n";
+        return false;
+    }
+
+    float cpu_max_abs = 0.0f, gpu_max_abs = 0.0f;
+    for (float v : y_cpu) cpu_max_abs = std::max(cpu_max_abs, std::abs(v));
+    for (int i = 0; i < moe_inter; ++i) {
+        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at GPU output index " << i << ")\n";
+            return false;
+        }
+        gpu_max_abs = std::max(gpu_max_abs, std::abs(y_gpu[i]));
+    }
+    bool cpu_all_zero = (cpu_max_abs == 0.0f);
+    bool gpu_all_zero = (gpu_max_abs == 0.0f);
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (int i = 0; i < moe_inter; ++i) {
+        float diff = std::abs(y_cpu[i] - y_gpu[i]);
+        float rel = diff / std::max(1e-6f, std::abs(y_cpu[i]));
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, rel);
+    }
+
+    std::cout << "  -> cpu_max_abs=" << cpu_max_abs << " gpu_max_abs=" << gpu_max_abs
+              << " cpu_all_zero=" << cpu_all_zero << " gpu_all_zero=" << gpu_all_zero
+              << " max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+
+    if (cpu_all_zero != gpu_all_zero) {
+        std::cout << "  -> FAILED: CPU and GPU disagree on all-zero-ness for this real expert's real "
+                     "bytes -- this is the smoking gun for a GPU-kernel-specific dequant bug.\n";
+        return false;
+    }
+    if (cpu_all_zero && gpu_all_zero) {
+        if (using_real_x) {
+            std::cout << "  -> PASSED: both CPU and GPU independently dequantize this real expert to "
+                         "all-zero on the REAL captured activation vector -- corroborates the genuine "
+                         "degenerate-data-property hypothesis (the live trace wasn't a pipeline bug); "
+                         "next step is upstream, e.g. why this token's hidden state produces a near-zero "
+                         "dot product with every one of this expert's rows (attention/RMSNorm, per the "
+                         "residual-norm-divergence investigation).\n";
+        } else {
+            std::cout << "  -> PASSED: both CPU and GPU independently dequantize this real expert to "
+                         "all-zero -- two separate implementations agreeing is strong evidence this is a "
+                         "genuine property of the trained/quantized weight data, not a kernel bug. Re-run "
+                         "with MOESTREAM_REAL_ACTIVATION_BIN set to confirm this holds for the ACTUAL "
+                         "activation vector from the real failing decode step, not just synthetic random "
+                         "input.\n";
+        }
+        return true;
+    }
+    if (using_real_x) {
+        std::cout << "  -> Real activation + real weight bytes produced NONZERO output on both CPU and "
+                     "GPU in this isolated harness. If the live decode trace showed all-zero for this "
+                     "exact (layer, expert, token), that's strong evidence of a caching/data-pipeline bug "
+                     "serving different bytes during real decode -- look at the RAM/VRAM tier claim-"
+                     "publish path and expert dispatch (CLAUDE.md section 3/6), not the dequant kernels.\n";
+    }
+    bool pass = max_rel_diff < 0.01f;
+    std::cout << "  -> " << (pass ? "PASSED" : "FAILED") << " (nonzero output, tolerance check)\n";
+    return pass;
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "  MoeStream Native Test Harness\n";
@@ -971,9 +1197,21 @@ int main() {
     bool fused_kernels_ok = test_cuda_fused_kernels();
     bool avx512_dequant_ok = test_avx512_dequant();
     bool avx512_dequant_iq_ok = test_avx512_dequant_iq();
-    bench_cpu_dequant_matmul();
+    // Test 8 is throughput-only (no pass/fail verdict, see its own header
+    // comment) and runs many timed dequant/matmul passes -- by far the
+    // slowest thing in this binary, and irrelevant to every other test's
+    // pass/fail verdict. Skipped by default so a normal `make test`/targeted
+    // re-run (e.g. Test 11's real-expert comparison via
+    // MOESTREAM_REAL_EXPERT_BIN/MOESTREAM_REAL_ACTIVATION_BIN) stays fast;
+    // set MOESTREAM_RUN_BENCH=1 to opt back into the throughput numbers.
+    if (std::getenv("MOESTREAM_RUN_BENCH")) {
+        bench_cpu_dequant_matmul();
+    } else {
+        std::cout << "\n[Test 8] SKIPPED by default (set MOESTREAM_RUN_BENCH=1 to run the throughput bench)\n";
+    }
     bool bf16_dense_ok = test_bf16_cublas_dense_matmul();
     bool bf16_matched_dense_ok = test_bf16_matched_cublas_dense_matmul();
+    bool real_expert_iq2xxs_ok = test_real_expert_iq2xxs_dequant();
 
     std::cout << "========================================\n";
     if (!fused_kernels_ok) {
@@ -996,6 +1234,10 @@ int main() {
     }
     if (!bf16_matched_dense_ok) {
         std::cout << "❌ BF16 matched-precision cuBLAS dense matmul correctness test FAILED -- see [Test 10] output above.\n";
+        return 1;
+    }
+    if (!real_expert_iq2xxs_ok) {
+        std::cout << "❌ Real-Data IQ2_XXS dequant consistency test FAILED -- see [Test 11] output above.\n";
         return 1;
     }
     std::cout << "✅ All core engine tests passed successfully!\n";

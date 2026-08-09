@@ -14,6 +14,8 @@
 #include <thread>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 
 extern void mla_attention_absorbed_gguf(StreamingEngine& engine, int layer_idx, const float* Q_roped, int S, int pos_base, float* out);
 extern void dense_attention_gguf(StreamingEngine& engine, int layer_idx, const float* hidden_states, int S, int pos_base, float* out);
@@ -340,6 +342,39 @@ struct LayerScratch {
     // pilot_recall's raw top-K accuracy (which includes already-cached
     // picks whose correctness doesn't matter to that question).
     std::array<bool, 8> pilot_pred_was_hint{};
+
+    // DEPTH-2 measurement (approach (a), "naive reuse" only) -- mirrors
+    // pilot_pred_ids/count/layer/was_hint, one hop further out. Predicts
+    // a slot's target layer's routing by reusing the SAME pre-(l+1)-
+    // attention hidden_states vector the l+1 pilot above already computed
+    // from, i.e. gated on a vector missing l+1's own FFN contribution
+    // entirely -- the single term already proven fatal to omit at depth-1
+    // (see the pilot loop's own comment on the 0%-recall failure the
+    // post-FFN timing fix corrected). Deliberately NOT wired to
+    // async_io_queue.push_hint or publish_pilot_confirmed_resident --
+    // this is pure recall measurement to settle whether depth-2 is worth
+    // building at all, not a real prefetch path.
+    //
+    // TWO-SLOT, not one: a depth-2 prediction set while processing layer l
+    // (targeting l+2) has to survive a FULL intervening iteration (l+1) --
+    // whose OWN pilot block ALSO fires and would overwrite a single shared
+    // field with its own l+3 target before layer l+2 is ever reached to
+    // consume the l+2 entry. A single scalar here silently loses ~every
+    // prediction except the last one or two near the tail of the layer
+    // stack (caught via a suspiciously low check count: exactly
+    // ~1/layer-count of the expected volume, one surviving match per
+    // token instead of one per (layer, token) pair). Indexed by l % 2:
+    // l and l+2 always share parity, so slot[l % 2] is only ever
+    // overwritten again at iteration l+2 itself -- AFTER that iteration's
+    // own check (at the top of moe_forward_gguf) has already consumed it.
+    // l+1 (opposite parity) writes to the other slot and never collides.
+    struct Pilot2Pending {
+        std::array<int, 8> ids{};
+        int count = 0;
+        int layer = -1;
+        std::array<bool, 8> was_hint{};
+    };
+    std::array<Pilot2Pending, 2> pilot_pred2_slots{};
 
     void resize(int S, int D, int n_experts, int moe_inter, int topk, int n_expert_shared = 0, int dense_inter = 0) {
         attn_out.resize(S * D);
@@ -779,6 +814,180 @@ static bool expert_ffn_gpu_issue(
     const uint8_t* gate_dev = base;
     const uint8_t* up_dev   = base + (up_meta.offset - gate_meta.offset);
 
+    // Raw-weight-bytes probe: distinguishes "the VRAM weight bytes for this
+    // expert are genuinely never/wrongly written" from "written but the
+    // matmul/SiLU pipeline zeroes them downstream". A plain cudaMemcpy with
+    // no explicit stream (legacy default stream) implicitly synchronizes
+    // with every prior stream's work first, so a post-copy all-zero read
+    // here means the bytes really are zero in VRAM at this exact address --
+    // not merely "not yet" written by some still-in-flight async upload.
+    //
+    // REVISED from a first cut that only sampled the first 64 bytes of each
+    // tensor: the corrupted matmul output is the FULL 2048-element gate/up
+    // vector coming back zero, which (for a ~2MB quantized tensor) requires
+    // a much larger swath to actually be zero than 64 bytes out of ~2M could
+    // ever confirm or rule out -- that first version could not distinguish
+    // "genuinely all zero" from "zero happened to land in the first 64
+    // bytes, real data follows". Now samples NUM_WINDOWS windows spread
+    // evenly across each tensor's real extent (gate: [0, up_off_delta); up:
+    // [up_off_delta, loc->size)) so a corrupted region anywhere in either
+    // tensor is very likely to land in at least one window, without paying
+    // for a full-tensor download every dispatch.
+    if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+        constexpr int NUM_WINDOWS = 16;
+        constexpr size_t WIN = 64;
+        size_t up_off = (size_t)(up_meta.offset - gate_meta.offset);
+        size_t gate_extent = std::min(up_off, loc->size);
+        size_t up_extent = (loc->size > up_off) ? (loc->size - up_off) : (size_t)0;
+        uint8_t buf[WIN];
+        int gate_zero_windows = 0, gate_windows = 0;
+        int up_zero_windows = 0, up_windows = 0;
+        for (int w = 0; w < NUM_WINDOWS && gate_extent > 0; ++w) {
+            size_t off = (gate_extent > WIN) ? (size_t)((double)w / NUM_WINDOWS * (gate_extent - WIN)) : 0;
+            size_t n = std::min(WIN, gate_extent - off);
+            if (n == 0) continue;
+            cudaMemcpy(buf, gate_dev + off, n, cudaMemcpyDeviceToHost);
+            ++gate_windows;
+            bool all_zero = true;
+            for (size_t i = 0; i < n; ++i) if (buf[i] != 0) { all_zero = false; break; }
+            if (all_zero) ++gate_zero_windows;
+        }
+        for (int w = 0; w < NUM_WINDOWS && up_extent > 0; ++w) {
+            size_t off = (up_extent > WIN) ? (size_t)((double)w / NUM_WINDOWS * (up_extent - WIN)) : 0;
+            size_t n = std::min(WIN, up_extent - off);
+            if (n == 0) continue;
+            cudaMemcpy(buf, up_dev + off, n, cudaMemcpyDeviceToHost);
+            ++up_windows;
+            bool all_zero = true;
+            for (size_t i = 0; i < n; ++i) if (buf[i] != 0) { all_zero = false; break; }
+            if (all_zero) ++up_zero_windows;
+        }
+        LOG_STREAM_VERBOSE() << "[VRAM-BYTE-PROBE l=" << loc->layer_idx << " e=" << loc->expert_id
+                             << "] device_ptr=" << (const void*)loc->device_ptr
+                             << " size=" << loc->size << " upload_ready=" << loc->upload_ready
+                             << " gate_extent=" << gate_extent << " up_extent=" << up_extent
+                             << " gate_zero_windows=" << gate_zero_windows << "/" << gate_windows
+                             << " up_zero_windows=" << up_zero_windows << "/" << up_windows
+                             << " gate_type=" << gpu_type_name(gate_meta.type)
+                             << " up_type=" << gpu_type_name(up_meta.type) << "\n";
+
+        // d-scale probe: the byte-window probe above only proves the tensor
+        // isn't ALL zero -- it can't tell "real nonzero qs/sign bits sitting
+        // next to a zero dequant scale" from genuinely-live data, because the
+        // scale is a small fraction of each block's bytes. iq2_matmul.cu's
+        // dequant_iq2_xxs_coop multiplies every one of a block's 256 elements
+        // by a single shared per-block scale db = d * (...) * 0.25, where d
+        // is that block's own leading fp16 header (2 of its 66 bytes). If d
+        // is 0 for (nearly) every block of a tensor, EVERY dequantized value
+        // is exactly 0.0 regardless of what the qs/sign bits look like --
+        // exactly the "raw bytes look real but matmul output is all zero"
+        // pattern the byte-window probe couldn't explain. Sampled block-
+        // aligned (not byte-window-aligned) so every sample lands exactly on
+        // a `d` header instead of an arbitrary offset into qs data.
+        if (gate_meta.type == GGUFType::IQ2_XXS || up_meta.type == GGUFType::IQ2_XXS) {
+            // Named IQ2_BLOCK_BYTES, not BLOCK_SIZE: <linux/fs.h> #defines a
+            // bare BLOCK_SIZE macro ((1<<10)), pulled in transitively via
+            // async_prefetcher.hpp -> io_uring_backend.hpp's real Linux
+            // branch (#include <linux/io_uring.h>) -- invisible from the
+            // Mac-side lint workflow, which always takes that header's
+            // non-Linux stub branch instead. A local `constexpr size_t
+            // BLOCK_SIZE` silently got rewritten to `constexpr size_t
+            // (1<<10)` by the preprocessor, producing the confusing real
+            // GCC error "expected primary-expression before 'constexpr'".
+            constexpr size_t IQ2_BLOCK_BYTES = 66;  // sizeof(block_iq2_xxs_cu): 2(d) + 32*2(qs)
+            constexpr int NUM_SAMPLES = 8;
+            auto sample_d = [&](const uint8_t* dev, size_t extent, int& zero_d, int& sampled,
+                                 float& min_d, float& max_d) {
+                size_t num_blocks = extent / IQ2_BLOCK_BYTES;
+                if (num_blocks == 0) return;
+                for (int i = 0; i < NUM_SAMPLES; ++i) {
+                    size_t block_idx = (num_blocks > 1)
+                        ? (size_t)((double)i / (NUM_SAMPLES - 1) * (num_blocks - 1))
+                        : 0;
+                    uint16_t d_raw = 0;
+                    cudaMemcpy(&d_raw, dev + block_idx * IQ2_BLOCK_BYTES, sizeof(d_raw), cudaMemcpyDeviceToHost);
+                    float d = fp16_to_fp32(d_raw);
+                    ++sampled;
+                    if (d == 0.0f) ++zero_d;
+                    min_d = std::min(min_d, d);
+                    max_d = std::max(max_d, d);
+                }
+            };
+            int gate_zero_d = 0, gate_d_sampled = 0, up_zero_d = 0, up_d_sampled = 0;
+            float gate_min_d = 1e30f, gate_max_d = -1e30f, up_min_d = 1e30f, up_max_d = -1e30f;
+            if (gate_meta.type == GGUFType::IQ2_XXS)
+                sample_d(gate_dev, gate_extent, gate_zero_d, gate_d_sampled, gate_min_d, gate_max_d);
+            if (up_meta.type == GGUFType::IQ2_XXS)
+                sample_d(up_dev, up_extent, up_zero_d, up_d_sampled, up_min_d, up_max_d);
+            LOG_STREAM_VERBOSE() << "[VRAM-DSCALE-PROBE l=" << loc->layer_idx << " e=" << loc->expert_id
+                                 << "] gate_zero_d=" << gate_zero_d << "/" << gate_d_sampled
+                                 << " gate_d_range=[" << gate_min_d << "," << gate_max_d << "]"
+                                 << " up_zero_d=" << up_zero_d << "/" << up_d_sampled
+                                 << " up_d_range=[" << up_min_d << "," << up_max_d << "]\n";
+        }
+    }
+
+    // One-shot real-activation capture for the DeepSeek-V4-Flash garbled-
+    // output investigation (see main_test.cpp's Test 11 header comment):
+    // that test already proved expert 199's real weight bytes produce
+    // NONZERO output on both CPU and GPU when fed a synthetic random `x`,
+    // ruling out an unconditional GPU-kernel dequant bug -- but it can't
+    // rule out a caching/pipeline bug that only manifests with the ACTUAL
+    // activation vector at the real failing decode step. This pulls that
+    // exact real `x` (the same buffer about to be uploaded as d_x below)
+    // out to a flat binary file the moment it matches env-selected
+    // (layer, expert) coordinates, so it can be replayed offline through
+    // the same isolated cpu_quant_matmul/dense_matmul_host harness Test 11
+    // already uses on the real dumped weight bytes. Inert unless both env
+    // vars are set; fires at most once per process (an expert can be
+    // dispatched many times across decode steps -- only the first hit is
+    // captured, matching how the original all-zero trace was a single
+    // observed instant, not a steady-state property to average over).
+    {
+        static std::atomic<bool> activation_dumped{false};
+        if (!activation_dumped.load(std::memory_order_relaxed)) {
+            const char* target_layer_env = std::getenv("MOESTREAM_DUMP_ACTIVATION_LAYER");
+            const char* target_expert_env = std::getenv("MOESTREAM_DUMP_ACTIVATION_EXPERT");
+            if (target_layer_env && target_expert_env &&
+                loc->layer_idx == std::atoi(target_layer_env) &&
+                loc->expert_id == std::atoi(target_expert_env)) {
+                bool expected = false;
+                if (activation_dumped.compare_exchange_strong(expected, true)) {
+                    const char* out_path_env = std::getenv("MOESTREAM_DUMP_ACTIVATION_OUT");
+                    const std::string out_path = out_path_env ? out_path_env : "/tmp/real_activation.bin";
+                    std::ofstream f(out_path, std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(input), (std::streamsize)((size_t)S * D * sizeof(float)));
+                    LOG_STREAM_VERBOSE() << "[ACTIVATION-DUMP l=" << loc->layer_idx
+                                         << " e=" << loc->expert_id << "] wrote S=" << S
+                                         << " D=" << D << " floats to " << out_path << "\n";
+                }
+            }
+        }
+    }
+
+    // Triage aid for the "every layer shows post-SiLU all-zero" finding
+    // (debug.log grep of [SILU-TRACE-GPU] range=[0, 0] matched at every
+    // traced layer, not one suspect expert as originally hypothesized --
+    // see conversation). Distinguishes "activation feeding this expert is
+    // already degenerate before the matmul" (points upstream, to
+    // attention/RMSNorm/embedding -- see the residual-norm divergence
+    // memory note) from "real nonzero input still produces zero gate_buf"
+    // (points at the matmul/weight-dispatch path itself). Cheap (S*D scan,
+    // same VERBOSE gate as the existing SILU-TRACE-GPU it's meant to be
+    // read alongside) so left unconditional rather than env-var-gated.
+    if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+        float in_min = input[0], in_max = input[0];
+        int in_zero = 0;
+        for (int i = 0; i < S * D; ++i) {
+            in_min = std::min(in_min, input[i]);
+            in_max = std::max(in_max, input[i]);
+            if (input[i] == 0.0f) ++in_zero;
+        }
+        LOG_STREAM_VERBOSE() << "[INPUT-TRACE-GPU l=" << loc->layer_idx << " e=" << loc->expert_id
+                             << "] activation range=[" << in_min << ", " << in_max
+                             << "] zeros=" << in_zero << "/" << (S * D) << "\n";
+    }
+
     if (!gpu_scratch.ensure(S, D, moe_inter, loc->gpu_id)) return false;  // pins the correct vault GPU
 
     PERF_START(gexp_up1);
@@ -835,9 +1044,67 @@ static void expert_ffn_gpu_finish(
     PERF_END(gexp_dn1, t_gpu_download);
     check_finite("gate_buf (post gate+up matmul)", layer_idx, expert_id, gate_buf, (size_t)S * moe_inter);
     check_finite("up_buf   (post gate+up matmul)", layer_idx, expert_id, up_buf,   (size_t)S * moe_inter);
+
+    // Mirrors expert_ffn_cpu's own [SILU-TRACE] instrumentation -- this GPU
+    // path runs the IDENTICAL silu_inplace/elem_mul/swiglu_clamp_inplace CPU
+    // functions on the downloaded gate_buf/up_buf (see this function's own
+    // header comment: no dedicated CUDA activation kernel exists), so the
+    // same SiLU/FTZ-saturation-vs-upstream-corruption question applies here
+    // too. Needed because the CPU-path trace alone can't distinguish "this
+    // dispatch went through the GPU path instead" from "the CPU path itself
+    // never zeroes" -- a zero-`down_buf` call with no CPU SILU-TRACE nearby
+    // may simply have been GPU-dispatched and thus invisible to that trace.
+    float pre_min = 0.0f, pre_max = 0.0f;
+    bool trace = Logger::instance().would_log(LogLevel::VERBOSE);
+    if (trace) {
+        pre_min = gate_buf[0]; pre_max = gate_buf[0];
+        for (int i = 1; i < S * moe_inter; ++i) {
+            pre_min = std::min(pre_min, gate_buf[i]);
+            pre_max = std::max(pre_max, gate_buf[i]);
+        }
+    }
+    // Downloads gpu_scratch.d_x -- the EXACT device buffer this call's own
+    // gate/up matmul just read -- rather than relying on issue()'s own
+    // separate [INPUT-TRACE-GPU] log line to correlate by (layer, expert):
+    // Pass A issues every in-flight expert's gate/up kernel before Pass B
+    // (this function) downloads/finishes any of them, so issue()'s trace
+    // lines for a whole batch print consecutively, followed later by this
+    // function's SILU-TRACE-GPU lines for the same batch in a possibly
+    // different order -- adjacent-line greps (or even matching (l,e) keys,
+    // if the same expert is re-dispatched across tokens) can pair the wrong
+    // occurrences. Logged in the SAME statement grouping as SILU-TRACE-GPU
+    // below so the two are always about the literal same call, no
+    // correlation-by-eye required.
+    if (trace) {
+        std::vector<float> x_check((size_t)S * D);
+        cudaMemcpy(x_check.data(), gpu_scratch.d_x, (size_t)S * D * sizeof(float), cudaMemcpyDeviceToHost);
+        float x_min = x_check[0], x_max = x_check[0];
+        int x_zero = 0;
+        for (size_t i = 0; i < x_check.size(); ++i) {
+            x_min = std::min(x_min, x_check[i]);
+            x_max = std::max(x_max, x_check[i]);
+            if (x_check[i] == 0.0f) ++x_zero;
+        }
+        LOG_STREAM_VERBOSE() << "[INPUT-TRACE-GPU-PAIRED l=" << layer_idx << " e=" << expert_id
+                             << "] d_x range=[" << x_min << ", " << x_max
+                             << "] zeros=" << x_zero << "/" << x_check.size() << "\n";
+    }
     silu_inplace(gate_buf, S * moe_inter);
+    if (trace) {
+        int n_zero = 0;
+        for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
+        LOG_STREAM_VERBOSE() << "[SILU-TRACE-GPU l=" << layer_idx << " e=" << expert_id
+                             << "] pre-SiLU gate range=[" << pre_min << ", " << pre_max
+                             << "] post-SiLU zeros=" << n_zero << "/" << (S * moe_inter) << "\n";
+    }
     elem_mul(gate_buf, gate_buf, up_buf, S * moe_inter);
     swiglu_clamp_inplace(gate_buf, S * moe_inter, swiglu_clamp);
+    if (trace) {
+        int n_zero = 0;
+        for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
+        LOG_STREAM_VERBOSE() << "[SWIGLU-TRACE-GPU l=" << layer_idx << " e=" << expert_id
+                             << "] post-mul+clamp product zeros=" << n_zero << "/" << (S * moe_inter) << "\n";
+    }
 
     PERF_START(gexp_up2);
     cudaMemcpy(gpu_scratch.d_prod, gate_buf, (size_t)S * moe_inter * sizeof(float), cudaMemcpyHostToDevice);
@@ -875,14 +1142,47 @@ static void expert_ffn_cpu(
     const uint8_t* down_data, const GGUFTensor& down_meta,
     float* gate_buf, float* up_buf,
     int S, int D, int moe_inter,
-    float swiglu_clamp
+    float swiglu_clamp,
+    int layer_idx, int expert_id
 ) {
     PERF_START(cexp);
     cpu_quant_matmul(gate_meta.type, gate_data, input, gate_buf, S, D, moe_inter);
     cpu_quant_matmul(up_meta.type,   up_data,   input, up_buf,   S, D, moe_inter);
+
+    // Pre-SiLU gate_buf extremes + post-SiLU exact-zero count, VERBOSE-gated:
+    // distinguishes a legitimate SiLU/FTZ saturation (x/(1+exp(-x)) flushing
+    // to exactly 0.0f for a sufficiently negative pre-activation -- plausible
+    // now that ~100+ magnitude hidden states are confirmed legitimate model
+    // behavior, not corruption, per the attention-magnitude investigation)
+    // from a real bug upstream of this point (e.g. gate_buf already
+    // zero/garbage before SiLU ever runs). Only computed under VERBOSE,
+    // matching every other high-volume per-expert trace in this file.
+    float pre_min = 0.0f, pre_max = 0.0f;
+    bool trace = Logger::instance().would_log(LogLevel::VERBOSE);
+    if (trace) {
+        pre_min = gate_buf[0]; pre_max = gate_buf[0];
+        for (int i = 1; i < S * moe_inter; ++i) {
+            pre_min = std::min(pre_min, gate_buf[i]);
+            pre_max = std::max(pre_max, gate_buf[i]);
+        }
+    }
     silu_inplace(gate_buf, S * moe_inter);
+    if (trace) {
+        int n_zero = 0;
+        for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
+        LOG_STREAM_VERBOSE() << "[SILU-TRACE l=" << layer_idx << " e=" << expert_id
+                             << "] pre-SiLU gate range=[" << pre_min << ", " << pre_max
+                             << "] post-SiLU zeros=" << n_zero << "/" << (S * moe_inter) << "\n";
+    }
+
     elem_mul(gate_buf, gate_buf, up_buf, S * moe_inter);
     swiglu_clamp_inplace(gate_buf, S * moe_inter, swiglu_clamp);
+    if (trace) {
+        int n_zero = 0;
+        for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
+        LOG_STREAM_VERBOSE() << "[SWIGLU-TRACE l=" << layer_idx << " e=" << expert_id
+                             << "] post-mul+clamp product zeros=" << n_zero << "/" << (S * moe_inter) << "\n";
+    }
     cpu_quant_matmul(down_meta.type, down_data, gate_buf, output, S, moe_inter, D);
     PERF_END(cexp, t_cpu_expert);
     perf().n_expert_cpu_calls.fetch_add(1, std::memory_order_relaxed);
@@ -981,6 +1281,31 @@ void moe_forward_gguf(
     // experts this resolves to; only the selection step branches, in the
     // per-token loop further down.
     const int32_t* tid2eid = nullptr;
+    // Real on-disk row count (ne[1]) of ffn_gate_tid2eid.weight for THIS
+    // layer -- i.e. the number of vocab rows the table actually has.
+    // Populated only when `tid2eid` above is populated. ROOT-CAUSE FIX:
+    // the per-token lookup below used to bounds-check `tok` against
+    // `c.vocab` (the engine's global vocab size, derived from
+    // token_embd.weight -- see graph_initializer.cpp's own vocab_size
+    // fallback history) under the assumption that it equals this
+    // tensor's real ne[1]. Nothing actually enforces that the two agree:
+    // if this GGUF (or a separate dense_model_path file, when
+    // has_dense_model is set -- ffn_gate_tid2eid.weight loads from
+    // whichever of the two `initialize_resident_memory` was given) ever
+    // exported this specific table over a SMALLER vocab than c.vocab,
+    // `tid2eid + tok*topk` for any real token id past that smaller
+    // extent reads past the posix_memalign'd buffer entirely -- an
+    // out-of-bounds heap read (UB), not a bug in the file's actual
+    // content. That reads as EXACTLY this symptom: every hash-route
+    // lookup "succeeds" past the type/shape check below (type IS I32,
+    // shape[0] IS topk) yet every row comes back full of nonsense
+    // expert ids, for every token, every hash layer -- because every
+    // lookup this run happens to land past the table's real extent.
+    // Bounding against the tensor's OWN shape[1] instead closes the UB
+    // and turns a silent corruption into a clean, diagnosable fallback;
+    // the mismatch check right after logs the smoking gun the moment it
+    // fires.
+    int64_t tid2eid_n_vocab = 0;
     if (layer_idx < c.hash_layer_count) {
         std::string tid2eid_key = "blk." + std::to_string(layer_idx) + ".ffn_gate_tid2eid.weight";
         auto tid2eid_it = engine.resident_layers.find(tid2eid_key);
@@ -1001,6 +1326,22 @@ void moe_forward_gguf(
         if (meta_ptr && tid2eid_it->second.host_ptr &&
             meta_ptr->type == GGUFType::I32 && shape_ok) {
             tid2eid = reinterpret_cast<const int32_t*>(tid2eid_it->second.host_ptr);
+            tid2eid_n_vocab = (meta_ptr->shape.size() >= 2) ? (int64_t)meta_ptr->shape[1] : 0;
+            // Loud, PER-LAYER, ONE-SHOT: fires only if the table's real
+            // extent actually diverges from c.vocab -- the previous
+            // silent-UB path never had a way to surface this at all.
+            static std::vector<bool> tid2eid_vocab_mismatch_logged;
+            if ((int)tid2eid_vocab_mismatch_logged.size() <= layer_idx)
+                tid2eid_vocab_mismatch_logged.resize(layer_idx + 1, false);
+            if (!tid2eid_vocab_mismatch_logged[layer_idx] &&
+                tid2eid_n_vocab > 0 && tid2eid_n_vocab != (int64_t)c.vocab) {
+                LOG_ERROR("[MOE-ROUTE] layer=%d ffn_gate_tid2eid.weight real n_vocab (shape[1]=%lld) "
+                          "!= engine c.vocab (%d) -- bounding token-id lookups to the SMALLER of the "
+                          "two from now on; any real token id in that gap can never use the hash "
+                          "route for this layer and falls back to the learned router instead.\n",
+                          layer_idx, (long long)tid2eid_n_vocab, c.vocab);
+                tid2eid_vocab_mismatch_logged[layer_idx] = true;
+            }
         } else if (meta_ptr && tid2eid_it->second.host_ptr) {
             // Tensor loaded, but its type or row width doesn't match what
             // this raw-int32 read path assumes -- loud, PER-LAYER (see
@@ -1198,10 +1539,22 @@ void moe_forward_gguf(
         // garbage row would hand a downstream expert-array access an
         // out-of-bounds id -- any of these falls through to the normal
         // argsort path below for just this token, never crashes.
+        //
+        // Bound against tid2eid_n_vocab (the table's OWN on-disk ne[1]),
+        // not c.vocab: they're only guaranteed to agree if this file (or,
+        // under has_dense_model, whichever separate file the table
+        // actually loaded from) exported the table over the full engine
+        // vocab. Using c.vocab here previously let a real token id past
+        // the table's real, smaller extent read straight off the end of
+        // the posix_memalign'd buffer -- silent heap OOB, not a bounds
+        // check -- and come back with plausible-looking but meaningless
+        // int32 garbage that just happened to look like an "out-of-range
+        // expert id" downstream. tid2eid_n_vocab is 0 when the table
+        // failed to load at all, so this also degrades cleanly.
         bool used_hash_route = false;
         if (tid2eid && token_ids) {
             int tok = token_ids[s];
-            if (tok >= 0 && tok < c.vocab) {
+            if (tok >= 0 && (int64_t)tok < tid2eid_n_vocab) {
                 const int32_t* row = tid2eid + (size_t)tok * topk;
                 bool ids_valid = true;
                 for (int k = 0; k < topk; ++k) {
@@ -1286,6 +1639,54 @@ void moe_forward_gguf(
             perf().n_pilot_recall_hint_hits.fetch_add((uint64_t)hint_overlap, std::memory_order_relaxed);
             perf().n_pilot_recall_hint_checks_denom.fetch_add((uint64_t)hint_denom, std::memory_order_relaxed);
             scratch.pilot_pred_layer = -1;
+        }
+
+        // DEPTH-2 recall check (approach (a), measurement only) -- exact
+        // mirror of the depth-1 check above, comparing the slot for THIS
+        // parity (LayerScratch::pilot_pred2_slots[layer_idx % 2] -- see
+        // that array's own comment for why it's two slots, not one)
+        // against this same real router pick. Also buckets each pick's
+        // outcome by ITS OWN RANK (pk, 0..7) into the *_by_rank counters
+        // -- see n_pilot2_recall_hits_by_rank's own comment in
+        // perf_timer.hpp for why: pilot_pred_ids/pilot_pred2_ids[k] is
+        // already ranked by the pilot's own confidence (repeated argmax,
+        // k=0 = highest), so this answers "does accuracy concentrate in
+        // the high-confidence ranks" separately from the aggregate
+        // overlap counters above, which only sum across the whole top-K
+        // and can't distinguish "flat accuracy across all 8 ranks" from
+        // "rank 0-2 are great, rank 5-7 are noise."
+        {
+            auto& slot2 = scratch.pilot_pred2_slots[layer_idx % 2];
+            if (s == S - 1 && slot2.layer == layer_idx) {
+                int overlap = 0;
+                int hint_overlap = 0, hint_denom = 0;
+                for (int pk = 0; pk < slot2.count; ++pk) {
+                    int pred_id = slot2.ids[pk];
+                    bool matched = false;
+                    for (int k = 0; k < topk; ++k) {
+                        if (scratch.tok_topk_ids[s * topk + k] == pred_id) { matched = true; break; }
+                    }
+                    if (matched) ++overlap;
+                    if (pk < 8) {
+                        perf().n_pilot2_recall_checks_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                        if (matched) perf().n_pilot2_recall_hits_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (slot2.was_hint[pk]) {
+                        ++hint_denom;
+                        if (matched) ++hint_overlap;
+                        if (pk < 8) {
+                            perf().n_pilot2_recall_hint_checks_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                            if (matched) perf().n_pilot2_recall_hint_hits_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                perf().n_pilot2_recall_hits.fetch_add((uint64_t)overlap, std::memory_order_relaxed);
+                perf().n_pilot2_recall_checks.fetch_add(1, std::memory_order_relaxed);
+                perf().n_pilot2_recall_topk_sum.fetch_add((uint64_t)topk, std::memory_order_relaxed);
+                perf().n_pilot2_recall_hint_hits.fetch_add((uint64_t)hint_overlap, std::memory_order_relaxed);
+                perf().n_pilot2_recall_hint_checks_denom.fetch_add((uint64_t)hint_denom, std::memory_order_relaxed);
+                slot2.layer = -1;
+            }
         }
     }
 
@@ -1574,7 +1975,8 @@ void moe_forward_gguf(
                     exp->up_proj.host_ptr, exp->up_proj.meta,
                     exp->down_proj.host_ptr, exp->down_proj.meta,
                     scratch.gate_buf.data(), scratch.up_buf.data(),
-                    1, D, moe_inter, clamp_exp);
+                    1, D, moe_inter, clamp_exp,
+                    layer_idx, exp->expert_id);
                 accumulate(k, exp, scratch.down_buf.data());
             }
         };
@@ -2173,6 +2575,153 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                 // one -- see was_pilot_confirmed_resident's own comment on
                 // why this is measurement-only, not a hard correctness
                 // dependency either way.
+                // --- DEPTH-2 measurement (approach (a), "naive reuse"),
+                // now with REAL prefetch wiring gated by
+                // prefetch_pilot_depth2_enabled() ---
+                // Predicts l+2's routing by reusing the SAME `last_hidden`
+                // vector above -- i.e. gated on a vector missing l+1's own
+                // FFN contribution entirely, the exact term this block's
+                // own opening comment already showed is fatal to omit at
+                // depth-1. Reuses scratch.pilot_nrm/pilot_logits (l+1's
+                // k-loop has already consumed everything it needed from
+                // them). The MEASUREMENT (recall counters, residency
+                // classification, "Pilot recall by rank" report) always
+                // runs -- it's cheap (one more gate pass, same order as
+                // the l+1 pilot's own query) and lets a user evaluate
+                // depth-2 before ever turning it on. Only the REAL
+                // async_io_queue.push_hint / publish_pilot_confirmed_
+                // resident side effects are gated by
+                // prefetch_pilot_depth2_enabled() (EngineConfig::
+                // prefetch_pilot_depth) and further limited to the top
+                // pilot_k2_for_layer() ranks (EngineConfig::
+                // prefetch_pilot_k_depth2) -- see that config field's own
+                // comment for why a separate, often-smaller cutoff makes
+                // sense here than for l+1. (An FFN-reconstruction
+                // alternative, approach "(b)", was measured statistically
+                // tied with this despite costing real compute, and was
+                // removed -- see CLAUDE.md.)
+                //
+                // confirmed_resident_this_transition/count (declared above,
+                // in the l+1 block) is REUSED, not republished separately
+                // -- l+1's and l+2's confirmed-resident entries are
+                // published together in ONE call after this block, so a
+                // reader (evict_lru/RAM-tier eviction) always sees a
+                // complete, internally-consistent set for the WHOLE
+                // transition, matching that publish call's own
+                // single-call-after-the-full-k-loop reasoning at l+1's
+                // depth. PILOT_CONFIRMED_CAP (16) already covers the
+                // worst case (up to 8 from l+1 + up to 8 from l+2).
+                bool depth2_enabled = prefetch_pilot_depth2_enabled();
+                if (l + 2 < c.n_layers && c.n_experts > 0) {
+                    std::string norm_key2 = "blk." + std::to_string(l + 2) + ".ffn_norm.weight";
+                    std::string router_key2 = "blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight";
+                    auto norm_it2 = engine.resident_layers.find(norm_key2);
+                    auto router_it2 = engine.resident_layers.find(router_key2);
+                    if (norm_it2 != engine.resident_layers.end() && router_it2 != engine.resident_layers.end()
+                        && norm_it2->second.host_ptr && router_it2->second.host_ptr) {
+                        rmsnorm_row(scratch.pilot_nrm.data(), last_hidden,
+                                   reinterpret_cast<float*>(norm_it2->second.host_ptr), D, c.eps);
+
+                        dense_proj(engine, router_key2,
+                                   scratch.pilot_nrm.data(), scratch.pilot_logits.data(), 1, D, c.n_experts);
+
+                        apply_gating_activation(c.gating_func, scratch.pilot_logits.data(), c.n_experts);
+                        {
+                            std::string bias_key2 = "blk." + std::to_string(l + 2) + ".exp_probs_b.bias";
+                            auto bias_it2 = engine.resident_layers.find(bias_key2);
+                            if (bias_it2 != engine.resident_layers.end() && bias_it2->second.host_ptr) {
+                                const float* bias_row2 = reinterpret_cast<float*>(bias_it2->second.host_ptr);
+                                for (int e = 0; e < c.n_experts; ++e) scratch.pilot_logits[e] += bias_row2[e];
+                            }
+                        }
+
+                        // Two-slot ring, indexed by l % 2 -- see
+                        // LayerScratch::pilot_pred2_slots's own comment:
+                        // a single shared field here would get clobbered
+                        // by layer l+1's own depth-2 write before layer
+                        // l+2 ever gets a chance to consume it.
+                        auto& slot2 = scratch.pilot_pred2_slots[l % 2];
+                        int pilot_k2 = std::min(pilot_k_for_layer(l + 2), c.topk);
+                        slot2.count = pilot_k2;
+                        slot2.layer = l + 2;
+                        // How many of THIS transition's l+2 picks (ranked
+                        // 0 = highest pilot confidence, since they're
+                        // extracted by repeated argmax below) actually get
+                        // pushed as real hints -- independent of pilot_k2
+                        // above, which governs how many get MEASURED. See
+                        // EngineConfig::prefetch_pilot_k_depth2's own
+                        // comment for why a separate, often-smaller cutoff
+                        // makes sense for l+2 than for l+1.
+                        int depth2_push_cutoff = std::min(pilot_k2_for_layer(l + 2), pilot_k2);
+                        for (int k = 0; k < pilot_k2; ++k) {
+                            int best_exp = 0;
+                            for (int e = 1; e < c.n_experts; ++e) {
+                                if (scratch.pilot_logits[e] > scratch.pilot_logits[best_exp]) best_exp = e;
+                            }
+                            scratch.pilot_logits[best_exp] = -2e30f;
+                            slot2.ids[k] = best_exp;
+
+                            // Residency classification -- ALWAYS runs
+                            // (measurement, drives the report below and
+                            // the recall-check's fetch-worthy split)
+                            // regardless of whether this pick is actually
+                            // pushed as a real hint.
+                            bool already_ram = ram_mgr.is_ram_resident(l + 2, best_exp);
+                            bool already_vram = false, vram_pinned = false;
+                            if (!already_ram && ram_mgr.vram_cache) {
+                                for (const auto& loc : ram_mgr.vram_cache->expert_vram_cache) {
+                                    if (loc.layer_idx == l + 2 && loc.expert_id == best_exp) {
+                                        already_vram = true;
+                                        vram_pinned = loc.pinned;
+                                        break;
+                                    }
+                                }
+                            }
+                            bool is_hint_worthy = !already_ram && !already_vram;
+                            // Only picks within the real push cutoff can
+                            // affect real dispatch -- gate the eviction-
+                            // guard entry and the real push_hint call on
+                            // the SAME condition, so nothing gets
+                            // "protected" that was never actually relied
+                            // on, and nothing gets a real hint pushed for
+                            // it beyond what depth2_push_cutoff allows.
+                            bool depth2_active_here = depth2_enabled && k < depth2_push_cutoff;
+                            if (already_ram) {
+                                perf().n_pilot2_pred_already_ram.fetch_add(1, std::memory_order_relaxed);
+                                if (depth2_active_here && confirmed_resident_count < PILOT_CONFIRMED_CAP)
+                                    confirmed_resident_this_transition[confirmed_resident_count++] = {l + 2, best_exp};
+                            } else if (already_vram && vram_pinned) {
+                                perf().n_pilot2_pred_already_vram_pinned.fetch_add(1, std::memory_order_relaxed);
+                                // Deliberately NOT added to confirmed_resident_this_transition
+                                // -- a pinned slot can never be an evict_lru victim, see
+                                // that buffer's own comment above (same reasoning as l+1).
+                            } else if (already_vram) {
+                                perf().n_pilot2_pred_already_vram_lru.fetch_add(1, std::memory_order_relaxed);
+                                if (depth2_active_here && confirmed_resident_count < PILOT_CONFIRMED_CAP)
+                                    confirmed_resident_this_transition[confirmed_resident_count++] = {l + 2, best_exp};
+                            } else {
+                                perf().n_pilot2_pred_needs_fetch.fetch_add(1, std::memory_order_relaxed);
+                            }
+                            slot2.was_hint[k] = is_hint_worthy;
+                            if (depth2_active_here && is_hint_worthy) {
+                                // Tagged Depth2 -- see PilotSource's own
+                                // comment (async_prefetcher.hpp) -- so the
+                                // real disk-I/O cost of THIS hint is
+                                // attributable in the shutdown report's
+                                // "Prefetch real fetches (DEPTH-2 only)"
+                                // line, not silently folded into the
+                                // aggregate.
+                                async_io_queue.push_hint(l + 2, best_exp, PilotSource::Depth2);
+                                perf().n_pilot2_hints_pushed.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+
+                // Published ONCE for the whole transition (l+1's entries
+                // above plus l+2's above, if depth-2 is enabled) -- see
+                // this block's own opening comment for why a single
+                // combined publish, not two separate calls.
                 publish_pilot_confirmed_resident(confirmed_resident_this_transition, confirmed_resident_count);
             }
             PERF_END(pilot, t_prefetch);

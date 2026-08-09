@@ -103,6 +103,46 @@ struct EngineConfig {
     // actually pays off, without needing a single global value that fits
     // every layer's very different routing concentration equally badly.
     std::vector<int> prefetch_pilot_k_per_layer;
+
+    // How many layers ahead the pilot predicts AND pushes real prefetch
+    // hints for. 1 (default) = only l+1, the original production pilot
+    // (measured ~74% fetch-worthy recall on GLM-5.2/UD-IQ2_M). 2 = ALSO
+    // predicts and hints l+2, reusing the SAME vector the l+1 pilot
+    // already computes from (approach "(a)" -- free, one more gate pass,
+    // no extra compute; an FFN-reconstruction alternative was measured
+    // statistically tied with this despite costing real compute and was
+    // removed, see execution_layer.cpp's pilot loop). ADDITIVE, not a
+    // replacement: l+1 hints are always predicted and pushed first, l+2
+    // hints (governed by prefetch_pilot_k_depth2 below) are pushed after,
+    // on top -- since the shared prefetch queue is a FIFO ring buffer,
+    // this naturally gives l+1's more-accurate hints first claim on queue
+    // capacity. The l+2 MEASUREMENT (recall counters, "Pilot recall by
+    // rank" report) always runs regardless of this setting -- it's cheap
+    // (one gate pass) -- only the real push_hint/eviction-guard behavior
+    // is gated by it, so you can leave this at 1 and still see whether
+    // depth-2 would be worth enabling before ever turning it on. Valid
+    // values: 1 or 2; anything else falls back to 1 with a startup
+    // warning. UNVERIFIED ON REAL HARDWARE for wall-clock impact: l+2's
+    // recall (~55% fetch-worthy vs l+1's ~74%) is measured, but whether
+    // enabling this actually improves throughput -- versus adding queue
+    // contention or spending prefetch bandwidth on the ~45% wrong
+    // guesses -- has not been A/B'd on a real run yet.
+    int prefetch_pilot_depth = 1;
+
+    // How many of l+2's predicted top-K (ranked by the pilot's own
+    // confidence score -- rank 0 is the single highest-confidence pick,
+    // see the "Pilot recall by rank (DEPTH-2...)" shutdown report) are
+    // actually pushed as real prefetch hints. Independent of
+    // prefetch_pilot_k (which governs l+1 only) -- l+2's own measured
+    // accuracy is meaningfully lower, so a smaller cutoff here often
+    // makes sense once you've seen your own per-rank curve; fetching the
+    // low-confidence tail ranks costs the same prefetch bandwidth as the
+    // high-confidence ones for a much lower hit rate. Only takes effect
+    // when prefetch_pilot_depth = 2. Defaults to 8 (same ceiling as
+    // prefetch_pilot_k) -- lower it once the per-rank report shows where
+    // your model's own curve drops off.
+    int prefetch_pilot_k_depth2 = 8;
+
     // O_DIRECT expert-slab reads (Linux only). Opt-in, requires the model
     // to have been repacked with tools/gguf_tool pack (or otherwise have
     // general.alignment >= 4096) -- see GGUFFile::enable_direct_io. A
@@ -469,6 +509,22 @@ struct EngineConfig {
     // template-detection behavior is unchanged for normal interactive use.
     bool raw_prompt = false;
 
+    // Optional system-role message, prepended ahead of the user turn when a
+    // chat template is in use (GGUFTokenizer::has_chat_template /
+    // has_deepseek_chat_template). Empty by default -- confirmed
+    // byte-for-byte against the real DeepSeek-V4-Flash jinja template
+    // (models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja in a real
+    // llama.cpp checkout) that an absent system message legitimately
+    // produces {bos}<｜User｜>{msg}<｜Assistant｜></think> with no system
+    // text at all -- exactly what this engine already sent, so "missing
+    // system prompt" alone is not a template bug. A base model with no
+    // language-steering instruction will happily answer an
+    // ambiguous/short English prompt in Chinese; that's normal
+    // DeepSeek/Qwen/GLM-family behavior without one. Set this (or
+    // --system-prompt) to add one, e.g. "Respond in English unless asked
+    // otherwise."
+    std::string system_prompt;
+
     // Logging. Empty log_path (default) keeps everything on stderr, matching
     // prior behavior. log_level filters by severity: VERBOSE shows
     // high-volume structural traces (e.g. per-layer hidden-state norms
@@ -684,6 +740,13 @@ inline bool EngineConfig::load(const std::string& path) {
     cpu_affinity_layers = doc.root.get_int_array("cpu_affinity_layers");
     prefetch_pilot_k    = doc.root.get_int("prefetch_pilot_k", prefetch_pilot_k);
     prefetch_pilot_k_per_layer = doc.root.get_int_array("prefetch_pilot_k_per_layer");
+    prefetch_pilot_depth = doc.root.get_int("prefetch_pilot_depth", prefetch_pilot_depth);
+    if (prefetch_pilot_depth != 1 && prefetch_pilot_depth != 2) {
+        LOG_WARN("[CONFIG] prefetch_pilot_depth=%d is invalid (must be 1 or 2) -- falling back to 1\n",
+                 prefetch_pilot_depth);
+        prefetch_pilot_depth = 1;
+    }
+    prefetch_pilot_k_depth2 = doc.root.get_int("prefetch_pilot_k_depth2", prefetch_pilot_k_depth2);
     direct_io        = doc.root.get_bool("direct_io", direct_io);
     cuda_cufile      = doc.root.get_bool("cuda_cufile", cuda_cufile);
     prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher", prefill_warm_via_prefetcher);
@@ -722,6 +785,7 @@ inline bool EngineConfig::load(const std::string& path) {
     active_layer_promote_hit_threshold = doc.root.get_int("active_layer_promote_hit_threshold",
                                                             active_layer_promote_hit_threshold);
     raw_prompt           = doc.root.get_bool("raw_prompt", raw_prompt);
+    system_prompt        = doc.root.get_str("system_prompt", system_prompt);
     log_path         = doc.root.get_str("log_path", log_path);
     log_level        = doc.root.get_str("log_level", log_level);
 
@@ -870,6 +934,14 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Prefetch pilot_k (hints/layer transition): default=" << prefetch_pilot_k
                        << (prefetch_pilot_k_per_layer.empty() ? "" : ", " + std::to_string(prefetch_pilot_k_per_layer.size())
                            + " layer override value(s) set (see [PREFETCH-LAYER] report)")
+                       << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Prefetch pilot depth: " << prefetch_pilot_depth
+                       << (prefetch_pilot_depth == 2
+                               ? (" (l+2 hints ON, top-" + std::to_string(prefetch_pilot_k_depth2)
+                                  + " ranks pushed -- UNVERIFIED for wall-clock impact, see 'Pilot recall (DEPTH-2...' "
+                                  + "and 'Pilot recall by rank' in the shutdown report)")
+                               : " (l+2 measurement-only -- see 'Pilot recall (DEPTH-2...' in the shutdown report "
+                                 "before enabling)")
                        << "\n";
     if (cpu_only) LOG_STREAM_INFO() << "[CONFIG] CPU-only mode: ON (all GPU dispatch disabled)\n";
     if (!cpu_affinity_layers.empty()) {
@@ -1080,6 +1152,26 @@ prefetch_pilot_k = 8
 # likely to be wasted; this lets you turn those down without touching
 # layers where prediction is genuinely good.
 # prefetch_pilot_k_per_layer = [8, 8, 8, 0, 0, 4]
+
+# prefetch_pilot_depth: how many layers ahead the pilot predicts AND pushes
+# real prefetch hints for. 1 (default) = only l+1, the original pilot. 2 =
+# ALSO predicts and hints l+2 (free -- reuses l+1's own input vector, no
+# extra compute). l+2's measurement (recall counters, "Pilot recall by
+# rank" report) always runs regardless of this setting, so you can check
+# whether depth-2 looks worth it BEFORE flipping this to 2. On GLM-5.2,
+# l+2's own fetch-worthy recall measured ~55% vs l+1's ~74% -- meaningfully
+# worse, real, not free of cost once wired into real dispatch (queue
+# contention, wrong-guess bandwidth). UNVERIFIED ON REAL HARDWARE for
+# wall-clock impact -- only the recall numbers are measured so far.
+prefetch_pilot_depth = 1
+
+# prefetch_pilot_k_depth2: how many of l+2's predicted top-K (ranked by the
+# pilot's own confidence, rank 0 = highest) are actually pushed as real
+# hints. Independent of prefetch_pilot_k. Only takes effect when
+# prefetch_pilot_depth = 2. Check the fetch-worthy 'Pilot recall by rank
+# (DEPTH-2...' shutdown-report line first -- if accuracy drops off
+# sharply past rank 2-3, there's little point pushing ranks 4-7 too.
+prefetch_pilot_k_depth2 = 8
 
 # Host RAM (DDR) budget for the MoE expert LRU cache, in GB.
 # 0 = auto-detect (88% of currently-available system memory).

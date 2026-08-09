@@ -409,6 +409,59 @@ struct PerfCounters {
     std::atomic<uint64_t> n_pilot_recall_hint_hits{0};        // of the needs_fetch subset, how many matched the real router's later choice
     std::atomic<uint64_t> n_pilot_recall_hint_checks_denom{0}; // denominator for the above (sum of needs_fetch picks actually checked against a real routing decision)
 
+    // DEPTH-2 measurement (approach (a), "naive reuse" only) -- exact
+    // mirror of the eight counters above, one hop further out.
+    // execution_layer.cpp's pilot loop predicts l+2's routing by reusing
+    // the SAME pre-(l+1)-attention hidden_states vector the l+1 pilot
+    // already computes from -- i.e. missing l+1's own FFN contribution
+    // entirely, the single term already proven fatal to omit at depth-1
+    // (see that block's own comment on the 0%-recall failure the
+    // post-FFN timing fix corrected). MEASUREMENT ONLY: never wired to
+    // async_io_queue.push_hint or publish_pilot_confirmed_resident, so
+    // these counters have zero effect on cache behavior or dispatch --
+    // they exist purely to get a real per-token answer to "is depth-2
+    // worth building at all" instead of the aggregate .moestream_usage
+    // proxy check.
+    std::atomic<uint64_t> n_pilot2_recall_hits{0};
+    std::atomic<uint64_t> n_pilot2_recall_checks{0};
+    std::atomic<uint64_t> n_pilot2_recall_topk_sum{0};
+    std::atomic<uint64_t> n_pilot2_pred_already_ram{0};
+    std::atomic<uint64_t> n_pilot2_pred_already_vram_pinned{0};
+    std::atomic<uint64_t> n_pilot2_pred_already_vram_lru{0};
+    std::atomic<uint64_t> n_pilot2_pred_needs_fetch{0};
+    std::atomic<uint64_t> n_pilot2_recall_hint_hits{0};
+    std::atomic<uint64_t> n_pilot2_recall_hint_checks_denom{0};
+
+    // Real push_hint(l+2, ...) calls -- nonzero only once
+    // EngineConfig::prefetch_pilot_depth=2 AND a pick both clears the
+    // is_hint_worthy check (genuinely cold) and falls within
+    // prefetch_pilot_k_depth2's rank cutoff (execution_layer.cpp's pilot
+    // loop). Distinguishes "we WOULD have pushed a hint here" (the
+    // measurement counters above, always live) from "we actually did"
+    // (this one, only live when depth-2 is turned on for real).
+    std::atomic<uint64_t> n_pilot2_hints_pushed{0};
+
+    // Per-RANK breakdown of DEPTH-2(a)'s accuracy -- LayerScratch::
+    // pilot_pred2_ids[k] is already ranked by the pilot's own gate score
+    // (k=0 is the single highest-confidence pick, built by a repeated
+    // argmax -- see execution_layer.cpp's pilot loop), but
+    // n_pilot2_recall_hits/n_pilot2_recall_hint_hits above only sum across
+    // the whole top-K, so they can't say whether accuracy concentrates in
+    // the high-confidence ranks or is spread flat across all 8 -- the real
+    // question behind "could we skip fetching the low-confidence tail and
+    // only prefetch the top M ranks." Indexed by rank k (0..7).
+    // *_checks_by_rank[k] is the per-rank denominator (how many times rank
+    // k was even populated -- pilot_k2 can be < 8 for some layers via
+    // prefetch_pilot_k_per_layer, so this isn't always a flat divide by
+    // n_pilot2_recall_checks). *_hint_*_by_rank[k] mirrors this restricted
+    // to the fetch-worthy subset, same "only correctness that could change
+    // real I/O matters" reasoning as the aggregate hint counters above,
+    // just broken out per rank instead of summed into one total.
+    std::array<std::atomic<uint64_t>, 8> n_pilot2_recall_hits_by_rank{};
+    std::array<std::atomic<uint64_t>, 8> n_pilot2_recall_checks_by_rank{};
+    std::array<std::atomic<uint64_t>, 8> n_pilot2_recall_hint_hits_by_rank{};
+    std::array<std::atomic<uint64_t>, 8> n_pilot2_recall_hint_checks_by_rank{};
+
     // Real prefetch-worker fetch stats (only nonzero once
     // prefetch_worker_threads > 0 and a worker actually starts a read --
     // separate from n_pilot_pred_needs_fetch above, which counts hints
@@ -425,6 +478,37 @@ struct PerfCounters {
     std::atomic<uint64_t> n_prefetch_failed{0};
     std::atomic<uint64_t> bytes_prefetched{0};
     std::atomic<double>   t_prefetch_read_ms_sum{0};
+
+    // DEPTH-2-only breakdown of the five counters directly above --
+    // subsets, not separate totals (n_prefetch_issued already includes
+    // n_prefetch_issued_depth2's count, etc.). Exists to make depth-2's
+    // (EngineConfig::prefetch_pilot_depth=2) marginal real disk-I/O cost a
+    // MEASURED number: real bytes read, real time spent, real fetches
+    // issued/completed/failed, all attributable specifically to l+2 pilot
+    // hints (async_prefetcher.hpp's PilotSource::Depth2) rather than an
+    // estimate extrapolated from the recall-only counters above (which
+    // count predictions, not actual disk activity). "Depth-1's own share"
+    // is recoverable as (aggregate - this) but isn't tracked as its own
+    // explicit counter -- see PilotSource's own comment for why: the
+    // aggregate also includes Phase 2 prefill-warm hints, which aren't
+    // depth-1 pilot hints either, so a literal "_depth1" counter would
+    // invite exactly that misreading.
+    std::atomic<uint64_t> n_prefetch_issued_depth2{0};
+    std::atomic<uint64_t> n_prefetch_completed_depth2{0};
+    std::atomic<uint64_t> n_prefetch_failed_depth2{0};
+    std::atomic<uint64_t> bytes_prefetched_depth2{0};
+    std::atomic<double>   t_prefetch_read_ms_sum_depth2{0};
+    // A depth-2 hint's worker claim found the expert already resident or
+    // already being fetched by someone else -- a hint that cost queue
+    // space and worker attention but triggered no real read either way
+    // (async_prefetcher.hpp's active_prefetch, claim_or_wait's Hit/Loading
+    // branches). Distinct from n_pilot2_pred_already_* (perf_timer.hpp,
+    // execution_layer.cpp) -- those measure residency AT PREDICTION TIME
+    // (before a hint is even pushed, already excluded via is_hint_worthy);
+    // this measures residency AT CLAIM TIME (moments later, when a worker
+    // actually got to it) -- a real, if usually small, race window this
+    // number quantifies directly instead of assuming away.
+    std::atomic<uint64_t> n_prefetch_claims_beaten_depth2{0};
 
     std::atomic<uint64_t> n_vram_evict_demoted{0};  // VRAM evictions salvaged into the RAM tier via a D2H copy instead of being dropped outright (vram_evict_demote_to_ram=true) -- nonzero proves the salvage path is engaging; compare against Expert cache's disk-miss count for the real win (a demoted expert re-hit later serves from RAM, no disk read at all)
     std::atomic<uint64_t> n_vram_evict_demote_skipped{0}; // demote attempts that declined for a benign reason (already RAM-resident, or the layer uses the legacy per-expert-tensor format with no packed_slab_geometry) -- not an error, just nothing to do
@@ -1218,6 +1302,69 @@ struct PerfCounters {
             }
         }
         {
+            // DEPTH-2 report -- approach (a), "naive reuse", measurement
+            // only (see n_pilot2_recall_hits's own comment). Not wired to
+            // any real prefetch path; exists to answer whether depth-2 is
+            // worth building at all.
+            uint64_t rhits2 = n_pilot2_recall_hits.load(), rchecks2 = n_pilot2_recall_checks.load();
+            uint64_t rdenom2 = n_pilot2_recall_topk_sum.load();
+            if (rchecks2 > 0) {
+                LOG_INFO("Pilot recall (DEPTH-2, EXPERIMENTAL, measurement-only): %lu/%lu (%.1f%%) predicted-top-K "
+                         "overlap with the REAL router's top-K two layers out, over %lu (layer, last-token) "
+                         "checks -- naive reuse of the SAME vector the depth-1 pilot uses, missing l+1's own FFN "
+                         "contribution entirely\n",
+                         (unsigned long)rhits2, (unsigned long)rdenom2,
+                         rdenom2 > 0 ? 100.0 * rhits2 / rdenom2 : 0.0, (unsigned long)rchecks2);
+                uint64_t already_ram2 = n_pilot2_pred_already_ram.load();
+                uint64_t already_pin2 = n_pilot2_pred_already_vram_pinned.load();
+                uint64_t already_lru2 = n_pilot2_pred_already_vram_lru.load();
+                uint64_t needs_fetch2 = n_pilot2_pred_needs_fetch.load();
+                uint64_t total_pred2 = already_ram2 + already_pin2 + already_lru2 + needs_fetch2;
+                LOG_INFO("Pilot prediction coverage (DEPTH-2): %lu/%lu top-K picks needed a fetch (already cached: "
+                         "%lu vram-pin + %lu vram-lru + %lu ram)\n",
+                         (unsigned long)needs_fetch2, (unsigned long)total_pred2,
+                         (unsigned long)already_pin2, (unsigned long)already_lru2, (unsigned long)already_ram2);
+                uint64_t hhits2 = n_pilot2_recall_hint_hits.load(), hdenom2 = n_pilot2_recall_hint_checks_denom.load();
+                LOG_INFO("Pilot accuracy (DEPTH-2, fetch-worthy only): %lu/%lu (%.1f%%) -- the number that "
+                         "determines whether depth-2 prefetch (prefetch_pilot_depth=2) can help\n",
+                         (unsigned long)hhits2, (unsigned long)hdenom2,
+                         hdenom2 > 0 ? 100.0 * hhits2 / hdenom2 : 0.0);
+                uint64_t pushed2 = n_pilot2_hints_pushed.load();
+                LOG_INFO("Pilot DEPTH-2 real hints pushed: %lu (nonzero only when prefetch_pilot_depth=2 -- "
+                         "compare against %lu fetch-worthy picks above to see how much prefetch_pilot_k_depth2's "
+                         "rank cutoff is holding back)\n",
+                         (unsigned long)pushed2, (unsigned long)hdenom2);
+
+                // Per-RANK breakdown -- see n_pilot2_recall_hits_by_rank's
+                // own comment. Answers "does accuracy concentrate in the
+                // pilot's own highest-confidence ranks" -- the question
+                // that decides whether truncating to fewer fetched ranks
+                // is a sound idea, as opposed to naively scaling K by the
+                // aggregate fetch-worthy percentage above (which says
+                // nothing about the SHAPE of the accuracy-by-rank curve).
+                // Two lines (overall / fetch-worthy) mirroring the two
+                // aggregate numbers just printed, one %% per rank instead
+                // of one %% total.
+                std::string rank_line_overall = "Pilot recall by rank (DEPTH-2, overall):     ";
+                std::string rank_line_hint    = "Pilot recall by rank (DEPTH-2, fetch-worthy): ";
+                char buf[64];
+                for (int rk = 0; rk < 8; ++rk) {
+                    uint64_t rh = n_pilot2_recall_hits_by_rank[rk].load();
+                    uint64_t rc = n_pilot2_recall_checks_by_rank[rk].load();
+                    snprintf(buf, sizeof(buf), "k%d=%.1f%%(n=%lu) ", rk,
+                             rc > 0 ? 100.0 * rh / rc : 0.0, (unsigned long)rc);
+                    rank_line_overall += buf;
+                    uint64_t hh = n_pilot2_recall_hint_hits_by_rank[rk].load();
+                    uint64_t hc = n_pilot2_recall_hint_checks_by_rank[rk].load();
+                    snprintf(buf, sizeof(buf), "k%d=%.1f%%(n=%lu) ", rk,
+                             hc > 0 ? 100.0 * hh / hc : 0.0, (unsigned long)hc);
+                    rank_line_hint += buf;
+                }
+                LOG_INFO("%s\n", rank_line_overall.c_str());
+                LOG_INFO("%s\n", rank_line_hint.c_str());
+            }
+        }
+        {
             uint64_t issued = n_prefetch_issued.load();
             if (issued > 0) {
                 uint64_t completed = n_prefetch_completed.load();
@@ -1240,6 +1387,30 @@ struct PerfCounters {
                 LOG_INFO("Prefetch real fetches: %lu issued, %lu completed / %lu failed | %.2f MB read, "
                          "avg %.2f ms/fetch\n",
                          (unsigned long)issued, (unsigned long)completed, (unsigned long)failed, mb, avg_ms);
+
+                // DEPTH-2's marginal share of the above -- see
+                // n_prefetch_issued_depth2's own comment for why this is a
+                // subset, not a separate total, and why "depth-1's share"
+                // isn't computed here as a literal subtraction (the
+                // aggregate also includes Phase 2 prefill-warm hints).
+                // Only printed once depth-2 has actually issued at least
+                // one real fetch -- silent (not a misleading 0-line) when
+                // prefetch_pilot_depth=1, the default.
+                uint64_t issued2 = n_prefetch_issued_depth2.load();
+                if (issued2 > 0) {
+                    uint64_t completed2 = n_prefetch_completed_depth2.load();
+                    uint64_t failed2 = n_prefetch_failed_depth2.load();
+                    uint64_t beaten2 = n_prefetch_claims_beaten_depth2.load();
+                    double mb2 = bytes_prefetched_depth2.load() / 1e6;
+                    double avg_ms2 = completed2 > 0 ? t_prefetch_read_ms_sum_depth2.load() / completed2 : 0.0;
+                    LOG_INFO("Prefetch real fetches (DEPTH-2 only): %lu issued (%.1f%% of all real fetches), "
+                             "%lu completed / %lu failed / %lu claim-beaten (already resident/loading by the "
+                             "time a worker got to it) | %.2f MB read (%.1f%% of all prefetched bytes), "
+                             "avg %.2f ms/fetch\n",
+                             (unsigned long)issued2, issued > 0 ? 100.0 * issued2 / issued : 0.0,
+                             (unsigned long)completed2, (unsigned long)failed2, (unsigned long)beaten2,
+                             mb2, mb > 0 ? 100.0 * mb2 / mb : 0.0, avg_ms2);
+                }
             }
         }
         LOG_INFO("VRAM->RAM demote:    %lu salvaged / %lu skipped (benign) / %lu failed "

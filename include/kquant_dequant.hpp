@@ -360,6 +360,9 @@ inline bool dequant_row(GGUFType type, const uint8_t* ptr, float* out, int n) {
         case GGUFType::IQ3_XXS:
             dequantize_row_iq3_xxs_avx512(ptr, out, n);
             return true;
+        case GGUFType::IQ2_XS:
+            dequantize_row_iq2_xs_avx512(ptr, out, n);
+            return true;
         case GGUFType::IQ2_S:
             dequantize_row_iq2_s_avx512(ptr, out, n);
             return true;
