@@ -1,5 +1,6 @@
 #pragma once
 #include "engine.hpp"
+#include "tensor_trace.hpp"
 #include "ram_manager.hpp"
 #include "kernels_cpu.hpp"
 #include "dense_dispatch.hpp"
@@ -33,7 +34,10 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[HIDDEN] %s: hidden_states corrupted -- %d/%zu NaN, %d/%zu Inf.\n",
                   label, nan_count, n, inf_count, n);
+        trace_abort_if_nan("HIDDEN", true);
+        return;
     }
+    if (trace_gate("HIDDEN")) trace_row("HIDDEN", -1, label, data, n);
 }
 // token_ids: the S current input token ids that produced hidden_states'
 // S rows (one per row, same order) -- needed by DeepSeek-V4 hash-routed MoE
@@ -265,6 +269,18 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     }
 
     std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
+    // Brackets the SAME window PERF_START(prefill)/PERF_END(prefill, ...)
+    // measures, reusing the exact Snapshot/operator-/print_summary
+    // machinery the whole-REQUEST line already uses (request_snap_start
+    // below) -- gives a full attn=/gpu=/disk=/ram_scan=/etc. breakdown
+    // scoped to ONLY this prefill call, not the whole request. Added
+    // specifically because Phase 2 (prefill_warm/opportunistic-promotion
+    // tuning) turned out to cost well under 1s while "Prefill (whole
+    // pass)" stayed ~19s -- meaning most of prefill's own wall time was
+    // going somewhere never actually broken down (attention? real disk
+    // wait? GPU dispatch?), and guessing further at VRAM-placement timing
+    // without that breakdown was no longer well-founded. See CLAUDE.md.
+    auto prefill_snap_start = perf().snapshot();
     PERF_START(prefill);
     // Hyper-Connections (DeepSeek-V4): expand into engine.hc_stream_buf
     // before, collapse back into hidden_states after -- see
@@ -286,7 +302,45 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // contribution during this same call, so nothing here needs to also
     // feed t_attn.
     PERF_END(prefill, t_prefill_total);
+    // THIS call's own wall time, not t_prefill_total's cumulative-across-
+    // requests total -- reuses PERF_END(prefill, ...)'s own start-time local
+    // (_perf_prefill, from PERF_START(prefill) above) rather than adding a
+    // second independent timer, so this is the exact same window PERF_END
+    // just measured (re-reading now() a few cheap instructions later, not a
+    // second clock source).
+    double prefill_wall_s = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - _perf_prefill).count();
     perf().n_prompt_tokens.fetch_add(prompt_ids.size(), std::memory_order_relaxed);
+    // Full attn=/gpu=/disk=/ram_scan=/etc. breakdown for JUST this prefill
+    // call -- same Snapshot-diff + print_summary machinery the whole-
+    // REQUEST line uses (request_snap_start/print_summary("REQUEST", ...)
+    // below), just scoped to prefill_snap_start's own narrower window
+    // instead of the whole request. Label "PREFILL" so it's visually
+    // distinct from "REQUEST" and "TOKEN N" in the log.
+    auto prefill_snap_end = perf().snapshot();
+    auto prefill_delta = prefill_snap_end - prefill_snap_start;
+    PerfCounters::print_summary("PREFILL", prefill_wall_s * 1000.0, (int)prompt_ids.size(), prefill_delta);
+    // Answers "is phase_b's remaining cost a coverage gap (never hinted)
+    // or a worker-capacity gap (hinted, but the decode thread's own
+    // dispatch got there before any prefetch worker did)" -- see
+    // PerfCounters::Snapshot's own comment on these fields. by_decode
+    // means the decode thread itself won the claim (no prefetch worker
+    // had even started on it yet); by_prefetch means a worker won it
+    // first (the intended case). A high by_decode share alongside a real
+    // avg wait time on the SEPARATE "Unified RAM wait" counter (dump_
+    // report(), whole-run) would point at prefetch_worker_threads being
+    // undersized relative to prefill's own hint volume, not a coverage
+    // gap in what gets hinted.
+    LOG_STREAM_INFO() << "[PREFILL] RAM claim: " << prefill_delta.n_ram_claim_hit << " hit / "
+                       << prefill_delta.n_ram_claim_by_decode << " by-decode (raced ahead of any "
+                          "prefetch worker -- a real disk read on the decode thread, phase_b's own cost) / "
+                       << prefill_delta.n_ram_claim_by_prefetch << " by-prefetch (a worker won the claim "
+                          "first, as intended), " << prefill_delta.n_ram_wait_inflight_decode
+                       << " decode wait(s) for an in-flight prefetch, avg "
+                       << (prefill_delta.n_ram_wait_inflight_decode > 0
+                               ? (prefill_delta.t_ram_wait_inflight_ms_sum / prefill_delta.n_ram_wait_inflight_decode)
+                               : 0.0)
+                       << "ms\n";
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
 
     // Snapshot VRAM slot occupancy RIGHT HERE, at the exact prefill/decode
@@ -296,6 +350,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // Phase 2's warm-up) vs. during decode's own reactive promotions
     // afterward. Previously the only way to see prefill's own contribution
     // was to infer it indirectly.
+    LOG_STREAM_INFO() << "[PREFILL-DONE] " << prompt_ids.size() << " tokens in " << prefill_wall_s
+                       << "s (" << ((prefill_wall_s > 0.0) ? (prompt_ids.size() / prefill_wall_s) : 0.0)
+                       << " tok/s) -- this request's own prefill pass only, matches the 'prefill=' figure "
+                          "in the shutdown report's Rates line but available here at the actual "
+                          "prefill/decode boundary instead of only after the whole request finishes.\n";
     if (ram_mgr.vram_cache) {
         LOG_STREAM_INFO() << "[PREFILL-DONE] VRAM slot occupancy immediately after prefill (before any decode "
                               "token) -- compare against the same [VRAM-SLOTS] line at shutdown:\n";

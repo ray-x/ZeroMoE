@@ -205,6 +205,7 @@ if(NOT MOESTREAM_CPU_ONLY)
     # between both executables the same way models/model_factory.cpp
     # already is, since both need the identical GPU dispatch surface.
     set(MOESTREAM_CUDA_SRCS
+        cuda/attn_score_softmax.cu
         cuda/gguf_cuda.cu
         cuda/iq1_dequant.cu
         cuda/iq2_matmul.cu

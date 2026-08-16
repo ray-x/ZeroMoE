@@ -128,6 +128,26 @@ __device__ __forceinline__ float dequant_iq2_s_coop(const block_iq2_s_cu* xb, in
     return dl * (float)grid_j * ((signs[l] & c_kmask_iq2xs[j]) ? -1.f : 1.f);
 }
 
+// Reduction: 256-thread shared-memory tree (8 rounds of shared-mem add +
+// __syncthreads()). An external suggestion proposed warp-shuffle reduction
+// here instead, matching the pattern already used in cuda/q8_0_matmul.cu,
+// cuda/kquant_matmul.cu, cuda/iq3_matmul.cu, cuda/iq4xs_matmul.cu, and
+// cuda/mxfp4_matmul.cu -- REAL-HARDWARE TESTED (RTX 3090, real gate/up
+// expert shape I=6144 O=2048) and found to be NO improvement here: a
+// first, FLAWED A/B (comparing dense_matmul_host's full H2D+kernel+D2H
+// pipeline for tree against a raw kernel-only launch for shfl) wrongly
+// suggested 1.45-1.64x; a corrected kernel-only-both-sides re-measurement
+// showed 0.9999x (statistically identical), confirmed independently by a
+// real [PREFILL] run's own dense_cmp counter barely moving (1.57s->1.55s,
+// ~1.3%, within noise) after the shfl variant briefly shipped. Root cause:
+// unlike q8_0/K-quant's simpler dequant loops (where the tree reduction's
+// fixed 8-sync cost is a meaningful fraction of a cheap kernel), IQ2_XXS's
+// per-element dequant (grid/sign table lookups from __constant__ memory)
+// keeps all 256 threads doing real, comparatively expensive work every
+// iteration -- the reduction stage is a much smaller slice of total kernel
+// time here, so switching its algorithm doesn't move the needle. Reverted
+// to the tree kernel (this comment kept as a marker so a future session
+// doesn't re-propose and re-test the identical idea from scratch).
 #define IQ2_MATMUL_KERNEL(NAME, BLOCKT, DEQUANT) \
 __global__ void NAME##_iq2_matmul_kernel( \
     float* __restrict__ y, const float* __restrict__ x, const BLOCKT* __restrict__ W, \

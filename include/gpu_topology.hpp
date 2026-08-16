@@ -105,6 +105,54 @@ struct ExpertLocation {
     bool upload_ready = true;
     cudaEvent_t upload_event = nullptr;
 
+    // Active-layer batch pre-warm only (upload_expert_active_async,
+    // gpu_topology.cpp, 2026-08-12): set true when a slot is proactively
+    // filled BEFORE any token's Phase-3 dispatch has touched it this
+    // layer. Real-hardware A/B found pre-warming interacts badly with a
+    // low active_layer_promote_hit_threshold (this config: 1) --
+    // reactive upload_expert_active's own first touch was ALWAYS a
+    // find_active_expert MISS (cheap, no promotion; promotion only fired
+    // on a genuine SECOND touch by a different token needing the same
+    // expert). Pre-warming makes the FIRST real touch a HIT instead,
+    // immediately crossing threshold=1 and promoting EVERY pre-warmed
+    // expert on first use, not just genuinely repeat-visited ones --
+    // measured cost: vram_demote and find_active_expert's own scan cost
+    // both roughly TRIPLED (1.2s->3.8-3.9s), more than erasing active_up's
+    // own real 63% reduction (4.87s->1.78s), net prefill wall time WORSE
+    // (16.28s->18.89s). Fixed by having find_active_expert's hit branch
+    // skip counting this ONE upcoming hit toward the promote threshold
+    // when this flag is set, then clearing it -- restores the original
+    // "first touch is free" semantics pre-warming would otherwise silently
+    // break, without changing hit_count accounting itself.
+    bool prewarm_skip_next_promote = false;
+
+    // Waste-measurement pair for decode_async_prewarm/prefill's Phase-2
+    // batch pre-warm (2026-08-15) -- built specifically to answer "how much
+    // of the ~205GB/request this feature moves is later actually used"
+    // before spending any further engineering effort tuning HOW MUCH gets
+    // pre-warmed (see t_active_layer_upload_async's own comment for why two
+    // real transfer-mechanism fixes were tried and reverted, converging on
+    // "the volume itself is the real cost, not the mechanism"). was_async_
+    // prewarmed marks a slot's CURRENT content as having arrived via
+    // upload_expert_active_async (never set by the reactive upload_expert_
+    // active sync path -- that's already a confirmed real need, not a
+    // speculative one). prewarm_touched is set true the instant find_active
+    // _expert finds a real dispatch match for this slot's content,
+    // regardless of hit_count/promotion outcome -- deliberately NOT the
+    // same signal as hit_count==0, because decode_async_prewarm's own
+    // prewarm_skip_next_promote branch (see find_active_expert's own
+    // comment) intentionally does NOT increment hit_count on a prewarmed
+    // slot's first real touch, which is exactly the common, INTENDED,
+    // successful case this counter must not misclassify as "wasted".
+    // Checked (and both reset) at every reclaim site (cleanup_active_layer_
+    // area, upload_expert_active_async's own victim-eviction of an occupied
+    // slot, upload_expert_active's equivalent, and a successful promotion)
+    // -- was_async_prewarmed && !prewarm_touched at reclaim time means the
+    // data was fetched but no real dispatch ever needed it before it was
+    // discarded.
+    bool was_async_prewarmed = false;
+    bool prewarm_touched = false;
+
     // Phase A a pinned slot is never chosen as an eviction
     // victim, regardless of eviction_score. Set once a RAM-cache expert's
     // hit_count crosses RAMSafetyManager::pin_threshold (proven-hot within
@@ -206,6 +254,34 @@ public:
     // than the RAM tier's whole-conversation lifetime, so a repeat hit here
     // is already a comparatively strong signal.
     int active_layer_promote_threshold = 1;
+
+    // Mirrors RAMSafetyManager::in_prefill (same set site, execution_layer.
+    // cpp's layers_forward_gguf, S>1 = prefill). REAL-HARDWARE FINDING
+    // (2026-08-12): active_layer_promote_threshold=1 means literally any
+    // second touch of a pre-warmed/reactively-uploaded active-layer expert
+    // promotes it into the main VRAM cache -- fine at decode's steady one-
+    // token-at-a-time pace, but during prefill's own dense multi-token
+    // burst this fires constantly, and since the main cache is ALREADY
+    // essentially 100% full by partway through every prefill pass, each
+    // promotion forces a real eviction (vram_demote) of some OTHER
+    // resident to make room. Measured: vram_demote and find_active_
+    // expert's own scan cost both climbed to ~40% of prefill's total wall
+    // time chasing this churn, repeatedly, across several attempted
+    // mitigations (see CLAUDE.md) that each still allowed SOME promotion
+    // during prefill. The actual fix: don't promote from the active layer
+    // into the main cache AT ALL while in_prefill is true -- let prefill's
+    // own experts live in the active-layer pool (a real, separate ~256-
+    // slot VRAM allowance that doesn't compete with the main cache's fixed
+    // budget at all) for the whole prefill pass, protecting decode's own
+    // pinned/hot main-cache content from any prefill-driven churn by
+    // construction, not by chasing every downstream side effect of
+    // letting it happen. cleanup_active_layer_area's own end-of-layer
+    // reclaim already frees/reuses active-layer slots every layer
+    // regardless (no explicit prefill-specific swap-out step needed --
+    // nothing prefill-only ever reaches the main cache in the first
+    // place). Decode's own promotion behavior (in_prefill=false) is
+    // completely unchanged -- this only gates the prefill case.
+    bool in_prefill = false;
 
     // Periodic decay of hit_count so a once-hot expert doesn't stay
     // permanently sticky after routing patterns shift (e.g. topic change).
@@ -353,6 +429,54 @@ public:
     std::vector<BounceBuffer> bounce_pool;
     size_t bounce_next = 0;
 
+    // upload_expert_async's cudaHostRegister conversion (2026-08-13, Alt A,
+    // same mechanism as upload_expert's own -- see that function's comment
+    // for the real-hardware numbers that motivated it there). Unlike
+    // upload_expert, this function's DMA is still in flight when it
+    // returns, so host_data can't be unregistered synchronously -- doing
+    // so would risk unregistering pinned memory a still-in-flight DMA is
+    // reading from, the exact class of "completion timing" mistake this
+    // codebase's own documented decode-path corruption incident already
+    // taught it to avoid. Deferred instead: each successful registration's
+    // (host pointer, slot's upload_event) pair is queued here, and
+    // reap_pending_host_unregisters() -- called opportunistically, with
+    // `lock` already held, at the top of every upload_expert_async call --
+    // unregisters only the ones whose event has ACTUALLY completed
+    // (cudaEventQuery == cudaSuccess), never speculatively. Safe to check
+    // slot->upload_event even though it's a per-SLOT event that may be
+    // re-recorded by a LATER, unrelated promotion before this entry is
+    // reaped: cudaMemcpyAsync + cudaEventRecord are both issued on the same
+    // dev.copy_stream in program order, and CUDA streams execute enqueued
+    // work in issue order, so confirming ANY recording of this event from
+    // this point forward (this one or a later one) also proves THIS entry's
+    // own earlier DMA -- issued strictly before that recording on the same
+    // stream -- has already completed. Never records the same host pointer
+    // twice while a prior registration for it is still pending (see the
+    // guard in upload_expert_async itself) -- cudaHostRegister on an
+    // already-registered range fails, which would otherwise misattribute a
+    // failure to a genuinely fine call.
+    struct PendingHostUnregister { void* host_ptr; cudaEvent_t event; };
+    std::vector<PendingHostUnregister> pending_host_unregisters;
+
+    // Drains pending_host_unregisters of every entry whose DMA has
+    // genuinely completed. Caller must already hold `lock` (both call
+    // sites -- upload_expert_async and the destructor -- satisfy this).
+    void reap_pending_host_unregisters() {
+        size_t write = 0;
+        for (size_t i = 0; i < pending_host_unregisters.size(); ++i) {
+            auto& p = pending_host_unregisters[i];
+            if (cudaEventQuery(p.event) == cudaSuccess) {
+                PERF_START(upload_async_host_unregister);
+                cudaHostUnregister(p.host_ptr);
+                PERF_END(upload_async_host_unregister, t_upload_async_host_unregister);
+                perf().n_upload_async_deferred_unregister_reaped.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                pending_host_unregisters[write++] = p;
+            }
+        }
+        pending_host_unregisters.resize(write);
+    }
+
     bool initialize() {
         int device_count = 0;
         if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -417,6 +541,20 @@ public:
     }
 
     ~GpuTopology() {
+        // Drain pending_host_unregisters BEFORE the upload_event destroy
+        // loop below -- reap_pending_host_unregisters() reads those same
+        // events to decide what's safe to unregister, so it must run while
+        // they're still valid. A normal, orderly shutdown should have
+        // little or nothing left pending here (every real DMA had ample
+        // time to complete); any genuine leftovers are force-unregistered
+        // afterward rather than leaked, since the process teardown below
+        // (cudaFree on the pools these pointers' DMAs targeted) is about to
+        // happen regardless of whether the copy is technically still
+        // in-flight -- best-effort cleanup on the way out, not a new
+        // correctness contract for mid-run behavior.
+        reap_pending_host_unregisters();
+        for (auto& p : pending_host_unregisters) cudaHostUnregister(p.host_ptr);
+        pending_host_unregisters.clear();
         for (auto& loc : expert_vram_cache) {
             if (loc.upload_event) { cudaSetDevice(loc.gpu_id); cudaEventDestroy(loc.upload_event); }
         }
@@ -485,8 +623,41 @@ public:
         BounceBuffer& bb = bounce_pool[bounce_next];
         bounce_next = (bounce_next + 1) % bounce_pool.size();
         if (!bb.host_ptr) return nullptr;
-        if (bb.in_flight) cudaEventSynchronize(bb.in_flight);
+        // Direct test of a real hypothesis -- see t_bounce_buffer_wait's own
+        // comment in PerfCounters for the full reasoning: this exact wait
+        // was never timed before (by anything, ever), and is suspected to
+        // be most of this codebase's own long-standing "untimed expert=
+        // gap". Now the only caller is upload_expert_async (upload_expert
+        // was converted off the bounce pool entirely -- see gpu_topology.hpp's
+        // upload_expert), so this should read small if that hypothesis holds.
+        if (bb.in_flight) {
+            PERF_START(bounce_buffer_wait);
+            cudaEventSynchronize(bb.in_flight);
+            PERF_END(bounce_buffer_wait, t_bounce_buffer_wait);
+        }
         return &bb;
+    }
+
+    // Shared by every active-layer reclaim site (cleanup_active_layer_area,
+    // upload_expert_active_async/upload_expert_active's own victim-eviction
+    // of an occupied slot, and a successful promotion in find_active_expert)
+    // -- see ExpertLocation::was_async_prewarmed/prewarm_touched's own
+    // comment for the full design. Call BEFORE overwriting/clearing a
+    // slot's identity, with the slot's CURRENT (about-to-be-replaced)
+    // content -- not after, since prewarm_touched only means anything
+    // relative to the content being discarded. Resets both flags itself,
+    // so callers don't need their own explicit reset alongside this.
+    void record_active_layer_prewarm_reclaim(ExpertLocation& slot) {
+        if (slot.was_async_prewarmed) {
+            if (slot.prewarm_touched) {
+                perf().n_active_layer_prewarm_used.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                perf().n_active_layer_prewarm_wasted.fetch_add(1, std::memory_order_relaxed);
+                perf().bytes_active_layer_prewarm_wasted.fetch_add((int64_t)slot.size, std::memory_order_relaxed);
+            }
+        }
+        slot.was_async_prewarmed = false;
+        slot.prewarm_touched = false;
     }
 
     void allocate_expert_cache(size_t expert_slab_bytes, int n_experts_total,
@@ -1220,23 +1391,93 @@ public:
             on_vram_evict(old_layer, old_expert, slot->device_ptr, slot->size, slot->gpu_id);
         }
 
-        // Copy host → device (synchronous for correctness). Stages through
-        // a pinned bounce buffer first (see init_bounce_pool) so the real
-        // DMA reads from page-locked memory instead of host_data's pageable
-        // RAM-tier slab_buffer -- avoids the CUDA driver's own internal
-        // pageable-copy staging, which is slower and not truly overlapped.
+        // Copy host → device (synchronous for correctness). Transiently
+        // cudaHostRegister/cudaHostUnregister the RAM tier's own slab_buffer
+        // bytes directly for the duration of this ONE DMA, instead of
+        // memcpy-ing them into a separate pinned bounce buffer first (Alt A
+        // of a cudaHostRegister investigation -- see t_host_register_stage's
+        // own comment in PerfCounters for the real-hardware numbers: ~25%
+        // less combined overhead than the memcpy approach, 1.070ms/call vs
+        // 1.428ms/call @ ~8.26MB). Nothing stays pinned beyond this one
+        // synchronous call -- safe specifically because upload_expert is
+        // fully blocking, so the unregister below can never race an
+        // in-flight read the way it would on an async path (see
+        // upload_expert_async's own comment for why THAT function is
+        // deliberately NOT converted to this same approach: its DMA is
+        // still in flight when the function returns, so unregistering
+        // host_data before the async copy actually completes would be a
+        // real, silent correctness violation -- not a resurrection of the
+        // codebase's own documented decode-path corruption incident, but
+        // the same *class* of "completion timing" mistake).
         size_t copy_bytes = std::min(bytes, slot->size);
         cudaSetDevice(slot->gpu_id);
-        BounceBuffer* bb = acquire_bounce_buffer();
-        const uint8_t* dma_src = host_data;
-        if (bb) {
-            memcpy(bb->host_ptr, host_data, copy_bytes);
-            dma_src = bb->host_ptr;
+
+        PERF_START(host_register);
+        cudaError_t reg_err = cudaHostRegister((void*)host_data, copy_bytes, cudaHostRegisterPortable);
+        bool registered = (reg_err == cudaSuccess);
+        PERF_END(host_register, t_host_register_stage);
+        if (!registered) {
+            // cudaErrorHostMemoryAlreadyRegistered is now an EXPECTED, benign
+            // outcome, not the "real double-registration bug" this comment
+            // originally assumed it could only mean: with EngineConfig::
+            // ram_pinned_budget_gb set, the RAM tier persistently pins its
+            // own slabs once at allocation (see ensure_slab_capacity), so
+            // this per-call register correctly finds them already pinned.
+            // The copy below then DMAs straight from that already-page-locked
+            // source -- exactly what we want -- and `registered` staying
+            // false is also correct, since this call must not unregister a
+            // pin it does not own.
+            if (reg_err == cudaErrorHostMemoryAlreadyRegistered) {
+                cudaGetLastError();  // benign -- don't leak into a later unrelated check
+                perf().n_upload_expert_src_already_pinned.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                perf().n_host_register_fail.fetch_add(1, std::memory_order_relaxed);
+                LOG_WARN("[MOE-VRAM]  upload_expert: cudaHostRegister failed for layer=%d expert=%d "
+                          "(%zu bytes): %s -- falling back to direct pageable-source copy\n",
+                          layer, expert_id, copy_bytes, cudaGetErrorString(reg_err));
+            }
         }
+
+        // Issued on the vault GPU's own copy_stream (via cudaMemcpyAsync +
+        // an immediate cudaStreamSynchronize) instead of a plain cudaMemcpy,
+        // which implicitly runs on the legacy default stream (stream 0).
+        // Same fix, same real-hardware evidence, as demote_from_vram's own
+        // D2H copy (see CLAUDE.md): stream-0 ops force a full wait for
+        // everything queued on every OTHER stream on the device (e.g.
+        // compute_stream's in-flight expert FFN kernels) before they can
+        // even start. cudaStreamSynchronize below still blocks this
+        // function until the copy genuinely completes before returning --
+        // identical synchronous-completion contract to the old cudaMemcpy,
+        // NOT the kind of async change that caused the documented decode-
+        // path corruption incident (that was about a completion EVENT
+        // being trusted before the reading kernels had finished, letting a
+        // background thread reclaim the slot mid-compute -- this function
+        // still fully blocks before returning, so no such event-vs-actual-
+        // completion gap exists here).
         PERF_START(gpu_sync_upload);
-        cudaError_t err = cudaMemcpy(slot->device_ptr, dma_src, copy_bytes, cudaMemcpyHostToDevice);
+        cudaStream_t upload_stream = devices[slot->gpu_id].copy_stream;
+        cudaError_t err;
+        if (upload_stream) {
+            err = cudaMemcpyAsync(slot->device_ptr, host_data, copy_bytes, cudaMemcpyHostToDevice, upload_stream);
+            if (err == cudaSuccess) err = cudaStreamSynchronize(upload_stream);
+        } else {
+            perf().n_upload_expert_stream_unavailable.fetch_add(1, std::memory_order_relaxed);
+            err = cudaMemcpy(slot->device_ptr, host_data, copy_bytes, cudaMemcpyHostToDevice);
+        }
         PERF_END(gpu_sync_upload, t_gpu_upload);
-        if (bb && bb->in_flight) cudaEventRecord(bb->in_flight, 0);
+
+        // Unregister BEFORE checking err/returning -- must run on every path
+        // (success or failure) since a registration that's never undone
+        // would otherwise leak, and freeing/reallocating this slab later
+        // (ensure_slab_capacity) while still registered would be undefined
+        // behavior.
+        if (registered) {
+            PERF_START(host_unregister);
+            cudaHostUnregister((void*)host_data);
+            PERF_END(host_unregister, t_host_register_stage);
+            perf().bytes_host_registered.fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
+        }
+
         if (err != cudaSuccess) {
             // Previously silent -- see evict_lru's own no-victim log above
             // for why this visibility was added. A real cudaMemcpy failure
@@ -1426,20 +1667,91 @@ public:
         GpuDevice& dev = devices[slot->gpu_id];
         cudaSetDevice(dev.id);
         slot->upload_ready = false;
-        // Same pinned bounce-buffer staging as upload_expert -- see its
-        // comment. Ping-ponging across bounce_pool's N buffers is what
-        // gives this async path real double buffering: while buffer[i]'s
-        // DMA is still draining on copy_stream, the NEXT call's memcpy into
-        // buffer[i+1] can proceed immediately without waiting on it.
-        BounceBuffer* bb = acquire_bounce_buffer();
+
+        // Opportunistic cleanup of earlier calls' deferred unregisters --
+        // see pending_host_unregisters' own comment. Cheap (a linear scan
+        // of a normally-small, actively-draining list) and keeps the list
+        // from growing unbounded even on a run that never happens to hit
+        // the other reap call site (the destructor).
+        reap_pending_host_unregisters();
+
+        // cudaHostRegister the RAM tier's own slab_buffer bytes directly,
+        // DMA straight from host_data -- same Alt-A approach as
+        // upload_expert (see that function's comment for the real-hardware
+        // numbers), replacing the CPU-side bounce-buffer memcpy entirely
+        // for the common case, not just relocating it. Falls back to the
+        // OLD bounce-buffer staging on any registration failure (pool
+        // exhaustion equivalent -- e.g. cudaErrorHostMemoryAlreadyRegistered
+        // if this exact range is already mid-registration from an earlier,
+        // not-yet-reaped call) or if this slot has no upload_event to defer
+        // against (should not happen for a real pool slot -- see
+        // allocate_expert_cache's unconditional event creation -- but
+        // registering with no way to safely know when to unregister would
+        // be a real leak, not a degraded-but-safe path, so this is treated
+        // as a hard precondition, not an optimization to skip opportunistically).
         const uint8_t* dma_src = host_data;
-        if (bb) {
-            memcpy(bb->host_ptr, host_data, copy_bytes);
-            dma_src = bb->host_ptr;
+        BounceBuffer* bb = nullptr;
+        bool registered = false;
+        // Set when host_data turns out to be PERSISTENTLY pinned already
+        // (EngineConfig::ram_pinned_budget_gb -- see ensure_slab_capacity).
+        // In that case this call must NOT stage through a bounce buffer:
+        // the source is already page-locked, so a direct DMA from it is
+        // both correct and strictly faster, and there is nothing for THIS
+        // call to unregister afterwards (it never registered anything --
+        // the persistent owner does that, once, at allocation). Without
+        // this branch a persistent pin actively DEGRADES this path, since
+        // the failed register would fall through to the bounce-buffer
+        // memcpy below -- a real, measured regression (stage_cpy 0.00s ->
+        // 1.28s on the first real run with pinning enabled).
+        bool already_pinned = false;
+        if (slot->upload_event) {
+            PERF_START(upload_async_host_register);
+            cudaError_t reg_err = cudaHostRegister((void*)host_data, copy_bytes, cudaHostRegisterPortable);
+            registered = (reg_err == cudaSuccess);
+            PERF_END(upload_async_host_register, t_upload_async_host_register);
+            if (!registered) {
+                already_pinned = (reg_err == cudaErrorHostMemoryAlreadyRegistered);
+                if (already_pinned) {
+                    cudaGetLastError();  // benign -- don't leak into a later unrelated check
+                    perf().n_upload_async_src_already_pinned.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    perf().n_upload_async_host_register_fail.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (!registered && !already_pinned) {
+            // Same pinned bounce-buffer staging as upload_expert used to --
+            // see its comment (now historical there, still live here as the
+            // fallback). Ping-ponging across bounce_pool's N buffers is
+            // what gives this path real double buffering: while buffer[i]'s
+            // DMA is still draining on copy_stream, the NEXT call's memcpy
+            // into buffer[i+1] can proceed immediately without waiting on it.
+            bb = acquire_bounce_buffer();
+            if (bb) {
+                // Same staging cost bucket upload_expert's sync path used to
+                // share this with, back when it also used the bounce pool --
+                // kept as the same counter since it's still the same
+                // operation, just upload_expert_async-only now.
+                PERF_START(bounce_stage_async);
+                memcpy(bb->host_ptr, host_data, copy_bytes);
+                PERF_END(bounce_stage_async, t_bounce_stage_memcpy);
+                perf().bytes_bounce_staged.fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
+                dma_src = bb->host_ptr;
+            }
         }
         cudaMemcpyAsync(slot->device_ptr, dma_src, copy_bytes, cudaMemcpyHostToDevice, dev.copy_stream);
         if (slot->upload_event) cudaEventRecord(slot->upload_event, dev.copy_stream);
         if (bb && bb->in_flight) cudaEventRecord(bb->in_flight, dev.copy_stream);
+        if (registered) {
+            // Unregister deferred to reap_pending_host_unregisters() (this
+            // function's own next call, or the destructor) once
+            // slot->upload_event confirms the DMA above has actually
+            // completed -- see pending_host_unregisters' own comment for
+            // why checking that event is safe even though it's a per-slot
+            // event that may be re-recorded before this entry is reaped.
+            pending_host_unregisters.push_back({(void*)host_data, slot->upload_event});
+            perf().bytes_upload_async_host_registered.fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
+        }
 
         // Record promotion metrics immediately (bytes enqueued + count).
         perf().bytes_gpu_uploaded.fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
@@ -1464,6 +1776,49 @@ public:
     // This is decode-thread-only and never participates in LRU eviction
     ExpertLocation* upload_expert_active(int layer, int expert_id,
                                         const uint8_t* host_data, size_t bytes);
+
+    // Async sibling of upload_expert_active, for BATCH pre-warming a whole
+    // layer's known-needed active-layer misses before Phase 3's per-token
+    // dispatch loop starts (execution_layer.cpp's moe_forward_gguf, S>1),
+    // instead of one blocking cudaMemcpy per cold miss scattered through
+    // that loop -- see t_active_layer_upload_async's own comment in
+    // perf_timer.hpp for the real-hardware finding that motivated this
+    // (active_up costing ~3x the full-run per-call average during
+    // prefill's own tight burst).
+    //
+    // CORRECTNESS CONTRACT, read before calling: the returned slot's
+    // upload_ready is left FALSE and its temp_pin_count is bumped by 1 --
+    // the DMA has only been ISSUED on this GPU's copy_stream, not
+    // necessarily completed. find_active_expert does NOT check
+    // upload_ready (confirmed by reading it -- it only matches identity),
+    // so a slot returned by this function must NEVER be exposed to a
+    // find_active_expert lookup, by any thread, before
+    // sync_active_layer_batch() has confirmed the whole batch this slot
+    // belongs to. In THIS codebase that's satisfied structurally, not just
+    // by convention: find_active_expert is decode-thread-only (prefetch
+    // workers never touch VRAM/GpuTopology -- see claim_or_wait's own
+    // CRITICAL rule), and every intended caller issues a full batch then
+    // calls sync_active_layer_batch() BEFORE returning to Phase 3 on that
+    // SAME thread -- so Phase 3 can never run, on any layer, before its
+    // own layer's batch has already been synced. Do not call this and
+    // then let control reach any find_active_expert call site (on any
+    // thread) without an intervening sync_active_layer_batch() for this
+    // exact slot -- that would be a real use-of-incomplete-data race, not
+    // a hypothetical one. temp_pin_count already protects against a
+    // SECOND call in the same batch picking this same slot before the
+    // first's copy lands, same discipline upload_expert_active's own
+    // victim loop already uses.
+    ExpertLocation* upload_expert_active_async(int layer, int expert_id,
+                                                const uint8_t* host_data, size_t bytes);
+
+    // Companion to upload_expert_active_async: ONE cudaStreamSynchronize
+    // for the whole batch (the actual point of batching -- N async issues
+    // amortized behind a single wait instead of N separate blocking
+    // calls), then marks every victim upload_ready=true and releases its
+    // temp_pin_count. Safe to call with an empty vector (no-op). All
+    // victims MUST share the same GPU (true by construction -- the active
+    // layer area is allocated on exactly one GPU, allocate_active_layer_area).
+    void sync_active_layer_batch(const std::vector<ExpertLocation*>& victims);
 
     // Cleanup active layer area after processing a layer's experts
     // Called from moe_forward_gguf after each layer completion.
@@ -1494,6 +1849,28 @@ public:
     // subsequent hold_for_compute call search the wrong pool and fail.
     ExpertLocation* find_active_expert(int layer, int expert_id,
                                         const std::function<void(int, int)>& on_promoted = nullptr);
+
+    // Side-effect-free residency peek for the active layer area -- unlike
+    // find_active_expert, this NEVER bumps hit_count/last_used_clock and
+    // NEVER triggers promote_active_to_main. Exists specifically for
+    // upload_expert_active_async's Phase-2 batch pre-warm caller
+    // (execution_layer.cpp), which must check "is this candidate already
+    // active-layer-resident" for MANY candidates before Phase 3 has
+    // legitimately dispatched to any of them yet -- calling the real
+    // find_active_expert speculatively there would inflate hit_count for
+    // experts not actually used yet this token, and (with a threshold as
+    // low as 1, this codebase's own GLM default) could fire a REAL
+    // promotion/D2D-copy/slot-free as a side effect of a mere existence
+    // check, corrupting the same active_layer_slots state the pre-warm
+    // batch is simultaneously choosing victims from. Mirrors
+    // RAMSafetyManager::is_ram_resident's own "peek, don't touch" pattern.
+    bool active_layer_has(int layer, int expert_id) const {
+        GPU_TOPO_TIMED_LOCK(lock);
+        for (const auto& slot : active_layer_slots) {
+            if (slot.layer_idx == layer && slot.expert_id == expert_id) return true;
+        }
+        return false;
+    }
 
     // Promote an expert already resident in the active layer area (VRAM)
     // into the real VRAM LRU cache via a device-to-device copy -- same

@@ -12,6 +12,7 @@
 #include <thread>
 #include <future>
 #include <vector>
+#include <sstream>   // warn_if_expert_tensors_unaligned
 #include <memory>
 #include <unordered_map>
 #include <algorithm>
@@ -88,6 +89,16 @@ struct MoEExpertBlock {
     QuantizedTensor down_proj;
     uint8_t* slab_buffer = nullptr;
     size_t slab_capacity = 0;
+    // True once this slab_buffer has been cudaHostRegister'd ONCE, for the
+    // lifetime of the allocation (EngineConfig::ram_pinned_budget_gb -- see
+    // StreamingEngine::ensure_slab_capacity for the real-hardware reasoning).
+    // Distinct from every OTHER cudaHostRegister site in this codebase
+    // (upload_expert/upload_expert_async's own Alt-A conversions), which all
+    // register and unregister around a SINGLE transfer; this one is paid
+    // exactly once per allocation and never per call. MUST be unregistered
+    // before the buffer is free()'d/realloc'd (ensure_slab_capacity's own
+    // grow path does this) -- freeing still-registered memory is UB.
+    bool slab_pinned = false;
     uint64_t last_used_clock = 0;
     uint32_t hit_count = 0;  // frequency signal for eviction scoring (power-law routing)
 
@@ -393,6 +404,77 @@ public:
     // synchronously in the critical path.
     bool prefill_warm_via_prefetcher = false;
 
+    // Set from EngineConfig::ram_pinned_budget_gb at startup (main.cpp);
+    // 0 = feature off (every slab stays plain pageable memory, exactly the
+    // pre-2026-08-15 behavior). See ensure_slab_capacity for the full
+    // reasoning and the real-hardware numbers this exists to capture.
+    // ram_pinned_bytes_used is ATOMIC because ensure_slab_capacity is
+    // genuinely multi-threaded -- it's reached from LockFreePrefetcher's
+    // worker threads via build_expert_read_requests, not just the decode
+    // thread (confirmed by grep, not assumed).
+    size_t ram_pinned_budget_bytes = 0;
+    std::atomic<size_t> ram_pinned_bytes_used{0};
+
+    // Set from EngineConfig::prefill_opportunistic_promote at startup
+    // (main.cpp). Only meaningful when prefill_warm_via_prefetcher is also
+    // true -- gates LayerScratch::pending_prefill_promotions' cross-layer
+    // follow-up (execution_layer.cpp) separately from the hint-pushing
+    // itself.
+    //
+    // REAL A/B, CONCLUSIVE, DEFAULT FLIPPED TO OFF (2026-08-12): four
+    // consecutive runs with this ON all landed at prefill=0.56 tok/s; one
+    // run with it OFF landed at 0.60, matching the pre-feature baseline
+    // (0.59) almost exactly. Root cause confirmed, not just correlated:
+    // hint volume (n_prefill_hint_pushed) nearly HALVED when this was ON
+    // (420 vs ~930) -- this pass and Phase 2's own per-layer hint-pushing
+    // loop compete for the SAME resource (vram_cache->has_free_slot()).
+    // Running the opportunistic follow-up FIRST in every Phase 2 call
+    // consumes free slots faster than Phase 2's own loop would have on its
+    // own, so `has_free_slot()` goes false sooner -- meaning LATER layers'
+    // own candidates stop getting hints pushed at all, losing the RAM-
+    // prefetch overlap prefill_warm_via_prefetcher exists to provide, and
+    // falling back to Phase 3's fully-synchronous path instead. The
+    // mechanism itself is safe (every candidate is a confirmed real router
+    // pick, never a wrong speculative bet) -- the bug is resource
+    // contention with the very feature it was meant to complement, not
+    // promotion accuracy. Left implemented (not deleted) rather than
+    // ripped out, per this project's own convention for a well-evidenced,
+    // cleanly-reasoned negative result -- see CLAUDE.md.
+    bool prefill_opportunistic_promote = false;
+
+    // Set from EngineConfig::decode_async_prewarm/decode_async_prewarm_
+    // max_batch at startup (main.cpp). Decode-time analogue of the prefill
+    // pre-warm above -- see EngineConfig::decode_async_prewarm's own
+    // extensive comment (engine_config.hpp) for the real incident that made
+    // this default OFF and capped, rather than a straight reinstatement of
+    // the first (unbounded) attempt.
+    bool decode_async_prewarm = false;
+    int decode_async_prewarm_max_batch = 3;
+
+    // Set from EngineConfig::attn_qabsorb_gpu/attn_qabsorb_gpu_max_vram_gb
+    // at startup (main.cpp) -- gates the MLA absorbed-attention qabsorb
+    // BF16 batched GPU GEMM path (attention_layer.cpp / cuda_manager.hpp).
+    // See EngineConfig::attn_qabsorb_gpu's own extensive comment
+    // (engine_config.hpp) for why this defaults off and is deliberately
+    // per-model/hardware configurable rather than a blanket default.
+    bool attn_qabsorb_gpu = false;
+    double attn_qabsorb_gpu_max_vram_gb = 2.0;
+
+    // Set from EngineConfig::attn_score_gpu/attn_score_gpu_max_vram_gb at
+    // startup (main.cpp) -- gates the MLA score (QK^T-over-latent + softmax
+    // + weighted-V) GPU path (attention_layer.cpp / cuda_manager.hpp). See
+    // EngineConfig::attn_score_gpu's own extensive comment for why this
+    // defaults off and is deliberately per-model/hardware configurable --
+    // same rationale as attn_qabsorb_gpu, plus: unlike qabsorb, DeepSeek-V4
+    // bounds this phase's cost with a sliding window (dsv4_attention_gguf),
+    // so it's structurally cheaper there than GLM-5.2's unbounded version
+    // this GPU path targets.
+    bool attn_score_gpu = false;
+    double attn_score_gpu_max_vram_gb = 2.0;
+    // Set from EngineConfig::attn_score_gpu_max_context -- see that field's
+    // own comment. 0 = no cap (mirror sized to the full context_size).
+    int attn_score_gpu_max_context = 0;
+
     // Frees every buffer this class allocated directly: host-side
     // posix_memalign'd tensors (resident dense weights, KV cache, expert
     // slabs) and GPU-side cudaMalloc'd buffers (offloaded dense tensors, KV
@@ -560,6 +642,91 @@ public:
         return packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM);
     }
 
+    // Startup diagnostic (called from main.cpp right after the model loads).
+    // Reports, LOUDLY and to BOTH the log file and stderr, when this model's
+    // expert tensors are not 4096-aligned -- a condition that silently
+    // degrades I/O in two different ways depending on WHERE the misalignment
+    // is, and which was previously only discoverable after the fact:
+    //
+    //   * general.alignment < 4096 (file was never repacked, or repacked with
+    //     a smaller --align): enable_direct_io refuses O_DIRECT for EVERY
+    //     shard, so all expert reads fall back to buffered I/O through the
+    //     page cache. On a box whose RAM tier is already sized near physical
+    //     memory this is far worse than "a bit slower" -- streaming a
+    //     multi-hundred-GB model through the page cache competes directly
+    //     with the tier for headroom.
+    //
+    //   * per-expert stride (gb/ub/db) or base offset not a 4096 multiple:
+    //     O_DIRECT still works, but individual expert reads land off a block
+    //     boundary, so io_uring_backend's submit_and_wait must stage each one
+    //     through an aligned scratch buffer and memcpy it out. On this
+    //     project's own reference model that memcpy was ~132GB per session
+    //     once measured -- real CPU and memory-bandwidth burn competing with
+    //     the compute the engine is trying to overlap I/O against.
+    //
+    // Deliberately emitted to stderr as well as the log: log_path routes
+    // LOG_* to a file (logger.hpp's `FILE* out = file_ ? file_ : stderr`), so
+    // a warning that only went through LOG_WARN would be invisible to someone
+    // watching the console, which is exactly where a "why is this slow?"
+    // investigation usually starts.
+    void warn_if_expert_tensors_unaligned() const {
+        constexpr uint64_t ALIGN = 4096;
+        const auto& c = model_file.architecture_config;
+
+        auto it = model_file.kv_uint.find("general.alignment");
+        const uint64_t file_align = (it != model_file.kv_uint.end()) ? it->second : 32;
+
+        int n_checked = 0, n_bad_offset = 0, n_bad_stride = 0, first_bad = -1;
+        for (int l = 0; l < c.n_layers; ++l) {
+            size_t gb = 0, ub = 0, db = 0;
+            const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+            if (!expert_layer_geometry(l, gb, ub, db, gM, uM, dM)) continue;
+            ++n_checked;
+            const bool bad_offset = (gM->offset % ALIGN) || (uM->offset % ALIGN) || (dM->offset % ALIGN);
+            const bool bad_stride = (gb % ALIGN) || (ub % ALIGN) || (db % ALIGN);
+            if (bad_offset || bad_stride) {
+                if (first_bad < 0) first_bad = l;
+                if (bad_offset) ++n_bad_offset;
+                if (bad_stride) ++n_bad_stride;
+            }
+        }
+
+        auto emit = [](const std::string& msg) {
+            LOG_WARN("%s", msg.c_str());
+            std::fprintf(stderr, "%s", msg.c_str());
+            std::fflush(stderr);
+        };
+
+        if (file_align < ALIGN) {
+            std::ostringstream o;
+            o << "[ALIGN-WARN] general.alignment=" << file_align << " (< " << ALIGN
+              << "): O_DIRECT will be DISABLED for every shard, so all expert reads fall back to "
+                 "BUFFERED I/O through the page cache -- slower, and it makes the page cache compete "
+                 "with the host RAM expert tier for memory. Fix: repack with "
+                 "`tools/gguf_tool pack --align 4096`.\n";
+            emit(o.str());
+        }
+
+        if (n_checked > 0 && (n_bad_offset > 0 || n_bad_stride > 0)) {
+            std::ostringstream o;
+            o << "[ALIGN-WARN] Expert tensors are not " << ALIGN << "-aligned in "
+              << (n_bad_offset > n_bad_stride ? n_bad_offset : n_bad_stride) << " of " << n_checked
+              << " MoE layer(s) (first: layer " << first_bad << "; "
+              << n_bad_offset << " with an unaligned base offset, " << n_bad_stride
+              << " with an unaligned per-expert stride). Every direct expert read will be staged "
+                 "through a scratch buffer and memcpy'd out instead of DMA'd straight into the "
+                 "destination -- watch the `io_uring direct staging:` line in the shutdown report to "
+                 "see the real cost. Fix: repack with `tools/gguf_tool pack --align 4096`.\n";
+            emit(o.str());
+        }
+
+        if (file_align >= ALIGN && n_checked > 0 && n_bad_offset == 0 && n_bad_stride == 0) {
+            LOG_STREAM_INFO() << "[ALIGN] Expert tensors are " << ALIGN << "-aligned across all "
+                              << n_checked << " MoE layer(s) -- direct reads can DMA straight into "
+                                 "the destination buffer (no staging memcpy).\n";
+        }
+    }
+
     // Full-model startup validation for unpacked_expert_format=true. Called
     // once from main.cpp right after the model graph is built (so
     // architecture_config.n_layers/n_experts are known), BEFORE any real
@@ -688,11 +855,56 @@ public:
     // Ensure target_slot.slab_buffer can hold `total` bytes (grow-only, like
     // load_expert_slab). Used by both the pread path and the consume_staged
     // path so the destination buffer is sized before the bytes arrive.
+    // PERSISTENT PINNING (EngineConfig::ram_pinned_budget_gb, 2026-08-15):
+    // registers each slab with CUDA exactly ONCE, here at allocation time,
+    // instead of per-transfer. Motivation, from real hardware -- a per-call
+    // cudaHostRegister conversion of upload_expert_active_async was tried
+    // and reverted (see that function's own comment), but its measurements
+    // proved the underlying mechanism works and quantified the prize: with
+    // a PINNED source, that call site's cudaMemcpyAsync becomes genuinely
+    // asynchronous, so the DMA overlaps real compute instead of blocking
+    // the decode thread -- its own cost collapsed from 18.96s (blocking, on
+    // unpinned memory the driver must stage synchronously through an
+    // internal bounce buffer) to 0.15s issue + 5.26s batch-sync wait. The
+    // ONLY reason that attempt was a net loss was the 19.10s of per-call
+    // register+unregister tax paid to get there. Paying it once per
+    // allocation instead removes exactly that tax: projected ~14s/request
+    // saved on this config (0.57 -> ~0.72 tok/s).
+    //
+    // Deliberately BUDGETED, not unconditional: this pins host RAM, which
+    // the kernel can then never reclaim under pressure, and host_ram_gb is
+    // already 120 of this box's 125GB (see host_ram_gb's own freeze-incident
+    // history). Note pinning does not ALLOCATE anything -- these pages are
+    // already resident -- it only locks them, so the real risk is reduced OS
+    // headroom, not new consumption. Registration throughput measured at
+    // ~11 GB/s on this hardware, so even a large budget costs only seconds,
+    // once, during preload. Overshoot past the budget is impossible: the
+    // reservation is a single atomic fetch_add, undone if it would exceed.
+    //
+    // Composes safely with this codebase's OTHER cudaHostRegister sites
+    // (upload_expert/upload_expert_async): their per-call register on an
+    // already-registered slab simply fails, and each only unregisters what
+    // its OWN register succeeded at -- so a persistent pin is never torn
+    // down underneath them. Expect their n_*_host_register_fail counters to
+    // read nonzero (and their own staging path to be skipped) whenever this
+    // feature is on; that is the expected, benign interaction, not a bug.
     void ensure_slab_capacity(MoEExpertBlock& slot, size_t total) {
         PERF_START(alloc);
         if (slot.slab_capacity < total) {
             auto t0 = std::chrono::high_resolution_clock::now();
-            if (slot.slab_buffer) free(slot.slab_buffer);
+            if (slot.slab_buffer) {
+                // MUST unregister before free() -- freeing still-registered
+                // memory is undefined behavior (the same hazard
+                // upload_expert's own unregister-on-every-path comment
+                // already calls out for its transient registrations).
+                if (slot.slab_pinned) {
+                    cudaHostUnregister(slot.slab_buffer);
+                    slot.slab_pinned = false;
+                    ram_pinned_bytes_used.fetch_sub(slot.slab_capacity, std::memory_order_relaxed);
+                    perf().n_ram_slab_unpinned_on_regrow.fetch_add(1, std::memory_order_relaxed);
+                }
+                free(slot.slab_buffer);
+            }
             posix_memalign((void**)&slot.slab_buffer, 4096, total);
             double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
@@ -701,6 +913,30 @@ public:
                          total / 1e6, ms, slot.slab_capacity / 1e6);
             }
             slot.slab_capacity = total;
+
+            if (slot.slab_buffer && ram_pinned_budget_bytes > 0) {
+                // Reserve first, register second -- a plain check-then-add
+                // would let concurrent callers (decode thread + prefetch
+                // workers) both pass the check and jointly overshoot.
+                size_t prev = ram_pinned_bytes_used.fetch_add(total, std::memory_order_relaxed);
+                if (prev + total <= ram_pinned_budget_bytes) {
+                    PERF_START(ram_slab_pin);
+                    cudaError_t perr = cudaHostRegister(slot.slab_buffer, total, cudaHostRegisterPortable);
+                    PERF_END(ram_slab_pin, t_ram_slab_pin);
+                    if (perr == cudaSuccess) {
+                        slot.slab_pinned = true;
+                        perf().n_ram_slab_pinned.fetch_add(1, std::memory_order_relaxed);
+                        perf().bytes_ram_slab_pinned.fetch_add((int64_t)total, std::memory_order_relaxed);
+                    } else {
+                        ram_pinned_bytes_used.fetch_sub(total, std::memory_order_relaxed);
+                        perf().n_ram_slab_pin_fail.fetch_add(1, std::memory_order_relaxed);
+                        cudaGetLastError();  // don't let this leak into an unrelated later check
+                    }
+                } else {
+                    ram_pinned_bytes_used.fetch_sub(total, std::memory_order_relaxed);
+                    perf().n_ram_slab_pin_over_budget.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
         }
         PERF_END(alloc, t_host_alloc);
     }
@@ -811,11 +1047,44 @@ public:
     // (should never happen against a static tensor table), and the correct
     // response is "refuse this one read", not "guess and read garbage
     // across an unknown gap".
+    // Passed as `replica` to request an INTRA-EXPERT split rather than a
+    // single copy: gate+up are read from the primary and down from the
+    // mirror, so BOTH drives work on every single expert fetch -- including
+    // a solo one, where per-expert striping leaves the other drive fully
+    // idle. Real bucketed measurement showed why this matters: with
+    // per-expert striping, ~50% of prefetch fetches have no other fetch in
+    // flight, and those improved only 15% (8.27 -> 7.04ms) versus 40% at
+    // high concurrency, because one drive was moving the whole 11.3MB slab
+    // alone.
+    //
+    // The gate+up / down cut is deliberate, not arbitrary: it puts 6.48MB of
+    // 11.3MB (57.3%) on the primary, and this box's primary is the faster
+    // drive (2.25 vs 1.98 GB/s), whose ideal share would be 53.2% -- close
+    // enough that both legs finish together, which is what actually
+    // determines a split read's latency. Predicted solo cost:
+    // max(6.48/2.25, 4.82/1.98) = 2.88ms versus 11.3/2.25 = 5.0ms unsplit.
+    //
+    // Packed format only -- unpacked_expert_format issues ONE combined read
+    // for the whole slab by design (that format exists precisely to make it
+    // a single DMA), so there is nothing to split and it falls back to the
+    // primary.
+    static constexpr int REPLICA_SPLIT = -1;
+
+    // `replica` selects which physical copy of the model to read from when a
+    // mirror is configured (0 = primary, 1 = mirror on the other device --
+    // see GGUFModel::open_mirror). Defaults to 0, so every existing caller
+    // is byte-identical to before. A caller that wants striping just varies
+    // this per expert; because io_uring allows mixed fds in one submission,
+    // a batch built with alternating replicas becomes a single submit that
+    // both devices service in parallel.
     bool build_expert_read_requests(int layer_idx, int expert_id,
                                      MoEExpertBlock& target_slot,
                                      io_uring_backend::ReadRequest* out_reqs,
-                                     int& out_n, size_t& out_total) {
+                                     int& out_n, size_t& out_total,
+                                     int replica = 0) {
         if (unpacked_expert_format) {
+            // One combined read; nothing to split across devices.
+            if (replica == REPLICA_SPLIT) replica = 0;
             size_t gb, ub, db;
             const GGUFTensor *gM, *uM, *dM;
             if (!unpacked_expert_geometry(layer_idx, expert_id, gb, ub, db, gM, uM, dM)) return false;
@@ -828,7 +1097,7 @@ public:
             out_total = gb + ub + db;
             ensure_slab_capacity(target_slot, out_total);
             out_n = 0;
-            out_reqs[out_n++] = {model_file.fd_for_tensor(*gM), model_file.direct_io_active_for(*gM),
+            out_reqs[out_n++] = {model_file.fd_for_tensor(*gM, replica), model_file.direct_io_active_for(*gM, replica),
                                   model_file.direct_io_alignment, target_slot.slab_buffer, out_total, gM->offset};
             return true;
         }
@@ -847,11 +1116,18 @@ public:
         uint64_t down_off = dM->offset + (uint64_t)expert_id * db;
 
         out_n = 0;
-        out_reqs[out_n++] = {model_file.fd_for_tensor(*gM), model_file.direct_io_active_for(*gM),
+        // Per-tensor replica selection -- see REPLICA_SPLIT's own comment.
+        // For a plain (non-split) replica every leg resolves to the same
+        // copy, byte-identical to the previous behavior.
+        const bool split = (replica == REPLICA_SPLIT);
+        const int r_gate = split ? 0 : replica;
+        const int r_up   = split ? 0 : replica;
+        const int r_down = split ? 1 : replica;
+        out_reqs[out_n++] = {model_file.fd_for_tensor(*gM, r_gate), model_file.direct_io_active_for(*gM, r_gate),
                               model_file.direct_io_alignment, dst_gate, gb, gate_off};
-        out_reqs[out_n++] = {model_file.fd_for_tensor(*uM), model_file.direct_io_active_for(*uM),
+        out_reqs[out_n++] = {model_file.fd_for_tensor(*uM, r_up), model_file.direct_io_active_for(*uM, r_up),
                               model_file.direct_io_alignment, dst_up, ub, up_off};
-        out_reqs[out_n++] = {model_file.fd_for_tensor(*dM), model_file.direct_io_active_for(*dM),
+        out_reqs[out_n++] = {model_file.fd_for_tensor(*dM, r_down), model_file.direct_io_active_for(*dM, r_down),
                               model_file.direct_io_alignment, dst_down, db, down_off};
         return true;
     }

@@ -21,6 +21,7 @@
 #include "engine.hpp"
 #include "dense_dispatch.hpp"
 #include "hyper_connections.hpp"
+#include "tensor_trace.hpp"
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -56,14 +57,11 @@ static bool check_finite_hc(const char* label, int layer_idx, const float* data,
     }
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[HC] %s layer=%d: %d/%zu NaN, %d/%zu Inf.\n", label, layer_idx, nan_count, n, inf_count, n);
+        trace_abort_if_nan("HC", true);
         return false;
     }
-    if (row_width > 0 && Logger::instance().would_log(LogLevel::VERBOSE)) {
-        const float* last_row = data + (n - (size_t)row_width);
-        double sq = 0.0;
-        for (int i = 0; i < row_width; ++i) sq += (double)last_row[i] * last_row[i];
-        LOG_STREAM_VERBOSE() << "[HC-TRACE l=" << layer_idx << "] " << label
-                             << " |last_row|=" << std::sqrt(sq) << "\n";
+    if (row_width > 0 && trace_gate("HC")) {
+        trace_row("HC", layer_idx, label, data, n, row_width);
     }
     return true;
 }
@@ -175,7 +173,7 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
     // dst/src indexing feeding it) is still wrong despite passing the
     // pure-math unit test, since the unit test can't catch a
     // caller-side transposition of a matrix that's ALREADY symmetric-ish.
-    if (s == S - 1 && Logger::instance().would_log(LogLevel::VERBOSE)) {
+    if (s == S - 1 && trace_gate("HC")) {
       auto &&os = LOG_STREAM_VERBOSE();
       os << "[HC-TRACE l=" << layer_idx << "] " << prefix << "pre_gate=[";
       for (int h = 0; h < HC; ++h) os << (h ? "," : "") << pre_gate[h];
@@ -321,7 +319,7 @@ void hc_collapse_output(StreamingEngine &engine, float *hidden_states, int S,
     }
   }
   check_finite_hc("hidden_states (post hc_collapse_output)", -1, hidden_states, (size_t)S * D, D);
-  if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+  if (trace_gate("HC")) {
     const float *row = gate_logits.data() + (size_t)(S - 1) * HC;
     auto &&os = LOG_STREAM_VERBOSE();
     os << "[HC-TRACE] output_hc gate_logits(last token)=[";

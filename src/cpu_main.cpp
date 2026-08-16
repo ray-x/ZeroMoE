@@ -43,15 +43,36 @@ int main(int argc, char **argv) {
   CPUEngine engine;
   engine.config = std::move(cfg);
 
-  if (!engine.model_file.load_header(engine.config.model_path)) {
-    std::cerr << "[CPU-MAIN] Failed to load GGUF: " << engine.config.model_path
-              << "\n";
-    return 1;
-  }
+  const bool is_safetensors =
+      engine.config.model_path.size() >= 12 &&
+      engine.config.model_path.compare(engine.config.model_path.size() - 12, 12,
+                                       ".safetensors") == 0;
 
-  if (!engine.build(engine.config.context_size)) {
-    std::cerr << "[CPU-MAIN] Engine build failed.\n";
-    return 1;
+  if (is_safetensors) {
+    if (!engine.build_from_safetensors(engine.config.model_path,
+                                       engine.config.context_size)) {
+      std::cerr << "[CPU-MAIN] Safetensors engine build failed.\n";
+      return 1;
+    }
+    std::cerr << "[CPU-MAIN] Safetensors model loaded successfully: "
+              << engine.config.model_path << "\n";
+    if (!engine.tokenizer.is_loaded()) {
+      std::cerr << "[CPU-MAIN] No tokenizer available for this safetensors "
+                   "model; generation skipped. Provide a GGUF tokenizer or "
+                   "use this path as a load smoke check.\n";
+      return 0;
+    }
+  } else {
+    if (!engine.model_file.load_header(engine.config.model_path)) {
+      std::cerr << "[CPU-MAIN] Failed to load GGUF: " << engine.config.model_path
+                << "\n";
+      return 1;
+    }
+
+    if (!engine.build(engine.config.context_size)) {
+      std::cerr << "[CPU-MAIN] Engine build failed.\n";
+      return 1;
+    }
   }
 
   // Prompt handling.

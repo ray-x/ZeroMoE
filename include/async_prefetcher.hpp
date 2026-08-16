@@ -47,6 +47,33 @@ constexpr double SLOW_PICKUP_MS = 250.0;
 // for "depth-1 pilot only".
 enum class PilotSource : uint8_t { Other, Depth2 };
 
+// 2026-08-14 TRIED AND REVERTED: batching PREFETCH_BATCH_HINTS (3) queued
+// hints into one worker io_uring submission (up to depth 9 legs instead of
+// the old one-hint/3-leg design), motivated by a real fio microbenchmark
+// showing this NVMe saturates around queue depth 8 for this exact request
+// shape (2.47 GB/s @ depth1 -> 3.50 GB/s @ depth4 -> 3.56 GB/s @ depth8)
+// while production's blended throughput sat at ~1.54 GB/s. Real A/B on
+// real hardware DISPROVED the hypothesis: session-wide blended disk GB/s
+// was IDENTICAL before/after (1.54 -> 1.53, noise), and phase_c (decode
+// waiting on an in-flight prefetch) got MEASURABLY WORSE (5.60s -> 7.02s,
+// +25%) from head-of-line blocking -- a hint now waits behind its slower
+// batch-mates before publishing, instead of publishing the moment its own
+// 3 legs land. Root cause, best current understanding: the fio benchmark
+// measured pure back-to-back I/O with zero think-time between
+// submissions; real production interleaves real CPU work between reads
+// (ram_mutex claim, populate_packed_slab's memcpy, orchestration across
+// prefetch_worker_threads workers + the decode thread's own reads), so the
+// device is likely idle in the GAPS between bursts, not queue-depth-
+// starved within one burst -- a bigger batch just makes a bigger burst
+// followed by the same size gap, not genuinely higher SUSTAINED
+// concurrency. This is a different, harder problem than per-submission
+// batch size. Reverted to the original one-hint-at-a-time design below;
+// kept as a marker (see [[moestream-io-pipeline-findings]] memory) so a
+// future session doesn't re-propose the identical idea without this
+// evidence. If revisited, the real lever is probably closing the CPU-side
+// gaps between bursts (e.g. a worker claiming/prepping its NEXT hint while
+// the current read is still in flight), not widening one submission.
+
 struct PrefetchHint {
     int layer_idx;
     int expert_id;
@@ -80,9 +107,26 @@ class LockFreePrefetcher {
 private:
     static constexpr size_t QUEUE_SIZE = 4096;
 
-    PrefetchHint queue[QUEUE_SIZE];
-    std::atomic<unsigned int> head{0};
-    std::atomic<unsigned int> tail{0};
+    // Two-lane priority queue, not one -- HIGH carries l+1 pilot hints and
+    // prefill's Phase-2 warm hints (both "needed soon, real confidence"),
+    // LOW carries l+2 pilot hints (further out, measurably lower accuracy
+    // per rank -- see CLAUDE.md's depth-2 real-hardware A/B). Each lane is
+    // an independent copy of the exact same single-queue design this class
+    // used before (own array, own head/tail, own CAS-claim discipline in
+    // worker_loop) -- deliberately NOT one array with a priority field,
+    // so the well-understood existing lock-free reasoning for one lane
+    // carries over unchanged to two, rather than needing new reasoning
+    // about ordering within a single shared array. worker_loop always
+    // drains HIGH to empty before ever looking at LOW (strict priority,
+    // not round-robin/weighted-fair) -- see n_prefetch_lo_lane_starved_ticks'
+    // own comment (perf_timer.hpp) for the accepted starvation risk this
+    // implies and how to tell if it's actually biting.
+    PrefetchHint queue_hi[QUEUE_SIZE];
+    std::atomic<unsigned int> head_hi{0};
+    std::atomic<unsigned int> tail_hi{0};
+    PrefetchHint queue_lo[QUEUE_SIZE];
+    std::atomic<unsigned int> head_lo{0};
+    std::atomic<unsigned int> tail_lo{0};
 
     // Multiple worker threads pulling from the SAME queue -- see
     // worker_loop's CAS-based tail claim for why a plain load+store
@@ -277,16 +321,25 @@ public:
         }
     }
 
+    // Lane is derived from `source`, not a separate parameter -- Depth2 is
+    // the ONLY population that's ever meant to be lower-priority (see the
+    // lane fields' own comment above); every other current/future
+    // PilotSource value defaults to HIGH.
     void push_hint(int layer_idx, int expert_id, PilotSource source = PilotSource::Other) {
-        unsigned int current_head = head.load(std::memory_order_relaxed);
-        unsigned int current_tail = tail.load(std::memory_order_acquire);
+        bool hi_lane = (source != PilotSource::Depth2);
+        PrefetchHint* q = hi_lane ? queue_hi : queue_lo;
+        std::atomic<unsigned int>& head_ref = hi_lane ? head_hi : head_lo;
+        std::atomic<unsigned int>& tail_ref = hi_lane ? tail_hi : tail_lo;
+
+        unsigned int current_head = head_ref.load(std::memory_order_relaxed);
+        unsigned int current_tail = tail_ref.load(std::memory_order_acquire);
 
         if (current_head - current_tail >= QUEUE_SIZE) {
             return;
         }
 
-        queue[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now(), source};
-        head.store(current_head + 1, std::memory_order_release);
+        q[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now(), source};
+        head_ref.store(current_head + 1, std::memory_order_release);
         if (auto* s = layer_stat(layer_idx)) s->hints_pushed.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -310,63 +363,103 @@ public:
     // worker attention at all). Left untouched when no match is found, so
     // callers can use a sentinel like -1.0 to mean "not this reason."
     bool has_pending_hint(int layer_idx, int expert_id, double* out_queued_ms = nullptr) const {
-        unsigned int h = head.load(std::memory_order_acquire);
-        unsigned int t = tail.load(std::memory_order_relaxed);
-        for (unsigned int i = t; i != h; ++i) {
-            const PrefetchHint& hint = queue[i & (QUEUE_SIZE - 1)];
-            if (hint.layer_idx == layer_idx && hint.expert_id == expert_id) {
-                if (out_queued_ms) {
-                    *out_queued_ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::high_resolution_clock::now() - hint.pushed_at).count();
+        // Scans HIGH then LOW -- both lanes can legitimately hold a pending
+        // hint for the same (layer,expert) only in the sense that at most
+        // one push_hint call ever targets a given key per pilot pass, so
+        // this is really "check whichever lane it could be in", not a
+        // genuine double-counting risk.
+        for (int lane = 0; lane < 2; ++lane) {
+            const PrefetchHint* q = lane == 0 ? queue_hi : queue_lo;
+            const std::atomic<unsigned int>& head_ref = lane == 0 ? head_hi : head_lo;
+            const std::atomic<unsigned int>& tail_ref = lane == 0 ? tail_hi : tail_lo;
+            unsigned int h = head_ref.load(std::memory_order_acquire);
+            unsigned int t = tail_ref.load(std::memory_order_relaxed);
+            for (unsigned int i = t; i != h; ++i) {
+                const PrefetchHint& hint = q[i & (QUEUE_SIZE - 1)];
+                if (hint.layer_idx == layer_idx && hint.expert_id == expert_id) {
+                    if (out_queued_ms) {
+                        *out_queued_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::high_resolution_clock::now() - hint.pushed_at).count();
+                    }
+                    return true;
                 }
-                return true;
             }
         }
         return false;
     }
 
 private:
+    // Attempts to CAS-claim exactly one slot from the given lane. Returns
+    // true (and fills hint/backlog) on success; false means "this lane was
+    // empty OR another worker beat us to the only available slot -- caller
+    // should retry the outer loop, not treat this as 'queue is empty'".
+    // Identical CAS discipline to the single-lane version this replaces --
+    // see the inline comment below for why a plain load+store isn't safe
+    // with multiple consumers.
+    static bool try_claim(PrefetchHint* q, std::atomic<unsigned int>& head_ref,
+                           std::atomic<unsigned int>& tail_ref, PrefetchHint& out_hint,
+                           unsigned int& out_backlog) {
+        unsigned int current_tail = tail_ref.load(std::memory_order_relaxed);
+        unsigned int current_head = head_ref.load(std::memory_order_acquire);
+        if (current_tail == current_head) return false;  // lane empty
+
+        // Multiple worker threads share this lane -- CAS-claim a unique
+        // slot instead of a single-consumer load+store. A plain store here
+        // would let a thread that read a stale current_tail (e.g.
+        // preempted between the load above and this point, while OTHER
+        // workers advanced tail further) overwrite tail BACKWARD, causing
+        // hints to be reprocessed and push_hint's overflow check to think
+        // the lane is fuller than it really is. compare_exchange_weak only
+        // succeeds if tail still equals what we just read; on failure
+        // (another worker claimed this slot, or advanced tail some other
+        // way) current_tail is updated to the real value, and the caller's
+        // outer loop retries with fresh reads.
+        if (!tail_ref.compare_exchange_weak(current_tail, current_tail + 1,
+                                             std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return false;
+        }
+        out_hint = q[current_tail & (QUEUE_SIZE - 1)];
+        // Backlog depth AT the moment of pickup (includes the hint just
+        // popped) -- a direct, independent signal for "is the worker
+        // falling behind hint production", complementing the pickup-delay
+        // measurement below.
+        out_backlog = current_head - current_tail;
+        return true;
+    }
+
     // thread_idx selects this worker's own io_uring ring (uring_rings[thread_idx]).
     void worker_loop(int thread_idx) {
         io_uring_backend::Ring& my_ring = *uring_rings[thread_idx];
-        while (running.load(std::memory_order_acquire) ||
-               head.load(std::memory_order_acquire) != tail.load(std::memory_order_relaxed)) {
-
-            unsigned int current_tail = tail.load(std::memory_order_relaxed);
-            unsigned int current_head = head.load(std::memory_order_acquire);
-
-            if (current_tail == current_head) {
-                usleep(200);
-                continue;
+        auto lanes_empty = [&]() {
+            return head_hi.load(std::memory_order_acquire) == tail_hi.load(std::memory_order_relaxed)
+                && head_lo.load(std::memory_order_acquire) == tail_lo.load(std::memory_order_relaxed);
+        };
+        while (running.load(std::memory_order_acquire) || !lanes_empty()) {
+            PrefetchHint hint;
+            unsigned int backlog = 0;
+            bool from_hi = try_claim(queue_hi, head_hi, tail_hi, hint, backlog);
+            if (!from_hi) {
+                // HIGH lane was empty (or we lost a race for its last
+                // slot, in which case the outer while loop will simply
+                // come back around and try HIGH again next iteration --
+                // this single LOW attempt this tick is not "skip LOW
+                // forever", just "don't wait behind it").
+                if (!try_claim(queue_lo, head_lo, tail_lo, hint, backlog)) {
+                    usleep(200);
+                    continue;
+                }
+            } else {
+                // Claimed from HIGH -- if LOW had anything waiting at this
+                // exact moment, it just lost its turn to a higher-priority
+                // hint. See n_prefetch_lo_lane_starved_ticks' own comment
+                // (perf_timer.hpp) for how to read this counter.
+                if (head_lo.load(std::memory_order_acquire) != tail_lo.load(std::memory_order_relaxed)) {
+                    perf().n_prefetch_lo_lane_starved_ticks.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
-            // Multiple worker threads share this queue -- CAS-claim a
-            // unique slot instead of the old single-consumer load+store.
-            // A plain store here would let a thread that read a stale
-            // current_tail (e.g. preempted between the load above and
-            // this point, while OTHER workers advanced tail further)
-            // overwrite tail BACKWARD, causing hints to be reprocessed
-            // and push_hint's overflow check to think the queue is
-            // fuller than it really is. compare_exchange_weak only
-            // succeeds if tail still equals what we just read; on
-            // failure (another worker claimed this slot, or advanced
-            // tail some other way) current_tail is updated to the real
-            // value and we retry from the top with fresh head/tail reads.
-            if (!tail.compare_exchange_weak(current_tail, current_tail + 1,
-                                             std::memory_order_acq_rel, std::memory_order_relaxed)) {
-                continue;
-            }
-
-            PrefetchHint hint = queue[current_tail & (QUEUE_SIZE - 1)];
-            // Backlog depth AT the moment of pickup (includes the hint just
-            // popped) -- a direct, independent signal for "is the worker
-            // falling behind hint production", complementing the pickup-
-            // delay measurement below (a growing backlog and a growing
-            // delay should move together; if they don't, that itself is
-            // informative -- e.g. a big backlog with small delay would mean
-            // hints are being produced in a sudden burst but still drained
-            // fast once picked up).
-            unsigned int backlog = current_head - current_tail;
+            if (from_hi) perf().n_prefetch_hi_lane_processed.fetch_add(1, std::memory_order_relaxed);
+            else perf().n_prefetch_lo_lane_processed.fetch_add(1, std::memory_order_relaxed);
 
             double pickup_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - hint.pushed_at).count();
@@ -375,12 +468,23 @@ private:
             PerfCounters::atomic_max(perf().n_prefetch_backlog_peak, (uint64_t)backlog);
             if (pickup_ms > SLOW_PICKUP_MS) {
                 LOG_WARN("[SLOW-PICKUP] layer=%d expert=%d waited %.2fms in queue before the worker "
-                         "thread picked it up (queue backlog at pickup: %u hints) -- worker is falling "
-                         "behind hint production, either CPU-starved or I/O-throughput-bound\n",
-                         hint.layer_idx, hint.expert_id, pickup_ms, backlog);
+                         "thread picked it up (%s lane, backlog at pickup: %u hints) -- worker is "
+                         "falling behind hint production, either CPU-starved or I/O-throughput-bound\n",
+                         hint.layer_idx, hint.expert_id, pickup_ms, from_hi ? "HIGH" : "LOW", backlog);
             }
 
-            active_prefetch(hint.layer_idx, hint.expert_id, my_ring, hint.source);
+            // Device affinity: even workers read the primary, odd workers the
+            // mirror. Falls back to replica 0 for everyone when no mirror is
+            // open (fd_for_tensor degrades internally), so this needs no
+            // single-drive special case.
+            // Intra-expert split beats per-worker device affinity here: with
+            // affinity, a worker doing a solo fetch used only its own drive,
+            // and the real bucketed data showed ~50% of fetches have no other
+            // fetch in flight. Splitting puts both drives on every fetch.
+            (void)thread_idx;
+            int replica = (engine && engine->model_file.has_mirror())
+                ? StreamingEngine::REPLICA_SPLIT : 0;
+            active_prefetch(hint.layer_idx, hint.expert_id, my_ring, hint.source, replica);
         }
     }
 
@@ -460,8 +564,15 @@ private:
     //
     // my_ring is the CALLING worker thread's own io_uring ring (see
     // worker_loop) -- never shared across threads.
+    // `replica` selects which physical copy of the model this worker reads
+    // from when a mirror is configured (GGUFModel::open_mirror). Assigned
+    // per-WORKER (device affinity) rather than per-request: each worker
+    // already owns its own io_uring ring, so pinning worker->device means
+    // the two drives are driven by disjoint sets of threads and rings, with
+    // no shared-queue contention between them at all. Defaults to 0, so a
+    // single-drive setup and any other caller are byte-identical to before.
     void active_prefetch(int layer_idx, int expert_id, io_uring_backend::Ring& my_ring,
-                          PilotSource source = PilotSource::Other) {
+                          PilotSource source = PilotSource::Other, int replica = 0) {
         if (!engine || !ram_mgr) return;
         bool is_depth2 = (source == PilotSource::Depth2);
 
@@ -482,7 +593,11 @@ private:
         perf().n_prefetch_issued.fetch_add(1, std::memory_order_relaxed);
         if (is_depth2) perf().n_prefetch_issued_depth2.fetch_add(1, std::memory_order_relaxed);
         if (auto* s = layer_stat(layer_idx)) s->fetches_issued.fetch_add(1, std::memory_order_relaxed);
-        n_fetches_in_flight.fetch_add(1, std::memory_order_relaxed);
+        // fetch_add's return value is the count BEFORE this fetch joined --
+        // i.e. exactly how many OTHER prefetch-worker fetches were already
+        // in flight the instant this one starts (see PerfCounters::
+        // n_prefetch_fetch_by_concurrency's own comment for why).
+        int concurrent_others = (int)n_fetches_in_flight.fetch_add(1, std::memory_order_relaxed);
         // Measurement only (expert_fetch_tracker.hpp) -- kept for the
         // VRAM-tier shadow-fast-path's own independent signal
         // (execution_layer.cpp); the RAM-tier race this used to detect is
@@ -492,7 +607,7 @@ private:
 
         io_uring_backend::ReadRequest reqs[3];
         int n = 0; size_t total = 0;
-        bool ok = engine->build_expert_read_requests(layer_idx, expert_id, slot, reqs, n, total);
+        bool ok = engine->build_expert_read_requests(layer_idx, expert_id, slot, reqs, n, total, replica);
         if (ok) {
             ok = try_uring_batch(reqs, n, my_ring);
             if (!ok) {
@@ -513,6 +628,13 @@ private:
             perf().n_prefetch_completed.fetch_add(1, std::memory_order_relaxed);
             perf().bytes_prefetched.fetch_add(total, std::memory_order_relaxed);
             PerfCounters::atomic_add(perf().t_prefetch_read_ms_sum, dt_ms);
+            {
+                int bucket = concurrent_others < PerfCounters::PREFETCH_CONCURRENCY_BUCKETS - 1
+                    ? concurrent_others : PerfCounters::PREFETCH_CONCURRENCY_BUCKETS - 1;
+                if (bucket < 0) bucket = 0;
+                perf().n_prefetch_fetch_by_concurrency[bucket].fetch_add(1, std::memory_order_relaxed);
+                PerfCounters::atomic_add(perf().t_prefetch_fetch_ms_by_concurrency[bucket], dt_ms);
+            }
             if (is_depth2) {
                 perf().n_prefetch_completed_depth2.fetch_add(1, std::memory_order_relaxed);
                 perf().bytes_prefetched_depth2.fetch_add(total, std::memory_order_relaxed);

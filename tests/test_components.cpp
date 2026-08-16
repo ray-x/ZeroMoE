@@ -6,6 +6,8 @@
 #include "rope.hpp" // the REAL, unit-tested RoPE (no CUDA / no AVX-512 deps)
 #include "hyper_connections.hpp" // the REAL Sinkhorn normalization (DeepSeek-V4)
 #include "route_usage.hpp" // CUDA-free routing histogram used by CPU and GPU paths
+#include "safetensors_adapter.hpp" // DFlash/DSpark safetensors adapter boundary
+#include "tensor_trace.hpp" // TraceFilter (pure C++, no CUDA deps -- see logger.hpp)
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -2180,6 +2182,100 @@ void test_route_usage() {
   std::cout << " PASSED\n";
 }
 
+void test_trace_filter() {
+  std::cout << "[TEST] TraceFilter configure/matches/abort_on_nan..."
+            << std::flush;
+
+  TraceFilter& tf = TraceFilter::instance();
+
+  // Empty pattern list (the default, unset trace_filter config) matches
+  // every tag -- existing VERBOSE behavior must be unchanged unless a user
+  // explicitly opts into filtering.
+  tf.configure("", false);
+  assert(tf.matches("HC"));
+  assert(tf.matches("EXPERT-GPU"));
+  assert(!tf.abort_on_nan());
+
+  // A configured tag matches itself and any tag it's a PREFIX of (mirrors
+  // llama.cpp's own "^"-anchored convention), but not an unrelated tag.
+  tf.configure("HC,EXPERT", true);
+  assert(tf.matches("HC"));
+  assert(tf.matches("EXPERT-GPU")); // "EXPERT" is a prefix of "EXPERT-GPU"
+  assert(!tf.matches("MLA"));
+  assert(!tf.matches("SILU-TRACE-GPU"));
+  assert(tf.abort_on_nan());
+
+  // Re-configuring resets both the pattern list and abort_on_nan -- no
+  // state leaks from a prior configure() call.
+  tf.configure("MLA", false);
+  assert(tf.matches("MLA"));
+  assert(!tf.matches("HC"));
+  assert(!tf.abort_on_nan());
+
+  // An invalid regex token must not throw or crash configure() -- it's
+  // logged and skipped, and any other valid token in the same CSV list
+  // still takes effect.
+  tf.configure("[invalid,MLA", false);
+  assert(tf.matches("MLA"));
+  assert(!tf.matches("HC"));
+
+  std::cout << " PASSED\n";
+}
+
+void test_safetensors_adapter() {
+  std::cout << "[TEST] safetensors_adapter DFlash/DSpark normalization..." << std::flush;
+
+  static const std::string header = R"({
+    "__metadata__": {"format": "dflash"},
+    "model.layers.0.self_attn.q_proj.weight": {"dtype": "BF16", "shape": [4096, 2048], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.k_proj.weight": {"dtype": "BF16", "shape": [1024, 2048], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.v_proj.weight": {"dtype": "BF16", "shape": [1024, 2048], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.o_proj.weight": {"dtype": "BF16", "shape": [2048, 4096], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.gate_proj.weight": {"dtype": "BF16", "shape": [6144, 2048], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.up_proj.weight": {"dtype": "BF16", "shape": [6144, 2048], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.down_proj.weight": {"dtype": "BF16", "shape": [2048, 6144], "data_offsets": [0, 0]},
+    "model.layers.0.input_layernorm.weight": {"dtype": "BF16", "shape": [2048], "data_offsets": [0, 0]},
+    "model.layers.0.post_attention_layernorm.weight": {"dtype": "BF16", "shape": [2048], "data_offsets": [0, 0]},
+    "model.layers.1.self_attn.q_proj.weight": {"dtype": "BF16", "shape": [4096, 2048], "data_offsets": [0, 0]},
+    "model.layers.1.self_attn.k_proj.weight": {"dtype": "BF16", "shape": [1024, 2048], "data_offsets": [0, 0]},
+    "model.layers.1.mlp.gate_proj.weight": {"dtype": "BF16", "shape": [6144, 2048], "data_offsets": [0, 0]},
+    "model.layers.1.mlp.up_proj.weight": {"dtype": "BF16", "shape": [6144, 2048], "data_offsets": [0, 0]},
+    "model.layers.1.mlp.down_proj.weight": {"dtype": "BF16", "shape": [2048, 6144], "data_offsets": [0, 0]},
+    "model.embed_tokens.weight": {"dtype": "BF16", "shape": [16384, 2048], "data_offsets": [0, 0]},
+    "model.norm.weight": {"dtype": "BF16", "shape": [2048], "data_offsets": [0, 0]}
+  })";
+
+  SafetensorsModelInfo model;
+  assert(SafetensorsAdapter::parse_header_bytes(header, model));
+  assert(model.tensors.size() == 16u);
+  assert(SafetensorsAdapter::detect_format(model) == "dflash");
+  assert(SafetensorsAdapter::detect_family(model) == SafetensorsFamily::DenseGQA);
+
+  const auto normalized = SafetensorsAdapter::normalize_tensors(model, "dflash");
+  assert(!normalized.empty());
+  assert(std::any_of(normalized.begin(), normalized.end(), [](const NormalizedTensor &t) {
+    return t.logical_name.find("attn_q.weight") != std::string::npos;
+  }));
+
+  const auto dense = SafetensorsAdapter::map_dense_cpu_contract(model, "dflash");
+  assert(dense.n_layers == 2);
+  assert(dense.n_heads == 32);
+  assert(dense.n_kv_heads == 8);
+  assert(dense.head_dim == 128);
+  assert(dense.hidden == 2048);
+  assert(dense.intermediate == 6144);
+  assert(dense.vocab == 16384);
+  assert(dense.resolved_tensors.count("token_embd.weight") == 1);
+  assert(dense.resolved_tensors.count("output_norm.weight") == 1);
+  assert(dense.resolved_tensors.count("blk.0.attn_q.weight") == 1);
+
+  const std::string canonical = SafetensorsAdapter::canonicalize_qwen_name(
+      "model.layers.0.self_attn.q_proj.weight", "dflash");
+  assert(canonical == "blk.0.attn_q.weight");
+
+  std::cout << " PASSED\n";
+}
+
 // Optional substring filtering via argv, so a subset can be exercised without
 // recompiling -- the workflow this file exists for: run the CPU-only
 // component tests on a box where the full CUDA harness (main_test.cpp) can't
@@ -2224,6 +2320,8 @@ int main(int argc, char **argv) {
       {"cpu_silu", test_cpu_silu},
       {"cpu_elem_mul", test_cpu_elem_mul},
       {"route_usage", test_route_usage},
+      {"trace_filter", test_trace_filter},
+      {"safetensors_adapter", test_safetensors_adapter},
   };
   const bool filtered = argc > 1;
   auto matches = [&](const char *name) {

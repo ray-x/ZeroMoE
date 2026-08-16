@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <fcntl.h>
+#include <sys/stat.h>   // ::stat, for open_mirror's per-shard size check
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -262,6 +263,31 @@ public:
   std::vector<bool> shard_direct_io;
   uint64_t direct_io_alignment = 4096;
 
+  // OPTIONAL SECOND REPLICA of the same model on a DIFFERENT physical
+  // device (EngineConfig::mirror_model_path). Index-matched to shard_fds/
+  // shard_paths, so mirror_shard_fds[i] is the same shard as
+  // shard_fds[i], just opened from the other drive. Empty until
+  // open_mirror() succeeds; every read path stays byte-identical to the
+  // single-drive behavior until a caller explicitly asks for replica 1.
+  //
+  // Why: expert reads are the dominant startup and decode-time cost here,
+  // and a single NVMe saturates around ~2.2-2.5 GB/s for this model's real
+  // access shape (3 scattered per-expert tensors -- see tools/gguf_dma.cpp).
+  // Two INDEPENDENT devices have independent queues, so striping across
+  // them is genuinely additive bandwidth rather than a redistribution of
+  // one device's ceiling. Measured on this box: primary (Samsung 980 PRO)
+  // 2.25-2.52 GB/s vs mirror (KIOXIA KXG60ZNV1T02) 1.98-2.15 GB/s -- the
+  // second drive runs at ~85-88% of the first for this pattern, so the
+  // combined ceiling is ~1.85x.
+  //
+  // io_uring makes exploiting this nearly free: a SINGLE submission may
+  // mix fds pointing at different devices, and the kernel drives both
+  // queues in parallel -- so a batched read just has to alternate which
+  // replica each expert's requests target, with no change to batching or
+  // completion handling.
+  std::vector<int> mirror_shard_fds;
+  std::vector<bool> mirror_shard_direct_io;
+
   // One cuFile handle per shard_fds, registered by enable_cufile() below
   // (empty/all-invalid until then). Index-matched to shard_fds/
   // shard_direct_io, same convention as everything else per-shard here.
@@ -290,6 +316,127 @@ public:
   bool direct_io_active_for(const GGUFTensor &t) const {
     return t.shard_idx >= 0 && (size_t)t.shard_idx < shard_direct_io.size() &&
            shard_direct_io[t.shard_idx];
+  }
+
+  bool has_mirror() const { return !mirror_shard_fds.empty(); }
+
+  // replica 0 = primary (always valid), 1 = mirror. Degrades to the primary
+  // whenever the mirror isn't open or doesn't cover this shard, so callers
+  // may pass a replica index unconditionally without checking has_mirror()
+  // first -- a striping policy stays correct (just unbalanced) on a
+  // single-drive setup instead of needing its own fallback branch.
+  int fd_for_tensor(const GGUFTensor &t, int replica) const {
+    if (replica == 1 && t.shard_idx >= 0 &&
+        (size_t)t.shard_idx < mirror_shard_fds.size() &&
+        mirror_shard_fds[t.shard_idx] >= 0)
+      return mirror_shard_fds[t.shard_idx];
+    return fd_for_tensor(t);
+  }
+
+  // MUST be paired with the matching fd_for_tensor(t, replica) call -- the
+  // two replicas can legitimately differ here (e.g. the mirror lives on a
+  // filesystem that rejects O_DIRECT while the primary accepts it), and
+  // passing a primary-derived is_direct flag alongside a mirror fd would
+  // mis-describe that read to direct_io/io_uring's alignment handling.
+  bool direct_io_active_for(const GGUFTensor &t, int replica) const {
+    if (replica == 1 && t.shard_idx >= 0 &&
+        (size_t)t.shard_idx < mirror_shard_fds.size() &&
+        mirror_shard_fds[t.shard_idx] >= 0)
+      return (size_t)t.shard_idx < mirror_shard_direct_io.size() &&
+             mirror_shard_direct_io[t.shard_idx];
+    return direct_io_active_for(t);
+  }
+
+  // Opens a second copy of this model from `mirror_dir`, matching each
+  // shard by BASENAME (the mirror is expected to be a plain file-level copy,
+  // so filenames match even though directories differ). Best-effort and
+  // all-or-nothing per shard: any shard that can't be opened, or whose size
+  // doesn't match the primary's exactly, leaves that shard mirror-less
+  // (reads for it silently use the primary). A size mismatch is the one
+  // check that really matters -- every read uses offsets computed from the
+  // PRIMARY's tensor table, so a mirror that isn't byte-identical would
+  // silently return wrong weights rather than fail loudly.
+  // Returns the number of shards successfully mirrored.
+  int open_mirror(const std::string &mirror_dir) {
+    mirror_shard_fds.assign(shard_fds.size(), -1);
+    mirror_shard_direct_io.assign(shard_fds.size(), false);
+#ifndef __linux__
+    LOG_STREAM_WARN() << "[MIRROR] Only supported on Linux -- ignoring.\n";
+    return 0;
+#else
+    int n_ok = 0;
+    for (size_t i = 0; i < shard_paths.size(); ++i) {
+      std::string base = shard_paths[i];
+      size_t slash = base.find_last_of('/');
+      if (slash != std::string::npos) base = base.substr(slash + 1);
+      std::string mpath = mirror_dir;
+      if (!mpath.empty() && mpath.back() != '/') mpath += '/';
+      mpath += base;
+
+      // Size equality against the primary -- see this function's comment on
+      // why a silent mismatch would be a correctness bug, not just a perf
+      // miss. Compared via stat on both, not a trusted config assertion.
+      struct stat sp;
+      struct stat sm;
+      // ::stat -- the `struct stat sp;` declarations above bring the TYPE
+      // name into scope, which hides the function of the same name.
+      if (::stat(shard_paths[i].c_str(), &sp) != 0 || ::stat(mpath.c_str(), &sm) != 0) {
+        LOG_STREAM_WARN() << "[MIRROR] Shard " << i << ": cannot stat " << mpath
+                          << " -- this shard will read from the primary only.\n";
+        continue;
+      }
+      if (sp.st_size != sm.st_size) {
+        LOG_STREAM_ERROR() << "[MIRROR] Shard " << i << " SIZE MISMATCH (primary "
+                           << sp.st_size << " vs mirror " << sm.st_size << " bytes) for "
+                           << mpath << " -- refusing to stripe this shard; every read "
+                              "uses the primary's tensor offsets, so a differing copy "
+                              "would silently return wrong weights.\n";
+        continue;
+      }
+
+      // Match the primary's O_DIRECT state for this shard where possible;
+      // verify with a real pread rather than trusting open() (same
+      // discipline as enable_direct_io -- some filesystems accept the flag
+      // then reject the read).
+      bool want_direct = (i < shard_direct_io.size() && shard_direct_io[i]);
+      int fd = -1;
+      bool got_direct = false;
+      if (want_direct) {
+        fd = open(mpath.c_str(), O_RDONLY | O_DIRECT);
+        if (fd >= 0) {
+          void *tb = nullptr;
+          if (posix_memalign(&tb, (size_t)direct_io_alignment,
+                             (size_t)direct_io_alignment) == 0 && tb) {
+            got_direct = (pread(fd, tb, (size_t)direct_io_alignment, 0) >= 0);
+            free(tb);
+          }
+          if (!got_direct) { close(fd); fd = -1; }
+        }
+      }
+      if (fd < 0) {
+        fd = open(mpath.c_str(), O_RDONLY);
+        got_direct = false;
+        if (fd >= 0 && want_direct) {
+          LOG_STREAM_WARN() << "[MIRROR] Shard " << i << " (" << mpath
+                            << ") could not use O_DIRECT (the primary does) -- "
+                               "striping this shard with buffered reads.\n";
+        }
+      }
+      if (fd < 0) {
+        LOG_STREAM_WARN() << "[MIRROR] Shard " << i << ": open failed for " << mpath
+                          << " -- this shard will read from the primary only.\n";
+        continue;
+      }
+      mirror_shard_fds[i] = fd;
+      mirror_shard_direct_io[i] = got_direct;
+      n_ok++;
+    }
+    LOG_STREAM_INFO() << "[MIRROR] Second replica: " << n_ok << "/" << shard_paths.size()
+                      << " shard(s) opened from " << mirror_dir
+                      << " -- expert reads can now stripe across both devices "
+                         "(io_uring drives both queues from one submission).\n";
+    return n_ok;
+#endif
   }
 
   // Returns a pointer to the registered cuFile handle for this tensor's

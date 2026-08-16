@@ -6,6 +6,7 @@
 #include "ram_manager.hpp"
 #include "async_prefetcher.hpp"
 #include "logger.hpp"
+#include "tensor_trace.hpp"
 #include <cuda_runtime.h>
 #include <immintrin.h>
 #include <vector>
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <string>
 
 extern void mla_attention_absorbed_gguf(StreamingEngine& engine, int layer_idx, const float* Q_roped, int S, int pos_base, float* out);
 extern void dense_attention_gguf(StreamingEngine& engine, int layer_idx, const float* hidden_states, int S, int pos_base, float* out);
@@ -167,7 +169,12 @@ static bool check_finite(const char* label, int layer_idx, int expert_id, const 
     if (nan_count > 0 || inf_count > 0) {
         LOG_ERROR("[EXPERT-GPU] %s layer=%d expert=%d: %d/%zu NaN, %d/%zu Inf.\n",
                   label, layer_idx, expert_id, nan_count, n, inf_count, n);
+        trace_abort_if_nan("EXPERT-GPU", true);
         return false;
+    }
+    if (trace_gate("EXPERT-GPU")) {
+        std::string labeled = std::string(label) + " expert=" + std::to_string(expert_id);
+        trace_row("EXPERT-GPU", layer_idx, labeled, data, n);
     }
     return true;
 }
@@ -319,6 +326,31 @@ struct LayerScratch {
     std::vector<float> tok_topk_weights; // [S * topk]
     std::vector<int> expert_freq;       // [n_experts]
 
+    // prefill_warm_via_prefetcher=true: experts Phase 2 hinted to the async
+    // prefetcher but hadn't yet confirmed VRAM-resident. Unlike decode's own
+    // speculative ram_vram_promote_top_k pilot promotion, opportunistically
+    // promoting these is NOT a bet -- every entry here is a CONFIRMED real
+    // router pick for a token already in this exact prefill batch (built
+    // from expert_freq, the batch's own already-computed router output),
+    // so it WILL be dispatched to before this prefill call returns; the
+    // only open question is timing, not correctness or "was this the right
+    // guess". Checked at the START of each subsequent layer's own Phase 2
+    // (cross-layer -- a same-layer check right after push_hint essentially
+    // never finds the fetch has landed yet, see push_hint's own call-site
+    // comment) and opportunistically promoted via a decode-thread
+    // upload_expert_async call, mirroring exactly what the legacy
+    // synchronous Phase-2 path already did inline for every candidate.
+    // Phase 3's own synchronous dispatch remains the correctness backstop
+    // regardless -- an entry that ages out here unpromoted just costs
+    // exactly what it always cost before this opportunistic path existed,
+    // never a hang or a miss. static thread_local LayerScratch persists
+    // across the whole layer loop (and across requests), so this is a
+    // real, if small, cross-layer relay, not per-call scratch.
+    struct PendingPrefillPromotion { int layer_idx; int expert_id; int age_layers; };
+    static constexpr int PENDING_PREFILL_CAP = 32;
+    std::array<PendingPrefillPromotion, PENDING_PREFILL_CAP> pending_prefill_promotions{};
+    int pending_prefill_count = 0;
+
     // Pilot RECALL instrumentation (diagnostic only, no behavior change):
     // the pilot's full predicted top-K for pilot_pred_layer, captured
     // BEFORE the already-resident skip filter so this measures pure
@@ -342,6 +374,21 @@ struct LayerScratch {
     // pilot_recall's raw top-K accuracy (which includes already-cached
     // picks whose correctness doesn't matter to that question).
     std::array<bool, 8> pilot_pred_was_hint{};
+    // Parallel to pilot_pred_ids, same idea as pilot_pred_was_hint but for
+    // the OTHER bucket that matters for RAM->VRAM promotion: was
+    // pilot_pred_ids[k] classified "already_ram" (RAM-resident, NOT yet
+    // VRAM-resident) at prediction time? This is a genuinely different
+    // population from pilot_pred_was_hint's "needs_fetch" bucket -- disjoint,
+    // in fact, since a pick is classified into exactly one of the four
+    // buckets (needs_fetch / already_vram_pinned / already_vram_lru /
+    // already_ram). Neither the raw top-K recall (which mixes all four
+    // buckets together) nor the fetch-worthy accuracy (which measures ONLY
+    // needs_fetch, the population the EXISTING disk-prefetch path cares
+    // about) says anything about this one -- the population a RAM->VRAM
+    // promotion decision actually needs: of the picks already sitting in
+    // RAM with nothing further to fetch, how often does the prediction
+    // that put them there turn out to match the real router's later pick?
+    std::array<bool, 8> pilot_pred_was_ram_only{};
 
     // DEPTH-2 measurement (approach (a), "naive reuse" only) -- mirrors
     // pilot_pred_ids/count/layer/was_hint, one hop further out. Predicts
@@ -451,8 +498,9 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
     const ExpertGpuContext* gpu_ctx, int S,
     const GGUFTensor& gate_meta, const GGUFTensor& up_meta, const GGUFTensor& down_meta,
     bool* out_needs_release, bool* out_loc_from_active_layer,
-    RAMSafetyManager& ram_mgr
+    RAMSafetyManager& ram_mgr, StreamingEngine& engine
 ) {
+    PERF_SCOPE(t_resolve_gpu_loc_total);
     *out_needs_release = false;
     const ExpertLocation* loc = gpu_ctx ? gpu_ctx->loc : nullptr;
     // cpu_affinity_layers (config): this specific layer is pinned to CPU --
@@ -504,7 +552,8 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
         // EVERY synchronous-upload site in this function, not just
         // find_active_expert's, so this site no longer needs to avoid an
         // active MOVE either.
-        if (vram_resident && gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, gpu_ctx->layer_idx, gpu_ctx->expert_id);
+        if (vram_resident && gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, gpu_ctx->layer_idx, gpu_ctx->expert_id,
+                                                                          &engine.layers_experts[gpu_ctx->layer_idx]);
     }
 
     // Decode-time cold miss (S < GPU_COLD_BATCH_THRESHOLD, in practice
@@ -590,7 +639,8 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
         loc = gpu_ctx->topo->find_active_expert(gpu_ctx->layer_idx, gpu_ctx->expert_id,
             [&](int layer, int expert_id) {
                 promoted_to_main = true;
-                if (gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, layer, expert_id);
+                if (gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, layer, expert_id,
+                                                                 &engine.layers_experts[layer]);
             });
         vram_resident = loc && loc->device_ptr;
         if (vram_resident) {
@@ -658,7 +708,8 @@ static const ExpertLocation* expert_ffn_resolve_gpu_loc(
                     // three synchronous-upload sites in this function.
                     // Upgraded to active reclaim -- see the cold-batch
                     // site's own comment above for why this is now safe.
-                    if (gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, gpu_ctx->layer_idx, gpu_ctx->expert_id);
+                    if (gpu_ctx->exp) ram_mgr.finish_sync_promotion(*gpu_ctx->exp, gpu_ctx->layer_idx, gpu_ctx->expert_id,
+                                                                     &engine.layers_experts[gpu_ctx->layer_idx]);
                     LOG_DEBUG("[MOE-VRAM]  COLD-GPU layer=%d expert=%d -> synchronous H2D upload on decode-time "
                               "miss (avoids CPU dequant-matmul fallback)\n",
                               gpu_ctx->layer_idx, gpu_ctx->expert_id);
@@ -808,6 +859,7 @@ static bool expert_ffn_gpu_issue(
     const float* input, const GGUFTensor& gate_meta, const GGUFTensor& up_meta,
     int S, int D, int moe_inter
 ) {
+    PERF_SCOPE(t_gpu_issue_total);
     // Slab layout mirrors the host copy: gate at offset 0, up at its
     // original file-offset delta from gate (see load_expert_slab).
     const uint8_t* base = loc->device_ptr;
@@ -833,7 +885,7 @@ static bool expert_ffn_gpu_issue(
     // [up_off_delta, loc->size)) so a corrupted region anywhere in either
     // tensor is very likely to land in at least one window, without paying
     // for a full-tensor download every dispatch.
-    if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+    if (trace_gate("VRAM-BYTE-PROBE")) {
         constexpr int NUM_WINDOWS = 16;
         constexpr size_t WIN = 64;
         size_t up_off = (size_t)(up_meta.offset - gate_meta.offset);
@@ -870,61 +922,68 @@ static bool expert_ffn_gpu_issue(
                              << " up_zero_windows=" << up_zero_windows << "/" << up_windows
                              << " gate_type=" << gpu_type_name(gate_meta.type)
                              << " up_type=" << gpu_type_name(up_meta.type) << "\n";
+    }
 
-        // d-scale probe: the byte-window probe above only proves the tensor
-        // isn't ALL zero -- it can't tell "real nonzero qs/sign bits sitting
-        // next to a zero dequant scale" from genuinely-live data, because the
-        // scale is a small fraction of each block's bytes. iq2_matmul.cu's
-        // dequant_iq2_xxs_coop multiplies every one of a block's 256 elements
-        // by a single shared per-block scale db = d * (...) * 0.25, where d
-        // is that block's own leading fp16 header (2 of its 66 bytes). If d
-        // is 0 for (nearly) every block of a tensor, EVERY dequantized value
-        // is exactly 0.0 regardless of what the qs/sign bits look like --
-        // exactly the "raw bytes look real but matmul output is all zero"
-        // pattern the byte-window probe couldn't explain. Sampled block-
-        // aligned (not byte-window-aligned) so every sample lands exactly on
-        // a `d` header instead of an arbitrary offset into qs data.
-        if (gate_meta.type == GGUFType::IQ2_XXS || up_meta.type == GGUFType::IQ2_XXS) {
-            // Named IQ2_BLOCK_BYTES, not BLOCK_SIZE: <linux/fs.h> #defines a
-            // bare BLOCK_SIZE macro ((1<<10)), pulled in transitively via
-            // async_prefetcher.hpp -> io_uring_backend.hpp's real Linux
-            // branch (#include <linux/io_uring.h>) -- invisible from the
-            // Mac-side lint workflow, which always takes that header's
-            // non-Linux stub branch instead. A local `constexpr size_t
-            // BLOCK_SIZE` silently got rewritten to `constexpr size_t
-            // (1<<10)` by the preprocessor, producing the confusing real
-            // GCC error "expected primary-expression before 'constexpr'".
-            constexpr size_t IQ2_BLOCK_BYTES = 66;  // sizeof(block_iq2_xxs_cu): 2(d) + 32*2(qs)
-            constexpr int NUM_SAMPLES = 8;
-            auto sample_d = [&](const uint8_t* dev, size_t extent, int& zero_d, int& sampled,
-                                 float& min_d, float& max_d) {
-                size_t num_blocks = extent / IQ2_BLOCK_BYTES;
-                if (num_blocks == 0) return;
-                for (int i = 0; i < NUM_SAMPLES; ++i) {
-                    size_t block_idx = (num_blocks > 1)
-                        ? (size_t)((double)i / (NUM_SAMPLES - 1) * (num_blocks - 1))
-                        : 0;
-                    uint16_t d_raw = 0;
-                    cudaMemcpy(&d_raw, dev + block_idx * IQ2_BLOCK_BYTES, sizeof(d_raw), cudaMemcpyDeviceToHost);
-                    float d = fp16_to_fp32(d_raw);
-                    ++sampled;
-                    if (d == 0.0f) ++zero_d;
-                    min_d = std::min(min_d, d);
-                    max_d = std::max(max_d, d);
-                }
-            };
-            int gate_zero_d = 0, gate_d_sampled = 0, up_zero_d = 0, up_d_sampled = 0;
-            float gate_min_d = 1e30f, gate_max_d = -1e30f, up_min_d = 1e30f, up_max_d = -1e30f;
-            if (gate_meta.type == GGUFType::IQ2_XXS)
-                sample_d(gate_dev, gate_extent, gate_zero_d, gate_d_sampled, gate_min_d, gate_max_d);
-            if (up_meta.type == GGUFType::IQ2_XXS)
-                sample_d(up_dev, up_extent, up_zero_d, up_d_sampled, up_min_d, up_max_d);
-            LOG_STREAM_VERBOSE() << "[VRAM-DSCALE-PROBE l=" << loc->layer_idx << " e=" << loc->expert_id
-                                 << "] gate_zero_d=" << gate_zero_d << "/" << gate_d_sampled
-                                 << " gate_d_range=[" << gate_min_d << "," << gate_max_d << "]"
-                                 << " up_zero_d=" << up_zero_d << "/" << up_d_sampled
-                                 << " up_d_range=[" << up_min_d << "," << up_max_d << "]\n";
-        }
+    // d-scale probe: the byte-window probe above only proves the tensor
+    // isn't ALL zero -- it can't tell "real nonzero qs/sign bits sitting
+    // next to a zero dequant scale" from genuinely-live data, because the
+    // scale is a small fraction of each block's bytes. iq2_matmul.cu's
+    // dequant_iq2_xxs_coop multiplies every one of a block's 256 elements
+    // by a single shared per-block scale db = d * (...) * 0.25, where d
+    // is that block's own leading fp16 header (2 of its 66 bytes). If d
+    // is 0 for (nearly) every block of a tensor, EVERY dequantized value
+    // is exactly 0.0 regardless of what the qs/sign bits look like --
+    // exactly the "raw bytes look real but matmul output is all zero"
+    // pattern the byte-window probe couldn't explain. Sampled block-
+    // aligned (not byte-window-aligned) so every sample lands exactly on
+    // a `d` header instead of an arbitrary offset into qs data.
+    // Independently gated from VRAM-BYTE-PROBE above (own trace tag) even
+    // though it shares that block's gate_extent/up_extent derivation --
+    // both are cheap arithmetic, not worth threading a shared gate through.
+    if (trace_gate("VRAM-DSCALE-PROBE") &&
+        (gate_meta.type == GGUFType::IQ2_XXS || up_meta.type == GGUFType::IQ2_XXS)) {
+        size_t up_off = (size_t)(up_meta.offset - gate_meta.offset);
+        size_t gate_extent = std::min(up_off, loc->size);
+        size_t up_extent = (loc->size > up_off) ? (loc->size - up_off) : (size_t)0;
+        // Named IQ2_BLOCK_BYTES, not BLOCK_SIZE: <linux/fs.h> #defines a
+        // bare BLOCK_SIZE macro ((1<<10)), pulled in transitively via
+        // async_prefetcher.hpp -> io_uring_backend.hpp's real Linux
+        // branch (#include <linux/io_uring.h>) -- invisible from the
+        // Mac-side lint workflow, which always takes that header's
+        // non-Linux stub branch instead. A local `constexpr size_t
+        // BLOCK_SIZE` silently got rewritten to `constexpr size_t
+        // (1<<10)` by the preprocessor, producing the confusing real
+        // GCC error "expected primary-expression before 'constexpr'".
+        constexpr size_t IQ2_BLOCK_BYTES = 66;  // sizeof(block_iq2_xxs_cu): 2(d) + 32*2(qs)
+        constexpr int NUM_SAMPLES = 8;
+        auto sample_d = [&](const uint8_t* dev, size_t extent, int& zero_d, int& sampled,
+                             float& min_d, float& max_d) {
+            size_t num_blocks = extent / IQ2_BLOCK_BYTES;
+            if (num_blocks == 0) return;
+            for (int i = 0; i < NUM_SAMPLES; ++i) {
+                size_t block_idx = (num_blocks > 1)
+                    ? (size_t)((double)i / (NUM_SAMPLES - 1) * (num_blocks - 1))
+                    : 0;
+                uint16_t d_raw = 0;
+                cudaMemcpy(&d_raw, dev + block_idx * IQ2_BLOCK_BYTES, sizeof(d_raw), cudaMemcpyDeviceToHost);
+                float d = fp16_to_fp32(d_raw);
+                ++sampled;
+                if (d == 0.0f) ++zero_d;
+                min_d = std::min(min_d, d);
+                max_d = std::max(max_d, d);
+            }
+        };
+        int gate_zero_d = 0, gate_d_sampled = 0, up_zero_d = 0, up_d_sampled = 0;
+        float gate_min_d = 1e30f, gate_max_d = -1e30f, up_min_d = 1e30f, up_max_d = -1e30f;
+        if (gate_meta.type == GGUFType::IQ2_XXS)
+            sample_d(gate_dev, gate_extent, gate_zero_d, gate_d_sampled, gate_min_d, gate_max_d);
+        if (up_meta.type == GGUFType::IQ2_XXS)
+            sample_d(up_dev, up_extent, up_zero_d, up_d_sampled, up_min_d, up_max_d);
+        LOG_STREAM_VERBOSE() << "[VRAM-DSCALE-PROBE l=" << loc->layer_idx << " e=" << loc->expert_id
+                             << "] gate_zero_d=" << gate_zero_d << "/" << gate_d_sampled
+                             << " gate_d_range=[" << gate_min_d << "," << gate_max_d << "]"
+                             << " up_zero_d=" << up_zero_d << "/" << up_d_sampled
+                             << " up_d_range=[" << up_min_d << "," << up_max_d << "]\n";
     }
 
     // One-shot real-activation capture for the DeepSeek-V4-Flash garbled-
@@ -975,7 +1034,7 @@ static bool expert_ffn_gpu_issue(
     // (points at the matmul/weight-dispatch path itself). Cheap (S*D scan,
     // same VERBOSE gate as the existing SILU-TRACE-GPU it's meant to be
     // read alongside) so left unconditional rather than env-var-gated.
-    if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+    if (trace_gate("INPUT-TRACE-GPU")) {
         float in_min = input[0], in_max = input[0];
         int in_zero = 0;
         for (int i = 0; i < S * D; ++i) {
@@ -1026,6 +1085,7 @@ static void expert_ffn_gpu_finish(
     GpuTopology* topo, bool needs_release, bool loc_from_active_layer,
     float swiglu_clamp
 ) {
+    PERF_SCOPE(t_gpu_finish_total);
     // Each in-flight expert's issue() may have run on a different vault GPU
     // (multi-GPU config) and left a different device "current" on this
     // thread -- re-pin explicitly rather than trusting ambient state.
@@ -1055,8 +1115,8 @@ static void expert_ffn_gpu_finish(
     // never zeroes" -- a zero-`down_buf` call with no CPU SILU-TRACE nearby
     // may simply have been GPU-dispatched and thus invisible to that trace.
     float pre_min = 0.0f, pre_max = 0.0f;
-    bool trace = Logger::instance().would_log(LogLevel::VERBOSE);
-    if (trace) {
+    bool trace_silu_gpu = trace_gate("SILU-TRACE-GPU");
+    if (trace_silu_gpu) {
         pre_min = gate_buf[0]; pre_max = gate_buf[0];
         for (int i = 1; i < S * moe_inter; ++i) {
             pre_min = std::min(pre_min, gate_buf[i]);
@@ -1075,7 +1135,7 @@ static void expert_ffn_gpu_finish(
     // occurrences. Logged in the SAME statement grouping as SILU-TRACE-GPU
     // below so the two are always about the literal same call, no
     // correlation-by-eye required.
-    if (trace) {
+    if (trace_gate("INPUT-TRACE-GPU-PAIRED")) {
         std::vector<float> x_check((size_t)S * D);
         cudaMemcpy(x_check.data(), gpu_scratch.d_x, (size_t)S * D * sizeof(float), cudaMemcpyDeviceToHost);
         float x_min = x_check[0], x_max = x_check[0];
@@ -1089,17 +1149,29 @@ static void expert_ffn_gpu_finish(
                              << "] d_x range=[" << x_min << ", " << x_max
                              << "] zeros=" << x_zero << "/" << x_check.size() << "\n";
     }
+    // Tightly wraps only the three real math calls (not the trace-only
+    // blocks in between, which are no-ops off the VERBOSE path and would
+    // otherwise pollute this measurement when tracing happens to be on) --
+    // see t_expert_silu_activation's own comment (PerfCounters) for why
+    // this was added: three prior investigation rounds instrumented
+    // GpuTopology/RAMSafetyManager functions looking for the gap between
+    // expert= and every other sub-timer and all came back near-zero; this
+    // is the first timer on this specific CPU-side activation path.
+    PERF_START(gexp_silu);
     silu_inplace(gate_buf, S * moe_inter);
-    if (trace) {
+    PERF_END(gexp_silu, t_expert_silu_activation);
+    if (trace_silu_gpu) {
         int n_zero = 0;
         for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
         LOG_STREAM_VERBOSE() << "[SILU-TRACE-GPU l=" << layer_idx << " e=" << expert_id
                              << "] pre-SiLU gate range=[" << pre_min << ", " << pre_max
                              << "] post-SiLU zeros=" << n_zero << "/" << (S * moe_inter) << "\n";
     }
+    PERF_START(gexp_mulclamp);
     elem_mul(gate_buf, gate_buf, up_buf, S * moe_inter);
     swiglu_clamp_inplace(gate_buf, S * moe_inter, swiglu_clamp);
-    if (trace) {
+    PERF_END(gexp_mulclamp, t_expert_silu_activation);
+    if (trace_gate("SWIGLU-TRACE-GPU")) {
         int n_zero = 0;
         for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
         LOG_STREAM_VERBOSE() << "[SWIGLU-TRACE-GPU l=" << layer_idx << " e=" << expert_id
@@ -1158,8 +1230,8 @@ static void expert_ffn_cpu(
     // zero/garbage before SiLU ever runs). Only computed under VERBOSE,
     // matching every other high-volume per-expert trace in this file.
     float pre_min = 0.0f, pre_max = 0.0f;
-    bool trace = Logger::instance().would_log(LogLevel::VERBOSE);
-    if (trace) {
+    bool trace_silu = trace_gate("SILU-TRACE");
+    if (trace_silu) {
         pre_min = gate_buf[0]; pre_max = gate_buf[0];
         for (int i = 1; i < S * moe_inter; ++i) {
             pre_min = std::min(pre_min, gate_buf[i]);
@@ -1167,7 +1239,7 @@ static void expert_ffn_cpu(
         }
     }
     silu_inplace(gate_buf, S * moe_inter);
-    if (trace) {
+    if (trace_silu) {
         int n_zero = 0;
         for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
         LOG_STREAM_VERBOSE() << "[SILU-TRACE l=" << layer_idx << " e=" << expert_id
@@ -1177,7 +1249,7 @@ static void expert_ffn_cpu(
 
     elem_mul(gate_buf, gate_buf, up_buf, S * moe_inter);
     swiglu_clamp_inplace(gate_buf, S * moe_inter, swiglu_clamp);
-    if (trace) {
+    if (trace_gate("SWIGLU-TRACE")) {
         int n_zero = 0;
         for (int i = 0; i < S * moe_inter; ++i) if (gate_buf[i] == 0.0f) ++n_zero;
         LOG_STREAM_VERBOSE() << "[SWIGLU-TRACE l=" << layer_idx << " e=" << expert_id
@@ -1475,6 +1547,17 @@ void moe_forward_gguf(
                      scratch.router_logits.data(), (size_t)S * n_experts);
     }
 
+    // Real, previously-untimed cost -- see t_moe_topk_select's own comment
+    // (perf_timer.hpp) for why this got its own scope: this block (bias add
+    // + argsort/partial_sort top-k selection + pilot recall bookkeeping) was
+    // NOT inside t_moe_route's PERF_SCOPE above despite that counter's name
+    // implying it covered "top-k selection" too. Explicit brace block (not a
+    // bare statement) so this scope ends where Phase 1 actually ends, NOT
+    // at the end of the whole function -- PERF_SCOPE is RAII, timed until
+    // its ENCLOSING scope closes.
+    {
+    PERF_SCOPE(t_moe_topk_select);
+
     // Selection bias (DeepSeek-V3/GLM-5.2 style expert_selection_bias):
     // present only on some architectures, absent -> selection uses raw probs.
     // GGUF name confirmed against llama-arch.cpp: "blk.N.exp_probs_b.bias"
@@ -1596,7 +1679,7 @@ void moe_forward_gguf(
         // FFN math itself is correct, just applied to the wrong experts.
         // Only the LAST token (s==S-1) -- that's the one whose output
         // actually feeds the next-token prediction.
-        if (s == S - 1 && Logger::instance().would_log(LogLevel::VERBOSE)) {
+        if (s == S - 1 && trace_gate("TRACE-ROUTER")) {
             LogStream ls(LogLevel::VERBOSE);
             ls << "[TRACE l=" << layer_idx << "] router picks:";
             for (int k = 0; k < topk; ++k) {
@@ -1623,6 +1706,18 @@ void moe_forward_gguf(
                     if (scratch.tok_topk_ids[s * topk + k] == pred_id) { matched = true; break; }
                 }
                 if (matched) ++overlap;
+                // Per-rank breakdown -- exact mirror of the DEPTH-2 version
+                // further below (see n_pilot_recall_hits_by_rank's own
+                // comment, perf_timer.hpp): pilot_pred_ids[k] is already
+                // ranked by the pilot's own confidence (repeated argmax,
+                // k=0 = highest), so this answers "does l+1's accuracy
+                // concentrate in the high-confidence ranks" -- the number
+                // that actually decides how many top ranks are safe to
+                // promote RAM->VRAM speculatively.
+                if (pk < 8) {
+                    perf().n_pilot_recall_checks_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                    if (matched) perf().n_pilot_recall_hits_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                }
                 // Restricted tally: of the picks that were actually
                 // fetch-worthy (not already cached, so a real hint got
                 // pushed for them), how many turned out correct? This is
@@ -1631,6 +1726,24 @@ void moe_forward_gguf(
                 if (scratch.pilot_pred_was_hint[pk]) {
                     ++hint_denom;
                     if (matched) ++hint_overlap;
+                    if (pk < 8) {
+                        perf().n_pilot_recall_hint_checks_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                        if (matched) perf().n_pilot_recall_hint_hits_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                // Third, disjoint tally: of the picks that were RAM-resident
+                // but NOT yet VRAM-resident at prediction time (a completely
+                // different population from the fetch-worthy one just above
+                // -- see pilot_pred_was_ram_only's own comment), how many
+                // matched the real router's later pick? This is the number
+                // that actually calibrates a RAM->VRAM speculative-promotion
+                // cutoff -- neither the raw per-rank recall above (mixes in
+                // already-VRAM and needs-fetch picks too) nor the
+                // fetch-worthy number (a disjoint population entirely) can
+                // answer it.
+                if (pk < 8 && scratch.pilot_pred_was_ram_only[pk]) {
+                    perf().n_pilot_ram_only_checks_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
+                    if (matched) perf().n_pilot_ram_only_hits_by_rank[pk].fetch_add(1, std::memory_order_relaxed);
                 }
             }
             perf().n_pilot_recall_hits.fetch_add((uint64_t)overlap, std::memory_order_relaxed);
@@ -1689,6 +1802,7 @@ void moe_forward_gguf(
             }
         }
     }
+    }  // end t_moe_topk_select scope (Phase 1)
 
     // --- Phase 2: cold-start VRAM warm-up (prefill only, S > 1) ---
     // A brand-new turn's prefill sees every prompt token in one shot, so
@@ -1725,8 +1839,61 @@ void moe_forward_gguf(
                 && gpu_type_supported(p2_dM->type);
         }
 
+        // Active-layer BATCH pre-warm (async issue + one shared sync) --
+        // a SEPARATE pool from the main vram_cache pre-warm loop below.
+        // GLM's dominant cold-miss dispatch path is upload_expert_active
+        // (find_active_expert/upload_expert_active), not the main cache,
+        // so THIS pool is what actually targets active_up's real cost
+        // (2026-08-12 prefill investigation, see CLAUDE.md: active_up was
+        // ~29% of prefill's own wall time, the single largest bucket).
+        // No resource-competition risk with the main-cache loop below
+        // (unlike prefill_opportunistic_promote's reverted mistake) --
+        // these are two independent VRAM pools with no shared gate.
+        // Scoped to THIS layer only, entirely inside Phase 2 -- by the
+        // time Phase 3 begins a few lines below, sync_active_layer_batch
+        // has already confirmed every issued copy landed (load-bearing
+        // ordering, not just tidy -- see upload_expert_active_async's own
+        // correctness contract in gpu_topology.hpp). Anything not covered
+        // here (not yet RAM-resident, active-layer area unavailable/full,
+        // or GPU-incapable) falls through to Phase 3's existing reactive
+        // path unchanged -- never a correctness issue, only a missed-
+        // overlap opportunity for that specific expert.
+        if (ram_mgr.vram_cache->active_layer_capacity > 0) {
+            std::vector<ExpertLocation*> active_prewarm_batch;
+            active_prewarm_batch.reserve(candidates.size());
+            for (int expert_id : candidates) {
+                // Side-effect-free peek (active_layer_has), NOT
+                // find_active_expert -- see that function's own comment
+                // for why calling the real, hit-count-bumping/promotion-
+                // triggering lookup speculatively here would corrupt the
+                // exact state this batch is simultaneously choosing
+                // victims from.
+                if (ram_mgr.vram_cache->active_layer_has(layer_idx, expert_id)) continue;
+                if (ram_mgr.vram_cache->find_expert(layer_idx, expert_id)) continue; // main-cache hit already covers it
+                // Non-blocking: only pre-warm what's ALREADY RAM-resident
+                // (from phase_b's own prefetch coverage) -- never trigger
+                // a fresh disk read here, that would defeat the point.
+                MoEExpertBlock* ready = ram_mgr.find_ram_slot_if_ready(
+                    engine.layers_experts[layer_idx],
+                    (size_t)ram_mgr.cap_for_layer(layer_idx), layer_idx, expert_id);
+                if (!ready) {
+                    perf().n_active_layer_prewarm_not_ram_ready.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                bool ready_gpu_capable = gpu_type_supported(ready->gate_proj.meta.type)
+                                       && gpu_type_supported(ready->up_proj.meta.type)
+                                       && gpu_type_supported(ready->down_proj.meta.type);
+                if (!ready_gpu_capable) continue;
+                ExpertLocation* v = ram_mgr.vram_cache->upload_expert_active_async(
+                    layer_idx, expert_id, ready->slab_buffer, ready->slab_capacity);
+                if (v) active_prewarm_batch.push_back(v);
+            }
+            if (!active_prewarm_batch.empty()) {
+                ram_mgr.vram_cache->sync_active_layer_batch(active_prewarm_batch);
+            }
+        }
+
         for (int expert_id : candidates) {
-            if (!ram_mgr.vram_cache->has_free_slot()) break; // cache warm now — stop preloading
             if (ram_mgr.vram_cache->find_expert(layer_idx, expert_id)) continue; // already resident
 
             if (engine.prefill_warm_via_prefetcher) {
@@ -1738,13 +1905,68 @@ void moe_forward_gguf(
                 // in time for THIS layer's own Phase 3 dispatch a moment
                 // later, falling through to the ordinary (already-correct)
                 // miss path for this call; never a correctness issue.
+                //
+                // Deliberately NOT gated on vram_cache->has_free_slot() the
+                // way the legacy synchronous path below still is (2026-08-
+                // 12 fix). A pushed hint only ever populates the RAM tier
+                // -- active_prefetch (async_prefetcher.hpp) never touches
+                // VRAM from a prefetch-worker thread (see claim_or_wait's
+                // own CRITICAL rule) -- so it doesn't need a free VRAM
+                // slot at all, only RAM-tier capacity (host_ram_gb,
+                // currently 120GB, far less contended than the ~1400-slot
+                // VRAM cache that saturates partway through nearly every
+                // prefill run). Gating the hint-push on VRAM capacity it
+                // doesn't need was needlessly conservative: real per-
+                // request [PREFILL] instrumentation showed phase_b (real,
+                // decode-thread-BLOCKING disk reads inside Phase 3's own
+                // miss handling) costing ~26% of prefill's own wall time
+                // -- exactly the cost this gate creates, by refusing to
+                // even START a background RAM fetch for any layer whose
+                // candidates come up once VRAM happens to be full,
+                // forcing that layer's real Phase-3 miss to pay for a
+                // synchronous disk read from scratch instead of finding
+                // it already RAM-resident. No VRAM-competition risk here
+                // (unlike prefill_opportunistic_promote, which DID
+                // compete for VRAM capacity and was reverted for exactly
+                // that reason) -- this only ever adds queue pressure on
+                // the prefetcher's own worker threads, not VRAM slots.
+                // UNVERIFIED on real hardware -- watch "Prefetch pickup"
+                // (avg ms/backlog) for a WORSE queue backlog than before
+                // (this could push MORE total hints than previously,
+                // since the loop no longer breaks early), which would
+                // mean this trades one bottleneck for another rather than
+                // removing it. See CLAUDE.md.
                 if (!hint_mode_gpu_capable) continue;
                 async_io_queue.push_hint(layer_idx, expert_id);
                 perf().n_prefill_hint_pushed.fetch_add(1, std::memory_order_relaxed);
+                // Track for cross-layer opportunistic VRAM promotion (see
+                // LayerScratch::pending_prefill_promotions's own comment,
+                // and the follow-up pass above). Silently drops the newest
+                // hint if the small pending list is already full rather
+                // than growing unbounded -- Phase 3's synchronous dispatch
+                // is always the correctness backstop either way, so a
+                // dropped tracking entry only forgoes the OPPORTUNISTIC
+                // early promotion for that one expert, never correctness.
+                if (!engine.prefill_opportunistic_promote) {
+                    // Not tracked at all -- see EngineConfig::prefill_
+                    // opportunistic_promote's own comment for the A/B this
+                    // gate exists to enable.
+                } else if (scratch.pending_prefill_count < LayerScratch::PENDING_PREFILL_CAP) {
+                    scratch.pending_prefill_promotions[scratch.pending_prefill_count++] =
+                        {layer_idx, expert_id, 0};
+                } else {
+                    perf().n_prefill_pending_cap_dropped.fetch_add(1, std::memory_order_relaxed);
+                }
                 continue;
             }
 
             // ---- Legacy synchronous path (default, unchanged behavior) ----
+            // has_free_slot() gate lives HERE now, not at the top of the
+            // loop -- this path DOES promote directly into VRAM
+            // (upload_expert_async below), so it genuinely needs a free
+            // slot, unlike the hint-push path above. See that branch's own
+            // comment for the full reasoning.
+            if (!ram_mgr.vram_cache->has_free_slot()) break; // cache warm now — stop preloading
             MoEExpertBlock* blk = ram_mgr.get_expert(engine, layer_idx, expert_id);
             if (!blk || !blk->slab_buffer) continue;
 
@@ -1775,11 +1997,78 @@ void moe_forward_gguf(
             else perf().n_prefill_warm_failed.fetch_add(1, std::memory_order_relaxed);
             ram_mgr.apply_promotion_bookkeeping(*blk, layer_idx, expert_id, promoted);
         }
+
+        // Cross-layer follow-up for LayerScratch::pending_prefill_promotions
+        // (see that field's own comment) -- runs AFTER the candidate loop
+        // above, not before. ORDERING FIX (2026-08-12): running this FIRST
+        // (the original placement) let it consume vram_cache->has_free_slot()
+        // capacity before THIS layer's own hint-pushing loop got to decide
+        // how much of that shared budget it wanted -- confirmed via a real
+        // A/B to starve LATER layers of hints entirely (n_prefill_hint_pushed
+        // nearly halved, 420 vs ~930), a genuine regression (see CLAUDE.md).
+        // Running it AFTER means the candidate loop above always gets first
+        // claim on whatever's free; this pass only ever mops up whatever's
+        // left, which can never come at another layer's expense. Still
+        // fires every Phase-2 entry regardless of THIS layer's own
+        // prefill_warm_via_prefetcher status, since a pending entry can
+        // reference an EARLIER layer. Cheap no-op when the list is empty.
+        if (engine.prefill_opportunistic_promote && scratch.pending_prefill_count > 0) {
+            constexpr int PENDING_PREFILL_MAX_AGE = 12;  // layers; starting guess, unverified on hardware
+            int write = 0;
+            for (int i = 0; i < scratch.pending_prefill_count; ++i) {
+                auto& pend = scratch.pending_prefill_promotions[i];
+                ++pend.age_layers;
+                bool resolved = false;
+
+                if (ram_mgr.vram_cache->find_expert(pend.layer_idx, pend.expert_id)) {
+                    perf().n_prefill_pending_already_resident.fetch_add(1, std::memory_order_relaxed);
+                    resolved = true;  // something else already promoted it (e.g. a reactive hit) -- fine
+                } else if (!ram_mgr.vram_cache->has_free_slot()) {
+                    perf().n_prefill_pending_no_free_slot.fetch_add(1, std::memory_order_relaxed);
+                    resolved = true;  // cache is warm now -- opportunistic promotion is moot for the rest of this run
+                } else {
+                    MoEExpertBlock* ready = ram_mgr.find_ram_slot_if_ready(
+                        engine.layers_experts[pend.layer_idx],
+                        (size_t)ram_mgr.cap_for_layer(pend.layer_idx), pend.layer_idx, pend.expert_id);
+                    if (!ready) {
+                        perf().n_prefill_pending_still_loading.fetch_add(1, std::memory_order_relaxed);
+                        resolved = (pend.age_layers >= PENDING_PREFILL_MAX_AGE);
+                        if (resolved) perf().n_prefill_pending_aged_out.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        size_t p2_gb = 0, p2_ub = 0, p2_db = 0;
+                        const GGUFTensor *p2_gM = nullptr, *p2_uM = nullptr, *p2_dM = nullptr;
+                        bool ready_gpu_capable = engine.expert_layer_geometry(
+                                pend.layer_idx, p2_gb, p2_ub, p2_db, p2_gM, p2_uM, p2_dM)
+                            && gpu_type_supported(p2_gM->type) && gpu_type_supported(p2_uM->type)
+                            && gpu_type_supported(p2_dM->type);
+                        resolved = true;  // decided one way or the other below, either way don't re-check it again
+                        if (ready_gpu_capable) {
+                            ExpertLocation* promoted = ram_mgr.vram_cache->upload_expert_async(
+                                pend.layer_idx, pend.expert_id, ready->slab_buffer, ready->slab_capacity);
+                            if (promoted) perf().n_prefill_pending_promoted.fetch_add(1, std::memory_order_relaxed);
+                            ram_mgr.apply_promotion_bookkeeping(*ready, pend.layer_idx, pend.expert_id, promoted);
+                        }
+                    }
+                }
+
+                if (!resolved) scratch.pending_prefill_promotions[write++] = pend;  // keep, still legitimately pending
+            }
+            scratch.pending_prefill_count = write;
+        }
+
         PERF_END(prefill_warm, t_prefill_warm_time);
     }
 
     // --- Phase 3: execute each token's already-selected experts ---
     for (int s = 0; s < S; ++s) {
+        // Diagnostic upper bound on this whole per-token dispatch loop --
+        // see t_moe_phase3_dispatch's own comment (perf_timer.hpp) for why
+        // this is DELIBERATELY not a clean partition against gpu=/cpu=/
+        // ram_scan= (all nested inside this same loop body); its own real
+        // per-loop-iteration cost accumulates correctly across repeated
+        // scope entry/exit (ScopedTimer's destructor ADDS elapsed, doesn't
+        // overwrite), matching the S>1 prefill case too.
+        PERF_SCOPE(t_moe_phase3_dispatch);
         // FIX: both routed and shared expert FFNs must consume the SAME
         // ffn_norm'd input the router scored (matching the reference: llama.cpp
         // builds one normed `cur` tensor and feeds it to both the router and
@@ -1796,13 +2085,14 @@ void moe_forward_gguf(
         // Moved up (was previously defined between the loading block and the
         // old Pass A loop) so dispatch_expert_k below can capture it.
         auto accumulate = [&](int k, MoEExpertBlock* exp, const float* down_buf_ptr) {
+            PERF_SCOPE(t_accumulate_total);
             // Per-expert output norm, VERBOSE-gated: distinguishes "expert_ffn
             // itself computed all-zero" from "it computed something real but
             // the weighted accumulation below never applied it" -- check_finite
             // only catches NaN/Inf, never a suspiciously-exact zero, which is
             // exactly the symptom under investigation (moe_out|=0 every MoE
             // layer during prefill)
-            if (Logger::instance().would_log(LogLevel::VERBOSE)) {
+            if (trace_gate("TRACE-EXPERT-NORM")) {
                 double ss = 0.0; for (int d = 0; d < D; ++d) ss += (double)down_buf_ptr[d] * down_buf_ptr[d];
                 LOG_STREAM_VERBOSE() << "[TRACE l=" << layer_idx << "] expert k=" << k
                                      << " id=" << exp->expert_id << " requested_id="
@@ -1893,7 +2183,7 @@ void moe_forward_gguf(
             bool loc_from_active_layer = false;
             const ExpertLocation* resolved = expert_ffn_resolve_gpu_loc(
                 &gpu_ctx, 1, exp->gate_proj.meta, exp->up_proj.meta, exp->down_proj.meta,
-                &needs_release, &loc_from_active_layer, ram_mgr);
+                &needs_release, &loc_from_active_layer, ram_mgr, engine);
 
             bool gpu_issued = false;
             if (resolved) {
@@ -2160,10 +2450,181 @@ void moe_forward_gguf(
                                            (int)ram_needed_ids.size(), ram_needed_ptrs.data());
                 for (size_t i = 0; i < ram_needed_ids.size(); ++i)
                     scratch.expert_ptrs[ram_needed_k[i]] = ram_needed_ptrs[i];
-                // Dispatch whatever get_experts_batch just resolved. The
-                // shadowed experts above already had their kernels issued
-                // inline, before this blocking call ran -- only the genuine
-                // misses are dispatched here, after their data is ready.
+
+                // Batch-async pre-warm this token's own RAM->VRAM active-
+                // layer misses BEFORE dispatching them one at a time below --
+                // mirrors prefill Phase 2's own upload_expert_active_async +
+                // sync_active_layer_batch pattern (gpu_topology.cpp),
+                // applied to this TOKEN's real ram_needed_k set instead of a
+                // whole layer's predicted candidates. Real, measured DMA-level
+                // win on both GPUs in this box via tests/bench_dma_sync_vs_
+                // async.cu -- see that file's header comment.
+                //
+                // DEFAULT OFF (engine.decode_async_prewarm) and CHUNKED
+                // (engine.decode_async_prewarm_max_batch, default 3), NOT
+                // the simple "batch everything in one shot" shape this
+                // started as -- that unbounded version caused a real
+                // production incident (host RAM exhaustion / swap thrashing
+                // / freeze) on a config running host_ram_gb close to
+                // physical RAM. Processing in small chunks, each with its
+                // own full pin -> issue -> sync -> unpin cycle before the
+                // next chunk starts, bounds how many RAM slots are
+                // simultaneously pinned and how many active-layer slots are
+                // simultaneously mid-DMA at any one instant -- trading some
+                // batching benefit for tokens with more misses than
+                // max_batch, in exchange for a hard cap on peak simultaneous
+                // footprint. See EngineConfig::decode_async_prewarm's own
+                // comment (engine_config.hpp) for the full incident writeup.
+                //
+                // Only ever targets the ACTIVE-LAYER pool (the one pool with
+                // an existing async+batch-sync primitive) -- a model without
+                // one allocated (use_active_layer_area=false, e.g. DeepSeek-
+                // V4) makes upload_expert_active_async a guaranteed no-op
+                // nullptr return for every candidate, so this whole block
+                // degrades to zero-cost no-op and dispatch_expert_k's
+                // existing main-cache (upload_expert) sync path runs
+                // completely unchanged for those models.
+                if (engine.decode_async_prewarm && !cpu_only_mode()
+                    && !is_cpu_affinity_layer(layer_idx) && ram_mgr.vram_cache) {
+                    static thread_local std::vector<size_t> decode_async_candidates;
+                    decode_async_candidates.clear();
+                    for (size_t i = 0; i < ram_needed_ids.size(); ++i) {
+                        MoEExpertBlock* blk = ram_needed_ptrs[i];
+                        // Cheap pre-filter only, NOT the safety-critical check
+                        // (that one is re-done immediately adjacent to
+                        // ram_pin below, right before use -- see that
+                        // comment for why re-checking there, not trusting
+                        // this earlier read, is what actually matters).
+                        // Still worth filtering here too, to avoid adding a
+                        // definitely-invalid candidate to the list at all.
+                        if (!blk || !blk->slab_buffer || blk->slab_capacity == 0) continue;
+                        int expert_id = ram_needed_ids[i];
+                        // Side-effect-free peek (active_layer_has, NOT
+                        // find_active_expert -- the real lookup would bump
+                        // hit_count/could promote as a side effect of a mere
+                        // pre-check, corrupting the exact state this batch is
+                        // simultaneously choosing victims from). Already-
+                        // resident candidates need no upload -- dispatch_
+                        // expert_k's own find_active_expert call will hit
+                        // them directly.
+                        if (ram_mgr.vram_cache->active_layer_has(layer_idx, expert_id)) continue;
+                        bool gpu_capable = gpu_type_supported(blk->gate_proj.meta.type)
+                                         && gpu_type_supported(blk->up_proj.meta.type)
+                                         && gpu_type_supported(blk->down_proj.meta.type);
+                        if (!gpu_capable) continue;
+                        decode_async_candidates.push_back(i);
+                    }
+
+                    static thread_local std::vector<ExpertLocation*> decode_async_victims;
+                    static thread_local std::vector<MoEExpertBlock*> decode_async_pinned_blocks;
+                    size_t max_batch = (size_t)std::max(1, engine.decode_async_prewarm_max_batch);
+                    for (size_t chunk_start = 0; chunk_start < decode_async_candidates.size();
+                         chunk_start += max_batch) {
+                        size_t chunk_end = std::min(decode_async_candidates.size(), chunk_start + max_batch);
+                        decode_async_victims.clear();
+                        decode_async_pinned_blocks.clear();
+                        for (size_t ci = chunk_start; ci < chunk_end; ++ci) {
+                            size_t i = decode_async_candidates[ci];
+                            MoEExpertBlock* blk = ram_needed_ptrs[i];
+                            int expert_id = ram_needed_ids[i];
+                            // FIX (real bug behind a real production
+                            // incident's "[ERROR] [GPU] Invalid upload_
+                            // expert_active_async parameters" log line): the
+                            // FIRST version of this code checked slab_buffer
+                            // once in the filter pass above, then did MORE
+                            // lock-taking work (active_layer_has, gpu_
+                            // capable) before actually pinning and using it
+                            // -- a real TOCTOU window in which a concurrent
+                            // prefetch-worker thread's own ORDINARY (not
+                            // even the buggy "fallback to slot 0") victim-
+                            // selection could legitimately reclaim this
+                            // exact, still-unprotected RAM slot before this
+                            // code got around to protecting it. The fix is
+                            // this exact ordering: re-check freshly, pin,
+                            // THEN re-read slab_buffer/slab_capacity AGAIN
+                            // (not the filter pass's now-possibly-stale
+                            // values) immediately after pinning -- ram_pin
+                            // is what actually excludes this slot from
+                            // claim_or_wait's victim-selection from this
+                            // point on (never_pick checks ram_temp_pin_
+                            // count>0 under the same lock), so only a value
+                            // read AFTER the pin is guaranteed protected.
+                            // Nothing else (no lock-taking calls) sits
+                            // between this check and the pin below.
+                            if (!blk || !blk->slab_buffer || blk->slab_capacity == 0) continue;
+                            ram_mgr.ram_pin(*blk);
+                            // Identity check, not just non-null/non-zero:
+                            // if this slot was reclaimed AND already
+                            // repopulated for a DIFFERENT expert in the
+                            // window before the pin above, slab_buffer/
+                            // slab_capacity could both look perfectly valid
+                            // while actually belonging to someone else's
+                            // data -- a silent wrong-bytes-uploaded-under-
+                            // the-wrong-label bug, worse than a clean error.
+                            // Confirms this slot still actually holds the
+                            // expert we intend before trusting its bytes.
+                            if (blk->expert_id != expert_id) {
+                                ram_mgr.ram_unpin(*blk);
+                                perf().n_decode_async_prewarm_stale_caught.fetch_add(1, std::memory_order_relaxed);
+                                continue;
+                            }
+                            const uint8_t* host_data = blk->slab_buffer;
+                            size_t host_bytes = blk->slab_capacity;
+                            if (!host_data || host_bytes == 0) {
+                                // Reclaimed (freed, not yet repopulated) in
+                                // the now-negligible window between the
+                                // check above and the pin -- extremely
+                                // unlikely (no lock-taking work in between
+                                // anymore) but cheap to guard against rather
+                                // than assume can't happen.
+                                ram_mgr.ram_unpin(*blk);
+                                perf().n_decode_async_prewarm_stale_caught.fetch_add(1, std::memory_order_relaxed);
+                                continue;
+                            }
+                            // The async DMA below keeps reading host_data in
+                            // the background until sync_active_layer_batch's
+                            // cudaStreamSynchronize confirms it landed --
+                            // ram_pin above is what protects that window
+                            // (bounded further by chunking); unpinned again
+                            // immediately below once this CHUNK's sync
+                            // confirms completion.
+                            ExpertLocation* v = ram_mgr.vram_cache->upload_expert_active_async(
+                                layer_idx, expert_id, host_data, host_bytes);
+                            if (v) {
+                                decode_async_victims.push_back(v);
+                                decode_async_pinned_blocks.push_back(blk);
+                                perf().n_decode_async_prewarm_issued.fetch_add(1, std::memory_order_relaxed);
+                            } else {
+                                // Pool full/alloc failed -- no async copy was
+                                // actually issued, nothing to protect; this k
+                                // falls through to dispatch_expert_k's
+                                // existing synchronous fallback path.
+                                ram_mgr.ram_unpin(*blk);
+                                perf().n_decode_async_prewarm_no_slot.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                        if (!decode_async_victims.empty()) {
+                            ram_mgr.vram_cache->sync_active_layer_batch(decode_async_victims);
+                            for (auto* blk : decode_async_pinned_blocks) ram_mgr.ram_unpin(*blk);
+                            perf().n_decode_async_prewarm_synced.fetch_add(decode_async_victims.size(), std::memory_order_relaxed);
+                            perf().n_decode_async_prewarm_chunks.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+
+                // Dispatch whatever get_experts_batch (and the pre-warm pass
+                // above, if enabled) just resolved. The shadowed experts
+                // above already had their kernels issued inline, before the
+                // blocking get_experts_batch call ran -- only the genuine
+                // misses are dispatched here, after their data is ready. Any
+                // expert pre-warmed above is now active-layer-resident with
+                // upload_ready=true, so expert_ffn_resolve_gpu_loc's find_
+                // active_expert call inside dispatch_expert_k will hit it
+                // directly instead of paying for its own synchronous upload
+                // -- everything else (not pre-warmed: feature off, active-
+                // layer pool full, unsupported type, or no active-layer area
+                // on this model) takes the original synchronous path exactly
+                // as before.
                 for (size_t i = 0; i < ram_needed_k.size(); ++i)
                     dispatch_expert_k(ram_needed_k[i]);
             }
@@ -2207,6 +2668,7 @@ void moe_forward_gguf(
         // is applied to the gathered top-k weights, never to the shared path).
         std::string sp = "blk." + std::to_string(layer_idx) + ".";
         if (c.n_expert_shared > 0 && engine.resident_layers.count(sp + "ffn_gate_shexp.weight")) {
+            PERF_SCOPE(t_shared_expert_total);
             int shared_inter = moe_inter * c.n_expert_shared;
             dense_proj(engine, sp + "ffn_gate_shexp.weight", token_hidden, scratch.gate_buf.data(), 1, D, shared_inter);
             dense_proj(engine, sp + "ffn_up_shexp.weight",   token_hidden, scratch.up_buf.data(),   1, D, shared_inter);
@@ -2229,6 +2691,7 @@ void moe_forward_gguf(
     // Three-tier caching: Cleanup active layer area after processing this layer
     // This reclaims temporary workspace used for current-layer experts
     if (ram_mgr.vram_cache && ram_mgr.vram_cache->active_layer_pool) {
+        PERF_SCOPE(t_layer_cleanup_total);
         // FIX ("[TIER-OVERLAP]" leak, see CLAUDE.md): the rare end-of-layer
         // promotion path (a slot that crossed active_layer_promote_threshold
         // but couldn't promote inline via find_active_expert, e.g. because
@@ -2335,6 +2798,9 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
     // token at a time) -- see RAMSafetyManager::in_prefill's own comment
     // for why the prefetch miss path needs this split.
     ram_mgr.in_prefill = (S > 1);
+    // Mirror on GpuTopology -- see GpuTopology::in_prefill's own comment
+    // for why active-layer promotion gates on this (2026-08-12).
+    if (ram_mgr.vram_cache) ram_mgr.vram_cache->in_prefill = (S > 1);
 
     // Measurement only (expert_fetch_tracker.hpp) -- one call to this
     // function IS one token's worth of processing (prefill's single S>1
@@ -2356,7 +2822,7 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
         return std::sqrt(s);
     };
     int n = S * D;  // hoisted above the loop -- was declared after its first use at "[L0] in" below
-    bool trace = Logger::instance().would_log(LogLevel::VERBOSE);  // gate BEFORE paying for l2norm, not just before printing
+    bool trace = trace_gate("TRACE-HIDDEN");  // gate BEFORE paying for l2norm, not just before printing
     for (int l = 0; l < c.n_layers; ++l) {
         const float* last_tok = hidden_states + (size_t)(S - 1) * D;  // hidden_states is mutated in place below, not reallocated -- always valid
         if (trace) LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] in      |hidden|=" << l2norm(last_tok, D) << "\n";
@@ -2488,6 +2954,18 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                 // buffer on something that could never match.
                 PilotConfirmedEntry confirmed_resident_this_transition[PILOT_CONFIRMED_CAP];
                 int confirmed_resident_count = 0;
+                // Adaptive-mode contiguous-prefix cutoff state for THIS
+                // transition's k-loop -- ranks are walked in increasing
+                // order below, so tracking "still eligible" as we go
+                // correctly implements "promote rank k only if every rank
+                // < k also cleared the bar" without a second pass. Reset
+                // per transition (not persisted across layers/tokens) --
+                // whether rank k clears the bar is a function of the LIVE,
+                // GLOBAL n_pilot_ram_only_* counters at the moment this
+                // runs, not of anything specific to this one transition.
+                // Unused in static top_k mode.
+                bool adaptive_promote_still_eligible = true;
+                const auto& promo_cfg = ram_vram_promote_config();
                 for (int k = 0; k < pilot_k; ++k) {
                     int best_exp = 0;
                     for (int e = 1; e < c.n_experts; ++e) {
@@ -2548,6 +3026,45 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                         perf().n_pilot_pred_already_ram.fetch_add(1, std::memory_order_relaxed);
                         if (confirmed_resident_count < PILOT_CONFIRMED_CAP)
                             confirmed_resident_this_transition[confirmed_resident_count++] = {l + 1, best_exp};
+
+                        // Pilot-driven RAM->VRAM speculative promotion --
+                        // see dense_dispatch.hpp's ram_vram_promote_config
+                        // for config wiring and RAMSafetyManager::
+                        // promote_ram_to_vram for the actual upload +
+                        // deadlock-safety contract. This branch (already_
+                        // ram) is deliberately the ONLY place this fires:
+                        // it's the exact population the "ram-only" per-rank
+                        // metric measures, disjoint from is_hint_worthy's
+                        // needs_fetch population above and from the two
+                        // already_vram branches below (which need no
+                        // action -- already where they need to be).
+                        bool should_promote = false;
+                        if (promo_cfg.top_k > 0) {
+                            should_promote = (k < promo_cfg.top_k);
+                        } else if (promo_cfg.adaptive && adaptive_promote_still_eligible) {
+                            uint64_t checks = (k < 8)
+                                ? perf().n_pilot_ram_only_checks_by_rank[k].load(std::memory_order_relaxed) : 0;
+                            uint64_t rhits = (k < 8)
+                                ? perf().n_pilot_ram_only_hits_by_rank[k].load(std::memory_order_relaxed) : 0;
+                            double acc = checks > 0 ? (double)rhits / (double)checks : 0.0;
+                            if (checks >= (uint64_t)promo_cfg.min_samples && acc >= promo_cfg.adaptive_threshold) {
+                                should_promote = true;
+                            } else {
+                                // Contiguous-prefix cutoff: this rank failed
+                                // (too few samples OR accuracy below
+                                // threshold) -- no later rank this
+                                // transition may promote either, even if a
+                                // deeper rank's OWN live accuracy happens to
+                                // look higher (matches the monotonic-decay
+                                // shape observed in every real capture so
+                                // far; a later rank clearing the bar alone
+                                // isn't trusted).
+                                adaptive_promote_still_eligible = false;
+                            }
+                        }
+                        if (should_promote) {
+                            ram_mgr.promote_ram_to_vram(engine, l + 1, best_exp);
+                        }
                     } else if (already_vram && vram_pinned) {
                         perf().n_pilot_pred_already_vram_pinned.fetch_add(1, std::memory_order_relaxed);
                         // Deliberately NOT added to confirmed_resident_this_transition
@@ -2561,6 +3078,7 @@ void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                         perf().n_pilot_pred_needs_fetch.fetch_add(1, std::memory_order_relaxed);
                     }
                     scratch.pilot_pred_was_hint[k] = is_hint_worthy;
+                    scratch.pilot_pred_was_ram_only[k] = already_ram;
                     if (is_hint_worthy) {
                         async_io_queue.push_hint(l + 1, best_exp);
                     } else {

@@ -135,6 +135,8 @@ Launch the standalone engine directly by pointing it at your local GGUF model, e
 | `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — MoEStream never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
 | `--log-path <file>` | Redirect logging to a file instead of stderr. |
 | `--log-level <lvl>` | `VERBOSE` \| `DEBUG` \| `INFO` (default) \| `WARN` \| `ERROR`. |
+| `--trace-filter <tags>` | Comma-separated tag prefixes (e.g. `HC,MLA`) restricting VERBOSE tensor tracing to just those checkpoints; requires `--log-level VERBOSE`. Empty (default) traces everything. See `include/tensor_trace.hpp` / CLAUDE.md §5. |
+| `--trace-abort-on-nan` | Abort the process at the first NaN/Inf caught by a tensor-trace checkpoint, instead of continuing. Off by default. |
 | `--help`, `-h` | Show the CLI help interface. |
 
 > Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `cuda_cufile`, `pin_strategy`) that have no CLI-flag equivalent.

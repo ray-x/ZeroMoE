@@ -40,6 +40,7 @@
 #include <cstddef>
 #include <cstring>
 #include "direct_io.hpp"
+#include "perf_timer.hpp"
 
 #if defined(__linux__)
 #include <linux/io_uring.h>
@@ -200,12 +201,39 @@ public:
         // scratch region and get memcpy'd out afterward.
         direct_io::AlignedWindow windows[CAPACITY];
         void* targets[CAPACITY];
+        // Per-request: did this read actually need the scratch detour? A
+        // request whose offset, length AND destination are all already
+        // alignment-clean can be DMA'd straight into the caller's buffer,
+        // skipping both the staging read-into-scratch and the memcpy-out
+        // below. This is the common case for MoE expert reads by
+        // construction -- per-expert GGUF offsets are exact multiples of the
+        // 4096 alignment (verified against the real file: zero slack for
+        // every expert), tensor byte sizes are exact multiples too, and
+        // slab_buffer is posix_memalign(4096) with 4096-multiple
+        // sub-offsets -- so the staging memcpy was pure waste on ~every
+        // read. Measured scale before this fix: ~112 GB of avoidable memcpy
+        // per session (preload + prefetch + phase_b), i.e. real CPU and
+        // memory-bandwidth burn competing with the very compute this engine
+        // is trying to overlap I/O against.
+        bool staged[CAPACITY];
         for (int i = 0; i < n; ++i) {
+            staged[i] = false;
             if (reqs[i].is_direct) {
                 windows[i] = direct_io::compute_aligned_window(reqs[i].offset, reqs[i].len, reqs[i].alignment);
-                scratch[i].ensure(windows[i].aligned_len, reqs[i].alignment);
-                if (!scratch[i].buf) return false; // allocation failure -- caller falls back entirely
-                targets[i] = scratch[i].buf;
+                const bool dst_aligned =
+                    (reinterpret_cast<uintptr_t>(reqs[i].dst) % (uintptr_t)reqs[i].alignment) == 0;
+                if (windows[i].front_slack == 0 && windows[i].aligned_len == reqs[i].len && dst_aligned) {
+                    targets[i] = reqs[i].dst;   // O_DIRECT straight into the caller's buffer
+                    perf().n_uring_direct_unstaged.fetch_add(1, std::memory_order_relaxed);
+                    perf().bytes_uring_stage_memcpy_saved.fetch_add((int64_t)reqs[i].len,
+                                                                     std::memory_order_relaxed);
+                } else {
+                    scratch[i].ensure(windows[i].aligned_len, reqs[i].alignment);
+                    if (!scratch[i].buf) return false; // allocation failure -- caller falls back entirely
+                    targets[i] = scratch[i].buf;
+                    staged[i] = true;
+                    perf().n_uring_direct_staged.fetch_add(1, std::memory_order_relaxed);
+                }
             } else {
                 targets[i] = reqs[i].dst;
             }
@@ -270,13 +298,19 @@ public:
             int i = (int)cqe.user_data;
             if (i < 0 || i >= n) continue; // defensive; should never happen
             ssize_t res = (ssize_t)cqe.res;
-            if (reqs[i].is_direct && res >= 0) {
+            if (reqs[i].is_direct && res >= 0 && staged[i]) {
                 uint64_t have = (uint64_t)res > windows[i].front_slack
                                  ? (uint64_t)res - windows[i].front_slack : 0;
                 uint64_t want = reqs[i].len;
                 uint64_t got = have < want ? have : want;
                 if (got > 0) std::memcpy(reqs[i].dst, scratch[i].buf + windows[i].front_slack, got);
                 results[i] = (ssize_t)got;
+            } else if (reqs[i].is_direct && res >= 0) {
+                // Unstaged: the DMA landed directly in reqs[i].dst. Clamp to
+                // the requested length for an identical contract to the
+                // staged path (aligned_len == len here, so this is a no-op
+                // on success, but keeps a short read reporting the same way).
+                results[i] = (ssize_t)((uint64_t)res < reqs[i].len ? (uint64_t)res : reqs[i].len);
             } else {
                 results[i] = res;
             }

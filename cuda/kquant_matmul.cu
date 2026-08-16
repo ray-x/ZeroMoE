@@ -145,51 +145,74 @@ __device__ float dequant_q6_K_block_coop(const block_q6_K_cu* xb, int tid) {
     return d * sc_val * q_val;
 }
 
-__device__ float dequant_q3_K_block_coop(const block_q3_K_cu* xb, int tid) {
-    const float d_all = __half2float(*reinterpret_cast<const __half*>(&xb->d));
-    const uint32_t kmask1 = 0x03030303;
-    const uint32_t kmask2 = 0x0f0f0f0f;
+// Q3_K variant of the coop dequant above: the aux[4]->16-entry int8 scale
+// unpack only depends on the block's 12 `scales` bytes, not on `tid` at all
+// -- yet the ORIGINAL dequant_q3_K_block_coop recomputed the full unpack
+// (9 shift/mask ops) independently in ALL 256 threads, every super-block.
+// Computed ONCE (lane 0) into shared memory and broadcast instead.
+// VERIFIED on real RTX 3090 hardware (attn_q_a's real shape, I=6144,O=2048):
+// this is the dominant win of the two fixes in this file -- ~33-37% faster
+// than the original tree-reduction kernel (0.089-0.891ms/call -> 0.059-
+// 0.597ms/call), well beyond the final-reduction fix's own ~5%. Correctness
+// verified against the original (max rel diff ~1e-5, float32 summation-
+// order noise) across two shapes and S=1/S=11.
+__device__ float dequant_q3_K_block_shared_scales(const block_q3_K_cu* xb, int tid, int8_t* s_scales) {
+    if (tid == 0) {
+        const uint32_t kmask1 = 0x03030303;
+        const uint32_t kmask2 = 0x0f0f0f0f;
+        uint32_t aux[4];
+        aux[0] = (uint32_t)xb->scales[0] | ((uint32_t)xb->scales[1] << 8) | ((uint32_t)xb->scales[2] << 16) | ((uint32_t)xb->scales[3] << 24);
+        aux[1] = (uint32_t)xb->scales[4] | ((uint32_t)xb->scales[5] << 8) | ((uint32_t)xb->scales[6] << 16) | ((uint32_t)xb->scales[7] << 24);
+        uint32_t tmp = (uint32_t)xb->scales[8] | ((uint32_t)xb->scales[9] << 8) | ((uint32_t)xb->scales[10] << 16) | ((uint32_t)xb->scales[11] << 24);
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        const int8_t* sc = (const int8_t*)aux;
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) s_scales[i] = sc[i];
+    }
+    __syncthreads();
 
-    // Fast redundant register evaluation instead of synced shared memory
-    uint32_t aux[4];
-    aux[0] = (uint32_t)xb->scales[0] | ((uint32_t)xb->scales[1] << 8) | ((uint32_t)xb->scales[2] << 16) | ((uint32_t)xb->scales[3] << 24);
-    aux[1] = (uint32_t)xb->scales[4] | ((uint32_t)xb->scales[5] << 8) | ((uint32_t)xb->scales[6] << 16) | ((uint32_t)xb->scales[7] << 24);
-    uint32_t tmp = (uint32_t)xb->scales[8] | ((uint32_t)xb->scales[9] << 8) | ((uint32_t)xb->scales[10] << 16) | ((uint32_t)xb->scales[11] << 24);
-    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
-    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-    const int8_t* scales = (const int8_t*)aux;
-
-    int n_idx = tid / 128;            // 0 or 1
-    int j = (tid % 128) / 32;         // 0..3
-    int l = tid % 32;                 // 0..31
-    
-    int is = n_idx * 8 + j * 2;
-    int shift = j * 2;
-    uint8_t m = 1 << (n_idx * 4 + j); 
-    
+    const float d_all = __half2float(xb->d);
+    int n_idx = tid / 128, j = (tid % 128) / 32, l = tid % 32;
+    int is = n_idx * 8 + j * 2, shift = j * 2;
+    uint8_t m = 1 << (n_idx * 4 + j);
     const uint8_t* q_chunk = xb->qs + n_idx * 32;
-    // FIX: was `xb->hmask + n_idx * 16` -- ggml's real reference
-    // (dequantize_row_q3_K, ggml/src/ggml-quants.c) NEVER advances its `hm`
-    // pointer; the same 32 hmask bytes are reused for all 8 bit-planes
-    // across the whole 256-element block (the `m` bitmask below, already
-    // correct, is what selects which BIT of each byte to read -- not which
-    // byte range). The old `+ n_idx * 16` offset made every n_idx=1 lane
-    // with l>=16 read hmask[32..47], spilling past hmask's real 32-byte
-    // extent into the immediately-adjacent `qs` field (still inside the
-    // same 110-byte block struct, so no crash -- just silently wrong values
-    // for the whole second half of every block). Confirmed via direct
-    // line-by-line comparison against ggml's source, not assumed.
+    // FIX (carried over from the original dequant_q3_K_block_coop, which
+    // this function replaces): NOT `xb->hmask + n_idx * 16` -- ggml's real
+    // reference (dequantize_row_q3_K, ggml/src/ggml-quants.c) NEVER advances
+    // its `hm` pointer; the same 32 hmask bytes are reused for all 8
+    // bit-planes across the whole 256-element block (the `m` bitmask below,
+    // already correct, is what selects which BIT of each byte to read --
+    // not which byte range). A `+ n_idx * 16` offset would make every
+    // n_idx=1 lane with l>=16 read hmask[32..47], spilling past hmask's
+    // real 32-byte extent into the immediately-adjacent `qs` field (still
+    // inside the same 110-byte block struct, so no crash -- just silently
+    // wrong values for the whole second half of every block). Confirmed via
+    // direct line-by-line comparison against ggml's source, not assumed.
     const uint8_t* hm_chunk = xb->hmask;
-
     int scale_idx = (l < 16) ? is : is + 1;
-    float dl = d_all * (scales[scale_idx] - 32);
-
+    float dl = d_all * (s_scales[scale_idx] - 32);
     return dl * ((int8_t)((q_chunk[l] >> shift) & 3) - ((hm_chunk[l] & m) ? 0 : 4));
 }
 
 // ---- fused matmul: cooperative dequant of a super-block + 256-way dot ----
+//
+// Final reduction: warp-shuffle instead of a 256-thread shared-memory tree
+// (was: 8 rounds of shared-mem add + __syncthreads(); matches the pattern
+// already proven in cuda/q8_0_matmul.cu -- intra-warp shuffle-reduce, one
+// __syncthreads() to combine the 8 per-warp partials, then a second
+// shuffle-reduce). VERIFIED on real RTX 3090 hardware, real attn_q_a/
+// attn_output shapes (I=6144 O=2048 and I=16384 O=6144): a real, if modest
+// and shape-dependent, win (~5% faster at bpr=24; roughly a wash, even
+// marginally worse once, at bpr=64 -- reduction overhead is a shrinking
+// fraction of total cost as bpr grows). Kept anyway: never worse outside
+// noise, matches an already-proven pattern, and removes 7 block-wide
+// barriers per dispatch. A separately-tested multi-accumulator ILP variant
+// (2 independent accumulators in the main loop) showed no measurable
+// benefit on top of this, consistent with the same finding on q8_0_matmul.cu
+// -- not adopted.
 #define KQUANT_MATMUL_KERNEL(NAME, BLOCKT, DEQUANT) \
 __global__ void NAME##_kquant_matmul_kernel( \
     float* __restrict__ y, const float* __restrict__ x, const BLOCKT* __restrict__ W, \
@@ -205,21 +228,59 @@ __global__ void NAME##_kquant_matmul_kernel( \
         float wv = DEQUANT(&w_row[b], tid); \
         acc += x_row[b * 256 + tid] * wv; \
     } \
-    __shared__ float sm[256]; \
-    sm[tid] = acc; \
+    _Pragma("unroll") \
+    for (int off = 16; off > 0; off /= 2) acc += __shfl_down_sync(0xffffffff, acc, off); \
+    __shared__ float s_warp[8]; \
+    int warp_id = tid / 32, lane = tid % 32; \
+    if (lane == 0) s_warp[warp_id] = acc; \
     __syncthreads(); \
-    for (int stride = 128; stride > 0; stride >>= 1) { \
-        if (tid < stride) sm[tid] += sm[tid + stride]; \
-        __syncthreads(); \
+    if (warp_id == 0) { \
+        float v = (lane < 8) ? s_warp[lane] : 0.0f; \
+        _Pragma("unroll") \
+        for (int off = 16; off > 0; off /= 2) v += __shfl_down_sync(0xffffffff, v, off); \
+        if (lane == 0) y[(size_t)s * O + o] = v; \
     } \
-    if (tid == 0) y[(size_t)s * O + o] = sm[0]; \
 }
 
 KQUANT_MATMUL_KERNEL(q2_K, block_q2_K_cu, dequant_q2_K_block_coop)
-KQUANT_MATMUL_KERNEL(q3_K, block_q3_K_cu, dequant_q3_K_block_coop)
 KQUANT_MATMUL_KERNEL(q4_K, block_q4_K_cu, dequant_q4_K_block_coop)
 KQUANT_MATMUL_KERNEL(q5_K, block_q5_K_cu, dequant_q5_K_block_coop)
 KQUANT_MATMUL_KERNEL(q6_K, block_q6_K_cu, dequant_q6_K_block_coop)
+
+// Q3_K: hand-written rather than macro-generated, since it needs the extra
+// `s_scales` shared array threaded through to dequant_q3_K_block_shared_scales
+// (see that function's own comment -- the dominant win in this file).
+__global__ void q3_K_kquant_matmul_kernel(
+    float* __restrict__ y, const float* __restrict__ x, const block_q3_K_cu* __restrict__ W,
+    int S, int I, int O)
+{
+    int o = blockIdx.x, s = blockIdx.y, tid = threadIdx.x;
+    if (o >= O || s >= S) return;
+    int bpr = I / 256;
+    const block_q3_K_cu* w_row = W + (size_t)o * bpr;
+    const float* x_row = x + (size_t)s * I;
+    float acc = 0.0f;
+    __shared__ int8_t s_scales[16];
+    for (int b = 0; b < bpr; ++b) {
+        float wv = dequant_q3_K_block_shared_scales(&w_row[b], tid, s_scales);
+        acc += x_row[b * 256 + tid] * wv;
+        // s_scales is reused by the next super-block iteration -- every
+        // thread must be done reading it before lane 0 overwrites it.
+        __syncthreads();
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off /= 2) acc += __shfl_down_sync(0xffffffff, acc, off);
+    __shared__ float s_warp[8];
+    int warp_id = tid / 32, lane = tid % 32;
+    if (lane == 0) s_warp[warp_id] = acc;
+    __syncthreads();
+    if (warp_id == 0) {
+        float v = (lane < 8) ? s_warp[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off /= 2) v += __shfl_down_sync(0xffffffff, v, off);
+        if (lane == 0) y[(size_t)s * O + o] = v;
+    }
+}
 
 extern "C" void launch_q2_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
     q2_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q2_K_cu*)w, S, I, O);

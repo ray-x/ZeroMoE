@@ -204,6 +204,11 @@ struct CPUEngine {
   // and model backend.
   bool build(int max_ctx);
 
+  // Alternate build path for .safetensors exports. Parses the file, creates the
+  // right backend, and loads raw tensor bytes into resident host memory using
+  // canonical GGUF-style tensor names.
+  bool build_from_safetensors(const std::string &path, int max_ctx);
+
   // Helpers
   CPUQuantizedTensor *find_layer(const std::string &name);
   const CPUQuantizedTensor *find_layer(const std::string &name) const;

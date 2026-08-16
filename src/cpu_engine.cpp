@@ -497,6 +497,136 @@ bool CPUEngine::build(int max_ctx) {
   return true;
 }
 
+static GGUFType gguf_type_from_safetensors_dtype(const std::string &dtype) {
+  if (dtype == "F32")
+    return GGUFType::F32;
+  if (dtype == "F16")
+    return GGUFType::F16;
+  if (dtype == "BF16")
+    return GGUFType::BF16;
+  if (dtype == "I32")
+    return GGUFType::I32;
+  if (dtype == "I64")
+    return GGUFType::I64;
+  return GGUFType::F32;
+}
+
+bool CPUEngine::build_from_safetensors(const std::string &path, int max_ctx) {
+  max_t = max_ctx;
+
+  SafetensorsModelInfo model;
+  if (!SafetensorsAdapter::parse_file(path, model)) {
+    std::cerr << "[CPU-ENGINE] Failed to parse safetensors: " << path << "\n";
+    return false;
+  }
+
+  // Look for an optional HF-style config.json next to the model file.
+  std::string config_json_path;
+  {
+    size_t slash = path.find_last_of("/\\");
+    std::string dir = (slash == std::string::npos) ? "" : path.substr(0, slash + 1);
+    config_json_path = dir + "config.json";
+  }
+  DenseCpuConfigJson cfg = SafetensorsAdapter::parse_dense_config_json(config_json_path);
+
+  std::string format = SafetensorsAdapter::detect_format(model);
+  auto backend_or = CPUModelBackend::create_from_safetensors_path(
+      path, &model_file.architecture_config, config_json_path);
+  if (!backend_or) {
+    std::cerr << "[CPU-ENGINE] No backend for safetensors file: " << path
+              << "\n";
+    return false;
+  }
+  backend = std::move(backend_or);
+
+  ArchitectureConfig &c = model_file.architecture_config;
+  if (c.eps <= 0.0f)
+    c.eps = 1e-6f;
+  if (c.head_dim <= 0 && c.n_heads > 0)
+    c.head_dim = c.hidden / c.n_heads;
+  if (c.n_head_kv <= 0)
+    c.n_head_kv = c.n_heads;
+
+  LOG_STREAM_INFO() << "[CPU-ENGINE] Safetensors architecture: hidden="
+                    << c.hidden << " layers=" << c.n_layers
+                    << " heads=" << c.n_heads << "/" << c.n_head_kv
+                    << " head_dim=" << c.head_dim << " vocab=" << c.vocab
+                    << "\n";
+
+  // Load tensor bytes from the safetensors file directly into resident_layers,
+  // using the canonical GGUF-style names produced by the adapter.
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    std::cerr << "[CPU-ENGINE] Cannot open safetensors file: " << path << "\n";
+    return false;
+  }
+
+  std::string header_len_bytes(8, '\0');
+  file.read(header_len_bytes.data(), 8);
+  if (!file)
+    return false;
+  uint64_t header_len = 0;
+  std::memcpy(&header_len, header_len_bytes.data(), sizeof(header_len));
+  const uint64_t data_base = 8 + header_len;
+
+  DenseCpuContract contract =
+      SafetensorsAdapter::map_dense_cpu_contract(model, format);
+  size_t total_loaded = 0;
+  for (const auto &kv : contract.resolved_tensors) {
+    const std::string &canonical_name = kv.first;
+    const std::string &raw_name = kv.second;
+    auto it = model.tensors.find(raw_name);
+    if (it == model.tensors.end())
+      continue;
+    const SafetensorsTensorInfo &info = it->second;
+
+    CPUQuantizedTensor qt;
+    qt.meta.name = canonical_name;
+    qt.meta.type = gguf_type_from_safetensors_dtype(info.dtype);
+    qt.meta.shape.assign(info.shape.begin(), info.shape.end());
+    qt.meta.size_bytes = info.length;
+    qt.meta.offset = data_base + info.data_offset;
+
+    if (posix_memalign((void **)&qt.host_ptr, 4096, info.length) != 0) {
+      std::cerr << "[CPU-ENGINE] Failed to allocate tensor " << canonical_name
+                << "\n";
+      return false;
+    }
+    qt.host_size = info.length;
+
+    file.seekg(static_cast<std::streamoff>(qt.meta.offset));
+    file.read(reinterpret_cast<char *>(qt.host_ptr),
+              static_cast<std::streamsize>(info.length));
+    if (!file) {
+      std::cerr << "[CPU-ENGINE] Failed to read tensor " << canonical_name
+                << "\n";
+      free(qt.host_ptr);
+      return false;
+    }
+
+    if (!densify_tensor(qt)) {
+      std::cerr << "[CPU-ENGINE] Failed to densify tensor " << canonical_name
+                << "\n";
+      free(qt.host_ptr);
+      return false;
+    }
+
+    total_loaded += qt.host_size;
+    resident_layers.emplace(canonical_name, std::move(qt));
+  }
+
+  LOG_STREAM_INFO() << "[CPU-ENGINE] Loaded " << resident_layers.size()
+                    << " safetensors tensors, " << (total_loaded / 1e9)
+                    << " GB\n";
+
+  if (!kv_cache.init(max_t, c.n_layers, c.n_head_kv, c.head_dim)) {
+    std::cerr << "[CPU-ENGINE] KV cache init failed.\n";
+    return false;
+  }
+
+  return true;
+}
+
 CPUQuantizedTensor *CPUEngine::find_layer(const std::string &name) {
   auto it = resident_layers.find(name);
   return (it != resident_layers.end() && it->second.host_ptr) ? &it->second

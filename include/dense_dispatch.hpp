@@ -21,6 +21,7 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include <omp.h>  // omp_get_max_threads -- attn_score_threads()'s fallback
 
 // Diagnostic kill-switch: forces every dense matmul, norm, and expert FFN onto
 // the CPU reference path (libggml dequant + f32 matmul), bypassing ALL GPU
@@ -37,6 +38,21 @@ inline bool& cpu_only_flag() {
 }
 inline bool cpu_only_mode() { return cpu_only_flag(); }
 inline void enable_cpu_only_mode() { cpu_only_flag() = true; }
+
+// dsv4_outproj_gpu (config): enables cuBLAS GPU dispatch for DeepSeek-V4
+// attention's grouped output projection (attn_output_a), whose weight gets
+// a one-time persistent VRAM upload per layer -- see EngineConfig::
+// dsv4_outproj_gpu's own comment for the full reasoning (memory-bandwidth-
+// bound on CPU, ~12x faster once VRAM-resident, real ~5.8GB VRAM cost).
+// Same function-local-static-storage pattern as cpu_only_flag() above --
+// set once by main.cpp after config load, read from attention_layer.cpp's
+// hot path with no locking needed since it's never mutated after startup.
+inline bool& dsv4_outproj_gpu_flag() {
+    static bool v = false;
+    return v;
+}
+inline bool dsv4_outproj_gpu_enabled() { return dsv4_outproj_gpu_flag(); }
+inline void enable_dsv4_outproj_gpu() { dsv4_outproj_gpu_flag() = true; }
 
 // Per-layer version of the same idea: `cpu_affinity_layers` (config) names
 // specific MoE layers whose routed experts should NEVER be dispatched on
@@ -68,6 +84,37 @@ inline void set_cpu_affinity_layers(const std::vector<int>& layers, int n_layers
 inline bool is_cpu_affinity_layer(int layer_idx) {
     const auto& v = cpu_affinity_layer_flags();
     return layer_idx >= 0 && layer_idx < (int)v.size() && v[(size_t)layer_idx];
+}
+
+// attn_score_threads (config): dedicated OMP team size for the causal
+// attention score/softmax/value-aggregate loop (attention_layer.cpp's
+// `#pragma omp parallel for collapse(2)` score computation) -- SEPARATE
+// from the general omp_max_threads default. Motivated by a real-hardware
+// finding (2026-08-13): score is the one attention sub-step that's 100%
+// CPU (no GPU path exists for it, see CLAUDE.md), and raising expert_
+// fetch_threads/omp_max_threads 8->10 for a real, measured disk-I/O win
+// simultaneously raised score's own per-token cost ~74.8->83.5ms/token in
+// the SAME real run -- the two regions now compete for the same 12
+// physical cores. Same function-local-static-storage idiom as
+// cpu_affinity_layer_flags() above; set once at startup (set_attn_score_
+// threads, main.cpp, from EngineConfig::attn_score_threads), read from
+// attention_layer.cpp's hot path with no locking needed.
+//
+// 0 (the flag's own default) means "no override" -- attn_score_threads()
+// falls back to omp_get_max_threads(), i.e. whatever the process-wide
+// default (omp_max_threads, or its own auto value) already is, so a
+// config that never sets this behaves identically to before this existed.
+// A caller explicitly passing 0 or a negative number to num_threads()
+// would be undefined behavior, which is exactly why this function -- not
+// the raw config field -- is what call sites should use.
+inline int& attn_score_threads_flag() {
+    static int v = 0;
+    return v;
+}
+inline void set_attn_score_threads(int n) { attn_score_threads_flag() = n; }
+inline int attn_score_threads() {
+    int v = attn_score_threads_flag();
+    return v > 0 ? v : omp_get_max_threads();
 }
 
 // Per-layer override for the pilot router's prefetch hint count
@@ -126,6 +173,37 @@ inline bool prefetch_pilot_depth2_enabled() {
 inline int pilot_k2_for_layer(int layer_idx) {
     (void)layer_idx;  // no per-layer override yet -- see this block's own comment
     return pilot_k2_default_value();
+}
+
+// ram_vram_promote_top_k / ram_vram_promote_adaptive (config): pilot-
+// prediction-driven speculative RAM->VRAM promotion, calibrated against the
+// "ram-only" per-rank metric (PerfCounters::n_pilot_ram_only_hits_by_rank /
+// n_pilot_ram_only_checks_by_rank) -- see EngineConfig's own comment for
+// the full design and CLAUDE.md for the real-hardware data this was
+// calibrated against. Same set-once-at-startup / read-from-decode-thread
+// idiom as pilot_k_for_layer above (set_ram_vram_promote_config, main.cpp;
+// read from execution_layer.cpp's l+1 pilot loop, the "already_ram" branch
+// specifically -- see RAMSafetyManager::promote_ram_to_vram's own comment
+// for why that's the only place this may be called from). Mutual
+// exclusivity between the two modes (at most one of top_k>0 / adaptive) is
+// already enforced by EngineConfig's own validation before this is ever
+// set -- not re-checked here.
+struct RamVramPromoteConfig {
+    int top_k = 0;
+    bool adaptive = false;
+    double adaptive_threshold = 0.30;
+    int min_samples = 30;
+};
+inline RamVramPromoteConfig& ram_vram_promote_config() {
+    static RamVramPromoteConfig v;
+    return v;
+}
+inline void set_ram_vram_promote_config(int top_k, bool adaptive, double adaptive_threshold, int min_samples) {
+    auto& v = ram_vram_promote_config();
+    v.top_k = top_k;
+    v.adaptive = adaptive;
+    v.adaptive_threshold = adaptive_threshold;
+    v.min_samples = min_samples;
 }
 
 inline void dense_proj(StreamingEngine& engine, const std::string& wname,

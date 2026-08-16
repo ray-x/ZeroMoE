@@ -87,6 +87,7 @@ public:
   bool has_deepseek_chat_template() const {
     return ds_user_id >= 0 && ds_assistant_id >= 0;
   }
+  bool is_loaded() const { return !id_to_token.empty(); }
 
   bool is_stop_token(int id) const {
     for (int s : stop_ids)

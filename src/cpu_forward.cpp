@@ -6,13 +6,27 @@
 
 bool cpu_embed_token(CPUEngine &engine, int tok, float *out, int D) {
   CPUQuantizedTensor *emb = engine.find_layer("token_embd.weight");
-  if (!emb || !emb->host_ptr)
-    return false;
+  if (emb && emb->host_ptr) {
+    // token_embd.weight is [V, D]; copy row tok.
+    const float *embd = reinterpret_cast<const float *>(emb->host_ptr);
+    std::memcpy(out, embd + (int64_t)tok * D, (size_t)D * sizeof(float));
+    return true;
+  }
 
-  // token_embd.weight is [V, D]; copy row tok.
-  const float *embd = reinterpret_cast<const float *>(emb->host_ptr);
-  std::memcpy(out, embd + (int64_t)tok * D, (size_t)D * sizeof(float));
-  return true;
+  // Fallback: tied embedding/LM head where only output.weight [D, V] exists.
+  // In that layout, column `tok` is the embedding vector for that token.
+  CPUQuantizedTensor *head = engine.find_layer("output.weight");
+  if (head && head->host_ptr && head->meta.shape.size() >= 2 &&
+      static_cast<int>(head->meta.shape[0]) == D) {
+    int V = static_cast<int>(head->meta.shape[1]);
+    if (tok >= 0 && tok < V) {
+      const float *w = reinterpret_cast<const float *>(head->host_ptr);
+      for (int i = 0; i < D; ++i)
+        out[i] = w[(int64_t)i * V + tok];
+      return true;
+    }
+  }
+  return false;
 }
 
 bool cpu_forward_layer(CPUEngine &engine, int layer_idx, float *hidden_states,

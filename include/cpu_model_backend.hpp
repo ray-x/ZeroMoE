@@ -6,7 +6,9 @@
 #pragma once
 
 #include "cpu_engine.hpp"
+#include "gguf_loader.hpp"
 #include "model_family.hpp"
+#include "safetensors_adapter.hpp"
 #include <memory>
 #include <string>
 
@@ -47,4 +49,14 @@ public:
 
   // Factory: create the right backend for the loaded GGUF file.
   static std::unique_ptr<CPUModelBackend> create(const GGUFFile &model_file);
+
+  // Factory: normalize a safetensors export into the logical CPU contract
+  // before the backend is constructed.  This is intentionally kept as a
+  // separate integration seam so the same adapter can later be reused by the
+  // future GPU path without scattering format-specific knowledge through the
+  // runtime.  If out_cfg is non-null, it receives the architecture values
+  // inferred from the tensor shapes.
+  static std::unique_ptr<CPUModelBackend> create_from_safetensors_path(
+      const std::string &path, ArchitectureConfig *out_cfg = nullptr,
+      const std::string &config_json_path = "");
 };

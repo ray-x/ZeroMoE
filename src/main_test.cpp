@@ -28,6 +28,7 @@ extern void extract_gguf_row_q4_0(const QuantizedTensor& tensor, int row_idx, fl
 // Encodes real ggml-valid quantized bytes from f32 input (src/ggml_dequant.cpp).
 // Returns 1 if this type has a reference quantizer wired up, 0 otherwise.
 extern "C" int ggml_quantize_row_ref(uint32_t type, const float* src, void* dst, int64_t n);
+extern "C" int ggml_dequant_row(uint32_t type, const void* src, float* out, int n);
 
 class GGUFGraphInitializer {
 public:
@@ -196,9 +197,46 @@ static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O,
     }
 
     // CPU reference: ggml's own dequantize_row_* + naive dot product.
+    //
+    // Q6_K/Q8_0 are a deliberate EXCEPTION: cpu_quant_matmul's own fast path
+    // for these two (matmul_q6_k_fused / matmul_q8_0_fused, kernels_cpu.cpp)
+    // quantizes the ACTIVATIONS to int8 per 16-element group for a VNNI dot
+    // product -- a genuinely lossy, different computation from the GPU
+    // kernel's exact f32 dequant+dot, not just summation-order noise (see
+    // this function's own tolerance comment further down). That's fine as a
+    // PRODUCTION fast path, but real hardware confirmed it's NOT a reliable
+    // TEST REFERENCE at real production scale: a direct 3-way check (GPU /
+    // this lossy path / a from-scratch exact f32 dequant+dot, added
+    // one-off during that investigation and since removed) at attn_q_b's
+    // real shape (I=2048, O=16384, S=1) found the GPU kernel matching the
+    // exact reference to ~2.9e-6 absolute error while the lossy CPU path was
+    // off by up to 0.17 absolute at a normal-magnitude (~0.31) true value --
+    // a real ~57% error, not a near-zero-crossing artifact, and far beyond
+    // what any sane tolerance should paper over without risking masking an
+    // actual GPU bug of similar size. Root cause not chased further (not
+    // this file's concern) -- likely the int8 activation-quantization
+    // granularity not holding up over a wider (I=2048, more super-blocks)
+    // dot product than the smaller shapes below ever exercised. Since the
+    // exact reference is now proven trustworthy (it's what caught the lossy
+    // path's own error), these two types compute it directly here instead
+    // of going through cpu_quant_matmul, and get the SAME tight tolerance
+    // every other (already exact-vs-exact) type gets below.
     std::vector<float> y_cpu((size_t)S * O, 0.0f);
-    bool cpu_ok = cpu_quant_matmul(type, w_bytes.data(), x.data(), y_cpu.data(), S, I, O);
-    assert(cpu_ok && "cpu_quant_matmul should support every type this test drives");
+    if (type == GGUFType::Q6_K || type == GGUFType::Q8_0) {
+        std::vector<float> w_row_f32(I);
+        for (int o = 0; o < O; ++o) {
+            ggml_dequant_row((uint32_t)type, w_bytes.data() + (size_t)o * rb, w_row_f32.data(), I);
+            for (int s = 0; s < S; ++s) {
+                double acc = 0.0;
+                const float* xr = x.data() + (size_t)s * I;
+                for (int i = 0; i < I; ++i) acc += (double)xr[i] * (double)w_row_f32[i];
+                y_cpu[(size_t)s * O + o] = (float)acc;
+            }
+        }
+    } else {
+        bool cpu_ok = cpu_quant_matmul(type, w_bytes.data(), x.data(), y_cpu.data(), S, I, O);
+        assert(cpu_ok && "cpu_quant_matmul should support every type this test drives");
+    }
 
     // GPU: the fused dequant+matmul kernel under test.
     QuantizedTensor qt;
@@ -219,7 +257,34 @@ static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O,
         return false;
     }
 
+    // Generous tolerance: these are I-element f32 dot products; GPU
+    // tree-reduction vs CPU sequential accumulation legitimately differ by a
+    // few ULPs scaled by term count. This threshold is about catching REAL
+    // bugs (wrong grid index, wrong scale/min, wrong stride), not chasing
+    // bit-exactness. Applies uniformly to every type now -- Q6_K/Q8_0 no
+    // longer need a special (and, as real hardware proved, still not loose
+    // enough) tolerance, since y_cpu above is now the exact reference for
+    // them too, not cpu_quant_matmul's lossy int8-activation-quantized fast
+    // path (see that block's own comment for why that path was dropped as a
+    // test reference: real hardware found it off by up to ~57% at a
+    // NORMAL-magnitude output at attn_q_b's real shape, I=2048 O=16384 --
+    // not just quantization noise at a near-zero value, which is what the
+    // original looser tolerance here was designed to tolerate).
+    //
+    // numpy-`allclose`-style combined criterion (|a-b| <= atol + rtol*|ref|)
+    // instead of a pure relative bound: a genuinely exact-vs-exact
+    // comparison can still have a real near-zero-crossing output (more
+    // likely the larger O gets -- confirmed on real hardware at O=16384),
+    // where even a few ULPs of float32 summation-order noise (~1e-6
+    // absolute, as small as this gets) is a huge relative error against an
+    // exact reference near zero. atol=1e-4 comfortably covers that scale of
+    // genuine float noise without being anywhere close to loose enough to
+    // mask a real bug (which produces errors many orders of magnitude
+    // larger, as every actual bug caught by this test file historically has).
+    const float rtol = 0.01f;
+    const float atol = 1e-4f;
     float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    bool pass = true;
     for (size_t i = 0; i < y_cpu.size(); ++i) {
         if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
             std::cout << "  -> " << name << ": FAILED (NaN/Inf at output index " << i << ")\n";
@@ -229,33 +294,12 @@ static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O,
         float rel = diff / std::max(1e-6f, std::abs(y_cpu[i]));
         max_abs_diff = std::max(max_abs_diff, diff);
         max_rel_diff = std::max(max_rel_diff, rel);
+        if (diff > atol + rtol * std::abs(y_cpu[i])) pass = false;
     }
-
-    // Generous tolerance: these are I-element f32 dot products; GPU
-    // tree-reduction vs CPU sequential accumulation legitimately differ by a
-    // few ULPs scaled by term count. This threshold is about catching REAL
-    // bugs (wrong grid index, wrong scale/min, wrong stride), not chasing
-    // bit-exactness.
-    //
-    // Q6_K and Q8_0 are a different case, not just more float noise:
-    // cpu_quant_matmul's fused path for these two (matmul_q6_k_fused /
-    // matmul_q8_0_fused, src/kernels_cpu.cpp) quantizes the ACTIVATIONS to
-    // int8 per 16-element group to drive a VNNI integer dot product -- a
-    // genuinely different, lossy computation from the GPU kernel's exact f32
-    // dequant+dot, not summation-order noise. Every other type's CPU
-    // reference (Q2_K/Q3_K/Q4_K/Q5_K's plain dequant+f32-dot, IQ2/IQ3_XXS's
-    // float-grid dequant+f32-dot) stays exact-vs-exact and keeps the tight
-    // 0.01 bar; loosening it globally would have masked a real dequant bug
-    // in one of those. Confirmed via direct derivation against ggml's
-    // dequantize_row_q6_K that cuda/kquant_matmul.cu's own dequant math is
-    // correct -- this tolerance covers real int8-activation-quant error on
-    // small I (few super-blocks -> one outlier group dominates), not a
-    // kernel bug.
-    const float tol = (type == GGUFType::Q6_K || type == GGUFType::Q8_0) ? 0.10f : 0.01f;
-    bool pass = max_rel_diff < tol;
     std::cout << "  -> " << name << " (I=" << I << " O=" << O << " S=" << S << "): "
               << (pass ? "PASSED" : "FAILED")
               << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+
     return pass;
 }
 
@@ -280,6 +324,20 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q4_K,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_K,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q6_K,    512, 8, 3);
+    // Q8_0 (cuda/q8_0_matmul.cu): pre-existing gap in this suite -- the
+    // tolerance handling above (line ~254) was already prepared for this
+    // type but no case ever actually exercised it. Closed while touching
+    // this exact kernel to add a reuse-across-S variant (launch_q8_0_matmul
+    // now dispatches S==1 to the original per-(o,s) kernel and S>1 to the
+    // new shared-memory weight-reuse kernel -- see that file for the real-
+    // hardware A/B). S=3 below exercises the NEW reuse kernel (S>1); S=1
+    // exercises the ORIGINAL untouched kernel, at attn_q_b's real GLM-5.2
+    // shape (I=2048, O=16384, confirmed via direct GGUF parse) so a
+    // shape-dependent bug in either path has the best chance of showing up
+    // here rather than only in a live run.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    512, 8, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    4096, 4, 2);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    2048, 16384, 1);
     // IQ2_XXS/XS/S and IQ3_XXS are the highest-priority cases: per a real
     // [QUANT] report from this model, the dominant routed-expert combo is
     // gate=up=IQ2_XXS, down=IQ3_XXS across 71/76 MoE layers -- i.e. every
@@ -987,6 +1045,505 @@ bool test_bf16_matched_cublas_dense_matmul() {
 }
 
 // ------------------------------------------------------------------
+// 12. cuBLAS Strided-Batched BF16 Matched Dense Matmul (MLA qabsorb fast-
+//     path, EngineConfig::attn_qabsorb_gpu) -- per this project's own
+//     established discipline (Test 10's own header comment: "verify in
+//     isolation FIRST"), exercises BOTH the raw cublasGemmStridedBatchedEx
+//     wrapper (cublas_dense_matmul_bf16_matched_batched) AND the full
+//     CudaManager::upload_wuk_bf16 + qabsorb_bf16_batched_host round trip
+//     end to end, using the EXACT layout production uses: WUK [H,kvl,nope]
+//     (per-head [O=kvl,I=nope] row-major, matching the CPU matmul() call
+//     this replaces), activation [H,S,nope], output [H,S,kvl]. H>1 (unlike
+//     Test 10's implicit batch-of-1) is the whole point -- this is what
+//     confirms cublasGemmStridedBatchedEx's per-batch strideA/B/C actually
+//     select the RIGHT head's slice and don't silently reuse head 0 for
+//     everything, a mistake H=1 could never catch.
+bool test_bf16_batched_qabsorb() {
+    std::cout << "[Test 12] cuBLAS Strided-Batched BF16 Matched Dense Matmul (MLA qabsorb)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    const int H = 5, S = 3, nope = 128, kvl = 64;  // deliberately non-uniform, off-multiple-of-32 dims
+    std::mt19937 rng(9012);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> WUK((size_t)H * kvl * nope);
+    for (auto& v : WUK) v = dist(rng);
+    std::vector<float> X((size_t)H * S * nope);
+    for (auto& v : X) v = dist(rng);
+
+    // CPU reference: H independent bf16-rounded dot products (same
+    // rounding-aware methodology as Test 10), each head's own [kvl,nope]
+    // slice against its own [S,nope] slice -- exactly what H separate
+    // matmul()-then-round-trip calls would produce, which is what the
+    // batched GPU call must match.
+    std::vector<float> y_cpu((size_t)H * S * kvl, 0.0f);
+    for (int h = 0; h < H; ++h) {
+        const float* Wh = WUK.data() + (size_t)h * kvl * nope;
+        const float* Xh = X.data() + (size_t)h * S * nope;
+        float* Yh = y_cpu.data() + (size_t)h * S * kvl;
+        for (int s = 0; s < S; ++s) {
+            for (int o = 0; o < kvl; ++o) {
+                double acc = 0.0;
+                for (int i = 0; i < nope; ++i) {
+                    float xb = bf16_to_fp32(fp32_to_bf16(Xh[(size_t)s * nope + i]));
+                    float wb = bf16_to_fp32(fp32_to_bf16(Wh[(size_t)o * nope + i]));
+                    acc += (double)xb * (double)wb;
+                }
+                Yh[(size_t)s * kvl + o] = (float)acc;
+            }
+        }
+    }
+
+    // upload_wuk_bf16 expects layer_idx-keyed storage -- use layer_idx=0,
+    // a generous max_bytes (this test's tensors are tiny).
+    std::vector<float> WUK_vec(WUK.begin(), WUK.end());
+    bool uploaded = gpu.upload_wuk_bf16(0, WUK_vec, H, nope, kvl, 1ull << 30);
+    if (!uploaded) {
+        std::cout << "  -> FAILED (upload_wuk_bf16 returned false)\n";
+        return false;
+    }
+
+    std::vector<float> y_gpu((size_t)H * S * kvl, -999.0f);
+    bool ok = gpu.qabsorb_bf16_batched_host(0, X.data(), y_gpu.data(), H, S, nope, kvl);
+    if (!ok) {
+        std::cout << "  -> FAILED (qabsorb_bf16_batched_host returned false)\n";
+        return false;
+    }
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (size_t i = 0; i < y_cpu.size(); ++i) {
+        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff = std::abs(y_cpu[i] - y_gpu[i]);
+        float rel = diff / std::max(1e-6f, std::abs(y_cpu[i]));
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, rel);
+    }
+
+    // Also confirm the raw batched wrapper directly picks the right
+    // per-head slice, not just "the round trip produced plausible-looking
+    // numbers overall" -- re-check head H-1 in isolation against a FRESH
+    // single (non-batched) matched-precision call for the same head, so a
+    // stride bug that silently aliased two heads together (still passing
+    // the aggregate diff check by coincidence) can't hide.
+    {
+        std::vector<uint16_t> w_bf16((size_t)kvl * nope), x_bf16((size_t)S * nope);
+        const float* Wlast = WUK.data() + (size_t)(H - 1) * kvl * nope;
+        const float* Xlast = X.data() + (size_t)(H - 1) * S * nope;
+        for (size_t i = 0; i < w_bf16.size(); ++i) w_bf16[i] = fp32_to_bf16(Wlast[i]);
+        for (size_t i = 0; i < x_bf16.size(); ++i) x_bf16[i] = fp32_to_bf16(Xlast[i]);
+        void *d_W = nullptr, *d_X = nullptr; float* d_Y = nullptr;
+        cudaMalloc(&d_W, w_bf16.size() * sizeof(uint16_t));
+        cudaMalloc(&d_X, x_bf16.size() * sizeof(uint16_t));
+        cudaMalloc((void**)&d_Y, (size_t)S * kvl * sizeof(float));
+        cudaMemcpy(d_W, w_bf16.data(), w_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_X, x_bf16.data(), x_bf16.size() * sizeof(uint16_t), cudaMemcpyHostToDevice);
+        cublasStatus_t st = cublas_dense_matmul_bf16_matched(gpu.cublas_handle, d_W, d_X, d_Y, S, nope, kvl);
+        std::vector<float> y_last((size_t)S * kvl);
+        if (st == CUBLAS_STATUS_SUCCESS) cudaMemcpy(y_last.data(), d_Y, y_last.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_W); cudaFree(d_X); cudaFree(d_Y);
+        const float* y_gpu_last = y_gpu.data() + (size_t)(H - 1) * S * kvl;
+        for (size_t i = 0; i < y_last.size(); ++i) {
+            float diff = std::abs(y_last[i] - y_gpu_last[i]);
+            if (diff > 1e-4f) {
+                std::cout << "  -> FAILED (batched head " << (H - 1) << " diverges from an isolated single-head "
+                          << "call by " << diff << " at index " << i << " -- possible stride/aliasing bug)\n";
+                return false;
+            }
+        }
+    }
+
+    bool pass = max_rel_diff < 0.01f;
+    std::cout << "  -> BF16 batched qabsorb (H=" << H << " S=" << S << " nope=" << nope << " kvl=" << kvl << "): "
+              << (pass ? "PASSED" : "FAILED")
+              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+// ------------------------------------------------------------------
+// 13. MLA Score GPU Path (EngineConfig::attn_score_gpu) -- 3 plain GEMMs
+//     (no strided-batching needed, unlike qabsorb: MLA's latent K/V is
+//     SHARED across every head) + a combine-scale-softmax kernel
+//     (cuda/attn_score_softmax.cu), replacing the CPU AVX-512 per-head
+//     score loop (attention_layer.cpp). See tests/bench_score_cpu_vs_gpu.cu
+//     for the real-hardware feasibility numbers (5x-51x speedup, growing
+//     with context length) this is based on.
+// ------------------------------------------------------------------
+bool test_score_gpu() {
+    std::cout << "[Test 13] Score GPU Path (3-GEMM + softmax kernel, MLA score)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    // Deliberately non-uniform, small, off-multiple-of-16 dims -- unlike
+    // production's AVX-512 CPU path (which needs kvl/rope divisible by 16),
+    // this test's CPU reference is plain scalar double-accumulation, so no
+    // such constraint applies; picked specifically to stress the softmax
+    // kernel's grid-stride-loop boundary handling (T=23 doesn't divide the
+    // kernel's 256-thread block evenly).
+    const int H = 5, kvl = 37, rope = 13, T = 23;
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> Lc((size_t)T * kvl), Rc((size_t)T * rope);
+    for (auto& v : Lc) v = dist(rng);
+    for (auto& v : Rc) v = dist(rng);
+    std::vector<float> Q_absorbed((size_t)H * kvl), Q_rope((size_t)H * rope);
+    for (auto& v : Q_absorbed) v = dist(rng);
+    for (auto& v : Q_rope) v = dist(rng);
+    float scale = 0.137f;  // arbitrary -- a pure-math correctness check doesn't need the real YaRN formula
+
+    // CPU reference: plain double-accumulation, same 4-step math (score,
+    // softmax, weighted sum) production's own AVX-512 loop computes.
+    std::vector<float> context_cpu((size_t)H * kvl);
+    for (int h = 0; h < H; ++h) {
+        std::vector<double> scores(T);
+        for (int t = 0; t < T; ++t) {
+            double s_nope = 0.0, s_rope = 0.0;
+            for (int i = 0; i < kvl; ++i) s_nope += (double)Q_absorbed[(size_t)h * kvl + i] * (double)Lc[(size_t)t * kvl + i];
+            for (int i = 0; i < rope; ++i) s_rope += (double)Q_rope[(size_t)h * rope + i] * (double)Rc[(size_t)t * rope + i];
+            scores[t] = (s_nope + s_rope) * scale;
+        }
+        double mx = scores[0];
+        for (int t = 1; t < T; ++t) mx = std::max(mx, scores[t]);
+        double sum = 0.0;
+        for (int t = 0; t < T; ++t) { scores[t] = std::exp(scores[t] - mx); sum += scores[t]; }
+        for (int t = 0; t < T; ++t) scores[t] /= sum;
+        for (int i = 0; i < kvl; ++i) {
+            double acc = 0.0;
+            for (int t = 0; t < T; ++t) acc += scores[t] * (double)Lc[(size_t)t * kvl + i];
+            context_cpu[(size_t)h * kvl + i] = (float)acc;
+        }
+    }
+
+    if (!gpu.ensure_lc_rc_gpu(0, T, kvl, rope, 1ull << 30)) {
+        std::cout << "  -> FAILED (ensure_lc_rc_gpu returned false)\n";
+        return false;
+    }
+    if (!gpu.upload_lc_rc_rows(0, Lc.data(), Rc.data(), 0, T, kvl, rope)) {
+        std::cout << "  -> FAILED (upload_lc_rc_rows returned false)\n";
+        return false;
+    }
+
+    std::vector<float> context_gpu((size_t)H * kvl, -999.0f);
+    if (!gpu.score_gpu_batched_host(0, Q_absorbed.data(), Q_rope.data(), context_gpu.data(), H, T, kvl, rope, scale)) {
+        std::cout << "  -> FAILED (score_gpu_batched_host returned false)\n";
+        return false;
+    }
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (size_t i = 0; i < context_cpu.size(); ++i) {
+        if (std::isnan(context_gpu[i]) || std::isinf(context_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff = std::abs(context_cpu[i] - context_gpu[i]);
+        float rel = diff / std::max(1e-6f, std::abs(context_cpu[i]));
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, rel);
+    }
+
+    // Head-aliasing safeguard: unlike qabsorb (a strided-batched GEMM,
+    // where the risk is silently reusing one head's slice for another),
+    // this design uses 3 PLAIN GEMMs with no batch stride at all -- the
+    // risk profile here is a row/transpose bug in the GEMM call reading
+    // the SAME row for every head. With random, independent per-head
+    // inputs, two different heads should never coincidentally match to
+    // float precision if the computation is actually per-head-distinct.
+    {
+        const float* ctx0 = context_gpu.data();
+        const float* ctxLast = context_gpu.data() + (size_t)(H - 1) * kvl;
+        float max_diff_heads = 0.0f;
+        for (int i = 0; i < kvl; ++i) max_diff_heads = std::max(max_diff_heads, std::abs(ctx0[i] - ctxLast[i]));
+        if (max_diff_heads < 1e-6f) {
+            std::cout << "  -> FAILED (head 0 and head " << (H - 1) << " produced identical output -- "
+                         "possible head-aliasing/transpose bug)\n";
+            return false;
+        }
+    }
+
+    bool pass = max_rel_diff < 0.05f;
+    std::cout << "  -> Score GPU path (H=" << H << " kvl=" << kvl << " rope=" << rope << " T=" << T << "): "
+              << (pass ? "PASSED" : "FAILED")
+              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+// ------------------------------------------------------------------
+// 14. WUV BF16 Batched GPU Path (score GPU path's own down-projection,
+//     wuv_bf16_batched_host) -- added after a real production run showed
+//     the CPU per-head OMP-parallel loop this replaces costing 0.916ms/call
+//     (2.86s over one 40-token decode run), the same OMP team-spawn-
+//     overhead pattern qabsorb's own gather fix already found and fixed at
+//     a different call site. Structurally identical to Test 12 (same
+//     cublasGemmStridedBatchedEx call, cublas_dense_matmul_bf16_matched_
+//     batched), just S folded to 1 and different tensor roles.
+// ------------------------------------------------------------------
+bool test_wuv_batched_gpu() {
+    std::cout << "[Test 14] WUV BF16 Batched GPU Path (score down-projection)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    const int H = 5, kvl = 37, vh = 23;  // deliberately non-uniform, off-multiple-of-32 dims
+    std::mt19937 rng(6161);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> WUV((size_t)H * kvl * vh);
+    for (auto& v : WUV) v = dist(rng);
+    std::vector<float> X((size_t)H * kvl);
+    for (auto& v : X) v = dist(rng);
+
+    // CPU reference: H independent bf16-rounded dot products (same
+    // methodology as Test 12), each head's own [vh,kvl] slice against its
+    // own [kvl] slice.
+    std::vector<float> y_cpu((size_t)H * vh, 0.0f);
+    for (int h = 0; h < H; ++h) {
+        const float* Wh = WUV.data() + (size_t)h * kvl * vh;
+        const float* Xh = X.data() + (size_t)h * kvl;
+        float* Yh = y_cpu.data() + (size_t)h * vh;
+        for (int o = 0; o < vh; ++o) {
+            double acc = 0.0;
+            for (int i = 0; i < kvl; ++i) {
+                float xb = bf16_to_fp32(fp32_to_bf16(Xh[i]));
+                float wb = bf16_to_fp32(fp32_to_bf16(Wh[(size_t)o * kvl + i]));
+                acc += (double)xb * (double)wb;
+            }
+            Yh[o] = (float)acc;
+        }
+    }
+
+    std::vector<float> WUV_vec(WUV.begin(), WUV.end());
+    if (!gpu.upload_wuv_bf16(0, WUV_vec, H, kvl, vh, 1ull << 30)) {
+        std::cout << "  -> FAILED (upload_wuv_bf16 returned false)\n";
+        return false;
+    }
+
+    std::vector<float> y_gpu((size_t)H * vh, -999.0f);
+    if (!gpu.wuv_bf16_batched_host(0, X.data(), y_gpu.data(), H, kvl, vh)) {
+        std::cout << "  -> FAILED (wuv_bf16_batched_host returned false)\n";
+        return false;
+    }
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (size_t i = 0; i < y_cpu.size(); ++i) {
+        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff = std::abs(y_cpu[i] - y_gpu[i]);
+        float rel = diff / std::max(1e-6f, std::abs(y_cpu[i]));
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, rel);
+    }
+
+    bool pass = max_rel_diff < 0.01f;
+    std::cout << "  -> WUV batched GPU (H=" << H << " kvl=" << kvl << " vh=" << vh << "): "
+              << (pass ? "PASSED" : "FAILED")
+              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+// Gated throughput bench (MOESTREAM_RUN_BENCH=1, same convention as
+// bench_cpu_dequant_matmul/Test 8) for the qabsorb BF16 batched GPU path,
+// at GLM-5.2's REAL dims (H=64 nope=192 kvl=512, read directly off a real
+// run's own "[MLA] attn_k_b.weight ... config nope*kvl*H=6291456" debug.log
+// line: 192*512*64=6291456, confirmed) -- not the small synthetic
+// H=5/nope=128/kvl=64 shape Test 12 uses for correctness-only checking.
+// Times BOTH the CPU per-head matmul() loop (attention_layer.cpp's
+// fallback, exact same call pattern reproduced here) and the GPU batched
+// path, at S=1 (decode, the dominant call volume) and S=12 (this project's
+// own recent real prefill batch size) -- gives a real, hardware-grounded
+// answer to "is this actually a win here" instead of leaving it as
+// synthetic-correctness-only + speculation.
+void bench_qabsorb_cpu_vs_gpu() {
+    std::cout << "\n[Bench] MLA qabsorb: CPU per-head matmul() vs GPU BF16 batched (GLM-5.2 real dims)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return;
+    }
+    const int H = 64, nope = 192, kvl = 512;
+    std::mt19937 rng(3141);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> WUK((size_t)H * kvl * nope);
+    for (auto& v : WUK) v = dist(rng);
+    if (!gpu.upload_wuk_bf16(0, WUK, H, nope, kvl, 1ull << 31)) {
+        std::cout << "  -> Skipped (upload_wuk_bf16 failed -- insufficient VRAM for this bench)\n";
+        return;
+    }
+
+    for (int S : {1, 12}) {
+        std::vector<float> X((size_t)H * S * nope);
+        for (auto& v : X) v = dist(rng);
+        std::vector<float> Y_cpu((size_t)H * S * kvl), Y_gpu((size_t)H * S * kvl);
+
+        const int WARMUP = 5, ITERS = 50;
+        for (int it = 0; it < WARMUP; ++it) {
+            for (int h = 0; h < H; ++h)
+                matmul(Y_cpu.data() + (size_t)h * S * kvl, X.data() + (size_t)h * S * nope,
+                       WUK.data() + (size_t)h * kvl * nope, S, nope, kvl);
+        }
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < ITERS; ++it) {
+            for (int h = 0; h < H; ++h)
+                matmul(Y_cpu.data() + (size_t)h * S * kvl, X.data() + (size_t)h * S * nope,
+                       WUK.data() + (size_t)h * kvl * nope, S, nope, kvl);
+        }
+        double cpu_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+        for (int it = 0; it < WARMUP; ++it) gpu.qabsorb_bf16_batched_host(0, X.data(), Y_gpu.data(), H, S, nope, kvl);
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < ITERS; ++it) gpu.qabsorb_bf16_batched_host(0, X.data(), Y_gpu.data(), H, S, nope, kvl);
+        double gpu_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+        std::cout << "  S=" << S << " (" << (S == 1 ? "decode" : "prefill-batch") << "): "
+                  << "CPU=" << cpu_ms << "ms/call  GPU=" << gpu_ms << "ms/call  "
+                  << "speedup=" << (cpu_ms / gpu_ms) << "x\n";
+    }
+
+    // 2026-08-14 follow-up: a real GLM-5.2 run with attn_qabsorb_gpu=true
+    // showed the [REQUEST] line's own qabsorb= bucket (1.99s) noticeably
+    // bigger than qabsorb_bf16_batched_host's own up+cmp+dn total (0.616s)
+    // for the same 3198 calls -- the bucket also wraps the q_nope_gather_all
+    // pre-pass (attention_layer.cpp), a #pragma omp parallel for over H=64
+    // heads copying `nope` floats each. Isolate that gather's own cost,
+    // serial vs. the production OMP-parallel version, to test the
+    // hypothesis that team-spawn overhead dominates a workload this small
+    // (S=1: 64*192*4 bytes = 48KB total copied -- a few microseconds of
+    // real memcpy work) before touching production code.
+    std::cout << "\n[Bench] q_nope_gather_all: serial memcpy vs #pragma omp parallel for (H=" << H << " nope=" << nope << ")...\n";
+    for (int S : {1, 12}) {
+        const int qh = nope; // rope portion irrelevant to copy cost, omitted for simplicity
+        std::vector<float> Q((size_t)S * H * qh);
+        for (auto& v : Q) v = dist(rng);
+        std::vector<float> gathered((size_t)H * S * nope);
+
+        const int WARMUP = 5, ITERS = 200;
+        for (int it = 0; it < WARMUP; ++it) {
+            for (int h = 0; h < H; ++h) {
+                float* dst = gathered.data() + (size_t)h * S * nope;
+                for (int s = 0; s < S; ++s) {
+                    const float* head_q = Q.data() + ((size_t)s * H + h) * qh;
+                    std::memcpy(dst + (size_t)s * nope, head_q, nope * sizeof(float));
+                }
+            }
+        }
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < ITERS; ++it) {
+            for (int h = 0; h < H; ++h) {
+                float* dst = gathered.data() + (size_t)h * S * nope;
+                for (int s = 0; s < S; ++s) {
+                    const float* head_q = Q.data() + ((size_t)s * H + h) * qh;
+                    std::memcpy(dst + (size_t)s * nope, head_q, nope * sizeof(float));
+                }
+            }
+        }
+        double serial_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+        for (int it = 0; it < WARMUP; ++it) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int h = 0; h < H; ++h) {
+                float* dst = gathered.data() + (size_t)h * S * nope;
+                for (int s = 0; s < S; ++s) {
+                    const float* head_q = Q.data() + ((size_t)s * H + h) * qh;
+                    std::memcpy(dst + (size_t)s * nope, head_q, nope * sizeof(float));
+                }
+            }
+        }
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < ITERS; ++it) {
+            #pragma omp parallel for schedule(dynamic, 1)
+            for (int h = 0; h < H; ++h) {
+                float* dst = gathered.data() + (size_t)h * S * nope;
+                for (int s = 0; s < S; ++s) {
+                    const float* head_q = Q.data() + ((size_t)s * H + h) * qh;
+                    std::memcpy(dst + (size_t)s * nope, head_q, nope * sizeof(float));
+                }
+            }
+        }
+        double omp_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+        std::cout << "  S=" << S << ": serial=" << serial_ms << "ms/call  omp_parallel=" << omp_ms
+                  << "ms/call  (omp is " << (omp_ms / serial_ms) << "x serial -- >1x means spawn overhead "
+                     "exceeds the work being parallelized)\n";
+    }
+
+    // The gather timings above (tens of microseconds) are far too small to
+    // explain the real gap seen between a live [REQUEST] line's qabsorb=
+    // bucket (1.99s/3198 calls = 0.622ms/call) and qabsorb_bf16_batched_
+    // host's own up+cmp+dn total (0.616s/3198 = 0.193ms/call) -- a ~0.43ms/
+    // call gap. The bucket also wraps TWO fresh std::vector allocations
+    // every call (Q_absorbed, q_nope_gather_all) -- value-initialized (zero-
+    // touched) then freed at scope exit, every single call, every layer,
+    // every token. Test that directly: fresh-alloc-per-call vs. persistent
+    // grow-only scratch (this codebase's own established fix for exactly
+    // this class of cost elsewhere, e.g. dense_matmul_bf16_matched_host's
+    // scratch buffers) for the WHOLE block the bucket actually wraps.
+    std::cout << "\n[Bench] Full qabsorb-block cost: fresh std::vector alloc/call vs. persistent grow-only scratch (S=1, decode)...\n";
+    {
+        const int S = 1;
+        std::vector<float> Q((size_t)S * H * nope);
+        for (auto& v : Q) v = dist(rng);
+        const int WARMUP = 5, ITERS = 200;
+
+        auto run_fresh_alloc = [&]() {
+            std::vector<float> Q_absorbed((size_t)H * S * kvl);
+            std::vector<float> q_nope_gather_all((size_t)H * S * nope);
+            for (int h = 0; h < H; ++h) {
+                float* dst = q_nope_gather_all.data() + (size_t)h * S * nope;
+                for (int s = 0; s < S; ++s) {
+                    const float* head_q = Q.data() + ((size_t)s * H + h) * nope;
+                    std::memcpy(dst + (size_t)s * nope, head_q, nope * sizeof(float));
+                }
+            }
+            gpu.qabsorb_bf16_batched_host(0, q_nope_gather_all.data(), Q_absorbed.data(), H, S, nope, kvl);
+        };
+        for (int it = 0; it < WARMUP; ++it) run_fresh_alloc();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < ITERS; ++it) run_fresh_alloc();
+        double fresh_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+        std::vector<float> Q_absorbed_persist((size_t)H * S * kvl);
+        std::vector<float> q_nope_gather_persist((size_t)H * S * nope);
+        auto run_persistent = [&]() {
+            for (int h = 0; h < H; ++h) {
+                float* dst = q_nope_gather_persist.data() + (size_t)h * S * nope;
+                for (int s = 0; s < S; ++s) {
+                    const float* head_q = Q.data() + ((size_t)s * H + h) * nope;
+                    std::memcpy(dst + (size_t)s * nope, head_q, nope * sizeof(float));
+                }
+            }
+            gpu.qabsorb_bf16_batched_host(0, q_nope_gather_persist.data(), Q_absorbed_persist.data(), H, S, nope, kvl);
+        };
+        for (int it = 0; it < WARMUP; ++it) run_persistent();
+        t0 = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < ITERS; ++it) run_persistent();
+        double persist_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+        std::cout << "  fresh-alloc=" << fresh_ms << "ms/call  persistent-scratch=" << persist_ms
+                  << "ms/call  (" << (fresh_ms / persist_ms) << "x -- this is the whole block the "
+                     "production qabsorb= bucket wraps, serial gather both ways since S=1)\n";
+    }
+}
+
+// ------------------------------------------------------------------
 // 11. Real-Data IQ2_XXS Dequant Consistency (GPU kernel vs CPU reference,
 //     on ACTUAL model bytes -- not Test 5's synthetic ggml_quantize_row_ref
 //     data)
@@ -1206,11 +1763,15 @@ int main() {
     // set MOESTREAM_RUN_BENCH=1 to opt back into the throughput numbers.
     if (std::getenv("MOESTREAM_RUN_BENCH")) {
         bench_cpu_dequant_matmul();
+        bench_qabsorb_cpu_vs_gpu();
     } else {
         std::cout << "\n[Test 8] SKIPPED by default (set MOESTREAM_RUN_BENCH=1 to run the throughput bench)\n";
     }
     bool bf16_dense_ok = test_bf16_cublas_dense_matmul();
     bool bf16_matched_dense_ok = test_bf16_matched_cublas_dense_matmul();
+    bool bf16_batched_qabsorb_ok = test_bf16_batched_qabsorb();
+    bool score_gpu_ok = test_score_gpu();
+    bool wuv_batched_gpu_ok = test_wuv_batched_gpu();
     bool real_expert_iq2xxs_ok = test_real_expert_iq2xxs_dequant();
 
     std::cout << "========================================\n";
@@ -1234,6 +1795,18 @@ int main() {
     }
     if (!bf16_matched_dense_ok) {
         std::cout << "❌ BF16 matched-precision cuBLAS dense matmul correctness test FAILED -- see [Test 10] output above.\n";
+        return 1;
+    }
+    if (!bf16_batched_qabsorb_ok) {
+        std::cout << "❌ BF16 strided-batched qabsorb correctness test FAILED -- see [Test 12] output above.\n";
+        return 1;
+    }
+    if (!score_gpu_ok) {
+        std::cout << "❌ Score GPU path correctness test FAILED -- see [Test 13] output above.\n";
+        return 1;
+    }
+    if (!wuv_batched_gpu_ok) {
+        std::cout << "❌ WUV batched GPU path correctness test FAILED -- see [Test 14] output above.\n";
         return 1;
     }
     if (!real_expert_iq2xxs_ok) {

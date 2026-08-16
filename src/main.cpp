@@ -8,6 +8,7 @@
 #include "perf_timer.hpp"
 #include "engine_config.hpp"
 #include "logger.hpp"
+#include "tensor_trace.hpp"
 #include "shutdown.hpp"
 
 #include <iostream>
@@ -17,6 +18,7 @@
 #include <expected>
 #include <chrono>
 #include <map>
+#include <unordered_set>
 #include <cmath>
 #include <thread>
 #include <omp.h>
@@ -64,7 +66,105 @@ void print_usage() {
               << "                   to steer response language: --system-prompt \"Respond in English.\"\n"
               << "  --log-path <file>  Redirect logging to a file instead of stderr\n"
               << "  --log-level <lvl>  VERBOSE | DEBUG | INFO (default) | WARN | ERROR\n"
+              << "  --trace-filter <tags>  Comma-separated tags (requires --log-level VERBOSE),\n"
+              << "                   e.g. --trace-filter \"HC,MLA\" -- see any tensor-trace tag\n"
+              << "  --trace-abort-on-nan  Abort at the first tensor a NaN/Inf checker flags\n"
+              << "  --freeze-usage-stats  Don't overwrite pin_file/prefill_pin_file at shutdown\n"
+              << "                   (still read at startup) -- for controlled A/B testing\n"
               << "  --help           Show this help interface\n";
+}
+
+// Batches up to Ring::CAPACITY/3 packed-format experts' reads into ONE
+// io_uring submission, for the startup [PIN] preload pass -- real
+// measurement (gguf_tool dma's own N-sweep) found that pass's original
+// single-expert-at-a-time load_expert_slab loop runs at roughly the
+// device's depth-1 ceiling (~2.2 GB/s) instead of its ~2.5 GB/s
+// deep-queue ceiling, unlike decode-time reads this doesn't compete with
+// any GPU compute for pacing, so there's nothing structurally stopping it
+// from batching the same way RAMSafetyManager::get_experts_batch's own
+// Phase B already does. All-or-nothing per chunk (same discipline as
+// Phase B): on ANY failure (ring unavailable, a non-packed-format layer,
+// batch too large, submit failure, short read) returns false and touches
+// no slot's metadata -- ensure_slab_capacity may already have grown a
+// slab_buffer via build_expert_read_requests, which is harmless (grow-only,
+// tolerated by a subsequent load_expert_slab call on the same slot); the
+// caller must fall back to the original per-expert load_expert_slab loop
+// for every item in this exact chunk. Packed format only, matching
+// build_expert_read_requests' own scope -- unpacked_expert_format/legacy
+// per-expert-tensor layouts fall back immediately (build_expert_read_
+// requests returns cnt!=3 or false for those), same as Phase B.
+static bool preload_batch_load(StreamingEngine& engine, io_uring_backend::Ring& ring,
+                                const std::vector<std::tuple<int, int, MoEExpertBlock*>>& items) {
+    if (items.empty() || !ring.available() || items.size() * 3 > io_uring_backend::Ring::CAPACITY)
+        return false;
+
+    std::vector<io_uring_backend::ReadRequest> reqs;
+    reqs.reserve(items.size() * 3);
+    // Per-item geometry, needed to call populate_packed_slab after a
+    // successful read -- build_expert_read_requests only fills the raw
+    // slab_buffer bytes, not the QuantizedTensor host_ptr/meta fields (see
+    // its own comment); load_expert_slab's packed-format branch calls
+    // populate_packed_slab as its own last step, which this mirrors.
+    struct ItemGeom {
+        size_t gb, ub, db;
+        const GGUFTensor *gM, *uM, *dM;
+        int expert_id;
+        MoEExpertBlock* slot;
+    };
+    std::vector<ItemGeom> geoms;
+    geoms.reserve(items.size());
+
+    // Stripe alternate experts across the two replicas when a mirror is
+    // configured (GGUFModel::open_mirror) -- io_uring allows mixed fds in a
+    // single submission, so this one submit_and_wait below is serviced by
+    // BOTH devices' queues concurrently, roughly halving the wall time of
+    // each chunk. Falls back to replica 0 for everything on a single-drive
+    // setup (fd_for_tensor degrades internally), so no branch is needed here.
+    for (auto& [layer, expert_id, slot] : items) {
+        io_uring_backend::ReadRequest tmp[3];
+        int cnt = 0;
+        size_t total = 0;
+        // Intra-expert split (see StreamingEngine::REPLICA_SPLIT): both
+        // drives work on EVERY expert rather than alternating whole experts
+        // between them, so even a chunk's last, otherwise-solo expert uses
+        // both devices.
+        int replica = engine.model_file.has_mirror() ? StreamingEngine::REPLICA_SPLIT : 0;
+        if (!engine.build_expert_read_requests(layer, expert_id, *slot, tmp, cnt, total, replica) || cnt != 3)
+            return false;
+        for (int j = 0; j < cnt; ++j) reqs.push_back(tmp[j]);
+        size_t gb, ub, db;
+        const GGUFTensor *gM, *uM, *dM;
+        if (!engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) return false;
+        geoms.push_back({gb, ub, db, gM, uM, dM, expert_id, slot});
+    }
+
+    std::vector<ssize_t> results(reqs.size());
+    // Timed and credited to the SAME t_disk_read/bytes_disk_read counters
+    // load_expert_slab's own per-expert path uses -- mirrors RAMSafetyManager
+    // ::get_experts_batch's Phase B convention exactly (times submit_and_wait
+    // alone, charged unconditionally since a failed/short submission still
+    // consumed real wall-clock time; bytes credited only on full success,
+    // to avoid double-counting a chunk the caller then re-reads via the
+    // load_expert_slab fallback). Without this, the shutdown report's
+    // "Disk read (expert)" line would silently omit every batched chunk's
+    // real disk activity -- a real gap this had before being caught by
+    // comparing two real runs' own total-bytes figures.
+    auto t0 = std::chrono::high_resolution_clock::now();
+    bool submitted = ring.submit_and_wait(reqs.data(), (int)reqs.size(), results.data());
+    double batch_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+    PerfCounters::atomic_add(perf().t_disk_read, batch_ms / 1000.0);
+    if (!submitted) return false;
+    size_t total_bytes = 0;
+    for (size_t r = 0; r < reqs.size(); ++r) {
+        if (results[r] != (ssize_t)reqs[r].len) return false;
+        total_bytes += reqs[r].len;
+    }
+    perf().bytes_disk_read.fetch_add(total_bytes, std::memory_order_relaxed);
+    for (auto& g : geoms) {
+        engine.populate_packed_slab(*g.slot, g.expert_id, g.gb, g.ub, g.db, *g.gM, *g.uM, *g.dM);
+    }
+    return true;
 }
 
 std::expected<void, std::string> run_engine(const EngineConfig& config) {
@@ -91,6 +191,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         LOG_STREAM_INFO() << "[CONFIG] OMP process-wide default team size: " << omp_cap
                   << (config.omp_max_threads > 0 ? " (explicit)" : " (auto: hardware_concurrency-2)")
                   << "\n";
+        // attn_score_threads (dense_dispatch.hpp): dedicated override for
+        // attention_layer.cpp's causal score loop specifically -- 0 (unset)
+        // means attn_score_threads() falls back to omp_get_max_threads(),
+        // i.e. omp_cap above, so this is a genuine no-op when the config
+        // never sets it. See EngineConfig::attn_score_threads' own comment.
+        set_attn_score_threads(config.attn_score_threads);
     }
 
     // Declared BEFORE engine/gpu below (destructor runs in REVERSE
@@ -128,14 +234,38 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     engine.drop_expert_pages = config.drop_pages;
     engine.unpacked_expert_format = config.unpacked_expert_format;
     engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;
+    // Must be set BEFORE the [PIN] preload block below -- that's where the
+    // bulk of the RAM tier's slabs are first allocated, and each slab is
+    // pinned exactly once at its own allocation (ensure_slab_capacity).
+    // Setting it later would silently leave every preloaded slab pageable.
+    engine.ram_pinned_budget_bytes =
+        (size_t)(config.ram_pinned_budget_gb * 1024.0 * 1024.0 * 1024.0);
+    if (config.ram_pinned_budget_gb > 0.0) {
+        LOG_STREAM_INFO() << "[CONFIG] RAM slab persistent pin budget: "
+                          << config.ram_pinned_budget_gb << " GB of host_ram_gb="
+                          << config.host_ram_gb << " -- slabs are cudaHostRegister'd once at "
+                             "allocation so upload_expert_active_async's DMA can overlap compute "
+                             "(see ram_pinned_budget_gb's own comment). Pinned pages are never "
+                             "reclaimable by the kernel; raise this deliberately, not wholesale.\n";
+    }
+    engine.prefill_opportunistic_promote = config.prefill_opportunistic_promote;
+    engine.decode_async_prewarm = config.decode_async_prewarm;
+    engine.decode_async_prewarm_max_batch = config.decode_async_prewarm_max_batch;
+    engine.attn_qabsorb_gpu = config.attn_qabsorb_gpu;
+    engine.attn_qabsorb_gpu_max_vram_gb = config.attn_qabsorb_gpu_max_vram_gb;
+    engine.attn_score_gpu = config.attn_score_gpu;
+    engine.attn_score_gpu_max_vram_gb = config.attn_score_gpu_max_vram_gb;
+    engine.attn_score_gpu_max_context = config.attn_score_gpu_max_context;
     ram_mgr.configured_ram_gb = config.host_ram_gb;
     ram_mgr.promote_hit_threshold = (uint32_t)config.promote_hit_threshold;
     ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
     ram_mgr.verbose_cache_log = config.verbose_moe_log;
     ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
     ram_mgr.move_on_promotion = config.move_on_promotion;
+    ram_mgr.ram_copy_reclaim_threshold = config.ram_copy_reclaim_threshold;
     ram_mgr.disk_batch_padding = config.disk_batch_padding;
     ram_mgr.disk_batch_padding_target = config.disk_batch_padding_target;
+    ram_mgr.disk_batch_padding_evict_dup = config.disk_batch_padding_evict_dup;
     gpu.topology.active_layer_promote_threshold = std::max(1, config.active_layer_promote_hit_threshold);
     if (config.dense_gpu_idx >= 0) {
         gpu.device_id = config.gpus[config.dense_gpu_idx].device_id;
@@ -174,6 +304,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // shard. Called right after load_header (all shard fds + KV metadata
     // are populated by then) and before anything starts reading experts.
     if (config.direct_io) engine.model_file.enable_direct_io();
+    // Opened AFTER enable_direct_io deliberately: open_mirror matches each
+    // shard's O_DIRECT state against the primary's, which isn't decided until
+    // the call above has run and verified it per shard.
+    if (!config.mirror_model_path.empty())
+        engine.model_file.open_mirror(config.mirror_model_path);
+
 
     // Opt-in, only reachable when the driver actually opened above (config.
     // cuda_cufile alone doesn't guarantee that -- see cufile_driver_guard).
@@ -217,6 +353,14 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     }
     engine.init_route_freq();
 
+    // Alignment diagnostic. Must come AFTER build_model_graph: it walks every
+    // MoE layer, and architecture_config.n_layers is only known as of that
+    // call (an earlier placement silently checked zero layers and printed
+    // nothing at all). Direct-io/mirror setup has already run by here too, so
+    // the report reflects the O_DIRECT state actually in force. Emits to
+    // stderr as well as the log -- see the function's own comment for why.
+    engine.warn_if_expert_tensors_unaligned();
+
     // cpu_affinity_layers (config): must be set before ANYTHING below can
     // dispatch an expert or preload VRAM -- expert_ffn_resolve_gpu_loc,
     // RAMSafetyManager's reactive-hit promotion, Phase 2's prefill warm-up,
@@ -235,6 +379,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // Same timing/reasoning as the pilot_k call directly above, for
     // EngineConfig::prefetch_pilot_depth / prefetch_pilot_k_depth2.
     set_prefetch_pilot_depth(config.prefetch_pilot_depth, config.prefetch_pilot_k_depth2);
+    // Same timing/reasoning again, for the pilot-driven RAM->VRAM
+    // speculative promotion config (ram_vram_promote_top_k/adaptive) --
+    // execution_layer.cpp's pilot loop reads this on the very same l+1
+    // transition as pilot_k_for_layer above.
+    set_ram_vram_promote_config(config.ram_vram_promote_top_k, config.ram_vram_promote_adaptive,
+                                 config.ram_vram_promote_adaptive_threshold, config.ram_vram_promote_min_samples);
 
     // unpacked_expert_format is an explicit performance contract (single
     // combined DMA per expert) -- validate it holds for the WHOLE model
@@ -845,19 +995,55 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> by_layer;
             for (auto& e : entries) by_layer[e.layer].push_back(e);
             for (auto& [layer, v] : by_layer) {
-                std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+                // stable_sort: plain std::sort has no tie-break guarantee for
+                // equal-count entries (very common at the low-count end of a
+                // real usage file). See the prefill_pin_file merge block
+                // below for the concrete, measured case this caused -- kept
+                // stable here too so this ranking is deterministic on its
+                // own, not just relative to that merge.
+                std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
             }
 
-            // prefill_pin_file: prefer ITS ranking for any layer it has data
-            // for, since decode's higher routing volume can otherwise
-            // outrank prefill's own needs in the combined pin_file above
-            // (see StreamingEngine::route_freq_prefill's own comment).
-            // Per-layer, not a blanket switch -- a layer this file has no
-            // entries for (e.g. its very first run, before any prefill has
-            // been recorded into it yet) keeps falling back to the general
-            // pin_file's ranking for that specific layer, exactly as if
-            // prefill_pin_file weren't configured at all.
-            int prefill_layers_overridden = 0;
+            // prefill_pin_file: MERGE its ranking ahead of the general
+            // pin_file ranking for any layer it has data for, rather than
+            // replacing that layer's ranking outright. Prefill runs before
+            // any decode token, so its own experts get priority for Tier
+            // 1/2/3 slot assignment (they're needed first, chronologically)
+            // -- but a hard per-layer REPLACE (the previous behavior) threw
+            // away pin_file's own, typically much richer, decode-time
+            // ranking for that same layer entirely. On a real run this
+            // starved Tier 3 (RAM) down to 0 preloaded experts across every
+            // layer: prefill_pin_file had only 732 known experts vs.
+            // pin_file's 3311, and since decode dominates a normal
+            // request's wall-clock time (prefill is a handful of tokens),
+            // discarding pin_file's knowledge for every prefill-covered
+            // layer left Tier 1/2 (topk + vram_lru target) with nothing
+            // left over for Tier 3 to draw from, even though pin_ram_
+            // fraction=1.0 was requesting the maximum.
+            //
+            // Fixed by concatenating instead: prefill's own ranked list
+            // stays first (unchanged priority for Tier 1/2), then pin_
+            // file's ranked list for that layer is appended MINUS any
+            // expert prefill already covers (an unordered_set membership
+            // check per layer) -- so a given (layer,expert) pair is never
+            // attempted twice by two different source rankings, and Tier 3
+            // gets pin_file's full remaining knowledge instead of nothing.
+            // A layer prefill_pin_file has no entries for (e.g. its very
+            // first run, before any prefill has been recorded into it yet)
+            // is untouched and keeps using the general pin_file ranking
+            // alone, exactly as before.
+            int prefill_layers_merged = 0;
+            // prefill_exclusive_protected: entries that got the bounded,
+            // unconditional floor slot (pin_global_floor_per_layer/layer at
+            // most). prefill_exclusive_competing: prefill-exclusive entries
+            // that instead went into the honest count-sorted pool alongside
+            // pin_file's own data -- a low number here relative to the
+            // total known-experts count is expected and correct given how
+            // flat prefill's own routing tends to be (see the per-layer
+            // concentration diagnostic below); it's only a problem if it's
+            // near-zero for EVERY layer, which would mean the floor itself
+            // is mis-sized (pin_global_floor_per_layer too small/large).
+            int prefill_exclusive_protected = 0, prefill_exclusive_competing = 0;
             if (!config.prefill_pin_file.empty()) {
                 auto [pf_entries, pf_maxc] = StreamingEngine::load_usage(config.prefill_pin_file);
                 (void)pf_maxc;
@@ -866,17 +1052,164 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                               << ") has no data yet -- every layer falls back to the general pin_file "
                                  "ranking for this run.\n";
                 } else {
+                    // Per-layer concentration diagnostic (the "statistics
+                    // for the prefill pin" this whole redesign was
+                    // motivated by) -- mirrors the general pin_file's own
+                    // [PIN-CONCENTRATION] block below, but computed on
+                    // prefill's OWN data before any merge with pin_file, so
+                    // it answers "how concentrated is PREFILL's routing,
+                    // independent of decode" directly rather than through
+                    // the combined ranking's own lens.
+                    {
+                        std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> pf_raw_by_layer;
+                        for (auto& e : pf_entries) pf_raw_by_layer[e.layer].push_back(e);
+                        double cov_sum = 0.0; int cov_n = 0;
+                        double cov_min = 2.0, cov_max = -1.0; int layer_min = -1, layer_max_l = -1;
+                        for (auto& [layer, v] : pf_raw_by_layer) {
+                            uint64_t total = 0, top1 = 0;
+                            for (auto& e : v) { total += e.count; if (e.count > top1) top1 = e.count; }
+                            if (total == 0) continue;
+                            double share = (double)top1 / (double)total;
+                            cov_sum += share; ++cov_n;
+                            if (share < cov_min) { cov_min = share; layer_min = layer; }
+                            if (share > cov_max) { cov_max = share; layer_max_l = layer; }
+                            LOG_STREAM_DEBUG() << "[PIN-PREFILL-CONCENTRATION] layer=" << layer
+                                      << " top-1 share=" << (share * 100.0) << "% of "
+                                      << v.size() << " distinct experts / " << total << " total picks\n";
+                        }
+                        if (cov_n > 0) {
+                            LOG_STREAM_INFO() << "[PIN] prefill_pin_file own concentration: avg top-1 share "
+                                      << (cov_sum / cov_n * 100.0) << "% across " << cov_n
+                                      << " layer(s) -- most concentrated: layer " << layer_max_l
+                                      << " (" << (cov_max * 100.0) << "%), flattest: layer " << layer_min
+                                      << " (" << (cov_min * 100.0) << "%). Low values everywhere mean "
+                                         "prefill's own routing rarely has a clear per-layer winner -- "
+                                         "expect the bounded floor below to protect little, by design. "
+                                         "Full per-layer breakdown at log_level=DEBUG "
+                                         "([PIN-PREFILL-CONCENTRATION] lines).\n";
+                        }
+                    }
                     std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> pf_by_layer;
                     for (auto& e : pf_entries) pf_by_layer[e.layer].push_back(e);
-                    for (auto& [layer, v] : pf_by_layer) {
-                        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
-                        by_layer[layer] = std::move(v);  // override this layer only
-                        ++prefill_layers_overridden;
+                    for (auto& [layer, pf_v] : pf_by_layer) {
+                        std::stable_sort(pf_v.begin(), pf_v.end(), [](const auto& a, const auto& b) { return a.count > b.count; });
+
+                        // Real, measured regression (2026-08-12, GLM-5.2),
+                        // fixed in two stages:
+                        //
+                        // Stage 1 (count corruption): the original version
+                        // here kept PREFILL's entry and dropped pin_file's
+                        // (decode's) entry for any (layer,expert) pair known
+                        // to both -- silently discarding decode's real,
+                        // much-larger-sample count in favor of prefill's
+                        // tiny one (a handful of hits from one short
+                        // prompt). Under pin_strategy=global_topn, ranking
+                        // is purely by that count value, so a genuinely
+                        // decode-hot expert that prefill also happened to
+                        // touch once lost its earned global rank to
+                        // whatever unrelated expert decode never needed --
+                        // measured net cost on a 51-token decode-heavy
+                        // generation: decode 0.68->0.57 tok/s (+11.2s wall)
+                        // vs. prefill 0.61->0.81 tok/s (-4.4s wall), a net
+                        // +6.7s loss. Fixed by never discarding pin_file's
+                        // own entry -- prefill only contributes entries
+                        // pin_file has ZERO history for.
+                        //
+                        // Stage 2 (positional bug, found while investigating
+                        // why prefill's OWN throughput never improved even
+                        // after stage 1 -- real per-layer concentration
+                        // check on .moestream_usage_prefill showed EVERY
+                        // layer's prefill routing is close to flat, 3.4%-
+                        // 11.4% top-1 share, nowhere near "an obvious
+                        // winner"): stage 1 still put ALL prefill-exclusive
+                        // entries at the front of a layer's list,
+                        // unconditionally, regardless of how many there
+                        // were or how small their own counts. The NUMBER of
+                        // pinned slots a layer gets (layer_pin_count below)
+                        // is decided by real per-entry counts, but WHICH
+                        // entries fill those slots was still pure array
+                        // position -- so on a layer with, say, 8 weak
+                        // prefill-exclusive picks (count 1-4 each) at the
+                        // front, they could still bump a genuinely strong
+                        // decode pick (count 50+) out of that layer's real
+                        // pinned budget, purely by position, not merit.
+                        //
+                        // Fixed by bounding prefill's UNCONDITIONAL
+                        // protection to prefill's own best
+                        // pin_global_floor_per_layer pick(s) (mirroring the
+                        // floor concept the global_topn remainder ranking
+                        // below already uses) -- everything else, whether
+                        // it came from prefill or decode, is pooled and
+                        // re-sorted by its own real count before being
+                        // sliced into tiers. A layer where prefill genuinely
+                        // IS concentrated naturally wins more of the
+                        // remainder ranking (its counts are real and
+                        // competitive); a flat layer correctly falls back
+                        // to being decided by decode's data alone. This is
+                        // effectively global-topk applied one level deeper,
+                        // to prefill's own contribution specifically, not
+                        // just the top-level pin_file/prefill_pin_file
+                        // split.
+                        auto it = by_layer.find(layer);
+                        std::unordered_set<int> decode_experts;
+                        if (it != by_layer.end()) {
+                            decode_experts.reserve(it->second.size());
+                            for (auto& e : it->second) decode_experts.insert(e.expert);
+                        }
+                        std::vector<StreamingEngine::UsageEntry> exclusive;  // pf_v already sorted by count desc
+                        for (auto& e : pf_v) {
+                            if (decode_experts.find(e.expert) == decode_experts.end())
+                                exclusive.push_back(e);  // prefill-exclusive only -- decode has no data for this one
+                        }
+                        size_t protected_n = std::min((size_t)std::max(0, config.pin_global_floor_per_layer),
+                                                       exclusive.size());
+                        std::vector<StreamingEngine::UsageEntry> merged(exclusive.begin(),
+                                                                          exclusive.begin() + protected_n);
+                        std::vector<StreamingEngine::UsageEntry> rest(exclusive.begin() + protected_n,
+                                                                        exclusive.end());
+                        if (it != by_layer.end())
+                            rest.insert(rest.end(), it->second.begin(), it->second.end());
+                        // stable_sort: THE fix -- this is the exact resort a
+                        // real run showed regressing decode from 0.68->0.62
+                        // tok/s. rest is `exclusive`'s remainder (often EMPTY
+                        // -- confirmed via a real usage-file check that this
+                        // prompt's prefill routing is a strict subset of
+                        // decode's own) plus a freshly-copied `it->second`.
+                        // Even when exclusive truly is empty, this is a NEW
+                        // vector object (different memory layout than
+                        // by_layer[layer]'s own in-place-sorted vector), and
+                        // plain std::sort gives no tie-break guarantee for
+                        // equal-count entries -- common at the low-count end
+                        // of a real usage file. Two sorts of "the same"
+                        // count-sorted data, on two different vector objects,
+                        // can legally disagree on tie order; under
+                        // pin_strategy=global_topn's hard top-N truncation
+                        // (see the [PIN] block below), that's enough to swap
+                        // which of several equal-count experts lands just
+                        // above vs. below the pin cutoff -- a real, measured
+                        // effect, not a theoretical one. stable_sort on an
+                        // already-count-sorted `it->second` preserves its
+                        // existing relative order for ties instead of
+                        // reshuffling them, so a functionally-empty merge
+                        // (the common case here) is now ALSO a byte-for-byte
+                        // no-op, matching prefill_pin_file being unset.
+                        std::stable_sort(rest.begin(), rest.end(),
+                                  [](const auto& a, const auto& b) { return a.count > b.count; });
+                        merged.insert(merged.end(), rest.begin(), rest.end());
+                        by_layer[layer] = std::move(merged);
+                        prefill_exclusive_protected += (int)protected_n;
+                        prefill_exclusive_competing += (int)(exclusive.size() - protected_n);
+                        ++prefill_layers_merged;
                     }
                     LOG_STREAM_INFO() << "[PIN] prefill_pin_file (" << config.prefill_pin_file << ", "
-                              << pf_entries.size() << " known experts): overriding ranking for "
-                              << prefill_layers_overridden << " layer(s); remaining layers use the "
-                                 "general pin_file ranking.\n";
+                              << pf_entries.size() << " known experts): merged for "
+                              << prefill_layers_merged << " layer(s) -- " << prefill_exclusive_protected
+                              << " entries got the unconditional bounded floor (pin_global_floor_per_layer="
+                              << config.pin_global_floor_per_layer << "/layer), " << prefill_exclusive_competing
+                              << " more prefill-exclusive entries went into honest count-based competition "
+                                 "against pin_file's own data (wins depend on real concentration, see "
+                                 "the [PIN] prefill_pin_file own concentration line above); remaining "
+                                 "layers use the general pin_file ranking alone.\n";
                 }
             }
 
@@ -969,7 +1302,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     for (int i = f; i < (int)v.size(); ++i)
                         remainder.push_back({layer, v[i].count});
                 }
-                std::sort(remainder.begin(), remainder.end(),
+                // stable_sort for the same reason as the merge block above.
+                // Residual, NOT fixed here (separate, smaller-impact issue,
+                // out of scope for the regression this fix targets): `by_layer`
+                // is an unordered_map, so the for-loop feeding `remainder`
+                // above already iterates layers in hash-bucket order, not a
+                // deterministic one -- stable_sort preserves whatever that
+                // input order was for count-ties, but doesn't make the input
+                // order itself reproducible run-to-run. A fully deterministic
+                // global ranking would need GlobalCand to also carry
+                // `expert` and use (layer,expert) as an explicit tie-break
+                // key, not just rely on input order -- a real, if lower-
+                // priority, follow-up.
+                std::stable_sort(remainder.begin(), remainder.end(),
                           [](const GlobalCand& a, const GlobalCand& b) { return a.count > b.count; });
                 // If pinned_vram_capacity isn't set, fall back to the REAL VRAM
                 // pool size (same quantity the per_layer_topk path's own "auto"
@@ -1045,6 +1390,29 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 }
             }
 
+            // Batched io_uring preload (see preload_batch_load's own
+            // comment for why): a dedicated Ring, separate from
+            // RAMSafetyManager's decode_uring_ring/LockFreePrefetcher's
+            // per-worker rings -- this whole [PIN] pass runs single-
+            // threaded on the main thread before those are ever touched
+            // (prefetcher.start() happens after this block, same as the
+            // Unified RAM-tier design's own startup-ordering rule), so no
+            // shared-ownership concern, just a plain local Ring.
+            constexpr int PRELOAD_URING_CHUNK = (int)(io_uring_backend::Ring::CAPACITY / 3);  // 21
+            io_uring_backend::Ring preload_ring;
+            bool preload_ring_ok = preload_ring.init();
+            if (preload_ring_ok) {
+                preload_ring.register_iowq_workers(
+                    config.expert_fetch_threads > 0 ? (unsigned)config.expert_fetch_threads : 8u);
+            }
+            int preload_uring_chunks_ok = 0, preload_uring_chunks_fallback = 0;
+            LOG_STREAM_INFO() << "[PIN] Batched io_uring preload: "
+                      << (preload_ring_ok
+                              ? ("ring ready, " + std::to_string(PRELOAD_URING_CHUNK) + " experts/submission")
+                              : std::string("ring unavailable, falling back to the original "
+                                            "single-expert-at-a-time load for this whole pass"))
+                      << "\n";
+
             LOG_STREAM_INFO() << "[PIN] Preloading from " << config.pin_file << " (" << entries.size()
                       << " known experts, max count " << maxc << "): "
                       << (global_topn ? "global_topn ranking (see above)"
@@ -1102,43 +1470,84 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // tier2_start correctly comes out to 0 too via the
                 // global_topn branch (layer_max) regardless of topk.
                 int tier2_start = (cpu_affinity || global_topn) ? layer_max : topk;
-                for (int i = 0; i < n && i < layer_max; ++i) {
-                    ++attempted;
-                    MoEExpertBlock scratch{};
-                    engine.load_expert_slab(v[i].layer, v[i].expert, scratch);
-                    if (scratch.slab_buffer && scratch.slab_capacity > 0) {
-                        ExpertLocation* loc = gpu.topology.upload_expert(
-                            v[i].layer, v[i].expert, scratch.slab_buffer, scratch.slab_capacity);
-                        if (loc && gpu.topology.pin_expert(v[i].layer, v[i].expert)) {
-                            ++pinned;
-                            ++total_pinned;  // Three-tier: track global pinned count
-                        } else if (!loc) {
-                            ++tier1_upload_fail;
-                        }
-                    } else {
-                        ++tier1_disk_fail;
+                for (int i = 0; i < n && i < layer_max; ) {
+                    int chunk_end = std::min(n, std::min(layer_max, i + PRELOAD_URING_CHUNK));
+                    int chunk_n = chunk_end - i;
+                    std::vector<MoEExpertBlock> scratch(chunk_n);
+                    bool batch_ok = false;
+                    if (preload_ring_ok) {
+                        std::vector<std::tuple<int, int, MoEExpertBlock*>> items;
+                        items.reserve(chunk_n);
+                        for (int j = 0; j < chunk_n; ++j)
+                            items.emplace_back(v[i + j].layer, v[i + j].expert, &scratch[j]);
+                        batch_ok = preload_batch_load(engine, preload_ring, items);
                     }
-                    if (scratch.slab_buffer) free(scratch.slab_buffer);
+                    if (batch_ok) {
+                        ++preload_uring_chunks_ok;
+                    } else {
+                        ++preload_uring_chunks_fallback;
+                        for (int j = 0; j < chunk_n; ++j)
+                            engine.load_expert_slab(v[i + j].layer, v[i + j].expert, scratch[j]);
+                    }
+                    for (int j = 0; j < chunk_n; ++j) {
+                        ++attempted;
+                        MoEExpertBlock& s = scratch[j];
+                        if (s.slab_buffer && s.slab_capacity > 0) {
+                            ExpertLocation* loc = gpu.topology.upload_expert(
+                                v[i + j].layer, v[i + j].expert, s.slab_buffer, s.slab_capacity);
+                            if (loc && gpu.topology.pin_expert(v[i + j].layer, v[i + j].expert)) {
+                                ++pinned;
+                                ++total_pinned;  // Three-tier: track global pinned count
+                            } else if (!loc) {
+                                ++tier1_upload_fail;
+                            }
+                        } else {
+                            ++tier1_disk_fail;
+                        }
+                        if (s.slab_buffer) free(s.slab_buffer);
+                    }
+                    i = chunk_end;
                 }
                 // Tier 2: next vram_lru_n ranks -> VRAM, but NOT pinned --
                 // a normal reactively-evictable slot, just pre-warmed
                 // instead of starting cold. Reuses the exact same
                 // upload_expert() call as Tier 1, just skips pin_expert().
-                for (int i = tier2_start; i < n && i < tier2_start + layer_vram_lru_n; ++i) {
-                    ++attempted;
-                    MoEExpertBlock scratch{};
-                    engine.load_expert_slab(v[i].layer, v[i].expert, scratch);
-                    if (scratch.slab_buffer && scratch.slab_capacity > 0) {
-                        if (gpu.topology.upload_expert(v[i].layer, v[i].expert,
-                                                        scratch.slab_buffer, scratch.slab_capacity)) {
-                            ++vram_lru;
-                        } else {
-                            ++tier2_upload_fail;
-                        }
-                    } else {
-                        ++tier2_disk_fail;
+                int tier2_end = std::min(n, tier2_start + layer_vram_lru_n);
+                for (int i = tier2_start; i < tier2_end; ) {
+                    int chunk_end = std::min(tier2_end, i + PRELOAD_URING_CHUNK);
+                    int chunk_n = chunk_end - i;
+                    std::vector<MoEExpertBlock> scratch(chunk_n);
+                    bool batch_ok = false;
+                    if (preload_ring_ok) {
+                        std::vector<std::tuple<int, int, MoEExpertBlock*>> items;
+                        items.reserve(chunk_n);
+                        for (int j = 0; j < chunk_n; ++j)
+                            items.emplace_back(v[i + j].layer, v[i + j].expert, &scratch[j]);
+                        batch_ok = preload_batch_load(engine, preload_ring, items);
                     }
-                    if (scratch.slab_buffer) free(scratch.slab_buffer);
+                    if (batch_ok) {
+                        ++preload_uring_chunks_ok;
+                    } else {
+                        ++preload_uring_chunks_fallback;
+                        for (int j = 0; j < chunk_n; ++j)
+                            engine.load_expert_slab(v[i + j].layer, v[i + j].expert, scratch[j]);
+                    }
+                    for (int j = 0; j < chunk_n; ++j) {
+                        ++attempted;
+                        MoEExpertBlock& s = scratch[j];
+                        if (s.slab_buffer && s.slab_capacity > 0) {
+                            if (gpu.topology.upload_expert(v[i + j].layer, v[i + j].expert,
+                                                            s.slab_buffer, s.slab_capacity)) {
+                                ++vram_lru;
+                            } else {
+                                ++tier2_upload_fail;
+                            }
+                        } else {
+                            ++tier2_disk_fail;
+                        }
+                        if (s.slab_buffer) free(s.slab_buffer);
+                    }
+                    i = chunk_end;
                 }
                 // Tier 3: next ram_n ranks -> host RAM tier directly.
                 // Bounded to ram_mgr.slots_per_layer (see comment above) and
@@ -1148,14 +1557,38 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // reactive fill has happened.
                 int ram_cap = std::min({ram_n, ram_mgr.cap_for_layer(layer),
                                          (int)engine.layers_experts[layer].size()});
-                int slot_idx = 0;
-                for (int i = tier2_start + layer_vram_lru_n; i < n && slot_idx < ram_cap; ++i, ++slot_idx) {
-                    ++attempted;
-                    MoEExpertBlock& slot = engine.layers_experts[layer][slot_idx];
-                    engine.load_expert_slab(v[i].layer, v[i].expert, slot);
-                    if (slot.slab_buffer && slot.slab_capacity > 0) {
-                        ++ram_preloaded;
-                        // Goes through RAMSafetyManager::preload_ram_slot
+                int ram_start_i = tier2_start + layer_vram_lru_n;
+                int ram_count = std::min(std::max(0, n - ram_start_i), ram_cap);
+                for (int off = 0; off < ram_count; ) {
+                    int chunk_n = std::min(PRELOAD_URING_CHUNK, ram_count - off);
+                    bool batch_ok = false;
+                    if (preload_ring_ok) {
+                        std::vector<std::tuple<int, int, MoEExpertBlock*>> items;
+                        items.reserve(chunk_n);
+                        for (int j = 0; j < chunk_n; ++j) {
+                            int i = ram_start_i + off + j, slot_idx = off + j;
+                            items.emplace_back(v[i].layer, v[i].expert,
+                                                &engine.layers_experts[layer][slot_idx]);
+                        }
+                        batch_ok = preload_batch_load(engine, preload_ring, items);
+                    }
+                    if (batch_ok) {
+                        ++preload_uring_chunks_ok;
+                    } else {
+                        ++preload_uring_chunks_fallback;
+                        for (int j = 0; j < chunk_n; ++j) {
+                            int i = ram_start_i + off + j, slot_idx = off + j;
+                            engine.load_expert_slab(v[i].layer, v[i].expert,
+                                                     engine.layers_experts[layer][slot_idx]);
+                        }
+                    }
+                    for (int j = 0; j < chunk_n; ++j) {
+                        int i = ram_start_i + off + j, slot_idx = off + j;
+                        ++attempted;
+                        MoEExpertBlock& slot = engine.layers_experts[layer][slot_idx];
+                        if (slot.slab_buffer && slot.slab_capacity > 0) {
+                            ++ram_preloaded;
+                            // Goes through RAMSafetyManager::preload_ram_slot
                         // (takes ram_mutex internally) rather than poking
                         // last_used_clock/hit_count/ram_expert_index
                         // directly -- closes a real gap: this used to be
@@ -1171,9 +1604,16 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         // (indistinguishable from "really not resident"),
                         // see that function's own comment.
                         ram_mgr.preload_ram_slot(engine, v[i].layer, v[i].expert, (size_t)slot_idx);
+                        }
                     }
+                    off += chunk_n;
                 }
             }
+            LOG_STREAM_INFO() << "[PIN] Batched io_uring preload: " << preload_uring_chunks_ok
+                      << " chunk(s) batched / " << preload_uring_chunks_fallback
+                      << " chunk(s) fell back to the original single-expert-at-a-time load (ring "
+                         "unavailable, a non-packed-format layer, or a short/failed read -- see "
+                         "preload_batch_load's own comment)\n";
             LOG_STREAM_INFO() << "[PIN] Preloaded " << pinned << " VRAM-pinned + " << vram_lru
                       << " VRAM-unpinned + " << ram_preloaded << " RAM (of " << attempted
                       << " attempted).\n";
@@ -1214,6 +1654,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // process lifetime (both are stack-local to main(), ram_mgr declared
     // first).
     prefetcher.ram_mgr = &ram_mgr;
+
+    // Dequant attn_k_b/attn_v_b (MLA's absorbed-attention weights) for
+    // every layer NOW, once, model load fully done but before any prompt
+    // is timed -- see warm_mla_absorb_cache's own comment
+    // (attention_layer.cpp) for the real measurement that motivated this
+    // (1.59s previously landing inside the FIRST prefill call's own
+    // "absorb" sub-phase, confirmed to be a one-time, model-only cost
+    // completely independent of the prompt). No-op/harmless for
+    // architectures that don't use MLA-absorbed attention (DeepSeek-V4's
+    // own dsv4_attention_gguf path uses a structurally separate woa_cache
+    // this doesn't touch; the function itself early-returns for any model
+    // with kv_lora<=0).
+    extern void warm_mla_absorb_cache(StreamingEngine& engine);
+    warm_mla_absorb_cache(engine);
 
     std::cout << "----------------------------------------\n";
     std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
@@ -1323,11 +1777,23 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // the NEXT run's startup preload (above) has real data to work from.
     // Best-effort, matches dump_usage's own contract (a failed write just
     // logs and continues -- not worth failing shutdown over).
-    engine.dump_usage(config.pin_file);
-    // Prefill-only histogram -- see route_freq_prefill's own comment.
-    // No-op (dump_usage_histogram's own empty-path guard) if
-    // prefill_pin_file isn't configured.
-    engine.dump_usage_prefill(config.prefill_pin_file);
+    // freeze_usage_stats (debug/A-B aid): skip both writes entirely so
+    // pin_file/prefill_pin_file stay exactly as they were at startup --
+    // see EngineConfig::freeze_usage_stats's own comment for why this
+    // exists (real, confirmed run-to-run drift in the accumulated
+    // histogram, even under an identical prompt).
+    if (!config.freeze_usage_stats) {
+        engine.dump_usage(config.pin_file);
+        // Prefill-only histogram -- see route_freq_prefill's own comment.
+        // No-op (dump_usage_histogram's own empty-path guard) if
+        // prefill_pin_file isn't configured.
+        engine.dump_usage_prefill(config.prefill_pin_file);
+    } else {
+        LOG_STREAM_INFO() << "[USAGE] freeze_usage_stats=true -- skipping usage-file write(s) this "
+                              "session (" << config.pin_file
+                          << (config.prefill_pin_file.empty() ? "" : (", " + config.prefill_pin_file))
+                          << " left untouched).\n";
+    }
 
     // Cache-churn summary for both tiers: which experts were swapped in/out
     // the most, and (VRAM only, since that's the only tier with a pinning
@@ -1384,6 +1850,9 @@ int main(int argc, char* argv[]) {
     std::string system_prompt_cli;
     std::string log_path_cli;
     std::string log_level_cli;
+    std::string trace_filter_cli;
+    bool trace_abort_on_nan_cli = false;
+    bool freeze_usage_stats_cli = false;
     float temp_cli = -1.0f, top_p_cli = -1.0f;  // -1 sentinel = "not given" (0.0 is a valid greedy-decode value)
 
     for (int i = 1; i < argc; ++i) {
@@ -1410,6 +1879,9 @@ int main(int argc, char* argv[]) {
         else if (arg == "--prefetch-threads" && i + 1 < argc) prefetch_worker_threads_cli = std::stoi(argv[++i]);
         else if (arg == "--log-path" && i + 1 < argc) log_path_cli = argv[++i];
         else if (arg == "--log-level" && i + 1 < argc) log_level_cli = argv[++i];
+        else if (arg == "--trace-filter" && i + 1 < argc) trace_filter_cli = argv[++i];
+        else if (arg == "--trace-abort-on-nan") trace_abort_on_nan_cli = true;
+        else if (arg == "--freeze-usage-stats") freeze_usage_stats_cli = true;
         else if (arg == "--temp" && i + 1 < argc) temp_cli = std::stof(argv[++i]);
         else if (arg == "--top_p" && i + 1 < argc) top_p_cli = std::stof(argv[++i]);
         else if (arg == "--help" || arg == "-h") {
@@ -1471,12 +1943,16 @@ int main(int argc, char* argv[]) {
     if (prefetch_worker_threads_cli > 0) config.prefetch_worker_threads = prefetch_worker_threads_cli;
     if (!log_path_cli.empty()) config.log_path = log_path_cli;
     if (!log_level_cli.empty()) config.log_level = log_level_cli;
+    if (!trace_filter_cli.empty()) config.trace_filter = trace_filter_cli;
+    if (trace_abort_on_nan_cli) config.trace_abort_on_nan = true;
+    if (freeze_usage_stats_cli) config.freeze_usage_stats = true;
     if (temp_cli >= 0.0f) config.temperature = temp_cli;
     if (top_p_cli >= 0.0f) config.top_p = top_p_cli;
 
     // Initialize the logger before anything else logs — empty log_path keeps
     // everything on stderr exactly as before.
     Logger::instance().init(config.log_path, config.log_level);
+    TraceFilter::instance().configure(config.trace_filter, config.trace_abort_on_nan);
 
     std::cout << "  MoEStream Engine initializing (C++23 mode)...\n";
     std::cout << "----------------------------------------\n";
@@ -1486,6 +1962,7 @@ int main(int argc, char* argv[]) {
     // compute onto the CPU reference path. Enable it BEFORE run_engine so every
     // dense_proj / rmsnorm_proj / expert_ffn dispatch sees the flag.
     if (config.cpu_only) enable_cpu_only_mode();
+    if (config.dsv4_outproj_gpu) enable_dsv4_outproj_gpu();
 
     auto outcome = run_engine(config);
     if (!outcome) {

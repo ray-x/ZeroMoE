@@ -352,6 +352,42 @@ int cmd_dma(int argc, char **argv) {
                    "discovered: "
                 << candidates.size() << ", 1-combined-eligible (interleaved "
                    "on disk): " << combined_eligible.size() << "\n";
+
+      // Alignment report: per-expert offsets are base_tensor_offset +
+      // expert_id * per_expert_bytes, with NO re-alignment per expert (see
+      // this loop's own g.g_off/u_off/d_off computation above) -- whether
+      // that leaves every real read exactly O_DIRECT-aligned or not
+      // depends entirely on whether per_expert_bytes (itself block-quant-
+      // derived, so always a whole number of bytes) happens to be a
+      // multiple of model.direct_io_alignment. Reported once per model,
+      // real numbers, not estimated -- answers "how often does a real
+      // per-expert tensor start on a non-aligned boundary" directly.
+      {
+        uint64_t align = model.direct_io_alignment;
+        auto report_one = [&](const char *proj, uint64_t per_expert_bytes) {
+          uint64_t rem = per_expert_bytes % align;
+          std::cout << "  " << proj << ": " << per_expert_bytes
+                    << " bytes/expert (" << (per_expert_bytes / 1024.0 / 1024.0)
+                    << " MiB), % " << align << " = " << rem
+                    << (rem == 0 ? "  -- every expert index lands on an aligned "
+                                   "offset (0 slack, ALL experts, by construction: "
+                                   "offset = E * per_expert_bytes, and per_expert_"
+                                   "bytes itself is alignment-clean)"
+                                 : "  -- MISALIGNED: every expert index E>0 whose "
+                                   "(E * per_expert_bytes) % align != 0 pays real "
+                                   "front/back slack padding on this projection's "
+                                   "read")
+                    << "\n";
+        };
+        if (!candidates.empty()) {
+          // One representative expert's sizes stand in for the whole model
+          // (gb/ub/db are per-LAYER-projection constants, uniform across
+          // every expert in that layer for this codebase's quant scheme).
+          report_one("gate", candidates[0].gb);
+          report_one("up", candidates[0].ub);
+          report_one("down", candidates[0].db);
+        }
+      }
     }
 
     if (candidates.empty()) {
@@ -469,6 +505,24 @@ int cmd_dma(int argc, char **argv) {
       double combined_bytes = 0, combined_ns = 0;
       double separate_bytes = 0, separate_ns = 0;
       bool combined_ok_all = true, separate_ok_all = true;
+      // Per-submission latency (ns), one entry per submit_and_wait call --
+      // lets us report the actual STALL distribution (min/p50/p90/p99/max)
+      // a single real submission experiences, not just the aggregate
+      // bytes/aggregate-time throughput figure above (which hides tail
+      // latency entirely).
+      std::vector<double> combined_lat_ns, separate_lat_ns;
+      combined_lat_ns.reserve((size_t)submissions);
+      separate_lat_ns.reserve((size_t)submissions);
+      // Bytes actually moved by that SAME submission -- paired index-for-
+      // index with the _lat_ns vectors above, so we can report the
+      // INSTANTANEOUS per-submission GB/s distribution, not just one
+      // blended aggregate-bytes/aggregate-time average across every
+      // submission in the sweep (which hides how much any single real
+      // transfer varies -- exactly what averaging across a whole run hides
+      // in production too).
+      std::vector<double> combined_bytes_call, separate_bytes_call;
+      combined_bytes_call.reserve((size_t)submissions);
+      separate_bytes_call.reserve((size_t)submissions);
 
       std::vector<io_uring_backend::ReadRequest> reqs_c(N);
       std::vector<ssize_t> res_c(N);
@@ -513,6 +567,10 @@ int cmd_dma(int argc, char **argv) {
               combined_bytes += (double)reqs_c[i].len;
             }
             combined_ns += ns;
+            combined_lat_ns.push_back(ns);
+            double call_bytes = 0;
+            for (int i = 0; i < N; ++i) call_bytes += (double)reqs_c[i].len;
+            combined_bytes_call.push_back(call_bytes);
           }
         }
 
@@ -542,6 +600,10 @@ int cmd_dma(int argc, char **argv) {
               separate_bytes += (double)reqs_s[i].len;
             }
             separate_ns += ns;
+            separate_lat_ns.push_back(ns);
+            double call_bytes = 0;
+            for (int i = 0; i < 3 * N; ++i) call_bytes += (double)reqs_s[i].len;
+            separate_bytes_call.push_back(call_bytes);
           }
         }
       }
@@ -562,6 +624,43 @@ int cmd_dma(int argc, char **argv) {
       if (have_combined && combined_ok_all && separate_ok_all && s_gbps > 0)
         std::cout << std::setw(10) << (std::ostringstream() << std::fixed << std::setprecision(2) << (c_gbps / s_gbps) << "x").str();
       std::cout << "\n";
+
+      // Per-submission STALL distribution (ms) -- what a single real
+      // submit_and_wait call actually costs, tail included, not just the
+      // aggregate bytes/aggregate-time throughput figure above.
+      auto print_latency_dist = [](const char *label, std::vector<double> &ns) {
+        if (ns.empty()) return;
+        std::sort(ns.begin(), ns.end());
+        auto pct = [&](double p) { return ns[(size_t)(p * (double)(ns.size() - 1))] / 1e6; };
+        std::cout << "        " << label << " latency(ms): min=" << std::fixed << std::setprecision(3)
+                   << ns.front() / 1e6 << " p50=" << pct(0.50) << " p90=" << pct(0.90)
+                   << " p99=" << pct(0.99) << " max=" << ns.back() / 1e6 << "\n";
+      };
+      // Per-submission INSTANTANEOUS GB/s -- bytes and latency from the SAME
+      // call, so this is "how fast was this one real transfer", not the
+      // blended aggregate-bytes/aggregate-time figure printed above. A wide
+      // min..max spread here means the device genuinely runs at different
+      // speeds call-to-call even in this isolated, single-process benchmark
+      // (queue-depth/NVMe-internal-state effects) -- separate from, and a
+      // lower bound under, whatever additional spread real production sees
+      // from sharing the device/PCIe/CPU with the rest of the live engine.
+      auto print_bw_dist = [](const char *label, std::vector<double> &bytes, std::vector<double> &ns) {
+        if (bytes.empty() || bytes.size() != ns.size()) return;
+        std::vector<double> gbps(bytes.size());
+        for (size_t i = 0; i < bytes.size(); ++i)
+          gbps[i] = ns[i] > 0 ? (bytes[i] / 1e9) / (ns[i] / 1e9) : 0.0;
+        std::sort(gbps.begin(), gbps.end());
+        auto pct = [&](double p) { return gbps[(size_t)(p * (double)(gbps.size() - 1))]; };
+        std::cout << "        " << label << " per-call GB/s: min=" << std::fixed << std::setprecision(3)
+                   << gbps.front() << " p10=" << pct(0.10) << " p50=" << pct(0.50)
+                   << " p90=" << pct(0.90) << " max=" << gbps.back() << "\n";
+      };
+      print_latency_dist("3-separate", separate_lat_ns);
+      print_bw_dist("3-separate", separate_bytes_call, separate_lat_ns);
+      if (have_combined) {
+        print_latency_dist("1-combined", combined_lat_ns);
+        print_bw_dist("1-combined", combined_bytes_call, combined_lat_ns);
+      }
     }
   }
 

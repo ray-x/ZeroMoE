@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <cstdlib>
 #include <cuda_runtime.h>
+#include <optional>
 
 // Per-GPU configuration
 struct GpuConfig {
@@ -61,6 +62,168 @@ struct EngineConfig {
     // (should collapse toward ~0 when this is on) and overall Prefill
     // wall-clock before trusting it. See CLAUDE.md.
     bool prefill_warm_via_prefetcher = false;
+
+    // Only meaningful when prefill_warm_via_prefetcher is also true --
+    // separately gates the cross-layer opportunistic RAM->VRAM promotion
+    // follow-up (LayerScratch::pending_prefill_promotions,
+    // execution_layer.cpp) from the hint-pushing itself.
+    //
+    // REAL A/B, CONCLUSIVE, DEFAULT OFF (2026-08-12): four runs ON all
+    // landed at prefill=0.56 tok/s; OFF landed at 0.60, matching the
+    // pre-feature baseline. Root cause confirmed: this pass and Phase 2's
+    // own hint-pushing loop compete for the same free-VRAM-slot budget --
+    // running eager promotion first starves later layers of hints
+    // entirely (n_prefill_hint_pushed nearly halved, 420 vs ~930 ON vs
+    // OFF), losing the RAM-prefetch overlap the whole feature exists to
+    // provide. See engine.hpp's mirror of this field for the full
+    // writeup, and CLAUDE.md.
+    bool prefill_opportunistic_promote = false;
+
+    // Decode-time analogue of prefill's own upload_expert_active_async +
+    // sync_active_layer_batch pre-warm (see execution_layer.cpp's Phase-3
+    // ram_needed_k dispatch loop): batches a TOKEN's own real active-layer
+    // VRAM misses into small groups of async H2D issues + one shared
+    // cudaStreamSynchronize per group, instead of dispatch_expert_k's
+    // existing fully-sequential blocking cudaMemcpy per miss. Real DMA-level
+    // win confirmed via tests/bench_dma_sync_vs_async.cu on both GPUs in
+    // this box (2-16%, biggest at small sizes on the faster link) -- see
+    // that file's header comment.
+    //
+    // DEFAULT OFF, and NOT a simple reinstatement of the first attempt: an
+    // earlier, unbounded version of this (batching a whole token's ~8
+    // candidates in one shot) caused a REAL production incident on real
+    // hardware -- host RAM exhaustion, swap thrashing, and an eventual
+    // freeze (SLOW-HOST-ALLOC times climbing past 1s, SLOW-PICKUP prefetch
+    // backlog exploding to 30+ seconds, matching a classic memory-pressure
+    // death spiral). No confirmed single root-cause line was found in the
+    // recovered debug.log (specifically: no "[RAM-CLAIM] ... falling back
+    // to slot 0" ever fired, ruling out the first suspected mechanism), but
+    // one real code bug WAS found and fixed as part of re-adding this
+    // (upload_expert_active_async was being called without checking
+    // slab_capacity > 0, only slab_buffer != nullptr -- see the "[GPU]
+    // Invalid upload_expert_active_async parameters" ERROR line that
+    // incident's log showed). Given host_ram_gb is commonly tuned close to
+    // physical RAM on this project's own real hardware (e.g. 120GB of
+    // 128GB, ~8GB margin -- see CLAUDE.md's GLM-5.2 settled config), even a
+    // small, otherwise-harmless shift in PEAK simultaneous in-flight memory
+    // (several slab-buffer resizes clustering together under batching,
+    // instead of serializing one-at-a-time the way the old fully-sequential
+    // sync path forced) is plausible as a contributing factor on a config
+    // running that close to the ceiling. decode_async_prewarm_max_batch
+    // (below) exists specifically to bound that peak footprint;
+    // decode_async_prewarm itself defaults OFF so this can be re-validated
+    // deliberately (start small: low max_batch, generous host_ram_gb
+    // headroom, watch SLOW-HOST-ALLOC/SLOW-PICKUP) rather than silently
+    // re-enabled by an upgrade. UNVERIFIED ON REAL HARDWARE as of this
+    // writing -- the safer, capped version has not yet been tested end to
+    // end on a real run.
+    bool decode_async_prewarm = false;
+
+    // Caps how many of a token's active-layer VRAM misses get batched into
+    // ONE async-issue-then-sync group at a time when decode_async_prewarm
+    // is on -- e.g. 8 real misses become ceil(8/3)=3 groups of <=3 instead
+    // of one group of 8. Directly bounds peak simultaneous in-flight
+    // footprint (RAM slots pinned + active-layer slots mid-DMA at once) at
+    // the cost of losing some of the batching win for tokens with more
+    // misses than this -- a deliberate trade after the unbounded version's
+    // real incident (see decode_async_prewarm's own comment). 3 chosen to
+    // roughly match tests/bench_dma_sync_vs_async.cu's own tested n=4
+    // (closest tested value that's still conservatively smaller), not
+    // derived from any real per-layer-miss-count data on this specific
+    // knob -- a reasonable starting guess, not a tuned value.
+    int decode_async_prewarm_max_batch = 3;
+
+    // MLA absorbed-attention qabsorb (Q_absorbed = q_nope @ WUK) BF16 batched
+    // GPU fast-path (CudaManager::upload_wuk_bf16/qabsorb_bf16_batched_host,
+    // cuda_manager.hpp), replacing the CPU per-head matmul() loop
+    // (attention_layer.cpp) with one cublasGemmStridedBatchedEx call across
+    // all H heads. Real motivation: qabsorb measured at ~60ms/decode-token
+    // on GLM-5.2 real hardware (see CLAUDE.md's decode-vs-prefill attn
+    // breakdown), 100% CPU with zero GPU path today -- WUK/WUV are cached
+    // F32 host vectors (ensure_wuk_wuv_cached), never dispatched through
+    // dense_proj's existing quant/GPU pipeline at all.
+    //
+    // Deliberately per-model/hardware configurable, not a blanket default,
+    // per direct user observation: DeepSeek-V4 (dsv4_attention_gguf, the
+    // structurally SEPARATE raw/SWA MLA path with no absorption at all --
+    // no WUK/WUV, this flag has literally no effect there) already runs its
+    // CPU attention path much faster relative to GLM-5.2's absorbed
+    // mla_attention_absorbed_gguf, so a GPU win measured on one model/GPU
+    // pairing should not be assumed to generalize -- always re-verify with a
+    // real same-prompt A/B (compare CPU-only decode tok/s against this flag
+    // on, watching the "MLA qabsorb BF16 batched GPU path" shutdown report
+    // line for real call counts / fallback rate) before trusting it for a
+    // given model+hardware combination. Default OFF (matches this project's
+    // standing convention for anything not yet real-hardware-verified).
+    bool attn_qabsorb_gpu = false;
+
+    // Per-layer VRAM budget cap for attn_qabsorb_gpu's one-time WUK BF16
+    // upload (warm_mla_absorb_cache, attention_layer.cpp) -- a real,
+    // measured free-VRAM query (cudaMemGetInfo) at startup, not an assumed
+    // headroom figure, is still capped by this ceiling so the upload can
+    // never eat into VRAM some OTHER subsystem (expert cache, dense pool)
+    // was counting on, even on a box with lots of apparent free VRAM at the
+    // moment this particular warmup step runs. A layer whose WUK doesn't
+    // fit under the remaining budget just stays on the CPU qabsorb path
+    // (n_qabsorb_gpu_fallback_cpu) -- never a hard failure.
+    double attn_qabsorb_gpu_max_vram_gb = 2.0;
+
+    // attn_score_gpu: 3-GEMM + softmax kernel replacing the CPU AVX-512
+    // per-head loop for MLA's score phase (QK^T-over-latent + softmax +
+    // weighted-V, mla_attention_absorbed_gguf's attn_score block --
+    // attention_layer.cpp). Structurally simpler than qabsorb: MLA's latent
+    // K/V (Lc/Rc) is SHARED across every head, so this collapses into 3
+    // PLAIN (non-batched) GEMMs -- no cublasGemmStridedBatchedEx needed.
+    // Real isolated bench at GLM-5.2's actual dims (H=64 kvl=512 rope=64,
+    // tests/bench_score_cpu_vs_gpu.cu): 5x-51x speedup, GROWING with
+    // context length (CPU cost is O(T), GPU stays flat ~0.08-0.13ms/call
+    // regardless of T) -- unlike qabsorb, whose cost is context-independent.
+    // Decode (S=1) only: prefill (S>1) has a DIFFERENT past_context_len per
+    // row within the same batch, out of scope for this first cut, and
+    // decode is where score's unbounded-with-context cost actually bites.
+    // Same DeepSeek-V4-vs-GLM-5.2 configurability rationale as
+    // attn_qabsorb_gpu -- V4's dsv4_attention_gguf bounds this phase with a
+    // sliding window (see CLAUDE.md), so it's already cheap there and this
+    // flag has no reason to default on for that model. Default OFF (matches
+    // this project's standing convention for anything not yet real-
+    // hardware-verified end-to-end).
+    bool attn_score_gpu = false;
+
+    // Per-layer VRAM budget cap for attn_score_gpu's persistent KV latent
+    // cache GPU mirror (d_lc_by_layer/d_rc_by_layer, cuda_manager.hpp),
+    // allocated once at startup (warm_mla_absorb_cache) sized to
+    // engine.max_t so it never needs a mid-generation realloc. Same
+    // cudaMemGetInfo-checked, never-assume-headroom discipline as
+    // attn_qabsorb_gpu_max_vram_gb. A layer whose mirror doesn't fit just
+    // stays on the CPU score path (n_score_gpu_fallback_cpu) -- never a
+    // hard failure. Note this budget is typically larger in absolute GB
+    // than qabsorb's own (the mirror holds the WHOLE context, not one
+    // layer's static weights) -- e.g. at context_size=4096, kv_lora=512:
+    // 4096*512*4 bytes = 8.4MB just for Lc per layer, before Rc.
+    double attn_score_gpu_max_vram_gb = 2.0;
+
+    // Caps the KV latent cache GPU mirror's ALLOCATED size independently of
+    // context_size/engine.max_t -- 0 (default) means "no cap, size to the
+    // full context_size" (the original behavior). A nonzero value smaller
+    // than context_size lets the mirror (and the WUV BF16 upload that
+    // competes with it for the SAME attn_score_gpu_max_vram_gb budget pool)
+    // use much less VRAM, at the cost of the score GPU path silently
+    // falling back to CPU (score_gpu_batched_host's existing `T >
+    // lc_rc_max_t_by_layer[layer_idx]` bounds check, already tested) for
+    // any decode position beyond this cap -- the MODEL's real context_size
+    // is completely unaffected, only how much of it gets the GPU speedup.
+    // Added after a real production run on a VRAM-scarce GPU (RTX 5060 Ti,
+    // 1.82GB free at this point in startup) showed qabsorb_gpu (0.98GB) +
+    // the full-context_size=4096 mirror (0.74GB F32) left only 0.10GB for
+    // WUV's own 1.22GB need (78 layers), so only 6/78 layers got WUV
+    // coverage -- capping the mirror instead of shrinking context_size
+    // (which would also cap the model's real usable conversation length)
+    // recovers most of that VRAM for WUV without that downside. The real
+    // ceiling on WUV coverage while qabsorb_gpu stays enabled is fixed by
+    // WUV's own footprint alone (~50/78 layers = 64% on that same GPU, even
+    // at cap=0 mirror) -- this can get close to that ceiling, not exceed
+    // it; disabling attn_qabsorb_gpu is the only way to reach 78/78.
+    int attn_score_gpu_max_context = 0;
 
     // Per-layer version of cpu_only: these specific MoE layers never
     // dispatch on GPU and their routed experts are never uploaded/promoted
@@ -224,6 +387,11 @@ struct EngineConfig {
     // fixed at 3 (every active_prefetch() submission is exactly one
     // hint's gate/up/down, never more, so more workers there than 3
     // couldn't parallelize anything further regardless of this setting).
+    // 2026-08-14: batching multiple hints into one prefetch-worker
+    // submission (PREFETCH_BATCH_HINTS) was tried and reverted -- real A/B
+    // showed zero blended-throughput change and a real phase_c regression
+    // (head-of-line blocking). See async_prefetcher.hpp's top-of-file
+    // comment for the full finding before re-attempting this.
     int io_uring_workers = 8;
 
     // Pad Phase B's real cache-miss submission (RAMSafetyManager::
@@ -255,6 +423,31 @@ struct EngineConfig {
     // tools/gguf_dma.cpp's own --experts sweep clamp uses, for the
     // identical reason.
     int disk_batch_padding_target = 8;
+
+    // V1 of disk_batch_padding (above) only ever claims genuinely FREE RAM
+    // slots -- a real, confirmed limitation once the RAM tier saturates: a
+    // real GLM-5.2 run showed 9138 "no-free-slot" skips against only 8
+    // successful pads in one request, because a RAM tier sized to stay
+    // under a fixed host_ram_gb budget runs essentially full almost the
+    // entire time, not just during early ramp-up. This flag lets padding
+    // ALSO reclaim a RAM slot whose expert is already VRAM-resident
+    // (also_in_vram==true) once free slots run out, instead of giving up.
+    // Safe for the SAME reason claim_or_wait's own real-miss victim scoring
+    // already treats also_in_vram slots as score=0 (the cheapest possible
+    // eviction, see eviction_score's own comment): decode's real dispatch
+    // resolves VRAM residency FIRST (GpuTopology::find_expert), before ever
+    // consulting the RAM tier, so this expert's real dispatch doesn't touch
+    // this RAM slot at all while it stays VRAM-resident -- the RAM copy is
+    // provably redundant at the moment of eviction. The one residual risk
+    // (VRAM independently evicts its own copy later, and a FUTURE RAM-tier
+    // lookup then misses and re-fetches from disk, having lost the RAM
+    // copy here) is the exact same tradeoff a real miss's own victim
+    // selection already accepts today -- padding is a strictly lower-
+    // priority, purely speculative consumer of that same tradeoff, not a
+    // new risk class. Default false (opt-in, unverified on real hardware --
+    // needs a real A/B against disk_batch_padding_evict_dup=false on the
+    // same prompt/config before treating this as a default-on win).
+    bool disk_batch_padding_evict_dup = false;
 
     // Number of concurrent async prefetcher worker threads pulling hints
     // off the SPSC queue and servicing them (disk read + optional async
@@ -291,6 +484,46 @@ struct EngineConfig {
     // Host RAM (DDR) budget for the MoE expert LRU cache, in GB.
     // 0 = auto-detect (88% of currently-available system memory).
     double host_ram_gb = 0.0;
+
+    // Persistent RAM-slab pinning budget, in GB. 0 (default) = OFF, every
+    // slab stays plain pageable memory (pre-2026-08-15 behavior).
+    //
+    // What it buys: cudaMemcpyAsync from UNPINNED host memory cannot
+    // actually run asynchronously -- the CUDA driver stages it through its
+    // own internal pinned buffer, synchronously, on the calling thread.
+    // That is exactly what made upload_expert_active_async's supposedly
+    // "small/cheap, no wait" issue call cost 18.96s across ~13.9k calls on
+    // a real GLM-5.2 run. Registering each slab ONCE (here) rather than per
+    // transfer lets that DMA overlap real compute: measured 0.15s issue +
+    // 5.26s batch-sync when the source was pinned, vs 18.96s blocking when
+    // it wasn't -- projected ~14s/request, 0.57 -> ~0.72 tok/s.
+    //
+    // Why a BUDGET rather than just pinning everything: pinned pages can
+    // never be reclaimed by the kernel, and host_ram_gb is routinely tuned
+    // close to physical RAM (120 of 125GB on the box this was developed on
+    // -- see host_ram_gb's own freeze-incident history). Pinning does not
+    // allocate anything new (these pages are already resident), so the risk
+    // is reduced OS headroom, not extra consumption -- but that is still a
+    // real risk worth capping and stepping up deliberately rather than
+    // enabling wholesale. Start well below host_ram_gb (e.g. 40), confirm
+    // stability and the [REQUEST] line's own active_layer_prewarm_issue=
+    // drop, then raise. Registration costs ~11 GB/s, one time, during
+    // preload -- a large budget adds seconds to startup, not to any request.
+    double ram_pinned_budget_gb = 0.0;
+
+    // Optional SECOND physical copy of the same model, on a DIFFERENT drive
+    // (e.g. "/data/models/UD-IQ2_M_align" while model_path is on another
+    // NVMe). Empty (default) = single-drive behavior, unchanged.
+    //
+    // Expert reads dominate both startup preload and decode-time stalls, and
+    // one NVMe saturates around 2.2-2.5 GB/s for this model's real access
+    // shape. Two independent devices have independent queues, so striping is
+    // additive bandwidth, not a redistribution of one ceiling -- measured on
+    // the development box: primary 2.25-2.52 GB/s, mirror 1.98-2.15 GB/s,
+    // combined ceiling ~1.85x. The copy must be byte-identical (all reads use
+    // the PRIMARY's tensor offsets); GGUFModel::open_mirror enforces this with
+    // a per-shard size check and refuses to stripe any shard that differs.
+    std::string mirror_model_path;
 
     // Log every host RAM cache HIT for the MoE expert cache (high volume —
     // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY
@@ -329,6 +562,26 @@ struct EngineConfig {
     // prefill has been recorded into it yet). Written at shutdown
     // alongside pin_file, same accumulate-across-sessions semantics.
     std::string prefill_pin_file;
+
+    // Debug/A-B-testing aid: when true, skip the shutdown writes to
+    // pin_file AND prefill_pin_file entirely -- both files are still READ
+    // at startup (preload behaves exactly as configured), just never
+    // overwritten. Without this, both usage files accumulate additively
+    // on every single run (see dump_usage_histogram's own comment) --
+    // confirmed on real hardware to genuinely drift the startup pin/
+    // preload ranking run-to-run even under a literally identical,
+    // temperature=0 prompt (two runs a few minutes apart logged
+    // .moestream_usage growing from 12958 to 12988 known experts, +45 on
+    // the single hottest entry's count -- GPU reduction order isn't
+    // bit-exact call-to-call, and this model's IQ2_XXS routing margins are
+    // thin enough for that jitter to occasionally flip a close top-8 tie).
+    // That drift is real signal to accumulate across genuinely different
+    // sessions, but it's exactly the wrong thing to have moving underneath
+    // you mid-A/B when isolating a SINGLE variable (e.g. a pin-merge logic
+    // change) -- set this true, keep re-running against the same frozen
+    // files, and only the variable actually under test can explain a
+    // result. Default false (unchanged accumulate-forever behavior).
+    bool freeze_usage_stats = false;
 
     // How the pinned_vram_capacity budget gets DISTRIBUTED across layers at
     // startup preload. Two options, both driven by the same pin_file usage
@@ -386,6 +639,28 @@ struct EngineConfig {
     // Three-tier VRAM caching configuration
     // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion
     bool move_on_promotion = true;
+    // Only consulted when move_on_promotion=false (COPY semantics). 0.0
+    // (default) preserves plain COPY behavior: a RAM slot stays occupied
+    // for as long as reactive eviction pressure allows, relying entirely
+    // on also_in_vram-based scoring to reclaim it once some OTHER expert's
+    // miss needs the slot -- which may never happen for a lightly-trafficked
+    // layer, on a long enough session. Set to a fraction in (0.0, 1.0] to
+    // bound that: once a layer's RAM-tier occupancy (filled slots /
+    // cap_for_layer(layer)) reaches this threshold, a newly-CONFIRMED
+    // promotion (finish_sync_promotion, called the instant a sync VRAM
+    // upload lands) is proactively reclaimed immediately -- same field-
+    // clearing as MOVE, not a new mechanism -- instead of being left
+    // occupied-but-redundant. Gives graceful degradation on a tighter
+    // host_ram_gb budget (e.g. a bigger model, or less RAM) without fully
+    // reverting to MOVE and losing COPY's own real, measured throughput win
+    // (see CLAUDE.md) on setups with enough headroom to not need this at
+    // all. Only ever applied at the ONE call site verified safe for it
+    // (execution_layer.cpp's finish_sync_promotion sites, confirmed to
+    // never read slab_buffer/host_ptr fields again in the same call after
+    // this fires) -- deliberately NOT applied to do_promote_ram_slot_to_vram's
+    // own COPY branches, which are reached from a different, NOT
+    // confirmed-safe context (see CLAUDE.md for the correctness reasoning).
+    double ram_copy_reclaim_threshold = 0.0;
     // Maximum number of permanently pinned experts (was ~600, targeting 1024)
     int pinned_vram_capacity = 1024;
     // Active layer area: temporary workspace for current-layer experts
@@ -430,6 +705,72 @@ struct EngineConfig {
     // dump_report()'s "VRAM->RAM demote:" line and Expert cache hit
     // rate/disk-read totals for the real effect).
     bool vram_evict_demote_to_ram = false;
+
+    // dsv4_attention_gguf's grouped output-projection weight (attn_output_a,
+    // "WOA") gets a ONE-TIME persistent VRAM upload per layer, and its
+    // decode-time (S==1) matmul runs via cuBLAS GEMV on GPU instead of the
+    // CPU AVX-512+OMP path. Root-caused on real hardware: this projection's
+    // ~134MB/layer weight has to be re-read from host RAM on every single
+    // decode token (no other layer's work fits in cache between two calls
+    // to the same layer), making it memory-bandwidth-bound on CPU (~6.8s of
+    // a real 40-token run) -- moving the weight to VRAM once and reusing it
+    // trades CPU's ~30-50GB/s DDR bandwidth for GPU's ~900+GB/s, measured
+    // 12x+ faster in a standalone microbenchmark (tests/
+    // bench_outproj_cpu_vs_gpu.cu) using this exact shape and access
+    // pattern, with numerically verified-matching output before this was
+    // wired into the live path. Default false (opt-in) because the VRAM
+    // cost is real and persistent, not reclaimable like the RAM/VRAM expert
+    // caches: all 43 layers' WOA resident simultaneously is
+    // ~134MB*43=~5.8GB, committed for the whole process lifetime the moment
+    // each layer is first used, on the SAME CoreEngine GPU that also holds
+    // dense weights/KV cache/BF16 fast-path buffers -- on a tight VRAM
+    // budget (see this file's own dense_gb/kv_cache_gb sizing) this could
+    // starve something else rather than helping. Falls back to the existing
+    // CPU path per-layer (not a hard failure) if the VRAM upload fails.
+    bool dsv4_outproj_gpu = false;
+
+    // Pilot-driven RAM->VRAM speculative promotion. Calibrated against the
+    // "ram-only" per-rank metric (PerfCounters::n_pilot_ram_only_hits_by_
+    // rank / n_pilot_ram_only_checks_by_rank, printed as "Pilot recall by
+    // rank (DEPTH-1, ram-only)") -- the ONE metric that measures the actual
+    // population this decision acts on: pilot's l+1 rank-k picks that are
+    // already RAM-resident but NOT yet VRAM-resident at prediction time.
+    // Deliberately NOT calibrated against the "overall" or "fetch-worthy"
+    // metrics printed alongside it -- those measure disjoint populations
+    // (all 4 residency buckets mixed, and the needs-fetch-only bucket that
+    // drives disk prefetch, respectively) that say nothing about whether
+    // promoting an already-RAM expert into VRAM is worth its cost.
+    //
+    // Exactly two mutually exclusive modes; setting both in TOML disables
+    // BOTH (with a startup warning) rather than silently picking one --
+    // see the validation block below.
+    //
+    // Static mode: unconditionally promote pilot's rank [0, top_k) picks
+    // whenever classified into the "already_ram" bucket. Default 0 = off.
+    int ram_vram_promote_top_k = 0;
+
+    // Adaptive mode: self-calibrating from the session's OWN live "ram-
+    // only" counters (no static per-model tuning needed -- these counters
+    // are process-lifetime, i.e. naturally reset each session). Walks
+    // rank = 0, 1, 2... promoting while BOTH:
+    //   n_pilot_ram_only_checks_by_rank[rank] >= ram_vram_promote_min_samples
+    //   AND (hits/checks) at that rank >= ram_vram_promote_adaptive_threshold
+    // stopping at the first rank that fails either condition (contiguous-
+    // prefix cutoff -- a later rank clearing the bar after an earlier one
+    // failed it is not enough, matching the observed monotonic-decay shape
+    // of this metric in every real capture so far). The sample-count check
+    // doubles as the cold-start guard: early in a session, or for a rank
+    // the "already_ram" bucket rarely reaches, there's no separate branch
+    // -- it just fails the same floor check an established-but-inaccurate
+    // rank would fail, and the cutoff stops there until more data arrives.
+    bool ram_vram_promote_adaptive = false;
+    double ram_vram_promote_adaptive_threshold = 0.30; // 30%, provisional --
+        // re-tune once more than one real capture exists (single-run data
+        // so far: k0=44.2% k1=43.0% k2=30.5% k3=25.3% k4=22.8% k5=16.7%,
+        // GLM-... see CLAUDE.md; NOT yet validated across a fresh-vs-repeat
+        // prompt spread the way the fetch-worthy metric was).
+    int ram_vram_promote_min_samples = 30; // per-rank floor before that
+        // rank's own accuracy is trusted enough to act on.
 
     // Redistributes RAMSafetyManager's fixed total RAM-tier budget
     // (uniform slots_per_layer * n_layers) across layers proportional to
@@ -494,6 +835,28 @@ struct EngineConfig {
     // above this value is still honored for that one region specifically.
     int omp_max_threads = 0;
 
+    // Dedicated OMP team size for JUST attention_layer.cpp's causal
+    // score/softmax/value-aggregate loop (mla_attention_absorbed_gguf's
+    // `#pragma omp parallel for collapse(2)`) -- separate from omp_max_
+    // threads above, which this region would otherwise share with every
+    // other parallel region in the process. Motivated by a real-hardware
+    // finding (2026-08-13): raising expert_fetch_threads/omp_max_threads
+    // 8->10 for a real, measured disk-I/O win (decode 0.68->0.70 tok/s)
+    // simultaneously raised score's own per-token cost from ~74.8 to
+    // ~83.5ms/token in that SAME real run -- score is the one attention
+    // sub-step with no GPU path at all (see CLAUDE.md), so it competes
+    // directly with expert_fetch_threads' background disk-read threads for
+    // the same physical cores once omp_max_threads is raised alongside it.
+    // 0 (default) = no override, falls back to whatever omp_max_threads'
+    // own effective value already is (see dense_dispatch.hpp's
+    // attn_score_threads() for the exact fallback) -- a config that never
+    // sets this behaves identically to before this field existed. Set
+    // LOWER than omp_max_threads to trade some of score's own parallelism
+    // back for less contention against expert_fetch_threads;
+    // UNVERIFIED which value (if any) is actually a net win here -- this
+    // is a real, previously-uninvestigated lever, not yet A/B tested.
+    int attn_score_threads = 0;
+
     // When true, main.cpp's REPL feeds stdin content to the tokenizer
     // VERBATIM -- skips the GLM-3/4-style chat-template wrap
     // ([gMASK]<sop><|user|>\n{msg}<|assistant|>\n) it would otherwise apply
@@ -534,6 +897,19 @@ struct EngineConfig {
     // and shows only startup info and real warnings/errors.
     std::string log_path;
     std::string log_level = "INFO";
+
+    // Tensor-trace debugging (include/tensor_trace.hpp), a llama.cpp
+    // eval-callback analog for this engine's imperative forward pass.
+    // trace_filter is a comma-separated list of tags (e.g. "HC,MLA") matched
+    // as an anchored regex prefix against each VERBOSE trace call site's own
+    // tag ("HC", "MLA", "EXPERT-GPU", "SILU-TRACE-GPU", ...); empty (default)
+    // matches every tag, i.e. no filtering beyond log_level=VERBOSE itself.
+    // trace_abort_on_nan hard-aborts the process at the FIRST tensor a
+    // NaN/Inf checker flags, instead of logging an error and continuing --
+    // useful for stopping right where a numerical bug originates rather than
+    // scrolling through pages of downstream fallout.
+    std::string trace_filter;
+    bool trace_abort_on_nan = false;
 
     // GPU configuration
     std::vector<GpuConfig> gpus;
@@ -587,6 +963,20 @@ struct Table {
     std::unordered_map<std::string, Value> values;
 
     bool has(const std::string& key) const { return values.count(key) > 0; }
+
+    // Every get_*() above silently falls back to `def` on a type mismatch,
+    // by design (same "def" spirit noted on get_int_array) -- but that
+    // makes a present-but-wrong-type key (e.g. `prefetch_pilot_depth =
+    // true` where an integer was expected) INDISTINGUISHABLE from the key
+    // being absent entirely, so a real typo silently vanishes with no
+    // warning anywhere. This lets a call site tell the two apart and warn
+    // specifically on "present but wrong type", without changing any
+    // existing get_*()'s own default-on-mismatch behavior (many call sites
+    // rely on that leniency and shouldn't need to change).
+    std::optional<Value::Type> get_type(const std::string& key) const {
+        auto it = values.find(key);
+        return (it != values.end()) ? std::optional<Value::Type>(it->second.type) : std::nullopt;
+    }
 
     std::string get_str(const std::string& key, const std::string& def = "") const {
         auto it = values.find(key);
@@ -740,6 +1130,22 @@ inline bool EngineConfig::load(const std::string& path) {
     cpu_affinity_layers = doc.root.get_int_array("cpu_affinity_layers");
     prefetch_pilot_k    = doc.root.get_int("prefetch_pilot_k", prefetch_pilot_k);
     prefetch_pilot_k_per_layer = doc.root.get_int_array("prefetch_pilot_k_per_layer");
+    // Real incident this caught: a config had `prefetch_pilot_depth = true`
+    // (a boolean, presumably intended as an enable/disable toggle -- an easy
+    // mistake given how many OTHER flags in this same config format ARE
+    // plain booleans, e.g. io_uring/direct_io/disk_batch_padding). get_int()
+    // silently ignores a non-Number value and falls back to its default
+    // (1), so that config had been silently running DEPTH-1-only the whole
+    // time with zero indication anything was wrong -- caught only by
+    // manually reading the raw TOML, not by any startup log. Closed via
+    // get_type(): a present-but-wrong-type key is now distinguishable from
+    // an absent one and warned about explicitly, before get_int()'s own
+    // silent fallback ever runs.
+    if (auto t = doc.root.get_type("prefetch_pilot_depth"); t && *t != toml::Value::Number) {
+        LOG_WARN("[CONFIG] prefetch_pilot_depth is set but is not a number (e.g. a boolean like "
+                 "`true` was found) -- this key takes an integer, 1 or 2 (e.g. "
+                 "prefetch_pilot_depth = 2), not a toggle -- ignoring, falling back to 1\n");
+    }
     prefetch_pilot_depth = doc.root.get_int("prefetch_pilot_depth", prefetch_pilot_depth);
     if (prefetch_pilot_depth != 1 && prefetch_pilot_depth != 2) {
         LOG_WARN("[CONFIG] prefetch_pilot_depth=%d is invalid (must be 1 or 2) -- falling back to 1\n",
@@ -750,27 +1156,65 @@ inline bool EngineConfig::load(const std::string& path) {
     direct_io        = doc.root.get_bool("direct_io", direct_io);
     cuda_cufile      = doc.root.get_bool("cuda_cufile", cuda_cufile);
     prefill_warm_via_prefetcher = doc.root.get_bool("prefill_warm_via_prefetcher", prefill_warm_via_prefetcher);
+    prefill_opportunistic_promote = doc.root.get_bool("prefill_opportunistic_promote", prefill_opportunistic_promote);
+    decode_async_prewarm = doc.root.get_bool("decode_async_prewarm", decode_async_prewarm);
+    decode_async_prewarm_max_batch = doc.root.get_int("decode_async_prewarm_max_batch", decode_async_prewarm_max_batch);
+    if (decode_async_prewarm_max_batch < 1) {
+        LOG_WARN("[CONFIG] decode_async_prewarm_max_batch must be >= 1 (got %d) -- clamping to 1\n",
+                 decode_async_prewarm_max_batch);
+        decode_async_prewarm_max_batch = 1;
+    }
+    attn_qabsorb_gpu = doc.root.get_bool("attn_qabsorb_gpu", attn_qabsorb_gpu);
+    attn_qabsorb_gpu_max_vram_gb = doc.root.get_double("attn_qabsorb_gpu_max_vram_gb", attn_qabsorb_gpu_max_vram_gb);
+    if (attn_qabsorb_gpu_max_vram_gb < 0.0) {
+        LOG_WARN("[CONFIG] attn_qabsorb_gpu_max_vram_gb must be >= 0 (got %.2f) -- clamping to 0\n",
+                 attn_qabsorb_gpu_max_vram_gb);
+        attn_qabsorb_gpu_max_vram_gb = 0.0;
+    }
+    attn_score_gpu = doc.root.get_bool("attn_score_gpu", attn_score_gpu);
+    attn_score_gpu_max_vram_gb = doc.root.get_double("attn_score_gpu_max_vram_gb", attn_score_gpu_max_vram_gb);
+    if (attn_score_gpu_max_vram_gb < 0.0) {
+        LOG_WARN("[CONFIG] attn_score_gpu_max_vram_gb must be >= 0 (got %.2f) -- clamping to 0\n",
+                 attn_score_gpu_max_vram_gb);
+        attn_score_gpu_max_vram_gb = 0.0;
+    }
+    attn_score_gpu_max_context = doc.root.get_int("attn_score_gpu_max_context", attn_score_gpu_max_context);
+    if (attn_score_gpu_max_context < 0) {
+        LOG_WARN("[CONFIG] attn_score_gpu_max_context must be >= 0 (got %d) -- clamping to 0 (no cap)\n",
+                 attn_score_gpu_max_context);
+        attn_score_gpu_max_context = 0;
+    }
     unpacked_expert_format = doc.root.get_bool("unpacked_expert_format", unpacked_expert_format);
     io_uring         = doc.root.get_bool("io_uring", io_uring);
     io_uring_workers = doc.root.get_int("io_uring_workers", io_uring_workers);
     disk_batch_padding        = doc.root.get_bool("disk_batch_padding", disk_batch_padding);
     disk_batch_padding_target = doc.root.get_int("disk_batch_padding_target", disk_batch_padding_target);
+    disk_batch_padding_evict_dup = doc.root.get_bool("disk_batch_padding_evict_dup", disk_batch_padding_evict_dup);
     prefetch_worker_threads = doc.root.get_int("prefetch_worker_threads", prefetch_worker_threads);
     host_ram_gb      = doc.root.get_double("host_ram_gb", host_ram_gb);
+    mirror_model_path = doc.root.get_str("mirror_model_path", mirror_model_path);
+    ram_pinned_budget_gb = doc.root.get_double("ram_pinned_budget_gb", ram_pinned_budget_gb);
     verbose_moe_log  = doc.root.get_bool("verbose_moe_log", verbose_moe_log);
     promote_hit_threshold = doc.root.get_int("promote_hit_threshold", promote_hit_threshold);
     pin_threshold    = doc.root.get_int("pin_threshold", pin_threshold);
     pin_file         = doc.root.get_str("pin_file", pin_file);
     prefill_pin_file = doc.root.get_str("prefill_pin_file", prefill_pin_file);
+    freeze_usage_stats = doc.root.get_bool("freeze_usage_stats", freeze_usage_stats);
     pin_topk_per_layer = doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
     pin_strategy = doc.root.get_str("pin_strategy", pin_strategy);
     pin_global_floor_per_layer = doc.root.get_int("pin_global_floor_per_layer", pin_global_floor_per_layer);
     pin_vram_lru_fraction = doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
     pin_ram_fraction      = doc.root.get_double("pin_ram_fraction", pin_ram_fraction);
     vram_evict_demote_to_ram = doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
+    dsv4_outproj_gpu = doc.root.get_bool("dsv4_outproj_gpu", dsv4_outproj_gpu);
+    ram_vram_promote_top_k = doc.root.get_int("ram_vram_promote_top_k", ram_vram_promote_top_k);
+    ram_vram_promote_adaptive = doc.root.get_bool("ram_vram_promote_adaptive", ram_vram_promote_adaptive);
+    ram_vram_promote_adaptive_threshold = doc.root.get_double("ram_vram_promote_adaptive_threshold", ram_vram_promote_adaptive_threshold);
+    ram_vram_promote_min_samples = doc.root.get_int("ram_vram_promote_min_samples", ram_vram_promote_min_samples);
     ram_cache_layer_adaptive = doc.root.get_bool("ram_cache_layer_adaptive", ram_cache_layer_adaptive);
     expert_fetch_threads = doc.root.get_int("expert_fetch_threads", expert_fetch_threads);
     omp_max_threads = doc.root.get_int("omp_max_threads", omp_max_threads);
+    attn_score_threads = doc.root.get_int("attn_score_threads", attn_score_threads);
     // NOTE: these four were previously missing from parsing entirely --
     // every configs/*.toml's `pinned_vram_capacity`/`move_on_promotion`/
     // `active_layer_capacity`/`use_active_layer_area` lines were silently
@@ -780,6 +1224,7 @@ inline bool EngineConfig::load(const std::string& path) {
     // no warning.
     pinned_vram_capacity = doc.root.get_int("pinned_vram_capacity", pinned_vram_capacity);
     move_on_promotion    = doc.root.get_bool("move_on_promotion", move_on_promotion);
+    ram_copy_reclaim_threshold = doc.root.get_double("ram_copy_reclaim_threshold", ram_copy_reclaim_threshold);
     active_layer_capacity = doc.root.get_int("active_layer_capacity", active_layer_capacity);
     use_active_layer_area = doc.root.get_bool("use_active_layer_area", use_active_layer_area);
     active_layer_promote_hit_threshold = doc.root.get_int("active_layer_promote_hit_threshold",
@@ -788,6 +1233,8 @@ inline bool EngineConfig::load(const std::string& path) {
     system_prompt        = doc.root.get_str("system_prompt", system_prompt);
     log_path         = doc.root.get_str("log_path", log_path);
     log_level        = doc.root.get_str("log_level", log_level);
+    trace_filter     = doc.root.get_str("trace_filter", trace_filter);
+    trace_abort_on_nan = doc.root.get_bool("trace_abort_on_nan", trace_abort_on_nan);
 
     for (auto& gt : doc.gpu_tables) {
         GpuConfig gc;
@@ -894,6 +1341,14 @@ inline bool EngineConfig::validate() {
         pin_strategy = "per_layer_topk";
     }
 
+    if (ram_vram_promote_top_k > 0 && ram_vram_promote_adaptive) {
+        std::cerr << "[CONFIG] ram_vram_promote_top_k and ram_vram_promote_adaptive are "
+                  << "mutually exclusive but both were set -- disabling BOTH rather than "
+                  << "guessing which one you meant. Set exactly one.\n";
+        ram_vram_promote_top_k = 0;
+        ram_vram_promote_adaptive = false;
+    }
+
     if (disk_batch_padding && !io_uring) {
         std::cerr << "[CONFIG] disk_batch_padding=true requires io_uring=true (padding rides the "
                   << "decode thread's own io_uring ring, RAMSafetyManager::decode_uring_ring) -- "
@@ -922,6 +1377,24 @@ inline void EngineConfig::print() const {
               << (cuda_cufile ? " (falls back to RAM-mediated upload if GDS/nvidia-fs unavailable -- see [CUFILE] log)" : "") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefill warm-up via prefetcher: " << (prefill_warm_via_prefetcher ? "ON" : "off (legacy synchronous)")
               << "\n";
+    if (prefill_warm_via_prefetcher)
+        LOG_STREAM_INFO() << "[CONFIG] Prefill opportunistic VRAM promotion: "
+                  << (prefill_opportunistic_promote ? "ON" : "off (hints land in RAM only until Phase 3's own synchronous dispatch)")
+                  << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Decode async pre-warm (batched active-layer H2D for decode-time misses): "
+              << (decode_async_prewarm ? "ON" : "off (legacy sequential blocking upload)")
+              << (decode_async_prewarm ? (", max_batch=" + std::to_string(decode_async_prewarm_max_batch)) : std::string())
+              << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] MLA qabsorb BF16 batched GPU path: "
+              << (attn_qabsorb_gpu ? "ON" : "off (CPU per-head matmul() loop)")
+              << (attn_qabsorb_gpu ? (", max_vram=" + std::to_string(attn_qabsorb_gpu_max_vram_gb) + "GB")
+                                    : std::string())
+              << " (no effect on DeepSeek-V4 -- dsv4_attention_gguf has no absorption/WUK at all)\n";
+    LOG_STREAM_INFO() << "[CONFIG] MLA score GPU path (3-GEMM+softmax, decode only): "
+              << (attn_score_gpu ? "ON" : "off (CPU AVX-512 per-head loop)")
+              << (attn_score_gpu ? (", max_vram=" + std::to_string(attn_score_gpu_max_vram_gb) + "GB")
+                                  : std::string())
+              << " (DeepSeek-V4's windowed score is already cheap on CPU -- see attn_score_gpu's own comment)\n";
     LOG_STREAM_INFO() << "[CONFIG] io_uring (batched prefetcher reads): " << (io_uring ? "requested" : "off")
               << (io_uring ? " (falls back to sequential preads if unsupported -- see [IO-URING] log)" : "") << "\n";
     if (io_uring) {
@@ -929,7 +1402,11 @@ inline void EngineConfig::print() const {
     }
     if (disk_batch_padding)
         LOG_STREAM_INFO() << "[CONFIG] Disk batch padding: ON (target " << disk_batch_padding_target
-                           << " experts/submission, speculative reads from route_freq)\n";
+                           << " experts/submission, speculative reads from route_freq"
+                           << (disk_batch_padding_evict_dup
+                                   ? ", CAN evict also-VRAM-resident RAM slots once free slots run out"
+                                   : ", free-slots-only (V1)")
+                           << ")\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch worker threads: " << prefetch_worker_threads << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Prefetch pilot_k (hints/layer transition): default=" << prefetch_pilot_k
                        << (prefetch_pilot_k_per_layer.empty() ? "" : ", " + std::to_string(prefetch_pilot_k_per_layer.size())
@@ -966,16 +1443,39 @@ inline void EngineConfig::print() const {
                       : (" (top-" + (pin_topk_per_layer > 0 ? std::to_string(pin_topk_per_layer) : std::string("auto")) + "/layer)"))
               << ", next " << (pin_vram_lru_fraction * 100.0) << "% of VRAM tier capacity (unpinned)"
               << ", next " << (pin_ram_fraction * 100.0) << "% of RAM tier capacity\n";
+    if (freeze_usage_stats)
+        LOG_STREAM_INFO() << "[CONFIG] Usage-file writes: FROZEN (pin_file/prefill_pin_file read at startup "
+                              "as configured, but NOT overwritten at shutdown -- for controlled A/B testing "
+                              "against a fixed ranking)\n";
     LOG_STREAM_INFO() << "[CONFIG] VRAM evict -> RAM demote: "
               << (vram_evict_demote_to_ram ? "ON (D2H-salvage evicted experts into the RAM tier)" : "off") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] DeepSeek-V4 outproj GPU dispatch: "
+              << (dsv4_outproj_gpu ? "ON (cuBLAS GEMV, weight VRAM-resident once per layer, ~5.8GB total)" : "off") << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] RAM->VRAM speculative promotion: "
+              << (ram_vram_promote_top_k > 0
+                      ? ("static top-" + std::to_string(ram_vram_promote_top_k))
+                      : (ram_vram_promote_adaptive
+                             ? ("adaptive (threshold " + std::to_string(ram_vram_promote_adaptive_threshold * 100.0)
+                                + "%, min_samples " + std::to_string(ram_vram_promote_min_samples) + "/rank)")
+                             : std::string("off")))
+              << "\n";
     LOG_STREAM_INFO() << "[CONFIG] RAM cache layer-adaptive: "
               << (ram_cache_layer_adaptive ? "ON (per-layer capacity by historical need, not uniform)" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Expert fetch threads: " << expert_fetch_threads << "\n";
     LOG_STREAM_INFO() << "[CONFIG] OMP max threads (process-wide default): "
               << (omp_max_threads > 0 ? std::to_string(omp_max_threads) : std::string("auto"))
               << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Attn score threads (dedicated, attention_layer.cpp's causal "
+                          "score loop only): "
+              << (attn_score_threads > 0 ? std::to_string(attn_score_threads)
+                                         : std::string("no override (uses the process-wide default above)"))
+              << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Pinned VRAM capacity: " << pinned_vram_capacity
-              << " | move_on_promotion: " << (move_on_promotion ? "MOVE" : "COPY") << "\n";
+              << " | move_on_promotion: " << (move_on_promotion ? "MOVE" : "COPY")
+              << (!move_on_promotion && ram_copy_reclaim_threshold > 0.0
+                  ? (" (ram_copy_reclaim_threshold=" + std::to_string(ram_copy_reclaim_threshold) + ")")
+                  : std::string(""))
+              << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Active layer area: "
               << (use_active_layer_area ? std::to_string(active_layer_capacity) + " slots, promote at "
                                            + std::to_string(active_layer_promote_hit_threshold) + " hit(s)"
@@ -986,6 +1486,8 @@ inline void EngineConfig::print() const {
     LOG_STREAM_INFO() << "[CONFIG] Verbose MoE cache logging: " << (verbose_moe_log ? "on" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] Log level: " << log_level
                << " | Log path: " << (log_path.empty() ? "(stderr)" : log_path) << "\n";
+    LOG_STREAM_INFO() << "[CONFIG] Trace filter: " << (trace_filter.empty() ? "(all)" : trace_filter)
+               << " | Trace abort-on-nan: " << (trace_abort_on_nan ? "on" : "off") << "\n";
     for (size_t i = 0; i < gpus.size(); ++i) {
         const auto& g = gpus[i];
         LOG_STREAM_INFO() << "[CONFIG] GPU " << g.device_id << " (" << g.name << ") — " << g.role
@@ -1056,6 +1558,89 @@ cuda_cufile    = false
 # legacy behavior); A/B via t_prefill_warm_time / overall Prefill wall time
 # before trusting it.
 prefill_warm_via_prefetcher = false
+# prefill_opportunistic_promote: only meaningful when
+# prefill_warm_via_prefetcher=true above. When true, a hint that lands in
+# RAM before Phase 3 needs it gets opportunistically promoted to VRAM
+# right then (cross-layer follow-up, decode-thread), instead of waiting
+# for Phase 3's own synchronous dispatch to do it. REAL A/B, CONCLUSIVE,
+# DEFAULT OFF: four runs ON landed at prefill=0.56 tok/s; OFF landed at
+# 0.60 (matches the pre-feature baseline). Root cause: this pass competes
+# with Phase 2's own hint-pushing loop for the same free-VRAM-slot budget
+# -- eager promotion starves LATER layers of hints entirely (hint volume
+# nearly halved, 420 vs ~930), losing the RAM-prefetch overlap the whole
+# feature exists to provide. Not a promotion-accuracy problem (every
+# candidate is still a confirmed real pick, never a wrong bet) -- a
+# resource-contention one. See CLAUDE.md.
+prefill_opportunistic_promote = false
+
+# decode_async_prewarm: decode-time analogue of prefill's own
+# upload_expert_active_async batch pre-warm -- batches a token's own real
+# active-layer VRAM misses into small async-issue-then-sync groups (size
+# capped by decode_async_prewarm_max_batch below) instead of dispatch_expert_
+# k's existing fully-sequential blocking cudaMemcpy per miss. DEFAULT OFF:
+# an earlier, UNBOUNDED version of this (batch the whole token's ~8
+# candidates in one shot) caused a real production incident -- host RAM
+# exhaustion, swap thrashing, eventual freeze -- on a config running
+# host_ram_gb close to physical RAM. UNVERIFIED ON REAL HARDWARE as of this
+# writing even in this capped form; enable deliberately, with real host_ram_gb
+# headroom, and watch [SLOW-HOST-ALLOC]/[SLOW-PICKUP] for signs of memory
+# pressure before trusting it for a real run. See CLAUDE.md and
+# tests/bench_dma_sync_vs_async.cu.
+decode_async_prewarm = false
+# decode_async_prewarm_max_batch: caps how many misses get batched into one
+# async-issue-then-sync group at a time when decode_async_prewarm=true --
+# bounds peak simultaneous in-flight footprint (RAM slots pinned + active-
+# layer slots mid-DMA at once), at the cost of losing some batching benefit
+# for tokens with more misses than this. A starting guess (roughly matches
+# the bench file's own tested n=4), not a tuned value.
+decode_async_prewarm_max_batch = 3
+
+# attn_qabsorb_gpu: batched BF16 GPU GEMM (cublasGemmStridedBatchedEx, all
+# attention heads in one call) for MLA's absorbed-query step (Q_absorbed =
+# q_nope @ WUK), replacing the CPU per-head matmul() loop. Real measured cost
+# on GLM-5.2: ~60ms/decode-token, 100% CPU today. No effect on DeepSeek-V4
+# (dsv4_attention_gguf has no absorption/WUK at all -- structurally separate
+# path). Per-model/hardware configurable rather than a blanket default:
+# DeepSeek-V4's own CPU attention path already runs much faster relative to
+# GLM-5.2's absorbed path on this hardware, so a win measured on one
+# model+GPU pairing should not be assumed to generalize -- always re-verify
+# with a real same-prompt A/B, watching the "MLA qabsorb BF16 batched GPU
+# path" shutdown report line for real call counts / CPU-fallback rate.
+attn_qabsorb_gpu = false
+# attn_qabsorb_gpu_max_vram_gb: hard ceiling on the one-time startup WUK BF16
+# upload (warm_mla_absorb_cache), on top of a real cudaMemGetInfo headroom
+# check -- a layer whose WUK doesn't fit under this budget just stays on the
+# CPU qabsorb path (see n_qabsorb_gpu_fallback_cpu in the shutdown report),
+# never a hard failure.
+attn_qabsorb_gpu_max_vram_gb = 2.0
+
+# attn_score_gpu: 3-GEMM + softmax GPU path for MLA's score phase (decode
+# only), replacing the CPU AVX-512 per-head loop -- real isolated bench at
+# GLM-5.2's actual dims showed 5x-51x speedup, GROWING with context length
+# (unlike qabsorb, this phase's CPU cost is unbounded with context for
+# GLM-5.2), see tests/bench_score_cpu_vs_gpu.cu and CLAUDE.md for the full
+# writeup. Same per-model caveat as attn_qabsorb_gpu: DeepSeek-V4 bounds
+# this phase with a sliding window, so it's already cheap there -- always
+# re-verify with a real same-prompt A/B, watching the "MLA score GPU path"
+# shutdown report line for real call counts / CPU-fallback rate.
+attn_score_gpu = false
+# attn_score_gpu_max_vram_gb: hard ceiling on the persistent per-layer KV
+# latent cache GPU mirror (d_lc_by_layer/d_rc_by_layer), allocated once at
+# startup sized to context_size so it never needs a mid-generation realloc
+# -- on top of a real cudaMemGetInfo headroom check. A layer whose mirror
+# doesn't fit under this budget just stays on the CPU score path (see
+# n_score_gpu_fallback_cpu in the shutdown report), never a hard failure.
+attn_score_gpu_max_vram_gb = 2.0
+# attn_score_gpu_max_context: caps the KV latent cache GPU mirror's
+# ALLOCATED size independently of context_size -- 0 (default) means no cap
+# (mirror sized to the full context_size). On a VRAM-scarce GPU, lowering
+# this frees room for WUV's own BF16 upload (which competes for the SAME
+# attn_score_gpu_max_vram_gb budget) WITHOUT reducing the model's real
+# context_size -- the score GPU path just falls back to CPU for any decode
+# position beyond this cap, a correctness-safe, already-tested fallback.
+# See attn_score_gpu_max_context's own comment (engine_config.hpp) for the
+# real VRAM math this was added to solve.
+attn_score_gpu_max_context = 0
 
 # unpacked_expert_format: set true ONLY for a model directory produced by
 # `gguf_tool pack --unpack` (per-expert tensors, gate/up/down laid out
@@ -1118,6 +1703,18 @@ disk_batch_padding = false
 # the worst-case (packed-format, 3 requests/expert) bound that keeps total
 # requests within the ring's hard capacity regardless of format.
 disk_batch_padding_target = 8
+
+# disk_batch_padding_evict_dup: V1 of disk_batch_padding above only ever
+# claims genuinely FREE RAM slots -- once the RAM tier saturates (the normal
+# steady state under any fixed host_ram_gb budget, not just early ramp-up)
+# it can barely engage at all (watch n_pad_no_free_slot vs n_pad_reads_issued
+# in the shutdown report). This lets padding ALSO reclaim a RAM slot whose
+# expert is already VRAM-resident (a provably redundant RAM copy -- decode's
+# real dispatch resolves VRAM residency first and never touches this RAM
+# slot while it stays VRAM-resident) once free slots run out. Default false,
+# unverified on real hardware -- A/B against disk_batch_padding_evict_dup=
+# false (same disk_batch_padding=true baseline) before trusting it.
+disk_batch_padding_evict_dup = false
 
 # prefetch_worker_threads: number of concurrent worker threads servicing
 # the async prefetcher's hint queue (disk read + optional async H2D
@@ -1196,6 +1793,19 @@ pin_file = ".moestream_usage"
 # (falling back to pin_file per-layer where this file has no data yet).
 # Empty (default) = not used, falls back entirely to pin_file.
 # prefill_pin_file = ".moestream_usage_prefill"
+# freeze_usage_stats: debug/A-B-testing aid. When true, pin_file and
+# prefill_pin_file are both still READ at startup exactly as configured,
+# but NEITHER is overwritten at shutdown -- stops the additive
+# accumulate-forever behavior from shifting the startup pin/preload
+# ranking underneath you between runs. Real drift was confirmed on
+# hardware even under a literally identical, temperature=0 prompt (GPU
+# reduction order isn't bit-exact call-to-call, and this model's IQ2_XXS
+# routing margins are thin enough for that jitter to occasionally flip a
+# close top-8 tie) -- turn this on whenever comparing two configs/code
+# paths against each other, so only the thing actually under test can
+# explain the result. Leave off (default) for normal use, where that
+# accumulation across genuinely different sessions is the whole point.
+freeze_usage_stats = false
 # pin_topk_per_layer: how many of each layer's hottest experts to preload.
 # 0 = auto-size to fill available VRAM expert-cache capacity. Only used when
 # pin_strategy="per_layer_topk" below.
@@ -1243,6 +1853,34 @@ pin_ram_fraction = 0.0
 # again). New, untested on real hardware, opt-in only -- default false.
 vram_evict_demote_to_ram = false
 
+# dsv4_outproj_gpu: run DeepSeek-V4 attention's grouped output projection
+# (attn_output_a) on GPU via cuBLAS instead of CPU -- the weight is
+# memory-bandwidth-bound on CPU (re-read from host RAM every decode token),
+# measured 12x+ faster once VRAM-resident. Costs ~5.8GB VRAM, committed
+# permanently once each layer's weight is first used (not reclaimable like
+# the expert caches) -- only enable if you have real headroom on the
+# CoreEngine GPU (see dense_gb/kv_cache_gb sizing above). Default false.
+dsv4_outproj_gpu = false
+
+# ram_vram_promote_top_k / ram_vram_promote_adaptive: pilot-driven RAM->VRAM
+# speculative promotion, calibrated against the "ram-only" per-rank metric
+# (see the "Pilot recall by rank (DEPTH-1, ram-only" line in the run log) -- NOT the
+# overall or fetch-worthy metrics printed next to it, which measure
+# different populations. Mutually exclusive: setting both disables both
+# (with a startup warning). Both default off/0 -- no behavior change from
+# the pre-existing reactive-hit-count promotion until one is set.
+#
+# Static: unconditionally promote pilot's rank [0, top_k) "already_ram"
+# picks. 0 = off.
+ram_vram_promote_top_k = 0
+# Adaptive: self-calibrate from this session's own live counters -- promote
+# rank 0, 1, 2... while that rank's accuracy >= adaptive_threshold AND its
+# sample count >= min_samples, stopping at the first rank that fails either
+# (contiguous-prefix cutoff, doubles as the cold-start guard).
+ram_vram_promote_adaptive = false
+ram_vram_promote_adaptive_threshold = 0.30
+ram_vram_promote_min_samples = 30
+
 # ram_cache_layer_adaptive: give layers with flatter/less-predictable
 # routing more RAM-tier cache slots and concentrated layers fewer, instead
 # of splitting the total budget evenly -- uses the same pin_file usage
@@ -1274,6 +1912,22 @@ expert_fetch_threads = 4
 # over the process default).
 omp_max_threads = 0
 
+# attn_score_threads: dedicated OMP team size for JUST attention_layer.cpp's
+# causal score/softmax/value-aggregate loop -- separate from omp_max_threads
+# above, which this region would otherwise share with every other parallel
+# region. Motivated by a real-hardware finding (2026-08-13): raising
+# expert_fetch_threads/omp_max_threads 8->10 for a real, measured disk-I/O
+# win (decode 0.68->0.70 tok/s) simultaneously raised this loop's own
+# per-token cost ~74.8->83.5ms/token in the SAME real run -- this is the one
+# attention sub-step with no GPU path at all, so it directly competes with
+# expert_fetch_threads' background disk-read threads for the same physical
+# cores once omp_max_threads is raised alongside it. 0 = no override, falls
+# back to whatever omp_max_threads' own effective value already is. Set
+# LOWER than omp_max_threads to trade some of this loop's own parallelism
+# back for less contention -- UNVERIFIED which value (if any) is a net win,
+# a real, previously-uninvestigated lever, not yet A/B tested.
+attn_score_threads = 0
+
 # Three-tier VRAM caching. pinned_vram_capacity is a global ceiling on
 # permanently-pinned experts (see pin_topk_per_layer above -- the effective
 # per-layer pin count is min(pin_topk_per_layer, floor(pinned_vram_capacity
@@ -1284,6 +1938,18 @@ omp_max_threads = 0
 # report if this regresses).
 pinned_vram_capacity = 1024
 move_on_promotion = true
+
+# Only consulted when move_on_promotion=false (COPY semantics). Real A/B on
+# real hardware (see CLAUDE.md) showed COPY can be a genuine throughput win
+# over MOVE when host_ram_gb has enough headroom for the model -- but on a
+# tighter budget (bigger model, less RAM), COPY-mode RAM slots only get
+# reclaimed reactively (whenever some OTHER expert's miss needs the exact
+# same slot), which can leave redundant RAM+VRAM copies sitting unreclaimed
+# for a whole session on a lightly-trafficked layer. Set to e.g. 0.9 to
+# proactively reclaim a layer's redundant slots once that layer's RAM
+# occupancy crosses 90%, instead of relying purely on reactive pressure.
+# 0.0 (default) preserves plain COPY behavior, no threshold applied.
+ram_copy_reclaim_threshold = 0.0
 
 # Active layer area: a small dedicated VRAM buffer holding the CURRENT
 # layer's decode-time cold-miss experts, so a not-yet-proven-hot expert can
@@ -1312,6 +1978,17 @@ active_layer_promote_hit_threshold = 1
 # notices) -- both are very high volume, intended for active debugging only.
 # log_path = "output.log"
 log_level = "INFO"
+
+# Tensor-trace debugging (a llama.cpp eval-callback analog for this engine's
+# imperative forward pass). Requires log_level = "VERBOSE" to have any
+# effect. trace_filter narrows VERBOSE tensor-trace output to specific tags
+# (comma-separated, matched as an anchored prefix regex against each trace
+# call site's own tag, e.g. "HC", "MLA", "EXPERT-GPU", "SILU-TRACE-GPU") --
+# empty (default) shows every tag. trace_abort_on_nan hard-aborts the
+# process at the FIRST tensor a NaN/Inf checker flags, instead of logging
+# and continuing.
+# trace_filter = "HC,MLA"
+trace_abort_on_nan = false
 
 # GPU 0: Core Engine — Dense layers + KV cache
 [[gpus]]

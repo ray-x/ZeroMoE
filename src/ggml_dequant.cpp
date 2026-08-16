@@ -188,6 +188,17 @@ extern "C" int ggml_quantize_row_ref(uint32_t type, const float *src, void *dst,
   case 39:
     quantize_row_mxfp4_ref(src, (block_mxfp4 *)dst, n);
     return 1;
+  // Q8_0: a real single-row _ref quantizer, same simple shape as the cases
+  // above (no imatrix, no init call needed). Was missing entirely --
+  // src/main_test.cpp's Test 5 had tolerance handling already prepared for
+  // this type (see its comment on Q6_K/Q8_0's lossy-CPU-reference caveat)
+  // but no case ever actually ran, since this function silently returned 0
+  // and the test just SKIPPED. Added while touching cuda/q8_0_matmul.cu's
+  // reuse-across-S kernel, so that change has real GPU-vs-CPU-reference
+  // coverage instead of relying on lint + a live model run alone.
+  case 8:
+    quantize_row_q8_0_ref(src, (block_q8_0 *)dst, n);
+    return 1;
   default:
     return 0;
   }
