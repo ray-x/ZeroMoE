@@ -2,12 +2,17 @@
 // Build: g++ -std=c++23 -O2 -I../include -o test_components test_components.cpp
 // (Does NOT require CUDA for the CPU-path tests)
 #include "direct_io.hpp" // the REAL O_DIRECT alignment-window arithmetic (no CUDA deps)
+#include "gguf_loader.hpp" // DeepSeek-V4 compression metadata validation helper
+#include "dsv4_compressed_attention.hpp"
 #include "kernels_cpu.hpp" // CPU kernel backend (AVX-512 or NEON, selected by build script)
 #include "rope.hpp" // the REAL, unit-tested RoPE (no CUDA / no AVX-512 deps)
 #include "hyper_connections.hpp" // the REAL Sinkhorn normalization (DeepSeek-V4)
 #include "route_usage.hpp" // CUDA-free routing histogram used by CPU and GPU paths
 #include "safetensors_adapter.hpp" // DFlash/DSpark safetensors adapter boundary
 #include "tensor_trace.hpp" // TraceFilter (pure C++, no CUDA deps -- see logger.hpp)
+#include "qwen4exp_gdn.hpp" // the REAL Qwen4Exp GDN delta-rule step (no CUDA deps)
+#include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
+#include "memory_guard.hpp" // deterministic host-budget admission arithmetic
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -765,6 +770,133 @@ void test_swa_ring_index() {
     check_one(100, 1);
     check_one(5, 1000);
   }
+
+  std::cout << " PASSED\n";
+}
+
+// dsv4_score_gpu (EngineConfig): the GPU dispatch (cuda_manager.hpp's
+// dsv4_score_gpu_batched_host, and this same math duplicated in
+// tests/bench_dsv4_score_cpu_vs_gpu.cu) compacts the raw ring buffer's
+// (possibly-wrapped) [oldest_slot, oldest_slot+past_context_len) span into
+// a contiguous [0,past_context_len) scratch buffer via a tail_len/head_len
+// split, instead of a wrap-aware GEMM. This is pure arithmetic -- no CUDA
+// needed -- so it's verified here directly against test_swa_ring_index's
+// own already-trusted per-t `abs_pos % window` formula: the ring order the
+// GPU path's split produces must exactly match the ring order the existing
+// CPU per-t loop already visits, for every t.
+void test_dsv4_gpu_ring_compact() {
+  std::cout << "[TEST] DSV4 GPU score ring-buffer compaction math..." << std::flush;
+
+  auto check_one = [](int current_pos, int window) {
+    int past_context_len = std::min(current_pos + 1, window);
+    int oldest_pos = current_pos - past_context_len + 1;
+    int oldest_slot = ((oldest_pos % window) + window) % window;
+
+    // GPU-path split (mirrors dsv4_score_gpu_batched_host / the bench).
+    int tail_len = std::min(past_context_len, window - oldest_slot);
+    int head_len = past_context_len - tail_len;
+    assert(tail_len >= 0 && tail_len <= window);
+    assert(head_len >= 0 && head_len < window);
+    assert(tail_len + head_len == past_context_len);
+
+    for (int t = 0; t < past_context_len; ++t) {
+      // Reference: the CPU per-t ring slot (test_swa_ring_index's own
+      // formula, i.e. what production's existing CPU loop reads).
+      int abs_pos = current_pos - past_context_len + 1 + t;
+      int expected_slot = abs_pos % window;
+
+      // GPU-path reconstruction: t < tail_len reads compacted row t from
+      // ring[oldest_slot + t]; t >= tail_len reads compacted row t from
+      // ring[t - tail_len] (the wrapped-around head segment).
+      int compacted_slot = (t < tail_len) ? (oldest_slot + t) : (t - tail_len);
+      assert(compacted_slot == expected_slot);
+    }
+  };
+
+  // Same case shapes as test_swa_ring_index: never-wrapped, steady-state
+  // wrapped, and the window=1 degenerate case.
+  {
+    int window = 16;
+    for (int pos = 0; pos < window; ++pos) check_one(pos, window);
+  }
+  {
+    int window = 16;
+    for (int pos = window; pos < window * 5; pos += 3) check_one(pos, window);
+  }
+  {
+    check_one(0, 1);
+    check_one(100, 1);
+    check_one(5, 1000);
+  }
+
+  std::cout << " PASSED\n";
+}
+
+// Compression-ratio metadata distinguishes raw Flash/SWA layers from Pro's
+// CSA/HCA layers.
+void test_dsv4_compression_metadata() {
+  std::cout << "[TEST] DeepSeek-V4 compression metadata..." << std::flush;
+
+  ArchitectureConfig config;
+  assert(!dsv4_uses_compressed_attention(config));
+
+  config.dsv4_compress_ratios = {0, 0, 0};
+  assert(!dsv4_uses_compressed_attention(config));
+
+  config.dsv4_compress_ratios = {0, 4, 0, 128};
+  assert(dsv4_uses_compressed_attention(config));
+
+  std::cout << " PASSED\n";
+}
+
+void test_dsv4_compressed_state_helpers() {
+  std::cout << "[TEST] DeepSeek-V4 compressed state helpers..." << std::flush;
+
+  assert(dsv4_compressed_cache_capacity(1, kDsv4CsaRatio) == 1);
+  assert(dsv4_compressed_cache_capacity(128, kDsv4HcaRatio) == 1);
+  assert(dsv4_compressed_cache_capacity(129, kDsv4HcaRatio) == 2);
+  assert(dsv4_completed_compressed_blocks(2, kDsv4CsaRatio) == 0);
+  assert(dsv4_completed_compressed_blocks(3, kDsv4CsaRatio) == 1);
+  assert(dsv4_compressed_block_visible(0, 3, kDsv4CsaRatio));
+  assert(!dsv4_compressed_block_visible(1, 3, kDsv4CsaRatio));
+  assert(dsv4_state_slot(7, 8) == 7);
+  assert(dsv4_state_slot(8, 8) == 0);
+
+  // At the first CSA boundary, previous positions are synthetic and the
+  // current half maps to tokens 0..3. Later blocks retain the preceding
+  // four-token window in the eight-row state ring.
+  assert(dsv4_csa_overlap_position(3, 0, 0) == -4);
+  assert(dsv4_csa_overlap_position(3, 0, 3) == -1);
+  assert(dsv4_csa_overlap_position(3, 1, 0) == 0);
+  assert(dsv4_csa_overlap_position(7, 0, 0) == 0);
+  assert(dsv4_csa_overlap_position(7, 1, 3) == 7);
+
+  const std::vector<float> scores = {2.0f, 8.0f, 8.0f, -1.0f, 4.0f};
+  const std::vector<int> top = dsv4_top_k_indices(scores, 3);
+  assert((top == std::vector<int>{1, 2, 4}));
+
+  Dsv4CompressedLayerState csa;
+  csa.configure(kDsv4CsaRatio, /*key_dim=*/8, /*max_tokens=*/17,
+                /*indexer_key_dim=*/6);
+  assert(csa.is_csa());
+  assert(csa.cache_capacity == 5);
+  assert(csa.state_size == 8);
+  assert(csa.state_width == 16);
+  assert(csa.keys.size() == 40);
+  assert(csa.indexer_keys.size() == 30);
+  csa.keys[0] = 3.0f;
+  csa.indexer_state_score.back() = 5.0f;
+  csa.reset();
+  assert(csa.keys[0] == 0.0f);
+  assert(csa.indexer_state_score.back() == 0.0f);
+
+  Dsv4CompressedLayerState hca;
+  hca.configure(kDsv4HcaRatio, /*key_dim=*/8, /*max_tokens=*/129);
+  assert(hca.is_hca());
+  assert(hca.cache_capacity == 2);
+  assert(hca.state_size == 128);
+  assert(hca.state_width == 8);
+  assert(hca.indexer_keys.empty());
 
   std::cout << " PASSED\n";
 }
@@ -2287,6 +2419,278 @@ void test_safetensors_adapter() {
 //   ./test_components rope          -> just test_rope
 //   ./test_components dequant       -> every *dequant* test
 //   ./test_components rope dequant  -> rope OR any dequant test
+// Qwen4Exp (Qwen3.8-Flash-Next) hybrid layer-type detection
+// (gguf_loader.hpp's qwen4exp_is_gdn_layer) -- the layer-type switch the
+// whole hybrid dispatch hinges on.
+void test_qwen4exp_layer_detection() {
+  std::cout << "[TEST] qwen4exp layer detection..." << std::flush;
+
+  // Interval fallback (no explicit array): every 4th layer (1-based) is
+  // full attention, the rest GDN -- llama.cpp qwen4exp.cpp's
+  // load_arch_hparams fallback (full_attention_interval, default 4).
+  {
+    ArchitectureConfig c;
+    c.n_layers = 8;
+    c.qwen4exp_full_attention_interval = 4;
+    const bool want[8] = {true, true, true, false, true, true, true, false};
+    for (int l = 0; l < 8; ++l)
+      assert(qwen4exp_is_gdn_layer(c, l) == want[l]);
+  }
+
+  // An explicit attention.recurrent_layers array wins over the interval.
+  {
+    ArchitectureConfig c;
+    c.n_layers = 4;
+    c.qwen4exp_full_attention_interval = 2; // would say: 0,2 full
+    c.qwen4exp_recurrent_layers = {1, 0, 0, 1}; // but the array says otherwise
+    assert(qwen4exp_is_gdn_layer(c, 0));
+    assert(!qwen4exp_is_gdn_layer(c, 1));
+    assert(!qwen4exp_is_gdn_layer(c, 2));
+    assert(qwen4exp_is_gdn_layer(c, 3));
+  }
+
+  // Defensive cases: out-of-range and fully-unconfigured configs fail safe
+  // toward the full-attention path (real tensors to report missing), never
+  // toward the recurrent path's state allocation.
+  {
+    ArchitectureConfig c;
+    c.n_layers = 4; // neither field set at all
+    assert(!qwen4exp_is_gdn_layer(c, 0));
+    assert(!qwen4exp_is_gdn_layer(c, 3));
+    assert(!qwen4exp_is_gdn_layer(c, -1));
+    assert(!qwen4exp_is_gdn_layer(c, 4));
+    c.qwen4exp_full_attention_interval = 4;
+    assert(!qwen4exp_is_gdn_layer(c, 100));
+  }
+
+  // PLE layer membership
+  {
+    ArchitectureConfig c;
+    c.ple_layers = {1, 17};
+    assert(qwen4exp_is_ple_layer(c, 1));
+    assert(qwen4exp_is_ple_layer(c, 17));
+    assert(!qwen4exp_is_ple_layer(c, 0));
+    assert(!qwen4exp_is_ple_layer(c, 2));
+  }
+
+  std::cout << " PASSED\n";
+}
+
+// Qwen4Exp GDN gated delta rule (include/qwen4exp_gdn.hpp's
+// qwen4exp_gdn_delta_chunk vs qwen4exp_gdn_delta_step: the chunked form must
+// reproduce the sequential recurrence EXACTLY (to float rounding), because it
+// is a closed-form rewrite of the same rule, not an approximation. The
+// sequential step is the oracle here -- it is itself checked against an
+// independent double-precision reference by the test below, so this chains
+// onto a verified base rather than asserting two unverified things agree.
+//
+// Covers the cases that actually distinguish a correct derivation from a
+// plausible-looking wrong one: a chunk applied to a NON-zero starting state
+// (the A_t*S_0 term and the S_0^T K / S_0^T Q projections), several chunks in
+// sequence (inter-chunk state carry-over), a non-multiple-of-chunk tail, and
+// beta/decay values in their real ranges.
+void test_qwen4exp_gdn_delta_chunk() {
+  std::cout << "[TEST] qwen4exp GDN chunked vs sequential..." << std::flush;
+
+  std::mt19937 rng(1234);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  double worst = 0.0, worst_state = 0.0;
+  // (hd, chunk lengths) -- last chunk deliberately shorter than the others.
+  const int hd_list[] = {8, 16, 32};
+  const int chunks[]  = {5, 7, 3};
+
+  for (int hi = 0; hi < 3; ++hi) {
+    const int hd = hd_list[hi];
+    // A non-zero starting state: zero would hide any bug in the A_t*S_0 term.
+    std::vector<float> st0((size_t)hd * hd);
+    for (auto &x : st0) x = 0.25f * dist(rng);
+
+    std::vector<float> st_seq = st0, st_chunk = st0;
+
+    for (int ci = 0; ci < 3; ++ci) {
+      const int C = chunks[ci];
+      std::vector<float> Q((size_t)C * hd), K((size_t)C * hd), V((size_t)C * hd);
+      std::vector<float> beta((size_t)C), g_log((size_t)C);
+      for (auto &x : Q) x = dist(rng);
+      for (auto &x : K) x = dist(rng);
+      for (auto &x : V) x = dist(rng);
+      for (int t = 0; t < C; ++t) {
+        beta[(size_t)t] = 1.0f / (1.0f + std::exp(-dist(rng)));   // sigmoided
+        g_log[(size_t)t] = qwen4exp_gdn_decay_log(dist(rng), dist(rng),
+                                                  -std::exp(dist(rng)));
+      }
+
+      std::vector<float> out_seq((size_t)C * hd, 0.0f);
+      for (int t = 0; t < C; ++t)
+        qwen4exp_gdn_delta_step(Q.data() + (size_t)t * hd, K.data() + (size_t)t * hd,
+                                V.data() + (size_t)t * hd, beta[(size_t)t],
+                                g_log[(size_t)t], st_seq.data(),
+                                out_seq.data() + (size_t)t * hd, hd);
+
+      std::vector<float> out_chunk((size_t)C * hd, 0.0f);
+      qwen4exp_gdn_delta_chunk(Q.data(), K.data(), V.data(), beta.data(),
+                               g_log.data(), st_chunk.data(), out_chunk.data(),
+                               C, hd);
+
+      for (size_t n = 0; n < out_seq.size(); ++n)
+        worst = std::max(worst, (double)std::fabs(out_seq[n] - out_chunk[n]));
+      for (size_t n = 0; n < st_seq.size(); ++n)
+        worst_state = std::max(worst_state,
+                               (double)std::fabs(st_seq[n] - st_chunk[n]));
+    }
+  }
+
+  std::cout << " max_out_diff=" << worst << " max_state_diff=" << worst_state;
+  // Same rewrite, different summation order -> float noise only, not an
+  // approximation error. 1e-4 is loose enough for accumulated rounding over
+  // several chunks at hd=32 and still far tighter than any real bug would be.
+  assert(worst < 1e-4);
+  assert(worst_state < 1e-4);
+  std::cout << " PASSED\n";
+}
+
+// qwen4exp_gdn_delta_step, the REAL function attention_layer.cpp calls)
+// checked against an independent naive double-precision reference written
+// straight from delta-net-base.cpp's build_delta_net_autoregressive ops.
+void test_qwen4exp_gdn_delta_step() {
+  std::cout << "[TEST] qwen4exp GDN delta step..." << std::flush;
+
+  const int hd = 8;
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+  // decay must be in (0,1): ssm_a is -exp(A_log) < 0, softplus > 0, so
+  // g_log < 0 -- use a realistic value.
+  std::vector<float> state((size_t)hd * hd, 0.0f);
+  std::vector<std::vector<double>> ref(hd, std::vector<double>(hd, 0.0));
+
+  for (int tok = 0; tok < 5; ++tok) { // multiple steps: checks state carry-over
+    std::vector<float> q(hd), k(hd), v(hd);
+    for (auto &x : q) x = dist(rng);
+    for (auto &x : k) x = dist(rng);
+    for (auto &x : v) x = dist(rng);
+    const float beta = 1.0f / (1.0f + std::exp(-dist(rng))); // sigmoided
+    const float g_log = qwen4exp_gdn_decay_log(dist(rng), dist(rng),
+                                               -1.5f); // ssm_a < 0
+    assert(g_log < 0.0f); // negative log-decay, always
+
+    std::vector<float> out(hd, 0.0f);
+    qwen4exp_gdn_delta_step(q.data(), k.data(), v.data(), beta, g_log,
+                            state.data(), out.data(), hd);
+
+    // Reference: S' = decay*S; sk = S'^T k; S'' = S' + beta * k (v-sk)^T;
+    // o = S''^T (q/sqrt(hd)) -- all in double.
+    const double decay = std::exp((double)g_log);
+    const double qs = 1.0 / std::sqrt((double)hd);
+    for (int i = 0; i < hd; ++i)
+      for (int j = 0; j < hd; ++j)
+        ref[i][j] *= decay;
+    std::vector<double> sk(hd, 0.0);
+    for (int j = 0; j < hd; ++j)
+      for (int i = 0; i < hd; ++i)
+        sk[j] += ref[i][j] * (double)k[i];
+    for (int i = 0; i < hd; ++i)
+      for (int j = 0; j < hd; ++j)
+        ref[i][j] += (double)k[i] * ((double)v[j] - sk[j]) * (double)beta;
+    for (int j = 0; j < hd; ++j) {
+      double o = 0.0;
+      for (int i = 0; i < hd; ++i)
+        o += ref[i][j] * (double)q[i] * qs;
+      // f32-vs-f64 accumulation tolerance
+      assert(std::fabs((double)out[j] - o) < 1e-4);
+    }
+  }
+
+  // Sanity: zero beta freezes the state's content contribution, so a repeated
+  // (k, v) pair with beta=0 and decay=1 leaves the output unchanged.
+  {
+    std::vector<float> st((size_t)hd * hd, 0.0f);
+    std::vector<float> q(hd), k(hd), v(hd), o1(hd), o2(hd);
+    for (int i = 0; i < hd; ++i) { q[i] = 0.1f * i; k[i] = 0.2f; v[i] = 0.3f; }
+    qwen4exp_gdn_delta_step(q.data(), k.data(), v.data(), /*beta=*/1.0f,
+                            /*g_log=*/0.0f, st.data(), o1.data(), hd);
+    qwen4exp_gdn_delta_step(q.data(), k.data(), v.data(), /*beta=*/0.0f,
+                            /*g_log=*/0.0f, st.data(), o2.data(), hd);
+    for (int i = 0; i < hd; ++i)
+      assert(std::fabs(o2[i] - o1[i]) < 1e-6f);
+  }
+
+  std::cout << " PASSED\n";
+}
+
+// Qwen4Exp GDN L2 norm (qwen4exp_l2_norm_inplace): ggml_l2_norm's exact
+// formula x / max(sqrt(sum(x^2)), eps) -- NOT x / sqrt(sum + eps).
+void test_qwen4exp_l2_norm() {
+  std::cout << "[TEST] qwen4exp L2 norm..." << std::flush;
+  {
+    float v[4] = {3.0f, 4.0f, 0.0f, 0.0f}; // sum(x^2)=25, sqrt=5
+    qwen4exp_l2_norm_inplace(v, 4, 1e-6f);
+    assert(std::fabs(v[0] - 0.6f) < 1e-6f);
+    assert(std::fabs(v[1] - 0.8f) < 1e-6f);
+  }
+  {
+    // near-zero vector: the max(, eps) floor dominates (would be a different
+    // answer under the sqrt(sum + eps) formula)
+    float v[2] = {1e-8f, 0.0f};
+    qwen4exp_l2_norm_inplace(v, 2, 1e-6f);
+    assert(std::fabs(v[0] - 1e-8f / 1e-6f) < 1e-4f);
+  }
+  std::cout << " PASSED\n";
+}
+
+// Qwen4Exp PLE n-gram hash (include/ple_hash.hpp's ple_ngram_row, the REAL
+// function ple_ngram.cpp calls) against a hand-computed reference,
+// including a multiplier too wide for float32 (45-bit constants are the
+// whole reason this hash exists in int64 -- see the header comment).
+void test_qwen4exp_ple_hash() {
+  std::cout << "[TEST] qwen4exp PLE n-gram hash..." << std::flush;
+
+  // hand-computed: mixed = (c0*m0) ^ (c1*m1); row = mixed % vocab + offset
+  {
+    const int64_t ctx[2] = {12345, 678};
+    const int64_t mult[2] = {1000003, 1000033};
+    const uint64_t mixed = (uint64_t)12345 * 1000003ull ^ (uint64_t)678 * 1000033ull;
+    const int64_t row = ple_ngram_row(ctx, 2, mult, /*vocab=*/1000000, /*off=*/7777);
+    assert(row == (int64_t)(mixed % 1000000ull) + 7777);
+  }
+
+  // 45-bit multiplier: (c0*m0) exceeds 2^53, where double (and float32)
+  // silently round -- the row must still match exact integer math.
+  {
+    const int64_t ctx[3] = {248044, 99991, 7};
+    const int64_t mult[3] = {(1ll << 45) + 12345, (1ll << 44) + 77, 3};
+    const uint64_t mixed = (uint64_t)ctx[0] * (uint64_t)mult[0] ^
+                           (uint64_t)ctx[1] * (uint64_t)mult[1] ^
+                           (uint64_t)ctx[2] * (uint64_t)mult[2];
+    const int64_t row = ple_ngram_row(ctx, 3, mult, /*vocab=*/20000000, /*off=*/0);
+    assert(row == (int64_t)(mixed % 20000000ull));
+    assert(row >= 0 && row < 20000000);
+  }
+
+  // EOS-cut semantics are the CALLER's job (ple_ngram.cpp); the hash itself
+  // must simply be deterministic in its inputs -- same window, same row.
+  {
+    const int64_t ctx[2] = {42, 42};
+    const int64_t mult[2] = {5, 9};
+    assert(ple_ngram_row(ctx, 2, mult, 100, 0) ==
+           ple_ngram_row(ctx, 2, mult, 100, 0));
+  }
+
+  std::cout << " PASSED\n";
+}
+
+void test_host_budget_admission() {
+  std::cout << "[TEST] host-memory budget admission..." << std::flush;
+  assert(host_budget_allows(0, 1000, 1000, 1000));
+  assert(host_budget_allows(1000, 400, 500, 100));
+  assert(!host_budget_allows(1000, 400, 601, 0));
+  assert(!host_budget_allows(1000, 400, 500, 101));
+  assert(!host_budget_allows(1000, 1001, 0, 0));
+  assert(!host_budget_allows(1000, 900, 200, 0));
+  std::cout << " PASSED\n";
+}
+
 int main(int argc, char **argv) {
   std::cout << "=== MoEStream Component Tests ===\n";
   struct TestEntry {
@@ -2300,6 +2704,9 @@ int main(int argc, char **argv) {
       {"sinkhorn", test_sinkhorn_normalize},
       {"sqrtsoftplus", test_sqrtsoftplus_gating},
       {"swa_ring_index", test_swa_ring_index},
+      {"dsv4_gpu_ring_compact", test_dsv4_gpu_ring_compact},
+      {"dsv4_compression_metadata", test_dsv4_compression_metadata},
+      {"dsv4_compressed_state", test_dsv4_compressed_state_helpers},
       {"tid2eid_lookup", test_tid2eid_lookup},
       {"topk_selection", test_topk_selection},
       {"softmax_routing", test_softmax_routing},
@@ -2321,6 +2728,15 @@ int main(int argc, char **argv) {
       {"cpu_elem_mul", test_cpu_elem_mul},
       {"route_usage", test_route_usage},
       {"trace_filter", test_trace_filter},
+      // NOTE: registered BEFORE safetensors_adapter on purpose -- that test
+      // currently aborts (assert) on a pre-existing, unrelated failure, and
+      // registration order is execution order here.
+      {"qwen4exp_layer_detection", test_qwen4exp_layer_detection},
+      {"qwen4exp_gdn_delta_step", test_qwen4exp_gdn_delta_step},
+      {"qwen4exp_gdn_delta_chunk", test_qwen4exp_gdn_delta_chunk},
+      {"qwen4exp_l2_norm", test_qwen4exp_l2_norm},
+      {"qwen4exp_ple_hash", test_qwen4exp_ple_hash},
+      {"host_budget_admission", test_host_budget_admission},
       {"safetensors_adapter", test_safetensors_adapter},
   };
   const bool filtered = argc > 1;

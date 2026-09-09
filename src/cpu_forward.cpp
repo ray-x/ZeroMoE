@@ -4,13 +4,43 @@
 
 #include <cstring>
 
+#ifdef MOESTREAM_USE_GGML
+extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
+                                int n);
+#endif
+
 bool cpu_embed_token(CPUEngine &engine, int tok, float *out, int D) {
   CPUQuantizedTensor *emb = engine.find_layer("token_embd.weight");
   if (emb && emb->host_ptr) {
-    // token_embd.weight is [V, D]; copy row tok.
-    const float *embd = reinterpret_cast<const float *>(emb->host_ptr);
-    std::memcpy(out, embd + (int64_t)tok * D, (size_t)D * sizeof(float));
-    return true;
+    const int rows = emb->meta.shape.size() >= 2
+                         ? static_cast<int>(emb->meta.shape[1])
+                         : static_cast<int>(emb->meta.shape[0]);
+    if (tok >= 0 && tok < rows) {
+      const size_t row_bytes = emb->host_size / static_cast<size_t>(rows);
+      const uint8_t *src = emb->host_ptr + static_cast<size_t>(tok) * row_bytes;
+      if (emb->meta.type == GGUFType::F32) {
+        std::memcpy(out, src, (size_t)D * sizeof(float));
+        return true;
+      }
+      if (emb->meta.type == GGUFType::F16) {
+        const auto *p = reinterpret_cast<const uint16_t *>(src);
+        for (int i = 0; i < D; ++i)
+          out[i] = fp16_to_fp32(p[i]);
+        return true;
+      }
+      if (emb->meta.type == GGUFType::BF16) {
+        const auto *p = reinterpret_cast<const uint16_t *>(src);
+        for (int i = 0; i < D; ++i) {
+          uint32_t bits = static_cast<uint32_t>(p[i]) << 16;
+          std::memcpy(out + i, &bits, sizeof(float));
+        }
+        return true;
+      }
+#ifdef MOESTREAM_USE_GGML
+      return ggml_dequant_row(static_cast<uint32_t>(emb->meta.type), src,
+                              out, D) != 0;
+#endif
+    }
   }
 
   // Fallback: tied embedding/LM head where only output.weight [D, V] exists.

@@ -1,0 +1,11 @@
+Review this Python function and point out any bugs or bad practices:
+```python
+def process_orders(orders):
+    total = 0
+    for order in orders:
+        total = total + order['amount']
+        if order['status'] == 'refunded':
+            total = total - order['amount']
+    average = total / len(orders)
+    return average
+```

@@ -81,11 +81,22 @@ public:
   int ds_user_id = -1, ds_assistant_id = -1, ds_think_start_id = -1,
       ds_think_end_id = -1;
 
+  // ChatML (Qwen3.8-Flash-Next / qwen4exp): <|im_start|>/<|im_end|> turn
+  // markers. The template is ChatML with thinking enabled by default:
+  //   <|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n<think>\n
+  // (a system turn with the reasoning-effort instructions precedes it; see
+  // the model's tokenizer_config.json chat_template).
+  int im_start_id = -1, im_end_id = -1;
+
   GGUFTokenizer() { init_byte_unicode(); }
 
   bool has_chat_template() const { return user_id >= 0 && assistant_id >= 0; }
   bool has_deepseek_chat_template() const {
     return ds_user_id >= 0 && ds_assistant_id >= 0;
+  }
+  // ChatML (qwen4exp and Qwen chat models generally) -- turn markers only;
+  // roles are plain text after <|im_start|>.
+  bool has_chatml_template() const { return im_start_id >= 0 && im_end_id >= 0;
   }
   bool is_loaded() const { return !id_to_token.empty(); }
 
@@ -202,6 +213,10 @@ public:
                         << ds_user_id << " <｜Assistant｜>=" << ds_assistant_id
                         << " </think>=" << ds_think_end_id
                         << " -- will wrap prompts DeepSeek-chat-style.\n";
+    } else if (has_chatml_template()) {
+      LOG_STREAM_INFO() << "[Tokenizer] Chat template detected: <|im_start|>="
+                        << im_start_id << " <|im_end|>=" << im_end_id
+                        << " -- will wrap prompts ChatML-style.\n";
     } else {
       LOG_STREAM_WARN() << "[Tokenizer] No <|user|>/<|assistant|> or "
                            "<｜User｜>/<｜Assistant｜> chat tokens "
@@ -228,6 +243,8 @@ public:
     ds_assistant_id = find("<｜Assistant｜>");
     ds_think_start_id = find("<think>");
     ds_think_end_id = find("</think>");
+    im_start_id = find("<|im_start|>");
+    im_end_id = find("<|im_end|>");
 
     // GLM-5.2's real HF config.json has THREE eos_token_id entries:
     // <|endoftext|>, <|user|>, <|observation|>
@@ -254,6 +271,11 @@ public:
     // but add_stop dedups, so this is a harmless extra safety net rather
     // than a behavior change when that's already true.
     add_stop(find("<｜end▁of▁sentence｜>"));
+    // ChatML turn-end marker (qwen4exp): the assistant turn closes with
+    // <|im_end|> -- a real stop point, same "handed the turn back"
+    // reasoning as GLM's <|user|> above. Dedup makes this a no-op when the
+    // GGUF's own eos_token_id already IS <|im_end|>.
+    add_stop(im_end_id);
 
     if (!stop_ids.empty()) {
       LogStream ls(LogLevel::INFO);

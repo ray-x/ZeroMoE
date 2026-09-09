@@ -28,12 +28,28 @@
 
 struct block_iq3_xxs_cu { uint16_t d; uint8_t qs[3*QK_K/8]; }; // 98 bytes
 
+// IQ3_S: real block layout (ggml-common.h's block_iq3_s), 110 bytes/256 elems
+// (3.4375 bpw -- matches kquant_dequant.hpp's own bpw table entry and its
+// row_bytes() formula, (I/256)*110). d + qs[64] (grid low-8-bits, 2/weight-
+// pair) + qh[8] (grid 9th bit) + signs[32] (sign bits) + scales[4] (2 nibble
+// scales/byte, one per 32-weight half-block).
+struct block_iq3_s_cu {
+    __half d;
+    uint8_t qs[QK_K/4];
+    uint8_t qh[QK_K/32];
+    uint8_t signs[QK_K/8];
+    uint8_t scales[QK_K/64];
+};
+static_assert(sizeof(block_iq3_s_cu) == 110, "block_iq3_s_cu size mismatch");
+
 __constant__ uint32_t c_iq3xxs_grid[256];
+__constant__ uint32_t c_iq3s_grid[512];
 __constant__ uint8_t  c_ksigns_iq2xs[128];
 __constant__ uint8_t  c_kmask_iq2xs[8];
 
 extern "C" {
 const void* ms_grid_iq3xxs();
+const void* ms_grid_iq3s();
 const void* ms_grid_ksigns_iq2xs();
 const void* ms_grid_kmask_iq2xs();
 }
@@ -55,6 +71,7 @@ static void init_iq3_grids() {
     if (dev < 0 || dev >= MAX_CUDA_DEVICES) dev = 0;
     if (iq3_grids_ready[dev]) return;
     cudaMemcpyToSymbol(c_iq3xxs_grid,  ms_grid_iq3xxs(),       256 * sizeof(uint32_t));
+    cudaMemcpyToSymbol(c_iq3s_grid,    ms_grid_iq3s(),          512 * sizeof(uint32_t));
     cudaMemcpyToSymbol(c_ksigns_iq2xs, ms_grid_ksigns_iq2xs(), 128);
     cudaMemcpyToSymbol(c_kmask_iq2xs,  ms_grid_kmask_iq2xs(),    8);
     iq3_grids_ready[dev] = true;
@@ -142,6 +159,94 @@ __global__ void iq3_xxs_matmul_kernel(
 extern "C" void launch_iq3_xxs_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
     init_iq3_grids();
     iq3_xxs_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_iq3_xxs_cu*)w, S, I, O);
+}
+
+// ---- IQ3_S fused matmul ----
+//
+// Verbatim port of ggml's dequantize_row_iq3_s (ggml/src/ggml-quants.c),
+// flattened from its nested ib32/l/half loop + running-pointer structure
+// into one thread per output weight. Real per-block layout (256 weights):
+// 4 "scale blocks" (k=0..3, one nibble-pair scale byte each), each split
+// into 2 "halves" (h=0/1, qh[2k]/qh[2k+1] + scales[k]&0xf / >>4), each half
+// holding 4 "l" groups of 8 weights (r=0..7: r<4 uses qs[2l+0]'s grid entry,
+// r>=4 uses qs[2l+1]'s -- two DIFFERENT 4-byte codebook entries per l, not
+// one split in two). Flat index w = k*64 + h*32 + l*8 + r reproduces the
+// SAME sequential order ggml's y+=8-per-l, half-then-next-k loop writes in
+// (confirmed by tracing the source's own pointer-advance order), so
+// x_row[b*QK_K + tid] addresses the correct activation element exactly like
+// iq3_xxs_matmul_kernel above does for its own (simpler) format.
+__global__ void iq3_s_matmul_kernel(
+    float* __restrict__ y, const float* __restrict__ x, const block_iq3_s_cu* __restrict__ W,
+    int S, int I, int O)
+{
+    int o = blockIdx.x;
+    int s = blockIdx.y;
+    int tid = threadIdx.x; // 0..255, doubles as the flat within-superblock weight index
+
+    if (o >= O || s >= S) return;
+
+    int bpr = I / QK_K;
+    const block_iq3_s_cu* w_row = W + (size_t)o * bpr;
+    const float* x_row = x + (size_t)s * I;
+
+    const int k   = tid >> 6;          // 0..3
+    const int rem = tid & 63;
+    const int h   = rem >> 5;          // 0 or 1
+    const int m   = rem & 31;
+    const int l   = m >> 3;            // 0..3
+    const int r   = m & 7;             // 0..7 -- also the kmask/sign-bit index
+    const int use_grid2 = r >> 2;      // 0 or 1
+    const int j   = r & 3;             // 0..3 -- byte within the 4-byte grid entry
+    const int qs_idx_in_half = 2 * l + use_grid2;
+    const int shift = use_grid2 ? (7 - 2 * l) : (8 - 2 * l);
+
+    float acc = 0.0f;
+    for (int b = 0; b < bpr; ++b) {
+        const block_iq3_s_cu& blk = w_row[b];
+        const float d = __half2float(blk.d);
+
+        uint8_t qs_byte = blk.qs[k * 16 + h * 8 + qs_idx_in_half];
+        uint8_t qh_byte = blk.qh[2 * k + h];
+        int grid_index = (int)qs_byte | ((((int)qh_byte) << shift) & 256);
+        const uint8_t* grid = (const uint8_t*)&c_iq3s_grid[grid_index];
+
+        uint8_t sign_byte = blk.signs[k * 8 + h * 4 + l];
+        float sign = (sign_byte & c_kmask_iq2xs[r]) ? -1.f : 1.f;
+
+        uint8_t scale_byte = blk.scales[k];
+        int scale_nibble = (h == 0) ? (scale_byte & 0xf) : (scale_byte >> 4);
+        float db = d * (1.0f + 2.0f * (float)scale_nibble);
+
+        float w_val = db * (float)grid[j] * sign;
+        acc += x_row[(size_t)b * QK_K + tid] * w_val;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+    }
+
+    __shared__ float warp_sums[8];
+    const int lane_id = tid % 32;
+    const int warp_id = tid / 32;
+    if (lane_id == 0) warp_sums[warp_id] = acc;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float sum = (lane_id < 8) ? warp_sums[lane_id] : 0.0f;
+        #pragma unroll
+        for (int offset = 4; offset > 0; offset /= 2) {
+            sum += __shfl_down_sync(0x000000ff, sum, offset);
+        }
+        if (tid == 0) {
+            y[(size_t)s * O + o] = sum;
+        }
+    }
+}
+
+extern "C" void launch_iq3s_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
+    init_iq3_grids();
+    iq3_s_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_iq3_s_cu*)w, S, I, O);
 }
 
 

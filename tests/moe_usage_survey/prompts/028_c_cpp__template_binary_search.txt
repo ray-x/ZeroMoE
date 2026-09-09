@@ -1,0 +1,1 @@
+Write a C++ template function for a generic binary search over a sorted vector.

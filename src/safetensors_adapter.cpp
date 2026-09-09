@@ -671,6 +671,16 @@ DenseCpuContract SafetensorsAdapter::map_dense_cpu_contract(const SafetensorsMod
   auto heads_from_out = [&](int raw_out, int fallback_heads) -> int {
     if (contract.head_dim > 0 && raw_out % contract.head_dim == 0)
       return raw_out / contract.head_dim;
+    // For an HF-style GQA export, the Q projection's output width is the
+    // reliable source for head_dim.  The hidden width is the model input
+    // width and need not equal the Q output width (e.g. hidden=2048,
+    // q_out=4096, heads=32 => head_dim=128).  Using hidden/fallback_heads
+    // here would infer 64 and consequently turn k_out=1024 into 16 KV heads
+    // instead of the intended 8.
+    if (raw_out > 0 && raw_out % fallback_heads == 0) {
+      contract.head_dim = raw_out / fallback_heads;
+      return fallback_heads;
+    }
     if (contract.hidden > 0 && contract.hidden % fallback_heads == 0) {
       contract.head_dim = contract.hidden / fallback_heads;
       return fallback_heads;

@@ -1,0 +1,1 @@
+Write a Go function that uses a WaitGroup to wait for multiple goroutines to finish.

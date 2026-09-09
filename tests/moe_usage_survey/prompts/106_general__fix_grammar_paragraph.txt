@@ -1,0 +1,3 @@
+Fix the grammar in this paragraph:
+
+"Me and my team has been working on this project since three months. We are hopeing to finish it by next week, but there is alot of bugs that we still need to fixed. Its been a challenging experience but we learn alot from it."

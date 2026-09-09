@@ -104,6 +104,17 @@ void hc_post_plain_add(StreamingEngine &engine, int layer_idx, int sub_block,
                         float *hidden_states, const float *sub_block_out,
                         int S, int D);
 
+// Optional per-layer INPUT hook, called at the very top of each layer's
+// iteration in layers_forward_gguf, BEFORE hc_pre_fn -- for families that
+// inject something into the (possibly multi-stream) residual ahead of the
+// attention sub-block. Added for Qwen4Exp's PLE n-gram hash embedding,
+// which modifies the HC stream buffer at PLE layers (qwen4exp.cpp's
+// build_ple call sits between the HC-stream carry-over and the attention
+// hc_mix). token_ids/pos_base are the same values layers_forward_gguf
+// already receives. nullptr (the default) = no hook, zero cost.
+using LayerInputFn = void (*)(StreamingEngine &engine, int layer_idx, int S,
+                              int pos_base, const int *token_ids);
+
 struct FamilyOps {
   ModelFamily family = ModelFamily::Unknown;
   AttentionType attn_type = AttentionType::DenseQKV;
@@ -116,6 +127,7 @@ struct FamilyOps {
   AllocCacheFn alloc_cache_fn = nullptr; // required, non-null once resolved
   HcPreFn hc_pre_fn = &hc_pre_noop;
   HcPostFn hc_post_fn = &hc_post_plain_add;
+  LayerInputFn layer_input_fn = nullptr; // optional; nullptr = no hook
 };
 
 // The single place ModelFamily -> "what does this family actually do" gets

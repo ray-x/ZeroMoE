@@ -1,0 +1,9 @@
+Review this JavaScript function for bugs:
+```javascript
+function getUserAge(user) {
+  if (user.birthYear = 2000) {
+    return new Date().getFullYear() - user.birthYear;
+  }
+  return null;
+}
+```

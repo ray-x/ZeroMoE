@@ -1,3 +1,6 @@
+#include "qwen4exp_gdn.hpp"   // qwen4exp_gdn_delta_chunk (CPU oracle for Test 25)
+#include "ggml_gdn_proj_backend.hpp"  // GgmlGdnProjRunner (Test 29)
+#include "ggml_glm5next_proj_backend.hpp"  // GLM5NEXT KDA fusion (Test 34)
 #include "kernels_cpu.hpp"
 #include "ram_manager.hpp"
 #include "engine.hpp"
@@ -11,11 +14,21 @@
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
+#include <numeric>
 #include <random>
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <omp.h>
+
+// Defined (non-static) in src/attention_layer.cpp specifically so Test 28
+// can compare qwen4exp_conv1d_silu_gpu_host's GPU kernel directly against
+// this already-proven CPU reference. No header declares it (it's an
+// internal helper, not part of any public API), so it's forward-declared
+// here to match.
+void attn_causal_conv1d_silu(const float* x, const float* w, float* out,
+                             int S, int channels, int kernel, float* history);
 
 // ------------------------------------------------------------------
 // External Links to Core Functions
@@ -222,7 +235,15 @@ static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O,
     // of going through cpu_quant_matmul, and get the SAME tight tolerance
     // every other (already exact-vs-exact) type gets below.
     std::vector<float> y_cpu((size_t)S * O, 0.0f);
-    if (type == GGUFType::Q6_K || type == GGUFType::Q8_0) {
+    // IQ1_S and IQ1_M both join this branch: neither has a cpu_quant_matmul
+    // fast-path kernel of its own (never had one, so no "lossy production
+    // fast path vs exact reference" ambiguity to worry about the way
+    // Q6_K/Q8_0's own comment above documents) -- ggml_dequant_row already
+    // dispatches both correctly (dequantize_row_iq1_s/_iq1_m, confirmed via
+    // src/ggml_dequant.cpp), so the exact dequant+naive-dot path is both
+    // the simplest and the only correct reference available here.
+    if (type == GGUFType::Q6_K || type == GGUFType::Q8_0 ||
+        type == GGUFType::IQ1_S || type == GGUFType::IQ1_M) {
         std::vector<float> w_row_f32(I);
         for (int o = 0; o < O; ++o) {
             ggml_dequant_row((uint32_t)type, w_bytes.data() + (size_t)o * rb, w_row_f32.data(), I);
@@ -324,6 +345,27 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q4_K,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_K,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q6_K,    512, 8, 3);
+
+    // 2026-09-01: the five cases above all use I=512 -> bpr = I/256 = 2, which
+    // sits BELOW kquant_lane8_ok()'s `bpr >= 8` gate (cuda/kquant_matmul.cu) --
+    // so before these were added, Test 5 exercised ONLY the cooperative path
+    // and had literally zero coverage of the lane8 kernels, despite lane8
+    // being what every real GLM-5.3 dense tensor actually dispatches to
+    // (attn_output is I=16384 -> bpr=64). Same class of gap as the Q8_0 one
+    // this test already documents finding and fixing.
+    //
+    // I=16384 is attn_output's real production shape (309 Q5_K + 81 Q6_K
+    // dense tensors in GLM-5.3); I=6144 is the hidden-size square shape.
+    // Both are >= 2048, so both take the lane8 path.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q2_K,   16384, 64, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q3_K,   16384, 64, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q4_K,   16384, 64, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_K,   16384, 64, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q6_K,   16384, 64, 1);
+    // S>1 as well: the lane8 kernel keeps grid(O,S), so an S>1 launch must be
+    // confirmed to index x_row correctly per row, not just at s=0.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_K,    6144, 32, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q6_K,    6144, 32, 3);
     // Q8_0 (cuda/q8_0_matmul.cu): pre-existing gap in this suite -- the
     // tolerance handling above (line ~254) was already prepared for this
     // type but no case ever actually exercised it. Closed while touching
@@ -338,6 +380,25 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    4096, 4, 2);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    2048, 16384, 1);
+
+    // Q5_1 (cuda/q5_1_matmul.cu, new 2026-09-04). No lossy CPU fast path
+    // exists for this type in cpu_quant_matmul, so the default comparison
+    // above is already exact-vs-exact (ggml's own dequantize_row_q5_1 +
+    // naive dot) -- no exact-reference special case needed the way Q6_K/
+    // Q8_0 required one.
+    //
+    // These shapes are chosen to cover BOTH of the launcher's reduction
+    // paths, which the real model alone would not: launch_q5_1_matmul sizes
+    // blockDim from blocks_per_row, so bpr<=32 takes the single-warp
+    // shuffle-only path (no shared memory, no __syncthreads) and bpr>32
+    // takes the shared-memory cross-warp path. qwen4exp's real down_proj is
+    // I=640 -> bpr=20, i.e. it only ever exercises the FIRST path -- a bug
+    // in the second would have shipped invisibly.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_1,     512, 8, 3);     // bpr=16,  1 warp,  S>1
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_1,     640, 2560, 1);  // REAL qwen4exp ffn_down_exps shape, decode
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_1,     640, 32, 3);    // real I, prefill S>1
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_1,    2048, 16, 1);    // bpr=64,  multi-warp shared-mem reduction
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_1,    4096, 4, 2);     // bpr=128, threads stride >1 block each
     // IQ2_XXS/XS/S and IQ3_XXS are the highest-priority cases: per a real
     // [QUANT] report from this model, the dominant routed-expert combo is
     // gate=up=IQ2_XXS, down=IQ3_XXS across 71/76 MoE layers -- i.e. every
@@ -349,6 +410,47 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ2_XS,  512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ2_S,   512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ3_XXS, 512, 8, 3);
+    // IQ1_S: added 2026-09 when a real launch_iq1s_matmul (verbatim port of
+    // ggml's dequantize_row_iq1_s, real 2048-entry grid codebook) replaced
+    // this project's pre-existing but WRONG "iq1_matmul_kernel_optimized"
+    // (found this session to decode flat sign bits with no grid lookup, no
+    // per-group scale, no delta -- see cuda/iq1_dequant.cu's own comment).
+    // Real motivation: GLM-5.3's Unsloth "UD-IQ1_S" release keeps gate/up at
+    // this type for a real subset of MoE layers. Small shape first, then
+    // this model's real per-expert gate/up dims (I=2048, O=6144, confirmed
+    // against a real downloaded shard's own byte count: row_bytes(IQ1_S,
+    // 2048)=400, 400*6144=2,457,600 bytes, matching the file exactly) at
+    // both S=1 (decode) and a real prefill-batch-sized S.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ1_S,   512, 8, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ1_S,   2048, 6144, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ1_S,   2048, 6144, 12);
+    // IQ1_M: added 2026-09 alongside IQ1_S -- launch_iq1m_matmul reuses the
+    // same c_iq1s_grid table (see that kernel's own header comment) but a
+    // genuinely different per-block scale/index packing (block_iq1_m:
+    // qs[32]+qh[16]+scales[8], no standalone `d`), so it needs its own
+    // independent correctness check, not just "IQ1_S passed, so this
+    // probably does too". No real downloaded GLM-5.3 shard has ever been
+    // confirmed to contain IQ1_M tensors (checked: 0 across every shard
+    // this project currently has) -- these synthetic-data shapes are the
+    // ONLY verification this type has, unlike IQ1_S's later real-model
+    // confirmation. Same three shapes as IQ1_S for a direct comparison.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ1_M,   512, 8, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ1_M,   2048, 6144, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ1_M,   2048, 6144, 12);
+    // IQ3_S: added 2026-09 when a real launch_iq3s_matmul (verbatim port of
+    // ggml's dequantize_row_iq3_s, real 512-entry grid codebook + qh 9th-bit
+    // extension) replaced the "no fused CUDA kernel" state this type had
+    // (see kquant_dequant.hpp's gpu_type_supported() -- IQ3_S was the last
+    // member of the IQ2/IQ3 grid-codebook family without one). Real
+    // motivation: a real downloaded Unsloth Dynamic-quant GLM-5.3 shard set
+    // (7 shards, "UD-IQ3_XXS"-labeled) keeps gate/up=IQ2_S, down=IQ3_S
+    // uniformly across nearly all 75 MoE layers (confirmed via direct probe
+    // of every layer, 2026-09) -- production shape I=2048, O=6144 matches
+    // this file's own real down_proj dims exactly (row_bytes(IQ3_S,
+    // 2048)=880, 880*6144=5,406,720 bytes, matching the file byte-for-byte).
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ3_S,   512, 8, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ3_S,   2048, 6144, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ3_S,   2048, 6144, 12);
     // Exercise a >1 super-block row too (real weight matrices are I=4096+),
     // since a per-block indexing bug can hide in a single-block test.
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ2_XXS, 4096, 4, 2);
@@ -359,6 +461,13 @@ bool test_cuda_fused_kernels() {
     // IQ2/IQ3 variable-grid siblings despite the similar name.
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_XS,  512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_XS,  4096, 4, 2);
+    // IQ4_NL: added 2026-09-04 with launch_iq4_nl_matmul. I=640 is the REAL
+    // down-projection input dim for Qwen3.8-Flash-Next (moe_inter), the shape
+    // that model's 48 MoE layers actually run; the 2048 case adds a larger
+    // bpr, and S=1/S>1 are both covered since the kernel strides blocks by 8.
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_NL,  640, 8, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_NL,  640, 4, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_NL,  2048, 5, 2);
     // REAL production shape for this checkpoint's down-projection, not a
     // synthetic small O -- added after IQ4_XS passed the two cases above
     // (small O=4/O=8) yet a real generation run still produced NaN in this
@@ -932,6 +1041,66 @@ bool test_bf16_cublas_dense_matmul() {
     return pass;
 }
 
+// Regression test for GLM5NEXT/DSA's nope-only score path. A zero-sized RoPE
+// component must still run the no-PE GEMM, one joint softmax, and latent
+// context GEMM on CUDA instead of being rejected and falling back to the
+// O(T) AVX-512 CPU loop.
+bool test_score_gpu_nope_only() {
+    std::cout << "[Test 33] Score GPU path with rope=0 (DSA/nope-only)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int H = 4, kvl = 13, rope = 0, T = 17;
+    const float scale = 0.19f;
+    std::mt19937 rng(5330);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> Lc((size_t)T * kvl), Q((size_t)H * kvl);
+    for (auto& v : Lc) v = dist(rng);
+    for (auto& v : Q) v = dist(rng);
+
+    std::vector<float> ref((size_t)H * kvl, 0.0f);
+    for (int h = 0; h < H; ++h) {
+        std::vector<float> scores(T);
+        for (int t = 0; t < T; ++t) {
+            double dot = 0.0;
+            for (int i = 0; i < kvl; ++i)
+                dot += (double)Q[(size_t)h * kvl + i] * Lc[(size_t)t * kvl + i];
+            scores[t] = (float)(dot * scale);
+        }
+        float mx = *std::max_element(scores.begin(), scores.end());
+        float sum = 0.0f;
+        for (float& v : scores) { v = std::exp(v - mx); sum += v; }
+        for (float& v : scores) v /= sum;
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < kvl; ++i)
+                ref[(size_t)h * kvl + i] += scores[t] * Lc[(size_t)t * kvl + i];
+    }
+
+    if (!gpu.ensure_lc_rc_gpu(0, T, kvl, rope, 1ull << 30) ||
+        !gpu.upload_lc_rc_rows(0, Lc.data(), nullptr, 0, T, kvl, rope)) {
+        std::cout << "  -> FAILED: nope-only Lc/Rc setup rejected\n";
+        return false;
+    }
+    std::vector<float> got(ref.size(), -999.0f);
+    if (!gpu.score_gpu_batched_host(0, Q.data(), nullptr, got.data(),
+                                    H, T, kvl, rope, scale, 1, T - 1)) {
+        std::cout << "  -> FAILED: nope-only score GPU path returned false\n";
+        return false;
+    }
+    double max_abs = 0.0, ref_abs = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        max_abs = std::max(max_abs, (double)std::fabs(got[i] - ref[i]));
+        ref_abs = std::max(ref_abs, (double)std::fabs(ref[i]));
+    }
+    const double normalized = max_abs / (ref_abs + 1e-9);
+    const bool ok = normalized < 5e-4;
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED")
+              << " max_abs=" << max_abs << " normalized=" << normalized << "\n";
+    return ok;
+}
+
 // ------------------------------------------------------------------
 // 10. cuBLAS Matched-Precision (BF16 weight / BF16 activation) Dense Matmul
 // ------------------------------------------------------------------
@@ -1234,7 +1403,22 @@ bool test_score_gpu() {
     }
 
     std::vector<float> context_gpu((size_t)H * kvl, -999.0f);
-    if (!gpu.score_gpu_batched_host(0, Q_absorbed.data(), Q_rope.data(), context_gpu.data(), H, T, kvl, rope, scale)) {
+    // pos_base=T-1: this test's own CPU reference above attends over the
+    // FULL T-length context with no causal masking at all -- the GPU call
+    // must be told "this query's absolute position is the last one" so its
+    // causal-mask logic (combine_scale_softmax_kernel's `valid = pos_base +
+    // s + 1`, added 2026-09-01, see that kernel's own comment) computes
+    // valid=T and stays inert, matching what this test actually checks.
+    // FOUND AS A REAL BUG this session: left at the function's default
+    // pos_base=0, `valid` collapsed to 1 (only key t=0 ever attended to),
+    // making every head's context equal Lc row 0 regardless of its own
+    // Q -- i.e. every head's output collapsed to the SAME value, tripping
+    // the head-aliasing safeguard below. Not a production bug: Test 16 (the
+    // S>1 sibling, added alongside the masking feature) already threads
+    // pos_base through correctly; this S=1 test simply predates the
+    // masking feature and was never updated for it.
+    if (!gpu.score_gpu_batched_host(0, Q_absorbed.data(), Q_rope.data(), context_gpu.data(), H, T, kvl, rope, scale,
+                                    /*S=*/1, /*pos_base=*/T - 1)) {
         std::cout << "  -> FAILED (score_gpu_batched_host returned false)\n";
         return false;
     }
@@ -1351,6 +1535,448 @@ bool test_wuv_batched_gpu() {
     std::cout << "  -> WUV batched GPU (H=" << H << " kvl=" << kvl << " vh=" << vh << "): "
               << (pass ? "PASSED" : "FAILED")
               << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+// ------------------------------------------------------------------
+// 15. WUV int8 Batched GPU Path (score down-projection, int8-persistent
+//     since 2026-08-29) -- see CudaManager::upload_wuv_int8/wuv_int8_
+//     batched_host's own comments (cuda_manager.hpp) for the full design.
+//     Two checks against two different references, matching this
+//     project's own "isolate kernel correctness from inherent quantization
+//     error" discipline (see the Q6_K/Q8_0 exact-reference fix elsewhere
+//     in this file for the same principle applied to a different path):
+//       (a) same-quantization CPU reference -- quantizes/dequantizes on
+//           the CPU with the IDENTICAL per-row max-abs/127 scheme the GPU
+//           path uses, then computes the reference dot products from
+//           those dequantized values. Isolates "did the dequant kernel +
+//           GEMM correctly implement the intended math" from int8's own
+//           inherent quantization error -- should be tight (same order as
+//           Test 14's own BF16 tolerance).
+//       (b) exact F32 reference -- the real, honest answer to "how much
+//           accuracy does switching from BF16 to int8 actually cost" that
+//           a user of this path should expect, reported but not gated on
+//           a tight tolerance (int8 quantization error is real and
+//           expected here, not a bug).
+// ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 16. MLA Score GPU Path at S>1 (PREFILL) -- causal mask + [H,S,*] layouts.
+//
+// Test 13 above covers S=1 (decode), where the causal mask is inert and every
+// [H,S,*] buffer collapses to [H,*]. That means it exercises none of what the
+// 2026-09-01 prefill batching actually added, and would stay green even if the
+// mask or the s-major/h-major transposes were completely wrong -- the same
+// coverage trap Test 5's K-quant cases fell into (all I=512, i.e. entirely
+// below the lane8 dispatch gate).
+//
+// Two failure modes this is built to catch, both of which produce plausible
+// finite numbers rather than a crash:
+//   * causal mask off-by-one or absent -- a query attending to keys it must
+//     not see. Caught because the CPU reference masks at exactly t <= pos_base+s
+//     and the outputs diverge sharply if the GPU disagrees by even one key.
+//   * row-major confusion -- Q_absorbed/context are [H,S,*] (h-major) while Q
+//     and head_contexts are [S,H,*] (s-major). Swapping them scrambles WHICH
+//     query's context lands in which output row. Caught by using S and H that
+//     are both > 1 and DIFFERENT (a square S==H would let a transpose bug pass).
+// pos_base > 0 so the mask is genuinely per-row (valid lengths 4..6 here),
+// not just "row s sees s+1 keys".
+bool test_score_gpu_prefill() {
+    std::cout << "[Test 16] Score GPU Path at S>1 (prefill, causal mask + [H,S,*] layout)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    // H != S deliberately (see above). T = pos_base + S, matching what
+    // attention_layer.cpp now passes.
+    const int H = 5, S = 3, kvl = 37, rope = 13, pos_base = 3;
+    const int T = pos_base + S;   // 6
+    std::mt19937 rng(97531);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> Lc((size_t)T * kvl), Rc((size_t)T * rope);
+    for (auto& v : Lc) v = dist(rng);
+    for (auto& v : Rc) v = dist(rng);
+    // [H,S,*] h-major, exactly as attention_layer.cpp builds them.
+    std::vector<float> Q_absorbed((size_t)H * S * kvl), Q_rope((size_t)H * S * rope);
+    for (auto& v : Q_absorbed) v = dist(rng);
+    for (auto& v : Q_rope) v = dist(rng);
+    float scale = 0.211f;
+
+    // CPU reference: same 4-step math as Test 13, but each row (h,s) attends
+    // only to keys [0, pos_base+s].
+    std::vector<float> context_cpu((size_t)H * S * kvl);
+    for (int h = 0; h < H; ++h) {
+        for (int sq = 0; sq < S; ++sq) {
+            const int valid = pos_base + sq + 1;
+            const float* qa = Q_absorbed.data() + ((size_t)h * S + sq) * kvl;
+            const float* qr = Q_rope.data()     + ((size_t)h * S + sq) * rope;
+            std::vector<double> scores(valid);
+            for (int t = 0; t < valid; ++t) {
+                double s_nope = 0.0, s_rope = 0.0;
+                for (int i = 0; i < kvl; ++i)  s_nope += (double)qa[i] * (double)Lc[(size_t)t * kvl + i];
+                for (int i = 0; i < rope; ++i) s_rope += (double)qr[i] * (double)Rc[(size_t)t * rope + i];
+                scores[t] = (s_nope + s_rope) * scale;
+            }
+            double mx = scores[0];
+            for (int t = 1; t < valid; ++t) mx = std::max(mx, scores[t]);
+            double sum = 0.0;
+            for (int t = 0; t < valid; ++t) { scores[t] = std::exp(scores[t] - mx); sum += scores[t]; }
+            for (int t = 0; t < valid; ++t) scores[t] /= sum;
+            float* out = context_cpu.data() + ((size_t)h * S + sq) * kvl;
+            for (int i = 0; i < kvl; ++i) {
+                double acc = 0.0;
+                for (int t = 0; t < valid; ++t) acc += scores[t] * (double)Lc[(size_t)t * kvl + i];
+                out[i] = (float)acc;
+            }
+        }
+    }
+
+    if (!gpu.ensure_lc_rc_gpu(0, T, kvl, rope, 1ull << 30)) {
+        std::cout << "  -> FAILED (ensure_lc_rc_gpu returned false)\n";
+        return false;
+    }
+    if (!gpu.upload_lc_rc_rows(0, Lc.data(), Rc.data(), 0, T, kvl, rope)) {
+        std::cout << "  -> FAILED (upload_lc_rc_rows returned false)\n";
+        return false;
+    }
+
+    std::vector<float> context_gpu((size_t)H * S * kvl, -999.0f);
+    if (!gpu.score_gpu_batched_host(0, Q_absorbed.data(), Q_rope.data(), context_gpu.data(),
+                                    H, T, kvl, rope, scale, S, pos_base)) {
+        std::cout << "  -> FAILED (score_gpu_batched_host returned false at S>1)\n";
+        return false;
+    }
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (size_t i = 0; i < context_cpu.size(); ++i) {
+        if (std::isnan(context_gpu[i]) || std::isinf(context_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff = std::abs(context_cpu[i] - context_gpu[i]);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, diff / std::max(1e-6f, std::abs(context_cpu[i])));
+    }
+
+    // Explicit anti-aliasing check: row (h,s) must NOT equal row (h,s') for
+    // s != s'. Every row shares the same Lc/Rc and differs only in its query
+    // and its causal limit, so a bug that broadcasts one row over the batch
+    // (a strideB/rows mix-up in the GEMM) would still produce finite, sane
+    // numbers -- and would still pass an aggregate diff check if the CPU
+    // reference were computed the same wrong way. This compares GPU rows
+    // against EACH OTHER, so it is independent of the reference entirely.
+    for (int h = 0; h < H; ++h) {
+        for (int a = 0; a + 1 < S; ++a) {
+            const float* ra = context_gpu.data() + ((size_t)h * S + a) * kvl;
+            const float* rb = context_gpu.data() + ((size_t)h * S + a + 1) * kvl;
+            float d = 0.0f;
+            for (int i = 0; i < kvl; ++i) d = std::max(d, std::abs(ra[i] - rb[i]));
+            if (d < 1e-6f) {
+                std::cout << "  -> FAILED (rows s=" << a << " and s=" << (a + 1)
+                          << " of head " << h << " are identical -- batch dim collapsed)\n";
+                return false;
+            }
+        }
+    }
+
+    bool pass = (max_abs_diff < 1e-4f) || (max_rel_diff < 1e-4f);
+    std::cout << "  -> Score GPU prefill (H=" << H << " S=" << S << " kvl=" << kvl
+              << " rope=" << rope << " pos_base=" << pos_base << " T=" << T << "): "
+              << (pass ? "PASSED" : "FAILED")
+              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+// ---------------------------------------------------------------------------
+// 17. WUV BF16 batched path at S>1 -- the [H,S,kvl] -> [S,H,vh] scatter.
+//
+// The prefill path relies on cuBLAS writing each batch's columns straight into
+// an INTERLEAVED destination (ldc = H*vh, strideC = vh) so no transpose pass is
+// needed. That is the single most likely thing to be silently wrong: a packed
+// [H,S,vh] write produces the right VALUES in the wrong PLACES, which downstream
+// looks like a subtly incoherent model rather than an error. H != S again so a
+// transpose cannot alias.
+bool test_wuv_batched_gpu_prefill() {
+    std::cout << "[Test 17] WUV BF16 Batched GPU Path at S>1 ([H,S,kvl] -> [S,H,vh] scatter)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int H = 5, S = 3, kvl = 37, vh = 23;
+    std::mt19937 rng(24680);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> WUV_vec((size_t)H * kvl * vh);   // [H][vh][kvl]
+    for (auto& v : WUV_vec) v = dist(rng);
+    std::vector<float> X((size_t)H * S * kvl);          // [H,S,kvl]
+    for (auto& v : X) v = dist(rng);
+
+    // CPU reference, written directly in the [S,H,vh] destination layout.
+    // Same-quantization methodology as Test 14 (its S=1 sibling) and Test
+    // 15's own "(a)" reference: pre-round x/w through the SAME fp32->bf16->
+    // fp32 round-trip the GPU path applies, before computing the reference
+    // dot product. FOUND AS A REAL BUG this session: this test originally
+    // compared against an EXACT F32 reference (no bf16 rounding at all)
+    // with a tolerance far too tight for genuine BF16 GEMM noise (1e-4),
+    // which fails on ordinary, expected BF16 rounding error (~0.3-0.6%
+    // relative on values in the 1-5 range) -- confirmed via a one-off debug
+    // dump showing every per-head value already agreeing to within normal
+    // BF16 precision (e.g. cpu=1.08911 gpu=1.09167), not a real correctness
+    // bug (a real scatter/layout bug was also ruled out separately via an
+    // isolated cublasGemmStridedBatchedEx repro of the exact same ldc/
+    // strideC scatter trick, which matched its expected output exactly).
+    std::vector<float> y_cpu((size_t)S * H * vh);
+    for (int h = 0; h < H; ++h)
+        for (int sq = 0; sq < S; ++sq)
+            for (int o = 0; o < vh; ++o) {
+                double acc = 0.0;
+                const float* x = X.data() + ((size_t)h * S + sq) * kvl;
+                const float* w = WUV_vec.data() + (size_t)h * kvl * vh + (size_t)o * kvl;
+                for (int i = 0; i < kvl; ++i) {
+                    float xb = bf16_to_fp32(fp32_to_bf16(x[i]));
+                    float wb = bf16_to_fp32(fp32_to_bf16(w[i]));
+                    acc += (double)xb * (double)wb;
+                }
+                y_cpu[((size_t)sq * H + h) * vh + o] = (float)acc;
+            }
+
+    if (!gpu.upload_wuv_bf16(0, WUV_vec, H, kvl, vh, 1ull << 30)) {
+        std::cout << "  -> FAILED (upload_wuv_bf16 returned false)\n";
+        return false;
+    }
+    std::vector<float> y_gpu((size_t)S * H * vh, -999.0f);
+    if (!gpu.wuv_bf16_batched_host(0, X.data(), y_gpu.data(), H, kvl, vh, S)) {
+        std::cout << "  -> FAILED (wuv_bf16_batched_host returned false at S>1)\n";
+        return false;
+    }
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (size_t i = 0; i < y_cpu.size(); ++i) {
+        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff = std::abs(y_cpu[i] - y_gpu[i]);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, diff / std::max(1e-6f, std::abs(y_cpu[i])));
+    }
+    // Same-quantization reference now (see above) -- tighten to match Test
+    // 14's own S=1 tolerance exactly, since both are now isolating pure GEMM
+    // correctness from BF16's own inherent rounding noise the same way.
+    bool pass = max_rel_diff < 0.01f;
+    std::cout << "  -> WUV batched GPU prefill (H=" << H << " S=" << S << " kvl=" << kvl
+              << " vh=" << vh << "): " << (pass ? "PASSED" : "FAILED")
+              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+// 2026-09-02: S>1 coverage for the int8 WUV path. Test 15 (its S=1 sibling)
+// would stay green even if the batched strides and the [H,S,kvl]->[S,H,vh]
+// scatter were both completely wrong, because at S=1 every stride collapses
+// and ldc is unused -- the exact trap Test 5's K-quant cases fell into. H!=S
+// deliberately, so a transposed index cannot alias into a passing answer.
+bool test_wuv_int8_batched_gpu_prefill() {
+    std::cout << "[Test 22] WUV int8 Batched GPU Path at S>1 ([H,S,kvl] -> [S,H,vh] scatter)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int H = 5, S = 3, kvl = 37, vh = 23;
+    std::mt19937 rng(13579);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> WUV_vec((size_t)H * kvl * vh);   // [H][vh][kvl]
+    for (auto& v : WUV_vec) v = dist(rng);
+    std::vector<float> X((size_t)H * S * kvl);          // [H,S,kvl]
+    for (auto& v : X) v = dist(rng);
+
+    // Same-quantization reference, written directly in the [S,H,vh]
+    // destination layout: per-output-row symmetric int8 quantize/dequantize
+    // (byte-for-byte upload_wuv_int8's scheme), then the same fp32->bf16
+    // round-trip on both operands that the BF16-matched GEMM applies. This
+    // isolates batched-stride/scatter correctness from int8's own accuracy
+    // cost, exactly as Test 15 does at S=1.
+    std::vector<float> y_cpu((size_t)S * H * vh);
+    for (int h = 0; h < H; ++h)
+        for (int o = 0; o < vh; ++o) {
+            const float* w = WUV_vec.data() + (size_t)h * kvl * vh + (size_t)o * kvl;
+            float max_abs = 0.0f;
+            for (int i = 0; i < kvl; ++i) max_abs = std::max(max_abs, std::abs(w[i]));
+            const float scale = max_abs / 127.0f;
+            for (int sq = 0; sq < S; ++sq) {
+                const float* x = X.data() + ((size_t)h * S + sq) * kvl;
+                double acc = 0.0;
+                for (int i = 0; i < kvl; ++i) {
+                    float w_dq = w[i];
+                    if (scale > 0.0f) {
+                        float qf = std::round(w[i] / scale);
+                        qf = std::max(-127.0f, std::min(127.0f, qf));
+                        w_dq = qf * scale;
+                    }
+                    acc += (double)bf16_to_fp32(fp32_to_bf16(w_dq))
+                         * (double)bf16_to_fp32(fp32_to_bf16(x[i]));
+                }
+                y_cpu[((size_t)sq * H + h) * vh + o] = (float)acc;
+            }
+        }
+
+    if (!gpu.upload_wuv_int8(0, WUV_vec, H, kvl, vh, 1ull << 30)) {
+        std::cout << "  -> FAILED (upload_wuv_int8 returned false)\n";
+        return false;
+    }
+    std::vector<float> y_gpu((size_t)S * H * vh, -999.0f);
+    if (!gpu.wuv_int8_batched_host(0, X.data(), y_gpu.data(), H, kvl, vh, S)) {
+        std::cout << "  -> FAILED (wuv_int8_batched_host returned false at S>1)\n";
+        return false;
+    }
+
+    float max_abs_diff = 0.0f, max_rel_diff = 0.0f;
+    for (size_t i = 0; i < y_cpu.size(); ++i) {
+        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff = std::abs(y_cpu[i] - y_gpu[i]);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        max_rel_diff = std::max(max_rel_diff, diff / std::max(1e-6f, std::abs(y_cpu[i])));
+    }
+    // Independent anti-aliasing check, NOT dependent on the CPU reference:
+    // rows sq and sq+1 of the same head share the weight matrix and differ
+    // only in the query, so a strideB/ldc mix-up that broadcast one query
+    // across the batch would still produce finite, plausible numbers AND
+    // would still pass an aggregate diff check if the reference happened to
+    // be computed the same wrong way. Distinct random queries must give
+    // distinct outputs.
+    bool distinct = false;
+    for (int o = 0; o < vh && !distinct; ++o)
+        if (std::abs(y_gpu[(size_t)0 * H * vh + o] - y_gpu[(size_t)1 * H * vh + o]) > 1e-6f)
+            distinct = true;
+    if (!distinct) {
+        std::cout << "  -> FAILED (query rows s=0 and s=1 of head 0 are identical -- "
+                     "batched stride/scatter is broadcasting one row)\n";
+        return false;
+    }
+
+    bool pass = max_rel_diff < 0.01f;
+    std::cout << "  -> WUV int8 batched GPU prefill (H=" << H << " S=" << S << " kvl=" << kvl
+              << " vh=" << vh << "): " << (pass ? "PASSED" : "FAILED")
+              << "  max_abs_diff=" << max_abs_diff << " max_rel_diff=" << max_rel_diff << "\n";
+    return pass;
+}
+
+bool test_wuv_int8_batched_gpu() {
+    std::cout << "[Test 15] WUV int8 Batched GPU Path (score down-projection)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    const int H = 5, kvl = 37, vh = 23;  // same deliberately non-uniform shape as Test 14
+    std::mt19937 rng(7171);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> WUV((size_t)H * kvl * vh);
+    for (auto& v : WUV) v = dist(rng);
+    std::vector<float> X((size_t)H * kvl);
+    for (auto& v : X) v = dist(rng);
+
+    // Same-quantization CPU reference: per-row (per h,o) symmetric int8
+    // quantize/dequantize, byte-for-byte the same scheme upload_wuv_int8
+    // uses, then an exact-F32 dot product from the dequantized values
+    // (activation X is NOT quantized in this design -- only the weight
+    // is -- matching wuv_int8_batched_host's own contract).
+    std::vector<float> y_same_quant((size_t)H * vh, 0.0f);
+    // Exact F32 reference (no quantization anywhere) -- the honest
+    // real-world accuracy number.
+    std::vector<float> y_exact((size_t)H * vh, 0.0f);
+    for (int h = 0; h < H; ++h) {
+        const float* Wh = WUV.data() + (size_t)h * kvl * vh;
+        const float* Xh = X.data() + (size_t)h * kvl;
+        float* Yh_q = y_same_quant.data() + (size_t)h * vh;
+        float* Yh_e = y_exact.data() + (size_t)h * vh;
+        for (int o = 0; o < vh; ++o) {
+            const float* Wo = Wh + (size_t)o * kvl;
+            float max_abs = 0.0f;
+            for (int i = 0; i < kvl; ++i) max_abs = std::max(max_abs, std::abs(Wo[i]));
+            float scale = max_abs / 127.0f;
+            double acc_q = 0.0, acc_e = 0.0;
+            for (int i = 0; i < kvl; ++i) {
+                float w_dequant = Wo[i];
+                if (scale > 0.0f) {
+                    float qf = std::round(Wo[i] / scale);
+                    qf = std::max(-127.0f, std::min(127.0f, qf));
+                    w_dequant = qf * scale;
+                }
+                // Weight side also passes through the same fp32->bf16
+                // round-trip the dequant kernel's own output feeds into
+                // (the GEMM itself is BF16-matched) -- and the activation
+                // side is bf16-rounded too, matching wuv_int8_batched_
+                // host's own h_wuv_ctx_bf16_scratch conversion.
+                float w_bf16 = bf16_to_fp32(fp32_to_bf16(w_dequant));
+                float x_bf16 = bf16_to_fp32(fp32_to_bf16(Xh[i]));
+                acc_q += (double)w_bf16 * (double)x_bf16;
+                acc_e += (double)Wo[i] * (double)Xh[i];
+            }
+            Yh_q[o] = (float)acc_q;
+            Yh_e[o] = (float)acc_e;
+        }
+    }
+
+    std::vector<float> WUV_vec(WUV.begin(), WUV.end());
+    if (!gpu.upload_wuv_int8(0, WUV_vec, H, kvl, vh, 1ull << 30)) {
+        std::cout << "  -> FAILED (upload_wuv_int8 returned false)\n";
+        return false;
+    }
+
+    std::vector<float> y_gpu((size_t)H * vh, -999.0f);
+    if (!gpu.wuv_int8_batched_host(0, X.data(), y_gpu.data(), H, kvl, vh)) {
+        std::cout << "  -> FAILED (wuv_int8_batched_host returned false)\n";
+        return false;
+    }
+
+    float max_abs_diff_q = 0.0f, max_rel_diff_q = 0.0f;
+    float max_abs_diff_e = 0.0f, max_rel_diff_e = 0.0f;
+    for (size_t i = 0; i < y_gpu.size(); ++i) {
+        if (std::isnan(y_gpu[i]) || std::isinf(y_gpu[i])) {
+            std::cout << "  -> FAILED (NaN/Inf at output index " << i << ")\n";
+            return false;
+        }
+        float diff_q = std::abs(y_same_quant[i] - y_gpu[i]);
+        float rel_q = diff_q / std::max(1e-6f, std::abs(y_same_quant[i]));
+        max_abs_diff_q = std::max(max_abs_diff_q, diff_q);
+        max_rel_diff_q = std::max(max_rel_diff_q, rel_q);
+
+        float diff_e = std::abs(y_exact[i] - y_gpu[i]);
+        float rel_e = diff_e / std::max(1e-6f, std::abs(y_exact[i]));
+        max_abs_diff_e = std::max(max_abs_diff_e, diff_e);
+        max_rel_diff_e = std::max(max_rel_diff_e, rel_e);
+    }
+
+    // Gate ONLY on the same-quantization comparison (kernel correctness,
+    // should be tight) -- the exact-F32 comparison is reported for
+    // visibility into int8's real accuracy cost, not gated, since a large
+    // relative error there is expected int8 quantization behavior, not a
+    // bug (same principle as this file's own Q6_K/Q8_0 exact-vs-lossy
+    // distinction elsewhere). CONFIRMED via a one-off real-dims run
+    // (H=64,kvl=512,vh=256, GLM-5.2's actual shape, not kept as the
+    // permanent test shape here since the small/non-uniform shape above is
+    // better for catching indexing/stride bugs): every worst-relative-
+    // error element traced back to a near-zero y_exact (e.g. 0.00106),
+    // while absolute error stayed small and consistent (0.005-0.055)
+    // across every output magnitude including large ones (0.05% relative
+    // error at y_exact=10.9) -- the classic near-zero-crossing artifact,
+    // not a real accuracy problem.
+    bool pass = max_rel_diff_q < 0.01f;
+    std::cout << "  -> WUV int8 batched GPU (H=" << H << " kvl=" << kvl << " vh=" << vh << "): "
+              << (pass ? "PASSED" : "FAILED")
+              << "  vs-same-quant: max_abs_diff=" << max_abs_diff_q << " max_rel_diff=" << max_rel_diff_q
+              << "  |  vs-exact-F32 (informational): max_abs_diff=" << max_abs_diff_e
+              << " max_rel_diff=" << max_rel_diff_e << "\n";
     return pass;
 }
 
@@ -1541,6 +2167,210 @@ void bench_qabsorb_cpu_vs_gpu() {
                   << "ms/call  (" << (fresh_ms / persist_ms) << "x -- this is the whole block the "
                      "production qabsorb= bucket wraps, serial gather both ways since S=1)\n";
     }
+}
+
+// Gated feasibility bench (MOESTREAM_RUN_BENCH=1, same convention as the
+// others above) for dot_iq2_xxs_vnni_prototype (kernels_cpu.cpp) -- answers
+// "does a VNNI int8 dot beat the existing dot_iq2_xxs_f32_avx512 FMA path"
+// BEFORE committing to a real production kernel (see CLAUDE.md's
+// cpu_offload_max_experts investigation: this codebase's own CPU expert
+// path runs ~9x slower per call than the GPU path, and IQ2_XXS/IQ3_XXS --
+// GLM-5.2's actual routed-expert types, 71-76/78 layers -- were confirmed
+// via source read to have NO VNNI fast path at all, unlike Q4_0/Q6_K/Q8_0
+// elsewhere in this file). Times BOTH the existing FMA baseline and the new
+// VNNI prototype at a real production row size, AND checks accuracy of
+// both against ggml's own independent reference (ggml_dequant_row + an
+// exact F64 dot) -- not just against each other, matching this project's
+// own established lesson (see CLAUDE.md's Q8_0/K-quant VNNI investigation)
+// that a lossy path must never be its own test oracle.
+void bench_iq2xxs_vnni_prototype() {
+    std::cout << "\n[Bench] IQ2_XXS CPU dot: existing FMA path vs EXPERIMENTAL VNNI prototype...\n";
+    const int I = 2048;  // real production row size (moe_inter-class dim)
+    assert(I % 256 == 0);
+    std::mt19937 rng(2718);
+    std::uniform_real_distribution<float> wdist(-2.0f, 2.0f);
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+
+    std::vector<float> w_f32((size_t)I);
+    for (auto& v : w_f32) v = wdist(rng);
+    int rb = row_bytes(GGUFType::IQ2_XXS, I);
+    std::vector<uint8_t> w_bytes((size_t)rb);
+    int ok = ggml_quantize_row_ref((uint32_t)GGUFType::IQ2_XXS, w_f32.data(), w_bytes.data(), I);
+    assert(ok && "ggml_quantize_row_ref should support IQ2_XXS");
+
+    std::vector<float> x((size_t)I);
+    for (auto& v : x) v = xdist(rng);
+
+    // Exact reference: ggml's OWN independent dequant (not this project's
+    // AVX-512 port) + a plain F64-accumulated dot -- the "don't let a lossy
+    // path be its own oracle" lesson from the Q8_0/K-quant investigation.
+    std::vector<float> w_exact((size_t)I, -999.0f);
+    int dq_ok = ggml_dequant_row((uint32_t)GGUFType::IQ2_XXS, w_bytes.data(), w_exact.data(), I);
+    assert(dq_ok && "ggml_dequant_row should support IQ2_XXS");
+    double exact = 0.0;
+    for (int i = 0; i < I; ++i) exact += (double)w_exact[i] * (double)x[i];
+
+    // Existing FMA baseline (production code, unmodified).
+    float y_fma = dot_iq2_xxs_f32_avx512(w_bytes.data(), x.data(), I);
+
+    // VNNI prototype needs int8-quantized activations (32-wide blocks, same
+    // granularity dot_iq2_xxs_vnni_prototype indexes by).
+    int num_blocks = I / 32;
+    std::vector<block_q8_0> xq(num_blocks);
+    quantize_activations_q8_0(x.data(), xq.data(), I);
+    float y_vnni = dot_iq2_xxs_vnni_prototype(w_bytes.data(), xq.data(), I);
+
+    // AVX2 prototype (ggml upstream port) needs Q8_K-quantized activations
+    // (one scale per 256-element superblock, not per-32 like block_q8_0).
+    int num_superblocks = I / 256;
+    std::vector<block_q8_K_local> xk(num_superblocks);
+    quantize_row_q8_K_ref(x.data(), xk.data(), I);
+    float y_avx2 = dot_iq2_xxs_avx2_prototype(w_bytes.data(), xk.data(), I);
+
+    auto rel_err = [&](double v) {
+        return std::abs(v - exact) / std::max(1e-6, std::abs(exact));
+    };
+    std::cout << std::setprecision(6)
+              << "  Accuracy (I=" << I << "): exact_ref=" << exact
+              << "  FMA=" << y_fma << " (rel_err=" << rel_err(y_fma) << ")"
+              << "  VNNI=" << y_vnni << " (rel_err=" << rel_err(y_vnni) << ")"
+              << "  AVX2(ggml-port)=" << y_avx2 << " (rel_err=" << rel_err(y_avx2) << ")\n";
+
+    // A single I=2048 dot is sub-microsecond -- WARMUP/ITERS sized (and
+    // reported in us, not ms) specifically so the per-call number clears
+    // std::chrono's real resolution floor instead of rounding to noise.
+    const int WARMUP = 200, ITERS = 200000;
+    for (int it = 0; it < WARMUP; ++it) dot_iq2_xxs_f32_avx512(w_bytes.data(), x.data(), I);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) dot_iq2_xxs_f32_avx512(w_bytes.data(), x.data(), I);
+    double fma_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    for (int it = 0; it < WARMUP; ++it) dot_iq2_xxs_vnni_prototype(w_bytes.data(), xq.data(), I);
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) dot_iq2_xxs_vnni_prototype(w_bytes.data(), xq.data(), I);
+    double vnni_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    // quantize_activations_q8_0's own cost -- paid ONCE per token (all O
+    // output rows share the same quantized activation), not once per row
+    // like the two dot timings above, so report it separately rather than
+    // fold it into vnni_us (which would misrepresent the real per-row cost
+    // at any realistic O > 1).
+    for (int it = 0; it < WARMUP; ++it) quantize_activations_q8_0(x.data(), xq.data(), I);
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) quantize_activations_q8_0(x.data(), xq.data(), I);
+    double qact_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    for (int it = 0; it < WARMUP; ++it) dot_iq2_xxs_avx2_prototype(w_bytes.data(), xk.data(), I);
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) dot_iq2_xxs_avx2_prototype(w_bytes.data(), xk.data(), I);
+    double avx2_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    for (int it = 0; it < WARMUP; ++it) quantize_row_q8_K_ref(x.data(), xk.data(), I);
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) quantize_row_q8_K_ref(x.data(), xk.data(), I);
+    double qk_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    std::cout << std::setprecision(4)
+              << "  Throughput (single dot, I=" << I << "): FMA=" << fma_us
+              << "us/call  VNNI=" << vnni_us << "us/call (speedup=" << (fma_us / vnni_us) << "x)"
+              << "  AVX2(ggml-port)=" << avx2_us << "us/call (speedup=" << (fma_us / avx2_us) << "x)\n"
+              << "  Activation quant cost (paid once/token, not once/row): "
+                 "Q8_0-style=" << qact_us << "us  Q8_K-style=" << qk_us << "us\n";
+}
+
+// IQ3_XXS sibling of the bench above -- GLM-5.2's down-proj type (same
+// 71-76/78 layers as IQ2_XXS gate/up). Only the ggml-port AVX2 kernel is
+// compared here (the VNNI prototype was never built for IQ3_XXS -- its own
+// verdict on IQ2_XXS already ruled that avenue out before IQ3_XXS's own
+// port would have been attempted).
+void bench_iq3xxs_avx2_prototype() {
+    std::cout << "\n[Bench] IQ3_XXS CPU dot: existing FMA path vs EXPERIMENTAL AVX2 (ggml-port) prototype...\n";
+    const int I = 2048;
+    assert(I % 256 == 0);
+    std::uniform_real_distribution<float> wdist(-2.0f, 2.0f);
+    std::uniform_real_distribution<float> xdist(-1.0f, 1.0f);
+
+    // Accuracy across N independent rows/seeds -- a single draw (the first
+    // real number here came back at 1.6% rel_err, notably higher than
+    // IQ2_XXS's 0.19%) isn't enough to tell "this format is just noisier"
+    // from "this seed happened to be unlucky" apart. Matches Test 7's own
+    // run_dequant_case discipline (multiple rows, not one).
+    const int N_ROWS = 20;
+    double worst_fma = 0.0, worst_avx2 = 0.0, sum_avx2 = 0.0;
+    float y_fma_last = 0.0f, y_avx2_last = 0.0f;
+    double exact_last = 0.0;
+    std::vector<uint8_t> w_bytes_last;
+    std::vector<float> x_last;
+    std::vector<block_q8_K_local> xk_last;
+
+    int rb = row_bytes(GGUFType::IQ3_XXS, I);
+    for (int row = 0; row < N_ROWS; ++row) {
+        std::mt19937 rng(1618 + row);
+        std::vector<float> w_f32((size_t)I);
+        for (auto& v : w_f32) v = wdist(rng);
+        std::vector<uint8_t> w_bytes((size_t)rb);
+        int ok = ggml_quantize_row_ref((uint32_t)GGUFType::IQ3_XXS, w_f32.data(), w_bytes.data(), I);
+        assert(ok && "ggml_quantize_row_ref should support IQ3_XXS");
+
+        std::vector<float> x((size_t)I);
+        for (auto& v : x) v = xdist(rng);
+
+        std::vector<float> w_exact((size_t)I, -999.0f);
+        int dq_ok = ggml_dequant_row((uint32_t)GGUFType::IQ3_XXS, w_bytes.data(), w_exact.data(), I);
+        assert(dq_ok && "ggml_dequant_row should support IQ3_XXS");
+        double exact = 0.0;
+        for (int i = 0; i < I; ++i) exact += (double)w_exact[i] * (double)x[i];
+
+        float y_fma = dot_iq3_xxs_f32_avx512(w_bytes.data(), x.data(), I);
+        int num_superblocks = I / 256;
+        std::vector<block_q8_K_local> xk(num_superblocks);
+        quantize_row_q8_K_ref(x.data(), xk.data(), I);
+        float y_avx2 = dot_iq3_xxs_avx2_prototype(w_bytes.data(), xk.data(), I);
+
+        auto rel_err = [&](double v) { return std::abs(v - exact) / std::max(1e-6, std::abs(exact)); };
+        worst_fma = std::max(worst_fma, rel_err(y_fma));
+        double re = rel_err(y_avx2);
+        worst_avx2 = std::max(worst_avx2, re);
+        sum_avx2 += re;
+
+        if (row == N_ROWS - 1) {
+            y_fma_last = y_fma; y_avx2_last = y_avx2; exact_last = exact;
+            w_bytes_last = std::move(w_bytes); x_last = std::move(x); xk_last = std::move(xk);
+        }
+    }
+    std::cout << std::setprecision(6)
+              << "  Accuracy over " << N_ROWS << " row(s) (I=" << I << "): "
+                 "FMA worst_rel_err=" << worst_fma
+              << "  AVX2(ggml-port) avg_rel_err=" << (sum_avx2 / N_ROWS)
+              << " worst_rel_err=" << worst_avx2
+              << "  (last row: exact_ref=" << exact_last << " FMA=" << y_fma_last
+              << " AVX2=" << y_avx2_last << ")\n";
+
+    const uint8_t* w_bytes_ptr = w_bytes_last.data();
+    const float* x_ptr = x_last.data();
+    const block_q8_K_local* xk_ptr = xk_last.data();
+
+    const int WARMUP = 200, ITERS = 200000;
+    for (int it = 0; it < WARMUP; ++it) dot_iq3_xxs_f32_avx512(w_bytes_ptr, x_ptr, I);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) dot_iq3_xxs_f32_avx512(w_bytes_ptr, x_ptr, I);
+    double fma_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    for (int it = 0; it < WARMUP; ++it) dot_iq3_xxs_avx2_prototype(w_bytes_ptr, xk_ptr, I);
+    t0 = std::chrono::high_resolution_clock::now();
+    for (int it = 0; it < ITERS; ++it) dot_iq3_xxs_avx2_prototype(w_bytes_ptr, xk_ptr, I);
+    double avx2_us = std::chrono::duration<double, std::micro>(
+        std::chrono::high_resolution_clock::now() - t0).count() / ITERS;
+
+    std::cout << std::setprecision(4)
+              << "  Throughput (single dot, I=" << I << "): FMA=" << fma_us
+              << "us/call  AVX2(ggml-port)=" << avx2_us << "us/call (speedup=" << (fma_us / avx2_us) << "x)\n";
 }
 
 // ------------------------------------------------------------------
@@ -1742,6 +2572,1730 @@ bool test_real_expert_iq2xxs_dequant() {
     return pass;
 }
 
+// ------------------------------------------------------------------
+// 18. Mixed-precision-within-one-layer Phase 1 correctness test.
+//
+// Tests the FILE/loader/GPU-dispatch layer directly, independent of
+// StreamingEngine's own sanity_check_unpacked_format() (that function's
+// own relaxation is separately verified by Test 19, right below). Given a
+// real, hand-built GGUF file whose layer 0 has two experts of GENUINELY
+// DIFFERENT real quant types (unpacked per-expert tensor naming,
+// blk.0.ffn_{gate,up,down}.<E>.weight), does gguf_loader.hpp correctly
+// parse and offset-resolve BOTH experts, and does the GPU fused-kernel
+// dispatch path correctly handle two different types loaded side-by-side
+// in one session (no cross-type __constant__-memory bleed, no
+// offset/stride confusion)?
+//
+// Both experts' gate/up/down bytes are copied VERBATIM (no re-quantization)
+// from two real, already-verified-correct sources this session established:
+// expert 0 from production (IQ2_XXS/IQ2_XXS/IQ3_XXS, layer 20 expert 5),
+// expert 1 from the real downloaded IQ1_S release (IQ1_S/IQ1_S/IQ3_XXS,
+// layer 60 expert 7 -- inside the confirmed-real-IQ1_S range 56-67).
+// Gated (SKIPPED, not FAILED) behind both source paths existing, matching
+// Test 11's own "real files this exact session has, not every checkout"
+// convention -- this is a real-hardware/real-data verification, not a
+// portable unit test.
+bool test_mixed_precision_layer() {
+    std::cout << "[Test 18] Mixed-Precision-Within-One-Layer (Phase 1: file read + VRAM dispatch)...\n";
+
+    const std::string prod_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align";
+    const std::string iq1s_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align/"
+        "repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
+
+    struct ExpertSpec { std::string src_path; int src_layer; int src_expert; int out_expert; };
+    std::vector<ExpertSpec> specs = {
+        {prod_path, 20, 5, 0},
+        {iq1s_path, 60, 7, 1},
+    };
+
+    struct OutTensor { std::string name; GGUFType type; std::vector<uint64_t> shape; std::vector<uint8_t> data; };
+    std::vector<OutTensor> out_tensors;
+
+    for (auto& spec : specs) {
+        GGUFFile f;
+        if (!f.load_header(spec.src_path)) {
+            std::cout << "  -> SKIPPED (real source not available: " << spec.src_path << ")\n";
+            return true;
+        }
+        for (const char* kind : {"gate", "up", "down"}) {
+            std::string tn = "blk." + std::to_string(spec.src_layer) + ".ffn_" + kind + "_exps.weight";
+            auto it = f.tensors.find(tn);
+            if (it == f.tensors.end()) {
+                std::cout << "  -> FAILED (tensor not found: " << tn << " in " << spec.src_path << ")\n";
+                return false;
+            }
+            const GGUFTensor& t = it->second;
+            uint64_t n_experts = t.shape.back();
+            uint64_t bpe = t.size_bytes / n_experts;
+            uint64_t eoff = t.offset + (uint64_t)spec.src_expert * bpe;
+            std::vector<uint8_t> raw(bpe);
+            ssize_t got = pread(f.shard_fds[t.shard_idx], raw.data(), bpe, eoff);
+            if (got != (ssize_t)bpe) {
+                std::cout << "  -> FAILED (short read for " << tn << " expert " << spec.src_expert << ")\n";
+                return false;
+            }
+            OutTensor ot;
+            ot.name = "blk.0.ffn_" + std::string(kind) + "." + std::to_string(spec.out_expert) + ".weight";
+            ot.type = t.type;
+            ot.shape.assign(t.shape.begin(), t.shape.end() - 1);
+            ot.data = std::move(raw);
+            out_tensors.push_back(std::move(ot));
+        }
+    }
+
+    // Write a real, minimal, valid GGUF file (0 KV pairs -- this test drives
+    // gguf_loader.hpp's tensor-table parsing directly, not the full
+    // StreamingEngine/architecture-discovery pipeline, which doesn't need
+    // any KV keys to exercise what's under test here).
+    std::string out_path = "/tmp/moestream_test_mixed_layer0.gguf";
+    {
+        FILE* out = fopen(out_path.c_str(), "wb");
+        if (!out) { std::cout << "  -> FAILED (cannot write " << out_path << ")\n"; return false; }
+        auto w_u32 = [&](uint32_t v) { fwrite(&v, 4, 1, out); };
+        auto w_u64 = [&](uint64_t v) { fwrite(&v, 8, 1, out); };
+        auto w_str = [&](const std::string& s) { uint64_t n = s.size(); fwrite(&n, 8, 1, out); fwrite(s.data(), 1, n, out); };
+        fwrite("GGUF", 1, 4, out);
+        w_u32(3);
+        w_u64(out_tensors.size());
+        w_u64(0);
+        const uint64_t ALIGN = 32;
+        uint64_t running = 0;
+        std::vector<uint64_t> offs;
+        for (auto& ot : out_tensors) {
+            w_str(ot.name);
+            w_u32((uint32_t)ot.shape.size());
+            for (auto d : ot.shape) w_u64(d);
+            w_u32((uint32_t)ot.type);
+            offs.push_back(running);
+            w_u64(running);
+            running += ot.data.size();
+            running = (running + ALIGN - 1) & ~(ALIGN - 1);
+        }
+        long pos = ftell(out);
+        long data_start = (pos + (long)ALIGN - 1) & ~((long)ALIGN - 1);
+        while (ftell(out) < data_start) fputc(0, out);
+        for (size_t i = 0; i < out_tensors.size(); ++i) {
+            fseek(out, data_start + (long)offs[i], SEEK_SET);
+            fwrite(out_tensors[i].data.data(), 1, out_tensors[i].data.size(), out);
+        }
+        fclose(out);
+    }
+
+    // Reload through the REAL loader -- this is the actual thing under test.
+    GGUFFile mixed;
+    if (!mixed.load_header(out_path)) {
+        std::cout << "  -> FAILED (gguf_loader.hpp could not parse the hand-built mixed file)\n";
+        return false;
+    }
+    if (mixed.tensors.size() != out_tensors.size()) {
+        std::cout << "  -> FAILED (loaded " << mixed.tensors.size() << " tensors, expected " << out_tensors.size() << ")\n";
+        return false;
+    }
+
+    CudaManager gpu;
+    bool have_gpu = gpu.initialize();
+    if (!have_gpu) std::cout << "  (no CUDA device -- VRAM dispatch checks skipped, file-read checks still run)\n";
+
+    bool all_ok = true;
+    for (auto& [name, t] : mixed.tensors) {
+        uint64_t numel = 1;
+        for (auto d : t.shape) numel *= d;
+
+        std::vector<uint8_t> raw(t.size_bytes);
+        ssize_t got = pread(mixed.shard_fds[t.shard_idx], raw.data(), t.size_bytes, t.offset);
+        if (got != (ssize_t)t.size_bytes) {
+            std::cout << "  -> FAILED (" << name << ": short read from reloaded file)\n";
+            all_ok = false; continue;
+        }
+
+        // Round-trip: dequant the reloaded bytes, compare byte-for-byte
+        // against the SAME expert's bytes read fresh from its own original
+        // source (not just "dequants without crashing" -- proves the
+        // write+reload path preserved the data exactly).
+        auto& spec = (name.find(".0.weight") != std::string::npos) ? specs[0] : specs[1];
+        std::string kind = name.find("gate") != std::string::npos ? "gate" : name.find("up") != std::string::npos ? "up" : "down";
+        GGUFFile fsrc;
+        bool byte_identical = false;
+        if (fsrc.load_header(spec.src_path)) {
+            std::string sn = "blk." + std::to_string(spec.src_layer) + ".ffn_" + kind + "_exps.weight";
+            auto sit = fsrc.tensors.find(sn);
+            if (sit != fsrc.tensors.end()) {
+                const GGUFTensor& st = sit->second;
+                uint64_t bpe = st.size_bytes / st.shape.back();
+                uint64_t soff = st.offset + (uint64_t)spec.src_expert * bpe;
+                std::vector<uint8_t> sraw(bpe);
+                pread(fsrc.shard_fds[st.shard_idx], sraw.data(), bpe, soff);
+                byte_identical = (sraw.size() == raw.size()) && (std::memcmp(sraw.data(), raw.data(), raw.size()) == 0);
+            }
+        }
+        std::vector<float> deq(numel);
+        bool dequant_ok = ggml_dequant_row((uint32_t)t.type, raw.data(), deq.data(), (int)numel);
+        size_t nan_ct = 0;
+        for (auto v : deq) if (std::isnan(v) || std::isinf(v)) nan_ct++;
+
+        std::cout << "  " << name << " type=" << (t.type == GGUFType::IQ1_S ? "IQ1_S" :
+                     t.type == GGUFType::IQ2_XXS ? "IQ2_XXS" : t.type == GGUFType::IQ3_XXS ? "IQ3_XXS" : "?")
+                   << " round-trip=" << (byte_identical ? "BYTE-IDENTICAL" : "MISMATCH")
+                   << " dequant_NaN=" << nan_ct << "/" << numel;
+        if (!byte_identical || !dequant_ok || nan_ct > 0) all_ok = false;
+
+        // VRAM push + real fused-kernel dispatch, mirroring Test 5's own
+        // offload_tensor_to_vram/dense_matmul_host usage exactly.
+        if (have_gpu) {
+            QuantizedTensor qt;
+            qt.meta.type = t.type;
+            qt.meta.shape = t.shape;
+            qt.meta.size_bytes = t.size_bytes;
+            qt.host_ptr = raw.data();
+            int I = (int)t.shape[0], O = (int)t.shape[1];
+            if (!gpu.offload_tensor_to_vram(qt)) {
+                std::cout << " VRAM=FAIL(offload)\n"; all_ok = false; continue;
+            }
+            std::mt19937 rng(4321);
+            std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+            std::vector<float> x(I);
+            for (auto& v : x) v = dist(rng);
+            std::vector<float> y_gpu(O, -999.0f);
+            bool gpu_ok = gpu.dense_matmul_host(t.type, qt.device_ptr, x.data(), y_gpu.data(), 1, I, O);
+            cudaFree(qt.device_ptr);
+            if (!gpu_ok) { std::cout << " VRAM=FAIL(matmul)\n"; all_ok = false; continue; }
+
+            int rb = (int)(t.size_bytes / O);
+            std::vector<float> wrow(I), y_cpu(O, 0.0f);
+            for (int o = 0; o < O; ++o) {
+                ggml_dequant_row((uint32_t)t.type, raw.data() + (size_t)o * rb, wrow.data(), I);
+                double acc = 0.0;
+                for (int i = 0; i < I; ++i) acc += (double)x[i] * (double)wrow[i];
+                y_cpu[o] = (float)acc;
+            }
+            float max_abs = 0, max_rel = 0;
+            for (int o = 0; o < O; ++o) {
+                float d = std::abs(y_cpu[o] - y_gpu[o]);
+                max_abs = std::max(max_abs, d);
+                max_rel = std::max(max_rel, d / std::max(1e-6f, std::abs(y_cpu[o])));
+            }
+            bool vram_ok = (max_abs < 1e-2f) || (max_rel < 0.02f);
+            std::cout << " VRAM(I=" << I << ",O=" << O << ")=" << (vram_ok ? "OK" : "SUSPECT")
+                       << " max_abs=" << max_abs << " max_rel=" << max_rel;
+            if (!vram_ok) all_ok = false;
+        }
+        std::cout << "\n";
+    }
+
+    std::cout << "  -> " << (all_ok ? "PASSED" : "FAILED")
+              << " (two different real quant types, loaded side-by-side in one layer, "
+                 "one process: file read, dequant round-trip, and GPU dispatch all checked)\n";
+    return all_ok;
+}
+
+// ------------------------------------------------------------------
+// 19. sanity_check_unpacked_format()'s RELAXATION itself, exercised
+//     through the real StreamingEngine methods (not a reimplementation of
+//     their logic) -- reuses the same hand-built mixed-type file Test 18
+//     already wrote, so this test depends on Test 18 having run first in
+//     the same process (main() below preserves that order).
+//
+// Three things checked, all against the real engine.hpp code:
+//   (a) sanity_check_unpacked_format() no longer FATAL-refuses a layer
+//       whose two experts have different byte sizes (the old behavior,
+//       now removed) -- it must return true.
+//   (b) it correctly flags that layer in layer_has_mixed_expert_sizes.
+//   (c) expert_layer_geometry() -- the "one number represents the whole
+//       layer" shortcut every RAM/VRAM-sizing caller still uses, and which
+//       has NOT been made per-expert-aware yet -- correctly REFUSES
+//       (returns false) for this flagged layer, rather than silently
+//       handing back expert 0's size as if it applied to expert 1 too.
+//       This is the safety net: Phase 2/3 callers that haven't been
+//       updated yet get a clean "not supported for this layer" signal
+//       instead of a silent wrong-size bug.
+// unpacked_expert_geometry() itself (the real per-expert lookup, which
+// Phase 2 work will call directly) is deliberately NOT re-tested here --
+// Test 18 already exercises it for both experts via the exact same code
+// path, reading back genuinely different, correct byte counts for each.
+// ------------------------------------------------------------------
+bool test_unpacked_format_relaxed_check() {
+    std::cout << "[Test 19] sanity_check_unpacked_format() relaxation (mixed-size layer accepted, "
+                 "geometry shortcut refuses)...\n";
+
+    const std::string mixed_path = "/tmp/moestream_test_mixed_layer0.gguf";
+    StreamingEngine engine;
+    if (!engine.model_file.load_header(mixed_path)) {
+        std::cout << "  -> SKIPPED (Test 18's mixed-layer file not found -- did it run first?)\n";
+        return true;
+    }
+    // Test 18's file carries 0 KV pairs by design (see its own comment) --
+    // architecture_config is normally populated by graph_initializer.cpp's
+    // discovery pass, which this test deliberately does not invoke (out of
+    // scope: this test drives sanity_check_unpacked_format()/expert_layer_
+    // geometry() directly, not the full model-load pipeline). Set exactly
+    // what those two functions read.
+    engine.model_file.architecture_config.n_layers = 1;
+    engine.model_file.architecture_config.n_experts = 2;
+    engine.unpacked_expert_format = true;
+
+    bool all_ok = true;
+
+    bool sanity_ok = engine.sanity_check_unpacked_format();
+    std::cout << "  sanity_check_unpacked_format(): " << (sanity_ok ? "true (accepted)" : "false (REFUSED)") << "\n";
+    if (!sanity_ok) {
+        std::cout << "  -> FAILED (a genuinely mixed-size layer should be ACCEPTED now, not refused -- "
+                     "the old hard-fail should be gone)\n";
+        all_ok = false;
+    }
+
+    bool flagged_mixed = !engine.layer_has_mixed_expert_sizes.empty() && engine.layer_has_mixed_expert_sizes[0];
+    std::cout << "  layer_has_mixed_expert_sizes[0]: " << (flagged_mixed ? "true" : "false") << "\n";
+    if (!flagged_mixed) {
+        std::cout << "  -> FAILED (layer 0 genuinely has two different-sized experts and must be flagged)\n";
+        all_ok = false;
+    }
+
+    size_t gb, ub, db;
+    const GGUFTensor *gM, *uM, *dM;
+    bool geometry_refused = !engine.expert_layer_geometry(0, gb, ub, db, gM, uM, dM);
+    std::cout << "  expert_layer_geometry(0, ...): " << (geometry_refused ? "false (REFUSED, correct)" : "true (returned a size)") << "\n";
+    if (!geometry_refused) {
+        std::cout << "  -> FAILED (this shortcut must refuse for a mixed layer -- returning expert 0's "
+                     "size here would silently mis-size every RAM/VRAM caller that still assumes one "
+                     "size per layer)\n";
+        all_ok = false;
+    }
+
+    std::cout << "  -> " << (all_ok ? "PASSED" : "FAILED")
+              << " (relaxed check accepts real mixed sizes; the layer-level shortcut correctly refuses "
+                 "instead of silently mis-sizing)\n";
+    return all_ok;
+}
+
+// ------------------------------------------------------------------
+// 20. Phase 2: compute_expert_slab_bytes() must return the LAYER'S MAX
+//     per-expert size for a mixed layer, not just expert 0's.
+//
+// Deliberately builds a SEPARATE file from Test 18/19's, with the two
+// experts' output indices SWAPPED (small IQ1_S expert at out_expert=0,
+// larger baseline expert at out_expert=1) -- Test 18/19's own file
+// happens to have the larger expert already at index 0, so checking
+// compute_expert_slab_bytes against it wouldn't actually distinguish the
+// old "expert 0 only" behavior from the new "true max" behavior; both
+// would coincidentally return the same number. This ordering is chosen
+// specifically so the two behaviors disagree: the old code would return
+// expert 0's (SMALLER) IQ1_S total; only the fix returns the true
+// (LARGER) max.
+// ------------------------------------------------------------------
+bool test_compute_expert_slab_bytes_max() {
+    std::cout << "[Test 20] compute_expert_slab_bytes() returns the layer's TRUE MAX for a mixed layer...\n";
+
+    const std::string prod_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align";
+    const std::string iq1s_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align/"
+        "repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
+
+    struct ExpertSpec { std::string src_path; int src_layer; int src_expert; int out_expert; };
+    // SWAPPED vs Test 18: small (IQ1_S) expert first, large (baseline) expert second.
+    std::vector<ExpertSpec> specs = {
+        {iq1s_path, 60, 7, 0},
+        {prod_path, 20, 5, 1},
+    };
+
+    struct OutTensor { std::string name; GGUFType type; std::vector<uint64_t> shape; std::vector<uint8_t> data; };
+    std::vector<OutTensor> out_tensors;
+    size_t expert_total[2] = {0, 0};
+
+    for (auto& spec : specs) {
+        GGUFFile f;
+        if (!f.load_header(spec.src_path)) {
+            std::cout << "  -> SKIPPED (real source not available: " << spec.src_path << ")\n";
+            return true;
+        }
+        for (const char* kind : {"gate", "up", "down"}) {
+            std::string tn = "blk." + std::to_string(spec.src_layer) + ".ffn_" + kind + "_exps.weight";
+            auto it = f.tensors.find(tn);
+            if (it == f.tensors.end()) { std::cout << "  -> FAILED (tensor not found: " << tn << ")\n"; return false; }
+            const GGUFTensor& t = it->second;
+            uint64_t n_experts = t.shape.back();
+            uint64_t bpe = t.size_bytes / n_experts;
+            uint64_t eoff = t.offset + (uint64_t)spec.src_expert * bpe;
+            std::vector<uint8_t> raw(bpe);
+            if (pread(f.shard_fds[t.shard_idx], raw.data(), bpe, eoff) != (ssize_t)bpe) {
+                std::cout << "  -> FAILED (short read)\n"; return false;
+            }
+            OutTensor ot;
+            ot.name = "blk.0.ffn_" + std::string(kind) + "." + std::to_string(spec.out_expert) + ".weight";
+            ot.type = t.type;
+            ot.shape.assign(t.shape.begin(), t.shape.end() - 1);
+            expert_total[spec.out_expert] += bpe;
+            ot.data = std::move(raw);
+            out_tensors.push_back(std::move(ot));
+        }
+    }
+
+    std::string out_path = "/tmp/moestream_test_mixed_layer0_swapped.gguf";
+    {
+        FILE* out = fopen(out_path.c_str(), "wb");
+        if (!out) { std::cout << "  -> FAILED (cannot write " << out_path << ")\n"; return false; }
+        auto w_u32 = [&](uint32_t v) { fwrite(&v, 4, 1, out); };
+        auto w_u64 = [&](uint64_t v) { fwrite(&v, 8, 1, out); };
+        auto w_str = [&](const std::string& s) { uint64_t n = s.size(); fwrite(&n, 8, 1, out); fwrite(s.data(), 1, n, out); };
+        fwrite("GGUF", 1, 4, out);
+        w_u32(3);
+        w_u64(out_tensors.size());
+        w_u64(0);
+        const uint64_t ALIGN = 32;
+        uint64_t running = 0;
+        std::vector<uint64_t> offs;
+        for (auto& ot : out_tensors) {
+            w_str(ot.name);
+            w_u32((uint32_t)ot.shape.size());
+            for (auto d : ot.shape) w_u64(d);
+            w_u32((uint32_t)ot.type);
+            offs.push_back(running);
+            w_u64(running);
+            running += ot.data.size();
+            running = (running + ALIGN - 1) & ~(ALIGN - 1);
+        }
+        long pos = ftell(out);
+        long data_start = (pos + (long)ALIGN - 1) & ~((long)ALIGN - 1);
+        while (ftell(out) < data_start) fputc(0, out);
+        for (size_t i = 0; i < out_tensors.size(); ++i) {
+            fseek(out, data_start + (long)offs[i], SEEK_SET);
+            fwrite(out_tensors[i].data.data(), 1, out_tensors[i].data.size(), out);
+        }
+        fclose(out);
+    }
+
+    StreamingEngine engine;
+    if (!engine.model_file.load_header(out_path)) { std::cout << "  -> FAILED (reload)\n"; return false; }
+    engine.model_file.architecture_config.n_layers = 1;
+    engine.model_file.architecture_config.n_experts = 2;
+    engine.unpacked_expert_format = true;
+
+    size_t expected_max = std::max(expert_total[0], expert_total[1]);
+    size_t got = engine.compute_expert_slab_bytes(0);
+
+    std::cout << "  expert 0 (small, IQ1_S) total=" << expert_total[0]
+              << "  expert 1 (large, baseline) total=" << expert_total[1]
+              << "  expected_max=" << expected_max << "  got=" << got << "\n";
+
+    bool pass = (got == expected_max) && (got != expert_total[0] || expert_total[0] == expert_total[1]);
+    if (got == expert_total[0] && expert_total[0] != expected_max) {
+        std::cout << "  -> FAILED (returned expert 0's SMALLER size -- the old 'expert 0 only' bug is still present)\n";
+        pass = false;
+    } else if (got != expected_max) {
+        std::cout << "  -> FAILED (returned " << got << ", neither expert's real total matches this)\n";
+        pass = false;
+    }
+    std::cout << "  -> " << (pass ? "PASSED" : "FAILED") << "\n";
+    return pass;
+}
+
+// ------------------------------------------------------------------
+// 20b. Compact VRAM slot planner: variable-sized layer regions must fit the
+//     requested byte budget, never exceed the model expert count, and keep
+//     every layer with a usable slab represented when the budget permits.
+//
+// This is deliberately a pure topology test. It does not allocate CUDA
+// memory, touch a model file, or start an engine, so it is safe to run in the
+// component test target and gives the compact layout a deterministic guard.
+// ------------------------------------------------------------------
+bool test_compact_vram_slot_planner() {
+    std::cout << "[Test 20b] compact VRAM slot planner preserves layer regions within budget...\n";
+
+    const std::vector<size_t> layer_bytes = {10, 20, 10};
+    const std::vector<int> counts =
+        GpuTopology::compact_layer_slot_counts(100, 4, layer_bytes);
+    size_t used = 0;
+    bool ok = counts.size() == layer_bytes.size();
+    for (size_t l = 0; l < counts.size(); ++l) {
+        ok = ok && counts[l] >= 1 && counts[l] <= 4;
+        used += (size_t)counts[l] * layer_bytes[l];
+    }
+    ok = ok && used <= 100 && counts == std::vector<int>({3, 2, 3});
+
+    const std::vector<int> sparse =
+        GpuTopology::compact_layer_slot_counts(50, 2, {0, 20, 30});
+    ok = ok && sparse == std::vector<int>({0, 1, 1});
+
+    std::cout << "  counts=";
+    for (int count : counts) std::cout << count << " ";
+    std::cout << "used=" << used << " bytes -> " << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
+// ------------------------------------------------------------------
+// 20c. RAM source lifetime: an asynchronous H2D caller must receive an
+// atomic hold together with its ready-slot lookup. A separate lookup followed
+// by ram_pin() leaves a real eviction/regrow window for prefetch workers.
+// This stays CPU-only: it exercises the RAM state machine and does not start
+// CUDA, allocate a VRAM pool, or read a model file.
+// ------------------------------------------------------------------
+bool test_ram_async_source_hold() {
+    std::cout << "[Test 20c] RAM ready lookup holds an async source slab...\n";
+
+    StreamingEngine engine;
+    engine.layers_experts.resize(1);
+    engine.layers_experts[0].resize(1);
+
+    RAMSafetyManager ram;
+    ram.slots_per_layer = 1;
+    // Heap-allocated (not a stack array): StreamingEngine's destructor calls
+    // plain free() on any slot.slab_buffer that isn't slab_from_shared_arena
+    // (engine.hpp, ~StreamingEngine) -- matching real production ownership,
+    // where every slab_buffer is always a malloc/posix_memalign allocation.
+    // A stack array here previously made `engine`'s destructor call free()
+    // on stack memory at end of scope, corrupting the heap ("double free or
+    // corruption (out)") the moment this test function returned -- not a
+    // production bug, just this test not giving the engine a real buffer to
+    // own. No manual free() needed below; the destructor now does it correctly.
+    constexpr size_t kSourceBytes = 16;
+    uint8_t *source_bytes = static_cast<uint8_t *>(calloc(1, kSourceBytes));
+    MoEExpertBlock &slot = engine.layers_experts[0][0];
+    slot.expert_id = 7;
+    slot.slab_buffer = source_bytes;
+    slot.slab_capacity = kSourceBytes;
+    ram.preload_ram_slot(engine, 0, 7, 0);
+
+    const uint8_t *captured = nullptr;
+    MoEExpertBlock *held = ram.find_ram_slot_if_ready_held(
+        engine.layers_experts[0], 1, 0, 7, &captured, nullptr);
+    bool ok = held == &slot && captured == source_bytes &&
+              slot.ram_temp_pin_count == 1;
+    if (held)
+        ram.ram_unpin(*held);
+
+    // Also cover the wait path used when another thread published the slot:
+    // pin_on_ready must be taken under the same lock that observed Ready.
+    MoEExpertBlock *waited =
+        ram.wait_for_ram_slot(engine, 0, 7, /*pin_on_ready=*/true);
+    ok = ok && waited == &slot && slot.ram_temp_pin_count == 1;
+    if (waited)
+        ram.ram_unpin(*waited);
+
+    // The unified Hit path has the same atomic-pinning contract used by
+    // get_expert(..., pin_for_caller=true).
+    RamClaimResult hit = ram.claim_or_wait(
+        engine, 0, 7, RamClaimCaller::MainThread, nullptr,
+        /*pin_on_hit=*/true);
+    ok = ok && hit.status == RamClaimStatus::Hit && hit.slot == &slot &&
+         slot.ram_temp_pin_count == 1;
+    if (hit.slot)
+        ram.ram_unpin(*hit.slot);
+
+    ok = ok && slot.ram_temp_pin_count == 0;
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
+// ------------------------------------------------------------------
+// 21. Phase 3 (VRAM): the REAL GpuTopology cache path -- upload_expert +
+//     find_expert + a real fused-kernel dispatch -- with two genuinely
+//     different-sized real experts sharing ONE fixed-size slot pool.
+//
+// Unlike Test 18 (which used the simpler, direct offload_tensor_to_vram/
+// dense_matmul_host helper Test 5 also uses -- correct, but not the real
+// production cache path), this drives the actual GpuTopology::upload_
+// expert/find_expert machinery every real decode call goes through.
+//
+// The real question Phase 3 needed answered: GpuTopology's VRAM pool is
+// ONE fixed slot size for the whole pool (reindex_expert_vram_cache,
+// offset += expert_slab_bytes per slot) -- does uploading a SMALLER
+// expert into a slot sized for the LARGER one actually work correctly,
+// or does it read/write the wrong number of bytes? Traced through the
+// real source (gpu_topology.cpp) before writing this test: every upload
+// path (upload_expert, upload_expert_async, upload_expert_active[_async])
+// already computes `copy_bytes = std::min(bytes, slot->size)` -- i.e. it
+// was ALREADY built to copy exactly the real caller-supplied byte count
+// into a possibly-larger slot, not a fixed slot-sized copy. This predates
+// per-expert mixed precision entirely -- it's what already made
+// GLM-5.2-style CROSS-layer type heterogeneity (Q2_K vs Q3_K per layer,
+// one pool sized to the global max) work. This test confirms the same
+// mechanism, unmodified, genuinely extends to WITHIN-layer heterogeneity:
+// no VRAM-tier code changes were needed for Phase 3, only real
+// verification that the claim holds.
+// ------------------------------------------------------------------
+bool test_vram_cache_mixed_sizes() {
+    std::cout << "[Test 21] Phase 3: real GpuTopology cache (upload_expert/find_expert) with two "
+                 "different-sized real experts in one fixed-size slot pool...\n";
+
+    const std::string prod_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align";
+    const std::string iq1s_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align/"
+        "repacked-GLM-5.3-UD-IQ1_S-00005-of-00006-part00001-of-00001.gguf";
+
+    struct ExpertSpec { std::string src_path; int src_layer; int src_expert; };
+    // expert 0 = large (baseline), expert 1 = small (IQ1_S) -- real sizes,
+    // real bytes, same two sources every other test in this file uses.
+    std::vector<ExpertSpec> specs = {
+        {prod_path, 20, 5},
+        {iq1s_path, 60, 7},
+    };
+
+    struct RealExpert {
+        std::vector<uint8_t> slab;  // gate @ 0, up @ gb, down @ gb+ub -- matches populate_packed_slab's layout
+        size_t gb = 0, ub = 0, db = 0;
+        GGUFType gtype, utype, dtype;
+    };
+    std::vector<RealExpert> experts;
+
+    for (auto& spec : specs) {
+        GGUFFile f;
+        if (!f.load_header(spec.src_path)) {
+            std::cout << "  -> SKIPPED (real source not available: " << spec.src_path << ")\n";
+            return true;
+        }
+        RealExpert re;
+        GGUFType* types[3] = {&re.gtype, &re.utype, &re.dtype};
+        size_t* sizes[3] = {&re.gb, &re.ub, &re.db};
+        int ti = 0;
+        for (const char* kind : {"gate", "up", "down"}) {
+            std::string tn = "blk." + std::to_string(spec.src_layer) + ".ffn_" + kind + "_exps.weight";
+            auto it = f.tensors.find(tn);
+            if (it == f.tensors.end()) { std::cout << "  -> FAILED (tensor not found: " << tn << ")\n"; return false; }
+            const GGUFTensor& t = it->second;
+            uint64_t n_experts = t.shape.back();
+            uint64_t bpe = t.size_bytes / n_experts;
+            uint64_t eoff = t.offset + (uint64_t)spec.src_expert * bpe;
+            size_t base = re.slab.size();
+            re.slab.resize(base + bpe);
+            if (pread(f.shard_fds[t.shard_idx], re.slab.data() + base, bpe, eoff) != (ssize_t)bpe) {
+                std::cout << "  -> FAILED (short read)\n"; return false;
+            }
+            *sizes[ti] = bpe;
+            *types[ti] = t.type;
+            ++ti;
+        }
+        experts.push_back(std::move(re));
+    }
+
+    size_t slab_bytes[2] = {experts[0].slab.size(), experts[1].slab.size()};
+    size_t pool_slot_size = std::max(slab_bytes[0], slab_bytes[1]);
+    std::cout << "  expert 0 (baseline) slab=" << slab_bytes[0]
+              << "  expert 1 (IQ1_S) slab=" << slab_bytes[1]
+              << "  pool_slot_size(=max)=" << pool_slot_size << "\n";
+
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> SKIPPED (no CUDA device)\n";
+        return true;
+    }
+    // Force the vault pool onto the SAME GPU dense_matmul_host below
+    // targets (CudaManager::device_id, "Core engine GPU" -- can genuinely
+    // differ from topology.vault_gpus on a real multi-GPU box, confirmed
+    // on this one: upload_expert placed the slot on the real vault GPU
+    // while dense_matmul_host's own cudaSetDevice(device_id) targeted the
+    // core GPU, an unintended cross-device pointer access -- "illegal
+    // memory access", not a bug in upload_expert or dense_matmul_host
+    // individually, just this test's simplified single-device helper
+    // meeting a genuinely multi-GPU cache placement it wasn't told to
+    // match). Production code dispatches multi-GPU-aware; this override
+    // keeps the test scoped to Phase 3's real question (does variable-size
+    // upload/dispatch work on a fixed-size slot pool) without also having
+    // to reimplement cross-GPU dispatch here.
+    gpu.topology.vault_gpus = {gpu.device_id};
+    // No config passed -- allocate_expert_cache's own documented fallback
+    // for a caller without one ("safe default... e.g. tests"): grabs
+    // available VRAM, sized to pool_slot_size per slot. n_experts_total=2
+    // is just a hint for internal bookkeeping array sizing, not a hard cap.
+    gpu.topology.allocate_expert_cache(pool_slot_size, 2, nullptr);
+
+    bool all_ok = true;
+    for (int e = 0; e < 2; ++e) {
+        ExpertLocation* loc = gpu.topology.upload_expert(0, e, experts[e].slab.data(), experts[e].slab.size());
+        if (!loc) { std::cout << "  -> FAILED (upload_expert returned null for expert " << e << ")\n"; return false; }
+        if (loc->size != pool_slot_size) {
+            std::cout << "  -> FAILED (slot size=" << loc->size << ", expected the pool's fixed " << pool_slot_size << ")\n";
+            all_ok = false;
+        }
+
+        ExpertLocation* found = gpu.topology.find_expert(0, e);
+        if (found != loc) { std::cout << "  -> FAILED (find_expert didn't return the same slot just uploaded)\n"; all_ok = false; }
+
+        // Real dispatch against each projection, at its own real offset
+        // WITHIN the slot (gate@0, up@gb, down@gb+ub -- exactly what
+        // populate_packed_slab/dispatch_expert_k assume) and its own real
+        // type -- the same shape of call the production hot path makes.
+        int I_gate = 6144, O_gate = 2048, I_down = 2048, O_down = 6144;
+        struct Proj { const char* name; size_t off; size_t bytes; GGUFType type; int I, O; };
+        Proj projs[3] = {
+            {"gate", 0,                              experts[e].gb, experts[e].gtype, I_gate, O_gate},
+            {"up",   experts[e].gb,                  experts[e].ub, experts[e].utype, I_gate, O_gate},
+            {"down", experts[e].gb + experts[e].ub,   experts[e].db, experts[e].dtype, I_down, O_down},
+        };
+        std::mt19937 rng(9999 + e);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+        for (auto& p : projs) {
+            std::vector<float> x(p.I);
+            for (auto& v : x) v = dist(rng);
+            std::vector<float> y_gpu(p.O, -999.0f);
+            bool ok = gpu.dense_matmul_host(p.type, loc->device_ptr + p.off, x.data(), y_gpu.data(), 1, p.I, p.O);
+            if (!ok) { std::cout << "  -> FAILED (expert " << e << " " << p.name << ": dense_matmul_host failed)\n"; all_ok = false; continue; }
+
+            // uint8_t, not float -- a real bug this test hit on its first
+            // real run: declaring this as std::vector<float> still compiles
+            // (p.bytes silently becomes an element count, not a byte count)
+            // but makes host_bytes.data() + o*rb below stride by o*rb
+            // FLOATS (4x too far) instead of o*rb bytes. Row 0 (offset 0
+            // either way) came out byte-correct; every later row read from
+            // the wrong place -- confirmed via a one-off debug dump showing
+            // y_gpu[0]==y_cpu[0] exactly but every later element diverging,
+            // which is what pointed at a stride bug specifically rather
+            // than a real GPU-side one (a real raw D2H readback, also
+            // added and removed during that same debugging pass, had
+            // already confirmed the uploaded VRAM bytes were byte-for-byte
+            // identical to what was uploaded).
+            std::vector<uint8_t> host_bytes(p.bytes);
+            std::memcpy(host_bytes.data(), experts[e].slab.data() + p.off, p.bytes);
+            int rb = (int)(p.bytes / p.O);
+            std::vector<float> wrow(p.I), y_cpu(p.O, 0.0f);
+            for (int o = 0; o < p.O; ++o) {
+                ggml_dequant_row((uint32_t)p.type, host_bytes.data() + (size_t)o * rb, wrow.data(), p.I);
+                double acc = 0.0;
+                for (int i = 0; i < p.I; ++i) acc += (double)x[i] * (double)wrow[i];
+                y_cpu[o] = (float)acc;
+            }
+            float max_abs = 0, max_rel = 0;
+            for (int o = 0; o < p.O; ++o) {
+                float d = std::abs(y_cpu[o] - y_gpu[o]);
+                max_abs = std::max(max_abs, d);
+                max_rel = std::max(max_rel, d / std::max(1e-6f, std::abs(y_cpu[o])));
+            }
+            bool proj_ok = (max_abs < 1e-2f) || (max_rel < 0.02f);
+            std::cout << "  expert=" << e << " " << p.name << " (in-slot offset=" << p.off << " bytes=" << p.bytes
+                      << "): " << (proj_ok ? "OK" : "SUSPECT") << " max_abs=" << max_abs << " max_rel=" << max_rel << "\n";
+            if (!proj_ok) all_ok = false;
+        }
+    }
+
+    std::cout << "  -> " << (all_ok ? "PASSED" : "FAILED")
+              << " (real upload_expert/find_expert cache path, two different-sized real experts, "
+                 "one fixed-size slot pool, real per-projection dispatch all checked)\n";
+    return all_ok;
+}
+
+// Test 23: fast, deterministic repro (milliseconds, no model/disk needed) of
+// the real compute-sanitizer finding from a live GLM-5.3 generation run --
+// 1375 flagged cudaErrorHostMemoryAlreadyRegistered "errors" inside
+// upload_expert_async's speculative cudaHostRegister, once
+// ram_pinned_budget_gb had persistently pinned most RAM-tier slabs (see
+// upload_expert_async's own header comment). Reproduces the EXACT CUDA call
+// sequence directly: manually cudaHostRegister a buffer (standing in for
+// ensure_slab_capacity's persistent pin), then call the real
+// upload_expert_async on it with the fixed, real production call shape
+// (src_already_pinned=true) -- the permanent regression guard, always runs,
+// expected to be sanitizer-clean.
+//
+// Set MOESTREAM_REPRO_SANITIZER_ISSUE=1 to ALSO run a second, deliberate
+// call with the hint omitted (src_already_pinned=false, the pre-fix shape)
+// -- this is what actually reproduces the flagged-but-harmless
+// cudaErrorHostMemoryAlreadyRegistered under compute-sanitizer (confirmed:
+// `MOESTREAM_REPRO_SANITIZER_ISSUE=1 compute-sanitizer --tool memcheck
+// ./moestream_tests` -> exactly 2 errors, both attributed to this call, 0
+// anywhere else). Off by default so a normal `compute-sanitizer` pass over
+// this whole suite stays a trustworthy "0 errors" signal -- this
+// demonstration call is not itself a bug, it's the OLD, still-correct
+// fallback shape that any future caller forgetting to pass the hint would
+// still safely (if noisily, under sanitizer) fall back to.
+bool test_upload_async_already_pinned_src() {
+    std::cout << "[Test 23] upload_expert_async + already-cudaHostRegister'd source "
+                 "(fast repro of the real compute-sanitizer finding)...\n";
+
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> SKIPPED (no CUDA device)\n";
+        return true;
+    }
+    gpu.topology.vault_gpus = {gpu.device_id};
+    const size_t buf_bytes = 128 * 1024;  // small and arbitrary -- only the
+                                           // cudaHostRegister interaction matters here
+    gpu.topology.allocate_expert_cache(buf_bytes, 2, nullptr);
+
+    auto make_registered_buf = [&](uint32_t seed) -> std::vector<uint8_t> {
+        std::vector<uint8_t> buf(buf_bytes);
+        std::mt19937 rng(seed);
+        for (auto& b : buf) b = (uint8_t)(rng() & 0xFF);
+        // Simulate ensure_slab_capacity's persistent pin under
+        // ram_pinned_budget_gb -- the exact state that makes
+        // upload_expert_async's own speculative register call doomed.
+        cudaError_t err = cudaHostRegister(buf.data(), buf_bytes, cudaHostRegisterPortable);
+        if (err != cudaSuccess) {
+            std::cout << "  -> SKIPPED (cudaHostRegister setup failed: "
+                      << cudaGetErrorString(err) << ")\n";
+            buf.clear();
+        }
+        return buf;
+    };
+
+    auto verify_upload = [&](const char* label, ExpertLocation* loc,
+                              const std::vector<uint8_t>& src) -> bool {
+        if (!loc) { std::cout << "  -> FAILED (" << label << ": upload_expert_async returned null)\n"; return false; }
+        cudaDeviceSynchronize();
+        std::vector<uint8_t> readback(buf_bytes);
+        cudaError_t err = cudaMemcpy(readback.data(), loc->device_ptr, buf_bytes, cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            std::cout << "  -> FAILED (" << label << ": readback cudaMemcpy: " << cudaGetErrorString(err) << ")\n";
+            return false;
+        }
+        bool ok = (readback == src);
+        std::cout << "  " << label << ": " << (ok ? "OK (VRAM bytes match)" : "MISMATCH") << "\n";
+        return ok;
+    };
+
+    bool all_ok = true;
+    std::vector<uint8_t> src_a;
+
+    // Deliberate, opt-in-only demonstration of the OLD (still-correct,
+    // still-safe) no-hint shape -- this is the one that actually reproduces
+    // the flagged sanitizer error, since host_data is already registered by
+    // this test above and upload_expert_async will still try
+    // cudaHostRegister on it speculatively when not told otherwise.
+    if (std::getenv("MOESTREAM_REPRO_SANITIZER_ISSUE")) {
+        src_a = make_registered_buf(1001);
+        if (src_a.empty()) return true;  // setup skip already logged
+        ExpertLocation* loc_a = gpu.topology.upload_expert_async(0, 0, src_a.data(), buf_bytes);
+        all_ok &= verify_upload("no-hint call (expect a flagged-but-harmless sanitizer error above)", loc_a, src_a);
+    } else {
+        std::cout << "  no-hint demonstration: SKIPPED by default (set MOESTREAM_REPRO_SANITIZER_ISSUE=1 "
+                     "to reproduce the flagged-but-harmless sanitizer error this test's fix removes)\n";
+    }
+
+    // The permanent regression guard: real production call shape after the
+    // fix -- src_already_pinned=true. Always runs; expected sanitizer-clean.
+    std::vector<uint8_t> src_b = make_registered_buf(2002);
+    if (src_b.empty()) return true;
+    ExpertLocation* loc_b = gpu.topology.upload_expert_async(0, 1, src_b.data(), buf_bytes, -1, /*src_already_pinned=*/true);
+    all_ok &= verify_upload("with-hint call (expect zero sanitizer errors)", loc_b, src_b);
+
+    if (!src_a.empty()) cudaHostUnregister(src_a.data());
+    cudaHostUnregister(src_b.data());
+
+    std::cout << "  -> " << (all_ok ? "PASSED" : "FAILED")
+              << " (both calls uploaded correct bytes; compare a compute-sanitizer log around "
+                 "this test's two calls to confirm the hint actually removes the flagged error)\n";
+    return all_ok;
+}
+
+
+// 2026-09-04: qwen4exp dense full-attention GPU path (qwen4exp_attn_gpu_host).
+// Dims chosen so no index can alias into a passing answer by coincidence:
+// H != S != T, hd not a multiple of 16 (exercises any tail handling), Hkv > 1
+// with group > 1 so GQA head->kv mapping is actually exercised, and pos_base
+// != 0 so the causal bound is offset rather than the trivial s+1.
+// Critically, each kv head's K/V is given a DISTINCT magnitude: a wrong
+// h/group mapping would still produce finite, plausible numbers against a
+// tolerance check, so the test is built to make that specific bug visible.
+bool test_qwen4exp_attn_gpu() {
+    std::cout << "[Test 24] Qwen4Exp dense full-attention GPU path (causal GQA softmax(QK^T)V)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int S = 5, H = 6, Hkv = 2, hd = 40, pos_base = 3;
+    const int T = pos_base + S;              // 8 keys visible at most
+    const int group = H / Hkv;               // 3
+    const float scale = 1.0f / std::sqrt((float)hd);
+
+    std::mt19937 rng(20260904);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    std::vector<float> Q((size_t)S * H * hd);
+    std::vector<float> K((size_t)T * Hkv * hd), V((size_t)T * Hkv * hd);
+    for (auto& v : Q) v = dist(rng);
+    // distinct per-kv-head scale so a wrong head->kv mapping cannot pass
+    for (int t = 0; t < T; ++t)
+        for (int kv = 0; kv < Hkv; ++kv)
+            for (int i = 0; i < hd; ++i) {
+                const float mag = (kv == 0) ? 1.0f : 5.0f;
+                K[((size_t)t * Hkv + kv) * hd + i] = dist(rng) * mag;
+                V[((size_t)t * Hkv + kv) * hd + i] = dist(rng) * mag;
+            }
+
+    // CPU reference: byte-for-byte the same math attention_layer.cpp's loop does
+    std::vector<float> ref((size_t)S * H * hd, 0.0f);
+    for (int s = 0; s < S; ++s) {
+        int valid = pos_base + s + 1;
+        if (valid > T) valid = T;
+        for (int h = 0; h < H; ++h) {
+            const int kv = h / group;
+            const float* q_h = Q.data() + ((size_t)s * H + h) * hd;
+            std::vector<float> sc(valid);
+            for (int t = 0; t < valid; ++t) {
+                const float* k_t = K.data() + ((size_t)t * Hkv + kv) * hd;
+                double d = 0.0;
+                for (int i = 0; i < hd; ++i) d += (double)q_h[i] * k_t[i];
+                sc[t] = (float)(d * scale);
+            }
+            float mx = sc[0];
+            for (int t = 1; t < valid; ++t) mx = std::max(mx, sc[t]);
+            double sum = 0.0;
+            for (int t = 0; t < valid; ++t) { sc[t] = std::exp(sc[t] - mx); sum += sc[t]; }
+            for (int t = 0; t < valid; ++t) sc[t] /= (float)sum;
+            float* o = ref.data() + ((size_t)s * H + h) * hd;
+            for (int t = 0; t < valid; ++t) {
+                const float* v_t = V.data() + ((size_t)t * Hkv + kv) * hd;
+                for (int i = 0; i < hd; ++i) o[i] += sc[t] * v_t[i];
+            }
+        }
+    }
+
+    std::vector<float> got((size_t)S * H * hd, -12345.0f);
+    if (!gpu.qwen4exp_attn_gpu_host(Q.data(), K.data(), V.data(), got.data(),
+                                    S, T, H, Hkv, hd, pos_base, scale)) {
+        std::cout << "  -> FAILED: qwen4exp_attn_gpu_host returned false\n";
+        return false;
+    }
+
+    double max_abs = 0.0, max_rel = 0.0, ref_absmax = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) ref_absmax = std::max(ref_absmax, (double)std::fabs(ref[i]));
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double d = std::fabs((double)got[i] - ref[i]);
+        max_abs = std::max(max_abs, d);
+        max_rel = std::max(max_rel, d / (std::fabs((double)ref[i]) + 1e-6));
+    }
+    std::cout << "  -> max_abs_diff=" << max_abs << "  max_abs/|ref|max=" << (max_abs / (ref_absmax + 1e-9)) << "\n";
+
+    // Independent anti-aliasing check: the LAST query row of the LAST head must
+    // differ from the first head's, and rows s=0 vs s=S-1 of one head must
+    // differ -- a broadcast/stride bug that reused one row everywhere would
+    // still pass an aggregate diff check if the rows happened to be close.
+    const float* r0 = got.data() + ((size_t)0 * H + 0) * hd;
+    const float* rL = got.data() + ((size_t)(S - 1) * H + (H - 1)) * hd;
+    const float* rS = got.data() + ((size_t)(S - 1) * H + 0) * hd;
+    double d_head = 0.0, d_row = 0.0;
+    for (int i = 0; i < hd; ++i) {
+        d_head = std::max(d_head, (double)std::fabs(r0[i] - rL[i]));
+        d_row  = std::max(d_row,  (double)std::fabs(r0[i] - rS[i]));
+    }
+    if (d_head < 1e-6 || d_row < 1e-6) {
+        std::cout << "  -> FAILED: rows alias (head-diff=" << d_head << " row-diff=" << d_row << ")\n";
+        return false;
+    }
+    // F32 GEMM vs a double-accumulated reference: judge on max_abs/|ref|max,
+    // the standard GEMM metric, not per-element relative error (softmax
+    // outputs include near-zero elements where relative error is meaningless).
+    if (!(max_abs / (ref_absmax + 1e-9) < 1e-5)) {
+        std::cout << "  -> FAILED: normalized error too large\n";
+        return false;
+    }
+    std::cout << "  -> PASSED\n";
+    return true;
+}
+
+
+// 2026-09-04: qwen4exp chunkwise GDN GPU path vs the CPU chunk function, which
+// is itself unit-tested against the sequential qwen4exp_gdn_delta_step oracle
+// (tests/test_components.cpp) -- so this transitively checks the GPU port
+// against the real recurrence without re-deriving it here.
+//
+// Dims chosen to exercise what a naive port gets wrong:
+//  * S is NOT a multiple of the chunk size, so the final partial chunk runs.
+//  * H_v > H_k with group 3, so the hk = h % H_k tiled broadcast is exercised;
+//    each key head is given a distinct scale so a wrong h%H_k mapping shows up.
+//  * g_log values differ per head, so the per-head cumsum/decay cannot alias.
+//  * state starts NON-zero, so the S0 carry terms (K@S0, Q@S0, A_last*S0) are
+//    all live -- a zero initial state would hide three of the six terms.
+bool test_qwen4exp_gdn_gpu() {
+    std::cout << "[Test 25] Qwen4Exp chunkwise GDN GPU path (vs CPU chunk closed form)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int S = 70, H_k = 2, H_v = 6, hd = 16, chunk = 32;
+    const int group = H_v / H_k;
+    std::mt19937 rng(4242);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    std::uniform_real_distribution<float> up(0.05f, 0.95f);
+
+    std::vector<float> Q((size_t)S * H_k * hd), K((size_t)S * H_k * hd);
+    std::vector<float> V((size_t)S * H_v * hd);
+    std::vector<float> beta((size_t)S * H_v), g((size_t)S * H_v);
+    for (int s = 0; s < S; ++s)
+        for (int h = 0; h < H_k; ++h) {
+            const float mag = (h == 0) ? 1.0f : 4.0f;   // distinct per key head
+            float* q = Q.data() + ((size_t)s * H_k + h) * hd;
+            float* k = K.data() + ((size_t)s * H_k + h) * hd;
+            for (int i = 0; i < hd; ++i) { q[i] = d(rng) * mag; k[i] = d(rng) * mag; }
+            qwen4exp_l2_norm_inplace(q, hd, 1e-6f);      // production L2-norms Q/K
+            qwen4exp_l2_norm_inplace(k, hd, 1e-6f);
+        }
+    for (auto& x : V) x = d(rng);
+    for (int s = 0; s < S; ++s)
+        for (int h = 0; h < H_v; ++h) {
+            beta[(size_t)s * H_v + h] = up(rng);
+            g[(size_t)s * H_v + h] = -up(rng) * (0.5f + 0.1f * h);  // per-head decay
+        }
+    std::vector<float> st0((size_t)H_v * hd * hd);
+    for (auto& x : st0) x = d(rng) * 0.1f;               // NON-zero initial state
+
+    // CPU reference: same chunk loop the production CPU path runs
+    std::vector<float> st_cpu = st0, out_cpu((size_t)S * H_v * hd, 0.0f);
+    {
+        std::vector<float> qc((size_t)chunk*hd), kc((size_t)chunk*hd), vc((size_t)chunk*hd),
+                           oc((size_t)chunk*hd), bc((size_t)chunk), gc((size_t)chunk);
+        for (int h = 0; h < H_v; ++h) {
+            const int hk = h % H_k;
+            float* stp = st_cpu.data() + (size_t)h * hd * hd;
+            for (int s0 = 0; s0 < S; s0 += chunk) {
+                const int C = std::min(chunk, S - s0);
+                for (int i = 0; i < C; ++i) {
+                    const int s = s0 + i;
+                    std::memcpy(qc.data()+(size_t)i*hd, Q.data()+((size_t)s*H_k+hk)*hd, hd*sizeof(float));
+                    std::memcpy(kc.data()+(size_t)i*hd, K.data()+((size_t)s*H_k+hk)*hd, hd*sizeof(float));
+                    std::memcpy(vc.data()+(size_t)i*hd, V.data()+((size_t)s*H_v+h)*hd, hd*sizeof(float));
+                    bc[i] = beta[(size_t)s*H_v+h];
+                    gc[i] = g[(size_t)s*H_v+h];
+                }
+                qwen4exp_gdn_delta_chunk(qc.data(), kc.data(), vc.data(), bc.data(),
+                                         gc.data(), stp, oc.data(), C, hd);
+                for (int i = 0; i < C; ++i)
+                    std::memcpy(out_cpu.data()+((size_t)(s0+i)*H_v+h)*hd,
+                                oc.data()+(size_t)i*hd, hd*sizeof(float));
+            }
+        }
+    }
+
+    std::vector<float> st_gpu = st0, out_gpu((size_t)S * H_v * hd, -999.0f);
+    if (!gpu.qwen4exp_gdn_gpu_host(Q.data(), K.data(), V.data(), beta.data(), g.data(),
+                                   st_gpu.data(), out_gpu.data(), S, H_k, H_v, hd, chunk)) {
+        std::cout << "  -> FAILED: qwen4exp_gdn_gpu_host returned false\n";
+        return false;
+    }
+
+    auto norm_err = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double m = 0.0, ref = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            m = std::max(m, (double)std::fabs(a[i] - b[i]));
+            ref = std::max(ref, (double)std::fabs(b[i]));
+        }
+        return std::make_pair(m, m / (ref + 1e-9));
+    };
+    auto [o_abs, o_rel] = norm_err(out_gpu, out_cpu);
+    auto [s_abs, s_rel] = norm_err(st_gpu, st_cpu);
+    std::cout << "  -> out: max_abs=" << o_abs << " normalized=" << o_rel
+              << " | state: max_abs=" << s_abs << " normalized=" << s_rel << "\n";
+    if (!(o_rel < 1e-4 && s_rel < 1e-4)) {
+        std::cout << "  -> FAILED: GPU chunkwise GDN diverges from the CPU closed form\n";
+        return false;
+    }
+    std::cout << "  -> PASSED\n";
+    return true;
+}
+
+
+// 2026-09-04: GPU-side routed-expert accumulation (cuda/expert_accum.cu).
+// An end-to-end output diff CANNOT validate this: the engine is already
+// non-deterministic run-to-run (cache-state-dependent dispatch), AND the
+// feature legitimately changes summation order (device-accumulated experts are
+// summed first, then added onto CPU-dispatched ones). So this compares the
+// kernel directly against the exact CPU loop it replaces, on fixed data.
+//
+// Shapes chosen so a stride/index bug cannot alias into a pass: n != D, tokens
+// deliberately REPEATED across experts (so the accumulate really accumulates
+// rather than just scattering), one token left untouched by any expert (must
+// stay exactly zero), and non-uniform weights.
+bool test_expert_gpu_accum() {
+    std::cout << "[Test 26] MoE GPU-side expert accumulation (device scatter-add vs CPU loop)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int S = 7, D = 20, n_experts = 3;
+    // pairs: (expert, token, weight) -- token 5 is touched by NO expert
+    const std::vector<std::vector<int>> ex_tok = {{0, 2, 3}, {1, 2}, {4, 6, 0}};
+    std::mt19937 rng(777);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+
+    std::vector<int> tok; std::vector<float> w;
+    for (auto& e : ex_tok) for (int t : e) { tok.push_back(t); w.push_back(d(rng)); }
+    const int total_pairs = (int)tok.size();
+
+    // per-expert output rows
+    std::vector<std::vector<float>> eout;
+    for (auto& e : ex_tok) { std::vector<float> v((size_t)e.size() * D); for (auto& x : v) x = d(rng); eout.push_back(v); }
+
+    // CPU reference: exactly the loop this replaces
+    std::vector<float> ref((size_t)S * D, 0.0f);
+    { int off = 0;
+      for (size_t e = 0; e < ex_tok.size(); ++e) {
+        for (size_t i = 0; i < ex_tok[e].size(); ++i) {
+            const int s = tok[off + i]; const float wt = w[off + i];
+            for (int c = 0; c < D; ++c) ref[(size_t)s * D + c] += wt * eout[e][i * D + c];
+        }
+        off += (int)ex_tok[e].size();
+      } }
+
+    std::vector<float> got((size_t)S * D, 0.0f);
+    if (!gpu.expert_accum_begin(0, S, D, tok.data(), w.data(), total_pairs)) {
+        std::cout << "  -> FAILED: expert_accum_begin returned false\n"; return false;
+    }
+    int off = 0;
+    for (size_t e = 0; e < ex_tok.size(); ++e) {
+        const int n = (int)ex_tok[e].size();
+        float* d_src = nullptr;
+        if (cudaMalloc((void**)&d_src, (size_t)n * D * sizeof(float)) != cudaSuccess) {
+            std::cout << "  -> FAILED: cudaMalloc\n"; return false;
+        }
+        cudaMemcpy(d_src, eout[e].data(), (size_t)n * D * sizeof(float), cudaMemcpyHostToDevice);
+        if (!gpu.expert_accum_add(0, d_src, off, n, D, S)) {
+            std::cout << "  -> FAILED: expert_accum_add\n"; cudaFree(d_src); return false;
+        }
+        cudaDeviceSynchronize();
+        cudaFree(d_src);
+        off += n;
+    }
+    if (!gpu.expert_accum_end(0, got.data(), S, D)) {
+        std::cout << "  -> FAILED: expert_accum_end returned false\n"; return false;
+    }
+
+    double max_abs = 0.0, refmax = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) { max_abs = std::max(max_abs, (double)std::fabs(got[i]-ref[i]));
+                                              refmax = std::max(refmax, (double)std::fabs(ref[i])); }
+    // token 5 must be exactly untouched
+    double untouched = 0.0;
+    for (int c = 0; c < D; ++c) untouched = std::max(untouched, (double)std::fabs(got[(size_t)5*D + c]));
+    std::cout << "  -> max_abs=" << max_abs << " normalized=" << (max_abs/(refmax+1e-9))
+              << " untouched_row_max=" << untouched << "\n";
+    if (untouched != 0.0) { std::cout << "  -> FAILED: a row no expert routed to was written\n"; return false; }
+    if (!(max_abs/(refmax+1e-9) < 1e-6)) { std::cout << "  -> FAILED: diverges from the CPU loop\n"; return false; }
+    std::cout << "  -> PASSED\n";
+    return true;
+}
+
+
+// 2026-09-05: dense BF16 prefill GEMM extended from Q8_0-only to Q5_K/Q6_K.
+// Test 5 does NOT cover this path: dense_bf16_prefill_gemm() is a config-set
+// global that defaults to false in the test binary, so Test 5's Q5_K/Q6_K
+// cases go through the fused kernels instead (visible as ~1e-6 error, i.e.
+// F32 precision, where BF16 would show ~1e-2). This calls the BF16 host
+// function DIRECTLY so the new dequant kernels are actually exercised.
+//
+// Tolerance is deliberately BF16-appropriate: 8 mantissa bits gives ~0.4%
+// per-element, and the dot product accumulates over I terms, so this is judged
+// on max_abs/|ref|max (the normalized GEMM metric) rather than per-element
+// relative error -- same reasoning as the lane8 and qwen4exp-attn tests.
+bool test_dense_bf16_kquant() {
+    std::cout << "[Test 27] Dense BF16 prefill GEMM for Q5_K / Q6_K (new dequant kernels)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    struct Case { GGUFType t; const char* name; int I, O, S; };
+    const Case cases[] = {
+        {GGUFType::Q5_K, "Q5_K", 512,  8, 3},
+        {GGUFType::Q6_K, "Q6_K", 512,  8, 3},
+        {GGUFType::Q5_K, "Q5_K", 2560, 16, 4},   // real dense shape order for qwen4exp
+        {GGUFType::Q6_K, "Q6_K", 2560, 16, 4},
+    };
+    bool all = true;
+    for (const auto& c : cases) {
+        std::mt19937 rng(9001);
+        std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+        std::vector<float> Wf((size_t)c.O * c.I), x((size_t)c.S * c.I);
+        for (auto& v : Wf) v = d(rng);
+        for (auto& v : x)  v = d(rng);
+
+        // quantize each row, then dequantize back for an EXACT reference --
+        // comparing against the original f32 would fold in the quantizer's own
+        // loss and tell us nothing about the BF16 GEMM.
+        const size_t rb = row_bytes(c.t, c.I);
+        std::vector<uint8_t> Wq((size_t)c.O * rb);
+        std::vector<float> Wdq((size_t)c.O * c.I);
+        for (int o = 0; o < c.O; ++o) {
+            if (!ggml_quantize_row_ref((uint32_t)c.t, Wf.data() + (size_t)o * c.I, Wq.data() + (size_t)o * rb, c.I)) {
+                std::cout << "  -> " << c.name << ": SKIPPED (no ref quantizer)\n"; goto next_case;
+            }
+            ggml_dequant_row((uint32_t)c.t, Wq.data() + (size_t)o * rb, Wdq.data() + (size_t)o * c.I, c.I);
+        }
+        {
+            std::vector<double> ref((size_t)c.S * c.O, 0.0);
+            for (int si = 0; si < c.S; ++si)
+                for (int o = 0; o < c.O; ++o) {
+                    double acc = 0.0;
+                    for (int i = 0; i < c.I; ++i) acc += (double)x[(size_t)si*c.I+i] * Wdq[(size_t)o*c.I+i];
+                    ref[(size_t)si*c.O+o] = acc;
+                }
+            void* d_W = nullptr;
+            if (cudaMalloc(&d_W, Wq.size()) != cudaSuccess) { std::cout << "  -> cudaMalloc failed\n"; return false; }
+            cudaMemcpy(d_W, Wq.data(), Wq.size(), cudaMemcpyHostToDevice);
+            std::vector<float> got((size_t)c.S * c.O, -1e30f);
+            const bool ok = gpu.dense_matmul_bf16_host(c.t, d_W, x.data(), got.data(), c.S, c.I, c.O);
+            cudaFree(d_W);
+            if (!ok) { std::cout << "  -> " << c.name << ": FAILED (dense_matmul_bf16_host returned false)\n"; all = false; goto next_case; }
+            double mx = 0.0, refmax = 0.0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                mx = std::max(mx, std::fabs((double)got[i] - ref[i]));
+                refmax = std::max(refmax, std::fabs(ref[i]));
+            }
+            const double norm = mx / (refmax + 1e-9);
+            std::cout << "  -> " << c.name << " (I=" << c.I << " O=" << c.O << " S=" << c.S
+                      << "): max_abs=" << mx << " normalized=" << norm
+                      << (norm < 2e-2 ? "  PASSED" : "  FAILED") << "\n";
+            if (!(norm < 2e-2)) all = false;
+        }
+        next_case:;
+    }
+    return all;
+}
+
+// 2026-09-05: GDN causal conv1d+SiLU GPU path (cuda/gdn_conv1d.cu,
+// EngineConfig::qwen4exp_gdn_conv_gpu). Compares the new GPU kernel
+// directly against attn_causal_conv1d_silu (the already-proven CPU
+// reference, itself already fixed once for cache-locality -- see CLAUDE.md's
+// "conv1d loop order: 29.4x" entry) rather than an independent from-scratch
+// implementation, so a shared conceptual bug in both can't produce a false
+// pass. Checks BOTH the conv+SiLU output AND the post-call history update
+// (the GPU path does the history tail on the host, byte-identical to the
+// CPU function's own tail -- this catches a divergence there too, not just
+// in the kernel itself).
+//
+// Two cases: S=37 (deliberately not a multiple of channels/kernel, to catch
+// a stride/index bug that a round S could hide) exercises the common
+// S>=hist path; S=2 < hist=3 exercises the history-update tail's OTHER
+// branch (new history partly comes from OLD history, not just from x) --
+// a real edge case (a short window-slid prefill chunk) the S=37 case alone
+// cannot reach.
+bool test_gdn_conv1d_gpu() {
+    std::cout << "[Test 28] GDN causal conv1d+SiLU GPU path (vs CPU reference)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int channels = 130, kernel = 4;
+    const int hist = kernel - 1;
+    std::mt19937 rng(9090);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+
+    auto run_case = [&](int S, const char* label) -> bool {
+        std::vector<float> x((size_t)S * channels), w((size_t)channels * kernel);
+        std::vector<float> hist0((size_t)channels * hist);
+        for (auto& v : x) v = d(rng);
+        for (auto& v : w) v = d(rng);
+        for (auto& v : hist0) v = d(rng);
+
+        std::vector<float> hist_cpu = hist0, hist_gpu = hist0;
+        std::vector<float> out_cpu((size_t)S * channels, -999.0f);
+        std::vector<float> out_gpu((size_t)S * channels, -777.0f);
+
+        attn_causal_conv1d_silu(x.data(), w.data(), out_cpu.data(), S, channels, kernel,
+                                hist_cpu.data());
+        if (!gpu.qwen4exp_conv1d_silu_gpu_host(x.data(), w.data(), out_gpu.data(), S,
+                                               channels, kernel, hist_gpu.data())) {
+            std::cout << "  -> " << label << ": FAILED (qwen4exp_conv1d_silu_gpu_host returned false)\n";
+            return false;
+        }
+
+        double o_abs = 0.0, o_refmax = 0.0, h_abs = 0.0, h_refmax = 0.0;
+        for (size_t i = 0; i < out_cpu.size(); ++i) {
+            o_abs = std::max(o_abs, (double)std::fabs(out_gpu[i] - out_cpu[i]));
+            o_refmax = std::max(o_refmax, (double)std::fabs(out_cpu[i]));
+        }
+        for (size_t i = 0; i < hist_cpu.size(); ++i) {
+            h_abs = std::max(h_abs, (double)std::fabs(hist_gpu[i] - hist_cpu[i]));
+            h_refmax = std::max(h_refmax, (double)std::fabs(hist_cpu[i]));
+        }
+        const double o_rel = o_abs / (o_refmax + 1e-9);
+        const double h_rel = h_abs / (h_refmax + 1e-9);
+        std::cout << "  -> " << label << " (S=" << S << " channels=" << channels
+                  << " kernel=" << kernel << "): out max_abs=" << o_abs << " normalized=" << o_rel
+                  << " | history max_abs=" << h_abs << " normalized=" << h_rel << "\n";
+        if (!(o_rel < 1e-4 && h_rel < 1e-4)) {
+            std::cout << "  -> " << label << ": FAILED -- GPU path diverges from the CPU reference\n";
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok &= run_case(37, "S >= hist");
+    ok &= run_case(2, "S < hist");
+    std::cout << (ok ? "  -> PASSED\n" : "  -> at least one case FAILED\n");
+    return ok;
+}
+
+// 2026-09-05: GgmlGdnProjRunner::run_with_conv (the conv1d round-trip
+// elimination -- chains the causal conv1d + SiLU directly onto the qkv
+// tensor the 4-projection-fusion graph already produces, instead of
+// downloading qkv then re-uploading the identical bytes for a separate
+// conv1d call). Compares run_with_conv's FULL output (conv_out, gate,
+// g_log, beta, AND the updated history) against the composition of two
+// already-proven-correct pieces: run() (the existing, unfused-conv 4-
+// projection graph) followed by attn_causal_conv1d_silu (the CPU reference
+// Test 28 already validated) -- not an independent from-scratch
+// implementation, so a shared conceptual bug in run_with_conv's ggml-graph
+// transpose/concat layout can't produce a false pass.
+bool test_gdn_conv_fused() {
+    std::cout << "[Test 29] GDN proj+conv1d fused GPU path (run_with_conv vs run()+CPU conv)...\n";
+    // conv_dim MUST be a multiple of 128 -- ggml-cuda's ssm_conv kernel
+    // (ggml-cuda/ssm-conv.cu) hardcodes a 128-thread block and hard-asserts
+    // this (GGML_ASSERT, not a graceful failure) if violated. Found by this
+    // test itself; ensure_conv_weight() now checks it and declines instead
+    // of crashing for a non-conforming model (see that function's comment).
+    const int D = 24, conv_dim = 128, value_dim = 16, H_v = 4, d_conv = 4;
+    const int hist = d_conv - 1;
+    GgmlGdnProjRunner &r = GgmlGdnProjRunner::instance();
+    if (!r.ensure(0, D, conv_dim, value_dim, H_v)) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system, or ensure() failed)\n";
+        return true;
+    }
+    const int layer = 0;
+    std::mt19937 rng(31337);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+
+    std::vector<float> w_qkv((size_t)D * conv_dim), w_gate((size_t)D * value_dim),
+        w_alpha((size_t)D * H_v), w_beta((size_t)D * H_v),
+        dt_bias(H_v), ssm_a(H_v), w_conv((size_t)conv_dim * d_conv);
+    for (auto &v : w_qkv) v = d(rng);
+    for (auto &v : w_gate) v = d(rng);
+    for (auto &v : w_alpha) v = d(rng);
+    for (auto &v : w_beta) v = d(rng);
+    for (auto &v : dt_bias) v = d(rng);
+    for (auto &v : ssm_a) v = -std::fabs(d(rng));  // real -A_log.exp()-style: negative decay
+    for (auto &v : w_conv) v = d(rng);
+
+    auto ref = [&](const std::vector<float> &v, int64_t ne0, int64_t ne1) {
+        GgmlGdnProjWeightRef out;
+        out.host_data = v.data();
+        out.type = 0;  // GGML_TYPE_F32
+        out.ne0 = ne0;
+        out.ne1 = ne1;
+        out.nbytes = v.size() * sizeof(float);
+        return out;
+    };
+    if (!r.ensure_weights(layer, ref(w_qkv, D, conv_dim), ref(w_gate, D, value_dim),
+                          ref(w_alpha, D, H_v), ref(w_beta, D, H_v),
+                          dt_bias.data(), ssm_a.data())) {
+        std::cout << "  -> FAILED: ensure_weights returned false\n";
+        return false;
+    }
+    if (!r.ensure_conv_weight(layer, ref(w_conv, d_conv, conv_dim))) {
+        std::cout << "  -> FAILED: ensure_conv_weight returned false\n";
+        return false;
+    }
+
+    auto run_case = [&](int S, const char *label) -> bool {
+        std::vector<float> hidden((size_t)S * D), hist0((size_t)conv_dim * hist);
+        for (auto &v : hidden) v = d(rng);
+        for (auto &v : hist0) v = d(rng);
+
+        // Reference: unfused proj (run()) + the already-proven CPU conv.
+        std::vector<float> qkv_ref((size_t)S * conv_dim), gate_ref((size_t)S * value_dim),
+            glog_ref((size_t)S * H_v), beta_ref((size_t)S * H_v);
+        if (!r.run(layer, hidden.data(), S, qkv_ref.data(), gate_ref.data(),
+                   glog_ref.data(), beta_ref.data())) {
+            std::cout << "  -> " << label << ": FAILED (run() returned false)\n";
+            return false;
+        }
+        std::vector<float> hist_ref = hist0;
+        std::vector<float> conv_ref((size_t)S * conv_dim, -999.0f);
+        attn_causal_conv1d_silu(qkv_ref.data(), w_conv.data(), conv_ref.data(), S,
+                                conv_dim, d_conv, hist_ref.data());
+
+        // Test: the fully-fused path.
+        std::vector<float> gate_test((size_t)S * value_dim), glog_test((size_t)S * H_v),
+            beta_test((size_t)S * H_v), conv_test((size_t)S * conv_dim, -777.0f);
+        std::vector<float> hist_test = hist0;
+        if (!r.run_with_conv(layer, hidden.data(), S, conv_test.data(), gate_test.data(),
+                             glog_test.data(), beta_test.data(), hist_test.data(), d_conv)) {
+            std::cout << "  -> " << label << ": FAILED (run_with_conv returned false)\n";
+            return false;
+        }
+
+        auto cmp = [](const std::vector<float> &a, const std::vector<float> &b) {
+            double m = 0.0, ref = 0.0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                m = std::max(m, (double)std::fabs(a[i] - b[i]));
+                ref = std::max(ref, (double)std::fabs(b[i]));
+            }
+            return m / (ref + 1e-9);
+        };
+        const double conv_rel = cmp(conv_test, conv_ref);
+        const double gate_rel = cmp(gate_test, gate_ref);
+        const double glog_rel = cmp(glog_test, glog_ref);
+        const double beta_rel = cmp(beta_test, beta_ref);
+        const double hist_rel = cmp(hist_test, hist_ref);
+        std::cout << "  -> " << label << " (S=" << S << "): conv=" << conv_rel
+                  << " gate=" << gate_rel << " g_log=" << glog_rel
+                  << " beta=" << beta_rel << " history=" << hist_rel << "\n";
+        if (!(conv_rel < 1e-4 && gate_rel < 1e-4 && glog_rel < 1e-4 &&
+              beta_rel < 1e-4 && hist_rel < 1e-4)) {
+            std::cout << "  -> " << label << ": FAILED -- fused path diverges from run()+CPU-conv\n";
+            return false;
+        }
+        return true;
+    };
+
+    bool ok = true;
+    ok &= run_case(29, "S >= hist");
+    ok &= run_case(2, "S < hist");
+    std::cout << (ok ? "  -> PASSED\n" : "  -> at least one case FAILED\n");
+    return ok;
+}
+
+// Test 34: GLM5NEXT KDA projection graph. This is an opt-in production
+// optimization, so the test uses small F32 matrices and compares every graph
+// output with the existing CPU matmul oracle. It also exercises the f_a->f_b
+// and g_a->g_b dependency branches rather than testing only the three shared
+// input projections.
+bool test_glm5next_dense_projection_fusion() {
+    std::cout << "[Test 34] GLM5NEXT KDA dense projection fusion (vs CPU oracle)...\n";
+    if (!GgmlGlm5nextKdaProjRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CUDA backend not compiled)\n";
+        return true;
+    }
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int S = 3, D = 5, inner = 8, hd = 4, H = 2;
+    std::mt19937 rng(5340);
+    std::uniform_real_distribution<float> dist(-0.6f, 0.6f);
+    std::vector<float> x((size_t)S * D);
+    std::vector<float> wq((size_t)inner * D), wk(wq.size()), wv(wq.size());
+    std::vector<float> wfa((size_t)hd * D), wfb((size_t)inner * hd);
+    std::vector<float> wbeta((size_t)H * D), wga((size_t)hd * D),
+        wgb((size_t)inner * hd);
+    for (auto* values : {&x, &wq, &wk, &wv, &wfa, &wfb, &wbeta, &wga, &wgb})
+        for (float& value : *values) value = dist(rng);
+
+    auto ref = [&](const std::vector<float>& input, const std::vector<float>& w,
+                   int input_dim, int output_dim) {
+        std::vector<float> out((size_t)S * output_dim, 0.0f);
+        matmul(out.data(), input.data(), w.data(), S, input_dim, output_dim);
+        return out;
+    };
+    const std::vector<float> q_ref = ref(x, wq, D, inner);
+    const std::vector<float> k_ref = ref(x, wk, D, inner);
+    const std::vector<float> v_ref = ref(x, wv, D, inner);
+    const std::vector<float> fa_ref = ref(x, wfa, D, hd);
+    const std::vector<float> fb_ref = ref(fa_ref, wfb, hd, inner);
+    const std::vector<float> beta_ref = ref(x, wbeta, D, H);
+    const std::vector<float> ga_ref = ref(x, wga, D, hd);
+    const std::vector<float> gb_ref = ref(ga_ref, wgb, hd, inner);
+
+    auto make_ref = [](const std::vector<float>& w, int I, int O) {
+        GgmlGlm5nextProjWeightRef r;
+        r.host_data = w.data();
+        r.type = (uint32_t)GGUFType::F32;
+        r.ne0 = I;
+        r.ne1 = O;
+        r.nbytes = w.size() * sizeof(float);
+        return r;
+    };
+    auto& runner = GgmlGlm5nextKdaProjRunner::instance();
+    bool ok = runner.ensure(gpu.device_id, D, inner, hd, H, S);
+    ok = ok && runner.ensure_layer(0, make_ref(wq, D, inner),
+                                   make_ref(wk, D, inner),
+                                   make_ref(wv, D, inner),
+                                   make_ref(wfa, D, hd),
+                                   make_ref(wfb, hd, inner),
+                                   make_ref(wbeta, D, H),
+                                   make_ref(wga, D, hd),
+                                   make_ref(wgb, hd, inner));
+    std::vector<float> q(q_ref.size()), k(k_ref.size()), v(v_ref.size()),
+        fb(fb_ref.size()), beta(beta_ref.size()), gb(gb_ref.size());
+    ok = ok && runner.run(0, x.data(), S, q.data(), k.data(), v.data(),
+                          fb.data(), beta.data(), gb.data());
+    auto max_err = [](const std::vector<float>& got,
+                      const std::vector<float>& expected) {
+        double e = 0.0;
+        for (size_t i = 0; i < got.size(); ++i)
+            e = std::max(e, (double)std::fabs(got[i] - expected[i]));
+        return e;
+    };
+    const double eq = max_err(q, q_ref), ek = max_err(k, k_ref),
+                 ev = max_err(v, v_ref), efb = max_err(fb, fb_ref),
+                 ebeta = max_err(beta, beta_ref), egb = max_err(gb, gb_ref);
+    std::cout << "  -> max_abs q=" << eq << " k=" << ek << " v=" << ev
+              << " f_b=" << efb << " beta=" << ebeta << " g_b=" << egb
+              << (ok && eq < 1e-4 && ek < 1e-4 && ev < 1e-4 && efb < 1e-4 &&
+                          ebeta < 1e-4 && egb < 1e-4
+                      ? " PASSED\n"
+                      : " FAILED\n");
+    runner.shutdown();
+    return ok && eq < 1e-4 && ek < 1e-4 && ev < 1e-4 && efb < 1e-4 &&
+           ebeta < 1e-4 && egb < 1e-4;
+}
+
+// Test 30: GLM5NEXT KDA recurrent delta rule on CUDA, compared with an
+// independent scalar CPU oracle. The dimensions intentionally do not match
+// a warp size and the initial state is non-zero, so state layout, per-key
+// decay, token carry-over, and output scaling are all exercised.
+bool test_glm5next_kda_gpu() {
+    std::cout << "[Test 30] GLM5NEXT KDA delta-rule GPU path (vs CPU oracle)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    const int S = 5, H = 3, hd = 7;
+    std::mt19937 rng(5300);
+    std::uniform_real_distribution<float> value(-0.7f, 0.7f);
+    std::uniform_real_distribution<float> beta_dist(0.05f, 0.95f);
+    std::uniform_real_distribution<float> decay_dist(-0.8f, -0.02f);
+    std::vector<float> Q((size_t)S * H * hd), K(Q.size()), V(Q.size());
+    std::vector<float> beta((size_t)S * H), g_log(Q.size());
+    for (auto& x : Q) x = value(rng);
+    for (auto& x : K) x = value(rng);
+    for (auto& x : V) x = value(rng);
+    for (auto& x : beta) x = beta_dist(rng);
+    for (auto& x : g_log) x = decay_dist(rng);
+
+    std::vector<float> state0((size_t)H * hd * hd);
+    for (auto& x : state0) x = value(rng) * 0.2f;
+    std::vector<float> state_cpu = state0;
+    std::vector<float> out_cpu((size_t)S * H * hd, 0.0f);
+    const float scale = 1.0f / std::sqrt((float)hd);
+    std::vector<float> sk(hd);
+    for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < H; ++h) {
+            float* st = state_cpu.data() + (size_t)h * hd * hd;
+            const float* q = Q.data() + ((size_t)s * H + h) * hd;
+            const float* k = K.data() + ((size_t)s * H + h) * hd;
+            const float* v = V.data() + ((size_t)s * H + h) * hd;
+            const float* g = g_log.data() + ((size_t)s * H + h) * hd;
+            const float b = beta[(size_t)s * H + h];
+            for (int key = 0; key < hd; ++key) {
+                float* row = st + (size_t)key * hd;
+                const float decay = std::exp(g[key]);
+                for (int out = 0; out < hd; ++out) row[out] *= decay;
+            }
+            std::fill(sk.begin(), sk.end(), 0.0f);
+            for (int key = 0; key < hd; ++key) {
+                const float* row = st + (size_t)key * hd;
+                for (int out = 0; out < hd; ++out) sk[out] += row[out] * k[key];
+            }
+            for (int key = 0; key < hd; ++key) {
+                float* row = st + (size_t)key * hd;
+                for (int out = 0; out < hd; ++out)
+                    row[out] += k[key] * (v[out] - sk[out]) * b;
+            }
+            float* out = out_cpu.data() + ((size_t)s * H + h) * hd;
+            for (int out_i = 0; out_i < hd; ++out_i) {
+                float sum = 0.0f;
+                for (int key = 0; key < hd; ++key)
+                    sum += st[(size_t)key * hd + out_i] * q[key] * scale;
+                out[out_i] = sum;
+            }
+        }
+    }
+
+    std::vector<float> state_gpu = state0;
+    std::vector<float> out_gpu(out_cpu.size(), -999.0f);
+    if (!gpu.glm5next_kda_delta_rule_gpu_host(
+            Q.data(), K.data(), V.data(), beta.data(), g_log.data(),
+            state_gpu.data(), out_gpu.data(), S, H, hd)) {
+        std::cout << "  -> FAILED: glm5next_kda_delta_rule_gpu_host returned false\n";
+        return false;
+    }
+    auto max_normalized = [](const std::vector<float>& got,
+                             const std::vector<float>& ref) {
+        double max_abs = 0.0, ref_abs = 0.0;
+        for (size_t i = 0; i < got.size(); ++i) {
+            max_abs = std::max(max_abs, (double)std::fabs(got[i] - ref[i]));
+            ref_abs = std::max(ref_abs, (double)std::fabs(ref[i]));
+        }
+        return max_abs / (ref_abs + 1e-9);
+    };
+    const double out_err = max_normalized(out_gpu, out_cpu);
+    const double state_err = max_normalized(state_gpu, state_cpu);
+    std::cout << "  -> out normalized=" << out_err
+              << " state normalized=" << state_err << "\n";
+    const bool ok = out_err < 2e-4 && state_err < 2e-4;
+    std::cout << (ok ? "  -> PASSED\n" : "  -> FAILED\n");
+
+    // The production path must carry state across TWO separate calls without
+    // requiring a state D2H after the first one. Use one additional token as
+    // an independent continuation oracle and explicitly synchronize only at
+    // the end, matching the prompt-cache boundary contract.
+    auto cpu_one = [&](std::vector<float>& st, std::vector<float>& out_one) {
+        out_one.assign((size_t)H * hd, 0.0f);
+        for (int h = 0; h < H; ++h) {
+            float* sh = st.data() + (size_t)h * hd * hd;
+            const float* q = Q.data() + (size_t)h * hd;
+            const float* k = K.data() + (size_t)h * hd;
+            const float* v = V.data() + (size_t)h * hd;
+            const float* g = g_log.data() + (size_t)h * hd;
+            const float b = beta[(size_t)h];
+            for (int key = 0; key < hd; ++key) {
+                float* row = sh + (size_t)key * hd;
+                const float decay = std::exp(g[key]);
+                for (int value = 0; value < hd; ++value) row[value] *= decay;
+            }
+            std::vector<float> sk_one((size_t)hd, 0.0f);
+            for (int key = 0; key < hd; ++key) {
+                const float* row = sh + (size_t)key * hd;
+                for (int value = 0; value < hd; ++value) sk_one[value] += row[value] * k[key];
+            }
+            for (int key = 0; key < hd; ++key) {
+                float* row = sh + (size_t)key * hd;
+                for (int value = 0; value < hd; ++value)
+                    row[value] += k[key] * (v[value] - sk_one[value]) * b;
+            }
+            float* out_h = out_one.data() + (size_t)h * hd;
+            for (int value = 0; value < hd; ++value) {
+                for (int key = 0; key < hd; ++key)
+                    out_h[value] += sh[(size_t)key * hd + value] * q[key] * scale;
+            }
+        }
+    };
+    std::vector<float> state_cpu_cont = state_cpu;
+    std::vector<float> out_cpu_cont;
+    cpu_one(state_cpu_cont, out_cpu_cont);
+    std::vector<float> state_persistent = state0;
+    std::vector<float> out_persistent(out_cpu.size(), -999.0f);
+    std::vector<float> out_persistent_cont;
+    const bool persistent_first = gpu.glm5next_kda_delta_rule_gpu_device(
+        Q.data(), K.data(), V.data(), beta.data(), g_log.data(),
+        state_persistent.data(), out_persistent.data(), 0, S, H, hd, true);
+    bool persistent_ok = persistent_first;
+    if (persistent_first) {
+        // The continuation is deliberately a separate S=1 call. Its output
+        // is sized here before passing the pointer to the device bridge.
+        out_persistent_cont.assign((size_t)H * hd, -999.0f);
+        persistent_ok = gpu.glm5next_kda_delta_rule_gpu_device(
+            Q.data(), K.data(), V.data(), beta.data(), g_log.data(),
+            state_persistent.data(), out_persistent_cont.data(), 0, 1, H, hd, false);
+    }
+    std::vector<float> state_synced = state0;
+    if (persistent_ok) {
+        persistent_ok = gpu.glm5next_kda_sync_state_to_host(
+            0, state_synced.data(), state_synced.size());
+    }
+    const double persistent_first_err = max_normalized(out_persistent, out_cpu);
+    const double persistent_cont_err = persistent_ok
+        ? max_normalized(out_persistent_cont, out_cpu_cont) : 1.0;
+    const double persistent_state_err = persistent_ok
+        ? max_normalized(state_synced, state_cpu_cont) : 1.0;
+    persistent_ok = persistent_ok && persistent_first_err < 2e-4 &&
+                    persistent_cont_err < 2e-4 && persistent_state_err < 2e-4;
+    std::cout << "  -> persistent state: first=" << persistent_first_err
+              << " continuation=" << persistent_cont_err
+              << " synced_state=" << persistent_state_err
+              << (persistent_ok ? " PASSED\n" : " FAILED\n");
+    return ok && persistent_ok;
+}
+
+// Test 31: GLM5NEXT native router end-to-end (device matmul plus CUDA
+// gating/top-k) against a scalar reference. This deliberately uses an F32
+// router tensor so it tests the host bridge independently of the model's
+// quantized expert format.
+bool test_glm5next_router_gpu() {
+    std::cout << "[Test 31] GLM5NEXT native router GPU path (matmul + top-k)...\n";
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int S = 3, D = 9, E = 11, K = 4;
+    std::mt19937 rng(5310);
+    std::uniform_real_distribution<float> dist(-0.8f, 0.8f);
+    std::vector<float> w((size_t)E * D), x((size_t)S * D), bias(E);
+    for (auto& v : w) v = dist(rng);
+    for (auto& v : x) v = dist(rng);
+    for (auto& v : bias) v = dist(rng) * 0.15f;
+
+    QuantizedTensor router;
+    router.meta.type = GGUFType::F32;
+    router.meta.shape = {(uint64_t)D, (uint64_t)E};
+    router.meta.size_bytes = w.size() * sizeof(float);
+    router.host_ptr = reinterpret_cast<uint8_t*>(w.data());
+    if (!gpu.offload_tensor_to_vram(router)) {
+        std::cout << "  -> FAILED: could not offload test router weight\n";
+        return false;
+    }
+
+    constexpr float weight_scale = 1.7f;
+    std::vector<int32_t> ids((size_t)S * K, -1);
+    std::vector<float> weights((size_t)S * K, -1.0f);
+    if (!gpu.glm5next_router_gpu_host(
+            router, x.data(), bias.data(), S, D, E, K,
+            GatingFunc::Softmax, true, weight_scale,
+            ids.data(), weights.data())) {
+        std::cout << "  -> FAILED: glm5next_router_gpu_host returned false\n";
+        cudaFree(router.device_ptr);
+        router.device_ptr = nullptr;
+        return false;
+    }
+
+    std::vector<int32_t> ref_ids((size_t)S * K, -1);
+    std::vector<float> ref_weights((size_t)S * K, 0.0f);
+    for (int s = 0; s < S; ++s) {
+        std::vector<float> probs(E);
+        float max_logit = -std::numeric_limits<float>::infinity();
+        for (int e = 0; e < E; ++e) {
+            float z = 0.0f;
+            for (int d = 0; d < D; ++d) z += x[(size_t)s * D + d] * w[(size_t)e * D + d];
+            probs[e] = z;
+            max_logit = std::max(max_logit, z);
+        }
+        float sum = 0.0f;
+        for (float& p : probs) { p = std::exp(p - max_logit); sum += p; }
+        for (float& p : probs) p /= sum;
+        std::vector<int> candidates(E);
+        std::iota(candidates.begin(), candidates.end(), 0);
+        std::partial_sort(candidates.begin(), candidates.begin() + K, candidates.end(),
+                          [&](int a, int b) {
+                              const float sa = probs[a] + bias[a];
+                              const float sb = probs[b] + bias[b];
+                              return sa != sb ? sa > sb : a < b;
+                          });
+        float selected_sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            ref_ids[(size_t)s * K + k] = candidates[k];
+            ref_weights[(size_t)s * K + k] = probs[candidates[k]];
+            selected_sum += ref_weights[(size_t)s * K + k];
+        }
+        for (int k = 0; k < K; ++k)
+            ref_weights[(size_t)s * K + k] =
+                ref_weights[(size_t)s * K + k] / selected_sum * weight_scale;
+    }
+
+    double max_diff = 0.0;
+    bool ok = true;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] != ref_ids[i]) ok = false;
+        max_diff = std::max(max_diff, (double)std::fabs(weights[i] - ref_weights[i]));
+    }
+    std::cout << "  -> IDs " << (ok ? "match" : "MISMATCH")
+              << ", max_weight_diff=" << max_diff << "\n";
+    ok = ok && max_diff < 3e-4;
+    cudaFree(router.device_ptr);
+    router.device_ptr = nullptr;
+    std::cout << (ok ? "  -> PASSED\n" : "  -> FAILED\n");
+    return ok;
+}
+
+// Test 32: a config allow-list must prevent an omitted physical adapter from
+// becoming an ExpertVault. This is intentionally a topology-only test: it
+// creates streams but no model, RAM tier, or expert cache allocation.
+bool test_gpu_device_allowlist() {
+    std::cout << "[Test 32] GPU config allow-list (omitted adapters stay unused)...\n";
+    CudaManager gpu;
+    gpu.topology.configured_device_ids = {0};
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    bool ok = gpu.topology.core_gpu >= 0 &&
+              gpu.topology.devices[(size_t)gpu.topology.core_gpu].id == 0 &&
+              gpu.topology.vault_gpus.size() == 1 &&
+              gpu.topology.vault_gpus[0] == gpu.topology.core_gpu;
+    for (const auto& dev : gpu.topology.devices) {
+        if (dev.id == 0) {
+            ok = ok && dev.role == GpuRole::CoreEngine;
+        } else {
+            ok = ok && dev.role == GpuRole::Unused;
+        }
+    }
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED")
+              << " (configured IDs={0}, physical devices="
+              << gpu.topology.devices.size() << ")\n";
+    return ok;
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "  MoeStream Native Test Harness\n";
@@ -1764,6 +4318,8 @@ int main() {
     if (std::getenv("MOESTREAM_RUN_BENCH")) {
         bench_cpu_dequant_matmul();
         bench_qabsorb_cpu_vs_gpu();
+        bench_iq2xxs_vnni_prototype();
+        bench_iq3xxs_avx2_prototype();
     } else {
         std::cout << "\n[Test 8] SKIPPED by default (set MOESTREAM_RUN_BENCH=1 to run the throughput bench)\n";
     }
@@ -1771,8 +4327,31 @@ int main() {
     bool bf16_matched_dense_ok = test_bf16_matched_cublas_dense_matmul();
     bool bf16_batched_qabsorb_ok = test_bf16_batched_qabsorb();
     bool score_gpu_ok = test_score_gpu();
+    bool score_gpu_nope_only_ok = test_score_gpu_nope_only();
     bool wuv_batched_gpu_ok = test_wuv_batched_gpu();
+    bool wuv_int8_batched_gpu_ok = test_wuv_int8_batched_gpu();
+    bool wuv_int8_batched_prefill_ok = test_wuv_int8_batched_gpu_prefill();
+    bool qwen4exp_attn_gpu_ok = test_qwen4exp_attn_gpu();
+    bool qwen4exp_gdn_gpu_ok = test_qwen4exp_gdn_gpu();
+    bool expert_gpu_accum_ok = test_expert_gpu_accum();
+    bool dense_bf16_kquant_ok = test_dense_bf16_kquant();
+    bool gdn_conv1d_gpu_ok = test_gdn_conv1d_gpu();
+    bool gdn_conv_fused_ok = test_gdn_conv_fused();
+    bool score_gpu_prefill_ok = test_score_gpu_prefill();
+    bool wuv_batched_prefill_ok = test_wuv_batched_gpu_prefill();
     bool real_expert_iq2xxs_ok = test_real_expert_iq2xxs_dequant();
+    bool mixed_precision_layer_ok = test_mixed_precision_layer();
+    bool unpacked_relaxed_check_ok = test_unpacked_format_relaxed_check();
+    bool slab_bytes_max_ok = test_compute_expert_slab_bytes_max();
+    bool compact_vram_planner_ok = test_compact_vram_slot_planner();
+    bool ram_async_source_hold_ok = test_ram_async_source_hold();
+    bool vram_mixed_sizes_ok = test_vram_cache_mixed_sizes();
+    bool upload_async_pinned_src_ok = test_upload_async_already_pinned_src();
+    bool glm5next_kda_gpu_ok = test_glm5next_kda_gpu();
+    bool glm5next_router_gpu_ok = test_glm5next_router_gpu();
+    bool glm5next_dense_projection_fusion_ok =
+        test_glm5next_dense_projection_fusion();
+    bool gpu_device_allowlist_ok = test_gpu_device_allowlist();
 
     std::cout << "========================================\n";
     if (!fused_kernels_ok) {
@@ -1801,16 +4380,104 @@ int main() {
         std::cout << "❌ BF16 strided-batched qabsorb correctness test FAILED -- see [Test 12] output above.\n";
         return 1;
     }
+    if (!score_gpu_prefill_ok) {
+        std::cout << "❌ Score GPU prefill (S>1, causal mask) correctness test FAILED -- see [Test 16] output above.\n";
+        return 1;
+    }
+    if (!wuv_batched_prefill_ok) {
+        std::cout << "❌ WUV batched prefill (S>1 scatter) correctness test FAILED -- see [Test 17] output above.\n";
+        return 1;
+    }
     if (!score_gpu_ok) {
         std::cout << "❌ Score GPU path correctness test FAILED -- see [Test 13] output above.\n";
+        return 1;
+    }
+    if (!score_gpu_nope_only_ok) {
+        std::cout << "❌ Score GPU nope-only/DSA path FAILED -- see [Test 33] output above.\n";
         return 1;
     }
     if (!wuv_batched_gpu_ok) {
         std::cout << "❌ WUV batched GPU path correctness test FAILED -- see [Test 14] output above.\n";
         return 1;
     }
+    if (!wuv_int8_batched_gpu_ok) {
+        std::cout << "❌ WUV int8 batched GPU path correctness test FAILED -- see [Test 15] output above.\n";
+        return 1;
+    }
+    if (!dense_bf16_kquant_ok) {
+        std::cout << "❌ Dense BF16 Q5_K/Q6_K path FAILED -- see [Test 27] output above.\n";
+        return 1;
+    }
+    if (!gdn_conv1d_gpu_ok) {
+        std::cout << "❌ GDN causal conv1d+SiLU GPU path FAILED -- see [Test 28] output above.\n";
+        return 1;
+    }
+    if (!gdn_conv_fused_ok) {
+        std::cout << "❌ GDN proj+conv1d fused GPU path FAILED -- see [Test 29] output above.\n";
+        return 1;
+    }
+    if (!expert_gpu_accum_ok) {
+        std::cout << "❌ MoE GPU-side expert accumulation FAILED -- see [Test 26] output above.\n";
+        return 1;
+    }
+    if (!qwen4exp_gdn_gpu_ok) {
+        std::cout << "❌ Qwen4Exp chunkwise GDN GPU path FAILED -- see [Test 25] output above.\n";
+        return 1;
+    }
+    if (!qwen4exp_attn_gpu_ok) {
+        std::cout << "❌ Qwen4Exp dense-attention GPU path FAILED -- see [Test 24] output above.\n";
+        return 1;
+    }
+    if (!wuv_int8_batched_prefill_ok) {
+        std::cout << "❌ WUV int8 batched GPU path FAILED at S>1 -- see [Test 22] output above.\n";
+        return 1;
+    }
     if (!real_expert_iq2xxs_ok) {
         std::cout << "❌ Real-Data IQ2_XXS dequant consistency test FAILED -- see [Test 11] output above.\n";
+        return 1;
+    }
+    if (!mixed_precision_layer_ok) {
+        std::cout << "❌ Mixed-precision-within-one-layer test FAILED -- see [Test 18] output above.\n";
+        return 1;
+    }
+    if (!unpacked_relaxed_check_ok) {
+        std::cout << "❌ sanity_check_unpacked_format() relaxation test FAILED -- see [Test 19] output above.\n";
+        return 1;
+    }
+    if (!slab_bytes_max_ok) {
+        std::cout << "❌ compute_expert_slab_bytes() max-size test FAILED -- see [Test 20] output above.\n";
+        return 1;
+    }
+    if (!compact_vram_planner_ok) {
+        std::cout << "❌ compact VRAM slot planner test FAILED -- see [Test 20b] output above.\n";
+        return 1;
+    }
+    if (!ram_async_source_hold_ok) {
+        std::cout << "❌ RAM async source hold test FAILED -- see [Test 20c] output above.\n";
+        return 1;
+    }
+    if (!vram_mixed_sizes_ok) {
+        std::cout << "❌ VRAM cache mixed-sizes test FAILED -- see [Test 21] output above.\n";
+        return 1;
+    }
+    if (!upload_async_pinned_src_ok) {
+        std::cout << "❌ upload_expert_async already-pinned-source test FAILED -- see [Test 23] output above.\n";
+        return 1;
+    }
+    if (!glm5next_kda_gpu_ok) {
+        std::cout << "❌ GLM5NEXT KDA GPU path FAILED -- see [Test 30] output above.\n";
+        return 1;
+    }
+    if (!glm5next_router_gpu_ok) {
+        std::cout << "❌ GLM5NEXT native router GPU path FAILED -- see [Test 31] output above.\n";
+        return 1;
+    }
+    if (!glm5next_dense_projection_fusion_ok) {
+        std::cout << "❌ GLM5NEXT KDA dense projection fusion FAILED -- see [Test 34] output above.\n";
+        return 1;
+    }
+    if (!gpu_device_allowlist_ok) {
+        std::cout << "❌ GPU config allow-list test FAILED -- see [Test 32] output above.\n";
         return 1;
     }
     std::cout << "✅ All core engine tests passed successfully!\n";

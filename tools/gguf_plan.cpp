@@ -72,10 +72,23 @@ bool is_dense_offload_candidate(const std::string &name) {
       name.find("attn_output_a.weight") != std::string::npos) {
     return false;
   }
+  // DeepSeek-V4 Pro CSA/HCA compressor and Lightning Indexer weights are
+  // resident tensors (graph_initializer.cpp's compressed-attention
+  // manifest). Compressor names do not contain "attn", so include them
+  // explicitly. This does not alter the unrelated GLM DSA indexer policy:
+  // its attn tensors are still excluded upstream from the manifest.
+  if (name.find("compressor_") != std::string::npos ||
+      name.find("indexer.proj.weight") != std::string::npos) {
+    return true;
+  }
   // hc_ catches DeepSeek-V4's Hyper-Connections weights (6 per-layer +
   // 3 global output_hc_*) -- see src/main.cpp's own comment on this same
   // predicate for the full rationale.
   if (name.find("hc_") != std::string::npos) return true;
+  // ssm_/ple_ catch Qwen4Exp's GDN/PLE resident tensors -- see main.cpp's
+  // own comment on this same predicate.
+  if (name.find("ssm_") != std::string::npos ||
+      name.find("ple_") != std::string::npos) return true;
   return name.find("attn") != std::string::npos ||
          name.find("norm") != std::string::npos ||
          name.find("gate_inp") != std::string::npos ||
@@ -101,6 +114,9 @@ const char *categorize_dense_tensor(const std::string &name) {
     return "attn_output";
   if (name.find("hc_") != std::string::npos)
     return "hyper_connections (hc_*)";
+  if (name.find("compressor_") != std::string::npos ||
+      name.find("indexer.") != std::string::npos)
+    return "compressed_attention (CSA/HCA/indexer)";
   if (name.find("shexp") != std::string::npos)
     return "shared_expert (shexp)";
   if (name.find("ffn_gate.weight") != std::string::npos ||
@@ -346,7 +362,35 @@ int cmd_plan(int argc, char **argv) {
     return 1;
   }
 
-  for (int L = min_layer; L <= max_layer; ++L) {
+  // NextN/MTP draft-block exclusion -- mirrors graph_initializer.cpp's own
+  // c.n_layers computation EXACTLY (block_count - nextn_predict_layers),
+  // via the SAME get_config_int KV lookup GGUFFile already provides. Found
+  // by hand (2026-08-16) chasing a real ~1.4GB gap between this tool's
+  // reported dense total and a live engine run's own [VRAM-BREAKDOWN] for
+  // the SAME GLM-5.2 checkpoint: this tool was naively including the raw
+  // max blk.N found in the file (79 blocks, blk.0..blk.78) as if all were
+  // real transformer layers, while the live engine excludes the trailing
+  // NextN/MTP draft block(s) (nextn_predict_layers=1 for this checkpoint)
+  // from n_layers entirely -- it doesn't implement speculative decoding, so
+  // that block's tensors are loaded but never touched. Without this fix,
+  // every downstream number here (dense GB, MoE layer count, per-layer
+  // slab table) silently disagreed with what a real run actually allocates
+  // -- exactly the invariant this tool's own header comment promises.
+  // Falls back to the naive max_layer+1 (old behavior) if block_count is
+  // absent from KV metadata, matching graph_initializer.cpp's own fallback.
+  int block_count = M.get_config_int("block_count", 0);
+  int nextn_layers = M.get_config_int("nextn_predict_layers", 0);
+  int n_layers_real = (block_count > 0) ? (block_count - nextn_layers)
+                                         : (max_layer - min_layer + 1);
+  int last_real_layer = min_layer + n_layers_real - 1;
+  if (nextn_layers > 0) {
+    printf("[plan] block_count=%d nextn_predict_layers=%d -- excluding "
+           "blk.%d..blk.%d (NextN/MTP draft block(s), never touched by the "
+           "live engine's main forward pass) from every total below.\n",
+           block_count, nextn_layers, last_real_layer + 1, max_layer);
+  }
+
+  for (int L = min_layer; L <= last_real_layer; ++L) {
     std::string base = "blk." + std::to_string(L) + ".";
     auto gE = M.tensors.find(base + "ffn_gate_exps.weight");
     auto uE = M.tensors.find(base + "ffn_up_exps.weight");
@@ -365,7 +409,7 @@ int cmd_plan(int argc, char **argv) {
     }
   }
 
-  int total_layers = max_layer - min_layer + 1;
+  int total_layers = n_layers_real;
   int n_moe_layers = (int)layers_with_experts.size();
   size_t max_slab_bytes = 0;
   for (auto &kv : layer_slab_bytes)
@@ -373,7 +417,7 @@ int cmd_plan(int argc, char **argv) {
 
   printf("Layers blk.%d..blk.%d (%d total), %d with routed experts, %d "
          "leading dense-only.\n",
-         min_layer, max_layer, total_layers, n_moe_layers,
+         min_layer, last_real_layer, total_layers, n_moe_layers,
          total_layers - n_moe_layers);
   if (n_experts > 0)
     printf("Experts per MoE layer: %d\n", n_experts);
@@ -386,6 +430,13 @@ int cmd_plan(int argc, char **argv) {
   for (auto &kv : M.tensors) {
     const std::string &name = kv.first;
     const GGUFTensor &t = kv.second;
+    // Same NextN/MTP exclusion as the layer-range detection above -- a
+    // blk.N tensor past last_real_layer is real data in the file but never
+    // loaded/dispatched by the live engine's dense-offload pass, so it
+    // must not count toward the dense VRAM total either.
+    int L;
+    if (parse_blk_layer(name, L) && (L < min_layer || L > last_real_layer))
+      continue;
     if (!is_dense_offload_candidate(name))
       continue;
     auto &cat = categories[categorize_dense_tensor(name)];

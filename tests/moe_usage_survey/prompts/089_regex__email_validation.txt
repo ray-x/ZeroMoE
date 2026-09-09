@@ -1,0 +1,1 @@
+Write a regex that validates an email address.

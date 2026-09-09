@@ -196,6 +196,16 @@ struct CPUEngine {
   // All dense weights loaded into host memory at startup.
   std::unordered_map<std::string, CPUQuantizedTensor> resident_layers;
 
+  // Qwen4Exp recurrent/HC state. These are allocated lazily by the CPU
+  // backend so non-Qwen models pay no memory cost.
+  std::vector<std::vector<float>> qwen4exp_conv_history;
+  std::vector<std::vector<float>> qwen4exp_recur_state;
+  std::vector<float> qwen4exp_hc_stream_buf;
+  std::vector<float> qwen4exp_hc_inject;
+  std::vector<std::vector<float>> qwen4exp_ple_conv_history;
+  std::vector<int32_t> qwen4exp_ple_token_history;
+  int qwen4exp_ple_next_pos = 0;
+
   // Architecture shortcuts (mirrors StreamingEngine)
   int max_t = 0;
   int64_t t_gen = 0;

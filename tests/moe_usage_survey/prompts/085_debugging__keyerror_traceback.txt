@@ -1,0 +1,16 @@
+I'm getting this error, what's wrong and how do I fix it?
+```
+Traceback (most recent call last):
+  File "app.py", line 12, in <module>
+    result = process(data)
+  File "app.py", line 7, in process
+    return data['value'] / count
+KeyError: 'value'
+```
+Here's the relevant code:
+```python
+def process(items):
+    count = len(items)
+    data = items[0]
+    return data['value'] / count
+```

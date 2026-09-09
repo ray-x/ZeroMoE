@@ -30,6 +30,28 @@ enum class ModelFamily {
                // family_ops table and CLAUDE.md's DeepSeek-V4 plan writeup.
                // Phase 1 only: correct within each layer's local SWA window;
                // CSA/HCA/Lightning-Indexer long-context tiers are future work.
+  GLM5NEXT,    // GLM 5.3 Flash (GGUF arch "glm5next"): HYBRID per-layer
+               // architecture -- recurrent KDA layers (head_count_kv[l]==0)
+               // interleaved with nope-only absorbed-MLA DSA layers, plus
+               // mHC hyper-connections (same per-layer form as DeepSeek_V4,
+               // but the model-level collapse is an unweighted hc_mean, not
+               // DSV4's learned output_hc_* head). NOT a variant of GLM_DSA
+               // (GLM 5.3) -- a different architecture family entirely.
+               // Reference: llama.cpp branch glm5next (src/models/glm5next.cpp).
+               // v1: DSA layers run dense (Lightning indexer deferred).
+  Qwen4Exp,    // Qwen3.8-Flash-Next (GGUF arch "qwen4exp"): HYBRID per-layer
+               // architecture -- Gated DeltaNet recurrent layers interleaved
+               // with full-attention layers every full_attention_interval,
+               // low-rank hyper-connections in place of every layer norm
+               // (INCLUDING the model-level output mixer: no output_norm
+               // tensor), QSA sparse attention on the full-attention layers
+               // (v1: runs dense, indexer deferred -- same staging as
+               // GLM5NEXT's own v1), PLE n-gram hash embedding on select
+               // layers, and a 512-expert MoE with a sigmoid-gated shared
+               // expert. NOT a variant of Qwen -- a different architecture
+               // family entirely. Reference: llama.cpp branch
+               // qwen4exp/qwen3.8-flash-next (src/models/qwen4exp.cpp,
+               // conversion/qwen4exp.py).
   Llama,       // Llama-family (dense FFN, standard attention)
   Qwen, // Qwen MoE family (Qwen3.6-35B-A3B and later) — hybrid SSM + DenseQKV
         // + MoE
@@ -57,6 +79,10 @@ inline ModelFamily detect_model_family(const GGUFFile &model_file) {
     return ModelFamily::DeepSeek_V3;
   if (arch == "deepseek4")
     return ModelFamily::DeepSeek_V4;
+  if (arch == "glm5next")
+    return ModelFamily::GLM5NEXT;
+  if (arch == "qwen4exp")
+    return ModelFamily::Qwen4Exp;
   if (arch == "llama")
     return ModelFamily::Llama;
   if (arch == "qwen" || arch == "qwen2" || arch == "qwen2moe" ||
@@ -70,6 +96,14 @@ inline ModelFamily detect_model_family(const GGUFFile &model_file) {
     return ModelFamily::GLM_DSA;
   if (model_file.kv_uint.count("hy-v3.embedding_length"))
     return ModelFamily::Hunyuan;
+  // Qwen3.8-Flash-Next ALSO carries blk.0.attn_gate.weight (its GDN layers'
+  // z-gate projection) + expert_count, so it must be distinguished from the
+  // generic-Qwen heuristic below FIRST: its low-rank hyper-connection
+  // tensors (hc_*/output_hc_*) exist in no other family.
+  if (model_file.tensors.count("blk.0.hc_attn_inject.weight") ||
+      model_file.tensors.count("output_hc_norm.weight")) {
+    return ModelFamily::Qwen4Exp;
+  }
   // Qwen3.6-35B-A3B hybrid SSM+MoE files carry attention.head_count and
   // expert_count but may not set general.architecture=qwen*; look for SSM
   // gate tensors together with an expert_count.

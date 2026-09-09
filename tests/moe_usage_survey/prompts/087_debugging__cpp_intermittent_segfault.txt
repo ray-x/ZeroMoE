@@ -1,0 +1,12 @@
+This C++ code segfaults intermittently, what's the likely cause?
+```cpp
+std::vector<int> getEvens(std::vector<int>& nums) {
+    std::vector<int> result;
+    for (auto it = nums.begin(); it != nums.end(); ++it) {
+        if (*it % 2 == 0) {
+            nums.erase(it);
+        }
+    }
+    return result;
+}
+```

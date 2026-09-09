@@ -3,6 +3,7 @@
 #include "ram_manager.hpp"
 #include "gguf_tokenizer.hpp"
 #include "async_prefetcher.hpp"
+#include "active_layer_upload_workers.hpp"
 #include "generation_loop.hpp"
 #include "cuda_manager.hpp"
 #include "perf_timer.hpp"
@@ -10,14 +11,23 @@
 #include "logger.hpp"
 #include "tensor_trace.hpp"
 #include "shutdown.hpp"
+#include "startup_preflight.hpp"
+#include "ggml_hc_backend.hpp"
+#include "ggml_moe_backend.hpp"
+#include "ggml_gdn_proj_backend.hpp"
+#include "ggml_glm5next_proj_backend.hpp"
+#include "ggml_deepseek_v4_graph.hpp"
 
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <climits>
 #include <expected>
 #include <chrono>
 #include <map>
+#include <memory>
 #include <unordered_set>
 #include <cmath>
 #include <thread>
@@ -64,6 +74,9 @@ void print_usage() {
               << "                   (chat-template modes only; ignored with --raw-prompt). Empty by\n"
               << "                   default -- MoEStream never invents one on its own; e.g. use this\n"
               << "                   to steer response language: --system-prompt \"Respond in English.\"\n"
+              << "  --reasoning-effort <low|high|max>  GLM-5.3-Flash only: select the\n"
+              << "                   Reasoning Effort system turn when thinking is enabled\n"
+              << "                   (default: max; enable_thinking=false selects direct answer).\n"
               << "  --log-path <file>  Redirect logging to a file instead of stderr\n"
               << "  --log-level <lvl>  VERBOSE | DEBUG | INFO (default) | WARN | ERROR\n"
               << "  --trace-filter <tags>  Comma-separated tags (requires --log-level VERBOSE),\n"
@@ -71,6 +84,9 @@ void print_usage() {
               << "  --trace-abort-on-nan  Abort at the first tensor a NaN/Inf checker flags\n"
               << "  --freeze-usage-stats  Don't overwrite pin_file/prefill_pin_file at shutdown\n"
               << "                   (still read at startup) -- for controlled A/B testing\n"
+              << "  --force-start    Bypass the startup safety checks (concurrent moestream\n"
+              << "                   instance, real RAM headroom, free VRAM) -- only use when\n"
+              << "                   certain it's safe; see startup_preflight.hpp\n"
               << "  --help           Show this help interface\n";
 }
 
@@ -83,16 +99,25 @@ void print_usage() {
 // any GPU compute for pacing, so there's nothing structurally stopping it
 // from batching the same way RAMSafetyManager::get_experts_batch's own
 // Phase B already does. All-or-nothing per chunk (same discipline as
-// Phase B): on ANY failure (ring unavailable, a non-packed-format layer,
-// batch too large, submit failure, short read) returns false and touches
-// no slot's metadata -- ensure_slab_capacity may already have grown a
-// slab_buffer via build_expert_read_requests, which is harmless (grow-only,
-// tolerated by a subsequent load_expert_slab call on the same slot); the
-// caller must fall back to the original per-expert load_expert_slab loop
-// for every item in this exact chunk. Packed format only, matching
-// build_expert_read_requests' own scope -- unpacked_expert_format/legacy
-// per-expert-tensor layouts fall back immediately (build_expert_read_
-// requests returns cnt!=3 or false for those), same as Phase B.
+// Phase B): on ANY failure (ring unavailable, batch too large, submit
+// failure, short read) returns false and touches no slot's metadata --
+// ensure_slab_capacity may already have grown a slab_buffer via
+// build_expert_read_requests, which is harmless (grow-only, tolerated by
+// a subsequent load_expert_slab call on the same slot); the caller must
+// fall back to the original per-expert load_expert_slab loop for every
+// item in this exact chunk.
+//
+// Handles BOTH packed and genuinely-unpacked (Phase 5 mixed-precision)
+// layers, matching build_expert_read_requests' own layer_is_unpacked()
+// branch below -- this comment previously said "packed format only,
+// unpacked falls back immediately", true when build_expert_read_requests
+// itself was packed-only, no longer true since it grew a real unpacked
+// branch. A real bug lived here from exactly that drift: the SECOND,
+// separate geometry lookup a few lines down (feeding populate_packed_slab)
+// still unconditionally assumed packed, silently corrupting a mixed
+// layer's smaller experts even though the real disk read right above it
+// had already used the correct geometry -- see that call site's own
+// comment for the full incident.
 static bool preload_batch_load(StreamingEngine& engine, io_uring_backend::Ring& ring,
                                 const std::vector<std::tuple<int, int, MoEExpertBlock*>>& items) {
     if (items.empty() || !ring.available() || items.size() * 3 > io_uring_backend::Ring::CAPACITY)
@@ -134,7 +159,31 @@ static bool preload_batch_load(StreamingEngine& engine, io_uring_backend::Ring& 
         for (int j = 0; j < cnt; ++j) reqs.push_back(tmp[j]);
         size_t gb, ub, db;
         const GGUFTensor *gM, *uM, *dM;
-        if (!engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) return false;
+        // MUST match the geometry build_expert_read_requests actually used
+        // just above, not just try packed unconditionally -- a real,
+        // confirmed bug (found 2026-09 chasing a real GPU-path NaN on a
+        // genuinely mixed per-expert model): this function's own header
+        // comment says "unpacked_expert_format/legacy per-expert-tensor
+        // layouts fall back immediately (build_expert_read_requests
+        // returns cnt!=3 or false for those)" -- true when this was
+        // written, no longer true since build_expert_read_requests grew a
+        // real layer_is_unpacked() branch (Phase 5 mixed-precision work)
+        // that SUCCEEDS for an unpacked layer instead of falling back. The
+        // real disk read a few lines up already correctly used the per-
+        // expert unpacked geometry in that case -- but this second,
+        // independent packed_slab_geometry() call still unconditionally
+        // reported the layer's OLD packed baseline sizing (that tensor is
+        // still physically present in a symlinked baseline shard
+        // alongside the real override, same reason load_expert_slab had
+        // this identical bug -- see its own comment), so a correctly-read
+        // small cold expert's bytes got handed to populate_packed_slab
+        // with the WRONG (larger, baseline-uniform) gate/up/down
+        // boundaries, corrupting exactly where gate ends and up begins.
+        if (engine.layer_is_unpacked(layer)) {
+            if (!engine.unpacked_expert_geometry(layer, expert_id, gb, ub, db, gM, uM, dM)) return false;
+        } else if (!engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
+            return false;
+        }
         geoms.push_back({gb, ub, db, gM, uM, dM, expert_id, slot});
     }
 
@@ -150,7 +199,7 @@ static bool preload_batch_load(StreamingEngine& engine, io_uring_backend::Ring& 
     // real disk activity -- a real gap this had before being caught by
     // comparing two real runs' own total-bytes figures.
     auto t0 = std::chrono::high_resolution_clock::now();
-    bool submitted = ring.submit_and_wait(reqs.data(), (int)reqs.size(), results.data());
+    bool submitted = ring.submit_and_wait(reqs.data(), (int)reqs.size(), results.data(), engine.drop_expert_pages);
     double batch_ms = std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - t0).count();
     PerfCounters::atomic_add(perf().t_disk_read, batch_ms / 1000.0);
@@ -226,6 +275,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     GGUFTokenizer tokenizer;
     LockFreePrefetcher prefetcher;
     CudaManager gpu;
+    // Constructed further below (after gpu.topology is initialized), only
+    // when config.active_layer_upload_worker_threads > 0 -- see main()'s own
+    // construction site's comment for why it's placed there. Null/unset
+    // means the feature is fully off (ram_mgr.upload_workers stays nullptr,
+    // every call site's existing null-check keeps its current inline
+    // behavior unchanged).
+    std::unique_ptr<ActiveLayerUploadWorkers> upload_worker_pool;
 
     const std::string& model_path = config.model_path;
     int max_ctx = config.context_size;
@@ -234,6 +290,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     engine.drop_expert_pages = config.drop_pages;
     engine.unpacked_expert_format = config.unpacked_expert_format;
     engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;
+    ram_mgr.configured_total_experts =
+        std::max(0, config.ram_cache_total_experts);
     // Must be set BEFORE the [PIN] preload block below -- that's where the
     // bulk of the RAM tier's slabs are first allocated, and each slab is
     // pinned exactly once at its own allocation (ensure_slab_capacity).
@@ -247,17 +305,72 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                              "allocation so upload_expert_active_async's DMA can overlap compute "
                              "(see ram_pinned_budget_gb's own comment). Pinned pages are never "
                              "reclaimable by the kernel; raise this deliberately, not wholesale.\n";
+        LOG_STREAM_INFO() << "[CONFIG] RAM pin eager pre-registration (extends Tier 3's own "
+                             "ranking-informed preload further down its real candidate list when "
+                             "budget remains, single-threaded, before any request is timed -- see "
+                             "ram_pin_eager_preregister's own comment): "
+                          << (config.ram_pin_eager_preregister ? "ON" : "off") << "\n";
+        LOG_STREAM_INFO() << "[CONFIG] RAM preload hit_count seeding (Tier 3 slots start "
+                             "'known warm' from their real pin_file count, clamped below "
+                             "promote_hit_threshold -- see ram_preload_seed_hit_count's own "
+                             "comment): "
+                          << (config.ram_preload_seed_hit_count ? "ON" : "off") << "\n";
     }
     engine.prefill_opportunistic_promote = config.prefill_opportunistic_promote;
     engine.decode_async_prewarm = config.decode_async_prewarm;
     engine.decode_async_prewarm_max_batch = config.decode_async_prewarm_max_batch;
+    engine.decode_async_prewarm_nonblocking = config.decode_async_prewarm_nonblocking;
+    engine.cpu_offload_max_experts = config.cpu_offload_max_experts;
+    engine.prefill_retention_decay = config.prefill_retention_decay;
+    engine.prefill_dispatch_lookahead_tokens = config.prefill_dispatch_lookahead_tokens;
+    engine.prefill_hint_order_by_earliest_token = config.prefill_hint_order_by_earliest_token;
+    engine.pilot_widen_all_tokens = config.pilot_widen_all_tokens;
+    engine.prefetch_widen_all_tokens = config.prefetch_widen_all_tokens;
     engine.attn_qabsorb_gpu = config.attn_qabsorb_gpu;
     engine.attn_qabsorb_gpu_max_vram_gb = config.attn_qabsorb_gpu_max_vram_gb;
     engine.attn_score_gpu = config.attn_score_gpu;
+    engine.qwen4exp_attn_gpu = config.qwen4exp_attn_gpu;
+    engine.qwen4exp_gdn_gpu = config.qwen4exp_gdn_gpu;
+    engine.qwen4exp_gdn_conv_gpu = config.qwen4exp_gdn_conv_gpu;
+    engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
+    engine.glm5next_router_gpu = config.glm5next_router_gpu;
+    engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
+    engine.glm5next_dense_prefill_fusion = config.glm5next_dense_prefill_fusion;
+    engine.mtp_enabled = config.mtp_enabled;
+    engine.mtp_draft_tokens = config.mtp_draft_tokens;
+    engine.prompt_cache = config.prompt_cache;
+    static MemoryGuard g_mem_guard;
+    if (config.mem_guard)
+        g_mem_guard.start(config.mem_guard_warn_mb, config.mem_guard_stop_mb,
+                          config.mem_guard_poll_ms);
+    // Graph-owned expert arenas and the legacy RAM-tier slabs are allocated by
+    // different subsystems.  Configure one process-wide admission ceiling so
+    // a graph source allocation cannot silently sit outside host_ram_gb.  For
+    // host_ram_gb=0, resolve the same 88%-of-currently-available policy used
+    // by RAMSafetyManager; this is only an admission ceiling, while the
+    // background watchdog still protects the live low-water mark.
+    size_t host_budget_bytes = 0;
+    if (config.host_ram_gb > 0.0) {
+        const double bytes = config.host_ram_gb * 1.0e9;
+        host_budget_bytes = bytes >= (double)SIZE_MAX ? SIZE_MAX : (size_t)bytes;
+    } else {
+        const long available_mb = MemoryGuard::read_available_mb();
+        if (available_mb > 0)
+            host_budget_bytes = (size_t)((double)available_mb * 1024.0 * 1024.0 * 0.88);
+    }
+    MemoryGuard::configure_host_budget(host_budget_bytes);
+    LOG_STREAM_INFO() << "[MEM-GUARD] shared host admission budget: "
+                      << (host_budget_bytes > 0
+                              ? std::to_string((double)host_budget_bytes / 1.0e9) + " GB"
+                              : "unbounded (automatic budget unavailable)")
+                      << "\n";
     engine.attn_score_gpu_max_vram_gb = config.attn_score_gpu_max_vram_gb;
     engine.attn_score_gpu_max_context = config.attn_score_gpu_max_context;
+    engine.dsv4_score_gpu = config.dsv4_score_gpu;
+    engine.dsv4_score_gpu_max_vram_gb = config.dsv4_score_gpu_max_vram_gb;
     ram_mgr.configured_ram_gb = config.host_ram_gb;
     ram_mgr.promote_hit_threshold = (uint32_t)config.promote_hit_threshold;
+    ram_mgr.reactive_promote_gpu1_every_n = config.reactive_promote_gpu1_every_n;
     ram_mgr.pin_threshold = (uint32_t)std::max(0, config.pin_threshold);
     ram_mgr.verbose_cache_log = config.verbose_moe_log;
     ram_mgr.expert_fetch_threads = std::max(1, config.expert_fetch_threads);
@@ -267,6 +380,14 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     ram_mgr.disk_batch_padding_target = config.disk_batch_padding_target;
     ram_mgr.disk_batch_padding_evict_dup = config.disk_batch_padding_evict_dup;
     gpu.topology.active_layer_promote_threshold = std::max(1, config.active_layer_promote_hit_threshold);
+    gpu.topology.speculative_active_layer_fill = config.speculative_promote_to_active_layer;
+    // The CUDA runtime reports all physical adapters, but the TOML's
+    // [[gpus]] list is an explicit allocation allow-list. Without passing it
+    // into the topology, a GPU omitted from a single-GPU profile was still
+    // auto-assigned as an ExpertVault and received a large expert pool.
+    gpu.topology.configured_device_ids.clear();
+    for (const auto& gc : config.gpus)
+        gpu.topology.configured_device_ids.push_back(gc.device_id);
     if (config.dense_gpu_idx >= 0) {
         gpu.device_id = config.gpus[config.dense_gpu_idx].device_id;
         // REAL BUG FIX: gpu.device_id above was being set correctly here,
@@ -361,6 +482,23 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // stderr as well as the log -- see the function's own comment for why.
     engine.warn_if_expert_tensors_unaligned();
 
+    // Whole-shard mmap for the prefill expert-streaming path. Enabled here
+    // rather than lazily so a failure is visible at startup and simply
+    // leaves moe_prefill_stream inert (moe_forward_gguf checks
+    // mmap_active()) instead of failing mid-prefill. Deliberately AFTER
+    // enable_direct_io: the mapping uses its own non-O_DIRECT fd, and the
+    // ordering makes that independence obvious at the call site.
+    if (config.moe_prefill_stream) {
+      if (!config.moe_prefill_batched) {
+        LOG_WARN("[CONFIG] moe_prefill_stream=true has no effect without "
+                 "moe_prefill_batched=true (it replaces how that path "
+                 "acquires weights) -- staying on the cached path.\n");
+      } else if (!engine.model_file.enable_mmap()) {
+        LOG_WARN("[CONFIG] moe_prefill_stream=true but the shard mmap could "
+                 "not be established -- staying on the cached path.\n");
+      }
+    }
+
     // cpu_affinity_layers (config): must be set before ANYTHING below can
     // dispatch an expert or preload VRAM -- expert_ffn_resolve_gpu_loc,
     // RAMSafetyManager's reactive-hit promotion, Phase 2's prefill warm-up,
@@ -379,12 +517,65 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // Same timing/reasoning as the pilot_k call directly above, for
     // EngineConfig::prefetch_pilot_depth / prefetch_pilot_k_depth2.
     set_prefetch_pilot_depth(config.prefetch_pilot_depth, config.prefetch_pilot_k_depth2);
+    set_attn_pilot_enabled(config.prefetch_attn_pilot, config.prefetch_attn_pilot_k);
+    set_attn_pilot_vram_promote_top_k(config.attn_pilot_vram_promote_top_k);
+    set_attn_pilot_vram_promote_dynamic(config.attn_pilot_vram_promote_dynamic);
     // Same timing/reasoning again, for the pilot-driven RAM->VRAM
     // speculative promotion config (ram_vram_promote_top_k/adaptive) --
     // execution_layer.cpp's pilot loop reads this on the very same l+1
     // transition as pilot_k_for_layer above.
     set_ram_vram_promote_config(config.ram_vram_promote_top_k, config.ram_vram_promote_adaptive,
                                  config.ram_vram_promote_adaptive_threshold, config.ram_vram_promote_min_samples);
+    // Per-layer accuracy veto (2026-08-25) -- layered on top of whichever
+    // mode set_ram_vram_promote_config/set_attn_pilot_vram_promote_top_k
+    // just configured above, see LayerPromoteGateConfig's own comment
+    // (dense_dispatch.hpp).
+    set_layer_promote_gate_config(config.ram_vram_promote_layer_gate, config.ram_vram_promote_layer_gate_threshold,
+                                   config.ram_vram_promote_layer_gate_min_samples);
+    // Per-layer dynamic WIDTH (2026-08-26) -- graduates the veto above into
+    // a smooth per-layer promotion width, see RamVramPromoteConfig's own
+    // dynamic_* fields (dense_dispatch.hpp) and EngineConfig::ram_vram_
+    // promote_dynamic_layer's own comment.
+    set_ram_vram_promote_dynamic_config(
+        config.ram_vram_promote_dynamic_layer,
+        config.ram_vram_promote_dynamic_threshold_4, config.ram_vram_promote_dynamic_threshold_3,
+        config.ram_vram_promote_dynamic_threshold_2, config.ram_vram_promote_dynamic_threshold_1,
+        config.ram_vram_promote_dynamic_k_tier4, config.ram_vram_promote_dynamic_k_tier3,
+        config.ram_vram_promote_dynamic_k_tier2, config.ram_vram_promote_dynamic_k_tier1,
+        config.ram_vram_promote_dynamic_k_floor, config.ram_vram_promote_dynamic_cold_start_k,
+        config.ram_vram_promote_dynamic_min_samples);
+    set_gpu1_predict_promote_config(config.predict_gpu1_rank_start >= 0, config.predict_gpu1_rank_start,
+                                     config.predict_gpu1_rank_end, config.predict_gpu1_cap_per_layer);
+    // Redirect pilot promotion into the active-layer pool instead of the
+    // main VRAM cache (2026-08-26) -- see EngineConfig::speculative_promote_
+    // to_active_layer's own comment. The dense_dispatch.hpp-side flag
+    // (read by execution_layer.cpp's call sites) and the GpuTopology-side
+    // flag (gpu.topology.speculative_active_layer_fill, set above --
+    // consulted by cleanup_active_layer_area) are deliberately two separate
+    // settings from the SAME config value: the former decides which
+    // function the pilot loop calls, the latter decides whether cleanup
+    // protects a one-layer-ahead entry. Both must agree for the feature to
+    // behave correctly, which is why both are set here from the same
+    // config.speculative_promote_to_active_layer, not independently.
+    set_speculative_promote_to_active_layer(config.speculative_promote_to_active_layer);
+    set_speculative_active_layer_max_k(config.speculative_active_layer_max_k);
+    set_speculative_active_layer_promote_on_confirm(config.speculative_active_layer_promote_on_confirm);
+
+    // 2026-08-28: multi-GPU active-layer routing registry -- see
+    // EngineConfig::active_layer_routing_policy's own comment for the
+    // full design. Built from whichever [[gpus]] entries opted in via
+    // active_layer_weight > 0; route_active_layer_gpu_impl/
+    // active_layer_multi_gpu_enabled (dense_dispatch.hpp) both correctly
+    // degrade to "no routing" when fewer than 2 entries qualify, so this
+    // is safe to call unconditionally regardless of whether the feature
+    // is actually configured.
+    {
+        std::vector<ActiveLayerRouteGpu> al_gpus;
+        for (auto& gc : config.gpus) {
+            if (gc.active_layer_weight > 0) al_gpus.push_back({gc.device_id, gc.active_layer_weight});
+        }
+        set_active_layer_routing_config(config.active_layer_routing_policy, al_gpus);
+    }
 
     // unpacked_expert_format is an explicit performance contract (single
     // combined DMA per expert) -- validate it holds for the WHOLE model
@@ -425,6 +616,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
     // Allocate expert VRAM cache on vault GPU(s)
     size_t expert_slab_bytes = 0;
+    // The optional GLM NextN/MTP block is a real streamed MoE layer too.
+    // Use the cache topology populated by graph_initializer rather than only
+    // the target trunk, so its per-layer geometry is sized consistently.
+    const int cache_layers = static_cast<int>(engine.layers_experts.size());
+    std::vector<size_t> expert_layer_slab_bytes(
+        (size_t)std::max(0, cache_layers), 0);
     if (cfg.n_experts > 0 && cfg.moe_inter > 0) {
         // Real per-expert byte size, accounting for each projection's own quant
         // type (e.g. GLM-5.2 UD ships gate/up=Q2_K, down=Q3_K — a flat "2-bit
@@ -435,11 +632,82 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         // per layer — so sizing from just the first MoE layer found can still
         // undersize the pool for a later, bigger-quant layer. Scan every MoE
         // layer and take the max.
-        for (int l = cfg.first_dense; l < cfg.n_layers; ++l) {
-            expert_slab_bytes = std::max(expert_slab_bytes, engine.compute_expert_slab_bytes(l));
+        for (int l = cfg.first_dense; l < cache_layers; ++l) {
+            const size_t raw_layer_bytes = engine.compute_expert_slab_bytes(l);
+            // The compact pool is still laid out in byte-addressable VRAM,
+            // but 4 KiB region padding keeps every following slot/page base
+            // aligned for future direct GPU/file transfers. This is tiny
+            // overhead compared with the old global row-LCM stride.
+            constexpr size_t COMPACT_REGION_ALIGNMENT = 4096;
+            size_t layer_slot_bytes = raw_layer_bytes;
+            if (layer_slot_bytes > 0) {
+                const size_t rem = layer_slot_bytes % COMPACT_REGION_ALIGNMENT;
+                if (rem != 0 && layer_slot_bytes <= SIZE_MAX - (COMPACT_REGION_ALIGNMENT - rem)) {
+                    layer_slot_bytes += COMPACT_REGION_ALIGNMENT - rem;
+                }
+            }
+            expert_layer_slab_bytes[(size_t)l] = layer_slot_bytes;
+            expert_slab_bytes = std::max(expert_slab_bytes, raw_layer_bytes);
+        }
+        // The direct resident-layer GGML view uses the cache's physical slot
+        // stride as the quantized tensor nb[2].  Round the model-wide maximum
+        // slot to a whole number of rows for every routed projection so
+        // mixed IQ formats (for example IQ2_XXS + IQ1_M) remain valid when
+        // viewed without a repack.  This is a small cache-capacity tradeoff;
+        // the normal compact path would not require it, but the Bee-style
+        // zero-repack path does.
+        const size_t stride_alignment = engine.expert_cache_stride_alignment();
+        if (expert_slab_bytes > 0 && stride_alignment > 1 &&
+            stride_alignment != SIZE_MAX) {
+            const size_t rem = expert_slab_bytes % stride_alignment;
+            if (rem != 0) expert_slab_bytes += stride_alignment - rem;
+            LOG_STREAM_INFO() << "[GPU] Expert staging/legacy stride: "
+                              << expert_slab_bytes << " bytes (row-compatible alignment "
+                              << stride_alignment << "; compact per-layer VRAM regions use their own 4 KiB-padded sizes)\n";
+        } else if (stride_alignment == SIZE_MAX) {
+            LOG_STREAM_WARN() << "[GPU] Expert cache row alignment overflow; "
+                              << "disabling zero-repack stride adjustment\n";
         }
     }
-    gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, config);
+    // GLM NextN/MTP and the target-only full graph cannot share this startup
+    // path: the full graph owns a separate target expert arena and does not
+    // contain the optional NextN block.  Let an explicit MTP request win over
+    // a stale MOESTREAM_GLM5NEXT_FULL_GRAPH=1 inherited from another test
+    // session.  Other families retain their existing graph selection.
+    const bool glm5next_mtp_uses_legacy_path =
+        engine.mtp_enabled && engine.family_ops.family == ModelFamily::GLM5NEXT;
+    const bool graph_mode =
+        (qwen4exp_full_graph_enabled() &&
+         engine.family_ops.family == ModelFamily::Qwen4Exp) ||
+        (glm5next_full_graph_enabled() &&
+         engine.family_ops.family == ModelFamily::GLM5NEXT &&
+         !glm5next_mtp_uses_legacy_path) ||
+        (deepseek_v4_full_graph_enabled() &&
+         engine.family_ops.family == ModelFamily::DeepSeek_V4);
+    const bool graph_ram_cache = graph_mode &&
+        std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr;
+    if (glm5next_mtp_uses_legacy_path && glm5next_full_graph_enabled()) {
+        LOG_STREAM_INFO()
+            << "[MTP] GLM NextN/MTP is enabled; bypassing the target-only "
+               "GLM full graph so the NextN block can be loaded and executed.\n";
+    }
+    if (graph_mode && !graph_ram_cache) {
+      // The full GGML graph owns its selected expert tensors in a separate
+      // CUDA arena. The legacy cache is not referenced by that graph;
+      // retaining it would consume the VRAM needed by graph-owned weights and
+      // duplicate cache bookkeeping. This applies even when zero routed
+      // layers are preloaded: host-backed MUL_MAT_ID remains the graph's
+      // selective-copy source in that case.
+      LOG_STREAM_INFO() << "[GPU] Legacy expert cache skipped: full GGML graph "
+                          << "device residency is enabled\n";
+    } else if (!graph_mode) {
+        gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, config,
+                               expert_layer_slab_bytes);
+    } else {
+        LOG_STREAM_INFO()
+            << "[GPU] Legacy VRAM expert cache skipped: full graph is using "
+               "the graph-compatible RAM cache\n";
+    }
     gpu.report_vram_usage("after expert cache setup");
 
     // Connect VRAM expert cache to the RAM manager for LRU integration
@@ -474,7 +742,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // the substrings below, so dense_proj's GPU dispatch check
     // (`W.device_ptr`) always failed for them and every token paid the
     // full CPU dequant-matmul cost for every layer's shared expert.
-    auto is_dense_offload_candidate = [](const std::string& name) {
+    // HC/GDN GGML runners borrow their weight pointers from this shared dense
+    // pool, avoiding a second private CUDA copy. Host copies remain in
+    // resident_layers for registration and CPU fallback.
+    auto is_dense_offload_candidate = [&](const std::string& name) {
         // attn_k_b/attn_v_b are dequantized ONCE, CPU-side, straight from
         // host_ptr into the MLA absorption cache (wuk_cache/wuv_cache,
         // attention_layer.cpp's mla_attention_absorbed_gguf) -- dense_proj
@@ -513,6 +784,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         // DeepSeek-V4 model (found auditing tools/gguf_plan.cpp, which
         // mirrors this exact function, against the newly-added tensor set).
         if (name.find("hc_") != std::string::npos) return true;
+        // ssm_/ple_ catch Qwen4Exp's GDN recurrent-layer tensors (ssm_conv1d,
+        // ssm_beta/alpha, ssm_out, ssm_norm, ...) and PLE layer tensors --
+        // all resident, per-token dense_proj targets, same "resident and
+        // always-used" rationale as the attention set. (attn_qkv/attn_gate
+        // already match "attn".)
+        if (name.find("ssm_") != std::string::npos ||
+            name.find("ple_") != std::string::npos) return true;
         return name.find("attn") != std::string::npos ||
                name.find("norm") != std::string::npos ||
                name.find("gate_inp") != std::string::npos ||
@@ -520,10 +798,16 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                name.find("ffn_gate.weight") != std::string::npos ||
                name.find("ffn_up.weight") != std::string::npos ||
                name.find("ffn_down.weight") != std::string::npos ||
+               name.find("nextn.") != std::string::npos ||
                name == "token_embd.weight" ||
                name == "output.weight" ||
                name == "output_norm.weight";
     };
+
+    // HC/GDN tensors are included in this same pool. Their GGML runners
+    // borrow the pool's device_ptrs through an external tensor marker, so
+    // excluding them would only force a second private CUDA copy. The host
+    // copies remain available for registration and CPU fallback.
 
     // attn_output fast-path: this weight is a STATIC per-layer matrix (same
     // every token, like attn_k_b/attn_v_b) that's large enough (~69 MB in
@@ -681,6 +965,50 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     size_t dual_role_slice_reservation = (size_t)(core_moe_cache_gb_for_reservation * 1e9);
 
     size_t worst_case_pool_bytes = non_attn_output_pool_bytes + attn_output_quantized_total;
+
+    // Real-vs-configured dense_gb sanity check. worst_case_pool_bytes above
+    // is the SAME byte-for-byte total this run's own dense pool is about to
+    // request (non_attn_output_pool_bytes + attn_output at native quant
+    // size) -- ground truth for THIS exact model/quant-mix, not an
+    // estimate. dense_gb itself is never actually enforced as a cap
+    // anywhere (confirmed by grep: only read by engine_config.hpp's
+    // auto-sizing branch, which doesn't run when dense_gb is set
+    // explicitly, as it is in every real config this project uses) -- so a
+    // stale/wrong value doesn't break anything structurally, but it DOES
+    // silently misrepresent how much of the card's VRAM budget is actually
+    // spoken for, which is exactly the kind of "reasoned from a number that
+    // was never true" mistake this session's own GPU1-VRAM investigation
+    // kept tripping over. Matches the same fixed tools/gguf_plan.cpp
+    // categorization (NextN/MTP-excluded, DSA-indexer-excluded) so a
+    // pre-flight `gguf_tool plan` run and this warning agree.
+    for (auto& gc : config.gpus) {
+        if (gc.device_id != gpu.device_id || gc.dense_gb <= 0) continue;
+        double real_gb = worst_case_pool_bytes / 1e9;
+        double configured_gb = gc.dense_gb;
+        double diff_gb = std::abs(real_gb - configured_gb);
+        double diff_pct = (configured_gb > 0) ? 100.0 * diff_gb / configured_gb : 0.0;
+        // Combined threshold, not percentage alone: on a small (16GB-class)
+        // card a "modest" 5-8% miss is still ~1GB of real, unaccounted-for
+        // VRAM budget -- exactly the size of gap that mattered throughout
+        // this session's own GPU1 investigation. Fires on EITHER a real
+        // >=5% relative miss or a >=0.5GB absolute one, so it still catches
+        // a small-percentage-but-large-absolute miss on a big card too.
+        if (diff_pct >= 5.0 || diff_gb >= 0.5) {
+            LOG_STREAM_WARN() << "[CONFIG] dense_gb=" << configured_gb
+                << " GB (device " << gc.device_id << ") looks stale -- this "
+                << "model's REAL dense-tensor requirement (native quant, "
+                << "nothing BF16-converted, gate_inp excluded since it's "
+                << "budgeted/converted separately) is " << real_gb
+                << " GB, " << diff_pct << "% off. This isn't a hard cap "
+                << "(the pool allocates against real free VRAM regardless "
+                << "of this value), but it misrepresents this card's real "
+                << "budget for any headroom math you do by hand. Suggested: "
+                << "dense_gb = " << (real_gb + 0.5)
+                << " (real requirement + ~0.5GB margin). Cross-check with "
+                << "`gguf_tool plan <model>` before a real run.\n";
+        }
+    }
+
     constexpr size_t FAST_PATH_SAFETY_MARGIN = (size_t)1 << 30;  // 1 GB, matches the dense-pool backoff's own margin style
     size_t free_before_fast_path = gpu.core_free_vram_bytes();
     size_t fast_path_reserved = worst_case_pool_bytes + FAST_PATH_SAFETY_MARGIN + dual_role_slice_reservation;
@@ -690,6 +1018,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         : 0;
 
     int fast_converted = 0, fast_skipped = 0;
+    int fast_skipped_budget = 0, fast_skipped_upload = 0;
     size_t fast_bytes_used = 0;    // gross BF16 bytes actually allocated (for the log line only)
     size_t budget_spent = 0;       // NET budget consumed: sum of (bf16_bytes - quant_bytes) over converted layers
     // Tracks what the SAME converted layers would have cost under the old
@@ -705,7 +1034,10 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         size_t bf16_bytes_estimate = (size_t)qt->meta.shape[0] * (size_t)qt->meta.shape[1] * sizeof(uint16_t);
         size_t net_cost = (bf16_bytes_estimate > quant_bytes) ? (bf16_bytes_estimate - quant_bytes) : 0;
         size_t remaining_net_budget = (fast_path_budget > budget_spent) ? (fast_path_budget - budget_spent) : 0;
-        if (net_cost > remaining_net_budget) { ++fast_skipped; continue; }
+        if (net_cost > remaining_net_budget) {
+            ++fast_skipped; ++fast_skipped_budget;
+            continue;
+        }
         // upload_dequantized_bf16 itself checks the GROSS bf16 size against
         // whatever's passed here -- pass the real remaining free VRAM (ground
         // truth), not the net-budget figure, since the two are different
@@ -718,17 +1050,38 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             budget_spent += net_cost;
             f32_equivalent_bytes += (size_t)qt->meta.shape[0] * (size_t)qt->meta.shape[1] * sizeof(float);
         } else {
-            ++fast_skipped;
+            ++fast_skipped; ++fast_skipped_upload;
         }
     }
+
     LOG_STREAM_INFO() << "[CUDA] attn_output fast-path (BF16 dequant + matched-type cuBLAS): "
               << fast_converted << " layer(s) converted (" << fast_bytes_used / 1e9
               << " GB BF16, vs " << f32_equivalent_bytes / 1e9
               << " GB if these same layers had used the old F32 fast-path -- "
               << (f32_equivalent_bytes - fast_bytes_used) / 1e9 << " GB saved), "
               << fast_skipped << " layer(s) kept on the slower fused kernel"
+              << " [" << fast_skipped_budget << " skipped for lack of budget, "
+              << fast_skipped_upload << " rejected by upload_dequantized_bf16 itself]"
               << " (net budget was " << fast_path_budget / 1e9 << " GB, worst-case pool reservation "
               << worst_case_pool_bytes / 1e9 << " GB).\n";
+    // 2026-09-01: the two skip reasons used to be indistinguishable, which
+    // is actively misleading -- the budget figure is printed either way, so a
+    // run where EVERY layer was rejected by upload_dequantized_bf16 (which
+    // returns false immediately for any non-F32 tensor) still reads as though
+    // VRAM budget were the constraint, sending you off to tune dense_gb /
+    // moe_cache_gb for nothing. On GLM-5.3 attn_output is quantized, so all
+    // 78 are 'rejected', 0 are budget skips, with 15.6 GB VRAM free.
+    //
+    // That rejection is CORRECT, not a bug worth 'fixing': this path's
+    // original win was BF16-vs-F32 (halves memory AND speeds up compute).
+    // BF16-vs-quantized is the opposite trade -- 69 MB -> 201 MB per layer,
+    // ~10.3 GB extra across 78 layers on a 16.65 GB card -- to accelerate a
+    // ~5.7s bucket. Do not relax the F32 guard without measuring that trade.
+    if (fast_skipped_upload > 0 && fast_converted == 0) {
+        LOG_STREAM_INFO() << "[CUDA] attn_output fast-path is INACTIVE by design on this model: "
+                             "upload_dequantized_bf16 accepts F32 tensors only, and this model's "
+                             "attn_output is quantized. Not a VRAM problem -- see the note in main.cpp.\n";
+    }
 
     // Pass 1: collect the REMAINING candidates (fast-path attn_output layers
     // excluded — they don't need a quantized VRAM copy anymore) and total the
@@ -817,7 +1170,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                   return a->meta.size_bytes > b->meta.size_bytes;
               });
 
-    bool pool_ready = gpu.init_dense_pool(pool_bytes_needed);
+    // Full-graph mode binds these weights into its own GGML CUDA arena. The
+    // main pool would be a duplicate copy that the graph cannot reference and
+    // would consume the headroom needed by the scheduler workspace.
+    bool pool_ready = graph_mode ? true : gpu.init_dense_pool(pool_bytes_needed);
+    if (graph_mode) {
+        LOG_STREAM_INFO() << "[CUDA] Dense pool skipped: full GGML graph owns a GGML device arena\n";
+    }
     if (!pool_ready && pool_bytes_needed > 0) {
         // Didn't fit at full size — back off to a fraction of ACTUAL free
         // VRAM (ground truth, not our own estimate) and retry. Whatever
@@ -833,7 +1192,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
     int offload_ok = 0, offload_failed = 0;
     size_t offload_failed_bytes = 0;
-    if (pool_ready) {
+    if (pool_ready && !graph_mode) {
         for (QuantizedTensor* tensor : dense_candidates) {
             if (gpu.offload_tensor_to_pool(*tensor)) {
                 ++offload_ok;
@@ -842,14 +1201,18 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 offload_failed_bytes += tensor->meta.size_bytes;
             }
         }
-    } else {
+    } else if (!graph_mode) {
         offload_failed = (int)dense_candidates.size();
         for (QuantizedTensor* tensor : dense_candidates) offload_failed_bytes += tensor->meta.size_bytes;
         LOG_STREAM_ERROR() << "[CUDA] Dense tensor pool could not be allocated at any size — "
                   << "all " << offload_failed << " tensor(s) staying host-resident.\n";
     }
 
-    LOG_STREAM_INFO() << "[CUDA] Dense offload: " << offload_ok << " tensors on VRAM\n";
+    if (graph_mode) {
+        LOG_STREAM_INFO() << "[CUDA] Dense offload skipped: full GGML graph owns the device arena\n";
+    } else {
+        LOG_STREAM_INFO() << "[CUDA] Dense offload: " << offload_ok << " tensors on VRAM\n";
+    }
     if (offload_failed > 0) {
         LOG_STREAM_WARN() << "[CUDA] " << offload_failed << " tensor(s) ("
                   << offload_failed_bytes / 1e9 << " GB) did NOT fit in VRAM — "
@@ -966,10 +1329,108 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // No-op if disabled, or if there's no usage history yet -- see that
     // function's own "first-ever run is identical to disabled" guarantee.
     if (config.ram_cache_layer_adaptive) {
-        ram_mgr.apply_layer_adaptive_capacity(config.pin_file, cfg.n_layers, cfg.n_experts);
+        ram_mgr.apply_layer_adaptive_capacity(config.pin_file, cache_layers,
+                                               cfg.n_experts);
     }
 
-    // vram_evict_demote_to_ram: wired here (after calculate_safe_cache_capacity
+    // Prefill sliding-window RAM capacity (2026-08-30, P1+P2) -- must come
+    // AFTER both capacity steps above, since the window is a third override
+    // tier layered on top of whatever base cap they settled (uniform, or
+    // adaptive per-layer). No-op when disabled: sizes the override vector
+    // all-zero, which cap_for_layer falls straight through.
+    ram_mgr.init_prefill_window(engine, config.prefill_window_cap, config.prefill_window_extra_gb);
+
+    // Optional graph/RAM handoff. A stock GGML graph cannot safely refer to
+    // an LRU slot whose slab may be evicted, so only layers whose complete
+    // expert set fits the already-calculated RAM capacity are exposed as
+    // fixed-stride graph tensors. The remaining layers use the graph's
+    // source-backed fallback and retain normal lazy cache behavior.
+    if (graph_ram_cache) {
+        std::vector<int> graph_ram_full_layers;
+        const int n_experts = engine.model_file.architecture_config.n_experts;
+        for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
+            if (n_experts <= 0 || engine.compute_expert_slab_bytes(layer) == 0 ||
+                (int)engine.layers_experts[(size_t)layer].size() < n_experts ||
+                ram_mgr.cap_for_layer(layer) < n_experts)
+                continue;
+            graph_ram_full_layers.push_back(layer);
+        }
+        if (!engine.prepare_graph_ram_arenas(graph_ram_full_layers)) {
+            LOG_STREAM_WARN()
+                << "[GRAPH-RAM] no complete layer arena was admitted; "
+                   "full graph will use its bounded source-backed path\n";
+        }
+    }
+
+  // prefill->decode retention handoff (2026-08-31). 0 = off (default),
+  // in which case eviction_score is byte-identical to its prior form.
+  RAMSafetyManager::set_prefill_retention_weight((uint64_t)std::max(0, config.prefill_retention_weight));
+  RAMSafetyManager::set_prefill_retention_shape(
+      std::max(0, config.prefill_retention_top_n),
+      std::max(1, config.prefill_retention_min_demand),
+      config.prefill_retention_flat_cut, config.prefill_retention_peaky_cut);
+
+  // RAM-tier load grace period (2026-09-04). 0 tokens = off (default), in
+  // which case eviction_score is byte-identical to its prior form.
+    RAMSafetyManager::set_ram_grace_period(
+      (uint64_t)std::max(0, config.ram_grace_period_tokens),
+      (uint64_t)std::max(0, config.ram_grace_period_bonus));
+
+    // Usage files are learned state, not model data.  A stale file from a
+    // different checkpoint can therefore contain layer/expert IDs that do
+    // not exist in this model.  The preload code below indexes
+    // engine.layers_experts[layer] several times, so let the bad record be
+    // visible and discard it before it can turn into an opaque SIGSEGV.
+    // Keep this validation here, after build_model_graph has created the real
+    // per-layer slot vectors (GLM-5.3 has dense leading layers and a hybrid
+    // layer count), rather than trusting only architecture metadata.
+    auto sanitize_usage_entries = [&](const std::string& path,
+                                      const char *source,
+                                      std::vector<StreamingEngine::UsageEntry> raw) {
+        const size_t model_layer_count = engine.layers_experts.size();
+        const int model_expert_count = engine.model_file.architecture_config.n_experts;
+        std::vector<StreamingEngine::UsageEntry> valid;
+        valid.reserve(raw.size());
+        size_t rejected = 0;
+        constexpr size_t kMaxSamples = 8;
+        for (size_t record = 0; record < raw.size(); ++record) {
+            const auto &entry = raw[record];
+            const bool layer_valid = entry.layer >= 0 &&
+                                     (size_t)entry.layer < model_layer_count;
+            const size_t layer_slot_count = layer_valid
+                ? engine.layers_experts[(size_t)entry.layer].size() : 0;
+            const bool expert_valid = entry.expert >= 0 &&
+                                      entry.expert < model_expert_count &&
+                                      (size_t)entry.expert < layer_slot_count;
+            if (layer_valid && expert_valid) {
+                valid.push_back(entry);
+                continue;
+            }
+
+            ++rejected;
+            if (rejected <= kMaxSamples) {
+                LOG_STREAM_ERROR() << "[PIN-BOUNDS] Ignoring invalid " << source
+                          << " record #" << (record + 1) << " from " << path
+                          << ": layer=" << entry.layer << ", expert=" << entry.expert
+                          << ", count=" << entry.count
+                          << ". Model has layer vectors [0," << model_layer_count
+                          << ") and n_experts=" << model_expert_count
+                          << "; this layer has " << layer_slot_count
+                          << " expert slots. The usage file is stale/incompatible or corrupt.\n";
+            }
+        }
+        if (rejected > 0) {
+            LOG_STREAM_WARN() << "[PIN-BOUNDS] Rejected " << rejected << "/"
+                      << raw.size() << " " << source << " record(s) from " << path
+                      << "; retained " << valid.size()
+                      << " model-compatible record(s). Preload will continue safely."
+                      << (rejected > kMaxSamples ? " Additional invalid records were suppressed.\n"
+                                                  : "\n");
+        }
+        return valid;
+    };
+
+  // vram_evict_demote_to_ram: wired here (after calculate_safe_cache_capacity
     // has set a real ram_mgr.slots_per_layer, and before anything -- including
     // the [PIN] preload block right below -- can trigger a real VRAM eviction)
     // so a demote never runs against an uninitialized RAM-tier cap. See
@@ -986,11 +1447,34 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         };
     }
 
-    if (!config.pin_file.empty() && ram_mgr.vram_cache && ram_mgr.vram_cache->expert_vram_cache_cap > 0) {
+    // The opt-in Qwen4Exp full graph owns one complete host-side expert
+    // backing set for ggml MUL_MAT_ID.  Running the ordinary pin/preload
+    // pipeline as well would allocate a second complete expert set before
+    // graph preparation (about 42 GB on UD-IQ1_M), and can push this box
+    // into swap/OOM.  The graph still reads every expert into DDR before its
+    // measured prefill; it just avoids maintaining the unrelated legacy
+    // RAM/VRAM cache alongside it.  If the graph declines and falls back,
+    // that fallback is intentionally visible in the log rather than silently
+    // paying this unsafe duplicate allocation.
+    if ((!graph_mode || graph_ram_cache) &&
+        (!config.pin_file.empty() || config.ram_preload_all_experts) &&
+        ram_mgr.vram_cache &&
+        (graph_ram_cache || ram_mgr.vram_cache->expert_vram_cache_cap > 0)) {
+        ram_mgr.vram_cache->startup_preload_phase = true;
         auto [entries, maxc] = StreamingEngine::load_usage(config.pin_file);
-        if (entries.empty()) {
-            LOG_STREAM_INFO() << "[PIN] No usage file at " << config.pin_file
-                      << " yet (first run) -- VRAM/RAM caches will fill reactively.\n";
+        const bool usage_file_had_entries = !entries.empty();
+        entries = sanitize_usage_entries(config.pin_file, "pin_file", std::move(entries));
+        maxc = 0;
+        for (const auto &entry : entries) maxc = std::max(maxc, entry.count);
+        if (entries.empty() && !config.ram_preload_all_experts) {
+            if (usage_file_had_entries) {
+                LOG_STREAM_WARN() << "[PIN] No model-compatible records remain in "
+                          << config.pin_file
+                          << " -- VRAM/RAM caches will fill reactively for this run.\n";
+            } else {
+                LOG_STREAM_INFO() << "[PIN] No usage file at " << config.pin_file
+                          << " yet (first run) -- VRAM/RAM caches will fill reactively.\n";
+            }
         } else {
             std::unordered_map<int, std::vector<StreamingEngine::UsageEntry>> by_layer;
             for (auto& e : entries) by_layer[e.layer].push_back(e);
@@ -1047,10 +1531,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             if (!config.prefill_pin_file.empty()) {
                 auto [pf_entries, pf_maxc] = StreamingEngine::load_usage(config.prefill_pin_file);
                 (void)pf_maxc;
+                const bool prefill_file_had_entries = !pf_entries.empty();
+                pf_entries = sanitize_usage_entries(config.prefill_pin_file,
+                                                     "prefill_pin_file", std::move(pf_entries));
                 if (pf_entries.empty()) {
-                    LOG_STREAM_INFO() << "[PIN] prefill_pin_file (" << config.prefill_pin_file
-                              << ") has no data yet -- every layer falls back to the general pin_file "
-                                 "ranking for this run.\n";
+                    if (prefill_file_had_entries) {
+                        LOG_STREAM_WARN() << "[PIN] prefill_pin_file (" << config.prefill_pin_file
+                                  << ") has no model-compatible records -- every layer falls back "
+                                     "to the general pin_file ranking for this run.\n";
+                    } else {
+                        LOG_STREAM_INFO() << "[PIN] prefill_pin_file (" << config.prefill_pin_file
+                                  << ") has no data yet -- every layer falls back to the general pin_file "
+                                     "ranking for this run.\n";
+                    }
                 } else {
                     // Per-layer concentration diagnostic (the "statistics
                     // for the prefill pin" this whole redesign was
@@ -1213,6 +1706,50 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 }
             }
 
+            // A usage file is a ranking signal, not a complete model
+            // manifest. When DDR is large enough to hold the whole MoE, add
+            // zero-count entries for every model expert so Tier 3 preloads
+            // the full set instead of leaving history-missing experts to
+            // fault in during the first request. Existing counts retain
+            // their ranking priority; the newly added entries simply fill
+            // the remaining RAM slots.
+            if (config.ram_preload_all_experts) {
+                // `n_layers` is the target trunk count. When the GLM
+                // NextN/MTP bridge is active, the optional final block is a
+                // real routed MoE layer too and must be included here;
+                // otherwise its first proposal can still fault experts from
+                // SSD even when the target trunk was fully preloaded into
+                // host RAM.
+                const int model_layers =
+                    static_cast<int>(engine.layers_experts.size());
+                const int model_experts =
+                    engine.model_file.architecture_config.n_experts;
+                size_t added = 0;
+                for (int layer = 0; layer < model_layers; ++layer) {
+                    if (engine.compute_expert_slab_bytes(layer) == 0 ||
+                        model_experts <= 0)
+                        continue;
+                    auto &v = by_layer[layer];
+                    std::vector<unsigned char> present((size_t)model_experts, 0);
+                    for (const auto &entry : v) {
+                        if (entry.expert >= 0 && entry.expert < model_experts)
+                            present[(size_t)entry.expert] = 1;
+                    }
+                    for (int expert = 0; expert < model_experts; ++expert) {
+                        if (present[(size_t)expert]) continue;
+                        v.push_back({layer, expert, 0});
+                        ++added;
+                    }
+                    std::stable_sort(v.begin(), v.end(),
+                                     [](const auto &a, const auto &b) {
+                                         return a.count > b.count;
+                                     });
+                }
+                LOG_STREAM_INFO()
+                    << "[PIN] ram_preload_all_experts: added " << added
+                    << " history-missing model experts to the preload manifest\n";
+            }
+
             // Persist this SAME final ranking (post prefill_pin_file
             // override) for RAMSafetyManager's runtime disk_batch_padding
             // to use as its candidate source -- see that member's own
@@ -1264,6 +1801,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 config.pin_vram_lru_fraction * avg_vram_slots_per_layer));
             int ram_n = std::max(0, (int)std::lround(
                 config.pin_ram_fraction * ram_mgr.slots_per_layer));
+            bool prefix_vram = config.vram_preload_prefix_layers > 0;
+
+            // The graph/RAM experiment deliberately has no legacy VRAM
+            // expert pool. Do not let the ordinary pin ranking attempt GPU
+            // uploads merely because the config still contains its normal
+            // VRAM settings; all complete layers go to the shared RAM arena,
+            // while incomplete layers stay on the graph source fallback.
+            if (graph_ram_cache) {
+                topk = 0;
+                max_pinned_total = 0;
+                global_topn = false;
+                vram_lru_n = 0;
+                prefix_vram = false;
+            }
 
             // pin_strategy=="global_topn": replace the uniform per-layer topk
             // above with a per-layer pin count derived from a SINGLE ranking
@@ -1287,7 +1838,30 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             // unchanged -- only N itself becomes per-layer instead of a
             // single shared topk.
             std::unordered_map<int, int> layer_pin_count;
-            if (global_topn) {
+            if (prefix_vram) {
+                const int prefix_end = std::min(
+                    config.vram_preload_prefix_layers,
+                    (int)engine.model_file.architecture_config.n_layers);
+                const int effective_cap = max_pinned_total > 0
+                    ? max_pinned_total
+                    : (int)(avg_vram_slots_per_layer * moe_layers);
+                int assigned = 0;
+                for (int layer = 0; layer < prefix_end; ++layer) {
+                    auto it = by_layer.find(layer);
+                    if (it == by_layer.end()) continue;
+                    const int take = std::min(
+                        (int)it->second.size(),
+                        std::max(0, effective_cap - assigned));
+                    layer_pin_count[layer] = take;
+                    assigned += take;
+                    if (assigned >= effective_cap) break;
+                }
+                LOG_STREAM_INFO()
+                    << "[PIN] vram_preload_prefix_layers: layers [0, "
+                    << prefix_end << ") assigned " << assigned << "/"
+                    << effective_cap
+                    << " VRAM slots in ascending layer order\n";
+            } else if (global_topn) {
                 int floor_n = std::max(0, config.pin_global_floor_per_layer);
                 int floor_total = 0;
                 for (auto& [layer, v] : by_layer) {
@@ -1334,6 +1908,91 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                           << " target pins across " << moe_layers << " layer(s)\n";
             }
 
+            // pin_core_gpu_top_n: of the experts layer_pin_count[] just
+            // decided WILL be pinned, redirect the globally-hottest N of
+            // them (by real count, across every layer) to land specifically
+            // on the CoreEngine/dual-role GPU instead of wherever the
+            // default unrestricted scan would put them -- see this field's
+            // own EngineConfig comment for the full rationale. Only
+            // meaningful under global_topn, since that's the only strategy
+            // that already produces a coherent cross-layer ranking here
+            // (per_layer_topk's own layer_max is decided inline, order-
+            // dependent on the running total_pinned -- not worth
+            // reconstructing a second ranking for a strategy this project
+            // isn't actually running).
+            int pinned = 0, vram_lru = 0, ram_preloaded = 0, attempted = 0;
+            int pin_core_gpu_redirected = 0, pin_core_gpu_redirect_fallback = 0;
+            int total_pinned = 0;  // Three-tier: track total pinned count
+            if (global_topn && config.pin_core_gpu_top_n > 0 &&
+                gpu.topology.core_gpu >= 0 &&
+                std::find(gpu.topology.vault_gpus.begin(), gpu.topology.vault_gpus.end(),
+                          gpu.topology.core_gpu) != gpu.topology.vault_gpus.end()) {
+                struct FlatCand { int layer; int expert; uint64_t count; };
+                std::vector<FlatCand> flat;
+                for (auto& [layer, v] : by_layer) {
+                    int lim = std::min(layer_pin_count[layer], (int)v.size());
+                    for (int i = 0; i < lim; ++i)
+                        flat.push_back({layer, v[i].expert, v[i].count});
+                }
+                std::stable_sort(flat.begin(), flat.end(),
+                          [](const FlatCand& a, const FlatCand& b) { return a.count > b.count; });
+                int core_take = std::min((int)flat.size(), config.pin_core_gpu_top_n);
+                LOG_STREAM_INFO() << "[PIN] pin_core_gpu_top_n: redirecting " << core_take
+                          << " of the globally-hottest already-pinned experts to land on the "
+                             "CoreEngine GPU (gpu=" << gpu.topology.core_gpu << ")'s own dual-role "
+                             "slice specifically, instead of the default (unrestricted) placement -- "
+                             "falls back to unrestricted per-expert if that GPU's own slots fill up "
+                             "before all " << core_take << " fit\n";
+                // Do this as its own DEDICATED pass, RIGHT NOW, before the
+                // main by_layer loop below (Tier1/Tier2) ever runs -- not
+                // just a check inside that loop. Reason, found via a real
+                // run before trusting this: the main loop processes layers
+                // in unordered_map hash-bucket order and does Tier2's own
+                // UNRESTRICTED uploads for every layer along the way -- by
+                // the time a later-processed layer's marked candidate is
+                // reached, Tier2's own (unmarked) uploads for EARLIER-
+                // processed layers can already have accidentally consumed
+                // the CoreEngine GPU's tiny slot count via nothing more
+                // than iteration-order luck (evict_lru's unrestricted scan
+                // takes the first empty slot it finds, regardless of GPU).
+                // Confirmed real: a first attempt with the check only
+                // inside the main loop landed just 5 of 61 requested on
+                // GPU1. Running this pass FIRST, before anything else has
+                // touched that GPU's slots, removes the race entirely.
+                // Simple per-item load (not the chunked io_uring batching
+                // the main loop uses below) -- core_take is small (bounded
+                // by the CoreEngine GPU's own tiny slot count), not worth
+                // the extra machinery for a few dozen one-time reads.
+                for (int i = 0; i < core_take; ++i) {
+                    // NOT counted into attempted/pinned/total_pinned here --
+                    // the main by_layer loop below will reach this exact
+                    // (layer,expert) again in its own normal position and
+                    // count it there (upload_expert's find_expert() returns
+                    // this SAME cached location, pin_expert() is safely
+                    // re-callable), which is the single source of truth for
+                    // "how many distinct experts are pinned" against
+                    // pinned_vram_capacity. Counting here too would double-
+                    // count these 61 and make the final tally read >1000
+                    // pinned when only 1000 distinct experts really are.
+                    MoEExpertBlock s;
+                    engine.load_expert_slab(flat[i].layer, flat[i].expert, s);
+                    if (!s.slab_buffer || s.slab_capacity == 0) {
+                        if (s.slab_buffer) free(s.slab_buffer);
+                        continue;  // counted as a normal disk-read miss when the main loop retries it
+                    }
+                    ExpertLocation* loc = gpu.topology.upload_expert(
+                        flat[i].layer, flat[i].expert, s.slab_buffer, s.slab_capacity,
+                        gpu.topology.core_gpu);
+                    if (loc) {
+                        gpu.topology.mark_startup_preloaded(flat[i].layer, flat[i].expert);
+                        ++pin_core_gpu_redirected;
+                    } else {
+                        ++pin_core_gpu_redirect_fallback;  // that GPU's own slots are already full
+                    }
+                    free(s.slab_buffer);
+                }
+            }
+
             // Concentration diagnostic: pinning a FIXED top-K per layer only
             // helps future (unseen) prompts to the extent that layer's
             // historical routing is actually concentrated in that top-K --
@@ -1361,8 +2020,9 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     for (auto& e : v) layer_total += e.count;
                     if (layer_total == 0) continue;
                     uint64_t topk_sum = 0;
-                    int k = global_topn ? std::min(layer_pin_count[layer], (int)v.size())
-                                        : std::min(topk, (int)v.size());
+                    int k = (global_topn || prefix_vram)
+                                ? std::min(layer_pin_count[layer], (int)v.size())
+                                : std::min(topk, (int)v.size());
                     for (int i = 0; i < k; ++i) topk_sum += v[i].count;
                     double coverage = (double)topk_sum / (double)layer_total;
                     coverage_sum += coverage;
@@ -1376,8 +2036,9 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 }
                 if (coverage_n > 0) {
                     LOG_STREAM_INFO() << "[PIN] "
-                              << (global_topn ? "global_topn (per-layer K varies, see above)"
-                                              : ("Top-" + std::to_string(topk) + "/layer"))
+                              << (prefix_vram ? "prefix-layer preload"
+                                              : (global_topn ? "global_topn (per-layer K varies, see above)"
+                                                              : ("Top-" + std::to_string(topk) + "/layer")))
                               << " concentration: avg "
                               << (coverage_sum / coverage_n * 100.0) << "% of each layer's historical "
                               << "traffic covered by its pinned set -- most concentrated: layer "
@@ -1400,7 +2061,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             // shared-ownership concern, just a plain local Ring.
             constexpr int PRELOAD_URING_CHUNK = (int)(io_uring_backend::Ring::CAPACITY / 3);  // 21
             io_uring_backend::Ring preload_ring;
-            bool preload_ring_ok = preload_ring.init();
+            // Keep a deterministic escape hatch for diagnosing model-specific
+            // preload failures.  The normal path uses batched reads, while a
+            // disabled batch ring exercises the original one-expert loader
+            // without changing runtime inference behavior.
+            const bool disable_preload_batch =
+                std::getenv("MOESTREAM_DISABLE_PRELOAD_BATCH") != nullptr;
+            bool preload_ring_ok = !disable_preload_batch && preload_ring.init();
             if (preload_ring_ok) {
                 preload_ring.register_iowq_workers(
                     config.expert_fetch_threads > 0 ? (unsigned)config.expert_fetch_threads : 8u);
@@ -1415,11 +2082,16 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
             LOG_STREAM_INFO() << "[PIN] Preloading from " << config.pin_file << " (" << entries.size()
                       << " known experts, max count " << maxc << "): "
-                      << (global_topn ? "global_topn ranking (see above)"
-                                      : ("top-" + std::to_string(topk) + "/layer VRAM-pinned"))
-                      << ", next " << vram_lru_n << "/layer VRAM-unpinned, next "
-                      << ram_n << "/layer RAM...\n";
-            int pinned = 0, vram_lru = 0, ram_preloaded = 0, attempted = 0;
+                      << (prefix_vram ? "prefix-layer ranking (see above)"
+                                      : (global_topn ? "global_topn ranking (see above)"
+                                                     : ("top-" + std::to_string(topk) + "/layer VRAM-pinned")))
+                      << ", next " << (prefix_vram ? 0 : vram_lru_n)
+                      << "/layer VRAM-unpinned, "
+                      << (config.ram_preload_all_experts
+                              ? "all experts within each layer's RAM cap"
+                              : ("next " + std::to_string(ram_n) +
+                                 "/layer RAM"))
+                      << "...\n";
             // Previously, a preload attempt failing anywhere in this loop
             // (disk read producing no usable slab, or upload_expert
             // rejecting it) was completely silent -- a real run lost
@@ -1430,9 +2102,39 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             // n_upload_expert_no_victim/n_upload_expert_memcpy_fail).
             int tier1_disk_fail = 0, tier1_upload_fail = 0;
             int tier2_disk_fail = 0, tier2_upload_fail = 0;
-            int total_pinned = 0;  // Three-tier: track total pinned count
             for (auto& [layer, v] : by_layer) {
+                // Defensive second barrier: all records are sanitized above,
+                // but this loop is the last point before direct indexing into
+                // layers_experts and should remain safe if a future manifest
+                // augmentation adds entries from another source.
+                if (layer < 0 || (size_t)layer >= engine.layers_experts.size() ||
+                    engine.layers_experts[(size_t)layer].empty()) {
+                    LOG_STREAM_ERROR() << "[PIN-BOUNDS] Skipping preload layer " << layer
+                              << " from " << config.pin_file
+                              << " immediately before cache indexing: valid layer vectors are [0,"
+                              << engine.layers_experts.size() << ") and this layer has no expert slots.\n";
+                    continue;
+                }
                 int n = (int)v.size();
+                // A complete prefix layer is intentionally placed in expert
+                // ID order.  Its membership is unchanged (all experts in
+                // the layer are still loaded and pinned), but the physical
+                // VRAM slots then form the regular [expert 0, expert 1, ...]
+                // layout that GGML's 3-D MUL_MAT_ID tensor can view directly.
+                // evict_lru takes empty slots from the back because
+                // pin_expert removes entries with swap-and-pop, so the load
+                // order is descending to make the resulting device pointers
+                // increase with the expert ID.
+                // Partial prefix layers keep the historical frequency order
+                // because they cannot use the direct resident-layer view.
+                const bool complete_prefix_layer =
+                    prefix_vram && layer_pin_count[layer] >= n && n > 0;
+                if (complete_prefix_layer) {
+                    std::stable_sort(v.begin(), v.end(),
+                                     [](const auto &a, const auto &b) {
+                                         return a.expert > b.expert;
+                                     });
+                }
                 // cpu_affinity_layers (config): never pin or pre-warm VRAM
                 // for these layers -- Tier 1/2 below both call
                 // gpu.topology.upload_expert, so forcing layer_max=0 and
@@ -1444,7 +2146,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // 0 (the layer's OWN hottest experts) instead of after a
                 // pinned/vram_lru prefix that never happened for this layer.
                 bool cpu_affinity = is_cpu_affinity_layer(layer);
-                int layer_vram_lru_n = cpu_affinity ? 0 : vram_lru_n;
+                int layer_vram_lru_n =
+                    (cpu_affinity || prefix_vram) ? 0 : vram_lru_n;
                 // Three-tier: enforce global pinned capacity per layer.
                 // global_topn already computed a final per-layer count
                 // (floor + its share of the global ranking) up front; the
@@ -1453,7 +2156,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 int layer_max;
                 if (cpu_affinity) {
                     layer_max = 0;
-                } else if (global_topn) {
+                } else if (global_topn || prefix_vram) {
                     layer_max = layer_pin_count[layer];
                 } else {
                     layer_max = topk;
@@ -1469,7 +2172,9 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 // A cpu_affinity layer's layer_max is already 0, so
                 // tier2_start correctly comes out to 0 too via the
                 // global_topn branch (layer_max) regardless of topk.
-                int tier2_start = (cpu_affinity || global_topn) ? layer_max : topk;
+                int tier2_start =
+                    (cpu_affinity || global_topn || prefix_vram) ? layer_max
+                                                                  : topk;
                 for (int i = 0; i < n && i < layer_max; ) {
                     int chunk_end = std::min(n, std::min(layer_max, i + PRELOAD_URING_CHUNK));
                     int chunk_n = chunk_end - i;
@@ -1493,9 +2198,22 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         ++attempted;
                         MoEExpertBlock& s = scratch[j];
                         if (s.slab_buffer && s.slab_capacity > 0) {
+                            // Plain unrestricted upload -- any expert this
+                            // pass reaches that pin_core_gpu_top_n already
+                            // placed on the CoreEngine GPU (the dedicated
+                            // pre-pass above) is ALREADY cached, so
+                            // upload_expert's own find_expert() check
+                            // returns that same location immediately here;
+                            // no need to re-check pin_to_core_gpu or pass a
+                            // target_gpu_id a second time (that would just
+                            // double-count the redirect diagnostics below
+                            // without changing where anything lands --
+                            // confirmed real on a first attempt at this).
                             ExpertLocation* loc = gpu.topology.upload_expert(
-                                v[i + j].layer, v[i + j].expert, s.slab_buffer, s.slab_capacity);
+                                v[i + j].layer, v[i + j].expert, s.slab_buffer, s.slab_capacity,
+                                -1, true);
                             if (loc && gpu.topology.pin_expert(v[i + j].layer, v[i + j].expert)) {
+                                gpu.topology.mark_startup_preloaded(v[i + j].layer, v[i + j].expert);
                                 ++pinned;
                                 ++total_pinned;  // Three-tier: track global pinned count
                             } else if (!loc) {
@@ -1537,7 +2255,8 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         MoEExpertBlock& s = scratch[j];
                         if (s.slab_buffer && s.slab_capacity > 0) {
                             if (gpu.topology.upload_expert(v[i + j].layer, v[i + j].expert,
-                                                            s.slab_buffer, s.slab_capacity)) {
+                                                            s.slab_buffer, s.slab_capacity, -1, true)) {
+                                gpu.topology.mark_startup_preloaded(v[i + j].layer, v[i + j].expert);
                                 ++vram_lru;
                             } else {
                                 ++tier2_upload_fail;
@@ -1549,14 +2268,50 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     }
                     i = chunk_end;
                 }
-                // Tier 3: next ram_n ranks -> host RAM tier directly.
-                // Bounded to ram_mgr.slots_per_layer (see comment above) and
-                // to this layer's own slot-array size for safety; writes
-                // into slot indices [0, count) -- safe because every slot
-                // starts empty (expert_id=-1) at startup, before any
-                // reactive fill has happened.
-                int ram_cap = std::min({ram_n, ram_mgr.cap_for_layer(layer),
-                                         (int)engine.layers_experts[layer].size()});
+                // Tier 3: the next ranked experts -> host RAM tier directly.
+                // In ram_preload_all_experts mode, use the entire effective
+                // per-layer cap.  The old fixed ram_n fraction silently
+                // limited this path to ~130 experts/layer even when the safe
+                // RAM cache cap was materially larger, which left DDR bytes
+                // unused and caused avoidable SSD misses.  Both modes remain
+                // bounded by the layer's byte-aware cap and the slot-array
+                // size; writes start at slot 0 while the cache is empty.
+                int ram_layer_cap = std::min(ram_mgr.cap_for_layer(layer),
+                                              (int)engine.layers_experts[layer].size());
+                int ram_cap = config.ram_preload_all_experts
+                                  ? ram_layer_cap
+                                  : std::min(ram_n, ram_layer_cap);
+                if (graph_ram_cache && !engine.graph_ram_layer_allocated(layer))
+                    ram_cap = 0;
+                // 2026-08-29 (EngineConfig::ram_pin_eager_preregister):
+                // ram_n itself is a FIXED fraction of slots_per_layer
+                // (pin_ram_fraction), unrelated to how much of
+                // ram_pinned_budget_gb is actually still available -- in
+                // practice this routinely leaves real pin budget unused
+                // (a real run: ~12.6GB of a 45GB budget). Extends ram_cap
+                // further down this layer's OWN real ranking (v, already
+                // sorted by historical count) using the SAME load path
+                // just below, spending whatever budget room remains on
+                // MORE real, historically-plausible experts -- not blind
+                // capacity (see the reverted eager_preregister_remaining_
+                // slots entry above this block for why that distinction
+                // matters: an earlier generic-slot version of this idea
+                // measurably backfired). Reading ram_pinned_bytes_used
+                // fresh per layer means budget spent by earlier layers is
+                // correctly reflected for later ones -- no separate
+                // tracking needed, the atomic already does it.
+                if (config.ram_pin_eager_preregister && config.ram_pinned_budget_gb > 0.0 && ram_cap < ram_layer_cap) {
+                    size_t per_expert_bytes = engine.compute_expert_slab_bytes(layer);
+                    if (per_expert_bytes > 0) {
+                        size_t used = engine.ram_pinned_bytes_used.load(std::memory_order_relaxed);
+                        size_t budget = engine.ram_pinned_budget_bytes;
+                        size_t remaining = (used < budget) ? (budget - used) : 0;
+                        int extra = (int)(remaining / per_expert_bytes);
+                        if (extra > 0) {
+                            ram_cap = std::min(ram_cap + extra, ram_layer_cap);
+                        }
+                    }
+                }
                 int ram_start_i = tier2_start + layer_vram_lru_n;
                 int ram_count = std::min(std::max(0, n - ram_start_i), ram_cap);
                 for (int off = 0; off < ram_count; ) {
@@ -1566,7 +2321,18 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         std::vector<std::tuple<int, int, MoEExpertBlock*>> items;
                         items.reserve(chunk_n);
                         for (int j = 0; j < chunk_n; ++j) {
-                            int i = ram_start_i + off + j, slot_idx = off + j;
+                            int i = ram_start_i + off + j;
+                            // A graph RAM arena has one immutable slice per
+                            // expert ID. The normal preload path writes the
+                            // ranked list densely, which is correct for the
+                            // LRU cache but gives a shared graph arena the
+                            // wrong identity-to-slice mapping. Use the expert
+                            // ID as the slot in graph RAM mode.
+                            int slot_idx =
+                                (graph_ram_cache &&
+                                 engine.graph_ram_layer_allocated(layer))
+                                    ? v[i].expert
+                                    : off + j;
                             items.emplace_back(v[i].layer, v[i].expert,
                                                 &engine.layers_experts[layer][slot_idx]);
                         }
@@ -1577,13 +2343,23 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     } else {
                         ++preload_uring_chunks_fallback;
                         for (int j = 0; j < chunk_n; ++j) {
-                            int i = ram_start_i + off + j, slot_idx = off + j;
+                            int i = ram_start_i + off + j;
+                            int slot_idx =
+                                (graph_ram_cache &&
+                                 engine.graph_ram_layer_allocated(layer))
+                                    ? v[i].expert
+                                    : off + j;
                             engine.load_expert_slab(v[i].layer, v[i].expert,
                                                      engine.layers_experts[layer][slot_idx]);
                         }
                     }
                     for (int j = 0; j < chunk_n; ++j) {
-                        int i = ram_start_i + off + j, slot_idx = off + j;
+                        int i = ram_start_i + off + j;
+                        int slot_idx =
+                            (graph_ram_cache &&
+                             engine.graph_ram_layer_allocated(layer))
+                                ? v[i].expert
+                                : off + j;
                         ++attempted;
                         MoEExpertBlock& slot = engine.layers_experts[layer][slot_idx];
                         if (slot.slab_buffer && slot.slab_capacity > 0) {
@@ -1603,7 +2379,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         // lookup would look like a genuine index miss
                         // (indistinguishable from "really not resident"),
                         // see that function's own comment.
-                        ram_mgr.preload_ram_slot(engine, v[i].layer, v[i].expert, (size_t)slot_idx);
+                        uint32_t ram_seed_hit_count = 0;
+                        if (config.ram_preload_seed_hit_count) {
+                            // Clamp below promote_hit_threshold so this only
+                            // biases RAM-tier retention, never fires a
+                            // reactive VRAM promotion before the slot has
+                            // actually been touched this session -- see
+                            // ram_preload_seed_hit_count's own comment.
+                            uint32_t cap = ram_mgr.promote_hit_threshold > 0
+                                               ? ram_mgr.promote_hit_threshold - 1
+                                               : 0;
+                            ram_seed_hit_count = (uint32_t)std::min<uint64_t>(v[i].count, cap);
+                        }
+                        ram_mgr.preload_ram_slot(engine, v[i].layer, v[i].expert,
+                                                  (size_t)slot_idx, ram_seed_hit_count);
                         }
                     }
                     off += chunk_n;
@@ -1617,6 +2406,13 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             LOG_STREAM_INFO() << "[PIN] Preloaded " << pinned << " VRAM-pinned + " << vram_lru
                       << " VRAM-unpinned + " << ram_preloaded << " RAM (of " << attempted
                       << " attempted).\n";
+            if (pin_core_gpu_redirected || pin_core_gpu_redirect_fallback) {
+                LOG_STREAM_INFO() << "[PIN] pin_core_gpu_top_n: " << pin_core_gpu_redirected
+                          << " expert(s) landed on the CoreEngine GPU (gpu=" << gpu.topology.core_gpu
+                          << ") as intended, " << pin_core_gpu_redirect_fallback
+                          << " fell back to the default placement (that GPU's own slots were full "
+                             "by the time they were reached)\n";
+            }
             if (tier1_disk_fail || tier1_upload_fail || tier2_disk_fail || tier2_upload_fail) {
                 LOG_STREAM_WARN() << "[PIN] Preload attrition -- Tier1(pinned): " << tier1_disk_fail
                           << " disk-read failures, " << tier1_upload_fail << " GPU-upload rejections | "
@@ -1634,7 +2430,45 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                           << ")\n";
             }
         }
+        ram_mgr.vram_cache->startup_preload_phase = false;
+
+        if (graph_ram_cache) {
+            int allocated = 0;
+            int ready = 0;
+            const int n_graph_layers =
+                engine.model_file.architecture_config.n_layers;
+            for (int layer = 0; layer < n_graph_layers; ++layer) {
+                if (engine.graph_ram_layer_allocated(layer)) {
+                    ++allocated;
+                    if (engine.graph_ram_layer_ready(layer)) ++ready;
+                }
+            }
+            LOG_STREAM_INFO() << "[GRAPH-RAM] post-preload: " << ready << "/"
+                              << allocated
+                              << " arena layer(s) have the required expert-ID"
+                                 " mapping and host tensor views\n";
+        }
     }
+
+    // 2026-08-29: EngineConfig::ram_pin_eager_preregister's FIRST
+    // implementation lived here -- RAMSafetyManager::eager_preregister_
+    // remaining_slots, which eagerly grew+registered GENERIC (identity-
+    // agnostic) empty slots for whatever ram_pinned_budget_gb the
+    // ranking-informed [PIN] preload above left unused. Real A/B: it made
+    // things WORSE, not better (active_up 0.76-0.81s -> 1.18-1.20s,
+    // Active-layer source-pin coverage 62.7% -> 47.7%, "stayed pageable"
+    // 808 -> 1232 slabs). Root cause: it's still greedy pre-allocation
+    // against the SAME finite, shared budget the ranking-informed preload
+    // and live demand-driven registration were already using efficiently
+    // -- but UNINFORMED (no signal about which specific expert would ever
+    // land in a given slot), so it displaced better-targeted allocations
+    // with worse ones for the same fixed spend. Function kept in
+    // ram_manager.hpp (unused, default off) per this project's own
+    // convention for a correctly-diagnosed negative result -- see its own
+    // comment and CLAUDE.md for the full A/B. Superseded by the extended,
+    // ranking-informed Tier 3 preload below (same config flag, same
+    // budget, but spends it on MORE real, historically-ranked experts
+    // instead of blind slots).
 
     // Spun up here, AFTER the [PIN] block above has fully finished writing
     // into engine.layers_experts (Tier-3 RAM preload) and gpu.topology
@@ -1655,6 +2489,23 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // first).
     prefetcher.ram_mgr = &ram_mgr;
 
+    // 2026-08-28: active-layer upload worker pool -- see EngineConfig::
+    // active_layer_upload_worker_threads' own comment and active_layer_
+    // upload_workers.hpp's header comment for the full design. Constructed
+    // here (after gpu.topology's streams/pool exist, same ordering
+    // constraint the prefetcher's own start() call above already respects)
+    // rather than at the ram_mgr/prefetcher declaration site above, since
+    // the pool's ctor immediately spawns worker threads that will touch
+    // gpu.topology.devices[...] the moment real work arrives.
+    if (config.active_layer_upload_worker_threads > 0) {
+        upload_worker_pool = std::make_unique<ActiveLayerUploadWorkers>(
+            gpu.topology, ram_mgr, config.active_layer_upload_worker_threads);
+        ram_mgr.upload_workers = upload_worker_pool.get();
+        LOG_STREAM_INFO() << "[GPU] Active-layer upload worker pool: "
+                           << config.active_layer_upload_worker_threads
+                           << " thread(s) started.\n";
+    }
+
     // Dequant attn_k_b/attn_v_b (MLA's absorbed-attention weights) for
     // every layer NOW, once, model load fully done but before any prompt
     // is timed -- see warm_mla_absorb_cache's own comment
@@ -1668,6 +2519,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // with kv_lora<=0).
     extern void warm_mla_absorb_cache(StreamingEngine& engine);
     warm_mla_absorb_cache(engine);
+
+    // The full GLM-5.3-Flash graph needs a host-side source view of the
+    // routed experts, but that source is independent of prompt length.  Load
+    // it now, before accepting the first prompt, so a later prompt with a
+    // different token count only rebuilds its small GGML topology and never
+    // rereads the ~78 GiB expert set from SSD.  The source admission is
+    // bounded by host_ram_gb and the memory watchdog; failure leaves the
+    // established layer path available.
+    if (graph_mode && engine.family_ops.family == ModelFamily::GLM5NEXT &&
+        !glm5next_full_graph_bootstrap(engine)) {
+        LOG_STREAM_WARN()
+            << "[GGML-GLM5NEXT-FULL] boot source preload unavailable; "
+               "the graph will attempt bounded lazy preparation on the first prompt.\n";
+    }
 
     std::cout << "----------------------------------------\n";
     std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
@@ -1687,6 +2552,36 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
 
         std::cout << "\n  User > ";
         std::getline(std::cin, user_input);
+
+        // Multi-line input support (2026-09): this loop reads exactly one
+        // getline() per turn, so a genuinely multi-line message piped via
+        // stdin (e.g. "review this code:\n```python\ndef f():\n...") was
+        // silently split into N SEPARATE turns, one per embedded newline —
+        // found via a real survey harness where a code-review prompt with
+        // an embedded function produced 6 fragmented, wrong generations
+        // instead of one coherent one. Rather than degrade callers to
+        // single-line-only content, accept a literal two-character "\n"
+        // escape sequence (backslash + 'n') as a caller-side convention for
+        // "real newline here" and unescape it right after reading, before
+        // any tokenization -- a caller that wants a true multi-line message
+        // in one turn sends its text with real newlines replaced by this
+        // literal sequence. Interactive human typing is unaffected (nobody
+        // types a literal backslash-n expecting it to stay literal in a
+        // prompt to an LLM in practice, and if they did, the model still
+        // sees intelligible text either way).
+        {
+            std::string unescaped;
+            unescaped.reserve(user_input.size());
+            for (size_t i = 0; i < user_input.size(); ++i) {
+                if (user_input[i] == '\\' && i + 1 < user_input.size() && user_input[i + 1] == 'n') {
+                    unescaped.push_back('\n');
+                    ++i;
+                } else {
+                    unescaped.push_back(user_input[i]);
+                }
+            }
+            user_input = std::move(unescaped);
+        }
 
         // Ctrl-C (SIGINT) sets the flag and, on most platforms, interrupts
         // the blocking getline with a failed/EOF stream state. Treat any of
@@ -1708,7 +2603,50 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         // very likely the real explanation for "the same output regardless
         // of prompt": the input to the model WAS identical every time.
         std::vector<int> prompt_tokens;
-        if (!config.raw_prompt && tokenizer.has_chat_template()) {
+        if (!config.raw_prompt && engine.family_ops.family == ModelFamily::GLM5NEXT &&
+            tokenizer.has_chat_template()) {
+            // GLM-5.3-Flash's real template is distinct from the older GLM
+            // template even though both use [gMASK], <sop>, <|user|>, and
+            // <|assistant|>. It has no newline after role tags. Thinking is
+            // enabled by an open <think> block; direct-answer mode is the
+            // explicit empty <think></think> block used by the GLM template.
+            if (tokenizer.gmask_id >= 0) prompt_tokens.push_back(tokenizer.gmask_id);
+            if (tokenizer.sop_id >= 0) prompt_tokens.push_back(tokenizer.sop_id);
+
+            if (config.enable_thinking) {
+                std::string effort = config.reasoning_effort;
+                std::string effort_cap;
+                if (effort == "low") effort_cap = "Low";
+                else if (effort == "high") effort_cap = "High";
+                else effort_cap = "Max";
+                std::vector<int> reff = tokenizer.encode(
+                    "<|system|>Reasoning Effort: " + effort_cap);
+                prompt_tokens.insert(prompt_tokens.end(), reff.begin(), reff.end());
+            }
+
+            if (!config.system_prompt.empty()) {
+                std::vector<int> sys = tokenizer.encode(
+                    "<|system|>" + config.system_prompt);
+                prompt_tokens.insert(prompt_tokens.end(), sys.begin(), sys.end());
+            }
+            prompt_tokens.push_back(tokenizer.user_id);
+            std::vector<int> body = tokenizer.encode(user_input);
+            prompt_tokens.insert(prompt_tokens.end(), body.begin(), body.end());
+            prompt_tokens.push_back(tokenizer.assistant_id);
+            if (config.enable_thinking) {
+                if (tokenizer.ds_think_start_id >= 0)
+                    prompt_tokens.push_back(tokenizer.ds_think_start_id);
+            } else {
+                // GLM's direct-answer switch is not "no think token". The
+                // model expects the assistant turn to contain an explicitly
+                // empty reasoning block: <think></think>.
+                if (tokenizer.ds_think_start_id >= 0 &&
+                    tokenizer.ds_think_end_id >= 0) {
+                    prompt_tokens.push_back(tokenizer.ds_think_start_id);
+                    prompt_tokens.push_back(tokenizer.ds_think_end_id);
+                }
+            }
+        } else if (!config.raw_prompt && tokenizer.has_chat_template()) {
             // GLM-3/4-style: [gMASK]<sop><|user|>\n{msg}<|assistant|>\n
             // (see GGUFTokenizer::detect_chat_special_tokens for the
             // reference source and the caveat that GLM-5.2 specifically
@@ -1754,6 +2692,50 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             prompt_tokens.push_back(tokenizer.ds_assistant_id);
             if (tokenizer.ds_think_end_id >= 0)
                 prompt_tokens.push_back(tokenizer.ds_think_end_id);
+        } else if (!config.raw_prompt && tokenizer.has_chatml_template()) {
+            // ChatML (Qwen3.8-Flash-Next / qwen4exp), per the
+            // model's tokenizer_config.json chat_template:
+            //   <|im_start|>system\n{reasoning_instructions}[\n\n{system}]<|im_end|>\n
+            //   <|im_start|>user\n{msg}<|im_end|>\n
+            //   <|im_start|>assistant\n<think>\n
+            // enable_thinking defaults to true for reference compatibility;
+            // false omits the default reasoning system instruction.
+            const char* kQwen4ExpReasoningXHigh =
+                "Reasoning effort is set to xhigh. Please think carefully through "
+                "the task, validate key assumptions, consider plausible "
+                "alternatives, and prioritize correctness, consistency, and "
+                "clarity in the final answer.";
+            auto push_text = [&](const std::string& text) {
+                std::vector<int> ids = tokenizer.encode(text);
+                prompt_tokens.insert(prompt_tokens.end(), ids.begin(), ids.end());
+            };
+            if (config.enable_thinking || !config.system_prompt.empty()) {
+                prompt_tokens.push_back(tokenizer.im_start_id);
+                if (config.enable_thinking) {
+                    push_text(std::string("system\n") + kQwen4ExpReasoningXHigh +
+                              (config.system_prompt.empty()
+                                   ? ""
+                                   : "\n\n" + config.system_prompt));
+                } else {
+                    push_text("system\n" + config.system_prompt);
+                }
+                prompt_tokens.push_back(tokenizer.im_end_id);
+                push_text("\n");
+            }
+            prompt_tokens.push_back(tokenizer.im_start_id);
+            push_text("user\n" + user_input);
+            prompt_tokens.push_back(tokenizer.im_end_id);
+            push_text("\n");
+            prompt_tokens.push_back(tokenizer.im_start_id);
+            // generation prompt with thinking ON (template default): the
+            // model opens its own <think> block. <think> is pushed as its
+            // special-token ID, not BPE-encoded text (encode() doesn't
+            // special-case control tokens).
+            push_text("assistant\n");
+            if (config.enable_thinking && tokenizer.ds_think_start_id >= 0)
+                prompt_tokens.push_back(tokenizer.ds_think_start_id);
+            if (config.enable_thinking)
+                push_text("\n");
         } else {
             // Respect tokenizer.ggml.add_bos_token -- see
             // GGUFTokenizer::add_bos_token for why unconditionally pushing
@@ -1765,6 +2747,57 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             prompt_tokens.insert(prompt_tokens.end(), encoded.begin(), encoded.end());
         }
 
+        // Diagnostic/fairness hook: BeeLLama's llama-bench can consume an
+        // exact token-ID file. Allow its token IDs to be replayed here so the
+        // two engines execute the same prompt, independent of small tokenizer
+        // wrapper differences. The normal text prompt path is unchanged when
+        // this variable is absent.
+        if (const char *token_input =
+                std::getenv("MOESTREAM_PROMPT_TOKEN_INPUT_FILE")) {
+            std::ifstream input(token_input);
+            std::vector<int> exact_tokens;
+            long long value = 0;
+            while (input >> value) {
+                if (value < INT_MIN || value > INT_MAX) {
+                    exact_tokens.clear();
+                    break;
+                }
+                exact_tokens.push_back((int)value);
+            }
+            if (!input.eof() || exact_tokens.empty()) {
+                LOG_STREAM_ERROR() << "[MOE-PROMPT] failed to read token input file: "
+                                   << token_input << "\n";
+            } else {
+                prompt_tokens = std::move(exact_tokens);
+                LOG_STREAM_INFO() << "[MOE-PROMPT] loaded " << prompt_tokens.size()
+                                  << " exact token IDs from " << token_input << "\n";
+            }
+        }
+        if (std::getenv("MOESTREAM_MOE_SET_TRACE") != nullptr) {
+            uint64_t hash = 1469598103934665603ULL;
+            for (int token : prompt_tokens) {
+                uint32_t value = (uint32_t) token;
+                for (int i = 0; i < 4; ++i) {
+                    hash ^= (value >> (i * 8)) & 0xffU;
+                    hash *= 1099511628211ULL;
+                }
+            }
+            LOG_STREAM_INFO() << "[MOE-PROMPT] tokens=" << prompt_tokens.size()
+                              << " fnv64=0x" << std::hex << hash << std::dec << "\n";
+        }
+        if (const char * token_path = std::getenv("MOESTREAM_PROMPT_TOKEN_FILE")) {
+            std::ofstream output(token_path);
+            if (!output) {
+                LOG_STREAM_ERROR() << "[MOE-PROMPT] failed to open token file for writing: "
+                                   << token_path << "\n";
+            } else {
+                for (int token : prompt_tokens)
+                    output << token << "\n";
+                LOG_STREAM_INFO() << "[MOE-PROMPT] wrote " << prompt_tokens.size()
+                                  << " token IDs to " << token_path << "\n";
+            }
+        }
+
         std::cout << "\n  MoEStream * ";
         generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens, max_new_tokens, tokenizer.eos_token_id,
                       config.temperature, config.top_p);
@@ -1773,6 +2806,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     }
 
     prefetcher.stop();
+    // The full Qwen graph owns a GGML scheduler and CUDA workspace buffers.
+    // Release them while CudaManager is still alive; otherwise the static
+    // graph destructor runs after CUDA driver teardown and cudaFree aborts.
+    qwen4exp_full_graph_shutdown();
+    glm5next_full_graph_shutdown();
+    deepseek_v4_full_graph_shutdown();
     // Phase A write this run's routing-frequency histogram so
     // the NEXT run's startup preload (above) has real data to work from.
     // Best-effort, matches dump_usage's own contract (a failed write just
@@ -1807,6 +2846,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     ram_mgr.report_tier_map(engine);
     prefetcher.log_per_layer_report();  // [PREFETCH-LAYER]: per-layer prefetch hint/fetch/outcome breakdown
     report_named_timers();  // attn_q_a/attn_q_b/attn_kv_a_mqa fast-path investigation, see CLAUDE.md
+    report_layer_miss_stats();  // [LAYER-MISS]: per-layer decode-time real disk-fetch misses -- see CLAUDE.md CPU-offload data-gathering entry
+    report_pilot_recall_by_layer();  // [PILOT-BY-LAYER]: per-layer DEPTH-1/ATTN-PILOT/DEPTH-2 prediction accuracy -- see CLAUDE.md per-layer prediction accuracy entry
+    report_moe_bucket_stats();  // [MOE-BUCKET]: real token-sharing rate for MoE expert dispatch -- the llama.cpp -ub/mul_mat_id batching investigation
+    report_prefill_lookahead_stats();  // [PREFILL-LOOKAHEAD]: prefill_dispatch_lookahead_tokens real added/skipped counts
+    report_pilot_wide_stats();
+    report_prefill_window_stats();  // [PREFILL-WINDOW]: prefill sliding-window capacity (P1+P2)  // [PILOT-WIDE]: pilot_widen_all_tokens real recall/coverage measurement
 
     double session_elapsed_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - session_start).count();
@@ -1848,12 +2893,21 @@ int main(int argc, char* argv[]) {
     bool verbose_moe = false;
     bool raw_prompt_cli = false;
     std::string system_prompt_cli;
+    std::string reasoning_effort_cli;
     std::string log_path_cli;
     std::string log_level_cli;
     std::string trace_filter_cli;
     bool trace_abort_on_nan_cli = false;
     bool freeze_usage_stats_cli = false;
     float temp_cli = -1.0f, top_p_cli = -1.0f;  // -1 sentinel = "not given" (0.0 is a valid greedy-decode value)
+    // 2026-09: real incident -- a second moestream instance (a separate
+    // one-off smoke test) was started while this box already had another
+    // moestream benchmark running; the two together drove the box into
+    // swap thrashing hard enough to force a reboot. See
+    // startup_preflight.hpp's own header comment. --force-start bypasses
+    // the resulting startup checks for a deliberate, known-safe case
+    // (e.g. two instances on disjoint GPU sets).
+    bool force_start_cli = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1872,6 +2926,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--verbose-moe") verbose_moe = true;
         else if (arg == "--raw-prompt") raw_prompt_cli = true;
         else if (arg == "--system-prompt" && i + 1 < argc) system_prompt_cli = argv[++i];
+        else if (arg == "--reasoning-effort" && i + 1 < argc) reasoning_effort_cli = argv[++i];
         else if (arg == "--promote-threshold" && i + 1 < argc) promote_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-threshold" && i + 1 < argc) pin_threshold_cli = std::stoi(argv[++i]);
         else if (arg == "--pin-file" && i + 1 < argc) pin_file_cli = argv[++i];
@@ -1884,6 +2939,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--freeze-usage-stats") freeze_usage_stats_cli = true;
         else if (arg == "--temp" && i + 1 < argc) temp_cli = std::stof(argv[++i]);
         else if (arg == "--top_p" && i + 1 < argc) top_p_cli = std::stof(argv[++i]);
+        else if (arg == "--force-start") force_start_cli = true;
         else if (arg == "--help" || arg == "-h") {
             print_usage();
             return 0;
@@ -1928,6 +2984,7 @@ int main(int argc, char* argv[]) {
     if (verbose_moe) config.verbose_moe_log = true;
     if (raw_prompt_cli) config.raw_prompt = true;
     if (!system_prompt_cli.empty()) config.system_prompt = system_prompt_cli;
+    if (!reasoning_effort_cli.empty()) config.reasoning_effort = reasoning_effort_cli;
     if (drop_pages) config.drop_pages = true;
     if (direct_io_cli) config.direct_io = true;
     if (io_uring_cli) config.io_uring = true;
@@ -1958,11 +3015,81 @@ int main(int argc, char* argv[]) {
     std::cout << "----------------------------------------\n";
     config.print();
 
+    // Real, cheap startup safety checks -- BEFORE any RAM-tier allocation,
+    // [PIN] preload, or GPU VRAM pool allocation begins. See
+    // startup_preflight.hpp's own header comment for the real incident
+    // this exists to prevent (two moestream instances driving this box
+    // into swap thrashing / a hard crash). Fail-closed: refuses to start
+    // rather than silently proceeding into a repeat of that incident.
+    {
+        std::vector<int> gpu_ids;
+        for (auto &g : config.gpus) gpu_ids.push_back(g.device_id);
+        if (!preflight::run(config.host_ram_gb, gpu_ids, force_start_cli)) {
+            LOG_STREAM_ERROR() << "  Startup pre-flight check(s) failed -- see [PREFLIGHT] "
+                                   "lines above. Refusing to start (pass --force-start to "
+                                   "override once you're certain it's safe).\n";
+            return 1;
+        }
+    }
+
     // cpu_only (TOML `cpu_only = true` or MOESTREAM_CPU_ONLY env var) forces all
     // compute onto the CPU reference path. Enable it BEFORE run_engine so every
     // dense_proj / rmsnorm_proj / expert_ffn dispatch sees the flag.
     if (config.cpu_only) enable_cpu_only_mode();
     if (config.dsv4_outproj_gpu) enable_dsv4_outproj_gpu();
+    if (config.dsv4_score_gpu) enable_dsv4_score_gpu();
+    if (config.cpu_dot_ggml_avx2) enable_cpu_dot_ggml_avx2();
+    set_moe_prefill_batched(config.moe_prefill_batched);
+    set_moe_prefill_stream(config.moe_prefill_stream);
+    set_moe_prefill_stream_chunk(config.moe_prefill_stream_chunk);
+    set_moe_expert_bf16_gemm(config.moe_expert_bf16_gemm);
+    set_moe_ggml_mul_mat_id(config.moe_ggml_mul_mat_id);
+    set_moe_ggml_shared_expert(config.moe_ggml_shared_expert);
+    set_moe_ggml_gpu_router(config.moe_ggml_gpu_router);
+    set_moe_ggml_device(config.moe_ggml_device);
+    set_ggml_hc_async_graph_reuse(config.ggml_async_graph_reuse);
+    set_ggml_moe_async_graph_reuse(config.ggml_async_graph_reuse);
+    LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML shared expert: "
+                      << (config.moe_ggml_shared_expert ? "ON" : "off")
+                      << " (device routed+shared FFN)\n";
+    set_hc_ggml(config.hc_ggml);
+    set_gdn_proj_ggml(config.gdn_proj_ggml);
+    set_gdn_full_ggml(config.gdn_full_ggml);
+    LOG_STREAM_INFO() << "[CONFIG] Full Qwen4Exp GDN GGML graph: "
+                      << (config.gdn_full_ggml ? "ON" : "off")
+                      << " (projection+conv+delta+norm+ssm_out)\n";
+    set_moe_gpu_accum(config.moe_gpu_accum);
+    set_dense_bf16_kquant(config.dense_bf16_kquant);
+    set_expert_gpu_activation(config.expert_gpu_activation);
+    LOG_STREAM_INFO() << "[CONFIG] Expert SwiGLU on GPU: "
+                      << (config.expert_gpu_activation ? "ON" : "off")
+                      << " (device silu/mul/clamp, no gate/up host round trip)\n";
+    set_vram_min_free_mb(config.vram_min_free_mb);
+    LOG_STREAM_INFO() << "[CONFIG] VRAM headroom: dynamic allocations keep at least "
+                      << config.vram_min_free_mb << " MB free per GPU\n";
+    set_dense_bf16_prefill_gemm(config.dense_bf16_prefill_gemm);
+    LOG_STREAM_INFO() << "[CONFIG] Dense prefill GEMM via dequant->BF16 + cuBLAS: "
+                      << (config.dense_bf16_prefill_gemm ? "ON" : "off")
+                      << " (Q8_0 weights, S>1 only)\n";
+    LOG_STREAM_INFO() << "[CONFIG] MoE GPU-side expert accumulation: "
+                      << (config.moe_gpu_accum ? "ON" : "off")
+                      << " (device scatter-add + one [S,D] download per layer)\n";
+    LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML device router: "
+                      << (config.moe_ggml_gpu_router ? "ON" : "off")
+                      << " (GPU top-k; returns IDs/weights only)\n";
+    LOG_STREAM_INFO() << "[CONFIG] GGML async graph workspace reuse: "
+                      << (config.ggml_async_graph_reuse ? "ON" : "off")
+                      << " (shared backend stream ordering)\n";
+    LOG_STREAM_INFO() << "[CONFIG] MoE prefill token-batching (group tokens by expert): "
+                      << (config.moe_prefill_batched ? "ON" : "off")
+                      << " -- shared path, see dense_dispatch.hpp's blast-radius note\n";
+    LOG_STREAM_INFO() << "[CONFIG] GLM5NEXT grouped GPU prefill: "
+                      << (config.glm5next_moe_prefill_gpu ? "ON" : "off")
+                      << " (GLM5NEXT only; host-validated routing, grouped GPU FFN)\n";
+    LOG_STREAM_INFO() << "[CONFIG] GLM5NEXT KDA dense projection fusion: "
+                      << (config.glm5next_dense_prefill_fusion ? "ON" : "off")
+                      << " (S>1 best-effort GGML CUDA graph, legacy fallback)\n";
+
 
     auto outcome = run_engine(config);
     if (!outcome) {

@@ -2,6 +2,7 @@
 #include "cpu_model_backend.hpp"
 #include "cpu_dense.hpp"
 #include "cpu_qwen_moe.hpp"
+#include "cpu_qwen4exp.hpp"
 
 #include <iostream>
 
@@ -30,6 +31,33 @@ CPUModelBackend::create(const GGUFFile &model_file) {
     std::cerr << "[CPU-MODEL] MLA backend (GLM-DSA/DeepSeek-V3) not yet "
                  "implemented for moestream_cpu.\n";
     return nullptr;
+
+  case ModelFamily::GLM5NEXT:
+    std::cerr << "[CPU-MODEL] GLM 5.3 Flash (glm5next, hybrid KDA+DSA) not yet "
+                 "implemented for moestream_cpu -- use the main moestream "
+                 "engine path.\n";
+    return nullptr;
+
+  case ModelFamily::Qwen4Exp:
+    {
+      auto backend = std::make_unique<CPUQwen4ExpBackend>();
+      backend->traits.inspect_tensors(model_file);
+      backend->layer_types.assign(
+          static_cast<size_t>(model_file.architecture_config.n_layers),
+          CPULayerType::DenseQKV);
+      for (int l = 0; l < model_file.architecture_config.n_layers; ++l)
+        if (qwen4exp_is_gdn_layer(model_file.architecture_config, l))
+          backend->layer_types[static_cast<size_t>(l)] =
+              CPULayerType::LinearAttention;
+      if (!backend->compatible(model_file)) {
+        std::cerr << "[CPU-MODEL] Qwen3.8-Flash-Next metadata is incomplete "
+                    "for the CPU backend.\n";
+        return nullptr;
+      }
+      std::cerr << "[CPU-MODEL] Detected: Qwen3.8-Flash-Next (qwen4exp, "
+                  "hybrid GDN+full-attention)\n";
+      return backend;
+    }
 
   case ModelFamily::Hunyuan:
   case ModelFamily::GLM4_MOE:

@@ -1,0 +1,1 @@
+Write an HTML page using <details>/<summary> for a collapsible FAQ section.

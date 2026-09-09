@@ -1,0 +1,1 @@
+Write a SQL query using a window function to rank employees by salary within each department.

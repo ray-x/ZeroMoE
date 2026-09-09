@@ -1,0 +1,1 @@
+Write a C++ RAII wrapper class for a raw file handle.

@@ -1539,7 +1539,27 @@ void matmul_iq2_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
     const float *xs = x + (int64_t)s * I;
     float *ys = y + (int64_t)s * O;
 
-// Parallelize over output rows O using OpenMP
+    // 2026-08-29: TRIED an S==1 (decode) serial-dispatch gate here, matching
+    // the S>1-gating pattern this project used successfully elsewhere
+    // (q_nope_gather_all, this same session's attention_layer.cpp WUV
+    // fixes) -- REVERTED, a real, measured regression, not a win. Unlike
+    // those earlier fixes (an already-parallel OUTER loop meant the inner
+    // OMP was purely redundant -- a genuinely free removal), this call has
+    // no outer parallelism to fall back on: GLM-5.2's real expert dims are
+    // gate/up I=6144,O=2048 and down I=2048,O=6144 (confirmed by reading
+    // the live GGUF's own tensor shapes, not assumed) -- large enough that
+    // going single-threaded over O rows is a real, substantial loss of
+    // parallelism, not just avoided team-spawn overhead. Real hardware
+    // confirmed this: per-CPU-dispatched-expert cost went from ~2.7ms
+    // (parallel, baseline) to ~7.5ms (serial, after the gate) -- consistent
+    // with the ~10x serial-vs-10-thread-parallel slowdown these dims would
+    // predict. The real perf-profiling finding that motivated trying this
+    // (this call site is one of the few resolvable callers into libgomp's
+    // barrier-wait hotspot, CLAUDE.md's 2026-08-29 entry) is still real --
+    // but per that same entry's own point 4 (OMP_WAIT_POLICY=PASSIVE making
+    // things WORSE), the background spin time isn't actually costing
+    // wall-clock time, so there was no real problem here to fix in the
+    // first place. Left as the original, always-parallel form.
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; ++o) {
       const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
@@ -1555,6 +1575,349 @@ void matmul_iq2_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
     }
   }
 }
+
+// ============================================================
+// EXPERIMENTAL VNNI prototype for IQ2_XXS -- feasibility check only, NOT
+// wired into any production dispatch path. Exists to answer "would a VNNI
+// int8 dot beat the existing dot_iq2_xxs_f32_avx512 FMA path above" before
+// committing to a real production kernel (see CLAUDE.md's "CPU expert
+// dispatch is unexpectedly slow" / cpu_offload_max_experts investigation).
+//
+// Reuses the EXACT SAME grid/sign bit-unpacking as dot_iq2_xxs_f32_avx512
+// above (same grid_tbl/ksigns/kmask_vec16 lookups, byte-for-byte -- only
+// the final combine step differs) specifically so this prototype inherits
+// that function's already-proven-correct byte interpretation instead of
+// re-deriving it and risking a NEW parsing bug. Sign is applied to the
+// ALREADY-int8-quantized ACTIVATION lane instead of the weight
+// (mathematically equivalent: sign*mag*x == mag*(sign*x)) -- the grid
+// magnitude byte is fed directly, unsigned, to a VNNI uint8xint8 dot with
+// no +128 debias needed (unlike a Q8_0-style signed-weight VNNI dot),
+// since the grid magnitude byte is already non-negative by construction,
+// exactly as dot_iq2_xxs_f32_avx512's own _mm512_cvtepu8_epi32 already
+// treats it.
+static inline void dequant_pack16_u8s8(uint64_t grid64_lo, uint64_t grid64_hi,
+                                       uint8_t signs_lo, uint8_t signs_hi,
+                                       __m512i kmask_vec16,
+                                       const int8_t *xq_ptr,
+                                       uint8_t *mag_out, int8_t *xsigned_out) {
+  // Raw grid bytes ARE the unsigned magnitude (0-255) -- identical read to
+  // dequant_and_fmadd_16's own `g`/`gi32` above.
+  __m128i g = _mm_set_epi64x((int64_t)grid64_hi, (int64_t)grid64_lo);
+  _mm_storeu_si128((__m128i *)mag_out, g);
+
+  // Identical sign-bit derivation to dequant_and_fmadd_16 above (same
+  // signs_bcast/andres/bit_set_mask construction) -- only the consumer of
+  // bit_set_mask differs (blend an int8 activation lane instead of XOR'ing
+  // a float sign bit).
+  __m256i signs_lo_bcast = _mm256_set1_epi32((int32_t)signs_lo);
+  __m256i signs_hi_bcast = _mm256_set1_epi32((int32_t)signs_hi);
+  __m512i signs_bcast = _mm512_inserti32x8(
+      _mm512_castsi256_si512(signs_lo_bcast), signs_hi_bcast, 1);
+  __m512i andres = _mm512_and_si512(signs_bcast, kmask_vec16);
+  __mmask16 bit_set_mask = _mm512_cmpneq_epi32_mask(andres, _mm512_setzero_si512());
+
+  __m128i xq = _mm_loadu_si128((const __m128i *)xq_ptr);
+  __m128i xq_neg = _mm_sub_epi8(_mm_setzero_si128(), xq);
+  __m128i xsigned = _mm_mask_blend_epi8(bit_set_mask, xq, xq_neg);
+  _mm_storeu_si128((__m128i *)xsigned_out, xsigned);
+}
+
+// Combined 64-lane VNNI dot: processes TWO 32-element groups (each with its
+// own db scale) in ONE _mm512_dpbusd_epi32 call, splitting the resulting
+// 16x int32 accumulator into two 8-lane halves (lanes 0-7 <- bytes 0-31,
+// lanes 8-15 <- bytes 32-63) so each group's own dot product can still be
+// scaled independently by its caller.
+//
+// REAL BUG this replaces, caught by this bench's own honest numbers before
+// any conclusion was drawn (not assumed): an earlier version called a
+// 32-lane-only `dot_u8s8_direct_avx512(w, x, 32)` per group -- but its VNNI
+// branch was gated `for (; i+64<=I; i+=64)`, and 32 < 64 means that loop
+// condition is false on the FIRST check, so the VNNI branch never executed
+// even once; every call silently fell through to the scalar tail loop (32
+// plain int32 multiply-adds). The first bench run this produced (VNNI
+// 1.18us/call vs FMA 0.34us/call, i.e. VNNI looking ~3.5x SLOWER) was
+// therefore comparing scalar-vs-SIMD, not VNNI-vs-FMA -- a real, if
+// unintentional, instance of this project's own documented "the two
+// benchmark sides must go through the same dispatch path" lesson (see
+// CLAUDE.md's iq2_matmul.cu shfl-reduction entry). Fixed by actually
+// filling the full 64-lane register with two real 32-element groups.
+static void dot_u8s8_direct_avx512_x2(const uint8_t *w64, const int8_t *x64,
+                                      int32_t &sum_lo, int32_t &sum_hi) {
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__) && defined(__AVX512VL__)
+  __m512i wv = _mm512_loadu_si512((const void *)w64);
+  __m512i xv = _mm512_loadu_si512((const void *)x64);
+  __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv);
+  __m256i acc_lo = _mm512_extracti64x4_epi64(acc, 0);
+  __m256i acc_hi = _mm512_extracti64x4_epi64(acc, 1);
+  sum_lo = _mm256_reduce_add_epi32(acc_lo);
+  sum_hi = _mm256_reduce_add_epi32(acc_hi);
+#else
+  sum_lo = 0;
+  for (int i = 0; i < 32; ++i) sum_lo += (int32_t)w64[i] * (int32_t)x64[i];
+  sum_hi = 0;
+  for (int i = 32; i < 64; ++i) sum_hi += (int32_t)w64[i] * (int32_t)x64[i];
+#endif
+}
+
+// Full IQ2_XXS row dot via the VNNI prototype above. `xq` must be
+// pre-quantized (e.g. via quantize_activations_q8_0) over the SAME k
+// elements, 32-wide blocks -- num_blocks = k/32 entries, xq[block_idx]
+// aligns 1:1 with this function's own ib32 sub-block index.
+float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq, int64_t k) {
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 66;
+  const int64_t nb = k / QK_K;
+
+  const uint64_t *grid_tbl = (const uint64_t *)ms_grid_iq2xxs();
+  const uint8_t *ksigns = (const uint8_t *)ms_grid_ksigns_iq2xs();
+  __m512i kmask_vec16 = kmask_iq2xs_vec32_16_fused();
+
+  double total = 0.0;  // double accumulation -- this is a reference-quality
+                        // implementation for a feasibility bench, not yet
+                        // optimized for the accumulator width production
+                        // code would use.
+  alignas(64) uint8_t mag64[64];
+  alignas(64) int8_t xsigned64[64];
+
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t *base = block + (size_t)i * BLOCK_BYTES;
+    uint16_t d_half;
+    std::memcpy(&d_half, base, 2);
+    const float d = fp16_to_fp32_fused(d_half);
+    const uint8_t *qs_bytes = base + 2;
+
+    // Two 32-element groups per iteration (ib32, ib32+1) -- fills one full
+    // 64-lane VNNI call instead of a 32-lane-only one, see
+    // dot_u8s8_direct_avx512_x2's own comment for why that matters.
+    for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+      uint32_t aux32_0, aux32_1;
+      std::memcpy(&aux32_0, qs_bytes + ib32 * 8 + 0, 4);
+      std::memcpy(&aux32_1, qs_bytes + ib32 * 8 + 4, 4);
+      const uint8_t *aux8 = (const uint8_t *)&aux32_0;
+      const float db = d * (0.5f + (float)(aux32_1 >> 28)) * 0.25f;
+
+      int block_idx = (int)(i * (QK_K / 32) + ib32);
+      const int8_t *xq_row = xq[block_idx].qs;
+
+      dequant_pack16_u8s8(grid_tbl[aux8[0]], grid_tbl[aux8[1]],
+                          ksigns[(aux32_1 >> 0) & 127], ksigns[(aux32_1 >> 7) & 127],
+                          kmask_vec16, xq_row + 0, mag64 + 0, xsigned64 + 0);
+      dequant_pack16_u8s8(grid_tbl[aux8[2]], grid_tbl[aux8[3]],
+                          ksigns[(aux32_1 >> 14) & 127], ksigns[(aux32_1 >> 21) & 127],
+                          kmask_vec16, xq_row + 16, mag64 + 16, xsigned64 + 16);
+
+      int ib32_next = ib32 + 1;
+      uint32_t aux32_0_next, aux32_1_next;
+      std::memcpy(&aux32_0_next, qs_bytes + ib32_next * 8 + 0, 4);
+      std::memcpy(&aux32_1_next, qs_bytes + ib32_next * 8 + 4, 4);
+      const uint8_t *aux8_next = (const uint8_t *)&aux32_0_next;
+      const float db_next = d * (0.5f + (float)(aux32_1_next >> 28)) * 0.25f;
+
+      int block_idx_next = (int)(i * (QK_K / 32) + ib32_next);
+      const int8_t *xq_row_next = xq[block_idx_next].qs;
+
+      dequant_pack16_u8s8(grid_tbl[aux8_next[0]], grid_tbl[aux8_next[1]],
+                          ksigns[(aux32_1_next >> 0) & 127], ksigns[(aux32_1_next >> 7) & 127],
+                          kmask_vec16, xq_row_next + 0, mag64 + 32, xsigned64 + 32);
+      dequant_pack16_u8s8(grid_tbl[aux8_next[2]], grid_tbl[aux8_next[3]],
+                          ksigns[(aux32_1_next >> 14) & 127], ksigns[(aux32_1_next >> 21) & 127],
+                          kmask_vec16, xq_row_next + 16, mag64 + 48, xsigned64 + 48);
+
+      int32_t idot_lo, idot_hi;
+      dot_u8s8_direct_avx512_x2(mag64, xsigned64, idot_lo, idot_hi);
+      float xq_scale = fp16_to_fp32(xq[block_idx].d);
+      float xq_scale_next = fp16_to_fp32(xq[block_idx_next].d);
+      total += (double)idot_lo * (double)db * (double)xq_scale;
+      total += (double)idot_hi * (double)db_next * (double)xq_scale_next;
+    }
+  }
+  return (float)total;
+}
+
+// ============================================================
+// EXPERIMENTAL AVX2 prototype #2 for IQ2_XXS -- a faithful port of
+// upstream llama.cpp/ggml's own ggml_vec_dot_iq2_xxs_q8_K (vendored at
+// build/_deps/ggml-src/src/ggml-cpu/arch/x86/quants.c), NOT this project's
+// invention. Built after the first VNNI prototype above came out ~2.1x
+// SLOWER than the existing FMA path -- checking what upstream's own
+// production CPU backend does for this exact type turned up a genuinely
+// different structural choice, worth measuring for real rather than
+// assuming either "VNNI must be better" or "upstream must have already
+// solved this."
+//
+// Two structural differences from the VNNI prototype above, both aimed at
+// the exact weakness that sank it (packing overhead / memory round-trips):
+//  1. NO VNNI. Uses the classic pre-VNNI two-instruction int8 dot:
+//     _mm256_maddubs_epi16 (u8 x s8 -> s16 pairs) + _mm256_madd_epi16
+//     (s16 x s16 -> s32 pairs) -- confirmed by reading upstream's own
+//     source that this function has an __AVX2__ branch and an __AVX__
+//     fallback but NO __AVX512VNNI__ branch at all for this specific type.
+//  2. Weight packing is REGISTER-RESIDENT: _mm256_set_epi64x assembles the
+//     4 grid-table lookups directly into a register in one instruction --
+//     no store-to-memory-then-reload, unlike dequant_pack16_u8s8 above.
+//  Per-32-subblock scale is folded as an INTEGER multiplier (2*ls+1) via
+//  _mm256_madd_epi16 and accumulated in int32 across the WHOLE 256-element
+//  superblock -- only ONE float scale multiply per superblock (not one per
+//  32-group like both earlier prototypes in this file), matching upstream
+//  exactly. The trailing 0.125f is the same constant baked differently
+//  into dot_iq2_xxs_f32_avx512's own "(0.5+ls)*0.25" -- algebraically
+//  identical: (2*ls+1)*0.125 == (0.5+ls)*0.25.
+//
+// Reuses THIS project's own grid_tbl/ksigns/kmask (already Test-7-verified
+// byte-identical to ggml's reference dequant) rather than duplicating
+// ggml's literal keven_signs_q2xs table (which is `static` in ggml's own
+// x86 quants.c, not linkable) -- iq2xxs_sign_pattern_table() below derives
+// the equivalent pre-expanded 8-byte-per-index sign pattern ONCE (lazy
+// static init, same idiom as kmask_iq2xs_vec32_16_fused() above) from that
+// already-correct source data.
+
+static inline float hsum_f32_avx2(__m256 v) {
+  __m128 lo = _mm256_castps256_ps128(v);
+  __m128 hi = _mm256_extractf128_ps(v, 1);
+  lo = _mm_add_ps(lo, hi);
+  __m128 shuf = _mm_movehdup_ps(lo);
+  __m128 sums = _mm_add_ps(lo, shuf);
+  shuf = _mm_movehl_ps(shuf, sums);
+  sums = _mm_add_ss(sums, shuf);
+  return _mm_cvtss_f32(sums);
+}
+
+// Precomputed 128-entry x 8-byte sign-pattern table (0x01=keep, 0xFF=negate
+// per lane), directly usable as _mm256_sign_epi8's second operand --
+// equivalent to ggml's own `keven_signs_q2xs`, derived from this project's
+// existing ksigns/kmask bytes instead of duplicating that literal table.
+static const uint64_t *iq2xxs_sign_pattern_table() {
+  static uint64_t tbl[128];
+  static bool ready = [] {
+    const uint8_t *kmask8 = (const uint8_t *)ms_grid_kmask_iq2xs();  // [8]
+    const uint8_t *ksigns = (const uint8_t *)ms_grid_ksigns_iq2xs(); // [128]
+    for (int idx = 0; idx < 128; ++idx) {
+      uint8_t bytes[8];
+      for (int j = 0; j < 8; ++j) bytes[j] = (ksigns[idx] & kmask8[j]) ? 0xFF : 0x01;
+      std::memcpy(&tbl[idx], bytes, 8);
+    }
+    return true;
+  }();
+  (void)ready;
+  return tbl;
+}
+
+static_assert(sizeof(block_q8_K_local) == 292, "block_q8_K_local layout must match ggml's block_q8_K exactly");
+
+float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k) {
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 66;
+  const int64_t nb = k / QK_K;
+
+  const uint64_t *grid_tbl = (const uint64_t *)ms_grid_iq2xxs();
+  const uint64_t *signs64 = iq2xxs_sign_pattern_table();
+
+  __m256 accumf = _mm256_setzero_ps();
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t *base = block + (size_t)i * BLOCK_BYTES;
+    uint16_t d_half;
+    std::memcpy(&d_half, base, 2);
+    const float d = fp16_to_fp32_fused(d_half) * y[i].d;
+    const uint8_t *qs_bytes = base + 2;
+    const int8_t *q8 = y[i].qs;
+
+    __m256i sumi1 = _mm256_setzero_si256();
+    __m256i sumi2 = _mm256_setzero_si256();
+    for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+      const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+      const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+
+      uint32_t aux32_0, aux32_1;
+      std::memcpy(&aux32_0, qs_bytes + ib32 * 8 + 0, 4);
+      std::memcpy(&aux32_1, qs_bytes + ib32 * 8 + 4, 4);
+      const uint8_t *aux8 = (const uint8_t *)&aux32_0;
+      int ib32_next = ib32 + 1;
+      uint32_t aux32_0_next, aux32_1_next;
+      std::memcpy(&aux32_0_next, qs_bytes + ib32_next * 8 + 0, 4);
+      std::memcpy(&aux32_1_next, qs_bytes + ib32_next * 8 + 4, 4);
+      const uint8_t *aux8_next = (const uint8_t *)&aux32_0_next;
+
+      const __m256i q2_1 = _mm256_set_epi64x((int64_t)grid_tbl[aux8[3]], (int64_t)grid_tbl[aux8[2]],
+                                             (int64_t)grid_tbl[aux8[1]], (int64_t)grid_tbl[aux8[0]]);
+      const __m256i q2_2 = _mm256_set_epi64x((int64_t)grid_tbl[aux8_next[3]], (int64_t)grid_tbl[aux8_next[2]],
+                                             (int64_t)grid_tbl[aux8_next[1]], (int64_t)grid_tbl[aux8_next[0]]);
+      const __m256i s2_1 = _mm256_set_epi64x((int64_t)signs64[(aux32_1 >> 21) & 127], (int64_t)signs64[(aux32_1 >> 14) & 127],
+                                             (int64_t)signs64[(aux32_1 >> 7) & 127], (int64_t)signs64[(aux32_1 >> 0) & 127]);
+      const __m256i s2_2 = _mm256_set_epi64x((int64_t)signs64[(aux32_1_next >> 21) & 127], (int64_t)signs64[(aux32_1_next >> 14) & 127],
+                                             (int64_t)signs64[(aux32_1_next >> 7) & 127], (int64_t)signs64[(aux32_1_next >> 0) & 127]);
+      const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+      const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+      const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+      const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+      const uint16_t ls1 = (uint16_t)(aux32_1 >> 28);
+      const uint16_t ls2 = (uint16_t)(aux32_1_next >> 28);
+      const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1)));
+      const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1)));
+      sumi1 = _mm256_add_epi32(sumi1, p1);
+      sumi2 = _mm256_add_epi32(sumi2, p2);
+    }
+    // Plain mul+add, not _mm256_fmadd_ps -- this file's build flags enable
+    // AVX-512F (which covers 512-bit FMA, already used elsewhere in this
+    // file) but not the separate legacy FMA3 flag the 256-bit FMA
+    // intrinsic needs ("target specific option mismatch" at compile time).
+    accumf = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2))), accumf);
+  }
+  return 0.125f * hsum_f32_avx2(accumf);
+}
+
+// OpenMP wrapper for dot_iq2_xxs_avx2_prototype -- EngineConfig::
+// cpu_dot_ggml_avx2's own matmul entry point (kquant_dequant.hpp's
+// cpu_quant_matmul, gated behind cpu_dot_ggml_avx2_enabled()), mirroring
+// matmul_iq2_xxs_fused's own structure exactly but quantizing activations
+// to Q8_K ONCE per token (not per output row) before the parallel O-loop --
+// same "plain static, not thread_local" reasoning as matmul_q8_0_fused's
+// own g_xq_q8 buffer above (single decode-thread-only caller, fully
+// written before the parallel region reads it).
+void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
+                              int S, int I, int O) {
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 66;
+  const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
+  const int num_superblocks = I / QK_K;
+
+  static std::vector<block_q8_K_local> g_xq_k;
+  if (g_xq_k.size() < (size_t)(S * num_superblocks)) g_xq_k.resize((size_t)S * num_superblocks);
+
+  // Gated on S>1 -- an OMP team-spawn for a single S=1 (decode, the
+  // dominant call volume for this dispatch path) serial iteration is pure
+  // overhead with zero parallelism gained, the exact same "OMP-spawn cost
+  // exceeds a tiny workload" regression this project has hit and fixed
+  // multiple times before (see CLAUDE.md's qabsorb q_nope_gather_all entry
+  // for the canonical writeup) -- copied uncritically from matmul_q8_0_
+  // fused's own identical pattern above, which never got the same fix
+  // because Q8_0 isn't a real routed-expert type for this model (never
+  // exercised at S=1 in production, so the inefficiency was never
+  // surfaced). Real hardware run caught this: wiring this function in
+  // showed ZERO decode improvement over the existing FMA path despite a
+  // genuine ~1.8x isolated per-call win -- this is the fix for that gap.
+  if (S > 1) {
+#pragma omp parallel for schedule(static)
+    for (int s = 0; s < S; ++s) {
+      quantize_row_q8_K_ref(x + (int64_t)s * I, g_xq_k.data() + (int64_t)s * num_superblocks, I);
+    }
+  } else if (S == 1) {
+    quantize_row_q8_K_ref(x, g_xq_k.data(), I);
+  }
+
+  for (int s = 0; s < S; ++s) {
+    const block_q8_K_local *xq = g_xq_k.data() + (int64_t)s * num_superblocks;
+    float *ys = y + (int64_t)s * O;
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; ++o) {
+      const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
+      if (o + 1 < O) {
+        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+      }
+      ys[o] = dot_iq2_xxs_avx2_prototype(row_w, xq, I);
+    }
+  }
+}
+// ============================================================
 
 // Direct fused kernel: computes dot product of IQ3_XXS block weights with FP32
 // activation vector x
@@ -1625,6 +1988,10 @@ void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
     const float *xs = x + (int64_t)s * I;
     float *ys = y + (int64_t)s * O;
 
+    // 2026-08-29: same S>1 gate TRIED and REVERTED here as matmul_iq2_xxs_
+    // fused's own sibling above -- see that function's comment for the
+    // full rationale and real-hardware measurement. Left as the original,
+    // always-parallel form.
 #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; ++o) {
       const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
@@ -1636,6 +2003,133 @@ void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
     }
   }
 }
+
+// ============================================================
+// EXPERIMENTAL AVX2 prototype for IQ3_XXS -- faithful port of upstream
+// llama.cpp/ggml's own ggml_vec_dot_iq3_xxs_q8_K (vendored at build/_deps/
+// ggml-src/src/ggml-cpu/arch/x86/quants.c), same rationale and design as
+// dot_iq2_xxs_avx2_prototype above (see that function's own header comment
+// for the full story -- this is its IQ3_XXS sibling, GLM-5.2's down-proj
+// type, 71-76/78 layers). Reuses iq2xxs_sign_pattern_table() unchanged --
+// confirmed via source that dot_iq3_xxs_f32_avx512 above already shares the
+// SAME ksigns/kmask table with IQ2_XXS (ms_grid_ksigns_iq2xs()), and ggml's
+// own kernel likewise shares its single keven_signs_q2xs table across both
+// types -- no new sign table needed.
+//
+// Structural difference from IQ2_XXS's port: IQ3_XXS's grid indices are
+// flat bytes in their own 64-byte region (x[i].qs, 4-weight/32-bit grid
+// entries, 8 bytes -> 8 entries -> 32 weights per iteration) rather than
+// packed into the same uint32 as the sign/scale data -- the sign/scale
+// aux32 words live in a SEPARATE 32-byte region right after (`gas`/
+// `scales_and_signs`). Confirmed byte-for-byte against dot_iq3_xxs_f32_
+// avx512 above (same BLOCK_BYTES=98, same qs/scales_and_signs split, same
+// aux32 bit layout) before writing this, not re-derived from scratch.
+float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k) {
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 98;
+  const int64_t nb = k / QK_K;
+
+  const uint32_t *grid_tbl = (const uint32_t *)ms_grid_iq3xxs();
+  const uint64_t *signs64 = iq2xxs_sign_pattern_table();
+
+  __m256 accumf = _mm256_setzero_ps();
+  for (int64_t i = 0; i < nb; ++i) {
+    const uint8_t *base = block + (size_t)i * BLOCK_BYTES;
+    uint16_t d_half;
+    std::memcpy(&d_half, base, 2);
+    const float d = fp16_to_fp32_fused(d_half) * y[i].d;
+    const uint8_t *q3 = base + 2;               // [64] grid indices
+    const uint8_t *gas = base + 2 + 64;          // [32] sign/scale aux32 words
+    const int8_t *q8 = y[i].qs;
+
+    __m256i sumi1 = _mm256_setzero_si256();
+    __m256i sumi2 = _mm256_setzero_si256();
+    for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+      const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+      const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+
+      const __m256i q2_1 = _mm256_set_epi32(
+          (int)grid_tbl[q3[7]], (int)grid_tbl[q3[6]], (int)grid_tbl[q3[5]], (int)grid_tbl[q3[4]],
+          (int)grid_tbl[q3[3]], (int)grid_tbl[q3[2]], (int)grid_tbl[q3[1]], (int)grid_tbl[q3[0]]);
+      q3 += 8;
+      const __m256i q2_2 = _mm256_set_epi32(
+          (int)grid_tbl[q3[7]], (int)grid_tbl[q3[6]], (int)grid_tbl[q3[5]], (int)grid_tbl[q3[4]],
+          (int)grid_tbl[q3[3]], (int)grid_tbl[q3[2]], (int)grid_tbl[q3[1]], (int)grid_tbl[q3[0]]);
+      q3 += 8;
+
+      uint32_t aux32_0, aux32_1;
+      std::memcpy(&aux32_0, gas, 4);
+      std::memcpy(&aux32_1, gas + 4, 4);
+      gas += 8;
+
+      const __m256i s2_1 = _mm256_set_epi64x((int64_t)signs64[(aux32_0 >> 21) & 127], (int64_t)signs64[(aux32_0 >> 14) & 127],
+                                             (int64_t)signs64[(aux32_0 >> 7) & 127], (int64_t)signs64[(aux32_0 >> 0) & 127]);
+      const __m256i s2_2 = _mm256_set_epi64x((int64_t)signs64[(aux32_1 >> 21) & 127], (int64_t)signs64[(aux32_1 >> 14) & 127],
+                                             (int64_t)signs64[(aux32_1 >> 7) & 127], (int64_t)signs64[(aux32_1 >> 0) & 127]);
+      const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
+      const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
+      const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+      const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+      const uint16_t ls1 = (uint16_t)(aux32_0 >> 28);
+      const uint16_t ls2 = (uint16_t)(aux32_1 >> 28);
+      const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1)));
+      const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1)));
+      sumi1 = _mm256_add_epi32(sumi1, p1);
+      sumi2 = _mm256_add_epi32(sumi2, p2);
+    }
+    accumf = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2))), accumf);
+  }
+  return 0.25f * hsum_f32_avx2(accumf);
+}
+
+// OpenMP wrapper for dot_iq3_xxs_avx2_prototype -- IQ3_XXS sibling of
+// matmul_iq2_xxs_ggml_avx2 above, same design (see that function's own
+// comment).
+void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
+                              int S, int I, int O) {
+  constexpr int QK_K = 256;
+  constexpr size_t BLOCK_BYTES = 98;
+  const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
+  const int num_superblocks = I / QK_K;
+
+  static std::vector<block_q8_K_local> g_xq_k;
+  if (g_xq_k.size() < (size_t)(S * num_superblocks)) g_xq_k.resize((size_t)S * num_superblocks);
+
+  // Gated on S>1 -- an OMP team-spawn for a single S=1 (decode, the
+  // dominant call volume for this dispatch path) serial iteration is pure
+  // overhead with zero parallelism gained, the exact same "OMP-spawn cost
+  // exceeds a tiny workload" regression this project has hit and fixed
+  // multiple times before (see CLAUDE.md's qabsorb q_nope_gather_all entry
+  // for the canonical writeup) -- copied uncritically from matmul_q8_0_
+  // fused's own identical pattern above, which never got the same fix
+  // because Q8_0 isn't a real routed-expert type for this model (never
+  // exercised at S=1 in production, so the inefficiency was never
+  // surfaced). Real hardware run caught this: wiring this function in
+  // showed ZERO decode improvement over the existing FMA path despite a
+  // genuine ~1.8x isolated per-call win -- this is the fix for that gap.
+  if (S > 1) {
+#pragma omp parallel for schedule(static)
+    for (int s = 0; s < S; ++s) {
+      quantize_row_q8_K_ref(x + (int64_t)s * I, g_xq_k.data() + (int64_t)s * num_superblocks, I);
+    }
+  } else if (S == 1) {
+    quantize_row_q8_K_ref(x, g_xq_k.data(), I);
+  }
+
+  for (int s = 0; s < S; ++s) {
+    const block_q8_K_local *xq = g_xq_k.data() + (int64_t)s * num_superblocks;
+    float *ys = y + (int64_t)s * O;
+#pragma omp parallel for schedule(static)
+    for (int o = 0; o < O; ++o) {
+      const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
+      if (o + 1 < O) {
+        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+      }
+      ys[o] = dot_iq3_xxs_avx2_prototype(row_w, xq, I);
+    }
+  }
+}
+// ============================================================
 
 // Fast AVX-512 dequantization helper for Q5_K 16-element sub-groups
 // Corrected AVX-512 dequantization helper for Q5_K 16-element sub-groups

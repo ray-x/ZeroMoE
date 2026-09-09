@@ -1,10 +1,15 @@
 #pragma once
+#include <cstdio>
 #include "cufile_io.hpp"
 #include "logger.hpp"
+#include "perf_timer.hpp"  // register_mirror_fd -- per-drive read-byte attribution
 #include <algorithm>
 #include <cstdint>
 #include <fcntl.h>
 #include <sys/stat.h>   // ::stat, for open_mirror's per-shard size check
+#include <sys/mman.h>   // mmap/munmap -- whole-shard mapping for the prefill stream path
+#include <cstring>      // strerror
+#include <cerrno>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -177,6 +182,12 @@ enum class GatingFunc {
 struct ArchitectureConfig {
   int hidden = 0;
   int n_layers = 0;
+  // Number of llama.cpp-style NextN/MTP blocks appended after the normal
+  // transformer trunk.  n_layers remains the target/trunk count so all
+  // existing forward loops keep their historical bounds; callers that
+  // explicitly implement MTP can use n_layers_total() for cache/manifest
+  // sizing.  Zero is the common case and is a strict no-op.
+  int n_layer_nextn = 0;
   int n_heads = 0;
   int n_experts = 0;
   int topk = 0;
@@ -229,9 +240,7 @@ struct ArchitectureConfig {
   int rope_n_ctx_orig = 0;
 
   // ---- DeepSeek-V4 (Hyper-Connections, grouped output projection,
-  // attention sinks, SWA). Phase 1 (correctness within each layer's local
-  // sliding window) only -- see models/family_ops.cpp's DeepSeek_V4 table
-  // entry and CLAUDE.md's DeepSeek-V4 plan writeup. Every field here
+  // attention sinks, raw SWA plus CSA/HCA compressed attention). Every field
   // defaults to "feature inactive" so populating them is a strict no-op for
   // every other family.
   int hc_mult = 1;              // hyper_connection.count; 1 = inactive
@@ -241,9 +250,142 @@ struct ArchitectureConfig {
   int o_lora_rank = 0;          // attention.output_lora_rank
   int hash_layer_count = 0;     // hash_layer_count; 0 = no hash-routed layers
   int sliding_window = 0;       // attention.sliding_window; 0 = SWA inactive
+  // Per-layer DeepSeek-V4 attention compression. A zero ratio selects raw
+  // SWA; 4 selects CSA + Lightning Indexer; 128 selects HCA.
+  std::vector<int64_t> dsv4_compress_ratios;
+  float dsv4_compress_rope_freq_base = 0.0f;
+  int dsv4_indexer_head_count = 0;
+  int dsv4_indexer_key_length = 0;
+  int dsv4_indexer_top_k = 0;
   std::vector<float> swiglu_clamp_exp;   // per-layer, size n_layers when set
   std::vector<float> swiglu_clamp_shexp; // per-layer, size n_layers when set
+
+  // ---- GLM5Next (GLM 5.3 Flash, GGUF arch "glm5next"): hybrid recurrent
+  // KDA + nope-only absorbed-MLA (DSA) layers. Every field defaults to
+  // "feature inactive" so populating them is a strict no-op for every other
+  // family. Reference: llama.cpp branch glm5next (src/models/glm5next.cpp,
+  // conversion/glm5next.py).
+  //
+  // Per-layer layer-type switch, straight from the GGUF
+  // attention.head_count_kv ARRAY (the converter writes 0 for KDA layers,
+  // 1 for DSA layers -- the scalar c.n_head_kv read elsewhere never sees
+  // this key, since it's array-typed here). Empty for every other family;
+  // glm5next_is_kda_layer() below is the only correct way to read it.
+  std::vector<int64_t> glm5next_head_count_kv;
+  int ssm_conv_kernel = 0;        // ssm.conv_kernel (KDA short-conv width)
+  int kda_head_dim = 0;           // kda.head_dim (per-head KDA dim)
+  float kda_gate_lower_bound = 0.0f; // kda.gate_lower_bound (required, < 0;
+                                     // scales the sigmoid decay gate -- 0
+                                     // here means "never loaded", which the
+                                     // glm5next validation block rejects)
+  // Indexer (Lightning sparse attention on DSA layers) -- metadata loaded
+  // and logged at startup, but NOT executed in v1: DSA layers run as dense
+  // absorbed MLA over the full KV cache. Recorded here so the startup log
+  // can state plainly what was deferred.
+  int glm5next_indexer_head_count = 0;  // attention.indexer.head_count
+  int glm5next_indexer_key_length = 0;  // attention.indexer.key_length
+  int glm5next_indexer_top_k = 0;       // attention.indexer.top_k
+  int glm5next_indexer_kpool = 0;       // attention.indexer.kpool
+
+  // ---- Qwen4Exp (Qwen3.8-Flash-Next, GGUF arch "qwen4exp"): hybrid Gated
+  // DeltaNet (recurrent) + full-attention layers, low-rank hyper-connections
+  // replacing every layer norm, QSA sparse attention (v1: deferred, full
+  // attention runs dense), PLE n-gram hash embedding on select layers.
+  // Every field defaults to "feature inactive" so populating them is a
+  // strict no-op for every other family. Reference: llama.cpp branch
+  // qwen4exp/qwen3.8-flash-next (src/models/qwen4exp.cpp's
+  // load_arch_hparams/load_arch_tensors, conversion/qwen4exp.py).
+  //
+  // Per-layer hybrid map: attention.recurrent_layers bool array (1 = GDN
+  // recurrent, 0 = full attention). If the file omits it, derived from
+  // full_attention_interval (every interval-th layer is full attention).
+  // qwen4exp_is_gdn_layer() below is the only correct way to read it.
+  std::vector<int64_t> qwen4exp_recurrent_layers;
+  int qwen4exp_full_attention_interval = 0; // attention.full_attention_interval
+  // GDN dimensions (ssm.* keys, shared names with GLM5Next's KDA but a
+  // DIFFERENT parameterization -- see attention_layer.cpp's qwen4exp block):
+  int ssm_inner_size = 0;    // ssm.inner_size  (d_inner = n_v_heads*head_v_dim)
+  int ssm_state_size = 0;    // ssm.state_size  (head_k_dim == head_v_dim)
+  int ssm_time_step_rank = 0; // ssm.time_step_rank (num_v_heads)
+  int ssm_group_count = 0;   // ssm.group_count (num_k_heads)
+  // (ssm_conv_kernel, declared for GLM5Next above, is reused: same GGUF key.)
+  // Low-rank hyper-connections (qwen4exp-specific; DeepSeek-V4 leaves the
+  // key absent = full rank, qwen4exp requires it):
+  int hc_low_rank = 0;       // hyper_connection.low_rank
+  // QSA indexer on full-attention layers -- metadata loaded and logged, NOT
+  // executed in v1 (full-attention layers run dense over the whole KV cache,
+  // a correct superset of the indexer's selected blocks). Same deferral
+  // discipline as GLM5Next's own indexer.
+  std::vector<int64_t> qwen4exp_compress_ratios; // attention.compress_ratios
+  int qwen4exp_indexer_head_count = 0;  // attention.indexer.head_count
+  int qwen4exp_indexer_key_length = 0;  // attention.indexer.key_length
+  int qwen4exp_indexer_top_k = 0;       // attention.indexer.top_k
+  // PLE n-gram hash embedding (absent key group = no PLE layers at all).
+  std::vector<int64_t> ple_layers;   // ple.layers (0-based layer indices)
+  int ple_ngram_size = 0;            // ple.ngram_size
+  int ple_heads_per_ngram = 0;       // ple.heads_per_ngram
+  int ple_conv_kernel = 0;           // ple.conv_kernel
+  int ple_eos_token_id = -1;         // ple.eos_token_id
+  int ple_image_token_id = 0;        // ple.image_token_id (0 = fall back to eos)
+  int ple_n_embd_per_layer = 0;      // embedding_length_per_layer_input
+  // ple_n_heads = (ngram_size-1)*heads_per_ngram, computed at load.
+  int ple_n_heads = 0;
+  // 45-bit hash constants, read as int64 arrays (uint64 in the file, but
+  // every value fits int64 -- the converter itself narrows them to int32
+  // row indices after a mod, and the multipliers are < 2^63).
+  std::vector<int64_t> ple_layer_multipliers; // ple.layer_multipliers [ngram]
+  std::vector<int64_t> ple_head_offsets;      // ple.head_offsets [ple_n_heads]
+  std::vector<int64_t> ple_head_vocab_sizes;  // ple.head_vocab_sizes
+  // Interleaved partial RoPE (mrope sections; text-only degenerates to plain
+  // interleaved RoPE over the first rope_n_rot dims of each head):
+  std::vector<int64_t> rope_sections; // rope.dimension_sections (4 entries)
+  int rope_n_rot = 0;                 // rope.dimension_count (0 = full head)
+
+  int n_layers_total() const {
+    return n_layers + std::max(0, n_layer_nextn);
+  }
 };
+
+// GLM5Next layer-type query: true when layer l is a recurrent KDA layer
+// (head_count_kv[l] == 0), false for a full-attention DSA layer. Returns
+// false for any non-GLM5Next config (empty array) and for out-of-range
+// layers (defensive -- a short array fails safe toward the DSA path, which
+// at least has real tensors to report missing, rather than toward the KDA
+// path's state allocation).
+inline bool glm5next_is_kda_layer(const ArchitectureConfig &config, int layer_idx) {
+  return layer_idx >= 0 &&
+         (size_t)layer_idx < config.glm5next_head_count_kv.size() &&
+         config.glm5next_head_count_kv[(size_t)layer_idx] == 0;
+}
+
+// Qwen4Exp layer-type query: true when layer l is a recurrent GDN layer,
+// false for a full-attention layer. Prefers the GGUF's explicit
+// attention.recurrent_layers array; falls back to the
+// full_attention_interval rule (every interval-th layer, 1-based, is full
+// attention) when the array is absent. Returns false for any non-Qwen4Exp
+// config (both empty) and for out-of-range layers (fails safe toward the
+// full-attention path, which at least has real tensors to report missing,
+// rather than toward the GDN path's state allocation -- mirrors
+// glm5next_is_kda_layer's defensive rationale).
+inline bool qwen4exp_is_gdn_layer(const ArchitectureConfig &config, int layer_idx) {
+  if (layer_idx < 0 || layer_idx >= config.n_layers) return false;
+  if ((size_t)layer_idx < config.qwen4exp_recurrent_layers.size())
+    return config.qwen4exp_recurrent_layers[(size_t)layer_idx] != 0;
+  if (config.qwen4exp_full_attention_interval > 0)
+    return ((layer_idx + 1) % config.qwen4exp_full_attention_interval) != 0;
+  return false;
+}
+
+inline bool qwen4exp_is_ple_layer(const ArchitectureConfig &config, int layer_idx) {
+  return std::find(config.ple_layers.begin(), config.ple_layers.end(),
+                   (int64_t)layer_idx) != config.ple_layers.end();
+}
+
+inline bool dsv4_uses_compressed_attention(const ArchitectureConfig &config) {
+  return std::any_of(config.dsv4_compress_ratios.begin(),
+                     config.dsv4_compress_ratios.end(),
+                     [](int64_t ratio) { return ratio != 0; });
+}
 
 class GGUFFile {
 public:
@@ -317,6 +459,136 @@ public:
     return t.shard_idx >= 0 && (size_t)t.shard_idx < shard_direct_io.size() &&
            shard_direct_io[t.shard_idx];
   }
+
+  // ---- Whole-shard read-only mmap (EngineConfig::moe_prefill_stream) ----
+  // Motivation, MEASURED 2026-09-05 on a real 441-token qwen4exp prefill:
+  // the batched prefill path pulled 31.07 GB of expert weights per pass
+  // through load_expert_slab's pread + memcpy into private RAM-tier slabs
+  // -- 5.08 GB/s warm, 0.77 GB/s cold -- for data each expert touches
+  // EXACTLY ONCE per prefill. That run reported `cache=0% hit`, and it is
+  // not a tuning failure but arithmetic: 48 layers x 512 experts is ~68 GB
+  // of DISTINCT slabs against a 29.5 GB VRAM cache, and a long prompt
+  // activates essentially every expert in every layer (512 tokens x top-10
+  // over 512 experts is ~5120 draws, so coupon-collector says all 512), so
+  // there is no reuse for a cache to capture. llama.cpp mmaps the file and
+  // copies nothing. This closes that specific gap without disturbing the
+  // RAM tier, which decode -- where a token touches only 10 of 512 experts
+  // and reuse across tokens is real -- genuinely needs.
+  //
+  // MAP_SHARED/PROT_READ over the WHOLE shard, so any tensor's bytes are
+  // just (base + t.offset). Deliberately opens its OWN fd instead of
+  // reusing shard_fds[i]: those may carry O_DIRECT (see enable_direct_io),
+  // and pairing an O_DIRECT fd's page-cache-BYPASSING reads with a
+  // page-cache-BACKED mapping of the same file is a coherence hazard --
+  // this project already hit the mirror image of it once (see CLAUDE.md's
+  // btrfs O_DIRECT page-cache-leak entry). The mapping holds its own
+  // reference to the file, so the fd is closed immediately after mmap.
+  std::vector<void *> shard_maps;
+  std::vector<size_t> shard_map_sizes;
+
+  bool mmap_active() const { return !shard_maps.empty(); }
+
+  // Idempotent. All-or-nothing: any failure unmaps whatever already
+  // succeeded and reports false, so mmap_active() never describes a
+  // partially-mapped model that mmap_bytes() would then answer for some
+  // shards but not others.
+  bool enable_mmap() {
+    if (!shard_maps.empty()) return true;
+    const size_t n = shard_paths.size();
+    if (n == 0) {
+      LOG_WARN("[MMAP] no shard paths recorded -- cannot enable mmap.\n");
+      return false;
+    }
+    std::vector<void *> maps(n, nullptr);
+    std::vector<size_t> sizes(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+      int fd = ::open(shard_paths[i].c_str(), O_RDONLY);
+      if (fd < 0) {
+        LOG_ERROR("[MMAP] cannot open shard %s: %s\n", shard_paths[i].c_str(),
+                  strerror(errno));
+        unmap_list(maps, sizes);
+        return false;
+      }
+      struct stat st {};
+      if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
+        LOG_ERROR("[MMAP] fstat failed for %s\n", shard_paths[i].c_str());
+        ::close(fd);
+        unmap_list(maps, sizes);
+        return false;
+      }
+      void *m = ::mmap(nullptr, (size_t)st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+      ::close(fd);
+      if (m == MAP_FAILED) {
+        LOG_ERROR("[MMAP] mmap of %s (%lld bytes) failed: %s\n",
+                  shard_paths[i].c_str(), (long long)st.st_size, strerror(errno));
+        unmap_list(maps, sizes);
+        return false;
+      }
+      maps[i] = m;
+      sizes[i] = (size_t)st.st_size;
+    }
+    shard_maps.swap(maps);
+    shard_map_sizes.swap(sizes);
+    size_t total = 0;
+    for (size_t b : shard_map_sizes) total += b;
+    LOG_STREAM_INFO() << "[MMAP] mapped " << n << " shard(s), "
+                      << (total / (1024.0 * 1024.0 * 1024.0)) << " GB of "
+                      << "address space (resident pages are the OS page "
+                      << "cache's business, not ours)" << std::endl;
+    return true;
+  }
+
+  // Pointer to `len` bytes at ABSOLUTE file offset `off` within t's shard,
+  // or nullptr if this shard isn't mapped or the range would run past the
+  // end of the file. Bounds-checked rather than trusted: a truncated or
+  // malformed shard would otherwise turn into a silent out-of-bounds read
+  // of mapped memory (a SIGBUS at best, wrong weights at worst).
+  const uint8_t *mmap_bytes(const GGUFTensor &t, uint64_t off,
+                            size_t len) const {
+    if (t.shard_idx < 0 || (size_t)t.shard_idx >= shard_maps.size())
+      return nullptr;
+    void *base = shard_maps[(size_t)t.shard_idx];
+    if (!base) return nullptr;
+    const size_t cap = shard_map_sizes[(size_t)t.shard_idx];
+    if (off > cap || len > cap - off) return nullptr;
+    return static_cast<const uint8_t *>(base) + off;
+  }
+
+  // Ask the kernel to stage a mapped expert range into the page cache before
+  // the prefill stream's memcpy touches it. This is deliberately a
+  // best-effort hint: the mmap path remains correct if the kernel ignores
+  // it, and the caller still validates the range through mmap_bytes().
+  // Per-range hints matter here because the batched route can have every
+  // expert resident in MoEStream's RAM tier already, so the prefetcher does
+  // not perform the reads that would otherwise warm these same mmap pages.
+  bool mmap_willneed(const GGUFTensor &t, uint64_t off, size_t len) const {
+#ifdef __linux__
+    if (len == 0 || t.shard_idx < 0 ||
+        (size_t)t.shard_idx >= shard_maps.size())
+      return false;
+    void *base = shard_maps[(size_t)t.shard_idx];
+    const size_t cap = shard_map_sizes[(size_t)t.shard_idx];
+    if (!base || off > cap || len > cap - off)
+      return false;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0)
+      return false;
+    const uintptr_t start =
+        reinterpret_cast<uintptr_t>(base) + (size_t)off;
+    const uintptr_t aligned =
+        start & ~((uintptr_t)page_size - 1U);
+    const size_t delta = (size_t)(start - aligned);
+    const size_t hinted = len + delta;
+    return madvise(reinterpret_cast<void *>(aligned), hinted,
+                   MADV_WILLNEED) == 0;
+#else
+    (void)t;
+    (void)off;
+    (void)len;
+    return false;
+#endif
+  }
+
 
   bool has_mirror() const { return !mirror_shard_fds.empty(); }
 
@@ -429,6 +701,7 @@ public:
       }
       mirror_shard_fds[i] = fd;
       mirror_shard_direct_io[i] = got_direct;
+      register_mirror_fd(fd);  // perf_timer.hpp -- lets submit_and_wait attribute real read bytes per drive
       n_ok++;
     }
     LOG_STREAM_INFO() << "[MIRROR] Second replica: " << n_ok << "/" << shard_paths.size()
@@ -719,22 +992,177 @@ public:
     return {};
   }
 
+  // 2026-08-31: user-facing model-load diagnostics.
+  //
+  // These go to stderr DIRECTLY (std::fprintf), not only through Logger.
+  // That is the whole point: this project's configs set `log_path`
+  // (e.g. debug.log), and Logger::log resolves `FILE* out = file_ ? file_
+  // : stderr` -- so once a log file is configured, every LOG_ERROR goes to
+  // that FILE and NOTHING reaches the terminal. A model that cannot be
+  // loaded is exactly the case where the operator is staring at the
+  // terminal wondering why nothing happened, so it must be visible there
+  // regardless of log routing. Emitted IN ADDITION to the normal
+  // LOG_STREAM_ERROR call, so the log file still contains the full record.
+  static void warn_stderr(const std::string &msg) {
+    std::fprintf(stderr, "[MODEL] %s\n", msg.c_str());
+    std::fflush(stderr);
+  }
+
+  // What a file actually looks like on disk, independent of its extension
+  // (an extension is a naming convention, not a format -- a .gguf file can
+  // be a truncated download, an HTML error page saved by a failed fetch, or
+  // a safetensors file someone renamed).
+  enum class FileFormat { Unreadable, Empty, GGUF, Safetensors, Unknown };
+
+  static FileFormat detect_file_format(const std::string &p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f.is_open()) return FileFormat::Unreadable;
+    f.seekg(0, std::ios::end);
+    std::streamoff sz = f.tellg();
+    if (sz <= 0) return FileFormat::Empty;
+    f.seekg(0, std::ios::beg);
+
+    char magic[4] = {0};
+    f.read(magic, 4);
+    if (f.gcount() == 4 && std::string(magic, 4) == "GGUF") return FileFormat::GGUF;
+
+    // safetensors: 8-byte little-endian header length, then that many bytes
+    // of JSON beginning with '{'. Validated against the real file size so a
+    // random 8 bytes that happen to look like a plausible length don't get
+    // misreported as safetensors.
+    f.seekg(0, std::ios::beg);
+    uint64_t hdr = 0;
+    f.read(reinterpret_cast<char *>(&hdr), 8);
+    if (f.gcount() == 8 && hdr > 0 && hdr < (uint64_t)sz && hdr < (1ull << 32)) {
+      char brace = 0;
+      f.read(&brace, 1);
+      if (f.gcount() == 1 && brace == '{') return FileFormat::Safetensors;
+    }
+    return FileFormat::Unknown;
+  }
+
+  // One place that turns a failed load into an actionable stderr message,
+  // so every failure path reports the SAME way instead of each site
+  // inventing its own wording.
+  static void report_load_failure(const std::string &p) {
+    switch (detect_file_format(p)) {
+      case FileFormat::Unreadable:
+        warn_stderr("ERROR: cannot open model file: " + p +
+                    "  (does not exist, or no read permission)");
+        break;
+      case FileFormat::Empty:
+        warn_stderr("ERROR: model file is empty (0 bytes): " + p +
+                    "  (an interrupted or failed download?)");
+        break;
+      case FileFormat::Safetensors:
+        // NOTE: src/safetensors_adapter.cpp exists in this tree but is NOT
+        // in the build (verified: no object file in build/CMakeFiles), so
+        // safetensors is a supported FORMAT that this particular binary
+        // cannot currently load. Say exactly that rather than "unsupported
+        // format", which would wrongly send the operator off to re-convert
+        // a file that is actually fine.
+        warn_stderr("ERROR: model file is safetensors: " + p +
+                    "  (safetensors is supported, but this binary was built "
+                    "without the safetensors adapter -- use a GGUF file, or "
+                    "rebuild with src/safetensors_adapter.cpp included)");
+        break;
+      case FileFormat::GGUF:
+        // Real GGUF magic, so the format is right and something else went
+        // wrong (truncated/corrupt body, unreadable metadata). Say so
+        // rather than blaming the format, which would send the operator
+        // down the wrong path entirely.
+        warn_stderr("ERROR: model file has a valid GGUF header but could not "
+                    "be loaded: " + p +
+                    "  (truncated, corrupt, or unreadable metadata -- see the "
+                    "log for details)");
+        break;
+      case FileFormat::Unknown:
+      default:
+        warn_stderr("ERROR: unsupported model file format: " + p +
+                    "  (only GGUF and safetensors are recognized; this file "
+                    "matches neither)");
+        break;
+    }
+  }
+
   bool load_header(const std::string &path) {
     std::vector<std::string> gguf_files;
 
     if (std::filesystem::is_directory(path)) {
-      for (const auto &entry : std::filesystem::directory_iterator(path)) {
+      std::error_code dir_ec;
+      for (std::filesystem::directory_iterator it(path, dir_ec), end;
+           it != end && !dir_ec; it.increment(dir_ec)) {
+        const auto &entry = *it;
         if (entry.path().extension() == ".gguf")
           gguf_files.push_back(entry.path().string());
+      }
+      if (dir_ec) {
+        LOG_STREAM_ERROR() << "[GGUF] Cannot enumerate model directory " << path
+                           << ": " << dir_ec.message() << "\n";
+        return false;
       }
       if (gguf_files.empty()) {
         LOG_STREAM_ERROR() << "[GGUF] No .gguf files found in directory: "
                            << path << "\n";
+        // stderr too -- see warn_stderr's own comment for why a log_path'd
+        // run would otherwise show the operator nothing at all.
+        warn_stderr("ERROR: no .gguf files found in model directory: " + path +
+                    "  (only GGUF and safetensors are supported; check the "
+                    "path points at the model, and that the download "
+                    "completed)");
         return false;
       }
       std::sort(gguf_files.begin(), gguf_files.end());
     } else {
-      gguf_files.push_back(path);
+      // Report a missing/unreadable path here rather than letting it fall
+      // through to load_shard's generic failure -- at this point we still
+      // know it was given as a FILE path, which makes the message specific.
+      if (!std::filesystem::exists(path)) {
+        LOG_STREAM_ERROR() << "[GGUF] Model path does not exist: " << path << "\n";
+        warn_stderr("ERROR: model path does not exist: " + path);
+        return false;
+      }
+      // A split GGUF may be passed as its metadata-only first shard. Discover
+      // the remaining numbered siblings so explicit first-shard configs work
+      // the same way as directory configs.
+      const std::filesystem::path input(path);
+      const std::string filename = input.filename().string();
+      const size_t of_pos = filename.find("-of-");
+      const size_t index_dash =
+          of_pos == std::string::npos ? std::string::npos
+                                      : filename.rfind('-', of_pos - 1);
+      if (of_pos != std::string::npos && index_dash != std::string::npos) {
+        const std::string prefix = filename.substr(0, index_dash);
+        const size_t total_begin = of_pos + 4;
+        const size_t total_end = filename.find_first_not_of("0123456789",
+                                                              total_begin);
+        const std::string total =
+            filename.substr(total_begin, total_end - total_begin);
+        std::error_code dir_ec;
+        for (std::filesystem::directory_iterator it(input.parent_path(), dir_ec),
+             end;
+             it != end && !dir_ec; it.increment(dir_ec)) {
+          const auto &entry = *it;
+          if (entry.path().extension() != ".gguf")
+            continue;
+          const std::string candidate = entry.path().filename().string();
+          if (candidate.rfind(prefix + "-", 0) != 0)
+            continue;
+          const size_t candidate_of = candidate.find("-of-");
+          if (candidate_of == std::string::npos ||
+              candidate.substr(candidate_of + 4, total.size()) != total)
+            continue;
+          gguf_files.push_back(entry.path().string());
+        }
+        if (dir_ec)
+          LOG_STREAM_WARN() << "[GGUF] Could not enumerate sibling shards in "
+                            << input.parent_path() << ": " << dir_ec.message()
+                            << " -- trying the requested shard only.\n";
+      }
+      if (gguf_files.empty())
+        gguf_files.push_back(path);
+      else
+        std::sort(gguf_files.begin(), gguf_files.end());
     }
 
     LOG_STREAM_INFO() << "[GGUF] Loading " << gguf_files.size()
@@ -744,6 +1172,10 @@ public:
       if (!load_shard(gguf_files[shard], (int)shard)) {
         LOG_STREAM_ERROR() << "[GGUF] Failed to load shard: "
                            << gguf_files[shard] << "\n";
+        // Classify WHY before reporting: "failed to load" alone does not
+        // tell the operator whether the file is missing, empty, the wrong
+        // format, or corrupt -- four problems with four different fixes.
+        report_load_failure(gguf_files[shard]);
         return false;
       }
     }
@@ -757,7 +1189,15 @@ public:
     return file_fd >= 0;
   }
 
+  static void unmap_list(std::vector<void *> &maps, std::vector<size_t> &sizes) {
+    for (size_t i = 0; i < maps.size(); ++i)
+      if (maps[i]) ::munmap(maps[i], sizes[i]);
+    maps.clear();
+    sizes.clear();
+  }
+
   ~GGUFFile() {
+    unmap_list(shard_maps, shard_map_sizes);
     // Deregister BEFORE closing the underlying fd -- cuFile's own
     // handle owns a reference tied to that fd staying open/valid.
     for (auto &h : shard_cufile_handles) {
@@ -789,18 +1229,71 @@ private:
     f.read(reinterpret_cast<char *>(&tensor_count), 8);
     f.read(reinterpret_cast<char *>(&kv_count), 8);
 
+    // 2026-08-31: reject a TRUNCATED/corrupt GGUF here, at the point the
+    // damage is actually detectable, instead of letting it through.
+    // Previously a file with valid "GGUF" magic but a short/garbage body
+    // sailed past this function entirely -- the reads above silently failed,
+    // tensor_count/kv_count kept whatever garbage they had, and the run died
+    // much later with "Tokenizer vocabulary table completely missing from
+    // GGUF metadata". That message sends the operator hunting for a
+    // tokenizer problem when the real fault is a truncated download, which
+    // is a genuinely misleading diagnostic, not just a terse one.
+    //
+    // Two checks: (a) the stream must still be good -- a short file makes
+    // these 8-byte reads fail, which is the direct truncation signal; and
+    // (b) the counts must be within sane bounds. The bounds are deliberately
+    // very loose (millions), far above any real model, so they only ever
+    // catch garbage, never a legitimately large file.
+    constexpr uint64_t kMaxPlausibleTensors = 10'000'000ull;
+    constexpr uint64_t kMaxPlausibleKV      =  1'000'000ull;
+    if (!f.good() || tensor_count > kMaxPlausibleTensors || kv_count > kMaxPlausibleKV) {
+      LOG_STREAM_ERROR() << "[GGUF] Corrupt or truncated shard header: " << shard_path
+                         << " (tensor_count=" << tensor_count
+                         << " kv_count=" << kv_count
+                         << " stream_ok=" << (f.good() ? "yes" : "no") << ")\n";
+      return false;
+    }
+
     LOG_STREAM_DEBUG() << "[GGUF]   shard " << shard_idx << ": " << tensor_count
                        << " tensors, " << kv_count << " kv pairs"
                        << " ("
                        << std::filesystem::path(shard_path).filename().string()
                        << ")\n";
 
-    // Read KV metadata — store values for architecture config extraction
+    // Read KV metadata — store values for architecture config extraction.
+    // general.alignment is captured a SECOND time, locally, right below --
+    // see that capture's own comment for why kv_uint alone (shared/never
+    // reset across shards) isn't safe to read back for this one key.
+    uint64_t shard_alignment = 32;      // GGUF spec default when absent
+    bool shard_alignment_seen = false;
     for (uint64_t i = 0; i < kv_count; ++i) {
       std::string key = read_string(f);
       uint32_t value_type;
       f.read(reinterpret_cast<char *>(&value_type), 4);
       read_kv_value(f, key, value_type);
+      // Real, confirmed bug (found 2026-09 stitching a repacked model's
+      // shards, general.alignment=4096, together with a raw/un-repacked
+      // shard from a different release that never sets this key at all):
+      // kv_uint is a GGUFFile-wide member map that persists across every
+      // shard in this loop, never reset per shard -- so once an EARLIER
+      // shard defines general.alignment, that value silently survives into
+      // a LATER shard's own data_start computation below even when the
+      // later shard's own header never mentions the key. Confirmed via a
+      // real isolated repro: the same tensor decoded 0 NaN read alone from
+      // its own file, but ~4.7% NaN once loaded after a repacked shard --
+      // traced to data_start computed with the wrong (leaked) alignment,
+      // off by exactly the 4096-vs-32 rounding difference. kv_uint[key] is
+      // still written above (read_kv_value's normal behavior, used
+      // elsewhere for real per-model KV lookups where "last shard wins" is
+      // fine, e.g. architecture hparams that ARE genuinely consistent
+      // across every shard of the SAME model) -- but reading it back
+      // immediately, right here, right after this exact call, captures
+      // ONLY what THIS shard's own KV block just said, before any later
+      // shard in the loop gets a chance to touch the same map entry.
+      if (key == "general.alignment") {
+        auto it = kv_uint.find(key);
+        if (it != kv_uint.end()) { shard_alignment = it->second; shard_alignment_seen = true; }
+      }
     }
 
     // Read tensor info
@@ -855,15 +1348,20 @@ private:
     // per-expert offsets) -- without this, this loader would compute the
     // wrong data_start for such a file (assume 32-aligned when the file
     // is actually 4096-aligned) and silently misinterpret every tensor
-    // offset as a result. Read from kv_uint first (already populated by
-    // this SAME shard's own KV loop above, and/or an earlier shard's, if
-    // general.alignment is only present once -- see tools/gguf_tool pack
-    // for why the repack tool writes it into every shard defensively
-    // rather than relying on load order).
-    auto align_it = kv_uint.find("general.alignment");
-    uint64_t alignment = (align_it != kv_uint.end() && align_it->second > 0)
-                             ? align_it->second
-                             : 32;
+    // offset as a result.
+    //
+    // Uses shard_alignment (captured locally, right above, from THIS
+    // shard's own KV block only) rather than reading kv_uint back here --
+    // NOT equivalent when a model mixes shards from different releases:
+    // kv_uint is shared across the whole multi-shard load, so if an
+    // EARLIER shard set general.alignment and this shard's own header
+    // never mentions the key, a kv_uint lookup here would silently reuse
+    // the earlier shard's value for this one's offsets. Real, confirmed
+    // bug (see the capture site's own comment for the full incident) --
+    // this per-shard local is the actual fix, not the read_kv_value call
+    // above, which still (correctly) writes into the shared map for every
+    // OTHER KV consumer that wants "last shard wins" semantics.
+    uint64_t alignment = shard_alignment_seen ? shard_alignment : 32;
     uint64_t data_start = (current_pos + alignment - 1) & ~(alignment - 1);
     for (auto &[name, t] : tensors) {
       if (t.shard_idx == shard_idx) {

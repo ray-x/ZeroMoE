@@ -1,0 +1,1 @@
+Explain the difference between a hard link and a symbolic link in Linux.

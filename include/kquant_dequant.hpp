@@ -29,6 +29,59 @@ extern "C" int ggml_dequant_row(uint32_t type, const void* src, float* out, int 
 // cold-start warm-up, async_prefetcher.hpp's speculative promotion) so none
 // of them waste PCIe bandwidth + VRAM cache slots promoting an expert whose
 // quant type can never actually run on GPU regardless of residency.
+// --- dense_bf16_prefill_gemm (EngineConfig, default OFF) -----------------
+// Route S>1 dense projections through "dequantise the weight to BF16, then
+// cuBLAS" instead of this project's own fused matmul kernels.
+//
+// WHY (measured 2026-09-04, attn_qkv's real prefill shape S=3189 I=2560
+// O=10240 on an RTX 3090): every fused kernel in cuda/ is GEMV-shaped -- one
+// output row per block, streaming the activation -- so each of the O blocks
+// re-reads the whole [S, I] activation. Correct at S=1, badly wrong at
+// prefill batch sizes:
+//     fused q8_0 kernel                  194.41 ms   ( 2.2% of peak)
+//     dequant->BF16 + cublasGemmEx         3.11 ms   (71.1 TFLOPS, ~100% of
+//                                                     the card's BF16 peak)
+// Only Q8_0 is routed for now -- which happens to be EVERY dense projection
+// in qwen4exp (attn_qkv/attn_gate/ssm_out/attn_q/k/v/output/hc_*/shexp), so
+// it covers that whole bucket. The expert types (Q4_K/Q5_K/Q5_1) are the
+// separate, larger bucket and come next.
+//
+// !! SHARED PATH !! dense_matmul_host is family-agnostic, so GLM-5.3 and
+// DeepSeek-V4 reach this too and both have Q8_0 dense tensors. DEFAULT ON as
+// of 2026-09-04, after verifying GLM-5.3 as well as qwen4exp; set
+// dense_bf16_prefill_gemm=false to restore the fused kernels unchanged.
+inline bool& dense_bf16_prefill_gemm_flag() {
+    static bool v = false;
+    return v;
+}
+inline bool dense_bf16_prefill_gemm() { return dense_bf16_prefill_gemm_flag(); }
+
+// VRAM watermark fraction (EngineConfig::vram_max_fraction, llama.cpp-style
+// 0.9). Lives HERE rather than dense_dispatch.hpp for the same reason
+// dense_bf16_prefill_gemm() does: dense_dispatch.hpp includes cuda_manager.hpp,
+// so cuda_manager.hpp cannot include it back.
+// Minimum FREE VRAM to keep on each device when growing a dynamic buffer.
+// A free-memory floor, NOT a fraction of total -- see vram_has_headroom()'s
+// comment for why the fraction form is wrong for this engine.
+inline size_t &vram_min_free_bytes_flag() { static size_t b = 256ull*1024*1024; return b; }
+inline void set_vram_min_free_mb(long mb) { vram_min_free_bytes_flag() = (size_t)mb*1024*1024; }
+inline size_t vram_min_free_bytes() { return vram_min_free_bytes_flag(); }
+
+// dense_bf16_kquant: gates the 2026-09-05 EXTENSION of the dense BF16 GEMM to
+// Q5_K/Q6_K, separately from dense_bf16_prefill_gemm's original Q8_0 path.
+// Two reasons they are separate knobs rather than one:
+//   * The Q8_0 path was verified COHERENT on GLM-5.3; the K-quant extension
+//     has only been verified on qwen4exp. A model should be able to take the
+//     proven half without the unproven half.
+//   * They have very different VRAM cost profiles. GLM's dense pool has 309
+//     Q5_K + 81 Q6_K tensors, some 201 MB once expanded to BF16, on GPUs that
+//     already sit at 23.7/24 GB -- so on that model the extension mostly gets
+//     refused by the watermark anyway, at the cost of trying.
+inline bool &dense_bf16_kquant_flag() { static bool f = false; return f; }
+inline void set_dense_bf16_kquant(bool v) { dense_bf16_kquant_flag() = v; }
+inline bool dense_bf16_kquant() { return dense_bf16_kquant_flag(); }
+inline void set_dense_bf16_prefill_gemm(bool v) { dense_bf16_prefill_gemm_flag() = v; }
+
 inline bool gpu_type_supported(GGUFType type) {
     switch (type) {
         case GGUFType::Q4_0: case GGUFType::Q2_K: case GGUFType::Q3_K:
@@ -78,9 +131,113 @@ inline bool gpu_type_supported(GGUFType type) {
         // pass — see CLAUDE.md and this change's plan file for the writeup.
         case GGUFType::MXFP4:
             return true;
-        // No GPU kernel implemented anywhere in cuda/*.cu for these: IQ3_S,
-        // IQ4_NL, TQ1_0, TQ2_0, IQ2_M. See gpu_unsupported_reason() for why
-        // each specific one isn't supported yet.
+        // IQ1_S: cuda/iq1_dequant.cu's launch_iq1s_matmul, a verbatim port
+        // of ggml's dequantize_row_iq1_s (real 2048-entry ternary grid
+        // codebook + per-32-weight-group scale/delta, NOT the flat
+        // sign-bit decode the file's pre-existing "iq1_matmul_kernel_
+        // optimized" turned out to implement -- found wrong this session
+        // while wiring this up for real, see that kernel's own updated
+        // comment). Correctness verified via src/main_test.cpp's Test 5
+        // against ggml's own exact dequant+dot reference (same path Q6_K/
+        // Q8_0 use, not the lossy cpu_quant_matmul fast path -- IQ1_S has
+        // no CPU AVX-512 fast-path kernel of its own, so there's no
+        // "production fast path vs test reference" ambiguity to resolve
+        // here the way that comment block had to for Q6_K/Q8_0).
+        // Motivation: GLM-5.3's real Unsloth "UD-IQ1_S" release keeps
+        // gate/up at IQ1_S for a real subset of MoE layers (confirmed
+        // 2026-09 against a real downloaded shard: 12 layers on this
+        // checkpoint) while leaving down at IQ3_XXS (already supported
+        // above) and dense/output-adjacent layers at IQ2_XXS -- without
+        // this case, EVERY expert in an IQ1_S layer would fall back to the
+        // CPU AVX-512 path entirely (the gpu_type_supported() check below
+        // is a per-expert AND across gate/up/down, so one unsupported
+        // tensor forces the whole expert off GPU), at roughly the ~9-10x
+        // per-call CPU-vs-GPU tax this project has already measured
+        // elsewhere (see CLAUDE.md's cpu_offload_max_experts investigation)
+        // -- which would swamp any disk/PCIe savings the smaller IQ1_S
+        // tensors themselves provide. IQ1_M/TQ1_0 remain unsupported (see
+        // gpu_unsupported_reason() below) -- not verified or fixed this
+        // session, do not assume this case's correctness work covers them.
+        case GGUFType::IQ1_S:
+            return true;
+        // IQ3_S: cuda/iq3_matmul.cu's launch_iq3s_matmul, a verbatim port of
+        // ggml's dequantize_row_iq3_s (real 512-entry grid codebook + qh
+        // 9th-bit extension + per-32-weight nibble scale -- same grid family
+        // as IQ2_XXS/XS/S and IQ3_XXS above, just with the extra qh byte and
+        // a different scale encoding). Correctness verified via
+        // src/main_test.cpp's Test 5, comparing against cpu_quant_matmul's
+        // own exact dequant+dot path (IQ3_S has no lossy AVX-512 fast-path
+        // kernel of its own, so unlike Q6_K/Q8_0 there's no "production fast
+        // path vs test reference" ambiguity to resolve here). Motivation:
+        // real Unsloth Dynamic-quant "UD-IQ3_XXS"-labeled GLM-5.3 files keep
+        // gate/up at IQ2_S and down at IQ3_S for the large majority of MoE
+        // layers (confirmed 2026-09 against a real downloaded 7-shard file:
+        // uniform IQ2_S/IQ3_S except the same handful of special layers this
+        // checkpoint's own IQ2_M/IQ1_S files also elevate) -- without this
+        // case, every expert using that source's down_proj would fall back
+        // to CPU AVX-512 entirely.
+        case GGUFType::IQ3_S:
+            return true;
+        // IQ1_M: cuda/iq1_dequant.cu's launch_iq1m_matmul, a verbatim port
+        // of ggml's dequantize_row_iq1_m -- reuses IQ1_S's own 2048-entry
+        // c_iq1s_grid table (same ternary grid, different per-block
+        // scale/index packing: block_iq1_m is qs[32]+qh[16]+scales[8], no
+        // standalone `d` half -- the super-block scale is packed into
+        // scales[]'s own top nibbles). Added 2026-09 alongside the IQ1_S
+        // fix, once IQ1_S's own investigation found the OLD "iq1_matmul_
+        // kernel_optimized" this project already had was ALSO meant to
+        // cover IQ1_M and was ALSO wrong (see that kernel's own comment) --
+        // that dead kernel was never wired to gpu_type_supported() for
+        // either type, so this was never a live correctness bug, just an
+        // unimplemented one. Correctness verified via src/main_test.cpp's
+        // Test 5 against ggml's own exact dequant+dot reference (same
+        // ggml_dequant_row path IQ1_S/Q6_K/Q8_0 use -- IQ1_M has no lossy
+        // CPU AVX-512 fast-path of its own either). NOT present in the
+        // real GLM-5.3 checkpoint this project currently tests against
+        // (confirmed via a direct header parse of every downloaded
+        // shard: 0 IQ1_M tensors) -- unlike IQ1_S, this has NOT been
+        // confirmed via a real production run with real IQ1_M weights,
+        // only Test 5's synthetic data. Treat with the same caution as
+        // any Test-5-only-verified type until real data exists to check
+        // against.
+        case GGUFType::IQ1_M:
+            return true;
+        // Q8_0: cuda/q8_0_matmul.cu's launch_q8_0_matmul -- long-standing,
+        // real, and already load-bearing for the DENSE path
+        // (cuda_manager.hpp's dense_matmul_host switch), plus covered by
+        // src/main_test.cpp's Test 5 at attn_q_b's real production shape
+        // (I=2048, O=16384, S=1) against an exact f32 reference. It was
+        // simply never advertised here, so no ROUTED EXPERT could use it.
+        // Added 2026-09-04 during qwen4exp (Qwen3.8-Flash-Next) bring-up:
+        // that checkpoint's ffn_down_exps is Q8_0 on 5 of 48 MoE layers, and
+        // because this predicate is an AND over gate/up/down, that single
+        // tensor was pinning those layers' entire expert compute to CPU.
+        // Q5_1 (the other 43 layers) genuinely has no kernel and stays
+        // unsupported -- see gpu_unsupported_reason().
+        case GGUFType::Q8_0:
+            return true;
+        // Q5_1: cuda/q5_1_matmul.cu's launch_q5_1_matmul, a direct port of
+        // ggml's dequantize_row_q5_1 (per-32 scale d + minimum m over 4-bit
+        // nibbles, with each weight's 5th bit packed into a 32-bit qh).
+        // Written 2026-09-04 specifically because qwen4exp
+        // (Qwen3.8-Flash-Next) stores ffn_down_exps as Q5_1 on 43 of 48 MoE
+        // layers, which -- this predicate being an AND over gate/up/down --
+        // pinned ~90% of that model's routed-expert compute to CPU.
+        // Verified via src/main_test.cpp's Test 5 against an exact f32
+        // reference at the real production shape, plus a real generation run.
+        case GGUFType::Q5_1:
+            return true;
+        case GGUFType::IQ4_NL:
+            // 2026-09-04: cuda/iq4xs_matmul.cu's launch_iq4_nl_matmul. Shares
+            // IQ4_XS's 16-entry codebook; simpler block (one fp16 scale per 32,
+            // no sub-scales). Unblocks Qwen3.8-Flash-Next UD-IQ1_M, whose down
+            // projection is IQ4_NL on all 48 MoE layers -- that single gap made
+            // every layer CPU-bound.
+            return true;
+        // No GPU kernel implemented anywhere in cuda/*.cu for these:
+        // TQ1_0, TQ2_0, IQ2_M. (IQ4_NL gained one 2026-09-04.) See
+        // gpu_unsupported_reason()
+        // for why each specific one isn't supported yet.
         default: return false;
     }
 }
@@ -137,6 +294,12 @@ inline double gpu_type_bits_per_weight(GGUFType type) {
         case GGUFType::Q8_0:    return 8.5;
         case GGUFType::Q6_K:    return 6.5625;
         case GGUFType::Q5_K: case GGUFType::Q5_0: return 5.5;
+        // Q4_1/Q5_1 were missing here too, so the [QUANT] startup census
+        // printed "down=Q5_1 (0 bits/weight)" for a real model -- the
+        // `default: return 0.0` branch, not a real measurement. 20 and 24
+        // bytes per 32-element block (see row_bytes above) -> 5.0 and 6.0.
+        case GGUFType::Q4_1:    return 5.0;
+        case GGUFType::Q5_1:    return 6.0;
         case GGUFType::Q4_K: case GGUFType::Q4_0: return 4.5;
         case GGUFType::IQ4_NL:  return 4.5;
         case GGUFType::IQ4_XS:  return 4.25;
@@ -162,12 +325,11 @@ inline double gpu_type_bits_per_weight(GGUFType type) {
 // (cuda/iq2_matmul.cu), so sub-byte packing alone isn't the blocker. Two
 // genuinely different reasons hide behind "IQ-series", verified against
 // ggml's actual dequant source (ggml/src/ggml-quants.c) rather than assumed:
-//   - IQ3_S (IQ3_XXS was in this category too, until cuda/iq2_matmul.cu's
-//     launch_iq3_xxs_matmul was added): each block picks a combination from
-//     a LARGE variable grid table (256-1024 entries, ggml-common.h's
-//     iq3xxs_grid/iq3s_grid) plus separate sign bits to reconstruct values —
-//     genuinely the same family/difficulty as the already-supported
-//     IQ2_XXS/XS/S grids (and now IQ3_XXS).
+//   - The IQ2_XXS/XS/S, IQ3_XXS, and IQ3_S family: each block picks a
+//     combination from a LARGE variable grid table (256-1024 entries,
+//     ggml-common.h's iq2xxs_grid/iq2xs_grid/iq2s_grid/iq3xxs_grid/
+//     iq3s_grid) plus separate sign bits to reconstruct values — all five
+//     now have a fused kernel (cuda/iq2_matmul.cu, cuda/iq3_matmul.cu).
 //   - IQ4_NL/IQ4_XS: dequantize_row_iq4_nl/_xs BOTH just index a single
 //     FIXED 16-entry table (kvalues_iq4nl, identical for every block) times
 //     a per-block linear scale — structurally close to the ALREADY-SUPPORTED
@@ -179,13 +341,9 @@ inline double gpu_type_bits_per_weight(GGUFType type) {
 inline const char* gpu_unsupported_reason(GGUFType type) {
     if (gpu_type_supported(type)) return "supported";
     switch (type) {
-        case GGUFType::IQ3_S:
-            return "non-linear codebook/grid quantization (same family as the "
-                   "already-supported IQ2_XXS/XS/S and IQ3_XXS: a large "
-                   "256-1024 entry variable grid + sign bits per block) -- no "
-                   "fused CUDA kernel written for THIS specific format yet. "
-                   "Not a fundamental bit-width limit; it's unimplemented, "
-                   "not unimplementable.";
+        // IQ3_S moved to gpu_type_supported()'s TRUE case above (real
+        // grid-codebook kernel added 2026-09, see that case's own comment)
+        // -- unreachable here now.
         // IQ4_XS moved to gpu_type_supported()'s TRUE case above (re-
         // enabled) -- this reason string only applies to IQ4_NL now, since
         // gpu_unsupported_reason() already returns early with "supported"
@@ -196,13 +354,41 @@ inline const char* gpu_unsupported_reason(GGUFType type) {
                    "Q4_K/Q5_K/Q6_K/IQ4_XS kernels. No fused CUDA kernel written "
                    "yet for THIS specific block layout (IQ4_NL's is smaller, "
                    "32 elements/block vs IQ4_XS's 256).";
-        case GGUFType::IQ1_S: case GGUFType::IQ1_M: case GGUFType::TQ1_0:
-            return "1-2 bit ternary/codebook format -- CUDA kernels for these "
-                   "actually EXIST (cuda/iq1_dequant.cu: launch_iq1s_matmul / "
-                   "launch_iq1m_matmul / launch_tq1_matmul) but are not wired "
-                   "into the dispatch table yet -- pure plumbing gap.";
+        // IQ1_S and IQ1_M both moved to gpu_type_supported()'s TRUE case
+        // above (real grid-codebook kernels, 2026-09) -- unreachable here
+        // now. This reason string covers ONLY TQ1_0.
+        case GGUFType::TQ1_0:
+            return "1-bit ternary format -- cuda/iq1_dequant.cu has a "
+                   "kernel shaped for this (tq1_matmul_kernel_optimized, "
+                   "branchless trit decode, no grid table needed for a "
+                   "true per-weight ternary format -- structurally closer "
+                   "to correct than the OLD IQ1_S/IQ1_M kernel this file "
+                   "also had, which was found genuinely wrong). Still not "
+                   "independently re-verified against dequantize_row_"
+                   "tq1_0 (ggml-quants.c) -- do not assume correct just "
+                   "because it wasn't flagged wrong; it simply hasn't "
+                   "been checked. Not wired into the dispatch table; "
+                   "needs the same Test-5-style verification IQ1_S/IQ1_M "
+                   "got before that's safe.";
         case GGUFType::TQ2_0:
             return "ternary quantization -- no fused CUDA kernel implemented.";
+        // Q4_1/Q5_0: the two remaining legacy non-K linear quants. Their
+        // sibling Q5_1 IS supported now (cuda/q5_1_matmul.cu, 2026-09-04),
+        // and these two are structurally the same shape -- a per-32-element
+        // scale, plus a minimum for Q4_1 and a packed 5th bit for Q5_0, over
+        // 4-bit nibbles. So this is no longer "hard", it is just unwritten:
+        // q5_1_matmul.cu is close to a template for either (Q4_1 = drop the
+        // qh handling, Q5_0 = drop m and re-center the nibble at -16). Left
+        // undone deliberately rather than speculatively, since no checkpoint
+        // this engine has been pointed at actually uses them for experts --
+        // and ggml_dequant_row (src/ggml_dequant.cpp) has no Q4_1 case
+        // either, so Q4_1 would need a CPU path too, not just a kernel.
+        case GGUFType::Q4_1:
+        case GGUFType::Q5_0:
+            return "legacy linear quant (per-32 scale [+ min] over 4-bit "
+                   "nibbles, plus a packed 5th bit for Q5_x) -- structurally "
+                   "simpler than the supported Q4_0/K-quant kernels, just no "
+                   "fused CUDA kernel written for it yet.";
         case GGUFType::IQ2_M:
             return "codebook quantization -- no ggml CPU dequant export exists "
                    "either (see kquant_dequant.hpp's dequant_row), so this type "
@@ -276,6 +462,29 @@ inline int row_bytes(GGUFType type, int I) {
         case GGUFType::BF16:     return I * 2;
         case GGUFType::Q4_0:     return (I / 32)  * 18;
         case GGUFType::Q5_0:     return (I / 32)  * 22;
+        // Q4_1/Q5_1: the SAME table-hole that already bit this project twice
+        // (IQ3_XXS/IQ3_S/IQ4_XS, then MXFP4/NVFP4 -- see both comment blocks
+        // below), hit a third time. Found 2026-09-04 by a real SIGSEGV during
+        // qwen4exp (Qwen3.8-Flash-Next) prefill: that checkpoint stores
+        // ffn_down_exps as Q5_1 on 43 of 48 MoE layers, `default:` returned a
+        // stride of I instead of (I/32)*24, and cpu_quant_matmul walked
+        // `W + o*rb` off the end of the buffer until dequantize_row_q5_1
+        // dereferenced unmapped memory (confirmed from the coredump:
+        // dequantize_row_q5_1 <- ggml_dequant_row <- cpu_quant_matmul).
+        // Sizes taken from ggml's own static_asserts (ggml-common.h), not
+        // re-derived: block_q4_1 = 2*ggml_half + QK4_1/2 = 20, block_q5_1 =
+        // 2*ggml_half + uint32_t + QK5_1/2 = 24, both over 32 elements. They
+        // agree with gguf_loader.hpp's calculate_size(), which is an
+        // INDEPENDENT table that already had both (which is exactly why the
+        // model loaded with correct tensor sizes and only crashed later, in
+        // compute -- the same split-brain signature as the MXFP4 case).
+        // NOTE: only Q5_1 is end-to-end usable today -- ggml_dequant_row
+        // (src/ggml_dequant.cpp) dispatches Q5_1 (case 7) but has no Q4_1
+        // (case 3) case, so Q4_1 here just replaces a guaranteed-wrong
+        // stride with the right one; it still needs a dequant case before a
+        // real Q4_1 weight could compute.
+        case GGUFType::Q4_1:     return (I / 32)  * 20;
+        case GGUFType::Q5_1:     return (I / 32)  * 24;
         case GGUFType::Q8_0:     return (I / 32)  * 34;
         case GGUFType::Q2_K:     return (I / 256) * 84;
         case GGUFType::Q3_K:     return (I / 256) * 110;
@@ -398,6 +607,30 @@ inline bool dequant_v_b_row(const QuantizedTensor& t, int row, float* out) {
     return dequant_row(t.meta.type, t.host_ptr + (int64_t)row * rb, out, I);
 }
 
+// cpu_dot_ggml_avx2 (config): switches the CPU-fallback dot product for
+// IQ2_XXS/IQ3_XXS (GLM-5.2's actual routed-expert types, 71-76/78 layers,
+// dispatched from cpu_quant_matmul below) from the existing FMA path
+// (dot_iq2/3_xxs_f32_avx512, F32 dequant + FMA against F32 activations) to
+// a ported upstream llama.cpp/ggml AVX2 kernel (matmul_iq2/3_xxs_ggml_
+// avx2, register-resident int8 dot via _mm256_maddubs_epi16+madd_epi16
+// against Q8_K-quantized activations). Real isolated microbenchmark showed
+// ~1.7-1.9x faster per-call on this hardware (see CLAUDE.md's "CPU-offload
+// feasibility" entries for the full investigation) -- but ALSO a real,
+// not-yet-resolved accuracy caveat for IQ3_XXS specifically (20-row
+// worst-case 1.73% relative error, above this project's own ~1% tolerance
+// convention used elsewhere). This flag exists to A/B the REAL end-to-end
+// effect on decode throughput before deciding whether that tradeoff is
+// worth it -- default off, NOT yet a recommended production setting.
+// Same function-local-static-storage pattern as cpu_only_flag() (dense_
+// dispatch.hpp) -- defined HERE (not there) because dense_dispatch.hpp
+// already #includes this file, and the reverse would be circular.
+inline bool& cpu_dot_ggml_avx2_flag() {
+    static bool v = false;
+    return v;
+}
+inline bool cpu_dot_ggml_avx2_enabled() { return cpu_dot_ggml_avx2_flag(); }
+inline void enable_cpu_dot_ggml_avx2() { cpu_dot_ggml_avx2_flag() = true; }
+
 // CPU reference quantized matmul: y[S,O] = x[S,I] @ W^T, W packed [O,I].
 // Dequantizes each weight row on the fly and dots. Correct for every type
 // dequant_row handles; rows of unsupported types are zeroed (returns false).
@@ -414,7 +647,10 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
     
     if (type == GGUFType::IQ2_XXS) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        matmul_iq2_xxs_fused(y, x, W, S, I, O);
+        // cpu_dot_ggml_avx2: see this flag's own comment above for the
+        // real speedup/accuracy tradeoff this switches between.
+        if (cpu_dot_ggml_avx2_enabled()) matmul_iq2_xxs_ggml_avx2(y, x, W, S, I, O);
+        else matmul_iq2_xxs_fused(y, x, W, S, I, O);
         auto t1 = std::chrono::high_resolution_clock::now();
         PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
         return true;
@@ -422,7 +658,8 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
 
     if (type == GGUFType::IQ3_XXS) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        matmul_iq3_xxs_fused(y, x, W, S, I, O);
+        if (cpu_dot_ggml_avx2_enabled()) matmul_iq3_xxs_ggml_avx2(y, x, W, S, I, O);
+        else matmul_iq3_xxs_fused(y, x, W, S, I, O);
         auto t1 = std::chrono::high_resolution_clock::now();
         PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
         return true;

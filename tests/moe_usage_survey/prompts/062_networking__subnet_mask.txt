@@ -1,0 +1,1 @@
+Explain what a subnet mask does and how to calculate the number of usable hosts in a /26 network.

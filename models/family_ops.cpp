@@ -10,9 +10,11 @@
 // (CMakeLists.txt).
 #include "family_ops.hpp"
 #include "engine.hpp"
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
+#include <limits>
 
 // Real attention functions (attention_layer.cpp). No shared header declares
 // these today -- execution_layer.cpp itself reaches them the same way, via
@@ -43,6 +45,32 @@ extern void hc_pre_collapse(StreamingEngine &engine, int layer_idx,
 extern void hc_post_combine(StreamingEngine &engine, int layer_idx,
                              int sub_block, float *hidden_states,
                              const float *sub_block_out, int S, int D);
+// GLM5Next (GLM 5.3 Flash, attention_layer.cpp) -- hybrid per-layer dispatch
+// (recurrent KDA vs absorbed-MLA DSA), same signature discipline as above.
+extern void glm5next_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                     const float *hidden_states, int S,
+                                     int pos_base, float *out_context);
+// Qwen4Exp (Qwen3.8-Flash-Next, attention_layer.cpp) -- hybrid per-layer
+// dispatch (recurrent GDN vs dense full attention), same signature.
+extern void qwen4exp_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                     const float *hidden_states, int S,
+                                     int pos_base, float *out_context);
+// Qwen4Exp's low-rank hyper-connection bracket hooks (hyper_connections.cpp)
+// -- a DIFFERENT HC variant from DeepSeek-V4's Sinkhorn form (norm/down/up/
+// inject tensors, gated mean-collapse, no comb matrix).
+extern void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
+                                  int sub_block, float *hidden_states, int S,
+                                  int D);
+extern void qwen4exp_hc_post_combine(StreamingEngine &engine, int layer_idx,
+                                      int sub_block, float *hidden_states,
+                                      const float *sub_block_out, int S,
+                                      int D);
+// Qwen4Exp's PLE n-gram hash embedding (ple_ngram.cpp) -- optional per-layer
+// input hook (FamilyOps::layer_input_fn), runs before hc_pre_fn at PLE
+// layers.
+extern void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx,
+                                      int S, int pos_base,
+                                      const int *token_ids);
 
 // ---------------------------------------------------------------------
 // Shared hyper-connection hooks (hc_mult == 1 degenerate case)
@@ -78,6 +106,28 @@ void hc_post_plain_add(StreamingEngine & /*engine*/, int /*layer_idx*/,
 // resolve_family_ops's table entries can point at them).
 // ---------------------------------------------------------------------
 
+static bool alloc_zeroed_host(StreamingEngine &engine, float **out,
+                              size_t bytes, const char *what) {
+  *out = nullptr;
+  if (bytes == 0) return true;
+  if (!engine.reserve_host_memory(bytes)) {
+    LOG_ERROR("[MEM-GUARD] host cache allocation refused: %s (%.2f MB)\n",
+              what, bytes / 1e6);
+    return false;
+  }
+  void *p = nullptr;
+  const int err = posix_memalign(&p, 4096, bytes);
+  if (err != 0 || !p) {
+    engine.release_host_memory(bytes);
+    LOG_ERROR("[CACHE] posix_memalign failed for %s (%.2f MB, errno=%d)\n",
+              what, bytes / 1e6, err);
+    return false;
+  }
+  *out = static_cast<float *>(p);
+  std::memset(*out, 0, bytes);
+  return true;
+}
+
 static void alloc_mla_absorbed_cache(StreamingEngine &engine,
                                       const ArchitectureConfig &c,
                                       int max_ctx) {
@@ -87,12 +137,18 @@ static void alloc_mla_absorbed_cache(StreamingEngine &engine,
   engine.d_Rc.resize(c.n_layers + 1, nullptr);
   size_t total_kv_bytes = 0;
   for (int i = 0; i <= c.n_layers; ++i) {
-    size_t lc_bytes = (size_t)max_ctx * c.kv_lora * sizeof(float);
-    size_t rc_bytes = (size_t)max_ctx * c.qk_rope * sizeof(float);
-    posix_memalign((void **)&engine.Lc[i], 4096, lc_bytes);
-    posix_memalign((void **)&engine.Rc[i], 4096, rc_bytes);
-    std::memset(engine.Lc[i], 0, lc_bytes);
-    std::memset(engine.Rc[i], 0, rc_bytes);
+    // max(1, ...) on the ELEMENT count: GLM5Next is nope-only (qk_rope == 0),
+    // which would otherwise make rc_bytes 0 -- posix_memalign(0) may return
+    // NULL, and the live MLA path then forms `Rc[i] + pos * 0` and memcpys 0
+    // bytes from it (technically UB on a null base, universally harmless in
+    // practice). One float removes the question entirely for every family.
+    size_t lc_elems = (size_t)max_ctx * c.kv_lora;
+    size_t rc_elems = std::max<size_t>((size_t)max_ctx * c.qk_rope, 1);
+    size_t lc_bytes = lc_elems * sizeof(float);
+    size_t rc_bytes = rc_elems * sizeof(float);
+    if (!alloc_zeroed_host(engine, &engine.Lc[i], lc_bytes, "MLA latent KV") ||
+        !alloc_zeroed_host(engine, &engine.Rc[i], rc_bytes, "MLA rope KV"))
+      return;
     total_kv_bytes += lc_bytes + rc_bytes;
   }
   // NOTE: this used to also mirror the latent/rope KV cache into VRAM here
@@ -119,10 +175,9 @@ static void alloc_dense_kv_cache(StreamingEngine &engine,
   engine.Vc.resize(c.n_layers, nullptr);
   size_t kv_bytes = (size_t)max_ctx * kvd * sizeof(float);
   for (int i = 0; i < c.n_layers; ++i) {
-    posix_memalign((void **)&engine.Kc[i], 4096, kv_bytes);
-    posix_memalign((void **)&engine.Vc[i], 4096, kv_bytes);
-    std::memset(engine.Kc[i], 0, kv_bytes);
-    std::memset(engine.Vc[i], 0, kv_bytes);
+    if (!alloc_zeroed_host(engine, &engine.Kc[i], kv_bytes, "dense K cache") ||
+        !alloc_zeroed_host(engine, &engine.Vc[i], kv_bytes, "dense V cache"))
+      return;
   }
   size_t total_kv_bytes = 2 * kv_bytes * c.n_layers;
   LOG_STREAM_INFO() << "[GRAPH] Dense KV cache: " << total_kv_bytes / 1e9
@@ -132,16 +187,9 @@ static void alloc_dense_kv_cache(StreamingEngine &engine,
 
 static void alloc_dsv4_swa_cache(StreamingEngine &engine,
                                   const ArchitectureConfig &c, int max_ctx) {
-  // DeepSeek-V4 raw/SWA MLA cache (engine.hpp's KVc): one per-head-sized
-  // latent per layer, sized by sliding_window NOT max_ctx -- the whole
-  // point of SWA is bounding per-layer KV memory by the window, not the
-  // full context length. Falls back to max_ctx if the file didn't set a
-  // sliding_window (shouldn't happen for a real DeepSeek-V4 checkpoint,
-  // but a 0-or-negative window would make every ring-index modulo either
-  // divide-by-zero or degenerate to 1 slot -- clamping to max_ctx here
-  // means a missing sliding_window fails safe into "acts like the full,
-  // unbounded absorbed-MLA cache" rather than corrupting every attention
-  // read/write with a bad modulus).
+  // Every V4 layer retains a raw sliding-window cache. CSA/HCA layers add
+  // their own K-only compressed cache below; the raw cache remains the local
+  // attention source and is intentionally not replaced.
   int window = c.sliding_window > 0 ? c.sliding_window : max_ctx;
   engine.sliding_window = window;
   engine.KVc.resize(c.n_layers, nullptr);
@@ -158,13 +206,207 @@ static void alloc_dsv4_swa_cache(StreamingEngine &engine,
   int qh = c.qk_nope + c.qk_rope;
   size_t kv_bytes = (size_t)window * qh * sizeof(float);
   for (int i = 0; i < c.n_layers; ++i) {
-    posix_memalign((void **)&engine.KVc[i], 4096, kv_bytes);
-    std::memset(engine.KVc[i], 0, kv_bytes);
+    if (!alloc_zeroed_host(engine, &engine.KVc[i], kv_bytes, "DeepSeek-V4 SWA KV"))
+      return;
   }
   size_t total_kv_bytes = kv_bytes * c.n_layers;
   LOG_STREAM_INFO() << "[GRAPH] DeepSeek-V4 SWA KV cache: "
                      << total_kv_bytes / 1e9 << " GB (window=" << window
                      << " tokens/layer, " << c.n_layers << " layers)\n";
+
+  engine.dsv4_compressed.clear();
+  engine.dsv4_compressed.resize(c.n_layers);
+  size_t compressed_bytes = 0;
+  int csa_layers = 0, hca_layers = 0;
+  const auto compressed_size = [&](int ratio, int indexer_dim) -> size_t {
+    const size_t capacity = (size_t)dsv4_compressed_cache_capacity(max_ctx, ratio);
+    const size_t state_size = (size_t)(ratio == kDsv4CsaRatio ? 2 * ratio : ratio);
+    const size_t state_width = (size_t)(ratio == kDsv4CsaRatio ? 2 * qh : qh);
+    size_t elems = capacity * (size_t)qh +
+                   2 * state_size * state_width;
+    if (ratio == kDsv4CsaRatio)
+      elems += capacity * (size_t)indexer_dim +
+               2 * state_size * (size_t)indexer_dim;
+    return elems * sizeof(float);
+  };
+  for (int l = 0; l < c.n_layers; ++l) {
+    const int ratio = c.dsv4_compress_ratios.empty()
+        ? 0 : static_cast<int>(c.dsv4_compress_ratios[(size_t)l]);
+    if (ratio != 0)
+      compressed_bytes += compressed_size(
+          ratio, ratio == kDsv4CsaRatio ? c.dsv4_indexer_key_length : 0);
+  }
+  if (compressed_bytes && !engine.reserve_host_memory(compressed_bytes)) {
+    LOG_ERROR("[MEM-GUARD] DeepSeek-V4 compressed state refused: %.2f MB\n",
+              compressed_bytes / 1e6);
+    return;
+  }
+  for (int l = 0; l < c.n_layers; ++l) {
+    const int ratio = c.dsv4_compress_ratios.empty()
+        ? 0 : static_cast<int>(c.dsv4_compress_ratios[(size_t)l]);
+    if (ratio == 0) continue;
+    Dsv4CompressedLayerState &state = engine.dsv4_compressed[(size_t)l];
+    state.configure(ratio, qh, max_ctx,
+                    ratio == kDsv4CsaRatio ? c.dsv4_indexer_key_length : 0);
+    if (ratio == kDsv4CsaRatio) ++csa_layers;
+    if (ratio == kDsv4HcaRatio) ++hca_layers;
+  }
+  if (csa_layers + hca_layers > 0) {
+    LOG_STREAM_INFO() << "[GRAPH] DeepSeek-V4 compressed KV state: "
+                      << compressed_bytes / 1e9 << " GB (" << csa_layers
+                      << " CSA layer(s), " << hca_layers << " HCA layer(s), "
+                      << "single contiguous sequence)\n";
+  }
+}
+
+// GLM5Next (GLM 5.3 Flash): DSA layers reuse the absorbed-MLA latent cache
+// (Lc/Rc -- allocated for every layer; KDA layers simply never touch theirs,
+// cheaper than a sparse layer-indexed map), and KDA layers additionally get
+// their recurrent state (conv history + gated-delta-rule state, engine.hpp's
+// glm5next_conv_history/glm5next_recur_state).
+static void alloc_glm5next_cache(StreamingEngine &engine,
+                                  const ArchitectureConfig &c, int max_ctx) {
+  alloc_mla_absorbed_cache(engine, c, max_ctx);
+
+  const int H = c.n_heads;
+  const int hd = c.kda_head_dim;
+  const int d_inner = H * hd;
+  const int hist = c.ssm_conv_kernel - 1;
+  engine.glm5next_conv_history.resize(c.n_layers);
+  engine.glm5next_recur_state.resize(c.n_layers);
+  size_t total_bytes = 0;
+  int n_kda = 0;
+  for (int l = 0; l < c.n_layers; ++l) {
+    if (!glm5next_is_kda_layer(c, l)) continue;
+    ++n_kda;
+    total_bytes += ((size_t)3 * d_inner * hist + (size_t)H * hd * hd) * sizeof(float);
+  }
+  if (total_bytes && !engine.reserve_host_memory(total_bytes)) {
+    LOG_ERROR("[MEM-GUARD] GLM5Next recurrent state refused: %.2f MB\n",
+              total_bytes / 1e6);
+    return;
+  }
+  for (int l = 0; l < c.n_layers; ++l) {
+    if (!glm5next_is_kda_layer(c, l)) continue;
+    engine.glm5next_conv_history[l].assign((size_t)3 * d_inner * hist, 0.0f);
+    engine.glm5next_recur_state[l].assign((size_t)H * hd * hd, 0.0f);
+  }
+  LOG_STREAM_INFO() << "[GRAPH] GLM5Next KDA recurrent state: "
+                    << total_bytes / 1e9 << " GB across " << n_kda
+                    << " KDA layer(s) (conv history " << 3 * d_inner << "x" << hist
+                    << " + state " << H << "x" << hd << "x" << hd << " per layer)\n";
+}
+
+// Qwen4Exp (Qwen3.8-Flash-Next): full-attention layers use the dense KV
+// cache (Kc/Vc -- allocated for every layer; GDN layers simply never touch
+// theirs, same "cheaper than a sparse layer-indexed map" tradeoff as
+// GLM5Next's Lc/Rc above), and GDN layers additionally get their recurrent
+// state (conv history + gated-delta-rule state, engine.hpp's
+// qwen4exp_conv_history/qwen4exp_recur_state). PLE layers get their dilated
+// conv history + the n-gram token window.
+static void alloc_qwen4exp_cache(StreamingEngine &engine,
+                                   const ArchitectureConfig &c, int max_ctx) {
+  alloc_dense_kv_cache(engine, c, max_ctx);
+
+  const int n_v_heads = c.ssm_time_step_rank;
+  const int hd = c.ssm_state_size;
+  const int conv_dim =
+      2 * c.ssm_group_count * hd + c.ssm_inner_size; // q|k|v channels
+  const int hist = c.ssm_conv_kernel - 1;
+  engine.qwen4exp_conv_history.resize(c.n_layers);
+  engine.qwen4exp_recur_state.resize(c.n_layers);
+  size_t total_bytes = 0;
+  int n_gdn = 0;
+  const auto add_checked = [](size_t &total, size_t bytes) -> bool {
+    if (bytes > std::numeric_limits<size_t>::max() - total) return false;
+    total += bytes;
+    return true;
+  };
+  for (int l = 0; l < c.n_layers; ++l) {
+    if (!qwen4exp_is_gdn_layer(c, l)) continue;
+    ++n_gdn;
+    const size_t elems = (size_t)conv_dim * (size_t)hist +
+                         (size_t)n_v_heads * (size_t)hd * (size_t)hd;
+    if (elems > std::numeric_limits<size_t>::max() / sizeof(float) ||
+        !add_checked(total_bytes, elems * sizeof(float))) {
+      LOG_ERROR("[MEM-GUARD] Qwen4Exp recurrent-state size overflow\n");
+      engine.host_memory_allocation_failed = true;
+      return;
+    }
+  }
+  engine.qwen4exp_ple_conv_history.resize(c.n_layers);
+  size_t ple_bytes = 0;
+  for (int64_t l64 : c.ple_layers) {
+    const int l = (int)l64;
+    if (l < 0 || l >= c.n_layers) {
+      LOG_ERROR("[MEM-GUARD] Qwen4Exp PLE layer index out of range: %d\n", l);
+      engine.host_memory_allocation_failed = true;
+      return;
+    }
+    const size_t ple_hist = (size_t)std::max(0, c.ple_conv_kernel - 1) *
+                            (size_t)std::max(0, c.ple_ngram_size);
+    const size_t hc_dim = (size_t)std::max(0, c.hc_mult) *
+                          (size_t)std::max(0, c.hidden);
+    if (ple_hist != 0 &&
+        hc_dim > std::numeric_limits<size_t>::max() / ple_hist) {
+      LOG_ERROR("[MEM-GUARD] Qwen4Exp PLE-state size overflow\n");
+      engine.host_memory_allocation_failed = true;
+      return;
+    }
+    const size_t elems = hc_dim * ple_hist;
+    if (elems > std::numeric_limits<size_t>::max() / sizeof(float) ||
+        !add_checked(ple_bytes, elems * sizeof(float))) {
+      LOG_ERROR("[MEM-GUARD] Qwen4Exp PLE-state size overflow\n");
+      engine.host_memory_allocation_failed = true;
+      return;
+    }
+  }
+  const size_t ple_tok_count =
+      (size_t)std::max(0, c.ple_ngram_size - 1);
+  if (ple_tok_count > std::numeric_limits<size_t>::max() / sizeof(int32_t) ||
+      !add_checked(ple_bytes, ple_tok_count * sizeof(int32_t))) {
+    LOG_ERROR("[MEM-GUARD] Qwen4Exp PLE token-history size overflow\n");
+    engine.host_memory_allocation_failed = true;
+    return;
+  }
+  if (ple_bytes > std::numeric_limits<size_t>::max() - total_bytes) {
+    LOG_ERROR("[MEM-GUARD] Qwen4Exp host-state size overflow\n");
+    engine.host_memory_allocation_failed = true;
+    return;
+  }
+  const size_t host_state_bytes = total_bytes + ple_bytes;
+  if (host_state_bytes && !engine.reserve_host_memory(host_state_bytes)) {
+    LOG_ERROR("[MEM-GUARD] Qwen4Exp recurrent state refused: %.2f MB\n",
+              (double)host_state_bytes / 1e6);
+    return;
+  }
+  for (int l = 0; l < c.n_layers; ++l) {
+    if (!qwen4exp_is_gdn_layer(c, l)) continue;
+    engine.qwen4exp_conv_history[l].assign((size_t)conv_dim * hist, 0.0f);
+    engine.qwen4exp_recur_state[l].assign((size_t)n_v_heads * hd * hd, 0.0f);
+  }
+  LOG_STREAM_INFO() << "[GRAPH] Qwen4Exp GDN recurrent state: "
+                    << total_bytes / 1e9 << " GB across " << n_gdn
+                    << " GDN layer(s) (conv history " << conv_dim << "x" << hist
+                    << " + state " << n_v_heads << "x" << hd << "x" << hd
+                    << " per layer)\n";
+
+  for (int64_t l64 : c.ple_layers) {
+    const int l = (int)l64;
+    const size_t ple_hist =
+        (size_t)(c.ple_conv_kernel - 1) * (size_t)c.ple_ngram_size;
+    const size_t hc_dim = (size_t)c.hc_mult * (size_t)c.hidden;
+    engine.qwen4exp_ple_conv_history[(size_t)l].assign(hc_dim * ple_hist, 0.0f);
+  }
+  if (!c.ple_layers.empty()) {
+    engine.qwen4exp_ple_tok_hist.assign((size_t)std::max(0, c.ple_ngram_size - 1),
+                                        (int32_t)c.ple_eos_token_id);
+    engine.qwen4exp_ple_next_pos = 0;
+    LOG_STREAM_INFO() << "[GRAPH] Qwen4Exp PLE state: " << ple_bytes / 1e9
+                      << " GB conv history across " << c.ple_layers.size()
+                      << " PLE layer(s) + " << engine.qwen4exp_ple_tok_hist.size()
+                      << "-token n-gram window\n";
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -185,8 +427,7 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     break;
 
   case ModelFamily::DeepSeek_V4:
-    // Phase 1 only (correctness within each layer's local SWA window) --
-    // see CLAUDE.md's DeepSeek-V4 plan writeup. c.hc_mult is a GGUF
+    // Raw SWA plus CSA/HCA compressed attention. c.hc_mult is a GGUF
     // hyperparameter (hyper_connection.count), already populated by
     // graph_initializer.cpp before this function is called -- hence
     // resolve_family_ops taking ArchitectureConfig at all, unlike every
@@ -206,6 +447,57 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     if (c.hc_mult > 1) {
       ops.hc_pre_fn = &hc_pre_collapse;
       ops.hc_post_fn = &hc_post_combine;
+    }
+    break;
+
+  case ModelFamily::GLM5NEXT:
+    // Hybrid KDA (recurrent) + DSA (nope-only absorbed MLA). The DSA side
+    // reuses the MLAAbsorbed cache shape (Lc/Rc); the KDA side's recurrent
+    // state is allocated alongside it by alloc_glm5next_cache. Per-layer
+    // HC hooks are the SAME build_hc_pre/build_hc_post form as DeepSeek-V4
+    // (glm5next.cpp inherits them unchanged) -- only the MODEL-LEVEL
+    // collapse differs (hc_mean, handled inside hc_collapse_output).
+    // default_gating: GLM-family MoE convention (sigmoid router + selection
+    // bias + routed_scaling_factor, per the converter's
+    // norm_topk_prob/routed_scaling_factor/exp_probs_b wiring); the GGUF's
+    // own expert_gating_func key still overrides this when set.
+    ops.attn_type = AttentionType::MLA;
+    ops.cache_shape = CacheShape::MLAAbsorbed;
+    ops.default_gating = GatingFunc::Sigmoid;
+    ops.uses_hyper_connections = (c.hc_mult > 1);
+    ops.hc_mult = c.hc_mult;
+    ops.attention_fn = &glm5next_attention_gguf;
+    ops.alloc_cache_fn = &alloc_glm5next_cache;
+    if (c.hc_mult > 1) {
+      ops.hc_pre_fn = &hc_pre_collapse;
+      ops.hc_post_fn = &hc_post_combine;
+    }
+    break;
+
+  case ModelFamily::Qwen4Exp:
+    // Hybrid GDN (recurrent) + dense full attention, low-rank hyper-
+    // connections, PLE n-gram embedding, softmax-gated MoE. CacheShape is
+    // DenseKV (full-attention layers only use it; GDN layers' recurrent
+    // state is allocated alongside by alloc_qwen4exp_cache).
+    // default_gating: Softmax, the Qwen3Next-convention router
+    // (qwen4exp.cpp's build_layer_ffn passes
+    // LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX); the GGUF's own
+    // expert_gating_func key still overrides.
+    // QSA sparse attention on the full-attention layers is DEFERRED in v1
+    // (they run dense) -- same staging as GLM5NEXT's own indexer.
+    ops.attn_type = AttentionType::SSM;
+    ops.cache_shape = CacheShape::DenseKV;
+    ops.default_gating = GatingFunc::Softmax;
+    ops.uses_hyper_connections = (c.hc_mult > 1);
+    ops.hc_mult = c.hc_mult;
+    ops.attention_fn = &qwen4exp_attention_gguf;
+    ops.alloc_cache_fn = &alloc_qwen4exp_cache;
+    if (c.hc_mult > 1) {
+      ops.hc_pre_fn = &qwen4exp_hc_pre_mix;
+      ops.hc_post_fn = &qwen4exp_hc_post_combine;
+    }
+    if (!c.ple_layers.empty()) {
+      ops.layer_input_fn = &qwen4exp_ple_layer_input;
     }
     break;
 

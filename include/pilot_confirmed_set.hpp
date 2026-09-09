@@ -34,7 +34,7 @@
 // publish_pilot_confirmed_resident() runs, so a stale entry from several
 // transitions ago can never still match.
 struct PilotConfirmedEntry { int layer_idx; int expert_id; };
-inline constexpr int PILOT_CONFIRMED_CAP = 16;  // >= max realistic pilot_k (8); generous, not a hard model limit
+inline constexpr int PILOT_CONFIRMED_CAP = 24;  // >= 3 contributors x max realistic pilot_k (8): DEPTH-1 + DEPTH-2 + ATTN-PILOT; generous, not a hard model limit
 struct PilotConfirmedSet {
     std::mutex m;
     PilotConfirmedEntry entries[PILOT_CONFIRMED_CAP];

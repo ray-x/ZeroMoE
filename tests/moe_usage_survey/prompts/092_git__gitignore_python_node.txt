@@ -1,0 +1,1 @@
+Write a good .gitignore for a Python + Node.js monorepo.

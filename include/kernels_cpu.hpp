@@ -138,6 +138,32 @@ void dequantize_row_iq2_s_avx512_wide(const uint8_t *block, float *y,
 float dot_iq2_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k);
 void matmul_iq2_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
                           int S, int I, int O);
+// EXPERIMENTAL VNNI prototype -- feasibility check only, see its own header
+// comment (kernels_cpu.cpp). NOT wired into any production dispatch path.
+float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq, int64_t k);
+// EXPERIMENTAL AVX2 prototype #2 (ggml upstream port, no VNNI) -- see its
+// own header comment (kernels_cpu.cpp). NOT wired into any production path.
+// Layout-identical local mirror of ggml's own block_q8_K (ggml-common.h),
+// declared here (not just in kernels_cpu.cpp) so callers like main_test.cpp
+// can allocate/index it directly -- quantize_row_q8_K_ref only needs a
+// layout-compatible pointer, not the exact type name (GGML_API extern "C").
+struct block_q8_K_local {
+  float d;
+  int8_t qs[256];
+  int16_t bsums[16];
+};
+extern "C" void quantize_row_q8_K_ref(const float *x, block_q8_K_local *y, int64_t k);
+float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k);
+float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k);
+// Production-callable OMP-parallel matmul wrappers around the two dot
+// functions above -- called from kquant_dequant.hpp's cpu_quant_matmul,
+// gated behind EngineConfig::cpu_dot_ggml_avx2 (dense_dispatch.hpp's
+// cpu_dot_ggml_avx2_enabled()). See their own header comments (kernels_cpu.cpp).
+void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
+                              int S, int I, int O);
+void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
+                              int S, int I, int O);
+float dot_iq3_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k);
 void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
                           int S, int I, int O);
 void matmul_q5_k_fused(float *y, const float *x, const uint8_t *W_quantized,

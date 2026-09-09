@@ -1,0 +1,1 @@
+Write an HTML page embedding a responsive image with srcset for different screen sizes.

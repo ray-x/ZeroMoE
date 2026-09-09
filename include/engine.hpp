@@ -4,7 +4,9 @@
 #include "io_uring_backend.hpp"
 #include "perf_timer.hpp"
 #include "logger.hpp"
+#include "memory_guard.hpp"  // MemoryGuard::allocation_blocked() -- see ensure_slab_capacity
 #include "family_ops.hpp" // FamilyOps -- see StreamingEngine::family_ops below
+#include "dsv4_compressed_attention.hpp" // Dsv4CompressedLayerState -- see StreamingEngine::dsv4_compressed below
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -16,6 +18,8 @@
 #include <memory>
 #include <unordered_map>
 #include <algorithm>
+#include <numeric>
+#include <mutex>
 
 #ifdef __APPLE__
 // macOS doesn't have posix_fadvise; provide no-op stubs. The function
@@ -33,6 +37,14 @@ static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
 #endif
 
 class CudaManager;  // forward decl — defined in cuda_manager.hpp; engine holds a pointer
+class StreamingEngine;
+
+// GLM5NEXT KDA's production CUDA state is owned by CudaManager, but prompt
+// cache save/restore is owned by the generation loop. These narrow bridges
+// keep that boundary explicit without making engine.hpp include the complete
+// CUDA manager definition.
+void sync_glm5next_kda_gpu_states(StreamingEngine& engine);
+void invalidate_glm5next_kda_gpu_states(StreamingEngine& engine);
 
 // Any single expert-slab pread(), or a single posix_memalign call in
 // ensure_slab_capacity, exceeding this is logged individually (tagged
@@ -71,16 +83,27 @@ struct BlockQ4_KV {
 };
 
 // Which side is calling RAMSafetyManager::claim_or_wait (ram_manager.hpp) -- the
-// decode thread's own miss-handling, or a LockFreePrefetcher worker thread's
-// speculative claim. Gating behavior on this is a hard correctness requirement, not
-// a style choice: claim_or_wait's Hit branch may only run its VRAM-promotion side
-// effects (which take GpuTopology::cache_mutex) for Decode -- a PrefetchWorker
-// caller must never touch GpuTopology/cache_mutex at all, or a cross-thread AB-BA
-// deadlock against the decode thread's own cache_mutex-then-ram_mutex nesting
-// (demote_from_vram/finish_sync_promotion, both reached from GpuTopology callbacks
-// fired while cache_mutex is still held) becomes reachable. See ram_manager.hpp's
-// claim_or_wait for the full reasoning.
-enum class RamClaimCaller { Decode, PrefetchWorker };
+// main generation-loop thread's own synchronous miss-handling (moe_forward_gguf's
+// per-token dispatch loop -- runs during BOTH prefill's S>1 loop and decode's S=1
+// loop, so MainThread does NOT mean "this happened during decode", despite the
+// name this replaced; see this enum's own git history / CLAUDE.md for the
+// "why is claimed-by-decode nonzero during a --ngen 0, decode-never-ran prefill
+// run" investigation that motivated the rename), or a LockFreePrefetcher worker
+// thread's speculative claim. Gating behavior on this is a hard correctness
+// requirement, not a style choice: claim_or_wait's Hit branch may only run its
+// VRAM-promotion side effects (which take GpuTopology::cache_mutex) for
+// MainThread -- a PrefetchWorker caller must never touch GpuTopology/cache_mutex
+// at all, or a cross-thread AB-BA deadlock against the main thread's own
+// cache_mutex-then-ram_mutex nesting (demote_from_vram/finish_sync_promotion,
+// both reached from GpuTopology callbacks fired while cache_mutex is still held)
+// becomes reachable. See ram_manager.hpp's claim_or_wait for the full reasoning.
+// To actually distinguish prefill's own contribution from decode's: read the
+// [PREFILL]-scoped "RAM claim" line (generation_loop.hpp) for prefill alone,
+// vs. the shutdown "Unified RAM claim" line for the whole session including
+// decode -- that phase split already exists via the per-request Snapshot delta
+// mechanism, independent of this enum (which only ever distinguishes caller
+// THREAD, main vs. background-worker, never generation PHASE).
+enum class RamClaimCaller { MainThread, PrefetchWorker };
 
 struct MoEExpertBlock {
     int expert_id;
@@ -89,6 +112,10 @@ struct MoEExpertBlock {
     QuantizedTensor down_proj;
     uint8_t* slab_buffer = nullptr;
     size_t slab_capacity = 0;
+    // Bytes charged to MemoryGuard while this slab allocation is live.  Keep
+    // this per-slot because slab growth can defer the old free while an async
+    // H2D reader still owns the old pointer.
+    size_t host_reservation_bytes = 0;
     // True once this slab_buffer has been cudaHostRegister'd ONCE, for the
     // lifetime of the allocation (EngineConfig::ram_pinned_budget_gb -- see
     // StreamingEngine::ensure_slab_capacity for the real-hardware reasoning).
@@ -99,8 +126,25 @@ struct MoEExpertBlock {
     // before the buffer is free()'d/realloc'd (ensure_slab_capacity's own
     // grow path does this) -- freeing still-registered memory is UB.
     bool slab_pinned = false;
+    // The slab is a fixed-stride slice of StreamingEngine::graph_ram_arenas,
+    // not an individually-owned allocation.  Graph-backed layers keep every
+    // expert slice alive for the complete graph execution; release_slab and
+    // ensure_slab_capacity must therefore never free, unregister, or regrow
+    // this pointer.
+    bool slab_from_shared_arena = false;
     uint64_t last_used_clock = 0;
     uint32_t hit_count = 0;  // frequency signal for eviction scoring (power-law routing)
+    // EngineConfig::ram_grace_period_tokens (2026-09-04): the DECODE token
+    // index (RAMSafetyManager::current_decode_token_idx_ref, NOT the raw
+    // operation-tick last_used_clock above) at which this slot was last
+    // genuinely (re)loaded with a NEW expert -- set only at the real load
+    // sites (RAMSafetyManager::claim_or_wait's Claimed branch, the
+    // demote_from_vram salvage-into-RAM path, disk_batch_padding's
+    // speculative fill, and preload_ram_slot), never on a plain re-hit or
+    // a slot-vacate/free. 0 by default -- harmless even with the feature
+    // off, since eviction_score only reads it when ram_grace_period_
+    // tokens > 0.
+    uint64_t load_token_idx = 0;
 
     // True for a lightweight "shadow" block populated by
     // StreamingEngine::populate_vram_shadow (execution_layer.cpp's
@@ -238,6 +282,72 @@ struct MoEExpertBlock {
     // for a different expert, same lifecycle as also_in_vram.
     bool loaded_by_prefetch = false;
 
+    // 2026-08-30 diagnostic: true once this slot's slab_buffer bytes have
+    // been handed to a VRAM upload (active-layer pre-warm, active-layer
+    // speculative promotion, or a main-cache RAM->VRAM promotion) WITHOUT
+    // that read going through claim_or_wait's own Hit path -- i.e. the data
+    // was genuinely CONSUMED, but the RAM tier's own hit_count never
+    // recorded it, because the eventual dispatch resolved out of VRAM
+    // instead of ever consulting this RAM slot again.
+    //
+    // Exists solely to split n_ram_prefetch_loaded_evicted_unused (the
+    // "Unified RAM waste" line, reporting 86.6% on a real 100-token
+    // prefill) into its two structurally different causes, which call for
+    // completely different fixes and must not be conflated:
+    //   (a) BENIGN -- consumed_by_vram_upload==true: the prefetch DID pay
+    //       off, the bytes reached VRAM and were used from there; only the
+    //       RAM-tier hit_count is blind to it. Nothing to fix.
+    //   (b) REAL WASTE -- consumed_by_vram_upload==false: the slot was
+    //       fetched, never read by anyone, and reclaimed under capacity
+    //       pressure. This is the number that would justify the
+    //       prefill-sliding-window capacity work (per-layer cap is 76 while
+    //       a 100-token prefill layer needs ~212 unique experts).
+    // Same reset lifecycle as also_in_vram/loaded_by_prefetch (cleared
+    // whenever the slot is claimed for a different expert).
+    bool consumed_by_vram_upload = false;
+
+    // 2026-08-31: how many times THIS REQUEST's prefill router selected this
+    // expert (0 = not selected, or not stamped yet). Copied from
+    // LayerScratch::expert_freq -- Phase 1's real, already-computed
+    // whole-batch router output, not a prediction.
+    //
+    // WHY this is worth a field: measured on real 5-prompt data, ranking the
+    // RAM tier by THIS REQUEST's own prefill counts captures 64.1% of the
+    // following decode phase's traffic, against 67.8% for an oracle that
+    // already knows decode's answer -- a ratio of 0.946, holding at both
+    // 2850 and 5700 slots. Prefill's expert set is also a strict SUPERSET
+    // relationship in the right direction (0 prefill-exclusive entries;
+    // prefill's set covers 95.7% of decode traffic, r=0.921). So "what
+    // prefill just used" is very nearly the best possible answer to "what
+    // should survive into decode", and it costs nothing to obtain.
+    //
+    // eviction_score() folds this in (gated by prefill_retention_weight, 0 =
+    // off) so a heavily-used prefill expert outranks a merely-recently-
+    // touched one at eviction time. Same reset lifecycle as also_in_vram /
+    // loaded_by_prefetch: cleared whenever the slot is claimed for a
+    // different expert, so it can never describe the wrong expert.
+    uint32_t prefill_demand = 0;
+
+    // True when this slot was claimed by EngineConfig::prefill_dispatch_
+    // lookahead_tokens (prefill-only, additive get_experts_batch widening --
+    // see that field's own comment, engine_config.hpp) rather than by the
+    // token whose real, immediate need triggered the call. Deliberately a
+    // SEPARATE flag from loaded_by_prefetch above, not a shared one: that
+    // flag is set purely from RamClaimCaller (who==PrefetchWorker), and
+    // lookahead widening always goes through RamClaimCaller::MainThread (it's
+    // called from the SAME get_experts_batch call as the triggering token's
+    // own real needs, just for a different, later token's picks) -- so
+    // reusing loaded_by_prefetch would have made lookahead-loaded slots
+    // invisible to the "Unified RAM waste" design's own who-based gate, and
+    // this project's own "was_it_used" question for this specific mechanism
+    // needs its own answer, not a borrowed one. See RAMSafetyManager::
+    // claim_or_wait's own n_prefill_lookahead_first_hit comment (the "used"
+    // signal) and the eviction-victim-selection sites' n_prefill_lookahead_
+    // loaded_evicted_unused comment (the "wasted" signal) for the two halves
+    // of this measurement. Reset to false whenever a slot is claimed for a
+    // different expert, same lifecycle as also_in_vram/loaded_by_prefetch.
+    bool loaded_by_lookahead = false;
+
     // True when this slot was claimed by Phase B's speculative disk-batch
     // padding (RAMSafetyManager::get_experts_batch, disk_batch_padding
     // config -- a route_freq-ranked, historically hot but not currently
@@ -282,6 +392,26 @@ public:
     std::unordered_map<std::string, QuantizedTensor> resident_layers;
     std::vector<std::vector<MoEExpertBlock>> layers_experts;
 
+    // A graph-compatible host representation of a fully resident MoE layer.
+    // Each expert occupies one fixed-stride [gate|up|down] slice, allowing
+    // GGML MUL_MAT_ID to view gate/up/down as three expert-axis tensors while
+    // still referencing the same DDR bytes used by the RAM cache.  The graph
+    // only aliases an arena after every expert in its layer is Ready; partial
+    // layers remain on the graph's complete source fallback.
+    struct GraphRamLayerArena {
+        uint8_t *base = nullptr;
+        size_t bytes = 0;
+        size_t stride = 0;
+        size_t gate_bytes = 0;
+        size_t up_bytes = 0;
+        size_t down_bytes = 0;
+        int n_experts = 0;
+        bool pinned = false;
+        size_t host_reservation_bytes = 0;
+    };
+    std::vector<GraphRamLayerArena> graph_ram_arenas;
+    bool graph_ram_cache_enabled = false;
+
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 
     // the "learned hot set" signal that drives VRAM preloading on the
@@ -324,6 +454,81 @@ public:
     std::vector<float*> KVc;
     int sliding_window = 0;
 
+    // Per-layer DeepSeek-V4 CSA/HCA compressed-attention state (compressed
+    // K cache + ring-buffer compressor state, dsv4_compressed_attention.hpp)
+    // -- one entry per layer, sized/configured by alloc_dsv4_swa_cache
+    // (models/family_ops.cpp) at load time. A layer with compress_ratio==0
+    // (raw SWA, or any non-DeepSeek-V4 architecture) has its entry left
+    // default-constructed (Dsv4CompressedLayerState::enabled() == false),
+    // never resized/touched -- dsv4_attention_gguf (attention_layer.cpp)
+    // checks `enabled()` before using an entry, so an unconfigured slot is
+    // inert rather than undefined.
+    std::vector<Dsv4CompressedLayerState> dsv4_compressed;
+
+    // GLM5Next (GLM 5.3 Flash) KDA recurrent-layer state -- one entry per
+    // layer, sized/populated by alloc_glm5next_cache (models/family_ops.cpp)
+    // at load time. DSA (full-attention) layers get an EMPTY entry and never
+    // touch these; KDA layers (glm5next_is_kda_layer) own:
+    //   conv_history[l]: [3*d_inner, ssm_conv_kernel-1] -- the last
+    //     (kernel-1) pre-conv q|k|v samples per channel, carried across
+    //     calls so a decode-time S=1 call still sees its real receptive
+    //     field (same contract as cpu_qwen_moe.cpp's conv_history).
+    //   recur_state[l]: [n_heads, kda_head_dim, kda_head_dim] -- the
+    //     gated-delta-rule recurrent state, [key, value] per head.
+    // Both persist for the whole session and are mutated in place by
+    // glm5next_kda_gguf (attention_layer.cpp). Sized once at allocation;
+    // a layer whose entry is the wrong size is re-initialized (zeroed) by
+    // the attention function, matching cpu_qwen_moe.cpp's discipline.
+    std::vector<std::vector<float>> glm5next_conv_history;
+    std::vector<std::vector<float>> glm5next_recur_state;
+
+    // Qwen4Exp (Qwen3.8-Flash-Next) recurrent-layer + PLE state -- one entry
+    // per layer, sized/populated by alloc_qwen4exp_cache (models/
+    // family_ops.cpp) at load time. Full-attention layers get an EMPTY entry
+    // and never touch these; GDN layers (qwen4exp_is_gdn_layer) own:
+    //   qwen4exp_conv_history[l]: [conv_dim, ssm_conv_kernel-1] -- the last
+    //     (kernel-1) pre-conv q|k|v samples per channel (conv_dim =
+    //     2*key_dim + value_dim from the fused attn_qkv projection), carried
+    //     across calls (same contract as glm5next_conv_history above).
+    //   qwen4exp_recur_state[l]: [n_v_heads, head_dim, head_dim] -- the
+    //     gated-delta-rule recurrent state, [key, value] per value head
+    //     (key heads are shared: v-head h reads k-head h % group_count,
+    //     matching the converter's tiled V-head reorder --
+    //     conversion/qwen.py's _LinearAttentionVReorderBase).
+    // PLE n-gram layers (qwen4exp_is_ple_layer) additionally own:
+    //   qwen4exp_ple_conv_history[l]: [hc_mult*hidden, hist] where hist =
+    //     (ple_conv_kernel-1)*ple_ngram_size -- the dilated causal conv's
+    //     per-layer input history (qwen4exp.cpp's build_ple /
+    //     build_conv_state_at on the PLE conv's own recurrent row).
+    //   qwen4exp_ple_tok_hist: last (ple_ngram_size-1) token ids of the
+    //     (single) sequence + the next expected position -- the PLE hash's
+    //     n-gram window across decode steps (llama-memory-hybrid-idx's
+    //     ple_hist equivalent; single-sequence only, matching this engine's
+    //     single-session generation loop).
+    // All persist for the whole session and are mutated in place.
+    std::vector<std::vector<float>> qwen4exp_conv_history;
+    std::vector<std::vector<float>> qwen4exp_recur_state;
+    std::vector<std::vector<float>> qwen4exp_ple_conv_history;
+    std::vector<int32_t> qwen4exp_ple_tok_hist;
+    int64_t qwen4exp_ple_next_pos = 0;
+
+    // Qwen4Exp low-rank HC: the inject vector ([S * hc_mult]) computed by
+    // qwen4exp_hc_pre_mix and consumed by qwen4exp_hc_post_combine within
+    // the same layer/sub-block bracket (hyper_connections.cpp). Sized per
+    // call; reused across layers (pre/post are strictly sequential per
+    // sub-block, so one buffer is enough).
+    std::vector<float> qwen4exp_hc_inject;
+
+    // Optional Qwen4Exp device handoff for one layer's attention bracket.
+    // GDN outputs are GGML tensors; dense full-attention outputs are raw F32
+    // CUDA buffers owned by CudaManager. Both are consumed before the next
+    // layer advances.
+    const void *qwen4exp_device_hc_input = nullptr;
+    const void *qwen4exp_device_hc_ffn_input = nullptr;
+    const void *qwen4exp_device_attn_output = nullptr;
+    bool qwen4exp_device_attn_output_ready = false;
+    bool qwen4exp_device_attn_output_raw = false;
+
     // Hyper-Connections multi-stream residual (DeepSeek-V4, hc_mult > 1
     // only -- empty/unused for every other family, per family_ops.hpp's own
     // "hc_mult==1 is the degenerate case" design). Layout is PRIVATE to
@@ -333,6 +538,23 @@ public:
     // scratch buffers). Sized [S * hc_mult * D] floats, resized once per
     // layers_forward_gguf call (S can change between prefill and decode).
     std::vector<float> hc_stream_buf;
+
+    // Set by the opt-in Qwen4Exp full GGML prefill graph after it has
+    // produced the final model-level HC output directly into the caller's
+    // [S,D] buffer.  The generation loop must not run the legacy HC collapse
+    // a second time for that result.
+    bool qwen4exp_full_graph_output_ready = false;
+
+    // Set by the opt-in GLM5NEXT full GGML prefill graph.  This is separate
+    // from the Qwen flag so the shared generation loop cannot apply the
+    // legacy HC collapse twice.
+    bool glm5next_full_graph_output_ready = false;
+
+    // Set by the opt-in DeepSeek-V4 full GGML prefill graph after it has
+    // produced the learned HC collapse and published raw/compressed state
+    // for the following decode step.
+    bool deepseek_v4_full_graph_output_ready = false;
+
     // Post-gate/comb-matrix scratch: computed once by hc_pre_collapse
     // (hyper_connections.cpp) and consumed by the LATER hc_post_combine
     // call for the SAME layer/sub_block, after the sub-block itself has run
@@ -356,6 +578,13 @@ public:
     // GPU-resident hidden state (persistent, never freed mid-session)
     float* d_hidden = nullptr;
     size_t d_hidden_cap = 0;
+
+    // Process-wide host-memory admission accounting for allocations owned by
+    // the engine itself (resident dense tensors, KV caches, and recurrent
+    // state). RAM slabs and graph/MTP allocations keep their own lifetimes but
+    // charge the same MemoryGuard ledger.
+    size_t host_memory_reservation_bytes = 0;
+    bool host_memory_allocation_failed = false;
 
     int max_t = 0;
 
@@ -386,6 +615,19 @@ public:
     // below (expert_layer_geometry, build_expert_read_requests) should
     // resolve against the per-expert tensor convention instead.
     bool unpacked_expert_format = false;
+
+    // Per-expert MIXED-PRECISION support, Phase 1 (file-level correctness
+    // only -- see CLAUDE.md's per-expert-mixed-precision design writeup for
+    // the full phased plan). Populated by sanity_check_unpacked_format(),
+    // indexed by layer_idx: true means this layer's experts do NOT all
+    // share the same gate/up/down byte size (i.e. genuinely different quant
+    // types coexist within the layer), false means they're uniform (the
+    // ONLY case expert_layer_geometry's single-representative-expert
+    // shortcut, and everything downstream of it -- compute_expert_slab_
+    // bytes, RAM/VRAM slot sizing, disk-read batch planning -- is safe to
+    // use as-is; none of that has been updated yet to reason per-expert).
+    // Empty until sanity_check_unpacked_format() runs.
+    std::vector<bool> layer_has_mixed_expert_sizes;
 
     // Set from EngineConfig::cuda_cufile at startup (main.cpp), AFTER
     // confirming GGUFFile::enable_cufile() actually registered at least one
@@ -450,6 +692,52 @@ public:
     // the first (unbounded) attempt.
     bool decode_async_prewarm = false;
     int decode_async_prewarm_max_batch = 3;
+    // Set from EngineConfig::decode_async_prewarm_nonblocking -- see its own
+    // comment for the mechanism (find_active_expert poll instead of
+    // sync_active_layer_batch's blocking cudaStreamSynchronize).
+    bool decode_async_prewarm_nonblocking = false;
+
+    // Opt-in GLM5Next MTP speculative decoding.  The target trunk remains
+    // authoritative; the extra NextN block proposes tokens and the target
+    // verifies them in bounded batches.  Kept on StreamingEngine (rather
+    // than a process-global switch) so a future multi-model caller cannot
+    // accidentally enable MTP for Qwen/DeepSeek.
+    bool mtp_enabled = false;
+    int mtp_draft_tokens = 3;
+
+    // Set from EngineConfig::cpu_offload_max_experts at startup (main.cpp).
+    // 0 = off (default). See that field's own extensive comment
+    // (engine_config.hpp) for the Fiddler-style rationale and the real
+    // per-layer miss data this was sized against.
+    int cpu_offload_max_experts = 0;
+    // Copied from EngineConfig at startup (main.cpp). Halve retention stamps
+    // at the end of each request -- see RAMSafetyManager::decay_prefill_demand.
+    bool prefill_retention_decay = true;
+
+    // Set from EngineConfig::prefill_dispatch_lookahead_tokens at startup
+    // (main.cpp). 0 = off (default is 8 in EngineConfig itself). See that
+    // field's own extensive comment (engine_config.hpp) for the mechanism
+    // and the real "phase_b dominates even with prefill_warm_via_prefetcher
+    // on" finding this responds to.
+    int prefill_dispatch_lookahead_tokens = 0;
+
+    // Set from EngineConfig::prefill_hint_order_by_earliest_token at
+    // startup (main.cpp). false = off (default, exact prior expert_freq-
+    // descending order). See that field's own comment for the mechanism.
+    bool prefill_hint_order_by_earliest_token = false;
+
+    // Set from EngineConfig::pilot_widen_all_tokens at startup (main.cpp).
+    // false = off (default). See that field's own comment for the
+    // mechanism -- computes the widened prediction + drives the
+    // [PILOT-WIDE] measurement; prefetch_widen_all_tokens below decides
+    // whether real hints get pushed from it.
+    bool pilot_widen_all_tokens = false;
+
+    // Set from EngineConfig::prefetch_widen_all_tokens at startup
+    // (main.cpp). false = off (default). See that field's own comment --
+    // real disk-prefetch hint push from pilot_widen_all_tokens's widened
+    // prediction, hint-push only (no VRAM promotion).
+    bool prefetch_widen_all_tokens = false;
 
     // Set from EngineConfig::attn_qabsorb_gpu/attn_qabsorb_gpu_max_vram_gb
     // at startup (main.cpp) -- gates the MLA absorbed-attention qabsorb
@@ -470,10 +758,85 @@ public:
     // so it's structurally cheaper there than GLM-5.2's unbounded version
     // this GPU path targets.
     bool attn_score_gpu = false;
+    // Set from EngineConfig::qwen4exp_attn_gpu -- read by
+    // qwen4exp_full_attention_gguf's dense-attention step.
+    bool qwen4exp_attn_gpu = false;
+    // Set from EngineConfig::qwen4exp_gdn_gpu.
+    bool qwen4exp_gdn_gpu = false;
+    // Set from EngineConfig::qwen4exp_gdn_conv_gpu.
+    bool qwen4exp_gdn_conv_gpu = false;
+
+    // Set from EngineConfig::glm5next_kda_gpu. The GLM5NEXT KDA recurrent
+    // update itself runs on CUDA; the host mirror is synchronized only at
+    // explicit prompt-cache/checkpoint boundaries because the live state is
+    // kept resident on the device between calls.
+    bool glm5next_kda_gpu = false;
+    // Set from EngineConfig::glm5next_router_gpu. The native CUDA route
+    // returns only compact IDs/weights to the host cache machinery.
+    bool glm5next_router_gpu = false;
+
+    // GLM5NEXT-only grouped GPU prefill. This deliberately does not reuse the
+    // family-agnostic moe_prefill_batched switch: GLM's mixed expert tensor
+    // geometries made that generic path unsafe in earlier revisions. The
+    // GLM-specific path has its own routing-consistency checks and fallback.
+    bool glm5next_moe_prefill_gpu = false;
+
+    // GLM5NEXT-only KDA dense projection graph fusion. Best effort: any
+    // unavailable GGML/CUDA shape or allocation falls back to dense_proj.
+    bool glm5next_dense_prefill_fusion = false;
+
+    // Prompt (prefix) state cache -- EngineConfig::prompt_cache.
+    //
+    // Skips re-prefilling a prompt prefix that this process already processed.
+    // Dense KV (Kc/Vc, and MLA's Lc/Rc) is POSITION-indexed and already
+    // persists in place across requests, so it needs no snapshot -- what does
+    // need snapshotting is every piece of state that is a ROLLING function of
+    // the token stream rather than indexed by position:
+    //   * qwen4exp_recur_state / glm5next_recur_state (the recurrent state)
+    //   * qwen4exp_conv_history / glm5next_conv_history (short-conv history)
+    //   * qwen4exp_ple_conv_history + ple_tok_hist + ple_next_pos (PLE n-gram)
+    // Missing ANY of these would silently produce wrong output rather than
+    // fail, which is why the feature is restricted to the two families whose
+    // carried state is fully enumerated here (see prompt_cache_supported()).
+    //
+    // Only the END-of-prompt state is stored, so a hit requires the cached
+    // token list to be a strict prefix of the new prompt -- a divergence
+    // earlier than that would need state at the divergence point, which is
+    // not retained. One entry: this targets repeated/extending prompts
+    // (benchmark reruns, multi-turn continuation), not a general prefix tree.
+    struct PromptStateCache {
+        bool valid = false;
+        std::vector<int> tokens;                      // tokens whose END state this is
+        std::vector<std::vector<float>> recur_state;
+        std::vector<std::vector<float>> conv_history;
+        std::vector<std::vector<float>> ple_conv_history;
+        std::vector<int32_t> ple_tok_hist;
+        int64_t ple_next_pos = 0;
+        std::vector<std::vector<float>> glm_recur_state;
+        std::vector<std::vector<float>> glm_conv_history;
+        // Post-prefill last hidden row (D floats). Lets an EXACT repeat skip
+        // the forward pass altogether and reuse these logits, which makes that
+        // path bit-identical to the run that populated it -- a stronger and
+        // more checkable guarantee than comparing sampled text, which this
+        // hardware's cache-state-dependent dispatch makes non-deterministic.
+        std::vector<float> last_hidden;
+    };
+    PromptStateCache prompt_state_cache;
+    bool prompt_cache = false;
     double attn_score_gpu_max_vram_gb = 2.0;
     // Set from EngineConfig::attn_score_gpu_max_context -- see that field's
     // own comment. 0 = no cap (mirror sized to the full context_size).
     int attn_score_gpu_max_context = 0;
+
+    // Set from EngineConfig::dsv4_score_gpu/dsv4_score_gpu_max_vram_gb at
+    // startup (main.cpp) -- gates DeepSeek-V4's raw-SWA/HCA score GPU path
+    // (attention_layer.cpp / cuda_manager.hpp's dsv4_score_gpu_batched_
+    // host). See EngineConfig::dsv4_score_gpu's own extensive comment for
+    // why this defaults off (unverified on real hardware -- this Mac has no
+    // CUDA toolchain to test with) and why CSA (ratio==4) layers never use
+    // it regardless of this flag.
+    bool dsv4_score_gpu = false;
+    double dsv4_score_gpu_max_vram_gb = 1.0;
 
     // Frees every buffer this class allocated directly: host-side
     // posix_memalign'd tensors (resident dense weights, KV cache, expert
@@ -488,22 +851,69 @@ public:
 
         for (auto& [name, qt] : resident_layers) {
             if (qt.host_ptr) free(qt.host_ptr);
-            if (have_gpu && qt.device_ptr) cudaFree(qt.device_ptr);
-            // Unlike device_ptr (may be a dense_pool suballocation), gpu_fast_ptr
-            // is always its own standalone cudaMalloc — always safe/correct to
-            // cudaFree individually.
+            // device_ptr is NEVER individually freed here -- the only real
+            // assignment site in the whole codebase (CudaManager::
+            // offload_tensor_to_pool) always sets it to `dense_pool +
+            // aligned_used`, a suballocation of CudaManager's single
+            // dense_pool cudaMalloc, never its own standalone allocation.
+            // CudaManager's own destructor already frees the whole pool
+            // exactly once. Calling cudaFree on an interior (non-base)
+            // pointer here was a real, confirmed bug -- compute-sanitizer
+            // flagged 861 cudaErrorInvalidValue ("invalid argument")
+            // errors from this exact line on a real GLM-5.3 shutdown
+            // (reproducible in ~17s via a no-prompt/--ngen 0 run, since
+            // this fires purely from model load + teardown, no generation
+            // needed) -- harmless in practice (cudaFree on an invalid
+            // pointer is a no-op past logging the error, and dense_pool's
+            // own later free still succeeds), but a real, avoidable,
+            // sanitizer-visible bug all the same. Unlike device_ptr,
+            // gpu_fast_ptr (below) is always its own standalone cudaMalloc
+            // (see QuantizedTensor's own comment) -- freeing it here
+            // individually stays correct.
             if (have_gpu && qt.gpu_fast_ptr) cudaFree(qt.gpu_fast_ptr);
         }
         for (auto& layer_slots : layers_experts) {
             for (auto& slot : layer_slots) {
-                if (slot.slab_buffer) free(slot.slab_buffer);
+                if (slot.slab_buffer && !slot.slab_from_shared_arena)
+                    free(slot.slab_buffer);
+                MemoryGuard::release_host_bytes(slot.host_reservation_bytes);
+                slot.host_reservation_bytes = 0;
             }
+        }
+        // Shared graph arenas own the bytes referenced by their slots.  They
+        // are released once per layer, after all slot aliases have stopped
+        // being used, and their single CUDA registration is undone here.
+        for (auto &arena : graph_ram_arenas) {
+            if (!arena.base) continue;
+            if (arena.pinned) {
+                cudaHostUnregister(arena.base);
+                ram_pinned_bytes_used.fetch_sub(arena.bytes,
+                                                std::memory_order_relaxed);
+            }
+            free(arena.base);
+            MemoryGuard::release_host_bytes(arena.host_reservation_bytes);
+            arena = {};
+        }
+        graph_ram_arenas.clear();
+        graph_ram_cache_enabled = false;
+        // At this point run_engine has already stopped the prefetcher and GPU
+        // topology, so deferred slab readers cannot remain in flight.  Free
+        // and discharge any old realloc buffers that were parked for safety.
+        {
+            std::lock_guard<std::mutex> dg(deferred_slab_free_mutex);
+            for (const auto& d : deferred_slab_frees) {
+                if (d.ptr) free(d.ptr);
+                MemoryGuard::release_host_bytes(d.reservation_bytes);
+            }
+            deferred_slab_frees.clear();
         }
         for (float* p : Lc) if (p) free(p);
         for (float* p : Rc) if (p) free(p);
         for (float* p : Kc) if (p) free(p);
         for (float* p : Vc) if (p) free(p);
         for (float* p : KVc) if (p) free(p);
+        MemoryGuard::release_host_bytes(host_memory_reservation_bytes);
+        host_memory_reservation_bytes = 0;
 
         if (have_gpu) {
             for (float* p : d_Lc) if (p) cudaFree(p);
@@ -527,7 +937,22 @@ public:
             auto& t_meta = src.tensors[name];
             QuantizedTensor qt{t_meta, nullptr, nullptr};
 
-            posix_memalign((void**)&qt.host_ptr, 4096, t_meta.size_bytes);
+            if (!reserve_host_memory(t_meta.size_bytes)) {
+                LOG_ERROR("[MEM-GUARD] resident tensor %s refused: %.2f MB would exceed "
+                          "the process host budget; continuing without this tensor\n",
+                          name.c_str(), t_meta.size_bytes / 1e6);
+                resident_layers[name] = qt;
+                continue;
+            }
+            const int alloc_err = posix_memalign((void**)&qt.host_ptr, 4096,
+                                                 t_meta.size_bytes);
+            if (alloc_err != 0 || !qt.host_ptr) {
+                release_host_memory(t_meta.size_bytes);
+                LOG_ERROR("[RESIDENT] posix_memalign failed for %s (errno=%d)\n",
+                          name.c_str(), alloc_err);
+                resident_layers[name] = qt;
+                continue;
+            }
             int tensor_fd = src.fd_for_tensor(t_meta);
             ssize_t bytes_read = direct_io::pread_direct_aware(
                 tensor_fd, src.direct_io_active_for(t_meta), src.direct_io_alignment,
@@ -539,6 +964,7 @@ public:
                 // Mark as unusable — downstream code checks host_ptr != nullptr
                 free(qt.host_ptr);
                 qt.host_ptr = nullptr;
+                release_host_memory(t_meta.size_bytes);
             } else {
                 total_loaded += t_meta.size_bytes;
             }
@@ -623,6 +1049,47 @@ public:
             && dM.offset == uM.offset + uM.size_bytes;
     }
 
+    // 2026-09: per-LAYER format detection, for mixed packed/unpacked models
+    // (Phase 5 of per-expert mixed precision, see CLAUDE.md) -- a real
+    // model can now have SOME layers converted to unpacked (per-expert
+    // tensors, gguf_tool pack --unpack) while the rest stay in the default
+    // packed format, rather than requiring the whole model to be one or
+    // the other. unpacked_expert_format (the config flag) is no longer the
+    // authority on a specific layer's real format -- it stays a real,
+    // meaningful user-facing toggle (the ORIGINAL "every layer is unpacked"
+    // expectation, still what most callers should assume when it's set),
+    // but the 4 real call sites that make a per-layer packed-vs-unpacked
+    // DISPATCH decision (expert_layer_geometry, expert_geometry_for,
+    // build_expert_read_requests, and execution_layer.cpp's cuFile
+    // eligibility block) now ask THIS function instead, so a layer that
+    // genuinely has per-expert tensors is used correctly even if the flag
+    // is off, and a layer that's still packed falls back correctly even if
+    // the flag is on. Mirrors looks_like_unpacked_format's own per-layer
+    // check (packed_slab_geometry succeeding means packed, regardless of
+    // the flag; unpacked_expert_geometry succeeding for expert 0 means
+    // unpacked) -- reused here at single-layer granularity instead of that
+    // function's whole-model aggregate, but with the two checks in the
+    // OPPOSITE priority order (unpacked checked first). Deliberate: a real
+    // multi-source build can genuinely have BOTH a layer's old packed
+    // _exps tensor (from an untouched shard) AND a full set of per-expert
+    // unpacked tensors for the same layer (from a supplementary override
+    // file) present in the SAME loaded tensor map -- they never collide by
+    // NAME (gguf_loader.hpp's last-shard-wins rule only resolves same-name
+    // collisions), so both simply coexist unless something here picks one.
+    // The per-expert tensors are the more specific, deliberate signal --
+    // gguf_tool pack --unpack's own real output never leaves the old
+    // packed tensor behind, so seeing both only happens when a caller
+    // (this project's own test tooling, or a real "layer this in as an
+    // override" build) explicitly added the unpacked set on top of an
+    // otherwise-untouched packed shard. Checking packed first would let
+    // that leftover packed tensor silently shadow the deliberate override.
+    bool layer_is_unpacked(int layer_idx) const {
+        size_t gb, ub, db;
+        const GGUFTensor *gM, *uM, *dM;
+        if (unpacked_expert_geometry(layer_idx, 0, gb, ub, db, gM, uM, dM)) return true;
+        return false;
+    }
+
     // Unified layer-level geometry: dispatches to packed_slab_geometry (the
     // default format) or, when unpacked_expert_format is set, to
     // unpacked_expert_geometry using expert 0 as the layer's representative
@@ -635,10 +1102,66 @@ public:
     // layer-level sizing/type info (populate_vram_shadow,
     // compute_expert_slab_bytes) gain unpacked-format support through this
     // one switch point with no other change.
+    //
+    // 2026-09: the "expert 0 represents the whole layer" guarantee above no
+    // longer holds unconditionally -- sanity_check_unpacked_format now
+    // ACCEPTS a layer whose experts have genuinely different sizes (real
+    // mixed precision, Phase 1), flagging it in layer_has_mixed_expert_
+    // sizes instead of refusing to start. Every caller of THIS function
+    // still assumes one number represents the whole layer (RAM/VRAM slot
+    // sizing, disk-read batch planning -- none of that has been made
+    // per-expert-aware yet), so returning expert 0's size for a flagged
+    // layer would silently under/over-size those callers rather than
+    // failing loudly. Refuse instead: false here is a clear, well-defined
+    // "not supported yet for this layer" signal a caller can act on,
+    // rather than quietly wrong numbers a caller has no way to detect.
+    // Per-expert callers (build_expert_read_requests et al., which already
+    // call unpacked_expert_geometry directly with a real expert_id) are
+    // completely unaffected -- this function is the ONLY thing gated here.
     bool expert_layer_geometry(int layer_idx, size_t& gb, size_t& ub, size_t& db,
                                 const GGUFTensor*& gM, const GGUFTensor*& uM, const GGUFTensor*& dM) const {
-        if (unpacked_expert_format)
+        // layer_is_unpacked, not the global unpacked_expert_format flag --
+        // per-layer dispatch (2026-09, Phase 5, see layer_is_unpacked's own
+        // comment): a mixed model can have this SPECIFIC layer packed even
+        // when the flag is set, or unpacked even when it's not.
+        if (layer_is_unpacked(layer_idx)) {
+            if (layer_idx >= 0 && (size_t)layer_idx < layer_has_mixed_expert_sizes.size()
+                && layer_has_mixed_expert_sizes[layer_idx]) {
+                return false;
+            }
             return unpacked_expert_geometry(layer_idx, 0, gb, ub, db, gM, uM, dM);
+        }
+        return packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM);
+    }
+
+    // Per-(layer, REAL expert_id) geometry, correctly dispatching by
+    // format -- for the caller that already knows exactly which expert it
+    // wants, unlike expert_layer_geometry's "expert 0 represents the
+    // layer" shortcut above. Packed format: uniform per layer by
+    // construction, expert_id is irrelevant, same packed_slab_geometry
+    // call either function would make. Unpacked format: resolves THIS
+    // expert's own real geometry directly via unpacked_expert_geometry,
+    // never expert 0's -- correct for a uniform layer (where they'd agree
+    // anyway) AND a genuinely mixed one (where they would not).
+    //
+    // 2026-09: added after an expert_layer_geometry caller audit (Phase 2
+    // of per-expert mixed precision, see CLAUDE.md) found 3 real call
+    // sites that already had a specific expert_id in scope but were
+    // calling expert_layer_geometry anyway -- silently correct only
+    // because every layer was uniform so far, and would have silently
+    // populated the WRONG expert's metadata for a genuinely mixed layer
+    // once expert_layer_geometry stopped refusing those. Two more call
+    // sites called expert_layer_geometry without even checking its return
+    // value -- a real, newly-exposed crash risk (dereferencing an
+    // uninitialized GGUFTensor* on refusal) once that function started
+    // returning false for mixed layers instead of always succeeding.
+    // Both classes of caller are fixed to call this function instead.
+    bool expert_geometry_for(int layer_idx, int expert_id, size_t& gb, size_t& ub, size_t& db,
+                              const GGUFTensor*& gM, const GGUFTensor*& uM, const GGUFTensor*& dM) const {
+        // layer_is_unpacked, not the global flag -- see its own comment
+        // (2026-09, Phase 5: per-layer mixed packed/unpacked models).
+        if (layer_is_unpacked(layer_idx))
+            return unpacked_expert_geometry(layer_idx, expert_id, gb, ub, db, gM, uM, dM);
         return packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM);
     }
 
@@ -749,7 +1272,28 @@ public:
     // fatal incomplete-repack signature (mirrors gguf_tool verify's own
     // completeness check, but enforced by the engine itself at load time
     // for this specific format instead of left to a separate offline step).
-    bool sanity_check_unpacked_format() const {
+    // 2026-09: RELAXED, Phase 1 of per-expert mixed precision (see
+    // CLAUDE.md). Completeness (every expert present) and tightness (each
+    // expert's own gate/up/down physically contiguous, still the real
+    // precondition for a single-DMA read of THAT expert) remain hard,
+    // fatal requirements -- unchanged from before. What's DROPPED is the
+    // old requirement that every expert in a layer share the SAME
+    // gate/up/down byte size as expert 0. That requirement was never
+    // actually needed for per-expert single-DMA reads (tightness is a
+    // per-expert property, independent of what size any OTHER expert in
+    // the layer is) -- it existed only because expert_layer_geometry's own
+    // "expert 0 represents the whole layer" shortcut needed it to be safe,
+    // and nothing downstream of that shortcut has been updated yet to
+    // reason per-expert (RAM/VRAM slot sizing, disk-read batch planning --
+    // see layer_has_mixed_expert_sizes's own comment). So: a genuinely
+    // mixed layer is no longer refused at the FILE level, but is flagged
+    // in layer_has_mixed_expert_sizes so expert_layer_geometry can refuse
+    // to hand out a wrong "representative" size for it instead of silently
+    // returning expert 0's numbers as if they applied to every expert.
+    // Verified against a real hand-built 2-expert mixed-type layer (real
+    // IQ1_S + real IQ2_XXS/IQ3_XXS bytes, byte-identical round-trip, clean
+    // GPU dispatch for both) -- see main_test.cpp Test 18.
+    bool sanity_check_unpacked_format() {
         int n_layers = model_file.architecture_config.n_layers;
         int n_exp = model_file.architecture_config.n_experts;
         if (n_layers <= 0 || n_exp <= 0) {
@@ -758,9 +1302,68 @@ public:
                     n_layers, n_exp);
             return false;
         }
+        layer_has_mixed_expert_sizes.assign(n_layers, false);
+        int mixed_layer_count = 0;
+        int packed_layer_count = 0;
+        // Genuinely unpacked (found == n_exp), tracked separately from
+        // "not packed" -- a dense-only layer (no MoE tensors at all,
+        // architecture_config.first_dense) is also "not packed" without
+        // being unpacked either. A real bug this session's own Phase 5
+        // verification run caught: the summary log below used to compute
+        // this as `n_layers - packed_layer_count`, which silently counted
+        // every dense-only layer as "unpacked" too (a real run reported
+        // "3/78 unpacked" for a file with only ONE real unpacked layer --
+        // confirmed via a direct tensor-table check finding exactly one).
+        // Purely a log-message inaccuracy, not a dispatch bug -- layer_is_
+        // unpacked() itself already correctly returns false for a
+        // dense-only layer, same as it does for a packed one -- but worth
+        // fixing for real, since a wrong count here would mislead the next
+        // person reading this exact line to debug a real mixed model.
+        int unpacked_layer_count = 0;
         for (int l = 0; l < n_layers; ++l) {
+            // 2026-09, Phase 5 (mixed packed/unpacked models, see
+            // layer_is_unpacked's own comment): a layer that genuinely has
+            // the default packed _exps tensor is NOT this function's
+            // concern at all -- it's not an incomplete unpacked repack,
+            // it's simply a different, already-correct format, validated
+            // and handled by the existing packed-format code paths
+            // entirely independently of this function. Skip it outright
+            // rather than let it fall into the "found==0" dense-layer
+            // case below (which happens to also return early, but for the
+            // wrong reason, and would misreport a real packed layer as an
+            // empty one in any future diagnostic that inspects `found`).
+            // MUST use layer_is_unpacked() here, not a fresh inline
+            // packed_slab_geometry() check -- a real bug this session's
+            // own Phase 5 verification run caught: this used to check
+            // packed FIRST (its own separate copy of the logic), while
+            // layer_is_unpacked() (what every real dispatch/read-planning
+            // call site now uses) checks unpacked FIRST -- see that
+            // function's own comment for why. The mismatch meant a layer
+            // with BOTH a stale packed tensor (untouched shard) and a
+            // genuine unpacked override (this function's whole reason to
+            // exist) got silently SKIPPED here as "packed", so its real
+            // completeness/tightness was NEVER actually validated, even
+            // though the real dispatch path correctly used the unpacked
+            // data. Confirmed on real hardware: a genuinely mixed test
+            // model (one real layer overridden to unpacked, rest
+            // untouched packed) logged "0/78 genuinely unpacked" here
+            // despite the override working correctly end-to-end (0
+            // errors, coherent output) -- the validation was the only
+            // thing actually broken, not the dispatch.
+            if (!layer_is_unpacked(l)) {
+                // Not unpacked -- distinguish genuinely packed (has the
+                // _exps tensor) from dense-only (neither format, e.g. a
+                // architecture_config.first_dense leading layer) purely
+                // for an accurate summary count below; either way there's
+                // nothing for this function to validate, so both continue.
+                size_t pgb, pub, pdb;
+                const GGUFTensor *pgM, *puM, *pdM;
+                if (packed_slab_geometry(l, pgb, pub, pdb, pgM, puM, pdM)) ++packed_layer_count;
+                continue;
+            }
             size_t layer_gb = 0, layer_ub = 0, layer_db = 0;
             bool have_layer_size = false;
+            bool layer_mixed = false;
             int found = 0;
             for (int e = 0; e < n_exp; ++e) {
                 size_t gb, ub, db;
@@ -779,21 +1382,17 @@ public:
                     layer_gb = gb; layer_ub = ub; layer_db = db;
                     have_layer_size = true;
                 } else if (gb != layer_gb || ub != layer_ub || db != layer_db) {
-                    fprintf(stderr, "[FATAL] unpacked_expert_format=true: layer %d expert %d has "
-                                    "projection sizes (%zu,%zu,%zu) bytes but this layer's expert 0 had "
-                                    "(%zu,%zu,%zu) -- non-uniform per-expert sizes within one layer are "
-                                    "not supported by the single-DMA fast path. Stopping.\n",
-                            l, e, gb, ub, db, layer_gb, layer_ub, layer_db);
-                    return false;
+                    layer_mixed = true;   // real, expected for a mixed-precision layer -- not fatal
                 }
                 if (!unpacked_expert_is_tight(*gM, *uM, *dM)) {
                     fprintf(stderr, "[FATAL] unpacked_expert_format=true: layer %d expert %d's "
                                     "gate/up/down are not physically contiguous on one file (likely split "
-                                    "across a repack output-shard boundary) -- the single-DMA fast path "
-                                    "requires every expert to be tight. Re-run gguf_tool pack --unpack "
-                                    "with a larger --max-shard-gb so no expert straddles a shard boundary, "
-                                    "or set unpacked_expert_format=false and use the default --align-only "
-                                    "packed format instead. Stopping before any real read.\n",
+                                    "across a repack output-shard boundary) -- a single-DMA read of THIS "
+                                    "expert requires it to be tight, regardless of what size any other "
+                                    "expert in the layer is. Re-run gguf_tool pack --unpack with a larger "
+                                    "--max-shard-gb so no expert straddles a shard boundary, or set "
+                                    "unpacked_expert_format=false and use the default --align-only packed "
+                                    "format instead. Stopping before any real read.\n",
                             l, e);
                     return false;
                 }
@@ -804,9 +1403,30 @@ public:
                         l, found, n_exp);
                 return false;
             }
+            layer_has_mixed_expert_sizes[l] = layer_mixed;
+            if (layer_mixed) ++mixed_layer_count;
+            if (found == n_exp) ++unpacked_layer_count;
         }
-        LOG_INFO("[UNPACKED] sanity check passed: every MoE layer's experts are complete, uniformly "
-                 "sized, and physically tight -- single-DMA reads enabled.\n");
+        if (packed_layer_count > 0) {
+            LOG_INFO("[UNPACKED] sanity check passed: %d/%d layer(s) are genuinely unpacked (validated "
+                     "complete + tight below), %d/%d layer(s) are still the default packed format "
+                     "(untouched, handled entirely by the existing packed-format code paths), %d/%d "
+                     "layer(s) are dense-only (no MoE tensors, neither format) -- a real mixed model "
+                     "(Phase 5, see CLAUDE.md), not a full-model conversion.\n",
+                     unpacked_layer_count, n_layers, packed_layer_count, n_layers,
+                     n_layers - packed_layer_count - unpacked_layer_count, n_layers);
+        }
+        if (mixed_layer_count > 0) {
+            LOG_INFO("[UNPACKED] every genuinely-unpacked layer's experts are complete and physically "
+                     "tight (single-DMA-per-expert reads enabled). %d/%d unpacked layer(s) have "
+                     "non-uniform per-expert sizes (real mixed precision) -- layer-level geometry "
+                     "shortcuts are disabled for those layers until per-expert-aware sizing lands "
+                     "(Phase 2/3); per-expert reads/dispatch are unaffected.\n",
+                     mixed_layer_count, unpacked_layer_count);
+        } else if (unpacked_layer_count > 0) {
+            LOG_INFO("[UNPACKED] sanity check passed: every genuinely-unpacked layer's experts are "
+                     "complete, uniformly sized, and physically tight -- single-DMA reads enabled.\n");
+        }
         return true;
     }
 
@@ -888,31 +1508,186 @@ public:
     // down underneath them. Expect their n_*_host_register_fail counters to
     // read nonzero (and their own staging path to be skipped) whenever this
     // feature is on; that is the expected, benign interaction, not a bug.
+    // Old slab buffers whose free() had to be deferred because a reader
+    // still held the pointer (see ensure_slab_capacity). Bounded in
+    // practice: only a genuine regrow-under-a-live-reader lands here, which
+    // a real run hit 3 times, and each entry is released as soon as the
+    // owning block's guards clear.
+    struct DeferredSlabFree {
+        void* ptr;
+        const MoEExpertBlock* owner;
+        size_t reservation_bytes;
+    };
+    std::vector<DeferredSlabFree> deferred_slab_frees;
+    std::mutex deferred_slab_free_mutex;
+
+    // Release any deferred buffer whose owning block no longer has a reader.
+    // Once that block's temp pin is gone, its load finished, and no async
+    // copy is pending, nothing can still be holding the OLD pointer either:
+    // every reader of a slab takes one of those holds for the duration of
+    // its use, so all three clearing is proof the old pointer is unreachable.
+    void drain_deferred_slab_frees() {
+        std::lock_guard<std::mutex> dg(deferred_slab_free_mutex);
+        size_t w = 0;
+        for (size_t i = 0; i < deferred_slab_frees.size(); ++i) {
+            const auto& d = deferred_slab_frees[i];
+            const MoEExpertBlock* o = d.owner;
+            const bool still_busy = o && (o->ram_temp_pin_count > 0 || o->ram_loading ||
+                                          const_cast<MoEExpertBlock*>(o)->copy_still_pending());
+            if (still_busy) {
+                deferred_slab_frees[w++] = d;   // keep waiting
+            } else {
+                free(d.ptr);
+                MemoryGuard::release_host_bytes(d.reservation_bytes);
+                perf().n_ram_slab_deferred_freed.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        deferred_slab_frees.resize(w);
+    }
+
+    // Single safe way to release a slot's slab. Every caller that frees a
+    // slab MUST go through this rather than calling free() directly: the
+    // three guards are the only thing standing between a regrow/reclaim and
+    // an in-flight reader (e.g. a queued ActiveLayerUploadWorkItem holding
+    // host_data captured at claim time). Unregister happens immediately --
+    // that only drops the page-lock, never the pages -- while the free
+    // itself is deferred whenever a reader may still hold the pointer.
+    void release_slab(MoEExpertBlock& slot) {
+        // A graph-backed layer owns this slice for the lifetime of the
+        // engine. Its identity is part of the graph's tensor view and it is
+        // never an LRU victim while the graph cache is active.
+        if (slot.slab_from_shared_arena) return;
+        // 2026-09-04 DOUBLE-FREE FIX. This and ensure_slab_capacity both did
+        // read slab_buffer -> decide -> push/free -> clear, with the mutex held
+        // ONLY around the push_back. Since ensure_slab_capacity runs inside
+        // get_experts_batch's OMP region, two threads could both observe the
+        // same non-null pointer and both push it onto deferred_slab_frees; the
+        // drain then freed it twice. Observed as
+        // `double free or corruption (!prev)` under glibc.malloc.check=3,
+        // aborting in ensure_slab_capacity during decode.
+        //
+        // Fix: CLAIM the pointer (read + null it) while holding the mutex, so
+        // exactly one caller can ever own it. The actual free() happens after
+        // the lock is dropped -- free() is thread-safe on its own and there is
+        // no reason to hold a global mutex across it.
+        uint8_t* claimed = nullptr;
+        size_t claimed_reservation = 0;
+        bool deferred = false;
+        {
+            std::lock_guard<std::mutex> dg(deferred_slab_free_mutex);
+            claimed = slot.slab_buffer;
+            if (!claimed) return;
+            claimed_reservation = slot.host_reservation_bytes;
+            slot.host_reservation_bytes = 0;
+            if (slot.slab_pinned) {
+                cudaHostUnregister(claimed);
+                slot.slab_pinned = false;
+                ram_pinned_bytes_used.fetch_sub(slot.slab_capacity, std::memory_order_relaxed);
+            }
+            const bool in_use = slot.ram_temp_pin_count > 0 || slot.ram_loading ||
+                                slot.copy_still_pending();
+            if (in_use) {
+                deferred_slab_frees.push_back({claimed, &slot, claimed_reservation});
+                perf().n_ram_slab_free_deferred.fetch_add(1, std::memory_order_relaxed);
+                deferred = true;
+            }
+            slot.slab_buffer = nullptr;
+            slot.slab_capacity = 0;
+        }
+        if (!deferred) {
+            free(claimed);
+            MemoryGuard::release_host_bytes(claimed_reservation);
+        }
+    }
+
     void ensure_slab_capacity(MoEExpertBlock& slot, size_t total) {
+        drain_deferred_slab_frees();
         PERF_START(alloc);
+        if (slot.slab_from_shared_arena) {
+            if (slot.slab_capacity < total) {
+                LOG_ERROR("[GRAPH-RAM] shared arena slice too small: have=%zu need=%zu\n",
+                          slot.slab_capacity, total);
+            }
+            PERF_END(alloc, t_host_alloc);
+            return;
+        }
         if (slot.slab_capacity < total) {
             auto t0 = std::chrono::high_resolution_clock::now();
-            if (slot.slab_buffer) {
-                // MUST unregister before free() -- freeing still-registered
-                // memory is undefined behavior (the same hazard
-                // upload_expert's own unregister-on-every-path comment
-                // already calls out for its transient registrations).
-                if (slot.slab_pinned) {
-                    cudaHostUnregister(slot.slab_buffer);
-                    slot.slab_pinned = false;
-                    ram_pinned_bytes_used.fetch_sub(slot.slab_capacity, std::memory_order_relaxed);
-                    perf().n_ram_slab_unpinned_on_regrow.fetch_add(1, std::memory_order_relaxed);
-                }
-                free(slot.slab_buffer);
+            // Reserve before allocating and before releasing the old slab.
+            // This accounts for the realloc peak (old + new), so a growth
+            // cannot transiently exceed host_ram_gb even when the old buffer
+            // is still protected by an async reader.
+            if (!MemoryGuard::try_reserve_host_bytes(total)) {
+                perf().n_mem_guard_alloc_refused.fetch_add(1, std::memory_order_relaxed);
+                LOG_WARN("[MEM-GUARD] RAM slab growth refused: %.2f MB (reserved=%.2f GB, "
+                         "budget=%.2f GB); retaining the existing slab\n",
+                         total / 1e6,
+                         MemoryGuard::reserved_host_bytes() / 1e9,
+                         MemoryGuard::host_budget_bytes() / 1e9);
+                PERF_END(alloc, t_host_alloc);
+                return;
             }
-            posix_memalign((void**)&slot.slab_buffer, 4096, total);
+
+            // Allocate the replacement while the old slab remains valid.  If
+            // malloc fails, the caller keeps a usable old slot and the new
+            // reservation is discharged immediately.
+            void* nb = nullptr;
+            const int pmerr = posix_memalign(&nb, 4096, total);
+            if (pmerr != 0 || !nb) {
+                MemoryGuard::release_host_bytes(total);
+                LOG_ERROR("[RAM] posix_memalign(%.2f MB) failed (errno=%d) -- this slot is "
+                          "left unchanged so the caller can keep using its old slab.\n",
+                          total / 1e6, pmerr);
+                PERF_END(alloc, t_host_alloc);
+                return;
+            }
+
+            uint8_t* claimed = nullptr;
+            size_t claimed_reservation = 0;
+            bool claimed_deferred = false;
+            {
+                std::lock_guard<std::mutex> dg(deferred_slab_free_mutex);
+                claimed = slot.slab_buffer;
+                if (claimed) {
+                    claimed_reservation = slot.host_reservation_bytes;
+                    slot.host_reservation_bytes = 0;
+                    const bool in_use = slot.ram_temp_pin_count > 0 ||
+                                        slot.ram_loading ||
+                                        slot.copy_still_pending();
+                    // Unregister before free or deferral; unregister only
+                    // removes the CUDA page lock, not the allocation.
+                    if (slot.slab_pinned) {
+                        cudaHostUnregister(claimed);
+                        slot.slab_pinned = false;
+                        ram_pinned_bytes_used.fetch_sub(slot.slab_capacity,
+                                                        std::memory_order_relaxed);
+                        perf().n_ram_slab_unpinned_on_regrow.fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
+                    if (in_use) {
+                        deferred_slab_frees.push_back(
+                            {claimed, &slot, claimed_reservation});
+                        perf().n_ram_slab_free_deferred.fetch_add(
+                            1, std::memory_order_relaxed);
+                        claimed_deferred = true;
+                    }
+                    slot.slab_buffer = nullptr;
+                    slot.slab_capacity = 0;
+                }
+                slot.slab_buffer = static_cast<uint8_t*>(nb);
+                slot.slab_capacity = total;
+                slot.host_reservation_bytes = total;
+            }
+            if (claimed && !claimed_deferred) {
+                free(claimed);
+                MemoryGuard::release_host_bytes(claimed_reservation);
+            }
             double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
             if (ms > 50.0) {
                 LOG_WARN("[SLOW-HOST-ALLOC] posix_memalign(%.2fMB) took %.2fms (old_capacity=%.2fMB)\n",
-                         total / 1e6, ms, slot.slab_capacity / 1e6);
+                         total / 1e6, ms, claimed_reservation / 1e6);
             }
-            slot.slab_capacity = total;
 
             if (slot.slab_buffer && ram_pinned_budget_bytes > 0) {
                 // Reserve first, register second -- a plain check-then-add
@@ -989,7 +1764,10 @@ public:
     bool populate_vram_shadow(MoEExpertBlock& slot, int layer_idx, int expert_id) const {
         size_t gb = 0, ub = 0, db = 0;
         const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
-        if (!expert_layer_geometry(layer_idx, gb, ub, db, gM, uM, dM)) return false;
+        // expert_geometry_for, not expert_layer_geometry -- this expert_id
+        // is real, not a stand-in for "the layer" (see that function's own
+        // comment: found by the 2026-09 caller audit).
+        if (!expert_geometry_for(layer_idx, expert_id, gb, ub, db, gM, uM, dM)) return false;
         slot.gate_proj.host_ptr = nullptr;
         slot.gate_proj.meta = *gM;
         slot.gate_proj.meta.offset = 0;
@@ -1082,7 +1860,14 @@ public:
                                      io_uring_backend::ReadRequest* out_reqs,
                                      int& out_n, size_t& out_total,
                                      int replica = 0) {
-        if (unpacked_expert_format) {
+        // layer_is_unpacked, not the global flag -- see its own comment
+        // (2026-09, Phase 5: per-layer mixed packed/unpacked models). This
+        // is the function that actually PLANS the real disk read, so
+        // dispatching on the wrong per-layer format here would build a
+        // read request against the wrong tensor entirely, not just size
+        // something wrong -- REPLICA_SPLIT's own single-DMA rationale
+        // below still only applies to a layer that's genuinely unpacked.
+        if (layer_is_unpacked(layer_idx)) {
             // One combined read; nothing to split across devices.
             if (replica == REPLICA_SPLIT) replica = 0;
             size_t gb, ub, db;
@@ -1135,16 +1920,42 @@ public:
     void load_expert_slab(int layer_idx, int expert_id, MoEExpertBlock& target_slot) {
         std::string base = "blk." + std::to_string(layer_idx) + ".";
         int n_exp = model_file.architecture_config.n_experts;
-
         // ---- Packed expert format: ffn_{gate,up,down}_exps.weight ----
         // Each packed tensor is [a, b, n_experts] with the expert index as the
         // LAST (contiguous) dimension, so expert E occupies bytes
         // [E*per_exp, (E+1)*per_exp). ne0 is the input dim, so the slice is
         // already the [O,I] row-major weight the matmul expects — no shuffle.
         // (GLM-5.2 UD ships this way: gate/up = Q2_K, down = Q3_K, packed.)
+        //
+        // MUST gate on !layer_is_unpacked(layer_idx), not a bare
+        // packed_slab_geometry() success check -- a real, confirmed bug
+        // (found 2026-09 chasing a real GPU-path NaN on a genuinely mixed
+        // per-expert model): a Phase 5 mixed-precision build deliberately
+        // leaves the ORIGINAL packed _exps tensor sitting untouched in a
+        // symlinked baseline shard alongside a genuine unpacked override
+        // (see engine.hpp's layer_is_unpacked() comment -- "both simply
+        // coexist... unless something here picks one", and every OTHER
+        // dispatch-decision call site already checks layer_is_unpacked()
+        // FIRST for exactly this reason). This function was the one real
+        // holdout still checking packed_slab_geometry() unconditionally --
+        // packed_slab_geometry() SUCCEEDS whenever that old tensor is still
+        // present, regardless of whether an unpacked override also exists,
+        // so this branch was silently reading a mixed layer's WRONG
+        // (baseline-uniform-sized) bytes for every expert -- while every
+        // other function downstream (expert_geometry_for, VRAM sizing, GPU
+        // kernel type selection) correctly resolved the SAME expert via the
+        // real override. That size/type mismatch (RAM slab holds e.g. an
+        // IQ2_S expert's bytes at IQ2_S's own offset/size, while everything
+        // downstream treats it as the real IQ1_S override -- different
+        // size, different quant format) is what produced a real NaN
+        // cascade on real hardware once GPU dispatch actually reached a
+        // promoted cold expert -- confirmed by an isolated GPU-kernel test
+        // against this exact expert's REAL override bytes coming back
+        // completely clean (0 NaN), proving the kernel itself was never
+        // the problem, only what bytes this function fed it.
         size_t gb, ub, db;
         const GGUFTensor *gM, *uM, *dM;
-        if (packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) {
+        if (!layer_is_unpacked(layer_idx) && packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM)) {
             const size_t total = gb + ub + db;
             ensure_slab_capacity(target_slot, total);
 
@@ -1308,8 +2119,9 @@ public:
             && down.offset == up_t->offset + ub_pe;
         if (tight) {
             auto t0 = std::chrono::high_resolution_clock::now();
+            bool is_direct_this = model_file.direct_io_active_for(gate);
             ssize_t r = direct_io::pread_direct_aware(
-                gate_fd, model_file.direct_io_active_for(gate), model_file.direct_io_alignment,
+                gate_fd, is_direct_this, model_file.direct_io_alignment,
                 target_slot.slab_buffer, total, gate.offset);
             double ms = std::chrono::duration<double, std::milli>(
                 std::chrono::high_resolution_clock::now() - t0).count();
@@ -1362,6 +2174,23 @@ public:
     // size and the prefetcher's staging buffer size always match what
     // load_expert_slab actually allocates. Returns 0 if layer_idx has no
     // expert tensors at all (e.g. a leading dense layer).
+    //
+    // 2026-09: unpacked-format branch now scans EVERY expert in the layer
+    // and returns the MAX combined size, not just expert 0's -- Phase 2 of
+    // per-expert mixed precision (see CLAUDE.md). All 5 real callers of
+    // this function are budget/capacity-planning uses (never "give me a
+    // specific expert's own type"), and 4 of the 5 already take a max
+    // across every LAYER to handle GLM-5.2-style cross-layer type
+    // heterogeneity (see this function's own comment above and main.cpp's
+    // VRAM-pool-sizing loop) -- returning this layer's own max here is the
+    // exact same principle applied one level deeper, not a new design, and
+    // it's a real, provable safe bound: every caller wants "big enough for
+    // whatever this layer might need to hold", and the true max is exactly
+    // that, for a uniform layer (max == the one shared size, byte-
+    // identical to the old expert-0 lookup) or a genuinely mixed one alike.
+    // The packed-format branch below is untouched -- GGUF's one-type-per-
+    // tensor constraint already makes it inherently uniform per layer, so
+    // there's nothing to scan.
     size_t compute_expert_slab_bytes(int layer_idx) const {
         std::string base = "blk." + std::to_string(layer_idx) + ".";
         int n_exp = model_file.architecture_config.n_experts;
@@ -1375,6 +2204,27 @@ public:
                  + dE->second.size_bytes / n_exp;
         }
 
+        if (n_exp > 0) {
+            size_t max_total = 0;
+            bool found_any = false;
+            for (int e = 0; e < n_exp; ++e) {
+                size_t gb, ub, db;
+                const GGUFTensor *gM, *uM, *dM;
+                if (!unpacked_expert_geometry(layer_idx, e, gb, ub, db, gM, uM, dM)) {
+                    if (!found_any) continue;  // no experts at all yet -- keep scanning, e.g. a sparse test file
+                    break;                     // real gap after real experts -- sanity_check_unpacked_format
+                                                // already refuses this at startup; here, just stop scanning
+                                                // rather than let a hole silently under-count.
+                }
+                found_any = true;
+                max_total = std::max(max_total, gb + ub + db);
+            }
+            if (found_any) return max_total;
+        }
+
+        // Legacy fallback (architecture_config.n_experts not yet populated,
+        // e.g. a narrow test harness that only sets up expert 0) -- same
+        // expert-0-only lookup this function always had, unchanged.
         auto git = model_file.tensors.find(base + "ffn_gate.0.weight");
         auto uit = model_file.tensors.find(base + "ffn_up.0.weight");
         auto dit = model_file.tensors.find(base + "ffn_down.0.weight");
@@ -1391,6 +2241,222 @@ public:
         }
 
         return 0;
+    }
+
+    bool prepare_graph_ram_arenas(const std::vector<int> &full_layers) {
+        graph_ram_arenas.assign(layers_experts.size(), {});
+        graph_ram_cache_enabled = false;
+        const int n_experts = model_file.architecture_config.n_experts;
+        if (n_experts <= 0 || full_layers.empty()) return false;
+
+        std::vector<unsigned char> requested(layers_experts.size(), 0);
+        for (int layer : full_layers) {
+            if (layer >= 0 && (size_t)layer < requested.size())
+                requested[(size_t)layer] = 1;
+        }
+
+        size_t allocated_layers = 0;
+        for (size_t layer = 0; layer < requested.size(); ++layer) {
+            if (!requested[layer] || layers_experts[layer].size() < (size_t)n_experts)
+                continue;
+
+            size_t gb = 0, ub = 0, db = 0;
+            const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+            if (!expert_layer_geometry((int)layer, gb, ub, db, gM, uM, dM) ||
+                gb == 0 || ub == 0 || db == 0 ||
+                gb > SIZE_MAX - ub || gb + ub > SIZE_MAX - db)
+                continue;
+
+            const size_t raw = gb + ub + db;
+            constexpr size_t alignment = 4096;
+            const size_t stride = (raw + alignment - 1) & ~(alignment - 1);
+            if (stride < raw || stride > SIZE_MAX / (size_t)n_experts)
+                continue;
+            const size_t bytes = stride * (size_t)n_experts;
+            if (!MemoryGuard::try_reserve_host_bytes(
+                    bytes, 8ull * 1024ull * 1024ull * 1024ull)) {
+                LOG_WARN("[GRAPH-RAM] layer %zu arena refused: %.2f GiB "
+                         "(reserved=%.2f GiB, budget=%.2f GB)\n",
+                         layer, (double)bytes / (1024.0 * 1024.0 * 1024.0),
+                         (double)MemoryGuard::reserved_host_bytes() / 1.0e9,
+                         (double)MemoryGuard::host_budget_bytes() / 1.0e9);
+                continue;
+            }
+
+            void *raw_ptr = nullptr;
+            if (posix_memalign(&raw_ptr, alignment, bytes) != 0 || !raw_ptr) {
+                MemoryGuard::release_host_bytes(bytes);
+                LOG_WARN("[GRAPH-RAM] layer %zu arena allocation failed: %.2f GiB\n",
+                         layer, (double)bytes / (1024.0 * 1024.0 * 1024.0));
+                continue;
+            }
+
+            GraphRamLayerArena &arena = graph_ram_arenas[layer];
+            arena.base = static_cast<uint8_t *>(raw_ptr);
+            arena.bytes = bytes;
+            arena.stride = stride;
+            arena.gate_bytes = gb;
+            arena.up_bytes = ub;
+            arena.down_bytes = db;
+            arena.n_experts = n_experts;
+            arena.host_reservation_bytes = bytes;
+
+            // Registration is optional and budgeted independently from the
+            // host allocation. A failed registration leaves a valid pageable
+            // arena; the graph remains correct, only the H2D copy cannot DMA
+            // directly from this layer.
+            if (ram_pinned_budget_bytes > 0) {
+                const size_t previous =
+                    ram_pinned_bytes_used.fetch_add(bytes, std::memory_order_relaxed);
+                if (previous <= ram_pinned_budget_bytes &&
+                    bytes <= ram_pinned_budget_bytes - previous) {
+                    const cudaError_t err = cudaHostRegister(
+                        arena.base, arena.bytes, cudaHostRegisterPortable);
+                    if (err == cudaSuccess) {
+                        arena.pinned = true;
+                    } else {
+                        ram_pinned_bytes_used.fetch_sub(bytes,
+                                                        std::memory_order_relaxed);
+                        cudaGetLastError();
+                    }
+                } else {
+                    ram_pinned_bytes_used.fetch_sub(bytes,
+                                                    std::memory_order_relaxed);
+                }
+            }
+
+            for (int expert = 0; expert < n_experts; ++expert) {
+                MoEExpertBlock &slot = layers_experts[layer][(size_t)expert];
+                // This path is startup-only and is called before preload. Do
+                // not overwrite a live individually-owned slab if a caller
+                // violates that ordering; leave the layer out of the graph
+                // view rather than leaking or aliasing the wrong allocation.
+                if (slot.slab_buffer && !slot.slab_from_shared_arena) {
+                    LOG_WARN("[GRAPH-RAM] layer %zu has an existing RAM slab; "
+                             "shared view disabled for this layer\n", layer);
+                    if (arena.pinned) {
+                        cudaHostUnregister(arena.base);
+                        ram_pinned_bytes_used.fetch_sub(
+                            arena.bytes, std::memory_order_relaxed);
+                    }
+                    free(arena.base);
+                    MemoryGuard::release_host_bytes(arena.host_reservation_bytes);
+                    arena = {};
+                    goto next_graph_ram_layer;
+                }
+                slot.slab_buffer = arena.base + (size_t)expert * arena.stride;
+                slot.slab_capacity = arena.stride;
+                slot.host_reservation_bytes = 0;
+                slot.slab_pinned = arena.pinned;
+                slot.slab_from_shared_arena = true;
+            }
+            ++allocated_layers;
+            LOG_STREAM_INFO() << "[GRAPH-RAM] layer " << layer << " arena: "
+                              << (double)bytes / (1024.0 * 1024.0 * 1024.0)
+                              << " GiB, stride=" << stride << " bytes, "
+                              << (arena.pinned ? "pinned" : "pageable") << "\n";
+        next_graph_ram_layer:
+            continue;
+        }
+
+        graph_ram_cache_enabled = allocated_layers > 0;
+        if (graph_ram_cache_enabled)
+            LOG_STREAM_INFO() << "[GRAPH-RAM] prepared " << allocated_layers
+                              << " complete layer arena(s); startup preload will "
+                                 "populate existing graph-visible slots\n";
+        return graph_ram_cache_enabled;
+    }
+
+    bool graph_ram_layer_allocated(int layer) const {
+        return graph_ram_cache_enabled && layer >= 0 &&
+               (size_t)layer < graph_ram_arenas.size() &&
+               graph_ram_arenas[(size_t)layer].base != nullptr;
+    }
+
+    bool graph_ram_layer_ready(int layer) const {
+        if (!graph_ram_layer_allocated(layer)) return false;
+        const GraphRamLayerArena &arena = graph_ram_arenas[(size_t)layer];
+        if (arena.n_experts <= 0 || (size_t)arena.n_experts > layers_experts[(size_t)layer].size())
+            return false;
+        for (int expert = 0; expert < arena.n_experts; ++expert) {
+            const MoEExpertBlock &slot = layers_experts[(size_t)layer][(size_t)expert];
+            if (!slot.slab_from_shared_arena || slot.expert_id != expert ||
+                slot.slab_buffer != arena.base + (size_t)expert * arena.stride ||
+                slot.slab_capacity < arena.gate_bytes + arena.up_bytes + arena.down_bytes ||
+                slot.ram_loading || !slot.gate_proj.host_ptr ||
+                !slot.up_proj.host_ptr || !slot.down_proj.host_ptr)
+                return false;
+        }
+        return true;
+    }
+
+    const GraphRamLayerArena *graph_ram_arena(int layer) const {
+        return graph_ram_layer_allocated(layer)
+                   ? &graph_ram_arenas[(size_t)layer]
+                   : nullptr;
+    }
+
+    // GGML-CUDA's quantized MUL_MAT_ID kernels express nb[2] in units of
+    // the source type's block size.  The VRAM cache uses one physical slot
+    // stride for every layer, while dynamic-quant models can have different
+    // row sizes (for example IQ2_XXS and IQ1_M in the same Qwen checkpoint).
+    // A direct view of an interleaved resident slot is valid only when that
+    // common stride is a whole number of rows for every routed projection.
+    // Return the smallest such byte alignment.  This is deliberately based
+    // on the GGUF tensor metadata, so it remains correct for future mixed
+    // quantization layouts without hard-coding a list of block sizes.
+    size_t expert_cache_stride_alignment() const {
+        size_t alignment = 1;
+        const int n_exp = model_file.architecture_config.n_experts;
+        if (n_exp <= 0) return alignment;
+
+        auto add_row_alignment = [&](const GGUFTensor& t, size_t divisor) {
+            if (divisor == 0 || t.shape.size() < 2) return;
+            const size_t rows = (size_t)t.shape[1];
+            if (rows == 0) return;
+            const size_t per_expert = t.size_bytes / divisor;
+            const size_t row_bytes = per_expert / rows;
+            if (row_bytes == 0) return;
+            const size_t g = std::gcd(alignment, row_bytes);
+            if (alignment > SIZE_MAX / (row_bytes / g)) {
+                alignment = SIZE_MAX;
+                return;
+            }
+            alignment *= row_bytes / g;
+        };
+
+        // Normally layers_experts is populated by graph_initializer and also
+        // includes the optional GLM NextN/MTP routed block.  Keep the target
+        // count as a fallback for narrow unit-test engines that call this
+        // helper before constructing the cache topology.
+        const int cache_layers = layers_experts.empty()
+                                     ? model_file.architecture_config.n_layers
+                                     : static_cast<int>(layers_experts.size());
+        for (int l = 0; l < cache_layers; ++l) {
+            const std::string base = "blk." + std::to_string(l) + ".";
+            auto add = [&](const std::string& name, size_t divisor) {
+                auto it = model_file.tensors.find(name);
+                if (it != model_file.tensors.end()) add_row_alignment(it->second, divisor);
+            };
+
+            add(base + "ffn_gate_exps.weight", (size_t)n_exp);
+            add(base + "ffn_up_exps.weight", (size_t)n_exp);
+            add(base + "ffn_down_exps.weight", (size_t)n_exp);
+
+            // Repacked per-expert GGUFs have one tensor per expert.  Their
+            // row alignment is the same constraint, but there is no expert
+            // axis to divide out.
+            if (layer_is_unpacked(l)) {
+                for (int e = 0; e < n_exp; ++e) {
+                    const std::string es = std::to_string(e);
+                    add(base + "ffn_gate." + es + ".weight", 1);
+                    add(base + "ffn_up." + es + ".weight", 1);
+                    add(base + "ffn_down." + es + ".weight", 1);
+                }
+            }
+            if (alignment == SIZE_MAX) return alignment;
+        }
+        return alignment;
     }
 
     void issue_prefetch(int layer_idx, const std::vector<int>& predicted_expert_ids) {
@@ -1418,7 +2484,10 @@ public:
     // route_freq is [n_layers * n_experts]; call once layers/n_experts are known
     // (after build_model_graph). Idempotent.
     void init_route_freq() {
-        int nl = model_file.architecture_config.n_layers;
+        // layers_experts is the authoritative routed-layer topology.  It also
+        // includes an opt-in GLM NextN/MTP block; omitting that layer here
+        // would make its router writes silently fall outside the histogram.
+        int nl = static_cast<int>(layers_experts.size());
         int ne = model_file.architecture_config.n_experts;
         if (nl <= 0 || ne <= 0) return;
         size_t n = (size_t)nl * (size_t)ne;
@@ -1478,6 +2547,26 @@ public:
     // (typically) a different path (EngineConfig::prefill_pin_file).
     void dump_usage_prefill(const std::string& path) const {
         dump_usage_histogram(path, route_freq_prefill);
+    }
+
+    // Charge a long-lived engine-owned host allocation to the same ledger
+    // used by RAM slabs, graph buffers, and MTP scratch.  Callers must invoke
+    // this before allocating and release the charge if allocation fails.
+    bool reserve_host_memory(size_t bytes) {
+        if (bytes == 0) return true;
+        if (!MemoryGuard::try_reserve_host_bytes(bytes)) {
+            host_memory_allocation_failed = true;
+            return false;
+        }
+        host_memory_reservation_bytes += bytes;
+        return true;
+    }
+
+    void release_host_memory(size_t bytes) {
+        if (bytes == 0) return;
+        const size_t released = std::min(bytes, host_memory_reservation_bytes);
+        host_memory_reservation_bytes -= released;
+        MemoryGuard::release_host_bytes(released);
     }
 
 private:

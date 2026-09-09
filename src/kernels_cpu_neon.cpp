@@ -19,7 +19,7 @@
 #include "kernels_cpu.hpp"
 #include "logger.hpp"
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(MOESTREAM_METAL)
 #include "kernels_metal.hpp"
 #endif
 
@@ -131,7 +131,7 @@ uint16_t fp32_to_fp16(float f) { return f32_to_fp16_bits(f); }
 // f32 x f32 matmul: y[S,O] = x[S,I] @ W^T, W is [O,I] row-major.
 // ----------------------------------------------------------------------------
 void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(MOESTREAM_METAL)
   if (moestream_metal::available() &&
       moestream_metal::matmul_f32(y, x, W, S, I, O))
     return;

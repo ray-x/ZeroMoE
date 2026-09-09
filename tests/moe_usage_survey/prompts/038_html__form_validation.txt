@@ -1,0 +1,1 @@
+Write an HTML form with fields for name, email, and password, including basic client-side validation attributes.

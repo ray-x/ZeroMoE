@@ -1,0 +1,1 @@
+Write a TypeScript React functional component with a counter using useState.

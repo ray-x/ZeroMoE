@@ -1,0 +1,1 @@
+Write a bash script that parses command-line arguments with getopts, supporting -v and --file.

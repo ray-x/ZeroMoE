@@ -1,0 +1,1 @@
+Write a JSON schema describing a "user" object with id, name, email, and an array of roles.

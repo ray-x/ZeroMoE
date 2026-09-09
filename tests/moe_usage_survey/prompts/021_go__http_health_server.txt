@@ -1,0 +1,1 @@
+Write a Go HTTP server with a single /health endpoint returning JSON.

@@ -1,0 +1,6 @@
+Explain what this TypeScript code does and whether the types are safe:
+```typescript
+function merge(a: any, b: any) {
+  return { ...a, ...b };
+}
+```

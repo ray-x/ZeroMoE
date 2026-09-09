@@ -1,0 +1,1 @@
+Explain the difference between a zombie process and an orphan process in Linux.

@@ -1,0 +1,9 @@
+Review this bash script for potential bugs:
+```bash
+#!/bin/bash
+for f in $(ls *.log); do
+  if [ $f -gt 1000000 ]; then
+    rm $f
+  fi
+done
+```

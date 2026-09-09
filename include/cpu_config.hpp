@@ -207,6 +207,8 @@ struct CPUConfig {
   // not evidence of a missing/broken template. Set this (or --system-prompt)
   // to add one, e.g. "Respond in English unless asked otherwise."
   std::string system_prompt;
+  bool enable_thinking = true;
+  std::string reasoning_effort = "max";
   std::string log_level = "INFO";
   std::string log_path;
 
@@ -232,6 +234,8 @@ struct CPUConfig {
     omp_max_threads = doc.root.get_int("omp_max_threads", omp_max_threads);
     raw_prompt = doc.root.get_bool("raw_prompt", raw_prompt);
     system_prompt = doc.root.get_str("system_prompt", system_prompt);
+    enable_thinking = doc.root.get_bool("enable_thinking", enable_thinking);
+    reasoning_effort = doc.root.get_str("reasoning_effort", reasoning_effort);
     log_level = doc.root.get_str("log_level", log_level);
     log_path = doc.root.get_str("log_path", log_path);
 
@@ -248,6 +252,8 @@ struct CPUConfig {
                       << " tokens | Max gen: " << max_new_tokens << "\n";
     LOG_STREAM_INFO() << "[CPU-CONFIG] Temperature: " << temperature
                       << " | Top-p: " << top_p << "\n";
+    LOG_STREAM_INFO() << "[CPU-CONFIG] Thinking: "
+                      << (enable_thinking ? "enabled" : "disabled") << "\n";
     LOG_STREAM_INFO() << "[CPU-CONFIG] Host RAM budget: " << host_ram_gb
                       << " GB\n";
     LOG_STREAM_INFO() << "[CPU-CONFIG] Pin: top-" << pin_topk_per_layer

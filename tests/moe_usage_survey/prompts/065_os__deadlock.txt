@@ -1,0 +1,1 @@
+Explain deadlock, the four necessary conditions for it, and one strategy to prevent it.

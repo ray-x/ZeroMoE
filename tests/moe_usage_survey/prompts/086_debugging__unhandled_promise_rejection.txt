@@ -1,0 +1,8 @@
+This Node.js code throws `UnhandledPromiseRejectionWarning`, what's the issue?
+```javascript
+async function loadUser(id) {
+  const res = await fetch(`/api/users/${id}`);
+  return res.json();
+}
+loadUser(123).then(user => console.log(user.name));
+```

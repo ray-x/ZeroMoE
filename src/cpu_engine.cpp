@@ -329,6 +329,15 @@ static bool is_routed_expert_tensor(const std::string &name) {
          name.find("ffn_down_exps.weight") != std::string::npos;
 }
 
+static bool is_qwen4exp_deferred_tensor(const GGUFFile &model,
+                                        const std::string &name) {
+  if (detect_model_family(model) != ModelFamily::Qwen4Exp)
+    return false;
+  return name == "per_layer_token_embd.weight" ||
+         name.find(".indexer_") != std::string::npos ||
+         name.find(".indexer.") != std::string::npos;
+}
+
 bool CPUEngine::build(int max_ctx) {
   max_t = max_ctx;
 
@@ -366,6 +375,45 @@ bool CPUEngine::build(int max_ctx) {
   c.head_dim = model_file.get_config_int("attention.key_length", c.head_dim);
   c.dense_inter =
       model_file.get_config_int("feed_forward_length", c.dense_inter);
+  if (detect_model_family(model_file) == ModelFamily::Qwen4Exp) {
+    c.qwen4exp_recurrent_layers =
+        model_file.get_config_int_array("attention.recurrent_layers");
+    c.qwen4exp_full_attention_interval =
+        model_file.get_config_int("full_attention_interval", 4);
+    c.ssm_conv_kernel = model_file.get_config_int("ssm.conv_kernel", 0);
+    c.ssm_inner_size = model_file.get_config_int("ssm.inner_size", 0);
+    c.ssm_state_size = model_file.get_config_int("ssm.state_size", 0);
+    c.ssm_time_step_rank =
+        model_file.get_config_int("ssm.time_step_rank", 0);
+    c.ssm_group_count = model_file.get_config_int("ssm.group_count", 0);
+    c.hc_mult = model_file.get_config_int("hyper_connection.count", 1);
+    c.hc_low_rank = model_file.get_config_int("hyper_connection.low_rank", 0);
+    c.qwen4exp_compress_ratios =
+        model_file.get_config_int_array("attention.compress_ratios");
+    c.qwen4exp_indexer_head_count =
+        model_file.get_config_int("attention.indexer.head_count", 0);
+    c.qwen4exp_indexer_key_length =
+        model_file.get_config_int("attention.indexer.key_length", 0);
+    c.qwen4exp_indexer_top_k =
+        model_file.get_config_int("attention.indexer.top_k", 0);
+    c.rope_sections =
+        model_file.get_config_int_array("rope.dimension_sections");
+    c.rope_n_rot = model_file.get_config_int("rope.dimension_count", 0);
+    c.ple_layers = model_file.get_config_int_array("ple.layers");
+    c.ple_ngram_size = model_file.get_config_int("ple.ngram_size", 0);
+    c.ple_heads_per_ngram =
+        model_file.get_config_int("ple.heads_per_ngram", 0);
+    c.ple_conv_kernel = model_file.get_config_int("ple.conv_kernel", 0);
+    c.ple_eos_token_id = model_file.get_config_int("ple.eos_token_id", -1);
+    c.ple_n_embd_per_layer =
+        model_file.get_config_int("embedding_length_per_layer_input", 0);
+    c.ple_layer_multipliers =
+        model_file.get_config_int_array("ple.layer_multipliers");
+    c.ple_head_offsets = model_file.get_config_int_array("ple.head_offsets");
+    c.ple_head_vocab_sizes =
+        model_file.get_config_int_array("ple.head_vocab_sizes");
+    c.ple_n_heads = (c.ple_ngram_size - 1) * c.ple_heads_per_ngram;
+  }
   c.expert_weights_scale = model_file.get_config_float("expert_weights_scale",
                                                        c.expert_weights_scale);
   c.eps =
@@ -401,7 +449,8 @@ bool CPUEngine::build(int max_ctx) {
   size_t total_loaded = 0;
   size_t dense_count = 0;
   for (auto &[name, t_meta] : model_file.tensors) {
-    if (is_routed_expert_tensor(name))
+    if (is_routed_expert_tensor(name) ||
+        is_qwen4exp_deferred_tensor(model_file, name))
       continue;
 
     CPUQuantizedTensor qt;
@@ -430,7 +479,9 @@ bool CPUEngine::build(int max_ctx) {
       return false;
     }
 
-    if (!densify_tensor(qt)) {
+    const bool keep_qwen4exp_quantized =
+        detect_model_family(model_file) == ModelFamily::Qwen4Exp;
+    if (!keep_qwen4exp_quantized && !densify_tensor(qt)) {
       LOG_ERROR("[CPU-ENGINE] Failed to densify tensor %s (type=%u shape=[",
                 name.c_str(), static_cast<uint32_t>(t_meta.type));
       for (size_t i = 0; i < t_meta.shape.size(); ++i) {

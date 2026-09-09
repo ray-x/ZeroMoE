@@ -1,0 +1,1 @@
+Write a C++ class implementing a thread-safe queue using std::mutex and std::condition_variable.

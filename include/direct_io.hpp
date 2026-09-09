@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unistd.h>
+#include "memory_guard.hpp"
 
 namespace direct_io {
 
@@ -68,13 +69,31 @@ inline AlignedWindow compute_aligned_window(uint64_t real_offset, uint64_t real_
 struct AlignedScratch {
     uint8_t* buf = nullptr;
     size_t cap = 0;
-    ~AlignedScratch() { if (buf) free(buf); }
-    void ensure(size_t need, size_t alignment) {
-        if (cap >= need) return;
+    size_t reservation = 0;
+    ~AlignedScratch() {
         if (buf) free(buf);
-        buf = nullptr;
-        if (posix_memalign((void**)&buf, alignment, need) != 0) buf = nullptr;
-        cap = buf ? need : 0;
+        MemoryGuard::release_host_bytes(reservation);
+    }
+    bool ensure(size_t need, size_t alignment) {
+        if (cap >= need && buf) return true;
+        if (need == 0 || alignment == 0 ||
+            !MemoryGuard::try_reserve_host_bytes(need))
+            return false;
+        uint8_t *replacement = nullptr;
+        if (posix_memalign((void**)&replacement, alignment, need) != 0 ||
+            !replacement) {
+            MemoryGuard::release_host_bytes(need);
+            return false;
+        }
+        // Reserve the replacement before dropping the old scratch so a
+        // concurrent direct-I/O batch cannot observe an under-counted growth
+        // peak. The old buffer remains valid if allocation fails.
+        if (buf) free(buf);
+        MemoryGuard::release_host_bytes(reservation);
+        buf = replacement;
+        cap = need;
+        reservation = need;
+        return true;
     }
 };
 
@@ -102,8 +121,11 @@ inline ssize_t pread_direct_aware(int fd, bool is_direct, uint64_t alignment,
     AlignedWindow win = compute_aligned_window(offset, len, alignment);
 
     thread_local AlignedScratch scratch;
-    scratch.ensure(win.aligned_len, alignment);
-    if (!scratch.buf) return -1;  // allocation failure -- caller's short-read check will flag this
+    // A failed grow must fail even when an older, smaller scratch buffer
+    // exists. Reusing that buffer would let pread() overwrite past its
+    // allocation on the next larger aligned window.
+    if (!scratch.ensure(win.aligned_len, alignment))
+        return -1;  // allocation failure -- caller's short-read check will flag this
 
     ssize_t r = pread(fd, scratch.buf, win.aligned_len, (off_t)win.aligned_offset);
     if (r < 0) return r;

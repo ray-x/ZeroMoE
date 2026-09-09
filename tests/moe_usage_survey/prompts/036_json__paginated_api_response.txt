@@ -1,0 +1,1 @@
+Write a JSON example representing a paginated API response with metadata (page, total, per_page) and a data array.

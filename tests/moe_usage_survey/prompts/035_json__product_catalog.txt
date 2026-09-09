@@ -1,0 +1,1 @@
+Convert this description into JSON: a product catalog entry with id, name, price, tags, and nested dimensions (width/height/depth).

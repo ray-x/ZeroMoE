@@ -1,0 +1,10 @@
+Review this C++ code for potential issues:
+```cpp
+class Buffer {
+public:
+    Buffer(int size) { data = new int[size]; }
+    ~Buffer() { delete data; }
+private:
+    int* data;
+};
+```

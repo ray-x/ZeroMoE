@@ -1,0 +1,1 @@
+Write a JavaScript function that debounces another function by a given delay.

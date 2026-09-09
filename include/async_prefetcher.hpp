@@ -15,25 +15,48 @@
 #include <unistd.h>
 #include <cuda_runtime.h>
 
-// How long a hint may sit in the queue before the worker thread actually
-// starts processing it (pickup delay) before it's logged as anomalous
-// ([SLOW-PICKUP]). Even a perfectly healthy worker processes hints strictly
-// sequentially, and the pilot pushes up to 8 hints per layer -- at a normal
-// ~15ms/expert read, the LAST hint in one layer's batch can legitimately
-// wait ~100ms+ just from the worker churning through the ones ahead of it,
-// with zero contention or backlog involved. 250ms gives real margin above
-// that benign case while still catching genuine backlog/starvation.
-// Distinguishes "the worker thread can't get scheduled promptly" (CPU
-// contention with OMP dequant threads) from "the worker thread is scheduled
-// fine but can't drain hints as fast as they're produced" (pure throughput/
-// concurrency ceiling) -- the two point at very different fixes. NOTE: the
-// "~100ms+ legitimate wait" baseline above assumed exactly ONE worker thread
-// serializing all 8 hints; with prefetch_worker_threads > 1 that worst case
-// shrinks roughly proportionally, so this threshold is correspondingly more
-// conservative (looser, not tighter) than strictly necessary when multiple
-// workers are configured -- left as-is since a looser threshold only risks
-// under-, not over-, reporting SLOW-PICKUP.
-constexpr double SLOW_PICKUP_MS = 250.0;
+// [SLOW-PICKUP] fires when a hint sits in the queue longer than a healthy
+// worker pool could possibly justify. The hard part is that "healthy" is not
+// a constant: a hint pushed behind N others must wait for those N to be read
+// first, so the benign wait scales with how deep the queue was when it was
+// pushed, and shrinks with worker count.
+//
+// This was originally a flat 250ms, calibrated against DECODE's batch size
+// (prefetch_pilot_k=8 hints per layer transition: 8 x ~15ms/read ~= 120ms
+// benign, so 250ms left margin). That calibration silently rotted once
+// prefill_warm_via_prefetcher started pushing prefill's whole real candidate
+// set at once -- measured at ~137 hints/layer on GLM-5.3, ~17x what the
+// constant assumed. The result was 254 warnings per run, ALL inside prefill,
+// on a prefetcher that was in fact working perfectly: only 16 of 31,931
+// accesses (0.05%) ever raced ahead of a worker, backlog stayed bounded at
+// 45, and the observed max wait (334ms) matched the predicted benign drain
+// for prefill's real batch (137/6 workers x 15ms ~= 343ms) to within 3%.
+//
+// So the threshold is now derived per hint instead of fixed:
+//
+//   expected_ms  = (queue_depth_at_push / n_workers) * avg_observed_read_ms
+//   threshold_ms = max(SLOW_PICKUP_FLOOR_MS, expected_ms * SLOW_PICKUP_SLACK)
+//
+// avg_observed_read_ms is this run's own measured average (t_prefetch_read_
+// ms_sum / n_prefetch_completed), so it self-calibrates to the real device
+// and workload rather than to a hardcoded 15ms guess -- and it will not rot
+// again the next time prefetch_pilot_k, prefetch_worker_threads, or the
+// storage layout changes, which is the actual failure this replaces.
+//
+// The floor keeps DECODE's behaviour byte-identical to the old constant: at
+// decode's depth of ~8, expected_ms is ~20ms, so the floor dominates and the
+// effective threshold is still 250ms. A genuine decode-side backlog still
+// trips it exactly as before. The slack multiplier covers ordinary variance
+// in per-read time (a cold vs warm shard, an unlucky io_uring batch) without
+// which a merely slower-than-average read would look anomalous.
+constexpr double SLOW_PICKUP_FLOOR_MS = 250.0;
+constexpr double SLOW_PICKUP_SLACK    = 2.0;
+// Used only until this run has enough completed reads to average -- matches
+// the ~15ms/expert figure the original constant's own arithmetic assumed.
+constexpr double SLOW_PICKUP_BOOTSTRAP_READ_MS = 15.0;
+// Below this many completed reads, the measured average is too noisy to
+// trust as a threshold basis; fall back to the bootstrap figure.
+constexpr uint64_t SLOW_PICKUP_MIN_SAMPLES = 32;
 
 // Which pilot fired this hint -- exists purely to split the shared queue's
 // real disk-cost counters (bytes/time/issued/completed/failed/claims_
@@ -45,7 +68,12 @@ constexpr double SLOW_PICKUP_MS = 250.0;
 // prefill_warm_via_prefetcher hints) -- NOT split further, since isolating
 // depth-2's cost is this split's only purpose; "Other" is not a synonym
 // for "depth-1 pilot only".
-enum class PilotSource : uint8_t { Other, Depth2 };
+// AttnPilot (2026-08-25): ATTN-PILOT's real hints -- predicts a layer from
+// the PREVIOUS layer's post-attention/pre-FFN state, tagged separately from
+// Depth2 (which also, in effect, reaches "2 layers past the last known-
+// complete layer" but via naive stale reuse instead) so their real disk-I/O
+// costs are attributable independently in the shutdown report.
+enum class PilotSource : uint8_t { Other, Depth2, AttnPilot };
 
 // 2026-08-14 TRIED AND REVERTED: batching PREFETCH_BATCH_HINTS (3) queued
 // hints into one worker io_uring submission (up to depth 9 legs instead of
@@ -79,6 +107,12 @@ struct PrefetchHint {
     int expert_id;
     std::chrono::high_resolution_clock::time_point pushed_at;
     PilotSource source = PilotSource::Other;
+    // How many hints were already queued ahead of this one when it was
+    // pushed. This is the quantity that makes a long pickup delay benign or
+    // not -- see SLOW_PICKUP_FLOOR_MS's own comment. Recorded at push rather
+    // than derived at pickup because by pickup time the queue has already
+    // drained and the number that actually mattered is gone.
+    unsigned int depth_at_push = 0;
 };
 
 // Per-layer prefetch activity, sized to the model's layer count once in
@@ -89,16 +123,19 @@ struct PrefetchHint {
 // claim/publish design (RAMSafetyManager::claim_or_wait): the old prefetch_
 // served/prefetch_no_match/prefetch_not_ready/staged_evicted_unused/used_lifetime_
 // us_sum/evicted_lifetime_us_sum fields described a separate staging pool
-// that no longer exists -- claims_beaten_by_decode is the new, directly
+// that no longer exists -- claims_beaten_by_other is the new, directly
 // analogous signal (a prefetch worker's OWN claim attempt for this layer
-// found the expert already Hit or Loading -- i.e. the decode thread's own
-// miss-handling, or another prefetch worker, won the claim first).
+// found the expert already Hit or Loading -- i.e. the main generation-loop
+// thread's own miss-handling, or another prefetch worker, won the claim
+// first; NOT specifically "decode" -- see RamClaimCaller's own comment,
+// engine.hpp, for why the main thread's claims aren't decode-specific
+// either, since this same code path runs during prefill too).
 struct LayerPrefetchStats {
     std::atomic<uint64_t> hints_pushed{0};           // push_hint calls for this layer
     std::atomic<uint64_t> fetches_issued{0};         // real disk reads actually started (active_prefetch)
     std::atomic<uint64_t> fetches_completed{0};      // ...and finished successfully
     std::atomic<uint64_t> fetches_failed{0};         // ...and finished with a short-read/error
-    std::atomic<uint64_t> claims_beaten_by_decode{0}; // this layer's claim_or_wait attempt found the expert already resident or already being fetched by someone else -- a wasted hint, now directly countable
+    std::atomic<uint64_t> claims_beaten_by_other{0}; // this layer's claim_or_wait attempt found the expert already resident or already being fetched by someone else (main thread or another prefetch worker) -- a wasted hint, now directly countable
     std::atomic<uint64_t> fetch_us_sum{0};           // sum of completed-fetch durations (microseconds) -- for this layer's avg_ms
 };
 
@@ -226,7 +263,7 @@ public:
             const LayerPrefetchStats& s = layer_stats[l];
             uint64_t hints = s.hints_pushed.load(std::memory_order_relaxed);
             uint64_t issued = s.fetches_issued.load(std::memory_order_relaxed);
-            uint64_t beaten = s.claims_beaten_by_decode.load(std::memory_order_relaxed);
+            uint64_t beaten = s.claims_beaten_by_other.load(std::memory_order_relaxed);
             if (hints == 0 && issued == 0 && beaten == 0) continue;
             uint64_t completed = s.fetches_completed.load(std::memory_order_relaxed);
             uint64_t failed = s.fetches_failed.load(std::memory_order_relaxed);
@@ -335,10 +372,31 @@ public:
         unsigned int current_tail = tail_ref.load(std::memory_order_acquire);
 
         if (current_head - current_tail >= QUEUE_SIZE) {
+            // Ring full -- this hint is thrown away, which means the expert it
+            // named is now a guaranteed future cache miss (a real blocking disk
+            // read on the decode thread). This is THE signal that the workers
+            // are throughput-bound rather than merely busy, and it is why
+            // [SLOW-PICKUP] alone is not sufficient: once the queue is deep
+            // enough to drop, a depth-aware pickup threshold correctly reports
+            // the long wait as "explained by drain", so this counter is the
+            // only thing left that says the system is actually losing work.
+            // Warned on powers of two so a sustained overload stays visible in
+            // the log without drowning it.
+            uint64_t n = perf().n_prefetch_hints_dropped_queue_full.fetch_add(
+                             1, std::memory_order_relaxed) + 1;
+            if ((n & (n - 1)) == 0) {
+                LOG_WARN("[PREFETCH-DROP] hint queue full (%zu), dropped layer=%d expert=%d -- "
+                         "%llu hint(s) dropped so far this run. Each dropped hint is a guaranteed "
+                         "future cache miss; the workers cannot drain hints as fast as they are "
+                         "produced (raise prefetch_worker_threads, or lower prefetch_pilot_k)\n",
+                         QUEUE_SIZE, layer_idx, expert_id, (unsigned long long)n);
+            }
             return;
         }
 
-        q[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id, std::chrono::high_resolution_clock::now(), source};
+        q[current_head & (QUEUE_SIZE - 1)] = {layer_idx, expert_id,
+                                              std::chrono::high_resolution_clock::now(), source,
+                                              current_head - current_tail};
         head_ref.store(current_head + 1, std::memory_order_release);
         if (auto* s = layer_stat(layer_idx)) s->hints_pushed.fetch_add(1, std::memory_order_relaxed);
     }
@@ -466,11 +524,29 @@ private:
             PerfCounters::atomic_add(perf().t_prefetch_pickup_delay, pickup_ms / 1000.0);
             perf().n_prefetch_hints_processed.fetch_add(1, std::memory_order_relaxed);
             PerfCounters::atomic_max(perf().n_prefetch_backlog_peak, (uint64_t)backlog);
-            if (pickup_ms > SLOW_PICKUP_MS) {
+            // Self-calibrating threshold -- see SLOW_PICKUP_FLOOR_MS's comment
+            // for why this is not a constant. Uses THIS run's own measured
+            // average read time once enough samples exist, so it tracks the
+            // real device rather than a hardcoded guess.
+            const uint64_t done = perf().n_prefetch_completed.load(std::memory_order_relaxed);
+            const double avg_read_ms =
+                (done >= SLOW_PICKUP_MIN_SAMPLES)
+                    ? (perf().t_prefetch_read_ms_sum.load(std::memory_order_relaxed) / (double)done)
+                    : SLOW_PICKUP_BOOTSTRAP_READ_MS;
+            const int n_workers = worker_threads.empty() ? 1 : (int)worker_threads.size();
+            const double expected_ms =
+                ((double)hint.depth_at_push / (double)n_workers) * avg_read_ms;
+            const double threshold_ms =
+                std::max(SLOW_PICKUP_FLOOR_MS, expected_ms * SLOW_PICKUP_SLACK);
+            if (pickup_ms > threshold_ms) {
                 LOG_WARN("[SLOW-PICKUP] layer=%d expert=%d waited %.2fms in queue before the worker "
-                         "thread picked it up (%s lane, backlog at pickup: %u hints) -- worker is "
-                         "falling behind hint production, either CPU-starved or I/O-throughput-bound\n",
-                         hint.layer_idx, hint.expert_id, pickup_ms, from_hi ? "HIGH" : "LOW", backlog);
+                         "thread picked it up (%s lane, backlog at pickup: %u hints, %u ahead of it "
+                         "at push, %d worker(s), avg read %.1fms -> expected <=%.0fms) -- this is "
+                         "ABOVE what sequential drain of the queue it was pushed behind can explain, "
+                         "so the worker really is falling behind: either CPU-starved or "
+                         "I/O-throughput-bound\n",
+                         hint.layer_idx, hint.expert_id, pickup_ms, from_hi ? "HIGH" : "LOW", backlog,
+                         hint.depth_at_push, n_workers, avg_read_ms, threshold_ms);
             }
 
             // Device affinity: even workers read the primary, odd workers the
@@ -507,7 +583,7 @@ private:
     bool try_uring_batch(const io_uring_backend::ReadRequest* reqs, int n, io_uring_backend::Ring& my_ring) {
         if (!my_ring.available()) return false;
         ssize_t results[3];
-        bool ok = my_ring.submit_and_wait(reqs, n, results);
+        bool ok = my_ring.submit_and_wait(reqs, n, results, engine && engine->drop_expert_pages);
         if (ok) {
             for (int i = 0; i < n; ++i) {
                 if (results[i] != (ssize_t)reqs[i].len) { ok = false; break; }
@@ -581,7 +657,7 @@ private:
             // Already resident (Hit) or already being fetched by someone
             // else (Loading, owned by the decode thread or another prefetch
             // worker) -- structurally cannot duplicate a fetch here.
-            if (auto* s = layer_stat(layer_idx)) s->claims_beaten_by_decode.fetch_add(1, std::memory_order_relaxed);
+            if (auto* s = layer_stat(layer_idx)) s->claims_beaten_by_other.fetch_add(1, std::memory_order_relaxed);
             if (is_depth2) perf().n_prefetch_claims_beaten_depth2.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -652,7 +728,10 @@ private:
             // down@gb+ub) is the same either way.
             size_t gb, ub, db;
             const GGUFTensor *gM, *uM, *dM;
-            if (engine->expert_layer_geometry(layer_idx, gb, ub, db, gM, uM, dM)) {
+            // expert_geometry_for, not expert_layer_geometry -- expert_id
+            // is real here, not a stand-in for "the layer" (2026-09 caller
+            // audit, see StreamingEngine::expert_geometry_for's comment).
+            if (engine->expert_geometry_for(layer_idx, expert_id, gb, ub, db, gM, uM, dM)) {
                 engine->populate_packed_slab(slot, expert_id, gb, ub, db, *gM, *uM, *dM);
                 slot.loaded_by_prefetch = true;
                 ram_mgr->publish_ram_slot(slot);

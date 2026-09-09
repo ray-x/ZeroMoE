@@ -1,0 +1,12 @@
+What does this Go code do, and is there a bug in the error handling?
+```go
+func readConfig(path string) (*Config, error) {
+    data, err := os.ReadFile(path)
+    var cfg Config
+    json.Unmarshal(data, &cfg)
+    if err != nil {
+        return nil, err
+    }
+    return &cfg, nil
+}
+```

@@ -1,0 +1,1 @@
+Write a Python function that reads a CSV file and returns the average of a numeric column.

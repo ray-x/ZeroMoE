@@ -1,0 +1,7 @@
+What does this Python code do, and is there a more idiomatic way to write it?
+```python
+result = []
+for i in range(len(data)):
+    if data[i] % 2 == 0:
+        result.append(data[i] * 2)
+```

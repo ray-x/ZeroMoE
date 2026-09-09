@@ -1,0 +1,1 @@
+Write a C program demonstrating a basic producer-consumer pattern with pthreads.

@@ -1,0 +1,1 @@
+Write a SQL query to find duplicate rows in a table based on a subset of columns.

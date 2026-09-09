@@ -1,0 +1,1 @@
+Reverse a linked list in place — explain the approach, then write the code.

@@ -1,0 +1,1 @@
+Write a SQL CREATE TABLE statement for an "orders" table with proper foreign keys and constraints.

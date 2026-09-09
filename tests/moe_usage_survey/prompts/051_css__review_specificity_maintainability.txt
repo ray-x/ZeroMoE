@@ -1,0 +1,9 @@
+Review this CSS for specificity or maintainability issues:
+```css
+#header .nav ul li a {
+  color: red !important;
+}
+.nav a {
+  color: blue;
+}
+```

@@ -156,12 +156,22 @@ inline cublasStatus_t cublas_dense_matmul_bf16_matched(
 // Strides are passed explicitly (not assumed == O*I/S*I/S*O) in case a
 // future caller wants a non-contiguous head layout; every current caller
 // passes the densely-packed value.
+// `ldc` (2026-09-01): defaults to O, which is the contiguous case every
+// pre-existing caller uses -- pass ldc<=0 and behaviour is byte-identical to
+// before this parameter existed. It is a parameter so a caller can scatter each
+// batch's rows into an interleaved destination instead of writing a packed
+// [batch, S, O] block and transposing afterwards. WUV's prefill path is the
+// motivating case: head_contexts is laid out [S, H, vh] (element (s,h) at
+// (s*H+h)*vh, see attention_layer.cpp) while the natural batched output is
+// [H, S, vh]. Setting ldc = H*vh and strideC = vh makes batch h's column s land
+// at h*vh + s*H*vh == (s*H+h)*vh exactly, so the GEMM writes straight into the
+// caller's buffer with no transpose pass at all.
 inline cublasStatus_t cublas_dense_matmul_bf16_matched_batched(
     cublasHandle_t handle,
     const void* d_W_bf16, long long int strideA,
     const void* d_X_bf16, long long int strideB,
     float* d_Y,           long long int strideC,
-    int S, int I, int O, int batch_count)
+    int S, int I, int O, int batch_count, int ldc = 0)
 {
     const float alpha = 1.0f, beta = 0.0f;
     return cublasGemmStridedBatchedEx(
@@ -172,7 +182,7 @@ inline cublasStatus_t cublas_dense_matmul_bf16_matched_batched(
         d_W_bf16, CUDA_R_16BF, /*lda=*/I, strideA,
         d_X_bf16, CUDA_R_16BF, /*ldb=*/I, strideB,
         &beta,
-        d_Y, CUDA_R_32F, /*ldc=*/O, strideC,
+        d_Y, CUDA_R_32F, /*ldc=*/(ldc > 0 ? ldc : O), strideC,
         batch_count,
         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 }

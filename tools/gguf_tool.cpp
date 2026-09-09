@@ -47,6 +47,14 @@ int usage(const char *prog) {
           "the same file offsets --\n"
           "          random access across every layer. Linux-only for a "
           "real run.\n"
+          "  mix     <baseline_dir> <cold_dir> <output_dir> --usage-file "
+          "<path> [options]\n"
+          "          Builds a real per-expert mixed-precision override "
+          "shard: the coldest N%% of\n"
+          "          each eligible layer's experts (by real traffic) come "
+          "from <cold_dir>, the\n"
+          "          rest stay on <baseline_dir>. Pure byte-copy, no "
+          "requantization.\n"
           "\n"
           "Run '%s <subcommand>' with no further args for that "
           "subcommand's full usage.\n",
@@ -74,6 +82,8 @@ int main(int argc, char **argv) {
     return gguf_tool::cmd_plan(argc - 1, argv + 1);
   if (sub == "dma")
     return gguf_tool::cmd_dma(argc - 1, argv + 1);
+  if (sub == "mix")
+    return gguf_tool::cmd_mix(argc - 1, argv + 1);
   if (sub == "-h" || sub == "--help") {
     usage(argv[0]);
     return 0;

@@ -1,0 +1,1 @@
+Write a JSON config file example for a simple web server (port, host, routes array, logging level).

@@ -1,0 +1,1 @@
+Write a GitHub Actions YAML workflow that runs pytest on every push to main.

@@ -49,6 +49,25 @@ std::unique_ptr<ModelBackend> ModelBackend::create(const GGUFFile &model_file) {
     std::cerr << "[MODEL] Detected: Qwen MoE (hybrid SSM + DenseQKV + MoE)\n";
     return std::make_unique<QwenMoEBackend>();
 
+  case ModelFamily::GLM5NEXT:
+    // GLM 5.3 Flash is served by the LIVE engine path (FamilyOps /
+    // glm5next_attention_gguf), not this legacy backend hierarchy -- no
+    // ModelBackend subclass implements the hybrid KDA+DSA forward.
+    std::cerr << "[MODEL] Detected: GLM 5.3 Flash (glm5next, hybrid KDA+DSA) -- "
+                 "not supported by the legacy ModelBackend hierarchy; use the "
+                 "main moestream engine path.\n";
+    return nullptr;
+
+  case ModelFamily::Qwen4Exp:
+    // Qwen3.8-Flash-Next is served by the LIVE engine path (FamilyOps /
+    // qwen4exp_attention_gguf), not this legacy backend hierarchy -- no
+    // ModelBackend subclass implements the hybrid GDN+full-attention forward.
+    std::cerr << "[MODEL] Detected: Qwen3.8-Flash-Next (qwen4exp, hybrid "
+                 "GDN+full-attention + low-rank HC + PLE) -- not supported by "
+                 "the legacy ModelBackend hierarchy; use the main moestream "
+                 "engine path.\n";
+    return nullptr;
+
   default:
     // Default to GLM-DSA for unknown architectures with kv_lora_rank > 0
     if (model_file.get_config_int("attention.kv_lora_rank") > 0) {

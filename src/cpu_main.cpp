@@ -2,8 +2,10 @@
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
 #include "logger.hpp"
+#include "models/model_family.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -12,7 +14,7 @@
 
 static void print_usage(const char *argv0) {
   std::cerr << "Usage: " << argv0
-            << " --config <path.toml> [--prompt \"<text>\"]\n";
+            << " --config <path.toml> [--prompt \"<text>\"] [--ngen N]\n";
 }
 
 static std::string parse_arg(int argc, char **argv, const std::string &flag,
@@ -21,7 +23,22 @@ static std::string parse_arg(int argc, char **argv, const std::string &flag,
     if (flag == argv[i])
       return argv[i + 1];
   }
+
   return def;
+}
+
+static int parse_int_arg(int argc, char **argv, const std::string &flag,
+                         int def) {
+  const std::string value = parse_arg(argc, argv, flag, "");
+  if (value.empty())
+    return def;
+  try {
+    return std::stoi(value);
+  } catch (...) {
+    std::cerr << "[CPU-MAIN] Invalid integer for " << flag << ": " << value
+              << "\n";
+    return def;
+  }
 }
 
 int main(int argc, char **argv) {
@@ -42,6 +59,10 @@ int main(int argc, char **argv) {
 
   CPUEngine engine;
   engine.config = std::move(cfg);
+  const int requested_new_tokens =
+      parse_int_arg(argc, argv, "--ngen", engine.config.max_new_tokens);
+  if (requested_new_tokens >= 0)
+    engine.config.max_new_tokens = requested_new_tokens;
 
   const bool is_safetensors =
       engine.config.model_path.size() >= 12 &&
@@ -84,6 +105,15 @@ int main(int argc, char **argv) {
       parse_arg(argc, argv, "--system-prompt", "");
   if (!system_prompt_cli.empty())
     engine.config.system_prompt = system_prompt_cli;
+  const std::string reasoning_effort_cli =
+      parse_arg(argc, argv, "--reasoning-effort", "");
+  if (!reasoning_effort_cli.empty())
+    engine.config.reasoning_effort = reasoning_effort_cli;
+
+  // Startup/model loading is complete here. In CLI mode the prompt argument
+  // is already available, so this is the closest equivalent to receiving the
+  // first input token; prompt encoding and all prefill work are timed below.
+  const auto prefill_start = std::chrono::steady_clock::now();
 
   // Mirror main.cpp's own prompt-encoding convention: a chat-tuned model
   // gets its detected special-token wrapper, everything else gets a raw
@@ -91,7 +121,40 @@ int main(int argc, char **argv) {
   // gives the model a token sequence it never saw start a request during
   // training.
   std::vector<int> input_ids;
-  if (!engine.config.raw_prompt && engine.tokenizer.has_chat_template()) {
+  if (!engine.config.raw_prompt &&
+      detect_model_family(engine.model_file) == ModelFamily::GLM5NEXT &&
+      engine.tokenizer.has_chat_template()) {
+    if (engine.tokenizer.gmask_id >= 0)
+      input_ids.push_back(engine.tokenizer.gmask_id);
+    if (engine.tokenizer.sop_id >= 0)
+      input_ids.push_back(engine.tokenizer.sop_id);
+    if (engine.config.enable_thinking) {
+      std::string effort = engine.config.reasoning_effort;
+      std::string effort_cap = effort == "low" ? "Low"
+                             : effort == "high" ? "High" : "Max";
+      std::vector<int> reff = engine.tokenizer.encode(
+          "<|system|>Reasoning Effort: " + effort_cap);
+      input_ids.insert(input_ids.end(), reff.begin(), reff.end());
+    }
+    if (!engine.config.system_prompt.empty()) {
+      std::vector<int> sys =
+          engine.tokenizer.encode("<|system|>" + engine.config.system_prompt);
+      input_ids.insert(input_ids.end(), sys.begin(), sys.end());
+    }
+    input_ids.push_back(engine.tokenizer.user_id);
+    std::vector<int> body = engine.tokenizer.encode(prompt);
+    input_ids.insert(input_ids.end(), body.begin(), body.end());
+    input_ids.push_back(engine.tokenizer.assistant_id);
+    if (engine.config.enable_thinking) {
+      if (engine.tokenizer.ds_think_start_id >= 0)
+        input_ids.push_back(engine.tokenizer.ds_think_start_id);
+    } else if (engine.tokenizer.ds_think_start_id >= 0 &&
+               engine.tokenizer.ds_think_end_id >= 0) {
+      // GLM direct-answer mode requires an explicit empty reasoning block.
+      input_ids.push_back(engine.tokenizer.ds_think_start_id);
+      input_ids.push_back(engine.tokenizer.ds_think_end_id);
+    }
+  } else if (!engine.config.raw_prompt && engine.tokenizer.has_chat_template()) {
     if (engine.tokenizer.gmask_id >= 0)
       input_ids.push_back(engine.tokenizer.gmask_id);
     if (engine.tokenizer.sop_id >= 0)
@@ -131,6 +194,43 @@ int main(int argc, char **argv) {
     input_ids.push_back(engine.tokenizer.ds_assistant_id);
     if (engine.tokenizer.ds_think_end_id >= 0)
       input_ids.push_back(engine.tokenizer.ds_think_end_id);
+  } else if (!engine.config.raw_prompt &&
+             engine.tokenizer.has_chatml_template()) {
+    // Qwen3.8-Flash-Next uses ChatML. Thinking is configurable; disabling it
+    // omits the long default xhigh reasoning instruction from short prompts.
+    const char *reasoning =
+        "Reasoning effort is set to xhigh. Please think carefully through "
+        "the task, validate key assumptions, consider plausible "
+        "alternatives, and prioritize correctness, consistency, and "
+        "clarity in the final answer.";
+    auto push_text = [&](const std::string &text) {
+      std::vector<int> ids = engine.tokenizer.encode(text);
+      input_ids.insert(input_ids.end(), ids.begin(), ids.end());
+    };
+    if (engine.config.enable_thinking || !engine.config.system_prompt.empty()) {
+      input_ids.push_back(engine.tokenizer.im_start_id);
+      if (engine.config.enable_thinking) {
+        push_text(std::string("system\n") + reasoning +
+                  (engine.config.system_prompt.empty()
+                       ? ""
+                       : "\n\n" + engine.config.system_prompt));
+      } else {
+        push_text("system\n" + engine.config.system_prompt);
+      }
+      input_ids.push_back(engine.tokenizer.im_end_id);
+      push_text("\n");
+    }
+    input_ids.push_back(engine.tokenizer.im_start_id);
+    push_text("user\n" + prompt);
+    input_ids.push_back(engine.tokenizer.im_end_id);
+    push_text("\n");
+    input_ids.push_back(engine.tokenizer.im_start_id);
+    push_text("assistant\n");
+    if (engine.config.enable_thinking &&
+        engine.tokenizer.ds_think_start_id >= 0)
+      input_ids.push_back(engine.tokenizer.ds_think_start_id);
+    if (engine.config.enable_thinking)
+      push_text("\n");
   } else {
     // Respect the model's own tokenizer.ggml.add_bos_token metadata --
     // unconditionally prepending BOS regardless of this key fed
@@ -147,8 +247,12 @@ int main(int argc, char **argv) {
     std::cerr << "[CPU-MAIN] Tokenizer produced no tokens.\n";
     return 1;
   }
-
   std::cerr << "[CPU-MAIN] Prompt tokens: " << input_ids.size() << "\n";
+
+  if (engine.config.max_new_tokens == 0) {
+    std::cerr << "[CPU-MAIN] Model load smoke test completed; generation skipped.\n";
+    return 0;
+  }
 
   const ArchitectureConfig &c = engine.model_file.architecture_config;
   int D = c.hidden;
@@ -156,6 +260,7 @@ int main(int argc, char **argv) {
 
   // Prefill: process all prompt tokens at once.
   std::vector<float> hidden((size_t)input_ids.size() * D);
+  engine.qwen4exp_ple_token_history.assign(input_ids.begin(), input_ids.end());
   for (size_t i = 0; i < input_ids.size(); ++i) {
     if (!cpu_embed_token(engine, input_ids[i], hidden.data() + i * D, D)) {
       std::cerr << "[CPU-MAIN] Embedding lookup failed.\n";
@@ -178,6 +283,15 @@ int main(int argc, char **argv) {
     std::cerr << "[CPU-MAIN] LM head failed.\n";
     return 1;
   }
+  const double prefill_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    prefill_start)
+          .count();
+  std::cerr << "[CPU-PERF] Prefill: " << input_ids.size() << " token(s) in "
+            << prefill_seconds << " s ("
+            << (input_ids.empty() ? 0.0
+                                  : input_ids.size() / prefill_seconds)
+            << " token/s)\n";
 
   // DEBUG: print top-5 logits after prefill
   {
@@ -204,8 +318,10 @@ int main(int argc, char **argv) {
   generated.reserve(engine.config.max_new_tokens);
 
   int pos = (int)input_ids.size();
+  const auto decode_start = std::chrono::steady_clock::now();
   for (int i = 0; i < engine.config.max_new_tokens; ++i) {
     generated.push_back(next_tok);
+    engine.qwen4exp_ple_token_history.push_back(next_tok);
 
     // Decode one token.
     std::vector<float> single_hidden((size_t)D);
@@ -258,14 +374,24 @@ int main(int argc, char **argv) {
     if (engine.tokenizer.is_stop_token(next_tok))
       break;
   }
-
   std::string out_text;
   for (int id : generated)
     out_text += engine.tokenizer.decode(id);
-  std::cout << prompt << out_text << "\n";
+  std::cout << prompt << out_text << "\n" << std::flush;
+
+  // Stop after the final generated token has been written to the console.
+  const double decode_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                    decode_start)
+          .count();
+  std::cerr << "[CPU-PERF] Decode: " << generated.size() << " token(s) in "
+            << decode_seconds << " s ("
+            << (generated.empty() ? 0.0 : generated.size() / decode_seconds)
+            << " token/s)\n";
 
   // Persist routing histogram for the next run's pin preload.
-  if (!engine.route_usage.dump(engine.config.pin_file)) {
+  if (!engine.config.pin_file.empty() &&
+      !engine.route_usage.dump(engine.config.pin_file)) {
     LOG_STREAM_WARN() << "[CPU-MAIN] Failed to write usage file.\n";
   }
   return 0;

@@ -1,0 +1,1 @@
+Write a Go struct with methods implementing a simple stack.

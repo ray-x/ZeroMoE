@@ -32,6 +32,9 @@ extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
   case 6:
     dequantize_row_q5_0((const block_q5_0 *)src, out, n);
     return 1;
+  case 7:
+    dequantize_row_q5_1((const block_q5_1 *)src, out, n);
+    return 1;
   case 8:
     dequantize_row_q8_0((const block_q8_0 *)src, out, n);
     return 1;
@@ -170,6 +173,54 @@ extern "C" int ggml_quantize_row_ref(uint32_t type, const float *src, void *dst,
     ggml_quantize_init(GGML_TYPE_IQ3_XXS);
     quantize_row_iq3_xxs_ref(src, (block_iq3_xxs *)dst, n);
     return 1;
+  // IQ1_S: same shape as the IQ2_XXS/XS/S cases above -- a real grid-search
+  // quantizer (quantize_iq1_s, ggml-quants.c), no single-row "_ref" export,
+  // requires ggml_quantize_init(GGML_TYPE_IQ1_S) first (builds the 2048-
+  // entry kmap_1bit search table) and a non-null quant_weights array (a
+  // synthetic all-ones array is fine here -- only whether the CUDA kernel
+  // decodes the resulting real bytes identically to ggml's own dequantizer
+  // is under test, not quantization quality, same rationale as IQ2_XXS/XS/S
+  // above). Added 2026-09 while wiring up cuda/iq1_dequant.cu's real
+  // launch_iq1s_matmul so Test 5 can drive it with real ggml-valid bytes
+  // instead of silently SKIPPING (this function previously had no case 19
+  // at all, so any earlier IQ1_S test attempt would have returned 0 here).
+  case 19: {
+    ggml_quantize_init(GGML_TYPE_IQ1_S);
+    std::vector<float> imatrix(n, 1.0f);
+    quantize_iq1_s(src, dst, 1, n, imatrix.data());
+    return 1;
+  }
+  // IQ1_M: same shape as IQ1_S immediately above -- a real grid-search
+  // quantizer (quantize_iq1_m, ggml-quants.c) sharing the SAME
+  // ggml_quantize_init(GGML_TYPE_IQ1_S) table build (IQ1_M indexes the
+  // identical iq1s_grid, confirmed by reading dequantize_row_iq1_m
+  // directly -- no separate GGML_TYPE_IQ1_M init call needed or
+  // available). Added 2026-09 alongside IQ1_S's own case so Test 5 can
+  // drive the new launch_iq1m_matmul with real ggml-valid bytes instead
+  // of silently SKIPPING -- this function previously had no case 29 at
+  // all, so any Test 5 attempt at IQ1_M would have returned 0 here.
+  case 29: {
+    ggml_quantize_init(GGML_TYPE_IQ1_S);
+    std::vector<float> imatrix(n, 1.0f);
+    quantize_iq1_m(src, dst, 1, n, imatrix.data());
+    return 1;
+  }
+  // IQ3_S: same shape as IQ1_S/IQ2_XXS/XS/S above -- a real grid-search
+  // quantizer (quantize_iq3_s, ggml-quants.c), needs ggml_quantize_init()
+  // first (builds the IQ3_S codebook search table) and a non-null
+  // quant_weights array (synthetic all-ones is fine, same rationale as
+  // every other case in this block: only whether the CUDA kernel decodes
+  // the resulting real bytes identically to ggml's own dequantizer is under
+  // test here, not quantization quality). Added while wiring up a real
+  // launch_iq3s_matmul (cuda/iq3_matmul.cu) -- this function previously had
+  // no case 21 at all, so any Test 5 attempt at IQ3_S would have silently
+  // returned 0 (SKIPPED) here.
+  case 21: {
+    ggml_quantize_init(GGML_TYPE_IQ3_S);
+    std::vector<float> imatrix(n, 1.0f);
+    quantize_iq3_s(src, dst, 1, n, imatrix.data());
+    return 1;
+  }
   // IQ4_XS: a fixed 16-entry lookup table (kvalues_iq4nl) + per-block
   // linear scale, NOT the harder IQ2/IQ3 variable-codebook family --
   // ggml exposes a real single-row _ref quantizer (no imatrix
@@ -179,6 +230,15 @@ extern "C" int ggml_quantize_row_ref(uint32_t type, const float *src, void *dst,
   // type this bridge couldn't encode test data for).
   case 23:
     quantize_row_iq4_xs_ref(src, (block_iq4_xs *)dst, n);
+    return 1;
+  // IQ4_NL: same 16-entry kvalues_iq4nl codebook as IQ4_XS above, but a
+  // 32-element block with a single fp16 scale (18 bytes) instead of 256 with
+  // hierarchical sub-scales. Real single-row _ref quantizer, no imatrix.
+  // Added 2026-09-04 to give Test 5 real bytes for the new
+  // launch_iq4_nl_matmul -- IQ4_NL is the down projection on all 48 MoE
+  // layers of Qwen3.8-Flash-Next UD-IQ1_M.
+  case 20:
+    quantize_row_iq4_nl_ref(src, (block_iq4_nl *)dst, n);
     return 1;
   // MXFP4: fixed 16-entry table + one E8M0 scale byte per 32-element block
   // (see cuda/mxfp4_matmul.cu's header comment for the full algorithm) --
@@ -196,6 +256,12 @@ extern "C" int ggml_quantize_row_ref(uint32_t type, const float *src, void *dst,
   // and the test just SKIPPED. Added while touching cuda/q8_0_matmul.cu's
   // reuse-across-S kernel, so that change has real GPU-vs-CPU-reference
   // coverage instead of relying on lint + a live model run alone.
+  case 7:
+    // Q5_1 -- added 2026-09-04 alongside cuda/q5_1_matmul.cu so Test 5 can
+    // build a real quantized weight buffer for it. Same simple single-row
+    // shape as the Q8_0 case below; no imatrix, no ggml_quantize_init.
+    quantize_row_q5_1_ref(src, (block_q5_1 *)dst, n);
+    return 1;
   case 8:
     quantize_row_q8_0_ref(src, (block_q8_0 *)dst, n);
     return 1;

@@ -1,0 +1,6 @@
+Write pytest unit tests for this function:
+```python
+def is_palindrome(s):
+    s = s.lower().replace(' ', '')
+    return s == s[::-1]
+```

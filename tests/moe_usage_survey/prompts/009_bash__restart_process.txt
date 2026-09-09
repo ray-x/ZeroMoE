@@ -1,0 +1,1 @@
+Write a bash function that checks if a given process name is running and restarts it if not.

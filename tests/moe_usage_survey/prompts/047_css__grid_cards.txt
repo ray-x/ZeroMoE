@@ -1,0 +1,1 @@
+Write CSS Grid layout code for a 3-column responsive card layout that becomes 1 column on mobile.

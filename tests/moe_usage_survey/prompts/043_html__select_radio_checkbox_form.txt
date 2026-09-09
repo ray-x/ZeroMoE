@@ -1,0 +1,1 @@
+Write an HTML5 form with a <select> dropdown, radio buttons, and a checkbox group, using semantic <fieldset>/<legend>.

@@ -1,0 +1,8 @@
+Review this C code for memory safety issues:
+```c
+char* build_greeting(const char* name) {
+    char buffer[20];
+    sprintf(buffer, "Hello, %s!", name);
+    return buffer;
+}
+```

@@ -1,0 +1,7 @@
+Review this SQL query for performance and correctness issues:
+```sql
+SELECT * FROM orders o, customers c
+WHERE o.customer_id = c.id
+AND o.created_at > '2023-01-01'
+ORDER BY o.amount;
+```

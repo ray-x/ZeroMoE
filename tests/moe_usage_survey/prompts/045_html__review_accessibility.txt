@@ -1,0 +1,6 @@
+Review this HTML for accessibility issues:
+```html
+<div onclick="submitForm()">Submit</div>
+<img src="logo.png">
+<input type="text">
+```

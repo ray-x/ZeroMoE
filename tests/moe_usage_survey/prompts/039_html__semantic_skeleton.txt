@@ -1,0 +1,1 @@
+Write a semantic HTML5 page skeleton with header, nav, main, article, and footer.

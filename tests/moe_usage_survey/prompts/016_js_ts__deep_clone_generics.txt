@@ -1,0 +1,1 @@
+Write a TypeScript function using generics to deep-clone an object.

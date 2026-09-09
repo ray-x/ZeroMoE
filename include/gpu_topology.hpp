@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -68,6 +69,95 @@ struct GpuDevice {
     GpuRole role = GpuRole::Unused;
     cudaStream_t compute_stream = nullptr;
     cudaStream_t copy_stream = nullptr;
+    // Dedicated stream for the decode-critical-path active-layer batch
+    // pre-warm (upload_expert_active_async/sync_active_layer_batch) ONLY --
+    // added 2026-08-19 after a real-hardware diagnostic (n_active_prewarm_
+    // saw_copy_stream_busy, perf_timer.hpp) showed copy_stream busy 62.7%
+    // of the time (8932/14247 calls) at the exact moment this call site's
+    // H2D fires. copy_stream is also shared by upload_expert_async's
+    // reactive/pilot RAM->VRAM promotions and demote_from_vram's D2H
+    // evictions -- background housekeeping that has no reason to make
+    // THIS token's own imminent expert dispatch wait behind it, since a
+    // CUDA stream executes its enqueued ops strictly in issue order
+    // regardless of the 2 independent copy engines this hardware actually
+    // has (asyncEngineCount=2 on both GPUs here, confirmed in CLAUDE.md's
+    // demote_from_vram investigation) that could otherwise run one H2D and
+    // one D2H concurrently. Giving this specific traffic its own stream
+    // lets it overlap with, rather than serialize behind, that other
+    // copy_stream work. Two EARLIER fix attempts at this call site
+    // (cudaHostRegister-per-call, then a persistent bounce-buffer pool --
+    // see upload_expert_active_async's own comment) were both about making
+    // the DMA source pinned/genuinely-async and were reverted after real
+    // regressions; neither of them touched WHICH stream the copy went on,
+    // so this is a genuinely different, previously-untried lever, not a
+    // re-run of a closed investigation.
+    cudaStream_t active_layer_stream = nullptr;
+
+    // Dedicated stream for SPECULATIVE pilot pre-fills only (EngineConfig::
+    // speculative_promote_to_active_layer's async issue path,
+    // RAMSafetyManager::promote_ram_to_active_layer -> upload_expert_
+    // active_async(speculative=true)), added 2026-08-26 -- separates this
+    // traffic from active_layer_stream's OWN, more time-critical
+    // consumers (decode_async_prewarm's real-need pre-warm, prefill's
+    // Phase-2 batch warm-up, and the reactive synchronous upload_expert_
+    // active path all still use active_layer_stream). A speculative l+1
+    // prediction is lower-priority than any of those (it's a guess about
+    // NEXT layer, not a confirmed need for the layer about to dispatch),
+    // so it should never be able to queue ahead of and delay them on a
+    // shared stream -- CUDA streams execute enqueued work strictly in
+    // issue order, the exact mechanism active_layer_stream's own creation
+    // comment above documents a real, measured win from. Whether THIS
+    // split also pays off needs its own real A/B (this project's own
+    // history has both proven wins, e.g. active_layer_stream itself, and
+    // clean no-benefit results, e.g. demote_from_vram/upload_expert_
+    // active's own reverted attempts, from the identical-looking change
+    // at different call sites) -- see CLAUDE.md for the result.
+    cudaStream_t speculative_prefetch_stream = nullptr;
+
+    // 2026-08-26 follow-up: a SECOND speculative stream, alternated with
+    // the one above via speculative_stream_rr -- built after a real
+    // diagnostic (n_speculative_issue_saw_own_stream_busy/_idle,
+    // perf_timer.hpp) DISPROVED the original hypothesis for this feature
+    // (cross-mechanism contention with active_layer_stream: confirmed
+    // 0.0% busy, never once caught) and instead found the real cost is
+    // SELF-contention -- 22.7-31.4% of speculative issues found the
+    // PREVIOUS speculative issue's own DMA still draining on the SAME
+    // stream, from several pilot candidates (up to max_k per pilot, two
+    // pilots) bursting through in one transition. Splitting that burst
+    // across two independent streams should directly cut same-stream
+    // queuing -- see speculative_stream_rr's own comment for the
+    // alternation logic. Real A/B result in CLAUDE.md.
+    cudaStream_t speculative_prefetch_stream2 = nullptr;
+
+    // Round-robin counter picking which of the two speculative streams
+    // above a given upload_expert_active_async(speculative=true) call
+    // uses -- plain (not atomic), safe because every caller already holds
+    // GPU_TOPO_TIMED_LOCK for the whole call.
+    uint64_t speculative_stream_rr = 0;
+
+    // 2026-08-29 re-test: dedicated stream for upload_expert_active's
+    // SYNCHRONOUS fallback cudaMemcpy specifically -- see n_active_upload_
+    // saw_active_layer_stream_busy's own comment (perf_timer.hpp) for the
+    // real diagnostic that motivated this (22.5% of these calls found
+    // active_layer_stream busy at the exact moment this genuinely urgent,
+    // real-dispatch fallback fired, and CUDA's legacy default/NULL stream
+    // -- what this call used before -- implicitly waits for EVERY other
+    // blocking-type stream on the device to drain before it can even
+    // start). A broader version of this exact fix (bundled with a
+    // cudaHostRegister change) was already tried once and reverted with
+    // "no effect" (0.70->0.68 tok/s, within noise) -- see this function's
+    // own comment above the cudaMemcpy call for that history. Re-tried
+    // narrowly (stream only, no register change) because the system has
+    // changed substantially since that null result (ActiveLayerUploadWorkers,
+    // multi-GPU active-layer routing, ram_pinned_budget_gb=45, the cache_
+    // mutex batching fix) -- any of which could plausibly have changed how
+    // much real active_layer_stream backlog exists at the moment this
+    // fires. cudaMemcpyAsync+an explicit cudaStreamSynchronize right after
+    // preserves this function's existing fully-synchronous contract
+    // (caller still blocks until the copy is done) -- only WHICH stream
+    // the copy waits behind changes, not whether the caller waits for it.
+    // See CLAUDE.md for the real A/B result.
+    cudaStream_t active_layer_sync_fallback_stream = nullptr;
 
     // Persistent VRAM allocations
     uint8_t* expert_cache_pool = nullptr;  // For ExpertVault role
@@ -94,6 +184,11 @@ struct ExpertLocation {
     uint8_t* device_ptr = nullptr;  // pointer within that GPU's cache pool
     size_t offset = 0;         // offset within the pool (for slab reuse)
     size_t size = 0;
+    // Static layout region owning this slot. In the legacy cache all slots
+    // are interchangeable and this stays -1. In the compact cache each
+    // layer gets slots sized to that layer's real packed expert slab, so
+    // eviction must only reuse a slot from the requested layer's region.
+    int pool_layer = -1;
     uint64_t last_used_clock = 0;
     uint32_t hit_count = 0;    // frequency signal for eviction scoring (power-law routing)
     int layer_idx = -1;
@@ -104,6 +199,38 @@ struct ExpertLocation {
     // compute yet (device_ptr contents are only partially written).
     bool upload_ready = true;
     cudaEvent_t upload_event = nullptr;
+
+    // 2026-08-28: guards a real race the worker-thread upload path
+    // introduces (ActiveLayerUploadWorkers, active_layer_upload_workers.
+    // hpp) that does NOT exist for any synchronous or same-thread-async
+    // caller today. find_active_expert's poll trusts cudaEventQuery(
+    // upload_event) -- but cudaEventQuery on an event that has NEVER been
+    // recorded returns cudaSuccess immediately (CUDA's own documented
+    // semantics: nothing to wait for). Every EXISTING caller issues
+    // cudaMemcpyAsync + cudaEventRecord back-to-back on the SAME thread
+    // before returning, so no poll could ever observe an unrecorded event
+    // for a slot it's able to look up. A worker-thread hand-off breaks
+    // that invariant: the decode thread marks this slot claimed
+    // (upload_ready=false) and returns BEFORE a worker has necessarily
+    // gotten around to the actual cudaMemcpyAsync/cudaEventRecord call --
+    // a poll landing in that window would otherwise see "event query
+    // succeeded" and wrongly treat an unstarted copy as complete. Default
+    // true (matches every existing synchronous-record caller, zero
+    // behavior change for them); set false ONLY when a slot is claimed
+    // for worker-deferred dispatch, and flipped back to true by the
+    // worker itself, under cache_mutex, immediately after it has
+    // genuinely called cudaEventRecord -- never before. Every reader of
+    // upload_event on active_layer_slots must check this FIRST, before
+    // trusting cudaEventQuery/cudaEventSynchronize at all: find_active_
+    // expert's poll, cleanup_active_layer_area's opportunistic stale-hold
+    // release, AND upload_expert_active's own duplicate-transfer pre-check
+    // (gpu_topology.cpp) -- the last of these was found MISSING this guard
+    // on real hardware (a real, severe NaN-cascade corruption bug: a
+    // cudaEventSynchronize on a not-yet-recorded event returns immediately,
+    // spuriously marking a still-stale slot "ready") and fixed the same day
+    // this field was added; see that fix's own comment for the full
+    // bisection that found it.
+    bool copy_dispatched = true;
 
     // Active-layer batch pre-warm only (upload_expert_active_async,
     // gpu_topology.cpp, 2026-08-12): set true when a slot is proactively
@@ -153,6 +280,39 @@ struct ExpertLocation {
     bool was_async_prewarmed = false;
     bool prewarm_touched = false;
 
+    // Speculative pilot pre-fill only (EngineConfig::speculative_promote_to_
+    // active_layer, 2026-08-26, default off): set true when a slot is
+    // proactively filled by DEPTH-1/ATTN-PILOT's one-layer-ahead prediction
+    // (RAMSafetyManager::promote_ram_to_active_layer), BEFORE any real
+    // dispatch has confirmed this expert is actually needed -- structurally
+    // the same role as was_async_prewarmed above (skip-next-promote,
+    // waste-tracked via prewarm_touched), but kept as its own separate
+    // flag/counter pair rather than reusing was_async_prewarmed directly:
+    // this is a genuinely different source (a PREDICTION, not a real
+    // router's already-computed, 100%-confirmed-need batch the way
+    // decode_async_prewarm's own pre-warm is) -- conflating the two would
+    // hide which source actually dominates a run's waste, the same
+    // "don't share buckets across structurally distinct call sites"
+    // discipline this project already follows elsewhere (see
+    // t_active_layer_upload_async's own comment). record_active_layer_
+    // prewarm_reclaim checks this alongside was_async_prewarmed and resets
+    // both, so no new reclaim call sites were needed.
+    bool pilot_speculative_fill = false;
+
+    // 2026-08-28: which pilot RANK (0-7, the k in DEPTH-1/ATTN-PILOT's own
+    // per-transition k-loop, execution_layer.cpp) caused THIS speculative
+    // fill -- set only alongside pilot_speculative_fill above, -1
+    // otherwise. Exists specifically to answer "of the MoEs promoted at
+    // rank K specifically, what fraction were actually touched by a real
+    // dispatch before reclaim" -- a genuinely different question from the
+    // pilot's own per-rank PREDICTION-accuracy metric (n_pilot_ram_only_
+    // hits_by_rank, which compares a prediction against the real router's
+    // outcome regardless of whether that prediction was ever promoted or
+    // used). record_active_layer_prewarm_reclaim reads this alongside
+    // prewarm_touched to attribute the used/wasted outcome to the correct
+    // rank, then resets it to -1.
+    int8_t promoted_at_rank = -1;
+
     // Phase A a pinned slot is never chosen as an eviction
     // victim, regardless of eviction_score. Set once a RAM-cache expert's
     // hit_count crosses RAMSafetyManager::pin_threshold (proven-hot within
@@ -190,6 +350,15 @@ struct ExpertLocation {
     // pool's effective capacity collapsing to zero the moment one address
     // goes bad. Never cleared, mirroring `pinned`'s "permanent" convention.
     bool memcpy_broken = false;
+    // 2026-09-01: how many times an H2D copy into THIS slot has failed.
+    // memcpy_broken is now only set at >=2, because a single failure does
+    // NOT prove the slot is at fault: a bad HOST pointer fails against
+    // whatever destination it is handed, so it produces one failure each on
+    // several DIFFERENT healthy slots (observed on a real run: one host_src
+    // failing against three distinct dst, retiring three good slots). A
+    // genuinely faulty VRAM address, by contrast, fails repeatedly on the
+    // SAME slot and still trips the guard on its second attempt.
+    int memcpy_fail_count = 0;
 
     // Blended recency+frequency score used for eviction: a frequently-hit
     // expert resists eviction even after a burst of newer accesses touches
@@ -198,6 +367,35 @@ struct ExpertLocation {
         return last_used_clock + (uint64_t)hit_count * FREQ_BONUS_TICKS;
     }
     static constexpr uint64_t FREQ_BONUS_TICKS = 64;
+
+    // 2026-08-26 (user-requested): a speculative pilot fill (pilot_
+    // speculative_fill=true) that has NEVER yet been confirmed by a real
+    // dispatch (prewarm_touched still false) is still just a guess -- it
+    // should always be preferred as an active-layer eviction victim over
+    // ANY other content, real or speculative-but-already-confirmed,
+    // regardless of how its own eviction_score() compares. Once a real
+    // dispatch touches it (prewarm_touched flips true, see find_active_
+    // expert), it's proven useful and competes on normal eviction_score
+    // footing from then on, same as everything else -- this is NOT a
+    // permanent "speculative content is always cheap" rule, only "an
+    // UNCONFIRMED guess is always cheap". Mirrors also_in_vram's own
+    // "force to the front of the eviction queue" trick (ram_manager.hpp),
+    // applied here to the active-layer pool's own internal victim
+    // selection instead of the RAM tier's.
+    bool is_unconfirmed_speculative_fill() const {
+        return pilot_speculative_fill && !prewarm_touched;
+    }
+
+    // Comparator for active-layer victim-selection scans: does `this`
+    // deserve to be picked as the victim ahead of `other`? An unconfirmed
+    // speculative fill always outranks anything that isn't also one;
+    // between two candidates of the same kind, falls back to the normal
+    // recency+frequency eviction_score().
+    bool preferred_victim_over(const ExpertLocation& other) const {
+        bool a = is_unconfirmed_speculative_fill(), b = other.is_unconfirmed_speculative_fill();
+        if (a != b) return a;
+        return eviction_score() < other.eviction_score();
+    }
 };
 
 class GpuTopology {
@@ -230,10 +428,26 @@ public:
     // one function that decides which physical GPU plays which role.
     int forced_core_device_id = -1;
 
+    // Optional allow-list supplied by EngineConfig. CUDA still enumerates all
+    // physical adapters (the runtime requires that), but only these device
+    // IDs may receive a MoEStream role or allocation. An entry omitted from
+    // the TOML is therefore genuinely unused rather than silently becoming
+    // an ExpertVault through the old hardware-count heuristic. Empty keeps
+    // the legacy "use every adapter" behavior for callers that do not use a
+    // config file.
+    std::vector<int> configured_device_ids;
+
     // Expert VRAM LRU cache: maps (layer, expert_id) -> location
     std::vector<ExpertLocation> expert_vram_cache;
     size_t expert_vram_cache_cap = 0;  // max entries
-    size_t expert_slab_size = 0;       // bytes per expert slot
+    // Nonzero only for the legacy uniform-stride layout. A compact layout
+    // deliberately sets this to zero so callers cannot assume that every
+    // layer's slots are equally sized or physically consecutive.
+    size_t expert_slab_size = 0;
+    size_t expert_max_slab_size = 0;   // largest real/aligned slab, for staging
+    int expert_n_experts = 0;
+    std::vector<size_t> expert_layer_slab_bytes;
+    bool expert_compact_layout = false;
     uint64_t cache_clock = 0;
 
     // ========== Three-tier caching: Active layer area ==========
@@ -242,6 +456,31 @@ public:
     uint8_t* active_layer_pool = nullptr;
     size_t active_layer_capacity = 0;     // Maximum experts active layer can hold
     std::vector<ExpertLocation> active_layer_slots;  // Pre-allocated slot metadata
+
+    // 2026-08-28: multi-GPU active-layer pool routing. Each participating
+    // GPU gets its OWN cudaMalloc allocation (own ActiveLayerGpuSlice
+    // entry); active_layer_slots above stays ONE combined vector spanning
+    // ALL participating GPUs' slots contiguously (this GPU's slots first,
+    // that GPU's next, etc.) -- find_active_expert/active_layer_has/
+    // cleanup_active_layer_area continue to do a flat linear scan over the
+    // WHOLE vector, completely unchanged, since residency lookup doesn't
+    // care which GPU a slot lives on (a slot already carries its own
+    // gpu_id, same as every other ExpertLocation). Only allocation and
+    // victim-selection need to be GPU-aware -- see allocate_active_layer_
+    // area_multi and upload_expert_active(_async)'s new target_gpu_id
+    // parameter. Empty = legacy single-pool mode (today's behavior,
+    // byte-identical) -- active_layer_pool/active_layer_capacity above are
+    // still populated in that case too, exactly as before, so any code
+    // that still reads them directly (there is none left after this
+    // change, but kept for safety) continues to work.
+    struct ActiveLayerGpuSlice {
+        int gpu_id = -1;
+        int weight = 0;
+        size_t slot_start = 0;   // first index into active_layer_slots owned by this GPU
+        size_t slot_count = 0;   // contiguous slot count this GPU owns
+        uint8_t* pool_base = nullptr;  // this GPU's own cudaMalloc'd base pointer
+    };
+    std::vector<ActiveLayerGpuSlice> active_layer_gpu_slices;
 
     // Hit count (while resident in the active layer area) at which an
     // expert gets promoted into the real VRAM LRU cache (device-to-device
@@ -282,6 +521,38 @@ public:
     // place). Decode's own promotion behavior (in_prefill=false) is
     // completely unchanged -- this only gates the prefill case.
     bool in_prefill = false;
+    // Layer currently being executed by the batched prefill. When set,
+    // evict_lru prefers unpinned experts from completed layers before it
+    // considers current/future-layer residents.
+    int prefill_current_layer = -1;
+    // Suppresses hit accounting while the startup manifest itself is being
+    // replayed. The preload loop calls upload_expert again for duplicates;
+    // those cache lookups are setup work, not routed prompt usage.
+    bool startup_preload_phase = false;
+
+    // Speculative pilot pre-fill (EngineConfig::speculative_promote_to_
+    // active_layer, 2026-08-26, default off, set once by main.cpp). When
+    // true, cleanup_active_layer_area additionally protects slots tagged
+    // for current_layer_idx+1 -- a speculative fill made one layer ahead of
+    // when it will actually be dispatched (RAMSafetyManager::promote_ram_
+    // to_active_layer, called from execution_layer.cpp's l+1 pilot-
+    // prediction loop DURING layer l's own processing, before layer l+1
+    // has even started). Without this widening, such an entry would be
+    // wiped out by THIS SAME layer's own end-of-layer cleanup call the
+    // instant it's inserted (tagged l+1, which never matches
+    // current_layer_idx==l) -- before layer l+1's real dispatch ever gets a
+    // chance to look it up. Safe to be a plain, unconditional-looking "+1"
+    // match in cleanup_active_layer_area's own code (not itself re-checking
+    // this flag there) BECAUSE nothing is ever tagged current_layer_idx+1
+    // in the first place unless this flag is on -- see promote_ram_to_
+    // active_layer's own gate. With this on, a speculative l+1 entry gets
+    // the exact same real lifetime a genuine l+1 active-layer entry already
+    // gets (survives through l's cleanup via the +1 exemption, then through
+    // l+1's own cleanup via a direct match, reclaimed only at l+2's
+    // cleanup if nothing consumed it) -- never touches the main VRAM cache
+    // at all unless a real repeat hit later promotes it, exactly mirroring
+    // decode_async_prewarm's own prewarm_skip_next_promote discipline.
+    bool speculative_active_layer_fill = false;
 
     // Periodic decay of hit_count so a once-hot expert doesn't stay
     // permanently sticky after routing patterns shift (e.g. topic change).
@@ -308,6 +579,54 @@ public:
     // additional synchronization is needed here.
     struct SwapStats { uint64_t swap_in = 0; uint64_t swap_out = 0; };
     std::unordered_map<uint64_t, SwapStats> vram_swap_stats;
+
+    // Startup-preload accounting. The normal swap counters say how much
+    // churn occurred, but cannot answer whether a preloaded identity was
+    // ever actually routed before it was evicted. These records are marked
+    // by main.cpp after a successful startup upload, touched by
+    // finish_expert_hit(), and finalized by evict_lru(). All mutation sites
+    // already hold cache_mutex, except the startup-only mark call.
+    struct StartupPreloadStats {
+        bool used = false;
+        bool eviction_counted = false;
+    };
+    std::unordered_map<uint64_t, StartupPreloadStats> startup_preload_stats;
+    uint64_t startup_preload_marked = 0;
+    uint64_t startup_preload_used = 0;
+    uint64_t startup_preload_evicted_before_use = 0;
+    uint64_t startup_preload_evicted_before_use_prefill = 0;
+    uint64_t startup_preload_evicted_after_use = 0;
+    uint64_t startup_preload_evicted_after_use_prefill = 0;
+
+    void mark_startup_preloaded(int layer, int expert_id) {
+        const uint64_t key = swap_key(layer, expert_id);
+        const auto result = startup_preload_stats.emplace(key, StartupPreloadStats{});
+        if (result.second) ++startup_preload_marked;
+    }
+
+    void note_startup_preload_hit(int layer, int expert_id) {
+        if (startup_preload_phase) return;
+        auto it = startup_preload_stats.find(swap_key(layer, expert_id));
+        if (it != startup_preload_stats.end() && !it->second.used) {
+            it->second.used = true;
+            ++startup_preload_used;
+        }
+    }
+
+    void note_startup_preload_eviction(int layer, int expert_id) {
+        auto it = startup_preload_stats.find(swap_key(layer, expert_id));
+        if (it == startup_preload_stats.end() || it->second.eviction_counted)
+            return;
+        it->second.eviction_counted = true;
+        if (it->second.used) {
+            ++startup_preload_evicted_after_use;
+            if (in_prefill) ++startup_preload_evicted_after_use_prefill;
+        } else {
+            ++startup_preload_evicted_before_use;
+            if (in_prefill) ++startup_preload_evicted_before_use_prefill;
+        }
+    }
+
     static uint64_t swap_key(int layer, int expert_id) {
         return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert_id;
     }
@@ -416,6 +735,7 @@ public:
     // Pinned host buffer for cross-device transfers
     float* h_xfer_pinned = nullptr;
     size_t h_xfer_cap = 0;
+    size_t host_pinned_reservation_bytes = 0;
 
     // Fixed-size pinned staging pool for expert H2D uploads (upload_expert/
     // upload_expert_async) -- see init_bounce_pool's own comment for why
@@ -530,11 +850,30 @@ public:
             cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
             cudaStreamCreate(&dev.compute_stream);
             cudaStreamCreate(&dev.copy_stream);
+            cudaStreamCreate(&dev.active_layer_stream);
+            cudaStreamCreate(&dev.speculative_prefetch_stream);
+            cudaStreamCreate(&dev.speculative_prefetch_stream2);
+            cudaStreamCreate(&dev.active_layer_sync_fallback_stream);
         }
 
-        // Allocate pinned host transfer buffer (64 KB for small cross-GPU vectors)
-        cudaMallocHost((void**)&h_xfer_pinned, 256 * 1024);
-        h_xfer_cap = 256 * 1024;
+        // Allocate pinned host transfer buffer (256 KB for small cross-GPU
+        // vectors).  CUDA host allocations are real host memory and are not
+        // visible to the RAM-slab accounting, so charge them to the shared
+        // process budget before asking the driver for the pages.
+        constexpr size_t kXferBytes = 256 * 1024;
+        const bool xfer_admitted = MemoryGuard::try_reserve_host_bytes(kXferBytes);
+        if (xfer_admitted) {
+            if (cudaMallocHost((void**)&h_xfer_pinned, kXferBytes) == cudaSuccess &&
+                h_xfer_pinned) {
+                h_xfer_cap = kXferBytes;
+                host_pinned_reservation_bytes += kXferBytes;
+            } else {
+                cudaGetLastError();
+                MemoryGuard::release_host_bytes(kXferBytes);
+            }
+        } else {
+            LOG_STREAM_WARN() << "[MEM-GUARD] cross-device pinned transfer buffer refused\n";
+        }
 
         print_topology();
         return true;
@@ -558,9 +897,18 @@ public:
         for (auto& loc : expert_vram_cache) {
             if (loc.upload_event) { cudaSetDevice(loc.gpu_id); cudaEventDestroy(loc.upload_event); }
         }
+        // Mirrors the main-cache loop above -- active_layer_slots' own
+        // upload_event, added 2026-08-26 (see allocate_active_layer_area).
+        for (auto& loc : active_layer_slots) {
+            if (loc.upload_event) { cudaSetDevice(loc.gpu_id); cudaEventDestroy(loc.upload_event); }
+        }
         for (auto& dev : devices) {
             if (dev.compute_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.compute_stream); }
             if (dev.copy_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.copy_stream); }
+            if (dev.active_layer_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.active_layer_stream); }
+            if (dev.speculative_prefetch_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.speculative_prefetch_stream); }
+            if (dev.speculative_prefetch_stream2) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.speculative_prefetch_stream2); }
+            if (dev.active_layer_sync_fallback_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.active_layer_sync_fallback_stream); }
             if (dev.expert_cache_pool) {
                 cudaSetDevice(dev.id);
                 if (dev.cufile_pool_registered) cufile_io::deregister_buffer(dev.expert_cache_pool);
@@ -578,6 +926,8 @@ public:
         // slot inside expert_cache_pool/add_dual_role's pool, never this
         // one, so there is nothing to deregister here.
         if (active_layer_pool) { cudaSetDevice(active_layer_slots.front().gpu_id); cudaFree(active_layer_pool); }
+        MemoryGuard::release_host_bytes(host_pinned_reservation_bytes);
+        host_pinned_reservation_bytes = 0;
     }
 
     // Allocate expert VRAM cache on vault GPUs
@@ -597,7 +947,20 @@ public:
     // tightly budgeted (see host_ram_gb's freeze-incident history).
     void init_bounce_pool(size_t slab_bytes) {
         if (!bounce_pool.empty() || slab_bytes == 0) return;
+        if (slab_bytes > std::numeric_limits<size_t>::max() / BOUNCE_POOL_SIZE) {
+            LOG_STREAM_WARN() << "[GPU] Bounce buffer size overflow -- disabled\n";
+            return;
+        }
+        const size_t total_host_bytes = slab_bytes * BOUNCE_POOL_SIZE;
+        if (!MemoryGuard::try_reserve_host_bytes(total_host_bytes)) {
+            LOG_STREAM_WARN() << "[MEM-GUARD] bounce-buffer pool refused: "
+                              << total_host_bytes / 1e6
+                              << " MB; expert uploads will use pageable sources\n";
+            return;
+        }
+        host_pinned_reservation_bytes += total_host_bytes;
         bounce_pool.resize(BOUNCE_POOL_SIZE);
+        int allocated = 0;
         for (auto& bb : bounce_pool) {
             cudaError_t err = cudaHostAlloc((void**)&bb.host_ptr, slab_bytes, cudaHostAllocPortable);
             if (err != cudaSuccess) {
@@ -607,7 +970,13 @@ public:
                 bb.host_ptr = nullptr;
                 continue;
             }
+            ++allocated;
             cudaEventCreate(&bb.in_flight);
+        }
+        if (allocated < BOUNCE_POOL_SIZE) {
+            const size_t unused = (size_t)(BOUNCE_POOL_SIZE - allocated) * slab_bytes;
+            MemoryGuard::release_host_bytes(unused);
+            host_pinned_reservation_bytes -= unused;
         }
         LOG_STREAM_INFO() << "[GPU] Bounce buffer pool: " << BOUNCE_POOL_SIZE << " x "
                   << slab_bytes / 1e6 << " MB pinned (portable) staging buffers for expert H2D uploads\n";
@@ -648,6 +1017,19 @@ public:
     // relative to the content being discarded. Resets both flags itself,
     // so callers don't need their own explicit reset alongside this.
     void record_active_layer_prewarm_reclaim(ExpertLocation& slot) {
+        // 2026-08-28: per-GPU used/wasted breakdown -- covers BOTH branches
+        // below (was_async_prewarmed and pilot_speculative_fill), since the
+        // question "does this GPU's routed slice have a different real
+        // hit-rate" applies regardless of which mechanism populated the
+        // slot. See n_active_layer_used_by_gpu's own comment (perf_timer.hpp).
+        if ((slot.was_async_prewarmed || slot.pilot_speculative_fill)
+            && slot.gpu_id >= 0 && slot.gpu_id < 8) {
+            if (slot.prewarm_touched) {
+                perf().n_active_layer_used_by_gpu[slot.gpu_id].fetch_add(1, std::memory_order_relaxed);
+            } else {
+                perf().n_active_layer_wasted_by_gpu[slot.gpu_id].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         if (slot.was_async_prewarmed) {
             if (slot.prewarm_touched) {
                 perf().n_active_layer_prewarm_used.fetch_add(1, std::memory_order_relaxed);
@@ -655,14 +1037,97 @@ public:
                 perf().n_active_layer_prewarm_wasted.fetch_add(1, std::memory_order_relaxed);
                 perf().bytes_active_layer_prewarm_wasted.fetch_add((int64_t)slot.size, std::memory_order_relaxed);
             }
+        } else if (slot.pilot_speculative_fill) {
+            // Own counter pair -- see ExpertLocation::pilot_speculative_fill's
+            // own comment for why this is deliberately not folded into the
+            // was_async_prewarmed branch above.
+            if (slot.prewarm_touched) {
+                perf().n_pilot_active_fill_used.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                perf().n_pilot_active_fill_wasted.fetch_add(1, std::memory_order_relaxed);
+                perf().bytes_pilot_active_fill_wasted.fetch_add((int64_t)slot.size, std::memory_order_relaxed);
+            }
+            // Per-rank breakdown -- see ExpertLocation::promoted_at_rank's
+            // own comment for why this answers a different question than
+            // the pilot's own per-rank prediction-accuracy metric.
+            if (slot.promoted_at_rank >= 0 && slot.promoted_at_rank < 8) {
+                if (slot.prewarm_touched) {
+                    perf().n_pilot_active_fill_used_by_rank[slot.promoted_at_rank].fetch_add(
+                        1, std::memory_order_relaxed);
+                } else {
+                    perf().n_pilot_active_fill_wasted_by_rank[slot.promoted_at_rank].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+            }
         }
         slot.was_async_prewarmed = false;
+        slot.pilot_speculative_fill = false;
         slot.prewarm_touched = false;
+        slot.promoted_at_rank = -1;
+    }
+
+    // Build a balanced compact-cache plan for one physical VRAM pool. The
+    // plan gives every MoE layer the same number of resident expert slots as
+    // far as the byte budget permits, instead of charging every slot at the
+    // largest slab size in the model. The round-robin fill keeps coverage
+    // balanced across layers; the final remainder is used wherever it fits.
+    // A pure function so its arithmetic can be tested without allocating a
+    // CUDA pool.
+    static std::vector<int> compact_layer_slot_counts(
+        size_t cache_bytes, int n_experts_total,
+        const std::vector<size_t>& layer_slab_bytes) {
+        std::vector<int> counts(layer_slab_bytes.size(), 0);
+        if (cache_bytes == 0 || n_experts_total <= 0) return counts;
+
+        size_t used = 0;
+        // Give each active layer one slot first when possible. This avoids a
+        // large layer disappearing entirely from the VRAM tier just because
+        // an earlier layer consumed the budget during the balanced fill.
+        for (size_t l = 0; l < layer_slab_bytes.size(); ++l) {
+            const size_t bytes = layer_slab_bytes[l];
+            if (bytes == 0 || bytes > cache_bytes - used) continue;
+            counts[l] = 1;
+            used += bytes;
+        }
+
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            for (size_t l = 0; l < layer_slab_bytes.size(); ++l) {
+                const size_t bytes = layer_slab_bytes[l];
+                if (bytes == 0 || counts[l] >= n_experts_total ||
+                    bytes > cache_bytes - used)
+                    continue;
+                ++counts[l];
+                used += bytes;
+                progress = true;
+            }
+        }
+        return counts;
     }
 
     void allocate_expert_cache(size_t expert_slab_bytes, int n_experts_total,
-                                const EngineConfig* config = nullptr) {
-        expert_slab_size = expert_slab_bytes;
+                                const EngineConfig* config = nullptr,
+                                const std::vector<size_t>& layer_slab_bytes = {}) {
+        expert_max_slab_size = expert_slab_bytes;
+        expert_n_experts = n_experts_total;
+        expert_layer_slab_bytes = layer_slab_bytes;
+        // A geometry vector is an explicit request for the compact layout.
+        // Do not require the raw layer sizes to differ: the old global
+        // stride may have been inflated by the LCM/row-alignment calculation
+        // even when every layer's real slab is the same size. In that case
+        // compact mode is still what removes the alignment-induced waste.
+        expert_compact_layout = false;
+        for (size_t bytes : expert_layer_slab_bytes) {
+            if (bytes != 0) {
+                expert_compact_layout = true;
+                break;
+            }
+        }
+        // The scalar is still the legacy fallback and the staging-buffer
+        // maximum. It is intentionally hidden from consumers that need a
+        // contiguous resident-layer view when compact mode is active.
+        expert_slab_size = expert_compact_layout ? 0 : expert_slab_bytes;
         if (expert_slab_bytes == 0) return;
         init_bounce_pool(expert_slab_bytes);
 
@@ -759,8 +1224,67 @@ public:
     // has started USING expert_vram_cache (true at startup, before the
     // prefetcher/decode loop begins) -- not safe to call mid-session.
     void reindex_expert_vram_cache(size_t expert_slab_bytes) {
-        expert_slab_size = expert_slab_bytes;
+        expert_max_slab_size = expert_slab_bytes;
+        expert_slab_size = expert_compact_layout ? 0 : expert_slab_bytes;
         if (expert_slab_bytes == 0) return;
+
+        if (expert_compact_layout && expert_n_experts > 0 &&
+            !expert_layer_slab_bytes.empty()) {
+            expert_vram_cache_cap = 0;
+            for (int vi : vault_gpus) {
+                const auto counts = compact_layer_slot_counts(
+                    devices[vi].expert_cache_size, expert_n_experts,
+                    expert_layer_slab_bytes);
+                for (int count : counts) expert_vram_cache_cap += (size_t)count;
+            }
+            expert_vram_cache.resize(expert_vram_cache_cap);
+
+            size_t slot_index = 0;
+            for (int vi : vault_gpus) {
+                auto& dev = devices[vi];
+                const auto counts = compact_layer_slot_counts(
+                    dev.expert_cache_size, expert_n_experts,
+                    expert_layer_slab_bytes);
+                size_t offset = 0;
+                for (size_t layer = 0; layer < counts.size(); ++layer) {
+                    const size_t layer_bytes = expert_layer_slab_bytes[layer];
+                    for (int e = 0; e < counts[layer]; ++e) {
+                        auto& slot = expert_vram_cache[slot_index++];
+                        slot.gpu_id = dev.id;
+                        slot.device_ptr = dev.expert_cache_pool + offset;
+                        slot.offset = offset;
+                        slot.size = layer_bytes;
+                        slot.pool_layer = (int)layer;
+                        slot.layer_idx = -1;
+                        slot.expert_id = -1;
+                        slot.last_used_clock = 0;
+                        slot.hit_count = 0;
+                        if (!slot.upload_event) {
+                            cudaSetDevice(dev.id);
+                            cudaEventCreate(&slot.upload_event);
+                        }
+                        offset += layer_bytes;
+                    }
+                }
+                LOG_STREAM_INFO() << "[GPU] Compact expert pool: GPU " << dev.id
+                                  << " uses " << slot_index << " total slots so far, "
+                                  << offset / 1e9 << " GB laid out across "
+                                  << expert_layer_slab_bytes.size() << " layer regions\n";
+            }
+
+            unpinned_slot_indices.clear();
+            unpinned_slot_indices.reserve(expert_vram_cache_cap);
+            for (size_t i = 0; i < expert_vram_cache_cap; ++i)
+                unpinned_slot_indices.push_back(i);
+
+            size_t total_cache_bytes = 0;
+            for (int vi : vault_gpus) total_cache_bytes += devices[vi].expert_cache_size;
+            LOG_STREAM_INFO() << "[GPU] Compact expert VRAM cache: "
+                              << expert_vram_cache_cap << " variable-size slots ("
+                              << total_cache_bytes / 1e9 << " GB pool) across "
+                              << vault_gpus.size() << " GPU(s)\n";
+            return;
+        }
 
         // REAL BUG FIX: total usable capacity must be the SUM of each
         // device's OWN floor(expert_cache_size / expert_slab_bytes), not
@@ -812,6 +1336,7 @@ public:
             expert_vram_cache[i].device_ptr = dev.expert_cache_pool + offset;
             expert_vram_cache[i].offset = offset;
             expert_vram_cache[i].size = expert_slab_bytes;
+            expert_vram_cache[i].pool_layer = -1;
             expert_vram_cache[i].layer_idx = -1;
             expert_vram_cache[i].expert_id = -1;
             // Guard against re-creating (and leaking) an event that a
@@ -879,10 +1404,18 @@ public:
     // dual-role device is indistinguishable from any other vault GPU to
     // that code; only role stays CoreEngine for VRAM-usage reporting.
     bool add_dual_role_expert_cache(int device_index, size_t cap_bytes, size_t expert_slab_bytes) {
-        if (expert_slab_bytes == 0 || cap_bytes < expert_slab_bytes) {
+        size_t minimum_compact_slab = expert_slab_bytes;
+        if (expert_compact_layout) {
+            minimum_compact_slab = SIZE_MAX;
+            for (size_t bytes : expert_layer_slab_bytes) {
+                if (bytes != 0) minimum_compact_slab = std::min(minimum_compact_slab, bytes);
+            }
+            if (minimum_compact_slab == SIZE_MAX) minimum_compact_slab = expert_slab_bytes;
+        }
+        if (expert_slab_bytes == 0 || cap_bytes < minimum_compact_slab) {
             LOG_STREAM_INFO() << "[GPU] Dual-role expert cache on device " << devices[device_index].id
                       << " skipped -- cap (" << cap_bytes / 1e9 << " GB) smaller than one expert slab ("
-                      << expert_slab_bytes / 1e9 << " GB).\n";
+                      << minimum_compact_slab / 1e9 << " GB).\n";
             return false;
         }
         auto& dev = devices[device_index];
@@ -953,6 +1486,11 @@ public:
                 return nullptr; // async copy still in flight — not safe to use yet
             }
         }
+        // A successful cache lookup is the first real routed use of this
+        // startup-loaded identity. Keep this separate from hit_count because
+        // the question here is binary: was the preloaded expert ever needed
+        // before eviction?
+        note_startup_preload_hit(layer, expert_id);
         loc.last_used_clock = ++cache_clock;
         if (loc.hit_count < UINT32_MAX) loc.hit_count++;
         if (++hits_since_decay >= HIT_DECAY_INTERVAL) decay_hit_counts();
@@ -1213,7 +1751,59 @@ public:
     // already computes this identity internally (for vram_swap_stats/
     // expert_index bookkeeping) right before clearing it, so this just
     // surfaces a value that was already being thrown away.
-    ExpertLocation* evict_lru(size_t needed_bytes, int* out_old_layer = nullptr, int* out_old_expert = nullptr) {
+    // dual_role_gpu_id: the CoreEngine GPU's device index, ONLY when it
+    // also hosts a genuine (>0 slot) dual-role vault slice AND at least
+    // one OTHER vault GPU exists too (vault_gpus.size() > 1) -- the second
+    // condition matters: a single-GPU dense+moe deployment has core_gpu
+    // IN vault_gpus but nothing else to fall back to, so treating it as
+    // "the dual-role GPU to exclude by default" would leave evict_lru's
+    // default (unrestricted) scan with nothing to consider at all. Used
+    // by evict_lru's own default-exclusion below and by the pilot-driven
+    // GPU1-targeted promotion call site (execution_layer.cpp) to know
+    // which device index to explicitly target. Returns -1 (no dual-role
+    // GPU to treat specially) otherwise.
+    int dual_role_gpu_id() const {
+        if (core_gpu < 0 || vault_gpus.size() <= 1) return -1;
+        return (std::find(vault_gpus.begin(), vault_gpus.end(), core_gpu) != vault_gpus.end())
+            ? core_gpu : -1;
+    }
+
+    // restrict_gpu_id: -1 (default) = the general/unrestricted pool, EXACTLY
+    // as evict_lru behaved before 2026-08-16's Idea-1/Direction-1 work --
+    // every existing caller (upload_expert, upload_expert_async's own
+    // default, promote_active_to_main, startup PIN preload, reactive
+    // promote_ram_to_vram, etc.) keeps calling this with no new argument
+    // and sees NO behavior change at all. Any value >= 0 instead means
+    // "ONLY consider slots physically on this one device" -- used
+    // exclusively by the explicit GPU1-targeted promotion paths
+    // (RAMSafetyManager::promote_ram_to_vram_gpu1, reactive_promote_gpu1_
+    // every_n's routing) to stage something specifically into the
+    // dual-role slice.
+    //
+    // REGRESSION FOUND AND FIXED 2026-08-16: an earlier version of this
+    // function made restrict_gpu_id=-1 ALSO exclude the dual-role GPU by
+    // default (to make GPU1 "prediction-only" for the since-reverted Idea
+    // 1 speculative mechanism) -- but that changed the DEFAULT for every
+    // other caller too, not just the new one, silently zeroing out GPU1's
+    // dual-role slice for the rest of the session every time (confirmed on
+    // real hardware: [VRAM-SLOTS] showed exactly GPU0's own slot count,
+    // 1322/1410, i.e. GPU1's ~88 slots sat completely empty all session,
+    // whenever the new opt-in features were off -- which is the default,
+    // so this was silently active in every "baseline" run since it landed,
+    // not just the Idea-1 test runs). Real, measurable throughput cost,
+    // not noise -- caught by the user questioning a persistent ~0.60-0.64
+    // vs 0.68 tok/s gap that survived a reboot. Since Direction 1 (routing
+    // REAL reactive demand to GPU1, not speculation) is the surviving
+    // approach, the whole "GPU1 must be prediction-only" premise this
+    // exclusion existed for is obsolete anyway -- removed outright rather
+    // than gated behind yet another flag.
+    // required_layer: -1 (default) = any layer (legacy behavior). In compact
+    // mode a non-negative value restricts the victim to the region whose
+    // slots are sized for that layer. This is required because a compact
+    // slot is not interchangeable with a slot from another layer.
+    ExpertLocation* evict_lru(size_t needed_bytes, int* out_old_layer = nullptr,
+                              int* out_old_expert = nullptr, int restrict_gpu_id = -1,
+                              int required_layer = -1) {
         GPU_TOPO_TIMED_LOCK(lock);
         // Whole-function cost -- never directly timed before. Unlike a plain
         // comparison-only scan, this loop can call cudaEventQuery (a real
@@ -1225,7 +1815,6 @@ public:
         // (itself untimed until this same investigation pass -- see its own
         // t_upload_expert_async), and promote_active_to_main.
         PERF_SCOPE(t_evict_lru);
-        (void)needed_bytes; // All slots are fixed-size in slab allocator
         ExpertLocation* victim = nullptr;
         // Iterates unpinned_slot_indices, NOT expert_vram_cache directly --
         // see that vector's own comment. Permanently pinned slots are
@@ -1235,6 +1824,16 @@ public:
         for (size_t _idx : unpinned_slot_indices) {
             auto& loc = expert_vram_cache[_idx];
             if (loc.memcpy_broken) continue;  // permanently excluded -- see its own comment
+            if (restrict_gpu_id >= 0 && loc.gpu_id != restrict_gpu_id) {
+                continue;  // targeted scan: this device ONLY -- restrict_gpu_id=-1 (default) never filters at all
+            }
+            if (expert_compact_layout && required_layer >= 0 &&
+                loc.pool_layer != required_layer) {
+                continue;  // compact slots are reusable only within their layer region
+            }
+            if (needed_bytes > loc.size) {
+                continue;  // never truncate an expert into a smaller compact slot
+            }
             if (loc.layer_idx == -1) { victim = &loc; break; } // empty slot preferred
             // Defensive only, should be unreachable by construction: if a
             // slot in unpinned_slot_indices is somehow ALSO pinned (a
@@ -1280,6 +1879,20 @@ public:
                 if (loc.temp_pin_count > 0) perf().n_temp_pin_eviction_skips.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+            // 2026-08-17: exclude a candidate the pilot's most recent
+            // skip-fetch decision JUST confirmed resident -- see
+            // pilot_confirmed_set.hpp and n_pilot_protected_eviction_skips_
+            // vram's own comment (perf_timer.hpp) for why this can never
+            // starve the scan (the confirmed set holds at most 16 entries,
+            // all for one single most-recent layer transition). Checked
+            // AFTER pinned/temp_pin_count (those are hard correctness
+            // requirements; this is a soft preference), so a pilot-
+            // confirmed slot that's ALSO pinned still hits the branch above
+            // first with the right counter.
+            if (loc.layer_idx != -1 && was_pilot_confirmed_resident(loc.layer_idx, loc.expert_id)) {
+                perf().n_pilot_protected_eviction_skips_vram.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             if (!loc.upload_ready) {
                 cudaSetDevice(loc.gpu_id);
                 if (loc.upload_event && cudaEventQuery(loc.upload_event) == cudaSuccess) {
@@ -1290,7 +1903,25 @@ public:
                     continue;  // genuinely still copying -- must not evict
                 }
             }
-            if (!victim || loc.eviction_score() < victim->eviction_score()) victim = &loc;
+            // Prefill advances strictly by layer. Once a layer is complete,
+            // its unpinned runtime experts are the safest first victims: they
+            // cannot be needed by this forward pass again. Within the same
+            // age class, retain the existing recency+frequency policy.
+            if (!victim) {
+                victim = &loc;
+            } else {
+                const bool loc_completed =
+                    in_prefill && prefill_current_layer >= 0 &&
+                    loc.layer_idx < prefill_current_layer;
+                const bool victim_completed =
+                    in_prefill && prefill_current_layer >= 0 &&
+                    victim->layer_idx < prefill_current_layer;
+                if (loc_completed != victim_completed ||
+                    (loc_completed == victim_completed &&
+                     loc.eviction_score() < victim->eviction_score())) {
+                    victim = &loc;
+                }
+            }
         }
         if (victim) {
             // Record the swap-out BEFORE clearing identity below -- an empty
@@ -1308,6 +1939,7 @@ public:
                 if (was_pilot_confirmed_resident(victim->layer_idx, victim->expert_id)) {
                     perf().n_evicted_was_pilot_confirmed_vram.fetch_add(1, std::memory_order_relaxed);
                 }
+                note_startup_preload_eviction(victim->layer_idx, victim->expert_id);
                 vram_swap_stats[swap_key(victim->layer_idx, victim->expert_id)].swap_out++;
                 // Drop the index entry for the identity being evicted --
                 // without this, expert_index would keep pointing this
@@ -1350,8 +1982,21 @@ public:
 
     // Upload an expert slab from host memory into a VRAM cache slot.
     // Returns the slot if successful, nullptr if cache is full/not available.
+    // target_gpu_id: optional hint restricting this upload to a specific
+    // vault GPU (passed straight through to evict_lru's own restrict_
+    // gpu_id, -1 = unrestricted). Added 2026-09 for pin_core_gpu_top_n
+    // (main.cpp's startup [PIN] preload) -- before this, every caller of
+    // upload_expert always went through the unrestricted scan, which in
+    // practice means "whichever vault GPU evict_lru's scan order happens
+    // to check first with a free slot", almost always the much bigger
+    // primary vault GPU. Callers that pass a real target_gpu_id and get
+    // nullptr back should be prepared to retry with -1 (evict_lru finding
+    // no victim on a SPECIFIC, possibly-tiny GPU is an expected outcome,
+    // not a hard failure of the whole upload).
     ExpertLocation* upload_expert(int layer, int expert_id,
-                                   const uint8_t* host_data, size_t bytes) {
+                                   const uint8_t* host_data, size_t bytes,
+                                   int target_gpu_id = -1,
+                                   bool startup_plain_copy = false) {
         if (expert_vram_cache_cap == 0 || !host_data || bytes == 0) return nullptr;
         GPU_TOPO_TIMED_LOCK(lock);
 
@@ -1361,21 +2006,36 @@ public:
 
         // Get a slot (evict LRU if needed)
         int old_layer = -1, old_expert = -1;
-        ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert);
+        ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert,
+                                          target_gpu_id, layer);
         if (!slot || !slot->device_ptr) {
             // Previously silent -- a real run showed this path (or the
             // cudaMemcpy failure below) responsible for a startup preload
             // losing ~99% of its attempts with zero diagnostic evidence
             // either way. Should be near-impossible on an otherwise-empty
             // cache (every slot pinned/temp-pinned/upload-pending
-            // simultaneously) -- if this fires during startup preload,
-            // something upstream (vault_gpus/unpinned_slot_indices
-            // bookkeeping, likely around a dual-role reindex) is broken.
-            perf().n_upload_expert_no_victim.fetch_add(1, std::memory_order_relaxed);
-            LOG_ERROR("[MOE-VRAM]  upload_expert: evict_lru found NO victim for layer=%d expert=%d "
-                      "(cache_cap=%zu, unpinned_slots=%zu) -- every candidate slot is pinned, "
-                      "temp-pinned, or upload-pending, or the pool is empty/misconfigured\n",
-                      layer, expert_id, expert_vram_cache_cap, unpinned_slot_indices.size());
+            // simultaneously) -- if this fires during startup preload with
+            // target_gpu_id==-1 (unrestricted), something upstream
+            // (vault_gpus/unpinned_slot_indices bookkeeping, likely around
+            // a dual-role reindex) is broken. A target_gpu_id-RESTRICTED
+            // miss is a different, expected story -- the caller asked for
+            // a SPECIFIC (possibly small) GPU's own slots specifically, so
+            // "that one GPU is already full" is routine, not alarming
+            // (e.g. pin_core_gpu_top_n exceeding the CoreEngine GPU's own
+            // small slice once its slots run out) -- DEBUG, not ERROR, and
+            // its own counter so it's not conflated with the real-bug case.
+            if (target_gpu_id < 0) {
+                perf().n_upload_expert_no_victim.fetch_add(1, std::memory_order_relaxed);
+                LOG_ERROR("[MOE-VRAM]  upload_expert: evict_lru found NO victim for layer=%d expert=%d "
+                          "(cache_cap=%zu, unpinned_slots=%zu) -- every candidate slot is pinned, "
+                          "temp-pinned, or upload-pending, or the pool is empty/misconfigured\n",
+                          layer, expert_id, expert_vram_cache_cap, unpinned_slot_indices.size());
+            } else {
+                perf().n_upload_expert_no_victim_restricted.fetch_add(1, std::memory_order_relaxed);
+                LOG_DEBUG("[MOE-VRAM]  upload_expert: no victim on restricted target_gpu_id=%d for "
+                          "layer=%d expert=%d (that GPU's own slots are full -- caller should retry "
+                          "unrestricted)\n", target_gpu_id, layer, expert_id);
+            }
             return nullptr;
         }
 
@@ -1413,10 +2073,14 @@ public:
         cudaSetDevice(slot->gpu_id);
 
         PERF_START(host_register);
-        cudaError_t reg_err = cudaHostRegister((void*)host_data, copy_bytes, cudaHostRegisterPortable);
-        bool registered = (reg_err == cudaSuccess);
+        cudaError_t reg_err = cudaSuccess;
+        bool registered = false;
+        if (!startup_plain_copy) {
+            reg_err = cudaHostRegister((void*)host_data, copy_bytes, cudaHostRegisterPortable);
+            registered = (reg_err == cudaSuccess);
+        }
         PERF_END(host_register, t_host_register_stage);
-        if (!registered) {
+        if (!registered && !startup_plain_copy) {
             // cudaErrorHostMemoryAlreadyRegistered is now an EXPECTED, benign
             // outcome, not the "real double-registration bug" this comment
             // originally assumed it could only mean: with EngineConfig::
@@ -1457,7 +2121,16 @@ public:
         PERF_START(gpu_sync_upload);
         cudaStream_t upload_stream = devices[slot->gpu_id].copy_stream;
         cudaError_t err;
-        if (upload_stream) {
+        if (startup_plain_copy) {
+            // Startup preload runs before inference and has no compute to
+            // overlap. Keep this path independent of pageable-source
+            // async-copy staging and transient host registration; those
+            // operations are useful for runtime promotion but produced
+            // invalid-argument failures during large one-time preloads on
+            // this machine. The caller still gets the same synchronous
+            // completion contract.
+            err = cudaMemcpy(slot->device_ptr, host_data, copy_bytes, cudaMemcpyHostToDevice);
+        } else if (upload_stream) {
             err = cudaMemcpyAsync(slot->device_ptr, host_data, copy_bytes, cudaMemcpyHostToDevice, upload_stream);
             if (err == cudaSuccess) err = cudaStreamSynchronize(upload_stream);
         } else {
@@ -1465,6 +2138,10 @@ public:
             err = cudaMemcpy(slot->device_ptr, host_data, copy_bytes, cudaMemcpyHostToDevice);
         }
         PERF_END(gpu_sync_upload, t_gpu_upload);
+        if (err == cudaSuccess && slot->gpu_id >= 0 && (size_t)slot->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS) {
+            perf().bytes_h2d_upload_by_gpu[slot->gpu_id].fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
+            perf().n_h2d_upload_by_gpu[slot->gpu_id].fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Unregister BEFORE checking err/returning -- must run on every path
         // (success or failure) since a registration that's never undone
@@ -1489,6 +2166,12 @@ public:
                       "gpu=%d bytes=%zu dst=%p host_src=%p: %s\n",
                       layer, expert_id, slot->gpu_id, copy_bytes, (void*)slot->device_ptr,
                       (void*)host_data, cudaGetErrorString(err));
+            // This synchronous startup path treats a failed preload as a
+            // rejected residency hint and continues with the expert in RAM.
+            // Clear the handled CUDA error before the next startup upload or
+            // the first GGML graph call; otherwise CUDA can report the same
+            // stale invalid-argument state from an unrelated later API call.
+            cudaGetLastError();
             // Permanently exclude this slot from future eviction candidacy --
             // a real run showed evict_lru re-selecting the SAME still-"empty"
             // slot on every subsequent call (a failed write never marks a
@@ -1498,10 +2181,24 @@ public:
             // slots. Whatever is wrong with this address (bad device_ptr
             // computation, or a genuinely faulty VRAM region) won't fix
             // itself by retrying -- see ExpertLocation::memcpy_broken.
-            slot->memcpy_broken = true;
-            LOG_ERROR("[MOE-VRAM]  upload_expert: permanently excluding slot at dst=%p from future "
-                      "eviction candidacy (gpu=%d) -- this address has now failed at least once\n",
-                      (void*)slot->device_ptr, slot->gpu_id);
+            ++slot->memcpy_fail_count;
+            if (slot->memcpy_fail_count >= 2) {
+                slot->memcpy_broken = true;
+                LOG_ERROR("[MOE-VRAM]  upload_expert: permanently excluding slot at dst=%p from future "
+                          "eviction candidacy (gpu=%d) -- this SAME address has now failed %d times, "
+                          "so the fault really is destination-side\n",
+                          (void*)slot->device_ptr, slot->gpu_id, slot->memcpy_fail_count);
+            } else {
+                // First failure on this slot: most likely a bad SOURCE
+                // pointer being handed to a healthy destination. Retiring
+                // the slot here would punish the wrong object and shrink
+                // usable VRAM cache for a host-side bug (which is exactly
+                // what this workaround was doing before 2026-09-01).
+                LOG_ERROR("[MOE-VRAM]  upload_expert: H2D failed once at dst=%p (gpu=%d) -- NOT retiring "
+                          "the slot; a bad host_src fails against any destination, so one failure is not "
+                          "evidence this address is faulty. Retires only on a second failure here.\n",
+                          (void*)slot->device_ptr, slot->gpu_id);
+            }
             return nullptr;
         }
 
@@ -1566,7 +2263,7 @@ public:
         if (existing) return existing;
 
         int old_layer = -1, old_expert = -1;
-        ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert);
+        ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert, -1, layer);
         if (!slot || !slot->device_ptr) {
             perf().n_cufile_read_fail.fetch_add(1, std::memory_order_relaxed);
             LOG_ERROR("[CUFILE]  upload_expert_cufile: evict_lru found NO victim for layer=%d "
@@ -1641,8 +2338,33 @@ public:
     // it never blocks the CPU decode critical path. The slot is marked
     // not-ready until the async copy completes (checked via cudaEventQuery in
     // find_expert), so no compute can race a partially-written slab.
+    // target_gpu_id: -1 (default, every existing caller) = the general
+    // pool (see evict_lru's own default-exclusion). >= 0 targets ONE
+    // specific device -- currently only used by the pilot-driven GPU1
+    // promotion path (RAMSafetyManager::promote_ram_to_vram_gpu1).
+    // src_already_pinned: caller-provided hint that host_data is already
+    // PERSISTENTLY page-locked (MoEExpertBlock::slab_pinned -- set once by
+    // ensure_slab_capacity under EngineConfig::ram_pinned_budget_gb). When
+    // true, this function skips the speculative cudaHostRegister attempt
+    // below entirely instead of trying it and catching the resulting
+    // cudaErrorHostMemoryAlreadyRegistered -- functionally identical (both
+    // paths end up doing a direct, unregistered-by-this-call DMA from
+    // host_data), but a real, confirmed difference under compute-sanitizer:
+    // sanitizer flags ANY non-success CUDA API return as an "error" even
+    // when the caller handles it correctly, so the old always-attempt
+    // pattern produced one flagged (but harmless) error per promotion once
+    // ram_pinned_budget_gb was raised into its "most slabs already pinned"
+    // range (>=30GB -- see that field's own comment) -- confirmed via a
+    // real compute-sanitizer run against a live GLM-5.3 generation: 1375
+    // errors, all this exact call/class, zero actual memory-safety issues,
+    // output coherent throughout. Passing the hint when known removes the
+    // doomed call instead of just tolerating its result -- default false so
+    // any caller that doesn't know its pin state keeps the old, still-safe,
+    // reactive fallback.
     ExpertLocation* upload_expert_async(int layer, int expert_id,
-                                         const uint8_t* host_data, size_t bytes) {
+                                         const uint8_t* host_data, size_t bytes,
+                                         int target_gpu_id = -1,
+                                         bool src_already_pinned = false) {
         if (expert_vram_cache_cap == 0 || !host_data || bytes == 0) return nullptr;
         GPU_TOPO_TIMED_LOCK(lock);
         // Whole-function cost -- had ZERO instrumentation of any kind before
@@ -1658,9 +2380,20 @@ public:
         PERF_SCOPE(t_upload_expert_async);
 
         ExpertLocation* existing = find_expert(layer, expert_id);
+        // TEMPORARY diagnostic (2026-08-16, Idea 1 churn investigation --
+        // see doc/gpu-utilization-vram-analysis.md): target_gpu_id >= 0
+        // means this call came from promote_ram_to_vram_gpu1 specifically.
+        // Distinguishes "found already resident (no new transfer -- either
+        // a prior k4 promotion still sitting there, or already on GPU0)"
+        // from "genuinely fresh upload" for THAT call site only, without
+        // touching the general-purpose counters every other caller shares.
+        if (target_gpu_id >= 0) {
+            if (existing) perf().n_predict_gpu1_already_resident.fetch_add(1, std::memory_order_relaxed);
+            else perf().n_predict_gpu1_fresh_upload.fetch_add(1, std::memory_order_relaxed);
+        }
         if (existing) return existing;
 
-        ExpertLocation* slot = evict_lru(bytes);
+        ExpertLocation* slot = evict_lru(bytes, nullptr, nullptr, target_gpu_id, layer);
         if (!slot || !slot->device_ptr) return nullptr;
 
         size_t copy_bytes = std::min(bytes, slot->size);
@@ -1703,8 +2436,15 @@ public:
         // the failed register would fall through to the bounce-buffer
         // memcpy below -- a real, measured regression (stage_cpy 0.00s ->
         // 1.28s on the first real run with pinning enabled).
-        bool already_pinned = false;
-        if (slot->upload_event) {
+        bool already_pinned = src_already_pinned;
+        if (already_pinned) {
+            // Caller already told us -- skip the doomed cudaHostRegister
+            // call entirely (see this function's own header comment for
+            // why this is more than just tidiness: it removes a real,
+            // compute-sanitizer-flagged CUDA API error, not just tolerates
+            // it after the fact).
+            perf().n_upload_async_src_already_pinned.fetch_add(1, std::memory_order_relaxed);
+        } else if (slot->upload_event) {
             PERF_START(upload_async_host_register);
             cudaError_t reg_err = cudaHostRegister((void*)host_data, copy_bytes, cudaHostRegisterPortable);
             registered = (reg_err == cudaSuccess);
@@ -1740,6 +2480,10 @@ public:
             }
         }
         cudaMemcpyAsync(slot->device_ptr, dma_src, copy_bytes, cudaMemcpyHostToDevice, dev.copy_stream);
+        if (slot->gpu_id >= 0 && (size_t)slot->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS) {
+            perf().bytes_h2d_upload_by_gpu[slot->gpu_id].fetch_add((int64_t)copy_bytes, std::memory_order_relaxed);
+            perf().n_h2d_upload_by_gpu[slot->gpu_id].fetch_add(1, std::memory_order_relaxed);
+        }
         if (slot->upload_event) cudaEventRecord(slot->upload_event, dev.copy_stream);
         if (bb && bb->in_flight) cudaEventRecord(bb->in_flight, dev.copy_stream);
         if (registered) {
@@ -1771,11 +2515,38 @@ public:
     // Returns true if successful, false on allocation failure
     bool allocate_active_layer_area(size_t expert_slab_bytes, int max_experts_per_layer);
 
+    // 2026-08-28: multi-GPU variant. `requests` with fewer than 2 entries
+    // (i.e. at most one GPU opted in via active_layer_weight > 0) falls
+    // through to the plain single-GPU allocate_active_layer_area above,
+    // UNCHANGED -- this is what keeps the feature fully opt-in and
+    // byte-identical to legacy when not configured. Each request's own
+    // capacity_slots (falling back to legacy_max_experts_per_layer if 0)
+    // sizes that GPU's own allocation independently.
+    struct ActiveLayerGpuRequest { int gpu_id; int weight; int capacity_slots; };
+    bool allocate_active_layer_area_multi(size_t expert_slab_bytes, int legacy_max_experts_per_layer,
+                                           const std::vector<ActiveLayerGpuRequest>& requests);
+
     // Upload expert to active layer area (temporary, never cached)
     // Returns slot pointer or nullptr if area is full/allocation failed
     // This is decode-thread-only and never participates in LRU eviction
+    // speculative (2026-08-26, default false): set true ONLY by
+    // RAMSafetyManager::promote_ram_to_active_layer (pilot one-layer-ahead
+    // prediction) -- marks the returned slot pilot_speculative_fill=true
+    // and prewarm_skip_next_promote=true instead of the plain reactive-
+    // cold-miss defaults, mirroring upload_expert_active_async's own
+    // treatment of a genuine pre-warm. Every OTHER existing caller (real
+    // dispatch-time cold miss) passes the default false, unchanged.
+    // target_gpu_id (2026-08-28, default -1): when >= 0, restricts BOTH
+    // the pre-check (is this identity already present/in-flight -- see the
+    // duplicate-transfer fix's own comment) and victim-selection to slots
+    // belonging to that GPU's own active_layer_gpu_slices entry, instead of
+    // scanning the whole (possibly multi-GPU) active_layer_slots vector.
+    // -1 (legacy default) scans everything, unchanged -- the correct value
+    // whenever active_layer_gpu_slices is empty (single-GPU mode) or a
+    // caller has no routing decision to make.
     ExpertLocation* upload_expert_active(int layer, int expert_id,
-                                        const uint8_t* host_data, size_t bytes);
+                                        const uint8_t* host_data, size_t bytes,
+                                        bool speculative = false, int target_gpu_id = -1);
 
     // Async sibling of upload_expert_active, for BATCH pre-warming a whole
     // layer's known-needed active-layer misses before Phase 3's per-token
@@ -1808,8 +2579,116 @@ public:
     // SECOND call in the same batch picking this same slot before the
     // first's copy lands, same discipline upload_expert_active's own
     // victim loop already uses.
+    // speculative (2026-08-26, default false): set true ONLY by
+    // RAMSafetyManager::promote_ram_to_active_layer (pilot one-layer-ahead
+    // prediction) -- marks the returned slot pilot_speculative_fill=true
+    // instead of was_async_prewarmed=true, and counts into n_pilot_active_
+    // fill_attempted instead of n_active_layer_uploads_async_issued, so
+    // this source's own used/wasted rate is never blended with decode_
+    // async_prewarm/prefill's Phase-2 batch pre-warm (both existing,
+    // structurally different callers of this same function). Caller is
+    // responsible for eventually calling sync_active_layer_batch on the
+    // returned slot, same contract as every other caller.
+    // target_gpu_id: same meaning as upload_expert_active's own parameter
+    // of the same name -- see its comment.
     ExpertLocation* upload_expert_active_async(int layer, int expert_id,
-                                                const uint8_t* host_data, size_t bytes);
+                                                const uint8_t* host_data, size_t bytes,
+                                                bool speculative = false, int target_gpu_id = -1);
+
+    // 2026-08-28: victim-selection ONLY, no copy -- for ActiveLayerUploadWorkers
+    // (active_layer_upload_workers.hpp), which does the actual register+
+    // cudaMemcpyAsync+cudaEventRecord on a background worker thread instead
+    // of inline here. Mirrors upload_expert_active_async's own victim-
+    // selection exactly (temp_pin_count>0 slots skipped, an unconfirmed
+    // speculative fill always outranks a real slot as a victim), but marks
+    // the chosen slot copy_dispatched=false instead of issuing anything --
+    // see ExpertLocation::copy_dispatched's own comment for why this is
+    // load-bearing, not optional. Callers (both real caller sites already
+    // filter via active_layer_has() before reaching this point, so no
+    // duplicate-transfer pre-check is repeated here) must, immediately
+    // after this returns a non-null slot: (1) hand {host_data, bytes,
+    // slot->device_ptr, slot->gpu_id, slot} to ActiveLayerUploadWorkers::
+    // submit, and (2) protect the RAM-tier source via ram_pin() (NOT
+    // pending_copy_event yet -- that transition only happens once the
+    // worker confirms cudaEventRecord actually ran, via RAMSafetyManager::
+    // ram_mark_pending_copy_and_unpin) until the worker takes over.
+    // Returns nullptr on the same conditions upload_expert_active_async
+    // would (pool not allocated, invalid params, pool full).
+    ExpertLocation* claim_active_layer_slot_for_worker(int layer, int expert_id, size_t bytes,
+                                                         bool speculative, int target_gpu_id);
+
+    // Companion to claim_active_layer_slot_for_worker: called by
+    // ActiveLayerUploadWorkers' own worker thread once it has genuinely
+    // issued the cudaMemcpyAsync + cudaEventRecord for a claimed slot. Under
+    // one brief cache_mutex critical section: flips copy_dispatched back to
+    // true (see that field's own comment -- this is what makes it safe for
+    // find_active_expert/cleanup_active_layer_area to start trusting
+    // cudaEventQuery on this slot's event again) and, if the register call
+    // succeeded, queues the deferred unregister onto the EXISTING pending_
+    // host_unregisters mechanism (reused verbatim -- see its own comment;
+    // already reaped opportunistically by upload_expert_async and the
+    // destructor, no new drain path needed). If register_succeeded is
+    // false, nothing is queued -- there is nothing to unregister.
+    void finalize_worker_dispatch(ExpertLocation* slot, void* host_ptr, bool register_succeeded) {
+        if (!slot) return;
+        GPU_TOPO_TIMED_LOCK(lock);
+        slot->copy_dispatched = true;
+        if (register_succeeded) {
+            pending_host_unregisters.push_back({host_ptr, slot->upload_event});
+        }
+    }
+
+    // 2026-08-29: batched sibling of finalize_worker_dispatch, added to
+    // reduce cache_mutex ACQUISITION COUNT from ActiveLayerUploadWorkers'
+    // two background threads -- real hardware measurement (this session)
+    // found "Cache mutex wait" at ~2.4-3.0s/request (5.7-6.9% of decode
+    // wall), root-caused to these two threads' frequent brief acquisitions
+    // contending with the decode thread's own longer critical sections
+    // elsewhere in this file (evict_lru, upload_expert, ...). Decoupling
+    // copy_dispatched/temp_pin_count onto a separate lock was considered
+    // and REJECTED after a full audit: temp_pin_count is read/written by
+    // 10+ functions across this file and is a hard safety invariant
+    // (victim-selection's "never evict a temp-pinned slot" guard) --
+    // splitting it risks a new TOCTOU race class in the one file with the
+    // most documented lock-ordering history in this codebase. This is the
+    // safer alternative: don't touch what's protected or by whom, just
+    // reduce how MANY separate acquisitions the worker pool needs by
+    // batching several already-completed items' bookkeeping into one.
+    // Safe because it changes nothing about WHEN a copy is considered done
+    // (each item's cudaStreamSynchronize already confirmed completion
+    // before ActiveLayerUploadWorkers ever calls this) or the meaning of
+    // copy_dispatched itself -- purely fewer lock/unlock cycles for the
+    // exact same set of writes, no new invariant. register_succeeded is
+    // always false from this pool (confirmed via grep of every call site
+    // -- this pool never calls cudaHostRegister, see its own header
+    // comment), so pending_host_unregisters is never touched by this path;
+    // any FUTURE caller needing that branch should keep using the
+    // single-item version above, not this one.
+    void finalize_worker_dispatch_batch(const std::vector<ExpertLocation*>& slots) {
+        if (slots.empty()) return;
+        GPU_TOPO_TIMED_LOCK(lock);
+        for (ExpertLocation* slot : slots) {
+            if (slot) slot->copy_dispatched = true;
+        }
+    }
+
+    // Companion to claim_active_layer_slot_for_worker's OTHER exit path --
+    // the claim succeeded but ActiveLayerUploadWorkers::try_submit then
+    // rejected the item (queue at capacity). Releases the claim's temp_pin_
+    // count hold so the slot is immediately eligible for a fresh claim by
+    // anything else (a later worker submission, or the ordinary synchronous
+    // path) -- deliberately does NOT restore layer_idx/expert_id/upload_
+    // ready to any prior state (this slot's true previous occupant was
+    // already reclaim-accounted by record_active_layer_prewarm_reclaim
+    // inside claim_active_layer_slot_for_worker and is gone either way).
+    // copy_dispatched is left false, so any reader still correctly treats
+    // this half-claimed slot as a miss until it's picked as a victim again
+    // (by anything) and genuinely overwritten.
+    void abandon_worker_claim(ExpertLocation* slot) {
+        if (!slot) return;
+        GPU_TOPO_TIMED_LOCK(lock);
+        if (slot->temp_pin_count > 0) slot->temp_pin_count--;
+    }
 
     // Companion to upload_expert_active_async: ONE cudaStreamSynchronize
     // for the whole batch (the actual point of batching -- N async issues
@@ -1897,9 +2776,19 @@ public:
     // directly, so this callback is the caller's hook to apply that
     // marking (via RAMSafetyManager::mark_ram_also_in_vram) without
     // creating a reverse header dependency.
+    // src_gpu_id (2026-08-28, default -1): which GPU device_src actually
+    // lives on. Required now that multi-GPU active-layer pools mean the
+    // promotion SOURCE and the main-cache victim evict_lru picks can be on
+    // DIFFERENT GPUs -- previously always implicitly the same GPU (the
+    // active-layer pool was single-GPU), so a plain same-device cudaMemcpy
+    // was always correct; it silently is NOT once a second GPU is in play.
+    // -1 means "assume same GPU as the destination victim" (the historical
+    // behavior, still correct for every legacy single-GPU-pool call) --
+    // every NEW call site should pass the source slot's own real gpu_id.
     ExpertLocation* promote_active_to_main(int layer, int expert_id,
                                             const uint8_t* device_src, size_t bytes,
-                                            const std::function<void(int, int)>& on_promoted = nullptr);
+                                            const std::function<void(int, int)>& on_promoted = nullptr,
+                                            int src_gpu_id = -1);
 
     // Transfer a small result vector between GPUs (e.g., expert output → core)
     void cross_device_transfer(float* dst, int dst_device,
@@ -1925,12 +2814,37 @@ private:
         int n = devices.size();
         if (n == 0) return;
 
-        if (n == 1) {
+        // CUDA must enumerate every physical adapter, but a config may
+        // intentionally select only a subset. Keep the full inventory for
+        // diagnostics while restricting roles and allocations to the
+        // configured device IDs. Previously an omitted adapter silently
+        // became an ExpertVault whenever the machine had more than one GPU.
+        std::vector<int> selected;
+        if (configured_device_ids.empty()) {
+            selected.reserve(n);
+            for (int i = 0; i < n; ++i) selected.push_back(i);
+        } else {
+            for (int i = 0; i < n; ++i) {
+                if (std::find(configured_device_ids.begin(), configured_device_ids.end(),
+                              devices[i].id) != configured_device_ids.end())
+                    selected.push_back(i);
+            }
+        }
+        if (selected.empty()) {
+            LOG_STREAM_ERROR() << "[GPU] Configured device allow-list does not match any "
+                                  "CUDA device; no GPU roles assigned\n";
+            return;
+        }
+        for (auto& dev : devices) dev.role = GpuRole::Unused;
+        core_gpu = -1;
+        vault_gpus.clear();
+
+        if (selected.size() == 1) {
             // Profile A: single GPU does everything
             profile = HardwareProfile::SingleGPU;
-            devices[0].role = GpuRole::CoreEngine;
-            core_gpu = 0;
-            vault_gpus.push_back(0); // same device serves as vault too
+            devices[selected[0]].role = GpuRole::CoreEngine;
+            core_gpu = selected[0];
+            vault_gpus.push_back(selected[0]); // same device serves as vault too
         } else {
             // Multi-GPU: honor an explicit config choice if one was given
             // (forced_core_device_id, set by main.cpp from
@@ -1940,7 +2854,7 @@ private:
             // arch), Vault to the rest.
             int best_core = -1;
             if (forced_core_device_id >= 0) {
-                for (int i = 0; i < n; ++i) {
+                for (int i : selected) {
                     if (devices[i].id == forced_core_device_id) { best_core = i; break; }
                 }
                 if (best_core < 0) {
@@ -1950,8 +2864,9 @@ private:
                 }
             }
             if (best_core < 0) {
-                best_core = 0;
-                for (int i = 1; i < n; ++i) {
+                best_core = selected[0];
+                for (size_t si = 1; si < selected.size(); ++si) {
+                    int i = selected[si];
                     bool newer = devices[i].sm_major > devices[best_core].sm_major;
                     bool same_gen_less_vram = (devices[i].sm_major == devices[best_core].sm_major &&
                                                devices[i].total_vram < devices[best_core].total_vram);
@@ -1962,7 +2877,7 @@ private:
             devices[best_core].role = GpuRole::CoreEngine;
             core_gpu = best_core;
 
-            for (int i = 0; i < n; ++i) {
+            for (int i : selected) {
                 if (i != best_core) {
                     devices[i].role = GpuRole::ExpertVault;
                     vault_gpus.push_back(i);
@@ -2055,6 +2970,17 @@ public:
     // generation has finished (no locking -- nothing else is touching
     // expert_vram_cache/vram_swap_stats by then).
     void report_cache_churn(int top_n = 15) const {
+        if (startup_preload_marked > 0) {
+            LOG_STREAM_INFO()
+                << "[CACHE-CHURN] Startup VRAM preload: " << startup_preload_marked
+                << " identities marked, " << startup_preload_used << " used at least once, "
+                << (startup_preload_marked - startup_preload_used)
+                << " never used; evicted before first use="
+                << startup_preload_evicted_before_use << " (during prefill="
+                << startup_preload_evicted_before_use_prefill << "), evicted after use="
+                << startup_preload_evicted_after_use << " (during prefill="
+                << startup_preload_evicted_after_use_prefill << ").\n";
+        }
         if (vram_swap_stats.empty()) {
             LOG_STREAM_INFO() << "[CACHE-CHURN] VRAM tier: no swap activity recorded.\n";
             return;
@@ -2107,7 +3033,14 @@ public:
             if (loc.pinned) ++pinned_n;
             if (!loc.upload_ready) ++mid_upload;
         }
-        size_t bytes_used = filled * expert_slab_size;
+        // Compact mode gives each layer its own variable-sized region, so
+        // filled * expert_slab_size would report zero there (the scalar is
+        // intentionally zero) instead of the real resident bytes. Sum each
+        // slot's actual geometry; this is also correct for legacy slots.
+        size_t bytes_used = 0;
+        for (const auto& loc : expert_vram_cache) {
+            if (loc.layer_idx != -1) bytes_used += loc.size;
+        }
         LOG_STREAM_INFO() << "[VRAM-SLOTS] " << filled << " / " << expert_vram_cache_cap
                            << " slots filled (" << bytes_used / 1e9 << " GB of experts resident), "
                            << pinned_n << " pinned, " << mid_upload << " mid-upload\n";

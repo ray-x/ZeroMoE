@@ -1,0 +1,1 @@
+Explain how DNS resolution works, including caching and recursive vs iterative queries.

@@ -138,3 +138,76 @@ extern "C" void launch_iq4_xs_matmul(float* y, const float* x, const void* w, in
     init_iq4xs_table();
     iq4_xs_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_iq4_xs_cu*)w, S, I, O);
 }
+
+// ---------------------------------------------------------------------------
+// IQ4_NL — added 2026-09-04. Same 16-entry non-linear codebook as IQ4_XS above
+// (c_kvalues_iq4nl, already uploaded per-device by init_iq4xs_table), but a
+// much simpler block: ONE fp16 scale per 32 elements and no hierarchical
+// 6-bit sub-scales. Verbatim port of ggml's dequantize_row_iq4_nl:
+//     y[j]      = d * kvalues_iq4nl[qs[j] & 0xf];   // low nibble  -> first 16
+//     y[j + 16] = d * kvalues_iq4nl[qs[j] >>  4];   // high nibble -> next 16
+// so element `local` (0..31) of a block reads byte (local & 15) and takes the
+// high nibble iff local >= 16 -- which is exactly is_high*16 + j == local.
+//
+// WHY THIS EXISTS: the Qwen3.8-Flash-Next UD-IQ1_M checkpoint uses IQ4_NL for
+// the down projection of ALL 48 MoE layers. gpu_type_supported() requires
+// gate, up AND down to be supported, so this single missing type made every
+// layer CPU-bound ("0 layer(s) GPU-capable, 48 CPU-bound") and pinned the CPU
+// at 100% with the GPUs idle, even though IQ1_M and IQ2_XXS were both already
+// supported. kquant_dequant.hpp's own comment had flagged IQ4_NL as "the one
+// still genuinely missing".
+//
+// Block layout matches ggml's block_iq4_nl byte-for-byte: d(2) + qs[16] = 18
+// bytes / 32 elements = 4.5 bits/weight, matching row_bytes()'s (I/32)*18.
+#define QK4_NL 32
+struct block_iq4_nl_cu { __half d; uint8_t qs[QK4_NL/2]; };   // 18 bytes
+
+__global__ void iq4_nl_matmul_kernel(
+    float* __restrict__ y, const float* __restrict__ x,
+    const block_iq4_nl_cu* __restrict__ W, int S, int I, int O)
+{
+    const int o = blockIdx.x;
+    const int s = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (o >= O || s >= S) return;
+
+    const int bpr = I / QK4_NL;                 // blocks per row
+    const block_iq4_nl_cu* w_row = W + (size_t)o * bpr;
+    const float* x_row = x + (size_t)s * I;
+
+    // 256 threads cover 8 blocks of 32 at a time.
+    const int sub   = tid >> 5;                 // 0..7  which of the 8 blocks
+    const int local = tid & 31;                 // 0..31 element within block
+    const int j       = local & 15;             // byte index into qs
+    const int is_high = local >> 4;             // 0 = low nibble, 1 = high
+
+    float acc = 0.0f;
+    for (int b = sub; b < bpr; b += 8) {
+        const float d = __half2float(w_row[b].d);
+        const uint8_t qs_byte = w_row[b].qs[j];
+        const int nibble = (qs_byte >> (is_high << 2)) & 0xf;
+        const float w_val = d * (float)c_kvalues_iq4nl[nibble];
+        acc += x_row[b * QK4_NL + local] * w_val;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2)
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
+
+    __shared__ float warp_sums[8];
+    if ((tid & 31) == 0) warp_sums[tid >> 5] = acc;
+    __syncthreads();
+    if (tid == 0) {
+        float total = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) total += warp_sums[i];
+        y[(size_t)s * O + o] = total;
+    }
+}
+
+extern "C" void launch_iq4_nl_matmul(float* y, const float* x, const void* weights,
+                                     int S, int I, int O) {
+    init_iq4xs_table();                         // shared codebook, per-device
+    dim3 grid(O, S);
+    iq4_nl_matmul_kernel<<<grid, 256>>>(y, x, (const block_iq4_nl_cu*)weights, S, I, O);
+}
