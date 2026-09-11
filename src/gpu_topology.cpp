@@ -60,6 +60,7 @@ bool GpuTopology::allocate_active_layer_area(size_t expert_slab_bytes, int max_e
         // of the main cache's already-proven cudaEventQuery poll pattern.
         cudaSetDevice(target_gpu);
         cudaEventCreate(&slot.upload_event);
+        cudaEventCreate(&slot.upload_start_event);
         slot.prewarm_skip_next_promote = false;
         active_layer_slots.push_back(slot);
     }
@@ -148,6 +149,7 @@ bool GpuTopology::allocate_active_layer_area_multi(size_t expert_slab_bytes, int
             slot.pinned = false;
             slot.temp_pin_count = 0;
             cudaEventCreate(&slot.upload_event);
+            cudaEventCreate(&slot.upload_start_event);
             slot.prewarm_skip_next_promote = false;
             active_layer_slots.push_back(slot);
         }
@@ -406,6 +408,15 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
     }
     size_t copy_bytes = std::min(bytes, victim->size);
     cudaSetDevice(victim->gpu_id);
+    // A completed nonblocking prewarm can be selected as a victim before any
+    // later lookup consumes it. Consume its old event pair before reusing the
+    // persistent events, otherwise the next upload overwrites the timing and
+    // the CUDA-event report undercounts real DMA time.
+    if (victim->upload_timing_pending && victim->upload_event &&
+        cudaEventQuery(victim->upload_event) == cudaSuccess) {
+        record_active_layer_upload_event_timing(*victim, false);
+    }
+    cudaGetLastError();
     // Diagnostic ONLY, mirrors demote_from_vram's own cudaStreamQuery check
     // (ram_manager.hpp) exactly, at THIS call site instead -- see
     // n_active_upload_saw_*'s own comment in perf_timer.hpp for why this
@@ -442,6 +453,20 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
         // demote_from_vram's own copy of this check already takes).
         cudaGetLastError();
     }
+    // Record source coverage without changing the active-layer policy.  This
+    // path intentionally does not register/unregister pageable slabs per
+    // call; the query tells the report whether a persistent RAM pin was
+    // available for this transfer.
+    cudaPointerAttributes sync_attr{};
+    cudaError_t sync_attr_err = cudaPointerGetAttributes(&sync_attr, host_data);
+    victim->upload_source_pinned =
+        sync_attr_err == cudaSuccess && sync_attr.type == cudaMemoryTypeHost;
+    cudaGetLastError();
+    victim->last_upload_bytes = copy_bytes;
+    victim->upload_timing_pending = false;
+    victim->upload_timing_recorded = false;
+    victim->upload_timing_async = false;
+
     PERF_START(active_layer_upload);
     // 2026-08-29: cudaMemcpyAsync on a dedicated stream + an explicit
     // cudaStreamSynchronize, instead of a plain cudaMemcpy on the legacy
@@ -454,11 +479,17 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
     // only WHICH stream it queues behind (its own dedicated one, not
     // whatever active_layer_stream/copy_stream/etc. happen to have queued)
     // changes.
+    cudaStream_t sync_stream = devices[victim->gpu_id].active_layer_sync_fallback_stream;
+    if (victim->upload_start_event) cudaEventRecord(victim->upload_start_event, sync_stream);
     cudaError_t err = cudaMemcpyAsync(victim->device_ptr, host_data, copy_bytes,
-                                cudaMemcpyHostToDevice,
-                                devices[victim->gpu_id].active_layer_sync_fallback_stream);
+                                cudaMemcpyHostToDevice, sync_stream);
     if (err == cudaSuccess) {
-        err = cudaStreamSynchronize(devices[victim->gpu_id].active_layer_sync_fallback_stream);
+        if (victim->upload_event) cudaEventRecord(victim->upload_event, sync_stream);
+        victim->upload_timing_pending = victim->upload_start_event && victim->upload_event;
+        err = cudaStreamSynchronize(sync_stream);
+        if (err == cudaSuccess && victim->upload_timing_pending) {
+            record_active_layer_upload_event_timing(*victim, true);
+        }
     }
     PERF_END(active_layer_upload, t_active_layer_upload);
     if (err != cudaSuccess) {
@@ -576,6 +607,13 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     size_t copy_bytes = std::min(bytes, victim->size);
     cudaSetDevice(victim->gpu_id);
     auto& dev = devices[victim->gpu_id];
+    // Same accounting guard for the async sibling: do not re-record a slot's
+    // persistent start/end events until the previous copy has been charged.
+    if (victim->upload_timing_pending && victim->upload_event &&
+        cudaEventQuery(victim->upload_event) == cudaSuccess) {
+        record_active_layer_upload_event_timing(*victim, false);
+    }
+    cudaGetLastError();
 
     // TWO fixes tried at this call site (2026-08-15), BOTH REVERTED after
     // real, confirmed hardware regressions -- kept as a documented dead end
@@ -710,6 +748,12 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     bool src_pinned = (attr_err == cudaSuccess && attr.type == cudaMemoryTypeHost);
     cudaGetLastError();  // clear any spurious error the query itself leaves behind
 
+    victim->last_upload_bytes = copy_bytes;
+    victim->upload_timing_pending = false;
+    victim->upload_timing_recorded = false;
+    victim->upload_timing_async = true;
+    victim->upload_source_pinned = src_pinned;
+    if (victim->upload_start_event) cudaEventRecord(victim->upload_start_event, issue_stream);
     PERF_START(active_layer_upload_async);
     cudaError_t err = cudaMemcpyAsync(victim->device_ptr, host_data, copy_bytes,
                                        cudaMemcpyHostToDevice, issue_stream);
@@ -744,6 +788,7 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     // makes it safe to skip the caller's blocking sync_active_layer_batch
     // entirely for the speculative pilot-fill path.
     if (victim->upload_event) cudaEventRecord(victim->upload_event, issue_stream);
+    victim->upload_timing_pending = victim->upload_start_event && victim->upload_event;
 
     // Waste accounting for whatever this victim slot held BEFORE this call
     // overwrites it -- must run before the identity-overwrite below, since
@@ -905,12 +950,68 @@ void GpuTopology::sync_active_layer_batch(const std::vector<ExpertLocation*>& vi
     }
     PERF_END(active_layer_batch_sync, t_active_layer_batch_sync);
 
+    // The stream waits above prove every completion event in this batch is
+    // ready. Read each persistent event pair before a slot can be reused.
+    // This is intentionally separate from t_active_layer_batch_sync: that
+    // CPU wait includes queueing behind earlier work, while this reports the
+    // actual copy-engine interval.
+    for (auto* v : victims) {
+        if (v && v->upload_timing_pending) {
+            cudaSetDevice(v->gpu_id);
+            record_active_layer_upload_event_timing(*v, false);
+        }
+    }
+
     GPU_TOPO_TIMED_LOCK(lock);
     for (auto* v : victims) {
         v->upload_ready = true;
         if (v->temp_pin_count > 0) v->temp_pin_count--;
     }
     perf().n_active_layer_uploads_async_synced.fetch_add((uint64_t)victims.size(), std::memory_order_relaxed);
+}
+
+void GpuTopology::record_active_layer_upload_event_timing(ExpertLocation& slot,
+                                                           bool sync_path) {
+    if (!slot.upload_timing_pending || slot.upload_timing_recorded ||
+        !slot.upload_start_event || !slot.upload_event) {
+        return;
+    }
+    cudaSetDevice(slot.gpu_id);
+    float elapsed_ms = 0.0f;
+    cudaError_t err = cudaEventElapsedTime(&elapsed_ms, slot.upload_start_event,
+                                           slot.upload_event);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return;
+    }
+
+    const double seconds = static_cast<double>(elapsed_ms) * 1e-3;
+    const int64_t bytes = static_cast<int64_t>(slot.last_upload_bytes);
+    const bool pinned = slot.upload_source_pinned;
+    slot.upload_timing_recorded = true;
+    slot.upload_timing_pending = false;
+
+    auto add = [&](std::atomic<double>& t, std::atomic<int64_t>& b,
+                   std::atomic<uint64_t>& n) {
+        PerfCounters::atomic_add(t, seconds);
+        b.fetch_add(bytes, std::memory_order_relaxed);
+        n.fetch_add(1, std::memory_order_relaxed);
+    };
+    if (sync_path) {
+        if (pinned) add(perf().t_active_layer_dma_sync_pinned,
+                        perf().bytes_active_layer_dma_sync_pinned,
+                        perf().n_active_layer_dma_sync_pinned);
+        else add(perf().t_active_layer_dma_sync_unpinned,
+                 perf().bytes_active_layer_dma_sync_unpinned,
+                 perf().n_active_layer_dma_sync_unpinned);
+    } else {
+        if (pinned) add(perf().t_active_layer_dma_async_pinned,
+                        perf().bytes_active_layer_dma_async_pinned,
+                        perf().n_active_layer_dma_async_pinned);
+        else add(perf().t_active_layer_dma_async_unpinned,
+                 perf().bytes_active_layer_dma_async_unpinned,
+                 perf().n_active_layer_dma_async_unpinned);
+    }
 }
 
 void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
@@ -956,7 +1057,8 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
         // the flag) because nothing is ever tagged current_layer_idx+1 in
         // the first place unless that flag is on.
         bool is_next_layer_speculative =
-            speculative_active_layer_fill && slot.layer_idx == current_layer_idx + 1;
+            (speculative_active_layer_fill || slot.pilot_speculative_fill) &&
+            slot.layer_idx == current_layer_idx + 1;
         if (slot.layer_idx != current_layer_idx && !is_next_layer_speculative && slot.layer_idx != -1) {
             // Never touch a slot a GPU kernel may still be reading (same
             // discipline as evict_lru/upload_expert_active's victim picker
@@ -1006,6 +1108,7 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
                 if (!slot.upload_ready && slot.copy_dispatched && slot.upload_event) {
                     cudaSetDevice(slot.gpu_id);
                     if (cudaEventQuery(slot.upload_event) == cudaSuccess) {
+                        record_active_layer_upload_event_timing(slot, false);
                         slot.upload_ready = true;
                         if (slot.temp_pin_count > 0) slot.temp_pin_count--;
                         perf().n_active_layer_stale_hold_released.fetch_add(1, std::memory_order_relaxed);
@@ -1090,6 +1193,7 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id,
                 }
                 if (slot.gpu_id >= 0 && (size_t)slot.gpu_id < devices.size()) cudaSetDevice(slot.gpu_id);
                 if (slot.upload_event && cudaEventQuery(slot.upload_event) == cudaSuccess) {
+                    record_active_layer_upload_event_timing(slot, false);
                     slot.upload_ready = true;
                     // Release the async-issue's own hold now that its DMA is
                     // confirmed complete -- exactly what sync_active_layer_
@@ -1204,6 +1308,44 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id,
         }
     }
     return nullptr;
+}
+
+ExpertLocation* GpuTopology::find_active_expert_wait(
+    int layer, int expert_id,
+    const std::function<void(int, int)>& on_promoted) {
+    auto forward_promotion = [&](int promoted_layer, int promoted_expert) {
+        if (on_promoted) on_promoted(promoted_layer, promoted_expert);
+    };
+
+    // Fast path: a completed active-layer hit does not add a synchronization.
+    if (ExpertLocation *ready = find_active_expert(layer, expert_id,
+                                                    forward_promotion))
+        return ready;
+
+    cudaEvent_t event = nullptr;
+    int gpu_id = -1;
+    {
+        GPU_TOPO_TIMED_LOCK(lock);
+        for (const auto &slot : active_layer_slots) {
+            if (slot.layer_idx != layer || slot.expert_id != expert_id)
+                continue;
+            // A worker-claimed slot has no valid event until its copy is
+            // actually dispatched. Never wait on an old/recycled event.
+            if (slot.upload_ready || !slot.copy_dispatched || !slot.upload_event)
+                return nullptr;
+            event = slot.upload_event;
+            gpu_id = slot.gpu_id;
+            break;
+        }
+    }
+    if (!event) return nullptr;
+
+    if (gpu_id >= 0) cudaSetDevice(gpu_id);
+    if (cudaEventSynchronize(event) != cudaSuccess) return nullptr;
+
+    // Re-enter through the normal lookup so readiness accounting, hit
+    // counters, and any threshold promotion remain centralized there.
+    return find_active_expert(layer, expert_id, forward_promotion);
 }
 
 ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,

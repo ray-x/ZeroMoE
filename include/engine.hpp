@@ -380,6 +380,15 @@ public:
     GGUFFile model_file;
     GGUFFile dense_model_file;      // separate dense GGUF (config.dense_model_path); optional
     bool has_dense_model = false;
+    // Standalone "shared" MTP/NextN checkpoint (config.mtp_model_path),
+    // Qwen4Exp's own convention -- see EngineConfig::mtp_model_path's own
+    // comment. Only its blk.<n_layers>.* tensors are read (resident-loaded
+    // whole, via initialize_resident_memory's explicit-source overload --
+    // see graph_initializer.cpp's qwen4exp_nextn_manifest); token_embd/
+    // output are deliberately absent from this file and resolved from
+    // model_file instead wherever the NextN forward pass needs them.
+    GGUFFile mtp_model_file;
+    bool has_mtp_model = false;
 
     // Resolved ONCE from ModelFamily (detect_model_family(model_file)) in
     // graph_initializer.cpp, right after architecture_config's other fields
@@ -765,6 +774,29 @@ public:
     bool qwen4exp_gdn_gpu = false;
     // Set from EngineConfig::qwen4exp_gdn_conv_gpu.
     bool qwen4exp_gdn_conv_gpu = false;
+    // Set from EngineConfig::qwen4exp_router_pilot. Qwen-only HC stream-0
+    // prediction; conventional GLM/DeepSeek pilot inputs do not use this.
+    bool qwen4exp_router_pilot = false;
+    int qwen4exp_router_pilot_k = 10;
+    // Qwen pilot prefetch action. RAM-resident predictions are copied into
+    // the next layer's temporary active-layer area asynchronously; non-RAM
+    // predictions use the ordinary disk/RAM hint path.
+    bool qwen4exp_router_pilot_prefetch = false;
+    // 0 means qwen4exp_router_pilot_k. Kept separate so accuracy can remain
+    // measured over top-10 while only (for example) top-5 is prefetched.
+    int qwen4exp_router_pilot_prefetch_k = 0;
+    // Layer indices excluded from Qwen estimation-based prefetch. Prediction
+    // and accuracy collection remain enabled for excluded layers.
+    std::vector<int> qwen4exp_router_pilot_prefetch_exclude_layers;
+    // Qwen4Exp-only decode opt-in: run the routed FFN through the grouped
+    // GGML/CUDA MUL_MAT_ID graph for S==1. Other families never read this
+    // switch; false preserves the established per-expert decode path.
+    bool qwen4exp_decode_ggml_moe = false;
+    // Qwen4Exp-only CPU affinity fast path: group IQ1_M expert projections
+    // with the same ggml Q8_K dot kernel used by BeeLlama. It is consulted
+    // only when cpu_affinity_layers selects a layer, so other models and the
+    // normal GPU route are unchanged.
+    bool qwen4exp_cpu_ggml_moe = false;
 
     // Set from EngineConfig::glm5next_kda_gpu. The GLM5NEXT KDA recurrent
     // update itself runs on CUDA; the host mirror is synchronized only at
@@ -924,13 +956,21 @@ public:
         }
     }
 
-    void initialize_resident_memory(const std::vector<std::string>& dense_tensor_names) {
+    // `src_override`: read from this GGUFFile instead of the usual dense/
+    // model_file choice -- used by qwen4exp_nextn_manifest (graph_
+    // initializer.cpp) to resident-load a standalone MTP checkpoint
+    // (mtp_model_file) without duplicating this whole function. Defaulted
+    // to nullptr so the one pre-existing call site (dense_preload_manifest)
+    // is byte-for-byte unchanged.
+    void initialize_resident_memory(const std::vector<std::string>& dense_tensor_names,
+                                    GGUFFile* src_override = nullptr) {
         PERF_START(dense_load);
         size_t total_loaded = 0;
         // Dense tensors load from the separate dense GGUF when one is configured
         // (dense_model_path); routed experts still stream from model_file. Both
         // files are complete GGUFs of the same model at different precisions.
-        GGUFFile& src = has_dense_model ? dense_model_file : model_file;
+        GGUFFile& src = src_override ? *src_override
+                                     : (has_dense_model ? dense_model_file : model_file);
         for (const auto& name : dense_tensor_names) {
             if (src.tensors.find(name) == src.tensors.end()) continue;
 
@@ -2273,8 +2313,12 @@ public:
             if (stride < raw || stride > SIZE_MAX / (size_t)n_experts)
                 continue;
             const size_t bytes = stride * (size_t)n_experts;
+            // 10 GiB watermark, per explicit user instruction after the
+            // 2026-09-09 crash (was 8 GiB) -- aligned to the same floor as
+            // every other host-memory admission check in the full-graph
+            // path (ggml_glm5next_graph.cpp/ggml_qwen4exp_graph.cpp).
             if (!MemoryGuard::try_reserve_host_bytes(
-                    bytes, 8ull * 1024ull * 1024ull * 1024ull)) {
+                    bytes, 10ull * 1024ull * 1024ull * 1024ull)) {
                 LOG_WARN("[GRAPH-RAM] layer %zu arena refused: %.2f GiB "
                          "(reserved=%.2f GiB, budget=%.2f GB)\n",
                          layer, (double)bytes / (1024.0 * 1024.0 * 1024.0),

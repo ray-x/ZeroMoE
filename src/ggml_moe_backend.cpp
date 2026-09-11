@@ -10,6 +10,7 @@
 #include "perf_timer.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -87,8 +88,51 @@ bool type_supported(uint32_t t) {
   return ggml_is_quantized(gt);
 }
 
+// Route IDs and weights are compact host-visible outputs.  Do not use
+// ggml_backend_tensor_get() here: the CUDA backend implements that callback
+// with cudaMemcpyAsync() on cudaStreamPerThread and CUDA_CHECK(), so a
+// transient invalid pointer/stream or a previously surfaced asynchronous
+// error aborts the whole prefill before the caller can use its established
+// CPU-router fallback.  All callers below have already synchronized the
+// shared GGML backend.  A synchronous copy is both safe for these few bytes
+// and, unlike the backend callback, gives us a recoverable error path.
+bool copy_router_tensor_to_host(int device, const ggml_tensor *tensor,
+                                void *host, size_t bytes, const char *name) {
+  if (device < 0 || !tensor || !tensor->data || !host || bytes == 0)
+    return false;
+  const size_t available = ggml_nbytes(tensor);
+  if (bytes > available) {
+    LOG_ERROR("[GGML-ROUTER] %s readback bounds error: requested=%zu "
+              "available=%zu\n",
+              name, bytes, available);
+    return false;
+  }
+  cudaSetDevice(device);
+  const cudaError_t err =
+      cudaMemcpy(host, tensor->data, bytes, cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    LOG_ERROR("[GGML-ROUTER] %s readback failed: %s (bytes=%zu "
+              "tensor_bytes=%zu device=%d data=%p)\n",
+              name, cudaGetErrorString(err), bytes, available, device,
+              tensor->data);
+    return false;
+  }
+  return true;
+}
+
 bool backend_stream_copy_override = false;
 
+// "Bee-style" H2D-queued-on-shared-GGML-stream mode (MOESTREAM_GGML_BACKEND_
+// STREAM_COPY=1 or the override flag above). TRIED earlier this session:
+// gave no measurable improvement over the plain copy_stream_ path (61.70 vs
+// 62.72 tok/s baseline) -- left OFF by default. RE-VERIFIED 2026-09-10
+// against the current, materially faster post-fix baseline (RAM/VRAM tier
+// independence fix + vram_preload_prefix_layers + the GgmlQwenSharedRunner
+// device_x fix): same 574-token real-text prompt, prefill= from the
+// shutdown report's Rates line -- ON: 86.01 tok/s, vs the same-config OFF
+// baseline's 79.84/86.37/85.66 tok/s (mean 83.96) -- squarely inside the
+// OFF spread, not a separate cluster. Conclusion unchanged: still no real
+// effect, confirmed against the current baseline too.
 bool use_backend_stream_copies() {
   static const bool env_enabled = [] {
     const char *env = std::getenv("MOESTREAM_GGML_BACKEND_STREAM_COPY");
@@ -112,6 +156,8 @@ bool use_direct_router_input() {
   return enabled;
 }
 
+bool moe_ggml_planar_copies_override = false;
+
 // The packed transfer path is the experimental optimization under test. Keep
 // a runtime escape hatch to the old three-planar-copy path so correctness can
 // be bisected without rebuilding the engine or changing the GGML graph.
@@ -119,6 +165,14 @@ bool use_packed_transfer() {
   static const bool enabled = [] {
     const char *env = std::getenv("MOESTREAM_GGML_PLANAR_COPIES");
     return !(env && env[0] == '1');
+  }();
+  return enabled && !moe_ggml_planar_copies_override;
+}
+
+bool trace_pure_h2d() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_TRACE_PURE_H2D");
+    return env && env[0] == '1';
   }();
   return enabled;
 }
@@ -183,6 +237,10 @@ bool debug_check_device_output() {
 
 }  // namespace
 
+void set_moe_ggml_planar_copies(bool enabled) {
+  moe_ggml_planar_copies_override = enabled;
+}
+
 void set_ggml_moe_async_graph_reuse(bool enabled) {
   async_moe_graph_reuse_override = enabled;
   // The async graph mode is only safe and useful when expert weights are
@@ -211,6 +269,64 @@ void *ggml_shared_backend(int device) {
   cached[device] = b;
   cached_dev[device] = device;
   return b;
+}
+
+// ---------------------------------------------------------------------------
+// Test-only device tensor helper (2026-09-10) -- see the header's own
+// comment. Deliberately minimal: one F32 2-D tensor, no_alloc context plus a
+// real backend buffer, populated via a synchronous tensor_set so the data is
+// guaranteed resident before the caller uses the pointer.
+// ---------------------------------------------------------------------------
+
+bool ggml_moe_test_make_device_tensor(int device, int64_t ne0, int64_t ne1,
+                                      const float *host_data,
+                                      void **out_tensor, void **out_ctx,
+                                      void **out_buf) {
+  if (!out_tensor || !out_ctx || !out_buf || ne0 <= 0 || ne1 <= 0 ||
+      !host_data)
+    return false;
+  *out_tensor = nullptr;
+  *out_ctx = nullptr;
+  *out_buf = nullptr;
+  ggml_backend_t backend = (ggml_backend_t)ggml_shared_backend(device);
+  if (!backend) return false;
+  cudaSetDevice(device);
+  ggml_init_params ip = {};
+  ip.mem_size = ggml_tensor_overhead() * 4;
+  ip.no_alloc = true;
+  ggml_context *ctx = ggml_init(ip);
+  if (!ctx) return false;
+  ggml_tensor *t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
+  if (!t) {
+    ggml_free(ctx);
+    return false;
+  }
+  ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+  if (!buf) {
+    ggml_free(ctx);
+    return false;
+  }
+  ggml_backend_tensor_set(t, host_data, 0,
+                          (size_t)ne0 * (size_t)ne1 * sizeof(float));
+  *out_tensor = t;
+  *out_ctx = ctx;
+  *out_buf = buf;
+  return true;
+}
+
+void ggml_moe_test_free_device_tensor(void *ctx, void *buf) {
+  if (buf) ggml_backend_buffer_free((ggml_backend_buffer_t)buf);
+  if (ctx) ggml_free((ggml_context *)ctx);
+}
+
+bool ggml_moe_test_download_tensor(int device, const void *tensor,
+                                   float *host_out, size_t n_floats) {
+  if (!tensor || !host_out) return false;
+  cudaSetDevice(device);
+  cudaDeviceSynchronize();
+  ggml_backend_tensor_get((const ggml_tensor *)tensor, host_out, 0,
+                          n_floats * sizeof(float));
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -452,13 +568,13 @@ bool GgmlRouterRunner::run(int layer, const void *device_x, int32_t *ids_ks,
   // TOP_K and the final weight tensor are both compact outputs.  A flat
   // transfer is therefore sufficient and keeps the host layout identical to
   // GGML's row-major [tokens, topk] storage used by the MoE runner.
-  ggml_backend_tensor_get(
-      (ggml_tensor *)l.ids, ids_ks, 0,
-      (size_t)topk_ * n_tokens_ * sizeof(int32_t));
-  ggml_backend_tensor_get(
-      (ggml_tensor *)l.weights, weights_ks, 0,
-      (size_t)topk_ * n_tokens_ * sizeof(float));
-  return true;
+  const size_t route_count = (size_t)topk_ * n_tokens_;
+  return copy_router_tensor_to_host(
+             device_, (const ggml_tensor *)l.ids, ids_ks,
+             route_count * sizeof(int32_t), "ids") &&
+         copy_router_tensor_to_host(
+             device_, (const ggml_tensor *)l.weights, weights_ks,
+             route_count * sizeof(float), "weights");
 }
 
 bool GgmlRouterRunner::run_tensor_device(int layer, const void *device_tensor,
@@ -560,21 +676,22 @@ bool GgmlRouterRunner::run_tensor(int layer, const void *device_tensor,
   perf().n_ggml_router_host_calls.fetch_add(1, std::memory_order_relaxed);
   layers_[layer].graph_in_flight = false;
   const auto get_start = std::chrono::steady_clock::now();
-  ggml_backend_tensor_get(
-      (ggml_tensor *)device_ids, ids_ks, 0,
-      (size_t)topk_ * n_tokens_ * sizeof(int32_t));
-  ggml_backend_tensor_get(
-      (ggml_tensor *)device_weights, weights_ks, 0,
-      (size_t)topk_ * n_tokens_ * sizeof(float));
+  const size_t route_count = (size_t)topk_ * n_tokens_;
+  const bool ids_ok = copy_router_tensor_to_host(
+      device_, (const ggml_tensor *)device_ids, ids_ks,
+      route_count * sizeof(int32_t), "ids");
+  const bool weights_ok = ids_ok && copy_router_tensor_to_host(
+      device_, (const ggml_tensor *)device_weights, weights_ks,
+      route_count * sizeof(float), "weights");
   const double get_s = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - get_start).count();
   perf().t_ggml_router_host_get.fetch_add(get_s, std::memory_order_relaxed);
   perf().t_ggml_router_host_call.fetch_add(
       std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                    total_start)
+          total_start)
           .count(),
       std::memory_order_relaxed);
-  return true;
+  return ids_ok && weights_ok;
 }
 
 bool GgmlRouterRunner::copy_route_to_host(int layer, int32_t *ids_ks,
@@ -587,12 +704,13 @@ bool GgmlRouterRunner::copy_route_to_host(int layer, int32_t *ids_ks,
     ggml_backend_synchronize((ggml_backend_t)backend_);
     l.graph_in_flight = false;
   }
-  const size_t bytes = (size_t)topk_ * n_tokens_;
-  ggml_backend_tensor_get((ggml_tensor *)l.ids, ids_ks, 0,
-                          bytes * sizeof(int32_t));
-  ggml_backend_tensor_get((ggml_tensor *)l.weights, weights_ks, 0,
-                          bytes * sizeof(float));
-  return true;
+  const size_t route_count = (size_t)topk_ * n_tokens_;
+  return copy_router_tensor_to_host(
+             device_, (const ggml_tensor *)l.ids, ids_ks,
+             route_count * sizeof(int32_t), "ids") &&
+         copy_router_tensor_to_host(
+             device_, (const ggml_tensor *)l.weights, weights_ks,
+             route_count * sizeof(float), "weights");
 }
 
 // ---------------------------------------------------------------------------
@@ -852,9 +970,30 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
       r->nb[0] != sizeof(float) ||
       r->nb[1] != (size_t)d_model_ * sizeof(float) || !r->data || !r->buffer)
     return false;
+  // 2026-09-10: real, confirmed root cause of the shared-expert NaN
+  // corruption bug (see Test 35, which reproduces it in isolation with a
+  // CPU oracle). Every production caller of run() -- run_qwen4exp_shared_device()
+  // in execution_layer.cpp, fed by GgmlHcRunner::pre_mix()'s
+  // `*device_output = t_mixed_` -- passes device_x as a `ggml_tensor *`
+  // (t_mixed_), exactly like routed_output below. This function instead
+  // fed device_x straight into cudaMemcpy() as if it were already a raw
+  // CUDA device pointer: copying from a host ggml_tensor struct's address
+  // via cudaMemcpyDeviceToDevice is undefined behavior, and in practice
+  // silently produced an all-zero (or garbage) x_ input -- silu(0)*0=0
+  // down the whole gate/up/act/shared chain, so `combined` collapsed to
+  // just `routed` (see the "combined == routed" trace). Dereference it the
+  // same way `src` is handled just below, instead of memcpy'ing the wrong
+  // bytes.
+  ggml_tensor *hc_in = (ggml_tensor *)device_x;
+  if (hc_in->type != GGML_TYPE_F32 || hc_in->ne[0] != d_model_ ||
+      hc_in->ne[1] != n_tokens_ || hc_in->ne[2] != 1 || hc_in->ne[3] != 1 ||
+      hc_in->nb[0] != sizeof(float) ||
+      hc_in->nb[1] != (size_t)d_model_ * sizeof(float) || !hc_in->data ||
+      !hc_in->buffer)
+    return false;
   cudaSetDevice(device_);
   const size_t bytes = (size_t)d_model_ * n_tokens_ * sizeof(float);
-  if (cudaMemcpy(x->data, device_x, bytes, cudaMemcpyDeviceToDevice) !=
+  if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
       cudaSuccess)
     return false;
   ggml_tensor *src = (ggml_tensor *)routed_output;
@@ -874,6 +1013,19 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                                        (ggml_cgraph *)graph_) !=
       GGML_STATUS_SUCCESS)
     return false;
+  // 2026-09-10: added -- unlike GgmlMoeRunner (which exposes an explicit
+  // wait_device_output() specifically because its graph_out_ is consumed by
+  // ANOTHER runner on a potentially different stream, see that method's own
+  // comment), this class had no equivalent: run() returned right after
+  // queuing the async compute, with no guarantee output_'s data was actually
+  // ready before the caller's combined_output pointer got used. Real,
+  // confirmed correctness bug when this path was tried: 100% NaN corruption
+  // end to end (hidden_states 1249280/1249280, logits 248320/248320), while
+  // throughput looked great (140.59 tok/s) -- exactly the shape of a race
+  // that reads uninitialized/stale VRAM. Synchronizing here is the same
+  // safety margin ggml_backend_sched_graph_compute (the ordinary synchronous
+  // wrapper) already gives every other graph in this codebase.
+  ggml_backend_synchronize((ggml_backend_t)backend_);
   *combined_output = output_;
   return true;
 }
@@ -947,20 +1099,63 @@ void GgmlMoeRunner::finish_all_h2d() {
 }
 
 void GgmlMoeRunner::collect_all_h2d(double &seconds, size_t &bytes) {
-  seconds = 0.0;
-  bytes = 0;
+  GgmlMoeTransferStats stats;
+  collect_all_transfer_stats(stats);
+  seconds = stats.h2d_seconds;
+  bytes = stats.h2d_bytes;
+}
+
+void GgmlMoeRunner::collect_all_transfer_stats(GgmlMoeTransferStats &stats) {
+  stats = GgmlMoeTransferStats{};
   GgmlMoeRunner *pool = runner_pool();
   for (int i = 0; i < kMoeRunnerPoolSize; ++i) {
     if (!pool[i].backend_) continue;
-    double s = 0.0;
-    size_t b = 0;
-    pool[i].collect_h2d(s, b);
-    seconds += s;
-    bytes += b;
+    GgmlMoeTransferStats one;
+    pool[i].collect_transfer_stats(one);
+    stats.d2d_seconds += one.d2d_seconds;
+    stats.h2d_seconds += one.h2d_seconds;
+    stats.h2d_dma_seconds += one.h2d_dma_seconds;
+    stats.d2d_bytes += one.d2d_bytes;
+    stats.h2d_bytes += one.h2d_bytes;
   }
 }
 
 GgmlMoeRunner::~GgmlMoeRunner() { shutdown(); }
+
+bool GgmlMoeRunner::ensure_h2d_timing_events() {
+  if (!trace_pure_h2d()) return true;
+  for (int buf = 0; buf < NBUF; ++buf) {
+    for (int i = 0; i < NH2D_TIMING_EVENTS; ++i) {
+      if (!h2d_t0_event_[buf][i] &&
+          cudaEventCreate((cudaEvent_t *)&h2d_t0_event_[buf][i]) != cudaSuccess)
+        return false;
+      if (!h2d_t1_event_[buf][i] &&
+          cudaEventCreate((cudaEvent_t *)&h2d_t1_event_[buf][i]) != cudaSuccess)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool GgmlMoeRunner::begin_h2d_timing(int buf, int &slot) {
+  slot = -1;
+  if (!trace_pure_h2d()) return true;
+  if (buf < 0 || buf >= NBUF) return false;
+  const int next = h2d_timing_count_[buf];
+  if (next >= NH2D_TIMING_EVENTS) return true; // tracer capacity only
+  if (cudaEventRecord((cudaEvent_t)h2d_t0_event_[buf][next],
+                      (cudaStream_t)copy_stream_) != cudaSuccess)
+    return false;
+  h2d_timing_count_[buf] = next + 1;
+  slot = next;
+  return true;
+}
+
+bool GgmlMoeRunner::end_h2d_timing(int buf, int slot) {
+  if (!trace_pure_h2d() || slot < 0) return true;
+  return cudaEventRecord((cudaEvent_t)h2d_t1_event_[buf][slot],
+                         (cudaStream_t)copy_stream_) == cudaSuccess;
+}
 
 void GgmlMoeRunner::shutdown() {
   if (device_ >= 0) cudaSetDevice(device_);  // see wait_stage_free()
@@ -1026,6 +1221,21 @@ void GgmlMoeRunner::shutdown() {
       cudaEventDestroy((cudaEvent_t)backend_copy_t1_event_[i]);
       backend_copy_t1_event_[i] = nullptr;
     }
+    if (backend_copy_split_event_[i]) {
+      cudaEventDestroy((cudaEvent_t)backend_copy_split_event_[i]);
+      backend_copy_split_event_[i] = nullptr;
+    }
+    for (int j = 0; j < NH2D_TIMING_EVENTS; ++j) {
+      if (h2d_t0_event_[i][j]) {
+        cudaEventDestroy((cudaEvent_t)h2d_t0_event_[i][j]);
+        h2d_t0_event_[i][j] = nullptr;
+      }
+      if (h2d_t1_event_[i][j]) {
+        cudaEventDestroy((cudaEvent_t)h2d_t1_event_[i][j]);
+        h2d_t1_event_[i][j] = nullptr;
+      }
+    }
+    h2d_timing_count_[i] = 0;
     if (chunk_scatter_done_events_[i]) {
       cudaEventDestroy((cudaEvent_t)chunk_scatter_done_events_[i]);
       chunk_scatter_done_events_[i] = nullptr;
@@ -1033,7 +1243,19 @@ void GgmlMoeRunner::shutdown() {
     pending_[i] = false;
     copy_batch_started_[i] = false;
     direct_h2d_bytes_[i] = 0;
+    pending_d2d_bytes_[i] = 0;
+    copy_split_recorded_[i] = false;
   }
+  if (route_ids_pinned_) {
+    cudaFreeHost(route_ids_pinned_);
+    route_ids_pinned_ = nullptr;
+  }
+  if (route_weights_pinned_) {
+    cudaFreeHost(route_weights_pinned_);
+    route_weights_pinned_ = nullptr;
+  }
+  route_stage_capacity_ = 0;
+  route_stage_index_ = 0;
   MemoryGuard::release_host_bytes(stage_host_reservation_bytes_);
   stage_host_reservation_bytes_ = 0;
   for (int i = 0; i < NWEIGHT_EVENTS; ++i) {
@@ -1116,6 +1338,70 @@ void GgmlMoeRunner::shutdown() {
   weight_d_model_ = weight_d_ff_ = 0;
   weight_gate_type_ = weight_up_type_ = weight_down_type_ = 0;
   weight_external_ = false;
+}
+
+bool GgmlMoeRunner::ensure_route_stage(size_t route_count) {
+  if (route_count == 0)
+    return true;
+  if (route_ids_pinned_ && route_weights_pinned_ &&
+      route_stage_capacity_ >= route_count)
+    return true;
+
+  // A larger request may require reallocating the pinned ring.  The previous
+  // ring can still be the source of an asynchronous H2D queued on the shared
+  // backend, so drain it before releasing or reusing that storage.  This is a
+  // request-shape change, not a per-layer synchronization point.
+  if (backend_)
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+  if (route_ids_pinned_) {
+    cudaFreeHost(route_ids_pinned_);
+    route_ids_pinned_ = nullptr;
+  }
+  if (route_weights_pinned_) {
+    cudaFreeHost(route_weights_pinned_);
+    route_weights_pinned_ = nullptr;
+  }
+  route_stage_capacity_ = 0;
+  route_stage_index_ = 0;
+
+  if (route_count > std::numeric_limits<size_t>::max() /
+                          (size_t)NROUTE_STAGE ||
+      route_count * (size_t)NROUTE_STAGE >
+          std::numeric_limits<size_t>::max() / sizeof(int32_t))
+    return false;
+  const size_t entries = route_count * (size_t)NROUTE_STAGE;
+  if (cudaHostAlloc((void **)&route_ids_pinned_,
+                    entries * sizeof(int32_t), cudaHostAllocPortable) !=
+          cudaSuccess ||
+      cudaHostAlloc((void **)&route_weights_pinned_,
+                    entries * sizeof(float), cudaHostAllocPortable) !=
+          cudaSuccess) {
+    if (route_ids_pinned_) {
+      cudaFreeHost(route_ids_pinned_);
+      route_ids_pinned_ = nullptr;
+    }
+    if (route_weights_pinned_) {
+      cudaFreeHost(route_weights_pinned_);
+      route_weights_pinned_ = nullptr;
+    }
+    return false;
+  }
+  route_stage_capacity_ = route_count;
+  return true;
+}
+
+void GgmlMoeRunner::invalidate_graph() {
+  // Same drain-then-free sequence ensure_graph() uses on its own shape-
+  // mismatch rebuild path -- see this method's own header comment (ggml_
+  // moe_backend.hpp) for the real crash this was extracted to fix. Unlike
+  // ensure_graph()'s internal call, this is reachable with the runner never
+  // having been set up at all (backend_ == nullptr) -- guard it explicitly
+  // since this method is public.
+  if (graph_in_flight_ && backend_) {
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+    graph_in_flight_ = false;
+  }
+  free_graph();
 }
 
 void GgmlMoeRunner::free_graph() {
@@ -1508,6 +1794,8 @@ bool GgmlMoeRunner::ensure_stage_buffers(size_t bytes_per_buf) {
     pending_[i] = false;
     copy_batch_started_[i] = false;
     direct_h2d_bytes_[i] = 0;
+    pending_d2d_bytes_[i] = 0;
+    copy_split_recorded_[i] = false;
   }
   MemoryGuard::release_host_bytes(stage_host_reservation_bytes_);
   stage_host_reservation_bytes_ = 0;
@@ -1591,6 +1879,14 @@ bool GgmlMoeRunner::ensure_stage_buffers(size_t bytes_per_buf) {
       }
       ev_t0_[i] = e;
     }
+    if (!backend_copy_split_event_[i]) {
+      cudaEvent_t e = nullptr;
+      if (cudaEventCreate(&e) != cudaSuccess) {
+        cleanup_failed_stage();
+        return false;
+      }
+      backend_copy_split_event_[i] = e;
+    }
     if (backend_stream_copies_ && !backend_stage_event_[i]) {
       ggml_backend_event_t e = ggml_backend_event_new(
           ggml_backend_get_device((ggml_backend_t)backend_));
@@ -1663,11 +1959,14 @@ bool GgmlMoeRunner::begin_copy_batch(int buf) {
         return false;
     }
     direct_h2d_bytes_[buf] = 0;
+    h2d_timing_count_[buf] = 0;
     if (cudaEventRecord((cudaEvent_t)backend_copy_t0_event_[buf],
                         (cudaStream_t)copy_stream_) != cudaSuccess)
       return false;
     backend_copy_t0_[buf] = std::chrono::steady_clock::now();
     copy_batch_started_[buf] = true;
+    pending_d2d_bytes_[buf] = 0;
+    copy_split_recorded_[buf] = false;
     return true;
   }
   if (!copy_stream_ || !ev_t0_[buf]) return false;
@@ -1676,8 +1975,25 @@ bool GgmlMoeRunner::begin_copy_batch(int buf) {
   if (cudaEventRecord((cudaEvent_t)ev_t0_[buf],
                       (cudaStream_t)copy_stream_) != cudaSuccess)
     return false;
+  backend_copy_t0_[buf] = std::chrono::steady_clock::now();
   direct_h2d_bytes_[buf] = 0;
+  h2d_timing_count_[buf] = 0;
+  pending_d2d_bytes_[buf] = 0;
+  copy_split_recorded_[buf] = false;
   copy_batch_started_[buf] = true;
+  return true;
+}
+
+bool GgmlMoeRunner::mark_copy_d2d_done(int buf) {
+  if (!layer_ready_ || buf < 0 || buf >= NBUF || !copy_batch_started_[buf])
+    return false;
+  if (copy_split_recorded_[buf]) return true;
+  cudaSetDevice(device_);
+  if (!backend_copy_split_event_[buf] ||
+      cudaEventRecord((cudaEvent_t)backend_copy_split_event_[buf],
+                      (cudaStream_t)copy_stream_) != cudaSuccess)
+    return false;
+  copy_split_recorded_[buf] = true;
   return true;
 }
 
@@ -1705,6 +2021,7 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
   // current between layers (attention/dense work runs there).
   cudaSetDevice(plan.device_id);
   if (!ensure_backend(plan.device_id)) return false;
+  if (!ensure_h2d_timing_events()) return false;
 
   // Raw-copy mode has one compact weight buffer.  The device-output path
   // submits the previous MoE graph asynchronously so HC can consume its
@@ -1916,6 +2233,21 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
     if (copy_backend_)
       ggml_backend_synchronize((ggml_backend_t)copy_backend_);
     if (backend_) ggml_backend_synchronize((ggml_backend_t)backend_);
+    // 2026-09-10: ANSWERED, keeping the counter (cheap, fires ~2x/session).
+    // Hypothesis was that alternating gate/up/down quant TYPES between
+    // layers (UD's mixed quantization -- real per-layer graph= spikes of
+    // 11-145ms looked correlated with type changes) forces repeated,
+    // avoidable weight-tensor rebuilds despite instance_for()'s per-
+    // signature runner pool. REFUTED by direct measurement on a real
+    // 488-token prefill: only 2 rebuilds fired total across all 48 layers,
+    // both had_tensors=0 (first-ever build for that signature, not churn).
+    // instance_for() caches correctly; the graph= spikes are one-time JIT/
+    // cudaMalloc cost (2 occurrences), not a per-layer recurring tax -- NOT
+    // part of the still-open ~115ms/layer H2D+wait overhead floor.
+    LOG_INFO("[GGML-MOE-REBUILD] gate_type=%u up_type=%u down_type=%u "
+             "old_slots=%d new_slots=%d had_tensors=%d\n",
+             weight_gate_type_, weight_up_type_, weight_down_type_,
+             weight_slots_, tensor_slots, t_gate_ ? 1 : 0);
     free_weight_tensors();
   }
 
@@ -2099,15 +2431,27 @@ bool GgmlMoeRunner::ensure_graph() {
   // fire before the downstream D2D handoff has finished. Drain the shared
   // backend at this topology reuse point; normal same-shape layers retain
   // the existing queued graph and do not pay this boundary.
-  if (graph_in_flight_) {
-    ggml_backend_synchronize((ggml_backend_t)backend_);
-    graph_in_flight_ = false;
-  }
+  invalidate_graph();  // drains in-flight work and frees graph_ctx_
 
-  free_graph();
-
+  // Real crash, found on real hardware (2026-09-09, Qwen4Exp MTP bring-up):
+  // "ggml_new_object: not enough space in the context's memory pool
+  // (needed 132144, available 131760)" -- the SAME two numbers on every
+  // occurrence, regardless of how many prior calls had already run
+  // (confirmed by testing invalidate_graph() between every caller-level
+  // forward pass, which did NOT fix it) -- meaning this is a deterministic
+  // per-shape shortfall in a FRESHLY REBUILT context, not cross-call
+  // accumulation: ggml_graph_overhead()'s own fixed cost (hash table +
+  // node/leaf arrays, sized for ggml_new_graph()'s default max-node count)
+  // plus this function's own ~20-30 tensor objects (more with a large
+  // topk -- the accumulation loop below allocates one view+add pair PER
+  // selected expert) leaves the 128-tensor-slot term with essentially no
+  // slack, and run_layer_device_impl's OWN extra ggml_view_2d call (the
+  // one that actually aborts) needs just one more slot than remains.
+  // 256 gives a real, generous margin (the added ~49 KB of host-side
+  // metadata is irrelevant against this process's GB-scale budgets)
+  // instead of chasing the exact minimum.
   ggml_init_params ip = {};
-  ip.mem_size = ggml_tensor_overhead() * 128 + ggml_graph_overhead();
+  ip.mem_size = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
   ip.mem_buffer = nullptr;
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
@@ -2260,34 +2604,84 @@ GgmlMoeStageSlot GgmlMoeRunner::stage_slot(int buf, int slot) const {
   return s;
 }
 
+void GgmlMoeRunner::account_copy_buffer(int buf) {
+  if (buf < 0 || buf >= NBUF || !pending_[buf]) return;
+
+  cudaSetDevice(device_);
+  float d2d_ms = 0.0f;
+  float h2d_ms = 0.0f;
+  bool timed = false;
+  if (copy_split_recorded_[buf]) {
+    if (backend_stream_copies_) {
+      timed = cudaEventElapsedTime(
+                  &d2d_ms, (cudaEvent_t)backend_copy_t0_event_[buf],
+                  (cudaEvent_t)backend_copy_split_event_[buf]) == cudaSuccess &&
+              cudaEventElapsedTime(
+                  &h2d_ms, (cudaEvent_t)backend_copy_split_event_[buf],
+                  (cudaEvent_t)backend_copy_t1_event_[buf]) == cudaSuccess;
+    } else {
+      timed = cudaEventElapsedTime(
+                  &d2d_ms, (cudaEvent_t)ev_t0_[buf],
+                  (cudaEvent_t)backend_copy_split_event_[buf]) == cudaSuccess &&
+              cudaEventElapsedTime(
+                  &h2d_ms, (cudaEvent_t)backend_copy_split_event_[buf],
+                  (cudaEvent_t)ev_free_[buf]) == cudaSuccess;
+    }
+  }
+  if (!timed) {
+    float total_ms = 0.0f;
+    if (backend_stream_copies_) {
+      timed = cudaEventElapsedTime(
+                  &total_ms, (cudaEvent_t)backend_copy_t0_event_[buf],
+                  (cudaEvent_t)backend_copy_t1_event_[buf]) == cudaSuccess;
+    } else {
+      timed = cudaEventElapsedTime(&total_ms, (cudaEvent_t)ev_t0_[buf],
+                                   (cudaEvent_t)ev_free_[buf]) == cudaSuccess;
+    }
+    // Without a valid split event, retain a conservative total in the H2D
+    // bucket. This is a diagnostics fallback only; normal runs record the
+    // split before the first RAM upload.
+    h2d_ms = total_ms;
+  }
+  if (timed) {
+    d2d_seconds_ += (double)d2d_ms / 1000.0;
+    h2d_seconds_ += (double)h2d_ms / 1000.0;
+  } else {
+    h2d_seconds_ += std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() -
+                         backend_copy_t0_[buf])
+                         .count();
+  }
+  if (trace_pure_h2d()) {
+    for (int i = 0; i < h2d_timing_count_[buf]; ++i) {
+      float dma_ms = 0.0f;
+      if (cudaEventElapsedTime(
+              &dma_ms, (cudaEvent_t)h2d_t0_event_[buf][i],
+              (cudaEvent_t)h2d_t1_event_[buf][i]) == cudaSuccess)
+        h2d_dma_seconds_ += (double)dma_ms / 1000.0;
+    }
+  }
+  d2d_bytes_ += pending_d2d_bytes_[buf];
+  h2d_bytes_ += pending_bytes_[buf];
+  pending_[buf] = false;
+  pending_bytes_[buf] = 0;
+  pending_d2d_bytes_[buf] = 0;
+  copy_batch_started_[buf] = false;
+  copy_split_recorded_[buf] = false;
+  h2d_timing_count_[buf] = 0;
+  direct_h2d_bytes_[buf] = 0;
+}
+
 void GgmlMoeRunner::wait_stage_free(int buf) {
   if (buf < 0 || buf >= NBUF || !pending_[buf]) return;
   if (backend_stream_copies_) {
     cudaSetDevice(device_);
     ggml_backend_event_synchronize(
         (ggml_backend_event_t)backend_stage_event_[buf]);
-    float ms = 0.0f;
-    if (cudaEventElapsedTime(
-            &ms, (cudaEvent_t)backend_copy_t0_event_[buf],
-            (cudaEvent_t)backend_copy_t1_event_[buf]) == cudaSuccess) {
-      // This is the copy-stream service interval. It excludes the host's
-      // wait for a reusable double-buffer slot and any time spent after the
-      // copy was queued while the compute stream was running.
-      h2d_seconds_ += (double)ms / 1000.0;
-    } else {
-      // A driver timing failure should not hide the transfer entirely. This
-      // fallback is only for diagnostics; normal CUDA runs use the event
-      // interval above.
-      h2d_seconds_ += std::chrono::duration<double>(
-                           std::chrono::steady_clock::now() -
-                           backend_copy_t0_[buf])
-                           .count();
-    }
-    h2d_bytes_ += pending_bytes_[buf];
-    pending_[buf] = false;
-    pending_bytes_[buf] = 0;
-    copy_batch_started_[buf] = false;
-    direct_h2d_bytes_[buf] = 0;
+    // This is the copy-stream service interval. It excludes the host's wait
+    // for a reusable double-buffer slot and any time spent after the copy was
+    // queued while the compute stream was running.
+    account_copy_buffer(buf);
     return;
   }
   // MUST pin the device. A CUDA event belongs to the device that was current
@@ -2303,16 +2697,7 @@ void GgmlMoeRunner::wait_stage_free(int buf) {
   // utilisation. Same class as PrefillExpertStream::pin_device().
   cudaSetDevice(device_);
   cudaEventSynchronize((cudaEvent_t)ev_free_[buf]);
-  float ms = 0.0f;
-  if (cudaEventElapsedTime(&ms, (cudaEvent_t)ev_t0_[buf],
-                           (cudaEvent_t)ev_free_[buf]) == cudaSuccess) {
-    h2d_seconds_ += (double)ms / 1000.0;
-    h2d_bytes_ += pending_bytes_[buf];
-  }
-  pending_[buf] = false;
-  pending_bytes_[buf] = 0;
-  copy_batch_started_[buf] = false;
-  direct_h2d_bytes_[buf] = 0;
+  account_copy_buffer(buf);
 }
 
 bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
@@ -2321,6 +2706,7 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
   if (first_expert < 0 || first_expert + count > plan_.n_experts) return false;
   if (count > plan_.chunk_experts) return false;
   if (!begin_copy_batch(buf)) return false;
+  if (!mark_copy_d2d_done(buf)) return false;
   cudaSetDevice(device_);
 
   size_t total = 0;
@@ -2368,9 +2754,12 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
     }
     if (compact_count > 0) {
       const size_t bytes = weight_expert_stride_ * (size_t)compact_count;
+      int h2d_timing_slot = -1;
+      if (!begin_h2d_timing(buf, h2d_timing_slot)) return false;
       e = cudaMemcpyAsync(
           packed_base_, h_stage_[buf], bytes, cudaMemcpyHostToDevice,
           (cudaStream_t)copy_stream_);
+      if (!end_h2d_timing(buf, h2d_timing_slot)) return false;
       if (e == cudaSuccess) {
         e = cudaMemcpyAsync(
             d_stage_slot_map_[buf], slot_map.data(),
@@ -2449,7 +2838,9 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
           }
         }
       }
-      total += bytes;
+      // The route-map upload is small but is still a real H2D operation; keep
+      // it in the source-specific accounting instead of silently dropping it.
+      total += bytes + (size_t)compact_count * sizeof(int32_t);
     }
   } else {
     // Walk maximal runs of consecutive staged experts. The reference path
@@ -2531,6 +2922,8 @@ bool GgmlMoeRunner::copy_expert_h2d(int buf, int expert_index,
   cudaStream_t st = (cudaStream_t)copy_stream_;
   if (!st) return false;
   cudaError_t e = cudaSuccess;
+  int h2d_timing_slot = -1;
+  if (!begin_h2d_timing(buf, h2d_timing_slot)) return false;
   if (!use_packed_transfer()) {
     uint8_t *gate_dst = w_gate_base_ + gate_exp_bytes_ * (size_t)expert_index;
     uint8_t *up_dst = w_up_base_ + up_exp_bytes_ * (size_t)expert_index;
@@ -2560,6 +2953,7 @@ bool GgmlMoeRunner::copy_expert_h2d(int buf, int expert_index,
           (cudaStream_t)copy_stream_);
     }
   }
+  if (!end_h2d_timing(buf, h2d_timing_slot)) return false;
   if (e != cudaSuccess) {
     LOG_ERROR("[GGML-MOE] direct RAM H2D failed for expert=%d: %s\n",
               expert_index, cudaGetErrorString(e));
@@ -2569,8 +2963,11 @@ bool GgmlMoeRunner::copy_expert_h2d(int buf, int expert_index,
   return true;
 }
 
-bool GgmlMoeRunner::copy_expert_d2d(int expert_index, const void *src_slab) {
-  if (!layer_ready_ || !src_slab) return false;
+bool GgmlMoeRunner::copy_expert_d2d(int buf, int expert_index,
+                                    const void *src_slab) {
+  if (!layer_ready_ || !src_slab || buf < 0 || buf >= NBUF ||
+      !copy_batch_started_[buf])
+    return false;
   if (expert_index < 0 || expert_index >= plan_.n_experts) return false;
   cudaSetDevice(device_);
   cudaStream_t st = (cudaStream_t)copy_stream_;
@@ -2593,6 +2990,7 @@ bool GgmlMoeRunner::copy_expert_d2d(int expert_index, const void *src_slab) {
                 cudaGetErrorString(e));
       return false;
     }
+    pending_d2d_bytes_[buf] += gate_exp_bytes_ + up_exp_bytes_ + down_exp_bytes_;
     raw_d2d_pending_ = true;
     return true;
   }
@@ -2617,6 +3015,7 @@ bool GgmlMoeRunner::copy_expert_d2d(int expert_index, const void *src_slab) {
     LOG_ERROR("[GGML-MOE] weight D2D failed: %s\n", cudaGetErrorString(e));
     return false;
   }
+  pending_d2d_bytes_[buf] += weight_raw_expert_stride_;
   if (debug_check_device_output()) {
     e = cudaStreamSynchronize(st);
     if (e != cudaSuccess) return false;
@@ -2684,29 +3083,33 @@ void GgmlMoeRunner::sync_copies() {
   cudaStreamSynchronize((cudaStream_t)copy_stream_);
   for (int i = 0; i < NBUF; ++i) {
     if (!pending_[i]) continue;
-    float ms = 0.0f;
-    if (cudaEventElapsedTime(&ms, (cudaEvent_t)ev_t0_[i],
-                             (cudaEvent_t)ev_free_[i]) == cudaSuccess) {
-      h2d_seconds_ += (double)ms / 1000.0;
-      h2d_bytes_ += pending_bytes_[i];
-    }
-    pending_[i] = false;
-    pending_bytes_[i] = 0;
-    copy_batch_started_[i] = false;
-    direct_h2d_bytes_[i] = 0;
+    account_copy_buffer(i);
   }
 }
 
 void GgmlMoeRunner::collect_h2d(double &seconds, size_t &bytes) {
+  GgmlMoeTransferStats stats;
+  collect_transfer_stats(stats);
+  seconds = stats.h2d_seconds;
+  bytes = stats.h2d_bytes;
+}
+
+void GgmlMoeRunner::collect_transfer_stats(GgmlMoeTransferStats &stats) {
   if (backend_stream_copies_ && !use_async_moe_graph_reuse()) {
     // Preserve the conservative backend-stream mode when queued graph reuse
     // is disabled.  The asynchronous mode leaves these events pending across
     // layers; finish_h2d() performs the single request-level drain.
     for (int i = 0; i < NBUF; ++i) wait_stage_free(i);
   }
-  seconds = h2d_seconds_;
-  bytes = h2d_bytes_;
+  stats.d2d_seconds = d2d_seconds_;
+  stats.h2d_seconds = h2d_seconds_;
+  stats.h2d_dma_seconds = h2d_dma_seconds_;
+  stats.d2d_bytes = d2d_bytes_;
+  stats.h2d_bytes = h2d_bytes_;
+  d2d_seconds_ = 0.0;
+  d2d_bytes_ = 0;
   h2d_seconds_ = 0.0;
+  h2d_dma_seconds_ = 0.0;
   h2d_bytes_ = 0;
 }
 
@@ -2915,23 +3318,46 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
                                    (ggml_tensor *)graph_w_);
     if (trace_backend_calls())
       LOG_INFO("[GGML-MOE-TRACE] device route copies queued\n");
-  } else if (backend_stream_copies_ && use_async_moe_graph_reuse() &&
-      !debug_sync_route_inputs()) {
-    // The route tables are normally local vectors owned by the caller. Keep
-    // a stable source until this backend stream has consumed the queued H2D
-    // copy; otherwise the next layer can overwrite/free the source while an
-    // asynchronous graph still reads it.
-    const int slot = route_stage_index_++ % NROUTE_STAGE;
-    auto &route_ids = route_ids_stage_[slot];
-    auto &route_weights = route_weights_stage_[slot];
-    route_ids.assign(ids, ids + route_count);
-    route_weights.assign(w, w + route_count);
-    ggml_backend_tensor_set_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)graph_ids_, route_ids.data(),
-        0, route_count * sizeof(int32_t));
-    ggml_backend_tensor_set_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)graph_w_, route_weights.data(),
-        0, route_count * sizeof(float));
+  } else if (use_async_moe_graph_reuse() && !debug_sync_route_inputs()) {
+    // Route tables are tiny, but this path is exercised once per MoE layer.
+    // The old synchronous setter made each pair a blocking cudaMemcpy.  Use
+    // a persistent pinned ring so GGML can queue both writes on its shared
+    // CUDA stream; that stream already orders them before this layer's graph.
+    if (!ensure_route_stage(route_count)) {
+      LOG_WARN("[GGML-MOE] pinned route-table staging unavailable; "
+               "falling back to synchronous route copies\n");
+      ggml_backend_tensor_set((ggml_tensor *)graph_ids_, ids, 0,
+                              route_count * sizeof(int32_t));
+      ggml_backend_tensor_set((ggml_tensor *)graph_w_, w, 0,
+                              route_count * sizeof(float));
+    } else {
+      static std::atomic<bool> logged_async_route_stage{false};
+      bool expected = false;
+      if (logged_async_route_stage.compare_exchange_strong(
+              expected, true, std::memory_order_relaxed)) {
+        LOG_INFO("[GGML-MOE] async pinned route-table staging active\n");
+      }
+      if (route_stage_index_ >= NROUTE_STAGE) {
+        // The normal request path consumes fewer than NROUTE_STAGE slots.
+        // Keep wrap-around safe for long-lived interactive sessions without
+        // adding a synchronization to ordinary layer dispatch.
+        ggml_backend_synchronize((ggml_backend_t)backend_);
+        route_stage_index_ = 0;
+      }
+      const int slot = route_stage_index_++;
+      int32_t *route_ids = route_ids_pinned_ +
+                           (size_t)slot * route_stage_capacity_;
+      float *route_weights = route_weights_pinned_ +
+                             (size_t)slot * route_stage_capacity_;
+      std::memcpy(route_ids, ids, route_count * sizeof(int32_t));
+      std::memcpy(route_weights, w, route_count * sizeof(float));
+      ggml_backend_tensor_set_async((ggml_backend_t)backend_,
+                                     (ggml_tensor *)graph_ids_, route_ids, 0,
+                                     route_count * sizeof(int32_t));
+      ggml_backend_tensor_set_async((ggml_backend_t)backend_,
+                                    (ggml_tensor *)graph_w_, route_weights, 0,
+                                    route_count * sizeof(float));
+    }
   } else if (backend_stream_copies_ && use_async_moe_graph_reuse() &&
              debug_sync_route_inputs()) {
     // Diagnostic isolation: a synchronous device write removes both the
@@ -2944,12 +3370,14 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
     ggml_backend_tensor_set((ggml_tensor *)graph_w_, w, 0,
                             route_count * sizeof(float));
   } else {
-    ggml_backend_tensor_set_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)graph_ids_, ids, 0,
-        route_count * sizeof(int32_t));
-    ggml_backend_tensor_set_async((ggml_backend_t)backend_,
-                                  (ggml_tensor *)graph_w_, w, 0,
-                                  route_count * sizeof(float));
+    // The non-backend-stream path has the same pageable-source lifetime
+    // problem as the branch above. The route tables are only S*K integers and
+    // floats, so use the synchronous setter here as well rather than handing
+    // caller-owned vectors to GGML's raw cudaMemcpyAsync entry point.
+    ggml_backend_tensor_set((ggml_tensor *)graph_ids_, ids, 0,
+                            route_count * sizeof(int32_t));
+    ggml_backend_tensor_set((ggml_tensor *)graph_w_, w, 0,
+                            route_count * sizeof(float));
   }
 
   // H2D writes are queued on the dedicated copy backend. Insert the device
@@ -3535,7 +3963,17 @@ bool GgmlMoeRunner::run_layer(const float *x, const int32_t *ids,
 
 #else  // !MOESTREAM_USE_GGML_CUDA
 
+void set_moe_ggml_planar_copies(bool) {}
 void set_ggml_moe_async_graph_reuse(bool) {}
+
+bool ggml_moe_test_make_device_tensor(int, int64_t, int64_t, const float *,
+                                      void **, void **, void **) {
+  return false;
+}
+void ggml_moe_test_free_device_tensor(void *, void *) {}
+bool ggml_moe_test_download_tensor(int, const void *, float *, size_t) {
+  return false;
+}
 
 bool GgmlRouterRunner::compiled_in() { return false; }
 GgmlRouterRunner &GgmlRouterRunner::instance() {
@@ -3591,6 +4029,9 @@ void GgmlMoeRunner::collect_all_h2d(double &s, size_t &b) {
   s = 0.0;
   b = 0;
 }
+void GgmlMoeRunner::collect_all_transfer_stats(GgmlMoeTransferStats &stats) {
+  stats = GgmlMoeTransferStats{};
+}
 GgmlMoeRunner::~GgmlMoeRunner() {}
 void GgmlMoeRunner::shutdown() {}
 void GgmlMoeRunner::free_weight_tensors() {}
@@ -3607,7 +4048,8 @@ void GgmlMoeRunner::wait_stage_free(int) {}
 bool GgmlMoeRunner::push_chunk(int, int, int, const bool *) { return false; }
 bool GgmlMoeRunner::begin_copy_batch(int) { return false; }
 bool GgmlMoeRunner::copy_expert_h2d(int, int, const void *) { return false; }
-bool GgmlMoeRunner::copy_expert_d2d(int, const void *) { return false; }
+bool GgmlMoeRunner::copy_expert_d2d(int, int, const void *) { return false; }
+bool GgmlMoeRunner::mark_copy_d2d_done(int) { return false; }
 void GgmlMoeRunner::sync_copies() {}
 bool GgmlMoeRunner::run_layer(const float *, const int32_t *, const float *,
                               float *) {
@@ -3640,6 +4082,9 @@ bool GgmlMoeRunner::copy_device_output_to_host(const void *, float *) {
   return false;
 }
 void GgmlMoeRunner::collect_h2d(double &s, size_t &b) { s = 0.0; b = 0; }
+void GgmlMoeRunner::collect_transfer_stats(GgmlMoeTransferStats &stats) {
+  stats = GgmlMoeTransferStats{};
+}
 void GgmlMoeRunner::finish_h2d() {}
 void GgmlMoeRunner::defer_vram_hold(void *, int, int, const uint8_t *) {}
 void GgmlMoeRunner::release_completed_vram_holds() {}

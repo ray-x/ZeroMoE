@@ -124,7 +124,8 @@ class GgmlGdnProjRunner {
   // history and recurrent state keep their existing host-side contracts.
   bool run_full_device(int layer, const void *device_hidden, int S,
                        const void **device_output, float *history, int d_conv,
-                       float *state, float eps);
+                       float *state, float eps,
+                       bool device_state_resident = false);
 
   // Shared-backend tensor form of run_full_device(). The input is an F32
   // [D,S] GGML tensor and is copied into the graph input asynchronously on
@@ -132,11 +133,24 @@ class GgmlGdnProjRunner {
   bool run_full_device_tensor(int layer, const void *device_hidden_tensor,
                               int S, const void **device_output,
                               float *history, int d_conv, float *state,
-                              float eps);
+                              float eps,
+                              bool device_state_resident = false);
 
   // Download recurrent state and convolution history produced by all full
-  // device GDN layers. This is called once at the end of a forward pass.
-  void finish_full_device_updates();
+  // device GDN layers. This is called once at the end of a prefill or before
+  // a host fallback. Decode keeps the persistent state on the device and
+  // calls this with copy_to_host=false.
+  void finish_full_device_updates(bool copy_to_host = true);
+
+  // Recovery-only barrier for a device-graph failure. Unlike the normal
+  // drain, this also copies state completed by an earlier decode token that
+  // is no longer marked pending.
+  void sync_full_device_states_to_host();
+
+  // Clear all already-allocated persistent device GDN state tensors at the
+  // start of a fresh S=1 sequence. Newly-created state tensors are zeroed by
+  // ensure_full_state(), so this is safe before the first layer allocates.
+  void reset_full_device_states();
   bool copy_full_output_to_host(const void *device_output, float *host, int S);
 
   void shutdown();
@@ -192,6 +206,7 @@ class GgmlGdnProjRunner {
     size_t history_bytes = 0;
     size_t state_bytes = 0;
     bool pending = false;
+    bool device_state_resident = false;
   };
 
   struct FullDeviceSlot {
@@ -236,5 +251,6 @@ class GgmlGdnProjRunner {
   bool run_full_device_impl(int layer, const void *device_hidden,
                             const void *device_hidden_tensor, int S,
                             const void **device_output, float *history,
-                            int d_conv, float *state, float eps);
+                            int d_conv, float *state, float eps,
+                            bool device_state_resident);
 };

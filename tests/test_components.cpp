@@ -12,6 +12,7 @@
 #include "tensor_trace.hpp" // TraceFilter (pure C++, no CUDA deps -- see logger.hpp)
 #include "qwen4exp_gdn.hpp" // the REAL Qwen4Exp GDN delta-rule step (no CUDA deps)
 #include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
+#include "moe_decode_batch.hpp" // decode-gap prototype: grouped per-token expert dispatch (no CUDA deps)
 #include "memory_guard.hpp" // deterministic host-budget admission arithmetic
 #include <algorithm>
 #include <cassert>
@@ -2691,6 +2692,139 @@ void test_host_budget_admission() {
   std::cout << " PASSED\n";
 }
 
+// moe_decode_batch.hpp's grouped per-token expert dispatch (the decode-gap
+// investigation's prototype, 2026-09-10) vs a reference reimplementation of
+// TODAY's per-expert-call convention (execution_layer.cpp's expert_ffn_cpu:
+// gate/up matmul -> silu -> elem_mul -> down matmul, called once per k with
+// its own fresh buffers, weighted-accumulated by the caller). Both use the
+// exact same primitives (kernels_cpu.hpp's matmul/silu_inplace/elem_mul) in
+// the exact same order, so this is a structural-equivalence proof (shared
+// scratch buffers + a single grouped call vs one call per expert with fresh
+// buffers), not an approximation -- output must be BIT-IDENTICAL, matching
+// this project's own convention for this class of "reorganize the
+// dispatch, don't change the math" change (e.g. Test 26 / moe_gpu_accum,
+// "max_abs=0").
+void test_moe_decode_batch() {
+  std::cout << "[TEST] moe_decode_batch grouped vs per-expert loop..."
+            << std::flush;
+
+  // Deliberately smaller than qwen4exp's real shape (D=2560, moe_inter=640,
+  // topk=10) -- this test is about dispatch STRUCTURE, not performance, so
+  // a small shape keeps it fast while still exercising every code path
+  // (multiple experts, non-square gate/down matrices, real SiLU/mul math).
+  const int D = 96, moe_inter = 64, n_pool = 6, k_used = 4;
+
+  std::mt19937 rng(12345);
+  std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+  auto fill = [&](std::vector<float> &v) {
+    for (float &x : v) x = dist(rng);
+  };
+
+  std::vector<float> hidden(D);
+  fill(hidden);
+
+  // n_pool candidate experts' weights; only the first k_used are actually
+  // "selected" (mirrors a token's real topk subset of n_experts).
+  std::vector<std::vector<float>> gate_w(n_pool, std::vector<float>((size_t)moe_inter * D));
+  std::vector<std::vector<float>> up_w(n_pool, std::vector<float>((size_t)moe_inter * D));
+  std::vector<std::vector<float>> down_w(n_pool, std::vector<float>((size_t)D * moe_inter));
+  for (int e = 0; e < n_pool; ++e) {
+    fill(gate_w[e]);
+    fill(up_w[e]);
+    fill(down_w[e]);
+  }
+
+  std::vector<const float *> expert_gate(k_used), expert_up(k_used), expert_down(k_used);
+  std::vector<float> expert_weight(k_used);
+  // Non-trivial, non-uniform routing weights (as a real softmax top-k would
+  // produce), NOT normalized to sum 1 -- the function must not assume that.
+  const float raw_weights[k_used] = {0.41f, 0.05f, 0.30f, 0.10f};
+  for (int k = 0; k < k_used; ++k) {
+    // out-of-order pool indices, matching a real router's non-contiguous
+    // expert-id selection.
+    const int pool_idx = (k * 2 + 1) % n_pool;
+    expert_gate[k] = gate_w[pool_idx].data();
+    expert_up[k] = up_w[pool_idx].data();
+    expert_down[k] = down_w[pool_idx].data();
+    expert_weight[k] = raw_weights[k];
+  }
+
+  // --- Reference: today's per-expert-call convention, fresh buffers per k ---
+  std::vector<float> ref_out(D, 0.0f);
+  for (int k = 0; k < k_used; ++k) {
+    std::vector<float> gate_buf(moe_inter), up_buf(moe_inter), down_buf(D);
+    matmul(gate_buf.data(), hidden.data(), expert_gate[k], 1, D, moe_inter);
+    matmul(up_buf.data(), hidden.data(), expert_up[k], 1, D, moe_inter);
+    silu_inplace(gate_buf.data(), moe_inter);
+    elem_mul(gate_buf.data(), gate_buf.data(), up_buf.data(), moe_inter);
+    matmul(down_buf.data(), gate_buf.data(), expert_down[k], 1, moe_inter, D);
+    for (int d = 0; d < D; ++d)
+      ref_out[d] += down_buf[d] * expert_weight[k];
+  }
+
+  // --- Grouped path: one call, shared/reused scratch buffers ---
+  std::vector<float> gate_scratch(moe_inter), up_scratch(moe_inter), down_scratch(D);
+  std::vector<float> batched_out(D, 0.0f);
+  moe_decode_expert_ffn_batched(hidden.data(), batched_out.data(),
+                                expert_gate.data(), expert_up.data(),
+                                expert_down.data(), expert_weight.data(),
+                                k_used, D, moe_inter, gate_scratch.data(),
+                                up_scratch.data(), down_scratch.data());
+
+  double max_abs_diff = 0.0;
+  for (int d = 0; d < D; ++d)
+    max_abs_diff = std::max(max_abs_diff, (double)std::fabs(batched_out[d] - ref_out[d]));
+  assert(max_abs_diff == 0.0);
+
+  // Accumulate convention: calling again on a buffer that already holds a
+  // prior contribution (e.g. a shared-expert term added before this call,
+  // matching moe_forward_gguf's own out_row[d] += ... convention) must ADD,
+  // never overwrite.
+  std::vector<float> preloaded(D);
+  fill(preloaded);
+  // Built with the SAME left-to-right accumulation order the function
+  // itself uses (preloaded, then each k's contribution in turn) -- float
+  // addition isn't associative, so "preloaded[d] + ref_out[d]" (which adds
+  // ref_out's own already-summed total in one shot) is only approximately,
+  // not bit-exactly, equal to accumulating each term in this order.
+  std::vector<float> expect_sum = preloaded;
+  for (int k = 0; k < k_used; ++k) {
+    matmul(gate_scratch.data(), hidden.data(), expert_gate[k], 1, D, moe_inter);
+    matmul(up_scratch.data(), hidden.data(), expert_up[k], 1, D, moe_inter);
+    silu_inplace(gate_scratch.data(), moe_inter);
+    elem_mul(gate_scratch.data(), gate_scratch.data(), up_scratch.data(), moe_inter);
+    matmul(down_scratch.data(), gate_scratch.data(), expert_down[k], 1, moe_inter, D);
+    for (int d = 0; d < D; ++d)
+      expect_sum[d] += down_scratch[d] * expert_weight[k];
+  }
+  moe_decode_expert_ffn_batched(hidden.data(), preloaded.data(),
+                                expert_gate.data(), expert_up.data(),
+                                expert_down.data(), expert_weight.data(),
+                                k_used, D, moe_inter, gate_scratch.data(),
+                                up_scratch.data(), down_scratch.data());
+  for (int d = 0; d < D; ++d)
+    assert(preloaded[d] == expect_sum[d]);
+
+  // k_used=1 edge case (a token that routed to only one expert this step).
+  std::vector<float> single_ref(D, 0.0f), single_batched(D, 0.0f);
+  matmul(gate_scratch.data(), hidden.data(), expert_gate[0], 1, D, moe_inter);
+  matmul(up_scratch.data(), hidden.data(), expert_up[0], 1, D, moe_inter);
+  silu_inplace(gate_scratch.data(), moe_inter);
+  elem_mul(gate_scratch.data(), gate_scratch.data(), up_scratch.data(), moe_inter);
+  matmul(down_scratch.data(), gate_scratch.data(), expert_down[0], 1, moe_inter, D);
+  for (int d = 0; d < D; ++d)
+    single_ref[d] = down_scratch[d] * expert_weight[0];
+  moe_decode_expert_ffn_batched(hidden.data(), single_batched.data(),
+                                expert_gate.data(), expert_up.data(),
+                                expert_down.data(), expert_weight.data(),
+                                /*k_used=*/1, D, moe_inter, gate_scratch.data(),
+                                up_scratch.data(), down_scratch.data());
+  for (int d = 0; d < D; ++d)
+    assert(single_batched[d] == single_ref[d]);
+
+  std::cout << " PASSED\n";
+}
+
 int main(int argc, char **argv) {
   std::cout << "=== MoEStream Component Tests ===\n";
   struct TestEntry {
@@ -2737,6 +2871,7 @@ int main(int argc, char **argv) {
       {"qwen4exp_l2_norm", test_qwen4exp_l2_norm},
       {"qwen4exp_ple_hash", test_qwen4exp_ple_hash},
       {"host_budget_admission", test_host_budget_admission},
+      {"moe_decode_batch", test_moe_decode_batch},
       {"safetensors_adapter", test_safetensors_adapter},
   };
   const bool filtered = argc > 1;

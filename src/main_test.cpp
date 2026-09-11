@@ -1,6 +1,7 @@
 #include "qwen4exp_gdn.hpp"   // qwen4exp_gdn_delta_chunk (CPU oracle for Test 25)
 #include "ggml_gdn_proj_backend.hpp"  // GgmlGdnProjRunner (Test 29)
 #include "ggml_glm5next_proj_backend.hpp"  // GLM5NEXT KDA fusion (Test 34)
+#include "ggml_moe_backend.hpp"  // GgmlQwenSharedRunner (Test 35)
 #include "kernels_cpu.hpp"
 #include "ram_manager.hpp"
 #include "engine.hpp"
@@ -3932,6 +3933,173 @@ bool test_gdn_conv_fused() {
     return ok;
 }
 
+// Test 35: GgmlQwenSharedRunner (moe_ggml_shared_expert, EXPERIMENTAL, kept
+// OFF in every shipped config -- see configs/qwen4exp_3090_only.toml's own
+// comment). Written 2026-09-10 to isolate a real, confirmed correctness bug
+// found on real hardware: 100% NaN corruption end to end (hidden_states
+// 1249280/1249280 NaN, logits 248320/248320 NaN), traced via VERBOSE tracing
+// to layer=46 of 48 specifically -- finite input, NaN router weights with a
+// suspicious exact stride-4 expert-ID pattern (e292,e288,e284,...), pointing
+// at a buffer-aliasing/overwrite bug rather than the missing-sync race first
+// suspected (that race was real too -- see run()'s own ggml_backend_synchronize
+// fix -- but re-testing after it still aborts under trace_abort_on_nan).
+// This test calls ensure_layer()+run() across MANY synthetic "layers" in a
+// loop (mimicking the real model's per-layer weight-swap pattern) checking
+// EVERY iteration against a hand-computed CPU oracle, specifically to see
+// whether a similar "breaks after N calls" pattern reproduces here -- a
+// compute-sanitizer run against the real 48-layer model timed out entirely
+// inside startup preload before reaching layer 46 (impractical: the model's
+// own preload dominates runtime even before compute-sanitizer's overhead is
+// added), so this minimal harness is the fast path to isolating it.
+bool test_qwen_shared_expert_runner() {
+    std::cout << "[Test 35] Qwen4Exp shared-expert GGML runner (moe_ggml_shared_expert, vs CPU oracle)...\n";
+    if (!GgmlMoeRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CUDA backend not compiled)\n";
+        return true;
+    }
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+    const int device = 0;
+    const int D = 16, inter = 12, S = 5;
+    const int n_synthetic_layers = 50;  // mirrors the real model's 48 + margin
+    std::mt19937 rng(90210);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+    auto sigmoid = [](float v) { return 1.0f / (1.0f + std::exp(-v)); };
+    auto silu = [&](float v) { return v * sigmoid(v); };
+
+    auto &runner = GgmlQwenSharedRunner::instance();
+    bool all_ok = true;
+    int first_bad_layer = -1;
+    double worst_rel = 0.0;
+
+    for (int layer = 0; layer < n_synthetic_layers && all_ok; ++layer) {
+        std::vector<float> w_gate((size_t)inter * D), w_up((size_t)inter * D),
+            w_down((size_t)D * inter), w_gate_inp((size_t)D);
+        for (auto &v : w_gate) v = dist(rng);
+        for (auto &v : w_up) v = dist(rng);
+        for (auto &v : w_down) v = dist(rng);
+        for (auto &v : w_gate_inp) v = dist(rng);
+        std::vector<float> x((size_t)D * S), routed((size_t)D * S);
+        for (auto &v : x) v = dist(rng);
+        for (auto &v : routed) v = dist(rng);
+
+        // CPU oracle, matching build_graph()'s exact op sequence:
+        //   gate = W_gate @ x ; up = W_up @ x ; act = silu(gate) * up
+        //   shared = W_down @ act ; gate_scalar = sigmoid(W_gate_inp @ x)
+        //   combined = routed + shared * gate_scalar
+        std::vector<float> gate_ref((size_t)inter * S), up_ref((size_t)inter * S),
+            act_ref((size_t)inter * S), shared_ref((size_t)D * S),
+            gate_scalar_ref((size_t)S), combined_ref((size_t)D * S);
+        for (int t = 0; t < S; ++t) {
+            for (int o = 0; o < inter; ++o) {
+                double g = 0.0, u = 0.0;
+                for (int d = 0; d < D; ++d) {
+                    g += (double)w_gate[(size_t)o * D + d] * x[(size_t)t * D + d];
+                    u += (double)w_up[(size_t)o * D + d] * x[(size_t)t * D + d];
+                }
+                gate_ref[(size_t)o * S + t] = (float)g;
+                up_ref[(size_t)o * S + t] = (float)u;
+                act_ref[(size_t)o * S + t] = silu((float)g) * (float)u;
+            }
+            double gs = 0.0;
+            for (int d = 0; d < D; ++d)
+                gs += (double)w_gate_inp[d] * x[(size_t)t * D + d];
+            gate_scalar_ref[t] = sigmoid((float)gs);
+            for (int o = 0; o < D; ++o) {
+                double s = 0.0;
+                for (int i = 0; i < inter; ++i)
+                    s += (double)w_down[(size_t)o * inter + i] * act_ref[(size_t)i * S + t];
+                shared_ref[(size_t)o * S + t] = (float)s;
+                combined_ref[(size_t)t * D + o] =
+                    routed[(size_t)t * D + o] +
+                    (float)s * gate_scalar_ref[t];
+            }
+        }
+
+        void *x_tensor = nullptr, *x_ctx = nullptr, *x_buf = nullptr;
+        void *routed_tensor = nullptr, *routed_ctx = nullptr, *routed_buf = nullptr;
+        if (!ggml_moe_test_make_device_tensor(device, D, S, x.data(), &x_tensor,
+                                              &x_ctx, &x_buf) ||
+            !ggml_moe_test_make_device_tensor(device, D, S, routed.data(),
+                                              &routed_tensor, &routed_ctx,
+                                              &routed_buf)) {
+            std::cout << "  -> layer=" << layer << ": FAILED (device tensor setup)\n";
+            all_ok = false;
+            break;
+        }
+
+        GgmlSharedWeightRef gate_ref_w{w_gate.data(), 0, D, inter, w_gate.size() * sizeof(float)};
+        GgmlSharedWeightRef up_ref_w{w_up.data(), 0, D, inter, w_up.size() * sizeof(float)};
+        GgmlSharedWeightRef down_ref_w{w_down.data(), 0, inter, D, w_down.size() * sizeof(float)};
+        GgmlSharedWeightRef gate_inp_ref_w{w_gate_inp.data(), 0, D, 1, w_gate_inp.size() * sizeof(float)};
+
+        const void *combined_output = nullptr;
+        bool step_ok =
+            runner.ensure(device, D, inter, S, /*has_gate=*/true, /*clamp=*/0.0f) &&
+            runner.ensure_layer(layer, gate_ref_w, up_ref_w, down_ref_w, &gate_inp_ref_w) &&
+            runner.run(layer, x_tensor, routed_tensor, &combined_output);
+
+        std::vector<float> combined_test((size_t)D * S, -999.0f);
+        if (step_ok)
+            step_ok = ggml_moe_test_download_tensor(device, combined_output,
+                                                     combined_test.data(),
+                                                     combined_test.size());
+
+        ggml_moe_test_free_device_tensor(x_ctx, x_buf);
+        ggml_moe_test_free_device_tensor(routed_ctx, routed_buf);
+
+        if (!step_ok) {
+            std::cout << "  -> layer=" << layer << ": FAILED (runner call returned false)\n";
+            all_ok = false;
+            break;
+        }
+
+        double m = 0.0, ref_max = 0.0;
+        bool has_nan = false;
+        for (size_t i = 0; i < combined_test.size(); ++i) {
+            if (!std::isfinite(combined_test[i])) has_nan = true;
+            m = std::max(m, (double)std::fabs(combined_test[i] - combined_ref[i]));
+            ref_max = std::max(ref_max, (double)std::fabs(combined_ref[i]));
+        }
+        const double rel = m / (ref_max + 1e-9);
+        worst_rel = std::max(worst_rel, rel);
+        if (has_nan || rel > 1e-3) {
+            if (first_bad_layer < 0) first_bad_layer = layer;
+            std::cout << "  -> layer=" << layer << ": FAILED -- rel=" << rel
+                      << (has_nan ? " (NaN/Inf present)" : "") << "\n";
+            if (layer == 0) {
+                std::cout << "     first 8 test:  ";
+                for (int i = 0; i < 8 && i < (int)combined_test.size(); ++i)
+                    std::cout << combined_test[i] << " ";
+                std::cout << "\n     first 8 ref:   ";
+                for (int i = 0; i < 8 && i < (int)combined_ref.size(); ++i)
+                    std::cout << combined_ref[i] << " ";
+                std::cout << "\n     first 8 routed:";
+                for (int i = 0; i < 8 && i < (int)routed.size(); ++i)
+                    std::cout << " " << routed[i];
+                std::cout << "\n     first 8 shared_ref:";
+                for (int i = 0; i < 8 && i < (int)shared_ref.size(); ++i)
+                    std::cout << " " << shared_ref[i];
+                std::cout << "\n";
+            }
+            all_ok = false;
+        }
+    }
+
+    if (all_ok) {
+        std::cout << "  -> " << n_synthetic_layers << " synthetic layers, worst rel="
+                  << worst_rel << "\n  -> PASSED\n";
+    } else {
+        std::cout << "  -> first bad layer=" << first_bad_layer << " of "
+                  << n_synthetic_layers << "\n";
+    }
+    return all_ok;
+}
+
 // Test 34: GLM5NEXT KDA projection graph. This is an opt-in production
 // optimization, so the test uses small F32 matrices and compares every graph
 // output with the existing CPU matmul oracle. It also exercises the f_a->f_b
@@ -4301,6 +4469,15 @@ int main() {
     std::cout << "  MoeStream Native Test Harness\n";
     std::cout << "========================================\n";
 
+    // Diagnostic-only escape hatch (2026-09-10): run just Test 35 in
+    // isolation so compute-sanitizer's overhead is tractable -- the full
+    // suite's CPU-only tests dominate wall time and add nothing to a
+    // race-condition investigation scoped to GgmlQwenSharedRunner.
+    if (std::getenv("MOESTREAM_TEST_ONLY_35")) {
+        bool ok = test_qwen_shared_expert_runner();
+        return ok ? 0 : 1;
+    }
+
     test_cpu_matrix_ops();
     test_graph_initializer();
     test_attention_extraction();
@@ -4337,6 +4514,7 @@ int main() {
     bool dense_bf16_kquant_ok = test_dense_bf16_kquant();
     bool gdn_conv1d_gpu_ok = test_gdn_conv1d_gpu();
     bool gdn_conv_fused_ok = test_gdn_conv_fused();
+    bool qwen_shared_expert_ok = test_qwen_shared_expert_runner();
     bool score_gpu_prefill_ok = test_score_gpu_prefill();
     bool wuv_batched_prefill_ok = test_wuv_batched_gpu_prefill();
     bool real_expert_iq2xxs_ok = test_real_expert_iq2xxs_dequant();
@@ -4414,6 +4592,10 @@ int main() {
     }
     if (!gdn_conv_fused_ok) {
         std::cout << "❌ GDN proj+conv1d fused GPU path FAILED -- see [Test 29] output above.\n";
+        return 1;
+    }
+    if (!qwen_shared_expert_ok) {
+        std::cout << "❌ Qwen4Exp shared-expert GGML runner FAILED -- see [Test 35] output above.\n";
         return 1;
     }
     if (!expert_gpu_accum_ok) {

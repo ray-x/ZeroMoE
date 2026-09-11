@@ -84,6 +84,76 @@ inline bool expert_gpu_activation() { return expert_gpu_activation_flag(); }
 inline bool moe_prefill_batched() { return moe_prefill_batched_flag(); }
 inline void set_moe_prefill_batched(bool v) { moe_prefill_batched_flag() = v; }
 
+// --- moe_decode_batched (EngineConfig, default OFF) -----------------------
+// Decode-time (S==1) counterpart to moe_prefill_batched, from the
+// MoEStream-vs-beellama decode-gap investigation (2026-09-10). A live
+// measurement found the `expert` dispatch bucket at ~77% of decode wall
+// time, with the actual GPU matmul inside it only ~7% of that bucket --
+// the rest is dispatch_expert_k's per-expert VRAM-cache bookkeeping
+// (find_expert's index lookup, expert_ffn_resolve_gpu_loc's
+// hold_for_compute lock, the gpu_pool issue/finish machinery), paid fresh
+// for EVERY one of topk x n_layers expert lookups, every decode token --
+// even when the whole expert set is already 100% RAM-resident
+// (ram_preload_all_experts) and no miss is possible for the session's
+// lifetime. beellama/llama.cpp instead decide weight placement ONCE at
+// load time (`-ncmoe`) and never revisit it per token (see this
+// project's own [[llamacpp-op-offload-is-the-lever]] /
+// [[moe-expert-dispatch-not-batched]] memory).
+//
+// When on, dispatch_expert_k (execution_layer.cpp) skips straight to its
+// OWN existing CPU-fallback branch (ram_pin -> expert_ffn_cpu ->
+// ram_unpin -> accumulate, the exact same call already used whenever GPU
+// dispatch fails today) for S==1, instead of attempting the VRAM path
+// first. The RAM-tier pin/claim discipline (get_experts_batch, ram_pin)
+// is NOT touched or weakened -- that machinery protects against genuinely
+// concurrent mutation from prefetch-worker threads, not just this
+// function's own redundant work, and stays exactly as today.
+//
+// REAL TRADE-OFF, not a free win: this also means a decode-time expert
+// dispatched this way never goes through expert_ffn_resolve_gpu_loc's own
+// cold-miss VRAM promotion path, so it can no longer newly promote an
+// expert into VRAM residency from a decode-time hit while this is
+// enabled. Acceptable when the model is already fully RAM-resident
+// up front (this project's current tuned qwen4exp configs); a real
+// regression risk for a config that relies on decode-time promotion to
+// build VRAM residency over a session. Never engages for a vram_shadow
+// block (VRAM-only, no host bytes without a synchronous reload) --
+// dispatch_expert_k falls through to its existing path unchanged there.
+//
+// VERIFIED ON REAL HARDWARE, 2026-09-10, qwen4exp (Qwen3.8-Flash-Next,
+// UD-IQ1_M) -- MUST STAY FALSE FOR THIS MODEL. Position-controlled A/B
+// (baseline / batched / baseline, same build, same 1-token prompt):
+//   baseline (GPU dispatch)      5.03, 4.97 tok/s decode  (~1% spread)
+//   moe_decode_batched=true      2.93 tok/s decode         (-41%)
+// A real, reproducible REGRESSION, not a wash and not a win.
+// `expert_calls` flips from 480GPU/0CPU (baseline) to 418GPU/2462CPU
+// (batched): this model's real quant type (IQ1_M) has a fast, working GPU
+// kernel, so forcing CPU dequant-then-matmul (cpu_quant_matmul) instead
+// is strictly worse -- it reconfirms an earlier, under-weighted project
+// measurement (CPU-only decode 0.80 tok/s vs GPU-routed 1.55 tok/s,
+// qwen4exp-gpu-path-state.md) that this same investigation had initially
+// discounted. See memory: moe-decode-batched-regression.md for the full
+// writeup, including the root-cause lesson (the `dispatch_k`/
+// `phase3_loop` sub-timers this flag was built to eliminate are
+// explicitly commented "upper-bound, overlaps gpu/cpu" -- they measure a
+// window that OVERLAPS async GPU dispatch, not pure serial overhead
+// sitting on top of it, so removing the GPU path traded a cheap async GPU
+// op for an expensive synchronous CPU one, not free time back).
+//
+// This flag is only a plausible win when GPU dispatch was NEVER going to
+// be used anyway -- i.e. the routed expert's quant type has NO GPU
+// kernel at all (CLAUDE.md's CPU AVX-512 fallback list: IQ2_XXS,
+// IQ3_XXS, IQ2_S) or the layer is `cpu_affinity_layers`-pinned. Qwen4Exp
+// UD-IQ1_M is neither -- every one of its routed experts already has a
+// fast GPU kernel (confirmed by the 480GPU/0CPU baseline above), so this
+// flag has NO valid use case for that model/quant combination. Left in
+// the tree, default false, as a documented negative result -- do not
+// re-enable for qwen4exp without re-measuring, and do not assume this
+// generalizes to a model/quant where the GPU kernel is missing or slow.
+inline bool &moe_decode_batched_flag() { static bool v = false; return v; }
+inline bool moe_decode_batched() { return moe_decode_batched_flag(); }
+inline void set_moe_decode_batched(bool v) { moe_decode_batched_flag() = v; }
+
 // --- moe_prefill_stream (EngineConfig, default OFF) ----------------------
 // Optional legacy path that streams prefill expert weights straight from a
 // whole-shard mmap into a pinned, double-buffered chunk on the GPU, bypassing

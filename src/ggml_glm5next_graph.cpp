@@ -905,6 +905,41 @@ ggml_tensor *dsv4_hash_ids(FullGraph &g, ggml_context *ctx, int layer,
   return ids;
 }
 
+// Real, measured incident (2026-09-09, qwen4exp side, same ggml scheduler
+// code path this file also uses): ggml_backend_sched_alloc_graph's internal
+// ggml_gallocr_reserve_n_impl does not fail gracefully on a real cudaMalloc
+// OOM -- it logs "cudaMalloc failed: out of memory" and then segfaults the
+// whole process instead of returning a checkable failure. That happened when
+// main.cpp's fallback VRAM cache reservation (a fixed 4GB, unaware of
+// device_expert_layers' own VRAM use) left the scheduler's own reserve()
+// short by ~1.8GB. main.cpp now sizes that fallback cache against real free
+// VRAM and this family's own device_expert_layers estimate, but this check
+// stays as a second, independent line of defense: refuse to even attempt the
+// allocator call when real free VRAM on the graph's device is below a
+// generous floor, and decline to the legacy path instead of risking the same
+// crash again.
+bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag) {
+  size_t free_b = 0, total_b = 0;
+  int prev_device = -1;
+  cudaGetDevice(&prev_device);
+  cudaSetDevice(g.device);
+  const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+  if (prev_device >= 0) cudaSetDevice(prev_device);
+  constexpr size_t kMinGraphAllocHeadroomBytes = 2ull * 1024ull * 1024ull * 1024ull;  // 2 GiB
+  if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
+    LOG_ERROR("%s refusing graph allocator reserve: device %d free=%.2f GiB "
+              "< %.2f GiB safety floor (expert arena + dense arena already "
+              "committed %.2f GiB) -- falling back to the legacy path\n",
+              log_tag, g.device,
+              err == cudaSuccess ? static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0) : -1.0,
+              static_cast<double>(kMinGraphAllocHeadroomBytes) / (1024.0 * 1024.0 * 1024.0),
+              static_cast<double>(g.expert_capacity + g.dense_capacity) /
+                  (1024.0 * 1024.0 * 1024.0));
+    return false;
+  }
+  return true;
+}
+
 bool build_dsv4_graph(FullGraph &g, const int *token_ids) {
   const auto &c = g.engine->model_file.architecture_config;
   ggml_init_params ip = {};
@@ -1079,6 +1114,7 @@ bool build_dsv4_graph(FullGraph &g, const int *token_ids) {
       }
     }
   }
+  if (!graph_alloc_vram_headroom_ok(g, "[GGML-DSV4-FULL]")) return false;
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph)) return false;
   g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
   int cuda_nodes = 0, cpu_nodes = 0, transitions = 0;
@@ -2395,7 +2431,10 @@ bool source_configuration_matches(const FullGraph &source,
 bool prepare_expert_source_only(FullGraph &g, const char *tag) {
   const size_t source = expert_source_bytes(*g.engine, g.device_expert_layers);
   constexpr size_t kSourceSlack = 1ull << 20;
-  constexpr size_t kWatermark = 8ull * 1024ull * 1024ull * 1024ull;
+  // 10 GiB, per explicit user instruction after the 2026-09-09 crash (was
+  // 8 GiB) -- align every host-memory watermark in this file to the same
+  // floor rather than several different ad hoc numbers.
+  constexpr size_t kWatermark = 10ull * 1024ull * 1024ull * 1024ull;
   const size_t host_live = graph_host_live_bytes(*g.engine);
   if (source > SIZE_MAX - kSourceSlack ||
       (source > 0 && !MemoryGuard::try_reserve_host_bytes(
@@ -3060,6 +3099,7 @@ bool build_graph(FullGraph &g) {
     ggml_set_output(t);
     ggml_build_forward_expand(g.graph, t);
   }
+  if (!graph_alloc_vram_headroom_ok(g, "[GGML-GLM5NEXT-FULL]")) return false;
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph)) return false;
   g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
 
@@ -3286,6 +3326,35 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
               (size_t)g.D * g.HC * S * sizeof(float));
 
+  // Real-hardware incident (2026-09-09): a 480-token prompt crashed the
+  // whole machine (hard reboot required, no surviving kernel/OOM log --
+  // this box has no persistent journald storage) with the last surviving
+  // application-log line being "graph prepared for S=...", i.e. somewhere
+  // in the gap between prepare() returning and this compute call. Every
+  // OTHER host allocation on this path (arena prep, expert source, graph
+  // context) goes through MemoryGuard::try_reserve_host_bytes first; this
+  // compute call did not, and it is the last real memory-relevant, cheaply
+  // avoidable step before the model correctness this session verified
+  // could otherwise be undone by a repeat crash. Re-check REAL, fresh
+  // MemAvailable (not the background watchdog's own possibly-500ms-stale
+  // allocation_blocked() flag) immediately before committing to it -- a
+  // large gap can open between the admission checks earlier in prepare()
+  // (preload alone took minutes) and this moment. Not a fix for whatever
+  // the real mechanism was (unconfirmed -- no kernel evidence survived),
+  // just a cheap, additional, defense-in-depth backstop.
+  {
+    const long avail_mb = MemoryGuard::read_available_mb();
+    constexpr long kMinComputeHeadroomMb = 10240;  // 10 GiB, per explicit user instruction after the 2026-09-09 crash
+    if (avail_mb >= 0 && avail_mb < kMinComputeHeadroomMb) {
+      LOG_ERROR("[GGML-GLM5NEXT-FULL] refusing graph compute: MemAvailable=%ld MiB "
+                "< %ld MiB safety floor -- falling back to the legacy path rather "
+                "than risk the host-memory incident this check was added for "
+                "(2026-09-09, see this call site's own comment)\n",
+                avail_mb, kMinComputeHeadroomMb);
+      return false;
+    }
+  }
+
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS)
@@ -3378,7 +3447,8 @@ bool deepseek_v4_full_graph_prepare(StreamingEngine &engine, int S, int pos_base
   const size_t source = expert_source_bytes(engine, g->device_expert_layers);
   const size_t host_live = graph_host_live_bytes(engine);
   constexpr size_t kSourceSlack = 1ull << 20;
-  constexpr size_t kWatermark = 8ull * 1024ull * 1024ull * 1024ull;
+  // 10 GiB, per explicit user instruction after the 2026-09-09 crash.
+  constexpr size_t kWatermark = 10ull * 1024ull * 1024ull * 1024ull;
   if (source == 0 || source > SIZE_MAX - kSourceSlack ||
       !MemoryGuard::try_reserve_host_bytes(source + kSourceSlack,
                                            kWatermark)) {
@@ -3439,6 +3509,23 @@ bool deepseek_v4_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return false;
   std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
               (size_t)g.D * g.HC * S * sizeof(float));
+
+  // Same defense-in-depth backstop as glm5next_full_graph_run's own compute
+  // call (see that call site's own comment for the real-hardware incident
+  // that motivated it) -- DSV4's full graph hasn't been run on real hardware
+  // yet at all, so there is no evidence either way here, but the gap this
+  // closes (a fresh, synchronous MemAvailable check right before the one
+  // uncounted compute step in this whole admission chain) applies equally.
+  {
+    const long avail_mb = MemoryGuard::read_available_mb();
+    constexpr long kMinComputeHeadroomMb = 10240;  // 10 GiB, per explicit user instruction after the 2026-09-09 crash
+    if (avail_mb >= 0 && avail_mb < kMinComputeHeadroomMb) {
+      LOG_ERROR("[GGML-DSV4-FULL] refusing graph compute: MemAvailable=%ld MiB "
+                "< %ld MiB safety floor -- falling back to the legacy path\n",
+                avail_mb, kMinComputeHeadroomMb);
+      return false;
+    }
+  }
 
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=

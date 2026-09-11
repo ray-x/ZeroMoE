@@ -51,6 +51,16 @@ struct PerfCounters {
     std::atomic<double> t_hc_hooks{0};
     std::atomic<double> t_prefill_stream_h2d{0};  // real on-GPU H2D, CUDA-event timed
     std::atomic<uint64_t> bytes_prefill_stream_h2d{0};
+    // Source-separated timing for the GGML MUL_MAT_ID MoE runner. These are
+    // copied from CUDA events at the forward-level drain, so they describe
+    // copy-stream service time rather than request wall time. Keep them
+    // separate from the older generic prefill-stream bucket because that
+    // bucket also includes the legacy prefill expert stream on some models.
+    std::atomic<double> t_ggml_moe_d2d{0};
+    std::atomic<double> t_ggml_moe_h2d{0};
+    std::atomic<double> t_ggml_moe_h2d_dma{0};
+    std::atomic<uint64_t> bytes_ggml_moe_d2d{0};
+    std::atomic<uint64_t> bytes_ggml_moe_h2d{0};
     std::atomic<double> t_host_alloc{0};    // posix_memalign + setup
     std::atomic<double> t_gpu_upload{0};    // cudaMemcpy H2D -- shared by expert cache
                                              // PROMOTION uploads (GpuTopology::upload_expert,
@@ -1027,6 +1037,50 @@ struct PerfCounters {
     std::atomic<uint64_t> n_pilot_recall_checks{0};   // number of (layer, "last token") comparisons made
     std::atomic<uint64_t> n_pilot_recall_topk_sum{0}; // sum of topk across those checks (denominator, since topk could vary in principle)
 
+    // Qwen4Exp-only router-pilot measurements. This predictor uses the
+    // device-authoritative HC stream-0 state as a deliberately explicit
+    // proxy for the next layer's HC router input; it is not the conventional
+    // hidden->RMSNorm->gate pilot above. These counters are separate so a
+    // Qwen experiment cannot change the GLM/DeepSeek pilot report or policy.
+    std::atomic<uint64_t> n_qwen_pilot_predictions{0};
+    std::atomic<uint64_t> n_qwen_pilot_recall_hits{0};
+    std::atomic<uint64_t> n_qwen_pilot_recall_checks{0};
+    std::atomic<uint64_t> n_qwen_pilot_recall_pred_size_sum{0};
+    // Accuracy of the candidates actually eligible for Qwen prefetch. This
+    // is intentionally separate from the diagnostic top-10 predictor metric:
+    // the runtime may predict top-10 but prefetch only the first N ranks, and
+    // may disable prefetch for selected layers.
+    std::atomic<uint64_t> n_qwen_pilot_prefetch_recall_hits{0};
+    std::atomic<uint64_t> n_qwen_pilot_prefetch_recall_checks{0};
+    std::atomic<uint64_t> n_qwen_pilot_prefetch_recall_pred_size_sum{0};
+    std::atomic<uint32_t> n_qwen_pilot_prefetch_k_observed{0};
+    std::atomic<uint64_t> n_qwen_pilot_pred_already_ram{0};
+    std::atomic<uint64_t> n_qwen_pilot_pred_already_vram{0};
+    std::atomic<uint64_t> n_qwen_pilot_pred_needs_fetch{0};
+    std::atomic<uint64_t> n_qwen_pilot_hints_pushed{0};
+    std::atomic<uint64_t> n_qwen_pilot_hints_skipped_resident{0};
+    // Qwen estimation-based next-layer active-area prefetch. These are
+    // separate from ordinary disk/RAM hint counters because an active-area
+    // copy is an actual H2D transfer issued by cudaMemcpyAsync.
+    std::atomic<uint64_t> n_qwen_pilot_active_prefetch_issued{0};
+    std::atomic<uint64_t> n_qwen_pilot_active_prefetch_failed{0};
+    std::atomic<uint64_t> n_qwen_pilot_prefetch_excluded{0};
+    std::atomic<uint64_t> n_qwen_pilot_prefetch_rank_skipped{0};
+    std::atomic<uint64_t> n_qwen_pilot_sync_fail{0};
+    static constexpr int kQwenPilotMaxRanks = 16;
+    // Per-predicted-rank membership accuracy. A hit means the expert at
+    // predicted rank r belongs to the real router's top-k set; this is the
+    // useful definition for loading, where order among the required experts
+    // does not matter.
+    std::array<std::atomic<uint64_t>, kQwenPilotMaxRanks>
+        n_qwen_pilot_rank_hits{};
+    std::array<std::atomic<uint64_t>, kQwenPilotMaxRanks>
+        n_qwen_pilot_rank_checks{};
+    std::array<std::atomic<uint64_t>, kQwenPilotMaxRanks>
+        n_qwen_pilot_prefetch_rank_hits{};
+    std::array<std::atomic<uint64_t>, kQwenPilotMaxRanks>
+        n_qwen_pilot_prefetch_rank_checks{};
+
     // ATTN-PILOT measurement (2026-08-25) -- predicts a layer from the
     // PREVIOUS layer's post-attention (pre-FFN) state, instead of DEPTH-1's
     // post-FFN state or DEPTH-2's naive 2-layer reuse. See execution_layer.
@@ -1315,6 +1369,18 @@ struct PerfCounters {
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot2_recall_hits_by_layer{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot2_recall_topk_sum_by_layer{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot2_recall_checks_by_layer{};
+    std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_qwen_pilot_recall_hits_by_layer{};
+    std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_qwen_pilot_recall_pred_size_sum_by_layer{};
+    std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_qwen_pilot_recall_checks_by_layer{};
+    std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_qwen_pilot_prefetch_recall_hits_by_layer{};
+    std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_qwen_pilot_prefetch_recall_pred_size_sum_by_layer{};
+    std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_qwen_pilot_prefetch_recall_checks_by_layer{};
+    std::array<std::array<std::atomic<uint32_t>, kQwenPilotMaxRanks>,
+               kMaxTrackedLayersForMiss>
+        n_qwen_pilot_rank_hits_by_layer{};
+    std::array<std::array<std::atomic<uint32_t>, kQwenPilotMaxRanks>,
+               kMaxTrackedLayersForMiss>
+        n_qwen_pilot_rank_checks_by_layer{};
 
     // DEPTH-2 measurement (approach (a), "naive reuse" only) -- exact
     // mirror of the eight counters above, one hop further out.
@@ -1805,6 +1871,23 @@ struct PerfCounters {
     // moves the same total cost around for no net change.
     std::atomic<double> t_active_layer_upload_async{0};
     std::atomic<double> t_active_layer_batch_sync{0};
+
+    // Actual active-layer H2D intervals measured by persistent CUDA events.
+    // Split by async-vs-reactive-sync and by persistent host pin coverage.
+    // These times exclude CPU cudaMemcpyAsync issue/staging and the later
+    // stream wait; bytes/time is therefore a per-transfer copy-engine rate.
+    std::atomic<double> t_active_layer_dma_async_pinned{0};
+    std::atomic<double> t_active_layer_dma_async_unpinned{0};
+    std::atomic<double> t_active_layer_dma_sync_pinned{0};
+    std::atomic<double> t_active_layer_dma_sync_unpinned{0};
+    std::atomic<int64_t> bytes_active_layer_dma_async_pinned{0};
+    std::atomic<int64_t> bytes_active_layer_dma_async_unpinned{0};
+    std::atomic<int64_t> bytes_active_layer_dma_sync_pinned{0};
+    std::atomic<int64_t> bytes_active_layer_dma_sync_unpinned{0};
+    std::atomic<uint64_t> n_active_layer_dma_async_pinned{0};
+    std::atomic<uint64_t> n_active_layer_dma_async_unpinned{0};
+    std::atomic<uint64_t> n_active_layer_dma_sync_pinned{0};
+    std::atomic<uint64_t> n_active_layer_dma_sync_unpinned{0};
     // 2026-08-28: total bytes carried by every cudaMemcpyAsync issued at
     // this call site (upload_expert_active_async), across BOTH callers --
     // decode_async_prewarm AND the speculative pilot fill (they share this
@@ -3253,6 +3336,26 @@ struct PerfCounters {
                          sw, sh, sb / 1e9, sh > 0 ? (sb / 1e9) / sh : 0.0);
             }
         }
+        {
+            const double d2d = t_ggml_moe_d2d.load();
+            const double h2d = t_ggml_moe_h2d.load();
+            const double h2d_dma = t_ggml_moe_h2d_dma.load();
+            const uint64_t db = bytes_ggml_moe_d2d.load();
+            const uint64_t hb = bytes_ggml_moe_h2d.load();
+            if (db > 0 || hb > 0) {
+                LOG_INFO("GGML MoE copy stream: D2D %8.3f s (%.2f GB, %.2f GB/s) | "
+                         "H2D %8.3f s (%.2f GB, %.2f GB/s) -- CUDA-event service "
+                         "intervals; H2D is the PCIe-relevant number, not request-total "
+                         "bytes / request-total time\n",
+                         d2d, db / 1e9, d2d > 0 ? (db / 1e9) / d2d : 0.0,
+                         h2d, hb / 1e9, h2d > 0 ? (hb / 1e9) / h2d : 0.0);
+                if (h2d_dma > 0.0) {
+                    LOG_INFO("GGML MoE pure H2D DMA: %.3f s (%.2f GB, %.2f GB/s) -- "
+                             "opt-in per-copy CUDA events; excludes device unpack kernels\n",
+                             h2d_dma, hb / 1e9, (hb / 1e9) / h2d_dma);
+                }
+            }
+        }
         LOG_INFO("Expert activation upload (H2D): %8.3f s  (expert_ffn's own per-call upload, "
                  "isolated from cache-promotion uploads above -- %llu calls, %.4f ms/call avg)\n",
                  t_expert_gpu_upload.load(), (unsigned long long)n_expert_gpu_calls.load(),
@@ -3864,6 +3967,33 @@ struct PerfCounters {
                              (unsigned long)nu, tu, nu > 0 ? (tu * 1000.0 / nu) : 0.0,
                              (np > 0 && nu > 0 && tp > 0) ? ((tu / nu) / (tp / np)) : 0.0);
                 }
+            }
+            {
+                // Unlike the legacy issue-time ratio above, these four
+                // buckets are CUDA-event measurements of the actual H2D
+                // interval on the selected stream.  They are the numbers to
+                // compare with the RTX 3090 PCIe Gen3 x16 ceiling (~15.75
+                // GB/s), while the CPU issue and batch-wait timers explain
+                // host-side staging/queueing separately.
+                auto log_dma = [](const char* label, double seconds,
+                                  int64_t bytes, uint64_t calls) {
+                    if (calls == 0 || seconds <= 0.0 || bytes <= 0) return;
+                    LOG_INFO("Active-layer H2D CUDA-event %-18s: %lu calls, %.2f GB in %.3fs = %.2f GB/s\n",
+                             label, (unsigned long)calls, bytes / 1e9, seconds,
+                             (bytes / 1e9) / seconds);
+                };
+                log_dma("async+pinned", t_active_layer_dma_async_pinned.load(),
+                        bytes_active_layer_dma_async_pinned.load(),
+                        n_active_layer_dma_async_pinned.load());
+                log_dma("async+pageable", t_active_layer_dma_async_unpinned.load(),
+                        bytes_active_layer_dma_async_unpinned.load(),
+                        n_active_layer_dma_async_unpinned.load());
+                log_dma("sync+pinned", t_active_layer_dma_sync_pinned.load(),
+                        bytes_active_layer_dma_sync_pinned.load(),
+                        n_active_layer_dma_sync_pinned.load());
+                log_dma("sync+pageable", t_active_layer_dma_sync_unpinned.load(),
+                        bytes_active_layer_dma_sync_unpinned.load(),
+                        n_active_layer_dma_sync_unpinned.load());
             }
             {
                 uint64_t sub = n_active_layer_worker_submitted.load();
@@ -5229,5 +5359,185 @@ inline void report_pilot_recall_by_layer() {
                  "n=checks (higher n = more reliable estimate for that layer) -- NOT yet acted on by "
                  "any config, gathered purely to inform a future per-layer speculation policy.\n",
                  layers_seen);
+    }
+}
+
+inline void report_qwen4exp_pilot_stats() {
+    auto &p = perf();
+    const uint64_t predictions =
+        p.n_qwen_pilot_predictions.load(std::memory_order_relaxed);
+    const uint64_t checks =
+        p.n_qwen_pilot_recall_checks.load(std::memory_order_relaxed);
+    const uint64_t sync_fail =
+        p.n_qwen_pilot_sync_fail.load(std::memory_order_relaxed);
+    if (predictions == 0 && checks == 0 && sync_fail == 0)
+        return;
+
+    const uint64_t hits =
+        p.n_qwen_pilot_recall_hits.load(std::memory_order_relaxed);
+    const uint64_t pred_slots =
+        p.n_qwen_pilot_recall_pred_size_sum.load(std::memory_order_relaxed);
+    const double accuracy = pred_slots > 0
+                                ? 100.0 * (double)hits / (double)pred_slots
+                                : 0.0;
+    LOG_INFO("[QWEN-PILOT] HC stream-0 proxy: predictions=%llu checks=%llu "
+             "overlap=%llu/%llu (%.1f%% predicted-slot accuracy), sync_fail=%llu\n",
+             (unsigned long long)predictions, (unsigned long long)checks,
+             (unsigned long long)hits, (unsigned long long)pred_slots,
+             accuracy, (unsigned long long)sync_fail);
+    LOG_INFO("[QWEN-PILOT] load coverage: already_ram=%llu already_vram=%llu "
+             "needs_fetch=%llu hints_pushed=%llu hints_skipped_resident=%llu\n",
+             (unsigned long long)p.n_qwen_pilot_pred_already_ram.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_pred_already_vram.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_pred_needs_fetch.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_hints_pushed.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_hints_skipped_resident.load(
+                 std::memory_order_relaxed));
+    LOG_INFO("[QWEN-PILOT] active-layer prefetch: issued=%llu failed=%llu "
+             "excluded_layer=%llu rank_skipped=%llu\n",
+             (unsigned long long)p.n_qwen_pilot_active_prefetch_issued.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_active_prefetch_failed.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_prefetch_excluded.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_prefetch_rank_skipped.load(
+                 std::memory_order_relaxed));
+
+    const uint32_t prefetch_k =
+        p.n_qwen_pilot_prefetch_k_observed.load(std::memory_order_relaxed);
+    const uint64_t prefetch_hits =
+        p.n_qwen_pilot_prefetch_recall_hits.load(std::memory_order_relaxed);
+    const uint64_t prefetch_checks =
+        p.n_qwen_pilot_prefetch_recall_checks.load(std::memory_order_relaxed);
+    const uint64_t prefetch_slots = p.n_qwen_pilot_prefetch_recall_pred_size_sum
+                                        .load(std::memory_order_relaxed);
+    const double prefetch_accuracy =
+        prefetch_slots > 0
+            ? 100.0 * (double)prefetch_hits / (double)prefetch_slots
+            : 0.0;
+    if (prefetch_k > 0) {
+      LOG_INFO(
+          "[QWEN-PILOT] prefetch accuracy: top-%u on eligible layers "
+          "overlap=%llu/%llu (%.1f%%), checks=%llu -- actionable metric "
+          "for the active-layer prefetch policy\n",
+          prefetch_k, (unsigned long long)prefetch_hits,
+          (unsigned long long)prefetch_slots, prefetch_accuracy,
+          (unsigned long long)prefetch_checks);
+      std::string prefetch_rank_line;
+      for (uint32_t r = 0; r < prefetch_k &&
+                           r < (uint32_t)PerfCounters::kQwenPilotMaxRanks;
+           ++r) {
+        const uint64_t rc = p.n_qwen_pilot_prefetch_rank_checks[r].load(
+            std::memory_order_relaxed);
+        if (rc == 0)
+          continue;
+        const uint64_t rh = p.n_qwen_pilot_prefetch_rank_hits[r].load(
+            std::memory_order_relaxed);
+        char part[64];
+        std::snprintf(part, sizeof(part), " r%u=%.1f%%(%llu/%llu)", r,
+                      100.0 * (double)rh / (double)rc,
+                      (unsigned long long)rh, (unsigned long long)rc);
+        prefetch_rank_line += part;
+      }
+      LOG_INFO("[QWEN-PILOT] prefetch rank membership (eligible layers):%s\n",
+               prefetch_rank_line.empty() ? " none"
+                                          : prefetch_rank_line.c_str());
+    } else {
+      LOG_INFO("[QWEN-PILOT] prefetch accuracy: disabled for this run\n");
+    }
+
+    std::string overall_rank_line;
+    for (int r = 0; r < PerfCounters::kQwenPilotMaxRanks; ++r) {
+        const uint64_t rc =
+            p.n_qwen_pilot_rank_checks[r].load(std::memory_order_relaxed);
+        if (rc == 0)
+            continue;
+        const uint64_t rh =
+            p.n_qwen_pilot_rank_hits[r].load(std::memory_order_relaxed);
+        char part[64];
+        std::snprintf(part, sizeof(part), " r%d=%.1f%%(%llu/%llu)", r,
+                      100.0 * (double)rh / (double)rc,
+                      (unsigned long long)rh, (unsigned long long)rc);
+        overall_rank_line += part;
+    }
+    LOG_INFO("[QWEN-PILOT] rank membership accuracy overall:%s\n",
+             overall_rank_line.empty() ? " none" : overall_rank_line.c_str());
+
+    int layers_seen = 0;
+    int prefetch_enabled_layers = 0;
+    int prefetch_excluded_layers = 0;
+    for (int l = 0; l < PerfCounters::kMaxTrackedLayersForMiss; ++l) {
+        const uint32_t lc = p.n_qwen_pilot_recall_checks_by_layer[l].load(
+            std::memory_order_relaxed);
+        if (lc == 0)
+            continue;
+        ++layers_seen;
+        const uint32_t lh = p.n_qwen_pilot_recall_hits_by_layer[l].load(
+            std::memory_order_relaxed);
+        const uint32_t lp =
+            p.n_qwen_pilot_recall_pred_size_sum_by_layer[l].load(
+                std::memory_order_relaxed);
+        const double la = lp > 0 ? 100.0 * (double)lh / (double)lp : 0.0;
+        const uint32_t plc =
+            p.n_qwen_pilot_prefetch_recall_checks_by_layer[l].load(
+                std::memory_order_relaxed);
+        const uint32_t plh =
+            p.n_qwen_pilot_prefetch_recall_hits_by_layer[l].load(
+                std::memory_order_relaxed);
+        const uint32_t plp =
+            p.n_qwen_pilot_prefetch_recall_pred_size_sum_by_layer[l].load(
+                std::memory_order_relaxed);
+        const double pla =
+            plp > 0 ? 100.0 * (double)plh / (double)plp : 0.0;
+        char prefetch_part[128];
+        if (prefetch_k > 0 && plc > 0) {
+          ++prefetch_enabled_layers;
+          std::snprintf(prefetch_part, sizeof(prefetch_part),
+                        " prefetch=ON top-%u=%u/%u (%.1f%%)", prefetch_k,
+                        plh, plp, pla);
+        } else if (prefetch_k > 0) {
+          ++prefetch_excluded_layers;
+          std::snprintf(prefetch_part, sizeof(prefetch_part),
+                        " prefetch=EXCLUDED");
+        } else {
+          std::snprintf(prefetch_part, sizeof(prefetch_part),
+                        " prefetch=OFF");
+        }
+        std::string layer_rank_line;
+        for (int r = 0; r < PerfCounters::kQwenPilotMaxRanks; ++r) {
+            const uint32_t rc =
+                p.n_qwen_pilot_rank_checks_by_layer[l][r].load(
+                    std::memory_order_relaxed);
+            if (rc == 0)
+                continue;
+            const uint32_t rh =
+                p.n_qwen_pilot_rank_hits_by_layer[l][r].load(
+                    std::memory_order_relaxed);
+            char part[48];
+            std::snprintf(part, sizeof(part), " r%d=%.1f%%", r,
+                          100.0 * (double)rh / (double)rc);
+            layer_rank_line += part;
+        }
+        LOG_INFO("[QWEN-PILOT] layer=%-3d top-10=%u/%u (%.1f%%) checks=%u%s "
+                 "ranks:%s\n",
+                 l, lh, lp, la, lc, prefetch_part,
+                 layer_rank_line.empty() ? " none" : layer_rank_line.c_str());
+    }
+    if (layers_seen > 0) {
+        LOG_INFO("[QWEN-PILOT] %d target layer(s) tracked; accuracy is "
+                 "predicted IDs overlapping the real top-k divided by "
+                 "predicted IDs checked.\n",
+                 layers_seen);
+      if (prefetch_k > 0)
+        LOG_INFO("[QWEN-PILOT] prefetch policy: %d eligible layer(s), %d "
+                 "excluded layer(s); per-layer top-%u values above are the "
+                 "prefetch-relevant measurements.\n",
+                 prefetch_enabled_layers, prefetch_excluded_layers,
+                 prefetch_k);
     }
 }

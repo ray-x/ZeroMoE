@@ -163,6 +163,46 @@ void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
                               int S, int I, int O);
 void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
                               int S, int I, int O);
+// Qwen4Exp/UD-IQ1_M CPU fallback using ggml's production IQ1_M x Q8_K
+// quantized-activation path.  Kept as a separate opt-in symbol so GLM and
+// other model CPU paths remain unchanged.
+bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
+                           int S, int I, int O);
+// Grouped Qwen CPU route: one Q8_K activation quantization feeds several
+// compact expert matrices. `W_quantized[m]` points to one [O,I] matrix and
+// `y[m]` points to its [S,O] result. This removes the per-expert OpenMP
+// fork/join and activation quantization that made the old CPU fallback much
+// slower than BeeLlama's ggml MUL_MAT_ID path.
+bool matmul_iq1_m_ggml_q8k_grouped(float *const *y, const float *x,
+                                   const uint8_t *const *W_quantized,
+                                   int n_matrices, int S, int I, int O);
+// Same grouped kernel when each matrix has its own activation row (the down
+// projection after per-expert SwiGLU).
+bool matmul_iq1_m_ggml_q8k_grouped_inputs(
+    float *const *y, const float *const *x,
+    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O);
+// Grouped Qwen CPU routes for the other quantized projections present in the
+// Qwen4Exp checkpoint.  IQ2/ IQ3 use the same Q8_K activation contract as the
+// existing AVX2 per-matrix wrappers; IQ4_NL uses ggml's Q8_0 dot kernel for
+// the down projection, whose activation differs after each expert's SwiGLU.
+bool matmul_iq2_xxs_ggml_avx2_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O);
+bool matmul_iq3_xxs_ggml_avx2_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O);
+// Qwen-only grouped wrappers around the production GGML CPU dot kernels.
+// Unlike the older AVX2 prototypes above, these use the same dispatched
+// ggml_vec_dot_iq*_q8_K implementation as BeeLlama's MUL_MAT_ID path.
+bool matmul_iq2_xxs_ggml_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O);
+bool matmul_iq3_xxs_ggml_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O);
+bool matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+    float *const *y, const float *const *x,
+    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O);
 float dot_iq3_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k);
 void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
                           int S, int I, int O);

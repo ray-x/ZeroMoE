@@ -414,21 +414,47 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   c.hidden = file.get_config_int("embedding_length", 0);
   int n_layer_all = file.get_config_int("block_count", 0);
   int n_layer_nextn = file.get_config_int("nextn_predict_layers", 0);
-  if (n_layer_nextn < 0 || n_layer_nextn >= n_layer_all) {
+  // Qwen4Exp's own "shared" MTP convention (verified against the real
+  // mtp-*-shared-*.gguf file and against the correct upstream reference,
+  // /home/ray/Projects/unsloth/llama.cpp branch mtp/qwen4exp-nextn,
+  // qwen4exp.cpp's load_arch_hparams/graph_mtp): the extra NextN block is
+  // NOT described by the base model file at all -- its own block_count KV
+  // (confirmed 48, real tensor dump) has no nextn_predict_layers entry,
+  // unlike GLM5NEXT/GLM_DSA where the trunk file's own block_count already
+  // counts the inline NextN block. Instead, nextn_predict_layers=1 (and a
+  // matching block_count=49, i.e. n_layer_all+1) is declared in the
+  // SEPARATE mtp_model_path file's own KV metadata. Read it from there
+  // when that file is configured; n_layer_all itself is unaffected (it
+  // still describes only the base file's real trunk layers).
+  // Qwen4Exp's shared-file NextN block sits ONE PAST the base file's own
+  // real trunk layers (blk.<n_layer_all>.*, in the SEPARATE mtp file) --
+  // unlike GLM's inline convention, it is never carved OUT of n_layer_all,
+  // so the ordinary "subtract" below must not apply to it.
+  const bool qwen4exp_shared_mtp =
+      engine.has_mtp_model && detect_model_family(file) == ModelFamily::Qwen4Exp;
+  if (qwen4exp_shared_mtp) {
+    n_layer_nextn = engine.mtp_model_file.get_config_int("nextn_predict_layers", 0);
+  }
+  if (n_layer_nextn < 0 || (!qwen4exp_shared_mtp && n_layer_nextn >= n_layer_all)) {
     LOG_STREAM_ERROR() << "[GRAPH] Invalid nextn_predict_layers="
                        << n_layer_nextn << " for block_count=" << n_layer_all
                        << " -- expected 0 <= nextn_predict_layers < block_count.\n";
     return false;
   }
   c.n_layer_nextn = n_layer_nextn;
-  c.n_layers = n_layer_all - n_layer_nextn;
+  c.n_layers = qwen4exp_shared_mtp ? n_layer_all : (n_layer_all - n_layer_nextn);
   if (n_layer_nextn > 0) {
     LOG_STREAM_INFO()
         << "[GRAPH] block_count=" << n_layer_all
         << " nextn_predict_layers=" << n_layer_nextn
         << " -- using n_layers=" << c.n_layers
-        << " for the target forward pass (excludes NextN/MTP draft block(s); "
-           "MTP is enabled only after model-gated validation below).\n";
+        << (qwen4exp_shared_mtp
+                ? " for the target forward pass (shared MTP file's own "
+                  "extra block sits at layer index n_layers, not carved "
+                  "out of the base file's own trunk count); "
+                : " for the target forward pass (excludes NextN/MTP draft "
+                  "block(s); ")
+        << "MTP is enabled only after model-gated validation below).\n";
   }
   c.n_heads = file.get_config_int("attention.head_count", 0);
   c.vocab = file.get_config_int("vocab_size", 0);
@@ -1285,15 +1311,18 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   if (engine.mtp_enabled) {
     const bool glm_family = fam == ModelFamily::GLM5NEXT ||
                             fam == ModelFamily::GLM_DSA;
-    if (!glm_family) {
+    const bool qwen4exp_shared_mtp_family =
+        fam == ModelFamily::Qwen4Exp && engine.has_mtp_model;
+    if (!glm_family && !qwen4exp_shared_mtp_family) {
       LOG_STREAM_WARN() << "[MTP] requested but this model family is not yet "
-                           "supported; using ordinary generation\n";
+                           "supported (Qwen4Exp requires mtp_model_path to be "
+                           "configured); using ordinary generation\n";
     } else if (n_layer_nextn != 1) {
       LOG_STREAM_WARN() << "[MTP] requested but nextn_predict_layers="
                         << n_layer_nextn
-                        << " (the GLM bridge requires exactly one extra block); "
-                           "using ordinary generation\n";
-    } else {
+                        << " (the GLM/Qwen4Exp bridge requires exactly one "
+                           "extra block); using ordinary generation\n";
+    } else if (glm_family) {
       const int mtp_layer = c.n_layers;
       // GLM5Next's extra block is always the ordinary DSA block, even though
       // its target trunk is hybrid KDA+DSA.  Reusing the KDA interpretation
@@ -1338,6 +1367,62 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
                                "DSA/MLA+MoE block at layer "
                             << mtp_layer << "\n";
         }
+      }
+    } else {
+      // Qwen4Exp "shared" MTP checkpoint: the extra block lives at layer
+      // index c.n_layers (one PAST the base file's own real trunk layers,
+      // never carved out of them -- see the n_layer_nextn computation
+      // above), and its tensors live in the SEPARATE mtp_model_file, not
+      // `file`. Verified against the real mtp-*-shared-*.gguf file (32
+      // tensors, all under blk.48.*) and against
+      // /home/ray/Projects/unsloth/llama.cpp's qwen4exp.cpp (branch
+      // mtp/qwen4exp-nextn): layer 48 is architecturally an ordinary
+      // full-attention trunk layer (split attn_q/k/v, not the recurrent
+      // attn_qkv-combined GDN layout) plus the nextn.* bridge/head
+      // tensors. indexer.* tensors are present but intentionally not
+      // required here -- v1 attends densely, same as the base trunk's own
+      // qwen4exp_full_attention_gguf.
+      const int mtp_layer = c.n_layers;
+      const std::string p = "blk." + std::to_string(mtp_layer) + ".";
+      GGUFFile &mf = engine.mtp_model_file;
+      const char *required[] = {
+          "attn_q.weight", "attn_k.weight", "attn_v.weight",
+          "attn_output.weight", "attn_q_norm.weight", "attn_k_norm.weight",
+          "hc_attn_norm.weight", "hc_attn_down.weight", "hc_attn_up.weight",
+          "hc_attn_inject.weight",
+          "hc_ffn_norm.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+          "hc_ffn_inject.weight",
+          "ffn_gate_inp.weight", "ffn_gate_inp_shexp.weight",
+          "ffn_gate_shexp.weight", "ffn_up_shexp.weight",
+          "ffn_down_shexp.weight",
+          "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+          "nextn.hc_head_norm.weight", "nextn.hc_head_down.weight",
+          "nextn.hc_head_up.weight",
+      };
+      std::string missing;
+      for (const char *suffix : required) {
+        if (mf.tensors.find(p + suffix) == mf.tensors.end()) {
+          if (!missing.empty()) missing += ", ";
+          missing += suffix;
+        }
+      }
+      auto has_mtp = [&](const std::string &name) {
+        return mf.tensors.find(name) != mf.tensors.end();
+      };
+      if (!missing.empty() || !has_mtp(p + "ffn_gate_exps.weight") ||
+          !has_mtp(p + "ffn_up_exps.weight") ||
+          !has_mtp(p + "ffn_down_exps.weight")) {
+        if (missing.empty()) missing = "packed routed expert tensors";
+        else missing += ", packed routed expert tensors";
+        LOG_STREAM_WARN() << "[MTP] requested but Qwen4Exp NextN tensors are "
+                             "missing from mtp_model_path: " << missing
+                          << "; using ordinary generation\n";
+      } else {
+        mtp_active = true;
+        LOG_STREAM_INFO() << "[MTP] Qwen4Exp NextN validation passed: one "
+                             "extra full-attention+MoE block at layer "
+                          << mtp_layer << " (shared checkpoint: "
+                          << mf.resolved_file_path << ")\n";
       }
     }
   }
@@ -1615,7 +1700,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     }
   }
 
-  if (mtp_active) {
+  if (mtp_active && fam != ModelFamily::Qwen4Exp) {
     const int l = c.n_layers;
     const std::string p = "blk." + std::to_string(l) + ".";
     // The GLM reference MTP block reuses the target token embedding/output
@@ -1651,6 +1736,60 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       engine.layers_experts[l][e].slab_buffer = nullptr;
       engine.layers_experts[l][e].slab_capacity = 0;
     }
+  }
+
+  if (mtp_active && fam == ModelFamily::Qwen4Exp) {
+    // Qwen4Exp's shared MTP checkpoint is small and self-contained (32
+    // tensors, ~1.9 GB at Q4_K_M) by design -- resident-load ALL of it,
+    // including the packed routed-expert tensors, from the SEPARATE
+    // engine.mtp_model_file rather than routing layer 48 through the
+    // ordinary disk-streaming/RAM-VRAM LRU cache machinery that every
+    // other layer uses (that machinery is hardwired to engine.model_file
+    // throughout ram_manager.hpp/async_prefetcher.hpp/engine.hpp -- see
+    // this session's own investigation notes). qwen4exp_mtp_forward
+    // (execution_layer.cpp) reads the packed experts directly out of
+    // engine.resident_layers by name, slicing per-expert offsets with the
+    // SAME size_bytes/n_experts convention as packed_slab_geometry()
+    // (engine.hpp) -- verified against a real tensor dump (per-expert
+    // gate/up/down byte counts match the dense shexp sibling tensors'
+    // own byte counts exactly, confirming no inter-expert padding).
+    const int l = c.n_layers;
+    const std::string p = "blk." + std::to_string(l) + ".";
+    std::vector<std::string> qwen4exp_nextn_manifest = {
+        p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight",
+        p + "attn_output.weight", p + "attn_q_norm.weight",
+        p + "attn_k_norm.weight",
+        p + "hc_attn_norm.weight", p + "hc_attn_down.weight",
+        p + "hc_attn_up.weight", p + "hc_attn_inject.weight",
+        p + "hc_ffn_norm.weight", p + "hc_ffn_down.weight",
+        p + "hc_ffn_up.weight", p + "hc_ffn_inject.weight",
+        p + "ffn_gate_inp.weight", p + "ffn_gate_inp_shexp.weight",
+        p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight",
+        p + "ffn_down_shexp.weight",
+        p + "ffn_gate_exps.weight", p + "ffn_up_exps.weight",
+        p + "ffn_down_exps.weight",
+        p + "nextn.eh_proj.weight", p + "nextn.enorm.weight",
+        p + "nextn.hnorm.weight", p + "nextn.hc_head_norm.weight",
+        p + "nextn.hc_head_down.weight", p + "nextn.hc_head_up.weight",
+    };
+    // Optional per the reference (falls back to the base model's own
+    // token_embd.weight/output.weight -- both already resident from
+    // dense_preload_manifest below).
+    GGUFFile &mf = engine.mtp_model_file;
+    if (mf.tensors.find(p + "nextn.embed_tokens.weight") != mf.tensors.end())
+      qwen4exp_nextn_manifest.push_back(p + "nextn.embed_tokens.weight");
+    if (mf.tensors.find(p + "nextn.shared_head_head.weight") != mf.tensors.end())
+      qwen4exp_nextn_manifest.push_back(p + "nextn.shared_head_head.weight");
+    engine.initialize_resident_memory(qwen4exp_nextn_manifest, &engine.mtp_model_file);
+    // Not resized/used for streaming (no disk fetch ever targets layer
+    // c.n_layers for this family -- see qwen4exp_mtp_forward), but kept at
+    // size 1 rather than left default-constructed so any generic
+    // "iterate every layer in [0, cache_layers)" loop elsewhere still
+    // finds a valid (if unused) slot instead of an out-of-bounds access.
+    engine.layers_experts[l].resize(1);
+    engine.layers_experts[l][0].expert_id = -1;
+    engine.layers_experts[l][0].slab_buffer = nullptr;
+    engine.layers_experts[l][0].slab_capacity = 0;
   }
 
   if (fam == ModelFamily::GLM5NEXT && glm5next_dsa_layers > 0) {

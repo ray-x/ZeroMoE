@@ -59,6 +59,15 @@ struct EngineConfig {
   std::string model_path; // Primary model GGUF (experts + architecture)
   std::string
       dense_model_path; // Optional: separate GGUF for dense layers (e.g. 4-bit)
+  // Optional: a standalone "shared" MTP/NextN checkpoint (Qwen4Exp's own
+  // mtp-*-shared-*.gguf convention) -- carries ONLY the dedicated draft-
+  // block tensors (blk.<n_layers>.*: attention, MoE, HC, nextn.* bridge/
+  // head) and deliberately omits token_embd.weight/output.weight, which
+  // this engine instead reuses directly from the already-loaded base
+  // model (see StreamingEngine::mtp_model_file / has_mtp_model). Distinct
+  // from GLM5NEXT/GLM_DSA's own NextN tensors, which already live inside
+  // model_path itself and need no second file.
+  std::string mtp_model_path;
 
   // Generation parameters
   int context_size = 4096;   // Max context window (tokens)
@@ -322,6 +331,38 @@ struct EngineConfig {
   // failure. Independent of qwen4exp_gdn_gpu (that flag covers the
   // recurrent delta-rule step only, not this conv step).
   bool qwen4exp_gdn_conv_gpu = false;
+
+  // Qwen4Exp-only router pilot. The pilot projects the current layer's
+  // device-authoritative HC stream-0 snapshot through the next layer's gate
+  // and records the predicted expert set against the real next-layer route.
+  // This is deliberately separate from the conventional hidden->norm->gate
+  // pilot used by GLM/DeepSeek, whose inputs and routing semantics differ.
+  // Default off so every other model, and Qwen configs that do not opt in,
+  // retain their existing behavior.
+  bool qwen4exp_router_pilot = false;
+  int qwen4exp_router_pilot_k = 10;
+  // Optional next-layer prefetch from the Qwen pilot. When enabled, ranks
+  // that are already resident in RAM are copied into the next layer's
+  // temporary active-layer area with cudaMemcpyAsync; colder predictions are
+  // sent as ordinary disk/RAM hints. The active-layer copy is event-tracked
+  // and the target-layer dispatch waits on that exact expert if necessary.
+  bool qwen4exp_router_pilot_prefetch = false;
+  // Keep prediction/accuracy K independent from the number of experts loaded
+  // speculatively. 0 means use qwen4exp_router_pilot_k for compatibility.
+  int qwen4exp_router_pilot_prefetch_k = 0;
+  // Qwen layer indices for which estimation-based prefetch is disabled.
+  // Prediction and accuracy collection still run for these layers.
+  std::vector<int> qwen4exp_router_pilot_prefetch_exclude_layers;
+
+  // Qwen4Exp-only decode path: use the grouped GGML/CUDA MUL_MAT_ID routed
+  // FFN for S==1, collapsing the per-token/per-expert cache and dispatch
+  // loop into one graph submission per MoE layer. Separate from the older
+  // CPU-oriented moe_decode_batched experiment, which is not appropriate
+  // for Qwen IQ1_M. Default off for every model/config.
+  bool qwen4exp_decode_ggml_moe = false;
+  // Qwen4Exp-only grouped CPU fallback for explicitly selected
+  // cpu_affinity_layers. Other model families never consult this switch.
+  bool qwen4exp_cpu_ggml_moe = false;
 
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
@@ -1612,6 +1653,12 @@ struct EngineConfig {
   // recommended production setting.
   bool cpu_dot_ggml_avx2 = false;
 
+  // Qwen4Exp-only CPU expert fallback: use ggml's IQ1_M x Q8_K kernel
+  // (the same family used by BeeLlama) instead of row dequant + FP32 dot.
+  // Off by default so other model families and their existing CPU paths are
+  // unchanged; enable only after an end-to-end Qwen CPU-layer A/B.
+  bool cpu_dot_ggml_iq1m = false;
+
   // Group a prefill batch's tokens BY EXPERT before dispatch (one call per
   // expert over all its tokens) instead of one S=1 call per (token, expert).
   // This generic switch remains OFF by default because moe_forward_gguf is
@@ -1620,6 +1667,34 @@ struct EngineConfig {
   // loop. GLM5NEXT has a separate glm5next_moe_prefill_gpu opt-in so this
   // generic switch can stay off in the GLM profile.
   bool moe_prefill_batched = false;
+
+  // Decode-time (S==1) counterpart to moe_prefill_batched -- see
+  // dense_dispatch.hpp's own accessor for the full writeup and the real
+  // measured numbers. Routes every topk expert of a decode token straight
+  // to the existing CPU dequant-matmul path (dispatch_expert_k's own
+  // CPU-fallback branch, execution_layer.cpp), skipping the VRAM-cache
+  // find_expert/hold_for_compute/GPU-pool-issue machinery entirely for a
+  // genuinely RAM-resident expert.
+  //
+  // MUST STAY FALSE FOR QWEN3.8-FLASH-NEXT (qwen4exp) -- VERIFIED ON REAL
+  // HARDWARE, 2026-09-10: a real, reproducible ~41% DECODE REGRESSION
+  // (5.03/4.97 tok/s baseline vs 2.93 tok/s with this on), not a wash and
+  // not a win. That model's routed experts (UD-IQ1_M quant) already have
+  // a fast, working GPU kernel (480GPU/0CPU dispatch at baseline), so
+  // forcing CPU dequant-then-matmul instead is strictly worse for it. See
+  // memory: moe-decode-batched-regression.md. Only a plausible win when
+  // GPU dispatch was never going to be used anyway (a quant type with NO
+  // GPU kernel at all, or an all-`cpu_affinity_layers` config) -- do not
+  // enable for qwen4exp UD-IQ1_M, and do not assume this generalizes to
+  // any other model/quant without re-measuring first.
+  //
+  // Real trade-off even where it might help, not free: this also
+  // permanently skips expert_ffn_resolve_gpu_loc's own decode-time
+  // cold-miss VRAM promotion for every expert while enabled. Never
+  // engages for a vram_shadow block (no host bytes without a synchronous
+  // reload) -- falls through to the existing per-expert path unchanged
+  // for those. Default off.
+  bool moe_decode_batched = false;
 
   // Optional legacy stream path: read prefill expert weights from a whole-
   // shard mmap through a pinned, double-buffered GPU chunk instead of the RAM
@@ -1639,6 +1714,11 @@ struct EngineConfig {
   // include/ggml_moe_backend.hpp and dense_dispatch.hpp's own accessor.
   bool moe_ggml_mul_mat_id = false;
   bool moe_ggml_shared_expert = false;
+  // Use three direct planar H2D copies per expert instead of the packed
+  // H2D+device-unpack path. Qwen4Exp currently benefits from this on PCIe
+  // Gen3 because it removes an unpack kernel between small DMA operations;
+  // default false preserves other model families' behavior.
+  bool moe_ggml_planar_copies = false;
 
   // Qwen4Exp-only device router. Requires the GGML MoE path and HC GGML
   // handoff. The router consumes HC's device-resident [S,D] result and
@@ -2209,6 +2289,7 @@ inline bool EngineConfig::load(const std::string &path) {
 
   model_path = doc.root.get_str("model_path");
   dense_model_path = doc.root.get_str("dense_model_path");
+  mtp_model_path = doc.root.get_str("mtp_model_path");
   context_size = doc.root.get_int("context_size", context_size);
   max_new_tokens = doc.root.get_int("max_new_tokens", max_new_tokens);
   temperature = doc.root.get_float("temperature", temperature);
@@ -2366,6 +2447,42 @@ inline bool EngineConfig::load(const std::string &path) {
   qwen4exp_attn_gpu = doc.root.get_bool("qwen4exp_attn_gpu", qwen4exp_attn_gpu);
   qwen4exp_gdn_gpu = doc.root.get_bool("qwen4exp_gdn_gpu", qwen4exp_gdn_gpu);
   qwen4exp_gdn_conv_gpu = doc.root.get_bool("qwen4exp_gdn_conv_gpu", qwen4exp_gdn_conv_gpu);
+  qwen4exp_router_pilot =
+      doc.root.get_bool("qwen4exp_router_pilot", qwen4exp_router_pilot);
+  qwen4exp_router_pilot_k = (int)doc.root.get_int(
+      "qwen4exp_router_pilot_k", qwen4exp_router_pilot_k);
+  if (qwen4exp_router_pilot_k < 1) {
+    LOG_WARN("[CONFIG] qwen4exp_router_pilot_k=%d is invalid -- clamping to 1\n",
+             qwen4exp_router_pilot_k);
+    qwen4exp_router_pilot_k = 1;
+  } else if (qwen4exp_router_pilot_k > 16) {
+    LOG_WARN("[CONFIG] qwen4exp_router_pilot_k=%d exceeds the bounded Qwen "
+             "pilot capacity -- clamping to 16\n",
+             qwen4exp_router_pilot_k);
+    qwen4exp_router_pilot_k = 16;
+  }
+  qwen4exp_router_pilot_prefetch = doc.root.get_bool(
+      "qwen4exp_router_pilot_prefetch", qwen4exp_router_pilot_prefetch);
+  qwen4exp_router_pilot_prefetch_k = (int)doc.root.get_int(
+      "qwen4exp_router_pilot_prefetch_k",
+      qwen4exp_router_pilot_prefetch_k);
+  if (qwen4exp_router_pilot_prefetch_k < 0) {
+    LOG_WARN("[CONFIG] qwen4exp_router_pilot_prefetch_k=%d is invalid -- "
+             "clamping to 0 (use prediction K)\n",
+             qwen4exp_router_pilot_prefetch_k);
+    qwen4exp_router_pilot_prefetch_k = 0;
+  } else if (qwen4exp_router_pilot_prefetch_k > 16) {
+    LOG_WARN("[CONFIG] qwen4exp_router_pilot_prefetch_k=%d exceeds the bounded "
+             "Qwen pilot capacity -- clamping to 16\n",
+             qwen4exp_router_pilot_prefetch_k);
+    qwen4exp_router_pilot_prefetch_k = 16;
+  }
+  qwen4exp_router_pilot_prefetch_exclude_layers =
+      doc.root.get_int_array("qwen4exp_router_pilot_prefetch_exclude_layers");
+  qwen4exp_decode_ggml_moe =
+      doc.root.get_bool("qwen4exp_decode_ggml_moe", qwen4exp_decode_ggml_moe);
+  qwen4exp_cpu_ggml_moe =
+      doc.root.get_bool("qwen4exp_cpu_ggml_moe", qwen4exp_cpu_ggml_moe);
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
   mtp_enabled = doc.root.get_bool("mtp_enabled", mtp_enabled);
   mtp_draft_tokens = (int)doc.root.get_int("mtp_draft_tokens", mtp_draft_tokens);
@@ -2455,11 +2572,15 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
   dsv4_outproj_gpu = doc.root.get_bool("dsv4_outproj_gpu", dsv4_outproj_gpu);
   cpu_dot_ggml_avx2 = doc.root.get_bool("cpu_dot_ggml_avx2", cpu_dot_ggml_avx2);
+  cpu_dot_ggml_iq1m = doc.root.get_bool("cpu_dot_ggml_iq1m", cpu_dot_ggml_iq1m);
   moe_prefill_batched = doc.root.get_bool("moe_prefill_batched", moe_prefill_batched);
+  moe_decode_batched = doc.root.get_bool("moe_decode_batched", moe_decode_batched);
   moe_prefill_stream = doc.root.get_bool("moe_prefill_stream", moe_prefill_stream);
   moe_prefill_stream_chunk = (int)doc.root.get_int("moe_prefill_stream_chunk", moe_prefill_stream_chunk);
   moe_ggml_mul_mat_id = doc.root.get_bool("moe_ggml_mul_mat_id", moe_ggml_mul_mat_id);
   moe_ggml_shared_expert = doc.root.get_bool("moe_ggml_shared_expert", moe_ggml_shared_expert);
+  moe_ggml_planar_copies =
+      doc.root.get_bool("moe_ggml_planar_copies", moe_ggml_planar_copies);
   moe_ggml_gpu_router =
       doc.root.get_bool("moe_ggml_gpu_router", moe_ggml_gpu_router);
   ggml_async_graph_reuse =
@@ -2766,6 +2887,9 @@ inline void EngineConfig::print() const {
   LOG_STREAM_INFO() << "[CONFIG] Model: " << model_path << "\n";
   if (!dense_model_path.empty() && dense_model_path != model_path)
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";
+  if (!mtp_model_path.empty())
+    LOG_STREAM_INFO() << "[CONFIG] MTP model (shared draft-block checkpoint): "
+                      << mtp_model_path << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Context: " << context_size
                     << " tokens | Max gen: " << max_new_tokens << "\n";
   LOG_STREAM_INFO() << "[CONFIG] Temperature: " << temperature
@@ -3047,6 +3171,10 @@ inline void EngineConfig::print() const {
               : "existing FMA path")
       << "\n";
   LOG_STREAM_INFO()
+      << "[CONFIG] CPU-fallback dot (Qwen IQ1_M): "
+      << (cpu_dot_ggml_iq1m ? "ggml Q8_K AVX2/VNNI path" : "row dequant + FP32 path")
+      << "\n";
+  LOG_STREAM_INFO()
       << "[CONFIG] RAM->VRAM speculative promotion: "
       << (ram_vram_promote_top_k > 0
               ? ("static top-" + std::to_string(ram_vram_promote_top_k))
@@ -3243,6 +3371,9 @@ inline void EngineConfig::write_sample(const std::string &path) {
 
 model_path = "/models/GLM-5.2-UD-IQ2_M/"
 # dense_model_path = "/models/GLM-5.2-Q4_K/"  # optional: separate dense weights
+# mtp_model_path = "/models/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"  # optional: a
+#   standalone "shared" MTP/NextN checkpoint (Qwen4Exp convention) -- omits
+#   token_embd.weight/output.weight, which are reused from model_path.
 
 context_size   = 131072   # max context window (tokens)
 max_new_tokens = 4096

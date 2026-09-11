@@ -668,7 +668,7 @@ void mla_attention_absorbed_gguf(
     PERF_START(attn_norm);
     std::vector<float> normed((size_t)S * D);
     rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(), S, D, c.eps);
-    check_finite_attn("normed (post attn_norm rmsnorm)", layer_idx, normed.data(), (size_t)S * D);
+    check_finite_attn("normed (post attn_norm rmsnorm)", layer_idx, normed.data(), (size_t)S * D, D);
     PERF_END(attn_norm, t_attn_norm);
 
     // ---- 2. project Q: q_a -> q_a_norm -> q_b  =>  Q [S, H*qh] ----
@@ -696,7 +696,7 @@ void mla_attention_absorbed_gguf(
             apply_rope_yarn(q_rope, rope, pos, rope_theta, c);
         }
     }
-    check_finite_attn("Q (post RoPE)", layer_idx, Q.data(), Q.size());
+    check_finite_attn("Q (post RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
     PERF_END(attn_qproj, t_attn_qproj);
 
     // ---- 3. project KV (kv_a_mqa) and WRITE Lc / Rc ----
@@ -1133,13 +1133,13 @@ void mla_attention_absorbed_gguf(
     }  // !score_gpu_ok
 
     check_finite_attn("head_contexts (post absorbed attention loop)", layer_idx,
-                       head_contexts.data(), head_contexts.size());
+                       head_contexts.data(), head_contexts.size(), H * vh);
     PERF_END(attn_score, t_attn_score);
 
     // ---- 5. output projection (attn_output) via dense GPU dispatch ----
     PERF_START(attn_outproj);
     dense_proj(engine, p + "attn_output.weight", head_contexts.data(), out_context, S, H * vh, D);
-    check_finite_attn("out_context (post attn_output projection)", layer_idx, out_context, (size_t)S * D);
+    check_finite_attn("out_context (post attn_output projection)", layer_idx, out_context, (size_t)S * D, D);
     PERF_END(attn_outproj, t_attn_outproj);
 }
 
@@ -2055,7 +2055,7 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
     // This is deliberately attempted before the older split path and falls
     // back without changing its state if any registration, allocation or
     // graph execution precondition is unavailable.
-    if (S > 1 && gdn_full_ggml() &&
+    if (S > 0 && gdn_full_ggml() &&
         gdn_proj_ggml_usable(engine, D, conv_dim, value_dim, H_v) &&
         gdn_proj_ggml_register(engine, layer_idx, p, H_v) &&
         gdn_proj_ggml_register_conv(engine, layer_idx, p, conv_dim, d_conv) &&
@@ -2064,11 +2064,14 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
         const void *device_output = nullptr;
         bool full_ok = false;
         bool host_input_ready = true;
+        bool device_state_attempted = false;
         if (engine.qwen4exp_device_hc_input) {
             if (!force_gdn_full_host()) {
+                device_state_attempted = true;
                 full_ok = GgmlGdnProjRunner::instance().run_full_device_tensor(
                     layer_idx, engine.qwen4exp_device_hc_input, S, &device_output,
-                    conv_hist.data(), d_conv, recur_state.data(), c.eps);
+                    conv_hist.data(), d_conv, recur_state.data(), c.eps,
+                    /*device_state_resident=*/S == 1);
             }
             if (full_ok) {
                 engine.qwen4exp_device_attn_output = device_output;
@@ -2088,6 +2091,8 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
             }
         }
         if (!full_ok && host_input_ready) {
+            if (device_state_attempted)
+                GgmlGdnProjRunner::instance().sync_full_device_states_to_host();
             log_gdn_full_stats("input", layer_idx, hidden_states, S, D);
             if (force_gdn_full_host())
                 check_finite_attn("GDN full graph input", layer_idx,
@@ -2298,7 +2303,14 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
 //     (mrope sections degenerate to plain interleaved RoPE for text-only
 //     positions -- every section's position is the same token position)
 //   - sigmoid output gate on the attention result before attn_output
-static void qwen4exp_full_attention_gguf(StreamingEngine& engine, int layer_idx,
+// Exposed (not static) so qwen4exp_mtp_forward (execution_layer.cpp) can
+// reuse this exact math for the shared MTP checkpoint's own extra layer
+// (blk.<n_layers>.*, architecturally an ordinary full-attention layer --
+// verified against a real tensor dump: identical attn_q/k/v/output shapes
+// to a normal full-attention trunk layer). See attention_layer.hpp (or the
+// extern declaration at the qwen4exp_mtp_forward call site) for the
+// signature.
+void qwen4exp_full_attention_gguf(StreamingEngine& engine, int layer_idx,
                                          const float* hidden_states, int S,
                                          int pos_base, float* out_context) {
     PERF_SCOPE(t_attn);
@@ -2345,8 +2357,8 @@ static void qwen4exp_full_attention_gguf(StreamingEngine& engine, int layer_idx,
                             c.rope_freq_scale == 1.0f &&
                             c.rope_attn_factor == 1.0f &&
                             c.rope_yarn_log_mul == 0.0f;
-    if (qwen4exp_device_qkv_enabled() && device_hidden && engine.gpu &&
-        S > 1 && pos_base == 0 && plain_rope) {
+    if (qwen4exp_device_qkv_enabled() && engine.qwen4exp_attn_gpu &&
+        device_hidden && engine.gpu && S > 0 && plain_rope) {
         auto q_it = engine.resident_layers.find(p + "attn_q.weight");
         auto k_it = engine.resident_layers.find(p + "attn_k.weight");
         auto v_it = engine.resident_layers.find(p + "attn_v.weight");
@@ -2446,28 +2458,19 @@ static void qwen4exp_full_attention_gguf(StreamingEngine& engine, int layer_idx,
                                       0.0f, 1.0f, 1.0f, 0.0f, 0);
             }
         }
-    } else {
-        // The host cache is still the compatibility store used by decode and
-        // by the CPU fallback paths.  This small K/V copy is kept, while the
-        // large Q and gate arrays never cross the PCIe boundary.
-        const size_t kv_bytes = (size_t)S * Hkv * hd * sizeof(float);
-        if (cudaMemcpy(K.data(), device_K, kv_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
-            cudaMemcpy(V.data(), device_V, kv_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-            LOG_ERROR("[QWEN4EXP-ATTN] device QKV cache copy failed at layer=%d\n", layer_idx);
-            std::memset(out_context, 0, (size_t)S * D * sizeof(float));
-            return;
-        }
     }
 
     // ---- 3. write K/V into the dense cache ----
     const int kvd = Hkv * hd;
-    for (int s = 0; s < S; ++s) {
-        int pos = pos_base + s;
-        if (pos >= engine.max_t) continue; // bounds check, mirrors dense path
-        std::memcpy(engine.Kc[layer_idx] + (size_t)pos * kvd, K.data() + (size_t)s * kvd,
-                    (size_t)kvd * sizeof(float));
-        std::memcpy(engine.Vc[layer_idx] + (size_t)pos * kvd, V.data() + (size_t)s * kvd,
-                    (size_t)kvd * sizeof(float));
+    if (!device_qkv) {
+        for (int s = 0; s < S; ++s) {
+            int pos = pos_base + s;
+            if (pos >= engine.max_t) continue; // bounds check, mirrors dense path
+            std::memcpy(engine.Kc[layer_idx] + (size_t)pos * kvd, K.data() + (size_t)s * kvd,
+                        (size_t)kvd * sizeof(float));
+            std::memcpy(engine.Vc[layer_idx] + (size_t)pos * kvd, V.data() + (size_t)s * kvd,
+                        (size_t)kvd * sizeof(float));
+        }
     }
 
     // ---- 4. causal GQA attention (dense; QSA top-k deferred) ----
@@ -2492,9 +2495,9 @@ static void qwen4exp_full_attention_gguf(StreamingEngine& engine, int layer_idx,
             // With device-live HC, retain the result in the CUDA attention
             // buffer so HC post-combine can consume it without a D2H copy.
             if (device_qkv) {
-                attn_done_gpu = engine.gpu->qwen4exp_attn_gpu_device_inputs(
-                    device_Q, device_K, device_V, S, T, H, Hkv, hd,
-                    pos_base, kq_scale, &attn_device_output);
+                attn_done_gpu = engine.gpu->qwen4exp_attn_gpu_device_cached(
+                    layer_idx, device_Q, device_K, device_V, S, T, H, Hkv, hd,
+                    pos_base, engine.max_t, kq_scale, &attn_device_output);
             } else if (qwen4exp_hc_device_live()) {
                 attn_done_gpu = engine.gpu->qwen4exp_attn_gpu_device(
                     Q.data(), engine.Kc[layer_idx], engine.Vc[layer_idx],
@@ -2552,10 +2555,37 @@ static void qwen4exp_full_attention_gguf(StreamingEngine& engine, int layer_idx,
                     cudaMemcpy(gate.data(), device_gate, q_bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
                     attn_done_gpu = false;
             }
+            attn_done_gpu = false;
         }
     }
 
     if (!attn_done_gpu) {
+    if (device_qkv) {
+        int host_T = pos_base + S;
+        if (host_T > engine.max_t) host_T = engine.max_t;
+        bool host_kv_ok = host_T > 0 &&
+            engine.gpu->qwen4exp_attn_gpu_device_kv_to_host(
+                layer_idx, engine.Kc[layer_idx], engine.Vc[layer_idx],
+                host_T, Hkv, hd);
+        if (!host_kv_ok) {
+            // The cache should exist whenever a preceding device decode
+            // succeeded.  Preserve a correct first-call fallback if a cache
+            // allocation or CUDA copy failed before it became available.
+            const size_t current_bytes = (size_t)S * kvd * sizeof(float);
+            host_kv_ok = cudaMemcpy(
+                engine.Kc[layer_idx] + (size_t)pos_base * kvd, device_K,
+                current_bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
+                cudaMemcpy(
+                engine.Vc[layer_idx] + (size_t)pos_base * kvd, device_V,
+                current_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        if (!host_kv_ok) {
+            LOG_ERROR("[QWEN4EXP-ATTN] device KV recovery failed at layer=%d\n",
+                      layer_idx);
+            std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+            return;
+        }
+    }
     if (device_qkv) {
         const size_t q_bytes = (size_t)S * H * hd * sizeof(float);
         if (cudaMemcpy(Q.data(), device_Q, q_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||

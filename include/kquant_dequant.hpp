@@ -631,6 +631,15 @@ inline bool& cpu_dot_ggml_avx2_flag() {
 inline bool cpu_dot_ggml_avx2_enabled() { return cpu_dot_ggml_avx2_flag(); }
 inline void enable_cpu_dot_ggml_avx2() { cpu_dot_ggml_avx2_flag() = true; }
 
+// Qwen4Exp-only CPU path.  It mirrors BeeLlama's ggml IQ1_M x Q8_K route
+// and is deliberately independent of the GLM IQ2/IQ3 AVX2 experiment above.
+inline bool& cpu_dot_ggml_iq1m_flag() {
+    static bool v = false;
+    return v;
+}
+inline bool cpu_dot_ggml_iq1m_enabled() { return cpu_dot_ggml_iq1m_flag(); }
+inline void enable_cpu_dot_ggml_iq1m() { cpu_dot_ggml_iq1m_flag() = true; }
+
 // CPU reference quantized matmul: y[S,O] = x[S,I] @ W^T, W packed [O,I].
 // Dequantizes each weight row on the fly and dots. Correct for every type
 // dequant_row handles; rows of unsupported types are zeroed (returns false).
@@ -663,6 +672,18 @@ inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
         auto t1 = std::chrono::high_resolution_clock::now();
         PerfCounters::atomic_add(perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
         return true;
+    }
+
+    if (type == GGUFType::IQ1_M && cpu_dot_ggml_iq1m_enabled()) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        if (matmul_iq1_m_ggml_q8k(y, x, W, S, I, O)) {
+            auto t1 = std::chrono::high_resolution_clock::now();
+            PerfCounters::atomic_add(perf().t_cpu_dot,
+                                     std::chrono::duration<double>(t1 - t0).count());
+            return true;
+        }
+        // Invalid shape or a non-ggml build: preserve the existing
+        // correctness fallback below rather than returning partial output.
     }
 
     if (type == GGUFType::Q5_K) {

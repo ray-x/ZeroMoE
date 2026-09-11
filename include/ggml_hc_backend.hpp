@@ -202,6 +202,7 @@ class GgmlHcRunner {
   void *post_ctx_ = nullptr;    // ggml_context*
   void *post_graph_ = nullptr;  // ggml_cgraph*
   void *post_input_ = nullptr;  // ggml_tensor* [D,S]
+  void *post_source_view_ = nullptr; // ggml_tensor* [D,S], retargeted per producer
   int post_graph_S_ = 0;
   int s_cap_ = 0;
   int inject_valid_S_ = 0;

@@ -332,6 +332,16 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     engine.qwen4exp_attn_gpu = config.qwen4exp_attn_gpu;
     engine.qwen4exp_gdn_gpu = config.qwen4exp_gdn_gpu;
     engine.qwen4exp_gdn_conv_gpu = config.qwen4exp_gdn_conv_gpu;
+    engine.qwen4exp_router_pilot = config.qwen4exp_router_pilot;
+    engine.qwen4exp_router_pilot_k = config.qwen4exp_router_pilot_k;
+    engine.qwen4exp_router_pilot_prefetch =
+        config.qwen4exp_router_pilot_prefetch;
+    engine.qwen4exp_router_pilot_prefetch_k =
+        config.qwen4exp_router_pilot_prefetch_k;
+    engine.qwen4exp_router_pilot_prefetch_exclude_layers =
+        config.qwen4exp_router_pilot_prefetch_exclude_layers;
+    engine.qwen4exp_decode_ggml_moe = config.qwen4exp_decode_ggml_moe;
+    engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
     engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
     engine.glm5next_router_gpu = config.glm5next_router_gpu;
     engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
@@ -454,6 +464,19 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         }
         engine.has_dense_model = true;
         if (config.direct_io) engine.dense_model_file.enable_direct_io();
+    }
+
+    // Optional standalone "shared" MTP/NextN checkpoint (Qwen4Exp convention
+    // -- see EngineConfig::mtp_model_path's own comment). Loaded BEFORE
+    // build_model_graph below so graph_initializer.cpp's own MTP validation
+    // can see engine.has_mtp_model/mtp_model_file when deciding whether
+    // Qwen4Exp MTP is actually available for this run.
+    if (!config.mtp_model_path.empty()) {
+        if (!engine.mtp_model_file.load_header(config.mtp_model_path)) {
+            return std::unexpected("Failed to parse MTP GGUF (mtp_model_path)");
+        }
+        engine.has_mtp_model = true;
+        if (config.direct_io) engine.mtp_model_file.enable_direct_io();
     }
 
     const std::string& gguf_path = engine.model_file.resolved_file_path;
@@ -669,44 +692,144 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                               << "disabling zero-repack stride adjustment\n";
         }
     }
-    // GLM NextN/MTP and the target-only full graph cannot share this startup
-    // path: the full graph owns a separate target expert arena and does not
-    // contain the optional NextN block.  Let an explicit MTP request win over
-    // a stale MOESTREAM_GLM5NEXT_FULL_GRAPH=1 inherited from another test
-    // session.  Other families retain their existing graph selection.
-    const bool glm5next_mtp_uses_legacy_path =
-        engine.mtp_enabled && engine.family_ops.family == ModelFamily::GLM5NEXT;
+    // GLM NextN/MTP's own target-verification pass (MtpSpeculator::
+    // target_forward, mtp_speculative.cpp) always calls layers_forward_gguf
+    // directly and never the full graph -- that call site's own comment
+    // already anticipates "a full-graph fast path already produced final
+    // output" as a real (if previously unreachable) case and guards it
+    // explicitly. The full graph itself still does not build the optional
+    // NextN draft block, so MTP's draft/verification loop continues to run
+    // entirely on the legacy path regardless of this flag; only the MAIN
+    // generation loop's own prefill is affected.
+    //
+    // This used to unconditionally disable the full graph whenever MTP was
+    // enabled. That was a real, warranted precaution at the time: the full
+    // graph's prefill-to-decode handoff (KDA/GDN recurrent state, conv
+    // history) had a silent state-transposition bug (ggml-cuda's
+    // gated_delta_net stores state [k-fast,v-slow]; this codebase's own
+    // legacy CPU delta step expects [k-slow,v-fast] -- see build_kda's own
+    // comment, ggml_glm5next_graph.cpp) that corrupted every decode token
+    // after a full-graph prefill. Running MTP -- which depends on an
+    // accurate continuing state to draft against -- on top of that would
+    // have made an already-hard-to-diagnose bug even harder to isolate. Now
+    // that the transposition is fixed (ggml_cont(ggml_transpose(...)) before
+    // the state is copied out), there is no longer a known correctness
+    // reason to keep the two mutually exclusive.
     const bool graph_mode =
         (qwen4exp_full_graph_enabled() &&
          engine.family_ops.family == ModelFamily::Qwen4Exp) ||
         (glm5next_full_graph_enabled() &&
-         engine.family_ops.family == ModelFamily::GLM5NEXT &&
-         !glm5next_mtp_uses_legacy_path) ||
+         engine.family_ops.family == ModelFamily::GLM5NEXT) ||
         (deepseek_v4_full_graph_enabled() &&
          engine.family_ops.family == ModelFamily::DeepSeek_V4);
     const bool graph_ram_cache = graph_mode &&
         std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr;
-    if (glm5next_mtp_uses_legacy_path && glm5next_full_graph_enabled()) {
+    if (engine.mtp_enabled && engine.family_ops.family == ModelFamily::GLM5NEXT &&
+        glm5next_full_graph_enabled()) {
         LOG_STREAM_INFO()
-            << "[MTP] GLM NextN/MTP is enabled; bypassing the target-only "
-               "GLM full graph so the NextN block can be loaded and executed.\n";
+            << "[MTP] GLM NextN/MTP is enabled alongside the GLM full graph: "
+               "the main generation loop's prefill uses the full graph, "
+               "MTP's own draft/verification pass continues to run entirely "
+               "on the legacy path (see mtp_speculative.cpp's target_forward, "
+               "which never calls the full graph).\n";
     }
-    if (graph_mode && !graph_ram_cache) {
-      // The full GGML graph owns its selected expert tensors in a separate
-      // CUDA arena. The legacy cache is not referenced by that graph;
-      // retaining it would consume the VRAM needed by graph-owned weights and
-      // duplicate cache bookkeeping. This applies even when zero routed
-      // layers are preloaded: host-backed MUL_MAT_ID remains the graph's
-      // selective-copy source in that case.
-      LOG_STREAM_INFO() << "[GPU] Legacy expert cache skipped: full GGML graph "
-                          << "device residency is enabled\n";
-    } else if (!graph_mode) {
+    if (!graph_mode) {
         gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, config,
                                expert_layer_slab_bytes);
     } else {
+        // 2026-09-09: two real, measured incidents, both from this same
+        // decision point.
+        //
+        // Incident A (why this can never be "skip the cache entirely"): the
+        // full graph ONLY ever handles S>1, pos_base==0 prefill (see
+        // execution_layer.cpp's layers_forward_gguf -- decode, S==1, always
+        // falls through to the legacy per-token loop below, unconditionally,
+        // for every one of these three families). So a real decode-time GPU
+        // expert cache is not optional insurance for "the graph declined" --
+        // it's needed on EVERY graph_mode run, every single decode step, by
+        // construction. The old code skipped the legacy cache completely
+        // whenever MOESTREAM_FULL_GRAPH_USE_RAM_CACHE was unset, which for
+        // qwen4exp/deepseek_v4 (neither of which implement the RAM-arena
+        // dedup that env var was designed to gate -- that's GLM5NEXT-only)
+        // meant EVERY graph_mode run had zero decode-time GPU cache. Measured
+        // on real hardware: decode collapsed to 0.13 tok/s, expert_calls=
+        // 0GPU/8160CPU, "CPU fallback cause: 8160 upload-failed" -- there was
+        // no cache slot to upload into at all.
+        //
+        // Incident B (why the fallback size can't just be a flat 4GB either):
+        // setting MOESTREAM_FULL_GRAPH_USE_RAM_CACHE (the old workaround for
+        // Incident A) reinstated a flat 4GB fallback cache regardless of how
+        // much VRAM the graph's own device-resident expert arena
+        // (device_expert_layers) already committed. At device_expert_layers=
+        // 20 on a 24GB card (16.11 GiB device expert arena + 2.92 GiB dense
+        // graph arena), the extra flat 4GB starved the graph's own later
+        // ggml_gallocr_reserve() call of its last ~1.8GB, which ggml does not
+        // handle gracefully -- it aborted the whole process (SIGSEGV).
+        //
+        // Fix: always stand up a real fallback cache (never the "skip
+        // entirely" branch), but size it against REAL current free VRAM on
+        // the device the graph will use, minus this family's own
+        // device_expert_layers estimate (same expert_slab_bytes/n_experts
+        // this cache itself is sized from) and a flat reserve for the
+        // graph's dense arena + compute workspace (measured 2.92+1.80 GiB
+        // above; kept generous since neither scales down with
+        // device_expert_layers). Capped at the original 4GB ceiling, floored
+        // at 0 (never negative) -- a 0-sized cache still means every decode
+        // step pays the CPU-fallback cost, but at least never crashes the
+        // process fighting the graph for the same VRAM.
+        constexpr double kGraphRamCacheFallbackVramGb = 4.0;
+        constexpr double kGraphOverheadReserveGb = 6.0;
+        constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+
+        int dev_layers = 0;
+        if (engine.family_ops.family == ModelFamily::Qwen4Exp)
+            dev_layers = qwen4exp_full_graph_device_expert_layers();
+        else if (engine.family_ops.family == ModelFamily::GLM5NEXT)
+            dev_layers = glm5next_full_graph_device_expert_layers();
+        else if (engine.family_ops.family == ModelFamily::DeepSeek_V4)
+            dev_layers = deepseek_v4_full_graph_device_expert_layers();
+
+        double est_device_expert_gb = 0.0;
+        if (dev_layers > 0 && expert_slab_bytes > 0)
+            est_device_expert_gb = (double)expert_slab_bytes *
+                                    (double)cfg.n_experts *
+                                    (double)dev_layers / kBytesPerGb;
+
+        // Ground-truth free VRAM right now, same GPU setup_expert_cache is
+        // about to target. Single-GPU-vault configs only (the graphs'
+        // current real deployment target) -- core_free_vram_bytes() reads
+        // the "core" device, which is also the vault/graph device in every
+        // config these families ship with today.
+        const double free_gb = (double)gpu.core_free_vram_bytes() / kBytesPerGb;
+        const double headroom_gb =
+            free_gb - est_device_expert_gb - kGraphOverheadReserveGb;
+        const double fallback_gb =
+            std::clamp(headroom_gb, 0.0, kGraphRamCacheFallbackVramGb);
+
+        EngineConfig fallback_config = config;
+        for (auto& gc : fallback_config.gpus) {
+            if (gc.moe_cache_gb > fallback_gb)
+                gc.moe_cache_gb = fallback_gb;
+        }
         LOG_STREAM_INFO()
-            << "[GPU] Legacy VRAM expert cache skipped: full graph is using "
-               "the graph-compatible RAM cache\n";
+            << "[GPU] Legacy VRAM expert cache: reduced to <=" << fallback_gb
+            << " GB/GPU as a decode-time fallback (full graph only ever "
+               "covers S>1 prefill -- every graph_mode decode step needs this "
+               "cache; sized from free=" << free_gb << " GiB - device_expert_"
+               "layers(" << dev_layers << ")~=" << est_device_expert_gb
+            << " GiB - " << kGraphOverheadReserveGb
+            << " GiB graph overhead reserve, capped at "
+            << kGraphRamCacheFallbackVramGb << " GiB -- see this call site's "
+               "own comment for the two real incidents this guards against)\n";
+        if (fallback_gb <= 0.0) {
+            LOG_WARN("[GPU] Decode-time expert cache is 0 GB -- device_expert_layers=%d "
+                     "leaves no VRAM headroom after the %.1f GiB overhead reserve; every "
+                     "decode step will pay the CPU-fallback dispatch cost. Lower "
+                     "device_expert_layers if decode throughput matters for this run.\n",
+                     dev_layers, kGraphOverheadReserveGb);
+        }
+        gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, fallback_config,
+                               expert_layer_slab_bytes);
     }
     gpu.report_vram_usage("after expert cache setup");
 
@@ -1803,6 +1926,25 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 config.pin_ram_fraction * ram_mgr.slots_per_layer));
             bool prefix_vram = config.vram_preload_prefix_layers > 0;
 
+            // Compact VRAM has a separate, non-interchangeable slot region
+            // for each layer. A prefix request is expressed as a GLOBAL
+            // budget, but planning it from that budget alone can ask for
+            // every expert in a layer even when that layer's physical region
+            // is much smaller. The old loop then read those excess slabs from
+            // disk and emitted one "no victim" error per rejected upload.
+            // Use the already-built physical slot map to cap each requested
+            // layer before the preload loop starts. This applies to prefix
+            // placement AND global_topn: the latter used to rank globally
+            // without knowing that compact VRAM has independent per-layer
+            // regions, so a hot layer could consume more than its region and
+            // lose the excess as a no-victim upload rejection.
+            std::unordered_map<int, int> compact_layer_capacity;
+            if (ram_mgr.vram_cache->expert_compact_layout) {
+                for (const auto &loc : ram_mgr.vram_cache->expert_vram_cache) {
+                    if (loc.pool_layer >= 0) ++compact_layer_capacity[loc.pool_layer];
+                }
+            }
+
             // The graph/RAM experiment deliberately has no legacy VRAM
             // expert pool. Do not let the ordinary pin ranking attempt GPU
             // uploads merely because the config still contains its normal
@@ -1849,8 +1991,14 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 for (int layer = 0; layer < prefix_end; ++layer) {
                     auto it = by_layer.find(layer);
                     if (it == by_layer.end()) continue;
+                    int layer_capacity = (int)it->second.size();
+                    if (!compact_layer_capacity.empty()) {
+                        auto cap_it = compact_layer_capacity.find(layer);
+                        layer_capacity = cap_it == compact_layer_capacity.end()
+                            ? 0 : std::min(layer_capacity, cap_it->second);
+                    }
                     const int take = std::min(
-                        (int)it->second.size(),
+                        layer_capacity,
                         std::max(0, effective_cap - assigned));
                     layer_pin_count[layer] = take;
                     assigned += take;
@@ -1866,6 +2014,12 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 int floor_total = 0;
                 for (auto& [layer, v] : by_layer) {
                     int f = std::min(floor_n, (int)v.size());
+                    if (!compact_layer_capacity.empty()) {
+                        auto cap_it = compact_layer_capacity.find(layer);
+                        f = cap_it == compact_layer_capacity.end()
+                                ? 0
+                                : std::min(f, cap_it->second);
+                    }
                     layer_pin_count[layer] = f;
                     floor_total += f;
                 }
@@ -1899,8 +2053,21 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     ? max_pinned_total
                     : (int)(avg_vram_slots_per_layer * moe_layers);
                 int remaining_budget = std::max(0, effective_cap - floor_total);
-                int take = std::min((int)remainder.size(), remaining_budget);
-                for (int i = 0; i < take; ++i) layer_pin_count[remainder[i].layer]++;
+                int take = 0;
+                for (const GlobalCand &candidate : remainder) {
+                    if (take >= remaining_budget) break;
+                    int layer_cap = std::numeric_limits<int>::max();
+                    if (!compact_layer_capacity.empty()) {
+                        auto cap_it = compact_layer_capacity.find(candidate.layer);
+                        layer_cap = cap_it == compact_layer_capacity.end()
+                                         ? 0
+                                         : cap_it->second;
+                    }
+                    int &assigned = layer_pin_count[candidate.layer];
+                    if (assigned >= layer_cap) continue;
+                    ++assigned;
+                    ++take;
+                }
                 LOG_STREAM_INFO() << "[PIN] global_topn: floor " << floor_n << "/layer (" << floor_total
                           << " total) + " << take << " globally-ranked -> " << (floor_total + take)
                           << "/" << effective_cap
@@ -2312,7 +2479,36 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         }
                     }
                 }
-                int ram_start_i = tier2_start + layer_vram_lru_n;
+                // 2026-09-10: was `tier2_start + layer_vram_lru_n` -- RAM
+                // tier's own preload started AFTER however many ranks VRAM's
+                // pinned + LRU-prewarm tiers already consumed from this
+                // SAME layer's ranked list, i.e. RAM and VRAM tiers were
+                // treated as necessarily DISJOINT. Real, measured, TWICE-
+                // confirmed incident: raising VRAM's own per-layer share
+                // (pin_vram_lru_fraction=1.0, then separately
+                // vram_preload_prefix_layers=15 with a raised
+                // pinned_vram_capacity) both starved RAM tier for the exact
+                // layers VRAM took the most from -- one run lost 9984 RAM
+                // preloads (24528->14544, cache 100%->78%, real disk I/O
+                // reappeared), a later one lost 7632 (24528->16896, cache
+                // 100%->74%, 3.12 GB of real NVMe reads, prefill 74.18->
+                // 22.53 tok/s, a 3.3x regression) purely from this.
+                // Root cause: MoEStream's own RAM and VRAM tiers serve
+                // mostly DIFFERENT consumers here (this session's own
+                // investigation found qwen4exp's prefill dispatch path
+                // sources almost everything from the RAM tier via
+                // ram_direct/ram_staged and only checks VRAM residency via
+                // a narrow per-expert D2D lookup -- see execution_layer.cpp
+                // around GgmlMoeRunner::copy_expert_d2d) -- an expert being
+                // VRAM-resident is not a reason to deny it a RAM-tier copy
+                // too, and RAM has vastly more headroom (100 GB here vs
+                // 17 GB of VRAM) to just hold both. cpu_affinity_layers
+                // already special-cased exactly this (tier2_start forced
+                // to 0 for those layers specifically, see this loop's own
+                // comment above) -- this generalizes that same, already-
+                // proven-safe pattern to every layer, unconditionally,
+                // instead of only the cpu_affinity case.
+                int ram_start_i = 0;
                 int ram_count = std::min(std::max(0, n - ram_start_i), ram_cap);
                 for (int off = 0; off < ram_count; ) {
                     int chunk_n = std::min(PRELOAD_URING_CHUNK, ram_count - off);
@@ -2848,6 +3044,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     report_named_timers();  // attn_q_a/attn_q_b/attn_kv_a_mqa fast-path investigation, see CLAUDE.md
     report_layer_miss_stats();  // [LAYER-MISS]: per-layer decode-time real disk-fetch misses -- see CLAUDE.md CPU-offload data-gathering entry
     report_pilot_recall_by_layer();  // [PILOT-BY-LAYER]: per-layer DEPTH-1/ATTN-PILOT/DEPTH-2 prediction accuracy -- see CLAUDE.md per-layer prediction accuracy entry
+    report_qwen4exp_pilot_stats();  // [QWEN-PILOT]: Qwen HC-proxy prediction accuracy and load coverage
     report_moe_bucket_stats();  // [MOE-BUCKET]: real token-sharing rate for MoE expert dispatch -- the llama.cpp -ub/mul_mat_id batching investigation
     report_prefill_lookahead_stats();  // [PREFILL-LOOKAHEAD]: prefill_dispatch_lookahead_tokens real added/skipped counts
     report_pilot_wide_stats();
@@ -3039,12 +3236,15 @@ int main(int argc, char* argv[]) {
     if (config.dsv4_outproj_gpu) enable_dsv4_outproj_gpu();
     if (config.dsv4_score_gpu) enable_dsv4_score_gpu();
     if (config.cpu_dot_ggml_avx2) enable_cpu_dot_ggml_avx2();
+    if (config.cpu_dot_ggml_iq1m) enable_cpu_dot_ggml_iq1m();
     set_moe_prefill_batched(config.moe_prefill_batched);
+    set_moe_decode_batched(config.moe_decode_batched);
     set_moe_prefill_stream(config.moe_prefill_stream);
     set_moe_prefill_stream_chunk(config.moe_prefill_stream_chunk);
     set_moe_expert_bf16_gemm(config.moe_expert_bf16_gemm);
     set_moe_ggml_mul_mat_id(config.moe_ggml_mul_mat_id);
     set_moe_ggml_shared_expert(config.moe_ggml_shared_expert);
+    set_moe_ggml_planar_copies(config.moe_ggml_planar_copies);
     set_moe_ggml_gpu_router(config.moe_ggml_gpu_router);
     set_moe_ggml_device(config.moe_ggml_device);
     set_ggml_hc_async_graph_reuse(config.ggml_async_graph_reuse);
@@ -3077,12 +3277,60 @@ int main(int argc, char* argv[]) {
     LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML device router: "
                       << (config.moe_ggml_gpu_router ? "ON" : "off")
                       << " (GPU top-k; returns IDs/weights only)\n";
+    std::string qwen_prefetch_excluded = "none";
+    if (!config.qwen4exp_router_pilot_prefetch_exclude_layers.empty()) {
+        qwen_prefetch_excluded = "[";
+        for (size_t i = 0;
+             i < config.qwen4exp_router_pilot_prefetch_exclude_layers.size();
+             ++i) {
+            if (i > 0) qwen_prefetch_excluded += ",";
+            qwen_prefetch_excluded += std::to_string(
+                config.qwen4exp_router_pilot_prefetch_exclude_layers[i]);
+        }
+        qwen_prefetch_excluded += "]";
+    }
+    LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp router pilot: "
+                      << (config.qwen4exp_router_pilot ? "ON" : "off")
+                      << " (HC stream-0 proxy, top-"
+                      << config.qwen4exp_router_pilot_k
+                      << ", prefetch top-"
+                      << (config.qwen4exp_router_pilot_prefetch_k > 0
+                              ? config.qwen4exp_router_pilot_prefetch_k
+                              : config.qwen4exp_router_pilot_k)
+                      << ", active-layer async prefetch "
+                      << (config.qwen4exp_router_pilot_prefetch ? "ON" : "off")
+                      << ", excluded layers=" << qwen_prefetch_excluded
+                      << ")\n";
     LOG_STREAM_INFO() << "[CONFIG] GGML async graph workspace reuse: "
                       << (config.ggml_async_graph_reuse ? "ON" : "off")
                       << " (shared backend stream ordering)\n";
     LOG_STREAM_INFO() << "[CONFIG] MoE prefill token-batching (group tokens by expert): "
                       << (config.moe_prefill_batched ? "ON" : "off")
                       << " -- shared path, see dense_dispatch.hpp's blast-radius note\n";
+    LOG_STREAM_INFO() << "[CONFIG] MoE decode batched dispatch (skip VRAM-cache "
+                         "lock/residency machinery, CPU-direct for RAM-resident experts): "
+                      << (config.moe_decode_batched ? "ON" : "off")
+                      << " -- see dense_dispatch.hpp's own accessor for the real "
+                         "measured numbers\n";
+    // VERIFIED regression on real hardware (dense_dispatch.hpp's own
+    // moe_decode_batched() comment / memory: moe-decode-batched-
+    // regression.md): 5.03/4.97 tok/s baseline decode -> 2.93 tok/s with
+    // this on for qwen4exp (Qwen3.8-Flash-Next, UD-IQ1_M), ~41% SLOWER,
+    // because that model's routed experts already have a fast GPU kernel
+    // and forcing CPU dequant instead is strictly worse. `engine` isn't
+    // constructed yet at this point in main() (this block only has
+    // `config`), so this can't be gated on model family the way the
+    // header comments are -- warns unconditionally whenever the flag is
+    // on. Loud, not just a comment, so a config drift or copy-paste from
+    // another model's tuning doesn't silently reintroduce this.
+    if (config.moe_decode_batched) {
+      LOG_WARN("[CONFIG] moe_decode_batched=true -- VERIFIED ~41%% DECODE "
+               "REGRESSION on qwen4exp/qwen3.8-flash-next UD-IQ1_M (5.0 -> "
+               "2.9 tok/s), not a win. Only a plausible win when the routed "
+               "experts have NO GPU kernel at all -- most checkpoints' quant "
+               "types ARE GPU-capable. Re-measure before trusting this on "
+               "for any model/quant combination.\n");
+    }
     LOG_STREAM_INFO() << "[CONFIG] GLM5NEXT grouped GPU prefill: "
                       << (config.glm5next_moe_prefill_gpu ? "ON" : "off")
                       << " (GLM5NEXT only; host-validated routing, grouped GPU FFN)\n";

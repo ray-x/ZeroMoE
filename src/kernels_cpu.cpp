@@ -1,5 +1,6 @@
 #include "kernels_cpu.hpp"
 #include "logger.hpp"
+#include "perf_timer.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -12,6 +13,33 @@
 #endif
 #include <cstdint>
 #include <vector>
+#if defined(MOESTREAM_USE_GGML)
+// Keep these two ggml-internal declarations local instead of including
+// ggml-common.h: that header defines QK_K/QK8_0 macros and block_q*_0 types
+// which intentionally have different compatibility structs in kernels_cpu.hpp.
+struct moestream_ggml_block_q8_K {
+  float d;
+  int8_t qs[256];
+  int16_t bsums[16];
+};
+struct moestream_ggml_block_iq1_m {
+  uint8_t qs[32];
+  uint8_t qh[16];
+  uint8_t scales[8];
+};
+static_assert(sizeof(moestream_ggml_block_q8_K) == 292);
+static_assert(sizeof(moestream_ggml_block_iq1_m) == 56);
+extern "C" void quantize_row_q8_K(const float *, void *, int64_t);
+extern "C" void ggml_vec_dot_iq1_m_q8_K(int, float *, size_t, const void *,
+                                          size_t, const void *, size_t, int);
+extern "C" void ggml_vec_dot_iq2_xxs_q8_K(int, float *, size_t, const void *,
+                                            size_t, const void *, size_t, int);
+extern "C" void ggml_vec_dot_iq3_xxs_q8_K(int, float *, size_t, const void *,
+                                            size_t, const void *, size_t, int);
+extern "C" void quantize_row_q8_0(const float *, void *, int64_t);
+extern "C" void ggml_vec_dot_iq4_nl_q8_0(int, float *, size_t, const void *,
+                                           size_t, const void *, size_t, int);
+#endif
 
 // Thread-safe "log this exactly once" -- cpu_quant_matmul's OMP parallel
 // region can call dequant_row from many threads concurrently, so a plain
@@ -1919,6 +1947,129 @@ void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
 }
 // ============================================================
 
+// BeeLlama/ggml's Qwen CPU route uses IQ1_M weights against one Q8_K-
+// quantized activation row. MoEStream's old fallback instead dequantized
+// every IQ1_M row to FP32 and then ran an AVX-512 FP32 dot, leaving the
+// integer unpack/lookup work in ggml_dequant_row. Reuse ggml's production
+// entry point here. On the current BeeLlama build this selects AVX2 (its
+// AVX512 and AVX512-VNNI options are disabled); a ggml build with VNNI can
+// select its own VNNI implementation internally.
+bool matmul_iq1_m_ggml_q8k(float *y, const float *x,
+                           const uint8_t *W_quantized, int S, int I, int O) {
+#if defined(MOESTREAM_USE_GGML)
+  constexpr int QK_K = 256;
+  if (!y || !x || !W_quantized || S <= 0 || I <= 0 || O <= 0 || I % QK_K != 0) {
+    return false;
+  }
+  const int nblocks = I / QK_K;
+  const size_t row_bytes = static_cast<size_t>(nblocks) * sizeof(moestream_ggml_block_iq1_m);
+  std::vector<moestream_ggml_block_q8_K> xq(static_cast<size_t>(S) * nblocks);
+  for (int s = 0; s < S; ++s) {
+    quantize_row_q8_K(x + static_cast<int64_t>(s) * I,
+                      xq.data() + static_cast<size_t>(s) * nblocks, I);
+  }
+
+#pragma omp parallel for schedule(static)
+  for (int o = 0; o < O; ++o) {
+    const uint8_t *wrow = W_quantized + static_cast<size_t>(o) * row_bytes;
+    for (int s = 0; s < S; ++s) {
+      ggml_vec_dot_iq1_m_q8_K(
+          I, y + static_cast<int64_t>(s) * O + o, 0,
+          wrow, 0,
+          xq.data() + static_cast<size_t>(s) * nblocks,
+          sizeof(moestream_ggml_block_q8_K), 1);
+    }
+  }
+  return true;
+#else
+  (void)y; (void)x; (void)W_quantized; (void)S; (void)I; (void)O;
+  return false;
+#endif
+}
+
+namespace {
+
+bool matmul_iq1_m_ggml_q8k_grouped_impl(
+    float *const *y, const float *const *x,
+    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
+#if defined(MOESTREAM_USE_GGML)
+  constexpr int QK_K = 256;
+  if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
+      O <= 0 || I % QK_K != 0)
+    return false;
+  const int nblocks = I / QK_K;
+  const size_t row_bytes = static_cast<size_t>(nblocks) *
+                           sizeof(moestream_ggml_block_iq1_m);
+  // BeeLLama's MUL_MAT_ID path quantizes a shared activation once for the
+  // whole expert group.  The ordinary grouped-input API also supports a
+  // different activation per matrix, so retain that form only when callers
+  // actually provide distinct pointers.
+  bool shared_input = true;
+  for (int m = 1; m < n_matrices; ++m)
+    shared_input = shared_input && (x[m] == x[0]);
+  const size_t xq_rows = static_cast<size_t>(shared_input ? S
+                                                           : n_matrices * S);
+  std::vector<moestream_ggml_block_q8_K> xq(xq_rows * nblocks);
+  for (int m = 0; m < (shared_input ? 1 : n_matrices); ++m) {
+    for (int s = 0; s < S; ++s) {
+      quantize_row_q8_K(x[m] + static_cast<int64_t>(s) * I,
+                        xq.data() +
+                            (static_cast<size_t>(shared_input ? 0 : m) * S +
+                             s) * nblocks,
+                        I);
+    }
+  }
+
+  const auto t0 = std::chrono::high_resolution_clock::now();
+  const int64_t total = static_cast<int64_t>(n_matrices) * S * O;
+#pragma omp parallel for schedule(static)
+  for (int64_t flat = 0; flat < total; ++flat) {
+    const int o = static_cast<int>(flat % O);
+    const int64_t matrix_row = flat / O;
+    const int s = static_cast<int>(matrix_row % S);
+    const int m = static_cast<int>(matrix_row / S);
+    const uint8_t *wrow = W_quantized[m] + static_cast<size_t>(o) * row_bytes;
+    y[m][static_cast<int64_t>(s) * O + o] = 0.0f;
+    ggml_vec_dot_iq1_m_q8_K(
+        I, y[m] + static_cast<int64_t>(s) * O + o, 0, wrow, 0,
+        xq.data() +
+            (static_cast<size_t>(shared_input ? 0 : m) * S + s) * nblocks,
+        sizeof(moestream_ggml_block_q8_K), 1);
+  }
+  const auto t1 = std::chrono::high_resolution_clock::now();
+  PerfCounters::atomic_add(perf().t_cpu_dot,
+                           std::chrono::duration<double>(t1 - t0).count());
+  return true;
+#else
+  (void)y;
+  (void)x;
+  (void)W_quantized;
+  (void)n_matrices;
+  (void)S;
+  (void)I;
+  (void)O;
+  return false;
+#endif
+}
+
+} // namespace
+
+bool matmul_iq1_m_ggml_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O) {
+  if (!x) return false;
+  std::vector<const float *> inputs(static_cast<size_t>(n_matrices), x);
+  return matmul_iq1_m_ggml_q8k_grouped_impl(
+      y, inputs.data(), W_quantized, n_matrices, S, I, O);
+}
+
+bool matmul_iq1_m_ggml_q8k_grouped_inputs(
+    float *const *y, const float *const *x,
+    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
+  return matmul_iq1_m_ggml_q8k_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O);
+}
+
 // Direct fused kernel: computes dot product of IQ3_XXS block weights with FP32
 // activation vector x
 float dot_iq3_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k) {
@@ -2129,6 +2280,180 @@ void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
     }
   }
 }
+
+namespace {
+
+using q8k_dot_fn = float (*)(const uint8_t *, const block_q8_K_local *, int64_t);
+
+#if defined(MOESTREAM_USE_GGML)
+// The linked GGML CPU backend exports the same production dot functions that
+// its MUL_MAT_ID implementation calls.  Keep the small adapter here so the
+// grouped Qwen path can share the existing matrix loop without changing the
+// older, experimental AVX2 prototype entry points used by other callers.
+static float dot_iq2_xxs_ggml_q8k_exact(
+    const uint8_t *w, const block_q8_K_local *xq, int64_t n) {
+  float out = 0.0f;
+  ggml_vec_dot_iq2_xxs_q8_K((int)n, &out, 0, w, 0, xq, 0, 1);
+  return out;
+}
+
+static float dot_iq3_xxs_ggml_q8k_exact(
+    const uint8_t *w, const block_q8_K_local *xq, int64_t n) {
+  float out = 0.0f;
+  ggml_vec_dot_iq3_xxs_q8_K((int)n, &out, 0, w, 0, xq, 0, 1);
+  return out;
+}
+#endif
+
+bool matmul_iqxxs_ggml_avx2_grouped_impl(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O, size_t block_bytes,
+    q8k_dot_fn dot) {
+#if defined(MOESTREAM_USE_GGML)
+  constexpr int QK_K = 256;
+  if (!y || !x || !W_quantized || !dot || n_matrices <= 0 || S <= 0 ||
+      I <= 0 || O <= 0 || I % QK_K != 0)
+    return false;
+  const int nblocks = I / QK_K;
+  const size_t row_bytes = static_cast<size_t>(nblocks) * block_bytes;
+  std::vector<block_q8_K_local> xq(static_cast<size_t>(S) * nblocks);
+  const auto t0 = std::chrono::high_resolution_clock::now();
+  for (int s = 0; s < S; ++s)
+    quantize_row_q8_K_ref(x + static_cast<int64_t>(s) * I,
+                          xq.data() + static_cast<size_t>(s) * nblocks, I);
+
+  const int64_t total = static_cast<int64_t>(n_matrices) * S * O;
+#pragma omp parallel for schedule(static)
+  for (int64_t flat = 0; flat < total; ++flat) {
+    const int o = static_cast<int>(flat % O);
+    const int64_t matrix_row = flat / O;
+    const int s = static_cast<int>(matrix_row % S);
+    const int m = static_cast<int>(matrix_row / S);
+    const uint8_t *row = W_quantized[m] + static_cast<size_t>(o) * row_bytes;
+    y[m][static_cast<int64_t>(s) * O + o] =
+        dot(row, xq.data() + static_cast<size_t>(s) * nblocks, I);
+  }
+  const auto t1 = std::chrono::high_resolution_clock::now();
+  PerfCounters::atomic_add(
+      perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+  return true;
+#else
+  (void)y;
+  (void)x;
+  (void)W_quantized;
+  (void)n_matrices;
+  (void)S;
+  (void)I;
+  (void)O;
+  (void)block_bytes;
+  (void)dot;
+  return false;
+#endif
+}
+
+bool matmul_iq4_nl_ggml_q8_0_grouped_impl(
+    float *const *y, const float *const *x,
+    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
+#if defined(MOESTREAM_USE_GGML)
+  constexpr int QK4_NL = 32;
+  if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
+      O <= 0 || I % QK4_NL != 0)
+    return false;
+  const int nblocks = I / QK4_NL;
+  const size_t row_bytes = static_cast<size_t>(nblocks) * 18;
+  std::vector<block_q8_0> xq(
+      static_cast<size_t>(n_matrices) * S * nblocks);
+  const auto t0 = std::chrono::high_resolution_clock::now();
+  for (int m = 0; m < n_matrices; ++m) {
+    if (!x[m]) return false;
+    for (int s = 0; s < S; ++s)
+      quantize_row_q8_0(
+          x[m] + static_cast<int64_t>(s) * I,
+          xq.data() + (static_cast<size_t>(m) * S + s) * nblocks, I);
+  }
+
+  const int64_t total = static_cast<int64_t>(n_matrices) * S * O;
+#pragma omp parallel for schedule(static)
+  for (int64_t flat = 0; flat < total; ++flat) {
+    const int o = static_cast<int>(flat % O);
+    const int64_t matrix_row = flat / O;
+    const int s = static_cast<int>(matrix_row % S);
+    const int m = static_cast<int>(matrix_row / S);
+    const uint8_t *row = W_quantized[m] + static_cast<size_t>(o) * row_bytes;
+    ggml_vec_dot_iq4_nl_q8_0(
+        I, y[m] + static_cast<int64_t>(s) * O + o, 0, row, 0,
+        xq.data() + (static_cast<size_t>(m) * S + s) * nblocks,
+        sizeof(block_q8_0), 1);
+  }
+  const auto t1 = std::chrono::high_resolution_clock::now();
+  PerfCounters::atomic_add(
+      perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+  return true;
+#else
+  (void)y;
+  (void)x;
+  (void)W_quantized;
+  (void)n_matrices;
+  (void)S;
+  (void)I;
+  (void)O;
+  return false;
+#endif
+}
+
+} // namespace
+
+bool matmul_iq2_xxs_ggml_avx2_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O) {
+  return matmul_iqxxs_ggml_avx2_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O, 66,
+      dot_iq2_xxs_avx2_prototype);
+}
+
+bool matmul_iq3_xxs_ggml_avx2_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O) {
+  return matmul_iqxxs_ggml_avx2_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O, 98,
+      dot_iq3_xxs_avx2_prototype);
+}
+
+bool matmul_iq2_xxs_ggml_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O) {
+#if defined(MOESTREAM_USE_GGML)
+  return matmul_iqxxs_ggml_avx2_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O, 66,
+      dot_iq2_xxs_ggml_q8k_exact);
+#else
+  (void)y; (void)x; (void)W_quantized; (void)n_matrices; (void)S; (void)I;
+  (void)O;
+  return false;
+#endif
+}
+
+bool matmul_iq3_xxs_ggml_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O) {
+#if defined(MOESTREAM_USE_GGML)
+  return matmul_iqxxs_ggml_avx2_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O, 98,
+      dot_iq3_xxs_ggml_q8k_exact);
+#else
+  (void)y; (void)x; (void)W_quantized; (void)n_matrices; (void)S; (void)I;
+  (void)O;
+  return false;
+#endif
+}
+
+bool matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+    float *const *y, const float *const *x,
+    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
+  return matmul_iq4_nl_ggml_q8_0_grouped_impl(
+      y, x, W_quantized, n_matrices, S, I, O);
+}
+
 // ============================================================
 
 // Fast AVX-512 dequantization helper for Q5_K 16-element sub-groups

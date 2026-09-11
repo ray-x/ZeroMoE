@@ -15,6 +15,7 @@
 #include "ggml_moe_backend.hpp"
 #include "kquant_dequant.hpp"
 #include "logger.hpp"
+#include "memory_guard.hpp"
 #include "ple_hash.hpp"
 
 #include <algorithm>
@@ -1141,6 +1142,38 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_set_output(g.ple_hist_out);
     ggml_build_forward_expand(g.graph, g.ple_hist_out);
   }
+  // Real, measured incident (2026-09-09): ggml_backend_sched_alloc_graph's
+  // internal ggml_gallocr_reserve_n_impl does not fail gracefully on a real
+  // cudaMalloc OOM -- it logged "cudaMalloc failed: out of memory" and then
+  // segfaulted the whole process (exit 139) instead of returning a checkable
+  // failure, at the exact point where main.cpp's own fallback VRAM cache
+  // reservation (a fixed 4GB, unaware of device_expert_layers' own VRAM use)
+  // left the scheduler's own reserve() short by ~1.8GB. main.cpp now sizes
+  // that fallback cache against real free VRAM and this family's own
+  // device_expert_layers estimate, but this check stays as a second,
+  // independent line of defense: refuse to even attempt the allocator call
+  // when real free VRAM on the graph's device is below a generous floor,
+  // and decline to the legacy path instead of risking the same crash again.
+  {
+    size_t free_b = 0, total_b = 0;
+    int prev_device = -1;
+    cudaGetDevice(&prev_device);
+    cudaSetDevice(g.device);
+    const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (prev_device >= 0) cudaSetDevice(prev_device);
+    constexpr size_t kMinGraphAllocHeadroomBytes = 2ull * 1024ull * 1024ull * 1024ull;  // 2 GiB
+    if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
+      LOG_ERROR("[GGML-QWEN-FULL] refusing graph allocator reserve: device %d free=%.2f GiB "
+                "< %.2f GiB safety floor (device expert arena + dense arena already "
+                "committed %.2f GiB) -- falling back to the legacy path\n",
+                g.device,
+                err == cudaSuccess ? static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0) : -1.0,
+                static_cast<double>(kMinGraphAllocHeadroomBytes) / (1024.0 * 1024.0 * 1024.0),
+                static_cast<double>(g.device_expert_capacity + g.device_dense_capacity) /
+                    (1024.0 * 1024.0 * 1024.0));
+      return false;
+    }
+  }
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph)) return false;
   g.graph_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
 
@@ -1291,7 +1324,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
   // GGML host context, prompt/state inputs, and allocator/I/O fluctuation;
   // no /proc/meminfo read is performed in the per-buffer allocation loop.
   const size_t expert_bytes = full_expert_source_bytes(engine);
-  constexpr size_t kGraphHostWatermark = 4ull * 1024ull * 1024ull * 1024ull;
+  // 10 GiB, per explicit user instruction after the 2026-09-09 crash (was
+  // 4 GiB -- the smallest, least-conservative watermark of any admission
+  // check in either graph file; aligned to the same 10 GiB floor as the
+  // rest).
+  constexpr size_t kGraphHostWatermark = 10ull * 1024ull * 1024ull * 1024ull;
   if (expert_bytes == 0 ||
       !MemoryGuard::try_reserve_host_bytes(expert_bytes,
                                            kGraphHostWatermark)) {
@@ -1397,6 +1434,32 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return fail("expanded HC input is missing or too small");
   std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
               static_cast<size_t>(g.D) * g.HC * S * sizeof(float));
+
+  // Real-hardware incident (2026-09-09, GLM5NEXT side): a 480-token prompt
+  // crashed the whole machine (hard reboot required, no surviving kernel/
+  // OOM log -- this box has no persistent journald storage) with the last
+  // surviving application-log line printed just before this exact kind of
+  // compute call. Every OTHER host allocation on this path (arena prep,
+  // expert source, graph context) goes through MemoryGuard::try_reserve_
+  // host_bytes first; this compute call did not. Re-check REAL, fresh
+  // MemAvailable (not the background watchdog's own possibly-500ms-stale
+  // allocation_blocked() flag) immediately before committing to it -- a
+  // large gap can open between prepare()'s own admission checks and this
+  // moment (preload alone can take minutes). Not a confirmed fix for
+  // whatever the real mechanism was (no kernel evidence survived to
+  // confirm it), just a cheap, additional, defense-in-depth backstop,
+  // applied identically to qwen4exp's own graph for the same reason.
+  {
+    const long avail_mb = MemoryGuard::read_available_mb();
+    constexpr long kMinComputeHeadroomMb = 10240;  // 10 GiB, per explicit user instruction after the 2026-09-09 crash
+    if (avail_mb >= 0 && avail_mb < kMinComputeHeadroomMb) {
+      LOG_ERROR("[GGML-QWEN-FULL] refusing graph compute: MemAvailable=%ld MiB "
+                "< %ld MiB safety floor -- falling back to the legacy path\n",
+                avail_mb, kMinComputeHeadroomMb);
+      return false;
+    }
+  }
+
   const auto t_compute_start = std::chrono::steady_clock::now();
   ggml_status st = ggml_backend_sched_graph_compute_async(g.sched, g.graph);
   const auto t_submit_end = std::chrono::steady_clock::now();

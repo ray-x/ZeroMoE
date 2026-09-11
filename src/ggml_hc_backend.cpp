@@ -105,6 +105,7 @@ void GgmlHcRunner::shutdown() {
   }
   post_graph_ = nullptr;
   post_input_ = nullptr;
+  post_source_view_ = nullptr;
   post_graph_S_ = 0;
   if (state_buf_) {
     ggml_backend_buffer_free((ggml_backend_buffer_t)state_buf_);
@@ -433,7 +434,8 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
 }
 
 bool GgmlHcRunner::ensure_post_graph(int S) {
-  if (!backend_ || !t_streams_ || !t_inject_ || S <= 0 || S > s_cap_)
+  if (!backend_ || !t_streams_ || !t_inject_ || S <= 0 ||
+      S > s_cap_)
     return false;
   if (post_graph_ && post_graph_S_ == S)
     return true;
@@ -449,11 +451,16 @@ bool GgmlHcRunner::ensure_post_graph(int S) {
     post_ctx_ = nullptr;
     post_graph_ = nullptr;
     post_input_ = nullptr;
+    post_source_view_ = nullptr;
     post_graph_S_ = 0;
   }
 
   ggml_init_params ip = {};
-  ip.mem_size = ggml_tensor_overhead() * 64 + ggml_graph_overhead();
+  // Keep metadata headroom for the persistent producer view below and the
+  // graph's small shape bookkeeping. The old 64-tensor pool was also being
+  // consumed by a fresh decode view on every call, eventually turning this
+  // harmless shape difference into GGML_ASSERT(obj_new).
+  ip.mem_size = ggml_tensor_overhead() * 256 + ggml_graph_overhead();
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
   if (!ctx) return false;
@@ -467,6 +474,12 @@ bool GgmlHcRunner::ensure_post_graph(int S) {
   ggml_set_name(so_flat, "hc_sub_block_out");
 
   ggml_tensor *streams = (ggml_tensor *)t_streams_;
+  // A full-GDN producer keeps a grow-only [D,S_cap] output tensor. Decode
+  // consumes only its first row, so creating a fresh view in post_combine_impl
+  // would leak one GGML metadata object per token until the context exhausted.
+  // Create one [D,S] view here and retarget its data/buffer for each producer.
+  ggml_tensor *source_view =
+      ggml_view_2d(ctx, streams, d_model_, S, streams->nb[1], 0);
   ggml_tensor *sv = ggml_view_3d(ctx, streams, d_model_, hc_, S,
                                  streams->nb[1], streams->nb[2], 0);
   ggml_tensor *inj = ggml_view_2d(ctx, (ggml_tensor *)t_inject_, hc_, S,
@@ -474,7 +487,7 @@ bool GgmlHcRunner::ensure_post_graph(int S) {
   ggml_tensor *w =
       ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, inj, 1.0f / (float)hc_)),
                  2.0f);
-  if (!sv || !inj || !w) {
+  if (!source_view || !sv || !inj || !w) {
     ggml_free(ctx);
     return false;
   }
@@ -511,6 +524,7 @@ bool GgmlHcRunner::ensure_post_graph(int S) {
   post_ctx_ = ctx;
   post_graph_ = gf;
   post_input_ = so_flat;
+  post_source_view_ = source_view;
   post_graph_S_ = S;
   return true;
 }
@@ -867,11 +881,17 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
                   layer, sub_block, S);
       return false;
     }
-    ggml_tensor *src_view =
-        src->ne[1] == S
-            ? src
-            : ggml_view_2d((ggml_context *)post_ctx_, src, d_model_, S,
-                           src->nb[1], 0);
+    ggml_tensor *src_view = src;
+    if (src->ne[1] != S) {
+      // Reuse the one metadata view built by ensure_post_graph().  Retargeting
+      // the CUDA pointer is safe here because the producer tensor is already
+      // complete/ordered by the shared backend dependency; allocating a new
+      // view on every decode token would eventually exhaust post_ctx_.
+      src_view = (ggml_tensor *)post_source_view_;
+      if (!src_view) return false;
+      src_view->data = src->data;
+      src_view->buffer = src->buffer;
+    }
     if (!src_view) {
       return false;
     }

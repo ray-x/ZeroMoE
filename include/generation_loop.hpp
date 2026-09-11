@@ -584,7 +584,6 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         engine.mtp_enabled && pc_reuse == 0 && pc_n_new == prompt_ids.size() &&
         !prompt_ids.empty();
     if (mtp_context_ready) {
-        MtpSpeculator mtp(engine, ram_mgr, prefetcher);
         auto emit_mtp = [&](int next_token) {
             perf().n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
             std::string token_str = tokenizer.decode(next_token);
@@ -598,9 +597,22 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                 return false;
             return !g_shutdown_requested.load(std::memory_order_relaxed);
         };
-        mtp_started = mtp.run(prompt_ids, hidden_states, max_new_tokens, eos_id,
-                              temperature, top_p, sequence, sampler.rng,
-                              emit_mtp);
+        // Qwen4Exp's "shared" MTP checkpoint needs its own driver
+        // (Qwen4ExpMtpSpeculator, mtp_speculative.cpp) -- its NextN state
+        // is hc_dim wide, not n_embd wide, and GLM's MtpSpeculator is kept
+        // untouched by this family's own, separately-verified path (see
+        // Qwen4ExpMtpSpeculator's own header comment).
+        if (engine.family_ops.family == ModelFamily::Qwen4Exp) {
+            Qwen4ExpMtpSpeculator mtp(engine, ram_mgr, prefetcher);
+            mtp_started = mtp.run(prompt_ids, hidden_states, max_new_tokens,
+                                  eos_id, temperature, top_p, sequence,
+                                  sampler.rng, emit_mtp);
+        } else {
+            MtpSpeculator mtp(engine, ram_mgr, prefetcher);
+            mtp_started = mtp.run(prompt_ids, hidden_states, max_new_tokens,
+                                  eos_id, temperature, top_p, sequence,
+                                  sampler.rng, emit_mtp);
+        }
         if (mtp_started) {
             LOG_STREAM_INFO() << "[MTP] speculative decoding active (draft tokens="
                               << engine.mtp_draft_tokens << ")\n";

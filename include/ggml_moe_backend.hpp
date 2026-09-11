@@ -220,6 +220,24 @@ class GgmlQwenSharedRunner {
   bool graph_ready_ = false;
 };
 
+// Test-only helper (2026-09-10, added to isolate a real GgmlQwenSharedRunner
+// NaN bug -- see main_test.cpp's own test). Wraps host_data as a device-
+// resident [ne0,ne1] F32 tensor matching exactly what GgmlQwenSharedRunner::
+// run()'s device_x/routed_output parameters expect (type/ne/nb/data/buffer
+// all checked there), without main_test.cpp needing its own raw ggml.h
+// includes. Returns false/no-op without MOESTREAM_USE_GGML_CUDA. Caller
+// owns *out_ctx/*out_buf and must free them via
+// ggml_moe_test_free_device_tensor once done with *out_tensor.
+bool ggml_moe_test_make_device_tensor(int device, int64_t ne0, int64_t ne1,
+                                      const float *host_data,
+                                      void **out_tensor, void **out_ctx,
+                                      void **out_buf);
+void ggml_moe_test_free_device_tensor(void *ctx, void *buf);
+// Synchronizes the given device before reading, so a caller doesn't need to
+// separately track/wait on whatever stream produced `tensor`.
+bool ggml_moe_test_download_tensor(int device, const void *tensor,
+                                   float *host_out, size_t n_floats);
+
 struct GgmlMoeLayerPlan {
   int device_id = -1;   // CUDA device the weights and graph live on
   int n_experts = 0;    // size of the compact routed set for this layer
@@ -258,6 +276,24 @@ struct GgmlMoeLayerPlan {
   size_t external_expert_stride = 0;
 };
 
+// Timing for the actual CUDA copy-stream service interval.  The byte counts
+// are source-specific; `d2d_seconds` and `h2d_seconds` are CUDA-event
+// service intervals, not bytes divided by request wall time. The optional
+// `h2d_dma_seconds` measures only the actual H2D DMA calls, excluding packed
+// device-unpack kernels between them.
+struct GgmlMoeTransferStats {
+  double d2d_seconds = 0.0;
+  double h2d_seconds = 0.0;
+  double h2d_dma_seconds = 0.0;
+  size_t d2d_bytes = 0;
+  size_t h2d_bytes = 0;
+};
+
+// Select the reference planar H2D path without using a process-wide
+// environment variable. The engine sets this from EngineConfig so a Qwen
+// tuning choice cannot silently alter GLM/DeepSeek runners.
+void set_moe_ggml_planar_copies(bool enabled);
+
 // One expert's three destination pointers inside a pinned staging buffer.
 struct GgmlMoeStageSlot {
   uint8_t *gate = nullptr;
@@ -267,7 +303,52 @@ struct GgmlMoeStageSlot {
 
 class GgmlMoeRunner {
  public:
-  static constexpr int NBUF = 2;  // pinned staging buffers (memcpy || H2D)
+  // Pinned staging buffers (memcpy || H2D).
+  //
+  // 2026-09-09: TRIED raising this to 4, reverted -- real, measured, net
+  // loss, not a win. The hypothesis was sound and half-confirmed: the
+  // "Prefill expert stream:" shutdown line showed 1.593s of a 488-token
+  // prefill's 4.93s expert= bucket was CPU blocked waiting for a staging
+  // buffer to free up (t_prefill_stream_wait), on top of 2.518s of real H2D
+  // transfer already close to this box's PCIe ceiling (10.07 of ~12.3
+  // GB/s). Raising NBUF to 4 DID cut that wait time as predicted (3 real
+  // runs: 0.172s / 0.834s / 0.956s, vs 1.593s baseline) -- but overall
+  // prefill throughput came out WORSE across all 3 runs (59.09 / 61.18 /
+  // 60.49 tok/s, mean 60.25) than the NBUF=2 baseline (62.48 / 62.77 /
+  // 63.20, mean 62.82). The first run's `disk=` bucket (which folds in the
+  // RAM-tier->pinned-staging memcpy) jumped 0.28s->2.21s -- more buffers in
+  // flight apparently increases contention/overhead on that memcpy path
+  // (or per-event bookkeeping cost) by more than the wait-time saved.
+  // Net: the buffer-wait time was real but was NOT the dominant lever it
+  // looked like in isolation -- don't re-raise this without re-measuring
+  // BOTH the wait time AND the disk= bucket together, not just the metric
+  // that motivated the change.
+  //
+  // 2026-09-10: TRIED NBUF=3, REVERTED. Decisive negative result via a
+  // precise per-layer overhead measurement (inter-layer wall-clock gap
+  // minus that layer's own reported graph= compute time, summed across all
+  // 48 layers, from the [GGML-MOE] layer=N timestamps): NBUF=2 -> 138.32
+  // ms/layer overhead, NBUF=3 -> 139.89 ms/layer -- essentially identical,
+  // despite NBUF=3 cutting the "CPU blocked on double-buffer handoff" bucket
+  // from 1.6s to 1.25s. The wait-time drop was real but got absorbed
+  // elsewhere (graph_sum itself grew 688ms->865ms), so total per-layer cost
+  // didn't move. Conclusion: NBUF is NOT the real lever at 2, 3, OR 4 --
+  // all three land in the same ~138-140 ms/layer range. The real ~140ms/
+  // layer floor (measured against full-graph's ~54ms/layer-equivalent for
+  // the identical work) comes from something else inherent to the
+  // per-layer host-orchestrated dispatch design itself, not buffer depth.
+  // Don't re-try NBUF tuning without a new hypothesis for what THAT is.
+  //
+  // 2026-09-10 (later same day): RE-VERIFIED against the post-fix baseline
+  // (RAM/VRAM tier independence fix + vram_preload_prefix_layers adopted
+  // since the test above; also after the real GgmlQwenSharedRunner
+  // device_x bug was fixed, see ggml_moe_backend.cpp/Test 35). Same 574-
+  // token real-text prompt, prefill= from the shutdown report's Rates
+  // line: NBUF=2 baseline 79.84 / 86.37 / 85.66 tok/s (mean 83.96), NBUF=3
+  // 83.57 tok/s -- squarely inside the NBUF=2 spread, not a separate
+  // cluster. Conclusion unchanged: NBUF is still not a real lever, now
+  // confirmed against the current, materially faster baseline too.
+  static constexpr int NBUF = 2;
   static constexpr int NWEIGHT_BUFS = 1;
   // A prefill can queue all model layers before the final synchronization.
   // Keep one completion event per possible layer so an event still being
@@ -295,6 +376,7 @@ class GgmlMoeRunner {
   // Request-boundary helpers for the small pool of persistent runners.
   static void finish_all_h2d();
   static void collect_all_h2d(double &seconds, size_t &bytes);
+  static void collect_all_transfer_stats(GgmlMoeTransferStats &stats);
 
   // Size/validate storage for one layer's compact expert set. Returns false if
   // the plan is unsupported (bad shape, unsupported quant type, allocation
@@ -330,7 +412,12 @@ class GgmlMoeRunner {
   // the whole point of doing it. Ordered on the same copy stream as the H2D,
   // so one wait covers both. Asynchronous: the source slab must stay held
   // (hold_for_compute) until sync_copies() returns.
-  bool copy_expert_d2d(int expert_index, const void *src_slab);
+  bool copy_expert_d2d(int buf, int expert_index, const void *src_slab);
+
+  // Mark the boundary between the D2D reuse phase and the RAM H2D phase for
+  // the current copy batch.  The runner also records this lazily in
+  // push_chunk(), so older callers that issue no D2D copies remain valid.
+  bool mark_copy_d2d_done(int buf);
 
   // Wait for every in-flight weight copy (H2D and D2D) on this layer. Safe to
   // call more than once; run_layer() does it internally.
@@ -406,6 +493,29 @@ class GgmlMoeRunner {
   // when graph execution uses an internal CUDA stream.
   void wait_device_output();
 
+  // Force the next run_layer_device*() call to rebuild graph_ctx_ from
+  // scratch, even if the layer shape (n_tokens/topk/d_model/...) matches
+  // what's already cached. Safe to call any time (drains any in-flight
+  // graph first, exactly like ensure_graph()'s own shape-mismatch rebuild
+  // path -- this just exposes that same sequence publicly instead of
+  // duplicating it).
+  //
+  // Real crash this exists for (2026-09-09): graph_ctx_'s tensor-object
+  // pool (ensure_graph()'s own ggml_tensor_overhead()*128 budget) is sized
+  // for roughly one forward pass's worth of per-layer run_layer_device_impl
+  // calls (each adds a small, fixed number of tensor objects into the SAME
+  // reused context whenever the shape matches -- normal decode/prefill
+  // never accumulates enough to matter). Qwen4ExpMtpSpeculator::run()
+  // (mtp_speculative.cpp) re-runs the target trunk over the WHOLE prompt a
+  // second time, at the SAME shape, immediately after the caller's own
+  // real prefill already ran it once -- the two calls' accumulated tensor
+  // objects landed in the SAME never-reset context and overflowed it by a
+  // few dozen bytes (`ggml_new_object: not enough space in the context's
+  // memory pool`, a hard ggml_abort, not a catchable error). Call this
+  // between the two passes to force a clean rebuild instead of growing the
+  // shared budget for every caller.
+  void invalidate_graph();
+
   // Copy a result returned by run_layer_device() to a row-major host buffer.
   // Used only for the guarded fallback/debug path when the device consumer
   // cannot accept the result.
@@ -413,6 +523,11 @@ class GgmlMoeRunner {
 
   // Drain and reset the accumulated H2D timing/byte counters.
   void collect_h2d(double &seconds, size_t &bytes);
+
+  // Drain and reset source-separated CUDA-event timing.  collect_h2d() is
+  // retained for existing callers; new performance reports should use this
+  // method so D2D cache reuse is not mislabeled as PCIe traffic.
+  void collect_transfer_stats(GgmlMoeTransferStats &stats);
 
   // Complete outstanding backend-stream staging transfers at the end of a
   // forward pass. Per-layer collection leaves them pending so copies can
@@ -453,6 +568,10 @@ class GgmlMoeRunner {
   bool ensure_backend(int device);
   bool ensure_weight_buffer(size_t bytes, size_t packed_bytes);
   bool ensure_stage_buffers(size_t bytes_per_buf);
+  void account_copy_buffer(int buf);
+  bool ensure_h2d_timing_events();
+  bool begin_h2d_timing(int buf, int &slot);
+  bool end_h2d_timing(int buf, int slot);
   void free_graph();
   bool ensure_graph();
   bool ensure_chunk_state();
@@ -572,14 +691,19 @@ class GgmlMoeRunner {
 
   // IDs and router weights are supplied by per-layer local vectors in the
   // execution path. In asynchronous graph mode those vectors can disappear
-  // before the backend's H2D stream consumes them, so retain one stable host
-  // copy per possible layer submission. A request has at most 48 layers here;
-  // the extra slots also cover a request boundary before the backend is
-  // drained, without reintroducing a per-layer device synchronization.
+  // before the backend's H2D stream consumes them. Keep a persistent pinned
+  // host ring so the route tables can use ggml_backend_tensor_set_async()
+  // instead of the synchronous setter (which showed up as one blocking
+  // cudaMemcpy pair per MoE layer during decode). A request has at most 48
+  // layers here; the extra slots cover a request boundary before the backend
+  // is drained. The ring is drained only on wrap or capacity growth.
   static constexpr int NROUTE_STAGE = 64;
-  std::vector<int32_t> route_ids_stage_[NROUTE_STAGE];
-  std::vector<float> route_weights_stage_[NROUTE_STAGE];
+  int32_t *route_ids_pinned_ = nullptr;
+  float *route_weights_pinned_ = nullptr;
+  size_t route_stage_capacity_ = 0;
   int route_stage_index_ = 0;
+
+  bool ensure_route_stage(size_t route_count);
 
   // --- staging (pinned host) ---
   uint8_t *h_stage_[NBUF] = {nullptr, nullptr};
@@ -602,7 +726,12 @@ class GgmlMoeRunner {
   // CUDA event pair measures only the copy-stream interval.
   void *backend_copy_t0_event_[NBUF] = {nullptr, nullptr};
   void *backend_copy_t1_event_[NBUF] = {nullptr, nullptr};
+  void *backend_copy_split_event_[NBUF] = {nullptr, nullptr};
   void *backend_stage_event_[NBUF] = {nullptr, nullptr}; // ggml event
+  static constexpr int NH2D_TIMING_EVENTS = 128;
+  void *h2d_t0_event_[NBUF][NH2D_TIMING_EVENTS] = {};
+  void *h2d_t1_event_[NBUF][NH2D_TIMING_EVENTS] = {};
+  int h2d_timing_count_[NBUF] = {0, 0};
   void *backend_weight_done_event_[NWEIGHT_EVENTS] = {};
   void *backend_weight_last_event_[NWEIGHT_BUFS] = {};
   bool backend_weight_buffer_in_use_[NWEIGHT_BUFS] = {};
@@ -613,6 +742,8 @@ class GgmlMoeRunner {
   std::chrono::steady_clock::time_point backend_copy_t0_[NBUF];
   bool pending_[NBUF] = {false, false};
   size_t pending_bytes_[NBUF] = {0, 0};
+  size_t pending_d2d_bytes_[NBUF] = {0, 0};
+  bool copy_split_recorded_[NBUF] = {false, false};
 
   struct DeferredVramHold {
     void * topology = nullptr;
@@ -633,5 +764,8 @@ class GgmlMoeRunner {
   bool layer_ready_ = false;
 
   double h2d_seconds_ = 0.0;
+  double h2d_dma_seconds_ = 0.0;
   size_t h2d_bytes_ = 0;
+  double d2d_seconds_ = 0.0;
+  size_t d2d_bytes_ = 0;
 };

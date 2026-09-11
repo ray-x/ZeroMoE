@@ -308,6 +308,35 @@ static void alloc_qwen4exp_cache(StreamingEngine &engine,
                                    const ArchitectureConfig &c, int max_ctx) {
   alloc_dense_kv_cache(engine, c, max_ctx);
 
+  // Qwen4Exp's shared MTP checkpoint (config.mtp_model_path) adds one
+  // extra full-attention layer at index c.n_layers -- alloc_dense_kv_cache
+  // above sizes Kc/Vc to EXACTLY c.n_layers (correct for the ordinary,
+  // non-MTP case, and shared with other dense-KV families that never
+  // carry an extra layer). GLM5Next's own MLA cache already reserves this
+  // same "+1" slot unconditionally (alloc_mla_absorbed_cache, this file);
+  // do the equivalent here, but only when a shared MTP file is actually
+  // configured, since qwen4exp_full_attention_gguf(engine, c.n_layers,
+  // ...) (called from qwen4exp_mtp_forward, execution_layer.cpp) indexes
+  // engine.Kc[c.n_layers]/Vc[c.n_layers] directly -- an out-of-bounds
+  // read/write on the plain std::vector<float*> otherwise. Harmless to
+  // allocate even if later validation (graph_initializer.cpp) declines to
+  // activate MTP (missing/invalid tensors) -- one unused layer's worth of
+  // KV cache, not charged if reserve_host_memory below refuses it.
+  if (engine.has_mtp_model) {
+    const int mtp_layer = c.n_layers;
+    engine.Kc.resize(mtp_layer + 1, nullptr);
+    engine.Vc.resize(mtp_layer + 1, nullptr);
+    const int kvd = std::max(1, c.n_head_kv) * std::max(1, c.head_dim);
+    const size_t kv_bytes = (size_t)max_ctx * kvd * sizeof(float);
+    if (!alloc_zeroed_host(engine, &engine.Kc[mtp_layer], kv_bytes,
+                           "Qwen4Exp MTP dense K cache") ||
+        !alloc_zeroed_host(engine, &engine.Vc[mtp_layer], kv_bytes,
+                           "Qwen4Exp MTP dense V cache")) {
+      LOG_ERROR("[MEM-GUARD] Qwen4Exp MTP KV cache (layer %d) refused; MTP "
+                "validation will fail closed\n", mtp_layer);
+    }
+  }
+
   const int n_v_heads = c.ssm_time_step_rank;
   const int hd = c.ssm_state_size;
   const int conv_dim =

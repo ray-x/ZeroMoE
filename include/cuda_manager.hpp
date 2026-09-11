@@ -191,6 +191,22 @@ public:
     float* d_q4_scores = nullptr; size_t d_q4_scores_cap = 0;
     float* d_q4_out = nullptr;    size_t d_q4_out_cap = 0;
 
+    // Persistent Qwen4Exp dense-attention KV cache.  The projection scratch
+    // above holds only the current [S,Hkv,hd] rows; decode must retain every
+    // earlier row on the GPU or it pays a host round trip once per dense
+    // attention layer and token.  Layout matches the existing host Kc/Vc
+    // cache: [T, Hkv, hd], so the cuBLAS strided-batched kernels can consume
+    // it without a transpose or materialized repeated KV heads.
+    struct Qwen4ExpDeviceKvCache {
+        float* k = nullptr;
+        float* v = nullptr;
+        size_t bytes = 0;
+        int max_t = 0;
+        int hkv = 0;
+        int hd = 0;
+    };
+    std::vector<Qwen4ExpDeviceKvCache> d_qwen4exp_kv_by_layer;
+
     // GDN causal conv1d+SiLU GPU scratch (qwen4exp_conv1d_silu_gpu_host).
     // Grow-only, shared across all 36 GDN layers and every call. Weight and
     // history are small (163 KB / 123 KB at qwen4exp's real dims) and
@@ -612,6 +628,11 @@ public:
         if (d_q4_knorm) cudaFree(d_q4_knorm);
         if (d_q4_scores) cudaFree(d_q4_scores);
         if (d_q4_out) cudaFree(d_q4_out);
+        for (auto& cache : d_qwen4exp_kv_by_layer) {
+            if (cache.k) cudaFree(cache.k);
+            if (cache.v) cudaFree(cache.v);
+            cache = Qwen4ExpDeviceKvCache{};
+        }
         if (d_gdnconv_x) cudaFree(d_gdnconv_x);
         if (d_gdnconv_w) cudaFree(d_gdnconv_w);
         if (d_gdnconv_h) cudaFree(d_gdnconv_h);
@@ -1906,6 +1927,168 @@ public:
         return true;
     }
 
+    // Device-input attention with a persistent per-layer KV cache.  The
+    // current K/V rows are appended directly on CUDA and the GEMMs read the
+    // cache for the complete causal context.  This is the decode counterpart
+    // of qwen4exp_attn_gpu_device_inputs(): it deliberately never downloads
+    // K/V to the host on the successful path.
+    bool qwen4exp_attn_gpu_device_cached(
+        int layer, const void *Q_device, const void *K_device,
+        const void *V_device, int S, int T, int H, int Hkv, int hd,
+        int pos_base, int max_t, float scale, const void **device_out) {
+        if (device_out) *device_out = nullptr;
+        if (!device_out || layer < 0 || !Q_device || !K_device || !V_device ||
+            Q_device != d_q4_Q || K_device != d_q4_K || V_device != d_q4_V ||
+            S <= 0 || T <= 0 || H <= 0 || Hkv <= 0 || hd <= 0 || H % Hkv ||
+            pos_base < 0 || max_t <= 0 || T > max_t || pos_base + S > max_t)
+            return false;
+        if ((size_t)S * H * hd * sizeof(float) > d_q4_Q_cap ||
+            (size_t)S * Hkv * hd * sizeof(float) > d_q4_K_cap ||
+            (size_t)S * Hkv * hd * sizeof(float) > d_q4_V_cap)
+            return false;
+
+        cudaSetDevice(device_id);
+        const size_t row_bytes = (size_t)Hkv * hd * sizeof(float);
+        const size_t cache_bytes = (size_t)max_t * row_bytes;
+        Qwen4ExpDeviceKvCache &cache = [&]() -> Qwen4ExpDeviceKvCache & {
+            if ((int)d_qwen4exp_kv_by_layer.size() <= layer)
+                d_qwen4exp_kv_by_layer.resize((size_t)layer + 1);
+            return d_qwen4exp_kv_by_layer[(size_t)layer];
+        }();
+        if (cache.k && cache.v &&
+            (cache.bytes != cache_bytes || cache.max_t != max_t ||
+             cache.hkv != Hkv || cache.hd != hd)) {
+            // A different model/context shape must not free a cache while a
+            // previous layer's cuBLAS work is still using it.
+            if (cudaStreamSynchronize(0) != cudaSuccess) return false;
+            cudaFree(cache.k);
+            cudaFree(cache.v);
+            cache = Qwen4ExpDeviceKvCache{};
+        }
+        if (!cache.k || !cache.v) {
+            if (!vram_ok_to_grow(2 * cache_bytes)) return false;
+            if (cudaMalloc((void **)&cache.k, cache_bytes) != cudaSuccess) {
+                cache.k = nullptr;
+                return false;
+            }
+            if (cudaMalloc((void **)&cache.v, cache_bytes) != cudaSuccess) {
+                cudaFree(cache.k);
+                cache = Qwen4ExpDeviceKvCache{};
+                return false;
+            }
+            cache.bytes = cache_bytes;
+            cache.max_t = max_t;
+            cache.hkv = Hkv;
+            cache.hd = hd;
+            static bool logged_cache_alloc = false;
+            if (!logged_cache_alloc) {
+                logged_cache_alloc = true;
+                LOG_INFO("[QWEN4EXP-ATTN] persistent device KV cache active "
+                         "(%.2f MiB/layer, max_t=%d)\n",
+                         (double)(2 * cache_bytes) / (1024.0 * 1024.0), max_t);
+            }
+        }
+
+        const size_t current_bytes = (size_t)S * row_bytes;
+        if (cudaMemcpyAsync(cache.k + (size_t)pos_base * row_bytes, K_device,
+                            current_bytes, cudaMemcpyDeviceToDevice, 0) != cudaSuccess ||
+            cudaMemcpyAsync(cache.v + (size_t)pos_base * row_bytes, V_device,
+                            current_bytes, cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
+            return false;
+        if (S == 1) {
+            static bool logged_decode_cache = false;
+            if (!logged_decode_cache) {
+                logged_decode_cache = true;
+                LOG_INFO("[QWEN4EXP-ATTN] decode uses device-resident KV cache\n");
+            }
+        }
+
+        const size_t kScoreBudget = 512ull * 1024 * 1024;
+        const size_t per_q = (size_t)H * T * sizeof(float);
+        const int group = H / Hkv;
+        const int n_q = (int)std::min<size_t>(
+            (size_t)S, std::max<size_t>(1, kScoreBudget / std::max<size_t>(1, per_q)));
+        const size_t q_bytes = (size_t)S * H * hd * sizeof(float);
+        const size_t sc_bytes = (size_t)H * n_q * T * sizeof(float);
+        auto grow = [&](float **buf, size_t *cap, size_t need,
+                        const char *label) -> bool {
+            if (need <= *cap) return true;
+            if (!vram_ok_to_grow(need - *cap)) return false;
+            if (*buf) { cudaFree(*buf); *buf = nullptr; }
+            *cap = 0;
+            if (cudaMalloc((void **)buf, need) != cudaSuccess) {
+                LOG_WARN("[CUDA] qwen4exp_attn_gpu_device_cached: %s grow failed\n",
+                         label);
+                return false;
+            }
+            *cap = need;
+            return true;
+        };
+        if (!grow(&d_q4_scores, &d_q4_scores_cap, sc_bytes, "d_q4_scores") ||
+            !grow(&d_q4_out, &d_q4_out_cap, q_bytes, "d_q4_out"))
+            return false;
+
+        const float alpha = 1.0f, beta = 0.0f;
+        PERF_START(q4_cmp);
+        for (int s0 = 0; s0 < S; s0 += n_q) {
+            const int nq = std::min(n_q, S - s0);
+            for (int kv = 0; kv < Hkv; ++kv) {
+                const int h0 = kv * group;
+                if (cublasSgemmStridedBatched(
+                        cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        T, nq, hd, &alpha,
+                        cache.k + (size_t)kv * hd, Hkv * hd, 0,
+                        d_q4_Q + (size_t)s0 * H * hd + (size_t)h0 * hd,
+                        H * hd, hd,
+                        &beta,
+                        d_q4_scores + (size_t)h0 * nq * T, T,
+                        (long long)nq * T, group) != CUBLAS_STATUS_SUCCESS)
+                    return false;
+            }
+            launch_qwen4exp_scale_softmax_causal(d_q4_scores, H, nq, T,
+                                                 pos_base + s0, scale, 0);
+            for (int kv = 0; kv < Hkv; ++kv) {
+                const int h0 = kv * group;
+                if (cublasSgemmStridedBatched(
+                        cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                        hd, nq, T, &alpha,
+                        cache.v + (size_t)kv * hd, Hkv * hd, 0,
+                        d_q4_scores + (size_t)h0 * nq * T, T,
+                        (long long)nq * T, &beta,
+                        d_q4_out + (size_t)s0 * H * hd + (size_t)h0 * hd,
+                        H * hd, hd, group) != CUBLAS_STATUS_SUCCESS)
+                    return false;
+            }
+        }
+        if (cudaStreamSynchronize(0) != cudaSuccess) return false;
+        PERF_END(q4_cmp, t_qwen4exp_attn_gpu_cmp);
+        *device_out = d_q4_out;
+        perf().n_qwen4exp_attn_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Only used when the GPU attention/post-projection path fails.  It
+    // reconstructs the compatibility host cache in one transfer per K/V
+    // tensor so CPU fallback remains correct without making this the normal
+    // decode path.
+    bool qwen4exp_attn_gpu_device_kv_to_host(
+        int layer, float *K_host, float *V_host, int T, int Hkv, int hd) {
+        if (layer < 0 || !K_host || !V_host || T <= 0 || Hkv <= 0 || hd <= 0 ||
+            (int)d_qwen4exp_kv_by_layer.size() <= layer)
+            return false;
+        const Qwen4ExpDeviceKvCache &cache =
+            d_qwen4exp_kv_by_layer[(size_t)layer];
+        const size_t row_bytes = (size_t)Hkv * hd * sizeof(float);
+        if (!cache.k || !cache.v || cache.max_t < T || cache.hkv != Hkv ||
+            cache.hd != hd || cache.bytes < (size_t)T * row_bytes)
+            return false;
+        cudaSetDevice(device_id);
+        return cudaMemcpy(K_host, cache.k, (size_t)T * row_bytes,
+                          cudaMemcpyDeviceToHost) == cudaSuccess &&
+               cudaMemcpy(V_host, cache.v, (size_t)T * row_bytes,
+                          cudaMemcpyDeviceToHost) == cudaSuccess;
+    }
+
     // Project and prepare Q/K/V directly on CUDA for Qwen4Exp prefill.  The
     // caller supplies the already device-resident HC activation and the three
     // resident projection weights.  This method intentionally implements the
@@ -2121,12 +2304,24 @@ public:
                       (size_t)total_pairs * sizeof(int))) return false;
             if (!grow((void**)&d_acc_w[gpu_id], &d_acc_w_cap[gpu_id],
                       (size_t)total_pairs * sizeof(float))) return false;
-            if (cudaMemcpy(d_acc_tok[gpu_id], tok_host, (size_t)total_pairs * sizeof(int),
-                           cudaMemcpyHostToDevice) != cudaSuccess) return false;
-            if (cudaMemcpy(d_acc_w[gpu_id], w_host, (size_t)total_pairs * sizeof(float),
-                           cudaMemcpyHostToDevice) != cudaSuccess) return false;
+            // The scatter kernels below run on the legacy/default stream and
+            // expert_accum_end() already provides the layer boundary wait.
+            // Queue these tiny control uploads there instead of forcing two
+            // blocking cudaMemcpy calls for every layer/token.  The caller's
+            // host route arrays remain alive until expert_accum_end(), so the
+            // async source-lifetime contract is satisfied even when they are
+            // ordinary pageable vectors.
+            if (cudaMemcpyAsync(d_acc_tok[gpu_id], tok_host,
+                                (size_t)total_pairs * sizeof(int),
+                                cudaMemcpyHostToDevice, 0) != cudaSuccess)
+                return false;
+            if (cudaMemcpyAsync(d_acc_w[gpu_id], w_host,
+                                (size_t)total_pairs * sizeof(float),
+                                cudaMemcpyHostToDevice, 0) != cudaSuccess)
+                return false;
         }
-        if (cudaMemset(d_acc[gpu_id], 0, acc_b) != cudaSuccess) return false;
+        if (cudaMemsetAsync(d_acc[gpu_id], 0, acc_b, 0) != cudaSuccess)
+            return false;
         acc_active[gpu_id] = true;
         return true;
     }
@@ -2145,10 +2340,14 @@ public:
 
     // One [S,D] download per layer per GPU, ADDED into the host output (which
     // may already hold contributions from CPU-dispatched experts).
-    bool expert_accum_end(int gpu_id, float* out_host, int S, int D) {
+    bool expert_accum_end(int gpu_id, float* out_host, int S, int D,
+                          bool stream_already_synced = false) {
         if (gpu_id < 0 || gpu_id >= kMaxAccumGpus || !acc_active[gpu_id]) return false;
         cudaSetDevice(gpu_id);
-        if (cudaStreamSynchronize(0) != cudaSuccess) { acc_active[gpu_id] = false; return false; }
+        if (!stream_already_synced && cudaStreamSynchronize(0) != cudaSuccess) {
+            acc_active[gpu_id] = false;
+            return false;
+        }
         static thread_local std::vector<float> tmp;
         tmp.resize((size_t)S * D);
         PERF_START(acc_dn);

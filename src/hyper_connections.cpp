@@ -334,17 +334,36 @@ void hc_post_combine(StreamingEngine &engine, int layer_idx, int /*sub_block*/,
 // no inject tensor). norm/down/up are required; inject may be null.
 // out_hidden receives the mean-collapsed [S,D]; out_inject (when non-null)
 // receives [S,HC].
-static void qwen4exp_hc_mix_impl(StreamingEngine &engine,
+// `in_streams`: the [S, HC, D] multi-stream state to mix, stream-major per
+// token (same layout as engine.hc_stream_buf). Defaults to nullptr, meaning
+// "use engine.hc_stream_buf.data()" -- the trunk's own live, shared
+// residual state, exactly as before this parameter was added (both
+// pre-existing call sites omit it, so their behavior is byte-for-byte
+// unchanged). qwen4exp_mtp_forward (execution_layer.cpp) passes its own
+// local NextN-block res_hc buffer instead -- that state must never alias
+// engine.hc_stream_buf, which belongs to the target trunk's own, entirely
+// separate forward pass.
+// NOT static: qwen4exp_mtp_forward (execution_layer.cpp) calls this
+// directly (via its own extern declaration at the call site) to run the
+// shared MTP checkpoint's own hc_attn/hc_ffn/hc_head mixers against a
+// LOCAL res_hc buffer, deliberately bypassing qwen4exp_hc_pre_mix/
+// qwen4exp_hc_post_combine below (which are hardwired to engine.
+// hc_stream_buf and the trunk's own ggml-HC/device-router bookkeeping --
+// wrong state entirely for the NextN block's own independent residual).
+void qwen4exp_hc_mix_impl(StreamingEngine &engine,
                                   const std::string &norm_name,
                                   const std::string &down_name,
                                   const std::string &up_name,
                                   const std::string &inject_name, int S, int D,
                                   float *out_hidden, float *out_inject,
-                                  int trace_layer) {
+                                  int trace_layer,
+                                  const float *in_streams = nullptr) {
   auto &c = engine.model_file.architecture_config;
   const int HC = c.hc_mult;
   const int hc_dim = HC * D;
   const int hc_lr = c.hc_low_rank;
+  const float *const streams_base =
+      in_streams ? in_streams : engine.hc_stream_buf.data();
 
   // 1. grouped RMS norm: ggml_rms_norm over x [n_embd, hc, T] normalizes
   // over ne0 = n_embd PER (stream, token) with NO learned gain (the gain is
@@ -373,7 +392,7 @@ static void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   // until this session added t_hc_hooks.
 #pragma omp parallel for schedule(static)
   for (int s = 0; s < S; ++s) {
-    const float *streams = engine.hc_stream_buf.data() + (size_t)s * HC * D;
+    const float *streams = streams_base + (size_t)s * HC * D;
     float *out = xn + (size_t)s * hc_dim;
     for (int h = 0; h < HC; ++h) {
       const float *row = streams + (size_t)h * D;
@@ -483,6 +502,17 @@ bool qwen4exp_hc_prepare_host_layer_input(StreamingEngine &engine, int S) {
     return true;
   hc_ggml_abort(engine, S, "layer-input host sync failed");
   return false;
+}
+
+// Measurement-only bridge for Qwen's router pilot. Unlike the PLE bridge
+// above, a failed snapshot must not abort the forward pass: the pilot is
+// advisory and the production router remains authoritative. The host copy is
+// already current on the legacy HC path; only the GGML-device path needs the
+// one explicit device->host snapshot.
+bool qwen4exp_hc_download_streams(StreamingEngine &engine, int S) {
+  if (!g_hc_ggml_live) return true;
+  return GgmlHcRunner::instance().download_streams(
+      engine.hc_stream_buf.data(), S);
 }
 
 bool qwen4exp_hc_commit_host_layer_input(StreamingEngine &engine, int S) {
@@ -600,7 +630,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
     const bool dual_gdn_pre_output =
         device_gdn_input && dual_hc_gdn_pre_output();
     const bool device_full_attn_input =
-        engine.qwen4exp_attn_gpu && sub_block == 0 && S > 1 &&
+        engine.qwen4exp_attn_gpu && sub_block == 0 && S > 0 &&
         !qwen4exp_is_gdn_layer(c, layer_idx);
     const bool device_moe_input =
         moe_ggml_mul_mat_id() && sub_block == 1 &&
@@ -768,21 +798,35 @@ void hc_collapse_output(StreamingEngine &engine, float *hidden_states, int S,
   // execution. This is the one forward-level drain.
   GgmlMoeRunner::finish_all_h2d();
   const auto after_h2d = std::chrono::steady_clock::now();
-  double moe_h2d_s = 0.0;
-  size_t moe_h2d_b = 0;
-  GgmlMoeRunner::collect_all_h2d(moe_h2d_s, moe_h2d_b);
-  if (moe_h2d_b) {
-    perf().t_prefill_stream_h2d.fetch_add(moe_h2d_s,
-                                          std::memory_order_relaxed);
-    perf().bytes_prefill_stream_h2d.fetch_add(moe_h2d_b,
-                                              std::memory_order_relaxed);
+  GgmlMoeTransferStats moe_copy;
+  GgmlMoeRunner::collect_all_transfer_stats(moe_copy);
+  if (moe_copy.h2d_bytes || moe_copy.d2d_bytes) {
+    perf().t_ggml_moe_d2d.fetch_add(moe_copy.d2d_seconds,
+                                    std::memory_order_relaxed);
+    perf().t_ggml_moe_h2d.fetch_add(moe_copy.h2d_seconds,
+                                    std::memory_order_relaxed);
+    perf().t_ggml_moe_h2d_dma.fetch_add(moe_copy.h2d_dma_seconds,
+                                        std::memory_order_relaxed);
+    perf().bytes_ggml_moe_d2d.fetch_add(moe_copy.d2d_bytes,
+                                        std::memory_order_relaxed);
+    perf().bytes_ggml_moe_h2d.fetch_add(moe_copy.h2d_bytes,
+                                        std::memory_order_relaxed);
+    if (moe_copy.h2d_bytes) {
+      perf().t_prefill_stream_h2d.fetch_add(moe_copy.h2d_seconds,
+                                            std::memory_order_relaxed);
+      perf().bytes_prefill_stream_h2d.fetch_add(
+          moe_copy.h2d_bytes, std::memory_order_relaxed);
+    }
   }
 
   // Full device GDN keeps each layer's recurrent state and convolution tail
   // on the shared GGML backend while the 48-layer forward pass is queued.
   // Publish those small persistent updates to the engine's host state once,
   // before any subsequent request can observe them.
-  GgmlGdnProjRunner::instance().finish_full_device_updates();
+  // Prefill keeps the existing host state contract for prompt-cache and
+  // fallback paths.  Decode consumes the persistent GDN state on the GGML
+  // device and must not perform a state D2H/D2H round trip every token.
+  GgmlGdnProjRunner::instance().finish_full_device_updates(S > 1);
   const auto after_gdn = std::chrono::steady_clock::now();
 
   // Every layer's brackets are done; bring the device state back so the

@@ -200,6 +200,16 @@ struct ExpertLocation {
     bool upload_ready = true;
     cudaEvent_t upload_event = nullptr;
 
+    // Persistent per-active-slot CUDA events used to measure the actual H2D
+    // interval.  They are never created in the per-transfer path.  The main
+    // VRAM cache keeps using upload_event alone.
+    cudaEvent_t upload_start_event = nullptr;
+    bool upload_timing_pending = false;
+    bool upload_timing_recorded = false;
+    bool upload_timing_async = false;
+    bool upload_source_pinned = false;
+    size_t last_upload_bytes = 0;
+
     // 2026-08-28: guards a real race the worker-thread upload path
     // introduces (ActiveLayerUploadWorkers, active_layer_upload_workers.
     // hpp) that does NOT exist for any synchronous or same-thread-async
@@ -901,6 +911,7 @@ public:
         // upload_event, added 2026-08-26 (see allocate_active_layer_area).
         for (auto& loc : active_layer_slots) {
             if (loc.upload_event) { cudaSetDevice(loc.gpu_id); cudaEventDestroy(loc.upload_event); }
+            if (loc.upload_start_event) { cudaSetDevice(loc.gpu_id); cudaEventDestroy(loc.upload_start_event); }
         }
         for (auto& dev : devices) {
             if (dev.compute_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.compute_stream); }
@@ -1723,6 +1734,21 @@ public:
         }
         for (auto& loc : expert_vram_cache) {
             if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
+                if (loc.temp_pin_count > 0) loc.temp_pin_count--;
+                return;
+            }
+        }
+        // Defensive cross-tier recovery. A few legacy/deferred callers do
+        // not carry the source-pool bit alongside a raw device pointer. If
+        // the main-cache identity is gone but the exact pointer is still a
+        // live active-layer slot, release that slot instead of leaking its
+        // temporary pin and reporting a false identity-change error. The
+        // pointer comparison is required: layer/expert alone is not enough
+        // because the same identity may be re-materialized in the other
+        // pool during a promotion.
+        for (auto& loc : active_layer_slots) {
+            if (loc.layer_idx == layer && loc.expert_id == expert_id &&
+                loc.device_ptr == device_ptr) {
                 if (loc.temp_pin_count > 0) loc.temp_pin_count--;
                 return;
             }
@@ -2729,6 +2755,16 @@ public:
     ExpertLocation* find_active_expert(int layer, int expert_id,
                                         const std::function<void(int, int)>& on_promoted = nullptr);
 
+    // Like find_active_expert(), but if the matching active-layer upload is
+    // already dispatched and still in flight, wait for that one CUDA event
+    // before retrying. This prevents a consumer from issuing a duplicate
+    // host upload for an expert that was already predicted and copied.
+    // Worker-claimed slots whose upload has not been dispatched are still
+    // reported as misses rather than blocking on an unbounded worker.
+    ExpertLocation* find_active_expert_wait(
+        int layer, int expert_id,
+        const std::function<void(int, int)>& on_promoted = nullptr);
+
     // Side-effect-free residency peek for the active layer area -- unlike
     // find_active_expert, this NEVER bumps hit_count/last_used_clock and
     // NEVER triggers promote_active_to_main. Exists specifically for
@@ -2810,6 +2846,12 @@ public:
     }
 
 private:
+    // Consume one active-layer start/end event pair after its completion event
+    // is known to have fired.  CUDA event time is the copy-engine interval,
+    // not the CPU issue/wait time or a session-wide bytes/time ratio.
+    void record_active_layer_upload_event_timing(ExpertLocation& slot,
+                                                 bool sync_path);
+
     void assign_roles() {
         int n = devices.size();
         if (n == 0) return;

@@ -156,10 +156,18 @@ inline void release_host_admission_lock() {
 inline bool run(double required_host_ram_gb,
                  const std::vector<int> &gpu_device_ids, bool force,
                  double margin_gb = -1.0) {
+  // 10 GB floor, per explicit user instruction after the 2026-09-09 crash
+  // (was 8 GB): that incident's own surviving log showed the ledger sitting
+  // at 91.87/100 GB -- comfortably inside an 8 GB margin -- immediately
+  // before the machine went down hard enough to need a reboot. Raising the
+  // floor does not by itself prove sufficiency (this box's own zram swap
+  // degrades off a cliff, not a slope -- see CLAUDE.md), but it is a real,
+  // direct, low-risk response to the one concrete number this incident did
+  // produce.
   if (margin_gb < 0.0)
-    margin_gb = required_host_ram_gb * 0.05 > 8.0
+    margin_gb = required_host_ram_gb * 0.05 > 10.0
                     ? required_host_ram_gb * 0.05
-                    : 8.0;
+                    : 10.0;
 
   bool ok = true;
 

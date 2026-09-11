@@ -3,6 +3,7 @@
 #include "dense_dispatch.hpp"
 #include "prefill_expert_stream.hpp"
 #include "ggml_moe_backend.hpp"
+#include "ggml_gdn_proj_backend.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
@@ -47,6 +48,7 @@ extern bool qwen4exp_hc_post_combine_device_raw(
     const void *device_data);
 extern bool qwen4exp_hc_prepare_host_layer_input(StreamingEngine &engine,
                                                   int S);
+extern bool qwen4exp_hc_download_streams(StreamingEngine &engine, int S);
 extern bool qwen4exp_hc_commit_host_layer_input(StreamingEngine &engine,
                                                  int S);
 extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
@@ -650,6 +652,10 @@ struct PendingGpuExpert {
   // CLAUDE.md's active-reclaim entries). This field exists so Pass B
   // never needs to trust exp's mutable state again for this one purpose.
   int expert_id = -1;
+  // Decode-time device accumulation has already consumed this expert's
+  // d_down with expert_accum_add(). Keep the VRAM hold and RAM pin until the
+  // accumulator's final stream wait below, then release them together.
+  bool accumulated_on_device = false;
 };
 
 // 2026-08-29: minimal grow-only pinned-host float buffer, backed by
@@ -788,6 +794,18 @@ struct LayerScratch {
   std::vector<MoEExpertBlock *> expert_ptrs; // [topk]
   std::vector<float> pilot_nrm;              // [D]
   std::vector<float> pilot_logits;           // [n_experts]
+
+  // Qwen4Exp-only router pilot. The HC graph's mixed activation is not
+  // exposed as a host tensor between layers, so this explicitly records a
+  // stream-0 proxy from the device-authoritative HC state. It is kept
+  // separate from the conventional pilot fields above so other families
+  // cannot accidentally consume or overwrite Qwen measurements.
+  static constexpr int kQwenPilotMax = 16;
+  std::array<int, kQwenPilotMax> qwen_pilot_pred_ids{};
+  std::vector<float> qwen_pilot_logits; // [n_experts]
+  int qwen_pilot_pred_count = 0;
+  int qwen_pilot_pred_layer = -1;
+  int qwen_pilot_prefetch_count = 0;
 
   // Metadata-only "shadow" blocks (StreamingEngine::populate_vram_shadow)
   // for experts already confirmed GPU-resident before the per-token
@@ -1034,6 +1052,10 @@ struct LayerScratch {
     vram_loc_hint.assign(std::max(1, topk), nullptr);
     pilot_nrm.resize(D);
     pilot_logits.resize(n_experts);
+    qwen_pilot_logits.resize(n_experts);
+    qwen_pilot_pred_count = 0;
+    qwen_pilot_pred_layer = -1;
+    qwen_pilot_prefetch_count = 0;
     pilot_wide_nrm.resize(D);
     pilot_wide_logits.resize(n_experts);
     pilot_attn_snapshot.resize(D);
@@ -2148,6 +2170,128 @@ static void expert_ffn_cpu(const float *input, float *output,
   perf().n_expert_cpu_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Qwen4Exp CPU-affinity fast path for the quantized expert projections.
+// BeeLlama's CPU MUL_MAT_ID path groups the selected matrices, quantizes the
+// shared gate/up activation once, and uses ggml's quantized dot kernels rather
+// than dequantizing every output row. Qwen uses IQ1_M or IQ2_XXS gate/up and
+// IQ4_NL down in this checkpoint. Keep this helper family- and config-gated so
+// mixed-quant and non-Qwen models retain the established fallback.
+static bool expert_ffn_cpu_qwen_grouped_quantized(
+    const float *input, float *output,
+    const std::vector<MoEExpertBlock *> &experts, const float *weights, int D,
+    int moe_inter, float swiglu_clamp, int layer_idx) {
+  const int n = static_cast<int>(experts.size());
+  if (!input || !output || !weights || n <= 0 || D <= 0 || moe_inter <= 0)
+    return false;
+  std::vector<const uint8_t *> gate_w((size_t)n);
+  std::vector<const uint8_t *> up_w((size_t)n);
+  std::vector<const uint8_t *> down_w((size_t)n);
+  std::vector<float *> gate((size_t)n);
+  std::vector<float *> up((size_t)n);
+  std::vector<float *> down((size_t)n);
+  std::vector<float> gate_storage((size_t)n * moe_inter);
+  std::vector<float> up_storage((size_t)n * moe_inter);
+  std::vector<float> down_storage((size_t)n * D);
+  GGUFType gate_type = GGUFType::F32;
+  GGUFType up_type = GGUFType::F32;
+  GGUFType down_type = GGUFType::F32;
+  bool types_initialized = false;
+  for (int i = 0; i < n; ++i) {
+    MoEExpertBlock *e = experts[(size_t)i];
+    if (!e || e->vram_shadow || !e->gate_proj.host_ptr ||
+        !e->up_proj.host_ptr || !e->down_proj.host_ptr)
+      return false;
+    if (!types_initialized) {
+      gate_type = e->gate_proj.meta.type;
+      up_type = e->up_proj.meta.type;
+      down_type = e->down_proj.meta.type;
+      types_initialized = true;
+    }
+    if (e->gate_proj.meta.type != gate_type ||
+        e->up_proj.meta.type != up_type ||
+        e->down_proj.meta.type != down_type)
+      return false;
+    gate_w[(size_t)i] = e->gate_proj.host_ptr;
+    up_w[(size_t)i] = e->up_proj.host_ptr;
+    down_w[(size_t)i] = e->down_proj.host_ptr;
+    gate[(size_t)i] = gate_storage.data() + (size_t)i * moe_inter;
+    up[(size_t)i] = up_storage.data() + (size_t)i * moe_inter;
+    down[(size_t)i] = down_storage.data() + (size_t)i * D;
+  }
+
+  PERF_START(qwen_cpu_group);
+  auto grouped_gate_up = [&](float *const *dst, const uint8_t *const *weights,
+                             GGUFType type) {
+    switch (type) {
+    case GGUFType::IQ1_M:
+      return matmul_iq1_m_ggml_q8k_grouped(dst, input, weights, n, 1, D,
+                                           moe_inter);
+    case GGUFType::IQ2_XXS:
+      // Qwen's grouped CPU path uses GGML's production kernel directly,
+      // matching BeeLlama's MUL_MAT_ID implementation.  Keep the existing
+      // AVX2-prototype gate for all non-Qwen callers; this switch is reached
+      // only by the Qwen4Exp-specific helper below.
+      return matmul_iq2_xxs_ggml_q8k_grouped(dst, input, weights, n, 1, D,
+                                              moe_inter);
+    case GGUFType::IQ3_XXS:
+      return matmul_iq3_xxs_ggml_q8k_grouped(dst, input, weights, n, 1, D,
+                                              moe_inter);
+    default:
+      return false;
+    }
+  };
+  if (!grouped_gate_up(gate.data(), gate_w.data(), gate_type) ||
+      !grouped_gate_up(up.data(), up_w.data(), up_type)) {
+    PERF_END(qwen_cpu_group, t_cpu_expert);
+    return false;
+  }
+  for (int i = 0; i < n; ++i) {
+    if (swiglu_clamp_fused()) {
+      swiglu_clamp_fused_inplace(gate[(size_t)i], up[(size_t)i], moe_inter,
+                                 swiglu_clamp);
+    } else {
+      silu_inplace(gate[(size_t)i], moe_inter);
+      elem_mul(gate[(size_t)i], gate[(size_t)i], up[(size_t)i], moe_inter);
+      swiglu_clamp_inplace(gate[(size_t)i], moe_inter, swiglu_clamp);
+    }
+  }
+  bool down_grouped = false;
+  // The IQ4_NL q8_0 kernel is kept behind an explicit diagnostic switch until
+  // its numerical output is checked against cpu_quant_matmul on this model's
+  // exact GGUF rows.  The validated default remains the old down projection;
+  // gate/up grouping is independent and remains enabled below.
+  static const bool enable_grouped_iq4_nl = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN4EXP_GROUPED_IQ4_NL");
+    return env && env[0] == '1';
+  }();
+  if (enable_grouped_iq4_nl && down_type == GGUFType::IQ4_NL) {
+    std::vector<const float *> act((size_t)n);
+    for (int i = 0; i < n; ++i)
+      act[(size_t)i] = gate[(size_t)i];
+    down_grouped = matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+        down.data(), act.data(), down_w.data(), n, 1, moe_inter, D);
+  }
+  if (!down_grouped) {
+    for (int i = 0; i < n; ++i) {
+      if (!cpu_quant_matmul(down_type, down_w[(size_t)i], gate[(size_t)i],
+                            down[(size_t)i], 1, moe_inter, D)) {
+        PERF_END(qwen_cpu_group, t_cpu_expert);
+        return false;
+      }
+    }
+  }
+  for (int d = 0; d < D; ++d) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i)
+      sum += weights[i] * down[(size_t)i][d];
+    output[d] += sum;
+  }
+  PERF_END(qwen_cpu_group, t_cpu_expert);
+  perf().n_expert_cpu_calls.fetch_add((uint64_t)n, std::memory_order_relaxed);
+  (void)layer_idx;
+  return true;
+}
+
 // Gating activation: turns one row of raw router logits into probs
 // in-place, per ArchitectureConfig::gating_func (GatingFunc, gguf_loader.
 // hpp). Shared by moe_forward_gguf's real router (below) AND the pilot
@@ -2391,7 +2535,7 @@ static bool run_ggml_moe_layer_chunked(
       if (rl && rl->device_ptr && rl->upload_ready &&
           rl->gpu_id == chosen_device &&
           topo->hold_for_compute(layer_idx, e, rl->device_ptr, false)) {
-        if (runner.copy_expert_d2d(slot_base + i, rl->device_ptr)) {
+        if (runner.copy_expert_d2d(buf, slot_base + i, rl->device_ptr)) {
           staged[(size_t)i] = 0;
           d2d_holds.push_back({e, rl->device_ptr});
           ++n_reused;
@@ -2400,6 +2544,7 @@ static bool run_ggml_moe_layer_chunked(
         }
       }
     }
+    if (!runner.mark_copy_d2d_done(buf)) return abort_pipeline();
     cudaSetDevice(chosen_device);
 
     std::vector<const uint8_t *> ram_sources((size_t)count, nullptr);
@@ -2510,11 +2655,12 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
                                const void **device_output = nullptr,
                                const void *device_input = nullptr,
                                const void *device_route_ids = nullptr,
-                               const void *device_route_weights = nullptr) {
+                               const void *device_route_weights = nullptr,
+                               bool allow_active_layer_sources = false) {
   if (device_output) *device_output = nullptr;
   if (!GgmlMoeRunner::compiled_in()) return false;
   const int n_used = (int)used.size();
-  if (n_used <= 0 || S <= 1 || topk <= 0 || D <= 0 || moe_inter <= 0)
+  if (n_used <= 0 || S < 1 || topk <= 0 || D <= 0 || moe_inter <= 0)
     return false;
   if (!topo) return false;
   static const bool trace_set = [] {
@@ -2778,6 +2924,7 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
   struct D2DHold {
     int expert_id;
     const uint8_t *device_ptr;
+    bool from_active_layer;
   };
   std::vector<D2DHold> d2d_holds;
   d2d_holds.reserve((size_t)n_used);
@@ -2788,6 +2935,7 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
   std::vector<RamH2DHold> ram_h2d_holds;
   ram_h2d_holds.reserve((size_t)n_used);
   int n_reused = 0;
+  int n_active_reused = 0;
   int n_ram_direct = 0;
   int n_ram_staged = 0;
   std::vector<char> staged_flag((size_t)chunk, 1);
@@ -2822,7 +2970,7 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
   // D2D cache copies use a separate raw stream. The sync point below drains
   // only that stream in backend mode; H2D staging and graph work remain
   // continuously queued on GGML's shared stream.
-  const bool use_d2d = !no_d2d;
+    const bool use_d2d = !no_d2d;
 
   for (int c = 0; c < n_chunks; ++c) {
     const int c0 = c * chunk;
@@ -2837,6 +2985,15 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
     PERF_START(gm_wait);
     runner.wait_stage_free(buf);
     PERF_END(gm_wait, t_prefill_stream_wait);
+
+    // Start the copy-stream timing batch before VRAM reuse is queued.  This
+    // lets the runner report the real D2D and H2D CUDA-event intervals
+    // separately; the old placement started the timer only after D2D and
+    // made the source breakdown ambiguous.
+    if (!runner.begin_copy_batch(buf)) {
+      runner.sync_copies();
+      return false;
+    }
 
     // Classify BEFORE staging: an expert already resident in this GPU's VRAM
     // cache is filled device-to-device (~600 GB/s) instead of being read out
@@ -2858,20 +3015,33 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
         if (rl->gpu_id == chosen_device)
           trace_resident_gpu.push_back(e);
       }
+      bool from_active_layer = false;
+      if (!rl && use_d2d && allow_active_layer_sources) {
+        bool promoted_to_main = false;
+        rl = topo->find_active_expert_wait(
+            layer_idx, e, [&](int, int) { promoted_to_main = true; });
+        from_active_layer = rl != nullptr && !promoted_to_main;
+      }
       if (rl && rl->device_ptr && rl->upload_ready &&
           rl->gpu_id == chosen_device &&
-          topo->hold_for_compute(layer_idx, e, rl->device_ptr, false)) {
-        if (runner.copy_expert_d2d(i, rl->device_ptr)) {
+          topo->hold_for_compute(layer_idx, e, rl->device_ptr,
+                                 from_active_layer)) {
+        if (runner.copy_expert_d2d(buf, i, rl->device_ptr)) {
           staged_flag[(size_t)(i - c0)] = 0;
           trace_source[(size_t)i] = 1;
-          d2d_holds.push_back({e, rl->device_ptr});
+          d2d_holds.push_back({e, rl->device_ptr, from_active_layer});
           ++n_reused;
+          if (from_active_layer) ++n_active_reused;
         } else {
           // Copy could not be issued -- give the hold straight back and let
           // this expert go through the normal staging path below.
-          topo->release_hold(layer_idx, e, rl->device_ptr, false);
+          topo->release_hold(layer_idx, e, rl->device_ptr, from_active_layer);
         }
       }
+    }
+    if (!runner.mark_copy_d2d_done(buf)) {
+      runner.sync_copies();
+      return false;
     }
     // find_expert() -> finish_expert_hit() does cudaSetDevice(loc.gpu_id) and
     // does NOT restore it, so a hit on an expert resident on the other vault
@@ -2881,7 +3051,8 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
     if (!runner.begin_copy_batch(buf)) {
       runner.sync_copies();
       for (const auto &h : d2d_holds)
-        topo->release_hold(layer_idx, h.expert_id, h.device_ptr, false);
+        topo->release_hold(layer_idx, h.expert_id, h.device_ptr,
+                          h.from_active_layer);
       for (const auto &h : ram_h2d_holds)
         ram_mgr.ram_unpin(*h.block);
       return false;
@@ -3059,7 +3230,8 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
       runner.sync_copies();
       if (runner.backend_stream_copies()) runner.finish_h2d();
       for (const auto &h : d2d_holds)
-        topo->release_hold(layer_idx, h.expert_id, h.device_ptr, false);
+        topo->release_hold(layer_idx, h.expert_id, h.device_ptr,
+                          h.from_active_layer);
       for (const auto &h : ram_h2d_holds)
         ram_mgr.ram_unpin(*h.block);
       LOG_ERROR("[GGML-MOE] layer=%d chunk@%d: staging failed -- falling back "
@@ -3080,7 +3252,8 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
   PERF_END(gm_sync, t_prefill_stream_wait);
   if (!runner.backend_stream_copies()) {
     for (const auto &h : d2d_holds)
-      topo->release_hold(layer_idx, h.expert_id, h.device_ptr, false);
+      topo->release_hold(layer_idx, h.expert_id, h.device_ptr,
+                        h.from_active_layer);
     for (const auto &h : ram_h2d_holds)
       ram_mgr.ram_unpin(*h.block);
     ram_h2d_holds.clear();
@@ -3158,9 +3331,11 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
                           std::chrono::steady_clock::now() - t_graph0)
                           .count();
     LOG_INFO("[GGML-MOE] layer=%d experts=%d gate=%u up=%u down=%u "
-             "graph=%.2f ms ram_direct=%d ram_staged=%d mmap_staged=%.2f MB\n",
+             "graph=%.2f ms d2d=%d active_d2d=%d ram_direct=%d "
+             "ram_staged=%d mmap_staged=%.2f MB\n",
              layer_idx, n_used, (unsigned)g0->type, (unsigned)u0->type,
-             (unsigned)d0->type, ms, n_ram_direct, n_ram_staged,
+             (unsigned)d0->type, ms, n_reused, n_active_reused,
+             n_ram_direct, n_ram_staged,
              (double)mmap_staged_total / (1024.0 * 1024.0));
   }
 
@@ -3221,12 +3396,27 @@ static bool run_ggml_moe_layer(StreamingEngine &engine,
              format_ids(mmap_ids).c_str(), format_ids(h2d_ids).c_str());
   }
 
-  double h2d_s = 0.0;
-  size_t h2d_b = 0;
-  runner.collect_h2d(h2d_s, h2d_b);
-  if (h2d_b) {
-    perf().t_prefill_stream_h2d.fetch_add(h2d_s, std::memory_order_relaxed);
-    perf().bytes_prefill_stream_h2d.fetch_add(h2d_b, std::memory_order_relaxed);
+  GgmlMoeTransferStats transfer;
+  runner.collect_transfer_stats(transfer);
+  if (transfer.h2d_bytes || transfer.d2d_bytes) {
+    perf().t_ggml_moe_d2d.fetch_add(transfer.d2d_seconds,
+                                    std::memory_order_relaxed);
+    perf().t_ggml_moe_h2d.fetch_add(transfer.h2d_seconds,
+                                    std::memory_order_relaxed);
+    perf().t_ggml_moe_h2d_dma.fetch_add(transfer.h2d_dma_seconds,
+                                        std::memory_order_relaxed);
+    perf().bytes_ggml_moe_d2d.fetch_add(transfer.d2d_bytes,
+                                        std::memory_order_relaxed);
+    perf().bytes_ggml_moe_h2d.fetch_add(transfer.h2d_bytes,
+                                        std::memory_order_relaxed);
+    // Preserve the existing generic report for compatibility, but it now
+    // contains only actual H2D bytes/time from this runner.
+    if (transfer.h2d_bytes) {
+      perf().t_prefill_stream_h2d.fetch_add(transfer.h2d_seconds,
+                                            std::memory_order_relaxed);
+      perf().bytes_prefill_stream_h2d.fetch_add(
+          transfer.h2d_bytes, std::memory_order_relaxed);
+    }
   }
   return ok;
 }
@@ -3370,6 +3560,16 @@ static bool qwen4exp_device_route_enabled() {
     return e && e[0] == '1';
   }();
   return enabled;
+}
+
+// The grouped Qwen decode graph sources routed weights from the main VRAM
+// cache/RAM tier and does not consume temporary active-layer slots. Keep the
+// older active-layer prewarm mechanisms out of that path; otherwise they move
+// the same experts into a pool the grouped graph never consults. Explicitly
+// family-gated so other model families retain their existing behavior.
+static bool qwen4exp_decode_ggml_path(const StreamingEngine &engine) {
+  return engine.qwen4exp_decode_ggml_moe &&
+         engine.family_ops.family == ModelFamily::Qwen4Exp;
 }
 
 // ============================================================
@@ -4300,6 +4500,93 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   } // end t_moe_topk_select scope (Phase 1)
   }
 
+  // Qwen4Exp pilot recall is checked at the shared host route-table point,
+  // after the real IDs have been populated and before any expert dispatch.
+  // Decode and the normal Qwen GPU-router fallback both use this compact host
+  // route. The all-resident device-only prefill route has no host IDs here and
+  // therefore contributes no false measurement; its production behavior is
+  // unchanged.
+  if (!gpu_route_device && scratch.qwen_pilot_pred_layer == layer_idx &&
+      S > 0) {
+    const int s = S - 1;
+    int overlap = 0;
+    int prefetch_overlap = 0;
+    const int prefetch_count = std::min(scratch.qwen_pilot_prefetch_count,
+                                        scratch.qwen_pilot_pred_count);
+    const bool track_qwen_layer =
+        layer_idx >= 0 &&
+        layer_idx < PerfCounters::kMaxTrackedLayersForMiss;
+    for (int pk = 0; pk < scratch.qwen_pilot_pred_count; ++pk) {
+      const int predicted = scratch.qwen_pilot_pred_ids[pk];
+      bool matched = false;
+      for (int k = 0; k < topk; ++k) {
+        if (scratch.tok_topk_ids[(size_t)s * topk + k] == predicted) {
+          matched = true;
+          break;
+        }
+      }
+      if (matched)
+        ++overlap;
+      if (pk < prefetch_count) {
+        perf().n_qwen_pilot_prefetch_rank_checks[pk].fetch_add(
+            1, std::memory_order_relaxed);
+        if (matched) {
+          ++prefetch_overlap;
+          perf().n_qwen_pilot_prefetch_rank_hits[pk].fetch_add(
+              1, std::memory_order_relaxed);
+        }
+      }
+      if (pk < PerfCounters::kQwenPilotMaxRanks) {
+        perf().n_qwen_pilot_rank_checks[pk].fetch_add(
+            1, std::memory_order_relaxed);
+        if (matched)
+          perf().n_qwen_pilot_rank_hits[pk].fetch_add(
+              1, std::memory_order_relaxed);
+        if (track_qwen_layer) {
+          perf().n_qwen_pilot_rank_checks_by_layer[layer_idx][pk].fetch_add(
+              1, std::memory_order_relaxed);
+          if (matched)
+            perf().n_qwen_pilot_rank_hits_by_layer[layer_idx][pk].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+      }
+    }
+    const uint64_t predicted_slots =
+        (uint64_t)scratch.qwen_pilot_pred_count;
+    perf().n_qwen_pilot_recall_hits.fetch_add((uint64_t)overlap,
+                                               std::memory_order_relaxed);
+    perf().n_qwen_pilot_recall_checks.fetch_add(1,
+                                                std::memory_order_relaxed);
+    perf().n_qwen_pilot_recall_pred_size_sum.fetch_add(
+        predicted_slots, std::memory_order_relaxed);
+    if (track_qwen_layer) {
+      perf().n_qwen_pilot_recall_hits_by_layer[layer_idx].fetch_add(
+          (uint32_t)overlap, std::memory_order_relaxed);
+      perf().n_qwen_pilot_recall_pred_size_sum_by_layer[layer_idx].fetch_add(
+          (uint32_t)predicted_slots, std::memory_order_relaxed);
+      perf().n_qwen_pilot_recall_checks_by_layer[layer_idx].fetch_add(
+          1, std::memory_order_relaxed);
+      if (prefetch_count > 0) {
+        perf().n_qwen_pilot_prefetch_recall_hits_by_layer[layer_idx].fetch_add(
+            (uint32_t)prefetch_overlap, std::memory_order_relaxed);
+        perf().n_qwen_pilot_prefetch_recall_pred_size_sum_by_layer[layer_idx]
+            .fetch_add((uint32_t)prefetch_count, std::memory_order_relaxed);
+        perf().n_qwen_pilot_prefetch_recall_checks_by_layer[layer_idx]
+            .fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    if (prefetch_count > 0) {
+      perf().n_qwen_pilot_prefetch_recall_hits.fetch_add(
+          (uint64_t)prefetch_overlap, std::memory_order_relaxed);
+      perf().n_qwen_pilot_prefetch_recall_checks.fetch_add(
+          1, std::memory_order_relaxed);
+      perf().n_qwen_pilot_prefetch_recall_pred_size_sum.fetch_add(
+          (uint64_t)prefetch_count, std::memory_order_relaxed);
+    }
+    scratch.qwen_pilot_pred_layer = -1;
+    scratch.qwen_pilot_pred_count = 0;
+  }
+
   // --- Prefill sliding-window RAM capacity, P2 (2026-08-30) ------------
   // EngineConfig::prefill_window_cap. Placed HERE, immediately after
   // Phase 1 and BEFORE Phase 2 pushes this layer's prefetch hints, for
@@ -4442,6 +4729,7 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     const bool prefill_stream_bypasses_active_prewarm =
         moe_prefill_stream() && engine.model_file.mmap_active();
     if (!prefill_stream_bypasses_active_prewarm &&
+        !qwen4exp_decode_ggml_path(engine) &&
         ram_mgr.vram_cache->active_layer_capacity > 0) {
       std::vector<ExpertLocation *> active_prewarm_batch;
       std::vector<MoEExpertBlock *> active_prewarm_pinned_blocks;
@@ -4800,7 +5088,8 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       engine.glm5next_moe_prefill_gpu &&
       engine.family_ops.family == ModelFamily::GLM5NEXT;
   bool batched_handled = false;
-  if (gpu_route_device && S > 1 && topk > 0 && n_experts > 0) {
+  if (gpu_route_device && S > 1 && topk > 0 && n_experts > 0 &&
+      !is_cpu_affinity_layer(layer_idx)) {
     // Keep the actual routed set for compact fallback.  The previous device
     // handoff made `used` the complete [0,n_experts) range so global IDs could
     // be passed directly to the device graph.  That was correct only for the
@@ -4867,7 +5156,8 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
     const bool qwen_device_handoff =
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
-        engine.family_ops.uses_hyper_connections && qwen4exp_hc_device_live();
+        engine.family_ops.uses_hyper_connections && qwen4exp_hc_device_live() &&
+        !is_cpu_affinity_layer(layer_idx);
     bool ggml_handled =
         qwen_device_handoff && clamp_exp == 0.0f && ram_mgr.vram_cache &&
         run_ggml_moe_layer(
@@ -5051,6 +5341,7 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       bool qwen_device_handoff = false;
       bool shared_device_handled = false;
       if (moe_ggml_mul_mat_id() && clamp_exp == 0.0f && n_used > 0 &&
+          !is_cpu_affinity_layer(layer_idx) &&
           ram_mgr.vram_cache) {
         qwen_device_handoff =
             engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -5769,6 +6060,71 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
   }
 
+  // Qwen4Exp decode-only grouped routed FFN.  The ordinary grouped path
+  // above is intentionally prefill-only because its expert-major buckets are
+  // built for many source rows.  For S==1, the same GGML MUL_MAT_ID graph is
+  // still valuable: it collapses this token's up-to-topk expert cache lookup,
+  // upload, dispatch, and host accumulation into one graph submission.  Keep
+  // this explicitly Qwen/device-HC gated so GLM, DeepSeek, and the validated
+  // legacy Qwen path are unchanged unless this new opt-in is present.
+  if (!batched_handled && S == 1 && topk > 0 && n_experts > 0 &&
+      engine.qwen4exp_decode_ggml_moe &&
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      engine.family_ops.uses_hyper_connections &&
+      qwen4exp_hc_device_live() && moe_ggml_mul_mat_id() &&
+      clamp_exp == 0.0f && !is_cpu_affinity_layer(layer_idx) &&
+      ram_mgr.vram_cache) {
+    std::vector<int> used;
+    used.reserve((size_t)n_experts);
+    for (int e = 0; e < n_experts; ++e)
+      if (scratch.expert_freq[(size_t)e] > 0)
+        used.push_back(e);
+
+    if (!used.empty()) {
+      const bool handled = run_ggml_moe_layer(
+          engine, ram_mgr, ram_mgr.vram_cache, layer_idx, S, D, moe_inter,
+          topk, n_experts, used, scratch.tok_topk_ids.data(),
+          scratch.tok_topk_weights.data(), scratch.normed.data(), output,
+          moe_prefill_stream_chunk(), engine.layer_is_unpacked(layer_idx),
+          &scratch.moe_device_output, engine.qwen4exp_device_hc_ffn_input,
+          nullptr, nullptr, /*allow_active_layer_sources=*/true);
+      if (handled) {
+        scratch.moe_device_output_ready =
+            scratch.moe_device_output != nullptr;
+        bool shared_device_handled = false;
+        if (moe_ggml_shared_expert() && c.n_expert_shared > 0) {
+          const void *combined = nullptr;
+          shared_device_handled = run_qwen4exp_shared_device(
+              engine, layer_idx, S, D, moe_inter,
+              engine.qwen4exp_device_hc_ffn_input,
+              scratch.moe_device_output, c, &combined);
+          if (shared_device_handled)
+            scratch.moe_device_output = combined;
+        }
+        if (!shared_device_handled && c.n_expert_shared > 0) {
+          // The routed result is device-resident, but the established host
+          // shared-expert implementation remains the correctness fallback.
+          if (!GgmlMoeRunner::active_instance().copy_device_output_to_host(
+                  scratch.moe_device_output, output)) {
+            LOG_ERROR("[GGML-MOE] Qwen decode layer=%d: routed output "
+                      "recovery failed\n",
+                      layer_idx);
+          }
+          scratch.moe_device_output = nullptr;
+          scratch.moe_device_output_ready = false;
+          run_qwen4exp_shared_host(engine, layer_idx, S, D, moe_inter,
+                                   scratch.normed.data(), output, scratch, c);
+        }
+        batched_handled = true;
+        static bool logged_qwen_decode_graph = false;
+        if (!logged_qwen_decode_graph) {
+          LOG_INFO("[GGML-MOE] Qwen4Exp grouped decode graph active (S=1)\n");
+          logged_qwen_decode_graph = true;
+        }
+      }
+    }
+  }
+
   // --- Phase 3: execute each token's already-selected experts ---
   for (int s = 0; !batched_handled && s < S; ++s) {
     // Diagnostic upper bound on this whole per-token dispatch loop --
@@ -5862,6 +6218,25 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     std::fill(force_cpu_offload_k.begin(), force_cpu_offload_k.begin() + topk,
               false);
 
+    // Decode normally routes one token through each selected expert.  Reuse
+    // the same device-side scatter accumulator as the grouped prefill path so
+    // the final [D] result is downloaded once per layer/GPU instead of once
+    // per expert.  The route table is tiny at S==1, but keep it in a
+    // thread-local grow-only vector so this does not allocate on every token.
+    const bool decode_gpu_accum = S == 1 && topk > 0 && moe_gpu_accum() &&
+                                  ram_mgr.vram_cache;
+    static thread_local std::vector<int> decode_accum_tok;
+    static thread_local std::vector<float> decode_accum_w;
+    bool decode_accum_begun[PerfCounters::PERF_MAX_GPU_SLOTS] = {};
+    if (decode_gpu_accum) {
+      decode_accum_tok.resize((size_t)topk);
+      decode_accum_w.resize((size_t)topk);
+      for (int k = 0; k < topk; ++k) {
+        decode_accum_tok[(size_t)k] = 0;
+        decode_accum_w[(size_t)k] = scratch.tok_topk_weights[s * topk + k];
+      }
+    }
+
     auto dispatch_expert_k = [&](int k) {
       // 2026-08-29, "Fifth round" of the phase3_loop-residual
       // investigation (see PerfCounters::t_shadow_precheck_total's
@@ -5896,6 +6271,31 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                  : (!exp->gate_proj.host_ptr ? "missing gate_proj.host_ptr"
                                              : "missing down_proj.host_ptr"),
             (void *)exp);
+        return;
+      }
+
+      // EngineConfig::moe_decode_batched (default OFF, PROTOTYPE) --
+      // decode-time (S==1) fast path. Skips the VRAM-cache resolve/lock/
+      // GPU-pool machinery below entirely and goes straight to the same
+      // CPU dequant-matmul call this lambda's own GPU-dispatch-failure
+      // branch already uses further down (ram_pin -> expert_ffn_cpu ->
+      // ram_unpin -> accumulate) -- see dense_dispatch.hpp's
+      // moe_decode_batched() for the full writeup, including the real
+      // trade-off (this expert can no longer be newly promoted into VRAM
+      // from a decode-time hit while this path is taken for it). Never
+      // engages for a vram_shadow block -- it has no host bytes to read
+      // without the synchronous reload the code below already handles;
+      // falls through unchanged for that case.
+      if (S == 1 && !exp->vram_shadow && moe_decode_batched()) {
+        ram_mgr.ram_pin(*exp);
+        expert_ffn_cpu(token_hidden, scratch.down_buf.data(),
+                       exp->gate_proj.host_ptr, exp->gate_proj.meta,
+                       exp->up_proj.host_ptr, exp->up_proj.meta,
+                       exp->down_proj.host_ptr, exp->down_proj.meta,
+                       scratch.gate_buf.data(), scratch.up_buf.data(), 1, D,
+                       moe_inter, clamp_exp, layer_idx, exp->expert_id);
+        ram_mgr.ram_unpin(*exp);
+        accumulate(k, exp, scratch.down_buf.data());
         return;
       }
 
@@ -6432,6 +6832,47 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
           scratch.expert_ptrs[ram_needed_k[i]] = ram_needed_ptrs[i];
         }
 
+        // Qwen-only CPU-affinity grouping. At this point every selected
+        // expert has a published RAM block and get_experts_batch has already
+        // pinned it for the dispatch that follows. Consume the whole token in
+        // one grouped gate/up pass when the IQ1_M geometry permits it, then
+        // clear the normal per-expert work lists so the legacy active-layer
+        // prewarm/upload/dispatch code becomes a no-op for this token. Other
+        // families, mixed quant signatures, and non-affinity layers retain
+        // the established path byte-for-byte.
+        if (S == 1 && engine.qwen4exp_cpu_ggml_moe &&
+            engine.family_ops.family == ModelFamily::Qwen4Exp &&
+            engine.family_ops.uses_hyper_connections &&
+            is_cpu_affinity_layer(layer_idx) &&
+            ram_needed_k.size() == (size_t)topk) {
+          std::vector<MoEExpertBlock *> grouped_experts((size_t)topk);
+          bool complete = true;
+          for (int k = 0; k < topk; ++k) {
+            grouped_experts[(size_t)k] = scratch.expert_ptrs[k];
+            if (!grouped_experts[(size_t)k] ||
+                grouped_experts[(size_t)k]->vram_shadow)
+              complete = false;
+          }
+          const float *grouped_weights =
+              scratch.tok_topk_weights.data() + (size_t)s * topk;
+          if (complete && expert_ffn_cpu_qwen_grouped_quantized(
+                              token_hidden, token_output, grouped_experts,
+                              grouped_weights, D, moe_inter, clamp_exp,
+                              layer_idx)) {
+            static std::atomic<bool> logged_grouped_cpu{false};
+            if (!logged_grouped_cpu.exchange(true, std::memory_order_relaxed))
+              LOG_STREAM_INFO()
+                  << "[CPU-MOE] Qwen grouped IQ1_M CPU path active at layer "
+                  << layer_idx << " (topk=" << topk
+                  << ", shared activation quantization)\n";
+            for (MoEExpertBlock *block : ram_needed_ptrs)
+              if (block) ram_mgr.ram_unpin(*block);
+            ram_needed_ids.clear();
+            ram_needed_k.clear();
+            ram_needed_ptrs.clear();
+          }
+        }
+
         // EngineConfig::cpu_offload_max_experts: of THIS token/
         // layer's genuine real-fetch misses (ram_was_real_fetch[i],
         // set by get_experts_batch's own Phase A -- the exact
@@ -6536,7 +6977,8 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         // orchestration-bound per call, not schedulable-around by
         // reordering when work gets issued. See CLAUDE.md's
         // 2026-08-19 entry for the full writeup.
-        if (engine.decode_async_prewarm && !cpu_only_mode() &&
+        if (engine.decode_async_prewarm &&
+            !qwen4exp_decode_ggml_path(engine) && !cpu_only_mode() &&
             !is_cpu_affinity_layer(layer_idx) && ram_mgr.vram_cache) {
           static thread_local std::vector<size_t> decode_async_candidates;
           decode_async_candidates.clear();
@@ -6872,19 +7314,15 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
 
     // --- Pass B, batched (2026-08-29): finish every GPU-issued expert
-    // queued above, but with only ONE cudaStreamSynchronize per DISTINCT
-    // vault GPU per round (not one per expert) -- see expert_ffn_gpu_
-    // finish_stage1/_stage2's own header comments for the real nsys
-    // evidence motivating this (cudaStreamSynchronize alone: 99,791
-    // calls/21.5s/26.4% of all CUDA API time, with "0% stream busy"
-    // already independently confirmed 4 times elsewhere in this
-    // codebase -- these calls were mostly waiting on nothing, pure
-    // fixed per-call overhead). Two shared-sync rounds, matching the
-    // ORIGINAL per-expert function's own two internal syncs (one before
-    // gate/up download, one after down-proj) -- grouped by loc->gpu_id
-    // because Pass A's in-flight experts can legitimately span more
-    // than one vault GPU in a multi-GPU/dual-role config, and stream 0
-    // is a PER-CURRENT-DEVICE default stream, not a single global one.
+    // queued above, grouped by loc->gpu_id rather than synchronizing per
+    // expert.  With device SwiGLU and moe_gpu_accum enabled (the normal
+    // qwen4exp decode configuration), stage1 and the scatter accumulate are
+    // both queued on the legacy stream and the accumulator's one final wait
+    // per GPU confirms the whole chain.  A first wait remains only when a
+    // host gate/up read is required; a second wait remains only for a legacy
+    // per-expert host-output fallback.  This is the same cache-safety
+    // invariant as the old two-round implementation, but it avoids waits
+    // that no longer guard a host-visible dependency.
     //
     // gate_buf/up_buf/down_buf are SHARED host buffers (scratch's own,
     // one copy, not one per pending expert) -- stage1 is safe to call
@@ -6900,21 +7338,56 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // per-expert loop already fully finished and accumulated one
     // expert before starting the next).
     if (!scratch.pending_gpu.empty()) {
-      bool synced[PerfCounters::PERF_MAX_GPU_SLOTS] = {};
-      PERF_START(gpu_batch_sync1);
-      for (auto &p : scratch.pending_gpu) {
-        int gid = (p.loc->gpu_id >= 0 &&
-                   p.loc->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS)
-                      ? p.loc->gpu_id
-                      : 0;
-        if (!synced[gid]) {
-          cudaSetDevice(p.loc->gpu_id);
-          cudaStreamSynchronize(0);
-          synced[gid] = true;
-          perf().n_gpu_batch_sync_calls.fetch_add(1, std::memory_order_relaxed);
+      // With device SwiGLU there is no host read between the gate/up issue
+      // and stage1: stage1 only queues more work on the same legacy stream.
+      // Avoid the first batch wait in that case.  If the GPU activation
+      // scratch cannot be prepared (or tracing forces the host activation
+      // path), retain the old wait before stage1's blocking gate/up copies.
+      const bool activation_requested =
+          expert_gpu_activation() && !trace_gate("SILU-TRACE-GPU") &&
+          !trace_gate("SWIGLU-TRACE-GPU") && !trace_gate("EXPERT-GPU") &&
+          !trace_gate("INPUT-TRACE-GPU-PAIRED");
+      bool all_device_activation = activation_requested;
+      if (all_device_activation) {
+        for (size_t pi = 0; pi < scratch.pending_gpu.size(); ++pi) {
+          if (!scratch.gpu_pool[pi].ensure_bad_counter()) {
+            all_device_activation = false;
+            break;
+          }
         }
       }
-      PERF_END(gpu_batch_sync1, t_gpu_batch_sync);
+
+      bool synced[PerfCounters::PERF_MAX_GPU_SLOTS] = {};
+      if (!all_device_activation) {
+        PERF_START(gpu_batch_sync1);
+        for (auto &p : scratch.pending_gpu) {
+          int gid = (p.loc->gpu_id >= 0 &&
+                     p.loc->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS)
+                        ? p.loc->gpu_id
+                        : 0;
+          if (!synced[gid]) {
+            cudaSetDevice(p.loc->gpu_id);
+            cudaStreamSynchronize(0);
+            synced[gid] = true;
+            perf().n_gpu_batch_sync_calls.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        PERF_END(gpu_batch_sync1, t_gpu_batch_sync);
+      }
+
+      // The decode route table has one row per selected expert.  Upload and
+      // clear the accumulator once per GPU before stage1 starts, so each
+      // expert can scatter its d_down directly into the final token result.
+      if (decode_gpu_accum) {
+        for (auto &p : scratch.pending_gpu) {
+          const int gid = p.loc->gpu_id;
+          if (gid < 0 || gid >= PerfCounters::PERF_MAX_GPU_SLOTS ||
+              decode_accum_begun[gid])
+            continue;
+          decode_accum_begun[gid] = engine.gpu->expert_accum_begin(
+              gid, 1, D, decode_accum_tok.data(), decode_accum_w.data(), topk);
+        }
+      }
 
       for (size_t pi = 0; pi < scratch.pending_gpu.size(); ++pi) {
         PendingGpuExpert &p = scratch.pending_gpu[pi];
@@ -6925,25 +7398,63 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
             p.expert_id, 1, D, moe_inter, clamp_exp, ram_mgr.vram_cache);
       }
 
-      std::fill(std::begin(synced), std::end(synced), false);
-      PERF_START(gpu_batch_sync2);
-      for (auto &p : scratch.pending_gpu) {
-        int gid = (p.loc->gpu_id >= 0 &&
-                   p.loc->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS)
-                      ? p.loc->gpu_id
-                      : 0;
-        if (!synced[gid]) {
-          cudaSetDevice(p.loc->gpu_id);
-          cudaStreamSynchronize(0);
-          synced[gid] = true;
-          perf().n_gpu_batch_sync_calls.fetch_add(1, std::memory_order_relaxed);
+      // Queue the device scatter immediately after each expert's down kernel.
+      // The default stream orders down -> scatter, so a second batch wait is
+      // needed only for experts that still require the legacy host download.
+      bool need_sync2[PerfCounters::PERF_MAX_GPU_SLOTS] = {};
+      if (decode_gpu_accum) {
+        for (size_t pi = 0; pi < scratch.pending_gpu.size(); ++pi) {
+          PendingGpuExpert &p = scratch.pending_gpu[pi];
+          const int gid = p.loc->gpu_id;
+          if (gid >= 0 && gid < PerfCounters::PERF_MAX_GPU_SLOTS &&
+              decode_accum_begun[gid]) {
+            p.accumulated_on_device = engine.gpu->expert_accum_add(
+                gid, scratch.gpu_pool[pi].d_down, p.k, 1, D, 1);
+            if (p.accumulated_on_device)
+              perf().n_expert_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+          }
+          if (!p.accumulated_on_device) {
+            const int sync_gid =
+                (gid >= 0 && gid < PerfCounters::PERF_MAX_GPU_SLOTS) ? gid : 0;
+            need_sync2[sync_gid] = true;
+          }
+        }
+      } else {
+        for (auto &p : scratch.pending_gpu) {
+          const int gid = (p.loc->gpu_id >= 0 &&
+                           p.loc->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS)
+                              ? p.loc->gpu_id
+                              : 0;
+          need_sync2[gid] = true;
         }
       }
-      PERF_END(gpu_batch_sync2, t_gpu_batch_sync);
+
+      std::fill(std::begin(synced), std::end(synced), false);
+      bool any_sync2 = false;
+      for (bool needed : need_sync2)
+        any_sync2 |= needed;
+      if (any_sync2) {
+        PERF_START(gpu_batch_sync2);
+        for (auto &p : scratch.pending_gpu) {
+          int gid = (p.loc->gpu_id >= 0 &&
+                     p.loc->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS)
+                        ? p.loc->gpu_id
+                        : 0;
+          if (need_sync2[gid] && !synced[gid]) {
+            cudaSetDevice(p.loc->gpu_id);
+            cudaStreamSynchronize(0);
+            synced[gid] = true;
+            perf().n_gpu_batch_sync_calls.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+        PERF_END(gpu_batch_sync2, t_gpu_batch_sync);
+      }
 
       for (size_t pi = 0; pi < scratch.pending_gpu.size(); ++pi) {
         PendingGpuExpert &p = scratch.pending_gpu[pi];
         GpuExpertScratch &gs = scratch.gpu_pool[pi];
+        if (p.accumulated_on_device)
+          continue;
         // This sync round just confirmed EVERY kernel that reads
         // this slab (gate, up, AND down -- the last of the three)
         // has actually finished executing, not just that launches
@@ -6967,6 +7478,30 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         // decrement.
         ram_mgr.ram_unpin(*p.exp);
         accumulate(p.k, p.exp, scratch.down_buf.data());
+      }
+
+      // One [D] download per active GPU for all device-accumulated routed
+      // experts in this token/layer.  A GPU that also had a legacy fallback
+      // was already synchronized above, so avoid paying a duplicate wait.
+      for (int gid = 0; gid < PerfCounters::PERF_MAX_GPU_SLOTS; ++gid) {
+        if (!decode_accum_begun[gid])
+          continue;
+        const bool already_synced = need_sync2[gid] && synced[gid];
+        if (!engine.gpu->expert_accum_end(gid, token_output, 1, D,
+                                          already_synced))
+          perf().n_moe_gpu_accum_fallback.fetch_add(1, std::memory_order_relaxed);
+      }
+      for (auto &p : scratch.pending_gpu) {
+        if (!p.accumulated_on_device)
+          continue;
+        // The accumulator end above has waited for down and scatter, so the
+        // temporary VRAM hold can now be released without reopening the
+        // eviction-during-compute race.  The RAM pin has the same lifetime.
+        if (p.needs_release && ram_mgr.vram_cache)
+          ram_mgr.vram_cache->release_hold(
+              layer_idx, p.expert_id, p.loc->device_ptr,
+              p.loc_from_active_layer);
+        ram_mgr.ram_unpin(*p.exp);
       }
     }
 
@@ -7182,6 +7717,8 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   ram_mgr.in_prefill = (S > 1);
   if (ram_mgr.vram_cache)
     ram_mgr.vram_cache->in_prefill = (S > 1);
+  if (S == 1 && pos_base == 0 && gdn_full_ggml())
+    GgmlGdnProjRunner::instance().reset_full_device_states();
   if (S == 1)
     RAMSafetyManager::set_current_decode_token_idx((uint64_t)pos_base);
   const int layer_idx = c.n_layers;
@@ -7269,10 +7806,34 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                    [](float v) { return std::isfinite(v); }))
     return false;
 
+  // DIAGNOSTIC (2026-09-09): per-call L2 norms through the NextN block's own
+  // residual stream, added while chasing an abnormally low MTP acceptance
+  // rate. Compares directly against the real trunk's own [TRACE-HIDDEN]
+  // norms (layers_forward_gguf, same file) at trace_filter="MLA,TRACE-
+  // HIDDEN" -- a norm wildly out of the real layers' own range would
+  // localize the bug to this block specifically rather than the draft/
+  // verify math in mtp_speculative.cpp. Cheap (one sqrt-sum per call, S is
+  // always tiny here) and unconditional, no trace_filter gate, so it
+  // survives into the next debugging session without a rebuild.
+  // Matches layers_forward_gguf's own l2norm lambda EXACTLY (raw sqrt-sum,
+  // not RMS) so these numbers are directly comparable against its
+  // [TRACE-HIDDEN] output, not off by a sqrt(n) scale factor.
+  auto mtp_l2norm = [](const float *p, size_t n) {
+    double s = 0.0;
+    for (size_t i = 0; i < n; ++i) s += (double)p[i] * (double)p[i];
+    return std::sqrt(s);
+  };
+  LOG_STREAM_INFO() << "[MTP-DIAG] layer=" << layer_idx << " pos_base=" << pos_base
+                    << " S=" << S << " |cur(post eh_proj)|=" << mtp_l2norm(cur.data(), cur.size())
+                    << "\n";
+
   rmsnorm_proj(engine, block + "attn_norm.weight", cur.data(),
                scratch.normed.data(), S, D, c.eps);
   engine.family_ops.attention_fn(engine, layer_idx, scratch.normed.data(), S,
                                  pos_base, scratch.attn_out.data());
+  LOG_STREAM_INFO() << "[MTP-DIAG] layer=" << layer_idx
+                    << " |attn_out|=" << mtp_l2norm(scratch.attn_out.data(), (size_t)S * D)
+                    << "\n";
   for (size_t i = 0; i < cur.size(); ++i)
     cur[i] += scratch.attn_out[i];
 
@@ -7281,6 +7842,9 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   moe_forward_gguf(engine, ram_mgr, async_io_queue, layer_idx,
                    scratch.normed.data(), S, scratch.moe_out.data(), scratch,
                    token_ids);
+  LOG_STREAM_INFO() << "[MTP-DIAG] layer=" << layer_idx
+                    << " |moe_out|=" << mtp_l2norm(scratch.moe_out.data(), (size_t)S * D)
+                    << "\n";
   // MTP is intentionally host-residual in this first bridge.  Consuming a
   // future GGML device result here would make the host residual stale and
   // would also couple GLM MTP to Qwen's unrelated device-HC path.
@@ -7309,6 +7873,344 @@ bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     if (!has_host(output_head)) return false;
     dense_proj(engine, output_head, h_nextn + (size_t)(S - 1) * D, logits_last,
                1, D, c.vocab);
+    if (!std::all_of(logits_last, logits_last + c.vocab,
+                     [](float v) { return std::isfinite(v); }))
+      return false;
+  }
+  return true;
+}
+
+// Declared non-static in their own .cpp files (attention_layer.cpp,
+// hyper_connections.cpp respectively) specifically so this function can
+// reuse them; see each declaration's own comment.
+void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                  const float *hidden_states, int S,
+                                  int pos_base, float *out_context);
+void qwen4exp_hc_mix_impl(StreamingEngine &engine, const std::string &norm_name,
+                          const std::string &down_name,
+                          const std::string &up_name,
+                          const std::string &inject_name, int S, int D,
+                          float *out_hidden, float *out_inject,
+                          int trace_layer, const float *in_streams);
+
+// Qwen4Exp shared MTP checkpoint's own extra full-attention+MoE block.
+// Verified against /home/ray/Projects/unsloth/llama.cpp's qwen4exp.cpp
+// (branch mtp/qwen4exp-nextn, graph_mtp) and a real tensor dump of
+// mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf. Structurally: (1) eh_proj
+// bridges the token embedding and the incoming wide HC state into a fresh
+// per-stream residual res_hc, (2) hc_attn/hc_ffn sub-blocks run exactly
+// like a normal Qwen4Exp trunk full-attention layer's own HC pre-mix ->
+// sub-block -> HC post-combine, but against res_hc (a LOCAL buffer, never
+// engine.hc_stream_buf), (3) res_hc is exported as h_nextn BEFORE the
+// final hc_head collapse, matching the reference's own "next draft step
+// re-enters here" comment, (4) the collapsed [S,D] result is projected to
+// logits via the shared LM head (nextn.shared_head_head, or the base
+// model's own output.weight).
+//
+// The routed-expert MoE step deliberately does NOT go through
+// moe_forward_gguf/engine.layers_experts -- this block's own packed
+// expert tensors are resident-loaded whole from the SEPARATE
+// engine.mtp_model_file (graph_initializer.cpp's qwen4exp_nextn_manifest)
+// rather than routed through the disk-streaming/RAM-VRAM LRU cache that
+// every other layer's routed experts use (that machinery is hardwired to
+// engine.model_file throughout ram_manager.hpp/async_prefetcher.hpp). Per-
+// expert slicing uses the exact same size_bytes/n_experts stride
+// convention as StreamingEngine::packed_slab_geometry (engine.hpp).
+bool qwen4exp_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
+                          LockFreePrefetcher &async_io_queue,
+                          const int *token_ids, const float *h_input, int S,
+                          int pos_base, float *h_nextn, float *logits_last) {
+  auto &c = engine.model_file.architecture_config;
+  const ModelFamily fam = engine.family_ops.family;
+  if (!engine.mtp_enabled || !engine.has_mtp_model || c.n_layer_nextn != 1 ||
+      S <= 0 || c.hidden <= 0 || c.vocab <= 0 || c.hc_mult <= 1 ||
+      fam != ModelFamily::Qwen4Exp) {
+    return false;
+  }
+  const int layer_idx = c.n_layers;
+  if (pos_base < 0 || pos_base + S > engine.max_t) {
+    LOG_STREAM_WARN() << "[MTP] position range [" << pos_base << ", "
+                      << (pos_base + S) << ") exceeds max_t=" << engine.max_t
+                      << " -- disabling this proposal batch\n";
+    return false;
+  }
+  if ((int)engine.Kc.size() <= layer_idx || (int)engine.Vc.size() <= layer_idx ||
+      !engine.Kc[layer_idx] || !engine.Vc[layer_idx]) {
+    LOG_STREAM_WARN() << "[MTP] Qwen4Exp NextN KV cache (layer " << layer_idx
+                      << ") not allocated -- proposal batch skipped\n";
+    return false;
+  }
+
+  const int D = c.hidden;
+  const int HC = c.hc_mult;
+  const int hc_dim = HC * D;
+  const int n_experts = c.n_experts;
+  const int topk = c.topk;
+  const int moe_inter = c.moe_inter;
+  const std::string p = "blk." + std::to_string(layer_idx) + ".";
+
+  auto has_host = [&](const std::string &name) {
+    auto it = engine.resident_layers.find(name);
+    return it != engine.resident_layers.end() && it->second.host_ptr;
+  };
+  // Recheck resident tensors here (defense-in-depth, same convention as
+  // glm_mtp_forward): graph_initializer.cpp validated these before
+  // activating MTP, but a dense-pool backoff must never turn a required
+  // MTP weight into a silent zero-filled projection.
+  const char *required[] = {
+      "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+      "attn_q_norm.weight", "attn_k_norm.weight",
+      "hc_attn_norm.weight", "hc_attn_down.weight", "hc_attn_up.weight",
+      "hc_attn_inject.weight",
+      "hc_ffn_norm.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+      "hc_ffn_inject.weight",
+      "ffn_gate_inp.weight", "ffn_gate_exps.weight", "ffn_up_exps.weight",
+      "ffn_down_exps.weight",
+      "nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight",
+      "nextn.hc_head_norm.weight", "nextn.hc_head_down.weight",
+      "nextn.hc_head_up.weight",
+  };
+  for (const char *suffix : required) {
+    if (!has_host(p + suffix)) {
+      LOG_STREAM_WARN() << "[MTP] required resident tensor missing: " << p
+                        << suffix << " -- proposal batch skipped\n";
+      return false;
+    }
+  }
+  auto emb_it = engine.resident_layers.find(p + "nextn.embed_tokens.weight");
+  if (emb_it == engine.resident_layers.end() || !emb_it->second.host_ptr)
+    emb_it = engine.resident_layers.find("token_embd.weight");
+  if (emb_it == engine.resident_layers.end() || !emb_it->second.host_ptr)
+    return false;
+
+  // Never let this block's attention call pick up a stale device-resident
+  // activation left behind by the target trunk's own last GPU-HC layer
+  // (engine.qwen4exp_device_hc_input/_ffn_input) -- this function never
+  // calls qwen4exp_hc_pre_mix (the trunk's own hook, which would normally
+  // set/clear these), so a leftover non-null value here would make
+  // qwen4exp_full_attention_gguf silently consume the WRONG activation
+  // (the trunk's, not this block's cur_attn buffer below). Force the safe
+  // host dense_proj fallback path unconditionally.
+  engine.qwen4exp_device_hc_input = nullptr;
+  engine.qwen4exp_device_hc_ffn_input = nullptr;
+
+  auto embed_row = [&](int tok, float *dst) {
+    if (tok < 0 || tok >= c.vocab) return false;
+    const int rb = row_bytes(emb_it->second.meta.type, D);
+    if (rb <= 0) return false;
+    return dequant_row(emb_it->second.meta.type,
+                       emb_it->second.host_ptr + (int64_t)tok * rb, dst, D);
+  };
+  std::vector<float> token_emb((size_t)S * D, 0.0f);
+  for (int s = 0; s < S; ++s) {
+    if (!token_ids || !embed_row(token_ids[s], token_emb.data() + (size_t)s * D))
+      return false;
+  }
+
+  // ---- eh_proj bridge: e_norm (token embedding) concat h_norm (incoming
+  // wide state, grouped RMS-norm'd per stream) -> res_hc ----
+  std::vector<float> e_norm((size_t)S * D);
+  rmsnorm_proj(engine, p + "nextn.enorm.weight", token_emb.data(),
+              e_norm.data(), S, D, c.eps);
+
+  std::vector<float> h_norm((size_t)S * hc_dim);
+  {
+    const float *hnorm_w = nullptr;
+    auto hn_it = engine.resident_layers.find(p + "nextn.hnorm.weight");
+    hnorm_w = reinterpret_cast<float *>(hn_it->second.host_ptr);
+    // Grouped RMS norm: each (token, stream) row normalized independently
+    // over its own D elements, NO learned gain in the norm itself (matches
+    // ggml_rms_norm's definition) -- the hc_dim-wide learned gain
+    // (nextn.hnorm, one scalar per (stream,dim) pair, NOT broadcast across
+    // streams -- unlike e_norm below) is applied after, over the flattened
+    // [hc_dim] layout. Identical math to qwen4exp_hc_mix_impl's own steps
+    // 1-2, inlined here since that function's own gate/inject math past
+    // step 2 doesn't apply to this bridge step.
+    for (int s = 0; s < S; ++s) {
+      const float *in_s = h_input + (size_t)s * hc_dim;
+      float *out_s = h_norm.data() + (size_t)s * hc_dim;
+      for (int h = 0; h < HC; ++h) {
+        const float *row = in_s + (size_t)h * D;
+        double ss = 0.0;
+        for (int d = 0; d < D; ++d) ss += (double)row[d] * row[d];
+        float inv = 1.0f / std::sqrt((float)(ss / (double)D) + c.eps);
+        float *out_row = out_s + (size_t)h * D;
+        for (int d = 0; d < D; ++d) out_row[d] = row[d] * inv;
+      }
+      if (hnorm_w)
+        for (int j = 0; j < hc_dim; ++j) out_s[j] *= hnorm_w[j];
+    }
+  }
+
+  std::vector<float> concat((size_t)S * HC * 2 * D);
+  for (int s = 0; s < S; ++s) {
+    const float *e = e_norm.data() + (size_t)s * D;
+    for (int h = 0; h < HC; ++h) {
+      float *row = concat.data() + ((size_t)s * HC + h) * 2 * D;
+      std::memcpy(row, e, (size_t)D * sizeof(float));
+      std::memcpy(row + D, h_norm.data() + ((size_t)s * HC + h) * D,
+                 (size_t)D * sizeof(float));
+    }
+  }
+
+  std::vector<float> res_hc((size_t)S * hc_dim);
+  dense_proj(engine, p + "nextn.eh_proj.weight", concat.data(), res_hc.data(),
+            S * HC, 2 * D, D);
+  if (!std::all_of(res_hc.begin(), res_hc.end(),
+                   [](float v) { return std::isfinite(v); }))
+    return false;
+
+  // ---- hc_attn sub-block ----
+  std::vector<float> cur_attn((size_t)S * D), inject_attn((size_t)S * HC);
+  qwen4exp_hc_mix_impl(engine, p + "hc_attn_norm.weight",
+                       p + "hc_attn_down.weight", p + "hc_attn_up.weight",
+                       p + "hc_attn_inject.weight", S, D, cur_attn.data(),
+                       inject_attn.data(), layer_idx, res_hc.data());
+  std::vector<float> attn_out((size_t)S * D);
+  qwen4exp_full_attention_gguf(engine, layer_idx, cur_attn.data(), S,
+                               pos_base, attn_out.data());
+  {
+    const float inv_hc = 1.0f / (float)HC;
+    for (int s = 0; s < S; ++s) {
+      const float *inj = inject_attn.data() + (size_t)s * HC;
+      const float *sub_out = attn_out.data() + (size_t)s * D;
+      float *streams = res_hc.data() + (size_t)s * hc_dim;
+      for (int h = 0; h < HC; ++h) {
+        float w = 2.0f / (1.0f + std::exp(-inj[h] * inv_hc));
+        float *stream_h = streams + (size_t)h * D;
+        for (int d = 0; d < D; ++d) stream_h[d] += sub_out[d] * w;
+      }
+    }
+  }
+
+  // ---- hc_ffn sub-block: routed MoE (v1: no active-layer/LRU cache, the
+  // shared checkpoint's whole expert table is already resident) + shared
+  // expert ----
+  std::vector<float> cur_ffn((size_t)S * D), inject_ffn((size_t)S * HC);
+  qwen4exp_hc_mix_impl(engine, p + "hc_ffn_norm.weight",
+                       p + "hc_ffn_down.weight", p + "hc_ffn_up.weight",
+                       p + "hc_ffn_inject.weight", S, D, cur_ffn.data(),
+                       inject_ffn.data(), layer_idx, res_hc.data());
+  std::vector<float> moe_out((size_t)S * D, 0.0f);
+  {
+    auto &gate_t = engine.resident_layers[p + "ffn_gate_exps.weight"];
+    auto &up_t = engine.resident_layers[p + "ffn_up_exps.weight"];
+    auto &down_t = engine.resident_layers[p + "ffn_down_exps.weight"];
+    if (!gate_t.host_ptr || !up_t.host_ptr || !down_t.host_ptr) {
+      LOG_STREAM_WARN() << "[MTP] Qwen4Exp NextN packed expert tensors not "
+                           "resident -- proposal batch skipped\n";
+      return false;
+    }
+    const size_t gate_stride = gate_t.meta.size_bytes / (size_t)n_experts;
+    const size_t up_stride = up_t.meta.size_bytes / (size_t)n_experts;
+    const size_t down_stride = down_t.meta.size_bytes / (size_t)n_experts;
+
+    std::vector<float> router_logits((size_t)S * n_experts);
+    dense_proj(engine, p + "ffn_gate_inp.weight", cur_ffn.data(),
+              router_logits.data(), S, D, n_experts);
+    for (int s = 0; s < S; ++s)
+      apply_gating_activation(c.gating_func,
+                              router_logits.data() + (size_t)s * n_experts,
+                              n_experts);
+    if (!std::all_of(router_logits.begin(), router_logits.end(),
+                     [](float v) { return std::isfinite(v); }))
+      return false;
+
+    std::vector<float> gate_buf((size_t)moe_inter), up_buf((size_t)moe_inter);
+    std::vector<float> expert_out((size_t)D);
+    std::vector<std::pair<float, int>> scores((size_t)n_experts);
+    const float clamp_exp =
+        (layer_idx < (int)c.swiglu_clamp_exp.size()) ? c.swiglu_clamp_exp[layer_idx] : 0.0f;
+    for (int s = 0; s < S; ++s) {
+      float *token_probs = router_logits.data() + (size_t)s * n_experts;
+      for (int e = 0; e < n_experts; ++e) scores[e] = {token_probs[e], e};
+      std::partial_sort(scores.begin(), scores.begin() + topk, scores.end(),
+                        [](const auto &a, const auto &b) { return a.first > b.first; });
+      float sum_w = 0.0f;
+      for (int k = 0; k < topk; ++k) sum_w += scores[k].first;
+      float inv_sum = c.expert_weights_norm
+                          ? 1.0f / std::max(sum_w, 6.103515625e-5f)
+                          : 1.0f;
+      float *out_row = moe_out.data() + (size_t)s * D;
+      for (int k = 0; k < topk; ++k) {
+        const int e = scores[k].second;
+        float w = scores[k].first * inv_sum;
+        if (c.expert_weights_scale != 0.0f) w *= c.expert_weights_scale;
+        GGUFTensor gm = gate_t.meta, um = up_t.meta, dm = down_t.meta;
+        const uint8_t *gd = gate_t.host_ptr + (size_t)e * gate_stride;
+        const uint8_t *ud = up_t.host_ptr + (size_t)e * up_stride;
+        const uint8_t *dd = down_t.host_ptr + (size_t)e * down_stride;
+        expert_ffn_cpu(cur_ffn.data() + (size_t)s * D, expert_out.data(), gd,
+                       gm, ud, um, dd, dm, gate_buf.data(), up_buf.data(), 1,
+                       D, moe_inter, clamp_exp, layer_idx, e);
+        for (int d = 0; d < D; ++d) out_row[d] += expert_out[d] * w;
+      }
+    }
+
+    // Shared expert (mirrors moe_forward_gguf's own CPU shexp block --
+    // same formula, same ffn_gate_inp_shexp per-token sigmoid gate).
+    if (c.n_expert_shared > 0 && has_host(p + "ffn_gate_shexp.weight")) {
+      const int shared_inter = moe_inter * c.n_expert_shared;
+      const float clamp_shexp =
+          (layer_idx < (int)c.swiglu_clamp_shexp.size()) ? c.swiglu_clamp_shexp[layer_idx] : 0.0f;
+      std::vector<float> sg((size_t)shared_inter), su((size_t)shared_inter);
+      for (int s = 0; s < S; ++s) {
+        const float *tok = cur_ffn.data() + (size_t)s * D;
+        dense_proj(engine, p + "ffn_gate_shexp.weight", tok, sg.data(), 1, D, shared_inter);
+        dense_proj(engine, p + "ffn_up_shexp.weight", tok, su.data(), 1, D, shared_inter);
+        silu_inplace(sg.data(), shared_inter);
+        elem_mul(sg.data(), sg.data(), su.data(), shared_inter);
+        swiglu_clamp_inplace(sg.data(), shared_inter, clamp_shexp);
+        std::vector<float> shexp_down((size_t)D);
+        dense_proj(engine, p + "ffn_down_shexp.weight", sg.data(),
+                  shexp_down.data(), 1, shared_inter, D);
+        float shexp_gate = 1.0f;
+        if (has_host(p + "ffn_gate_inp_shexp.weight")) {
+          float g = 0.0f;
+          dense_proj(engine, p + "ffn_gate_inp_shexp.weight", tok, &g, 1, D, 1);
+          shexp_gate = 1.0f / (1.0f + std::exp(-g));
+        }
+        float *out_row = moe_out.data() + (size_t)s * D;
+        for (int d = 0; d < D; ++d) out_row[d] += shexp_down[d] * shexp_gate;
+      }
+    }
+  }
+  if (!std::all_of(moe_out.begin(), moe_out.end(),
+                   [](float v) { return std::isfinite(v); }))
+    return false;
+  {
+    const float inv_hc = 1.0f / (float)HC;
+    for (int s = 0; s < S; ++s) {
+      const float *inj = inject_ffn.data() + (size_t)s * HC;
+      const float *sub_out = moe_out.data() + (size_t)s * D;
+      float *streams = res_hc.data() + (size_t)s * hc_dim;
+      for (int h = 0; h < HC; ++h) {
+        float w = 2.0f / (1.0f + std::exp(-inj[h] * inv_hc));
+        float *stream_h = streams + (size_t)h * D;
+        for (int d = 0; d < D; ++d) stream_h[d] += sub_out[d] * w;
+      }
+    }
+  }
+
+  // Export the WIDE state before collapse -- "the next draft step
+  // re-enters here" (reference's own comment on res_hc/t_h_nextn).
+  std::memcpy(h_nextn, res_hc.data(), (size_t)S * hc_dim * sizeof(float));
+
+  std::vector<float> cur_head((size_t)S * D);
+  qwen4exp_hc_mix_impl(engine, p + "nextn.hc_head_norm.weight",
+                       p + "nextn.hc_head_down.weight",
+                       p + "nextn.hc_head_up.weight", "", S, D,
+                       cur_head.data(), nullptr, layer_idx, res_hc.data());
+  if (!std::all_of(cur_head.begin(), cur_head.end(),
+                   [](float v) { return std::isfinite(v); }))
+    return false;
+
+  if (logits_last) {
+    const std::string head = p + "nextn.shared_head_head.weight";
+    const std::string output_head = has_host(head) ? head : "output.weight";
+    if (!has_host(output_head)) return false;
+    dense_proj(engine, output_head, cur_head.data() + (size_t)(S - 1) * D,
+              logits_last, 1, D, c.vocab);
     if (!std::all_of(logits_last, logits_last + c.vocab,
                      [](float v) { return std::isfinite(v); }))
       return false;
@@ -7581,6 +8483,166 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                                      D)
                            << " |hidden|=" << l2norm(last_tok, D) << "\n";
 
+    // --- QWEN-PILOT (Qwen4Exp only) -------------------------------------
+    // Qwen's production router consumes the HC graph's mixed activation, not
+    // the conventional hidden->RMSNorm->gate input used by the generic pilot
+    // below. After a device HC post-combine, engine.hc_stream_buf is stale;
+    // take one explicit snapshot before projecting the next layer. The
+    // stream-0 row is an intentionally conservative proxy for the mixed
+    // activation and is labelled as such in the shutdown report. It never
+    // changes routing or expert dispatch. Optional Qwen prefetch is kept
+    // separate from the generic GLM/DeepSeek pilot: its top-K candidates are
+    // either issued into the next layer's temporary active-layer area via
+    // cudaMemcpyAsync (when already RAM-resident), or sent to the ordinary
+    // disk/RAM hint queue (when they still need a RAM fetch).
+    if (engine.qwen4exp_router_pilot &&
+        engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        l >= c.first_dense && l + 1 < c.n_layers &&
+        l + 1 >= c.first_dense && c.n_experts > 0 && c.hc_mult > 0) {
+      scratch.qwen_pilot_pred_count = 0;
+      scratch.qwen_pilot_pred_layer = -1;
+      scratch.qwen_pilot_prefetch_count = 0;
+      const int target_layer = l + 1;
+      const size_t hc_need = (size_t)S * c.hc_mult * D;
+      const bool host_snapshot_ok =
+          engine.hc_stream_buf.size() >= hc_need &&
+          qwen4exp_hc_download_streams(engine, S);
+      if (!host_snapshot_ok) {
+        perf().n_qwen_pilot_sync_fail.fetch_add(1,
+                                                 std::memory_order_relaxed);
+      } else {
+        const std::string qwen_router_key =
+            "blk." + std::to_string(target_layer) + ".ffn_gate_inp.weight";
+        auto qwen_router_it = engine.resident_layers.find(qwen_router_key);
+        if (qwen_router_it != engine.resident_layers.end() &&
+            qwen_router_it->second.host_ptr) {
+          const float *proxy = engine.hc_stream_buf.data() +
+                               (size_t)(S - 1) * c.hc_mult * D;
+          dense_proj(engine, qwen_router_key, proxy,
+                     scratch.qwen_pilot_logits.data(), 1, D, c.n_experts);
+          apply_gating_activation(c.gating_func,
+                                  scratch.qwen_pilot_logits.data(),
+                                  c.n_experts);
+          const std::string qwen_bias_key =
+              "blk." + std::to_string(target_layer) + ".exp_probs_b.bias";
+          auto qwen_bias_it = engine.resident_layers.find(qwen_bias_key);
+          if (qwen_bias_it != engine.resident_layers.end() &&
+              qwen_bias_it->second.host_ptr &&
+              qwen_bias_it->second.meta.type == GGUFType::F32) {
+            const float *bias = reinterpret_cast<const float *>(
+                qwen_bias_it->second.host_ptr);
+            for (int e = 0; e < c.n_experts; ++e)
+              scratch.qwen_pilot_logits[e] += bias[e];
+          }
+
+          const int qwen_k = std::min(
+              {engine.qwen4exp_router_pilot_k, c.topk,
+               LayerScratch::kQwenPilotMax});
+          const int qwen_prefetch_k = std::min(
+              {engine.qwen4exp_router_pilot_prefetch_k > 0
+                   ? engine.qwen4exp_router_pilot_prefetch_k
+                   : engine.qwen4exp_router_pilot_k,
+               qwen_k, LayerScratch::kQwenPilotMax});
+          const bool qwen_prefetch_layer_enabled =
+              std::find(engine.qwen4exp_router_pilot_prefetch_exclude_layers
+                            .begin(),
+                        engine.qwen4exp_router_pilot_prefetch_exclude_layers
+                            .end(),
+                        target_layer) ==
+              engine.qwen4exp_router_pilot_prefetch_exclude_layers.end();
+          const bool qwen_prefetch_enabled =
+              engine.qwen4exp_router_pilot_prefetch &&
+              qwen_prefetch_layer_enabled;
+          perf().n_qwen_pilot_prefetch_k_observed.store(
+              (uint32_t)(engine.qwen4exp_router_pilot_prefetch
+                             ? qwen_prefetch_k
+                             : 0),
+              std::memory_order_relaxed);
+          if (engine.qwen4exp_router_pilot_prefetch &&
+              !qwen_prefetch_layer_enabled) {
+            perf().n_qwen_pilot_prefetch_excluded.fetch_add(
+                1, std::memory_order_relaxed);
+          } else if (engine.qwen4exp_router_pilot_prefetch &&
+                     qwen_prefetch_k < qwen_k) {
+            perf().n_qwen_pilot_prefetch_rank_skipped.fetch_add(
+                (uint64_t)(qwen_k - qwen_prefetch_k),
+                std::memory_order_relaxed);
+          }
+          scratch.qwen_pilot_pred_count = qwen_k;
+          scratch.qwen_pilot_pred_layer = target_layer;
+          scratch.qwen_pilot_prefetch_count =
+              qwen_prefetch_enabled ? qwen_prefetch_k : 0;
+          perf().n_qwen_pilot_predictions.fetch_add(
+              1, std::memory_order_relaxed);
+
+          for (int k = 0; k < qwen_k; ++k) {
+            int best = 0;
+            for (int e = 1; e < c.n_experts; ++e) {
+              if (scratch.qwen_pilot_logits[e] >
+                  scratch.qwen_pilot_logits[best])
+                best = e;
+            }
+            scratch.qwen_pilot_logits[best] = -2e30f;
+            scratch.qwen_pilot_pred_ids[k] = best;
+
+            // Classify without a mutating lookup. The active-layer pool is a
+            // real VRAM source but is separate from the main LRU cache.
+            bool already_vram =
+                ram_mgr.vram_cache &&
+                ram_mgr.vram_cache->active_layer_has(target_layer, best);
+            if (!already_vram && ram_mgr.vram_cache) {
+              for (const auto &loc : ram_mgr.vram_cache->expert_vram_cache) {
+                if (loc.layer_idx == target_layer && loc.expert_id == best) {
+                  already_vram = true;
+                  break;
+                }
+              }
+            }
+            const bool already_ram =
+                !already_vram && ram_mgr.is_ram_resident(target_layer, best);
+            const bool qwen_prefetch_this_rank =
+                qwen_prefetch_enabled && k < qwen_prefetch_k;
+            if (already_vram) {
+              perf().n_qwen_pilot_pred_already_vram.fetch_add(
+                  1, std::memory_order_relaxed);
+            } else if (already_ram) {
+              perf().n_qwen_pilot_pred_already_ram.fetch_add(
+                  1, std::memory_order_relaxed);
+              if (qwen_prefetch_this_rank) {
+                // promote_ram_to_active_layer issues cudaMemcpyAsync on the
+                // dedicated active-layer stream and records the destination
+                // event. It also protects the RAM source until that event,
+                // so the prefetch worker cannot reclaim the slab underneath
+                // the DMA.
+                ExpertLocation *issued =
+                    ram_mgr.promote_ram_to_active_layer(engine, target_layer,
+                                                        best);
+                if (issued) {
+                  perf().n_qwen_pilot_active_prefetch_issued.fetch_add(
+                      1, std::memory_order_relaxed);
+                } else {
+                  perf().n_qwen_pilot_active_prefetch_failed.fetch_add(
+                      1, std::memory_order_relaxed);
+                }
+              }
+            } else {
+              perf().n_qwen_pilot_pred_needs_fetch.fetch_add(
+                  1, std::memory_order_relaxed);
+              if (qwen_prefetch_this_rank) {
+                async_io_queue.push_hint(target_layer, best);
+                perf().n_qwen_pilot_hints_pushed.fetch_add(
+                    1, std::memory_order_relaxed);
+              }
+            }
+            if (qwen_prefetch_this_rank && already_vram) {
+              perf().n_qwen_pilot_hints_skipped_resident.fetch_add(
+                  1, std::memory_order_relaxed);
+            }
+          }
+        }
+      }
+    }
+
     // EngineConfig::pilot_widen_all_tokens -- see that field's own
     // comment (engine_config.hpp) for the full motivation. Deliberately
     // self-contained (own norm/router/bias lookups, own scratch
@@ -7728,11 +8790,20 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       auto norm_it = engine.resident_layers.find(norm_key);
       auto router_it = engine.resident_layers.find(router_key);
 
-      if (norm_it != engine.resident_layers.end() &&
+      // This pilot reconstructs the conventional norm->gate router input.
+      // Qwen4Exp derives its route input through the HC/GPU graph instead,
+      // so never apply this approximation to Qwen; its production router
+      // remains the only source of truth there. GLM/DeepSeek-style families
+      // stay on this existing path.
+      const bool generic_pilot_inputs_ready =
+          engine.family_ops.family != ModelFamily::Qwen4Exp &&
+          norm_it != engine.resident_layers.end() &&
           router_it != engine.resident_layers.end() &&
-          norm_it->second.host_ptr && router_it->second.host_ptr) {
+          norm_it->second.host_ptr && router_it->second.host_ptr;
+      const float *last_hidden = hidden_states + ((S - 1) * D);
+
+      if (generic_pilot_inputs_ready) {
         // Use only last token for pilot prediction (saves compute)
-        const float *last_hidden = hidden_states + ((S - 1) * D);
         rmsnorm_row(scratch.pilot_nrm.data(), last_hidden,
                     reinterpret_cast<float *>(norm_it->second.host_ptr), D,
                     c.eps);
