@@ -826,6 +826,9 @@ public:
     // Qwen-only S==1 HC -> router/MoE device handoff. Kept separate from
     // the grouped decode switch for controlled correctness/performance A/B.
     bool qwen4exp_decode_device_hc = false;
+    // Qwen-only S==1 RAM->VRAM batch staging. Other model families never
+    // consult this switch; false preserves the direct pinned-slab path.
+    bool qwen4exp_decode_batch_stage = false;
     bool qwen4exp_decode_custom_hc_q8 = false;
     // Keep the GPU router for batched Qwen prefill, but opt into it for the
     // S==1 decode boundary only when it wins on the target hardware. The
@@ -836,6 +839,9 @@ public:
     // only when cpu_affinity_layers selects a layer, so other models and the
     // normal GPU route are unchanged.
     bool qwen4exp_cpu_ggml_moe = false;
+    // Overlap the Qwen CPU routed graph with the GPU shared expert when
+    // cpu_affinity_layers is active. Other model families never consult it.
+    bool qwen4exp_cpu_gpu_overlap = false;
 
     // Set from EngineConfig::glm5next_kda_gpu. The GLM5NEXT KDA recurrent
     // update itself runs on CUDA; the host mirror is synchronized only at

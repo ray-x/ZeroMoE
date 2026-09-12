@@ -57,7 +57,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 // Enable stream-ordered reuse of the persistent MoE graph workspace. This is
@@ -220,6 +223,13 @@ class GgmlQwenSharedRunner {
   bool run(int layer, const void *device_x, const void *routed_output,
            const void **combined_output);
 
+  // Qwen CPU-affinity variant: upload a DDR-backed CPU routed result into
+  // the persistent routed input and keep the shared expert plus the routed+
+  // shared combine on the CUDA graph.
+  bool run_host_routed(int layer, const void *device_x,
+                       const float *host_routed,
+                       const void **combined_output);
+
   // Copy the result of the most recent run() to a row-major host buffer.
   // This is the deliberate boundary for the host-HC fallback: the routed and
   // shared FFNs remain one device graph, then HC post-combine consumes the
@@ -268,6 +278,10 @@ class GgmlQwenSharedRunner {
   void *x_ = nullptr;           // ggml_tensor* [D,S]
   void *routed_ = nullptr;     // ggml_tensor* [D,S]
   void *output_ = nullptr;     // ggml_tensor* [D,S]
+  // Direct-input mode temporarily retargets graph input data pointers to
+  // producer tensors. Restore these allocations before a host upload.
+  void *x_owned_data_ = nullptr;
+  void *routed_owned_data_ = nullptr;
   bool graph_ready_ = false;
 };
 
@@ -400,11 +414,12 @@ class GgmlMoeRunner {
   // cluster. Conclusion unchanged: NBUF is still not a real lever, now
   // confirmed against the current, materially faster baseline too.
   static constexpr int NBUF = 2;
-  // The conservative raw-copy path uses one compact weight buffer.  The
-  // opt-in backend-stream path needs two so layer N can compute while the
-  // copy stream fills the other buffer for layer N+1.  Keep the arrays at
-  // the maximum size, but select one or two at runtime so the default path
-  // and other model families do not acquire an extra VRAM allocation.
+  // Keep one compact weight buffer. The graph stores one mutable set of GGML
+  // weight descriptors; alternating allocations without a separate graph
+  // descriptor set would let a queued layer observe the next layer's data
+  // pointer. The backend-stream path can still overlap host staging and
+  // transfer work, but true weight double-buffering requires per-buffer graph
+  // state and is intentionally not enabled by this runner.
   static constexpr int NWEIGHT_BUFS = 2;
   // A prefill can queue all model layers before the final synchronization.
   // Keep one completion event per possible layer so an event still being
@@ -888,6 +903,29 @@ class GgmlQwenCpuMoeRunner {
                   int n_experts, const float *router_weights, int d_model,
                   int d_ff, int topk, size_t expert_stride);
 
+  // Qwen-only CPU/GPU partition: run the CPU graph through the down
+  // projection, returning the unweighted [d_model, topk] expert outputs.
+  // The top-k weighting and reduction are performed by
+  // GgmlQwenDeviceCombineRunner on the shared CUDA stream.  This keeps the
+  // DDR-backed strided arena and the global route IDs unchanged while moving
+  // the small, arithmetic-heavy combine off the CPU.
+  bool run_strided_down(const float *input, float *expert_output,
+                        const GgmlQwenCpuExpertRef &layer,
+                        const void *gate_plane, const void *up_plane,
+                        const void *down_plane, const int *expert_ids,
+                        int n_experts, int d_model, int d_ff, int topk,
+                        size_t expert_stride);
+
+  // Queue one strided CPU graph execution on the runner's persistent worker.
+  // The caller may use the interval before wait_strided_async() to run the
+  // Qwen shared expert on CUDA. Requests are strictly one at a time.
+  bool start_strided_async(
+      const float *input, float *output, const GgmlQwenCpuExpertRef &layer,
+      const void *gate_plane, const void *up_plane, const void *down_plane,
+      const int *expert_ids, int n_experts, const float *router_weights,
+      int d_model, int d_ff, int topk, size_t expert_stride);
+  bool wait_strided_async();
+
   void shutdown();
   ~GgmlQwenCpuMoeRunner();
 
@@ -899,10 +937,34 @@ class GgmlQwenCpuMoeRunner {
   bool ensure_graph(const GgmlQwenCpuExpertRef &ref, int n_experts,
                     int d_model, int d_ff, int topk, bool strided,
                     const void *gate_plane, const void *up_plane,
-                    const void *down_plane, size_t expert_stride);
+                    const void *down_plane, size_t expert_stride,
+                    bool output_per_expert);
+  bool compute_graph();
   void free_graph();
+  void async_worker_loop();
+
+  struct AsyncStridedRequest {
+    const float *input = nullptr;
+    float *output = nullptr;
+    GgmlQwenCpuExpertRef layer{};
+    const void *gate_plane = nullptr;
+    const void *up_plane = nullptr;
+    const void *down_plane = nullptr;
+    const int *expert_ids = nullptr;
+    int n_experts = 0;
+    const float *router_weights = nullptr;
+    int d_model = 0;
+    int d_ff = 0;
+    int topk = 0;
+    size_t expert_stride = 0;
+  };
 
   void *cpu_backend_ = nullptr;       // ggml_backend_t, owned
+  // BeeLlama keeps one CPU worker pool attached to its CPU backend for the
+  // lifetime of the context.  Keep the Qwen-only runner's pool persistent as
+  // well; leaving this null makes ggml_backend_graph_compute() create and
+  // destroy a disposable pool for every CPU-affinity layer call.
+  void *cpu_threadpool_ = nullptr;    // ggml_threadpool_t, owned
   void *weight_ctx_ = nullptr;        // ggml_context*, owned
   void *weight_buf_ = nullptr;        // ggml_backend_buffer_t, owned
   std::vector<void *> external_weight_bufs_; // three non-owning CPU pointer buffers
@@ -911,6 +973,10 @@ class GgmlQwenCpuMoeRunner {
   void *down_ = nullptr;              // ggml_tensor*
   void *graph_ctx_ = nullptr;         // ggml_context*, owned
   void *galloc_ = nullptr;            // ggml_gallocr_t, owned
+  // CPU backend execution plan, created once for the persistent graph.  The
+  // plan owns the reusable GGML work buffer and avoids rerunning
+  // ggml_graph_plan() for every CPU-affinity layer/token call.
+  void *graph_plan_ = nullptr;        // ggml_backend_graph_plan_t, owned
   void *graph_ = nullptr;             // ggml_cgraph*
   void *x_ = nullptr;                 // ggml_tensor*
   void *ids_ = nullptr;               // ggml_tensor*
@@ -928,6 +994,7 @@ class GgmlQwenCpuMoeRunner {
   uint32_t down_type_ = 0;
   int n_threads_ = 0;
   bool strided_mode_ = false;
+  bool output_per_expert_ = false;
   size_t expert_stride_ = 0;
 
   // The compact GGML graph owns one [gate|up|down] slot per selected
@@ -943,4 +1010,59 @@ class GgmlQwenCpuMoeRunner {
     size_t down_bytes = 0;
   };
   std::vector<CachedExpertSource> cached_sources_;
+
+  // The worker owns CPU graph execution while the decode thread submits the
+  // independent GPU shared-expert path. All request pointers remain valid
+  // until wait_strided_async() returns.
+  std::mutex async_mutex_;
+  std::condition_variable async_cv_;
+  std::thread async_worker_;
+  AsyncStridedRequest async_request_{};
+  bool async_stop_ = false;
+  bool async_request_pending_ = false;
+  bool async_request_done_ = true;
+  bool async_result_ = false;
+};
+
+// Qwen-only GPU top-k weighting/reduction for CPU-affinity layers.  The
+// runner is intentionally separate from GgmlQwenSharedRunner: its output is
+// a normal GGML CUDA tensor, so the existing shared-expert graph can consume
+// it directly on the same backend stream without a device-to-host round trip.
+// Other model families never call this class.
+class GgmlQwenDeviceCombineRunner {
+ public:
+  static bool compiled_in();
+  static GgmlQwenDeviceCombineRunner &instance();
+
+  bool ensure(int device, int d_model, int topk);
+  bool run(const float *host_expert_output, const float *host_weights,
+           const void **device_output);
+
+  void shutdown();
+  ~GgmlQwenDeviceCombineRunner();
+
+ private:
+  GgmlQwenDeviceCombineRunner() = default;
+  GgmlQwenDeviceCombineRunner(const GgmlQwenDeviceCombineRunner &) = delete;
+  GgmlQwenDeviceCombineRunner &operator=(
+      const GgmlQwenDeviceCombineRunner &) = delete;
+
+  static constexpr int kStageBuffers = 4;
+
+  void *backend_ = nullptr;  // borrowed from ggml_shared_backend()
+  void *graph_ctx_ = nullptr; // ggml_context*
+  void *galloc_ = nullptr;    // ggml_gallocr_t
+  void *graph_ = nullptr;     // ggml_cgraph*
+  void *expert_output_ = nullptr; // ggml_tensor* [D,topk]
+  void *weights_ = nullptr;       // ggml_tensor* [1,topk]
+  void *output_ = nullptr;        // ggml_tensor* [D,1]
+  std::vector<void *> host_stage_;
+  std::vector<void *> weight_stage_;
+  std::vector<void *> stage_events_; // ggml_backend_event_t
+  std::vector<uint8_t> stage_used_;
+  int device_ = -1;
+  int d_model_ = 0;
+  int topk_ = 0;
+  int stage_next_ = 0;
+  bool graph_ready_ = false;
 };

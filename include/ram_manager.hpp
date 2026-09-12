@@ -2761,7 +2761,8 @@ public:
   // enabled() is false.
   ExpertLocation *promote_ram_to_active_layer(StreamingEngine &engine,
                                               int layer, int expert_id,
-                                              int target_gpu_id = -1) {
+                                              int target_gpu_id = -1,
+                                              int64_t qwen_pilot_prediction_ns = -1) {
     if (!vram_cache || !vram_cache->active_layer_pool)
       return nullptr;
     RAM_TIMED_LOCK(lock);
@@ -2856,7 +2857,7 @@ public:
     ++slot.ram_temp_pin_count;
     ExpertLocation *issued = vram_cache->upload_expert_active_async(
         layer, expert_id, slot.slab_buffer, real_total,
-        /*speculative=*/true, target_gpu_id);
+        /*speculative=*/true, target_gpu_id, qwen_pilot_prediction_ns);
     if (!issued) {
       --slot.ram_temp_pin_count;
       perf().n_pilot_active_fill_pool_full.fetch_add(1,

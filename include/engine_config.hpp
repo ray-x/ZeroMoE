@@ -380,6 +380,12 @@ struct EngineConfig {
   // from qwen4exp_decode_ggml_moe so the latter can be benchmarked with the
   // established host-router boundary. Default off for every model/config.
   bool qwen4exp_decode_device_hc = false;
+  // Qwen-only S==1 transfer policy. Batch RAM-resident expert slabs through
+  // the pinned staging arena before the CUDA upload, reducing the per-expert
+  // memcpy/unpack submission count. Prefill and every other model family
+  // retain the existing direct-slab path unless the diagnostic environment
+  // override is used.
+  bool qwen4exp_decode_batch_stage = false;
   // Qwen-only exact-Q8 HC decode kernels. Off by default and ignored by all
   // other model families.
   bool qwen4exp_decode_custom_hc_q8 = false;
@@ -392,6 +398,11 @@ struct EngineConfig {
   // Qwen4Exp-only grouped CPU fallback for explicitly selected
   // cpu_affinity_layers. Other model families never consult this switch.
   bool qwen4exp_cpu_ggml_moe = false;
+  // Qwen-only CPU/GPU overlap for cpu_affinity_layers: run the routed CPU
+  // MUL_MAT_ID graph on a persistent worker while the always-on shared expert
+  // runs on CUDA. Disabled by default for an explicit A/B and ignored by all
+  // other model families.
+  bool qwen4exp_cpu_gpu_overlap = false;
 
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
@@ -2535,12 +2546,16 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("qwen4exp_decode_ggml_moe", qwen4exp_decode_ggml_moe);
   qwen4exp_decode_device_hc = doc.root.get_bool(
       "qwen4exp_decode_device_hc", qwen4exp_decode_device_hc);
+  qwen4exp_decode_batch_stage = doc.root.get_bool(
+      "qwen4exp_decode_batch_stage", qwen4exp_decode_batch_stage);
   qwen4exp_decode_custom_hc_q8 = doc.root.get_bool(
       "qwen4exp_decode_custom_hc_q8", qwen4exp_decode_custom_hc_q8);
   qwen4exp_decode_gpu_router = doc.root.get_bool(
       "qwen4exp_decode_gpu_router", qwen4exp_decode_gpu_router);
   qwen4exp_cpu_ggml_moe =
       doc.root.get_bool("qwen4exp_cpu_ggml_moe", qwen4exp_cpu_ggml_moe);
+  qwen4exp_cpu_gpu_overlap = doc.root.get_bool(
+      "qwen4exp_cpu_gpu_overlap", qwen4exp_cpu_gpu_overlap);
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
   mtp_enabled = doc.root.get_bool("mtp_enabled", mtp_enabled);
   mtp_draft_tokens = (int)doc.root.get_int("mtp_draft_tokens", mtp_draft_tokens);

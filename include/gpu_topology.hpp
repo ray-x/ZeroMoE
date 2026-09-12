@@ -209,6 +209,12 @@ struct ExpertLocation {
     bool upload_timing_async = false;
     bool upload_source_pinned = false;
     size_t last_upload_bytes = 0;
+    // Non-negative only for an active-layer upload issued by the Qwen
+    // prediction path.  This lets the CUDA-event completion accounting split
+    // predicted copies from generic active-layer prewarm without changing the
+    // latter's behavior.
+    int64_t qwen_pilot_prediction_ns = -1;
+    int64_t qwen_pilot_issue_ns = -1;
 
     // 2026-08-28: guards a real race the worker-thread upload path
     // introduces (ActiveLayerUploadWorkers, active_layer_upload_workers.
@@ -457,6 +463,10 @@ public:
     size_t expert_max_slab_size = 0;   // largest real/aligned slab, for staging
     int expert_n_experts = 0;
     std::vector<size_t> expert_layer_slab_bytes;
+    // Explicit CPU-affinity layers do not dispatch routed experts to VRAM.
+    // Retain the list so compact-cache reindexing after a topology update
+    // preserves the same redistributed physical ownership.
+    std::vector<int> expert_cpu_affinity_layers;
     bool expert_compact_layout = false;
     int expert_full_layer_prefix = 0;
     uint64_t cache_clock = 0;
@@ -1088,9 +1098,15 @@ public:
     static std::vector<int> compact_layer_slot_counts(
         size_t cache_bytes, int n_experts_total,
         const std::vector<size_t>& layer_slab_bytes,
-        int full_layer_prefix = 0) {
+        int full_layer_prefix = 0,
+        const std::vector<int>& excluded_layers = {}) {
         std::vector<int> counts(layer_slab_bytes.size(), 0);
         if (cache_bytes == 0 || n_experts_total <= 0) return counts;
+
+        const auto is_excluded = [&](size_t layer) {
+            return std::find(excluded_layers.begin(), excluded_layers.end(),
+                             static_cast<int>(layer)) != excluded_layers.end();
+        };
 
         size_t used = 0;
         // A complete layer is useful to the GGML external-weight path, while
@@ -1101,6 +1117,7 @@ public:
         const int prefix_end = std::min(
             std::max(0, full_layer_prefix), (int)layer_slab_bytes.size());
         for (int l = 0; l < prefix_end; ++l) {
+            if (is_excluded((size_t)l)) continue;
             const size_t bytes = layer_slab_bytes[(size_t)l];
             if (bytes == 0 || bytes > cache_bytes - used ||
                 (size_t)n_experts_total > (cache_bytes - used) / bytes)
@@ -1112,6 +1129,7 @@ public:
         // large layer disappearing entirely from the VRAM tier just because
         // an earlier layer consumed the budget during the balanced fill.
         for (size_t l = 0; l < layer_slab_bytes.size(); ++l) {
+            if (is_excluded(l)) continue;
             const size_t bytes = layer_slab_bytes[l];
             if (bytes == 0 || counts[l] != 0 || bytes > cache_bytes - used)
                 continue;
@@ -1123,6 +1141,7 @@ public:
         while (progress) {
             progress = false;
             for (size_t l = 0; l < layer_slab_bytes.size(); ++l) {
+                if (is_excluded(l)) continue;
                 const size_t bytes = layer_slab_bytes[l];
                 if (bytes == 0 || counts[l] >= n_experts_total ||
                     bytes > cache_bytes - used)
@@ -1141,6 +1160,8 @@ public:
         expert_max_slab_size = expert_slab_bytes;
         expert_n_experts = n_experts_total;
         expert_layer_slab_bytes = layer_slab_bytes;
+        expert_cpu_affinity_layers = config ? config->cpu_affinity_layers
+                                            : std::vector<int>{};
         expert_full_layer_prefix = config
             ? std::max(0, config->vram_cache_full_layer_prefix)
             : 0;
@@ -1266,7 +1287,8 @@ public:
             for (int vi : vault_gpus) {
                 const auto counts = compact_layer_slot_counts(
                     devices[vi].expert_cache_size, expert_n_experts,
-                    expert_layer_slab_bytes, expert_full_layer_prefix);
+                    expert_layer_slab_bytes, expert_full_layer_prefix,
+                    expert_cpu_affinity_layers);
                 for (int count : counts) expert_vram_cache_cap += (size_t)count;
             }
             expert_vram_cache.resize(expert_vram_cache_cap);
@@ -1276,7 +1298,8 @@ public:
                 auto& dev = devices[vi];
                 const auto counts = compact_layer_slot_counts(
                     dev.expert_cache_size, expert_n_experts,
-                    expert_layer_slab_bytes, expert_full_layer_prefix);
+                    expert_layer_slab_bytes, expert_full_layer_prefix,
+                    expert_cpu_affinity_layers);
                 size_t offset = 0;
                 for (size_t layer = 0; layer < counts.size(); ++layer) {
                     const size_t layer_bytes = expert_layer_slab_bytes[layer];
@@ -1314,7 +1337,11 @@ public:
             LOG_STREAM_INFO() << "[GPU] Compact expert VRAM cache: "
                               << expert_vram_cache_cap << " variable-size slots ("
                               << total_cache_bytes / 1e9 << " GB pool) across "
-                              << vault_gpus.size() << " GPU(s)\n";
+                              << vault_gpus.size() << " GPU(s)"
+                              << (expert_cpu_affinity_layers.empty()
+                                      ? "\n"
+                                      : " (CPU-affinity layers excluded from "
+                                        "physical slot ownership)\n");
             return;
         }
 
@@ -1657,6 +1684,36 @@ public:
                 return false;
         }
         return true;
+    }
+
+    // Side-effect-free O(1) identity check for prediction/prefetch policy.
+    // Unlike find_expert(), this does not update hit/LRU counters, poll an
+    // upload event, or change the current CUDA device.  An identity whose
+    // async upload is still pending is deliberately reported as present:
+    // another transfer has already claimed the slot, so a predictor must not
+    // enqueue a duplicate copy.  The eventual consumer uses the normal
+    // upload-ready/active-layer wait path before reading the bytes.
+    bool main_layer_has(int layer, int expert_id) const {
+        if (layer < 0 || expert_id < 0) return false;
+        GPU_TOPO_TIMED_LOCK(lock);
+        const uint64_t key = swap_key(layer, expert_id);
+        const auto it = expert_index.find(key);
+        if (it != expert_index.end() &&
+            it->second < expert_vram_cache.size()) {
+            const ExpertLocation &loc = expert_vram_cache[it->second];
+            if (loc.layer_idx == layer && loc.expert_id == expert_id &&
+                loc.device_ptr)
+                return true;
+        }
+        // Keep a defensive fallback for a transient stale index.  This is
+        // rare and preserves the old correctness behavior without making the
+        // normal prediction path scan the entire cache.
+        for (const ExpertLocation &loc : expert_vram_cache) {
+            if (loc.layer_idx == layer && loc.expert_id == expert_id &&
+                loc.device_ptr)
+                return true;
+        }
+        return false;
     }
 
     // Resolve a complete layer's contiguous resident view with one cache
@@ -2763,7 +2820,8 @@ public:
     // of the same name -- see its comment.
     ExpertLocation* upload_expert_active_async(int layer, int expert_id,
                                                 const uint8_t* host_data, size_t bytes,
-                                                bool speculative = false, int target_gpu_id = -1);
+                                                bool speculative = false, int target_gpu_id = -1,
+                                                int64_t qwen_pilot_prediction_ns = -1);
 
     // 2026-08-28: victim-selection ONLY, no copy -- for ActiveLayerUploadWorkers
     // (active_layer_upload_workers.hpp), which does the actual register+

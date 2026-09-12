@@ -3245,14 +3245,19 @@ static bool run_ggml_moe_layer(
   // combine the whole 32-expert batch into one H2D plus one unpack-scatter,
   // which tests whether launch/submission overhead is larger than the extra
   // DDR->pinned-DDR memcpy.
-  static const bool force_batch_stage = [] {
+  static const bool env_force_batch_stage = [] {
     const char *ev = std::getenv("MOESTREAM_GGML_FORCE_BATCH_STAGE");
     return ev && ev[0] == '1';
   }();
+  const bool qwen_decode_batch_stage =
+      engine.family_ops.family == ModelFamily::Qwen4Exp && S == 1 &&
+      engine.qwen4exp_decode_batch_stage;
+  const bool force_batch_stage =
+      env_force_batch_stage || qwen_decode_batch_stage;
   static bool logged_batch_stage = false;
   if (force_batch_stage && !logged_batch_stage) {
-    LOG_INFO(
-        "[GGML-MOE] forcing all RAM sources through packed batch staging\n");
+    LOG_INFO("[GGML-MOE] RAM sources use packed batch staging (%s)\n",
+             qwen_decode_batch_stage ? "Qwen decode config" : "environment");
     logged_batch_stage = true;
   }
   // D2D cache copies use a separate raw stream. The sync point below drains

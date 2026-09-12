@@ -1326,6 +1326,32 @@ struct PerfCounters {
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_decode_calls_by_layer{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_decode_real_fetch_by_layer{};
 
+    // Qwen prediction timeline.  The *_ns arrays are one-shot handoff slots
+    // between the decode thread's next-layer pilot and that target layer;
+    // they are diagnostics only and are consumed atomically when the target
+    // reaches the corresponding boundary.
+    std::array<std::atomic<int64_t>, kMaxTrackedLayersForMiss>
+        qwen_pilot_prediction_ready_ns{};
+    std::array<std::atomic<int64_t>, kMaxTrackedLayersForMiss>
+        qwen_pilot_prediction_for_fetch_ns{};
+    std::array<std::atomic<int64_t>, kMaxTrackedLayersForMiss>
+        qwen_pilot_router_ready_ns{};
+    std::atomic<double> t_qwen_pilot_queue_to_ready{0};
+    std::atomic<double> t_qwen_pilot_ready_to_router{0};
+    std::atomic<double> t_qwen_pilot_router_to_fetch{0};
+    std::atomic<double> t_qwen_pilot_ready_to_fetch{0};
+    std::atomic<uint64_t> n_qwen_pilot_queue_to_ready{0};
+    std::atomic<uint64_t> n_qwen_pilot_ready_to_router{0};
+    std::atomic<uint64_t> n_qwen_pilot_router_to_fetch{0};
+    std::atomic<uint64_t> n_qwen_pilot_ready_to_fetch{0};
+    // Active-layer copies tagged as Qwen prediction fills.  The event time
+    // is the actual GPU copy-engine interval, not request-total time.
+    std::atomic<double> t_qwen_pilot_active_ready_to_issue{0};
+    std::atomic<double> t_qwen_pilot_active_dma{0};
+    std::atomic<uint64_t> n_qwen_pilot_active_ready_to_issue{0};
+    std::atomic<uint64_t> n_qwen_pilot_active_dma{0};
+    std::atomic<int64_t> bytes_qwen_pilot_active_dma{0};
+
     // Per-layer split of n_ram_prefetch_evicted_untouched (declared
     // earlier in this struct; placed HERE only because it needs
     // kMaxTrackedLayersForMiss, declared just above). This is
@@ -1354,6 +1380,21 @@ struct PerfCounters {
     static constexpr int kFetchHistogramBuckets = 9;  // 0,1,2,3,4,5,6,7,8+
     std::array<std::atomic<uint32_t>, kFetchHistogramBuckets> n_decode_fetch_count_histogram{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_decode_max_fetch_by_layer{};
+
+    // Qwen4Exp decode-only MoE layer wall time.  This is deliberately a
+    // model-gated diagnostic rather than part of Snapshot(): it measures the
+    // complete moe_forward_gguf call for S==1, including routing, cache
+    // resolution, expert execution, and any CPU/GPU handoff.  The split is
+    // what we need to choose a CPU-affinity set from evidence instead of
+    // assuming that low router confidence alone predicts a faster path.
+    std::array<std::atomic<double>, kMaxTrackedLayersForMiss>
+        t_qwen_decode_layer{};
+    std::array<std::atomic<double>, kMaxTrackedLayersForMiss>
+        t_qwen_decode_cpu_layer{};
+    std::array<std::atomic<double>, kMaxTrackedLayersForMiss>
+        t_qwen_decode_gpu_layer{};
+    std::array<std::atomic<uint64_t>, kMaxTrackedLayersForMiss>
+        n_qwen_decode_layer{};
 
     // EngineConfig::cpu_offload_max_experts -- how many of the real (Claimed)
     // misses classified above were actually redirected to CPU compute this
@@ -3470,6 +3511,38 @@ struct PerfCounters {
                  (unsigned long long)n_ggml_router_host_calls.load(),
                  (unsigned long long)n_ggml_router_device_calls.load());
         LOG_INFO("MoE expert FFN:      %8.3f s\n", t_moe_expert.load());
+        {
+            double qwen_cpu_total = 0.0;
+            double qwen_gpu_total = 0.0;
+            uint64_t qwen_calls = 0;
+            for (int l = 0; l < kMaxTrackedLayersForMiss; ++l) {
+                qwen_cpu_total += t_qwen_decode_cpu_layer[l].load();
+                qwen_gpu_total += t_qwen_decode_gpu_layer[l].load();
+                qwen_calls += n_qwen_decode_layer[l].load();
+            }
+            if (qwen_calls > 0) {
+                const double qwen_total = qwen_cpu_total + qwen_gpu_total;
+                LOG_INFO("Qwen decode MoE split: CPU-affinity %8.3f s | GPU %8.3f s | "
+                         "%.3f s total (%llu layer calls)\n",
+                         qwen_cpu_total, qwen_gpu_total, qwen_total,
+                         (unsigned long long)qwen_calls);
+                LOG_INFO("Qwen decode layer timing (wall, includes route/cache/expert):\n");
+                for (int l = 0; l < kMaxTrackedLayersForMiss; ++l) {
+                    const uint64_t calls = n_qwen_decode_layer[l].load();
+                    if (calls == 0)
+                        continue;
+                    const double total = t_qwen_decode_layer[l].load();
+                    const double cpu = t_qwen_decode_cpu_layer[l].load();
+                    const double gpu = t_qwen_decode_gpu_layer[l].load();
+                    LOG_INFO("  layer=%d path=%s calls=%llu total=%.3f s avg=%.3f ms "
+                             "share=%.1f%%\n",
+                             l, cpu > gpu ? "CPU-affinity" : "GPU",
+                             (unsigned long long)calls, total,
+                             1000.0 * total / (double)calls,
+                             qwen_total > 0.0 ? 100.0 * total / qwen_total : 0.0);
+                }
+            }
+        }
         LOG_INFO("Prefetch overhead:   %8.3f s\n", t_prefetch.load());
         LOG_INFO("--------------------------------------------------\n");
         uint64_t gcalls = n_expert_gpu_calls, ccalls = n_expert_cpu_calls;
@@ -5509,6 +5582,50 @@ inline void report_qwen4exp_pilot_stats() {
                  std::memory_order_relaxed),
              (unsigned long long)p.n_qwen_pilot_prefetch_rank_skipped.load(
                  std::memory_order_relaxed));
+
+    const uint64_t q_queue =
+        p.n_qwen_pilot_queue_to_ready.load(std::memory_order_relaxed);
+    const uint64_t q_router =
+        p.n_qwen_pilot_ready_to_router.load(std::memory_order_relaxed);
+    const uint64_t q_fetch =
+        p.n_qwen_pilot_ready_to_fetch.load(std::memory_order_relaxed);
+    const uint64_t q_router_fetch =
+        p.n_qwen_pilot_router_to_fetch.load(std::memory_order_relaxed);
+    if (q_queue || q_router || q_fetch || q_router_fetch) {
+      LOG_INFO("[QWEN-PILOT] timeline: GPU prediction queue->host IDs %.3f ms avg "
+               "(n=%llu) | IDs-ready->exact-router-ready %.3f ms avg (n=%llu) | "
+               "exact-router-ready->DDR fetch start %.3f ms avg (n=%llu) | "
+               "IDs-ready->DDR fetch start %.3f ms avg (n=%llu)\n",
+               q_queue ? 1000.0 * p.t_qwen_pilot_queue_to_ready / q_queue : 0.0,
+               (unsigned long long)q_queue,
+               q_router ? 1000.0 * p.t_qwen_pilot_ready_to_router / q_router : 0.0,
+               (unsigned long long)q_router,
+               q_router_fetch ? 1000.0 * p.t_qwen_pilot_router_to_fetch /
+                                      q_router_fetch
+                              : 0.0,
+               (unsigned long long)q_router_fetch,
+               q_fetch ? 1000.0 * p.t_qwen_pilot_ready_to_fetch / q_fetch : 0.0,
+               (unsigned long long)q_fetch);
+    }
+    const uint64_t q_issue = p.n_qwen_pilot_active_ready_to_issue.load(
+        std::memory_order_relaxed);
+    const uint64_t q_dma =
+        p.n_qwen_pilot_active_dma.load(std::memory_order_relaxed);
+    if (q_issue || q_dma) {
+      const int64_t q_bytes =
+          p.bytes_qwen_pilot_active_dma.load(std::memory_order_relaxed);
+      LOG_INFO("[QWEN-PILOT] predicted active H2D: ready->cudaMemcpyAsync issue "
+               "%.3f ms/copy (n=%llu) | CUDA-event DMA service %.3f ms/copy "
+               "(n=%llu, %.2f GB, %.2f GB/s)\n",
+               q_issue ? 1000.0 * p.t_qwen_pilot_active_ready_to_issue / q_issue
+                       : 0.0,
+               (unsigned long long)q_issue,
+               q_dma ? 1000.0 * p.t_qwen_pilot_active_dma / q_dma : 0.0,
+               (unsigned long long)q_dma, q_bytes / 1e9,
+               p.t_qwen_pilot_active_dma > 0.0
+                   ? (q_bytes / 1e9) / p.t_qwen_pilot_active_dma
+                   : 0.0);
+    }
 
     const uint32_t prefetch_k =
         p.n_qwen_pilot_prefetch_k_observed.load(std::memory_order_relaxed);

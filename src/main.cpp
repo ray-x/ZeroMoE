@@ -412,6 +412,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       config.qwen4exp_router_pilot_skip_prefetch_excluded_layers;
   engine.qwen4exp_decode_ggml_moe = config.qwen4exp_decode_ggml_moe;
   engine.qwen4exp_decode_device_hc = config.qwen4exp_decode_device_hc;
+  engine.qwen4exp_decode_batch_stage = config.qwen4exp_decode_batch_stage;
   engine.qwen4exp_decode_custom_hc_q8 = config.qwen4exp_decode_custom_hc_q8;
   engine.qwen4exp_decode_gpu_router = config.qwen4exp_decode_gpu_router;
   engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
@@ -3762,6 +3763,9 @@ int main(int argc, char *argv[]) {
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode device HC handoff: "
                     << (config.qwen4exp_decode_device_hc ? "ON" : "off")
                     << " (Qwen S=1 only)\n";
+  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode batch RAM staging: "
+                    << (config.qwen4exp_decode_batch_stage ? "ON" : "off")
+                    << " (Qwen S=1 only; direct pinned-slab path otherwise)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp custom exact-Q8 HC decode: "
                     << (config.qwen4exp_decode_custom_hc_q8 ? "ON" : "off")
                     << " (requires device HC; Qwen-only)\n";
