@@ -1004,18 +1004,49 @@ int process_one_shard(const std::string &input_path,
       mismatches++;
       continue;
     }
-    std::vector<uint8_t> src_buf(plan.size_bytes), out_buf(plan.size_bytes);
-    ssize_t r1 = pread(src.shard_fds[plan.src_shard_idx], src_buf.data(),
-                       plan.size_bytes, (off_t)plan.src_offset);
-    ssize_t r2 = pread(owner->fd_for_tensor(reloaded), out_buf.data(),
-                       plan.size_bytes, (off_t)reloaded.offset);
-    if (r1 != (ssize_t)plan.size_bytes || r2 != (ssize_t)plan.size_bytes) {
+    // Chunked compare, NOT one pread() sized to the whole tensor: a single
+    // read/write syscall is capped by the kernel at MAX_RW_COUNT (0x7ffff000
+    // bytes, just under 2GiB) and silently short-reads past it, which this
+    // code used to treat as a hard "pread error" -- a real failure found on
+    // DeepSeek-V4.1's blk.N.engram_embd.weight tables (~32GB each, a huge
+    // hash-embedding lookup table, unlike every other tensor in this
+    // project's models which stays well under the limit). Sizing src_buf/
+    // out_buf to plan.size_bytes directly was also a real double-allocation
+    // risk on its own for a tensor this size (two ~32GB buffers just to
+    // verify one tensor) -- fixed-size 64MB chunks match the write loop's
+    // own scratch-buffer convention above and keep memory use constant
+    // regardless of tensor size.
+    constexpr size_t kVerifyChunk = 64ULL * 1024 * 1024;
+    static std::vector<uint8_t> src_chunk, out_chunk;
+    src_chunk.resize(std::min<uint64_t>(kVerifyChunk, plan.size_bytes));
+    out_chunk.resize(src_chunk.size());
+    uint64_t remaining = plan.size_bytes;
+    uint64_t src_off = plan.src_offset;
+    uint64_t out_off = reloaded.offset;
+    bool io_error = false, mismatch = false;
+    while (remaining > 0 && !io_error && !mismatch) {
+      size_t chunk = (size_t)std::min<uint64_t>(remaining, kVerifyChunk);
+      ssize_t r1 = pread(src.shard_fds[plan.src_shard_idx], src_chunk.data(),
+                         chunk, (off_t)src_off);
+      ssize_t r2 = pread(owner->fd_for_tensor(reloaded), out_chunk.data(),
+                         chunk, (off_t)out_off);
+      if (r1 != (ssize_t)chunk || r2 != (ssize_t)chunk) {
+        io_error = true;
+        break;
+      }
+      if (std::memcmp(src_chunk.data(), out_chunk.data(), chunk) != 0)
+        mismatch = true;
+      remaining -= chunk;
+      src_off += chunk;
+      out_off += chunk;
+    }
+    if (io_error) {
       fprintf(stderr, "[pack] VERIFY FAILED: pread error while checking %s\n",
               plan.name.c_str());
       mismatches++;
       continue;
     }
-    if (std::memcmp(src_buf.data(), out_buf.data(), plan.size_bytes) != 0) {
+    if (mismatch) {
       fprintf(stderr,
               "[pack] VERIFY FAILED: %s bytes differ between source and "
               "repacked output\n",
