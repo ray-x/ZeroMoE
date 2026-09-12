@@ -32,14 +32,14 @@ static_assert(sizeof(moestream_ggml_block_q8_K) == 292);
 static_assert(sizeof(moestream_ggml_block_iq1_m) == 56);
 extern "C" void quantize_row_q8_K(const float *, void *, int64_t);
 extern "C" void ggml_vec_dot_iq1_m_q8_K(int, float *, size_t, const void *,
-                                          size_t, const void *, size_t, int);
+                                        size_t, const void *, size_t, int);
 extern "C" void ggml_vec_dot_iq2_xxs_q8_K(int, float *, size_t, const void *,
-                                            size_t, const void *, size_t, int);
+                                          size_t, const void *, size_t, int);
 extern "C" void ggml_vec_dot_iq3_xxs_q8_K(int, float *, size_t, const void *,
-                                            size_t, const void *, size_t, int);
+                                          size_t, const void *, size_t, int);
 extern "C" void quantize_row_q8_0(const float *, void *, int64_t);
 extern "C" void ggml_vec_dot_iq4_nl_q8_0(int, float *, size_t, const void *,
-                                           size_t, const void *, size_t, int);
+                                         size_t, const void *, size_t, int);
 extern "C" void ggml_cpu_init(void);
 
 // GGML's quantized CPU dot kernels use ggml_table_f32_f16, which is filled by
@@ -1639,8 +1639,8 @@ void matmul_iq2_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
 static inline void dequant_pack16_u8s8(uint64_t grid64_lo, uint64_t grid64_hi,
                                        uint8_t signs_lo, uint8_t signs_hi,
                                        __m512i kmask_vec16,
-                                       const int8_t *xq_ptr,
-                                       uint8_t *mag_out, int8_t *xsigned_out) {
+                                       const int8_t *xq_ptr, uint8_t *mag_out,
+                                       int8_t *xsigned_out) {
   // Raw grid bytes ARE the unsigned magnitude (0-255) -- identical read to
   // dequant_and_fmadd_16's own `g`/`gi32` above.
   __m128i g = _mm_set_epi64x((int64_t)grid64_hi, (int64_t)grid64_lo);
@@ -1655,7 +1655,8 @@ static inline void dequant_pack16_u8s8(uint64_t grid64_lo, uint64_t grid64_hi,
   __m512i signs_bcast = _mm512_inserti32x8(
       _mm512_castsi256_si512(signs_lo_bcast), signs_hi_bcast, 1);
   __m512i andres = _mm512_and_si512(signs_bcast, kmask_vec16);
-  __mmask16 bit_set_mask = _mm512_cmpneq_epi32_mask(andres, _mm512_setzero_si512());
+  __mmask16 bit_set_mask =
+      _mm512_cmpneq_epi32_mask(andres, _mm512_setzero_si512());
 
   __m128i xq = _mm_loadu_si128((const __m128i *)xq_ptr);
   __m128i xq_neg = _mm_sub_epi8(_mm_setzero_si128(), xq);
@@ -1690,13 +1691,24 @@ static void dot_u8s8_direct_avx512_x2(const uint8_t *w64, const int8_t *x64,
   __m512i acc = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv);
   __m256i acc_lo = _mm512_extracti64x4_epi64(acc, 0);
   __m256i acc_hi = _mm512_extracti64x4_epi64(acc, 1);
-  sum_lo = _mm256_reduce_add_epi32(acc_lo);
-  sum_hi = _mm256_reduce_add_epi32(acc_hi);
+  // GCC does not provide an _mm256_reduce_add_epi32 intrinsic (the
+  // corresponding reduction helper exists for __m512i only).  Keep this
+  // helper usable with both GCC and Clang by reducing the two extracted
+  // eight-lane vectors explicitly.
+  alignas(32) int32_t lanes[8];
+  _mm256_store_si256((__m256i *)lanes, acc_lo);
+  sum_lo = lanes[0] + lanes[1] + lanes[2] + lanes[3] +
+           lanes[4] + lanes[5] + lanes[6] + lanes[7];
+  _mm256_store_si256((__m256i *)lanes, acc_hi);
+  sum_hi = lanes[0] + lanes[1] + lanes[2] + lanes[3] +
+           lanes[4] + lanes[5] + lanes[6] + lanes[7];
 #else
   sum_lo = 0;
-  for (int i = 0; i < 32; ++i) sum_lo += (int32_t)w64[i] * (int32_t)x64[i];
+  for (int i = 0; i < 32; ++i)
+    sum_lo += (int32_t)w64[i] * (int32_t)x64[i];
   sum_hi = 0;
-  for (int i = 32; i < 64; ++i) sum_hi += (int32_t)w64[i] * (int32_t)x64[i];
+  for (int i = 32; i < 64; ++i)
+    sum_hi += (int32_t)w64[i] * (int32_t)x64[i];
 #endif
 }
 
@@ -1704,7 +1716,8 @@ static void dot_u8s8_direct_avx512_x2(const uint8_t *w64, const int8_t *x64,
 // pre-quantized (e.g. via quantize_activations_q8_0) over the SAME k
 // elements, 32-wide blocks -- num_blocks = k/32 entries, xq[block_idx]
 // aligns 1:1 with this function's own ib32 sub-block index.
-float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq, int64_t k) {
+float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq,
+                                 int64_t k) {
   constexpr int QK_K = 256;
   constexpr size_t BLOCK_BYTES = 66;
   const int64_t nb = k / QK_K;
@@ -1713,10 +1726,10 @@ float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq, int
   const uint8_t *ksigns = (const uint8_t *)ms_grid_ksigns_iq2xs();
   __m512i kmask_vec16 = kmask_iq2xs_vec32_16_fused();
 
-  double total = 0.0;  // double accumulation -- this is a reference-quality
-                        // implementation for a feasibility bench, not yet
-                        // optimized for the accumulator width production
-                        // code would use.
+  double total = 0.0; // double accumulation -- this is a reference-quality
+                      // implementation for a feasibility bench, not yet
+                      // optimized for the accumulator width production
+                      // code would use.
   alignas(64) uint8_t mag64[64];
   alignas(64) int8_t xsigned64[64];
 
@@ -1741,11 +1754,13 @@ float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq, int
       const int8_t *xq_row = xq[block_idx].qs;
 
       dequant_pack16_u8s8(grid_tbl[aux8[0]], grid_tbl[aux8[1]],
-                          ksigns[(aux32_1 >> 0) & 127], ksigns[(aux32_1 >> 7) & 127],
-                          kmask_vec16, xq_row + 0, mag64 + 0, xsigned64 + 0);
+                          ksigns[(aux32_1 >> 0) & 127],
+                          ksigns[(aux32_1 >> 7) & 127], kmask_vec16, xq_row + 0,
+                          mag64 + 0, xsigned64 + 0);
       dequant_pack16_u8s8(grid_tbl[aux8[2]], grid_tbl[aux8[3]],
-                          ksigns[(aux32_1 >> 14) & 127], ksigns[(aux32_1 >> 21) & 127],
-                          kmask_vec16, xq_row + 16, mag64 + 16, xsigned64 + 16);
+                          ksigns[(aux32_1 >> 14) & 127],
+                          ksigns[(aux32_1 >> 21) & 127], kmask_vec16,
+                          xq_row + 16, mag64 + 16, xsigned64 + 16);
 
       int ib32_next = ib32 + 1;
       uint32_t aux32_0_next, aux32_1_next;
@@ -1758,11 +1773,13 @@ float dot_iq2_xxs_vnni_prototype(const uint8_t *block, const block_q8_0 *xq, int
       const int8_t *xq_row_next = xq[block_idx_next].qs;
 
       dequant_pack16_u8s8(grid_tbl[aux8_next[0]], grid_tbl[aux8_next[1]],
-                          ksigns[(aux32_1_next >> 0) & 127], ksigns[(aux32_1_next >> 7) & 127],
-                          kmask_vec16, xq_row_next + 0, mag64 + 32, xsigned64 + 32);
+                          ksigns[(aux32_1_next >> 0) & 127],
+                          ksigns[(aux32_1_next >> 7) & 127], kmask_vec16,
+                          xq_row_next + 0, mag64 + 32, xsigned64 + 32);
       dequant_pack16_u8s8(grid_tbl[aux8_next[2]], grid_tbl[aux8_next[3]],
-                          ksigns[(aux32_1_next >> 14) & 127], ksigns[(aux32_1_next >> 21) & 127],
-                          kmask_vec16, xq_row_next + 16, mag64 + 48, xsigned64 + 48);
+                          ksigns[(aux32_1_next >> 14) & 127],
+                          ksigns[(aux32_1_next >> 21) & 127], kmask_vec16,
+                          xq_row_next + 16, mag64 + 48, xsigned64 + 48);
 
       int32_t idot_lo, idot_hi;
       dot_u8s8_direct_avx512_x2(mag64, xsigned64, idot_lo, idot_hi);
@@ -1834,7 +1851,8 @@ static const uint64_t *iq2xxs_sign_pattern_table() {
     const uint8_t *ksigns = (const uint8_t *)ms_grid_ksigns_iq2xs(); // [128]
     for (int idx = 0; idx < 128; ++idx) {
       uint8_t bytes[8];
-      for (int j = 0; j < 8; ++j) bytes[j] = (ksigns[idx] & kmask8[j]) ? 0xFF : 0x01;
+      for (int j = 0; j < 8; ++j)
+        bytes[j] = (ksigns[idx] & kmask8[j]) ? 0xFF : 0x01;
       std::memcpy(&tbl[idx], bytes, 8);
     }
     return true;
@@ -1843,9 +1861,11 @@ static const uint64_t *iq2xxs_sign_pattern_table() {
   return tbl;
 }
 
-static_assert(sizeof(block_q8_K_local) == 292, "block_q8_K_local layout must match ggml's block_q8_K exactly");
+static_assert(sizeof(block_q8_K_local) == 292,
+              "block_q8_K_local layout must match ggml's block_q8_K exactly");
 
-float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k) {
+float dot_iq2_xxs_avx2_prototype(const uint8_t *block,
+                                 const block_q8_K_local *y, int64_t k) {
   constexpr int QK_K = 256;
   constexpr size_t BLOCK_BYTES = 66;
   const int64_t nb = k / QK_K;
@@ -1865,8 +1885,10 @@ float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
     __m256i sumi1 = _mm256_setzero_si256();
     __m256i sumi2 = _mm256_setzero_si256();
     for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-      const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-      const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+      const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
+      q8 += 32;
+      const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8);
+      q8 += 32;
 
       uint32_t aux32_0, aux32_1;
       std::memcpy(&aux32_0, qs_bytes + ib32 * 8 + 0, 4);
@@ -1878,22 +1900,32 @@ float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
       std::memcpy(&aux32_1_next, qs_bytes + ib32_next * 8 + 4, 4);
       const uint8_t *aux8_next = (const uint8_t *)&aux32_0_next;
 
-      const __m256i q2_1 = _mm256_set_epi64x((int64_t)grid_tbl[aux8[3]], (int64_t)grid_tbl[aux8[2]],
-                                             (int64_t)grid_tbl[aux8[1]], (int64_t)grid_tbl[aux8[0]]);
-      const __m256i q2_2 = _mm256_set_epi64x((int64_t)grid_tbl[aux8_next[3]], (int64_t)grid_tbl[aux8_next[2]],
-                                             (int64_t)grid_tbl[aux8_next[1]], (int64_t)grid_tbl[aux8_next[0]]);
-      const __m256i s2_1 = _mm256_set_epi64x((int64_t)signs64[(aux32_1 >> 21) & 127], (int64_t)signs64[(aux32_1 >> 14) & 127],
-                                             (int64_t)signs64[(aux32_1 >> 7) & 127], (int64_t)signs64[(aux32_1 >> 0) & 127]);
-      const __m256i s2_2 = _mm256_set_epi64x((int64_t)signs64[(aux32_1_next >> 21) & 127], (int64_t)signs64[(aux32_1_next >> 14) & 127],
-                                             (int64_t)signs64[(aux32_1_next >> 7) & 127], (int64_t)signs64[(aux32_1_next >> 0) & 127]);
+      const __m256i q2_1 = _mm256_set_epi64x(
+          (int64_t)grid_tbl[aux8[3]], (int64_t)grid_tbl[aux8[2]],
+          (int64_t)grid_tbl[aux8[1]], (int64_t)grid_tbl[aux8[0]]);
+      const __m256i q2_2 = _mm256_set_epi64x(
+          (int64_t)grid_tbl[aux8_next[3]], (int64_t)grid_tbl[aux8_next[2]],
+          (int64_t)grid_tbl[aux8_next[1]], (int64_t)grid_tbl[aux8_next[0]]);
+      const __m256i s2_1 =
+          _mm256_set_epi64x((int64_t)signs64[(aux32_1 >> 21) & 127],
+                            (int64_t)signs64[(aux32_1 >> 14) & 127],
+                            (int64_t)signs64[(aux32_1 >> 7) & 127],
+                            (int64_t)signs64[(aux32_1 >> 0) & 127]);
+      const __m256i s2_2 =
+          _mm256_set_epi64x((int64_t)signs64[(aux32_1_next >> 21) & 127],
+                            (int64_t)signs64[(aux32_1_next >> 14) & 127],
+                            (int64_t)signs64[(aux32_1_next >> 7) & 127],
+                            (int64_t)signs64[(aux32_1_next >> 0) & 127]);
       const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
       const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
       const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
       const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
       const uint16_t ls1 = (uint16_t)(aux32_1 >> 28);
       const uint16_t ls2 = (uint16_t)(aux32_1_next >> 28);
-      const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1)));
-      const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1)));
+      const __m256i p1 =
+          _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1)));
+      const __m256i p2 =
+          _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1)));
       sumi1 = _mm256_add_epi32(sumi1, p1);
       sumi2 = _mm256_add_epi32(sumi2, p2);
     }
@@ -1901,7 +1933,10 @@ float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
     // AVX-512F (which covers 512-bit FMA, already used elsewhere in this
     // file) but not the separate legacy FMA3 flag the 256-bit FMA
     // intrinsic needs ("target specific option mismatch" at compile time).
-    accumf = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2))), accumf);
+    accumf = _mm256_add_ps(
+        _mm256_mul_ps(_mm256_set1_ps(d),
+                      _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2))),
+        accumf);
   }
   return 0.125f * hsum_f32_avx2(accumf);
 }
@@ -1914,15 +1949,16 @@ float dot_iq2_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
 // same "plain static, not thread_local" reasoning as matmul_q8_0_fused's
 // own g_xq_q8 buffer above (single decode-thread-only caller, fully
 // written before the parallel region reads it).
-void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
-                              int S, int I, int O) {
+void matmul_iq2_xxs_ggml_avx2(float *y, const float *x,
+                              const uint8_t *W_quantized, int S, int I, int O) {
   constexpr int QK_K = 256;
   constexpr size_t BLOCK_BYTES = 66;
   const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
   const int num_superblocks = I / QK_K;
 
   static std::vector<block_q8_K_local> g_xq_k;
-  if (g_xq_k.size() < (size_t)(S * num_superblocks)) g_xq_k.resize((size_t)S * num_superblocks);
+  if (g_xq_k.size() < (size_t)(S * num_superblocks))
+    g_xq_k.resize((size_t)S * num_superblocks);
 
   // Gated on S>1 -- an OMP team-spawn for a single S=1 (decode, the
   // dominant call volume for this dispatch path) serial iteration is pure
@@ -1939,7 +1975,8 @@ void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
   if (S > 1) {
 #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; ++s) {
-      quantize_row_q8_K_ref(x + (int64_t)s * I, g_xq_k.data() + (int64_t)s * num_superblocks, I);
+      quantize_row_q8_K_ref(x + (int64_t)s * I,
+                            g_xq_k.data() + (int64_t)s * num_superblocks, I);
     }
   } else if (S == 1) {
     quantize_row_q8_K_ref(x, g_xq_k.data(), I);
@@ -1952,7 +1989,8 @@ void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
     for (int o = 0; o < O; ++o) {
       const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
       if (o + 1 < O) {
-        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes),
+                     _MM_HINT_T0);
       }
       ys[o] = dot_iq2_xxs_avx2_prototype(row_w, xq, I);
     }
@@ -1960,15 +1998,15 @@ void matmul_iq2_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
 }
 // ============================================================
 
-// BeeLlama/ggml's Qwen CPU route uses IQ1_M weights against one Q8_K-
+// Llama.cpp/ggml's Qwen CPU route uses IQ1_M weights against one Q8_K-
 // quantized activation row. MoEStream's old fallback instead dequantized
 // every IQ1_M row to FP32 and then ran an AVX-512 FP32 dot, leaving the
 // integer unpack/lookup work in ggml_dequant_row. Reuse ggml's production
-// entry point here. On the current BeeLlama build this selects AVX2 (its
+// entry point here. On the current Llama.cpp build this selects AVX2 (its
 // AVX512 and AVX512-VNNI options are disabled); a ggml build with VNNI can
 // select its own VNNI implementation internally.
-bool matmul_iq1_m_ggml_q8k(float *y, const float *x,
-                           const uint8_t *W_quantized, int S, int I, int O) {
+bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
+                           int S, int I, int O) {
 #if defined(MOESTREAM_USE_GGML)
   constexpr int QK_K = 256;
   if (!y || !x || !W_quantized || S <= 0 || I <= 0 || O <= 0 || I % QK_K != 0) {
@@ -1976,7 +2014,8 @@ bool matmul_iq1_m_ggml_q8k(float *y, const float *x,
   }
   ensure_ggml_cpu_initialized();
   const int nblocks = I / QK_K;
-  const size_t row_bytes = static_cast<size_t>(nblocks) * sizeof(moestream_ggml_block_iq1_m);
+  const size_t row_bytes =
+      static_cast<size_t>(nblocks) * sizeof(moestream_ggml_block_iq1_m);
   std::vector<moestream_ggml_block_q8_K> xq(static_cast<size_t>(S) * nblocks);
   for (int s = 0; s < S; ++s) {
     quantize_row_q8_K(x + static_cast<int64_t>(s) * I,
@@ -1987,25 +2026,28 @@ bool matmul_iq1_m_ggml_q8k(float *y, const float *x,
   for (int o = 0; o < O; ++o) {
     const uint8_t *wrow = W_quantized + static_cast<size_t>(o) * row_bytes;
     for (int s = 0; s < S; ++s) {
-      ggml_vec_dot_iq1_m_q8_K(
-          I, y + static_cast<int64_t>(s) * O + o, 0,
-          wrow, 0,
-          xq.data() + static_cast<size_t>(s) * nblocks,
-          sizeof(moestream_ggml_block_q8_K), 1);
+      ggml_vec_dot_iq1_m_q8_K(I, y + static_cast<int64_t>(s) * O + o, 0, wrow,
+                              0, xq.data() + static_cast<size_t>(s) * nblocks,
+                              sizeof(moestream_ggml_block_q8_K), 1);
     }
   }
   return true;
 #else
-  (void)y; (void)x; (void)W_quantized; (void)S; (void)I; (void)O;
+  (void)y;
+  (void)x;
+  (void)W_quantized;
+  (void)S;
+  (void)I;
+  (void)O;
   return false;
 #endif
 }
 
 namespace {
 
-bool matmul_iq1_m_ggml_q8k_grouped_impl(
-    float *const *y, const float *const *x,
-    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
+bool matmul_iq1_m_ggml_q8k_grouped_impl(float *const *y, const float *const *x,
+                                        const uint8_t *const *W_quantized,
+                                        int n_matrices, int S, int I, int O) {
 #if defined(MOESTREAM_USE_GGML)
   constexpr int QK_K = 256;
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
@@ -2013,25 +2055,24 @@ bool matmul_iq1_m_ggml_q8k_grouped_impl(
     return false;
   ensure_ggml_cpu_initialized();
   const int nblocks = I / QK_K;
-  const size_t row_bytes = static_cast<size_t>(nblocks) *
-                           sizeof(moestream_ggml_block_iq1_m);
-  // BeeLLama's MUL_MAT_ID path quantizes a shared activation once for the
+  const size_t row_bytes =
+      static_cast<size_t>(nblocks) * sizeof(moestream_ggml_block_iq1_m);
+  // Llama.cpp's MUL_MAT_ID path quantizes a shared activation once for the
   // whole expert group.  The ordinary grouped-input API also supports a
   // different activation per matrix, so retain that form only when callers
   // actually provide distinct pointers.
   bool shared_input = true;
   for (int m = 1; m < n_matrices; ++m)
     shared_input = shared_input && (x[m] == x[0]);
-  const size_t xq_rows = static_cast<size_t>(shared_input ? S
-                                                           : n_matrices * S);
+  const size_t xq_rows = static_cast<size_t>(shared_input ? S : n_matrices * S);
   std::vector<moestream_ggml_block_q8_K> xq(xq_rows * nblocks);
   for (int m = 0; m < (shared_input ? 1 : n_matrices); ++m) {
     for (int s = 0; s < S; ++s) {
-      quantize_row_q8_K(x[m] + static_cast<int64_t>(s) * I,
-                        xq.data() +
-                            (static_cast<size_t>(shared_input ? 0 : m) * S +
-                             s) * nblocks,
-                        I);
+      quantize_row_q8_K(
+          x[m] + static_cast<int64_t>(s) * I,
+          xq.data() +
+              (static_cast<size_t>(shared_input ? 0 : m) * S + s) * nblocks,
+          I);
     }
   }
 
@@ -2069,20 +2110,22 @@ bool matmul_iq1_m_ggml_q8k_grouped_impl(
 
 } // namespace
 
-bool matmul_iq1_m_ggml_q8k_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O) {
-  if (!x) return false;
+bool matmul_iq1_m_ggml_q8k_grouped(float *const *y, const float *x,
+                                   const uint8_t *const *W_quantized,
+                                   int n_matrices, int S, int I, int O) {
+  if (!x)
+    return false;
   std::vector<const float *> inputs(static_cast<size_t>(n_matrices), x);
-  return matmul_iq1_m_ggml_q8k_grouped_impl(
-      y, inputs.data(), W_quantized, n_matrices, S, I, O);
+  return matmul_iq1_m_ggml_q8k_grouped_impl(y, inputs.data(), W_quantized,
+                                            n_matrices, S, I, O);
 }
 
-bool matmul_iq1_m_ggml_q8k_grouped_inputs(
-    float *const *y, const float *const *x,
-    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
-  return matmul_iq1_m_ggml_q8k_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O);
+bool matmul_iq1_m_ggml_q8k_grouped_inputs(float *const *y,
+                                          const float *const *x,
+                                          const uint8_t *const *W_quantized,
+                                          int n_matrices, int S, int I, int O) {
+  return matmul_iq1_m_ggml_q8k_grouped_impl(y, x, W_quantized, n_matrices, S, I,
+                                            O);
 }
 
 // Direct fused kernel: computes dot product of IQ3_XXS block weights with FP32
@@ -2190,7 +2233,8 @@ void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
 // `scales_and_signs`). Confirmed byte-for-byte against dot_iq3_xxs_f32_
 // avx512 above (same BLOCK_BYTES=98, same qs/scales_and_signs split, same
 // aux32 bit layout) before writing this, not re-derived from scratch.
-float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y, int64_t k) {
+float dot_iq3_xxs_avx2_prototype(const uint8_t *block,
+                                 const block_q8_K_local *y, int64_t k) {
   constexpr int QK_K = 256;
   constexpr size_t BLOCK_BYTES = 98;
   const int64_t nb = k / QK_K;
@@ -2204,23 +2248,27 @@ float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
     uint16_t d_half;
     std::memcpy(&d_half, base, 2);
     const float d = fp16_to_fp32_fused(d_half) * y[i].d;
-    const uint8_t *q3 = base + 2;               // [64] grid indices
-    const uint8_t *gas = base + 2 + 64;          // [32] sign/scale aux32 words
+    const uint8_t *q3 = base + 2;       // [64] grid indices
+    const uint8_t *gas = base + 2 + 64; // [32] sign/scale aux32 words
     const int8_t *q8 = y[i].qs;
 
     __m256i sumi1 = _mm256_setzero_si256();
     __m256i sumi2 = _mm256_setzero_si256();
     for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
-      const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
-      const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8); q8 += 32;
+      const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
+      q8 += 32;
+      const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)q8);
+      q8 += 32;
 
       const __m256i q2_1 = _mm256_set_epi32(
-          (int)grid_tbl[q3[7]], (int)grid_tbl[q3[6]], (int)grid_tbl[q3[5]], (int)grid_tbl[q3[4]],
-          (int)grid_tbl[q3[3]], (int)grid_tbl[q3[2]], (int)grid_tbl[q3[1]], (int)grid_tbl[q3[0]]);
+          (int)grid_tbl[q3[7]], (int)grid_tbl[q3[6]], (int)grid_tbl[q3[5]],
+          (int)grid_tbl[q3[4]], (int)grid_tbl[q3[3]], (int)grid_tbl[q3[2]],
+          (int)grid_tbl[q3[1]], (int)grid_tbl[q3[0]]);
       q3 += 8;
       const __m256i q2_2 = _mm256_set_epi32(
-          (int)grid_tbl[q3[7]], (int)grid_tbl[q3[6]], (int)grid_tbl[q3[5]], (int)grid_tbl[q3[4]],
-          (int)grid_tbl[q3[3]], (int)grid_tbl[q3[2]], (int)grid_tbl[q3[1]], (int)grid_tbl[q3[0]]);
+          (int)grid_tbl[q3[7]], (int)grid_tbl[q3[6]], (int)grid_tbl[q3[5]],
+          (int)grid_tbl[q3[4]], (int)grid_tbl[q3[3]], (int)grid_tbl[q3[2]],
+          (int)grid_tbl[q3[1]], (int)grid_tbl[q3[0]]);
       q3 += 8;
 
       uint32_t aux32_0, aux32_1;
@@ -2228,22 +2276,33 @@ float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
       std::memcpy(&aux32_1, gas + 4, 4);
       gas += 8;
 
-      const __m256i s2_1 = _mm256_set_epi64x((int64_t)signs64[(aux32_0 >> 21) & 127], (int64_t)signs64[(aux32_0 >> 14) & 127],
-                                             (int64_t)signs64[(aux32_0 >> 7) & 127], (int64_t)signs64[(aux32_0 >> 0) & 127]);
-      const __m256i s2_2 = _mm256_set_epi64x((int64_t)signs64[(aux32_1 >> 21) & 127], (int64_t)signs64[(aux32_1 >> 14) & 127],
-                                             (int64_t)signs64[(aux32_1 >> 7) & 127], (int64_t)signs64[(aux32_1 >> 0) & 127]);
+      const __m256i s2_1 =
+          _mm256_set_epi64x((int64_t)signs64[(aux32_0 >> 21) & 127],
+                            (int64_t)signs64[(aux32_0 >> 14) & 127],
+                            (int64_t)signs64[(aux32_0 >> 7) & 127],
+                            (int64_t)signs64[(aux32_0 >> 0) & 127]);
+      const __m256i s2_2 =
+          _mm256_set_epi64x((int64_t)signs64[(aux32_1 >> 21) & 127],
+                            (int64_t)signs64[(aux32_1 >> 14) & 127],
+                            (int64_t)signs64[(aux32_1 >> 7) & 127],
+                            (int64_t)signs64[(aux32_1 >> 0) & 127]);
       const __m256i q8s_1 = _mm256_sign_epi8(q8_1, s2_1);
       const __m256i q8s_2 = _mm256_sign_epi8(q8_2, s2_2);
       const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
       const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
       const uint16_t ls1 = (uint16_t)(aux32_0 >> 28);
       const uint16_t ls2 = (uint16_t)(aux32_1 >> 28);
-      const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1)));
-      const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1)));
+      const __m256i p1 =
+          _mm256_madd_epi16(dot1, _mm256_set1_epi16((short)(2 * ls1 + 1)));
+      const __m256i p2 =
+          _mm256_madd_epi16(dot2, _mm256_set1_epi16((short)(2 * ls2 + 1)));
       sumi1 = _mm256_add_epi32(sumi1, p1);
       sumi2 = _mm256_add_epi32(sumi2, p2);
     }
-    accumf = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2))), accumf);
+    accumf = _mm256_add_ps(
+        _mm256_mul_ps(_mm256_set1_ps(d),
+                      _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2))),
+        accumf);
   }
   return 0.25f * hsum_f32_avx2(accumf);
 }
@@ -2251,15 +2310,16 @@ float dot_iq3_xxs_avx2_prototype(const uint8_t *block, const block_q8_K_local *y
 // OpenMP wrapper for dot_iq3_xxs_avx2_prototype -- IQ3_XXS sibling of
 // matmul_iq2_xxs_ggml_avx2 above, same design (see that function's own
 // comment).
-void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantized,
-                              int S, int I, int O) {
+void matmul_iq3_xxs_ggml_avx2(float *y, const float *x,
+                              const uint8_t *W_quantized, int S, int I, int O) {
   constexpr int QK_K = 256;
   constexpr size_t BLOCK_BYTES = 98;
   const size_t row_bytes = (size_t)(I / QK_K) * BLOCK_BYTES;
   const int num_superblocks = I / QK_K;
 
   static std::vector<block_q8_K_local> g_xq_k;
-  if (g_xq_k.size() < (size_t)(S * num_superblocks)) g_xq_k.resize((size_t)S * num_superblocks);
+  if (g_xq_k.size() < (size_t)(S * num_superblocks))
+    g_xq_k.resize((size_t)S * num_superblocks);
 
   // Gated on S>1 -- an OMP team-spawn for a single S=1 (decode, the
   // dominant call volume for this dispatch path) serial iteration is pure
@@ -2276,7 +2336,8 @@ void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
   if (S > 1) {
 #pragma omp parallel for schedule(static)
     for (int s = 0; s < S; ++s) {
-      quantize_row_q8_K_ref(x + (int64_t)s * I, g_xq_k.data() + (int64_t)s * num_superblocks, I);
+      quantize_row_q8_K_ref(x + (int64_t)s * I,
+                            g_xq_k.data() + (int64_t)s * num_superblocks, I);
     }
   } else if (S == 1) {
     quantize_row_q8_K_ref(x, g_xq_k.data(), I);
@@ -2289,7 +2350,8 @@ void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
     for (int o = 0; o < O; ++o) {
       const uint8_t *row_w = W_quantized + (size_t)o * row_bytes;
       if (o + 1 < O) {
-        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes), _MM_HINT_T0);
+        _mm_prefetch((const char *)(W_quantized + (size_t)(o + 1) * row_bytes),
+                     _MM_HINT_T0);
       }
       ys[o] = dot_iq3_xxs_avx2_prototype(row_w, xq, I);
     }
@@ -2298,36 +2360,37 @@ void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
 
 namespace {
 
-using q8k_dot_fn = float (*)(const uint8_t *, const block_q8_K_local *, int64_t);
+using q8k_dot_fn = float (*)(const uint8_t *, const block_q8_K_local *,
+                             int64_t);
 
 #if defined(MOESTREAM_USE_GGML)
 // The linked GGML CPU backend exports the same production dot functions that
 // its MUL_MAT_ID implementation calls.  Keep the small adapter here so the
 // grouped Qwen path can share the existing matrix loop without changing the
 // older, experimental AVX2 prototype entry points used by other callers.
-static float dot_iq2_xxs_ggml_q8k_exact(
-    const uint8_t *w, const block_q8_K_local *xq, int64_t n) {
+static float dot_iq2_xxs_ggml_q8k_exact(const uint8_t *w,
+                                        const block_q8_K_local *xq, int64_t n) {
   float out = 0.0f;
   ggml_vec_dot_iq2_xxs_q8_K((int)n, &out, 0, w, 0, xq, 0, 1);
   return out;
 }
 
-static float dot_iq3_xxs_ggml_q8k_exact(
-    const uint8_t *w, const block_q8_K_local *xq, int64_t n) {
+static float dot_iq3_xxs_ggml_q8k_exact(const uint8_t *w,
+                                        const block_q8_K_local *xq, int64_t n) {
   float out = 0.0f;
   ggml_vec_dot_iq3_xxs_q8_K((int)n, &out, 0, w, 0, xq, 0, 1);
   return out;
 }
 #endif
 
-bool matmul_iqxxs_ggml_avx2_grouped_impl(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O, size_t block_bytes,
-    q8k_dot_fn dot) {
+bool matmul_iqxxs_ggml_avx2_grouped_impl(float *const *y, const float *x,
+                                         const uint8_t *const *W_quantized,
+                                         int n_matrices, int S, int I, int O,
+                                         size_t block_bytes, q8k_dot_fn dot) {
 #if defined(MOESTREAM_USE_GGML)
   constexpr int QK_K = 256;
-  if (!y || !x || !W_quantized || !dot || n_matrices <= 0 || S <= 0 ||
-      I <= 0 || O <= 0 || I % QK_K != 0)
+  if (!y || !x || !W_quantized || !dot || n_matrices <= 0 || S <= 0 || I <= 0 ||
+      O <= 0 || I % QK_K != 0)
     return false;
   ensure_ggml_cpu_initialized();
   const int nblocks = I / QK_K;
@@ -2350,8 +2413,8 @@ bool matmul_iqxxs_ggml_avx2_grouped_impl(
         dot(row, xq.data() + static_cast<size_t>(s) * nblocks, I);
   }
   const auto t1 = std::chrono::high_resolution_clock::now();
-  PerfCounters::atomic_add(
-      perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+  PerfCounters::atomic_add(perf().t_cpu_dot,
+                           std::chrono::duration<double>(t1 - t0).count());
   return true;
 #else
   (void)y;
@@ -2367,9 +2430,10 @@ bool matmul_iqxxs_ggml_avx2_grouped_impl(
 #endif
 }
 
-bool matmul_iq4_nl_ggml_q8_0_grouped_impl(
-    float *const *y, const float *const *x,
-    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
+bool matmul_iq4_nl_ggml_q8_0_grouped_impl(float *const *y,
+                                          const float *const *x,
+                                          const uint8_t *const *W_quantized,
+                                          int n_matrices, int S, int I, int O) {
 #if defined(MOESTREAM_USE_GGML)
   constexpr int QK4_NL = 32;
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
@@ -2378,15 +2442,15 @@ bool matmul_iq4_nl_ggml_q8_0_grouped_impl(
   ensure_ggml_cpu_initialized();
   const int nblocks = I / QK4_NL;
   const size_t row_bytes = static_cast<size_t>(nblocks) * 18;
-  std::vector<block_q8_0> xq(
-      static_cast<size_t>(n_matrices) * S * nblocks);
+  std::vector<block_q8_0> xq(static_cast<size_t>(n_matrices) * S * nblocks);
   const auto t0 = std::chrono::high_resolution_clock::now();
   for (int m = 0; m < n_matrices; ++m) {
-    if (!x[m]) return false;
+    if (!x[m])
+      return false;
     for (int s = 0; s < S; ++s)
-      quantize_row_q8_0(
-          x[m] + static_cast<int64_t>(s) * I,
-          xq.data() + (static_cast<size_t>(m) * S + s) * nblocks, I);
+      quantize_row_q8_0(x[m] + static_cast<int64_t>(s) * I,
+                        xq.data() + (static_cast<size_t>(m) * S + s) * nblocks,
+                        I);
   }
 
   const int64_t total = static_cast<int64_t>(n_matrices) * S * O;
@@ -2403,8 +2467,8 @@ bool matmul_iq4_nl_ggml_q8_0_grouped_impl(
         sizeof(block_q8_0), 1);
   }
   const auto t1 = std::chrono::high_resolution_clock::now();
-  PerfCounters::atomic_add(
-      perf().t_cpu_dot, std::chrono::duration<double>(t1 - t0).count());
+  PerfCounters::atomic_add(perf().t_cpu_dot,
+                           std::chrono::duration<double>(t1 - t0).count());
   return true;
 #else
   (void)y;
@@ -2420,55 +2484,63 @@ bool matmul_iq4_nl_ggml_q8_0_grouped_impl(
 
 } // namespace
 
-bool matmul_iq2_xxs_ggml_avx2_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O) {
+bool matmul_iq2_xxs_ggml_avx2_grouped(float *const *y, const float *x,
+                                      const uint8_t *const *W_quantized,
+                                      int n_matrices, int S, int I, int O) {
   return matmul_iqxxs_ggml_avx2_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O, 66,
-      dot_iq2_xxs_avx2_prototype);
+      y, x, W_quantized, n_matrices, S, I, O, 66, dot_iq2_xxs_avx2_prototype);
 }
 
-bool matmul_iq3_xxs_ggml_avx2_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O) {
+bool matmul_iq3_xxs_ggml_avx2_grouped(float *const *y, const float *x,
+                                      const uint8_t *const *W_quantized,
+                                      int n_matrices, int S, int I, int O) {
   return matmul_iqxxs_ggml_avx2_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O, 98,
-      dot_iq3_xxs_avx2_prototype);
+      y, x, W_quantized, n_matrices, S, I, O, 98, dot_iq3_xxs_avx2_prototype);
 }
 
-bool matmul_iq2_xxs_ggml_q8k_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O) {
+bool matmul_iq2_xxs_ggml_q8k_grouped(float *const *y, const float *x,
+                                     const uint8_t *const *W_quantized,
+                                     int n_matrices, int S, int I, int O) {
 #if defined(MOESTREAM_USE_GGML)
   return matmul_iqxxs_ggml_avx2_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O, 66,
-      dot_iq2_xxs_ggml_q8k_exact);
+      y, x, W_quantized, n_matrices, S, I, O, 66, dot_iq2_xxs_ggml_q8k_exact);
 #else
-  (void)y; (void)x; (void)W_quantized; (void)n_matrices; (void)S; (void)I;
+  (void)y;
+  (void)x;
+  (void)W_quantized;
+  (void)n_matrices;
+  (void)S;
+  (void)I;
   (void)O;
   return false;
 #endif
 }
 
-bool matmul_iq3_xxs_ggml_q8k_grouped(
-    float *const *y, const float *x, const uint8_t *const *W_quantized,
-    int n_matrices, int S, int I, int O) {
+bool matmul_iq3_xxs_ggml_q8k_grouped(float *const *y, const float *x,
+                                     const uint8_t *const *W_quantized,
+                                     int n_matrices, int S, int I, int O) {
 #if defined(MOESTREAM_USE_GGML)
   return matmul_iqxxs_ggml_avx2_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O, 98,
-      dot_iq3_xxs_ggml_q8k_exact);
+      y, x, W_quantized, n_matrices, S, I, O, 98, dot_iq3_xxs_ggml_q8k_exact);
 #else
-  (void)y; (void)x; (void)W_quantized; (void)n_matrices; (void)S; (void)I;
+  (void)y;
+  (void)x;
+  (void)W_quantized;
+  (void)n_matrices;
+  (void)S;
+  (void)I;
   (void)O;
   return false;
 #endif
 }
 
-bool matmul_iq4_nl_ggml_q8_0_grouped_inputs(
-    float *const *y, const float *const *x,
-    const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O) {
-  return matmul_iq4_nl_ggml_q8_0_grouped_impl(
-      y, x, W_quantized, n_matrices, S, I, O);
+bool matmul_iq4_nl_ggml_q8_0_grouped_inputs(float *const *y,
+                                            const float *const *x,
+                                            const uint8_t *const *W_quantized,
+                                            int n_matrices, int S, int I,
+                                            int O) {
+  return matmul_iq4_nl_ggml_q8_0_grouped_impl(y, x, W_quantized, n_matrices, S,
+                                              I, O);
 }
 
 // ============================================================

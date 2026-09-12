@@ -3,7 +3,7 @@
 // and its deliberately narrow scope.
 #include "ggml_gdn_proj_backend.hpp"
 
-#include "ggml_moe_backend.hpp"  // ggml_shared_backend()
+#include "ggml_moe_backend.hpp" // ggml_shared_backend()
 #include "logger.hpp"
 
 #include <algorithm>
@@ -14,14 +14,15 @@
 
 #include <cuda_runtime.h>
 
-#include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cuda.h"
+#include "ggml.h"
 
 namespace {
 bool type_ok(uint32_t t) {
-  if (t >= (uint32_t)GGML_TYPE_COUNT) return false;
+  if (t >= (uint32_t)GGML_TYPE_COUNT)
+    return false;
   const ggml_type g = (ggml_type)t;
   return g == GGML_TYPE_F32 || g == GGML_TYPE_F16 || g == GGML_TYPE_BF16 ||
          ggml_is_quantized(g);
@@ -46,7 +47,7 @@ bool debug_device_sync_full_gdn() {
   }();
   return enabled;
 }
-}  // namespace
+} // namespace
 
 bool GgmlGdnProjRunner::compiled_in() { return true; }
 
@@ -58,7 +59,8 @@ GgmlGdnProjRunner &GgmlGdnProjRunner::instance() {
 GgmlGdnProjRunner::~GgmlGdnProjRunner() { shutdown(); }
 
 void GgmlGdnProjRunner::release_completed_weights(int before_layer) {
-  if (!backend_ || before_layer <= 0) return;
+  if (!backend_ || before_layer <= 0)
+    return;
 
   // Every completed-layer GDN graph has already been submitted to this
   // backend.  One barrier makes its projection/conv/full weight buffers safe
@@ -74,23 +76,25 @@ void GgmlGdnProjRunner::release_completed_weights(int before_layer) {
         !b.full_ctx)
       continue;
     if (b.buf) {
-      reclaimed += ggml_backend_buffer_get_size(
-          (ggml_backend_buffer_t)b.buf);
+      reclaimed += ggml_backend_buffer_get_size((ggml_backend_buffer_t)b.buf);
       ggml_backend_buffer_free((ggml_backend_buffer_t)b.buf);
     }
-    if (b.ctx) ggml_free((ggml_context *)b.ctx);
+    if (b.ctx)
+      ggml_free((ggml_context *)b.ctx);
     if (b.conv_buf) {
-      reclaimed += ggml_backend_buffer_get_size(
-          (ggml_backend_buffer_t)b.conv_buf);
+      reclaimed +=
+          ggml_backend_buffer_get_size((ggml_backend_buffer_t)b.conv_buf);
       ggml_backend_buffer_free((ggml_backend_buffer_t)b.conv_buf);
     }
-    if (b.conv_ctx) ggml_free((ggml_context *)b.conv_ctx);
+    if (b.conv_ctx)
+      ggml_free((ggml_context *)b.conv_ctx);
     if (b.full_buf) {
-      reclaimed += ggml_backend_buffer_get_size(
-          (ggml_backend_buffer_t)b.full_buf);
+      reclaimed +=
+          ggml_backend_buffer_get_size((ggml_backend_buffer_t)b.full_buf);
       ggml_backend_buffer_free((ggml_backend_buffer_t)b.full_buf);
     }
-    if (b.full_ctx) ggml_free((ggml_context *)b.full_ctx);
+    if (b.full_ctx)
+      ggml_free((ggml_context *)b.full_ctx);
     b = Bracket{};
     ++layers;
   }
@@ -102,16 +106,24 @@ void GgmlGdnProjRunner::release_completed_weights(int before_layer) {
 }
 
 void GgmlGdnProjRunner::shutdown() {
-  if (device_ >= 0) cudaSetDevice(device_);
-  if (backend_) ggml_backend_synchronize((ggml_backend_t)backend_);
+  if (device_ >= 0)
+    cudaSetDevice(device_);
+  if (backend_)
+    ggml_backend_synchronize((ggml_backend_t)backend_);
   for (int l = 0; l < kMaxLayers; ++l) {
     Bracket &b = brackets_[l];
-    if (b.buf) ggml_backend_buffer_free((ggml_backend_buffer_t)b.buf);
-    if (b.ctx) ggml_free((ggml_context *)b.ctx);
-    if (b.conv_buf) ggml_backend_buffer_free((ggml_backend_buffer_t)b.conv_buf);
-    if (b.conv_ctx) ggml_free((ggml_context *)b.conv_ctx);
-    if (b.full_buf) ggml_backend_buffer_free((ggml_backend_buffer_t)b.full_buf);
-    if (b.full_ctx) ggml_free((ggml_context *)b.full_ctx);
+    if (b.buf)
+      ggml_backend_buffer_free((ggml_backend_buffer_t)b.buf);
+    if (b.ctx)
+      ggml_free((ggml_context *)b.ctx);
+    if (b.conv_buf)
+      ggml_backend_buffer_free((ggml_backend_buffer_t)b.conv_buf);
+    if (b.conv_ctx)
+      ggml_free((ggml_context *)b.conv_ctx);
+    if (b.full_buf)
+      ggml_backend_buffer_free((ggml_backend_buffer_t)b.full_buf);
+    if (b.full_ctx)
+      ggml_free((ggml_context *)b.full_ctx);
     b = Bracket{};
   }
   for (FullState &s : full_states_) {
@@ -123,8 +135,10 @@ void GgmlGdnProjRunner::shutdown() {
       ggml_free((ggml_context *)s.output_ctx);
       s.output_ctx = nullptr;
     }
-    if (s.buf) ggml_backend_buffer_free((ggml_backend_buffer_t)s.buf);
-    if (s.ctx) ggml_free((ggml_context *)s.ctx);
+    if (s.buf)
+      ggml_backend_buffer_free((ggml_backend_buffer_t)s.buf);
+    if (s.ctx)
+      ggml_free((ggml_context *)s.ctx);
     s = FullState{};
   }
   for (FullDeviceSlot &slot : full_device_slots_) {
@@ -157,21 +171,23 @@ void GgmlGdnProjRunner::shutdown() {
     ggml_backend_buffer_free((ggml_backend_buffer_t)external_buf_);
     external_buf_ = nullptr;
   }
-  backend_ = nullptr;  // shared, not owned
+  backend_ = nullptr; // shared, not owned
   device_ = -1;
 }
 
 bool GgmlGdnProjRunner::ensure(int device, int D, int conv_dim, int value_dim,
-                              int H_v) {
+                               int H_v) {
   if (device < 0 || D <= 0 || conv_dim <= 0 || value_dim <= 0 || H_v <= 0)
     return false;
   if (backend_ && device_ == device && D_ == D && conv_dim_ == conv_dim &&
       value_dim_ == value_dim && H_v_ == H_v)
     return true;
-  if (backend_) shutdown();
+  if (backend_)
+    shutdown();
   cudaSetDevice(device);
   backend_ = ggml_shared_backend(device);
-  if (!backend_) return false;
+  if (!backend_)
+    return false;
   galloc_ = ggml_gallocr_new(
       ggml_backend_get_default_buffer_type((ggml_backend_t)backend_));
   if (!galloc_) {
@@ -185,8 +201,8 @@ bool GgmlGdnProjRunner::ensure(int device, int D, int conv_dim, int value_dim,
     backend_ = nullptr;
     return false;
   }
-  ggml_backend_buffer_set_usage(
-      (ggml_backend_buffer_t)external_buf_, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+  ggml_backend_buffer_set_usage((ggml_backend_buffer_t)external_buf_,
+                                GGML_BACKEND_BUFFER_USAGE_COMPUTE);
   device_ = device;
   D_ = D;
   conv_dim_ = conv_dim;
@@ -211,12 +227,14 @@ bool GgmlGdnProjRunner::ensure(int device, int D, int conv_dim, int value_dim,
 }
 
 bool GgmlGdnProjRunner::weights_ready(int layer) const {
-  if (layer < 0 || layer >= kMaxLayers) return false;
+  if (layer < 0 || layer >= kMaxLayers)
+    return false;
   return brackets_[layer].ready;
 }
 
 bool GgmlGdnProjRunner::full_weights_ready(int layer) const {
-  if (layer < 0 || layer >= kMaxLayers) return false;
+  if (layer < 0 || layer >= kMaxLayers)
+    return false;
   return brackets_[layer].full_ready;
 }
 
@@ -225,9 +243,11 @@ bool GgmlGdnProjRunner::ensure_full_output(int layer, int S) {
   // S<=1 guard silently disabled the device-resident full-GDN graph for every
   // single-token step, even though the graph itself and its state tensors
   // support S=1.
-  if (!backend_ || layer < 0 || layer >= kMaxLayers || S <= 0) return false;
+  if (!backend_ || layer < 0 || layer >= kMaxLayers || S <= 0)
+    return false;
   FullState &state = full_states_[layer];
-  if (state.output && S <= state.output_cap) return true;
+  if (state.output && S <= state.output_cap)
+    return true;
 
   cudaSetDevice(device_);
   // A request can change S between calls.  The previous request's
@@ -249,7 +269,8 @@ bool GgmlGdnProjRunner::ensure_full_output(int layer, int S) {
   ip.mem_size = ggml_tensor_overhead() * 2;
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
-  if (!ctx) return false;
+  if (!ctx)
+    return false;
   ggml_tensor *out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_, cap);
   if (!out) {
     ggml_free(ctx);
@@ -258,8 +279,7 @@ bool GgmlGdnProjRunner::ensure_full_output(int layer, int S) {
   ggml_backend_buffer_t buf =
       ggml_backend_alloc_ctx_tensors(ctx, (ggml_backend_t)backend_);
   if (!buf) {
-    LOG_WARN("[GGML-GDN-FULL] persistent output allocation failed (S=%d)\n",
-             S);
+    LOG_WARN("[GGML-GDN-FULL] persistent output allocation failed (S=%d)\n", S);
     ggml_free(ctx);
     return false;
   }
@@ -270,15 +290,13 @@ bool GgmlGdnProjRunner::ensure_full_output(int layer, int S) {
   state.output_cap = cap;
   LOG_INFO("[GGML-GDN-FULL-MEM] persistent output: layer=%d %.2f MiB "
            "(S_cap=%d)\n",
-           layer,
-           (double)ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0),
+           layer, (double)ggml_backend_buffer_get_size(buf) / (1024.0 * 1024.0),
            cap);
   return true;
 }
 
 bool GgmlGdnProjRunner::ensure_full_state(int layer, int d_conv, int hd) {
-  if (!backend_ || layer < 0 || layer >= kMaxLayers || d_conv <= 1 ||
-      hd <= 0)
+  if (!backend_ || layer < 0 || layer >= kMaxLayers || d_conv <= 1 || hd <= 0)
     return false;
   const int hist = d_conv - 1;
   FullState &s = full_states_[layer];
@@ -295,9 +313,12 @@ bool GgmlGdnProjRunner::ensure_full_state(int layer, int d_conv, int hd) {
     ggml_backend_synchronize((ggml_backend_t)backend_);
     if (s.output_buf)
       ggml_backend_buffer_free((ggml_backend_buffer_t)s.output_buf);
-    if (s.output_ctx) ggml_free((ggml_context *)s.output_ctx);
-    if (s.buf) ggml_backend_buffer_free((ggml_backend_buffer_t)s.buf);
-    if (s.ctx) ggml_free((ggml_context *)s.ctx);
+    if (s.output_ctx)
+      ggml_free((ggml_context *)s.output_ctx);
+    if (s.buf)
+      ggml_backend_buffer_free((ggml_backend_buffer_t)s.buf);
+    if (s.ctx)
+      ggml_free((ggml_context *)s.ctx);
     s = FullState{};
   }
 
@@ -305,11 +326,11 @@ bool GgmlGdnProjRunner::ensure_full_state(int layer, int d_conv, int hd) {
   ip.mem_size = ggml_tensor_overhead() * 4;
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
-  if (!ctx) return false;
+  if (!ctx)
+    return false;
   ggml_tensor *history =
       ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, conv_dim_, 1);
-  ggml_tensor *state =
-      ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, hd, H_v_, 1);
+  ggml_tensor *state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, hd, H_v_, 1);
   if (!history || !state) {
     ggml_free(ctx);
     return false;
@@ -332,7 +353,8 @@ bool GgmlGdnProjRunner::ensure_full_state(int layer, int d_conv, int hd) {
   // the only zeroing needed for a first S=1 sequence; subsequent requests use
   // reset_full_device_states() before their first decode graph.
   cudaSetDevice(device_);
-  if (cudaMemset(((ggml_tensor *)history)->data, 0, history_bytes) != cudaSuccess ||
+  if (cudaMemset(((ggml_tensor *)history)->data, 0, history_bytes) !=
+          cudaSuccess ||
       cudaMemset(((ggml_tensor *)state)->data, 0, state_bytes) != cudaSuccess) {
     ggml_backend_buffer_free(buf);
     ggml_free(ctx);
@@ -345,7 +367,8 @@ bool GgmlGdnProjRunner::ensure_full_state(int layer, int d_conv, int hd) {
 }
 
 void GgmlGdnProjRunner::finish_full_device_updates(bool copy_to_host) {
-  if (!backend_) return;
+  if (!backend_)
+    return;
   if (!copy_to_host) {
     // HC collapse/download already provides the forward-level device barrier.
     // Do not enqueue state D2H copies for S=1 decode; the next graph on the
@@ -360,48 +383,56 @@ void GgmlGdnProjRunner::finish_full_device_updates(bool copy_to_host) {
   }
   bool queued = false;
   for (FullState &s : full_states_) {
-    if (!s.pending || !s.host_history || !s.host_state) continue;
-    ggml_backend_tensor_get_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)s.history, s.host_history,
-        0, s.history_bytes);
-    ggml_backend_tensor_get_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)s.state, s.host_state, 0,
-        s.state_bytes);
+    if (!s.pending || !s.host_history || !s.host_state)
+      continue;
+    ggml_backend_tensor_get_async((ggml_backend_t)backend_,
+                                  (ggml_tensor *)s.history, s.host_history, 0,
+                                  s.history_bytes);
+    ggml_backend_tensor_get_async((ggml_backend_t)backend_,
+                                  (ggml_tensor *)s.state, s.host_state, 0,
+                                  s.state_bytes);
     queued = true;
     s.pending = false;
     s.device_state_resident = false;
   }
-  if (queued) ggml_backend_synchronize((ggml_backend_t)backend_);
+  if (queued)
+    ggml_backend_synchronize((ggml_backend_t)backend_);
 }
 
 void GgmlGdnProjRunner::sync_full_device_states_to_host() {
-  if (!backend_) return;
+  if (!backend_)
+    return;
   bool queued = false;
   for (FullState &s : full_states_) {
     if ((!s.pending && !s.device_state_resident) || !s.host_history ||
         !s.host_state || !s.history || !s.state)
       continue;
-    ggml_backend_tensor_get_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)s.history, s.host_history,
-        0, s.history_bytes);
-    ggml_backend_tensor_get_async(
-        (ggml_backend_t)backend_, (ggml_tensor *)s.state, s.host_state,
-        0, s.state_bytes);
+    ggml_backend_tensor_get_async((ggml_backend_t)backend_,
+                                  (ggml_tensor *)s.history, s.host_history, 0,
+                                  s.history_bytes);
+    ggml_backend_tensor_get_async((ggml_backend_t)backend_,
+                                  (ggml_tensor *)s.state, s.host_state, 0,
+                                  s.state_bytes);
     s.pending = false;
     s.device_state_resident = false;
     queued = true;
   }
-  if (queued) ggml_backend_synchronize((ggml_backend_t)backend_);
+  if (queued)
+    ggml_backend_synchronize((ggml_backend_t)backend_);
 }
 
 void GgmlGdnProjRunner::reset_full_device_states() {
-  if (!backend_) return;
+  if (!backend_)
+    return;
   ggml_backend_synchronize((ggml_backend_t)backend_);
   cudaSetDevice(device_);
   for (FullState &s : full_states_) {
-    if (!s.history || !s.state) continue;
-    if (cudaMemset(((ggml_tensor *)s.history)->data, 0, s.history_bytes) != cudaSuccess ||
-        cudaMemset(((ggml_tensor *)s.state)->data, 0, s.state_bytes) != cudaSuccess) {
+    if (!s.history || !s.state)
+      continue;
+    if (cudaMemset(((ggml_tensor *)s.history)->data, 0, s.history_bytes) !=
+            cudaSuccess ||
+        cudaMemset(((ggml_tensor *)s.state)->data, 0, s.state_bytes) !=
+            cudaSuccess) {
       LOG_ERROR("[GGML-GDN-FULL] failed to reset persistent device state\n");
       break;
     }
@@ -410,16 +441,18 @@ void GgmlGdnProjRunner::reset_full_device_states() {
   }
 }
 
-bool GgmlGdnProjRunner::ensure_full_weights(
-    int layer, const GgmlGdnProjWeightRef &norm,
-    const GgmlGdnProjWeightRef &out) {
-  if (!backend_ || layer < 0 || layer >= kMaxLayers) return false;
+bool GgmlGdnProjRunner::ensure_full_weights(int layer,
+                                            const GgmlGdnProjWeightRef &norm,
+                                            const GgmlGdnProjWeightRef &out) {
+  if (!backend_ || layer < 0 || layer >= kMaxLayers)
+    return false;
   Bracket &b = brackets_[layer];
-  if (b.full_ready) return true;
+  if (b.full_ready)
+    return true;
   if (!b.ready || !norm.host_data || !out.host_data || !type_ok(norm.type) ||
       !type_ok(out.type) || value_dim_ % H_v_ != 0 ||
-      norm.ne0 != value_dim_ / H_v_ || norm.ne1 != 1 ||
-      out.ne0 != value_dim_ || out.ne1 != D_) {
+      norm.ne0 != value_dim_ / H_v_ || norm.ne1 != 1 || out.ne0 != value_dim_ ||
+      out.ne1 != D_) {
     LOG_WARN("[GGML-GDN-FULL] layer=%d weight precondition/shape check failed "
              "(norm=%lldx%lld out=%lldx%lld expected norm=%dx1 out=%dx%d)\n",
              layer, (long long)norm.ne0, (long long)norm.ne1,
@@ -439,7 +472,8 @@ bool GgmlGdnProjRunner::ensure_full_weights(
     ip.mem_size = ggml_tensor_overhead() * 4;
     ip.no_alloc = true;
     ctx = ggml_init(ip);
-    if (!ctx) return false;
+    if (!ctx)
+      return false;
     tnorm = ggml_new_tensor_2d(ctx, (ggml_type)norm.type, norm.ne0, norm.ne1);
     tout = ggml_new_tensor_2d(ctx, (ggml_type)out.type, out.ne0, out.ne1);
     if (!tnorm || !tout) {
@@ -466,12 +500,14 @@ bool GgmlGdnProjRunner::ensure_full_weights(
       break;
     }
     buf = ggml_backend_alloc_ctx_tensors(ctx, (ggml_backend_t)backend_);
-    if (buf) break;
+    if (buf)
+      break;
     ggml_free(ctx);
     ctx = nullptr;
     if (attempt == 0) {
       LOG_WARN("[GGML-GDN-FULL-MEM] layer=%d allocation pressure; "
-               "reclaiming completed GDN layers and retrying\n", layer);
+               "reclaiming completed GDN layers and retrying\n",
+               layer);
       release_completed_weights(layer);
     }
   }
@@ -498,15 +534,17 @@ bool GgmlGdnProjRunner::ensure_full_weights(
 }
 
 bool GgmlGdnProjRunner::ensure_weights(int layer,
-                                      const GgmlGdnProjWeightRef &qkv,
-                                      const GgmlGdnProjWeightRef &gate,
-                                      const GgmlGdnProjWeightRef &alpha,
-                                      const GgmlGdnProjWeightRef &beta,
-                                      const float *dt_bias_host,
-                                      const float *ssm_a_host) {
-  if (!backend_ || layer < 0 || layer >= kMaxLayers) return false;
+                                       const GgmlGdnProjWeightRef &qkv,
+                                       const GgmlGdnProjWeightRef &gate,
+                                       const GgmlGdnProjWeightRef &alpha,
+                                       const GgmlGdnProjWeightRef &beta,
+                                       const float *dt_bias_host,
+                                       const float *ssm_a_host) {
+  if (!backend_ || layer < 0 || layer >= kMaxLayers)
+    return false;
   Bracket &b = brackets_[layer];
-  if (b.ready) return true;
+  if (b.ready)
+    return true;
   if (!qkv.host_data || !gate.host_data || !alpha.host_data ||
       !beta.host_data || !dt_bias_host || !ssm_a_host)
     return false;
@@ -518,11 +556,12 @@ bool GgmlGdnProjRunner::ensure_weights(int layer,
   if (qkv.ne0 != D_ || qkv.ne1 != conv_dim_ || gate.ne0 != D_ ||
       gate.ne1 != value_dim_ || alpha.ne0 != D_ || alpha.ne1 != H_v_ ||
       beta.ne0 != D_ || beta.ne1 != H_v_) {
-    LOG_ERROR("[GGML-GDN-PROJ] layer=%d unexpected weight shapes (qkv %lldx%lld, "
-              "gate %lldx%lld, alpha %lldx%lld, beta %lldx%lld)\n",
-              layer, (long long)qkv.ne0, (long long)qkv.ne1,
-              (long long)gate.ne0, (long long)gate.ne1, (long long)alpha.ne0,
-              (long long)alpha.ne1, (long long)beta.ne0, (long long)beta.ne1);
+    LOG_ERROR(
+        "[GGML-GDN-PROJ] layer=%d unexpected weight shapes (qkv %lldx%lld, "
+        "gate %lldx%lld, alpha %lldx%lld, beta %lldx%lld)\n",
+        layer, (long long)qkv.ne0, (long long)qkv.ne1, (long long)gate.ne0,
+        (long long)gate.ne1, (long long)alpha.ne0, (long long)alpha.ne1,
+        (long long)beta.ne0, (long long)beta.ne1);
     return false;
   }
   cudaSetDevice(device_);
@@ -540,7 +579,8 @@ bool GgmlGdnProjRunner::ensure_weights(int layer,
     ip.mem_size = ggml_tensor_overhead() * 8;
     ip.no_alloc = true;
     ctx = ggml_init(ip);
-    if (!ctx) return false;
+    if (!ctx)
+      return false;
     tqkv = ggml_new_tensor_2d(ctx, (ggml_type)qkv.type, D_, conv_dim_);
     tgate = ggml_new_tensor_2d(ctx, (ggml_type)gate.type, D_, value_dim_);
     talpha = ggml_new_tensor_2d(ctx, (ggml_type)alpha.type, D_, H_v_);
@@ -564,17 +604,23 @@ bool GgmlGdnProjRunner::ensure_weights(int layer,
       t->buffer = (ggml_backend_buffer_t)external_buf_;
       ggml_backend_buffer_init_tensor(t->buffer, t);
     };
-    if (ext_qkv) bind_external(tqkv, qkv.device_data);
-    if (ext_gate) bind_external(tgate, gate.device_data);
-    if (ext_alpha) bind_external(talpha, alpha.device_data);
-    if (ext_beta) bind_external(tbeta, beta.device_data);
+    if (ext_qkv)
+      bind_external(tqkv, qkv.device_data);
+    if (ext_gate)
+      bind_external(tgate, gate.device_data);
+    if (ext_alpha)
+      bind_external(talpha, alpha.device_data);
+    if (ext_beta)
+      bind_external(tbeta, beta.device_data);
     buf = ggml_backend_alloc_ctx_tensors(ctx, (ggml_backend_t)backend_);
-    if (buf) break;
+    if (buf)
+      break;
     ggml_free(ctx);
     ctx = nullptr;
     if (attempt == 0) {
       LOG_WARN("[GGML-GDN-PROJ-MEM] layer=%d allocation pressure; "
-               "reclaiming completed GDN layers and retrying\n", layer);
+               "reclaiming completed GDN layers and retrying\n",
+               layer);
       release_completed_weights(layer);
     }
   }
@@ -617,20 +663,22 @@ bool GgmlGdnProjRunner::ensure_weights(int layer,
 }
 
 bool GgmlGdnProjRunner::run(int layer, const float *hidden_states, int S,
-                           float *qkv_out, float *gate_out, float *g_log_out,
-                           float *beta_out) {
+                            float *qkv_out, float *gate_out, float *g_log_out,
+                            float *beta_out) {
   if (!backend_ || layer < 0 || layer >= kMaxLayers || !hidden_states ||
       !qkv_out || !gate_out || !g_log_out || !beta_out)
     return false;
   const Bracket &b = brackets_[layer];
-  if (!b.ready) return false;
+  if (!b.ready)
+    return false;
   cudaSetDevice(device_);
 
   ggml_init_params ip = {};
   ip.mem_size = ggml_tensor_overhead() * 32 + ggml_graph_overhead();
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
-  if (!ctx) return false;
+  if (!ctx)
+    return false;
   ggml_cgraph *gf = ggml_new_graph(ctx);
   if (!gf) {
     ggml_free(ctx);
@@ -691,9 +739,12 @@ bool GgmlGdnProjRunner::run(int layer, const float *hidden_states, int S,
   // layout the CPU callers already expect from dense_proj (row-major [S,O]
   // with row stride O) -- ggml's ne0-fastest layout IS that row layout when
   // read back as a flat buffer, so no transpose is needed either direction.
-  ggml_backend_tensor_get(qkv, qkv_out, 0, (size_t)conv_dim_ * S * sizeof(float));
-  ggml_backend_tensor_get(gate, gate_out, 0, (size_t)value_dim_ * S * sizeof(float));
-  ggml_backend_tensor_get(g_log, g_log_out, 0, (size_t)H_v_ * S * sizeof(float));
+  ggml_backend_tensor_get(qkv, qkv_out, 0,
+                          (size_t)conv_dim_ * S * sizeof(float));
+  ggml_backend_tensor_get(gate, gate_out, 0,
+                          (size_t)value_dim_ * S * sizeof(float));
+  ggml_backend_tensor_get(g_log, g_log_out, 0,
+                          (size_t)H_v_ * S * sizeof(float));
   ggml_backend_tensor_get(beta, beta_out, 0, (size_t)H_v_ * S * sizeof(float));
 
   ggml_free(ctx);
@@ -701,16 +752,20 @@ bool GgmlGdnProjRunner::run(int layer, const float *hidden_states, int S,
 }
 
 bool GgmlGdnProjRunner::conv_weight_ready(int layer) const {
-  if (layer < 0 || layer >= kMaxLayers) return false;
+  if (layer < 0 || layer >= kMaxLayers)
+    return false;
   return brackets_[layer].conv_ready;
 }
 
 bool GgmlGdnProjRunner::ensure_conv_weight(int layer,
-                                          const GgmlGdnProjWeightRef &conv_w) {
-  if (!backend_ || layer < 0 || layer >= kMaxLayers) return false;
+                                           const GgmlGdnProjWeightRef &conv_w) {
+  if (!backend_ || layer < 0 || layer >= kMaxLayers)
+    return false;
   Bracket &b = brackets_[layer];
-  if (b.conv_ready) return true;
-  if (!conv_w.host_data || conv_w.type != (uint32_t)GGML_TYPE_F32) return false;
+  if (b.conv_ready)
+    return true;
+  if (!conv_w.host_data || conv_w.type != (uint32_t)GGML_TYPE_F32)
+    return false;
   // REAL, hard constraint found via Test 29, not documented in ggml_ssm_conv's
   // own header: ggml-cuda's ssm_conv kernel (ggml-cuda/ssm-conv.cu) hardcodes
   // a 128-thread block and asserts `nr % 128 == 0` where nr is the CHANNEL
@@ -725,16 +780,18 @@ bool GgmlGdnProjRunner::ensure_conv_weight(int layer,
              "ggml-cuda's ssm_conv kernel requires this and would abort "
              "(GGML_ASSERT), not fail gracefully. Declining conv fusion for "
              "this model; the 4-projection fusion and/or the separate GPU "
-             "conv1d path are unaffected.\n", conv_dim_);
+             "conv1d path are unaffected.\n",
+             conv_dim_);
     return false;
   }
   // ne0=d_conv (kernel taps), ne1=conv_dim_ (channels) -- ggml_ssm_conv's own
   // `c` parameter convention. Any real d_conv works (checked against conv_dim_
   // only, since d_conv itself isn't fixed at ensure() time).
   if (conv_w.ne1 != conv_dim_ || conv_w.ne0 <= 0) {
-    LOG_ERROR("[GGML-GDN-PROJ] layer=%d unexpected conv weight shape (%lldx%lld, "
-              "expected ne1=%d)\n", layer, (long long)conv_w.ne0,
-              (long long)conv_w.ne1, conv_dim_);
+    LOG_ERROR(
+        "[GGML-GDN-PROJ] layer=%d unexpected conv weight shape (%lldx%lld, "
+        "expected ne1=%d)\n",
+        layer, (long long)conv_w.ne0, (long long)conv_w.ne1, conv_dim_);
     return false;
   }
   cudaSetDevice(device_);
@@ -746,19 +803,22 @@ bool GgmlGdnProjRunner::ensure_conv_weight(int layer,
     ip.mem_size = ggml_tensor_overhead() * 4;
     ip.no_alloc = true;
     ctx = ggml_init(ip);
-    if (!ctx) return false;
+    if (!ctx)
+      return false;
     tconv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_w.ne0, conv_dim_);
     if (!tconv) {
       ggml_free(ctx);
       return false;
     }
     buf = ggml_backend_alloc_ctx_tensors(ctx, (ggml_backend_t)backend_);
-    if (buf) break;
+    if (buf)
+      break;
     ggml_free(ctx);
     ctx = nullptr;
     if (attempt == 0) {
       LOG_WARN("[GGML-GDN-PROJ-MEM] layer=%d conv allocation pressure; "
-               "reclaiming completed GDN layers and retrying\n", layer);
+               "reclaiming completed GDN layers and retrying\n",
+               layer);
       release_completed_weights(layer);
     }
   }
@@ -778,7 +838,7 @@ bool GgmlGdnProjRunner::ensure_conv_weight(int layer,
 }
 
 // See the header's own comment for the full rationale. Layout derivation,
-// confirmed against beellama's own build_conv_state_at/build_layer_attn_linear
+// confirmed against Llama.cpp's own build_conv_state_at/build_layer_attn_linear
 // (src/models/qwen4exp.cpp) rather than reverse-engineered from ggml_ssm_conv's
 // assert()s alone:
 //   - qkv (this graph's own mul_mat result) is ne=[conv_dim_, S] -- channels
@@ -808,17 +868,20 @@ bool GgmlGdnProjRunner::run_with_conv(int layer, const float *hidden_states,
   if (!backend_ || layer < 0 || layer >= kMaxLayers || !hidden_states ||
       !conv_out || !gate_out || !g_log_out || !beta_out || !history)
     return false;
-  if (d_conv <= 1) return false;
+  if (d_conv <= 1)
+    return false;
   const int hist = d_conv - 1;
   const Bracket &b = brackets_[layer];
-  if (!b.ready || !b.conv_ready) return false;
+  if (!b.ready || !b.conv_ready)
+    return false;
   cudaSetDevice(device_);
 
   ggml_init_params ip = {};
   ip.mem_size = ggml_tensor_overhead() * 48 + ggml_graph_overhead();
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
-  if (!ctx) return false;
+  if (!ctx)
+    return false;
   ggml_cgraph *gf = ggml_new_graph(ctx);
   if (!gf) {
     ggml_free(ctx);
@@ -840,12 +903,15 @@ bool GgmlGdnProjRunner::run_with_conv(int layer, const float *hidden_states,
   ggml_tensor *g_log = ggml_mul(ctx, sp, (ggml_tensor *)b.ssm_a);
   ggml_tensor *beta = ggml_sigmoid(ctx, beta_raw);
 
-  ggml_tensor *hist_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, conv_dim_, 1);
+  ggml_tensor *hist_in =
+      ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, conv_dim_, 1);
   ggml_set_input(hist_in);
   ggml_set_name(hist_in, "gdn_conv_hist_in");
 
-  ggml_tensor *conv_input = ggml_concat(ctx, hist_in, ggml_transpose(ctx, qkv), 0);
-  ggml_tensor *conv_raw = ggml_ssm_conv(ctx, conv_input, (ggml_tensor *)b.conv_w);
+  ggml_tensor *conv_input =
+      ggml_concat(ctx, hist_in, ggml_transpose(ctx, qkv), 0);
+  ggml_tensor *conv_raw =
+      ggml_ssm_conv(ctx, conv_input, (ggml_tensor *)b.conv_w);
   ggml_tensor *conv_silu = ggml_silu(ctx, conv_raw);
 
   ggml_tensor *tail_view = ggml_view_3d(
@@ -878,7 +944,8 @@ bool GgmlGdnProjRunner::run_with_conv(int layer, const float *hidden_states,
              (double)graph_bytes / (1024.0 * 1024.0), S);
   }
   ggml_backend_tensor_set(x, hidden_states, 0, (size_t)D_ * S * sizeof(float));
-  ggml_backend_tensor_set(hist_in, history, 0, (size_t)conv_dim_ * hist * sizeof(float));
+  ggml_backend_tensor_set(hist_in, history, 0,
+                          (size_t)conv_dim_ * hist * sizeof(float));
 
   const ggml_status st =
       ggml_backend_graph_compute((ggml_backend_t)backend_, gf);
@@ -889,22 +956,26 @@ bool GgmlGdnProjRunner::run_with_conv(int layer, const float *hidden_states,
     return false;
   }
 
-  ggml_backend_tensor_get(conv_silu, conv_out, 0, (size_t)conv_dim_ * S * sizeof(float));
-  ggml_backend_tensor_get(gate, gate_out, 0, (size_t)value_dim_ * S * sizeof(float));
-  ggml_backend_tensor_get(g_log, g_log_out, 0, (size_t)H_v_ * S * sizeof(float));
+  ggml_backend_tensor_get(conv_silu, conv_out, 0,
+                          (size_t)conv_dim_ * S * sizeof(float));
+  ggml_backend_tensor_get(gate, gate_out, 0,
+                          (size_t)value_dim_ * S * sizeof(float));
+  ggml_backend_tensor_get(g_log, g_log_out, 0,
+                          (size_t)H_v_ * S * sizeof(float));
   ggml_backend_tensor_get(beta, beta_out, 0, (size_t)H_v_ * S * sizeof(float));
   // Small (conv_dim_*hist floats, e.g. ~123 KB at qwen4exp's real dims)
   // update, in place -- the only "download" this path pays beyond the
   // outputs it would have needed anyway.
-  ggml_backend_tensor_get(tail_cont, history, 0, (size_t)conv_dim_ * hist * sizeof(float));
+  ggml_backend_tensor_get(tail_cont, history, 0,
+                          (size_t)conv_dim_ * hist * sizeof(float));
 
   ggml_free(ctx);
   return true;
 }
 
 bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
-                                 float *out_context, float *history,
-                                 int d_conv, float *state, float eps) {
+                                 float *out_context, float *history, int d_conv,
+                                 float *state, float eps) {
   if (!backend_ || layer < 0 || layer >= kMaxLayers || !hidden_states ||
       !out_context || !history || !state || S <= 0 || d_conv <= 1)
     return false;
@@ -931,7 +1002,8 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   ip.mem_size = ggml_tensor_overhead() * 96 + ggml_graph_overhead();
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
-  if (!ctx) return false;
+  if (!ctx)
+    return false;
   ggml_cgraph *gf = ggml_new_graph(ctx);
   if (!gf) {
     ggml_free(ctx);
@@ -964,8 +1036,8 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   }
   ggml_tensor *alpha_biased =
       ggml_add(ctx, alpha_raw, (ggml_tensor *)b.dt_bias);
-  ggml_tensor *g = ggml_mul(
-      ctx, ggml_softplus(ctx, alpha_biased), (ggml_tensor *)b.ssm_a);
+  ggml_tensor *g =
+      ggml_mul(ctx, ggml_softplus(ctx, alpha_biased), (ggml_tensor *)b.ssm_a);
   ggml_tensor *beta = ggml_sigmoid(ctx, beta_raw);
 
   // concat() materializes the transposed qkv into the contiguous
@@ -977,24 +1049,21 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   ggml_tensor *conv_silu = ggml_silu(ctx, conv_raw);
 
   const size_t qkv_row = ggml_row_size(GGML_TYPE_F32, conv_dim_);
-  ggml_tensor *q = ggml_view_4d(
-      ctx, conv_silu, hd, key_dim / hd, S, 1,
-      ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S, 0);
+  ggml_tensor *q =
+      ggml_view_4d(ctx, conv_silu, hd, key_dim / hd, S, 1,
+                   ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S, 0);
   ggml_tensor *k = ggml_view_4d(
-      ctx, conv_silu, hd, key_dim / hd, S, 1,
-      ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S,
-      ggml_row_size(GGML_TYPE_F32, key_dim));
+      ctx, conv_silu, hd, key_dim / hd, S, 1, ggml_row_size(GGML_TYPE_F32, hd),
+      qkv_row, qkv_row * S, ggml_row_size(GGML_TYPE_F32, key_dim));
   ggml_tensor *v = ggml_view_4d(
-      ctx, conv_silu, hd, H_v_, S, 1,
-      ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S,
-      ggml_row_size(GGML_TYPE_F32, 2 * key_dim));
+      ctx, conv_silu, hd, H_v_, S, 1, ggml_row_size(GGML_TYPE_F32, hd), qkv_row,
+      qkv_row * S, ggml_row_size(GGML_TYPE_F32, 2 * key_dim));
   q = ggml_l2_norm(ctx, q, eps);
   k = ggml_l2_norm(ctx, k, eps);
 
   g = ggml_reshape_4d(ctx, g, 1, H_v_, S, 1);
   beta = ggml_reshape_4d(ctx, beta, 1, H_v_, S, 1);
-  ggml_tensor *gdn =
-      ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, 1);
+  ggml_tensor *gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, 1);
   if (!gdn) {
     ggml_free(ctx);
     return false;
@@ -1004,14 +1073,13 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   const size_t value_row = ggml_row_size(GGML_TYPE_F32, value_dim_);
   const size_t state_row = ggml_row_size(GGML_TYPE_F32, hd * hd);
   const size_t score_bytes = (size_t)value_dim_ * S * sizeof(float);
-  ggml_tensor *core = ggml_view_4d(
-      ctx, gdn, hd, H_v_, S, 1, hd_row, value_row,
-      value_row * S, 0);
-  ggml_tensor *new_state = ggml_view_4d(
-      ctx, gdn, hd, hd, H_v_, 1, hd_row, state_row,
-      state_row * H_v_, score_bytes);
+  ggml_tensor *core = ggml_view_4d(ctx, gdn, hd, H_v_, S, 1, hd_row, value_row,
+                                   value_row * S, 0);
+  ggml_tensor *new_state =
+      ggml_view_4d(ctx, gdn, hd, hd, H_v_, 1, hd_row, state_row,
+                   state_row * H_v_, score_bytes);
 
-  // build_norm_gated() in BeeLLama is RMSNorm(ssm_norm) * sigmoid(z).
+  // build_norm_gated() in Llama.cpp is RMSNorm(ssm_norm) * sigmoid(z).
   ggml_tensor *normed = ggml_rms_norm(ctx, core, eps);
   normed = ggml_mul(ctx, normed, (ggml_tensor *)b.ssm_norm);
   ggml_tensor *z4 = ggml_reshape_4d(ctx, z, hd, H_v_, S, 1);
@@ -1021,9 +1089,8 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
       ggml_mul_mat(ctx, (ggml_tensor *)b.ssm_out, final_input);
 
   ggml_tensor *tail_view = ggml_view_3d(
-      ctx, conv_input, hist, conv_dim_, 1, conv_input->nb[1],
-      conv_input->nb[2], ggml_row_size(conv_input->type,
-                                       conv_input->ne[0] - hist));
+      ctx, conv_input, hist, conv_dim_, 1, conv_input->nb[1], conv_input->nb[2],
+      ggml_row_size(conv_input->type, conv_input->ne[0] - hist));
   ggml_tensor *tail_cont = ggml_cont(ctx, tail_view);
   if (!final_output || !tail_cont) {
     ggml_free(ctx);
@@ -1038,8 +1105,7 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   ggml_build_forward_expand(gf, tail_cont);
 
   if (!ggml_gallocr_alloc_graph((ggml_gallocr_t)galloc_, gf)) {
-    LOG_ERROR("[GGML-GDN-FULL] graph alloc failed (layer=%d S=%d)\n", layer,
-              S);
+    LOG_ERROR("[GGML-GDN-FULL] graph alloc failed (layer=%d S=%d)\n", layer, S);
     ggml_free(ctx);
     return false;
   }
@@ -1058,8 +1124,8 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   // uploads on its copy stream.  The caller does not mutate these buffers
   // until this function returns, so one backend barrier below is sufficient
   // to cover their lifetimes.
-  ggml_backend_tensor_set_async((ggml_backend_t)backend_, x, hidden_states,
-                                0, x_bytes);
+  ggml_backend_tensor_set_async((ggml_backend_t)backend_, x, hidden_states, 0,
+                                x_bytes);
   ggml_backend_tensor_set_async((ggml_backend_t)backend_, hist_in, history, 0,
                                 history_bytes);
   ggml_backend_tensor_set_async((ggml_backend_t)backend_, state_in, state, 0,
@@ -1079,8 +1145,8 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
                                 out_context, 0, x_bytes);
   ggml_backend_tensor_get_async((ggml_backend_t)backend_, new_state, state, 0,
                                 state_bytes);
-  ggml_backend_tensor_get_async((ggml_backend_t)backend_, tail_cont, history,
-                                0, history_bytes);
+  ggml_backend_tensor_get_async((ggml_backend_t)backend_, tail_cont, history, 0,
+                                history_bytes);
   ggml_backend_synchronize((ggml_backend_t)backend_);
   ggml_free(ctx);
   return true;
@@ -1090,7 +1156,8 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     int layer, const void *device_hidden, const void *device_hidden_tensor,
     int S, const void **device_output, float *history, int d_conv, float *state,
     float eps, bool device_state_resident) {
-  if (device_output) *device_output = nullptr;
+  if (device_output)
+    *device_output = nullptr;
   if (!backend_ || layer < 0 || layer >= kMaxLayers ||
       (!device_hidden && !device_hidden_tensor) || !device_output || !history ||
       !state || S <= 0 || d_conv <= 1)
@@ -1109,13 +1176,15 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   const int key_dim = (conv_dim_ - value_dim_) / 2;
   if (key_dim <= 0 || key_dim % hd != 0 || key_dim / hd != kQwen4ExpKeyHeads)
     return false;
-  if (!ensure_full_state(layer, d_conv, hd)) return false;
+  if (!ensure_full_state(layer, d_conv, hd))
+    return false;
   FullState &full_state = full_states_[layer];
   if (device_state_resident) {
     static bool logged_decode_state = false;
     if (!logged_decode_state) {
       logged_decode_state = true;
-      LOG_INFO("[GGML-GDN-FULL] decode recurrent state/history remain on CUDA\n");
+      LOG_INFO(
+          "[GGML-GDN-FULL] decode recurrent state/history remain on CUDA\n");
     }
   }
   if (full_state.pending) {
@@ -1137,7 +1206,8 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   ip.mem_size = ggml_tensor_overhead() * 96 + ggml_graph_overhead();
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
-  if (!ctx) return false;
+  if (!ctx)
+    return false;
   ggml_cgraph *gf = ggml_new_graph(ctx);
   if (!gf) {
     ggml_free(ctx);
@@ -1145,12 +1215,14 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   }
 
   ggml_tensor *x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D_, S);
-  ggml_tensor *hist_in = device_state_resident
-      ? (ggml_tensor *)full_state.history
-      : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, conv_dim_, 1);
-  ggml_tensor *state_in = device_state_resident
-      ? (ggml_tensor *)full_state.state
-      : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, hd, H_v_, 1);
+  ggml_tensor *hist_in =
+      device_state_resident
+          ? (ggml_tensor *)full_state.history
+          : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hist, conv_dim_, 1);
+  ggml_tensor *state_in =
+      device_state_resident
+          ? (ggml_tensor *)full_state.state
+          : ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hd, hd, H_v_, 1);
   if (!x || !hist_in || !state_in) {
     ggml_free(ctx);
     return false;
@@ -1171,8 +1243,8 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   }
   ggml_tensor *alpha_biased =
       ggml_add(ctx, alpha_raw, (ggml_tensor *)b.dt_bias);
-  ggml_tensor *g = ggml_mul(
-      ctx, ggml_softplus(ctx, alpha_biased), (ggml_tensor *)b.ssm_a);
+  ggml_tensor *g =
+      ggml_mul(ctx, ggml_softplus(ctx, alpha_biased), (ggml_tensor *)b.ssm_a);
   ggml_tensor *beta = ggml_sigmoid(ctx, beta_raw);
   ggml_tensor *conv_input =
       ggml_concat(ctx, hist_in, ggml_transpose(ctx, qkv), 0);
@@ -1180,23 +1252,20 @@ bool GgmlGdnProjRunner::run_full_device_impl(
       ggml_ssm_conv(ctx, conv_input, (ggml_tensor *)b.conv_w);
   ggml_tensor *conv_silu = ggml_silu(ctx, conv_raw);
   const size_t qkv_row = ggml_row_size(GGML_TYPE_F32, conv_dim_);
-  ggml_tensor *q = ggml_view_4d(
-      ctx, conv_silu, hd, key_dim / hd, S, 1,
-      ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S, 0);
+  ggml_tensor *q =
+      ggml_view_4d(ctx, conv_silu, hd, key_dim / hd, S, 1,
+                   ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S, 0);
   ggml_tensor *k = ggml_view_4d(
-      ctx, conv_silu, hd, key_dim / hd, S, 1,
-      ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S,
-      ggml_row_size(GGML_TYPE_F32, key_dim));
+      ctx, conv_silu, hd, key_dim / hd, S, 1, ggml_row_size(GGML_TYPE_F32, hd),
+      qkv_row, qkv_row * S, ggml_row_size(GGML_TYPE_F32, key_dim));
   ggml_tensor *v = ggml_view_4d(
-      ctx, conv_silu, hd, H_v_, S, 1,
-      ggml_row_size(GGML_TYPE_F32, hd), qkv_row, qkv_row * S,
-      ggml_row_size(GGML_TYPE_F32, 2 * key_dim));
+      ctx, conv_silu, hd, H_v_, S, 1, ggml_row_size(GGML_TYPE_F32, hd), qkv_row,
+      qkv_row * S, ggml_row_size(GGML_TYPE_F32, 2 * key_dim));
   q = ggml_l2_norm(ctx, q, eps);
   k = ggml_l2_norm(ctx, k, eps);
   g = ggml_reshape_4d(ctx, g, 1, H_v_, S, 1);
   beta = ggml_reshape_4d(ctx, beta, 1, H_v_, S, 1);
-  ggml_tensor *gdn =
-      ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, 1);
+  ggml_tensor *gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state_in, 1);
   if (!gdn) {
     ggml_free(ctx);
     return false;
@@ -1205,11 +1274,11 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   const size_t value_row = ggml_row_size(GGML_TYPE_F32, value_dim_);
   const size_t state_row = ggml_row_size(GGML_TYPE_F32, hd * hd);
   const size_t score_bytes = (size_t)value_dim_ * S * sizeof(float);
-  ggml_tensor *core = ggml_view_4d(
-      ctx, gdn, hd, H_v_, S, 1, hd_row, value_row, value_row * S, 0);
-  ggml_tensor *new_state = ggml_view_4d(
-      ctx, gdn, hd, hd, H_v_, 1, hd_row, state_row,
-      state_row * H_v_, score_bytes);
+  ggml_tensor *core = ggml_view_4d(ctx, gdn, hd, H_v_, S, 1, hd_row, value_row,
+                                   value_row * S, 0);
+  ggml_tensor *new_state =
+      ggml_view_4d(ctx, gdn, hd, hd, H_v_, 1, hd_row, state_row,
+                   state_row * H_v_, score_bytes);
   ggml_tensor *normed = ggml_rms_norm(ctx, core, eps);
   normed = ggml_mul(ctx, normed, (ggml_tensor *)b.ssm_norm);
   ggml_tensor *z4 = ggml_reshape_4d(ctx, z, hd, H_v_, S, 1);
@@ -1218,9 +1287,8 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   ggml_tensor *final_output =
       ggml_mul_mat(ctx, (ggml_tensor *)b.ssm_out, final_input);
   ggml_tensor *tail_view = ggml_view_3d(
-      ctx, conv_input, hist, conv_dim_, 1, conv_input->nb[1],
-      conv_input->nb[2], ggml_row_size(conv_input->type,
-                                       conv_input->ne[0] - hist));
+      ctx, conv_input, hist, conv_dim_, 1, conv_input->nb[1], conv_input->nb[2],
+      ggml_row_size(conv_input->type, conv_input->ne[0] - hist));
   ggml_tensor *tail_cont = ggml_cont(ctx, tail_view);
   ggml_tensor *state_store =
       ggml_cpy(ctx, new_state, (ggml_tensor *)full_state.state);
@@ -1229,9 +1297,9 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   // Each layer owns its output buffer.  A single shared output used to be
   // overwritten by the next GDN graph before HC's post-combine graph had
   // consumed it, which is the source of the old asynchronous NaNs.
-  ggml_tensor *out_view = ggml_view_2d(
-      ctx, (ggml_tensor *)full_state.output, D_, S,
-      ((ggml_tensor *)full_state.output)->nb[1], 0);
+  ggml_tensor *out_view =
+      ggml_view_2d(ctx, (ggml_tensor *)full_state.output, D_, S,
+                   ((ggml_tensor *)full_state.output)->nb[1], 0);
   ggml_tensor *out_store = ggml_cpy(ctx, final_output, out_view);
   if (!final_output || !tail_cont || !state_store || !history_store ||
       !out_store) {
@@ -1290,9 +1358,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
       return false;
     }
     ggml_tensor *src_view =
-        src->ne[1] == S
-            ? src
-            : ggml_view_2d(ctx, src, D_, S, src->nb[1], 0);
+        src->ne[1] == S ? src : ggml_view_2d(ctx, src, D_, S, src->nb[1], 0);
     if (!src_view) {
       ggml_free(ctx);
       return false;
@@ -1305,12 +1371,10 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     return false;
   }
   if (!device_state_resident) {
-    ggml_backend_tensor_set_async(
-        (ggml_backend_t)backend_, hist_in, history, 0,
-        (size_t)conv_dim_ * hist * sizeof(float));
-    ggml_backend_tensor_set_async(
-        (ggml_backend_t)backend_, state_in, state, 0,
-        (size_t)H_v_ * hd * hd * sizeof(float));
+    ggml_backend_tensor_set_async((ggml_backend_t)backend_, hist_in, history, 0,
+                                  (size_t)conv_dim_ * hist * sizeof(float));
+    ggml_backend_tensor_set_async((ggml_backend_t)backend_, state_in, state, 0,
+                                  (size_t)H_v_ * hd * hd * sizeof(float));
   }
   const ggml_status st =
       ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);
@@ -1346,10 +1410,11 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   return true;
 }
 
-bool GgmlGdnProjRunner::run_full_device(
-    int layer, const void *device_hidden, int S, const void **device_output,
-    float *history, int d_conv, float *state, float eps,
-    bool device_state_resident) {
+bool GgmlGdnProjRunner::run_full_device(int layer, const void *device_hidden,
+                                        int S, const void **device_output,
+                                        float *history, int d_conv,
+                                        float *state, float eps,
+                                        bool device_state_resident) {
   return run_full_device_impl(layer, device_hidden, nullptr, S, device_output,
                               history, d_conv, state, eps,
                               device_state_resident);
@@ -1366,7 +1431,8 @@ bool GgmlGdnProjRunner::run_full_device_tensor(
 
 bool GgmlGdnProjRunner::copy_full_output_to_host(const void *device_output,
                                                  float *host, int S) {
-  if (!backend_ || !device_output || !host || S <= 0) return false;
+  if (!backend_ || !device_output || !host || S <= 0)
+    return false;
   ggml_tensor *out = nullptr;
   if (t_full_output_ &&
       (device_output == t_full_output_ ||
@@ -1375,7 +1441,8 @@ bool GgmlGdnProjRunner::copy_full_output_to_host(const void *device_output,
     out = (ggml_tensor *)t_full_output_;
   }
   for (const FullState &state : full_states_) {
-    if (!state.output || S > state.output_cap) continue;
+    if (!state.output || S > state.output_cap)
+      continue;
     if (device_output == state.output ||
         device_output == ((ggml_tensor *)state.output)->data) {
       out = (ggml_tensor *)state.output;
@@ -1385,12 +1452,11 @@ bool GgmlGdnProjRunner::copy_full_output_to_host(const void *device_output,
   if (!out)
     return false;
   cudaSetDevice(device_);
-  ggml_backend_tensor_get(out, host, 0,
-                          (size_t)D_ * S * sizeof(float));
+  ggml_backend_tensor_get(out, host, 0, (size_t)D_ * S * sizeof(float));
   return true;
 }
 
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else // !MOESTREAM_USE_GGML_CUDA
 
 bool GgmlGdnProjRunner::compiled_in() { return false; }
 GgmlGdnProjRunner &GgmlGdnProjRunner::instance() {
@@ -1403,10 +1469,10 @@ bool GgmlGdnProjRunner::ensure(int, int, int, int, int) { return false; }
 bool GgmlGdnProjRunner::weights_ready(int) const { return false; }
 bool GgmlGdnProjRunner::full_weights_ready(int) const { return false; }
 bool GgmlGdnProjRunner::ensure_weights(int, const GgmlGdnProjWeightRef &,
-                                      const GgmlGdnProjWeightRef &,
-                                      const GgmlGdnProjWeightRef &,
-                                      const GgmlGdnProjWeightRef &,
-                                      const float *, const float *) {
+                                       const GgmlGdnProjWeightRef &,
+                                       const GgmlGdnProjWeightRef &,
+                                       const GgmlGdnProjWeightRef &,
+                                       const float *, const float *) {
   return false;
 }
 bool GgmlGdnProjRunner::ensure_full_weights(int, const GgmlGdnProjWeightRef &,
@@ -1414,7 +1480,7 @@ bool GgmlGdnProjRunner::ensure_full_weights(int, const GgmlGdnProjWeightRef &,
   return false;
 }
 bool GgmlGdnProjRunner::run(int, const float *, int, float *, float *, float *,
-                           float *) {
+                            float *) {
   return false;
 }
 bool GgmlGdnProjRunner::conv_weight_ready(int) const { return false; }
@@ -1433,9 +1499,10 @@ bool GgmlGdnProjRunner::run_full_device(int, const void *, int, const void **,
                                         float *, int, float *, float, bool) {
   return false;
 }
-bool GgmlGdnProjRunner::run_full_device_tensor(
-    int, const void *, int, const void **, float *, int, float *, float, bool) {
-    return false;
+bool GgmlGdnProjRunner::run_full_device_tensor(int, const void *, int,
+                                               const void **, float *, int,
+                                               float *, float, bool) {
+  return false;
 }
 void GgmlGdnProjRunner::finish_full_device_updates(bool) {}
 void GgmlGdnProjRunner::sync_full_device_states_to_host() {}

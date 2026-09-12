@@ -561,7 +561,8 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
 // for the whole batch).
 ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id,
                                                           const uint8_t* host_data, size_t bytes,
-                                                          bool speculative, int target_gpu_id) {
+                                                          bool speculative, int target_gpu_id,
+                                                          int64_t qwen_pilot_prediction_ns) {
     if (active_layer_pool == nullptr || active_layer_capacity == 0) {
         return nullptr;
     }
@@ -749,6 +750,13 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     cudaGetLastError();  // clear any spurious error the query itself leaves behind
 
     victim->last_upload_bytes = copy_bytes;
+    victim->qwen_pilot_prediction_ns = qwen_pilot_prediction_ns;
+    victim->qwen_pilot_issue_ns =
+        qwen_pilot_prediction_ns >= 0
+            ? std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch())
+                  .count()
+            : -1;
     victim->upload_timing_pending = false;
     victim->upload_timing_recorded = false;
     victim->upload_timing_async = true;
@@ -990,6 +998,28 @@ void GpuTopology::record_active_layer_upload_event_timing(ExpertLocation& slot,
     const bool pinned = slot.upload_source_pinned;
     slot.upload_timing_recorded = true;
     slot.upload_timing_pending = false;
+
+    // The CUDA event pair is the real copy-engine service interval for this
+    // prediction fill.  It is intentionally separate from the host-observed
+    // time at which a later poll noticed completion, which would include
+    // unrelated CPU work and make a good DMA look slow.
+    if (slot.qwen_pilot_prediction_ns >= 0) {
+        if (slot.qwen_pilot_issue_ns >= slot.qwen_pilot_prediction_ns) {
+            const double ready_to_issue =
+                (double)(slot.qwen_pilot_issue_ns -
+                         slot.qwen_pilot_prediction_ns) * 1e-9;
+            PerfCounters::atomic_add(perf().t_qwen_pilot_active_ready_to_issue,
+                                     ready_to_issue);
+            perf().n_qwen_pilot_active_ready_to_issue.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        PerfCounters::atomic_add(perf().t_qwen_pilot_active_dma, seconds);
+        perf().bytes_qwen_pilot_active_dma.fetch_add(bytes,
+                                                     std::memory_order_relaxed);
+        perf().n_qwen_pilot_active_dma.fetch_add(1, std::memory_order_relaxed);
+        slot.qwen_pilot_prediction_ns = -1;
+        slot.qwen_pilot_issue_ns = -1;
+    }
 
     auto add = [&](std::atomic<double>& t, std::atomic<int64_t>& b,
                    std::atomic<uint64_t>& n) {

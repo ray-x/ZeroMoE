@@ -228,11 +228,19 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
       float b = base ? base[HC + h] : 0.0f;
       pg[h] = 2.0f * hc_sigmoid(row[HC + h] * scale_post + b);
     }
-    // comb: mix[2HC..2HC+HC*HC), raw logits -- sinkhorn_normalize_comb
-    // applies its own softmax as step 1, so no activation here.
-    for (int i = 0; i < HC * HC; ++i) {
-      float b = base ? base[2 * HC + i] : 0.0f;
-      cb[i] = row[2 * HC + i] * scale_comb + b;
+    // comb: the GGML reshape in llama.cpp makes the destination index the
+    // fastest-varying dimension: physical index = dst + src*HC.  The
+    // host-side Sinkhorn helper and post-combine use a conventional
+    // row-major [dst*HC + src] matrix, so convert the learned output here.
+    // Feeding the GGML layout directly to the row-major helper silently
+    // transposes this routing matrix at every sub-block.
+    for (int dst = 0; dst < HC; ++dst) {
+      for (int src = 0; src < HC; ++src) {
+        const int ggml_idx = dst + src * HC;
+        const int row_idx = dst * HC + src;
+        const float b = base ? base[2 * HC + ggml_idx] : 0.0f;
+        cb[row_idx] = row[2 * HC + ggml_idx] * scale_comb + b;
+      }
     }
     sinkhorn_normalize_comb(cb, HC, c.hc_sinkhorn_iters, c.hc_eps);
 
@@ -736,6 +744,11 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         layer_idx >= c.first_dense && (S > 1 || decode_device_moe_input);
     const bool need_device_input =
         device_gdn_input || device_full_attn_input || device_moe_input;
+    const bool qwen_decode_gpu_layer =
+        engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        engine.family_ops.uses_hyper_connections &&
+        !is_cpu_affinity_layer(layer_idx) &&
+        engine.qwen4exp_decode_gpu_router;
     const bool keep_moe_input_on_device =
         // GPU routing consumes the mixed activation directly and returns only
         // the compact route table to the host.  The shared-expert flag used
@@ -744,8 +757,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         // of the per-layer boundaries this path is intended to remove.
         // Without GPU routing the host router still needs hidden_states, so
         // its copy remains mandatory.
-        device_moe_input && moe_ggml_gpu_router() &&
-        engine.qwen4exp_decode_gpu_router;
+        device_moe_input && moe_ggml_gpu_router() && qwen_decode_gpu_layer;
     const void *device_input = nullptr;
     if (hc_ggml_register(engine, layer_idx, sub_block, D, S) &&
         GgmlHcRunner::instance().pre_mix(layer_idx, sub_block, S,

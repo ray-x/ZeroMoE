@@ -1015,6 +1015,22 @@ bool test_qwen_cpu_moe_graph() {
     ok = compare_iq_outputs("Qwen CPU graph strided DDR arena", actual.data(),
                             expected.data(), D, 2e-5f, 2e-5f) &&
          ok;
+
+    // Exercise the persistent-worker entry point used by the Qwen CPU/GPU
+    // overlap path. The result must match the synchronous strided graph; the
+    // test deliberately waits before releasing the arena backing storage.
+    std::vector<float> async_actual((size_t)D, 0.0f);
+    const bool async_started =
+        GgmlQwenCpuMoeRunner::instance().start_strided_async(
+            x.data(), async_actual.data(), refs[0], arena, arena + gate_bytes,
+            arena + gate_bytes + up_bytes, ids, N, ordered_weights, D, FF, N,
+            stride);
+    const bool async_ok = async_started &&
+                          GgmlQwenCpuMoeRunner::instance().wait_strided_async();
+    ok = async_ok &&
+         compare_iq_outputs("Qwen CPU graph async worker", async_actual.data(),
+                            expected.data(), D, 2e-5f, 2e-5f) &&
+         ok;
     std::free(arena_raw);
     GgmlQwenCpuMoeRunner::instance().shutdown();
     std::cout << "  -> Qwen CPU graph test " << (ok ? "PASSED" : "FAILED")
@@ -1124,6 +1140,397 @@ bool test_qwen_cpu_moe_iq1m_graph() {
     ok = signal_ok && ok;
     GgmlQwenCpuMoeRunner::instance().shutdown();
     std::cout << "  -> Qwen IQ1_M graph test " << (ok ? "PASSED" : "FAILED")
+              << "\n";
+    return ok;
+}
+
+// Exercise the exact mixed quantization used by the Qwen CPU-affinity path
+// through the fixed-stride, global-expert-ID graph.  Test 7d only covers one
+// IQ1_M expert and the throughput probe below uses zero-filled blocks, so
+// neither catches a projection-type mismatch or an indexing error when
+// IQ1_M/IQ1_M gate/up is combined with IQ4_NL down and top-k > 1.
+bool test_qwen_cpu_moe_mixed_strided_graph() {
+    std::cout << "[Test 7e] Qwen mixed-type strided CPU GGML MoE graph...\n";
+    if (!GgmlQwenCpuMoeRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CPU backend not compiled)\n";
+        return true;
+    }
+
+    constexpr int D = 256;
+    constexpr int FF = 256;
+    constexpr int N = 4;
+    constexpr int TOPK = 3;
+    const GGUFType gate_type = GGUFType::IQ1_M;
+    const GGUFType up_type = GGUFType::IQ1_M;
+    const GGUFType down_type = GGUFType::IQ4_NL;
+    const size_t gate_row = row_bytes(gate_type, D);
+    const size_t up_row = row_bytes(up_type, D);
+    const size_t down_row = row_bytes(down_type, FF);
+    const size_t gate_used = (size_t)FF * gate_row;
+    const size_t up_used = (size_t)FF * up_row;
+    const size_t down_used = (size_t)D * down_row;
+    const size_t stride = std::max({gate_used, up_used, down_used}) + 64;
+    const size_t plane_bytes = stride * (size_t)N;
+
+    void *arena_raw = nullptr;
+    if (posix_memalign(&arena_raw, 64, plane_bytes * 3) != 0 ||
+        !arena_raw) {
+        std::cout << "  -> FAILED (arena allocation)\n";
+        return false;
+    }
+    auto *arena = static_cast<uint8_t *>(arena_raw);
+    auto *gate_plane = arena;
+    auto *up_plane = arena + plane_bytes;
+    auto *down_plane = arena + 2 * plane_bytes;
+    std::memset(arena, 0, plane_bytes * 3);
+
+    std::mt19937 rng(20260912 + 7);
+    std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
+    bool ok = true;
+    auto quantize_plane = [&](uint8_t *plane, GGUFType type, int rows,
+                              int width, size_t row_bytes_value) {
+        std::vector<float> row((size_t)width);
+        for (int expert = 0; expert < N && ok; ++expert) {
+            uint8_t *expert_plane = plane + (size_t)expert * stride;
+            for (int r = 0; r < rows; ++r) {
+                for (float &v : row)
+                    v = dist(rng);
+                ok = ggml_quantize_row_ref(
+                         (uint32_t)type, row.data(),
+                         expert_plane + (size_t)r * row_bytes_value, width) &&
+                     ok;
+            }
+        }
+    };
+    quantize_plane(gate_plane, gate_type, FF, D, gate_row);
+    quantize_plane(up_plane, up_type, FF, D, up_row);
+    quantize_plane(down_plane, down_type, D, FF, down_row);
+    if (!ok) {
+        std::cout << "  -> FAILED (reference quantizer unavailable)\n";
+        std::free(arena_raw);
+        GgmlQwenCpuMoeRunner::instance().shutdown();
+        return false;
+    }
+
+    const GgmlQwenCpuExpertRef layer{
+        gate_plane, up_plane, down_plane, gate_used, up_used, down_used,
+        (uint32_t)gate_type, (uint32_t)up_type, (uint32_t)down_type};
+    std::vector<float> input((size_t)D);
+    for (float &v : input)
+        v = dist(rng);
+
+    auto oracle = [&](const std::array<int, TOPK> &ids,
+                      const std::array<float, TOPK> &weights,
+                      std::vector<float> &out) {
+        std::fill(out.begin(), out.end(), 0.0f);
+        std::vector<float> gate_out((size_t)FF);
+        std::vector<float> up_out((size_t)FF);
+        std::vector<float> act((size_t)FF);
+        std::vector<float> down_out((size_t)D);
+        bool oracle_ok = true;
+        for (int k = 0; k < TOPK; ++k) {
+            const size_t expert_offset = (size_t)ids[(size_t)k] * stride;
+            oracle_ok = exact_iq_matmul_reference(
+                            gate_type, gate_plane + expert_offset,
+                            input.data(), gate_out.data(), 1, D, FF) &&
+                        oracle_ok;
+            oracle_ok = exact_iq_matmul_reference(
+                            up_type, up_plane + expert_offset, input.data(),
+                            up_out.data(), 1, D, FF) &&
+                        oracle_ok;
+            for (int j = 0; j < FF; ++j)
+                act[(size_t)j] = gate_out[(size_t)j] /
+                                 (1.0f + std::exp(-gate_out[(size_t)j])) *
+                                 up_out[(size_t)j];
+            oracle_ok = exact_iq_matmul_reference(
+                            down_type, down_plane + expert_offset,
+                            act.data(), down_out.data(), 1, FF, D) &&
+                        oracle_ok;
+            for (int d = 0; d < D; ++d)
+                out[(size_t)d] += weights[(size_t)k] * down_out[(size_t)d];
+        }
+        return oracle_ok;
+    };
+
+    auto &runner = GgmlQwenCpuMoeRunner::instance();
+    const std::array<std::array<int, TOPK>, 2> ids = {{{3, 1, 0},
+                                                        {2, 0, 3}}};
+    const std::array<std::array<float, TOPK>, 2> weights = {{
+        std::array<float, TOPK>{0.2f, 0.5f, 0.3f},
+        std::array<float, TOPK>{0.6f, 0.1f, 0.3f}}};
+    std::vector<float> expected((size_t)D), actual((size_t)D);
+    for (int pass = 0; pass < 2; ++pass) {
+        ok = oracle(ids[(size_t)pass], weights[(size_t)pass], expected) && ok;
+        ok = runner.run_strided(
+                 input.data(), actual.data(), layer, gate_plane, up_plane,
+                 down_plane, ids[(size_t)pass].data(), N,
+                 weights[(size_t)pass].data(), D, FF, TOPK, stride) &&
+             ok;
+        ok = compare_iq_outputs(
+                 "Qwen mixed IQ1_M/IQ4_NL strided pass " +
+                     std::to_string(pass),
+                 actual.data(), expected.data(), expected.size(), 0.30f,
+                 0.35f) &&
+             ok;
+    }
+
+    runner.shutdown();
+    std::free(arena_raw);
+    std::cout << "  -> Qwen mixed-type strided graph "
+              << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
+// The checkpoint has a second routed projection family with IQ2_XXS
+// gate/up. Keep an independent test for it instead of assuming the IQ1_M
+// graph result generalizes: both types share the same graph shape, but their
+// GGML CPU dot kernels and row sizes are different.
+bool test_qwen_cpu_moe_iq2_strided_graph() {
+    std::cout << "[Test 7f] Qwen IQ2_XXS strided CPU GGML MoE graph...\n";
+    if (!GgmlQwenCpuMoeRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CPU backend not compiled)\n";
+        return true;
+    }
+
+    constexpr int D = 256;
+    constexpr int FF = 256;
+    constexpr int N = 3;
+    constexpr int TOPK = 2;
+    const GGUFType gate_type = GGUFType::IQ2_XXS;
+    const GGUFType down_type = GGUFType::IQ4_NL;
+    const size_t gate_row = row_bytes(gate_type, D);
+    const size_t down_row = row_bytes(down_type, FF);
+    const size_t gate_used = (size_t)FF * gate_row;
+    const size_t down_used = (size_t)D * down_row;
+    const size_t stride = std::max(gate_used, down_used) + 64;
+    const size_t plane_bytes = stride * (size_t)N;
+    void *arena_raw = nullptr;
+    if (posix_memalign(&arena_raw, 64, plane_bytes * 3) != 0 ||
+        !arena_raw) {
+        std::cout << "  -> FAILED (arena allocation)\n";
+        return false;
+    }
+    auto *arena = static_cast<uint8_t *>(arena_raw);
+    auto *gate_plane = arena;
+    auto *up_plane = arena + plane_bytes;
+    auto *down_plane = arena + 2 * plane_bytes;
+    std::memset(arena, 0, plane_bytes * 3);
+
+    std::mt19937 rng(20260912 + 17);
+    std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
+    bool ok = true;
+    auto quantize_plane = [&](uint8_t *plane, GGUFType type, int rows,
+                              int width, size_t row_bytes_value) {
+        std::vector<float> row((size_t)width);
+        for (int expert = 0; expert < N && ok; ++expert) {
+            uint8_t *expert_plane = plane + (size_t)expert * stride;
+            for (int r = 0; r < rows; ++r) {
+                for (float &v : row)
+                    v = dist(rng);
+                ok = ggml_quantize_row_ref(
+                         (uint32_t)type, row.data(),
+                         expert_plane + (size_t)r * row_bytes_value, width) &&
+                     ok;
+            }
+        }
+    };
+    quantize_plane(gate_plane, gate_type, FF, D, gate_row);
+    quantize_plane(up_plane, gate_type, FF, D, gate_row);
+    quantize_plane(down_plane, down_type, D, FF, down_row);
+    if (!ok) {
+        std::cout << "  -> FAILED (reference quantizer unavailable)\n";
+        std::free(arena_raw);
+        GgmlQwenCpuMoeRunner::instance().shutdown();
+        return false;
+    }
+
+    const GgmlQwenCpuExpertRef layer{
+        gate_plane, up_plane, down_plane, gate_used, gate_used, down_used,
+        (uint32_t)gate_type, (uint32_t)gate_type, (uint32_t)down_type};
+    std::vector<float> input((size_t)D);
+    for (float &v : input)
+        v = dist(rng);
+    const std::array<int, TOPK> ids = {2, 0};
+    const std::array<float, TOPK> weights = {0.35f, 0.65f};
+    std::vector<float> expected((size_t)D, 0.0f);
+    std::vector<float> actual((size_t)D, 0.0f);
+    std::vector<float> gate_out((size_t)FF);
+    std::vector<float> up_out((size_t)FF);
+    std::vector<float> act((size_t)FF);
+    std::vector<float> down_out((size_t)D);
+    for (int k = 0; k < TOPK; ++k) {
+        const size_t off = (size_t)ids[(size_t)k] * stride;
+        ok = exact_iq_matmul_reference(gate_type, gate_plane + off,
+                                       input.data(), gate_out.data(), 1, D,
+                                       FF) &&
+             ok;
+        ok = exact_iq_matmul_reference(gate_type, up_plane + off,
+                                       input.data(), up_out.data(), 1, D, FF) &&
+             ok;
+        for (int j = 0; j < FF; ++j)
+            act[(size_t)j] = gate_out[(size_t)j] /
+                             (1.0f + std::exp(-gate_out[(size_t)j])) *
+                             up_out[(size_t)j];
+        ok = exact_iq_matmul_reference(down_type, down_plane + off,
+                                       act.data(), down_out.data(), 1, FF,
+                                       D) &&
+             ok;
+        for (int d = 0; d < D; ++d)
+            expected[(size_t)d] += weights[(size_t)k] * down_out[(size_t)d];
+    }
+
+    ok = GgmlQwenCpuMoeRunner::instance().run_strided(
+             input.data(), actual.data(), layer, gate_plane, up_plane,
+             down_plane, ids.data(), N, weights.data(), D, FF, TOPK, stride) &&
+         ok;
+    ok = compare_iq_outputs("Qwen IQ2_XXS/IQ4_NL strided", actual.data(),
+                            expected.data(), expected.size(), 0.30f, 0.40f) &&
+         ok;
+    GgmlQwenCpuMoeRunner::instance().shutdown();
+    std::free(arena_raw);
+    std::cout << "  -> Qwen IQ2_XXS strided graph "
+              << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
+// Informational benchmark for the production Qwen CPU-affinity graph.  The
+// shape and quantization match Qwen3.8-Flash-Next's routed experts:
+// IQ1_M or IQ2_XXS gate/up, IQ4_NL down, D=2560, FF=640, top-k=10.  A compact 32-expert
+// synthetic arena is enough to exercise MUL_MAT_ID and keeps this diagnostic
+// runnable without allocating a full 512-expert model layer; the selected
+// expert work is identical.  Run in isolation with
+// MOESTREAM_TEST_ONLY_QWEN_CPU_BENCH=1 and vary OMP_NUM_THREADS to measure
+// physical-core versus hyperthread scaling.  Set
+// MOESTREAM_QWEN_CPU_BENCH_TYPE=iq2_xxs to measure the other production type.
+bool bench_qwen_cpu_moe() {
+    std::cout << "\n[BENCH] Qwen CPU strided GGML MoE path (informational)\n";
+    if (!GgmlQwenCpuMoeRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CPU backend not compiled)\n";
+        return true;
+    }
+
+    constexpr int D = 2560;
+    constexpr int FF = 640;
+    constexpr int N = 32;
+    constexpr int TOPK = 10;
+    const char *type_env = std::getenv("MOESTREAM_QWEN_CPU_BENCH_TYPE");
+    const bool use_iq2 = type_env &&
+                         (std::strcmp(type_env, "iq2") == 0 ||
+                          std::strcmp(type_env, "iq2_xxs") == 0 ||
+                          std::strcmp(type_env, "IQ2_XXS") == 0);
+    const GGUFType gate_type =
+        use_iq2 ? GGUFType::IQ2_XXS : GGUFType::IQ1_M;
+    const GGUFType up_type = gate_type;
+    const GGUFType down_type = GGUFType::IQ4_NL;
+    const size_t gate_bytes = (size_t)FF * row_bytes(gate_type, D);
+    const size_t up_bytes = (size_t)FF * row_bytes(up_type, D);
+    const size_t down_bytes = (size_t)D * row_bytes(down_type, FF);
+    const size_t stride = std::max({gate_bytes, up_bytes, down_bytes}) + 64;
+    const size_t plane_bytes = stride * (size_t)N;
+
+    void *gate_raw = nullptr, *up_raw = nullptr, *down_raw = nullptr;
+    if (posix_memalign(&gate_raw, 64, plane_bytes) != 0 ||
+        posix_memalign(&up_raw, 64, plane_bytes) != 0 ||
+        posix_memalign(&down_raw, 64, plane_bytes) != 0 ||
+        !gate_raw || !up_raw || !down_raw) {
+        std::free(gate_raw);
+        std::free(up_raw);
+        std::free(down_raw);
+        std::cout << "  -> FAILED (arena allocation)\n";
+        return false;
+    }
+    std::memset(gate_raw, 0, plane_bytes);
+    std::memset(up_raw, 0, plane_bytes);
+    std::memset(down_raw, 0, plane_bytes);
+
+    // This is a throughput benchmark, not a quantizer-correctness test.  The
+    // GGML kernels consume fixed-size block bytes, so deterministic raw block
+    // bytes are sufficient and avoid spending most of the run in the slow
+    // IQ1_M reference search quantizer.  Test 7d covers real quantizer output
+    // and the independent correctness oracle separately.
+    auto fill_plane = [&](void *raw, GGUFType type, int rows, int width,
+                          size_t bytes_per_expert) {
+        auto *base = static_cast<uint8_t *>(raw);
+        const int rb = row_bytes(type, width);
+        for (int expert = 0; expert < N; ++expert) {
+            uint8_t *dst = base + (size_t)expert * stride;
+            const size_t used = (size_t)rows * (size_t)rb;
+            // Zero-filled blocks are structurally valid and keep this
+            // throughput probe finite.  Random bytes are not valid IQ1_M
+            // codebook/scales and can legitimately produce NaNs, which makes
+            // the benchmark report misleading even though its timing is fine.
+            std::memset(dst, 0, used);
+            // Make accidental short-row/stride mistakes visible while
+            // keeping the padding deterministic.
+            if (bytes_per_expert < used)
+                std::abort();
+        }
+    };
+    fill_plane(gate_raw, gate_type, FF, D, gate_bytes);
+    fill_plane(up_raw, up_type, FF, D, up_bytes);
+    fill_plane(down_raw, down_type, D, FF, down_bytes);
+    bool ok = true;
+
+    GgmlQwenCpuExpertRef ref{
+        gate_raw, up_raw, down_raw, gate_bytes, up_bytes, down_bytes,
+        (uint32_t)gate_type, (uint32_t)up_type, (uint32_t)down_type};
+    std::vector<float> input((size_t)D, 0.1f);
+    std::vector<float> output((size_t)D, 0.0f);
+    std::array<int, TOPK> ids{};
+    std::array<float, TOPK> weights{};
+    for (int k = 0; k < TOPK; ++k) {
+        ids[(size_t)k] = (k * 3) % N;
+        weights[(size_t)k] = 1.0f / (float)TOPK;
+    }
+
+    const char *iter_env = std::getenv("MOESTREAM_QWEN_CPU_BENCH_ITERS");
+    const int iterations = std::max(1, iter_env ? std::atoi(iter_env) : 12);
+    auto &runner = GgmlQwenCpuMoeRunner::instance();
+    if (!runner.run_strided(input.data(), output.data(), ref, gate_raw, up_raw,
+                            down_raw, ids.data(), N, weights.data(), D, FF,
+                            TOPK, stride)) {
+        runner.shutdown();
+        std::free(gate_raw);
+        std::free(up_raw);
+        std::free(down_raw);
+        std::cout << "  -> FAILED (runner setup/warm-up)\n";
+        return false;
+    }
+    for (int i = 0; i < 2; ++i)
+        if (!runner.run_strided(input.data(), output.data(), ref, gate_raw,
+                                up_raw, down_raw, ids.data(), N,
+                                weights.data(), D, FF, TOPK, stride))
+            ok = false;
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        if (!runner.run_strided(input.data(), output.data(), ref, gate_raw,
+                                up_raw, down_raw, ids.data(), N,
+                                weights.data(), D, FF, TOPK, stride))
+            ok = false;
+    }
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t0).count();
+    const double ms_per_layer = elapsed_ms / (double)iterations;
+    double checksum = 0.0;
+    for (float v : output)
+        checksum += v;
+    const int threads = omp_get_max_threads();
+    std::cout << "  shape D=" << D << " FF=" << FF << " experts=" << N
+              << " topk=" << TOPK << " types="
+              << (use_iq2 ? "IQ2_XXS/IQ2_XXS" : "IQ1_M/IQ1_M")
+              << "/IQ4_NL"
+              << " OMP threads=" << threads << "\n"
+              << "  " << iterations << " calls: " << std::fixed
+              << std::setprecision(3) << ms_per_layer << " ms/layer"
+              << " | 6 CPU layers=" << (1000.0 / (6.0 * ms_per_layer))
+              << " tok/s | 16 CPU layers="
+              << (1000.0 / (16.0 * ms_per_layer))
+              << " tok/s | checksum=" << checksum << "\n";
+    runner.shutdown();
+    std::free(gate_raw);
+    std::free(up_raw);
+    std::free(down_raw);
+    std::cout << "  -> Qwen CPU benchmark " << (ok ? "COMPLETED" : "FAILED")
               << "\n";
     return ok;
 }
@@ -3507,6 +3914,14 @@ bool test_compact_vram_slot_planner() {
         GpuTopology::compact_layer_slot_counts(100, 4, layer_bytes, 1);
     ok = ok && full_prefix == std::vector<int>({4, 2, 2});
 
+    // Explicit CPU-affinity layers must not strand their physical cache
+    // regions. The same 100-byte pool should be redistributed across the
+    // two GPU-executed layers rather than leaving layer 1's share unusable.
+    const std::vector<int> cpu_affinity_excluded =
+        GpuTopology::compact_layer_slot_counts(
+            100, 4, layer_bytes, 0, std::vector<int>{1});
+    ok = ok && cpu_affinity_excluded == std::vector<int>({4, 0, 4});
+
     std::cout << "  counts=";
     for (int count : counts) std::cout << count << " ";
     std::cout << "used=" << used << " bytes, full-prefix=";
@@ -5283,6 +5698,10 @@ int main() {
         bool ok = test_qwen_hc_runner_q8_exact();
         return ok ? 0 : 1;
     }
+    if (std::getenv("MOESTREAM_TEST_ONLY_QWEN_CPU_BENCH")) {
+        bool ok = bench_qwen_cpu_moe();
+        return ok ? 0 : 1;
+    }
     if (std::getenv("MOESTREAM_TEST_ONLY_CPU_IQ")) {
         // Keep both diagnostics independent.  In particular, an IQ1_M
         // failure must not hide the Qwen graph test, and a graph failure must
@@ -5290,7 +5709,15 @@ int main() {
         const bool iq_ok = test_cpu_iq_matmul_paths();
         const bool graph_ok = test_qwen_cpu_moe_graph();
         const bool iq1m_graph_ok = test_qwen_cpu_moe_iq1m_graph();
-        return (iq_ok && graph_ok && iq1m_graph_ok) ? 0 : 1;
+        const bool mixed_graph_ok = test_qwen_cpu_moe_mixed_strided_graph();
+        const bool iq2_graph_ok = test_qwen_cpu_moe_iq2_strided_graph();
+        return (iq_ok && graph_ok && iq1m_graph_ok && mixed_graph_ok &&
+                iq2_graph_ok)
+                   ? 0
+                   : 1;
+    }
+    if (std::getenv("MOESTREAM_TEST_ONLY_COMPACT_CACHE")) {
+        return test_compact_vram_slot_planner() ? 0 : 1;
     }
 
     test_cpu_matrix_ops();
@@ -5303,6 +5730,10 @@ int main() {
     bool cpu_iq_matmul_ok = test_cpu_iq_matmul_paths();
     bool qwen_cpu_moe_graph_ok = test_qwen_cpu_moe_graph();
     bool qwen_cpu_moe_iq1m_graph_ok = test_qwen_cpu_moe_iq1m_graph();
+    bool qwen_cpu_moe_mixed_strided_graph_ok =
+        test_qwen_cpu_moe_mixed_strided_graph();
+    bool qwen_cpu_moe_iq2_strided_graph_ok =
+        test_qwen_cpu_moe_iq2_strided_graph();
     // Test 8 is throughput-only (no pass/fail verdict, see its own header
     // comment) and runs many timed dequant/matmul passes -- by far the
     // slowest thing in this binary, and irrelevant to every other test's
@@ -5374,6 +5805,14 @@ int main() {
     }
     if (!qwen_cpu_moe_iq1m_graph_ok) {
         std::cout << "❌ Qwen IQ1_M CPU GGML MoE graph test FAILED -- see [Test 7d] output above.\n";
+        return 1;
+    }
+    if (!qwen_cpu_moe_mixed_strided_graph_ok) {
+        std::cout << "❌ Qwen mixed-type strided CPU GGML MoE graph test FAILED -- see [Test 7e] output above.\n";
+        return 1;
+    }
+    if (!qwen_cpu_moe_iq2_strided_graph_ok) {
+        std::cout << "❌ Qwen IQ2_XXS strided CPU GGML MoE graph test FAILED -- see [Test 7f] output above.\n";
         return 1;
     }
     if (!bf16_dense_ok) {
