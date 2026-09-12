@@ -158,6 +158,11 @@ public:
     size_t d_outproj_x_cap = 0;
     size_t d_outproj_y_cap = 0;
 
+    // Event-ordered copy path for dense_matmul_host. It is opt-in because
+    // the legacy default-stream path remains the compatibility baseline for
+    // model families not yet measured with this ordering.
+    bool dense_async_copies_enabled = false;
+
     // Persistent device buffers on core GPU (never freed mid-session)
     float* d_x = nullptr;
     float* d_y = nullptr;
@@ -206,6 +211,21 @@ public:
         int hd = 0;
     };
     std::vector<Qwen4ExpDeviceKvCache> d_qwen4exp_kv_by_layer;
+
+    // Qwen's q/k norm vectors are dequantized into short temporary host
+    // vectors by the attention adapter on every call.  Their values are
+    // constant per layer, so identifying them by content lets the decode
+    // path upload each pair once and reuse device storage thereafter.  The
+    // old path used two blocking H2D copies for every Qwen attention call,
+    // which serialized the CUDA stream even though the vectors are only
+    // 256 floats each.
+    struct Qwen4ExpNormCache {
+        std::vector<float> q_host;
+        std::vector<float> k_host;
+        float *q_device = nullptr;
+        float *k_device = nullptr;
+    };
+    std::vector<Qwen4ExpNormCache> d_qwen4exp_norm_cache;
 
     // GDN causal conv1d+SiLU GPU scratch (qwen4exp_conv1d_silu_gpu_host).
     // Grow-only, shared across all 36 GDN layers and every call. Weight and
@@ -633,6 +653,13 @@ public:
             if (cache.v) cudaFree(cache.v);
             cache = Qwen4ExpDeviceKvCache{};
         }
+        for (auto &cache : d_qwen4exp_norm_cache) {
+            if (cache.q_device) cudaFree(cache.q_device);
+            if (cache.k_device) cudaFree(cache.k_device);
+            cache.q_device = nullptr;
+            cache.k_device = nullptr;
+        }
+        d_qwen4exp_norm_cache.clear();
         if (d_gdnconv_x) cudaFree(d_gdnconv_x);
         if (d_gdnconv_w) cudaFree(d_gdnconv_w);
         if (d_gdnconv_h) cudaFree(d_gdnconv_h);
@@ -657,6 +684,9 @@ public:
         if (d_glm_router_weights) cudaFree(d_glm_router_weights);
         if (cublas_handle) cublasDestroy(cublas_handle);
         if (outproj_cublas_handle) cublasDestroy(outproj_cublas_handle);
+        if (dense_h2d_ready) cudaEventDestroy(dense_h2d_ready);
+        if (dense_compute_done) cudaEventDestroy(dense_compute_done);
+        if (dense_copy_stream) cudaStreamDestroy(dense_copy_stream);
         if (outproj_stream) cudaStreamDestroy(outproj_stream);
         if (d_outproj_x) cudaFree(d_outproj_x);
         if (d_outproj_y) cudaFree(d_outproj_y);
@@ -926,8 +956,25 @@ public:
             h_x_bf16_scratch[i] = fp32_to_bf16(x_host[i]);
         PERF_END(dense_bf16_cvt, t_dense_gpu_up);
 
+        const bool async_copies = ensure_dense_async_resources();
+        const void *bf16_upload_src = h_x_bf16_scratch;
+        if (async_copies && !host_ptr_is_pinned(bf16_upload_src) &&
+            ensure_dense_stage(x_bf16_bytes)) {
+            std::memcpy(dense_stage, bf16_upload_src, x_bf16_bytes);
+            bf16_upload_src = dense_stage;
+        }
+
         PERF_START(dense_bf16_up);
-        cudaMemcpy(d_x_bf16, h_x_bf16_scratch, x_bf16_bytes, cudaMemcpyHostToDevice);
+        if (async_copies) {
+            if (!dense_async_h2d(d_x_bf16, bf16_upload_src, x_bf16_bytes)) {
+                cudaStreamSynchronize(dense_stream());
+                cudaStreamSynchronize(0);
+                return false;
+            }
+        } else {
+            cudaMemcpy(d_x_bf16, h_x_bf16_scratch, x_bf16_bytes,
+                       cudaMemcpyHostToDevice);
+        }
         PERF_END(dense_bf16_up, t_dense_gpu_up);
 
         PERF_START(dense_bf16_cmp);
@@ -937,7 +984,19 @@ public:
         if (status != CUBLAS_STATUS_SUCCESS) return false;
 
         PERF_START(dense_bf16_dn);
-        cudaMemcpy(y_host, d_y, y_bytes, cudaMemcpyDeviceToHost);
+        if (async_copies) {
+            void *bf16_download_dst = y_host;
+            bool staged_download = false;
+            if (!host_ptr_is_pinned(y_host) && ensure_dense_stage(y_bytes)) {
+                bf16_download_dst = dense_stage;
+                staged_download = true;
+            }
+            if (!dense_async_d2h(bf16_download_dst, d_y, y_bytes)) return false;
+            if (staged_download)
+                std::memcpy(y_host, bf16_download_dst, y_bytes);
+        } else {
+            cudaMemcpy(y_host, d_y, y_bytes, cudaMemcpyDeviceToHost);
+        }
         PERF_END(dense_bf16_dn, t_dense_gpu_down);
         return true;
     }
@@ -2060,7 +2119,10 @@ public:
                     return false;
             }
         }
-        if (cudaStreamSynchronize(0) != cudaSuccess) return false;
+        // The caller immediately queues sigmoid/output projection and the
+        // HC raw D2D handoff on the same CUDA stream. Its event bridge waits
+        // for this work before the shared GGML post graph, so a host-side
+        // stream synchronize here only destroys overlap.
         PERF_END(q4_cmp, t_qwen4exp_attn_gpu_cmp);
         *device_out = d_q4_out;
         perf().n_qwen4exp_attn_gpu_calls.fetch_add(1, std::memory_order_relaxed);
@@ -2150,14 +2212,48 @@ public:
             !dense_matmul_device(v_type, v_weight, device_x, d_q4_V,
                                  S, D, Hkv * hd))
             return false;
-        if (cudaMemcpy(d_q4_qnorm, q_norm_host, norm_bytes,
-                       cudaMemcpyHostToDevice) != cudaSuccess ||
-            cudaMemcpy(d_q4_knorm, k_norm_host, norm_bytes,
-                       cudaMemcpyHostToDevice) != cudaSuccess)
-            return false;
+        // `q_norm_host`/`k_norm_host` are temporary dequantized vectors in
+        // the attention adapter, so their host addresses are not stable
+        // across calls. Match the values instead and retain one device pair
+        // per distinct layer's norms. The blocking copies are consequently
+        // paid only on first use of a pair, not once per decode token.
+        const float *qnorm_device = nullptr;
+        const float *knorm_device = nullptr;
+        for (const auto &cached : d_qwen4exp_norm_cache) {
+            if (cached.q_host.size() == (size_t)hd &&
+                cached.k_host.size() == (size_t)hd &&
+                std::memcmp(cached.q_host.data(), q_norm_host, norm_bytes) == 0 &&
+                std::memcmp(cached.k_host.data(), k_norm_host, norm_bytes) == 0) {
+                qnorm_device = cached.q_device;
+                knorm_device = cached.k_device;
+                break;
+            }
+        }
+        if (!qnorm_device || !knorm_device) {
+            Qwen4ExpNormCache cached;
+            cached.q_host.assign(q_norm_host, q_norm_host + hd);
+            cached.k_host.assign(k_norm_host, k_norm_host + hd);
+            if (cudaMalloc((void **)&cached.q_device, norm_bytes) != cudaSuccess ||
+                cudaMalloc((void **)&cached.k_device, norm_bytes) != cudaSuccess) {
+                if (cached.q_device) cudaFree(cached.q_device);
+                if (cached.k_device) cudaFree(cached.k_device);
+                return false;
+            }
+            if (cudaMemcpy(cached.q_device, cached.q_host.data(), norm_bytes,
+                           cudaMemcpyHostToDevice) != cudaSuccess ||
+                cudaMemcpy(cached.k_device, cached.k_host.data(), norm_bytes,
+                           cudaMemcpyHostToDevice) != cudaSuccess) {
+                cudaFree(cached.q_device);
+                cudaFree(cached.k_device);
+                return false;
+            }
+            qnorm_device = cached.q_device;
+            knorm_device = cached.k_device;
+            d_qwen4exp_norm_cache.push_back(std::move(cached));
+        }
         launch_qwen4exp_prepare_qkv(
             d_q4_qfull, d_q4_K, d_q4_V, d_q4_Q, d_q4_gate, d_q4_K, d_q4_V,
-            d_q4_qnorm, d_q4_knorm, S, H, Hkv, hd, n_rot, pos_base,
+            qnorm_device, knorm_device, S, H, Hkv, hd, n_rot, pos_base,
             theta_base, eps, 0);
         if (cudaGetLastError() != cudaSuccess) return false;
         *q_device = d_q4_Q;
@@ -2208,8 +2304,8 @@ public:
             return false;
         // Preserve the raw attention context for a safe host fallback if the
         // output projection type or allocation is unsupported.
-        if (cudaMemcpy(d_x, d_q4_out, context_bytes,
-                       cudaMemcpyDeviceToDevice) != cudaSuccess)
+        if (cudaMemcpyAsync(d_x, d_q4_out, context_bytes,
+                            cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
             return false;
         launch_qwen4exp_sigmoid_gate(d_x, d_q4_Q,
                                      (int)((size_t)S * H * hd), 0);
@@ -2238,8 +2334,8 @@ public:
         if (!ensure_buffers(context_bytes, (size_t)S * D * sizeof(float)))
             return false;
         cudaSetDevice(device_id);
-        if (cudaMemcpy(d_x, d_q4_out, context_bytes,
-                       cudaMemcpyDeviceToDevice) != cudaSuccess)
+        if (cudaMemcpyAsync(d_x, d_q4_out, context_bytes,
+                            cudaMemcpyDeviceToDevice, 0) != cudaSuccess)
             return false;
         launch_qwen4exp_sigmoid_gate(d_x, (const float *)d_q4_gate,
                                      (int)((size_t)S * H * hd), 0);
@@ -3247,10 +3343,69 @@ public:
     // unchanged because each copy is still followed by a synchronize before
     // anything reads it; only the device-wide wait goes away.
     cudaStream_t dense_copy_stream = nullptr;
+    cudaEvent_t dense_h2d_ready = nullptr;
+    cudaEvent_t dense_compute_done = nullptr;
     cudaStream_t dense_stream() {
         if (!dense_copy_stream)
             cudaStreamCreateWithFlags(&dense_copy_stream, cudaStreamNonBlocking);
         return dense_copy_stream;  // nullptr on failure == legacy stream, still correct
+    }
+
+    void set_dense_async_copies(bool enabled) {
+        dense_async_copies_enabled = enabled;
+        // Keep command-line A/B runs independent of a temporary config edit.
+        // An explicit environment override is useful for regression checks;
+        // absent the variable, the config remains authoritative.
+        if (const char *override_value = std::getenv("MOESTREAM_DENSE_ASYNC_COPIES")) {
+            dense_async_copies_enabled = (override_value[0] == '1' ||
+                                          override_value[0] == 'y' ||
+                                          override_value[0] == 'Y' ||
+                                          override_value[0] == 't' ||
+                                          override_value[0] == 'T');
+        }
+    }
+
+    bool ensure_dense_async_resources() {
+        if (!dense_async_copies_enabled) return false;
+        cudaSetDevice(device_id);
+        cudaStream_t st = dense_stream();
+        if (!st) return false;
+        if (!dense_h2d_ready &&
+            cudaEventCreateWithFlags(&dense_h2d_ready, cudaEventDisableTiming) !=
+                cudaSuccess) {
+            dense_h2d_ready = nullptr;
+            return false;
+        }
+        if (!dense_compute_done &&
+            cudaEventCreateWithFlags(&dense_compute_done, cudaEventDisableTiming) !=
+                cudaSuccess) {
+            dense_compute_done = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    bool dense_async_h2d(void *dst, const void *src, size_t bytes) {
+        cudaStream_t st = dense_stream();
+        if (!st || !dense_h2d_ready || bytes == 0) return false;
+        if (cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, st) !=
+                cudaSuccess ||
+            cudaEventRecord(dense_h2d_ready, st) != cudaSuccess ||
+            cudaStreamWaitEvent(0, dense_h2d_ready, 0) != cudaSuccess)
+            return false;
+        return true;
+    }
+
+    bool dense_async_d2h(void *dst, const void *src, size_t bytes) {
+        cudaStream_t st = dense_stream();
+        if (!st || !dense_compute_done || bytes == 0) return false;
+        if (cudaEventRecord(dense_compute_done, 0) != cudaSuccess ||
+            cudaStreamWaitEvent(st, dense_compute_done, 0) != cudaSuccess ||
+            cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, st) !=
+                cudaSuccess ||
+            cudaStreamSynchronize(st) != cudaSuccess)
+            return false;
+        return true;
     }
     void dense_copy(void* dst, const void* src, size_t n, cudaMemcpyKind kind) {
         cudaStream_t st = dense_stream();
@@ -3659,7 +3814,20 @@ public:
         // copy, same method that found the real expert-FFN GPU issue
         // earlier this session.
         PERF_START(dense_up);
-        if (host_ptr_is_pinned(x_host) || !ensure_dense_stage(x_bytes)) {
+        const bool async_copies = ensure_dense_async_resources();
+        const void *upload_src = x_host;
+        if (async_copies && !host_ptr_is_pinned(upload_src) &&
+            ensure_dense_stage(x_bytes)) {
+            std::memcpy(dense_stage, upload_src, x_bytes);
+            upload_src = dense_stage;
+        }
+        if (async_copies) {
+            if (!dense_async_h2d(d_x, upload_src, x_bytes)) {
+                cudaStreamSynchronize(dense_stream());
+                cudaStreamSynchronize(0);
+                return false;
+            }
+        } else if (host_ptr_is_pinned(x_host) || !ensure_dense_stage(x_bytes)) {
             cudaMemcpy(d_x, x_host, x_bytes, cudaMemcpyHostToDevice);
         } else {
             std::memcpy(dense_stage, x_host, x_bytes);
@@ -3772,12 +3940,22 @@ public:
         // anyway (default-stream blocking semantics), but that would fold
         // compute time into t_dense_gpu_down instead of attributing it
         // correctly.
-        cudaStreamSynchronize(0);
+        if (!async_copies) cudaStreamSynchronize(0);
         PERF_END(dense_cmp, t_dense_gpu_compute);
         if (!ok) return false;
 
         PERF_START(dense_dn);
-        if (host_ptr_is_pinned(y_host) || !ensure_dense_stage(y_bytes)) {
+        if (async_copies) {
+            void *download_dst = y_host;
+            bool staged_download = false;
+            if (!host_ptr_is_pinned(y_host) && ensure_dense_stage(y_bytes)) {
+                download_dst = dense_stage;
+                staged_download = true;
+            }
+            if (!dense_async_d2h(download_dst, d_y, y_bytes)) return false;
+            if (staged_download)
+                std::memcpy(y_host, download_dst, y_bytes);
+        } else if (host_ptr_is_pinned(y_host) || !ensure_dense_stage(y_bytes)) {
             cudaMemcpy(y_host, d_y, y_bytes, cudaMemcpyDeviceToHost);
         } else {
             cudaMemcpy(dense_stage, d_y, y_bytes, cudaMemcpyDeviceToHost);

@@ -16,10 +16,17 @@
 #include <cuda_runtime.h>
 
 #include "ggml.h"
+#include "ggml-quants.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
+
+extern "C" void launch_qwen4exp_hc_q8_pre(
+    float *streams, const float *norm, float *xn, float *lo, float *gate,
+    float *mixed, float *inject, const void *down, const void *up,
+    const void *inject_w, int S, int HC, int D, int LR, float eps,
+    int inject_q8, cudaStream_t stream);
 
 namespace {
 constexpr int kMaxLayers = 256;
@@ -30,6 +37,30 @@ bool type_ok(uint32_t t) {
   const ggml_type g = (ggml_type)t;
   return g == GGML_TYPE_F32 || g == GGML_TYPE_F16 || g == GGML_TYPE_BF16 ||
          ggml_is_quantized(g);
+}
+
+// ggml's CUDA Q8_0 dot path quantizes an F32 activation to Q8_1 before
+// multiplying.  That is a useful general GEMM trade-off, but it is not
+// acceptable for Qwen4Exp HC: the low-rank gate feeds the next router and a
+// small projection error can change the selected expert IDs.  Dequantize the
+// small HC matrices once and let the persistent graph use an F32 matmul,
+// matching MoEStream's existing exact-F32-activation Q8_0 dense path.
+bool dequant_q8_0_rows(const GgmlHcWeightRef &src,
+                       std::vector<float> &dst) {
+  if (!src.exact_f32_q8 || src.type != (uint32_t)GGML_TYPE_Q8_0 ||
+      !src.host_data || src.ne0 <= 0 || src.ne1 <= 0)
+    return false;
+  const size_t row_bytes = ggml_row_size(GGML_TYPE_Q8_0, src.ne0);
+  const size_t rows = (size_t)src.ne1;
+  if (src.nbytes < row_bytes * rows)
+    return false;
+  dst.resize((size_t)src.ne0 * rows);
+  const auto *q = static_cast<const block_q8_0 *>(src.host_data);
+  for (size_t row = 0; row < rows; ++row) {
+    dequantize_row_q8_0(q + row * (row_bytes / sizeof(block_q8_0)),
+                        dst.data() + row * (size_t)src.ne0, src.ne0);
+  }
+  return true;
 }
 
 // All HC graphs use the same shared CUDA backend.  Its main stream is ordered,
@@ -122,6 +153,14 @@ void GgmlHcRunner::shutdown() {
   post_graph_workspace_bytes_ = 0;
   pre_source_layer_ = -1;
   pre_source_sub_block_ = -1;
+  weight_mode_valid_ = false;
+  weight_mode_exact_ = false;
+  weight_mode_custom_ = false;
+  if (custom_xn_) cudaFree(custom_xn_);
+  if (custom_lo_) cudaFree(custom_lo_);
+  if (custom_gate_) cudaFree(custom_gate_);
+  custom_xn_ = custom_lo_ = custom_gate_ = nullptr;
+  custom_capacity_ = 0;
   for (void *&event : pre_done_events_) {
     if (event) {
       ggml_backend_event_free((ggml_backend_event_t)event);
@@ -132,6 +171,10 @@ void GgmlHcRunner::shutdown() {
   if (post_done_event_) {
     ggml_backend_event_free((ggml_backend_event_t)post_done_event_);
     post_done_event_ = nullptr;
+  }
+  if (raw_input_event_) {
+    ggml_backend_event_free((ggml_backend_event_t)raw_input_event_);
+    raw_input_event_ = nullptr;
   }
   pre_in_flight_ = false;
   post_in_flight_ = false;
@@ -188,9 +231,12 @@ bool GgmlHcRunner::ensure(int device, int d_model, int hc_mult,
       (ggml_backend_buffer_t)external_buf_, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
   ggml_backend_dev_t dev = ggml_backend_get_device((ggml_backend_t)backend_);
   post_done_event_ = ggml_backend_event_new(dev);
-  if (!post_done_event_) {
+  raw_input_event_ = ggml_backend_event_new(dev);
+  if (!post_done_event_ || !raw_input_event_) {
     if (post_done_event_) ggml_backend_event_free((ggml_backend_event_t)post_done_event_);
+    if (raw_input_event_) ggml_backend_event_free((ggml_backend_event_t)raw_input_event_);
     post_done_event_ = nullptr;
+    raw_input_event_ = nullptr;
     ggml_gallocr_free((ggml_gallocr_t)galloc_pre_);
     ggml_gallocr_free((ggml_gallocr_t)galloc_post_);
     galloc_pre_ = galloc_post_ = nullptr;
@@ -268,6 +314,41 @@ bool GgmlHcRunner::ensure_state(int S) {
   return true;
 }
 
+bool GgmlHcRunner::ensure_custom_buffers(int S) {
+  if (S <= 0) return false;
+  const size_t capacity = (size_t)std::max(S, 1);
+  if (custom_xn_ && custom_lo_ && custom_gate_ && custom_capacity_ >= capacity)
+    return true;
+
+  // Decode is S=1 today, but use a grow-only allocation so an accidental
+  // device-HC prefill call cannot turn this into a per-token cudaMalloc path.
+  const size_t xn_bytes = capacity * (size_t)hc_dim_ * sizeof(float);
+  const size_t lo_bytes = capacity * (size_t)hc_lr_ * sizeof(float);
+  void *xn = nullptr;
+  void *lo = nullptr;
+  void *gate = nullptr;
+  if (cudaMalloc(&xn, xn_bytes) != cudaSuccess ||
+      cudaMalloc(&lo, lo_bytes) != cudaSuccess ||
+      cudaMalloc(&gate, xn_bytes) != cudaSuccess) {
+    if (xn) cudaFree(xn);
+    if (lo) cudaFree(lo);
+    if (gate) cudaFree(gate);
+    cudaGetLastError();
+    return false;
+  }
+  if (custom_xn_) cudaFree(custom_xn_);
+  if (custom_lo_) cudaFree(custom_lo_);
+  if (custom_gate_) cudaFree(custom_gate_);
+  custom_xn_ = xn;
+  custom_lo_ = lo;
+  custom_gate_ = gate;
+  custom_capacity_ = capacity;
+  LOG_INFO("[GGML-HC-MEM] custom exact-Q8 workspace: %.2f MiB (S_cap=%d)\n",
+           (double)(xn_bytes + lo_bytes + xn_bytes) / (1024.0 * 1024.0),
+           S);
+  return true;
+}
+
 void GgmlHcRunner::free_pre_graph() {
   if (pre_ctx_) {
     ggml_free((ggml_context *)pre_ctx_);
@@ -305,7 +386,19 @@ void GgmlHcRunner::release_completed_weights(int before_layer) {
         ggml_backend_buffer_free((ggml_backend_buffer_t)b.buf);
       }
       if (b.ctx) ggml_free((ggml_context *)b.ctx);
+      // Keep the host-side exact dequantization cached.  Rebuilding a decode
+      // bracket should only allocate/upload its device tensors; repeating the
+      // Q8->F32 conversion for every token would move the bottleneck to the
+      // CPU as soon as the rolling reclaim policy engages.
+      std::vector<float> down_f32 = std::move(b.down_f32);
+      std::vector<float> up_f32 = std::move(b.up_f32);
+      const bool exact_mode = b.exact_f32_q8;
+      const bool custom_mode = b.custom_q8;
       b = Bracket{};
+      b.down_f32 = std::move(down_f32);
+      b.up_f32 = std::move(up_f32);
+      b.exact_f32_q8 = exact_mode;
+      b.custom_q8 = custom_mode;
       ++brackets;
     }
   }
@@ -315,6 +408,66 @@ void GgmlHcRunner::release_completed_weights(int before_layer) {
              "sub=%d\n",
              brackets, (double)reclaimed / (1024.0 * 1024.0),
              pre_source_layer_, pre_source_sub_block_);
+  }
+}
+
+void GgmlHcRunner::release_completed_weights_nonblocking(int before_layer) {
+  if (!backend_ || before_layer <= 0) return;
+
+  size_t reclaimed = 0;
+  int brackets = 0;
+  for (int sb = 0; sb < 2; ++sb) {
+    for (int l = 0; l < before_layer && l < kMaxLayers; ++l) {
+      if (l == pre_source_layer_ && sb == pre_source_sub_block_) continue;
+      Bracket &b = brackets_[sb][l];
+      if (!b.buf && !b.ctx) continue;
+
+      void *event_ptr = pre_done_events_[sb * 256 + l];
+      if (!event_ptr || !((ggml_backend_event_t)event_ptr)->context)
+        continue;
+      const cudaError_t status = cudaEventQuery(
+          (cudaEvent_t)((ggml_backend_event_t)event_ptr)->context);
+      if (status == cudaErrorNotReady) {
+        // cudaEventQuery leaves the expected not-ready status in the CUDA
+        // error slot; clear it so a later unrelated CUDA call is not blamed.
+        cudaGetLastError();
+        continue;
+      }
+      if (status != cudaSuccess) {
+        cudaGetLastError();
+        continue;
+      }
+
+      reclaimed += b.buf
+                       ? ggml_backend_buffer_get_size(
+                             (ggml_backend_buffer_t)b.buf)
+                       : 0;
+      if (b.buf) {
+        ggml_backend_buffer_free((ggml_backend_buffer_t)b.buf);
+        b.buf = nullptr;
+      }
+      if (b.ctx) {
+        ggml_free((ggml_context *)b.ctx);
+        b.ctx = nullptr;
+      }
+      std::vector<float> down_f32 = std::move(b.down_f32);
+      std::vector<float> up_f32 = std::move(b.up_f32);
+      const bool exact_mode = b.exact_f32_q8;
+      const bool custom_mode = b.custom_q8;
+      b = Bracket{};
+      b.down_f32 = std::move(down_f32);
+      b.up_f32 = std::move(up_f32);
+      b.exact_f32_q8 = exact_mode;
+      b.custom_q8 = custom_mode;
+      ++brackets;
+    }
+  }
+  if (brackets > 0) {
+    LOG_STREAM_INFO()
+        << "[GGML-HC-MEM] event reclaim: released " << brackets
+        << " completed brackets ("
+        << (double)reclaimed / (1024.0 * 1024.0)
+        << " MiB) before layer " << before_layer << "\n";
   }
 }
 
@@ -544,7 +697,6 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
       sub_block > 1)
     return false;
   Bracket &b = brackets_[sub_block][layer];
-  if (b.ready) return true;
   if (!norm.host_data || !down.host_data || !up.host_data || !inject.host_data)
     return false;
   if (!type_ok(norm.type) || !type_ok(down.type) || !type_ok(up.type) ||
@@ -563,7 +715,90 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
               (long long)inject.ne0, (long long)inject.ne1);
     return false;
   }
+  const bool custom_mode = down.custom_q8 && up.custom_q8 && inject.custom_q8 &&
+                           down.type == (uint32_t)GGML_TYPE_Q8_0 &&
+                           up.type == (uint32_t)GGML_TYPE_Q8_0 &&
+                           (inject.type == (uint32_t)GGML_TYPE_Q8_0 ||
+                            inject.type == (uint32_t)GGML_TYPE_F32);
+  const bool exact_mode = down.exact_f32_q8 || up.exact_f32_q8;
+  if (weight_mode_valid_ &&
+      (weight_mode_exact_ != exact_mode || weight_mode_custom_ != custom_mode)) {
+    // All brackets from the previous mode may still be referenced by the
+    // persistent graph or by queued CUDA work. One drain makes the whole
+    // mode transition safe; later brackets can be replaced without another
+    // blocking synchronization.
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+    free_pre_graph();
+  }
+  weight_mode_valid_ = true;
+  weight_mode_exact_ = exact_mode;
+  weight_mode_custom_ = custom_mode;
+  if (b.ready && b.exact_f32_q8 == exact_mode && b.custom_q8 == custom_mode)
+    return true;
+  if (b.ready) {
+    // The only normal mode transition is the request-boundary switch from
+    // prefill's quantized graph to decode's exact Q8 graph.  The forward-level
+    // HC collapse has already drained the backend before the next decode
+    // request reaches this point, so replacing this bracket is safe.
+    if (b.buf) {
+      ggml_backend_buffer_free((ggml_backend_buffer_t)b.buf);
+      b.buf = nullptr;
+    }
+    if (b.ctx) {
+      ggml_free((ggml_context *)b.ctx);
+      b.ctx = nullptr;
+    }
+    b.norm = b.down = b.up = b.inject = nullptr;
+    b.ready = false;
+    if (!exact_mode) {
+      b.down_f32.clear();
+      b.up_f32.clear();
+    }
+  }
+  const bool exact_down_q8 = !custom_mode && down.exact_f32_q8 &&
+                             down.type == (uint32_t)GGML_TYPE_Q8_0;
+  const bool exact_up_q8 = !custom_mode && up.exact_f32_q8 &&
+                           up.type == (uint32_t)GGML_TYPE_Q8_0;
+  const size_t down_f32_count = (size_t)down.ne0 * (size_t)down.ne1;
+  const size_t up_f32_count = (size_t)up.ne0 * (size_t)up.ne1;
+  if (exact_down_q8 &&
+      (b.down_f32.size() != down_f32_count) &&
+      !dequant_q8_0_rows(down, b.down_f32)) {
+    LOG_ERROR("[GGML-HC] layer=%d sub=%d invalid Q8_0 down weight\n", layer,
+              sub_block);
+    return false;
+  }
+  if (exact_up_q8 &&
+      (b.up_f32.size() != up_f32_count) &&
+      !dequant_q8_0_rows(up, b.up_f32)) {
+    LOG_ERROR("[GGML-HC] layer=%d sub=%d invalid Q8_0 up weight\n", layer,
+              sub_block);
+    return false;
+  }
+  if (exact_mode && !custom_mode) {
+    // Exact Q8 HC weights are larger than their on-disk quantized form. Keep
+    // completed brackets resident when there is room; otherwise the normal
+    // decode path would repeatedly free/re-upload the same HC matrices. The
+    // allocation-failure path below still performs a definitive reclaim.
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    const cudaError_t mem_status = cudaMemGetInfo(&free_bytes, &total_bytes);
+    constexpr size_t kHcReclaimMargin = (size_t)768 * 1024 * 1024;
+    if (mem_status == cudaSuccess && free_bytes < kHcReclaimMargin) {
+      release_completed_weights_nonblocking(layer);
+    } else if (mem_status != cudaSuccess) {
+      cudaGetLastError();
+    }
+  }
+  const ggml_type down_ggml_type = exact_down_q8 ? GGML_TYPE_F32
+                                                  : (ggml_type)down.type;
+  const ggml_type up_ggml_type = exact_up_q8 ? GGML_TYPE_F32
+                                              : (ggml_type)up.type;
   cudaSetDevice(device_);
+  static const bool no_external_weights = [] {
+    const char *e = std::getenv("MOESTREAM_GGML_HC_NO_EXTERNAL");
+    return e && e[0] == '1';
+  }();
   ggml_context *ctx = nullptr;
   ggml_tensor *tn = nullptr;
   ggml_tensor *td = nullptr;
@@ -578,20 +813,22 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
     ctx = ggml_init(ip);
     if (!ctx) return false;
     tn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, hc_dim_);
-    td = ggml_new_tensor_2d(ctx, (ggml_type)down.type, hc_dim_, hc_lr_);
-    tu = ggml_new_tensor_2d(ctx, (ggml_type)up.type, hc_lr_, hc_dim_);
+    td = ggml_new_tensor_2d(ctx, down_ggml_type, hc_dim_, hc_lr_);
+    tu = ggml_new_tensor_2d(ctx, up_ggml_type, hc_lr_, hc_dim_);
     ti = ggml_new_tensor_2d(ctx, (ggml_type)inject.type, hc_dim_, hc_);
     if (!tn || !td || !tu || !ti) {
       ggml_free(ctx);
       return false;
     }
-    ext_n = external_buf_ && norm.device_data &&
+    ext_n = !no_external_weights && external_buf_ && norm.device_data &&
             norm.device_bytes >= ggml_nbytes(tn);
-    ext_d = external_buf_ && down.device_data &&
+    ext_d = (custom_mode || !exact_down_q8) && !no_external_weights && external_buf_ &&
+            down.device_data &&
             down.device_bytes >= ggml_nbytes(td);
-    ext_u = external_buf_ && up.device_data &&
+    ext_u = (custom_mode || !exact_up_q8) && !no_external_weights && external_buf_ &&
+            up.device_data &&
             up.device_bytes >= ggml_nbytes(tu);
-    ext_i = external_buf_ && inject.device_data &&
+    ext_i = !no_external_weights && external_buf_ && inject.device_data &&
             inject.device_bytes >= ggml_nbytes(ti);
     auto bind_external = [&](ggml_tensor *t, const void *data) {
       t->data = const_cast<void *>(data);
@@ -621,9 +858,7 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
       release_completed_weights(layer);
     }
   }
-  const bool uses_external = norm.device_data && down.device_data &&
-                             up.device_data && inject.device_data &&
-                             external_buf_;
+  const bool uses_external = ext_n && ext_d && ext_u && ext_i;
   if (!buf && !uses_external) {
     LOG_ERROR("[GGML-HC] weight alloc failed for layer=%d sub=%d\n", layer,
               sub_block);
@@ -635,11 +870,17 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
     ggml_backend_tensor_set(tn, norm.host_data, 0,
                             (size_t)hc_dim_ * sizeof(float));
   if (!ext_d)
-    ggml_backend_tensor_set(td, down.host_data, 0,
-                            std::min(down.nbytes, ggml_nbytes(td)));
+    ggml_backend_tensor_set(
+        td, exact_down_q8 ? static_cast<const void *>(b.down_f32.data())
+                          : down.host_data,
+        0, exact_down_q8 ? b.down_f32.size() * sizeof(float)
+                         : std::min(down.nbytes, ggml_nbytes(td)));
   if (!ext_u)
-    ggml_backend_tensor_set(tu, up.host_data, 0,
-                            std::min(up.nbytes, ggml_nbytes(tu)));
+    ggml_backend_tensor_set(
+        tu, exact_up_q8 ? static_cast<const void *>(b.up_f32.data())
+                        : up.host_data,
+        0, exact_up_q8 ? b.up_f32.size() * sizeof(float)
+                       : std::min(up.nbytes, ggml_nbytes(tu)));
   if (!ext_i)
     ggml_backend_tensor_set(ti, inject.host_data, 0,
                             std::min(inject.nbytes, ggml_nbytes(ti)));
@@ -649,9 +890,22 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   b.down = td;
   b.up = tu;
   b.inject = ti;
+  b.exact_f32_q8 = exact_mode;
+  b.custom_q8 = custom_mode;
   b.ready = true;
   const size_t weight_bytes = ggml_nbytes(tn) + ggml_nbytes(td) +
                               ggml_nbytes(tu) + ggml_nbytes(ti);
+  static const bool log_types = [] {
+    const char *e = std::getenv("MOESTREAM_GGML_HC_DEBUG_TYPES");
+    return e && e[0] == '1';
+  }();
+  if (log_types) {
+    LOG_INFO("[GGML-HC-MEM] types: layer=%d sub=%d norm=%u down=%u up=%u "
+             "inject=%u external=%s\n",
+             layer, sub_block, norm.type, (unsigned)down_ggml_type,
+             (unsigned)up_ggml_type, inject.type,
+             uses_external ? "yes" : "no");
+  }
   LOG_INFO("[GGML-HC-MEM] weights: layer=%d sub=%d %.2f MiB (%s)\n", layer,
            sub_block, (double)weight_bytes / (1024.0 * 1024.0),
            uses_external ? "borrowed dense pool" : "private buffer");
@@ -702,17 +956,53 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
   if (!ensure_post_graph(S)) return false;
   const Bracket &b = brackets_[sub_block][layer];
   cudaSetDevice(device_);
-  if (!ensure_pre_graph(S, b, layer, sub_block)) return false;
-  // The persistent graph is allocated once per request shape.  Its stable
-  // source metadata has just been rebound to this layer's HC weights, so
-  // submitting it does not reset/reuse a temporary allocator while the prior
-  // layer is still queued.
-  ggml_cgraph *gf = (ggml_cgraph *)pre_graph_;
-  const ggml_status st =
-      ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);
-  if (st != GGML_STATUS_SUCCESS) {
-    LOG_ERROR("[GGML-HC] pre_mix compute failed (status=%d)\n", (int)st);
-    return false;
+  if (S == 1) {
+    // In Qwen device-HC decode, GgmlMoeRunner's direct-input optimization
+    // aliases its reusable graph input to t_mixed_.  The previous layer's
+    // MoE graph may still be reading that tensor when this pre-mix graph is
+    // about to overwrite it.  Publish the dependency on the shared backend
+    // stream instead of synchronizing the host at every layer.
+    GgmlMoeRunner::queue_input_reuse_dependency();
+  }
+  if (b.custom_q8) {
+    if (!ensure_custom_buffers(S)) return false;
+    // The previous post graph updates t_streams_ on GGML's nonblocking
+    // backend stream. Import that completion before the custom kernels read
+    // the persistent state on CUDA's legacy stream.
+    if (post_in_flight_ && post_done_event_ &&
+        ((ggml_backend_event_t)post_done_event_)->context) {
+      cudaStreamWaitEvent(
+          0, (cudaEvent_t)((ggml_backend_event_t)post_done_event_)->context,
+          0);
+    }
+    const auto *streams = (const ggml_tensor *)t_streams_;
+    const auto *norm = (const ggml_tensor *)b.norm;
+    const auto *down = (const ggml_tensor *)b.down;
+    const auto *up = (const ggml_tensor *)b.up;
+    const auto *inject = (const ggml_tensor *)b.inject;
+    launch_qwen4exp_hc_q8_pre(
+        static_cast<float *>(streams->data),
+        static_cast<const float *>(norm->data),
+        static_cast<float *>(custom_xn_), static_cast<float *>(custom_lo_),
+        static_cast<float *>(custom_gate_),
+        static_cast<float *>(((ggml_tensor *)t_mixed_)->data),
+        static_cast<float *>(((ggml_tensor *)t_inject_)->data), down->data,
+        up->data,
+        inject->data, S, hc_, d_model_, hc_lr_, eps_,
+        inject->type == GGML_TYPE_Q8_0 ? 1 : 0, 0);
+  } else {
+    // The persistent graph is allocated once per request shape. Its stable
+    // source metadata has just been rebound to this layer's HC weights, so
+    // submitting it does not reset/reuse a temporary allocator while the
+    // prior layer is still queued.
+    if (!ensure_pre_graph(S, b, layer, sub_block)) return false;
+    ggml_cgraph *gf = (ggml_cgraph *)pre_graph_;
+    const ggml_status st =
+        ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);
+    if (st != GGML_STATUS_SUCCESS) {
+      LOG_ERROR("[GGML-HC] pre_mix compute failed (status=%d)\n", (int)st);
+      return false;
+    }
   }
   const int event_index = sub_block * 256 + layer;
   if (!pre_done_events_[event_index]) {
@@ -726,8 +1016,14 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
     }
   }
   active_pre_done_event_ = pre_done_events_[event_index];
-  ggml_backend_event_record((ggml_backend_event_t)active_pre_done_event_,
-                            (ggml_backend_t)backend_);
+  if (b.custom_q8) {
+    cudaEventRecord(
+        (cudaEvent_t)((ggml_backend_event_t)active_pre_done_event_)->context,
+        0);
+  } else {
+    ggml_backend_event_record((ggml_backend_event_t)active_pre_done_event_,
+                              (ggml_backend_t)backend_);
+  }
   pre_in_flight_ = true;
   if (debug_sync_hc())
     ggml_backend_synchronize((ggml_backend_t)backend_);
@@ -766,11 +1062,18 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
     }
   }
   if (out_hidden) {
-    // tensor_get synchronizes GGML's copy stream, not the shared compute
-    // stream on which pre_mix was queued.
-    ggml_backend_synchronize((ggml_backend_t)backend_);
-    ggml_backend_tensor_get((ggml_tensor *)t_mixed_, out_hidden, 0,
-                            (size_t)S * d_model_ * sizeof(float));
+    if (b.custom_q8) {
+      cudaEventSynchronize(
+          (cudaEvent_t)((ggml_backend_event_t)active_pre_done_event_)->context);
+      cudaMemcpy(out_hidden, ((ggml_tensor *)t_mixed_)->data,
+                 (size_t)S * d_model_ * sizeof(float), cudaMemcpyDeviceToHost);
+    } else {
+      // tensor_get synchronizes GGML's copy stream, not the shared compute
+      // stream on which pre_mix was queued.
+      ggml_backend_synchronize((ggml_backend_t)backend_);
+      ggml_backend_tensor_get((ggml_tensor *)t_mixed_, out_hidden, 0,
+                              (size_t)S * d_model_ * sizeof(float));
+    }
   }
   if (device_output) *device_output = t_mixed_;
   inject_valid_S_ = S;
@@ -856,14 +1159,33 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
                 layer, sub_block, S, device_bytes, bytes);
       return false;
     }
-    const cudaError_t copy_status = cudaMemcpy(
-        so_flat->data, device_sub_block_out, bytes, cudaMemcpyDeviceToDevice);
-    if (copy_status != cudaSuccess) {
-      LOG_ERROR("[GGML-HC] post_combine raw device copy failed (layer=%d "
-                "sub=%d S=%d): %s\n",
-                layer, sub_block, S, cudaGetErrorString(copy_status));
+    if (!raw_input_event_ ||
+        !((ggml_backend_event_t)raw_input_event_)->context) {
+      LOG_ERROR("[GGML-HC] raw post-combine dependency event unavailable\n");
       return false;
     }
+    // Full-attention's producer kernels run on CUDA stream 0. Queue the
+    // device-to-device handoff on that same stream, then bridge it to the
+    // shared GGML stream with one event. The old blocking cudaMemcpy forced
+    // the CPU to wait for every attention layer before HC could be queued.
+    const cudaError_t copy_status = cudaMemcpyAsync(
+        so_flat->data, device_sub_block_out, bytes, cudaMemcpyDeviceToDevice,
+        0);
+    const cudaError_t event_status =
+        copy_status == cudaSuccess
+            ? cudaEventRecord(
+                  (cudaEvent_t)((ggml_backend_event_t)raw_input_event_)->context,
+                  0)
+            : copy_status;
+    if (copy_status != cudaSuccess || event_status != cudaSuccess) {
+      LOG_ERROR("[GGML-HC] post_combine raw device copy failed (layer=%d "
+                "sub=%d S=%d): %s\n",
+                layer, sub_block, S, cudaGetErrorString(
+                    copy_status != cudaSuccess ? copy_status : event_status));
+      return false;
+    }
+    ggml_backend_event_wait((ggml_backend_t)backend_,
+                            (ggml_backend_event_t)raw_input_event_);
   } else {
     // GgmlMoeRunner's graph output is [D,S] F32 contiguous and `so` now has
     // the exact same layout. Both runners borrow ggml_shared_backend(device),
@@ -958,6 +1280,7 @@ void GgmlHcRunner::shutdown() {}
 bool GgmlHcRunner::ensure(int, int, int, int, float) { return false; }
 bool GgmlHcRunner::ensure_state(int) { return false; }
 bool GgmlHcRunner::weights_ready(int, int) const { return false; }
+void GgmlHcRunner::release_completed_weights_nonblocking(int) {}
 bool GgmlHcRunner::ensure_weights(int, int, const GgmlHcWeightRef &,
                                   const GgmlHcWeightRef &,
                                   const GgmlHcWeightRef &,

@@ -233,11 +233,17 @@ inline void set_moe_ggml_shared_expert(bool v) {
 // and does not imply Qwen4Exp router semantics.
 inline bool &moe_ggml_gpu_router_flag() { static bool v = false; return v; }
 inline bool moe_ggml_gpu_router() {
-  static const bool env = [] {
+  // Unlike the older feature flags, this one needs an explicit `=0` escape
+  // hatch for performance A/B tests: the config setter may enable it for a
+  // Qwen profile, while a run can still compare the existing AVX-512 host
+  // router without making a temporary config copy.  The override is scoped
+  // to this Qwen-only feature; other model routers do not consult it.
+  static const int env_override = [] {
     const char *e = std::getenv("MOESTREAM_GGML_GPU_ROUTER");
-    return e && e[0] == '1';
+    if (!e || !e[0]) return -1;
+    return e[0] == '1' ? 1 : 0;
   }();
-  return env || moe_ggml_gpu_router_flag();
+  return env_override >= 0 ? env_override != 0 : moe_ggml_gpu_router_flag();
 }
 inline void set_moe_ggml_gpu_router(bool v) { moe_ggml_gpu_router_flag() = v; }
 
@@ -1091,7 +1097,8 @@ inline void set_gpu1_predict_promote_config(bool enabled, int rank_start, int ra
 }
 
 inline void dense_proj(StreamingEngine& engine, const std::string& wname,
-                       const float* x, float* y, int S, int I, int O) {
+                       const float* x, float* y, int S, int I, int O,
+                       bool force_original_quant = false) {
     auto it = engine.resident_layers.find(wname);
     if (it == engine.resident_layers.end() || !it->second.host_ptr) {
         LOG_WARN("[DENSE] missing weight %s — zeroing output\n", wname.c_str());
@@ -1122,7 +1129,7 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
     //    BF16 activation, dense_matmul_bf16_matched_host), verified correct
     //    in isolation via Test 10 (real hardware) before being wired in
     //    here.
-    if (!cpu_only_mode() && engine.gpu && W.gpu_fast_ptr &&
+    if (!force_original_quant && !cpu_only_mode() && engine.gpu && W.gpu_fast_ptr &&
         engine.gpu->dense_matmul_bf16_matched_host(W.gpu_fast_ptr, x, y, S, I, O)) {
         return;
     }

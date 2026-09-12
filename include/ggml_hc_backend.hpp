@@ -37,6 +37,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 // The HC/GDN/MoE runners share one GGML CUDA backend stream. When enabled,
 // graph temporaries are reused by stream order instead of waiting on a host
@@ -57,6 +58,14 @@ struct GgmlHcWeightRef {
   int64_t ne0 = 0;  // input dim  (ggml src0 ne0 -- the contracted axis)
   int64_t ne1 = 0;  // output dim
   size_t nbytes = 0;
+  // Qwen4Exp device-HC mode opts into an exact F32-activation matmul for
+  // Q8_0 down/up projections.  Other GGML HC users retain the normal GGML
+  // quantized graph path.
+  bool exact_f32_q8 = false;
+  // Qwen-only fused implementation: keep Q8_0 weights compressed and use an
+  // exact F32-activation CUDA dot product.  This is separate from the F32
+  // expansion reference path so the latter remains available for validation.
+  bool custom_q8 = false;
 };
 
 class GgmlHcRunner {
@@ -115,6 +124,17 @@ class GgmlHcRunner {
   // has to fall back to the older host attention path.
   bool copy_pre_mix_to_host(const void *device_data, float *host, int S);
 
+  // Opaque GGML tensor for the persistent [D, HC, S] HC state. This is used
+  // only by Qwen's device-side router pilot; callers must not retain it past
+  // the current forward pass or treat it as a host pointer.
+  const void *device_streams_tensor() const { return t_streams_; }
+
+  // Opaque GGML tensor for the persistent [D,S] mixed activation produced by
+  // pre_mix().  Keep the producer handle authoritative at this boundary;
+  // callers must not substitute its raw CUDA data pointer because downstream
+  // GGML graph builders need the tensor shape/stride metadata as well.
+  const void *device_mixed_tensor() const { return t_mixed_; }
+
   // Queue the completion dependency for the most recent pre_mix on the
   // shared GGML stream and on CUDA's legacy stream. This is device-side
   // ordering only; it does not block the host thread.
@@ -140,10 +160,24 @@ class GgmlHcRunner {
     void *down = nullptr;
     void *up = nullptr;
     void *inject = nullptr;
+    // GGML's CUDA Q8_0 matmul quantizes the F32 activation to Q8_1 before
+    // the dot product.  That approximation is fine for ordinary model
+    // projections, but HC's low-rank gate is also used as the next-layer
+    // router input: the resulting small error changes expert IDs.  Keep an
+    // exact F32 dequantization for Q8_0 HC down/up weights, owned by the
+    // bracket for the lifetime of the graph metadata.
+    std::vector<float> down_f32;
+    std::vector<float> up_f32;
+    // Whether this bracket was built for exact Q8 decode mode.  Prefill keeps
+    // the original quantized graph; decode can rebuild a bracket with exact
+    // F32 projections without confusing the persistent graph's source types.
+    bool exact_f32_q8 = false;
+    bool custom_q8 = false;
     bool ready = false;
   };
 
   bool ensure_state(int S);
+  bool ensure_custom_buffers(int S);
   bool ensure_pre_graph(int S, const Bracket &b, int layer, int sub_block);
   bool ensure_post_graph(int S);
   // Called only after a device weight allocation fails.  The completed
@@ -151,6 +185,10 @@ class GgmlHcRunner {
   // them after one backend barrier and retry the allocation.  Keep the
   // bracket used as the persistent pre-graph's source metadata alive.
   void release_completed_weights(int before_layer);
+  // Opportunistic version used before an exact decode bracket is allocated.
+  // CUDA event polling reclaims completed weights without a host-side backend
+  // synchronization on the normal device-HC path.
+  void release_completed_weights_nonblocking(int before_layer);
   void free_pre_graph();
   bool post_combine_impl(int layer, int sub_block, int S,
                          const float *host_sub_block_out,
@@ -194,6 +232,19 @@ class GgmlHcRunner {
   uint32_t pre_inject_type_ = 0;
   int pre_source_layer_ = -1;
   int pre_source_sub_block_ = -1;
+  // Weight storage can switch between prefill's quantized graph and decode's
+  // exact-Q8 graph. A transition needs one backend drain before old tensor
+  // buffers are replaced, not one drain per layer/sub-block bracket.
+  bool weight_mode_valid_ = false;
+  bool weight_mode_exact_ = false;
+  bool weight_mode_custom_ = false;
+
+  // Small persistent work buffers used only by the explicit custom Q8 decode
+  // mode. They avoid a large F32 copy of every Q8 HC bracket.
+  void *custom_xn_ = nullptr;
+  void *custom_lo_ = nullptr;
+  void *custom_gate_ = nullptr;
+  size_t custom_capacity_ = 0;
 
   // The post-combine graph is built once for the active request shape and
   // reused for every layer/sub-block.  Rebuilding it at the handoff point
@@ -219,6 +270,10 @@ class GgmlHcRunner {
   void *pre_done_events_[kPreDoneEventCount] = {}; // ggml_backend_event_t
   void *active_pre_done_event_ = nullptr;          // current bracket's event
   void *post_done_event_ = nullptr;  // ggml_backend_event_t
+  // Producer fence for a raw CUDA attention output copied into the shared
+  // GGML post graph. The event is recorded on CUDA stream 0 and waited on by
+  // the GGML backend stream, so the D2D handoff need not block the host.
+  void *raw_input_event_ = nullptr;  // ggml_backend_event_t
   bool pre_in_flight_ = false;
   bool post_in_flight_ = false;
 

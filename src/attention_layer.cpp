@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <limits>
+#include <unordered_map>
 
 extern bool qwen4exp_hc_device_live();
 
@@ -2063,15 +2065,17 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
         PERF_START(gdnfull);
         const void *device_output = nullptr;
         bool full_ok = false;
+        bool device_full_ok = false;
         bool host_input_ready = true;
         bool device_state_attempted = false;
         if (engine.qwen4exp_device_hc_input) {
             if (!force_gdn_full_host()) {
                 device_state_attempted = true;
-                full_ok = GgmlGdnProjRunner::instance().run_full_device_tensor(
+                device_full_ok = GgmlGdnProjRunner::instance().run_full_device_tensor(
                     layer_idx, engine.qwen4exp_device_hc_input, S, &device_output,
                     conv_hist.data(), d_conv, recur_state.data(), c.eps,
                     /*device_state_resident=*/S == 1);
+                full_ok = device_full_ok;
             }
             if (full_ok) {
                 engine.qwen4exp_device_attn_output = device_output;
@@ -2102,6 +2106,13 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
                 d_conv, recur_state.data(), c.eps);
         }
         if (full_ok) {
+            if (device_full_ok) {
+                perf().n_gdn_full_device_success.fetch_add(
+                    1, std::memory_order_relaxed);
+            } else {
+                perf().n_gdn_full_host_success.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
             PERF_END(gdnfull, t_gdn_full);
             log_gdn_full_stats("output", layer_idx, out_context, S, D);
             if (!engine.qwen4exp_device_attn_output_ready)
@@ -2109,6 +2120,11 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
                                   out_context, (size_t)S * D, D);
             return;
         }
+        if (device_state_attempted)
+            perf().n_gdn_full_device_failure.fetch_add(
+                1, std::memory_order_relaxed);
+        perf().n_gdn_full_split_fallback.fetch_add(
+            1, std::memory_order_relaxed);
     }
 
     bool gdn_proj_ggml_ok = false;   // 4 projections fused; qkv still needs step 2's own conv
@@ -2193,14 +2209,14 @@ static void qwen4exp_gdn_gguf(StreamingEngine& engine, int layer_idx,
     PERF_START(gdnl2);
     // Both loops below are per-token independent (each s writes only its own
     // rows of Q/K/V), so parallelising leaves them bit-identical.
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
     for (int s = 0; s < S; ++s) {
         const float* src = conv_out + (size_t)s * conv_dim;
         std::memcpy(Q + (size_t)s * key_dim, src, (size_t)key_dim * sizeof(float));
         std::memcpy(K + (size_t)s * key_dim, src + key_dim, (size_t)key_dim * sizeof(float));
         std::memcpy(V + (size_t)s * value_dim, src + 2 * key_dim, (size_t)value_dim * sizeof(float));
     }
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
     for (int s = 0; s < S; ++s) {
         for (int h = 0; h < H_k; ++h) {
             qwen4exp_l2_norm_inplace(Q + ((size_t)s * H_k + h) * hd, hd, c.eps);
@@ -2972,16 +2988,20 @@ void dsv4_attention_gguf(
     // would only surface (if at all) at the post-RoPE check below, one
     // stage later than necessary.
     check_finite_attn("Q (post attn_q_a/q_a_norm/q_b projection, pre-RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
-    // Weightless per-head RMSNorm on the full [qh] Q vector -- see
-    // rmsnorm_inplace_noweight's own comment above. Must run BEFORE the
-    // RoPE loop below, matching deepseek4.cpp's ordering (norm, then split
-    // nope/pe, then RoPE on the pe half only).
-    for (int s = 0; s < S; ++s) {
-        for (int h = 0; h < H; ++h) {
-            rmsnorm_inplace_noweight(Q.data() + ((size_t)s * H + h) * qh, qh, c.eps);
+    // The original V4 path has a weightless per-head RMSNorm here. V4.1's
+    // reference Attention applies only q_a_norm before q_b, so skip that
+    // legacy normalization when this function is used for V4.1 ratio-zero
+    // layers.
+    if (engine.family_ops.family != ModelFamily::DeepSeek_V41) {
+        for (int s = 0; s < S; ++s) {
+            for (int h = 0; h < H; ++h) {
+                rmsnorm_inplace_noweight(
+                    Q.data() + ((size_t)s * H + h) * qh, qh, c.eps);
+            }
         }
+        check_finite_attn("Q (post per-head RMSNorm, pre-RoPE)", layer_idx,
+                          Q.data(), Q.size(), H * qh);
     }
-    check_finite_attn("Q (post per-head RMSNorm, pre-RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
     // CSA/HCA use the checkpoint's dedicated compressed-RoPE base plus
     // YaRN scaling; raw-SWA layers stay on the plain V4 RoPE path.
     for (int s = 0; s < S; ++s) {
@@ -2999,8 +3019,9 @@ void dsv4_attention_gguf(
 
     // ---- 3. project raw KV and update any compressed-state machine. ----
     PERF_START(dsv4_kvproj);
+    std::vector<float> raw_kv_prefill((size_t)S * qh);
     {
-        std::vector<float> kv((size_t)S * qh);
+        std::vector<float> &kv = raw_kv_prefill;
         dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D, qh);
         check_finite_attn("kv (post attn_kv projection, pre-norm/RoPE)", layer_idx, kv.data(), kv.size(), qh);
         rmsnorm_proj(engine, p + "attn_kv_a_norm.weight", kv.data(), kv.data(), S, qh, c.eps);
@@ -3240,6 +3261,11 @@ void dsv4_attention_gguf(
     // DeepSeek-V4's attention scale is always plain 1/sqrt(head_size), even
     // when CSA/HCA use compressed RoPE/YaRN for Q and K.
     const float attn_scale = 1.0f / std::sqrt((float)qh);
+    auto raw_key = [&](int abs_pos) -> const float * {
+        if (pos_base == 0 && abs_pos >= 0 && abs_pos < S)
+            return raw_kv_prefill.data() + (size_t)abs_pos * qh;
+        return engine.KVc[layer_idx] + (int64_t)(abs_pos % window) * qh;
+    };
 
     // dsv4_score_gpu: try ONE joint GPU softmax over [raw window | HCA
     // compressed rows | sink] for the whole [H,qh] token at once, decode
@@ -3292,7 +3318,6 @@ void dsv4_attention_gguf(
             int past_context_len = std::min(current_pos + 1, window);
 
             const float* head_q = Q.data() + ((size_t)s * H + h) * qh;
-            const float* layer_kv_cache = engine.KVc[layer_idx];
             const std::vector<int>* selected_csa =
                 (compressed && compressed_state->is_csa()) ? &csa_selected[(size_t)s] : nullptr;
             const int hca_visible = (compressed && compressed_state->is_hca())
@@ -3321,8 +3346,7 @@ void dsv4_attention_gguf(
                 // (current_pos - past_context_len + 1); ring slot for the
                 // absolute position current_pos-past_context_len+1+t.
                 int abs_pos = current_pos - past_context_len + 1 + t;
-                int slot = abs_pos % window;
-                const float* cached = layer_kv_cache + (int64_t)slot * qh;
+                const float* cached = raw_key(abs_pos);
                 attn_scores[(size_t)t] = score_key(cached);
             }
             for (int i = 0; i < compressed_count; ++i) {
@@ -3339,8 +3363,7 @@ void dsv4_attention_gguf(
 
             for (int t = 0; t < past_context_len; ++t) {
                 int abs_pos = current_pos - past_context_len + 1 + t;
-                int slot = abs_pos % window;
-                const float* cached = layer_kv_cache + (int64_t)slot * qh;
+                const float* cached = raw_key(abs_pos);
                 float w = attn_scores[t];
                 for (int i = 0; i < qh; ++i) head_out_dest[i] += w * cached[i];
             }
@@ -3510,6 +3533,353 @@ void dsv4_attention_gguf(
     dense_proj(engine, p + "attn_output_b.weight", grouped_out.data(), out_context, S, o_groups * o_rank, D);
     check_finite_attn("out_context (post attn_output_b projection)", layer_idx, out_context, (size_t)S * D, D);
     PERF_END(dsv4_outproj, t_attn_outproj);
+}
+
+namespace {
+
+bool dsv41_load_f32(const StreamingEngine &engine, const std::string &name,
+                    size_t expected, std::vector<float> &out) {
+    auto it = engine.resident_layers.find(name);
+    if (it == engine.resident_layers.end() || !it->second.host_ptr)
+        return false;
+    uint64_t n = 1;
+    for (uint64_t dim : it->second.meta.shape) n *= dim;
+    if (n != expected) return false;
+    out.resize(expected);
+    if (it->second.meta.type == GGUFType::F32)
+        std::memcpy(out.data(), it->second.host_ptr, expected * sizeof(float));
+    else
+        dequant_row(it->second.meta.type, it->second.host_ptr, out.data(),
+                    (int)expected);
+    return true;
+}
+
+} // namespace
+
+// DeepSeek-V4.1 attention. Ratio-zero layers are delegated to the already
+// verified V4 raw-SWA implementation. Compressed layers use V4.1's own
+// ratio-1/2 pooling and shared source-layer caches; its indexer is the direct
+// wk/k_norm path from the pooled latent (V4's overlap compressor is absent).
+void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
+                          const float *hidden_states, int S, int pos_base,
+                          float *out_context) {
+    const auto &c = engine.model_file.architecture_config;
+    const int ratio = (layer_idx >= 0 &&
+                       layer_idx < (int)c.dsv4_compress_ratios.size())
+                          ? (int)c.dsv4_compress_ratios[(size_t)layer_idx]
+                          : 0;
+    if (layer_idx == 0 && pos_base == 0) {
+        for (auto &state : engine.dsv41_compressed) state.reset();
+        engine.dsv41_candidate_positions.clear();
+    }
+    if (ratio == 0) {
+        dsv4_attention_gguf(engine, layer_idx, hidden_states, S, pos_base,
+                            out_context);
+        return;
+    }
+
+    const int H = c.n_heads;
+    const int D = c.hidden;
+    const int nope = c.qk_nope;
+    const int rope = c.qk_rope;
+    const int qh = nope + rope;
+    const int q_lora = engine.model_file.get_config_int("attention.q_lora_rank", 2048);
+    const int window = engine.sliding_window > 0 ? engine.sliding_window : engine.max_t;
+    const std::string p = "blk." + std::to_string(layer_idx) + ".";
+    const float rope_theta = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
+    const float rope_theta_v41 = c.dsv4_compress_rope_freq_base;
+
+    if (layer_idx >= (int)engine.dsv41_kv_source_for_layer.size() ||
+        layer_idx >= (int)engine.dsv41_index_source_for_layer.size()) {
+        LOG_ERROR("[DSV41] layer %d has no source map\n", layer_idx);
+        std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+        return;
+    }
+    const int kv_source = engine.dsv41_kv_source_for_layer[(size_t)layer_idx];
+    const int index_source =
+        engine.dsv41_index_source_for_layer[(size_t)layer_idx];
+    if (kv_source < 0 || kv_source >= (int)engine.dsv41_compressed.size() ||
+        !engine.dsv41_compressed[(size_t)kv_source].enabled()) {
+        LOG_ERROR("[DSV41] layer %d has no usable compressed KV source\n", layer_idx);
+        std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+        return;
+    }
+    Dsv41CompressedLayerState &state =
+        engine.dsv41_compressed[(size_t)kv_source];
+    const bool owns_kv = kv_source == layer_idx;
+    const bool owns_index = index_source == layer_idx;
+
+    std::vector<float> normed((size_t)S * D);
+    rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(),
+                 S, D, c.eps);
+    std::vector<float> ql((size_t)S * q_lora);
+    dense_proj(engine, p + "attn_q_a.weight", normed.data(), ql.data(), S, D,
+               q_lora);
+    rmsnorm_proj(engine, p + "attn_q_a_norm.weight", ql.data(), ql.data(), S,
+                 q_lora, c.eps);
+
+    std::vector<float> Q((size_t)S * H * qh);
+    dense_proj(engine, p + "attn_q_b.weight", ql.data(), Q.data(), S, q_lora,
+               H * qh);
+    for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < H; ++h) {
+            float *qrow = Q.data() + ((size_t)s * H + h) * qh;
+            rope_yarn_inplace(qrow + nope, rope, pos_base + s,
+                              rope_theta_v41, c.rope_ext_factor,
+                              c.rope_freq_scale, c.rope_attn_factor,
+                              c.rope_yarn_log_mul, c.rope_n_ctx_orig, true);
+        }
+    }
+
+    // Raw sliding-window KV always belongs to the current layer.
+    std::vector<float> kv((size_t)S * qh);
+    dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D,
+               qh);
+    rmsnorm_proj(engine, p + "attn_kv_a_norm.weight", kv.data(), kv.data(), S,
+                 qh, c.eps);
+    for (int s = 0; s < S; ++s) {
+        const int pos = pos_base + s;
+        rope_yarn_inplace(kv.data() + (size_t)s * qh + nope, rope, pos,
+                          rope_theta_v41, c.rope_ext_factor, c.rope_freq_scale,
+                          c.rope_attn_factor, c.rope_yarn_log_mul,
+                          c.rope_n_ctx_orig, true);
+        const int slot = pos % window;
+        std::memcpy(engine.KVc[(size_t)layer_idx] + (size_t)slot * qh,
+                    kv.data() + (size_t)s * qh, (size_t)qh * sizeof(float));
+    }
+
+    // The source layer publishes pooled compressed KV.  The source's indexer
+    // consumes the same latent before compressed RoPE is applied.
+    if (owns_kv) {
+        std::vector<float> comp_kv((size_t)S * qh);
+        dense_proj(engine, p + "attn_compressor_kv.weight", normed.data(),
+                   comp_kv.data(), S, D, qh);
+        std::vector<float> comp_gate;
+        if (ratio > 1) {
+            comp_gate.resize((size_t)S * qh);
+            dense_proj(engine, p + "attn_compressor_gate.weight", normed.data(),
+                       comp_gate.data(), S, D, qh);
+        }
+        std::vector<float> comp_norm;
+        if (!dsv41_load_f32(engine, p + "attn_compressor_norm.weight", qh,
+                            comp_norm)) {
+            LOG_ERROR("[DSV41] layer %d missing attn_compressor_norm\n", layer_idx);
+            std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+            return;
+        }
+        std::vector<float> latent(qh);
+        for (int s = 0; s < S; ++s) {
+            const int pos = pos_base + s;
+            const float *src_kv = comp_kv.data() + (size_t)s * qh;
+            if (ratio == 1) {
+                std::memcpy(latent.data(), src_kv, (size_t)qh * sizeof(float));
+                rmsnorm_row(latent.data(), latent.data(), comp_norm.data(), qh,
+                            c.eps);
+            } else {
+                const int slot = pos % ratio;
+                std::memcpy(state.pending_kv.data() + (size_t)slot * qh,
+                            src_kv, (size_t)qh * sizeof(float));
+                std::memcpy(state.pending_score.data() + (size_t)slot * qh,
+                            comp_gate.data() + (size_t)s * qh,
+                            (size_t)qh * sizeof(float));
+                state.pending_count = std::max(state.pending_count, slot + 1);
+                if ((pos + 1) % ratio != 0) continue;
+                for (int d = 0; d < qh; ++d) {
+                    float mx = -std::numeric_limits<float>::infinity();
+                    for (int t = 0; t < ratio; ++t)
+                        mx = std::max(mx, state.pending_score[(size_t)t * qh + d]);
+                    float denom = 0.0f, value = 0.0f;
+                    for (int t = 0; t < ratio; ++t) {
+                        const float w = std::exp(state.pending_score[(size_t)t * qh + d] - mx);
+                        denom += w;
+                        value += w * state.pending_kv[(size_t)t * qh + d];
+                    }
+                    latent[(size_t)d] = denom > 0.0f ? value / denom : 0.0f;
+                }
+                rmsnorm_row(latent.data(), latent.data(), comp_norm.data(), qh,
+                            c.eps);
+            }
+            const int block = pos / ratio;
+            if (block < 0 || block >= state.cache_capacity) continue;
+            // The indexer's wk/k_norm consumes the RoPE-free latent. Only
+            // after publishing that side cache may the attention copy be
+            // rotated and stored in the compressed KV cache.
+            if (state.indexer_key_dim > 0) {
+                std::vector<float> ik(c.dsv4_indexer_key_length);
+                dense_proj(engine, p + "indexer.attn_k.weight", latent.data(),
+                           ik.data(), 1, qh,
+                           c.dsv4_indexer_key_length);
+                rmsnorm_proj(engine, p + "indexer.k_norm.weight", ik.data(),
+                             ik.data(), 1, c.dsv4_indexer_key_length, c.eps);
+                // Only the indexer's RoPE tail is rotated; the key cache is
+                // otherwise the normalized projection of the unrotated latent.
+                rope_yarn_inplace(
+                    ik.data() + c.dsv4_indexer_key_length - rope, rope,
+                    pos + 1 - ratio, rope_theta_v41, c.rope_ext_factor,
+                    c.rope_freq_scale, c.rope_attn_factor, c.rope_yarn_log_mul,
+                    c.rope_n_ctx_orig, true);
+                std::memcpy(state.indexer_keys.data() +
+                                (size_t)block * c.dsv4_indexer_key_length,
+                            ik.data(),
+                            (size_t)c.dsv4_indexer_key_length * sizeof(float));
+            }
+            rope_yarn_inplace(latent.data() + nope, rope, pos + 1 - ratio,
+                              rope_theta_v41, c.rope_ext_factor,
+                              c.rope_freq_scale, c.rope_attn_factor,
+                              c.rope_yarn_log_mul, c.rope_n_ctx_orig, true);
+            std::memcpy(state.keys.data() + (size_t)block * qh, latent.data(),
+                        (size_t)qh * sizeof(float));
+        }
+    }
+
+    // Index source layers publish the compressed positions used by all
+    // following consumers until the next source. The compact CPU top-k is
+    // deterministic and mirrors llama.cpp's sort-by-position result.
+    if (owns_index) {
+        if (state.indexer_keys.empty()) {
+            LOG_ERROR("[DSV41] layer %d has no indexer key cache\n", layer_idx);
+            std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+            return;
+        }
+        std::vector<float> iq((size_t)S * c.dsv4_indexer_head_count *
+                              c.dsv4_indexer_key_length);
+        std::vector<float> iw((size_t)S * c.dsv4_indexer_head_count);
+        dense_proj(engine, p + "indexer.attn_q_b.weight", ql.data(), iq.data(),
+                   S, q_lora,
+                   c.dsv4_indexer_head_count * c.dsv4_indexer_key_length);
+        dense_proj(engine, p + "indexer.proj.weight", normed.data(), iw.data(),
+                   S, D, c.dsv4_indexer_head_count);
+        for (int s = 0; s < S; ++s) {
+            const int pos = pos_base + s;
+            const int visible = std::min(
+                dsv4_completed_compressed_blocks(pos, ratio),
+                state.cache_capacity);
+            for (int h = 0; h < c.dsv4_indexer_head_count; ++h) {
+                rope_yarn_inplace(
+                    iq.data() +
+                        ((size_t)s * c.dsv4_indexer_head_count + h) *
+                            c.dsv4_indexer_key_length +
+                        c.dsv4_indexer_key_length - rope,
+                    rope, pos, rope_theta_v41, c.rope_ext_factor,
+                    c.rope_freq_scale, c.rope_attn_factor, c.rope_yarn_log_mul,
+                    c.rope_n_ctx_orig, true);
+            }
+            std::vector<float> scores((size_t)visible, 0.0f);
+            const float scale = 1.0f / std::sqrt(
+                (float)(c.dsv4_indexer_key_length * c.dsv4_indexer_head_count));
+            for (int block = 0; block < visible; ++block) {
+                const float *key = state.indexer_keys.data() +
+                                   (size_t)block * c.dsv4_indexer_key_length;
+                float score = 0.0f;
+                for (int h = 0; h < c.dsv4_indexer_head_count; ++h) {
+                    const float *q = iq.data() +
+                        ((size_t)s * c.dsv4_indexer_head_count + h) *
+                            c.dsv4_indexer_key_length;
+                    float dot = 0.0f;
+                    for (int d = 0; d < c.dsv4_indexer_key_length; ++d)
+                        dot += q[d] * key[d];
+                    score += std::max(0.0f, dot) *
+                             iw[(size_t)s * c.dsv4_indexer_head_count + h] * scale;
+                }
+                scores[(size_t)block] = score;
+            }
+            if (engine.dsv41_candidate_positions.size() != (size_t)S)
+                engine.dsv41_candidate_positions.resize((size_t)S);
+            engine.dsv41_candidate_positions[(size_t)s] =
+                dsv4_top_k_indices(scores, c.dsv4_indexer_top_k);
+        }
+    }
+
+    if (engine.dsv41_candidate_positions.size() != (size_t)S) {
+        LOG_ERROR("[DSV41] layer %d has no shared indexer top-k result\n", layer_idx);
+        std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+        return;
+    }
+
+    const auto sinks_it = engine.resident_layers.find(p + "attn_sinks.weight");
+    const float *sinks = sinks_it != engine.resident_layers.end() &&
+                                 sinks_it->second.host_ptr
+                             ? reinterpret_cast<const float *>(sinks_it->second.host_ptr)
+                             : nullptr;
+    std::vector<float> contexts((size_t)S * H * qh, 0.0f);
+    const float attn_scale = 1.0f / std::sqrt((float)qh);
+    auto raw_key = [&](int abs_pos) -> const float * {
+        if (pos_base == 0 && abs_pos >= 0 && abs_pos < S)
+            return kv.data() + (size_t)abs_pos * qh;
+        return engine.KVc[(size_t)layer_idx] +
+               (int64_t)(abs_pos % window) * qh;
+    };
+    for (int s = 0; s < S; ++s) {
+        const int pos = pos_base + s;
+        const int past = std::min(pos + 1, window);
+        const std::vector<int> &selected = engine.dsv41_candidate_positions[(size_t)s];
+        for (int h = 0; h < H; ++h) {
+            const float *head_q = Q.data() + ((size_t)s * H + h) * qh;
+            std::vector<float> scores((size_t)past + selected.size() + 1);
+            for (int t = 0; t < past; ++t) {
+                const int abs_pos = pos - past + 1 + t;
+                const float *key = raw_key(abs_pos);
+                scores[(size_t)t] = dot_f32_avx512(head_q, key, qh) * attn_scale;
+            }
+            const float *compressed_keys = state.keys.data();
+            for (size_t i = 0; i < selected.size(); ++i) {
+                const int block = selected[i];
+                scores[(size_t)past + i] =
+                    dot_f32_avx512(head_q, compressed_keys + (size_t)block * qh,
+                                   qh) * attn_scale;
+            }
+            scores.back() = sinks ? sinks[h] : 0.0f;
+            softmax_row(scores.data(), (int)scores.size());
+            float *out = contexts.data() + ((size_t)s * H + h) * qh;
+            for (int t = 0; t < past; ++t) {
+                const int abs_pos = pos - past + 1 + t;
+                const float *key = raw_key(abs_pos);
+                for (int d = 0; d < qh; ++d) out[d] += scores[(size_t)t] * key[d];
+            }
+            for (size_t i = 0; i < selected.size(); ++i) {
+                const float *key = compressed_keys + (size_t)selected[i] * qh;
+                const float w = scores[(size_t)past + i];
+                for (int d = 0; d < qh; ++d) out[d] += w * key[d];
+            }
+            rope_yarn_inplace_inverse(out + nope, rope, pos, rope_theta_v41,
+                                      c.rope_ext_factor, c.rope_freq_scale,
+                                      c.rope_attn_factor, c.rope_yarn_log_mul,
+                                      c.rope_n_ctx_orig, true);
+        }
+    }
+
+    const int groups = std::max(1, c.o_group_count);
+    const int rank = c.o_lora_rank;
+    const int group_in = (H * qh) / groups;
+    const size_t woa_n = (size_t)groups * rank * group_in;
+    static std::unordered_map<std::string, std::vector<float>> woa_cache;
+    auto &WOA = woa_cache[engine.model_file.resolved_file_path + "#" +
+                           p + "attn_output_a.weight"];
+    if (WOA.empty()) {
+        auto it = engine.resident_layers.find(p + "attn_output_a.weight");
+        if (it == engine.resident_layers.end() || !it->second.host_ptr) {
+            LOG_ERROR("[DSV41] layer %d missing attn_output_a\n", layer_idx);
+            std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+            return;
+        }
+        WOA.resize(woa_n);
+        dequant_row(it->second.meta.type, it->second.host_ptr, WOA.data(),
+                    (int)woa_n);
+    }
+    std::vector<float> grouped((size_t)S * groups * rank);
+    for (int s = 0; s < S; ++s) {
+        const float *in = contexts.data() + (size_t)s * H * qh;
+        for (int g = 0; g < groups; ++g) {
+            for (int r = 0; r < rank; ++r) {
+                grouped[((size_t)s * groups + g) * rank + r] =
+                    dot_f32_avx512(in + (size_t)g * group_in,
+                                    WOA.data() + ((size_t)g * rank + r) * group_in,
+                                    group_in);
+            }
+        }
+    }
+    dense_proj(engine, p + "attn_output_b.weight", grouped.data(), out_context,
+               S, groups * rank, D);
 }
 
 // ============================================================

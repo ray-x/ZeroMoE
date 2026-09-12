@@ -20,7 +20,11 @@
 // weights so the two execution models can be compared directly. When a routed
 // expert already has a persistent page-locked RAM-tier slab, its three
 // projection planes are copied directly on the copy stream; otherwise the
-// existing mmap -> pinned staging fallback supplies the graph.
+// existing file-backed prefill-stream fallback supplies the GPU graph. When
+// Qwen's ram_preload_all_experts contract is active, that fallback is refused
+// and the already-populated DDR tier is the only permitted expert source. The
+// Qwen decode CPU-affinity path is separate: it binds MUL_MAT_ID directly to
+// the complete, preloaded DDR arena and never uses a file-backed source.
 //
 // SHAPE CONTRACT (matches llama.cpp's build_moe_ffn exactly)
 //   weights   gate/up : [d_model, d_ff,    n_experts]   (quantised, 3-D)
@@ -101,6 +105,18 @@ class GgmlRouterRunner {
   bool run_tensor(int layer, const void *device_tensor, int32_t *ids_ks,
                   float *weights_ks);
 
+  // Same as run_tensor(), but consumes stream 0 of one token from a GGML
+  // [D, HC, S] tensor. Qwen's advisory router pilot uses this to project
+  // the device-authoritative HC state without downloading the full HC slab.
+  // The returned route table is still the small host-visible [topk,1]
+  // result required by the cache/prefetch policy.
+  bool run_tensor_stream0(int layer, const void *device_tensor,
+                          int token_index, int32_t *ids_ks,
+                          float *weights_ks);
+  bool run_tensor_stream0_device(int layer, const void *device_tensor,
+                                 int token_index, const void **device_ids,
+                                 const void **device_weights);
+
   // Queue the same router graph but leave its compact route outputs on the
   // shared GGML CUDA backend.  This is used only when the caller has already
   // established that every expert in the layer is resident on the MoE GPU,
@@ -115,6 +131,16 @@ class GgmlRouterRunner {
   // router graph and is called only by the explicit MoE set trace, so normal
   // device routing remains host-free.
   bool copy_route_to_host(int layer, int32_t *ids_ks, float *weights_ks);
+
+  // Queue the compact route-table readback after run_tensor_stream0_device().
+  // The IDs/weights are copied into a small pinned host buffer and fenced by
+  // a backend event, so the next layer can poll the result instead of
+  // unconditionally synchronizing the router backend at the layer boundary.
+  bool queue_route_to_host(int layer);
+
+  // Diagnostic-only export of the pre-softmax router logits.  This is used
+  // to distinguish a GEMM/input mismatch from a top-k/layout mismatch.
+  bool copy_logits_to_host(int layer, float *logits);
 
   void shutdown();
   ~GgmlRouterRunner();
@@ -135,12 +161,20 @@ class GgmlRouterRunner {
     void *x = nullptr;          // ggml_tensor*
     void *ids = nullptr;        // ggml_tensor* [topk,tokens]
     void *weights = nullptr;    // ggml_tensor* [1,topk,tokens]
+    void *logits = nullptr;     // ggml_tensor* [experts,tokens]
+    void *route_done_event = nullptr; // ggml_backend_event_t
+    int32_t *route_ids_host = nullptr;
+    float *route_weights_host = nullptr;
+    bool route_readback_pending = false;
     bool graph_in_flight = false;
     bool ready = false;
   };
 
   bool build_graph(int layer);
   void free_layer(Layer &layer);
+  bool run_tensor_view(int layer, const void *src_view,
+                       const void **device_ids,
+                       const void **device_weights);
 
   void *backend_ = nullptr; // shared, not owned
   int device_ = -1;
@@ -161,6 +195,11 @@ class GgmlRouterRunner {
 // model's shared tensors do not satisfy this narrow Qwen shape contract.
 struct GgmlSharedWeightRef {
   const void *host_data = nullptr;
+  // Optional persistent device copy owned by the engine's dense pool.  When
+  // present, the shared runner binds its GGML weight tensor directly to this
+  // pointer instead of uploading a second per-layer copy.
+  const void *device_data = nullptr;
+  size_t device_bytes = 0;
   uint32_t type = 0;
   int64_t ne0 = 0;
   int64_t ne1 = 0;
@@ -181,6 +220,13 @@ class GgmlQwenSharedRunner {
   bool run(int layer, const void *device_x, const void *routed_output,
            const void **combined_output);
 
+  // Copy the result of the most recent run() to a row-major host buffer.
+  // This is the deliberate boundary for the host-HC fallback: the routed and
+  // shared FFNs remain one device graph, then HC post-combine consumes the
+  // combined result on the host. The method synchronizes only as required by
+  // ggml_backend_tensor_get().
+  bool copy_output_to_host(const void *combined_output, float *host_out);
+
   void shutdown();
   ~GgmlQwenSharedRunner();
 
@@ -193,6 +239,7 @@ class GgmlQwenSharedRunner {
   void free_graph();
 
   void *backend_ = nullptr; // borrowed from ggml_shared_backend()
+  void *external_buf_ = nullptr; // non-owning-pointer GGML source marker
   int device_ = -1;
   int d_model_ = 0;
   int shared_inter_ = 0;
@@ -206,6 +253,10 @@ class GgmlQwenSharedRunner {
   void *up_ = nullptr;
   void *down_ = nullptr;
   void *gate_inp_ = nullptr;   // optional ggml_tensor*
+  void *owned_gate_data_ = nullptr;
+  void *owned_up_data_ = nullptr;
+  void *owned_down_data_ = nullptr;
+  void *owned_gate_inp_data_ = nullptr;
   uint32_t gate_type_ = 0;
   uint32_t up_type_ = 0;
   uint32_t down_type_ = 0;
@@ -349,7 +400,12 @@ class GgmlMoeRunner {
   // cluster. Conclusion unchanged: NBUF is still not a real lever, now
   // confirmed against the current, materially faster baseline too.
   static constexpr int NBUF = 2;
-  static constexpr int NWEIGHT_BUFS = 1;
+  // The conservative raw-copy path uses one compact weight buffer.  The
+  // opt-in backend-stream path needs two so layer N can compute while the
+  // copy stream fills the other buffer for layer N+1.  Keep the arrays at
+  // the maximum size, but select one or two at runtime so the default path
+  // and other model families do not acquire an extra VRAM allocation.
+  static constexpr int NWEIGHT_BUFS = 2;
   // A prefill can queue all model layers before the final synchronization.
   // Keep one completion event per possible layer so an event still being
   // waited on by the copy backend is never re-recorded.
@@ -377,6 +433,13 @@ class GgmlMoeRunner {
   static void finish_all_h2d();
   static void collect_all_h2d(double &seconds, size_t &bytes);
   static void collect_all_transfer_stats(GgmlMoeTransferStats &stats);
+
+  // Queue a device-side dependency before Qwen's persistent HC mixed-input
+  // tensor is reused by the next pre-mix graph.  The direct HC->MoE input
+  // path intentionally aliases that tensor instead of copying it, so the
+  // previous MoE graph must have finished reading it first.  This is an
+  // asynchronous backend event wait, not a host synchronize.
+  static void queue_input_reuse_dependency();
 
   // Size/validate storage for one layer's compact expert set. Returns false if
   // the plan is unsupported (bad shape, unsupported quant type, allocation
@@ -452,6 +515,12 @@ class GgmlMoeRunner {
   // keep the host-output behaviour above.
   bool run_layer_device(const float *x, const int32_t *ids, const float *w,
                         const void **device_output);
+
+  // The persistent GGML tensor receiving the host input in the most recent
+  // run_layer_device() call. It is valid until the next begin_layer() or
+  // run_layer_device*() call and is used by Qwen's shared-expert graph to
+  // consume the same activation without another host upload or D2D copy.
+  const void *device_input_tensor() const { return graph_x_; }
 
   // Same as run_layer_device(), but `device_x` is an already resident F32
   // [D,S] activation on this runner's CUDA device.  This avoids downloading
@@ -631,6 +700,13 @@ class GgmlMoeRunner {
   void *graph_ctx_ = nullptr;    // ggml_context*
   void *graph_ = nullptr;        // ggml_cgraph*
   void *graph_x_ = nullptr;      // ggml_tensor*
+  // `graph_x_` is the flat parent; MUL_MAT_ID consumes the persistent reshape
+  // below.  Both data pointers must follow a direct device-input handoff.
+  void *graph_x_input_ = nullptr; // ggml_tensor* (reshape/view of graph_x_)
+  // Reusable view of a producer-owned [D,S_cap] input when the current graph
+  // consumes only its first S rows. Allocating this in run_layer_* per layer
+  // exhausts the persistent graph context during decode.
+  void *graph_source_view_ = nullptr; // ggml_tensor*
   void *graph_ids_ = nullptr;    // ggml_tensor*
   void *graph_w_ = nullptr;      // ggml_tensor*
   void *graph_token_ids_ = nullptr; // ggml_tensor* (chunk graph only)
@@ -738,6 +814,7 @@ class GgmlMoeRunner {
   int backend_weight_event_next_ = 0;
   int weight_buffer_index_ = 0;
   bool backend_stream_copies_ = false;
+  int weight_buffer_count_ = 1;
   bool raw_d2d_pending_ = false;
   std::chrono::steady_clock::time_point backend_copy_t0_[NBUF];
   bool pending_[NBUF] = {false, false};
@@ -768,4 +845,102 @@ class GgmlMoeRunner {
   size_t h2d_bytes_ = 0;
   double d2d_seconds_ = 0.0;
   size_t d2d_bytes_ = 0;
+};
+
+// Qwen4Exp CPU routed-expert runner.  This is deliberately separate from the
+// generic CPU fallback and from the CUDA GgmlMoeRunner: Qwen's CPU-affinity
+// path is the only caller, so changing its graph or quantized activation
+// policy cannot alter GLM/DeepSeek/other model families.
+//
+// The legacy fallback copies selected expert slabs into one compact
+// [gate|up|down] group before the graph runs.  The Qwen CPU-affinity path can
+// instead use a fixed-stride DDR arena: every expert keeps its existing RAM
+// slab, and GGML MUL_MAT_ID indexes the real global expert IDs directly.
+struct GgmlQwenCpuExpertRef {
+  const void *gate = nullptr;
+  const void *up = nullptr;
+  const void *down = nullptr;
+  size_t gate_bytes = 0;
+  size_t up_bytes = 0;
+  size_t down_bytes = 0;
+  uint32_t gate_type = 0;
+  uint32_t up_type = 0;
+  uint32_t down_type = 0;
+};
+
+class GgmlQwenCpuMoeRunner {
+ public:
+  static bool compiled_in();
+  static GgmlQwenCpuMoeRunner &instance();
+
+  bool run(const float *input, float *output,
+           const GgmlQwenCpuExpertRef *experts, int n_experts,
+           const float *router_weights, int d_model, int d_ff, int topk);
+
+  // BeeLlama-style CPU-offload entry point. The three projection pointers are
+  // the first expert's views in a complete host-RAM layer arena. `expert_stride`
+  // is the byte distance between expert IDs; route IDs remain global and
+  // selected expert weights are not copied per token.
+  bool run_strided(const float *input, float *output,
+                  const GgmlQwenCpuExpertRef &layer,
+                  const void *gate_plane, const void *up_plane,
+                  const void *down_plane, const int *expert_ids,
+                  int n_experts, const float *router_weights, int d_model,
+                  int d_ff, int topk, size_t expert_stride);
+
+  void shutdown();
+  ~GgmlQwenCpuMoeRunner();
+
+ private:
+  GgmlQwenCpuMoeRunner() = default;
+  GgmlQwenCpuMoeRunner(const GgmlQwenCpuMoeRunner &) = delete;
+  GgmlQwenCpuMoeRunner &operator=(const GgmlQwenCpuMoeRunner &) = delete;
+
+  bool ensure_graph(const GgmlQwenCpuExpertRef &ref, int n_experts,
+                    int d_model, int d_ff, int topk, bool strided,
+                    const void *gate_plane, const void *up_plane,
+                    const void *down_plane, size_t expert_stride);
+  void free_graph();
+
+  void *cpu_backend_ = nullptr;       // ggml_backend_t, owned
+  void *weight_ctx_ = nullptr;        // ggml_context*, owned
+  void *weight_buf_ = nullptr;        // ggml_backend_buffer_t, owned
+  std::vector<void *> external_weight_bufs_; // three non-owning CPU pointer buffers
+  void *gate_ = nullptr;              // ggml_tensor*
+  void *up_ = nullptr;                // ggml_tensor*
+  void *down_ = nullptr;              // ggml_tensor*
+  void *graph_ctx_ = nullptr;         // ggml_context*, owned
+  void *galloc_ = nullptr;            // ggml_gallocr_t, owned
+  void *graph_ = nullptr;             // ggml_cgraph*
+  void *x_ = nullptr;                 // ggml_tensor*
+  void *ids_ = nullptr;               // ggml_tensor*
+  void *weights_ = nullptr;           // ggml_tensor*
+  void *output_ = nullptr;            // ggml_tensor*
+
+  void *weight_storage_ = nullptr;
+  size_t weight_storage_bytes_ = 0;
+  int n_experts_ = 0;
+  int d_model_ = 0;
+  int d_ff_ = 0;
+  int topk_ = 0;
+  uint32_t gate_type_ = 0;
+  uint32_t up_type_ = 0;
+  uint32_t down_type_ = 0;
+  int n_threads_ = 0;
+  bool strided_mode_ = false;
+  size_t expert_stride_ = 0;
+
+  // The compact GGML graph owns one [gate|up|down] slot per selected
+  // expert.  Qwen decode commonly selects the same expert in the same slot
+  // on adjacent tokens; remember the source slabs so run() does not memcpy
+  // an unchanged slot into the compact staging buffer again.
+  struct CachedExpertSource {
+    const void *gate = nullptr;
+    const void *up = nullptr;
+    const void *down = nullptr;
+    size_t gate_bytes = 0;
+    size_t up_bytes = 0;
+    size_t down_bytes = 0;
+  };
+  std::vector<CachedExpertSource> cached_sources_;
 };

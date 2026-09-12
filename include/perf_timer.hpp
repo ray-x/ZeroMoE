@@ -61,6 +61,16 @@ struct PerfCounters {
     std::atomic<double> t_ggml_moe_h2d_dma{0};
     std::atomic<uint64_t> bytes_ggml_moe_d2d{0};
     std::atomic<uint64_t> bytes_ggml_moe_h2d{0};
+    // Source classification for the routed expert records submitted to the
+    // GGML MoE runner. These are expert counts, not bytes: the byte counters
+    // above are the authoritative transfer-volume measurements, while this
+    // split explains why a given H2D volume came from VRAM reuse, pinned DDR,
+    // pageable-DDR staging, or the file-backed fallback.
+    std::atomic<uint64_t> n_ggml_moe_d2d_experts{0};
+    std::atomic<uint64_t> n_ggml_moe_active_d2d_experts{0};
+    std::atomic<uint64_t> n_ggml_moe_ram_direct_experts{0};
+    std::atomic<uint64_t> n_ggml_moe_ram_staged_experts{0};
+    std::atomic<uint64_t> n_ggml_moe_mmap_experts{0};
     std::atomic<double> t_host_alloc{0};    // posix_memalign + setup
     std::atomic<double> t_gpu_upload{0};    // cudaMemcpy H2D -- shared by expert cache
                                              // PROMOTION uploads (GpuTopology::upload_expert,
@@ -394,6 +404,13 @@ struct PerfCounters {
     std::atomic<double> t_gdn_outnorm{0};    // gated per-head RMSNorm
     std::atomic<double> t_gdn_outproj{0};    // ssm_out dense_proj
     std::atomic<double> t_gdn_full{0};      // complete device-resident GDN graph
+    // Path accounting for the complete Qwen GDN graph. The timer above is
+    // shared by device-input and host-output variants, so these counters make
+    // a decode report identify the path that actually ran.
+    std::atomic<uint64_t> n_gdn_full_device_success{0};
+    std::atomic<uint64_t> n_gdn_full_host_success{0};
+    std::atomic<uint64_t> n_gdn_full_device_failure{0};
+    std::atomic<uint64_t> n_gdn_full_split_fallback{0};
     // Isolates the CPU-side WUV down-projection loop (attention_layer.cpp's
     // score_gpu_ok branch, run AFTER the GPU call returns) from
     // t_score_gpu_up/compute/down above, which only cover the GPU call
@@ -1043,6 +1060,8 @@ struct PerfCounters {
     // hidden->RMSNorm->gate pilot above. These counters are separate so a
     // Qwen experiment cannot change the GLM/DeepSeek pilot report or policy.
     std::atomic<uint64_t> n_qwen_pilot_predictions{0};
+    std::atomic<uint64_t> n_qwen_pilot_gpu_predictions{0};
+    std::atomic<uint64_t> n_qwen_pilot_host_fallbacks{0};
     std::atomic<uint64_t> n_qwen_pilot_recall_hits{0};
     std::atomic<uint64_t> n_qwen_pilot_recall_checks{0};
     std::atomic<uint64_t> n_qwen_pilot_recall_pred_size_sum{0};
@@ -1067,6 +1086,9 @@ struct PerfCounters {
     std::atomic<uint64_t> n_qwen_pilot_prefetch_excluded{0};
     std::atomic<uint64_t> n_qwen_pilot_prefetch_rank_skipped{0};
     std::atomic<uint64_t> n_qwen_pilot_sync_fail{0};
+    std::atomic<uint64_t> n_qwen_pilot_skipped_fully_cached{0};
+    std::atomic<uint64_t> n_qwen_pilot_skipped_prefetch_excluded{0};
+    std::atomic<uint64_t> n_qwen_pilot_skipped_predict_policy{0};
     static constexpr int kQwenPilotMaxRanks = 16;
     // Per-predicted-rank membership accuracy. A hit means the expert at
     // predicted rank r belongs to the real router's top-k set; this is the
@@ -2743,9 +2765,11 @@ struct PerfCounters {
         double t_ram_get_expert=0, t_ram_get_experts_batch=0;
         double t_ram_batch_phase_a=0, t_ram_batch_phase_b=0, t_ram_batch_phase_c=0;
         double t_bounce_stage_memcpy=0, t_host_register_stage=0, t_bounce_buffer_wait=0;
+        double t_ggml_moe_d2d=0, t_ggml_moe_h2d=0, t_ggml_moe_h2d_dma=0;
         uint64_t n_expert_cache_hit=0, n_expert_cache_miss=0, n_expert_promote=0, n_tokens_generated=0;
         uint64_t n_expert_gpu_calls=0, n_expert_cpu_calls=0, n_dense_gpu_calls=0;
         int64_t bytes_disk_read=0, bytes_gpu_uploaded=0, bytes_bounce_staged=0, bytes_host_registered=0;
+        int64_t bytes_ggml_moe_d2d=0, bytes_ggml_moe_h2d=0;
         // Added alongside print_summary's own "disk=" throughput figures --
         // see dump_report's "Disk read (expert)" line and bytes_disk_read_
         // speculative's own comment (PerfCounters) for why t_disk_read
@@ -2828,6 +2852,9 @@ struct PerfCounters {
                 t_bounce_stage_memcpy - b.t_bounce_stage_memcpy,
                 t_host_register_stage - b.t_host_register_stage,
                 t_bounce_buffer_wait - b.t_bounce_buffer_wait,
+                t_ggml_moe_d2d - b.t_ggml_moe_d2d,
+                t_ggml_moe_h2d - b.t_ggml_moe_h2d,
+                t_ggml_moe_h2d_dma - b.t_ggml_moe_h2d_dma,
                     n_expert_cache_hit - b.n_expert_cache_hit,
                     n_expert_cache_miss - b.n_expert_cache_miss,
                     n_expert_promote - b.n_expert_promote,
@@ -2835,10 +2862,12 @@ struct PerfCounters {
                     n_expert_gpu_calls - b.n_expert_gpu_calls,
                     n_expert_cpu_calls - b.n_expert_cpu_calls,
                     n_dense_gpu_calls - b.n_dense_gpu_calls,
-                    bytes_disk_read - b.bytes_disk_read,
-                    bytes_gpu_uploaded - b.bytes_gpu_uploaded,
-                    bytes_bounce_staged - b.bytes_bounce_staged,
-                    bytes_host_registered - b.bytes_host_registered,
+                bytes_disk_read - b.bytes_disk_read,
+                bytes_gpu_uploaded - b.bytes_gpu_uploaded,
+                bytes_bounce_staged - b.bytes_bounce_staged,
+                bytes_host_registered - b.bytes_host_registered,
+                bytes_ggml_moe_d2d - b.bytes_ggml_moe_d2d,
+                bytes_ggml_moe_h2d - b.bytes_ggml_moe_h2d,
                     bytes_disk_read_speculative - b.bytes_disk_read_speculative,
                     n_prefetch_hits - b.n_prefetch_hits,
                     n_pinned_eviction_skips - b.n_pinned_eviction_skips,
@@ -2889,9 +2918,12 @@ struct PerfCounters {
             t_ram_get_expert.load(), t_ram_get_experts_batch.load(),
             t_ram_batch_phase_a.load(), t_ram_batch_phase_b.load(), t_ram_batch_phase_c.load(),
             t_bounce_stage_memcpy.load(), t_host_register_stage.load(), t_bounce_buffer_wait.load(),
+            t_ggml_moe_d2d.load(), t_ggml_moe_h2d.load(), t_ggml_moe_h2d_dma.load(),
             n_expert_cache_hit.load(), n_expert_cache_miss.load(), n_expert_promote.load(), n_tokens_generated.load(),
             n_expert_gpu_calls.load(), n_expert_cpu_calls.load(), n_dense_gpu_calls.load(),
             bytes_disk_read.load(), bytes_gpu_uploaded.load(), bytes_bounce_staged.load(), bytes_host_registered.load(),
+            (int64_t)bytes_ggml_moe_d2d.load(),
+            (int64_t)bytes_ggml_moe_h2d.load(),
             bytes_disk_read_speculative.load(),
             n_prefetch_hits.load(), n_pinned_eviction_skips.load(), n_pinned_resident.load(),
             n_staging_regrow.load(),
@@ -2958,6 +2990,20 @@ struct PerfCounters {
             (unsigned long long)d.n_expert_gpu_calls, (unsigned long long)d.n_expert_cpu_calls,
             (unsigned long long)d.n_prefetch_hits, (unsigned long long)d.n_pinned_eviction_skips,
             (unsigned long long)d.n_pinned_resident);
+        if (d.bytes_ggml_moe_d2d > 0 || d.bytes_ggml_moe_h2d > 0) {
+            const double d2d_gb = d.bytes_ggml_moe_d2d / 1e9;
+            const double h2d_gb = d.bytes_ggml_moe_h2d / 1e9;
+            LOG_INFO("[%s] GGML MoE transfer window: D2D %.3f s (%.2f GB, %.2f GB/s) | "
+                     "H2D %.3f s (%.2f GB, %.2f GB/s; pure DMA %.3f s, %.2f GB/s)\n",
+                     label, d.t_ggml_moe_d2d, d2d_gb,
+                     d.t_ggml_moe_d2d > 0.0 ? d2d_gb / d.t_ggml_moe_d2d : 0.0,
+                     d.t_ggml_moe_h2d, h2d_gb,
+                     d.t_ggml_moe_h2d > 0.0 ? h2d_gb / d.t_ggml_moe_h2d : 0.0,
+                     d.t_ggml_moe_h2d_dma,
+                     d.t_ggml_moe_h2d_dma > 0.0
+                         ? h2d_gb / d.t_ggml_moe_h2d_dma
+                         : 0.0);
+        }
     }
 
     // Concise INFO-level summary for one finished request (prompt + all
@@ -3100,6 +3146,20 @@ struct PerfCounters {
             (unsigned long long)gcalls, (unsigned long long)ccalls,
             (unsigned long long)d.n_prefetch_hits, (unsigned long long)d.n_pinned_eviction_skips,
             (unsigned long long)d.n_pinned_resident);
+        if (d.bytes_ggml_moe_d2d > 0 || d.bytes_ggml_moe_h2d > 0) {
+            const double d2d_gb = d.bytes_ggml_moe_d2d / 1e9;
+            const double h2d_gb = d.bytes_ggml_moe_h2d / 1e9;
+            LOG_INFO("[%s] GGML MoE transfer window: D2D %.3f s (%.2f GB, %.2f GB/s) | "
+                     "H2D %.3f s (%.2f GB, %.2f GB/s; pure DMA %.3f s, %.2f GB/s)\n",
+                     label, d.t_ggml_moe_d2d, d2d_gb,
+                     d.t_ggml_moe_d2d > 0.0 ? d2d_gb / d.t_ggml_moe_d2d : 0.0,
+                     d.t_ggml_moe_h2d, h2d_gb,
+                     d.t_ggml_moe_h2d > 0.0 ? h2d_gb / d.t_ggml_moe_h2d : 0.0,
+                     d.t_ggml_moe_h2d_dma,
+                     d.t_ggml_moe_h2d_dma > 0.0
+                         ? h2d_gb / d.t_ggml_moe_h2d_dma
+                         : 0.0);
+        }
     }
 
     // session_elapsed_s: REAL wall-clock seconds from "engine ready to
@@ -3328,8 +3388,10 @@ struct PerfCounters {
             const uint64_t sb = bytes_prefill_stream_h2d.load();
             if (sw > 0.0 || sb > 0) {
                 LOG_INFO("Prefill expert stream:  %8.3f s CPU blocked on the double-buffer handoff"
-                         " | real on-GPU H2D %8.3f s (%.2f GB, %.2f GB/s) -- mmap->pinned staging"
-                         " itself is folded into 'disk=' in the [PREFILL] line. If the H2D figure is"
+                         " | real on-GPU H2D %8.3f s (%.2f GB, %.2f GB/s) -- any file-backed"
+                         " mmap->pinned staging is folded into 'disk=' in the [PREFILL] line;"
+                         " resident DDR sources are reported separately as pinned/pageable-DDR."
+                         " If the H2D figure is"
                          " far below this box's measured link ceiling (3090 12.30 GB/s, 5060 Ti 6.81),"
                          " the transfer is the lever; if the blocked figure greatly exceeds the H2D"
                          " figure, the GEMMs (not the transfer) are what the CPU is waiting on.\n",
@@ -3354,6 +3416,14 @@ struct PerfCounters {
                              "opt-in per-copy CUDA events; excludes device unpack kernels\n",
                              h2d_dma, hb / 1e9, (hb / 1e9) / h2d_dma);
                 }
+                LOG_INFO("GGML MoE source split: D2D=%llu experts (active-layer=%llu), "
+                         "pinned-DDR-direct=%llu, pageable-DDR-staged=%llu, "
+                         "file-mmap=%llu\n",
+                         (unsigned long long)n_ggml_moe_d2d_experts.load(),
+                         (unsigned long long)n_ggml_moe_active_d2d_experts.load(),
+                         (unsigned long long)n_ggml_moe_ram_direct_experts.load(),
+                         (unsigned long long)n_ggml_moe_ram_staged_experts.load(),
+                         (unsigned long long)n_ggml_moe_mmap_experts.load());
             }
         }
         LOG_INFO("Expert activation upload (H2D): %8.3f s  (expert_ffn's own per-call upload, "
@@ -4342,6 +4412,16 @@ struct PerfCounters {
                 LOG_INFO("Qwen4Exp full GDN GGML graph: %.2fs (complete device "
                          "projection+conv+delta+norm+ssm_out; nested inside GDN attention)\n",
                          af);
+            const uint64_t gd = n_gdn_full_device_success.load();
+            const uint64_t gh = n_gdn_full_host_success.load();
+            const uint64_t gdf = n_gdn_full_device_failure.load();
+            const uint64_t gs = n_gdn_full_split_fallback.load();
+            if (gd || gh || gdf || gs)
+                LOG_INFO("Qwen4Exp full GDN path: %llu device success / "
+                         "%llu host success / %llu device failure / "
+                         "%llu split fallbacks\n",
+                         (unsigned long long)gd, (unsigned long long)gh,
+                         (unsigned long long)gdf, (unsigned long long)gs);
         }
         {
             uint64_t gc = n_qwen4exp_gdn_gpu_calls.load();
@@ -5370,7 +5450,17 @@ inline void report_qwen4exp_pilot_stats() {
         p.n_qwen_pilot_recall_checks.load(std::memory_order_relaxed);
     const uint64_t sync_fail =
         p.n_qwen_pilot_sync_fail.load(std::memory_order_relaxed);
-    if (predictions == 0 && checks == 0 && sync_fail == 0)
+    const uint64_t skipped_fully_cached =
+        p.n_qwen_pilot_skipped_fully_cached.load(std::memory_order_relaxed);
+    const uint64_t skipped_prefetch_excluded =
+        p.n_qwen_pilot_skipped_prefetch_excluded.load(
+            std::memory_order_relaxed);
+    const uint64_t skipped_predict_policy =
+        p.n_qwen_pilot_skipped_predict_policy.load(
+            std::memory_order_relaxed);
+    if (predictions == 0 && checks == 0 && sync_fail == 0 &&
+        skipped_fully_cached == 0 && skipped_prefetch_excluded == 0 &&
+        skipped_predict_policy == 0)
         return;
 
     const uint64_t hits =
@@ -5380,11 +5470,23 @@ inline void report_qwen4exp_pilot_stats() {
     const double accuracy = pred_slots > 0
                                 ? 100.0 * (double)hits / (double)pred_slots
                                 : 0.0;
-    LOG_INFO("[QWEN-PILOT] HC stream-0 proxy: predictions=%llu checks=%llu "
-             "overlap=%llu/%llu (%.1f%% predicted-slot accuracy), sync_fail=%llu\n",
-             (unsigned long long)predictions, (unsigned long long)checks,
+    LOG_INFO("[QWEN-PILOT] HC stream-0 proxy: predictions=%llu gpu=%llu "
+             "host_fallback=%llu checks=%llu "
+             "overlap=%llu/%llu (%.1f%% predicted-slot accuracy), sync_fail=%llu "
+             "skipped_fully_cached=%llu skipped_prefetch_excluded=%llu\n",
+             (unsigned long long)predictions,
+             (unsigned long long)p.n_qwen_pilot_gpu_predictions.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_host_fallbacks.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)checks,
              (unsigned long long)hits, (unsigned long long)pred_slots,
-             accuracy, (unsigned long long)sync_fail);
+             accuracy, (unsigned long long)sync_fail,
+             (unsigned long long)p.n_qwen_pilot_skipped_fully_cached.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)skipped_prefetch_excluded);
+    LOG_INFO("[QWEN-PILOT] prediction policy skips: allow-list=%llu\n",
+             (unsigned long long)skipped_predict_policy);
     LOG_INFO("[QWEN-PILOT] load coverage: already_ram=%llu already_vram=%llu "
              "needs_fetch=%llu hints_pushed=%llu hints_skipped_resident=%llu\n",
              (unsigned long long)p.n_qwen_pilot_pred_already_ram.load(

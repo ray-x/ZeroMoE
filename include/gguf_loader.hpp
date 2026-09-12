@@ -257,6 +257,27 @@ struct ArchitectureConfig {
   int dsv4_indexer_head_count = 0;
   int dsv4_indexer_key_length = 0;
   int dsv4_indexer_top_k = 0;
+  // DeepSeek-V4.1 shared compressed-attention source/candidate metadata.
+  std::vector<int64_t> dsv41_kv_source_layers;
+  std::vector<int64_t> dsv41_index_source_layers;
+  int dsv41_candidate_source_layer = -1;
+  int dsv41_candidate_top_k_blocks = 0;
+  int dsv41_candidate_block_size = 0;
+
+  // DeepSeek-V4.1 Engram metadata. The very large engram_embd tables are
+  // intentionally not resident; the layer hook gathers their quantized rows.
+  std::vector<int64_t> dsv41_engram_layer_ids;
+  std::vector<int64_t> dsv41_engram_num_embeddings;
+  std::vector<int64_t> dsv41_engram_primes;
+  std::vector<int64_t> dsv41_engram_offsets;
+  std::vector<int64_t> dsv41_engram_multipliers;
+  std::vector<int64_t> dsv41_engram_token_map;
+  int dsv41_engram_max_ngram_size = 0;
+  int dsv41_engram_vocab_size = 0;
+  int dsv41_engram_n_heads = 0;
+  int dsv41_engram_head_dim = 0;
+  int dsv41_engram_pad_id = 2;
+  int dsv41_engram_compressed_vocab_size = 0;
   std::vector<float> swiglu_clamp_exp;   // per-layer, size n_layers when set
   std::vector<float> swiglu_clamp_shexp; // per-layer, size n_layers when set
 
@@ -385,6 +406,15 @@ inline bool dsv4_uses_compressed_attention(const ArchitectureConfig &config) {
   return std::any_of(config.dsv4_compress_ratios.begin(),
                      config.dsv4_compress_ratios.end(),
                      [](int64_t ratio) { return ratio != 0; });
+}
+
+inline bool dsv41_is_layer_in(const std::vector<int64_t> &layers, int layer) {
+  return std::find(layers.begin(), layers.end(), (int64_t)layer) != layers.end();
+}
+
+inline bool dsv41_is_engram_layer(const ArchitectureConfig &config,
+                                  int layer) {
+  return dsv41_is_layer_in(config.dsv41_engram_layer_ids, layer);
 }
 
 class GGUFFile {

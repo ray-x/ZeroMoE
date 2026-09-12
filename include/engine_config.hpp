@@ -353,6 +353,21 @@ struct EngineConfig {
   // Qwen layer indices for which estimation-based prefetch is disabled.
   // Prediction and accuracy collection still run for these layers.
   std::vector<int> qwen4exp_router_pilot_prefetch_exclude_layers;
+  // Optional Qwen-only prediction allow-list. When non-empty, the pilot runs
+  // only for these target layers. This is independent of production routing,
+  // usage-file pinning, and all other model families.
+  std::vector<int> qwen4exp_router_pilot_predict_layers;
+  // Decode-only optimization: when the target layer's complete expert set is
+  // already in the durable VRAM cache, skip the advisory pilot snapshot and
+  // router pass because no placement decision can change. Prediction remains
+  // active for any layer with a real placement gap. Other model families do
+  // not read this option.
+  bool qwen4exp_router_pilot_skip_fully_cached = false;
+  // Decode-only optimization: when a target layer is explicitly excluded
+  // from estimation-based prefetch, skip the pilot itself as well. This keeps
+  // the exclusion list useful for performance; set false during an accuracy-
+  // collection run when excluded layers should still be measured.
+  bool qwen4exp_router_pilot_skip_prefetch_excluded_layers = false;
 
   // Qwen4Exp-only decode path: use the grouped GGML/CUDA MUL_MAT_ID routed
   // FFN for S==1, collapsing the per-token/per-expert cache and dispatch
@@ -360,6 +375,20 @@ struct EngineConfig {
   // CPU-oriented moe_decode_batched experiment, which is not appropriate
   // for Qwen IQ1_M. Default off for every model/config.
   bool qwen4exp_decode_ggml_moe = false;
+  // Qwen4Exp-only decode handoff: keep the HC pre-mix result on the GGML
+  // CUDA backend for the S==1 router and grouped MoE graph. This is separate
+  // from qwen4exp_decode_ggml_moe so the latter can be benchmarked with the
+  // established host-router boundary. Default off for every model/config.
+  bool qwen4exp_decode_device_hc = false;
+  // Qwen-only exact-Q8 HC decode kernels. Off by default and ignored by all
+  // other model families.
+  bool qwen4exp_decode_custom_hc_q8 = false;
+  // Qwen-only S==1 router policy. The GPU router is useful for batched
+  // prefill, but its graph launch/synchronization/readback boundary is slower
+  // than the AVX-512 host router for decode on the RTX 3090. Keep this opt-in
+  // so enabling the GPU router for prefill does not force the slower decode
+  // boundary. The Qwen prediction pilot has its own GPU-router path.
+  bool qwen4exp_decode_gpu_router = false;
   // Qwen4Exp-only grouped CPU fallback for explicitly selected
   // cpu_affinity_layers. Other model families never consult this switch.
   bool qwen4exp_cpu_ggml_moe = false;
@@ -1362,6 +1391,15 @@ struct EngineConfig {
   // usage-ranked preload strategy.
   int vram_preload_prefix_layers = 0;
 
+  // Optional physical cache-layout policy. When nonzero, the compact expert
+  // allocator gives layers [0, value) complete expert-ID regions first,
+  // provided they fit in the configured VRAM cache, then distributes any
+  // remaining bytes across later layers. This is separate from the preload
+  // policy above: it is an opt-in layout change whose benefit is that a
+  // complete layer can be consumed by GGML without a per-token repack or
+  // PCIe transfer. Zero preserves the balanced compact layout.
+  int vram_cache_full_layer_prefix = 0;
+
   // Only used when pin_strategy=="global_topn". Of the experts already
   // selected for pinning by the ranking above, the top N by real
   // historical count (globally, across every layer -- not per-layer) are
@@ -1758,6 +1796,12 @@ struct EngineConfig {
   // before the flip. Set false to restore the fused kernels unchanged. See
   // kquant_dequant.hpp's dense_bf16_prefill_gemm_flag() for the numbers.
   bool dense_bf16_prefill_gemm = false;
+
+  // Use a dedicated non-blocking copy stream for host-staged dense decode
+  // projections.  The default remains off because older model paths rely on
+  // the legacy stream's implicit ordering; Qwen4Exp enables it after the
+  // event-ordered path is validated on that model.
+  bool dense_async_copies = false;
 
   // Pilot-driven RAM->VRAM speculative promotion. Calibrated against the
   // "ram-only" per-rank metric (PerfCounters::n_pilot_ram_only_hits_by_
@@ -2479,8 +2523,22 @@ inline bool EngineConfig::load(const std::string &path) {
   }
   qwen4exp_router_pilot_prefetch_exclude_layers =
       doc.root.get_int_array("qwen4exp_router_pilot_prefetch_exclude_layers");
+  qwen4exp_router_pilot_predict_layers =
+      doc.root.get_int_array("qwen4exp_router_pilot_predict_layers");
+  qwen4exp_router_pilot_skip_fully_cached = doc.root.get_bool(
+      "qwen4exp_router_pilot_skip_fully_cached",
+      qwen4exp_router_pilot_skip_fully_cached);
+  qwen4exp_router_pilot_skip_prefetch_excluded_layers = doc.root.get_bool(
+      "qwen4exp_router_pilot_skip_prefetch_excluded_layers",
+      qwen4exp_router_pilot_skip_prefetch_excluded_layers);
   qwen4exp_decode_ggml_moe =
       doc.root.get_bool("qwen4exp_decode_ggml_moe", qwen4exp_decode_ggml_moe);
+  qwen4exp_decode_device_hc = doc.root.get_bool(
+      "qwen4exp_decode_device_hc", qwen4exp_decode_device_hc);
+  qwen4exp_decode_custom_hc_q8 = doc.root.get_bool(
+      "qwen4exp_decode_custom_hc_q8", qwen4exp_decode_custom_hc_q8);
+  qwen4exp_decode_gpu_router = doc.root.get_bool(
+      "qwen4exp_decode_gpu_router", qwen4exp_decode_gpu_router);
   qwen4exp_cpu_ggml_moe =
       doc.root.get_bool("qwen4exp_cpu_ggml_moe", qwen4exp_cpu_ggml_moe);
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
@@ -2564,6 +2622,8 @@ inline bool EngineConfig::load(const std::string &path) {
                                                 pin_global_floor_per_layer);
   vram_preload_prefix_layers = doc.root.get_int(
       "vram_preload_prefix_layers", vram_preload_prefix_layers);
+  vram_cache_full_layer_prefix = doc.root.get_int(
+      "vram_cache_full_layer_prefix", vram_cache_full_layer_prefix);
   pin_core_gpu_top_n = doc.root.get_int("pin_core_gpu_top_n", pin_core_gpu_top_n);
   pin_vram_lru_fraction =
       doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
@@ -2591,6 +2651,7 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
   gdn_full_ggml = doc.root.get_bool("gdn_full_ggml", gdn_full_ggml);
   moe_expert_bf16_gemm = doc.root.get_bool("moe_expert_bf16_gemm", moe_expert_bf16_gemm);
   dense_bf16_prefill_gemm = doc.root.get_bool("dense_bf16_prefill_gemm", dense_bf16_prefill_gemm);
+  dense_async_copies = doc.root.get_bool("dense_async_copies", dense_async_copies);
   ram_vram_promote_top_k =
       doc.root.get_int("ram_vram_promote_top_k", ram_vram_promote_top_k);
   ram_vram_promote_adaptive =
@@ -2824,6 +2885,11 @@ inline bool EngineConfig::validate() {
     std::cerr << "[CONFIG] vram_preload_prefix_layers cannot be negative -- "
                  "using 0 (disabled).\n";
     vram_preload_prefix_layers = 0;
+  }
+  if (vram_cache_full_layer_prefix < 0) {
+    std::cerr << "[CONFIG] vram_cache_full_layer_prefix cannot be negative -- "
+                 "using 0 (disabled).\n";
+    vram_cache_full_layer_prefix = 0;
   }
 
   {

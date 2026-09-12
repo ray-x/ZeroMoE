@@ -110,6 +110,11 @@ struct FullGraph {
 
   size_t graph_bytes = 0;
   size_t host_weight_bytes = 0;
+  // Bytes/views borrowed from StreamingEngine's already-populated graph-RAM
+  // arenas.  These are not owned by this graph and must not be counted as a
+  // second host-side expert copy.
+  size_t host_ram_alias_bytes = 0;
+  size_t host_ram_alias_tensors = 0;
   size_t host_pinned_bytes = 0;
   size_t host_pin_failures = 0;
   size_t host_reservation_bytes = 0;
@@ -190,6 +195,8 @@ struct FullGraph {
     ready = false;
     graph_bytes = 0;
     host_weight_bytes = 0;
+    host_ram_alias_bytes = 0;
+    host_ram_alias_tensors = 0;
     host_pinned_bytes = 0;
     host_pin_failures = 0;
     MemoryGuard::release_host_bytes(host_reservation_bytes);
@@ -434,6 +441,11 @@ size_t full_expert_source_bytes(const StreamingEngine &engine) {
   const auto &c = engine.model_file.architecture_config;
   size_t total = 0;
   for (int layer = 0; layer < c.n_layers; ++layer) {
+    // When main.cpp prepared a complete graph-RAM arena, the three packed
+    // expert planes for this layer are already resident in DDR.  The full
+    // graph aliases those bytes below; do not pre-charge or allocate a second
+    // graph-owned source set for the same layer.
+    if (engine.graph_ram_layer_ready(layer)) continue;
     for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
                              "ffn_down_exps.weight"}) {
       const GGUFTensor *m = model_tensor(
@@ -446,6 +458,66 @@ size_t full_expert_source_bytes(const StreamingEngine &engine) {
     }
   }
   return total;
+}
+
+// Resolve one packed Qwen expert projection to the complete, preloaded
+// graph-RAM arena.  This is deliberately Qwen-specific: the arena layout is
+// [gate|up|down] per expert with a fixed expert stride, whereas other model
+// families have different graph/cache ownership rules.
+bool preloaded_ram_expert_source(FullGraph &g, const std::string &name,
+                                 const GGUFTensor &meta, void *&ptr,
+                                 size_t &bytes, size_t &expert_stride,
+                                 size_t &arena_bytes) {
+  const std::string prefix = "blk.";
+  if (name.compare(0, prefix.size(), prefix) != 0) return false;
+
+  char *end = nullptr;
+  const long parsed_layer = std::strtol(name.c_str() + prefix.size(), &end, 10);
+  if (end == name.c_str() + prefix.size() || parsed_layer < 0 ||
+      *end != '.')
+    return false;
+  const int layer = static_cast<int>(parsed_layer);
+  const std::string suffix(end + 1);
+  const auto *arena = g.engine->graph_ram_arena(layer);
+  if (!arena) return false;
+  size_t plane_offset = 0;
+  size_t plane_bytes = 0;
+  if (suffix == "ffn_gate_exps.weight") {
+    plane_bytes = arena->gate_bytes;
+  } else if (suffix == "ffn_up_exps.weight") {
+    plane_offset = arena->gate_bytes;
+    plane_bytes = arena->up_bytes;
+  } else if (suffix == "ffn_down_exps.weight") {
+    plane_offset = arena->gate_bytes + arena->up_bytes;
+    plane_bytes = arena->down_bytes;
+  } else {
+    return false;
+  }
+
+  if (!g.engine->graph_ram_layer_ready(layer)) return false;
+  const int n_experts = g.engine->model_file.architecture_config.n_experts;
+  const size_t n_exp = static_cast<size_t>(std::max(0, n_experts));
+  if (!arena || !arena->base || n_experts <= 0 ||
+      arena->n_experts != n_experts || plane_bytes == 0 ||
+      plane_offset > arena->bytes ||
+      plane_bytes > arena->bytes - plane_offset ||
+      n_exp > SIZE_MAX / plane_bytes ||
+      meta.size_bytes != plane_bytes * n_exp ||
+      arena->stride < plane_bytes ||
+      static_cast<size_t>(n_experts - 1) >
+          (SIZE_MAX - plane_bytes) / arena->stride)
+    return false;
+
+  const size_t view_bytes = arena->stride * static_cast<size_t>(n_experts - 1) +
+                            plane_bytes;
+  if (plane_offset > arena->bytes || view_bytes > arena->bytes - plane_offset)
+    return false;
+
+  ptr = arena->base + plane_offset;
+  bytes = view_bytes;
+  expert_stride = arena->stride;
+  arena_bytes = arena->bytes;
+  return true;
 }
 
 size_t device_expert_bytes(const FullGraph &g) {
@@ -549,8 +621,75 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
   if (!t) return nullptr;
   const size_t bytes = static_cast<size_t>(m->size_bytes);
   const size_t required = std::max(bytes, ggml_nbytes(t));
+
+  // A Qwen full graph must consume the same complete DDR expert planes that
+  // the RAM tier already loaded.  In that configuration the source is an
+  // interleaved fixed-stride arena, so adjust only the expert-axis stride;
+  // no selected weights are copied and no GGUF mapping is consulted.
+  if (!device_resident) {
+    void *ram_ptr = nullptr;
+    size_t ram_bytes = 0;
+    size_t ram_stride = 0;
+    size_t ram_arena_bytes = 0;
+    if (preloaded_ram_expert_source(g, name, *m, ram_ptr, ram_bytes,
+                                    ram_stride, ram_arena_bytes)) {
+      if (shape.size() < 3 || t->ne[2] != g.engine->model_file
+                                      .architecture_config.n_experts ||
+          ram_stride < t->nb[2])
+        return nullptr;
+      t->nb[2] = ram_stride;
+      t->nb[3] = ram_stride * static_cast<size_t>(t->ne[2]);
+      if (!bind_host(g, t, ram_ptr, ram_bytes,
+                     GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
+        return nullptr;
+      // The three projection views overlap the same one-layer arena. Count
+      // the backing arena once, on the gate view, rather than summing the
+      // three strided view spans and reporting a fictitious 3x allocation.
+      if (name.find("ffn_gate_exps.weight") != std::string::npos)
+        g.host_ram_alias_bytes += ram_arena_bytes;
+      ++g.host_ram_alias_tensors;
+      ggml_set_name(t, name.c_str());
+      return t;
+    }
+
+    // A graph-RAM arena is an explicit ownership decision: once it exists,
+    // this Qwen layer is supposed to use the already-preloaded DDR bytes.
+    // Do not quietly turn an incomplete arena into a second graph-owned
+    // startup read from the GGUF file.  Rejecting the optional graph keeps
+    // the normal RAM/cache dispatcher as the correctness fallback and makes
+    // the source policy visible instead of hiding an SSD read behind this
+    // path.  This guard is deliberately Qwen-full-graph-only; other model
+    // families have their own graph source ownership rules.
+    int graph_ram_layer = -1;
+    if (name.compare(0, 4, "blk.") == 0) {
+      char *end = nullptr;
+      const long parsed = std::strtol(name.c_str() + 4, &end, 10);
+      if (end != name.c_str() + 4 && end && *end == '.')
+        graph_ram_layer = static_cast<int>(parsed);
+    }
+    if (graph_ram_layer >= 0 &&
+        g.engine->qwen_ram_preload_all_experts) {
+      LOG_WARN("[GGML-QWEN-FULL] refusing file-backed expert source for "
+               "layer=%d: ram_preload_all_experts requires the preloaded "
+               "DDR arena\n",
+               graph_ram_layer);
+      return nullptr;
+    }
+    if (graph_ram_layer >= 0 &&
+        g.engine->graph_ram_layer_allocated(graph_ram_layer) &&
+        !g.engine->graph_ram_layer_ready(graph_ram_layer)) {
+      LOG_WARN("[GGML-QWEN-FULL] refusing file-backed expert source for "
+               "layer=%d: preloaded DDR arena is allocated but not ready\n",
+               graph_ram_layer);
+      return nullptr;
+    }
+  }
+
   void *p = alloc_host(g, required);
   if (!p) return nullptr;
+  // Fallback for graph configurations without a complete preloaded RAM
+  // arena. This is a startup copy into graph-owned DDR via pread; it is not
+  // the decode-time CPU source used by the DDR-affinity path above.
   const int fd = g.engine->model_file.fd_for_tensor(*m);
   const ssize_t got = direct_io::pread_direct_aware(
       fd, g.engine->model_file.direct_io_active_for(*m),
@@ -1232,9 +1371,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
              g.device_expert_layers,
              complete_records);
   }
-  LOG_INFO("[GGML-QWEN-FULL] host expert source=%.2f GiB (one graph-owned DDR copy)\n",
+  LOG_INFO("[GGML-QWEN-FULL] host expert source=%.2f GiB graph-owned DDR copy; "
+           "%.2f GiB aliased from preloaded DDR arena (%zu projection views)\n",
            static_cast<double>(g.host_weight_bytes) /
-               (1024.0 * 1024.0 * 1024.0));
+               (1024.0 * 1024.0 * 1024.0),
+           static_cast<double>(g.host_ram_alias_bytes) /
+               (1024.0 * 1024.0 * 1024.0),
+           g.host_ram_alias_tensors);
   if (g.host_weight_bytes > 0) {
     LOG_INFO("[GGML-QWEN-FULL] host expert source pinned=%.2f GiB; "
              "pin failures=%zu\n",
@@ -1273,6 +1416,17 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
       engine.family_ops.family != ModelFamily::Qwen4Exp)
     return false;
   const auto &c = engine.model_file.architecture_config;
+  if (engine.qwen_ram_preload_all_experts) {
+    for (int layer = 0; layer < c.n_layers; ++layer) {
+      if (!engine.graph_ram_layer_ready(layer)) {
+        LOG_WARN("[GGML-QWEN-FULL] disabled: ram_preload_all_experts "
+                 "requires a ready DDR arena for every layer (missing "
+                 "layer=%d); no GGUF mmap fallback\n",
+                 layer);
+        return false;
+      }
+    }
+  }
   const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   if (g_graph && g_graph->ready && g_graph->engine == &engine && g_graph->S == S) {
     // PLE rows are request data, so refresh that input when the graph shape
@@ -1317,10 +1471,12 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
   g->cpu = ggml_backend_cpu_init();
   if (!g->cuda || !g->cpu) return false;
 
-  // Admit the complete graph source set once, before any of its individual
-  // host buffers are allocated.  The ordinary RAM/VRAM preload is disabled
-  // for this mode in main.cpp, so this is one DDR copy rather than a second
-  // copy alongside the legacy expert tier.  The extra watermark covers the
+  // Admit the graph-owned expert source set once, before any of its
+  // individual host buffers are allocated.  Layers with a complete
+  // preloaded graph-RAM arena are excluded: their expert planes are aliased
+  // directly from the existing DDR cache below, so this graph does not make
+  // a second copy.  Any remaining layers use one graph-owned DDR copy rather
+  // than a decode-time GGUF mmap source.  The extra watermark covers the
   // GGML host context, prompt/state inputs, and allocator/I/O fluctuation;
   // no /proc/meminfo read is performed in the per-buffer allocation loop.
   const size_t expert_bytes = full_expert_source_bytes(engine);
@@ -1329,7 +1485,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
   // check in either graph file; aligned to the same 10 GiB floor as the
   // rest).
   constexpr size_t kGraphHostWatermark = 10ull * 1024ull * 1024ull * 1024ull;
-  if (expert_bytes == 0 ||
+  if (expert_bytes > 0 &&
       !MemoryGuard::try_reserve_host_bytes(expert_bytes,
                                            kGraphHostWatermark)) {
     LOG_WARN("[GGML-QWEN-FULL] host watermark refused graph source=%.2f GiB + %.2f GiB reserve; "
@@ -1342,10 +1498,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
   }
   g->host_reservation_bytes = expert_bytes;
   g->host_precharged_bytes = expert_bytes;
-  LOG_INFO("[GGML-QWEN-FULL] host watermark admitted source=%.2f GiB + %.2f GiB reserve\n",
+  LOG_INFO("[GGML-QWEN-FULL] host source admission: graph-owned=%.2f GiB + %.2f GiB reserve; "
+           "complete preloaded DDR arenas are aliased directly\n",
            static_cast<double>(expert_bytes) / (1024.0 * 1024.0 * 1024.0),
            static_cast<double>(kGraphHostWatermark) /
-               (1024.0 * 1024.0 * 1024.0));
+                 (1024.0 * 1024.0 * 1024.0));
   if (!init_device_expert_arena(*g)) return false;
   if (!init_device_dense_arena(*g)) return false;
   ggml_backend_t backends[] = {g->cuda, g->cpu};

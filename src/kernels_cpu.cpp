@@ -12,6 +12,7 @@
 #include <omp.h>
 #endif
 #include <cstdint>
+#include <mutex>
 #include <vector>
 #if defined(MOESTREAM_USE_GGML)
 // Keep these two ggml-internal declarations local instead of including
@@ -39,6 +40,18 @@ extern "C" void ggml_vec_dot_iq3_xxs_q8_K(int, float *, size_t, const void *,
 extern "C" void quantize_row_q8_0(const float *, void *, int64_t);
 extern "C" void ggml_vec_dot_iq4_nl_q8_0(int, float *, size_t, const void *,
                                            size_t, const void *, size_t, int);
+extern "C" void ggml_cpu_init(void);
+
+// GGML's quantized CPU dot kernels use ggml_table_f32_f16, which is filled by
+// ggml_cpu_init().  The normal GGML backend initializes it as a side effect of
+// ggml_backend_cpu_init(), but these direct Q8_K adapters can be called before
+// any persistent GGML graph exists (for example, from the Qwen CPU-affinity
+// fallback).  Without this guard the table is still zero-initialized and the
+// dot kernels silently return zero for otherwise valid IQ1/IQ2/IQ3 rows.
+static void ensure_ggml_cpu_initialized() {
+  static std::once_flag once;
+  std::call_once(once, [] { ggml_cpu_init(); });
+}
 #endif
 
 // Thread-safe "log this exactly once" -- cpu_quant_matmul's OMP parallel
@@ -1961,6 +1974,7 @@ bool matmul_iq1_m_ggml_q8k(float *y, const float *x,
   if (!y || !x || !W_quantized || S <= 0 || I <= 0 || O <= 0 || I % QK_K != 0) {
     return false;
   }
+  ensure_ggml_cpu_initialized();
   const int nblocks = I / QK_K;
   const size_t row_bytes = static_cast<size_t>(nblocks) * sizeof(moestream_ggml_block_iq1_m);
   std::vector<moestream_ggml_block_q8_K> xq(static_cast<size_t>(S) * nblocks);
@@ -1997,6 +2011,7 @@ bool matmul_iq1_m_ggml_q8k_grouped_impl(
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
       O <= 0 || I % QK_K != 0)
     return false;
+  ensure_ggml_cpu_initialized();
   const int nblocks = I / QK_K;
   const size_t row_bytes = static_cast<size_t>(nblocks) *
                            sizeof(moestream_ggml_block_iq1_m);
@@ -2314,6 +2329,7 @@ bool matmul_iqxxs_ggml_avx2_grouped_impl(
   if (!y || !x || !W_quantized || !dot || n_matrices <= 0 || S <= 0 ||
       I <= 0 || O <= 0 || I % QK_K != 0)
     return false;
+  ensure_ggml_cpu_initialized();
   const int nblocks = I / QK_K;
   const size_t row_bytes = static_cast<size_t>(nblocks) * block_bytes;
   std::vector<block_q8_K_local> xq(static_cast<size_t>(S) * nblocks);
@@ -2359,6 +2375,7 @@ bool matmul_iq4_nl_ggml_q8_0_grouped_impl(
   if (!y || !x || !W_quantized || n_matrices <= 0 || S <= 0 || I <= 0 ||
       O <= 0 || I % QK4_NL != 0)
     return false;
+  ensure_ggml_cpu_initialized();
   const int nblocks = I / QK4_NL;
   const size_t row_bytes = static_cast<size_t>(nblocks) * 18;
   std::vector<block_q8_0> xq(

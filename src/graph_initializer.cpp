@@ -628,6 +628,54 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         file.get_config_int("attention.indexer.key_length", 0);
     c.dsv4_indexer_top_k =
         file.get_config_int("attention.indexer.top_k", 0);
+    if (fam == ModelFamily::DeepSeek_V41) {
+      c.dsv41_kv_source_layers =
+          file.get_config_int_array("attention.kv_source_layers");
+      c.dsv41_index_source_layers =
+          file.get_config_int_array("attention.index_source_layers");
+      c.dsv41_candidate_source_layer =
+          file.get_config_int("attention.candidate_source_layer", -1);
+      c.dsv41_candidate_top_k_blocks =
+          file.get_config_int("attention.candidate_topk_blocks", 0);
+      c.dsv41_candidate_block_size =
+          file.get_config_int("attention.candidate_block_size", 0);
+      c.dsv41_engram_layer_ids = file.get_config_int_array("engram.layer_ids");
+      c.dsv41_engram_num_embeddings =
+          file.get_config_int_array("engram.num_embeddings");
+      c.dsv41_engram_primes = file.get_config_int_array("engram.primes");
+      c.dsv41_engram_offsets = file.get_config_int_array("engram.offsets");
+      c.dsv41_engram_multipliers =
+          file.get_config_int_array("engram.multipliers");
+      c.dsv41_engram_token_map =
+          file.get_config_int_array("engram.token_map");
+      c.dsv41_engram_max_ngram_size =
+          file.get_config_int("engram.max_ngram_size", 0);
+      c.dsv41_engram_vocab_size =
+          file.get_config_int("engram.vocab_size", 0);
+      c.dsv41_engram_n_heads = file.get_config_int("engram.head_count", 0);
+      c.dsv41_engram_head_dim = file.get_config_int("engram.key_length", 0);
+      c.dsv41_engram_pad_id = file.get_config_int("engram.pad_id", 2);
+      c.dsv41_engram_compressed_vocab_size =
+          file.get_config_int("engram.compressed_vocab_size", 0);
+
+      // The converter writes source lists, but infer them from the tensor
+      // presence as a compatibility fallback for early converted files.
+      if (c.dsv41_kv_source_layers.empty() ||
+          c.dsv41_index_source_layers.empty()) {
+        c.dsv41_kv_source_layers.clear();
+        c.dsv41_index_source_layers.clear();
+        for (int l = 0; l < c.n_layers; ++l) {
+          const std::string p = "blk." + std::to_string(l) + ".";
+          if (file.tensors.count(p + "attn_compressor_kv.weight"))
+            c.dsv41_kv_source_layers.push_back(l);
+          // attn_k/k_norm belong to the KV-key owner; the query-side
+          // indexer owner is identified by its proj/q_b pair.
+          if (file.tensors.count(p + "indexer.proj.weight") ||
+              file.tensors.count(p + "indexer.attn_q_b.weight"))
+            c.dsv41_index_source_layers.push_back(l);
+        }
+      }
+    }
     // Per-layer arrays (read_kv_array/get_config_float_array, gguf_loader.
     // hpp) -- empty vector (not a size-n_layers vector of the scalar
     // default) when the file doesn't set them; FFN call sites (Project B's
@@ -655,6 +703,17 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
                         << " swiglu_clamp_exp.size()=" << c.swiglu_clamp_exp.size()
                         << " swiglu_clamp_shexp.size()=" << c.swiglu_clamp_shexp.size()
                         << "\n";
+    }
+    if (fam == ModelFamily::DeepSeek_V41) {
+      LOG_STREAM_INFO() << "[DSV41] hc_mult=" << c.hc_mult
+                        << " sliding_window=" << c.sliding_window
+                        << " compress_ratios.size()="
+                        << c.dsv4_compress_ratios.size()
+                        << " kv_sources=" << c.dsv41_kv_source_layers.size()
+                        << " index_sources=" << c.dsv41_index_source_layers.size()
+                        << " engram_layers=" << c.dsv41_engram_layer_ids.size()
+                        << " engram_max_ngram=" << c.dsv41_engram_max_ngram_size
+                        << " engram_heads=" << c.dsv41_engram_n_heads << "\n";
     }
   }
 
@@ -1001,6 +1060,156 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     }
   }
 
+  if (fam == ModelFamily::DeepSeek_V41) {
+    if (c.dsv4_compress_ratios.size() < static_cast<size_t>(c.n_layers)) {
+      LOG_STREAM_ERROR() << "[DSV41] Invalid attention.compress_ratios: expected "
+                         << c.n_layers << " trunk entries, got "
+                         << c.dsv4_compress_ratios.size() << ".\n";
+      return false;
+    }
+    bool has_compressed = false;
+    for (int l = 0; l < c.n_layers; ++l) {
+      const int64_t ratio = c.dsv4_compress_ratios[(size_t)l];
+      if (ratio != 0 && ratio != 1 && ratio != 2) {
+        LOG_STREAM_ERROR() << "[DSV41] Invalid attention.compress_ratios["
+                           << l << "]=" << ratio
+                           << "; supported values are 0, 1, and 2.\n";
+        return false;
+      }
+      has_compressed |= ratio != 0;
+    }
+    if (has_compressed && c.dsv4_compress_rope_freq_base <= 0.0f) {
+      LOG_STREAM_ERROR() << "[DSV41] Compressed attention requires a positive "
+                            "attention.compress_rope_freq_base.\n";
+      return false;
+    }
+    if (has_compressed &&
+        (c.dsv4_indexer_head_count <= 0 || c.dsv4_indexer_key_length <= 0 ||
+         c.dsv4_indexer_top_k <= 0)) {
+      LOG_STREAM_ERROR() << "[DSV41] Compressed attention requires positive "
+                            "indexer head_count/key_length/top_k metadata.\n";
+      return false;
+    }
+
+    auto numel = [&file](const std::string &name) -> uint64_t {
+      auto it = file.tensors.find(name);
+      if (it == file.tensors.end()) return 0;
+      uint64_t n = 1;
+      for (uint64_t dim : it->second.shape) n *= dim;
+      return n;
+    };
+    auto source_for = [](const std::vector<int64_t> &sources, int l) {
+      return std::find(sources.begin(), sources.end(), (int64_t)l) !=
+             sources.end();
+    };
+    const int qh = c.qk_nope + c.qk_rope;
+    const int q_lora = file.get_config_int("attention.q_lora_rank", 0);
+    for (int l = 0; l < c.n_layers; ++l) {
+      const int ratio = (int)c.dsv4_compress_ratios[(size_t)l];
+      if (!ratio) continue;
+      const std::string p = "blk." + std::to_string(l) + ".";
+      const bool kv_source = source_for(c.dsv41_kv_source_layers, l);
+      const bool index_source = source_for(c.dsv41_index_source_layers, l);
+      const auto has_compatible_source = [l, &c](
+          const std::vector<int64_t> &sources) {
+        return std::any_of(sources.begin(), sources.end(), [l, &c](int64_t s) {
+          return s <= l && s >= 0 && s < c.n_layers &&
+                 c.dsv4_compress_ratios[(size_t)s] ==
+                     c.dsv4_compress_ratios[(size_t)l];
+        });
+      };
+      if (!has_compatible_source(c.dsv41_kv_source_layers)) {
+        LOG_STREAM_ERROR() << "[DSV41] Layer " << l
+                           << " has no compatible compressed-KV source.\n";
+        return false;
+      }
+      if (!has_compatible_source(c.dsv41_index_source_layers)) {
+        LOG_STREAM_ERROR() << "[DSV41] Layer " << l
+                           << " has no compatible indexer source.\n";
+        return false;
+      }
+      if (kv_source) {
+        if (numel(p + "attn_compressor_kv.weight") !=
+                (uint64_t)c.hidden * qh ||
+            numel(p + "attn_compressor_norm.weight") != (uint64_t)qh ||
+            (ratio == 2 && numel(p + "attn_compressor_gate.weight") !=
+                                (uint64_t)c.hidden * qh)) {
+          LOG_STREAM_ERROR() << "[DSV41] Layer " << l
+                             << " has incompatible compressor tensor shapes.\n";
+          return false;
+        }
+        if (numel(p + "indexer.attn_k.weight") !=
+                (uint64_t)qh * c.dsv4_indexer_key_length ||
+            numel(p + "indexer.k_norm.weight") !=
+                (uint64_t)c.dsv4_indexer_key_length) {
+          LOG_STREAM_ERROR() << "[DSV41] Layer " << l
+                             << " has incompatible indexer key tensors.\n";
+          return false;
+        }
+      }
+      if (index_source &&
+          (q_lora <= 0 || numel(p + "indexer.proj.weight") !=
+                              (uint64_t)c.hidden * c.dsv4_indexer_head_count ||
+           numel(p + "indexer.attn_q_b.weight") !=
+               (uint64_t)q_lora * c.dsv4_indexer_head_count *
+                   c.dsv4_indexer_key_length)) {
+        LOG_STREAM_ERROR() << "[DSV41] Layer " << l
+                           << " has incompatible indexer tensor shapes.\n";
+        return false;
+      }
+    }
+
+    if (c.dsv41_engram_layer_ids.empty()) {
+      LOG_STREAM_ERROR() << "[DSV41] Engram metadata is absent; refusing to "
+                            "run a V4.1 file without its conditional memory.\n";
+      return false;
+    }
+    {
+      const size_t n_engram = c.dsv41_engram_layer_ids.size();
+      const int n_hash_cols =
+          std::max(0, c.dsv41_engram_max_ngram_size - 1) *
+          c.dsv41_engram_n_heads;
+      if (c.dsv41_engram_max_ngram_size < 2 || c.dsv41_engram_n_heads <= 0 ||
+          c.dsv41_engram_head_dim <= 0 ||
+          c.dsv41_engram_primes.size() !=
+              n_engram * (size_t)n_hash_cols ||
+          c.dsv41_engram_offsets.size() !=
+              n_engram * (size_t)n_hash_cols ||
+          c.dsv41_engram_multipliers.size() !=
+              n_engram * (size_t)c.dsv41_engram_max_ngram_size ||
+          c.dsv41_engram_token_map.empty()) {
+        LOG_STREAM_ERROR() << "[DSV41] Incomplete Engram metadata; refusing "
+                             "to run without the converter's hash layout.\n";
+        return false;
+      }
+      for (size_t i = 0; i < n_engram; ++i) {
+        const int l = (int)c.dsv41_engram_layer_ids[i];
+        if (l < 0 || l >= c.n_layers) {
+          LOG_STREAM_ERROR() << "[DSV41] Engram layer id out of range: " << l
+                             << ".\n";
+          return false;
+        }
+        const std::string p = "blk." + std::to_string(l) + ".";
+        auto table = file.tensors.find(p + "engram_embd.weight");
+        if (table == file.tensors.end() || table->second.shape.size() != 2 ||
+            table->second.shape[0] != (uint64_t)c.dsv41_engram_head_dim ||
+            (!c.dsv41_engram_num_embeddings.empty() &&
+             table->second.shape[1] !=
+                 (uint64_t)c.dsv41_engram_num_embeddings[i]) ||
+            row_bytes(table->second.type, c.dsv41_engram_head_dim) == 0 ||
+            numel(p + "engram_q.weight") != (uint64_t)c.hc_mult * c.hidden ||
+            numel(p + "engram_k.weight") != (uint64_t)c.hc_mult * c.hidden ||
+            numel(p + "engram_wkv.weight") !=
+                (uint64_t)(c.hc_mult + 1) * c.hidden * n_hash_cols *
+                    c.dsv41_engram_head_dim) {
+          LOG_STREAM_ERROR() << "[DSV41] Engram tensors for layer " << l
+                             << " are missing or have incompatible shapes.\n";
+          return false;
+        }
+      }
+    }
+  }
+
   engine.family_ops = resolve_family_ops(fam, c);
   c.cache_shape = engine.family_ops.cache_shape;
 
@@ -1084,7 +1293,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     // already multiplies this coefficient through to exactly zero
     // contribution when it's 0, so no new RoPE code is needed for this --
     // only this one override.
-    if (fam == ModelFamily::DeepSeek_V4)
+    if (fam == ModelFamily::DeepSeek_V4 || fam == ModelFamily::DeepSeek_V41)
       c.rope_yarn_log_mul = 0.0f;
     // GLM5Next's text tower has NO rotary at all (n_rot == 0, nope-only MLA
     // -- the converter hard-rejects anything else), and its DSA kq_scale is
@@ -1242,7 +1451,8 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     const bool shared_fam =
         (wfam == ModelFamily::GLM_DSA || wfam == ModelFamily::GLM4_MOE ||
          wfam == ModelFamily::GLM5NEXT || wfam == ModelFamily::DeepSeek_V3 ||
-         wfam == ModelFamily::DeepSeek_V4);
+         wfam == ModelFamily::DeepSeek_V4 ||
+         wfam == ModelFamily::DeepSeek_V41);
     if (shared_fam && moe_prefill_batched()) {
       LOG_STREAM_WARN()
           << "[CONFIG] GLM/DeepSeek model detected with moe_prefill_batched "
@@ -1448,6 +1658,8 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   LOG_STREAM_INFO() << "[GRAPH] Attention type: "
                     << (fam == ModelFamily::GLM5NEXT
                             ? "HYBRID KDA (recurrent) + MLA (absorbed, DSA layers)"
+                        : fam == ModelFamily::DeepSeek_V41
+                            ? "MLA (raw SWA + shared compressed KV/indexer, Engram)"
                         : c.cache_shape == CacheShape::MLAAbsorbed
                             ? "MLA (absorbed)"
                         : c.cache_shape == CacheShape::MLARawSWA
@@ -1569,6 +1781,43 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       dense_preload_manifest.push_back(p + "attn_k_b.weight");
       dense_preload_manifest.push_back(p + "attn_v_b.weight");
       dense_preload_manifest.push_back(p + "attn_output.weight");
+    } else if (fam == ModelFamily::DeepSeek_V41) {
+      // DeepSeek-V4.1 uses the V4 raw/SWA tensor names, but its compressed
+      // tensors are ratio-1/2 source-layer weights and its indexer derives
+      // keys directly from the pooled latent. The huge engram table is never
+      // added here; it is mmap-gathered by deepseek41_engram.cpp.
+      dense_preload_manifest.push_back(p + "attn_q_a.weight");
+      dense_preload_manifest.push_back(p + "attn_q_a_norm.weight");
+      dense_preload_manifest.push_back(p + "attn_q_b.weight");
+      dense_preload_manifest.push_back(p + "attn_kv.weight");
+      dense_preload_manifest.push_back(p + "attn_kv_a_norm.weight");
+      dense_preload_manifest.push_back(p + "attn_sinks.weight");
+      dense_preload_manifest.push_back(p + "attn_output_a.weight");
+      dense_preload_manifest.push_back(p + "attn_output_b.weight");
+
+      const int64_t ratio = c.dsv4_compress_ratios[(size_t)l];
+      const bool kv_source = dsv41_is_layer_in(c.dsv41_kv_source_layers, l);
+      const bool index_source =
+          dsv41_is_layer_in(c.dsv41_index_source_layers, l);
+      if (ratio != 0 && kv_source) {
+        dense_preload_manifest.push_back(p + "attn_compressor_kv.weight");
+        if (ratio > 1)
+          dense_preload_manifest.push_back(p + "attn_compressor_gate.weight");
+        dense_preload_manifest.push_back(p + "attn_compressor_norm.weight");
+      }
+      if (ratio != 0 && index_source) {
+        dense_preload_manifest.push_back(p + "indexer.proj.weight");
+        dense_preload_manifest.push_back(p + "indexer.attn_q_b.weight");
+      }
+      if (ratio != 0 && kv_source) {
+        dense_preload_manifest.push_back(p + "indexer.attn_k.weight");
+        dense_preload_manifest.push_back(p + "indexer.k_norm.weight");
+      }
+      if (dsv41_is_engram_layer(c, l)) {
+        dense_preload_manifest.push_back(p + "engram_q.weight");
+        dense_preload_manifest.push_back(p + "engram_k.weight");
+        dense_preload_manifest.push_back(p + "engram_wkv.weight");
+      }
     } else if (c.cache_shape == CacheShape::MLARawSWA) {
       // MLA raw/SWA attention (DeepSeek-V4) -- no absorption tensors
       // (attn_k_b/attn_v_b/kv_lora-sized attn_kv_a_mqa): wkv already
@@ -1829,6 +2078,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   // constructor), so these tensors don't exist in a glm5next file.
   // Qwen4Exp likewise has its OWN low-rank output mixer instead.
   if (c.hc_mult > 1 && fam != ModelFamily::GLM5NEXT &&
+      fam != ModelFamily::DeepSeek_V41 &&
       fam != ModelFamily::Qwen4Exp) {
     dense_preload_manifest.push_back("output_hc_fn.weight");
     dense_preload_manifest.push_back("output_hc_base.weight");

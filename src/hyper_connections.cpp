@@ -141,6 +141,7 @@ const float *find_resident_float_anytype(StreamingEngine &engine,
 // [S, HC*D] buffer, ready for dense_proj.
 void hc_flatten_and_norm(StreamingEngine &engine, int S, int HC, int D,
                          std::vector<float> &out_normed) {
+  const float eps = engine.model_file.architecture_config.eps;
   int width = HC * D;
   out_normed.resize((size_t)S * width);
   for (int s = 0; s < S; ++s) {
@@ -148,7 +149,7 @@ void hc_flatten_and_norm(StreamingEngine &engine, int S, int HC, int D,
     float *out = out_normed.data() + (size_t)s * width;
     double ss = 0.0;
     for (int i = 0; i < width; ++i) ss += (double)row[i] * row[i];
-    float rms = (float)std::sqrt(ss / (double)width + 1e-6);
+    float rms = (float)std::sqrt(ss / (double)width + eps);
     float inv = 1.0f / rms;
     for (int i = 0; i < width; ++i) out[i] = row[i] * inv;
   }
@@ -168,6 +169,10 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
 
   engine.hc_post_gate_scratch.resize((size_t)S * HC);
   engine.hc_comb_scratch.resize((size_t)S * HC * HC);
+  if (engine.hc_pending_pre_mix.size() != (size_t)S * HC)
+    engine.hc_pending_pre_mix.assign((size_t)S * HC, 0.0f);
+  if (engine.hc_attn_pre_mix.size() != (size_t)S * HC)
+    engine.hc_attn_pre_mix.resize((size_t)S * HC);
 
   std::vector<float> normed;
   hc_flatten_and_norm(engine, S, HC, D, normed);
@@ -201,6 +206,22 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
     for (int h = 0; h < HC; ++h) {
       float b = base ? base[h] : 0.0f;
       pre_gate[h] = hc_sigmoid(row[h] * scale_pre + b) + c.hc_eps;
+    }
+    const float *collapse_mix = pre_gate.data();
+    if (sub_block == 0) {
+      std::memcpy(engine.hc_attn_pre_mix.data() + (size_t)s * HC,
+                  pre_gate.data(), (size_t)HC * sizeof(float));
+      collapse_mix = engine.hc_pending_pre_mix.data() + (size_t)s * HC;
+    } else {
+      collapse_mix = engine.hc_attn_pre_mix.data() + (size_t)s * HC;
+      std::memcpy(engine.hc_pending_pre_mix.data() + (size_t)s * HC,
+                  pre_gate.data(), (size_t)HC * sizeof(float));
+      if (layer_idx == c.n_layers - 1) {
+        if (engine.hc_final_pre_mix.size() != (size_t)S * HC)
+          engine.hc_final_pre_mix.resize((size_t)S * HC);
+        std::memcpy(engine.hc_final_pre_mix.data() + (size_t)s * HC,
+                    pre_gate.data(), (size_t)HC * sizeof(float));
+      }
     }
     // post-gate: mix[HC..2HC), sigmoid*2.
     for (int h = 0; h < HC; ++h) {
@@ -251,7 +272,7 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
     std::memset(out, 0, (size_t)D * sizeof(float));
     for (int h = 0; h < HC; ++h) {
       const float *stream_h = streams + (size_t)h * D;
-      float w = pre_gate[h];
+      float w = collapse_mix[h];
       for (int d = 0; d < D; ++d) out[d] += w * stream_h[d];
     }
   }
@@ -357,7 +378,8 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
                                   const std::string &inject_name, int S, int D,
                                   float *out_hidden, float *out_inject,
                                   int trace_layer,
-                                  const float *in_streams = nullptr) {
+                                  const float *in_streams,
+                                  bool force_original_quant) {
   auto &c = engine.model_file.architecture_config;
   const int HC = c.hc_mult;
   const int hc_dim = HC * D;
@@ -390,7 +412,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   // MEASURED 2026-09-05: hc_pre/hc_post together were 7.502 s of a 20.05 s
   // prefill (37%), entirely serial scalar code, and completely untimed
   // until this session added t_hc_hooks.
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
     const float *streams = streams_base + (size_t)s * HC * D;
     float *out = xn + (size_t)s * hc_dim;
@@ -414,7 +436,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
     // ran once per element, i.e. ~4.5M integer divisions per call at this
     // shape. i == s*hc_dim + j makes i % hc_dim == j exactly, so this is
     // the same multiply in the same order, just without the division.
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
     for (int s = 0; s < S; ++s) {
       float *row = xn + (size_t)s * hc_dim;
       for (int j = 0; j < hc_dim; ++j) row[j] *= norm_w[j];
@@ -426,25 +448,27 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
 
   // 3. low-rank gate: lo = silu(down(xn) / hc); gate = sigmoid(up(lo)).
   float *const lo = grow(lo_buf, (size_t)S * hc_lr);
-  dense_proj(engine, down_name, xn, lo, S, hc_dim, hc_lr);
+  dense_proj(engine, down_name, xn, lo, S, hc_dim, hc_lr,
+             force_original_quant);
   const float inv_hc = 1.0f / (float)HC;
   const size_t lo_n = (size_t)S * hc_lr;
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (size_t i = 0; i < lo_n; ++i) {
     float x = lo[i] * inv_hc;
     lo[i] = x / (1.0f + std::exp(-x)); // silu
   }
   float *const gate = grow(gate_buf, (size_t)S * hc_dim);
-  dense_proj(engine, up_name, lo, gate, S, hc_lr, hc_dim);
+  dense_proj(engine, up_name, lo, gate, S, hc_lr, hc_dim,
+             force_original_quant);
   // ~4.5M std::exp calls per call at this shape -- the single hottest loop
   // in the whole HC block, and it was serial.
   const size_t gate_n = (size_t)S * hc_dim;
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (size_t i = 0; i < gate_n; ++i)
     gate[i] = 1.0f / (1.0f + std::exp(-gate[i]));
 
   // 4. gated = xn * gate; mixed = mean over the HC streams.
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
     const float *xs = xn + (size_t)s * hc_dim;
     const float *gs = gate + (size_t)s * hc_dim;
@@ -459,7 +483,8 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   // 5. inject = w_inject(xn) -> [S, HC], consumed by the matching
   // hc_post_combine (per-layer hooks only).
   if (out_inject) {
-    dense_proj(engine, inject_name, xn, out_inject, S, hc_dim, HC);
+    dense_proj(engine, inject_name, xn, out_inject, S, hc_dim, HC,
+               force_original_quant);
     if (trace_gate("HC")) {
       const float *row = out_inject + (size_t)(S - 1) * HC;
       auto &&os = LOG_STREAM_VERBOSE();
@@ -496,8 +521,15 @@ bool qwen4exp_hc_device_live() { return g_hc_ggml_live; }
 // device-authoritative HC state. This is normally one pair per prefill (the
 // checkpoint has one PLE layer), and avoids silently dropping the PLE update
 // while the GGML HC path is live.
-bool qwen4exp_hc_prepare_host_layer_input(StreamingEngine &engine, int S) {
+bool qwen4exp_hc_prepare_host_layer_input(StreamingEngine &engine,
+                                          int layer_idx, int S) {
   if (!g_hc_ggml_live) return true;
+  // The FamilyOps hook is installed for Qwen because PLE is sparse by layer,
+  // not because every layer edits hc_stream_buf. Avoid a full HC D2H barrier
+  // on the other 47/48 decode layers; only the actual PLE layer needs a host
+  // view before its gather/hash update.
+  if (!qwen4exp_is_ple_layer(engine.model_file.architecture_config, layer_idx))
+    return true;
   if (GgmlHcRunner::instance().download_streams(engine.hc_stream_buf.data(), S))
     return true;
   hc_ggml_abort(engine, S, "layer-input host sync failed");
@@ -515,8 +547,11 @@ bool qwen4exp_hc_download_streams(StreamingEngine &engine, int S) {
       engine.hc_stream_buf.data(), S);
 }
 
-bool qwen4exp_hc_commit_host_layer_input(StreamingEngine &engine, int S) {
+bool qwen4exp_hc_commit_host_layer_input(StreamingEngine &engine,
+                                         int layer_idx, int S) {
   if (!g_hc_ggml_live) return true;
+  if (!qwen4exp_is_ple_layer(engine.model_file.architecture_config, layer_idx))
+    return true;
   if (GgmlHcRunner::instance().upload_streams(engine.hc_stream_buf.data(), S))
     return true;
   hc_ggml_abort(engine, S, "layer-input device sync failed");
@@ -536,9 +571,8 @@ static bool hc_ggml_usable(StreamingEngine &engine, int D) {
 // them to the runner. Kept here rather than in the runner so that header
 // needs nothing from engine.hpp.
 static bool hc_ggml_register(StreamingEngine &engine, int layer, int sub,
-                             int D) {
+                             int D, int S) {
   GgmlHcRunner &r = GgmlHcRunner::instance();
-  if (r.weights_ready(layer, sub)) return true;
   const std::string p = "blk." + std::to_string(layer) + ".";
   const std::string pre = (sub == 0) ? "hc_attn_" : "hc_ffn_";
   auto &c = engine.model_file.architecture_config;
@@ -575,12 +609,27 @@ static bool hc_ggml_register(StreamingEngine &engine, int layer, int sub,
     out.nbytes = W.meta.size_bytes;
     out.device_data = W.device_ptr;
     out.device_bytes = W.device_ptr ? W.meta.size_bytes : 0;
+    // Preserve the established Qwen quantized projection semantics in the
+    // device-HC graph.  Expanding Q8_0 down/up weights to F32 here changes
+    // the mixed activation enough to change later router IDs (the injected
+    // vector still matched, which made this easy to misdiagnose as a router
+    // or stream-ordering bug).  Device residency must not silently select a
+    // different numerical model; keep exact_f32_q8 available for diagnostics
+    // but do not enable it from the production handoff flag.
+    out.exact_f32_q8 = false;
     return true;
   };
   GgmlHcWeightRef dref, uref, iref;
   if (!ref(p + pre + "down.weight", dref) || !ref(p + pre + "up.weight", uref) ||
       !ref(p + pre + "inject.weight", iref))
     return false;
+  const bool custom_q8 = engine.qwen4exp_decode_custom_hc_q8 &&
+                         engine.qwen4exp_decode_device_hc && S == 1 &&
+                         dref.type == (uint32_t)GGUFType::Q8_0 &&
+                         uref.type == (uint32_t)GGUFType::Q8_0 &&
+                         (iref.type == (uint32_t)GGUFType::Q8_0 ||
+                          iref.type == (uint32_t)GGUFType::F32);
+  dref.custom_q8 = uref.custom_q8 = iref.custom_q8 = custom_q8;
   return r.ensure_weights(layer, sub, nref, dref, uref, iref);
 }
 
@@ -622,6 +671,43 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
   }
 
   engine.qwen4exp_hc_inject.resize((size_t)S * HC);
+  static const bool compare_decode_hc = [] {
+    const char *e = std::getenv("MOESTREAM_GGML_HC_COMPARE");
+    return e && e[0] == '1';
+  }();
+  const bool compare_this_call =
+      compare_decode_hc && S == 1 && sub_block == 1 && layer_idx < 2;
+  bool compare_ready = compare_this_call && g_hc_ggml_live;
+  std::vector<float> compare_streams;
+  std::vector<float> compare_hidden;
+  std::vector<float> compare_inject;
+  if (compare_ready) {
+    const size_t stream_count = (size_t)S * HC * D;
+    // After a device post-combine, engine.hc_stream_buf is deliberately stale:
+    // the GGML runner keeps the HC state authoritative on the device until the
+    // model-level collapse.  Comparing against that host buffer would compare
+    // the new graph with the PREVIOUS HC state and falsely report a large
+    // mismatch (especially at sub_block=1).  This diagnostic is opt-in, so a
+    // one-off D2H here is appropriate; the production path never takes it.
+    compare_streams.resize(stream_count);
+    if (!GgmlHcRunner::instance().download_streams(compare_streams.data(), S)) {
+      LOG_WARN("[GGML-HC-COMPARE] layer=%d sub=%d could not snapshot device HC state\n",
+               layer_idx, sub_block);
+      compare_streams.clear();
+    }
+    if (compare_streams.size() == stream_count) {
+      compare_hidden.resize((size_t)S * D);
+      compare_inject.resize((size_t)S * HC);
+      const std::string p_compare = "blk." + std::to_string(layer_idx) + ".";
+      qwen4exp_hc_mix_impl(
+          engine, p_compare + "hc_ffn_norm.weight",
+          p_compare + "hc_ffn_down.weight", p_compare + "hc_ffn_up.weight",
+          p_compare + "hc_ffn_inject.weight", S, D, compare_hidden.data(),
+          compare_inject.data(), layer_idx, compare_streams.data(), true);
+    } else {
+      compare_ready = false;
+    }
+  }
   if (g_hc_ggml_live) {
     const bool device_gdn_input =
         gdn_full_ggml() && sub_block == 0 &&
@@ -632,9 +718,22 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
     const bool device_full_attn_input =
         engine.qwen4exp_attn_gpu && sub_block == 0 && S > 0 &&
         !qwen4exp_is_gdn_layer(c, layer_idx);
+    // Keep the Qwen decode MoE input on the device independently of where
+    // routing is performed.  The host-router A/B path still needs a host
+    // copy of the mixed [D] row for the AVX-512 projection, but the grouped
+    // expert graph and HC post-combine must continue to consume the exact
+    // device-authoritative activation.  Previously this gate was tied to
+    // qwen_decode_gpu_router, so disabling only the GPU router also disabled
+    // the device MoE handoff and silently switched the whole routed FFN to a
+    // numerically different host path (including a different quantized
+    // expert execution/accumulation path).  Keep this Qwen-specific; other
+    // families never enter this branch.
+    const bool decode_device_moe_input =
+        S == 1 && engine.qwen4exp_decode_ggml_moe &&
+        engine.qwen4exp_decode_device_hc;
     const bool device_moe_input =
         moe_ggml_mul_mat_id() && sub_block == 1 &&
-        layer_idx >= c.first_dense && S > 1;
+        layer_idx >= c.first_dense && (S > 1 || decode_device_moe_input);
     const bool need_device_input =
         device_gdn_input || device_full_attn_input || device_moe_input;
     const bool keep_moe_input_on_device =
@@ -645,31 +744,76 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         // of the per-layer boundaries this path is intended to remove.
         // Without GPU routing the host router still needs hidden_states, so
         // its copy remains mandatory.
-        device_moe_input && moe_ggml_gpu_router();
+        device_moe_input && moe_ggml_gpu_router() &&
+        engine.qwen4exp_decode_gpu_router;
     const void *device_input = nullptr;
-    if (hc_ggml_register(engine, layer_idx, sub_block, D) &&
+    if (hc_ggml_register(engine, layer_idx, sub_block, D, S) &&
         GgmlHcRunner::instance().pre_mix(layer_idx, sub_block, S,
                                          dual_gdn_pre_output
                                              ? hidden_states
                                              : ((device_gdn_input ||
                                                  device_full_attn_input ||
                                                  keep_moe_input_on_device)
-                                                    ? nullptr
-                                                    : hidden_states),
+                                         ? nullptr
+                                         : hidden_states),
                                          need_device_input ? &device_input
                                                             : nullptr)) {
       GgmlHcRunner::instance().queue_pre_mix_dependency();
+      if (compare_ready && device_input) {
+        std::vector<float> device_hidden((size_t)S * D);
+        std::vector<float> device_inject((size_t)S * HC);
+        const bool hidden_ok = GgmlHcRunner::instance().copy_pre_mix_to_host(
+            device_input, device_hidden.data(), S);
+        const bool inject_ok = GgmlHcRunner::instance().download_inject(
+            device_inject.data(), S);
+        double max_hidden_abs = 0.0;
+        double max_hidden_rel = 0.0;
+        double max_inject_abs = 0.0;
+        double max_inject_rel = 0.0;
+        if (hidden_ok) {
+          for (size_t i = 0; i < device_hidden.size(); ++i) {
+            const double a = device_hidden[i];
+            const double b = compare_hidden[i];
+            max_hidden_abs = std::max(max_hidden_abs, std::abs(a - b));
+            max_hidden_rel = std::max(
+                max_hidden_rel, std::abs(a - b) /
+                                    std::max(1.0e-6, std::abs(b)));
+          }
+        }
+        if (inject_ok) {
+          for (size_t i = 0; i < device_inject.size(); ++i) {
+            const double a = device_inject[i];
+            const double b = compare_inject[i];
+            max_inject_abs = std::max(max_inject_abs, std::abs(a - b));
+            max_inject_rel = std::max(
+                max_inject_rel, std::abs(a - b) /
+                                    std::max(1.0e-6, std::abs(b)));
+          }
+        }
+        LOG_WARN(
+            "[GGML-HC-COMPARE] layer=%d sub=%d hidden=%s max_abs=%g "
+            "max_rel=%g inject=%s max_abs=%g max_rel=%g\n",
+            layer_idx, sub_block, hidden_ok ? "ok" : "failed", max_hidden_abs,
+            max_hidden_rel, inject_ok ? "ok" : "failed", max_inject_abs,
+            max_inject_rel);
+      }
       // The normal device path consumes the injection vector from the
       // persistent GGML tensor in post_combine.  Do not download it here:
       // tensor_get synchronizes the backend stream once per bracket.  If a
       // later device operation fails, hc_ggml_abort() downloads the current
       // injection tensor before switching the pass back to the host path.
+      // Use the runner's stable GGML tensor handle at the handoff.  The
+      // downstream GDN/router/MoE graphs need ne/nb/buffer metadata; a raw
+      // CUDA data pointer is not a valid replacement even though both are
+      // represented as opaque `const void *` at this API boundary.
+      const void *mixed_tensor =
+          GgmlHcRunner::instance().device_mixed_tensor();
       if (device_gdn_input)
-        engine.qwen4exp_device_hc_input = device_input;
+        engine.qwen4exp_device_hc_input = mixed_tensor;
       if (device_full_attn_input)
-        engine.qwen4exp_device_hc_input = device_input;
+        engine.qwen4exp_device_hc_input = mixed_tensor;
       if (device_moe_input)
-        engine.qwen4exp_device_hc_ffn_input = device_input;
+        engine.qwen4exp_device_hc_ffn_input = mixed_tensor;
       check_finite_hc("hidden_states (post qwen4exp hc_pre_mix, ggml)",
                       layer_idx, hidden_states, (size_t)S * D, D);
       return;
@@ -679,7 +823,8 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
   qwen4exp_hc_mix_impl(engine, p + prefix + "norm.weight",
                          p + prefix + "down.weight", p + prefix + "up.weight",
                          p + prefix + "inject.weight", S, D, hidden_states,
-                         engine.qwen4exp_hc_inject.data(), layer_idx);
+                         engine.qwen4exp_hc_inject.data(), layer_idx,
+                         nullptr, false);
   check_finite_hc("hidden_states (post qwen4exp hc_pre_mix)", layer_idx,
                   hidden_states, (size_t)S * D, D);
 }
@@ -701,7 +846,7 @@ void qwen4exp_hc_post_combine(StreamingEngine &engine, int layer_idx,
   // Per-token independent (each s touches only its own HC*D stream slice),
   // so this is bit-identical to the serial form -- same reasoning as the
   // matching loops in qwen4exp_hc_pre_mix.
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
     const float *inj = engine.qwen4exp_hc_inject.data() + (size_t)s * HC;
     float *streams = engine.hc_stream_buf.data() + (size_t)s * HC * D;
@@ -734,9 +879,80 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
     return false;
   if (sub_block == 1)
     GgmlMoeRunner::active_instance().wait_device_output();
+
+  // Diagnostic-only oracle for the device post-combine.  The pilot consumes
+  // stream 0 after this operation, so a projection/input mismatch here can
+  // look exactly like a bad router predictor.  Keep this behind the existing
+  // explicit HC comparison switch and restrict it to the first two decode
+  // layers; it deliberately pays the D2H synchronizations only in that
+  // diagnostic run, never in the production path.
+  static const bool compare_post = [] {
+    const char *e = std::getenv("MOESTREAM_GGML_HC_COMPARE");
+    return e && e[0] == '1';
+  }();
+  const bool compare_this_call = compare_post && S == 1 && sub_block == 1 &&
+                                 layer_idx < 2;
+  std::vector<float> before_streams;
+  std::vector<float> inject;
+  std::vector<float> sub_out;
+  if (compare_this_call) {
+    before_streams.resize((size_t)S * engine.model_file.architecture_config.hc_mult * D);
+    inject.resize((size_t)S * engine.model_file.architecture_config.hc_mult);
+    sub_out.resize((size_t)S * D);
+    const bool before_ok = GgmlHcRunner::instance().download_streams(
+        before_streams.data(), S);
+    const bool inject_ok = GgmlHcRunner::instance().download_inject(
+        inject.data(), S);
+    // Qwen's device-HC path passes the output of the routed+shared graph.
+    // That tensor belongs to GgmlQwenSharedRunner, not the routed
+    // GgmlMoeRunner, so the latter's output-slot validator correctly rejects
+    // it.  Try the Qwen combined-output owner first; retain the routed
+    // fallback for diagnostics of the non-shared path.
+    bool output_ok = GgmlQwenSharedRunner::instance().copy_output_to_host(
+        device_sub_block_out, sub_out.data());
+    if (!output_ok)
+      output_ok = GgmlMoeRunner::active_instance().copy_device_output_to_host(
+          device_sub_block_out, sub_out.data());
+    if (!before_ok || !inject_ok || !output_ok) {
+      LOG_WARN("[GGML-HC-POST-COMPARE] layer=%d snapshot failed before=%s "
+               "inject=%s output=%s\n",
+               layer_idx, before_ok ? "ok" : "failed",
+               inject_ok ? "ok" : "failed", output_ok ? "ok" : "failed");
+      before_streams.clear();
+      inject.clear();
+      sub_out.clear();
+    }
+  }
   if (GgmlHcRunner::instance().post_combine_device(
           layer_idx, /*runner_sub_block=*/0, S, device_sub_block_out))
-    return true;
+    {
+      if (compare_this_call && !before_streams.empty()) {
+        std::vector<float> after_streams(before_streams.size());
+        const bool after_ok = GgmlHcRunner::instance().download_streams(
+            after_streams.data(), S);
+        double max_abs = 0.0;
+        double max_rel = 0.0;
+        if (after_ok) {
+          const int HC = engine.model_file.architecture_config.hc_mult;
+          const float inv_hc = 1.0f / (float)HC;
+          for (int h = 0; h < HC; ++h) {
+            const float w = 2.0f / (1.0f + std::exp(-inject[(size_t)h] * inv_hc));
+            for (int d = 0; d < D; ++d) {
+              const size_t i = (size_t)h * D + d;
+              const float expected = before_streams[i] + sub_out[(size_t)d] * w;
+              const double err = std::abs((double)after_streams[i] - expected);
+              max_abs = std::max(max_abs, err);
+              max_rel = std::max(
+                  max_rel, err / std::max(1.0e-6, std::abs((double)expected)));
+            }
+          }
+        }
+        LOG_WARN("[GGML-HC-POST-COMPARE] layer=%d after=%s max_abs=%g "
+                 "max_rel=%g\n",
+                 layer_idx, after_ok ? "ok" : "failed", max_abs, max_rel);
+      }
+      return true;
+    }
   // Preserve the existing all-or-nothing HC invariant. The caller will copy
   // the MoE result back and invoke the ordinary host hook after this abort.
   hc_ggml_abort(engine, S, "post_combine_device failed");
@@ -763,6 +979,11 @@ void hc_expand_embedding(StreamingEngine &engine, const float *hidden_states,
                          int S, int D) {
   auto &c = engine.model_file.architecture_config;
   int HC = c.hc_mult;
+  engine.hc_pending_pre_mix.assign((size_t)S * HC, 0.0f);
+  engine.hc_attn_pre_mix.assign((size_t)S * HC, 0.0f);
+  engine.hc_final_pre_mix.clear();
+  for (int s = 0; s < S; ++s)
+    engine.hc_pending_pre_mix[(size_t)s * HC] = 1.0f;
   engine.hc_stream_buf.resize((size_t)S * HC * D);
   // Structural repeat, no weights -- every one of the HC streams starts as
   // an identical copy of the token embedding (ggml_repeat_4d in
@@ -874,8 +1095,34 @@ void hc_collapse_output(StreamingEngine &engine, float *hidden_states, int S,
     qwen4exp_hc_mix_impl(engine, "output_hc_norm.weight",
                            "output_hc_down.weight", "output_hc_up.weight",
                            /*inject_name=*/"", S, D, hidden_states,
-                           /*out_inject=*/nullptr, /*trace_layer=*/-1);
+                           /*out_inject=*/nullptr, /*trace_layer=*/-1,
+                           nullptr, false);
     check_finite_hc("hidden_states (post qwen4exp hc_collapse_output)", -1,
+                    hidden_states, (size_t)S * D, D);
+    return;
+  }
+
+  // DeepSeek-V4.1 deliberately omits the V4 model-level output_hc_* head.
+  // The reference Transformer uses the final block's FFN pre-mix to collapse
+  // the HC streams, then generation_loop applies output_norm normally.
+  if (detect_model_family(engine.model_file) == ModelFamily::DeepSeek_V41) {
+    if (engine.hc_final_pre_mix.size() != (size_t)S * HC) {
+      LOG_ERROR("[DSV41-HC] final FFN pre-mix is unavailable; zeroing output\n");
+      std::memset(hidden_states, 0, (size_t)S * D * sizeof(float));
+      return;
+    }
+    for (int s = 0; s < S; ++s) {
+      const float *streams = engine.hc_stream_buf.data() + (size_t)s * HC * D;
+      const float *mix = engine.hc_final_pre_mix.data() + (size_t)s * HC;
+      float *out = hidden_states + (size_t)s * D;
+      std::memset(out, 0, (size_t)D * sizeof(float));
+      for (int h = 0; h < HC; ++h) {
+        const float w = mix[h];
+        const float *stream_h = streams + (size_t)h * D;
+        for (int d = 0; d < D; ++d) out[d] += w * stream_h[d];
+      }
+    }
+    check_finite_hc("hidden_states (post DSV41 final pre-mix)", -1,
                     hidden_states, (size_t)S * D, D);
     return;
   }

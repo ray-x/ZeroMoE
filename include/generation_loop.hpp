@@ -21,6 +21,7 @@
 #include <iostream>
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
@@ -214,6 +215,31 @@ public:
         return V - 1;
     }
 };
+
+// Keep the historical default unchanged, but allow controlled benchmark runs
+// to match another runtime's sampling policy.  In particular, applying a
+// 1.3 penalty to the prompt's special tokens can change the very first decode
+// token, so it must not be silently mixed into a BeeLlama parity comparison.
+// This is intentionally an environment override rather than a model-wide
+// default/config change: existing models retain exactly the old behavior.
+inline float moestream_repetition_penalty() {
+    static const float penalty = [] {
+        constexpr float default_penalty = 1.3f;
+        const char* text = std::getenv("MOESTREAM_REPETITION_PENALTY");
+        if (!text || !*text) return default_penalty;
+
+        char* end = nullptr;
+        const float value = std::strtof(text, &end);
+        if (end == text || *end != '\0' || !std::isfinite(value) || value <= 0.0f) {
+            LOG_WARN("[GEN] ignoring invalid MOESTREAM_REPETITION_PENALTY='%s'\n", text);
+            return default_penalty;
+        }
+        LOG_INFO("[GEN] MOESTREAM_REPETITION_PENALTY=%.6g (default=%.6g)\n",
+                 value, default_penalty);
+        return value;
+    }();
+    return penalty;
+}
 
 // `prefetcher` is caller-owned (main.cpp starts it ONCE for the whole
 // session with the real VRAM topology and a pointer back to ram_mgr --
@@ -711,14 +737,14 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // it less likely (dividing a positive logit or multiplying a
         // negative one both reduce post-softmax probability).
         {
-            constexpr float REPETITION_PENALTY = 1.3f;
+            const float repetition_penalty = moestream_repetition_penalty();
             constexpr int REPETITION_WINDOW = 64;
             int start = std::max(0, (int)sequence.size() - REPETITION_WINDOW);
             for (int i = start; i < (int)sequence.size(); ++i) {
                 int tok = sequence[i];
                 if (tok < 0 || tok >= V) continue;
                 float& l = logits[tok];
-                l = (l > 0.0f) ? (l / REPETITION_PENALTY) : (l * REPETITION_PENALTY);
+                l = (l > 0.0f) ? (l / repetition_penalty) : (l * repetition_penalty);
             }
         }
 

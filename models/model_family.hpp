@@ -30,6 +30,8 @@ enum class ModelFamily {
                // family_ops table and CLAUDE.md's DeepSeek-V4 plan writeup.
                // Phase 1 only: correct within each layer's local SWA window;
                // CSA/HCA/Lightning-Indexer long-context tiers are future work.
+  DeepSeek_V41, // DeepSeek-V4.1-Flash: shared ratio-1/2 compressed MLA,
+                // Hyper-Connections, and conditional-memory Engram layers.
   GLM5NEXT,    // GLM 5.3 Flash (GGUF arch "glm5next"): HYBRID per-layer
                // architecture -- recurrent KDA layers (head_count_kv[l]==0)
                // interleaved with nope-only absorbed-MLA DSA layers, plus
@@ -79,6 +81,8 @@ inline ModelFamily detect_model_family(const GGUFFile &model_file) {
     return ModelFamily::DeepSeek_V3;
   if (arch == "deepseek4")
     return ModelFamily::DeepSeek_V4;
+  if (arch == "deepseek41")
+    return ModelFamily::DeepSeek_V41;
   if (arch == "glm5next")
     return ModelFamily::GLM5NEXT;
   if (arch == "qwen4exp")

@@ -105,3 +105,43 @@ struct Dsv4CompressedLayerState {
         std::fill(indexer_state_score.begin(), indexer_state_score.end(), 0.0f);
     }
 };
+
+// V4.1 does not use V4's ratio-4 overlap compressor. It pools ratio-1/2
+// groups, publishes the result from source layers, and derives index keys
+// directly from the unrotated pooled latent. Keep the state separate so the
+// older CSA/HCA state machine cannot be selected by accident.
+struct Dsv41CompressedLayerState {
+    int ratio = 0;
+    int key_dim = 0;
+    int indexer_key_dim = 0;
+    int cache_capacity = 0;
+    std::vector<float> keys;
+    std::vector<float> indexer_keys;
+    std::vector<float> pending_kv;
+    std::vector<float> pending_score;
+    int pending_count = 0;
+
+    bool enabled() const { return ratio > 0; }
+
+    void configure(int new_ratio, int new_key_dim, int max_tokens,
+                   int new_indexer_key_dim = 0) {
+        ratio = new_ratio;
+        key_dim = new_key_dim;
+        indexer_key_dim = new_indexer_key_dim;
+        cache_capacity = dsv4_compressed_cache_capacity(max_tokens, ratio);
+        keys.assign(static_cast<size_t>(cache_capacity) * key_dim, 0.0f);
+        indexer_keys.assign(static_cast<size_t>(cache_capacity) * indexer_key_dim,
+                            0.0f);
+        pending_kv.assign(static_cast<size_t>(ratio) * key_dim, 0.0f);
+        pending_score.assign(static_cast<size_t>(ratio) * key_dim, 0.0f);
+        pending_count = 0;
+    }
+
+    void reset() {
+        std::fill(keys.begin(), keys.end(), 0.0f);
+        std::fill(indexer_keys.begin(), indexer_keys.end(), 0.0f);
+        std::fill(pending_kv.begin(), pending_kv.end(), 0.0f);
+        std::fill(pending_score.begin(), pending_score.end(), 0.0f);
+        pending_count = 0;
+    }
+};

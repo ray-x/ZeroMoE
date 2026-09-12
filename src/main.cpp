@@ -290,6 +290,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     engine.drop_expert_pages = config.drop_pages;
     engine.unpacked_expert_format = config.unpacked_expert_format;
     engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;
+    engine.qwen_ram_preload_all_experts = config.ram_preload_all_experts;
     ram_mgr.configured_total_experts =
         std::max(0, config.ram_cache_total_experts);
     // Must be set BEFORE the [PIN] preload block below -- that's where the
@@ -340,7 +341,17 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         config.qwen4exp_router_pilot_prefetch_k;
     engine.qwen4exp_router_pilot_prefetch_exclude_layers =
         config.qwen4exp_router_pilot_prefetch_exclude_layers;
+    engine.qwen4exp_router_pilot_predict_layers =
+        config.qwen4exp_router_pilot_predict_layers;
+    engine.qwen4exp_router_pilot_skip_fully_cached =
+        config.qwen4exp_router_pilot_skip_fully_cached;
+    engine.qwen4exp_router_pilot_skip_prefetch_excluded_layers =
+        config.qwen4exp_router_pilot_skip_prefetch_excluded_layers;
     engine.qwen4exp_decode_ggml_moe = config.qwen4exp_decode_ggml_moe;
+    engine.qwen4exp_decode_device_hc = config.qwen4exp_decode_device_hc;
+    engine.qwen4exp_decode_custom_hc_q8 =
+        config.qwen4exp_decode_custom_hc_q8;
+    engine.qwen4exp_decode_gpu_router = config.qwen4exp_decode_gpu_router;
     engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
     engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
     engine.glm5next_router_gpu = config.glm5next_router_gpu;
@@ -417,6 +428,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     if (!gpu.initialize()) {
         return std::unexpected("Failed to initialize GPU subsystem");
     }
+    gpu.set_dense_async_copies(config.dense_async_copies);
     gpu.report_vram_usage("after gpu.initialize()");
     engine.gpu = &gpu;  // give the forward path access to dense GPU dispatch
     // Captured separately (not read back via engine.gpu) so StreamingEngine's
@@ -659,14 +671,33 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             const size_t raw_layer_bytes = engine.compute_expert_slab_bytes(l);
             // The compact pool is still laid out in byte-addressable VRAM,
             // but 4 KiB region padding keeps every following slot/page base
-            // aligned for future direct GPU/file transfers. This is tiny
-            // overhead compared with the old global row-LCM stride.
+            // aligned for future direct GPU/file transfers. Explicit
+            // full-layer prefix regions additionally need a stride that is a
+            // whole number of quantization rows so GGML's MUL_MAT_ID can view
+            // the resident slots without a repack. Ordinary compact regions
+            // retain the smaller 4 KiB-only layout.
             constexpr size_t COMPACT_REGION_ALIGNMENT = 4096;
             size_t layer_slot_bytes = raw_layer_bytes;
             if (layer_slot_bytes > 0) {
-                const size_t rem = layer_slot_bytes % COMPACT_REGION_ALIGNMENT;
-                if (rem != 0 && layer_slot_bytes <= SIZE_MAX - (COMPACT_REGION_ALIGNMENT - rem)) {
-                    layer_slot_bytes += COMPACT_REGION_ALIGNMENT - rem;
+                size_t slot_alignment = COMPACT_REGION_ALIGNMENT;
+                if (config.vram_cache_full_layer_prefix > l) {
+                    const size_t row_alignment =
+                        engine.expert_cache_layer_stride_alignment(l);
+                    if (row_alignment == SIZE_MAX) {
+                        LOG_STREAM_WARN()
+                            << "[GPU] Full-layer cache row alignment overflow at layer "
+                            << l << "; leaving the 4 KiB compact stride\n";
+                    } else if (row_alignment > 1) {
+                        // The direct-view path only needs row alignment. Do
+                        // not take the LCM with 4096 here: for IQ formats the
+                        // LCM can be tens of MiB per expert and would waste
+                        // most of the cache on alignment padding alone.
+                        slot_alignment = row_alignment;
+                    }
+                }
+                const size_t rem = layer_slot_bytes % slot_alignment;
+                if (rem != 0 && layer_slot_bytes <= SIZE_MAX - (slot_alignment - rem)) {
+                    layer_slot_bytes += slot_alignment - rem;
                 }
             }
             expert_layer_slab_bytes[(size_t)l] = layer_slot_bytes;
@@ -722,8 +753,35 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
          engine.family_ops.family == ModelFamily::GLM5NEXT) ||
         (deepseek_v4_full_graph_enabled() &&
          engine.family_ops.family == ModelFamily::DeepSeek_V4);
-    const bool graph_ram_cache = graph_mode &&
-        std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr;
+    // Qwen's complete expert set is already loaded into the RAM tier when
+    // ram_preload_all_experts is enabled.  Its optional full graph must use
+    // those fixed-stride DDR arenas directly; otherwise it would create a
+    // second graph-owned DDR copy by reading the GGUF shards at graph
+    // startup.  Keep the explicit environment switch for the other graph
+    // families, whose source ownership rules are different.
+    const bool graph_ram_cache =
+        graph_mode &&
+        (std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
+         (engine.family_ops.family == ModelFamily::Qwen4Exp &&
+          config.ram_preload_all_experts));
+    // Qwen CPU-affinity layers use the same fixed-stride host-RAM arena as
+    // the full graph, but only when the configured RAM preload really owns
+    // every expert in those layers. This gives the CPU MUL_MAT_ID graph a
+    // stable DDR source without enabling the full-graph cache or changing
+    // any other model family's cache policy.
+    const bool qwen_cpu_ram_cache =
+        !graph_mode && config.qwen4exp_cpu_ggml_moe &&
+        engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        !config.cpu_affinity_layers.empty() && config.ram_preload_all_experts;
+    const bool ram_graph_cache = graph_ram_cache || qwen_cpu_ram_cache;
+    if (engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        config.ram_preload_all_experts) {
+        LOG_STREAM_INFO()
+            << "[CONFIG] Qwen MoE source contract: use the already-preloaded "
+               "DDR RAM tier directly; file-backed GGUF expert mmap fallback "
+               "is disabled. The PLE table may still be mmap-backed, but MoE "
+               "expert planes are not.\n";
+    }
     if (engine.mtp_enabled && engine.family_ops.family == ModelFamily::GLM5NEXT &&
         glm5next_full_graph_enabled()) {
         LOG_STREAM_INFO()
@@ -1468,10 +1526,24 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
     // expert set fits the already-calculated RAM capacity are exposed as
     // fixed-stride graph tensors. The remaining layers use the graph's
     // source-backed fallback and retain normal lazy cache behavior.
-    if (graph_ram_cache) {
+    if (ram_graph_cache) {
         std::vector<int> graph_ram_full_layers;
         const int n_experts = engine.model_file.architecture_config.n_experts;
         for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
+            const bool qwen_cpu_layer =
+                qwen_cpu_ram_cache && is_cpu_affinity_layer(layer);
+            // A full-graph RAM cache is intentionally complete-model wide,
+            // but the Qwen CPU-affinity path only needs fixed-stride arenas
+            // for its CPU layers.  `graph_ram_cache` is also true for the
+            // Qwen CPU mode, so testing it directly here used to allocate
+            // graph arenas for every layer.  That was wasteful and made the
+            // source ownership harder to audit; non-CPU Qwen layers already
+            // use the ordinary RAM cache.  In either case the bytes are
+            // populated by the preload block below, never by GGUF mmap at
+            // decode time.
+            const bool full_graph_ram_layer = graph_mode && graph_ram_cache;
+            if (!full_graph_ram_layer && !qwen_cpu_layer)
+                continue;
             if (n_experts <= 0 || engine.compute_expert_slab_bytes(layer) == 0 ||
                 (int)engine.layers_experts[(size_t)layer].size() < n_experts ||
                 ram_mgr.cap_for_layer(layer) < n_experts)
@@ -1570,19 +1642,20 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         };
     }
 
-    // The opt-in Qwen4Exp full graph owns one complete host-side expert
-    // backing set for ggml MUL_MAT_ID.  Running the ordinary pin/preload
-    // pipeline as well would allocate a second complete expert set before
-    // graph preparation (about 42 GB on UD-IQ1_M), and can push this box
-    // into swap/OOM.  The graph still reads every expert into DDR before its
-    // measured prefill; it just avoids maintaining the unrelated legacy
-    // RAM/VRAM cache alongside it.  If the graph declines and falls back,
-    // that fallback is intentionally visible in the log rather than silently
+    // The opt-in Qwen4Exp full graph needs one complete host-side expert
+    // backing set for ggml MUL_MAT_ID.  With MOESTREAM_FULL_GRAPH_USE_RAM_CACHE
+    // enabled, that set is the already-preloaded fixed-stride DDR arena and
+    // the graph aliases it directly; otherwise the graph owns one startup
+    // pread-backed DDR copy.  Running the ordinary pin/preload pipeline as
+    // well without the RAM-cache mode would allocate a second complete expert
+    // set before graph preparation (about 42 GB on UD-IQ1_M), and can push
+    // this box into swap/OOM.  If the graph declines and falls back, that
+    // fallback is intentionally visible in the log rather than silently
     // paying this unsafe duplicate allocation.
     if ((!graph_mode || graph_ram_cache) &&
         (!config.pin_file.empty() || config.ram_preload_all_experts) &&
         ram_mgr.vram_cache &&
-        (graph_ram_cache || ram_mgr.vram_cache->expert_vram_cache_cap > 0)) {
+        (ram_graph_cache || ram_mgr.vram_cache->expert_vram_cache_cap > 0)) {
         ram_mgr.vram_cache->startup_preload_phase = true;
         auto [entries, maxc] = StreamingEngine::load_usage(config.pin_file);
         const bool usage_file_had_entries = !entries.empty();
@@ -2144,7 +2217,11 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     MoEExpertBlock s;
                     engine.load_expert_slab(flat[i].layer, flat[i].expert, s);
                     if (!s.slab_buffer || s.slab_capacity == 0) {
-                        if (s.slab_buffer) free(s.slab_buffer);
+                        // load_expert_slab may have persistently pinned this
+                        // temporary VRAM-promotion slab.  Route cleanup
+                        // through the engine owner so CUDA unregisters the
+                        // range before the allocation is freed.
+                        engine.release_slab(s);
                         continue;  // counted as a normal disk-read miss when the main loop retries it
                     }
                     ExpertLocation* loc = gpu.topology.upload_expert(
@@ -2156,7 +2233,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     } else {
                         ++pin_core_gpu_redirect_fallback;  // that GPU's own slots are already full
                     }
-                    free(s.slab_buffer);
+                    engine.release_slab(s);
                 }
             }
 
@@ -2284,14 +2361,15 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 }
                 int n = (int)v.size();
                 // A complete prefix layer is intentionally placed in expert
-                // ID order.  Its membership is unchanged (all experts in
+                // ID order. Its membership is unchanged (all experts in
                 // the layer are still loaded and pinned), but the physical
                 // VRAM slots then form the regular [expert 0, expert 1, ...]
                 // layout that GGML's 3-D MUL_MAT_ID tensor can view directly.
-                // evict_lru takes empty slots from the back because
-                // pin_expert removes entries with swap-and-pop, so the load
-                // order is descending to make the resulting device pointers
-                // increase with the expert ID.
+                // evict_lru takes the first available empty slot, while
+                // pin_expert removes that slot from the free-list with
+                // swap-and-pop. Therefore ascending IDs are required here:
+                // expert 0 must occupy the first physical slot, expert 1 the
+                // next one, and so on.
                 // Partial prefix layers keep the historical frequency order
                 // because they cannot use the direct resident-layer view.
                 const bool complete_prefix_layer =
@@ -2299,7 +2377,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                 if (complete_prefix_layer) {
                     std::stable_sort(v.begin(), v.end(),
                                      [](const auto &a, const auto &b) {
-                                         return a.expert > b.expert;
+                                         return a.expert < b.expert;
                                      });
                 }
                 // cpu_affinity_layers (config): never pin or pre-warm VRAM
@@ -2389,7 +2467,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         } else {
                             ++tier1_disk_fail;
                         }
-                        if (s.slab_buffer) free(s.slab_buffer);
+                        engine.release_slab(s);
                     }
                     i = chunk_end;
                 }
@@ -2431,7 +2509,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         } else {
                             ++tier2_disk_fail;
                         }
-                        if (s.slab_buffer) free(s.slab_buffer);
+                        engine.release_slab(s);
                     }
                     i = chunk_end;
                 }
@@ -2521,12 +2599,11 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                             // A graph RAM arena has one immutable slice per
                             // expert ID. The normal preload path writes the
                             // ranked list densely, which is correct for the
-                            // LRU cache but gives a shared graph arena the
-                            // wrong identity-to-slice mapping. Use the expert
-                            // ID as the slot in graph RAM mode.
+                            // LRU cache but gives a shared arena the wrong
+                            // identity-to-slice mapping. Use the expert ID
+                            // as the slot whenever an arena is allocated.
                             int slot_idx =
-                                (graph_ram_cache &&
-                                 engine.graph_ram_layer_allocated(layer))
+                                engine.graph_ram_layer_allocated(layer)
                                     ? v[i].expert
                                     : off + j;
                             items.emplace_back(v[i].layer, v[i].expert,
@@ -2541,8 +2618,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                         for (int j = 0; j < chunk_n; ++j) {
                             int i = ram_start_i + off + j;
                             int slot_idx =
-                                (graph_ram_cache &&
-                                 engine.graph_ram_layer_allocated(layer))
+                                engine.graph_ram_layer_allocated(layer)
                                     ? v[i].expert
                                     : off + j;
                             engine.load_expert_slab(v[i].layer, v[i].expert,
@@ -2552,8 +2628,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
                     for (int j = 0; j < chunk_n; ++j) {
                         int i = ram_start_i + off + j;
                         int slot_idx =
-                            (graph_ram_cache &&
-                             engine.graph_ram_layer_allocated(layer))
+                            engine.graph_ram_layer_allocated(layer)
                                 ? v[i].expert
                                 : off + j;
                         ++attempted;
@@ -2628,7 +2703,7 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
         }
         ram_mgr.vram_cache->startup_preload_phase = false;
 
-        if (graph_ram_cache) {
+        if (ram_graph_cache) {
             int allocated = 0;
             int ready = 0;
             const int n_graph_layers =
@@ -2923,15 +2998,32 @@ std::expected<void, std::string> run_engine(const EngineConfig& config) {
             prompt_tokens.push_back(tokenizer.im_end_id);
             push_text("\n");
             prompt_tokens.push_back(tokenizer.im_start_id);
-            // generation prompt with thinking ON (template default): the
-            // model opens its own <think> block. <think> is pushed as its
-            // special-token ID, not BPE-encoded text (encode() doesn't
-            // special-case control tokens).
+            // The Qwen template puts the thinking markers in the rendered
+            // text.  They are not special-token entries in this checkpoint's
+            // vocabulary, so checking ds_think_start_id alone silently
+            // dropped the whole reasoning block and left the model at
+            // `<|im_start|>assistant\n`.  Preserve the template literally;
+            // use the special-token IDs when a future Qwen vocabulary has
+            // them, otherwise let the normal BPE encoder produce the IDs.
             push_text("assistant\n");
-            if (config.enable_thinking && tokenizer.ds_think_start_id >= 0)
-                prompt_tokens.push_back(tokenizer.ds_think_start_id);
-            if (config.enable_thinking)
+            if (config.enable_thinking) {
+                if (tokenizer.ds_think_start_id >= 0)
+                    prompt_tokens.push_back(tokenizer.ds_think_start_id);
+                else
+                    push_text("<think>");
                 push_text("\n");
+            } else {
+                if (tokenizer.ds_think_start_id >= 0)
+                    prompt_tokens.push_back(tokenizer.ds_think_start_id);
+                else
+                    push_text("<think>");
+                push_text("\n\n");
+                if (tokenizer.ds_think_end_id >= 0)
+                    prompt_tokens.push_back(tokenizer.ds_think_end_id);
+                else
+                    push_text("</think>");
+                push_text("\n\n");
+            }
         } else {
             // Respect tokenizer.ggml.add_bos_token -- see
             // GGUFTokenizer::add_bos_token for why unconditionally pushing
@@ -3252,6 +3344,16 @@ int main(int argc, char* argv[]) {
     LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML shared expert: "
                       << (config.moe_ggml_shared_expert ? "ON" : "off")
                       << " (device routed+shared FFN)\n";
+    LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode device HC handoff: "
+                      << (config.qwen4exp_decode_device_hc ? "ON" : "off")
+                      << " (Qwen S=1 only)\n";
+    LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp custom exact-Q8 HC decode: "
+                      << (config.qwen4exp_decode_custom_hc_q8 ? "ON" : "off")
+                      << " (requires device HC; Qwen-only)\n";
+    LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GPU router during S==1 decode: "
+                      << (config.qwen4exp_decode_gpu_router ? "ON" : "off")
+                      << " (batched prefill still follows moe_ggml_gpu_router; "
+                         "Qwen pilot is independent)\n";
     set_hc_ggml(config.hc_ggml);
     set_gdn_proj_ggml(config.gdn_proj_ggml);
     set_gdn_full_ggml(config.gdn_full_ggml);
@@ -3271,6 +3373,8 @@ int main(int argc, char* argv[]) {
     LOG_STREAM_INFO() << "[CONFIG] Dense prefill GEMM via dequant->BF16 + cuBLAS: "
                       << (config.dense_bf16_prefill_gemm ? "ON" : "off")
                       << " (Q8_0 weights, S>1 only)\n";
+    LOG_STREAM_INFO() << "[CONFIG] Dense host copies on dedicated CUDA stream: "
+                      << (config.dense_async_copies ? "ON" : "off") << "\n";
     LOG_STREAM_INFO() << "[CONFIG] MoE GPU-side expert accumulation: "
                       << (config.moe_gpu_accum ? "ON" : "off")
                       << " (device scatter-add + one [S,D] download per layer)\n";
@@ -3289,6 +3393,17 @@ int main(int argc, char* argv[]) {
         }
         qwen_prefetch_excluded += "]";
     }
+    std::string qwen_predict_layers = "all";
+    if (!config.qwen4exp_router_pilot_predict_layers.empty()) {
+        qwen_predict_layers = "[";
+        for (size_t i = 0;
+             i < config.qwen4exp_router_pilot_predict_layers.size(); ++i) {
+            if (i > 0) qwen_predict_layers += ",";
+            qwen_predict_layers += std::to_string(
+                config.qwen4exp_router_pilot_predict_layers[i]);
+        }
+        qwen_predict_layers += "]";
+    }
     LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp router pilot: "
                       << (config.qwen4exp_router_pilot ? "ON" : "off")
                       << " (HC stream-0 proxy, top-"
@@ -3300,7 +3415,19 @@ int main(int argc, char* argv[]) {
                       << ", active-layer async prefetch "
                       << (config.qwen4exp_router_pilot_prefetch ? "ON" : "off")
                       << ", excluded layers=" << qwen_prefetch_excluded
+                      << ", predict layers=" << qwen_predict_layers
                       << ")\n";
+    LOG_STREAM_INFO() << "[CONFIG] Qwen pilot skip fully VRAM-resident decode layers: "
+                      << (config.qwen4exp_router_pilot_skip_fully_cached
+                              ? "ON"
+                              : "off")
+                      << "\n";
+    LOG_STREAM_INFO()
+        << "[CONFIG] Qwen pilot skip prefetch-excluded decode layers: "
+        << (config.qwen4exp_router_pilot_skip_prefetch_excluded_layers
+                ? "ON"
+                : "off")
+        << "\n";
     LOG_STREAM_INFO() << "[CONFIG] GGML async graph workspace reuse: "
                       << (config.ggml_async_graph_reuse ? "ON" : "off")
                       << " (shared backend stream ordering)\n";

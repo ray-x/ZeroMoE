@@ -65,6 +65,76 @@ static bool is_attention_or_norm(const std::string &suffix) {
          suffix.find("hc_") != std::string::npos;
 }
 
+static bool is_deepseek41_sparse_tensor(const std::string &suffix) {
+  // DeepSeek-V4.1 publishes compressed-KV and indexer weights only on the
+  // source layers named by attention.kv_source_layers and
+  // attention.index_source_layers. They are deliberately not repeated for
+  // every transformer block, so the generic all-layers check must not treat
+  // their absence as a truncated shard.
+  return suffix.rfind("attn_compressor_", 0) == 0 ||
+         suffix.rfind("indexer.", 0) == 0;
+}
+
+static bool verify_deepseek41_engram(const GGUFFile &M) {
+  const auto arch_it = M.kv_string.find("general.architecture");
+  if (arch_it == M.kv_string.end() || arch_it->second != "deepseek41")
+    return true;
+
+  const std::string prefix = "deepseek41.engram.";
+  auto array_size = [&M, &prefix](const char *name) -> size_t {
+    auto it = M.kv_arr_int.find(prefix + name);
+    return it == M.kv_arr_int.end() ? 0 : it->second.size();
+  };
+  const int max_ngram = M.get_config_int("engram.max_ngram_size", 0);
+  const int heads = M.get_config_int("engram.head_count", 0);
+  const int key_length = M.get_config_int("engram.key_length", 0);
+  const size_t n_layers = array_size("layer_ids");
+  const size_t n_hash_cols = max_ngram >= 2 && heads > 0
+                                 ? (size_t)(max_ngram - 1) * heads
+                                 : 0;
+  const bool metadata_ok =
+      n_layers > 0 && max_ngram >= 2 && heads > 0 && key_length > 0 &&
+      (array_size("num_embeddings") == 0 ||
+       array_size("num_embeddings") == n_layers) &&
+      array_size("primes") == n_layers * n_hash_cols &&
+      array_size("offsets") == n_layers * n_hash_cols &&
+      array_size("multipliers") == n_layers * (size_t)max_ngram &&
+      array_size("token_map") > 0;
+  if (!metadata_ok) {
+    printf("[verify] MISSING/INCOMPLETE deepseek41 Engram metadata "
+           "(conditional memory hash layout)\n");
+    return false;
+  }
+
+  const auto &layer_ids = M.kv_arr_int.at(prefix + "layer_ids");
+  const auto num_embeddings_it = M.kv_arr_int.find(prefix + "num_embeddings");
+  bool tensors_ok = true;
+  for (size_t i = 0; i < n_layers; ++i) {
+    const int layer = (int)layer_ids[i];
+    const std::string base = "blk." + std::to_string(layer) + ".";
+    auto table = M.tensors.find(base + "engram_embd.weight");
+    auto q = M.tensors.find(base + "engram_q.weight");
+    auto k = M.tensors.find(base + "engram_k.weight");
+    auto wkv = M.tensors.find(base + "engram_wkv.weight");
+    if (table == M.tensors.end() || q == M.tensors.end() ||
+        k == M.tensors.end() || wkv == M.tensors.end() ||
+        table->second.shape.size() != 2 ||
+        table->second.shape[0] != (uint64_t)key_length ||
+        (num_embeddings_it != M.kv_arr_int.end() &&
+         table->second.shape[1] !=
+             (uint64_t)num_embeddings_it->second[i])) {
+      printf("[verify] MISSING/INVALID Engram tensors at blk.%d\n", layer);
+      tensors_ok = false;
+    }
+  }
+  if (!tensors_ok)
+    return false;
+  printf("[verify] DeepSeek-V4.1 Engram metadata/tensors complete "
+         "(%zu layer tables, %d n-gram limit, %d heads)\n",
+         n_layers, max_ngram, heads);
+  return true;
+}
+
 int cmd_verify(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
@@ -103,6 +173,9 @@ int cmd_verify(int argc, char **argv) {
          M.tensors.size(), M.shard_paths.size(), model.c_str());
 
   bool incomplete = false;
+
+  if (!verify_deepseek41_engram(M))
+    incomplete = true;
 
   // ---- per-suffix layer-consistency completeness check ----
   std::map<std::string, std::set<int>> suffix_layers; // suffix -> layers present
@@ -154,6 +227,10 @@ int cmd_verify(int argc, char **argv) {
       const std::string &suf = kv.first;
       const std::set<int> &layers = kv.second;
       if (!is_attention_or_norm(suf))
+        continue;
+      const auto arch_it = M.kv_string.find("general.architecture");
+      if (arch_it != M.kv_string.end() && arch_it->second == "deepseek41" &&
+          is_deepseek41_sparse_tensor(suf))
         continue;
       if ((int)layers.size() < 2)
         continue; // not a per-layer tensor

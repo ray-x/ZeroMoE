@@ -1127,8 +1127,18 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
             // (gpu_topology.hpp) for why prefill NEVER promotes from the
             // active layer into the main cache, regardless of hit_count.
             if (!in_prefill && slot.hit_count >= active_layer_promote_threshold) {
+                // The active pool is sized by its largest slab, while the
+                // compact main cache has per-layer slab sizes. Promote only
+                // the bytes actually uploaded for this identity; using the
+                // active slot capacity can make evict_lru reject a valid
+                // smaller layer-region slot.
+                const size_t payload_bytes =
+                    slot.last_upload_bytes > 0
+                        ? std::min(slot.last_upload_bytes, slot.size)
+                        : slot.size;
                 promote_active_to_main(slot.layer_idx, slot.expert_id,
-                                       slot.device_ptr, slot.size, on_promoted, slot.gpu_id);
+                                       slot.device_ptr, payload_bytes, on_promoted,
+                                       slot.gpu_id);
             }
             // Waste accounting -- the main "swap out the one not used" path,
             // expected to catch the bulk of any real waste this feature
@@ -1282,9 +1292,20 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id,
                 // caller "loc is now main-cache" for a `loc` that's actually
                 // still the active-layer slot. Fired manually below, only in
                 // the branch that actually commits to returning `promoted`.
-                ExpertLocation* promoted = promote_active_to_main(layer, expert_id,
-                                                                   slot.device_ptr, slot.size,
-                                                                   nullptr, slot.gpu_id);
+                // Active-layer slots use the largest supported slab as their
+                // capacity, but compact main-cache regions are sized to the
+                // layer's real expert payload. Passing slot.size here made
+                // evict_lru reject every smaller layer as "slot too small",
+                // so confirmed active hits were silently discarded instead
+                // of becoming durable cache entries. last_upload_bytes is
+                // the exact payload copied into this active slot.
+                const size_t payload_bytes =
+                    slot.last_upload_bytes > 0
+                        ? std::min(slot.last_upload_bytes, slot.size)
+                        : slot.size;
+                ExpertLocation* promoted = promote_active_to_main(
+                    layer, expert_id, slot.device_ptr, payload_bytes, nullptr,
+                    slot.gpu_id);
                 if (promoted && slot.temp_pin_count == 0) {
                     // Always "used" here by construction (prewarm_touched
                     // was just set true above, unconditionally, before this

@@ -226,11 +226,24 @@ int main(int argc, char **argv) {
     push_text("\n");
     input_ids.push_back(engine.tokenizer.im_start_id);
     push_text("assistant\n");
-    if (engine.config.enable_thinking &&
-        engine.tokenizer.ds_think_start_id >= 0)
-      input_ids.push_back(engine.tokenizer.ds_think_start_id);
-    if (engine.config.enable_thinking)
+    if (engine.config.enable_thinking) {
+      if (engine.tokenizer.ds_think_start_id >= 0)
+        input_ids.push_back(engine.tokenizer.ds_think_start_id);
+      else
+        push_text("<think>");
       push_text("\n");
+    } else {
+      if (engine.tokenizer.ds_think_start_id >= 0)
+        input_ids.push_back(engine.tokenizer.ds_think_start_id);
+      else
+        push_text("<think>");
+      push_text("\n\n");
+      if (engine.tokenizer.ds_think_end_id >= 0)
+        input_ids.push_back(engine.tokenizer.ds_think_end_id);
+      else
+        push_text("</think>");
+      push_text("\n\n");
+    }
   } else {
     // Respect the model's own tokenizer.ggml.add_bos_token metadata --
     // unconditionally prepending BOS regardless of this key fed

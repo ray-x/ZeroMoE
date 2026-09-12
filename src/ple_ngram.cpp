@@ -220,7 +220,7 @@ bool ple_dequant_tensor(StreamingEngine &engine, const std::string &name,
 void ple_grouped_norm(const float *x, const float *w, float *out, int S,
                       int hc_dim, int D, float eps) {
   const int HC = hc_dim / D;
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
     const float *xs = x + (size_t)s * hc_dim;
     float *os = out + (size_t)s * hc_dim;
@@ -233,7 +233,7 @@ void ple_grouped_norm(const float *x, const float *w, float *out, int S,
         os[(size_t)h * D + d] = xs[(size_t)h * D + d] * inv;
     }
   }
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s)
     for (int i = 0; i < hc_dim; ++i)
       out[(size_t)s * hc_dim + i] *= w[i];
@@ -401,7 +401,7 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
   // ---- 5. signed-sqrt sigmoid gate; value broadcast across streams ----
   const float inv_sqrt_d = 1.0f / std::sqrt((float)D);
   std::vector<float> gated((size_t)S * hc_dim);
-#pragma omp parallel for schedule(static)
+#pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
     double dot = 0.0;
     const float *ks = key.data() + (size_t)s * hc_dim;

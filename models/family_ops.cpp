@@ -33,6 +33,9 @@ extern void dense_attention_gguf(StreamingEngine &engine, int layer_idx,
 extern void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
                                  const float *hidden_states, int S,
                                  int pos_base, float *out_context);
+extern void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                  const float *hidden_states, int S,
+                                  int pos_base, float *out_context);
 // DeepSeek-V4's hyper-connection bracket hooks (hyper_connections.cpp,
 // Project B) -- alloc_dsv4_swa_cache itself is defined further down in
 // THIS file, alongside its alloc_mla_absorbed_cache/alloc_dense_kv_cache
@@ -71,6 +74,9 @@ extern void qwen4exp_hc_post_combine(StreamingEngine &engine, int layer_idx,
 extern void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx,
                                       int S, int pos_base,
                                       const int *token_ids);
+extern void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
+                                           int S, int pos_base,
+                                           const int *token_ids);
 
 // ---------------------------------------------------------------------
 // Shared hyper-connection hooks (hc_mult == 1 degenerate case)
@@ -257,6 +263,79 @@ static void alloc_dsv4_swa_cache(StreamingEngine &engine,
                       << " CSA layer(s), " << hca_layers << " HCA layer(s), "
                       << "single contiguous sequence)\n";
   }
+}
+
+// DeepSeek-V4.1 uses the same raw SWA cache geometry as V4, but its
+// compressed KV and indexer caches are shared between source layers and its
+// compressor only supports ratio 1/2. Keep allocation separate from the V4
+// ratio-4/128 state machine.
+static void alloc_dsv41_swa_cache(StreamingEngine &engine,
+                                  const ArchitectureConfig &c, int max_ctx) {
+  const int window = c.sliding_window > 0 ? c.sliding_window : max_ctx;
+  engine.sliding_window = window;
+  engine.KVc.resize(c.n_layers, nullptr);
+  const int qh = c.qk_nope + c.qk_rope;
+  const size_t kv_bytes = (size_t)window * qh * sizeof(float);
+  for (int l = 0; l < c.n_layers; ++l) {
+    if (!alloc_zeroed_host(engine, &engine.KVc[l], kv_bytes,
+                           "DeepSeek-V4.1 SWA KV"))
+      return;
+  }
+
+  engine.dsv41_compressed.clear();
+  engine.dsv41_compressed.resize(c.n_layers);
+  engine.dsv41_kv_source_for_layer.assign(c.n_layers, -1);
+  engine.dsv41_index_source_for_layer.assign(c.n_layers, -1);
+
+  auto source_for = [](const std::vector<int64_t> &sources,
+                       int layer, int ratio,
+                       const ArchitectureConfig &cfg) -> int {
+    int result = -1;
+    for (int64_t source : sources) {
+      if (source < 0 || source >= cfg.n_layers || source > layer)
+        continue;
+      const int sl = (int)source;
+      const int sr = cfg.dsv4_compress_ratios.empty()
+                         ? 0
+                         : (int)cfg.dsv4_compress_ratios[(size_t)sl];
+      if (sr != ratio) continue;
+      result = sl;
+    }
+    return result;
+  };
+
+  size_t compressed_bytes = 0;
+  for (int l = 0; l < c.n_layers; ++l) {
+    const int ratio = c.dsv4_compress_ratios.empty()
+                          ? 0
+                          : (int)c.dsv4_compress_ratios[(size_t)l];
+    if (ratio <= 0) continue;
+    const int kv_source = source_for(c.dsv41_kv_source_layers, l, ratio, c);
+    const int index_source = source_for(c.dsv41_index_source_layers, l, ratio, c);
+    engine.dsv41_kv_source_for_layer[(size_t)l] = kv_source;
+    engine.dsv41_index_source_for_layer[(size_t)l] = index_source;
+    if (kv_source == l) {
+      const size_t cap = (size_t)dsv4_compressed_cache_capacity(max_ctx, ratio);
+      compressed_bytes += cap * (size_t)qh * sizeof(float);
+      // A KV source owns the index key cache even when a later layer owns
+      // the query-side indexer that scores it.
+      compressed_bytes += cap * (size_t)c.dsv4_indexer_key_length * sizeof(float);
+      compressed_bytes += 2 * (size_t)ratio * (size_t)qh * sizeof(float);
+    }
+  }
+  if (compressed_bytes && !engine.reserve_host_memory(compressed_bytes)) {
+    LOG_ERROR("[MEM-GUARD] DeepSeek-V4.1 compressed state refused: %.2f MB\n",
+              compressed_bytes / 1e6);
+    return;
+  }
+  for (int l = 0; l < c.n_layers; ++l) {
+    if (engine.dsv41_kv_source_for_layer[(size_t)l] != l) continue;
+    const int ratio = (int)c.dsv4_compress_ratios[(size_t)l];
+    const int index_dim = c.dsv4_indexer_key_length;
+    engine.dsv41_compressed[(size_t)l].configure(ratio, qh, max_ctx, index_dim);
+  }
+  LOG_STREAM_INFO() << "[GRAPH] DeepSeek-V4.1 raw SWA/compressed state: "
+                    << compressed_bytes / 1e9 << " GB, shared source caches\n";
 }
 
 // GLM5Next (GLM 5.3 Flash): DSA layers reuse the absorbed-MLA latent cache
@@ -477,6 +556,21 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
       ops.hc_pre_fn = &hc_pre_collapse;
       ops.hc_post_fn = &hc_post_combine;
     }
+    break;
+
+  case ModelFamily::DeepSeek_V41:
+    ops.attn_type = AttentionType::MLA;
+    ops.cache_shape = CacheShape::MLARawSWA;
+    ops.default_gating = GatingFunc::SqrtSoftplus;
+    ops.uses_hyper_connections = (c.hc_mult > 1);
+    ops.hc_mult = c.hc_mult;
+    ops.attention_fn = &dsv41_attention_gguf;
+    ops.alloc_cache_fn = &alloc_dsv41_swa_cache;
+    if (c.hc_mult > 1) {
+      ops.hc_pre_fn = &hc_pre_collapse;
+      ops.hc_post_fn = &hc_post_combine;
+    }
+    ops.layer_input_fn = &deepseek41_engram_layer_input;
     break;
 
   case ModelFamily::GLM5NEXT:

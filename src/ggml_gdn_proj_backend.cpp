@@ -906,7 +906,7 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
                                  float *out_context, float *history,
                                  int d_conv, float *state, float eps) {
   if (!backend_ || layer < 0 || layer >= kMaxLayers || !hidden_states ||
-      !out_context || !history || !state || S <= 1 || d_conv <= 1)
+      !out_context || !history || !state || S <= 0 || d_conv <= 1)
     return false;
   const Bracket &b = brackets_[layer];
   if (!b.ready || !b.conv_ready || !b.full_ready || H_v_ <= 0 ||
@@ -1051,26 +1051,37 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
              (double)graph_bytes / (1024.0 * 1024.0), S);
   }
 
-  ggml_backend_tensor_set(x, hidden_states, 0,
-                          (size_t)D_ * S * sizeof(float));
-  ggml_backend_tensor_set(hist_in, history, 0,
-                          (size_t)conv_dim_ * hist * sizeof(float));
-  ggml_backend_tensor_set(state_in, state, 0,
-                          (size_t)H_v_ * hd * hd * sizeof(float));
+  const size_t x_bytes = (size_t)D_ * S * sizeof(float);
+  const size_t history_bytes = (size_t)conv_dim_ * hist * sizeof(float);
+  const size_t state_bytes = (size_t)H_v_ * hd * hd * sizeof(float);
+  // Keep the host-output path ordered, but let GGML queue the three input
+  // uploads on its copy stream.  The caller does not mutate these buffers
+  // until this function returns, so one backend barrier below is sufficient
+  // to cover their lifetimes.
+  ggml_backend_tensor_set_async((ggml_backend_t)backend_, x, hidden_states,
+                                0, x_bytes);
+  ggml_backend_tensor_set_async((ggml_backend_t)backend_, hist_in, history, 0,
+                                history_bytes);
+  ggml_backend_tensor_set_async((ggml_backend_t)backend_, state_in, state, 0,
+                                state_bytes);
 
   const ggml_status st =
-      ggml_backend_graph_compute((ggml_backend_t)backend_, gf);
+      ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);
   if (st != GGML_STATUS_SUCCESS) {
     LOG_ERROR("[GGML-GDN-FULL] graph compute failed (status=%d)\n", (int)st);
     ggml_free(ctx);
     return false;
   }
-  ggml_backend_tensor_get(final_output, out_context, 0,
-                          (size_t)D_ * S * sizeof(float));
-  ggml_backend_tensor_get(new_state, state, 0,
-                          (size_t)H_v_ * hd * hd * sizeof(float));
-  ggml_backend_tensor_get(tail_cont, history, 0,
-                          (size_t)conv_dim_ * hist * sizeof(float));
+  // Queue all three outputs before waiting.  The old synchronous gets could
+  // each force a separate CUDA stream wait/copy; one barrier preserves the
+  // host-output contract while removing those redundant CPU stalls.
+  ggml_backend_tensor_get_async((ggml_backend_t)backend_, final_output,
+                                out_context, 0, x_bytes);
+  ggml_backend_tensor_get_async((ggml_backend_t)backend_, new_state, state, 0,
+                                state_bytes);
+  ggml_backend_tensor_get_async((ggml_backend_t)backend_, tail_cont, history,
+                                0, history_bytes);
+  ggml_backend_synchronize((ggml_backend_t)backend_);
   ggml_free(ctx);
   return true;
 }

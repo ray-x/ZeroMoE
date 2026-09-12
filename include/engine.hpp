@@ -420,6 +420,11 @@ public:
     };
     std::vector<GraphRamLayerArena> graph_ram_arenas;
     bool graph_ram_cache_enabled = false;
+    // Qwen-only source contract copied from EngineConfig at startup. When
+    // true, Qwen expert graph/dispatch code must use the preloaded DDR tier
+    // and must not silently fall back to a GGUF mmap read. Other model
+    // families do not consult this flag.
+    bool qwen_ram_preload_all_experts = false;
 
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 
@@ -473,6 +478,21 @@ public:
     // checks `enabled()` before using an entry, so an unconfigured slot is
     // inert rather than undefined.
     std::vector<Dsv4CompressedLayerState> dsv4_compressed;
+
+    // DeepSeek-V4.1 shared compressed-attention state. Only source layers
+    // own allocated entries; the source maps below point consumers at them.
+    std::vector<Dsv41CompressedLayerState> dsv41_compressed;
+    std::vector<int> dsv41_kv_source_for_layer;
+    std::vector<int> dsv41_index_source_for_layer;
+    std::vector<std::vector<int>> dsv41_candidate_positions;
+    std::vector<int32_t> dsv41_engram_tok_hist;
+    int64_t dsv41_engram_next_pos = 0;
+    // Hash ids are shared by every Engram layer in one forward call. Cache
+    // the batch so a later Engram layer does not reset/replay the token
+    // history that the first layer already advanced.
+    std::vector<int64_t> dsv41_engram_hashes;
+    int dsv41_engram_hash_pos_base = -1;
+    int dsv41_engram_hash_batch = 0;
 
     // GLM5Next (GLM 5.3 Flash) KDA recurrent-layer state -- one entry per
     // layer, sized/populated by alloc_glm5next_cache (models/family_ops.cpp)
@@ -547,6 +567,11 @@ public:
     // scratch buffers). Sized [S * hc_mult * D] floats, resized once per
     // layers_forward_gguf call (S can change between prefill and decode).
     std::vector<float> hc_stream_buf;
+    // Reference HC carry: previous FFN pre-mix feeds the next layer's
+    // attention, and the final FFN pre-mix collapses V4.1 output.
+    std::vector<float> hc_pending_pre_mix;
+    std::vector<float> hc_attn_pre_mix;
+    std::vector<float> hc_final_pre_mix;
 
     // Set by the opt-in Qwen4Exp full GGML prefill graph after it has
     // produced the final model-level HC output directly into the caller's
@@ -788,10 +813,24 @@ public:
     // Layer indices excluded from Qwen estimation-based prefetch. Prediction
     // and accuracy collection remain enabled for excluded layers.
     std::vector<int> qwen4exp_router_pilot_prefetch_exclude_layers;
+    // Optional Qwen-only prediction allow-list. Empty means every target
+    // layer not otherwise skipped by the Qwen pilot policy.
+    std::vector<int> qwen4exp_router_pilot_predict_layers;
+    // Decode-only cache-aware pilot bypass; Qwen-only, other families ignore it.
+    bool qwen4exp_router_pilot_skip_fully_cached = false;
+    bool qwen4exp_router_pilot_skip_prefetch_excluded_layers = false;
     // Qwen4Exp-only decode opt-in: run the routed FFN through the grouped
     // GGML/CUDA MUL_MAT_ID graph for S==1. Other families never read this
     // switch; false preserves the established per-expert decode path.
     bool qwen4exp_decode_ggml_moe = false;
+    // Qwen-only S==1 HC -> router/MoE device handoff. Kept separate from
+    // the grouped decode switch for controlled correctness/performance A/B.
+    bool qwen4exp_decode_device_hc = false;
+    bool qwen4exp_decode_custom_hc_q8 = false;
+    // Keep the GPU router for batched Qwen prefill, but opt into it for the
+    // S==1 decode boundary only when it wins on the target hardware. The
+    // Qwen router pilot remains independently GPU-backed for prediction.
+    bool qwen4exp_decode_gpu_router = false;
     // Qwen4Exp-only CPU affinity fast path: group IQ1_M expert projections
     // with the same ggml Q8_K dot kernel used by BeeLlama. It is consulted
     // only when cpu_affinity_layers selects a layer, so other models and the
@@ -1745,6 +1784,23 @@ public:
                     } else {
                         ram_pinned_bytes_used.fetch_sub(total, std::memory_order_relaxed);
                         perf().n_ram_slab_pin_fail.fetch_add(1, std::memory_order_relaxed);
+                        // The aggregate counter is useful for the final
+                        // report, but it cannot distinguish a driver-wide
+                        // registration ceiling from a bad range or an
+                        // already-registered allocation.  Keep only the
+                        // first few startup examples so a large preload does
+                        // not turn this diagnostic into a log bottleneck.
+                        static std::atomic<uint64_t> pin_failure_examples{0};
+                        const uint64_t example =
+                            pin_failure_examples.fetch_add(1, std::memory_order_relaxed);
+                        if (example < 4) {
+                            LOG_WARN("[RAM-PIN] cudaHostRegister declined slab %.2f MiB "
+                                     "after %.2f GiB was accepted: %s\n",
+                                     total / (1024.0 * 1024.0),
+                                     ram_pinned_bytes_used.load(std::memory_order_relaxed) /
+                                         (1024.0 * 1024.0 * 1024.0),
+                                     cudaGetErrorString(perr));
+                        }
                         cudaGetLastError();  // don't let this leak into an unrelated later check
                     }
                 } else {
@@ -2449,6 +2505,45 @@ public:
     // Return the smallest such byte alignment.  This is deliberately based
     // on the GGUF tensor metadata, so it remains correct for future mixed
     // quantization layouts without hard-coding a list of block sizes.
+    size_t expert_cache_layer_stride_alignment(int layer) const {
+        size_t alignment = 1;
+        const int n_exp = model_file.architecture_config.n_experts;
+        if (n_exp <= 0 || layer < 0) return alignment;
+
+        const std::string base = "blk." + std::to_string(layer) + ".";
+        auto add_row_alignment = [&](const GGUFTensor& t, size_t divisor) {
+            if (divisor == 0 || t.shape.size() < 2) return;
+            const size_t rows = (size_t)t.shape[1];
+            if (rows == 0) return;
+            const size_t per_expert = t.size_bytes / divisor;
+            const size_t row_bytes = per_expert / rows;
+            if (row_bytes == 0) return;
+            const size_t g = std::gcd(alignment, row_bytes);
+            if (alignment > SIZE_MAX / (row_bytes / g)) {
+                alignment = SIZE_MAX;
+                return;
+            }
+            alignment *= row_bytes / g;
+        };
+
+        auto add = [&](const std::string& name, size_t divisor) {
+            auto it = model_file.tensors.find(name);
+            if (it != model_file.tensors.end()) add_row_alignment(it->second, divisor);
+        };
+        add(base + "ffn_gate_exps.weight", (size_t)n_exp);
+        add(base + "ffn_up_exps.weight", (size_t)n_exp);
+        add(base + "ffn_down_exps.weight", (size_t)n_exp);
+        if (layer_is_unpacked(layer)) {
+            for (int e = 0; e < n_exp; ++e) {
+                const std::string es = std::to_string(e);
+                add(base + "ffn_gate." + es + ".weight", 1);
+                add(base + "ffn_up." + es + ".weight", 1);
+                add(base + "ffn_down." + es + ".weight", 1);
+            }
+        }
+        return alignment;
+    }
+
     size_t expert_cache_stride_alignment() const {
         size_t alignment = 1;
         const int n_exp = model_file.architecture_config.n_experts;

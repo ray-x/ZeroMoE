@@ -186,8 +186,9 @@ __global__ void q8_0_matmul_kernel_reuse(
     }
 }
 
-extern "C" void launch_q8_0_matmul(float* y, const float* x, const void* weights,
-                                    int S, int I, int O) {
+extern "C" void launch_q8_0_matmul_stream(float* y, const float* x,
+                                           const void* weights, int S, int I,
+                                           int O, cudaStream_t stream) {
     dim3 block(256);
     int blocks_per_row = I / 32;
     size_t smem_bytes = (size_t)blocks_per_row * sizeof(block_q8_0_k);
@@ -205,11 +206,16 @@ extern "C" void launch_q8_0_matmul(float* y, const float* x, const void* weights
     constexpr size_t kMaxStaticSmem = 49152; // 48KB
     if (S > 1 && smem_bytes <= kMaxStaticSmem) {
         dim3 grid(O);
-        q8_0_matmul_kernel_reuse<<<grid, block, smem_bytes>>>(
+        q8_0_matmul_kernel_reuse<<<grid, block, smem_bytes, stream>>>(
             y, x, (const block_q8_0_k*)weights, S, I, O);
     } else {
         dim3 grid(O, S);
-        q8_0_matmul_kernel_optimized<<<grid, block>>>(
+        q8_0_matmul_kernel_optimized<<<grid, block, 0, stream>>>(
             y, x, (const block_q8_0_k*)weights, S, I, O);
     }
+}
+
+extern "C" void launch_q8_0_matmul(float* y, const float* x,
+                                    const void* weights, int S, int I, int O) {
+    launch_q8_0_matmul_stream(y, x, weights, S, I, O, 0);
 }

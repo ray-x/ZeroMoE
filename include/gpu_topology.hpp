@@ -458,6 +458,7 @@ public:
     int expert_n_experts = 0;
     std::vector<size_t> expert_layer_slab_bytes;
     bool expert_compact_layout = false;
+    int expert_full_layer_prefix = 0;
     uint64_t cache_clock = 0;
 
     // ========== Three-tier caching: Active layer area ==========
@@ -1086,17 +1087,34 @@ public:
     // CUDA pool.
     static std::vector<int> compact_layer_slot_counts(
         size_t cache_bytes, int n_experts_total,
-        const std::vector<size_t>& layer_slab_bytes) {
+        const std::vector<size_t>& layer_slab_bytes,
+        int full_layer_prefix = 0) {
         std::vector<int> counts(layer_slab_bytes.size(), 0);
         if (cache_bytes == 0 || n_experts_total <= 0) return counts;
 
         size_t used = 0;
+        // A complete layer is useful to the GGML external-weight path, while
+        // a partial layer still needs the ordinary compact repack. Reserve
+        // complete prefix layers first when the caller explicitly requests
+        // that layout. The option is deliberately independent of preload
+        // ranking: this function only decides physical slot ownership.
+        const int prefix_end = std::min(
+            std::max(0, full_layer_prefix), (int)layer_slab_bytes.size());
+        for (int l = 0; l < prefix_end; ++l) {
+            const size_t bytes = layer_slab_bytes[(size_t)l];
+            if (bytes == 0 || bytes > cache_bytes - used ||
+                (size_t)n_experts_total > (cache_bytes - used) / bytes)
+                break;
+            counts[(size_t)l] = n_experts_total;
+            used += bytes * (size_t)n_experts_total;
+        }
         // Give each active layer one slot first when possible. This avoids a
         // large layer disappearing entirely from the VRAM tier just because
         // an earlier layer consumed the budget during the balanced fill.
         for (size_t l = 0; l < layer_slab_bytes.size(); ++l) {
             const size_t bytes = layer_slab_bytes[l];
-            if (bytes == 0 || bytes > cache_bytes - used) continue;
+            if (bytes == 0 || counts[l] != 0 || bytes > cache_bytes - used)
+                continue;
             counts[l] = 1;
             used += bytes;
         }
@@ -1123,6 +1141,9 @@ public:
         expert_max_slab_size = expert_slab_bytes;
         expert_n_experts = n_experts_total;
         expert_layer_slab_bytes = layer_slab_bytes;
+        expert_full_layer_prefix = config
+            ? std::max(0, config->vram_cache_full_layer_prefix)
+            : 0;
         // A geometry vector is an explicit request for the compact layout.
         // Do not require the raw layer sizes to differ: the old global
         // stride may have been inflated by the LCM/row-alignment calculation
@@ -1245,7 +1266,7 @@ public:
             for (int vi : vault_gpus) {
                 const auto counts = compact_layer_slot_counts(
                     devices[vi].expert_cache_size, expert_n_experts,
-                    expert_layer_slab_bytes);
+                    expert_layer_slab_bytes, expert_full_layer_prefix);
                 for (int count : counts) expert_vram_cache_cap += (size_t)count;
             }
             expert_vram_cache.resize(expert_vram_cache_cap);
@@ -1255,7 +1276,7 @@ public:
                 auto& dev = devices[vi];
                 const auto counts = compact_layer_slot_counts(
                     dev.expert_cache_size, expert_n_experts,
-                    expert_layer_slab_bytes);
+                    expert_layer_slab_bytes, expert_full_layer_prefix);
                 size_t offset = 0;
                 for (size_t layer = 0; layer < counts.size(); ++layer) {
                     const size_t layer_bytes = expert_layer_slab_bytes[layer];
@@ -1566,6 +1587,129 @@ public:
             }
         }
         return nullptr;
+    }
+
+    // Batch sibling of find_expert().  Grouped MoE dispatch already has the
+    // complete routed expert set for a layer, but the old loop acquired
+    // cache_mutex and re-entered the expert-index lookup once per expert.
+    // Keep one lock over the layer's main-cache probes while preserving the
+    // exact per-hit semantics (upload-ready polling, startup-hit accounting,
+    // hit/LRU updates, decay, and stale-index self-healing).  The returned
+    // pointers obey the same contract as find_expert(): callers must still
+    // validate/hold the identity before enqueueing work because an upload or
+    // eviction can occur after this function releases cache_mutex.
+    void find_expert_batch(int layer, const int *expert_ids, int count,
+                           ExpertLocation **out) {
+        if (!expert_ids || !out || count <= 0) return;
+        GPU_TOPO_TIMED_LOCK(lock);
+        PERF_SCOPE(t_find_expert);
+        for (int i = 0; i < count; ++i) {
+            out[i] = nullptr;
+            const int expert_id = expert_ids[i];
+            const uint64_t key = swap_key(layer, expert_id);
+            auto it = expert_index.find(key);
+            if (it != expert_index.end()) {
+                const size_t idx = it->second;
+                if (idx < expert_vram_cache.size()) {
+                    ExpertLocation &loc = expert_vram_cache[idx];
+                    if (loc.layer_idx == layer && loc.expert_id == expert_id &&
+                        loc.device_ptr) {
+                        out[i] = finish_expert_hit(loc, layer, expert_id);
+                        continue;
+                    }
+                }
+                LOG_ERROR(
+                    "[MOE-VRAM] find_expert_batch: stale expert_index entry "
+                    "for layer=%d expert=%d (slot %zu) -- linear scan\n",
+                    layer, expert_id, idx);
+                perf().n_stale_expert_index_hits.fetch_add(
+                    1, std::memory_order_relaxed);
+                expert_index.erase(it);
+            }
+            for (size_t idx = 0; idx < expert_vram_cache.size(); ++idx) {
+                ExpertLocation &loc = expert_vram_cache[idx];
+                if (loc.layer_idx == layer && loc.expert_id == expert_id &&
+                    loc.device_ptr) {
+                    expert_index[key] = idx;
+                    out[i] = finish_expert_hit(loc, layer, expert_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Side-effect-free residency probe used by the Qwen pilot policy. Unlike
+    // find_expert(), this deliberately does not update hit counters or LRU
+    // clocks: it answers only whether every expert in a layer is already in
+    // the durable main VRAM cache. When that is true, a decode-time pilot
+    // cannot improve placement and its HC snapshot/router synchronization is
+    // pure overhead. Active-layer entries do not count as durable residency.
+    bool layer_fully_resident(int layer, int expert_count) const {
+        if (layer < 0 || expert_count <= 0) return false;
+        GPU_TOPO_TIMED_LOCK(lock);
+        for (int expert = 0; expert < expert_count; ++expert) {
+            const auto it = expert_index.find(swap_key(layer, expert));
+            if (it == expert_index.end() || it->second >= expert_vram_cache.size())
+                return false;
+            const ExpertLocation &loc = expert_vram_cache[it->second];
+            if (loc.layer_idx != layer || loc.expert_id != expert ||
+                !loc.device_ptr || !loc.upload_ready)
+                return false;
+        }
+        return true;
+    }
+
+    // Resolve a complete layer's contiguous resident view with one cache
+    // lock. This is intentionally separate from repeated find_expert() calls:
+    // the GGML external-weight path may inspect 512 experts for one layer,
+    // and taking the cache mutex once per expert would erase the benefit of
+    // avoiding the transfer. When `holds` is supplied, only unpinned slots
+    // receive a temporary compute hold; pinned slots are already eviction-
+    // safe. The returned hold pairs are released by the caller after the
+    // queued graph completes.
+    bool find_contiguous_resident_layer(
+        int layer, int expert_count, int gpu_id, size_t stride,
+        const uint8_t **base,
+        std::vector<std::pair<int, const uint8_t *>> *holds = nullptr) {
+        if (base) *base = nullptr;
+        if (!base || layer < 0 || expert_count <= 0 || gpu_id < 0 ||
+            stride == 0)
+            return false;
+
+        GPU_TOPO_TIMED_LOCK(lock);
+        std::vector<size_t> indices;
+        indices.reserve((size_t)expert_count);
+        const uint8_t *first = nullptr;
+        for (int expert = 0; expert < expert_count; ++expert) {
+            const auto it = expert_index.find(swap_key(layer, expert));
+            if (it == expert_index.end() || it->second >= expert_vram_cache.size()) {
+                return false;
+            }
+            const size_t index = it->second;
+            const ExpertLocation &loc = expert_vram_cache[index];
+            if (loc.layer_idx != layer || loc.expert_id != expert ||
+                !loc.device_ptr || !loc.upload_ready || loc.gpu_id != gpu_id) {
+                return false;
+            }
+            if (expert == 0) {
+                first = loc.device_ptr;
+            } else if (loc.device_ptr != first + (size_t)expert * stride) {
+                return false;
+            }
+            indices.push_back(index);
+        }
+
+        if (holds) holds->clear();
+        for (size_t index : indices) {
+            ExpertLocation &loc = expert_vram_cache[index];
+            if (!loc.pinned) {
+                if (loc.temp_pin_count < UINT32_MAX) ++loc.temp_pin_count;
+                if (holds)
+                    holds->push_back({loc.expert_id, loc.device_ptr});
+            }
+        }
+        *base = first;
+        return first != nullptr;
     }
 
     // Mark a currently VRAM-resident expert's slot as pinned (never chosen

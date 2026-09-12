@@ -2,6 +2,7 @@
 #include "ggml_gdn_proj_backend.hpp"  // GgmlGdnProjRunner (Test 29)
 #include "ggml_glm5next_proj_backend.hpp"  // GLM5NEXT KDA fusion (Test 34)
 #include "ggml_moe_backend.hpp"  // GgmlQwenSharedRunner (Test 35)
+#include "ggml_hc_backend.hpp"   // GgmlHcRunner (Test 36)
 #include "kernels_cpu.hpp"
 #include "ram_manager.hpp"
 #include "engine.hpp"
@@ -12,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <vector>
+#include <array>
 #include <cstring>
 #include <cstdlib>
 #include <fstream>
@@ -638,6 +640,492 @@ bool test_avx512_dequant_iq() {
                                        : "AVX-512 IQ dequant DISAGREED with ggml's reference -- see MISMATCH lines above.")
               << "\n";
     return all_pass;
+}
+
+// ------------------------------------------------------------------
+// 7b. CPU IQ matmul paths and grouped-wrapper consistency
+// ------------------------------------------------------------------
+// The decode path uses three different CPU contracts here:
+//   * IQ2_XXS/IQ3_XXS default to MoEStream's exact dequant+F32 dot path;
+//   * IQ1_M optionally uses ggml's production IQ1_M x Q8_K dot path;
+//   * the Qwen grouped wrappers must produce the same result as their
+//     one-matrix form, regardless of whether the caller has one or many
+//     routed experts.
+// These tests deliberately use real GGML-quantized bytes, not synthetic block
+// contents.  They catch row-stride, block-size, expert-index, and grouped
+// activation-quantization mistakes without loading a model.
+static bool exact_iq_matmul_reference(GGUFType type, const uint8_t *weights,
+                                      const float *x, float *y, int S, int I,
+                                      int O) {
+    const int rb = row_bytes(type, I);
+    std::vector<float> row((size_t)I);
+    for (int o = 0; o < O; ++o) {
+        if (!ggml_dequant_row((uint32_t)type,
+                              weights + (size_t)o * rb, row.data(), I))
+            return false;
+        for (int s = 0; s < S; ++s) {
+            double acc = 0.0;
+            for (int i = 0; i < I; ++i)
+                acc += (double)row[(size_t)i] *
+                       (double)x[(size_t)s * I + i];
+            y[(size_t)s * O + o] = (float)acc;
+        }
+    }
+    return true;
+}
+
+static bool compare_iq_outputs(const std::string &label, const float *a,
+                               const float *b, size_t n, float atol,
+                               float rtol) {
+    float max_abs = 0.0f;
+    float max_rel = 0.0f;
+    bool ok = true;
+    for (size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            ok = false;
+            continue;
+        }
+        const float diff = std::abs(a[i] - b[i]);
+        max_abs = std::max(max_abs, diff);
+        max_rel = std::max(max_rel,
+                           diff / std::max(1e-6f, std::abs(b[i])));
+        if (diff > atol + rtol * std::abs(b[i])) ok = false;
+    }
+    std::cout << "  -> " << label << ": " << (ok ? "PASSED" : "FAILED")
+              << " max_abs=" << max_abs << " max_rel=" << max_rel << "\n";
+    return ok;
+}
+
+bool test_cpu_iq_matmul_paths() {
+    std::cout << "[Test 7b] CPU IQ1_M/IQ2_XXS/IQ3_XXS matmul paths...\n";
+    constexpr int I = 1024;
+    constexpr int O = 9;
+    constexpr int S = 2;
+    std::mt19937 rng(20260911);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> x((size_t)S * I);
+    for (float &v : x) v = dist(rng);
+
+    bool ok = true;
+    for (GGUFType type : {GGUFType::IQ1_M, GGUFType::IQ2_XXS,
+                          GGUFType::IQ3_XXS}) {
+        const int rb = row_bytes(type, I);
+        std::vector<float> wf((size_t)O * I);
+        for (float &v : wf) v = dist(rng);
+        std::vector<uint8_t> w((size_t)O * rb);
+        bool quantized = true;
+        for (int o = 0; o < O; ++o) {
+            if (!ggml_quantize_row_ref(
+                    (uint32_t)type, wf.data() + (size_t)o * I,
+                    w.data() + (size_t)o * rb, I)) {
+                quantized = false;
+                break;
+            }
+        }
+        if (!quantized) {
+            std::cout << "  -> " << gpu_type_name(type)
+                      << ": SKIPPED (reference quantizer unavailable)\n";
+            continue;
+        }
+        std::vector<float> reference((size_t)S * O, 0.0f);
+        std::vector<float> actual((size_t)S * O, 0.0f);
+        ok = exact_iq_matmul_reference(type, w.data(), x.data(),
+                                       reference.data(), S, I, O) && ok;
+        ok = cpu_quant_matmul(type, w.data(), x.data(), actual.data(), S, I,
+                              O) && ok;
+        // IQ2/3's default fused path is intended to reproduce GGML's
+        // dequantized FP32 dot. IQ1_M's default path is the same exact
+        // fallback; its optional Q8_K path is tested separately below.
+        ok = compare_iq_outputs(gpu_type_name(type), actual.data(),
+                                reference.data(), actual.size(), 2e-3f,
+                                2e-3f) && ok;
+
+        if (type == GGUFType::IQ1_M) {
+            std::vector<float> q8k((size_t)S * O, 0.0f);
+            const bool q8k_ok = matmul_iq1_m_ggml_q8k(
+                q8k.data(), x.data(), w.data(), S, I, O);
+            bool q8k_matches = q8k_ok;
+            if (q8k_ok) {
+                // Q8_K activation quantization is intentionally lossy, so
+                // use a broad numerical bound here. A row/stride bug is much
+                // larger than this and is exactly what this test is meant to
+                // catch; the grouped consistency check below is strict.
+                q8k_matches = compare_iq_outputs(
+                    "IQ1_M ggml Q8_K vs exact", q8k.data(), reference.data(),
+                    q8k.size(), 0.15f, 0.08f);
+            }
+            ok = q8k_matches && ok;
+        }
+    }
+
+    // Grouped production wrappers: compare n=3 against three n=1 calls.
+    // This isolates the shared activation quantization and row indexing from
+    // the expected IQ quantization error relative to an FP32 reference.
+    constexpr int M = 3;
+    std::vector<std::vector<float>> wf((size_t)M,
+                                       std::vector<float>((size_t)O * I));
+    std::vector<std::vector<uint8_t>> wb((size_t)M);
+    std::vector<const uint8_t *> wp((size_t)M);
+    bool all_iq1m_quantized = true;
+    for (int m = 0; m < M; ++m) {
+        for (float &v : wf[(size_t)m]) v = dist(rng);
+        const int rb = row_bytes(GGUFType::IQ1_M, I);
+        wb[(size_t)m].resize((size_t)O * rb);
+        bool quantized = true;
+        for (int o = 0; o < O; ++o)
+            if (!ggml_quantize_row_ref(
+                    (uint32_t)GGUFType::IQ1_M,
+                    wf[(size_t)m].data() + (size_t)o * I,
+                    wb[(size_t)m].data() + (size_t)o * rb, I)) {
+                quantized = false;
+                break;
+            }
+        if (!quantized) {
+            all_iq1m_quantized = false;
+            break;
+        }
+        wp[(size_t)m] = wb[(size_t)m].data();
+    }
+    if (!all_iq1m_quantized) {
+        std::cout << "  -> IQ1_M grouped checks skipped (reference quantizer "
+                     "unavailable)\n";
+        std::cout << "  -> CPU IQ path tests " << (ok ? "PASSED" : "FAILED")
+                  << "\n";
+        return ok;
+    }
+    std::vector<std::vector<float>> grouped(
+        (size_t)M, std::vector<float>((size_t)O, 0.0f));
+    std::vector<std::vector<float>> single(
+        (size_t)M, std::vector<float>((size_t)O, 0.0f));
+    std::vector<float *> grouped_ptr((size_t)M), single_ptr((size_t)M);
+    for (int m = 0; m < M; ++m) {
+        grouped_ptr[(size_t)m] = grouped[(size_t)m].data();
+        single_ptr[(size_t)m] = single[(size_t)m].data();
+        ok = matmul_iq1_m_ggml_q8k(single_ptr[(size_t)m], x.data(),
+                                   wp[(size_t)m], 1, I, O) &&
+             ok;
+    }
+    ok = matmul_iq1_m_ggml_q8k_grouped(
+             grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O) &&
+         ok;
+    for (int m = 0; m < M; ++m)
+        ok = compare_iq_outputs("IQ1_M grouped vs single",
+                                grouped[(size_t)m].data(),
+                                single[(size_t)m].data(), O, 1e-6f,
+                                1e-6f) &&
+             ok;
+
+    for (GGUFType type : {GGUFType::IQ2_XXS, GGUFType::IQ3_XXS}) {
+        const int rb = row_bytes(type, I);
+        wb.assign((size_t)M, std::vector<uint8_t>{});
+        wp.assign((size_t)M, nullptr);
+        bool all_quantized = true;
+        for (int m = 0; m < M; ++m) {
+            wb[(size_t)m].resize((size_t)O * rb);
+            bool quantized = true;
+            for (int o = 0; o < O; ++o)
+                if (!ggml_quantize_row_ref(
+                        (uint32_t)type,
+                        wf[(size_t)m].data() + (size_t)o * I,
+                        wb[(size_t)m].data() + (size_t)o * rb, I)) {
+                    quantized = false;
+                    break;
+                }
+            if (!quantized) {
+                all_quantized = false;
+                break;
+            }
+            wp[(size_t)m] = wb[(size_t)m].data();
+        }
+        if (!all_quantized) {
+            std::cout << "  -> " << gpu_type_name(type)
+                      << " grouped checks skipped (reference quantizer "
+                         "unavailable)\n";
+            continue;
+        }
+        grouped.assign((size_t)M, std::vector<float>((size_t)O, 0.0f));
+        single.assign((size_t)M, std::vector<float>((size_t)O, 0.0f));
+        grouped_ptr.resize((size_t)M);
+        single_ptr.resize((size_t)M);
+        for (int m = 0; m < M; ++m) {
+            grouped_ptr[(size_t)m] = grouped[(size_t)m].data();
+            single_ptr[(size_t)m] = single[(size_t)m].data();
+            float *one_y = single_ptr[(size_t)m];
+            const uint8_t *one_w = wp[(size_t)m];
+            ok = (type == GGUFType::IQ2_XXS
+                      ? matmul_iq2_xxs_ggml_q8k_grouped(
+                            &one_y, x.data(), &one_w, 1, 1, I, O)
+                      : matmul_iq3_xxs_ggml_q8k_grouped(
+                            &one_y, x.data(), &one_w, 1, 1, I, O)) &&
+                 ok;
+        }
+        ok = (type == GGUFType::IQ2_XXS
+                  ? matmul_iq2_xxs_ggml_q8k_grouped(
+                        grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O)
+                  : matmul_iq3_xxs_ggml_q8k_grouped(
+                        grouped_ptr.data(), x.data(), wp.data(), M, 1, I, O)) &&
+             ok;
+        for (int m = 0; m < M; ++m)
+            ok = compare_iq_outputs(
+                     std::string(gpu_type_name(type)) +
+                         " grouped vs single",
+                     grouped[(size_t)m].data(), single[(size_t)m].data(), O,
+                     1e-6f, 1e-6f) &&
+                 ok;
+
+        // Consistency alone can make a systematically-zero kernel look
+        // healthy.  Also compare the production Q8_K grouped result with
+        // the independent GGML dequantize+F32 oracle.
+        for (int m = 0; m < M; ++m) {
+            std::vector<float> reference_one((size_t)O, 0.0f);
+            const bool reference_ok = exact_iq_matmul_reference(
+                type, wb[(size_t)m].data(), x.data(), reference_one.data(), 1,
+                I, O);
+            bool semantic_ok = reference_ok;
+            if (reference_ok)
+                semantic_ok = compare_iq_outputs(
+                    std::string(gpu_type_name(type)) +
+                        " grouped vs dequant oracle",
+                    grouped[(size_t)m].data(), reference_one.data(), O, 0.20f,
+                    0.25f);
+            ok = semantic_ok && ok;
+        }
+    }
+    std::cout << "  -> CPU IQ path tests " << (ok ? "PASSED" : "FAILED")
+              << "\n";
+    return ok;
+}
+
+bool test_qwen_cpu_moe_graph() {
+    std::cout << "[Test 7c] Qwen persistent CPU GGML MoE graph...\n";
+    if (!GgmlQwenCpuMoeRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CPU backend not compiled)\n";
+        return true;
+    }
+    constexpr int D = 8;
+    constexpr int FF = 12;
+    constexpr int N = 2;
+    std::vector<std::vector<float>> gate(
+        N, std::vector<float>((size_t)D * FF));
+    std::vector<std::vector<float>> up(N, std::vector<float>((size_t)D * FF));
+    std::vector<std::vector<float>> down(
+        N, std::vector<float>((size_t)FF * D));
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
+    for (int e = 0; e < N; ++e) {
+        for (float &v : gate[(size_t)e]) v = dist(rng);
+        for (float &v : up[(size_t)e]) v = dist(rng);
+        for (float &v : down[(size_t)e]) v = dist(rng);
+    }
+    std::vector<GgmlQwenCpuExpertRef> refs((size_t)N);
+    for (int e = 0; e < N; ++e) {
+        refs[(size_t)e] = {
+            gate[(size_t)e].data(), up[(size_t)e].data(), down[(size_t)e].data(),
+            gate[(size_t)e].size() * sizeof(float),
+            up[(size_t)e].size() * sizeof(float),
+            down[(size_t)e].size() * sizeof(float),
+            static_cast<uint32_t>(GGUFType::F32),
+            static_cast<uint32_t>(GGUFType::F32),
+            static_cast<uint32_t>(GGUFType::F32)};
+    }
+
+    auto oracle = [&](const std::vector<float> &x,
+                      const std::array<float, N> &route,
+                      std::vector<float> &out) {
+        std::fill(out.begin(), out.end(), 0.0f);
+        for (int e = 0; e < N; ++e) {
+            std::vector<float> act((size_t)FF);
+            for (int j = 0; j < FF; ++j) {
+                float g = 0.0f, u = 0.0f;
+                for (int i = 0; i < D; ++i) {
+                    g += gate[(size_t)e][(size_t)j * D + i] * x[(size_t)i];
+                    u += up[(size_t)e][(size_t)j * D + i] * x[(size_t)i];
+                }
+                act[(size_t)j] = g / (1.0f + std::exp(-g)) * u;
+            }
+            for (int d = 0; d < D; ++d) {
+                float v = 0.0f;
+                for (int j = 0; j < FF; ++j)
+                    v += down[(size_t)e][(size_t)d * FF + j] *
+                         act[(size_t)j];
+                out[(size_t)d] += route[(size_t)e] * v;
+            }
+        }
+    };
+
+    bool ok = true;
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<float> x((size_t)D);
+        for (float &v : x) v = dist(rng);
+        const std::array<float, N> route =
+            pass == 0 ? std::array<float, N>{0.35f, 0.65f}
+                      : std::array<float, N>{0.8f, 0.2f};
+        std::vector<float> expected((size_t)D), actual((size_t)D);
+        oracle(x, route, expected);
+        ok = GgmlQwenCpuMoeRunner::instance().run(
+                 x.data(), actual.data(), refs.data(), N, route.data(), D, FF,
+                 N) &&
+             ok;
+        ok = compare_iq_outputs("Qwen CPU graph F32 pass " +
+                                    std::to_string(pass),
+                                actual.data(), expected.data(), D, 2e-5f,
+                                2e-5f) &&
+             ok;
+    }
+
+    // The production CPU-affinity path does not compact selected experts.
+    // It points MUL_MAT_ID at one fixed-stride [gate|up|down] DDR arena and
+    // supplies the real global expert IDs.  Exercise that layout explicitly
+    // so a future graph change cannot silently fall back to a file-backed or
+    // compact-copy source.
+    const size_t gate_bytes = gate[0].size() * sizeof(float);
+    const size_t up_bytes = up[0].size() * sizeof(float);
+    const size_t down_bytes = down[0].size() * sizeof(float);
+    const size_t raw_stride = gate_bytes + up_bytes + down_bytes;
+    const size_t stride = raw_stride + 64; // include inter-expert padding
+    void *arena_raw = nullptr;
+    const bool arena_allocated =
+        posix_memalign(&arena_raw, 64, stride * static_cast<size_t>(N)) == 0 &&
+        arena_raw != nullptr;
+    if (!arena_allocated) {
+        std::cout << "  -> Qwen CPU graph strided DDR arena: allocation FAILED\n";
+        GgmlQwenCpuMoeRunner::instance().shutdown();
+        return false;
+    }
+    auto *arena = static_cast<uint8_t *>(arena_raw);
+    std::memset(arena, 0, stride * static_cast<size_t>(N));
+    for (int e = 0; e < N; ++e) {
+        uint8_t *slot = arena + static_cast<size_t>(e) * stride;
+        std::memcpy(slot, gate[(size_t)e].data(), gate_bytes);
+        std::memcpy(slot + gate_bytes, up[(size_t)e].data(), up_bytes);
+        std::memcpy(slot + gate_bytes + up_bytes, down[(size_t)e].data(),
+                    down_bytes);
+    }
+    const int ids[N] = {1, 0};
+    const float ordered_weights[N] = {0.65f, 0.35f};
+    const std::array<float, N> by_id = {0.35f, 0.65f};
+    std::vector<float> x((size_t)D), expected((size_t)D), actual((size_t)D);
+    for (float &v : x) v = dist(rng);
+    oracle(x, by_id, expected);
+    ok = GgmlQwenCpuMoeRunner::instance().run_strided(
+             x.data(), actual.data(), refs[0], arena, arena + gate_bytes,
+             arena + gate_bytes + up_bytes, ids, N, ordered_weights,
+             D, FF, N, stride) &&
+         ok;
+    ok = compare_iq_outputs("Qwen CPU graph strided DDR arena", actual.data(),
+                            expected.data(), D, 2e-5f, 2e-5f) &&
+         ok;
+    std::free(arena_raw);
+    GgmlQwenCpuMoeRunner::instance().shutdown();
+    std::cout << "  -> Qwen CPU graph test " << (ok ? "PASSED" : "FAILED")
+              << "\n";
+    return ok;
+}
+
+// Exercise the same persistent graph with a real IQ1_M expert.  This is
+// intentionally a one-expert case: it isolates the quantized MUL_MAT_ID
+// contract from routing/compaction and makes a zero-output CPU dot kernel
+// immediately visible against an independent dequantize+F32 oracle.
+bool test_qwen_cpu_moe_iq1m_graph() {
+    std::cout << "[Test 7d] Qwen IQ1_M CPU GGML MoE graph...\n";
+    if (!GgmlQwenCpuMoeRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CPU backend not compiled)\n";
+        return true;
+    }
+    constexpr int D = 256;
+    constexpr int FF = 256;
+    const GGUFType type = GGUFType::IQ1_M;
+    const int gate_row_bytes = row_bytes(type, D);
+    const int down_row_bytes = row_bytes(type, FF);
+    std::mt19937 rng(20260911 + 7);
+    std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
+
+    std::vector<float> gate_f((size_t)FF * D);
+    std::vector<float> up_f((size_t)FF * D);
+    std::vector<float> down_f((size_t)D * FF);
+    for (float &v : gate_f) v = dist(rng);
+    for (float &v : up_f) v = dist(rng);
+    for (float &v : down_f) v = dist(rng);
+
+    std::vector<uint8_t> gate((size_t)FF * gate_row_bytes);
+    std::vector<uint8_t> up((size_t)FF * gate_row_bytes);
+    std::vector<uint8_t> down((size_t)D * down_row_bytes);
+    bool ok = true;
+    for (int row = 0; row < FF; ++row) {
+        ok = ggml_quantize_row_ref(
+                 (uint32_t)type, gate_f.data() + (size_t)row * D,
+                 gate.data() + (size_t)row * gate_row_bytes, D) &&
+             ok;
+        ok = ggml_quantize_row_ref(
+                 (uint32_t)type, up_f.data() + (size_t)row * D,
+                 up.data() + (size_t)row * gate_row_bytes, D) &&
+             ok;
+    }
+    for (int row = 0; row < D; ++row) {
+        ok = ggml_quantize_row_ref(
+                 (uint32_t)type, down_f.data() + (size_t)row * FF,
+                 down.data() + (size_t)row * down_row_bytes, FF) &&
+             ok;
+    }
+    if (!ok) {
+        std::cout << "  -> FAILED (IQ1_M reference quantizer unavailable)\n";
+        GgmlQwenCpuMoeRunner::instance().shutdown();
+        return false;
+    }
+
+    std::vector<float> input((size_t)D);
+    for (float &v : input) v = dist(rng);
+    std::vector<float> gate_out((size_t)FF), up_out((size_t)FF), act((size_t)FF);
+    std::vector<float> expected((size_t)D), actual((size_t)D);
+    ok = exact_iq_matmul_reference(type, gate.data(), input.data(),
+                                   gate_out.data(), 1, D, FF) &&
+         ok;
+    ok = exact_iq_matmul_reference(type, up.data(), input.data(),
+                                   up_out.data(), 1, D, FF) &&
+         ok;
+    for (int j = 0; j < FF; ++j)
+        act[(size_t)j] = gate_out[(size_t)j] /
+                         (1.0f + std::exp(-gate_out[(size_t)j])) *
+                         up_out[(size_t)j];
+    ok = exact_iq_matmul_reference(type, down.data(), act.data(),
+                                   expected.data(), 1, FF, D) &&
+         ok;
+
+    GgmlQwenCpuExpertRef ref{
+        gate.data(), up.data(), down.data(), gate.size(), up.size(), down.size(),
+        static_cast<uint32_t>(type), static_cast<uint32_t>(type),
+        static_cast<uint32_t>(type)};
+    const float route = 1.0f;
+    ok = GgmlQwenCpuMoeRunner::instance().run(
+             input.data(), actual.data(), &ref, 1, &route, D, FF, 1) &&
+         ok;
+    ok = compare_iq_outputs("Qwen IQ1_M graph vs dequant oracle", actual.data(),
+                            expected.data(), expected.size(), 0.20f, 0.25f) &&
+         ok;
+    double expected_norm2 = 0.0;
+    double actual_norm2 = 0.0;
+    double dot = 0.0;
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected_norm2 += (double)expected[i] * expected[i];
+        actual_norm2 += (double)actual[i] * actual[i];
+        dot += (double)expected[i] * actual[i];
+    }
+    const double expected_norm = std::sqrt(expected_norm2);
+    const double actual_norm = std::sqrt(actual_norm2);
+    const double cosine = expected_norm > 0.0 && actual_norm > 0.0
+                              ? dot / (expected_norm * actual_norm)
+                              : 0.0;
+    const bool signal_ok = expected_norm > 1e-4 &&
+                           actual_norm >= 0.25 * expected_norm && cosine > 0.25;
+    std::cout << "  -> IQ1_M graph signal: " << (signal_ok ? "PASSED" : "FAILED")
+              << " expected_norm=" << expected_norm
+              << " actual_norm=" << actual_norm << " cosine=" << cosine
+              << "\n";
+    ok = signal_ok && ok;
+    GgmlQwenCpuMoeRunner::instance().shutdown();
+    std::cout << "  -> Qwen IQ1_M graph test " << (ok ? "PASSED" : "FAILED")
+              << "\n";
+    return ok;
 }
 
 // ------------------------------------------------------------------
@@ -3015,9 +3503,15 @@ bool test_compact_vram_slot_planner() {
         GpuTopology::compact_layer_slot_counts(50, 2, {0, 20, 30});
     ok = ok && sparse == std::vector<int>({0, 1, 1});
 
+    const std::vector<int> full_prefix =
+        GpuTopology::compact_layer_slot_counts(100, 4, layer_bytes, 1);
+    ok = ok && full_prefix == std::vector<int>({4, 2, 2});
+
     std::cout << "  counts=";
     for (int count : counts) std::cout << count << " ";
-    std::cout << "used=" << used << " bytes -> " << (ok ? "PASSED" : "FAILED") << "\n";
+    std::cout << "used=" << used << " bytes, full-prefix=";
+    for (int count : full_prefix) std::cout << count << " ";
+    std::cout << "-> " << (ok ? "PASSED" : "FAILED") << "\n";
     return ok;
 }
 
@@ -4032,10 +4526,28 @@ bool test_qwen_shared_expert_runner() {
             break;
         }
 
-        GgmlSharedWeightRef gate_ref_w{w_gate.data(), 0, D, inter, w_gate.size() * sizeof(float)};
-        GgmlSharedWeightRef up_ref_w{w_up.data(), 0, D, inter, w_up.size() * sizeof(float)};
-        GgmlSharedWeightRef down_ref_w{w_down.data(), 0, inter, D, w_down.size() * sizeof(float)};
-        GgmlSharedWeightRef gate_inp_ref_w{w_gate_inp.data(), 0, D, 1, w_gate_inp.size() * sizeof(float)};
+        auto make_shared_ref = [](const void *data, int64_t ne0, int64_t ne1,
+                                  size_t nbytes) {
+            GgmlSharedWeightRef ref;
+            ref.host_data = data;
+            ref.type = 0;  // GGML_TYPE_F32
+            ref.ne0 = ne0;
+            ref.ne1 = ne1;
+            ref.nbytes = nbytes;
+            return ref;
+        };
+        GgmlSharedWeightRef gate_ref_w =
+            make_shared_ref(w_gate.data(), D, inter,
+                            w_gate.size() * sizeof(float));
+        GgmlSharedWeightRef up_ref_w =
+            make_shared_ref(w_up.data(), D, inter,
+                            w_up.size() * sizeof(float));
+        GgmlSharedWeightRef down_ref_w =
+            make_shared_ref(w_down.data(), inter, D,
+                            w_down.size() * sizeof(float));
+        GgmlSharedWeightRef gate_inp_ref_w =
+            make_shared_ref(w_gate_inp.data(), D, 1,
+                            w_gate_inp.size() * sizeof(float));
 
         const void *combined_output = nullptr;
         bool step_ok =
@@ -4098,6 +4610,292 @@ bool test_qwen_shared_expert_runner() {
                   << n_synthetic_layers << "\n";
     }
     return all_ok;
+}
+
+// Test 36: Qwen4Exp HC pre-mix graph against the reference operation order.
+// This specifically covers the S==1 decode shape and the flattened
+// [D,HC,S] -> [HC*D,S] view used by the production device-HC handoff.
+bool test_qwen_hc_runner() {
+    std::cout << "[Test 36] Qwen4Exp HC GGML pre-mix (S=1/decode shape, vs CPU oracle)...\n";
+    if (!GgmlHcRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CUDA backend not compiled)\n";
+        return true;
+    }
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    const int device = 0;
+    const int D = 8;
+    const int HC = 2;
+    const int LR = 3;
+    const int S = 1;
+    const int I = HC * D;
+    const float eps = 1.0e-6f;
+    std::mt19937 rng(3617);
+    std::uniform_real_distribution<float> dist(-0.08f, 0.08f);
+
+    std::vector<float> norm((size_t)I), down((size_t)I * LR),
+        up((size_t)LR * I), inject((size_t)I * HC),
+        streams((size_t)S * I);
+    for (float &v : norm) v = 0.8f + dist(rng);
+    for (float &v : down) v = dist(rng);
+    for (float &v : up) v = dist(rng);
+    for (float &v : inject) v = dist(rng);
+    for (float &v : streams) v = dist(rng);
+
+    auto ref = [](const void *data, uint32_t type, int64_t ne0, int64_t ne1,
+                  size_t bytes) {
+        GgmlHcWeightRef r;
+        r.host_data = data;
+        r.type = type;
+        r.ne0 = ne0;
+        r.ne1 = ne1;
+        r.nbytes = bytes;
+        return r;
+    };
+    const uint32_t f32 = 0;  // GGML_TYPE_F32
+    const GgmlHcWeightRef norm_ref =
+        ref(norm.data(), f32, I, 1, norm.size() * sizeof(float));
+    const GgmlHcWeightRef down_ref =
+        ref(down.data(), f32, I, LR, down.size() * sizeof(float));
+    const GgmlHcWeightRef up_ref =
+        ref(up.data(), f32, LR, I, up.size() * sizeof(float));
+    const GgmlHcWeightRef inject_ref =
+        ref(inject.data(), f32, I, HC, inject.size() * sizeof(float));
+
+    auto sigmoid = [](float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    };
+    auto silu = [&](float x) { return x * sigmoid(x); };
+    std::vector<float> xn((size_t)S * I), lo((size_t)S * LR),
+        gate((size_t)S * I), expected((size_t)S * D),
+        expected_inject((size_t)S * HC);
+    for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < HC; ++h) {
+            const float *src = streams.data() + (size_t)s * I + (size_t)h * D;
+            double ss = 0.0;
+            for (int d = 0; d < D; ++d) ss += (double)src[d] * src[d];
+            const float inv = 1.0f / std::sqrt((float)(ss / D) + eps);
+            for (int d = 0; d < D; ++d)
+                xn[(size_t)s * I + (size_t)h * D + d] =
+                    src[d] * inv * norm[(size_t)h * D + d];
+        }
+        for (int j = 0; j < LR; ++j) {
+            double sum = 0.0;
+            for (int i = 0; i < I; ++i)
+                sum += (double)down[(size_t)j * I + i] * xn[(size_t)s * I + i];
+            lo[(size_t)s * LR + j] = silu((float)(sum / HC));
+        }
+        for (int k = 0; k < I; ++k) {
+            double sum = 0.0;
+            for (int j = 0; j < LR; ++j)
+                sum += (double)up[(size_t)k * LR + j] * lo[(size_t)s * LR + j];
+            gate[(size_t)s * I + k] = sigmoid((float)sum);
+        }
+        for (int d = 0; d < D; ++d) {
+            double sum = 0.0;
+            for (int h = 0; h < HC; ++h)
+                sum += (double)xn[(size_t)s * I + (size_t)h * D + d] *
+                       gate[(size_t)s * I + (size_t)h * D + d];
+            expected[(size_t)s * D + d] = (float)(sum / HC);
+        }
+        for (int h = 0; h < HC; ++h) {
+            double sum = 0.0;
+            for (int i = 0; i < I; ++i)
+                sum += (double)inject[(size_t)h * I + i] * xn[(size_t)s * I + i];
+            expected_inject[(size_t)s * HC + h] = (float)sum;
+        }
+    }
+
+    auto &runner = GgmlHcRunner::instance();
+    bool ok = runner.ensure(device, D, HC, LR, eps) &&
+              runner.ensure_weights(0, 1, norm_ref, down_ref, up_ref,
+                                    inject_ref) &&
+              runner.upload_streams(streams.data(), S);
+    std::vector<float> actual((size_t)S * D), actual_inject((size_t)S * HC);
+    if (ok)
+        ok = runner.pre_mix(0, 1, S, actual.data(), nullptr) &&
+             runner.download_inject(actual_inject.data(), S);
+    runner.shutdown();
+
+    double max_abs = 0.0;
+    double max_inject_abs = 0.0;
+    double ref_scale = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        max_abs = std::max(max_abs, (double)std::abs(actual[i] - expected[i]));
+        ref_scale = std::max(ref_scale, (double)std::abs(expected[i]));
+    }
+    for (size_t i = 0; i < actual_inject.size(); ++i)
+        max_inject_abs = std::max(
+            max_inject_abs,
+            (double)std::abs(actual_inject[i] - expected_inject[i]));
+    const double rel = max_abs / (ref_scale + 1.0e-6);
+    ok = ok && std::isfinite(rel) && rel < 2.0e-3 && max_inject_abs < 2.0e-3;
+    std::cout << "  -> max_hidden_abs=" << max_abs
+              << " max_hidden_rel=" << rel
+              << " max_inject_abs=" << max_inject_abs << "\n";
+    std::cout << (ok ? "  -> PASSED\n" : "  -> FAILED\n");
+    return ok;
+}
+
+// Test 37: the Qwen device-HC escape hatch for Q8_0 HC projections.  GGML's
+// normal CUDA Q8_0 matmul quantizes an F32 activation to Q8_1; the exact path
+// dequantizes the small HC weights once and uses an F32 graph instead.  This
+// test keeps the quantized source bytes, computes the oracle from those same
+// dequantized bytes, and verifies the opt-in ref flag selects the exact path.
+bool test_qwen_hc_runner_q8_exact() {
+    std::cout << "[Test 37] Qwen4Exp HC exact Q8_0 down/up projections (vs oracle)...\n";
+    if (!GgmlHcRunner::compiled_in()) {
+        std::cout << "  -> Skipped (GGML CUDA backend not compiled)\n";
+        return true;
+    }
+    CudaManager gpu;
+    if (!gpu.initialize()) {
+        std::cout << "  -> Skipped (No CUDA Device Found on system)\n";
+        return true;
+    }
+
+    const int device = 0;
+    const int D = 32;
+    const int HC = 2;
+    const int LR = 32;
+    const int S = 1;
+    const int I = HC * D;
+    const float eps = 1.0e-6f;
+    const uint32_t q8 = (uint32_t)GGUFType::Q8_0;
+    std::mt19937 rng(3701);
+    std::uniform_real_distribution<float> dist(-0.08f, 0.08f);
+
+    std::vector<float> norm((size_t)I), down((size_t)I * LR),
+        up((size_t)LR * I), inject((size_t)I * HC), streams((size_t)S * I);
+    for (float &v : norm) v = 0.8f + dist(rng);
+    for (float &v : down) v = dist(rng);
+    for (float &v : up) v = dist(rng);
+    for (float &v : inject) v = dist(rng);
+    for (float &v : streams) v = dist(rng);
+
+    auto quantize_rows = [&](const std::vector<float> &src, int ne0, int ne1,
+                             std::vector<unsigned char> &qbytes,
+                             std::vector<float> &dequant) -> bool {
+        const size_t row_bytes = (size_t)(ne0 / 32) * 34;
+        qbytes.resize(row_bytes * (size_t)ne1);
+        dequant.resize((size_t)ne0 * ne1);
+        for (int row = 0; row < ne1; ++row) {
+            if (!ggml_quantize_row_ref(
+                    q8, src.data() + (size_t)row * ne0,
+                    qbytes.data() + (size_t)row * row_bytes, ne0) ||
+                !ggml_dequant_row(
+                    q8, qbytes.data() + (size_t)row * row_bytes,
+                    dequant.data() + (size_t)row * ne0, ne0))
+                return false;
+        }
+        return true;
+    };
+    std::vector<unsigned char> down_q8, up_q8;
+    std::vector<float> down_f32, up_f32;
+    bool ok = quantize_rows(down, I, LR, down_q8, down_f32) &&
+              quantize_rows(up, LR, I, up_q8, up_f32);
+    if (!ok) {
+        std::cout << "  -> FAILED (Q8_0 reference quantizer unavailable)\n";
+        return false;
+    }
+
+    auto make_ref = [](const void *data, uint32_t type, int64_t ne0,
+                       int64_t ne1, size_t bytes, bool exact_f32_q8) {
+        GgmlHcWeightRef r;
+        r.host_data = data;
+        r.type = type;
+        r.ne0 = ne0;
+        r.ne1 = ne1;
+        r.nbytes = bytes;
+        r.exact_f32_q8 = exact_f32_q8;
+        return r;
+    };
+    const GgmlHcWeightRef norm_ref =
+        make_ref(norm.data(), 0, I, 1, norm.size() * sizeof(float), false);
+    const GgmlHcWeightRef down_ref =
+        make_ref(down_q8.data(), q8, I, LR, down_q8.size(), true);
+    const GgmlHcWeightRef up_ref =
+        make_ref(up_q8.data(), q8, LR, I, up_q8.size(), true);
+    const GgmlHcWeightRef inject_ref =
+        make_ref(inject.data(), 0, I, HC, inject.size() * sizeof(float), false);
+
+    auto sigmoid = [](float x) {
+        return 1.0f / (1.0f + std::exp(-x));
+    };
+    auto silu = [&](float x) { return x * sigmoid(x); };
+    std::vector<float> xn((size_t)S * I), lo((size_t)S * LR),
+        gate((size_t)S * I), expected((size_t)S * D),
+        expected_inject((size_t)S * HC);
+    for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < HC; ++h) {
+            const float *src = streams.data() + (size_t)s * I + (size_t)h * D;
+            double ss = 0.0;
+            for (int d = 0; d < D; ++d) ss += (double)src[d] * src[d];
+            const float inv = 1.0f / std::sqrt((float)(ss / D) + eps);
+            for (int d = 0; d < D; ++d)
+                xn[(size_t)s * I + (size_t)h * D + d] =
+                    src[d] * inv * norm[(size_t)h * D + d];
+        }
+        for (int j = 0; j < LR; ++j) {
+            double sum = 0.0;
+            for (int i = 0; i < I; ++i)
+                sum += (double)down_f32[(size_t)j * I + i] *
+                       xn[(size_t)s * I + i];
+            lo[(size_t)s * LR + j] = silu((float)(sum / HC));
+        }
+        for (int k = 0; k < I; ++k) {
+            double sum = 0.0;
+            for (int j = 0; j < LR; ++j)
+                sum += (double)up_f32[(size_t)k * LR + j] *
+                       lo[(size_t)s * LR + j];
+            gate[(size_t)s * I + k] = sigmoid((float)sum);
+        }
+        for (int d = 0; d < D; ++d) {
+            double sum = 0.0;
+            for (int h = 0; h < HC; ++h)
+                sum += (double)xn[(size_t)s * I + (size_t)h * D + d] *
+                       gate[(size_t)s * I + (size_t)h * D + d];
+            expected[(size_t)s * D + d] = (float)(sum / HC);
+        }
+        for (int h = 0; h < HC; ++h) {
+            double sum = 0.0;
+            for (int i = 0; i < I; ++i)
+                sum += (double)inject[(size_t)h * I + i] *
+                       xn[(size_t)s * I + i];
+            expected_inject[(size_t)s * HC + h] = (float)sum;
+        }
+    }
+
+    auto &runner = GgmlHcRunner::instance();
+    ok = runner.ensure(device, D, HC, LR, eps) &&
+         runner.ensure_weights(0, 1, norm_ref, down_ref, up_ref, inject_ref) &&
+         runner.upload_streams(streams.data(), S);
+    std::vector<float> actual((size_t)S * D), actual_inject((size_t)S * HC);
+    if (ok)
+        ok = runner.pre_mix(0, 1, S, actual.data(), nullptr) &&
+             runner.download_inject(actual_inject.data(), S);
+    runner.shutdown();
+
+    double max_abs = 0.0, max_inject_abs = 0.0, scale = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        max_abs = std::max(max_abs, (double)std::abs(actual[i] - expected[i]));
+        scale = std::max(scale, (double)std::abs(expected[i]));
+    }
+    for (size_t i = 0; i < actual_inject.size(); ++i)
+        max_inject_abs = std::max(
+            max_inject_abs,
+            (double)std::abs(actual_inject[i] - expected_inject[i]));
+    const double rel = max_abs / (scale + 1.0e-6);
+    ok = ok && std::isfinite(rel) && rel < 2.0e-3 && max_inject_abs < 2.0e-3;
+    std::cout << "  -> max_hidden_abs=" << max_abs
+              << " max_hidden_rel=" << rel
+              << " max_inject_abs=" << max_inject_abs << "\n";
+    std::cout << (ok ? "  -> PASSED\n" : "  -> FAILED\n");
+    return ok;
 }
 
 // Test 34: GLM5NEXT KDA projection graph. This is an opt-in production
@@ -4477,6 +5275,23 @@ int main() {
         bool ok = test_qwen_shared_expert_runner();
         return ok ? 0 : 1;
     }
+    if (std::getenv("MOESTREAM_TEST_ONLY_36")) {
+        bool ok = test_qwen_hc_runner();
+        return ok ? 0 : 1;
+    }
+    if (std::getenv("MOESTREAM_TEST_ONLY_37")) {
+        bool ok = test_qwen_hc_runner_q8_exact();
+        return ok ? 0 : 1;
+    }
+    if (std::getenv("MOESTREAM_TEST_ONLY_CPU_IQ")) {
+        // Keep both diagnostics independent.  In particular, an IQ1_M
+        // failure must not hide the Qwen graph test, and a graph failure must
+        // not hide the lower-level quantized-kernel result.
+        const bool iq_ok = test_cpu_iq_matmul_paths();
+        const bool graph_ok = test_qwen_cpu_moe_graph();
+        const bool iq1m_graph_ok = test_qwen_cpu_moe_iq1m_graph();
+        return (iq_ok && graph_ok && iq1m_graph_ok) ? 0 : 1;
+    }
 
     test_cpu_matrix_ops();
     test_graph_initializer();
@@ -4485,6 +5300,9 @@ int main() {
     bool fused_kernels_ok = test_cuda_fused_kernels();
     bool avx512_dequant_ok = test_avx512_dequant();
     bool avx512_dequant_iq_ok = test_avx512_dequant_iq();
+    bool cpu_iq_matmul_ok = test_cpu_iq_matmul_paths();
+    bool qwen_cpu_moe_graph_ok = test_qwen_cpu_moe_graph();
+    bool qwen_cpu_moe_iq1m_graph_ok = test_qwen_cpu_moe_iq1m_graph();
     // Test 8 is throughput-only (no pass/fail verdict, see its own header
     // comment) and runs many timed dequant/matmul passes -- by far the
     // slowest thing in this binary, and irrelevant to every other test's
@@ -4515,6 +5333,8 @@ int main() {
     bool gdn_conv1d_gpu_ok = test_gdn_conv1d_gpu();
     bool gdn_conv_fused_ok = test_gdn_conv_fused();
     bool qwen_shared_expert_ok = test_qwen_shared_expert_runner();
+    bool qwen_hc_runner_ok = test_qwen_hc_runner();
+    bool qwen_hc_q8_exact_ok = test_qwen_hc_runner_q8_exact();
     bool score_gpu_prefill_ok = test_score_gpu_prefill();
     bool wuv_batched_prefill_ok = test_wuv_batched_gpu_prefill();
     bool real_expert_iq2xxs_ok = test_real_expert_iq2xxs_dequant();
@@ -4542,6 +5362,18 @@ int main() {
     }
     if (!avx512_dequant_iq_ok) {
         std::cout << "❌ AVX-512 IQ dequant correctness test FAILED -- see [Test 7] output above.\n";
+        return 1;
+    }
+    if (!cpu_iq_matmul_ok) {
+        std::cout << "❌ CPU IQ1_M/IQ2_XXS/IQ3_XXS matmul test FAILED -- see [Test 7b] output above.\n";
+        return 1;
+    }
+    if (!qwen_cpu_moe_graph_ok) {
+        std::cout << "❌ Qwen persistent CPU GGML MoE graph test FAILED -- see [Test 7c] output above.\n";
+        return 1;
+    }
+    if (!qwen_cpu_moe_iq1m_graph_ok) {
+        std::cout << "❌ Qwen IQ1_M CPU GGML MoE graph test FAILED -- see [Test 7d] output above.\n";
         return 1;
     }
     if (!bf16_dense_ok) {
@@ -4596,6 +5428,14 @@ int main() {
     }
     if (!qwen_shared_expert_ok) {
         std::cout << "❌ Qwen4Exp shared-expert GGML runner FAILED -- see [Test 35] output above.\n";
+        return 1;
+    }
+    if (!qwen_hc_runner_ok) {
+        std::cout << "❌ Qwen4Exp HC GGML runner FAILED -- see [Test 36] output above.\n";
+        return 1;
+    }
+    if (!qwen_hc_q8_exact_ok) {
+        std::cout << "❌ Qwen4Exp HC exact Q8_0 path FAILED -- see [Test 37] output above.\n";
         return 1;
     }
     if (!expert_gpu_accum_ok) {
