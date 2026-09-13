@@ -8,12 +8,13 @@ class StreamingEngine;
 class RAMSafetyManager;
 class LockFreePrefetcher;
 
-// Runs the single GLM NextN block.  `h_input` is the hidden state supplied by
-// the target for each row (the first row may be the pending zero state), and
-// `h_nextn` receives the block's shared-head-normalized hidden rows.  Only the
-// final row's logits are returned because proposal steps consume one row at a
-// time.  The function lives beside the normal execution layer so it can reuse
-// the existing attention, MoE cache, and dense dispatch implementations.
+// Runs the single GLM NextN block.  Each `h_input` row is the target hidden
+// state carried from the preceding target position (the first row may be the
+// pending zero state during prompt catch-up), and `h_nextn` receives the
+// block's shared-head-normalized hidden rows.  Only the final row's logits are
+// returned because proposal steps consume one row at a time.  The function
+// lives beside the normal execution layer so it can reuse the existing
+// attention, MoE cache, and dense dispatch implementations.
 bool glm_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                      LockFreePrefetcher &prefetcher, const int *token_ids,
                      const float *h_input, int S, int pos_base,
@@ -113,4 +114,3 @@ private:
     // sample_distribution/emit_token) without duplicating that math.
     MtpSpeculator base_;
 };
-

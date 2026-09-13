@@ -22,6 +22,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <expected>
 #include <fstream>
 #include <iostream>
@@ -1195,10 +1196,35 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // CLAUDE.md. If generation quality regresses in a way attn_output's
   // fast-path never did, this is the first thing to suspect and revert.
   int gate_inp_converted = 0, gate_inp_skipped = 0;
+  int gate_inp_scheduler_kept = 0;
   size_t gate_inp_bf16_bytes_used = 0, gate_inp_f32_equivalent_bytes = 0;
+  // Bee's CPU-MoE topology keeps the router projection on CUDA and moves only
+  // the routed expert planes to the CPU.  The Qwen decode scheduler consumes
+  // the original device_ptr representation; it cannot use the separate
+  // gpu_fast_ptr BF16 representation without changing router math/type
+  // contracts.  Keep these small Qwen router tensors in the ordinary dense
+  // pool when that explicitly gated scheduler is enabled.  This is deliberately
+  // scoped to Qwen + CPU-affinity layers; all other models and the normal
+  // Qwen path retain the existing BF16 optimization.
+  auto qwen_scheduler_cpu_router = [&](const std::string &name) {
+    if (!config.qwen4exp_decode_scheduler ||
+        engine.family_ops.family != ModelFamily::Qwen4Exp ||
+        name.rfind("blk.", 0) != 0 ||
+        name.find("gate_inp.weight") == std::string::npos)
+      return false;
+    char *end = nullptr;
+    const long layer = std::strtol(name.c_str() + 4, &end, 10);
+    return end != name.c_str() + 4 && end && *end == '.' && layer >= 0 &&
+           layer < engine.model_file.architecture_config.n_layers &&
+           is_cpu_affinity_layer((int)layer);
+  };
   for (auto &[name, tensor] : engine.resident_layers) {
     if (!tensor.host_ptr || name.find("gate_inp.weight") == std::string::npos)
       continue;
+    if (qwen_scheduler_cpu_router(name)) {
+      ++gate_inp_scheduler_kept;
+      continue;
+    }
     size_t remaining_free_vram = gpu.core_free_vram_bytes();
     if (gpu.upload_dequantized_bf16(tensor, remaining_free_vram)) {
       ++gate_inp_converted;
@@ -1218,6 +1244,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       << gate_inp_f32_equivalent_bytes / 1e9 << " GB at original F32 -- "
       << (gate_inp_f32_equivalent_bytes - gate_inp_bf16_bytes_used) / 1e9
       << " GB saved), " << gate_inp_skipped << " layer(s) kept at original F32"
+      << ", " << gate_inp_scheduler_kept
+      << " Qwen scheduler router(s) deliberately kept at original F32"
       << " -- NOTE: rounds router logits, a routing-behavior change, not just "
          "numerical noise.\n";
 

@@ -747,25 +747,32 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
         const float* last_hidden = hidden_states.data() + ((hidden_states.size() / D - 1) * D);
 
-        // Final norm + lm_head projection. output_norm is OPTIONAL:
-        // qwen4exp (Qwen3.8-Flash-Next) has no output_norm tensor at all --
-        // its low-rank HC output mixer (output_hc_*, applied inside
-        // hc_collapse_output above) IS the final norm, so last_hidden is
-        // already normed when the tensor is absent.
-        auto norm_it = engine.resident_layers.find("output_norm.weight");
-        auto lm_it = engine.resident_layers.find("output.weight");
-        if (lm_it == engine.resident_layers.end()) break;
+        // The opt-in Qwen full decode graph can publish next-token logits
+        // while it executes the trunk. Consume those once; all other models
+        // and the normal layered path retain the existing lm-head dispatch.
+        const bool have_full_graph_logits =
+            engine.qwen4exp_full_graph_logits_ready;
+        if (have_full_graph_logits) {
+            engine.qwen4exp_full_graph_logits_ready = false;
+        } else {
+            // output_norm is optional. Qwen4Exp has no output_norm tensor;
+            // its low-rank HC output mixer is already the final collapse.
+            auto norm_it = engine.resident_layers.find("output_norm.weight");
+            auto lm_it = engine.resident_layers.find("output.weight");
+            if (lm_it == engine.resident_layers.end()) break;
 
-        auto diag_lmhead_start = std::chrono::high_resolution_clock::now();
-        const float* lm_in = last_hidden;
-        if (norm_it != engine.resident_layers.end()) {
-            rmsnorm_proj(engine, "output_norm.weight", last_hidden, normed_last.data(), 1, D,
-                         engine.model_file.architecture_config.eps);
-            lm_in = normed_last.data();
+            auto diag_lmhead_start = std::chrono::high_resolution_clock::now();
+            const float* lm_in = last_hidden;
+            if (norm_it != engine.resident_layers.end()) {
+                rmsnorm_proj(engine, "output_norm.weight", last_hidden,
+                             normed_last.data(), 1, D,
+                             engine.model_file.architecture_config.eps);
+                lm_in = normed_last.data();
+            }
+            dense_proj(engine, "output.weight", lm_in, logits.data(), 1, D, V);
+            diag_lmhead_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - diag_lmhead_start).count();
         }
-        dense_proj(engine, "output.weight", lm_in, logits.data(), 1, D, V);
-        diag_lmhead_ms += std::chrono::duration<double, std::milli>(
-            std::chrono::high_resolution_clock::now() - diag_lmhead_start).count();
 
         // Diagnostic: catch corrupted (NaN/Inf) logits at the source, right
         // where they're produced, rather than downstream where Sampler::sample
@@ -884,8 +891,17 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // this loop.
         if (hc_active)
             hc_expand_embedding(engine, decode_hidden.data(), 1, D);
+        // This destination is valid only for the immediately following
+        // forward call. It is consumed by the Qwen-only full decode bridge;
+        // other model families ignore it.
+        engine.qwen4exp_full_graph_logits_target = logits.data();
+        engine.qwen4exp_full_graph_logits_target_size = V;
         layers_forward_gguf(engine, ram_mgr, prefetcher, decode_hidden.data(), 1, pos, &next_token);
-        if (hc_active)
+        engine.qwen4exp_full_graph_logits_target = nullptr;
+        engine.qwen4exp_full_graph_logits_target_size = 0;
+        if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+            !engine.glm5next_full_graph_output_ready &&
+            !engine.deepseek_v4_full_graph_output_ready)
             hc_collapse_output(engine, decode_hidden.data(), 1, D);
         double token_wall_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - token_wall_start).count();

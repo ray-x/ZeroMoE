@@ -583,6 +583,16 @@ public:
     // [S,D] buffer.  The generation loop must not run the legacy HC collapse
     // a second time for that result.
     bool qwen4exp_full_graph_output_ready = false;
+    // The Qwen full decode graph may also produce the next-token logits in
+    // the same one-submission graph.  The generation loop consumes this once
+    // on the following sampling iteration to avoid a separate lm-head H2D/D2H
+    // dispatch; false for the layered path and every other model family.
+    bool qwen4exp_full_graph_logits_ready = false;
+    // Short-lived destination installed by the generation loop while it
+    // calls layers_forward_gguf(). The Qwen decode graph writes logits here
+    // without retaining a pointer into a caller-local vector.
+    float *qwen4exp_full_graph_logits_target = nullptr;
+    int qwen4exp_full_graph_logits_target_size = 0;
 
     // Set by the opt-in GLM5NEXT full GGML prefill graph.  This is separate
     // from the Qwen flag so the shared generation loop cannot apply the

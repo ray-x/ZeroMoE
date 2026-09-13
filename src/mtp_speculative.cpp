@@ -346,11 +346,11 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
                       << (double)MemoryGuard::host_budget_bytes() / 1.0e9
                       << " GB)\n";
 
-    // The reference MTP driver leaves the final prompt token separate.  It
-    // first processes prompt[0 .. N-2] with target hidden rows shifted by one,
-    // then feeds prompt[N-1] with the MTP hidden row produced for prompt[N-2].
-    // Feeding the whole prompt in one call would use target h[N-2] for the
-    // final token and skips the trained MTP-to-MTP handoff at the boundary.
+    // Catch up the NextN KV cache with the whole prompt using target hidden
+    // rows shifted by one.  The final prompt-row NextN logits are not emitted:
+    // the target model owns the first post-prompt token.  That committed token
+    // is then paired with the target hidden row after the prompt for the first
+    // real NextN proposal.
     const int prompt_prefix_rows = std::max(0, (int)prompt_ids.size() - 1);
     std::vector<float> mtp_input((size_t)prompt_prefix_rows * D, 0.0f);
     for (int s = 1; s < prompt_prefix_rows; ++s) {
@@ -358,29 +358,38 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
                                       mtp_input.data() + (size_t)s * D))
             return false;
     }
-    std::vector<float> mtp_hidden((size_t)D, 0.0f);
+    std::vector<float> prompt_mtp_hidden((size_t)D, 0.0f);
     if (prompt_prefix_rows > 0) {
         std::vector<float> prefix_hidden((size_t)prompt_prefix_rows * D);
         if (!glm_mtp_forward(engine_, ram_mgr_, prefetcher_, prompt_ids.data(),
                              mtp_input.data(), prompt_prefix_rows, 0,
                              prefix_hidden.data(), nullptr))
             return false;
-        std::memcpy(mtp_hidden.data(),
-                    prefix_hidden.data() + (size_t)(prompt_prefix_rows - 1) * D,
-                    (size_t)D * sizeof(float));
     }
 
-    // `mtp_input_h` is the MTP hidden row paired with the current token.  The
-    // block returns `mtp_hidden` for that token, which supplies the next
-    // proposal step.  Keeping both rows is important: the target verification
-    // bridge below needs the former, while the draft chain needs the latter.
-    std::vector<float> mtp_input_h = mtp_hidden;
+    // Finish prompt-side NextN cache catch-up.  Its input is H[N-2], but its
+    // output/logits are deliberately discarded; the target head below makes
+    // the first generation decision.
+    std::vector<float> mtp_input_h((size_t)D, 0.0f);
+    if (prompt_prefix_rows > 0 &&
+        !normalized_target_hidden(
+            prompt_hidden.data() + (size_t)(prompt_prefix_rows - 1) * D,
+            mtp_input_h.data()))
+        return false;
     const int last_prompt_token = prompt_ids.back();
-    std::vector<float> mtp_logits((size_t)V);
     if (!glm_mtp_forward(engine_, ram_mgr_, prefetcher_, &last_prompt_token,
                          mtp_input_h.data(), 1,
-                         (int)prompt_ids.size() - 1, mtp_hidden.data(),
-                         mtp_logits.data()))
+                         (int)prompt_ids.size() - 1, prompt_mtp_hidden.data(),
+                         nullptr))
+        return false;
+
+    // This is the target hidden row after the final prompt token, i.e. the
+    // `pending_h` handoff used by llama.cpp's draft-MTP implementation.  It is
+    // also correct for a one-token prompt, whose prompt-side NextN call used
+    // the zero initial state.
+    if (!normalized_target_hidden(
+            prompt_hidden.data() + (size_t)(prompt_ids.size() - 1) * D,
+            mtp_input_h.data()))
         return false;
 
     struct TargetSnapshot {
@@ -402,6 +411,40 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
 
     std::vector<float> current_raw(prompt_hidden.end() - D, prompt_hidden.end());
     int current_pos = (int)prompt_ids.size() - 1;
+
+    // GLM5NEXT's target contains recurrent KDA layers.  Keep target
+    // verification/replay token-by-token for GLM so its state evolution is
+    // identical to ordinary decode.  Qwen4Exp and every other family retain
+    // the existing batched verification path.  This is a correctness guard,
+    // not an acceptance-threshold adjustment: p must come from the same
+    // target state that ordinary GLM decoding would use.
+    const bool glm_target_verification =
+        engine_.family_ops.family == ModelFamily::GLM5NEXT ||
+        engine_.family_ops.family == ModelFamily::GLM_DSA;
+    bool logged_sequential_target = false;
+    auto target_verify_forward = [&](const std::vector<int> &tokens,
+                                     int pos_base,
+                                     std::vector<float> &raw_hidden) {
+        if (!glm_target_verification || tokens.size() <= 1)
+            return target_forward(tokens, pos_base, raw_hidden);
+        if (!logged_sequential_target) {
+            LOG_STREAM_INFO()
+                << "[MTP] GLM target verification uses sequential KDA-safe "
+                   "forwards (batched target verification disabled)\n";
+            logged_sequential_target = true;
+        }
+        raw_hidden.clear();
+        raw_hidden.reserve(tokens.size() * (size_t)D);
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const std::vector<int> one{tokens[i]};
+            std::vector<float> row;
+            if (!target_forward(one, pos_base + (int)i, row) ||
+                row.size() != (size_t)D)
+                return false;
+            raw_hidden.insert(raw_hidden.end(), row.begin(), row.end());
+        }
+        return true;
+    };
 
     // A bounded direct-target tail is used if a later MTP proposal cannot be
     // formed (for example, a best-effort VRAM allocation was reclaimed). It
@@ -427,12 +470,62 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
         }
         return true;
     };
+    auto finish_direct_tail = [&]() {
+        if (!direct_tail()) {
+            LOG_STREAM_WARN()
+                << "[MTP] direct target fallback failed after the GLM seed; "
+                   "stopping speculative generation safely\n";
+        }
+        // The outer generation loop still owns the pre-MTP hidden buffer. Do
+        // not return false after the seed has been committed: that would make
+        // it resume from a stale prompt hidden state. A short, coherent stop
+        // is safer than continuing with mismatched recurrent state.
+        return true;
+    };
+
+    // The target, not the NextN head, owns the first generated token.  This is
+    // the reference driver's `id_last` seed: commit it, advance the target
+    // trunk once, then run NextN on (seed, target_H[N-1]) to obtain q for the
+    // first speculative token after it.  The previous code used the logits
+    // from the final prompt-row NextN call as this decision, which is an
+    // off-by-one boundary and can make a plausible q token look accepted even
+    // though it was not produced from the post-prompt target state.
+    std::vector<float> seed_logits;
+    if (!target_logits_batch(current_raw, 1, seed_logits)) return false;
+    std::vector<float> seed_probs;
+    if (!make_distribution(seed_logits.data(), V, sequence, temperature, top_p,
+                           seed_probs))
+        return false;
+    const int seed = sample_distribution(seed_probs, rng);
+    if (seed < 0) return false;
+    const std::vector<int> seed_tokens{seed};
+    const TargetSnapshot seed_snapshot = take_snapshot();
+    std::vector<float> seed_raw;
+    if (!target_forward(seed_tokens, current_pos + 1, seed_raw)) {
+        restore_snapshot(seed_snapshot);
+        return false;
+    }
+    current_raw = std::move(seed_raw);
+    ++current_pos;
+
+    std::vector<float> mtp_hidden((size_t)D, 0.0f);
+    std::vector<float> mtp_logits((size_t)V);
+    if (!glm_mtp_forward(engine_, ram_mgr_, prefetcher_, &seed,
+                         mtp_input_h.data(), 1, current_pos, mtp_hidden.data(),
+                         mtp_logits.data())) {
+        // The target state already includes the seed.  Commit it and finish
+        // with ordinary target decoding rather than returning false to the
+        // caller, whose hidden-state buffer still represents the prompt.
+        if (!emit_token(sequence, seed, eos_id, emit)) return true;
+        return finish_direct_tail();
+    }
+    if (!emit_token(sequence, seed, eos_id, emit)) return true;
 
     while ((int)sequence.size() - (int)prompt_ids.size() < max_new_tokens) {
         const int remaining = max_new_tokens -
                               ((int)sequence.size() - (int)prompt_ids.size());
         if (remaining <= 1) {
-            return direct_tail();
+            return finish_direct_tail();
         }
         const int K = std::min(std::max(1, engine_.mtp_draft_tokens), remaining - 1);
         perf().n_mtp_cycles.fetch_add(1, std::memory_order_relaxed);
@@ -477,17 +570,16 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
             }
         }
         if (!proposal_ok) {
-            if (drafts.empty()) return false; // target state is still untouched
-            return direct_tail();
+            return finish_direct_tail();
         }
         perf().n_mtp_drafts_proposed.fetch_add((uint64_t)drafts.size(),
                                                std::memory_order_relaxed);
 
         const TargetSnapshot snapshot = take_snapshot();
         std::vector<float> verified_raw;
-        if (!target_forward(drafts, current_pos + 1, verified_raw)) {
+        if (!target_verify_forward(drafts, current_pos + 1, verified_raw)) {
             restore_snapshot(snapshot);
-            return false; // caller may safely use the ordinary target loop
+            return finish_direct_tail();
         }
 
         // Mirror common_speculative_impl_draft_mtp::process(): after the
@@ -495,9 +587,9 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
         // with the target hidden rows shifted onto the following tokens. The
         // proposal chain above is speculative, so leaving it in place would
         // make the next cycle depend on rejected MTP state. Row 0 is the
-        // current committed token paired with the previous MTP output; row j
-        // (j>0) is draft[j-1] paired with the target hidden state after the
-        // preceding token.
+        // current committed token paired with the target hidden row from the
+        // preceding token; row j (j>0) is draft[j-1] paired with the target
+        // hidden state after the preceding token.
         std::vector<int> sync_tokens;
         sync_tokens.reserve((size_t)K + 1);
         sync_tokens.push_back(sequence.back());
@@ -508,14 +600,14 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
         if (!normalized_target_hidden(current_raw.data(),
                                       sync_input.data() + (size_t)D)) {
             restore_snapshot(snapshot);
-            return false;
+            return finish_direct_tail();
         }
         for (int j = 1; j < K; ++j) {
             if (!normalized_target_hidden(
                     verified_raw.data() + (size_t)(j - 1) * D,
                     sync_input.data() + (size_t)(j + 1) * D)) {
                 restore_snapshot(snapshot);
-                return false;
+                return finish_direct_tail();
             }
         }
         std::vector<float> sync_hidden((size_t)(K + 1) * D);
@@ -523,7 +615,7 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
                              sync_input.data(), K + 1, current_pos,
                              sync_hidden.data(), nullptr)) {
             restore_snapshot(snapshot);
-            return false;
+            return finish_direct_tail();
         }
 
         // One batched target-head call produces p_0 ... p_K.  p_0 is the
@@ -540,7 +632,7 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
         std::vector<float> target_logits;
         if (!target_logits_batch(target_input, K + 1, target_logits)) {
             restore_snapshot(snapshot);
-            return false;
+            return finish_direct_tail();
         }
 
         std::vector<std::vector<float>> p_probs;
@@ -553,7 +645,7 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
             if (!make_distribution(target_logits.data() + (size_t)j * V, V,
                                    context, temperature, top_p, p)) {
                 restore_snapshot(snapshot);
-                return false;
+                return finish_direct_tail();
             }
             p_probs.push_back(std::move(p));
         }
@@ -623,7 +715,7 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
         }
         if (correction < 0) {
             restore_snapshot(snapshot);
-            return false;
+            return finish_direct_tail();
         }
 
         const int correction_pos = current_pos + accepted + 1;
@@ -636,16 +728,17 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
             const std::vector<int> one{correction};
             if (!target_forward(one, correction_pos, correction_raw)) {
                 restore_snapshot(snapshot);
-                return false;
+                return finish_direct_tail();
             }
         } else {
             // Rejected target rows may have updated KDA state.  Restore the
             // state at the current committed position, then replay exactly
             // the accepted prefix and correction token.
             restore_snapshot(snapshot);
-            if (!target_forward(committed, current_pos + 1, correction_raw)) {
+            if (!target_verify_forward(committed, current_pos + 1,
+                                       correction_raw)) {
                 restore_snapshot(snapshot);
-                return false;
+                return finish_direct_tail();
             }
         }
 
@@ -667,25 +760,38 @@ bool MtpSpeculator::run(const std::vector<int> &prompt_ids,
             (uint64_t)(sequence.size() - seq_before_emit),
             std::memory_order_relaxed);
         if (stop_early) return true;
+        // Advance the MTP block on the correction token.  Its input is the
+        // target hidden row for the preceding committed token, exactly like
+        // the reference driver's pending_h handoff.  The target hidden row
+        // for `correction` is deliberately not used here: it is the output
+        // of the token we are about to feed to the MTP block, not its input.
+        // This also overwrites a rejected draft at correction_pos, preventing
+        // stale speculative KV from being read by the next cycle.
+        std::vector<float> next_mtp_input((size_t)D, 0.0f);
+        if (accepted == 0) {
+            if (!normalized_target_hidden(current_raw.data(),
+                                          next_mtp_input.data())) {
+                restore_snapshot(snapshot);
+                return finish_direct_tail();
+            }
+        } else if (!normalized_target_hidden(
+                       verified_raw.data() + (size_t)(accepted - 1) * D,
+                       next_mtp_input.data())) {
+            restore_snapshot(snapshot);
+            return finish_direct_tail();
+        }
+
         current_raw = std::move(correction_raw);
         current_pos = correction_pos;
 
-        // Advance the MTP block on the correction token.  The input hidden is
-        // the MTP output for the last committed token in the synchronized
-        // [current, drafts...] bridge above, matching the reference driver's
-        // pending_h handoff. It is deliberately NOT the target output for
-        // `correction`: that target row is not the MTP input convention.
         std::vector<float> next_h(D);
         std::vector<float> next_logits(V);
         const int token = correction;
-        const float * correction_mtp_input =
-            sync_hidden.data() + (size_t)accepted * D;
         if (!glm_mtp_forward(engine_, ram_mgr_, prefetcher_, &token,
-                             correction_mtp_input, 1, correction_pos,
+                             next_mtp_input.data(), 1, correction_pos,
                              next_h.data(), next_logits.data()))
-            return direct_tail();
-        mtp_input_h.assign(correction_mtp_input,
-                           correction_mtp_input + D);
+            return finish_direct_tail();
+        mtp_input_h = std::move(next_mtp_input);
         mtp_hidden = std::move(next_h);
         mtp_logits = std::move(next_logits);
     }

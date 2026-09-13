@@ -26,6 +26,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -37,6 +38,10 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace {
 
@@ -67,9 +72,14 @@ struct FullGraph {
   int value_dim = 0;
   int conv_dim = 0;
   int d_conv = 0;
+  bool decode_mode = false;
+  int kv_capacity = 0;
+  int decode_last_pos = -1;
 
   ggml_backend_t cuda = nullptr;
   ggml_backend_t cpu = nullptr;
+  ggml_threadpool_t cpu_threadpool = nullptr;
+  int cpu_threads = 0;
   ggml_backend_sched_t sched = nullptr;
   ggml_backend_buffer_t device_expert_buffer = nullptr;
   void *device_expert_base = nullptr;
@@ -80,6 +90,10 @@ struct FullGraph {
   size_t device_dense_capacity = 0;
   size_t device_dense_used = 0;
   int device_dense_tensors = 0;
+  ggml_backend_buffer_t device_state_buffer = nullptr;
+  void *device_state_base = nullptr;
+  size_t device_state_capacity = 0;
+  size_t device_state_used = 0;
   int device_expert_layers = 0;
   bool device_expert_partial_gate_up = false;
   ggml_context *ctx = nullptr;
@@ -87,17 +101,27 @@ struct FullGraph {
 
   ggml_tensor *input = nullptr;         // [D, HC, S], CPU input
   ggml_tensor *output = nullptr;        // [D, S], final HC output
+  ggml_tensor *logits = nullptr;        // [vocab, S], decode-only output
   ggml_tensor *final_streams = nullptr; // [D, HC, S], for state/debug writeback
   ggml_tensor *positions = nullptr;     // [S], I32
   ggml_tensor *attn_mask = nullptr;     // [S, S], F16 (flash-attn contract)
+  ggml_tensor *decode_indices = nullptr; // [Hkv], I32 row indices for KV append
   ggml_tensor *ple_embedding = nullptr;
   ggml_tensor *ple_hist_out = nullptr;
+  ggml_tensor *ple_hist_storage = nullptr;
+  ggml_tensor *ple_hist_update = nullptr;
 
   std::vector<ggml_tensor *> kv_k;
   std::vector<ggml_tensor *> kv_v;
   std::vector<int> kv_layers;
   std::vector<ggml_tensor *> gdn_state_out;
   std::vector<ggml_tensor *> gdn_hist_out;
+  std::vector<ggml_tensor *> kv_state_k;
+  std::vector<ggml_tensor *> kv_state_v;
+  std::vector<ggml_tensor *> gdn_state_storage;
+  std::vector<ggml_tensor *> gdn_hist_storage;
+  std::vector<ggml_tensor *> gdn_state_updates;
+  std::vector<ggml_tensor *> gdn_hist_updates;
   std::vector<int> gdn_layers;
   std::vector<float *> gdn_state_inputs;
   std::vector<float *> gdn_hist_inputs;
@@ -139,6 +163,12 @@ struct FullGraph {
       ggml_backend_sched_free(sched);
       sched = nullptr;
     }
+    if (cpu && cpu_threadpool)
+      ggml_backend_cpu_set_threadpool(cpu, nullptr);
+    if (cpu_threadpool) {
+      ggml_threadpool_free(cpu_threadpool);
+      cpu_threadpool = nullptr;
+    }
     if (cpu) {
       ggml_backend_free(cpu);
       cpu = nullptr;
@@ -158,6 +188,13 @@ struct FullGraph {
     device_dense_capacity = 0;
     device_dense_used = 0;
     device_dense_tensors = 0;
+    if (device_state_buffer) {
+      ggml_backend_buffer_free(device_state_buffer);
+      device_state_buffer = nullptr;
+    }
+    device_state_base = nullptr;
+    device_state_capacity = 0;
+    device_state_used = 0;
     device_expert_layers = 0;
     device_expert_partial_gate_up = false;
     for (ggml_backend_buffer_t b : host_buffers) {
@@ -182,15 +219,24 @@ struct FullGraph {
     host_inputs.clear();
     cuda = nullptr;
     cpu = nullptr;
+    cpu_threads = 0;
     graph = nullptr;
-    input = output = final_streams = positions = attn_mask = ple_embedding =
-        nullptr;
+    input = output = logits = final_streams = positions = attn_mask =
+        decode_indices = ple_embedding = nullptr;
     ple_hist_out = nullptr;
+    ple_hist_storage = nullptr;
+    ple_hist_update = nullptr;
     kv_k.clear();
     kv_v.clear();
     kv_layers.clear();
     gdn_state_out.clear();
     gdn_hist_out.clear();
+    kv_state_k.clear();
+    kv_state_v.clear();
+    gdn_state_storage.clear();
+    gdn_hist_storage.clear();
+    gdn_state_updates.clear();
+    gdn_hist_updates.clear();
     gdn_layers.clear();
     gdn_state_inputs.clear();
     gdn_hist_inputs.clear();
@@ -210,6 +256,9 @@ struct FullGraph {
     host_precharged_bytes = 0;
     engine = nullptr;
     S = 0;
+    decode_mode = false;
+    kv_capacity = 0;
+    decode_last_pos = -1;
   }
 };
 
@@ -232,6 +281,42 @@ int env_device_expert_layers() {
   if (end == v || *end != '\0' || n <= 0)
     return 0;
   return static_cast<int>(std::min<long>(n, 48));
+}
+
+bool env_decode_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE");
+    return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
+int env_decode_kv_capacity(int max_t, int required) {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY");
+  int requested = 2048;
+  if (v && v[0]) {
+    char *end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end != v && *end == '\0' && parsed > 0)
+      requested = static_cast<int>(std::min<long>(parsed, max_t));
+  }
+  return std::min(max_t, std::max(required, requested));
+}
+
+int graph_cpu_threads() {
+#if defined(_OPENMP)
+  const int available = std::max(1, omp_get_max_threads());
+#else
+  const int available = 1;
+#endif
+  const char *v = std::getenv("MOESTREAM_QWEN_CPU_THREADS");
+  if (v && v[0]) {
+    char *end = nullptr;
+    const long parsed = std::strtol(v, &end, 10);
+    if (end != v && *end == '\0' && parsed > 0)
+      return std::min(available, static_cast<int>(parsed));
+  }
+  return available;
 }
 
 bool has_ple_layer(const ArchitectureConfig &c) {
@@ -397,7 +482,8 @@ bool graph_dense_weight_name(const std::string &name) {
          name.find("ffn_down.weight") != std::string::npos ||
          name.find("exp_probs_b.bias") != std::string::npos ||
          name == "output_hc_norm.weight" || name == "output_hc_down.weight" ||
-         name == "output_hc_up.weight";
+         name == "output_hc_up.weight" || name == "output.weight" ||
+         name == "output_norm.weight";
 }
 
 bool init_device_dense_arena(FullGraph &g) {
@@ -439,6 +525,90 @@ bool init_device_dense_arena(FullGraph &g) {
                (1024.0 * 1024.0 * 1024.0),
            tensors);
   return true;
+}
+
+bool init_device_state_arena(FullGraph &g) {
+  if (!g.decode_mode || g.kv_capacity <= 0)
+    return true;
+  const auto &c = g.engine->model_file.architecture_config;
+  size_t bytes = 0;
+  auto add = [&](size_t n) {
+    constexpr size_t kSlack = 4096;
+    if (n > SIZE_MAX - kSlack || bytes > SIZE_MAX - n - kSlack)
+      return false;
+    bytes += n + kSlack;
+    return true;
+  };
+  for (int l = 0; l < g.n_layers; ++l) {
+    if (!qwen4exp_is_gdn_layer(c, l)) {
+      const size_t kv = static_cast<size_t>(g.kv_capacity) * g.Hkv * g.hd *
+                        sizeof(float);
+      if (!add(kv) || !add(kv))
+        return false;
+    } else {
+      const size_t state = static_cast<size_t>(g.gdn_hd) * g.gdn_hd *
+                           g.Hv_gdn * sizeof(float);
+      const size_t hist = static_cast<size_t>(g.d_conv - 1) * g.conv_dim *
+                          sizeof(float);
+      if (!add(state) || !add(hist))
+        return false;
+    }
+    if (qwen4exp_is_ple_layer(c, l)) {
+      const size_t ple_hist = static_cast<size_t>(c.ple_conv_kernel - 1) *
+                              c.ple_ngram_size * g.D * g.HC * sizeof(float);
+      if (!add(ple_hist))
+        return false;
+    }
+  }
+  constexpr size_t kArenaSlack = 1ull << 20;
+  if (bytes > SIZE_MAX - kArenaSlack)
+    return false;
+  const size_t capacity = bytes + kArenaSlack;
+  const ggml_backend_buffer_type_t buft =
+      ggml_backend_get_default_buffer_type(g.cuda);
+  g.device_state_buffer = ggml_backend_buft_alloc_buffer(buft, capacity);
+  if (!g.device_state_buffer) {
+    LOG_WARN("[GGML-QWEN-FULL-DECODE] device state arena declined: %.2f GiB\n",
+             static_cast<double>(capacity) / (1024.0 * 1024.0 * 1024.0));
+    return false;
+  }
+  ggml_backend_buffer_set_usage(g.device_state_buffer,
+                                GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+  g.device_state_base = ggml_backend_buffer_get_base(g.device_state_buffer);
+  g.device_state_capacity = ggml_backend_buffer_get_size(g.device_state_buffer);
+  g.device_state_used = 0;
+  LOG_INFO("[GGML-QWEN-FULL-DECODE] device state arena=%.2f GiB, KV capacity=%d\n",
+           static_cast<double>(g.device_state_capacity) /
+               (1024.0 * 1024.0 * 1024.0),
+           g.kv_capacity);
+  return true;
+}
+
+ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
+                                     const std::vector<int64_t> &shape,
+                                     const char *name) {
+  if (!g.device_state_buffer)
+    return nullptr;
+  ggml_tensor *t = new_tensor(g.ctx, type, shape);
+  if (!t)
+    return nullptr;
+  const ggml_backend_buffer_type_t buft =
+      ggml_backend_buffer_get_type(g.device_state_buffer);
+  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+  const size_t alignment =
+      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+  const size_t aligned =
+      (g.device_state_used + alignment - 1) & ~(alignment - 1);
+  if (aligned > g.device_state_capacity ||
+      alloc_size > g.device_state_capacity - aligned)
+    return nullptr;
+  void *addr = static_cast<uint8_t *>(g.device_state_base) + aligned;
+  if (ggml_backend_tensor_alloc(g.device_state_buffer, t, addr) !=
+      GGML_STATUS_SUCCESS)
+    return nullptr;
+  g.device_state_used = aligned + alloc_size;
+  ggml_set_name(t, name);
+  return t;
 }
 
 bool graph_expert_projection_resident(const FullGraph &g, int layer,
@@ -1001,10 +1171,68 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
   return ggml_mul_mat(ctx, w_o, attn);
 }
 
+// Decode variant of build_full_attention().  K/V are appended directly to a
+// device-resident cache with one set_rows node.  The graph therefore carries
+// the cache update, attention, and output projection in the same scheduler
+// submission; no host K/V readback is needed between tokens.
+ggml_tensor *build_full_attention_decode(
+    FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer,
+    ggml_tensor *w_q, ggml_tensor *w_k, ggml_tensor *w_v, ggml_tensor *w_qn,
+    ggml_tensor *w_kn, ggml_tensor *w_o, ggml_tensor *k_storage,
+    ggml_tensor *v_storage) {
+  ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
+  ggml_tensor *q = ggml_view_3d(
+      ctx, qfull, g.hd, g.H, 1, sizeof(float) * g.hd * 2,
+      sizeof(float) * g.hd * 2 * g.H, 0);
+  q = ggml_mul(
+      ctx, ggml_rms_norm(ctx, q, g.engine->model_file.architecture_config.eps),
+      w_qn);
+  ggml_tensor *k = ggml_reshape_3d(
+      ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, 1);
+  k = ggml_mul(
+      ctx, ggml_rms_norm(ctx, k, g.engine->model_file.architecture_config.eps),
+      w_kn);
+  ggml_tensor *v = ggml_reshape_3d(
+      ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, 1);
+  const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
+                        ? g.engine->model_file.architecture_config.rope_n_rot
+                        : g.hd;
+  q = ggml_rope(ctx, q, g.positions, n_rot, GGML_ROPE_TYPE_NORMAL);
+  k = ggml_rope(ctx, k, g.positions, n_rot, GGML_ROPE_TYPE_NORMAL);
+
+  ggml_tensor *k2 = ggml_reshape_2d(ctx, k, g.hd, g.Hkv);
+  ggml_tensor *v2 = ggml_reshape_2d(ctx, v, g.hd, g.Hkv);
+  ggml_tensor *kset = ggml_set_rows(ctx, k_storage, k2, g.decode_indices);
+  ggml_tensor *vset = ggml_set_rows(ctx, v_storage, v2, g.decode_indices);
+  ggml_tensor *kcache = ggml_reshape_4d(
+      ctx, kset, g.hd, g.kv_capacity, g.Hkv, 1);
+  ggml_tensor *vcache = ggml_reshape_4d(
+      ctx, vset, g.hd, g.kv_capacity, g.Hkv, 1);
+
+  q = ggml_permute(ctx, q, 0, 2, 1, 3);
+  if (kcache->type == GGML_TYPE_F32)
+    kcache = ggml_cast(ctx, kcache, GGML_TYPE_F16);
+  if (vcache->type == GGML_TYPE_F32)
+    vcache = ggml_cast(ctx, vcache, GGML_TYPE_F16);
+  ggml_tensor *attn = ggml_flash_attn_ext(
+      ctx, q, kcache, vcache, g.attn_mask,
+      1.0f / std::sqrt(static_cast<float>(g.hd)), 0.0f, 0.0f);
+  ggml_tensor *gate = ggml_view_3d(
+      ctx, qfull, g.hd, g.H, 1, sizeof(float) * g.hd * 2,
+      sizeof(float) * g.hd * 2 * g.H, sizeof(float) * g.hd);
+  gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, 1), g.hd,
+                         g.H, 1);
+  attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+  attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, 1);
+  (void)layer;
+  return ggml_mul_mat(ctx, w_o, attn);
+}
+
 bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
                            int pos_base, const int *token_ids) {
   const auto &c = g.engine->model_file.architecture_config;
-  if (!has_ple_layer(c) || !token_ids || pos_base != 0)
+  if (!has_ple_layer(c) || !token_ids ||
+      (pos_base != 0 && !(g.decode_mode && S == 1)))
     return !has_ple_layer(c);
   const GGUFTensor *table =
       model_tensor(*g.engine, "per_layer_token_embd.weight");
@@ -1024,8 +1252,21 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
     ctx[0] = token_ids[i];
     bool cut = false;
     for (int s = 1; s < c.ple_ngram_size; ++s) {
-      int j = i - s;
-      ctx[s] = j >= 0 ? token_ids[j] : eos;
+      if (g.decode_mode) {
+        const int64_t pos = pos_base + i;
+        const int64_t back = s - i;
+        const auto &history = g.engine->qwen4exp_ple_tok_hist;
+        if (g.engine->qwen4exp_ple_next_pos == pos && back > 0 &&
+            back <= static_cast<int64_t>(history.size())) {
+          const size_t index = history.size() - static_cast<size_t>(back);
+          ctx[s] = history[index];
+        } else {
+          ctx[s] = eos;
+        }
+      } else {
+        const int j = i - s;
+        ctx[s] = j >= 0 ? token_ids[j] : eos;
+      }
       if (cut || ctx[s] == eos) {
         ctx[s] = eos;
         cut = true;
@@ -1045,9 +1286,13 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
   }
 
   std::unordered_map<int32_t, std::vector<float>> cache;
-  auto *raw = static_cast<uint8_t *>(alloc_host(g, static_cast<size_t>(rb)));
-  if (!raw)
+  void *raw_mem = nullptr;
+  if (posix_memalign(&raw_mem, 4096, static_cast<size_t>(rb)) != 0 ||
+      !raw_mem)
     return false;
+  std::unique_ptr<uint8_t, decltype(&std::free)> raw_guard(
+      static_cast<uint8_t *>(raw_mem), &std::free);
+  auto *raw = raw_guard.get();
   const int fd = g.engine->model_file.fd_for_tensor(*table);
   for (int32_t r : rows) {
     if (cache.count(r))
@@ -1106,19 +1351,40 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   g.positions = host_input(g, g.ctx, GGML_TYPE_I32, {g.S},
                            static_cast<size_t>(g.S) * sizeof(int32_t),
                            "qwen_full_positions");
-  g.attn_mask = host_input(g, g.ctx, GGML_TYPE_F16, {g.S, g.S},
-                           static_cast<size_t>(g.S) * g.S * sizeof(ggml_fp16_t),
-                           "qwen_full_causal_mask");
-  if (!g.input || !g.positions || !g.attn_mask)
+  if (g.decode_mode) {
+    g.attn_mask = host_input(
+        g, g.ctx, GGML_TYPE_F16, {g.kv_capacity, 1, 1, 1},
+        static_cast<size_t>(g.kv_capacity) * sizeof(ggml_fp16_t),
+        "qwen_full_decode_mask");
+    g.decode_indices = host_input(
+        g, g.ctx, GGML_TYPE_I32, {g.Hkv},
+        static_cast<size_t>(g.Hkv) * sizeof(int32_t),
+        "qwen_full_decode_kv_indices");
+  } else {
+    g.attn_mask = host_input(
+        g, g.ctx, GGML_TYPE_F16, {g.S, g.S},
+        static_cast<size_t>(g.S) * g.S * sizeof(ggml_fp16_t),
+        "qwen_full_causal_mask");
+  }
+  if (!g.input || !g.positions || !g.attn_mask ||
+      (g.decode_mode && !g.decode_indices))
     return false;
-  auto *pos = static_cast<int32_t *>(g.host_inputs[1]);
-  auto *mask = static_cast<ggml_fp16_t *>(g.host_inputs[2]);
+  auto *pos = static_cast<int32_t *>(g.positions->data);
+  auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int i = 0; i < g.S; ++i)
     pos[i] = i;
-  for (int q = 0; q < g.S; ++q)
-    for (int k = 0; k < g.S; ++k)
-      mask[static_cast<size_t>(q) * g.S + k] =
-          ggml_fp32_to_fp16(k <= q ? 0.0f : -INFINITY);
+  if (g.decode_mode) {
+    for (int k = 0; k < g.kv_capacity; ++k)
+      mask[k] = ggml_fp32_to_fp16(0.0f);
+    auto *indices = static_cast<int32_t *>(g.decode_indices->data);
+    for (int h = 0; h < g.Hkv; ++h)
+      indices[h] = h;
+  } else {
+    for (int q = 0; q < g.S; ++q)
+      for (int k = 0; k < g.S; ++k)
+        mask[static_cast<size_t>(q) * g.S + k] =
+            ggml_fp32_to_fp16(k <= q ? 0.0f : -INFINITY);
+  }
 
   ggml_tensor *res = g.input;
   for (int l = 0; l < g.n_layers; ++l) {
@@ -1134,7 +1400,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                      "qwen_full_ple_embedding");
       if (!g.ple_embedding)
         return false;
-      std::memcpy(g.host_inputs.back(), ple_embedding->data(),
+      std::memcpy(g.ple_embedding->data, ple_embedding->data(),
                   ple_embedding->size() * sizeof(float));
       g.ple_layer = l;
       // PLE graph is constructed below with the same equations as Bee's
@@ -1180,17 +1446,27 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       normed = ggml_reshape_2d(g.ctx, normed, g.D * g.HC, g.S);
 
       const int hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
-      ggml_tensor *ph =
-          host_input(g, g.ctx, GGML_TYPE_F32, {hist, g.D * g.HC, 1},
-                     static_cast<size_t>(hist) * g.D * g.HC * sizeof(float),
-                     "qwen_full_ple_history");
+      ggml_tensor *ph = nullptr;
+      if (g.decode_mode) {
+        ph = new_device_state_tensor(
+            g, GGML_TYPE_F32, {hist, g.D * g.HC, 1},
+            "qwen_full_decode_ple_history");
+        g.ple_hist_storage = ph;
+      } else {
+        ph = host_input(
+            g, g.ctx, GGML_TYPE_F32, {hist, g.D * g.HC, 1},
+            static_cast<size_t>(hist) * g.D * g.HC * sizeof(float),
+            "qwen_full_ple_history");
+      }
       if (!ph)
         return false;
-      g.ple_hist_input = static_cast<float *>(ph->data);
-      if (l < static_cast<int>(g.engine->qwen4exp_ple_conv_history.size())) {
+      if (!g.decode_mode)
+        g.ple_hist_input = static_cast<float *>(ph->data);
+      if (!g.decode_mode &&
+          l < static_cast<int>(g.engine->qwen4exp_ple_conv_history.size())) {
         auto &h = g.engine->qwen4exp_ple_conv_history[l];
         if (h.size() == static_cast<size_t>(hist) * g.D * g.HC)
-          std::memcpy(g.host_inputs.back(), h.data(), h.size() * sizeof(float));
+          std::memcpy(ph->data, h.data(), h.size() * sizeof(float));
       }
       ggml_tensor *padded =
           ggml_concat(g.ctx, ph, ggml_transpose(g.ctx, normed), 0);
@@ -1218,6 +1494,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       g.ple_hist_out = ggml_cont(
           g.ctx, ggml_view_3d(g.ctx, padded, hist, g.D * g.HC, 1, padded->nb[1],
                               padded->nb[2], ggml_row_size(padded->type, g.S)));
+      if (g.decode_mode) {
+        g.ple_hist_update =
+            ggml_cpy(g.ctx, g.ple_hist_out, g.ple_hist_storage);
+      }
     }
 
     ggml_tensor *inject = nullptr;
@@ -1242,36 +1522,59 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       if (!qkv || !zg || !al || !be || !dt || !aa || !cv || !nm || !oo)
         return false;
       const int hist = g.d_conv - 1;
-      ggml_tensor *hi =
-          host_input(g, g.ctx, GGML_TYPE_F32, {hist, g.conv_dim, 1},
-                     static_cast<size_t>(hist) * g.conv_dim * sizeof(float),
-                     "qwen_full_gdn_history");
-      ggml_tensor *si = host_input(
-          g, g.ctx, GGML_TYPE_F32, {g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1},
-          static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn * sizeof(float),
-          "qwen_full_gdn_state");
+      ggml_tensor *hi = nullptr;
+      ggml_tensor *si = nullptr;
+      if (g.decode_mode) {
+        hi = new_device_state_tensor(g, GGML_TYPE_F32, {hist, g.conv_dim, 1},
+                                      "qwen_full_decode_gdn_history");
+        si = new_device_state_tensor(
+            g, GGML_TYPE_F32, {g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1},
+            "qwen_full_decode_gdn_state");
+        g.gdn_hist_storage.push_back(hi);
+        g.gdn_state_storage.push_back(si);
+      } else {
+        hi = host_input(
+            g, g.ctx, GGML_TYPE_F32, {hist, g.conv_dim, 1},
+            static_cast<size_t>(hist) * g.conv_dim * sizeof(float),
+            "qwen_full_gdn_history");
+        si = host_input(
+            g, g.ctx, GGML_TYPE_F32, {g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1},
+            static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn *
+                sizeof(float),
+            "qwen_full_gdn_state");
+      }
       if (!hi || !si)
         return false;
-      g.gdn_hist_inputs.push_back(static_cast<float *>(hi->data));
-      g.gdn_state_inputs.push_back(static_cast<float *>(si->data));
-      if (l < static_cast<int>(g.engine->qwen4exp_conv_history.size()) &&
-          g.engine->qwen4exp_conv_history[l].size() ==
-              static_cast<size_t>(hist) * g.conv_dim)
-        std::memcpy(g.host_inputs[g.host_inputs.size() - 2],
-                    g.engine->qwen4exp_conv_history[l].data(),
-                    static_cast<size_t>(hist) * g.conv_dim * sizeof(float));
-      if (l < static_cast<int>(g.engine->qwen4exp_recur_state.size()) &&
-          g.engine->qwen4exp_recur_state[l].size() ==
-              static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn)
-        std::memcpy(g.host_inputs.back(),
-                    g.engine->qwen4exp_recur_state[l].data(),
-                    static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn *
-                        sizeof(float));
+      if (g.decode_mode) {
+        g.gdn_hist_updates.push_back(nullptr);
+        g.gdn_state_updates.push_back(nullptr);
+      } else {
+        g.gdn_hist_inputs.push_back(static_cast<float *>(hi->data));
+        g.gdn_state_inputs.push_back(static_cast<float *>(si->data));
+        if (l < static_cast<int>(g.engine->qwen4exp_conv_history.size()) &&
+            g.engine->qwen4exp_conv_history[l].size() ==
+                static_cast<size_t>(hist) * g.conv_dim)
+          std::memcpy(hi->data, g.engine->qwen4exp_conv_history[l].data(),
+                      static_cast<size_t>(hist) * g.conv_dim * sizeof(float));
+        if (l < static_cast<int>(g.engine->qwen4exp_recur_state.size()) &&
+            g.engine->qwen4exp_recur_state[l].size() ==
+                static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn)
+          std::memcpy(si->data, g.engine->qwen4exp_recur_state[l].data(),
+                      static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn *
+                          sizeof(float));
+      }
       ggml_tensor *so = nullptr, *ho = nullptr;
       attn_out = build_gdn(g, g.ctx, attn_in, l, qkv, zg, al, be, dt, aa, cv,
                            nm, oo, hi, si, &so, &ho);
-      g.gdn_state_out.push_back(so);
-      g.gdn_hist_out.push_back(ho);
+      if (g.decode_mode) {
+        g.gdn_state_updates.back() =
+            ggml_cpy(g.ctx, so, g.gdn_state_storage.back());
+        g.gdn_hist_updates.back() =
+            ggml_cpy(g.ctx, ho, g.gdn_hist_storage.back());
+      } else {
+        g.gdn_state_out.push_back(so);
+        g.gdn_hist_out.push_back(ho);
+      }
       g.gdn_layers.push_back(l);
     } else {
       ggml_tensor *wq = dense_weight(g, g.ctx, l, "attn_q.weight");
@@ -1282,14 +1585,29 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       ggml_tensor *wo = dense_weight(g, g.ctx, l, "attn_output.weight");
       if (!wq || !wk || !wv || !wqn || !wkn || !wo)
         return false;
-      ggml_tensor *k_cache = nullptr;
-      ggml_tensor *v_cache = nullptr;
-      attn_out = build_full_attention(g, g.ctx, attn_in, l, wq, wk, wv, wqn,
-                                      wkn, wo, &k_cache, &v_cache);
-      if (!k_cache || !v_cache)
-        return false;
-      g.kv_k.push_back(k_cache);
-      g.kv_v.push_back(v_cache);
+      if (g.decode_mode) {
+        ggml_tensor *k_cache = new_device_state_tensor(
+            g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
+            "qwen_full_decode_kv_k");
+        ggml_tensor *v_cache = new_device_state_tensor(
+            g, GGML_TYPE_F32, {g.hd, g.kv_capacity * g.Hkv},
+            "qwen_full_decode_kv_v");
+        if (!k_cache || !v_cache)
+          return false;
+        g.kv_state_k.push_back(k_cache);
+        g.kv_state_v.push_back(v_cache);
+        attn_out = build_full_attention_decode(
+            g, g.ctx, attn_in, l, wq, wk, wv, wqn, wkn, wo, k_cache, v_cache);
+      } else {
+        ggml_tensor *k_cache = nullptr;
+        ggml_tensor *v_cache = nullptr;
+        attn_out = build_full_attention(g, g.ctx, attn_in, l, wq, wk, wv, wqn,
+                                        wkn, wo, &k_cache, &v_cache);
+        if (!k_cache || !v_cache)
+          return false;
+        g.kv_k.push_back(k_cache);
+        g.kv_v.push_back(v_cache);
+      }
       g.kv_layers.push_back(l);
     }
     res = hc_combine(g, g.ctx, res, attn_out, inject);
@@ -1330,29 +1648,63 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     return false;
   g.final_streams = res;
   g.output = hc_mix(g, g.ctx, res, on, od, ou, nullptr, nullptr);
-  ggml_set_output(g.final_streams);
-  ggml_build_forward_expand(g.graph, g.final_streams);
+  if (!g.decode_mode) {
+    ggml_set_output(g.final_streams);
+    ggml_build_forward_expand(g.graph, g.final_streams);
+  }
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  for (ggml_tensor *t : g.kv_k) {
-    ggml_set_output(t);
-    ggml_build_forward_expand(g.graph, t);
+  if (g.decode_mode) {
+    ggml_tensor *lm_in = g.output;
+    ggml_tensor *out_norm =
+        resident_tensor(g, g.ctx, "output_norm.weight");
+    if (out_norm) {
+      lm_in = ggml_mul(
+          g.ctx,
+          ggml_rms_norm(g.ctx, lm_in,
+                        g.engine->model_file.architecture_config.eps),
+          out_norm);
+    }
+    ggml_tensor *out_weight =
+        resident_tensor(g, g.ctx, "output.weight");
+    if (!out_weight)
+      return false;
+    g.logits = ggml_mul_mat(g.ctx, out_weight, lm_in);
+    ggml_set_output(g.logits);
+    ggml_build_forward_expand(g.graph, g.logits);
   }
-  for (ggml_tensor *t : g.kv_v) {
-    ggml_set_output(t);
-    ggml_build_forward_expand(g.graph, t);
-  }
-  for (ggml_tensor *t : g.gdn_state_out) {
-    ggml_set_output(t);
-    ggml_build_forward_expand(g.graph, t);
-  }
-  for (ggml_tensor *t : g.gdn_hist_out) {
-    ggml_set_output(t);
-    ggml_build_forward_expand(g.graph, t);
-  }
-  if (g.ple_hist_out) {
-    ggml_set_output(g.ple_hist_out);
-    ggml_build_forward_expand(g.graph, g.ple_hist_out);
+  if (!g.decode_mode) {
+    for (ggml_tensor *t : g.kv_k) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(g.graph, t);
+    }
+    for (ggml_tensor *t : g.kv_v) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(g.graph, t);
+    }
+    for (ggml_tensor *t : g.gdn_state_out) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(g.graph, t);
+    }
+    for (ggml_tensor *t : g.gdn_hist_out) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(g.graph, t);
+    }
+    if (g.ple_hist_out) {
+      ggml_set_output(g.ple_hist_out);
+      ggml_build_forward_expand(g.graph, g.ple_hist_out);
+    }
+  } else {
+    // State copies are graph nodes, but are intentionally not graph outputs:
+    // decode keeps GDN/KV/PLE state on the CUDA backend between submissions.
+    for (ggml_tensor *t : g.gdn_state_updates)
+      if (t)
+        ggml_build_forward_expand(g.graph, t);
+    for (ggml_tensor *t : g.gdn_hist_updates)
+      if (t)
+        ggml_build_forward_expand(g.graph, t);
+    if (g.ple_hist_update)
+      ggml_build_forward_expand(g.graph, g.ple_hist_update);
   }
   // Real, measured incident (2026-09-09): ggml_backend_sched_alloc_graph's
   // internal ggml_gallocr_reserve_n_impl does not fail gracefully on a real
@@ -1486,12 +1838,66 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   return true;
 }
 
+bool sync_decode_state_to_host(FullGraph &g) {
+  if (!g.decode_mode || !g.ready || !g.engine)
+    return true;
+  StreamingEngine &engine = *g.engine;
+  const size_t state_n = static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
+  const size_t hist_n = static_cast<size_t>(g.d_conv - 1) * g.conv_dim;
+  for (size_t i = 0; i < g.gdn_layers.size(); ++i) {
+    const int l = g.gdn_layers[i];
+    if (i >= g.gdn_state_storage.size() || i >= g.gdn_hist_storage.size() ||
+        l < 0 || l >= static_cast<int>(engine.qwen4exp_recur_state.size()) ||
+        l >= static_cast<int>(engine.qwen4exp_conv_history.size()) ||
+        engine.qwen4exp_recur_state[l].size() != state_n ||
+        engine.qwen4exp_conv_history[l].size() != hist_n)
+      return false;
+    ggml_backend_tensor_get(g.gdn_state_storage[i],
+                            engine.qwen4exp_recur_state[l].data(), 0,
+                            state_n * sizeof(float));
+    ggml_backend_tensor_get(g.gdn_hist_storage[i],
+                            engine.qwen4exp_conv_history[l].data(), 0,
+                            hist_n * sizeof(float));
+  }
+  const size_t row = static_cast<size_t>(g.Hkv) * g.hd;
+  const int rows = std::min(std::max(0, g.decode_last_pos + 1), g.kv_capacity);
+  for (size_t i = 0; i < g.kv_layers.size(); ++i) {
+    const int l = g.kv_layers[i];
+    if (i >= g.kv_state_k.size() || i >= g.kv_state_v.size() || l < 0 ||
+        l >= static_cast<int>(engine.Kc.size()) ||
+        l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
+        !engine.Vc[l])
+      return false;
+    const size_t bytes = static_cast<size_t>(rows) * row * sizeof(float);
+    if (bytes > 0) {
+      ggml_backend_tensor_get(g.kv_state_k[i], engine.Kc[l], 0, bytes);
+      ggml_backend_tensor_get(g.kv_state_v[i], engine.Vc[l], 0, bytes);
+    }
+  }
+  if (g.ple_layer >= 0 && g.ple_hist_storage) {
+    const auto &c = engine.model_file.architecture_config;
+    const size_t ple_n = static_cast<size_t>(c.ple_conv_kernel - 1) *
+                         c.ple_ngram_size * g.HC * g.D;
+    if (g.ple_layer >= static_cast<int>(engine.qwen4exp_ple_conv_history.size()) ||
+        engine.qwen4exp_ple_conv_history[g.ple_layer].size() != ple_n)
+      return false;
+    ggml_backend_tensor_get(g.ple_hist_storage,
+                            engine.qwen4exp_ple_conv_history[g.ple_layer].data(),
+                            0, ple_n * sizeof(float));
+  }
+  return true;
+}
+
 } // namespace
 
 bool qwen4exp_full_graph_enabled() { return env_enabled(); }
 
 int qwen4exp_full_graph_device_expert_layers() {
   return env_enabled() ? env_device_expert_layers() : 0;
+}
+
+bool qwen4exp_full_graph_decode_enabled() {
+  return env_enabled() && env_decode_enabled();
 }
 
 void qwen4exp_full_graph_shutdown() { g_graph.reset(); }
@@ -1559,6 +1965,16 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->cpu = ggml_backend_cpu_init();
   if (!g->cuda || !g->cpu)
     return false;
+  g->cpu_threads = graph_cpu_threads();
+  ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
+  ggml_threadpool_params cpu_tp_params =
+      ggml_threadpool_params_default(g->cpu_threads);
+  g->cpu_threadpool = ggml_threadpool_new(&cpu_tp_params);
+  if (g->cpu_threadpool)
+    ggml_backend_cpu_set_threadpool(g->cpu, g->cpu_threadpool);
+  LOG_INFO("[GGML-QWEN-FULL] CPU backend configured with %d threads%s\n",
+           g->cpu_threads,
+           g->cpu_threadpool ? " (persistent threadpool)" : "");
 
   // Admit the graph-owned expert source set once, before any of its
   // individual host buffers are allocated.  Layers with a complete
@@ -1617,6 +2033,260 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     return false;
   }
   g_graph = std::move(g);
+  return true;
+}
+
+bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
+                                        const int *token_ids) {
+  if (!qwen4exp_full_graph_decode_enabled() || pos_base < 0 ||
+      engine.family_ops.family != ModelFamily::Qwen4Exp)
+    return false;
+  const auto &c = engine.model_file.architecture_config;
+  if (engine.max_t <= 0 || pos_base >= engine.max_t)
+    return false;
+
+  // The decode graph seeds recurrent/KV state from the graph's validated
+  // prefill writeback.  Do not silently combine it with the existing layered
+  // GPU attention/GDN state owners; that would create two divergent state
+  // stores.  A later capacity growth is allowed because it first downloads
+  // the current decode graph state below.
+  const bool continuing_decode =
+      g_graph && g_graph->ready && g_graph->engine == &engine &&
+      g_graph->decode_mode;
+  const bool has_graph_prefill =
+      g_graph && g_graph->ready && g_graph->engine == &engine &&
+      !g_graph->decode_mode;
+  if (!continuing_decode && !has_graph_prefill) {
+    LOG_WARN("[GGML-QWEN-FULL-DECODE] disabled: decode state has not been "
+             "seeded by the opt-in full-graph prefill\n");
+    return false;
+  }
+
+  // Decode full-graph mode is intentionally stricter than the ordinary graph:
+  // all expert planes must already be in the complete DDR graph arena.  This
+  // keeps a graph submission from silently introducing an SSD/GGUF source or
+  // a per-token lazy-load boundary.  Models with lazy expert ownership stay on
+  // the established layered path.
+  for (int layer = 0; layer < c.n_layers; ++layer) {
+    if (!engine.graph_ram_layer_ready(layer)) {
+      LOG_WARN("[GGML-QWEN-FULL-DECODE] disabled: layer=%d has no complete "
+               "preloaded DDR expert arena; layered decode remains active\n",
+               layer);
+      return false;
+    }
+  }
+
+  const int required = pos_base + 1;
+  const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+  if (g_graph && g_graph->ready && g_graph->engine == &engine &&
+      g_graph->decode_mode && g_graph->kv_capacity >= required &&
+      g_graph->decode_last_pos + 1 == pos_base) {
+    if (has_ple_layer(c)) {
+      std::vector<float> ple;
+      if (!prepare_ple_embedding(*g_graph, ple, 1, pos_base, token_ids) ||
+          !g_graph->ple_embedding ||
+          ple.size() * sizeof(float) > ggml_nbytes(g_graph->ple_embedding))
+        return false;
+      std::memcpy(g_graph->ple_embedding->data, ple.data(),
+                  ple.size() * sizeof(float));
+    }
+    return true;
+  }
+
+  if (g_graph && g_graph->ready && g_graph->decode_mode &&
+      g_graph->engine == &engine) {
+    if (!sync_decode_state_to_host(*g_graph)) {
+      LOG_WARN("[GGML-QWEN-FULL-DECODE] state download failed while growing "
+               "KV capacity; using layered decode\n");
+      return false;
+    }
+  }
+  g_graph.reset();
+
+  auto g = std::make_unique<FullGraph>();
+  g->engine = &engine;
+  g->device = dev;
+  g->S = 1;
+  g->D = c.hidden;
+  g->HC = c.hc_mult;
+  g->n_layers = c.n_layers;
+  g->H = c.n_heads;
+  g->Hkv = std::max(1, c.n_head_kv);
+  g->hd = c.head_dim;
+  g->Hk_gdn = c.ssm_group_count;
+  g->Hv_gdn = c.ssm_time_step_rank;
+  g->gdn_hd = c.ssm_state_size;
+  g->key_dim = g->Hk_gdn * g->gdn_hd;
+  g->value_dim = c.ssm_inner_size;
+  g->conv_dim = 2 * g->key_dim + g->value_dim;
+  g->d_conv = c.ssm_conv_kernel;
+  g->decode_mode = true;
+  g->kv_capacity = env_decode_kv_capacity(engine.max_t, required);
+  g->decode_last_pos = pos_base - 1;
+  g->device_expert_layers =
+      std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
+  const char *partial_gate_up =
+      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
+  g->device_expert_partial_gate_up = g->device_expert_layers > 0 &&
+                                     partial_gate_up &&
+                                     partial_gate_up[0] == '1';
+  g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
+  g->cpu = ggml_backend_cpu_init();
+  if (!g->cuda || !g->cpu)
+    return false;
+  g->cpu_threads = graph_cpu_threads();
+  ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
+  ggml_threadpool_params cpu_tp_params =
+      ggml_threadpool_params_default(g->cpu_threads);
+  g->cpu_threadpool = ggml_threadpool_new(&cpu_tp_params);
+  if (g->cpu_threadpool)
+    ggml_backend_cpu_set_threadpool(g->cpu, g->cpu_threadpool);
+  LOG_INFO("[GGML-QWEN-FULL-DECODE] CPU backend configured with %d threads%s\n",
+           g->cpu_threads,
+           g->cpu_threadpool ? " (persistent threadpool)" : "");
+
+  // Every expert view aliases the already populated DDR graph arena, so this
+  // mode has no graph-owned expert source admission or GGUF expert read.
+  if (!init_device_expert_arena(*g) || !init_device_dense_arena(*g) ||
+      !init_device_state_arena(*g))
+    return false;
+  ggml_backend_t backends[] = {g->cuda, g->cpu};
+  g->sched =
+      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, true);
+  if (!g->sched)
+    return false;
+
+  std::vector<float> ple;
+  if (!prepare_ple_embedding(*g, ple, 1, pos_base, token_ids) &&
+      has_ple_layer(c)) {
+    LOG_WARN("[GGML-QWEN-FULL-DECODE] PLE embedding preparation declined\n");
+    return false;
+  }
+  if (!build_graph(*g, has_ple_layer(c) ? &ple : nullptr)) {
+    LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined; layered "
+             "decode remains active\n");
+    return false;
+  }
+
+  // Seed the device state once from the state/cache that the existing prefill
+  // or layered path produced.  This is a one-time boundary transfer; later
+  // decode submissions update these tensors in the graph itself.
+  const size_t state_n = static_cast<size_t>(g->gdn_hd) * g->gdn_hd * g->Hv_gdn;
+  const size_t hist_n = static_cast<size_t>(g->d_conv - 1) * g->conv_dim;
+  for (size_t i = 0; i < g->gdn_layers.size(); ++i) {
+    const int l = g->gdn_layers[i];
+    if (l < 0 || l >= static_cast<int>(engine.qwen4exp_recur_state.size()) ||
+        l >= static_cast<int>(engine.qwen4exp_conv_history.size()) ||
+        engine.qwen4exp_recur_state[l].size() != state_n ||
+        engine.qwen4exp_conv_history[l].size() != hist_n)
+      return false;
+    ggml_backend_tensor_set(g->gdn_state_storage[i],
+                            engine.qwen4exp_recur_state[l].data(), 0,
+                            state_n * sizeof(float));
+    ggml_backend_tensor_set(g->gdn_hist_storage[i],
+                            engine.qwen4exp_conv_history[l].data(), 0,
+                            hist_n * sizeof(float));
+  }
+  const size_t kv_row = static_cast<size_t>(g->Hkv) * g->hd;
+  const size_t kv_bytes = static_cast<size_t>(pos_base) * kv_row * sizeof(float);
+  for (size_t i = 0; i < g->kv_layers.size(); ++i) {
+    const int l = g->kv_layers[i];
+    if (i >= g->kv_state_k.size() || i >= g->kv_state_v.size() || l < 0 ||
+        l >= static_cast<int>(engine.Kc.size()) ||
+        l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
+        !engine.Vc[l])
+      return false;
+    if (kv_bytes > 0) {
+      ggml_backend_tensor_set(g->kv_state_k[i], engine.Kc[l], 0, kv_bytes);
+      ggml_backend_tensor_set(g->kv_state_v[i], engine.Vc[l], 0, kv_bytes);
+    }
+  }
+  if (g->ple_layer >= 0 && g->ple_hist_storage) {
+    const size_t ple_n = static_cast<size_t>(c.ple_conv_kernel - 1) *
+                         c.ple_ngram_size * g->HC * g->D;
+    if (g->ple_layer >=
+            static_cast<int>(engine.qwen4exp_ple_conv_history.size()) ||
+        engine.qwen4exp_ple_conv_history[g->ple_layer].size() != ple_n)
+      return false;
+    ggml_backend_tensor_set(
+        g->ple_hist_storage,
+        engine.qwen4exp_ple_conv_history[g->ple_layer].data(), 0,
+        ple_n * sizeof(float));
+  }
+
+  LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "
+           "token, KV capacity=%d, device GDN/KV/PLE state, DDR expert "
+           "arenas=%d\n",
+           g->kv_capacity, c.n_layers);
+  g_graph = std::move(g);
+  return true;
+}
+
+bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
+                                    float *hidden_states, int pos_base,
+                                    const int *token_ids, float *logits,
+                                    int vocab) {
+  if (!qwen4exp_full_graph_decode_enabled() || !hidden_states || pos_base < 0 ||
+      !g_graph || !g_graph->ready || !g_graph->decode_mode ||
+      g_graph->engine != &engine || g_graph->S != 1 ||
+      pos_base >= g_graph->kv_capacity ||
+      ((logits == nullptr) != (vocab <= 0)))
+    return false;
+  FullGraph &g = *g_graph;
+  if (engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC)
+    return false;
+  if (has_ple_layer(engine.model_file.architecture_config) &&
+      (!g.ple_embedding || !token_ids))
+    return false;
+  // Validate the optional output before submitting the graph.  If this
+  // check were left until after compute, a malformed logits destination
+  // could advance device KV/GDN state and then fall back to the layered path
+  // with stale host state.
+  if (logits && (!g.logits || ggml_nelements(g.logits) < vocab))
+    return false;
+
+  std::memcpy(g.input->data, engine.hc_stream_buf.data(),
+              static_cast<size_t>(g.D) * g.HC * sizeof(float));
+  static_cast<int32_t *>(g.positions->data)[0] = pos_base;
+  auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
+  for (int k = 0; k < g.kv_capacity; ++k)
+    mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
+  auto *indices = static_cast<int32_t *>(g.decode_indices->data);
+  for (int h = 0; h < g.Hkv; ++h)
+    indices[h] = pos_base * g.Hkv + h;
+
+  const auto start = std::chrono::steady_clock::now();
+  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  ggml_backend_sched_synchronize(g.sched);
+  ggml_backend_tensor_get(g.output, hidden_states, 0,
+                          static_cast<size_t>(g.D) * sizeof(float));
+  if (logits) {
+    ggml_backend_tensor_get(g.logits, logits, 0,
+                            static_cast<size_t>(vocab) * sizeof(float));
+  }
+  g.decode_last_pos = pos_base;
+
+  // The PLE hash window is host metadata, not numerical recurrent state. Keep
+  // it current so a later graph disable/capacity growth can seed the layered
+  // path without changing the token-context semantics.
+  if (has_ple_layer(engine.model_file.architecture_config)) {
+    auto &hist = engine.qwen4exp_ple_tok_hist;
+    hist.push_back(token_ids[0]);
+    const int keep = std::max(
+        0, engine.model_file.architecture_config.ple_ngram_size - 1);
+    if (static_cast<int>(hist.size()) > keep)
+      hist.erase(hist.begin(), hist.end() - keep);
+    engine.qwen4exp_ple_next_pos = pos_base + 1;
+  }
+  engine.qwen4exp_full_graph_output_ready = true;
+  engine.qwen4exp_full_graph_logits_ready = logits != nullptr;
+  const double ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+  LOG_INFO("[GGML-QWEN-FULL-DECODE-TIME] pos=%d total=%.3f ms\n", pos_base,
+           ms);
   return true;
 }
 
@@ -1788,12 +2458,20 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
 #else
 
 bool qwen4exp_full_graph_enabled() { return false; }
+bool qwen4exp_full_graph_decode_enabled() { return false; }
 int qwen4exp_full_graph_device_expert_layers() { return 0; }
 bool qwen4exp_full_graph_prepare(StreamingEngine &, int, int, const int *) {
   return false;
 }
+bool qwen4exp_full_graph_decode_prepare(StreamingEngine &, int, const int *) {
+  return false;
+}
 bool qwen4exp_full_graph_run(StreamingEngine &, float *, int, int,
                              const int *) {
+  return false;
+}
+bool qwen4exp_full_graph_decode_run(StreamingEngine &, float *, int,
+                                    const int *, float *, int) {
   return false;
 }
 void qwen4exp_full_graph_shutdown() {}

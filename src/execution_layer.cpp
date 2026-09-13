@@ -2803,6 +2803,20 @@ static bool qwen_cpu_compact_graph_enabled() {
   return enabled;
 }
 
+// The direct DDR-strided grouped kernel is the measured fast Qwen CPU path,
+// so the ordinary overlap guard keeps it on the simpler one shared-graph
+// handoff.  Keep a separate, explicit probe for comparing the existing
+// shared-only/host-add overlap topology against that kernel.  This is
+// Qwen-only and defaults off; it must never silently alter the production
+// path or any other model family's scheduler.
+static bool qwen_cpu_direct_gpu_overlap_probe() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_DIRECT_GPU_OVERLAP");
+    return env && env[0] == '1';
+  }();
+  return enabled;
+}
+
 static bool qwen_cpu_strided_grouped_enabled(const StreamingEngine &engine) {
   static const int env_override = [] {
     const char *env = std::getenv("MOESTREAM_QWEN_CPU_STRIDED_GROUPED");
@@ -7995,11 +8009,12 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
           engine.qwen4exp_cpu_gpu_overlap && shared_available &&
           qwen4exp_hc_device_live() && engine.qwen4exp_device_hc_ffn_input &&
           moe_ggml_shared_expert() &&
-          !qwen_direct_grouped_cpu &&
+          (!qwen_direct_grouped_cpu || qwen_cpu_direct_gpu_overlap_probe()) &&
           (engine.qwen4exp_cpu_gpu_overlap_max_layers <= 0 ||
            cpu_affinity_count <= engine.qwen4exp_cpu_gpu_overlap_max_layers);
       static std::atomic<bool> logged_direct_overlap_guard{false};
       if (engine.qwen4exp_cpu_gpu_overlap && qwen_direct_grouped_cpu &&
+          !qwen_cpu_direct_gpu_overlap_probe() &&
           !logged_direct_overlap_guard.exchange(true,
                                                  std::memory_order_relaxed)) {
         LOG_INFO("[CPU-MOE] Qwen CPU/GPU overlap worker bypassed: direct "
@@ -10551,10 +10566,19 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // scheduler call.  They return true only after producing final [S,D]
   // output; otherwise the established layer loop remains the fallback.
   engine.qwen4exp_full_graph_output_ready = false;
+  engine.qwen4exp_full_graph_logits_ready = false;
   engine.glm5next_full_graph_output_ready = false;
   engine.deepseek_v4_full_graph_output_ready = false;
   if (S > 1 && pos_base == 0 && qwen4exp_full_graph_enabled() &&
       qwen4exp_full_graph_run(engine, hidden_states, S, pos_base, token_ids)) {
+    return;
+  }
+  if (S == 1 && pos_base >= 0 && qwen4exp_full_graph_decode_enabled() &&
+      qwen4exp_full_graph_decode_prepare(engine, pos_base, token_ids) &&
+      qwen4exp_full_graph_decode_run(engine, hidden_states, pos_base,
+                                     token_ids,
+                                     engine.qwen4exp_full_graph_logits_target,
+                                     engine.qwen4exp_full_graph_logits_target_size)) {
     return;
   }
   if (S > 1 && pos_base == 0 && glm5next_full_graph_enabled() &&
