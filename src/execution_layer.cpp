@@ -44,7 +44,8 @@ extern bool qwen4exp_hc_device_live();
 extern bool qwen4exp_hc_post_combine_device(StreamingEngine &engine,
                                             int layer_idx, int sub_block, int S,
                                             int D,
-                                            const void *device_sub_block_out);
+                                            const void *device_sub_block_out,
+                                            const void *producer_event);
 extern bool qwen4exp_hc_post_combine_device_raw(StreamingEngine &engine,
                                                 int layer_idx, int sub_block,
                                                 int S, int D,
@@ -56,6 +57,12 @@ extern bool qwen4exp_hc_commit_host_layer_input(StreamingEngine &engine,
                                                 int layer_idx, int S);
 extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
                                                     float *host, int S);
+
+// Decode-only timing for the Qwen DDR-backed routed expert calculation. It
+// is declared before the layer dispatch because the timing wrapper lives in
+// that earlier section of this translation unit.
+static double g_diag_decode_qwen_cpu_graph_ms = 0.0;
+static double g_diag_decode_qwen_shared_submit_ms = 0.0;
 
 // CUDA kernel launchers
 extern "C" void launch_gguf_q4_0_dp4a(float *y, const float *x,
@@ -2436,15 +2443,10 @@ static bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
       !first.gate_proj.host_ptr || !first.up_proj.host_ptr ||
       !first.down_proj.host_ptr)
     return false;
-  for (int expert = 0; expert < n_experts; ++expert) {
-    const MoEExpertBlock &slot = slots[(size_t)expert];
-    if (slot.expert_id != expert || !slot.slab_from_shared_arena ||
-        slot.slab_buffer != arena->base + (size_t)expert * arena->stride ||
-        slot.slab_capacity < arena->stride || slot.ram_loading ||
-        !slot.gate_proj.host_ptr || !slot.up_proj.host_ptr ||
-        !slot.down_proj.host_ptr)
-      return false;
-  }
+  // graph_ram_layer_ready() performed the complete 512-slot validation and
+  // caches it for the lifetime of this immutable shared arena. Repeating
+  // that walk here made every decode token pay another O(n_experts) check for
+  // every CPU layer; graph-backed slices cannot be reclaimed or resized.
 
   out.meta = {arena->base,
               arena->base + arena->gate_bytes,
@@ -2459,6 +2461,232 @@ static bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
   out.up_plane = arena->base + arena->gate_bytes;
   out.down_plane = arena->base + arena->gate_bytes + arena->up_bytes;
   out.expert_stride = arena->stride;
+  return true;
+}
+
+// Qwen-only direct strided CPU path.  The persistent MUL_MAT_ID graph above
+// is the safe default, but its per-layer graph submission still carries
+// generic GGML scheduling overhead.  For the common UD-IQ1_M layout, the
+// selected experts can be addressed directly in the already-populated DDR
+// arena and grouped into one activation-quantization/dot pass per
+// projection.  Keep this behind an environment switch until a real hardware
+// A/B proves it; no other model family can reach this helper.
+static bool qwen_cpu_stage_timing_enabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_STAGE_TIMING");
+    return env && env[0] == '1';
+  }();
+  return enabled;
+}
+
+static bool qwen_cpu_fused_iq1_iq4_enabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_IQ1_IQ4");
+    return env && env[0] == '1';
+  }();
+  return enabled;
+}
+
+static bool qwen_cpu_fused_grouped_enabled(const StreamingEngine &engine) {
+  static const int env_override = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_GROUPED");
+    if (!env || !env[0])
+      return -1;
+    return env[0] == '0' ? 0 : (env[0] == '1' ? 1 : -1);
+  }();
+  return env_override >= 0 ? env_override == 1
+                           : engine.qwen4exp_cpu_fused_grouped;
+}
+
+static bool qwen_cpu_fused_iq2_iq4_enabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_IQ2_IQ4");
+    return env && env[0] == '1';
+  }();
+  return enabled;
+}
+
+static bool qwen4exp_cpu_strided_grouped_quantized(
+    const StreamingEngine &engine, const float *input, float *output,
+    const QwenRamCpuMoeLayer &layer,
+    const int *expert_ids, const float *router_weights, int n_experts,
+    int topk, int D, int moe_inter, float swiglu_clamp) {
+  if (!input || !output || !expert_ids || !router_weights ||
+      !layer.gate_plane || !layer.up_plane || !layer.down_plane ||
+      layer.expert_stride == 0 || n_experts <= 0 || topk <= 0 ||
+      topk > n_experts || D <= 0 || moe_inter <= 0 || swiglu_clamp != 0.0f)
+    return false;
+
+  const GGUFType gate_type = static_cast<GGUFType>(layer.meta.gate_type);
+  const GGUFType up_type = static_cast<GGUFType>(layer.meta.up_type);
+  const GGUFType down_type = static_cast<GGUFType>(layer.meta.down_type);
+  if (down_type != GGUFType::IQ4_NL)
+    return false;
+
+  auto grouped_gate_up_supported = [](GGUFType type) {
+    return type == GGUFType::IQ1_M || type == GGUFType::IQ2_XXS ||
+           type == GGUFType::IQ3_XXS;
+  };
+  if (!grouped_gate_up_supported(gate_type) ||
+      !grouped_gate_up_supported(up_type))
+    return false;
+
+  // Decode has one caller at a time.  Retain capacity across layers/tokens
+  // so the fast path does not turn its own dispatch overhead into repeated
+  // heap traffic.
+  struct Scratch {
+    std::vector<const uint8_t *> gate_w, up_w, down_w;
+    std::vector<const float *> down_x;
+    std::vector<float *> gate, up, down;
+    std::vector<float> gate_storage, up_storage, down_storage;
+  };
+  static thread_local Scratch scratch;
+  scratch.gate_w.resize(static_cast<size_t>(topk));
+  scratch.up_w.resize(static_cast<size_t>(topk));
+  scratch.down_w.resize(static_cast<size_t>(topk));
+  scratch.down_x.resize(static_cast<size_t>(topk));
+  scratch.gate.resize(static_cast<size_t>(topk));
+  scratch.up.resize(static_cast<size_t>(topk));
+  scratch.down.resize(static_cast<size_t>(topk));
+  scratch.gate_storage.resize(static_cast<size_t>(topk) * moe_inter);
+  scratch.up_storage.resize(static_cast<size_t>(topk) * moe_inter);
+  scratch.down_storage.resize(static_cast<size_t>(topk) * D);
+
+  const bool stage_timing = qwen_cpu_stage_timing_enabled();
+  using StageClock = std::chrono::steady_clock;
+  auto add_stage_time = [](std::atomic<double> &counter,
+                           StageClock::time_point start) {
+    PerfCounters::atomic_add(
+        counter, std::chrono::duration<double>(StageClock::now() - start)
+                     .count());
+  };
+
+  const auto gate_base = static_cast<const uint8_t *>(layer.gate_plane);
+  const auto up_base = static_cast<const uint8_t *>(layer.up_plane);
+  const auto down_base = static_cast<const uint8_t *>(layer.down_plane);
+  for (int k = 0; k < topk; ++k) {
+    const int expert = expert_ids[k];
+    if (expert < 0 || expert >= n_experts)
+      return false;
+    const size_t offset = static_cast<size_t>(expert) * layer.expert_stride;
+    scratch.gate_w[static_cast<size_t>(k)] = gate_base + offset;
+    scratch.up_w[static_cast<size_t>(k)] = up_base + offset;
+    scratch.down_w[static_cast<size_t>(k)] = down_base + offset;
+    scratch.gate[static_cast<size_t>(k)] =
+        scratch.gate_storage.data() + static_cast<size_t>(k) * moe_inter;
+    scratch.up[static_cast<size_t>(k)] =
+        scratch.up_storage.data() + static_cast<size_t>(k) * moe_inter;
+    scratch.down[static_cast<size_t>(k)] =
+        scratch.down_storage.data() + static_cast<size_t>(k) * D;
+  }
+
+  const bool fused_iq1_iq4 =
+      (qwen_cpu_fused_grouped_enabled(engine) ||
+       qwen_cpu_fused_iq1_iq4_enabled()) &&
+      gate_type == GGUFType::IQ1_M &&
+      up_type == GGUFType::IQ1_M;
+  const bool fused_iq2_iq4 =
+      (qwen_cpu_fused_grouped_enabled(engine) ||
+       qwen_cpu_fused_iq2_iq4_enabled()) &&
+      gate_type == GGUFType::IQ2_XXS &&
+      up_type == GGUFType::IQ2_XXS;
+  bool fused_done = false;
+  if (fused_iq1_iq4) {
+    fused_done = matmul_qwen_iq1_m_iq4_nl_fused(
+        scratch.gate.data(), scratch.up.data(), scratch.down.data(), input,
+        scratch.gate_w.data(), scratch.up_w.data(), scratch.down_w.data(),
+        topk, D, moe_inter, D);
+    static std::atomic<bool> logged_fused_iq1_iq4{false};
+    if (fused_done &&
+        !logged_fused_iq1_iq4.exchange(true, std::memory_order_relaxed))
+      LOG_INFO("[CPU-MOE] Qwen fused IQ1_M gate/up + SwiGLU + IQ4_NL down "
+               "probe active (one OpenMP team)\n");
+  }
+  if (!fused_done && fused_iq2_iq4) {
+    fused_done = matmul_qwen_iq2_xxs_iq4_nl_fused(
+        scratch.gate.data(), scratch.up.data(), scratch.down.data(), input,
+        scratch.gate_w.data(), scratch.up_w.data(), scratch.down_w.data(),
+        topk, D, moe_inter, D);
+    static std::atomic<bool> logged_fused_iq2_iq4{false};
+    if (fused_done &&
+        !logged_fused_iq2_iq4.exchange(true, std::memory_order_relaxed))
+      LOG_INFO("[CPU-MOE] Qwen fused IQ2_XXS gate/up + SwiGLU + IQ4_NL "
+               "down probe active (one OpenMP team)\n");
+  }
+
+  StageClock::time_point stage_start;
+  if (!fused_done) {
+    if (stage_timing)
+      stage_start = StageClock::now();
+    if (gate_type == GGUFType::IQ1_M && up_type == GGUFType::IQ1_M &&
+        matmul_iq1_m_ggml_q8k_grouped_pair(
+            scratch.gate.data(), scratch.up.data(), input,
+            scratch.gate_w.data(), scratch.up_w.data(), topk, 1, D,
+            moe_inter)) {
+      // The common Qwen IQ1_M gate/up layout shares the activation. The pair
+      // wrapper quantizes Q8_K once and avoids a second OpenMP team launch.
+    } else {
+    auto grouped_gate_up = [&](std::vector<float *> &dst,
+                               const std::vector<const uint8_t *> &weights,
+                               GGUFType type) {
+    if (type == GGUFType::IQ1_M)
+      return matmul_iq1_m_ggml_q8k_grouped(
+          dst.data(), input, weights.data(), topk, 1, D, moe_inter);
+    if (type == GGUFType::IQ2_XXS)
+      return matmul_iq2_xxs_ggml_q8k_grouped(
+          dst.data(), input, weights.data(), topk, 1, D, moe_inter);
+    if (type == GGUFType::IQ3_XXS)
+      return matmul_iq3_xxs_ggml_q8k_grouped(
+          dst.data(), input, weights.data(), topk, 1, D, moe_inter);
+      return false;
+    };
+
+    if (!grouped_gate_up(scratch.gate, scratch.gate_w, gate_type) ||
+        !grouped_gate_up(scratch.up, scratch.up_w, up_type))
+      return false;
+    }
+    if (stage_timing)
+      add_stage_time(perf().t_qwen_cpu_grouped_gate_up, stage_start);
+  }
+
+  if (!fused_done) {
+    if (stage_timing)
+      stage_start = StageClock::now();
+    for (int k = 0; k < topk; ++k) {
+      float *gate = scratch.gate[static_cast<size_t>(k)];
+      float *up = scratch.up[static_cast<size_t>(k)];
+      if (swiglu_clamp_fused())
+        swiglu_clamp_fused_inplace(gate, up, moe_inter, swiglu_clamp);
+      else {
+        silu_inplace(gate, moe_inter);
+        elem_mul(gate, gate, up, moe_inter);
+      }
+      scratch.down_x[static_cast<size_t>(k)] = gate;
+    }
+    if (stage_timing)
+      add_stage_time(perf().t_qwen_cpu_grouped_swiglu, stage_start);
+
+    if (stage_timing)
+      stage_start = StageClock::now();
+    if (!matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+            scratch.down.data(), scratch.down_x.data(), scratch.down_w.data(),
+            topk, 1, moe_inter, D))
+      return false;
+    if (stage_timing)
+      add_stage_time(perf().t_qwen_cpu_grouped_down, stage_start);
+  }
+
+  if (stage_timing)
+    stage_start = StageClock::now();
+  std::fill(output, output + D, 0.0f);
+  for (int k = 0; k < topk; ++k) {
+    const float weight = router_weights[k];
+    const float *down = scratch.down[static_cast<size_t>(k)];
+    for (int d = 0; d < D; ++d)
+      output[d] += weight * down[d];
+  }
+  if (stage_timing)
+    add_stage_time(perf().t_qwen_cpu_grouped_combine, stage_start);
   return true;
 }
 
@@ -2575,6 +2803,30 @@ static bool qwen_cpu_compact_graph_enabled() {
   return enabled;
 }
 
+static bool qwen_cpu_strided_grouped_enabled(const StreamingEngine &engine) {
+  static const int env_override = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_STRIDED_GROUPED");
+    if (!env || !env[0])
+      return -1;
+    return env[0] == '0' ? 0 : (env[0] == '1' ? 1 : -1);
+  }();
+  // `0` is an explicit Qwen-only A/B escape hatch: it disables the config
+  // switch so the persistent GGML MUL_MAT_ID graph can be measured without
+  // editing a benchmark config.  Other model families never call this
+  // helper, and the default remains the configured value byte-for-byte.
+  if (env_override == 0)
+    return false;
+  if (env_override == 1)
+    return true;
+  return engine.qwen4exp_cpu_strided_grouped;
+}
+
+// The direct DDR-strided CPU kernel is normally kept on the simple device
+// handoff path.  This opt-in allows the existing same-thread shared-FFN
+// overlap experiment to run beside it; it is deliberately separate from the
+// old worker-thread experiment, which contended with the CPU kernel.  The
+// caller still requires the async GGML graph/direct-input mode, so a failed
+// capability check falls back to the established path.
 // Qwen-only A/B for the Bee-style post-down partition.  The CPU graph still
 // owns all three quantized projections and the DDR strided arena; this switch
 // only decides whether the CPU also performs router weighting/accumulation.
@@ -2587,6 +2839,18 @@ static bool qwen_cpu_gpu_combine_enabled() {
     // CUDA graph launch for each CPU-affinity layer and, until the weighting
     // is fused into the shared graph, the extra launch/shape conversion is
     // slower than the established CPU weighted-result path on Qwen decode.
+    return env && env[0] == '1';
+  }();
+  return enabled;
+}
+
+// Qwen-only transfer A/B.  Packed VRAM-cache copies can be landed as a
+// compact batch and unpacked with one scatter kernel at the D2D/H2D boundary.
+// Keep the switch out of the generic runner so GLM/DeepSeek retain their exact
+// existing per-expert transfer behavior.
+static bool qwen_batch_d2d_unpack_enabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_BATCH_D2D_UNPACK");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -2715,6 +2979,9 @@ static bool run_ggml_moe_layer_chunked(
 
   GgmlMoeRunner &runner = GgmlMoeRunner::instance_for(
       (uint32_t)g0->type, (uint32_t)u0->type, (uint32_t)d0->type);
+  runner.set_batch_d2d_unpack(
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      qwen_batch_d2d_unpack_enabled());
   GgmlMoeLayerPlan plan;
   plan.device_id = chosen_device;
   plan.n_experts = 2 * chunk; // two alternating compact slot ranges
@@ -3039,6 +3306,9 @@ static bool run_ggml_moe_layer(
 
   GgmlMoeRunner &runner = GgmlMoeRunner::instance_for(
       (uint32_t)g0->type, (uint32_t)u0->type, (uint32_t)d0->type);
+  runner.set_batch_d2d_unpack(
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      qwen_batch_d2d_unpack_enabled());
   GgmlMoeLayerPlan plan;
   plan.device_id = chosen_device;
   plan.n_experts = n_used;
@@ -3220,6 +3490,7 @@ static bool run_ggml_moe_layer(
   int n_reused = 0;
   int n_active_reused = 0;
   int n_ram_direct = 0;
+  int n_ram_direct_runs = 0;
   int n_ram_staged = 0;
   // Filled once per compact chunk by GpuTopology::find_expert_batch().
   // These pointers are only residency hints; hold_for_compute() below still
@@ -3264,6 +3535,7 @@ static bool run_ggml_moe_layer(
   // only that stream in backend mode; H2D staging and graph work remain
   // continuously queued on GGML's shared stream.
   const bool use_d2d = !no_d2d;
+  const auto *ram_arena = engine.graph_ram_arena(layer_idx);
 
   for (int c = 0; c < n_chunks; ++c) {
     const int c0 = c * chunk;
@@ -3371,6 +3643,15 @@ static bool run_ggml_moe_layer(
             : 0;
     const bool qwen_ddr_only_source = qwen_ddr_only_expert_source(engine);
     static std::atomic<bool> logged_qwen_ddr_miss{false};
+    const bool can_coalesce_direct =
+        !force_batch_stage && ram_arena && ram_arena->base &&
+        ram_arena->stride >= gb0 + ub0 + db0;
+    std::vector<const uint8_t *> direct_sources;
+    std::vector<MoEExpertBlock *> direct_blocks;
+    if (can_coalesce_direct) {
+      direct_sources.assign((size_t)(c1 - c0), nullptr);
+      direct_blocks.assign((size_t)(c1 - c0), nullptr);
+    }
     if (ram_cap > 0) {
       auto &ram_slots = engine.layers_experts[(size_t)layer_idx];
       for (int i = c0; i < c1; ++i) {
@@ -3383,27 +3664,85 @@ static bool run_ggml_moe_layer(
             &ram_capacity);
         if (!rb)
           continue;
-        // Backend-stream mode used to force even persistently pinned RAM
-        // slabs through h_stage_: the CPU copied [gate|up|down] into the
-        // staging arena, then the copy stream uploaded that duplicate. A
-        // packed direct H2D is safe here because this lookup guarantees a
-        // page-locked slab and ram_h2d_holds keeps it from being evicted
-        // until collect_h2d() has drained the completion event.
-        const bool direct_ok = !force_batch_stage && ram_slab &&
-                               ram_capacity >= gb0 + ub0 + db0 &&
-                               runner.copy_expert_h2d(buf, i, ram_slab);
-        if (direct_ok) {
-          // This is the first actual predicted-layer DDR->VRAM H2D issue
-          // when the grouped runner cannot reuse a VRAM/active-layer source.
-          qwen4exp_record_pilot_fetch_start(layer_idx);
-          staged_flag[(size_t)(i - c0)] = 0;
-          trace_source[(size_t)i] = 2;
-          ram_h2d_holds.push_back({used[(size_t)i], rb});
-          ++n_ram_direct;
+        if (!force_batch_stage && ram_slab &&
+            ram_capacity >= gb0 + ub0 + db0) {
+          if (can_coalesce_direct) {
+            // Keep the source held while we classify the whole chunk. Direct
+            // copies are issued below, where consecutive graph-arena slabs
+            // can be coalesced into three pitched copies.
+            direct_sources[(size_t)(i - c0)] = ram_slab;
+            direct_blocks[(size_t)(i - c0)] = rb;
+          } else if (runner.copy_expert_h2d(buf, i, ram_slab)) {
+            // Preserve the established per-expert path for ordinary RAM
+            // slabs; only a validated fixed-stride arena enters the new
+            // batching path below.
+            qwen4exp_record_pilot_fetch_start(layer_idx);
+            staged_flag[(size_t)(i - c0)] = 0;
+            trace_source[(size_t)i] = 2;
+            ram_h2d_holds.push_back({used[(size_t)i], rb});
+            ++n_ram_direct;
+            ++n_ram_direct_runs;
+          } else {
+            ram_mgr.ram_unpin(*rb);
+          }
         } else {
           ram_mgr.ram_unpin(*rb);
         }
       }
+    }
+
+    const size_t direct_stride = can_coalesce_direct ? ram_arena->stride : 0;
+    for (int i = c0; can_coalesce_direct && i < c1;) {
+      const int local = i - c0;
+      const uint8_t *src = direct_sources[(size_t)local];
+      if (!src || !direct_blocks[(size_t)local]) {
+        ++i;
+        continue;
+      }
+      int j = i + 1;
+      if (ram_arena && ram_arena->base && direct_stride >= gb0 + ub0 + db0 &&
+          src == ram_arena->base + (size_t)used[(size_t)i] * direct_stride) {
+        while (j < c1) {
+          const int cur = j - c0;
+          const int offset = j - i;
+          if (!direct_sources[(size_t)cur] ||
+              !direct_blocks[(size_t)cur] ||
+              used[(size_t)j] != used[(size_t)i] + offset ||
+              direct_sources[(size_t)cur] !=
+                  src + (size_t)offset * direct_stride)
+            break;
+          ++j;
+        }
+      }
+      const int run = j - i;
+      const bool copied =
+          run > 1
+              ? runner.copy_expert_h2d_strided(buf, local, run, src,
+                                                direct_stride)
+              : runner.copy_expert_h2d(buf, local, src);
+      if (!copied) {
+        // A CUDA enqueue failure must not release a source slab while the
+        // copy stream may still reference it. Drain the already-issued work,
+        // release this run, and let the caller take its established fallback.
+        runner.sync_copies();
+        for (int k = i; k < j; ++k) {
+          MoEExpertBlock *held = direct_blocks[(size_t)(k - c0)];
+          if (held) ram_mgr.ram_unpin(*held);
+        }
+        return false;
+      }
+      // This is the first actual predicted-layer DDR->VRAM H2D issue when
+      // the grouped runner cannot reuse a VRAM/active-layer source.
+      qwen4exp_record_pilot_fetch_start(layer_idx);
+      for (int k = i; k < j; ++k) {
+        staged_flag[(size_t)(k - c0)] = 0;
+        trace_source[(size_t)k] = 2;
+        ram_h2d_holds.push_back(
+            {used[(size_t)k], direct_blocks[(size_t)(k - c0)]});
+        ++n_ram_direct;
+      }
+      ++n_ram_direct_runs;
+      i = j;
     }
 
     // Resident but pageable RAM is still the preferred source when the
@@ -3676,10 +4015,11 @@ static bool run_ggml_moe_layer(
                                              std::memory_order_relaxed);
     LOG_DEBUG("[GGML-MOE] layer=%d experts=%d gate=%u up=%u down=%u "
              "graph=%.2f ms d2d=%d active_d2d=%d ram_direct=%d "
-             "ram_staged=%d mmap_staged=%.2f MB\n",
+             "direct_runs=%d ram_staged=%d mmap_staged=%.2f MB\n",
              layer_idx, n_used, (unsigned)g0->type, (unsigned)u0->type,
              (unsigned)d0->type, ms, n_reused, n_active_reused, n_ram_direct,
-             n_ram_staged, (double)mmap_staged_total / (1024.0 * 1024.0));
+             n_ram_direct_runs, n_ram_staged,
+             (double)mmap_staged_total / (1024.0 * 1024.0));
   }
 
   if (trace_set) {
@@ -3777,7 +4117,17 @@ static bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
                                        const void *routed_output,
                                        const ArchitectureConfig &c,
                                        const void **combined_output,
-                                       const float *host_routed = nullptr) {
+                                       const float *host_routed = nullptr,
+                                       bool shared_only = false,
+                                       bool shared_add = false) {
+  const auto submit_start = std::chrono::steady_clock::now();
+  const auto record_submit_time = [&]() {
+    if (S == 1)
+      g_diag_decode_qwen_shared_submit_ms +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - submit_start)
+              .count();
+  };
   static const bool debug = [] {
     const char *e = std::getenv("MOESTREAM_GGML_SHARED_DEBUG");
     return e && e[0] == '1';
@@ -3790,7 +4140,9 @@ static bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
   }();
   if (force_host_decode && S == 1)
     return false;
-  if (!device_input || (!routed_output && !host_routed) ||
+  if (!device_input ||
+      (!routed_output && !host_routed && !shared_only) ||
+      (shared_add && (!host_routed || routed_output)) ||
       (routed_output && host_routed) || !combined_output ||
       c.n_expert_shared <= 0 || !moe_ggml_shared_expert()) {
     if (debug)
@@ -3860,7 +4212,7 @@ static bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
     gate_inp = ref;
   }
 
-  auto &runner = GgmlQwenSharedRunner::instance();
+  auto &runner = GgmlQwenSharedRunner::instance_for_layer(layer_idx);
   const float clamp = (layer_idx < (int)c.swiglu_clamp_shexp.size())
                           ? c.swiglu_clamp_shexp[(size_t)layer_idx]
                           : 0.0f;
@@ -3889,25 +4241,39 @@ static bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
     return false;
   }
 
-  const bool run_ok = host_routed
-                          ? runner.run_host_routed(layer_idx, device_input,
-                                                   host_routed, combined_output)
-                          : runner.run(layer_idx, device_input, routed_output,
-                                       combined_output);
+  const bool run_ok = shared_only
+                          ? runner.run_shared_only(layer_idx, device_input,
+                                                   combined_output)
+                          : shared_add
+                                ? runner.run_host_routed_add(
+                                      layer_idx, host_routed, combined_output)
+                          : host_routed
+                                ? runner.run_host_routed(
+                                      layer_idx, device_input, host_routed,
+                                      combined_output)
+                                : runner.run(layer_idx, device_input,
+                                             routed_output, combined_output);
   if (!run_ok) {
     if (debug)
       LOG_WARN("[GGML-SHARED-DEBUG] layer=%d S=%d runner %s failed input=%p "
                "routed=%p host_routed=%p\n",
-               layer_idx, S, host_routed ? "host-routed run" : "run",
+               layer_idx, S,
+               shared_only ? "shared-only run"
+                           : (shared_add ? "host-routed add"
+                                         : (host_routed ? "host-routed run"
+                                                        : "run")),
                device_input, routed_output, (const void *)host_routed);
+    record_submit_time();
     return false;
   }
   static bool logged = false;
   if (!logged) {
     logged = true;
-    LOG_INFO("[GGML-SHARED] Qwen4Exp routed+shared device FFN active%s\n",
-             host_routed ? " (CPU routed result handoff)" : "");
+    LOG_INFO("[GGML-SHARED] Qwen4Exp routed+shared device FFN active%s%s\n",
+             host_routed ? " (CPU routed result handoff)" : "",
+             shared_only ? " (shared-first overlap)" : "");
   }
+  record_submit_time();
   return true;
 }
 
@@ -3921,7 +4287,7 @@ static void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
     return;
   PERF_SCOPE(t_shared_expert_total);
   const int shared_inter = moe_inter * c.n_expert_shared;
-  if (!scratch.gate_buf.resize((size_t)S * shared_inter, "shared_gate_buf") ||
+    if (!scratch.gate_buf.resize((size_t)S * shared_inter, "shared_gate_buf") ||
       !scratch.up_buf.resize((size_t)S * shared_inter, "shared_up_buf") ||
       !scratch.down_buf.resize((size_t)S * D, "shared_down_buf")) {
     // The routed contribution is already present in output when this helper
@@ -3933,10 +4299,65 @@ static void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
              layer_idx);
     return;
   }
-  dense_proj(engine, prefix + "ffn_gate_shexp.weight", normed,
-             scratch.gate_buf.data(), S, D, shared_inter);
-  dense_proj(engine, prefix + "ffn_up_shexp.weight", normed,
-             scratch.up_buf.data(), S, D, shared_inter);
+  // The Qwen shared expert reads normed three times: gate, up, and the
+  // optional scalar gate-input projection.  With host-staged GPU dense
+  // dispatch, each ordinary dense_proj() uploads that same activation again.
+  // Keep this opt-in until the exact-output A/B is complete; the helper is
+  // Qwen-only and falls back to the old self-contained call for every
+  // unsupported weight/path.
+  static const bool reuse_shared_input = [] {
+    const char *e = std::getenv("MOESTREAM_QWEN_SHARED_INPUT_REUSE");
+    return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
+                 e[0] == 't' || e[0] == 'T');
+  }();
+  // Do not mix this sequence with the BF16 fast-path.  That path uses a
+  // separate d_x_bf16 buffer and its event-ordered upload; interleaving it
+  // with an explicit d_x preload would reuse the shared copy event while a
+  // previous record could still be in flight.  Requiring every normed-input
+  // projection in this small group to use the original device-resident
+  // dispatch keeps the stream/event ordering identical and makes a failed
+  // capability check fall back to the old path before any upload is issued.
+  auto original_gpu_projection = [&](const std::string &wname) {
+    auto it = engine.resident_layers.find(wname);
+    return it != engine.resident_layers.end() && it->second.host_ptr &&
+           it->second.device_ptr && !it->second.gpu_fast_ptr &&
+           it->second.meta.type != GGUFType::BF16;
+  };
+  const std::string gate_name = prefix + "ffn_gate_shexp.weight";
+  const std::string up_name = prefix + "ffn_up_shexp.weight";
+  const std::string gate_inp_name = prefix + "ffn_gate_inp_shexp.weight";
+  const bool reuse_capable =
+      original_gpu_projection(gate_name) &&
+      original_gpu_projection(up_name) &&
+      (!engine.resident_layers.count(gate_inp_name) ||
+       original_gpu_projection(gate_inp_name));
+  const bool reuse_this_call = reuse_shared_input && reuse_capable;
+  if (reuse_this_call) {
+    static bool logged_reuse = false;
+    if (!logged_reuse) {
+      logged_reuse = true;
+      LOG_INFO("[QWEN-SHARED] reusing one uploaded normed activation for "
+               "gate/up/gate-input projections\n");
+    }
+  }
+  bool shared_input_uploaded = false;
+  auto shared_dense_proj = [&](const std::string &wname, const float *x,
+                               float *y, int in, int out) {
+    if (reuse_this_call && x == normed && in == D) {
+      if (!shared_input_uploaded)
+        shared_input_uploaded =
+            dense_upload_shared_input(engine, normed, S, D);
+      if (shared_input_uploaded &&
+          dense_proj_from_shared_input(engine, wname, y, S, D, out))
+        return;
+    }
+    dense_proj(engine, wname, x, y, S, in, out);
+  };
+
+  shared_dense_proj(gate_name, normed,
+                    scratch.gate_buf.data(), D, shared_inter);
+  shared_dense_proj(up_name, normed,
+                    scratch.up_buf.data(), D, shared_inter);
   const float clamp = (layer_idx < (int)c.swiglu_clamp_shexp.size())
                           ? c.swiglu_clamp_shexp[(size_t)layer_idx]
                           : 0.0f;
@@ -3953,18 +4374,40 @@ static void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
              scratch.down_buf.data(), S, shared_inter, D);
 
   std::vector<float> gate((size_t)S, 1.0f);
-  if (engine.resident_layers.count(prefix + "ffn_gate_inp_shexp.weight")) {
-    dense_proj(engine, prefix + "ffn_gate_inp_shexp.weight", normed,
-               gate.data(), S, D, 1);
+  if (engine.resident_layers.count(gate_inp_name)) {
+    shared_dense_proj(gate_inp_name, normed,
+                      gate.data(), D, 1);
     for (float &g : gate)
       g = 1.0f / (1.0f + std::exp(-g));
   }
+  if (shared_input_uploaded && engine.gpu)
+    engine.gpu->dense_matmul_host_release_input();
   for (int s = 0; s < S; ++s) {
     float *dst = output + (size_t)s * D;
     const float *src = scratch.down_buf.data() + (size_t)s * D;
     const float g = gate[(size_t)s];
     for (int d = 0; d < D; ++d)
       dst[d] += g * src[d];
+  }
+  if (std::getenv("MOESTREAM_QWEN_SHARED_REUSE_DEBUG") && S == 1) {
+    auto checksum = [](const float *p, size_t n) {
+      double sum = 0.0;
+      double abs_sum = 0.0;
+      for (size_t i = 0; i < n; ++i) {
+        sum += p[i];
+        abs_sum += std::abs((double)p[i]);
+      }
+      return std::pair<double, double>{sum, abs_sum};
+    };
+    const auto nrm = checksum(normed, (size_t)D);
+    const auto gb = checksum(scratch.gate_buf.data(), (size_t)shared_inter);
+    const auto ub = checksum(scratch.up_buf.data(), (size_t)shared_inter);
+    const auto db = checksum(scratch.down_buf.data(), (size_t)D);
+    LOG_WARN("[QWEN-SHARED-REUSE-DEBUG] layer=%d reuse=%d normed=(%.9g,%.9g) "
+             "gate=(%.9g,%.9g) up=(%.9g,%.9g) down=(%.9g,%.9g) gate0=%.9g\n",
+             layer_idx, reuse_this_call ? 1 : 0,
+             nrm.first, nrm.second, gb.first, gb.second, ub.first, ub.second,
+             db.first, db.second, gate.empty() ? 1.0f : gate[0]);
   }
   if (std::getenv("MOESTREAM_GGML_SHARED_DEBUG") && S == 1) {
     double l2 = 0.0;
@@ -4004,6 +4447,66 @@ static bool qwen4exp_router_pilot_layer_allowed(const StreamingEngine &engine,
           engine.qwen4exp_router_pilot_predict_layers.end())
     return false;
   return true;
+}
+
+static std::array<std::atomic<uint8_t>,
+                  PerfCounters::kMaxTrackedLayersForMiss>
+    qwen4exp_decode_hot_streak{};
+
+// Decode-only Qwen pilot policy: remember whether the exact route just used
+// for a layer was already resident in either the temporary active area or the
+// durable VRAM cache.  The old skip check required all 512 experts in the
+// layer to be resident, which is almost never true when only a hot subset is
+// pinned.  This deliberately observes the route AFTER exact routing, then
+// lets the NEXT token bypass an otherwise redundant pilot after two stable
+// observations.  A miss immediately resets the streak, so skipping the pilot
+// can never change the authoritative route or its correctness fallback.
+static void qwen4exp_note_decode_route_residency(
+    const StreamingEngine &engine, const RAMSafetyManager &ram_mgr,
+    int layer_idx, int S, int topk, const LayerScratch &scratch) {
+  if (S != 1 || layer_idx < 0 ||
+      layer_idx >= PerfCounters::kMaxTrackedLayersForMiss || topk <= 0 ||
+      engine.family_ops.family != ModelFamily::Qwen4Exp ||
+      is_cpu_affinity_layer(layer_idx) || !ram_mgr.vram_cache ||
+      scratch.tok_topk_ids.size() < (size_t)topk)
+    return;
+
+  bool all_resident = true;
+  for (int k = 0; k < topk; ++k) {
+    const int expert_id = scratch.tok_topk_ids[(size_t)k];
+    if (expert_id < 0 ||
+        (!ram_mgr.vram_cache->active_layer_has(layer_idx, expert_id) &&
+         !ram_mgr.vram_cache->main_layer_has(layer_idx, expert_id))) {
+      all_resident = false;
+      break;
+    }
+  }
+
+  auto &p = perf();
+  p.n_qwen_pilot_adaptive_residency_checks.fetch_add(
+      1, std::memory_order_relaxed);
+  if (!all_resident) {
+    p.n_qwen_pilot_adaptive_residency_misses.fetch_add(
+        1, std::memory_order_relaxed);
+    qwen4exp_decode_hot_streak[layer_idx].store(0,
+                                                std::memory_order_release);
+    return;
+  }
+
+  auto &streak = qwen4exp_decode_hot_streak[layer_idx];
+  uint8_t old = streak.load(std::memory_order_relaxed);
+  while (old < 2 &&
+         !streak.compare_exchange_weak(old, (uint8_t)(old + 1),
+                                       std::memory_order_release,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
+static bool qwen4exp_decode_hot_set_stable(int layer_idx) {
+  return layer_idx >= 0 &&
+         layer_idx < PerfCounters::kMaxTrackedLayersForMiss &&
+         qwen4exp_decode_hot_streak[layer_idx].load(
+             std::memory_order_acquire) >= 2;
 }
 
 // Queue the same prediction without waiting for its compact route table.
@@ -4194,6 +4697,47 @@ static bool qwen4exp_decode_layer_timing_enabled() {
     return e && e[0] == '1';
   }();
   return enabled;
+}
+
+// Diagnostic/A-B only: route CPU-affinity Qwen decode layers with the local
+// AVX-512 F32 matmul instead of the ordinary dense_proj GPU GEMV.  The
+// production route remains unchanged unless this explicit Qwen-only switch is
+// set.  Other model families, GPU-affinity Qwen layers, and prefill never take
+// this branch.
+static bool qwen4exp_decode_cpu_router_enabled() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("MOESTREAM_QWEN_DECODE_CPU_ROUTER");
+    return e && e[0] == '1';
+  }();
+  return enabled;
+}
+
+// Diagnostic/A-B only: use the already device-resident Qwen HC mixed row as
+// the input to the ordinary CUDA router GEMV.  This is deliberately separate
+// from qwen4exp_decode_gpu_router: it does not build a second GGML routing
+// graph or change top-k/cache bookkeeping; it only removes the host->device
+// activation upload from dense_proj().  Keep it opt-in until the router's
+// device/host numerical result and real decode timing are confirmed.
+static bool qwen4exp_decode_device_router_gemv_enabled() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("MOESTREAM_QWEN_DECODE_DEVICE_ROUTER_GEMV");
+    return e && e[0] == '1';
+  }();
+  return enabled;
+}
+
+// Bee-style whole-graph decode topology is deliberately Qwen-only and
+// config-gated while it is being validated.  It is safe only for a layer
+// backed by the immutable fixed-stride DDR arena: a scheduler graph cannot
+// point one MUL_MAT_ID tensor at a changing set of lazy cache slots.  If the
+// arena is absent, the caller remains on the existing lazy-loading path,
+// which is the correct behavior for partially loaded Qwen layers.  GLM,
+// DeepSeek, and other families never consult this switch; their lazy expert
+// workflows are unchanged.  Do not add an environment override here: a
+// decode full graph must be an explicit model/config decision, not an
+// inherited process-wide experiment setting.
+static bool qwen4exp_decode_scheduler_enabled(const StreamingEngine &engine) {
+  return engine.qwen4exp_decode_scheduler;
 }
 
 // Decode-only, per-layer wall timer.  The existing aggregate counters tell
@@ -4418,6 +4962,275 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
   }
 
+  // Bee-style decode topology experiment.  This is placed before the
+  // ordinary host-router block so the CUDA router and the DDR-backed CPU
+  // MUL_MAT_ID expert graph are submitted as one scheduler graph.  It is
+  // intentionally conservative:
+  //   * Qwen4Exp only; GLM/DeepSeek keep their existing lazy topology.
+  //   * only S==1 and a complete immutable DDR arena; if an expert/layer is
+  //     lazy, qwen4exp_ram_cpu_moe_layer() fails and the normal path below
+  //     performs the existing lazy load.
+  //   * only when the next layer is also CPU-affinity (or this is the last
+  //     layer), because this first graph does not emit the existing Qwen
+  //     pilot/prefetch handoff for a following GPU layer.
+  //   * pilot/prefetch remains on the established path until route IDs from
+  //     this graph are integrated into its recall/promotion accounting.
+  //
+  // The topology is opt-in during validation via the config key
+  // qwen4exp_decode_scheduler=true.  A failed graph build or shared-GPU
+  // handoff is a local fallback, never a model-wide failure.
+  const bool scheduler_target_is_cpu_or_last =
+      layer_idx + 1 >= c.n_layers || is_cpu_affinity_layer(layer_idx + 1);
+  const bool scheduler_drops_active_pilot =
+      !scheduler_target_is_cpu_or_last &&
+      qwen4exp_router_pilot_layer_allowed(engine, layer_idx + 1) &&
+      (engine.qwen4exp_router_pilot ||
+       engine.qwen4exp_router_pilot_prefetch);
+  const bool qwen_decode_scheduler_candidate =
+      qwen4exp_decode_scheduler_enabled(engine) && S == 1 &&
+      engine.qwen4exp_cpu_ggml_moe &&
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      engine.family_ops.uses_hyper_connections &&
+      engine.qwen_ram_preload_all_experts &&
+      is_cpu_affinity_layer(layer_idx) && clamp_exp == 0.0f &&
+      engine.graph_ram_layer_ready(layer_idx) &&
+      !scheduler_drops_active_pilot && scheduler_target_is_cpu_or_last &&
+      engine.qwen4exp_device_hc_ffn_input &&
+      moe_ggml_shared_expert() && c.n_expert_shared > 0;
+  if (qwen4exp_decode_scheduler_enabled(engine) && S == 1 &&
+      layer_idx == 0) {
+    static std::atomic<bool> logged_scheduler_gate{false};
+    if (!logged_scheduler_gate.exchange(true, std::memory_order_relaxed)) {
+      const std::string scheduler_router_key =
+          "blk.0.ffn_gate_inp.weight";
+      auto scheduler_router_it =
+          engine.resident_layers.find(scheduler_router_key);
+      LOG_INFO(
+          "[GGML-QWEN-DECODE-SCHED] gate candidate=%d S=%d cpu=%d "
+          "ram_preload=%d router_device=%d ram_arena=%d shared=%d hc=%d "
+          "clamp=%.6g\n",
+          qwen_decode_scheduler_candidate ? 1 : 0, S,
+          is_cpu_affinity_layer(layer_idx) ? 1 : 0,
+          engine.qwen_ram_preload_all_experts ? 1 : 0,
+          scheduler_router_it != engine.resident_layers.end() &&
+                  scheduler_router_it->second.device_ptr
+              ? 1
+              : 0,
+          engine.graph_ram_layer_ready(layer_idx) ? 1 : 0,
+          (moe_ggml_shared_expert() && c.n_expert_shared > 0) ? 1 : 0,
+          engine.qwen4exp_device_hc_ffn_input ? 1 : 0, clamp_exp);
+    }
+  }
+  if (qwen_decode_scheduler_candidate) {
+    const std::string router_key =
+        "blk." + std::to_string(layer_idx) + ".ffn_gate_inp.weight";
+    auto router_it = engine.resident_layers.find(router_key);
+    QwenRamCpuMoeLayer ram_layer;
+    const bool scheduler_router_available =
+        router_it != engine.resident_layers.end() &&
+        (router_it->second.device_ptr || router_it->second.host_ptr);
+    const bool scheduler_ram_available =
+        scheduler_router_available &&
+        qwen4exp_ram_cpu_moe_layer(engine, layer_idx, n_experts, ram_layer);
+    if (scheduler_ram_available) {
+      const auto &rw = router_it->second;
+      GgmlQwenDecodeGraphRef ref;
+      ref.router_device = rw.device_ptr;
+      ref.router_device_bytes = rw.meta.size_bytes;
+      ref.router_host = rw.host_ptr;
+      ref.router_host_bytes = rw.meta.size_bytes;
+      ref.router_type = static_cast<uint32_t>(rw.meta.type);
+      ref.router_ne0 = rw.meta.shape.size() > 0 ? (int64_t)rw.meta.shape[0] : 0;
+      ref.router_ne1 = rw.meta.shape.size() > 1 ? (int64_t)rw.meta.shape[1] : 0;
+      ref.gate_plane = ram_layer.gate_plane;
+      ref.up_plane = ram_layer.up_plane;
+      ref.down_plane = ram_layer.down_plane;
+      ref.gate_type = ram_layer.meta.gate_type;
+      ref.up_type = ram_layer.meta.up_type;
+      ref.down_type = ram_layer.meta.down_type;
+      ref.gate_bytes = ram_layer.meta.gate_bytes;
+      ref.up_bytes = ram_layer.meta.up_bytes;
+      ref.down_bytes = ram_layer.meta.down_bytes;
+      ref.expert_stride = ram_layer.expert_stride;
+      const std::string bias_key =
+          "blk." + std::to_string(layer_idx) + ".exp_probs_b.bias";
+      auto bias_it = engine.resident_layers.find(bias_key);
+      if (bias_it != engine.resident_layers.end() &&
+          bias_it->second.host_ptr && bias_it->second.meta.type == GGUFType::F32)
+        ref.selection_bias =
+            reinterpret_cast<const float *>(bias_it->second.host_ptr);
+
+      // If the persistent dense pool already owns the Qwen shared expert,
+      // put that CUDA FFN in the same scheduler graph as the DDR-backed CPU
+      // routed FFN.  A missing device copy deliberately declines this
+      // optimization and falls through to run_qwen4exp_shared_device(), so
+      // partially resident/lazy configurations retain their old behavior.
+      const int scheduler_device =
+          moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
+      const bool no_external_shared_weights = [] {
+        const char *e = std::getenv("MOESTREAM_GGML_SHARED_NO_EXTERNAL");
+        return e && e[0] == '1';
+      }();
+      const int shared_inter = moe_inter * c.n_expert_shared;
+      auto make_decode_shared_ref =
+          [&](const std::string &name, int64_t ne0,
+              int64_t ne1) -> std::optional<GgmlSharedWeightRef> {
+        auto it = engine.resident_layers.find(name);
+        if (it == engine.resident_layers.end() || !it->second.host_ptr)
+          return std::nullopt;
+        const auto &w = it->second;
+        if (w.meta.shape.size() < 2 ||
+            (int64_t)w.meta.shape[0] != ne0 ||
+            (int64_t)w.meta.shape[1] != ne1)
+          return std::nullopt;
+        GgmlSharedWeightRef out;
+        out.host_data = w.host_ptr;
+        out.type = static_cast<uint32_t>(w.meta.type);
+        out.ne0 = ne0;
+        out.ne1 = ne1;
+        out.nbytes = w.meta.size_bytes;
+        if (!no_external_shared_weights && engine.gpu &&
+            engine.gpu->get_core_device() == scheduler_device &&
+            w.device_ptr) {
+          out.device_data = w.device_ptr;
+          out.device_bytes = w.meta.size_bytes;
+        }
+        return out;
+      };
+      auto shared_gate = make_decode_shared_ref(
+          "blk." + std::to_string(layer_idx) + ".ffn_gate_shexp.weight", D,
+          shared_inter);
+      auto shared_up = make_decode_shared_ref(
+          "blk." + std::to_string(layer_idx) + ".ffn_up_shexp.weight", D,
+          shared_inter);
+      auto shared_down = make_decode_shared_ref(
+          "blk." + std::to_string(layer_idx) + ".ffn_down_shexp.weight",
+          shared_inter, D);
+      std::optional<GgmlSharedWeightRef> shared_gate_inp;
+      auto shared_gate_inp_it = engine.resident_layers.find(
+          "blk." + std::to_string(layer_idx) + ".ffn_gate_inp_shexp.weight");
+      if (shared_gate_inp_it != engine.resident_layers.end() &&
+          shared_gate_inp_it->second.host_ptr &&
+          !shared_gate_inp_it->second.meta.shape.empty()) {
+        const auto &w = shared_gate_inp_it->second;
+        GgmlSharedWeightRef out;
+        out.host_data = w.host_ptr;
+        out.type = static_cast<uint32_t>(w.meta.type);
+        out.ne0 = (int64_t)w.meta.shape[0];
+        out.ne1 = w.meta.shape.size() >= 2
+                      ? (int64_t)w.meta.shape[1]
+                      : 1;
+        out.nbytes = w.meta.size_bytes;
+        if (!no_external_shared_weights && engine.gpu &&
+            engine.gpu->get_core_device() == scheduler_device &&
+            w.device_ptr) {
+          out.device_data = w.device_ptr;
+          out.device_bytes = w.meta.size_bytes;
+        }
+        shared_gate_inp = out;
+      }
+      const bool shared_has_gate = shared_gate_inp.has_value();
+      const bool fused_shared_ready =
+          shared_gate && shared_up && shared_down &&
+          shared_gate->device_data && shared_up->device_data &&
+          shared_down->device_data &&
+          (!shared_has_gate || shared_gate_inp->device_data);
+      if (fused_shared_ready) {
+        ref.shared_gate = *shared_gate;
+        ref.shared_up = *shared_up;
+        ref.shared_down = *shared_down;
+        ref.shared_has_gate = shared_has_gate;
+        if (shared_has_gate)
+          ref.shared_gate_inp = *shared_gate_inp;
+        ref.shared_clamp =
+            layer_idx < (int)c.swiglu_clamp_shexp.size()
+                ? c.swiglu_clamp_shexp[(size_t)layer_idx]
+                : 0.0f;
+      }
+
+      auto &scheduler = GgmlQwenDecodeGraphRunner::instance_for_signature(
+          ref.gate_type, ref.up_type, ref.down_type, ref.expert_stride);
+      scratch.tok_topk_ids.resize((size_t)topk);
+      scratch.tok_topk_weights.resize((size_t)topk);
+      const bool fused_shared_graph =
+          ref.shared_gate.device_data && ref.shared_up.device_data &&
+          ref.shared_down.device_data &&
+          (!ref.shared_has_gate || ref.shared_gate_inp.device_data);
+      const void *scheduler_device_output = nullptr;
+      const bool scheduler_ready =
+          scheduler.ensure(scheduler_device, D, n_experts, topk, moe_inter,
+                           c.expert_weights_norm, c.expert_weights_scale);
+      const bool scheduler_scratch_ready =
+          scheduler_ready &&
+          scratch.qwen_cpu_moe_out.resize((size_t)D, "qwen_cpu_moe_out");
+      const bool scheduler_run_ok =
+          scheduler_scratch_ready &&
+          scheduler.run(
+              engine.qwen4exp_device_hc_ffn_input, ref,
+              fused_shared_graph ? nullptr : scratch.qwen_cpu_moe_out.data(),
+              fused_shared_graph ? &scheduler_device_output : nullptr,
+              reinterpret_cast<int32_t *>(scratch.tok_topk_ids.data()),
+              scratch.tok_topk_weights.data());
+      if (S == 1 && layer_idx == 0) {
+        static std::atomic<bool> logged_scheduler_attempt{false};
+        if (!logged_scheduler_attempt.exchange(true, std::memory_order_relaxed))
+            LOG_INFO(
+              "[GGML-QWEN-DECODE-SCHED] decode attempt: router=%s ram=%d "
+              "runner=%d scratch=%d run=%d fused_shared=%d\n",
+              !scheduler_router_available
+                  ? "missing"
+                  : (router_it->second.device_ptr ? "device" : "host"),
+              scheduler_ram_available ? 1 : 0, scheduler_ready ? 1 : 0,
+              scheduler_scratch_ready ? 1 : 0, scheduler_run_ok ? 1 : 0,
+              fused_shared_graph ? 1 : 0);
+      }
+      if (scheduler_run_ok) {
+        bool route_valid = true;
+        for (int k = 0; k < topk; ++k) {
+          const int id = scratch.tok_topk_ids[(size_t)k];
+          if (id < 0 || id >= n_experts) {
+            route_valid = false;
+            break;
+          }
+        }
+        if (route_valid) {
+          for (int k = 0; k < topk; ++k)
+            engine.bump_route_freq(layer_idx,
+                                   scratch.tok_topk_ids[(size_t)k]);
+          const void *combined = scheduler_device_output;
+          const bool fallback_shared_ok =
+              !fused_shared_graph &&
+              run_qwen4exp_shared_device(
+                  engine, layer_idx, S, D, moe_inter,
+                  engine.qwen4exp_device_hc_ffn_input, nullptr, c, &combined,
+                  scratch.qwen_cpu_moe_out.data()) &&
+              combined;
+          if ((fused_shared_graph || fallback_shared_ok) && combined) {
+            scratch.moe_device_output = combined;
+            scratch.moe_shared_device_output = true;
+            scratch.moe_device_output_ready = true;
+            static std::atomic<bool> logged_scheduler{false};
+            if (!logged_scheduler.exchange(true, std::memory_order_relaxed))
+              LOG_INFO(
+                  "[GGML-QWEN-DECODE-SCHED] Bee-style CUDA-router + "
+                  "DDR-CPU-expert topology active; lazy layers fall back to "
+                  "the existing cache path\n");
+            return;
+          }
+        }
+      }
+    } else if (S == 1 && layer_idx == 0) {
+      static std::atomic<bool> logged_scheduler_unavailable{false};
+      if (!logged_scheduler_unavailable.exchange(true,
+                                                 std::memory_order_relaxed))
+        LOG_INFO(
+            "[GGML-QWEN-DECODE-SCHED] decode candidate declined before "
+            "runner: router_available=%d ram_arena=%d\n",
+            scheduler_router_available ? 1 : 0,
+            engine.graph_ram_layer_ready(layer_idx) ? 1 : 0);
+    }
+  }
+
   // --- Router: compute expert probs and select top-k. Reference algorithm
   // ported from llama.cpp's build_moe_ffn (llama-graph.cpp):
   //   1) probs = gate_func(logits)     [sigmoid/softmax/sqrtsoftplus, per
@@ -4502,13 +5315,17 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // data.  Keep this handoff explicitly Qwen+HC-only; other families and
     // any future norm-bearing variant remain on the established host route.
     // The graph also implements only the Qwen softmax semantics.
-    // A CPU-affinity layer is a hard CPU-only contract.  Keep its route
-    // table on the established host path even when GPU routing is enabled
-    // for the rest of Qwen decode; otherwise the HC input would be sent
-    // through a needless GPU router before the CPU expert graph consumes it.
+    // CPU-affinity controls expert execution, not necessarily route
+    // selection.  BeeLlama's CPU expert split receives IDs/weights produced
+    // by the CUDA graph.  Keep that option available for Qwen too: when
+    // qwen4exp_decode_gpu_router is enabled during S==1 decode, a
+    // CPU-affinity layer still executes all routed expert projections on the
+    // CPU, but obtains the compact route table from the existing CUDA router.
+    // The default flag is false, so the established host-router behavior is
+    // unchanged unless a Qwen profile explicitly opts into this A/B.
     const bool qwen_decode_gpu_router =
-        !is_cpu_affinity_layer(layer_idx) &&
-        (S > 1 || engine.qwen4exp_decode_gpu_router);
+        (S > 1 && !is_cpu_affinity_layer(layer_idx)) ||
+        (S == 1 && engine.qwen4exp_decode_gpu_router);
     if (moe_ggml_gpu_router() && qwen_decode_gpu_router &&
         c.gating_func == GatingFunc::Softmax &&
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -4724,9 +5541,65 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
 
     if (!gpu_router_handled) {
-      dense_proj(
-          engine, "blk." + std::to_string(layer_idx) + ".ffn_gate_inp.weight",
-          scratch.normed.data(), scratch.router_logits.data(), S, D, n_experts);
+      bool cpu_router_done = false;
+      const bool qwen_device_router_gemv =
+          qwen4exp_decode_device_router_gemv_enabled() && S == 1 &&
+          engine.family_ops.family == ModelFamily::Qwen4Exp &&
+          engine.family_ops.uses_hyper_connections &&
+          is_cpu_affinity_layer(layer_idx) && engine.gpu &&
+          engine.qwen4exp_device_hc_ffn_input &&
+          (router_it->second.device_ptr ||
+           router_it->second.gpu_fast_ptr);
+      if (qwen_device_router_gemv) {
+        const void *device_normed =
+            GgmlHcRunner::instance().device_data(
+                engine.qwen4exp_device_hc_ffn_input);
+        if (device_normed) {
+          const auto &router_weight = router_it->second;
+          const void *router_device_weight =
+              router_weight.gpu_fast_ptr
+                  ? static_cast<const void *>(router_weight.gpu_fast_ptr)
+                  : static_cast<const void *>(router_weight.device_ptr);
+          const GGUFType router_type =
+              router_weight.gpu_fast_ptr ? GGUFType::BF16
+                                         : router_weight.meta.type;
+          cpu_router_done = engine.gpu->dense_matmul_device_host(
+              router_type, router_device_weight,
+              static_cast<const float *>(device_normed),
+              scratch.router_logits.data(), S, D, n_experts);
+          static std::atomic<bool> logged_device_router_gemv{false};
+          if (cpu_router_done &&
+              !logged_device_router_gemv.exchange(true,
+                                                  std::memory_order_relaxed)) {
+            LOG_INFO("[MOE-ROUTE] Qwen decode router uses device HC input "
+                     "(CUDA GEMV; host top-k/CPU expert path retained)\n");
+          }
+        }
+      }
+      const bool qwen_cpu_router =
+          S == 1 && qwen4exp_decode_cpu_router_enabled() &&
+          engine.family_ops.family == ModelFamily::Qwen4Exp &&
+          engine.family_ops.uses_hyper_connections &&
+          is_cpu_affinity_layer(layer_idx) && router_it->second.host_ptr;
+      if (qwen_cpu_router) {
+        cpu_router_done = cpu_quant_matmul(
+            router_it->second.meta.type, router_it->second.host_ptr,
+            scratch.normed.data(), scratch.router_logits.data(), S, D,
+            n_experts);
+        static std::atomic<bool> logged_cpu_router{false};
+        if (cpu_router_done &&
+            !logged_cpu_router.exchange(true, std::memory_order_relaxed)) {
+          LOG_INFO("[MOE-ROUTE] Qwen CPU-affinity decode router A/B active "
+                   "(local CPU matmul; production GPU GEMV unchanged)\n");
+        }
+      }
+      if (!cpu_router_done) {
+        dense_proj(
+            engine,
+            "blk." + std::to_string(layer_idx) + ".ffn_gate_inp.weight",
+            scratch.normed.data(), scratch.router_logits.data(), S, D,
+            n_experts);
+      }
 
       // Gating activation: turns raw logits into probs in-place. These are
       // the UNBIASED values later gathered as expert weights.
@@ -5074,6 +5947,17 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               if (matched)
                 perf().n_pilot_recall_hits_by_rank[pk].fetch_add(
                     1, std::memory_order_relaxed);
+              // TEMPORARY DIAGNOSTIC (2026-09-13): the genuine 2D
+              // [layer][rank] cross table -- see n_pilot_recall_hits_by_
+              // layer_rank's own comment (PerfCounters).
+              if (layer_idx >= 0 &&
+                  layer_idx < PerfCounters::kMaxTrackedLayersForMiss) {
+                perf().n_pilot_recall_checks_by_layer_rank[layer_idx][pk]
+                    .fetch_add(1, std::memory_order_relaxed);
+                if (matched)
+                  perf().n_pilot_recall_hits_by_layer_rank[layer_idx][pk]
+                      .fetch_add(1, std::memory_order_relaxed);
+              }
             }
             // Restricted tally: of the picks that were actually
             // fetch-worthy (not already cached, so a real hint got
@@ -5280,6 +6164,10 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       }
     } // end t_moe_topk_select scope (Phase 1)
   }
+
+  if (!gpu_route_device)
+    qwen4exp_note_decode_route_residency(engine, ram_mgr, layer_idx, S, topk,
+                                         scratch);
 
   // Qwen4Exp pilot recall is checked at the shared host route-table point,
   // after the real IDs have been populated and before any expert dispatch.
@@ -6032,7 +6920,7 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
             layer_idx, engine.qwen4exp_device_hc_ffn_input,
             gpu_route_ids_ks.data(), gpu_route_weights_ks.data());
       }
-      if (!gpu_router_handled) {
+    if (!gpu_router_handled) {
         LOG_ERROR("[GGML-MOE] layer=%d: device-route and host-route fallback "
                   "both failed\n",
                   layer_idx);
@@ -6788,7 +7676,13 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
             // the expert keeps this a slow path, not a silently-wrong one --
             // an expert whose contribution is skipped corrupts the residual
             // stream with no error the output would reveal.
-            MoEExpertBlock *fb = exp;
+            // A VRAM shadow contains metadata only.  It deliberately has no
+            // host_ptr fields, so it must never be accepted as the CPU
+            // fallback source when its GPU dispatch loses the race.  Force a
+            // fresh RAM-tier materialization for that case; otherwise this
+            // branch would log a dropped expert and silently corrupt GLM's
+            // grouped-prefill residual.
+            MoEExpertBlock *fb = vram_shadowed ? nullptr : exp;
             bool fb_pinned = false;
             if (!fb) {
               fb = ram_mgr.get_expert(engine, layer_idx, e);
@@ -7064,8 +7958,13 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     QwenRamCpuMoeLayer ram_layer;
     if (qwen4exp_ram_cpu_moe_layer(engine, layer_idx, n_experts, ram_layer)) {
       PERF_START(qwen_cpu_ram);
-      GgmlQwenCpuMoeRunner &cpu_runner =
-          GgmlQwenCpuMoeRunner::instance();
+      GgmlQwenCpuMoeRunner &cpu_runner = qwen_cpu_compact_graph_enabled()
+                                              ? GgmlQwenCpuMoeRunner::instance()
+                                              : GgmlQwenCpuMoeRunner::instance_for_strided(
+                                                    ram_layer.meta, n_experts,
+                                                    D, moe_inter, topk,
+                                                    ram_layer.expert_stride,
+                                                    false);
       const bool shared_available =
           c.n_expert_shared > 0 &&
           engine.resident_layers.count("blk." + std::to_string(layer_idx) +
@@ -7078,10 +7977,54 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // existing device graph do shared FFN + routed/shared addition.  This
       // is Qwen-only and opt-in so other model families retain their
       // established CPU path.
+      int cpu_affinity_count = 0;
+      for (bool selected : cpu_affinity_layer_flags())
+        cpu_affinity_count += selected ? 1 : 0;
+      // The asynchronous overlap worker currently submits the persistent
+      // strided GGML graph.  When the Qwen-only direct DDR-strided grouped
+      // kernel is enabled, selecting that worker would silently replace the
+      // measured fast path with the much slower graph path (and lose the
+      // direct IQ1_M/IQ4_NL dispatch).  Keep the direct path authoritative;
+      // the ordinary device handoff below still keeps the shared expert on
+      // the GPU with one pinned H2D and no host shared projections, without
+      // regressing this model-specific optimization.
+      const bool qwen_direct_grouped_cpu =
+          !qwen_cpu_compact_graph_enabled() &&
+          qwen_cpu_strided_grouped_enabled(engine);
       const bool try_device_shared =
           engine.qwen4exp_cpu_gpu_overlap && shared_available &&
           qwen4exp_hc_device_live() && engine.qwen4exp_device_hc_ffn_input &&
-          moe_ggml_shared_expert();
+          moe_ggml_shared_expert() &&
+          !qwen_direct_grouped_cpu &&
+          (engine.qwen4exp_cpu_gpu_overlap_max_layers <= 0 ||
+           cpu_affinity_count <= engine.qwen4exp_cpu_gpu_overlap_max_layers);
+      static std::atomic<bool> logged_direct_overlap_guard{false};
+      if (engine.qwen4exp_cpu_gpu_overlap && qwen_direct_grouped_cpu &&
+          !logged_direct_overlap_guard.exchange(true,
+                                                 std::memory_order_relaxed)) {
+        LOG_INFO("[CPU-MOE] Qwen CPU/GPU overlap worker bypassed: direct "
+                 "DDR-strided grouped kernel is active; retaining the "
+                 "faster device-handoff path\n");
+      }
+      const bool try_device_handoff =
+          !try_device_shared && engine.qwen4exp_cpu_shared_device &&
+          shared_available && qwen4exp_hc_device_live() &&
+          engine.qwen4exp_device_hc_ffn_input && moe_ggml_shared_expert();
+      static std::atomic<bool> logged_overlap_limit{false};
+      if (engine.qwen4exp_cpu_gpu_overlap && !try_device_shared &&
+          shared_available && cpu_affinity_count > 0 &&
+          engine.qwen4exp_cpu_gpu_overlap_max_layers > 0 &&
+          cpu_affinity_count > engine.qwen4exp_cpu_gpu_overlap_max_layers &&
+          !logged_overlap_limit.exchange(true, std::memory_order_relaxed)) {
+        LOG_STREAM_INFO()
+            << "[CPU-MOE] Qwen CPU/GPU overlap disabled for this run: "
+               "cpu-affinity set has "
+            << cpu_affinity_count << " layers, limit is "
+            << engine.qwen4exp_cpu_gpu_overlap_max_layers
+            << " (the overlap path submits a shared-only graph plus a "
+               "host-routed-add graph per CPU layer)\n";
+      }
+      bool qwen_cpu_direct_grouped = false;
 
       // The compact A/B keeps the source in the preloaded DDR slabs but gives
       // GGML the same per-projection contiguous expert layout that Bee uses.
@@ -7089,6 +8032,20 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // does not copy the other 502 experts in a Qwen layer.
       auto run_qwen_cpu_graph = [&](float *result) {
         if (!qwen_cpu_compact_graph_enabled()) {
+          if (qwen_cpu_strided_grouped_enabled(engine) &&
+              qwen4exp_cpu_strided_grouped_quantized(
+                  engine, scratch.normed.data(), result, ram_layer,
+                  scratch.tok_topk_ids.data(),
+                  scratch.tok_topk_weights.data(), n_experts, topk, D,
+                  moe_inter, clamp_exp)) {
+            static std::atomic<bool> logged_strided_grouped{false};
+            if (!logged_strided_grouped.exchange(true,
+                                                 std::memory_order_relaxed))
+              LOG_INFO("[CPU-MOE] Qwen direct strided grouped quantized path "
+                       "active (DDR arena, IQ1_M/Q8_K + IQ4_NL/Q8_0)\n");
+            qwen_cpu_direct_grouped = true;
+            return true;
+          }
           return cpu_runner.run_strided(
               scratch.normed.data(), result, ram_layer.meta,
               ram_layer.gate_plane, ram_layer.up_plane, ram_layer.down_plane,
@@ -7122,8 +8079,27 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
             scratch.tok_topk_weights.data(), D, moe_inter, topk);
       };
 
+      // Keep the actual DDR-backed routed expert work separate from the
+      // device shared-FFN enqueue and HC event handoff.  The ordinary
+      // t_moe_expert bucket intentionally includes both, which is useful for
+      // request throughput but cannot explain the gap to Bee's CPU split.
+      auto run_qwen_cpu_graph_timed = [&](float *result) {
+        const auto start = std::chrono::high_resolution_clock::now();
+        const bool ok = run_qwen_cpu_graph(result);
+        if (S == 1)
+          g_diag_decode_qwen_cpu_graph_ms +=
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::high_resolution_clock::now() - start)
+                  .count();
+        return ok;
+      };
+
       auto run_qwen_cpu_down_graph = [&](float *result) {
-        return cpu_runner.run_strided_down(
+        GgmlQwenCpuMoeRunner &down_runner =
+            GgmlQwenCpuMoeRunner::instance_for_strided(
+                ram_layer.meta, n_experts, D, moe_inter, topk,
+                ram_layer.expert_stride, true);
+        return down_runner.run_strided_down(
             scratch.normed.data(), result, ram_layer.meta,
             ram_layer.gate_plane, ram_layer.up_plane, ram_layer.down_plane,
             scratch.tok_topk_ids.data(), n_experts, D, moe_inter, topk,
@@ -7132,8 +8108,107 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
 
       bool handled = false;
       bool device_shared_handled = false;
-      if (try_device_shared) {
-        if (qwen_cpu_gpu_combine_enabled() &&
+      if (try_device_handoff &&
+          scratch.qwen_cpu_moe_out.resize((size_t)D, "qwen_cpu_moe_out")) {
+        // This is the simple, non-overlapped device handoff.  The CPU still
+        // owns all routed projections and finishes the weighted [D] result,
+        // but the always-on shared expert consumes that result through the
+        // device graph.  Unlike qwen4exp_cpu_gpu_overlap, this submits one
+        // shared graph after the CPU result is ready; it does not submit a
+        // shared-only graph plus a second host-routed add graph.
+        handled = run_qwen_cpu_graph_timed(scratch.qwen_cpu_moe_out.data());
+        if (handled) {
+          const void *combined = nullptr;
+          device_shared_handled = run_qwen4exp_shared_device(
+              engine, layer_idx, S, D, moe_inter,
+              engine.qwen4exp_device_hc_ffn_input, nullptr, c, &combined,
+              scratch.qwen_cpu_moe_out.data());
+          if (device_shared_handled && combined) {
+            scratch.moe_device_output = combined;
+            scratch.moe_shared_device_output = true;
+            scratch.moe_device_output_ready = true;
+            static std::atomic<bool> logged_qwen_cpu_device_handoff{false};
+            if (!logged_qwen_cpu_device_handoff.exchange(
+                    true, std::memory_order_relaxed))
+              LOG_INFO("[CPU-MOE] Qwen CPU routed graph handed directly to "
+                       "the device shared FFN (one host->device routed "
+                       "handoff, no shared readback)\n");
+          } else {
+            // Preserve the established host-facing path if the optional
+            // device graph cannot allocate or execute on a particular
+            // layer/device.  The CPU result is already valid.
+            std::memcpy(output, scratch.qwen_cpu_moe_out.data(),
+                        (size_t)D * sizeof(float));
+            run_qwen4exp_shared_host(engine, layer_idx, S, D, moe_inter,
+                                     scratch.normed.data(), output, scratch,
+                                     c);
+          }
+        }
+      }
+
+      if (!handled && try_device_shared) {
+        // Start the shared GPU graph before running the DDR-backed routed
+        // graph.  The CUDA backend is asynchronous, so the existing decode
+        // thread can submit the shared-only graph and then execute the
+        // proven persistent CPU graph while CUDA is busy.  Avoid a second
+        // CPU worker here: the previous worker experiment made GGML's CPU
+        // graph contend with its own threadpool and was substantially slower
+        // on the real Qwen IQ1_M/IQ2_XXS checkpoint.
+        if (!qwen_cpu_compact_graph_enabled() &&
+            scratch.qwen_cpu_moe_out.resize((size_t)D,
+                                            "qwen_cpu_moe_out")) {
+          const void *shared_only = nullptr;
+          const bool shared_started = run_qwen4exp_shared_device(
+              engine, layer_idx, S, D, moe_inter,
+              engine.qwen4exp_device_hc_ffn_input, nullptr, c, &shared_only,
+              nullptr, true, false);
+          const bool cpu_finished = run_qwen_cpu_graph_timed(
+              scratch.qwen_cpu_moe_out.data());
+          if (shared_started && cpu_finished) {
+              const void *combined = nullptr;
+              device_shared_handled = run_qwen4exp_shared_device(
+                  engine, layer_idx, S, D, moe_inter, nullptr, nullptr, c,
+                  &combined, scratch.qwen_cpu_moe_out.data(), false, true);
+              if (device_shared_handled && combined) {
+                handled = true;
+                scratch.moe_device_output = combined;
+                scratch.moe_shared_device_output = true;
+                scratch.moe_device_output_ready = true;
+                static std::atomic<bool> logged_qwen_cpu_gpu_overlap{false};
+                if (!logged_qwen_cpu_gpu_overlap.exchange(
+                        true, std::memory_order_relaxed))
+                  LOG_INFO(
+                      "[CPU-MOE] Qwen CPU routed graph overlapped with "
+                      "shared GPU FFN on the decode thread; final host-route "
+                      "add queued on device\n");
+              }
+          }
+          // If the shared-only/add graph is unavailable, the CPU result is
+          // still valid. Use the established host-routed shared graph so a
+          // failed optional overlap allocation cannot change numerics.
+          if (!handled && cpu_finished) {
+            const void *combined = nullptr;
+            device_shared_handled = run_qwen4exp_shared_device(
+                engine, layer_idx, S, D, moe_inter,
+                engine.qwen4exp_device_hc_ffn_input, nullptr, c, &combined,
+                scratch.qwen_cpu_moe_out.data());
+            if (device_shared_handled && combined) {
+              handled = true;
+              scratch.moe_device_output = combined;
+              scratch.moe_shared_device_output = true;
+              scratch.moe_device_output_ready = true;
+            } else {
+              std::memcpy(output, scratch.qwen_cpu_moe_out.data(),
+                          (size_t)D * sizeof(float));
+              run_qwen4exp_shared_host(engine, layer_idx, S, D, moe_inter,
+                                       scratch.normed.data(), output, scratch,
+                                       c);
+              handled = true;
+            }
+          }
+        }
+
+        if (!handled && qwen_cpu_gpu_combine_enabled() &&
             scratch.qwen_cpu_moe_out.resize(
                 (size_t)D * (size_t)topk, "qwen_cpu_moe_down_out")) {
           handled = run_qwen_cpu_down_graph(scratch.qwen_cpu_moe_out.data());
@@ -7167,7 +8242,7 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
           // post-down GPU combine cannot be built or accepted.
           if (scratch.qwen_cpu_moe_out.resize((size_t)D,
                                                "qwen_cpu_moe_out")) {
-            handled = run_qwen_cpu_graph(scratch.qwen_cpu_moe_out.data());
+            handled = run_qwen_cpu_graph_timed(scratch.qwen_cpu_moe_out.data());
             if (handled) {
               const void *combined = nullptr;
               device_shared_handled = run_qwen4exp_shared_device(
@@ -7188,8 +8263,9 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
             }
           }
         }
-      } else {
-        handled = run_qwen_cpu_graph(output);
+      }
+      if (!handled && !try_device_shared) {
+        handled = run_qwen_cpu_graph_timed(output);
         if (handled && shared_available)
           run_qwen4exp_shared_host(engine, layer_idx, S, D, moe_inter,
                                    scratch.normed.data(), output, scratch, c);
@@ -7206,12 +8282,15 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                  "(source=preloaded-DDR-arena, file-mmap=not-used, full expert "
                  "layer resident, layout="
               << (qwen_cpu_compact_graph_enabled() ? "compact-routed" :
-                                                       "strided-slab")
+                  (qwen_cpu_direct_grouped ? "strided-grouped-quantized"
+                                           : "strided-slab"))
               << ", post-down-combine="
-              << (try_device_shared && qwen_cpu_gpu_combine_enabled() ? "GPU"
-                                                                        : "CPU")
+              << (device_shared_handled ? "GPU" : "CPU")
               << ", global route IDs, threads="
-              << omp_get_max_threads() << ", shared expert remains GPU)\n";
+              << (qwen_cpu_direct_grouped ? qwen_cpu_grouped_threads()
+                                          : cpu_runner.thread_count())
+              << " (OMP max=" << omp_get_max_threads()
+              << "), shared expert remains GPU)\n";
         if (device_shared_handled) {
           static std::atomic<bool> logged_qwen_cpu_device_handoff{false};
           if (!logged_qwen_cpu_device_handoff.exchange(
@@ -9363,6 +10442,77 @@ bool qwen4exp_mtp_forward(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   return true;
 }
 
+// TEMPORARY DIAGNOSTIC (2026-09-12) -- investigating the confirmed ~35-50%
+// gap between the [REQUEST] line's own wall_ms and the sum of its 4 named
+// top-level buckets (attn=/route=/expert=/dense_gpu=). Every named
+// PERF_SCOPE/PERF_START in layers_forward_gguf's per-layer loop has already
+// been checked; this accumulates the loop body's OWN full wall-clock time
+// (wrapping one entire iteration, all 40ish layers, for the whole forward
+// call) so it can be compared directly against that gap. Single-writer
+// (the one thread running generate_text's prefill/decode calls) -- plain
+// double, no atomic needed, same as diag_lmhead_ms/diag_vramlog_ms in
+// generation_loop.hpp. Reset once per request from generate_text via
+// diag_reset_layer_loop_total(); read via diag_get_layer_loop_total_ms()
+// right before print_summary("REQUEST", ...). Left in place after this
+// investigation for a later cleanup/productionize pass -- do not remove.
+static double g_diag_layer_loop_total_ms = 0.0;
+// Wall-clock around the two suspected async-dispatch-return-early call
+// sites (fo.attention_fn and the dense_ffn_gguf/moe_forward_gguf block) --
+// see each call site's own comment. Compared against t_attn/t_moe_expert's
+// own PERF_SCOPE-measured durations for the SAME calls: if GPU work is
+// queued but not actually awaited before PERF_SCOPE's RAII destructor
+// fires, the named counter under-reports relative to this wall-clock sum.
+static double g_diag_attn_call_ms = 0.0;
+static double g_diag_ffn_call_ms = 0.0;
+static double g_diag_decode_layer_loop_ms = 0.0;
+static double g_diag_decode_attn_call_ms = 0.0;
+static double g_diag_decode_ffn_call_ms = 0.0;
+static double g_diag_decode_pilot_ms = 0.0;
+static double g_diag_decode_hc_ms = 0.0;
+static double g_diag_decode_hc_pre_ms = 0.0;
+static double g_diag_decode_hc_attn_pre_ms = 0.0;
+static double g_diag_decode_hc_ffn_pre_ms = 0.0;
+static double g_diag_decode_hc_post_ms = 0.0;
+static double g_diag_decode_layer_input_ms = 0.0;
+void diag_reset_layer_loop_total() {
+  g_diag_layer_loop_total_ms = 0.0;
+  g_diag_attn_call_ms = 0.0;
+  g_diag_ffn_call_ms = 0.0;
+  g_diag_decode_layer_loop_ms = 0.0;
+  g_diag_decode_attn_call_ms = 0.0;
+  g_diag_decode_ffn_call_ms = 0.0;
+  g_diag_decode_pilot_ms = 0.0;
+  g_diag_decode_hc_ms = 0.0;
+  g_diag_decode_hc_pre_ms = 0.0;
+  g_diag_decode_hc_attn_pre_ms = 0.0;
+  g_diag_decode_hc_ffn_pre_ms = 0.0;
+  g_diag_decode_hc_post_ms = 0.0;
+  g_diag_decode_layer_input_ms = 0.0;
+  g_diag_decode_qwen_cpu_graph_ms = 0.0;
+  g_diag_decode_qwen_shared_submit_ms = 0.0;
+}
+double diag_get_layer_loop_total_ms() { return g_diag_layer_loop_total_ms; }
+double diag_get_attn_call_ms() { return g_diag_attn_call_ms; }
+double diag_get_ffn_call_ms() { return g_diag_ffn_call_ms; }
+double diag_get_decode_layer_loop_ms() { return g_diag_decode_layer_loop_ms; }
+double diag_get_decode_attn_call_ms() { return g_diag_decode_attn_call_ms; }
+double diag_get_decode_ffn_call_ms() { return g_diag_decode_ffn_call_ms; }
+double diag_get_decode_pilot_ms() { return g_diag_decode_pilot_ms; }
+double diag_get_decode_hc_ms() { return g_diag_decode_hc_ms; }
+double diag_get_decode_hc_pre_ms() { return g_diag_decode_hc_pre_ms; }
+double diag_get_decode_hc_attn_pre_ms() { return g_diag_decode_hc_attn_pre_ms; }
+double diag_get_decode_hc_ffn_pre_ms() { return g_diag_decode_hc_ffn_pre_ms; }
+double diag_get_decode_hc_post_ms() { return g_diag_decode_hc_post_ms; }
+double diag_get_decode_layer_input_ms() {
+  return g_diag_decode_layer_input_ms;
+}
+double diag_get_decode_qwen_cpu_graph_ms() {
+  return g_diag_decode_qwen_cpu_graph_ms;
+}
+double diag_get_decode_qwen_shared_submit_ms() {
+  return g_diag_decode_qwen_shared_submit_ms;
+}
+
 // ============================================================
 // Main layer-by-layer forward pass with pre-allocated scratch,
 // speculative pilot prefetch, and performance instrumentation.
@@ -9441,6 +10591,13 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   bool trace = trace_gate("TRACE-HIDDEN"); // gate BEFORE paying for l2norm, not
                                            // just before printing
   for (int l = 0; l < c.n_layers; ++l) {
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- see g_diag_layer_loop_total_ms's
+    // own comment above. Wraps this ENTIRE iteration (attention, hc hooks,
+    // FFN/MoE dispatch, and every pilot/prefetch block below, timed or not)
+    // so its accumulated total across all layers can be compared directly
+    // against the [REQUEST] line's own wall_ms and against the sum of the
+    // named PERF_SCOPE buckets that already feed that line.
+    auto diag_layer_loop_start = std::chrono::high_resolution_clock::now();
     if (ram_mgr.vram_cache)
       ram_mgr.vram_cache->prefill_current_layer = l;
     const float *last_tok =
@@ -9466,17 +10623,54 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // PLE n-gram hash embedding modifies the HC stream buffer BEFORE the
     // attention hc_pre collapse. nullptr for every other family.
     if (fo.layer_input_fn) {
+      const auto diag_layer_input_start =
+          std::chrono::high_resolution_clock::now();
       PERF_SCOPE(t_layer_input_hook);
       qwen4exp_hc_prepare_host_layer_input(engine, l, S);
       fo.layer_input_fn(engine, l, S, pos_base, token_ids);
       qwen4exp_hc_commit_host_layer_input(engine, l, S);
+      if (S == 1)
+        g_diag_decode_layer_input_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() -
+                diag_layer_input_start)
+                .count();
     }
     {
+      const auto diag_hc_start = std::chrono::high_resolution_clock::now();
       PERF_SCOPE(t_hc_hooks);
       fo.hc_pre_fn(engine, l, /*sub_block=*/0, hidden_states, S, D);
+      if (S == 1) {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+                                   std::chrono::high_resolution_clock::now() -
+                                   diag_hc_start)
+                                   .count();
+        g_diag_decode_hc_ms +=
+            elapsed;
+        g_diag_decode_hc_pre_ms += elapsed;
+        g_diag_decode_hc_attn_pre_ms += elapsed;
+      }
     }
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- wall-clock around this exact call,
+    // to compare against t_attn's OWN reported duration for the same call.
+    // If attention_fn issues async GPU work and returns before it lands
+    // (with the real wait happening implicitly at a later blocking call
+    // this loop doesn't separately time), t_attn would under-report this
+    // call's real cost relative to this wall-clock measurement. See
+    // g_diag_attn_call_ms's own comment above the function.
+    auto diag_attn_call_start = std::chrono::high_resolution_clock::now();
     fo.attention_fn(engine, l, hidden_states, S, pos_base,
                     scratch.attn_out.data());
+    g_diag_attn_call_ms += std::chrono::duration<double, std::milli>(
+                               std::chrono::high_resolution_clock::now() -
+                               diag_attn_call_start)
+                               .count();
+    if (S == 1)
+      g_diag_decode_attn_call_ms +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::high_resolution_clock::now() -
+              diag_attn_call_start)
+              .count();
     bool attn_device_consumed = false;
     if (engine.qwen4exp_device_attn_output_ready) {
       if (engine.qwen4exp_device_attn_output_raw) {
@@ -9494,7 +10688,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       } else {
         attn_device_consumed =
             qwen4exp_hc_post_combine_device(engine, l, /*sub_block=*/0, S, D,
-                                            engine.qwen4exp_device_attn_output);
+                                            engine.qwen4exp_device_attn_output,
+                                            nullptr);
         if (!attn_device_consumed && !qwen4exp_copy_gdn_device_output_to_host(
                                          engine.qwen4exp_device_attn_output,
                                          scratch.attn_out.data(), S)) {
@@ -9508,12 +10703,22 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       engine.qwen4exp_device_attn_output_raw = false;
     }
     {
+      const auto diag_hc_start = std::chrono::high_resolution_clock::now();
       PERF_SCOPE(t_hc_hooks);
       if (attn_device_consumed) {
         // The device post-combine already updated the authoritative HC state.
       } else {
         fo.hc_post_fn(engine, l, /*sub_block=*/0, hidden_states,
                       scratch.attn_out.data(), S, D);
+      }
+      if (S == 1)
+      {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+                                   std::chrono::high_resolution_clock::now() -
+                                   diag_hc_start)
+                                   .count();
+        g_diag_decode_hc_ms += elapsed;
+        g_diag_decode_hc_post_ms += elapsed;
       }
     }
 
@@ -9618,9 +10823,26 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // them (sub_block=1, matching attention's sub_block=0 above) knows
     // about hyper-connections. ---
     {
+      const auto diag_hc_start = std::chrono::high_resolution_clock::now();
       PERF_SCOPE(t_hc_hooks);
       fo.hc_pre_fn(engine, l, /*sub_block=*/1, hidden_states, S, D);
+      if (S == 1) {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+                                   std::chrono::high_resolution_clock::now() -
+                                   diag_hc_start)
+                                   .count();
+        g_diag_decode_hc_ms +=
+            elapsed;
+        g_diag_decode_hc_pre_ms += elapsed;
+        g_diag_decode_hc_ffn_pre_ms += elapsed;
+      }
     }
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- wall-clock around this exact
+    // block, same cross-check rationale as g_diag_attn_call_ms above (async
+    // GPU dispatch inside dense_ffn_gguf/moe_forward_gguf could return
+    // before the work is really done, making t_moe_expert under-report
+    // vs. this wall-clock measurement of the same call).
+    auto diag_ffn_call_start = std::chrono::high_resolution_clock::now();
     {
       PERF_SCOPE(t_moe_expert);
       if (l < c.first_dense) {
@@ -9631,6 +10853,16 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                          scratch.moe_out.data(), scratch, token_ids);
       }
     }
+    g_diag_ffn_call_ms += std::chrono::duration<double, std::milli>(
+                              std::chrono::high_resolution_clock::now() -
+                              diag_ffn_call_start)
+                              .count();
+    if (S == 1)
+      g_diag_decode_ffn_call_ms +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::high_resolution_clock::now() -
+              diag_ffn_call_start)
+              .count();
     bool moe_device_consumed = false;
   if (scratch.moe_device_output_ready) {
       // The actual residual update is device-to-device.  Do not read the
@@ -9648,7 +10880,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                                          scratch.moe_device_output,
                                          scratch.moe_out.data());
         else if (scratch.moe_shared_device_output)
-          copied_device_output = GgmlQwenSharedRunner::instance()
+          copied_device_output = GgmlQwenSharedRunner::instance_for_layer(l)
                                      .copy_output_to_host(
                                          scratch.moe_device_output,
                                          scratch.moe_out.data());
@@ -9659,14 +10891,17 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         }
       }
       moe_device_consumed = qwen4exp_hc_post_combine_device(
-          engine, l, /*sub_block=*/1, S, D, scratch.moe_device_output);
+          engine, l, /*sub_block=*/1, S, D, scratch.moe_device_output,
+          scratch.moe_shared_device_output
+              ? GgmlQwenSharedRunner::instance_for_layer(l).output_done_event()
+              : nullptr);
       if (!moe_device_consumed) {
         if (!copied_device_output && scratch.moe_device_runner)
           copied_device_output =
               scratch.moe_device_runner->copy_device_output_to_host(
                   scratch.moe_device_output, scratch.moe_out.data());
         else if (!copied_device_output && scratch.moe_shared_device_output)
-          copied_device_output = GgmlQwenSharedRunner::instance()
+          copied_device_output = GgmlQwenSharedRunner::instance_for_layer(l)
                                      .copy_output_to_host(
                                          scratch.moe_device_output,
                                          scratch.moe_out.data());
@@ -9680,9 +10915,29 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       scratch.moe_shared_device_output = false;
       scratch.moe_device_output_ready = false;
     }
-    if (!moe_device_consumed)
-      fo.hc_post_fn(engine, l, /*sub_block=*/1, hidden_states,
-                    scratch.moe_out.data(), S, D);
+    if (!moe_device_consumed) {
+      // Missing timer found investigating a large gap between [REQUEST]'s
+      // own wall_ms and the sum of its named buckets: every OTHER hc_pre_fn/
+      // hc_post_fn call site in this function (sub_block=0 x2, sub_block=1's
+      // own hc_pre_fn) is wrapped in PERF_SCOPE(t_hc_hooks) -- this one, the
+      // FFN-side post-combine, was not. Same counter as its siblings so the
+      // existing "Per-layer hooks:" report line picks it up automatically.
+      const auto diag_hc_start = std::chrono::high_resolution_clock::now();
+      {
+        PERF_SCOPE(t_hc_hooks);
+        fo.hc_post_fn(engine, l, /*sub_block=*/1, hidden_states,
+                      scratch.moe_out.data(), S, D);
+      }
+      if (S == 1)
+      {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+                                   std::chrono::high_resolution_clock::now() -
+                                   diag_hc_start)
+                                   .count();
+        g_diag_decode_hc_ms += elapsed;
+        g_diag_decode_hc_post_ms += elapsed;
+      }
+    }
 
     check_finite("hidden_states (post FFN/MoE residual)", l, -1, hidden_states,
                  (size_t)n);
@@ -9710,6 +10965,14 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         ram_mgr.vram_cache && l + 1 < c.n_layers &&
         ram_mgr.vram_cache->layer_fully_resident(l + 1, c.n_experts);
+    const bool qwen_pilot_skip_hot_set =
+        engine.qwen4exp_router_pilot_skip_fully_cached && S == 1 &&
+        engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        ram_mgr.vram_cache && l + 1 < c.n_layers &&
+        qwen4exp_router_pilot_layer_allowed(engine, l + 1) &&
+        qwen4exp_decode_hot_set_stable(l + 1);
+    const bool qwen_pilot_skip_any_resident =
+        qwen_pilot_skip_fully_cached || qwen_pilot_skip_hot_set;
     const bool qwen_pilot_skip_prefetch_excluded =
         engine.qwen4exp_router_pilot_skip_prefetch_excluded_layers && S == 1 &&
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -9722,9 +10985,13 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         l + 1 < c.n_layers &&
         !qwen4exp_router_pilot_layer_allowed(engine, l + 1);
-    if (qwen_pilot_skip_fully_cached) {
+    if (qwen_pilot_skip_any_resident) {
       perf().n_qwen_pilot_skipped_fully_cached.fetch_add(
           1, std::memory_order_relaxed);
+    }
+    if (qwen_pilot_skip_hot_set) {
+      perf().n_qwen_pilot_adaptive_skips.fetch_add(1,
+                                                   std::memory_order_relaxed);
     }
     if (qwen_pilot_skip_prefetch_excluded) {
       perf().n_qwen_pilot_skipped_prefetch_excluded.fetch_add(
@@ -9734,7 +11001,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       perf().n_qwen_pilot_skipped_predict_policy.fetch_add(
           1, std::memory_order_relaxed);
     }
-    if (engine.qwen4exp_router_pilot && !qwen_pilot_skip_fully_cached &&
+    if (engine.qwen4exp_router_pilot && !qwen_pilot_skip_any_resident &&
         !qwen_pilot_skip_prefetch_excluded && !qwen_pilot_skip_predict_policy &&
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         l >= c.first_dense && l + 1 < c.n_layers && l + 1 >= c.first_dense &&
@@ -10038,6 +11305,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // misprediction looks like (a timing/pool-size problem would
     // still show occasional lucky matches, not a clean zero).
     if (l + 1 < c.n_layers && c.n_experts > 0) {
+      const auto diag_pilot_start = std::chrono::high_resolution_clock::now();
       PERF_START(pilot);
       std::string norm_key =
           "blk." + std::to_string(l + 1) + ".ffn_norm.weight";
@@ -10094,6 +11362,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         }
 
         int pilot_k = std::min(pilot_k_for_layer(l + 1), c.topk);
+        // prefetch_pilot_k_adaptive (2026-09-13): narrows the above
+        // static ceiling to THIS layer's own live, most-confident ranks
+        // only -- see adaptive_pilot_k_for_layer's own comment
+        // (dense_dispatch.hpp). No-op (returns pilot_k unchanged) unless
+        // explicitly enabled in config.
+        pilot_k = adaptive_pilot_k_for_layer(l + 1, pilot_k);
         // Recall instrumentation: capture the full predicted set
         // BEFORE the already-resident skip below, so this measures
         // pure prediction accuracy against the real router's later
@@ -10873,6 +12147,23 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                                          confirmed_resident_count);
       }
       PERF_END(pilot, t_prefetch);
+      if (S == 1)
+        g_diag_decode_pilot_ms +=
+            std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - diag_pilot_start)
+                .count();
     }
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- see g_diag_layer_loop_total_ms's
+    // own comment above the function. No continue/break/return exits this
+    // loop early (verified) so this always runs once per layer iteration.
+    g_diag_layer_loop_total_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - diag_layer_loop_start)
+            .count();
+    if (S == 1)
+      g_diag_decode_layer_loop_ms +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::high_resolution_clock::now() - diag_layer_loop_start)
+              .count();
   }
 }

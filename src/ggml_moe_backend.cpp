@@ -10,9 +10,11 @@
 #include "perf_timer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <numeric>
@@ -29,6 +31,11 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
+#include "ggml-cpu.h"
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 extern "C" cudaError_t launch_ggml_moe_unpack(
     const void *src, void *gate, void *up, void *down, int count,
@@ -86,6 +93,14 @@ bool type_supported(uint32_t t) {
   if (gt == GGML_TYPE_F32 || gt == GGML_TYPE_F16 || gt == GGML_TYPE_BF16)
     return true;
   return ggml_is_quantized(gt);
+}
+
+bool qwen_decode_sched_debug() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("MOESTREAM_QWEN_DECODE_SCHED_DEBUG");
+    return e && e[0] == '1';
+  }();
+  return enabled;
 }
 
 // Route IDs and weights are compact host-visible outputs.  GGML's CUDA VMM
@@ -1007,26 +1022,61 @@ GgmlQwenSharedRunner &GgmlQwenSharedRunner::instance() {
   return r;
 }
 
+GgmlQwenSharedRunner &GgmlQwenSharedRunner::instance_for_layer(int layer) {
+  // The model currently has 48 trunk layers, but keep the pool comfortably
+  // above that without exposing a model-specific limit in the public header.
+  // Objects are initialized lazily and only the Qwen shared path reaches this
+  // selector; the legacy singleton remains available to tests/diagnostics.
+  static GgmlQwenSharedRunner runners[256];
+  if (layer >= 0 && layer < 256)
+    return runners[layer];
+  return instance();
+}
+
 bool GgmlQwenSharedRunner::compiled_in() { return true; }
 
 GgmlQwenSharedRunner::~GgmlQwenSharedRunner() { shutdown(); }
 
 void GgmlQwenSharedRunner::free_graph() {
   if (graph_ctx_) {
-    ggml_free((ggml_context *)graph_ctx_);
-    graph_ctx_ = nullptr;
+    if (overlap_combine_galloc_) {
+      ggml_gallocr_free((ggml_gallocr_t)overlap_combine_galloc_);
+      overlap_combine_galloc_ = nullptr;
+    }
+  }
+  if (overlap_shared_galloc_) {
+    ggml_gallocr_free((ggml_gallocr_t)overlap_shared_galloc_);
+    overlap_shared_galloc_ = nullptr;
   }
   if (galloc_) {
     ggml_gallocr_free((ggml_gallocr_t)galloc_);
     galloc_ = nullptr;
   }
-  graph_ = x_ = routed_ = output_ = nullptr;
+  if (zero_routed_data_) {
+    cudaSetDevice(device_);
+    cudaFree(zero_routed_data_);
+    zero_routed_data_ = nullptr;
+  }
+  if (graph_ctx_) {
+    ggml_free((ggml_context *)graph_ctx_);
+    graph_ctx_ = nullptr;
+  }
+  graph_ = overlap_shared_graph_ = overlap_combine_graph_ = nullptr;
+  x_ = routed_ = output_ = nullptr;
+  overlap_x_ = overlap_routed_ = overlap_shared_input_ = nullptr;
+  overlap_shared_output_ = overlap_combined_ = nullptr;
   x_owned_data_ = routed_owned_data_ = nullptr;
+  overlap_x_owned_data_ = overlap_routed_owned_data_ = nullptr;
   graph_ready_ = false;
+  overlap_graph_ready_ = false;
 }
 
 void GgmlQwenSharedRunner::shutdown() {
   if (device_ >= 0) cudaSetDevice(device_);
+  if (output_done_event_ &&
+      ((ggml_backend_event_t)output_done_event_)->context)
+    cudaEventSynchronize(
+        (cudaEvent_t)((ggml_backend_event_t)output_done_event_)->context);
   if (backend_) ggml_backend_synchronize((ggml_backend_t)backend_);
   free_graph();
   if (weight_buf_) {
@@ -1040,6 +1090,10 @@ void GgmlQwenSharedRunner::shutdown() {
   if (external_buf_) {
     ggml_backend_buffer_free((ggml_backend_buffer_t)external_buf_);
     external_buf_ = nullptr;
+  }
+  if (output_done_event_) {
+    ggml_backend_event_free((ggml_backend_event_t)output_done_event_);
+    output_done_event_ = nullptr;
   }
   gate_ = up_ = down_ = gate_inp_ = nullptr;
   owned_gate_data_ = owned_up_data_ = owned_down_data_ = nullptr;
@@ -1074,6 +1128,14 @@ bool GgmlQwenSharedRunner::ensure(int device, int d_model, int shared_inter,
   }
   ggml_backend_buffer_set_usage((ggml_backend_buffer_t)external_buf_,
                                 GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+  output_done_event_ = ggml_backend_event_new(
+      ggml_backend_get_device((ggml_backend_t)backend_));
+  if (!output_done_event_) {
+    ggml_backend_buffer_free((ggml_backend_buffer_t)external_buf_);
+    external_buf_ = nullptr;
+    backend_ = nullptr;
+    return false;
+  }
   device_ = device;
   d_model_ = d_model;
   shared_inter_ = shared_inter;
@@ -1085,12 +1147,20 @@ bool GgmlQwenSharedRunner::ensure(int device, int d_model, int shared_inter,
   return true;
 }
 
+bool GgmlQwenSharedRunner::record_output_event() {
+  if (!output_done_event_ || !backend_)
+    return false;
+  ggml_backend_event_record((ggml_backend_event_t)output_done_event_,
+                            (ggml_backend_t)backend_);
+  return true;
+}
+
 bool GgmlQwenSharedRunner::build_graph() {
   if (!backend_ || !gate_ || !up_ || !down_ ||
       (has_gate_ && !gate_inp_))
     return false;
   ggml_init_params ip = {};
-  ip.mem_size = ggml_tensor_overhead() * 96 + ggml_graph_overhead();
+  ip.mem_size = ggml_tensor_overhead() * 160 + ggml_graph_overhead() * 2;
   ip.no_alloc = true;
   ggml_context *ctx = ggml_init(ip);
   if (!ctx) return false;
@@ -1134,6 +1204,65 @@ bool GgmlQwenSharedRunner::build_graph() {
     if (ga) ggml_gallocr_free(ga);
     ggml_free(ctx);
     return false;
+  }
+
+  // Build a second, tiny graph for the Qwen CPU-affinity overlap path.  The
+  // normal graph above remains unchanged: it computes shared FFN + routed
+  // result in one operation.  The overlap graph only adds a host-routed
+  // result to a shared result that was produced by the normal graph with a
+  // zero routed input.  Keeping this graph separate avoids recomputing the
+  // shared expert after the CPU worker finishes.
+  ggml_cgraph *overlap_graph = ggml_new_graph(ctx);
+  ggml_tensor *overlap_routed =
+      ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model_, n_tokens_);
+  ggml_tensor *overlap_shared_input =
+      ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model_, n_tokens_);
+  ggml_tensor *overlap_combined =
+      overlap_routed && overlap_shared_input
+          ? ggml_add(ctx, overlap_routed, overlap_shared_input)
+          : nullptr;
+  ggml_gallocr_t overlap_ga = nullptr;
+  if (overlap_graph && overlap_routed && overlap_shared_input &&
+      overlap_combined) {
+    ggml_set_input(overlap_routed);
+    ggml_set_input(overlap_shared_input);
+    ggml_set_name(overlap_routed, "qwen4exp_overlap_routed_input");
+    ggml_set_name(overlap_shared_input, "qwen4exp_overlap_shared_input");
+    ggml_set_name(overlap_combined, "qwen4exp_overlap_routed_plus_shared");
+    ggml_set_output(overlap_combined);
+    ggml_build_forward_expand(overlap_graph, overlap_combined);
+    overlap_ga = ggml_gallocr_new(bt);
+    if (!overlap_ga || !ggml_gallocr_alloc_graph(overlap_ga, overlap_graph)) {
+      if (overlap_ga)
+        ggml_gallocr_free(overlap_ga);
+      overlap_ga = nullptr;
+    }
+  }
+
+  // The overlap graph is an optional Qwen-only optimization.  A failure to
+  // allocate its small add workspace must never disable the established
+  // shared graph or change any other model family's path.
+  if (overlap_ga) {
+    const size_t zero_bytes =
+        (size_t)d_model_ * (size_t)n_tokens_ * sizeof(float);
+    cudaSetDevice(device_);
+    if (cudaMalloc(&zero_routed_data_, zero_bytes) == cudaSuccess &&
+        cudaMemset(zero_routed_data_, 0, zero_bytes) == cudaSuccess) {
+      overlap_shared_galloc_ = nullptr;
+      overlap_combine_galloc_ = overlap_ga;
+      overlap_combine_graph_ = overlap_graph;
+      overlap_routed_ = overlap_routed;
+      overlap_shared_input_ = overlap_shared_input;
+      overlap_combined_ = overlap_combined;
+      overlap_routed_owned_data_ = overlap_routed->data;
+      overlap_graph_ready_ = true;
+    } else {
+      if (zero_routed_data_) {
+        cudaFree(zero_routed_data_);
+        zero_routed_data_ = nullptr;
+      }
+      ggml_gallocr_free(overlap_ga);
+    }
   }
   LOG_INFO("[GGML-SHARED-MEM] graph workspace: %.2f MiB\n",
            (double)ggml_gallocr_get_buffer_size(ga, 0) /
@@ -1369,6 +1498,10 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
       r->nb[0] != sizeof(float) ||
       r->nb[1] != (size_t)d_model_ * sizeof(float) || !r->data || !r->buffer)
     return fail("persistent routed tensor validation", routed, routed);
+  // run_shared_only() temporarily retargets the normal routed input to a
+  // device-zero buffer. Restore the graph-owned allocation before a normal
+  // routed run uses the same persistent graph again.
+  r->data = routed_owned_data_;
   // 2026-09-10: real, confirmed root cause of the shared-expert NaN
   // corruption bug (see Test 35, which reproduces it in isolation with a
   // CPU oracle). Every production caller of run() -- run_qwen4exp_shared_device()
@@ -1432,6 +1565,8 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                                        (ggml_cgraph *)graph_) !=
       GGML_STATUS_SUCCESS)
     return fail("graph compute", hc_in, src);
+  if (!record_output_event())
+    return fail("output event record", hc_in, src);
   // In the conservative mode, preserve the old request-local completion
   // fence.  In direct-input/async-reuse mode the next operation is HC
   // post-combine on this same backend, so its queued tensor copy is the
@@ -1522,9 +1657,89 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
           layer);
     return false;
   }
+  if (!record_output_event())
+    return false;
   if (!direct_inputs)
     ggml_backend_synchronize((ggml_backend_t)backend_);
   *combined_output = output_;
+  return true;
+}
+
+bool GgmlQwenSharedRunner::run_shared_only(int layer, const void *device_x,
+                                           const void **shared_output) {
+  if (shared_output)
+    *shared_output = nullptr;
+  if (!backend_ || !graph_ready_ || !overlap_graph_ready_ || layer < 0 ||
+      !device_x || !shared_output || !zero_routed_data_)
+    return false;
+
+  ggml_tensor *hc_in = (ggml_tensor *)device_x;
+  ggml_tensor *x = (ggml_tensor *)x_;
+  ggml_tensor *r = (ggml_tensor *)routed_;
+  if (!hc_in || !x || !r || hc_in->type != GGML_TYPE_F32 ||
+      hc_in->ne[0] != d_model_ || hc_in->ne[1] < n_tokens_ ||
+      hc_in->ne[2] != 1 || hc_in->ne[3] != 1 ||
+      hc_in->nb[0] != sizeof(float) ||
+      hc_in->nb[1] != (size_t)d_model_ * sizeof(float) || !hc_in->data ||
+      !hc_in->buffer)
+    return false;
+
+  const size_t bytes = (size_t)d_model_ * (size_t)n_tokens_ * sizeof(float);
+  const bool direct_inputs = use_direct_shared_inputs();
+  if (direct_inputs) {
+    // The HC producer and this graph are ordered on the same GGML backend
+    // stream.  Retargeting the persistent input removes the blocking D2D
+    // copy and lets the CPU worker start while CUDA computes the shared FFN.
+    x->data = hc_in->data;
+  } else {
+    cudaSetDevice(device_);
+    if (cudaMemcpy(x->data, hc_in->data, bytes, cudaMemcpyDeviceToDevice) !=
+        cudaSuccess)
+      return false;
+  }
+  r->data = zero_routed_data_;
+  if (ggml_backend_graph_compute_async(
+          (ggml_backend_t)backend_, (ggml_cgraph *)graph_) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  if (!record_output_event())
+    return false;
+  if (!direct_inputs)
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+  *shared_output = output_;
+  return true;
+}
+
+bool GgmlQwenSharedRunner::run_host_routed_add(
+    int layer, const float *host_routed, const void **combined_output) {
+  if (combined_output)
+    *combined_output = nullptr;
+  if (!backend_ || !overlap_graph_ready_ || layer < 0 || !host_routed ||
+      !combined_output || !overlap_routed_ || !overlap_shared_input_ ||
+      !overlap_combined_ || !overlap_routed_owned_data_ || !output_)
+    return false;
+
+  auto *routed = (ggml_tensor *)overlap_routed_;
+  auto *shared = (ggml_tensor *)overlap_shared_input_;
+  routed->data = overlap_routed_owned_data_;
+  // output_ is the shared-only result because run_shared_only() fed the
+  // normal graph a zero routed input.  Preserve this graph input's original
+  // buffer association while retargeting only its data pointer, exactly like
+  // the established direct-input path above.
+  shared->data = ((ggml_tensor *)output_)->data;
+
+  const size_t bytes = (size_t)d_model_ * (size_t)n_tokens_ * sizeof(float);
+  ggml_backend_tensor_set_async((ggml_backend_t)backend_, routed,
+                                host_routed, 0, bytes);
+  if (ggml_backend_graph_compute_async(
+          (ggml_backend_t)backend_,
+          (ggml_cgraph *)overlap_combine_graph_) != GGML_STATUS_SUCCESS)
+    return false;
+  if (!record_output_event())
+    return false;
+  if (!use_direct_shared_inputs())
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+  *combined_output = overlap_combined_;
   return true;
 }
 
@@ -1536,6 +1751,820 @@ bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
   cudaSetDevice(device_);
   const size_t bytes = (size_t)d_model_ * n_tokens_ * sizeof(float);
   ggml_backend_tensor_get((ggml_tensor *)combined_output, host_out, 0, bytes);
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Qwen decode scheduler graph (Bee-style CPU-affinity topology)
+// ---------------------------------------------------------------------------
+
+GgmlQwenDecodeGraphRunner &GgmlQwenDecodeGraphRunner::instance() {
+  static GgmlQwenDecodeGraphRunner runner;
+  return runner;
+}
+
+GgmlQwenDecodeGraphRunner &
+GgmlQwenDecodeGraphRunner::instance_for_signature(
+    uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+    size_t expert_stride) {
+  // The current Qwen checkpoint uses two signatures. Keep a few spare slots
+  // so a future mixed-quant export does not reintroduce the old unsafe
+  // destroy/rebuild transition. These runners are used serially by the
+  // decode loop, while each owns its own scheduler, graph, and host buffers.
+  static GgmlQwenDecodeGraphRunner runners[8];
+  for (auto &runner : runners) {
+    if (runner.has_signature(gate_type, up_type, down_type, expert_stride))
+      return runner;
+  }
+  for (auto &runner : runners) {
+    if (!runner.ready_)
+      return runner;
+  }
+  // More signatures than the bounded cache is unexpected. Reuse the first
+  // slot; run() will rebuild it safely after its scheduler has synchronized.
+  return runners[0];
+}
+
+bool GgmlQwenDecodeGraphRunner::has_signature(
+    uint32_t gate_type, uint32_t up_type, uint32_t down_type,
+    size_t expert_stride) const {
+  return ready_ && gate_type_ == gate_type && up_type_ == up_type &&
+         down_type_ == down_type && expert_stride_ == expert_stride;
+}
+
+bool GgmlQwenDecodeGraphRunner::compiled_in() { return true; }
+
+GgmlQwenDecodeGraphRunner::~GgmlQwenDecodeGraphRunner() { shutdown(); }
+
+void GgmlQwenDecodeGraphRunner::free_graph() {
+  if (sched_) {
+    ggml_backend_sched_synchronize((ggml_backend_sched_t)sched_);
+    ggml_backend_sched_free((ggml_backend_sched_t)sched_);
+    sched_ = nullptr;
+  }
+  graph_ = nullptr;
+  if (graph_ctx_) {
+    ggml_free((ggml_context *)graph_ctx_);
+    graph_ctx_ = nullptr;
+  }
+  output_ = x_ = ids_ = weights_ = nullptr;
+  shared_gate_ = shared_up_ = shared_down_ = shared_gate_inp_ = nullptr;
+  shared_has_gate_ = false;
+  shared_clamp_ = 0.0f;
+  shared_gate_type_ = shared_up_type_ = shared_down_type_ = 0;
+  shared_gate_inp_type_ = 0;
+  shared_graph_ = false;
+  router_external_ = false;
+
+  for (void *buf : expert_bufs_) {
+    if (buf)
+      ggml_backend_buffer_free((ggml_backend_buffer_t)buf);
+  }
+  expert_bufs_.clear();
+  gate_ = up_ = down_ = nullptr;
+  if (expert_ctx_) {
+    ggml_free((ggml_context *)expert_ctx_);
+    expert_ctx_ = nullptr;
+  }
+  if (router_buf_) {
+    ggml_backend_buffer_free((ggml_backend_buffer_t)router_buf_);
+    router_buf_ = nullptr;
+  }
+  router_ = bias_ = nullptr;
+  if (router_ctx_) {
+    ggml_free((ggml_context *)router_ctx_);
+    router_ctx_ = nullptr;
+  }
+  ready_ = false;
+  gate_type_ = up_type_ = down_type_ = 0;
+  expert_stride_ = 0;
+}
+
+void GgmlQwenDecodeGraphRunner::shutdown() {
+  free_graph();
+  // The external buffer is a small CUDA allocation used only as the GGML
+  // ownership marker for dense-pool/shared-weight pointers.  It must outlive
+  // graph rebuilds: free_graph() destroys the old graph, but a subsequent
+  // rebuild still needs the marker to bind the new graph's external tensors.
+  if (external_cuda_buf_) {
+    ggml_backend_buffer_free((ggml_backend_buffer_t)external_cuda_buf_);
+    external_cuda_buf_ = nullptr;
+  }
+  if (cpu_backend_ && cpu_threadpool_) {
+    // The CPU backend retains the pool pointer; detach it before destroying
+    // either object.  This mirrors GgmlQwenCpuMoeRunner and prevents a stale
+    // pool handle during scheduler teardown.
+    ggml_backend_cpu_set_threadpool(
+        (ggml_backend_t)cpu_backend_, nullptr);
+  }
+  if (cpu_threadpool_) {
+    ggml_threadpool_free((ggml_threadpool_t)cpu_threadpool_);
+    cpu_threadpool_ = nullptr;
+  }
+  cpu_threads_ = 0;
+  if (cpu_backend_) {
+    ggml_backend_free((ggml_backend_t)cpu_backend_);
+    cpu_backend_ = nullptr;
+  }
+  cuda_backend_ = nullptr;
+  device_ = -1;
+  d_model_ = n_experts_ = topk_ = d_ff_ = 0;
+  normalize_ = false;
+  weight_scale_ = 0.0f;
+}
+
+bool GgmlQwenDecodeGraphRunner::ensure(int device, int d_model,
+                                       int n_experts, int topk, int d_ff,
+                                       bool normalize, float weight_scale) {
+  if (device < 0 || d_model <= 0 || n_experts <= 0 || topk <= 0 ||
+      topk > n_experts || d_ff <= 0)
+    return false;
+  if (cuda_backend_ && device_ == device && d_model_ == d_model &&
+      n_experts_ == n_experts && topk_ == topk && d_ff_ == d_ff &&
+      normalize_ == normalize && weight_scale_ == weight_scale)
+    return true;
+
+  shutdown();
+  cudaSetDevice(device);
+  cuda_backend_ = ggml_shared_backend(device);
+  if (!cuda_backend_)
+    return false;
+  cpu_backend_ = ggml_backend_cpu_init();
+  if (!cpu_backend_) {
+    shutdown();
+    return false;
+  }
+  // Bee's whole-model scheduler explicitly gives its CPU backend the same
+  // decode threadpool as the rest of the inference graph.  Without this,
+  // MoEStream's opt-in Qwen topology silently executes CPU MUL_MAT_ID with
+  // the backend default (effectively one worker), which is why the first
+  // scheduler A/B measured only 1.7 tok/s despite placing the nodes on CPU.
+  // Keep this entirely inside the Qwen-only, config-gated runner; the normal
+  // per-layer path and every other model family are unchanged.
+#if defined(_OPENMP)
+  cpu_threads_ = std::max(1, omp_get_max_threads());
+#else
+  cpu_threads_ = 1;
+#endif
+  ggml_backend_cpu_set_n_threads((ggml_backend_t)cpu_backend_,
+                                 cpu_threads_);
+  ggml_threadpool_params tp_params =
+      ggml_threadpool_params_default(cpu_threads_);
+  cpu_threadpool_ = ggml_threadpool_new(&tp_params);
+  if (cpu_threadpool_) {
+    ggml_backend_cpu_set_threadpool((ggml_backend_t)cpu_backend_,
+                                     (ggml_threadpool_t)cpu_threadpool_);
+  } else {
+    LOG_WARN("[GGML-QWEN-DECODE-SCHED] CPU threadpool allocation failed; "
+             "using backend worker configuration (%d threads)\n",
+             cpu_threads_);
+  }
+  LOG_INFO("[GGML-QWEN-DECODE-SCHED] CPU backend configured with %d threads%s\n",
+           cpu_threads_, cpu_threadpool_ ? " (persistent threadpool)" : "");
+  external_cuda_buf_ = ggml_backend_alloc_buffer(
+      (ggml_backend_t)cuda_backend_, 1);
+  if (!external_cuda_buf_) {
+    shutdown();
+    return false;
+  }
+  ggml_backend_buffer_set_usage(
+      (ggml_backend_buffer_t)external_cuda_buf_,
+      GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  device_ = device;
+  d_model_ = d_model;
+  n_experts_ = n_experts;
+  topk_ = topk;
+  d_ff_ = d_ff;
+  normalize_ = normalize;
+  weight_scale_ = weight_scale;
+  return true;
+}
+
+bool GgmlQwenDecodeGraphRunner::rebuild(
+    const GgmlQwenDecodeGraphRef &ref) {
+  auto log_rebuild_failure = [&](const char *reason) {
+    if (qwen_decode_sched_debug())
+      LOG_WARN("[GGML-QWEN-DECODE-SCHED] rebuild failed before allocation: %s\n",
+               reason);
+  };
+  const bool basic_ok =
+      cuda_backend_ && cpu_backend_ &&
+      (ref.router_device || ref.router_host) && ref.gate_plane &&
+      ref.up_plane && ref.down_plane && ref.router_ne0 == d_model_ &&
+      ref.router_ne1 == n_experts_ &&
+      ref.router_type < (uint32_t)GGML_TYPE_COUNT &&
+      ref.gate_type < (uint32_t)GGML_TYPE_COUNT &&
+      ref.up_type < (uint32_t)GGML_TYPE_COUNT &&
+      ref.down_type < (uint32_t)GGML_TYPE_COUNT && ref.expert_stride != 0;
+  if (!basic_ok) {
+    if (qwen_decode_sched_debug())
+      LOG_WARN("[GGML-QWEN-DECODE-SCHED] rebuild rejected basic contract "
+               "router=%p/%p shape=%lldx%lld expected=%dx%d planes=%p/%p/%p "
+               "stride=%zu\n",
+               ref.router_device, ref.router_host,
+               (long long)ref.router_ne0, (long long)ref.router_ne1, d_model_,
+               n_experts_, ref.gate_plane, ref.up_plane, ref.down_plane,
+               ref.expert_stride);
+    return false;
+  }
+
+  const ggml_type router_type = (ggml_type)ref.router_type;
+  const ggml_type gate_type = (ggml_type)ref.gate_type;
+  const ggml_type up_type = (ggml_type)ref.up_type;
+  const ggml_type down_type = (ggml_type)ref.down_type;
+  if ((router_type != GGML_TYPE_F32 && router_type != GGML_TYPE_F16 &&
+       router_type != GGML_TYPE_BF16 && !ggml_is_quantized(router_type)) ||
+      !ggml_is_quantized(gate_type) || !ggml_is_quantized(up_type) ||
+      !ggml_is_quantized(down_type)) {
+    if (qwen_decode_sched_debug())
+      LOG_WARN("[GGML-QWEN-DECODE-SCHED] rebuild rejected unsupported "
+               "types router=%u gate=%u up=%u down=%u\n",
+               ref.router_type, ref.gate_type, ref.up_type, ref.down_type);
+    return false;
+  }
+
+  const int64_t shared_inter =
+      ref.shared_gate.ne0 > 0 ? ref.shared_gate.ne1 : 0;
+  const bool shared_requested =
+      ref.shared_gate.device_data && ref.shared_up.device_data &&
+      ref.shared_down.device_data && ref.shared_gate.ne0 == d_model_ &&
+      ref.shared_up.ne0 == d_model_ && ref.shared_down.ne0 == shared_inter &&
+      ref.shared_gate.ne1 == ref.shared_up.ne1 &&
+      ref.shared_down.ne1 == d_model_ && ref.shared_gate.ne1 > 0 &&
+      ref.shared_gate.device_bytes > 0 && ref.shared_up.device_bytes > 0 &&
+      ref.shared_down.device_bytes > 0 &&
+      (!ref.shared_has_gate ||
+       (ref.shared_gate_inp.device_data &&
+        ref.shared_gate_inp.ne0 == d_model_ &&
+        ref.shared_gate_inp.ne1 == 1 &&
+        ref.shared_gate_inp.device_bytes > 0));
+  const bool shared_types_supported =
+      !shared_requested ||
+      (ref.shared_gate.type < (uint32_t)GGML_TYPE_COUNT &&
+       ref.shared_up.type < (uint32_t)GGML_TYPE_COUNT &&
+       ref.shared_down.type < (uint32_t)GGML_TYPE_COUNT &&
+       type_supported(ref.shared_gate.type) &&
+       type_supported(ref.shared_up.type) &&
+       type_supported(ref.shared_down.type) &&
+       (!ref.shared_has_gate ||
+        (ref.shared_gate_inp.type < (uint32_t)GGML_TYPE_COUNT &&
+         type_supported(ref.shared_gate_inp.type))));
+  const bool use_shared_graph = shared_requested && shared_types_supported;
+
+  const bool same_signature =
+      ready_ && gate_type_ == ref.gate_type && up_type_ == ref.up_type &&
+      down_type_ == ref.down_type && expert_stride_ == ref.expert_stride &&
+      ((bias_ != nullptr) == (ref.selection_bias != nullptr)) &&
+      router_external_ == (ref.router_device != nullptr) &&
+      shared_graph_ == use_shared_graph &&
+      (!use_shared_graph ||
+       (shared_gate_type_ == ref.shared_gate.type &&
+        shared_up_type_ == ref.shared_up.type &&
+        shared_down_type_ == ref.shared_down.type &&
+        shared_gate_inp_type_ ==
+            (ref.shared_has_gate ? ref.shared_gate_inp.type : 0) &&
+        shared_has_gate_ == ref.shared_has_gate &&
+        shared_clamp_ == ref.shared_clamp));
+  if (same_signature)
+    return true;
+
+  free_graph();
+  cudaSetDevice(device_);
+
+  ggml_init_params rip = {};
+  rip.mem_size = ggml_tensor_overhead() * 16;
+  rip.no_alloc = true;
+  ggml_context *rctx = ggml_init(rip);
+  if (!rctx) {
+    log_rebuild_failure("router context");
+    return false;
+  }
+  ggml_tensor *router =
+      ggml_new_tensor_2d(rctx, router_type, d_model_, n_experts_);
+  ggml_tensor *bias = ref.selection_bias
+                          ? ggml_new_tensor_1d(rctx, GGML_TYPE_F32,
+                                               n_experts_)
+                          : nullptr;
+  if (!router || (ref.selection_bias && !bias)) {
+    log_rebuild_failure("router or bias tensor");
+    ggml_free(rctx);
+    return false;
+  }
+  ggml_backend_buffer_t rbuf = ggml_backend_alloc_ctx_tensors(
+      rctx, (ggml_backend_t)cuda_backend_);
+  if (!rbuf) {
+    log_rebuild_failure("router buffer");
+    ggml_free(rctx);
+    return false;
+  }
+  ggml_backend_buffer_set_usage(rbuf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  if ((ref.router_device && ref.router_device_bytes < ggml_nbytes(router)) ||
+      (!ref.router_device &&
+       ref.router_host_bytes < ggml_nbytes(router))) {
+    log_rebuild_failure("router bytes");
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  // Prefer the dense-pool pointer when one exists.  Otherwise retain the
+  // CUDA allocation from rbuf and upload the host-resident router weight
+  // asynchronously at each layer submission, matching the existing Qwen
+  // GPU-router ownership model without forcing router weights into the
+  // dense pool.
+  if (ref.router_device) {
+    router->data = const_cast<void *>(ref.router_device);
+    router->buffer = (ggml_backend_buffer_t)external_cuda_buf_;
+    ggml_backend_buffer_init_tensor(router->buffer, router);
+  }
+  if (bias)
+    ggml_backend_tensor_set((ggml_tensor *)bias, ref.selection_bias, 0,
+                            (size_t)n_experts_ * sizeof(float));
+  ggml_set_name(router, "qwen4exp_decode_router_weight");
+  if (bias)
+    ggml_set_name(bias, "qwen4exp_decode_router_bias");
+
+  ggml_init_params eip = {};
+  eip.mem_size = ggml_tensor_overhead() * 32;
+  eip.no_alloc = true;
+  ggml_context *ectx = ggml_init(eip);
+  if (!ectx) {
+    log_rebuild_failure("expert context");
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  ggml_tensor *gate =
+      ggml_new_tensor_3d(ectx, gate_type, d_model_, d_ff_, n_experts_);
+  ggml_tensor *up =
+      ggml_new_tensor_3d(ectx, up_type, d_model_, d_ff_, n_experts_);
+  ggml_tensor *down =
+      ggml_new_tensor_3d(ectx, down_type, d_ff_, d_model_, n_experts_);
+  ggml_tensor *shared_gate = nullptr;
+  ggml_tensor *shared_up = nullptr;
+  ggml_tensor *shared_down = nullptr;
+  ggml_tensor *shared_gate_inp = nullptr;
+  if (use_shared_graph) {
+    shared_gate = ggml_new_tensor_2d(
+        ectx, (ggml_type)ref.shared_gate.type, ref.shared_gate.ne0,
+        ref.shared_gate.ne1);
+    shared_up = ggml_new_tensor_2d(
+        ectx, (ggml_type)ref.shared_up.type, ref.shared_up.ne0,
+        ref.shared_up.ne1);
+    shared_down = ggml_new_tensor_2d(
+        ectx, (ggml_type)ref.shared_down.type, ref.shared_down.ne0,
+        ref.shared_down.ne1);
+    if (ref.shared_has_gate)
+      shared_gate_inp = ggml_new_tensor_2d(
+          ectx, (ggml_type)ref.shared_gate_inp.type,
+          ref.shared_gate_inp.ne0, ref.shared_gate_inp.ne1);
+  }
+  if (!gate || !up || !down ||
+      (use_shared_graph &&
+       (!shared_gate || !shared_up || !shared_down ||
+        (ref.shared_has_gate && !shared_gate_inp)))) {
+    log_rebuild_failure("expert or shared tensor");
+    ggml_free(ectx);
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  const size_t gate_bytes = ggml_nbytes(gate) / (size_t)n_experts_;
+  const size_t up_bytes = ggml_nbytes(up) / (size_t)n_experts_;
+  const size_t down_bytes = ggml_nbytes(down) / (size_t)n_experts_;
+  if (ref.gate_bytes < gate_bytes || ref.up_bytes < up_bytes ||
+      ref.down_bytes < down_bytes || ref.expert_stride < gate_bytes ||
+      ref.expert_stride < up_bytes || ref.expert_stride < down_bytes) {
+    log_rebuild_failure("expert plane bytes or stride");
+    ggml_free(ectx);
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  gate->nb[2] = ref.expert_stride;
+  up->nb[2] = ref.expert_stride;
+  down->nb[2] = ref.expert_stride;
+  gate->nb[3] = ref.expert_stride * (size_t)n_experts_;
+  up->nb[3] = ref.expert_stride * (size_t)n_experts_;
+  down->nb[3] = ref.expert_stride * (size_t)n_experts_;
+  const void *planes[] = {ref.gate_plane, ref.up_plane, ref.down_plane};
+  const size_t plane_bytes[] = {gate_bytes, up_bytes, down_bytes};
+  ggml_tensor *tensors[] = {gate, up, down};
+  for (int i = 0; i < 3; ++i) {
+    const size_t view_bytes = ref.expert_stride * (size_t)(n_experts_ - 1) +
+                              plane_bytes[i];
+    ggml_backend_buffer_t b = ggml_backend_cpu_buffer_from_ptr(
+        const_cast<void *>(planes[i]), view_bytes);
+    if (!b || ggml_backend_tensor_alloc(b, tensors[i],
+                                        const_cast<void *>(planes[i])) !=
+                 GGML_STATUS_SUCCESS) {
+      log_rebuild_failure(i == 0 ? "gate plane buffer" :
+                          (i == 1 ? "up plane buffer" : "down plane buffer"));
+      if (b)
+        ggml_backend_buffer_free(b);
+      ggml_free(ectx);
+      ggml_backend_buffer_free(rbuf);
+      ggml_free(rctx);
+      for (void *old : expert_bufs_)
+        if (old)
+          ggml_backend_buffer_free((ggml_backend_buffer_t)old);
+      expert_bufs_.clear();
+      return false;
+    }
+    ggml_backend_buffer_set_usage(b, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    expert_bufs_.push_back(b);
+  }
+  ggml_set_name(gate, "qwen4exp_decode_gate_experts");
+  ggml_set_name(up, "qwen4exp_decode_up_experts");
+  ggml_set_name(down, "qwen4exp_decode_down_experts");
+  if (use_shared_graph) {
+    auto bind_shared = [&](ggml_tensor *tensor,
+                           const GgmlSharedWeightRef &weight) {
+      const size_t required_bytes = tensor ? ggml_nbytes(tensor) : 0;
+      if (!tensor || !external_cuda_buf_ || !weight.device_data ||
+          weight.device_bytes < required_bytes) {
+        if (qwen_decode_sched_debug())
+          LOG_WARN("[GGML-QWEN-DECODE-SCHED] shared bind rejected name=%s "
+                   "ptr=%p external=%p bytes=%zu required=%zu type=%u "
+                   "shape=%lldx%lld meta_bytes=%zu\n",
+                   tensor ? tensor->name : "<null>", weight.device_data,
+                   (void *)external_cuda_buf_, weight.device_bytes,
+                   required_bytes, weight.type,
+                   tensor ? (long long)tensor->ne[0] : 0,
+                   tensor ? (long long)tensor->ne[1] : 0, weight.nbytes);
+        return false;
+      }
+      tensor->data = const_cast<void *>(weight.device_data);
+      tensor->buffer = (ggml_backend_buffer_t)external_cuda_buf_;
+      ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
+      return true;
+    };
+    if (!bind_shared(shared_gate, ref.shared_gate) ||
+        !bind_shared(shared_up, ref.shared_up) ||
+        !bind_shared(shared_down, ref.shared_down) ||
+        (ref.shared_has_gate &&
+         !bind_shared(shared_gate_inp, ref.shared_gate_inp))) {
+      log_rebuild_failure("shared weight binding");
+      ggml_free(ectx);
+      ggml_backend_buffer_free(rbuf);
+      ggml_free(rctx);
+      for (void *old : expert_bufs_)
+        if (old)
+          ggml_backend_buffer_free((ggml_backend_buffer_t)old);
+      expert_bufs_.clear();
+      return false;
+    }
+    ggml_set_name(shared_gate, "qwen4exp_decode_shared_gate");
+    ggml_set_name(shared_up, "qwen4exp_decode_shared_up");
+    ggml_set_name(shared_down, "qwen4exp_decode_shared_down");
+    if (shared_gate_inp)
+      ggml_set_name(shared_gate_inp, "qwen4exp_decode_shared_gate_inp");
+  }
+
+  ggml_init_params gip = {};
+  gip.mem_size = ggml_tensor_overhead() * 384 + ggml_graph_overhead();
+  gip.no_alloc = true;
+  ggml_context *gctx = ggml_init(gip);
+  if (!gctx) {
+    log_rebuild_failure("graph context");
+    ggml_free(ectx);
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  ggml_cgraph *graph = ggml_new_graph(gctx);
+  ggml_tensor *x = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, d_model_, 1);
+  if (!graph || !x) {
+    log_rebuild_failure("graph or input tensor");
+    ggml_free(gctx);
+    ggml_free(ectx);
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  ggml_set_input(x);
+  ggml_set_name(x, "qwen4exp_decode_router_input");
+  ggml_tensor *logits = ggml_mul_mat(gctx, router, x);
+  ggml_tensor *probs = logits ? ggml_soft_max(gctx, logits) : nullptr;
+  ggml_tensor *selection =
+      probs && bias ? ggml_add(gctx, probs, bias) : probs;
+  ggml_tensor *ids = selection
+                        ? ggml_cont(gctx,
+                                    ggml_argsort_top_k(gctx, selection, topk_))
+                        : nullptr;
+  ggml_tensor *probs3 = probs
+                            ? ggml_reshape_3d(gctx, probs, 1, n_experts_, 1)
+                            : nullptr;
+  ggml_tensor *weights = probs3 && ids
+                             ? ggml_get_rows(gctx, probs3, ids)
+                             : nullptr;
+  if (normalize_ && weights) {
+    ggml_tensor *w2 = ggml_reshape_2d(gctx, weights, topk_, 1);
+    ggml_tensor *sum = ggml_sum_rows(gctx, w2);
+    sum = ggml_clamp(gctx, sum, 6.103515625e-5f, INFINITY);
+    w2 = ggml_div(gctx, w2, sum);
+    weights = ggml_reshape_3d(gctx, w2, 1, topk_, 1);
+  }
+  if (weight_scale_ != 0.0f && weight_scale_ != 1.0f && weights)
+    weights = ggml_scale(gctx, weights, weight_scale_);
+  ggml_tensor *input3 = ggml_reshape_3d(gctx, x, d_model_, 1, 1);
+  ggml_tensor *gate_out = input3 && ids
+                              ? ggml_mul_mat_id(gctx, gate, input3, ids)
+                              : nullptr;
+  ggml_tensor *up_out = input3 && ids
+                            ? ggml_mul_mat_id(gctx, up, input3, ids)
+                            : nullptr;
+  ggml_tensor *act = gate_out && up_out
+                         ? ggml_swiglu_split(gctx, gate_out, up_out)
+                         : nullptr;
+  ggml_tensor *down_out = act && ids
+                              ? ggml_mul_mat_id(gctx, down, act, ids)
+                              : nullptr;
+  ggml_tensor *weighted = down_out && weights
+                              ? ggml_mul(gctx, down_out, weights)
+                              : nullptr;
+  ggml_tensor *result = nullptr;
+  if (weighted) {
+    for (int k = 0; k < topk_; ++k) {
+      ggml_tensor *e = ggml_view_2d(
+          gctx, weighted, d_model_, 1, weighted->nb[2],
+          (size_t)k * weighted->nb[1]);
+      result = k == 0 ? e : ggml_add(gctx, result, e);
+    }
+    if (topk_ > 1 && result)
+      result = ggml_cont(gctx, result);
+  }
+  ggml_tensor *graph_output = result;
+  if (use_shared_graph && result) {
+    ggml_tensor *shared_gate_out = ggml_mul_mat(gctx, shared_gate, x);
+    ggml_tensor *shared_up_out = ggml_mul_mat(gctx, shared_up, x);
+    ggml_tensor *shared_act =
+        (shared_gate_out && shared_up_out)
+            ? ggml_mul(gctx, ggml_silu(gctx, shared_gate_out), shared_up_out)
+            : nullptr;
+    if (ref.shared_clamp > 0.0f && shared_act)
+      shared_act = ggml_clamp(gctx, shared_act, -ref.shared_clamp,
+                              ref.shared_clamp);
+    ggml_tensor *shared =
+        shared_act ? ggml_mul_mat(gctx, shared_down, shared_act) : nullptr;
+    if (ref.shared_has_gate && shared) {
+      ggml_tensor *scalar = ggml_sigmoid(
+          gctx, ggml_mul_mat(gctx, shared_gate_inp, x));
+      shared = scalar ? ggml_mul(gctx, shared, scalar) : nullptr;
+    }
+    graph_output = shared ? ggml_add(gctx, result, shared) : nullptr;
+    if (!shared_gate_out || !shared_up_out || !shared_act || !shared ||
+        !graph_output) {
+      log_rebuild_failure("shared graph operation");
+      ggml_free(gctx);
+      ggml_free(ectx);
+      ggml_backend_buffer_free(rbuf);
+      ggml_free(rctx);
+      return false;
+    }
+    ggml_set_name(graph_output, "qwen4exp_decode_routed_plus_shared");
+  }
+  if (!logits || !probs || !selection || !ids || !probs3 || !weights ||
+      !input3 || !gate_out || !up_out || !act || !down_out || !weighted ||
+      !result || !graph_output) {
+    log_rebuild_failure("router or expert graph operation");
+    ggml_free(gctx);
+    ggml_free(ectx);
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  ggml_set_output(graph_output);
+  if (!use_shared_graph)
+    ggml_set_name(graph_output, "qwen4exp_decode_cpu_moe_output");
+  ggml_build_forward_expand(graph, graph_output);
+
+  ggml_backend_t backends[] = {(ggml_backend_t)cuda_backend_,
+                               (ggml_backend_t)cpu_backend_};
+  ggml_backend_sched_t sched =
+      ggml_backend_sched_new(backends, nullptr, 2, 4096, false, true);
+  // Force only the final routed+shared add to CUDA before allocation.  Its
+  // routed input is the CPU graph result, so the scheduler inserts one
+  // CPU->CUDA handoff there; the shared FFN stays on CUDA and no D2H routed
+  // result copy is needed.  The ordinary CPU-only graph keeps normal
+  // placement.
+  if (sched) {
+    // x is supplied by the device-resident HC path on every decode call.
+    // Explicitly classify the input as CUDA before allocation; otherwise the
+    // scheduler may place a harmless-looking reshape on CPU and the CPU
+    // executor will dereference the CUDA address as a host pointer.
+    ggml_backend_sched_set_tensor_backend(
+        sched, x, (ggml_backend_t)cuda_backend_);
+  }
+  if (sched && use_shared_graph)
+    ggml_backend_sched_set_tensor_backend(
+        sched, graph_output, (ggml_backend_t)cuda_backend_);
+  if (sched && qwen_decode_sched_debug()) {
+    // The scheduler's allocator can reject a mixed CUDA/CPU graph without
+    // exposing the assignment that caused the rejection.  Dump the resolved
+    // placement once, before alloc_graph(), so a Qwen-only experimental path
+    // can be diagnosed without changing the allocator or other model paths.
+    ggml_backend_sched_split_graph(sched, graph);
+    LOG_WARN("[GGML-QWEN-DECODE-SCHED] placement splits=%d nodes=%d output=%s\n",
+             ggml_backend_sched_get_n_splits(sched), ggml_graph_n_nodes(graph),
+             ggml_backend_name(ggml_backend_sched_get_tensor_backend(
+                 sched, graph_output)));
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+      ggml_tensor *node = ggml_graph_node(graph, i);
+      ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, node);
+      LOG_WARN("[GGML-QWEN-DECODE-SCHED] node=%d op=%s name=%s backend=%s "
+               "bytes=%zu support_cuda=%d support_cpu=%d buffer=%s\n",
+               i, ggml_op_name(node->op), node->name,
+               b ? ggml_backend_name(b) : "NULL", ggml_nbytes(node),
+               ggml_backend_supports_op((ggml_backend_t)cuda_backend_, node)
+                   ? 1
+                   : 0,
+               ggml_backend_supports_op((ggml_backend_t)cpu_backend_, node)
+                   ? 1
+                   : 0,
+               node->buffer ? ggml_backend_buffer_name(node->buffer) : "none");
+    }
+  }
+  if (!sched || !ggml_backend_sched_alloc_graph(sched, graph)) {
+    if (qwen_decode_sched_debug())
+      LOG_WARN("[GGML-QWEN-DECODE-SCHED] rebuild scheduler allocation failed "
+               "(sched=%p graph_nodes=%d shared=%d)\n",
+               (void *)sched, graph ? ggml_graph_n_nodes(graph) : -1,
+               use_shared_graph ? 1 : 0);
+    if (sched)
+      ggml_backend_sched_free(sched);
+    ggml_free(gctx);
+    ggml_free(ectx);
+    ggml_backend_buffer_free(rbuf);
+    ggml_free(rctx);
+    return false;
+  }
+  router_ctx_ = rctx;
+  router_buf_ = rbuf;
+  router_ = router;
+  bias_ = bias;
+  expert_ctx_ = ectx;
+  gate_ = gate;
+  up_ = up;
+  down_ = down;
+  shared_gate_ = shared_gate;
+  shared_up_ = shared_up;
+  shared_down_ = shared_down;
+  shared_gate_inp_ = shared_gate_inp;
+  shared_has_gate_ = use_shared_graph && ref.shared_has_gate;
+  shared_clamp_ = use_shared_graph ? ref.shared_clamp : 0.0f;
+  shared_gate_type_ = use_shared_graph ? ref.shared_gate.type : 0;
+  shared_up_type_ = use_shared_graph ? ref.shared_up.type : 0;
+  shared_down_type_ = use_shared_graph ? ref.shared_down.type : 0;
+  shared_gate_inp_type_ =
+      use_shared_graph && ref.shared_has_gate ? ref.shared_gate_inp.type : 0;
+  shared_graph_ = use_shared_graph;
+  router_external_ = ref.router_device != nullptr;
+  graph_ctx_ = gctx;
+  graph_ = graph;
+  sched_ = sched;
+  x_ = x;
+  output_ = graph_output;
+  ids_ = ids;
+  weights_ = weights;
+  gate_type_ = ref.gate_type;
+  up_type_ = ref.up_type;
+  down_type_ = ref.down_type;
+  expert_stride_ = ref.expert_stride;
+  ready_ = true;
+  LOG_INFO("[GGML-QWEN-DECODE-SCHED] persistent CUDA+CPU router/MUL_MAT_ID "
+           "graph active (D=%d experts=%d topk=%d router=%s shared=%s)\n",
+           d_model_, n_experts_, topk_,
+           ref.router_device ? "device" : "host-upload",
+           use_shared_graph ? "fused" : "fallback");
+  return true;
+}
+
+bool GgmlQwenDecodeGraphRunner::run(
+    const void *device_input, const GgmlQwenDecodeGraphRef &ref,
+    float *host_output, const void **device_output, int32_t *host_ids,
+    float *host_weights) {
+  // The caller owns the shape/device contract and calls ensure() before the
+  // first run.  Do not try to infer it here: on the first call all shape
+  // fields are zero, and doing so used to make an otherwise valid runner
+  // reject its first graph submission.  Keeping ensure() separate also lets
+  // the caller decline this path cleanly for lazy/non-arena layers.
+  if (device_output)
+    *device_output = nullptr;
+  if (!device_input || !cuda_backend_)
+    return false;
+  const bool wants_shared =
+      ref.shared_gate.device_data && ref.shared_up.device_data &&
+      ref.shared_down.device_data && ref.shared_gate.ne0 == d_model_ &&
+      ref.shared_up.ne0 == d_model_ &&
+      ref.shared_down.ne0 == ref.shared_gate.ne1 &&
+      ref.shared_gate.ne1 == ref.shared_up.ne1 &&
+      ref.shared_down.ne1 == d_model_ &&
+      ref.shared_gate.ne1 > 0 &&
+      (!ref.shared_has_gate ||
+       (ref.shared_gate_inp.device_data &&
+        ref.shared_gate_inp.ne0 == d_model_ &&
+        ref.shared_gate_inp.ne1 == 1)) &&
+      ref.shared_gate.type < (uint32_t)GGML_TYPE_COUNT &&
+      ref.shared_up.type < (uint32_t)GGML_TYPE_COUNT &&
+      ref.shared_down.type < (uint32_t)GGML_TYPE_COUNT &&
+      type_supported(ref.shared_gate.type) &&
+      type_supported(ref.shared_up.type) &&
+      type_supported(ref.shared_down.type) &&
+      (!ref.shared_has_gate ||
+       (ref.shared_gate_inp.type < (uint32_t)GGML_TYPE_COUNT &&
+        type_supported(ref.shared_gate_inp.type)));
+  if (!ready_ || gate_type_ != ref.gate_type || up_type_ != ref.up_type ||
+      down_type_ != ref.down_type || expert_stride_ != ref.expert_stride ||
+      ((bias_ != nullptr) != (ref.selection_bias != nullptr)) ||
+      shared_graph_ != wants_shared ||
+      router_external_ != (ref.router_device != nullptr)) {
+    if (!rebuild(ref)) {
+      if (qwen_decode_sched_debug())
+        LOG_WARN("[GGML-QWEN-DECODE-SCHED] run declined: graph rebuild "
+                 "failed (router=%s shared_request=%d)\n",
+                 ref.router_device ? "device" : "host", wants_shared ? 1 : 0);
+      return false;
+    }
+  }
+  if (!sched_)
+    return false;
+  const ggml_tensor *src = (const ggml_tensor *)device_input;
+  if (!src || src->type != GGML_TYPE_F32 || src->ne[0] != d_model_ ||
+      src->ne[1] < 1 || src->ne[2] != 1 || src->ne[3] != 1 ||
+      src->nb[0] != sizeof(float) ||
+      src->nb[1] != (size_t)d_model_ * sizeof(float) || !src->data ||
+      !src->buffer || (!ref.router_device && !ref.router_host) ||
+      !ref.gate_plane ||
+      !ref.up_plane || !ref.down_plane)
+    return false;
+
+  auto *router = (ggml_tensor *)router_;
+  if (ref.router_device) {
+    router->data = const_cast<void *>(ref.router_device);
+    router->buffer = (ggml_backend_buffer_t)external_cuda_buf_;
+    ggml_backend_buffer_init_tensor(router->buffer, router);
+  } else {
+    if (!router->buffer || ref.router_host_bytes < ggml_nbytes(router))
+      return false;
+    ggml_backend_tensor_set_async(
+        (ggml_backend_t)cuda_backend_, router, ref.router_host, 0,
+        ggml_nbytes(router));
+  }
+  if (bias_) {
+    if (!ref.selection_bias)
+      return false;
+    ggml_backend_tensor_set_async(
+        (ggml_backend_t)cuda_backend_, (ggml_tensor *)bias_,
+        ref.selection_bias, 0, (size_t)n_experts_ * sizeof(float));
+  }
+  ((ggml_tensor *)gate_)->data = const_cast<void *>(ref.gate_plane);
+  ((ggml_tensor *)up_)->data = const_cast<void *>(ref.up_plane);
+  ((ggml_tensor *)down_)->data = const_cast<void *>(ref.down_plane);
+  if (shared_graph_) {
+    auto rebind_shared = [&](void *opaque,
+                             const GgmlSharedWeightRef &weight) {
+      auto *tensor = (ggml_tensor *)opaque;
+      if (!tensor || !weight.device_data ||
+          weight.device_bytes < ggml_nbytes(tensor))
+        return false;
+      tensor->data = const_cast<void *>(weight.device_data);
+      tensor->buffer = (ggml_backend_buffer_t)external_cuda_buf_;
+      ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
+      return true;
+    };
+    if (!rebind_shared(shared_gate_, ref.shared_gate) ||
+        !rebind_shared(shared_up_, ref.shared_up) ||
+        !rebind_shared(shared_down_, ref.shared_down) ||
+        (shared_has_gate_ &&
+         !rebind_shared(shared_gate_inp_, ref.shared_gate_inp)))
+      return false;
+  }
+  // x_ was allocated and classified as a CUDA scheduler input.  Retargeting
+  // only its data pointer is safe because the HC producer and this scheduler
+  // share the same CUDA backend; the scheduler still owns the tensor's
+  // backend/buffer metadata and will create the CPU copy at the split.
+  ((ggml_tensor *)x_)->data = src->data;
+  if (ggml_backend_sched_graph_compute_async(
+          (ggml_backend_sched_t)sched_, (ggml_cgraph *)graph_) !=
+      GGML_STATUS_SUCCESS) {
+    if (qwen_decode_sched_debug())
+      LOG_WARN("[GGML-QWEN-DECODE-SCHED] graph compute submission failed "
+               "(shared=%d)\n",
+               shared_graph_ ? 1 : 0);
+    return false;
+  }
+  ggml_backend_sched_synchronize((ggml_backend_sched_t)sched_);
+  if (host_output)
+    ggml_backend_tensor_get((ggml_tensor *)output_, host_output, 0,
+                            (size_t)d_model_ * sizeof(float));
+  if (host_ids)
+    ggml_backend_tensor_get((ggml_tensor *)ids_, host_ids, 0,
+                            (size_t)topk_ * sizeof(int32_t));
+  if (host_weights)
+    ggml_backend_tensor_get((ggml_tensor *)weights_, host_weights, 0,
+                            (size_t)topk_ * sizeof(float));
+  if (device_output && shared_graph_)
+    *device_output = output_;
   return true;
 }
 
@@ -1926,6 +2955,8 @@ void GgmlMoeRunner::shutdown() {
       d_stage_slot_map_[i] = nullptr;
     }
     stage_slot_map_[i].clear();
+    d2d_slot_map_[i].clear();
+    packed_h2d_slot_map_[i].clear();
     if (ev_free_[i]) {
       cudaEventDestroy((cudaEvent_t)ev_free_[i]);
       ev_free_[i] = nullptr;
@@ -2525,6 +3556,8 @@ bool GgmlMoeRunner::ensure_stage_buffers(size_t bytes_per_buf) {
       d_stage_slot_map_[i] = nullptr;
     }
     stage_slot_map_[i].clear();
+    d2d_slot_map_[i].clear();
+    packed_h2d_slot_map_[i].clear();
     pending_[i] = false;
     copy_batch_started_[i] = false;
     direct_h2d_bytes_[i] = 0;
@@ -2584,6 +3617,8 @@ bool GgmlMoeRunner::ensure_stage_buffers(size_t bytes_per_buf) {
       return false;
     }
     stage_slot_map_[i].reserve((size_t)plan_.chunk_experts);
+    d2d_slot_map_[i].reserve((size_t)plan_.chunk_experts);
+    packed_h2d_slot_map_[i].reserve((size_t)plan_.chunk_experts);
   }
   stage_bytes_ = bytes_per_buf;
   stage_slot_capacity_ = plan_.chunk_experts;
@@ -2701,6 +3736,8 @@ bool GgmlMoeRunner::begin_copy_batch(int buf) {
     copy_batch_started_[buf] = true;
     pending_d2d_bytes_[buf] = 0;
     copy_split_recorded_[buf] = false;
+    d2d_slot_map_[buf].clear();
+    packed_h2d_slot_map_[buf].clear();
     return true;
   }
   if (!copy_stream_ || !ev_t0_[buf]) return false;
@@ -2715,6 +3752,8 @@ bool GgmlMoeRunner::begin_copy_batch(int buf) {
   pending_d2d_bytes_[buf] = 0;
   copy_split_recorded_[buf] = false;
   copy_batch_started_[buf] = true;
+  d2d_slot_map_[buf].clear();
+  packed_h2d_slot_map_[buf].clear();
   return true;
 }
 
@@ -2723,11 +3762,34 @@ bool GgmlMoeRunner::mark_copy_d2d_done(int buf) {
     return false;
   if (copy_split_recorded_[buf]) return true;
   cudaSetDevice(device_);
+  if (batch_d2d_unpack_ && use_packed_transfer() &&
+      !d2d_slot_map_[buf].empty()) {
+    if (!packed_base_ || !d_stage_slot_map_[buf]) return false;
+    const int count = (int)d2d_slot_map_[buf].size();
+    cudaError_t e = cudaMemcpyAsync(
+        d_stage_slot_map_[buf], d2d_slot_map_[buf].data(),
+        (size_t)count * sizeof(int32_t), cudaMemcpyHostToDevice,
+        (cudaStream_t)copy_stream_);
+    if (e == cudaSuccess) {
+      e = launch_ggml_moe_unpack_scatter(
+          packed_base_, w_gate_base_, w_up_base_, w_down_base_,
+          (const int32_t *)d_stage_slot_map_[buf], count,
+          weight_expert_stride_, gate_exp_bytes_, up_exp_bytes_,
+          down_exp_bytes_, gate_exp_bytes_, up_exp_bytes_, down_exp_bytes_,
+          (cudaStream_t)copy_stream_);
+    }
+    if (e != cudaSuccess) {
+      LOG_ERROR("[GGML-MOE] batched D2D unpack failed: %s\n",
+                cudaGetErrorString(e));
+      return false;
+    }
+  }
   if (!backend_copy_split_event_[buf] ||
       cudaEventRecord((cudaEvent_t)backend_copy_split_event_[buf],
                       (cudaStream_t)copy_stream_) != cudaSuccess)
     return false;
   copy_split_recorded_[buf] = true;
+  d2d_slot_map_[buf].clear();
   return true;
 }
 
@@ -3414,6 +4476,7 @@ void GgmlMoeRunner::account_copy_buffer(int buf) {
   copy_split_recorded_[buf] = false;
   h2d_timing_count_[buf] = 0;
   direct_h2d_bytes_[buf] = 0;
+  packed_h2d_slot_map_[buf].clear();
 }
 
 void GgmlMoeRunner::wait_stage_free(int buf) {
@@ -3480,6 +4543,11 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
     }
 
     const int compact_count = (int)slot_map.size();
+    const size_t direct_count =
+        batch_d2d_unpack_ ? packed_h2d_slot_map_[buf].size() : 0;
+    if (direct_count + (size_t)compact_count >
+        (size_t)plan_.chunk_experts)
+      return false;
     if (debug_check_device_output()) {
       int slot31_compact = -1;
       int slot63_compact = -1;
@@ -3496,30 +4564,46 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
                buf, first_expert, count, compact_count, slot31_compact,
                slot63_compact);
     }
+    size_t staged_bytes = 0;
     if (compact_count > 0) {
       const size_t bytes = weight_expert_stride_ * (size_t)compact_count;
+      staged_bytes = bytes;
       int h2d_timing_slot = -1;
       if (!begin_h2d_timing(buf, h2d_timing_slot)) return false;
       e = cudaMemcpyAsync(
-          packed_base_, h_stage_[buf], bytes, cudaMemcpyHostToDevice,
+          packed_base_ + direct_count * weight_expert_stride_, h_stage_[buf],
+          bytes, cudaMemcpyHostToDevice,
           (cudaStream_t)copy_stream_);
       if (!end_h2d_timing(buf, h2d_timing_slot)) return false;
-      if (e == cudaSuccess) {
-        e = cudaMemcpyAsync(
-            d_stage_slot_map_[buf], slot_map.data(),
-            (size_t)compact_count * sizeof(int32_t), cudaMemcpyHostToDevice,
-            (cudaStream_t)copy_stream_);
-      }
+    }
+    if (e == cudaSuccess && batch_d2d_unpack_ &&
+        !debug_check_device_output()) {
+      auto &combined_map = packed_h2d_slot_map_[buf];
+      combined_map.insert(combined_map.end(), slot_map.begin(), slot_map.end());
+    }
+    const int map_count = batch_d2d_unpack_
+                              ? (int)packed_h2d_slot_map_[buf].size()
+                              : compact_count;
+    const int32_t *map_host = batch_d2d_unpack_
+                                  ? packed_h2d_slot_map_[buf].data()
+                                  : slot_map.data();
+    if (e == cudaSuccess && map_count > 0) {
+      e = cudaMemcpyAsync(
+          d_stage_slot_map_[buf], map_host,
+          (size_t)map_count * sizeof(int32_t), cudaMemcpyHostToDevice,
+          (cudaStream_t)copy_stream_);
       if (e == cudaSuccess) {
         e = launch_ggml_moe_unpack_scatter(
-            packed_base_,
-            w_gate_base_, w_up_base_, w_down_base_,
-            (const int32_t *)d_stage_slot_map_[buf], compact_count,
+            packed_base_, w_gate_base_, w_up_base_, w_down_base_,
+            (const int32_t *)d_stage_slot_map_[buf], map_count,
             weight_expert_stride_, gate_exp_bytes_, up_exp_bytes_,
             down_exp_bytes_, gate_exp_bytes_, up_exp_bytes_, down_exp_bytes_,
             (cudaStream_t)copy_stream_);
       }
-      if (e == cudaSuccess && debug_check_device_output()) {
+    }
+    if (e == cudaSuccess && compact_count > 0 &&
+        debug_check_device_output() &&
+        !batch_d2d_unpack_) {
         // Diagnostic only: compare the edge rows immediately after the
         // device-local unpack, before MUL_MAT_ID consumes them.
         e = cudaStreamSynchronize((cudaStream_t)copy_stream_);
@@ -3582,10 +4666,10 @@ bool GgmlMoeRunner::push_chunk(int buf, int first_expert, int count,
           }
         }
       }
-      // The route-map upload is small but is still a real H2D operation; keep
-      // it in the source-specific accounting instead of silently dropping it.
-      total += bytes + (size_t)compact_count * sizeof(int32_t);
-    }
+    // The route-map upload is small but is still a real H2D operation; keep
+    // it in the source-specific accounting instead of silently dropping it.
+    if (e == cudaSuccess)
+      total += staged_bytes + (size_t)map_count * sizeof(int32_t);
   } else {
     // Walk maximal runs of consecutive staged experts. The reference path
     // keeps the established planar layout and deliberately does not use the
@@ -3682,19 +4766,33 @@ bool GgmlMoeRunner::copy_expert_h2d(int buf, int expert_index,
                           down_exp_bytes_, cudaMemcpyHostToDevice, st);
   } else {
     if (!packed_base_) return false;
-    // Direct calls are serialized on the same copy stream. Reuse slot zero
-    // in the chunk-sized packed buffer; the destination planar slot remains
-    // the global expert_index below.
-    e = cudaMemcpyAsync(packed_base_, src, weight_raw_expert_stride_,
-                        cudaMemcpyHostToDevice, st);
-    if (e == cudaSuccess) {
-      e = launch_ggml_moe_unpack(
-          packed_base_, w_gate_base_ + gate_exp_bytes_ * (size_t)expert_index,
-          w_up_base_ + up_exp_bytes_ * (size_t)expert_index,
-          w_down_base_ + down_exp_bytes_ * (size_t)expert_index, 1,
-          weight_expert_stride_, gate_exp_bytes_, up_exp_bytes_,
-          down_exp_bytes_, gate_exp_bytes_, up_exp_bytes_, down_exp_bytes_,
-          (cudaStream_t)copy_stream_);
+    if (batch_d2d_unpack_ && !debug_check_device_output()) {
+      // Direct RAM sources are already persistently pinned. Give each one a
+      // distinct packed record and defer the layout conversion until
+      // push_chunk(), where all direct-H2D and staged-H2D records can share
+      // one scatter-unpack launch.
+      const size_t compact = packed_h2d_slot_map_[buf].size();
+      if (compact >= (size_t)plan_.chunk_experts) return false;
+      e = cudaMemcpyAsync(
+          packed_base_ + compact * weight_expert_stride_, src,
+          weight_raw_expert_stride_, cudaMemcpyHostToDevice, st);
+      if (e == cudaSuccess)
+        packed_h2d_slot_map_[buf].push_back(expert_index);
+    } else {
+      // Legacy packed path: direct calls are serialized on the same copy
+      // stream, so one reusable record is sufficient.
+      e = cudaMemcpyAsync(packed_base_, src, weight_raw_expert_stride_,
+                          cudaMemcpyHostToDevice, st);
+      if (e == cudaSuccess) {
+        e = launch_ggml_moe_unpack(
+            packed_base_,
+            w_gate_base_ + gate_exp_bytes_ * (size_t)expert_index,
+            w_up_base_ + up_exp_bytes_ * (size_t)expert_index,
+            w_down_base_ + down_exp_bytes_ * (size_t)expert_index, 1,
+            weight_expert_stride_, gate_exp_bytes_, up_exp_bytes_,
+            down_exp_bytes_, gate_exp_bytes_, up_exp_bytes_, down_exp_bytes_,
+            (cudaStream_t)copy_stream_);
+      }
     }
   }
   if (!end_h2d_timing(buf, h2d_timing_slot)) return false;
@@ -3704,6 +4802,59 @@ bool GgmlMoeRunner::copy_expert_h2d(int buf, int expert_index,
     return false;
   }
   direct_h2d_bytes_[buf] += weight_raw_expert_stride_;
+  return true;
+}
+
+bool GgmlMoeRunner::copy_expert_h2d_strided(int buf, int first_expert,
+                                            int count, const void *src_slab,
+                                            size_t src_stride) {
+  if (!layer_ready_ || buf < 0 || buf >= NBUF || count <= 0 ||
+      first_expert < 0 || first_expert + count > plan_.n_experts ||
+      !src_slab || src_stride < weight_raw_expert_stride_)
+    return false;
+  if (use_packed_transfer()) {
+    const uint8_t *src = static_cast<const uint8_t *>(src_slab);
+    for (int i = 0; i < count; ++i) {
+      if (!copy_expert_h2d(buf, first_expert + i,
+                           src + (size_t)i * src_stride))
+        return false;
+    }
+    return true;
+  }
+  if (!begin_copy_batch(buf)) return false;
+
+  cudaSetDevice(device_);
+  cudaStream_t st = (cudaStream_t)copy_stream_;
+  if (!st) return false;
+  const uint8_t *src = static_cast<const uint8_t *>(src_slab);
+  const size_t rows = static_cast<size_t>(count);
+  int h2d_timing_slot = -1;
+  if (!begin_h2d_timing(buf, h2d_timing_slot)) return false;
+
+  cudaError_t e = cudaMemcpy2DAsync(
+      w_gate_base_ + gate_exp_bytes_ * (size_t)first_expert,
+      gate_exp_bytes_, src, src_stride, gate_exp_bytes_, rows,
+      cudaMemcpyHostToDevice, st);
+  if (e == cudaSuccess) {
+    e = cudaMemcpy2DAsync(
+        w_up_base_ + up_exp_bytes_ * (size_t)first_expert, up_exp_bytes_,
+        src + gate_exp_bytes_, src_stride, up_exp_bytes_, rows,
+        cudaMemcpyHostToDevice, st);
+  }
+  if (e == cudaSuccess) {
+    e = cudaMemcpy2DAsync(
+        w_down_base_ + down_exp_bytes_ * (size_t)first_expert, down_exp_bytes_,
+        src + gate_exp_bytes_ + up_exp_bytes_, src_stride, down_exp_bytes_,
+        rows, cudaMemcpyHostToDevice, st);
+  }
+  if (!end_h2d_timing(buf, h2d_timing_slot)) return false;
+  if (e != cudaSuccess) {
+    LOG_ERROR("[GGML-MOE] strided RAM H2D failed at compact expert=%d "
+              "count=%d: %s\n",
+              first_expert, count, cudaGetErrorString(e));
+    return false;
+  }
+  direct_h2d_bytes_[buf] += weight_raw_expert_stride_ * rows;
   return true;
 }
 
@@ -3741,8 +4892,28 @@ bool GgmlMoeRunner::copy_expert_d2d(int buf, int expert_index,
   // The VRAM cache stores an expert exactly as the RAM tier's slab does --
   // [gate|up|down] contiguous, no padding. Land it once in the packed device
   // buffer, then unpack into the three ordinary GGML planes.
-  // As with direct H2D, all D2D calls are ordered on the copy stream, so a
-  // single chunk-sized packed record is sufficient.
+  // As with direct H2D, all D2D calls are ordered on the copy stream.  The
+  // default path reuses one record and unpacks immediately.  The Qwen-only
+  // A/B path gives every queued D2D source its own record and defers one
+  // scatter-unpack for the whole chunk to mark_copy_d2d_done(); otherwise a
+  // cache hit costs one unpack kernel launch even though the copies are
+  // already naturally ordered.
+  if (batch_d2d_unpack_ && !debug_check_device_output()) {
+    const size_t compact = d2d_slot_map_[buf].size();
+    if (compact >= (size_t)plan_.chunk_experts) return false;
+    cudaError_t e = cudaMemcpyAsync(
+        packed_base_ + compact * weight_expert_stride_, src,
+        weight_raw_expert_stride_, cudaMemcpyDeviceToDevice, st);
+    if (e != cudaSuccess) {
+      LOG_ERROR("[GGML-MOE] batched weight D2D failed: %s\n",
+                cudaGetErrorString(e));
+      return false;
+    }
+    d2d_slot_map_[buf].push_back(expert_index);
+    pending_d2d_bytes_[buf] += weight_raw_expert_stride_;
+    raw_d2d_pending_ = true;
+    return true;
+  }
   cudaError_t e = cudaMemcpyAsync(
       packed_base_, src,
       weight_raw_expert_stride_, cudaMemcpyDeviceToDevice, st);
@@ -4804,6 +5975,10 @@ GgmlQwenSharedRunner &GgmlQwenSharedRunner::instance() {
   static GgmlQwenSharedRunner r;
   return r;
 }
+GgmlQwenSharedRunner &GgmlQwenSharedRunner::instance_for_layer(int layer) {
+  (void)layer;
+  return instance();
+}
 GgmlQwenSharedRunner::~GgmlQwenSharedRunner() {}
 void GgmlQwenSharedRunner::shutdown() {}
 bool GgmlQwenSharedRunner::ensure(int, int, int, int, bool, float) {
@@ -4821,9 +5996,38 @@ bool GgmlQwenSharedRunner::run_host_routed(int, const void *, const float *,
                                             const void **) {
   return false;
 }
+bool GgmlQwenSharedRunner::run_shared_only(int, const void *, const void **) {
+  return false;
+}
+bool GgmlQwenSharedRunner::run_host_routed_add(int, const float *,
+                                               const void **) {
+  return false;
+}
 bool GgmlQwenSharedRunner::copy_output_to_host(const void *, float *) {
   return false;
 }
+bool GgmlQwenSharedRunner::record_output_event() { return false; }
+
+bool GgmlQwenDecodeGraphRunner::compiled_in() { return false; }
+GgmlQwenDecodeGraphRunner &GgmlQwenDecodeGraphRunner::instance() {
+  static GgmlQwenDecodeGraphRunner r;
+  return r;
+}
+GgmlQwenDecodeGraphRunner &
+GgmlQwenDecodeGraphRunner::instance_for_signature(uint32_t, uint32_t,
+                                                  uint32_t, size_t) {
+  return instance();
+}
+GgmlQwenDecodeGraphRunner::~GgmlQwenDecodeGraphRunner() {}
+bool GgmlQwenDecodeGraphRunner::ensure(int, int, int, int, int, bool,
+                                       float) {
+  return false;
+}
+bool GgmlQwenDecodeGraphRunner::run(const void *, const GgmlQwenDecodeGraphRef &,
+                                    float *, const void **, int32_t *, float *) {
+  return false;
+}
+void GgmlQwenDecodeGraphRunner::shutdown() {}
 
 bool GgmlQwenDeviceCombineRunner::compiled_in() { return false; }
 GgmlQwenDeviceCombineRunner &GgmlQwenDeviceCombineRunner::instance() {
@@ -4871,6 +6075,10 @@ void GgmlMoeRunner::wait_stage_free(int) {}
 bool GgmlMoeRunner::push_chunk(int, int, int, const bool *) { return false; }
 bool GgmlMoeRunner::begin_copy_batch(int) { return false; }
 bool GgmlMoeRunner::copy_expert_h2d(int, int, const void *) { return false; }
+bool GgmlMoeRunner::copy_expert_h2d_strided(int, int, int, const void *,
+                                            size_t) {
+  return false;
+}
 bool GgmlMoeRunner::copy_expert_d2d(int, int, const void *) { return false; }
 bool GgmlMoeRunner::mark_copy_d2d_done(int) { return false; }
 void GgmlMoeRunner::sync_copies() {}

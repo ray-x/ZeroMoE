@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <numeric>
 #include <mutex>
+#include <chrono>
 
 #ifdef __APPLE__
 // macOS doesn't have posix_fadvise; provide no-op stubs. The function
@@ -417,6 +418,10 @@ public:
         int n_experts = 0;
         bool pinned = false;
         size_t host_reservation_bytes = 0;
+        // Shared graph arenas are immutable after the startup preload. Cache
+        // the complete-slot validation result so decode does not walk all
+        // experts again at every layer/token boundary.
+        mutable bool ready = false;
     };
     std::vector<GraphRamLayerArena> graph_ram_arenas;
     bool graph_ram_cache_enabled = false;
@@ -807,8 +812,9 @@ public:
     // the next layer's temporary active-layer area asynchronously; non-RAM
     // predictions use the ordinary disk/RAM hint path.
     bool qwen4exp_router_pilot_prefetch = false;
-    // 0 means qwen4exp_router_pilot_k. Kept separate so accuracy can remain
-    // measured over top-10 while only (for example) top-5 is prefetched.
+    // 0 means qwen4exp_router_pilot_k. A performance profile can set both
+    // values to 5, while a diagnostic/usage-collection profile can set
+    // pilot_k=10 and prefetch_k=5 to retain full top-10 rank reporting.
     int qwen4exp_router_pilot_prefetch_k = 0;
     // Layer indices excluded from Qwen estimation-based prefetch. Prediction
     // and accuracy collection remain enabled for excluded layers.
@@ -823,6 +829,10 @@ public:
     // GGML/CUDA MUL_MAT_ID graph for S==1. Other families never read this
     // switch; false preserves the established per-expert decode path.
     bool qwen4exp_decode_ggml_moe = false;
+    // Qwen-only Bee-style CUDA-router + CPU-MUL_MAT_ID scheduler topology.
+    // It is used only for complete immutable DDR arenas; lazy layers fall
+    // back to the normal cache/dispatch path.
+    bool qwen4exp_decode_scheduler = false;
     // Qwen-only S==1 HC -> router/MoE device handoff. Kept separate from
     // the grouped decode switch for controlled correctness/performance A/B.
     bool qwen4exp_decode_device_hc = false;
@@ -839,9 +849,18 @@ public:
     // only when cpu_affinity_layers selects a layer, so other models and the
     // normal GPU route are unchanged.
     bool qwen4exp_cpu_ggml_moe = false;
+    // Qwen-only direct DDR-strided grouped CPU projections. Other model
+    // families never consult this switch; false keeps the persistent GGML
+    // CPU graph as the default.
+    bool qwen4exp_cpu_strided_grouped = false;
+    // Qwen-only one-team fused gate/up -> SwiGLU -> down projections. This is
+    // consulted only by the direct DDR-strided CPU path.
+    bool qwen4exp_cpu_fused_grouped = false;
     // Overlap the Qwen CPU routed graph with the GPU shared expert when
     // cpu_affinity_layers is active. Other model families never consult it.
     bool qwen4exp_cpu_gpu_overlap = false;
+    int qwen4exp_cpu_gpu_overlap_max_layers = 16;
+    bool qwen4exp_cpu_shared_device = false;
 
     // Set from EngineConfig::glm5next_kda_gpu. The GLM5NEXT KDA recurrent
     // update itself runs on CUDA; the host mirror is synchronized only at
@@ -2482,6 +2501,7 @@ public:
     bool graph_ram_layer_ready(int layer) const {
         if (!graph_ram_layer_allocated(layer)) return false;
         const GraphRamLayerArena &arena = graph_ram_arenas[(size_t)layer];
+        if (arena.ready) return true;
         if (arena.n_experts <= 0 || (size_t)arena.n_experts > layers_experts[(size_t)layer].size())
             return false;
         for (int expert = 0; expert < arena.n_experts; ++expert) {
@@ -2493,6 +2513,7 @@ public:
                 !slot.up_proj.host_ptr || !slot.down_proj.host_ptr)
                 return false;
         }
+        arena.ready = true;
         return true;
     }
 

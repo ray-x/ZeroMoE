@@ -411,12 +411,19 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_router_pilot_skip_prefetch_excluded_layers =
       config.qwen4exp_router_pilot_skip_prefetch_excluded_layers;
   engine.qwen4exp_decode_ggml_moe = config.qwen4exp_decode_ggml_moe;
+  engine.qwen4exp_decode_scheduler = config.qwen4exp_decode_scheduler;
   engine.qwen4exp_decode_device_hc = config.qwen4exp_decode_device_hc;
   engine.qwen4exp_decode_batch_stage = config.qwen4exp_decode_batch_stage;
   engine.qwen4exp_decode_custom_hc_q8 = config.qwen4exp_decode_custom_hc_q8;
   engine.qwen4exp_decode_gpu_router = config.qwen4exp_decode_gpu_router;
   engine.qwen4exp_cpu_ggml_moe = config.qwen4exp_cpu_ggml_moe;
+  engine.qwen4exp_cpu_strided_grouped =
+      config.qwen4exp_cpu_strided_grouped;
+  engine.qwen4exp_cpu_fused_grouped = config.qwen4exp_cpu_fused_grouped;
   engine.qwen4exp_cpu_gpu_overlap = config.qwen4exp_cpu_gpu_overlap;
+  engine.qwen4exp_cpu_gpu_overlap_max_layers =
+      config.qwen4exp_cpu_gpu_overlap_max_layers;
+  engine.qwen4exp_cpu_shared_device = config.qwen4exp_cpu_shared_device;
   engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
   engine.glm5next_router_gpu = config.glm5next_router_gpu;
   engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
@@ -627,6 +634,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // every layer transition starting with the very first prefill token.
   set_prefetch_pilot_k(config.prefetch_pilot_k_per_layer,
                        config.prefetch_pilot_k);
+  // prefetch_pilot_k_adaptive (2026-09-13) -- narrows the pilot_k_for_layer
+  // ceiling above to each layer's own live most-confident ranks. See
+  // PilotKAdaptiveConfig's own comment (dense_dispatch.hpp).
+  set_pilot_k_adaptive_config(config.prefetch_pilot_k_adaptive,
+                              config.prefetch_pilot_k_adaptive_threshold,
+                              config.prefetch_pilot_k_adaptive_min_samples);
   // Same timing/reasoning as the pilot_k call directly above, for
   // EngineConfig::prefetch_pilot_depth / prefetch_pilot_k_depth2.
   set_prefetch_pilot_depth(config.prefetch_pilot_depth,
@@ -649,7 +662,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // (dense_dispatch.hpp).
   set_layer_promote_gate_config(config.ram_vram_promote_layer_gate,
                                 config.ram_vram_promote_layer_gate_threshold,
-                                config.ram_vram_promote_layer_gate_min_samples);
+                                config.ram_vram_promote_layer_gate_min_samples,
+                                config.ram_vram_promote_layer_gate_top_fraction);
   // Per-layer dynamic WIDTH (2026-08-26) -- graduates the veto above into
   // a smooth per-layer promotion width, see RamVramPromoteConfig's own
   // dynamic_* fields (dense_dispatch.hpp) and EngineConfig::ram_vram_
@@ -1074,6 +1088,24 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // mirrors this exact function, against the newly-added tensor set).
     if (name.find("hc_") != std::string::npos)
       return true;
+    // indexer.proj (DeepSeek-V4.1's Lightning Indexer projection) and
+    // engram_q/engram_k/engram_wkv (its Engram gate/projection weights --
+    // NOT engram_embd, the giant hash-embedding table that's deliberately
+    // kept mmap'd on NVMe and never reaches resident_layers at all, see
+    // deepseek41_engram.cpp) are real, per-token dense_proj targets that
+    // were simply missing from this allowlist. Found investigating a real
+    // ~10.7s/60-token-request CPU dequant-matmul cost that expert_calls'
+    // own "0 CPU" count couldn't explain -- t_cpu_dequant/t_cpu_dot are
+    // shared between the MoE CPU-fallback path and dense_proj's own,
+    // perf_timer.hpp's own comment on that. Individually tiny tensors, but
+    // engram_wkv fires per Engram layer per token and indexer.proj per
+    // CSA/HCA layer per token, so the CPU-vs-GPU gap compounds across a
+    // whole decode.
+    if (name.find("indexer.proj.weight") != std::string::npos ||
+        name.find("engram_wkv.weight") != std::string::npos ||
+        name.find("engram_q.weight") != std::string::npos ||
+        name.find("engram_k.weight") != std::string::npos)
+      return true;
     // ssm_/ple_ catch Qwen4Exp's GDN recurrent-layer tensors (ssm_conv1d,
     // ssm_beta/alpha, ssm_out, ssm_norm, ...) and PLE layer tensors --
     // all resident, per-token dense_proj targets, same "resident and
@@ -1444,6 +1476,11 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // projections).
     if (name.find("hc_") != std::string::npos)
       return "hyper_connections (hc_*)";
+    if (name.find("indexer.proj.weight") != std::string::npos ||
+        name.find("engram_wkv.weight") != std::string::npos ||
+        name.find("engram_q.weight") != std::string::npos ||
+        name.find("engram_k.weight") != std::string::npos)
+      return "indexer/engram (DeepSeek-V4.1 gate projections)";
     if (name.find("shexp") != std::string::npos)
       return "shared_expert (shexp)";
     if (name.find("ffn_gate.weight") != std::string::npos ||
@@ -2202,10 +2239,24 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       // "0.1" means the same relative thing (10% of that tier's own
       // real capacity) regardless of how much VRAM/RAM a given
       // deployment actually has.
-      int moe_layers = std::max(1, (int)by_layer.size());
+      // CPU-affinity layers have no physical VRAM region and must not
+      // consume a share of the VRAM preload budget.  The compact planner
+      // redistributes their bytes to GPU-executed layers, so dividing the
+      // same target by all model layers leaves those newly available slots
+      // empty (for example, 8 CPU layers used to cap the remaining 40
+      // layers at 206 pins each even though their regions could hold ~248).
+      // Keep the all-layer count for RAM policy/reporting, but use this
+      // GPU-only count for every VRAM budget calculation.
+      const int moe_layers = std::max(1, (int)by_layer.size());
+      int vram_moe_layers = 0;
+      for (const auto &[layer, v] : by_layer) {
+        if (!v.empty() && !is_cpu_affinity_layer(layer))
+          ++vram_moe_layers;
+      }
+      vram_moe_layers = std::max(1, vram_moe_layers);
       double avg_vram_slots_per_layer =
           (double)ram_mgr.vram_cache->expert_vram_cache_cap /
-          (double)moe_layers;
+          (double)vram_moe_layers;
 
       int topk = config.pin_topk_per_layer;
       if (topk <= 0) {
@@ -2225,10 +2276,18 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       bool global_topn = (config.pin_strategy == "global_topn");
       if (max_pinned_total > 0 && !global_topn) {
         // Adjust topk per layer to respect the global pinned cap
-        topk = std::min(topk, max_pinned_total / moe_layers);
+        // When auto-sizing, round up the average rather than flooring it.
+        // The physical compact-layer cap below trims the few layers whose
+        // region is smaller, allowing the preload loop to consume the final
+        // remainder slots instead of stranding one slot per layer.
+        if (config.pin_topk_per_layer <= 0)
+          topk = std::max(topk, (int)std::ceil(avg_vram_slots_per_layer));
+        topk = std::min(topk, max_pinned_total / vram_moe_layers);
         LOG_STREAM_INFO() << "[PIN] Three-tier: capped per-layer topk to "
                           << topk << " (global cap: " << max_pinned_total
-                          << " experts across " << moe_layers << " layers)\n";
+                          << " experts across " << vram_moe_layers
+                          << " GPU-executed layers; " << moe_layers
+                          << " total MoE layers)\n";
       }
 
       int vram_lru_n =
@@ -2299,9 +2358,11 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                      (int)engine.model_file.architecture_config.n_layers);
         const int effective_cap =
             max_pinned_total > 0 ? max_pinned_total
-                                 : (int)(avg_vram_slots_per_layer * moe_layers);
+                                 : (int)(avg_vram_slots_per_layer * vram_moe_layers);
         int assigned = 0;
         for (int layer = 0; layer < prefix_end; ++layer) {
+          if (is_cpu_affinity_layer(layer))
+            continue;
           auto it = by_layer.find(layer);
           if (it == by_layer.end())
             continue;
@@ -2327,6 +2388,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         int floor_n = std::max(0, config.pin_global_floor_per_layer);
         int floor_total = 0;
         for (auto &[layer, v] : by_layer) {
+          if (is_cpu_affinity_layer(layer)) {
+            layer_pin_count[layer] = 0;
+            continue;
+          }
           int f = std::min(floor_n, (int)v.size());
           if (!compact_layer_capacity.empty()) {
             auto cap_it = compact_layer_capacity.find(layer);
@@ -2343,6 +2408,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         };
         std::vector<GlobalCand> remainder;
         for (auto &[layer, v] : by_layer) {
+          if (is_cpu_affinity_layer(layer))
+            continue;
           int f = layer_pin_count[layer];
           for (int i = f; i < (int)v.size(); ++i)
             remainder.push_back({layer, v[i].count});
@@ -2370,7 +2437,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         // expert ever routed to and blow far past physical VRAM capacity.
         int effective_cap = (max_pinned_total > 0)
                                 ? max_pinned_total
-                                : (int)(avg_vram_slots_per_layer * moe_layers);
+                                : (int)(avg_vram_slots_per_layer * vram_moe_layers);
         int remaining_budget = std::max(0, effective_cap - floor_total);
         int take = 0;
         for (const GlobalCand &candidate : remainder) {
@@ -2396,8 +2463,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                                   ? ""
                                   : " (pinned_vram_capacity unset -- capped to "
                                     "real VRAM pool size instead)")
-                          << " target pins across " << moe_layers
-                          << " layer(s)\n";
+                          << " target pins across " << vram_moe_layers
+                          << " GPU-executed layer(s) (" << moe_layers
+                          << " total MoE layers)\n";
       }
 
       // pin_core_gpu_top_n: of the experts layer_pin_count[] just
@@ -2533,9 +2601,11 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           if (layer_total == 0)
             continue;
           uint64_t topk_sum = 0;
-          int k = (global_topn || prefix_vram)
-                      ? std::min(layer_pin_count[layer], (int)v.size())
-                      : std::min(topk, (int)v.size());
+          int k = is_cpu_affinity_layer(layer)
+                      ? 0
+                      : ((global_topn || prefix_vram)
+                             ? std::min(layer_pin_count[layer], (int)v.size())
+                             : std::min(topk, (int)v.size()));
           for (int i = 0; i < k; ++i)
             topk_sum += v[i].count;
           double coverage = (double)topk_sum / (double)layer_total;
@@ -2699,6 +2769,15 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
             layer_max = std::min(
                 {topk, (int)v.size(), max_pinned_total - total_pinned});
           }
+        }
+        // Compact VRAM has a separate physical region per layer.  The
+        // auto-sized top-k may round up by one, so never ask a region to
+        // accept more experts than the planner actually allocated for it.
+        if (!compact_layer_capacity.empty()) {
+          auto cap_it = compact_layer_capacity.find(layer);
+          layer_max = std::min(
+              layer_max,
+              cap_it == compact_layer_capacity.end() ? 0 : cap_it->second);
         }
         // Tier 2/3 start right after however many THIS layer got
         // pinned -- for per_layer_topk that's always exactly topk
@@ -3000,11 +3079,20 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
 
       // Three-tier caching: Log final pinned count
       if (max_pinned_total > 0) {
+        const int physical_vram_target = std::min(
+            max_pinned_total,
+            (int)std::min<size_t>(
+                ram_mgr.vram_cache->expert_vram_cache_cap,
+                (size_t)std::numeric_limits<int>::max()));
         LOG_STREAM_INFO() << "[PIN] Three-tier: " << total_pinned
-                          << " experts pinned (target: " << max_pinned_total
-                          << ") across " << moe_layers << " layers ("
-                          << (total_pinned >= max_pinned_total ? "target met"
-                                                               : "below target")
+                          << " experts pinned (target: " << physical_vram_target
+                          << ", configured: " << max_pinned_total
+                          << ") across " << vram_moe_layers
+                          << " GPU-executed layers (" << moe_layers
+                          << " total MoE layers; CPU-affinity layers excluded) ("
+                          << (total_pinned >= physical_vram_target
+                                  ? "target met"
+                                  : "below target")
                           << ")\n";
       }
     }
@@ -3025,6 +3113,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                         << allocated
                         << " arena layer(s) have the required expert-ID"
                            " mapping and host tensor views\n";
+
     }
   }
 
@@ -3490,6 +3579,11 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                                  // capacity (P1+P2)  // [PILOT-WIDE]:
                                  // pilot_widen_all_tokens real recall/coverage
                                  // measurement
+  extern void deepseek41_engram_print_cache_stats();
+  deepseek41_engram_print_cache_stats(); // [DSV41-ENGRAM-CACHE]: real
+                                         // hit-rate for the Engram row
+                                         // cache (goal item 4), never
+                                         // measured before this session
 
   double session_elapsed_s =
       std::chrono::duration<double>(std::chrono::high_resolution_clock::now() -
@@ -3756,6 +3850,7 @@ int main(int argc, char *argv[]) {
   set_moe_ggml_gpu_router(config.moe_ggml_gpu_router);
   set_moe_ggml_device(config.moe_ggml_device);
   set_ggml_hc_async_graph_reuse(config.ggml_async_graph_reuse);
+  set_qwen_hc_async_readback(config.qwen4exp_hc_async_readback);
   set_ggml_moe_async_graph_reuse(config.ggml_async_graph_reuse);
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GGML shared expert: "
                     << (config.moe_ggml_shared_expert ? "ON" : "off")
@@ -3763,12 +3858,22 @@ int main(int argc, char *argv[]) {
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode device HC handoff: "
                     << (config.qwen4exp_decode_device_hc ? "ON" : "off")
                     << " (Qwen S=1 only)\n";
+  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp Bee-style decode scheduler: "
+                    << (config.qwen4exp_decode_scheduler ? "ON" : "off")
+                    << " (complete DDR arenas only; lazy layers use the "
+                       "legacy path)\n";
+  LOG_STREAM_INFO() << "[CONFIG] Qwen CPU routed->device shared handoff: "
+                    << (config.qwen4exp_cpu_shared_device ? "ON" : "off")
+                    << " (CPU-affinity layers only; Qwen-only)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode batch RAM staging: "
                     << (config.qwen4exp_decode_batch_stage ? "ON" : "off")
                     << " (Qwen S=1 only; direct pinned-slab path otherwise)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp custom exact-Q8 HC decode: "
                     << (config.qwen4exp_decode_custom_hc_q8 ? "ON" : "off")
                     << " (requires device HC; Qwen-only)\n";
+  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp async HC readback: "
+                    << (config.qwen4exp_hc_async_readback ? "ON" : "off")
+                    << " (pinned D2H staging; Qwen CPU-affinity path only)\n";
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp GPU router during S==1 decode: "
                     << (config.qwen4exp_decode_gpu_router ? "ON" : "off")
                     << " (batched prefill still follows moe_ggml_gpu_router; "
@@ -3838,7 +3943,7 @@ int main(int argc, char *argv[]) {
                     << ", excluded layers=" << qwen_prefetch_excluded
                     << ", predict layers=" << qwen_predict_layers << ")\n";
   LOG_STREAM_INFO()
-      << "[CONFIG] Qwen pilot skip fully VRAM-resident decode layers: "
+      << "[CONFIG] Qwen pilot skip cache-stable decode layers: "
       << (config.qwen4exp_router_pilot_skip_fully_cached ? "ON" : "off")
       << "\n";
   LOG_STREAM_INFO()

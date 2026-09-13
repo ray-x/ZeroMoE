@@ -185,6 +185,17 @@ struct PerfCounters {
                                              // in the post-dequant AVX-512 dot
                                              // product (dot_f32_avx512), summed
                                              // across OMP worker threads.
+    // Opt-in wall-clock stages for Qwen4Exp's direct DDR-strided grouped
+    // CPU path.  These are deliberately separate from t_cpu_dequant/t_cpu_dot:
+    // the grouped GGML kernels do not expose their internal per-worker split,
+    // and the useful question here is which whole stage delays the decode
+    // thread (gate/up, SwiGLU, down, or weighted combine).  The counters stay
+    // zero unless MOESTREAM_QWEN_CPU_STAGE_TIMING=1 is set, so the normal
+    // path pays no extra clock reads.
+    std::atomic<double> t_qwen_cpu_grouped_gate_up{0};
+    std::atomic<double> t_qwen_cpu_grouped_swiglu{0};
+    std::atomic<double> t_qwen_cpu_grouped_down{0};
+    std::atomic<double> t_qwen_cpu_grouped_combine{0};
     std::atomic<double> t_attn{0};          // MLA attention forward (total)
     // Untimed setup before the first named sub-phase (arch-config reads,
     // rope_theta lookup via get_config_float, string prefix build) -- added
@@ -1089,6 +1100,13 @@ struct PerfCounters {
     std::atomic<uint64_t> n_qwen_pilot_skipped_fully_cached{0};
     std::atomic<uint64_t> n_qwen_pilot_skipped_prefetch_excluded{0};
     std::atomic<uint64_t> n_qwen_pilot_skipped_predict_policy{0};
+    // Qwen-only adaptive pilot bypass.  Unlike layer_fully_resident(), this
+    // tracks the actual routed top-k set seen by decode, not all experts in
+    // the layer.  A short streak prevents one lucky token from suppressing
+    // the pilot before the route has demonstrated cache stability.
+    std::atomic<uint64_t> n_qwen_pilot_adaptive_residency_checks{0};
+    std::atomic<uint64_t> n_qwen_pilot_adaptive_residency_misses{0};
+    std::atomic<uint64_t> n_qwen_pilot_adaptive_skips{0};
     static constexpr int kQwenPilotMaxRanks = 16;
     // Per-predicted-rank membership accuracy. A hit means the expert at
     // predicted rank r belongs to the real router's top-k set; this is the
@@ -1425,6 +1443,19 @@ struct PerfCounters {
     // for DEPTH-2), not the layer the prediction was made FROM.
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot_recall_hits_by_layer{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot_recall_topk_sum_by_layer{};
+    // TEMPORARY DIAGNOSTIC (2026-09-13): n_pilot_recall_hits_by_rank above
+    // (rank-only, summed across ALL layers) and n_pilot_recall_hits_by_layer
+    // above (layer-only, summed across ALL ranks) are both marginals --
+    // neither answers "for layer L specifically, is rank 0 more reliable
+    // than rank 3." Real question: this session's own per-layer routing
+    // concentration table shows top-8 share ranging ~16%-36% across
+    // layers, so the high-confidence-rank cutoff plausibly varies by
+    // layer too. Genuine 2D cross table: [layer][rank].
+    // kMaxTrackedLayersForMiss x 8 = 1024 atomics, trivial.
+    std::array<std::array<std::atomic<uint32_t>, 8>, kMaxTrackedLayersForMiss>
+        n_pilot_recall_hits_by_layer_rank{};
+    std::array<std::array<std::atomic<uint32_t>, 8>, kMaxTrackedLayersForMiss>
+        n_pilot_recall_checks_by_layer_rank{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot_recall_checks_by_layer{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot_attn_recall_hits_by_layer{};
     std::array<std::atomic<uint32_t>, kMaxTrackedLayersForMiss> n_pilot_attn_recall_topk_sum_by_layer{};
@@ -2793,6 +2824,8 @@ struct PerfCounters {
     struct Snapshot {
         double t_disk_read=0, t_host_alloc=0, t_gpu_upload=0, t_expert_gpu_upload=0, t_gpu_download=0, t_gpu_compute=0, t_expert_silu_activation=0, t_cpu_expert=0;
         double t_cpu_dequant=0, t_cpu_dot=0;
+        double t_qwen_cpu_grouped_gate_up=0, t_qwen_cpu_grouped_swiglu=0;
+        double t_qwen_cpu_grouped_down=0, t_qwen_cpu_grouped_combine=0;
         double t_attn=0;
         double t_attn_preamble=0;
         double t_attn_norm=0, t_attn_qproj=0, t_attn_kvproj=0, t_attn_absorb=0, t_attn_score=0, t_attn_outproj=0;
@@ -2862,6 +2895,10 @@ struct PerfCounters {
                 t_expert_silu_activation - b.t_expert_silu_activation,
                 t_cpu_expert - b.t_cpu_expert,
                 t_cpu_dequant - b.t_cpu_dequant, t_cpu_dot - b.t_cpu_dot,
+                t_qwen_cpu_grouped_gate_up - b.t_qwen_cpu_grouped_gate_up,
+                t_qwen_cpu_grouped_swiglu - b.t_qwen_cpu_grouped_swiglu,
+                t_qwen_cpu_grouped_down - b.t_qwen_cpu_grouped_down,
+                t_qwen_cpu_grouped_combine - b.t_qwen_cpu_grouped_combine,
                 t_attn - b.t_attn,
                 t_attn_preamble - b.t_attn_preamble,
                 t_attn_norm - b.t_attn_norm, t_attn_qproj - b.t_attn_qproj,
@@ -2945,6 +2982,8 @@ struct PerfCounters {
             t_expert_silu_activation.load(),
             t_cpu_expert.load(),
             t_cpu_dequant.load(), t_cpu_dot.load(),
+            t_qwen_cpu_grouped_gate_up.load(), t_qwen_cpu_grouped_swiglu.load(),
+            t_qwen_cpu_grouped_down.load(), t_qwen_cpu_grouped_combine.load(),
             t_attn.load(),
             t_attn_preamble.load(),
             t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
@@ -3031,6 +3070,21 @@ struct PerfCounters {
             (unsigned long long)d.n_expert_gpu_calls, (unsigned long long)d.n_expert_cpu_calls,
             (unsigned long long)d.n_prefetch_hits, (unsigned long long)d.n_pinned_eviction_skips,
             (unsigned long long)d.n_pinned_resident);
+        // Do not print this for the per-token DEBUG/INFO snapshots.  The
+        // counters are intended to explain a whole request; emitting a line
+        // on every token would itself perturb a short decode benchmark.
+        if (label && label[0] != 'T' &&
+            (d.t_qwen_cpu_grouped_gate_up > 0.0 ||
+            d.t_qwen_cpu_grouped_swiglu > 0.0 ||
+            d.t_qwen_cpu_grouped_down > 0.0 ||
+            d.t_qwen_cpu_grouped_combine > 0.0)) {
+            LOG_INFO("[%s] Qwen direct CPU stages: gate/up=%.3fs SwiGLU=%.3fs "
+                     "down=%.3fs combine=%.3fs (opt-in wall-clock timing)\n",
+                     label, d.t_qwen_cpu_grouped_gate_up,
+                     d.t_qwen_cpu_grouped_swiglu,
+                     d.t_qwen_cpu_grouped_down,
+                     d.t_qwen_cpu_grouped_combine);
+        }
         if (d.bytes_ggml_moe_d2d > 0 || d.bytes_ggml_moe_h2d > 0) {
             const double d2d_gb = d.bytes_ggml_moe_d2d / 1e9;
             const double h2d_gb = d.bytes_ggml_moe_h2d / 1e9;
@@ -3487,6 +3541,17 @@ struct PerfCounters {
                  n_expert_gpu_calls > 0 ? 1000.0 * t_expert_silu_activation / n_expert_gpu_calls : 0.0);
         LOG_INFO("CPU expert (fallback):%7.3f s  (dequant=%.3fs dot=%.3fs)\n",
                  t_cpu_expert.load(), t_cpu_dequant.load(), t_cpu_dot.load());
+        if (t_qwen_cpu_grouped_gate_up.load() > 0.0 ||
+            t_qwen_cpu_grouped_swiglu.load() > 0.0 ||
+            t_qwen_cpu_grouped_down.load() > 0.0 ||
+            t_qwen_cpu_grouped_combine.load() > 0.0) {
+            LOG_INFO("Qwen direct CPU stages: gate/up=%.3fs SwiGLU=%.3fs "
+                     "down=%.3fs combine=%.3fs (opt-in wall-clock timing)\n",
+                     t_qwen_cpu_grouped_gate_up.load(),
+                     t_qwen_cpu_grouped_swiglu.load(),
+                     t_qwen_cpu_grouped_down.load(),
+                     t_qwen_cpu_grouped_combine.load());
+        }
         LOG_INFO("Attention (MLA):     %8.3f s  (preamble=%.3f norm=%.3f qproj=%.3f kvproj=%.3f absorb=%.3f score=%.3f "
                  "outproj=%.3f [outproj_dequant=%.3f])\n",
                  t_attn.load(), t_attn_preamble.load(), t_attn_norm.load(), t_attn_qproj.load(), t_attn_kvproj.load(),
@@ -5513,6 +5578,46 @@ inline void report_pilot_recall_by_layer() {
                  "any config, gathered purely to inform a future per-layer speculation policy.\n",
                  layers_seen);
     }
+    // TEMPORARY DIAGNOSTIC (2026-09-13): the real [layer][rank] cross
+    // table for DEPTH-1, requested directly -- see n_pilot_recall_hits_
+    // by_layer_rank's own comment (PerfCounters) for why the two existing
+    // marginal breakdowns above (by rank alone, by layer alone) can't
+    // answer "for layer L specifically, is rank 0 more reliable than
+    // rank 3." rank_i here means the i-th highest-confidence prediction
+    // DEPTH-1 made for that layer (0 = most confident).
+    {
+        int lr_layers_seen = 0;
+        for (int l = 0; l < PerfCounters::kMaxTrackedLayersForMiss; ++l) {
+            uint32_t row_checks = 0;
+            for (int rk = 0; rk < 8; ++rk)
+                row_checks += p.n_pilot_recall_checks_by_layer_rank[l][rk].load(std::memory_order_relaxed);
+            if (row_checks == 0) continue;
+            if (lr_layers_seen == 0) {
+                LOG_INFO("[PILOT-BY-LAYER-RANK] DEPTH-1 accuracy for layer L at rank k (k=0 is the "
+                         "single most-confident prediction for that layer, k=7 the least) -- the real "
+                         "cross table, not a marginal:\n");
+            }
+            ++lr_layers_seen;
+            std::string row = "  layer=" + std::to_string(l) + " ";
+            char cell[24];
+            for (int rk = 0; rk < 8; ++rk) {
+                uint32_t hits = p.n_pilot_recall_hits_by_layer_rank[l][rk].load(std::memory_order_relaxed);
+                uint32_t checks = p.n_pilot_recall_checks_by_layer_rank[l][rk].load(std::memory_order_relaxed);
+                if (checks == 0) { std::snprintf(cell, sizeof(cell), "k%d=--  ", rk); }
+                else {
+                    std::snprintf(cell, sizeof(cell), "k%d=%4.1f%%(%u) ", rk,
+                                  100.0 * (double)hits / (double)checks, checks);
+                }
+                row += cell;
+            }
+            row += "\n";
+            LOG_STREAM_INFO() << row;
+        }
+        if (lr_layers_seen > 0) {
+            LOG_INFO("[PILOT-BY-LAYER-RANK] %d layer(s) tracked, real cross table (not a marginal).\n",
+                     lr_layers_seen);
+        }
+    }
 }
 
 inline void report_qwen4exp_pilot_stats() {
@@ -5533,7 +5638,9 @@ inline void report_qwen4exp_pilot_stats() {
             std::memory_order_relaxed);
     if (predictions == 0 && checks == 0 && sync_fail == 0 &&
         skipped_fully_cached == 0 && skipped_prefetch_excluded == 0 &&
-        skipped_predict_policy == 0)
+        skipped_predict_policy == 0 &&
+        p.n_qwen_pilot_adaptive_residency_checks.load(
+            std::memory_order_relaxed) == 0)
         return;
 
     const uint64_t hits =
@@ -5560,6 +5667,14 @@ inline void report_qwen4exp_pilot_stats() {
              (unsigned long long)skipped_prefetch_excluded);
     LOG_INFO("[QWEN-PILOT] prediction policy skips: allow-list=%llu\n",
              (unsigned long long)skipped_predict_policy);
+    LOG_INFO("[QWEN-PILOT] adaptive hot-set: checks=%llu misses=%llu "
+             "stable_skips=%llu (two consecutive all-resident routes)\n",
+             (unsigned long long)p.n_qwen_pilot_adaptive_residency_checks.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_adaptive_residency_misses.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)p.n_qwen_pilot_adaptive_skips.load(
+                 std::memory_order_relaxed));
     LOG_INFO("[QWEN-PILOT] load coverage: already_ram=%llu already_vram=%llu "
              "needs_fetch=%llu hints_pushed=%llu hints_skipped_resident=%llu\n",
              (unsigned long long)p.n_qwen_pilot_pred_already_ram.load(
@@ -5702,6 +5817,11 @@ inline void report_qwen4exp_pilot_stats() {
             p.n_qwen_pilot_recall_pred_size_sum_by_layer[l].load(
                 std::memory_order_relaxed);
         const double la = lp > 0 ? 100.0 * (double)lh / (double)lp : 0.0;
+        // Performance runs may predict only the active prefetch K (currently
+        // five), while diagnostic runs can use the full top-10. Derive the
+        // label from the observed candidate count instead of hard-coding it.
+        const uint32_t predicted_k =
+            lc > 0 ? (lp + lc / 2) / lc : 0;
         const uint32_t plc =
             p.n_qwen_pilot_prefetch_recall_checks_by_layer[l].load(
                 std::memory_order_relaxed);
@@ -5742,9 +5862,9 @@ inline void report_qwen4exp_pilot_stats() {
                           100.0 * (double)rh / (double)rc);
             layer_rank_line += part;
         }
-        LOG_INFO("[QWEN-PILOT] layer=%-3d top-10=%u/%u (%.1f%%) checks=%u%s "
+        LOG_INFO("[QWEN-PILOT] layer=%-3d top-%u=%u/%u (%.1f%%) checks=%u%s "
                  "ranks:%s\n",
-                 l, lh, lp, la, lc, prefetch_part,
+                 l, predicted_k, lh, lp, la, lc, prefetch_part,
                  layer_rank_line.empty() ? " none" : layer_rank_line.c_str());
     }
     if (layers_seen > 0) {

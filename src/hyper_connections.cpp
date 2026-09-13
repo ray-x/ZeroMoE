@@ -26,6 +26,7 @@
 #include "hyper_connections.hpp"
 #include "kquant_dequant.hpp" // dequant_row (find_resident_float_anytype)
 #include "tensor_trace.hpp"
+#include <atomic>
 #include <cstdlib>
 #include <chrono>
 #include <cmath>
@@ -208,7 +209,21 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
       pre_gate[h] = hc_sigmoid(row[h] * scale_pre + b) + c.hc_eps;
     }
     const float *collapse_mix = pre_gate.data();
-    if (sub_block == 0) {
+    // GLM5NEXT's reference graph calls build_hc_pre() independently for
+    // attention and FFN, and each call immediately collapses the current
+    // streams with that call's newly computed `pre` tensor.  The pending
+    // previous-FFN carry below is the DeepSeek-V4.1 host-path contract; using
+    // it for GLM makes the first attention block use the one-hot bootstrap
+    // vector and every later attention block use the previous FFN gate,
+    // instead of GLM's learned per-block attention gate.  That changes the
+    // model function and can produce incoherent text even when all values
+    // remain finite.  Keep the existing carry behavior isolated to the
+    // families that use it so GLM5NEXT follows llama.cpp's glm5next.cpp.
+    const bool glm5next_reference_hc =
+        detect_model_family(engine.model_file) == ModelFamily::GLM5NEXT;
+    if (glm5next_reference_hc) {
+      collapse_mix = pre_gate.data();
+    } else if (sub_block == 0) {
       std::memcpy(engine.hc_attn_pre_mix.data() + (size_t)s * HC,
                   pre_gate.data(), (size_t)HC * sizeof(float));
       collapse_mix = engine.hc_pending_pre_mix.data() + (size_t)s * HC;
@@ -885,10 +900,27 @@ void qwen4exp_hc_post_combine(StreamingEngine &engine, int layer_idx,
 
 bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
                                       int sub_block, int S, int D,
-                                      const void *device_sub_block_out) {
+                                      const void *device_sub_block_out,
+                                      const void *producer_event) {
   if (!g_hc_ggml_live || !device_sub_block_out ||
       (sub_block != 0 && sub_block != 1))
     return false;
+  // Qwen's CPU-affinity route uses GgmlQwenSharedRunner for the final
+  // routed+shared result. Its completion event lets one fused CUDA kernel
+  // update the HC state directly, avoiding the general post graph's per-
+  // stream mul/add/copy chain. The producer_event is intentionally required;
+  // without it, stream 0 could race the shared GGML backend stream.
+  if (sub_block == 1 && producer_event &&
+      GgmlHcRunner::instance().post_combine_device_fused(
+          layer_idx, /*runner_sub_block=*/0, S, device_sub_block_out,
+          producer_event))
+    {
+      static std::atomic<bool> logged_fused_post{false};
+      if (!logged_fused_post.exchange(true, std::memory_order_relaxed))
+        LOG_INFO("[GGML-HC] Qwen shared-output fused post-combine active "
+                 "(stream-0 kernel + producer/event bridge)\n");
+    return true;
+    }
   if (sub_block == 1)
     GgmlMoeRunner::active_instance().wait_device_output();
 
@@ -920,7 +952,8 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
     // GgmlMoeRunner, so the latter's output-slot validator correctly rejects
     // it.  Try the Qwen combined-output owner first; retain the routed
     // fallback for diagnostics of the non-shared path.
-    bool output_ok = GgmlQwenSharedRunner::instance().copy_output_to_host(
+    bool output_ok = GgmlQwenSharedRunner::instance_for_layer(layer_idx)
+                         .copy_output_to_host(
         device_sub_block_out, sub_out.data());
     if (!output_ok)
       output_ok = GgmlMoeRunner::active_instance().copy_device_output_to_host(

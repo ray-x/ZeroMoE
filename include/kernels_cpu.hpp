@@ -166,8 +166,17 @@ void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
 // Qwen4Exp/UD-IQ1_M CPU fallback using ggml's production IQ1_M x Q8_K
 // quantized-activation path.  Kept as a separate opt-in symbol so GLM and
 // other model CPU paths remain unchanged.
+// Returns the effective team size used by Qwen's direct grouped kernels;
+// MOESTREAM_QWEN_CPU_THREADS is a Qwen-only diagnostic override.
+int qwen_cpu_grouped_threads();
 bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
                            int S, int I, int O);
+// Qwen-only AVX-512-width IQ1_M x Q8_K probe.  This intentionally remains a
+// separate entry point from the GGML adapter until its numerical and
+// end-to-end performance checks justify making it the default.
+bool matmul_iq1_m_avx512_q8k_grouped(
+    float *const *y, const float *x, const uint8_t *const *W_quantized,
+    int n_matrices, int S, int I, int O);
 // Grouped Qwen CPU route: one Q8_K activation quantization feeds several
 // compact expert matrices. `W_quantized[m]` points to one [O,I] matrix and
 // `y[m]` points to its [S,O] result. This removes the per-expert OpenMP
@@ -176,6 +185,13 @@ bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
 bool matmul_iq1_m_ggml_q8k_grouped(float *const *y, const float *x,
                                    const uint8_t *const *W_quantized,
                                    int n_matrices, int S, int I, int O);
+// Qwen decode gate+up pair with the same activation: quantize the input once
+// and execute both IQ1_M projections in one OpenMP region. This is restricted
+// to the Qwen CPU-affinity path; it does not alter generic model kernels.
+bool matmul_iq1_m_ggml_q8k_grouped_pair(
+    float *const *gate_y, float *const *up_y, const float *x,
+    const uint8_t *const *gate_weights, const uint8_t *const *up_weights,
+    int n_matrices, int S, int I, int O);
 // Same grouped kernel when each matrix has its own activation row (the down
 // projection after per-expert SwiGLU).
 bool matmul_iq1_m_ggml_q8k_grouped_inputs(
@@ -203,6 +219,25 @@ bool matmul_iq3_xxs_ggml_q8k_grouped(
 bool matmul_iq4_nl_ggml_q8_0_grouped_inputs(
     float *const *y, const float *const *x,
     const uint8_t *const *W_quantized, int n_matrices, int S, int I, int O);
+// Qwen-only decode probe: keep IQ1_M gate/up, SwiGLU, IQ4_NL activation
+// quantization, and down projection inside one OpenMP team.  This is an
+// optional A/B entry point for the direct DDR path; callers must keep the
+// existing grouped implementation as the fallback until numerical and
+// end-to-end measurements prove it beneficial.
+bool matmul_qwen_iq1_m_iq4_nl_fused(
+    float *const *gate_y, float *const *up_y, float *const *down_y,
+    const float *x, const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights, const uint8_t *const *down_weights,
+    int n_matrices, int I, int gate_O, int down_O);
+// Qwen-only sibling for the IQ2_XXS gate/up layers in the same checkpoint.
+// Uses GGML's production IQ2_XXS x Q8_K dot kernel, but keeps the two
+// projections, activation, down-input quantization, and IQ4_NL down projection
+// inside one OpenMP team just like the IQ1_M fused path above.
+bool matmul_qwen_iq2_xxs_iq4_nl_fused(
+    float *const *gate_y, float *const *up_y, float *const *down_y,
+    const float *x, const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights, const uint8_t *const *down_weights,
+    int n_matrices, int I, int gate_O, int down_O);
 float dot_iq3_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k);
 void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
                           int S, int I, int O);

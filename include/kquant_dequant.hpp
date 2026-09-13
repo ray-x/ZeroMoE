@@ -633,6 +633,9 @@ inline void enable_cpu_dot_ggml_avx2() { cpu_dot_ggml_avx2_flag() = true; }
 
 // Qwen4Exp-only CPU path.  It mirrors BeeLlama's ggml IQ1_M x Q8_K route
 // and is deliberately independent of the GLM IQ2/IQ3 AVX2 experiment above.
+// Note that GGML's IQ1_M kernel is AVX2-width in the current dependency even
+// when the process was built with AVX-512/VNNI enabled; the Qwen-only
+// AVX-512 probe in kernels_cpu.cpp remains opt-in until it wins end-to-end.
 inline bool& cpu_dot_ggml_iq1m_flag() {
     static bool v = false;
     return v;

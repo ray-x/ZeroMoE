@@ -9,11 +9,13 @@
 #include "kquant_dequant.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cerrno>
 #include <fcntl.h>
 #include <limits>
+#include <list>
 #include <mutex>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -31,6 +33,103 @@ struct EngramTableMap {
 
 std::unordered_map<std::string, EngramTableMap> g_tables;
 std::mutex g_tables_mutex;
+
+// Small hot-row cache for the Engram tables. The tables themselves stay
+// mmap'd on NVMe (map_table's own comment: "no table is copied into the
+// resident dense pool") -- this does NOT change that. But decode re-hits the
+// SAME small set of hash rows far more than a uniform-random access pattern
+// would: the hash is built from a short, overlapping n-gram of recent
+// tokens (hash_batch's own tok_hist window), so consecutive decode steps
+// share most of that history and frequently rehash to the same row. Caching
+// the DEQUANTIZED row avoids both the page fault on a cold mmap page and the
+// dequant call on a repeat hit. Fixed, modest capacity (a few thousand
+// entries at head_dim floats each is a few MB) -- deliberately not a config
+// knob, matching "a small cache to keep the most used one" rather than a
+// tunable RAM-tier promotion policy.
+struct EngramRowKey {
+  int table_id;
+  int64_t row;
+  bool operator==(const EngramRowKey &o) const {
+    return table_id == o.table_id && row == o.row;
+  }
+};
+struct EngramRowKeyHash {
+  size_t operator()(const EngramRowKey &k) const {
+    return std::hash<int64_t>()(((int64_t)k.table_id << 48) ^ k.row);
+  }
+};
+
+class EngramRowCache {
+public:
+  // Exposed for the [DSV41-ENGRAM-CACHE] diagnostic line -- was
+  // previously hardcoded as a literal "8192" in that log message, which
+  // silently went stale the moment this constant changed. Read it from
+  // here instead so the two can never drift apart again.
+  static constexpr size_t capacity() { return kCapacity; }
+  bool get(int table_id, int64_t row, int head_dim, float *out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = map_.find({table_id, row});
+    if (it == map_.end()) return false;
+    order_.splice(order_.begin(), order_, it->second.order_it);
+    std::memcpy(out, it->second.data.data(), (size_t)head_dim * sizeof(float));
+    return true;
+  }
+  void put(int table_id, int64_t row, const float *data, int head_dim) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const EngramRowKey key{table_id, row};
+    auto it = map_.find(key);
+    if (it != map_.end()) {
+      order_.splice(order_.begin(), order_, it->second.order_it);
+      return;
+    }
+    if (map_.size() >= kCapacity) {
+      const EngramRowKey victim = order_.back();
+      order_.pop_back();
+      map_.erase(victim);
+    }
+    order_.push_front(key);
+    Entry &e = map_[key];
+    e.data.assign(data, data + head_dim);
+    e.order_it = order_.begin();
+  }
+
+private:
+  // TESTED (2026-09-12): raised 8192->65536 (8x) to check whether the
+  // real, measured 5.5% hit rate (545/9984 lookups on the standard
+  // 4-prompt test) was a capacity problem. Confirmed NOT: hit rate moved
+  // 5.5%->6.0%, well within noise for an 8x capacity increase -- genuine
+  // low locality (most Engram rows are touched once per request and
+  // essentially never revisited), not a sizing issue. `decode` tok/s was
+  // also unaffected (2.02 vs the 2.09 checkpoint, within normal noise) --
+  // consistent with this cache being too small a fraction of total
+  // decode cost to matter even if hit rate had improved. Reverted to
+  // 8192 -- a bigger cache buys nothing here, don't re-raise this
+  // without new evidence the access pattern has changed (e.g. much
+  // longer real conversations with genuine n-gram repetition, untested
+  // this session). See [[deepseek-v41-decode-speed-session]] for the
+  // full investigation.
+  static constexpr size_t kCapacity = 8192;
+  struct Entry {
+    std::vector<float> data;
+    std::list<EngramRowKey>::iterator order_it;
+  };
+  std::list<EngramRowKey> order_;
+  std::unordered_map<EngramRowKey, Entry, EngramRowKeyHash> map_;
+  std::mutex mutex_;
+};
+
+EngramRowCache g_row_cache;
+// TEMPORARY DIAGNOSTIC (2026-09-12): this cache has run with zero real
+// visibility into its own hit rate since it was built -- the goal's own
+// item 4 ("engram should keep in ssd/nvme and we can use a small cache
+// to keep the most used one") is exactly what this class already does,
+// but nobody has ever measured whether the fixed 8192-row capacity is
+// anywhere close to right for a real generation, or whether the
+// same-hash-window locality this class's own header comment predicts
+// actually holds on real DeepSeek-V4.1 traffic. Cheap relaxed atomics,
+// negligible per-lookup cost.
+std::atomic<uint64_t> g_engram_cache_hits{0};
+std::atomic<uint64_t> g_engram_cache_misses{0};
 
 const EngramTableMap *map_table(StreamingEngine &engine, const GGUFTensor &t,
                                 int row_dim) {
@@ -199,6 +298,21 @@ bool hash_batch(StreamingEngine &engine, int S, int pos_base,
 
 } // namespace
 
+// TEMPORARY DIAGNOSTIC (2026-09-12) -- see g_engram_cache_hits/misses'
+// own comment above. Called from the shutdown report so real Engram
+// row-cache effectiveness is visible without adding a per-request line.
+void deepseek41_engram_print_cache_stats() {
+  uint64_t hits = g_engram_cache_hits.load(std::memory_order_relaxed);
+  uint64_t misses = g_engram_cache_misses.load(std::memory_order_relaxed);
+  uint64_t total = hits + misses;
+  if (total == 0) return;
+  LOG_INFO("[DSV41-ENGRAM-CACHE] %llu hit / %llu miss (%.1f%% hit) of %llu "
+           "row lookups, fixed capacity %zu rows\n",
+           (unsigned long long)hits, (unsigned long long)misses,
+           100.0 * (double)hits / (double)total, (unsigned long long)total,
+           EngramRowCache::capacity());
+}
+
 void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
                                    int S, int pos_base, const int *token_ids) {
   auto &c = engine.model_file.architecture_config;
@@ -249,10 +363,16 @@ void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
                   (long long)row, (unsigned long long)table->n_rows, layer_idx);
         return;
       }
-      dequant_row(table_it->second.type,
-                  table->rows + (size_t)row * table->row_bytes,
-                  embed.data() + ((size_t)s * n_hash_cols + col) * head_dim,
-                  head_dim);
+      float *dst = embed.data() + ((size_t)s * n_hash_cols + col) * head_dim;
+      if (!g_row_cache.get(table_id, row, head_dim, dst)) {
+        g_engram_cache_misses.fetch_add(1, std::memory_order_relaxed);
+        dequant_row(table_it->second.type,
+                    table->rows + (size_t)row * table->row_bytes, dst,
+                    head_dim);
+        g_row_cache.put(table_id, row, dst, head_dim);
+      } else {
+        g_engram_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      }
     }
   }
 

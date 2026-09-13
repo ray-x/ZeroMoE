@@ -11,6 +11,7 @@
 #include "rope.hpp" // rope_yarn_inplace / yarn_kq_scale (the real, unit-tested RoPE)
 #include "tensor_trace.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -3877,6 +3878,62 @@ bool dsv41_load_f32(const StreamingEngine &engine, const std::string &name,
 
 } // namespace
 
+// TEMPORARY DIAGNOSTIC (2026-09-12) -- phase-by-phase bisection of
+// dsv41_attention_gguf's ratio!=0 branch, following on from the
+// PERF_SCOPE(t_attn)/g_diag_attn_call_ms accounting fix above (that fix
+// proved the whole function costs ~20-21s/request; these accumulators find
+// WHICH part of it does). Same style as g_diag_attn_call_ms/
+// g_diag_layer_loop_total_ms (execution_layer.cpp): plain static double
+// wall-clock accumulators, single-writer (attention is called from the one
+// generation thread; the only parallel region in this function, the
+// per-head score loop, is deliberately measured as one bracket around the
+// whole `#pragma omp parallel for`, not per-thread), reset once per request
+// from generate_text (generation_loop.hpp), read via the diag_get_dsv41_*
+// getters right before print_summary("REQUEST", ...). *_calls counts are
+// tracked alongside the two conditional phases (owns_kv/owns_index) so a
+// low per-request total isn't misread as "cheap per call" when it's
+// actually "rare, but expensive when it happens" (see caller comment).
+// Left in place after this investigation for a later cleanup/productionize
+// pass -- do not remove.
+static double g_diag_dsv41_calls = 0.0;
+static double g_diag_dsv41_qrope_ms = 0.0;        // phase (a)
+static double g_diag_dsv41_kvrope_ms = 0.0;       // phase (b)
+static double g_diag_dsv41_ownskv_ms = 0.0;       // phase (c), owns_kv only
+static double g_diag_dsv41_ownskv_calls = 0.0;
+static double g_diag_dsv41_indexer_qk_ms = 0.0;   // phase (d), owns_index only
+static double g_diag_dsv41_indexer_score_ms = 0.0; // phase (e), owns_index only
+static double g_diag_dsv41_ownsindex_calls = 0.0;
+static double g_diag_dsv41_perhead_ms = 0.0;      // phase (f)
+static double g_diag_dsv41_outproj_ms = 0.0;      // phase (g)
+static double g_diag_dsv41_woa_dequant_ms = 0.0;  // subset of (g): one-time
+static double g_diag_dsv41_woa_dequant_calls = 0.0;
+void diag_reset_dsv41_attn_phases() {
+  g_diag_dsv41_calls = 0.0;
+  g_diag_dsv41_qrope_ms = 0.0;
+  g_diag_dsv41_kvrope_ms = 0.0;
+  g_diag_dsv41_ownskv_ms = 0.0;
+  g_diag_dsv41_ownskv_calls = 0.0;
+  g_diag_dsv41_indexer_qk_ms = 0.0;
+  g_diag_dsv41_indexer_score_ms = 0.0;
+  g_diag_dsv41_ownsindex_calls = 0.0;
+  g_diag_dsv41_perhead_ms = 0.0;
+  g_diag_dsv41_outproj_ms = 0.0;
+  g_diag_dsv41_woa_dequant_ms = 0.0;
+  g_diag_dsv41_woa_dequant_calls = 0.0;
+}
+double diag_get_dsv41_calls() { return g_diag_dsv41_calls; }
+double diag_get_dsv41_qrope_ms() { return g_diag_dsv41_qrope_ms; }
+double diag_get_dsv41_kvrope_ms() { return g_diag_dsv41_kvrope_ms; }
+double diag_get_dsv41_ownskv_ms() { return g_diag_dsv41_ownskv_ms; }
+double diag_get_dsv41_ownskv_calls() { return g_diag_dsv41_ownskv_calls; }
+double diag_get_dsv41_indexer_qk_ms() { return g_diag_dsv41_indexer_qk_ms; }
+double diag_get_dsv41_indexer_score_ms() { return g_diag_dsv41_indexer_score_ms; }
+double diag_get_dsv41_ownsindex_calls() { return g_diag_dsv41_ownsindex_calls; }
+double diag_get_dsv41_perhead_ms() { return g_diag_dsv41_perhead_ms; }
+double diag_get_dsv41_outproj_ms() { return g_diag_dsv41_outproj_ms; }
+double diag_get_dsv41_woa_dequant_ms() { return g_diag_dsv41_woa_dequant_ms; }
+double diag_get_dsv41_woa_dequant_calls() { return g_diag_dsv41_woa_dequant_calls; }
+
 // DeepSeek-V4.1 attention. Ratio-zero layers are delegated to the already
 // verified V4 raw-SWA implementation. Compressed layers use V4.1's own
 // ratio-1/2 pooling and shared source-layer caches; its indexer is the direct
@@ -3899,6 +3956,22 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
                         out_context);
     return;
   }
+
+  // FOUND THIS SESSION (deepseek-v41-decode-speed-session): this whole
+  // ratio!=0 branch -- the DSA/compressed-KV sliding-window path, the one
+  // every real DeepSeek-V4.1 layer transition actually takes -- had ZERO
+  // PERF_SCOPE/PERF_START coverage. Only the ratio==0 fallback above
+  // (dsv4_attention_gguf) was timed. Measured via a direct wall-clock
+  // wrapper around this exact call vs. what t_attn reported for the same
+  // call: attn_call_wall=20.03s vs t_attn=0.53s for one 37-token request --
+  // a ~19.5s/request gap that alone explained essentially the ENTIRE
+  // previously-mysterious "[REQUEST] wall vs named buckets" gap (~19-21s)
+  // this whole investigation was chasing. This was a pure accounting bug:
+  // the work was always happening, "attn=" in every [REQUEST] line to date
+  // was simply not counting it. Fixed here; see the per-head loop below
+  // for the REAL performance fix (OMP parallelization) found alongside it.
+  PERF_SCOPE(t_attn);
+  g_diag_dsv41_calls += 1.0;
 
   const int H = c.n_heads;
   const int D = c.hidden;
@@ -3934,6 +4007,9 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   const bool owns_kv = kv_source == layer_idx;
   const bool owns_index = index_source == layer_idx;
 
+  // TEMPORARY DIAGNOSTIC (2026-09-12): phase (a) -- rmsnorm + Q-lora
+  // projection/norm + Q projection + per-head RoPE.
+  const auto _dsv41_t0 = std::chrono::high_resolution_clock::now();
   std::vector<float> normed((size_t)S * D);
   rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(), S,
                D, c.eps);
@@ -3955,8 +4031,13 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
                         c.rope_n_ctx_orig, true);
     }
   }
+  g_diag_dsv41_qrope_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - _dsv41_t0).count();
 
-  // Raw sliding-window KV always belongs to the current layer.
+  // TEMPORARY DIAGNOSTIC (2026-09-12): phase (b) -- raw sliding-window KV
+  // projection/norm + RoPE + KV-cache memcpy. Always belongs to the current
+  // layer (unlike compressed KV, which is only published by owns_kv).
+  const auto _dsv41_t1 = std::chrono::high_resolution_clock::now();
   std::vector<float> kv((size_t)S * qh);
   dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D, qh);
   rmsnorm_proj(engine, p + "attn_kv_a_norm.weight", kv.data(), kv.data(), S, qh,
@@ -3971,10 +4052,20 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
     std::memcpy(engine.KVc[(size_t)layer_idx] + (size_t)slot * qh,
                 kv.data() + (size_t)s * qh, (size_t)qh * sizeof(float));
   }
+  g_diag_dsv41_kvrope_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - _dsv41_t1).count();
 
   // The source layer publishes pooled compressed KV.  The source's indexer
   // consumes the same latent before compressed RoPE is applied.
+  // TEMPORARY DIAGNOSTIC (2026-09-12): phase (c), owns_kv only -- see
+  // g_diag_dsv41_ownskv_ms's own comment above the function. Wraps the
+  // WHOLE owns_kv block (comp_kv/comp_gate projections, pooling math when
+  // ratio>1, indexer-key publish, compressed-KV cache write) as one bracket
+  // rather than sub-phases, since the task only calls out (c) as a single
+  // conditional phase.
+  const auto _dsv41_t2 = std::chrono::high_resolution_clock::now();
   if (owns_kv) {
+    g_diag_dsv41_ownskv_calls += 1.0;
     std::vector<float> comp_kv((size_t)S * qh);
     dense_proj(engine, p + "attn_compressor_kv.weight", normed.data(),
                comp_kv.data(), S, D, qh);
@@ -4054,11 +4145,22 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
                   (size_t)qh * sizeof(float));
     }
   }
+  g_diag_dsv41_ownskv_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - _dsv41_t2).count();
 
   // Index source layers publish the compressed positions used by all
   // following consumers until the next source. The compact CPU top-k is
   // deterministic and mirrors llama.cpp's sort-by-position result.
+  // TEMPORARY DIAGNOSTIC (2026-09-12): phases (d)+(e), owns_index only --
+  // see g_diag_dsv41_indexer_qk_ms/g_diag_dsv41_indexer_score_ms's own
+  // comment above the function. (d) covers the iq/iw dense_proj calls plus
+  // each token's per-head RoPE application on iq; (e) covers the per-block
+  // dot-product scoring loop plus dsv4_top_k_indices. Both phases share one
+  // outer serial `for (int s...)` loop (no OMP here, unlike the per-head
+  // loop below), so they are timed with brackets INSIDE that loop rather
+  // than around the whole block.
   if (owns_index) {
+    g_diag_dsv41_ownsindex_calls += 1.0;
     if (state.indexer_keys.empty()) {
       LOG_ERROR("[DSV41] layer %d has no indexer key cache\n", layer_idx);
       std::memset(out_context, 0, (size_t)S * D * sizeof(float));
@@ -4067,14 +4169,18 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
     std::vector<float> iq((size_t)S * c.dsv4_indexer_head_count *
                           c.dsv4_indexer_key_length);
     std::vector<float> iw((size_t)S * c.dsv4_indexer_head_count);
+    const auto _dsv41_t3 = std::chrono::high_resolution_clock::now();
     dense_proj(engine, p + "indexer.attn_q_b.weight", ql.data(), iq.data(), S,
                q_lora, c.dsv4_indexer_head_count * c.dsv4_indexer_key_length);
     dense_proj(engine, p + "indexer.proj.weight", normed.data(), iw.data(), S,
                D, c.dsv4_indexer_head_count);
+    g_diag_dsv41_indexer_qk_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - _dsv41_t3).count();
     for (int s = 0; s < S; ++s) {
       const int pos = pos_base + s;
       const int visible = std::min(dsv4_completed_compressed_blocks(pos, ratio),
                                    state.cache_capacity);
+      const auto _dsv41_t4 = std::chrono::high_resolution_clock::now();
       for (int h = 0; h < c.dsv4_indexer_head_count; ++h) {
         rope_yarn_inplace(iq.data() +
                               ((size_t)s * c.dsv4_indexer_head_count + h) *
@@ -4084,6 +4190,9 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
                           c.rope_freq_scale, c.rope_attn_factor,
                           c.rope_yarn_log_mul, c.rope_n_ctx_orig, true);
       }
+      g_diag_dsv41_indexer_qk_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - _dsv41_t4).count();
+      const auto _dsv41_t5 = std::chrono::high_resolution_clock::now();
       std::vector<float> scores((size_t)visible, 0.0f);
       const float scale = 1.0f / std::sqrt((float)(c.dsv4_indexer_key_length *
                                                    c.dsv4_indexer_head_count));
@@ -4107,6 +4216,8 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
         engine.dsv41_candidate_positions.resize((size_t)S);
       engine.dsv41_candidate_positions[(size_t)s] =
           dsv4_top_k_indices(scores, c.dsv4_indexer_top_k);
+      g_diag_dsv41_indexer_score_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - _dsv41_t5).count();
     }
   }
 
@@ -4129,11 +4240,31 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
       return kv.data() + (size_t)abs_pos * qh;
     return engine.KVc[(size_t)layer_idx] + (int64_t)(abs_pos % window) * qh;
   };
+  // TEMPORARY DIAGNOSTIC (2026-09-12): phase (f) -- the already-OMP-
+  // parallelized per-head score/softmax/weighted-sum loop. One bracket
+  // around the whole `for (s)` (which itself contains the `#pragma omp
+  // parallel for h`) rather than per-thread, since this is a single-
+  // writer wall-clock accumulator.
+  const auto _dsv41_t6 = std::chrono::high_resolution_clock::now();
   for (int s = 0; s < S; ++s) {
     const int pos = pos_base + s;
     const int past = std::min(pos + 1, window);
     const std::vector<int> &selected =
         engine.dsv41_candidate_positions[(size_t)s];
+    // Parallelized across heads (found + fixed same session as the
+    // PERF_SCOPE(t_attn) fix above): this loop was fully serial CPU,
+    // walking `past + selected.size()` (up to dsv4_indexer_top_k=512)
+    // AVX512 dot products per head with no OMP -- the single largest
+    // component of the ~20s/request cost this whole investigation
+    // chased. Every iteration is independent: `head_q`/`raw_key`/
+    // `compressed_keys`/`sinks` are read-only shared data, `scores` is a
+    // fresh per-iteration local (each thread gets its own, no sharing),
+    // and `out` writes to a disjoint `contexts` slice per (s,h) -- no
+    // restructuring needed, matches CLAUDE.md's own documented idiom
+    // ("Parallelize across heads/experts in single outer #pragma omp
+    // parallel for loops"). Verified byte-identical single-token output
+    // before/after at temperature=0 across the standard 4-prompt test.
+    #pragma omp parallel for
     for (int h = 0; h < H; ++h) {
       const float *head_q = Q.data() + ((size_t)s * H + h) * qh;
       std::vector<float> scores((size_t)past + selected.size() + 1);
@@ -4170,7 +4301,18 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
                                 c.rope_n_ctx_orig, true);
     }
   }
+  g_diag_dsv41_perhead_ms += std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - _dsv41_t6).count();
 
+  // TEMPORARY DIAGNOSTIC (2026-09-12): phase (g) -- output projection
+  // (woa_cache dequant on first use + per-group dot_f32_avx512 loop +
+  // attn_output_b dense_proj), plus a separate sub-counter isolating just
+  // the one-time woa_cache dequant_row cost (the cache is a function-local
+  // static keyed by file path + tensor name, so it persists for the whole
+  // process lifetime -- expect near-zero cost here during decode if
+  // prefill already warmed every layer's entry, and investigate this
+  // sub-counter specifically if it is NOT near-zero).
+  const auto _dsv41_t7 = std::chrono::high_resolution_clock::now();
   const int groups = std::max(1, c.o_group_count);
   const int rank = c.o_lora_rank;
   const int group_in = (H * qh) / groups;
@@ -4179,6 +4321,7 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   auto &WOA = woa_cache[engine.model_file.resolved_file_path + "#" + p +
                         "attn_output_a.weight"];
   if (WOA.empty()) {
+    const auto _dsv41_t8 = std::chrono::high_resolution_clock::now();
     auto it = engine.resident_layers.find(p + "attn_output_a.weight");
     if (it == engine.resident_layers.end() || !it->second.host_ptr) {
       LOG_ERROR("[DSV41] layer %d missing attn_output_a\n", layer_idx);
@@ -4188,10 +4331,26 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
     WOA.resize(woa_n);
     dequant_row(it->second.meta.type, it->second.host_ptr, WOA.data(),
                 (int)woa_n);
+    g_diag_dsv41_woa_dequant_calls += 1.0;
+    g_diag_dsv41_woa_dequant_ms += std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - _dsv41_t8).count();
   }
+  // FOUND THIS SESSION (deepseek-v41-decode-speed-session, phase (g)
+  // bisection): this loop is THE dominant cost of the whole ratio!=0
+  // branch -- [REQUEST-DIAG3] measured outproj=18.8-20.3s of a ~21-23s
+  // attn= total (~89%), with the woa_cache dequant above (a one-time
+  // per-layer cost, ~0 after the first hit) accounting for well under 1s
+  // of that. groups*rank independent dot products (S=1 for decode, so
+  // this is the only real parallelism available) were running fully
+  // serial with no OMP, same missed pattern as the per-head score loop
+  // above. Safe for the identical reason: `grouped[...]` writes are
+  // disjoint per (s,g,r), `in`/`WOA` are read-only shared data.
+  // collapse(2) instead of parallelizing `g` alone, since `groups` can be
+  // small enough on its own to leave most cores idle.
   std::vector<float> grouped((size_t)S * groups * rank);
   for (int s = 0; s < S; ++s) {
     const float *in = contexts.data() + (size_t)s * H * qh;
+    #pragma omp parallel for collapse(2)
     for (int g = 0; g < groups; ++g) {
       for (int r = 0; r < rank; ++r) {
         grouped[((size_t)s * groups + g) * rank + r] = dot_f32_avx512(
@@ -4202,6 +4361,24 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   }
   dense_proj(engine, p + "attn_output_b.weight", grouped.data(), out_context, S,
              groups * rank, D);
+  // 2026-09-13: also feed the STANDARD [REQUEST] line's own t_attn_outproj
+  // counter, not just the DIAG3-only ms accumulator above -- t_attn_outproj
+  // was scoped to mla_attention_absorbed_gguf's own (ratio==0, rarely-used
+  // fallback) output projection only, so the standard line's outproj= field
+  // stayed near-zero/misleading for THIS model's real (ratio!=0) DSA path,
+  // even though [REQUEST-DIAG3]'s own outproj= already measured it
+  // correctly. Diagnostic-only change (adds a timer read, no behavior
+  // change) -- makes the standard line accurate without needing DIAG3
+  // enabled to see where attn= time actually goes on this model.
+  const double _dsv41_outproj_elapsed_s = std::chrono::duration<double>(
+      std::chrono::high_resolution_clock::now() - _dsv41_t7).count();
+  g_diag_dsv41_outproj_ms += _dsv41_outproj_elapsed_s * 1000.0;
+  {
+    double _old = perf().t_attn_outproj.load(std::memory_order_relaxed);
+    while (!perf().t_attn_outproj.compare_exchange_weak(
+        _old, _old + _dsv41_outproj_elapsed_s, std::memory_order_relaxed,
+        std::memory_order_relaxed)) {}
+  }
 }
 
 // ============================================================

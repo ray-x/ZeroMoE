@@ -168,6 +168,15 @@ public:
     float* d_y = nullptr;
     size_t d_x_cap = 0;
     size_t d_y_cap = 0;
+    // Explicit lifetime for the Qwen shared-expert input-reuse bridge.  This
+    // is intentionally not inferred from a host pointer: callers may reuse
+    // the same address after changing its contents.  The producer marks the
+    // device input valid, and the consumer clears it on release or on any
+    // ordinary dense_matmul_host call.
+    bool dense_host_input_valid = false;
+    size_t dense_host_input_bytes = 0;
+    int dense_host_input_S = 0;
+    int dense_host_input_I = 0;
     // Grow-only scratch for the BF16-matched fast-path's per-call activation
     // conversion (dense_matmul_bf16_matched_host) -- separate from d_x/d_y
     // above since those are F32-typed and shared by the fused-kernel /
@@ -3441,6 +3450,114 @@ public:
         return true;
     }
 
+    // Upload one host activation for a sequence of projections that all use
+    // the same [S,I] input.  This is deliberately separate from
+    // dense_matmul_host(): that function's normal contract is self-contained
+    // and must upload its caller's input on every call.  The Qwen4Exp shared
+    // expert has three projections reading normed (gate, up, gate-input), so
+    // the narrow sequence API removes two redundant H2D transfers without
+    // changing any other model path.
+    bool dense_matmul_host_upload_input(const float* x_host, int S, int I) {
+        dense_host_input_valid = false;
+        dense_host_input_bytes = 0;
+        dense_host_input_S = 0;
+        dense_host_input_I = 0;
+        if (!x_host || S <= 0 || I <= 0) return false;
+        const size_t x_bytes = (size_t)S * I * sizeof(float);
+        if (!ensure_buffers(x_bytes, 0)) return false;
+        cudaSetDevice(device_id);
+
+        PERF_START(dense_reuse_up);
+        const bool async_copies = ensure_dense_async_resources();
+        const void *upload_src = x_host;
+        if (async_copies && !host_ptr_is_pinned(upload_src) &&
+            ensure_dense_stage(x_bytes)) {
+            std::memcpy(dense_stage, upload_src, x_bytes);
+            upload_src = dense_stage;
+        }
+        bool ok = false;
+        if (async_copies) {
+            ok = dense_async_h2d(d_x, upload_src, x_bytes);
+        } else if (host_ptr_is_pinned(x_host) || !ensure_dense_stage(x_bytes)) {
+            ok = cudaMemcpy(d_x, x_host, x_bytes, cudaMemcpyHostToDevice) ==
+                 cudaSuccess;
+        } else {
+            std::memcpy(dense_stage, x_host, x_bytes);
+            ok = cudaMemcpy(d_x, dense_stage, x_bytes,
+                            cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        PERF_END(dense_reuse_up, t_dense_gpu_up);
+        if (!ok) {
+            if (async_copies) {
+                cudaStreamSynchronize(dense_stream());
+                cudaStreamSynchronize(0);
+            }
+            return false;
+        }
+
+        dense_host_input_valid = true;
+        dense_host_input_bytes = x_bytes;
+        dense_host_input_S = S;
+        dense_host_input_I = I;
+        return true;
+    }
+
+    // Run a projection using the activation uploaded by
+    // dense_matmul_host_upload_input().  This intentionally accepts only the
+    // original F32-input dispatch path.  BF16-fast-path weights have a
+    // different device activation buffer and therefore return false so the
+    // caller can use the established dense_proj() fallback unchanged.
+    bool dense_matmul_host_reuse_input(GGUFType wtype, const void* d_W,
+                                       float* y_host, int S, int I, int O) {
+        if (!d_W || !y_host || S <= 0 || I <= 0 || O <= 0 ||
+            wtype == GGUFType::BF16 || !dense_host_input_valid ||
+            dense_host_input_S != S || dense_host_input_I != I ||
+            dense_host_input_bytes != (size_t)S * I * sizeof(float))
+            return false;
+        const size_t y_bytes = (size_t)S * O * sizeof(float);
+        if (!ensure_buffers(0, y_bytes)) return false;
+        cudaSetDevice(device_id);
+        const bool async_copies = ensure_dense_async_resources();
+
+        PERF_START(dense_reuse_cmp);
+        const bool ok = dense_matmul_device(wtype, d_W, d_x, d_y, S, I, O);
+        if (ok && !async_copies) cudaStreamSynchronize(0);
+        PERF_END(dense_reuse_cmp, t_dense_gpu_compute);
+        if (!ok) return false;
+
+        PERF_START(dense_reuse_dn);
+        bool copied = false;
+        if (async_copies) {
+            void *download_dst = y_host;
+            bool staged_download = false;
+            if (!host_ptr_is_pinned(y_host) && ensure_dense_stage(y_bytes)) {
+                download_dst = dense_stage;
+                staged_download = true;
+            }
+            copied = dense_async_d2h(download_dst, d_y, y_bytes);
+            if (copied && staged_download)
+                std::memcpy(y_host, download_dst, y_bytes);
+        } else if (host_ptr_is_pinned(y_host) || !ensure_dense_stage(y_bytes)) {
+            copied = cudaMemcpy(y_host, d_y, y_bytes,
+                                cudaMemcpyDeviceToHost) == cudaSuccess;
+        } else {
+            copied = cudaMemcpy(dense_stage, d_y, y_bytes,
+                                cudaMemcpyDeviceToHost) == cudaSuccess;
+            if (copied) std::memcpy(y_host, dense_stage, y_bytes);
+        }
+        PERF_END(dense_reuse_dn, t_dense_gpu_down);
+        if (copied)
+            perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+        return copied;
+    }
+
+    void dense_matmul_host_release_input() {
+        dense_host_input_valid = false;
+        dense_host_input_bytes = 0;
+        dense_host_input_S = 0;
+        dense_host_input_I = 0;
+    }
+
     // Same grow-only pattern as ensure_buffers above, but for the DEDICATED
     // outproj staging buffers (d_outproj_x/d_outproj_y) -- kept fully
     // separate from d_x/d_y so grouped_output_proj_host never shares a
@@ -3625,6 +3742,36 @@ public:
         const size_t y_bytes = (size_t)S * O * sizeof(float);
         if (!ensure_buffers(0, y_bytes)) return false;
         cudaSetDevice(device_id);
+        // cuBLAS does not accept the project's F32 activation with a BF16
+        // weight in this GEMM form.  The host-input path already uses the
+        // matched BF16/BF16 operation; mirror that conversion here so a
+        // device-resident Qwen router (and any other device-input BF16
+        // projection) does not silently fall back to a full host round trip.
+        if (wtype == GGUFType::BF16) {
+            const size_t x_bf16_bytes =
+                (size_t)S * (size_t)I * sizeof(uint16_t);
+            if (x_bf16_bytes > d_x_bf16_cap) {
+                if (d_x_bf16) {
+                    cudaFree(d_x_bf16);
+                    d_x_bf16 = nullptr;
+                }
+                d_x_bf16_cap = 0;
+                if (cudaMalloc(&d_x_bf16, x_bf16_bytes) != cudaSuccess) {
+                    cudaGetLastError();
+                    return false;
+                }
+                d_x_bf16_cap = x_bf16_bytes;
+            }
+            launch_f32_to_bf16(d_x_bf16, d_X, (int64_t)S * I);
+            const cublasStatus_t status = cublas_dense_matmul_bf16_matched(
+                cublas_handle, d_W, d_x_bf16, d_y, S, I, O);
+            if (status != CUBLAS_STATUS_SUCCESS)
+                return false;
+            if (cudaStreamSynchronize(0) != cudaSuccess)
+                return false;
+            return cudaMemcpy(y_host, d_y, y_bytes,
+                              cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
         if (!dense_matmul_device(wtype, d_W, d_X, d_y, S, I, O))
             return false;
         if (cudaStreamSynchronize(0) != cudaSuccess) return false;
@@ -3783,6 +3930,9 @@ public:
     bool dense_matmul_host(GGUFType wtype, const void* d_W,
                            const float* x_host, float* y_host,
                            int S, int I, int O) {
+        // An ordinary call owns its input upload.  Do not leave an explicit
+        // Qwen shared-input sequence live across unrelated projections.
+        dense_matmul_host_release_input();
         if (!d_W) return false;
         if (wtype == GGUFType::BF16) {
             return dense_matmul_bf16_matched_host(d_W, x_host, y_host, S, I, O);

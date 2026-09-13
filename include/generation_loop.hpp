@@ -53,6 +53,46 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
 extern void layers_forward_gguf(StreamingEngine& engine, RAMSafetyManager& ram_mgr,
                                 LockFreePrefetcher& async_io_queue, float* hidden_states, int S, int pos_base,
                                 const int* token_ids);
+// TEMPORARY DIAGNOSTIC (2026-09-12) -- see g_diag_layer_loop_total_ms's own
+// comment in execution_layer.cpp. Accumulates layers_forward_gguf's
+// per-layer loop's OWN full wall-clock time (every layer, across the whole
+// forward call) so it can be compared directly against the [REQUEST] line's
+// wall_ms and against the sum of that line's named PERF_SCOPE buckets.
+extern void diag_reset_layer_loop_total();
+extern double diag_get_layer_loop_total_ms();
+extern double diag_get_attn_call_ms();
+extern double diag_get_ffn_call_ms();
+extern double diag_get_decode_layer_loop_ms();
+extern double diag_get_decode_attn_call_ms();
+extern double diag_get_decode_ffn_call_ms();
+extern double diag_get_decode_pilot_ms();
+extern double diag_get_decode_hc_ms();
+extern double diag_get_decode_hc_pre_ms();
+extern double diag_get_decode_hc_attn_pre_ms();
+extern double diag_get_decode_hc_ffn_pre_ms();
+extern double diag_get_decode_hc_post_ms();
+extern double diag_get_decode_layer_input_ms();
+extern double diag_get_decode_qwen_cpu_graph_ms();
+extern double diag_get_decode_qwen_shared_submit_ms();
+// TEMPORARY DIAGNOSTIC (2026-09-12) -- phase-by-phase bisection of
+// dsv41_attention_gguf's ratio!=0 branch (src/attention_layer.cpp), the
+// function g_diag_attn_call_ms proved costs ~20-21s/request. See the
+// g_diag_dsv41_* accumulators' own comment there for what each phase
+// covers and why the conditional ones (owns_kv/owns_index) also track a
+// call count.
+extern void diag_reset_dsv41_attn_phases();
+extern double diag_get_dsv41_calls();
+extern double diag_get_dsv41_qrope_ms();
+extern double diag_get_dsv41_kvrope_ms();
+extern double diag_get_dsv41_ownskv_ms();
+extern double diag_get_dsv41_ownskv_calls();
+extern double diag_get_dsv41_indexer_qk_ms();
+extern double diag_get_dsv41_indexer_score_ms();
+extern double diag_get_dsv41_ownsindex_calls();
+extern double diag_get_dsv41_perhead_ms();
+extern double diag_get_dsv41_outproj_ms();
+extern double diag_get_dsv41_woa_dequant_ms();
+extern double diag_get_dsv41_woa_dequant_calls();
 // Hyper-Connections (DeepSeek-V4, hyper_connections.cpp) model-level hooks --
 // bracket EVERY layers_forward_gguf call, converting the caller's plain
 // single-stream hidden_states into engine.hc_stream_buf's multi-stream form
@@ -262,6 +302,53 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                    float temperature = 0.7f, float top_p = 0.90f) {
     int max_ctx = prompt_ids.size() + max_new_tokens;
     ram_mgr.calculate_safe_cache_capacity(engine, max_ctx);
+
+    // Benchmark-only mode: max_new_tokens is normally an upper bound because
+    // EOS/turn-boundary tokens terminate generation early.  For controlled
+    // throughput comparisons, allow the caller to request exactly the full
+    // configured decode length.  This is opt-in, applies to the normal
+    // non-MTP loop only, and leaves normal inference behavior unchanged.
+    const bool bench_ignore_stop = [] {
+        const char *env = std::getenv("MOESTREAM_BENCH_IGNORE_STOP");
+        return env && env[0] == '1';
+    }();
+    if (bench_ignore_stop) {
+        LOG_STREAM_INFO() << "[BENCH] MOESTREAM_BENCH_IGNORE_STOP=1: "
+                             "EOS/stop tokens will not end this bounded decode\n";
+    }
+
+    // TEMPORARY DIAGNOSTIC (2026-09-12, deepseek-v41-decode-speed-session):
+    // bisecting the confirmed ~35-50% [REQUEST]-wall-vs-named-buckets gap
+    // (present in both prefill and decode, ruled OUT: HC-drain hooks --
+    // measured microseconds via [QWEN4EXP-DRAIN], and Sampler::sample's
+    // O(V log V) sort -- temperature=0.0 takes the cheap max_element path).
+    // Remaining candidates measured directly below instead of guessed at:
+    // lm-head norm+proj+NaN-scan+repetition-penalty, and log_vram_usage's
+    // per-token cudaSetDevice+cudaMemGetInfo (runs unconditionally every
+    // token regardless of log level -- only the string format is
+    // LOG_DEBUG-gated, the CUDA calls are not). Remove once the real
+    // source is found and fixed.
+    double diag_lmhead_ms = 0.0, diag_vramlog_ms = 0.0;
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- reset layers_forward_gguf's
+    // per-layer-loop wall-clock accumulator once per request, so the total
+    // printed alongside [REQUEST] below reflects only THIS request's
+    // prefill call plus all of its decode-step calls. See
+    // g_diag_layer_loop_total_ms's own comment (execution_layer.cpp).
+    diag_reset_layer_loop_total();
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- reset dsv41_attention_gguf's
+    // per-phase accumulators once per request too, same rationale as
+    // diag_reset_layer_loop_total() above. See g_diag_dsv41_* comment
+    // (attention_layer.cpp). No-op (extra function call only) for every
+    // non-DeepSeek-V4.1 family, since the accumulators are only ever
+    // incremented from inside dsv41_attention_gguf's ratio!=0 branch.
+    diag_reset_dsv41_attn_phases();
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- t_hc_hooks/t_layer_input_hook are
+    // real PerfCounters atomics but are NOT part of Snapshot/print_summary's
+    // per-request accounting (only ever printed as whole-session totals by
+    // dump_report's "Per-layer hooks:" line) -- captured here by hand so
+    // this request's own share is visible alongside the other diagnostics.
+    double diag_hc_hooks_start = perf().t_hc_hooks.load();
+    double diag_layer_input_hook_start = perf().t_layer_input_hook.load();
 
     // Snapshot for the whole-request latency breakdown, printed when this
     // request finishes (see bottom of function).
@@ -608,7 +695,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     bool mtp_started = false;
     const bool mtp_context_ready =
         engine.mtp_enabled && pc_reuse == 0 && pc_n_new == prompt_ids.size() &&
-        !prompt_ids.empty();
+        !prompt_ids.empty() && !bench_ignore_stop;
     if (mtp_context_ready) {
         auto emit_mtp = [&](int next_token) {
             perf().n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
@@ -669,6 +756,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         auto lm_it = engine.resident_layers.find("output.weight");
         if (lm_it == engine.resident_layers.end()) break;
 
+        auto diag_lmhead_start = std::chrono::high_resolution_clock::now();
         const float* lm_in = last_hidden;
         if (norm_it != engine.resident_layers.end()) {
             rmsnorm_proj(engine, "output_norm.weight", last_hidden, normed_last.data(), 1, D,
@@ -676,6 +764,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             lm_in = normed_last.data();
         }
         dense_proj(engine, "output.weight", lm_in, logits.data(), 1, D, V);
+        diag_lmhead_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - diag_lmhead_start).count();
 
         // Diagnostic: catch corrupted (NaN/Inf) logits at the source, right
         // where they're produced, rather than downstream where Sampler::sample
@@ -773,7 +863,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // markers into undefined continuation territory
         // tokenizer.is_stop_token covers all of them; the `eos_id` check
         // stays as a redundant safety net.
-        if (next_token == eos_id || tokenizer.is_stop_token(next_token)) break;
+        if (!bench_ignore_stop &&
+            (next_token == eos_id || tokenizer.is_stop_token(next_token)))
+            break;
 
         // Embed the new token and run one forward step
         if (emb_it != engine.resident_layers.end()) {
@@ -806,7 +898,12 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // to track actual usage over the run -- distinct from the one-time
         // startup topology dump and from the logical cache-fill heatmaps
         // below (this is raw memory, those are "what's actually resident").
-        if (ram_mgr.vram_cache) ram_mgr.vram_cache->log_vram_usage(token_label);
+        {
+            auto diag_vramlog_start = std::chrono::high_resolution_clock::now();
+            if (ram_mgr.vram_cache) ram_mgr.vram_cache->log_vram_usage(token_label);
+            diag_vramlog_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - diag_vramlog_start).count();
+        }
 
         // Replace hidden_states with the single-token output for next iteration
         hidden_states.resize(D);
@@ -829,6 +926,115 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     auto request_snap_end = perf().snapshot();
     auto request_delta = request_snap_end - request_snap_start;
     PerfCounters::print_summary("REQUEST", request_wall_ms, (int)request_delta.n_tokens_generated, request_delta);
+    // TEMPORARY DIAGNOSTIC -- see this function's top-of-function comment.
+    LOG_INFO("[REQUEST-DIAG] lmhead(norm+proj)=%.3fs vramlog(cudaMemGetInfo)=%.3fs\n",
+             diag_lmhead_ms / 1000.0, diag_vramlog_ms / 1000.0);
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- layer_loop_total is the FULL
+    // wall-clock time of layers_forward_gguf's per-layer loop, every layer,
+    // summed across this request's prefill call + all decode-step calls
+    // (see g_diag_layer_loop_total_ms's own comment, execution_layer.cpp).
+    // Compare against request_wall_ms above: if it's close, the ~21s/
+    // request gap between [REQUEST]'s wall_ms and its named buckets
+    // (attn=/route=/expert=/dense_gpu=) is genuinely inside this loop's own
+    // orchestration. t_prefetch is printed alongside it because it is
+    // ALREADY an existing, real PERF_START/PERF_END(t_prefetch) counter
+    // (execution_layer.cpp's DEPTH-1/ATTN-PILOT/DEPTH-2 speculative pilot
+    // block) that is captured correctly in every Snapshot diff but was
+    // never actually printed in print_summary/print_delta's format
+    // strings -- so it has been silently invisible in every [REQUEST] line
+    // to date despite running substantial CPU work (rmsnorm + a full
+    // dense_proj router matvec x3, plus RAM/VRAM residency scans) every
+    // single layer transition, unconditionally, regardless of whether any
+    // of the actual prefetch/promotion flags it feeds are even enabled.
+    // attn_call/ffn_call: wall-clock measured around the SAME calls that
+    // feed t_attn/t_moe_expert (request_delta.t_attn / .t_moe_expert) --
+    // see g_diag_attn_call_ms/g_diag_ffn_call_ms's own comment
+    // (execution_layer.cpp). Large wall vs. named-counter gaps here would
+    // mean async GPU dispatch returns before the work actually lands, with
+    // PERF_SCOPE's RAII destructor stopping the clock too early.
+    // hc_hooks/layer_input_hook: this request's own share of two
+    // PerfCounters atomics that exist but were never wired into
+    // Snapshot/print_summary at all (see the capture site above).
+    LOG_INFO("[REQUEST-DIAG2] layer_loop_total=%.3fs t_prefetch(pilot, already-collected-but-never-printed)=%.3fs "
+             "attn_call_wall=%.3fs(t_attn=%.3fs) ffn_call_wall=%.3fs(t_moe_expert=%.3fs) "
+             "hc_hooks=%.3fs layer_input_hook=%.3fs\n",
+             diag_get_layer_loop_total_ms() / 1000.0, request_delta.t_prefetch,
+             diag_get_attn_call_ms() / 1000.0, request_delta.t_attn,
+             diag_get_ffn_call_ms() / 1000.0, request_delta.t_moe_expert,
+             perf().t_hc_hooks.load() - diag_hc_hooks_start,
+             perf().t_layer_input_hook.load() - diag_layer_input_hook_start);
+    const double decode_layer_ms = diag_get_decode_layer_loop_ms();
+    const double decode_attn_ms = diag_get_decode_attn_call_ms();
+    const double decode_ffn_ms = diag_get_decode_ffn_call_ms();
+    const double decode_qwen_cpu_ms = diag_get_decode_qwen_cpu_graph_ms();
+    const double decode_qwen_shared_submit_ms =
+        diag_get_decode_qwen_shared_submit_ms();
+    const double decode_residual_ms =
+        std::max(0.0, decode_layer_ms - decode_attn_ms - decode_ffn_ms);
+    const double decode_hc_ms = diag_get_decode_hc_ms();
+    const double decode_hc_pre_ms = diag_get_decode_hc_pre_ms();
+    const double decode_hc_post_ms = diag_get_decode_hc_post_ms();
+    const double decode_layer_input_ms = diag_get_decode_layer_input_ms();
+    const double decode_other_ms = std::max(
+        0.0, decode_residual_ms - decode_hc_ms - decode_layer_input_ms -
+                 diag_get_decode_pilot_ms());
+    const double decode_tokens =
+        std::max(1.0, (double)request_delta.n_tokens_generated);
+    LOG_INFO("[REQUEST-DECODE-DIAG] tokens=%.0f layer_loop=%.3fs (%.3fms/token) "
+             "attention_call=%.3fs (%.3fms/token) "
+             "ffn_call=%.3fs (%.3fms/token) "
+             "qwen_cpu_routed=%.3fs (%.3fms/token) "
+             "qwen_shared_submit=%.3fs (%.3fms/token) "
+             "residual_scheduler_hc_route=%.3fs (%.3fms/token), "
+             "hc=%.3fs (%.3fms/token; pre=%.3f, post=%.3f), "
+             "pre_attn=%.3f, pre_ffn=%.3f, "
+             "layer_input=%.3fs (%.3fms/token), "
+             "other=%.3fs (%.3fms/token) "
+             "pilot=%.3fs (%.3fms/token)\n",
+             decode_tokens, decode_layer_ms / 1000.0,
+             decode_layer_ms / decode_tokens,
+             decode_attn_ms / 1000.0, decode_attn_ms / decode_tokens,
+             decode_ffn_ms / 1000.0, decode_ffn_ms / decode_tokens,
+             decode_qwen_cpu_ms / 1000.0,
+             decode_qwen_cpu_ms / decode_tokens,
+             decode_qwen_shared_submit_ms / 1000.0,
+             decode_qwen_shared_submit_ms / decode_tokens,
+             decode_residual_ms / 1000.0,
+             decode_residual_ms / decode_tokens,
+             decode_hc_ms / 1000.0, decode_hc_ms / decode_tokens,
+             decode_hc_pre_ms / decode_tokens,
+             decode_hc_post_ms / decode_tokens,
+             diag_get_decode_hc_attn_pre_ms() / decode_tokens,
+             diag_get_decode_hc_ffn_pre_ms() / decode_tokens,
+             decode_layer_input_ms / 1000.0,
+             decode_layer_input_ms / decode_tokens,
+             decode_other_ms / 1000.0, decode_other_ms / decode_tokens,
+             diag_get_decode_pilot_ms() / 1000.0,
+             diag_get_decode_pilot_ms() / decode_tokens);
+    // TEMPORARY DIAGNOSTIC (2026-09-12) -- phase-by-phase bisection of
+    // dsv41_attention_gguf's ratio!=0 branch (the thing attn_call_wall/
+    // t_attn above already proved costs ~20-21s/request for this model).
+    // qrope/kvrope/perhead/outproj run on EVERY call (all layers, all
+    // tokens); ownskv/indexer_qk/indexer_score only run on owns_kv/
+    // owns_index layers respectively -- their own *_calls counts are
+    // printed alongside them so a small per-request total isn't misread as
+    // "cheap per call" when few layers ever take that branch (see
+    // g_diag_dsv41_* comment, attention_layer.cpp). woa_dequant is a
+    // subset of outproj isolating the one-time WOA weight dequant.
+    LOG_INFO("[REQUEST-DIAG3] dsv41_attn_calls=%.0f qrope=%.3fs kvrope=%.3fs "
+             "ownskv=%.3fs(calls=%.0f) indexer_qk=%.3fs indexer_score=%.3fs(idx_calls=%.0f) "
+             "perhead=%.3fs outproj=%.3fs(woa_dequant=%.3fs,calls=%.0f)\n",
+             diag_get_dsv41_calls(),
+             diag_get_dsv41_qrope_ms() / 1000.0,
+             diag_get_dsv41_kvrope_ms() / 1000.0,
+             diag_get_dsv41_ownskv_ms() / 1000.0, diag_get_dsv41_ownskv_calls(),
+             diag_get_dsv41_indexer_qk_ms() / 1000.0,
+             diag_get_dsv41_indexer_score_ms() / 1000.0,
+             diag_get_dsv41_ownsindex_calls(),
+             diag_get_dsv41_perhead_ms() / 1000.0,
+             diag_get_dsv41_outproj_ms() / 1000.0,
+             diag_get_dsv41_woa_dequant_ms() / 1000.0,
+             diag_get_dsv41_woa_dequant_calls());
 
     // Inter-request decay of prefill->decode retention stamps. Fires once
     // per request, right after the REQUEST line, so the numbers above still

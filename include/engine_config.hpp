@@ -357,11 +357,11 @@ struct EngineConfig {
   // only for these target layers. This is independent of production routing,
   // usage-file pinning, and all other model families.
   std::vector<int> qwen4exp_router_pilot_predict_layers;
-  // Decode-only optimization: when the target layer's complete expert set is
-  // already in the durable VRAM cache, skip the advisory pilot snapshot and
-  // router pass because no placement decision can change. Prediction remains
-  // active for any layer with a real placement gap. Other model families do
-  // not read this option.
+  // Decode-only Qwen optimization: skip the advisory pilot snapshot/router
+  // pass when the target layer's complete expert set is resident OR the
+  // actual routed top-k hot set has stayed resident for two tokens. The
+  // latter avoids scanning all experts and is reset by an exact-route miss.
+  // Other model families do not read this option.
   bool qwen4exp_router_pilot_skip_fully_cached = false;
   // Decode-only optimization: when a target layer is explicitly excluded
   // from estimation-based prefetch, skip the pilot itself as well. This keeps
@@ -375,6 +375,11 @@ struct EngineConfig {
   // CPU-oriented moe_decode_batched experiment, which is not appropriate
   // for Qwen IQ1_M. Default off for every model/config.
   bool qwen4exp_decode_ggml_moe = false;
+  // Qwen4Exp-only Bee-style decode topology experiment. A complete
+  // preloaded DDR arena may use one scheduler graph containing the CUDA
+  // router and CPU MUL_MAT_ID expert path. Layers without a complete arena
+  // retain the ordinary lazy-loading path; other model families ignore this.
+  bool qwen4exp_decode_scheduler = false;
   // Qwen4Exp-only decode handoff: keep the HC pre-mix result on the GGML
   // CUDA backend for the S==1 router and grouped MoE graph. This is separate
   // from qwen4exp_decode_ggml_moe so the latter can be benchmarked with the
@@ -389,6 +394,11 @@ struct EngineConfig {
   // Qwen-only exact-Q8 HC decode kernels. Off by default and ignored by all
   // other model families.
   bool qwen4exp_decode_custom_hc_q8 = false;
+  // Qwen-only HC [D,S] result readback for CPU-routed layers. When enabled,
+  // the producer event is waited on by a reusable nonblocking CUDA copy
+  // stream and the D2H copy lands in pinned staging memory before the CPU
+  // consumer reads it. Off by default until the runtime A/B is validated.
+  bool qwen4exp_hc_async_readback = false;
   // Qwen-only S==1 router policy. The GPU router is useful for batched
   // prefill, but its graph launch/synchronization/readback boundary is slower
   // than the AVX-512 host router for decode on the RTX 3090. Keep this opt-in
@@ -398,11 +408,31 @@ struct EngineConfig {
   // Qwen4Exp-only grouped CPU fallback for explicitly selected
   // cpu_affinity_layers. Other model families never consult this switch.
   bool qwen4exp_cpu_ggml_moe = false;
+  // Qwen-only direct DDR-strided CPU implementation: reuse one Q8_K
+  // activation quantization for the selected experts and fuse IQ1_M gate/up.
+  // This is separate from qwen4exp_cpu_ggml_moe so the persistent GGML graph
+  // remains the default, verified CPU implementation.
+  bool qwen4exp_cpu_strided_grouped = false;
+  // Qwen-only opt-in for the one-team CPU projection path. When the direct
+  // DDR-strided path is active, fuse gate/up, SwiGLU, activation quantization,
+  // and down into one OpenMP team for IQ1_M/IQ2_XXS -> IQ4_NL layers. This is
+  // deliberately separate from the strided-path switch so existing configs
+  // keep their CPU implementation unchanged until both are enabled.
+  bool qwen4exp_cpu_fused_grouped = false;
   // Qwen-only CPU/GPU overlap for cpu_affinity_layers: run the routed CPU
   // MUL_MAT_ID graph on a persistent worker while the always-on shared expert
   // runs on CUDA. Disabled by default for an explicit A/B and ignored by all
-  // other model families.
+  // other model families. The bounded layer count prevents the two-graph
+  // shared-only/host-add handoff from becoming slower than the normal CPU
+  // path when a large fraction of the trunk is offloaded.
   bool qwen4exp_cpu_gpu_overlap = false;
+  int qwen4exp_cpu_gpu_overlap_max_layers = 16;
+  // Qwen-only CPU routed-result handoff: after the CPU MUL_MAT_ID graph
+  // finishes, feed its [D] result directly to the device shared-expert graph
+  // instead of using the host-facing shared-expert fallback.  This is kept
+  // separate from the two-graph overlap experiment above so it can be tested
+  // without adding a shared-only launch or a second device add graph.
+  bool qwen4exp_cpu_shared_device = false;
 
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
@@ -911,6 +941,44 @@ struct EngineConfig {
   // actually pays off, without needing a single global value that fits
   // every layer's very different routing concentration equally badly.
   std::vector<int> prefetch_pilot_k_per_layer;
+
+  // prefetch_pilot_k_adaptive (2026-09-13): user request -- "test the most
+  // confident numbers, not a guessed flat cut". Real data motivating this
+  // (see CLAUDE.md's DeepSeek-V4.1 session memory for the full numbers):
+  // fetch-worthy DEPTH-1 accuracy decays hard by rank (k0=93%, k1=86%,
+  // k2=65%, k3=50%, k4=37%, k5=27-30%), and the LOW ranks are also the
+  // MAJORITY of the fetch-worthy population (more picks need a fresh
+  // fetch at low confidence than at high, since high-confidence picks are
+  // more often already resident) -- 22.8% of all real prefetches this
+  // session were reclaimed by LRU before any hit ever touched them, a
+  // direct cost of always fetching all the way to prefetch_pilot_k
+  // regardless of a rank's own live accuracy. Instead of guessing a
+  // smaller flat number (or the extreme of disabling prefetch entirely),
+  // this computes each layer's own effective fetch width from its live,
+  // already-collected [PILOT-BY-LAYER-RANK] accuracy (PerfCounters::
+  // n_pilot_recall_hits_by_layer_rank / n_pilot_recall_checks_by_layer_
+  // rank, dense_dispatch.hpp's adaptive_pilot_k_for_layer) -- a
+  // contiguous-prefix walk from rank 0 (matches ram_vram_promote_
+  // adaptive's own proven shape below): keep extending the fetch width
+  // while the NEXT rank's own live accuracy is still >=
+  // prefetch_pilot_k_adaptive_threshold, stop at the first rank that
+  // fails. Deliberately only ever NARROWS the existing prefetch_pilot_k/
+  // prefetch_pilot_k_per_layer ceiling for that layer, never widens past
+  // it -- same "do less for unreliable ranks, never more for reliable
+  // ones" safety direction as ram_vram_promote_layer_gate. Off by
+  // default (false); every existing config/model that doesn't set this
+  // keeps its exact current fetch-width behavior.
+  bool prefetch_pilot_k_adaptive = false;
+  double prefetch_pilot_k_adaptive_threshold =
+      0.50; // roughly the
+            // k2/k3 boundary in the real fetch-worthy decay curve above --
+            // keeps the ranks that clear "more likely right than wrong".
+  int prefetch_pilot_k_adaptive_min_samples =
+      30; // per (layer,rank)
+          // floor before that rank's own accuracy is trusted -- below
+          // this, cold-start falls back to the existing static width
+          // (pilot_k_for_layer's ceiling) unchanged, same shape as every
+          // other adaptive/gate mechanism in this file.
 
   // How many layers ahead the pilot predicts AND pushes real prefetch
   // hints for. 1 (default) = only l+1, the original production pilot
@@ -1916,6 +1984,24 @@ struct EngineConfig {
           // a layer, the gate doesn't veto yet (falls back to "allow",
           // matching pre-gate behavior) since there's no real signal yet.
 
+  // ram_vram_promote_layer_gate_top_fraction (2026-09-13): user request --
+  // "promote to the most confident layers only". The flat `threshold`
+  // above is NOT that: it's a pass/fail cutoff against an absolute
+  // number, so if most tracked layers happen to clear 0.65 it allows
+  // nearly all of them (observed: a real A/B run showed ~no difference
+  // vs. the gate off, consistent with this). This field switches
+  // layer_promote_allowed (dense_dispatch.hpp) into a RANK-based mode
+  // instead: tracked layers (>= min_samples live checks) are sorted by
+  // their OWN live accuracy and only the top `top_fraction` of them
+  // pass, regardless of the absolute number. 0.0 (default) = disabled,
+  // falls back to the flat `threshold` behavior above unchanged -- so
+  // every existing config (including every non-DeepSeek model) that
+  // never sets this field keeps its exact current behavior. Only takes
+  // effect when ram_vram_promote_layer_gate is also true. Same per-
+  // pilot-type independence as the flat mode (DEPTH-1 and ATTN-PILOT
+  // ranked separately, never pooled).
+  double ram_vram_promote_layer_gate_top_fraction = 0.0;
+
   // ram_vram_promote_dynamic_layer (2026-08-26): a THIRD mode, mutually
   // exclusive with static top_k and adaptive above (same "setting more
   // than one disables all, with a warning" validation, extended to
@@ -2428,6 +2514,14 @@ inline bool EngineConfig::load(const std::string &path) {
   prefetch_pilot_k = doc.root.get_int("prefetch_pilot_k", prefetch_pilot_k);
   prefetch_pilot_k_per_layer =
       doc.root.get_int_array("prefetch_pilot_k_per_layer");
+  prefetch_pilot_k_adaptive = doc.root.get_bool("prefetch_pilot_k_adaptive",
+                                                 prefetch_pilot_k_adaptive);
+  prefetch_pilot_k_adaptive_threshold =
+      doc.root.get_double("prefetch_pilot_k_adaptive_threshold",
+                          prefetch_pilot_k_adaptive_threshold);
+  prefetch_pilot_k_adaptive_min_samples =
+      doc.root.get_int("prefetch_pilot_k_adaptive_min_samples",
+                       prefetch_pilot_k_adaptive_min_samples);
   // Real incident this caught: a config had `prefetch_pilot_depth = true`
   // (a boolean, presumably intended as an enable/disable toggle -- an easy
   // mistake given how many OTHER flags in this same config format ARE
@@ -2544,18 +2638,37 @@ inline bool EngineConfig::load(const std::string &path) {
       qwen4exp_router_pilot_skip_prefetch_excluded_layers);
   qwen4exp_decode_ggml_moe =
       doc.root.get_bool("qwen4exp_decode_ggml_moe", qwen4exp_decode_ggml_moe);
+  qwen4exp_decode_scheduler = doc.root.get_bool(
+      "qwen4exp_decode_scheduler", qwen4exp_decode_scheduler);
   qwen4exp_decode_device_hc = doc.root.get_bool(
       "qwen4exp_decode_device_hc", qwen4exp_decode_device_hc);
   qwen4exp_decode_batch_stage = doc.root.get_bool(
       "qwen4exp_decode_batch_stage", qwen4exp_decode_batch_stage);
   qwen4exp_decode_custom_hc_q8 = doc.root.get_bool(
       "qwen4exp_decode_custom_hc_q8", qwen4exp_decode_custom_hc_q8);
+  qwen4exp_hc_async_readback = doc.root.get_bool(
+      "qwen4exp_hc_async_readback", qwen4exp_hc_async_readback);
   qwen4exp_decode_gpu_router = doc.root.get_bool(
       "qwen4exp_decode_gpu_router", qwen4exp_decode_gpu_router);
   qwen4exp_cpu_ggml_moe =
       doc.root.get_bool("qwen4exp_cpu_ggml_moe", qwen4exp_cpu_ggml_moe);
+  qwen4exp_cpu_strided_grouped = doc.root.get_bool(
+      "qwen4exp_cpu_strided_grouped", qwen4exp_cpu_strided_grouped);
+  qwen4exp_cpu_fused_grouped = doc.root.get_bool(
+      "qwen4exp_cpu_fused_grouped", qwen4exp_cpu_fused_grouped);
   qwen4exp_cpu_gpu_overlap = doc.root.get_bool(
       "qwen4exp_cpu_gpu_overlap", qwen4exp_cpu_gpu_overlap);
+  qwen4exp_cpu_gpu_overlap_max_layers = (int)doc.root.get_int(
+      "qwen4exp_cpu_gpu_overlap_max_layers",
+      qwen4exp_cpu_gpu_overlap_max_layers);
+  if (qwen4exp_cpu_gpu_overlap_max_layers < 0) {
+    LOG_WARN("[CONFIG] qwen4exp_cpu_gpu_overlap_max_layers=%d is invalid -- "
+             "clamping to 0 (disabled)\n",
+             qwen4exp_cpu_gpu_overlap_max_layers);
+    qwen4exp_cpu_gpu_overlap_max_layers = 0;
+  }
+  qwen4exp_cpu_shared_device = doc.root.get_bool(
+      "qwen4exp_cpu_shared_device", qwen4exp_cpu_shared_device);
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
   mtp_enabled = doc.root.get_bool("mtp_enabled", mtp_enabled);
   mtp_draft_tokens = (int)doc.root.get_int("mtp_draft_tokens", mtp_draft_tokens);
@@ -2684,6 +2797,9 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
   ram_vram_promote_layer_gate_min_samples =
       doc.root.get_int("ram_vram_promote_layer_gate_min_samples",
                        ram_vram_promote_layer_gate_min_samples);
+  ram_vram_promote_layer_gate_top_fraction =
+      doc.root.get_double("ram_vram_promote_layer_gate_top_fraction",
+                          ram_vram_promote_layer_gate_top_fraction);
   ram_vram_promote_dynamic_layer = doc.root.get_bool(
       "ram_vram_promote_dynamic_layer", ram_vram_promote_dynamic_layer);
   ram_vram_promote_dynamic_threshold_4 =
@@ -3091,6 +3207,13 @@ inline void EngineConfig::print() const {
               : ", " + std::to_string(prefetch_pilot_k_per_layer.size()) +
                     " layer override value(s) set (see [PREFETCH-LAYER] "
                     "report)")
+      << (prefetch_pilot_k_adaptive
+              ? (", adaptive ON (per-layer/rank live accuracy, threshold " +
+                 std::to_string(prefetch_pilot_k_adaptive_threshold * 100.0) +
+                 "%, min_samples " +
+                 std::to_string(prefetch_pilot_k_adaptive_min_samples) +
+                 " -- narrows this ceiling per layer, never widens it)")
+              : "")
       << "\n";
   LOG_STREAM_INFO()
       << "[CONFIG] Prefetch pilot depth: " << prefetch_pilot_depth
@@ -3253,7 +3376,19 @@ inline void EngineConfig::print() const {
       << "\n";
   LOG_STREAM_INFO()
       << "[CONFIG] CPU-fallback dot (Qwen IQ1_M): "
-      << (cpu_dot_ggml_iq1m ? "ggml Q8_K AVX2/VNNI path" : "row dequant + FP32 path")
+      << (cpu_dot_ggml_iq1m
+              ? "ggml Q8_K path (current IQ1_M kernel is AVX2-width; no AVX-512/VNNI IQ1_M specialization)"
+              : "row dequant + FP32 path")
+      << "\n";
+  LOG_STREAM_INFO()
+      << "[CONFIG] Qwen CPU strided grouped projections: "
+      << (qwen4exp_cpu_strided_grouped
+              ? "ON (DDR arena, shared Q8_K activation + fused IQ1_M gate/up)"
+              : "off (persistent GGML strided graph)")
+      << "\n";
+  LOG_STREAM_INFO()
+      << "[CONFIG] Qwen CPU one-team fused projections: "
+      << (qwen4exp_cpu_fused_grouped ? "ON (IQ1_M/IQ2_XXS + IQ4_NL)" : "off")
       << "\n";
   LOG_STREAM_INFO()
       << "[CONFIG] RAM->VRAM speculative promotion: "
@@ -3309,9 +3444,16 @@ inline void EngineConfig::print() const {
   LOG_STREAM_INFO()
       << "[CONFIG] RAM->VRAM per-layer accuracy gate: "
       << (ram_vram_promote_layer_gate
-              ? ("ON (threshold " +
-                 std::to_string(ram_vram_promote_layer_gate_threshold * 100.0) +
-                 "%, min_samples " +
+              ? ((ram_vram_promote_layer_gate_top_fraction > 0.0
+                      ? ("ON (rank-based, top " +
+                         std::to_string(
+                             ram_vram_promote_layer_gate_top_fraction * 100.0) +
+                         "% most-confident layers")
+                      : ("ON (threshold " +
+                         std::to_string(
+                             ram_vram_promote_layer_gate_threshold * 100.0) +
+                         "%")) +
+                 ", min_samples " +
                  std::to_string(ram_vram_promote_layer_gate_min_samples) +
                  "/layer)")
               : std::string("off"))
@@ -3471,6 +3613,21 @@ drop_pages     = false    # true = evict expert pages from OS cache after use
 # upload, and that upload just steals cache capacity from layers where it
 # DOES help). Empty (default) = no layers affected.
 # cpu_affinity_layers = [4, 5, 7]
+
+# qwen4exp_cpu_gpu_overlap: optional Qwen-only overlap of the CPU routed
+# expert graph with the GPU shared expert. The implementation submits a
+# shared-only graph and a second host-routed-add graph per CPU layer, so it is
+# only useful for a small CPU-affinity set. The default limit of 16 disables
+# that overlap automatically for larger CPU splits; set to 0 to remove the
+# limit for an explicit experiment.
+# qwen4exp_cpu_gpu_overlap = false
+# qwen4exp_cpu_gpu_overlap_max_layers = 16
+# qwen4exp_cpu_shared_device: after a Qwen CPU-affinity routed graph finishes,
+# hand its result directly to the device shared-expert graph. This avoids the
+# host-facing shared-expert path's extra device-to-host/device transfers, but
+# does not overlap the CPU graph with a shared-only GPU graph. It is Qwen-only
+# and disabled by default until an end-to-end A/B confirms the hardware win.
+# qwen4exp_cpu_shared_device = false
 
 # cpu_offload_max_experts: decode-time cap on how many of a single token/
 # layer's GENUINE disk-cold misses (not RAM- nor VRAM-resident) skip the
@@ -3750,6 +3907,17 @@ prefetch_pilot_k = 8
 # layers where prediction is genuinely good.
 # prefetch_pilot_k_per_layer = [8, 8, 8, 0, 0, 4]
 
+# prefetch_pilot_k_adaptive (2026-09-13): data-driven per-layer fetch width
+# instead of a flat/guessed number -- for each layer, walks ranks 0,1,2...
+# using the live [PILOT-BY-LAYER-RANK] accuracy for THAT layer, stopping at
+# the first rank whose own accuracy drops below the threshold below. Only
+# ever narrows prefetch_pilot_k/prefetch_pilot_k_per_layer's ceiling for
+# that layer, never widens past it. Off by default -- every model/config
+# that doesn't set this keeps its current fetch-width behavior exactly.
+prefetch_pilot_k_adaptive = false
+prefetch_pilot_k_adaptive_threshold = 0.50
+prefetch_pilot_k_adaptive_min_samples = 30
+
 # prefetch_pilot_depth: how many layers ahead the pilot predicts AND pushes
 # real prefetch hints for. 1 (default) = only l+1, the original pilot. 2 =
 # ALSO predicts and hints l+2 (free -- reuses l+1's own input vector, no
@@ -3932,6 +4100,13 @@ ram_vram_promote_min_samples = 30
 ram_vram_promote_layer_gate = false
 ram_vram_promote_layer_gate_threshold = 0.65
 ram_vram_promote_layer_gate_min_samples = 30
+# ram_vram_promote_layer_gate_top_fraction (2026-09-13): rank-based mode --
+# "most confident layers only" instead of the flat threshold above. 0.0
+# (default) = disabled, uses the flat threshold unchanged. e.g. 0.3 = only
+# the top 30% of tracked layers by their OWN live accuracy pass the gate,
+# regardless of the absolute number. Every existing config that doesn't
+# set this keeps its current flat-threshold behavior exactly.
+ram_vram_promote_layer_gate_top_fraction = 0.0
 
 # ram_vram_promote_dynamic_layer (2026-08-26): a graduation of the veto-only
 # gate above -- mutually exclusive with ram_vram_promote_top_k/adaptive

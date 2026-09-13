@@ -755,6 +755,24 @@ bool test_cpu_iq_matmul_paths() {
                     q8k.size(), 0.15f, 0.08f);
             }
             ok = q8k_matches && ok;
+
+            // The experimental AVX-512-width probe must agree with GGML's
+            // production AVX2-width Q8_K result before it is allowed into the
+            // Qwen grouped CPU path.  A mismatch here means an IQ1_M packing,
+            // sign, or scale-porting error rather than normal Q8_K loss.
+            std::vector<float> avx512_q8k((size_t)S * O, 0.0f);
+            float *avx512_out = avx512_q8k.data();
+            const uint8_t *avx512_w = w.data();
+            const bool avx512_ok = matmul_iq1_m_avx512_q8k_grouped(
+                &avx512_out, x.data(), &avx512_w, 1, S, I, O);
+            if (avx512_ok) {
+                ok = compare_iq_outputs(
+                         "IQ1_M AVX-512 Q8_K vs GGML Q8_K", avx512_q8k.data(),
+                         q8k.data(), q8k.size(), 2e-4f, 2e-4f) &&
+                     ok;
+            } else {
+                std::cout << "  -> IQ1_M AVX-512 Q8_K: SKIPPED (ISA/build unavailable)\n";
+            }
         }
     }
 
@@ -814,6 +832,218 @@ bool test_cpu_iq_matmul_paths() {
                                 single[(size_t)m].data(), O, 1e-6f,
                                 1e-6f) &&
              ok;
+
+    // The Qwen decode fast path uses the same activation for IQ1_M gate/up.
+    // The fused pair must be numerically identical to two independent
+    // grouped calls while quantizing Q8_K only once internally.
+    std::vector<std::vector<float>> pair_gate(
+        (size_t)M, std::vector<float>((size_t)O, 0.0f));
+    std::vector<std::vector<float>> pair_up(
+        (size_t)M, std::vector<float>((size_t)O, 0.0f));
+    std::vector<float *> pair_gate_ptr((size_t)M), pair_up_ptr((size_t)M);
+    for (int m = 0; m < M; ++m) {
+        pair_gate_ptr[(size_t)m] = pair_gate[(size_t)m].data();
+        pair_up_ptr[(size_t)m] = pair_up[(size_t)m].data();
+    }
+    ok = matmul_iq1_m_ggml_q8k_grouped_pair(
+             pair_gate_ptr.data(), pair_up_ptr.data(), x.data(), wp.data(),
+             wp.data(), M, 1, I, O) &&
+         ok;
+    for (int m = 0; m < M; ++m) {
+        ok = compare_iq_outputs("IQ1_M fused pair gate vs grouped",
+                                pair_gate[(size_t)m].data(),
+                                grouped[(size_t)m].data(), O, 1e-6f,
+                                1e-6f) &&
+             ok;
+        ok = compare_iq_outputs("IQ1_M fused pair up vs grouped",
+                                pair_up[(size_t)m].data(),
+                                grouped[(size_t)m].data(), O, 1e-6f,
+                                1e-6f) &&
+             ok;
+    }
+
+    // The direct Qwen strided path uses IQ4_NL down projections with a
+    // separate SwiGLU activation for each selected expert.  Check the
+    // grouped-input wrapper against one-matrix calls as well; this catches
+    // the per-expert activation-pointer indexing that a shared-input test
+    // would miss.
+    {
+        constexpr int DOWN_I = 640;
+        constexpr int DOWN_O = 17;
+        std::vector<std::vector<float>> down_x(
+            (size_t)M, std::vector<float>((size_t)DOWN_I));
+        std::vector<std::vector<float>> down_wf(
+            (size_t)M, std::vector<float>((size_t)DOWN_O * DOWN_I));
+        std::vector<std::vector<uint8_t>> down_w((size_t)M);
+        std::vector<const float *> down_x_ptr((size_t)M);
+        std::vector<const uint8_t *> down_w_ptr((size_t)M);
+        std::vector<std::vector<float>> down_grouped(
+            (size_t)M, std::vector<float>((size_t)DOWN_O, 0.0f));
+        std::vector<std::vector<float>> down_single(
+            (size_t)M, std::vector<float>((size_t)DOWN_O, 0.0f));
+        std::vector<float *> down_grouped_ptr((size_t)M),
+            down_single_ptr((size_t)M);
+        const int down_rb = row_bytes(GGUFType::IQ4_NL, DOWN_I);
+        bool down_quantized = true;
+        for (int m = 0; m < M; ++m) {
+            for (float &v : down_x[(size_t)m]) v = dist(rng);
+            for (float &v : down_wf[(size_t)m]) v = dist(rng);
+            down_w[(size_t)m].resize((size_t)DOWN_O * down_rb);
+            for (int o = 0; o < DOWN_O; ++o) {
+                if (!ggml_quantize_row_ref(
+                        (uint32_t)GGUFType::IQ4_NL,
+                        down_wf[(size_t)m].data() + (size_t)o * DOWN_I,
+                        down_w[(size_t)m].data() + (size_t)o * down_rb,
+                        DOWN_I)) {
+                    down_quantized = false;
+                    break;
+                }
+            }
+            down_x_ptr[(size_t)m] = down_x[(size_t)m].data();
+            down_w_ptr[(size_t)m] = down_w[(size_t)m].data();
+            down_grouped_ptr[(size_t)m] = down_grouped[(size_t)m].data();
+            down_single_ptr[(size_t)m] = down_single[(size_t)m].data();
+        }
+        if (!down_quantized) {
+            std::cout << "  -> IQ4_NL grouped-input checks skipped (reference "
+                         "quantizer unavailable)\n";
+        } else {
+            for (int m = 0; m < M; ++m) {
+                const float *one_x = down_x_ptr[(size_t)m];
+                const uint8_t *one_w = down_w_ptr[(size_t)m];
+                float *one_y = down_single_ptr[(size_t)m];
+                ok = matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+                         &one_y, &one_x, &one_w, 1, 1, DOWN_I, DOWN_O) &&
+                     ok;
+            }
+            ok = matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+                     down_grouped_ptr.data(), down_x_ptr.data(),
+                     down_w_ptr.data(), M, 1, DOWN_I, DOWN_O) &&
+                 ok;
+            for (int m = 0; m < M; ++m)
+                ok = compare_iq_outputs(
+                         "IQ4_NL grouped inputs vs single",
+                         down_grouped[(size_t)m].data(),
+                         down_single[(size_t)m].data(), DOWN_O, 1e-6f,
+                         1e-6f) &&
+                     ok;
+        }
+    }
+
+    // Optional Qwen decode probe: gate/up IQ1_M, SwiGLU, and down IQ4_NL
+    // execute under one OpenMP team.  Compare every intermediate/output with
+    // the already-tested grouped composition so this optimization cannot
+    // silently change the routed expert result.
+    {
+        constexpr int FUSED_I = 1024;
+        constexpr int FUSED_GATE_O = 64; // also satisfies IQ4_NL's QK=32
+        constexpr int FUSED_DOWN_O = 17;
+        std::vector<float> fused_x((size_t)FUSED_I);
+        for (float &v : fused_x) v = dist(rng);
+        const int gate_rb = row_bytes(GGUFType::IQ1_M, FUSED_I);
+        const int down_rb = row_bytes(GGUFType::IQ4_NL, FUSED_GATE_O);
+        std::vector<std::vector<uint8_t>> fused_gate_w((size_t)M),
+            fused_up_w((size_t)M), fused_down_w((size_t)M);
+        std::vector<const uint8_t *> fused_gate_wp((size_t)M),
+            fused_up_wp((size_t)M), fused_down_wp((size_t)M);
+        bool fused_quantized = true;
+        for (int m = 0; m < M && fused_quantized; ++m) {
+            std::vector<float> gate_f((size_t)FUSED_GATE_O * FUSED_I),
+                up_f((size_t)FUSED_GATE_O * FUSED_I),
+                down_f((size_t)FUSED_DOWN_O * FUSED_GATE_O);
+            for (float &v : gate_f) v = dist(rng);
+            for (float &v : up_f) v = dist(rng);
+            for (float &v : down_f) v = dist(rng);
+            fused_gate_w[(size_t)m].resize((size_t)FUSED_GATE_O * gate_rb);
+            fused_up_w[(size_t)m].resize((size_t)FUSED_GATE_O * gate_rb);
+            fused_down_w[(size_t)m].resize((size_t)FUSED_DOWN_O * down_rb);
+            for (int o = 0; o < FUSED_GATE_O && fused_quantized; ++o) {
+                fused_quantized =
+                    ggml_quantize_row_ref(
+                        (uint32_t)GGUFType::IQ1_M,
+                        gate_f.data() + (size_t)o * FUSED_I,
+                        fused_gate_w[(size_t)m].data() + (size_t)o * gate_rb,
+                        FUSED_I) &&
+                    ggml_quantize_row_ref(
+                        (uint32_t)GGUFType::IQ1_M,
+                        up_f.data() + (size_t)o * FUSED_I,
+                        fused_up_w[(size_t)m].data() + (size_t)o * gate_rb,
+                        FUSED_I);
+            }
+            for (int o = 0; o < FUSED_DOWN_O && fused_quantized; ++o)
+                fused_quantized = ggml_quantize_row_ref(
+                    (uint32_t)GGUFType::IQ4_NL,
+                    down_f.data() + (size_t)o * FUSED_GATE_O,
+                    fused_down_w[(size_t)m].data() + (size_t)o * down_rb,
+                    FUSED_GATE_O);
+            fused_gate_wp[(size_t)m] = fused_gate_w[(size_t)m].data();
+            fused_up_wp[(size_t)m] = fused_up_w[(size_t)m].data();
+            fused_down_wp[(size_t)m] = fused_down_w[(size_t)m].data();
+        }
+        if (!fused_quantized) {
+            std::cout << "  -> Qwen fused IQ1/IQ4 check skipped (reference "
+                         "quantizer unavailable)\n";
+        } else {
+            std::vector<std::vector<float>> ref_gate(
+                (size_t)M, std::vector<float>((size_t)FUSED_GATE_O));
+            std::vector<std::vector<float>> ref_up(
+                (size_t)M, std::vector<float>((size_t)FUSED_GATE_O));
+            std::vector<std::vector<float>> ref_down(
+                (size_t)M, std::vector<float>((size_t)FUSED_DOWN_O));
+            std::vector<std::vector<float>> fused_gate = ref_gate,
+                fused_up = ref_up, fused_down = ref_down;
+            std::vector<float *> ref_gate_p((size_t)M), ref_up_p((size_t)M),
+                ref_down_p((size_t)M), fused_gate_p((size_t)M),
+                fused_up_p((size_t)M), fused_down_p((size_t)M);
+            std::vector<const float *> ref_down_x((size_t)M);
+            for (int m = 0; m < M; ++m) {
+                ref_gate_p[(size_t)m] = ref_gate[(size_t)m].data();
+                ref_up_p[(size_t)m] = ref_up[(size_t)m].data();
+                ref_down_p[(size_t)m] = ref_down[(size_t)m].data();
+                fused_gate_p[(size_t)m] = fused_gate[(size_t)m].data();
+                fused_up_p[(size_t)m] = fused_up[(size_t)m].data();
+                fused_down_p[(size_t)m] = fused_down[(size_t)m].data();
+            }
+            ok = matmul_iq1_m_ggml_q8k_grouped_pair(
+                     ref_gate_p.data(), ref_up_p.data(), fused_x.data(),
+                     fused_gate_wp.data(), fused_up_wp.data(), M, 1,
+                     FUSED_I, FUSED_GATE_O) &&
+                 ok;
+            for (int m = 0; m < M; ++m) {
+                silu_inplace(ref_gate[(size_t)m].data(), FUSED_GATE_O);
+                elem_mul(ref_gate[(size_t)m].data(), ref_gate[(size_t)m].data(),
+                         ref_up[(size_t)m].data(), FUSED_GATE_O);
+                ref_down_x[(size_t)m] = ref_gate[(size_t)m].data();
+            }
+            ok = matmul_iq4_nl_ggml_q8_0_grouped_inputs(
+                     ref_down_p.data(), ref_down_x.data(),
+                     fused_down_wp.data(), M, 1, FUSED_GATE_O, FUSED_DOWN_O) &&
+                 ok;
+            ok = matmul_qwen_iq1_m_iq4_nl_fused(
+                     fused_gate_p.data(), fused_up_p.data(), fused_down_p.data(),
+                     fused_x.data(), fused_gate_wp.data(), fused_up_wp.data(),
+                     fused_down_wp.data(), M, FUSED_I, FUSED_GATE_O,
+                     FUSED_DOWN_O) &&
+                 ok;
+            for (int m = 0; m < M; ++m) {
+                ok = compare_iq_outputs(
+                         "Qwen fused IQ1/IQ4 gate", fused_gate[(size_t)m].data(),
+                         ref_gate[(size_t)m].data(), FUSED_GATE_O, 1e-6f,
+                         1e-6f) &&
+                     ok;
+                ok = compare_iq_outputs(
+                         "Qwen fused IQ1/IQ4 up", fused_up[(size_t)m].data(),
+                         ref_up[(size_t)m].data(), FUSED_GATE_O, 1e-6f,
+                         1e-6f) &&
+                     ok;
+                ok = compare_iq_outputs(
+                         "Qwen fused IQ1/IQ4 down", fused_down[(size_t)m].data(),
+                         ref_down[(size_t)m].data(), FUSED_DOWN_O, 1e-6f,
+                         1e-6f) &&
+                     ok;
+            }
+        }
+    }
 
     for (GGUFType type : {GGUFType::IQ2_XXS, GGUFType::IQ3_XXS}) {
         const int rb = row_bytes(type, I);
@@ -1169,20 +1399,19 @@ bool test_qwen_cpu_moe_mixed_strided_graph() {
     const size_t gate_used = (size_t)FF * gate_row;
     const size_t up_used = (size_t)FF * up_row;
     const size_t down_used = (size_t)D * down_row;
-    const size_t stride = std::max({gate_used, up_used, down_used}) + 64;
-    const size_t plane_bytes = stride * (size_t)N;
+    const size_t stride = gate_used + up_used + down_used + 64;
+    const size_t arena_bytes = stride * (size_t)N;
 
     void *arena_raw = nullptr;
-    if (posix_memalign(&arena_raw, 64, plane_bytes * 3) != 0 ||
-        !arena_raw) {
+    if (posix_memalign(&arena_raw, 64, arena_bytes) != 0 || !arena_raw) {
         std::cout << "  -> FAILED (arena allocation)\n";
         return false;
     }
     auto *arena = static_cast<uint8_t *>(arena_raw);
     auto *gate_plane = arena;
-    auto *up_plane = arena + plane_bytes;
-    auto *down_plane = arena + 2 * plane_bytes;
-    std::memset(arena, 0, plane_bytes * 3);
+    auto *up_plane = arena + gate_used;
+    auto *down_plane = arena + gate_used + up_used;
+    std::memset(arena, 0, arena_bytes);
 
     std::mt19937 rng(20260912 + 7);
     std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
@@ -1302,19 +1531,18 @@ bool test_qwen_cpu_moe_iq2_strided_graph() {
     const size_t down_row = row_bytes(down_type, FF);
     const size_t gate_used = (size_t)FF * gate_row;
     const size_t down_used = (size_t)D * down_row;
-    const size_t stride = std::max(gate_used, down_used) + 64;
-    const size_t plane_bytes = stride * (size_t)N;
+    const size_t stride = gate_used + gate_used + down_used + 64;
+    const size_t arena_bytes = stride * (size_t)N;
     void *arena_raw = nullptr;
-    if (posix_memalign(&arena_raw, 64, plane_bytes * 3) != 0 ||
-        !arena_raw) {
+    if (posix_memalign(&arena_raw, 64, arena_bytes) != 0 || !arena_raw) {
         std::cout << "  -> FAILED (arena allocation)\n";
         return false;
     }
     auto *arena = static_cast<uint8_t *>(arena_raw);
     auto *gate_plane = arena;
-    auto *up_plane = arena + plane_bytes;
-    auto *down_plane = arena + 2 * plane_bytes;
-    std::memset(arena, 0, plane_bytes * 3);
+    auto *up_plane = arena + gate_used;
+    auto *down_plane = arena + gate_used + gate_used;
+    std::memset(arena, 0, arena_bytes);
 
     std::mt19937 rng(20260912 + 17);
     std::uniform_real_distribution<float> dist(-0.4f, 0.4f);
@@ -1425,23 +1653,24 @@ bool bench_qwen_cpu_moe() {
     const size_t gate_bytes = (size_t)FF * row_bytes(gate_type, D);
     const size_t up_bytes = (size_t)FF * row_bytes(up_type, D);
     const size_t down_bytes = (size_t)D * row_bytes(down_type, FF);
-    const size_t stride = std::max({gate_bytes, up_bytes, down_bytes}) + 64;
-    const size_t plane_bytes = stride * (size_t)N;
+    // Match the production graph-RAM source contract: each expert is one
+    // fixed-stride [gate|up|down] slab.  This is also what enables the
+    // BeeLlama-style merged gate_up MUL_MAT_ID path being measured here.
+    const size_t raw_stride = gate_bytes + up_bytes + down_bytes;
+    const size_t stride = raw_stride + 64;
+    const size_t arena_bytes = stride * (size_t)N;
 
-    void *gate_raw = nullptr, *up_raw = nullptr, *down_raw = nullptr;
-    if (posix_memalign(&gate_raw, 64, plane_bytes) != 0 ||
-        posix_memalign(&up_raw, 64, plane_bytes) != 0 ||
-        posix_memalign(&down_raw, 64, plane_bytes) != 0 ||
-        !gate_raw || !up_raw || !down_raw) {
-        std::free(gate_raw);
-        std::free(up_raw);
-        std::free(down_raw);
+    void *arena_raw = nullptr;
+    if (posix_memalign(&arena_raw, 64, arena_bytes) != 0 || !arena_raw) {
+        std::free(arena_raw);
         std::cout << "  -> FAILED (arena allocation)\n";
         return false;
     }
-    std::memset(gate_raw, 0, plane_bytes);
-    std::memset(up_raw, 0, plane_bytes);
-    std::memset(down_raw, 0, plane_bytes);
+    auto *arena = static_cast<uint8_t *>(arena_raw);
+    std::memset(arena, 0, arena_bytes);
+    auto *gate_raw = arena;
+    auto *up_raw = arena + gate_bytes;
+    auto *down_raw = arena + gate_bytes + up_bytes;
 
     // This is a throughput benchmark, not a quantizer-correctness test.  The
     // GGML kernels consume fixed-size block bytes, so deterministic raw block
@@ -1490,9 +1719,7 @@ bool bench_qwen_cpu_moe() {
                             down_raw, ids.data(), N, weights.data(), D, FF,
                             TOPK, stride)) {
         runner.shutdown();
-        std::free(gate_raw);
-        std::free(up_raw);
-        std::free(down_raw);
+        std::free(arena_raw);
         std::cout << "  -> FAILED (runner setup/warm-up)\n";
         return false;
     }
@@ -1526,10 +1753,136 @@ bool bench_qwen_cpu_moe() {
               << " tok/s | 16 CPU layers="
               << (1000.0 / (16.0 * ms_per_layer))
               << " tok/s | checksum=" << checksum << "\n";
+
+    // Optional apples-to-apples kernel probe.  The full GGML graph above is
+    // still the production reference; this isolates only the IQ1_M gate/up
+    // projection so an AVX-512 improvement is not hidden by down/IQ4_NL or
+    // graph scheduling time.  It is opt-in because it adds a second timed
+    // experiment to this diagnostic benchmark.
+    if (!use_iq2 && std::getenv("MOESTREAM_QWEN_CPU_BENCH_AVX512")) {
+        std::vector<const uint8_t *> gate_weights((size_t)TOPK);
+        std::vector<std::vector<float>> ggml_out(
+            (size_t)TOPK, std::vector<float>((size_t)FF));
+        std::vector<std::vector<float>> avx512_out(
+            (size_t)TOPK, std::vector<float>((size_t)FF));
+        std::vector<float *> ggml_ptr((size_t)TOPK);
+        std::vector<float *> avx512_ptr((size_t)TOPK);
+        for (int k = 0; k < TOPK; ++k) {
+            gate_weights[(size_t)k] =
+                static_cast<const uint8_t *>(gate_raw) +
+                (size_t)ids[(size_t)k] * stride;
+            ggml_ptr[(size_t)k] = ggml_out[(size_t)k].data();
+            avx512_ptr[(size_t)k] = avx512_out[(size_t)k].data();
+        }
+        for (int i = 0; i < 2; ++i) {
+            matmul_iq1_m_ggml_q8k_grouped(
+                ggml_ptr.data(), input.data(), gate_weights.data(), TOPK, 1,
+                D, FF);
+            matmul_iq1_m_avx512_q8k_grouped(
+                avx512_ptr.data(), input.data(), gate_weights.data(), TOPK, 1,
+                D, FF);
+        }
+        const int probe_iters = std::max(1, iterations * 2);
+        auto probe = [&](bool avx512) {
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < probe_iters; ++i) {
+                if (avx512)
+                    matmul_iq1_m_avx512_q8k_grouped(
+                        avx512_ptr.data(), input.data(), gate_weights.data(),
+                        TOPK, 1, D, FF);
+                else
+                    matmul_iq1_m_ggml_q8k_grouped(
+                        ggml_ptr.data(), input.data(), gate_weights.data(),
+                        TOPK, 1, D, FF);
+            }
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - begin)
+                       .count() /
+                   probe_iters;
+        };
+        const double ggml_ms = probe(false);
+        const double avx512_ms = probe(true);
+        double max_diff = 0.0;
+        for (int k = 0; k < TOPK; ++k)
+            for (int o = 0; o < FF; ++o)
+                max_diff = std::max(
+                    max_diff,
+                    static_cast<double>(std::abs(
+                        ggml_out[(size_t)k][(size_t)o] -
+                        avx512_out[(size_t)k][(size_t)o])));
+        std::cout << "  IQ1_M gate/up kernel probe: GGML-AVX2=" << ggml_ms
+                  << " ms/grouped-call AVX-512=" << avx512_ms
+                  << " ms/grouped-call speedup=" << (ggml_ms / avx512_ms)
+                  << "x max_abs_diff=" << max_diff << "\n";
+    }
+
+    // Optional direct-kernel A/B for the Qwen strided grouped path. The
+    // persistent GGML graph benchmark above does not exercise these wrappers;
+    // this isolates the gate/up pair's single quantization/team launch from
+    // the rest of the CPU MoE graph.
+    if (!use_iq2 &&
+        std::getenv("MOESTREAM_QWEN_CPU_BENCH_DIRECT_GROUPED")) {
+        constexpr int DIRECT_M = TOPK;
+        const int direct_rb = row_bytes(GGUFType::IQ1_M, D);
+        std::vector<std::vector<uint8_t>> direct_weights(
+            (size_t)DIRECT_M,
+            std::vector<uint8_t>((size_t)FF * direct_rb, 0));
+        std::vector<const uint8_t *> direct_ptr((size_t)DIRECT_M);
+        for (int m = 0; m < DIRECT_M; ++m)
+            direct_ptr[(size_t)m] = direct_weights[(size_t)m].data();
+        std::vector<std::vector<float>> direct_gate(
+            (size_t)DIRECT_M, std::vector<float>((size_t)FF));
+        std::vector<std::vector<float>> direct_up(
+            (size_t)DIRECT_M, std::vector<float>((size_t)FF));
+        std::vector<float *> direct_gate_ptr((size_t)DIRECT_M),
+            direct_up_ptr((size_t)DIRECT_M);
+        for (int m = 0; m < DIRECT_M; ++m) {
+            direct_gate_ptr[(size_t)m] = direct_gate[(size_t)m].data();
+            direct_up_ptr[(size_t)m] = direct_up[(size_t)m].data();
+        }
+        for (int i = 0; i < 2; ++i) {
+            matmul_iq1_m_ggml_q8k_grouped(
+                direct_gate_ptr.data(), input.data(), direct_ptr.data(),
+                DIRECT_M, 1, D, FF);
+            matmul_iq1_m_ggml_q8k_grouped(
+                direct_up_ptr.data(), input.data(), direct_ptr.data(),
+                DIRECT_M, 1, D, FF);
+            matmul_iq1_m_ggml_q8k_grouped_pair(
+                direct_gate_ptr.data(), direct_up_ptr.data(), input.data(),
+                direct_ptr.data(), direct_ptr.data(), DIRECT_M, 1, D, FF);
+        }
+        const int direct_iters = std::max(1, iterations * 2);
+        auto direct_time = [&](bool pair) {
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < direct_iters; ++i) {
+                if (pair) {
+                    matmul_iq1_m_ggml_q8k_grouped_pair(
+                        direct_gate_ptr.data(), direct_up_ptr.data(),
+                        input.data(), direct_ptr.data(), direct_ptr.data(),
+                        DIRECT_M, 1, D, FF);
+                } else {
+                    matmul_iq1_m_ggml_q8k_grouped(
+                        direct_gate_ptr.data(), input.data(), direct_ptr.data(),
+                        DIRECT_M, 1, D, FF);
+                    matmul_iq1_m_ggml_q8k_grouped(
+                        direct_up_ptr.data(), input.data(), direct_ptr.data(),
+                        DIRECT_M, 1, D, FF);
+                }
+            }
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - begin)
+                       .count() /
+                   direct_iters;
+        };
+        const double separate_ms = direct_time(false);
+        const double pair_ms = direct_time(true);
+        std::cout << "  direct IQ1_M gate/up: separate=" << separate_ms
+                  << " ms/pair pair=" << pair_ms
+                  << " ms/pair speedup=" << (separate_ms / pair_ms)
+                  << "x (OMP threads=" << omp_get_max_threads() << ")\n";
+    }
     runner.shutdown();
-    std::free(gate_raw);
-    std::free(up_raw);
-    std::free(down_raw);
+    std::free(arena_raw);
     std::cout << "  -> Qwen CPU benchmark " << (ok ? "COMPLETED" : "FAILED")
               << "\n";
     return ok;

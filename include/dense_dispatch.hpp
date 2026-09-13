@@ -538,6 +538,71 @@ inline int pilot_k_for_layer(int layer_idx) {
     return pilot_k_default_value();
 }
 
+// prefetch_pilot_k_adaptive (2026-09-13): "most confident numbers" fetch
+// width -- see EngineConfig::prefetch_pilot_k_adaptive's own comment for
+// the full motivation (22.8% of real prefetches this session were pure
+// LRU-evicted-before-use waste, concentrated in the low-confidence tail
+// ranks that also happen to be the MAJORITY of the fetch-worthy volume).
+// Same set-once-at-startup idiom as pilot_k_for_layer above.
+struct PilotKAdaptiveConfig {
+    bool enabled = false;
+    double threshold = 0.50;
+    int min_samples = 30;
+};
+inline PilotKAdaptiveConfig& pilot_k_adaptive_config() {
+    static PilotKAdaptiveConfig v;
+    return v;
+}
+inline void set_pilot_k_adaptive_config(bool enabled, double threshold, int min_samples) {
+    auto& v = pilot_k_adaptive_config();
+    v.enabled = enabled;
+    v.threshold = threshold;
+    v.min_samples = min_samples;
+}
+// Returns the effective fetch width for this layer transition: the
+// existing static ceiling (pilot_k_for_layer, ALREADY min'd against
+// c.topk by the caller) when the mode is off, cold-start (rank 0 itself
+// lacks min_samples live checks yet), or out of the tracked-layer range
+// -- same "no real signal yet means don't act on it" shape as every other
+// gate in this file. Otherwise walks ranks 0..ceiling-1, using the SAME
+// live per-layer-rank counters [PILOT-BY-LAYER-RANK] reports
+// (PerfCounters::n_pilot_recall_hits_by_layer_rank/checks_by_layer_rank
+// -- marginal, all-checks accuracy, not fetch-worthy-only; a real,
+// already-collected proxy for "is predicting this rank at this layer
+// generally reliable", one gate reuse cheaper than adding a second,
+// fetch-worthy-only 2D counter), stopping at the first rank whose own
+// accuracy drops below threshold (contiguous-prefix, matches ram_vram_
+// promote_adaptive's own proven shape) -- so a layer never fetches past
+// the point its own live data says is more likely wrong than right.
+// Deliberately floor 1 (always fetch at least the single top prediction)
+// and ceiling-capped (never fetches MORE than the existing static width
+// would have) -- narrows only, never widens.
+inline int adaptive_pilot_k_for_layer(int layer_idx, int ceiling) {
+    const auto& cfg = pilot_k_adaptive_config();
+    if (!cfg.enabled) return ceiling;
+    if (layer_idx < 0 || layer_idx >= PerfCounters::kMaxTrackedLayersForMiss) return ceiling;
+    if (ceiling <= 1) return ceiling;
+    auto& p = perf();
+    int kept = 0;
+    int cap = std::min(ceiling, 8);  // n_pilot_recall_*_by_layer_rank is a fixed [8] array
+    for (int k = 0; k < cap; ++k) {
+        uint32_t checks = p.n_pilot_recall_checks_by_layer_rank[layer_idx][k].load(std::memory_order_relaxed);
+        if (checks < (uint32_t)cfg.min_samples) {
+            // No real signal yet for this rank -- if this is rank 0 (cold
+            // start for the whole layer), fall back to the full ceiling
+            // unchanged; otherwise stop extending here (can't trust an
+            // unmeasured rank enough to include it, but ranks already
+            // accepted below it stay accepted).
+            return k == 0 ? ceiling : std::max(1, kept);
+        }
+        uint32_t hits = p.n_pilot_recall_hits_by_layer_rank[layer_idx][k].load(std::memory_order_relaxed);
+        double acc = (double)hits / (double)checks;
+        if (acc < cfg.threshold) return std::max(1, kept);
+        kept = k + 1;
+    }
+    return std::max(1, kept);
+}
+
 // Same set-once-at-startup / read-everywhere idiom as pilot_k_for_layer
 // above, for EngineConfig::prefetch_pilot_depth / prefetch_pilot_k_depth2
 // (set_prefetch_pilot_depth, main.cpp; read from execution_layer.cpp's
@@ -1023,16 +1088,83 @@ struct LayerPromoteGateConfig {
     bool enabled = false;
     double threshold = 0.65;
     int min_samples = 30;
+    // top_fraction (2026-09-13): rank-based "most confident layers only"
+    // mode -- see layer_promote_allowed's own comment below and
+    // EngineConfig::ram_vram_promote_layer_gate_top_fraction's comment
+    // for the full motivation. 0.0 = disabled, falls back to the flat
+    // `threshold` above unchanged.
+    double top_fraction = 0.0;
 };
 inline LayerPromoteGateConfig& layer_promote_gate_config() {
     static LayerPromoteGateConfig v;
     return v;
 }
-inline void set_layer_promote_gate_config(bool enabled, double threshold, int min_samples) {
+inline void set_layer_promote_gate_config(bool enabled, double threshold, int min_samples,
+                                           double top_fraction = 0.0) {
     auto& v = layer_promote_gate_config();
     v.enabled = enabled;
     v.threshold = threshold;
     v.min_samples = min_samples;
+    v.top_fraction = top_fraction;
+}
+
+// rank_based_layer_accuracy_cutoff (2026-09-13): backs layer_promote_
+// allowed's top_fraction mode. Sorts every currently-tracked layer's OWN
+// live accuracy (same counters [PILOT-BY-LAYER] reports) and returns the
+// accuracy value at the top_fraction cut point -- callers then require
+// acc >= this cutoff, which is a real "top N%" selection instead of an
+// absolute pass/fail line. Deliberately CACHED and refreshed only every
+// kRefreshInterval calls rather than recomputed on every call: this is
+// reached from the decode-thread hot path (up to prefetch_pilot_k times
+// per layer transition), and per-layer accuracy moves slowly over a
+// session, so a coarse refresh is both safe and far cheaper than sorting
+// ~kMaxTrackedLayersForMiss layers on every rank check. is_attn_pilot
+// keeps DEPTH-1 and ATTN-PILOT ranked independently, matching every
+// other per-pilot-type split in this gate. Returns 0.0 (== "allow all",
+// same cold-start-safe default as the flat-threshold path) until the
+// first layer anywhere has crossed min_samples -- no real signal yet
+// means don't act on it, not "assume the worst".
+inline double rank_based_layer_accuracy_cutoff(bool is_attn_pilot,
+                                                const LayerPromoteGateConfig& cfg) {
+    struct Cache {
+        std::atomic<uint64_t> calls{0};
+        std::atomic<double> cutoff{0.0};
+    };
+    static Cache depth1_cache;
+    static Cache attn_cache;
+    Cache& c = is_attn_pilot ? attn_cache : depth1_cache;
+
+    constexpr uint64_t kRefreshInterval = 256;
+    uint64_t n = c.calls.fetch_add(1, std::memory_order_relaxed);
+    if (n % kRefreshInterval == 0) {
+        auto& p = perf();
+        std::vector<double> accs;
+        accs.reserve(PerfCounters::kMaxTrackedLayersForMiss);
+        for (int li = 0; li < PerfCounters::kMaxTrackedLayersForMiss; ++li) {
+            uint32_t checks = is_attn_pilot
+                ? p.n_pilot_attn_recall_checks_by_layer[li].load(std::memory_order_relaxed)
+                : p.n_pilot_recall_checks_by_layer[li].load(std::memory_order_relaxed);
+            if (checks < (uint32_t)cfg.min_samples) continue;
+            uint32_t topk_sum = is_attn_pilot
+                ? p.n_pilot_attn_recall_topk_sum_by_layer[li].load(std::memory_order_relaxed)
+                : p.n_pilot_recall_topk_sum_by_layer[li].load(std::memory_order_relaxed);
+            if (topk_sum == 0) continue;
+            uint32_t hits = is_attn_pilot
+                ? p.n_pilot_attn_recall_hits_by_layer[li].load(std::memory_order_relaxed)
+                : p.n_pilot_recall_hits_by_layer[li].load(std::memory_order_relaxed);
+            accs.push_back((double)hits / (double)topk_sum);
+        }
+        if (!accs.empty()) {
+            std::sort(accs.begin(), accs.end(), std::greater<double>());
+            size_t keep = (size_t)(accs.size() * cfg.top_fraction);
+            if (keep == 0) keep = 1;  // always keep at least the single best layer
+            if (keep > accs.size()) keep = accs.size();
+            c.cutoff.store(accs[keep - 1], std::memory_order_relaxed);
+        }
+        // else: leave the cached cutoff as-is (0.0 on the very first call --
+        // allow-all cold start, same shape as the flat path's min_samples guard).
+    }
+    return c.cutoff.load(std::memory_order_relaxed);
 }
 // Returns true = allow the promotion the caller already decided to make;
 // false = veto it. is_attn_pilot selects which pilot's OWN per-layer
@@ -1061,6 +1193,12 @@ inline bool layer_promote_allowed(int layer_idx, bool is_attn_pilot) {
         : p.n_pilot_recall_topk_sum_by_layer[layer_idx].load(std::memory_order_relaxed);
     if (topk_sum == 0) return true;
     double acc = (double)hits / (double)topk_sum;
+    if (cfg.top_fraction > 0.0 && cfg.top_fraction < 1.0) {
+        // Rank-based "most confident layers only" mode -- see
+        // rank_based_layer_accuracy_cutoff's own comment above.
+        double cutoff = rank_based_layer_accuracy_cutoff(is_attn_pilot, cfg);
+        return acc >= cutoff;
+    }
     return acc >= cfg.threshold;
 }
 
@@ -1148,6 +1286,30 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
         LOG_ERROR("[DENSE] %s type=%u: CPU dequant unavailable — some outputs zeroed\n",
                   wname.c_str(), (unsigned)W.meta.type);
     }
+}
+
+// Narrow Qwen4Exp shared-expert bridge.  The normal dense_proj() contract is
+// intentionally unchanged: every call owns its activation upload.  These
+// helpers are used only by run_qwen4exp_shared_host() for the three
+// projections which read the same normed activation.  A false return means
+// "use dense_proj normally" (BF16 fast path, missing device tensor, or a
+// dispatch failure), never "the projection was completed".
+inline bool dense_upload_shared_input(StreamingEngine& engine,
+                                      const float* x, int S, int I) {
+    if (cpu_only_mode() || !engine.gpu || !x) return false;
+    return engine.gpu->dense_matmul_host_upload_input(x, S, I);
+}
+
+inline bool dense_proj_from_shared_input(StreamingEngine& engine,
+                                         const std::string& wname,
+                                         float* y, int S, int I, int O) {
+    auto it = engine.resident_layers.find(wname);
+    if (it == engine.resident_layers.end() || !it->second.host_ptr ||
+        cpu_only_mode() || !engine.gpu || !it->second.device_ptr ||
+        it->second.gpu_fast_ptr)
+        return false;
+    return engine.gpu->dense_matmul_host_reuse_input(
+        it->second.meta.type, it->second.device_ptr, y, S, I, O);
 }
 
 // F32 RMSNorm via GPU (norm weights are offloaded to VRAM), CPU rmsnorm fallback.

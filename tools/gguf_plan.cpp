@@ -81,6 +81,16 @@ bool is_dense_offload_candidate(const std::string &name) {
       name.find("indexer.proj.weight") != std::string::npos) {
     return true;
   }
+  // engram_q/engram_k/engram_wkv (DeepSeek-V4.1's Engram gate/projection
+  // weights, NOT engram_embd -- that giant hash-embedding table is
+  // deliberately kept mmap'd on NVMe, see deepseek41_engram.cpp) -- same
+  // gap fixed in src/main.cpp's own predicate, found investigating a real
+  // CPU-fallback cost these small resident tensors were paying.
+  if (name.find("engram_wkv.weight") != std::string::npos ||
+      name.find("engram_q.weight") != std::string::npos ||
+      name.find("engram_k.weight") != std::string::npos) {
+    return true;
+  }
   // hc_ catches DeepSeek-V4's Hyper-Connections weights (6 per-layer +
   // 3 global output_hc_*) -- see src/main.cpp's own comment on this same
   // predicate for the full rationale.
@@ -117,6 +127,10 @@ const char *categorize_dense_tensor(const std::string &name) {
   if (name.find("compressor_") != std::string::npos ||
       name.find("indexer.") != std::string::npos)
     return "compressed_attention (CSA/HCA/indexer)";
+  if (name.find("engram_wkv.weight") != std::string::npos ||
+      name.find("engram_q.weight") != std::string::npos ||
+      name.find("engram_k.weight") != std::string::npos)
+    return "indexer/engram (DeepSeek-V4.1 gate projections)";
   if (name.find("shexp") != std::string::npos)
     return "shared_expert (shexp)";
   if (name.find("ffn_gate.weight") != std::string::npos ||

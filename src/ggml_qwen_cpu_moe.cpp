@@ -8,7 +8,11 @@
 
 #include "ggml_moe_backend.hpp"
 
+#include "logger.hpp"
+
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -32,14 +36,110 @@ constexpr size_t kGraphContextBytes = 2ull * 1024ull * 1024ull;
 
 int default_cpu_threads() {
 #if defined(_OPENMP)
-  return std::max(1, omp_get_max_threads());
+  const int available = std::max(1, omp_get_max_threads());
 #else
-  return 1;
+  const int available = 1;
 #endif
+
+  // Qwen decode's MUL_MAT_ID graphs are small enough that SMT is not always
+  // beneficial: each selected expert performs irregular IQ unpacking and
+  // competes for the same LLC.  Keep the existing process-wide default, but
+  // allow a Qwen-only A/B override without changing any other model family or
+  // the application's global OpenMP setting.
+  const char *env = std::getenv("MOESTREAM_QWEN_CPU_THREADS");
+  if (env && env[0]) {
+    char *end = nullptr;
+    const long requested = std::strtol(env, &end, 10);
+    if (end != env && *end == '\0' && requested > 0)
+      return std::min(available, static_cast<int>(requested));
+  }
+  return available;
 }
 
 bool type_is_valid(uint32_t type) {
   return type < static_cast<uint32_t>(GGML_TYPE_COUNT);
+}
+
+// Optional decode-only timing for the persistent Qwen CPU graph.  The normal
+// production path does not pay for extra clocks or atomics.  Set
+// MOESTREAM_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS to the expected number of
+// decode graph calls (for example 3840 for 48 CPU layers x 80 tokens) to get
+// one aggregate split at the end of that window.  This is deliberately kept
+// in the Qwen runner instead of the generic PerfCounters so other model
+// families and the ordinary CPU fallback remain untouched.
+struct QwenCpuGraphTiming {
+  bool enabled = false;
+  uint64_t report_calls = 0;
+  std::atomic<uint64_t> calls{0};
+  std::atomic<double> input_s{0.0};
+  std::atomic<double> compute_s{0.0};
+  std::atomic<double> output_s{0.0};
+  std::atomic<double> total_s{0.0};
+  std::atomic<bool> reported{false};
+};
+
+QwenCpuGraphTiming &qwen_cpu_graph_timing() {
+  static QwenCpuGraphTiming state;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const char *env =
+        std::getenv("MOESTREAM_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS");
+    if (!env || !env[0])
+      return;
+    char *end = nullptr;
+    const unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (end != env && *end == '\0' && parsed > 0) {
+      // The state object is function-static and already constructed before
+      // call_once invokes this initializer.
+      state.enabled = true;
+      state.report_calls = static_cast<uint64_t>(parsed);
+    }
+  });
+  return state;
+}
+
+void qwen_cpu_graph_timing_add(std::atomic<double> &target, double seconds) {
+  double old = target.load(std::memory_order_relaxed);
+  while (!target.compare_exchange_weak(old, old + seconds,
+                                       std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+  }
+}
+
+void qwen_cpu_graph_timing_report(QwenCpuGraphTiming &state,
+                                  uint64_t calls) {
+  if (!state.enabled || calls != state.report_calls ||
+      state.reported.exchange(true, std::memory_order_relaxed))
+    return;
+  const double input = state.input_s.load(std::memory_order_relaxed);
+  const double compute = state.compute_s.load(std::memory_order_relaxed);
+  const double output = state.output_s.load(std::memory_order_relaxed);
+  const double total = state.total_s.load(std::memory_order_relaxed);
+  LOG_STREAM_INFO()
+      << "[CPU-MOE-GRAPH-TIMING] calls=" << calls
+      << " input_copy=" << input << "s (" << input * 1000.0 / calls
+      << "ms/call) compute=" << compute << "s ("
+      << compute * 1000.0 / calls << "ms/call) output_copy=" << output
+      << "s (" << output * 1000.0 / calls << "ms/call) total=" << total
+      << "s (" << total * 1000.0 / calls << "ms/call)\n";
+}
+
+// The production Qwen graph-RAM arena is interleaved per expert as
+// [gate|up|down].  Some focused tests and legacy callers provide three
+// independent strided planes instead; those must keep the separate gate/up
+// graph because their up pointer is not adjacent to the gate plane.
+bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
+                       const void *gate_plane, const void *up_plane) {
+  static const bool disabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_DISABLE_MERGED_GATE_UP");
+    return env && env[0] == '1';
+  }();
+  if (disabled)
+    return false;
+  return ref.gate_type == ref.up_type && ref.gate_bytes == ref.up_bytes &&
+         gate_plane && up_plane &&
+         static_cast<const uint8_t *>(up_plane) ==
+             static_cast<const uint8_t *>(gate_plane) + ref.gate_bytes;
 }
 
 } // namespace
@@ -49,7 +149,42 @@ GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance() {
   return runner;
 }
 
+GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance_for_strided(
+    const GgmlQwenCpuExpertRef &layer, int n_experts, int d_model, int d_ff,
+    int topk, size_t expert_stride, bool output_per_expert) {
+  // The current Qwen4Exp checkpoint needs two entries (IQ1_M and IQ2_XXS),
+  // while the extra slots make this resilient to a future third quantized
+  // layer family without falling back to per-layer graph destruction.  These
+  // runners are used serially by one decode request, but each keeps its own
+  // persistent GGML graph and worker pool.
+  static std::array<GgmlQwenCpuMoeRunner, 8> runners;
+  for (auto &runner : runners) {
+    if (runner.has_strided_signature(layer, n_experts, d_model, d_ff, topk,
+                                     expert_stride, output_per_expert))
+      return runner;
+  }
+  for (auto &runner : runners) {
+    if (!runner.graph_)
+      return runner;
+  }
+  // More signatures than the reserved cache is unexpected.  Reusing a slot
+  // retains the old safe behavior (ensure_graph() will rebuild it), while all
+  // normal Qwen signatures take one of the persistent slots above.
+  return runners[0];
+}
+
 bool GgmlQwenCpuMoeRunner::compiled_in() { return true; }
+
+bool GgmlQwenCpuMoeRunner::has_strided_signature(
+    const GgmlQwenCpuExpertRef &layer, int n_experts, int d_model, int d_ff,
+    int topk, size_t expert_stride, bool output_per_expert) const {
+  return graph_ && strided_mode_ && n_experts_ == n_experts &&
+         d_model_ == d_model && d_ff_ == d_ff && topk_ == topk &&
+         gate_type_ == layer.gate_type && up_type_ == layer.up_type &&
+         down_type_ == layer.down_type &&
+         output_per_expert_ == output_per_expert &&
+         expert_stride_ == expert_stride;
+}
 
 GgmlQwenCpuMoeRunner::~GgmlQwenCpuMoeRunner() { shutdown(); }
 
@@ -86,7 +221,7 @@ void GgmlQwenCpuMoeRunner::free_graph() {
     ggml_free(static_cast<ggml_context *>(weight_ctx_));
     weight_ctx_ = nullptr;
   }
-  gate_ = up_ = down_ = nullptr;
+  gate_ = up_ = gate_up_ = down_ = nullptr;
   if (weight_storage_)
     std::free(weight_storage_);
   weight_storage_ = nullptr;
@@ -94,6 +229,7 @@ void GgmlQwenCpuMoeRunner::free_graph() {
   n_experts_ = d_model_ = d_ff_ = topk_ = 0;
   gate_type_ = up_type_ = down_type_ = 0;
   strided_mode_ = false;
+  merged_gate_up_ = false;
   output_per_expert_ = false;
   expert_stride_ = 0;
   cached_sources_.clear();
@@ -132,13 +268,17 @@ void GgmlQwenCpuMoeRunner::shutdown() {
 bool GgmlQwenCpuMoeRunner::ensure_graph(
     const GgmlQwenCpuExpertRef &ref, int n_experts, int d_model, int d_ff,
     int topk, bool strided, const void *gate_plane, const void *up_plane,
-    const void *down_plane, size_t expert_stride, bool output_per_expert) {
+    const void *down_plane, size_t expert_stride, bool output_per_expert,
+    bool merged_gate_up) {
   if (!type_is_valid(ref.gate_type) || !type_is_valid(ref.up_type) ||
       !type_is_valid(ref.down_type) || n_experts <= 0 || d_model <= 0 ||
       d_ff <= 0 || topk <= 0 || topk > n_experts ||
       (strided &&
        (!gate_plane || !up_plane || !down_plane || expert_stride == 0)) ||
-      (!strided && topk != n_experts))
+      (!strided && topk != n_experts) ||
+      (merged_gate_up &&
+       (!strided || ref.gate_type != ref.up_type ||
+        ref.gate_bytes != ref.up_bytes)))
     return false;
 
   const bool shape_matches =
@@ -146,6 +286,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
       d_ff_ == d_ff && topk_ == topk && gate_type_ == ref.gate_type &&
       up_type_ == ref.up_type && down_type_ == ref.down_type &&
       strided_mode_ == strided && output_per_expert_ == output_per_expert &&
+      merged_gate_up_ == merged_gate_up &&
       (!strided || expert_stride_ == expert_stride);
   if (shape_matches)
     return true;
@@ -170,6 +311,22 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
         static_cast<ggml_threadpool_t>(cpu_threadpool_));
   }
 
+  // Make the effective ISA visible in the runtime log.  The Qwen IQ expert
+  // path is intentionally using GGML's production quantized dot kernels:
+  // IQ1_M/IQ2_XXS/IQ3_XXS select the x86 __AVX2__ implementations in
+  // arch/x86/quants.c.  AVX-512/VNNI remains available to other GGML ops and
+  // repacking paths, but those IQ kernels are not VNNI dot products.
+  static std::atomic<bool> logged_cpu_isa{false};
+  if (!logged_cpu_isa.exchange(true, std::memory_order_relaxed)) {
+    LOG_STREAM_INFO()
+        << "[CPU-ISA] Qwen GGML CPU graph: threads=" << n_threads_
+        << ", avx2=" << ggml_cpu_has_avx2()
+        << ", avx512=" << ggml_cpu_has_avx512()
+        << ", avx512_vnni=" << ggml_cpu_has_avx512_vnni()
+        << ", bmi2=" << ggml_cpu_has_bmi2()
+        << "; IQ1_M/IQ2_XXS/IQ3_XXS dot kernels=GGML AVX2 (not VNNI)\n";
+  }
+
   ggml_init_params wip = {};
   wip.mem_size = kWeightContextBytes + ggml_tensor_overhead() * 8;
   wip.no_alloc = true;
@@ -180,21 +337,37 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
   const ggml_type gate_type = static_cast<ggml_type>(ref.gate_type);
   const ggml_type up_type = static_cast<ggml_type>(ref.up_type);
   const ggml_type down_type = static_cast<ggml_type>(ref.down_type);
-  ggml_tensor *gate = ggml_new_tensor_3d(wctx, gate_type, d_model, d_ff,
-                                         n_experts);
-  ggml_tensor *up = ggml_new_tensor_3d(wctx, up_type, d_model, d_ff,
-                                       n_experts);
+  ggml_tensor *gate = nullptr;
+  ggml_tensor *up = nullptr;
+  ggml_tensor *gate_up = nullptr;
+  if (merged_gate_up) {
+    // The Qwen DDR arena stores each expert as [gate|up|down].  When gate and
+    // up have the same quantization/layout, the first two planes are already
+    // one contiguous [d_model, 2*d_ff] matrix per expert.  This mirrors
+    // BeeLlama's merged gate_up MUL_MAT_ID without copying or changing the
+    // arena ownership contract.
+    gate_up = ggml_new_tensor_3d(wctx, gate_type, d_model,
+                                 static_cast<int64_t>(d_ff) * 2, n_experts);
+  } else {
+    gate = ggml_new_tensor_3d(wctx, gate_type, d_model, d_ff, n_experts);
+    up = ggml_new_tensor_3d(wctx, up_type, d_model, d_ff, n_experts);
+  }
   ggml_tensor *down =
       ggml_new_tensor_3d(wctx, down_type, d_ff, d_model, n_experts);
-  if (!gate || !up || !down) {
+  if ((!merged_gate_up && (!gate || !up)) ||
+      (merged_gate_up && !gate_up) || !down) {
     ggml_free(wctx);
     return false;
   }
 
   const size_t gate_bytes_per_expert =
-      ggml_nbytes(gate) / static_cast<size_t>(n_experts);
+      merged_gate_up
+          ? (ggml_nbytes(gate_up) / static_cast<size_t>(n_experts)) / 2
+          : ggml_nbytes(gate) / static_cast<size_t>(n_experts);
   const size_t up_bytes_per_expert =
-      ggml_nbytes(up) / static_cast<size_t>(n_experts);
+      merged_gate_up
+          ? gate_bytes_per_expert
+          : ggml_nbytes(up) / static_cast<size_t>(n_experts);
   const size_t down_bytes_per_expert =
       ggml_nbytes(down) / static_cast<size_t>(n_experts);
   if (gate_bytes_per_expert == 0 || up_bytes_per_expert == 0 ||
@@ -203,7 +376,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
       up_bytes_per_expert > SIZE_MAX / static_cast<size_t>(n_experts) ||
       down_bytes_per_expert > SIZE_MAX / static_cast<size_t>(n_experts) ||
       (strided &&
-       (expert_stride < gate_bytes_per_expert ||
+       (expert_stride < gate_bytes_per_expert + up_bytes_per_expert ||
         expert_stride < up_bytes_per_expert ||
         expert_stride < down_bytes_per_expert ||
         (n_experts > 1 &&
@@ -256,18 +429,31 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
     // The three pointers refer to the first expert in one host-RAM arena.
     // GGML's expert-axis stride is the arena's fixed slab stride, so the
     // projection views skip each expert's other two projections and padding.
-    gate->nb[2] = expert_stride;
-    up->nb[2] = expert_stride;
-    gate->nb[3] = expert_stride * static_cast<size_t>(n_experts);
-    up->nb[3] = expert_stride * static_cast<size_t>(n_experts);
+    if (merged_gate_up) {
+      gate_up->nb[2] = expert_stride;
+      gate_up->nb[3] = expert_stride * static_cast<size_t>(n_experts);
+    } else {
+      gate->nb[2] = expert_stride;
+      up->nb[2] = expert_stride;
+      gate->nb[3] = expert_stride * static_cast<size_t>(n_experts);
+      up->nb[3] = expert_stride * static_cast<size_t>(n_experts);
+    }
     down->nb[2] = expert_stride;
     down->nb[3] = expert_stride * static_cast<size_t>(n_experts);
 
     const void *planes[3] = {gate_plane, up_plane, down_plane};
-    const size_t plane_bytes[3] = {gate_bytes_per_expert,
-                                   up_bytes_per_expert, down_bytes_per_expert};
-    ggml_tensor *tensors[3] = {gate, up, down};
-    for (int i = 0; i < 3; ++i) {
+    size_t plane_bytes[3] = {
+        merged_gate_up ? gate_bytes_per_expert + up_bytes_per_expert
+                       : gate_bytes_per_expert,
+        up_bytes_per_expert, down_bytes_per_expert};
+    ggml_tensor *tensors[3] = {merged_gate_up ? gate_up : gate, up, down};
+    const int n_planes = merged_gate_up ? 2 : 3;
+    if (merged_gate_up) {
+      planes[1] = down_plane;
+      plane_bytes[1] = down_bytes_per_expert;
+      tensors[1] = down;
+    }
+    for (int i = 0; i < n_planes; ++i) {
       const size_t view_bytes =
           expert_stride * static_cast<size_t>(n_experts - 1) + plane_bytes[i];
       const void *plane = planes[i];
@@ -337,8 +523,21 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
   ggml_tensor *input3 = ggml_reshape_3d(gctx, x, d_model, 1, 1);
   ggml_tensor *gate_out = nullptr;
   ggml_tensor *up_out = nullptr;
-  gate_out = ggml_mul_mat_id(gctx, gate, input3, ids);
-  up_out = ggml_mul_mat_id(gctx, up, input3, ids);
+  if (merged_gate_up) {
+    ggml_tensor *gate_up_out = ggml_mul_mat_id(gctx, gate_up, input3, ids);
+    if (gate_up_out) {
+      gate_out = ggml_view_3d(gctx, gate_up_out, d_ff, gate_up_out->ne[1],
+                              gate_up_out->ne[2], gate_up_out->nb[1],
+                              gate_up_out->nb[2], 0);
+      up_out = ggml_view_3d(
+          gctx, gate_up_out, d_ff, gate_up_out->ne[1], gate_up_out->ne[2],
+          gate_up_out->nb[1], gate_up_out->nb[2],
+          static_cast<size_t>(d_ff) * gate_up_out->nb[0]);
+    }
+  } else {
+    gate_out = ggml_mul_mat_id(gctx, gate, input3, ids);
+    up_out = ggml_mul_mat_id(gctx, up, input3, ids);
+  }
   ggml_tensor *act = ggml_swiglu_split(gctx, gate_out, up_out);
   ggml_tensor *down_out = ggml_mul_mat_id(gctx, down, act, ids);
   ggml_tensor *weighted = output_per_expert
@@ -404,6 +603,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
   weight_buf_ = wbuf;
   gate_ = gate;
   up_ = up;
+  gate_up_ = gate_up;
   down_ = down;
   graph_ctx_ = gctx;
   galloc_ = ga;
@@ -420,6 +620,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
   up_type_ = ref.up_type;
   down_type_ = ref.down_type;
   strided_mode_ = strided;
+  merged_gate_up_ = merged_gate_up;
   output_per_expert_ = output_per_expert;
   expert_stride_ = strided ? expert_stride : 0;
   return true;
@@ -461,7 +662,7 @@ bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
       return false;
   }
   if (!ensure_graph(first, n_experts, d_model, d_ff, topk, false, nullptr,
-                    nullptr, nullptr, 0, false))
+                    nullptr, nullptr, 0, false, false))
     return false;
 
   const size_t gate_plane =
@@ -539,17 +740,25 @@ bool GgmlQwenCpuMoeRunner::run_strided(
   }
 
   if (!ensure_graph(layer, n_experts, d_model, d_ff, topk, true, gate_plane,
-                    up_plane, down_plane, expert_stride, false))
+                    up_plane, down_plane, expert_stride, false,
+                    can_merge_gate_up(layer, gate_plane, up_plane)))
     return false;
 
   // The graph and its allocator are persistent, but the source planes can
   // belong to a different layer on the next call. GGML's CPU backend reads
   // tensor->data directly, so retarget the three external views without
   // allocating or copying the model weights.
-  static_cast<ggml_tensor *>(gate_)->data = const_cast<void *>(gate_plane);
-  static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);
+  if (merged_gate_up_) {
+    static_cast<ggml_tensor *>(gate_up_)->data = const_cast<void *>(gate_plane);
+  } else {
+    static_cast<ggml_tensor *>(gate_)->data = const_cast<void *>(gate_plane);
+    static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);
+  }
   static_cast<ggml_tensor *>(down_)->data = const_cast<void *>(down_plane);
 
+  QwenCpuGraphTiming &timing = qwen_cpu_graph_timing();
+  const auto total_start = std::chrono::steady_clock::now();
+  auto input_start = total_start;
   std::memcpy(static_cast<ggml_tensor *>(x_)->data, input,
               static_cast<size_t>(d_model_) * sizeof(float));
   auto *ids = static_cast<int32_t *>(static_cast<ggml_tensor *>(ids_)->data);
@@ -558,10 +767,39 @@ bool GgmlQwenCpuMoeRunner::run_strided(
   std::memcpy(static_cast<ggml_tensor *>(weights_)->data, router_weights,
               static_cast<size_t>(topk_) * sizeof(float));
 
+  if (timing.enabled)
+    qwen_cpu_graph_timing_add(
+        timing.input_s,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      input_start)
+            .count());
+  const auto compute_start = std::chrono::steady_clock::now();
   if (!compute_graph())
     return false;
+  if (timing.enabled)
+    qwen_cpu_graph_timing_add(
+        timing.compute_s,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      compute_start)
+            .count());
+  const auto output_start = std::chrono::steady_clock::now();
   std::memcpy(output, static_cast<ggml_tensor *>(output_)->data,
               static_cast<size_t>(d_model_) * sizeof(float));
+  if (timing.enabled) {
+    qwen_cpu_graph_timing_add(
+        timing.output_s,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      output_start)
+            .count());
+    qwen_cpu_graph_timing_add(
+        timing.total_s,
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      total_start)
+            .count());
+    const uint64_t calls =
+        timing.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    qwen_cpu_graph_timing_report(timing, calls);
+  }
   return true;
 }
 
@@ -583,11 +821,16 @@ bool GgmlQwenCpuMoeRunner::run_strided_down(
   }
 
   if (!ensure_graph(layer, n_experts, d_model, d_ff, topk, true, gate_plane,
-                    up_plane, down_plane, expert_stride, true))
+                    up_plane, down_plane, expert_stride, true,
+                    can_merge_gate_up(layer, gate_plane, up_plane)))
     return false;
 
-  static_cast<ggml_tensor *>(gate_)->data = const_cast<void *>(gate_plane);
-  static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);
+  if (merged_gate_up_) {
+    static_cast<ggml_tensor *>(gate_up_)->data = const_cast<void *>(gate_plane);
+  } else {
+    static_cast<ggml_tensor *>(gate_)->data = const_cast<void *>(gate_plane);
+    static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);
+  }
   static_cast<ggml_tensor *>(down_)->data = const_cast<void *>(down_plane);
 
   std::memcpy(static_cast<ggml_tensor *>(x_)->data, input,
@@ -677,6 +920,11 @@ bool GgmlQwenCpuMoeRunner::wait_strided_async() {
 GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance() {
   static GgmlQwenCpuMoeRunner runner;
   return runner;
+}
+
+GgmlQwenCpuMoeRunner &GgmlQwenCpuMoeRunner::instance_for_strided(
+    const GgmlQwenCpuExpertRef &, int, int, int, int, size_t, bool) {
+  return instance();
 }
 
 bool GgmlQwenCpuMoeRunner::compiled_in() { return false; }

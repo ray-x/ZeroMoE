@@ -45,6 +45,11 @@
 // opt in after validating the complete device-resident pipeline.
 void set_ggml_hc_async_graph_reuse(bool enabled);
 
+// Qwen-only opt-in for the pinned host staging/readback path used when a
+// device-HC result must feed a CPU-routed MoE layer. The default is false;
+// callers must enable it only after comparing the complete decode path.
+void set_qwen_hc_async_readback(bool enabled);
+
 // One HC weight, described by the caller so this header needs nothing from
 // engine.hpp. `type` is a GGUFType numeric, which is ggml's own numbering.
 struct GgmlHcWeightRef {
@@ -114,6 +119,15 @@ class GgmlHcRunner {
   bool post_combine_device(int layer, int sub_block, int S,
                            const void *device_sub_block_out);
 
+  // Qwen-only fused post-combine for the CPU-routed/shared-GPU path. The
+  // producer fence is an opaque ggml_backend_event_t owned by
+  // GgmlQwenSharedRunner; the implementation bridges it to CUDA stream 0,
+  // launches one fused HC update kernel, and publishes a fence back to the
+  // shared GGML stream.
+  bool post_combine_device_fused(int layer, int sub_block, int S,
+                                 const void *device_sub_block_out,
+                                 const void *producer_event);
+
   // Same operation as post_combine_device, for a raw F32 [D,S] device
   // buffer whose producer is another runner and therefore has no ggml tensor
   // metadata to validate.
@@ -178,6 +192,7 @@ class GgmlHcRunner {
 
   bool ensure_state(int S);
   bool ensure_custom_buffers(int S);
+  bool ensure_readback_buffer(size_t bytes);
   bool ensure_pre_graph(int S, const Bracket &b, int layer, int sub_block);
   bool ensure_post_graph(int S);
   // Called only after a device weight allocation fails.  The completed
@@ -246,6 +261,15 @@ class GgmlHcRunner {
   void *custom_gate_ = nullptr;
   size_t custom_capacity_ = 0;
 
+  // Optional Qwen decode readback path.  HC produces a small [D,S] F32
+  // result which the CPU-routed MoE must consume.  Keep one reusable pinned
+  // staging buffer and a nonblocking copy stream so the host does not use
+  // cudaMemcpy() on pageable memory for every CPU-affinity layer.
+  void *readback_host_ = nullptr;
+  size_t readback_capacity_ = 0;
+  void *readback_stream_ = nullptr;     // cudaStream_t
+  void *readback_done_event_ = nullptr; // cudaEvent_t
+
   // The post-combine graph is built once for the active request shape and
   // reused for every layer/sub-block.  Rebuilding it at the handoff point
   // allowed GGML's CUDA allocator to recycle temporary memory while the
@@ -276,6 +300,7 @@ class GgmlHcRunner {
   void *raw_input_event_ = nullptr;  // ggml_backend_event_t
   bool pre_in_flight_ = false;
   bool post_in_flight_ = false;
+  bool post_fused_in_flight_ = false;
 
   Bracket brackets_[2][256];  // [sub_block][layer]
 };

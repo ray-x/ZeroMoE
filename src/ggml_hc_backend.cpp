@@ -27,10 +27,14 @@ extern "C" void launch_qwen4exp_hc_q8_pre(
     float *mixed, float *inject, const void *down, const void *up,
     const void *inject_w, int S, int HC, int D, int LR, float eps,
     int inject_q8, cudaStream_t stream);
+extern "C" void launch_qwen4exp_hc_q8_post(
+    float *streams, const float *sub_out, const float *inject, int S, int HC,
+    int D, cudaStream_t stream);
 
 namespace {
 constexpr int kMaxLayers = 256;
 bool async_graph_reuse_override = false;
+bool qwen_hc_async_readback_override = false;
 
 bool type_ok(uint32_t t) {
   if (t >= (uint32_t)GGML_TYPE_COUNT) return false;
@@ -85,12 +89,24 @@ bool debug_sync_hc() {
     const char *v = std::getenv("MOESTREAM_GGML_DEBUG_SYNC_HC");
     return v && v[0] == '1';
   }();
-  return enabled;
+  return qwen_hc_async_readback_override || enabled;
 }
 
 bool debug_check_hc_state() {
   static const bool enabled = [] {
     const char *v = std::getenv("MOESTREAM_GGML_DEBUG_CHECK_HC_STATE");
+    return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
+// This is deliberately opt-in while it is being compared against the
+// established direct-copy path.  The runner is currently used by Qwen's
+// device-HC path; keeping the switch local means other model families retain
+// their existing synchronization behavior even if they reuse this class.
+bool qwen_hc_async_readback() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_QWEN_HC_ASYNC_READBACK");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -108,6 +124,10 @@ size_t count_nonfinite(const std::vector<T> &values) {
 
 void set_ggml_hc_async_graph_reuse(bool enabled) {
   async_graph_reuse_override = enabled;
+}
+
+void set_qwen_hc_async_readback(bool enabled) {
+  qwen_hc_async_readback_override = enabled;
 }
 
 bool GgmlHcRunner::compiled_in() { return true; }
@@ -161,6 +181,19 @@ void GgmlHcRunner::shutdown() {
   if (custom_gate_) cudaFree(custom_gate_);
   custom_xn_ = custom_lo_ = custom_gate_ = nullptr;
   custom_capacity_ = 0;
+  if (readback_done_event_) {
+    cudaEventDestroy((cudaEvent_t)readback_done_event_);
+    readback_done_event_ = nullptr;
+  }
+  if (readback_stream_) {
+    cudaStreamDestroy((cudaStream_t)readback_stream_);
+    readback_stream_ = nullptr;
+  }
+  if (readback_host_) {
+    cudaFreeHost(readback_host_);
+    readback_host_ = nullptr;
+  }
+  readback_capacity_ = 0;
   for (void *&event : pre_done_events_) {
     if (event) {
       ggml_backend_event_free((ggml_backend_event_t)event);
@@ -178,6 +211,7 @@ void GgmlHcRunner::shutdown() {
   }
   pre_in_flight_ = false;
   post_in_flight_ = false;
+  post_fused_in_flight_ = false;
   if (galloc_pre_) {
     ggml_gallocr_free((ggml_gallocr_t)galloc_pre_);
     galloc_pre_ = nullptr;
@@ -346,6 +380,37 @@ bool GgmlHcRunner::ensure_custom_buffers(int S) {
   LOG_INFO("[GGML-HC-MEM] custom exact-Q8 workspace: %.2f MiB (S_cap=%d)\n",
            (double)(xn_bytes + lo_bytes + xn_bytes) / (1024.0 * 1024.0),
            S);
+  return true;
+}
+
+bool GgmlHcRunner::ensure_readback_buffer(size_t bytes) {
+  if (bytes == 0) return false;
+  if (!readback_stream_) {
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) !=
+        cudaSuccess)
+      return false;
+    readback_stream_ = stream;
+  }
+  if (!readback_done_event_) {
+    cudaEvent_t event = nullptr;
+    if (cudaEventCreateWithFlags(&event, cudaEventDisableTiming) !=
+        cudaSuccess)
+      return false;
+    readback_done_event_ = event;
+  }
+  if (readback_host_ && readback_capacity_ >= bytes) return true;
+
+  void *host = nullptr;
+  if (cudaMallocHost(&host, bytes) != cudaSuccess) {
+    cudaGetLastError();
+    return false;
+  }
+  if (readback_host_) cudaFreeHost(readback_host_);
+  readback_host_ = host;
+  readback_capacity_ = bytes;
+  LOG_INFO("[GGML-HC-MEM] pinned pre_mix readback: %.2f KiB\n",
+           (double)bytes / 1024.0);
   return true;
 }
 
@@ -923,6 +988,10 @@ bool GgmlHcRunner::upload_streams(const float *host, int S) {
 bool GgmlHcRunner::download_streams(float *host, int S) {
   if (!backend_ || !host || !t_streams_ || S > s_cap_) return false;
   cudaSetDevice(device_);
+  if (post_fused_in_flight_ && post_done_event_ &&
+      ((ggml_backend_event_t)post_done_event_)->context)
+    cudaEventSynchronize(
+        (cudaEvent_t)((ggml_backend_event_t)post_done_event_)->context);
   ggml_backend_synchronize((ggml_backend_t)backend_);
   ggml_backend_tensor_get((ggml_tensor *)t_streams_, host, 0,
                           (size_t)S * hc_ * d_model_ * sizeof(float));
@@ -964,6 +1033,13 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
     // stream instead of synchronizing the host at every layer.
     GgmlMoeRunner::queue_input_reuse_dependency();
   }
+  // A Qwen CPU-routed layer may have published the previous HC update from
+  // CUDA stream 0 (the fused post-combine path below). Import that fence into
+  // the shared GGML stream before a normal pre graph reads t_streams_.
+  if (post_fused_in_flight_ && post_done_event_ &&
+      ((ggml_backend_event_t)post_done_event_)->context)
+    ggml_backend_event_wait((ggml_backend_t)backend_,
+                            (ggml_backend_event_t)post_done_event_);
   if (b.custom_q8) {
     if (!ensure_custom_buffers(S)) return false;
     // The previous post graph updates t_streams_ on GGML's nonblocking
@@ -1062,17 +1138,75 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
     }
   }
   if (out_hidden) {
-    if (b.custom_q8) {
+    const size_t bytes = (size_t)S * d_model_ * sizeof(float);
+    if (qwen_hc_async_readback() &&
+        ensure_readback_buffer(bytes) && readback_stream_ &&
+        readback_done_event_ && active_pre_done_event_ &&
+        ((ggml_backend_event_t)active_pre_done_event_)->context) {
+      // Do not synchronize the producer event on the host.  The copy stream
+      // waits for the exact HC completion event, performs a D2H copy into
+      // pinned memory, and publishes a second event for the one unavoidable
+      // CPU consumer wait.  This removes the pageable cudaMemcpy from the
+      // per-layer path while retaining the same dependency edge.
+      const cudaError_t wait_status = cudaStreamWaitEvent(
+          (cudaStream_t)readback_stream_,
+          (cudaEvent_t)((ggml_backend_event_t)active_pre_done_event_)->context,
+          0);
+      const cudaError_t copy_status =
+          wait_status == cudaSuccess
+              ? cudaMemcpyAsync(readback_host_, ((ggml_tensor *)t_mixed_)->data,
+                                bytes, cudaMemcpyDeviceToHost,
+                                (cudaStream_t)readback_stream_)
+              : wait_status;
+      const cudaError_t record_status =
+          copy_status == cudaSuccess
+              ? cudaEventRecord((cudaEvent_t)readback_done_event_,
+                                (cudaStream_t)readback_stream_)
+              : copy_status;
+      if (record_status != cudaSuccess) {
+        LOG_ERROR("[GGML-HC] async pre_mix readback failed: %s\n",
+                  cudaGetErrorString(record_status));
+        return false;
+      }
+      const cudaError_t sync_status =
+          cudaEventSynchronize((cudaEvent_t)readback_done_event_);
+      if (sync_status != cudaSuccess) {
+        LOG_ERROR("[GGML-HC] async pre_mix readback wait failed: %s\n",
+                  cudaGetErrorString(sync_status));
+        return false;
+      }
+      std::memcpy(out_hidden, readback_host_, bytes);
+    } else if (b.custom_q8) {
       cudaEventSynchronize(
           (cudaEvent_t)((ggml_backend_event_t)active_pre_done_event_)->context);
-      cudaMemcpy(out_hidden, ((ggml_tensor *)t_mixed_)->data,
-                 (size_t)S * d_model_ * sizeof(float), cudaMemcpyDeviceToHost);
+      cudaMemcpy(out_hidden, ((ggml_tensor *)t_mixed_)->data, bytes,
+                 cudaMemcpyDeviceToHost);
     } else {
-      // tensor_get synchronizes GGML's copy stream, not the shared compute
-      // stream on which pre_mix was queued.
-      ggml_backend_synchronize((ggml_backend_t)backend_);
-      ggml_backend_tensor_get((ggml_tensor *)t_mixed_, out_hidden, 0,
-                              (size_t)S * d_model_ * sizeof(float));
+      // The completion event is recorded immediately after this graph was
+      // queued on the shared backend stream. Waiting on that event is the
+      // only dependency needed to read t_mixed_; a backend-wide synchronize
+      // also drains unrelated router/MoE work queued on the same backend.
+      // tensor_get() additionally routes the small readback through GGML's
+      // copy stream, which adds another stream handoff at every CPU-affinity
+      // layer. Use the event followed by one direct copy instead. The tensor
+      // is the persistent F32 [D,S] buffer, whose contiguous layout is
+      // identical to the host [S,D] row-major layout used by callers.
+      if (active_pre_done_event_) {
+        ggml_backend_event_synchronize(
+            (ggml_backend_event_t)active_pre_done_event_);
+      } else {
+        // Defensive fallback for an incomplete runner initialization. The
+        // normal path always creates/records the event above.
+        ggml_backend_synchronize((ggml_backend_t)backend_);
+      }
+      const cudaError_t status = cudaMemcpy(
+          out_hidden, ((ggml_tensor *)t_mixed_)->data, bytes,
+          cudaMemcpyDeviceToHost);
+      if (status != cudaSuccess) {
+        LOG_ERROR("[GGML-HC] direct pre_mix readback failed: %s\n",
+                  cudaGetErrorString(status));
+        return false;
+      }
     }
   }
   if (device_output) *device_output = t_mixed_;
@@ -1102,6 +1236,50 @@ bool GgmlHcRunner::post_combine_device(int layer, int sub_block, int S,
                                        const void *device_sub_block_out) {
   return post_combine_impl(layer, sub_block, S, nullptr,
                            device_sub_block_out);
+}
+
+bool GgmlHcRunner::post_combine_device_fused(
+    int layer, int sub_block, int S, const void *device_sub_block_out,
+    const void *producer_event) {
+  (void)layer;
+  if (!backend_ || !t_streams_ || !t_inject_ || !device_sub_block_out ||
+      !producer_event || sub_block != 0 || S <= 0 || S > s_cap_ ||
+      inject_valid_S_ != S || !post_done_event_)
+    return false;
+
+  const ggml_tensor *src = (const ggml_tensor *)device_sub_block_out;
+  const ggml_backend_event_t producer =
+      (ggml_backend_event_t)const_cast<void *>(producer_event);
+  const ggml_tensor *streams = (const ggml_tensor *)t_streams_;
+  const ggml_tensor *inject = (const ggml_tensor *)t_inject_;
+  if (!src || !src->data || !src->buffer || src->type != GGML_TYPE_F32 ||
+      src->ne[0] != d_model_ || src->ne[1] < S || src->ne[2] != 1 ||
+      src->ne[3] != 1 || src->nb[0] != sizeof(float) ||
+      src->nb[1] != (size_t)d_model_ * sizeof(float) || !streams->data ||
+      !inject->data || !producer->context ||
+      !((ggml_backend_event_t)post_done_event_)->context)
+    return false;
+
+  cudaSetDevice(device_);
+  // The shared expert is queued on GGML's nonblocking CUDA stream. The fused
+  // HC update runs on stream 0 because the existing Qwen dense/attention
+  // bridge uses that stream. Bridge both producer and previous-state fences
+  // explicitly; no host synchronization is needed here.
+  if (post_fused_in_flight_)
+    cudaStreamWaitEvent(
+        0, (cudaEvent_t)((ggml_backend_event_t)post_done_event_)->context, 0);
+  cudaStreamWaitEvent(0, (cudaEvent_t)producer->context, 0);
+  launch_qwen4exp_hc_q8_post(
+      static_cast<float *>(streams->data),
+      static_cast<const float *>(src->data),
+      static_cast<const float *>(inject->data), S, hc_, d_model_, 0);
+  if (cudaEventRecord(
+          (cudaEvent_t)((ggml_backend_event_t)post_done_event_)->context,
+          0) != cudaSuccess)
+    return false;
+  post_in_flight_ = true;
+  post_fused_in_flight_ = true;
+  return true;
 }
 
 bool GgmlHcRunner::post_combine_device_raw(int layer, int sub_block, int S,
@@ -1246,6 +1424,7 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
   ggml_backend_event_record((ggml_backend_event_t)post_done_event_,
                             (ggml_backend_t)backend_);
   post_in_flight_ = true;
+  post_fused_in_flight_ = false;
   if (debug_sync_hc())
     ggml_backend_synchronize((ggml_backend_t)backend_);
   if (debug_check_hc_state()) {
@@ -1269,6 +1448,7 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
 #else  // !MOESTREAM_USE_GGML_CUDA
 
 void set_ggml_hc_async_graph_reuse(bool) {}
+void set_qwen_hc_async_readback(bool) {}
 
 bool GgmlHcRunner::compiled_in() { return false; }
 GgmlHcRunner &GgmlHcRunner::instance() {
@@ -1279,6 +1459,7 @@ GgmlHcRunner::~GgmlHcRunner() {}
 void GgmlHcRunner::shutdown() {}
 bool GgmlHcRunner::ensure(int, int, int, int, float) { return false; }
 bool GgmlHcRunner::ensure_state(int) { return false; }
+bool GgmlHcRunner::ensure_readback_buffer(size_t) { return false; }
 bool GgmlHcRunner::weights_ready(int, int) const { return false; }
 void GgmlHcRunner::release_completed_weights_nonblocking(int) {}
 bool GgmlHcRunner::ensure_weights(int, int, const GgmlHcWeightRef &,
@@ -1293,6 +1474,10 @@ bool GgmlHcRunner::download_inject(float *, int) { return false; }
 bool GgmlHcRunner::pre_mix(int, int, int, float *, const void **) { return false; }
 bool GgmlHcRunner::post_combine(int, int, int, const float *) { return false; }
 bool GgmlHcRunner::post_combine_device(int, int, int, const void *) {
+  return false;
+}
+bool GgmlHcRunner::post_combine_device_fused(int, int, int, const void *,
+                                             const void *) {
   return false;
 }
 bool GgmlHcRunner::post_combine_device_raw(int, int, int, const void *,
