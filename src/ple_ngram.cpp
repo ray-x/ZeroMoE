@@ -34,9 +34,14 @@
 
 #include <cmath>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <atomic>
+#include <cstdlib>
+#include <mutex>
+#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -46,6 +51,14 @@
 
 namespace {
 
+bool ple_timing_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_QWEN4EXP_TIMING");
+    return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
 // Lazily mmap'd PLE gather table (process-lifetime, like the KDA/GDN conv
 // weight caches in attention_layer.cpp). Not unloaded at exit.
 const uint8_t *g_ple_table = nullptr; // start of the tensor's rows
@@ -53,6 +66,61 @@ size_t g_ple_row_bytes = 0;
 GGUFType g_ple_type = GGUFType::F32;
 int g_ple_row_dim = 0;
 bool g_ple_init_attempted = false;
+
+// The PLE table is quantized row-wise and decode usually requests only 16
+// rows.  Consecutive n-gram windows can revisit rows, especially for
+// repetitive code/list output.  Keep a small process-local cache of the
+// already dequantized rows so those hits avoid another mmap read and IQ4_NL
+// decode.  This is deliberately bounded and Qwen/PLE-local; it is not part of
+// the model-wide expert cache and cannot affect other model families.
+constexpr size_t kPleRowCacheCapacity = 4096;
+std::mutex g_ple_row_cache_mutex;
+std::unordered_map<uint64_t, std::vector<float>> g_ple_row_cache;
+std::atomic<uint64_t> g_ple_row_cache_hits{0};
+std::atomic<uint64_t> g_ple_row_cache_misses{0};
+
+bool ple_row_cache_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_QWEN4EXP_PLE_ROW_CACHE");
+    return !v || v[0] != '0';
+  }();
+  return enabled;
+}
+
+bool ple_dequant_row_cached(uint64_t row, float *out) {
+  if (!ple_row_cache_enabled()) {
+    const uint8_t *src =
+        g_ple_table + row * static_cast<uint64_t>(g_ple_row_bytes);
+    return dequant_row(g_ple_type, src, out, g_ple_row_dim);
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_ple_row_cache_mutex);
+    auto it = g_ple_row_cache.find(row);
+    if (it != g_ple_row_cache.end()) {
+      std::memcpy(out, it->second.data(),
+                  static_cast<size_t>(g_ple_row_dim) * sizeof(float));
+      g_ple_row_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+  }
+
+  const uint8_t *src =
+      g_ple_table + row * static_cast<uint64_t>(g_ple_row_bytes);
+  if (!dequant_row(g_ple_type, src, out, g_ple_row_dim))
+    return false;
+
+  g_ple_row_cache_misses.fetch_add(1, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(g_ple_row_cache_mutex);
+    if (g_ple_row_cache.size() < kPleRowCacheCapacity) {
+      std::vector<float> copy(static_cast<size_t>(g_ple_row_dim));
+      std::memcpy(copy.data(), out,
+                  static_cast<size_t>(g_ple_row_dim) * sizeof(float));
+      g_ple_row_cache.emplace(row, std::move(copy));
+    }
+  }
+  return true;
+}
 
 bool ple_table_init(StreamingEngine &engine) {
   if (g_ple_init_attempted)
@@ -241,6 +309,66 @@ void ple_grouped_norm(const float *x, const float *w, float *out, int S,
 
 } // namespace
 
+bool qwen4exp_ple_gather_rows(StreamingEngine &engine,
+                              const std::vector<int32_t> &rows,
+                              std::vector<float> &out) {
+  const auto start = std::chrono::steady_clock::now();
+  if (rows.empty() || !ple_table_init(engine) || g_ple_row_dim <= 0)
+    return false;
+
+  const size_t row_dim = static_cast<size_t>(g_ple_row_dim);
+  out.resize(rows.size() * row_dim);
+  std::atomic<bool> gather_ok{true};
+  auto gather_one = [&](int i, std::vector<float> &rowbuf) {
+    const int64_t row = rows[static_cast<size_t>(i)];
+    if (row < 0) {
+      gather_ok.store(false, std::memory_order_relaxed);
+      return;
+    }
+    float *dst = out.data() + static_cast<size_t>(i) * row_dim;
+    if (!ple_dequant_row_cached(static_cast<uint64_t>(row), rowbuf.data())) {
+      gather_ok.store(false, std::memory_order_relaxed);
+      std::memset(dst, 0, row_dim * sizeof(float));
+    } else {
+      std::memcpy(dst, rowbuf.data(), row_dim * sizeof(float));
+    }
+  };
+
+  // Decode supplies one token (normally 20 rows).  Starting an OpenMP team
+  // for such a small gather costs more than the dequantization itself and
+  // adds another host scheduling pulse to every token.  Keep the prefill
+  // case parallel, where there are hundreds of independent rows.
+  if (rows.size() <= 32) {
+    std::vector<float> rowbuf(row_dim);
+    for (int i = 0; i < static_cast<int>(rows.size()); ++i)
+      gather_one(i, rowbuf);
+  } else {
+#pragma omp parallel
+    {
+      std::vector<float> rowbuf(row_dim);
+#pragma omp for schedule(static)
+      for (int i = 0; i < static_cast<int>(rows.size()); ++i)
+        gather_one(i, rowbuf);
+    }
+  }
+  const bool ok = gather_ok.load(std::memory_order_relaxed);
+  if (ple_timing_enabled()) {
+    size_t unique_rows = 0;
+    std::unordered_set<int32_t> seen;
+    seen.reserve(rows.size());
+    for (int32_t row : rows)
+      unique_rows += seen.insert(row).second ? 1u : 0u;
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+    LOG_INFO("[PLE-TIME] rows=%zu unique=%zu gather=%.3f ms ok=%s cache_hits=%llu cache_misses=%llu\n",
+             rows.size(), unique_rows, ms, ok ? "yes" : "no",
+             (unsigned long long)g_ple_row_cache_hits.load(std::memory_order_relaxed),
+             (unsigned long long)g_ple_row_cache_misses.load(std::memory_order_relaxed));
+  }
+  return ok;
+}
+
 // FamilyOps::layer_input_fn for Qwen4Exp. Runs at the top of a PLE layer,
 // BEFORE the attention hc_pre mix; modifies engine.hc_stream_buf in place.
 void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
@@ -351,7 +479,7 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
         const int64_t r = rows[(size_t)i * n_heads + h];
         const uint8_t *src =
             g_ple_table + (uint64_t)r * (uint64_t)g_ple_row_bytes;
-        if (!dequant_row(g_ple_type, src, rowbuf.data(), head_dim)) {
+        if (!ple_dequant_row_cached((uint64_t)r, rowbuf.data())) {
           gather_ok.store(false, std::memory_order_relaxed);
           std::memset(emb.data() + ((size_t)i * n_heads + h) * head_dim,
                       0, (size_t)head_dim * sizeof(float));

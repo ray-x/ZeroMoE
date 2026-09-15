@@ -1156,7 +1156,8 @@ public:
 
     void allocate_expert_cache(size_t expert_slab_bytes, int n_experts_total,
                                 const EngineConfig* config = nullptr,
-                                const std::vector<size_t>& layer_slab_bytes = {}) {
+                                const std::vector<size_t>& layer_slab_bytes = {},
+                                bool disable_auto_cache = false) {
         expert_max_slab_size = expert_slab_bytes;
         expert_n_experts = n_experts_total;
         expert_layer_slab_bytes = layer_slab_bytes;
@@ -1209,15 +1210,38 @@ public:
             // grab behavior unchanged (safe default for any caller that
             // doesn't pass config, e.g. tests).
             size_t requested_bytes = 0;
+            bool matched_config = false;
             if (config) {
                 for (auto& gc : config->gpus) {
-                    if (gc.device_id == dev.id && gc.moe_cache_gb > 0) {
-                        requested_bytes = (size_t)(gc.moe_cache_gb * 1e9);
+                    if (gc.device_id == dev.id) {
+                        matched_config = true;
+                        if (gc.moe_cache_gb > 0)
+                            requested_bytes = (size_t)(gc.moe_cache_gb * 1e9);
                         break;
                     }
                 }
             }
-            size_t cache_bytes = requested_bytes > 0 ? std::min(requested_bytes, hw_cap) : hw_cap;
+            // Most callers intentionally retain the historical meaning of
+            // moe_cache_gb <= 0: auto-size the cache.  Full-graph startup is
+            // the exception: it may have no VRAM left for a legacy decode
+            // fallback after reserving the resident graph, and in that case
+            // an explicit zero must really disable this allocation.  Without
+            // this separate switch, a graph fallback of 0 GB silently turns
+            // back into "total_vram - 1GB" here and starves the graph's own
+            // allocator before it is built.
+            const bool explicitly_disabled = disable_auto_cache &&
+                (matched_config || config != nullptr) && requested_bytes == 0;
+            size_t cache_bytes = explicitly_disabled
+                ? 0
+                : (requested_bytes > 0 ? std::min(requested_bytes, hw_cap) : hw_cap);
+
+            if (explicitly_disabled) {
+                dev.expert_cache_pool = nullptr;
+                dev.expert_cache_size = 0;
+                LOG_STREAM_INFO() << "[GPU] Expert cache disabled on " << dev.name
+                                  << " (explicit graph fallback budget is 0 GB)\n";
+                continue;
+            }
 
             cudaSetDevice(dev.id);
             if (cudaMalloc((void**)&dev.expert_cache_pool, cache_bytes) != cudaSuccess) {

@@ -650,6 +650,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // Phase 2's warm-up) vs. during decode's own reactive promotions
     // afterward. Previously the only way to see prefill's own contribution
     // was to infer it indirectly.
+    // Exact decode-only timing boundary.  The legacy aggregate Rates line
+    // subtracts t_prefill_total from the whole request wall time, which also
+    // contains prompt embedding and full-graph setup before PERF_START.
+    const auto decode_boundary_start = std::chrono::high_resolution_clock::now();
     LOG_STREAM_INFO() << "[PREFILL-DONE] " << prompt_ids.size() << " tokens in " << prefill_wall_s
                        << "s (" << ((prefill_wall_s > 0.0) ? (prompt_ids.size() / prefill_wall_s) : 0.0)
                        << " tok/s) -- this request's own prefill pass only, matches the 'prefill=' figure "
@@ -942,6 +946,16 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     auto request_snap_end = perf().snapshot();
     auto request_delta = request_snap_end - request_snap_start;
     PerfCounters::print_summary("REQUEST", request_wall_ms, (int)request_delta.n_tokens_generated, request_delta);
+    const double decode_boundary_s = std::chrono::duration<double>(
+        std::chrono::high_resolution_clock::now() - decode_boundary_start).count();
+    if (request_delta.n_tokens_generated > 0 && decode_boundary_s > 0.0) {
+        LOG_INFO("[REQUEST-DECODE-WALL] tokens=%lu wall=%.3fs rate=%.2f tok/s "
+                 "(starts immediately after PREFILL-DONE; includes one-time "
+                 "decode-graph setup)\n",
+                 (unsigned long)request_delta.n_tokens_generated,
+                 decode_boundary_s,
+                 (double)request_delta.n_tokens_generated / decode_boundary_s);
+    }
     // TEMPORARY DIAGNOSTIC -- see this function's top-of-function comment.
     LOG_INFO("[REQUEST-DIAG] lmhead(norm+proj)=%.3fs vramlog(cudaMemGetInfo)=%.3fs\n",
              diag_lmhead_ms / 1000.0, diag_vramlog_ms / 1000.0);

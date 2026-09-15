@@ -3208,8 +3208,10 @@ public:
 
     // Allocate expert VRAM cache on vault GPU(s) based on model geometry
     void setup_expert_cache(size_t expert_slab_bytes, int n_experts, const EngineConfig& config,
-                            const std::vector<size_t>& layer_slab_bytes = {}) {
-        topology.allocate_expert_cache(expert_slab_bytes, n_experts, &config, layer_slab_bytes);
+                            const std::vector<size_t>& layer_slab_bytes = {},
+                            bool disable_auto_cache = false) {
+        topology.allocate_expert_cache(expert_slab_bytes, n_experts, &config,
+                                       layer_slab_bytes, disable_auto_cache);
 
         // Three-tier caching: Allocate active layer area for temporary expert storage
         // This provides a workspace for current-layer experts without evicting LRU residents

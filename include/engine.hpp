@@ -431,6 +431,17 @@ public:
     // families do not consult this flag.
     bool qwen_ram_preload_all_experts = false;
 
+    // Per-expert VRAM split budget for full-graph decode (EngineConfig::
+    // qwen4exp_graph_expert_vram_budget_gb), copied at startup exactly like
+    // qwen_ram_preload_all_experts above. 0.0 = feature off. See
+    // ggml_qwen4exp_graph.cpp's plan_expert_vram_split for the consumer.
+    double qwen4exp_graph_expert_vram_budget_gb = 0.0;
+    // Usage-histogram file the split planner ranks experts from -- defaults
+    // to the same pin_file the startup [PIN] preload block already reads,
+    // copied here since the graph builder has no other route to
+    // EngineConfig (it only receives StreamingEngine&).
+    std::string qwen4exp_graph_pin_file;
+
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 
     // the "learned hot set" signal that drives VRAM preloading on the

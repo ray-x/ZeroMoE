@@ -581,6 +581,22 @@ struct EngineConfig {
   // identical to today's behavior. See CLAUDE.md.
   std::vector<int> cpu_affinity_layers;
 
+  // qwen4exp_graph_expert_vram_budget_gb: full-graph decode (S==1) ONLY --
+  // generalizes cpu_affinity_layers/device_expert_layers' whole-layer
+  // residency choice into a genuine PER-EXPERT split within a layer. When
+  // >0, the graph builder reads the existing usage-ranking data (pin_file,
+  // the same ".moestream_usage" histogram pin_topk_per_layer/global_topn
+  // already consult) and greedily spends this many GB of VRAM on the
+  // globally hottest routed experts, across every layer NOT already
+  // claimed by cpu_affinity_layers or device_expert_layers/
+  // device_expert_partial_gate_up (those two mechanisms are checked first
+  // and always win). A layer that gets some but not all of its experts
+  // placed this way runs TWO ggml_mul_mat_id calls per projection instead
+  // of one (one over the VRAM-resident subset, one over the rest, masked
+  // and merged) -- see ggml_qwen4exp_graph.cpp's plan_expert_vram_split/
+  // build_moe. Default 0.0 = feature off, identical to today's behavior.
+  double qwen4exp_graph_expert_vram_budget_gb = 0.0;
+
   // Decode-time (S==1) CPU-offload cap for genuine disk-cold misses:
   // instead of a REAL cache miss (not RAM- nor VRAM-resident, would need
   // an SSD read) always continuing on to a synchronous VRAM upload, up to
@@ -2438,6 +2454,9 @@ inline bool EngineConfig::load(const std::string &path) {
   drop_pages = doc.root.get_bool("drop_pages", drop_pages);
   cpu_only = doc.root.get_bool("cpu_only", cpu_only);
   cpu_affinity_layers = doc.root.get_int_array("cpu_affinity_layers");
+  qwen4exp_graph_expert_vram_budget_gb = doc.root.get_double(
+      "qwen4exp_graph_expert_vram_budget_gb",
+      qwen4exp_graph_expert_vram_budget_gb);
   cpu_offload_max_experts =
       doc.root.get_int("cpu_offload_max_experts", cpu_offload_max_experts);
   if (cpu_offload_max_experts < 0 || cpu_offload_max_experts > 8) {
@@ -3613,6 +3632,14 @@ drop_pages     = false    # true = evict expert pages from OS cache after use
 # upload, and that upload just steals cache capacity from layers where it
 # DOES help). Empty (default) = no layers affected.
 # cpu_affinity_layers = [4, 5, 7]
+
+# qwen4exp_graph_expert_vram_budget_gb: full-graph decode only. Generalizes
+# cpu_affinity_layers/device_expert_layers' whole-layer choice into a real
+# per-expert split: spends this many GB of VRAM on the globally hottest
+# routed experts (ranked from pin_file's usage histogram), across any layer
+# not already claimed by cpu_affinity_layers or device_expert_layers. 0.0
+# (default) = off, identical to today's behavior.
+# qwen4exp_graph_expert_vram_budget_gb = 2.0
 
 # qwen4exp_cpu_gpu_overlap: optional Qwen-only overlap of the CPU routed
 # expert graph with the GPU shared expert. The implementation submits a

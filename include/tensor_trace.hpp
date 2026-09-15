@@ -10,11 +10,8 @@
 //   - abort-on-nan (stop at the FIRST bad tensor instead of scrolling through
 //     pages of downstream NaN fallout)
 //
-// Deliberately NOT a replacement for the existing per-file helpers or a new
-// tracing architecture -- every call site keeps its own tag/format/signature;
-// this only centralizes the filter/abort POLICY behind three small
-// primitives (trace_gate, trace_row, trace_abort_if_nan) that those call
-// sites delegate to.
+// This keeps the existing per-file trace tags while centralizing the shared
+// filter/abort policy and the common finite-buffer check.
 //
 // Enabling: requires log_level = "VERBOSE" (or --log-level VERBOSE). Two
 // optional knobs on top, both wired in main.cpp right after Logger::init():
@@ -134,4 +131,26 @@ inline void trace_abort_if_nan(const char* tag, bool bad) {
         LOG_ERROR("[TRACE] Aborting: NaN/Inf detected at tag=%s (trace_abort_on_nan=true)\n", tag);
         std::abort();
     }
+}
+
+inline bool check_finite(const char* label, int layer_idx, int expert_id,
+                         const float* data, size_t n) {
+    int nan_count = 0;
+    int inf_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(data[i])) ++nan_count;
+        else if (std::isinf(data[i])) ++inf_count;
+    }
+    if (nan_count || inf_count) {
+        LOG_ERROR("[EXPERT-GPU] %s layer=%d expert=%d: %d/%zu NaN, %d/%zu Inf.\n",
+                  label, layer_idx, expert_id, nan_count, n, inf_count, n);
+        trace_abort_if_nan("EXPERT-GPU", true);
+        return false;
+    }
+    if (trace_gate("EXPERT-GPU")) {
+        trace_row("EXPERT-GPU", layer_idx,
+                  std::string(label) + " expert=" + std::to_string(expert_id),
+                  data, n);
+    }
+    return true;
 }

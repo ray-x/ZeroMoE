@@ -18,10 +18,15 @@
 #include "startup_preflight.hpp"
 #include "tensor_trace.hpp"
 
+#if defined(MOESTREAM_USE_GGML)
+#include "ggml.h"
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <fstream>
@@ -38,6 +43,26 @@ class GGUFGraphInitializer {
 public:
   static bool build_model_graph(StreamingEngine &engine, int max_ctx);
 };
+
+#if defined(MOESTREAM_USE_GGML)
+// The ggml tree used by the CUDA build is also shared with Bee and emits
+// CUDA-graph reuse diagnostics through GGML_LOG_DEBUG.  At MoEStream's
+// normal INFO/WARN/ERROR levels those messages are not useful, but a full
+// Qwen decode graph can hit the call site hundreds of times per token.  The
+// default ggml callback ignores severity and prints them anyway, turning a
+// diagnostic into a measurable serialization/stdio bottleneck.  Preserve
+// all non-debug ggml messages and retain debug output when the user explicitly
+// asks for DEBUG or VERBOSE logging.
+static void moestream_ggml_log_callback(enum ggml_log_level level,
+                                        const char *text, void *user_data) {
+  const bool allow_debug =
+      user_data && *static_cast<const bool *>(user_data);
+  if (level == GGML_LOG_LEVEL_DEBUG && !allow_debug)
+    return;
+  std::fputs(text, stderr);
+  std::fflush(stderr);
+}
+#endif
 
 void print_usage() {
   std::cout
@@ -347,6 +372,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.unpacked_expert_format = config.unpacked_expert_format;
   engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;
   engine.qwen_ram_preload_all_experts = config.ram_preload_all_experts;
+  engine.qwen4exp_graph_expert_vram_budget_gb =
+      config.qwen4exp_graph_expert_vram_budget_gb;
+  engine.qwen4exp_graph_pin_file = config.pin_file;
   ram_mgr.configured_total_experts =
       std::max(0, config.ram_cache_total_experts);
   // Must be set BEFORE the [PIN] preload block below -- that's where the
@@ -1001,6 +1029,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         << " GiB -- see this call site's "
            "own comment for the two real incidents this guards against)\n";
     if (fallback_gb <= 0.0) {
+      // This graph-only fallback is allowed to have no legacy cache.  Keep
+      // the temporary active-layer pool off too; otherwise it would consume
+      // another ~0.2 GB after the explicit zero-cache decision and could
+      // still starve the resident graph allocator.  This is local to the
+      // graph fallback config; normal model/cache policy is unchanged.
+      fallback_config.use_active_layer_area = false;
       LOG_WARN(
           "[GPU] Decode-time expert cache is 0 GB -- device_expert_layers=%d "
           "leaves no VRAM headroom after the %.1f GiB overhead reserve; every "
@@ -1009,7 +1043,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           dev_layers, kGraphOverheadReserveGb);
     }
     gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, fallback_config,
-                           expert_layer_slab_bytes);
+                           expert_layer_slab_bytes, fallback_gb <= 0.0);
   }
   gpu.report_vram_usage("after expert cache setup");
 
@@ -3828,6 +3862,11 @@ int main(int argc, char *argv[]) {
   // Initialize the logger before anything else logs — empty log_path keeps
   // everything on stderr exactly as before.
   Logger::instance().init(config.log_path, config.log_level);
+#if defined(MOESTREAM_USE_GGML)
+  bool allow_ggml_debug = config.log_level == "DEBUG" ||
+                          config.log_level == "VERBOSE";
+  ggml_log_set(moestream_ggml_log_callback, &allow_ggml_debug);
+#endif
   TraceFilter::instance().configure(config.trace_filter,
                                     config.trace_abort_on_nan);
 

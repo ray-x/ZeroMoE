@@ -63,6 +63,8 @@
 #include <thread>
 #include <vector>
 
+#include "ggml_moe_transfer_manager.hpp"
+
 // Enable stream-ordered reuse of the persistent MoE graph workspace. This is
 // separate from the copy-stream experiment and is disabled by default.
 void set_ggml_moe_async_graph_reuse(bool enabled);
@@ -401,7 +403,7 @@ struct GgmlMoeStageSlot {
   uint8_t *down = nullptr;
 };
 
-class GgmlMoeRunner {
+class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
  public:
   // Pinned staging buffers (memcpy || H2D).
   //
@@ -442,24 +444,26 @@ class GgmlMoeRunner {
   // 2026-09-10 (later same day): RE-VERIFIED against the post-fix baseline
   // (RAM/VRAM tier independence fix + vram_preload_prefix_layers adopted
   // since the test above; also after the real GgmlQwenSharedRunner
-  // device_x bug was fixed, see ggml_moe_backend.cpp/Test 35). Same 574-
+  // device_x bug was fixed, see ggml_qwen_shared_runner.cpp/Test 35). Same 574-
   // token real-text prompt, prefill= from the shutdown report's Rates
   // line: NBUF=2 baseline 79.84 / 86.37 / 85.66 tok/s (mean 83.96), NBUF=3
   // 83.57 tok/s -- squarely inside the NBUF=2 spread, not a separate
   // cluster. Conclusion unchanged: NBUF is still not a real lever, now
   // confirmed against the current, materially faster baseline too.
-  static constexpr int NBUF = 2;
+  static constexpr int NBUF = moe::GgmlMoeTransferManager::kTransferBuffers;
   // Keep one compact weight buffer. The graph stores one mutable set of GGML
   // weight descriptors; alternating allocations without a separate graph
   // descriptor set would let a queued layer observe the next layer's data
   // pointer. The backend-stream path can still overlap host staging and
   // transfer work, but true weight double-buffering requires per-buffer graph
   // state and is intentionally not enabled by this runner.
-  static constexpr int NWEIGHT_BUFS = 2;
+  static constexpr int NWEIGHT_BUFS =
+      moe::GgmlMoeTransferManager::kWeightBuffers;
   // A prefill can queue all model layers before the final synchronization.
   // Keep one completion event per possible layer so an event still being
   // waited on by the copy backend is never re-recorded.
-  static constexpr int NWEIGHT_EVENTS = 64;
+  static constexpr int NWEIGHT_EVENTS =
+      moe::GgmlMoeTransferManager::kWeightEvents;
 
   // False when built without MOESTREAM_USE_GGML_CUDA. Checked before anything
   // else so the flag can be left set in a config that is also used by a build
@@ -699,6 +703,8 @@ class GgmlMoeRunner {
   GgmlMoeRunner &operator=(const GgmlMoeRunner &) = delete;
 
   static GgmlMoeRunner *runner_pool();
+  static constexpr int NH2D_TIMING_EVENTS =
+      moe::GgmlMoeTransferManager::kH2dTimingEvents;
 
   bool ensure_backend(int device);
   bool ensure_weight_buffer(size_t bytes, size_t packed_bytes);
@@ -739,15 +745,6 @@ class GgmlMoeRunner {
   // device buffer is only a transfer landing zone: [gate|up|down] for expert
   // 0, then expert 1, ... . One H2D/D2D copy lands there and a CUDA unpack
   // kernel scatters it into the three GGML planes.
-  size_t weight_expert_stride_ = 0;
-  size_t weight_raw_expert_stride_ = 0;
-  size_t weight_tail_padding_ = 0;
-  size_t weight_gate_plane_offset_ = 0;
-  size_t weight_up_plane_offset_ = 0;
-  size_t weight_down_plane_offset_ = 0;
-  void *packed_wbuf_[NWEIGHT_BUFS] = {}; // raw CUDA packed transfer buffers
-  size_t packed_wbuf_bytes_ = 0;
-  uint8_t *packed_base_ = nullptr;
   int weight_slots_ = 0;         // axis-2 capacity of the persistent tensors
   int slot_capacity_ = 0;        // grow-only high-water mark across layers
   int weight_d_model_ = 0;
@@ -847,67 +844,6 @@ class GgmlMoeRunner {
 
   bool ensure_route_stage(size_t route_count);
 
-  // --- staging (pinned host) ---
-  uint8_t *h_stage_[NBUF] = {nullptr, nullptr};
-  void *d_stage_slot_map_[NBUF] = {nullptr, nullptr};
-  std::vector<int32_t> stage_slot_map_[NBUF];
-  // Packed direct-RAM H2D records. D2D records are unpacked at the split
-  // boundary; these records are combined with staged-H2D records in
-  // push_chunk() and unpacked once after all H2D sources have been queued.
-  std::vector<int32_t> packed_h2d_slot_map_[NBUF];
-  // Separate from stage_slot_map_: the D2D map is uploaded and consumed at
-  // mark_copy_d2d_done(), before push_chunk() compacts/reuses the H2D map and
-  // packed landing records on the same stream.
-  std::vector<int32_t> d2d_slot_map_[NBUF];
-  size_t stage_bytes_ = 0;       // per buffer
-  // cudaMallocHost() staging is real DDR.  Keep its charge separate from
-  // stage_bytes_ so a failed/partial setup cannot leave the process-wide host
-  // admission ledger thinking these pages are still live (or, worse, allow a
-  // later resize to cross host_ram_gb).
-  size_t stage_host_reservation_bytes_ = 0;
-  int stage_slot_capacity_ = 0;
-  void *copy_stream_ = nullptr;  // cudaStream_t
-  void *copy_backend_ = nullptr; // ggml_backend_t, backend-stream H2D only
-  void *ev_free_[NBUF] = {nullptr, nullptr};
-  void *ev_t0_[NBUF] = {nullptr, nullptr};
-  // Timing events for backend-stream copies.  The GGML staging event is a
-  // completion/fencing event, but wall-clock timing around its host-side
-  // wait includes time spent waiting for the buffer to become reusable.  A
-  // CUDA event pair measures only the copy-stream interval.
-  void *backend_copy_t0_event_[NBUF] = {nullptr, nullptr};
-  void *backend_copy_t1_event_[NBUF] = {nullptr, nullptr};
-  void *backend_copy_split_event_[NBUF] = {nullptr, nullptr};
-  void *backend_stage_event_[NBUF] = {nullptr, nullptr}; // ggml event
-  static constexpr int NH2D_TIMING_EVENTS = 128;
-  void *h2d_t0_event_[NBUF][NH2D_TIMING_EVENTS] = {};
-  void *h2d_t1_event_[NBUF][NH2D_TIMING_EVENTS] = {};
-  int h2d_timing_count_[NBUF] = {0, 0};
-  void *backend_weight_done_event_[NWEIGHT_EVENTS] = {};
-  void *backend_weight_last_event_[NWEIGHT_BUFS] = {};
-  bool backend_weight_buffer_in_use_[NWEIGHT_BUFS] = {};
-  int backend_weight_event_next_ = 0;
-  int weight_buffer_index_ = 0;
-  bool backend_stream_copies_ = false;
-  int weight_buffer_count_ = 1;
-  bool raw_d2d_pending_ = false;
-  bool batch_d2d_unpack_ = false;
-  std::chrono::steady_clock::time_point backend_copy_t0_[NBUF];
-  bool pending_[NBUF] = {false, false};
-  size_t pending_bytes_[NBUF] = {0, 0};
-  size_t pending_d2d_bytes_[NBUF] = {0, 0};
-  bool copy_split_recorded_[NBUF] = {false, false};
-
-  struct DeferredVramHold {
-    void * topology = nullptr;
-    int layer = -1;
-    int expert = -1;
-    const uint8_t * device_ptr = nullptr;
-  };
-  std::vector<DeferredVramHold> deferred_vram_holds_;
-  std::vector<std::function<void()>> deferred_host_releases_;
-  bool copy_batch_started_[NBUF] = {false, false};
-  size_t direct_h2d_bytes_[NBUF] = {0, 0};
-
   // --- current plan ---
   GgmlMoeLayerPlan plan_{};
   size_t gate_exp_bytes_ = 0;
@@ -915,11 +851,6 @@ class GgmlMoeRunner {
   size_t down_exp_bytes_ = 0;
   bool layer_ready_ = false;
 
-  double h2d_seconds_ = 0.0;
-  double h2d_dma_seconds_ = 0.0;
-  size_t h2d_bytes_ = 0;
-  double d2d_seconds_ = 0.0;
-  size_t d2d_bytes_ = 0;
 };
 
 // Qwen4Exp CPU routed-expert runner.  This is deliberately separate from the
