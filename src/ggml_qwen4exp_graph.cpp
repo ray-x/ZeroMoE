@@ -121,6 +121,29 @@ struct FullGraph {
   size_t device_dense_capacity = 0;
   size_t device_dense_used = 0;
   int device_dense_tensors = 0;
+  // Diagnostic (2026-09-17): cumulative time inside resident_tensor()'s own
+  // cudaMemcpy H2D calls, across this ONE build_graph() call -- see memory:
+  // full-graph-decode-graph-construction-5s-latency.md. Reset to 0 at the
+  // top of build_graph(), read+logged at the bottom, alongside the
+  // node_construction/sched_alloc_graph split already there.
+  double dense_upload_ms_total = 0.0;
+  // Same idea, for bind_device_expert()'s own cudaMemcpy (the 17.68 GiB,
+  // 22-GPU-resident-layer upload -- the other real candidate for where
+  // node_construction's time goes, besides dense_upload_ms_total above).
+  double expert_upload_ms_total = 0.0;
+  long expert_upload_calls = 0;
+  // Diagnostic (2026-09-17): further split of node_construction beyond the
+  // cudaMemcpy timers above, which only accounted for ~28-44% of the total.
+  // Buckets the REST of the per-layer node-construction work (host-side
+  // ggml_tensor/op building, not any device transfer) into attention-block
+  // vs MoE-block, to find where the remaining ~55-72% actually goes.
+  double attn_construction_ms_total = 0.0;
+  double moe_construction_ms_total = 0.0;
+  // Finer split of moe_construction_ms_total: time inside the weight-tensor
+  // lookup calls (expert_weight_split/expert_weight/expert_gate_up_weight --
+  // model_tensor lookup + preloaded_ram_expert_source + bind_host/
+  // bind_device_expert*) vs build_moe()'s own ggml graph-node creation.
+  double moe_weight_lookup_ms_total = 0.0;
   ggml_backend_buffer_t device_state_buffer = nullptr;
   void *device_state_base = nullptr;
   size_t device_state_capacity = 0;
@@ -152,6 +175,7 @@ struct FullGraph {
   ggml_cgraph *graph = nullptr;
 
   ggml_tensor *input = nullptr;         // [D, HC, S], CPU input
+  ggml_tensor *topology_cpu_prologue = nullptr;
   ggml_tensor *output = nullptr;        // [D, S], final HC output
   ggml_tensor *logits = nullptr;        // [vocab, S], decode-only output
   ggml_tensor *final_streams = nullptr; // [D, HC, S], for state/debug writeback
@@ -362,32 +386,6 @@ bool env_merged_gate_up_enabled() {
 
 int layer_timing_parse_layer(const char *name);
 
-// Diagnostic A/B for the CPU expert source layout.  The normal graph aliases
-// the preloaded [gate|up|down] per-expert DDR arena, which gives each
-// projection view a large inter-expert stride.  This opt-in path copies one
-// projection at a time into a compact graph-owned buffer so the CPU
-// MUL_MAT_ID kernel sees the same contiguous expert-axis layout as Bee.
-bool env_cpu_compact_expert_views_enabled() {
-  const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_CPU_COMPACT");
-  return v && v[0] == '1';
-}
-
-// Optional narrow version of the layout A/B.  A non-negative value limits
-// the extra copy to one model layer, which avoids turning a 26-CPU-layer test
-// into a host-memory-pressure test.  Unset means all CPU expert layers.
-int env_cpu_compact_only_layer() {
-  const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_CPU_COMPACT_ONLY_LAYER");
-  if (!v || !v[0])
-    return -1;
-  char *end = nullptr;
-  const long layer = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || layer < 0 || layer > 47)
-    return -2;
-  return static_cast<int>(layer);
-}
-
 // Parses the "blk.<N>." prefix ggml_qwen4exp_graph.cpp's own tensor names
 // always use (see expert_weight/dense_weight/etc.) -- returns -1 if the
 // name doesn't match (dense/global tensors with no per-layer index, e.g.
@@ -507,13 +505,59 @@ int graph_cpu_threads() {
   return available;
 }
 
-// The reference Bee scheduler uses pipeline_parallel=false for this
-// single-GPU mixed CPU/GPU graph.  This graph is strictly sequential across
-// the 52 CPU/GPU transitions, so the scheduler's four-copy/event mode adds
-// bookkeeping without useful overlap here.  Keep the reference mode as the
-// default; set MOESTREAM_QWEN4EXP_GRAPH_PARALLEL=1 for the event-mode A/B.
+// REVERTED (2026-09-17): a prior commit defaulted this to false, reasoning
+// "the reference Bee scheduler uses pipeline_parallel=false for this
+// graph... so the event/four-copy mode adds bookkeeping without useful
+// overlap." That reasoning does not hold up against Bee's own source
+// (llama-context.cpp): `pipeline_parallel` there is an UNRELATED feature --
+// it requires `model.n_devices() > 1` (multi-GPU tensor split) AND
+// `!model.has_tensor_overrides()`, and Bee's own `-ncmoe` flag sets tensor
+// overrides for exactly the CPU-offloaded MoE tensors this graph mirrors.
+// So Bee's `pipeline_parallel=false` in every comparison this project has
+// ever run is not a deliberate choice about CPU/GPU MoE handoff at all --
+// it is bee's own multi-GPU pipelining feature being auto-disabled by
+// `-ncmoe`, for reasons having nothing to do with this graph's performance.
+// Confirmed via direct measurement this graph's OWN parallel=false default
+// was a real regression (11.76 vs 12.20-12.86 tok/s, N=22 mixed decode) --
+// this is the fix from qwen4exp-mixed-gpu-decode-gap.md
+// (ggml_backend_sched_new's parallel=false leaves CUDA sync events NULL,
+// forcing a blocking stream-sync every CPU/GPU transition instead of a
+// cheap event wait), previously verified at ~15.7->18.5-18.9 tok/s and
+// accidentally undone by that commit. Default back to true; set
+// MOESTREAM_QWEN4EXP_GRAPH_PARALLEL=0 for the blocking-sync A/B.
 bool graph_scheduler_parallel() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PARALLEL");
+  return !(v && v[0] == '0');
+}
+
+// Bee gives the CPU scheduler slot the CUDA device's host buffer type. That
+// makes graph-owned CPU activations pinned host allocations, so the many
+// CPU<->CUDA boundary copies do not fall through the pageable-host staging
+// path. This is the normal full-graph mode; set the environment variable to
+// 0 for an explicit pageable-buffer A/B.
+bool graph_cuda_host_buffers() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_CUDA_HOST_BUFFERS");
+  return !(v && v[0] == '0');
+}
+
+// Bee's full graph begins with the CPU token-embedding GET_ROWS node, then
+// crosses to CUDA for the first transformer block.  MoEStream receives the
+// already-expanded hidden state from the engine, so it cannot include that
+// embedding operation without duplicating model work.  Keep the same
+// CPU->GPU graph boundary with one CPU contiguous staging node instead.  This
+// is a topology-compatibility node, not a numerical transformation; set the
+// variable to 0 for the original MoEStream graph shape when doing an A/B.
+bool graph_match_bee_topology() {
+  const char *v =
+      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MATCH_BEE_TOPOLOGY");
+  return !(v && v[0] == '0');
+}
+
+// Emit one-time tensor metadata for CPU MoE comparisons.  The same
+// BEE_GGML_PROFILE_LAYOUT switch is consumed by Bee's GGML scheduler so the
+// two implementations can be compared without changing their execution.
+bool graph_layout_debug() {
+  const char *v = std::getenv("BEE_GGML_PROFILE_LAYOUT");
   return v && v[0] == '1';
 }
 
@@ -641,8 +685,13 @@ ggml_tensor *resident_tensor(
     if (ggml_backend_tensor_alloc(g.device_dense_buffer, t, addr) !=
         GGML_STATUS_SUCCESS)
       return nullptr;
+    const auto t_memcpy_start = std::chrono::steady_clock::now();
     const cudaError_t err = cudaMemcpy(addr, q->host_ptr, q->meta.size_bytes,
                                        cudaMemcpyHostToDevice);
+    g.dense_upload_ms_total += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() -
+                                  t_memcpy_start)
+                                  .count();
     if (err != cudaSuccess) {
       LOG_ERROR("[GGML-QWEN-FULL] dense device upload failed for %s: %s\n",
                 name.c_str(), cudaGetErrorString(err));
@@ -988,9 +1037,10 @@ size_t full_expert_source_bytes(const StreamingEngine &engine) {
 }
 
 // Resolve one packed Qwen expert projection to the complete, preloaded
-// graph-RAM arena.  This is deliberately Qwen-specific: the arena layout is
-// [gate|up|down] per expert with a fixed expert stride, whereas other model
-// families have different graph/cache ownership rules.
+// graph-RAM arena. This is deliberately Qwen-specific. The arena may use the
+// legacy [gate|up|down] per-expert layout or the projection-compact layout
+// (three separate expert-axis planes); in both cases this returns a strided
+// view without making a graph-owned copy.
 bool preloaded_ram_expert_source(FullGraph &g, const std::string &name,
                                  const GGUFTensor &meta, void *&ptr,
                                  size_t &bytes, size_t &expert_stride,
@@ -1010,14 +1060,22 @@ bool preloaded_ram_expert_source(FullGraph &g, const std::string &name,
     return false;
   size_t plane_offset = 0;
   size_t plane_bytes = 0;
+  size_t plane_stride = 0;
   if (suffix == "ffn_gate_exps.weight") {
+    plane_offset = arena->gate_offset;
     plane_bytes = arena->gate_bytes;
+    plane_stride = arena->gate_stride;
   } else if (suffix == "ffn_up_exps.weight") {
-    plane_offset = arena->gate_bytes;
+    plane_offset = arena->projection_compact ? arena->up_offset
+                                             : arena->gate_bytes;
     plane_bytes = arena->up_bytes;
+    plane_stride = arena->up_stride;
   } else if (suffix == "ffn_down_exps.weight") {
-    plane_offset = arena->gate_bytes + arena->up_bytes;
+    plane_offset = arena->projection_compact
+                       ? arena->down_offset
+                       : arena->gate_bytes + arena->up_bytes;
     plane_bytes = arena->down_bytes;
+    plane_stride = arena->down_stride;
   } else {
     return false;
   }
@@ -1028,22 +1086,23 @@ bool preloaded_ram_expert_source(FullGraph &g, const std::string &name,
   const size_t n_exp = static_cast<size_t>(std::max(0, n_experts));
   if (!arena || !arena->base || n_experts <= 0 ||
       arena->n_experts != n_experts || plane_bytes == 0 ||
+      plane_stride == 0 ||
       plane_offset > arena->bytes ||
       plane_bytes > arena->bytes - plane_offset ||
       n_exp > SIZE_MAX / plane_bytes ||
-      meta.size_bytes != plane_bytes * n_exp || arena->stride < plane_bytes ||
+      meta.size_bytes != plane_bytes * n_exp || plane_stride < plane_bytes ||
       static_cast<size_t>(n_experts - 1) >
-          (SIZE_MAX - plane_bytes) / arena->stride)
+          (SIZE_MAX - plane_bytes) / plane_stride)
     return false;
 
   const size_t view_bytes =
-      arena->stride * static_cast<size_t>(n_experts - 1) + plane_bytes;
+      plane_stride * static_cast<size_t>(n_experts - 1) + plane_bytes;
   if (plane_offset > arena->bytes || view_bytes > arena->bytes - plane_offset)
     return false;
 
   ptr = arena->base + plane_offset;
   bytes = view_bytes;
-  expert_stride = arena->stride;
+  expert_stride = plane_stride;
   arena_bytes = arena->bytes;
   return true;
 }
@@ -1243,9 +1302,71 @@ bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host,
   if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
       GGML_STATUS_SUCCESS)
     return false;
+  const auto t_memcpy_start = std::chrono::steady_clock::now();
   const cudaError_t err = cudaMemcpy(addr, host, bytes, cudaMemcpyHostToDevice);
+  g.expert_upload_ms_total += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() -
+                                  t_memcpy_start)
+                                  .count();
+  ++g.expert_upload_calls;
   if (err != cudaSuccess) {
     LOG_ERROR("[GGML-QWEN-FULL] device expert upload failed: %s\n",
+              cudaGetErrorString(err));
+    return false;
+  }
+  g.device_expert_used = aligned + alloc_size;
+  return true;
+}
+
+// Same bump-allocation contract as bind_device_expert() above, but the
+// source is one uniform-stride run of n_experts planes inside a RAM arena
+// (base + e*src_stride for e in [0,n_experts)) rather than one contiguous
+// host buffer -- the arena interleaves gate|up|down per expert, so a single
+// plane's bytes across experts are NOT contiguous (see load_full_weight()'s
+// device_resident arena path). A per-expert cudaMemcpy loop (like
+// bind_device_expert_gather() below) works but pays real per-call CUDA API
+// overhead n_experts times (measured: made node_construction WORSE, not
+// better, at this model's expert count). cudaMemcpy2D expresses the whole
+// strided transfer as ONE driver call (width=per_expert_bytes,
+// height=n_experts, spitch=src_stride, dpitch=per_expert_bytes since the
+// destination is freshly bump-allocated and therefore compact).
+bool bind_device_expert_strided(FullGraph &g, ggml_tensor *t, const void *base,
+                                size_t src_stride, size_t per_expert_bytes,
+                                int n_experts) {
+  if (!g.device_expert_buffer || !t || !base || src_stride == 0 ||
+      per_expert_bytes == 0 || n_experts <= 0 || src_stride < per_expert_bytes)
+    return false;
+  if (static_cast<size_t>(n_experts) > SIZE_MAX / per_expert_bytes)
+    return false;
+  const size_t total_bytes =
+      per_expert_bytes * static_cast<size_t>(n_experts);
+  if (total_bytes < ggml_nbytes(t))
+    return false;
+  const ggml_backend_buffer_type_t buft =
+      ggml_backend_buffer_get_type(g.device_expert_buffer);
+  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+  const size_t alignment =
+      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+  const size_t aligned =
+      (g.device_expert_used + alignment - 1) & ~(alignment - 1);
+  if (aligned > g.device_expert_capacity ||
+      alloc_size > g.device_expert_capacity - aligned)
+    return false;
+  void *addr = static_cast<uint8_t *>(g.device_expert_base) + aligned;
+  if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  const auto t_memcpy_start = std::chrono::steady_clock::now();
+  const cudaError_t err =
+      cudaMemcpy2D(addr, per_expert_bytes, base, src_stride, per_expert_bytes,
+                  static_cast<size_t>(n_experts), cudaMemcpyHostToDevice);
+  g.expert_upload_ms_total += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() -
+                                  t_memcpy_start)
+                                  .count();
+  ++g.expert_upload_calls;
+  if (err != cudaSuccess) {
+    LOG_ERROR("[GGML-QWEN-FULL] device expert strided upload failed: %s\n",
               cudaGetErrorString(err));
     return false;
   }
@@ -1306,6 +1427,73 @@ bool bind_device_expert_gather(FullGraph &g, ggml_tensor *t,
   return true;
 }
 
+// Projection-compact counterpart of bind_device_expert_gather(). Gate and up
+// are separate host planes, so copy the two source slices into each compact
+// VRAM expert record. This is a startup-only graph construction operation; it
+// avoids rebuilding a large interleaved DDR copy merely to preserve the GPU
+// gate/up fusion.
+// Uniform-stride counterpart to bind_device_expert_gather_gate_up() below --
+// same interleaved-destination contract (dst holds [gate_e|up_e] per expert,
+// compact), but the two sources are each one uniform-stride run
+// (gate_base+e*gate_stride, up_base+e*up_stride) rather than arbitrary
+// per-expert pointers, so each plane's whole transfer is one cudaMemcpy2D
+// call instead of n_experts separate ones (same rationale as
+// bind_device_expert_strided() above -- measured real win on this model's
+// expert count).
+bool bind_device_expert_strided_gate_up(FullGraph &g, ggml_tensor *t,
+                                        const void *gate_base,
+                                        size_t gate_stride, size_t gate_bytes,
+                                        const void *up_base, size_t up_stride,
+                                        size_t up_bytes, int n_experts) {
+  if (!g.device_expert_buffer || !t || !gate_base || !up_base ||
+      gate_bytes == 0 || up_bytes == 0 || n_experts <= 0 ||
+      gate_stride < gate_bytes || up_stride < up_bytes ||
+      gate_bytes > SIZE_MAX - up_bytes)
+    return false;
+  const size_t per_expert_bytes = gate_bytes + up_bytes;
+  if (static_cast<size_t>(n_experts) > SIZE_MAX / per_expert_bytes)
+    return false;
+  const size_t total_bytes =
+      per_expert_bytes * static_cast<size_t>(n_experts);
+  if (total_bytes < ggml_nbytes(t))
+    return false;
+  const ggml_backend_buffer_type_t buft =
+      ggml_backend_buffer_get_type(g.device_expert_buffer);
+  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+  const size_t alignment =
+      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+  const size_t aligned =
+      (g.device_expert_used + alignment - 1) & ~(alignment - 1);
+  if (aligned > g.device_expert_capacity ||
+      alloc_size > g.device_expert_capacity - aligned)
+    return false;
+  void *addr = static_cast<uint8_t *>(g.device_expert_base) + aligned;
+  if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  const auto t_memcpy_start = std::chrono::steady_clock::now();
+  cudaError_t err =
+      cudaMemcpy2D(addr, per_expert_bytes, gate_base, gate_stride, gate_bytes,
+                  static_cast<size_t>(n_experts), cudaMemcpyHostToDevice);
+  if (err == cudaSuccess)
+    err = cudaMemcpy2D(static_cast<uint8_t *>(addr) + gate_bytes,
+                       per_expert_bytes, up_base, up_stride, up_bytes,
+                       static_cast<size_t>(n_experts), cudaMemcpyHostToDevice);
+  g.expert_upload_ms_total += std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() -
+                                  t_memcpy_start)
+                                  .count();
+  ++g.expert_upload_calls;
+  if (err != cudaSuccess) {
+    LOG_ERROR("[GGML-QWEN-FULL] compact gate/up strided upload failed: %s\n",
+              cudaGetErrorString(err));
+    return false;
+  }
+  g.device_expert_used = aligned + alloc_size;
+  return true;
+}
+
+
 ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
                               const std::string &name,
                               bool device_resident = false) {
@@ -1322,10 +1510,35 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
   const size_t required = std::max(bytes, ggml_nbytes(t));
 
   // A Qwen full graph must consume the same complete DDR expert planes that
-  // the RAM tier already loaded.  In that configuration the source is an
-  // interleaved fixed-stride arena, so adjust only the expert-axis stride;
-  // no selected weights are copied and no GGUF mapping is consulted.
-  if (!device_resident) {
+  // the RAM tier already loaded.  In that configuration the source is a
+  // fixed-stride arena, so adjust only the expert-axis stride; no selected
+  // weights are copied and no GGUF mapping is consulted.
+  //
+  // 2026-09-17: this arena source used to be consulted ONLY for
+  // !device_resident (the host-alias path just below). A device_resident
+  // caller (device_expert_layers' whole-layer VRAM block) fell through
+  // unconditionally to the pread_direct_aware() fallback further down --
+  // a REAL re-read from disk/page-cache of the entire device-resident expert
+  // block, on every single build_graph() call, even though the RAM tier had
+  // already loaded and validated (graph_ram_layer_ready()) these exact
+  // bytes moments earlier. Root-caused via a chrono split of node_construction
+  // (see memory: full-graph-decode-graph-construction-5s-latency.md) that
+  // isolated ~3.1s of the ~5.3s decode-build cost to this function, entirely
+  // OUTSIDE the already-measured dense/expert cudaMemcpy timers -- consistent
+  // with device_expert_bytes() (~17.68 GiB at device_expert_layers=22) moving
+  // through a page-cache-speed host memcpy that no counter was watching.
+  // Fixed by transferring straight from the arena into VRAM via
+  // bind_device_expert_strided() (one cudaMemcpy2D per tensor, since the
+  // arena's per-plane expert stride is uniform), skipping the host
+  // round-trip entirely instead of just skipping the disk read. A first cut
+  // used a per-expert cudaMemcpy loop (matching expert_gate_up_weight()'s
+  // pre-existing bind_device_expert_gather() mechanism) but measured WORSE
+  // than the disk-read baseline at this model's expert count -- n_experts
+  // separate CUDA API calls cost more than the read they replaced;
+  // expert_gate_up_weight()'s own device_resident branch had the same
+  // per-call-overhead problem and was converted to
+  // bind_device_expert_strided()/bind_device_expert_strided_gate_up() too.
+  {
     void *ram_ptr = nullptr;
     size_t ram_bytes = 0;
     size_t ram_stride = 0;
@@ -1336,56 +1549,15 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
           t->ne[2] != g.engine->model_file.architecture_config.n_experts ||
           ram_stride < t->nb[2])
         return nullptr;
-
-      const int compact_only_layer = env_cpu_compact_only_layer();
-      const bool compact_this_layer =
-          env_cpu_compact_expert_views_enabled() &&
-          compact_only_layer != -2 &&
-          (compact_only_layer < 0 ||
-           compact_only_layer == layer_timing_parse_layer(name.c_str()));
-      if (compact_this_layer) {
-        const size_t n_experts = static_cast<size_t>(t->ne[2]);
-        if (n_experts == 0 || bytes == 0 || bytes % n_experts != 0)
+      if (device_resident) {
+        const int n_experts = static_cast<int>(t->ne[2]);
+        if (n_experts <= 0 || bytes % static_cast<size_t>(n_experts) != 0)
           return nullptr;
-        const size_t plane_bytes = bytes / n_experts;
-        if (plane_bytes == 0 ||
-            (n_experts - 1) >
-                (SIZE_MAX - plane_bytes) / ram_stride)
+        const size_t per_expert_bytes =
+            bytes / static_cast<size_t>(n_experts);
+        if (!bind_device_expert_strided(g, t, ram_ptr, ram_stride,
+                                        per_expert_bytes, n_experts))
           return nullptr;
-        void *compact = alloc_host(g, bytes);
-        if (!compact)
-          return nullptr;
-        auto *dst = static_cast<uint8_t *>(compact);
-        const auto *src = static_cast<const uint8_t *>(ram_ptr);
-        for (size_t e = 0; e < n_experts; ++e) {
-          std::memcpy(dst + e * plane_bytes, src + e * ram_stride,
-                      plane_bytes);
-        }
-        if (!bind_host(g, t, compact, bytes,
-                       GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
-          return nullptr;
-        // Bee's CPU expert tensors are CUDA_Host-backed.  Pin the diagnostic
-        // compact copy as well, otherwise this A/B changes both the expert
-        // axis layout and the host-memory transfer/cache class.
-        const size_t owned_index = g.owned.size() - 1;
-        const cudaError_t pin_err =
-            cudaHostRegister(compact, bytes, cudaHostRegisterPortable);
-        if (pin_err == cudaSuccess) {
-          g.owned[owned_index].pinned = true;
-          g.host_pinned_bytes += bytes;
-        } else {
-          ++g.host_pin_failures;
-          cudaGetLastError();
-          if (g.host_pin_failures == 1) {
-            LOG_WARN(
-                "[GGML-QWEN-FULL] compact CPU expert pinning declined at "
-                "%.2f GiB: %s\n",
-                static_cast<double>(g.host_pinned_bytes) /
-                    (1024.0 * 1024.0 * 1024.0),
-                cudaGetErrorString(pin_err));
-          }
-        }
-        g.host_weight_bytes += bytes;
         ggml_set_name(t, name.c_str());
         return t;
       }
@@ -1493,12 +1665,12 @@ ggml_tensor *expert_weight(FullGraph &g, ggml_context *ctx, int layer,
                           graph_expert_projection_resident(g, layer, stem));
 }
 
-// The Qwen graph-RAM arena stores each expert as [gate|up|down].  When gate
-// and up have the same quantized row layout, expose the adjacent first two
-// planes as one [cols, 2*rows, n_expert] MUL_MAT_ID weight.  This is the same
-// zero-copy merge used by the persistent CPU MoE runner and Bee's reference
-// graph: it removes one routed matmul per MoE layer without changing the
-// source bytes or the scheduler's backend ownership.
+// When gate and up have the same quantized row layout, expose them as one
+// [cols, 2*rows, n_expert] MUL_MAT_ID weight. GPU graph layers retain this
+// merge by gathering the two compact host planes into their final VRAM tensor.
+// CPU graph layers use separate views: gate and up are separate planes in the
+// projection-compact arena, and making a merged host tensor would recreate the
+// large duplicate this layout is intended to remove.
 ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
                                    bool device_resident) {
   const std::string base = "blk." + std::to_string(layer) + ".";
@@ -1522,19 +1694,26 @@ ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
           static_cast<size_t>(gate->size_bytes) /
               static_cast<size_t>(n_experts) ||
       arena->up_bytes !=
-          static_cast<size_t>(up->size_bytes) /
+              static_cast<size_t>(up->size_bytes) /
               static_cast<size_t>(n_experts) ||
       arena->gate_bytes > SIZE_MAX - arena->up_bytes)
     return nullptr;
 
-  const size_t plane_bytes = arena->gate_bytes + arena->up_bytes;
-  if (plane_bytes == 0 || arena->stride < plane_bytes ||
-      static_cast<size_t>(n_experts - 1) >
-          (SIZE_MAX - plane_bytes) / arena->stride)
+  if (!device_resident && arena->projection_compact)
     return nullptr;
-  const size_t view_bytes =
-      arena->stride * static_cast<size_t>(n_experts - 1) + plane_bytes;
-  if (view_bytes > arena->bytes)
+
+  const size_t plane_bytes = arena->gate_bytes + arena->up_bytes;
+  if (plane_bytes == 0)
+    return nullptr;
+  const size_t legacy_view_bytes =
+      arena->stride != 0 &&
+              static_cast<size_t>(n_experts - 1) <=
+                  (SIZE_MAX - plane_bytes) / arena->stride
+          ? arena->stride * static_cast<size_t>(n_experts - 1) + plane_bytes
+          : 0;
+  if (!arena->projection_compact &&
+      (arena->stride < plane_bytes || legacy_view_bytes == 0 ||
+       legacy_view_bytes > arena->bytes))
     return nullptr;
 
   std::vector<int64_t> shape;
@@ -1552,24 +1731,30 @@ ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
     return nullptr;
 
   if (device_resident) {
-    // bind_device_expert_gather() packs the selected source planes into a
-    // contiguous VRAM tensor.  Keep ggml's default compact expert-axis
-    // strides here; using the DDR arena stride on this descriptor makes
-    // ggml_nbytes(t) include the skipped down plane/padding and incorrectly
-    // rejects the otherwise valid VRAM allocation.
-    std::vector<const void *> src_ptrs;
-    src_ptrs.reserve(static_cast<size_t>(n_experts));
-    for (int e = 0; e < n_experts; ++e)
-      src_ptrs.push_back(arena->base + static_cast<size_t>(e) * arena->stride);
-    if (!bind_device_expert_gather(g, t, src_ptrs, plane_bytes))
-      return nullptr;
+    // Keep ggml's default compact expert-axis strides here; using a DDR
+    // arena stride on this descriptor would make ggml_nbytes(t) include the
+    // skipped down plane/padding and reject the valid VRAM allocation.
+    if (arena->projection_compact) {
+      if (!bind_device_expert_strided_gate_up(
+              g, t, arena->base + arena->gate_offset, arena->gate_stride,
+              arena->gate_bytes, arena->base + arena->up_offset,
+              arena->up_stride, arena->up_bytes, n_experts))
+        return nullptr;
+    } else {
+      // Uniform expert-axis stride -- same shape bind_device_expert_strided()
+      // (load_full_weight()'s own device_resident arena path) already
+      // handles with one cudaMemcpy2D instead of an n_experts-call loop.
+      if (!bind_device_expert_strided(g, t, arena->base, arena->stride,
+                                      plane_bytes, n_experts))
+        return nullptr;
+    }
   } else {
     // The host view aliases the interleaved DDR arena, so its expert-axis
     // stride must skip the following down projection and any alignment
     // padding in each source slab.
     t->nb[2] = arena->stride;
     t->nb[3] = arena->stride * static_cast<size_t>(n_experts);
-    if (!bind_host(g, t, arena->base, view_bytes,
+    if (!bind_host(g, t, arena->base, legacy_view_bytes,
                    GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
       return nullptr;
     g.host_ram_alias_bytes += arena->bytes;
@@ -1906,6 +2091,82 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   return out;
 }
 
+bool qwen_moe_layer_cpu_only(const FullGraph &g, int layer) {
+  const auto split_it = g.split_gpu_expert_ids.find(layer);
+  if (split_it != g.split_gpu_expert_ids.end() && !split_it->second.empty())
+    return false;
+  return !graph_expert_projection_resident(g, layer, "ffn_gate_exps.weight") &&
+         !graph_expert_projection_resident(g, layer, "ffn_up_exps.weight") &&
+         !graph_expert_projection_resident(g, layer, "ffn_down_exps.weight");
+}
+
+void log_qwen_layout_tensor(const FullGraph &g, int layer, bool cpu_only,
+                            const char *role, const ggml_tensor *tensor) {
+  if (!tensor)
+    return;
+  ggml_backend_buffer_t buffer = tensor->buffer;
+  if (!buffer && tensor->view_src)
+    buffer = tensor->view_src->buffer;
+  const char *buft = buffer
+                         ? ggml_backend_buft_name(
+                               ggml_backend_buffer_get_type(buffer))
+                         : "unallocated";
+  const char *backend_name = "unassigned";
+  if (g.sched) {
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(
+        g.sched, const_cast<ggml_tensor *>(tensor));
+    if (backend)
+      backend_name = ggml_backend_name(backend);
+  }
+  const char *pinned = "unknown";
+  if (buffer && ggml_backend_buffer_is_host(buffer)) {
+    void *base = ggml_backend_buffer_get_base(buffer);
+    unsigned int flags = 0;
+    if (base && cudaHostGetFlags(&flags, base) == cudaSuccess) {
+      pinned = "yes";
+    } else {
+      cudaGetLastError();
+      pinned = "no";
+    }
+  }
+  LOG_INFO(
+      "[GGML-QWEN-LAYOUT] layer=%d cpu_only=%d role=%s op=%s name=%s "
+      "type=%s nbytes=%zu ne=[%lld,%lld,%lld,%lld] "
+      "nb=[%zu,%zu,%zu,%zu] buft=%s backend=%s pinned=%s\n",
+      layer, cpu_only ? 1 : 0, role, ggml_op_name(tensor->op),
+      ggml_get_name(tensor), ggml_type_name(tensor->type),
+      ggml_nbytes(tensor), (long long) tensor->ne[0],
+      (long long) tensor->ne[1], (long long) tensor->ne[2],
+      (long long) tensor->ne[3], tensor->nb[0], tensor->nb[1], tensor->nb[2],
+      tensor->nb[3], buft, backend_name, pinned);
+}
+
+void dump_qwen_moe_layout(const FullGraph &g) {
+  if (!graph_layout_debug() || !g.graph || !g.sched)
+    return;
+  std::unordered_set<const ggml_tensor *> logged;
+  for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i) {
+    ggml_tensor *node = ggml_graph_node(g.graph, i);
+    if (!node || node->op != GGML_OP_MUL_MAT_ID || !node->src[0])
+      continue;
+    ggml_backend_t backend =
+        ggml_backend_sched_get_tensor_backend(g.sched, node);
+    if (backend != g.cpu)
+      continue;
+    const int layer = layer_timing_parse_layer(ggml_get_name(node->src[0]));
+    if (layer < 0)
+      continue;
+    const bool cpu_only = qwen_moe_layer_cpu_only(g, layer);
+    const char *roles[] = {"weight", "input", "ids"};
+    for (int src = 0; src < 3; ++src) {
+      ggml_tensor *tensor = node->src[src];
+      if (!tensor || !logged.insert(tensor).second)
+        continue;
+      log_qwen_layout_tensor(g, layer, cpu_only, roles[src], tensor);
+    }
+  }
+}
+
 ggml_tensor *build_shared(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                           int layer, ggml_tensor *gate, ggml_tensor *up,
                           ggml_tensor *down, ggml_tensor *scalar_gate) {
@@ -2205,6 +2466,21 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
 }
 
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
+  // Timing split (2026-09-17): full-graph decode's FIRST call pays a real
+  // ~5.3s one-time cost, invisible in any --ngen 400 average (6000/400=
+  // 15ms/token) but a genuine multi-second latency cliff for interactive
+  // use (every new conversation/context reset pays it). See memory:
+  // full-graph-decode-graph-construction-5s-latency.md. This split isolates
+  // OUR host-side node-construction C++ (this function's own body) from
+  // ggml's own ggml_backend_sched_alloc_graph() call below, since the fix
+  // differs completely depending on which one dominates.
+  const auto t_build_graph_start = std::chrono::steady_clock::now();
+  g.dense_upload_ms_total = 0.0;
+  g.expert_upload_ms_total = 0.0;
+  g.expert_upload_calls = 0;
+  g.attn_construction_ms_total = 0.0;
+  g.moe_construction_ms_total = 0.0;
+  g.moe_weight_lookup_ms_total = 0.0;
   const auto &c = g.engine->model_file.architecture_config;
   ggml_init_params ip = {};
   ip.mem_size = kTensorContextBytes;
@@ -2270,6 +2546,19 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
 
   ggml_tensor *res = g.input;
+  if (graph_match_bee_topology()) {
+    // The scheduler normally starts directly on the first GPU-weighted
+    // operation because g.input is already a CPU buffer.  An explicit CPU
+    // CONT makes the initial CPU->GPU handoff visible as the same leading
+    // CPU/GPU split that Bee has around model.input_embed/hc_init.
+    res = ggml_cont(g.ctx, res);
+    if (!res)
+      return false;
+    ggml_set_name(res, "qwen_full_bee_cpu_prologue");
+    g.topology_cpu_prologue = res;
+    if (g.sched)
+      ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
+  }
   for (int l = 0; l < g.n_layers; ++l) {
     const std::string p = "blk." + std::to_string(l) + ".";
     if (qwen4exp_is_ple_layer(c, l)) {
@@ -2383,6 +2672,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       }
     }
 
+    const auto t_attn_start = std::chrono::steady_clock::now();
     ggml_tensor *inject = nullptr;
     ggml_tensor *hn = resident_tensor(g, g.ctx, p + "hc_attn_norm.weight");
     ggml_tensor *hdn = resident_tensor(g, g.ctx, p + "hc_attn_down.weight");
@@ -2494,7 +2784,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       g.kv_layers.push_back(l);
     }
     res = hc_combine(g, g.ctx, res, attn_out, inject);
+    g.attn_construction_ms_total += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_attn_start).count();
 
+    const auto t_moe_start = std::chrono::steady_clock::now();
     inject = nullptr;
     hn = resident_tensor(g, g.ctx, p + "hc_ffn_norm.weight");
     hdn = resident_tensor(g, g.ctx, p + "hc_ffn_down.weight");
@@ -2519,12 +2812,17 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         !split_it->second.empty();
     ggml_tensor *moe = nullptr;
     if (!split_planned && env_merged_gate_up_enabled()) {
+      const auto t_wlookup_start = std::chrono::steady_clock::now();
       const bool gate_up_device =
           graph_expert_projection_resident(g, l, "ffn_gate_exps.weight");
       ggml_tensor *gate_up =
           expert_gate_up_weight(g, g.ctx, l, gate_up_device);
       ggml_tensor *down = expert_weight(g, g.ctx, l,
                                         "ffn_down_exps.weight");
+      g.moe_weight_lookup_ms_total +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - t_wlookup_start)
+              .count();
       if (gate_up && down) {
         moe = build_moe(g, g.ctx, ffn_in, l, router, bias, nullptr, nullptr,
                         down, nullptr, nullptr, nullptr, nullptr, gate_up);
@@ -2532,12 +2830,17 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     }
 
     if (!moe) {
+      const auto t_wlookup_start = std::chrono::steady_clock::now();
       SplitExpertWeight ge =
           expert_weight_split(g, g.ctx, l, "ffn_gate_exps.weight");
       SplitExpertWeight ue =
           expert_weight_split(g, g.ctx, l, "ffn_up_exps.weight");
       SplitExpertWeight de =
           expert_weight_split(g, g.ctx, l, "ffn_down_exps.weight");
+      g.moe_weight_lookup_ms_total +=
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - t_wlookup_start)
+              .count();
       if (!ge.cpu || !ue.cpu || !de.cpu)
         return false;
       // v1 scope: uniform M across gate/up/down for a layer -- only treat
@@ -2562,6 +2865,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       moe = ggml_add(g.ctx, moe, shared);
     }
     res = hc_combine(g, g.ctx, res, moe, inject);
+    g.moe_construction_ms_total += std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t_moe_start).count();
   }
 
   ggml_tensor *on = resident_tensor(g, g.ctx, "output_hc_norm.weight");
@@ -2703,9 +3008,28 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       return false;
     }
   }
+  const double t_construction_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() -
+                                       t_build_graph_start)
+                                       .count();
+  const auto t_alloc_start = std::chrono::steady_clock::now();
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
     return false;
+  const double t_alloc_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                t_alloc_start)
+                                .count();
+  LOG_INFO("[GGML-QWEN-FULL-BUILD-TIME] node_construction=%.1fms "
+           "(of which dense_cudaMemcpy=%.1fms/%d tensors, "
+           "expert_cudaMemcpy=%.1fms/%ld calls, attn_block=%.1fms, "
+           "moe_block=%.1fms [weight_lookup=%.1fms]) sched_alloc_graph=%.1fms\n",
+           t_construction_ms, g.dense_upload_ms_total,
+           g.device_dense_tensors, g.expert_upload_ms_total,
+           g.expert_upload_calls, g.attn_construction_ms_total,
+           g.moe_construction_ms_total, g.moe_weight_lookup_ms_total,
+           t_alloc_ms);
   g.graph_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
+  dump_qwen_moe_layout(g);
 
   // The graph is only useful for performance if the scheduler keeps most of
   // the dependency chain on CUDA.  A high split count can otherwise hide a
@@ -2982,11 +3306,23 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (!init_device_expert_arena(*g))
     return false;
   ggml_backend_t backends[] = {g->cuda, g->cpu};
+  ggml_backend_buffer_type_t sched_bufts[2] = {};
+  ggml_backend_buffer_type_t *sched_bufts_ptr = nullptr;
+  if (graph_cuda_host_buffers()) {
+    sched_bufts[0] = ggml_backend_get_default_buffer_type(g->cuda);
+    sched_bufts[1] = ggml_backend_dev_host_buffer_type(
+        ggml_backend_get_device(g->cuda));
+    if (sched_bufts[1]) {
+      sched_bufts_ptr = sched_bufts;
+      LOG_INFO("[GGML-QWEN-FULL] scheduler CPU buffer=%s (CUDA host buffer)\n",
+               ggml_backend_buft_name(sched_bufts[1]));
+    }
+  }
   // Match Bee's pipeline_parallel=false scheduler mode by default.  The
   // graph's CPU/GPU transitions are dependency-serial; the event/four-copy
   // mode is retained as an explicit opt-in for comparison.
   g->sched =
-      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize,
+      ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
                              graph_scheduler_parallel(), true);
   if (!g->sched)
     return false;
@@ -3179,9 +3515,22 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !init_device_expert_arena(*g))
     return false;
   ggml_backend_t backends[] = {g->cuda, g->cpu};
+  ggml_backend_buffer_type_t sched_bufts[2] = {};
+  ggml_backend_buffer_type_t *sched_bufts_ptr = nullptr;
+  if (graph_cuda_host_buffers()) {
+    sched_bufts[0] = ggml_backend_get_default_buffer_type(g->cuda);
+    sched_bufts[1] = ggml_backend_dev_host_buffer_type(
+        ggml_backend_get_device(g->cuda));
+    if (sched_bufts[1]) {
+      sched_bufts_ptr = sched_bufts;
+      LOG_INFO(
+          "[GGML-QWEN-FULL-DECODE] scheduler CPU buffer=%s (CUDA host buffer)\n",
+          ggml_backend_buft_name(sched_bufts[1]));
+    }
+  }
   // Match the prefill scheduler mode above; event/four-copy mode is opt-in.
   g->sched =
-      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize,
+      ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
                              graph_scheduler_parallel(), true);
   if (!g->sched)
     return false;

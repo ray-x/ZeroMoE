@@ -403,20 +403,36 @@ public:
     std::vector<std::vector<MoEExpertBlock>> layers_experts;
 
     // A graph-compatible host representation of a fully resident MoE layer.
-    // Each expert occupies one fixed-stride [gate|up|down] slice, allowing
-    // GGML MUL_MAT_ID to view gate/up/down as three expert-axis tensors while
-    // still referencing the same DDR bytes used by the RAM cache.  The graph
-    // only aliases an arena after every expert in its layer is Ready; partial
-    // layers remain on the graph's complete source fallback.
+    // The legacy layout is one fixed-stride [gate|up|down] slice per expert.
+    // Qwen's CPU graph uses the projection-compact layout instead: all gate
+    // slices, all up slices, and all down slices are separate fixed-stride
+    // planes. This lets CPU MUL_MAT_ID consume compact projection views
+    // without allocating a second, per-graph copy after startup.
+    // The graph only aliases an arena after every expert in its layer is
+    // Ready; partial layers remain on the graph's complete source fallback.
     struct GraphRamLayerArena {
         uint8_t *base = nullptr;
+        // Usually equal to base.  The optional diagnostic host offset keeps
+        // the allocation pointer separately because cudaHostRegister/free
+        // must receive the original allocation, not an interior pointer.
+        void *allocation_base = nullptr;
+        size_t allocation_bytes = 0;
         size_t bytes = 0;
+        // Legacy interleaved expert stride. Zero for projection_compact.
         size_t stride = 0;
         size_t gate_bytes = 0;
         size_t up_bytes = 0;
         size_t down_bytes = 0;
+        size_t gate_offset = 0;
+        size_t up_offset = 0;
+        size_t down_offset = 0;
+        size_t gate_stride = 0;
+        size_t up_stride = 0;
+        size_t down_stride = 0;
         int n_experts = 0;
+        bool projection_compact = false;
         bool pinned = false;
+        bool mlocked = false;
         size_t host_reservation_bytes = 0;
         // Shared graph arenas are immutable after the startup preload. Cache
         // the complete-slot validation result so decode does not walk all
@@ -1003,11 +1019,18 @@ public:
         for (auto &arena : graph_ram_arenas) {
             if (!arena.base) continue;
             if (arena.pinned) {
-                cudaHostUnregister(arena.base);
+                cudaHostUnregister(arena.allocation_base ? arena.allocation_base
+                                                          : arena.base);
                 ram_pinned_bytes_used.fetch_sub(arena.bytes,
                                                 std::memory_order_relaxed);
             }
-            free(arena.base);
+            if (arena.mlocked) {
+                munlock(arena.allocation_base ? arena.allocation_base
+                                               : arena.base,
+                        arena.allocation_bytes ? arena.allocation_bytes
+                                               : arena.bytes);
+            }
+            free(arena.allocation_base ? arena.allocation_base : arena.base);
             MemoryGuard::release_host_bytes(arena.host_reservation_bytes);
             arena = {};
         }
@@ -2002,6 +2025,60 @@ public:
                                      io_uring_backend::ReadRequest* out_reqs,
                                      int& out_n, size_t& out_total,
                                      int replica = 0) {
+        // Projection-compact graph arenas have no packed per-expert slab, so
+        // point the three startup requests directly at their final planes.
+        // Runtime misses are not expected for a complete immutable graph
+        // arena and must not write a packed slab over the shared allocation.
+        if (graph_ram_layer_projection_compact(layer_idx)) {
+            if (layer_is_unpacked(layer_idx))
+                return false;
+            size_t gb = 0, ub = 0, db = 0;
+            const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+            if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM) ||
+                !gM || !uM || !dM)
+                return false;
+            const GraphRamLayerArena &arena =
+                graph_ram_arenas[(size_t)layer_idx];
+            const int n_exp = model_file.architecture_config.n_experts;
+            if (n_exp <= 0 || expert_id < 0 || expert_id >= n_exp ||
+                arena.n_experts != n_exp || gb != arena.gate_bytes ||
+                ub != arena.up_bytes || db != arena.down_bytes)
+                return false;
+            const size_t e = (size_t)expert_id;
+            if (e > SIZE_MAX / arena.gate_stride ||
+                e > SIZE_MAX / arena.up_stride ||
+                e > SIZE_MAX / arena.down_stride)
+                return false;
+            const uint8_t *base = arena.base;
+            uint8_t *dst_gate = const_cast<uint8_t *>(
+                base + arena.gate_offset + e * arena.gate_stride);
+            uint8_t *dst_up = const_cast<uint8_t *>(
+                base + arena.up_offset + e * arena.up_stride);
+            uint8_t *dst_down = const_cast<uint8_t *>(
+                base + arena.down_offset + e * arena.down_stride);
+            const bool split = replica == REPLICA_SPLIT;
+            const int r_gate = split ? 0 : replica;
+            const int r_up = split ? 0 : replica;
+            const int r_down = split ? 1 : replica;
+            out_n = 0;
+            out_reqs[out_n++] = {
+                model_file.fd_for_tensor(*gM, r_gate),
+                model_file.direct_io_active_for(*gM, r_gate),
+                model_file.direct_io_alignment, dst_gate, gb,
+                gM->offset + (uint64_t)expert_id * gb};
+            out_reqs[out_n++] = {
+                model_file.fd_for_tensor(*uM, r_up),
+                model_file.direct_io_active_for(*uM, r_up),
+                model_file.direct_io_alignment, dst_up, ub,
+                uM->offset + (uint64_t)expert_id * ub};
+            out_reqs[out_n++] = {
+                model_file.fd_for_tensor(*dM, r_down),
+                model_file.direct_io_active_for(*dM, r_down),
+                model_file.direct_io_alignment, dst_down, db,
+                dM->offset + (uint64_t)expert_id * db};
+            out_total = gb + ub + db;
+            return true;
+        }
         // layer_is_unpacked, not the global flag -- see its own comment
         // (2026-09, Phase 5: per-layer mixed packed/unpacked models). This
         // is the function that actually PLANS the real disk read, so
@@ -2059,7 +2136,147 @@ public:
         return true;
     }
 
+    // Publish projection metadata after a batched read has populated the
+    // final graph-arena planes. No bytes are copied here.
+    bool populate_graph_ram_projection_views(int layer_idx, int expert_id,
+                                             MoEExpertBlock &target_slot) {
+        if (!graph_ram_layer_projection_compact(layer_idx) ||
+            layer_is_unpacked(layer_idx) || expert_id < 0)
+            return false;
+        const GraphRamLayerArena &arena =
+            graph_ram_arenas[(size_t)layer_idx];
+        const int n_exp = model_file.architecture_config.n_experts;
+        if (n_exp <= 0 || expert_id >= n_exp || arena.n_experts != n_exp)
+            return false;
+        size_t gb = 0, ub = 0, db = 0;
+        const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM) ||
+            !gM || !uM || !dM || gb != arena.gate_bytes ||
+            ub != arena.up_bytes || db != arena.down_bytes)
+            return false;
+        const size_t e = (size_t)expert_id;
+        if (e > SIZE_MAX / arena.gate_stride ||
+            e > SIZE_MAX / arena.up_stride ||
+            e > SIZE_MAX / arena.down_stride)
+            return false;
+        target_slot.gate_proj.host_ptr =
+            arena.base + arena.gate_offset + e * arena.gate_stride;
+        target_slot.gate_proj.meta = *gM;
+        target_slot.gate_proj.meta.offset =
+            arena.gate_offset + e * arena.gate_stride;
+        target_slot.gate_proj.meta.size_bytes = gb;
+        target_slot.up_proj.host_ptr =
+            arena.base + arena.up_offset + e * arena.up_stride;
+        target_slot.up_proj.meta = *uM;
+        target_slot.up_proj.meta.offset =
+            arena.up_offset + e * arena.up_stride;
+        target_slot.up_proj.meta.size_bytes = ub;
+        target_slot.down_proj.host_ptr =
+            arena.base + arena.down_offset + e * arena.down_stride;
+        target_slot.down_proj.meta = *dM;
+        target_slot.down_proj.meta.offset =
+            arena.down_offset + e * arena.down_stride;
+        target_slot.down_proj.meta.size_bytes = db;
+        target_slot.expert_id = expert_id;
+        target_slot.vram_shadow = false;
+        return true;
+    }
+
+    // Populate a projection-compact graph arena directly from the model
+    // shards.  The old graph path first read each expert into an interleaved
+    // [gate|up|down] slab and load_full_weight() then copied every projection
+    // into a compact graph-owned buffer.  This path makes the three disk reads
+    // land in their final arena planes, eliminating that multi-gigabyte
+    // startup duplicate and preserving the same host pointers for the graph.
+    bool load_graph_ram_projection_compact(int layer_idx, int expert_id,
+                                           MoEExpertBlock &target_slot) {
+        if (!graph_ram_layer_projection_compact(layer_idx) ||
+            layer_is_unpacked(layer_idx) || expert_id < 0)
+            return false;
+        const GraphRamLayerArena &arena =
+            graph_ram_arenas[(size_t)layer_idx];
+        const int n_exp = model_file.architecture_config.n_experts;
+        if (n_exp <= 0 || expert_id >= n_exp || arena.n_experts != n_exp)
+            return false;
+
+        size_t gb = 0, ub = 0, db = 0;
+        const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
+        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM) ||
+            !gM || !uM || !dM || gb != arena.gate_bytes ||
+            ub != arena.up_bytes || db != arena.down_bytes ||
+            arena.gate_stride < gb || arena.up_stride < ub ||
+            arena.down_stride < db)
+            return false;
+
+        const size_t e = (size_t)expert_id;
+        if (e > SIZE_MAX / arena.gate_stride ||
+            e > SIZE_MAX / arena.up_stride ||
+            e > SIZE_MAX / arena.down_stride)
+            return false;
+        uint8_t *dst_gate = arena.base + arena.gate_offset +
+                            e * arena.gate_stride;
+        uint8_t *dst_up = arena.base + arena.up_offset + e * arena.up_stride;
+        uint8_t *dst_down = arena.base + arena.down_offset +
+                            e * arena.down_stride;
+
+        auto read_projection = [&](const GGUFTensor &meta, size_t bytes,
+                                   uint8_t *dst, const char *which) {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            const int fd = model_file.fd_for_tensor(meta);
+            const ssize_t got = direct_io::pread_direct_aware(
+                fd, model_file.direct_io_active_for(meta),
+                model_file.direct_io_alignment, dst, bytes,
+                meta.offset + (uint64_t)expert_id * bytes);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::high_resolution_clock::now() - t0)
+                                  .count();
+            if (got < 0 || (size_t)got != bytes)
+                LOG_WARN("[WARN] compact graph expert short read L%d E%d %s: "
+                         "%zd/%zu\n",
+                         layer_idx, expert_id, which, got, bytes);
+            if (ms > SLOW_PREAD_MS)
+                LOG_DEBUG("[SLOW-PREAD] compact graph L%d E%d proj=%s "
+                          "bytes=%.2fMB took=%.2fms\n",
+                          layer_idx, expert_id, which, bytes / 1e6, ms);
+            return got >= 0 && (size_t)got == bytes;
+        };
+
+        PERF_START(disk);
+        const bool ok = read_projection(*gM, gb, dst_gate, "gate") &&
+                        read_projection(*uM, ub, dst_up, "up") &&
+                        read_projection(*dM, db, dst_down, "down");
+        PERF_END(disk, t_disk_read);
+        perf().bytes_disk_read.fetch_add(gb + ub + db,
+                                         std::memory_order_relaxed);
+        if (!ok)
+            return false;
+
+        if (drop_expert_pages) {
+            posix_fadvise(model_file.fd_for_tensor(*gM),
+                          gM->offset + (uint64_t)expert_id * gb, gb,
+                          POSIX_FADV_DONTNEED);
+            posix_fadvise(model_file.fd_for_tensor(*uM),
+                          uM->offset + (uint64_t)expert_id * ub, ub,
+                          POSIX_FADV_DONTNEED);
+            posix_fadvise(model_file.fd_for_tensor(*dM),
+                          dM->offset + (uint64_t)expert_id * db, db,
+                          POSIX_FADV_DONTNEED);
+        }
+
+        return populate_graph_ram_projection_views(layer_idx, expert_id,
+                                                   target_slot);
+    }
+
     void load_expert_slab(int layer_idx, int expert_id, MoEExpertBlock& target_slot) {
+        if (graph_ram_layer_projection_compact(layer_idx)) {
+            // This arena is already the final projection layout. Never fall
+            // through to the legacy packed loader on a failed read: that
+            // would overwrite the gate plane with gate|up|down bytes and
+            // leave the graph with silently corrupted weights.
+            (void)load_graph_ram_projection_compact(layer_idx, expert_id,
+                                                    target_slot);
+            return;
+        }
         std::string base = "blk." + std::to_string(layer_idx) + ".";
         int n_exp = model_file.architecture_config.n_experts;
         // ---- Packed expert format: ffn_{gate,up,down}_exps.weight ----
@@ -2385,7 +2602,9 @@ public:
         return 0;
     }
 
-    bool prepare_graph_ram_arenas(const std::vector<int> &full_layers) {
+    bool prepare_graph_ram_arenas(
+        const std::vector<int> &full_layers,
+        const std::vector<int> &projection_compact_layers = {}) {
         graph_ram_arenas.assign(layers_experts.size(), {});
         graph_ram_cache_enabled = false;
         const int n_experts = model_file.architecture_config.n_experts;
@@ -2395,6 +2614,11 @@ public:
         for (int layer : full_layers) {
             if (layer >= 0 && (size_t)layer < requested.size())
                 requested[(size_t)layer] = 1;
+        }
+        std::vector<unsigned char> compact_requested(layers_experts.size(), 0);
+        for (int layer : projection_compact_layers) {
+            if (layer >= 0 && (size_t)layer < compact_requested.size())
+                compact_requested[(size_t)layer] = 1;
         }
 
         size_t allocated_layers = 0;
@@ -2409,12 +2633,54 @@ public:
                 gb > SIZE_MAX - ub || gb + ub > SIZE_MAX - db)
                 continue;
 
-            const size_t raw = gb + ub + db;
             constexpr size_t alignment = 4096;
-            const size_t stride = (raw + alignment - 1) & ~(alignment - 1);
-            if (stride < raw || stride > SIZE_MAX / (size_t)n_experts)
-                continue;
-            const size_t bytes = stride * (size_t)n_experts;
+            auto align_up = [](size_t value) -> size_t {
+                constexpr size_t align = 4096;
+                if (value > SIZE_MAX - (align - 1)) return 0;
+                return (value + align - 1) & ~(align - 1);
+            };
+            const bool projection_compact = compact_requested[layer] != 0;
+            size_t stride = 0;
+            size_t gate_offset = 0;
+            size_t up_offset = 0;
+            size_t down_offset = 0;
+            size_t gate_stride = 0;
+            size_t up_stride = 0;
+            size_t down_stride = 0;
+            size_t bytes = 0;
+            if (projection_compact) {
+                // Keep each projection plane tightly packed.  The CPU
+                // MUL_MAT_ID path consumes nb[2] as the expert-axis stride;
+                // making that stride exactly the per-expert byte count gives
+                // it the same layout as a normal contiguous [.., expert]
+                // tensor and avoids a second graph-owned projection copy.
+                // O_DIRECT does not require every destination expert slice
+                // to be aligned: direct_io::pread_direct_aware stages an
+                // unaligned destination through its aligned scratch buffer.
+                gate_stride = gb;
+                up_stride = ub;
+                down_stride = db;
+                if (gate_stride == 0 || up_stride == 0 || down_stride == 0 ||
+                    gate_stride > SIZE_MAX / (size_t)n_experts ||
+                    up_stride > SIZE_MAX / (size_t)n_experts ||
+                    down_stride > SIZE_MAX / (size_t)n_experts)
+                    continue;
+                up_offset = gate_stride * (size_t)n_experts;
+                if (up_offset > SIZE_MAX - up_stride * (size_t)n_experts)
+                    continue;
+                down_offset = up_offset + up_stride * (size_t)n_experts;
+                if (down_offset > SIZE_MAX - down_stride * (size_t)n_experts)
+                    continue;
+                bytes = down_offset + down_stride * (size_t)n_experts;
+            } else {
+                if (gb > SIZE_MAX - ub || gb + ub > SIZE_MAX - db)
+                    continue;
+                const size_t raw = gb + ub + db;
+                stride = align_up(raw);
+                if (stride == 0 || stride > SIZE_MAX / (size_t)n_experts)
+                    continue;
+                bytes = stride * (size_t)n_experts;
+            }
             // 10 GiB watermark, per explicit user instruction after the
             // 2026-09-09 crash (was 8 GiB) -- aligned to the same floor as
             // every other host-memory admission check in the full-graph
@@ -2429,8 +2695,21 @@ public:
                 continue;
             }
 
+            // Bee's CPU-mapped GGUF tensors are normally offset by 32 bytes
+            // from their mmap page base.  MoEStream's graph arenas are
+            // allocated separately, so reproduce that host pointer phase by
+            // default; the logical tensor layout is unchanged.  Set
+            // MOESTREAM_QWEN_GRAPH_HOST_OFFSET=0 for the page-aligned A/B.
+            size_t host_offset = 32;
+            if (const char *v = std::getenv("MOESTREAM_QWEN_GRAPH_HOST_OFFSET")) {
+                char *end = nullptr;
+                const long parsed = std::strtol(v, &end, 10);
+                if (end != v && *end == '\0' && parsed >= 0 && parsed <= 4096)
+                    host_offset = static_cast<size_t>(parsed);
+            }
+            const size_t allocation_bytes = bytes + host_offset;
             void *raw_ptr = nullptr;
-            if (posix_memalign(&raw_ptr, alignment, bytes) != 0 || !raw_ptr) {
+            if (posix_memalign(&raw_ptr, alignment, allocation_bytes) != 0 || !raw_ptr) {
                 MemoryGuard::release_host_bytes(bytes);
                 LOG_WARN("[GRAPH-RAM] layer %zu arena allocation failed: %.2f GiB\n",
                          layer, (double)bytes / (1024.0 * 1024.0 * 1024.0));
@@ -2438,26 +2717,64 @@ public:
             }
 
             GraphRamLayerArena &arena = graph_ram_arenas[layer];
-            arena.base = static_cast<uint8_t *>(raw_ptr);
+            arena.allocation_base = raw_ptr;
+            arena.allocation_bytes = allocation_bytes;
+            arena.base = static_cast<uint8_t *>(raw_ptr) + host_offset;
             arena.bytes = bytes;
             arena.stride = stride;
             arena.gate_bytes = gb;
             arena.up_bytes = ub;
             arena.down_bytes = db;
+            arena.gate_offset = gate_offset;
+            arena.up_offset = up_offset;
+            arena.down_offset = down_offset;
+            arena.gate_stride = projection_compact ? gate_stride : stride;
+            arena.up_stride = projection_compact ? up_stride : stride;
+            arena.down_stride = projection_compact ? down_stride : stride;
             arena.n_experts = n_experts;
+            arena.projection_compact = projection_compact;
             arena.host_reservation_bytes = bytes;
 
-            // Registration is optional and budgeted independently from the
-            // host allocation. A failed registration leaves a valid pageable
-            // arena; the graph remains correct, only the H2D copy cannot DMA
-            // directly from this layer.
-            if (ram_pinned_budget_bytes > 0) {
+            // Bee's fast CPU path uses mmap+mlock for its host expert source.
+            // Keep MoEStream's explicit preloaded DDR arena as the default,
+            // but expose the same page-residency property as a controlled A/B.
+            // This is deliberately opt-in: locking the complete graph-RAM
+            // set consumes the process's memlock allowance and should not be
+            // enabled without an explicit host-memory budget.
+            const char *graph_mlock =
+                std::getenv("MOESTREAM_QWEN_GRAPH_MLOCK");
+            if (graph_mlock && std::atoi(graph_mlock) != 0) {
+                if (mlock(arena.allocation_base, arena.allocation_bytes) == 0) {
+                    arena.mlocked = true;
+                } else if (layer == 0) {
+                    LOG_WARN("[GRAPH-RAM] mlock declined: %s\n",
+                             std::strerror(errno));
+                }
+            }
+
+            // Do not register the graph-RAM expert arena by default.  These
+            // are large CPU-resident expert weights, not activation staging
+            // buffers; pinning the complete arena consumes the host pin
+            // budget without helping the CPU MUL_MAT_ID path.  The scheduler
+            // separately uses CUDA_Host for its small CPU-only activation,
+            // route-ID, and output buffers.  Keep a deliberate opt-in for a
+            // future A/B that wants to measure pinned expert weights, and
+            // retain the old NO_REGISTER switch as a compatibility override.
+            const char * graph_register =
+                std::getenv("MOESTREAM_QWEN_GRAPH_REGISTER");
+            const char * graph_no_register =
+                std::getenv("MOESTREAM_QWEN_GRAPH_NO_REGISTER");
+            const bool graph_register_enabled =
+                graph_register && std::atoi(graph_register) != 0 &&
+                !(graph_no_register && std::atoi(graph_no_register) != 0);
+            if (ram_pinned_budget_bytes > 0 && graph_register_enabled) {
                 const size_t previous =
                     ram_pinned_bytes_used.fetch_add(bytes, std::memory_order_relaxed);
                 if (previous <= ram_pinned_budget_bytes &&
                     bytes <= ram_pinned_budget_bytes - previous) {
                     const cudaError_t err = cudaHostRegister(
-                        arena.base, arena.bytes, cudaHostRegisterPortable);
+                        arena.allocation_base, arena.allocation_bytes,
+                        cudaHostRegisterPortable);
                     if (err == cudaSuccess) {
                         arena.pinned = true;
                     } else {
@@ -2470,6 +2787,12 @@ public:
                                                     std::memory_order_relaxed);
                 }
             }
+            if (!graph_register_enabled && layer == 0) {
+                LOG_STREAM_INFO()
+                    << "[GRAPH-RAM] expert-arena cudaHostRegister disabled by "
+                       "default; set MOESTREAM_QWEN_GRAPH_REGISTER=1 for an "
+                       "explicit A/B\n";
+            }
 
             for (int expert = 0; expert < n_experts; ++expert) {
                 MoEExpertBlock &slot = layers_experts[layer][(size_t)expert];
@@ -2481,26 +2804,51 @@ public:
                     LOG_WARN("[GRAPH-RAM] layer %zu has an existing RAM slab; "
                              "shared view disabled for this layer\n", layer);
                     if (arena.pinned) {
-                        cudaHostUnregister(arena.base);
+                        cudaHostUnregister(arena.allocation_base);
                         ram_pinned_bytes_used.fetch_sub(
                             arena.bytes, std::memory_order_relaxed);
                     }
-                    free(arena.base);
+                    if (arena.mlocked) {
+                        munlock(arena.allocation_base, arena.allocation_bytes);
+                    }
+                    free(arena.allocation_base);
                     MemoryGuard::release_host_bytes(arena.host_reservation_bytes);
                     arena = {};
                     goto next_graph_ram_layer;
                 }
-                slot.slab_buffer = arena.base + (size_t)expert * arena.stride;
-                slot.slab_capacity = arena.stride;
+                // A compact arena has no single packed per-expert slab. Keep
+                // the shared allocation as the stable ownership token; the
+                // three projection host_ptr fields are set by the direct
+                // graph-arena loader below.
+                if (projection_compact) {
+                    slot.slab_buffer = arena.base;
+                    slot.slab_capacity = arena.bytes;
+                } else {
+                    slot.slab_buffer = arena.base + (size_t)expert * arena.stride;
+                    slot.slab_capacity = arena.stride;
+                }
                 slot.host_reservation_bytes = 0;
                 slot.slab_pinned = arena.pinned;
                 slot.slab_from_shared_arena = true;
             }
             ++allocated_layers;
-            LOG_STREAM_INFO() << "[GRAPH-RAM] layer " << layer << " arena: "
-                              << (double)bytes / (1024.0 * 1024.0 * 1024.0)
-                              << " GiB, stride=" << stride << " bytes, "
-                              << (arena.pinned ? "pinned" : "pageable") << "\n";
+            if (projection_compact) {
+                LOG_STREAM_INFO()
+                    << "[GRAPH-RAM] layer " << layer << " arena: "
+                    << (double)bytes / (1024.0 * 1024.0 * 1024.0)
+                    << " GiB, projection-compact, gate_stride=" << gate_stride
+                                  << ", up_stride=" << up_stride
+                                  << ", down_stride=" << down_stride << " bytes, "
+                                  << (arena.pinned ? "pinned" : "pageable")
+                                  << "\n";
+            } else {
+                LOG_STREAM_INFO()
+                    << "[GRAPH-RAM] layer " << layer << " arena: "
+                    << (double)bytes / (1024.0 * 1024.0 * 1024.0)
+                    << " GiB, interleaved, stride=" << stride << " bytes, "
+                                  << (arena.pinned ? "pinned" : "pageable")
+                                  << "\n";
+            }
         next_graph_ram_layer:
             continue;
         }
@@ -2527,15 +2875,42 @@ public:
             return false;
         for (int expert = 0; expert < arena.n_experts; ++expert) {
             const MoEExpertBlock &slot = layers_experts[(size_t)layer][(size_t)expert];
+            const bool slab_identity = arena.projection_compact
+                                           ? slot.slab_buffer == arena.base
+                                           : slot.slab_buffer ==
+                                                 arena.base +
+                                                     (size_t)expert * arena.stride;
+            const bool slab_capacity = arena.projection_compact
+                                           ? slot.slab_capacity >= arena.bytes
+                                           : slot.slab_capacity >=
+                                                 arena.gate_bytes +
+                                                     arena.up_bytes +
+                                                     arena.down_bytes;
+            const bool projection_identity =
+                arena.projection_compact
+                    ? slot.gate_proj.host_ptr ==
+                              arena.base + arena.gate_offset +
+                                  (size_t)expert * arena.gate_stride &&
+                          slot.up_proj.host_ptr ==
+                              arena.base + arena.up_offset +
+                                  (size_t)expert * arena.up_stride &&
+                          slot.down_proj.host_ptr ==
+                              arena.base + arena.down_offset +
+                                  (size_t)expert * arena.down_stride
+                    : true;
             if (!slot.slab_from_shared_arena || slot.expert_id != expert ||
-                slot.slab_buffer != arena.base + (size_t)expert * arena.stride ||
-                slot.slab_capacity < arena.gate_bytes + arena.up_bytes + arena.down_bytes ||
+                !slab_identity || !slab_capacity || !projection_identity ||
                 slot.ram_loading || !slot.gate_proj.host_ptr ||
                 !slot.up_proj.host_ptr || !slot.down_proj.host_ptr)
                 return false;
         }
         arena.ready = true;
         return true;
+    }
+
+    bool graph_ram_layer_projection_compact(int layer) const {
+        return graph_ram_layer_allocated(layer) &&
+               graph_ram_arenas[(size_t)layer].projection_compact;
     }
 
     const GraphRamLayerArena *graph_ram_arena(int layer) const {

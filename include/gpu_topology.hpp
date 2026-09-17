@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -868,7 +869,28 @@ public:
             // expert_ffn_gpu_finish) already correctly measure their own
             // wall-clock duration either way, so no existing timer numbers
             // become invalid -- only the CPU-side cost of THAT wait changes.
-            cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync);
+            // BeeLlama does not override the RTX 3090's CUDA scheduling mode,
+            // so its equivalent is cudaDeviceScheduleAuto (the CUDA default).
+            // Keep MoEStream's historical BlockingSync default, but expose a
+            // setup-only A/B switch.  This intentionally does not change the
+            // graph, scheduler API, copy API, or stream synchronization calls.
+            const char * schedule_env = std::getenv("MOESTREAM_CUDA_SCHEDULE");
+            unsigned schedule_flags = cudaDeviceScheduleBlockingSync;
+            const char * schedule_name = "blocking";
+            if (schedule_env && std::strcmp(schedule_env, "auto") == 0) {
+                schedule_flags = cudaDeviceScheduleAuto;
+                schedule_name = "auto";
+            } else if (schedule_env && std::strcmp(schedule_env, "spin") == 0) {
+                schedule_flags = cudaDeviceScheduleSpin;
+                schedule_name = "spin";
+            }
+            const cudaError_t schedule_err = cudaSetDeviceFlags(schedule_flags);
+            if (schedule_err != cudaSuccess) {
+                LOG_WARN("[CUDA-SCHEDULE] device=%d mode=%s set failed: %s\n",
+                         dev.id, schedule_name, cudaGetErrorString(schedule_err));
+            } else {
+                LOG_INFO("[CUDA-SCHEDULE] device=%d mode=%s\n", dev.id, schedule_name);
+            }
             cudaStreamCreate(&dev.compute_stream);
             cudaStreamCreate(&dev.copy_stream);
             cudaStreamCreate(&dev.active_layer_stream);

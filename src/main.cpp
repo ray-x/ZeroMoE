@@ -193,6 +193,7 @@ static bool preload_batch_load(
   // its own comment); load_expert_slab's packed-format branch calls
   // populate_packed_slab as its own last step, which this mirrors.
   struct ItemGeom {
+    int layer;
     size_t gb, ub, db;
     const GGUFTensor *gM, *uM, *dM;
     int expert_id;
@@ -252,7 +253,7 @@ static bool preload_batch_load(
     } else if (!engine.packed_slab_geometry(layer, gb, ub, db, gM, uM, dM)) {
       return false;
     }
-    geoms.push_back({gb, ub, db, gM, uM, dM, expert_id, slot});
+    geoms.push_back({layer, gb, ub, db, gM, uM, dM, expert_id, slot});
   }
 
   std::vector<ssize_t> results(reqs.size());
@@ -283,8 +284,14 @@ static bool preload_batch_load(
   }
   perf().bytes_disk_read.fetch_add(total_bytes, std::memory_order_relaxed);
   for (auto &g : geoms) {
-    engine.populate_packed_slab(*g.slot, g.expert_id, g.gb, g.ub, g.db, *g.gM,
-                                *g.uM, *g.dM);
+    if (engine.graph_ram_layer_projection_compact(g.layer)) {
+      if (!engine.populate_graph_ram_projection_views(g.layer, g.expert_id,
+                                                      *g.slot))
+        return false;
+    } else {
+      engine.populate_packed_slab(*g.slot, g.expert_id, g.gb, g.ub, g.db,
+                                  *g.gM, *g.uM, *g.dM);
+    }
   }
   return true;
 }
@@ -1805,6 +1812,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // source-backed fallback and retain normal lazy cache behavior.
   if (ram_graph_cache) {
     std::vector<int> graph_ram_full_layers;
+    std::vector<int> graph_ram_projection_compact_layers;
     const int n_experts = engine.model_file.architecture_config.n_experts;
     for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
       const bool qwen_cpu_layer =
@@ -1826,8 +1834,22 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           ram_mgr.cap_for_layer(layer) < n_experts)
         continue;
       graph_ram_full_layers.push_back(layer);
+      // Qwen's full graph can consume separate compact gate/up/down views on
+      // CPU. GPU layers keep their fused gate/up graph by gathering the two
+      // planes directly into the final VRAM tensor, so the arena itself can
+      // use the same no-duplicate layout for every Qwen graph layer. Keep an
+      // explicit opt-out for A/B comparisons; it changes only the DDR arena
+      // layout, not layer placement or graph topology.
+      const char *compact_env = std::getenv(
+          "MOESTREAM_QWEN4EXP_GRAPH_PROJECTION_COMPACT");
+      const bool projection_compact_enabled =
+          !(compact_env && compact_env[0] == '0');
+      if (engine.family_ops.family == ModelFamily::Qwen4Exp &&
+          projection_compact_enabled)
+        graph_ram_projection_compact_layers.push_back(layer);
     }
-    if (!engine.prepare_graph_ram_arenas(graph_ram_full_layers)) {
+    if (!engine.prepare_graph_ram_arenas(
+            graph_ram_full_layers, graph_ram_projection_compact_layers)) {
       LOG_STREAM_WARN()
           << "[GRAPH-RAM] no complete layer arena was admitted; "
              "full graph will use its bounded source-backed path\n";
