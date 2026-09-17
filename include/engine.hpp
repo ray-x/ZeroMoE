@@ -2816,13 +2816,18 @@ public:
                     arena = {};
                     goto next_graph_ram_layer;
                 }
-                // A compact arena has no single packed per-expert slab. Keep
-                // the shared allocation as the stable ownership token; the
-                // three projection host_ptr fields are set by the direct
-                // graph-arena loader below.
+                // A compact arena has no single packed per-expert slab.
+                // `slab_buffer` is consumed by the generic RAM->VRAM
+                // promotion paths as a contiguous [gate|up|down] source.
+                // Advertising arena.base here would make those paths upload
+                // the beginning of the gate plane as if it were this
+                // expert's packed record, corrupting graph-visible VRAM
+                // weights.  Leave the packed-slab handle empty; the three
+                // projection host_ptr fields below are the only valid source
+                // representation for a compact graph slot.
                 if (projection_compact) {
-                    slot.slab_buffer = arena.base;
-                    slot.slab_capacity = arena.bytes;
+                    slot.slab_buffer = nullptr;
+                    slot.slab_capacity = 0;
                 } else {
                     slot.slab_buffer = arena.base + (size_t)expert * arena.stride;
                     slot.slab_capacity = arena.stride;
@@ -2876,12 +2881,12 @@ public:
         for (int expert = 0; expert < arena.n_experts; ++expert) {
             const MoEExpertBlock &slot = layers_experts[(size_t)layer][(size_t)expert];
             const bool slab_identity = arena.projection_compact
-                                           ? slot.slab_buffer == arena.base
+                                           ? slot.slab_buffer == nullptr
                                            : slot.slab_buffer ==
                                                  arena.base +
                                                      (size_t)expert * arena.stride;
             const bool slab_capacity = arena.projection_compact
-                                           ? slot.slab_capacity >= arena.bytes
+                                           ? slot.slab_capacity == 0
                                            : slot.slab_capacity >=
                                                  arena.gate_bytes +
                                                      arena.up_bytes +
