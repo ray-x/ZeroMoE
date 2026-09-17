@@ -2184,6 +2184,29 @@ ggml_tensor *build_shared(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   return out;
 }
 
+// ggml-cuda's gated_delta_net kernel reads AND writes its per-head recurrent
+// state in one fixed physical layout: M[col][i] = S[i][col] (col=v slower,
+// i=k faster; see ggml-cuda/gated_delta_net.cu's own comment). This is the
+// only layout the op ever accepts as input, so any device-resident state
+// that round-trips straight back into the op (the full-graph decode
+// self-loop) must stay in this "native" layout untouched.
+//
+// This codebase's own legacy CPU step (qwen4exp_gdn_delta_step) uses the
+// opposite convention, st[k*hd+v] (k slower, v faster) -- i.e. exactly the
+// per-head TRANSPOSE of the native layout. Converting between the two is a
+// per-head square-matrix transpose, which is its own inverse, so the same
+// helper handles both directions: legacy-in-for-native-consumption and
+// native-out-for-legacy-consumption.
+void gdn_state_transpose_host(float *dst, const float *src, int hd, int Hv) {
+  for (int h = 0; h < Hv; ++h) {
+    const float *s = src + static_cast<size_t>(h) * hd * hd;
+    float *d = dst + static_cast<size_t>(h) * hd * hd;
+    for (int a = 0; a < hd; ++a)
+      for (int b = 0; b < hd; ++b)
+        d[a * hd + b] = s[b * hd + a];
+  }
+}
+
 ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *w_qkv, ggml_tensor *w_gate,
                        ggml_tensor *w_alpha, ggml_tensor *w_beta,
@@ -2225,24 +2248,21 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   const size_t state_row = ggml_row_size(GGML_TYPE_F32, g.gdn_hd * g.gdn_hd);
   ggml_tensor *core = ggml_view_4d(ctx, gdn, g.gdn_hd, g.Hv_gdn, g.S, 1, hd_row,
                                    value_row, value_row * g.S, 0);
-  // ggml-cuda's gated_delta_net kernel stores the per-head state TRANSPOSED
-  // relative to the [k][v] math convention this codebase's own legacy CPU
-  // qwen4exp_gdn_delta_step uses -- confirmed directly in
-  // ggml/src/ggml-cuda/gated_delta_net.cu's own comment ("state is stored
-  // transposed: M[col][i] = S[i][col]", where col indexes v and i indexes
-  // k), i.e. the raw view below has ne[0]=k (contiguous), ne[1]=v. Legacy's
-  // own flat layout (qwen4exp_recur_state[l], engine.hpp) is st[k*hd+v] --
-  // v contiguous, k slower -- the opposite axis order. Left unfixed, the
-  // flat ggml_backend_tensor_get+memcpy in qwen4exp_full_graph_run silently
-  // hands decode a transposed state matrix: same byte count, same total
-  // size (gdn_hd==gdn_hd), no crash, just wrong values from the very first
-  // decode token onward. Transpose+materialize here so the exported
-  // tensor's own byte layout already matches what the flat copy-out assumes.
+  // *state_out is kept in the op's own NATIVE layout (ne[0]=k, ne[1]=v; see
+  // the gdn_state_transpose_host comment above) because the full-graph
+  // decode self-loop feeds this same tensor straight back into
+  // ggml_gated_delta_net as next-token's state_in with no host round trip.
+  // Any host-facing consumer (legacy CPU decode, cross-request state
+  // persistence) must convert with gdn_state_transpose_host at the host
+  // boundary instead of receiving a transposed tensor from here -- a
+  // transpose baked in here only benefits the host path and silently
+  // breaks the device-resident self-loop instead (this was the actual bug:
+  // wrong values from the second decode token onward).
   ggml_tensor *state_raw =
       ggml_view_4d(ctx, gdn, g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1, hd_row, state_row,
                    state_row * g.Hv_gdn,
                    static_cast<size_t>(g.value_dim) * g.S * sizeof(float));
-  *state_out = ggml_cont(ctx, ggml_transpose(ctx, state_raw));
+  *state_out = ggml_cont(ctx, state_raw);
   ggml_tensor *norm = ggml_mul(
       ctx,
       ggml_rms_norm(ctx, core, g.engine->model_file.architecture_config.eps),
@@ -2732,9 +2752,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         if (l < static_cast<int>(g.engine->qwen4exp_recur_state.size()) &&
             g.engine->qwen4exp_recur_state[l].size() ==
                 static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn)
-          std::memcpy(si->data, g.engine->qwen4exp_recur_state[l].data(),
-                      static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn *
-                          sizeof(float));
+          // qwen4exp_recur_state is host-legacy layout; si->data feeds the
+          // ggml op directly and needs native layout. See
+          // gdn_state_transpose_host.
+          gdn_state_transpose_host(static_cast<float *>(si->data),
+                                   g.engine->qwen4exp_recur_state[l].data(),
+                                   g.gdn_hd, g.Hv_gdn);
       }
       ggml_tensor *so = nullptr, *ho = nullptr;
       attn_out = build_gdn(g, g.ctx, attn_in, l, qkv, zg, al, be, dt, aa, cv,
@@ -3133,9 +3156,14 @@ bool sync_decode_state_to_host(FullGraph &g) {
         engine.qwen4exp_recur_state[l].size() != state_n ||
         engine.qwen4exp_conv_history[l].size() != hist_n)
       return false;
-    ggml_backend_tensor_get(g.gdn_state_storage[i],
-                            engine.qwen4exp_recur_state[l].data(), 0,
+    // gdn_state_storage is native layout (it feeds the decode self-loop
+    // directly); qwen4exp_recur_state is host-legacy layout for legacy CPU
+    // consumption. See gdn_state_transpose_host.
+    std::vector<float> native_state(state_n);
+    ggml_backend_tensor_get(g.gdn_state_storage[i], native_state.data(), 0,
                             state_n * sizeof(float));
+    gdn_state_transpose_host(engine.qwen4exp_recur_state[l].data(),
+                             native_state.data(), g.gdn_hd, g.Hv_gdn);
     ggml_backend_tensor_get(g.gdn_hist_storage[i],
                             engine.qwen4exp_conv_history[l].data(), 0,
                             hist_n * sizeof(float));
@@ -3569,8 +3597,14 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         engine.qwen4exp_recur_state[l].size() != state_n ||
         engine.qwen4exp_conv_history[l].size() != hist_n)
       return false;
-    ggml_backend_tensor_set(g->gdn_state_storage[i],
-                            engine.qwen4exp_recur_state[l].data(), 0,
+    // qwen4exp_recur_state is host-legacy layout; gdn_state_storage feeds the
+    // decode self-loop's ggml op directly and needs native layout. See
+    // gdn_state_transpose_host.
+    std::vector<float> native_state(state_n);
+    gdn_state_transpose_host(native_state.data(),
+                             engine.qwen4exp_recur_state[l].data(), g->gdn_hd,
+                             g->Hv_gdn);
+    ggml_backend_tensor_set(g->gdn_state_storage[i], native_state.data(), 0,
                             state_n * sizeof(float));
     ggml_backend_tensor_set(g->gdn_hist_storage[i],
                             engine.qwen4exp_conv_history[l].data(), 0,
@@ -3827,9 +3861,14 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     const int l = g.gdn_layers[i];
     const size_t state_n = static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
     const size_t hist_n = static_cast<size_t>(g.d_conv - 1) * g.conv_dim;
-    ggml_backend_tensor_get(g.gdn_state_out[i],
-                            engine.qwen4exp_recur_state[l].data(), 0,
+    // gdn_state_out (build_gdn's *state_out) is native layout;
+    // qwen4exp_recur_state is host-legacy layout for legacy CPU consumption.
+    // See gdn_state_transpose_host.
+    std::vector<float> native_state(state_n);
+    ggml_backend_tensor_get(g.gdn_state_out[i], native_state.data(), 0,
                             state_n * sizeof(float));
+    gdn_state_transpose_host(engine.qwen4exp_recur_state[l].data(),
+                             native_state.data(), g.gdn_hd, g.Hv_gdn);
     ggml_backend_tensor_get(g.gdn_hist_out[i],
                             engine.qwen4exp_conv_history[l].data(), 0,
                             hist_n * sizeof(float));
