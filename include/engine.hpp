@@ -458,6 +458,21 @@ public:
     // EngineConfig (it only receives StreamingEngine&).
     std::string qwen4exp_graph_pin_file;
 
+    // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not
+    // per-token -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
+    // follow-on note for why per-token was ruled out: ggml has no in-graph
+    // conditional execution, so a genuine per-token GPU-or-CPU choice needs
+    // splitting the decode graph at this layer's boundary, which Phase 1
+    // deliberately defers). Engine-owned (not FullGraph-owned) because
+    // decode_prepare tears down and rebuilds a FRESH FullGraph object after
+    // prefill -- this decision must survive that swap.
+    int qwen4exp_partial_layer = -1;          // -1 = feature off
+    int qwen4exp_partial_layer_top_n = 256;
+    float qwen4exp_partial_layer_min_coverage = 1.0f;
+    std::vector<int> qwen4exp_partial_layer_gpu_ids; // top-N experts, ranked by usage
+    bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
+    bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
+
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 
     // the "learned hot set" signal that drives VRAM preloading on the

@@ -171,6 +171,59 @@ struct FullGraph {
   // already claim. Empty/absent entry = no split for that layer (today's
   // behavior, unchanged). v1 scope: decode only (S==1) -- see build_moe.
   std::unordered_map<int, std::vector<int>> split_gpu_expert_ids;
+  // Phase 1 partial-layer dispatch: prefill-only, non-null exactly when
+  // this graph is building engine->qwen4exp_partial_layer's MoE block
+  // during a non-decode (S>1) build. Marked as a graph output so
+  // qwen4exp_full_graph_run can read back this prompt's real routing for
+  // that layer and decide, once, whether decode may commit to the
+  // GPU-only path. Shape [topk, S] I32, same layout ggml_argsort_top_k
+  // itself produces.
+  ggml_tensor *partial_layer_ids_out = nullptr;
+  // Diagnostic sibling of partial_layer_ids_out: the partial layer's raw
+  // post-softmax router distribution ([n_experts, S]), for checking
+  // whether routing is genuinely peaked or effectively near-uniform noise.
+  ggml_tensor *partial_layer_probs_out = nullptr;
+  // Root-cause diagnostic (2026-09-18): the raw exp_probs_b.bias tensor
+  // for the partial layer, exposed as a graph output so
+  // qwen4exp_full_graph_run can dump its actual values -- see
+  // [[qwen4exp-legacy-vs-fullgraph-routing-divergence]].
+  ggml_tensor *partial_layer_bias_out = nullptr;
+
+  // Phase 2: true per-token GPU/CPU dispatch for the partial layer,
+  // validated via a standalone spike test (splitting a computation across
+  // two separately-submitted ggml graphs with a persistent device-tensor
+  // handoff -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
+  // follow-on note). Off (Full) is byte-identical to today's single-graph
+  // decode for every other config; Prefix/SuffixGpu/SuffixCpu are three
+  // DISTINCT FullGraph instances (own ctx/graph/sched) built once at
+  // decode-prepare time, chosen per token by a cheap host-side readback of
+  // the prefix's own layer routing.
+  enum class Phase2Mode { Off, Prefix, SuffixGpu, SuffixCpu };
+  Phase2Mode phase2_mode = Phase2Mode::Off;
+  int phase2_split_layer = -1;
+  // Prefix-only: the persistent handoff buffer this instance writes `res`
+  // (the residual right after the split layer's attention) into. Suffix
+  // instances read the prefix instance's own phase2_handoff_buf/addr
+  // directly (the prefix instance IS g_graph, phase2_mode==Prefix -- see
+  // the g_graph global's own comment) and bind a fresh leaf tensor to the
+  // SAME address in their own ctx -- never touch this pair themselves.
+  ggml_backend_buffer_t phase2_handoff_buf = nullptr;
+  void *phase2_handoff_addr = nullptr;
+  // SuffixGpu and SuffixCpu build the SAME layer range [split_layer+1,
+  // n_layers) and therefore issue new_device_state_tensor() calls in an
+  // IDENTICAL sequence (GDN/dense-attn/PLE classification per layer is a
+  // static model property, not decode-time data) -- but only ONE of them
+  // runs per token, so their GDN/KV/PLE state for those shared layers
+  // must be the SAME physical buffer, or it would silently diverge the
+  // moment dispatch alternates between them. The instance built FIRST
+  // (SuffixGpu) allocates for real and records each address in
+  // phase2_state_addrs, in call order; the instance built SECOND
+  // (SuffixCpu, via phase2_state_source_graph pointing at the first) replays
+  // that list instead of allocating its own arena slots, binding a fresh
+  // leaf in ITS OWN ctx to each recorded address in turn.
+  FullGraph *phase2_state_source_graph = nullptr;
+  std::vector<void *> phase2_state_addrs;
+  size_t phase2_state_replay_cursor = 0;
   ggml_context *ctx = nullptr;
   ggml_cgraph *graph = nullptr;
 
@@ -274,6 +327,22 @@ struct FullGraph {
     device_expert_layers = 0;
     device_expert_partial_gate_up = false;
     split_gpu_expert_ids.clear();
+    partial_layer_ids_out = nullptr;
+    partial_layer_probs_out = nullptr;
+    // Only the Prefix instance owns phase2_handoff_buf (a standalone
+    // buffer, independent of ctx/sched -- see the field's own comment).
+    // Suffix instances only ever bind a leaf to it, never allocate or
+    // free it themselves.
+    if (phase2_mode == Phase2Mode::Prefix && phase2_handoff_buf) {
+      ggml_backend_buffer_free(phase2_handoff_buf);
+    }
+    phase2_handoff_buf = nullptr;
+    phase2_handoff_addr = nullptr;
+    phase2_mode = Phase2Mode::Off;
+    phase2_split_layer = -1;
+    phase2_state_source_graph = nullptr;
+    phase2_state_addrs.clear();
+    phase2_state_replay_cursor = 0;
     for (ggml_backend_buffer_t b : host_buffers) {
       if (b)
         ggml_backend_buffer_free(b);
@@ -341,6 +410,22 @@ struct FullGraph {
 
 std::unique_ptr<FullGraph> g_graph;
 
+// Phase 2 per-token dynamic dispatch: three separately-built/submitted
+// FullGraph instances, own ctx/graph/sched each (see FullGraph::Phase2Mode's
+// comment). Only ever populated when qwen4exp_full_graph_decode_prepare
+// commits to Phase 2 for this session (real per-token routing at
+// phase2_split_layer decided the static Phase 1 coverage gate was not met,
+// but the layer is still worth a dynamic per-token GPU/CPU choice). Globals,
+// not FullGraph fields, because a suffix instance's build_graph() must reach
+// the SIBLING prefix instance's handoff buffer/address while its own `g` is
+// a completely different object.
+// The Prefix instance is just g_graph itself with phase2_mode==Prefix (its
+// construction is otherwise identical to the ordinary single-graph decode
+// path -- see qwen4exp_full_graph_decode_prepare's build_one lambda) --
+// no separate global needed for it.
+std::unique_ptr<FullGraph> g_graph_p2_suffix_gpu;
+std::unique_ptr<FullGraph> g_graph_p2_suffix_cpu;
+
 bool env_enabled() {
   static const bool enabled = [] {
     const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH");
@@ -381,6 +466,60 @@ bool env_layer_timing_enabled() {
 // changing placement or routing.
 bool env_merged_gate_up_enabled() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MERGED_GATE_UP");
+  return v && v[0] == '1';
+}
+
+// Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
+// engine.hpp's qwen4exp_partial_layer field group for the full contract).
+int env_partial_layer() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER");
+  if (!v || !v[0])
+    return -1;
+  char *end = nullptr;
+  const long n = std::strtol(v, &end, 10);
+  if (end == v || *end != '\0' || n < 0)
+    return -1;
+  return static_cast<int>(n);
+}
+
+int env_partial_layer_top_n() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_TOP_N");
+  if (!v || !v[0])
+    return 256;
+  char *end = nullptr;
+  const long n = std::strtol(v, &end, 10);
+  if (end == v || *end != '\0' || n <= 0)
+    return 256;
+  return static_cast<int>(n);
+}
+
+// Required prefill-routing coverage (fraction of this prompt's actual
+// distinct layer-13-style routing already inside the top-N pinned set)
+// before decode commits to the GPU-only path for the session. Default 1.0
+// (100%) is deliberately strict: Phase 1 has no per-token fallback once
+// committed, so an out-of-set expert mid-session is silently dropped by
+// GGML_MUL_MAT_ID's negative-id contract rather than mis-routed -- see
+// build_moe_partial_gpu's own comment. Lower this only to experiment; it
+// trades a small, measured accuracy risk for a higher commit rate.
+float env_partial_layer_min_coverage() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE");
+  if (!v || !v[0])
+    return 1.0f;
+  char *end = nullptr;
+  const double n = std::strtod(v, &end);
+  if (end == v || n < 0.0 || n > 1.0)
+    return 1.0f;
+  return static_cast<float>(n);
+}
+
+// Phase 2: true per-token dynamic GPU/CPU dispatch for the partial layer
+// (see FullGraph::Phase2Mode's own comment for the 3-graph-instance
+// mechanism). Off by default -- Phase 1's static session-level commit
+// (env_partial_layer_min_coverage) remains the default behavior even when
+// qwen4exp_partial_layer is configured; this flag opts into the dynamic
+// per-token variant instead for a direct A/B against Phase 1.
+bool env_partial_layer_phase2_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
   return v && v[0] == '1';
 }
 
@@ -834,10 +973,26 @@ bool init_device_state_arena(FullGraph &g) {
 ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
                                      const std::vector<int64_t> &shape,
                                      const char *name) {
-  if (!g.device_state_buffer)
-    return nullptr;
   ggml_tensor *t = new_tensor(g.ctx, type, shape);
   if (!t)
+    return nullptr;
+  // Phase 2 SuffixCpu (or any future sibling): bind to the SAME physical
+  // state a sibling instance already allocated for this exact call
+  // position, instead of allocating a fresh, independent buffer -- see
+  // FullGraph::phase2_state_source_graph's own comment.
+  if (g.phase2_state_source_graph) {
+    FullGraph &src = *g.phase2_state_source_graph;
+    if (!src.device_state_buffer ||
+        g.phase2_state_replay_cursor >= src.phase2_state_addrs.size())
+      return nullptr;
+    void *addr = src.phase2_state_addrs[g.phase2_state_replay_cursor++];
+    if (ggml_backend_tensor_alloc(src.device_state_buffer, t, addr) !=
+        GGML_STATUS_SUCCESS)
+      return nullptr;
+    ggml_set_name(t, name);
+    return t;
+  }
+  if (!g.device_state_buffer)
     return nullptr;
   const ggml_backend_buffer_type_t buft =
       ggml_backend_buffer_get_type(g.device_state_buffer);
@@ -854,6 +1009,10 @@ ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
       GGML_STATUS_SUCCESS)
     return nullptr;
   g.device_state_used = aligned + alloc_size;
+  // Record for a potential Phase 2 sibling built right after this one
+  // (harmless no-op cost otherwise -- one pointer per call, freed with
+  // the rest of this instance).
+  g.phase2_state_addrs.push_back(addr);
   ggml_set_name(t, name);
   return t;
 }
@@ -1003,6 +1162,52 @@ void plan_expert_vram_split(FullGraph &g) {
            "layer(s), %zu expert(s) total\n",
            budget_gb, bytes_spent / (1024.0 * 1024.0 * 1024.0),
            g.split_gpu_expert_ids.size(), experts_placed);
+}
+
+// Phase 1 partial-layer planner: ranks ONE specific layer's experts by real
+// usage (same pin_file the startup [PIN] preload block and
+// plan_expert_vram_split already read) and keeps the top N. Idempotent --
+// only does real work once per process (engine.qwen4exp_partial_layer_planned
+// guards it), since a layer's usage ranking doesn't change mid-process and
+// this must survive the prefill->decode FullGraph object swap (see
+// engine.hpp's own comment on why this state is engine-owned).
+void plan_partial_layer(StreamingEngine &engine) {
+  engine.qwen4exp_partial_layer = env_partial_layer();
+  if (engine.qwen4exp_partial_layer < 0)
+    return;
+  engine.qwen4exp_partial_layer_top_n = env_partial_layer_top_n();
+  engine.qwen4exp_partial_layer_min_coverage = env_partial_layer_min_coverage();
+  if (engine.qwen4exp_partial_layer_planned)
+    return;
+
+  const std::string path = engine.qwen4exp_graph_pin_file.empty()
+                               ? std::string(".moestream_usage")
+                               : engine.qwen4exp_graph_pin_file;
+  auto [entries, maxc] = StreamingEngine::load_usage(path);
+  (void)maxc;
+
+  std::vector<StreamingEngine::UsageEntry> layer_entries;
+  for (const auto &e : entries)
+    if (e.layer == engine.qwen4exp_partial_layer)
+      layer_entries.push_back(e);
+  std::stable_sort(layer_entries.begin(), layer_entries.end(),
+                   [](const auto &a, const auto &b) {
+                     return a.count > b.count;
+                   });
+
+  engine.qwen4exp_partial_layer_gpu_ids.clear();
+  for (size_t i = 0; i < layer_entries.size() &&
+                     static_cast<int>(i) < engine.qwen4exp_partial_layer_top_n;
+       ++i)
+    engine.qwen4exp_partial_layer_gpu_ids.push_back(layer_entries[i].expert);
+  engine.qwen4exp_partial_layer_planned = true;
+
+  LOG_INFO("[PARTIAL-LAYER] layer=%d top_n=%d ranked from %s: %zu known "
+           "expert(s) for this layer, using top %zu for the GPU-resident "
+           "compact set\n",
+           engine.qwen4exp_partial_layer, engine.qwen4exp_partial_layer_top_n,
+           path.c_str(), layer_entries.size(),
+           engine.qwen4exp_partial_layer_gpu_ids.size());
 }
 
 const GGUFTensor *model_tensor(const StreamingEngine &engine,
@@ -1163,12 +1368,46 @@ size_t device_expert_bytes(const FullGraph &g) {
       return 0;
     total += layer_bytes;
   }
+  // Phase 1/2 partial-layer compact GPU tensor (build_moe_partial_gpu):
+  // qwen4exp_partial_layer_gpu_ids.size() experts' gate+up+down for
+  // engine.qwen4exp_partial_layer, on every decode instance that could
+  // possibly build it -- Phase 1's g_graph when it might commit, and
+  // ALL THREE Phase 2 instances (only SuffixGpu actually builds the
+  // tensor, but reserving on Prefix/SuffixCpu too is a small, bounded,
+  // always-safe no-op there). Without this, g.device_expert_buffer is
+  // never allocated at all when device_expert_layers<=0 and
+  // split_gpu_expert_ids is empty (this feature's only two OTHER
+  // consumers) -- build_split_gpu_tensor then silently fails via
+  // bind_device_expert_gather's own `!g.device_expert_buffer` guard,
+  // and the whole compact path falls back to ordinary dispatch for
+  // that layer (found via real hardware testing, 2026-09-18: the
+  // [PARTIAL-LAYER] "compact GPU tensor construction failed... RAM
+  // arena not ready?" warning).
+  if (g.decode_mode && !engine.qwen4exp_partial_layer_gpu_ids.empty() &&
+      engine.qwen4exp_partial_layer >= 0) {
+    const size_t per_expert =
+        engine.compute_expert_slab_bytes(engine.qwen4exp_partial_layer);
+    const size_t n = engine.qwen4exp_partial_layer_gpu_ids.size();
+    if (per_expert != 0 && n <= SIZE_MAX / per_expert) {
+      const size_t layer_bytes = per_expert * n;
+      if (total <= SIZE_MAX - layer_bytes)
+        total += layer_bytes;
+    }
+  }
   return total;
 }
 
 bool init_device_expert_arena(FullGraph &g) {
   const bool split_active = !g.split_gpu_expert_ids.empty();
-  if (g.device_expert_layers <= 0 && !split_active)
+  // See device_expert_bytes's own comment: the Phase 1/2 partial-layer
+  // compact tensor needs this same arena, on every decode instance that
+  // could possibly build it, even when neither of the other two features
+  // that normally drive this arena's sizing is active.
+  const bool partial_active =
+      g.decode_mode && g.engine &&
+      !g.engine->qwen4exp_partial_layer_gpu_ids.empty() &&
+      g.engine->qwen4exp_partial_layer >= 0;
+  if (g.device_expert_layers <= 0 && !split_active && !partial_active)
     return true;
   const ggml_backend_buffer_type_t buft =
       ggml_backend_get_default_buffer_type(g.cuda);
@@ -1177,13 +1416,15 @@ bool init_device_expert_arena(FullGraph &g) {
   // cannot fit on the 24-GiB card.  Clamp only whole-layer residency requests
   // to the largest arena that actually allocates; the graph then keeps the
   // remaining layers on the DDR/CPU backend instead of abandoning the entire
-  // full graph. Per-expert split allocations remain strict until their own
-  // budget is made independently retryable.
-  const bool allow_layer_clamp = requested_layers > 0 && !split_active;
+  // full graph. Per-expert split allocations (and the partial-layer compact
+  // tensor, same rationale) remain strict until their own budget is made
+  // independently retryable.
+  const bool allow_layer_clamp =
+      requested_layers > 0 && !split_active && !partial_active;
   for (;;) {
     const size_t bytes = device_expert_bytes(g);
     if (bytes == 0) {
-      if (g.device_expert_layers <= 0 && !split_active) {
+      if (g.device_expert_layers <= 0 && !split_active && !partial_active) {
         g.split_gpu_expert_ids.clear();
         return true;
       }
@@ -1206,6 +1447,9 @@ bool init_device_expert_arena(FullGraph &g) {
     // Each split layer allocates 3 more small tensors (gate/up/down) into the
     // same bump arena -- same per-tensor alignment slack accounting as above.
     tensor_slack += g.split_gpu_expert_ids.size() * 3 * kAlignment;
+    // The partial-layer compact tensor is also 3 tensors (gate/up/down).
+    if (partial_active)
+      tensor_slack += 3 * kAlignment;
     constexpr size_t kArenaSlack = 1ull << 20;
     if (bytes > SIZE_MAX - tensor_slack - kArenaSlack) {
       if (allow_layer_clamp && g.device_expert_layers > 1) {
@@ -1970,13 +2214,60 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor *up_exps_gpu = nullptr,
                        ggml_tensor *down_exps_gpu = nullptr,
                        const std::vector<int> *split_gpu_ids = nullptr,
-                       ggml_tensor *gate_up_exps = nullptr) {
+                       ggml_tensor *gate_up_exps = nullptr,
+                       // Phase 1 partial-layer instrumentation only: when
+                       // non-null, receives this call's routing `ids`
+                       // tensor so the caller can mark it as a prefill
+                       // graph output for a real per-prompt routing
+                       // readback. Never used for anything decode does.
+                       ggml_tensor **ids_out = nullptr,
+                       // Same idea, but captures the raw post-softmax
+                       // router distribution (BEFORE selection_bias) so a
+                       // diagnostic can check how peaked/confident real
+                       // routing actually is -- see the "near-uniform =>
+                       // noise" precedent already used for the LM head in
+                       // generation_loop.hpp.
+                       ggml_tensor **probs_out = nullptr,
+                       // Phase 2 prefix builds only: compute the router
+                       // (logits/probs/ids/weights, already added to the
+                       // graph via the ggml_build_forward_expand below)
+                       // and return nullptr immediately, WITHOUT
+                       // constructing any dispatch/FFN nodes at all. Lets
+                       // the prefix graph capture ids_out for the host
+                       // decision without paying for (or even
+                       // constructing) the big expert matmuls it will
+                       // never use -- the real dispatch happens once,
+                       // for real, in whichever suffix graph gets chosen.
+                       bool routing_only = false) {
   const auto &c = g.engine->model_file.architecture_config;
   ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
   ggml_tensor *probs = ggml_soft_max(ctx, logits);
+  if (probs_out)
+    *probs_out = probs;
   ggml_tensor *selection =
       selection_bias ? ggml_add(ctx, probs, selection_bias) : probs;
   ggml_tensor *ids = ggml_argsort_top_k(ctx, selection, c.topk);
+  if (ids_out) {
+    // ggml_argsort_top_k is argsort (full n_experts-wide) + a VIEW that
+    // only shrinks ne[0] to topk -- the view's row stride (nb[1]) stays
+    // at the ORIGINAL n_experts-wide stride, not topk. A single flat
+    // ggml_backend_tensor_get over S>1 rows therefore does not read S
+    // independent per-token top-k slices; it reads a contiguous run of
+    // (topk*S) values out of THIS VIEW's ne[0]=topk logical columns
+    // reinterpreted at the wrong stride, which for S*topk <= n_experts
+    // (true for every case this repo exercises, e.g. topk=10, S<=51)
+    // silently degenerates into reading token 0's OWN top-(topk*S)
+    // ranking sliced into S fake "per-token" chunks -- found via real
+    // hardware testing, 2026-09-18 (every reported PREFILL coverage/
+    // routing-divergence number computed before this fix is invalid;
+    // see [[qwen4exp-legacy-vs-fullgraph-routing-divergence]] and
+    // [[qwen4exp-partial-layer-phase2-implemented]]). DECODE (S==1) was
+    // never affected -- there is only one row, so the flat read already
+    // lands on real data with no other row to conflate it with.
+    // ggml_cont() forces a real, densely-strided [topk, S] copy so any
+    // host-side flat readback of *ids_out is safe.
+    *ids_out = ggml_cont(ctx, ids);
+  }
   ggml_tensor *probs3 = ggml_reshape_3d(ctx, probs, 1, c.n_experts, g.S);
   ggml_tensor *weights = ggml_get_rows(ctx, probs3, ids);
   ggml_tensor *weights2 = ggml_reshape_2d(ctx, weights, c.topk, g.S);
@@ -1989,6 +2280,13 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     weights2 = ggml_scale(ctx, weights2, c.expert_weights_scale);
   weights = ggml_reshape_3d(ctx, weights2, 1, c.topk, g.S);
   ggml_build_forward_expand(g.graph, weights);
+  if (routing_only) {
+    // Phase 2 prefix graph: caller only wanted ids_out/probs_out for the
+    // per-token host dispatch decision. Stop here -- no FFN/dispatch
+    // nodes constructed, so this layer's real expert compute happens
+    // exactly once, in whichever suffix graph actually gets chosen.
+    return nullptr;
+  }
 
   ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
   ggml_tensor *experts = nullptr;
@@ -2078,6 +2376,80 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       g.layer_timing_layer_of[act] = {layer, "moe_swiglu"};
       g.layer_timing_layer_of[down] = {layer, "moe_down"};
     }
+  }
+
+  ggml_tensor *out = ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2], 0);
+  out = ggml_cont(ctx, out);
+  for (int k = 1; k < c.topk; ++k) {
+    ggml_tensor *e = ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2],
+                                  static_cast<size_t>(k) * experts->nb[1]);
+    out = ggml_add(ctx, out, e);
+  }
+  (void)layer;
+  return out;
+}
+
+// Phase 1 "all-or-nothing" partial-layer GPU dispatch. Deliberately NOT a
+// generalization of build_moe's existing split_gpu_ids branch above: that
+// path computes gate/up/down mul_mat_id TWICE per token (once per device,
+// full topk width each time, masked and merged) -- a real, measured,
+// ~20% decode regression at every budget tested regardless of split size,
+// because the redundant branch's FLOPs are not actually skipped by a
+// negative-id route, just zeroed after the fact (see
+// [[qwen4exp-expert-vram-split-regression]]). This function instead does
+// the single, un-doubled dispatch the name promises: ONE mul_mat_id triple
+// over a compact top-N-expert tensor, only ever called for the one layer
+// (engine->qwen4exp_partial_layer) that a whole prefill pass's real
+// routing already confirmed stays inside that top-N set (see
+// qwen4exp_full_graph_run's coverage-gated commit). An id that falls
+// outside the compact set anyway (decode routing something prefill never
+// saw) maps to -1 via `remap_gpu` and is silently dropped by
+// GGML_MUL_MAT_ID's own negative-id contract, i.e. that expert's
+// contribution to the weighted sum goes missing for that token -- a real,
+// bounded, MEASURED (not swept under the rug) accuracy risk, not a
+// design flaw to fix here; see env_partial_layer_min_coverage's own
+// comment for the knob that trades commit-rate against this risk.
+ggml_tensor *build_moe_partial_gpu(FullGraph &g, ggml_context *ctx,
+                                   ggml_tensor *cur, int layer,
+                                   ggml_tensor *router,
+                                   ggml_tensor *selection_bias,
+                                   ggml_tensor *gate_gpu, ggml_tensor *up_gpu,
+                                   ggml_tensor *down_gpu,
+                                   ggml_tensor *remap_gpu) {
+  const auto &c = g.engine->model_file.architecture_config;
+  ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
+  ggml_tensor *probs = ggml_soft_max(ctx, logits);
+  ggml_tensor *selection =
+      selection_bias ? ggml_add(ctx, probs, selection_bias) : probs;
+  ggml_tensor *ids = ggml_argsort_top_k(ctx, selection, c.topk);
+  ggml_tensor *probs3 = ggml_reshape_3d(ctx, probs, 1, c.n_experts, g.S);
+  ggml_tensor *weights = ggml_get_rows(ctx, probs3, ids);
+  ggml_tensor *weights2 = ggml_reshape_2d(ctx, weights, c.topk, g.S);
+  if (c.expert_weights_norm) {
+    ggml_tensor *sum = ggml_sum_rows(ctx, weights2);
+    sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
+    weights2 = ggml_div(ctx, weights2, sum);
+  }
+  if (c.expert_weights_scale != 0.0f && c.expert_weights_scale != 1.0f)
+    weights2 = ggml_scale(ctx, weights2, c.expert_weights_scale);
+  weights = ggml_reshape_3d(ctx, weights2, 1, c.topk, g.S);
+  ggml_build_forward_expand(g.graph, weights);
+
+  ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
+  ggml_tensor *ids_gpu_raw = ggml_get_rows(ctx, remap_gpu, ids);
+  ggml_tensor *ids_gpu = ggml_reshape_2d(ctx, ids_gpu_raw, c.topk, g.S);
+
+  ggml_tensor *up = ggml_mul_mat_id(ctx, up_gpu, input3, ids_gpu);
+  ggml_tensor *gate = ggml_mul_mat_id(ctx, gate_gpu, input3, ids_gpu);
+  ggml_tensor *act = ggml_swiglu_split(ctx, gate, up);
+  ggml_tensor *down = ggml_mul_mat_id(ctx, down_gpu, act, ids_gpu);
+  ggml_tensor *experts = ggml_mul(ctx, down, weights);
+
+  if (g.layer_timing_enabled) {
+    g.layer_timing_layer_of[up] = {layer, "moe_up_partial_gpu"};
+    g.layer_timing_layer_of[gate] = {layer, "moe_gate_partial_gpu"};
+    g.layer_timing_layer_of[act] = {layer, "moe_swiglu_partial_gpu"};
+    g.layer_timing_layer_of[down] = {layer, "moe_down_partial_gpu"};
   }
 
   ggml_tensor *out = ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2], 0);
@@ -2566,7 +2938,34 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
 
   ggml_tensor *res = g.input;
-  if (graph_match_bee_topology()) {
+  // Set true the moment the Phase 2 prefix instance hits its split-layer
+  // early stop, so the post-loop output-head/logits construction below
+  // (which assumes every layer got built) is skipped for this instance --
+  // its real "output" is the handoff tensor, already marked further up.
+  bool phase2_prefix_stopped = false;
+  if (g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
+      g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu) {
+    // Suffix graphs never read g.input at all -- they resume from the
+    // prefix instance's own persistent device-resident handoff tensor
+    // (the residual right after phase2_split_layer's attention,
+    // hc_combine'd but pre-FFN). Binds a fresh leaf, in THIS graph's own
+    // ctx, to the SAME device address the prefix instance wrote into --
+    // exactly the mechanism split_graph_spike.cpp validated (~1 ULP
+    // cross-backend noise, no structural divergence). The prefix instance
+    // is just g_graph itself with phase2_mode==Prefix (see
+    // qwen4exp_full_graph_decode_prepare's build_one lambda) -- it must
+    // already be assigned to g_graph, and must already have run this
+    // decode step, before either suffix graph is computed.
+    if (!g_graph || !g_graph->phase2_handoff_buf || !g_graph->phase2_handoff_addr)
+      return false;
+    res = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, g.D, g.HC, g.S);
+    ggml_backend_tensor_alloc(g_graph->phase2_handoff_buf, res,
+                              g_graph->phase2_handoff_addr);
+    ggml_set_name(res, "qwen_full_phase2_handoff_in");
+  }
+  if (g.phase2_mode != FullGraph::Phase2Mode::SuffixGpu &&
+      g.phase2_mode != FullGraph::Phase2Mode::SuffixCpu &&
+      graph_match_bee_topology()) {
     // The scheduler normally starts directly on the first GPU-weighted
     // operation because g.input is already a CPU buffer.  An explicit CPU
     // CONT makes the initial CPU->GPU handoff visible as the same leading
@@ -2580,8 +2979,33 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
   }
   for (int l = 0; l < g.n_layers; ++l) {
+    // Suffix instances own layers [phase2_split_layer, n_layers) -- layers
+    // strictly BEFORE the split live entirely in the prefix instance
+    // (which already ran this decode step). The split layer itself is
+    // special: its ATTENTION (and any PLE for that same index) already
+    // happened in the prefix graph, which handed off `res` right after
+    // that layer's post-attention hc_combine -- only ITS FFN still needs
+    // building here. Skipping via `continue` (not starting the loop at
+    // split_layer) keeps every downstream index (`p`, GDN/KV push_back
+    // ordering, layer_timing) identical to the Off/single-graph path for
+    // the layers each instance DOES fully build -- g.gdn_layers/
+    // g.kv_layers end up holding only this instance's own indices, which
+    // the existing state-seed/extract code already iterates
+    // instance-locally (no special-casing needed there).
+    if ((g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
+         g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu) &&
+        l < g.phase2_split_layer)
+      continue;
+    // True only for the split layer, in a suffix instance: skip PLE/
+    // attention entirely (the prefix graph already built and applied
+    // them into the `res` this instance resumed from via the handoff
+    // tensor) and fall straight through to the FFN section below.
+    const bool phase2_suffix_skip_attn =
+        (g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
+         g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu) &&
+        l == g.phase2_split_layer;
     const std::string p = "blk." + std::to_string(l) + ".";
-    if (qwen4exp_is_ple_layer(c, l)) {
+    if (!phase2_suffix_skip_attn && qwen4exp_is_ple_layer(c, l)) {
       if (!ple_embedding)
         return false;
       g.ple_embedding =
@@ -2694,10 +3118,16 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
 
     const auto t_attn_start = std::chrono::steady_clock::now();
     ggml_tensor *inject = nullptr;
-    ggml_tensor *hn = resident_tensor(g, g.ctx, p + "hc_attn_norm.weight");
-    ggml_tensor *hdn = resident_tensor(g, g.ctx, p + "hc_attn_down.weight");
-    ggml_tensor *hup = resident_tensor(g, g.ctx, p + "hc_attn_up.weight");
-    ggml_tensor *hinj = resident_tensor(g, g.ctx, p + "hc_attn_inject.weight");
+    // Declared here (not inside the guarded block below) because the FFN
+    // section further down reassigns these same four names to its own
+    // hc_ffn_* weights -- must stay in scope across the
+    // phase2_suffix_skip_attn guard.
+    ggml_tensor *hn = nullptr, *hdn = nullptr, *hup = nullptr, *hinj = nullptr;
+    if (!phase2_suffix_skip_attn) {
+    hn = resident_tensor(g, g.ctx, p + "hc_attn_norm.weight");
+    hdn = resident_tensor(g, g.ctx, p + "hc_attn_down.weight");
+    hup = resident_tensor(g, g.ctx, p + "hc_attn_up.weight");
+    hinj = resident_tensor(g, g.ctx, p + "hc_attn_inject.weight");
     if (!hn || !hdn || !hup || !hinj)
       return false;
     ggml_tensor *attn_in = hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
@@ -2809,6 +3239,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     res = hc_combine(g, g.ctx, res, attn_out, inject);
     g.attn_construction_ms_total += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_attn_start).count();
+    } // !phase2_suffix_skip_attn
 
     const auto t_moe_start = std::chrono::steady_clock::now();
     inject = nullptr;
@@ -2823,6 +3254,58 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
       return false;
+    if (!g.decode_mode && l == g.engine->qwen4exp_partial_layer && bias)
+      g.partial_layer_bias_out = bias;
+
+    if (g.phase2_mode == FullGraph::Phase2Mode::Prefix &&
+        l == g.phase2_split_layer) {
+      // This IS the split layer, and this graph is the Phase 2 prefix:
+      // compute routing only (ids/probs, for the host's per-token
+      // GPU-vs-CPU decision) and stop building entirely -- the split
+      // layer's real FFN, and everything after it, is built exactly
+      // once, in whichever suffix graph the host picks. `res` here is
+      // the post-attention, pre-FFN residual for this layer; hand it off
+      // through a persistent device buffer the chosen suffix graph binds
+      // a fresh leaf to at the same address (see build_graph's own
+      // res-seeding branch for SuffixGpu/SuffixCpu, and
+      // split_graph_spike.cpp for the validated mechanism).
+      build_moe(g, g.ctx, ffn_in, l, router, bias, nullptr, nullptr, nullptr,
+                nullptr, nullptr, nullptr, nullptr, nullptr,
+                &g.partial_layer_ids_out, &g.partial_layer_probs_out,
+                /*routing_only=*/true);
+      if (!g.partial_layer_ids_out || !g.partial_layer_probs_out)
+        return false;
+      ggml_set_output(g.partial_layer_ids_out);
+      ggml_build_forward_expand(g.graph, g.partial_layer_ids_out);
+      ggml_set_output(g.partial_layer_probs_out);
+      ggml_build_forward_expand(g.graph, g.partial_layer_probs_out);
+
+      ggml_backend_buffer_type_t cuda_buft =
+          ggml_backend_get_default_buffer_type(g.cuda);
+      g.phase2_handoff_buf = ggml_backend_buft_alloc_buffer(
+          cuda_buft,
+          static_cast<size_t>(g.D) * g.HC * g.S * sizeof(float));
+      if (!g.phase2_handoff_buf)
+        return false;
+      g.phase2_handoff_addr =
+          ggml_backend_buffer_get_base(g.phase2_handoff_buf);
+      ggml_tensor *handoff_out =
+          ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, g.D, g.HC, g.S);
+      ggml_backend_tensor_alloc(g.phase2_handoff_buf, handoff_out,
+                                g.phase2_handoff_addr);
+      ggml_set_name(handoff_out, "qwen_full_phase2_handoff_out");
+      ggml_tensor *handoff_cpy = ggml_cpy(g.ctx, res, handoff_out);
+      ggml_set_output(handoff_cpy);
+      ggml_build_forward_expand(g.graph, handoff_cpy);
+
+      g.final_streams = res;
+      g.output = nullptr;
+      g.logits = nullptr;
+      g.moe_construction_ms_total += std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t_moe_start).count();
+      phase2_prefix_stopped = true;
+      break; // Prefix's job stops here -- do not build layer l+1 onward.
+    }
 
     // The per-expert split path still needs separate gate/up tensors because
     // its two branches have different expert-axis remaps.  For ordinary
@@ -2834,7 +3317,75 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         g.S == 1 && split_it != g.split_gpu_expert_ids.end() &&
         !split_it->second.empty();
     ggml_tensor *moe = nullptr;
-    if (!split_planned && env_merged_gate_up_enabled()) {
+
+    // Phase 1 "all-or-nothing" partial-layer dispatch: only ever takes over
+    // for the ONE configured layer, and only once a prior prefill pass's
+    // real routing confirmed (via qwen4exp_full_graph_run's coverage check)
+    // that this session may commit to the GPU-only compact path. See
+    // build_moe_partial_gpu's own comment for why this is a separate
+    // function rather than a generalization of the split_gpu_expert_ids
+    // branch build_moe already has.
+    //
+    // Phase 2's SuffixGpu instance reuses this exact same compact-tensor
+    // path for the identical layer/expert-set, but its trigger is NOT the
+    // Phase 1 session-level commit flag -- the host already made a real
+    // PER-TOKEN decision (this token's own routing, read back from the
+    // prefix graph, fit entirely inside qwen4exp_partial_layer_gpu_ids)
+    // before ever choosing to submit this graph at all. Being asked to
+    // build at all IS the decision for this instance.
+    const bool phase2_suffix_gpu_here =
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu &&
+        l == g.phase2_split_layer;
+    if ((g.decode_mode && l == g.engine->qwen4exp_partial_layer &&
+         g.engine->qwen4exp_partial_layer_committed &&
+         !g.engine->qwen4exp_partial_layer_gpu_ids.empty()) ||
+        (phase2_suffix_gpu_here &&
+         !g.engine->qwen4exp_partial_layer_gpu_ids.empty())) {
+      const std::string gname = p + "ffn_gate_exps.weight";
+      const std::string uname = p + "ffn_up_exps.weight";
+      const std::string dname = p + "ffn_down_exps.weight";
+      const GGUFTensor *gm = model_tensor(*g.engine, gname);
+      const GGUFTensor *um = model_tensor(*g.engine, uname);
+      const GGUFTensor *dm = model_tensor(*g.engine, dname);
+      ggml_tensor *pg =
+          gm ? build_split_gpu_tensor(g, g.ctx, gname, *gm,
+                                      g.engine->qwen4exp_partial_layer_gpu_ids)
+             : nullptr;
+      ggml_tensor *pu =
+          um ? build_split_gpu_tensor(g, g.ctx, uname, *um,
+                                      g.engine->qwen4exp_partial_layer_gpu_ids)
+             : nullptr;
+      ggml_tensor *pd =
+          dm ? build_split_gpu_tensor(g, g.ctx, dname, *dm,
+                                      g.engine->qwen4exp_partial_layer_gpu_ids)
+             : nullptr;
+      if (pg && pu && pd) {
+        ExpertSplitTables tab = build_expert_split_tables(
+            g, g.ctx, c.n_experts, g.engine->qwen4exp_partial_layer_gpu_ids);
+        if (tab.remap_gpu)
+          moe = build_moe_partial_gpu(g, g.ctx, ffn_in, l, router, bias, pg,
+                                      pu, pd, tab.remap_gpu);
+      }
+      if (!moe)
+        LOG_WARN("[PARTIAL-LAYER] layer=%d: compact GPU tensor construction "
+                 "failed this run (RAM arena not ready?) -- falling back to "
+                 "normal dispatch for this layer\n",
+                 l);
+    }
+
+    // Prefill-only: capture this layer's routing `ids` for a real per-prompt
+    // readback in qwen4exp_full_graph_run, so decode can decide whether to
+    // commit to the path above. Never set outside prefill.
+    ggml_tensor **partial_ids_out =
+        (!g.decode_mode && l == g.engine->qwen4exp_partial_layer)
+            ? &g.partial_layer_ids_out
+            : nullptr;
+    ggml_tensor **partial_probs_out =
+        (!g.decode_mode && l == g.engine->qwen4exp_partial_layer)
+            ? &g.partial_layer_probs_out
+            : nullptr;
+
+    if (!moe && !split_planned && env_merged_gate_up_enabled()) {
       const auto t_wlookup_start = std::chrono::steady_clock::now();
       const bool gate_up_device =
           graph_expert_projection_resident(g, l, "ffn_gate_exps.weight");
@@ -2848,7 +3399,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
               .count();
       if (gate_up && down) {
         moe = build_moe(g, g.ctx, ffn_in, l, router, bias, nullptr, nullptr,
-                        down, nullptr, nullptr, nullptr, nullptr, gate_up);
+                        down, nullptr, nullptr, nullptr, nullptr, gate_up,
+                        partial_ids_out, partial_probs_out);
       }
     }
 
@@ -2875,7 +3427,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       moe = build_moe(g, g.ctx, ffn_in, l, router, bias, ge.cpu, ue.cpu,
                       de.cpu, split_ok ? ge.gpu : nullptr,
                       split_ok ? ue.gpu : nullptr,
-                      split_ok ? de.gpu : nullptr, split_ids);
+                      split_ok ? de.gpu : nullptr, split_ids, nullptr,
+                      partial_ids_out, partial_probs_out);
     }
     ggml_tensor *sg =
         resident_tensor(g, g.ctx, p + "ffn_gate_inp_shexp.weight");
@@ -2892,6 +3445,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         std::chrono::steady_clock::now() - t_moe_start).count();
   }
 
+  if (!phase2_prefix_stopped) {
   ggml_tensor *on = resident_tensor(g, g.ctx, "output_hc_norm.weight");
   ggml_tensor *od = resident_tensor(g, g.ctx, "output_hc_down.weight");
   ggml_tensor *ou = resident_tensor(g, g.ctx, "output_hc_up.weight");
@@ -2924,6 +3478,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_set_output(g.logits);
     ggml_build_forward_expand(g.graph, g.logits);
   }
+  } // !phase2_prefix_stopped
   if (!g.decode_mode) {
     for (ggml_tensor *t : g.kv_k) {
       ggml_set_output(t);
@@ -2944,6 +3499,18 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     if (g.ple_hist_out) {
       ggml_set_output(g.ple_hist_out);
       ggml_build_forward_expand(g.graph, g.ple_hist_out);
+    }
+    if (g.partial_layer_ids_out) {
+      ggml_set_output(g.partial_layer_ids_out);
+      ggml_build_forward_expand(g.graph, g.partial_layer_ids_out);
+    }
+    if (g.partial_layer_probs_out) {
+      ggml_set_output(g.partial_layer_probs_out);
+      ggml_build_forward_expand(g.graph, g.partial_layer_probs_out);
+    }
+    if (g.partial_layer_bias_out) {
+      ggml_set_output(g.partial_layer_bias_out);
+      ggml_build_forward_expand(g.graph, g.partial_layer_bias_out);
     }
   } else {
     // State copies are graph nodes, but are intentionally not graph outputs:
@@ -3209,7 +3776,19 @@ bool qwen4exp_full_graph_decode_enabled() {
   return env_enabled() && env_decode_enabled();
 }
 
-void qwen4exp_full_graph_shutdown() { g_graph.reset(); }
+void qwen4exp_full_graph_shutdown() {
+  // Explicit, EARLY teardown (before the CUDA driver itself starts
+  // shutting down) is why this function exists at all -- see g_graph's
+  // own destroy()'s comment. The two Phase 2 suffix globals are exactly
+  // as CUDA-backed as g_graph and must be reset here too, in this order
+  // (suffix instances first): SuffixCpu's GDN/KV/PLE state tensors for
+  // layers > split_layer are aliases into SuffixGpu's own
+  // device_state_buffer (see FullGraph::phase2_state_source_graph), so
+  // SuffixGpu must outlive SuffixCpu's teardown.
+  g_graph_p2_suffix_cpu.reset();
+  g_graph_p2_suffix_gpu.reset();
+  g_graph.reset();
+}
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                                  const int *token_ids) {
@@ -3277,6 +3856,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                                      partial_gate_up &&
                                      partial_gate_up[0] == '1';
   plan_expert_vram_split(*g); // must run before init_device_expert_arena
+  plan_partial_layer(engine); // Phase 1 all-or-nothing partial-layer dispatch
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
   g->cpu = ggml_backend_cpu_init();
   if (!g->cuda || !g->cpu)
@@ -3423,17 +4003,50 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   const int required = pos_base + 1;
   const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+
+  // Whether this session should attempt Phase 2 (true per-token dynamic
+  // GPU/CPU dispatch for the partial layer) instead of Phase 1's static,
+  // session-level commit. Both share the same usage-ranked expert set
+  // (plan_partial_layer/qwen4exp_partial_layer_gpu_ids) -- Phase 2 just
+  // decides per-token instead of once at prefill.
+  plan_partial_layer(engine); // Phase 1/2 shared: usage-ranked expert set
+  const bool phase2_wanted = env_partial_layer_phase2_enabled() &&
+                             engine.qwen4exp_partial_layer >= 0 &&
+                             !engine.qwen4exp_partial_layer_gpu_ids.empty();
+  const bool phase2_live = g_graph && g_graph->ready &&
+                           g_graph->phase2_mode ==
+                               FullGraph::Phase2Mode::Prefix &&
+                           g_graph_p2_suffix_gpu &&
+                           g_graph_p2_suffix_gpu->ready &&
+                           g_graph_p2_suffix_cpu && g_graph_p2_suffix_cpu->ready;
+
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->decode_mode && g_graph->kv_capacity >= required &&
-      g_graph->decode_last_pos + 1 == pos_base) {
+      g_graph->decode_last_pos + 1 == pos_base &&
+      (phase2_wanted == phase2_live)) {
     if (has_ple_layer(c)) {
-      std::vector<float> ple;
-      if (!prepare_ple_embedding(*g_graph, ple, 1, pos_base, token_ids) ||
-          !g_graph->ple_embedding ||
-          ple.size() * sizeof(float) > ggml_nbytes(g_graph->ple_embedding))
-        return false;
-      std::memcpy(g_graph->ple_embedding->data, ple.data(),
-                  ple.size() * sizeof(float));
+      // A PLE layer can land on either side of the split (prefix owns
+      // layers [0, split_layer], the live suffix owns everything after)
+      // -- refresh whichever instance's own ple_layer is actually >= 0,
+      // not just the prefix's. Both suffix candidates are refreshed
+      // (only one will actually run this token) since it's cheap and
+      // keeps whichever gets chosen already current.
+      FullGraph *targets[3] = {g_graph.get(),
+                               phase2_live ? g_graph_p2_suffix_gpu.get()
+                                           : nullptr,
+                               phase2_live ? g_graph_p2_suffix_cpu.get()
+                                           : nullptr};
+      for (FullGraph *t : targets) {
+        if (!t || t->ple_layer < 0)
+          continue;
+        std::vector<float> ple;
+        if (!prepare_ple_embedding(*t, ple, 1, pos_base, token_ids) ||
+            !t->ple_embedding ||
+            ple.size() * sizeof(float) > ggml_nbytes(t->ple_embedding))
+          return false;
+        std::memcpy(t->ple_embedding->data, ple.data(),
+                    ple.size() * sizeof(float));
+      }
     }
     return true;
   }
@@ -3443,6 +4056,17 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (!sync_decode_state_to_host(*g_graph)) {
       LOG_WARN("[GGML-QWEN-FULL-DECODE] state download failed while growing "
                "KV capacity; using layered decode\n");
+      return false;
+    }
+    // Phase 2's SuffixGpu instance holds its own GDN/KV/PLE state for
+    // layers this prefix doesn't own (SuffixCpu shares the SAME physical
+    // memory via phase2_state_source_graph -- downloading it a second
+    // time would just re-read identical bytes through a different tensor
+    // handle, so it's skipped).
+    if (g_graph_p2_suffix_gpu && g_graph_p2_suffix_gpu->ready &&
+        !sync_decode_state_to_host(*g_graph_p2_suffix_gpu)) {
+      LOG_WARN("[GGML-QWEN-FULL-DECODE-P2] suffix_gpu state download failed "
+               "while growing KV capacity; using layered decode\n");
       return false;
     }
   }
@@ -3459,6 +4083,11 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   {
     size_t free_before = 0, total_before = 0;
     cudaMemGetInfo(&free_before, &total_before);
+    // SuffixCpu's GDN/KV/PLE state tensors alias SuffixGpu's own
+    // device_state_buffer (see FullGraph::phase2_state_source_graph) --
+    // free it first, then the instance that actually owns that memory.
+    g_graph_p2_suffix_cpu.reset();
+    g_graph_p2_suffix_gpu.reset();
     g_graph.reset();
     size_t free_after = 0, total_after = 0;
     cudaMemGetInfo(&free_after, &total_after);
@@ -3469,179 +4098,415 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
              (free_after - free_before) / (1024.0 * 1024.0 * 1024.0));
   }
 
-  auto g = std::make_unique<FullGraph>();
-  g->engine = &engine;
-  g->device = dev;
-  g->S = 1;
-  g->D = c.hidden;
-  g->HC = c.hc_mult;
-  g->n_layers = c.n_layers;
-  g->H = c.n_heads;
-  g->Hkv = std::max(1, c.n_head_kv);
-  g->hd = c.head_dim;
-  g->Hk_gdn = c.ssm_group_count;
-  g->Hv_gdn = c.ssm_time_step_rank;
-  g->gdn_hd = c.ssm_state_size;
-  g->key_dim = g->Hk_gdn * g->gdn_hd;
-  g->value_dim = c.ssm_inner_size;
-  g->conv_dim = 2 * g->key_dim + g->value_dim;
-  g->d_conv = c.ssm_conv_kernel;
-  g->decode_mode = true;
-  g->kv_capacity = env_decode_kv_capacity(engine.max_t, required);
-  g->decode_last_pos = pos_base - 1;
-  g->device_expert_layers =
-      std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
-  g->device_expert_trailing = env_device_expert_trailing();
-  const char *partial_gate_up =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
-  // partial_gate_up's boundary math (layer==device_expert_layers, the
-  // first CPU layer just past a LEADING block) has no trailing-mode
-  // equivalent yet -- force it off rather than apply leading-only math
-  // to a trailing block. See device_expert_trailing's own comment.
-  g->device_expert_partial_gate_up = g->device_expert_layers > 0 &&
-                                     !g->device_expert_trailing &&
-                                     partial_gate_up &&
-                                     partial_gate_up[0] == '1';
-  plan_expert_vram_split(*g); // must run before init_device_expert_arena
-  g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
-  g->cpu = ggml_backend_cpu_init();
-  if (!g->cuda || !g->cpu)
-    return false;
-  g->cpu_threads = graph_cpu_threads();
-  ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
-  ggml_threadpool_params cpu_tp_params =
-      ggml_threadpool_params_default(g->cpu_threads);
-  // 2026-09-15: tested ggml's own threadpool .poll (default 50 -- NOT
-  // controlled by OMP_WAIT_POLICY/GOMP_SPINCOUNT, which only affect
-  // libgomp's separate pool) as a candidate for the mixed CPU/GPU decode
-  // regression via a temporary env override swept across 0/50/400/1000.
-  // Ruled out via THROUGHPUT: all four values landed within noise of each
-  // other (11.76-12.37 tok/s at device_expert_layers=20).
-  // TEMPORARY re-test (2026-09-15, same day): now that the ELEVENTH ROUND
-  // per-op gap instrumentation exists (MOESTREAM_QWEN4EXP_GRAPH_LAYER_
-  // TIMING=1), re-checking whether .poll moves the GAP time specifically
-  // (a real but small effect could have been lost in the earlier
-  // throughput-only measurement's noise). Remove this override again if
-  // inconclusive, per the original decision record's own discipline.
-  if (const char *poll_env =
-          std::getenv("MOESTREAM_QWEN4EXP_CPU_POLL_RETEST")) {
-    char *end = nullptr;
-    const long v = std::strtol(poll_env, &end, 10);
-    if (end != poll_env && v >= 0 && v <= 100)
-      cpu_tp_params.poll = static_cast<uint32_t>(v);
-  }
-  g->cpu_threadpool = ggml_threadpool_new(&cpu_tp_params);
-  if (g->cpu_threadpool)
-    ggml_backend_cpu_set_threadpool(g->cpu, g->cpu_threadpool);
-  LOG_INFO("[GGML-QWEN-FULL-DECODE] CPU backend configured with %d threads%s\n",
-           g->cpu_threads,
-           g->cpu_threadpool ? " (persistent threadpool)" : "");
-
-  // Every expert view aliases the already populated DDR graph arena, so this
-  // mode has no graph-owned expert source admission or GGUF expert read.
-  if (!init_device_dense_arena(*g) || !init_device_state_arena(*g) ||
-      !init_device_expert_arena(*g))
-    return false;
-  ggml_backend_t backends[] = {g->cuda, g->cpu};
-  ggml_backend_buffer_type_t sched_bufts[2] = {};
-  ggml_backend_buffer_type_t *sched_bufts_ptr = nullptr;
-  if (graph_cuda_host_buffers()) {
-    sched_bufts[0] = ggml_backend_get_default_buffer_type(g->cuda);
-    sched_bufts[1] = ggml_backend_dev_host_buffer_type(
-        ggml_backend_get_device(g->cuda));
-    if (sched_bufts[1]) {
-      sched_bufts_ptr = sched_bufts;
-      LOG_INFO(
-          "[GGML-QWEN-FULL-DECODE] scheduler CPU buffer=%s (CUDA host buffer)\n",
-          ggml_backend_buft_name(sched_bufts[1]));
+  // Builds ONE decode FullGraph instance -- the ordinary single-instance
+  // decode graph when mode==Off, or one leg of Phase 2's 3-instance split
+  // otherwise. Identical to the pre-Phase-2 body of this function in every
+  // other respect (same backends/arenas/scheduler setup, same PLE/state
+  // seeding), factored out only so Phase 2 can call it up to three times.
+  auto build_one = [&](FullGraph::Phase2Mode mode, int split_layer,
+                       FullGraph *state_source) -> std::unique_ptr<FullGraph> {
+    auto g = std::make_unique<FullGraph>();
+    g->engine = &engine;
+    g->device = dev;
+    g->S = 1;
+    g->D = c.hidden;
+    g->HC = c.hc_mult;
+    g->n_layers = c.n_layers;
+    g->H = c.n_heads;
+    g->Hkv = std::max(1, c.n_head_kv);
+    g->hd = c.head_dim;
+    g->Hk_gdn = c.ssm_group_count;
+    g->Hv_gdn = c.ssm_time_step_rank;
+    g->gdn_hd = c.ssm_state_size;
+    g->key_dim = g->Hk_gdn * g->gdn_hd;
+    g->value_dim = c.ssm_inner_size;
+    g->conv_dim = 2 * g->key_dim + g->value_dim;
+    g->d_conv = c.ssm_conv_kernel;
+    g->decode_mode = true;
+    g->kv_capacity = env_decode_kv_capacity(engine.max_t, required);
+    g->decode_last_pos = pos_base - 1;
+    g->device_expert_layers =
+        std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
+    g->device_expert_trailing = env_device_expert_trailing();
+    const char *partial_gate_up =
+        std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
+    // partial_gate_up's boundary math (layer==device_expert_layers, the
+    // first CPU layer just past a LEADING block) has no trailing-mode
+    // equivalent yet -- force it off rather than apply leading-only math
+    // to a trailing block. See device_expert_trailing's own comment.
+    g->device_expert_partial_gate_up = g->device_expert_layers > 0 &&
+                                       !g->device_expert_trailing &&
+                                       partial_gate_up &&
+                                       partial_gate_up[0] == '1';
+    g->phase2_mode = mode;
+    g->phase2_split_layer = split_layer;
+    g->phase2_state_source_graph = state_source;
+    plan_expert_vram_split(*g); // must run before init_device_expert_arena
+    g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
+    g->cpu = ggml_backend_cpu_init();
+    if (!g->cuda || !g->cpu)
+      return nullptr;
+    g->cpu_threads = graph_cpu_threads();
+    ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
+    ggml_threadpool_params cpu_tp_params =
+        ggml_threadpool_params_default(g->cpu_threads);
+    // 2026-09-15: tested ggml's own threadpool .poll (default 50 -- NOT
+    // controlled by OMP_WAIT_POLICY/GOMP_SPINCOUNT, which only affect
+    // libgomp's separate pool) as a candidate for the mixed CPU/GPU decode
+    // regression via a temporary env override swept across 0/50/400/1000.
+    // Ruled out via THROUGHPUT: all four values landed within noise of each
+    // other (11.76-12.37 tok/s at device_expert_layers=20).
+    // TEMPORARY re-test (2026-09-15, same day): now that the ELEVENTH ROUND
+    // per-op gap instrumentation exists (MOESTREAM_QWEN4EXP_GRAPH_LAYER_
+    // TIMING=1), re-checking whether .poll moves the GAP time specifically
+    // (a real but small effect could have been lost in the earlier
+    // throughput-only measurement's noise). Remove this override again if
+    // inconclusive, per the original decision record's own discipline.
+    if (const char *poll_env =
+            std::getenv("MOESTREAM_QWEN4EXP_CPU_POLL_RETEST")) {
+      char *end = nullptr;
+      const long v = std::strtol(poll_env, &end, 10);
+      if (end != poll_env && v >= 0 && v <= 100)
+        cpu_tp_params.poll = static_cast<uint32_t>(v);
     }
-  }
-  // Match the prefill scheduler mode above; event/four-copy mode is opt-in.
-  g->sched =
-      ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
-                             graph_scheduler_parallel(), true);
-  if (!g->sched)
-    return false;
-  LOG_INFO(
-      "[GGML-QWEN-FULL-DECODE] scheduler pipeline_parallel=%s copies=%d\n",
-      graph_scheduler_parallel() ? "true" : "false",
-      ggml_backend_sched_get_n_copies(g->sched));
-  g->layer_timing_enabled = env_layer_timing_enabled();
-  if (g->layer_timing_enabled) {
-    g->layer_timing_cpu_ms.assign(static_cast<size_t>(g->n_layers), 0.0);
-    ggml_backend_sched_set_eval_callback(g->sched, layer_timing_eval_callback,
-                                         g.get());
-  }
+    g->cpu_threadpool = ggml_threadpool_new(&cpu_tp_params);
+    if (g->cpu_threadpool)
+      ggml_backend_cpu_set_threadpool(g->cpu, g->cpu_threadpool);
+    LOG_INFO("[GGML-QWEN-FULL-DECODE] CPU backend configured with %d "
+             "threads%s (phase2_mode=%d)\n",
+             g->cpu_threads,
+             g->cpu_threadpool ? " (persistent threadpool)" : "",
+             static_cast<int>(mode));
 
-  std::vector<float> ple;
-  if (!prepare_ple_embedding(*g, ple, 1, pos_base, token_ids) &&
-      has_ple_layer(c)) {
-    LOG_WARN("[GGML-QWEN-FULL-DECODE] PLE embedding preparation declined\n");
-    return false;
-  }
-  if (!build_graph(*g, has_ple_layer(c) ? &ple : nullptr)) {
-    LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined; layered "
-             "decode remains active\n");
-    return false;
-  }
-
-  // Seed the device state once from the state/cache that the existing prefill
-  // or layered path produced.  This is a one-time boundary transfer; later
-  // decode submissions update these tensors in the graph itself.
-  const size_t state_n = static_cast<size_t>(g->gdn_hd) * g->gdn_hd * g->Hv_gdn;
-  const size_t hist_n = static_cast<size_t>(g->d_conv - 1) * g->conv_dim;
-  for (size_t i = 0; i < g->gdn_layers.size(); ++i) {
-    const int l = g->gdn_layers[i];
-    if (l < 0 || l >= static_cast<int>(engine.qwen4exp_recur_state.size()) ||
-        l >= static_cast<int>(engine.qwen4exp_conv_history.size()) ||
-        engine.qwen4exp_recur_state[l].size() != state_n ||
-        engine.qwen4exp_conv_history[l].size() != hist_n)
-      return false;
-    // qwen4exp_recur_state is host-legacy layout; gdn_state_storage feeds the
-    // decode self-loop's ggml op directly and needs native layout. See
-    // gdn_state_transpose_host.
-    std::vector<float> native_state(state_n);
-    gdn_state_transpose_host(native_state.data(),
-                             engine.qwen4exp_recur_state[l].data(), g->gdn_hd,
-                             g->Hv_gdn);
-    ggml_backend_tensor_set(g->gdn_state_storage[i], native_state.data(), 0,
-                            state_n * sizeof(float));
-    ggml_backend_tensor_set(g->gdn_hist_storage[i],
-                            engine.qwen4exp_conv_history[l].data(), 0,
-                            hist_n * sizeof(float));
-  }
-  const size_t kv_row = static_cast<size_t>(g->Hkv) * g->hd;
-  const size_t kv_bytes = static_cast<size_t>(pos_base) * kv_row * sizeof(float);
-  for (size_t i = 0; i < g->kv_layers.size(); ++i) {
-    const int l = g->kv_layers[i];
-    if (i >= g->kv_state_k.size() || i >= g->kv_state_v.size() || l < 0 ||
-        l >= static_cast<int>(engine.Kc.size()) ||
-        l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
-        !engine.Vc[l])
-      return false;
-    if (kv_bytes > 0) {
-      ggml_backend_tensor_set(g->kv_state_k[i], engine.Kc[l], 0, kv_bytes);
-      ggml_backend_tensor_set(g->kv_state_v[i], engine.Vc[l], 0, kv_bytes);
+    // Every expert view aliases the already populated DDR graph arena, so
+    // this mode has no graph-owned expert source admission or GGUF expert
+    // read.
+    if (!init_device_dense_arena(*g) || !init_device_state_arena(*g) ||
+        !init_device_expert_arena(*g))
+      return nullptr;
+    ggml_backend_t backends[] = {g->cuda, g->cpu};
+    ggml_backend_buffer_type_t sched_bufts[2] = {};
+    ggml_backend_buffer_type_t *sched_bufts_ptr = nullptr;
+    if (graph_cuda_host_buffers()) {
+      sched_bufts[0] = ggml_backend_get_default_buffer_type(g->cuda);
+      sched_bufts[1] = ggml_backend_dev_host_buffer_type(
+          ggml_backend_get_device(g->cuda));
+      if (sched_bufts[1]) {
+        sched_bufts_ptr = sched_bufts;
+        LOG_INFO("[GGML-QWEN-FULL-DECODE] scheduler CPU buffer=%s (CUDA "
+                 "host buffer)\n",
+                 ggml_backend_buft_name(sched_bufts[1]));
+      }
     }
-  }
-  if (g->ple_layer >= 0 && g->ple_hist_storage) {
-    const size_t ple_n = static_cast<size_t>(c.ple_conv_kernel - 1) *
-                         c.ple_ngram_size * g->HC * g->D;
-    if (g->ple_layer >=
-            static_cast<int>(engine.qwen4exp_ple_conv_history.size()) ||
-        engine.qwen4exp_ple_conv_history[g->ple_layer].size() != ple_n)
-      return false;
-    ggml_backend_tensor_set(
-        g->ple_hist_storage,
-        engine.qwen4exp_ple_conv_history[g->ple_layer].data(), 0,
-        ple_n * sizeof(float));
+    // Match the prefill scheduler mode above; event/four-copy mode is opt-in.
+    g->sched =
+        ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
+                               graph_scheduler_parallel(), true);
+    if (!g->sched)
+      return nullptr;
+    LOG_INFO(
+        "[GGML-QWEN-FULL-DECODE] scheduler pipeline_parallel=%s copies=%d\n",
+        graph_scheduler_parallel() ? "true" : "false",
+        ggml_backend_sched_get_n_copies(g->sched));
+    g->layer_timing_enabled = env_layer_timing_enabled();
+    if (g->layer_timing_enabled) {
+      g->layer_timing_cpu_ms.assign(static_cast<size_t>(g->n_layers), 0.0);
+      ggml_backend_sched_set_eval_callback(g->sched, layer_timing_eval_callback,
+                                           g.get());
+    }
+
+    std::vector<float> ple;
+    if (!prepare_ple_embedding(*g, ple, 1, pos_base, token_ids) &&
+        has_ple_layer(c)) {
+      LOG_WARN("[GGML-QWEN-FULL-DECODE] PLE embedding preparation declined\n");
+      return nullptr;
+    }
+    if (!build_graph(*g, has_ple_layer(c) ? &ple : nullptr)) {
+      LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined "
+               "(phase2_mode=%d); layered decode remains active\n",
+               static_cast<int>(mode));
+      return nullptr;
+    }
+
+    // Seed the device state once from the state/cache that the existing
+    // prefill or layered path produced. This is a one-time boundary
+    // transfer; later decode submissions update these tensors in the graph
+    // itself. Skipped when state_source is set: that physical memory was
+    // already seeded when the source instance was built (see
+    // new_device_state_tensor's replay path -- writing it again here would
+    // just re-write the identical bytes through an aliased tensor handle).
+    if (!state_source) {
+      const size_t state_n =
+          static_cast<size_t>(g->gdn_hd) * g->gdn_hd * g->Hv_gdn;
+      const size_t hist_n = static_cast<size_t>(g->d_conv - 1) * g->conv_dim;
+      for (size_t i = 0; i < g->gdn_layers.size(); ++i) {
+        const int l = g->gdn_layers[i];
+        if (l < 0 ||
+            l >= static_cast<int>(engine.qwen4exp_recur_state.size()) ||
+            l >= static_cast<int>(engine.qwen4exp_conv_history.size()) ||
+            engine.qwen4exp_recur_state[l].size() != state_n ||
+            engine.qwen4exp_conv_history[l].size() != hist_n)
+          return nullptr;
+        // qwen4exp_recur_state is host-legacy layout; gdn_state_storage
+        // feeds the decode self-loop's ggml op directly and needs native
+        // layout. See gdn_state_transpose_host.
+        std::vector<float> native_state(state_n);
+        gdn_state_transpose_host(native_state.data(),
+                                 engine.qwen4exp_recur_state[l].data(),
+                                 g->gdn_hd, g->Hv_gdn);
+        ggml_backend_tensor_set(g->gdn_state_storage[i], native_state.data(),
+                                0, state_n * sizeof(float));
+        ggml_backend_tensor_set(g->gdn_hist_storage[i],
+                                engine.qwen4exp_conv_history[l].data(), 0,
+                                hist_n * sizeof(float));
+      }
+      const size_t kv_row = static_cast<size_t>(g->Hkv) * g->hd;
+      const size_t kv_bytes =
+          static_cast<size_t>(pos_base) * kv_row * sizeof(float);
+      for (size_t i = 0; i < g->kv_layers.size(); ++i) {
+        const int l = g->kv_layers[i];
+        if (i >= g->kv_state_k.size() || i >= g->kv_state_v.size() ||
+            l < 0 || l >= static_cast<int>(engine.Kc.size()) ||
+            l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
+            !engine.Vc[l])
+          return nullptr;
+        if (kv_bytes > 0) {
+          ggml_backend_tensor_set(g->kv_state_k[i], engine.Kc[l], 0,
+                                  kv_bytes);
+          ggml_backend_tensor_set(g->kv_state_v[i], engine.Vc[l], 0,
+                                  kv_bytes);
+        }
+      }
+      if (g->ple_layer >= 0 && g->ple_hist_storage) {
+        const size_t ple_n = static_cast<size_t>(c.ple_conv_kernel - 1) *
+                             c.ple_ngram_size * g->HC * g->D;
+        if (g->ple_layer >=
+                static_cast<int>(engine.qwen4exp_ple_conv_history.size()) ||
+            engine.qwen4exp_ple_conv_history[g->ple_layer].size() != ple_n)
+          return nullptr;
+        ggml_backend_tensor_set(
+            g->ple_hist_storage,
+            engine.qwen4exp_ple_conv_history[g->ple_layer].data(), 0,
+            ple_n * sizeof(float));
+      }
+    }
+    g->ready = true;
+    return g;
+  };
+
+  if (phase2_wanted) {
+    auto prefix = build_one(FullGraph::Phase2Mode::Prefix,
+                            engine.qwen4exp_partial_layer, nullptr);
+    if (prefix) {
+      // Must be visible via the g_graph global BEFORE building either
+      // suffix instance: their own build_graph() reads g_graph to find
+      // the prefix's phase2_handoff_buf/addr for the res-seeding branch
+      // (see build_graph's own comment on that lookup).
+      g_graph = std::move(prefix);
+      auto suffix_gpu = build_one(FullGraph::Phase2Mode::SuffixGpu,
+                                  engine.qwen4exp_partial_layer, nullptr);
+      if (suffix_gpu) {
+        auto suffix_cpu = build_one(FullGraph::Phase2Mode::SuffixCpu,
+                                    engine.qwen4exp_partial_layer,
+                                    suffix_gpu.get());
+        if (suffix_cpu) {
+          LOG_INFO("[GGML-QWEN-FULL-DECODE-P2] enabled: split_layer=%d, 3 "
+                   "graph instances (prefix/suffix_gpu/suffix_cpu), KV "
+                   "capacity=%d\n",
+                   engine.qwen4exp_partial_layer, g_graph->kv_capacity);
+          g_graph_p2_suffix_gpu = std::move(suffix_gpu);
+          g_graph_p2_suffix_cpu = std::move(suffix_cpu);
+          return true;
+        }
+      }
+      g_graph_p2_suffix_gpu.reset();
+      g_graph_p2_suffix_cpu.reset();
+    }
+    g_graph.reset();
+    LOG_WARN("[GGML-QWEN-FULL-DECODE-P2] phase2 graph construction failed; "
+             "falling back to the ordinary single-graph decode path\n");
   }
 
+  auto g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr);
+  if (!g)
+    return false;
   LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "
            "token, KV capacity=%d, device GDN/KV/PLE state, DDR expert "
            "arenas=%d\n",
            g->kv_capacity, c.n_layers);
   g_graph = std::move(g);
+  return true;
+}
+
+// Writes the standard positions/mask/decode_indices tensors every decode
+// graph instance builds regardless of phase2_mode (see build_graph's own
+// unconditional construction of these). Prefix's g.input carries this
+// token's real hidden state (fed separately); suffix instances never read
+// theirs at all (they resume from the handoff tensor instead), but still
+// need positions/mask/indices for their OWN layers' attention.
+bool phase2_feed_common_inputs(FullGraph &g, int pos_base) {
+  if (!g.positions || !g.attn_mask || !g.decode_indices)
+    return false;
+  static_cast<int32_t *>(g.positions->data)[0] = pos_base;
+  auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
+  for (int k = 0; k < g.kv_capacity; ++k)
+    mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
+  auto *indices = static_cast<int32_t *>(g.decode_indices->data);
+  for (int h = 0; h < g.Hkv; ++h)
+    indices[h] = pos_base * g.Hkv + h;
+  return true;
+}
+
+// Phase 2 per-token orchestration: submits the prefix graph (attention
+// through the split layer), reads back this token's REAL routing at that
+// layer, decides GPU-vs-CPU purely from whether every routed id already
+// lives in qwen4exp_partial_layer_gpu_ids, then submits exactly ONE of the
+// two suffix graphs -- never both, per the "all-or-nothing" design (see
+// FullGraph::Phase2Mode's own comment). Two scheduler submissions per
+// token instead of one; that overhead is the real, measured cost this
+// feature trades against skipping the split layer's full-width FFN when
+// the GPU-compact path applies.
+bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
+                                           float *hidden_states, int pos_base,
+                                           const int *token_ids, float *logits,
+                                           int vocab) {
+  FullGraph &prefix = *g_graph;
+  FullGraph &sgpu = *g_graph_p2_suffix_gpu;
+  FullGraph &scpu = *g_graph_p2_suffix_cpu;
+  if (pos_base >= sgpu.kv_capacity || pos_base >= scpu.kv_capacity ||
+      !prefix.input || !prefix.partial_layer_ids_out)
+    return false;
+  if (engine.hc_stream_buf.size() <
+      static_cast<size_t>(prefix.D) * prefix.HC)
+    return false;
+  if (has_ple_layer(engine.model_file.architecture_config) && !token_ids)
+    return false;
+  if (logits && (!sgpu.logits || !scpu.logits ||
+                ggml_nelements(sgpu.logits) < vocab ||
+                ggml_nelements(scpu.logits) < vocab))
+    return false;
+
+  std::memcpy(prefix.input->data, engine.hc_stream_buf.data(),
+              static_cast<size_t>(prefix.D) * prefix.HC * sizeof(float));
+  if (!phase2_feed_common_inputs(prefix, pos_base) ||
+      !phase2_feed_common_inputs(sgpu, pos_base) ||
+      !phase2_feed_common_inputs(scpu, pos_base))
+    return false;
+
+  // Per-layer/per-op CPU timing (env: MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING=1),
+  // mirroring qwen4exp_full_graph_decode_run's own reset -- each of the
+  // (up to) two graphs submitted this token needs its own reset, since
+  // each has its own independent eval-callback state.
+  for (FullGraph *g : {&prefix, &sgpu, &scpu}) {
+    if (g->layer_timing_enabled) {
+      std::fill(g->layer_timing_cpu_ms.begin(), g->layer_timing_cpu_ms.end(),
+                0.0);
+      g->layer_timing_op_ms.clear();
+      g->layer_timing_t0.clear();
+      g->layer_timing_gap_ms_total = 0.0;
+      g->layer_timing_gap_count = 0;
+      g->layer_timing_have_last_ask_false = false;
+    }
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+
+  // Step 1: prefix -- real attention through the split layer, plus this
+  // token's own routing at that layer (a graph output).
+  if (ggml_backend_sched_graph_compute_async(prefix.sched, prefix.graph) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  ggml_backend_sched_synchronize(prefix.sched);
+
+  const auto &c = engine.model_file.architecture_config;
+  std::vector<int32_t> ids_host(static_cast<size_t>(c.topk));
+  ggml_backend_tensor_get(prefix.partial_layer_ids_out, ids_host.data(), 0,
+                          ids_host.size() * sizeof(int32_t));
+  const std::unordered_set<int> gpu_set(
+      engine.qwen4exp_partial_layer_gpu_ids.begin(),
+      engine.qwen4exp_partial_layer_gpu_ids.end());
+  bool all_in_gpu_set = true;
+  for (int32_t id : ids_host) {
+    if (id >= 0 && !gpu_set.count(id)) {
+      all_in_gpu_set = false;
+      break;
+    }
+  }
+  FullGraph &chosen = all_in_gpu_set ? sgpu : scpu;
+
+  // Step 2: exactly the one suffix this token's real routing needs -- the
+  // split layer's real FFN, plus every layer after it, on ONE device.
+  if (ggml_backend_sched_graph_compute_async(chosen.sched, chosen.graph) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  ggml_backend_sched_synchronize(chosen.sched);
+  ggml_backend_tensor_get(chosen.output, hidden_states, 0,
+                          static_cast<size_t>(chosen.D) * sizeof(float));
+  if (logits)
+    ggml_backend_tensor_get(chosen.logits, logits, 0,
+                            static_cast<size_t>(vocab) * sizeof(float));
+
+  prefix.decode_last_pos = pos_base;
+  sgpu.decode_last_pos = pos_base;
+  scpu.decode_last_pos = pos_base;
+
+  if (has_ple_layer(engine.model_file.architecture_config)) {
+    auto &hist = engine.qwen4exp_ple_tok_hist;
+    hist.push_back(token_ids[0]);
+    const int keep =
+        std::max(0, engine.model_file.architecture_config.ple_ngram_size - 1);
+    if (static_cast<int>(hist.size()) > keep)
+      hist.erase(hist.begin(), hist.end() - keep);
+    engine.qwen4exp_ple_next_pos = pos_base + 1;
+  }
+  engine.qwen4exp_full_graph_output_ready = true;
+  engine.qwen4exp_full_graph_logits_ready = logits != nullptr;
+  const double ms = std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - start)
+                         .count();
+  LOG_INFO("[GGML-QWEN-FULL-DECODE-P2-TIME] pos=%d dispatch=%s total=%.3f "
+           "ms\n",
+           pos_base, all_in_gpu_set ? "gpu" : "cpu", ms);
+  // Same per-layer CPU-timing report as the single-graph decode path, for
+  // BOTH graphs actually submitted this token -- lets a specific layer
+  // (e.g. the split layer) be compared directly against its own
+  // single-graph-baseline cost. Only meaningful for CPU-dispatched nodes
+  // (the split layer's compact GPU path has no CPU-side op to time here;
+  // its cost is inside the GPU-submission wall time captured above).
+  if ((prefix.layer_timing_enabled || chosen.layer_timing_enabled) &&
+      ++prefix.layer_timing_tokens_since_emit >= 10) {
+    prefix.layer_timing_tokens_since_emit = 0;
+    for (auto *tag_g : {&prefix, &chosen}) {
+      if (!tag_g->layer_timing_enabled)
+        continue;
+      double total_cpu_ms = 0.0;
+      std::string per_layer;
+      for (size_t l = 0; l < tag_g->layer_timing_cpu_ms.size(); ++l) {
+        const double lms = tag_g->layer_timing_cpu_ms[l];
+        total_cpu_ms += lms;
+        if (lms > 0.01)
+          per_layer += " L" + std::to_string(l) + "=" +
+                      std::to_string(static_cast<int>(lms * 100) / 100.0);
+      }
+      LOG_INFO("[GGML-QWEN-FULL-LAYER-TIMING-P2] pos=%d inst=%s "
+               "dispatch=%s cpu_total=%.3fms gap_total=%.3fms (n=%ld "
+               "gaps)%s\n",
+               pos_base,
+               tag_g == &prefix ? "prefix"
+               : tag_g == &sgpu ? "suffix_gpu"
+                                : "suffix_cpu",
+               all_in_gpu_set ? "gpu" : "cpu", total_cpu_ms,
+               tag_g->layer_timing_gap_ms_total, tag_g->layer_timing_gap_count,
+               per_layer.c_str());
+      for (const auto &[stem, oms] : tag_g->layer_timing_op_ms)
+        LOG_INFO("[GGML-QWEN-FULL-LAYER-TIMING-P2]   inst=%s op=%s "
+                 "cpu=%.3fms\n",
+                 tag_g == &prefix ? "prefix"
+                 : tag_g == &sgpu ? "suffix_gpu"
+                                  : "suffix_cpu",
+                 stem.c_str(), oms);
+    }
+  }
   return true;
 }
 
@@ -3655,6 +4520,13 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       pos_base >= g_graph->kv_capacity ||
       ((logits == nullptr) != (vocab <= 0)))
     return false;
+  if (g_graph->phase2_mode == FullGraph::Phase2Mode::Prefix &&
+      g_graph_p2_suffix_gpu && g_graph_p2_suffix_gpu->ready &&
+      g_graph_p2_suffix_cpu && g_graph_p2_suffix_cpu->ready) {
+    return qwen4exp_full_graph_decode_run_phase2(engine, hidden_states,
+                                                 pos_base, token_ids, logits,
+                                                 vocab);
+  }
   FullGraph &g = *g_graph;
   if (engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC)
     return false;
@@ -3904,6 +4776,162 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     for (int i = start; i < S; ++i)
       engine.qwen4exp_ple_tok_hist.push_back(token_ids[i]);
     engine.qwen4exp_ple_next_pos = S;
+  }
+  if (g.partial_layer_ids_out) {
+    // Phase 1 all-or-nothing partial-layer dispatch: this prompt's real
+    // layer-N routing, read back once per prefill. Coverage = fraction of
+    // this prompt's DISTINCT selected experts that fall inside the
+    // usage-ranked top-N pinned set (plan_partial_layer). Committing
+    // decode to the GPU-only path only when coverage clears the
+    // (default: 100%) threshold is what keeps build_moe_partial_gpu's
+    // silent-miss risk rare in practice, not just in theory -- see that
+    // function's own comment for what happens on the rare miss anyway.
+    const auto &c = engine.model_file.architecture_config;
+    const size_t n = static_cast<size_t>(c.topk) * static_cast<size_t>(S);
+    std::vector<int32_t> ids_host(n);
+    ggml_backend_tensor_get(g.partial_layer_ids_out, ids_host.data(), 0,
+                            n * sizeof(int32_t));
+    std::unordered_set<int32_t> used(ids_host.begin(), ids_host.end());
+    std::unordered_set<int> gpu_set(
+        engine.qwen4exp_partial_layer_gpu_ids.begin(),
+        engine.qwen4exp_partial_layer_gpu_ids.end());
+    size_t covered = 0;
+    for (int32_t id : used)
+      if (id >= 0 && gpu_set.count(id))
+        ++covered;
+    const double coverage =
+        used.empty() ? 1.0
+                     : static_cast<double>(covered) / static_cast<double>(used.size());
+    engine.qwen4exp_partial_layer_committed =
+        coverage >= engine.qwen4exp_partial_layer_min_coverage;
+    // Root-cause diagnostic (2026-09-18): last-prefill-token router picks,
+    // in the SAME format as legacy dispatch's own TRACE-ROUTER line
+    // (moe_router_service.cpp, "[TRACE l=<layer>] router picks: e<id> ...")
+    // -- for a fixed prompt, the last prefill token's input is IDENTICAL
+    // regardless of dispatch path (no generated-token drift can have
+    // contaminated it yet), so this is the one directly comparable,
+    // uncontaminated data point between the two paths. Diff this line
+    // against a legacy run's TRACE-ROUTER output (log_level=VERBOSE,
+    // trace_filter=TRACE-ROUTER) for the same prompt/layer to test
+    // [[qwen4exp-legacy-vs-fullgraph-routing-divergence]]'s BF16-router-
+    // precision hypothesis.
+    if (S > 0) {
+      // Cross-check: what raw probability does THIS SAME build_moe
+      // invocation's own probs_out assign to each id its own ids_out
+      // selected? If this doesn't match a plausible top-k-by-probability
+      // ranking, the divergence is internal to full-graph's own
+      // ids/probs pairing, not (only) a legacy-vs-full-graph difference.
+      std::vector<float> probs_host2;
+      if (g.partial_layer_probs_out) {
+        const size_t np2 =
+            static_cast<size_t>(c.n_experts) * static_cast<size_t>(S);
+        probs_host2.assign(np2, 0.0f);
+        ggml_backend_tensor_get(g.partial_layer_probs_out, probs_host2.data(),
+                                0, np2 * sizeof(float));
+      }
+      std::string picks;
+      for (int k = 0; k < c.topk; ++k) {
+        int32_t eid = ids_host[(S - 1) * c.topk + k];
+        picks += " e" + std::to_string(eid);
+        if (!probs_host2.empty()) {
+          const float *col2 =
+              probs_host2.data() + static_cast<size_t>(S - 1) * c.n_experts;
+          const float p = (eid >= 0 && eid < c.n_experts) ? col2[eid] : -1.0f;
+          picks += "(p=" + std::to_string(p) + ")";
+        }
+      }
+      LOG_INFO("[TRACE-ROUTER-FULLGRAPH l=%d] router picks (last prefill "
+               "token):%s\n",
+               engine.qwen4exp_partial_layer, picks.c_str());
+      // Root-cause diagnostic (2026-09-18), continued: dump full-graph's
+      // own top-20 by raw post-softmax probability for the same token, so
+      // a legacy pick NOT in full-graph's top-10 can be checked for
+      // "just outside, nearly tied" (rank ~11-20, close probability) vs
+      // "nowhere close" (rank in the hundreds) -- distinguishes a
+      // precision-flips-a-near-tie explanation from a genuinely different
+      // computation on one side.
+      if (g.partial_layer_probs_out) {
+        const size_t np = static_cast<size_t>(c.n_experts) * static_cast<size_t>(S);
+        std::vector<float> probs_host(np);
+        ggml_backend_tensor_get(g.partial_layer_probs_out, probs_host.data(), 0,
+                                np * sizeof(float));
+        const float *col = probs_host.data() +
+                           static_cast<size_t>(S - 1) * c.n_experts;
+        std::vector<int> order(c.n_experts);
+        for (int e = 0; e < c.n_experts; ++e)
+          order[e] = e;
+        std::partial_sort(order.begin(), order.begin() + std::min(20, c.n_experts),
+                          order.end(),
+                          [&](int a, int b) { return col[a] > col[b]; });
+        std::string top20;
+        for (int k = 0; k < std::min(20, c.n_experts); ++k)
+          top20 += " e" + std::to_string(order[k]) + "(p=" +
+                   std::to_string(col[order[k]]) + ")";
+        LOG_INFO("[TRACE-ROUTER-FULLGRAPH-TOP20 l=%d] last prefill token:%s\n",
+                 engine.qwen4exp_partial_layer, top20.c_str());
+      }
+      if (g.partial_layer_bias_out) {
+        std::vector<float> bias_host(static_cast<size_t>(c.n_experts));
+        ggml_backend_tensor_get(g.partial_layer_bias_out, bias_host.data(), 0,
+                                bias_host.size() * sizeof(float));
+        float bmin = bias_host[0], bmax = bias_host[0], bsum = 0.0f;
+        for (float v : bias_host) {
+          bmin = std::min(bmin, v);
+          bmax = std::max(bmax, v);
+          bsum += v;
+        }
+        LOG_INFO("[TRACE-ROUTER-FULLGRAPH-BIAS l=%d] exp_probs_b.bias: "
+                 "min=%.6f max=%.6f mean=%.6f (n=%d)\n",
+                 engine.qwen4exp_partial_layer, bmin, bmax,
+                 bsum / static_cast<float>(c.n_experts), c.n_experts);
+      }
+    }
+    // Router-confidence diagnostic: is this layer's routing genuinely
+    // peaked (real signal) or effectively near-uniform noise? A uniform
+    // distribution over n_experts would put EVERY token's top-1
+    // probability at 1/n_experts; a working router should sit well above
+    // that. Directly tests the "near-zero-collision selection" anomaly
+    // this whole check exists because of -- see
+    // qwen4exp-full-graph-decode-benchmark-baseline memory's follow-on
+    // note for the statistics that motivated it.
+    if (g.partial_layer_probs_out) {
+      const size_t np = static_cast<size_t>(c.n_experts) * static_cast<size_t>(S);
+      std::vector<float> probs_host(np);
+      ggml_backend_tensor_get(g.partial_layer_probs_out, probs_host.data(), 0,
+                              np * sizeof(float));
+      double top1_min = 1.0, top1_max = 0.0, top1_sum = 0.0;
+      for (int s = 0; s < S; ++s) {
+        float m = 0.0f;
+        const float *col = probs_host.data() + static_cast<size_t>(s) * c.n_experts;
+        for (int e = 0; e < c.n_experts; ++e)
+          m = std::max(m, col[e]);
+        top1_min = std::min(top1_min, static_cast<double>(m));
+        top1_max = std::max(top1_max, static_cast<double>(m));
+        top1_sum += m;
+      }
+      const double top1_mean = S > 0 ? top1_sum / S : 0.0;
+      const double uniform_baseline = 1.0 / static_cast<double>(c.n_experts);
+      LOG_INFO(
+          "[PARTIAL-LAYER-DIAG] layer=%d router top-1 confidence over %d "
+          "token(s): min=%.4f mean=%.4f max=%.4f (uniform/no-signal "
+          "baseline would be %.4f) -- %s\n",
+          engine.qwen4exp_partial_layer, S, top1_min, top1_mean, top1_max,
+          uniform_baseline,
+          top1_mean > uniform_baseline * 3.0
+              ? "routing looks peaked/real"
+              : "routing looks close to uniform -- possible router issue");
+    }
+    LOG_INFO(
+        "[PARTIAL-LAYER] layer=%d prefill routing: %zu distinct expert(s) "
+        "selected this prompt, %zu covered by the top-%d pinned set "
+        "(%.1f%% coverage, threshold %.1f%%) -- decode will run %s for "
+        "this layer\n",
+        engine.qwen4exp_partial_layer, used.size(), covered,
+        engine.qwen4exp_partial_layer_top_n, coverage * 100.0,
+        engine.qwen4exp_partial_layer_min_coverage * 100.0,
+        engine.qwen4exp_partial_layer_committed
+            ? "GPU-ONLY (committed)"
+            : "the normal CPU/GPU path (insufficient coverage)");
   }
   const auto t_state_end = std::chrono::steady_clock::now();
   const auto ms = [](const auto &a, const auto &b) {
