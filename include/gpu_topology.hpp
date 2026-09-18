@@ -869,17 +869,34 @@ public:
             // expert_ffn_gpu_finish) already correctly measure their own
             // wall-clock duration either way, so no existing timer numbers
             // become invalid -- only the CPU-side cost of THAT wait changes.
-            // BeeLlama does not override the RTX 3090's CUDA scheduling mode,
-            // so its equivalent is cudaDeviceScheduleAuto (the CUDA default).
-            // Keep MoEStream's historical BlockingSync default, but expose a
-            // setup-only A/B switch.  This intentionally does not change the
-            // graph, scheduler API, copy API, or stream synchronization calls.
+            // REVERSED (2026-09-18): the BlockingSync-by-default reasoning
+            // above was measured on the legacy per-layer dispatch path
+            // (many synchronous cudaStreamSynchronize calls interleaved with
+            // CPU-contended OMP dequant work), and that finding still holds
+            // there. But on the full-graph Qwen4Exp decode path (ggml CUDA
+            // graph capture/replay, see MOESTREAM_ENABLE_CUDA_GRAPHS),
+            // BlockingSync's per-call OS wake-up/context-switch latency
+            // (~40us median) was directly measured -- via nsys cuda_api_sum,
+            // matched 22/48-GPU-resident-layer config against beellama's own
+            // reference (~3.9us median for the equivalent call) -- to cost
+            // ~4-5ms of every ~50ms decode step with NO corresponding GPU
+            // work to show for it (kernel-busy + memcpy time per token
+            // together only account for ~1.8ms of that gap). Switching to
+            // Auto closed the entire remaining throughput gap to beellama on
+            // that path: full-graph decode went from ~20 tok/s to ~26 tok/s
+            // (beellama's own reference: ~25.2 tok/s), reproduced twice.
+            // BeeLlama itself never overrides CUDA scheduling mode at all,
+            // i.e. its equivalent is already cudaDeviceScheduleAuto.
+            // Defaulting to Auto here matches that and wins on the now-
+            // primary full-graph path; MOESTREAM_CUDA_SCHEDULE=blocking
+            // remains available for anyone who needs to A/B the legacy path
+            // against the old default.
             const char * schedule_env = std::getenv("MOESTREAM_CUDA_SCHEDULE");
-            unsigned schedule_flags = cudaDeviceScheduleBlockingSync;
-            const char * schedule_name = "blocking";
-            if (schedule_env && std::strcmp(schedule_env, "auto") == 0) {
-                schedule_flags = cudaDeviceScheduleAuto;
-                schedule_name = "auto";
+            unsigned schedule_flags = cudaDeviceScheduleAuto;
+            const char * schedule_name = "auto";
+            if (schedule_env && std::strcmp(schedule_env, "blocking") == 0) {
+                schedule_flags = cudaDeviceScheduleBlockingSync;
+                schedule_name = "blocking";
             } else if (schedule_env && std::strcmp(schedule_env, "spin") == 0) {
                 schedule_flags = cudaDeviceScheduleSpin;
                 schedule_name = "spin";

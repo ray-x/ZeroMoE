@@ -328,7 +328,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // token regardless of log level -- only the string format is
     // LOG_DEBUG-gated, the CUDA calls are not). Remove once the real
     // source is found and fixed.
-    double diag_lmhead_ms = 0.0, diag_vramlog_ms = 0.0;
+    double diag_lmhead_ms = 0.0, diag_vramlog_ms = 0.0, diag_vramlog_ms_prev = 0.0;
     // TEMPORARY DIAGNOSTIC (2026-09-12) -- reset layers_forward_gguf's
     // per-layer-loop wall-clock accumulator once per request, so the total
     // printed alongside [REQUEST] below reflects only THIS request's
@@ -737,6 +737,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     }
 
     if (!mtp_started) for (int step = 0; step < max_new_tokens; ++step) {
+        auto diag_loop_iter_start = std::chrono::high_resolution_clock::now();
         // Cooperative shutdown checkpoint: a decode step can take many
         // seconds (CPU-bound expert FFN with no cancellation point inside
         // it), so this is the earliest point a Ctrl-C from the previous
@@ -878,11 +879,17 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             (next_token == eos_id || tokenizer.is_stop_token(next_token)))
             break;
 
+        double diag_preproc_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - diag_loop_iter_start).count();
+
         // Embed the new token and run one forward step
+        auto diag_embed_start = std::chrono::high_resolution_clock::now();
         if (emb_it != engine.resident_layers.end()) {
             embed_token(engine, next_token, D, decode_hidden.data());
         }
-        
+        double diag_embed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - diag_embed_start).count();
+
         int pos = prompt_ids.size() + step;
 
         // Per-token latency breakdown: diff perf() counters across just this
@@ -928,6 +935,16 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // Replace hidden_states with the single-token output for next iteration
         hidden_states.resize(D);
         std::memcpy(hidden_states.data(), decode_hidden.data(), D * sizeof(float));
+
+        double diag_loop_iter_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - diag_loop_iter_start).count();
+        double diag_vramlog_delta_ms = diag_vramlog_ms - diag_vramlog_ms_prev;
+        diag_vramlog_ms_prev = diag_vramlog_ms;
+        LOG_INFO("[TOKEN-LOOP-DIAG] step=%d iter_total=%.3fms preproc(sample+decode+print)=%.3fms "
+                 "embed=%.3fms core(hc+forward)=%.3fms vramlog=%.3fms tail=%.3fms\n",
+                 step, diag_loop_iter_ms, diag_preproc_ms, diag_embed_ms, token_wall_ms,
+                 diag_vramlog_delta_ms,
+                 diag_loop_iter_ms - diag_preproc_ms - diag_embed_ms - token_wall_ms - diag_vramlog_delta_ms);
     }
     
     // prefetcher is caller-owned (started once for the whole session by
