@@ -99,6 +99,17 @@ cmake -S . -B build -DMOESTREAM_USE_GGML=ON -DMOESTREAM_GGML_TAG=b3923
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
+#### ggml-cuda / full-graph decode build
+
+The experimental ggml-backed full-graph prefill/decode path (`MOESTREAM_QWEN4EXP_FULL_GRAPH*` env vars at runtime) requires linking ggml's CUDA backend:
+
+```bash
+cmake -S . -B build -DMOESTREAM_USE_GGML=ON -DMOESTREAM_USE_GGML_CUDA=ON
+cmake --build build -j$(nproc)
+```
+
+`MOESTREAM_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `MOESTREAM_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DMOESTREAM_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
+
 ### Interactive Terminal Generation
 
 Launch the standalone engine directly by pointing it at your local GGUF model, either via a TOML config (preferred) or legacy CLI flags:
