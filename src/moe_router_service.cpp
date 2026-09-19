@@ -36,6 +36,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 extern void mla_attention_absorbed_gguf(StreamingEngine &engine, int layer_idx,
@@ -398,6 +399,69 @@ static bool qwen4exp_decode_device_router_gemv_enabled() {
 // inherited process-wide experiment setting.
 static bool qwen4exp_decode_scheduler_enabled(const StreamingEngine &engine) {
   return engine.qwen4exp_decode_scheduler;
+}
+
+// Predictive Partial Pinning empirical filter (2026-09-19): which layer to
+// check, read directly from the same env var Phase 1/2 uses
+// (MOESTREAM_QWEN4EXP_PARTIAL_LAYER) -- this measurement runs in LEGACY
+// dispatch (where qwen4exp_router_pilot actually lives), so it cannot rely
+// on engine.qwen4exp_partial_layer/plan_partial_layer(), which are only
+// ever populated from the full-graph prepare path.
+static int qwen4exp_ppp_target_layer() {
+  static const int layer = [] {
+    const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER");
+    if (!v || !v[0])
+      return -1;
+    char *end = nullptr;
+    const long n = std::strtol(v, &end, 10);
+    return (end == v || *end != '\0' || n < 0) ? -1 : static_cast<int>(n);
+  }();
+  return layer;
+}
+
+// Mirrors plan_partial_layer's own ranking (ggml_qwen4exp_graph.cpp) --
+// duplicated rather than shared across translation units because that
+// function has internal linkage and engine.qwen4exp_partial_layer_gpu_ids
+// is only ever populated by the full-graph prepare path, never by legacy
+// dispatch. Computed once (function-local static cache), since the usage
+// file and env vars are fixed for the life of the process.
+static const std::unordered_set<int> &qwen4exp_ppp_pin_set(StreamingEngine &engine) {
+  static const std::unordered_set<int> pin_set = [&engine] {
+    std::unordered_set<int> result;
+    const int layer = qwen4exp_ppp_target_layer();
+    if (layer < 0)
+      return result;
+    const char *topn_env = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_TOP_N");
+    int top_n = 256;
+    if (topn_env && topn_env[0]) {
+      char *end = nullptr;
+      const long n = std::strtol(topn_env, &end, 10);
+      if (end != topn_env && *end == '\0' && n > 0)
+        top_n = static_cast<int>(n);
+    }
+    const std::string path = engine.qwen4exp_graph_pin_file.empty()
+                                 ? std::string(".moestream_usage")
+                                 : engine.qwen4exp_graph_pin_file;
+    auto [entries, maxc] = StreamingEngine::load_usage(path);
+    (void)maxc;
+    std::vector<StreamingEngine::UsageEntry> layer_entries;
+    for (const auto &e : entries)
+      if (e.layer == layer)
+        layer_entries.push_back(e);
+    std::stable_sort(layer_entries.begin(), layer_entries.end(),
+                     [](const auto &a, const auto &b) {
+                       return a.count > b.count;
+                     });
+    for (size_t i = 0; i < layer_entries.size() &&
+                       static_cast<int>(i) < top_n;
+         ++i)
+      result.insert(layer_entries[i].expert);
+    LOG_INFO("[QWEN-PILOT-PPP] layer=%d static pin set: %zu expert(s) from "
+             "%s (top_n=%d)\n",
+             layer, result.size(), path.c_str(), top_n);
+    return result;
+  }();
+  return pin_set;
 }
 
 bool MoeRouterService::route(MoePipelineContext &context) {
@@ -1872,6 +1936,46 @@ bool MoeRouterService::route(MoePipelineContext &context) {
           1, std::memory_order_relaxed);
       perf().n_qwen_pilot_prefetch_recall_pred_size_sum.fetch_add(
           (uint64_t)prefetch_count, std::memory_order_relaxed);
+    }
+    // Predictive Partial Pinning empirical filter (2026-09-19): does
+    // (static pin set) UNION (pilot's staged predictions) cover this
+    // token's REAL routed experts for the configured partial layer? Only
+    // meaningful here, not in build_moe_partial_gpu's own dispatch --
+    // this is a pure measurement, no actual staging/fetch is issued.
+    if (layer_idx == qwen4exp_ppp_target_layer()) {
+      const std::unordered_set<int> &pin_set = qwen4exp_ppp_pin_set(engine);
+      if (!pin_set.empty()) {
+        const int stage_k_scenarios[PerfCounters::kPPPStagingScenarios] = {
+            0, prefetch_count, 5};
+        for (int sc = 0; sc < PerfCounters::kPPPStagingScenarios; ++sc) {
+          const int stage_k =
+              std::min(stage_k_scenarios[sc], scratch.qwen_pilot_pred_count);
+          int miss = 0;
+          for (int k = 0; k < topk; ++k) {
+            const int routed = scratch.tok_topk_ids[(size_t)s * topk + k];
+            if (routed < 0 || pin_set.count(routed))
+              continue;
+            bool staged = false;
+            for (int pk = 0; pk < stage_k; ++pk) {
+              if (scratch.qwen_pilot_pred_ids[pk] == routed) {
+                staged = true;
+                break;
+              }
+            }
+            if (!staged)
+              ++miss;
+          }
+          if (miss == 0)
+            perf().n_ppp_m0[sc].fetch_add(1, std::memory_order_relaxed);
+          else if (miss == 1)
+            perf().n_ppp_m1[sc].fetch_add(1, std::memory_order_relaxed);
+          else
+            perf().n_ppp_m2plus[sc].fetch_add(1, std::memory_order_relaxed);
+            perf().n_ppp_m2plus_sum[sc].fetch_add(
+                (uint64_t)miss, std::memory_order_relaxed);
+        }
+        perf().n_ppp_tokens_checked.fetch_add(1, std::memory_order_relaxed);
+      }
     }
     scratch.qwen_pilot_pred_layer = -1;
     scratch.qwen_pilot_pred_count = 0;

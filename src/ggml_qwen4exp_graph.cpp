@@ -103,6 +103,13 @@ struct FullGraph {
   bool layer_timing_have_last_ask_false = false;
   double layer_timing_gap_ms_total = 0.0;
   long layer_timing_gap_count = 0;
+  // One-shot verbose node/backend dump (env: MOESTREAM_QWEN4EXP_GRAPH_
+  // LAYER_TIMING_VERBOSE=1) -- see env_layer_timing_verbose()'s comment.
+  bool layer_timing_verbose_enabled = false;
+  bool layer_timing_verbose_dumped = false;
+  int layer_timing_verbose_tokens_seen = 0;
+  std::chrono::steady_clock::time_point layer_timing_verbose_last{};
+  bool layer_timing_verbose_have_last = false;
   // Op result tensors (mul_mat_id/swiglu outputs inside build_moe()) get
   // ggml's auto-generated "node_NNNN" name, not a "blk.N.stem" name --
   // only the persistent WEIGHT leaf tensors are explicitly named by
@@ -459,6 +466,67 @@ bool env_layer_timing_enabled() {
   return v && v[0] == '1';
 }
 
+// Runtime guard (2026-09-19): CMakeLists.txt already documents that a plain
+// MOESTREAM_USE_GGML_CUDA build can silently compile out ggml-cuda's CUDA
+// graph capture/replay path (GGML_CUDA_USE_GRAPHS never defined) -- this
+// exact failure mode cost an entire investigation before it was found once
+// already (full-graph decode 20 tok/s -> 8 tok/s, mistaken for a
+// correctness/scheduling bug). A build-time default is not enough: it can
+// still silently drift (wrong CMake cache value, a stale build directory,
+// an override left on from debugging). This checks the ACTUAL compiled
+// binary's feature list via ggml's own backend-registry API, every single
+// run, and logs impossible-to-miss output either way -- no one should have
+// to remember to ask "is this still on" again.
+static void verify_cuda_graphs_compiled_in(ggml_backend_t cuda_backend) {
+  static bool checked = false;
+  if (checked || !cuda_backend)
+    return;
+  checked = true;
+  ggml_backend_dev_t dev = ggml_backend_get_device(cuda_backend);
+  ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+  auto get_features = reg ? reinterpret_cast<ggml_backend_get_features_t>(
+                                ggml_backend_reg_get_proc_address(
+                                    reg, "ggml_backend_get_features"))
+                          : nullptr;
+  bool has_graphs = false;
+  if (get_features) {
+    for (const ggml_backend_feature *f = get_features(reg);
+        f && f->name; ++f) {
+      if (std::strcmp(f->name, "USE_GRAPHS") == 0) {
+        has_graphs = true;
+        break;
+      }
+    }
+  }
+  if (has_graphs) {
+    LOG_INFO("[CUDA-GRAPHS-CHECK] compiled in: yes (GGML_CUDA_USE_GRAPHS "
+             "active in this binary)\n");
+  } else {
+    LOG_WARN("[CUDA-GRAPHS-CHECK] compiled in: NO -- this build silently "
+             "lacks CUDA graph capture/replay (GGML_CUDA_USE_GRAPHS was not "
+             "defined when ggml-cuda was compiled). Full-graph decode will "
+             "run every node as an individual cudaLaunchKernel instead of "
+             "one batched cudaGraphLaunch per token -- previously measured "
+             "cost: ~20 tok/s -> ~8 tok/s on this same decode path. Rebuild "
+             "with -DMOESTREAM_ENABLE_CUDA_GRAPHS=ON (the CMakeLists.txt "
+             "default) and verify with a fresh 'cmake -B <dir>' configure, "
+             "not just an incremental build in a stale build directory.\n");
+  }
+}
+
+// One-shot diagnostic (2026-09-19): dumps EVERY node the scheduler visits
+// (both CPU- and CUDA-backend, which layer_timing_eval_callback's normal
+// path skips entirely) for the FIRST decode token only, so the real
+// node/backend sequence around a CPU-dispatched MoE layer's boundary is
+// visible directly instead of guessed at from the undifferentiated
+// layer_timing_gap_ms_total bucket. See memory:
+// qwen4exp-phase2-gpu-branch-slower-than-cpu.md's own "not yet diagnosed"
+// note and the live investigation this answers.
+bool env_layer_timing_verbose() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING_VERBOSE");
+  return v && v[0] == '1';
+}
+
 // The merged gate/up representation is intentionally runtime-switchable while
 // its CUDA and CPU kernel cost is being compared with the established
 // three-projection graph.  It is opt-in until the doubled-row MUL_MAT_ID path
@@ -551,6 +619,48 @@ bool layer_timing_eval_callback(struct ggml_tensor *t, bool ask,
   FullGraph *g = static_cast<FullGraph *>(user_data);
   if (!g || !t)
     return true;
+  if (g->layer_timing_verbose_enabled && !g->layer_timing_verbose_dumped) {
+    // One-shot: log EVERY node (both backends), first decode token only,
+    // so the real node/backend sequence bordering a CPU-dispatched MoE
+    // layer is visible directly instead of inferred from the undiferen-
+    // tiated gap bucket. ask=true is logged with the gap since the last
+    // ask=false of ANY node (not just CPU ones, unlike the timing above)
+    // so a GPU-backend D2H/H2D copy sitting in that gap shows up as real
+    // elapsed time next to its own name/op/backend.
+    ggml_backend_t node_be = ggml_backend_sched_get_tensor_backend(g->sched, t);
+    const char *be_name = node_be == g->cpu ? "CPU"
+                          : node_be == g->cuda ? "CUDA"
+                                               : "?";
+    const auto vnow = std::chrono::steady_clock::now();
+    double gap_ms = 0.0;
+    if (g->layer_timing_verbose_have_last)
+      gap_ms = std::chrono::duration<double, std::milli>(
+                   vnow - g->layer_timing_verbose_last)
+                   .count();
+    auto vtag_it = g->layer_timing_layer_of.find(t);
+    char tag_buf[32] = "-";
+    if (vtag_it != g->layer_timing_layer_of.end())
+      std::snprintf(tag_buf, sizeof(tag_buf), "L%d/%s",
+                    vtag_it->second.first, vtag_it->second.second);
+    LOG_INFO("[GGML-QWEN-FULL-LAYER-TIMING-VERBOSE] ask=%d name=%s op=%s "
+             "backend=%s tag=%s since_last=%.4fms\n",
+             ask ? 1 : 0, ggml_get_name(t), ggml_op_name(t->op), be_name,
+             tag_buf, gap_ms);
+    g->layer_timing_verbose_last = vnow;
+    g->layer_timing_verbose_have_last = true;
+    if (!ask && g->n_layers > 0) {
+      // End-of-graph marker: the LAST node's ask=false has fired once we
+      // see the final layer's down-projection result. Token 1 is reliably
+      // JIT/warm-up-contaminated (confirmed: ~4ms MoE ops vs ~0.3-0.4ms
+      // steady-state) -- capture several tokens, not just one, so a real
+      // steady-state sample is available alongside the warm-up outlier.
+      if (t == g->output || t == g->logits) {
+        ++g->layer_timing_verbose_tokens_seen;
+        if (g->layer_timing_verbose_tokens_seen >= 10)
+          g->layer_timing_verbose_dumped = true;
+      }
+    }
+  }
   if (ggml_backend_sched_get_tensor_backend(g->sched, t) != g->cpu)
     return true; // GPU node or unassigned -- not timeable this way, skip
   const auto now = std::chrono::steady_clock::now();
@@ -3861,6 +3971,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->cpu = ggml_backend_cpu_init();
   if (!g->cuda || !g->cpu)
     return false;
+  verify_cuda_graphs_compiled_in(g->cuda);
   g->cpu_threads = graph_cpu_threads();
   ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
   ggml_threadpool_params cpu_tp_params =
@@ -3938,7 +4049,8 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
            graph_scheduler_parallel() ? "true" : "false",
            ggml_backend_sched_get_n_copies(g->sched));
   g->layer_timing_enabled = env_layer_timing_enabled();
-  if (g->layer_timing_enabled) {
+  g->layer_timing_verbose_enabled = env_layer_timing_verbose();
+  if (g->layer_timing_enabled || g->layer_timing_verbose_enabled) {
     g->layer_timing_cpu_ms.assign(static_cast<size_t>(g->n_layers), 0.0);
     ggml_backend_sched_set_eval_callback(g->sched, layer_timing_eval_callback,
                                          g.get());
@@ -4146,6 +4258,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     g->cpu = ggml_backend_cpu_init();
     if (!g->cuda || !g->cpu)
       return nullptr;
+    verify_cuda_graphs_compiled_in(g->cuda);
     g->cpu_threads = graph_cpu_threads();
     ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
     ggml_threadpool_params cpu_tp_params =
@@ -4209,7 +4322,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         graph_scheduler_parallel() ? "true" : "false",
         ggml_backend_sched_get_n_copies(g->sched));
     g->layer_timing_enabled = env_layer_timing_enabled();
-    if (g->layer_timing_enabled) {
+    g->layer_timing_verbose_enabled = env_layer_timing_verbose();
+    if (g->layer_timing_enabled || g->layer_timing_verbose_enabled) {
       g->layer_timing_cpu_ms.assign(static_cast<size_t>(g->n_layers), 0.0);
       ggml_backend_sched_set_eval_callback(g->sched, layer_timing_eval_callback,
                                            g.get());
