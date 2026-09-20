@@ -597,7 +597,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       !batched_handled && S == 1 && topk > 0 && n_experts > 0 &&
       engine.qwen4exp_option_b_committed &&
       engine.family_ops.family == ModelFamily::Qwen4Exp &&
-      layer_idx == engine.qwen4exp_option_b_layer;
+      engine.qwen4exp_option_b_layer_enabled(layer_idx);
   bool option_b_shared_started = false;
   const void *option_b_shared_only_output = nullptr;
   if (option_b_target && engine.qwen4exp_cpu_gpu_overlap &&

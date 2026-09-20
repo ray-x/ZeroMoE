@@ -2886,6 +2886,22 @@ public:
                                                 bool speculative = false, int target_gpu_id = -1,
                                                 int64_t qwen_pilot_prediction_ns = -1);
 
+    // Single-slot Layer-13 proof path.  The graph-RAM arena is projection
+    // compact, so the three pinned DDR planes are copied into one active
+    // slot as [gate | up | down] on the dedicated active-layer stream.  The
+    // completion event is recorded after all three DMA legs; callers fence
+    // the GGML CUDA stream with slot->upload_event and never synchronize the
+    // host before graph submission.
+    ExpertLocation* upload_expert_active_projections_async(
+        int layer, int expert_id, const uint8_t * gate_data, size_t gate_bytes,
+        const uint8_t * up_data, size_t up_bytes, const uint8_t * down_data,
+        size_t down_bytes, int target_gpu_id = -1);
+
+    // Called only after the graph stream has completed the dependent work.
+    // This publishes the slot for the next proof transfer without adding a
+    // second host-side wait on the active-layer stream.
+    void complete_active_layer_upload_after_compute(ExpertLocation *slot);
+
     // 2026-08-28: victim-selection ONLY, no copy -- for ActiveLayerUploadWorkers
     // (active_layer_upload_workers.hpp), which does the actual register+
     // cudaMemcpyAsync+cudaEventRecord on a background worker thread instead

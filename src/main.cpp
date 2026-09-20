@@ -387,6 +387,14 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_option_b_top_n = config.qwen4exp_option_b_top_n;
   engine.qwen4exp_option_b_min_coverage =
       config.qwen4exp_option_b_min_coverage;
+  engine.qwen4exp_option_b_max_layers = config.qwen4exp_option_b_max_layers;
+  engine.qwen4exp_option_b_fill_vram = config.qwen4exp_option_b_fill_vram;
+  engine.qwen4exp_option_b_concentrated_only =
+      config.qwen4exp_option_b_concentrated_only;
+  engine.qwen4exp_option_b_stage_expert =
+      config.qwen4exp_option_b_stage_expert;
+  engine.qwen4exp_option_b_stage_count =
+      config.qwen4exp_option_b_stage_count;
   qwen4exp_full_graph_configure(config.qwen4exp_full_graph,
                                 config.qwen4exp_full_graph_decode);
   ram_mgr.configured_total_experts =
@@ -1042,7 +1050,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         << kGraphRamCacheFallbackVramGb
         << " GiB -- see this call site's "
            "own comment for the two real incidents this guards against)\n";
-    if (fallback_gb <= 0.0) {
+    const bool option_b_stage_enabled =
+        config.qwen4exp_option_b_stage_expert >= 0;
+    if (fallback_gb <= 0.0 && !option_b_stage_enabled) {
       // This graph-only fallback is allowed to have no legacy cache.  Keep
       // the temporary active-layer pool off too; otherwise it would consume
       // another ~0.2 GB after the explicit zero-cache decision and could
@@ -1055,6 +1065,18 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           "decode step will pay the CPU-fallback dispatch cost. Lower "
           "device_expert_layers if decode throughput matters for this run.\n",
           dev_layers, kGraphOverheadReserveGb);
+    } else if (fallback_gb <= 0.0 && option_b_stage_enabled) {
+      // The Layer-13 proof needs one slot per concurrently staged expert.
+      // These are small active-layer slabs, not the legacy cache, and fit in
+      // the residual headroom even when the generic graph fallback
+      // intentionally clamps that cache to zero.
+      fallback_config.use_active_layer_area = true;
+      fallback_config.active_layer_capacity = std::max(
+          1, std::max(fallback_config.active_layer_capacity,
+                      config.qwen4exp_option_b_stage_count));
+      LOG_INFO("[GPU] Retaining %d active-layer slot(s) for the explicit "
+               "Layer-13 staging proof despite zero legacy-cache fallback\n",
+               fallback_config.active_layer_capacity);
     }
     gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, fallback_config,
                            expert_layer_slab_bytes, fallback_gb <= 0.0);
@@ -2314,52 +2336,169 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       // that drives startup RAM/VRAM preload.  Keep membership in an O(1)
       // device-dispatch-side mask so cold routes can be forced to the CPU
       // without another histogram lookup in the token loop.
-      if (config.qwen4exp_option_b_layer >= 0 &&
-          config.qwen4exp_option_b_top_n > 0 &&
-          config.qwen4exp_option_b_layer <
-              (int)engine.layers_experts.size()) {
-        const int layer = config.qwen4exp_option_b_layer;
+      //
+      // In concentrated-only mode, qwen4exp_option_b_layer=-1 means:
+      // inspect every layer in pin_file and commit only layers whose top-N
+      // experts meet the requested historical coverage.  The baseline's
+      // complete GPU block is excluded; Option B is an augmentation for the
+      // CPU-side layers, not a reason to replace already-resident weights.
+      engine.qwen4exp_option_b_hot_mask.clear();
+      engine.qwen4exp_option_b_hot_masks.clear();
+      engine.qwen4exp_option_b_layers.clear();
+      engine.qwen4exp_option_b_layer_coverage.clear();
+      engine.qwen4exp_option_b_committed = false;
+      if (config.qwen4exp_option_b_top_n > 0) {
         const int n_experts = engine.model_file.architecture_config.n_experts;
-        auto it = by_layer.find(layer);
-        if (it != by_layer.end() && n_experts > 0) {
-          auto &ranked = it->second;
-          std::stable_sort(
-              ranked.begin(), ranked.end(),
-              [](const auto &a, const auto &b) {
-                if (a.count != b.count)
-                  return a.count > b.count;
-                return a.expert < b.expert;
-              });
-          engine.qwen4exp_option_b_hot_mask.assign(
-              static_cast<size_t>(n_experts), 0);
-          const int hot_n = std::min(config.qwen4exp_option_b_top_n,
-                                     n_experts);
+        const int n_layers = static_cast<int>(engine.layers_experts.size());
+        const int baseline_gpu_layers = std::min(
+            std::max(0, qwen4exp_full_graph_device_expert_layers()), n_layers);
+        const bool baseline_gpu_trailing =
+            qwen4exp_full_graph_device_expert_trailing();
+        auto baseline_gpu_layer = [&](int layer) {
+          if (baseline_gpu_layers <= 0)
+            return false;
+          return baseline_gpu_trailing
+                     ? layer >= n_layers - baseline_gpu_layers
+                     : layer < baseline_gpu_layers;
+        };
+
+        std::vector<int> option_layers;
+        if (config.qwen4exp_option_b_layer >= 0) {
+          option_layers.push_back(config.qwen4exp_option_b_layer);
+        } else if (!config.qwen4exp_option_b_selected_layers.empty()) {
+          option_layers = config.qwen4exp_option_b_selected_layers;
+        } else if (config.qwen4exp_option_b_concentrated_only) {
+          option_layers.reserve(by_layer.size());
+          for (const auto &[layer, entries_for_layer] : by_layer) {
+            (void)entries_for_layer;
+            option_layers.push_back(layer);
+          }
+          std::sort(option_layers.begin(), option_layers.end());
+        }
+
+        const int hot_n = std::min(config.qwen4exp_option_b_top_n,
+                                   n_experts);
+        if (config.qwen4exp_option_b_selected_layers.empty() &&
+            config.qwen4exp_option_b_concentrated_only &&
+            config.qwen4exp_option_b_max_layers > 0 && hot_n > 0) {
+          auto coverage_for_layer = [&](int layer) {
+            std::vector<uint64_t> counts(static_cast<size_t>(n_experts), 0);
+            auto it = by_layer.find(layer);
+            if (it != by_layer.end()) {
+              for (const auto &entry : it->second) {
+                if (entry.expert >= 0 && entry.expert < n_experts)
+                  counts[static_cast<size_t>(entry.expert)] += entry.count;
+              }
+            }
+            uint64_t total = 0;
+            for (uint64_t count : counts)
+              total += count;
+            std::sort(counts.begin(), counts.end(), std::greater<uint64_t>());
+            uint64_t covered = 0;
+            for (int i = 0; i < hot_n; ++i)
+              covered += counts[static_cast<size_t>(i)];
+            return total == 0
+                       ? 0.0
+                       : static_cast<double>(covered) /
+                             static_cast<double>(total);
+          };
+          std::stable_sort(option_layers.begin(), option_layers.end(),
+                           [&](int a, int b) {
+                             const double ca = coverage_for_layer(a);
+                             const double cb = coverage_for_layer(b);
+                             if (ca != cb)
+                               return ca > cb;
+                             return a < b;
+                           });
+          if (static_cast<int>(option_layers.size()) >
+              config.qwen4exp_option_b_max_layers)
+            option_layers.resize(
+                static_cast<size_t>(config.qwen4exp_option_b_max_layers));
+          LOG_STREAM_INFO()
+              << "[OPTION-B] concentrated-only layer selection ranked top-"
+              << option_layers.size() << " by top-" << hot_n
+              << " traffic coverage (cap="
+              << config.qwen4exp_option_b_max_layers << ")\n";
+        }
+        for (int layer : option_layers) {
+          if (layer < 0 || layer >= n_layers || n_experts <= 0)
+            continue;
+          if (baseline_gpu_layer(layer)) {
+            LOG_STREAM_INFO()
+                << "[OPTION-B] Layer " << layer
+                << " skipped: already covered by the complete GPU block\n";
+            continue;
+          }
+
+          std::vector<uint64_t> counts(static_cast<size_t>(n_experts), 0);
+          auto it = by_layer.find(layer);
+          if (it != by_layer.end()) {
+            for (const auto &entry : it->second) {
+              if (entry.expert >= 0 && entry.expert < n_experts)
+                counts[static_cast<size_t>(entry.expert)] += entry.count;
+            }
+          }
+          std::vector<int> ranked_ids(static_cast<size_t>(n_experts));
+          for (int expert = 0; expert < n_experts; ++expert)
+            ranked_ids[static_cast<size_t>(expert)] = expert;
+          std::stable_sort(ranked_ids.begin(), ranked_ids.end(),
+                           [&](int a, int b) {
+                             if (counts[static_cast<size_t>(a)] !=
+                                 counts[static_cast<size_t>(b)])
+                               return counts[static_cast<size_t>(a)] >
+                                      counts[static_cast<size_t>(b)];
+                             return a < b;
+                           });
+
           uint64_t total_count = 0, hot_count = 0;
-          for (const auto &entry : ranked)
-            if (entry.expert >= 0 && entry.expert < n_experts)
-              total_count += entry.count;
-          for (int i = 0; i < hot_n && i < (int)ranked.size(); ++i) {
-            const int expert = ranked[(size_t)i].expert;
-            if (expert < 0 || expert >= n_experts)
-              continue;
-            engine.qwen4exp_option_b_hot_mask[(size_t)expert] = 1;
-            hot_count += ranked[(size_t)i].count;
+          for (uint64_t count : counts)
+            total_count += count;
+          std::vector<uint8_t> hot_mask(static_cast<size_t>(n_experts), 0);
+          for (int i = 0; i < hot_n; ++i) {
+            const int expert = ranked_ids[static_cast<size_t>(i)];
+            hot_mask[static_cast<size_t>(expert)] = 1;
+            hot_count += counts[static_cast<size_t>(expert)];
           }
           const double coverage =
               total_count == 0
                   ? 0.0
                   : static_cast<double>(hot_count) /
                         static_cast<double>(total_count);
-          engine.qwen4exp_option_b_committed =
+          const bool meets_coverage =
               total_count > 0 &&
               coverage >= config.qwen4exp_option_b_min_coverage;
+          if (!meets_coverage) {
+            LOG_STREAM_INFO()
+                << "[OPTION-B] Layer " << layer
+                << " remains CPU/DDR: top-" << hot_n
+                << " coverage=" << (coverage * 100.0)
+                << "% threshold="
+                << (config.qwen4exp_option_b_min_coverage * 100.0) << "%\n";
+            continue;
+          }
+
+          engine.qwen4exp_option_b_hot_masks[layer] = hot_mask;
+          engine.qwen4exp_option_b_layers.push_back(layer);
+          engine.qwen4exp_option_b_layer_coverage[layer] = coverage;
+          if (layer == config.qwen4exp_option_b_layer)
+            engine.qwen4exp_option_b_hot_mask = hot_mask;
           LOG_STREAM_INFO()
-              << "[OPTION-B] Layer " << layer << " static hot set: "
-              << (engine.qwen4exp_option_b_committed ? "committed" : "disabled")
+              << "[OPTION-B] Layer " << layer << " static hot set: committed"
               << " hot=" << hot_n << " cold=" << (n_experts - hot_n)
               << " history coverage=" << (coverage * 100.0)
               << "% threshold="
               << (config.qwen4exp_option_b_min_coverage * 100.0) << "%\n";
+        }
+        std::sort(engine.qwen4exp_option_b_layers.begin(),
+                  engine.qwen4exp_option_b_layers.end());
+        engine.qwen4exp_option_b_committed =
+            !engine.qwen4exp_option_b_layers.empty();
+        if (config.qwen4exp_option_b_concentrated_only &&
+            config.qwen4exp_option_b_layer < 0) {
+          LOG_STREAM_INFO()
+              << "[OPTION-B] concentrated-only selection committed "
+              << engine.qwen4exp_option_b_layers.size()
+              << " CPU-side layer(s) from " << config.pin_file << "\n";
         }
       }
 
@@ -2900,7 +3039,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
             engine.qwen4exp_option_b_committed &&
             config.qwen4exp_option_b_top_n > 0;
         const bool option_b_target =
-            option_b_active && layer == config.qwen4exp_option_b_layer;
+            option_b_active && engine.qwen4exp_option_b_layer_enabled(layer);
+        const bool option_b_graph_target =
+            option_b_target && graph_mode && graph_ram_cache;
         int layer_vram_lru_n =
             (cpu_affinity || prefix_vram || option_b_target) ? 0
                                                              : vram_lru_n;
@@ -2913,7 +3054,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         if (cpu_affinity || (option_b_active && !option_b_target)) {
           layer_max = 0;
         } else if (option_b_target) {
-          layer_max = std::min(config.qwen4exp_option_b_top_n, n);
+          // The full graph owns the selected hot experts in its compact
+          // device arena. Do not also try to upload them through the legacy
+          // cache (which is normally zero-capacity in the 22/26 topology).
+          layer_max = option_b_graph_target
+                          ? 0
+                          : std::min(config.qwen4exp_option_b_top_n, n);
         } else if (global_topn || prefix_vram) {
           layer_max = layer_pin_count[layer];
         } else {

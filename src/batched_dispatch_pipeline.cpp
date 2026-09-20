@@ -2439,8 +2439,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       (qwen_decode_grouped_device || qwen_decode_grouped_host) &&
       clamp_exp == 0.0f && !is_cpu_affinity_layer(layer_idx) &&
       ram_mgr.vram_cache &&
-      !(engine.qwen4exp_option_b_committed &&
-        layer_idx == engine.qwen4exp_option_b_layer)) {
+      !engine.qwen4exp_option_b_layer_enabled(layer_idx)) {
     std::vector<int> used;
     used.reserve((size_t)n_experts);
     for (int e = 0; e < n_experts; ++e)

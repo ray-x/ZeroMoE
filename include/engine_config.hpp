@@ -606,6 +606,28 @@ struct EngineConfig {
   int qwen4exp_option_b_layer = -1;
   int qwen4exp_option_b_top_n = 0;
   float qwen4exp_option_b_min_coverage = 0.80f;
+  // Optional explicit layer allow-list for the multi-layer Option B test.
+  // When non-empty, only these CPU-side layers receive the static hot set;
+  // expert ranking within each selected layer still comes from pin_file.
+  std::vector<int> qwen4exp_option_b_selected_layers;
+  // In concentrated-only mode, cap the number of automatically selected
+  // layers after ranking them by top-N historical traffic coverage.
+  int qwen4exp_option_b_max_layers = 0;
+  // Start selected layers at top_n and use remaining graph-arena capacity for
+  // additional lower-ranked experts, subject to the VRAM safety floor.
+  bool qwen4exp_option_b_fill_vram = false;
+  // When true and qwen4exp_option_b_layer is -1, rank every layer from
+  // pin_file and apply Option B only where top_n experts cover at least the
+  // requested historical route share. Flat layers remain on the CPU path.
+  bool qwen4exp_option_b_concentrated_only = false;
+  // Layer-13 single-slot staging proof.  -1 keeps Option B byte-identical;
+  // a non-negative expert is appended to the static GPU split and refreshed
+  // from the pinned DDR arena before each decode graph replay.
+  int qwen4exp_option_b_stage_expert = -1;
+  // Number of cold experts to force into the active-layer proof.  The
+  // default preserves the original one-slot laboratory; values up to the
+  // model top-k are useful for stressing concurrent H2D staging.
+  int qwen4exp_option_b_stage_count = 1;
 
   // Configurable full-graph switches.  Environment variables remain valid
   // overrides for existing A/B scripts; these fields make the master-based
@@ -2479,6 +2501,19 @@ inline bool EngineConfig::load(const std::string &path) {
       "qwen4exp_option_b_top_n", qwen4exp_option_b_top_n);
   qwen4exp_option_b_min_coverage = doc.root.get_float(
       "qwen4exp_option_b_min_coverage", qwen4exp_option_b_min_coverage);
+  qwen4exp_option_b_selected_layers = doc.root.get_int_array(
+      "qwen4exp_option_b_selected_layers");
+  qwen4exp_option_b_max_layers = (int)doc.root.get_int(
+      "qwen4exp_option_b_max_layers", qwen4exp_option_b_max_layers);
+  qwen4exp_option_b_fill_vram = doc.root.get_bool(
+      "qwen4exp_option_b_fill_vram", qwen4exp_option_b_fill_vram);
+  qwen4exp_option_b_concentrated_only = doc.root.get_bool(
+      "qwen4exp_option_b_concentrated_only",
+      qwen4exp_option_b_concentrated_only);
+  qwen4exp_option_b_stage_expert = (int)doc.root.get_int(
+      "qwen4exp_option_b_stage_expert", qwen4exp_option_b_stage_expert);
+  qwen4exp_option_b_stage_count = (int)doc.root.get_int(
+      "qwen4exp_option_b_stage_count", qwen4exp_option_b_stage_count);
   qwen4exp_full_graph =
       doc.root.get_bool("qwen4exp_full_graph", qwen4exp_full_graph);
   qwen4exp_full_graph_decode = doc.root.get_bool(
@@ -2493,12 +2528,30 @@ inline bool EngineConfig::load(const std::string &path) {
              qwen4exp_option_b_top_n);
     qwen4exp_option_b_top_n = 0;
   }
+  if (qwen4exp_option_b_max_layers < 0) {
+    LOG_WARN("[CONFIG] qwen4exp_option_b_max_layers=%d is invalid -- "
+             "disabling the layer cap\n",
+             qwen4exp_option_b_max_layers);
+    qwen4exp_option_b_max_layers = 0;
+  }
   if (qwen4exp_option_b_min_coverage < 0.0f ||
       qwen4exp_option_b_min_coverage > 1.0f) {
     LOG_WARN("[CONFIG] qwen4exp_option_b_min_coverage=%.3f is invalid -- "
              "using 0.80\n",
              qwen4exp_option_b_min_coverage);
     qwen4exp_option_b_min_coverage = 0.80f;
+  }
+  if (qwen4exp_option_b_stage_expert < -1) {
+    LOG_WARN("[CONFIG] qwen4exp_option_b_stage_expert=%d is invalid -- "
+             "disabling single-slot staging proof\n",
+             qwen4exp_option_b_stage_expert);
+    qwen4exp_option_b_stage_expert = -1;
+  }
+  if (qwen4exp_option_b_stage_count < 1) {
+    LOG_WARN("[CONFIG] qwen4exp_option_b_stage_count=%d is invalid -- "
+             "using one staged expert\n",
+             qwen4exp_option_b_stage_count);
+    qwen4exp_option_b_stage_count = 1;
   }
   cpu_offload_max_experts =
       doc.root.get_int("cpu_offload_max_experts", cpu_offload_max_experts);

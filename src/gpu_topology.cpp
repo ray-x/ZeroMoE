@@ -929,6 +929,132 @@ ExpertLocation* GpuTopology::claim_active_layer_slot_for_worker(int layer, int e
     return victim;
 }
 
+ExpertLocation *GpuTopology::upload_expert_active_projections_async(
+    int layer, int expert_id, const uint8_t *gate_data, size_t gate_bytes,
+    const uint8_t *up_data, size_t up_bytes, const uint8_t *down_data,
+    size_t down_bytes, int target_gpu_id) {
+    if (!active_layer_pool || active_layer_capacity == 0 || !gate_data ||
+        !up_data || !down_data || gate_bytes == 0 || up_bytes == 0 ||
+        down_bytes == 0 || gate_bytes > SIZE_MAX - up_bytes ||
+        gate_bytes + up_bytes > SIZE_MAX - down_bytes)
+        return nullptr;
+
+    const size_t total_bytes = gate_bytes + up_bytes + down_bytes;
+    GPU_TOPO_TIMED_LOCK(lock);
+
+    ExpertLocation *victim = nullptr;
+    for (auto &slot : active_layer_slots) {
+        if (target_gpu_id >= 0 && slot.gpu_id != target_gpu_id)
+            continue;
+        if (slot.temp_pin_count > 0)
+            continue;
+        if (slot.layer_idx == -1) {
+            victim = &slot;
+            break;
+        }
+        if (!victim || slot.preferred_victim_over(*victim))
+            victim = &slot;
+    }
+    if (!victim || total_bytes > victim->size) {
+        if (victim) {
+            LOG_STREAM_ERROR()
+                << "[OPTION-B-STAGE] Layer " << layer << " expert "
+                << expert_id << " needs " << total_bytes
+                << " bytes but active slot capacity is " << victim->size
+                << "\n";
+        }
+        return nullptr;
+    }
+
+    cudaSetDevice(victim->gpu_id);
+    auto &dev = devices[victim->gpu_id];
+    if (victim->upload_timing_pending && victim->upload_event &&
+        cudaEventQuery(victim->upload_event) == cudaSuccess)
+        record_active_layer_upload_event_timing(*victim, false);
+    cudaGetLastError();
+
+    cudaPointerAttributes attr{};
+    cudaError_t attr_err = cudaPointerGetAttributes(&attr, gate_data);
+    const bool source_pinned =
+        attr_err == cudaSuccess && attr.type == cudaMemoryTypeHost;
+    cudaGetLastError();
+
+    victim->last_upload_bytes = total_bytes;
+    victim->qwen_pilot_prediction_ns = -1;
+    victim->qwen_pilot_issue_ns = -1;
+    victim->upload_timing_pending = false;
+    victim->upload_timing_recorded = false;
+    victim->upload_timing_async = true;
+    victim->upload_source_pinned = source_pinned;
+    victim->copy_dispatched = true;
+    const cudaStream_t issue_stream = dev.active_layer_stream;
+    if (!issue_stream)
+        return nullptr;
+    if (victim->upload_start_event)
+        cudaEventRecord(victim->upload_start_event, issue_stream);
+    cudaError_t err = cudaMemcpyAsync(victim->device_ptr, gate_data,
+                                      gate_bytes, cudaMemcpyHostToDevice,
+                                      issue_stream);
+    if (err == cudaSuccess)
+        err = cudaMemcpyAsync(victim->device_ptr + gate_bytes, up_data,
+                              up_bytes, cudaMemcpyHostToDevice, issue_stream);
+    if (err == cudaSuccess)
+        err = cudaMemcpyAsync(victim->device_ptr + gate_bytes + up_bytes,
+                              down_data, down_bytes, cudaMemcpyHostToDevice,
+                              issue_stream);
+    if (err != cudaSuccess) {
+        LOG_STREAM_ERROR() << "[OPTION-B-STAGE] async projection upload failed: "
+                           << cudaGetErrorString(err) << "\n";
+        cudaGetLastError();
+        return nullptr;
+    }
+    if (victim->upload_event)
+        cudaEventRecord(victim->upload_event, issue_stream);
+    victim->upload_timing_pending = victim->upload_start_event &&
+                                    victim->upload_event;
+
+    record_active_layer_prewarm_reclaim(*victim);
+    victim->temp_pin_count++;
+    victim->layer_idx = layer;
+    victim->expert_id = expert_id;
+    victim->last_used_clock = ++cache_clock;
+    victim->hit_count = 0;
+    victim->upload_ready = false;
+    victim->was_async_prewarmed = false;
+    victim->pilot_speculative_fill = false;
+    victim->prewarm_skip_next_promote = true;
+
+    perf().bytes_active_layer_upload_async.fetch_add(
+        (int64_t)total_bytes, std::memory_order_relaxed);
+    if (victim->gpu_id >= 0 &&
+        (size_t)victim->gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS) {
+        perf().bytes_h2d_upload_by_gpu[victim->gpu_id].fetch_add(
+            (int64_t)total_bytes, std::memory_order_relaxed);
+        perf().n_h2d_upload_by_gpu[victim->gpu_id].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    LOG_INFO("[OPTION-B-STAGE] queued Layer %d expert %d projections: "
+             "%.3f MiB source=%s gpu=%d\n",
+             layer, expert_id, (double)total_bytes / (1024.0 * 1024.0),
+             source_pinned ? "pinned" : "pageable", victim->gpu_id);
+    return victim;
+}
+
+void GpuTopology::complete_active_layer_upload_after_compute(
+    ExpertLocation *slot) {
+    if (!slot)
+        return;
+    cudaSetDevice(slot->gpu_id);
+    if (slot->upload_timing_pending && slot->upload_event &&
+        cudaEventQuery(slot->upload_event) == cudaSuccess)
+        record_active_layer_upload_event_timing(*slot, false);
+    cudaGetLastError();
+    GPU_TOPO_TIMED_LOCK(lock);
+    slot->upload_ready = true;
+    if (slot->temp_pin_count > 0)
+        slot->temp_pin_count--;
+}
+
 void GpuTopology::sync_active_layer_batch(const std::vector<ExpertLocation*>& victims) {
     if (victims.empty()) return;
     // 2026-08-28: with multi-GPU active-layer routing, a single batch CAN

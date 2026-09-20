@@ -2806,13 +2806,14 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
   // it from a caller that already owns another grouped-kernel scratch area;
   // the previous IQ2/3 TLS experiment demonstrated that aliasing nested
   // callers is not worth the small allocation saving.
-  // Decode invokes this fused kernel once for every CPU-routed layer. Keep
-  // the quantized activation and down-projection scratch on the calling
-  // thread so the repeated layer/token calls do not allocate two vectors
-  // each time. thread_local keeps this safe if independent request threads
-  // enter the model concurrently.
+  // The scratch must be shared by the OpenMP team: worker code accesses the
+  // down-input vector after the gate/up phase.  A thread_local vector here is
+  // incorrect because each worker would see a different, unresized vector.
+  // Keep input_q thread-local only because workers consume its captured data
+  // pointer; make down_input_q invocation-local and therefore shared and safe
+  // for independent request threads.
   static thread_local std::vector<moestream_ggml_block_q8_K> input_q;
-  static thread_local std::vector<block_q8_0> down_input_q;
+  std::vector<block_q8_0> down_input_q;
   input_q.resize(static_cast<size_t>(input_blocks));
   down_input_q.resize(static_cast<size_t>(n_matrices) * down_blocks);
   const bool stage_timing = qwen_cpu_stage_timing_enabled_local();
@@ -2859,9 +2860,21 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
     for (int m = 0; m < n_matrices; ++m) {
       silu_inplace(gate_y[m], gate_O);
       elem_mul(gate_y[m], gate_y[m], up_y[m], gate_O);
-      quantize_row_q8_0(
-          gate_y[m], down_input_q.data() + static_cast<size_t>(m) * down_blocks,
-          gate_O);
+    }
+
+    // GGML's optimized Q8_0 quantizer is not safe to enter concurrently from
+    // this fused OpenMP team on all CPU builds.  The rows are tiny at decode
+    // time, so keep the elementwise SwiGLU parallel and make only the
+    // post-SwiGLU quantization single-owner.  This removes the latent worker
+    // crash without serializing either projection GEMV or the down GEMV.
+#pragma omp barrier
+#pragma omp single
+    {
+      for (int m = 0; m < n_matrices; ++m)
+        quantize_row_q8_0(
+            gate_y[m],
+            down_input_q.data() + static_cast<size_t>(m) * down_blocks,
+            gate_O);
     }
 
     if (stage_timing) {
@@ -2935,7 +2948,7 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
   // the two small heap allocations that would otherwise occur for every
   // IQ2_XXS fused layer invocation.
   static thread_local std::vector<moestream_ggml_block_q8_K> input_q;
-  static thread_local std::vector<block_q8_0> down_input_q;
+  std::vector<block_q8_0> down_input_q;
   input_q.resize(static_cast<size_t>(input_blocks));
   down_input_q.resize(static_cast<size_t>(n_matrices) * down_blocks);
   const bool stage_timing = qwen_cpu_stage_timing_enabled_local();
@@ -2978,9 +2991,16 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
     for (int m = 0; m < n_matrices; ++m) {
       silu_inplace(gate_y[m], gate_O);
       elem_mul(gate_y[m], gate_y[m], up_y[m], gate_O);
-      quantize_row_q8_0(
-          gate_y[m], down_input_q.data() + static_cast<size_t>(m) * down_blocks,
-          gate_O);
+    }
+
+#pragma omp barrier
+#pragma omp single
+    {
+      for (int m = 0; m < n_matrices; ++m)
+        quantize_row_q8_0(
+            gate_y[m],
+            down_input_q.data() + static_cast<size_t>(m) * down_blocks,
+            gate_O);
     }
 
     if (stage_timing) {

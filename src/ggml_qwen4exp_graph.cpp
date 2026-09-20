@@ -11,6 +11,7 @@
 #include "ggml_qwen4exp_graph.hpp"
 
 #include "dense_dispatch.hpp" // is_cpu_affinity_layer (cpu_affinity_layers config)
+#include "cuda_manager.hpp"
 #include "direct_io.hpp"
 #include "engine.hpp"
 #include "ggml_moe_backend.hpp"
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -45,6 +47,9 @@
 #endif
 
 namespace {
+
+extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+    ggml_backend_t backend);
 
 constexpr int kGraphSize = 50000;
 constexpr size_t kTensorContextBytes = 128ull * 1024ull * 1024ull;
@@ -178,6 +183,48 @@ struct FullGraph {
   // already claim. Empty/absent entry = no split for that layer (today's
   // behavior, unchanged). v1 scope: decode only (S==1) -- see build_moe.
   std::unordered_map<int, std::vector<int>> split_gpu_expert_ids;
+  // Layer-13 staging proof. The graph keeps fixed compact GPU tensors; each
+  // decode token refreshes one or more cold expert records from the
+  // active-layer pool before graph replay.
+  bool stage_enabled = false;
+  bool stage_route_logged = false;
+  int stage_layer = -1;
+  int stage_expert = -1;
+  int stage_local_index = -1;
+  struct StageBinding {
+    int expert = -1;
+    int local_index = -1;
+    const uint8_t *src_gate = nullptr;
+    const uint8_t *src_up = nullptr;
+    const uint8_t *src_down = nullptr;
+    size_t gate_bytes = 0;
+    size_t up_bytes = 0;
+    size_t down_bytes = 0;
+    uint8_t *dst_gate = nullptr;
+    uint8_t *dst_up = nullptr;
+    uint8_t *dst_down = nullptr;
+    ExpertLocation *slot = nullptr;
+  };
+  std::vector<int> stage_experts;
+  std::vector<StageBinding> stage_bindings;
+  std::vector<ExpertLocation *> stage_slots;
+  const uint8_t *stage_src_gate = nullptr;
+  const uint8_t *stage_src_up = nullptr;
+  const uint8_t *stage_src_down = nullptr;
+  size_t stage_gate_bytes = 0;
+  size_t stage_up_bytes = 0;
+  size_t stage_down_bytes = 0;
+  uint8_t *stage_dst_gate = nullptr;
+  uint8_t *stage_dst_up = nullptr;
+  uint8_t *stage_dst_down = nullptr;
+  ExpertLocation *stage_slot = nullptr;
+  cudaEvent_t stage_wait_done_event = nullptr;
+  cudaEvent_t stage_wait_start_event = nullptr;
+  cudaEvent_t stage_d2d_start_event = nullptr;
+  cudaEvent_t stage_d2d_end_event = nullptr;
+  cudaEvent_t stage_compute_start_event = nullptr;
+  cudaEvent_t stage_compute_end_event = nullptr;
+  ggml_tensor *stage_route_ids = nullptr;
   // Phase 1 partial-layer dispatch: prefill-only, non-null exactly when
   // this graph is building engine->qwen4exp_partial_layer's MoE block
   // during a non-decode (S>1) build. Marked as a graph output so
@@ -299,6 +346,36 @@ struct FullGraph {
       ggml_backend_sched_free(sched);
       sched = nullptr;
     }
+    if (stage_wait_done_event || stage_wait_start_event ||
+        stage_d2d_start_event ||
+        stage_d2d_end_event || stage_compute_start_event ||
+        stage_compute_end_event) {
+      cudaSetDevice(device);
+      if (stage_wait_done_event)
+        cudaEventDestroy(stage_wait_done_event);
+      if (stage_wait_start_event)
+        cudaEventDestroy(stage_wait_start_event);
+      if (stage_d2d_start_event)
+        cudaEventDestroy(stage_d2d_start_event);
+      if (stage_d2d_end_event)
+        cudaEventDestroy(stage_d2d_end_event);
+      if (stage_compute_start_event)
+        cudaEventDestroy(stage_compute_start_event);
+      if (stage_compute_end_event)
+        cudaEventDestroy(stage_compute_end_event);
+    }
+    stage_wait_done_event = nullptr;
+    stage_wait_start_event = nullptr;
+    stage_d2d_start_event = nullptr;
+    stage_d2d_end_event = nullptr;
+    stage_compute_start_event = nullptr;
+    stage_compute_end_event = nullptr;
+    stage_slot = nullptr;
+    stage_slots.clear();
+    stage_bindings.clear();
+    stage_experts.clear();
+    stage_route_ids = nullptr;
+    stage_enabled = false;
     if (cpu && cpu_threadpool)
       ggml_backend_cpu_set_threadpool(cpu, nullptr);
     if (cpu_threadpool) {
@@ -1183,24 +1260,21 @@ void plan_expert_vram_split(FullGraph &g) {
   if (g.S != 1)
     return;
 
-  // Option B is intentionally a narrow, deterministic plan: one target
-  // layer, one static hot set, and the complementary experts left in the
-  // fixed-stride DDR arena.  This uses the same persisted routing histogram
-  // as the existing global-budget planner, but it does not spend the
-  // budget across unrelated layers and it does not rely on a per-token
-  // route readback.  The split-aware build_moe() path below computes the
-  // hot GPU branch and cold CPU branch as one graph, preserving the full
-  // routed result for every route ID.
+  // Option B is a deterministic usage-driven plan: a static hot set per
+  // selected layer, with complementary experts left in the fixed-stride DDR
+  // arena.  In concentrated-only mode the selected layers were chosen from
+  // the usage histogram by the startup preload pass.  The graph repeats the
+  // eligibility checks here because this is the final owner of the CUDA
+  // arena layout and must never split a layer already covered by the complete
+  // baseline GPU block.
   const int option_layer = g.engine->qwen4exp_option_b_layer;
   const int option_top_n = g.engine->qwen4exp_option_b_top_n;
-  if (option_layer >= 0 && option_top_n > 0) {
+  const bool option_b_auto =
+      g.engine->qwen4exp_option_b_concentrated_only && option_layer < 0;
+  if (option_top_n > 0 &&
+      (option_layer >= 0 || option_b_auto ||
+       !g.engine->qwen4exp_option_b_layers.empty())) {
     const auto &c = g.engine->model_file.architecture_config;
-    if (option_layer >= c.n_layers || c.n_experts <= 0) {
-      LOG_WARN("[OPTION-B] invalid target layer=%d (layers=%d); static split "
-               "disabled\n",
-               option_layer, c.n_layers);
-      return;
-    }
 
     const std::string path = g.engine->qwen4exp_graph_pin_file.empty()
                                  ? std::string(".moestream_usage")
@@ -1213,64 +1287,131 @@ void plan_expert_vram_split(FullGraph &g) {
       return;
     }
 
-    // Usage files normally contain one row per expert, but aggregate rather
-    // than trusting that format. Zero-count experts are included so a
-    // top-N request really means N out of the model's complete 512-expert
-    // domain, not merely N of the experts seen in an earlier run.
-    std::vector<uint64_t> counts(static_cast<size_t>(c.n_experts), 0);
-    for (const auto &e : entries) {
-      if (e.layer != option_layer || e.expert < 0 ||
-          e.expert >= c.n_experts)
+    std::vector<int> option_layers = g.engine->qwen4exp_option_b_layers;
+    if (option_layer >= 0)
+      option_layers = {option_layer};
+    else if (option_layers.empty() && option_b_auto) {
+      option_layers.reserve(static_cast<size_t>(c.n_layers));
+      for (int layer = 0; layer < c.n_layers; ++layer)
+        option_layers.push_back(layer);
+    }
+
+    int committed_layers = 0;
+    for (int layer : option_layers) {
+      if (layer < 0 || layer >= c.n_layers || c.n_experts <= 0) {
+        LOG_WARN("[OPTION-B] invalid target layer=%d (layers=%d); skipping\n",
+                 layer, c.n_layers);
         continue;
-      counts[static_cast<size_t>(e.expert)] += e.count;
-    }
-    uint64_t total_count = 0;
-    for (uint64_t count : counts)
-      total_count += count;
-    if (total_count == 0) {
-      LOG_WARN("[OPTION-B] Layer %d has no nonzero route history in %s; "
-               "static split disabled\n",
-               option_layer, path.c_str());
-      return;
-    }
+      }
+      if (is_cpu_affinity_layer(layer) || device_expert_block_covers(g, layer))
+        continue;
 
-    std::vector<int> ranked(static_cast<size_t>(c.n_experts));
-    for (int expert = 0; expert < c.n_experts; ++expert)
-      ranked[static_cast<size_t>(expert)] = expert;
-    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
-      if (counts[static_cast<size_t>(a)] != counts[static_cast<size_t>(b)])
-        return counts[static_cast<size_t>(a)] > counts[static_cast<size_t>(b)];
-      return a < b;
-    });
+      // Usage files normally contain one row per expert, but aggregate rather
+      // than trusting that format. Zero-count experts are included so a
+      // top-N request really means N out of the model's complete expert
+      // domain, not merely N of the experts seen in an earlier run.
+      std::vector<uint64_t> counts(static_cast<size_t>(c.n_experts), 0);
+      for (const auto &e : entries) {
+        if (e.layer == layer && e.expert >= 0 && e.expert < c.n_experts)
+          counts[static_cast<size_t>(e.expert)] += e.count;
+      }
+      uint64_t total_count = 0;
+      for (uint64_t count : counts)
+        total_count += count;
+      if (total_count == 0)
+        continue;
 
-    const int hot_count = std::min(option_top_n, c.n_experts);
-    std::vector<int> hot_ids(ranked.begin(), ranked.begin() + hot_count);
-    uint64_t hot_route_count = 0;
-    for (int expert : hot_ids)
-      hot_route_count += counts[static_cast<size_t>(expert)];
-    const double coverage = static_cast<double>(hot_route_count) /
-                            static_cast<double>(total_count);
-    if (coverage < g.engine->qwen4exp_option_b_min_coverage) {
-      LOG_WARN("[OPTION-B] Layer %d top-%d coverage=%.2f%% is below the "
-               "required %.2f%%; static split disabled\n",
-               option_layer, hot_count, coverage * 100.0,
-               g.engine->qwen4exp_option_b_min_coverage * 100.0);
-      return;
+      std::vector<int> ranked(static_cast<size_t>(c.n_experts));
+      for (int expert = 0; expert < c.n_experts; ++expert)
+        ranked[static_cast<size_t>(expert)] = expert;
+      std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+        if (counts[static_cast<size_t>(a)] != counts[static_cast<size_t>(b)])
+          return counts[static_cast<size_t>(a)] > counts[static_cast<size_t>(b)];
+        return a < b;
+      });
+
+      const int hot_count = std::min(option_top_n, c.n_experts);
+      std::vector<int> hot_ids(ranked.begin(), ranked.begin() + hot_count);
+      uint64_t hot_route_count = 0;
+      for (int expert : hot_ids)
+        hot_route_count += counts[static_cast<size_t>(expert)];
+      if (g.engine->qwen4exp_option_b_fill_vram) {
+        // Start with the requested coverage floor, then let the arena
+        // planner trim the least-used tail if the remaining VRAM cannot hold
+        // every expert from every selected layer.
+        hot_ids.insert(hot_ids.end(), ranked.begin() + hot_count,
+                       ranked.end());
+      }
+      const double coverage = static_cast<double>(hot_route_count) /
+                              static_cast<double>(total_count);
+      if (coverage < g.engine->qwen4exp_option_b_min_coverage) {
+        LOG_INFO("[OPTION-B] Layer %d remains CPU/DDR: top-%d coverage=%.2f%% "
+                 "is below %.2f%%\n",
+                 layer, hot_count, coverage * 100.0,
+                 g.engine->qwen4exp_option_b_min_coverage * 100.0);
+        continue;
+      }
+
+      std::vector<int> staged_experts;
+      // The staging proof is intentionally still Layer-13-only. Automatic
+      // concentrated-layer selection must not silently create active-layer
+      // slots or forced routes for every selected layer.
+      if (layer == option_layer) {
+        int stage_seed = g.engine->qwen4exp_option_b_stage_expert;
+        const int stage_count = std::min(
+            std::max(1, g.engine->qwen4exp_option_b_stage_count), c.topk);
+        if (stage_seed >= 0 && stage_seed < c.n_experts) {
+          for (int candidate = stage_seed;
+               candidate < c.n_experts &&
+               static_cast<int>(staged_experts.size()) < stage_count;
+               ++candidate) {
+            if (std::find(hot_ids.begin(), hot_ids.end(), candidate) !=
+                hot_ids.end())
+              continue;
+            staged_experts.push_back(candidate);
+          }
+          for (int candidate = 0;
+               candidate < stage_seed &&
+               static_cast<int>(staged_experts.size()) < stage_count;
+               ++candidate) {
+            if (std::find(hot_ids.begin(), hot_ids.end(), candidate) !=
+                hot_ids.end())
+              continue;
+            staged_experts.push_back(candidate);
+          }
+        }
+      }
+      if (!staged_experts.empty())
+        hot_ids.insert(hot_ids.end(), staged_experts.begin(),
+                       staged_experts.end());
+      if (!staged_experts.empty()) {
+        g.stage_experts = staged_experts;
+        g.stage_layer = layer;
+        g.stage_expert = staged_experts.front();
+      }
+
+      const size_t placed_hot = hot_ids.size();
+      const size_t per_expert = g.engine->compute_expert_slab_bytes(layer);
+      size_t bytes = 0;
+      if (per_expert != 0 && hot_ids.size() <= SIZE_MAX / per_expert)
+        bytes = per_expert * hot_ids.size();
+      g.split_gpu_expert_ids[layer] = std::move(hot_ids);
+      ++committed_layers;
+      LOG_INFO("[OPTION-B] Layer %d static hot/cold split: hot=%zu cold=%d "
+               "staged=%d coverage=%.2f%% threshold=%.2f%% VRAM=%.3f GiB "
+               "source=%s\n",
+               layer, placed_hot,
+               c.n_experts - static_cast<int>(placed_hot) -
+                   static_cast<int>(staged_experts.size()),
+               static_cast<int>(staged_experts.size()), coverage * 100.0,
+               g.engine->qwen4exp_option_b_min_coverage * 100.0,
+               static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
+               path.c_str());
     }
-
-    const size_t per_expert =
-        g.engine->compute_expert_slab_bytes(option_layer);
-    size_t bytes = 0;
-    if (per_expert != 0 &&
-        static_cast<size_t>(hot_count) <= SIZE_MAX / per_expert)
-      bytes = per_expert * static_cast<size_t>(hot_count);
-    g.split_gpu_expert_ids[option_layer] = std::move(hot_ids);
-    LOG_INFO("[OPTION-B] Layer %d static hot/cold split: hot=%d cold=%d "
-             "coverage=%.2f%% threshold=%.2f%% VRAM=%.3f GiB source=%s\n",
-             option_layer, hot_count, c.n_experts - hot_count, coverage * 100.0,
-             g.engine->qwen4exp_option_b_min_coverage * 100.0,
-             static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
-             path.c_str());
+    if (option_b_auto)
+      LOG_INFO("[OPTION-B] concentrated-only graph plan committed %d CPU-side "
+               "layer(s); baseline GPU block and flat layers were skipped\n",
+               committed_layers);
     return;
   }
 
@@ -1624,8 +1765,136 @@ bool init_device_expert_arena(FullGraph &g) {
   // independently retryable.
   const bool allow_layer_clamp =
       requested_layers > 0 && !split_active && !partial_active;
+
+  auto sync_option_b_hot_masks = [&]() {
+    if (!g.engine || !g.engine->qwen4exp_option_b_fill_vram)
+      return;
+    const int n_experts = g.engine->model_file.architecture_config.n_experts;
+    for (const auto &[layer, ids] : g.split_gpu_expert_ids) {
+      std::vector<uint8_t> mask(static_cast<size_t>(std::max(0, n_experts)),
+                                0);
+      for (int expert : ids) {
+        if (expert >= 0 && expert < n_experts)
+          mask[static_cast<size_t>(expert)] = 1;
+      }
+      g.engine->qwen4exp_option_b_hot_masks[layer] = std::move(mask);
+      if (layer == g.engine->qwen4exp_option_b_layer)
+        g.engine->qwen4exp_option_b_hot_mask =
+            g.engine->qwen4exp_option_b_hot_masks[layer];
+    }
+  };
+
+  if (split_active && g.engine && g.engine->qwen4exp_option_b_fill_vram) {
+    const auto &c = g.engine->model_file.architecture_config;
+    const int minimum = std::min(g.engine->qwen4exp_option_b_top_n,
+                                 c.n_experts);
+    size_t free_bytes = 0, total_bytes = 0;
+    int previous_device = -1;
+    cudaGetDevice(&previous_device);
+    cudaSetDevice(g.device);
+    const cudaError_t meminfo = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (previous_device >= 0)
+      cudaSetDevice(previous_device);
+    constexpr size_t kGraphFreeFloor = 1ull * 1024ull * 1024ull * 1024ull;
+    constexpr size_t kArenaSlack = 1ull << 20;
+    const size_t tensor_slack = g.split_gpu_expert_ids.size() * 3 * 256;
+    const size_t reserve = kGraphFreeFloor + tensor_slack + kArenaSlack;
+    const size_t max_data_bytes =
+        meminfo == cudaSuccess && free_bytes > reserve
+            ? free_bytes - reserve
+            : 0;
+    std::unordered_map<int, std::vector<int>> removed_experts;
+    size_t bytes = device_expert_bytes(g);
+    while (minimum > 0 && bytes > max_data_bytes) {
+      int trim_layer = -1;
+      size_t trim_per_expert = 0;
+      for (const auto &[layer, ids] : g.split_gpu_expert_ids) {
+        if (static_cast<int>(ids.size()) <= minimum)
+          continue;
+        const size_t per_expert = g.engine->compute_expert_slab_bytes(layer);
+        if (per_expert > trim_per_expert) {
+          trim_layer = layer;
+          trim_per_expert = per_expert;
+        }
+      }
+      if (trim_layer >= 0 && trim_per_expert != 0) {
+        auto &ids = g.split_gpu_expert_ids[trim_layer];
+        removed_experts[trim_layer].push_back(ids.back());
+        ids.pop_back(); // ranked least-used expert in this layer
+        bytes = device_expert_bytes(g);
+        continue;
+      }
+
+      // If every selected layer is at the requested 50% floor and the
+      // aggregate still does not fit, remove the lowest-coverage layer. This
+      // preserves the user's layer-ranking rule instead of silently falling
+      // back to the legacy dispatcher for the entire graph.
+      int drop_layer = -1;
+      double drop_coverage = std::numeric_limits<double>::infinity();
+      for (const auto &[layer, ids] : g.split_gpu_expert_ids) {
+        (void)ids;
+        const auto it = g.engine->qwen4exp_option_b_layer_coverage.find(layer);
+        const double coverage =
+            it == g.engine->qwen4exp_option_b_layer_coverage.end()
+                ? 0.0
+                : it->second;
+        if (coverage < drop_coverage ||
+            (coverage == drop_coverage && layer > drop_layer)) {
+          drop_layer = layer;
+          drop_coverage = coverage;
+        }
+      }
+      if (drop_layer < 0)
+        break;
+      LOG_WARN("[OPTION-B] VRAM capacity dropped layer %d at its %d-expert "
+               "floor (coverage=%.3f)\n",
+               drop_layer, minimum, drop_coverage * 100.0);
+      g.split_gpu_expert_ids.erase(drop_layer);
+      removed_experts.erase(drop_layer);
+      g.engine->qwen4exp_option_b_hot_masks.erase(drop_layer);
+      g.engine->qwen4exp_option_b_layer_coverage.erase(drop_layer);
+      g.engine->qwen4exp_option_b_layers.erase(
+          std::remove(g.engine->qwen4exp_option_b_layers.begin(),
+                      g.engine->qwen4exp_option_b_layers.end(), drop_layer),
+          g.engine->qwen4exp_option_b_layers.end());
+      bytes = device_expert_bytes(g);
+    }
+
+    // After dropping whole layers, put back as many removed tail experts as
+    // the remaining capacity allows. This makes the final placement as full
+    // as possible rather than stopping at an unnecessarily conservative 50%.
+    bool added = true;
+    while (added) {
+      added = false;
+      for (auto &[layer, removed] : removed_experts) {
+        auto it = g.split_gpu_expert_ids.find(layer);
+        if (it == g.split_gpu_expert_ids.end() || removed.empty())
+          continue;
+        const size_t per_expert = g.engine->compute_expert_slab_bytes(layer);
+        if (per_expert == 0 || bytes + per_expert > max_data_bytes)
+          continue;
+        it->second.push_back(removed.back());
+        removed.pop_back();
+        bytes = device_expert_bytes(g);
+        added = true;
+      }
+    }
+    sync_option_b_hot_masks();
+    size_t final_experts = 0;
+    for (const auto &[layer, ids] : g.split_gpu_expert_ids)
+      final_experts += ids.size();
+    LOG_INFO("[OPTION-B] VRAM fill: %.2f/%.2f GiB expert data, %zu expert "
+             "records across %zu split layer(s), floor=%.2f GiB\n",
+             static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
+             static_cast<double>(max_data_bytes) /
+                 (1024.0 * 1024.0 * 1024.0),
+             final_experts, g.split_gpu_expert_ids.size(),
+             static_cast<double>(kGraphFreeFloor) /
+                 (1024.0 * 1024.0 * 1024.0));
+  }
+
   for (;;) {
-    const size_t bytes = device_expert_bytes(g);
+    size_t bytes = device_expert_bytes(g);
     if (bytes == 0) {
       if (g.device_expert_layers <= 0 && !split_active && !partial_active) {
         g.split_gpu_expert_ids.clear();
@@ -2257,6 +2526,85 @@ ggml_tensor *build_split_gpu_tensor(FullGraph &g, ggml_context *ctx,
   }
   if (!bind_device_expert_gather(g, t, src_ptrs, plane_bytes))
     return nullptr;
+  const int stage_layer = g.engine->qwen4exp_option_b_layer;
+  if (g.decode_mode && !g.stage_experts.empty() && stage_layer >= 0) {
+    const auto *arena = g.engine->graph_ram_arena(stage_layer);
+    if (arena && g.engine->graph_ram_layer_ready(stage_layer)) {
+      if (g.stage_bindings.empty()) {
+        for (int expert : g.stage_experts) {
+          const auto it = std::find(hot_ids.begin(), hot_ids.end(), expert);
+          if (it == hot_ids.end())
+            continue;
+          FullGraph::StageBinding binding;
+          binding.expert = expert;
+          binding.local_index = static_cast<int>(it - hot_ids.begin());
+          g.stage_bindings.push_back(binding);
+        }
+      }
+      const std::string gate_stem = "ffn_gate_exps.weight";
+      const std::string up_stem = "ffn_up_exps.weight";
+      const std::string down_stem = "ffn_down_exps.weight";
+      g.stage_layer = stage_layer;
+      for (auto &binding : g.stage_bindings) {
+        const size_t dst_offset =
+            static_cast<size_t>(binding.local_index) * plane_bytes;
+        const uint8_t *src = static_cast<const uint8_t *>(ptr) +
+                             static_cast<size_t>(binding.expert) * stride;
+        if (arena->projection_compact) {
+          if (name.find(gate_stem) != std::string::npos)
+            binding.src_gate = arena->base + arena->gate_offset +
+                               static_cast<size_t>(binding.expert) *
+                                   arena->gate_stride;
+          else if (name.find(up_stem) != std::string::npos)
+            binding.src_up = arena->base + arena->up_offset +
+                             static_cast<size_t>(binding.expert) *
+                                 arena->up_stride;
+          else if (name.find(down_stem) != std::string::npos)
+            binding.src_down = arena->base + arena->down_offset +
+                               static_cast<size_t>(binding.expert) *
+                                   arena->down_stride;
+        } else {
+          if (name.find(gate_stem) != std::string::npos)
+            binding.src_gate = src;
+          else if (name.find(up_stem) != std::string::npos)
+            binding.src_up = src + arena->gate_bytes;
+          else if (name.find(down_stem) != std::string::npos)
+            binding.src_down = src + arena->gate_bytes + arena->up_bytes;
+        }
+        if (name.find(gate_stem) != std::string::npos) {
+          binding.dst_gate = static_cast<uint8_t *>(t->data) + dst_offset;
+          binding.gate_bytes = plane_bytes;
+        } else if (name.find(up_stem) != std::string::npos) {
+          binding.dst_up = static_cast<uint8_t *>(t->data) + dst_offset;
+          binding.up_bytes = plane_bytes;
+        } else if (name.find(down_stem) != std::string::npos) {
+          binding.dst_down = static_cast<uint8_t *>(t->data) + dst_offset;
+          binding.down_bytes = plane_bytes;
+        }
+      }
+      bool complete = !g.stage_bindings.empty();
+      for (const auto &binding : g.stage_bindings) {
+        complete = complete && binding.src_gate && binding.src_up &&
+                   binding.src_down && binding.dst_gate && binding.dst_up &&
+                   binding.dst_down && binding.gate_bytes && binding.up_bytes &&
+                   binding.down_bytes;
+      }
+      if (complete) {
+        g.stage_enabled = true;
+        g.stage_expert = g.stage_bindings.front().expert;
+        g.stage_local_index = g.stage_bindings.front().local_index;
+        g.stage_src_gate = g.stage_bindings.front().src_gate;
+        g.stage_src_up = g.stage_bindings.front().src_up;
+        g.stage_src_down = g.stage_bindings.front().src_down;
+        g.stage_dst_gate = g.stage_bindings.front().dst_gate;
+        g.stage_dst_up = g.stage_bindings.front().dst_up;
+        g.stage_dst_down = g.stage_bindings.front().dst_down;
+        g.stage_gate_bytes = g.stage_bindings.front().gate_bytes;
+        g.stage_up_bytes = g.stage_bindings.front().up_bytes;
+        g.stage_down_bytes = g.stage_bindings.front().down_bytes;
+      }
+    }
+  }
   ggml_set_name(t, (name + ".split_gpu").c_str());
   return t;
 }
@@ -2450,6 +2798,38 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *selection =
       selection_bias ? ggml_add(ctx, probs, selection_bias) : probs;
   ggml_tensor *ids = ggml_argsort_top_k(ctx, selection, c.topk);
+  if (g.decode_mode && g.stage_enabled && layer == g.stage_layer) {
+    if (!g.stage_route_ids) {
+      g.stage_route_ids = host_input(
+          g, ctx, GGML_TYPE_I32, {c.topk, g.S},
+          static_cast<size_t>(c.topk) * g.S * sizeof(int32_t),
+          "qwen_layer13_stage_route_ids");
+      if (g.stage_route_ids) {
+        auto *forced = static_cast<int32_t *>(g.stage_route_ids->data);
+        for (int s = 0; s < g.S; ++s) {
+          for (int k = 0; k < c.topk; ++k) {
+            const int index = s * c.topk + k;
+            forced[index] = g.stage_experts.empty()
+                                ? g.stage_expert
+                                : g.stage_experts[k % g.stage_experts.size()];
+          }
+        }
+      }
+    }
+    if (g.stage_route_ids) {
+      ids = g.stage_route_ids;
+      if (!g.stage_route_logged) {
+        std::ostringstream experts;
+        for (size_t i = 0; i < g.stage_experts.size(); ++i)
+          experts << (i == 0 ? "" : ",") << g.stage_experts[i];
+        LOG_INFO("[OPTION-B-STAGE] forcing Layer %d route IDs to cold "
+                 "experts [%s] for the %zu-slot proof\n",
+                 g.stage_layer, experts.str().c_str(),
+                 g.stage_experts.size());
+        g.stage_route_logged = true;
+      }
+    }
+  }
   if (ids_out) {
     // ggml_argsort_top_k is argsort (full n_experts-wide) + a VIEW that
     // only shrinks ne[0] to topk -- the view's row stride (nb[1]) stays
@@ -3975,6 +4355,10 @@ int qwen4exp_full_graph_device_expert_layers() {
   return env_enabled() ? env_device_expert_layers() : 0;
 }
 
+bool qwen4exp_full_graph_device_expert_trailing() {
+  return env_enabled() && env_device_expert_trailing();
+}
+
 bool qwen4exp_full_graph_decode_enabled() {
   return env_enabled() && env_decode_enabled();
 }
@@ -4722,6 +5106,127 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
   return true;
 }
 
+bool qwen4exp_stage_layer13_before_graph(FullGraph &g, int pos_base) {
+  if (!g.stage_enabled)
+    return true;
+  if (!g.engine || !g.engine->gpu || g.stage_bindings.empty())
+    return false;
+  if (g.stage_layer < 0 ||
+      static_cast<size_t>(g.stage_layer) >= g.engine->graph_ram_arenas.size())
+    return false;
+
+  // The proof deliberately requires a pinned DDR source.  Pin only the
+  // target layer if the normal graph-arena registration A/B was not enabled;
+  // this keeps the proof self-contained without pinning the other 47 arenas.
+  auto &arena = g.engine->graph_ram_arenas[static_cast<size_t>(g.stage_layer)];
+  if (!arena.pinned) {
+    if (g.engine->ram_pinned_budget_bytes == 0 ||
+        arena.allocation_base == nullptr || arena.allocation_bytes == 0)
+      return false;
+    const size_t previous = g.engine->ram_pinned_bytes_used.fetch_add(
+        arena.bytes, std::memory_order_relaxed);
+    if (previous > g.engine->ram_pinned_budget_bytes ||
+        arena.bytes > g.engine->ram_pinned_budget_bytes - previous) {
+      g.engine->ram_pinned_bytes_used.fetch_sub(arena.bytes,
+                                                std::memory_order_relaxed);
+      LOG_WARN("[OPTION-B-STAGE] Layer %d source pin budget exhausted\n",
+               g.stage_layer);
+      return false;
+    }
+    cudaSetDevice(g.device);
+    const cudaError_t pin_err = cudaHostRegister(
+        arena.allocation_base, arena.allocation_bytes, cudaHostRegisterPortable);
+    if (pin_err != cudaSuccess) {
+      g.engine->ram_pinned_bytes_used.fetch_sub(arena.bytes,
+                                                std::memory_order_relaxed);
+      cudaGetLastError();
+      LOG_WARN("[OPTION-B-STAGE] Layer %d source pin failed: %s\n",
+               g.stage_layer, cudaGetErrorString(pin_err));
+      return false;
+    }
+    arena.pinned = true;
+    LOG_INFO("[OPTION-B-STAGE] pinned Layer %d DDR arena: %.3f GiB\n",
+             g.stage_layer,
+             static_cast<double>(arena.bytes) /
+                 (1024.0 * 1024.0 * 1024.0));
+  }
+
+  cudaSetDevice(g.device);
+  if (!g.stage_wait_done_event) {
+    if (cudaEventCreate(&g.stage_wait_start_event) != cudaSuccess ||
+        cudaEventCreate(&g.stage_wait_done_event) != cudaSuccess ||
+        cudaEventCreate(&g.stage_d2d_start_event) != cudaSuccess ||
+        cudaEventCreate(&g.stage_d2d_end_event) != cudaSuccess ||
+        cudaEventCreate(&g.stage_compute_start_event) != cudaSuccess ||
+        cudaEventCreate(&g.stage_compute_end_event) != cudaSuccess)
+      return false;
+  }
+
+  GpuTopology &topology = g.engine->gpu->topology;
+  const auto host_issue_start = std::chrono::steady_clock::now();
+  g.stage_slots.clear();
+  for (auto &binding : g.stage_bindings) {
+    ExpertLocation *slot = topology.upload_expert_active_projections_async(
+        g.stage_layer, binding.expert, binding.src_gate, binding.gate_bytes,
+        binding.src_up, binding.up_bytes, binding.src_down,
+        binding.down_bytes, g.device);
+    if (!slot || !slot->upload_event) {
+      LOG_WARN("[OPTION-B-STAGE] failed to queue Layer %d expert %d upload "
+               "(%zu requested)\n",
+               g.stage_layer, binding.expert, g.stage_bindings.size());
+      return false;
+    }
+    binding.slot = slot;
+    g.stage_slots.push_back(slot);
+  }
+  g.stage_slot = g.stage_slots.front();
+
+  cudaStream_t graph_stream =
+      moestream_ggml_backend_cuda_get_stream(g.cuda);
+  if (!graph_stream) {
+    LOG_WARN("[OPTION-B-STAGE] ggml CUDA stream bridge unavailable\n");
+    return false;
+  }
+  if (cudaEventRecord(g.stage_wait_start_event, graph_stream) != cudaSuccess)
+    return false;
+  for (const auto *slot : g.stage_slots) {
+    if (cudaStreamWaitEvent(graph_stream, slot->upload_event, 0) !=
+        cudaSuccess)
+      return false;
+  }
+  if (cudaEventRecord(g.stage_wait_done_event, graph_stream) != cudaSuccess ||
+      cudaEventRecord(g.stage_d2d_start_event, graph_stream) != cudaSuccess)
+    return false;
+  for (const auto &binding : g.stage_bindings) {
+    const auto *slot = binding.slot;
+    if (cudaMemcpyAsync(binding.dst_gate, slot->device_ptr,
+                        binding.gate_bytes, cudaMemcpyDeviceToDevice,
+                        graph_stream) != cudaSuccess ||
+        cudaMemcpyAsync(binding.dst_up,
+                        slot->device_ptr + binding.gate_bytes,
+                        binding.up_bytes, cudaMemcpyDeviceToDevice,
+                        graph_stream) != cudaSuccess ||
+        cudaMemcpyAsync(binding.dst_down,
+                        slot->device_ptr + binding.gate_bytes + binding.up_bytes,
+                        binding.down_bytes, cudaMemcpyDeviceToDevice,
+                        graph_stream) != cudaSuccess)
+      return false;
+  }
+  if (cudaEventRecord(g.stage_d2d_end_event, graph_stream) != cudaSuccess ||
+      cudaEventRecord(g.stage_compute_start_event, graph_stream) !=
+          cudaSuccess)
+    return false;
+  const double host_issue_us = std::chrono::duration<double, std::micro>(
+                                   std::chrono::steady_clock::now() -
+                                   host_issue_start)
+                                   .count();
+  LOG_INFO("[OPTION-B-STAGE] pos=%d queued layer=%d experts=%zu "
+           "host_issue=%.3fus source=%s\n",
+           pos_base, g.stage_layer, g.stage_slots.size(), host_issue_us,
+           g.stage_slots.front()->upload_source_pinned ? "pinned" : "pageable");
+  return true;
+}
+
 bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *token_ids, float *logits,
@@ -4770,13 +5275,63 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     g.layer_timing_gap_count = 0;
     g.layer_timing_have_last_ask_false = false;
   }
+  if (!qwen4exp_stage_layer13_before_graph(g, pos_base)) {
+    LOG_WARN("[OPTION-B-STAGE] declining graph replay because the Layer-13 "
+             "staging proof could not be queued\n");
+    return false;
+  }
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS)
     return false;
+  if (g.stage_enabled && g.stage_compute_end_event) {
+    cudaStream_t graph_stream =
+        moestream_ggml_backend_cuda_get_stream(g.cuda);
+    if (!graph_stream ||
+        cudaEventRecord(g.stage_compute_end_event, graph_stream) !=
+            cudaSuccess)
+      return false;
+  }
   ggml_backend_sched_synchronize(g.sched);
+  if (g.stage_enabled && !g.stage_slots.empty()) {
+    float h2d_ms = 0.0f, wait_ms = 0.0f, d2d_ms = 0.0f, compute_ms = 0.0f;
+    cudaSetDevice(g.device);
+    const ExpertLocation *first_slot = g.stage_slots.front();
+    const ExpertLocation *last_slot = g.stage_slots.back();
+    cudaEventElapsedTime(&h2d_ms, first_slot->upload_start_event,
+                         last_slot->upload_event);
+    // This brackets the actual device-side stream fence.  The previous
+    // single-slot probe measured upload completion -> wait completion, which
+    // excluded the stall when the compute stream arrived before the DMA.
+    cudaEventElapsedTime(&wait_ms, g.stage_wait_start_event,
+                         g.stage_wait_done_event);
+    cudaEventElapsedTime(&d2d_ms, g.stage_d2d_start_event,
+                         g.stage_d2d_end_event);
+    cudaEventElapsedTime(&compute_ms, g.stage_compute_start_event,
+                         g.stage_compute_end_event);
+    LOG_INFO("[OPTION-B-STAGE-TIME] pos=%d layer=%d staged=%zu H2D=%.3fms "
+             "wait=%.3fms D2D=%.3fms graph_cuda=%.3fms\n",
+             pos_base, g.stage_layer, g.stage_slots.size(), h2d_ms, wait_ms,
+             d2d_ms, compute_ms);
+    for (ExpertLocation *slot : g.stage_slots)
+      g.engine->gpu->topology.complete_active_layer_upload_after_compute(slot);
+    g.stage_slots.clear();
+    g.stage_slot = nullptr;
+  }
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * sizeof(float));
+  if (g.stage_enabled) {
+    double l1 = 0.0;
+    bool finite = true;
+    for (int i = 0; i < g.D; ++i) {
+      finite = finite && std::isfinite(hidden_states[i]);
+      l1 += std::abs(static_cast<double>(hidden_states[i]));
+    }
+    LOG_INFO("[OPTION-B-STAGE-VERIFY] pos=%d output_finite=%d output_l1=%.6e\n",
+             pos_base, finite ? 1 : 0, l1);
+    if (!finite)
+      return false;
+  }
   if (logits) {
     ggml_backend_tensor_get(g.logits, logits, 0,
                             static_cast<size_t>(vocab) * sizeof(float));
@@ -5165,6 +5720,7 @@ bool qwen4exp_full_graph_enabled() { return false; }
 bool qwen4exp_full_graph_decode_enabled() { return false; }
 void qwen4exp_full_graph_configure(bool, bool) {}
 int qwen4exp_full_graph_device_expert_layers() { return 0; }
+bool qwen4exp_full_graph_device_expert_trailing() { return false; }
 bool qwen4exp_full_graph_prepare(StreamingEngine &, int, int, const int *) {
   return false;
 }

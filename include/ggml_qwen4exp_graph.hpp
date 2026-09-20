@@ -20,6 +20,10 @@ void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled);
 // Number of complete early MoE layers whose expert tensors should be placed
 // in the graph CUDA weight arena. Zero keeps all routed experts host-backed.
 int qwen4exp_full_graph_device_expert_layers();
+// Whether the configured full-graph resident block is at the end of the
+// model. Used by usage-driven Option B selection so it does not steal
+// residency from the baseline's already-complete GPU layers.
+bool qwen4exp_full_graph_device_expert_trailing();
 
 // Build/rebuild the graph for a prompt shape.  This is intended to run before
 // the measured prefill window, just as Bee builds its graph before execution.
