@@ -9,6 +9,7 @@
 #include "ggml_glm5next_proj_backend.hpp"
 #include "ggml_hc_backend.hpp"
 #include "ggml_moe_backend.hpp"
+#include "ggml_qwen4exp_graph.hpp"
 #include "gguf_loader.hpp"
 #include "gguf_tokenizer.hpp"
 #include "logger.hpp"
@@ -382,6 +383,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_graph_expert_vram_budget_gb =
       config.qwen4exp_graph_expert_vram_budget_gb;
   engine.qwen4exp_graph_pin_file = config.pin_file;
+  engine.qwen4exp_option_b_layer = config.qwen4exp_option_b_layer;
+  engine.qwen4exp_option_b_top_n = config.qwen4exp_option_b_top_n;
+  engine.qwen4exp_option_b_min_coverage =
+      config.qwen4exp_option_b_min_coverage;
+  qwen4exp_full_graph_configure(config.qwen4exp_full_graph,
+                                config.qwen4exp_full_graph_decode);
   ram_mgr.configured_total_experts =
       std::max(0, config.ram_cache_total_experts);
   // Must be set BEFORE the [PIN] preload block below -- that's where the
@@ -2303,6 +2310,59 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
             << " history-missing model experts to the preload manifest\n";
       }
 
+      // Option B's static hot set is prepared from the same final ranking
+      // that drives startup RAM/VRAM preload.  Keep membership in an O(1)
+      // device-dispatch-side mask so cold routes can be forced to the CPU
+      // without another histogram lookup in the token loop.
+      if (config.qwen4exp_option_b_layer >= 0 &&
+          config.qwen4exp_option_b_top_n > 0 &&
+          config.qwen4exp_option_b_layer <
+              (int)engine.layers_experts.size()) {
+        const int layer = config.qwen4exp_option_b_layer;
+        const int n_experts = engine.model_file.architecture_config.n_experts;
+        auto it = by_layer.find(layer);
+        if (it != by_layer.end() && n_experts > 0) {
+          auto &ranked = it->second;
+          std::stable_sort(
+              ranked.begin(), ranked.end(),
+              [](const auto &a, const auto &b) {
+                if (a.count != b.count)
+                  return a.count > b.count;
+                return a.expert < b.expert;
+              });
+          engine.qwen4exp_option_b_hot_mask.assign(
+              static_cast<size_t>(n_experts), 0);
+          const int hot_n = std::min(config.qwen4exp_option_b_top_n,
+                                     n_experts);
+          uint64_t total_count = 0, hot_count = 0;
+          for (const auto &entry : ranked)
+            if (entry.expert >= 0 && entry.expert < n_experts)
+              total_count += entry.count;
+          for (int i = 0; i < hot_n && i < (int)ranked.size(); ++i) {
+            const int expert = ranked[(size_t)i].expert;
+            if (expert < 0 || expert >= n_experts)
+              continue;
+            engine.qwen4exp_option_b_hot_mask[(size_t)expert] = 1;
+            hot_count += ranked[(size_t)i].count;
+          }
+          const double coverage =
+              total_count == 0
+                  ? 0.0
+                  : static_cast<double>(hot_count) /
+                        static_cast<double>(total_count);
+          engine.qwen4exp_option_b_committed =
+              total_count > 0 &&
+              coverage >= config.qwen4exp_option_b_min_coverage;
+          LOG_STREAM_INFO()
+              << "[OPTION-B] Layer " << layer << " static hot set: "
+              << (engine.qwen4exp_option_b_committed ? "committed" : "disabled")
+              << " hot=" << hot_n << " cold=" << (n_experts - hot_n)
+              << " history coverage=" << (coverage * 100.0)
+              << "% threshold="
+              << (config.qwen4exp_option_b_min_coverage * 100.0) << "%\n";
+        }
+      }
+
       // Persist this SAME final ranking (post prefill_pin_file
       // override) for RAMSafetyManager's runtime disk_batch_padding
       // to use as its candidate source -- see that member's own
@@ -2836,15 +2896,24 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         // 0 (the layer's OWN hottest experts) instead of after a
         // pinned/vram_lru prefix that never happened for this layer.
         bool cpu_affinity = is_cpu_affinity_layer(layer);
-        int layer_vram_lru_n = (cpu_affinity || prefix_vram) ? 0 : vram_lru_n;
+        const bool option_b_active =
+            engine.qwen4exp_option_b_committed &&
+            config.qwen4exp_option_b_top_n > 0;
+        const bool option_b_target =
+            option_b_active && layer == config.qwen4exp_option_b_layer;
+        int layer_vram_lru_n =
+            (cpu_affinity || prefix_vram || option_b_target) ? 0
+                                                             : vram_lru_n;
         // Three-tier: enforce global pinned capacity per layer.
         // global_topn already computed a final per-layer count
         // (floor + its share of the global ranking) up front; the
         // default per_layer_topk path keeps its EXACT original
         // running-total cap, unchanged.
         int layer_max;
-        if (cpu_affinity) {
+        if (cpu_affinity || (option_b_active && !option_b_target)) {
           layer_max = 0;
+        } else if (option_b_target) {
+          layer_max = std::min(config.qwen4exp_option_b_top_n, n);
         } else if (global_topn || prefix_vram) {
           layer_max = layer_pin_count[layer];
         } else {
@@ -2871,7 +2940,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         // tier2_start correctly comes out to 0 too via the
         // global_topn branch (layer_max) regardless of topk.
         int tier2_start =
-            (cpu_affinity || global_topn || prefix_vram) ? layer_max : topk;
+            (cpu_affinity || option_b_active || global_topn || prefix_vram)
+                ? layer_max
+                : topk;
         for (int i = 0; i < n && i < layer_max;) {
           int chunk_end =
               std::min(n, std::min(layer_max, i + PRELOAD_URING_CHUNK));

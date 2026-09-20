@@ -433,12 +433,14 @@ std::unique_ptr<FullGraph> g_graph;
 std::unique_ptr<FullGraph> g_graph_p2_suffix_gpu;
 std::unique_ptr<FullGraph> g_graph_p2_suffix_cpu;
 
+bool g_config_full_graph = false;
+bool g_config_full_graph_decode = false;
+
 bool env_enabled() {
-  static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH");
-    return v && v[0] == '1';
-  }();
-  return enabled;
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH");
+  if (v && v[0])
+    return v[0] == '1';
+  return g_config_full_graph;
 }
 
 int env_device_expert_layers() {
@@ -719,11 +721,10 @@ bool layer_timing_eval_callback(struct ggml_tensor *t, bool ask,
 }
 
 bool env_decode_enabled() {
-  static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE");
-    return v && v[0] == '1';
-  }();
-  return enabled;
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE");
+  if (v && v[0])
+    return v[0] == '1';
+  return g_config_full_graph_decode;
 }
 
 int env_decode_kv_capacity(int max_t, int required) {
@@ -1181,6 +1182,98 @@ void plan_expert_vram_split(FullGraph &g) {
   g.split_gpu_expert_ids.clear();
   if (g.S != 1)
     return;
+
+  // Option B is intentionally a narrow, deterministic plan: one target
+  // layer, one static hot set, and the complementary experts left in the
+  // fixed-stride DDR arena.  This uses the same persisted routing histogram
+  // as the existing global-budget planner, but it does not spend the
+  // budget across unrelated layers and it does not rely on a per-token
+  // route readback.  The split-aware build_moe() path below computes the
+  // hot GPU branch and cold CPU branch as one graph, preserving the full
+  // routed result for every route ID.
+  const int option_layer = g.engine->qwen4exp_option_b_layer;
+  const int option_top_n = g.engine->qwen4exp_option_b_top_n;
+  if (option_layer >= 0 && option_top_n > 0) {
+    const auto &c = g.engine->model_file.architecture_config;
+    if (option_layer >= c.n_layers || c.n_experts <= 0) {
+      LOG_WARN("[OPTION-B] invalid target layer=%d (layers=%d); static split "
+               "disabled\n",
+               option_layer, c.n_layers);
+      return;
+    }
+
+    const std::string path = g.engine->qwen4exp_graph_pin_file.empty()
+                                 ? std::string(".moestream_usage")
+                                 : g.engine->qwen4exp_graph_pin_file;
+    auto [entries, maxc] = StreamingEngine::load_usage(path);
+    (void)maxc;
+    if (entries.empty()) {
+      LOG_WARN("[OPTION-B] no usage data at %s; Layer %d remains CPU/DDR\n",
+               path.c_str(), option_layer);
+      return;
+    }
+
+    // Usage files normally contain one row per expert, but aggregate rather
+    // than trusting that format. Zero-count experts are included so a
+    // top-N request really means N out of the model's complete 512-expert
+    // domain, not merely N of the experts seen in an earlier run.
+    std::vector<uint64_t> counts(static_cast<size_t>(c.n_experts), 0);
+    for (const auto &e : entries) {
+      if (e.layer != option_layer || e.expert < 0 ||
+          e.expert >= c.n_experts)
+        continue;
+      counts[static_cast<size_t>(e.expert)] += e.count;
+    }
+    uint64_t total_count = 0;
+    for (uint64_t count : counts)
+      total_count += count;
+    if (total_count == 0) {
+      LOG_WARN("[OPTION-B] Layer %d has no nonzero route history in %s; "
+               "static split disabled\n",
+               option_layer, path.c_str());
+      return;
+    }
+
+    std::vector<int> ranked(static_cast<size_t>(c.n_experts));
+    for (int expert = 0; expert < c.n_experts; ++expert)
+      ranked[static_cast<size_t>(expert)] = expert;
+    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) {
+      if (counts[static_cast<size_t>(a)] != counts[static_cast<size_t>(b)])
+        return counts[static_cast<size_t>(a)] > counts[static_cast<size_t>(b)];
+      return a < b;
+    });
+
+    const int hot_count = std::min(option_top_n, c.n_experts);
+    std::vector<int> hot_ids(ranked.begin(), ranked.begin() + hot_count);
+    uint64_t hot_route_count = 0;
+    for (int expert : hot_ids)
+      hot_route_count += counts[static_cast<size_t>(expert)];
+    const double coverage = static_cast<double>(hot_route_count) /
+                            static_cast<double>(total_count);
+    if (coverage < g.engine->qwen4exp_option_b_min_coverage) {
+      LOG_WARN("[OPTION-B] Layer %d top-%d coverage=%.2f%% is below the "
+               "required %.2f%%; static split disabled\n",
+               option_layer, hot_count, coverage * 100.0,
+               g.engine->qwen4exp_option_b_min_coverage * 100.0);
+      return;
+    }
+
+    const size_t per_expert =
+        g.engine->compute_expert_slab_bytes(option_layer);
+    size_t bytes = 0;
+    if (per_expert != 0 &&
+        static_cast<size_t>(hot_count) <= SIZE_MAX / per_expert)
+      bytes = per_expert * static_cast<size_t>(hot_count);
+    g.split_gpu_expert_ids[option_layer] = std::move(hot_ids);
+    LOG_INFO("[OPTION-B] Layer %d static hot/cold split: hot=%d cold=%d "
+             "coverage=%.2f%% threshold=%.2f%% VRAM=%.3f GiB source=%s\n",
+             option_layer, hot_count, c.n_experts - hot_count, coverage * 100.0,
+             g.engine->qwen4exp_option_b_min_coverage * 100.0,
+             static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0),
+             path.c_str());
+    return;
+  }
+
   const double budget_gb = g.engine->qwen4exp_graph_expert_vram_budget_gb;
   if (budget_gb <= 0.0)
     return; // feature off -- identical to today, zero planning cost
@@ -3886,6 +3979,11 @@ bool qwen4exp_full_graph_decode_enabled() {
   return env_enabled() && env_decode_enabled();
 }
 
+void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled) {
+  g_config_full_graph = enabled;
+  g_config_full_graph_decode = decode_enabled;
+}
+
 void qwen4exp_full_graph_shutdown() {
   // Explicit, EARLY teardown (before the CUDA driver itself starts
   // shutting down) is why this function exists at all -- see g_graph's
@@ -5065,6 +5163,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
 bool qwen4exp_full_graph_enabled() { return false; }
 bool qwen4exp_full_graph_decode_enabled() { return false; }
+void qwen4exp_full_graph_configure(bool, bool) {}
 int qwen4exp_full_graph_device_expert_layers() { return 0; }
 bool qwen4exp_full_graph_prepare(StreamingEngine &, int, int, const int *) {
   return false;

@@ -458,6 +458,24 @@ public:
     // EngineConfig (it only receives StreamingEngine&).
     std::string qwen4exp_graph_pin_file;
 
+    // Option B: one-layer static hot/cold expert split.  The full graph
+    // planner places this layer's top-N usage-ranked experts in its fixed
+    // CUDA arena and routes the complementary experts through the fixed
+    // DDR/CPU branch.  Unlike qwen4exp_partial_layer, this is not a
+    // GPU-only fast path and therefore has no silent dropped-route risk.
+    int qwen4exp_option_b_layer = -1;
+    int qwen4exp_option_b_top_n = 0;
+    float qwen4exp_option_b_min_coverage = 0.80f;
+    std::vector<uint8_t> qwen4exp_option_b_hot_mask;
+    bool qwen4exp_option_b_committed = false;
+
+    bool qwen4exp_option_b_hot_expert(int layer, int expert) const {
+      return qwen4exp_option_b_committed &&
+             layer == qwen4exp_option_b_layer && expert >= 0 &&
+             static_cast<size_t>(expert) < qwen4exp_option_b_hot_mask.size() &&
+             qwen4exp_option_b_hot_mask[static_cast<size_t>(expert)] != 0;
+    }
+
     // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not
     // per-token -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
     // follow-on note for why per-token was ruled out: ggml has no in-graph

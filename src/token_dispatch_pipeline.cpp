@@ -10,6 +10,7 @@
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_hc_backend.hpp"
 #include "ggml_moe_backend.hpp"
+#include "ggml_qwen_shared_runner.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "kernels_cpu.hpp"
 #include "kquant_dequant.hpp"
@@ -587,6 +588,34 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
   auto &gpu_route_ids_ks = context.gpu_route_ids_ks;
   auto &gpu_route_weights_ks = context.gpu_route_weights_ks;
   auto &batched_handled = context.batched_handled;
+  // Option B is deliberately a legacy-dispatch experiment: only the target
+  // decode layer is split into the startup-pinned hot set and the DDR/CPU
+  // cold set.  Keeping this predicate here leaves every other layer on the
+  // normal master dispatcher and prevents the Phase-A graph/staging path from
+  // being selected accidentally.
+  const bool option_b_target =
+      !batched_handled && S == 1 && topk > 0 && n_experts > 0 &&
+      engine.qwen4exp_option_b_committed &&
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      layer_idx == engine.qwen4exp_option_b_layer;
+  bool option_b_shared_started = false;
+  const void *option_b_shared_only_output = nullptr;
+  if (option_b_target && engine.qwen4exp_cpu_gpu_overlap &&
+      engine.qwen4exp_device_hc_ffn_input && qwen4exp_hc_device_live() &&
+      c.n_expert_shared > 0 && moe_ggml_shared_expert() &&
+      engine.resident_layers.count("blk." + std::to_string(layer_idx) +
+                                   ".ffn_gate_shexp.weight")) {
+    option_b_shared_started = run_qwen4exp_shared_device(
+        engine, layer_idx, S, D, moe_inter,
+        engine.qwen4exp_device_hc_ffn_input, nullptr, c,
+        &option_b_shared_only_output, nullptr, true, false);
+    static std::atomic<bool> logged_option_b{false};
+    if (option_b_shared_started &&
+        !logged_option_b.exchange(true, std::memory_order_relaxed))
+      LOG_STREAM_INFO()
+          << "[OPTION-B] Layer " << layer_idx
+          << " legacy mixed dispatch active: hot experts on GPU, cold experts on DDR/CPU, shared FFN submitted first\n";
+  }
   // Qwen CPU-affinity layers can use the same source-backed workflow as
   // Llama.cpp: the complete packed expert layer stays in the already-loaded
   // DDR arena, the CPU GGML graph receives the real global route IDs, and
@@ -1145,8 +1174,11 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // promoted, never a metadata-only shadow.
       gpu_ctx.exp = exp;
       gpu_ctx.force_cpu_offload =
-          (k >= 0 && k < (int)force_cpu_offload_k.size()) &&
-          force_cpu_offload_k[k];
+          ((k >= 0 && k < (int)force_cpu_offload_k.size()) &&
+           force_cpu_offload_k[k]) ||
+          (option_b_target &&
+           !engine.qwen4exp_option_b_hot_expert(
+               layer_idx, scratch.tok_topk_ids[s * topk + k]));
       // Reuse the shadow pre-check's find_expert() result instead of
       // calling it a second time -- a real, measured cost (Cache
       // mutex wait roughly doubled, 4.185s vs 1.4-2.0s, from this
@@ -1413,7 +1445,8 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // tensor-table lookups) -- the actual per-expert absolute file
       // offset is resolved again inside the k-loop below, where the
       // specific expert_id is known.
-      bool cufile_layer_eligible = engine.cuda_cufile_active &&
+      bool cufile_layer_eligible = !option_b_target &&
+                                   engine.cuda_cufile_active &&
                                    !is_cpu_affinity_layer(layer_idx) &&
                                    ram_mgr.vram_cache;
       if (cufile_layer_eligible) {
@@ -1454,7 +1487,9 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         scratch.vram_loc_hint[k] =
             nullptr; // explicit every layer/token -- resize()'s
                      // one-time clear only covers the FIRST call
-        if (layer_gpu_capable) {
+        if (layer_gpu_capable &&
+            (!option_b_target ||
+             engine.qwen4exp_option_b_hot_expert(layer_idx, expert_id))) {
           const ExpertLocation *loc =
               ram_mgr.vram_cache->find_expert(layer_idx, expert_id);
           if (loc && loc->device_ptr) {
@@ -1802,7 +1837,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // orchestration-bound per call, not schedulable-around by
         // reordering when work gets issued. See CLAUDE.md's
         // 2026-08-19 entry for the full writeup.
-        if (engine.decode_async_prewarm &&
+        if (engine.decode_async_prewarm && !option_b_target &&
             !moe_pipeline_detail::qwen4exp_decode_ggml_path(engine) &&
             !cpu_only_mode() && !is_cpu_affinity_layer(layer_idx) &&
             ram_mgr.vram_cache) {
@@ -2337,6 +2372,43 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     check_finite("token_output (post routed experts, pre-shared)", layer_idx,
                  -1, token_output, (size_t)D);
 
+    // Option B's shared-only graph was submitted before the routed work, so
+    // the CPU cold tail could execute while CUDA processed the always-on
+    // shared FFN.  Add the completed routed result to that graph output now;
+    // the normal execution-layer HC post-combine then consumes one device
+    // result instead of running the host shared-expert implementation again.
+    if (option_b_shared_started) {
+      const void *combined = nullptr;
+      const bool added = run_qwen4exp_shared_device(
+          engine, layer_idx, S, D, moe_inter, nullptr, nullptr, c, &combined,
+          token_output, false, true);
+      if (added && combined) {
+        scratch.moe_device_output = combined;
+        scratch.moe_shared_device_output = true;
+        scratch.moe_device_output_ready = true;
+      } else {
+        // The shared-only graph has already been submitted.  Preserve
+        // numerical correctness if the add graph cannot be built by waiting
+        // for and downloading that result, then use the established host
+        // accumulation path for the routed result.
+        auto &shared_runner =
+            GgmlQwenSharedRunner::instance_for_layer(layer_idx);
+        if (!option_b_shared_only_output ||
+            !shared_runner.copy_output_to_host(option_b_shared_only_output,
+                                               scratch.down_buf.data())) {
+          LOG_STREAM_ERROR()
+              << "[OPTION-B] Layer " << layer_idx
+              << " shared add failed and shared-only output recovery failed;"
+                 " falling back to host shared FFN\n";
+          run_qwen4exp_shared_host(engine, layer_idx, S, D, moe_inter,
+                                   token_hidden, token_output, scratch, c);
+        } else {
+          for (int i = 0; i < D; ++i)
+            token_output[i] += scratch.down_buf[i];
+        }
+      }
+    }
+
     // Shared expert (always-active) — GLM-5.2/DeepSeek-V3/Hunyuan MoE
     // layers can have n_expert_shared always-on experts whose combined
     // FFN (intermediate width n_expert_shared * moe_inter — NOT just
@@ -2345,7 +2417,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     // routed weights get expert_weights_scale (see build_moe_ffn — w_scale
     // is applied to the gathered top-k weights, never to the shared path).
     std::string sp = "blk." + std::to_string(layer_idx) + ".";
-    if (c.n_expert_shared > 0 &&
+    if (!option_b_shared_started && c.n_expert_shared > 0 &&
         engine.resident_layers.count(sp + "ffn_gate_shexp.weight")) {
       PERF_SCOPE(t_shared_expert_total);
       int shared_inter = moe_inter * c.n_expert_shared;

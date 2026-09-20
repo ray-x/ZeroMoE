@@ -597,6 +597,22 @@ struct EngineConfig {
   // build_moe. Default 0.0 = feature off, identical to today's behavior.
   double qwen4exp_graph_expert_vram_budget_gb = 0.0;
 
+  // Option B: static power-law placement for one Qwen layer.  The full
+  // graph keeps the selected experts in a permanent CUDA graph arena and
+  // leaves the complementary experts in the fixed-stride DDR arena.  A
+  // value below zero disables the option; this is deliberately separate
+  // from the older partial-layer environment experiment, whose GPU-only
+  // path has different correctness semantics.
+  int qwen4exp_option_b_layer = -1;
+  int qwen4exp_option_b_top_n = 0;
+  float qwen4exp_option_b_min_coverage = 0.80f;
+
+  // Configurable full-graph switches.  Environment variables remain valid
+  // overrides for existing A/B scripts; these fields make the master-based
+  // Option B profile self-contained.
+  bool qwen4exp_full_graph = false;
+  bool qwen4exp_full_graph_decode = false;
+
   // Decode-time (S==1) CPU-offload cap for genuine disk-cold misses:
   // instead of a REAL cache miss (not RAM- nor VRAM-resident, would need
   // an SSD read) always continuing on to a synchronous VRAM upload, up to
@@ -2457,6 +2473,33 @@ inline bool EngineConfig::load(const std::string &path) {
   qwen4exp_graph_expert_vram_budget_gb = doc.root.get_double(
       "qwen4exp_graph_expert_vram_budget_gb",
       qwen4exp_graph_expert_vram_budget_gb);
+  qwen4exp_option_b_layer = (int)doc.root.get_int(
+      "qwen4exp_option_b_layer", qwen4exp_option_b_layer);
+  qwen4exp_option_b_top_n = (int)doc.root.get_int(
+      "qwen4exp_option_b_top_n", qwen4exp_option_b_top_n);
+  qwen4exp_option_b_min_coverage = doc.root.get_float(
+      "qwen4exp_option_b_min_coverage", qwen4exp_option_b_min_coverage);
+  qwen4exp_full_graph =
+      doc.root.get_bool("qwen4exp_full_graph", qwen4exp_full_graph);
+  qwen4exp_full_graph_decode = doc.root.get_bool(
+      "qwen4exp_full_graph_decode", qwen4exp_full_graph_decode);
+  if (qwen4exp_option_b_layer < -1) {
+    LOG_WARN("[CONFIG] qwen4exp_option_b_layer=%d is invalid -- disabling\n",
+             qwen4exp_option_b_layer);
+    qwen4exp_option_b_layer = -1;
+  }
+  if (qwen4exp_option_b_top_n < 0) {
+    LOG_WARN("[CONFIG] qwen4exp_option_b_top_n=%d is invalid -- disabling\n",
+             qwen4exp_option_b_top_n);
+    qwen4exp_option_b_top_n = 0;
+  }
+  if (qwen4exp_option_b_min_coverage < 0.0f ||
+      qwen4exp_option_b_min_coverage > 1.0f) {
+    LOG_WARN("[CONFIG] qwen4exp_option_b_min_coverage=%.3f is invalid -- "
+             "using 0.80\n",
+             qwen4exp_option_b_min_coverage);
+    qwen4exp_option_b_min_coverage = 0.80f;
+  }
   cpu_offload_max_experts =
       doc.root.get_int("cpu_offload_max_experts", cpu_offload_max_experts);
   if (cpu_offload_max_experts < 0 || cpu_offload_max_experts > 8) {

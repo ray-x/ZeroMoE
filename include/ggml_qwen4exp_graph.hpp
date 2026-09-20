@@ -13,6 +13,10 @@ struct StreamingEngine;
 bool qwen4exp_full_graph_enabled();
 bool qwen4exp_full_graph_decode_enabled();
 
+// Configure full-graph enablement from the TOML profile. Environment
+// variables remain supported and take precedence in the query functions.
+void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled);
+
 // Number of complete early MoE layers whose expert tensors should be placed
 // in the graph CUDA weight arena. Zero keeps all routed experts host-backed.
 int qwen4exp_full_graph_device_expert_layers();
