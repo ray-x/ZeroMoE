@@ -19,14 +19,19 @@
 #include "logger.hpp"
 #include "memory_guard.hpp"
 #include "ple_hash.hpp"
+#include "thread_profile.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iomanip>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -46,10 +51,464 @@
 #include <omp.h>
 #endif
 
+// A CPY node carrying this context is the graph-visible marker for a fused
+// CPU-offloaded MoE layer.  The CUDA backend sees only the opaque `extra`
+// pointer and calls the bridge below; the context itself stays owned by the
+// FullGraph instance for the lifetime of the captured graph.
+struct Qwen4ExpCudaHostNodeContext {
+  static constexpr uint64_t kMagic = 0x514f46464c4f4144ull; // QOFFLOAD
+  uint64_t magic = kMagic;
+  GgmlQwenCpuExpertRef layer{};
+  const void *gate_plane = nullptr;
+  const void *up_plane = nullptr;
+  const void *down_plane = nullptr;
+  int n_experts = 0;
+  int d_model = 0;
+  int d_ff = 0;
+  int topk = 0;
+  size_t expert_stride = 0;
+  size_t gate_stride = 0;
+  size_t up_stride = 0;
+  size_t down_stride = 0;
+  bool projection_compact = false;
+  // The full graph owns this pool. The host-node runner borrows it for the
+  // callback and never frees or pauses it.
+  ggml_threadpool_t shared_cpu_threadpool = nullptr;
+  int shared_cpu_threads = 0;
+  GgmlQwenCpuMoeRunner *cpu_runner = nullptr;
+  float *host_input = nullptr;
+  float *host_output = nullptr;
+  int32_t *host_ids = nullptr;
+  float *host_weights = nullptr;
+  size_t input_bytes = 0;
+  size_t output_bytes = 0;
+  size_t ids_bytes = 0;
+  size_t weights_bytes = 0;
+  void *device_output = nullptr;
+  int layer_index = -1;
+  // Immutable static hot set for a planned per-expert split.  This is
+  // diagnostic-only for the current full-CPU host marker, but keeping it in
+  // the captured context makes it possible to prove when the marker would
+  // otherwise bypass a planned GPU branch.
+  std::vector<int> gpu_resident_experts;
+  bool transport_diag = false;
+  float *host_output_gpu_check = nullptr;
+  cudaEvent_t d2h_start = nullptr;
+  cudaEvent_t d2h_end = nullptr;
+  cudaEvent_t h2d_start = nullptr;
+  cudaEvent_t h2d_end = nullptr;
+  cudaEvent_t post_h2d_check_end = nullptr;
+  std::atomic<bool> last_ok{false};
+  std::atomic<double> last_cpu_ms{0.0};
+  std::atomic<double> last_callback_total_ms{0.0};
+  std::atomic<double> last_callback_guard_wait_ms{0.0};
+  std::atomic<double> last_callback_body_ms{0.0};
+  std::atomic<uint64_t> last_cpu_hash{0};
+  std::atomic<uint64_t> last_gpu_hash{0};
+  std::atomic<bool> last_cpu_hash_valid{false};
+};
+
+static bool env_host_node_skip_cpu() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_SKIP_CPU");
+  return v && v[0] == '1';
+}
+
+// Diagnostic topology switch: keep the initial CPU->GPU contiguous handoff
+// on the CPU backend while retaining the CUDA-owned host-node markers.  This
+// lets A/B runs separate the prologue/backend-edge cost from host-callback
+// CPU contention without changing the default host-node topology.
+static bool env_host_node_keep_cpu_prologue() {
+  const char *v =
+      std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_KEEP_CPU_PROLOGUE");
+  return v && v[0] == '1';
+}
+
+// The CUDA host callback and the ordinary GGML CPU scheduler otherwise use
+// independent execution contexts.  During the callback's CPU critical
+// section, starting another CPU split causes the two pools to compete for
+// the same cores and memory bandwidth.  The scheduler-side weak hook (added
+// by patches/ggml-backend-host-node-gate.patch) waits on this counter.  It is
+// deliberately process-global because a replay has one host callback stream
+// per active MoE marker, and the guarded region is short.
+static std::atomic<unsigned> g_qwen4exp_host_node_cpu_active{0};
+static std::atomic<uint64_t> g_qwen4exp_host_node_cpu_gate_wait_ns{0};
+static std::atomic<unsigned> g_qwen4exp_ordinary_cpu_active{0};
+static std::atomic<uint64_t> g_qwen4exp_host_node_ordinary_cpu_wait_ns{0};
+static std::atomic<uint64_t> g_qwen4exp_cpu_split_enter_wait_ns{0};
+static std::mutex g_qwen4exp_cpu_execution_mutex;
+
+static bool qwen4exp_host_node_timing_enabled() {
+  const char *env = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_TIMING");
+  return env && env[0] == '1';
+}
+
+extern "C" bool moestream_qwen4exp_cpu_offload_coordination_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+  return v && v[0] == '1';
+}
+
+extern "C" void moestream_qwen4exp_host_node_cpu_wait() {
+  if (g_qwen4exp_host_node_cpu_active.load(std::memory_order_acquire) == 0)
+    return;
+
+  const auto start = std::chrono::steady_clock::now();
+  while (g_qwen4exp_host_node_cpu_active.load(std::memory_order_acquire) !=
+         0) {
+    // The callback normally lasts only a few milliseconds. Yielding here
+    // gives its worker pool a runnable core without creating another busy
+    // spinning CPU pool. This hook is only called before ordinary CPU splits.
+    std::this_thread::yield();
+  }
+  const uint64_t wait_ns = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - start)
+          .count());
+  g_qwen4exp_host_node_cpu_gate_wait_ns.fetch_add(
+      wait_ns, std::memory_order_relaxed);
+  if (wait_ns >= 50000 && qwen4exp_host_node_timing_enabled()) {
+    LOG_INFO("[DIAG-SCHEDULER] CPU split blocked for %.3f ms "
+             "waiting on host-node\n",
+             static_cast<double>(wait_ns) / 1000000.0);
+  }
+}
+
+// Admission protocol for the two independent CPU execution contexts.  The
+// retry after increment closes the race where a scheduler split observes an
+// idle host callback immediately before the callback publishes itself active.
+// This keeps the callback worker pool from competing with an already-running
+// ordinary GGML CPU split without taking a mutex on the normal path.
+extern "C" void moestream_qwen4exp_cpu_split_enter() {
+  const auto wait_start = std::chrono::steady_clock::now();
+  g_qwen4exp_cpu_execution_mutex.lock();
+  g_qwen4exp_cpu_split_enter_wait_ns.fetch_add(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wait_start)
+                                .count()),
+      std::memory_order_relaxed);
+  g_qwen4exp_ordinary_cpu_active.fetch_add(1, std::memory_order_acq_rel);
+}
+
+extern "C" void moestream_qwen4exp_cpu_split_exit() {
+  g_qwen4exp_ordinary_cpu_active.fetch_sub(1, std::memory_order_acq_rel);
+  g_qwen4exp_cpu_execution_mutex.unlock();
+}
+
+struct Qwen4ExpHostNodeCpuExecutionGuard {
+  const std::chrono::steady_clock::time_point start =
+      std::chrono::steady_clock::now();
+  std::unique_lock<std::mutex> lock;
+  explicit Qwen4ExpHostNodeCpuExecutionGuard()
+      : lock(g_qwen4exp_cpu_execution_mutex) {
+    const uint64_t wait_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    g_qwen4exp_host_node_ordinary_cpu_wait_ns.fetch_add(
+        wait_ns, std::memory_order_relaxed);
+  }
+};
+
+static double qwen4exp_host_node_ordinary_cpu_wait_ms_since_last() {
+  const uint64_t wait_ns = g_qwen4exp_host_node_ordinary_cpu_wait_ns.exchange(
+      0, std::memory_order_acq_rel);
+  return static_cast<double>(wait_ns) / 1000000.0;
+}
+
+static double qwen4exp_host_node_gate_wait_ms_since_last() {
+  const uint64_t wait_ns = g_qwen4exp_host_node_cpu_gate_wait_ns.exchange(
+      0, std::memory_order_acq_rel);
+  return static_cast<double>(wait_ns) / 1000000.0;
+}
+
+static double qwen4exp_cpu_split_enter_wait_ms_since_last() {
+  const uint64_t wait_ns = g_qwen4exp_cpu_split_enter_wait_ns.exchange(
+      0, std::memory_order_acq_rel);
+  return static_cast<double>(wait_ns) / 1000000.0;
+}
+
+struct Qwen4ExpHostNodeCpuActivityGuard {
+  Qwen4ExpHostNodeCpuActivityGuard() {
+    g_qwen4exp_host_node_cpu_active.fetch_add(1, std::memory_order_acq_rel);
+  }
+  ~Qwen4ExpHostNodeCpuActivityGuard() {
+    g_qwen4exp_host_node_cpu_active.fetch_sub(1, std::memory_order_acq_rel);
+  }
+};
+
+static uint64_t qwen4exp_fnv64(const void *data, size_t bytes) {
+  constexpr uint64_t kOffset = 0xcbf29ce484222325ull;
+  constexpr uint64_t kPrime = 0x100000001b3ull;
+  uint64_t hash = kOffset;
+  const auto *p = static_cast<const unsigned char *>(data);
+  for (size_t i = 0; i < bytes; ++i) {
+    hash ^= p[i];
+    hash *= kPrime;
+  }
+  return hash;
+}
+
+static const char *env_layer13_moe_dump_path() {
+  const char *path =
+      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_DUMP");
+  return path && path[0] ? path : nullptr;
+}
+
+static const char *env_layer13_moe_input_dump_path() {
+  const char *path =
+      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_INPUT_DUMP");
+  return path && path[0] ? path : nullptr;
+}
+
+static const char *env_layer13_moe_host_input_dump_path() {
+  const char *path =
+      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_HOST_INPUT_DUMP");
+  return path && path[0] ? path : env_layer13_moe_input_dump_path();
+}
+
+static const char *env_layer13_moe_ordinary_input_dump_path() {
+  const char *path =
+      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_ORDINARY_INPUT_DUMP");
+  return path && path[0] ? path : env_layer13_moe_input_dump_path();
+}
+
+static bool qwen4exp_dump_f32(const char *path, const float *data,
+                              size_t elements) {
+  if (!path || !data)
+    return false;
+  std::FILE *file = std::fopen(path, "wb");
+  if (!file)
+    return false;
+  const size_t written =
+      std::fwrite(data, sizeof(float), elements, file);
+  const bool closed = std::fclose(file) == 0;
+  return written == elements && closed;
+}
+
+static void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
+  static thread_local bool thread_configured = false;
+  if (!thread_configured) {
+    configure_current_thread({
+        .name = "QWEN-CUDA-CB",
+        // Leave the driver callback unpinned.  A fixed orchestration core
+        // contended with the ordinary GGML CPU pool in the first A/B run.
+        .cpu_ids = {},
+        .use_rt = true,
+        .rt_priority = 85,
+        .nice_value = -20,
+        .apply_nice = false,
+    });
+    thread_configured = true;
+  }
+  auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(user_data);
+  if (!ctx || ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic)
+    return;
+
+  const auto callback_entry = std::chrono::steady_clock::now();
+  Qwen4ExpHostNodeCpuActivityGuard activity_guard;
+  const auto guard_wait_start = std::chrono::steady_clock::now();
+  Qwen4ExpHostNodeCpuExecutionGuard execution_guard;
+  const double guard_wait_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() -
+                                   guard_wait_start)
+                                   .count();
+
+  // A callback context is replayed across tokens. Invalidate the previous
+  // token's diagnostic result before doing this token's CPU work so a failed
+  // callback can never be reported with a stale hash.
+  if (ctx->transport_diag)
+    ctx->last_cpu_hash_valid.store(false, std::memory_order_release);
+
+  const auto start = std::chrono::steady_clock::now();
+  if (qwen4exp_host_node_timing_enabled()) {
+    int resident = 0;
+    for (int k = 0; k < ctx->topk; ++k) {
+      const int expert = ctx->host_ids[k];
+      if (std::find(ctx->gpu_resident_experts.begin(),
+                    ctx->gpu_resident_experts.end(), expert) !=
+          ctx->gpu_resident_experts.end())
+        ++resident;
+    }
+    LOG_INFO("[QWEN4EXP-HOST-NODE-ROUTES] layer=%d routed=%d resident=%d "
+             "cold=%d static_hot=%zu callback_mode=full-cpu\n",
+             ctx->layer_index, ctx->topk, resident, ctx->topk - resident,
+             ctx->gpu_resident_experts.size());
+    if (resident > 0) {
+      LOG_WARN("[QWEN4EXP-HOST-NODE-ROUTES] layer=%d host marker is "
+               "computing routes that have a static GPU copy; this marker "
+               "does not yet compact the cold subset\n",
+               ctx->layer_index);
+    }
+  }
+  qwen_cpu_moe_diag_set_layer(ctx->layer_index);
+  bool ok = false;
+  GgmlQwenCpuMoeRunner *runner = nullptr;
+  if (env_host_node_skip_cpu()) {
+    std::fill_n(ctx->host_output, ctx->output_bytes / sizeof(float), 0.0f);
+    ok = true;
+  } else if (ctx->projection_compact) {
+    runner = ctx->cpu_runner;
+    if (!runner)
+      runner = &GgmlQwenCpuMoeRunner::instance_for_strided_planes(
+          ctx->layer, ctx->n_experts, ctx->d_model, ctx->d_ff, ctx->topk,
+          ctx->gate_stride, ctx->up_stride, ctx->down_stride, false);
+    if (!runner->uses_external_threadpool())
+      runner->resume_workers();
+    ok = runner->run_strided_planes(
+        ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
+        ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
+        ctx->host_weights, ctx->d_model, ctx->d_ff, ctx->topk,
+        ctx->gate_stride, ctx->up_stride, ctx->down_stride);
+  } else {
+    runner = ctx->cpu_runner;
+    if (!runner)
+      runner = &GgmlQwenCpuMoeRunner::instance_for_strided(
+          ctx->layer, ctx->n_experts, ctx->d_model, ctx->d_ff, ctx->topk,
+          ctx->expert_stride, false);
+    if (!runner->uses_external_threadpool())
+      runner->resume_workers();
+    ok = runner->run_strided(
+        ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
+        ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
+        ctx->host_weights, ctx->d_model, ctx->d_ff, ctx->topk,
+        ctx->expert_stride);
+  }
+  if (runner && !runner->uses_external_threadpool())
+    runner->pause_workers();
+  const double cpu_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+  ctx->last_callback_guard_wait_ms.store(guard_wait_ms,
+                                         std::memory_order_release);
+  ctx->last_callback_body_ms.store(cpu_ms, std::memory_order_release);
+  if (ctx->transport_diag && ctx->host_output && ctx->output_bytes != 0) {
+    // This is the exact byte sequence supplied to the subsequent H2D copy.
+    // Keep this inside the callback, immediately after the CPU runner, so a
+    // later consumer cannot be mistaken for a transport diagnostic.
+    ctx->last_cpu_hash.store(qwen4exp_fnv64(ctx->host_output,
+                                            ctx->output_bytes),
+                             std::memory_order_release);
+    ctx->last_cpu_hash_valid.store(true, std::memory_order_release);
+    if (ctx->layer_index == 13) {
+      const uint64_t input_hash =
+          qwen4exp_fnv64(ctx->host_input, ctx->input_bytes);
+      const uint64_t ids_hash =
+          qwen4exp_fnv64(ctx->host_ids, ctx->ids_bytes);
+      const uint64_t weights_hash =
+          qwen4exp_fnv64(ctx->host_weights, ctx->weights_bytes);
+      LOG_INFO("[QWEN4EXP-LAYER13-ROUTE-DIAG] host input_fnv64=0x%016llx "
+               "ids_fnv64=0x%016llx weights_fnv64=0x%016llx "
+               "ids=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+               static_cast<unsigned long long>(input_hash),
+               static_cast<unsigned long long>(ids_hash),
+               static_cast<unsigned long long>(weights_hash),
+               ctx->host_ids[0], ctx->host_ids[1], ctx->host_ids[2],
+               ctx->host_ids[3], ctx->host_ids[4], ctx->host_ids[5],
+               ctx->host_ids[6], ctx->host_ids[7], ctx->host_ids[8],
+               ctx->host_ids[9]);
+      const char *input_dump = env_layer13_moe_host_input_dump_path();
+      if (input_dump) {
+        const bool dumped = qwen4exp_dump_f32(
+            input_dump, ctx->host_input,
+            ctx->input_bytes / sizeof(float));
+        LOG_INFO("[QWEN4EXP-LAYER13-INPUT-DIAG] path=host-node "
+                 "dump=%s file=%s elements=%zu\n",
+                 dumped ? "ok" : "failed", input_dump,
+                 ctx->input_bytes / sizeof(float));
+      }
+    }
+  }
+  qwen_cpu_moe_diag_set_layer(-1);
+  ctx->last_ok.store(ok, std::memory_order_release);
+  ctx->last_cpu_ms.store(cpu_ms, std::memory_order_release);
+  const double callback_total_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - callback_entry)
+          .count();
+  ctx->last_callback_total_ms.store(callback_total_ms,
+                                    std::memory_order_release);
+  if (qwen4exp_host_node_timing_enabled()) {
+    LOG_INFO("[DIAG-CUDA-CB] layer=%d total=%.3f ms body=%.3f ms "
+             "guard_wait=%.3f ms ok=%d\n",
+             ctx->layer_index, callback_total_ms, cpu_ms, guard_wait_ms,
+             ok ? 1 : 0);
+  }
+}
+
+// Runs immediately before the marker's D2H copies on replay.  The direct
+// worker team was created during graph construction; this callback only arms
+// its short active window so workers do not pay an idle futex wake while the
+// activation/route metadata reaches the main CPU callback.
+static void CUDART_CB qwen4exp_cuda_host_node_arm_direct_workers(
+    void *user_data) {
+  auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(user_data);
+  if (!ctx || ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
+      !ctx->cpu_runner)
+    return;
+  ctx->cpu_runner->arm_direct_workers();
+}
+
+// Called by the opt-in CUDA backend bridge while a CUDA stream is being
+// captured.  All CUDA work is enqueued here, outside the callback itself;
+// the callback only runs the synchronous CPU GGML MoE and returns.
+extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
+    const ggml_tensor *node, cudaStream_t stream) {
+  if (!node || node->op != GGML_OP_CPY || !node->extra || !stream)
+    return false;
+  auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(node->extra);
+  if (ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
+      !node->data || !node->src[0] || !node->src[2] || !node->src[3] ||
+      !node->src[0]->data || !node->src[2]->data || !node->src[3]->data ||
+      !ctx->host_input || !ctx->host_output || !ctx->host_ids ||
+      !ctx->host_weights || !ctx->d2h_start || !ctx->d2h_end ||
+      !ctx->h2d_start || !ctx->h2d_end)
+    return false;
+
+  ctx->device_output = node->data;
+  const char *direct_pool_env =
+      std::getenv("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+  const char *direct_fused_env =
+      std::getenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+  const bool direct_pool_requested =
+      direct_pool_env && direct_pool_env[0] == '1' &&
+      !(direct_fused_env && direct_fused_env[0] == '1');
+  if (direct_pool_requested &&
+      cudaLaunchHostFunc(stream, qwen4exp_cuda_host_node_arm_direct_workers,
+                         ctx) != cudaSuccess)
+    return false;
+  if (cudaEventRecord(ctx->d2h_start, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->host_input, node->src[0]->data, ctx->input_bytes,
+                      cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->host_ids, node->src[2]->data, ctx->ids_bytes,
+                      cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->host_weights, node->src[3]->data,
+                      ctx->weights_bytes, cudaMemcpyDeviceToHost, stream) !=
+          cudaSuccess ||
+      cudaEventRecord(ctx->d2h_end, stream) != cudaSuccess ||
+      cudaLaunchHostFunc(stream, qwen4exp_cuda_host_node_callback, ctx) !=
+          cudaSuccess ||
+      cudaEventRecord(ctx->h2d_start, stream) != cudaSuccess ||
+      cudaMemcpyAsync(node->data, ctx->host_output, ctx->output_bytes,
+                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+      cudaEventRecord(ctx->h2d_end, stream) != cudaSuccess)
+    return false;
+  if (ctx->transport_diag) {
+    if (!ctx->host_output_gpu_check || !ctx->post_h2d_check_end ||
+        cudaMemcpyAsync(ctx->host_output_gpu_check, node->data,
+                        ctx->output_bytes, cudaMemcpyDeviceToHost, stream) !=
+            cudaSuccess ||
+        cudaEventRecord(ctx->post_h2d_check_end, stream) != cudaSuccess)
+      return false;
+  }
+  return true;
+}
+
 namespace {
 
 extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
+extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(
+    ggml_backend_t backend, const ggml_tensor *first_node);
+extern "C" void *moestream_qwen4exp_master_predicate_kernel_ptr();
 
 constexpr int kGraphSize = 50000;
 constexpr size_t kTensorContextBytes = 128ull * 1024ull * 1024ull;
@@ -124,6 +583,36 @@ struct FullGraph {
   // relying on tensor names at all.
   std::unordered_map<const ggml_tensor *, std::pair<int, const char *>>
       layer_timing_layer_of; // tensor -> (layer, op stem label)
+  // Opt-in Layer-0 quantization-path diagnostic. These graph-owned
+  // intermediates are retained only so the first compute can dump the
+  // actual gate/up values; the normal path never populates or reads them.
+  bool layer0_diag_enabled = false;
+  bool layer0_diag_dumped = false;
+  ggml_tensor *layer0_diag_gate = nullptr;
+  ggml_tensor *layer0_diag_up = nullptr;
+  ggml_tensor *layer0_diag_act = nullptr;
+  ggml_tensor *layer0_diag_down = nullptr;
+  ggml_tensor *layer0_diag_gate_up = nullptr;
+  ggml_tensor *layer0_diag_residual_before = nullptr;
+  ggml_tensor *layer0_diag_moe_block = nullptr;
+  ggml_tensor *layer0_diag_shared = nullptr;
+  ggml_tensor *layer0_diag_moe_plus_shared = nullptr;
+  ggml_tensor *layer0_diag_residual_after = nullptr;
+  ggml_tensor *layer0_diag_next_consumer = nullptr;
+  ggml_tensor *layer0_diag_residual_before_snapshot = nullptr;
+  ggml_tensor *layer0_diag_moe_plus_shared_snapshot = nullptr;
+  ggml_tensor *layer0_diag_residual_after_snapshot = nullptr;
+  ggml_tensor *layer0_diag_next_consumer_snapshot = nullptr;
+  // Optional one-shot raw routed-MoE output dump for Layer 13. This is
+  // deliberately before the shared expert and residual combine so the
+  // ordinary GGML CPU path and the host-node callback are compared at the
+  // same semantic boundary.
+  bool layer13_moe_diag_enabled = false;
+  bool layer13_moe_diag_dumped = false;
+  ggml_tensor *layer13_moe_diag = nullptr;
+  ggml_tensor *layer13_moe_input_diag = nullptr;
+  ggml_tensor *layer13_moe_ids_diag = nullptr;
+  ggml_tensor *layer13_moe_weights_diag = nullptr;
   ggml_backend_buffer_t device_expert_buffer = nullptr;
   void *device_expert_base = nullptr;
   size_t device_expert_capacity = 0;
@@ -183,6 +672,12 @@ struct FullGraph {
   // already claim. Empty/absent entry = no split for that layer (today's
   // behavior, unchanged). v1 scope: decode only (S==1) -- see build_moe.
   std::unordered_map<int, std::vector<int>> split_gpu_expert_ids;
+  // Phase 2 suffix graphs borrow the immutable VRAM expert arena from the
+  // prefix owner.  Expert tensors are keyed by their source layout because
+  // the same logical layer can be represented as a full, strided, gathered,
+  // or compact gate/up tensor depending on the graph path.
+  FullGraph *phase2_expert_source_graph = nullptr;
+  std::unordered_map<std::string, void *> phase2_expert_addrs;
   // Layer-13 staging proof. The graph keeps fixed compact GPU tensors; each
   // decode token refreshes one or more cold expert records from the
   // active-layer pool before graph replay.
@@ -208,6 +703,10 @@ struct FullGraph {
   std::vector<int> stage_experts;
   std::vector<StageBinding> stage_bindings;
   std::vector<ExpertLocation *> stage_slots;
+  // Stable per-layer contexts for the opt-in CUDA host-node bridge. These
+  // must outlive graph capture and every replay; they are cleared only after
+  // the scheduler/graph objects have been torn down.
+  std::vector<std::unique_ptr<Qwen4ExpCudaHostNodeContext>> host_node_contexts;
   const uint8_t *stage_src_gate = nullptr;
   const uint8_t *stage_src_up = nullptr;
   const uint8_t *stage_src_down = nullptr;
@@ -278,6 +777,13 @@ struct FullGraph {
   FullGraph *phase2_state_source_graph = nullptr;
   std::vector<void *> phase2_state_addrs;
   size_t phase2_state_replay_cursor = 0;
+  // Phase 2 sibling graphs use the same read-only dense-weight arena.  The
+  // source graph owns the CUDA buffer; borrowers bind their own ggml tensor
+  // handles to the source addresses.  Unlike the state arena above, dense
+  // weights are keyed by model tensor name because prefix and suffix graphs
+  // do not materialize the same layer range.
+  FullGraph *phase2_dense_source_graph = nullptr;
+  std::unordered_map<std::string, void *> phase2_dense_addrs;
   ggml_context *ctx = nullptr;
   ggml_cgraph *graph = nullptr;
 
@@ -346,6 +852,18 @@ struct FullGraph {
       ggml_backend_sched_free(sched);
       sched = nullptr;
     }
+    // Host-node CPU runners borrow this graph-owned pool.  Detach them after
+    // the scheduler is gone, but before the pool itself is destroyed.  The
+    // runner's graph plan is synchronous, so no callback can still be using
+    // it once graph teardown begins.
+    for (auto &host_node : host_node_contexts) {
+      if (host_node && host_node->cpu_runner &&
+          host_node->shared_cpu_threadpool) {
+        host_node->cpu_runner->unbind_external_threadpool(
+            host_node->shared_cpu_threadpool);
+        host_node->cpu_runner = nullptr;
+      }
+    }
     if (stage_wait_done_event || stage_wait_start_event ||
         stage_d2d_start_event ||
         stage_d2d_end_event || stage_compute_start_event ||
@@ -386,17 +904,17 @@ struct FullGraph {
       ggml_backend_free(cpu);
       cpu = nullptr;
     }
-    if (device_expert_buffer) {
+    if (device_expert_buffer && !phase2_expert_source_graph) {
       ggml_backend_buffer_free(device_expert_buffer);
-      device_expert_buffer = nullptr;
     }
+    device_expert_buffer = nullptr;
     device_expert_base = nullptr;
     device_expert_capacity = 0;
     device_expert_used = 0;
-    if (device_dense_buffer) {
+    if (device_dense_buffer && !phase2_dense_source_graph) {
       ggml_backend_buffer_free(device_dense_buffer);
-      device_dense_buffer = nullptr;
     }
+    device_dense_buffer = nullptr;
     device_dense_base = nullptr;
     device_dense_capacity = 0;
     device_dense_used = 0;
@@ -411,6 +929,8 @@ struct FullGraph {
     device_expert_layers = 0;
     device_expert_partial_gate_up = false;
     split_gpu_expert_ids.clear();
+    phase2_expert_source_graph = nullptr;
+    phase2_expert_addrs.clear();
     partial_layer_ids_out = nullptr;
     partial_layer_probs_out = nullptr;
     // Only the Prefix instance owns phase2_handoff_buf (a standalone
@@ -427,6 +947,28 @@ struct FullGraph {
     phase2_state_source_graph = nullptr;
     phase2_state_addrs.clear();
     phase2_state_replay_cursor = 0;
+    phase2_dense_source_graph = nullptr;
+    phase2_dense_addrs.clear();
+    for (auto &host_node : host_node_contexts) {
+      if (!host_node)
+        continue;
+      if (host_node->d2h_start)
+        cudaEventDestroy(host_node->d2h_start);
+      if (host_node->d2h_end)
+        cudaEventDestroy(host_node->d2h_end);
+      if (host_node->h2d_start)
+        cudaEventDestroy(host_node->h2d_start);
+      if (host_node->h2d_end)
+        cudaEventDestroy(host_node->h2d_end);
+      if (host_node->post_h2d_check_end)
+        cudaEventDestroy(host_node->post_h2d_check_end);
+      host_node->d2h_start = nullptr;
+      host_node->d2h_end = nullptr;
+      host_node->h2d_start = nullptr;
+      host_node->h2d_end = nullptr;
+      host_node->post_h2d_check_end = nullptr;
+    }
+    host_node_contexts.clear();
     for (ggml_backend_buffer_t b : host_buffers) {
       if (b)
         ggml_backend_buffer_free(b);
@@ -545,6 +1087,24 @@ bool env_layer_timing_enabled() {
   return v && v[0] == '1';
 }
 
+// Decode phase ledger for the Phase-2/master-graph A/B.  This is deliberately
+// separate from the per-CPU-node callback timing above: it brackets the
+// scheduler submission, route decision/readback, suffix submission, output
+// readback, and (for the master path) the actual device graph span.
+bool env_phase_timing_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PHASE_TIMING");
+  return v && v[0] == '1';
+}
+
+// Phase 4 host-node integration is deliberately a separate opt-in from the
+// ordinary full graph.  It is only safe when the graph builder replaces the
+// configured CPU MoE nodes with the fused CPY markers; an unset variable must
+// retain the proven scheduler-split path byte-for-byte.
+bool env_qwen4exp_host_node_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+  return v && v[0] == '1';
+}
+
 // Runtime guard (2026-09-19): CMakeLists.txt already documents that a plain
 // MOESTREAM_USE_GGML_CUDA build can silently compile out ggml-cuda's CUDA
 // graph capture/replay path (GGML_CUDA_USE_GRAPHS never defined) -- this
@@ -606,6 +1166,14 @@ bool env_layer_timing_verbose() {
   return v && v[0] == '1';
 }
 
+// Opt-in ledger for the CUDA graph replay boundary and ordinary GGML CPU
+// backend work.  Keep this disabled by default because it adds steady_clock
+// reads to the replay path.
+bool env_graph_replay_timing_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_REPLAY_TIMING");
+  return v && v[0] == '1';
+}
+
 // The merged gate/up representation is intentionally runtime-switchable while
 // its CUDA and CPU kernel cost is being compared with the established
 // three-projection graph.  It is opt-in until the doubled-row MUL_MAT_ID path
@@ -614,6 +1182,138 @@ bool env_layer_timing_verbose() {
 bool env_merged_gate_up_enabled() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MERGED_GATE_UP");
   return v && v[0] == '1';
+}
+
+bool env_layer0_iq2_diag_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+  return v && v[0] == '1';
+}
+
+// Host-node transport diagnostic. The layer is selected explicitly so the
+// same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
+// applied to Layer 13 without enabling diagnostics for every callback.
+int env_host_node_diag_layer() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_DIAG_LAYER");
+  if (!v || !v[0])
+    return -1;
+  char *end = nullptr;
+  const long layer = std::strtol(v, &end, 10);
+  if (end == v || *end != '\0' || layer < 0 || layer > 47)
+    return -1;
+  return static_cast<int>(layer);
+}
+
+bool env_host_node_transport_diag_enabled(int layer) {
+  return (layer == 0 && env_layer0_iq2_diag_enabled()) ||
+         layer == env_host_node_diag_layer();
+}
+
+// Narrow laboratory mode for the Layer-0 host-node residual/consumer
+// diagnostic. The ordinary full graph deliberately requires a complete DDR
+// arena for every layer when ram_preload_all_experts is enabled. That is the
+// right production safety rule, but it makes a one-layer diagnostic depend on
+// having enough RAM for the whole model. In this mode only Layer 0's callback
+// boundary is required to use a complete arena; other layers keep the normal
+// graph-owned source path.
+bool env_layer0_narrow_graph_diag_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
+  return v && v[0] == '1';
+}
+
+void log_layer0_diag_tensor(const char *role, const ggml_tensor *t) {
+  if (!t) {
+    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s=<null>\n", role);
+    return;
+  }
+  const char *buft = "unbound";
+  const char *dev = "unbound";
+  if (t->buffer) {
+    const auto type = ggml_backend_buffer_get_type(t->buffer);
+    buft = ggml_backend_buft_name(type);
+    if (const auto device = ggml_backend_buft_get_device(type))
+      dev = ggml_backend_dev_name(device);
+  }
+  LOG_INFO(
+      "[QWEN4EXP-LAYER0-DIAG] %s type=%s backend=%s device=%s "
+      "ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] data=%p\n",
+      role, ggml_type_name(t->type), buft, dev,
+      static_cast<long long>(t->ne[0]), static_cast<long long>(t->ne[1]),
+      static_cast<long long>(t->ne[2]), static_cast<long long>(t->ne[3]),
+      t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->data);
+}
+
+void log_layer0_diag_host_values(const char *role, const float *values,
+                                 size_t n) {
+  if (!values || n == 0)
+    return;
+  float min_v = INFINITY;
+  float max_v = -INFINITY;
+  double sum = 0.0;
+  std::ostringstream first;
+  for (size_t i = 0; i < n; ++i) {
+    min_v = std::min(min_v, values[i]);
+    max_v = std::max(max_v, values[i]);
+    sum += values[i];
+    if (i < 8)
+      first << (i ? "," : "") << std::setprecision(9) << values[i];
+  }
+  LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s values=%zu first=[%s] min=%.9g "
+           "max=%.9g sum=%.9g data=%p\n",
+           role, n, first.str().c_str(), min_v, max_v, sum,
+           static_cast<const void *>(values));
+}
+
+void dump_layer0_diag_values(FullGraph &g) {
+  if (!g.layer0_diag_enabled || g.layer0_diag_dumped)
+    return;
+  g.layer0_diag_dumped = true;
+  if (!g.layer0_diag_gate || !g.layer0_diag_up)
+    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] numeric gate/up outputs unavailable "
+             "for this graph (host-node or no separate projection result)\n");
+  auto dump = [](const char *role, const ggml_tensor *t) {
+    if (!t)
+      return;
+    const size_t n = static_cast<size_t>(ggml_nelements(t));
+    std::vector<float> values(n, 0.0f);
+    ggml_backend_tensor_get(t, values.data(), 0, n * sizeof(float));
+    float min_v = INFINITY;
+    float max_v = -INFINITY;
+    double sum = 0.0;
+    std::ostringstream first;
+    for (size_t i = 0; i < n; ++i) {
+      min_v = std::min(min_v, values[i]);
+      max_v = std::max(max_v, values[i]);
+      sum += values[i];
+      if (i < 8)
+        first << (i ? "," : "") << std::setprecision(9) << values[i];
+    }
+    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s values=%zu first=[%s] min=%.9g "
+             "max=%.9g sum=%.9g\n",
+             role, n, first.str().c_str(), min_v, max_v, sum);
+  };
+  if (g.layer0_diag_gate)
+    dump("gate_output", g.layer0_diag_gate);
+  if (g.layer0_diag_up)
+    dump("up_output", g.layer0_diag_up);
+  dump("down_input_swiglu", g.layer0_diag_act);
+  dump("down_output_raw", g.layer0_diag_down);
+  // The following graph-owned tensors may alias later allocations by the
+  // time the whole graph has retired. Their exact values are reported from
+  // the host snapshots below instead.
+  auto dump_snapshot = [](const char *role, const ggml_tensor *t) {
+    if (!t || !t->data)
+      return;
+    log_layer0_diag_host_values(role, static_cast<const float *>(t->data),
+                                static_cast<size_t>(ggml_nelements(t)));
+  };
+  dump_snapshot("residual_before_moe_snapshot",
+                g.layer0_diag_residual_before_snapshot);
+  dump_snapshot("moe_plus_shared_snapshot",
+                g.layer0_diag_moe_plus_shared_snapshot);
+  dump_snapshot("residual_after_moe_add_snapshot",
+                g.layer0_diag_residual_after_snapshot);
+  dump_snapshot("layer1_first_consumer_snapshot",
+                g.layer0_diag_next_consumer_snapshot);
 }
 
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
@@ -820,7 +1520,13 @@ int graph_cpu_threads() {
 #if defined(_OPENMP)
   const int available = std::max(1, omp_get_max_threads());
 #else
-  const int available = 1;
+  // The native ggml CPU backend has its own persistent worker pool when
+  // OpenMP is disabled.  Using one thread here would make the non-OpenMP
+  // build an accidental serial baseline and would also defeat the host-node
+  // runner's shared-pool experiment.
+  const unsigned hw_threads = std::thread::hardware_concurrency();
+  const int available = std::max(
+      1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
 #endif
   const char *v = std::getenv("MOESTREAM_QWEN_CPU_THREADS");
   if (v && v[0]) {
@@ -930,6 +1636,22 @@ ggml_backend_buffer_t bind_host(FullGraph &g, ggml_tensor *t, void *ptr,
   return b;
 }
 
+// A preallocated host buffer and a scheduler backend assignment are separate
+// pieces of state in ggml_backend_sched.  The former keeps gallocr from
+// allocating storage for the tensor; the latter keeps the operation that
+// consumes the tensor on the CPU backend.  This matters for full-graph
+// Qwen4Exp builds: without the explicit assignment, a host-backed expert
+// weight can be reconsidered during scheduler splitting and its CPU-layer
+// MoE subtree can be represented as a CUDA allocation request.  At 22 GPU /
+// 26 CPU layers that request is approximately the full 26-layer expert
+// footprint (~88 GiB), instead of a small activation workspace.
+void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
+  if (!g.sched || !g.cpu || !t || !t->buffer ||
+      !ggml_backend_buffer_is_host(t->buffer))
+    return;
+  ggml_backend_sched_set_tensor_backend(g.sched, t, g.cpu);
+}
+
 void *alloc_host(FullGraph &g, size_t bytes) {
   void *p = nullptr;
   if (bytes == 0)
@@ -973,6 +1695,51 @@ ggml_tensor *host_input(FullGraph &g, ggml_context *ctx, ggml_type type,
   return t;
 }
 
+// Diagnostic-only snapshot for tensors whose GGML allocator storage may be
+// reused later in the graph.  Reading such a tensor after the full graph has
+// retired can observe a later consumer's data, so materialize the value at
+// the exact graph position into a persistent host buffer.
+ggml_tensor *layer0_diag_snapshot(FullGraph &g, ggml_context *ctx,
+                                   ggml_tensor *src, const char *name) {
+  if (!g.layer0_diag_enabled || !src || !g.graph)
+    return nullptr;
+  const size_t bytes = ggml_nbytes(src);
+  const std::vector<int64_t> shape = {src->ne[0], src->ne[1], src->ne[2],
+                                      src->ne[3]};
+  ggml_tensor *dst = host_input(g, ctx, GGML_TYPE_F32, shape, bytes, name);
+  if (!dst)
+    return nullptr;
+  ggml_tensor *copy = ggml_cpy(ctx, src, dst);
+  if (!copy)
+    return nullptr;
+  ggml_set_name(copy, name);
+  ggml_build_forward_expand(g.graph, copy);
+  return dst;
+}
+
+ggml_tensor *layer13_moe_diag_snapshot(
+    FullGraph &g, ggml_context *ctx, ggml_tensor *src, ggml_type type,
+    const std::vector<int64_t> &shape, const char *name) {
+  if (!g.layer13_moe_diag_enabled || !src || !g.graph)
+    return nullptr;
+  size_t elements = 1;
+  for (const int64_t dim : shape) {
+    if (dim <= 0 || elements > SIZE_MAX / static_cast<size_t>(dim))
+      return nullptr;
+    elements *= static_cast<size_t>(dim);
+  }
+  ggml_tensor *dst = host_input(
+      g, ctx, type, shape, elements * ggml_type_size(type), name);
+  if (!dst)
+    return nullptr;
+  ggml_tensor *copy = ggml_cpy(ctx, src, dst);
+  if (!copy)
+    return nullptr;
+  ggml_set_name(copy, name);
+  ggml_build_forward_expand(g.graph, copy);
+  return dst;
+}
+
 const QuantizedTensor *resident(const StreamingEngine &engine,
                                 const std::string &name) {
   auto it = engine.resident_layers.find(name);
@@ -998,33 +1765,52 @@ ggml_tensor *resident_tensor(
     return nullptr;
   if (g.device_dense_buffer && usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
       graph_dense_weight_name(name)) {
-    const ggml_backend_buffer_type_t buft =
-        ggml_backend_buffer_get_type(g.device_dense_buffer);
-    const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-    const size_t alignment =
-        std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
-    const size_t aligned =
-        (g.device_dense_used + alignment - 1) & ~(alignment - 1);
-    if (aligned > g.device_dense_capacity ||
-        alloc_size > g.device_dense_capacity - aligned)
-      return nullptr;
-    void *addr = static_cast<uint8_t *>(g.device_dense_base) + aligned;
-    if (ggml_backend_tensor_alloc(g.device_dense_buffer, t, addr) !=
-        GGML_STATUS_SUCCESS)
-      return nullptr;
-    const auto t_memcpy_start = std::chrono::steady_clock::now();
-    const cudaError_t err = cudaMemcpy(addr, q->host_ptr, q->meta.size_bytes,
-                                       cudaMemcpyHostToDevice);
-    g.dense_upload_ms_total += std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() -
-                                  t_memcpy_start)
-                                  .count();
-    if (err != cudaSuccess) {
-      LOG_ERROR("[GGML-QWEN-FULL] dense device upload failed for %s: %s\n",
-                name.c_str(), cudaGetErrorString(err));
-      return nullptr;
+    // Prefix/suffix Phase 2 graphs are mutually exclusive at runtime and
+    // only read these weights.  Reuse the prefix-owned buffer rather than
+    // allocating and uploading a full dense arena for every graph instance.
+    // A suffix may request a name the prefix never materialized; in that
+    // case append it to the owner's pre-sized arena and record the address
+    // for the remaining siblings.
+    FullGraph &owner = g.phase2_dense_source_graph
+                           ? *g.phase2_dense_source_graph
+                           : g;
+    auto existing = owner.phase2_dense_addrs.find(name);
+    void *addr = nullptr;
+    if (existing != owner.phase2_dense_addrs.end()) {
+      addr = existing->second;
+      if (ggml_backend_tensor_alloc(owner.device_dense_buffer, t, addr) !=
+          GGML_STATUS_SUCCESS)
+        return nullptr;
+    } else {
+      const ggml_backend_buffer_type_t buft =
+          ggml_backend_buffer_get_type(owner.device_dense_buffer);
+      const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+      const size_t alignment =
+          std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+      const size_t aligned =
+          (owner.device_dense_used + alignment - 1) & ~(alignment - 1);
+      if (aligned > owner.device_dense_capacity ||
+          alloc_size > owner.device_dense_capacity - aligned)
+        return nullptr;
+      addr = static_cast<uint8_t *>(owner.device_dense_base) + aligned;
+      if (ggml_backend_tensor_alloc(owner.device_dense_buffer, t, addr) !=
+          GGML_STATUS_SUCCESS)
+        return nullptr;
+      const auto t_memcpy_start = std::chrono::steady_clock::now();
+      const cudaError_t err = cudaMemcpy(
+          addr, q->host_ptr, q->meta.size_bytes, cudaMemcpyHostToDevice);
+      owner.dense_upload_ms_total += std::chrono::duration<double, std::milli>(
+                                        std::chrono::steady_clock::now() -
+                                        t_memcpy_start)
+                                        .count();
+      if (err != cudaSuccess) {
+        LOG_ERROR("[GGML-QWEN-FULL] dense device upload failed for %s: %s\n",
+                  name.c_str(), cudaGetErrorString(err));
+        return nullptr;
+      }
+      owner.device_dense_used = aligned + alloc_size;
+      owner.phase2_dense_addrs.emplace(name, addr);
     }
-    g.device_dense_used = aligned + alloc_size;
     ++g.device_dense_tensors;
   } else if (!bind_host(g, t, q->host_ptr, q->meta.size_bytes, usage)) {
     return nullptr;
@@ -1061,6 +1847,22 @@ bool graph_dense_weight_name(const std::string &name) {
 }
 
 bool init_device_dense_arena(FullGraph &g) {
+  if (g.phase2_dense_source_graph) {
+    FullGraph &source = *g.phase2_dense_source_graph;
+    if (!source.device_dense_buffer || !source.device_dense_base ||
+        source.device_dense_capacity == 0)
+      return false;
+    g.device_dense_buffer = source.device_dense_buffer;
+    g.device_dense_base = source.device_dense_base;
+    g.device_dense_capacity = source.device_dense_capacity;
+    g.device_dense_used = 0;
+    g.device_dense_tensors = 0;
+    LOG_INFO("[GGML-QWEN-FULL] dense device arena borrowed from Phase 2 "
+             "source: %.2f GiB\n",
+             static_cast<double>(g.device_dense_capacity) /
+                 (1024.0 * 1024.0 * 1024.0));
+    return true;
+  }
   size_t bytes = 0;
   int tensors = 0;
   for (const auto &[name, q] : g.engine->resident_layers) {
@@ -1742,6 +2544,27 @@ size_t device_expert_bytes(const FullGraph &g) {
 }
 
 bool init_device_expert_arena(FullGraph &g) {
+  if (g.phase2_expert_source_graph) {
+    FullGraph &source = *g.phase2_expert_source_graph;
+    if (!source.device_expert_buffer || !source.device_expert_base ||
+        source.device_expert_capacity == 0)
+      return false;
+    // The owner may have reduced a whole-layer request to fit the actual
+    // device budget.  Reuse its final placement/layout, not this borrower's
+    // original request, so every graph binds the same physical records.
+    g.device_expert_layers = source.device_expert_layers;
+    g.device_expert_partial_gate_up = source.device_expert_partial_gate_up;
+    g.split_gpu_expert_ids = source.split_gpu_expert_ids;
+    g.device_expert_buffer = source.device_expert_buffer;
+    g.device_expert_base = source.device_expert_base;
+    g.device_expert_capacity = source.device_expert_capacity;
+    g.device_expert_used = 0;
+    LOG_INFO("[GGML-QWEN-FULL] device expert arena borrowed from Phase 2 "
+             "source: %.2f GiB\n",
+             static_cast<double>(g.device_expert_capacity) /
+                 (1024.0 * 1024.0 * 1024.0));
+    return true;
+  }
   const bool split_active = !g.split_gpu_expert_ids.empty();
   // See device_expert_bytes's own comment: the Phase 1/2 partial-layer
   // compact tensor needs this same arena, on every decode instance that
@@ -2000,24 +2823,64 @@ bool init_device_expert_arena(FullGraph &g) {
   return true;
 }
 
+std::string phase2_expert_ptr_text(const void *ptr) {
+  return std::to_string(reinterpret_cast<uintptr_t>(ptr));
+}
+
+// Allocate one immutable expert tensor in the owner arena, or bind a sibling
+// graph's tensor handle to the already allocated address.  The owner arena is
+// sized before any graph is built; this helper only advances its bump cursor
+// within that union-sized buffer and never allocates a second CUDA buffer.
+bool phase2_bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
+                                    const std::string &key, void **addr_out,
+                                    bool *new_allocation) {
+  if (!g.device_expert_buffer || !t || !addr_out || !new_allocation)
+    return false;
+  FullGraph &owner = g.phase2_expert_source_graph
+                         ? *g.phase2_expert_source_graph
+                         : g;
+  auto existing = owner.phase2_expert_addrs.find(key);
+  if (existing != owner.phase2_expert_addrs.end()) {
+    *addr_out = existing->second;
+    *new_allocation = false;
+    return ggml_backend_tensor_alloc(owner.device_expert_buffer, t,
+                                     *addr_out) == GGML_STATUS_SUCCESS;
+  }
+
+  const ggml_backend_buffer_type_t buft =
+      ggml_backend_buffer_get_type(owner.device_expert_buffer);
+  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+  constexpr size_t kAlignment = 256;
+  const size_t alignment =
+      std::max<size_t>(kAlignment, ggml_backend_buft_get_alignment(buft));
+  const size_t aligned =
+      (owner.device_expert_used + alignment - 1) & ~(alignment - 1);
+  if (aligned > owner.device_expert_capacity ||
+      alloc_size > owner.device_expert_capacity - aligned)
+    return false;
+  void *addr = static_cast<uint8_t *>(owner.device_expert_base) + aligned;
+  if (ggml_backend_tensor_alloc(owner.device_expert_buffer, t, addr) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  owner.device_expert_used = aligned + alloc_size;
+  owner.phase2_expert_addrs.emplace(key, addr);
+  *addr_out = addr;
+  *new_allocation = true;
+  return true;
+}
+
 bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host,
                         size_t bytes) {
   if (!g.device_expert_buffer || !t || !host || bytes < ggml_nbytes(t))
     return false;
-  const ggml_backend_buffer_type_t buft =
-      ggml_backend_buffer_get_type(g.device_expert_buffer);
-  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-  const size_t alignment =
-      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
-  const size_t aligned =
-      (g.device_expert_used + alignment - 1) & ~(alignment - 1);
-  if (aligned > g.device_expert_capacity ||
-      alloc_size > g.device_expert_capacity - aligned)
+  const std::string key = "single:" + phase2_expert_ptr_text(host) + ":" +
+                          std::to_string(bytes);
+  void *addr = nullptr;
+  bool new_allocation = false;
+  if (!phase2_bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
     return false;
-  void *addr = static_cast<uint8_t *>(g.device_expert_base) + aligned;
-  if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
-      GGML_STATUS_SUCCESS)
-    return false;
+  if (!new_allocation)
+    return true;
   const auto t_memcpy_start = std::chrono::steady_clock::now();
   const cudaError_t err = cudaMemcpy(addr, host, bytes, cudaMemcpyHostToDevice);
   g.expert_upload_ms_total += std::chrono::duration<double, std::milli>(
@@ -2030,7 +2893,6 @@ bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host,
               cudaGetErrorString(err));
     return false;
   }
-  g.device_expert_used = aligned + alloc_size;
   return true;
 }
 
@@ -2058,20 +2920,16 @@ bool bind_device_expert_strided(FullGraph &g, ggml_tensor *t, const void *base,
       per_expert_bytes * static_cast<size_t>(n_experts);
   if (total_bytes < ggml_nbytes(t))
     return false;
-  const ggml_backend_buffer_type_t buft =
-      ggml_backend_buffer_get_type(g.device_expert_buffer);
-  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-  const size_t alignment =
-      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
-  const size_t aligned =
-      (g.device_expert_used + alignment - 1) & ~(alignment - 1);
-  if (aligned > g.device_expert_capacity ||
-      alloc_size > g.device_expert_capacity - aligned)
+  const std::string key =
+      "strided:" + phase2_expert_ptr_text(base) + ":" +
+      std::to_string(src_stride) + ":" + std::to_string(per_expert_bytes) +
+      ":" + std::to_string(n_experts);
+  void *addr = nullptr;
+  bool new_allocation = false;
+  if (!phase2_bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
     return false;
-  void *addr = static_cast<uint8_t *>(g.device_expert_base) + aligned;
-  if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
-      GGML_STATUS_SUCCESS)
-    return false;
+  if (!new_allocation)
+    return true;
   const auto t_memcpy_start = std::chrono::steady_clock::now();
   const cudaError_t err =
       cudaMemcpy2D(addr, per_expert_bytes, base, src_stride, per_expert_bytes,
@@ -2086,7 +2944,6 @@ bool bind_device_expert_strided(FullGraph &g, ggml_tensor *t, const void *base,
               cudaGetErrorString(err));
     return false;
   }
-  g.device_expert_used = aligned + alloc_size;
   return true;
 }
 
@@ -2108,20 +2965,15 @@ bool bind_device_expert_gather(FullGraph &g, ggml_tensor *t,
   const size_t total_bytes = per_expert_bytes * src_ptrs.size();
   if (total_bytes < ggml_nbytes(t))
     return false;
-  const ggml_backend_buffer_type_t buft =
-      ggml_backend_buffer_get_type(g.device_expert_buffer);
-  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-  const size_t alignment =
-      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
-  const size_t aligned =
-      (g.device_expert_used + alignment - 1) & ~(alignment - 1);
-  if (aligned > g.device_expert_capacity ||
-      alloc_size > g.device_expert_capacity - aligned)
+  std::string key = "gather:" + std::to_string(per_expert_bytes);
+  for (const void *src : src_ptrs)
+    key += ":" + phase2_expert_ptr_text(src);
+  void *addr = nullptr;
+  bool new_allocation = false;
+  if (!phase2_bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
     return false;
-  void *addr = static_cast<uint8_t *>(g.device_expert_base) + aligned;
-  if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
-      GGML_STATUS_SUCCESS)
-    return false;
+  if (!new_allocation)
+    return true;
   for (size_t k = 0; k < src_ptrs.size(); ++k) {
     void *dst = static_cast<uint8_t *>(addr) + k * per_expert_bytes;
     const cudaError_t err =
@@ -2139,7 +2991,6 @@ bool bind_device_expert_gather(FullGraph &g, ggml_tensor *t,
       return false;
     }
   }
-  g.device_expert_used = aligned + alloc_size;
   return true;
 }
 
@@ -2173,20 +3024,17 @@ bool bind_device_expert_strided_gate_up(FullGraph &g, ggml_tensor *t,
       per_expert_bytes * static_cast<size_t>(n_experts);
   if (total_bytes < ggml_nbytes(t))
     return false;
-  const ggml_backend_buffer_type_t buft =
-      ggml_backend_buffer_get_type(g.device_expert_buffer);
-  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
-  const size_t alignment =
-      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
-  const size_t aligned =
-      (g.device_expert_used + alignment - 1) & ~(alignment - 1);
-  if (aligned > g.device_expert_capacity ||
-      alloc_size > g.device_expert_capacity - aligned)
+  const std::string key =
+      "strided_gate_up:" + phase2_expert_ptr_text(gate_base) + ":" +
+      std::to_string(gate_stride) + ":" + std::to_string(gate_bytes) + ":" +
+      phase2_expert_ptr_text(up_base) + ":" + std::to_string(up_stride) +
+      ":" + std::to_string(up_bytes) + ":" + std::to_string(n_experts);
+  void *addr = nullptr;
+  bool new_allocation = false;
+  if (!phase2_bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
     return false;
-  void *addr = static_cast<uint8_t *>(g.device_expert_base) + aligned;
-  if (ggml_backend_tensor_alloc(g.device_expert_buffer, t, addr) !=
-      GGML_STATUS_SUCCESS)
-    return false;
+  if (!new_allocation)
+    return true;
   const auto t_memcpy_start = std::chrono::steady_clock::now();
   cudaError_t err =
       cudaMemcpy2D(addr, per_expert_bytes, gate_base, gate_stride, gate_bytes,
@@ -2205,7 +3053,6 @@ bool bind_device_expert_strided_gate_up(FullGraph &g, ggml_tensor *t,
               cudaGetErrorString(err));
     return false;
   }
-  g.device_expert_used = aligned + alloc_size;
   return true;
 }
 
@@ -2290,6 +3137,7 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
         g.host_ram_alias_bytes += ram_arena_bytes;
       ++g.host_ram_alias_tensors;
       ggml_set_name(t, name.c_str());
+      bind_host_expert_scheduler_backend(g, t);
       return t;
     }
 
@@ -2308,7 +3156,11 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
       if (end != name.c_str() + 4 && end && *end == '.')
         graph_ram_layer = static_cast<int>(parsed);
     }
-    if (graph_ram_layer >= 0 && g.engine->qwen_ram_preload_all_experts) {
+    const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
+    const bool require_preloaded_ram =
+        g.engine->qwen_ram_preload_all_experts &&
+        (!narrow_layer0_diag || graph_ram_layer == 0);
+    if (graph_ram_layer >= 0 && require_preloaded_ram) {
       LOG_WARN("[GGML-QWEN-FULL] refusing file-backed expert source for "
                "layer=%d: ram_preload_all_experts requires the preloaded "
                "DDR arena\n",
@@ -2372,6 +3224,8 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
   }
   g.host_weight_bytes += bytes;
   ggml_set_name(t, name.c_str());
+  if (!device_resident)
+    bind_host_expert_scheduler_backend(g, t);
   return t;
 }
 
@@ -2477,6 +3331,8 @@ ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
     ++g.host_ram_alias_tensors;
   }
   ggml_set_name(t, (base + "ffn_gate_up_exps.weight").c_str());
+  if (!device_resident)
+    bind_host_expert_scheduler_backend(g, t);
   return t;
 }
 
@@ -2692,6 +3548,265 @@ ggml_tensor *hc_combine(FullGraph &g, ggml_context *ctx, ggml_tensor *residual,
   return ggml_add(ctx, residual, ggml_mul(ctx, b, w));
 }
 
+void *alloc_registered_host(FullGraph &g, size_t bytes) {
+  void *ptr = alloc_host(g, bytes);
+  if (!ptr || bytes == 0)
+    return nullptr;
+  const cudaError_t err =
+      cudaHostRegister(ptr, bytes, cudaHostRegisterPortable);
+  if (err != cudaSuccess) {
+    cudaGetLastError();
+    LOG_WARN("[QWEN4EXP-HOST-NODE] pinned host registration declined for "
+             "%zu bytes: %s\n",
+             bytes, cudaGetErrorString(err));
+    return nullptr;
+  }
+  g.owned.back().pinned = true;
+  g.host_pinned_bytes += bytes;
+  return ptr;
+}
+
+// Replace one complete routed MoE FFN with a CUDA-captured host marker. The
+// marker carries route tensors as hidden GGML dependencies, while the bridge
+// uses fixed pinned buffers and an immutable DDR arena. Both the legacy
+// interleaved arena and the newer projection-compact arena are supported;
+// the latter is passed to GGML through three independent expert-axis strides.
+// This is intentionally decode-only: the CPU runner's strided interface is a
+// single-token contract and the scheduler-split prefill path remains unchanged.
+ggml_tensor *build_qwen4exp_host_node(
+    FullGraph &g, ggml_context *ctx, ggml_tensor *cur, ggml_tensor *ids,
+    ggml_tensor *weights, int layer) {
+  if (!g.decode_mode || g.S != 1 || !g.engine ||
+      !g.engine->qwen4exp_cpu_offload_layer_enabled(layer))
+    return nullptr;
+
+  const auto &c = g.engine->model_file.architecture_config;
+  const auto *arena = g.engine->graph_ram_arena(layer);
+  const bool arena_valid =
+      arena && g.engine->graph_ram_layer_ready(layer) && arena->base &&
+      arena->gate_bytes != 0 && arena->up_bytes != 0 &&
+      arena->down_bytes != 0 &&
+      (arena->projection_compact
+           ? (arena->gate_stride >= arena->gate_bytes &&
+              arena->up_stride >= arena->up_bytes &&
+              arena->down_stride >= arena->down_bytes)
+           : (arena->stride != 0 &&
+              arena->stride >= arena->gate_bytes + arena->up_bytes +
+                                    arena->down_bytes));
+  if (!arena_valid ||
+      layer < 0 || layer >= static_cast<int>(g.engine->layers_experts.size()) ||
+      g.engine->layers_experts[static_cast<size_t>(layer)].empty()) {
+    LOG_WARN(
+        "[QWEN4EXP-HOST-NODE] layer=%d declined: complete compatible "
+        "DDR arena is required\n",
+        layer);
+    return nullptr;
+  }
+
+  const auto &first = g.engine->layers_experts[static_cast<size_t>(layer)][0];
+  if (!first.gate_proj.host_ptr || !first.up_proj.host_ptr ||
+      !first.down_proj.host_ptr)
+    return nullptr;
+
+  auto node_ctx = std::make_unique<Qwen4ExpCudaHostNodeContext>();
+  node_ctx->layer_index = layer;
+  const auto split_resident_it = g.split_gpu_expert_ids.find(layer);
+  if (split_resident_it != g.split_gpu_expert_ids.end())
+    node_ctx->gpu_resident_experts = split_resident_it->second;
+  // Reuse the persistent CPU pool already owned by this FullGraph.  The
+  // callback runner borrows it; FullGraph remains responsible for teardown.
+  node_ctx->shared_cpu_threadpool = g.cpu_threadpool;
+  node_ctx->shared_cpu_threads = g.cpu_threads;
+  node_ctx->transport_diag =
+      env_host_node_transport_diag_enabled(layer) ||
+      (layer == 13 && env_layer13_moe_dump_path() != nullptr);
+  node_ctx->projection_compact = arena->projection_compact;
+  LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d allocating callback context "
+           "arena=%p bytes=%zu layout=%s gate_stride=%zu up_stride=%zu "
+           "down_stride=%zu\n",
+           layer, static_cast<void *>(arena->base), arena->bytes,
+           arena->projection_compact ? "projection-compact" : "interleaved",
+           arena->gate_stride, arena->up_stride, arena->down_stride);
+  node_ctx->gate_plane = arena->base + arena->gate_offset;
+  node_ctx->up_plane = arena->base + arena->up_offset;
+  node_ctx->down_plane = arena->base + arena->down_offset;
+  node_ctx->layer = {node_ctx->gate_plane,
+                     node_ctx->up_plane,
+                     node_ctx->down_plane,
+                     arena->gate_bytes,
+                     arena->up_bytes,
+                     arena->down_bytes,
+                     static_cast<uint32_t>(first.gate_proj.meta.type),
+                     static_cast<uint32_t>(first.up_proj.meta.type),
+                     static_cast<uint32_t>(first.down_proj.meta.type)};
+  node_ctx->n_experts = c.n_experts;
+  node_ctx->d_model = g.D;
+  node_ctx->d_ff = c.moe_inter;
+  node_ctx->topk = c.topk;
+  node_ctx->expert_stride = arena->stride;
+  node_ctx->gate_stride = arena->gate_stride;
+  node_ctx->up_stride = arena->up_stride;
+  node_ctx->down_stride = arena->down_stride;
+  node_ctx->input_bytes = static_cast<size_t>(g.D) * sizeof(float);
+  node_ctx->output_bytes = node_ctx->input_bytes;
+  node_ctx->ids_bytes = static_cast<size_t>(c.topk) * sizeof(int32_t);
+  node_ctx->weights_bytes = static_cast<size_t>(c.topk) * sizeof(float);
+  node_ctx->host_input = static_cast<float *>(
+      alloc_registered_host(g, node_ctx->input_bytes));
+  node_ctx->host_output = static_cast<float *>(
+      alloc_registered_host(g, node_ctx->output_bytes));
+  if (node_ctx->transport_diag) {
+    node_ctx->host_output_gpu_check = static_cast<float *>(
+        alloc_registered_host(g, node_ctx->output_bytes));
+  }
+  node_ctx->host_ids = static_cast<int32_t *>(
+      alloc_registered_host(g, node_ctx->ids_bytes));
+  node_ctx->host_weights = static_cast<float *>(
+      alloc_registered_host(g, node_ctx->weights_bytes));
+  LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d callback buffers input=%p output=%p "
+           "ids=%p weights=%p\n",
+           layer, static_cast<void *>(node_ctx->host_input),
+           static_cast<void *>(node_ctx->host_output),
+           static_cast<void *>(node_ctx->host_ids),
+           static_cast<void *>(node_ctx->host_weights));
+  if (!node_ctx->host_input || !node_ctx->host_output ||
+      !node_ctx->host_ids || !node_ctx->host_weights ||
+      (node_ctx->transport_diag && !node_ctx->host_output_gpu_check))
+    return nullptr;
+
+  cudaSetDevice(g.device);
+  LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d creating timing events\n", layer);
+  if (cudaEventCreate(&node_ctx->d2h_start) != cudaSuccess ||
+      cudaEventCreate(&node_ctx->d2h_end) != cudaSuccess ||
+      cudaEventCreate(&node_ctx->h2d_start) != cudaSuccess ||
+      cudaEventCreate(&node_ctx->h2d_end) != cudaSuccess ||
+      (node_ctx->transport_diag &&
+       cudaEventCreate(&node_ctx->post_h2d_check_end) != cudaSuccess))
+    return nullptr;
+
+  // Warm the persistent CPU GGML plan before capture. The graph callback must
+  // not be the first call that allocates/builds the CPU plan.
+  std::fill_n(node_ctx->host_input, g.D, 0.0f);
+  std::fill_n(node_ctx->host_output, g.D, 0.0f);
+  std::fill_n(node_ctx->host_ids, c.topk, 0);
+  std::fill_n(node_ctx->host_weights, c.topk,
+              1.0f / static_cast<float>(std::max(1, c.topk)));
+  LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d warming CPU plan type=(%u,%u,%u) "
+           "dims=(%d,%d,%d) layout=%s planes=(%p,%p,%p) strides=(%zu,%zu,%zu)\n",
+           layer, node_ctx->layer.gate_type, node_ctx->layer.up_type,
+           node_ctx->layer.down_type, node_ctx->d_model, node_ctx->d_ff,
+           node_ctx->topk,
+           node_ctx->projection_compact ? "projection-compact" : "interleaved",
+           node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
+           node_ctx->gate_stride, node_ctx->up_stride,
+           node_ctx->down_stride);
+  bool warm_ok = false;
+  GgmlQwenCpuMoeRunner *warm_runner = nullptr;
+  if (node_ctx->projection_compact) {
+    warm_runner = &GgmlQwenCpuMoeRunner::instance_for_strided_planes(
+            node_ctx->layer, node_ctx->n_experts, node_ctx->d_model,
+            node_ctx->d_ff, node_ctx->topk, node_ctx->gate_stride,
+            node_ctx->up_stride, node_ctx->down_stride, false);
+    warm_ok = warm_runner->run_strided_planes(
+        node_ctx->host_input, node_ctx->host_output, node_ctx->layer,
+        node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
+        node_ctx->host_ids, node_ctx->n_experts, node_ctx->host_weights,
+        node_ctx->d_model, node_ctx->d_ff, node_ctx->topk,
+        node_ctx->gate_stride, node_ctx->up_stride, node_ctx->down_stride);
+  } else {
+    warm_runner = &GgmlQwenCpuMoeRunner::instance_for_strided(
+            node_ctx->layer, node_ctx->n_experts, node_ctx->d_model,
+            node_ctx->d_ff, node_ctx->topk, node_ctx->expert_stride, false);
+    warm_ok = warm_runner->run_strided(
+        node_ctx->host_input, node_ctx->host_output, node_ctx->layer,
+        node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
+        node_ctx->host_ids, node_ctx->n_experts, node_ctx->host_weights,
+        node_ctx->d_model, node_ctx->d_ff, node_ctx->topk,
+        node_ctx->expert_stride);
+  }
+  if (!warm_ok) {
+    LOG_WARN("[QWEN4EXP-HOST-NODE] layer=%d CPU plan warm-up failed\n", layer);
+    return nullptr;
+  }
+  const char *direct_pool_env = std::getenv("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+  const char *direct_fused_env =
+      std::getenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+  const bool direct_fused_requested =
+      direct_fused_env && direct_fused_env[0] == '1';
+  const bool direct_pool_requested =
+      direct_pool_env && direct_pool_env[0] == '1' &&
+      !direct_fused_requested;
+  if (warm_runner && direct_pool_requested) {
+    // The raw direct executor owns its pre-sized worker team.  Borrowing the
+    // FullGraph GGML pool here would tear down that direct signature during
+    // warm-up and recreate it from inside the first replay callback, exactly
+    // where we need deterministic wake-up behavior.  Prepare the team now,
+    // before capture; replay only arms/disarms it.
+    warm_runner->prepare_direct_workers();
+    node_ctx->cpu_runner = warm_runner;
+    LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d prepared direct CPU team "
+             "threads=%d before graph capture\n",
+             layer, warm_runner->thread_count());
+  } else if (warm_runner && !direct_fused_requested &&
+             node_ctx->shared_cpu_threadpool &&
+             node_ctx->shared_cpu_threads > 0) {
+    warm_runner->bind_external_threadpool(node_ctx->shared_cpu_threadpool,
+                                          node_ctx->shared_cpu_threads);
+    node_ctx->cpu_runner = warm_runner;
+    LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d borrowing FullGraph CPU pool "
+             "%p threads=%d\n",
+             layer, static_cast<void *>(node_ctx->shared_cpu_threadpool),
+             node_ctx->shared_cpu_threads);
+  } else if (warm_runner) {
+    node_ctx->cpu_runner = warm_runner;
+  }
+  // An owned runner may suspend its private native ggml pool between
+  // callbacks.  A borrowed FullGraph pool must remain available to ordinary
+  // scheduler CPU splits, so it is deliberately never paused here.
+  if (warm_runner && !warm_runner->uses_external_threadpool())
+    warm_runner->pause_workers();
+  LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d CPU plan warm-up complete\n", layer);
+
+  ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
+  if (!input3)
+    return nullptr;
+  if (input3->type != GGML_TYPE_F32)
+    input3 = ggml_cast(ctx, input3, GGML_TYPE_F32);
+  input3 = ggml_cont(ctx, input3);
+  ggml_tensor *route_ids = ggml_cont(ctx, ids);
+  ggml_tensor *route_weights = ggml_cont(ctx, weights);
+  if (!input3 || !route_ids || !route_weights)
+    return nullptr;
+
+  ggml_tensor *destination = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, g.D, g.S);
+  if (!destination)
+    return nullptr;
+  ggml_set_name(destination,
+                ("qwen4exp_host_moe_output_l" + std::to_string(layer))
+                    .c_str());
+  ggml_tensor *marker = ggml_cpy(ctx, input3, destination);
+  if (!marker)
+    return nullptr;
+  marker->extra = node_ctx.get();
+  // These are dependency-only sources. The CUDA bridge copies them to the
+  // pinned route buffers before the callback; the ordinary CPY backend never
+  // sees this marker because the bridge consumes it first.
+  marker->src[2] = route_ids;
+  marker->src[3] = route_weights;
+  ggml_set_name(marker,
+                ("qwen4exp_host_moe_marker_l" + std::to_string(layer))
+                    .c_str());
+  if (g.sched) {
+    ggml_backend_sched_set_tensor_backend(g.sched, destination, g.cuda);
+    ggml_backend_sched_set_tensor_backend(g.sched, marker, g.cuda);
+  }
+  g.host_node_contexts.push_back(std::move(node_ctx));
+  LOG_INFO("[QWEN4EXP-HOST-NODE] captured CPU MoE marker for layer=%d "
+           "(D=%d topk=%d stride=%zu)\n",
+           layer, g.D, c.topk, arena->stride);
+  return marker;
+}
+
 // Builds the two small I32/F32 constant lookup tables a genuinely split
 // layer's mul_mat_id pair needs, once, at graph-build time (never
 // refreshed per decode step -- these encode a STATIC expert->device
@@ -2791,6 +3906,25 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        // for real, in whichever suffix graph gets chosen.
                        bool routing_only = false) {
   const auto &c = g.engine->model_file.architecture_config;
+  const bool layer13_moe_diag =
+      layer == 13 && env_layer13_moe_dump_path() != nullptr;
+  if (layer13_moe_diag)
+    g.layer13_moe_diag_enabled = true;
+  const bool layer0_diag = layer == 0 && env_layer0_iq2_diag_enabled();
+  if (layer0_diag) {
+    g.layer0_diag_enabled = true;
+    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] graph=%p decode=%d S=%d "
+             "route_path_candidate=%s\n",
+             static_cast<void *>(&g), g.decode_mode ? 1 : 0, g.S,
+             (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+              g.engine->qwen4exp_cpu_offload_layer_enabled(layer))
+                 ? "host-node-CPU"
+                 : "ordinary-ggml-dispatch");
+    log_layer0_diag_tensor("gate_weight", gate_exps);
+    log_layer0_diag_tensor("up_weight", up_exps);
+    log_layer0_diag_tensor("down_weight", down_exps);
+    log_layer0_diag_tensor("gate_up_weight", gate_up_exps);
+  }
   ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
   ggml_tensor *probs = ggml_soft_max(ctx, logits);
   if (probs_out)
@@ -2862,6 +3996,28 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (c.expert_weights_scale != 0.0f && c.expert_weights_scale != 1.0f)
     weights2 = ggml_scale(ctx, weights2, c.expert_weights_scale);
   weights = ggml_reshape_3d(ctx, weights2, 1, c.topk, g.S);
+  if (layer13_moe_diag) {
+    // These are diagnostic snapshots only. The argsort result is a strided
+    // view and ordinary intermediate buffers may be allocator-reused after
+    // the graph retires, so retain the logical values in stable host inputs.
+    ggml_tensor *diag_input = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
+    if (diag_input && diag_input->type != GGML_TYPE_F32)
+      diag_input = ggml_cast(ctx, diag_input, GGML_TYPE_F32);
+    if (diag_input)
+      diag_input = ggml_cont(ctx, diag_input);
+    g.layer13_moe_input_diag = layer13_moe_diag_snapshot(
+        g, ctx, diag_input, GGML_TYPE_F32,
+        {g.D, g.S}, "qwen_layer13_moe_input_diag");
+    g.layer13_moe_ids_diag = layer13_moe_diag_snapshot(
+        g, ctx, ids, GGML_TYPE_I32,
+        {c.topk, g.S}, "qwen_layer13_moe_ids_diag");
+    g.layer13_moe_weights_diag = layer13_moe_diag_snapshot(
+        g, ctx, weights, GGML_TYPE_F32,
+        {1, c.topk, g.S}, "qwen_layer13_moe_weights_diag");
+    if (!g.layer13_moe_input_diag || !g.layer13_moe_ids_diag ||
+        !g.layer13_moe_weights_diag)
+      return nullptr;
+  }
   ggml_build_forward_expand(g.graph, weights);
   if (routing_only) {
     // Phase 2 prefix graph: caller only wanted ids_out/probs_out for the
@@ -2871,7 +4027,46 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return nullptr;
   }
 
+  // The host callback is a single-token strided CPU contract.  Prefill must
+  // keep the ordinary batched CPU/GGML MoE path so it can seed recurrent/KV
+  // state; entering this branch for S>1 returns a null marker and leaves the
+  // graph builder with no valid routed result.
+  // A static per-expert split has a GPU branch and a CPU branch constructed
+  // below.  Do not let the whole-layer host marker intercept it: doing so
+  // silently discards the GPU hot set and runs every routed expert in the
+  // callback, which is both slower and contrary to Option B's contract.
+  const bool split_planned_for_layer =
+      split_gpu_ids && !split_gpu_ids->empty() && gate_exps_gpu &&
+      up_exps_gpu && down_exps_gpu;
+  if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+      g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
+      !split_planned_for_layer) {
+    // The marker returns the already weighted/reduced routed result, so it
+    // intentionally bypasses the ordinary three MUL_MAT_ID + SwiGLU chain.
+    // A failure is fatal to this opt-in graph build; falling through to the
+    // scheduler CPU path here would make a supposedly unified capture
+    // silently contain the old scpu work again.
+    ggml_tensor *host_node =
+        build_qwen4exp_host_node(g, ctx, cur, ids, weights, layer);
+    if (!host_node)
+      return nullptr;
+    if (layer0_diag)
+      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] path=host-node-CPU "
+               "compute=CPU-GGML-MUL_MAT_ID (no CUDA IQ2 dot)\n");
+    return host_node;
+  }
+  if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+      g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
+      split_planned_for_layer && qwen4exp_host_node_timing_enabled()) {
+    LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d bypassed whole-layer marker "
+             "because a static GPU hot/cold split is planned\n",
+             layer);
+  }
+
   ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
+  if (layer13_moe_diag && input3) {
+    input3 = ggml_cont(ctx, input3);
+  }
   ggml_tensor *experts = nullptr;
 
   // Genuine per-expert split path: route IDs are remapped independently for
@@ -2939,6 +4134,19 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_tensor *act = ggml_swiglu_split(ctx, gate, up);
     ggml_tensor *down = ggml_mul_mat_id(ctx, down_exps, act, ids);
     experts = ggml_mul(ctx, down, weights);
+    if (layer0_diag) {
+      g.layer0_diag_gate = gate;
+      g.layer0_diag_up = up;
+      g.layer0_diag_act = act;
+      g.layer0_diag_down = down;
+      g.layer0_diag_gate_up = gate_up;
+      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] path=ordinary-ggml-dispatch "
+               "representation=%s\n",
+               gate_up ? "merged-gate-up" : "separate-gate-up");
+      log_layer0_diag_tensor("gate_output", gate);
+      log_layer0_diag_tensor("up_output", up);
+      log_layer0_diag_tensor("down_output", down);
+    }
     if (g.layer_timing_enabled) {
       // See FullGraph::layer_timing_layer_of's own comment -- these are
       // the actual CPU-dispatched op result tensors when this layer is
@@ -2968,6 +4176,10 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                                   static_cast<size_t>(k) * experts->nb[1]);
     out = ggml_add(ctx, out, e);
   }
+  if (layer13_moe_diag)
+    g.layer13_moe_diag = layer13_moe_diag_snapshot(
+        g, ctx, out, GGML_TYPE_F32, {g.D, g.S},
+        "qwen_layer13_moe_output_diag");
   (void)layer;
   return out;
 }
@@ -3112,6 +4324,12 @@ void dump_qwen_moe_layout(const FullGraph &g) {
     if (layer < 0)
       continue;
     const bool cpu_only = qwen_moe_layer_cpu_only(g, layer);
+    // The existing dump covered only MUL_MAT_ID sources.  Host-node mode
+    // changes CUDA ownership at the Layer-13 boundary, so also record the
+    // ordinary CPU op's destination: an output buffer changing from the
+    // shared CUDA-host arena to a backend-private buffer would explain a
+    // split-time fence even when weights and inputs are identical.
+    log_qwen_layout_tensor(g, layer, cpu_only, "output", node);
     const char *roles[] = {"weight", "input", "ids"};
     for (int src = 0; src < 3; ++src) {
       ggml_tensor *tensor = node->src[src];
@@ -3558,8 +4776,19 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       return false;
     ggml_set_name(res, "qwen_full_bee_cpu_prologue");
     g.topology_cpu_prologue = res;
-    if (g.sched)
-      ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
+    if (g.sched) {
+      // In host-node mode every CPU MoE boundary is represented by a
+      // CUDA-owned CPY marker.  Keep the initial contiguous handoff on the
+      // same CUDA split as those markers; otherwise this otherwise harmless
+      // topology node leaves a second scheduler split in the graph.  The
+      // default path remains Bee's original CPU prologue assignment.
+      ggml_backend_sched_set_tensor_backend(
+          g.sched, res,
+          env_qwen4exp_host_node_enabled() &&
+                  !env_host_node_keep_cpu_prologue()
+              ? g.cuda
+              : g.cpu);
+    }
   }
   for (int l = 0; l < g.n_layers; ++l) {
     // Suffix instances own layers [phase2_split_layer, n_layers) -- layers
@@ -3714,6 +4943,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     if (!hn || !hdn || !hup || !hinj)
       return false;
     ggml_tensor *attn_in = hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
+    if (l == 1 && g.layer0_diag_enabled) {
+      g.layer0_diag_next_consumer = attn_in;
+      g.layer0_diag_next_consumer_snapshot = layer0_diag_snapshot(
+          g, g.ctx, attn_in, "qwen_layer0_diag_layer1_consumer");
+    }
     ggml_tensor *attn_out = nullptr;
     if (qwen4exp_is_gdn_layer(c, l)) {
       ggml_tensor *qkv = resident_tensor(g, g.ctx, p + "attn_qkv.weight");
@@ -3833,6 +5067,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     if (!hn || !hdn || !hup || !hinj)
       return false;
     ggml_tensor *ffn_in = hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
+    if (l == 0 && g.layer0_diag_enabled) {
+      g.layer0_diag_residual_before = res;
+      g.layer0_diag_residual_before_snapshot = layer0_diag_snapshot(
+          g, g.ctx, res, "qwen_layer0_diag_residual_before");
+    }
     ggml_tensor *router = resident_tensor(g, g.ctx, p + "ffn_gate_inp.weight");
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
@@ -4013,6 +5252,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                       split_ok ? de.gpu : nullptr, split_ids, nullptr,
                       partial_ids_out, partial_probs_out);
     }
+    if (l == 0 && g.layer0_diag_enabled)
+      g.layer0_diag_moe_block = moe;
     ggml_tensor *sg =
         resident_tensor(g, g.ctx, p + "ffn_gate_inp_shexp.weight");
     ggml_tensor *sge = resident_tensor(g, g.ctx, p + "ffn_gate_shexp.weight");
@@ -4021,9 +5262,21 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     if (sge && sup && sdo) {
       ggml_tensor *shared =
           build_shared(g, g.ctx, ffn_in, l, sge, sup, sdo, sg);
+      if (l == 0 && g.layer0_diag_enabled)
+        g.layer0_diag_shared = shared;
       moe = ggml_add(g.ctx, moe, shared);
+      if (l == 0 && g.layer0_diag_enabled)
+        g.layer0_diag_moe_plus_shared = moe;
+      if (l == 0 && g.layer0_diag_enabled)
+        g.layer0_diag_moe_plus_shared_snapshot = layer0_diag_snapshot(
+            g, g.ctx, moe, "qwen_layer0_diag_moe_plus_shared");
     }
     res = hc_combine(g, g.ctx, res, moe, inject);
+    if (l == 0 && g.layer0_diag_enabled) {
+      g.layer0_diag_residual_after = res;
+      g.layer0_diag_residual_after_snapshot = layer0_diag_snapshot(
+          g, g.ctx, res, "qwen_layer0_diag_residual_after");
+    }
     g.moe_construction_ms_total += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_moe_start).count();
   }
@@ -4161,8 +5414,17 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
     if (prev_device >= 0)
       cudaSetDevice(prev_device);
-    constexpr size_t kMinGraphAllocHeadroomBytes =
-        1ull * 1024ull * 1024ull * 1024ull; // 1 GiB
+    // A Phase-2 suffix borrows the already committed dense/expert arenas,
+    // so its only new CUDA allocation is the small scheduler activation
+    // workspace.  The measured ordinary 22-layer graph uses 0.13 GiB; keep
+    // 512 MiB of headroom for each borrowed suffix while retaining the
+    // established 1-GiB admission floor for ordinary/full graph instances.
+    const bool borrowed_phase2_suffix =
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu;
+    const size_t kMinGraphAllocHeadroomBytes =
+        borrowed_phase2_suffix ? 512ull * 1024ull * 1024ull
+                               : 1ull * 1024ull * 1024ull * 1024ull;
     if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
       LOG_ERROR(
           "[GGML-QWEN-FULL] refusing graph allocator reserve: device %d "
@@ -4387,9 +5649,27 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (!env_enabled() || S <= 1 || pos_base != 0 ||
       engine.family_ops.family != ModelFamily::Qwen4Exp)
     return false;
+  // CPUOffload's prefill graph still uses the established scheduler CPU
+  // branch. The host-node bridge is decode-only because its callback is a
+  // single-token strided CPU contract; prefill must retain the ordinary
+  // batched MUL_MAT_ID path to seed recurrent/KV state correctly. Decode is
+  // allowed below only when every configured offload layer is replaced by a
+  // CUDA-visible host marker.
+  if (engine.qwen4exp_cpu_offload &&
+      !engine.qwen4exp_cpu_offload_layers.empty() &&
+      !env_qwen4exp_host_node_enabled()) {
+    LOG_WARN(
+        "[GGML-QWEN-FULL] disabled: CPUOffload layers are configured, but "
+        "the opt-in cudaHostNode bridge is disabled; use "
+        "the tested layered CPUOffload path instead\n");
+    return false;
+  }
   const auto &c = engine.model_file.architecture_config;
   if (engine.qwen_ram_preload_all_experts) {
+    const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
     for (int layer = 0; layer < c.n_layers; ++layer) {
+      if (narrow_layer0_diag && layer != 0)
+        continue;
       if (!engine.graph_ram_layer_ready(layer)) {
         LOG_WARN("[GGML-QWEN-FULL] disabled: ram_preload_all_experts "
                  "requires a ready DDR arena for every layer (missing "
@@ -4530,6 +5810,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   LOG_INFO("[GGML-QWEN-FULL] scheduler pipeline_parallel=%s copies=%d\n",
            graph_scheduler_parallel() ? "true" : "false",
            ggml_backend_sched_get_n_copies(g->sched));
+  // Replay timing must not install ggml's eval callback.  The callback path
+  // decomposes CUDA graph work into per-node submissions and therefore
+  // changes the execution being measured.  Keep the invasive per-node
+  // timing behind its explicit switch; replay timing itself is collected
+  // around the scheduler submit/synchronize boundary below.
   g->layer_timing_enabled = env_layer_timing_enabled();
   g->layer_timing_verbose_enabled = env_layer_timing_verbose();
   if (g->layer_timing_enabled || g->layer_timing_verbose_enabled) {
@@ -4560,6 +5845,19 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (!qwen4exp_full_graph_decode_enabled() || pos_base < 0 ||
       engine.family_ops.family != ModelFamily::Qwen4Exp)
     return false;
+  // Keep the same fail-closed rule as prefill.  A full-graph decode call
+  // takes precedence over the layered token dispatcher, so allowing this
+  // combination would make the configured CPUOffload layers disappear from
+  // the actual execution path rather than run through Milestone B.
+  if (engine.qwen4exp_cpu_offload &&
+      !engine.qwen4exp_cpu_offload_layers.empty() &&
+      !env_qwen4exp_host_node_enabled()) {
+    LOG_WARN(
+        "[GGML-QWEN-FULL-DECODE] disabled: CPUOffload layers are configured, "
+        "but the opt-in cudaHostNode bridge is disabled; falling back "
+        "to layered CPUOffload decode\n");
+    return false;
+  }
   const auto &c = engine.model_file.architecture_config;
   if (engine.max_t <= 0 || pos_base >= engine.max_t)
     return false;
@@ -4586,7 +5884,10 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // keeps a graph submission from silently introducing an SSD/GGUF source or
   // a per-token lazy-load boundary.  Models with lazy expert ownership stay on
   // the established layered path.
+  const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
   for (int layer = 0; layer < c.n_layers; ++layer) {
+    if (narrow_layer0_diag && layer != 0)
+      continue;
     if (!engine.graph_ram_layer_ready(layer)) {
       LOG_WARN("[GGML-QWEN-FULL-DECODE] disabled: layer=%d has no complete "
                "preloaded DDR expert arena; layered decode remains active\n",
@@ -4605,6 +5906,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // decides per-token instead of once at prefill.
   plan_partial_layer(engine); // Phase 1/2 shared: usage-ranked expert set
   const bool phase2_wanted = env_partial_layer_phase2_enabled() &&
+                             !engine.qwen4exp_partial_layer_phase2_disabled &&
                              engine.qwen4exp_partial_layer >= 0 &&
                              !engine.qwen4exp_partial_layer_gpu_ids.empty();
   const bool phase2_live = g_graph && g_graph->ready &&
@@ -4698,7 +6000,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // other respect (same backends/arenas/scheduler setup, same PLE/state
   // seeding), factored out only so Phase 2 can call it up to three times.
   auto build_one = [&](FullGraph::Phase2Mode mode, int split_layer,
-                       FullGraph *state_source) -> std::unique_ptr<FullGraph> {
+                       FullGraph *state_source,
+                       FullGraph *dense_source,
+                       FullGraph *expert_source) -> std::unique_ptr<FullGraph> {
     auto g = std::make_unique<FullGraph>();
     g->engine = &engine;
     g->device = dev;
@@ -4735,6 +6039,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     g->phase2_mode = mode;
     g->phase2_split_layer = split_layer;
     g->phase2_state_source_graph = state_source;
+    g->phase2_dense_source_graph = dense_source;
+    g->phase2_expert_source_graph = expert_source;
     plan_expert_vram_split(*g); // must run before init_device_expert_arena
     g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
     g->cpu = ggml_backend_cpu_init();
@@ -4803,6 +6109,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         "[GGML-QWEN-FULL-DECODE] scheduler pipeline_parallel=%s copies=%d\n",
         graph_scheduler_parallel() ? "true" : "false",
         ggml_backend_sched_get_n_copies(g->sched));
+    // See the prefill graph above: GRAPH_REPLAY_TIMING is deliberately
+    // non-invasive and must not enable the scheduler eval callback.
     g->layer_timing_enabled = env_layer_timing_enabled();
     g->layer_timing_verbose_enabled = env_layer_timing_verbose();
     if (g->layer_timing_enabled || g->layer_timing_verbose_enabled) {
@@ -4892,7 +6200,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   if (phase2_wanted) {
     auto prefix = build_one(FullGraph::Phase2Mode::Prefix,
-                            engine.qwen4exp_partial_layer, nullptr);
+                            engine.qwen4exp_partial_layer, nullptr, nullptr,
+                            nullptr);
     if (prefix) {
       // Must be visible via the g_graph global BEFORE building either
       // suffix instance: their own build_graph() reads g_graph to find
@@ -4900,11 +6209,13 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       // (see build_graph's own comment on that lookup).
       g_graph = std::move(prefix);
       auto suffix_gpu = build_one(FullGraph::Phase2Mode::SuffixGpu,
-                                  engine.qwen4exp_partial_layer, nullptr);
+                                  engine.qwen4exp_partial_layer, nullptr,
+                                  g_graph.get(), g_graph.get());
       if (suffix_gpu) {
         auto suffix_cpu = build_one(FullGraph::Phase2Mode::SuffixCpu,
                                     engine.qwen4exp_partial_layer,
-                                    suffix_gpu.get());
+                                    suffix_gpu.get(), g_graph.get(),
+                                    g_graph.get());
         if (suffix_cpu) {
           LOG_INFO("[GGML-QWEN-FULL-DECODE-P2] enabled: split_layer=%d, 3 "
                    "graph instances (prefix/suffix_gpu/suffix_cpu), KV "
@@ -4919,11 +6230,14 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       g_graph_p2_suffix_cpu.reset();
     }
     g_graph.reset();
+    engine.qwen4exp_partial_layer_phase2_disabled = true;
     LOG_WARN("[GGML-QWEN-FULL-DECODE-P2] phase2 graph construction failed; "
-             "falling back to the ordinary single-graph decode path\n");
+             "disabling Phase 2 for this session and falling back to the "
+             "ordinary single-graph decode path\n");
   }
 
-  auto g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr);
+  auto g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr, nullptr,
+                     nullptr);
   if (!g)
     return false;
   LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "
@@ -4953,6 +6267,304 @@ bool phase2_feed_common_inputs(FullGraph &g, int pos_base) {
   return true;
 }
 
+// Unifies the prefix + sgpu submission into one captured CUDA graph so the
+// common case (this token's routing lands entirely inside
+// qwen4exp_partial_layer_gpu_ids) needs a single cudaGraphLaunch instead of
+// two scheduler submissions with a host sync/branch between them. The
+// "is every routed id already GPU-resident" decision moves to a device-side
+// predicate (cuda/qwen4exp_master_graph.cu) driving a real
+// cudaGraphCondTypeIf node whose true body is sgpu's own already-captured
+// graph, spliced in as a child-graph node.
+//
+// scpu is deliberately NOT unified here: its ggml_backend_sched graph is a
+// genuine multi-backend {cuda, cpu} split (it requires CPU-buffer-backed
+// expert weight tensors), so it produces multiple independently-cached
+// cudaGraph_t objects rather than one -- harvesting a single handle for it
+// would silently drop whatever ggml placed on the CPU backend. When this
+// token needs the scpu fallback, this only unifies prefix+predicate; the
+// caller still submits scpu the existing way.
+//
+// Safety-gated: only engages once ggml_backend_sched_get_n_splits() confirms
+// BOTH prefix and sgpu are genuinely single-backend (CUDA-only) graphs.
+// Falls back permanently for the session if that is ever not true, rather
+// than guessing. Opt-in via MOESTREAM_QWEN4EXP_MASTER_GRAPH so the default
+// decode path is completely unchanged until this has been validated against
+// the existing coherence/output-parity checks.
+namespace qwen4exp_master_graph {
+
+struct State {
+  bool safety_verified = false;
+  bool safety_ok = false;
+  cudaGraph_t master_graph = nullptr;
+  cudaGraphExec_t master_exec = nullptr;
+  cudaGraph_t last_prefix_handle = nullptr;
+  cudaGraph_t last_sgpu_handle = nullptr;
+  // The predicate kernel writes the device copy.  The host copy is only a
+  // pinned destination for the same-stream D2H readback after the graph
+  // completes; cudaMallocHost() memory is not necessarily device-mapped and
+  // must not be dereferenced by a kernel directly.
+  int32_t *device_fallback_flag = nullptr;
+  int32_t *host_fallback_flag = nullptr;
+  uint8_t *device_hot_bitmap = nullptr;
+  int hot_bitmap_capacity = 0;
+  size_t last_gpu_ids_hash = 0;
+  cudaEvent_t phase_start_event = nullptr;
+  cudaEvent_t phase_end_event = nullptr;
+};
+
+State &state() {
+  static State s;
+  return s;
+}
+
+bool env_enabled() {
+  static const bool enabled =
+      std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH") != nullptr;
+  return enabled;
+}
+
+size_t hash_gpu_ids(const std::vector<int> &ids) {
+  size_t h = 1469598103934665603ull; // FNV-1a offset basis
+  for (int id : ids) {
+    h ^= static_cast<size_t>(static_cast<uint32_t>(id));
+    h *= 1099511628211ull; // FNV-1a prime
+  }
+  return h;
+}
+
+// Uploads a fresh device bitmap only when qwen4exp_partial_layer_gpu_ids
+// actually changed (normally a rare, session-level event, not per-token).
+bool ensure_hot_bitmap(StreamingEngine &engine, int n_experts,
+                       cudaStream_t stream) {
+  State &st = state();
+  if (n_experts <= 0)
+    return false;
+  const size_t h = hash_gpu_ids(engine.qwen4exp_partial_layer_gpu_ids);
+  if (st.device_hot_bitmap && st.hot_bitmap_capacity == n_experts &&
+      st.last_gpu_ids_hash == h)
+    return true;
+
+  if (!st.device_hot_bitmap || st.hot_bitmap_capacity != n_experts) {
+    if (st.device_hot_bitmap) {
+      cudaFree(st.device_hot_bitmap);
+      st.device_hot_bitmap = nullptr;
+    }
+    if (cudaMalloc(&st.device_hot_bitmap, static_cast<size_t>(n_experts)) !=
+        cudaSuccess) {
+      st.device_hot_bitmap = nullptr;
+      st.hot_bitmap_capacity = 0;
+      return false;
+    }
+    st.hot_bitmap_capacity = n_experts;
+  }
+
+  std::vector<uint8_t> host_bitmap(static_cast<size_t>(n_experts), 0);
+  for (int id : engine.qwen4exp_partial_layer_gpu_ids)
+    if (id >= 0 && id < n_experts)
+      host_bitmap[static_cast<size_t>(id)] = 1;
+  if (cudaMemcpyAsync(st.device_hot_bitmap, host_bitmap.data(),
+                      host_bitmap.size(), cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess)
+    return false;
+  // Rare path (only on a hot-set change, not per token): safe to sync here.
+  if (cudaStreamSynchronize(stream) != cudaSuccess)
+    return false;
+  st.last_gpu_ids_hash = h;
+  return true;
+}
+
+// Returns false if the fast path cannot be used this token (falls back to
+// the existing prefix/chosen dispatch unchanged); true if it successfully
+// launched prefix+predicate(+sgpu) as one graph, in which case
+// *needs_scpu_fallback tells the caller whether sgpu already produced the
+// result or scpu still needs to be submitted the existing way.
+bool try_launch(StreamingEngine &engine, FullGraph &prefix, FullGraph &sgpu,
+                bool *needs_scpu_fallback) {
+  *needs_scpu_fallback = true;
+  if (!env_enabled())
+    return false;
+
+  State &st = state();
+  const bool phase_timing = env_phase_timing_enabled();
+  const auto call_start = std::chrono::steady_clock::now();
+  if (!st.safety_verified) {
+    st.safety_verified = true;
+    const int prefix_splits = ggml_backend_sched_get_n_splits(prefix.sched);
+    const int sgpu_splits = ggml_backend_sched_get_n_splits(sgpu.sched);
+    st.safety_ok = prefix_splits == 1 && sgpu_splits == 1;
+    if (!st.safety_ok)
+      LOG_WARN(
+          "[QWEN4EXP-MASTER-GRAPH] disabled for this session: prefix/sgpu "
+          "graphs are not both single-backend (n_splits=%d/%d) -- a "
+          "multi-backend split would silently drop CPU-backend work if "
+          "harvested as one cudaGraph_t, so falling back to the existing "
+          "two-graph host-branch dispatch permanently.\n",
+          prefix_splits, sgpu_splits);
+    else
+      LOG_INFO("[QWEN4EXP-MASTER-GRAPH] enabled: prefix/sgpu both "
+              "single-backend, unifying the sgpu fast path into one "
+              "captured graph.\n");
+  }
+  if (!st.safety_ok)
+    return false;
+
+  cudaStream_t stream = moestream_ggml_backend_cuda_get_stream(prefix.cuda);
+  if (!stream)
+    return false;
+
+  const auto &c = engine.model_file.architecture_config;
+  if (!ensure_hot_bitmap(engine, c.n_experts, stream))
+    return false;
+
+  cudaGraph_t prefix_handle = moestream_ggml_cuda_get_captured_graph(
+      prefix.cuda, ggml_graph_node(prefix.graph, 0));
+  cudaGraph_t sgpu_handle = moestream_ggml_cuda_get_captured_graph(
+      sgpu.cuda, ggml_graph_node(sgpu.graph, 0));
+  if (!prefix_handle || !sgpu_handle)
+    return false; // not captured yet (warmup incomplete) -- fall back
+
+  if (!st.device_fallback_flag &&
+      cudaMalloc(&st.device_fallback_flag, sizeof(int32_t)) != cudaSuccess)
+    return false;
+  if (!st.host_fallback_flag &&
+      cudaMallocHost(&st.host_fallback_flag, sizeof(int32_t)) !=
+          cudaSuccess)
+    return false;
+
+  const bool graphs_changed = prefix_handle != st.last_prefix_handle ||
+                              sgpu_handle != st.last_sgpu_handle;
+  if (graphs_changed || !st.master_exec) {
+    if (st.master_exec) {
+      cudaGraphExecDestroy(st.master_exec);
+      st.master_exec = nullptr;
+    }
+    if (st.master_graph) {
+      cudaGraphDestroy(st.master_graph);
+      st.master_graph = nullptr;
+    }
+    if (cudaGraphCreate(&st.master_graph, 0) != cudaSuccess)
+      return false;
+
+    cudaGraphNode_t prefix_node = nullptr;
+    if (cudaGraphAddChildGraphNode(&prefix_node, st.master_graph, nullptr, 0,
+                                   prefix_handle) != cudaSuccess)
+      return false;
+
+    cudaGraphConditionalHandle cond_handle{};
+    if (cudaGraphConditionalHandleCreate(&cond_handle, st.master_graph, 0,
+                                         cudaGraphCondAssignDefault) !=
+        cudaSuccess)
+      return false;
+
+    ggml_tensor *routed_ids_tensor = prefix.partial_layer_ids_out;
+    auto *routed_ids = static_cast<int32_t *>(routed_ids_tensor->data);
+    int topk = c.topk;
+    uint8_t *hot_bitmap = st.device_hot_bitmap;
+    int32_t *fallback_flag = st.device_fallback_flag;
+
+    cudaKernelNodeParams predicate_kernel{};
+    predicate_kernel.func = moestream_qwen4exp_master_predicate_kernel_ptr();
+    void *predicate_args[] = {&cond_handle, &routed_ids, &hot_bitmap, &topk,
+                              &fallback_flag};
+    predicate_kernel.gridDim = dim3(1, 1, 1);
+    predicate_kernel.blockDim = dim3(1, 1, 1);
+    predicate_kernel.kernelParams = predicate_args;
+    cudaGraphNode_t predicate_node = nullptr;
+    if (cudaGraphAddKernelNode(&predicate_node, st.master_graph,
+                              &prefix_node, 1, &predicate_kernel) !=
+        cudaSuccess)
+      return false;
+
+    // size=1: cudaGraphCondTypeIf with only a true-body. When the predicate
+    // is 0 (scpu needed), the body is skipped entirely -- sgpu's compute
+    // genuinely never runs, not "run and ignore".
+    cudaGraphNodeParams cond_params{};
+    cond_params.type = cudaGraphNodeTypeConditional;
+    cond_params.conditional.handle = cond_handle;
+    cond_params.conditional.type = cudaGraphCondTypeIf;
+    cond_params.conditional.size = 1;
+    cudaGraphNode_t cond_node = nullptr;
+    if (cudaGraphAddNode(&cond_node, st.master_graph, &predicate_node,
+                        nullptr, 1, &cond_params) != cudaSuccess)
+      return false;
+
+    cudaGraphNode_t sgpu_child = nullptr;
+    if (cudaGraphAddChildGraphNode(
+            &sgpu_child, cond_params.conditional.phGraph_out[0], nullptr, 0,
+            sgpu_handle) != cudaSuccess)
+      return false;
+
+    if (cudaGraphInstantiate(&st.master_exec, st.master_graph, 0) !=
+        cudaSuccess)
+      return false;
+
+    st.last_prefix_handle = prefix_handle;
+    st.last_sgpu_handle = sgpu_handle;
+    LOG_INFO("[QWEN4EXP-MASTER-GRAPH] (re)built master graph (prefix=%p "
+            "sgpu=%p)\n",
+            (void *) prefix_handle, (void *) sgpu_handle);
+  }
+
+  bool phase_events_ready = false;
+  if (phase_timing) {
+    if (!st.phase_start_event &&
+        cudaEventCreate(&st.phase_start_event) != cudaSuccess)
+      return false;
+    if (!st.phase_end_event &&
+        cudaEventCreate(&st.phase_end_event) != cudaSuccess)
+      return false;
+    // The start event is queued immediately before the master launch by the
+    // same stream, so the elapsed span covers prefix + predicate + conditional
+    // sgpu work without measuring host submission time.
+    if (cudaEventRecord(st.phase_start_event, stream) != cudaSuccess)
+      return false;
+    phase_events_ready = true;
+  }
+  const auto launch_call_start = std::chrono::steady_clock::now();
+  if (cudaGraphLaunch(st.master_exec, stream) != cudaSuccess)
+    return false;
+  const auto launch_return = std::chrono::steady_clock::now();
+  if (phase_events_ready &&
+      cudaEventRecord(st.phase_end_event, stream) != cudaSuccess)
+    return false;
+  // Keep the predicate decision device-native through graph execution.  Only
+  // after the graph has completed do we copy the one-word result back so the
+  // existing host-side caller can decide whether to submit the CPU suffix.
+  if (cudaMemcpyAsync(st.host_fallback_flag, st.device_fallback_flag,
+                      sizeof(int32_t), cudaMemcpyDeviceToHost,
+                      stream) != cudaSuccess)
+    return false;
+  if (cudaStreamSynchronize(stream) != cudaSuccess)
+    return false;
+
+  *needs_scpu_fallback = *st.host_fallback_flag != 0;
+  if (phase_timing) {
+    float device_ms = 0.0f;
+    const cudaError_t elapsed =
+        phase_events_ready
+            ? cudaEventElapsedTime(&device_ms, st.phase_start_event,
+                                   st.phase_end_event)
+            : cudaErrorNotReady;
+    const double host_total_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - call_start)
+            .count();
+    const double launch_us =
+        std::chrono::duration<double, std::micro>(launch_return -
+                                                  launch_call_start)
+            .count();
+    LOG_INFO(
+        "[QWEN4EXP-MASTER-GRAPH-TIME] host_total=%.3fms launch_return=%.3fus "
+        "device_graph=%.3fms fallback=%d event_status=%s\n",
+        host_total_ms, launch_us, elapsed == cudaSuccess ? device_ms : -1.0,
+        *needs_scpu_fallback ? 1 : 0,
+        elapsed == cudaSuccess ? "ok" : cudaGetErrorString(elapsed));
+  }
+  return true;
+}
+
+} // namespace qwen4exp_master_graph
+
 // Phase 2 per-token orchestration: submits the prefix graph (attention
 // through the split layer), reads back this token's REAL routing at that
 // layer, decides GPU-vs-CPU purely from whether every routed id already
@@ -4961,7 +6573,10 @@ bool phase2_feed_common_inputs(FullGraph &g, int pos_base) {
 // FullGraph::Phase2Mode's own comment). Two scheduler submissions per
 // token instead of one; that overhead is the real, measured cost this
 // feature trades against skipping the split layer's full-width FFN when
-// the GPU-compact path applies.
+// the GPU-compact path applies. When MOESTREAM_QWEN4EXP_MASTER_GRAPH is set
+// and both prefix and sgpu are verified single-backend graphs, the common
+// (all-GPU-resident routing) case instead runs as one unified captured
+// graph -- see qwen4exp_master_graph::try_launch above.
 bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                                            float *hidden_states, int pos_base,
                                            const int *token_ids, float *logits,
@@ -5006,41 +6621,113 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
   }
 
   const auto start = std::chrono::steady_clock::now();
+  double prefix_submit_ms = 0.0;
+  double route_decision_ms = 0.0;
+  double suffix_submit_ms = 0.0;
+  double output_readback_ms = 0.0;
+  double prefix_replay_submit_ms = 0.0;
+  double prefix_replay_sync_ms = 0.0;
+  double suffix_replay_submit_ms = 0.0;
+  double suffix_replay_sync_ms = 0.0;
 
-  // Step 1: prefix -- real attention through the split layer, plus this
-  // token's own routing at that layer (a graph output).
-  if (ggml_backend_sched_graph_compute_async(prefix.sched, prefix.graph) !=
-      GGML_STATUS_SUCCESS)
-    return false;
-  ggml_backend_sched_synchronize(prefix.sched);
+  // Keep the host-side replay boundary distinct from the existing phase
+  // total.  The latter includes route selection and output readback; these
+  // two values isolate scheduler submission from the wait that contains GPU
+  // execution, ordinary CPU-backend work, and any host-node callback.
+  auto run_timed_replay = [](FullGraph &graph, double &submit_ms,
+                             double &sync_ms, double &total_ms) {
+    const auto replay_start = std::chrono::steady_clock::now();
+    if (ggml_backend_sched_graph_compute_async(graph.sched, graph.graph) !=
+        GGML_STATUS_SUCCESS)
+      return false;
+    const auto replay_submit_end = std::chrono::steady_clock::now();
+    ggml_backend_sched_synchronize(graph.sched);
+    const auto replay_end = std::chrono::steady_clock::now();
+    submit_ms = std::chrono::duration<double, std::milli>(
+                    replay_submit_end - replay_start)
+                    .count();
+    sync_ms = std::chrono::duration<double, std::milli>(
+                  replay_end - replay_submit_end)
+                  .count();
+    total_ms = std::chrono::duration<double, std::milli>(
+                   replay_end - replay_start)
+                   .count();
+    return true;
+  };
 
-  const auto &c = engine.model_file.architecture_config;
-  std::vector<int32_t> ids_host(static_cast<size_t>(c.topk));
-  ggml_backend_tensor_get(prefix.partial_layer_ids_out, ids_host.data(), 0,
-                          ids_host.size() * sizeof(int32_t));
-  const std::unordered_set<int> gpu_set(
-      engine.qwen4exp_partial_layer_gpu_ids.begin(),
-      engine.qwen4exp_partial_layer_gpu_ids.end());
-  bool all_in_gpu_set = true;
-  for (int32_t id : ids_host) {
-    if (id >= 0 && !gpu_set.count(id)) {
-      all_in_gpu_set = false;
-      break;
+  // Fast path: prefix + predicate + sgpu unified into one captured graph
+  // (see qwen4exp_master_graph::try_launch). Only engages once verified
+  // single-backend-safe; otherwise behaves exactly like the pre-existing
+  // path below (prefix run the normal way, ids read back, host branch).
+  bool used_master_graph = false;
+  bool needs_scpu_fallback = true;
+  if (qwen4exp_master_graph::try_launch(engine, prefix, sgpu,
+                                        &needs_scpu_fallback))
+    used_master_graph = true;
+
+  FullGraph *chosen = nullptr;
+  if (used_master_graph && !needs_scpu_fallback) {
+    // sgpu already computed inside the master graph -- nothing left to
+    // submit this token.
+    chosen = &sgpu;
+  } else {
+    if (!used_master_graph) {
+      // Step 1: prefix -- real attention through the split layer, plus this
+      // token's own routing at that layer (a graph output).
+      const auto phase_start = std::chrono::steady_clock::now();
+      if (!run_timed_replay(prefix, prefix_replay_submit_ms,
+                            prefix_replay_sync_ms, prefix_submit_ms))
+        return false;
+      prefix_submit_ms = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - phase_start)
+                             .count();
     }
-  }
-  FullGraph &chosen = all_in_gpu_set ? sgpu : scpu;
 
-  // Step 2: exactly the one suffix this token's real routing needs -- the
-  // split layer's real FFN, plus every layer after it, on ONE device.
-  if (ggml_backend_sched_graph_compute_async(chosen.sched, chosen.graph) !=
-      GGML_STATUS_SUCCESS)
-    return false;
-  ggml_backend_sched_synchronize(chosen.sched);
-  ggml_backend_tensor_get(chosen.output, hidden_states, 0,
-                          static_cast<size_t>(chosen.D) * sizeof(float));
+    if (used_master_graph) {
+      // The master graph's on-device predicate already determined this
+      // token needs the scpu fallback -- no host readback required.
+      chosen = &scpu;
+    } else {
+      const auto phase_start = std::chrono::steady_clock::now();
+      const auto &c = engine.model_file.architecture_config;
+      std::vector<int32_t> ids_host(static_cast<size_t>(c.topk));
+      ggml_backend_tensor_get(prefix.partial_layer_ids_out, ids_host.data(),
+                              0, ids_host.size() * sizeof(int32_t));
+      const std::unordered_set<int> gpu_set(
+          engine.qwen4exp_partial_layer_gpu_ids.begin(),
+          engine.qwen4exp_partial_layer_gpu_ids.end());
+      bool all_in_gpu_set = true;
+      for (int32_t id : ids_host) {
+        if (id >= 0 && !gpu_set.count(id)) {
+          all_in_gpu_set = false;
+          break;
+        }
+      }
+      chosen = all_in_gpu_set ? &sgpu : &scpu;
+      route_decision_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - phase_start)
+                              .count();
+    }
+
+    // Step 2: exactly the one suffix this token's real routing needs -- the
+    // split layer's real FFN, plus every layer after it, on ONE device.
+    const auto phase_start = std::chrono::steady_clock::now();
+    if (!run_timed_replay(*chosen, suffix_replay_submit_ms,
+                          suffix_replay_sync_ms, suffix_submit_ms))
+      return false;
+    suffix_submit_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - phase_start)
+                           .count();
+  }
+  const auto output_start = std::chrono::steady_clock::now();
+  ggml_backend_tensor_get(chosen->output, hidden_states, 0,
+                          static_cast<size_t>(chosen->D) * sizeof(float));
   if (logits)
-    ggml_backend_tensor_get(chosen.logits, logits, 0,
+    ggml_backend_tensor_get(chosen->logits, logits, 0,
                             static_cast<size_t>(vocab) * sizeof(float));
+  output_readback_ms = std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - output_start)
+                           .count();
 
   prefix.decode_last_pos = pos_base;
   sgpu.decode_last_pos = pos_base;
@@ -5062,17 +6749,81 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                          .count();
   LOG_INFO("[GGML-QWEN-FULL-DECODE-P2-TIME] pos=%d dispatch=%s total=%.3f "
            "ms\n",
-           pos_base, all_in_gpu_set ? "gpu" : "cpu", ms);
+           pos_base, chosen == &sgpu ? "gpu" : "cpu", ms);
+  if (env_phase_timing_enabled()) {
+    LOG_INFO(
+        "[GGML-QWEN-FULL-DECODE-P2-BREAKDOWN] pos=%d dispatch=%s "
+        "prefix_submit_sync=%.3fms route_decision=%.3fms "
+        "suffix_submit_sync=%.3fms output_readback=%.3fms total=%.3fms\n",
+        pos_base, chosen == &sgpu ? "gpu" : "cpu", prefix_submit_ms,
+        route_decision_ms, suffix_submit_ms, output_readback_ms, ms);
+  }
+  if (env_graph_replay_timing_enabled()) {
+    auto emit_replay_ledger = [&](const char *instance, FullGraph &graph,
+                                  double submit_ms, double sync_ms,
+                                  double total_ms) {
+      double ordinary_cpu_compute_ms = 0.0;
+      for (const double layer_ms : graph.layer_timing_cpu_ms)
+        ordinary_cpu_compute_ms += layer_ms;
+    double host_node_d2h_ms = 0.0;
+    double host_node_h2d_ms = 0.0;
+    double host_node_callback_span_ms = 0.0;
+    double host_node_cpu_ms = 0.0;
+      for (const auto &host_node : graph.host_node_contexts) {
+        if (!host_node)
+          continue;
+        float d2h = 0.0f;
+        float h2d = 0.0f;
+        if (cudaEventElapsedTime(&d2h, host_node->d2h_start,
+                                 host_node->d2h_end) == cudaSuccess)
+          host_node_d2h_ms += d2h;
+        if (cudaEventElapsedTime(&h2d, host_node->h2d_start,
+                                 host_node->h2d_end) == cudaSuccess)
+          host_node_h2d_ms += h2d;
+        // These events bracket the host callback on the captured CUDA
+        // stream.  Unlike the host-side callback clock, this includes the
+        // stream's observed callback handoff/return latency and lets us
+        // separate CPU work from CUDA host-node serialization.
+        float callback_span = 0.0f;
+        if (cudaEventElapsedTime(&callback_span, host_node->d2h_end,
+                                 host_node->h2d_start) == cudaSuccess)
+          host_node_callback_span_ms += callback_span;
+        host_node_cpu_ms +=
+            host_node->last_cpu_ms.load(std::memory_order_acquire);
+      }
+      LOG_INFO(
+          "[QWEN4EXP-GRAPH-REPLAY-LEDGER] pos=%d instance=%s splits=%d "
+          "host_nodes=%zu replay_submit=%.3fms replay_sync=%.3fms "
+          "replay_total=%.3fms host_node_d2h=%.3fms "
+          "host_node_cpu=%.3fms host_node_callback_span=%.3fms "
+          "host_node_h2d=%.3fms "
+          "ordinary_cpu_compute=%.3fms "
+          "ordinary_cpu_between_node_gap=%.3fms "
+          "ordinary_cpu_ledger=%.3fms\n",
+          pos_base, instance, ggml_backend_sched_get_n_splits(graph.sched),
+          graph.host_node_contexts.size(), submit_ms, sync_ms, total_ms,
+          host_node_d2h_ms, host_node_cpu_ms, host_node_callback_span_ms,
+          host_node_h2d_ms,
+          ordinary_cpu_compute_ms, graph.layer_timing_gap_ms_total,
+          ordinary_cpu_compute_ms + graph.layer_timing_gap_ms_total);
+    };
+    if (!used_master_graph)
+      emit_replay_ledger("prefix", prefix, prefix_replay_submit_ms,
+                         prefix_replay_sync_ms, prefix_submit_ms);
+    emit_replay_ledger(chosen == &sgpu ? "suffix_gpu" : "suffix_cpu", *chosen,
+                       suffix_replay_submit_ms, suffix_replay_sync_ms,
+                       suffix_submit_ms);
+  }
   // Same per-layer CPU-timing report as the single-graph decode path, for
   // BOTH graphs actually submitted this token -- lets a specific layer
   // (e.g. the split layer) be compared directly against its own
   // single-graph-baseline cost. Only meaningful for CPU-dispatched nodes
   // (the split layer's compact GPU path has no CPU-side op to time here;
   // its cost is inside the GPU-submission wall time captured above).
-  if ((prefix.layer_timing_enabled || chosen.layer_timing_enabled) &&
+  if ((prefix.layer_timing_enabled || chosen->layer_timing_enabled) &&
       ++prefix.layer_timing_tokens_since_emit >= 10) {
     prefix.layer_timing_tokens_since_emit = 0;
-    for (auto *tag_g : {&prefix, &chosen}) {
+    for (auto *tag_g : {&prefix, chosen}) {
       if (!tag_g->layer_timing_enabled)
         continue;
       double total_cpu_ms = 0.0;
@@ -5091,7 +6842,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                tag_g == &prefix ? "prefix"
                : tag_g == &sgpu ? "suffix_gpu"
                                 : "suffix_cpu",
-               all_in_gpu_set ? "gpu" : "cpu", total_cpu_ms,
+               chosen == &sgpu ? "gpu" : "cpu", total_cpu_ms,
                tag_g->layer_timing_gap_ms_total, tag_g->layer_timing_gap_count,
                per_layer.c_str());
       for (const auto &[stem, oms] : tag_g->layer_timing_op_ms)
@@ -5281,9 +7032,11 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     return false;
   }
   const auto start = std::chrono::steady_clock::now();
+  const auto replay_start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS)
     return false;
+  const auto replay_submit_end = std::chrono::steady_clock::now();
   if (g.stage_enabled && g.stage_compute_end_event) {
     cudaStream_t graph_stream =
         moestream_ggml_backend_cuda_get_stream(g.cuda);
@@ -5293,6 +7046,173 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       return false;
   }
   ggml_backend_sched_synchronize(g.sched);
+  const auto replay_sync_end = std::chrono::steady_clock::now();
+  dump_layer0_diag_values(g);
+  if (g.layer13_moe_diag_enabled && g.layer13_moe_input_diag &&
+      g.layer13_moe_ids_diag && g.layer13_moe_weights_diag) {
+    const size_t input_n = ggml_nelements(g.layer13_moe_input_diag);
+    const size_t ids_n = ggml_nelements(g.layer13_moe_ids_diag);
+    const size_t weights_n = ggml_nelements(g.layer13_moe_weights_diag);
+    std::vector<float> input(input_n), weights(weights_n);
+    std::vector<int32_t> ids(ids_n);
+    ggml_backend_tensor_get(g.layer13_moe_input_diag, input.data(), 0,
+                            input_n * sizeof(float));
+    ggml_backend_tensor_get(g.layer13_moe_ids_diag, ids.data(), 0,
+                            ids_n * sizeof(int32_t));
+    ggml_backend_tensor_get(g.layer13_moe_weights_diag, weights.data(), 0,
+                            weights_n * sizeof(float));
+    LOG_INFO("[QWEN4EXP-LAYER13-ROUTE-DIAG] ordinary input_fnv64=0x%016llx "
+             "ids_fnv64=0x%016llx weights_fnv64=0x%016llx "
+             "ids=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
+             static_cast<unsigned long long>(qwen4exp_fnv64(
+                 input.data(), input_n * sizeof(float))),
+             static_cast<unsigned long long>(qwen4exp_fnv64(
+                 ids.data(), ids_n * sizeof(int32_t))),
+             static_cast<unsigned long long>(qwen4exp_fnv64(
+                 weights.data(), weights_n * sizeof(float))),
+             ids_n > 0 ? ids[0] : -1, ids_n > 1 ? ids[1] : -1,
+             ids_n > 2 ? ids[2] : -1, ids_n > 3 ? ids[3] : -1,
+             ids_n > 4 ? ids[4] : -1, ids_n > 5 ? ids[5] : -1,
+             ids_n > 6 ? ids[6] : -1, ids_n > 7 ? ids[7] : -1,
+             ids_n > 8 ? ids[8] : -1, ids_n > 9 ? ids[9] : -1);
+    const char *input_dump = env_layer13_moe_ordinary_input_dump_path();
+    if (input_dump) {
+      const bool dumped = qwen4exp_dump_f32(input_dump, input.data(), input_n);
+      LOG_INFO("[QWEN4EXP-LAYER13-INPUT-DIAG] path=ordinary "
+               "dump=%s file=%s elements=%zu\n",
+               dumped ? "ok" : "failed", input_dump, input_n);
+    }
+  }
+  if (g.layer13_moe_diag_enabled && g.layer13_moe_diag &&
+      env_layer13_moe_dump_path() && !g.layer13_moe_diag_dumped) {
+    const size_t n = ggml_nelements(g.layer13_moe_diag);
+    std::vector<float> values(n);
+    ggml_backend_tensor_get(g.layer13_moe_diag, values.data(), 0,
+                            n * sizeof(float));
+    const uint64_t hash = qwen4exp_fnv64(values.data(), n * sizeof(float));
+    const bool dumped = qwen4exp_dump_f32(env_layer13_moe_dump_path(),
+                                          values.data(), n);
+    g.layer13_moe_diag_dumped = dumped;
+    LOG_INFO("[QWEN4EXP-LAYER13-MOE-DIAG] path=ordinary-ggml-dispatch "
+             "dump=%s file=%s fnv64=0x%016llx elements=%zu\n",
+             dumped ? "ok" : "failed", env_layer13_moe_dump_path(),
+             static_cast<unsigned long long>(hash), n);
+  }
+  double host_node_d2h_ms = 0.0;
+  double host_node_h2d_ms = 0.0;
+  double host_node_callback_span_ms = 0.0;
+  double host_node_cpu_ms = 0.0;
+  double host_node_callback_total_ms = 0.0;
+  double host_node_callback_guard_wait_ms = 0.0;
+  double host_node_callback_body_ms = 0.0;
+  bool host_node_all_ok = true;
+  if (!g.host_node_contexts.empty()) {
+    float d2h_ms = 0.0f;
+    float h2d_ms = 0.0f;
+    double cpu_ms = 0.0;
+    bool all_ok = true;
+    for (const auto &host_node : g.host_node_contexts) {
+      if (!host_node)
+        continue;
+      float node_d2h = 0.0f;
+      float node_h2d = 0.0f;
+      float node_callback_span = 0.0f;
+      if (cudaEventElapsedTime(&node_d2h, host_node->d2h_start,
+                               host_node->d2h_end) != cudaSuccess ||
+          cudaEventElapsedTime(&node_h2d, host_node->h2d_start,
+                               host_node->h2d_end) != cudaSuccess) {
+        LOG_WARN("[QWEN4EXP-HOST-NODE] event timing unavailable at pos=%d\n",
+                 pos_base);
+      } else {
+        d2h_ms += node_d2h;
+        h2d_ms += node_h2d;
+      }
+      if (cudaEventElapsedTime(&node_callback_span, host_node->d2h_end,
+                               host_node->h2d_start) == cudaSuccess)
+        host_node_callback_span_ms += node_callback_span;
+      cpu_ms += host_node->last_cpu_ms.load(std::memory_order_acquire);
+      host_node_callback_total_ms +=
+          host_node->last_callback_total_ms.load(std::memory_order_acquire);
+      host_node_callback_guard_wait_ms +=
+          host_node->last_callback_guard_wait_ms.load(
+              std::memory_order_acquire);
+      host_node_callback_body_ms +=
+          host_node->last_callback_body_ms.load(std::memory_order_acquire);
+      all_ok = all_ok && host_node->last_ok.load(std::memory_order_acquire);
+      if (host_node->transport_diag && host_node->host_output_gpu_check) {
+        const size_t n = host_node->output_bytes / sizeof(float);
+        const uint64_t cpu_hash =
+            host_node->last_cpu_hash.load(std::memory_order_acquire);
+        const uint64_t gpu_hash =
+            qwen4exp_fnv64(host_node->host_output_gpu_check,
+                           host_node->output_bytes);
+        host_node->last_gpu_hash.store(gpu_hash, std::memory_order_release);
+        log_layer0_diag_host_values("cpu_output_pre_h2d",
+                                   host_node->host_output, n);
+        log_layer0_diag_host_values("gpu_output_post_h2d",
+                                   host_node->host_output_gpu_check, n);
+        float max_abs_delta = 0.0f;
+        double sum_delta = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+          max_abs_delta = std::max(
+              max_abs_delta,
+              std::abs(host_node->host_output[i] -
+                        host_node->host_output_gpu_check[i]));
+          sum_delta += static_cast<double>(host_node->host_output_gpu_check[i]) -
+                       static_cast<double>(host_node->host_output[i]);
+        }
+        LOG_INFO("[QWEN4EXP-HOST-NODE-DIAG] layer=%d "
+                 "cpu_pre_h2d_fnv64=0x%016llx "
+                 "gpu_post_h2d_fnv64=0x%016llx hash_match=%d "
+                 "max_abs_delta=%.9g sum_delta=%.9g bytes=%zu\n",
+                 host_node->layer_index,
+                 static_cast<unsigned long long>(cpu_hash),
+                 static_cast<unsigned long long>(gpu_hash),
+                 host_node->last_cpu_hash_valid.load(
+                         std::memory_order_acquire) &&
+                         cpu_hash == gpu_hash
+                     ? 1
+                     : 0,
+                 max_abs_delta, sum_delta, host_node->output_bytes);
+        if (host_node->layer_index == 13 &&
+            env_layer13_moe_dump_path() && !g.layer13_moe_diag_dumped) {
+          const char *path = env_layer13_moe_dump_path();
+          const bool dumped = qwen4exp_dump_f32(
+              path, host_node->host_output,
+              host_node->output_bytes / sizeof(float));
+          g.layer13_moe_diag_dumped = dumped;
+          LOG_INFO("[QWEN4EXP-LAYER13-MOE-DIAG] path=host-node-CPU "
+                   "dump=%s file=%s fnv64=0x%016llx\n",
+                   dumped ? "ok" : "failed", path,
+                   static_cast<unsigned long long>(cpu_hash));
+        }
+      }
+    }
+    const double scheduler_gate_wait_ms =
+        qwen4exp_host_node_gate_wait_ms_since_last();
+    const double ordinary_cpu_wait_ms =
+        qwen4exp_host_node_ordinary_cpu_wait_ms_since_last();
+    const double cpu_split_enter_wait_ms =
+        qwen4exp_cpu_split_enter_wait_ms_since_last();
+    LOG_INFO("[QWEN4EXP-HOST-NODE-TIME] pos=%d nodes=%zu D2H=%.3fms "
+             "CPU=%.3fms H2D=%.3fms callback_total=%.3fms "
+             "callback_span=%.3fms callback_guard_wait=%.3fms "
+             "callback_body=%.3fms "
+             "scheduler_gate_wait=%.3fms ordinary_cpu_wait=%.3fms "
+             "cpu_split_enter_wait=%.3fms "
+             "callback_ok=%d\n",
+             pos_base, g.host_node_contexts.size(), d2h_ms, cpu_ms, h2d_ms,
+             host_node_callback_total_ms, host_node_callback_span_ms,
+             host_node_callback_guard_wait_ms, host_node_callback_body_ms,
+             scheduler_gate_wait_ms,
+             ordinary_cpu_wait_ms, cpu_split_enter_wait_ms, all_ok ? 1 : 0);
+    host_node_d2h_ms = d2h_ms;
+    host_node_h2d_ms = h2d_ms;
+    host_node_cpu_ms = cpu_ms;
+    host_node_all_ok = all_ok;
+    if (!all_ok)
+      return false;
+  }
   if (g.stage_enabled && !g.stage_slots.empty()) {
     float h2d_ms = 0.0f, wait_ms = 0.0f, d2d_ms = 0.0f, compute_ms = 0.0f;
     cudaSetDevice(g.device);
@@ -5357,6 +7277,29 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                          .count();
   LOG_INFO("[GGML-QWEN-FULL-DECODE-TIME] pos=%d total=%.3f ms\n", pos_base,
            ms);
+  if (env_graph_replay_timing_enabled()) {
+    double ordinary_cpu_compute_ms = 0.0;
+    for (const double layer_ms : g.layer_timing_cpu_ms)
+      ordinary_cpu_compute_ms += layer_ms;
+    const double ordinary_cpu_gap_ms = g.layer_timing_gap_ms_total;
+    const double replay_submit_ms = std::chrono::duration<double, std::milli>(
+        replay_submit_end - replay_start).count();
+    const double replay_sync_ms = std::chrono::duration<double, std::milli>(
+        replay_sync_end - replay_submit_end).count();
+    const double replay_total_ms = std::chrono::duration<double, std::milli>(
+        replay_sync_end - replay_start).count();
+    LOG_INFO(
+        "[QWEN4EXP-GRAPH-REPLAY-LEDGER] pos=%d splits=%d host_nodes=%zu "
+        "replay_submit=%.3fms replay_sync=%.3fms replay_total=%.3fms "
+        "host_node_d2h=%.3fms host_node_cpu=%.3fms host_node_h2d=%.3fms "
+        "host_node_ok=%d ordinary_cpu_compute=%.3fms "
+        "ordinary_cpu_between_node_gap=%.3fms ordinary_cpu_ledger=%.3fms\n",
+        pos_base, ggml_backend_sched_get_n_splits(g.sched),
+        g.host_node_contexts.size(), replay_submit_ms, replay_sync_ms,
+        replay_total_ms, host_node_d2h_ms, host_node_cpu_ms,
+        host_node_h2d_ms, host_node_all_ok ? 1 : 0, ordinary_cpu_compute_ms,
+        ordinary_cpu_gap_ms, ordinary_cpu_compute_ms + ordinary_cpu_gap_ms);
+  }
   // Per-layer/per-op CPU timing (env: MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING=1)
   // -- emitted every 10 tokens (not every token) to avoid log spam; see
   // memory: full-graph-per-layer-timing-instrumentation-plan.md for why
@@ -5495,6 +7438,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));
   const auto t_output_end = std::chrono::steady_clock::now();
+  dump_layer0_diag_values(g);
 
   for (size_t i = 0; i < g.gdn_layers.size(); ++i) {
     const int l = g.gdn_layers[i];

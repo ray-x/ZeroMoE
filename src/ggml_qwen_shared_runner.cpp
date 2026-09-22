@@ -34,6 +34,9 @@
 #endif
 using namespace moe::detail;
 
+extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+    ggml_backend_t backend);
+
 // Qwen4Exp shared expert
 // ---------------------------------------------------------------------------
 
@@ -752,6 +755,57 @@ bool GgmlQwenSharedRunner::run_host_routed_add(
   return true;
 }
 
+bool GgmlQwenSharedRunner::run_device_routed_add(
+    int layer, const void *base_device, const void *device_routed,
+    const void **combined_output) {
+  if (combined_output)
+    *combined_output = nullptr;
+  if (!backend_ || !overlap_graph_ready_ || layer < 0 || !base_device ||
+      !device_routed || !combined_output || !overlap_routed_ ||
+      !overlap_shared_input_ || !overlap_combined_)
+    return false;
+
+  auto *routed = (ggml_tensor *)overlap_routed_;
+  auto *base = (ggml_tensor *)overlap_shared_input_;
+  auto *base_output = (ggml_tensor *)const_cast<void *>(base_device);
+  if (!routed || !base || routed->type != GGML_TYPE_F32 ||
+      base->type != GGML_TYPE_F32 || !base_output ||
+      base_output->type != GGML_TYPE_F32 || routed->ne[0] != d_model_ ||
+      base_output->ne[0] != d_model_ || routed->ne[1] < n_tokens_ ||
+      base_output->ne[1] < n_tokens_ || routed->ne[2] != 1 ||
+      base_output->ne[2] != 1 || routed->ne[3] != 1 ||
+      base_output->ne[3] != 1 ||
+      routed->nb[0] != sizeof(float) || base->nb[0] != sizeof(float) ||
+      base_output->nb[0] != sizeof(float) ||
+      routed->nb[1] != (size_t)d_model_ * sizeof(float) ||
+      base_output->nb[1] != (size_t)d_model_ * sizeof(float) ||
+      !routed->buffer || !base->buffer || !base_output->data ||
+      !base_output->buffer)
+    return false;
+
+  // The graph owns the tensor metadata and buffer association.  Retargeting
+  // only `data` is the same external-pointer protocol used by the shared-only
+  // path; both pointers are device-resident and the caller has already
+  // established their stream dependency.
+  routed->data = const_cast<void *>(device_routed);
+  base->data = base_output->data;
+  if (ggml_backend_graph_compute_async(
+          (ggml_backend_t)backend_,
+          (ggml_cgraph *)overlap_combine_graph_) != GGML_STATUS_SUCCESS)
+    return false;
+  if (!record_output_event())
+    return false;
+  *combined_output = overlap_combined_;
+  return true;
+}
+
+void *GgmlQwenSharedRunner::backend_stream() const {
+  if (!backend_)
+    return nullptr;
+  return reinterpret_cast<void *>(
+      moestream_ggml_backend_cuda_get_stream((ggml_backend_t)backend_));
+}
+
 bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
                                                float *host_out) {
   if (!backend_ || !graph_ready_ || !combined_output || !host_out ||
@@ -996,6 +1050,11 @@ bool GgmlQwenSharedRunner::run_host_routed_add(int, const float *,
                                                const void **) {
   return false;
 }
+bool GgmlQwenSharedRunner::run_device_routed_add(int, const void *,
+                                                  const void *, const void **) {
+  return false;
+}
+void *GgmlQwenSharedRunner::backend_stream() const { return nullptr; }
 bool GgmlQwenSharedRunner::copy_output_to_host(const void *, float *) {
   return false;
 }

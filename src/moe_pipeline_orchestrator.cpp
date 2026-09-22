@@ -72,6 +72,17 @@ extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 namespace {
 double g_diag_decode_qwen_cpu_graph_ms = 0.0;
 double g_diag_decode_qwen_shared_submit_ms = 0.0;
+double g_diag_decode_qwen_cpu_offload_wait_ms = 0.0;
+double g_diag_decode_qwen_cpu_offload_total_ms = 0.0;
+double g_diag_decode_qwen_cpu_offload_fence_wait_ms = 0.0;
+double g_diag_decode_qwen_cpu_offload_h2d_ms = 0.0;
+double g_diag_decode_qwen_cpu_offload_ring_reuse_wait_ms = 0.0;
+uint64_t g_diag_decode_qwen_cpu_offload_cold_slots = 0;
+uint64_t g_diag_decode_qwen_cpu_offload_worker_calls = 0;
+uint64_t g_diag_decode_qwen_cpu_offload_worker_successes = 0;
+uint64_t g_diag_decode_qwen_cpu_offload_worker_failures = 0;
+uint64_t g_diag_decode_qwen_cpu_offload_fenced_calls = 0;
+uint64_t g_diag_decode_qwen_cpu_offload_fence_failures = 0;
 }
 
 namespace moe_pipeline_internal {
@@ -81,11 +92,55 @@ void add_decode_qwen_cpu_graph_ms(double elapsed_ms) {
 void add_decode_qwen_shared_submit_ms(double elapsed_ms) {
   g_diag_decode_qwen_shared_submit_ms += elapsed_ms;
 }
+void add_decode_qwen_cpu_offload_wait_ms(double elapsed_ms) {
+  g_diag_decode_qwen_cpu_offload_wait_ms += elapsed_ms;
+}
+void add_decode_qwen_cpu_offload_total_ms(double elapsed_ms) {
+  g_diag_decode_qwen_cpu_offload_total_ms += elapsed_ms;
+}
+void add_decode_qwen_cpu_offload_fence_wait_ms(double elapsed_ms) {
+  g_diag_decode_qwen_cpu_offload_fence_wait_ms += elapsed_ms;
+}
+void add_decode_qwen_cpu_offload_h2d_ms(double elapsed_ms) {
+  g_diag_decode_qwen_cpu_offload_h2d_ms += elapsed_ms;
+}
+void add_decode_qwen_cpu_offload_ring_reuse_wait_ms(double elapsed_ms) {
+  g_diag_decode_qwen_cpu_offload_ring_reuse_wait_ms += elapsed_ms;
+}
+void add_decode_qwen_cpu_offload_cold_slots(uint64_t count) {
+  g_diag_decode_qwen_cpu_offload_cold_slots += count;
+}
+void add_decode_qwen_cpu_offload_worker_call() {
+  ++g_diag_decode_qwen_cpu_offload_worker_calls;
+}
+void add_decode_qwen_cpu_offload_worker_success() {
+  ++g_diag_decode_qwen_cpu_offload_worker_successes;
+}
+void add_decode_qwen_cpu_offload_worker_failure() {
+  ++g_diag_decode_qwen_cpu_offload_worker_failures;
+}
+void add_decode_qwen_cpu_offload_fenced_call() {
+  ++g_diag_decode_qwen_cpu_offload_fenced_calls;
+}
+void add_decode_qwen_cpu_offload_fence_failure() {
+  ++g_diag_decode_qwen_cpu_offload_fence_failures;
+}
 } // namespace moe_pipeline_internal
 
 void moe_pipeline_detail::reset_diagnostics() {
   g_diag_decode_qwen_cpu_graph_ms = 0.0;
   g_diag_decode_qwen_shared_submit_ms = 0.0;
+  g_diag_decode_qwen_cpu_offload_wait_ms = 0.0;
+  g_diag_decode_qwen_cpu_offload_total_ms = 0.0;
+  g_diag_decode_qwen_cpu_offload_fence_wait_ms = 0.0;
+  g_diag_decode_qwen_cpu_offload_h2d_ms = 0.0;
+  g_diag_decode_qwen_cpu_offload_ring_reuse_wait_ms = 0.0;
+  g_diag_decode_qwen_cpu_offload_cold_slots = 0;
+  g_diag_decode_qwen_cpu_offload_worker_calls = 0;
+  g_diag_decode_qwen_cpu_offload_worker_successes = 0;
+  g_diag_decode_qwen_cpu_offload_worker_failures = 0;
+  g_diag_decode_qwen_cpu_offload_fenced_calls = 0;
+  g_diag_decode_qwen_cpu_offload_fence_failures = 0;
 }
 
 double diag_get_decode_qwen_cpu_graph_ms() {
@@ -94,6 +149,41 @@ double diag_get_decode_qwen_cpu_graph_ms() {
 
 double diag_get_decode_qwen_shared_submit_ms() {
   return g_diag_decode_qwen_shared_submit_ms;
+}
+
+double diag_get_decode_qwen_cpu_offload_wait_ms() {
+  return g_diag_decode_qwen_cpu_offload_wait_ms;
+}
+
+double diag_get_decode_qwen_cpu_offload_total_ms() {
+  return g_diag_decode_qwen_cpu_offload_total_ms;
+}
+double diag_get_decode_qwen_cpu_offload_fence_wait_ms() {
+  return g_diag_decode_qwen_cpu_offload_fence_wait_ms;
+}
+double diag_get_decode_qwen_cpu_offload_h2d_ms() {
+  return g_diag_decode_qwen_cpu_offload_h2d_ms;
+}
+double diag_get_decode_qwen_cpu_offload_ring_reuse_wait_ms() {
+  return g_diag_decode_qwen_cpu_offload_ring_reuse_wait_ms;
+}
+uint64_t diag_get_decode_qwen_cpu_offload_cold_slots() {
+  return g_diag_decode_qwen_cpu_offload_cold_slots;
+}
+uint64_t diag_get_decode_qwen_cpu_offload_worker_calls() {
+  return g_diag_decode_qwen_cpu_offload_worker_calls;
+}
+uint64_t diag_get_decode_qwen_cpu_offload_worker_successes() {
+  return g_diag_decode_qwen_cpu_offload_worker_successes;
+}
+uint64_t diag_get_decode_qwen_cpu_offload_worker_failures() {
+  return g_diag_decode_qwen_cpu_offload_worker_failures;
+}
+uint64_t diag_get_decode_qwen_cpu_offload_fenced_calls() {
+  return g_diag_decode_qwen_cpu_offload_fenced_calls;
+}
+uint64_t diag_get_decode_qwen_cpu_offload_fence_failures() {
+  return g_diag_decode_qwen_cpu_offload_fence_failures;
 }
 
 // Per-layer decode timing is intentionally opt-in.  It updates several

@@ -20,6 +20,7 @@
 #include "moe_router.hpp"
 #include "perf_timer.hpp"
 #include "prefill_expert_stream.hpp"
+#include "qwen_cpu_offload_ring.hpp"
 #include "ram_manager.hpp"
 #include "scratch_buffers.hpp"
 #include "tensor_trace.hpp"
@@ -274,8 +275,19 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
   if (slots.size() < static_cast<size_t>(n_experts))
     return false;
   const MoEExpertBlock &first = slots[0];
-  if (!first.slab_buffer || first.slab_capacity < arena->stride ||
-      !first.gate_proj.host_ptr || !first.up_proj.host_ptr ||
+  // Projection-compact arenas deliberately expose three independent planes:
+  // their per-expert slab_buffer/stride fields are empty by design.  The
+  // strided CPU runner consumes those plane bases directly, so validate the
+  // representation that was actually allocated instead of requiring the
+  // interleaved-slab metadata used by the legacy cache.
+  if (arena->projection_compact) {
+    if (arena->gate_stride == 0 || arena->up_stride == 0 ||
+        arena->down_stride == 0)
+      return false;
+  } else if (!first.slab_buffer || first.slab_capacity < arena->stride) {
+    return false;
+  }
+  if (!first.gate_proj.host_ptr || !first.up_proj.host_ptr ||
       !first.down_proj.host_ptr)
     return false;
   // graph_ram_layer_ready() performed the complete 512-slot validation and
@@ -598,9 +610,14 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       engine.qwen4exp_option_b_committed &&
       engine.family_ops.family == ModelFamily::Qwen4Exp &&
       engine.qwen4exp_option_b_layer_enabled(layer_idx);
+  const bool cpu_offload_target =
+      !batched_handled && S == 1 && topk > 0 && n_experts > 0 &&
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      engine.qwen4exp_cpu_offload_layer_enabled(layer_idx);
+  const bool mixed_cpu_gpu_target = option_b_target || cpu_offload_target;
   bool option_b_shared_started = false;
   const void *option_b_shared_only_output = nullptr;
-  if (option_b_target && engine.qwen4exp_cpu_gpu_overlap &&
+  if (mixed_cpu_gpu_target && engine.qwen4exp_cpu_gpu_overlap &&
       engine.qwen4exp_device_hc_ffn_input && qwen4exp_hc_device_live() &&
       c.n_expert_shared > 0 && moe_ggml_shared_expert() &&
       engine.resident_layers.count("blk." + std::to_string(layer_idx) +
@@ -1070,6 +1087,142 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     std::fill(force_cpu_offload_k.begin(), force_cpu_offload_k.begin() + topk,
               false);
 
+    // CPUOffload Milestone A: classify the selected route slots before any
+    // GPU dispatch.  The input is already in the pinned `normed` buffer, and
+    // the complete DDR arena is immutable for the lifetime of this request,
+    // so the persistent CPU worker can start while the hot GPU work is
+    // submitted below.  If worker setup fails, leave every slot on the
+    // established dispatcher so this experiment cannot drop a contribution.
+    GgmlQwenCpuMoeRunner *cpu_offload_runner = nullptr;
+    QwenRamCpuMoeLayer cpu_offload_ram_layer;
+    QwenCpuOffloadRing *cpu_offload_ring = nullptr;
+    int cpu_offload_ring_slot = -1;
+    bool cpu_offload_event_fence_active = false;
+    bool cpu_offload_worker_started = false;
+    int cpu_offload_cold_count = 0;
+    auto cpu_offload_start = std::chrono::steady_clock::now();
+    if (cpu_offload_target) {
+      const int forced_count = std::min(
+          std::max(0, engine.qwen4exp_cpu_offload_force_cold_count), topk);
+      for (int k = 0; k < topk; ++k) {
+        const int expert_id = scratch.tok_topk_ids[s * topk + k];
+        bool cold = false;
+        // If Option B has already built a usage-ranked mask for this layer,
+        // reuse it as the hot/cold policy.  The dedicated CPUOffload switch
+        // remains independent: with no mask, only the deterministic forced
+        // slots below are cold.
+        if (engine.qwen4exp_option_b_layer_enabled(layer_idx) &&
+            !engine.qwen4exp_option_b_hot_expert(layer_idx, expert_id))
+          cold = true;
+        if (k < forced_count)
+          cold = true;
+        if (engine.qwen4exp_cpu_offload_force_expert >= 0 &&
+            expert_id == engine.qwen4exp_cpu_offload_force_expert)
+          cold = true;
+        scratch.qwen_cpu_offload_cold_slots[(size_t)k] = cold ? 1 : 0;
+        if (cold) {
+          scratch.qwen_cpu_offload_cold_ids[(size_t)cpu_offload_cold_count] =
+              expert_id;
+          scratch.qwen_cpu_offload_cold_weights[
+              (size_t)cpu_offload_cold_count] =
+              scratch.tok_topk_weights[s * topk + k];
+          ++cpu_offload_cold_count;
+        }
+      }
+
+      float *cpu_offload_output = nullptr;
+      if (cpu_offload_cold_count > 0 &&
+          qwen4exp_ram_cpu_moe_layer(engine, layer_idx, n_experts,
+                                     cpu_offload_ram_layer)) {
+        // Milestone B uses a dedicated pinned host/device result slot.  The
+        // shared graph has already been submitted above, so its backend
+        // stream is the exact compute stream that must consume the slot.
+        if (engine.qwen4exp_cpu_offload_event_fence &&
+            option_b_shared_started) {
+          auto &shared_runner =
+              GgmlQwenSharedRunner::instance_for_layer(layer_idx);
+          const int ring_device =
+              moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
+          auto &ring = QwenCpuOffloadRing::instance();
+          if (ring.ensure(ring_device, D,
+                          engine.qwen4exp_cpu_offload_ring_slots)) {
+            double reuse_wait_ms = 0.0;
+            const double h2d_before = ring.h2d_total_ms();
+            if (ring.acquire(cpu_offload_ring_slot, reuse_wait_ms) &&
+                ring.prepare_slot(cpu_offload_ring_slot,
+                                  shared_runner.backend_stream())) {
+              cpu_offload_ring = &ring;
+              cpu_offload_event_fence_active = true;
+              cpu_offload_output = ring.host_output(cpu_offload_ring_slot);
+              if (reuse_wait_ms > 0.0)
+                moe_pipeline_internal::add_decode_qwen_cpu_offload_ring_reuse_wait_ms(
+                    reuse_wait_ms);
+              const double h2d_after = ring.h2d_total_ms();
+              if (h2d_after > h2d_before)
+                moe_pipeline_internal::add_decode_qwen_cpu_offload_h2d_ms(
+                    h2d_after - h2d_before);
+            }
+          }
+        }
+        if (!cpu_offload_output &&
+            scratch.qwen_cpu_moe_out.resize((size_t)D,
+                                            "qwen_cpu_offload_result"))
+          cpu_offload_output = scratch.qwen_cpu_moe_out.data();
+      }
+
+      if (cpu_offload_cold_count > 0 && cpu_offload_output) {
+        cpu_offload_start = std::chrono::steady_clock::now();
+        cpu_offload_runner =
+            &GgmlQwenCpuMoeRunner::instance_for_strided(
+                cpu_offload_ram_layer.meta, n_experts, D, moe_inter,
+                cpu_offload_cold_count,
+                cpu_offload_ram_layer.expert_stride, false);
+        if (cpu_offload_event_fence_active)
+          cpu_offload_worker_started = cpu_offload_runner->start_strided_async(
+            scratch.normed.data() + s * D, cpu_offload_output,
+            cpu_offload_ram_layer.meta, cpu_offload_ram_layer.gate_plane,
+            cpu_offload_ram_layer.up_plane, cpu_offload_ram_layer.down_plane,
+            scratch.qwen_cpu_offload_cold_ids.data(), n_experts,
+            scratch.qwen_cpu_offload_cold_weights.data(), D, moe_inter,
+            cpu_offload_cold_count, cpu_offload_ram_layer.expert_stride,
+            QwenCpuOffloadRing::completion_callback,
+            cpu_offload_ring->completion_user(cpu_offload_ring_slot));
+        else
+          cpu_offload_worker_started = cpu_offload_runner->start_strided_async(
+              scratch.normed.data() + s * D, cpu_offload_output,
+              cpu_offload_ram_layer.meta, cpu_offload_ram_layer.gate_plane,
+              cpu_offload_ram_layer.up_plane,
+              cpu_offload_ram_layer.down_plane,
+              scratch.qwen_cpu_offload_cold_ids.data(), n_experts,
+              scratch.qwen_cpu_offload_cold_weights.data(), D, moe_inter,
+              cpu_offload_cold_count, cpu_offload_ram_layer.expert_stride);
+        if (cpu_offload_worker_started)
+          moe_pipeline_internal::add_decode_qwen_cpu_offload_worker_call();
+        else if (cpu_offload_event_fence_active)
+          cpu_offload_ring->abandon(cpu_offload_ring_slot);
+      }
+
+      if (cpu_offload_cold_count > 0)
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_cold_slots(
+            static_cast<uint64_t>(cpu_offload_cold_count));
+
+      if (!cpu_offload_worker_started) {
+        std::fill(scratch.qwen_cpu_offload_cold_slots.begin(),
+                  scratch.qwen_cpu_offload_cold_slots.begin() + topk, 0);
+        cpu_offload_cold_count = 0;
+        cpu_offload_runner = nullptr;
+        cpu_offload_ring = nullptr;
+        cpu_offload_ring_slot = -1;
+        cpu_offload_event_fence_active = false;
+        static std::atomic<bool> logged_cpu_offload_fallback{false};
+        if (!logged_cpu_offload_fallback.exchange(true,
+                                                  std::memory_order_relaxed))
+          LOG_STREAM_WARN()
+              << "[CPU-OFFLOAD] Layer " << layer_idx
+              << " Milestone A worker setup failed; retaining legacy dispatch\n";
+      }
+    }
+
     // Decode normally routes one token through each selected expert.  Reuse
     // the same device-side scatter accumulator as the grouped prefill path so
     // the final [D] result is downloaded once per layer/GPU instead of once
@@ -1090,6 +1243,9 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     }
 
     auto dispatch_expert_k = [&](int k) {
+      if (cpu_offload_worker_started && k >= 0 && k < topk &&
+          scratch.qwen_cpu_offload_cold_slots[(size_t)k])
+        return;
       // 2026-08-29, "Fifth round" of the phase3_loop-residual
       // investigation (see PerfCounters::t_shadow_precheck_total's
       // own comment) -- an upper bound over this WHOLE lambda body,
@@ -2369,6 +2525,131 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       }
     }
 
+    bool cpu_offload_event_fenced_handled = false;
+    bool cpu_offload_event_fenced_finished = false;
+    if (cpu_offload_worker_started && cpu_offload_runner &&
+        cpu_offload_event_fence_active && cpu_offload_ring) {
+      // The worker publishes the copy/event/fence after its CPU graph
+      // finishes.  Waiting here is only a queue-publication handshake; the
+      // PCIe copy itself is consumed by the already-fenced GGML stream.
+      double fence_wait_ms = 0.0;
+      bool cpu_ok = false;
+      const bool fence_queued = cpu_offload_ring->wait_fence_enqueued(
+          cpu_offload_ring_slot, fence_wait_ms, cpu_ok);
+      moe_pipeline_internal::add_decode_qwen_cpu_offload_fence_wait_ms(
+          fence_wait_ms);
+      cpu_offload_event_fenced_finished = true;
+      if (fence_queued) {
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_fenced_call();
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_worker_success();
+        const void *hot_combined = nullptr;
+        const bool hot_added = run_qwen4exp_shared_device(
+            engine, layer_idx, S, D, moe_inter,
+            engine.qwen4exp_device_hc_ffn_input, nullptr, c, &hot_combined,
+            token_output, false, true);
+        const void *combined = nullptr;
+        auto &shared_runner =
+            GgmlQwenSharedRunner::instance_for_layer(layer_idx);
+        const bool device_added =
+            hot_added && hot_combined &&
+            shared_runner.run_device_routed_add(
+                layer_idx, hot_combined,
+                cpu_offload_ring->device_output(cpu_offload_ring_slot),
+                &combined);
+        if (device_added && combined) {
+          const bool consumed_marked = cpu_offload_ring->mark_consumed(
+              cpu_offload_ring_slot, shared_runner.backend_stream());
+          if (!consumed_marked)
+            moe_pipeline_internal::add_decode_qwen_cpu_offload_fence_failure();
+          scratch.moe_device_output = combined;
+          scratch.moe_shared_device_output = true;
+          scratch.moe_device_output_ready = true;
+          cpu_offload_event_fenced_handled = true;
+        } else {
+          // The CPU result is valid even if the optional device add cannot be
+          // built.  Retain it on the host and let the established host-routed
+          // add below publish a complete result.
+          moe_pipeline_internal::add_decode_qwen_cpu_offload_fence_failure();
+          for (int d = 0; d < D; ++d)
+            token_output[d] +=
+                cpu_offload_ring->host_output(cpu_offload_ring_slot)[d];
+          cpu_offload_ring->mark_consumed(
+              cpu_offload_ring_slot, shared_runner.backend_stream());
+        }
+      } else {
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_fence_failure();
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_worker_failure();
+        // The callback did not publish a usable device result.  Recompute the
+        // cold subset synchronously into the ordinary pinned scratch buffer;
+        // the final host-routed add remains the correctness fallback.
+        if (scratch.qwen_cpu_moe_out.resize((size_t)D,
+                                            "qwen_cpu_offload_result")) {
+          const bool fallback_ok = cpu_offload_runner->run_strided(
+              scratch.normed.data() + s * D,
+              scratch.qwen_cpu_moe_out.data(), cpu_offload_ram_layer.meta,
+              cpu_offload_ram_layer.gate_plane,
+              cpu_offload_ram_layer.up_plane,
+              cpu_offload_ram_layer.down_plane,
+              scratch.qwen_cpu_offload_cold_ids.data(), n_experts,
+              scratch.qwen_cpu_offload_cold_weights.data(), D, moe_inter,
+              cpu_offload_cold_count, cpu_offload_ram_layer.expert_stride);
+          if (fallback_ok)
+            for (int d = 0; d < D; ++d)
+              token_output[d] += scratch.qwen_cpu_moe_out[(size_t)d];
+        }
+      }
+      moe_pipeline_internal::add_decode_qwen_cpu_offload_total_ms(
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - cpu_offload_start)
+              .count());
+    }
+
+    if (cpu_offload_worker_started && cpu_offload_runner &&
+        !cpu_offload_event_fenced_finished) {
+      const auto cpu_wait_start = std::chrono::steady_clock::now();
+      const bool cpu_ok = cpu_offload_runner->wait_strided_async();
+      const double wait_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() -
+                                 cpu_wait_start)
+                                 .count();
+      moe_pipeline_internal::add_decode_qwen_cpu_offload_wait_ms(wait_ms);
+      if (cpu_ok)
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_worker_success();
+      else
+        moe_pipeline_internal::add_decode_qwen_cpu_offload_worker_failure();
+      if (cpu_ok) {
+        for (int d = 0; d < D; ++d)
+          token_output[d] += scratch.qwen_cpu_moe_out[(size_t)d];
+      } else {
+        // The worker owns no model state beyond the persistent runner. If it
+        // fails, recompute the same cold subset synchronously before the
+        // result is published; correctness takes precedence over the A/B
+        // timing path.
+        const bool fallback_ok = cpu_offload_runner->run_strided(
+            scratch.normed.data() + s * D, scratch.qwen_cpu_moe_out.data(),
+            cpu_offload_ram_layer.meta, cpu_offload_ram_layer.gate_plane,
+            cpu_offload_ram_layer.up_plane, cpu_offload_ram_layer.down_plane,
+            scratch.qwen_cpu_offload_cold_ids.data(), n_experts,
+            scratch.qwen_cpu_offload_cold_weights.data(), D, moe_inter,
+            cpu_offload_cold_count, cpu_offload_ram_layer.expert_stride);
+        if (fallback_ok) {
+          for (int d = 0; d < D; ++d)
+            token_output[d] += scratch.qwen_cpu_moe_out[(size_t)d];
+        } else {
+          LOG_STREAM_ERROR()
+              << "[CPU-OFFLOAD] Layer " << layer_idx
+              << " cold worker and synchronous fallback both failed\n";
+        }
+      }
+      // Milestone A total is measured from worker submission through
+      // completion. The actual GPU-side handoff is submitted by the shared
+      // graph below and remains asynchronous.
+      moe_pipeline_internal::add_decode_qwen_cpu_offload_total_ms(
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - cpu_offload_start)
+              .count());
+    }
+
     check_finite("token_output (post routed experts, pre-shared)", layer_idx,
                  -1, token_output, (size_t)D);
 
@@ -2377,7 +2658,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     // shared FFN.  Add the completed routed result to that graph output now;
     // the normal execution-layer HC post-combine then consumes one device
     // result instead of running the host shared-expert implementation again.
-    if (option_b_shared_started) {
+    if (option_b_shared_started && !cpu_offload_event_fenced_handled) {
       const void *combined = nullptr;
       const bool added = run_qwen4exp_shared_device(
           engine, layer_idx, S, D, moe_inter, nullptr, nullptr, c, &combined,

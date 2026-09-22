@@ -2786,7 +2786,7 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
     float *const *gate_y, float *const *up_y, float *const *down_y,
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
-    int n_matrices, int I, int gate_O, int down_O) {
+    int n_matrices, int I, int gate_O, int down_O, int n_threads) {
 #if defined(MOESTREAM_USE_GGML)
   constexpr int QK_K = 256;
   constexpr int QK4_NL = 32;
@@ -2813,21 +2813,28 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
   // pointer; make down_input_q invocation-local and therefore shared and safe
   // for independent request threads.
   static thread_local std::vector<moestream_ggml_block_q8_K> input_q;
-  std::vector<block_q8_0> down_input_q;
+  static thread_local std::vector<block_q8_0> down_input_q;
   input_q.resize(static_cast<size_t>(input_blocks));
   down_input_q.resize(static_cast<size_t>(n_matrices) * down_blocks);
+  const int team_threads = n_threads > 0 ? n_threads : qwen_cpu_grouped_threads();
   const bool stage_timing = qwen_cpu_stage_timing_enabled_local();
   std::chrono::steady_clock::time_point stage_start;
   if (stage_timing)
     stage_start = std::chrono::steady_clock::now();
   quantize_row_q8_K(x, input_q.data(), I);
   const auto *input_q_data = input_q.data();
+  // The vector objects above are caller-thread TLS, but the byte buffer must
+  // be shared by the OpenMP team.  Capture the data pointer before entering
+  // the parallel region; referring to down_input_q itself inside the region
+  // would resolve each worker's separate TLS instance, leaving its down
+  // projection input empty and causing an out-of-bounds dot-product read.
+  auto *down_input_q_data = down_input_q.data();
 
   // One persistent team performs all three projection phases.  The barriers
   // are required by the data dependencies, but the team itself is created
   // only once per routed layer/token instead of once for gate/up and once
   // again for down.
-#pragma omp parallel num_threads(qwen_cpu_grouped_threads())
+#pragma omp parallel num_threads(team_threads)
   {
 #pragma omp for schedule(static) nowait
     for (int64_t flat = 0;
@@ -2873,7 +2880,7 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
       for (int m = 0; m < n_matrices; ++m)
         quantize_row_q8_0(
             gate_y[m],
-            down_input_q.data() + static_cast<size_t>(m) * down_blocks,
+            down_input_q_data + static_cast<size_t>(m) * down_blocks,
             gate_O);
     }
 
@@ -2897,7 +2904,7 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
           down_weights[m] + static_cast<size_t>(d) * down_row_bytes;
       ggml_vec_dot_iq4_nl_q8_0(
           gate_O, down_y[m] + d, 0, down_row, 0,
-          down_input_q.data() + static_cast<size_t>(m) * down_blocks,
+          down_input_q_data + static_cast<size_t>(m) * down_blocks,
           sizeof(block_q8_0), 1);
     }
   }
@@ -2924,7 +2931,7 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
     float *const *gate_y, float *const *up_y, float *const *down_y,
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
-    int n_matrices, int I, int gate_O, int down_O) {
+    int n_matrices, int I, int gate_O, int down_O, int n_threads) {
 #if defined(MOESTREAM_USE_GGML)
   constexpr int QK_K = 256;
   constexpr int QK4_NL = 32;
@@ -2948,16 +2955,18 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
   // the two small heap allocations that would otherwise occur for every
   // IQ2_XXS fused layer invocation.
   static thread_local std::vector<moestream_ggml_block_q8_K> input_q;
-  std::vector<block_q8_0> down_input_q;
+  static thread_local std::vector<block_q8_0> down_input_q;
   input_q.resize(static_cast<size_t>(input_blocks));
   down_input_q.resize(static_cast<size_t>(n_matrices) * down_blocks);
+  const int team_threads = n_threads > 0 ? n_threads : qwen_cpu_grouped_threads();
   const bool stage_timing = qwen_cpu_stage_timing_enabled_local();
   std::chrono::steady_clock::time_point stage_start;
   if (stage_timing)
     stage_start = std::chrono::steady_clock::now();
   quantize_row_q8_K(x, input_q.data(), I);
+  auto *down_input_q_data = down_input_q.data();
 
-#pragma omp parallel num_threads(qwen_cpu_grouped_threads())
+#pragma omp parallel num_threads(team_threads)
   {
 #pragma omp for schedule(static) nowait
     for (int64_t flat = 0;
@@ -2997,10 +3006,10 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
 #pragma omp single
     {
       for (int m = 0; m < n_matrices; ++m)
-        quantize_row_q8_0(
-            gate_y[m],
-            down_input_q.data() + static_cast<size_t>(m) * down_blocks,
-            gate_O);
+      quantize_row_q8_0(
+          gate_y[m],
+          down_input_q_data + static_cast<size_t>(m) * down_blocks,
+          gate_O);
     }
 
     if (stage_timing) {
@@ -3023,7 +3032,7 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
           down_weights[m] + static_cast<size_t>(d) * down_row_bytes;
       ggml_vec_dot_iq4_nl_q8_0(
           gate_O, down_y[m] + d, 0, down_row, 0,
-          down_input_q.data() + static_cast<size_t>(m) * down_blocks,
+          down_input_q_data + static_cast<size_t>(m) * down_blocks,
           sizeof(block_q8_0), 1);
     }
   }

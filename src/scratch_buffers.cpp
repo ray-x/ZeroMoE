@@ -266,6 +266,9 @@ bool LayerScratch::resize(int S, int D, int n_experts, int moe_inter, int topk,
   pilot_attn_snapshot.resize(D);
   tok_topk_ids.resize(static_cast<size_t>(S) * topk);
   tok_topk_weights.resize(static_cast<size_t>(S) * topk);
+  qwen_cpu_offload_cold_ids.resize(static_cast<size_t>(topk));
+  qwen_cpu_offload_cold_weights.resize(static_cast<size_t>(topk));
+  qwen_cpu_offload_cold_slots.resize(static_cast<size_t>(topk));
   expert_freq.resize(n_experts);
   first_needed_by_token.resize(n_experts);
   if (static_cast<int>(gpu_pool.size()) < std::max(1, topk))

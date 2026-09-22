@@ -4,6 +4,7 @@
 #include "engine.hpp"
 #include "engine_config.hpp"
 #include "generation_loop.hpp"
+#include "thread_profile.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_glm5next_proj_backend.hpp"
@@ -475,6 +476,22 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_cpu_gpu_overlap_max_layers =
       config.qwen4exp_cpu_gpu_overlap_max_layers;
   engine.qwen4exp_cpu_shared_device = config.qwen4exp_cpu_shared_device;
+  engine.qwen4exp_cpu_offload = config.qwen4exp_cpu_offload;
+  engine.qwen4exp_cpu_offload_layers = config.qwen4exp_cpu_offload_layers;
+  std::sort(engine.qwen4exp_cpu_offload_layers.begin(),
+            engine.qwen4exp_cpu_offload_layers.end());
+  engine.qwen4exp_cpu_offload_layers.erase(
+      std::unique(engine.qwen4exp_cpu_offload_layers.begin(),
+                  engine.qwen4exp_cpu_offload_layers.end()),
+      engine.qwen4exp_cpu_offload_layers.end());
+  engine.qwen4exp_cpu_offload_force_cold_count =
+      config.qwen4exp_cpu_offload_force_cold_count;
+  engine.qwen4exp_cpu_offload_force_expert =
+      config.qwen4exp_cpu_offload_force_expert;
+  engine.qwen4exp_cpu_offload_event_fence =
+      config.qwen4exp_cpu_offload_event_fence;
+  engine.qwen4exp_cpu_offload_ring_slots =
+      config.qwen4exp_cpu_offload_ring_slots;
   engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
   engine.glm5next_router_gpu = config.glm5next_router_gpu;
   engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
@@ -941,7 +958,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   const bool qwen_cpu_ram_cache =
       !graph_mode && config.qwen4exp_cpu_ggml_moe &&
       engine.family_ops.family == ModelFamily::Qwen4Exp &&
-      !config.cpu_affinity_layers.empty() && config.ram_preload_all_experts;
+      (!config.cpu_affinity_layers.empty() ||
+       (config.qwen4exp_cpu_offload &&
+        !config.qwen4exp_cpu_offload_layers.empty())) &&
+      config.ram_preload_all_experts;
   const bool ram_graph_cache = graph_ram_cache || qwen_cpu_ram_cache;
   if (engine.family_ops.family == ModelFamily::Qwen4Exp &&
       config.ram_preload_all_experts) {
@@ -1840,12 +1860,18 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // fixed-stride graph tensors. The remaining layers use the graph's
   // source-backed fallback and retain normal lazy cache behavior.
   if (ram_graph_cache) {
+    const char *layer0_diag_env =
+        std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
+    const bool narrow_layer0_diag =
+        layer0_diag_env && layer0_diag_env[0] == '1';
     std::vector<int> graph_ram_full_layers;
     std::vector<int> graph_ram_projection_compact_layers;
     const int n_experts = engine.model_file.architecture_config.n_experts;
     for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
       const bool qwen_cpu_layer =
-          qwen_cpu_ram_cache && is_cpu_affinity_layer(layer);
+          qwen_cpu_ram_cache &&
+          (is_cpu_affinity_layer(layer) ||
+           engine.qwen4exp_cpu_offload_layer_enabled(layer));
       // A full-graph RAM cache is intentionally complete-model wide,
       // but the Qwen CPU-affinity path only needs fixed-stride arenas
       // for its CPU layers.  `graph_ram_cache` is also true for the
@@ -1855,8 +1881,13 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       // use the ordinary RAM cache.  In either case the bytes are
       // populated by the preload block below, never by GGUF mmap at
       // decode time.
-      const bool full_graph_ram_layer = graph_mode && graph_ram_cache;
-      if (!full_graph_ram_layer && !qwen_cpu_layer)
+      const bool full_graph_ram_layer =
+          graph_mode && graph_ram_cache && !narrow_layer0_diag;
+      const bool narrow_layer0_ram_layer =
+          narrow_layer0_diag && layer == 0 &&
+          engine.qwen4exp_cpu_offload_layer_enabled(layer);
+      if (!full_graph_ram_layer && !qwen_cpu_layer &&
+          !narrow_layer0_ram_layer)
         continue;
       if (n_experts <= 0 || engine.compute_expert_slab_bytes(layer) == 0 ||
           (int)engine.layers_experts[(size_t)layer].size() < n_experts ||
@@ -1873,8 +1904,17 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           "MOESTREAM_QWEN4EXP_GRAPH_PROJECTION_COMPACT");
       const bool projection_compact_enabled =
           !(compact_env && compact_env[0] == '0');
+      const char *host_node_env =
+          std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+      const bool host_node_enabled = host_node_env && host_node_env[0] == '1';
+      // The legacy scheduler CPUOffload path still uses the single-stride
+      // runner, so retain its interleaved arena. The opt-in host-node path
+      // now supports independent projection strides and can use the compact
+      // planes without creating a second copy.
       if (engine.family_ops.family == ModelFamily::Qwen4Exp &&
-          projection_compact_enabled)
+          projection_compact_enabled &&
+          (!engine.qwen4exp_cpu_offload_layer_enabled(layer) ||
+           host_node_enabled))
         graph_ram_projection_compact_layers.push_back(layer);
     }
     if (!engine.prepare_graph_ram_arenas(
@@ -3508,6 +3548,21 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   std::cout << "----------------------------------------\n";
   std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
   std::cout << "Use ':q' to exit execution loop cleanly.\n\n";
+
+  // Configure only after all startup worker pools have been created.  New
+  // threads inherit the creator's affinity mask, so doing this at the top of
+  // run_engine() would accidentally constrain prefetch/GGML workers too.
+  configure_current_thread({
+      .name = "MAIN-DECODE",
+      // Main decode and CUDA callbacks intentionally float.  Priority and
+      // the ring's wait policy are the variables under test; a fixed core
+      // was measured to create a static contention point.
+      .cpu_ids = {},
+      .use_rt = true,
+      .rt_priority = 80,
+      .nice_value = -20,
+      .apply_nice = false,
+  });
 
   // Real wall-clock anchor for perf().dump_report()'s final Throughput
   // line -- spans every turn in this session (not just one request),
