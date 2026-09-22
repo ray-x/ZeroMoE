@@ -31,19 +31,47 @@ import os
 import re
 import time
 import shutil
+import argparse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 MOESTREAM = REPO / "build" / "moestream"
-CONFIG = HERE / "survey_config.toml"
-PROMPTS_DIR = HERE / "prompts"
-RESPONSES_DIR = HERE / "responses"
-INDEX_TSV = HERE / "index.tsv"
-SURVEY_LOG = HERE / "survey_debug.log"  # matches survey_config.toml's log_path
+CONFIG = Path(os.environ.get("MOESTREAM_SURVEY_CONFIG",
+                            str(HERE / "survey_config.toml")))
+PROMPTS_DIR = Path(os.environ.get("MOESTREAM_SURVEY_PROMPTS_DIR",
+                                  str(HERE / "prompts")))
+RESPONSES_DIR = Path(os.environ.get("MOESTREAM_SURVEY_RESPONSES_DIR",
+                                   str(HERE / "responses")))
+INDEX_TSV = Path(os.environ.get("MOESTREAM_SURVEY_INDEX",
+                               str(HERE / "index.tsv")))
+SURVEY_LOG = Path(os.environ.get("MOESTREAM_SURVEY_LOG",
+                                str(HERE / "survey_debug.log")))
+USAGE_FILE = Path(os.environ.get("MOESTREAM_SURVEY_USAGE_FILE",
+                               str(HERE / "moestream_usage_survey")))
+ENGINE_LOG_PATH = os.environ.get("MOESTREAM_SURVEY_ENGINE_LOG_PATH", "")
+USE_GDB = os.environ.get("MOESTREAM_SURVEY_GDB", "0") == "1"
 
-NGEN = 128
+NGEN = int(os.environ.get("MOESTREAM_SURVEY_NGEN", "128"))
+FORCE_RERUN = os.environ.get("MOESTREAM_SURVEY_FORCE_RERUN", "0") == "1"
+PERSISTENT = os.environ.get("MOESTREAM_SURVEY_PERSISTENT", "0") == "1"
 PER_PROMPT_TIMEOUT_S = 900  # generous margin above the ~200-250s expected
+
+
+def engine_env():
+    """Return the child environment, including an explicit CUDA mask if set."""
+    env = os.environ.copy()
+    visible = os.environ.get("MOESTREAM_SURVEY_CUDA_VISIBLE_DEVICES")
+    if visible is not None:
+        env["CUDA_VISIBLE_DEVICES"] = visible
+    return env
+
+
+def wrap_engine_command(command):
+    """Run the engine under GDB when the sandbox blocks direct CUDA ioctls."""
+    if not USE_GDB:
+        return command
+    return ["gdb", "-q", "-batch", "-ex", "run", "--args", *command]
 
 # ---------------------------------------------------------------------------
 # Full prompt list: (category, slug, prompt_text)
@@ -379,13 +407,28 @@ def run_one(idx, category, slug, text):
     status = "OK"
     stdout_text = ""
     try:
+        command = [
+            str(MOESTREAM),
+            "--config",
+            str(CONFIG),
+            "--ngen",
+            str(NGEN),
+            "--collect-usage-stats",
+        ]
+        if ENGINE_LOG_PATH:
+            command += ["--log-path", ENGINE_LOG_PATH]
+        survey_pin_file = os.environ.get("MOESTREAM_SURVEY_PIN_FILE")
+        if survey_pin_file:
+            command += ["--pin-file", survey_pin_file]
+        command = wrap_engine_command(command)
         proc = subprocess.run(
-            [str(MOESTREAM), "--config", str(CONFIG), "--ngen", str(NGEN)],
+            command,
             input=stdin_text + "\n",
             capture_output=True,
             text=True,
             timeout=PER_PROMPT_TIMEOUT_S,
             cwd=str(REPO),
+            env=engine_env(),
         )
         stdout_text = proc.stdout
         if proc.returncode != 0:
@@ -420,6 +463,116 @@ def run_one(idx, category, slug, text):
     return status, wall_s, error_count
 
 
+def run_persistent(items):
+    """Run all pending prompts through one long-lived engine process."""
+    if not items:
+        return
+
+    prompt_lines = []
+    for idx, category, slug, text in items:
+        name = f"{idx:03d}_{slugify(category, slug)}"
+        (PROMPTS_DIR / f"{name}.txt").write_text(text + "\n")
+        prompt_lines.append(text.replace("\n", "\\n"))
+
+    command = [
+        str(MOESTREAM),
+        "--config",
+        str(CONFIG),
+        "--ngen",
+        str(NGEN),
+        "--collect-usage-stats",
+    ]
+    if ENGINE_LOG_PATH:
+        command += ["--log-path", ENGINE_LOG_PATH]
+    survey_pin_file = os.environ.get("MOESTREAM_SURVEY_PIN_FILE")
+    if survey_pin_file:
+        command += ["--pin-file", survey_pin_file]
+    command = wrap_engine_command(command)
+
+    print(f"Persistent survey: one engine process for {len(items)} prompts", flush=True)
+    proc = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=str(REPO),
+        env=engine_env(),
+    )
+
+    try:
+        proc.stdin.write("\n".join(prompt_lines) + "\n:q\n")
+        proc.stdin.close()
+    except BrokenPipeError:
+        pass
+
+    marker = "[Generation Complete]"
+    pending_output = ""
+    completed = 0
+    while True:
+        chunk = proc.stdout.read(4096)
+        if not chunk:
+            break
+        pending_output += chunk
+        while marker in pending_output and completed < len(items):
+            segment, pending_output = pending_output.split(marker, 1)
+            idx, category, slug, text = items[completed]
+            name = f"{idx:03d}_{slugify(category, slug)}"
+            response_file = RESPONSES_DIR / f"{name}.txt"
+            log_file = RESPONSES_DIR / f"{name}.log"
+            segment_with_marker = segment + "\n" + marker + "\n"
+            match = re.search(
+                r"Output:\s*(.*?)\n\[Generation Complete\]",
+                segment_with_marker,
+                re.S,
+            )
+            extracted = (
+                match.group(1).strip()
+                if match
+                else "(could not parse — see full raw output below)"
+            )
+            error_count = segment.count("[ERROR]")
+            response_file.write_text(
+                f"=== PROMPT ({category}/{slug}) ===\n{text}\n\n"
+                f"=== EXTRACTED RESPONSE ===\n{extracted}\n\n"
+                f"=== STATUS: OK  wall_s=persistent ===\n\n"
+                f"=== FULL RAW STDOUT ===\n{segment_with_marker}\n"
+            )
+            if SURVEY_LOG.exists():
+                try:
+                    log_file.write_text(SURVEY_LOG.read_text(errors="replace"))
+                except Exception:
+                    pass
+            with open(INDEX_TSV, "a") as index:
+                index.write(
+                    f"{idx}\t{category}\t{slug}\tOK\t-1\t"
+                    f"{error_count}\tDONE\n"
+                )
+            completed += 1
+            print(
+                f"[{idx:03d}/{len(PROMPTS)}] {category}/{slug}: "
+                "OK (persistent process)",
+                flush=True,
+            )
+
+    rc = proc.wait()
+    if completed != len(items):
+        if pending_output:
+            failure_log = RESPONSES_DIR / "persistent_engine_failure.log"
+            failure_log.write_text(pending_output)
+            print(
+                f"Persistent engine output saved to {failure_log}:\n"
+                f"{pending_output[-8000:]}",
+                file=sys.stderr,
+            )
+        print(
+            f"Persistent survey ended with exit={rc}; "
+            f"completed {completed}/{len(items)} prompts",
+            file=sys.stderr,
+        )
+
+
 def already_done(idx):
     if not INDEX_TSV.exists():
         return False
@@ -432,18 +585,60 @@ def already_done(idx):
 
 
 def main():
+    global CONFIG, NGEN
+
+    parser = argparse.ArgumentParser(description="Run the MoE usage prompt survey")
+    parser.add_argument(
+        "--config",
+        default=str(CONFIG),
+        help="engine TOML config (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--ngen",
+        type=int,
+        default=NGEN,
+        help="maximum generated tokens per prompt (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--persistent",
+        action="store_true",
+        default=PERSISTENT,
+        help="reuse one engine process for all prompts",
+    )
+    args = parser.parse_args()
+
+    CONFIG = Path(args.config).resolve()
+    NGEN = args.ngen
+
     if not MOESTREAM.exists():
         print(f"ERROR: {MOESTREAM} not found — build it first (cmake --build build --target moestream)", file=sys.stderr)
         sys.exit(1)
 
+    PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
+    RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+    INDEX_TSV.parent.mkdir(parents=True, exist_ok=True)
     if not INDEX_TSV.exists():
         INDEX_TSV.write_text("id\tcategory\tslug\tstatus\twall_s\terror_lines\tmarker\n")
 
-    print(f"Survey: {len(PROMPTS)} prompts, ngen={NGEN}, timeout={PER_PROMPT_TIMEOUT_S}s/prompt")
-    for idx, (category, slug, text) in enumerate(PROMPTS, start=1):
-        if already_done(idx):
-            print(f"[{idx:03d}/{len(PROMPTS)}] {category}/{slug}: already DONE, skipping")
-            continue
+    print(f"Survey: {len(PROMPTS)} prompts, ngen={NGEN}, "
+          f"timeout={PER_PROMPT_TIMEOUT_S}s/prompt, "
+          f"force_rerun={FORCE_RERUN}, persistent={args.persistent}, "
+          f"config={CONFIG}, usage_file={USAGE_FILE}")
+
+    pending = [
+        (idx, category, slug, text)
+        for idx, (category, slug, text) in enumerate(PROMPTS, start=1)
+        if FORCE_RERUN or not already_done(idx)
+    ]
+    if args.persistent:
+        run_persistent(pending)
+        pending = []
+
+    if args.persistent:
+        prompt_iter = []
+    else:
+        prompt_iter = pending
+    for idx, category, slug, text in prompt_iter:
         print(f"[{idx:03d}/{len(PROMPTS)}] {category}/{slug}: running...", flush=True)
         status, wall_s, error_count = run_one(idx, category, slug, text)
         with open(INDEX_TSV, "a") as f:
@@ -454,10 +649,9 @@ def main():
 
     # Final analysis: rank (layer,expert) by hit count from the accumulated
     # dedicated survey usage file.
-    usage_file = HERE / "moestream_usage_survey"
-    if usage_file.exists():
+    if USAGE_FILE.exists():
         entries = []
-        with open(usage_file) as f:
+        with open(USAGE_FILE) as f:
             for line in f:
                 parts = line.split()
                 if len(parts) == 3:

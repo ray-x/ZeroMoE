@@ -5407,6 +5407,89 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // without a fresh measurement -- these two points aren't enough to prove
   // it never goes higher for a different N or model.
   {
+    // The scheduler allocator is not a safe place to discover that a static
+    // model weight lost its external binding: on older ggml-cuda revisions it
+    // will reinterpret the whole unbound expert subtree as a CUDA workspace
+    // and attempt an allocation roughly equal to the complete MoE payload
+    // (~86 GiB for this model), then may crash instead of returning failure.
+    // This can surface only after repeated prompt graph rebuilds, when a
+    // stale backend assignment or buffer view is carried across teardown.
+    int unbound_static_weights = 0;
+    int misplaced_host_weights = 0;
+    size_t unbound_static_bytes = 0;
+    // GGML may wrap a resident weight in more than one view (for example
+    // view -> contiguous -> reshaped for PLE convolution).  The outer view
+    // does not necessarily carry the backend buffer itself; walk the full
+    // chain before classifying a static tensor as unbound.  A one-hop check
+    // falsely rejected these valid weights and sent every build to fallback.
+    auto view_buffer = [](ggml_tensor *tensor) -> ggml_backend_buffer_t {
+      for (int depth = 0; tensor && depth < 32; ++depth) {
+        if (tensor->buffer)
+          return tensor->buffer;
+        tensor = tensor->view_src;
+      }
+      return nullptr;
+    };
+    for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i) {
+      ggml_tensor *node = ggml_graph_node(g.graph, i);
+      if (!node)
+        continue;
+      for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        ggml_tensor *src = node->src[j];
+        if (!src)
+          continue;
+        const char *name = ggml_get_name(src);
+        const std::string tensor_name = name ? name : "";
+        // Operation results can inherit a source weight's display name
+        // (the PLE path produces names such as "...weight (cont)" and
+        // "...weight (reshaped)").  They are activation/intermediate
+        // tensors, not static model-storage leaves, and are expected to be
+        // allocated by the graph allocator.  Only GGML_OP_NONE tensors can
+        // represent a missing pre-bound model weight here.
+        if (src->op != GGML_OP_NONE)
+          continue;
+        const bool named_static_weight =
+            tensor_name.find(".weight") != std::string::npos ||
+            tensor_name.find(".bias") != std::string::npos ||
+            tensor_name.find("_exps") != std::string::npos;
+        if (!named_static_weight)
+          continue;
+        ggml_backend_buffer_t buffer = view_buffer(src);
+        if (!buffer) {
+          ++unbound_static_weights;
+          if (unbound_static_bytes <= SIZE_MAX - ggml_nbytes(src))
+            unbound_static_bytes += ggml_nbytes(src);
+          if (unbound_static_weights <= 8)
+            LOG_ERROR(
+                "[GGML-QWEN-FULL] refusing graph allocation: unbound static "
+                "weight name=%s bytes=%zu\n",
+                tensor_name.c_str(), ggml_nbytes(src));
+          continue;
+        }
+        if (ggml_backend_buffer_is_host(buffer) &&
+            ggml_backend_sched_get_tensor_backend(g.sched, src) == g.cuda &&
+            tensor_name.find("_exps") != std::string::npos) {
+          ++misplaced_host_weights;
+          if (misplaced_host_weights <= 8)
+            LOG_ERROR(
+                "[GGML-QWEN-FULL] refusing graph allocation: host expert "
+                "weight assigned to CUDA name=%s\n",
+                tensor_name.c_str());
+        }
+      }
+    }
+    if (unbound_static_weights > 0 || misplaced_host_weights > 0) {
+      LOG_ERROR(
+          "[GGML-QWEN-FULL] static binding validation failed: unbound=%d "
+          "(%.2f GiB), misplaced_host_experts=%d; skipping unsafe allocator "
+          "reserve\n",
+          unbound_static_weights,
+          static_cast<double>(unbound_static_bytes) /
+              (1024.0 * 1024.0 * 1024.0),
+          misplaced_host_weights);
+      return false;
+    }
+
     size_t free_b = 0, total_b = 0;
     int prev_device = -1;
     cudaGetDevice(&prev_device);
@@ -5696,6 +5779,12 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     }
     return true;
   }
+  // Phase-2 suffix graphs borrow state, dense, and expert storage from the
+  // previous prefix graph.  Destroy them before replacing that owner;
+  // otherwise a persistent multi-prompt run can leave suffix instances with
+  // dangling ggml/CUDA buffer views during the next rebuild.
+  g_graph_p2_suffix_cpu.reset();
+  g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;

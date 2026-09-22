@@ -144,6 +144,8 @@ void print_usage() {
          "shutdown\n"
       << "                   (still read at startup) -- for controlled A/B "
          "testing\n"
+      << "  --collect-usage-stats  Override freeze_usage_stats and write the "
+         "usage files at shutdown\n"
       << "  --force-start    Bypass the startup safety checks (concurrent "
          "moestream\n"
       << "                   instance, real RAM headroom, free VRAM) -- only "
@@ -3990,6 +3992,7 @@ int main(int argc, char *argv[]) {
   std::string trace_filter_cli;
   bool trace_abort_on_nan_cli = false;
   bool freeze_usage_stats_cli = false;
+  bool collect_usage_stats_cli = false;
   float temp_cli = -1.0f, top_p_cli = -1.0f; // -1 sentinel = "not given" (0.0
                                              // is a valid greedy-decode value)
   // 2026-09: real incident -- a second moestream instance (a separate
@@ -4055,6 +4058,8 @@ int main(int argc, char *argv[]) {
       trace_abort_on_nan_cli = true;
     else if (arg == "--freeze-usage-stats")
       freeze_usage_stats_cli = true;
+    else if (arg == "--collect-usage-stats")
+      collect_usage_stats_cli = true;
     else if (arg == "--temp" && i + 1 < argc)
       temp_cli = std::stof(argv[++i]);
     else if (arg == "--top_p" && i + 1 < argc)
@@ -4148,6 +4153,8 @@ int main(int argc, char *argv[]) {
     config.trace_abort_on_nan = true;
   if (freeze_usage_stats_cli)
     config.freeze_usage_stats = true;
+  if (collect_usage_stats_cli)
+    config.freeze_usage_stats = false;
   if (temp_cli >= 0.0f)
     config.temperature = temp_cli;
   if (top_p_cli >= 0.0f)

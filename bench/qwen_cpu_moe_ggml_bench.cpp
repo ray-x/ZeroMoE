@@ -451,9 +451,9 @@ bool run_stage(Stage stage, int threads, int n_experts, int d_model, int d_ff,
 } // namespace
 
 int main() {
-    constexpr int d_model = 2560;
-    constexpr int d_ff = 640;
-    constexpr int topk = 10;
+    const int d_model = env_int("MOESTREAM_QWEN_CPU_BENCH_D_MODEL", 2560);
+    const int d_ff = env_int("MOESTREAM_QWEN_CPU_BENCH_D_FF", 640);
+    const int topk = env_int("MOESTREAM_QWEN_CPU_BENCH_TOPK", 10);
     const int n_experts = env_int("MOESTREAM_QWEN_CPU_BENCH_EXPERTS", 512);
     const int threads = env_int(
         "MOESTREAM_QWEN_CPU_BENCH_THREADS",
