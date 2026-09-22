@@ -1,0 +1,30 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -24,9 +24,14 @@
+ #include <vector>
+ 
+ #ifdef __APPLE__
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+ #endif
+ 
++// Optional MoEStream hook.  The weak declaration keeps ggml-backend usable
++// by applications which do not link the MoEStream host-node implementation.
++extern "C" void moestream_qwen4exp_host_node_cpu_wait(void)
++    __attribute__((weak));
++
+ static bool ggml_copy_call_trace_enabled() {
+     static const bool enabled = [] {
+@@ -2724,3 +2724,11 @@
+         const auto profile_graph_start = std::chrono::steady_clock::now();
++        // A CUDA graph host node may execute CPU MoE work concurrently with
++        // this scheduler thread.  Gate every ordinary CPU split, including
++        // the fast path without callback_eval, while that callback is active.
++        // The weak hook is null for ordinary GGML applications.
++        if (ggml_backend_sched_profile_is_cpu(split_backend) &&
++            moestream_qwen4exp_host_node_cpu_wait != nullptr) {
++            moestream_qwen4exp_host_node_cpu_wait();
++        }
+         if (!sched->callback_eval) {
+             enum ggml_status ec;

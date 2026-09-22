@@ -78,6 +78,13 @@ struct LayerScratch {
   std::vector<float> expert_acc;
   PinnedFloatBuffer qwen_cpu_moe_out;
 
+  // CPUOffload Milestone A: fixed-capacity per-token cold route staging.
+  // These vectors are sized with the model's top-k during initialization and
+  // are only overwritten during decode; the offload path must not grow them.
+  std::vector<int32_t> qwen_cpu_offload_cold_ids;
+  std::vector<float> qwen_cpu_offload_cold_weights;
+  std::vector<uint8_t> qwen_cpu_offload_cold_slots;
+
   std::vector<ExpertScore> scores;
   std::vector<MoEExpertBlock *> expert_ptrs;
   std::vector<float> pilot_nrm;

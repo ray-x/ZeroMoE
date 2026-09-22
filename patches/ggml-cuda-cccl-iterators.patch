@@ -1,0 +1,34 @@
+diff --git a/src/ggml-cuda/argsort.cu b/src/ggml-cuda/argsort.cu
+--- a/src/ggml-cuda/argsort.cu
++++ b/src/ggml-cuda/argsort.cu
+@@ -1,8 +1,11 @@
+ #include "argsort.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+ #    include <cub/cub.cuh>
+-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
++#    if __CUDACC_VER_MAJOR__ >= 12
++#        include <cuda/iterator>
++#    endif
++#    if (__CUDACC_VER_MAJOR__ >= 12 && CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
+ #        define STRIDED_ITERATOR_AVAILABLE
+ #    endif
+ using namespace cub;
+diff --git a/src/ggml-cuda/top-k.cu b/src/ggml-cuda/top-k.cu
+--- a/src/ggml-cuda/top-k.cu
++++ b/src/ggml-cuda/top-k.cu
+@@ -1,10 +1,13 @@
+ #include "argsort.cuh"
+ #include "top-k.cuh"
+ 
+ #ifdef GGML_CUDA_USE_CUB
+ #    include <cub/cub.cuh>
+-#    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
++#    if __CUDACC_VER_MAJOR__ >= 12
++#        include <cuda/iterator>
++#    endif
++#    if (__CUDACC_VER_MAJOR__ >= 12 && CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
+ #        define CUB_TOP_K_AVAILABLE
+ using namespace cub;
+ #    endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
+ #endif      // GGML_CUDA_USE_CUB

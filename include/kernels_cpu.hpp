@@ -228,7 +228,7 @@ bool matmul_qwen_iq1_m_iq4_nl_fused(
     float *const *gate_y, float *const *up_y, float *const *down_y,
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
-    int n_matrices, int I, int gate_O, int down_O);
+    int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
 // Qwen-only sibling for the IQ2_XXS gate/up layers in the same checkpoint.
 // Uses GGML's production IQ2_XXS x Q8_K dot kernel, but keeps the two
 // projections, activation, down-input quantization, and IQ4_NL down projection
@@ -237,7 +237,7 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
     float *const *gate_y, float *const *up_y, float *const *down_y,
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
-    int n_matrices, int I, int gate_O, int down_O);
+    int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
 float dot_iq3_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k);
 void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
                           int S, int I, int O);

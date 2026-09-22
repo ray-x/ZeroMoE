@@ -1,0 +1,18 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -35,4 +35,6 @@
+ extern "C" void moestream_qwen4exp_cpu_split_exit(void)
+     __attribute__((weak));
++extern "C" bool moestream_qwen4exp_cpu_offload_coordination_enabled(void)
++    __attribute__((weak));
+ 
+ static bool ggml_copy_call_trace_enabled() {
+@@ -2727,5 +2727,7 @@
+         const auto profile_graph_start = std::chrono::steady_clock::now();
+         const bool moestream_cpu_split_hooks =
+             ggml_backend_sched_profile_is_cpu(split_backend) &&
++            moestream_qwen4exp_cpu_offload_coordination_enabled != nullptr &&
++            moestream_qwen4exp_cpu_offload_coordination_enabled() &&
+             moestream_qwen4exp_cpu_split_enter != nullptr &&
+             moestream_qwen4exp_cpu_split_exit != nullptr;

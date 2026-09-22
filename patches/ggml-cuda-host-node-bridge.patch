@@ -1,0 +1,32 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2542,3 +2542,9 @@
+ }
+
++// Optional strong implementation is supplied by MoEStream's Qwen graph
++// bridge. Undefined weak symbols resolve to null, preserving ordinary ggml
++// CPY behavior for every other application.
++extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
++    const ggml_tensor * node, cudaStream_t stream) __attribute__((weak));
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+@@ -2570,7 +2576,16 @@
+         case GGML_OP_DUP:
+             ggml_cuda_dup(ctx, dst);
+             break;
+         case GGML_OP_CPY:
+-            ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
+-            break;
++            // MoEStream's opt-in CPUOffload Phase 4 marker is represented as
++            // a normal CPY node so the scheduler keeps it in the CUDA
++            // capture. The strong bridge expands it to explicit D2H, host
++            // callback, and H2D operations.
++            if (dst->extra && moestream_qwen4exp_cuda_host_node_enqueue &&
++                moestream_qwen4exp_cuda_host_node_enqueue(
++                    dst, ctx.stream())) {
++                break;
++            }
++            ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
++            break;
+         case GGML_OP_CONT:

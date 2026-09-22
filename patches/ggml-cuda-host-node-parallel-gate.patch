@@ -1,0 +1,18 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -5057,3 +5057,7 @@
+-    if (!enable_graph_optimization) {
+-        return;
+-    }
++    // MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL_PREFILL_SAFE keeps the
++    // host-marker optimizer off the prefill graph unless explicitly enabled.
++    const bool enable_moestream_host_node_parallel =
++        getenv("MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL") != nullptr;
++    if (!enable_graph_optimization && !enable_moestream_host_node_parallel) {
++        return;
++    }
+@@ -5148,0 +5153,3 @@
++    if (!enable_graph_optimization) {
++        return;
++    }

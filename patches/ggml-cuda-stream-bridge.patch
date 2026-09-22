@@ -1,0 +1,19 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -6568,0 +6569,12 @@
++// MoEStream's Layer-13 staging proof needs to place a CUDA event dependency
++// on the exact stream used by this backend.  The normal ggml public API does
++// not expose that stream, while using the legacy default stream here would
++// not order a non-blocking ggml stream.  Keep this tiny bridge local to the
++// CUDA backend; it does not change normal ggml scheduling semantics.
++extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
++    ggml_backend_t backend) {
++    if (!backend || backend->iface.graph_compute != ggml_backend_cuda_graph_compute)
++        return nullptr;
++    auto *ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    return ctx ? ctx->stream() : nullptr;
++}
+
+
+ GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)

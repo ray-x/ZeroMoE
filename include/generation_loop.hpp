@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <fstream>
 #include <limits>
 
 extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
@@ -44,6 +45,102 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
         return;
     }
     if (trace_gate("HIDDEN")) trace_row("HIDDEN", -1, label, data, n);
+}
+
+// Diagnostic-only oracle support.  When set, write the unmodified decode
+// logits (before repetition penalty and sampling) as a small binary record
+// per generation step.  This is intentionally opt-in and outside the hot
+// path when unset; it lets a baseline and a hybrid run be compared by max
+// absolute logit delta instead of relying only on sampled text.
+inline void dump_decode_logits_if_enabled(int step, const float *logits,
+                                          size_t n) {
+    static const char *path = std::getenv("MOESTREAM_DECODE_LOGITS_DUMP");
+    if (!path || !path[0] || !logits || n == 0)
+        return;
+
+    std::ofstream out(path, step == 0
+                               ? (std::ios::binary | std::ios::trunc)
+                               : (std::ios::binary | std::ios::app));
+    if (!out)
+        return;
+    const uint32_t step_u = static_cast<uint32_t>(step);
+    const uint32_t n_u = static_cast<uint32_t>(n);
+    out.write(reinterpret_cast<const char *>(&step_u), sizeof(step_u));
+    out.write(reinterpret_cast<const char *>(&n_u), sizeof(n_u));
+    out.write(reinterpret_cast<const char *>(logits),
+              static_cast<std::streamsize>(n * sizeof(float)));
+}
+
+// Diagnostic-only full-vector checksum.  Hash the raw float bytes before the
+// repetition penalty mutates the working logits, so baseline and teacher-
+// forced runs compare the actual model output rather than sampler state.
+// FNV-1a is intentionally implemented over bytes instead of using
+// std::hash<float>, whose representation/contract is not a cross-process
+// diagnostic format.
+inline uint64_t decode_logits_fnv64(const float *logits, size_t n) {
+    constexpr uint64_t offset = 1469598103934665603ULL;
+    constexpr uint64_t prime = 1099511628211ULL;
+    uint64_t hash = offset;
+    const auto *bytes = reinterpret_cast<const unsigned char *>(logits);
+    for (size_t i = 0; i < n * sizeof(float); ++i) {
+        hash ^= bytes[i];
+        hash *= prime;
+    }
+    return hash;
+}
+
+inline bool decode_logits_hash_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("MOESTREAM_DECODE_LOGITS_HASH");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
+inline void log_decode_logits_hash(int step, uint64_t hash, int sampled_token,
+                                   int forced_token) {
+    if (!decode_logits_hash_enabled())
+        return;
+    LOG_STREAM_INFO() << "[TEACHER-FORCE-LOGITS] step=" << step
+                      << " sampled_token=" << sampled_token
+                      << " forced_token=" << forced_token
+                      << " fnv64=0x" << std::hex << hash << std::dec << "\n";
+}
+
+// Diagnostic-only teacher-forcing support.  A baseline run can write the
+// sampled token sequence with MOESTREAM_GENERATED_TOKEN_FILE; a comparison
+// run can then consume that sequence through
+// MOESTREAM_TEACHER_FORCE_TOKEN_FILE.  The forward pass still produces and
+// dumps its own logits, but the next input token is taken from the reference
+// sequence so autoregressive divergence cannot hide a numerical mismatch.
+inline void dump_generated_token_if_enabled(int step, int token) {
+    static const char *path = std::getenv("MOESTREAM_GENERATED_TOKEN_FILE");
+    if (!path || !path[0]) {
+        return;
+    }
+
+    std::ofstream out(path, step == 0 ? std::ios::trunc : std::ios::app);
+    if (out) {
+        out << token << '\n';
+    }
+}
+
+inline const std::vector<int> & teacher_force_tokens_if_enabled() {
+    static const std::vector<int> tokens = [] {
+        std::vector<int> result;
+        const char *path = std::getenv("MOESTREAM_TEACHER_FORCE_TOKEN_FILE");
+        if (!path || !path[0]) {
+            return result;
+        }
+
+        std::ifstream in(path);
+        int token = 0;
+        while (in >> token) {
+            result.push_back(token);
+        }
+        return result;
+    }();
+    return tokens;
 }
 // token_ids: the S current input token ids that produced hidden_states'
 // S rows (one per row, same order) -- needed by DeepSeek-V4 hash-routed MoE
@@ -74,6 +171,17 @@ extern double diag_get_decode_hc_post_ms();
 extern double diag_get_decode_layer_input_ms();
 extern double diag_get_decode_qwen_cpu_graph_ms();
 extern double diag_get_decode_qwen_shared_submit_ms();
+extern double diag_get_decode_qwen_cpu_offload_wait_ms();
+extern double diag_get_decode_qwen_cpu_offload_total_ms();
+extern double diag_get_decode_qwen_cpu_offload_fence_wait_ms();
+extern double diag_get_decode_qwen_cpu_offload_h2d_ms();
+extern double diag_get_decode_qwen_cpu_offload_ring_reuse_wait_ms();
+extern uint64_t diag_get_decode_qwen_cpu_offload_cold_slots();
+extern uint64_t diag_get_decode_qwen_cpu_offload_worker_calls();
+extern uint64_t diag_get_decode_qwen_cpu_offload_worker_successes();
+extern uint64_t diag_get_decode_qwen_cpu_offload_worker_failures();
+extern uint64_t diag_get_decode_qwen_cpu_offload_fenced_calls();
+extern uint64_t diag_get_decode_qwen_cpu_offload_fence_failures();
 // TEMPORARY DIAGNOSTIC (2026-09-12) -- phase-by-phase bisection of
 // dsv41_attention_gguf's ratio!=0 branch (src/attention_layer.cpp), the
 // function g_diag_attn_call_ms proved costs ~20-21s/request. See the
@@ -829,6 +937,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             LOG_STREAM_INFO() << "\n";
         }
 
+        dump_decode_logits_if_enabled(step, logits.data(), logits.size());
+        const uint64_t raw_logits_hash = decode_logits_hash_enabled()
+                                             ? decode_logits_fnv64(logits.data(), logits.size())
+                                             : 0;
+
         // Repetition penalty: no mechanism for this existed before -- with
         // no chat template applied either (main.cpp sends raw BOS+text, not
         // an instruct-formatted prompt; see CLAUDE.md), a low-confidence,
@@ -850,7 +963,20 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             }
         }
 
-        int next_token = sampler.sample(logits, temperature, top_p);
+        const int sampled_token = sampler.sample(logits, temperature, top_p);
+        dump_generated_token_if_enabled(step, sampled_token);
+
+        int next_token = sampled_token;
+        const auto & teacher_tokens = teacher_force_tokens_if_enabled();
+        if (step < static_cast<int>(teacher_tokens.size())) {
+            next_token = teacher_tokens[step];
+            if (step == 0) {
+                LOG_STREAM_INFO() << "[TEACHER-FORCE] using " << teacher_tokens.size()
+                                  << " reference decode token(s) from "
+                                  << "MOESTREAM_TEACHER_FORCE_TOKEN_FILE\n";
+            }
+        }
+        log_decode_logits_hash(step, raw_logits_hash, sampled_token, next_token);
         sequence.push_back(next_token);
         perf().n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
 
@@ -1016,6 +1142,28 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     const double decode_qwen_cpu_ms = diag_get_decode_qwen_cpu_graph_ms();
     const double decode_qwen_shared_submit_ms =
         diag_get_decode_qwen_shared_submit_ms();
+    const double decode_qwen_cpu_offload_wait_ms =
+        diag_get_decode_qwen_cpu_offload_wait_ms();
+    const double decode_qwen_cpu_offload_total_ms =
+        diag_get_decode_qwen_cpu_offload_total_ms();
+    const double decode_qwen_cpu_offload_fence_wait_ms =
+        diag_get_decode_qwen_cpu_offload_fence_wait_ms();
+    const double decode_qwen_cpu_offload_h2d_ms =
+        diag_get_decode_qwen_cpu_offload_h2d_ms();
+    const double decode_qwen_cpu_offload_ring_reuse_wait_ms =
+        diag_get_decode_qwen_cpu_offload_ring_reuse_wait_ms();
+    const uint64_t decode_qwen_cpu_offload_cold_slots =
+        diag_get_decode_qwen_cpu_offload_cold_slots();
+    const uint64_t decode_qwen_cpu_offload_worker_calls =
+        diag_get_decode_qwen_cpu_offload_worker_calls();
+    const uint64_t decode_qwen_cpu_offload_worker_successes =
+        diag_get_decode_qwen_cpu_offload_worker_successes();
+    const uint64_t decode_qwen_cpu_offload_worker_failures =
+        diag_get_decode_qwen_cpu_offload_worker_failures();
+    const uint64_t decode_qwen_cpu_offload_fenced_calls =
+        diag_get_decode_qwen_cpu_offload_fenced_calls();
+    const uint64_t decode_qwen_cpu_offload_fence_failures =
+        diag_get_decode_qwen_cpu_offload_fence_failures();
     const double decode_residual_ms =
         std::max(0.0, decode_layer_ms - decode_attn_ms - decode_ffn_ms);
     const double decode_hc_ms = diag_get_decode_hc_ms();
@@ -1032,6 +1180,14 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
              "ffn_call=%.3fs (%.3fms/token) "
              "qwen_cpu_routed=%.3fs (%.3fms/token) "
              "qwen_shared_submit=%.3fs (%.3fms/token) "
+             "qwen_cpu_offload_wait=%.3fs (%.3fms/token) "
+             "qwen_cpu_offload_total=%.3fs (%.3fms/token) "
+             "qwen_cpu_offload_fence_wait=%.3fs (%.3fms/token) "
+             "qwen_cpu_offload_h2d=%.3fs (%.3fms/token) "
+             "qwen_cpu_offload_ring_reuse=%.3fs (%.3fms/token) "
+             "qwen_cpu_offload_cold_slots=%llu (%.3f/token) "
+             "qwen_cpu_offload_workers=%llu success=%llu failure=%llu "
+             "fenced=%llu fence_failures=%llu "
              "residual_scheduler_hc_route=%.3fs (%.3fms/token), "
              "hc=%.3fs (%.3fms/token; pre=%.3f, post=%.3f), "
              "pre_attn=%.3f, pre_ffn=%.3f, "
@@ -1046,6 +1202,23 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
              decode_qwen_cpu_ms / decode_tokens,
              decode_qwen_shared_submit_ms / 1000.0,
              decode_qwen_shared_submit_ms / decode_tokens,
+             decode_qwen_cpu_offload_wait_ms / 1000.0,
+             decode_qwen_cpu_offload_wait_ms / decode_tokens,
+             decode_qwen_cpu_offload_total_ms / 1000.0,
+             decode_qwen_cpu_offload_total_ms / decode_tokens,
+             decode_qwen_cpu_offload_fence_wait_ms / 1000.0,
+             decode_qwen_cpu_offload_fence_wait_ms / decode_tokens,
+             decode_qwen_cpu_offload_h2d_ms / 1000.0,
+             decode_qwen_cpu_offload_h2d_ms / decode_tokens,
+             decode_qwen_cpu_offload_ring_reuse_wait_ms / 1000.0,
+             decode_qwen_cpu_offload_ring_reuse_wait_ms / decode_tokens,
+             (unsigned long long)decode_qwen_cpu_offload_cold_slots,
+             (double)decode_qwen_cpu_offload_cold_slots / decode_tokens,
+             (unsigned long long)decode_qwen_cpu_offload_worker_calls,
+             (unsigned long long)decode_qwen_cpu_offload_worker_successes,
+             (unsigned long long)decode_qwen_cpu_offload_worker_failures,
+             (unsigned long long)decode_qwen_cpu_offload_fenced_calls,
+             (unsigned long long)decode_qwen_cpu_offload_fence_failures,
              decode_residual_ms / 1000.0,
              decode_residual_ms / decode_tokens,
              decode_hc_ms / 1000.0, decode_hc_ms / decode_tokens,

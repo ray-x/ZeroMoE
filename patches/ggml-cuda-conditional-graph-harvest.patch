@@ -1,0 +1,30 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -5326,3 +5326,26 @@
+     auto *ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+     return ctx ? ctx->stream() : nullptr;
+ }
++
++// MoEStream's Phase2 master-graph unification needs the actual captured
++// cudaGraph_t for a single-backend-split ggml graph, so it can splice it in
++// as a child-graph node inside an externally-built conditional node (see
++// patches/ggml-cuda-conditional-graph-harvest.patch's caller). ggml keys its
++// internal graph cache the same way ggml_cuda_graph_get_key does (the
++// cgraph's first node pointer); callers must pass that same pointer here.
++// The returned handle is only valid as long as ggml does not recapture it
++// (a properties/shape change) -- callers must re-harvest after every call
++// and must not hold this across a call where the underlying cgraph's
++// properties changed.
++#ifdef USE_CUDA_GRAPH
++extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(
++    ggml_backend_t backend, const ggml_tensor *first_node) {
++    if (!backend || backend->iface.graph_compute != ggml_backend_cuda_graph_compute || !first_node)
++        return nullptr;
++    auto *ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    if (!ctx)
++        return nullptr;
++    ggml_cuda_graph *g = ctx->cuda_graph(first_node);
++    return g ? g->graph : nullptr;
++}
++#endif // USE_CUDA_GRAPH

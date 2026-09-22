@@ -50,5 +50,16 @@ struct MoePipelineContext {
 namespace moe_pipeline_internal {
 void add_decode_qwen_cpu_graph_ms(double elapsed_ms);
 void add_decode_qwen_shared_submit_ms(double elapsed_ms);
+void add_decode_qwen_cpu_offload_wait_ms(double elapsed_ms);
+void add_decode_qwen_cpu_offload_total_ms(double elapsed_ms);
+void add_decode_qwen_cpu_offload_fence_wait_ms(double elapsed_ms);
+void add_decode_qwen_cpu_offload_h2d_ms(double elapsed_ms);
+void add_decode_qwen_cpu_offload_ring_reuse_wait_ms(double elapsed_ms);
+void add_decode_qwen_cpu_offload_cold_slots(uint64_t count);
+void add_decode_qwen_cpu_offload_worker_call();
+void add_decode_qwen_cpu_offload_worker_success();
+void add_decode_qwen_cpu_offload_worker_failure();
+void add_decode_qwen_cpu_offload_fenced_call();
+void add_decode_qwen_cpu_offload_fence_failure();
 void qwen4exp_record_pilot_fetch_start(int layer_idx);
 } // namespace moe_pipeline_internal

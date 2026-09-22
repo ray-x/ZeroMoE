@@ -434,6 +434,23 @@ struct EngineConfig {
   // without adding a shared-only launch or a second device add graph.
   bool qwen4exp_cpu_shared_device = false;
 
+  // CPUOffload branch Milestone A: split selected decode layers into the
+  // existing VRAM expert path and a persistent DDR-backed CPU worker. This is
+  // deliberately separate from Option B's static pinning switch so the
+  // experiment can be enabled without changing the baseline configuration.
+  bool qwen4exp_cpu_offload = false;
+  std::vector<int> qwen4exp_cpu_offload_layers;
+  // Force the first N routed slots cold for a deterministic A/B while keeping
+  // the router's IDs and weights unchanged.  A fixed expert ID can be forced
+  // instead with qwen4exp_cpu_offload_force_expert.
+  int qwen4exp_cpu_offload_force_cold_count = 0;
+  int qwen4exp_cpu_offload_force_expert = -1;
+  // Milestone B: queue the CPU result through a pinned host/device ring and
+  // fence the shared CUDA stream on the copy event.  Milestone A remains the
+  // default until the event protocol has been A/B validated.
+  bool qwen4exp_cpu_offload_event_fence = false;
+  int qwen4exp_cpu_offload_ring_slots = 2;
+
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
   // prefilled. Restricted to families whose carried recurrent/conv/PLE state
@@ -2784,6 +2801,32 @@ inline bool EngineConfig::load(const std::string &path) {
   }
   qwen4exp_cpu_shared_device = doc.root.get_bool(
       "qwen4exp_cpu_shared_device", qwen4exp_cpu_shared_device);
+  qwen4exp_cpu_offload =
+      doc.root.get_bool("qwen4exp_cpu_offload", qwen4exp_cpu_offload);
+  qwen4exp_cpu_offload_layers =
+      doc.root.get_int_array("qwen4exp_cpu_offload_layers");
+  qwen4exp_cpu_offload_force_cold_count = (int)doc.root.get_int(
+      "qwen4exp_cpu_offload_force_cold_count",
+      qwen4exp_cpu_offload_force_cold_count);
+  if (qwen4exp_cpu_offload_force_cold_count < 0) {
+    LOG_WARN("[CONFIG] qwen4exp_cpu_offload_force_cold_count=%d is invalid; "
+             "clamping to 0\n",
+             qwen4exp_cpu_offload_force_cold_count);
+    qwen4exp_cpu_offload_force_cold_count = 0;
+  }
+  if (qwen4exp_cpu_offload_force_cold_count > 16)
+    qwen4exp_cpu_offload_force_cold_count = 16;
+  qwen4exp_cpu_offload_force_expert = (int)doc.root.get_int(
+      "qwen4exp_cpu_offload_force_expert",
+      qwen4exp_cpu_offload_force_expert);
+  qwen4exp_cpu_offload_event_fence = doc.root.get_bool(
+      "qwen4exp_cpu_offload_event_fence", qwen4exp_cpu_offload_event_fence);
+  qwen4exp_cpu_offload_ring_slots = (int)doc.root.get_int(
+      "qwen4exp_cpu_offload_ring_slots", qwen4exp_cpu_offload_ring_slots);
+  if (qwen4exp_cpu_offload_ring_slots < 1)
+    qwen4exp_cpu_offload_ring_slots = 1;
+  if (qwen4exp_cpu_offload_ring_slots > 4)
+    qwen4exp_cpu_offload_ring_slots = 4;
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
   mtp_enabled = doc.root.get_bool("mtp_enabled", mtp_enabled);
   mtp_draft_tokens = (int)doc.root.get_int("mtp_draft_tokens", mtp_draft_tokens);

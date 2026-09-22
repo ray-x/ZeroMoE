@@ -481,6 +481,16 @@ public:
         qwen4exp_option_b_hot_masks;
     bool qwen4exp_option_b_committed = false;
 
+    // CPUOffload branch Milestone A. This is independent of Option B's
+    // planner: it only controls whether the explicit mixed hot-GPU/
+    // cold-DDR CPU seam is eligible for a decode layer.
+    bool qwen4exp_cpu_offload = false;
+    std::vector<int> qwen4exp_cpu_offload_layers;
+    int qwen4exp_cpu_offload_force_cold_count = 0;
+    int qwen4exp_cpu_offload_force_expert = -1;
+    bool qwen4exp_cpu_offload_event_fence = false;
+    int qwen4exp_cpu_offload_ring_slots = 2;
+
     bool qwen4exp_option_b_layer_enabled(int layer) const {
       if (!qwen4exp_option_b_committed)
         return false;
@@ -498,8 +508,15 @@ public:
         return static_cast<size_t>(expert) < it->second.size() &&
                it->second[static_cast<size_t>(expert)] != 0;
       return layer == qwen4exp_option_b_layer &&
-             static_cast<size_t>(expert) < qwen4exp_option_b_hot_mask.size() &&
+               static_cast<size_t>(expert) < qwen4exp_option_b_hot_mask.size() &&
              qwen4exp_option_b_hot_mask[static_cast<size_t>(expert)] != 0;
+    }
+
+    bool qwen4exp_cpu_offload_layer_enabled(int layer) const {
+      if (!qwen4exp_cpu_offload || layer < 0)
+        return false;
+      return std::binary_search(qwen4exp_cpu_offload_layers.begin(),
+                                qwen4exp_cpu_offload_layers.end(), layer);
     }
 
     // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not
@@ -516,6 +533,10 @@ public:
     std::vector<int> qwen4exp_partial_layer_gpu_ids; // top-N experts, ranked by usage
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
+    // Phase 2 owns three decode graph instances.  If their additional arena
+    // footprint cannot be allocated, disable Phase 2 for this session rather
+    // than retrying the same failed construction on every decode token.
+    bool qwen4exp_partial_layer_phase2_disabled = false;
 
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 

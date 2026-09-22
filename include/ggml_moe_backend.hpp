@@ -56,10 +56,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -245,6 +247,18 @@ class GgmlQwenSharedRunner {
                        const void **shared_output);
   bool run_host_routed_add(int layer, const float *host_routed,
                            const void **combined_output);
+  // Add a device-resident routed vector to an already-combined device result.
+  // This is the second leg of CPUOffload Milestone B: the caller has already
+  // queued the shared+hot graph, and the device stream has been fenced on the
+  // CPU worker's H2D completion event before invoking this graph.
+  bool run_device_routed_add(int layer, const void *base_output_tensor,
+                             const void *device_routed,
+                             const void **combined_output);
+
+  // Opaque CUDA stream used by this runner's shared GGML backend.  The
+  // CPUOffload ring uses it only for cudaStreamWaitEvent; keeping the public
+  // type opaque preserves the no-CUDA header contract.
+  void *backend_stream() const;
 
   // Copy the result of the most recent run() to a row-major host buffer.
   // This is the deliberate boundary for the host-HC fallback: the routed and
@@ -874,8 +888,33 @@ struct GgmlQwenCpuExpertRef {
   uint32_t down_type = 0;
 };
 
+// Opt-in Layer-0 host-node diagnostics.  The CUDA graph bridge sets the
+// current layer around its callback so the persistent CPU graph can expose
+// the SwiGLU and raw down-projection tensors without changing its hot-path
+// API or allocating diagnostic state during normal decode.
+void qwen_cpu_moe_diag_set_layer(int layer);
+
+struct GgmlQwenDirectWorkerSample {
+  int64_t wall_start_ns = 0;
+  int64_t wall_end_ns = 0;
+  int64_t cpu_start_ns = 0;
+  int64_t cpu_end_ns = 0;
+  long voluntary_start = 0;
+  long voluntary_end = 0;
+  long involuntary_start = 0;
+  long involuntary_end = 0;
+  int cpu_start = -1;
+  int cpu_end = -1;
+};
+
 class GgmlQwenCpuMoeRunner {
  public:
+  // Called by the persistent worker after the CPU graph has finished.  The
+  // callback is deliberately a raw function pointer so the decode path does
+  // not allocate a std::function per token.  It may enqueue CUDA work, but it
+  // must not free or reuse the request buffers.
+  using AsyncCompletionFn = void (*)(void *user, bool success);
+
   static bool compiled_in();
   static GgmlQwenCpuMoeRunner &instance();
   // Qwen's packed DDR arenas use more than one real quantization/stride
@@ -885,6 +924,10 @@ class GgmlQwenCpuMoeRunner {
   static GgmlQwenCpuMoeRunner &instance_for_strided(
       const GgmlQwenCpuExpertRef &layer, int n_experts, int d_model,
       int d_ff, int topk, size_t expert_stride, bool output_per_expert);
+  static GgmlQwenCpuMoeRunner &instance_for_strided_planes(
+      const GgmlQwenCpuExpertRef &layer, int n_experts, int d_model,
+      int d_ff, int topk, size_t gate_stride, size_t up_stride,
+      size_t down_stride, bool output_per_expert);
 
   bool run(const float *input, float *output,
            const GgmlQwenCpuExpertRef *experts, int n_experts,
@@ -900,6 +943,15 @@ class GgmlQwenCpuMoeRunner {
                   const void *down_plane, const int *expert_ids,
                   int n_experts, const float *router_weights, int d_model,
                   int d_ff, int topk, size_t expert_stride);
+
+  // Projection-compact variant. Each projection has its own expert-axis
+  // stride; the three planes are not assumed to be adjacent per expert.
+  bool run_strided_planes(
+      const float *input, float *output, const GgmlQwenCpuExpertRef &layer,
+      const void *gate_plane, const void *up_plane, const void *down_plane,
+      const int *expert_ids, int n_experts, const float *router_weights,
+      int d_model, int d_ff, int topk, size_t gate_stride, size_t up_stride,
+      size_t down_stride);
 
   // Qwen-only CPU/GPU partition: run the CPU graph through the down
   // projection, returning the unweighted [d_model, topk] expert outputs.
@@ -922,11 +974,40 @@ class GgmlQwenCpuMoeRunner {
       const void *gate_plane, const void *up_plane, const void *down_plane,
       const int *expert_ids, int n_experts, const float *router_weights,
       int d_model, int d_ff, int topk, size_t expert_stride);
+  bool start_strided_async(
+      const float *input, float *output, const GgmlQwenCpuExpertRef &layer,
+      const void *gate_plane, const void *up_plane, const void *down_plane,
+      const int *expert_ids, int n_experts, const float *router_weights,
+      int d_model, int d_ff, int topk, size_t expert_stride,
+      AsyncCompletionFn completion, void *completion_user);
   bool wait_strided_async();
 
   // Actual GGML worker count for diagnostics. This may differ from the
   // process-wide OpenMP maximum when MOESTREAM_QWEN_CPU_THREADS is used.
   int thread_count() const { return n_threads_; }
+
+  // Start the pre-sized direct team during graph construction, before graph
+  // capture. Replay-time arming only changes an atomic state and never
+  // creates threads or allocates memory.
+  void prepare_direct_workers();
+  void arm_direct_workers();
+
+  // Host-node runners are inactive for most of a decode step. When ggml is
+  // built without OpenMP these calls suspend/resume the persistent ggml CPU
+  // worker team, so it cannot compete with the ordinary scheduler between
+  // callbacks. They are harmless with an OpenMP-backed ggml build because
+  // ggml implements them as no-ops there.
+  void pause_workers();
+  void resume_workers();
+
+  // The full Qwen graph already owns a persistent CPU worker pool for its
+  // ordinary CPU splits.  A host-node MoE runner may borrow that pool while
+  // its callback is active instead of creating a second execution context.
+  // The caller retains ownership and must release it before destroying the
+  // pool.
+  void bind_external_threadpool(void *threadpool, int n_threads);
+  void unbind_external_threadpool(void *threadpool);
+  bool uses_external_threadpool() const { return cpu_threadpool_borrowed_; }
 
   void shutdown();
   ~GgmlQwenCpuMoeRunner();
@@ -940,15 +1021,39 @@ class GgmlQwenCpuMoeRunner {
   GgmlQwenCpuMoeRunner(const GgmlQwenCpuMoeRunner &) = delete;
   GgmlQwenCpuMoeRunner &operator=(const GgmlQwenCpuMoeRunner &) = delete;
 
+  struct AsyncStridedRequest;
+
   bool ensure_graph(const GgmlQwenCpuExpertRef &ref, int n_experts,
                     int d_model, int d_ff, int topk, bool strided,
                     const void *gate_plane, const void *up_plane,
                     const void *down_plane, size_t expert_stride,
-                    bool output_per_expert, bool merged_gate_up);
+                    bool output_per_expert, bool merged_gate_up,
+                    size_t up_expert_stride = 0,
+                    size_t down_expert_stride = 0);
+  bool ensure_direct_signature(const GgmlQwenCpuExpertRef &ref,
+                              int n_experts, int d_model, int d_ff, int topk,
+                              size_t gate_stride, size_t up_stride,
+                              size_t down_stride);
+  bool direct_signature_supported(const GgmlQwenCpuExpertRef &ref,
+                                  int d_model, int d_ff, int topk,
+                                  size_t gate_stride, size_t up_stride,
+                                  size_t down_stride) const;
+  bool direct_pool_enabled() const;
+  bool submit_direct_request(const AsyncStridedRequest &request);
+  void run_direct_caller_phases(const AsyncStridedRequest &request);
+  bool run_direct_fused_request(const AsyncStridedRequest &request);
+  bool run_direct_request(const AsyncStridedRequest &request);
+  void direct_worker_loop(int worker_index);
+  void ensure_direct_workers();
+  void stop_direct_pool();
   bool has_strided_signature(const GgmlQwenCpuExpertRef &layer,
                              int n_experts, int d_model, int d_ff, int topk,
                              size_t expert_stride,
                              bool output_per_expert) const;
+  bool has_strided_planes_signature(
+      const GgmlQwenCpuExpertRef &layer, int n_experts, int d_model,
+      int d_ff, int topk, size_t gate_stride, size_t up_stride,
+      size_t down_stride, bool output_per_expert) const;
   bool compute_graph();
   void free_graph();
   void async_worker_loop();
@@ -967,6 +1072,10 @@ class GgmlQwenCpuMoeRunner {
     int d_ff = 0;
     int topk = 0;
     size_t expert_stride = 0;
+    size_t up_expert_stride = 0;
+    size_t down_expert_stride = 0;
+    AsyncCompletionFn completion = nullptr;
+    void *completion_user = nullptr;
   };
 
   void *cpu_backend_ = nullptr;       // ggml_backend_t, owned
@@ -975,6 +1084,7 @@ class GgmlQwenCpuMoeRunner {
   // well; leaving this null makes ggml_backend_graph_compute() create and
   // destroy a disposable pool for every CPU-affinity layer call.
   void *cpu_threadpool_ = nullptr;    // ggml_threadpool_t, owned
+  bool cpu_threadpool_borrowed_ = false;
   void *weight_ctx_ = nullptr;        // ggml_context*, owned
   void *weight_buf_ = nullptr;        // ggml_backend_buffer_t, owned
   std::vector<void *> external_weight_bufs_; // three non-owning CPU pointer buffers
@@ -993,6 +1103,8 @@ class GgmlQwenCpuMoeRunner {
   void *ids_ = nullptr;               // ggml_tensor*
   void *weights_ = nullptr;           // ggml_tensor*
   void *output_ = nullptr;            // ggml_tensor*
+  void *act_ = nullptr;               // ggml_tensor*, SwiGLU output
+  void *down_output_ = nullptr;       // ggml_tensor*, raw down projection
 
   void *weight_storage_ = nullptr;
   size_t weight_storage_bytes_ = 0;
@@ -1008,6 +1120,8 @@ class GgmlQwenCpuMoeRunner {
   bool merged_gate_up_ = false;
   bool output_per_expert_ = false;
   size_t expert_stride_ = 0;
+  size_t up_expert_stride_ = 0;
+  size_t down_expert_stride_ = 0;
 
   // The compact GGML graph owns one [gate|up|down] slot per selected
   // expert.  Qwen decode commonly selects the same expert in the same slot
@@ -1034,6 +1148,54 @@ class GgmlQwenCpuMoeRunner {
   bool async_request_pending_ = false;
   bool async_request_done_ = true;
   bool async_result_ = false;
+
+  // Opt-in direct CPU MoE executor.  It keeps a fixed worker team alive and
+  // runs only the dependency phases required by Qwen's routed FFN.  The
+  // buffers are allocated when a signature is selected, never in decode.
+  struct DirectQ8KBlock {
+    float d;
+    int8_t qs[256];
+    int16_t bsums[16];
+  };
+
+  bool direct_ready_ = false;
+  int direct_threads_ = 0;
+  std::vector<std::thread> direct_workers_;
+  // Pack the phase command and its generation into one publication word.
+  // Workers must observe a matching (generation, command) pair; publishing
+  // them through separate atomics permits a descheduled worker to observe a
+  // new generation with the previous command.
+  std::atomic<uint64_t> direct_phase_{0};
+  std::atomic<bool> direct_armed_{false};
+  std::atomic<int> direct_completed_{0};
+  std::atomic<bool> direct_finished_{true};
+  std::atomic<bool> direct_result_{false};
+  std::atomic<bool> direct_stop_{false};
+  std::atomic<bool> direct_request_ok_{true};
+  std::atomic<int64_t> direct_timing_input_ns_{0};
+  std::atomic<int64_t> direct_timing_phase1_start_ns_{0};
+  std::atomic<int64_t> direct_timing_phase1_ns_{0};
+  std::atomic<int64_t> direct_timing_down_start_ns_{0};
+  std::atomic<int64_t> direct_timing_down_ns_{0};
+  std::atomic<int64_t> direct_timing_reduce_start_ns_{0};
+  std::atomic<int64_t> direct_timing_reduce_ns_{0};
+  std::vector<uint8_t> direct_input_q8k_;
+  std::vector<uint8_t> direct_down_q8_0_;
+  std::vector<float> direct_gate_output_;
+  std::vector<float> direct_up_output_;
+  std::vector<float> direct_down_output_;
+  std::vector<float *> direct_fused_gate_output_ptrs_;
+  std::vector<float *> direct_fused_up_output_ptrs_;
+  std::vector<float *> direct_fused_down_output_ptrs_;
+  std::vector<const uint8_t *> direct_fused_gate_weight_ptrs_;
+  std::vector<const uint8_t *> direct_fused_up_weight_ptrs_;
+  std::vector<const uint8_t *> direct_fused_down_weight_ptrs_;
+  std::vector<const uint8_t *> direct_gate_rows_;
+  std::vector<const uint8_t *> direct_up_rows_;
+  std::vector<const uint8_t *> direct_down_rows_;
+  std::vector<GgmlQwenDirectWorkerSample> direct_gate_samples_;
+  std::vector<GgmlQwenDirectWorkerSample> direct_down_samples_;
+  std::vector<GgmlQwenDirectWorkerSample> direct_reduce_samples_;
 };
 
 // Qwen-only decode graph that mirrors BeeLlama's backend topology for a

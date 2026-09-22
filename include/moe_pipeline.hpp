@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 class StreamingEngine;
 class RAMSafetyManager;
 class LockFreePrefetcher;
@@ -12,6 +14,17 @@ void moe_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
 
 double diag_get_decode_qwen_cpu_graph_ms();
 double diag_get_decode_qwen_shared_submit_ms();
+double diag_get_decode_qwen_cpu_offload_wait_ms();
+double diag_get_decode_qwen_cpu_offload_total_ms();
+double diag_get_decode_qwen_cpu_offload_fence_wait_ms();
+double diag_get_decode_qwen_cpu_offload_h2d_ms();
+double diag_get_decode_qwen_cpu_offload_ring_reuse_wait_ms();
+uint64_t diag_get_decode_qwen_cpu_offload_cold_slots();
+uint64_t diag_get_decode_qwen_cpu_offload_worker_calls();
+uint64_t diag_get_decode_qwen_cpu_offload_worker_successes();
+uint64_t diag_get_decode_qwen_cpu_offload_worker_failures();
+uint64_t diag_get_decode_qwen_cpu_offload_fenced_calls();
+uint64_t diag_get_decode_qwen_cpu_offload_fence_failures();
 
 namespace moe_pipeline_detail {
 bool qwen4exp_router_pilot_layer_allowed(const StreamingEngine &engine,

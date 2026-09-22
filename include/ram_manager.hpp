@@ -687,7 +687,12 @@ private:
   void finish_sync_promotion_locked(
       MoEExpertBlock &blk, int layer, int expert_id,
       std::vector<MoEExpertBlock> *layer_slots_for_occupancy = nullptr) {
-    bool should_free = move_on_promotion && blk.ram_temp_pin_count <= 0;
+    // A graph-backed slot aliases an immutable shared arena.  It must retain
+    // its identity and capacity even when the same expert is also promoted to
+    // VRAM; treating it as MOVE would invalidate the arena metadata while the
+    // CPUOffload worker may still use the DDR view.
+    bool should_free = !blk.slab_from_shared_arena &&
+                       move_on_promotion && blk.ram_temp_pin_count <= 0;
     if (!should_free && !move_on_promotion &&
         ram_copy_reclaim_threshold > 0.0 && blk.ram_temp_pin_count <= 0 &&
         layer_slots_for_occupancy) {
@@ -767,7 +772,7 @@ public:
   void apply_promotion_bookkeeping(MoEExpertBlock &blk, int layer,
                                    int expert_id, ExpertLocation *promoted) {
     RAM_TIMED_LOCK(lock);
-    if (move_on_promotion) {
+    if (move_on_promotion && !blk.slab_from_shared_arena) {
       blk.expert_id = -1;
       ram_expert_index.erase(swap_key(layer, expert_id));
       blk.last_used_clock = 0;
@@ -2268,7 +2273,9 @@ public:
         perf().n_prefetch_staged_later_promoted.fetch_add(
             1, std::memory_order_relaxed);
       }
-      if (move_on_promotion && allow_move) {
+      // Shared graph-arena slots are immutable DDR sources for the CPU graph;
+      // keep them in place even when the global policy is MOVE.
+      if (move_on_promotion && allow_move && !slot.slab_from_shared_arena) {
         slot.expert_id = -1;
         ram_expert_index.erase(swap_key(layer, expert_id));
         slot.last_used_clock = 0;
