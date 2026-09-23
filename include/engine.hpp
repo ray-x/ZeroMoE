@@ -2110,12 +2110,18 @@ public:
         // Runtime misses are not expected for a complete immutable graph
         // arena and must not write a packed slab over the shared allocation.
         if (graph_ram_layer_projection_compact(layer_idx)) {
-            if (layer_is_unpacked(layer_idx))
-                return false;
             size_t gb = 0, ub = 0, db = 0;
             const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
-            if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM) ||
-                !gM || !uM || !dM)
+            const bool unpacked = layer_is_unpacked(layer_idx);
+            if (unpacked) {
+                if (!unpacked_expert_geometry(layer_idx, expert_id, gb, ub,
+                                              db, gM, uM, dM))
+                    return false;
+            } else if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM,
+                                             dM)) {
+                return false;
+            }
+            if (!gM || !uM || !dM)
                 return false;
             const GraphRamLayerArena &arena =
                 graph_ram_arenas[(size_t)layer_idx];
@@ -2136,26 +2142,47 @@ public:
                 base + arena.up_offset + e * arena.up_stride);
             uint8_t *dst_down = const_cast<uint8_t *>(
                 base + arena.down_offset + e * arena.down_stride);
-            const bool split = replica == REPLICA_SPLIT;
+            if (unpacked && replica == REPLICA_SPLIT)
+                replica = 0;
+            const bool split = !unpacked && replica == REPLICA_SPLIT;
             const int r_gate = split ? 0 : replica;
             const int r_up = split ? 0 : replica;
             const int r_down = split ? 1 : replica;
             out_n = 0;
-            out_reqs[out_n++] = {
-                model_file.fd_for_tensor(*gM, r_gate),
-                model_file.direct_io_active_for(*gM, r_gate),
-                model_file.direct_io_alignment, dst_gate, gb,
-                gM->offset + (uint64_t)expert_id * gb};
-            out_reqs[out_n++] = {
-                model_file.fd_for_tensor(*uM, r_up),
-                model_file.direct_io_active_for(*uM, r_up),
-                model_file.direct_io_alignment, dst_up, ub,
-                uM->offset + (uint64_t)expert_id * ub};
-            out_reqs[out_n++] = {
-                model_file.fd_for_tensor(*dM, r_down),
-                model_file.direct_io_active_for(*dM, r_down),
-                model_file.direct_io_alignment, dst_down, db,
-                dM->offset + (uint64_t)expert_id * db};
+            if (unpacked) {
+                // The per-expert format has independent source tensors.  The
+                // compact destination still has three separate planes, so
+                // this is necessarily three reads even when the source
+                // tensors happen to be tight in the GGUF file.
+                out_reqs[out_n++] = {
+                    model_file.fd_for_tensor(*gM, r_gate),
+                    model_file.direct_io_active_for(*gM, r_gate),
+                    model_file.direct_io_alignment, dst_gate, gb, gM->offset};
+                out_reqs[out_n++] = {
+                    model_file.fd_for_tensor(*uM, r_up),
+                    model_file.direct_io_active_for(*uM, r_up),
+                    model_file.direct_io_alignment, dst_up, ub, uM->offset};
+                out_reqs[out_n++] = {
+                    model_file.fd_for_tensor(*dM, r_down),
+                    model_file.direct_io_active_for(*dM, r_down),
+                    model_file.direct_io_alignment, dst_down, db, dM->offset};
+            } else {
+                out_reqs[out_n++] = {
+                    model_file.fd_for_tensor(*gM, r_gate),
+                    model_file.direct_io_active_for(*gM, r_gate),
+                    model_file.direct_io_alignment, dst_gate, gb,
+                    gM->offset + (uint64_t)expert_id * gb};
+                out_reqs[out_n++] = {
+                    model_file.fd_for_tensor(*uM, r_up),
+                    model_file.direct_io_active_for(*uM, r_up),
+                    model_file.direct_io_alignment, dst_up, ub,
+                    uM->offset + (uint64_t)expert_id * ub};
+                out_reqs[out_n++] = {
+                    model_file.fd_for_tensor(*dM, r_down),
+                    model_file.direct_io_active_for(*dM, r_down),
+                    model_file.direct_io_alignment, dst_down, db,
+                    dM->offset + (uint64_t)expert_id * db};
+            }
             out_total = gb + ub + db;
             return true;
         }
@@ -2220,8 +2247,7 @@ public:
     // final graph-arena planes. No bytes are copied here.
     bool populate_graph_ram_projection_views(int layer_idx, int expert_id,
                                              MoEExpertBlock &target_slot) {
-        if (!graph_ram_layer_projection_compact(layer_idx) ||
-            layer_is_unpacked(layer_idx) || expert_id < 0)
+        if (!graph_ram_layer_projection_compact(layer_idx) || expert_id < 0)
             return false;
         const GraphRamLayerArena &arena =
             graph_ram_arenas[(size_t)layer_idx];
@@ -2230,8 +2256,13 @@ public:
             return false;
         size_t gb = 0, ub = 0, db = 0;
         const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
-        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM) ||
-            !gM || !uM || !dM || gb != arena.gate_bytes ||
+        const bool unpacked = layer_is_unpacked(layer_idx);
+        const bool have_geometry = unpacked
+            ? unpacked_expert_geometry(layer_idx, expert_id, gb, ub, db,
+                                       gM, uM, dM)
+            : packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM);
+        if (!have_geometry || !gM || !uM || !dM ||
+            gb != arena.gate_bytes ||
             ub != arena.up_bytes || db != arena.down_bytes)
             return false;
         const size_t e = (size_t)expert_id;
@@ -2270,8 +2301,7 @@ public:
     // startup duplicate and preserving the same host pointers for the graph.
     bool load_graph_ram_projection_compact(int layer_idx, int expert_id,
                                            MoEExpertBlock &target_slot) {
-        if (!graph_ram_layer_projection_compact(layer_idx) ||
-            layer_is_unpacked(layer_idx) || expert_id < 0)
+        if (!graph_ram_layer_projection_compact(layer_idx) || expert_id < 0)
             return false;
         const GraphRamLayerArena &arena =
             graph_ram_arenas[(size_t)layer_idx];
@@ -2281,8 +2311,13 @@ public:
 
         size_t gb = 0, ub = 0, db = 0;
         const GGUFTensor *gM = nullptr, *uM = nullptr, *dM = nullptr;
-        if (!packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM) ||
-            !gM || !uM || !dM || gb != arena.gate_bytes ||
+        const bool unpacked = layer_is_unpacked(layer_idx);
+        const bool have_geometry = unpacked
+            ? unpacked_expert_geometry(layer_idx, expert_id, gb, ub, db,
+                                       gM, uM, dM)
+            : packed_slab_geometry(layer_idx, gb, ub, db, gM, uM, dM);
+        if (!have_geometry || !gM || !uM || !dM ||
+            gb != arena.gate_bytes ||
             ub != arena.up_bytes || db != arena.down_bytes ||
             arena.gate_stride < gb || arena.up_stride < ub ||
             arena.down_stride < db)
@@ -2300,13 +2335,13 @@ public:
                             e * arena.down_stride;
 
         auto read_projection = [&](const GGUFTensor &meta, size_t bytes,
-                                   uint8_t *dst, const char *which) {
+                                   uint8_t *dst, uint64_t source_offset,
+                                   const char *which) {
             const auto t0 = std::chrono::high_resolution_clock::now();
             const int fd = model_file.fd_for_tensor(meta);
             const ssize_t got = direct_io::pread_direct_aware(
                 fd, model_file.direct_io_active_for(meta),
-                model_file.direct_io_alignment, dst, bytes,
-                meta.offset + (uint64_t)expert_id * bytes);
+                model_file.direct_io_alignment, dst, bytes, source_offset);
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::high_resolution_clock::now() - t0)
                                   .count();
@@ -2322,9 +2357,15 @@ public:
         };
 
         PERF_START(disk);
-        const bool ok = read_projection(*gM, gb, dst_gate, "gate") &&
-                        read_projection(*uM, ub, dst_up, "up") &&
-                        read_projection(*dM, db, dst_down, "down");
+        const uint64_t gate_source =
+            gM->offset + (unpacked ? 0 : (uint64_t)expert_id * gb);
+        const uint64_t up_source =
+            uM->offset + (unpacked ? 0 : (uint64_t)expert_id * ub);
+        const uint64_t down_source =
+            dM->offset + (unpacked ? 0 : (uint64_t)expert_id * db);
+        const bool ok = read_projection(*gM, gb, dst_gate, gate_source, "gate") &&
+                        read_projection(*uM, ub, dst_up, up_source, "up") &&
+                        read_projection(*dM, db, dst_down, down_source, "down");
         PERF_END(disk, t_disk_read);
         perf().bytes_disk_read.fetch_add(gb + ub + db,
                                          std::memory_order_relaxed);
@@ -2333,13 +2374,13 @@ public:
 
         if (drop_expert_pages) {
             posix_fadvise(model_file.fd_for_tensor(*gM),
-                          gM->offset + (uint64_t)expert_id * gb, gb,
+                          gate_source, gb,
                           POSIX_FADV_DONTNEED);
             posix_fadvise(model_file.fd_for_tensor(*uM),
-                          uM->offset + (uint64_t)expert_id * ub, ub,
+                          up_source, ub,
                           POSIX_FADV_DONTNEED);
             posix_fadvise(model_file.fd_for_tensor(*dM),
-                          dM->offset + (uint64_t)expert_id * db, db,
+                          down_source, db,
                           POSIX_FADV_DONTNEED);
         }
 

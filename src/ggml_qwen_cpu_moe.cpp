@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <fstream>
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
 #endif
@@ -100,6 +101,33 @@ void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
            static_cast<long long>(tensor->ne[3]), tensor->nb[0], tensor->nb[1],
            tensor->nb[2], tensor->nb[3], n, first.str().c_str(), min_v, max_v,
            sum, tensor->data);
+
+  // Optional one-shot binary snapshots make the CPU graph boundary directly
+  // comparable with Bee's per-expert dumps.  Keep this opt-in and write only
+  // the first instance of each role: a diagnostic prefill may execute many
+  // S=1 positions, but position 0 is the parity boundary we are auditing.
+  const char *dump_dir = std::getenv("MOESTREAM_QWEN4EXP_DIAG_DUMP_DIR");
+  if (dump_dir && dump_dir[0]) {
+    static std::atomic<bool> dumped_down_input{false};
+    static std::atomic<bool> dumped_down_output{false};
+    static std::atomic<bool> dumped_cpu_output{false};
+    std::atomic<bool> *done = nullptr;
+    if (std::strcmp(role, "down_input_swiglu") == 0)
+      done = &dumped_down_input;
+    else if (std::strcmp(role, "down_output_raw") == 0)
+      done = &dumped_down_output;
+    else if (std::strcmp(role, "cpu_output_pre_h2d") == 0)
+      done = &dumped_cpu_output;
+    if (done && !done->exchange(true, std::memory_order_relaxed)) {
+      std::string path = std::string(dump_dir) + "/moe_cpu_" + role + ".f32";
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      if (out)
+        out.write(reinterpret_cast<const char *>(values.data()),
+                  static_cast<std::streamsize>(values.size() * sizeof(float)));
+      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s snapshot=%s bytes=%zu\n", role,
+               path.c_str(), values.size() * sizeof(float));
+    }
+  }
 }
 
 constexpr size_t kWeightContextBytes = 64ull * 1024ull;
@@ -1729,9 +1757,8 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
         effective_up_stride == 0 || effective_down_stride == 0)) ||
       (!strided && topk != n_experts) ||
       (merged_gate_up &&
-       (!strided || ref.gate_type != ref.up_type ||
-        ref.gate_bytes != ref.up_bytes ||
-        effective_up_stride != expert_stride)))
+       (ref.gate_type != ref.up_type || ref.gate_bytes != ref.up_bytes ||
+        (strided && effective_up_stride != expert_stride))))
     return false;
 
   const bool shape_matches =
@@ -1866,7 +1893,10 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
   void *storage = nullptr;
   ggml_backend_buffer_t wbuf = nullptr;
   if (!strided) {
-    const size_t storage_bytes = gate_bytes + up_bytes + down_bytes;
+    const size_t gate_up_total =
+        merged_gate_up ? gate_bytes + up_bytes : gate_bytes;
+    const size_t storage_bytes =
+        gate_up_total + (merged_gate_up ? down_bytes : up_bytes + down_bytes);
     if (posix_memalign(&storage, 64, storage_bytes) != 0 || !storage) {
       ggml_free(wctx);
       return false;
@@ -1875,16 +1905,26 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
     weight_storage_bytes_ = storage_bytes;
     wbuf = ggml_backend_cpu_buffer_from_ptr(weight_storage_,
                                             weight_storage_bytes_);
-    if (!wbuf ||
-        ggml_backend_tensor_alloc(wbuf, gate, weight_storage_) !=
-            GGML_STATUS_SUCCESS ||
-        ggml_backend_tensor_alloc(
-            wbuf, up, static_cast<uint8_t *>(weight_storage_) + gate_bytes) !=
-            GGML_STATUS_SUCCESS ||
-        ggml_backend_tensor_alloc(wbuf, down,
-                                  static_cast<uint8_t *>(weight_storage_) +
-                                      gate_bytes + up_bytes) !=
-            GGML_STATUS_SUCCESS) {
+    const bool weight_alloc_ok =
+        wbuf &&
+        (merged_gate_up
+             ? (ggml_backend_tensor_alloc(wbuf, gate_up, weight_storage_) ==
+                    GGML_STATUS_SUCCESS &&
+                ggml_backend_tensor_alloc(
+                    wbuf, down,
+                    static_cast<uint8_t *>(weight_storage_) + gate_up_total) ==
+                    GGML_STATUS_SUCCESS)
+             : (ggml_backend_tensor_alloc(wbuf, gate, weight_storage_) ==
+                    GGML_STATUS_SUCCESS &&
+                ggml_backend_tensor_alloc(
+                    wbuf, up,
+                    static_cast<uint8_t *>(weight_storage_) + gate_bytes) ==
+                    GGML_STATUS_SUCCESS &&
+                ggml_backend_tensor_alloc(
+                    wbuf, down,
+                    static_cast<uint8_t *>(weight_storage_) + gate_bytes +
+                        up_bytes) == GGML_STATUS_SUCCESS));
+    if (!weight_alloc_ok) {
       if (wbuf)
         ggml_backend_buffer_free(wbuf);
       ggml_free(wctx);
@@ -2150,17 +2190,26 @@ bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
         e.down_type != first.down_type)
       return false;
   }
+  const bool merged_gate_up = first.gate_type == first.up_type &&
+                              first.gate_bytes == first.up_bytes;
   if (!ensure_graph(first, n_experts, d_model, d_ff, topk, false, nullptr,
-                    nullptr, nullptr, 0, false, false))
+                    nullptr, nullptr, 0, false, merged_gate_up))
     return false;
 
   const size_t gate_plane =
       weight_storage_ == nullptr
           ? 0
-          : ggml_nbytes(static_cast<ggml_tensor *>(gate_)) /
+          : (merged_gate_up
+                 ? (ggml_nbytes(static_cast<ggml_tensor *>(gate_up_)) /
+                    static_cast<size_t>(n_experts_)) /
+                       2
+                 : ggml_nbytes(static_cast<ggml_tensor *>(gate_)) /
+                       static_cast<size_t>(n_experts_));
+  const size_t up_plane =
+      merged_gate_up
+          ? gate_plane
+          : ggml_nbytes(static_cast<ggml_tensor *>(up_)) /
                 static_cast<size_t>(n_experts_);
-  const size_t up_plane = ggml_nbytes(static_cast<ggml_tensor *>(up_)) /
-                          static_cast<size_t>(n_experts_);
   const size_t down_plane = ggml_nbytes(static_cast<ggml_tensor *>(down_)) /
                             static_cast<size_t>(n_experts_);
   if (gate_plane != first.gate_bytes || up_plane != first.up_bytes ||
@@ -2170,6 +2219,7 @@ bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
   uint8_t *storage = static_cast<uint8_t *>(weight_storage_);
   const size_t gate_total = gate_plane * static_cast<size_t>(n_experts_);
   const size_t up_total = up_plane * static_cast<size_t>(n_experts_);
+  const size_t gate_up_total = gate_total + up_total;
   if (cached_sources_.size() != static_cast<size_t>(n_experts_))
     cached_sources_.assign(static_cast<size_t>(n_experts_), {});
   for (int i = 0; i < n_experts_; ++i) {
@@ -2180,11 +2230,21 @@ bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
         cached.down == expert.down && cached.gate_bytes == gate_plane &&
         cached.up_bytes == up_plane && cached.down_bytes == down_plane;
     if (!unchanged) {
-      std::memcpy(storage + static_cast<size_t>(i) * gate_plane, expert.gate,
-                  gate_plane);
-      std::memcpy(storage + gate_total + static_cast<size_t>(i) * up_plane,
-                  expert.up, up_plane);
-      std::memcpy(storage + gate_total + up_total +
+      if (merged_gate_up) {
+        const size_t expert_gate_up =
+            static_cast<size_t>(i) * (gate_plane + up_plane);
+        std::memcpy(storage + expert_gate_up, expert.gate, gate_plane);
+        std::memcpy(storage + expert_gate_up + gate_plane, expert.up,
+                    up_plane);
+      } else {
+        std::memcpy(storage + static_cast<size_t>(i) * gate_plane,
+                    expert.gate, gate_plane);
+        std::memcpy(storage + gate_total +
+                        static_cast<size_t>(i) * up_plane,
+                    expert.up, up_plane);
+      }
+      std::memcpy(storage + (merged_gate_up ? gate_up_total
+                                             : gate_total + up_total) +
                       static_cast<size_t>(i) * down_plane,
                   expert.down, down_plane);
       cached.gate = expert.gate;
@@ -2206,6 +2266,12 @@ bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
 
   if (!compute_graph())
     return false;
+  dump_qwen_cpu_diag_tensor("down_input_swiglu",
+                            static_cast<const ggml_tensor *>(act_));
+  dump_qwen_cpu_diag_tensor("down_output_raw",
+                            static_cast<const ggml_tensor *>(down_output_));
+  dump_qwen_cpu_diag_tensor("cpu_output_pre_h2d",
+                            static_cast<const ggml_tensor *>(output_));
   std::memcpy(output, static_cast<ggml_tensor *>(output_)->data,
               static_cast<size_t>(d_model_) * sizeof(float));
   return true;
@@ -2383,8 +2449,17 @@ bool GgmlQwenCpuMoeRunner::run_strided_planes(
   // independent expert-axis strides here.
   if (!ensure_graph(layer, n_experts, d_model, d_ff, topk, true,
                     gate_plane, up_plane, down_plane, gate_stride, false,
-                    false, up_stride, down_stride))
+                    false, up_stride, down_stride)) {
+    const char *sched_debug = std::getenv("MOESTREAM_QWEN_DECODE_SCHED_DEBUG");
+    if (sched_debug && sched_debug[0] == '1')
+      LOG_WARN("[QWEN-CPU-PLANES] ensure_graph failed types=%u/%u/%u "
+               "bytes=%zu/%zu/%zu strides=%zu/%zu/%zu n=%d D=%d FF=%d K=%d\n",
+               layer.gate_type, layer.up_type, layer.down_type,
+               layer.gate_bytes, layer.up_bytes, layer.down_bytes,
+               gate_stride, up_stride, down_stride, n_experts, d_model, d_ff,
+               topk);
     return false;
+  }
 
   static_cast<ggml_tensor *>(gate_)->data = const_cast<void *>(gate_plane);
   static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);

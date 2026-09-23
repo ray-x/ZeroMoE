@@ -656,7 +656,13 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       engine.graph_ram_layer_ready(layer_idx) &&
       !scheduler_drops_active_pilot && scheduler_target_is_cpu_or_last &&
       engine.qwen4exp_device_hc_ffn_input &&
-      moe_ggml_shared_expert() && c.n_expert_shared > 0;
+      moe_ggml_shared_expert() && c.n_expert_shared > 0 &&
+      // Projection-compact arenas have independent gate/up/down expert
+      // strides.  The Bee-style scheduler graph has one common stride
+      // contract, so declining here avoids repeated rebuild/reject attempts
+      // and routes these layers through the parity-verified per-expert CPU
+      // references in token_dispatch_pipeline.cpp.
+      !engine.graph_ram_layer_projection_compact(layer_idx);
   if (qwen4exp_decode_scheduler_enabled(engine) && S == 1 &&
       layer_idx == 0) {
     static std::atomic<bool> logged_scheduler_gate{false};
@@ -906,7 +912,17 @@ bool MoeRouterService::route(MoePipelineContext &context) {
     std::string norm_key =
         "blk." + std::to_string(layer_idx) + ".ffn_norm.weight";
     auto norm_it = engine.resident_layers.find(norm_key);
-    if (norm_it != engine.resident_layers.end() && norm_it->second.host_ptr) {
+    // Qwen4Exp's hyper-connection pre-mix already applies hc_ffn_norm and
+    // produces the exact [S,D] input consumed by both the router and the
+    // routed experts.  Some GGUFs still expose an ordinary ffn_norm tensor,
+    // but it is not part of this architecture.  Applying it here a second
+    // time changes the route input (and therefore every expert projection)
+    // even though the HC boundary itself is correct.
+    const bool qwen_hc_route_input =
+        engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        engine.family_ops.uses_hyper_connections;
+    if (!qwen_hc_route_input &&
+        norm_it != engine.resident_layers.end() && norm_it->second.host_ptr) {
       // This reinterprets host_ptr as float* unconditionally -- only
       // correct if ffn_norm.weight is actually F32 (see CLAUDE.md's
       // "quantized weight correctness" gotcha). Norm weights are
@@ -956,7 +972,39 @@ bool MoeRouterService::route(MoePipelineContext &context) {
           "scratch.normed (post ffn_norm rmsnorm, router+expert input)",
           layer_idx, -1, scratch.normed.data(), (size_t)S * D);
     } else {
-      std::memcpy(scratch.normed.data(), hidden_states, S * D * sizeof(float));
+      if (qwen_hc_route_input) {
+        static std::atomic<bool> logged_qwen_hc_route_input{false};
+        if (!logged_qwen_hc_route_input.exchange(true,
+                                                  std::memory_order_relaxed)) {
+          LOG_INFO("[MOE-ROUTE] Qwen4Exp HC route input uses the HC pre-mix "
+                   "directly; ordinary ffn_norm bypassed\n");
+        }
+      }
+      bool copied_device_hc_input = false;
+      if (qwen_hc_route_input && engine.qwen4exp_device_hc_ffn_input &&
+          qwen4exp_hc_device_live()) {
+        copied_device_hc_input = GgmlHcRunner::instance().copy_pre_mix_to_host(
+            engine.qwen4exp_device_hc_ffn_input, scratch.normed.data(), S);
+        if (!copied_device_hc_input) {
+          LOG_WARN("[MOE-ROUTE] layer=%d failed to download device HC route "
+                   "input; using host fallback\n", layer_idx);
+        }
+      }
+      if (!copied_device_hc_input)
+        std::memcpy(scratch.normed.data(), hidden_states,
+                    S * D * sizeof(float));
+      if (qwen_hc_route_input && layer_idx == 0 && S == 1 &&
+          std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP")) {
+        uint64_t hash = 1469598103934665603ULL;
+        const auto *bytes = reinterpret_cast<const uint8_t *>(scratch.normed.data());
+        for (size_t i = 0; i < (size_t)D * sizeof(float); ++i) {
+          hash ^= bytes[i];
+          hash *= 1099511628211ULL;
+        }
+        LOG_INFO("[MOE-ROUTE] layer=0 HC route input fnv64=0x%016llx source=%s\n",
+                 static_cast<unsigned long long>(hash),
+                 copied_device_hc_input ? "device" : "host");
+      }
     }
 
     std::string router_key =

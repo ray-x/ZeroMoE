@@ -230,23 +230,28 @@ class GgmlHcRunner {
   void *t_inject_ = nullptr;   // [HC, S_cap]
   void *t_mixed_ = nullptr;    // [D, S_cap], stable last pre_mix result
 
-  // One pre-mix graph is reused for both HC brackets and all layers.  The
-  // graph shape is identical; only the four layer-specific weight data
-  // pointers change before submission.  Keeping the graph and allocator
-  // workspace alive removes the old per-layer gallocr reset, which could
-  // recycle a 64 MiB temporary buffer while the previous graph was queued.
-  void *pre_ctx_ = nullptr;    // ggml_context*
-  void *pre_graph_ = nullptr;  // ggml_cgraph*
-  void *pre_norm_ = nullptr;   // ggml_tensor* (weight source metadata)
-  void *pre_down_ = nullptr;
-  void *pre_up_ = nullptr;
-  void *pre_inject_ = nullptr;
-  int pre_graph_S_ = 0;
-  uint32_t pre_down_type_ = 0;
-  uint32_t pre_up_type_ = 0;
-  uint32_t pre_inject_type_ = 0;
-  int pre_source_layer_ = -1;
-  int pre_source_sub_block_ = -1;
+  // A CUDA graph captures the addresses of its tensor sources. Retargeting
+  // one captured graph's weight tensor data pointers for every layer is not
+  // sufficient: the CUDA graph executable can retain the old kernel
+  // arguments. Keep one fixed graph per (sub-block, layer) for the active
+  // batch shape instead. The temporary workspace is still shared through
+  // galloc_pre_; graph launches are ordered on the same backend stream.
+  struct PreGraphSlot {
+    void *ctx = nullptr;    // ggml_context*
+    void *graph = nullptr;  // ggml_cgraph*
+    void *norm = nullptr;   // ggml_tensor* (fixed weight source)
+    void *down = nullptr;
+    void *up = nullptr;
+    void *inject = nullptr;
+    int S = 0;
+    uint32_t down_type = 0;
+    uint32_t up_type = 0;
+    uint32_t inject_type = 0;
+  };
+  static constexpr int kPreGraphLayerCount = 256;
+  PreGraphSlot pre_graphs_[2][kPreGraphLayerCount] = {};
+  int pre_graph_cache_S_ = 0;
+  PreGraphSlot *active_pre_graph_ = nullptr;
   // Weight storage can switch between prefill's quantized graph and decode's
   // exact-Q8 graph. A transition needs one backend drain before old tensor
   // buffers are replaced, not one drain per layer/sub-block bracket.

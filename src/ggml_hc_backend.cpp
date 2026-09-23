@@ -100,6 +100,44 @@ bool debug_check_hc_state() {
   return enabled;
 }
 
+// Diagnostic only: force the S=1 HC pre graph to be rebuilt at every bracket.
+// This separates a persistent-graph retarget/replay problem from a numerical
+// difference in the HC projection itself.  The production path keeps graph
+// reuse enabled.
+bool debug_rebuild_pre_graph_each_call() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_GGML_HC_REBUILD_EACH_CALL");
+    return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
+bool hc_no_external_weights() {
+  static const bool disabled = [] {
+    const char *e = std::getenv("MOESTREAM_GGML_HC_NO_EXTERNAL");
+    return e && e[0] == '1';
+  }();
+  return disabled;
+}
+
+bool debug_external_weight_rebind() {
+  static const bool enabled = [] {
+    const char *e = std::getenv("MOESTREAM_GGML_HC_DIAG_EXTERNAL");
+    return e && e[0] == '1';
+  }();
+  return enabled;
+}
+
+uint64_t fnv64_bytes(const void *data, size_t bytes) {
+  const auto *p = static_cast<const uint8_t *>(data);
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < bytes; ++i) {
+    h ^= p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
 // This is deliberately opt-in while it is being compared against the
 // established direct-copy path.  The runner is currently used by Qwen's
 // device-HC path; keeping the switch local means other model families retain
@@ -171,8 +209,8 @@ void GgmlHcRunner::shutdown() {
   inject_valid_S_ = 0;
   pre_graph_workspace_bytes_ = 0;
   post_graph_workspace_bytes_ = 0;
-  pre_source_layer_ = -1;
-  pre_source_sub_block_ = -1;
+  pre_graph_cache_S_ = 0;
+  active_pre_graph_ = nullptr;
   weight_mode_valid_ = false;
   weight_mode_exact_ = false;
   weight_mode_custom_ = false;
@@ -415,34 +453,28 @@ bool GgmlHcRunner::ensure_readback_buffer(size_t bytes) {
 }
 
 void GgmlHcRunner::free_pre_graph() {
-  if (pre_ctx_) {
-    ggml_free((ggml_context *)pre_ctx_);
-    pre_ctx_ = nullptr;
+  for (int sb = 0; sb < 2; ++sb) {
+    for (int l = 0; l < kMaxLayers; ++l) {
+      PreGraphSlot &slot = pre_graphs_[sb][l];
+      if (slot.ctx) ggml_free((ggml_context *)slot.ctx);
+      slot = PreGraphSlot{};
+    }
   }
-  pre_graph_ = nullptr;
-  pre_norm_ = nullptr;
-  pre_down_ = nullptr;
-  pre_up_ = nullptr;
-  pre_inject_ = nullptr;
-  pre_graph_S_ = 0;
-  pre_down_type_ = 0;
-  pre_up_type_ = 0;
-  pre_inject_type_ = 0;
+  pre_graph_cache_S_ = 0;
+  active_pre_graph_ = nullptr;
 }
 
 void GgmlHcRunner::release_completed_weights(int before_layer) {
   if (!backend_ || before_layer <= 0) return;
 
-  // The persistent pre graph keeps tensor metadata from its first bracket as
-  // stable source nodes and retargets only their data pointers.  Leave that
-  // tiny source bracket allocated; all other completed-layer buffers can be
-  // returned to CUDA after the one barrier below.
+  // Cached pre graphs keep fixed tensor metadata and data pointers for every
+  // bracket. Do not reclaim a bracket whose graph is still cached.
   ggml_backend_synchronize((ggml_backend_t)backend_);
   size_t reclaimed = 0;
   int brackets = 0;
   for (int sb = 0; sb < 2; ++sb) {
     for (int l = 0; l < before_layer; ++l) {
-      if (l == pre_source_layer_ && sb == pre_source_sub_block_) continue;
+      if (pre_graphs_[sb][l].ctx) continue;
       Bracket &b = brackets_[sb][l];
       if (!b.buf && !b.ctx) continue;
       if (b.buf) {
@@ -469,10 +501,9 @@ void GgmlHcRunner::release_completed_weights(int before_layer) {
   }
   if (brackets > 0) {
     LOG_WARN("[GGML-HC-MEM] allocation-pressure reclaim: released %d "
-             "completed-layer brackets (%.2f MiB), keeping source layer=%d "
-             "sub=%d\n",
-             brackets, (double)reclaimed / (1024.0 * 1024.0),
-             pre_source_layer_, pre_source_sub_block_);
+             "completed-layer brackets (%.2f MiB); cached graph brackets "
+             "were retained\n",
+             brackets, (double)reclaimed / (1024.0 * 1024.0));
   }
 }
 
@@ -483,7 +514,7 @@ void GgmlHcRunner::release_completed_weights_nonblocking(int before_layer) {
   int brackets = 0;
   for (int sb = 0; sb < 2; ++sb) {
     for (int l = 0; l < before_layer && l < kMaxLayers; ++l) {
-      if (l == pre_source_layer_ && sb == pre_source_sub_block_) continue;
+      if (pre_graphs_[sb][l].ctx) continue;
       Bracket &b = brackets_[sb][l];
       if (!b.buf && !b.ctx) continue;
 
@@ -542,24 +573,36 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       S <= 0 || S > s_cap_)
     return false;
 
-  const ggml_tensor *bn = (const ggml_tensor *)b.norm;
   const ggml_tensor *bd = (const ggml_tensor *)b.down;
   const ggml_tensor *bu = (const ggml_tensor *)b.up;
   const ggml_tensor *bi = (const ggml_tensor *)b.inject;
-  const bool matches =
-      pre_ctx_ && pre_graph_ && pre_graph_S_ == S &&
-      pre_down_type_ == (uint32_t)bd->type &&
-      pre_up_type_ == (uint32_t)bu->type &&
-      pre_inject_type_ == (uint32_t)bi->type;
-
-  if (!matches) {
-    // A shape/type change is a request-boundary event in normal use.  The
-    // old graph owns temporary addresses from galloc_pre_, so drain the
-    // shared CUDA stream before releasing it and asking the allocator for a
-    // new plan.
-    if (pre_ctx_) {
+  if (debug_rebuild_pre_graph_each_call() ||
+      (pre_graph_cache_S_ != 0 && pre_graph_cache_S_ != S)) {
+    // The allocator workspace is shared by the cached graphs. Drain the
+    // backend before replacing a cache for a different shape, or when the
+    // diagnostic explicitly requests a rebuild.
+    if (pre_graph_cache_S_ != 0 || active_pre_graph_) {
       ggml_backend_synchronize((ggml_backend_t)backend_);
       free_pre_graph();
+    }
+  }
+  if (pre_graph_cache_S_ == 0) pre_graph_cache_S_ = S;
+
+  PreGraphSlot &slot = pre_graphs_[sub_block][layer];
+  const bool matches =
+      slot.ctx && slot.graph && slot.S == S &&
+      slot.down_type == (uint32_t)bd->type &&
+      slot.up_type == (uint32_t)bu->type &&
+      slot.inject_type == (uint32_t)bi->type;
+
+  if (!matches) {
+    if (slot.ctx) {
+      // A bracket's source tensors are immutable for the lifetime of its
+      // cached graph. A type/shape change therefore invalidates the complete
+      // cache rather than retargeting a captured graph.
+      ggml_backend_synchronize((ggml_backend_t)backend_);
+      free_pre_graph();
+      pre_graph_cache_S_ = S;
     }
 
     ggml_init_params ip = {};
@@ -573,10 +616,8 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       return false;
     }
 
-    // Keep the first layer's tensor metadata as stable graph sources.  On
-    // later calls bind_pre_weights() changes only their CUDA data pointers;
-    // all layers have the same HC shapes and the type check above prevents a
-    // quantization-kernel mismatch from being hidden.
+    // Keep this bracket's tensor metadata as fixed graph sources. The CUDA
+    // graph must never be asked to follow a later data-pointer retarget.
     ggml_tensor *streams = (ggml_tensor *)t_streams_;
     ggml_tensor *x = ggml_view_3d(ctx, streams, d_model_, hc_, S,
                                   streams->nb[1], streams->nb[2], 0);
@@ -627,27 +668,19 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       LOG_INFO("[GGML-HC-MEM] pre_mix persistent workspace: %.2f MiB (S=%d)\n",
                (double)graph_bytes / (1024.0 * 1024.0), S);
     }
-    pre_ctx_ = ctx;
-    pre_graph_ = gf;
-    pre_norm_ = b.norm;
-    pre_down_ = b.down;
-    pre_up_ = b.up;
-    pre_inject_ = b.inject;
-    pre_graph_S_ = S;
-    pre_down_type_ = (uint32_t)bd->type;
-    pre_up_type_ = (uint32_t)bu->type;
-    pre_inject_type_ = (uint32_t)bi->type;
-    pre_source_layer_ = layer;
-    pre_source_sub_block_ = sub_block;
+    slot.ctx = ctx;
+    slot.graph = gf;
+    slot.norm = b.norm;
+    slot.down = b.down;
+    slot.up = b.up;
+    slot.inject = b.inject;
+    slot.S = S;
+    slot.down_type = (uint32_t)bd->type;
+    slot.up_type = (uint32_t)bu->type;
+    slot.inject_type = (uint32_t)bi->type;
   }
 
-  // The graph is already queued or complete when this call returns.  CUDA
-  // kernels receive the current data pointers as launch arguments, so it is
-  // safe to retarget the stable source metadata before the next submission.
-  ((ggml_tensor *)pre_norm_)->data = bn->data;
-  ((ggml_tensor *)pre_down_)->data = bd->data;
-  ((ggml_tensor *)pre_up_)->data = bu->data;
-  ((ggml_tensor *)pre_inject_)->data = bi->data;
+  active_pre_graph_ = &slot;
   return true;
 }
 
@@ -798,8 +831,37 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   weight_mode_valid_ = true;
   weight_mode_exact_ = exact_mode;
   weight_mode_custom_ = custom_mode;
-  if (b.ready && b.exact_f32_q8 == exact_mode && b.custom_q8 == custom_mode)
+  if (b.ready && b.exact_f32_q8 == exact_mode && b.custom_q8 == custom_mode) {
+    // The dense pool is normally stable, but its owner can rebuild or move a
+    // borrowed tensor between request boundaries.  Keep the HC graph's
+    // source tensors in sync with the current resident-layer references just
+    // like the shared/MoE runners do before each submission.  This is safe for
+    // the cached per-bracket graph because these are the same tensor objects;
+    // no graph shape or type changes are introduced here.
+    auto rebind_if_external = [&](void *opaque, const GgmlHcWeightRef &ref,
+                                  const char *name) {
+      ggml_tensor *t = (ggml_tensor *)opaque;
+      if (!t || t->buffer != (ggml_backend_buffer_t)external_buf_ ||
+          !ref.device_data || ref.device_bytes < ggml_nbytes(t))
+        return;
+      const void *old = t->data;
+      t->data = const_cast<void *>(ref.device_data);
+      t->buffer = (ggml_backend_buffer_t)external_buf_;
+      if (ggml_backend_buffer_init_tensor(t->buffer, t) != GGML_STATUS_SUCCESS)
+        return;
+      if (debug_external_weight_rebind() && old != t->data) {
+        LOG_INFO("[GGML-HC-EXT] rebind layer=%d sub=%d %s old=%p new=%p\n",
+                 layer, sub_block, name, old, t->data);
+      }
+    };
+    if (!hc_no_external_weights()) {
+      rebind_if_external(b.norm, norm, "norm");
+      rebind_if_external(b.down, down, "down");
+      rebind_if_external(b.up, up, "up");
+      rebind_if_external(b.inject, inject, "inject");
+    }
     return true;
+  }
   if (b.ready) {
     // The only normal mode transition is the request-boundary switch from
     // prefill's quantized graph to decode's exact Q8 graph.  The forward-level
@@ -860,10 +922,7 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   const ggml_type up_ggml_type = exact_up_q8 ? GGML_TYPE_F32
                                               : (ggml_type)up.type;
   cudaSetDevice(device_);
-  static const bool no_external_weights = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_HC_NO_EXTERNAL");
-    return e && e[0] == '1';
-  }();
+  const bool no_external_weights = hc_no_external_weights();
   ggml_context *ctx = nullptr;
   ggml_tensor *tn = nullptr;
   ggml_tensor *td = nullptr;
@@ -908,6 +967,31 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
     if (all_external) {
       // No private weight allocation is needed.  `ctx` remains alive because
       // its tensor metadata is still used by the persistent pre graph.
+      if (debug_external_weight_rebind() && layer == 0 && sub_block == 1) {
+        auto log_external_hash = [&](const char *name, const GgmlHcWeightRef &ref,
+                                     ggml_tensor *t) {
+          const size_t bytes = ggml_nbytes(t);
+          std::vector<uint8_t> copy(bytes);
+          const cudaError_t e = cudaMemcpy(copy.data(), t->data, bytes,
+                                           cudaMemcpyDeviceToHost);
+          if (e != cudaSuccess) {
+            LOG_INFO("[GGML-HC-EXT] %s copy failed: %s\n", name,
+                     cudaGetErrorString(e));
+            cudaGetLastError();
+            return;
+          }
+          LOG_INFO("[GGML-HC-EXT] layer=0 sub=1 %s ptr=%p bytes=%zu "
+                   "host_fnv=0x%016llx device_fnv=0x%016llx\n",
+                   name, t->data, bytes,
+                   (unsigned long long)fnv64_bytes(ref.host_data,
+                                                   std::min(ref.nbytes, bytes)),
+                   (unsigned long long)fnv64_bytes(copy.data(), bytes));
+        };
+        log_external_hash("norm", norm, tn);
+        log_external_hash("down", down, td);
+        log_external_hash("up", up, tu);
+        log_external_hash("inject", inject, ti);
+      }
       buf = nullptr;
       break;
     }
@@ -1025,6 +1109,37 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
   if (!ensure_post_graph(S)) return false;
   const Bracket &b = brackets_[sub_block][layer];
   cudaSetDevice(device_);
+  if (debug_external_weight_rebind() && layer == 0 && sub_block == 1 &&
+      S == 1 && b.norm && b.down && b.up && b.inject) {
+    auto log_replay_hash = [&](const char *name, void *opaque) {
+      ggml_tensor *t = (ggml_tensor *)opaque;
+      if (!t || t->buffer != (ggml_backend_buffer_t)external_buf_ ||
+          !t->data)
+        return;
+      const size_t bytes = ggml_nbytes(t);
+      std::vector<uint8_t> copy(bytes);
+      const cudaError_t sync = cudaDeviceSynchronize();
+      const cudaError_t e = sync == cudaSuccess
+                                ? cudaMemcpy(copy.data(), t->data, bytes,
+                                             cudaMemcpyDeviceToHost)
+                                : sync;
+      if (e == cudaSuccess) {
+        LOG_INFO("[GGML-HC-EXT] replay layer=0 sub=1 %s ptr=%p bytes=%zu "
+                 "fnv=0x%016llx nb1=%zu alloc=%zu\n",
+                 name, t->data, bytes,
+                 (unsigned long long)fnv64_bytes(copy.data(), bytes),
+                 t->nb[1], ggml_backend_buft_get_alloc_size(t->buffer->buft, t));
+      } else {
+        LOG_INFO("[GGML-HC-EXT] replay layer=0 sub=1 %s copy failed: %s\n",
+                 name, cudaGetErrorString(e));
+        cudaGetLastError();
+      }
+    };
+    log_replay_hash("norm", b.norm);
+    log_replay_hash("down", b.down);
+    log_replay_hash("up", b.up);
+    log_replay_hash("inject", b.inject);
+  }
   if (S == 1) {
     // In Qwen device-HC decode, GgmlMoeRunner's direct-input optimization
     // aliases its reusable graph input to t_mixed_.  The previous layer's
@@ -1072,7 +1187,12 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
     // submitting it does not reset/reuse a temporary allocator while the
     // prior layer is still queued.
     if (!ensure_pre_graph(S, b, layer, sub_block)) return false;
-    ggml_cgraph *gf = (ggml_cgraph *)pre_graph_;
+    if (!active_pre_graph_ || !active_pre_graph_->graph) {
+      LOG_ERROR("[GGML-HC] active pre_mix graph missing (layer=%d sub=%d S=%d)\n",
+                layer, sub_block, S);
+      return false;
+    }
+    ggml_cgraph *gf = (ggml_cgraph *)active_pre_graph_->graph;
     const ggml_status st =
         ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);
     if (st != GGML_STATUS_SUCCESS) {

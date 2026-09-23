@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -46,6 +47,35 @@ bool debug_device_sync_full_gdn() {
     return v && v[0] == '1';
   }();
   return enabled;
+}
+
+bool gdn_diag_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    return v && v[0] != '\0' && v[0] != '0';
+  }();
+  return enabled;
+}
+
+void gdn_diag_dump(const char *base, const char *label, int layer, int S,
+                   ggml_tensor *tensor) {
+  if (!gdn_diag_enabled() || !base || !label || layer != 0 || S != 1 ||
+      !tensor)
+    return;
+  const size_t elements = ggml_nelements(tensor);
+  if (elements == 0 || elements > (size_t)64 * 1024 * 1024)
+    return;
+  std::vector<float> values(elements);
+  ggml_backend_tensor_get(tensor, values.data(), 0,
+                          elements * sizeof(float));
+  const std::string path = std::string(base) + ".l00.p0." + label + ".f32";
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output)
+    return;
+  output.write(reinterpret_cast<const char *>(values.data()),
+               static_cast<std::streamsize>(values.size() * sizeof(float)));
+  LOG_INFO("[GDN-DIAG] layer=%d label=%s elements=%zu path=%s\n", layer,
+           label, elements, path.c_str());
 }
 } // namespace
 
@@ -1097,12 +1127,27 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
     return false;
   }
 
+  const bool diag = gdn_diag_enabled() && layer == 0 && S == 1;
+  if (diag) {
+    // Keep intermediate lifetimes alive through the diagnostic readback.
+    // These are existing ancestors of final_output; adding them as graph
+    // roots does not change their math or execution order.
+    for (ggml_tensor *t : {qkv, z, conv_silu, q, k, v, g, beta, gdn, core,
+                           gated, final_input})
+      ggml_set_output(t);
+  }
+
   ggml_set_output(final_output);
   ggml_set_output(new_state);
   ggml_set_output(tail_cont);
   ggml_build_forward_expand(gf, final_output);
   ggml_build_forward_expand(gf, new_state);
   ggml_build_forward_expand(gf, tail_cont);
+  if (diag) {
+    for (ggml_tensor *t : {qkv, z, conv_silu, q, k, v, g, beta, gdn, core,
+                           gated, final_input})
+      ggml_build_forward_expand(gf, t);
+  }
 
   if (!ggml_gallocr_alloc_graph((ggml_gallocr_t)galloc_, gf)) {
     LOG_ERROR("[GGML-GDN-FULL] graph alloc failed (layer=%d S=%d)\n", layer, S);
@@ -1148,6 +1193,22 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   ggml_backend_tensor_get_async((ggml_backend_t)backend_, tail_cont, history, 0,
                                 history_bytes);
   ggml_backend_synchronize((ggml_backend_t)backend_);
+  if (diag) {
+    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    gdn_diag_dump(base, "qkv", layer, S, qkv);
+    gdn_diag_dump(base, "z", layer, S, z);
+    gdn_diag_dump(base, "conv_silu", layer, S, conv_silu);
+    gdn_diag_dump(base, "q_norm", layer, S, q);
+    gdn_diag_dump(base, "k_norm", layer, S, k);
+    gdn_diag_dump(base, "v", layer, S, v);
+    gdn_diag_dump(base, "g", layer, S, g);
+    gdn_diag_dump(base, "beta", layer, S, beta);
+    gdn_diag_dump(base, "gdn", layer, S, gdn);
+    gdn_diag_dump(base, "core", layer, S, core);
+    gdn_diag_dump(base, "gated", layer, S, gated);
+    gdn_diag_dump(base, "final_input", layer, S, final_input);
+    gdn_diag_dump(base, "final_output", layer, S, final_output);
+  }
   ggml_free(ctx);
   return true;
 }
@@ -1306,12 +1367,26 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     ggml_free(ctx);
     return false;
   }
+
+  // The normal device path exposes only the final output/state/history roots.
+  // For the opt-in Layer-0 parity audit, retain the internal GDN tensors as
+  // additional roots so the allocator cannot recycle their storage before we
+  // read them back after the one-token graph completes.  This path is
+  // deliberately disabled unless MOESTREAM_GDN_DIAG_DUMP is set.
+  const bool diag = gdn_diag_enabled() && layer == 0 && S == 1;
   ggml_set_output(out_store);
   ggml_set_output(state_store);
   ggml_set_output(history_store);
   ggml_build_forward_expand(gf, out_store);
   ggml_build_forward_expand(gf, state_store);
   ggml_build_forward_expand(gf, history_store);
+  if (diag) {
+    for (ggml_tensor *t : {qkv, z, conv_silu, q, k, v, g, beta, gdn, core,
+                           gated, final_input}) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(gf, t);
+    }
+  }
   FullDeviceSlot &slot = full_device_slots_[layer % kFullDeviceSlots];
   if (slot.in_flight) {
     // This is the only host wait in the ring. With eight slots it can happen
@@ -1400,6 +1475,25 @@ bool GgmlGdnProjRunner::run_full_device_impl(
       return false;
     }
     slot.in_flight = false;
+  }
+  if (diag) {
+    // The extra roots make these reads valid even though the ordinary path
+    // keeps the graph asynchronous and returns the device output immediately.
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    gdn_diag_dump(base, "qkv", layer, S, qkv);
+    gdn_diag_dump(base, "z", layer, S, z);
+    gdn_diag_dump(base, "conv_silu", layer, S, conv_silu);
+    gdn_diag_dump(base, "q_norm", layer, S, q);
+    gdn_diag_dump(base, "k_norm", layer, S, k);
+    gdn_diag_dump(base, "v", layer, S, v);
+    gdn_diag_dump(base, "g", layer, S, g);
+    gdn_diag_dump(base, "beta", layer, S, beta);
+    gdn_diag_dump(base, "gdn", layer, S, gdn);
+    gdn_diag_dump(base, "core", layer, S, core);
+    gdn_diag_dump(base, "gated", layer, S, gated);
+    gdn_diag_dump(base, "final_input", layer, S, final_input);
+    gdn_diag_dump(base, "final_output", layer, S, final_output);
   }
   full_state.host_history = history;
   full_state.host_state = state;

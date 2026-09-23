@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <immintrin.h>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -749,6 +750,169 @@ static double g_diag_decode_hc_attn_pre_ms = 0.0;
 static double g_diag_decode_hc_ffn_pre_ms = 0.0;
 static double g_diag_decode_hc_post_ms = 0.0;
 static double g_diag_decode_layer_input_ms = 0.0;
+
+// Opt-in raw boundary capture for the ordinary S==1 path. Norms cannot tell
+// us which side of the HC/attention/FFN boundary first diverges, so this
+// writes exact F32 rows for one selected layer and prompt position. It is
+// disabled by default and intended only for A/A diagnosis.
+static const char *prefill_boundary_dump_base() {
+  static const char *value = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+  return value && *value ? value : nullptr;
+}
+
+static int prefill_boundary_dump_last_pos() {
+  static const int value = [] {
+    const char *env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAST_POS");
+    return env && *env ? std::atoi(env) : -1;
+  }();
+  return value;
+}
+
+static int prefill_boundary_dump_first_pos() {
+  static const int value = [] {
+    const char *env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_FIRST_POS");
+    return env && *env ? std::atoi(env) : 0;
+  }();
+  return value;
+}
+
+static int prefill_boundary_dump_layer() {
+  static const int value = [] {
+    const char *env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAYER");
+    return env && *env ? std::atoi(env) : 0;
+  }();
+  return value;
+}
+
+static bool prefill_boundary_dump_layer_selected(int layer) {
+  const int selected = prefill_boundary_dump_layer();
+  // -1 means all layers.  This is useful for a same-token teacher-forced
+  // sweep: capture one exact position at every layer without changing the
+  // execution path or allocating a second graph.
+  return selected < 0 || layer == selected;
+}
+
+static uint64_t prefill_boundary_fnv64(const float *data, size_t count) {
+  constexpr uint64_t offset = 1469598103934665603ULL;
+  constexpr uint64_t prime = 1099511628211ULL;
+  uint64_t hash = offset;
+  const auto *bytes = reinterpret_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < count * sizeof(float); ++i) {
+    hash ^= bytes[i];
+    hash *= prime;
+  }
+  return hash;
+}
+
+static void dump_prefill_boundary(const char *label, int layer, int pos,
+                                  const float *data, int elements) {
+  const char *base = prefill_boundary_dump_base();
+  if (!base || !data || elements <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer) ||
+      pos < prefill_boundary_dump_first_pos() ||
+      pos > prefill_boundary_dump_last_pos())
+    return;
+
+  const std::string path = std::string(base) + ".l" +
+                           (layer < 10 ? "0" : "") +
+                           std::to_string(layer) + ".p" + std::to_string(pos) +
+                           "." + label + ".f32";
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output)
+    return;
+  output.write(reinterpret_cast<const char *>(data),
+               static_cast<std::streamsize>(elements * sizeof(float)));
+  output.close();
+  LOG_STREAM_INFO() << "[PREFILL-BOUNDARY] layer=" << layer
+                    << " pos=" << pos << " label=" << label
+                    << " elements=" << elements << " fnv64=0x" << std::hex
+                    << prefill_boundary_fnv64(data, elements) << std::dec
+                    << " path=" << path << "\n";
+}
+
+static void dump_prefill_boundary_i32(const char *label, int layer, int pos,
+                                      const int *data, int elements) {
+  const char *base = prefill_boundary_dump_base();
+  if (!base || !data || elements <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer) ||
+      pos < prefill_boundary_dump_first_pos() ||
+      pos > prefill_boundary_dump_last_pos())
+    return;
+
+  const std::string path = std::string(base) + ".l" +
+                           (layer < 10 ? "0" : "") +
+                           std::to_string(layer) + ".p" + std::to_string(pos) +
+                           "." + label + ".i32";
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output)
+    return;
+  output.write(reinterpret_cast<const char *>(data),
+               static_cast<std::streamsize>(elements * sizeof(int)));
+  output.close();
+  LOG_STREAM_INFO() << "[PREFILL-BOUNDARY] layer=" << layer
+                    << " pos=" << pos << " label=" << label
+                    << " elements=" << elements << " path=" << path << "\n";
+}
+
+static void dump_prefill_device_boundary(const char *label, int layer, int pos,
+                                         const void *device_data,
+                                         int elements) {
+  const char *base = prefill_boundary_dump_base();
+  if (!base || !device_data || elements <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer) ||
+      pos < prefill_boundary_dump_first_pos() ||
+      pos > prefill_boundary_dump_last_pos())
+    return;
+  std::vector<float> host(static_cast<size_t>(elements));
+  if (!GgmlHcRunner::instance().copy_pre_mix_to_host(device_data, host.data(),
+                                                      /*S=*/1)) {
+    LOG_STREAM_WARN() << "[PREFILL-BOUNDARY] failed to copy device label="
+                      << label << " layer=" << layer << " pos=" << pos
+                      << "\n";
+    return;
+  }
+  dump_prefill_boundary(label, layer, pos, host.data(), elements);
+}
+
+static void dump_prefill_hc_streams(const char *label, int layer, int pos,
+                                    int hc_mult, int d_model) {
+  const char *base = prefill_boundary_dump_base();
+  if (!base || hc_mult <= 0 || d_model <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer) ||
+      pos < prefill_boundary_dump_first_pos() ||
+      pos > prefill_boundary_dump_last_pos())
+    return;
+  const size_t elements = static_cast<size_t>(hc_mult) * d_model;
+  std::vector<float> host(elements);
+  if (!GgmlHcRunner::instance().download_streams(host.data(), /*S=*/1)) {
+    LOG_STREAM_WARN() << "[PREFILL-BOUNDARY] failed to copy HC streams label="
+                      << label << " layer=" << layer << " pos=" << pos
+                      << "\n";
+    return;
+  }
+  dump_prefill_boundary(label, layer, pos, host.data(),
+                        static_cast<int>(elements));
+}
+
+static void dump_prefill_attention_output(int layer, int pos,
+                                          const void *device_output,
+                                          int d_model) {
+  const char *base = prefill_boundary_dump_base();
+  if (!base || !device_output || d_model <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer) ||
+      pos < prefill_boundary_dump_first_pos() ||
+      pos > prefill_boundary_dump_last_pos())
+    return;
+  std::vector<float> host(static_cast<size_t>(d_model));
+  if (!qwen4exp_copy_gdn_device_output_to_host(device_output, host.data(),
+                                                /*S=*/1)) {
+    LOG_STREAM_WARN() << "[PREFILL-BOUNDARY] failed to copy attention output "
+                      << "layer=" << layer << " pos=" << pos << "\n";
+    return;
+  }
+  dump_prefill_boundary("attn_out", layer, pos, host.data(), d_model);
+}
+
 void diag_reset_layer_loop_total() {
   g_diag_layer_loop_total_ms = 0.0;
   g_diag_attn_call_ms = 0.0;
@@ -825,6 +989,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       qwen4exp_full_graph_run(engine, hidden_states, S, pos_base, token_ids)) {
     return;
   }
+  // Run the diagnostic before the production decode graph's early return;
+  // otherwise an enabled full-graph configuration would bypass the side
+  // graph entirely. It remains one-shot and does not alter hidden_states or
+  // the live recurrent/KV owners.
+  if (S == 1 && pos_base >= 0)
+    qwen4exp_two_layer_s1_diag_run(engine, pos_base, token_ids);
   if (S == 1 && pos_base >= 0 && qwen4exp_full_graph_decode_enabled() &&
       qwen4exp_full_graph_decode_prepare(engine, pos_base, token_ids) &&
       qwen4exp_full_graph_decode_run(engine, hidden_states, pos_base,
@@ -880,6 +1050,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         hidden_states +
         (size_t)(S - 1) * D; // hidden_states is mutated in place below, not
                              // reallocated -- always valid
+    if (S == 1)
+      dump_prefill_boundary("input", l, pos_base, last_tok, D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l
                            << "] in      |hidden|=" << l2norm(last_tok, D)
@@ -905,6 +1077,15 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       qwen4exp_hc_prepare_host_layer_input(engine, l, S);
       fo.layer_input_fn(engine, l, S, pos_base, token_ids);
       qwen4exp_hc_commit_host_layer_input(engine, l, S);
+      // A/A diagnostic: after a sparse Qwen PLE layer has modified the
+      // host HC copy and committed it back to the device-authoritative
+      // runner, capture the actual wide state before hc_pre.  This is the
+      // exact boundary that must equal Bee's previous l_last plus its PLE
+      // gated-value and causal-convolution outputs.  The helper is fully
+      // gated by MOESTREAM_PREFILL_BOUNDARY_DUMP and is a no-op normally.
+      if (S == 1)
+        dump_prefill_hc_streams("hc_streams_post_layer_input", l, pos_base,
+                                c.hc_mult, D);
       if (S == 1)
         g_diag_decode_layer_input_ms +=
             std::chrono::duration<double, std::milli>(
@@ -927,6 +1108,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_attn_pre_ms += elapsed;
       }
     }
+    if (S == 1)
+      dump_prefill_device_boundary("hc_attn_pre", l, pos_base,
+                                   engine.qwen4exp_device_hc_input, D);
     // TEMPORARY DIAGNOSTIC (2026-09-12) -- wall-clock around this exact call,
     // to compare against t_attn's OWN reported duration for the same call.
     // If attention_fn issues async GPU work and returns before it lands
@@ -947,6 +1131,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               std::chrono::high_resolution_clock::now() -
               diag_attn_call_start)
               .count();
+    if (S == 1 && engine.qwen4exp_device_attn_output_ready)
+      dump_prefill_attention_output(l, pos_base,
+                                    engine.qwen4exp_device_attn_output, D);
+    if (S == 1 && !engine.qwen4exp_device_attn_output_ready)
+      dump_prefill_boundary("attn_out", l, pos_base,
+                            scratch.attn_out.data() + (size_t)(S - 1) * D, D);
     bool attn_device_consumed = false;
     if (engine.qwen4exp_device_attn_output_ready) {
       if (engine.qwen4exp_device_attn_output_raw) {
@@ -997,6 +1187,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_post_ms += elapsed;
       }
     }
+    if (S == 1)
+      dump_prefill_hc_streams("hc_streams_post_attn", l, pos_base,
+                              c.hc_mult, D);
 
     // Per-layer, per-stage checkpoint: pinpoints the FIRST layer/stage
     // where hidden_states goes non-finite, instead of only learning
@@ -1006,6 +1199,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // NaN/Inf, so this is cheap on the (expected) all-finite path.
     check_finite("hidden_states (post attention residual)", l, -1,
                  hidden_states, (size_t)n);
+    if (S == 1)
+      dump_prefill_boundary("post_attn", l, pos_base, last_tok, D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-attn |attn_out|="
                            << l2norm(scratch.attn_out.data() +
@@ -1113,6 +1308,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_ffn_pre_ms += elapsed;
       }
     }
+    if (S == 1)
+      dump_prefill_device_boundary("hc_ffn_pre", l, pos_base,
+                                   engine.qwen4exp_device_hc_ffn_input, D);
     // TEMPORARY DIAGNOSTIC (2026-09-12) -- wall-clock around this exact
     // block, same cross-check rationale as g_diag_attn_call_ms above (async
     // GPU dispatch inside dense_ffn_gguf/moe_forward_gguf could return
@@ -1139,6 +1337,20 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               std::chrono::high_resolution_clock::now() -
               diag_ffn_call_start)
               .count();
+    // A/A prefill diagnostic: capture the plain routed FFN result before HC
+    // post-combine.  Bee's qwen4exp graph exposes the corresponding
+    // ffn_moe_out tensor, so this separates CPU-MoE math from the subsequent
+    // HC reduction.  Opt-in through MOESTREAM_PREFILL_BOUNDARY_DUMP; the
+    // normal path does no dump or extra device copy.
+    if (S == 1)
+      dump_prefill_boundary("moe_out_host", l, pos_base,
+                            scratch.moe_out.data(), D);
+    if (S == 1) {
+      dump_prefill_boundary("route_weights", l, pos_base,
+                            scratch.tok_topk_weights.data(), c.topk);
+      dump_prefill_boundary_i32("route_ids", l, pos_base,
+                                scratch.tok_topk_ids.data(), c.topk);
+    }
     bool moe_device_consumed = false;
   if (scratch.moe_device_output_ready) {
       // The actual residual update is device-to-device.  Do not read the
@@ -1149,7 +1361,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // explicit hidden-state tracing, or as the recovery path when the
       // device HC post-combine cannot accept the producer tensor.
       bool copied_device_output = false;
-      if (trace) {
+      // A boundary dump is itself an explicit request for the device result.
+      // Do not require TRACE-HIDDEN as well: otherwise the pre-combine dump
+      // below observes the stale host scratch.moe_out while the real Qwen
+      // scheduler result is still device-resident.
+      const bool boundary_requested = prefill_boundary_dump_base() != nullptr;
+      if (trace || boundary_requested) {
         if (scratch.moe_device_runner)
           copied_device_output = scratch.moe_device_runner
                                      ->copy_device_output_to_host(
@@ -1166,6 +1383,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                     l);
         }
       }
+      if (S == 1 && boundary_requested && copied_device_output)
+        dump_prefill_boundary("moe_out_device", l, pos_base,
+                              scratch.moe_out.data(), D);
       moe_device_consumed = qwen4exp_hc_post_combine_device(
           engine, l, /*sub_block=*/1, S, D, scratch.moe_device_output,
           scratch.moe_shared_device_output
@@ -1214,9 +1434,14 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_post_ms += elapsed;
       }
     }
+    if (S == 1)
+      dump_prefill_hc_streams("hc_streams_post_ffn", l, pos_base,
+                              c.hc_mult, D);
 
     check_finite("hidden_states (post FFN/MoE residual)", l, -1, hidden_states,
                  (size_t)n);
+    if (S == 1)
+      dump_prefill_boundary("post_ffn", l, pos_base, last_tok, D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-ffn  |moe_out|="
                            << l2norm(scratch.moe_out.data() +

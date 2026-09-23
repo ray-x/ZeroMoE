@@ -17,6 +17,12 @@ struct QwenRamCpuMoeLayer {
   const void *up_plane = nullptr;
   const void *down_plane = nullptr;
   size_t expert_stride = 0;
+  // Projection-compact arenas keep gate/up/down in independent expert-axis
+  // planes.  The legacy interleaved arena uses expert_stride for all three.
+  bool projection_compact = false;
+  size_t gate_stride = 0;
+  size_t up_stride = 0;
+  size_t down_stride = 0;
 };
 
 struct MoePipelineContext {

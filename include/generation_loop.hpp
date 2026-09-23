@@ -97,6 +97,20 @@ inline bool decode_logits_hash_enabled() {
     return enabled;
 }
 
+// Diagnostic-only prefill parity switch.  When enabled, process the prompt
+// one token at a time through the same S==1 path used by autoregressive
+// decode.  This is intentionally separate from moe_prefill_batched: that
+// option controls expert regrouping inside an S>1 forward, whereas this
+// switch changes the model-level prompt batch geometry so it can be compared
+// with llama.cpp launched using -b 1 -ub 1.
+inline bool prefill_unbatched_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("MOESTREAM_PREFILL_UNBATCHED");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+
 inline void log_decode_logits_hash(int step, uint64_t hash, int sampled_token,
                                    int forced_token) {
     if (!decode_logits_hash_enabled())
@@ -630,7 +644,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // Bee builds its complete model graph before entering the measured
     // prefill.  The prompt IDs are needed only by Qwen's PLE path; graph
     // construction and static weight upload are outside PERF_START.
-    if (pc_n_new > 1 && pc_reuse == 0) {
+    const bool unbatched_prefill = prefill_unbatched_enabled();
+    if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill) {
         if (qwen4exp_full_graph_enabled())
             qwen4exp_full_graph_prepare(engine, (int)pc_n_new, (int)pc_reuse,
                                         prompt_ids.data() + pc_reuse);
@@ -667,20 +682,47 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         hidden_states.assign(engine.prompt_state_cache.last_hidden.begin(),
                              engine.prompt_state_cache.last_hidden.end());
     } else {
-        if (hc_active)
-            hc_expand_embedding(engine, hidden_states.data(), (int)pc_n_new, D);
-        // pos_base = pc_reuse: the reused prefix's dense KV rows are already in
-        // place (position-indexed and untouched since they were written), so the
-        // causal attention below still sees the full context.
-        layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), pc_n_new,
-                            pc_reuse, prompt_ids.data() + pc_reuse);
-        if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
-            !engine.glm5next_full_graph_output_ready &&
-            !engine.deepseek_v4_full_graph_output_ready)
-            hc_collapse_output(engine, hidden_states.data(), (int)pc_n_new, D);
-        engine.qwen4exp_full_graph_output_ready = false;
-        engine.glm5next_full_graph_output_ready = false;
-        engine.deepseek_v4_full_graph_output_ready = false;
+        // llama.cpp's -b 1 -ub 1 parity mode: run each prompt token through
+        // the existing S==1 path.  This preserves the normal recurrent/KV
+        // update order while avoiding the batched HC projection and batched
+        // activation-quantization kernels.  The default prompt path below is
+        // unchanged when MOESTREAM_PREFILL_UNBATCHED is not enabled.
+        if (unbatched_prefill && pc_n_new > 1) {
+            LOG_STREAM_INFO() << "[PREFILL] unbatched parity mode: "
+                              << pc_n_new << " x S=1 forward calls\n";
+            for (size_t t = 0; t < pc_n_new; ++t) {
+                float *row = hidden_states.data() + t * (size_t)D;
+                if (hc_active)
+                    hc_expand_embedding(engine, row, 1, D);
+                // pos_base = pc_reuse + t: cached-prefix KV rows remain in
+                // place and each prompt token advances the recurrent state.
+                layers_forward_gguf(engine, ram_mgr, prefetcher, row, 1,
+                                    pc_reuse + (int)t,
+                                    prompt_ids.data() + pc_reuse + t);
+                if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+                    !engine.glm5next_full_graph_output_ready &&
+                    !engine.deepseek_v4_full_graph_output_ready)
+                    hc_collapse_output(engine, row, 1, D);
+                engine.qwen4exp_full_graph_output_ready = false;
+                engine.glm5next_full_graph_output_ready = false;
+                engine.deepseek_v4_full_graph_output_ready = false;
+            }
+        } else {
+            if (hc_active)
+                hc_expand_embedding(engine, hidden_states.data(), (int)pc_n_new, D);
+            // pos_base = pc_reuse: the reused prefix's dense KV rows are already in
+            // place (position-indexed and untouched since they were written), so the
+            // causal attention below still sees the full context.
+            layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), pc_n_new,
+                                pc_reuse, prompt_ids.data() + pc_reuse);
+            if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+                !engine.glm5next_full_graph_output_ready &&
+                !engine.deepseek_v4_full_graph_output_ready)
+                hc_collapse_output(engine, hidden_states.data(), (int)pc_n_new, D);
+            engine.qwen4exp_full_graph_output_ready = false;
+            engine.glm5next_full_graph_output_ready = false;
+            engine.deepseek_v4_full_graph_output_ready = false;
+        }
     }
     // Was `PERF_END(prefill, t_attn)` -- dumped this WHOLE prefill pass's
     // wall-clock (attention + MoE routing + MoE expert FFN + cold-cache

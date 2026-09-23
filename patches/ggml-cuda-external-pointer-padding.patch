@@ -1,0 +1,40 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 0000000..0000000 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -1105,7 +1105,8 @@
+         const size_t original_size = ggml_nbytes(tensor);
+         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+ 
+-        if (padded_size > original_size) {
++        if (padded_size > original_size &&
++            padded_size <= ggml_backend_buffer_get_size(buffer)) {
+             ggml_cuda_set_device(ctx->device);
+             CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+         }
+diff --git a/src/ggml-cuda/mmq.cu b/src/ggml-cuda/mmq.cu
+index 0000000..0000000 100644
+--- a/src/ggml-cuda/mmq.cu
++++ b/src/ggml-cuda/mmq.cu
+@@ -129,6 +129,7 @@
+         const size_t size_data  = ggml_nbytes(src0);
+         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+-        if (size_alloc > size_data) {
++        if (size_alloc > size_data &&
++            size_alloc <= ggml_backend_buffer_get_size(src0->buffer)) {
+             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+             GGML_ASSERT(!src0->view_src);
+             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
+diff --git a/src/ggml-cuda/mmvq.cu b/src/ggml-cuda/mmvq.cu
+index 0000000..0000000 100644
+--- a/src/ggml-cuda/mmvq.cu
++++ b/src/ggml-cuda/mmvq.cu
+@@ -1398,6 +1398,7 @@
+         const size_t size_data  = ggml_nbytes(src0);
+         const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
+-        if (size_alloc > size_data) {
++        if (size_alloc > size_data &&
++            size_alloc <= ggml_backend_buffer_get_size(src0->buffer)) {
+             GGML_ASSERT(ggml_is_contiguously_allocated(src0));
+             GGML_ASSERT(!src0->view_src);
+             CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));

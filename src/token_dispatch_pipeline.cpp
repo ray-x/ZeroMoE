@@ -147,9 +147,17 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
                          static_cast<uint32_t>(e->down_proj.meta.type)};
     }
     std::vector<float> graph_output((size_t)D, 0.0f);
-    if (GgmlQwenCpuMoeRunner::instance().run(input, graph_output.data(),
-                                             refs.data(), n, weights, D,
-                                             moe_inter, n)) {
+    const bool cpu_diag = [] {
+      const char *env = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+      return env && env[0] == '1';
+    }();
+    if (cpu_diag)
+      qwen_cpu_moe_diag_set_layer(layer_idx);
+    const bool graph_ok = GgmlQwenCpuMoeRunner::instance().run(
+        input, graph_output.data(), refs.data(), n, weights, D, moe_inter, n);
+    if (cpu_diag)
+      qwen_cpu_moe_diag_set_layer(-1);
+    if (graph_ok) {
       static std::atomic<bool> logged_cpu_graph{false};
       if (!logged_cpu_graph.exchange(true, std::memory_order_relaxed))
         LOG_STREAM_INFO()
@@ -261,14 +269,21 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
 bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
                                 int layer_idx, int n_experts,
                                        QwenRamCpuMoeLayer &out) {
-  if (layer_idx < 0 || n_experts <= 0 || engine.layer_is_unpacked(layer_idx) ||
+  // Projection-compact/unpacked layers are exactly the layout represented by
+  // graph_ram_arenas for the Qwen CPU/GPU parity path.  Do not reject them
+  // here: the validation below supplies the three plane bases and strides
+  // consumed by the CPU runner.  The old layer_is_unpacked() guard made the
+  // Bee-style scheduler candidate decline before construction, silently
+  // sending Layer 0 back through the legacy host shared-expert path.
+  if (layer_idx < 0 || n_experts <= 0 ||
       !engine.graph_ram_layer_ready(layer_idx))
     return false;
 
   const auto *arena = engine.graph_ram_arena(layer_idx);
   if (!arena || arena->n_experts != n_experts || !arena->base ||
-      arena->stride == 0 || arena->gate_bytes == 0 || arena->up_bytes == 0 ||
-      arena->down_bytes == 0)
+      arena->gate_bytes == 0 || arena->up_bytes == 0 ||
+      arena->down_bytes == 0 ||
+      (!arena->projection_compact && arena->stride == 0))
     return false;
 
   const auto &slots = engine.layers_experts[(size_t)layer_idx];
@@ -308,6 +323,21 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
   out.up_plane = arena->base + arena->gate_bytes;
   out.down_plane = arena->base + arena->gate_bytes + arena->up_bytes;
   out.expert_stride = arena->stride;
+  out.projection_compact = arena->projection_compact;
+  out.gate_stride = arena->projection_compact ? arena->gate_stride
+                                               : arena->stride;
+  out.up_stride = arena->projection_compact ? arena->up_stride
+                                             : arena->stride;
+  out.down_stride = arena->projection_compact ? arena->down_stride
+                                               : arena->stride;
+  if (const char *debug = std::getenv("MOESTREAM_QWEN_DECODE_SCHED_DEBUG");
+      debug && debug[0] == '1' && layer_idx == 0) {
+    LOG_WARN("[QWEN-CPU-ARENA] layer=%d compact=%d arena_stride=%zu "
+             "planes=%p/%p/%p strides=%zu/%zu/%zu\n",
+             layer_idx, out.projection_compact ? 1 : 0, out.expert_stride,
+             out.gate_plane, out.up_plane, out.down_plane, out.gate_stride,
+             out.up_stride, out.down_stride);
+  }
   return true;
 }
 
@@ -648,7 +678,15 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     QwenRamCpuMoeLayer ram_layer;
     if (qwen4exp_ram_cpu_moe_layer(engine, layer_idx, n_experts, ram_layer)) {
       PERF_START(qwen_cpu_ram);
-      GgmlQwenCpuMoeRunner &cpu_runner = qwen_cpu_compact_graph_enabled()
+      // A projection-compact arena has three independent expert planes.  The
+      // generic strided MUL_MAT_ID graph requires one non-zero common expert
+      // stride and therefore cannot represent this layout safely.  Use the
+      // per-expert reference graph for this representation (the same path
+      // used by the proven compact A/B replay); keep the strided runner for
+      // legacy interleaved arenas.
+      const bool use_compact_refs =
+          qwen_cpu_compact_graph_enabled() || ram_layer.projection_compact;
+      GgmlQwenCpuMoeRunner &cpu_runner = use_compact_refs
                                               ? GgmlQwenCpuMoeRunner::instance()
                                               : GgmlQwenCpuMoeRunner::instance_for_strided(
                                                     ram_layer.meta, n_experts,
@@ -722,7 +760,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // It is intentionally constructed from the exact routed IDs, so this
       // does not copy the other 502 experts in a Qwen layer.
       auto run_qwen_cpu_graph = [&](float *result) {
-        if (!qwen_cpu_compact_graph_enabled()) {
+        if (!use_compact_refs) {
           if (qwen_cpu_strided_grouped_enabled(engine) &&
               qwen4exp_cpu_strided_grouped_quantized(
                   engine, scratch.normed.data(), result, ram_layer,
@@ -776,7 +814,15 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // request throughput but cannot explain the gap to Bee's CPU split.
       auto run_qwen_cpu_graph_timed = [&](float *result) {
         const auto start = std::chrono::high_resolution_clock::now();
+        // Keep the first non-finite value visible at the CPU/GPU MoE seam.
+        // The downstream HC/device graph can otherwise turn one bad routed
+        // value into a much less useful all-layer failure report.
+        check_finite("Qwen CPU route input", layer_idx, -1,
+                     scratch.normed.data(), static_cast<size_t>(D));
         const bool ok = run_qwen_cpu_graph(result);
+        if (ok)
+          check_finite("Qwen CPU route output", layer_idx, -1, result,
+                       static_cast<size_t>(D));
         if (S == 1)
           moe_pipeline_internal::add_decode_qwen_cpu_graph_ms(
               std::chrono::duration<double, std::milli>(

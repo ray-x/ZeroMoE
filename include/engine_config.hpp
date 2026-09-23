@@ -3078,7 +3078,17 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
 
 inline bool EngineConfig::validate() {
   int hw_count = 0;
-  cudaGetDeviceCount(&hw_count);
+  const cudaError_t device_count_status = cudaGetDeviceCount(&hw_count);
+  if (device_count_status != cudaSuccess) {
+    std::cerr << "[CONFIG] cudaGetDeviceCount failed: "
+              << cudaGetErrorString(device_count_status)
+              << " (count=" << hw_count << ")\n";
+    // Keep the existing validation behavior, but make a transient driver
+    // failure distinguishable from a configuration that names a nonexistent
+    // ordinal.  This matters for parity runs: a no-device run must never be
+    // mistaken for a CPU-only model result.
+    hw_count = 0;
+  }
 
   std::vector<GpuConfig> valid_gpus;
   for (auto &gc : gpus) {

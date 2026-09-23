@@ -699,7 +699,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
     return e && e[0] == '1';
   }();
   const bool compare_this_call =
-      compare_decode_hc && S == 1 && sub_block == 1 && layer_idx < 2;
+      compare_decode_hc && S == 1 && layer_idx < 2;
   bool compare_ready = compare_this_call && g_hc_ggml_live;
   std::vector<float> compare_streams;
   std::vector<float> compare_hidden;
@@ -722,10 +722,14 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
       compare_hidden.resize((size_t)S * D);
       compare_inject.resize((size_t)S * HC);
       const std::string p_compare = "blk." + std::to_string(layer_idx) + ".";
+      const std::string compare_prefix =
+          (sub_block == 0) ? "hc_attn_" : "hc_ffn_";
       qwen4exp_hc_mix_impl(
-          engine, p_compare + "hc_ffn_norm.weight",
-          p_compare + "hc_ffn_down.weight", p_compare + "hc_ffn_up.weight",
-          p_compare + "hc_ffn_inject.weight", S, D, compare_hidden.data(),
+          engine, p_compare + compare_prefix + "norm.weight",
+          p_compare + compare_prefix + "down.weight",
+          p_compare + compare_prefix + "up.weight",
+          p_compare + compare_prefix + "inject.weight", S, D,
+          compare_hidden.data(),
           compare_inject.data(), layer_idx, compare_streams.data(), true);
     } else {
       compare_ready = false;

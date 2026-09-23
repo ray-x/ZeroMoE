@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <memory>
 #include <mutex>
@@ -603,6 +604,21 @@ struct FullGraph {
   ggml_tensor *layer0_diag_moe_plus_shared_snapshot = nullptr;
   ggml_tensor *layer0_diag_residual_after_snapshot = nullptr;
   ggml_tensor *layer0_diag_next_consumer_snapshot = nullptr;
+  // Actual graph-owned outputs for the two-layer S=1 diagnostic. These are
+  // deliberately not independent cpy leaves: each tensor remains on the
+  // Layer-0 -> Layer-1 dependency chain and is marked as a graph output.
+  bool two_layer_diag = false;
+  ggml_tensor *two_layer_l0_post_ffn = nullptr;
+  ggml_tensor *two_layer_l1_pre_attn = nullptr;
+  ggml_tensor *two_layer_l1_post_attn = nullptr;
+  ggml_tensor *two_layer_l1_post_ffn = nullptr;
+  // Optional exact hidden-state snapshots at the same semantic boundary as
+  // beellama's l_last-0/l_last-1 callbacks: after each layer's attention and
+  // FFN residual combine.  These are intentionally limited to layers 0/1.
+  ggml_tensor *hidden01_snapshot[2] = {nullptr, nullptr};
+  bool hidden01_dumped = false;
+  std::vector<std::pair<std::string, ggml_tensor *>> layer0_split_snapshots;
+  bool layer0_split_dumped = false;
   // Optional one-shot raw routed-MoE output dump for Layer 13. This is
   // deliberately before the shared expert and residual combine so the
   // ordinary GGML CPU path and the host-node callback are compared at the
@@ -995,6 +1011,11 @@ struct FullGraph {
     graph = nullptr;
     input = output = logits = final_streams = positions = attn_mask =
         decode_indices = ple_embedding = nullptr;
+    two_layer_diag = false;
+    two_layer_l0_post_ffn = nullptr;
+    two_layer_l1_pre_attn = nullptr;
+    two_layer_l1_post_attn = nullptr;
+    two_layer_l1_post_ffn = nullptr;
     ple_hist_out = nullptr;
     ple_hist_storage = nullptr;
     ple_hist_update = nullptr;
@@ -1035,6 +1056,12 @@ struct FullGraph {
 };
 
 std::unique_ptr<FullGraph> g_graph;
+
+// Standalone two-layer diagnostic owner. It is intentionally separate from
+// g_graph so enabling the diagnostic cannot alter the production full-graph
+// cache or its phase-2 sibling ownership.
+std::unique_ptr<FullGraph> g_two_layer_diag_graph;
+bool g_two_layer_diag_done = false;
 
 // Phase 2 per-token dynamic dispatch: three separately-built/submitted
 // FullGraph instances, own ctx/graph/sched each (see FullGraph::Phase2Mode's
@@ -1189,6 +1216,16 @@ bool env_layer0_iq2_diag_enabled() {
   return v && v[0] == '1';
 }
 
+static const char * env_hidden01_dump_path() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HIDDEN01_DUMP");
+  return v && v[0] ? v : nullptr;
+}
+
+static const char * env_layer0_split_dump_path() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_LAYER0_SPLIT_DUMP");
+  return v && v[0] ? v : nullptr;
+}
+
 // Host-node transport diagnostic. The layer is selected explicitly so the
 // same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
 // applied to Layer 13 without enabling diagnostics for every callback.
@@ -1218,6 +1255,66 @@ bool env_host_node_transport_diag_enabled(int layer) {
 bool env_layer0_narrow_graph_diag_enabled() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
   return v && v[0] == '1';
+}
+
+bool env_two_layer_s1_diag_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DIAG");
+  return v && v[0] == '1';
+}
+
+const char *env_two_layer_s1_diag_dump_path() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DUMP");
+  return v && v[0] ? v : nullptr;
+}
+
+// Controlled QKV replay input for the two-layer S=1 diagnostic.  The file
+// must contain exactly one F32 Layer-0 attention input row ([D] elements),
+// typically extracted from Bee's hc_mixed dump.  This replaces only the
+// diagnostic graph's Layer-0 hc_mix result; production execution is never
+// affected.  It lets us distinguish a small upstream HC rounding difference
+// from a QKV/MMQ implementation difference using the same bytes at the GEMM
+// boundary.
+const char *env_two_layer_s1_common_attn_input_path() {
+  const char *v = std::getenv(
+      "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_ATTN_INPUT");
+  return v && v[0] ? v : nullptr;
+}
+
+// Optional earlier seam for the same controlled replay.  This file contains
+// the post-RMSNorm*HC-norm activation ([D*HC] for S=1), allowing the HC
+// down/up/gate projection path to be tested independently of its input
+// normalization and upstream hidden-state construction.
+const char *env_two_layer_s1_common_hc_norm_path() {
+  const char *v = std::getenv(
+      "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_HC_NORM");
+  return v && v[0] ? v : nullptr;
+}
+
+const char *env_two_layer_s1_common_hc_down_silu_path() {
+  const char *v = std::getenv(
+      "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_HC_DOWN_SILU");
+  return v && v[0] ? v : nullptr;
+}
+
+const char *env_layer0_common_attn_input_path() {
+  const char *v =
+      std::getenv("MOESTREAM_QWEN4EXP_LAYER0_COMMON_ATTN_INPUT");
+  return v && v[0] ? v : nullptr;
+}
+
+bool load_exact_f32_file(const char *path, float *dst, size_t elements) {
+  if (!path || !dst || elements == 0)
+    return false;
+  std::ifstream in(path, std::ios::binary | std::ios::ate);
+  if (!in)
+    return false;
+  const std::streamoff expected = static_cast<std::streamoff>(
+      elements * sizeof(float));
+  if (in.tellg() != expected)
+    return false;
+  in.seekg(0, std::ios::beg);
+  in.read(reinterpret_cast<char *>(dst), expected);
+  return in.good() || in.eof() && in.gcount() == expected;
 }
 
 void log_layer0_diag_tensor(const char *role, const ggml_tensor *t) {
@@ -1264,56 +1361,149 @@ void log_layer0_diag_host_values(const char *role, const float *values,
 }
 
 void dump_layer0_diag_values(FullGraph &g) {
-  if (!g.layer0_diag_enabled || g.layer0_diag_dumped)
+  const char *split_dump_path = env_layer0_split_dump_path();
+  if (split_dump_path && g.decode_mode && !g.layer0_split_dumped) {
+    g.layer0_split_dumped = true;
+    std::unordered_map<std::string, size_t> snapshot_occurrences;
+    for (const auto &entry : g.layer0_split_snapshots) {
+      const size_t occurrence = snapshot_occurrences[entry.first]++;
+      // The side diagnostic graph runs immediately before production decode
+      // and uses the same snapshot labels. Keep its files separate so the
+      // production replay cannot overwrite controlled side-graph evidence.
+      const char *graph_tag = g.two_layer_diag ? ".two_layer." : ".";
+      std::string path = std::string(split_dump_path) + graph_tag +
+                         entry.first;
+      if (occurrence != 0)
+        path += "." + std::to_string(occurrence);
+      path += ".f32";
+      ggml_tensor *t = entry.second;
+      if (!t || !t->data)
+        continue;
+      const size_t n = static_cast<size_t>(ggml_nelements(t));
+      std::vector<float> values(n);
+      ggml_backend_tensor_get(t, values.data(), 0, n * sizeof(float));
+      std::ofstream out(path, std::ios::binary | std::ios::trunc);
+      if (!out) {
+        LOG_WARN("[QWEN4EXP-LAYER0-SPLIT] cannot open %s\n", path.c_str());
+        continue;
+      }
+      out.write(reinterpret_cast<const char *>(values.data()),
+                static_cast<std::streamsize>(n * sizeof(float)));
+      float min_v = INFINITY;
+      float max_v = -INFINITY;
+      double sum = 0.0;
+      double sum2 = 0.0;
+      for (float v : values) {
+        min_v = std::min(min_v, v);
+        max_v = std::max(max_v, v);
+        sum += v;
+        sum2 += static_cast<double>(v) * v;
+      }
+      LOG_INFO("[QWEN4EXP-LAYER0-SPLIT] boundary=%s elements=%zu "
+               "fnv64=0x%016llx min=%.9g max=%.9g mean=%.9g rms=%.9g "
+               "file=%s\n",
+               entry.first.c_str(), n,
+               static_cast<unsigned long long>(qwen4exp_fnv64(
+                   values.data(), n * sizeof(float))),
+               min_v, max_v, n ? sum / static_cast<double>(n) : 0.0,
+               n ? std::sqrt(sum2 / static_cast<double>(n)) : 0.0,
+               path.c_str());
+    }
+  }
+  const bool hidden_dump = env_hidden01_dump_path() && g.decode_mode &&
+                           !g.hidden01_dumped;
+  if (!g.layer0_diag_enabled ||
+      (g.layer0_diag_dumped && !hidden_dump))
     return;
-  g.layer0_diag_dumped = true;
-  if (!g.layer0_diag_gate || !g.layer0_diag_up)
-    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] numeric gate/up outputs unavailable "
-             "for this graph (host-node or no separate projection result)\n");
-  auto dump = [](const char *role, const ggml_tensor *t) {
-    if (!t)
-      return;
+  if (!g.layer0_diag_dumped) {
+    g.layer0_diag_dumped = true;
+    if (!g.layer0_diag_gate || !g.layer0_diag_up)
+      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] numeric gate/up outputs unavailable "
+               "for this graph (host-node or no separate projection result)\n");
+    auto dump = [](const char *role, const ggml_tensor *t) {
+      if (!t)
+        return;
+      const size_t n = static_cast<size_t>(ggml_nelements(t));
+      std::vector<float> values(n, 0.0f);
+      ggml_backend_tensor_get(t, values.data(), 0, n * sizeof(float));
+      float min_v = INFINITY;
+      float max_v = -INFINITY;
+      double sum = 0.0;
+      std::ostringstream first;
+      for (size_t i = 0; i < n; ++i) {
+        min_v = std::min(min_v, values[i]);
+        max_v = std::max(max_v, values[i]);
+        sum += values[i];
+        if (i < 8)
+          first << (i ? "," : "") << std::setprecision(9) << values[i];
+      }
+      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s values=%zu first=[%s] min=%.9g "
+               "max=%.9g sum=%.9g\n",
+               role, n, first.str().c_str(), min_v, max_v, sum);
+    };
+    if (g.layer0_diag_gate)
+      dump("gate_output", g.layer0_diag_gate);
+    if (g.layer0_diag_up)
+      dump("up_output", g.layer0_diag_up);
+    dump("down_input_swiglu", g.layer0_diag_act);
+    dump("down_output_raw", g.layer0_diag_down);
+    // The following graph-owned tensors may alias later allocations by the
+    // time the whole graph has retired. Their exact values are reported from
+    // the host snapshots below instead.
+    auto dump_snapshot = [](const char *role, const ggml_tensor *t) {
+      if (!t || !t->data)
+        return;
+      log_layer0_diag_host_values(role, static_cast<const float *>(t->data),
+                                  static_cast<size_t>(ggml_nelements(t)));
+    };
+    dump_snapshot("residual_before_moe_snapshot",
+                  g.layer0_diag_residual_before_snapshot);
+    dump_snapshot("moe_plus_shared_snapshot",
+                  g.layer0_diag_moe_plus_shared_snapshot);
+    dump_snapshot("residual_after_moe_add_snapshot",
+                  g.layer0_diag_residual_after_snapshot);
+    dump_snapshot("layer1_first_consumer_snapshot",
+                  g.layer0_diag_next_consumer_snapshot);
+  }
+
+  const char *dump_path = env_hidden01_dump_path();
+  if (!dump_path || !hidden_dump)
+    return;
+  g.hidden01_dumped = true;
+  for (int layer = 0; layer < 2; ++layer) {
+    ggml_tensor *t = g.hidden01_snapshot[layer];
+    if (!t || !t->data)
+      continue;
     const size_t n = static_cast<size_t>(ggml_nelements(t));
-    std::vector<float> values(n, 0.0f);
-    ggml_backend_tensor_get(t, values.data(), 0, n * sizeof(float));
+    const auto *values = static_cast<const float *>(t->data);
+    std::ostringstream suffix;
+    suffix << dump_path << ".decode.layer" << layer << ".f32";
+    std::ofstream out(suffix.str(), std::ios::binary | std::ios::trunc);
+    if (!out) {
+      LOG_WARN("[QWEN4EXP-HIDDEN01] cannot open %s\n", suffix.str().c_str());
+      continue;
+    }
+    out.write(reinterpret_cast<const char *>(values),
+              static_cast<std::streamsize>(n * sizeof(float)));
     float min_v = INFINITY;
     float max_v = -INFINITY;
     double sum = 0.0;
-    std::ostringstream first;
+    double sum2 = 0.0;
     for (size_t i = 0; i < n; ++i) {
       min_v = std::min(min_v, values[i]);
       max_v = std::max(max_v, values[i]);
       sum += values[i];
-      if (i < 8)
-        first << (i ? "," : "") << std::setprecision(9) << values[i];
+      sum2 += static_cast<double>(values[i]) * values[i];
     }
-    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] %s values=%zu first=[%s] min=%.9g "
-             "max=%.9g sum=%.9g\n",
-             role, n, first.str().c_str(), min_v, max_v, sum);
-  };
-  if (g.layer0_diag_gate)
-    dump("gate_output", g.layer0_diag_gate);
-  if (g.layer0_diag_up)
-    dump("up_output", g.layer0_diag_up);
-  dump("down_input_swiglu", g.layer0_diag_act);
-  dump("down_output_raw", g.layer0_diag_down);
-  // The following graph-owned tensors may alias later allocations by the
-  // time the whole graph has retired. Their exact values are reported from
-  // the host snapshots below instead.
-  auto dump_snapshot = [](const char *role, const ggml_tensor *t) {
-    if (!t || !t->data)
-      return;
-    log_layer0_diag_host_values(role, static_cast<const float *>(t->data),
-                                static_cast<size_t>(ggml_nelements(t)));
-  };
-  dump_snapshot("residual_before_moe_snapshot",
-                g.layer0_diag_residual_before_snapshot);
-  dump_snapshot("moe_plus_shared_snapshot",
-                g.layer0_diag_moe_plus_shared_snapshot);
-  dump_snapshot("residual_after_moe_add_snapshot",
-                g.layer0_diag_residual_after_snapshot);
-  dump_snapshot("layer1_first_consumer_snapshot",
-                g.layer0_diag_next_consumer_snapshot);
+    LOG_INFO("[QWEN4EXP-HIDDEN01] layer=%d elements=%zu fnv64=0x%016llx "
+             "min=%.9g max=%.9g mean=%.9g rms=%.9g file=%s\n",
+             layer, n,
+             static_cast<unsigned long long>(qwen4exp_fnv64(
+                 values, n * sizeof(float))),
+             min_v, max_v, n ? sum / static_cast<double>(n) : 0.0,
+             n ? std::sqrt(sum2 / static_cast<double>(n)) : 0.0,
+             suffix.str().c_str());
+  }
 }
 
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
@@ -1868,6 +2058,23 @@ bool init_device_dense_arena(FullGraph &g) {
   for (const auto &[name, q] : g.engine->resident_layers) {
     if (!q.host_ptr || !graph_dense_weight_name(name))
       continue;
+    if (g.two_layer_diag) {
+      // Reserve only the dense weights consumed by blocks 0 and 1 plus the
+      // final HC projection. A two-layer diagnostic must not claim the
+      // production model's complete dense arena.
+      int layer = -1;
+      if (name.rfind("blk.", 0) == 0) {
+        char *end = nullptr;
+        const long parsed = std::strtol(name.c_str() + 4, &end, 10);
+        if (end != name.c_str() + 4 && end && *end == '.')
+          layer = static_cast<int>(parsed);
+      }
+      const bool final_hc = name == "output_hc_norm.weight" ||
+                            name == "output_hc_down.weight" ||
+                            name == "output_hc_up.weight";
+      if (!final_hc && (layer < 0 || layer >= g.n_layers))
+        continue;
+    }
     constexpr size_t kTensorSlack = 4096;
     if (bytes > SIZE_MAX - q.meta.size_bytes - kTensorSlack)
       return false;
@@ -2362,10 +2569,13 @@ const GGUFTensor *model_tensor(const StreamingEngine &engine,
   return it == engine.model_file.tensors.end() ? nullptr : &it->second;
 }
 
-size_t full_expert_source_bytes(const StreamingEngine &engine) {
+size_t full_expert_source_bytes(const StreamingEngine &engine,
+                                int layer_limit = -1) {
   const auto &c = engine.model_file.architecture_config;
   size_t total = 0;
-  for (int layer = 0; layer < c.n_layers; ++layer) {
+  const int limit = layer_limit > 0 ? std::min(layer_limit, c.n_layers)
+                                    : c.n_layers;
+  for (int layer = 0; layer < limit; ++layer) {
     // When main.cpp prepared a complete graph-RAM arena, the three packed
     // expert planes for this layer are already resident in DDR.  The full
     // graph aliases those bytes below; do not pre-charge or allocate a second
@@ -2573,7 +2783,8 @@ bool init_device_expert_arena(FullGraph &g) {
   const bool partial_active =
       g.decode_mode && g.engine &&
       !g.engine->qwen4exp_partial_layer_gpu_ids.empty() &&
-      g.engine->qwen4exp_partial_layer >= 0;
+      g.engine->qwen4exp_partial_layer >= 0 &&
+      (!g.two_layer_diag || g.engine->qwen4exp_partial_layer < g.n_layers);
   if (g.device_expert_layers <= 0 && !split_active && !partial_active)
     return true;
   const ggml_backend_buffer_type_t buft =
@@ -3512,14 +3723,124 @@ ggml_tensor *dense_weight(FullGraph &g, ggml_context *ctx, int layer,
 
 ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *norm, ggml_tensor *down, ggml_tensor *up,
-                    ggml_tensor *inject, ggml_tensor **inject_out) {
+                    ggml_tensor *inject, ggml_tensor **inject_out,
+                    int diag_layer = -1, const char *diag_tag = nullptr) {
   ggml_tensor *xn =
       ggml_rms_norm(ctx, x, g.engine->model_file.architecture_config.eps);
   xn = ggml_reshape_2d(ctx, xn, g.D * g.HC, g.S);
   xn = ggml_mul(ctx, xn, norm);
+  if (g.two_layer_diag && diag_layer == 0 && diag_tag &&
+      !std::strcmp(diag_tag, "attn")) {
+    if (const char *common_path = env_two_layer_s1_common_hc_norm_path()) {
+      const size_t common_n = static_cast<size_t>(g.D) * g.HC * g.S;
+      ggml_tensor *common = host_input(
+          g, ctx, GGML_TYPE_F32, {g.D * g.HC, g.S},
+          common_n * sizeof(float), "qwen_two_layer_s1_common_hc_norm");
+      if (!common || !load_exact_f32_file(
+                           common_path, static_cast<float *>(common->data),
+                           common_n)) {
+        LOG_WARN(
+            "[QWEN4EXP-TWO-LAYER-S1] common HC norm rejected: path=%s "
+            "expected_bytes=%zu\n",
+            common_path, common_n * sizeof(float));
+      } else {
+        const uint64_t hash = qwen4exp_fnv64(
+            common->data, common_n * sizeof(float));
+        LOG_INFO(
+            "[QWEN4EXP-TWO-LAYER-S1] forcing Layer-0 HC projection input "
+            "from %s elements=%zu fnv64=0x%016llx\n",
+            common_path, common_n, static_cast<unsigned long long>(hash));
+        xn = common;
+      }
+    }
+  }
+  const bool capture_projection_diag =
+      diag_layer >= 0 && diag_layer < 2 && diag_tag && g.layer0_diag_enabled &&
+      env_layer0_split_dump_path();
+  if (capture_projection_diag) {
+    const std::string down_role = std::string(diag_tag) +
+                                  "_hc_down_weight";
+    const std::string up_role = std::string(diag_tag) + "_hc_up_weight";
+    log_layer0_diag_tensor(down_role.c_str(), down);
+    log_layer0_diag_tensor(up_role.c_str(), up);
+    const std::string down_name = std::string(diag_tag) +
+                                  "_hc_down_weight";
+    const std::string up_name = std::string(diag_tag) + "_hc_up_weight";
+    g.layer0_split_snapshots.emplace_back(
+        down_name, layer0_diag_snapshot(g, ctx, down, down_name.c_str()));
+    g.layer0_split_snapshots.emplace_back(
+        up_name, layer0_diag_snapshot(g, ctx, up, up_name.c_str()));
+  }
+  if (capture_projection_diag) {
+    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
+                             "_hc_norm";
+    g.layer0_split_snapshots.emplace_back(
+        std::string(diag_tag) + "_hc_norm",
+        layer0_diag_snapshot(g, ctx, xn, name.c_str()));
+    const std::string weight_name = std::string("qwen_layer0_split_") +
+                                    diag_tag + "_hc_norm_weight";
+    g.layer0_split_snapshots.emplace_back(
+        std::string(diag_tag) + "_hc_norm_weight",
+        layer0_diag_snapshot(g, ctx, norm, weight_name.c_str()));
+  }
   ggml_tensor *lo = ggml_mul_mat(ctx, down, xn);
+  if (capture_projection_diag) {
+    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
+                             "_hc_down_raw";
+    g.layer0_split_snapshots.emplace_back(
+        std::string(diag_tag) + "_hc_down_raw",
+        layer0_diag_snapshot(g, ctx, lo, name.c_str()));
+  }
   lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / static_cast<float>(g.HC)));
-  ggml_tensor *gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, up, lo));
+  if (g.two_layer_diag && diag_layer == 0 && diag_tag &&
+      !std::strcmp(diag_tag, "attn")) {
+    if (const char *common_path =
+            env_two_layer_s1_common_hc_down_silu_path()) {
+      const size_t common_n = static_cast<size_t>(ggml_nelements(lo));
+      ggml_tensor *common = host_input(
+          g, ctx, GGML_TYPE_F32, {lo->ne[0], lo->ne[1]},
+          common_n * sizeof(float), "qwen_two_layer_s1_common_hc_down_silu");
+      if (!common || !load_exact_f32_file(
+                           common_path, static_cast<float *>(common->data),
+                           common_n)) {
+        LOG_WARN(
+            "[QWEN4EXP-TWO-LAYER-S1] common HC down-SiLU rejected: "
+            "path=%s expected_bytes=%zu\n",
+            common_path, common_n * sizeof(float));
+      } else {
+        const uint64_t hash = qwen4exp_fnv64(
+            common->data, common_n * sizeof(float));
+        LOG_INFO(
+            "[QWEN4EXP-TWO-LAYER-S1] forcing Layer-0 HC up input from %s "
+            "elements=%zu fnv64=0x%016llx\n",
+            common_path, common_n, static_cast<unsigned long long>(hash));
+        lo = common;
+      }
+    }
+  }
+  if (capture_projection_diag) {
+    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
+                             "_hc_down_silu";
+    g.layer0_split_snapshots.emplace_back(
+        std::string(diag_tag) + "_hc_down_silu",
+        layer0_diag_snapshot(g, ctx, lo, name.c_str()));
+  }
+  ggml_tensor *gate_logits = ggml_mul_mat(ctx, up, lo);
+  if (capture_projection_diag) {
+    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
+                             "_hc_up_logits";
+    g.layer0_split_snapshots.emplace_back(
+        std::string(diag_tag) + "_hc_up_logits",
+        layer0_diag_snapshot(g, ctx, gate_logits, name.c_str()));
+  }
+  ggml_tensor *gate = ggml_sigmoid(ctx, gate_logits);
+  if (capture_projection_diag) {
+    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
+                             "_hc_gate";
+    g.layer0_split_snapshots.emplace_back(
+        std::string(diag_tag) + "_hc_gate",
+        layer0_diag_snapshot(g, ctx, gate, name.c_str()));
+  }
   ggml_tensor *gated = ggml_mul(ctx, xn, gate);
   ggml_tensor *g3 = ggml_reshape_3d(ctx, gated, g.D, g.HC, g.S);
 
@@ -3533,8 +3854,18 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
     mixed = ggml_add(ctx, mixed, s);
   }
   mixed = ggml_scale(ctx, mixed, 1.0f / static_cast<float>(g.HC));
-  if (inject_out)
+  if (inject_out) {
     *inject_out = inject ? ggml_mul_mat(ctx, inject, xn) : nullptr;
+    if (diag_layer >= 0 && diag_layer < 2 && diag_tag &&
+        g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      const std::string name = std::string("qwen_layer0_split_") + diag_tag +
+                               "_hc_inject";
+      g.layer0_split_snapshots.emplace_back(
+          std::string(diag_tag) + "_hc_inject",
+          layer0_diag_snapshot(g, ctx, *inject_out, name.c_str()));
+    }
+  }
   return mixed;
 }
 
@@ -3910,7 +4241,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       layer == 13 && env_layer13_moe_dump_path() != nullptr;
   if (layer13_moe_diag)
     g.layer13_moe_diag_enabled = true;
-  const bool layer0_diag = layer == 0 && env_layer0_iq2_diag_enabled();
+  const bool layer0_diag =
+      layer == 0 && (env_layer0_iq2_diag_enabled() ||
+                     env_layer0_split_dump_path() != nullptr);
   if (layer0_diag) {
     g.layer0_diag_enabled = true;
     LOG_INFO("[QWEN4EXP-LAYER0-DIAG] graph=%p decode=%d S=%d "
@@ -4388,6 +4721,20 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor *hist_in, ggml_tensor *state_in,
                        ggml_tensor **state_out, ggml_tensor **hist_out) {
   ggml_tensor *qkv = ggml_mul_mat(ctx, w_qkv, cur);
+  auto diag = [&](const char *label, ggml_tensor *value) {
+    if (layer == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          label, layer0_diag_snapshot(g, ctx, value, label));
+    }
+  };
+  // These snapshots are deliberately taken before and inside the GDN node.
+  // The existing attention-output dump only tells us that the discrepancy is
+  // present after the recurrent block; these boundaries separate qkv GEMM,
+  // convolution, GDN/state update, and the final output projection.
+  diag("gdn_qkv", qkv);
+  if (layer == 0 && g.layer0_diag_enabled && env_layer0_split_dump_path())
+    log_layer0_diag_tensor("gdn_qkv_weight", w_qkv);
   ggml_tensor *z = ggml_mul_mat(ctx, w_gate, cur);
   ggml_tensor *alpha = ggml_mul_mat(ctx, w_alpha, cur);
   ggml_tensor *beta_raw = ggml_mul_mat(ctx, w_beta, cur);
@@ -4396,7 +4743,9 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *beta = ggml_sigmoid(ctx, beta_raw);
 
   ggml_tensor *conv_in = ggml_concat(ctx, hist_in, ggml_transpose(ctx, qkv), 0);
+  diag("gdn_conv_in", conv_in);
   ggml_tensor *conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_in, w_conv));
+  diag("gdn_conv", conv);
   const size_t row = ggml_row_size(GGML_TYPE_F32, g.conv_dim);
   ggml_tensor *q =
       ggml_view_4d(ctx, conv, g.gdn_hd, g.Hk_gdn, g.S, 1,
@@ -4415,12 +4764,14 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   beta = ggml_reshape_4d(ctx, beta, 1, g.Hv_gdn, g.S, 1);
   ggml_tensor *gdn =
       ggml_gated_delta_net(ctx, q, k, v, glog, beta, state_in, 1);
+  diag("gdn_output", gdn);
 
   const size_t hd_row = ggml_row_size(GGML_TYPE_F32, g.gdn_hd);
   const size_t value_row = ggml_row_size(GGML_TYPE_F32, g.value_dim);
   const size_t state_row = ggml_row_size(GGML_TYPE_F32, g.gdn_hd * g.gdn_hd);
   ggml_tensor *core = ggml_view_4d(ctx, gdn, g.gdn_hd, g.Hv_gdn, g.S, 1, hd_row,
                                    value_row, value_row * g.S, 0);
+  diag("gdn_core", core);
   // *state_out is kept in the op's own NATIVE layout (ne[0]=k, ne[1]=v; see
   // the gdn_state_transpose_host comment above) because the full-graph
   // decode self-loop feeds this same tensor straight back into
@@ -4440,10 +4791,13 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ctx,
       ggml_rms_norm(ctx, core, g.engine->model_file.architecture_config.eps),
       w_norm);
+  diag("gdn_norm", norm);
   ggml_tensor *z4 = ggml_reshape_4d(ctx, z, g.gdn_hd, g.Hv_gdn, g.S, 1);
   ggml_tensor *gated = ggml_mul(ctx, norm, ggml_sigmoid(ctx, z4));
+  diag("gdn_gated", gated);
   ggml_tensor *out =
       ggml_mul_mat(ctx, w_out, ggml_reshape_2d(ctx, gated, g.value_dim, g.S));
+  diag("gdn_output_projection", out);
   *hist_out =
       ggml_cont(ctx, ggml_view_3d(ctx, conv_in, g.d_conv - 1, g.conv_dim, 1,
                                   conv_in->nb[1], conv_in->nb[2],
@@ -4675,6 +5029,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   g.moe_construction_ms_total = 0.0;
   g.moe_weight_lookup_ms_total = 0.0;
   const auto &c = g.engine->model_file.architecture_config;
+  if (env_layer0_iq2_diag_enabled() || env_layer0_split_dump_path())
+    g.layer0_diag_enabled = true;
   ggml_init_params ip = {};
   ip.mem_size = kTensorContextBytes;
   ip.no_alloc = true;
@@ -4817,6 +5173,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
          g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu) &&
         l == g.phase2_split_layer;
     const std::string p = "blk." + std::to_string(l) + ".";
+    if (l == 1 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "layer1_before_ple",
+          layer0_diag_snapshot(g, g.ctx, res,
+                               "qwen_layer0_split_layer1_before_ple"));
+    }
     if (!phase2_suffix_skip_attn && qwen4exp_is_ple_layer(c, l)) {
       if (!ple_embedding)
         return false;
@@ -4830,6 +5193,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         return false;
       std::memcpy(g.ple_embedding->data, ple_embedding->data(),
                   ple_embedding->size() * sizeof(float));
+      if (l == 1 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "ple_embd",
+            layer0_diag_snapshot(g, g.ctx, g.ple_embedding,
+                                 "qwen_layer0_split_ple_embd"));
+      }
       g.ple_layer = l;
       // PLE graph is constructed below with the same equations as Bee's
       // build_ple.  The input embedding is host gathered, while its learned
@@ -4869,9 +5239,39 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       ggml_tensor *v3 = ggml_repeat_4d(
           g.ctx, ggml_reshape_3d(g.ctx, pv, g.D, 1, g.S), g.D, g.HC, g.S, 1);
       ggml_tensor *gated = ggml_mul(g.ctx, v3, gate);
-      ggml_tensor *normed =
-          group_norm(ggml_reshape_2d(g.ctx, gated, g.D * g.HC, g.S), ple_nc);
-      normed = ggml_reshape_2d(g.ctx, normed, g.D * g.HC, g.S);
+      if (l == 1 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "ple_gate",
+            layer0_diag_snapshot(g, g.ctx, gate,
+                                 "qwen_layer0_split_ple_gate"));
+        g.layer0_split_snapshots.emplace_back(
+            "ple_gated_value",
+            layer0_diag_snapshot(g, g.ctx, gated,
+                                 "qwen_layer0_split_ple_gated_value"));
+      }
+      ggml_tensor *ple_conv_grouped =
+          ggml_reshape_3d(g.ctx, gated, g.D, g.HC, g.S);
+      ggml_tensor *ple_conv_rms =
+          ggml_rms_norm(g.ctx, ple_conv_grouped, c.eps);
+      ple_conv_rms =
+          ggml_reshape_2d(g.ctx, ple_conv_rms, g.D * g.HC, g.S);
+      ggml_tensor *normed = ggml_mul(g.ctx, ple_conv_rms, ple_nc);
+      if (l == 1 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "ple_conv_input",
+            layer0_diag_snapshot(g, g.ctx, normed,
+                                 "qwen_layer0_split_ple_conv_input"));
+        g.layer0_split_snapshots.emplace_back(
+            "ple_conv_rms",
+            layer0_diag_snapshot(g, g.ctx, ple_conv_rms,
+                                 "qwen_layer0_split_ple_conv_rms"));
+        g.layer0_split_snapshots.emplace_back(
+            "ple_norm_conv_weight",
+            layer0_diag_snapshot(g, g.ctx, ple_nc,
+                                 "qwen_layer0_split_ple_norm_conv_weight"));
+      }
 
       const int hist = (c.ple_conv_kernel - 1) * c.ple_ngram_size;
       ggml_tensor *ph = nullptr;
@@ -4916,9 +5316,31 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         ggml_tensor *term = ggml_mul(g.ctx, shifted, wk);
         conv_out = conv_out ? ggml_add(g.ctx, conv_out, term) : term;
       }
+      ggml_tensor *ple_conv_raw = conv_out;
+      if (l == 1 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "ple_conv_raw",
+            layer0_diag_snapshot(g, g.ctx, ple_conv_raw,
+                                 "qwen_layer0_split_ple_conv_raw"));
+      }
       conv_out =
           ggml_reshape_3d(g.ctx, ggml_silu(g.ctx, conv_out), g.D, g.HC, g.S);
+      if (l == 1 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "ple_conv_out",
+            layer0_diag_snapshot(g, g.ctx, conv_out,
+                                 "qwen_layer0_split_ple_conv_out"));
+      }
       res = ggml_add(g.ctx, res, ggml_add(g.ctx, gated, conv_out));
+      if (l == 1 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "layer1_after_ple",
+            layer0_diag_snapshot(g, g.ctx, res,
+                                 "qwen_layer0_split_layer1_after_ple"));
+      }
       g.ple_hist_out = ggml_cont(
           g.ctx, ggml_view_3d(g.ctx, padded, hist, g.D * g.HC, 1, padded->nb[1],
                               padded->nb[2], ggml_row_size(padded->type, g.S)));
@@ -4942,11 +5364,66 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     hinj = resident_tensor(g, g.ctx, p + "hc_attn_inject.weight");
     if (!hn || !hdn || !hup || !hinj)
       return false;
-    ggml_tensor *attn_in = hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
+    ggml_tensor *attn_in =
+        hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject, l, "attn");
+    if (l == 0) {
+      const char *common_path = nullptr;
+      if (g.two_layer_diag && g.S == 1)
+        common_path = env_two_layer_s1_common_attn_input_path();
+      else if (!g.decode_mode)
+        common_path = env_layer0_common_attn_input_path();
+      if (common_path) {
+        const size_t common_n = static_cast<size_t>(g.D) * g.S;
+        ggml_tensor *common = host_input(
+            g, g.ctx, GGML_TYPE_F32, {g.D, g.S},
+            common_n * sizeof(float),
+            g.two_layer_diag ? "qwen_two_layer_s1_common_attn_input"
+                             : "qwen_layer0_common_attn_input");
+        if (!common || !load_exact_f32_file(
+                           common_path, static_cast<float *>(common->data),
+                           common_n)) {
+          LOG_WARN(
+              "[QWEN4EXP-LAYER0-DIAG] common attention input rejected: "
+              "path=%s expected_bytes=%zu S=%d\n",
+              common_path, common_n * sizeof(float), g.S);
+          return false;
+        }
+        const uint64_t hash = qwen4exp_fnv64(
+            common->data, common_n * sizeof(float));
+        LOG_INFO("[QWEN4EXP-LAYER0-DIAG] forcing Layer-0 QKV input from %s "
+                 "elements=%zu S=%d fnv64=0x%016llx\n",
+                 common_path, common_n, g.S,
+                 static_cast<unsigned long long>(hash));
+        // The remainder of this graph, including Layer 1, consumes the
+        // forced result.  This is intentionally a graph input replacement,
+        // not a post-GEMM copy, so the QKV backend sees exactly the supplied
+        // bytes and its normal quantization path remains under test.
+        attn_in = common;
+      }
+    }
+    if (g.two_layer_diag && l == 1)
+      g.two_layer_l1_pre_attn = g.layer0_diag_enabled
+                                  ? layer0_diag_snapshot(
+                                        g, g.ctx, attn_in,
+                                        "qwen_two_layer_s1_l1_pre_attn")
+                                  : attn_in;
+    if (l == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "attention_input",
+          layer0_diag_snapshot(g, g.ctx, attn_in,
+                               "qwen_layer0_split_attention_input"));
+    }
     if (l == 1 && g.layer0_diag_enabled) {
       g.layer0_diag_next_consumer = attn_in;
       g.layer0_diag_next_consumer_snapshot = layer0_diag_snapshot(
           g, g.ctx, attn_in, "qwen_layer0_diag_layer1_consumer");
+      if (env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "layer1_attention_input",
+            layer0_diag_snapshot(g, g.ctx, attn_in,
+                                 "qwen_layer0_split_layer1_attention_input"));
+      }
     }
     ggml_tensor *attn_out = nullptr;
     if (qwen4exp_is_gdn_layer(c, l)) {
@@ -5053,7 +5530,34 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       }
       g.kv_layers.push_back(l);
     }
+    if (l == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "attention_output",
+          layer0_diag_snapshot(g, g.ctx, attn_out,
+                               "qwen_layer0_split_attention_output"));
+    }
     res = hc_combine(g, g.ctx, res, attn_out, inject);
+    if (g.two_layer_diag && l == 1)
+      g.two_layer_l1_post_attn = g.layer0_diag_enabled
+                                    ? layer0_diag_snapshot(
+                                          g, g.ctx, res,
+                                          "qwen_two_layer_s1_l1_post_attn")
+                                    : res;
+    if (l == 1 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "layer1_after_attention",
+          layer0_diag_snapshot(g, g.ctx, res,
+                               "qwen_layer0_split_layer1_after_attention"));
+    }
+    if (l == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "after_attention",
+          layer0_diag_snapshot(g, g.ctx, res,
+                               "qwen_layer0_split_after_attention"));
+    }
     g.attn_construction_ms_total += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_attn_start).count();
     } // !phase2_suffix_skip_attn
@@ -5066,7 +5570,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     hinj = resident_tensor(g, g.ctx, p + "hc_ffn_inject.weight");
     if (!hn || !hdn || !hup || !hinj)
       return false;
-    ggml_tensor *ffn_in = hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject);
+    ggml_tensor *ffn_in =
+        hc_mix(g, g.ctx, res, hn, hdn, hup, hinj, &inject, l, "ffn");
+    if (l == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "ffn_input",
+          layer0_diag_snapshot(g, g.ctx, ffn_in,
+                               "qwen_layer0_split_ffn_input"));
+    }
     if (l == 0 && g.layer0_diag_enabled) {
       g.layer0_diag_residual_before = res;
       g.layer0_diag_residual_before_snapshot = layer0_diag_snapshot(
@@ -5252,8 +5764,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                       split_ok ? de.gpu : nullptr, split_ids, nullptr,
                       partial_ids_out, partial_probs_out);
     }
-    if (l == 0 && g.layer0_diag_enabled)
+    if (l == 0 && g.layer0_diag_enabled) {
       g.layer0_diag_moe_block = moe;
+      if (env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "moe_routed",
+            layer0_diag_snapshot(g, g.ctx, moe,
+                                 "qwen_layer0_split_moe_routed"));
+      }
+    }
     ggml_tensor *sg =
         resident_tensor(g, g.ctx, p + "ffn_gate_inp_shexp.weight");
     ggml_tensor *sge = resident_tensor(g, g.ctx, p + "ffn_gate_shexp.weight");
@@ -5264,6 +5783,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
           build_shared(g, g.ctx, ffn_in, l, sge, sup, sdo, sg);
       if (l == 0 && g.layer0_diag_enabled)
         g.layer0_diag_shared = shared;
+      if (l == 0 && g.layer0_diag_enabled &&
+          env_layer0_split_dump_path()) {
+        g.layer0_split_snapshots.emplace_back(
+            "shared_output",
+            layer0_diag_snapshot(g, g.ctx, shared,
+                                 "qwen_layer0_split_shared_output"));
+      }
       moe = ggml_add(g.ctx, moe, shared);
       if (l == 0 && g.layer0_diag_enabled)
         g.layer0_diag_moe_plus_shared = moe;
@@ -5271,7 +5797,40 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         g.layer0_diag_moe_plus_shared_snapshot = layer0_diag_snapshot(
             g, g.ctx, moe, "qwen_layer0_diag_moe_plus_shared");
     }
+    if (l == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "ffn_output",
+          layer0_diag_snapshot(g, g.ctx, moe,
+                               "qwen_layer0_split_ffn_output"));
+    }
     res = hc_combine(g, g.ctx, res, moe, inject);
+    if (g.two_layer_diag && l == 0)
+      g.two_layer_l0_post_ffn = g.layer0_diag_enabled
+                                    ? layer0_diag_snapshot(
+                                          g, g.ctx, res,
+                                          "qwen_two_layer_s1_l0_post_ffn")
+                                    : res;
+    if (g.two_layer_diag && l == 1)
+      g.two_layer_l1_post_ffn = g.layer0_diag_enabled
+                                    ? layer0_diag_snapshot(
+                                          g, g.ctx, res,
+                                          "qwen_two_layer_s1_l1_post_ffn")
+                                    : res;
+    if (l == 0 && g.layer0_diag_enabled &&
+        env_layer0_split_dump_path()) {
+      g.layer0_split_snapshots.emplace_back(
+          "after_ffn",
+          layer0_diag_snapshot(g, g.ctx, res,
+                               "qwen_layer0_split_after_ffn"));
+    }
+    if (env_hidden01_dump_path() && l >= 0 && l < 2 &&
+        g.layer0_diag_enabled) {
+      const std::string name =
+          "qwen_hidden01_layer" + std::to_string(l);
+      g.hidden01_snapshot[l] =
+          layer0_diag_snapshot(g, g.ctx, res, name.c_str());
+    }
     if (l == 0 && g.layer0_diag_enabled) {
       g.layer0_diag_residual_after = res;
       g.layer0_diag_residual_after_snapshot = layer0_diag_snapshot(
@@ -5295,7 +5854,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode) {
+  if (g.decode_mode && !g.two_layer_diag) {
     ggml_tensor *lm_in = g.output;
     ggml_tensor *out_norm =
         resident_tensor(g, g.ctx, "output_norm.weight");
@@ -5315,6 +5874,22 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_build_forward_expand(g.graph, g.logits);
   }
   } // !phase2_prefix_stopped
+  if (g.two_layer_diag) {
+    // Preserve the actual intermediate tensors as graph terminals. This is
+    // the important distinction from the older diagnostic cpy snapshots:
+    // GGML must keep these exact values live while the dependent Layer-1
+    // subgraph executes, so allocator reuse cannot turn a snapshot into a
+    // different tensor's bytes.
+    for (ggml_tensor *t : {g.two_layer_l0_post_ffn,
+                           g.two_layer_l1_pre_attn,
+                           g.two_layer_l1_post_attn,
+                           g.two_layer_l1_post_ffn}) {
+      if (t) {
+        ggml_set_output(t);
+        ggml_build_forward_expand(g.graph, t);
+      }
+    }
+  }
   if (!g.decode_mode) {
     for (ggml_tensor *t : g.kv_k) {
       ggml_set_output(t);
@@ -5725,6 +6300,8 @@ void qwen4exp_full_graph_shutdown() {
   g_graph_p2_suffix_cpu.reset();
   g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
+  g_two_layer_diag_graph.reset();
+  g_two_layer_diag_done = false;
 }
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
@@ -7526,6 +8103,30 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));
+  if (const char *split_dump_path = env_layer0_split_dump_path()) {
+    std::unordered_map<std::string, size_t> snapshot_occurrences;
+    for (const auto &entry : g.layer0_split_snapshots) {
+      const size_t occurrence = snapshot_occurrences[entry.first]++;
+      ggml_tensor *t = entry.second;
+      if (!t || !t->data)
+        continue;
+      const size_t n = static_cast<size_t>(ggml_nelements(t));
+      std::vector<float> values(n);
+      ggml_backend_tensor_get(t, values.data(), 0, n * sizeof(float));
+      std::string path = std::string(split_dump_path) + ".prefill." +
+                         entry.first;
+      if (occurrence != 0)
+        path += "." + std::to_string(occurrence);
+      path += ".f32";
+      if (qwen4exp_dump_f32(path.c_str(), values.data(), n))
+        LOG_INFO("[QWEN4EXP-LAYER0-SPLIT] prefill snapshot=%s elements=%zu "
+                 "fnv64=0x%016llx path=%s\n",
+                 entry.first.c_str(), n,
+                 static_cast<unsigned long long>(qwen4exp_fnv64(
+                     values.data(), n * sizeof(float))),
+                 path.c_str());
+    }
+  }
   const auto t_output_end = std::chrono::steady_clock::now();
   dump_layer0_diag_values(g);
 
@@ -7570,6 +8171,22 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     auto &dst = engine.qwen4exp_ple_conv_history[g.ple_layer];
     ggml_backend_tensor_get(g.ple_hist_out, dst.data(), 0,
                             hist_n * sizeof(float));
+    // Prefill is the only place where the full S>1 PLE graph writes the
+    // recurrent convolution history.  Keep a diagnostic copy of that exact
+    // post-compute state so it can be compared with Bee's prefill cache
+    // without disturbing the state owner or adding a graph node.
+    if (!g.decode_mode) {
+      if (const char *split_dump_path = env_layer0_split_dump_path()) {
+        const std::string path = std::string(split_dump_path) +
+                                 ".prefill.ple_history_after.f32";
+        qwen4exp_dump_f32(path.c_str(), dst.data(), hist_n);
+        LOG_INFO("[QWEN4EXP-LAYER0-SPLIT] prefill PLE history dump path=%s "
+                 "elements=%zu fnv64=0x%016llx\n",
+                 path.c_str(), hist_n,
+                 static_cast<unsigned long long>(qwen4exp_fnv64(
+                     dst.data(), hist_n * sizeof(float))));
+      }
+    }
     engine.qwen4exp_ple_tok_hist.clear();
     const int keep = std::max(0, c.ple_ngram_size - 1);
     const int start = std::max(0, S - keep);
@@ -7747,6 +8364,212 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   return true;
 }
 
+bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine, int pos_base,
+                                    const int *token_ids) {
+  if (!env_two_layer_s1_diag_enabled() ||
+      engine.family_ops.family != ModelFamily::Qwen4Exp || pos_base < 0)
+    return false;
+  if (g_two_layer_diag_done)
+    return true;
+
+  const auto &c = engine.model_file.architecture_config;
+  if (c.n_layers < 2 || engine.max_t <= 0 || pos_base >= engine.max_t ||
+      engine.hc_stream_buf.size() <
+          static_cast<size_t>(c.hidden) * c.hc_mult)
+    return false;
+  const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+  const auto build_start = std::chrono::steady_clock::now();
+
+  auto g = std::make_unique<FullGraph>();
+  g->engine = &engine;
+  g->device = dev;
+  g->S = 1;
+  g->D = c.hidden;
+  g->HC = c.hc_mult;
+  g->n_layers = 2;
+  g->H = c.n_heads;
+  g->Hkv = std::max(1, c.n_head_kv);
+  g->hd = c.head_dim;
+  g->Hk_gdn = c.ssm_group_count;
+  g->Hv_gdn = c.ssm_time_step_rank;
+  g->gdn_hd = c.ssm_state_size;
+  g->key_dim = g->Hk_gdn * g->gdn_hd;
+  g->value_dim = c.ssm_inner_size;
+  g->conv_dim = 2 * g->key_dim + g->value_dim;
+  g->d_conv = c.ssm_conv_kernel;
+  g->decode_mode = true;
+  g->kv_capacity = env_decode_kv_capacity(engine.max_t, pos_base + 1);
+  g->decode_last_pos = pos_base - 1;
+  g->two_layer_diag = true;
+  // Reuse the existing HC boundary instrumentation when the caller also
+  // requests a split dump. This keeps the side-graph internals observable
+  // without changing the normal two-layer boundary API or graph topology.
+  g->layer0_diag_enabled = env_layer0_split_dump_path() != nullptr;
+  g->layer_timing_verbose_enabled = env_layer_timing_verbose();
+
+  g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
+  g->cpu = ggml_backend_cpu_init();
+  if (!g->cuda || !g->cpu)
+    return false;
+  verify_cuda_graphs_compiled_in(g->cuda);
+  g->cpu_threads = graph_cpu_threads();
+  ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
+  ggml_threadpool_params tp = ggml_threadpool_params_default(g->cpu_threads);
+  g->cpu_threadpool = ggml_threadpool_new(&tp);
+  if (g->cpu_threadpool)
+    ggml_backend_cpu_set_threadpool(g->cpu, g->cpu_threadpool);
+
+  // Only the first two layers can be referenced by this graph. This avoids
+  // charging/reserving the remaining 46 layers' expert source bytes when a
+  // caller has not enabled the full preloaded DDR arena.
+  const size_t expert_bytes = full_expert_source_bytes(engine, g->n_layers);
+  if (expert_bytes > 0 &&
+      !MemoryGuard::try_reserve_host_bytes(expert_bytes))
+    return false;
+  g->host_reservation_bytes = expert_bytes;
+  g->host_precharged_bytes = expert_bytes;
+  if (!init_device_dense_arena(*g) || !init_device_state_arena(*g) ||
+      !init_device_expert_arena(*g))
+    return false;
+
+  ggml_backend_t backends[] = {g->cuda, g->cpu};
+  ggml_backend_buffer_type_t sched_bufts[2] = {};
+  ggml_backend_buffer_type_t *sched_bufts_ptr = nullptr;
+  if (graph_cuda_host_buffers()) {
+    sched_bufts[0] = ggml_backend_get_default_buffer_type(g->cuda);
+    sched_bufts[1] = ggml_backend_dev_host_buffer_type(
+        ggml_backend_get_device(g->cuda));
+    if (sched_bufts[1])
+      sched_bufts_ptr = sched_bufts;
+  }
+  g->sched = ggml_backend_sched_new(backends, sched_bufts_ptr, 2,
+                                    kGraphSize, graph_scheduler_parallel(),
+                                    true);
+  if (!g->sched)
+    return false;
+  if (g->layer_timing_verbose_enabled) {
+    g->layer_timing_cpu_ms.assign(static_cast<size_t>(g->n_layers), 0.0);
+    ggml_backend_sched_set_eval_callback(g->sched, layer_timing_eval_callback,
+                                         g.get());
+  }
+
+  std::vector<float> ple;
+  if (!prepare_ple_embedding(*g, ple, 1, pos_base, token_ids) &&
+      has_ple_layer(c))
+    return false;
+  if (!build_graph(*g, has_ple_layer(c) ? &ple : nullptr))
+    return false;
+
+  // Seed only this diagnostic graph's private state/cache copies. The live
+  // engine state is never touched by the replay or its state-update nodes.
+  const size_t state_n = static_cast<size_t>(g->gdn_hd) * g->gdn_hd * g->Hv_gdn;
+  const size_t hist_n = static_cast<size_t>(g->d_conv - 1) * g->conv_dim;
+  for (size_t i = 0; i < g->gdn_layers.size(); ++i) {
+    const int l = g->gdn_layers[i];
+    if (l < 0 || l >= static_cast<int>(engine.qwen4exp_recur_state.size()) ||
+        l >= static_cast<int>(engine.qwen4exp_conv_history.size()) ||
+        engine.qwen4exp_recur_state[l].size() != state_n ||
+        engine.qwen4exp_conv_history[l].size() != hist_n)
+      return false;
+    std::vector<float> native(state_n);
+    gdn_state_transpose_host(native.data(), engine.qwen4exp_recur_state[l].data(),
+                              g->gdn_hd, g->Hv_gdn);
+    ggml_backend_tensor_set(g->gdn_state_storage[i], native.data(), 0,
+                            state_n * sizeof(float));
+    ggml_backend_tensor_set(g->gdn_hist_storage[i],
+                            engine.qwen4exp_conv_history[l].data(), 0,
+                            hist_n * sizeof(float));
+  }
+  const size_t kv_row = static_cast<size_t>(g->Hkv) * g->hd;
+  const size_t kv_bytes = static_cast<size_t>(pos_base) * kv_row * sizeof(float);
+  for (size_t i = 0; i < g->kv_layers.size(); ++i) {
+    const int l = g->kv_layers[i];
+    if (l < 0 || l >= static_cast<int>(engine.Kc.size()) ||
+        l >= static_cast<int>(engine.Vc.size()) || !engine.Kc[l] ||
+        !engine.Vc[l])
+      return false;
+    if (kv_bytes > 0) {
+      ggml_backend_tensor_set(g->kv_state_k[i], engine.Kc[l], 0, kv_bytes);
+      ggml_backend_tensor_set(g->kv_state_v[i], engine.Vc[l], 0, kv_bytes);
+    }
+  }
+  // Layer 1 on this model owns the PLE convolution state.  The diagnostic
+  // graph has private state tensors, so it must receive the same history as
+  // production before replay; otherwise Layer 0 can match while Layer 1's
+  // attention input diverges.
+  if (g->ple_layer >= 0 && g->ple_hist_storage) {
+    const size_t ple_n = static_cast<size_t>(c.ple_conv_kernel - 1) *
+                         c.ple_ngram_size * g->HC * g->D;
+    if (g->ple_layer >=
+            static_cast<int>(engine.qwen4exp_ple_conv_history.size()) ||
+        engine.qwen4exp_ple_conv_history[g->ple_layer].size() != ple_n)
+      return false;
+    ggml_backend_tensor_set(
+        g->ple_hist_storage,
+        engine.qwen4exp_ple_conv_history[g->ple_layer].data(), 0,
+        ple_n * sizeof(float));
+    if (env_two_layer_s1_diag_dump_path()) {
+      std::vector<float> history(ple_n);
+      ggml_backend_tensor_get(g->ple_hist_storage, history.data(), 0,
+                              ple_n * sizeof(float));
+      const std::string path =
+          std::string(env_two_layer_s1_diag_dump_path()) +
+          ".ple_history_before.f32";
+      qwen4exp_dump_f32(path.c_str(), history.data(), ple_n);
+    }
+  }
+  if (!phase2_feed_common_inputs(*g, pos_base))
+    return false;
+  std::memcpy(g->input->data, engine.hc_stream_buf.data(),
+              static_cast<size_t>(g->D) * g->HC * sizeof(float));
+
+  const auto build_done = std::chrono::steady_clock::now();
+  const auto replay_start = std::chrono::steady_clock::now();
+  if (ggml_backend_sched_graph_compute_async(g->sched, g->graph) !=
+      GGML_STATUS_SUCCESS)
+    return false;
+  ggml_backend_sched_synchronize(g->sched);
+  if (g->layer0_diag_enabled)
+    dump_layer0_diag_values(*g);
+  const double replay_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - replay_start)
+                               .count();
+
+  const char *dump_base = env_two_layer_s1_diag_dump_path();
+  auto dump_boundary = [&](const char *label, ggml_tensor *tensor) {
+    if (!tensor)
+      return;
+    const size_t n = static_cast<size_t>(ggml_nelements(tensor));
+    std::vector<float> values(n);
+    ggml_backend_tensor_get(tensor, values.data(), 0, n * sizeof(float));
+    const uint64_t hash = qwen4exp_fnv64(values.data(), n * sizeof(float));
+    LOG_INFO("[QWEN4EXP-TWO-LAYER-S1] boundary=%s elements=%zu "
+             "fnv64=0x%016llx\n",
+             label, n, static_cast<unsigned long long>(hash));
+    if (dump_base) {
+      std::string path = std::string(dump_base) + "." + label + ".f32";
+      const bool ok = qwen4exp_dump_f32(path.c_str(), values.data(), n);
+      LOG_INFO("[QWEN4EXP-TWO-LAYER-S1] dump=%s path=%s\n",
+               ok ? "ok" : "failed", path.c_str());
+    }
+  };
+  dump_boundary("layer0_post_ffn", g->two_layer_l0_post_ffn);
+  dump_boundary("layer1_pre_attn", g->two_layer_l1_pre_attn);
+  dump_boundary("layer1_post_attn", g->two_layer_l1_post_attn);
+  dump_boundary("layer1_post_ffn", g->two_layer_l1_post_ffn);
+  LOG_INFO("[QWEN4EXP-TWO-LAYER-S1] graph built_layers=%d nodes=%d "
+           "splits=%d build_to_replay=%.3f ms replay=%.3f ms\n",
+           g->n_layers, ggml_graph_n_nodes(g->graph),
+           ggml_backend_sched_get_n_splits(g->sched),
+           std::chrono::duration<double, std::milli>(build_done - build_start)
+               .count(),
+           replay_ms);
+  g->ready = true;
+  g_two_layer_diag_graph = std::move(g);
+  g_two_layer_diag_done = true;
+  return true;
+}
+
 #else
 
 bool qwen4exp_full_graph_enabled() { return false; }
@@ -7766,6 +8589,9 @@ bool qwen4exp_full_graph_run(StreamingEngine &, float *, int, int,
 }
 bool qwen4exp_full_graph_decode_run(StreamingEngine &, float *, int,
                                     const int *, float *, int) {
+  return false;
+}
+bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &, int, const int *) {
   return false;
 }
 void qwen4exp_full_graph_shutdown() {}

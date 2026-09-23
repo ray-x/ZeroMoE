@@ -39,6 +39,7 @@
 #include <cstring>
 #include <atomic>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
 #include <unordered_set>
 #include <unordered_map>
@@ -57,6 +58,45 @@ bool ple_timing_enabled() {
     return v && v[0] == '1';
   }();
   return enabled;
+}
+
+// Opt-in A/A snapshots for the host PLE implementation.  These use the same
+// boundary selector as execution_layer.cpp, but remain local to this TU so
+// the normal PLE path has no dependency on diagnostic plumbing.  The files
+// are only written when the existing prefill boundary dump is enabled.
+bool ple_diag_selected(int layer, int pos) {
+  static const char *base = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+  static const int selected_layer = [] {
+    const char *v = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAYER");
+    return v && *v ? std::atoi(v) : 0;
+  }();
+  static const int first_pos = [] {
+    const char *v = std::getenv("MOESTREAM_PREFILL_BOUNDARY_FIRST_POS");
+    return v && *v ? std::atoi(v) : 0;
+  }();
+  static const int last_pos = [] {
+    const char *v = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAST_POS");
+    return v && *v ? std::atoi(v) : -1;
+  }();
+  return base && *base && (selected_layer < 0 || selected_layer == layer) &&
+         pos >= first_pos && pos <= last_pos;
+}
+
+void ple_diag_dump(const char *label, int layer, int pos, const float *data,
+                   size_t count) {
+  if (!data || count == 0 || !ple_diag_selected(layer, pos))
+    return;
+  const char *base = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+  std::string path = std::string(base) + ".l" +
+                     (layer < 10 ? "0" : "") + std::to_string(layer) +
+                     ".p" + std::to_string(pos) + "." + label + ".f32";
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out)
+    return;
+  out.write(reinterpret_cast<const char *>(data),
+            static_cast<std::streamsize>(count * sizeof(float)));
+  LOG_INFO("[PLE-DIAG] layer=%d pos=%d label=%s elements=%zu path=%s\n",
+           layer, pos, label, count, path.c_str());
 }
 
 // Lazily mmap'd PLE gather table (process-lifetime, like the KDA/GDN conv
@@ -496,6 +536,7 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
       return;
     }
   }
+  ple_diag_dump("ple_embd", layer_idx, pos_base, emb.data(), emb.size());
   // ---- 3. key/value projections ----
   // emb per token is [n_heads * head_dim] == [hidden] wide (validated at
   // load: ple_n_embd_per_layer * ple_n_heads == hidden is required for the
@@ -509,6 +550,8 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
   std::vector<float> key((size_t)S * hc_dim), value((size_t)S * D);
   dense_proj(engine, p + "ple_key.weight", emb.data(), key.data(), S, D, hc_dim);
   dense_proj(engine, p + "ple_value.weight", emb.data(), value.data(), S, D, D);
+  ple_diag_dump("ple_key", layer_idx, pos_base, key.data(), key.size());
+  ple_diag_dump("ple_value", layer_idx, pos_base, value.data(), value.size());
 
   // ---- 4. grouped norms ----
   std::vector<float> norm_key_w, norm_query_w, norm_conv_w;
@@ -525,25 +568,40 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
   std::vector<float> query((size_t)S * hc_dim);
   ple_grouped_norm(engine.hc_stream_buf.data(), norm_query_w.data(),
                    query.data(), S, hc_dim, D, c.eps);
+  ple_diag_dump("ple_query", layer_idx, pos_base, query.data(), query.size());
 
   // ---- 5. signed-sqrt sigmoid gate; value broadcast across streams ----
   const float inv_sqrt_d = 1.0f / std::sqrt((float)D);
   std::vector<float> gated((size_t)S * hc_dim);
+  std::vector<float> gate_values((size_t)S * HC);
 #pragma omp parallel for if (S > 1) schedule(static)
   for (int s = 0; s < S; ++s) {
-    double dot = 0.0;
     const float *ks = key.data() + (size_t)s * hc_dim;
     const float *qs = query.data() + (size_t)s * hc_dim;
-    for (int i = 0; i < hc_dim; ++i) dot += (double)ks[i] * qs[i];
-    const float sc = (float)(dot)*inv_sqrt_d;
-    const float mag = std::sqrt(std::fmax(std::fabs(sc), 1e-6f));
-    const float gate = 1.0f / (1.0f + std::exp(-std::copysign(mag, sc)));
     const float *vs = value.data() + (size_t)s * D;
     float *gs = gated.data() + (size_t)s * hc_dim;
     for (int h = 0; h < HC; ++h)
+    {
+      // Bee's ggml_sum_rows reduces the [D, HC, S] key*query tensor over
+      // dimension 0, producing one signed-sqrt/sigmoid gate per HC stream.
+      // The old host path accidentally reduced all HC*D values into one
+      // scalar gate, then broadcast that scalar across the four streams.
+      double dot = 0.0;
+      for (int d = 0; d < D; ++d)
+        dot += (double)ks[(size_t)h * D + d] * qs[(size_t)h * D + d];
+      const float sc = (float)dot * inv_sqrt_d;
+      const float mag = std::sqrt(std::fmax(std::fabs(sc), 1e-6f));
+      const float gate =
+          1.0f / (1.0f + std::exp(-std::copysign(mag, sc)));
+      gate_values[(size_t)s * HC + h] = gate;
       for (int d = 0; d < D; ++d)
         gs[(size_t)h * D + d] = vs[d] * gate;
+    }
   }
+  ple_diag_dump("ple_gate", layer_idx, pos_base, gate_values.data(),
+                gate_values.size());
+  ple_diag_dump("ple_gated_value", layer_idx, pos_base, gated.data(),
+                gated.size());
 
   // ---- 6. dilated causal conv over the token axis (dilation = ngram_size),
   // persistent per-layer history; silu on the output ----
@@ -561,6 +619,8 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
   // normalized = grouped_norm(gated) feeds the conv (NOT gated itself).
   std::vector<float> conv_in((size_t)S * hc_dim);
   ple_grouped_norm(gated.data(), norm_conv_w.data(), conv_in.data(), S, hc_dim, D, c.eps);
+  ple_diag_dump("ple_conv_normed", layer_idx, pos_base, conv_in.data(),
+                conv_in.size());
 
   std::vector<float> conv_out((size_t)S * hc_dim);
 #pragma omp parallel for schedule(static)
@@ -580,6 +640,8 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
       conv_out[(size_t)s * hc_dim + ch] = acc / (1.0f + std::exp(-acc)); // silu
     }
   }
+  ple_diag_dump("ple_conv_out", layer_idx, pos_base, conv_out.data(),
+                conv_out.size());
   if (hist > 0) {
     // shift the window left by S and append this call's inputs
     std::vector<float> new_hist((size_t)hc_dim * hist);
@@ -598,8 +660,12 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
   }
 
   // ---- 7. res_hc += gated + conv_out ----
+  ple_diag_dump("ple_hc_before", layer_idx, pos_base,
+                engine.hc_stream_buf.data(), engine.hc_stream_buf.size());
   for (size_t i = 0; i < (size_t)S * hc_dim; ++i)
     engine.hc_stream_buf[i] += gated[i] + conv_out[i];
+  ple_diag_dump("ple_hc_after", layer_idx, pos_base,
+                engine.hc_stream_buf.data(), engine.hc_stream_buf.size());
 
   if (trace_gate("PLE")) {
     const size_t off = (size_t)(S - 1) * hc_dim;
