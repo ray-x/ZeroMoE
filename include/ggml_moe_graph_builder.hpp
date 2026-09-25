@@ -54,6 +54,7 @@ struct SharedGraphNodes {
   ggml_tensor *gate = nullptr;
   ggml_tensor *up = nullptr;
   ggml_tensor *activation = nullptr;
+  ggml_tensor *shared_raw = nullptr;
   ggml_tensor *shared = nullptr;
   ggml_tensor *combined = nullptr;
 };

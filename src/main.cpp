@@ -494,6 +494,15 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       config.qwen4exp_cpu_offload_event_fence;
   engine.qwen4exp_cpu_offload_ring_slots =
       config.qwen4exp_cpu_offload_ring_slots;
+  engine.qwen4exp_gpu_stage_enabled = config.qwen4exp_gpu_stage_enabled;
+  engine.qwen4exp_gpu_stage_layers = config.qwen4exp_gpu_stage_layers;
+  std::sort(engine.qwen4exp_gpu_stage_layers.begin(),
+            engine.qwen4exp_gpu_stage_layers.end());
+  engine.qwen4exp_gpu_stage_layers.erase(
+      std::unique(engine.qwen4exp_gpu_stage_layers.begin(),
+                  engine.qwen4exp_gpu_stage_layers.end()),
+      engine.qwen4exp_gpu_stage_layers.end());
+  engine.qwen4exp_track_router_usage = config.qwen4exp_track_router_usage;
   engine.glm5next_kda_gpu = config.glm5next_kda_gpu;
   engine.glm5next_router_gpu = config.glm5next_router_gpu;
   engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
@@ -1043,14 +1052,32 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       est_device_expert_gb = (double)expert_slab_bytes * (double)cfg.n_experts *
                              (double)dev_layers / kBytesPerGb;
 
+    // Generalized GPU staging (ggml_qwen4exp_graph.cpp's build_gpu_stage_node):
+    // a fixed, topk-sized (not n_experts-sized) compact gate+up+down
+    // destination per staged host-resident decode layer, bump-allocated
+    // from the SAME device_expert_buffer arena the block above estimates --
+    // this is a rough pre-estimate only (the real accounting, which
+    // correctly excludes layers already covered by dev_layers, lives in
+    // device_expert_bytes()); folded in here so this early fallback-cache
+    // sizing pass doesn't leave the legacy cache too large and get
+    // squeezed out later by the real graph's own allocation, the same
+    // class of bug Incident B (this file's own comment above) already
+    // documents.
+    double est_gpu_stage_gb = 0.0;
+    if (engine.qwen4exp_gpu_stage_enabled && expert_slab_bytes > 0 &&
+        cfg.topk > 0 && !engine.qwen4exp_gpu_stage_layers.empty())
+      est_gpu_stage_gb = (double)expert_slab_bytes * (double)cfg.topk *
+                         (double)engine.qwen4exp_gpu_stage_layers.size() /
+                         kBytesPerGb;
+
     // Ground-truth free VRAM right now, same GPU setup_expert_cache is
     // about to target. Single-GPU-vault configs only (the graphs'
     // current real deployment target) -- core_free_vram_bytes() reads
     // the "core" device, which is also the vault/graph device in every
     // config these families ship with today.
     const double free_gb = (double)gpu.core_free_vram_bytes() / kBytesPerGb;
-    const double headroom_gb =
-        free_gb - est_device_expert_gb - kGraphOverheadReserveGb;
+    const double headroom_gb = free_gb - est_device_expert_gb -
+                               est_gpu_stage_gb - kGraphOverheadReserveGb;
     const double fallback_gb =
         std::clamp(headroom_gb, 0.0, kGraphRamCacheFallbackVramGb);
 
@@ -1067,7 +1094,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         << free_gb
         << " GiB - device_expert_"
            "layers("
-        << dev_layers << ")~=" << est_device_expert_gb << " GiB - "
+        << dev_layers << ")~=" << est_device_expert_gb
+        << " GiB - gpu_stage_layers(" << engine.qwen4exp_gpu_stage_layers.size()
+        << ")~=" << est_gpu_stage_gb << " GiB - "
         << kGraphOverheadReserveGb << " GiB graph overhead reserve, capped at "
         << kGraphRamCacheFallbackVramGb
         << " GiB -- see this call site's "
@@ -1290,6 +1319,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   int gate_inp_converted = 0, gate_inp_skipped = 0;
   int gate_inp_scheduler_kept = 0;
   size_t gate_inp_bf16_bytes_used = 0, gate_inp_f32_equivalent_bytes = 0;
+  const bool disable_router_bf16 = [] {
+    const char *value = std::getenv("MOESTREAM_DISABLE_ROUTER_BF16");
+    return value && value[0] == '1';
+  }();
   // Bee's CPU-MoE topology keeps the router projection on CUDA and moves only
   // the routed expert planes to the CPU.  The Qwen decode scheduler consumes
   // the original device_ptr representation; it cannot use the separate
@@ -1317,6 +1350,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       ++gate_inp_scheduler_kept;
       continue;
     }
+    if (disable_router_bf16) {
+      ++gate_inp_skipped;
+      continue;
+    }
     size_t remaining_free_vram = gpu.core_free_vram_bytes();
     if (gpu.upload_dequantized_bf16(tensor, remaining_free_vram)) {
       ++gate_inp_converted;
@@ -1338,6 +1375,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       << " GB saved), " << gate_inp_skipped << " layer(s) kept at original F32"
       << ", " << gate_inp_scheduler_kept
       << " Qwen scheduler router(s) deliberately kept at original F32"
+      << (disable_router_bf16 ? ", router BF16 conversion disabled by env" : "")
       << " -- NOTE: rounds router logits, a routing-behavior change, not just "
          "numerical noise.\n";
 

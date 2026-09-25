@@ -1495,8 +1495,10 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
             run_qwen4exp_shared_device(engine, layer_idx, S, D, moe_inter,
                                        engine.qwen4exp_device_hc_ffn_input,
                                        scratch.moe_device_output, c, &combined);
-        if (shared_device_handled)
+        if (shared_device_handled) {
           scratch.moe_device_output = combined;
+          scratch.moe_shared_device_output = true;
+        }
       }
       if (!shared_device_handled) {
         // The routed graph is still correct; only the optional shared graph
@@ -1709,8 +1711,10 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
             run_qwen4exp_shared_device(engine, layer_idx, S, D, moe_inter,
                                        engine.qwen4exp_device_hc_ffn_input,
                                        scratch.moe_device_output, c, &combined);
-        if (shared_device_handled)
+        if (shared_device_handled) {
           scratch.moe_device_output = combined;
+          scratch.moe_shared_device_output = true;
+        }
         if (!shared_device_handled) {
           // The routed graph has no host output because it was handed to HC
           // as a device tensor.  Recover it before the existing shared CPU
@@ -2486,6 +2490,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
                 scratch.moe_device_output, c, &combined);
             if (shared_device_handled) {
               scratch.moe_device_output = combined;
+              scratch.moe_shared_device_output = true;
               // Even when the HC pre-mix was also exported to the host for
               // routing/cache bookkeeping, keep this routed+shared result on
               // the device. The layer loop below passes it to

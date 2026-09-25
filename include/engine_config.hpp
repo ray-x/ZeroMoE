@@ -451,6 +451,25 @@ struct EngineConfig {
   bool qwen4exp_cpu_offload_event_fence = false;
   int qwen4exp_cpu_offload_ring_slots = 2;
 
+  // GPU staging for host-resident decode layers: reuses the CUDA-graph
+  // host-node bridge (same technique as qwen4exp_cpu_offload above) to
+  // gather a listed layer's real per-token top-k routed experts from the
+  // preloaded DDR arena into a small, fixed, topk-sized compact VRAM buffer
+  // each decode token, so its MoE FFN compute can run as ordinary GPU
+  // MUL_MAT_ID nodes instead of always falling to CPU AVX-512. Decode
+  // (S==1) only -- see qwen4exp_full_graph_decode_run/build_gpu_stage_node
+  // in ggml_qwen4exp_graph.cpp for why prefill is out of scope. Independent
+  // of qwen4exp_cpu_offload: a layer should be listed in at most one of the
+  // two lists (build_moe checks staging first).
+  bool qwen4exp_gpu_stage_enabled = false;
+  std::vector<int> qwen4exp_gpu_stage_layers;
+
+  // Decode-only router-usage tap -- see StreamingEngine::
+  // qwen4exp_track_router_usage's own comment. Real per-token overhead
+  // (one D2H + one host callback per token); only worth enabling for a
+  // usage survey, never for production decode.
+  bool qwen4exp_track_router_usage = false;
+
   // prompt_cache: reuse the previous request's end-of-prompt state when the
   // new prompt EXTENDS it (or repeats it), so only the new suffix is
   // prefilled. Restricted to families whose carried recurrent/conv/PLE state
@@ -2821,6 +2840,12 @@ inline bool EngineConfig::load(const std::string &path) {
       qwen4exp_cpu_offload_force_expert);
   qwen4exp_cpu_offload_event_fence = doc.root.get_bool(
       "qwen4exp_cpu_offload_event_fence", qwen4exp_cpu_offload_event_fence);
+  qwen4exp_gpu_stage_enabled = doc.root.get_bool(
+      "qwen4exp_gpu_stage_enabled", qwen4exp_gpu_stage_enabled);
+  qwen4exp_gpu_stage_layers =
+      doc.root.get_int_array("qwen4exp_gpu_stage_layers");
+  qwen4exp_track_router_usage = doc.root.get_bool(
+      "qwen4exp_track_router_usage", qwen4exp_track_router_usage);
   qwen4exp_cpu_offload_ring_slots = (int)doc.root.get_int(
       "qwen4exp_cpu_offload_ring_slots", qwen4exp_cpu_offload_ring_slots);
   if (qwen4exp_cpu_offload_ring_slots < 1)

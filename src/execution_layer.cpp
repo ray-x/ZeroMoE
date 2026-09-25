@@ -874,43 +874,71 @@ static void dump_prefill_device_boundary(const char *label, int layer, int pos,
   dump_prefill_boundary(label, layer, pos, host.data(), elements);
 }
 
-static void dump_prefill_hc_streams(const char *label, int layer, int pos,
-                                    int hc_mult, int d_model) {
+static void dump_prefill_hc_streams(const char *label, int layer,
+                                    int pos_base, int S, int hc_mult,
+                                    int d_model) {
   const char *base = prefill_boundary_dump_base();
-  if (!base || hc_mult <= 0 || d_model <= 0 ||
-      !prefill_boundary_dump_layer_selected(layer) ||
-      pos < prefill_boundary_dump_first_pos() ||
-      pos > prefill_boundary_dump_last_pos())
+  if (!base || hc_mult <= 0 || d_model <= 0 || S <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer))
     return;
-  const size_t elements = static_cast<size_t>(hc_mult) * d_model;
-  std::vector<float> host(elements);
-  if (!GgmlHcRunner::instance().download_streams(host.data(), /*S=*/1)) {
+  bool any_in_range = false;
+  for (int i = 0; i < S; ++i) {
+    const int pos = pos_base + i;
+    if (pos >= prefill_boundary_dump_first_pos() &&
+        pos <= prefill_boundary_dump_last_pos()) {
+      any_in_range = true;
+      break;
+    }
+  }
+  if (!any_in_range) return;
+  const size_t per_token = static_cast<size_t>(hc_mult) * d_model;
+  std::vector<float> host((size_t)S * per_token);
+  if (!GgmlHcRunner::instance().download_streams(host.data(), S)) {
     LOG_STREAM_WARN() << "[PREFILL-BOUNDARY] failed to copy HC streams label="
-                      << label << " layer=" << layer << " pos=" << pos
-                      << "\n";
+                      << label << " layer=" << layer
+                      << " pos_base=" << pos_base << "\n";
     return;
   }
-  dump_prefill_boundary(label, layer, pos, host.data(),
-                        static_cast<int>(elements));
+  for (int i = 0; i < S; ++i) {
+    const int pos = pos_base + i;
+    dump_prefill_boundary(label, layer, pos, host.data() + (size_t)i * per_token,
+                          static_cast<int>(per_token));
+  }
 }
 
-static void dump_prefill_attention_output(int layer, int pos,
+static void dump_prefill_attention_output(int layer, int pos_base, int S,
                                           const void *device_output,
                                           int d_model) {
   const char *base = prefill_boundary_dump_base();
-  if (!base || !device_output || d_model <= 0 ||
-      !prefill_boundary_dump_layer_selected(layer) ||
-      pos < prefill_boundary_dump_first_pos() ||
-      pos > prefill_boundary_dump_last_pos())
+  if (!base || !device_output || d_model <= 0 || S <= 0 ||
+      !prefill_boundary_dump_layer_selected(layer))
     return;
-  std::vector<float> host(static_cast<size_t>(d_model));
+  // Any requested absolute position inside [pos_base, pos_base+S) is
+  // servable from one full-batch download -- batched (S>1) prefill calls
+  // this once per layer with the whole chunk, not once per token, so the
+  // old S=1-only version could never answer a batched-mode boundary dump.
+  bool any_in_range = false;
+  for (int i = 0; i < S; ++i) {
+    const int pos = pos_base + i;
+    if (pos >= prefill_boundary_dump_first_pos() &&
+        pos <= prefill_boundary_dump_last_pos()) {
+      any_in_range = true;
+      break;
+    }
+  }
+  if (!any_in_range) return;
+  std::vector<float> host((size_t)S * d_model);
   if (!qwen4exp_copy_gdn_device_output_to_host(device_output, host.data(),
-                                                /*S=*/1)) {
+                                                S)) {
     LOG_STREAM_WARN() << "[PREFILL-BOUNDARY] failed to copy attention output "
-                      << "layer=" << layer << " pos=" << pos << "\n";
+                      << "layer=" << layer << " pos_base=" << pos_base << "\n";
     return;
   }
-  dump_prefill_boundary("attn_out", layer, pos, host.data(), d_model);
+  for (int i = 0; i < S; ++i) {
+    const int pos = pos_base + i;
+    dump_prefill_boundary("attn_out", layer, pos,
+                          host.data() + (size_t)i * d_model, d_model);
+  }
 }
 
 void diag_reset_layer_loop_total() {
@@ -1083,9 +1111,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // exact boundary that must equal Bee's previous l_last plus its PLE
       // gated-value and causal-convolution outputs.  The helper is fully
       // gated by MOESTREAM_PREFILL_BOUNDARY_DUMP and is a no-op normally.
-      if (S == 1)
-        dump_prefill_hc_streams("hc_streams_post_layer_input", l, pos_base,
-                                c.hc_mult, D);
+      dump_prefill_hc_streams("hc_streams_post_layer_input", l, pos_base, S,
+                              c.hc_mult, D);
       if (S == 1)
         g_diag_decode_layer_input_ms +=
             std::chrono::duration<double, std::milli>(
@@ -1131,12 +1158,14 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               std::chrono::high_resolution_clock::now() -
               diag_attn_call_start)
               .count();
-    if (S == 1 && engine.qwen4exp_device_attn_output_ready)
-      dump_prefill_attention_output(l, pos_base,
+    if (engine.qwen4exp_device_attn_output_ready)
+      dump_prefill_attention_output(l, pos_base, S,
                                     engine.qwen4exp_device_attn_output, D);
-    if (S == 1 && !engine.qwen4exp_device_attn_output_ready)
-      dump_prefill_boundary("attn_out", l, pos_base,
-                            scratch.attn_out.data() + (size_t)(S - 1) * D, D);
+    if (!engine.qwen4exp_device_attn_output_ready) {
+      for (int i = 0; i < S; ++i)
+        dump_prefill_boundary("attn_out", l, pos_base + i,
+                              scratch.attn_out.data() + (size_t)i * D, D);
+    }
     bool attn_device_consumed = false;
     if (engine.qwen4exp_device_attn_output_ready) {
       if (engine.qwen4exp_device_attn_output_raw) {
@@ -1187,9 +1216,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_post_ms += elapsed;
       }
     }
-    if (S == 1)
-      dump_prefill_hc_streams("hc_streams_post_attn", l, pos_base,
-                              c.hc_mult, D);
+    dump_prefill_hc_streams("hc_streams_post_attn", l, pos_base, S,
+                            c.hc_mult, D);
 
     // Per-layer, per-stage checkpoint: pinpoints the FIRST layer/stage
     // where hidden_states goes non-finite, instead of only learning
@@ -1199,8 +1227,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // NaN/Inf, so this is cheap on the (expected) all-finite path.
     check_finite("hidden_states (post attention residual)", l, -1,
                  hidden_states, (size_t)n);
-    if (S == 1)
-      dump_prefill_boundary("post_attn", l, pos_base, last_tok, D);
+    for (int i = 0; i < S; ++i)
+      dump_prefill_boundary("post_attn", l, pos_base + i,
+                            hidden_states + (size_t)i * D, D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-attn |attn_out|="
                            << l2norm(scratch.attn_out.data() +
@@ -1367,14 +1396,14 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // scheduler result is still device-resident.
       const bool boundary_requested = prefill_boundary_dump_base() != nullptr;
       if (trace || boundary_requested) {
-        if (scratch.moe_device_runner)
-          copied_device_output = scratch.moe_device_runner
-                                     ->copy_device_output_to_host(
-                                         scratch.moe_device_output,
-                                         scratch.moe_out.data());
-        else if (scratch.moe_shared_device_output)
+        if (scratch.moe_shared_device_output)
           copied_device_output = GgmlQwenSharedRunner::instance_for_layer(l)
                                      .copy_output_to_host(
+                                         scratch.moe_device_output,
+                                         scratch.moe_out.data());
+        else if (scratch.moe_device_runner)
+          copied_device_output = scratch.moe_device_runner
+                                     ->copy_device_output_to_host(
                                          scratch.moe_device_output,
                                          scratch.moe_out.data());
         if (!copied_device_output) {
@@ -1392,15 +1421,15 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               ? GgmlQwenSharedRunner::instance_for_layer(l).output_done_event()
               : nullptr);
       if (!moe_device_consumed) {
-        if (!copied_device_output && scratch.moe_device_runner)
-          copied_device_output =
-              scratch.moe_device_runner->copy_device_output_to_host(
-                  scratch.moe_device_output, scratch.moe_out.data());
-        else if (!copied_device_output && scratch.moe_shared_device_output)
+        if (!copied_device_output && scratch.moe_shared_device_output)
           copied_device_output = GgmlQwenSharedRunner::instance_for_layer(l)
                                      .copy_output_to_host(
                                          scratch.moe_device_output,
                                          scratch.moe_out.data());
+        else if (!copied_device_output && scratch.moe_device_runner)
+          copied_device_output =
+              scratch.moe_device_runner->copy_device_output_to_host(
+                  scratch.moe_device_output, scratch.moe_out.data());
         if (!copied_device_output)
           LOG_ERROR("[GGML-MOE] Qwen4Exp device output fallback copy failed at "
                     "layer=%d\n",
@@ -1410,6 +1439,27 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       scratch.moe_device_runner = nullptr;
       scratch.moe_shared_device_output = false;
       scratch.moe_device_output_ready = false;
+      // TEMP DIAGNOSTIC: the last layer's FFN post-combine is the one HC
+      // residual update no later layer's own hc_pre_mix ever re-validates
+      // (every other layer's corruption would show up as that layer's own
+      // "post qwen4exp hc_pre_mix, ggml" check the very next iteration) --
+      // it's only ever checked once, at hc_collapse_output, after the whole
+      // 48-layer pass. Read it back right here instead, so a NaN at collapse
+      // can be attributed to this exact point instead of "somewhere in 48
+      // layers".
+      if (l == c.n_layers - 1 && std::getenv("MOESTREAM_LAST_LAYER_HC_TRACE")) {
+        std::vector<float> probe((size_t)S * D * c.hc_mult);
+        if (GgmlHcRunner::instance().download_streams(probe.data(), S)) {
+          size_t nan_count = 0;
+          for (float v : probe)
+            if (!std::isfinite(v)) ++nan_count;
+          LOG_ERROR("[LAST-LAYER-HC-TRACE] layer=%d after FFN post_combine: "
+                    "%zu/%zu non-finite\n",
+                    l, nan_count, probe.size());
+        } else {
+          LOG_ERROR("[LAST-LAYER-HC-TRACE] layer=%d download_streams failed\n", l);
+        }
+      }
     }
     if (!moe_device_consumed) {
       // Missing timer found investigating a large gap between [REQUEST]'s
@@ -1434,14 +1484,14 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_post_ms += elapsed;
       }
     }
-    if (S == 1)
-      dump_prefill_hc_streams("hc_streams_post_ffn", l, pos_base,
-                              c.hc_mult, D);
+    dump_prefill_hc_streams("hc_streams_post_ffn", l, pos_base, S,
+                            c.hc_mult, D);
 
     check_finite("hidden_states (post FFN/MoE residual)", l, -1, hidden_states,
                  (size_t)n);
-    if (S == 1)
-      dump_prefill_boundary("post_ffn", l, pos_base, last_tok, D);
+    for (int i = 0; i < S; ++i)
+      dump_prefill_boundary("post_ffn", l, pos_base + i,
+                            hidden_states + (size_t)i * D, D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-ffn  |moe_out|="
                            << l2norm(scratch.moe_out.data() +

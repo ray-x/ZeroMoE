@@ -71,6 +71,20 @@ inline void dump_decode_logits_if_enabled(int step, const float *logits,
               static_cast<std::streamsize>(n * sizeof(float)));
 }
 
+// Diagnostic-only capture of the final collapsed hidden row immediately
+// before output.weight. This separates prefill/trunk drift from an
+// output-projection-only difference during Bee/llama parity checks.
+inline void dump_prefill_final_hidden_if_enabled(int step, const float *hidden,
+                                                  size_t n) {
+    static const char *path = std::getenv("MOESTREAM_PREFILL_FINAL_HIDDEN_DUMP");
+    if (step != 0 || !path || !path[0] || !hidden || n == 0)
+        return;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out)
+        out.write(reinterpret_cast<const char *>(hidden),
+                  static_cast<std::streamsize>(n * sizeof(float)));
+}
+
 // Diagnostic-only full-vector checksum.  Hash the raw float bytes before the
 // repetition penalty mutates the working logits, so baseline and teacher-
 // forced runs compare the actual model output rather than sampler state.
@@ -901,6 +915,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         }
 
         const float* last_hidden = hidden_states.data() + ((hidden_states.size() / D - 1) * D);
+        dump_prefill_final_hidden_if_enabled(step, last_hidden, (size_t)D);
 
         // The opt-in Qwen full decode graph can publish next-token logits
         // while it executes the trunk. Consume those once; all other models

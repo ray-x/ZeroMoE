@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -1602,6 +1603,44 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
         (backend_weight_event_next_ + 1) % NWEIGHT_EVENTS;
     if (trace_backend_calls())
       LOG_INFO("[GGML-MOE-TRACE] weight completion event recorded\n");
+  }
+
+  // Opt-in Layer-0 A/A diagnostic.  The first runner invocation in the
+  // unbatched Qwen replay is layer 0; export the native GGML intermediates so
+  // the routed FFN can be compared against Bee's ffn_moe_down dump.  This is
+  // intentionally synchronizing and never runs without the diagnostic flag.
+  if (const char *dump_base = std::getenv("MOESTREAM_GGML_MOE_DUMP")) {
+    static std::atomic<bool> dumped_first_runner{false};
+    bool expected = false;
+    if (dumped_first_runner.compare_exchange_strong(
+            expected, true, std::memory_order_relaxed)) {
+      ggml_backend_synchronize((ggml_backend_t)backend_);
+      auto dump_tensor = [&](const char *label, void *opaque) {
+        const ggml_tensor *tensor = (const ggml_tensor *)opaque;
+        if (!tensor || !tensor->data) return;
+        const size_t elements = (size_t)ggml_nelements(tensor);
+        std::vector<float> host(elements);
+        if (cudaMemcpy(host.data(), tensor->data,
+                       elements * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+          return;
+        std::string path = std::string(dump_base) + "." + label + ".f32";
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (out)
+          out.write(reinterpret_cast<const char *>(host.data()),
+                    static_cast<std::streamsize>(elements * sizeof(float)));
+        LOG_INFO("[GGML-MOE-DUMP] %s elements=%zu type=%u ne=%lld,%lld,%lld,%lld path=%s\n",
+                 label, elements, (unsigned)tensor->type,
+                 (long long)tensor->ne[0], (long long)tensor->ne[1],
+                 (long long)tensor->ne[2], (long long)tensor->ne[3],
+                 path.c_str());
+      };
+      dump_tensor("gate", graph_gate_out_);
+      dump_tensor("up", graph_up_out_);
+      dump_tensor("act", graph_act_out_);
+      dump_tensor("down", graph_down_out_);
+      dump_tensor("out", graph_out_);
+    }
   }
 
   // Diagnostic only. The asynchronous path normally lets the next layer

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <numeric>
 #include <string>
@@ -86,6 +87,7 @@ void GgmlQwenSharedRunner::free_graph() {
   }
   graph_ = overlap_shared_graph_ = overlap_combine_graph_ = nullptr;
   x_ = routed_ = output_ = nullptr;
+  shared_raw_ = shared_ = nullptr;
   overlap_x_ = overlap_routed_ = overlap_shared_input_ = nullptr;
   overlap_shared_output_ = overlap_combined_ = nullptr;
   x_owned_data_ = routed_owned_data_ = nullptr;
@@ -285,6 +287,8 @@ bool GgmlQwenSharedRunner::build_graph() {
   x_ = x;
   routed_ = routed;
   output_ = combined;
+  shared_raw_ = shared_nodes.shared_raw;
+  shared_ = shared_nodes.shared;
   x_owned_data_ = x->data;
   routed_owned_data_ = routed->data;
   graph_ready_ = true;
@@ -546,6 +550,31 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
       src->nb[1] != (size_t)d_model_ * sizeof(float) || !src->data ||
       !src->buffer)
     return fail("routed input tensor validation", hc_in, src);
+
+  // Opt-in A/A diagnostic for the first FFN boundary.  The routed tensor is
+  // the output of GgmlMoeRunner; the combined tensor is the result of this
+  // shared+routed graph.  Keep this synchronizing path strictly diagnostic.
+  const char *dump_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP");
+  const bool dump_ffn = dump_base && n_tokens_ == 1 && layer < 3;
+  auto dump_device_f32 = [&](const char *label, const ggml_tensor *tensor) {
+    if (!dump_ffn || !tensor || !tensor->data) return;
+    cudaSetDevice(device_);
+    if (cudaDeviceSynchronize() != cudaSuccess) return;
+    const size_t n = (size_t)ggml_nelements(tensor);
+    std::vector<float> host(n);
+    if (cudaMemcpy(host.data(), tensor->data,
+                   host.size() * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+      return;
+    std::string path = std::string(dump_base) + ".l" +
+                       (layer < 10 ? "0" : "") + std::to_string(layer) +
+                       ".s1." + label + ".f32";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out)
+      out.write(reinterpret_cast<const char *>(host.data()),
+                static_cast<std::streamsize>(host.size() * sizeof(float)));
+  };
+  dump_device_f32("routed_in", src);
   const bool direct_inputs = use_direct_shared_inputs();
   if (direct_inputs) {
     // Match GgmlRouterRunner's already-validated direct-input optimization.
@@ -579,6 +608,48 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
     return fail("graph compute", hc_in, src);
   if (!record_output_event())
     return fail("output event record", hc_in, src);
+  // 2026-09-24: real, reproduced GPU correctness bug (found via device-side
+  // kernel tracing, not a race). ggml-cuda's mul_mat(down_weight[Q8_0],
+  // activation) for this shared-expert down-projection can produce NaN in
+  // exactly the LAST output row (d_model-1) for every token, only for
+  // batched (n_tokens_>1, i.e. prefill) calls -- confirmed reproducible on
+  // qwen3.8-flash-next layer 11 with clean, verified-finite weight bytes
+  // (checked against the GGUF file) and a clean, verified-finite activation
+  // input; S=1 decode calls with the identical weights never showed it. The
+  // corrupted value then silently poisons the persistent HC stream state for
+  // the rest of generation (`!!!!!!!!!!` output). Root cause is presumably a
+  // narrow ggml-cuda kernel-selection edge case for this exact (K=640,
+  // M=2560, N>1, Q8_0) shape; rather than patch vendored ggml-cuda, detect
+  // and refuse the corrupted result here so the caller's already-established
+  // host-shared-expert fallback (see batched_dispatch_pipeline.cpp) recovers
+  // instead of propagating NaN. Scoped to n_tokens_>1 to keep the decode hot
+  // path (S=1, called every layer every token) exactly as fast as before --
+  // that path was never observed to reproduce this.
+  if (n_tokens_ > 1) {
+    cudaSetDevice(device_);
+    cudaDeviceSynchronize();
+    const size_t n = (size_t)d_model_ * n_tokens_;
+    static thread_local std::vector<float> finite_check;
+    finite_check.resize(n);
+    const ggml_tensor *out_t = (const ggml_tensor *)output_;
+    const cudaError_t e = cudaMemcpy(finite_check.data(), out_t->data,
+                                     n * sizeof(float), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess)
+      return fail("output finiteness readback", hc_in, src);
+    for (float v : finite_check) {
+      if (!std::isfinite(v)) {
+        LOG_ERROR("[GGML-SHARED] layer=%d S=%d: non-finite value in shared+"
+                  "routed FFN output -- rejecting device result, falling "
+                  "back to host shared-expert path\n",
+                  layer, n_tokens_);
+        return fail("non-finite shared output", hc_in, src);
+      }
+    }
+  }
+  dump_device_f32("shared_raw", (const ggml_tensor *)shared_raw_);
+  dump_device_f32("shared_gated", (const ggml_tensor *)shared_);
+  if (dump_ffn)
+    dump_device_f32("combined_out", (const ggml_tensor *)output_);
   // In the conservative mode, preserve the old request-local completion
   // fence.  In direct-input/async-reuse mode the next operation is HC
   // post-combine on this same backend, so its queued tensor copy is the
@@ -671,6 +742,55 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
   }
   if (!record_output_event())
     return false;
+  // The CPU-affinity Qwen path uses run_host_routed(), not run().  Keep the
+  // same opt-in shared-expert snapshots on this production entry point so an
+  // A/A comparison cannot accidentally observe only the host fallback.
+  if (n_tokens_ == 1 && layer < 3) {
+    const char *dump_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP");
+    if (dump_base) {
+      cudaSetDevice(device_);
+      if (cudaDeviceSynchronize() == cudaSuccess) {
+        auto dump = [&](const char *label, const ggml_tensor *tensor) {
+          if (!tensor || !tensor->data) return;
+          const size_t n = (size_t)ggml_nelements(tensor);
+          std::vector<float> host(n);
+          if (cudaMemcpy(host.data(), tensor->data,
+                         n * sizeof(float), cudaMemcpyDeviceToHost) !=
+              cudaSuccess)
+            return;
+          std::string path = std::string(dump_base) + ".l" +
+                             (layer < 10 ? "0" : "") + std::to_string(layer) +
+                             ".s1." + label + ".f32";
+          std::ofstream out(path, std::ios::binary | std::ios::trunc);
+          if (out)
+            out.write(reinterpret_cast<const char *>(host.data()),
+                  static_cast<std::streamsize>(n * sizeof(float)));
+        };
+        // Capture the exact shared-expert input for the canonical GGML path;
+        // this lets the A/A comparison distinguish a producer mismatch from
+        // a Q5_K/Q8_0 projection-kernel mismatch.
+        if (hc_in->data) {
+          std::vector<float> host((size_t)d_model_ * n_tokens_);
+          if (cudaMemcpy(host.data(), hc_in->data,
+                         host.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost) == cudaSuccess) {
+            std::ofstream out(std::string(dump_base) + ".l" +
+                                  (layer < 10 ? "0" : "") +
+                                  std::to_string(layer) +
+                                  ".s1.shared_input.f32",
+                              std::ios::binary | std::ios::trunc);
+            if (out)
+              out.write(reinterpret_cast<const char *>(host.data()),
+                        static_cast<std::streamsize>(host.size() *
+                                                     sizeof(float)));
+          }
+        }
+        dump("shared_raw", (const ggml_tensor *)shared_raw_);
+        dump("shared_gated", (const ggml_tensor *)shared_);
+        dump("combined_out", (const ggml_tensor *)output_);
+      }
+    }
+  }
   if (!direct_inputs)
     ggml_backend_synchronize((ggml_backend_t)backend_);
   *combined_output = output_;
@@ -783,6 +903,34 @@ bool GgmlQwenSharedRunner::run_device_routed_add(
       !base_output->buffer)
     return false;
 
+  // Opt-in A/A diagnostic: export the two inputs to the final shared+routed
+  // add before the combine graph runs.  This is deliberately a synchronizing
+  // path and is never enabled during normal inference.
+  if (n_tokens_ == 1 && layer < 3) {
+    const char *dump_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP");
+    if (dump_base) {
+      cudaSetDevice(device_);
+      cudaDeviceSynchronize();
+      auto dump = [&](const char *label, const ggml_tensor *tensor) {
+        if (!tensor || !tensor->data) return;
+        std::vector<float> host((size_t)d_model_);
+        if (cudaMemcpy(host.data(), tensor->data,
+                       host.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+          return;
+        std::string path = std::string(dump_base) + ".l" +
+                           (layer < 10 ? "0" : "") + std::to_string(layer) +
+                           ".s1." + label + ".f32";
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (out)
+          out.write(reinterpret_cast<const char *>(host.data()),
+                    static_cast<std::streamsize>(host.size() * sizeof(float)));
+      };
+      dump("shared_out", base_output);
+      dump("routed_out", (const ggml_tensor *)device_routed);
+    }
+  }
+
   // The graph owns the tensor metadata and buffer association.  Retargeting
   // only `data` is the same external-pointer protocol used by the shared-only
   // path; both pointers are device-resident and the caller has already
@@ -809,9 +957,34 @@ void *GgmlQwenSharedRunner::backend_stream() const {
 bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
                                                float *host_out) {
   if (!backend_ || !graph_ready_ || !combined_output || !host_out ||
-      combined_output != output_)
+      (combined_output != output_ && combined_output != overlap_combined_)) {
+    const char *diag = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+    if (diag) {
+      LOG_ERROR("[GGML-SHARED-DIAG] output copy rejected backend=%d ready=%d "
+                "arg=%p output=%p overlap=%p host=%p\n",
+                backend_ ? 1 : 0, graph_ready_ ? 1 : 0, combined_output,
+                output_, overlap_combined_, (void *)host_out);
+    }
     return false;
+  }
   cudaSetDevice(device_);
+  const ggml_tensor *tensor =
+      (const ggml_tensor *)combined_output;
+  if (!tensor->data || tensor->type != GGML_TYPE_F32 ||
+      tensor->ne[0] != d_model_ || tensor->ne[1] < n_tokens_ ||
+      tensor->nb[0] != sizeof(float) ||
+      tensor->nb[1] != (size_t)d_model_ * sizeof(float)) {
+    const char *diag = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+    if (diag) {
+      LOG_ERROR("[GGML-SHARED-DIAG] output tensor rejected data=%p type=%u "
+                "ne=%lld,%lld nb=%zu,%zu expected=%d,%d,%zu\n",
+                tensor->data, (unsigned)tensor->type,
+                (long long)tensor->ne[0], (long long)tensor->ne[1],
+                tensor->nb[0], tensor->nb[1], d_model_, n_tokens_,
+                (size_t)d_model_ * sizeof(float));
+    }
+    return false;
+  }
   const size_t bytes = (size_t)d_model_ * n_tokens_ * sizeof(float);
   ggml_backend_tensor_get((ggml_tensor *)combined_output, host_out, 0, bytes);
   return true;

@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <fstream>
 #include <immintrin.h>
 #include <limits>
 #include <sstream>
@@ -245,6 +246,39 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
     return;
   PERF_SCOPE(t_shared_expert_total);
   const int shared_inter = moe_inter * c.n_expert_shared;
+  // Opt-in first-token snapshot for the A/A boundary audit.  This is kept on
+  // the real host-shared fallback path because that is the path used when the
+  // optional device shared graph is unavailable.  Normal execution does not
+  // allocate or copy anything here.
+  const char *diag_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP");
+  static std::atomic<bool> diag_dumped{false};
+  const bool diag = diag_base && layer_idx == 0 && S == 1 &&
+                    !diag_dumped.load(std::memory_order_relaxed);
+  auto dump_diag = [&](const char *label, const float *data, size_t n) {
+    if (!diag || !data || !n) return;
+    std::ofstream out(std::string(diag_base) + ".l00.s1." + label + ".f32",
+                      std::ios::binary | std::ios::trunc);
+    if (out)
+      out.write(reinterpret_cast<const char *>(data),
+                static_cast<std::streamsize>(n * sizeof(float)));
+  };
+  dump_diag("host_shared_input", normed, (size_t)S * D);
+  if (diag) {
+    auto log_dense_path = [&](const char *label, const std::string &name) {
+      auto it = engine.resident_layers.find(name);
+      if (it == engine.resident_layers.end()) return;
+      LOG_ERROR("[DIAG-SHARED] layer=%d %s type=%u device=%d fast=%d bytes=%zu\n",
+                layer_idx, label, (unsigned)it->second.meta.type,
+                it->second.device_ptr ? 1 : 0,
+                it->second.gpu_fast_ptr ? 1 : 0,
+                it->second.meta.size_bytes);
+    };
+    log_dense_path("gate", prefix + "ffn_gate_shexp.weight");
+    log_dense_path("up", prefix + "ffn_up_shexp.weight");
+    log_dense_path("down", prefix + "ffn_down_shexp.weight");
+    log_dense_path("gate_inp", prefix + "ffn_gate_inp_shexp.weight");
+  }
+  dump_diag("host_shared_routed_before", output, (size_t)S * D);
     if (!scratch.gate_buf.resize((size_t)S * shared_inter, "shared_gate_buf") ||
       !scratch.up_buf.resize((size_t)S * shared_inter, "shared_up_buf") ||
       !scratch.down_buf.resize((size_t)S * D, "shared_down_buf")) {
@@ -290,6 +324,11 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
       (!engine.resident_layers.count(gate_inp_name) ||
        original_gpu_projection(gate_inp_name));
   const bool reuse_this_call = reuse_shared_input && reuse_capable;
+  const bool force_cpu_shared = [] {
+    const char *e = std::getenv("MOESTREAM_QWEN_SHARED_CPU_ORACLE");
+    return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
+                 e[0] == 't' || e[0] == 'T');
+  }();
   if (reuse_this_call) {
     static bool logged_reuse = false;
     if (!logged_reuse) {
@@ -301,6 +340,13 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   bool shared_input_uploaded = false;
   auto shared_dense_proj = [&](const std::string &wname, const float *x,
                                float *y, int in, int out) {
+    if (force_cpu_shared) {
+      auto it = engine.resident_layers.find(wname);
+      if (it != engine.resident_layers.end() && it->second.host_ptr &&
+          cpu_quant_matmul(it->second.meta.type, it->second.host_ptr, x, y,
+                           S, in, out))
+        return;
+    }
     if (reuse_this_call && x == normed && in == D) {
       if (!shared_input_uploaded)
         shared_input_uploaded =
@@ -316,6 +362,10 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
                     scratch.gate_buf.data(), D, shared_inter);
   shared_dense_proj(up_name, normed,
                     scratch.up_buf.data(), D, shared_inter);
+  dump_diag("host_shared_gate_logits", scratch.gate_buf.data(),
+            (size_t)S * shared_inter);
+  dump_diag("host_shared_up_logits", scratch.up_buf.data(),
+            (size_t)S * shared_inter);
   const float clamp = (layer_idx < (int)c.swiglu_clamp_shexp.size())
                           ? c.swiglu_clamp_shexp[(size_t)layer_idx]
                           : 0.0f;
@@ -328,8 +378,11 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
              scratch.up_buf.data(), S * shared_inter);
     swiglu_clamp_inplace(scratch.gate_buf.data(), S * shared_inter, clamp);
   }
+  dump_diag("host_shared_activation", scratch.gate_buf.data(),
+            (size_t)S * shared_inter);
   dense_proj(engine, prefix + "ffn_down_shexp.weight", scratch.gate_buf.data(),
              scratch.down_buf.data(), S, shared_inter, D);
+  dump_diag("host_shared_raw", scratch.down_buf.data(), (size_t)S * D);
 
   std::vector<float> gate((size_t)S, 1.0f);
   if (engine.resident_layers.count(gate_inp_name)) {
@@ -340,6 +393,14 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   }
   if (shared_input_uploaded && engine.gpu)
     engine.gpu->dense_matmul_host_release_input();
+  if (diag) {
+    std::vector<float> gated((size_t)S * D);
+    for (int s = 0; s < S; ++s)
+      for (int d = 0; d < D; ++d)
+        gated[(size_t)s * D + d] =
+            gate[(size_t)s] * scratch.down_buf[(size_t)s * D + d];
+    dump_diag("host_shared_gated", gated.data(), gated.size());
+  }
   for (int s = 0; s < S; ++s) {
     float *dst = output + (size_t)s * D;
     const float *src = scratch.down_buf.data() + (size_t)s * D;
@@ -347,6 +408,9 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
     for (int d = 0; d < D; ++d)
       dst[d] += g * src[d];
   }
+  dump_diag("host_shared_combined", output, (size_t)S * D);
+  if (diag)
+    diag_dumped.store(true, std::memory_order_relaxed);
   if (std::getenv("MOESTREAM_QWEN_SHARED_REUSE_DEBUG") && S == 1) {
     auto checksum = [](const float *p, size_t n) {
       double sum = 0.0;

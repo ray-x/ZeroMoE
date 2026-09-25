@@ -621,6 +621,11 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
   ple_grouped_norm(gated.data(), norm_conv_w.data(), conv_in.data(), S, hc_dim, D, c.eps);
   ple_diag_dump("ple_conv_normed", layer_idx, pos_base, conv_in.data(),
                 conv_in.size());
+  // Opt-in parity snapshot of the recurrent state immediately before this
+  // call's depthwise convolution. The existing position selector ensures
+  // this adds no work or file output during ordinary inference.
+  ple_diag_dump("ple_conv_history", layer_idx, pos_base, conv_hist.data(),
+                conv_hist.size());
 
   std::vector<float> conv_out((size_t)S * hc_dim);
 #pragma omp parallel for schedule(static)

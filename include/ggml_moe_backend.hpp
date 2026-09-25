@@ -318,6 +318,9 @@ class GgmlQwenSharedRunner {
   void *x_ = nullptr;           // ggml_tensor* [D,S]
   void *routed_ = nullptr;     // ggml_tensor* [D,S]
   void *output_ = nullptr;     // ggml_tensor* [D,S]
+  // Graph-owned shared-expert nodes retained for opt-in parity diagnostics.
+  void *shared_raw_ = nullptr; // ggml_tensor* [D,S], before scalar gate
+  void *shared_ = nullptr;     // ggml_tensor* [D,S], after scalar gate
   void *overlap_x_ = nullptr;   // ggml_tensor* [D,S]
   void *overlap_routed_ = nullptr; // ggml_tensor* [D,S]
   void *overlap_shared_input_ = nullptr; // ggml_tensor* [D,S]

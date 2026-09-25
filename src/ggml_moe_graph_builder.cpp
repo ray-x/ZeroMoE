@@ -105,13 +105,14 @@ SharedGraphNodes build_shared_topology(
           : nullptr;
   if (clamp > 0.0f && result.activation)
     result.activation = ggml_clamp(ctx, result.activation, -clamp, clamp);
-  result.shared = result.activation
-                      ? ggml_mul_mat(ctx, down_weight, result.activation)
-                      : nullptr;
-  if (gate_input_weight && result.shared) {
+  result.shared_raw = result.activation
+                          ? ggml_mul_mat(ctx, down_weight, result.activation)
+                          : nullptr;
+  result.shared = result.shared_raw;
+  if (gate_input_weight && result.shared_raw) {
     ggml_tensor *scalar =
         ggml_sigmoid(ctx, ggml_mul_mat(ctx, gate_input_weight, input));
-    result.shared = scalar ? ggml_mul(ctx, result.shared, scalar) : nullptr;
+    result.shared = scalar ? ggml_mul(ctx, result.shared_raw, scalar) : nullptr;
   }
   result.combined =
       routed && result.shared ? ggml_add(ctx, routed, result.shared)

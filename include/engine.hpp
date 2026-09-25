@@ -491,6 +491,23 @@ public:
     bool qwen4exp_cpu_offload_event_fence = false;
     int qwen4exp_cpu_offload_ring_slots = 2;
 
+    // GPU staging for host-resident decode layers -- see
+    // EngineConfig::qwen4exp_gpu_stage_enabled's own comment for the design.
+    // qwen4exp_gpu_stage_layers must stay sorted (main.cpp sorts+dedupes it
+    // at startup, same convention as qwen4exp_cpu_offload_layers) so the
+    // binary_search below is valid.
+    bool qwen4exp_gpu_stage_enabled = false;
+    std::vector<int> qwen4exp_gpu_stage_layers;
+
+    // Decode-only router-usage tap: batches every layer's real routed
+    // `ids` into one on-device accumulator per token (ordinary ggml_concat
+    // nodes, no host bridge), then ONE D2H + ONE host callback per token
+    // bumps route_freq for all layers at once -- see
+    // Qwen4ExpUsageTrackContext (ggml_qwen4exp_graph.cpp) for why this
+    // beats a per-layer host-node tap. Off by default: real per-token
+    // overhead, only worth paying during a usage survey.
+    bool qwen4exp_track_router_usage = false;
+
     bool qwen4exp_option_b_layer_enabled(int layer) const {
       if (!qwen4exp_option_b_committed)
         return false;
@@ -517,6 +534,13 @@ public:
         return false;
       return std::binary_search(qwen4exp_cpu_offload_layers.begin(),
                                 qwen4exp_cpu_offload_layers.end(), layer);
+    }
+
+    bool qwen4exp_gpu_stage_layer_enabled(int layer) const {
+      if (!qwen4exp_gpu_stage_enabled || layer < 0)
+        return false;
+      return std::binary_search(qwen4exp_gpu_stage_layers.begin(),
+                                qwen4exp_gpu_stage_layers.end(), layer);
     }
 
     // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not

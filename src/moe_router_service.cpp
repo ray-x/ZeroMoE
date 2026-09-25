@@ -32,6 +32,7 @@
 #include <cstring>
 #include <cuda_runtime.h>
 #include <immintrin.h>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -62,6 +63,52 @@ extern bool qwen4exp_hc_commit_host_layer_input(StreamingEngine &engine,
                                                 int layer_idx, int S);
 extern bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
                                                     float *host, int S);
+
+// Opt-in router oracle dump.  This is deliberately kept local to the router
+// service because the existing execution-layer boundary dump only sees the
+// selected top-k values.  Comparing all n_experts probabilities distinguishes
+// projection/input drift from top-k gather/normalization drift.
+static void dump_qwen_router_probs_diag(int layer, const float *data,
+                                        int n_experts) {
+  const char *base = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+  const char *layer_env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAYER");
+  if (!base || !data || n_experts <= 0 ||
+      (layer_env && std::atoi(layer_env) >= 0 &&
+       std::atoi(layer_env) != layer))
+    return;
+
+  // The unbatched parity harness invokes each layer once per prompt token.
+  // Include that per-layer invocation index in the filename; the old fixed
+  // `.p0` suffix silently overwrote every replay except the final one.
+  static std::array<std::atomic<uint64_t>, 256> layer_invocations{};
+  const uint64_t position =
+      layer >= 0 && layer < (int)layer_invocations.size()
+          ? layer_invocations[(size_t)layer].fetch_add(
+                1, std::memory_order_relaxed)
+          : 0;
+
+  const std::string path = std::string(base) + ".l" +
+                           (layer < 10 ? "0" : "") + std::to_string(layer) +
+                           ".p" + std::to_string(position) +
+                           ".router_probs.f32";
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  if (!output)
+    return;
+  output.write(reinterpret_cast<const char *>(data),
+               static_cast<std::streamsize>(n_experts * sizeof(float)));
+  output.close();
+  uint64_t hash = 1469598103934665603ULL;
+  const auto *bytes = reinterpret_cast<const uint8_t *>(data);
+  for (size_t i = 0; i < static_cast<size_t>(n_experts) * sizeof(float); ++i) {
+    hash ^= bytes[i];
+    hash *= 1099511628211ULL;
+  }
+  LOG_STREAM_INFO() << "[PREFILL-BOUNDARY] layer=" << layer
+                    << " pos=" << position
+                    << " label=router_probs elements=" << n_experts
+                    << " fnv64=0x" << std::hex << hash << std::dec
+                    << " path=" << path << "\n";
+}
 
 #include "moe_pipeline_internal.hpp"
 #include "moe_router_service.hpp"
@@ -1322,6 +1369,9 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       // nothing upstream would ever catch it.
       check_finite("router_logits (post gate_inp matmul + gating)", layer_idx,
                    -1, scratch.router_logits.data(), (size_t)S * n_experts);
+      if (S == 1)
+        dump_qwen_router_probs_diag(layer_idx, scratch.router_logits.data(),
+                                    n_experts);
     }
   }
 

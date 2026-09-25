@@ -239,6 +239,13 @@ class GgmlHcRunner {
   struct PreGraphSlot {
     void *ctx = nullptr;    // ggml_context*
     void *graph = nullptr;  // ggml_cgraph*
+    // Opt-in numerical audit handles for the pre-mix graph's internal F32
+    // intermediates. Read only when MOESTREAM_GGML_HC_INTERNAL_DUMP is set.
+    void *diag_normed = nullptr;
+    void *diag_lowrank_silu = nullptr;
+    void *diag_gate = nullptr;
+    void *diag_mixed = nullptr;
+    void *diag_inject = nullptr;
     void *norm = nullptr;   // ggml_tensor* (fixed weight source)
     void *down = nullptr;
     void *up = nullptr;

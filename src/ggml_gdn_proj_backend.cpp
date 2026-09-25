@@ -57,10 +57,34 @@ bool gdn_diag_enabled() {
   return enabled;
 }
 
-void gdn_diag_dump(const char *base, const char *label, int layer, int S,
-                   ggml_tensor *tensor) {
+int &gdn_diag_call_counter() {
+  static int call_index = -1;
+  return call_index;
+}
+
+// Diagnostic range, configurable so a full token-by-token walk (finding the
+// FIRST position where GDN's recurrent state starts to diverge) doesn't need
+// a rebuild every time; unset env vars keep the original hardcoded 10/11.
+int gdn_diag_first_pos() {
+  static const int v = [] {
+    const char *e = std::getenv("MOESTREAM_GDN_DIAG_FIRST_POS");
+    return e ? std::atoi(e) : 10;
+  }();
+  return v;
+}
+int gdn_diag_last_pos() {
+  static const int v = [] {
+    const char *e = std::getenv("MOESTREAM_GDN_DIAG_LAST_POS");
+    return e ? std::atoi(e) : 11;
+  }();
+  return v;
+}
+
+void gdn_diag_dump_at(const char *base, const char *label, int layer, int S,
+                      int call_index, ggml_tensor *tensor) {
   if (!gdn_diag_enabled() || !base || !label || layer != 0 || S != 1 ||
-      !tensor)
+      !tensor || call_index < gdn_diag_first_pos() ||
+      call_index > gdn_diag_last_pos())
     return;
   const size_t elements = ggml_nelements(tensor);
   if (elements == 0 || elements > (size_t)64 * 1024 * 1024)
@@ -68,14 +92,25 @@ void gdn_diag_dump(const char *base, const char *label, int layer, int S,
   std::vector<float> values(elements);
   ggml_backend_tensor_get(tensor, values.data(), 0,
                           elements * sizeof(float));
-  const std::string path = std::string(base) + ".l00.p0." + label + ".f32";
+  const std::string path = std::string(base) + ".l00.p" +
+                           (call_index < 10 ? "0" : "") +
+                           std::to_string(call_index) + "." + label + ".f32";
   std::ofstream output(path, std::ios::binary | std::ios::trunc);
   if (!output)
     return;
   output.write(reinterpret_cast<const char *>(values.data()),
                static_cast<std::streamsize>(values.size() * sizeof(float)));
-  LOG_INFO("[GDN-DIAG] layer=%d label=%s elements=%zu path=%s\n", layer,
-           label, elements, path.c_str());
+  LOG_INFO("[GDN-DIAG] layer=%d position=%d label=%s elements=%zu path=%s\n",
+           layer, call_index, label, elements, path.c_str());
+}
+
+void gdn_diag_dump(const char *base, const char *label, int layer, int S,
+                   ggml_tensor *tensor) {
+  // Layer 0 is invoked once per unbatched prompt/decode token. The first dump
+  // in each invocation is qkv, which advances the position counter.
+  if (label && std::strcmp(label, "qkv") == 0)
+    ++gdn_diag_call_counter();
+  gdn_diag_dump_at(base, label, layer, S, gdn_diag_call_counter(), tensor);
 }
 } // namespace
 
@@ -1176,6 +1211,17 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
   ggml_backend_tensor_set_async((ggml_backend_t)backend_, state_in, state, 0,
                                 state_bytes);
 
+  if (diag) {
+    // These graph inputs alias caller-owned recurrent state/history. Snapshot
+    // them before the graph's in-place state/history stores can overwrite them.
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const int position = gdn_diag_call_counter() + 1;
+    gdn_diag_dump_at(base, "gdn_input", layer, S, position, x);
+    gdn_diag_dump_at(base, "conv_history_in", layer, S, position, hist_in);
+    gdn_diag_dump_at(base, "state_in", layer, S, position, state_in);
+  }
+
   const ggml_status st =
       ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);
   if (st != GGML_STATUS_SUCCESS) {
@@ -1450,6 +1496,17 @@ bool GgmlGdnProjRunner::run_full_device_impl(
                                   (size_t)conv_dim_ * hist * sizeof(float));
     ggml_backend_tensor_set_async((ggml_backend_t)backend_, state_in, state, 0,
                                   (size_t)H_v_ * hd * hd * sizeof(float));
+  }
+  if (diag) {
+    // full_state.history/state are updated in place by this graph, so read the
+    // true incoming state before replay rather than after their storage has
+    // become the outgoing state.
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const int position = gdn_diag_call_counter() + 1;
+    gdn_diag_dump_at(base, "gdn_input", layer, S, position, x);
+    gdn_diag_dump_at(base, "conv_history_in", layer, S, position, hist_in);
+    gdn_diag_dump_at(base, "state_in", layer, S, position, state_in);
   }
   const ggml_status st =
       ggml_backend_graph_compute_async((ggml_backend_t)backend_, gf);

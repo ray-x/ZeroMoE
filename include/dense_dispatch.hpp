@@ -1241,9 +1241,27 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
     if (it == engine.resident_layers.end() || !it->second.host_ptr) {
         LOG_WARN("[DENSE] missing weight %s — zeroing output\n", wname.c_str());
         std::memset(y, 0, (size_t)S * O * sizeof(float));
-        return;
-    }
-    auto& W = it->second;
+    return;
+  }
+  auto& W = it->second;
+  const bool ple_projection =
+      wname == "blk.1.ple_key.weight" ||
+      wname == "blk.1.ple_value.weight";
+  const char* ple_diag_env =
+      std::getenv("MOESTREAM_QWEN4EXP_PLE_PATH_DIAG");
+  const bool ple_path_diag = ple_projection && ple_diag_env &&
+                             ple_diag_env[0] == '1';
+  const char* ple_cpu_env =
+      std::getenv("MOESTREAM_QWEN4EXP_PLE_FORCE_CPU");
+  const bool ple_force_cpu = ple_path_diag && ple_cpu_env &&
+                             ple_cpu_env[0] == '1';
+  if (ple_path_diag) {
+      LOG_INFO("[QWEN4EXP-PLE-PATH] name=%s S=%d I=%d O=%d type=%u "
+               "bytes=%zu gpu_fast=%d device=%d force_cpu=%d\n",
+               wname.c_str(), S, I, O, static_cast<unsigned>(W.meta.type),
+               W.meta.size_bytes, W.gpu_fast_ptr ? 1 : 0,
+               W.device_ptr ? 1 : 0, ple_force_cpu ? 1 : 0);
+  }
     // 1) GPU dispatch. Prefer the BF16-matched fast-path buffer
     //    (upload_dequantized_bf16, cuda_manager.hpp) when present — cuBLAS
     //    GEMV (matched BF16 weight/BF16 activation, F32 accumulate/output)
@@ -1267,14 +1285,21 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
     //    BF16 activation, dense_matmul_bf16_matched_host), verified correct
     //    in isolation via Test 10 (real hardware) before being wired in
     //    here.
-    if (!force_original_quant && !cpu_only_mode() && engine.gpu && W.gpu_fast_ptr &&
+    if (!ple_force_cpu && !force_original_quant && !cpu_only_mode() &&
+        engine.gpu && W.gpu_fast_ptr &&
         engine.gpu->dense_matmul_bf16_matched_host(W.gpu_fast_ptr, x, y, S, I, O)) {
+        if (ple_path_diag)
+            LOG_INFO("[QWEN4EXP-PLE-PATH] selected=BF16-fast\n");
         return;
     }
-    if (!cpu_only_mode() && engine.gpu && W.device_ptr &&
+    if (!ple_force_cpu && !cpu_only_mode() && engine.gpu && W.device_ptr &&
         engine.gpu->dense_matmul_host(W.meta.type, W.device_ptr, x, y, S, I, O)) {
+        if (ple_path_diag)
+            LOG_INFO("[QWEN4EXP-PLE-PATH] selected=original-weight-GPU\n");
         return;
     }
+    if (ple_path_diag)
+        LOG_INFO("[QWEN4EXP-PLE-PATH] selected=CPU-reference\n");
     // 2) CPU reference dequant-matmul: correct for F32/F16/BF16/Q8_0/Q4_0;
     //    loudly zeroes K-quants/IQ2 (dequant bodies pending). Never the old
     //    silent "reinterpret quant as float". This is routine/expected for

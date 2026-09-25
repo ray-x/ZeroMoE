@@ -109,6 +109,215 @@ struct Qwen4ExpCudaHostNodeContext {
   std::atomic<bool> last_cpu_hash_valid{false};
 };
 
+// A CPY node carrying THIS context is the graph-visible marker for a
+// generalized GPU-staged decode layer (see engine.qwen4exp_gpu_stage_*).
+// Unlike Qwen4ExpCudaHostNodeContext above, the callback body here does a
+// pure host-memory GATHER (no CPU FFN compute, no CUDA API calls -- a hard
+// requirement inside a cudaLaunchHostFunc callback) -- it copies each of
+// this token's real routed experts' gate/up/down bytes, in router-output
+// order, out of the preloaded DDR arena into one compact pinned bounce
+// buffer, which the SAME enqueue call then H2D-copies into three fixed
+// compact device destinations (gate_dst/up_dst/down_dst). Slot k of every
+// destination always holds real routed expert ids[k]'s bytes, which is why
+// the downstream MUL_MAT_ID nodes can use a CONSTANT [0..topk-1] ids
+// tensor instead of any real per-token id remap -- see build_gpu_stage_node
+// and build_moe's staged-layer branch for the full invariant.
+struct Qwen4ExpGpuStageContext {
+  static constexpr uint64_t kMagic = 0x51474d53544147ull; // "QGMSTAG" (trunc)
+  uint64_t magic = kMagic;
+  int layer_index = -1;
+  int n_experts = 0;
+  int topk = 0;
+  // Source planes/strides into the persistent, engine-owned, independently
+  // pinnable DDR arena (StreamingEngine::graph_ram_arenas[layer]) -- the
+  // SAME arena load_full_weight()'s general host-resident path and Option
+  // B's layer-13 staging already read from. Borrowed, not owned.
+  const uint8_t *gate_plane = nullptr;
+  const uint8_t *up_plane = nullptr;
+  const uint8_t *down_plane = nullptr;
+  size_t gate_stride = 0;
+  size_t up_stride = 0;
+  size_t down_stride = 0;
+  size_t gate_bytes = 0; // bytes for ONE expert's gate plane
+  size_t up_bytes = 0;
+  size_t down_bytes = 0;
+  // Pinned host buffers, sized for exactly `topk` slots each.
+  int32_t *host_ids = nullptr;        // topk * sizeof(int32_t)
+  uint8_t *host_gate_bounce = nullptr; // topk * gate_bytes
+  uint8_t *host_up_bounce = nullptr;   // topk * up_bytes
+  uint8_t *host_down_bounce = nullptr; // topk * down_bytes
+  size_t ids_bytes = 0;
+  // Fixed device destinations (gate_dst/up_dst/down_dst's ->data), bound
+  // once via phase2_bind_or_allocate_expert -- never reallocated.
+  void *device_gate_dst = nullptr;
+  void *device_up_dst = nullptr;
+  void *device_down_dst = nullptr;
+  // The `ids` device tensor this layer's real routing produced this build
+  // (ggml_cont'd, so a flat D2H read is safe -- decode is always S==1, so
+  // the argsort-view-stride pitfall documented at build_moe's ids_out site
+  // does not apply here either way, but ggml_cont keeps this robust).
+  cudaEvent_t d2h_start = nullptr;
+  cudaEvent_t d2h_end = nullptr;
+  cudaEvent_t h2d_start = nullptr;
+  cudaEvent_t h2d_end = nullptr;
+  std::atomic<bool> last_ok{false};
+  std::atomic<double> last_callback_ms{0.0};
+};
+
+static void CUDART_CB
+qwen4exp_cuda_gpu_stage_callback(void *user_data) {
+  auto *ctx = static_cast<Qwen4ExpGpuStageContext *>(user_data);
+  if (!ctx || ctx->magic != Qwen4ExpGpuStageContext::kMagic)
+    return;
+  const auto start = std::chrono::steady_clock::now();
+  bool ok = true;
+  for (int k = 0; k < ctx->topk; ++k) {
+    const int32_t expert = ctx->host_ids[k];
+    if (expert < 0 || expert >= ctx->n_experts) {
+      // Defensive only -- real routing always produces valid ids. Zero-fill
+      // this slot and keep going rather than read out of bounds, mirroring
+      // env_host_node_skip_cpu()'s existing zero-fill escape hatch.
+      std::memset(ctx->host_gate_bounce +
+                      static_cast<size_t>(k) * ctx->gate_bytes,
+                  0, ctx->gate_bytes);
+      std::memset(ctx->host_up_bounce +
+                      static_cast<size_t>(k) * ctx->up_bytes,
+                  0, ctx->up_bytes);
+      std::memset(ctx->host_down_bounce +
+                      static_cast<size_t>(k) * ctx->down_bytes,
+                  0, ctx->down_bytes);
+      ok = false;
+      continue;
+    }
+    std::memcpy(ctx->host_gate_bounce + static_cast<size_t>(k) * ctx->gate_bytes,
+               ctx->gate_plane + static_cast<size_t>(expert) * ctx->gate_stride,
+               ctx->gate_bytes);
+    std::memcpy(ctx->host_up_bounce + static_cast<size_t>(k) * ctx->up_bytes,
+               ctx->up_plane + static_cast<size_t>(expert) * ctx->up_stride,
+               ctx->up_bytes);
+    std::memcpy(ctx->host_down_bounce + static_cast<size_t>(k) * ctx->down_bytes,
+               ctx->down_plane + static_cast<size_t>(expert) * ctx->down_stride,
+               ctx->down_bytes);
+  }
+  ctx->last_ok.store(ok, std::memory_order_release);
+  const double callback_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start)
+                                 .count();
+  ctx->last_callback_ms.store(callback_ms, std::memory_order_release);
+  if (std::getenv("MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING"))
+    LOG_INFO("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d callback_body_ms=%.4f\n",
+             ctx->layer_index, callback_ms);
+  if (!ok)
+    LOG_ERROR("[QWEN4EXP-GPU-STAGE] layer=%d one or more routed ids were "
+              "out of range [0,%d); affected slot(s) zero-filled\n",
+              ctx->layer_index, ctx->n_experts);
+}
+
+// Enqueues the D2H/callback/H2D sequence for a GPU-stage marker while a CUDA
+// stream is being captured -- same technique as
+// moestream_qwen4exp_cuda_host_node_enqueue below, called from the SAME weak
+// hook (dispatch is by ctx->magic, see that function's own top).
+static bool qwen4exp_cuda_gpu_stage_node_enqueue(const ggml_tensor *node,
+                                                 cudaStream_t stream) {
+  if (!node || node->op != GGML_OP_CPY || !node->extra || !stream)
+    return false;
+  auto *ctx = static_cast<Qwen4ExpGpuStageContext *>(node->extra);
+  if (ctx->magic != Qwen4ExpGpuStageContext::kMagic || !node->src[2] ||
+      !node->src[2]->data || !ctx->host_ids || !ctx->host_gate_bounce ||
+      !ctx->host_up_bounce || !ctx->host_down_bounce ||
+      !ctx->device_gate_dst || !ctx->device_up_dst || !ctx->device_down_dst ||
+      !ctx->d2h_start || !ctx->d2h_end || !ctx->h2d_start || !ctx->h2d_end)
+    return false;
+
+  const size_t gate_total = static_cast<size_t>(ctx->topk) * ctx->gate_bytes;
+  const size_t up_total = static_cast<size_t>(ctx->topk) * ctx->up_bytes;
+  const size_t down_total = static_cast<size_t>(ctx->topk) * ctx->down_bytes;
+  if (cudaEventRecord(ctx->d2h_start, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->host_ids, node->src[2]->data, ctx->ids_bytes,
+                      cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+      cudaEventRecord(ctx->d2h_end, stream) != cudaSuccess ||
+      cudaLaunchHostFunc(stream, qwen4exp_cuda_gpu_stage_callback, ctx) !=
+          cudaSuccess ||
+      cudaEventRecord(ctx->h2d_start, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->device_gate_dst, ctx->host_gate_bounce, gate_total,
+                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->device_up_dst, ctx->host_up_bounce, up_total,
+                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->device_down_dst, ctx->host_down_bounce, down_total,
+                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+      cudaEventRecord(ctx->h2d_end, stream) != cudaSuccess)
+    return false;
+  return true;
+}
+
+// Decode-only router-usage tap (engine.qwen4exp_track_router_usage): every
+// layer's real routed `ids` is appended (via an ordinary ggml_concat node --
+// a ususal graph op, no host bridge, no manual backend pin needed since it
+// inherits CUDA placement from its argsort_top_k ancestor) into ONE
+// persistent [topk * n_layers] I32 device accumulator
+// (FullGraph::usage_track_ids), in layer order. A SINGLE marker after the
+// whole layer loop D2H-copies that one buffer and bumps
+// StreamingEngine::route_freq for every (layer, expert) entry in one host
+// callback -- one host-bridge dispatch per token instead of n_layers, unlike
+// a naive per-layer tap. See engine.qwen4exp_track_router_usage's own
+// comment for why this is decode-only (S==1): the argsort-view-stride
+// pitfall documented at build_moe's ids_out site does not apply here since
+// there is exactly one row per layer.
+struct Qwen4ExpUsageTrackContext {
+  static constexpr uint64_t kMagic = 0x515552544b475431ull; // "QURTKGT1" trunc
+  uint64_t magic = kMagic;
+  StreamingEngine *engine = nullptr;
+  int n_layers = 0;
+  int n_experts = 0;
+  int topk = 0;
+  int32_t *host_ids = nullptr; // pinned, n_layers * topk entries
+  size_t ids_bytes = 0;
+  std::atomic<double> last_callback_ms{0.0};
+};
+
+static void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
+  auto *ctx = static_cast<Qwen4ExpUsageTrackContext *>(user_data);
+  if (!ctx || ctx->magic != Qwen4ExpUsageTrackContext::kMagic || !ctx->engine ||
+      !ctx->host_ids)
+    return;
+  const auto start = std::chrono::steady_clock::now();
+  for (int l = 0; l < ctx->n_layers; ++l) {
+    for (int k = 0; k < ctx->topk; ++k) {
+      const int32_t expert = ctx->host_ids[static_cast<size_t>(l) * ctx->topk + k];
+      if (expert < 0 || expert >= ctx->n_experts)
+        continue; // defensive only -- real routing always produces valid ids
+      ctx->engine->bump_route_freq(l, expert);
+    }
+  }
+  const double ms = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+  ctx->last_callback_ms.store(ms, std::memory_order_release);
+  if (std::getenv("MOESTREAM_QWEN4EXP_USAGE_TRACK_TIMING"))
+    LOG_INFO("[QWEN4EXP-USAGE-TRACK-TIMING] callback_body_ms=%.4f\n", ms);
+}
+
+// Enqueues the single D2H + host-callback sequence for the usage-track flush
+// marker while a CUDA stream is being captured -- same technique as
+// moestream_qwen4exp_cuda_host_node_enqueue below, dispatched by magic. No
+// H2D write-back: this marker is a pure read-only observer of already-real
+// routing, it never feeds back into the compute graph.
+static bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
+                                                    cudaStream_t stream) {
+  if (!node || node->op != GGML_OP_CPY || !node->extra || !stream)
+    return false;
+  auto *ctx = static_cast<Qwen4ExpUsageTrackContext *>(node->extra);
+  if (ctx->magic != Qwen4ExpUsageTrackContext::kMagic || !node->src[0] ||
+      !node->src[0]->data || !ctx->host_ids)
+    return false;
+  if (cudaMemcpyAsync(ctx->host_ids, node->src[0]->data, ctx->ids_bytes,
+                      cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+      cudaLaunchHostFunc(stream, qwen4exp_cuda_usage_track_callback, ctx) !=
+          cudaSuccess)
+    return false;
+  return true;
+}
+
 static bool env_host_node_skip_cpu() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_SKIP_CPU");
   return v && v[0] == '1';
@@ -455,6 +664,25 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
     const ggml_tensor *node, cudaStream_t stream) {
   if (!node || node->op != GGML_OP_CPY || !node->extra || !stream)
     return false;
+  // Two distinct marker context types share this one ggml-cuda weak-symbol
+  // hook (see patches/ggml-backend-host-node-*.patch's own wiring) rather
+  // than each needing its own patch to ggml-cuda.cu: the CPU-offload bridge
+  // below (Qwen4ExpCudaHostNodeContext), and the generalized GPU-staging
+  // bridge (Qwen4ExpGpuStageContext, see its own struct comment). Both put
+  // a uint64_t `magic` as their first member, so a peek at that field alone
+  // -- before committing to either concrete type -- is safe.
+  {
+    const auto *maybe_stage =
+        static_cast<const Qwen4ExpGpuStageContext *>(node->extra);
+    if (maybe_stage->magic == Qwen4ExpGpuStageContext::kMagic)
+      return qwen4exp_cuda_gpu_stage_node_enqueue(node, stream);
+  }
+  {
+    const auto *maybe_usage =
+        static_cast<const Qwen4ExpUsageTrackContext *>(node->extra);
+    if (maybe_usage->magic == Qwen4ExpUsageTrackContext::kMagic)
+      return qwen4exp_cuda_usage_track_node_enqueue(node, stream);
+  }
   auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(node->extra);
   if (ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
       !node->data || !node->src[0] || !node->src[2] || !node->src[3] ||
@@ -723,6 +951,45 @@ struct FullGraph {
   // must outlive graph capture and every replay; they are cleared only after
   // the scheduler/graph objects have been torn down.
   std::vector<std::unique_ptr<Qwen4ExpCudaHostNodeContext>> host_node_contexts;
+  // Generalized GPU staging for host-resident decode layers (see
+  // engine.qwen4exp_gpu_stage_enabled/_layers). One binding per staged
+  // layer: a fixed, topk-sized compact gate/up/down destination in the
+  // shared device_expert_buffer bump arena (see device_expert_bytes()'s own
+  // staging-bytes block), refreshed every decode token via the same
+  // CUDA-graph host-node-callback technique the CPU-offload bridge above
+  // uses -- but the callback here does a pure host-memory GATHER (real
+  // routed experts' bytes copied into a compact pinned bounce buffer) in
+  // place of CPU FFN compute, feeding ordinary GPU MUL_MAT_ID nodes instead
+  // of producing the final answer directly. See build_gpu_stage_node().
+  struct GpuStageBinding {
+    int layer = -1;
+    // [topk, S] I32, value = 0..topk-1, uploaded once at graph-build time,
+    // never touched again -- see build_gpu_stage_node's own comment for why
+    // a real per-token id remap table is unnecessary.
+    ggml_tensor *ids_dispatch_const = nullptr;
+    // Fixed compact device tensors, shape [cols, rows, topk] (topk, not
+    // n_experts), bound once via phase2_bind_or_allocate_expert into
+    // device_expert_buffer -- never re-bound, only their CONTENTS change
+    // per token.
+    ggml_tensor *gate_dst = nullptr;
+    ggml_tensor *up_dst = nullptr;
+    ggml_tensor *down_dst = nullptr;
+    // The GGML_OP_CPY marker node that refreshes gate/up/down_dst's
+    // contents each replay. build_moe attaches this as an extra src[] on
+    // every MUL_MAT_ID call that reads them, purely to force correct
+    // dependency ordering -- see build_gpu_stage_node's own comment.
+    ggml_tensor *gpu_stage_marker_dep = nullptr;
+  };
+  std::vector<GpuStageBinding> gpu_stage_bindings;
+  std::vector<std::unique_ptr<struct Qwen4ExpGpuStageContext>>
+      gpu_stage_contexts;
+  // Decode-only router-usage tap (engine.qwen4exp_track_router_usage) -- see
+  // Qwen4ExpUsageTrackContext's own comment. usage_track_ids accumulates
+  // every layer's real routed ids via ordinary ggml_concat nodes across the
+  // layer loop; usage_track_context owns the single flush marker's pinned
+  // buffer/state, built once after the loop.
+  ggml_tensor *usage_track_ids = nullptr;
+  std::unique_ptr<struct Qwen4ExpUsageTrackContext> usage_track_context;
   const uint8_t *stage_src_gate = nullptr;
   const uint8_t *stage_src_up = nullptr;
   const uint8_t *stage_src_down = nullptr;
@@ -1836,9 +2103,26 @@ ggml_backend_buffer_t bind_host(FullGraph &g, ggml_tensor *t, void *ptr,
 // 26 CPU layers that request is approximately the full 26-layer expert
 // footprint (~88 GiB), instead of a small activation workspace.
 void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
+  static int moestream_bind_diag = -1;
+  if (moestream_bind_diag < 0) {
+    const char *e = std::getenv("MOESTREAM_BIND_HOST_DIAG");
+    moestream_bind_diag = (e && e[0] == '1') ? 1 : 0;
+  }
+  if (moestream_bind_diag) {
+    LOG_WARN(
+        "[MOESTREAM-BIND-DIAG] name=%s sched=%p cpu=%p t=%p t->buffer=%p "
+        "is_host=%d\n",
+        t ? ggml_get_name(t) : "(null)", (void *)g.sched, (void *)g.cpu,
+        (void *)t, t ? (void *)t->buffer : nullptr,
+        (t && t->buffer) ? (int)ggml_backend_buffer_is_host(t->buffer) : -1);
+  }
   if (!g.sched || !g.cpu || !t || !t->buffer ||
-      !ggml_backend_buffer_is_host(t->buffer))
+      !ggml_backend_buffer_is_host(t->buffer)) {
+    if (moestream_bind_diag)
+      LOG_WARN("[MOESTREAM-BIND-DIAG] SKIPPED pin for name=%s\n",
+               t ? ggml_get_name(t) : "(null)");
     return;
+  }
   ggml_backend_sched_set_tensor_backend(g.sched, t, g.cpu);
 }
 
@@ -2748,6 +3032,27 @@ size_t device_expert_bytes(const FullGraph &g) {
       const size_t layer_bytes = per_expert * n;
       if (total <= SIZE_MAX - layer_bytes)
         total += layer_bytes;
+    }
+  }
+  // Generalized GPU staging (build_gpu_stage_node): a fixed compact
+  // gate+up+down destination per staged host-resident layer, sized for
+  // `topk` slots (not n_experts) -- see that function's own comment for
+  // why this is safe to size this small. A layer already covered by the
+  // static device_expert_layers block doesn't need a separate staging
+  // allocation (it's already fully device-resident); skip those to avoid
+  // double-counting.
+  if (g.decode_mode && engine.qwen4exp_gpu_stage_enabled) {
+    for (int layer : engine.qwen4exp_gpu_stage_layers) {
+      if (device_expert_block_covers(g, layer))
+        continue;
+      const size_t per_expert = engine.compute_expert_slab_bytes(layer);
+      const size_t topk = static_cast<size_t>(std::max(0, c.topk));
+      if (per_expert == 0 || topk == 0 || topk > SIZE_MAX / per_expert)
+        continue;
+      const size_t layer_bytes = per_expert * topk;
+      if (total > SIZE_MAX - layer_bytes)
+        return 0;
+      total += layer_bytes;
     }
   }
   return total;
@@ -4138,6 +4443,218 @@ ggml_tensor *build_qwen4exp_host_node(
   return marker;
 }
 
+// Generalizes Option-B's layer-13 staging proof
+// (qwen4exp_stage_layer13_before_graph/StageBinding) into a mechanism
+// covering every host-resident layer listed in
+// engine.qwen4exp_gpu_stage_layers, for real per-token routing instead of
+// a forced test set. Where the layer-13 proof issues its
+// upload_expert_active_projections_async() call as ordinary host code
+// immediately before graph replay -- which only works because it forces a
+// fixed route (build_moe's g.stage_route_ids branch) -- this uses the SAME
+// CUDA-graph host-node-callback technique qwen4exp_cuda_host_node_callback/
+// moestream_qwen4exp_cuda_host_node_enqueue already prove works mid-replay
+// with REAL per-token data: a captured D2H(ids)->host-callback(gather)->
+// H2D(compact planes) sequence that re-executes on every cudaGraphLaunch
+// replay with that token's real routed ids.
+//
+// Correctness invariant (see also Qwen4ExpGpuStageContext's own comment):
+// the callback writes routed expert ids[k]'s bytes into destination slot
+// k, for k in [0,topk), in the SAME order `ids` itself lists them. Because
+// build_moe's combine weights (`weights = ggml_get_rows(ctx, probs3,
+// ids)`) are ALSO indexed by that same order, a MUL_MAT_ID call against
+// these compact destinations can use a CONSTANT [0..topk-1] ids tensor --
+// slot k IS real expert ids[k] by construction -- with no per-token id
+// remap needed. Do NOT reassign `ids` itself here the way the layer-13
+// proof does (build_moe's `ids = g.stage_route_ids` line): that would
+// desync the real combine weights from the real routing, which the proof
+// gets away with only because it forces both consistently to the same
+// fake set.
+//
+// Decode (S==1) only -- see engine.qwen4exp_gpu_stage_enabled's own
+// comment for why prefill needs a different, batch-proportional design.
+// Returns the index into g.gpu_stage_bindings on success, -1 on any
+// failure (caller falls through to the next dispatch strategy for this
+// layer -- CPU-offload if enabled, otherwise today's plain CPU path;
+// never a hard error for the whole graph build).
+int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids,
+                         int layer) {
+  if (!g.decode_mode || g.S != 1 || !g.engine ||
+      !g.engine->qwen4exp_gpu_stage_layer_enabled(layer))
+    return -1;
+
+  const auto &c = g.engine->model_file.architecture_config;
+  const auto *arena = g.engine->graph_ram_arena(layer);
+  const bool arena_valid =
+      arena && g.engine->graph_ram_layer_ready(layer) && arena->base &&
+      arena->gate_bytes != 0 && arena->up_bytes != 0 &&
+      arena->down_bytes != 0 &&
+      (arena->projection_compact
+           ? (arena->gate_stride >= arena->gate_bytes &&
+              arena->up_stride >= arena->up_bytes &&
+              arena->down_stride >= arena->down_bytes)
+           : (arena->stride != 0 &&
+              arena->stride >= arena->gate_bytes + arena->up_bytes +
+                                    arena->down_bytes));
+  if (!arena_valid || layer < 0 ||
+      layer >= static_cast<int>(g.engine->layers_experts.size()) ||
+      g.engine->layers_experts[static_cast<size_t>(layer)].empty()) {
+    LOG_WARN("[QWEN4EXP-GPU-STAGE] layer=%d declined: complete compatible "
+             "DDR arena is required\n",
+             layer);
+    return -1;
+  }
+  const auto &first = g.engine->layers_experts[static_cast<size_t>(layer)][0];
+  if (!first.gate_proj.host_ptr || !first.up_proj.host_ptr ||
+      !first.down_proj.host_ptr)
+    return -1;
+
+  // Compact destination tensors: [cols, rows, topk] -- same shape
+  // convention build_split_gpu_tensor already uses for its own compact GPU
+  // tensors, sized for `topk` (constant per token) instead of a static
+  // hot-set count. Bump-allocated from the SAME device_expert_buffer arena
+  // device-resident layers use (see device_expert_bytes()'s staging-bytes
+  // block for the matching capacity accounting) -- never copied into here
+  // directly; only the per-token host-node callback below ever writes
+  // their bytes.
+  auto make_dst = [&](const char *stem,
+                      ggml_type type) -> ggml_tensor * {
+    const GGUFTensor *m = model_tensor(
+        *g.engine, "blk." + std::to_string(layer) + "." + stem);
+    if (!m || m->shape.size() < 3)
+      return nullptr;
+    std::vector<int64_t> shape = {static_cast<int64_t>(m->shape[0]),
+                                  static_cast<int64_t>(m->shape[1]),
+                                  static_cast<int64_t>(c.topk)};
+    ggml_tensor *t = new_tensor(ctx, type, shape);
+    if (!t)
+      return nullptr;
+    void *addr = nullptr;
+    bool new_allocation = false;
+    const std::string key =
+        "gpu_stage:" + std::to_string(layer) + ":" + stem;
+    if (!phase2_bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
+      return nullptr;
+    ggml_set_name(t, (std::string("blk.") + std::to_string(layer) + "." +
+                      stem + ".gpu_stage")
+                         .c_str());
+    return t;
+  };
+
+  FullGraph::GpuStageBinding binding;
+  binding.gate_dst = make_dst(
+      "ffn_gate_exps.weight", static_cast<ggml_type>(first.gate_proj.meta.type));
+  binding.up_dst = make_dst(
+      "ffn_up_exps.weight", static_cast<ggml_type>(first.up_proj.meta.type));
+  binding.down_dst = make_dst(
+      "ffn_down_exps.weight", static_cast<ggml_type>(first.down_proj.meta.type));
+  if (!binding.gate_dst || !binding.up_dst || !binding.down_dst) {
+    LOG_WARN("[QWEN4EXP-GPU-STAGE] layer=%d declined: compact device "
+             "destination allocation failed (VRAM budget?)\n",
+             layer);
+    return -1;
+  }
+
+  binding.ids_dispatch_const = host_input(
+      g, ctx, GGML_TYPE_I32, {c.topk, g.S},
+      static_cast<size_t>(c.topk) * static_cast<size_t>(g.S) * sizeof(int32_t),
+      (std::string("qwen_gpu_stage_ids_l") + std::to_string(layer)).c_str());
+  if (!binding.ids_dispatch_const)
+    return -1;
+  {
+    auto *ids_data = static_cast<int32_t *>(binding.ids_dispatch_const->data);
+    for (int s = 0; s < g.S; ++s)
+      for (int k = 0; k < c.topk; ++k)
+        ids_data[s * c.topk + k] = k;
+  }
+
+  auto node_ctx = std::make_unique<Qwen4ExpGpuStageContext>();
+  node_ctx->layer_index = layer;
+  node_ctx->n_experts = c.n_experts;
+  node_ctx->topk = c.topk;
+  node_ctx->gate_plane = arena->base + arena->gate_offset;
+  node_ctx->up_plane = arena->base + arena->up_offset;
+  node_ctx->down_plane = arena->base + arena->down_offset;
+  node_ctx->gate_stride = arena->gate_stride;
+  node_ctx->up_stride = arena->up_stride;
+  node_ctx->down_stride = arena->down_stride;
+  node_ctx->gate_bytes = arena->gate_bytes;
+  node_ctx->up_bytes = arena->up_bytes;
+  node_ctx->down_bytes = arena->down_bytes;
+  node_ctx->ids_bytes = static_cast<size_t>(c.topk) * sizeof(int32_t);
+  node_ctx->host_ids = static_cast<int32_t *>(
+      alloc_registered_host(g, node_ctx->ids_bytes));
+  node_ctx->host_gate_bounce = static_cast<uint8_t *>(alloc_registered_host(
+      g, static_cast<size_t>(c.topk) * node_ctx->gate_bytes));
+  node_ctx->host_up_bounce = static_cast<uint8_t *>(alloc_registered_host(
+      g, static_cast<size_t>(c.topk) * node_ctx->up_bytes));
+  node_ctx->host_down_bounce = static_cast<uint8_t *>(alloc_registered_host(
+      g, static_cast<size_t>(c.topk) * node_ctx->down_bytes));
+  if (!node_ctx->host_ids || !node_ctx->host_gate_bounce ||
+      !node_ctx->host_up_bounce || !node_ctx->host_down_bounce)
+    return -1;
+  node_ctx->device_gate_dst = binding.gate_dst->data;
+  node_ctx->device_up_dst = binding.up_dst->data;
+  node_ctx->device_down_dst = binding.down_dst->data;
+
+  cudaSetDevice(g.device);
+  if (cudaEventCreate(&node_ctx->d2h_start) != cudaSuccess ||
+      cudaEventCreate(&node_ctx->d2h_end) != cudaSuccess ||
+      cudaEventCreate(&node_ctx->h2d_start) != cudaSuccess ||
+      cudaEventCreate(&node_ctx->h2d_end) != cudaSuccess)
+    return -1;
+  // Warm the pinned buffers before capture -- same discipline
+  // build_qwen4exp_host_node follows, so capture never observes
+  // first-touch page faults.
+  std::fill_n(node_ctx->host_ids, c.topk, 0);
+  std::memset(node_ctx->host_gate_bounce, 0,
+             static_cast<size_t>(c.topk) * node_ctx->gate_bytes);
+  std::memset(node_ctx->host_up_bounce, 0,
+             static_cast<size_t>(c.topk) * node_ctx->up_bytes);
+  std::memset(node_ctx->host_down_bounce, 0,
+             static_cast<size_t>(c.topk) * node_ctx->down_bytes);
+
+  // A tiny dummy leaf (same type/shape as gate_dst) satisfies ggml_cpy's
+  // own shape/type validation for the marker's formal "source" -- the real
+  // work happens entirely inside the enqueue hijack
+  // (qwen4exp_cuda_gpu_stage_node_enqueue), never via ordinary CPY
+  // execution. `ids` (real routing, ggml_cont'd) is attached as an EXTRA
+  // dependency source purely for D2H/ordering purposes, matching the
+  // existing host-node marker's own src[2]/src[3] convention.
+  ggml_tensor *dummy_src = ggml_dup_tensor(ctx, binding.gate_dst);
+  if (!dummy_src)
+    return -1;
+  ggml_tensor *route_ids = ggml_cont(ctx, ids);
+  if (!route_ids)
+    return -1;
+  ggml_tensor *marker = ggml_cpy(ctx, dummy_src, binding.gate_dst);
+  if (!marker)
+    return -1;
+  marker->extra = node_ctx.get();
+  marker->src[2] = route_ids;
+  ggml_set_name(marker, (std::string("qwen4exp_gpu_stage_marker_l") +
+                        std::to_string(layer))
+                           .c_str());
+  if (g.sched)
+    ggml_backend_sched_set_tensor_backend(g.sched, marker, g.cuda);
+
+  // Force gate/up/down's own MUL_MAT_ID consumers to depend on the marker,
+  // so ggml's topological sort schedules the D2H/callback/H2D sequence
+  // strictly before anything reads gate_dst/up_dst/down_dst's contents --
+  // dst/up/down_dst are plain bump-allocated leaves with no other src[]
+  // edge to the marker, so this dependency must be explicit (ggml only
+  // tracks producer/consumer ordering through node src[] chains, never
+  // through incidental construction order or shared backing memory).
+  binding.gpu_stage_marker_dep = marker;
+
+  binding.layer = layer;
+  g.gpu_stage_contexts.push_back(std::move(node_ctx));
+  g.gpu_stage_bindings.push_back(binding);
+  LOG_INFO("[QWEN4EXP-GPU-STAGE] captured GPU staging marker for layer=%d "
+           "(D=%d topk=%d)\n",
+           layer, g.D, c.topk);
+  return static_cast<int>(g.gpu_stage_bindings.size()) - 1;
+}
+
 // Builds the two small I32/F32 constant lookup tables a genuinely split
 // layer's mul_mat_id pair needs, once, at graph-build time (never
 // refreshed per decode step -- these encode a STATIC expert->device
@@ -4358,6 +4875,67 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     // nodes constructed, so this layer's real expert compute happens
     // exactly once, in whichever suffix graph actually gets chosen.
     return nullptr;
+  }
+
+  // Generalized GPU staging for host-resident decode layers (see
+  // engine.qwen4exp_gpu_stage_enabled/_layers, build_gpu_stage_node).
+  // Highest precedence among host-resident dispatch strategies: takes over
+  // before the CPU-offload host-node marker and the static split_gpu_ids
+  // branch get a chance, since staging fully replaces what either would do
+  // for this layer's compute. `weights` above was already computed from
+  // the real, unmodified `ids` -- staging must NOT reassign `ids` itself
+  // (see build_gpu_stage_node's own comment on why that would desync the
+  // real combine weights from real routing).
+  if (g.decode_mode && g.S == 1 && g.engine &&
+      g.engine->qwen4exp_gpu_stage_layer_enabled(layer)) {
+    const int stage_idx = build_gpu_stage_node(g, ctx, ids, layer);
+    if (stage_idx >= 0) {
+      const FullGraph::GpuStageBinding &sb = g.gpu_stage_bindings[
+          static_cast<size_t>(stage_idx)];
+      ggml_tensor *input3_stage = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
+      ggml_tensor *up_s = ggml_mul_mat_id(ctx, sb.up_dst, input3_stage,
+                                          sb.ids_dispatch_const);
+      ggml_tensor *gate_s = ggml_mul_mat_id(ctx, sb.gate_dst, input3_stage,
+                                            sb.ids_dispatch_const);
+      if (up_s && gate_s && sb.gpu_stage_marker_dep) {
+        // Force ordering: the marker's D2H/callback/H2D sequence must
+        // complete before either matmul reads gate_dst/up_dst -- see
+        // GpuStageBinding::gpu_stage_marker_dep's own comment.
+        up_s->src[3] = sb.gpu_stage_marker_dep;
+        gate_s->src[3] = sb.gpu_stage_marker_dep;
+      }
+      ggml_tensor *act_s = (up_s && gate_s)
+                              ? ggml_swiglu_split(ctx, gate_s, up_s)
+                              : nullptr;
+      ggml_tensor *down_s =
+          act_s ? ggml_mul_mat_id(ctx, sb.down_dst, act_s,
+                                  sb.ids_dispatch_const)
+                : nullptr;
+      if (down_s && sb.gpu_stage_marker_dep)
+        down_s->src[3] = sb.gpu_stage_marker_dep;
+      if (down_s) {
+        // Same weighted-sum-over-topk reduction as the shared tail below
+        // (out = view+add loop over `experts`) -- duplicated here rather
+        // than falling through to it, matching build_qwen4exp_host_node's
+        // own self-contained-early-return convention for a dispatch
+        // strategy that fully replaces the ordinary mul_mat_id chain.
+        ggml_tensor *weighted_s = ggml_mul(ctx, down_s, weights);
+        ggml_tensor *out_s =
+            ggml_view_2d(ctx, weighted_s, g.D, g.S, weighted_s->nb[2], 0);
+        out_s = ggml_cont(ctx, out_s);
+        for (int k = 1; k < c.topk; ++k) {
+          ggml_tensor *e = ggml_view_2d(
+              ctx, weighted_s, g.D, g.S, weighted_s->nb[2],
+              static_cast<size_t>(k) * weighted_s->nb[1]);
+          out_s = ggml_add(ctx, out_s, e);
+        }
+        (void)layer;
+        return out_s;
+      }
+    }
+    LOG_WARN("[QWEN4EXP-GPU-STAGE] layer=%d falling through to the next "
+             "dispatch strategy (CPU-offload if enabled, else plain CPU)\n",
+             layer);
   }
 
   // The host callback is a single-token strided CPU contract.  Prefill must
@@ -5146,6 +5724,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
               : g.cpu);
     }
   }
+  // Decode-only router-usage tap (see Qwen4ExpUsageTrackContext's own
+  // comment). Every layer that goes through build_moe() below appends its
+  // real routed ids into g.usage_track_ids via an ordinary ggml_concat node;
+  // a single flush marker after the loop reads the whole buffer once.
+  const bool usage_track_enabled =
+      g.decode_mode && g.engine->qwen4exp_track_router_usage;
   for (int l = 0; l < g.n_layers; ++l) {
     // Suffix instances own layers [phase2_split_layer, n_layers) -- layers
     // strictly BEFORE the split live entirely in the prefix instance
@@ -5719,6 +6303,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
             ? &g.partial_layer_probs_out
             : nullptr;
 
+    // Decode-only router-usage tap: captures this layer's real routed ids
+    // via build_moe's own ids_out param. Safe to fold into partial_ids_out's
+    // slot -- usage_track_enabled implies g.decode_mode, and partial_ids_out
+    // above is only ever non-null when !g.decode_mode, so the two never
+    // collide.
+    ggml_tensor *layer_ids_for_usage = nullptr;
+    ggml_tensor **ids_out_param =
+        usage_track_enabled ? &layer_ids_for_usage : partial_ids_out;
+
     if (!moe && !split_planned && env_merged_gate_up_enabled()) {
       const auto t_wlookup_start = std::chrono::steady_clock::now();
       const bool gate_up_device =
@@ -5734,7 +6327,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       if (gate_up && down) {
         moe = build_moe(g, g.ctx, ffn_in, l, router, bias, nullptr, nullptr,
                         down, nullptr, nullptr, nullptr, nullptr, gate_up,
-                        partial_ids_out, partial_probs_out);
+                        ids_out_param, partial_probs_out);
       }
     }
 
@@ -5762,7 +6355,20 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                       de.cpu, split_ok ? ge.gpu : nullptr,
                       split_ok ? ue.gpu : nullptr,
                       split_ok ? de.gpu : nullptr, split_ids, nullptr,
-                      partial_ids_out, partial_probs_out);
+                      ids_out_param, partial_probs_out);
+    }
+    if (usage_track_enabled && layer_ids_for_usage) {
+      // Ordinary device-side accumulation -- ggml_concat inherits CUDA
+      // placement from layer_ids_for_usage's argsort_top_k ancestor, no
+      // manual backend pin needed (unlike the host-node CPY markers, this
+      // is a totally normal graph op). ggml_cont matches the same
+      // defensive-robustness convention build_qwen4exp_host_node's
+      // route_ids already uses, even though decode S==1 rows never hit the
+      // argsort-view-stride pitfall that convention guards against.
+      ggml_tensor *ids_cont = ggml_cont(g.ctx, layer_ids_for_usage);
+      g.usage_track_ids = g.usage_track_ids
+                              ? ggml_concat(g.ctx, g.usage_track_ids, ids_cont, 0)
+                              : ids_cont;
     }
     if (l == 0 && g.layer0_diag_enabled) {
       g.layer0_diag_moe_block = moe;
@@ -5838,6 +6444,53 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     }
     g.moe_construction_ms_total += std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_moe_start).count();
+  }
+
+  // Decode-only router-usage tap: one flush marker for the whole graph,
+  // built once here after every layer has appended into g.usage_track_ids
+  // (see the per-layer ggml_concat block above and
+  // Qwen4ExpUsageTrackContext's own comment). A construction failure here
+  // is non-fatal -- it just means this session's usage histogram stays
+  // incomplete, never that decode itself should fail.
+  if (usage_track_enabled && g.usage_track_ids) {
+    const int total_ids = c.topk * g.n_layers;
+    auto usage_ctx = std::make_unique<Qwen4ExpUsageTrackContext>();
+    usage_ctx->engine = g.engine;
+    usage_ctx->n_layers = g.n_layers;
+    usage_ctx->n_experts = c.n_experts;
+    usage_ctx->topk = c.topk;
+    usage_ctx->ids_bytes = static_cast<size_t>(total_ids) * sizeof(int32_t);
+    usage_ctx->host_ids = static_cast<int32_t *>(
+        alloc_registered_host(g, usage_ctx->ids_bytes));
+    if (usage_ctx->host_ids) {
+      std::fill_n(usage_ctx->host_ids, total_ids, 0);
+      ggml_tensor *usage_dummy_dst =
+          ggml_new_tensor_1d(g.ctx, GGML_TYPE_I32, total_ids);
+      ggml_tensor *usage_marker =
+          usage_dummy_dst ? ggml_cpy(g.ctx, g.usage_track_ids, usage_dummy_dst)
+                          : nullptr;
+      if (usage_marker) {
+        usage_marker->extra = usage_ctx.get();
+        ggml_set_name(usage_marker, "qwen_usage_track_flush_marker");
+        if (g.sched) {
+          ggml_backend_sched_set_tensor_backend(g.sched, usage_dummy_dst,
+                                                g.cuda);
+          ggml_backend_sched_set_tensor_backend(g.sched, usage_marker, g.cuda);
+        }
+        ggml_set_output(usage_marker);
+        ggml_build_forward_expand(g.graph, usage_marker);
+        g.usage_track_context = std::move(usage_ctx);
+        LOG_INFO("[QWEN4EXP-USAGE-TRACK] flush marker captured: n_layers=%d "
+                 "topk=%d total_ids=%d\n",
+                 g.n_layers, c.topk, total_ids);
+      } else {
+        LOG_WARN("[QWEN4EXP-USAGE-TRACK] marker construction failed; usage "
+                 "tracking disabled for this graph\n");
+      }
+    } else {
+      LOG_WARN("[QWEN4EXP-USAGE-TRACK] pinned host buffer allocation "
+               "failed; usage tracking disabled for this graph\n");
+    }
   }
 
   if (!phase2_prefix_stopped) {
@@ -6100,6 +6753,40 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
               (1024.0 * 1024.0 * 1024.0));
       return false;
     }
+  }
+  // Safe allocator-size probe for diagnosing unexpectedly large graph
+  // workspaces. reserve_size() performs GGML's no_alloc sizing pass, but it
+  // also rebuilds the scheduler's internal split graph. Do not reuse this
+  // FullGraph for a real allocation/compute after probing; decline it and let
+  // the owning prepare path destroy it. This is intentionally opt-in because
+  // it disables the full-graph instance for the diagnostic run.
+  const char *reserve_diag =
+      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_RESERVE_DIAG");
+  const bool reserve_diag_enabled =
+      reserve_diag &&
+      ((std::strcmp(reserve_diag, "1") == 0 ||
+        std::strcmp(reserve_diag, "all") == 0) ||
+       (std::strcmp(reserve_diag, "decode") == 0 && g.S == 1));
+  if (reserve_diag_enabled) {
+    const int n_backends = ggml_backend_sched_get_n_backends(g.sched);
+    std::vector<size_t> backend_sizes(static_cast<size_t>(n_backends), 0);
+    ggml_backend_sched_reserve_size(g.sched, g.graph, backend_sizes.data());
+    LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] no-allocation sizing only; "
+             "declining this graph instance (splits=%d copies=%d)\n",
+             ggml_backend_sched_get_n_splits(g.sched),
+             ggml_backend_sched_get_n_copies(g.sched));
+    for (int i = 0; i < n_backends; ++i) {
+      ggml_backend_t backend = ggml_backend_sched_get_backend(g.sched, i);
+      ggml_backend_buffer_type_t buft =
+          ggml_backend_sched_get_buffer_type(g.sched, backend);
+      const double gib = static_cast<double>(backend_sizes[i]) /
+                         (1024.0 * 1024.0 * 1024.0);
+      LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] backend=%s buffer=%s "
+               "required=%.3f GiB (%zu bytes)\n",
+               ggml_backend_name(backend), ggml_backend_buft_name(buft), gib,
+               backend_sizes[i]);
+    }
+    return false;
   }
   const double t_construction_ms = std::chrono::duration<double, std::milli>(
                                        std::chrono::steady_clock::now() -
@@ -6468,9 +7155,28 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // Match Bee's pipeline_parallel=false scheduler mode by default.  The
   // graph's CPU/GPU transitions are dependency-serial; the event/four-copy
   // mode is retained as an explicit opt-in for comparison.
+  //
+  // op_offload MUST stay false here. When true,
+  // ggml_backend_sched_backend_id_from_cur's host-weight-offload heuristic
+  // (ggml-backend.cpp, ~line 1178) can override a host-resident MoE expert
+  // weight's otherwise-correct CPU placement and push its consuming
+  // MUL_MAT_ID op onto CUDA instead -- but ONLY for S>=32 (ggml's own
+  // ggml_backend_offload_op prefill-scale gate), so it is invisible in any
+  // S=1 decode test. Confirmed on real hardware: a 26-host-layer /
+  // 22-device-layer full-graph prefill crashed with a genuine CUDA OOM
+  // trying to cudaMalloc ~84-90 GiB (approximately the complete host-layer
+  // expert footprint) the moment a prompt's prefill token count reached 32
+  // (38-token prompt crashed; 22/24/30-token prompts on the same config did
+  // not) -- exactly the failure mode bind_host_expert_scheduler_backend's
+  // own comment already warns about, and exactly what op_offload=false was
+  // chosen to prevent (see memory qwen4exp-mixed-gpu-decode-gap.md: "risks
+  // the exact host-weight/strided-DDR corruption... for any future S>=32
+  // codepath reusing this scheduler"). Device-resident expert layers are
+  // unaffected either way -- their tensors are already explicitly bound to
+  // the CUDA arena, independent of this flag.
   g->sched =
       ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
-                             graph_scheduler_parallel(), true);
+                             graph_scheduler_parallel(), false);
   if (!g->sched)
     return false;
   LOG_INFO("[GGML-QWEN-FULL] scheduler pipeline_parallel=%s copies=%d\n",
@@ -6766,9 +7472,14 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       }
     }
     // Match the prefill scheduler mode above; event/four-copy mode is opt-in.
+    // op_offload MUST stay false -- see the prefill call site's own comment
+    // (qwen4exp_full_graph_prepare, above) for the real S>=32 OOM/crash this
+    // prevents. Decode is always S==1 so this flag is a no-op for it either
+    // way; kept false here purely for consistency with the shared scheduler
+    // contract, not because decode itself is at risk.
     g->sched =
         ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
-                               graph_scheduler_parallel(), true);
+                               graph_scheduler_parallel(), false);
     if (!g->sched)
       return nullptr;
     LOG_INFO(
@@ -8442,9 +9153,11 @@ bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine, int pos_base,
     if (sched_bufts[1])
       sched_bufts_ptr = sched_bufts;
   }
+  // op_offload MUST stay false -- see qwen4exp_full_graph_prepare's own
+  // comment for the real S>=32 host-weight-offload OOM/crash this avoids.
   g->sched = ggml_backend_sched_new(backends, sched_bufts_ptr, 2,
                                     kGraphSize, graph_scheduler_parallel(),
-                                    true);
+                                    false);
   if (!g->sched)
     return false;
   if (g->layer_timing_verbose_enabled) {

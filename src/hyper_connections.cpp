@@ -31,6 +31,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -54,6 +55,22 @@ static bool dual_hc_gdn_pre_output() {
         return v && v[0] == '1';
     }();
     return enabled;
+}
+
+static void dump_hc_compare_vector(const char *base, const char *label,
+                                   int layer, int sub,
+                                   int call,
+                                   const std::vector<float> &values) {
+    if (!base || !label || values.empty()) return;
+    std::string path = std::string(base) + ".l" +
+                       (layer < 10 ? "0" : "") + std::to_string(layer) +
+                       ".s" + std::to_string(sub) + ".c" +
+                       (call < 10 ? "0" : "") + std::to_string(call) +
+                       "." + label + ".f32";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out)
+        out.write(reinterpret_cast<const char *>(values.data()),
+                  static_cast<std::streamsize>(values.size() * sizeof(float)));
 }
 
 // FIX: this file had ZERO finite-checks anywhere (confirmed via a real
@@ -410,6 +427,31 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   const float *const streams_base =
       in_streams ? in_streams : engine.hc_stream_buf.data();
 
+  // Diagnostic-only: mirror ggml_hc_backend.cpp's internal-dump instrument
+  // (same env var, same file-naming scheme) for this CPU path, so a run with
+  // hc_ggml=false is directly diffable against the GPU path's dumps and
+  // against Bee/llama.cpp's own captures. Restricted to S=1 / layers 0-1,
+  // like the GPU path; a no-op cost (one getenv + string compares) when the
+  // env var is unset.
+  const bool sub0 = norm_name.find("hc_attn_") != std::string::npos;
+  const bool sub1 = norm_name.find("hc_ffn_") != std::string::npos;
+  const char *internal_dump_base = std::getenv("MOESTREAM_GGML_HC_INTERNAL_DUMP");
+  const bool dump_this_call = internal_dump_base && S == 1 && trace_layer >= 0 &&
+                              trace_layer < 2 && (sub0 || sub1);
+  const int dump_sub = sub0 ? 0 : 1;
+  static int dump_call_index[2][2] = {};
+  const int dump_call = dump_this_call ? dump_call_index[dump_sub][trace_layer]++ : -1;
+  auto dump_hc_internal = [&](const char *label, const float *data, size_t n) {
+    if (!dump_this_call) return;
+    std::string path = std::string(internal_dump_base) + ".l" +
+                       (trace_layer < 10 ? "0" : "") + std::to_string(trace_layer) +
+                       ".s" + std::to_string(dump_sub) + ".call" +
+                       std::to_string(dump_call) + "." + label + ".f32";
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (out) out.write(reinterpret_cast<const char *>(data),
+                       (std::streamsize)(n * sizeof(float)));
+  };
+
   // 1. grouped RMS norm: ggml_rms_norm over x [n_embd, hc, T] normalizes
   // over ne0 = n_embd PER (stream, token) with NO learned gain (the gain is
   // the separate w_norm multiply after the flatten). Engine layout of
@@ -468,6 +510,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
     LOG_ERROR("[HC-Q4E] missing %s -- HC gate/norm silently unweighted.\n",
               norm_name.c_str());
   }
+  dump_hc_internal("normed", xn, (size_t)S * hc_dim);
 
   // 3. low-rank gate: lo = silu(down(xn) / hc); gate = sigmoid(up(lo)).
   float *const lo = grow(lo_buf, (size_t)S * hc_lr);
@@ -480,6 +523,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
     float x = lo[i] * inv_hc;
     lo[i] = x / (1.0f + std::exp(-x)); // silu
   }
+  dump_hc_internal("lowrank_silu", lo, lo_n);
   float *const gate = grow(gate_buf, (size_t)S * hc_dim);
   dense_proj(engine, up_name, lo, gate, S, hc_lr, hc_dim,
              force_original_quant);
@@ -489,6 +533,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
 #pragma omp parallel for if (S > 1) schedule(static)
   for (size_t i = 0; i < gate_n; ++i)
     gate[i] = 1.0f / (1.0f + std::exp(-gate[i]));
+  dump_hc_internal("gate", gate, gate_n);
 
   // 4. gated = xn * gate; mixed = mean over the HC streams.
 #pragma omp parallel for if (S > 1) schedule(static)
@@ -502,12 +547,14 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
         out[d] += xs[(size_t)h * D + d] * gs[(size_t)h * D + d];
     for (int d = 0; d < D; ++d) out[d] *= inv_hc;
   }
+  dump_hc_internal("mixed", out_hidden, (size_t)S * D);
 
   // 5. inject = w_inject(xn) -> [S, HC], consumed by the matching
   // hc_post_combine (per-layer hooks only).
   if (out_inject) {
     dense_proj(engine, inject_name, xn, out_inject, S, hc_dim, HC,
                force_original_quant);
+    dump_hc_internal("inject", out_inject, (size_t)S * HC);
     if (trace_gate("HC")) {
       const float *row = out_inject + (size_t)(S - 1) * HC;
       auto &&os = LOG_STREAM_VERBOSE();
@@ -906,6 +953,12 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
                                       int sub_block, int S, int D,
                                       const void *device_sub_block_out,
                                       const void *producer_event) {
+  if (std::getenv("MOESTREAM_HC_PATH_TRACE")) {
+    LOG_ERROR("[HC-PATH-TRACE] entry layer=%d sub=%d S=%d g_hc_ggml_live=%d "
+              "device_out=%p producer_event=%p\n",
+              layer_idx, sub_block, S, g_hc_ggml_live ? 1 : 0,
+              device_sub_block_out, producer_event);
+  }
   if (!g_hc_ggml_live || !device_sub_block_out ||
       (sub_block != 0 && sub_block != 1))
     return false;
@@ -914,32 +967,49 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
   // update the HC state directly, avoiding the general post graph's per-
   // stream mul/add/copy chain. The producer_event is intentionally required;
   // without it, stream 0 could race the shared GGML backend stream.
-  if (sub_block == 1 && producer_event &&
-      GgmlHcRunner::instance().post_combine_device_fused(
-          layer_idx, /*runner_sub_block=*/0, S, device_sub_block_out,
-          producer_event))
-    {
+  static const bool disable_fused_post = [] {
+    const char *v = std::getenv("MOESTREAM_QWEN_HC_DISABLE_FUSED_POST");
+    return v && v[0] == '1';
+  }();
+  {
+    const bool try_fused =
+        sub_block == 1 && producer_event && !disable_fused_post;
+    const bool fused_ok =
+        try_fused && GgmlHcRunner::instance().post_combine_device_fused(
+                         layer_idx, /*runner_sub_block=*/0, S,
+                         device_sub_block_out, producer_event);
+    if (layer_idx == 11 && sub_block == 1 &&
+        std::getenv("MOESTREAM_HC_PATH_TRACE")) {
+      LOG_ERROR("[HC-PATH-TRACE] layer=%d sub=%d S=%d try_fused=%d "
+                "fused_ok=%d\n",
+                layer_idx, sub_block, S, try_fused ? 1 : 0, fused_ok ? 1 : 0);
+    }
+    if (fused_ok) {
       static std::atomic<bool> logged_fused_post{false};
       if (!logged_fused_post.exchange(true, std::memory_order_relaxed))
         LOG_INFO("[GGML-HC] Qwen shared-output fused post-combine active "
                  "(stream-0 kernel + producer/event bridge)\n");
-    return true;
+      return true;
     }
+  }
   if (sub_block == 1)
     GgmlMoeRunner::active_instance().wait_device_output();
 
   // Diagnostic-only oracle for the device post-combine.  The pilot consumes
   // stream 0 after this operation, so a projection/input mismatch here can
   // look exactly like a bad router predictor.  Keep this behind the existing
-  // explicit HC comparison switch and restrict it to the first two decode
+  // explicit HC comparison switch and restrict it to Layer 0 decode
   // layers; it deliberately pays the D2H synchronizations only in that
   // diagnostic run, never in the production path.
   static const bool compare_post = [] {
     const char *e = std::getenv("MOESTREAM_GGML_HC_COMPARE");
     return e && e[0] == '1';
   }();
-  const bool compare_this_call = compare_post && S == 1 && sub_block == 1 &&
-                                 layer_idx < 2;
+  const bool compare_this_call = compare_post && S == 1 && layer_idx == 0;
+  static int compare_call_index[2][2] = {};
+  const int compare_call = compare_this_call
+                               ? compare_call_index[sub_block][layer_idx]++
+                               : -1;
   std::vector<float> before_streams;
   std::vector<float> inject;
   std::vector<float> sub_out;
@@ -951,25 +1021,39 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
         before_streams.data(), S);
     const bool inject_ok = GgmlHcRunner::instance().download_inject(
         inject.data(), S);
-    // Qwen's device-HC path passes the output of the routed+shared graph.
-    // That tensor belongs to GgmlQwenSharedRunner, not the routed
-    // GgmlMoeRunner, so the latter's output-slot validator correctly rejects
-    // it.  Try the Qwen combined-output owner first; retain the routed
-    // fallback for diagnostics of the non-shared path.
-    bool output_ok = GgmlQwenSharedRunner::instance_for_layer(layer_idx)
-                         .copy_output_to_host(
-        device_sub_block_out, sub_out.data());
-    if (!output_ok)
-      output_ok = GgmlMoeRunner::active_instance().copy_device_output_to_host(
-          device_sub_block_out, sub_out.data());
+    bool output_ok = false;
+    if (sub_block == 0) {
+      // Attention sub-block outputs are owned by the GDN runner, not either
+      // MoE runner. Read the persistent GDN output consumed by the HC graph.
+      output_ok = GgmlGdnProjRunner::instance().copy_full_output_to_host(
+          device_sub_block_out, sub_out.data(), S);
+    } else {
+      // Qwen's device-HC path passes the output of the routed+shared graph.
+      // That tensor belongs to GgmlQwenSharedRunner, not GgmlMoeRunner.
+      output_ok = GgmlQwenSharedRunner::instance_for_layer(layer_idx)
+                      .copy_output_to_host(device_sub_block_out,
+                                           sub_out.data());
+      if (!output_ok)
+        output_ok =
+            GgmlMoeRunner::active_instance().copy_device_output_to_host(
+                device_sub_block_out, sub_out.data());
+    }
     if (!before_ok || !inject_ok || !output_ok) {
-      LOG_WARN("[GGML-HC-POST-COMPARE] layer=%d snapshot failed before=%s "
-               "inject=%s output=%s\n",
-               layer_idx, before_ok ? "ok" : "failed",
+      LOG_WARN("[GGML-HC-POST-COMPARE] layer=%d sub=%d call=%d snapshot "
+               "failed before=%s inject=%s output=%s\n",
+               layer_idx, sub_block, compare_call,
+               before_ok ? "ok" : "failed",
                inject_ok ? "ok" : "failed", output_ok ? "ok" : "failed");
       before_streams.clear();
       inject.clear();
       sub_out.clear();
+    } else if (const char *dump_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP")) {
+      dump_hc_compare_vector(dump_base, "before_streams", layer_idx,
+                             sub_block, compare_call, before_streams);
+      dump_hc_compare_vector(dump_base, "inject", layer_idx, sub_block,
+                             compare_call, inject);
+      dump_hc_compare_vector(dump_base, "sub_out", layer_idx, sub_block,
+                             compare_call, sub_out);
     }
   }
   if (GgmlHcRunner::instance().post_combine_device(
@@ -996,9 +1080,10 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
             }
           }
         }
-        LOG_WARN("[GGML-HC-POST-COMPARE] layer=%d after=%s max_abs=%g "
-                 "max_rel=%g\n",
-                 layer_idx, after_ok ? "ok" : "failed", max_abs, max_rel);
+        LOG_WARN("[GGML-HC-POST-COMPARE] layer=%d sub=%d call=%d after=%s "
+                 "max_abs=%g max_rel=%g\n",
+                 layer_idx, sub_block, compare_call,
+                 after_ok ? "ok" : "failed", max_abs, max_rel);
       }
       return true;
     }

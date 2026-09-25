@@ -142,11 +142,6 @@ extern "C" void launch_qwen4exp_hc_q8_pre(float *streams, const float *norm,
                             stream>>>(xn, gate, mixed, S, HC, D);
 }
 
-extern "C" void launch_qwen4exp_hc_q8_post(float *streams,
-                                            const float *sub_out,
-                                            const float *inject, int S, int HC,
-                                            int D, cudaStream_t stream);
-
 namespace {
 __global__ void hc_post_kernel(float *__restrict__ streams,
                                const float *__restrict__ sub_out,

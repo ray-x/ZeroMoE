@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <vector>
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -653,6 +655,20 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       ggml_free(ctx);
       return false;
     }
+    static const bool keep_internal_dump_outputs = [] {
+      const char *env = std::getenv("MOESTREAM_GGML_HC_INTERNAL_DUMP");
+      return env && env[0] != '\0';
+    }();
+    if (keep_internal_dump_outputs && S == 1 && layer < 2) {
+      // The allocator normally reuses these temporaries immediately after
+      // their last consumer. Preserve them through graph completion only in
+      // the diagnostic run so the subsequent readback sees the real values.
+      ggml_set_output(xn2);
+      ggml_set_output(lo);
+      ggml_set_output(gate);
+      ggml_set_output(mixed);
+      ggml_set_output(inj);
+    }
     ggml_build_forward_expand(gf, mixed_store);
     ggml_build_forward_expand(gf, inj_store);
     if (!ggml_gallocr_alloc_graph((ggml_gallocr_t)galloc_pre_, gf)) {
@@ -670,6 +686,11 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
     }
     slot.ctx = ctx;
     slot.graph = gf;
+    slot.diag_normed = xn2;
+    slot.diag_lowrank_silu = lo;
+    slot.diag_gate = gate;
+    slot.diag_mixed = mixed;
+    slot.diag_inject = inj;
     slot.norm = b.norm;
     slot.down = b.down;
     slot.up = b.up;
@@ -1221,6 +1242,40 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
                               (ggml_backend_t)backend_);
   }
   pre_in_flight_ = true;
+  // Diagnostic-only snapshots to find which HC projection first magnifies an
+  // upstream state delta. They intentionally synchronize and are restricted
+  // to S=1 / Layers 0-1; the normal path is unchanged when the env var is unset.
+  static const char *internal_dump_base = [] {
+    return std::getenv("MOESTREAM_GGML_HC_INTERNAL_DUMP");
+  }();
+  if (internal_dump_base && S == 1 && layer < 2 && !b.custom_q8 &&
+      active_pre_graph_) {
+      static int call_index[2][kPreGraphLayerCount] = {};
+      const int call = call_index[sub_block][layer]++;
+      ggml_backend_event_synchronize(
+          (ggml_backend_event_t)active_pre_done_event_);
+      auto dump = [&](const char *label, void *opaque) {
+        auto *tensor = (ggml_tensor *)opaque;
+        if (!tensor || tensor->type != GGML_TYPE_F32 || !tensor->data)
+          return;
+        const size_t n = (size_t)ggml_nelements(tensor);
+        std::vector<float> host(n);
+        ggml_backend_tensor_get(tensor, host.data(), 0, n * sizeof(float));
+        std::string path = std::string(internal_dump_base) + ".l" +
+                           (layer < 10 ? "0" : "") + std::to_string(layer) +
+                           ".s" + std::to_string(sub_block) + ".call" +
+                           std::to_string(call) + "." + label + ".f32";
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (out)
+          out.write(reinterpret_cast<const char *>(host.data()),
+                    (std::streamsize)(host.size() * sizeof(float)));
+      };
+      dump("normed", active_pre_graph_->diag_normed);
+      dump("lowrank_silu", active_pre_graph_->diag_lowrank_silu);
+      dump("gate", active_pre_graph_->diag_gate);
+      dump("mixed", active_pre_graph_->diag_mixed);
+      dump("inject", active_pre_graph_->diag_inject);
+  }
   if (debug_sync_hc())
     ggml_backend_synchronize((ggml_backend_t)backend_);
   if (debug_check_hc_state()) {
@@ -1389,6 +1444,39 @@ bool GgmlHcRunner::post_combine_device_fused(
     cudaStreamWaitEvent(
         0, (cudaEvent_t)((ggml_backend_event_t)post_done_event_)->context, 0);
   cudaStreamWaitEvent(0, (cudaEvent_t)producer->context, 0);
+  // TEMP DIAGNOSTIC: is sub_out already NaN at its last element (d=D-1) for
+  // every token BEFORE this kernel ever touches it? Distinguishes "upstream
+  // FFN producer never wrote D-1" from "this kernel corrupts D-1 itself".
+  if (std::getenv("MOESTREAM_HC_POST_FUSED_SRC_TRACE")) {
+    cudaStreamSynchronize(0);
+    std::vector<float> probe((size_t)S * d_model_);
+    const cudaError_t e = cudaMemcpy(probe.data(), src->data,
+                                     probe.size() * sizeof(float),
+                                     cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) {
+      size_t nan_count = 0;
+      std::vector<int> nan_tokens;
+      for (int s = 0; s < S; ++s) {
+        if (!std::isfinite(probe[(size_t)s * d_model_ + d_model_ - 1])) {
+          ++nan_count;
+          if (nan_tokens.size() < 5) nan_tokens.push_back(s);
+        }
+      }
+      LOG_ERROR("[HC-POST-FUSED-SRC-TRACE] S=%d D=%d last-dim non-finite in "
+                "%zu/%d tokens (first tokens: %s)\n",
+                S, d_model_, nan_count, S,
+                [&] {
+                  std::string s;
+                  for (int t : nan_tokens) s += std::to_string(t) + " ";
+                  return s;
+                }()
+                    .c_str());
+    } else {
+      LOG_ERROR("[HC-POST-FUSED-SRC-TRACE] cudaMemcpy failed: %s\n",
+                cudaGetErrorString(e));
+      cudaGetLastError();
+    }
+  }
   launch_qwen4exp_hc_q8_post(
       static_cast<float *>(streams->data),
       static_cast<const float *>(src->data),
@@ -1439,6 +1527,33 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
   if (S > s_cap_ || inject_valid_S_ != S) return false;
   cudaSetDevice(device_);
   if (!ensure_post_graph(S)) return false;
+
+  // TEMP DIAGNOSTIC: is device_sub_block_out already NaN at its last element
+  // (d=D-1) for every token, before this function does anything with it?
+  if (device_sub_block_out && layer == 11 && sub_block == 1 &&
+      std::getenv("MOESTREAM_HC_POST_SRC_TRACE")) {
+    cudaStreamSynchronize(0);
+    ggml_backend_synchronize((ggml_backend_t)backend_);
+    std::vector<float> probe((size_t)S * d_model_);
+    const cudaError_t e = cudaMemcpy(probe.data(), device_sub_block_out,
+                                     probe.size() * sizeof(float),
+                                     cudaMemcpyDeviceToHost);
+    if (e == cudaSuccess) {
+      size_t nan_count = 0;
+      for (int s = 0; s < S; ++s)
+        if (!std::isfinite(probe[(size_t)s * d_model_ + d_model_ - 1]))
+          ++nan_count;
+      LOG_ERROR("[HC-POST-SRC-TRACE] layer=%d sub=%d S=%d D=%d last-dim "
+                "non-finite in %zu/%d tokens; overall nan_total=%zu\n",
+                layer, sub_block, S, d_model_, nan_count, S,
+                (size_t)std::count_if(probe.begin(), probe.end(),
+                                      [](float v) { return !std::isfinite(v); }));
+    } else {
+      LOG_ERROR("[HC-POST-SRC-TRACE] cudaMemcpy failed: %s\n",
+                cudaGetErrorString(e));
+      cudaGetLastError();
+    }
+  }
 
   // The graph and its [D,S] input are persistent for the whole request shape.
   // In particular, do not call ggml_gallocr_alloc_graph() here: doing so at

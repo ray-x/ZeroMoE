@@ -310,18 +310,22 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
   // that walk here made every decode token pay another O(n_experts) check for
   // every CPU layer; graph-backed slices cannot be reclaimed or resized.
 
-  out.meta = {arena->base,
-              arena->base + arena->gate_bytes,
-              arena->base + arena->gate_bytes + arena->up_bytes,
+  // Use the arena's explicit plane offsets.  Projection-compact arenas may
+  // insert alignment padding between gate/up/down; deriving the addresses
+  // from the raw plane byte counts makes the CPU graph read from the wrong
+  // projection whenever that padding is present.
+  out.meta = {arena->base + arena->gate_offset,
+              arena->base + arena->up_offset,
+              arena->base + arena->down_offset,
               arena->gate_bytes,
               arena->up_bytes,
               arena->down_bytes,
               static_cast<uint32_t>(first.gate_proj.meta.type),
               static_cast<uint32_t>(first.up_proj.meta.type),
               static_cast<uint32_t>(first.down_proj.meta.type)};
-  out.gate_plane = arena->base;
-  out.up_plane = arena->base + arena->gate_bytes;
-  out.down_plane = arena->base + arena->gate_bytes + arena->up_bytes;
+  out.gate_plane = arena->base + arena->gate_offset;
+  out.up_plane = arena->base + arena->up_offset;
+  out.down_plane = arena->base + arena->down_offset;
   out.expert_stride = arena->stride;
   out.projection_compact = arena->projection_compact;
   out.gate_stride = arena->projection_compact ? arena->gate_stride
@@ -819,7 +823,16 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // value into a much less useful all-layer failure report.
         check_finite("Qwen CPU route input", layer_idx, -1,
                      scratch.normed.data(), static_cast<size_t>(D));
+        const bool cpu_diag = [] {
+          const char *env =
+              std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+          return env && env[0] == '1';
+        }();
+        if (cpu_diag)
+          qwen_cpu_moe_diag_set_layer(layer_idx);
         const bool ok = run_qwen_cpu_graph(result);
+        if (cpu_diag)
+          qwen_cpu_moe_diag_set_layer(-1);
         if (ok)
           check_finite("Qwen CPU route output", layer_idx, -1, result,
                        static_cast<size_t>(D));
