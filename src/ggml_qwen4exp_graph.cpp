@@ -143,15 +143,23 @@ struct Qwen4ExpGpuStageContext {
   size_t down_bytes = 0;
   // Pinned host buffers, sized for exactly `topk` slots each.
   int32_t *host_ids = nullptr;        // topk * sizeof(int32_t)
-  uint8_t *host_gate_bounce = nullptr; // topk * gate_bytes
-  uint8_t *host_up_bounce = nullptr;   // topk * up_bytes
-  uint8_t *host_down_bounce = nullptr; // topk * down_bytes
+  // Bounded fix (see qwen4exp_cuda_gpu_stage_node_enqueue's own comment):
+  // gate_dst/up_dst/down_dst are bump-allocated back-to-back from the same
+  // device_expert_buffer arena (build_gpu_stage_node allocates them in that
+  // exact order, nothing else allocates in between), so they form one
+  // contiguous-modulo-alignment span. ONE pinned host buffer mirrors that
+  // same span/gaps byte-for-byte (gate at offset 0, up at
+  // combined_up_offset, down at combined_down_offset), so the H2D refresh
+  // is ONE cudaMemcpyAsync instead of three -- the callback still writes
+  // each projection's bytes at its own offset, unchanged in substance.
+  uint8_t *host_combined_bounce = nullptr; // combined_bytes total
+  size_t combined_bytes = 0;
+  size_t combined_up_offset = 0;
+  size_t combined_down_offset = 0;
   size_t ids_bytes = 0;
-  // Fixed device destinations (gate_dst/up_dst/down_dst's ->data), bound
-  // once via phase2_bind_or_allocate_expert -- never reallocated.
-  void *device_gate_dst = nullptr;
-  void *device_up_dst = nullptr;
-  void *device_down_dst = nullptr;
+  // gate_dst's ->data -- the start of the combined contiguous span; up/down
+  // are reached via combined_up_offset/combined_down_offset from here.
+  void *device_combined_dst = nullptr;
   // The `ids` device tensor this layer's real routing produced this build
   // (ggml_cont'd, so a flat D2H read is safe -- decode is always S==1, so
   // the argsort-view-stride pitfall documented at build_moe's ids_out site
@@ -171,42 +179,67 @@ qwen4exp_cuda_gpu_stage_callback(void *user_data) {
     return;
   const auto start = std::chrono::steady_clock::now();
   bool ok = true;
+  uint8_t *gate_base = ctx->host_combined_bounce;
+  uint8_t *up_base = ctx->host_combined_bounce + ctx->combined_up_offset;
+  uint8_t *down_base = ctx->host_combined_bounce + ctx->combined_down_offset;
+  // Split into three per-projection passes (was one interleaved loop) so
+  // gate/up/down memcpy cost can be measured independently -- diagnostic
+  // only, same total work and byte-for-byte identical output either way.
+  const auto t_gate_start = std::chrono::steady_clock::now();
   for (int k = 0; k < ctx->topk; ++k) {
     const int32_t expert = ctx->host_ids[k];
     if (expert < 0 || expert >= ctx->n_experts) {
-      // Defensive only -- real routing always produces valid ids. Zero-fill
-      // this slot and keep going rather than read out of bounds, mirroring
-      // env_host_node_skip_cpu()'s existing zero-fill escape hatch.
-      std::memset(ctx->host_gate_bounce +
-                      static_cast<size_t>(k) * ctx->gate_bytes,
-                  0, ctx->gate_bytes);
-      std::memset(ctx->host_up_bounce +
-                      static_cast<size_t>(k) * ctx->up_bytes,
-                  0, ctx->up_bytes);
-      std::memset(ctx->host_down_bounce +
-                      static_cast<size_t>(k) * ctx->down_bytes,
-                  0, ctx->down_bytes);
+      std::memset(gate_base + static_cast<size_t>(k) * ctx->gate_bytes, 0,
+                 ctx->gate_bytes);
+      continue;
+    }
+    std::memcpy(gate_base + static_cast<size_t>(k) * ctx->gate_bytes,
+               ctx->gate_plane + static_cast<size_t>(expert) * ctx->gate_stride,
+               ctx->gate_bytes);
+  }
+  const auto t_up_start = std::chrono::steady_clock::now();
+  for (int k = 0; k < ctx->topk; ++k) {
+    const int32_t expert = ctx->host_ids[k];
+    if (expert < 0 || expert >= ctx->n_experts) {
+      std::memset(up_base + static_cast<size_t>(k) * ctx->up_bytes, 0,
+                 ctx->up_bytes);
+      continue;
+    }
+    std::memcpy(up_base + static_cast<size_t>(k) * ctx->up_bytes,
+               ctx->up_plane + static_cast<size_t>(expert) * ctx->up_stride,
+               ctx->up_bytes);
+  }
+  const auto t_down_start = std::chrono::steady_clock::now();
+  for (int k = 0; k < ctx->topk; ++k) {
+    const int32_t expert = ctx->host_ids[k];
+    if (expert < 0 || expert >= ctx->n_experts) {
+      std::memset(down_base + static_cast<size_t>(k) * ctx->down_bytes, 0,
+                 ctx->down_bytes);
       ok = false;
       continue;
     }
-    std::memcpy(ctx->host_gate_bounce + static_cast<size_t>(k) * ctx->gate_bytes,
-               ctx->gate_plane + static_cast<size_t>(expert) * ctx->gate_stride,
-               ctx->gate_bytes);
-    std::memcpy(ctx->host_up_bounce + static_cast<size_t>(k) * ctx->up_bytes,
-               ctx->up_plane + static_cast<size_t>(expert) * ctx->up_stride,
-               ctx->up_bytes);
-    std::memcpy(ctx->host_down_bounce + static_cast<size_t>(k) * ctx->down_bytes,
+    std::memcpy(down_base + static_cast<size_t>(k) * ctx->down_bytes,
                ctx->down_plane + static_cast<size_t>(expert) * ctx->down_stride,
                ctx->down_bytes);
   }
+  const auto t_end = std::chrono::steady_clock::now();
   ctx->last_ok.store(ok, std::memory_order_release);
+  const double gate_ms =
+      std::chrono::duration<double, std::milli>(t_up_start - t_gate_start)
+          .count();
+  const double up_ms =
+      std::chrono::duration<double, std::milli>(t_down_start - t_up_start)
+          .count();
+  const double down_ms =
+      std::chrono::duration<double, std::milli>(t_end - t_down_start).count();
   const double callback_ms = std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - start)
+                                 t_end - start)
                                  .count();
   ctx->last_callback_ms.store(callback_ms, std::memory_order_release);
   if (std::getenv("MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING"))
-    LOG_INFO("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d callback_body_ms=%.4f\n",
-             ctx->layer_index, callback_ms);
+    LOG_INFO("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d gate_ms=%.4f up_ms=%.4f "
+             "down_ms=%.4f callback_body_ms=%.4f\n",
+             ctx->layer_index, gate_ms, up_ms, down_ms, callback_ms);
   if (!ok)
     LOG_ERROR("[QWEN4EXP-GPU-STAGE] layer=%d one or more routed ids were "
               "out of range [0,%d); affected slot(s) zero-filled\n",
@@ -223,15 +256,27 @@ static bool qwen4exp_cuda_gpu_stage_node_enqueue(const ggml_tensor *node,
     return false;
   auto *ctx = static_cast<Qwen4ExpGpuStageContext *>(node->extra);
   if (ctx->magic != Qwen4ExpGpuStageContext::kMagic || !node->src[2] ||
-      !node->src[2]->data || !ctx->host_ids || !ctx->host_gate_bounce ||
-      !ctx->host_up_bounce || !ctx->host_down_bounce ||
-      !ctx->device_gate_dst || !ctx->device_up_dst || !ctx->device_down_dst ||
+      !node->src[2]->data || !ctx->host_ids || !ctx->host_combined_bounce ||
+      !ctx->device_combined_dst ||
       !ctx->d2h_start || !ctx->d2h_end || !ctx->h2d_start || !ctx->h2d_end)
     return false;
 
-  const size_t gate_total = static_cast<size_t>(ctx->topk) * ctx->gate_bytes;
-  const size_t up_total = static_cast<size_t>(ctx->topk) * ctx->up_bytes;
-  const size_t down_total = static_cast<size_t>(ctx->topk) * ctx->down_bytes;
+  // Bounded overhead fix (2026-09-25): gate/up/down used to be three
+  // independent cudaMemcpyAsync H2D calls. build_gpu_stage_node now
+  // allocates them back-to-back from the same bump arena and the callback
+  // above writes into one combined pinned buffer at the same relative
+  // offsets, so the refresh is ONE H2D covering the whole span -- real,
+  // measured CUDA host-node dispatch overhead was found to scale with call
+  // COUNT more than payload size (see the usage-router-tap's own finding),
+  // so this cuts per-layer API calls from ~9 to ~7 without changing what
+  // bytes move. Does NOT fix the layer-to-layer sequential dependency: each
+  // staged layer's `ids` still isn't known until that layer's own router
+  // runs, which itself depends on the previous layer's output -- so unlike
+  // the usage tracker's end-of-graph batch (nothing downstream depends on
+  // its output, so every layer's tap could be deferred to one flush), each
+  // staged layer's bridge still has to run at its own point in the
+  // sequence, one at a time. This is a bounded per-layer fix, not a
+  // structural one.
   if (cudaEventRecord(ctx->d2h_start, stream) != cudaSuccess ||
       cudaMemcpyAsync(ctx->host_ids, node->src[2]->data, ctx->ids_bytes,
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
@@ -239,12 +284,9 @@ static bool qwen4exp_cuda_gpu_stage_node_enqueue(const ggml_tensor *node,
       cudaLaunchHostFunc(stream, qwen4exp_cuda_gpu_stage_callback, ctx) !=
           cudaSuccess ||
       cudaEventRecord(ctx->h2d_start, stream) != cudaSuccess ||
-      cudaMemcpyAsync(ctx->device_gate_dst, ctx->host_gate_bounce, gate_total,
-                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
-      cudaMemcpyAsync(ctx->device_up_dst, ctx->host_up_bounce, up_total,
-                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
-      cudaMemcpyAsync(ctx->device_down_dst, ctx->host_down_bounce, down_total,
-                      cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+      cudaMemcpyAsync(ctx->device_combined_dst, ctx->host_combined_bounce,
+                      ctx->combined_bytes, cudaMemcpyHostToDevice, stream) !=
+          cudaSuccess ||
       cudaEventRecord(ctx->h2d_end, stream) != cudaSuccess)
     return false;
   return true;
@@ -4554,6 +4596,28 @@ int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids,
     return -1;
   }
 
+  // Bounded overhead fix: gate_dst/up_dst/down_dst were just bump-allocated
+  // back-to-back (nothing else allocates from device_expert_buffer between
+  // the three make_dst() calls above), so they form one
+  // contiguous-modulo-alignment span -- confirm that here rather than
+  // assume it, so a future allocator change fails closed (falls back to a
+  // separate allocation) instead of silently corrupting an H2D copy.
+  const auto *gate_base = static_cast<const uint8_t *>(binding.gate_dst->data);
+  const auto *up_base = static_cast<const uint8_t *>(binding.up_dst->data);
+  const auto *down_base = static_cast<const uint8_t *>(binding.down_dst->data);
+  const size_t up_offset = static_cast<size_t>(up_base - gate_base);
+  const size_t down_offset = static_cast<size_t>(down_base - gate_base);
+  const size_t combined_bytes = down_offset + ggml_nbytes(binding.down_dst);
+  if (up_base <= gate_base || down_base <= up_base ||
+      up_offset < ggml_nbytes(binding.gate_dst) ||
+      down_offset < up_offset + ggml_nbytes(binding.up_dst)) {
+    LOG_WARN("[QWEN4EXP-GPU-STAGE] layer=%d declined: gate/up/down device "
+             "destinations are not contiguous (bump-allocator layout "
+             "changed?) -- combined single-copy staging requires it\n",
+             layer);
+    return -1;
+  }
+
   binding.ids_dispatch_const = host_input(
       g, ctx, GGML_TYPE_I32, {c.topk, g.S},
       static_cast<size_t>(c.topk) * static_cast<size_t>(g.S) * sizeof(int32_t),
@@ -4583,18 +4647,18 @@ int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids,
   node_ctx->ids_bytes = static_cast<size_t>(c.topk) * sizeof(int32_t);
   node_ctx->host_ids = static_cast<int32_t *>(
       alloc_registered_host(g, node_ctx->ids_bytes));
-  node_ctx->host_gate_bounce = static_cast<uint8_t *>(alloc_registered_host(
-      g, static_cast<size_t>(c.topk) * node_ctx->gate_bytes));
-  node_ctx->host_up_bounce = static_cast<uint8_t *>(alloc_registered_host(
-      g, static_cast<size_t>(c.topk) * node_ctx->up_bytes));
-  node_ctx->host_down_bounce = static_cast<uint8_t *>(alloc_registered_host(
-      g, static_cast<size_t>(c.topk) * node_ctx->down_bytes));
-  if (!node_ctx->host_ids || !node_ctx->host_gate_bounce ||
-      !node_ctx->host_up_bounce || !node_ctx->host_down_bounce)
+  // Per-expert slot size within the combined buffer stays gate_bytes/
+  // up_bytes/down_bytes (topk slots each, same as before) -- only the
+  // BASE offset of each projection's run of slots changed, from three
+  // independent allocations to up_offset/down_offset within one span.
+  node_ctx->combined_up_offset = up_offset;
+  node_ctx->combined_down_offset = down_offset;
+  node_ctx->combined_bytes = combined_bytes;
+  node_ctx->host_combined_bounce = static_cast<uint8_t *>(
+      alloc_registered_host(g, node_ctx->combined_bytes));
+  if (!node_ctx->host_ids || !node_ctx->host_combined_bounce)
     return -1;
-  node_ctx->device_gate_dst = binding.gate_dst->data;
-  node_ctx->device_up_dst = binding.up_dst->data;
-  node_ctx->device_down_dst = binding.down_dst->data;
+  node_ctx->device_combined_dst = binding.gate_dst->data;
 
   cudaSetDevice(g.device);
   if (cudaEventCreate(&node_ctx->d2h_start) != cudaSuccess ||
@@ -4606,12 +4670,7 @@ int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids,
   // build_qwen4exp_host_node follows, so capture never observes
   // first-touch page faults.
   std::fill_n(node_ctx->host_ids, c.topk, 0);
-  std::memset(node_ctx->host_gate_bounce, 0,
-             static_cast<size_t>(c.topk) * node_ctx->gate_bytes);
-  std::memset(node_ctx->host_up_bounce, 0,
-             static_cast<size_t>(c.topk) * node_ctx->up_bytes);
-  std::memset(node_ctx->host_down_bounce, 0,
-             static_cast<size_t>(c.topk) * node_ctx->down_bytes);
+  std::memset(node_ctx->host_combined_bounce, 0, node_ctx->combined_bytes);
 
   // A tiny dummy leaf (same type/shape as gate_dst) satisfies ggml_cpy's
   // own shape/type validation for the marker's formal "source" -- the real
@@ -8589,6 +8648,58 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     host_node_all_ok = all_ok;
     if (!all_ok)
       return false;
+  }
+  // GPU-staging D2H/gather/H2D breakdown -- the events were already created
+  // and recorded at enqueue time (qwen4exp_cuda_gpu_stage_node_enqueue) but
+  // never queried anywhere; add that here, mirroring the host-node ledger
+  // immediately above, so a real per-op breakdown exists instead of only
+  // the callback body's own wall-clock (MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING).
+  if (!g.gpu_stage_contexts.empty()) {
+    float d2h_ms = 0.0f;
+    float h2d_ms = 0.0f;
+    float callback_span_ms = 0.0f;
+    double callback_body_ms = 0.0;
+    bool all_ok = true;
+    for (const auto &stage_ctx : g.gpu_stage_contexts) {
+      if (!stage_ctx)
+        continue;
+      float node_d2h = 0.0f;
+      float node_h2d = 0.0f;
+      float node_callback_span = 0.0f;
+      // NOTE: cudaEventElapsedTime reliably fails with cudaErrorInvalidValue
+      // here on every REPLAY token (never on the first/capture token, and
+      // forcing cudaEventSynchronize first does not help) -- a real CUDA
+      // Graphs limitation, not a race: events recorded as NODES inside a
+      // captured graph are not reliably re-queryable for elapsed time
+      // across multiple cudaGraphLaunch replays via this API. D2H/H2D stay
+      // unmeasured; callback_body (host-side chrono, not CUDA-event-based)
+      // is unaffected and remains the reliable number.
+      const cudaError_t err_d2h = cudaEventElapsedTime(
+          &node_d2h, stage_ctx->d2h_start, stage_ctx->d2h_end);
+      const cudaError_t err_h2d = cudaEventElapsedTime(
+          &node_h2d, stage_ctx->h2d_start, stage_ctx->h2d_end);
+      if (err_d2h != cudaSuccess || err_h2d != cudaSuccess) {
+        LOG_WARN("[QWEN4EXP-GPU-STAGE] event timing unavailable at pos=%d "
+                 "d2h_err=%s h2d_err=%s\n",
+                 pos_base, cudaGetErrorString(err_d2h),
+                 cudaGetErrorString(err_h2d));
+      } else {
+        d2h_ms += node_d2h;
+        h2d_ms += node_h2d;
+      }
+      if (cudaEventElapsedTime(&node_callback_span, stage_ctx->d2h_end,
+                               stage_ctx->h2d_start) == cudaSuccess)
+        callback_span_ms += node_callback_span;
+      callback_body_ms +=
+          stage_ctx->last_callback_ms.load(std::memory_order_acquire);
+      all_ok = all_ok && stage_ctx->last_ok.load(std::memory_order_acquire);
+    }
+    LOG_INFO("[QWEN4EXP-GPU-STAGE-TIME] pos=%d layers=%zu D2H=%.3fms "
+             "callback_span=%.3fms callback_body=%.3fms H2D=%.3fms "
+             "total=%.3fms ok=%d\n",
+             pos_base, g.gpu_stage_contexts.size(), d2h_ms, callback_span_ms,
+             callback_body_ms, h2d_ms, d2h_ms + callback_span_ms + h2d_ms,
+             all_ok ? 1 : 0);
   }
   if (g.stage_enabled && !g.stage_slots.empty()) {
     float h2d_ms = 0.0f, wait_ms = 0.0f, d2d_ms = 0.0f, compute_ms = 0.0f;
