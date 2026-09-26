@@ -791,6 +791,23 @@ struct HostAllocation {
   size_t reservation_bytes = 0;
 };
 
+// Set by either of two independent VRAM-exhaustion sites -- init_device_
+// expert_arena's own allocation-declined path (real cudaMalloc failure, or a
+// pre-check that predicts one) and build_graph's later scheduler-admission-
+// floor check -- just before each declines specifically because there isn't
+// enough VRAM for the CURRENT device_expert_layers value, with room left to
+// shrink it further. Both call sites reach it as a plain global rather than
+// a return value because both are deep inside functions the plain
+// (Phase2Mode::Off) decode path's build_one()/build_graph() call chain
+// already tears down and rebuilds FROM SCRATCH on any failure -- so "was
+// THIS specific, retry-worth-it reason why construction just failed" only
+// needs a cheap signal read right after build_one() returns nullptr, not a
+// return-value plumbed through every intermediate call. Reset at the top of
+// every build_graph() call so a stale true from an earlier, unrelated
+// attempt can never leak into a later retry decision it doesn't apply to.
+static thread_local bool
+    g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
+
 struct FullGraph {
   StreamingEngine *engine = nullptr;
   int device = -1;
@@ -3350,6 +3367,22 @@ bool init_device_expert_arena(FullGraph &g) {
     LOG_WARN(
         "[GGML-QWEN-FULL] device expert arena allocation declined: %.2f GiB\n",
         static_cast<double>(capacity) / (1024.0 * 1024.0 * 1024.0));
+    // allow_layer_clamp is deliberately false whenever split_active (see its
+    // own comment) -- shrinking device_expert_layers in place here, mid-loop,
+    // while split_gpu_expert_ids stays fixed from an earlier
+    // plan_expert_vram_split() call, is NOT safe (the trailing-window
+    // boundary moves, so device_expert_block_covers()'s exclusion set for
+    // the split layers would be stale). But the CALLER's retry loop around
+    // build_one() already rebuilds the entire FullGraph from scratch on each
+    // attempt -- including a fresh plan_expert_vram_split() -- so it hits
+    // none of that staleness. Signal it the same way build_graph's own later
+    // check does, so a config that only fails HERE (real cudaMalloc OOM
+    // during arena allocation, not just build_graph's scheduler-admission
+    // floor) still gets the graceful shrink-and-retry instead of collapsing
+    // straight to legacy dispatch. Real, reproduced case: qwen4exp_option_b_
+    // selected_layers=7 layers at device_expert_layers=18, 2026-09-26.
+    if (g.device_expert_layers > 0)
+      g_qwen4exp_build_graph_retry_smaller_expert_layers = true;
     return false;
   }
   if (g.device_expert_layers != requested_layers)
@@ -5648,20 +5681,6 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
   }
   return true;
 }
-
-// Set by build_graph's own graph-allocator headroom check (see its own
-// comment) just before it declines specifically because free VRAM fell
-// under the scheduler's 1 GiB admission floor -- the SAME class of failure
-// init_device_expert_arena's allow_layer_clamp loop already retries at a
-// smaller device_expert_layers, but build_graph's later check has no such
-// retry of its own, so a caller that wants one has to ask "was THIS specific,
-// retry-worth-it reason why build_graph just returned false" instead of
-// blindly retrying on any failure (most build_graph failures are NOT fixed by
-// shrinking device_expert_layers). Reset at the top of every build_graph call
-// so a stale true from an earlier, unrelated call can never leak into a
-// caller's retry decision.
-static thread_local bool
-    g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
 
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
