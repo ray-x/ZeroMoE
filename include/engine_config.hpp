@@ -642,6 +642,14 @@ struct EngineConfig {
   int qwen4exp_option_b_layer = -1;
   int qwen4exp_option_b_top_n = 0;
   float qwen4exp_option_b_min_coverage = 0.80f;
+  // When true, top_n is only a ceiling: each selected layer's real hot-set
+  // size shrinks to the smallest N (per that layer's own real usage ranking)
+  // that still reaches qwen4exp_option_b_min_coverage, instead of every
+  // layer always paying for exactly top_n experts regardless of how
+  // concentrated its own routing is. Off by default -- existing configs
+  // that rely on a fixed, deterministic per-layer VRAM cost keep that
+  // behavior unchanged.
+  bool qwen4exp_option_b_right_size_top_n = false;
   // Optional explicit layer allow-list for the multi-layer Option B test.
   // When non-empty, only these CPU-side layers receive the static hot set;
   // expert ranking within each selected layer still comes from pin_file.
@@ -2537,6 +2545,9 @@ inline bool EngineConfig::load(const std::string &path) {
       "qwen4exp_option_b_top_n", qwen4exp_option_b_top_n);
   qwen4exp_option_b_min_coverage = doc.root.get_float(
       "qwen4exp_option_b_min_coverage", qwen4exp_option_b_min_coverage);
+  qwen4exp_option_b_right_size_top_n = doc.root.get_bool(
+      "qwen4exp_option_b_right_size_top_n",
+      qwen4exp_option_b_right_size_top_n);
   qwen4exp_option_b_selected_layers = doc.root.get_int_array(
       "qwen4exp_option_b_selected_layers");
   qwen4exp_option_b_max_layers = (int)doc.root.get_int(

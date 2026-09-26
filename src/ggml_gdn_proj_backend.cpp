@@ -1293,6 +1293,32 @@ bool GgmlGdnProjRunner::run_full_device_impl(
       LOG_INFO(
           "[GGML-GDN-FULL] decode recurrent state/history remain on CUDA\n");
     }
+    // ensure_full_state() zero-initializes the persistent device history/
+    // state tensors under the assumption that their first use is always the
+    // start of a brand-new sequence. That assumption breaks when this
+    // layer's full-graph weights first become ready DURING an in-progress
+    // prefill (gdn_full_ggml_register() succeeds lazily, mid-forward-pass,
+    // the first time the layer is ever visited): that same prefill call had
+    // device_state_resident=false (S>1) and went through run_full()'s
+    // HOST-state contract, which writes its final conv-history/recurrent
+    // state back into the CALLER's history/state arrays but never touches
+    // full_state.history/.state. Real, reproduced bug (found on a UD-IQ4_XS
+    // checkpoint, single fresh request): the first decode step after such a
+    // prefill silently started GDN's recurrent memory from ZERO instead of
+    // the prompt's real final state -- fluent but context-blind output, no
+    // NaN/crash. full_state.device_state_resident is exactly the "these
+    // device tensors are known authoritative" flag (also set by
+    // reset_full_device_states() for a genuinely new sequence, where zero
+    // IS correct) -- seed from the caller's own host arrays whenever it is
+    // not yet true, so both state representations start in agreement.
+    if (!full_state.device_state_resident) {
+      cudaSetDevice(device_);
+      ggml_backend_tensor_set((ggml_tensor *)full_state.history, history, 0,
+                              full_state.history_bytes);
+      ggml_backend_tensor_set((ggml_tensor *)full_state.state, state, 0,
+                              full_state.state_bytes);
+      full_state.device_state_resident = true;
+    }
   }
   if (full_state.pending) {
     if (device_state_resident) {
