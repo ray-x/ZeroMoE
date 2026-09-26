@@ -2682,7 +2682,27 @@ void plan_expert_vram_split(FullGraph &g) {
         return a < b;
       });
 
-      const int hot_count = std::min(option_top_n, c.n_experts);
+      int hot_count = std::min(option_top_n, c.n_experts);
+      // top_n is a flat per-model ceiling, but layers differ widely in how
+      // concentrated their real routing is -- a layer that already clears
+      // min_coverage well before top_n is still charged the full top_n VRAM
+      // cost below. When opted in, shrink hot_count to the smallest prefix
+      // of THIS layer's own ranking that reaches min_coverage, so VRAM scales
+      // with actual per-layer concentration instead of a one-size-fits-all
+      // count. Off by default: existing configs keep their exact, previously
+      // measured per-layer VRAM cost.
+      if (g.engine->qwen4exp_option_b_right_size_top_n && total_count > 0) {
+        const double target = g.engine->qwen4exp_option_b_min_coverage;
+        uint64_t cum = 0;
+        for (int k = 0; k < hot_count; ++k) {
+          cum += counts[static_cast<size_t>(ranked[static_cast<size_t>(k)])];
+          if (static_cast<double>(cum) / static_cast<double>(total_count) >=
+              target) {
+            hot_count = k + 1;
+            break;
+          }
+        }
+      }
       std::vector<int> hot_ids(ranked.begin(), ranked.begin() + hot_count);
       uint64_t hot_route_count = 0;
       for (int expert : hot_ids)

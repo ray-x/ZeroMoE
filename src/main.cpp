@@ -390,6 +390,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_option_b_top_n = config.qwen4exp_option_b_top_n;
   engine.qwen4exp_option_b_min_coverage =
       config.qwen4exp_option_b_min_coverage;
+  engine.qwen4exp_option_b_right_size_top_n =
+      config.qwen4exp_option_b_right_size_top_n;
   engine.qwen4exp_option_b_max_layers = config.qwen4exp_option_b_max_layers;
   engine.qwen4exp_option_b_fill_vram = config.qwen4exp_option_b_fill_vram;
   engine.qwen4exp_option_b_concentrated_only =
