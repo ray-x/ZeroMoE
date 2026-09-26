@@ -783,9 +783,27 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
     }
   }
   if (g_hc_ggml_live) {
+    // EngineConfig::gdn_full_ggml's own comment: "Requires gdn_proj_ggml and
+    // qwen4exp_gdn_conv_gpu; falls back per layer." attention_layer.cpp's own
+    // fast-path gate (qwen4exp_gdn_gguf) enforces that by chaining
+    // gdn_proj_ggml_usable()/gdn_full_ggml_register() before ever setting
+    // gdn_conv_fused_ok -- this call site must reach the SAME verdict about
+    // whether that fast path actually ran for this layer, not just whether
+    // gdn_full_ggml() is set. Checking gdn_proj_ggml() alone still isn't
+    // sufficient (the runner's own ensure()/registration can fail per-layer,
+    // e.g. a missing resident weight), so also require full_weights_ready():
+    // that is the exact bit attention_layer.cpp's gdn_full_ggml_register()
+    // itself short-circuits on (see its own `if (r.full_weights_ready(...))
+    // return true;`). Without this, a config with gdn_full_ggml=true but
+    // gdn_proj_ggml=false (or a layer whose full-graph registration simply
+    // failed) makes this function believe the GDN output is device-resident
+    // when qwen4exp_gdn_gguf silently fell back to the host dense_proj/CPU
+    // path for it -- real, reproduced bug: 2026-09-26, silently corrupted
+    // (context-blind garbage) decode output, not a crash or a clean fallback.
     const bool device_gdn_input =
-        gdn_full_ggml() && sub_block == 0 &&
+        gdn_full_ggml() && gdn_proj_ggml() && sub_block == 0 &&
         qwen4exp_is_gdn_layer(c, layer_idx) &&
+        GgmlGdnProjRunner::instance().full_weights_ready(layer_idx) &&
         !force_hc_gdn_pre_host();
     const bool dual_gdn_pre_output =
         device_gdn_input && dual_hc_gdn_pre_output();

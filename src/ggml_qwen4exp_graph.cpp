@@ -5649,7 +5649,22 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
   return true;
 }
 
+// Set by build_graph's own graph-allocator headroom check (see its own
+// comment) just before it declines specifically because free VRAM fell
+// under the scheduler's 1 GiB admission floor -- the SAME class of failure
+// init_device_expert_arena's allow_layer_clamp loop already retries at a
+// smaller device_expert_layers, but build_graph's later check has no such
+// retry of its own, so a caller that wants one has to ask "was THIS specific,
+// retry-worth-it reason why build_graph just returned false" instead of
+// blindly retrying on any failure (most build_graph failures are NOT fixed by
+// shrinking device_expert_layers). Reset at the top of every build_graph call
+// so a stale true from an earlier, unrelated call can never leak into a
+// caller's retry decision.
+static thread_local bool
+    g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
+
 bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
+  g_qwen4exp_build_graph_retry_smaller_expert_layers = false;
   // Timing split (2026-09-17): full-graph decode's FIRST call pays a real
   // ~5.3s one-time cost, invisible in any --ngen 400 average (6000/400=
   // 15ms/token) but a genuine multi-second latency cliff for interactive
@@ -6810,6 +6825,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
           static_cast<double>(g.device_expert_capacity +
                               g.device_dense_capacity) /
               (1024.0 * 1024.0 * 1024.0));
+      // Signal to a caller that wants one: THIS specific failure (scheduler
+      // admission floor, not some other construction error) may be fixed by
+      // shrinking device_expert_layers and rebuilding from scratch -- see
+      // this flag's own comment for why init_device_expert_arena's existing
+      // allow_layer_clamp retry doesn't already cover it (that check runs
+      // BEFORE the scheduler's own workspace is known to be needed).
+      if (err == cudaSuccess && !borrowed_phase2_suffix &&
+          g.device_expert_layers > 0)
+        g_qwen4exp_build_graph_retry_smaller_expert_layers = true;
       return false;
     }
   }
@@ -7425,6 +7449,14 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
              (free_after - free_before) / (1024.0 * 1024.0 * 1024.0));
   }
 
+  // How many trailing device_expert_layers to give up on this attempt,
+  // relative to the configured/env value -- only ever incremented by the
+  // plain (Phase2Mode::Off) retry loop further down, after build_graph
+  // itself reports (via g_qwen4exp_build_graph_retry_smaller_expert_layers)
+  // that the scheduler's own admission floor, not device_expert_layers
+  // itself, was the reason construction was declined.
+  int device_expert_layers_shrink = 0;
+
   // Builds ONE decode FullGraph instance -- the ordinary single-instance
   // decode graph when mode==Off, or one leg of Phase 2's 3-instance split
   // otherwise. Identical to the pre-Phase-2 body of this function in every
@@ -7454,8 +7486,16 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     g->decode_mode = true;
     g->kv_capacity = env_decode_kv_capacity(engine.max_t, required);
     g->decode_last_pos = pos_base - 1;
+    // device_expert_layers_shrink: only ever nonzero when the caller (the
+    // plain Phase2Mode::Off build_one() call below) is retrying after
+    // build_graph's own scheduler-admission-floor decline -- see
+    // g_qwen4exp_build_graph_retry_smaller_expert_layers's own comment.
+    // Phase 2's prefix/suffix build_one() calls never set it, so this is a
+    // no-op for them.
     g->device_expert_layers =
-        std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
+        std::max(0, std::min(qwen4exp_full_graph_device_expert_layers(),
+                             c.n_layers) -
+                        device_expert_layers_shrink);
     g->device_expert_trailing = env_device_expert_trailing();
     const char *partial_gate_up =
         std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
@@ -7562,9 +7602,23 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       return nullptr;
     }
     if (!build_graph(*g, has_ple_layer(c) ? &ple : nullptr)) {
-      LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined "
-               "(phase2_mode=%d); layered decode remains active\n",
-               static_cast<int>(mode));
+      // The plain (Phase2Mode::Off) caller retries at a smaller
+      // device_expert_layers when this is set, so "layered decode remains
+      // active" would be misleading here -- it only becomes true if that
+      // retry loop itself gives up. Phase 2 callers never retry, so for them
+      // the message is unconditionally accurate either way.
+      if (mode == FullGraph::Phase2Mode::Off &&
+          g_qwen4exp_build_graph_retry_smaller_expert_layers) {
+        LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined "
+                 "(phase2_mode=%d); retrying at a smaller "
+                 "device_expert_layers before falling back to layered "
+                 "decode\n",
+                 static_cast<int>(mode));
+      } else {
+        LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined "
+                 "(phase2_mode=%d); layered decode remains active\n",
+                 static_cast<int>(mode));
+      }
       return nullptr;
     }
 
@@ -7672,8 +7726,31 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
              "ordinary single-graph decode path\n");
   }
 
-  auto g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr, nullptr,
-                     nullptr);
+  // device_expert_layers's arena-allocation stage already retries at a
+  // smaller layer count when the ARENA itself doesn't fit
+  // (init_device_expert_arena's own allow_layer_clamp loop) -- but the
+  // scheduler's own admission-floor check further inside build_graph runs
+  // AFTER that arena is already committed, and until now had no retry of
+  // its own: a config that needed just one or two fewer device_expert_layers
+  // to leave room for the scheduler's workspace fell all the way back to the
+  // legacy per-layer decode path instead (a real, ~4x-plus throughput
+  // cliff, not a graceful one-layer-at-a-time degradation). Real, reproduced
+  // case: qwen4exp_option_b_selected_layers with 6+ split layers at
+  // device_expert_layers=19 on a 24 GiB card, 2026-09-26.
+  std::unique_ptr<FullGraph> g;
+  constexpr int kMaxExpertLayerShrinkRetries = 8;
+  for (int attempt = 0; attempt <= kMaxExpertLayerShrinkRetries; ++attempt) {
+    g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr, nullptr, nullptr);
+    if (g)
+      break;
+    if (!g_qwen4exp_build_graph_retry_smaller_expert_layers)
+      return false; // some other, non-retry-able construction failure
+    ++device_expert_layers_shrink;
+    LOG_WARN("[GGML-QWEN-FULL-DECODE] retrying with device_expert_layers "
+             "shrunk by %d (scheduler admission floor needed more headroom "
+             "than the arena-only check reserved)\n",
+             device_expert_layers_shrink);
+  }
   if (!g)
     return false;
   LOG_INFO("[GGML-QWEN-FULL-DECODE] enabled: one scheduler submission per "

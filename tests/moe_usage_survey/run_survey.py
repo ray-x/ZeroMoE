@@ -36,7 +36,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
-MOESTREAM = REPO / "build" / "moestream"
+MOESTREAM = Path(os.environ.get("MOESTREAM_SURVEY_BINARY",
+                               str(REPO / "build" / "moestream")))
 CONFIG = Path(os.environ.get("MOESTREAM_SURVEY_CONFIG",
                             str(HERE / "survey_config.toml")))
 PROMPTS_DIR = Path(os.environ.get("MOESTREAM_SURVEY_PROMPTS_DIR",
