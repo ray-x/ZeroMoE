@@ -3210,6 +3210,17 @@ inline bool EngineConfig::validate() {
                  "using 0 (disabled).\n";
     vram_preload_prefix_layers = 0;
   }
+  if (gdn_full_ggml && !gdn_proj_ggml) {
+    std::cerr
+        << "[CONFIG] gdn_full_ggml=true requires gdn_proj_ggml=true (see "
+           "gdn_full_ggml's own comment) -- with gdn_proj_ggml=false, "
+           "every GDN layer falls back to the per-layer CPU/dense_proj path "
+           "at runtime (hyper_connections.cpp's device_gdn_input now checks "
+           "gdn_proj_ggml() too, so this falls back safely rather than "
+           "corrupting decode as it silently did before that fix) -- but "
+           "you get none of gdn_full_ggml's intended speedup. Set "
+           "gdn_proj_ggml=true as well to actually use it.\n";
+  }
   if (vram_cache_full_layer_prefix < 0) {
     std::cerr << "[CONFIG] vram_cache_full_layer_prefix cannot be negative -- "
                  "using 0 (disabled).\n";
