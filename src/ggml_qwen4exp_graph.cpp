@@ -904,6 +904,13 @@ struct FullGraph {
   // FFN residual combine.  These are intentionally limited to layers 0/1.
   ggml_tensor *hidden01_snapshot[2] = {nullptr, nullptr};
   bool hidden01_dumped = false;
+  // Generalizes hidden01_snapshot above to ALL layers, dumped every decode
+  // step (not one-shot) -- for a full layer-by-layer, token-by-token parity
+  // trace against bee/llama.cpp when hidden01's 2-layer window isn't enough
+  // to localize where two engines' outputs first diverge. Gated by
+  // MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP; same semantic boundary (after each
+  // layer's attention+FFN residual combine) as hidden01_snapshot.
+  std::vector<ggml_tensor *> all_layers_snapshot;
   std::vector<std::pair<std::string, ggml_tensor *>> layer0_split_snapshots;
   bool layer0_split_dumped = false;
   // Optional one-shot raw routed-MoE output dump for Layer 13. This is
@@ -1552,6 +1559,13 @@ static const char * env_layer0_split_dump_path() {
   return v && v[0] ? v : nullptr;
 }
 
+// All-layer, every-decode-step hidden-state dump for a full parity trace
+// against bee/llama.cpp -- see all_layers_snapshot's own comment.
+static const char * env_alllayers_dump_path() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP");
+  return v && v[0] ? v : nullptr;
+}
+
 // Host-node transport diagnostic. The layer is selected explicitly so the
 // same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
 // applied to Layer 13 without enabling diagnostics for every callback.
@@ -1684,6 +1698,36 @@ void log_layer0_diag_host_values(const char *role, const float *values,
            "max=%.9g sum=%.9g data=%p\n",
            role, n, first.str().c_str(), min_v, max_v, sum,
            static_cast<const void *>(values));
+}
+
+// Every-decode-step, all-layer hidden-state dump for a bee/llama.cpp parity
+// trace. One file per decode step: <path>.step<pos>.f32, holding
+// n_layers * D float32s in layer-major order (all_layers_snapshot[l]'s raw
+// data back to back, skipping any layer whose snapshot is unavailable by
+// writing zeros so file layout/offsets stay fixed regardless).
+void dump_all_layers_snapshot(FullGraph &g, int pos) {
+  const char *path = env_alllayers_dump_path();
+  if (!path || g.all_layers_snapshot.empty())
+    return;
+  std::ostringstream fname;
+  fname << path << ".step" << pos << ".f32";
+  std::ofstream out(fname.str(), std::ios::binary | std::ios::trunc);
+  if (!out) {
+    LOG_WARN("[QWEN4EXP-ALLLAYERS] cannot open %s\n", fname.str().c_str());
+    return;
+  }
+  for (ggml_tensor *t : g.all_layers_snapshot) {
+    if (t && t->data) {
+      const size_t n = static_cast<size_t>(ggml_nelements(t));
+      out.write(static_cast<const char *>(t->data),
+                static_cast<std::streamsize>(n * sizeof(float)));
+    } else {
+      const size_t n = static_cast<size_t>(g.D);
+      std::vector<float> zeros(n, 0.0f);
+      out.write(reinterpret_cast<const char *>(zeros.data()),
+                static_cast<std::streamsize>(n * sizeof(float)));
+    }
+  }
 }
 
 void dump_layer0_diag_values(FullGraph &g) {
@@ -4871,8 +4915,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (layer13_moe_diag)
     g.layer13_moe_diag_enabled = true;
   const bool layer0_diag =
-      layer == 0 && (env_layer0_iq2_diag_enabled() ||
-                     env_layer0_split_dump_path() != nullptr);
+      (layer == 0 && (env_layer0_iq2_diag_enabled() ||
+                      env_layer0_split_dump_path() != nullptr)) ||
+      env_alllayers_dump_path() != nullptr;
   if (layer0_diag) {
     g.layer0_diag_enabled = true;
     LOG_INFO("[QWEN4EXP-LAYER0-DIAG] graph=%p decode=%d S=%d "
@@ -5519,8 +5564,29 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
   const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
                         ? g.engine->model_file.architecture_config.rope_n_rot
                         : g.hd;
-  q = ggml_rope(ctx, q, g.positions, n_rot, GGML_ROPE_TYPE_NORMAL);
-  k = ggml_rope(ctx, k, g.positions, n_rot, GGML_ROPE_TYPE_NORMAL);
+  // Qwen4Exp's upstream rope_type is IMROPE (interleaved M-RoPE), whose
+  // cos/sin pairing is NEOX-ordered (rotate-half), not the adjacent-pair
+  // (2j,2j+1) ordering GGML_ROPE_TYPE_NORMAL applies. For text-only decode
+  // every M-RoPE section carries the same scalar position (no vision/video
+  // tokens), so IMROPE's per-section theta selection is provably identical
+  // to plain single-axis NEOX rope (ggml.h's own ggml_rope_multi comment:
+  // "the theta for each dim is computed the same way as ggml_rope_ext, no
+  // matter the section") -- ggml_rope_ext with GGML_ROPE_TYPE_NEOX is exact,
+  // not an approximation, and needs no 4x-wide position tensor. Also use
+  // this model's real rope.freq_base (10,000,000 for this checkpoint) --
+  // plain ggml_rope()'s 5-arg wrapper silently hardcodes ggml's generic
+  // 10,000 default, which is wrong for Qwen4Exp by 1000x.
+  const float rope_freq_base =
+      g.engine->model_file.get_config_float("rope.freq_base", 10000.0f);
+  const auto &rope_c = g.engine->model_file.architecture_config;
+  q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
+                     rope_c.rope_n_ctx_orig, rope_freq_base,
+                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
+                     rope_c.rope_attn_factor, 32.0f, 1.0f);
+  k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
+                     rope_c.rope_n_ctx_orig, rope_freq_base,
+                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
+                     rope_c.rope_attn_factor, 32.0f, 1.0f);
   // The host dense KV cache stores the same normalized and rotated K/V values
   // that Bee's graph writes to its cache.  Keep these F32 tensors before the
   // layout-only permute/cast used by flash attention.
@@ -5578,8 +5644,20 @@ ggml_tensor *build_full_attention_decode(
   const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
                         ? g.engine->model_file.architecture_config.rope_n_rot
                         : g.hd;
-  q = ggml_rope(ctx, q, g.positions, n_rot, GGML_ROPE_TYPE_NORMAL);
-  k = ggml_rope(ctx, k, g.positions, n_rot, GGML_ROPE_TYPE_NORMAL);
+  // See build_full_attention() above for why NEOX ordering + the model's
+  // real rope.freq_base (not GGML_ROPE_TYPE_NORMAL + ggml's hardcoded
+  // 10,000 default) is the correct, exact substitute for IMROPE here.
+  const float rope_freq_base =
+      g.engine->model_file.get_config_float("rope.freq_base", 10000.0f);
+  const auto &rope_c = g.engine->model_file.architecture_config;
+  q = ggml_rope_ext(ctx, q, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
+                     rope_c.rope_n_ctx_orig, rope_freq_base,
+                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
+                     rope_c.rope_attn_factor, 32.0f, 1.0f);
+  k = ggml_rope_ext(ctx, k, g.positions, nullptr, n_rot, GGML_ROPE_TYPE_NEOX,
+                     rope_c.rope_n_ctx_orig, rope_freq_base,
+                     rope_c.rope_freq_scale, rope_c.rope_ext_factor,
+                     rope_c.rope_attn_factor, 32.0f, 1.0f);
 
   ggml_tensor *k2 = ggml_reshape_2d(ctx, k, g.hd, g.Hkv);
   ggml_tensor *v2 = ggml_reshape_2d(ctx, v, g.hd, g.Hkv);
@@ -5720,7 +5798,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   g.moe_construction_ms_total = 0.0;
   g.moe_weight_lookup_ms_total = 0.0;
   const auto &c = g.engine->model_file.architecture_config;
-  if (env_layer0_iq2_diag_enabled() || env_layer0_split_dump_path())
+  if (env_layer0_iq2_diag_enabled() || env_layer0_split_dump_path() ||
+      env_alllayers_dump_path())
     g.layer0_diag_enabled = true;
   ggml_init_params ip = {};
   ip.mem_size = kTensorContextBytes;
@@ -5776,8 +5855,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     for (int k = 0; k < g.kv_capacity; ++k)
       mask[k] = ggml_fp32_to_fp16(0.0f);
     auto *indices = static_cast<int32_t *>(g.decode_indices->data);
+    // k_cache/v_cache are [hd, kv_capacity * Hkv]; the later
+    // ggml_reshape_4d(..., hd, kv_capacity, Hkv, 1) makes kv_capacity the
+    // FASTER-varying of the two combined dims, so a flat row index r
+    // decomposes as (head = r / kv_capacity, pos = r % kv_capacity) --
+    // head is the outer index, position the inner one. Must write
+    // h * kv_capacity + pos, not pos * Hkv + h (this is the pos_base=0
+    // case of that same formula).
     for (int h = 0; h < g.Hkv; ++h)
-      indices[h] = h;
+      indices[h] = h * g.kv_capacity;
   } else {
     for (int q = 0; q < g.S; ++q)
       for (int k = 0; k < g.S; ++k)
@@ -6548,6 +6634,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       const std::string name =
           "qwen_hidden01_layer" + std::to_string(l);
       g.hidden01_snapshot[l] =
+          layer0_diag_snapshot(g, g.ctx, res, name.c_str());
+    }
+    if (env_alllayers_dump_path() && g.layer0_diag_enabled) {
+      if (static_cast<int>(g.all_layers_snapshot.size()) <= l)
+        g.all_layers_snapshot.resize(static_cast<size_t>(l) + 1, nullptr);
+      const std::string name = "qwen_alllayers_layer" + std::to_string(l);
+      g.all_layers_snapshot[static_cast<size_t>(l)] =
           layer0_diag_snapshot(g, g.ctx, res, name.c_str());
     }
     if (l == 0 && g.layer0_diag_enabled) {
@@ -7814,8 +7907,10 @@ bool phase2_feed_common_inputs(FullGraph &g, int pos_base) {
   for (int k = 0; k < g.kv_capacity; ++k)
     mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
   auto *indices = static_cast<int32_t *>(g.decode_indices->data);
+  // See build_graph()'s initial decode_indices fill for why this must be
+  // h * kv_capacity + pos_base, not pos_base * Hkv + h.
   for (int h = 0; h < g.Hkv; ++h)
-    indices[h] = pos_base * g.Hkv + h;
+    indices[h] = h * g.kv_capacity + pos_base;
   return true;
 }
 
@@ -8567,8 +8662,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   for (int k = 0; k < g.kv_capacity; ++k)
     mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
   auto *indices = static_cast<int32_t *>(g.decode_indices->data);
+  // See build_graph()'s initial decode_indices fill for why this must be
+  // h * kv_capacity + pos_base, not pos_base * Hkv + h.
   for (int h = 0; h < g.Hkv; ++h)
-    indices[h] = pos_base * g.Hkv + h;
+    indices[h] = h * g.kv_capacity + pos_base;
 
   if (g.layer_timing_enabled) {
     std::fill(g.layer_timing_cpu_ms.begin(), g.layer_timing_cpu_ms.end(), 0.0);
@@ -8600,6 +8697,8 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   ggml_backend_sched_synchronize(g.sched);
   const auto replay_sync_end = std::chrono::steady_clock::now();
   dump_layer0_diag_values(g);
+  if (env_alllayers_dump_path())
+    dump_all_layers_snapshot(g, pos_base);
   if (g.layer13_moe_diag_enabled && g.layer13_moe_input_diag &&
       g.layer13_moe_ids_diag && g.layer13_moe_weights_diag) {
     const size_t input_n = ggml_nelements(g.layer13_moe_input_diag);
@@ -9041,6 +9140,14 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));
+  // Prefill's own all-layers dump: build_graph() populates
+  // g.all_layers_snapshot identically for prefill and decode (same shared
+  // per-layer loop), but this compute call -- unlike the two decode call
+  // sites above -- never wrote it out. Without this, a bee/llama.cpp parity
+  // trace could only compare the single-token decode step, never any of
+  // the S>1 prompt-token positions bee's own nt=S batch covers.
+  if (env_alllayers_dump_path())
+    dump_all_layers_snapshot(g, pos_base);
   if (const char *split_dump_path = env_layer0_split_dump_path()) {
     std::unordered_map<std::string, size_t> snapshot_occurrences;
     for (const auto &entry : g.layer0_split_snapshots) {
@@ -9342,7 +9449,8 @@ bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine, int pos_base,
   // Reuse the existing HC boundary instrumentation when the caller also
   // requests a split dump. This keeps the side-graph internals observable
   // without changing the normal two-layer boundary API or graph topology.
-  g->layer0_diag_enabled = env_layer0_split_dump_path() != nullptr;
+  g->layer0_diag_enabled = env_layer0_split_dump_path() != nullptr ||
+                           env_alllayers_dump_path() != nullptr;
   g->layer_timing_verbose_enabled = env_layer_timing_verbose();
 
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
@@ -9471,6 +9579,8 @@ bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine, int pos_base,
   ggml_backend_sched_synchronize(g->sched);
   if (g->layer0_diag_enabled)
     dump_layer0_diag_values(*g);
+  if (env_alllayers_dump_path())
+    dump_all_layers_snapshot(*g, pos_base);
   const double replay_ms = std::chrono::duration<double, std::milli>(
                                std::chrono::steady_clock::now() - replay_start)
                                .count();

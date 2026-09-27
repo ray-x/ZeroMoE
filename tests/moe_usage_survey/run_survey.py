@@ -25,6 +25,7 @@ owns the GPUs exclusively). Designed to be safe to re-run: if index.tsv
 already has a COMPLETED row for a given id, that prompt is skipped, so an
 interrupted batch can just be restarted.
 """
+import codecs
 import subprocess
 import sys
 import os
@@ -427,6 +428,7 @@ def run_one(idx, category, slug, text):
             input=stdin_text + "\n",
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=PER_PROMPT_TIMEOUT_S,
             cwd=str(REPO),
             env=engine_env(),
@@ -491,19 +493,27 @@ def run_persistent(items):
     command = wrap_engine_command(command)
 
     print(f"Persistent survey: one engine process for {len(items)} prompts", flush=True)
+    # Binary mode + an incremental UTF-8 decoder (errors="replace"), not
+    # text=True: a streamed token piece can be a genuinely invalid partial
+    # byte sequence on its own (only valid once concatenated with the next
+    # piece), and text=True's TextIOWrapper crashed with UnicodeDecodeError
+    # mid-run (found on a real 106-prompt survey, prompt 52/106) -- killing
+    # the engine via SIGPIPE the moment this reader stopped draining its
+    # stdout, losing every usage-stat hit counted so far (never flushed;
+    # the engine only writes its pin_file on the graceful ':q' shutdown
+    # path). A decode error here must never propagate.
     proc = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        bufsize=0,
         cwd=str(REPO),
         env=engine_env(),
     )
 
     try:
-        proc.stdin.write("\n".join(prompt_lines) + "\n:q\n")
+        proc.stdin.write(("\n".join(prompt_lines) + "\n:q\n").encode("utf-8"))
         proc.stdin.close()
     except BrokenPipeError:
         pass
@@ -511,10 +521,13 @@ def run_persistent(items):
     marker = "[Generation Complete]"
     pending_output = ""
     completed = 0
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while True:
-        chunk = proc.stdout.read(4096)
-        if not chunk:
+        raw_chunk = proc.stdout.read(4096)
+        if not raw_chunk:
+            pending_output += decoder.decode(b"", final=True)
             break
+        chunk = decoder.decode(raw_chunk)
         pending_output += chunk
         while marker in pending_output and completed < len(items):
             segment, pending_output = pending_output.split(marker, 1)

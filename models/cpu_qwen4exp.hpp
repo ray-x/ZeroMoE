@@ -40,7 +40,7 @@ private:
   static void l2norm(float *x, int n, float eps);
   static void silu(float *x, int n);
   static void sigmoid(float *x, int n);
-  static void rope_interleaved(float *x, int n_rot, int pos, float theta);
+  static void rope_neox(float *x, int n_rot, int pos, float theta);
   static void softmax(float *x, int n);
 
   void hc_mix(CPUEngine &engine, int layer_idx, int sub_block,

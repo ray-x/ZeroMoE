@@ -169,18 +169,26 @@ void CPUQwen4ExpBackend::sigmoid(float *x, int n) {
     x[i] = 1.0f / (1.0f + std::exp(-x[i]));
 }
 
-void CPUQwen4ExpBackend::rope_interleaved(float *x, int n_rot, int pos,
-                                          float theta) {
+// Qwen4Exp's upstream rope_type is IMROPE, whose cos/sin pairing is
+// NEOX-ordered (rotate-half: pairs (j, j+half)), not the adjacent-pair
+// (2j,2j+1) ordering this function originally implemented under its old
+// name (rope_interleaved). For text-only decode every M-RoPE section
+// carries the same scalar position, so IMROPE's per-section theta
+// selection is provably identical to plain single-axis NEOX rope (see the
+// matching fix + comment in build_full_attention() in
+// ggml_qwen4exp_graph.cpp for the full derivation).
+void CPUQwen4ExpBackend::rope_neox(float *x, int n_rot, int pos,
+                                   float theta) {
   const int half = n_rot / 2;
   const float scale = std::pow(theta, -2.0f / n_rot);
   float angle = static_cast<float>(pos);
   for (int j = 0; j < half; ++j) {
     const float c = std::cos(angle);
     const float s = std::sin(angle);
-    const float a = x[2 * j];
-    const float b = x[2 * j + 1];
-    x[2 * j] = a * c - b * s;
-    x[2 * j + 1] = a * s + b * c;
+    const float a = x[j];
+    const float b = x[j + half];
+    x[j] = a * c - b * s;
+    x[j + half] = a * s + b * c;
     angle *= scale;
   }
 }
@@ -642,14 +650,14 @@ void CPUQwen4ExpBackend::forward_attention(CPUEngine &engine, int layer_idx,
       rmsnorm(q.data() + (static_cast<size_t>(s) * H + h) * hd,
               q.data() + (static_cast<size_t>(s) * H + h) * hd, qw.data(), hd,
               c.eps);
-      rope_interleaved(q.data() + (static_cast<size_t>(s) * H + h) * hd, nrot,
+      rope_neox(q.data() + (static_cast<size_t>(s) * H + h) * hd, nrot,
                        pos_base + s, theta);
     }
     for (int h = 0; h < Hkv; ++h) {
       rmsnorm(K.data() + (static_cast<size_t>(s) * Hkv + h) * hd,
               K.data() + (static_cast<size_t>(s) * Hkv + h) * hd, kw.data(), hd,
               c.eps);
-      rope_interleaved(K.data() + (static_cast<size_t>(s) * Hkv + h) * hd, nrot,
+      rope_neox(K.data() + (static_cast<size_t>(s) * Hkv + h) * hd, nrot,
                        pos_base + s, theta);
       if (pos_base + s < engine.max_t) {
         std::memcpy(engine.kv_cache.k_ptr(layer_idx, pos_base + s) + h * hd,
