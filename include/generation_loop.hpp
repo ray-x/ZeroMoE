@@ -400,7 +400,22 @@ public:
 // default/config change: existing models retain exactly the old behavior.
 inline float moestream_repetition_penalty() {
     static const float penalty = [] {
-        constexpr float default_penalty = 1.3f;
+        // Default matches official llama.cpp/bee's own `repeat_penalty`
+        // default (1.0 == disabled). The prior default (1.3) does not exist
+        // upstream and was confirmed as the root cause of a real, reproducible
+        // switch-to-non-English defect on Qwen4Exp/UD-IQ1_M: the penalty
+        // window (see its call site below) included the PROMPT's own
+        // tokens, so a common word merely appearing once in the user's own
+        // question (e.g. "and") got its logit suppressed in later decode
+        // steps -- confirmed via raw pre-penalty logit dumps
+        // (MOESTREAM_DECODE_LOGITS_DUMP) showing the correct English
+        // continuation winning by a clear margin pre-penalty, then losing to
+        // a non-English token post-penalty, and via bee/llama.cpp itself
+        // (same weights, same quant, same prompt, temp=0) staying coherent
+        // throughout where MoEStream did not. Still available and
+        // configurable via MOESTREAM_REPETITION_PENALTY for anyone who wants
+        // the old anti-loop behavior back.
+        constexpr float default_penalty = 1.0f;
         const char* text = std::getenv("MOESTREAM_REPETITION_PENALTY");
         if (!text || !*text) return default_penalty;
 
@@ -867,14 +882,21 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     if (mtp_context_ready) {
         auto emit_mtp = [&](int next_token) {
             perf().n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
-            std::string token_str = tokenizer.decode(next_token);
-            int parse_result = reasoning.feed(token_str);
-            if (parse_result == 0) {
-                std::cout << token_str << std::flush;
-            } else if (parse_result == 1) {
-                std::cout << "\033[90m" << token_str << "\033[0m" << std::flush;
+            // Same ordering fix as the main decode loop above: check for a
+            // stop token before printing its decoded text, so a correctly-
+            // detected stop token's own string isn't echoed to the user.
+            const bool is_stop =
+                next_token == eos_id || tokenizer.is_stop_token(next_token);
+            if (!is_stop) {
+                std::string token_str = tokenizer.decode(next_token);
+                int parse_result = reasoning.feed(token_str);
+                if (parse_result == 0) {
+                    std::cout << token_str << std::flush;
+                } else if (parse_result == 1) {
+                    std::cout << "\033[90m" << token_str << "\033[0m" << std::flush;
+                }
             }
-            if (next_token == eos_id || tokenizer.is_stop_token(next_token))
+            if (is_stop)
                 return false;
             return !g_shutdown_requested.load(std::memory_order_relaxed);
         };
@@ -1008,10 +1030,20 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // the logit of every token seen recently, whichever direction makes
         // it less likely (dividing a positive logit or multiplying a
         // negative one both reduce post-softmax probability).
-        {
-            const float repetition_penalty = moestream_repetition_penalty();
+        //
+        // The window must never reach into the PROMPT: `sequence` starts as
+        // a copy of `prompt_ids`, so scanning from `sequence.size() -
+        // REPETITION_WINDOW` with no floor at the prompt boundary penalizes
+        // the model for wanting to reuse a word the USER's own question
+        // happened to contain -- confirmed as the real mechanism behind a
+        // reproducible switch-to-non-English defect (see
+        // moestream_repetition_penalty's own comment). Only tokens the
+        // model itself generated should ever be penalized.
+        if (const float repetition_penalty = moestream_repetition_penalty();
+            repetition_penalty != 1.0f) {
             constexpr int REPETITION_WINDOW = 64;
-            int start = std::max(0, (int)sequence.size() - REPETITION_WINDOW);
+            int start = std::max((int)prompt_ids.size(),
+                                  (int)sequence.size() - REPETITION_WINDOW);
             for (int i = start; i < (int)sequence.size(); ++i) {
                 int tok = sequence[i];
                 if (tok < 0 || tok >= V) continue;
@@ -1037,29 +1069,44 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         sequence.push_back(next_token);
         perf().n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
 
-        // Reasoning-aware output: decode to real text, then parse
-        // <think>...</think> tags out of the decoded stream (the tag
-        // detection only works against actual text -- it never matched
-        // anything when fed stringified token IDs).
-        std::string token_str = tokenizer.decode(next_token);
-        int parse_result = reasoning.feed(token_str);
-        if (parse_result == 0) {
-            // Normal output token
-            std::cout << token_str << std::flush;
-        } else if (parse_result == 1) {
-            // Thinking token — print dimmed (ANSI gray)
-            std::cout << "\033[90m" << token_str << "\033[0m" << std::flush;
-        }
-        // parse_result == 2: tag consumed, don't print
-
         // GLM-5.2's real eos_token_id is a 3-entry array (<|endoftext|>,
         // <|user|>, <|observation|>) -- checking only the single `eos_id`
         // param means generation runs past the model's real turn-boundary
         // markers into undefined continuation territory
         // tokenizer.is_stop_token covers all of them; the `eos_id` check
         // stays as a redundant safety net.
-        if (!bench_ignore_stop &&
-            (next_token == eos_id || tokenizer.is_stop_token(next_token)))
+        //
+        // This check must run BEFORE printing: the original ordering
+        // printed every token's decoded text first and checked for a stop
+        // token second, so a real, correctly-detected stop token's own
+        // string (e.g. "<|im_end|>", "<|endoftext|>") was echoed to the
+        // user right as generation correctly ended -- confirmed via
+        // MOESTREAM_GENERATED_TOKEN_FILE (dump_generated_token_if_enabled)
+        // showing the model's actual last sampled token WAS the genuine
+        // stop-token ID, not ordinary vocabulary tokens that merely spell
+        // out that text. The model was stopping correctly; only the
+        // display was wrong.
+        const bool is_stop_now = !bench_ignore_stop &&
+            (next_token == eos_id || tokenizer.is_stop_token(next_token));
+
+        if (!is_stop_now) {
+            // Reasoning-aware output: decode to real text, then parse
+            // <think>...</think> tags out of the decoded stream (the tag
+            // detection only works against actual text -- it never matched
+            // anything when fed stringified token IDs).
+            std::string token_str = tokenizer.decode(next_token);
+            int parse_result = reasoning.feed(token_str);
+            if (parse_result == 0) {
+                // Normal output token
+                std::cout << token_str << std::flush;
+            } else if (parse_result == 1) {
+                // Thinking token — print dimmed (ANSI gray)
+                std::cout << "\033[90m" << token_str << "\033[0m" << std::flush;
+            }
+            // parse_result == 2: tag consumed, don't print
+        }
+
+        if (is_stop_now)
             break;
 
         double diag_preproc_ms = std::chrono::duration<double, std::milli>(
