@@ -375,7 +375,7 @@ struct EngineConfig {
   // CPU-oriented moe_decode_batched experiment, which is not appropriate
   // for Qwen IQ1_M. Default off for every model/config.
   bool qwen4exp_decode_ggml_moe = false;
-  // Qwen4Exp-only Bee-style decode topology experiment. A complete
+  // Qwen4Exp-only full-graph decode topology experiment. A complete
   // preloaded DDR arena may use one scheduler graph containing the CUDA
   // router and CPU MUL_MAT_ID expert path. Layers without a complete arena
   // retain the ordinary lazy-loading path; other model families ignore this.

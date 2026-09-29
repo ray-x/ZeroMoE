@@ -10,6 +10,9 @@
 // (CMakeLists.txt).
 #include "family_ops.hpp"
 #include "engine.hpp"
+#include "ggml_deepseek_v4_graph.hpp"
+#include "ggml_glm5next_graph.hpp"
+#include "ggml_qwen4exp_graph.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -77,6 +80,162 @@ extern void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx,
 extern void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
                                            int S, int pos_base,
                                            const int *token_ids);
+
+// ---------------------------------------------------------------------
+// Whole-model graph adapters
+// ---------------------------------------------------------------------
+//
+// These adapters deliberately keep the existing graph implementations intact.
+// They translate the common FamilyOps contract into each family's current
+// graph bridge, so graph selection no longer belongs in execution_layer.cpp.
+
+namespace {
+
+bool no_model_graph_enabled(const StreamingEngine &, ModelGraphPhase) {
+  return false;
+}
+
+bool qwen4exp_graph_enabled(const StreamingEngine &, ModelGraphPhase phase) {
+  return phase == ModelGraphPhase::Decode
+             ? qwen4exp_full_graph_decode_enabled()
+             : qwen4exp_full_graph_enabled();
+}
+
+bool qwen4exp_graph_build(StreamingEngine &engine,
+                          const ModelGraphRequest &request) {
+  if (!request.token_ids || request.n_tokens <= 0)
+    return false;
+
+  if (request.phase == ModelGraphPhase::Decode) {
+    return qwen4exp_full_graph_decode_prepare(engine, request.pos_base,
+                                               request.token_ids);
+  }
+  return qwen4exp_full_graph_prepare(engine, request.n_tokens,
+                                     request.pos_base, request.token_ids);
+}
+
+bool qwen4exp_graph_run(StreamingEngine &engine,
+                        const ModelGraphRequest &request) {
+  if (!request.hidden_states || !request.token_ids || request.n_tokens <= 0)
+    return false;
+
+  if (request.phase == ModelGraphPhase::Decode) {
+    // The generation loop installs this short-lived destination on the
+    // engine.  The request carries the same information for callers that do
+    // not use the generation loop's convenience fields.
+    float *logits = request.logits != nullptr
+                        ? request.logits
+                        : engine.qwen4exp_full_graph_logits_target;
+    const int vocab = request.vocab > 0
+                          ? request.vocab
+                          : engine.qwen4exp_full_graph_logits_target_size;
+    return qwen4exp_full_graph_decode_run(
+        engine, request.hidden_states, request.pos_base, request.token_ids,
+        logits, vocab);
+  }
+
+  return qwen4exp_full_graph_run(engine, request.hidden_states,
+                                 request.n_tokens, request.pos_base,
+                                 request.token_ids);
+}
+
+bool glm5next_graph_enabled(const StreamingEngine &engine,
+                            ModelGraphPhase phase) {
+  return !engine.mtp_enabled && glm5next_full_graph_enabled() &&
+         (phase == ModelGraphPhase::Prefill ||
+          phase == ModelGraphPhase::Decode);
+}
+
+bool glm5next_graph_bootstrap(StreamingEngine &engine) {
+  return glm5next_full_graph_bootstrap(engine);
+}
+
+bool glm5next_graph_build(StreamingEngine &engine,
+                          const ModelGraphRequest &request) {
+  if (engine.mtp_enabled || !request.token_ids || request.n_tokens <= 0)
+    return false;
+  if (request.phase == ModelGraphPhase::Decode)
+    return request.n_tokens == 1 && request.pos_base >= 0 &&
+           glm5next_full_graph_decode_prepare(engine, request.pos_base,
+                                              request.token_ids);
+  return glm5next_full_graph_prepare(engine, request.n_tokens,
+                                     request.pos_base, request.token_ids);
+}
+
+bool glm5next_graph_run(StreamingEngine &engine,
+                        const ModelGraphRequest &request) {
+  if (engine.mtp_enabled || !request.hidden_states || !request.token_ids ||
+      request.n_tokens <= 0)
+    return false;
+  if (request.phase == ModelGraphPhase::Decode)
+    return request.n_tokens == 1 && request.pos_base >= 0 &&
+           glm5next_full_graph_decode_run(engine, request.hidden_states,
+                                          request.pos_base,
+                                          request.token_ids);
+  return glm5next_full_graph_run(engine, request.hidden_states,
+                                 request.n_tokens, request.pos_base,
+                                 request.token_ids);
+}
+
+bool deepseek_v4_graph_enabled(const StreamingEngine &, ModelGraphPhase phase) {
+  return phase == ModelGraphPhase::Prefill &&
+         deepseek_v4_full_graph_enabled();
+}
+
+bool deepseek_v4_graph_build(StreamingEngine &engine,
+                             const ModelGraphRequest &request) {
+  if (request.phase != ModelGraphPhase::Prefill || !request.token_ids ||
+      request.n_tokens <= 0)
+    return false;
+  return deepseek_v4_full_graph_prepare(engine, request.n_tokens,
+                                        request.pos_base,
+                                        request.token_ids);
+}
+
+bool deepseek_v4_graph_run(StreamingEngine &engine,
+                           const ModelGraphRequest &request) {
+  if (request.phase != ModelGraphPhase::Prefill || !request.hidden_states ||
+      !request.token_ids || request.n_tokens <= 0)
+    return false;
+  return deepseek_v4_full_graph_run(engine, request.hidden_states,
+                                    request.n_tokens, request.pos_base,
+                                    request.token_ids);
+}
+
+ModelGraphOps make_empty_graph_ops() {
+  return {&no_model_graph_enabled, nullptr, nullptr, nullptr, nullptr,
+          nullptr};
+}
+
+} // namespace
+
+ModelGraphOps model_graph_ops_for(ModelFamily fam) {
+  switch (fam) {
+  case ModelFamily::Qwen4Exp:
+    return {&qwen4exp_graph_enabled,
+            nullptr,
+            &qwen4exp_graph_build,
+            &qwen4exp_graph_run,
+            &qwen4exp_full_graph_device_expert_layers,
+            &qwen4exp_full_graph_shutdown};
+  case ModelFamily::GLM5NEXT:
+    return {&glm5next_graph_enabled,
+            &glm5next_graph_bootstrap,
+            &glm5next_graph_build,
+            &glm5next_graph_run,
+            &glm5next_full_graph_device_expert_layers,
+            &glm5next_full_graph_shutdown};
+  case ModelFamily::DeepSeek_V4:
+    return {&deepseek_v4_graph_enabled,
+            nullptr,
+            &deepseek_v4_graph_build,
+            &deepseek_v4_graph_run,
+            &deepseek_v4_full_graph_device_expert_layers,
+            &deepseek_v4_full_graph_shutdown};
+  default:
+    return make_empty_graph_ops();
+  }
+}
 
 // ---------------------------------------------------------------------
 // Shared hyper-connection hooks (hc_mult == 1 degenerate case)
@@ -524,6 +683,7 @@ static void alloc_qwen4exp_cache(StreamingEngine &engine,
 FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
   FamilyOps ops;
   ops.family = fam;
+  ops.graph_ops = model_graph_ops_for(fam);
   switch (fam) {
   case ModelFamily::GLM_DSA:
   case ModelFamily::DeepSeek_V3: // DeepSeek-V3 shares GLM-5.2's MLA core

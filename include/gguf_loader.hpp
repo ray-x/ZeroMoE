@@ -146,6 +146,18 @@ enum class GGUFType : uint32_t {
   // this can never collide with an actual type this enum is also trying
   // to represent.
   IQ2_M = 31,
+  // Q2_0: a genuine legacy-style linear 2-bit format (per-64-element fp16
+  // scale + 2-bit signed-ish codes {-1,0,+1,+2}*scale, block_q2_0 in
+  // ggml-common.h) -- confirmed against the currently-linked ggml.h
+  // (GGML_TYPE_Q2_0 = 42), NOT to be confused with Q2_K (already present
+  // above at slot 10, a totally different super-block K-quant format).
+  // Added 2026-09-28 for a real ISTA DASLab "GSQ-RCO" Qwen3.8-Flash-Next
+  // release that stores blk.N.ffn_down_exps.weight (the routed-expert
+  // down projection, the single largest tensor bucket in the file) as
+  // this type on every MoE layer -- without this case those tensors fall
+  // through calculate_size()'s `return numel;` 1-byte/element fallback,
+  // a ~18x undersized read.
+  Q2_0 = 42,
 };
 
 struct GGUFTensor {
@@ -1703,6 +1715,9 @@ private:
       return (numel / 32) * 17; // MXFP4: block=32 elements, 1(e)+16(qs) bytes
     if (t == 40)
       return (numel / 64) * 36; // NVFP4: block=64 elements, 4(d)+32(qs) bytes
+    if (t == 42)
+      return (numel / 64) * 18; // Q2_0: block=64 elements, 2(d)+16(qs) bytes
+                                // -- see block_q2_0 in ggml-common.h
     // IQ2_M: no real GGML_TYPE_* slot in the currently-linked ggml at all
     // (see the enum's own comment) -- no formula to assign a number to.
     return numel;                // fallback: 1 byte per element

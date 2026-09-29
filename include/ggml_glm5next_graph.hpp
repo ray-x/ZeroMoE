@@ -1,13 +1,12 @@
 #pragma once
 
-// Opt-in GLM-5.3-Flash prefill graph.  The bridge is separate from the
-// established layer-at-a-time implementation so graph bring-up can fall back
-// without changing decode or other model families.
+// Opt-in GLM-5.3-Flash full graph. The prompt graph and reusable one-token
+// decode graph are separate static topologies and can independently fall
+// back to the established layer-at-a-time implementation.
 
 struct StreamingEngine;
 
-// Enabled only when MOESTREAM_GLM5NEXT_FULL_GRAPH=1 is present.  The graph is
-// prefill-only while recurrent and absorbed-MLA state writeback is validated.
+// Enabled only when MOESTREAM_GLM5NEXT_FULL_GRAPH=1 is present.
 bool glm5next_full_graph_enabled();
 
 // Load the graph's host expert source arena during engine startup.  This is
@@ -32,6 +31,15 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S,
 // state buffers.  false means the caller should use the legacy path.
 bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *token_ids);
+
+// Build once at the first decode position (seeding from the host prefill
+// state), then reuse the same graph and device KDA/DSA state for consecutive
+// decode tokens.
+bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
+                                        const int *token_ids);
+bool glm5next_full_graph_decode_run(StreamingEngine &engine,
+                                    float *hidden_states, int pos_base,
+                                    const int *token_ids);
 
 // Release scheduler buffers before the shared CUDA backend is torn down.
 void glm5next_full_graph_shutdown();

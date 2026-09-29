@@ -442,10 +442,12 @@ public:
     std::vector<GraphRamLayerArena> graph_ram_arenas;
     bool graph_ram_cache_enabled = false;
     // Qwen-only source contract copied from EngineConfig at startup. When
-    // true, Qwen expert graph/dispatch code must use the preloaded DDR tier
-    // and must not silently fall back to a GGUF mmap read. Other model
-    // families do not consult this flag.
+    // true, Qwen host-resident expert graph/dispatch code must use the
+    // preloaded DDR tier and must not silently fall back to a GGUF mmap read.
+    // Full-graph device-resident layers may use transient GGUF staging.
+    // Other model families do not consult this flag.
     bool qwen_ram_preload_all_experts = false;
+    std::vector<uint8_t> qwen_ram_vram_only_layers;
 
     // Per-expert VRAM split budget for full-graph decode (EngineConfig::
     // qwen4exp_graph_expert_vram_budget_gb), copied at startup exactly like
@@ -971,7 +973,7 @@ public:
     // GGML/CUDA MUL_MAT_ID graph for S==1. Other families never read this
     // switch; false preserves the established per-expert decode path.
     bool qwen4exp_decode_ggml_moe = false;
-    // Qwen-only Bee-style CUDA-router + CPU-MUL_MAT_ID scheduler topology.
+    // Qwen-only full-graph CUDA-router + CPU-MUL_MAT_ID scheduler topology.
     // It is used only for complete immutable DDR arenas; lazy layers fall
     // back to the normal cache/dispatch path.
     bool qwen4exp_decode_scheduler = false;
@@ -3057,6 +3059,12 @@ public:
         }
         arena.ready = true;
         return true;
+    }
+
+    bool qwen_ram_vram_only_layer(int layer) const {
+        return layer >= 0 &&
+               (size_t)layer < qwen_ram_vram_only_layers.size() &&
+               qwen_ram_vram_only_layers[(size_t)layer] != 0;
     }
 
     bool graph_ram_layer_projection_compact(int layer) const {

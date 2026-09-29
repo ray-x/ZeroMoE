@@ -706,7 +706,7 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   // Release every device/pinned allocation. Safe to call more than once.
   void shutdown();
 
-  // Bee-style submission mode: expert H2D copies are queued on the shared
+  // Full-graph submission mode: expert H2D copies are queued on the shared
   // GGML CUDA stream and are ordered directly before the MoE graph. While it
   // is enabled, the caller uses pinned staging sources so RAM-tier blocks do
   // not need to remain held after the CPU staging memcpy.

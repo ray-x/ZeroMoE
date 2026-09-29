@@ -84,7 +84,7 @@ inline void set_dense_bf16_prefill_gemm(bool v) { dense_bf16_prefill_gemm_flag()
 
 inline bool gpu_type_supported(GGUFType type) {
     switch (type) {
-        case GGUFType::Q4_0: case GGUFType::Q2_K: case GGUFType::Q3_K:
+        case GGUFType::Q4_0: case GGUFType::Q2_0: case GGUFType::Q2_K: case GGUFType::Q3_K:
         case GGUFType::Q4_K: case GGUFType::Q5_K: case GGUFType::Q6_K:
         case GGUFType::IQ2_XXS: case GGUFType::IQ2_XS: case GGUFType::IQ2_S:
         // IQ3_XXS: cuda/iq3_matmul.cu's launch_iq3_xxs_matmul, a verbatim
@@ -279,6 +279,7 @@ inline const char* gpu_type_name(GGUFType type) {
         // is still dormant (see gpu_type_supported()'s own comment above).
         case GGUFType::MXFP4:   return "MXFP4";
         case GGUFType::NVFP4:   return "NVFP4";
+        case GGUFType::Q2_0:    return "Q2_0";
         default:                return "UNKNOWN";
     }
 }
@@ -315,6 +316,7 @@ inline double gpu_type_bits_per_weight(GGUFType type) {
         case GGUFType::IQ1_S:   return 1.5625;
         case GGUFType::MXFP4:   return 4.25;   // 17 bytes * 8 / 32 elements
         case GGUFType::NVFP4:   return 4.5;    // 36 bytes * 8 / 64 elements
+        case GGUFType::Q2_0:    return 2.25;   // 18 bytes * 8 / 64 elements
         default:                return 0.0;  // unknown — don't claim a number
     }
 }
@@ -522,6 +524,15 @@ inline int row_bytes(GGUFType type, int I) {
         // bytes per 64-element block.
         case GGUFType::MXFP4:    return (I / 32)  * 17;
         case GGUFType::NVFP4:    return (I / 64)  * 36;
+        // Q2_0: real legacy-style linear 2-bit format (block_q2_0,
+        // ggml-common.h), block=64 elements, 2(d)+16(qs) bytes. Added
+        // 2026-09-28 for a real GSQ-RCO Qwen3.8-Flash-Next checkpoint
+        // storing ffn_down_exps this way on every MoE layer -- without
+        // this case cpu_quant_matmul would walk W+o*rb with the `default:`
+        // stride of I bytes/row instead of 18, corrupting every row past
+        // the first exactly like the IQ3_XXS/MXFP4 gaps this file's other
+        // comments describe.
+        case GGUFType::Q2_0:     return (I / 64)  * 18;
         default:
             LOG_ERROR("[ROW_BYTES] type=%u has no known row size — "
                       "this WILL misalign cpu_quant_matmul and can crash. "

@@ -42,6 +42,7 @@
 // already do -- that's expected, not a regression.
 #pragma once
 #include "model_family.hpp"
+#include <cstdint>
 
 struct StreamingEngine;
 struct ArchitectureConfig;
@@ -115,6 +116,54 @@ void hc_post_plain_add(StreamingEngine &engine, int layer_idx, int sub_block,
 using LayerInputFn = void (*)(StreamingEngine &engine, int layer_idx, int S,
                               int pos_base, const int *token_ids);
 
+// ---------------------------------------------------------------------------
+// Whole-model graph dispatch
+// ---------------------------------------------------------------------------
+//
+// The layer loop and the whole-model GGML graph are two execution strategies
+// for the same model family.  Keep the lifecycle common even though the graph
+// topology remains family-specific.  This is the MoEStream equivalent of
+// llama.cpp's model.build_graph()/set_inputs()/run_graph() boundary: the
+// caller owns the request, while the selected family owns graph construction,
+// state binding, and its scheduler-backed execution.
+enum class ModelGraphPhase : uint8_t {
+  Prefill,
+  Decode,
+};
+
+struct ModelGraphRequest {
+  ModelGraphPhase phase = ModelGraphPhase::Prefill;
+  int n_tokens = 0;
+  int pos_base = 0;
+  const int *token_ids = nullptr;
+  float *hidden_states = nullptr;
+  float *logits = nullptr;
+  int vocab = 0;
+};
+
+using ModelGraphEnabledFn = bool (*)(const StreamingEngine &engine,
+                                     ModelGraphPhase phase);
+using ModelGraphBootstrapFn = bool (*)(StreamingEngine &engine);
+using ModelGraphBuildFn = bool (*)(StreamingEngine &engine,
+                                   const ModelGraphRequest &request);
+using ModelGraphRunFn = bool (*)(StreamingEngine &engine,
+                                 const ModelGraphRequest &request);
+using ModelGraphDeviceExpertLayersFn = int (*)();
+using ModelGraphShutdownFn = void (*)();
+
+struct ModelGraphOps {
+  ModelGraphEnabledFn enabled = nullptr;
+  ModelGraphBootstrapFn bootstrap = nullptr;
+  ModelGraphBuildFn build = nullptr;
+  ModelGraphRunFn run = nullptr;
+  ModelGraphDeviceExpertLayersFn device_expert_layers = nullptr;
+  ModelGraphShutdownFn shutdown = nullptr;
+};
+
+// Resolved once with the rest of FamilyOps.  An empty table means that the
+// family uses the established layer-by-layer path.
+ModelGraphOps model_graph_ops_for(ModelFamily fam);
+
 struct FamilyOps {
   ModelFamily family = ModelFamily::Unknown;
   AttentionType attn_type = AttentionType::DenseQKV;
@@ -128,6 +177,7 @@ struct FamilyOps {
   HcPreFn hc_pre_fn = &hc_pre_noop;
   HcPostFn hc_post_fn = &hc_post_plain_add;
   LayerInputFn layer_input_fn = nullptr; // optional; nullptr = no hook
+  ModelGraphOps graph_ops;               // optional whole-model graph path
 };
 
 // The single place ModelFamily -> "what does this family actually do" gets

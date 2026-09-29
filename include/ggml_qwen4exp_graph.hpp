@@ -30,10 +30,11 @@ bool qwen4exp_full_graph_device_expert_trailing();
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
                                  int pos_base, const int *token_ids);
 
-// Build/reuse the one-token decode graph.  This is Qwen-only and requires a
-// complete preloaded DDR expert arena for every layer.  KV/GDN/PLE recurrent
-// state is seeded once from the existing host state and remains on the device
-// for subsequent submissions.
+// Build/reuse the one-token decode graph. This is Qwen-only and requires
+// complete preloaded DDR expert arenas for host-resident layers; the configured
+// device block is loaded directly into VRAM. KV/GDN/PLE recurrent state is
+// seeded once from the existing host state and remains on the device for
+// subsequent submissions.
 bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                          const int *token_ids);
 

@@ -674,16 +674,18 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // prefill.  The prompt IDs are needed only by Qwen's PLE path; graph
     // construction and static weight upload are outside PERF_START.
     const bool unbatched_prefill = prefill_unbatched_enabled();
-    if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill) {
-        if (qwen4exp_full_graph_enabled())
-            qwen4exp_full_graph_prepare(engine, (int)pc_n_new, (int)pc_reuse,
-                                        prompt_ids.data() + pc_reuse);
-        if (glm5next_full_graph_enabled() && !engine.mtp_enabled)
-            glm5next_full_graph_prepare(engine, (int)pc_n_new, (int)pc_reuse,
-                                        prompt_ids.data() + pc_reuse);
-        if (deepseek_v4_full_graph_enabled())
-            deepseek_v4_full_graph_prepare(engine, (int)pc_n_new, (int)pc_reuse,
-                                           prompt_ids.data() + pc_reuse);
+    const auto &graph_ops = engine.family_ops.graph_ops;
+    if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill &&
+        graph_ops.enabled && graph_ops.build &&
+        graph_ops.enabled(engine, ModelGraphPhase::Prefill)) {
+        const ModelGraphRequest request{
+            ModelGraphPhase::Prefill,
+            (int)pc_n_new,
+            (int)pc_reuse,
+            prompt_ids.data() + pc_reuse,
+            nullptr,
+        };
+        graph_ops.build(engine, request);
     }
 
     std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;

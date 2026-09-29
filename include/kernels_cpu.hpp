@@ -238,6 +238,34 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
+// Qwen-only sibling for Q4_0 gate/up/down checkpoints (e.g. a VRAM-constrained
+// deployment streaming a Q4_0-quantized MoE from disk, where CPU decode speed
+// for cold-miss experts is a first-order cost, not a fallback case). Same
+// one-OpenMP-team/4-phase shape as the IQ1_M/IQ2_XXS siblings above, but uses
+// dot_q4_0_q8_0_avx512 (this file's own zero-point-deferred VNNI kernel, no
+// GGML dependency for the dot itself) instead of a ggml_vec_dot_* call for
+// both the gate/up and down projections.
+bool matmul_qwen_q4_0_q4_0_fused(
+    float *const *gate_y, float *const *up_y, float *const *down_y,
+    const float *x, const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights, const uint8_t *const *down_weights,
+    int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
+// Qwen-only fused Q2_0 path. Uses MoEStream's AVX-512 VNNI dot when explicitly
+// enabled at runtime and the linked GGML CPU dot as its fallback.
+bool matmul_qwen_q2_0_q2_0_fused(
+    float *const *gate_y, float *const *up_y, float *const *down_y,
+    const float *x, const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights, const uint8_t *const *down_weights,
+    int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
+// Q2_0 AVX-512 VNNI is enabled by default when supported by the CPU.
+// MOESTREAM_Q2_0_DISABLE_VNNI=1 selects GGML's CPU dot instead.
+bool q2_0_vnni_enabled();
+// The Strata-derived batched kernel additionally requires AVX-512 VBMI.
+bool q2_0_vbmi_enabled();
+// One Q2_0 row dot against pre-quantized Q8_0 activations. Exposed so focused
+// benchmarks can isolate the selected backend from fused-MoE overhead.
+float dot_q2_0_q8_0_cpu(const uint8_t *weights,
+                        const block_q8_0 *activations, int n, bool use_vnni);
 float dot_iq3_xxs_f32_avx512(const uint8_t *block, const float *x, int64_t k);
 void matmul_iq3_xxs_fused(float *y, const float *x, const uint8_t *W_quantized,
                           int S, int I, int O);

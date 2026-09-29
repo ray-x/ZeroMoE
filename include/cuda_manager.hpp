@@ -22,6 +22,7 @@
 extern "C" void launch_gguf_q4_0_dp4a(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q8_0_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q5_1_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+extern "C" void launch_q2_0_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_dequant_q8_0_to_bf16(void* dst_bf16, const void* src_q8_0, int64_t n_elements);
 // Type-dispatched BF16 decoder (cuda/dequant_bf16.cu): Q8_0/Q5_1/Q4_K/Q5_K/Q6_K.
 extern "C" bool launch_dequant_to_bf16(int ggml_type, void* dst_bf16, const void* src, int64_t n_elements);
@@ -3713,6 +3714,7 @@ public:
                 return dense_matmul(wtype, d_W, d_X, d_Y, S, I, O);
             case GGUFType::Q8_0:      launch_q8_0_matmul(d_Y, d_X, d_W, S, I, O); return true;
             case GGUFType::Q5_1:      launch_q5_1_matmul(d_Y, d_X, d_W, S, I, O); return true;
+            case GGUFType::Q2_0:      launch_q2_0_matmul(d_Y, d_X, d_W, S, I, O); return true;
             case GGUFType::Q2_K:      launch_q2_K_matmul(d_Y, d_X, d_W, S, I, O); return true;
             case GGUFType::Q3_K:      launch_q3_K_matmul(d_Y, d_X, d_W, S, I, O); return true;
             case GGUFType::Q4_K:      launch_q4_K_matmul(d_Y, d_X, d_W, S, I, O); return true;
@@ -3999,6 +4001,10 @@ public:
                 break;
             case GGUFType::Q8_0:
                 launch_q8_0_matmul(d_y, d_x, d_W, S, I, O);
+                ok = true;
+                break;
+            case GGUFType::Q2_0:
+                launch_q2_0_matmul(d_y, d_x, d_W, S, I, O);
                 ok = true;
                 break;
             // Q5_1 (cuda/q5_1_matmul.cu, 2026-09-04). Written for the
