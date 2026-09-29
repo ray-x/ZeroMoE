@@ -181,7 +181,7 @@ bool matmul_iq1_m_avx512_q8k_grouped(
 // compact expert matrices. `W_quantized[m]` points to one [O,I] matrix and
 // `y[m]` points to its [S,O] result. This removes the per-expert OpenMP
 // fork/join and activation quantization that made the old CPU fallback much
-// slower than BeeLlama's ggml MUL_MAT_ID path.
+// slower than llama.cpp's ggml MUL_MAT_ID path.
 bool matmul_iq1_m_ggml_q8k_grouped(float *const *y, const float *x,
                                    const uint8_t *const *W_quantized,
                                    int n_matrices, int S, int I, int O);
@@ -209,7 +209,7 @@ bool matmul_iq3_xxs_ggml_avx2_grouped(
     int n_matrices, int S, int I, int O);
 // Qwen-only grouped wrappers around the production GGML CPU dot kernels.
 // Unlike the older AVX2 prototypes above, these use the same dispatched
-// ggml_vec_dot_iq*_q8_K implementation as BeeLlama's MUL_MAT_ID path.
+// ggml_vec_dot_iq*_q8_K implementation as llama.cpp's MUL_MAT_ID path.
 bool matmul_iq2_xxs_ggml_q8k_grouped(
     float *const *y, const float *x, const uint8_t *const *W_quantized,
     int n_matrices, int S, int I, int O);
@@ -260,7 +260,7 @@ bool matmul_qwen_q2_0_q2_0_fused(
 // Q2_0 AVX-512 VNNI is enabled by default when supported by the CPU.
 // MOESTREAM_Q2_0_DISABLE_VNNI=1 selects GGML's CPU dot instead.
 bool q2_0_vnni_enabled();
-// The Strata-derived batched kernel additionally requires AVX-512 VBMI.
+// The batched kernel additionally requires AVX-512 VBMI.
 bool q2_0_vbmi_enabled();
 // One Q2_0 row dot against pre-quantized Q8_0 activations. Exposed so focused
 // benchmarks can isolate the selected backend from fused-MoE overhead.

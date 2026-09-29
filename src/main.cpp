@@ -47,7 +47,7 @@ public:
 };
 
 #if defined(MOESTREAM_USE_GGML)
-// The ggml tree used by the CUDA build is also shared with Bee and emits
+// The ggml tree used by the CUDA build is also shared with llama.cpp and emits
 // CUDA-graph reuse diagnostics through GGML_LOG_DEBUG.  At MoEStream's
 // normal INFO/WARN/ERROR levels those messages are not useful, but a full
 // Qwen decode graph can hit the call site hundreds of times per token.  The
@@ -903,7 +903,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // slot to a whole number of rows for every routed projection so
     // mixed IQ formats (for example IQ2_XXS + IQ1_M) remain valid when
     // viewed without a repack.  This is a small cache-capacity tradeoff;
-    // the normal compact path would not require it, but the Bee-style
+    // the normal compact path would not require it, but the full graph
     // zero-repack path does.
     const size_t stride_alignment = engine.expert_cache_stride_alignment();
     if (expert_slab_bytes > 0 && stride_alignment > 1 &&
@@ -945,24 +945,58 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // that the transposition is fixed (ggml_cont(ggml_transpose(...)) before
   // the state is copied out), there is no longer a known correctness
   // reason to keep the two mutually exclusive.
+  const auto &graph_ops = engine.family_ops.graph_ops;
   const bool graph_mode =
-      (qwen4exp_full_graph_enabled() &&
-       engine.family_ops.family == ModelFamily::Qwen4Exp) ||
-      (glm5next_full_graph_enabled() &&
-       engine.family_ops.family == ModelFamily::GLM5NEXT) ||
-      (deepseek_v4_full_graph_enabled() &&
-       engine.family_ops.family == ModelFamily::DeepSeek_V4);
-  // Qwen's complete expert set is already loaded into the RAM tier when
-  // ram_preload_all_experts is enabled.  Its optional full graph must use
-  // those fixed-stride DDR arenas directly; otherwise it would create a
-  // second graph-owned DDR copy by reading the GGUF shards at graph
-  // startup.  Keep the explicit environment switch for the other graph
-  // families, whose source ownership rules are different.
+      graph_ops.enabled &&
+      graph_ops.enabled(engine, ModelGraphPhase::Prefill);
+  // Qwen's host-resident expert layers are loaded into fixed-stride DDR
+  // arenas when ram_preload_all_experts is enabled. The full graph aliases
+  // those arenas, while its configured device block is loaded directly into
+  // VRAM. Keep the explicit environment switch for other graph families,
+  // whose source ownership rules are different.
   const bool graph_ram_cache =
       graph_mode &&
       (std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&
         config.ram_preload_all_experts));
+  if (graph_mode && graph_ram_cache && config.ram_preload_all_experts &&
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      qwen4exp_full_graph_decode_enabled()) {
+    const int n_layers =
+        std::max(0, engine.model_file.architecture_config.n_layers);
+    const int n_experts =
+        std::max(0, engine.model_file.architecture_config.n_experts);
+    const int device_layers = std::min(
+        std::max(0, qwen4exp_full_graph_device_expert_layers()), n_layers);
+    if (device_layers > 0) {
+      engine.qwen_ram_vram_only_layers.assign((size_t)n_layers, 0);
+      const bool trailing = qwen4exp_full_graph_device_expert_trailing();
+      const int first_layer = trailing ? n_layers - device_layers : 0;
+      size_t vram_only_bytes = 0;
+      int vram_only_layer_count = 0;
+      for (int layer = first_layer; layer < first_layer + device_layers;
+           ++layer) {
+        if (is_cpu_affinity_layer(layer))
+          continue;
+        engine.qwen_ram_vram_only_layers[(size_t)layer] = 1;
+        ++vram_only_layer_count;
+        const size_t expert_bytes = engine.compute_expert_slab_bytes(layer);
+        if (n_experts > 0 &&
+            expert_bytes <= SIZE_MAX / (size_t)n_experts &&
+            vram_only_bytes <=
+                SIZE_MAX - expert_bytes * (size_t)n_experts)
+          vram_only_bytes += expert_bytes * (size_t)n_experts;
+      }
+      LOG_STREAM_INFO()
+          << "[MOE-OWNERSHIP] full-graph device block [" << first_layer
+          << ", " << (first_layer + device_layers)
+          << ") excludes " << vram_only_layer_count
+          << " non-CPU-affinity layer(s) from persistent DDR"
+          << " preload and graph-RAM arenas (VRAM-only), approximately "
+          << (double)vram_only_bytes / (1024.0 * 1024.0 * 1024.0)
+          << " GiB\n";
+    }
+  }
   // Qwen CPU-affinity layers use the same fixed-stride host-RAM arena as
   // the full graph, but only when the configured RAM preload really owns
   // every expert in those layers. This gives the CPU MUL_MAT_ID graph a
@@ -1000,15 +1034,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // 2026-09-09: two real, measured incidents, both from this same
     // decision point.
     //
-    // Incident A (why this can never be "skip the cache entirely"): the
-    // full graph ONLY ever handles S>1, pos_base==0 prefill (see
-    // execution_layer.cpp's layers_forward_gguf -- decode, S==1, always
-    // falls through to the legacy per-token loop below, unconditionally,
-    // for every one of these three families). So a real decode-time GPU
-    // expert cache is not optional insurance for "the graph declined" --
-    // it's needed on EVERY graph_mode run, every single decode step, by
-    // construction. The old code skipped the legacy cache completely
-    // whenever MOESTREAM_FULL_GRAPH_USE_RAM_CACHE was unset, which for
+    // Incident A (why this can never be "skip the cache entirely"): most
+    // family full graphs only handle S>1 prefill. GLM5NEXT now also has a
+    // reusable S=1 decode graph, but this legacy cache remains the safe
+    // fallback if either graph is declined. The old code skipped the legacy
+    // cache completely whenever MOESTREAM_FULL_GRAPH_USE_RAM_CACHE was unset,
+    // which for
     // qwen4exp/deepseek_v4 (neither of which implement the RAM-arena
     // dedup that env var was designed to gate -- that's GLM5NEXT-only)
     // meant EVERY graph_mode run had zero decode-time GPU cache. Measured
@@ -1033,21 +1064,34 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // this cache itself is sized from) and a flat reserve for the
     // graph's dense arena + compute workspace (measured 2.92+1.80 GiB
     // above; kept generous since neither scales down with
-    // device_expert_layers). Capped at the original 4GB ceiling, floored
-    // at 0 (never negative) -- a 0-sized cache still means every decode
-    // step pays the CPU-fallback cost, but at least never crashes the
-    // process fighting the graph for the same VRAM.
-    constexpr double kGraphRamCacheFallbackVramGb = 4.0;
+    // device_expert_layers). Floored at 0 (never negative) -- a 0-sized
+    // cache still means every decode step pays the CPU-fallback cost,
+    // but at least never crashes the process fighting the graph for the
+    // same VRAM.
+    //
+    // 2026-09-28: the original fix additionally clamped this to a flat
+    // 4GB ceiling ("capped at the original 4GB ceiling, kept generous"),
+    // reusing Incident B's pre-fix number as a known-safe value rather
+    // than trusting the now-headroom-aware math on its own. That ceiling
+    // is vestigial, not a safety requirement: Incident B's real cause was
+    // an UNCONDITIONAL flat cache stacked on top of a large already-
+    // committed device_expert_layers arena, and headroom_gb below already
+    // subtracts that same commitment (plus a 6GB reserve) before this
+    // point -- at device_expert_layers=20, the incident's own config,
+    // headroom_gb is already small and no fixed ceiling is needed to keep
+    // it safe. At low/zero device_expert_layers (e.g. the "dense split"
+    // topology, GRAPH_PRELOAD_LAYERS=0), the flat ceiling was the ONLY
+    // thing capping this cache -- confirmed on real hardware: it silently
+    // discarded ~12 GiB of real, already-computed-safe headroom on a
+    // 23.3 GiB-free card (only ~50% VRAM used), while the configured
+    // moe_cache_gb (11.5 GiB) sat unreachable behind a stale 4GB cap.
+    // Removed; headroom_gb's own subtraction is the real budget now.
     constexpr double kGraphOverheadReserveGb = 6.0;
     constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
 
-    int dev_layers = 0;
-    if (engine.family_ops.family == ModelFamily::Qwen4Exp)
-      dev_layers = qwen4exp_full_graph_device_expert_layers();
-    else if (engine.family_ops.family == ModelFamily::GLM5NEXT)
-      dev_layers = glm5next_full_graph_device_expert_layers();
-    else if (engine.family_ops.family == ModelFamily::DeepSeek_V4)
-      dev_layers = deepseek_v4_full_graph_device_expert_layers();
+    const int dev_layers = graph_ops.device_expert_layers
+                               ? graph_ops.device_expert_layers()
+                               : 0;
 
     double est_device_expert_gb = 0.0;
     if (dev_layers > 0 && expert_slab_bytes > 0)
@@ -1072,6 +1116,30 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                          (double)engine.qwen4exp_gpu_stage_layers.size() /
                          kBytesPerGb;
 
+    // GLM5NEXT's reusable full graph may allocate a separate device arena
+    // for the configured hot expert set.  Reserve that VRAM before sizing
+    // the legacy decode fallback cache; otherwise the ordinary 14 GB cache
+    // can consume all headroom and make the graph's own hot arena fail.
+    double est_graph_hot_expert_gb = 0.0;
+    if (engine.family_ops.family == ModelFamily::GLM5NEXT &&
+        glm5next_full_graph_enabled()) {
+      if (const char *env =
+              std::getenv("MOESTREAM_FULL_GRAPH_RESIDENT_GB")) {
+        char *end = nullptr;
+        const double requested = std::strtod(env, &end);
+        if (end != env && *end == '\0' && std::isfinite(requested) &&
+            requested > 0.0)
+          est_graph_hot_expert_gb = requested;
+      }
+    }
+
+    // GLM's resident hot-expert arena is followed by its dense arena and
+    // ggml allocator workspace. Keep an extra 3 GiB beyond the generic
+    // graph reserve: on the RTX 3090 the 6 GiB reserve left only 0.54 GiB
+    // after those arenas were committed, below the allocator's 2 GiB floor.
+    const double graph_overhead_reserve_gb =
+        kGraphOverheadReserveGb + (est_graph_hot_expert_gb > 0.0 ? 3.0 : 0.0);
+
     // Ground-truth free VRAM right now, same GPU setup_expert_cache is
     // about to target. Single-GPU-vault configs only (the graphs'
     // current real deployment target) -- core_free_vram_bytes() reads
@@ -1079,29 +1147,38 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // config these families ship with today.
     const double free_gb = (double)gpu.core_free_vram_bytes() / kBytesPerGb;
     const double headroom_gb = free_gb - est_device_expert_gb -
-                               est_gpu_stage_gb - kGraphOverheadReserveGb;
-    const double fallback_gb =
-        std::clamp(headroom_gb, 0.0, kGraphRamCacheFallbackVramGb);
+                               est_gpu_stage_gb - est_graph_hot_expert_gb -
+                               graph_overhead_reserve_gb;
+    const double fallback_gb = std::max(headroom_gb, 0.0);
 
     EngineConfig fallback_config = config;
     for (auto &gc : fallback_config.gpus) {
       if (gc.moe_cache_gb > fallback_gb)
         gc.moe_cache_gb = fallback_gb;
     }
+    if (est_graph_hot_expert_gb > 0.0) {
+      // The graph's hot expert arena replaces the normal temporary
+      // active-layer upload area for GLM5NEXT. Keeping both would reserve
+      // another ~2.8 GB on this 3090 and starve the graph arena even after
+      // the legacy LRU cache has been bounded above.
+      fallback_config.use_active_layer_area = false;
+      LOG_STREAM_INFO()
+          << "[GPU] Active-layer temporary area disabled: "
+             "GLM5NEXT graph hot arena reserves "
+          << est_graph_hot_expert_gb << " GiB\n";
+    }
     LOG_STREAM_INFO()
         << "[GPU] Legacy VRAM expert cache: reduced to <=" << fallback_gb
-        << " GB/GPU as a decode-time fallback (full graph only ever "
-           "covers S>1 prefill -- every graph_mode decode step needs this "
-           "cache; sized from free="
+        << " GB/GPU as a graph-decline fallback (sized from free="
         << free_gb
         << " GiB - device_expert_"
            "layers("
         << dev_layers << ")~=" << est_device_expert_gb
         << " GiB - gpu_stage_layers(" << engine.qwen4exp_gpu_stage_layers.size()
         << ")~=" << est_gpu_stage_gb << " GiB - "
-        << kGraphOverheadReserveGb << " GiB graph overhead reserve, capped at "
-        << kGraphRamCacheFallbackVramGb
-        << " GiB -- see this call site's "
+        << "graph_hot_experts~=" << est_graph_hot_expert_gb << " GiB - "
+        << graph_overhead_reserve_gb << " GiB graph overhead reserve"
+        << " -- see this call site's "
            "own comment for the two real incidents this guards against)\n";
     const bool option_b_stage_enabled =
         config.qwen4exp_option_b_stage_expert >= 0;
@@ -1113,11 +1190,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       // graph fallback config; normal model/cache policy is unchanged.
       fallback_config.use_active_layer_area = false;
       LOG_WARN(
-          "[GPU] Decode-time expert cache is 0 GB -- device_expert_layers=%d "
-          "leaves no VRAM headroom after the %.1f GiB overhead reserve; every "
-          "decode step will pay the CPU-fallback dispatch cost. Lower "
-          "device_expert_layers if decode throughput matters for this run.\n",
-          dev_layers, kGraphOverheadReserveGb);
+          "[GPU] Legacy expert fallback cache is 0 GB -- graph device "
+          "residency leaves no VRAM headroom after the %.1f GiB overhead "
+          "reserve; legacy fallback decode may use CPU if the reusable graph "
+          "declines. Lower graph residency if that fallback matters for this "
+          "run.\n",
+          graph_overhead_reserve_gb);
     } else if (fallback_gb <= 0.0 && option_b_stage_enabled) {
       // The Layer-13 proof needs one slot per concurrently staged expert.
       // These are small active-layer slabs, not the legacy cache, and fit in
@@ -1325,7 +1403,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     const char *value = std::getenv("MOESTREAM_DISABLE_ROUTER_BF16");
     return value && value[0] == '1';
   }();
-  // Bee's CPU-MoE topology keeps the router projection on CUDA and moves only
+  // llama.cpp's CPU-MoE topology keeps the router projection on CUDA and moves only
   // the routed expert planes to the CPU.  The Qwen decode scheduler consumes
   // the original device_ptr representation; it cannot use the separate
   // gpu_fast_ptr BF16 representation without changing router math/type
@@ -1910,6 +1988,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     std::vector<int> graph_ram_projection_compact_layers;
     const int n_experts = engine.model_file.architecture_config.n_experts;
     for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
+      if (engine.qwen_ram_vram_only_layer(layer))
+        continue;
       const bool qwen_cpu_layer =
           qwen_cpu_ram_cache &&
           (is_cpu_affinity_layer(layer) ||
@@ -2370,6 +2450,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                  "layers use the general pin_file ranking alone.\n";
         }
       }
+
+      for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer)
+        if (engine.qwen_ram_vram_only_layer(layer))
+          by_layer.erase(layer);
 
       // A usage file is a ranking signal, not a complete model
       // manifest. When DDR is large enough to hold the whole MoE, add
@@ -3579,10 +3663,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // rereads the ~78 GiB expert set from SSD.  The source admission is
   // bounded by host_ram_gb and the memory watchdog; failure leaves the
   // established layer path available.
-  if (graph_mode && engine.family_ops.family == ModelFamily::GLM5NEXT &&
-      !glm5next_full_graph_bootstrap(engine)) {
+  if (graph_mode && graph_ops.bootstrap && !graph_ops.bootstrap(engine)) {
     LOG_STREAM_WARN()
-        << "[GGML-GLM5NEXT-FULL] boot source preload unavailable; "
+        << "[GRAPH] graph bootstrap unavailable; "
            "the graph will attempt bounded lazy preparation on the first "
            "prompt.\n";
   }
@@ -3911,12 +3994,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   }
 
   prefetcher.stop();
-  // The full Qwen graph owns a GGML scheduler and CUDA workspace buffers.
-  // Release them while CudaManager is still alive; otherwise the static
-  // graph destructor runs after CUDA driver teardown and cudaFree aborts.
-  qwen4exp_full_graph_shutdown();
-  glm5next_full_graph_shutdown();
-  deepseek_v4_full_graph_shutdown();
+  // The selected full graph owns a GGML scheduler and CUDA workspace
+  // buffers. Release it through the model graph contract while CudaManager
+  // is still alive; otherwise a static graph destructor can run after CUDA
+  // driver teardown and cudaFree aborts.
+  if (engine.family_ops.graph_ops.shutdown)
+    engine.family_ops.graph_ops.shutdown();
   // Phase A write this run's routing-frequency histogram so
   // the NEXT run's startup preload (above) has real data to work from.
   // Best-effort, matches dump_usage's own contract (a failed write just
@@ -4266,7 +4349,7 @@ int main(int argc, char *argv[]) {
   LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp decode device HC handoff: "
                     << (config.qwen4exp_decode_device_hc ? "ON" : "off")
                     << " (Qwen S=1 only)\n";
-  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp Bee-style decode scheduler: "
+  LOG_STREAM_INFO() << "[CONFIG] Qwen4Exp full graph decode scheduler: "
                     << (config.qwen4exp_decode_scheduler ? "ON" : "off")
                     << " (complete DDR arenas only; lazy layers use the "
                        "legacy path)\n";

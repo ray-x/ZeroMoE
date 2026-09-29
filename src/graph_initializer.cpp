@@ -231,6 +231,7 @@ static void report_dense_quant_coverage(const StreamingEngine &engine) {
     case GGUFType::F16:
     case GGUFType::BF16:
     case GGUFType::Q4_0:
+    case GGUFType::Q2_0:
     case GGUFType::Q8_0:
     case GGUFType::Q5_1:
     case GGUFType::Q2_K:
@@ -252,7 +253,7 @@ static void report_dense_quant_coverage(const StreamingEngine &engine) {
 
   LOG_STREAM_INFO() << "[QUANT] Dense tensor coverage (CPU dequant via "
                        "libggml; GPU fused for "
-                       "F32/F16/BF16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/"
+                       "F32/F16/BF16/Q4_0/Q2_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/"
                        "IQ2_XXS/XS/S/IQ3_XXS):\n";
   for (const auto &tc : dense_counts) {
     const char *status = gpu_fused(tc.first) ? "GPU dispatch OK"
@@ -779,11 +780,9 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
       return false;
     }
 
-    // Indexer metadata: loaded + logged, NOT executed in v1 (DSA layers run
-    // as dense absorbed MLA over the full KV cache -- a correct superset of
-    // the indexer's selected positions, not bit-matching the trained sparse
-    // behavior). The reference converter REJECTS non-indexer variants, so
-    // these keys are always present on a real checkpoint.
+    // Lightning KPool indexer metadata used by GLM5NEXT's sparse DSA decode
+    // graph. The reference converter rejects non-indexer variants, so these
+    // keys are expected on a real checkpoint.
     c.glm5next_indexer_head_count = file.get_config_int("attention.indexer.head_count", 0);
     c.glm5next_indexer_key_length = file.get_config_int("attention.indexer.key_length", 0);
     c.glm5next_indexer_top_k = file.get_config_int("attention.indexer.top_k", 0);
@@ -801,7 +800,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
                       << "kda_head_dim=" << c.kda_head_dim
                       << " ssm_conv_kernel=" << c.ssm_conv_kernel
                       << " kda_gate_lower_bound=" << c.kda_gate_lower_bound
-                      << " | indexer (DEFERRED, dense attention in v1): heads="
+                      << " | Lightning KPool indexer: heads="
                       << c.glm5next_indexer_head_count
                       << " key_length=" << c.glm5next_indexer_key_length
                       << " top_k=" << c.glm5next_indexer_top_k
@@ -1640,11 +1639,10 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   const int cache_layers = c.n_layers + (mtp_active ? n_layer_nextn : 0);
   engine.layers_experts.resize(cache_layers);
 
-  // GLM5NEXT carries six additional indexer tensors on each DSA layer. The
-  // v1 implementation intentionally attends densely and does not consume
-  // them, but count them here so a real GGUF load proves that omission is
-  // understood rather than silently hiding a naming mismatch.
+  // GLM5NEXT's reusable sparse-decode graph consumes the six indexer tensors
+  // on owner DSA layers; keep their inventory tied to the preload manifest.
   int glm5next_dsa_layers = 0;
+  int glm5next_indexer_owner_layers = 0;
   int glm5next_indexer_tensors_present = 0;
   static constexpr const char * kGlm5nextIndexerSuffixes[] = {
       "indexer.k_norm.weight",
@@ -1752,10 +1750,8 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         dense_preload_manifest.push_back(p + "ssm_norm.weight");
         dense_preload_manifest.push_back(p + "attn_output.weight");
       } else {
-        // Full-attention DSA layer: nope-only absorbed MLA, same tensor
-        // names as GLM-5.2's absorbed path (which v1 reuses verbatim).
-        // Indexer tensors (indexer.*) deliberately NOT preloaded -- the
-        // sparse path is deferred; DSA runs dense over the full KV cache.
+        // Full-attention DSA layer: nope-only absorbed MLA plus any
+        // per-layer Lightning indexer weights carried by this GGUF.
         dense_preload_manifest.push_back(p + "attn_q_a.weight");
         dense_preload_manifest.push_back(p + "attn_q_a_norm.weight");
         dense_preload_manifest.push_back(p + "attn_q_b.weight");
@@ -1766,10 +1762,18 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         dense_preload_manifest.push_back(p + "attn_output.weight");
 
         ++glm5next_dsa_layers;
+        if (file.tensors.find(p + "indexer.proj.weight") !=
+            file.tensors.end())
+          ++glm5next_indexer_owner_layers;
         for (const char *suffix : kGlm5nextIndexerSuffixes) {
-          if (file.tensors.find(p + suffix) != file.tensors.end())
+          if (file.tensors.find(p + suffix) != file.tensors.end()) {
             ++glm5next_indexer_tensors_present;
+            dense_preload_manifest.push_back(p + suffix);
+          }
         }
+        const std::string indexer_norm_bias = p + "indexer.k_norm.bias";
+        if (file.tensors.find(indexer_norm_bias) != file.tensors.end())
+          dense_preload_manifest.push_back(indexer_norm_bias);
       }
     } else if (c.cache_shape == CacheShape::MLAAbsorbed) {
       // MLA absorbed attention (GLM-5.2 / DeepSeek-V3)
@@ -2044,7 +2048,7 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   if (fam == ModelFamily::GLM5NEXT && glm5next_dsa_layers > 0) {
     const int indexer_tensor_count = static_cast<int>(
         sizeof(kGlm5nextIndexerSuffixes) / sizeof(kGlm5nextIndexerSuffixes[0]));
-    const int expected = glm5next_dsa_layers * indexer_tensor_count;
+    const int expected = glm5next_indexer_owner_layers * indexer_tensor_count;
     const int dense_until = c.glm5next_indexer_top_k > 0 &&
                                     c.glm5next_indexer_kpool > 0
                                 ? c.glm5next_indexer_top_k +
@@ -2053,8 +2057,9 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     LOG_STREAM_INFO()
         << "[GLM5NEXT] Lightning indexer tensors present: "
         << glm5next_indexer_tensors_present << "/" << expected << " across "
-        << glm5next_dsa_layers
-        << " DSA layer(s); not preloaded because v1 uses dense DSA attention"
+        << glm5next_indexer_owner_layers
+        << " indexer-owner layer(s); required weights are resident for the "
+           "sparse decode graph"
         << (dense_until > 0
                 ? " (exact for context <= " + std::to_string(dense_until) +
                       " tokens)"

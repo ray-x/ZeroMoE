@@ -11,6 +11,8 @@
 
 extern "C" void launch_gguf_q4_0_dp4a(float *, const float *, const void *,
                                       int, int, int);
+extern "C" void launch_q2_0_matmul(float *, const float *, const void *, int,
+                                    int, int);
 extern "C" void launch_q2_K_matmul(float *, const float *, const void *, int,
                                    int, int);
 extern "C" void launch_q3_K_matmul(float *, const float *, const void *, int,
@@ -123,6 +125,9 @@ bool CudaKernelDispatcher::matmul(GGUFType type, float *y, const float *x,
   switch (type) {
   case GGUFType::Q4_0:
     launch_gguf_q4_0_dp4a(y, x, w, S, I, O);
+    return true;
+  case GGUFType::Q2_0:
+    launch_q2_0_matmul(y, x, w, S, I, O);
     return true;
   case GGUFType::Q2_K:
     launch_q2_K_matmul(y, x, w, S, I, O);

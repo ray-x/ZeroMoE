@@ -45,6 +45,14 @@ extern void extract_gguf_row_q4_0(const QuantizedTensor& tensor, int row_idx, fl
 // Returns 1 if this type has a reference quantizer wired up, 0 otherwise.
 extern "C" int ggml_quantize_row_ref(uint32_t type, const float* src, void* dst, int64_t n);
 extern "C" int ggml_dequant_row(uint32_t type, const void* src, float* out, int n);
+extern "C" void quantize_row_q8_0(const float *x, void *y, int64_t k);
+extern "C" void ggml_vec_dot_q2_0_q8_0(
+    int n, float *s, size_t bs, const void *vx, size_t bx, const void *vy,
+    size_t by, int nrc);
+extern "C" void ggml_vec_dot_iq4_nl_q8_0(
+    int n, float *s, size_t bs, const void *vx, size_t bx, const void *vy,
+    size_t by, int nrc);
+extern "C" void ggml_cpu_init(void);
 
 class GGUFGraphInitializer {
 public:
@@ -190,7 +198,8 @@ void test_cuda_execution() {
 // preventing GPU dispatch from ever firing).
 static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O, int S) {
     const char* name = gpu_type_name(type);
-    assert(I % 256 == 0 && "test cases below must use a multiple of 256");
+    const int required_block_size = type == GGUFType::Q2_0 ? 64 : 256;
+    assert(I % required_block_size == 0 && "test case input size is not block aligned");
 
     std::mt19937 rng(42);
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
@@ -343,6 +352,10 @@ bool test_cuda_fused_kernels() {
     }
 
     bool all_pass = true;
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q2_0,    512, 8, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q2_0,    640, 2560, 1);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q2_0,    640, 32, 3);
+    all_pass &= run_fused_kernel_case(gpu, GGUFType::Q2_0,   2048, 16, 1);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q2_K,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q3_K,    512, 8, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q4_K,    512, 8, 3);
@@ -696,6 +709,256 @@ static bool compare_iq_outputs(const std::string &label, const float *a,
     return ok;
 }
 
+bool test_qwen_q2_0_vnni_kernel() {
+    ggml_cpu_init();
+    constexpr int D = 2560;
+    constexpr int FF = 640;
+    constexpr int N = 10;
+    constexpr int ITERATIONS = 20;
+    const int input_row_bytes = row_bytes(GGUFType::Q2_0, D);
+    const int down_row_bytes = row_bytes(GGUFType::Q2_0, FF);
+    std::mt19937 rng(20260928);
+    std::uniform_real_distribution<float> dist(-0.15f, 0.15f);
+    std::vector<uint8_t> gate((size_t)N * FF * input_row_bytes);
+    std::vector<uint8_t> up((size_t)N * FF * input_row_bytes);
+    std::vector<uint8_t> down((size_t)N * D * down_row_bytes);
+    // Quantize each real GGUF Q2_0 row using GGML's reference quantizer.
+    auto fill_plane = [&](std::vector<uint8_t> &plane, int rows, int width,
+                          int rb) {
+        std::vector<float> values((size_t)width);
+        for (int e = 0; e < N; ++e) {
+            for (int r = 0; r < rows; ++r) {
+                for (float &v : values)
+                    v = dist(rng);
+                if (!ggml_quantize_row_ref(
+                        (uint32_t)GGUFType::Q2_0, values.data(),
+                        plane.data() + ((size_t)e * rows + r) * (size_t)rb,
+                        width))
+                    return false;
+            }
+        }
+        return true;
+    };
+    if (!fill_plane(gate, FF, D, input_row_bytes) ||
+        !fill_plane(up, FF, D, input_row_bytes) ||
+        !fill_plane(down, D, FF, down_row_bytes)) {
+        std::cout << "  -> Q2_0 fused VNNI: FAILED (quantizer unavailable)\n";
+        return false;
+    }
+
+    std::vector<const uint8_t *> gate_ptrs(N), up_ptrs(N), down_ptrs(N);
+    std::vector<std::vector<float>> gate_y(N, std::vector<float>(FF));
+    std::vector<std::vector<float>> up_y(N, std::vector<float>(FF));
+    std::vector<std::vector<float>> down_y(N, std::vector<float>(D));
+    std::vector<float *> gate_out(N), up_out(N), down_out(N);
+    for (int e = 0; e < N; ++e) {
+        gate_ptrs[e] = gate.data() + (size_t)e * FF * input_row_bytes;
+        up_ptrs[e] = up.data() + (size_t)e * FF * input_row_bytes;
+        down_ptrs[e] = down.data() + (size_t)e * D * down_row_bytes;
+        gate_out[e] = gate_y[e].data();
+        up_out[e] = up_y[e].data();
+        down_out[e] = down_y[e].data();
+    }
+    std::vector<float> input((size_t)D);
+    for (float &v : input)
+        v = dist(rng);
+    std::vector<block_q8_0> input_q((size_t)D / 32);
+    quantize_row_q8_0(input.data(), input_q.data(), D);
+    for (int e = 0; e < N; ++e) {
+        for (int o = 0; o < FF; ++o) {
+            ggml_vec_dot_q2_0_q8_0(
+                D, &gate_y[e][o], 0,
+                gate_ptrs[e] + (size_t)o * input_row_bytes, 0,
+                input_q.data(), 0, 1);
+            ggml_vec_dot_q2_0_q8_0(
+                D, &up_y[e][o], 0,
+                up_ptrs[e] + (size_t)o * input_row_bytes, 0,
+                input_q.data(), 0, 1);
+        }
+    }
+    const auto reference_gate_dot = gate_y;
+    const auto reference_up_dot = up_y;
+    for (int e = 0; e < N; ++e) {
+        silu_inplace(gate_y[e].data(), FF);
+        elem_mul(gate_y[e].data(), gate_y[e].data(), up_y[e].data(), FF);
+    }
+    std::vector<block_q8_0> down_q((size_t)N * FF / 32);
+    for (int e = 0; e < N; ++e) {
+        quantize_row_q8_0(gate_y[e].data(),
+                          down_q.data() + (size_t)e * FF / 32, FF);
+        for (int o = 0; o < D; ++o)
+            ggml_vec_dot_q2_0_q8_0(
+                FF, &down_y[e][o], 0,
+                down_ptrs[e] + (size_t)o * down_row_bytes, 0,
+                down_q.data() + (size_t)e * FF / 32, 0, 1);
+    }
+    const auto reference_gate = gate_y;
+    const auto reference_up = up_y;
+    const auto reference_down = down_y;
+
+    // Isolated dot-only A/B on the same real GGUF Q2_0 rows and already
+    // quantized Q8_0 inputs used by the fused-route test below. Quantization,
+    // activation, routing, and output reduction are deliberately outside the
+    // timed region. Keep the same five-worker team as the direct-route test.
+    struct Q2DotCase {
+        const uint8_t *weights;
+        const block_q8_0 *activations;
+        int n;
+        float expected;
+    };
+    constexpr int DOT_THREADS = 5;
+    constexpr int DOT_ITERATIONS = 20;
+    std::vector<Q2DotCase> dot_cases;
+    dot_cases.reserve((size_t)N * (2 * FF + D));
+    for (int e = 0; e < N; ++e) {
+        for (int o = 0; o < FF; ++o) {
+            dot_cases.push_back({gate_ptrs[e] + (size_t)o * input_row_bytes,
+                                 input_q.data(), D, reference_gate_dot[e][o]});
+            dot_cases.push_back({up_ptrs[e] + (size_t)o * input_row_bytes,
+                                 input_q.data(), D, reference_up_dot[e][o]});
+        }
+        const block_q8_0 *expert_down_q =
+            down_q.data() + (size_t)e * FF / 32;
+        for (int o = 0; o < D; ++o)
+            dot_cases.push_back({down_ptrs[e] + (size_t)o * down_row_bytes,
+                                 expert_down_q, FF, reference_down[e][o]});
+    }
+    std::vector<float> dot_output(dot_cases.size());
+    std::vector<float> ggml_dot_output;
+    const bool use_vnni = q2_0_vnni_enabled();
+    auto run_dot_set = [&](bool use_vnni_backend) {
+#pragma omp parallel for schedule(static) num_threads(DOT_THREADS)
+        for (int64_t i = 0; i < (int64_t)dot_cases.size(); ++i) {
+            const Q2DotCase &test = dot_cases[(size_t)i];
+            dot_output[(size_t)i] = dot_q2_0_q8_0_cpu(
+                test.weights, test.activations, test.n, use_vnni_backend);
+        }
+    };
+    run_dot_set(false);
+    ggml_dot_output = dot_output;
+    run_dot_set(use_vnni);
+    double ggml_dot_ms = 0.0;
+    double selected_dot_ms = 0.0;
+    for (int iteration = 0; iteration < DOT_ITERATIONS; ++iteration) {
+        auto start = std::chrono::steady_clock::now();
+        const bool first_is_vnni = (iteration & 1) != 0;
+        run_dot_set(first_is_vnni && use_vnni);
+        double elapsed = std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+        if (first_is_vnni) selected_dot_ms += elapsed;
+        else ggml_dot_ms += elapsed;
+
+        start = std::chrono::steady_clock::now();
+        run_dot_set(!first_is_vnni && use_vnni);
+        elapsed = std::chrono::duration<double, std::milli>(
+                      std::chrono::steady_clock::now() - start)
+                      .count();
+        if (first_is_vnni) ggml_dot_ms += elapsed;
+        else selected_dot_ms += elapsed;
+    }
+    ggml_dot_ms /= DOT_ITERATIONS;
+    selected_dot_ms /= DOT_ITERATIONS;
+    run_dot_set(use_vnni);
+    std::vector<float> dot_expected;
+    dot_expected.reserve(dot_cases.size());
+    for (const Q2DotCase &test : dot_cases)
+        dot_expected.push_back(test.expected);
+    bool ggml_dot_ok = compare_iq_outputs(
+        "Q2_0 GGML dot", ggml_dot_output.data(), dot_expected.data(),
+        ggml_dot_output.size(), 2e-5f, 2e-5f);
+    bool dot_ok = compare_iq_outputs("Q2_0 dot-only selected", dot_output.data(),
+                                     dot_expected.data(), dot_output.size(),
+                                     2e-5f, 2e-5f) && ggml_dot_ok;
+    float grouped_dot[4]{};
+    float grouped_reference[4]{};
+    for (int row = 0; row < 4; ++row) {
+        ggml_vec_dot_q2_0_q8_0(
+            D, &grouped_reference[row], 0,
+            gate_ptrs[0] + (size_t)row * input_row_bytes, 0,
+            input_q.data(), 0, 1);
+    }
+    ggml_vec_dot_q2_0_q8_0(
+        D, grouped_dot, sizeof(float), gate_ptrs[0], input_row_bytes,
+        input_q.data(), 0, 4);
+    dot_ok = compare_iq_outputs(
+                 "Q2_0 four-row VNNI dot", grouped_dot, grouped_reference, 4,
+                 2e-5f, 2e-5f) && dot_ok;
+    std::cout << "  -> Q2_0 dot-only (" << dot_cases.size() << " real rows, "
+              << DOT_THREADS << " threads): GGML " << std::fixed
+              << std::setprecision(3) << ggml_dot_ms << " ms/pass | selected "
+              << selected_dot_ms << " ms/pass ("
+              << (q2_0_vnni_enabled() ? "VNNI" : "GGML fallback") << ")\n";
+
+    std::vector<float> expected((size_t)D, 0.0f);
+    std::vector<int> expert_ids((size_t)N);
+    std::vector<float> route_weights((size_t)N, 1.0f / N);
+    for (int e = 0; e < N; ++e) {
+        expert_ids[(size_t)e] = e;
+        for (int i = 0; i < D; ++i)
+            expected[(size_t)i] += route_weights[(size_t)e] *
+                                  reference_down[(size_t)e][(size_t)i];
+    }
+
+    auto run_kernel = [&] {
+        return matmul_qwen_q2_0_q2_0_fused(
+            gate_out.data(), up_out.data(), down_out.data(), input.data(),
+            gate_ptrs.data(), up_ptrs.data(), down_ptrs.data(), N, D, FF, D,
+            std::max(1, omp_get_max_threads()));
+    };
+    // Restore reference arrays after the kernel overwrites its outputs.
+    bool ok = run_kernel() && dot_ok;
+    for (int e = 0; e < N; ++e) {
+        ok = compare_iq_outputs("Q2_0 gate", gate_y[e].data(),
+                               reference_gate[e].data(), FF, 2e-5f, 2e-5f) && ok;
+        ok = compare_iq_outputs("Q2_0 up", up_y[e].data(),
+                               reference_up[e].data(), FF, 2e-5f, 2e-5f) && ok;
+        ok = compare_iq_outputs("Q2_0 down", down_y[e].data(),
+                               reference_down[e].data(), D, 2e-5f, 2e-5f) && ok;
+    }
+
+    for (int i = 0; i < 3; ++i)
+        run_kernel();
+
+    // Exercise the actual direct Qwen dispatch with this measured all-Q2_0
+    // signature. This is the opt-in CPU host route used by the smoke config.
+    setenv("MOESTREAM_QWEN_CPU_DIRECT_POOL", "1", 1);
+    setenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED", "1", 1);
+    GgmlQwenCpuExpertRef ref{
+        gate_ptrs[0], up_ptrs[0], down_ptrs[0],
+        (size_t)FF * input_row_bytes, (size_t)FF * input_row_bytes,
+        (size_t)D * down_row_bytes, (uint32_t)GGUFType::Q2_0,
+        (uint32_t)GGUFType::Q2_0, (uint32_t)GGUFType::Q2_0};
+    std::vector<float> routed((size_t)D, 0.0f);
+    auto run_routed = [&] {
+        return GgmlQwenCpuMoeRunner::instance().run_strided(
+            input.data(), routed.data(), ref, gate_ptrs[0], up_ptrs[0],
+            down_ptrs[0], expert_ids.data(), N, route_weights.data(), D, FF,
+            N, (size_t)FF * input_row_bytes);
+    };
+    ok = run_routed() && ok;
+    ok = compare_iq_outputs("Q2_0 direct Qwen route", routed.data(),
+                            expected.data(), D, 2e-5f, 2e-5f) && ok;
+
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < ITERATIONS; ++i)
+        ok = run_routed() && ok;
+    const double ms = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - start)
+                          .count() /
+                      ITERATIONS;
+    const char *fused_backend = q2_0_vbmi_enabled()
+                                    ? "AVX-512 VNNI+VBMI"
+                                    : q2_0_vnni_enabled() ? "AVX-512 VNNI"
+                                                          : "GGML fallback";
+    std::cout << "  -> Q2_0 fused " << fused_backend
+              << " direct route: " << std::fixed << std::setprecision(3) << ms
+              << " ms/call (D=" << D << ", FF=" << FF << ", experts=" << N
+              << ") " << (ok ? "PASSED" : "FAILED") << "\n";
+    GgmlQwenCpuMoeRunner::instance().shutdown();
+    return ok;
+}
+
 bool test_cpu_iq_matmul_paths() {
     std::cout << "[Test 7b] CPU IQ1_M/IQ2_XXS/IQ3_XXS matmul paths...\n";
     constexpr int I = 1024;
@@ -708,7 +971,7 @@ bool test_cpu_iq_matmul_paths() {
 
     bool ok = true;
     for (GGUFType type : {GGUFType::IQ1_M, GGUFType::IQ2_XXS,
-                          GGUFType::IQ3_XXS}) {
+                          GGUFType::IQ3_XXS, GGUFType::Q2_0}) {
         const int rb = row_bytes(type, I);
         std::vector<float> wf((size_t)O * I);
         for (float &v : wf) v = dist(rng);
@@ -1655,7 +1918,7 @@ bool bench_qwen_cpu_moe() {
     const size_t down_bytes = (size_t)D * row_bytes(down_type, FF);
     // Match the production graph-RAM source contract: each expert is one
     // fixed-stride [gate|up|down] slab.  This is also what enables the
-    // BeeLlama-style merged gate_up MUL_MAT_ID path being measured here.
+    // llama.cpp-style merged gate_up MUL_MAT_ID path being measured here.
     const size_t raw_stride = gate_bytes + up_bytes + down_bytes;
     const size_t stride = raw_stride + 64;
     const size_t arena_bytes = stride * (size_t)N;
@@ -6035,6 +6298,10 @@ int main() {
     std::cout << "  MoeStream Native Test Harness\n";
     std::cout << "========================================\n";
 
+    if (std::getenv("MOESTREAM_TEST_ONLY_Q2_0_VNNI")) {
+        return test_qwen_q2_0_vnni_kernel() ? 0 : 1;
+    }
+
     // Diagnostic-only escape hatch (2026-09-10): run just Test 35 in
     // isolation so compute-sanitizer's overhead is tractable -- the full
     // suite's CPU-only tests dominate wall time and add nothing to a
@@ -6068,6 +6335,9 @@ int main() {
                 iq2_graph_ok)
                    ? 0
                    : 1;
+    }
+    if (std::getenv("MOESTREAM_TEST_ONLY_CUDA_FUSED")) {
+        return test_cuda_fused_kernels() ? 0 : 1;
     }
     if (std::getenv("MOESTREAM_TEST_ONLY_COMPACT_CACHE")) {
         return test_compact_vram_slot_planner() ? 0 : 1;

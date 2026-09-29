@@ -12,7 +12,7 @@
 // optional stage + H2D, an activation gather, a dispatch, a synchronisation
 // and accumulation bookkeeping, once per expert per layer.
 //
-// llama.cpp/beellama pay none of that. Their whole routed FFN is three
+// llama.cpp/llama.cpp pay none of that. Their whole routed FFN is three
 // GGML_OP_MUL_MAT_ID nodes in one backend graph; ggml-cuda sorts token rows by
 // expert ON THE GPU (get_rows into a sorted scratch buffer), derives expert
 // bounds, and dispatches one grouped matmul per expert without ever returning
@@ -936,7 +936,7 @@ class GgmlQwenCpuMoeRunner {
            const GgmlQwenCpuExpertRef *experts, int n_experts,
            const float *router_weights, int d_model, int d_ff, int topk);
 
-  // BeeLlama-style CPU-offload entry point. The three projection pointers are
+  // llama.cpp-style CPU-offload entry point. The three projection pointers are
   // the first expert's views in a complete host-RAM layer arena. `expert_stride`
   // is the byte distance between expert IDs; route IDs remain global and
   // selected expert weights are not copied per token.
@@ -1082,7 +1082,7 @@ class GgmlQwenCpuMoeRunner {
   };
 
   void *cpu_backend_ = nullptr;       // ggml_backend_t, owned
-  // BeeLlama keeps one CPU worker pool attached to its CPU backend for the
+  // llama.cpp keeps one CPU worker pool attached to its CPU backend for the
   // lifetime of the context.  Keep the Qwen-only runner's pool persistent as
   // well; leaving this null makes ggml_backend_graph_compute() create and
   // destroy a disposable pool for every CPU-affinity layer call.
@@ -1201,7 +1201,7 @@ class GgmlQwenCpuMoeRunner {
   std::vector<GgmlQwenDirectWorkerSample> direct_reduce_samples_;
 };
 
-// Qwen-only decode graph that mirrors BeeLlama's backend topology for a
+// Qwen-only decode graph that mirrors llama.cpp's backend topology for a
 // CPU-affinity routed layer.  The graph contains the CUDA router (including
 // softmax/top-k) and the host-RAM MUL_MAT_ID expert path in one scheduler
 // submission.  The scheduler owns the CUDA->CPU route/input handoff; callers

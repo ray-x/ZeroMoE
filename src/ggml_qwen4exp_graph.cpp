@@ -900,13 +900,13 @@ struct FullGraph {
   ggml_tensor *two_layer_l1_post_attn = nullptr;
   ggml_tensor *two_layer_l1_post_ffn = nullptr;
   // Optional exact hidden-state snapshots at the same semantic boundary as
-  // beellama's l_last-0/l_last-1 callbacks: after each layer's attention and
+  // llama.cpp's l_last-0/l_last-1 callbacks: after each layer's attention and
   // FFN residual combine.  These are intentionally limited to layers 0/1.
   ggml_tensor *hidden01_snapshot[2] = {nullptr, nullptr};
   bool hidden01_dumped = false;
   // Generalizes hidden01_snapshot above to ALL layers, dumped every decode
   // step (not one-shot) -- for a full layer-by-layer, token-by-token parity
-  // trace against bee/llama.cpp when hidden01's 2-layer window isn't enough
+  // trace against llama.cpp when hidden01's 2-layer window isn't enough
   // to localize where two engines' outputs first diverge. Gated by
   // MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP; same semantic boundary (after each
   // layer's attention+FFN residual combine) as hidden01_snapshot.
@@ -963,7 +963,7 @@ struct FullGraph {
   bool device_expert_partial_gate_up = false;
   // When true, the device_expert_layers-sized GPU-resident block sits at
   // the END of the model (layers [n_layers-N, n_layers)) instead of the
-  // START (layers [0, N)). Added specifically to match beellama's own
+  // START (layers [0, N)). Added specifically to match llama.cpp's own
   // `-ncmoe N` convention: llama-bench forces layers 0..N-1 to CPU via
   // llm_ffn_block_regex(i, ...) for i in [0,N), which leaves the LAST
   // n_layers-N layers GPU-resident -- the opposite end from MoEStream's
@@ -1433,7 +1433,7 @@ int env_device_expert_layers() {
   return static_cast<int>(std::min<long>(n, 48));
 }
 
-// Matches beellama's `-ncmoe N` convention (GPU-resident block at the END
+// Matches llama.cpp's `-ncmoe N` convention (GPU-resident block at the END
 // of the model) instead of MoEStream's historical leading-N convention.
 // See FullGraph::device_expert_trailing's own comment.
 bool env_device_expert_trailing() {
@@ -1560,7 +1560,7 @@ static const char * env_layer0_split_dump_path() {
 }
 
 // All-layer, every-decode-step hidden-state dump for a full parity trace
-// against bee/llama.cpp -- see all_layers_snapshot's own comment.
+// against llama.cpp -- see all_layers_snapshot's own comment.
 static const char * env_alllayers_dump_path() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP");
   return v && v[0] ? v : nullptr;
@@ -1609,7 +1609,7 @@ const char *env_two_layer_s1_diag_dump_path() {
 
 // Controlled QKV replay input for the two-layer S=1 diagnostic.  The file
 // must contain exactly one F32 Layer-0 attention input row ([D] elements),
-// typically extracted from Bee's hc_mixed dump.  This replaces only the
+// typically extracted from llama.cpp's hc_mixed dump.  This replaces only the
 // diagnostic graph's Layer-0 hc_mix result; production execution is never
 // affected.  It lets us distinguish a small upstream HC rounding difference
 // from a QKV/MMQ implementation difference using the same bytes at the GEMM
@@ -1700,7 +1700,7 @@ void log_layer0_diag_host_values(const char *role, const float *values,
            static_cast<const void *>(values));
 }
 
-// Every-decode-step, all-layer hidden-state dump for a bee/llama.cpp parity
+// Every-decode-step, all-layer hidden-state dump for a llama.cpp parity
 // trace. One file per decode step: <path>.step<pos>.f32, holding
 // n_layers * D float32s in layer-major order (all_layers_snapshot[l]'s raw
 // data back to back, skipping any layer whose snapshot is unavailable by
@@ -2099,16 +2099,16 @@ int graph_cpu_threads() {
 }
 
 // REVERTED (2026-09-17): a prior commit defaulted this to false, reasoning
-// "the reference Bee scheduler uses pipeline_parallel=false for this
+// "the reference llama.cpp scheduler uses pipeline_parallel=false for this
 // graph... so the event/four-copy mode adds bookkeeping without useful
-// overlap." That reasoning does not hold up against Bee's own source
+// overlap." That reasoning does not hold up against llama.cpp's own source
 // (llama-context.cpp): `pipeline_parallel` there is an UNRELATED feature --
 // it requires `model.n_devices() > 1` (multi-GPU tensor split) AND
-// `!model.has_tensor_overrides()`, and Bee's own `-ncmoe` flag sets tensor
+// `!model.has_tensor_overrides()`, and llama.cpp's own `-ncmoe` flag sets tensor
 // overrides for exactly the CPU-offloaded MoE tensors this graph mirrors.
-// So Bee's `pipeline_parallel=false` in every comparison this project has
+// So llama.cpp's `pipeline_parallel=false` in every comparison this project has
 // ever run is not a deliberate choice about CPU/GPU MoE handoff at all --
-// it is bee's own multi-GPU pipelining feature being auto-disabled by
+// it is llama.cpp's own multi-GPU pipelining feature being auto-disabled by
 // `-ncmoe`, for reasons having nothing to do with this graph's performance.
 // Confirmed via direct measurement this graph's OWN parallel=false default
 // was a real regression (11.76 vs 12.20-12.86 tok/s, N=22 mixed decode) --
@@ -2123,7 +2123,7 @@ bool graph_scheduler_parallel() {
   return !(v && v[0] == '0');
 }
 
-// Bee gives the CPU scheduler slot the CUDA device's host buffer type. That
+// llama.cpp gives the CPU scheduler slot the CUDA device's host buffer type. That
 // makes graph-owned CPU activations pinned host allocations, so the many
 // CPU<->CUDA boundary copies do not fall through the pageable-host staging
 // path. This is the normal full-graph mode; set the environment variable to
@@ -2133,24 +2133,24 @@ bool graph_cuda_host_buffers() {
   return !(v && v[0] == '0');
 }
 
-// Bee's full graph begins with the CPU token-embedding GET_ROWS node, then
+// llama.cpp's full graph begins with the CPU token-embedding GET_ROWS node, then
 // crosses to CUDA for the first transformer block.  MoEStream receives the
 // already-expanded hidden state from the engine, so it cannot include that
 // embedding operation without duplicating model work.  Keep the same
 // CPU->GPU graph boundary with one CPU contiguous staging node instead.  This
 // is a topology-compatibility node, not a numerical transformation; set the
 // variable to 0 for the original MoEStream graph shape when doing an A/B.
-bool graph_match_bee_topology() {
+bool graph_match_llama_cpp_topology() {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MATCH_BEE_TOPOLOGY");
+      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
   return !(v && v[0] == '0');
 }
 
 // Emit one-time tensor metadata for CPU MoE comparisons.  The same
-// BEE_GGML_PROFILE_LAYOUT switch is consumed by Bee's GGML scheduler so the
+// LLAMA_CPP_GGML_PROFILE_LAYOUT switch is consumed by llama.cpp's GGML scheduler so the
 // two implementations can be compared without changing their execution.
 bool graph_layout_debug() {
-  const char *v = std::getenv("BEE_GGML_PROFILE_LAYOUT");
+  const char *v = std::getenv("LLAMA_CPP_GGML_PROFILE_LAYOUT");
   return v && v[0] == '1';
 }
 
@@ -2603,7 +2603,7 @@ ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
 
 // True for a layer inside the device_expert_layers-sized GPU-resident
 // block, wherever that block sits (leading, the historical default, or
-// trailing, matching beellama's `-ncmoe` convention -- see
+// trailing, matching llama.cpp's `-ncmoe` convention -- see
 // FullGraph::device_expert_trailing's own comment). Single source of
 // truth for the block's bounds so device_expert_bytes() and
 // plan_expert_vram_split()'s eligibility filter can't drift from
@@ -2983,6 +2983,8 @@ size_t full_expert_source_bytes(const StreamingEngine &engine,
   const int limit = layer_limit > 0 ? std::min(layer_limit, c.n_layers)
                                     : c.n_layers;
   for (int layer = 0; layer < limit; ++layer) {
+    if (engine.qwen_ram_vram_only_layer(layer))
+      continue;
     // When main.cpp prepared a complete graph-RAM arena, the three packed
     // expert planes for this layer are already resident in DDR.  The full
     // graph aliases those bytes below; do not pre-charge or allocate a second
@@ -3213,7 +3215,19 @@ bool init_device_expert_arena(FullGraph &g) {
       !g.engine->qwen4exp_partial_layer_gpu_ids.empty() &&
       g.engine->qwen4exp_partial_layer >= 0 &&
       (!g.two_layer_diag || g.engine->qwen4exp_partial_layer < g.n_layers);
-  if (g.device_expert_layers <= 0 && !split_active && !partial_active)
+  // device_expert_bytes() already sizes in qwen4exp_gpu_stage_layers'
+  // compact per-layer tensors (see its own comment), but this early-return
+  // guard never checked for them -- with 0 preloaded layers and no Option-B
+  // split, it returned before device_expert_buffer was ever allocated, so
+  // EVERY gpu-stage layer's make_dst() call failed on a null buffer
+  // ("compact device destination allocation failed") regardless of how
+  // small the real requirement was. Same class of gap partial_active above
+  // already guards against for the Phase 1/2 tensor.
+  const bool gpu_stage_active =
+      g.decode_mode && g.engine && g.engine->qwen4exp_gpu_stage_enabled &&
+      !g.engine->qwen4exp_gpu_stage_layers.empty();
+  if (g.device_expert_layers <= 0 && !split_active && !partial_active &&
+      !gpu_stage_active)
     return true;
   const ggml_backend_buffer_type_t buft =
       ggml_backend_get_default_buffer_type(g.cuda);
@@ -3525,11 +3539,12 @@ bool phase2_bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
 }
 
 bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host,
-                        size_t bytes) {
+                        size_t bytes,
+                        const std::string &source_tag = std::string()) {
   if (!g.device_expert_buffer || !t || !host || bytes < ggml_nbytes(t))
     return false;
   const std::string key = "single:" + phase2_expert_ptr_text(host) + ":" +
-                          std::to_string(bytes);
+                          std::to_string(bytes) + ":" + source_tag;
   void *addr = nullptr;
   bool new_allocation = false;
   if (!phase2_bind_or_allocate_expert(g, t, key, &addr, &new_allocation))
@@ -3726,6 +3741,16 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
     return nullptr;
   const size_t bytes = static_cast<size_t>(m->size_bytes);
   const size_t required = std::max(bytes, ggml_nbytes(t));
+  int graph_ram_layer = -1;
+  if (name.compare(0, 4, "blk.") == 0) {
+    char *end = nullptr;
+    const long parsed = std::strtol(name.c_str() + 4, &end, 10);
+    if (end != name.c_str() + 4 && end && *end == '.')
+      graph_ram_layer = static_cast<int>(parsed);
+  }
+  const bool vram_only_device_source =
+      device_resident && graph_ram_layer >= 0 &&
+      g.engine->qwen_ram_vram_only_layer(graph_ram_layer);
 
   // A Qwen full graph must consume the same complete DDR expert planes that
   // the RAM tier already loaded.  In that configuration the source is a
@@ -3761,8 +3786,9 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
     size_t ram_bytes = 0;
     size_t ram_stride = 0;
     size_t ram_arena_bytes = 0;
-    if (preloaded_ram_expert_source(g, name, *m, ram_ptr, ram_bytes, ram_stride,
-                                    ram_arena_bytes)) {
+    if (!vram_only_device_source &&
+        preloaded_ram_expert_source(g, name, *m, ram_ptr, ram_bytes,
+                                    ram_stride, ram_arena_bytes)) {
       if (shape.size() < 3 ||
           t->ne[2] != g.engine->model_file.architecture_config.n_experts ||
           ram_stride < t->nb[2])
@@ -3804,16 +3830,10 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
     // the source policy visible instead of hiding an SSD read behind this
     // path.  This guard is deliberately Qwen-full-graph-only; other model
     // families have their own graph source ownership rules.
-    int graph_ram_layer = -1;
-    if (name.compare(0, 4, "blk.") == 0) {
-      char *end = nullptr;
-      const long parsed = std::strtol(name.c_str() + 4, &end, 10);
-      if (end != name.c_str() + 4 && end && *end == '.')
-        graph_ram_layer = static_cast<int>(parsed);
-    }
     const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
     const bool require_preloaded_ram =
         g.engine->qwen_ram_preload_all_experts &&
+        !g.engine->qwen_ram_vram_only_layer(graph_ram_layer) &&
         (!narrow_layer0_diag || graph_ram_layer == 0);
     if (graph_ram_layer >= 0 && require_preloaded_ram) {
       LOG_WARN("[GGML-QWEN-FULL] refusing file-backed expert source for "
@@ -3830,6 +3850,42 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
                graph_ram_layer);
       return nullptr;
     }
+  }
+
+  if (vram_only_device_source) {
+    constexpr size_t host_watermark =
+        10ull * 1024ull * 1024ull * 1024ull;
+    if (!MemoryGuard::try_reserve_host_bytes(required, host_watermark)) {
+      LOG_WARN("[GGML-QWEN-FULL-MEM] VRAM staging refused for %s: %.2f GiB "
+               "plus %.2f GiB reserve\n",
+               name.c_str(), static_cast<double>(required) / 1.0e9,
+               static_cast<double>(host_watermark) / 1.0e9);
+      return nullptr;
+    }
+    void *staging = nullptr;
+    const int alloc_err = posix_memalign(&staging, 4096, required);
+    if (alloc_err != 0 || !staging) {
+      MemoryGuard::release_host_bytes(required);
+      LOG_ERROR("[GGML-QWEN-FULL] VRAM staging allocation failed for %s\n",
+                name.c_str());
+      return nullptr;
+    }
+    const int fd = g.engine->model_file.fd_for_tensor(*m);
+    const ssize_t got = direct_io::pread_direct_aware(
+        fd, g.engine->model_file.direct_io_active_for(*m),
+        g.engine->model_file.direct_io_alignment, staging, bytes, m->offset);
+    const bool uploaded = got >= 0 && static_cast<size_t>(got) == bytes &&
+                          bind_device_expert(g, t, staging, bytes, name);
+    free(staging);
+    MemoryGuard::release_host_bytes(required);
+    if (!uploaded) {
+      if (got < 0 || static_cast<size_t>(got) != bytes)
+        LOG_ERROR("[GGML-QWEN-FULL] short read for VRAM-only %s: %zd/%zu\n",
+                  name.c_str(), got, bytes);
+      return nullptr;
+    }
+    ggml_set_name(t, name.c_str());
+    return t;
   }
 
   void *p = alloc_host(g, required);
@@ -5178,7 +5234,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_tensor *gate = nullptr;
     ggml_tensor *gate_up = nullptr; // only set on the fused path
     if (gate_up_exps) {
-      // Bee's Qwen graph and the CPU runner use one routed matmul for the
+      // llama.cpp's Qwen graph and the CPU runner use one routed matmul for the
       // adjacent gate+up planes, then split the result into two views.  The
       // tensor is a zero-copy view over the shared DDR arena for CPU layers;
       // GPU layers may use the same representation when available.
@@ -5588,7 +5644,7 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
                      rope_c.rope_freq_scale, rope_c.rope_ext_factor,
                      rope_c.rope_attn_factor, 32.0f, 1.0f);
   // The host dense KV cache stores the same normalized and rotated K/V values
-  // that Bee's graph writes to its cache.  Keep these F32 tensors before the
+  // that llama.cpp's graph writes to its cache.  Keep these F32 tensors before the
   // layout-only permute/cast used by flash attention.
   if (k_cache)
     *k_cache = k;
@@ -5899,22 +5955,22 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   if (g.phase2_mode != FullGraph::Phase2Mode::SuffixGpu &&
       g.phase2_mode != FullGraph::Phase2Mode::SuffixCpu &&
-      graph_match_bee_topology()) {
+      graph_match_llama_cpp_topology()) {
     // The scheduler normally starts directly on the first GPU-weighted
     // operation because g.input is already a CPU buffer.  An explicit CPU
     // CONT makes the initial CPU->GPU handoff visible as the same leading
-    // CPU/GPU split that Bee has around model.input_embed/hc_init.
+    // CPU/GPU split that llama.cpp has around model.input_embed/hc_init.
     res = ggml_cont(g.ctx, res);
     if (!res)
       return false;
-    ggml_set_name(res, "qwen_full_bee_cpu_prologue");
+    ggml_set_name(res, "qwen_full_llama_cpp_cpu_prologue");
     g.topology_cpu_prologue = res;
     if (g.sched) {
       // In host-node mode every CPU MoE boundary is represented by a
       // CUDA-owned CPY marker.  Keep the initial contiguous handoff on the
       // same CUDA split as those markers; otherwise this otherwise harmless
       // topology node leaves a second scheduler split in the graph.  The
-      // default path remains Bee's original CPU prologue assignment.
+      // default path remains llama.cpp's original CPU prologue assignment.
       ggml_backend_sched_set_tensor_backend(
           g.sched, res,
           env_qwen4exp_host_node_enabled() &&
@@ -5984,7 +6040,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                                  "qwen_layer0_split_ple_embd"));
       }
       g.ple_layer = l;
-      // PLE graph is constructed below with the same equations as Bee's
+      // PLE graph is constructed below with the same equations as llama.cpp's
       // build_ple.  The input embedding is host gathered, while its learned
       // projections and the rest of the operation stay in this graph.
       ggml_tensor *ple_key = resident_tensor(g, g.ctx, p + "ple_key.weight");
@@ -6428,7 +6484,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // its two branches have different expert-axis remaps.  For ordinary
     // whole-layer CPU/GPU placement, prefer the adjacent gate+up view: on
     // graph-RAM layers this is zero-copy and reduces three routed matmuls to
-    // two, matching Bee's reference graph.
+    // two, matching llama.cpp's reference graph.
     const auto split_it = g.split_gpu_expert_ids.find(l);
     const bool split_planned =
         g.S == 1 && split_it != g.split_gpu_expert_ids.end() &&
@@ -6796,7 +6852,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   // Real, measured incident (2026-09-09): ggml_backend_sched_alloc_graph's
   // internal ggml_gallocr_reserve_n_impl did not fail gracefully on a real
-  // cudaMalloc OOM on beellama's older ggml fork -- it logged "cudaMalloc
+  // cudaMalloc OOM on llama.cpp's older ggml fork -- it logged "cudaMalloc
   // failed: out of memory" and then segfaulted the whole process (exit 139)
   // instead of returning a checkable failure, at the exact point where
   // main.cpp's own fallback VRAM cache reservation (a fixed 4GB, unaware of
@@ -7232,9 +7288,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     for (int layer = 0; layer < c.n_layers; ++layer) {
       if (narrow_layer0_diag && layer != 0)
         continue;
+      if (engine.qwen_ram_vram_only_layer(layer))
+        continue;
       if (!engine.graph_ram_layer_ready(layer)) {
         LOG_WARN("[GGML-QWEN-FULL] disabled: ram_preload_all_experts "
-                 "requires a ready DDR arena for every layer (missing "
+                 "requires a ready DDR arena for every host layer (missing "
                  "layer=%d); no GGUF mmap fallback\n",
                  layer);
         return false;
@@ -7246,7 +7304,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       g_graph->S == S) {
     // PLE rows are request data, so refresh that input when the graph shape
     // is reused for a different prompt.  The model graph itself remains
-    // persistent, exactly like Bee's shape cache.
+    // persistent, exactly like llama.cpp's shape cache.
     if (has_ple_layer(c)) {
       std::vector<float> ple;
       if (!prepare_ple_embedding(*g_graph, ple, S, pos_base, token_ids) ||
@@ -7367,7 +7425,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                ggml_backend_buft_name(sched_bufts[1]));
     }
   }
-  // Match Bee's pipeline_parallel=false scheduler mode by default.  The
+  // Match llama.cpp's pipeline_parallel=false scheduler mode by default.  The
   // graph's CPU/GPU transitions are dependency-serial; the event/four-copy
   // mode is retained as an explicit opt-in for comparison.
   //
@@ -7467,17 +7525,20 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   }
 
   // Decode full-graph mode is intentionally stricter than the ordinary graph:
-  // all expert planes must already be in the complete DDR graph arena.  This
-  // keeps a graph submission from silently introducing an SSD/GGUF source or
-  // a per-token lazy-load boundary.  Models with lazy expert ownership stay on
-  // the established layered path.
+  // host-resident expert planes must already be in complete DDR graph arenas,
+  // while the configured device block is loaded directly into VRAM during
+  // graph construction. Models with lazy host expert ownership stay on the
+  // established layered path.
   const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
   for (int layer = 0; layer < c.n_layers; ++layer) {
     if (narrow_layer0_diag && layer != 0)
       continue;
+    if (engine.qwen_ram_vram_only_layer(layer))
+      continue;
     if (!engine.graph_ram_layer_ready(layer)) {
       LOG_WARN("[GGML-QWEN-FULL-DECODE] disabled: layer=%d has no complete "
-               "preloaded DDR expert arena; layered decode remains active\n",
+               "preloaded host DDR expert arena; layered decode remains "
+               "active\n",
                layer);
       return false;
     }
@@ -9143,9 +9204,9 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   // Prefill's own all-layers dump: build_graph() populates
   // g.all_layers_snapshot identically for prefill and decode (same shared
   // per-layer loop), but this compute call -- unlike the two decode call
-  // sites above -- never wrote it out. Without this, a bee/llama.cpp parity
+  // sites above -- never wrote it out. Without this, a llama.cpp parity
   // trace could only compare the single-token decode step, never any of
-  // the S>1 prompt-token positions bee's own nt=S batch covers.
+  // the S>1 prompt-token positions llama.cpp's own nt=S batch covers.
   if (env_alllayers_dump_path())
     dump_all_layers_snapshot(g, pos_base);
   if (const char *split_dump_path = env_layer0_split_dump_path()) {
@@ -9218,7 +9279,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                             hist_n * sizeof(float));
     // Prefill is the only place where the full S>1 PLE graph writes the
     // recurrent convolution history.  Keep a diagnostic copy of that exact
-    // post-compute state so it can be compared with Bee's prefill cache
+    // post-compute state so it can be compared with llama.cpp's prefill cache
     // without disturbing the state owner or adding a graph node.
     if (!g.decode_mode) {
       if (const char *split_dump_path = env_layer0_split_dump_path()) {

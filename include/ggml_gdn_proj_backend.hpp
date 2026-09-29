@@ -93,7 +93,7 @@ class GgmlGdnProjRunner {
   // qkv tensor this graph already computes on-device -- qkv_out becomes
   // conv_out (post-conv+SiLU), never leaving the GPU in between. Removes the
   // wasteful "download qkv, then re-upload the identical bytes for
-  // qwen4exp_conv1d_silu_gpu_host" round trip a real BeeLlama profile showed
+  // qwen4exp_conv1d_silu_gpu_host" round trip a real llama.cpp profile showed
   // costing ~65-70x more than necessary at this exact op (see CLAUDE.md's
   // 2026-09-05 "conv1d round-trip elimination" entry).
   //

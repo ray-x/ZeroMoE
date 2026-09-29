@@ -582,7 +582,7 @@ void qwen4exp_ple_layer_input(StreamingEngine &engine, int layer_idx, int S,
     float *gs = gated.data() + (size_t)s * hc_dim;
     for (int h = 0; h < HC; ++h)
     {
-      // Bee's ggml_sum_rows reduces the [D, HC, S] key*query tensor over
+      // llama.cpp's ggml_sum_rows reduces the [D, HC, S] key*query tensor over
       // dimension 0, producing one signed-sqrt/sigmoid gate per HC stream.
       // The old host path accidentally reduced all HC*D values into one
       // scalar gate, then broadcast that scalar across the four streams.

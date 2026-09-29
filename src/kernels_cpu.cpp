@@ -40,7 +40,9 @@ extern "C" void ggml_vec_dot_iq3_xxs_q8_K(int, float *, size_t, const void *,
                                           size_t, const void *, size_t, int);
 extern "C" void quantize_row_q8_0(const float *, void *, int64_t);
 extern "C" void ggml_vec_dot_iq4_nl_q8_0(int, float *, size_t, const void *,
-                                         size_t, const void *, size_t, int);
+                                           size_t, const void *, size_t, int);
+extern "C" void ggml_vec_dot_q2_0_q8_0(int, float *, size_t, const void *,
+                                        size_t, const void *, size_t, int);
 extern "C" void ggml_cpu_init(void);
 // The IQ1_M codebook is already linked into this binary for the CUDA IQ1_M
 // kernels.  Reuse the same data for the CPU AVX-512 probe instead of copying
@@ -2950,7 +2952,7 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
 
   // GGML's IQ2_XXS dot kernel consumes the production Q8_K activation
   // layout.  Quantize the shared input once for both projections, matching
-  // the IQ1_M fused path and Bee/ggml MUL_MAT_ID's grouped route.
+  // the IQ1_M fused path and llama.cpp/ggml MUL_MAT_ID's grouped route.
   // Reuse the same per-thread scratch across decode layer calls. This avoids
   // the two small heap allocations that would otherwise occur for every
   // IQ2_XXS fused layer invocation.
@@ -3051,6 +3053,458 @@ bool matmul_qwen_iq2_xxs_iq4_nl_fused(
   (void)I;
   (void)gate_O;
   (void)down_O;
+  return false;
+#endif
+}
+
+bool matmul_qwen_q4_0_q4_0_fused(
+    float *const *gate_y, float *const *up_y, float *const *down_y,
+    const float *x, const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights, const uint8_t *const *down_weights,
+    int n_matrices, int I, int gate_O, int down_O, int n_threads) {
+#if defined(MOESTREAM_USE_GGML)
+  constexpr int QK4_0 = 32;
+  if (!gate_y || !up_y || !down_y || !x || !gate_weights || !up_weights ||
+      !down_weights || n_matrices <= 0 || I <= 0 || gate_O <= 0 ||
+      down_O <= 0 || I % QK4_0 != 0 || gate_O % QK4_0 != 0)
+    return false;
+
+  ensure_ggml_cpu_initialized();
+  const int input_blocks = I / QK4_0;
+  const int down_blocks = gate_O / QK4_0;
+  const size_t gate_row_bytes =
+      static_cast<size_t>(input_blocks) * sizeof(block_q4_0);
+  const size_t down_row_bytes =
+      static_cast<size_t>(down_blocks) * sizeof(block_q4_0);
+
+  // Same scratch/threading idiom as the IQ1_M/IQ2_XXS siblings above:
+  // quantize the shared activation once (Q4_0's real vec_dot_type is Q8_0,
+  // block size 32 -- not the Q8_K/256 layout those IQ paths use), then run
+  // gate/up dot, SwiGLU, down-input requantize, and down dot inside one
+  // persistent OpenMP team.
+  static thread_local std::vector<block_q8_0> input_q;
+  static thread_local std::vector<block_q8_0> down_input_q;
+  input_q.resize(static_cast<size_t>(input_blocks));
+  down_input_q.resize(static_cast<size_t>(n_matrices) * down_blocks);
+  const int team_threads = n_threads > 0 ? n_threads : qwen_cpu_grouped_threads();
+  const bool stage_timing = qwen_cpu_stage_timing_enabled_local();
+  std::chrono::steady_clock::time_point stage_start;
+  if (stage_timing)
+    stage_start = std::chrono::steady_clock::now();
+  quantize_row_q8_0(x, input_q.data(), I);
+  const auto *input_q_data = input_q.data();
+  auto *down_input_q_data = down_input_q.data();
+
+#pragma omp parallel num_threads(team_threads)
+  {
+#pragma omp for schedule(static) nowait
+    for (int64_t flat = 0;
+         flat < static_cast<int64_t>(n_matrices) * gate_O; ++flat) {
+      const int m = static_cast<int>(flat / gate_O);
+      const int o = static_cast<int>(flat % gate_O);
+      const auto *gate_row = reinterpret_cast<const block_q4_0 *>(
+          gate_weights[m] + static_cast<size_t>(o) * gate_row_bytes);
+      const auto *up_row = reinterpret_cast<const block_q4_0 *>(
+          up_weights[m] + static_cast<size_t>(o) * gate_row_bytes);
+      gate_y[m][o] = dot_q4_0_q8_0_avx512(gate_row, input_q_data, input_blocks);
+      up_y[m][o] = dot_q4_0_q8_0_avx512(up_row, input_q_data, input_blocks);
+    }
+
+    if (stage_timing) {
+#pragma omp barrier
+#pragma omp master
+      {
+        qwen_cpu_stage_add(perf().t_qwen_cpu_grouped_gate_up, stage_start);
+        stage_start = std::chrono::steady_clock::now();
+      }
+#pragma omp barrier
+    } else {
+#pragma omp barrier
+    }
+#pragma omp for schedule(static) nowait
+    for (int m = 0; m < n_matrices; ++m) {
+      silu_inplace(gate_y[m], gate_O);
+      elem_mul(gate_y[m], gate_y[m], up_y[m], gate_O);
+    }
+
+#pragma omp barrier
+#pragma omp single
+    {
+      for (int m = 0; m < n_matrices; ++m)
+        quantize_row_q8_0(
+            gate_y[m],
+            down_input_q_data + static_cast<size_t>(m) * down_blocks,
+            gate_O);
+    }
+
+    if (stage_timing) {
+#pragma omp barrier
+#pragma omp master
+      {
+        qwen_cpu_stage_add(perf().t_qwen_cpu_grouped_swiglu, stage_start);
+        stage_start = std::chrono::steady_clock::now();
+      }
+#pragma omp barrier
+    } else {
+#pragma omp barrier
+    }
+#pragma omp for schedule(static) nowait
+    for (int64_t flat = 0;
+         flat < static_cast<int64_t>(n_matrices) * down_O; ++flat) {
+      const int m = static_cast<int>(flat / down_O);
+      const int d = static_cast<int>(flat % down_O);
+      const auto *down_row = reinterpret_cast<const block_q4_0 *>(
+          down_weights[m] + static_cast<size_t>(d) * down_row_bytes);
+      down_y[m][d] = dot_q4_0_q8_0_avx512(
+          down_row, down_input_q_data + static_cast<size_t>(m) * down_blocks,
+          down_blocks);
+    }
+  }
+  if (stage_timing)
+    qwen_cpu_stage_add(perf().t_qwen_cpu_grouped_down, stage_start);
+  return true;
+#else
+  (void)gate_y;
+  (void)up_y;
+  (void)down_y;
+  (void)x;
+  (void)gate_weights;
+  (void)up_weights;
+  (void)down_weights;
+  (void)n_matrices;
+  (void)I;
+  (void)gate_O;
+  (void)down_O;
+  return false;
+#endif
+}
+
+namespace {
+
+// Q2_0 stores 64 two-bit codes per fp16 scale. Activations use two Q8_0
+// blocks per weight block. Keep the ISA-specific body isolated so selecting
+// this kernel never requires compiling the whole engine with AVX-512 VNNI.
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,avx512f,avx512bw,avx512vl,avx512vnni")))
+#endif
+inline __m256i unpack_q2_0_half_vnni(const uint8_t *packed) {
+  // One Q8_0 block covers the four 2-bit fields in eight packed Q2_0 bytes.
+  // Expand directly to the 32-byte order consumed by VNNI; avoid materializing
+  // a whole 64-byte block and transposing it through scalar stores.
+  const __m256i q = _mm256_cvtepu8_epi32(
+      _mm_loadl_epi64(reinterpret_cast<const __m128i *>(packed)));
+  const __m256i mask = _mm256_set1_epi32(0x03);
+  const __m128i q0 = _mm256_cvtepi32_epi8(_mm256_and_si256(q, mask));
+  const __m128i q1 = _mm256_cvtepi32_epi8(
+      _mm256_and_si256(_mm256_srli_epi32(q, 2), mask));
+  const __m128i q2 = _mm256_cvtepi32_epi8(
+      _mm256_and_si256(_mm256_srli_epi32(q, 4), mask));
+  const __m128i q3 = _mm256_cvtepi32_epi8(
+      _mm256_and_si256(_mm256_srli_epi32(q, 6), mask));
+  const __m128i q01 = _mm_unpacklo_epi8(q0, q1);
+  const __m128i q23 = _mm_unpacklo_epi8(q2, q3);
+  const __m128i lo = _mm_unpacklo_epi16(q01, q23);
+  const __m128i hi = _mm_unpackhi_epi16(q01, q23);
+  return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,avx512f,avx512bw,avx512vl,avx512vnni")))
+#endif
+float dot_q2_0_q8_0_vnni(const uint8_t *weights,
+                         const block_q8_0 *activations, int n) {
+  constexpr int kBlock = 64;
+  constexpr int kQ2BlockBytes = 18;
+  __m512 accum = _mm512_setzero_ps();
+  const int blocks = n / kBlock;
+  for (int b = 0; b < blocks; ++b) {
+    const uint8_t *wb = weights + static_cast<size_t>(b) * kQ2BlockBytes;
+    uint16_t wd_bits;
+    std::memcpy(&wd_bits, wb, sizeof(wd_bits));
+    const float wd = fp16_to_fp32(wd_bits);
+    const uint8_t *packed = wb + sizeof(wd_bits);
+    const __m256i w0 = unpack_q2_0_half_vnni(packed);
+    const __m256i w1 = unpack_q2_0_half_vnni(packed + 8);
+    // Pack the two Q8_0 halves belonging to this Q2_0 block together. A
+    // single 512-bit VNNI dot then handles all 64 values; the two groups of
+    // eight int32 lanes retain separate scales in the float accumulator.
+    const block_q8_0 &x0 = activations[2 * b];
+    const block_q8_0 &x1 = activations[2 * b + 1];
+    const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(w0), w1, 1);
+    const __m512i xv = _mm512_inserti64x4(
+        _mm512_castsi256_si512(
+            _mm256_loadu_si256(reinterpret_cast<const __m256i *>(x0.qs))),
+        _mm256_loadu_si256(reinterpret_cast<const __m256i *>(x1.qs)), 1);
+    const __m512i sums = _mm512_dpbusd_epi32(_mm512_setzero_si512(), wv, xv);
+
+    // Correct Q2_0's unsigned codes (0..3) to its signed representation
+    // (code - 1) by subtracting the activation sum, also grouped by Q8 block.
+    const __m512i sx32 = _mm512_dpbusd_epi32(
+        _mm512_setzero_si512(), _mm512_set1_epi8(1), xv);
+    const __m512i corrected = _mm512_sub_epi32(sums, sx32);
+    const __m512 scale0 = _mm512_set1_ps(wd * fp16_to_fp32(x0.d));
+    const __m512 scale1 = _mm512_set1_ps(wd * fp16_to_fp32(x1.d));
+    const __m512 scales = _mm512_mask_blend_ps(0xff00, scale0, scale1);
+    // Keep the 16 partial sums in vector registers across Q2_0 blocks. Apply
+    // each block's (different) scales lane-wise, and pay one horizontal
+    // reduction only after the row is complete.
+    accum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(corrected), scales, accum);
+  }
+  return _mm512_reduce_add_ps(accum);
+}
+
+bool cpu_has_avx512_vnni() {
+#if (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__))
+  __builtin_cpu_init();
+  return __builtin_cpu_supports("avx512vnni");
+#else
+  return false;
+#endif
+}
+
+bool cpu_has_avx512_vbmi() {
+#if (defined(__GNUC__) || defined(__clang__)) && \
+    (defined(__x86_64__) || defined(__i386__))
+  __builtin_cpu_init();
+  return __builtin_cpu_supports("avx512vbmi");
+#else
+  return false;
+#endif
+}
+
+bool force_q2_0_fallback() {
+  const char *disable = std::getenv("MOESTREAM_Q2_0_DISABLE_VNNI");
+  return disable && disable[0] == '1';
+}
+
+} // namespace
+
+bool q2_0_vnni_enabled() {
+  return cpu_has_avx512_vnni() && !force_q2_0_fallback();
+}
+
+bool q2_0_vbmi_enabled() {
+  return q2_0_vnni_enabled() && cpu_has_avx512_vbmi();
+}
+
+namespace {
+
+struct Q2_0ActivationSummary {
+  std::vector<float> scales;
+  std::vector<float> hx;
+};
+
+void summarize_q8_0_activations(const block_q8_0 *activations, int n_blocks,
+                                Q2_0ActivationSummary &summary) {
+  summary.scales.resize(static_cast<size_t>(n_blocks));
+  summary.hx.resize(static_cast<size_t>(n_blocks));
+  for (int block = 0; block < n_blocks; ++block) {
+    const block_q8_0 &activation = activations[block];
+    const float scale = fp16_to_fp32(static_cast<uint16_t>(activation.d));
+    int32_t sum = 0;
+    for (int i = 0; i < 32; ++i)
+      sum += activation.qs[i];
+    summary.scales[static_cast<size_t>(block)] = scale;
+    summary.hx[static_cast<size_t>(block)] = scale * static_cast<float>(sum);
+  }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target(
+    "avx2,avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")))
+#endif
+float dot_q2_0_q8_0_vnni_vbmi_batched(
+    const uint8_t *weights, const block_q8_0 *activations,
+    const float *activation_scales, const float *activation_hx, int n) {
+  constexpr int kQ2BlockBytes = 18;
+  const int blocks = n / 64;
+  const __m512i scale_indices = _mm512_setr_epi32(
+      0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7);
+  const __m512i activation_indices = _mm512_setr_epi32(
+      0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1);
+  const __m512i multishift_control =
+      _mm512_set1_epi64(static_cast<long long>(0x0e0c0a0806040200ULL));
+  const __m512i code_mask = _mm512_set1_epi8(3);
+  __m512 accum = _mm512_setzero_ps();
+  __m512 correction = _mm512_setzero_ps();
+
+  for (int block_base = 0; block_base < blocks; block_base += 8) {
+    const int block_count = std::min(8, blocks - block_base);
+    const __mmask16 pair_mask =
+        block_count >= 8 ? static_cast<__mmask16>(0xffff)
+                         : static_cast<__mmask16>((1u << (2 * block_count)) - 1u);
+    alignas(16) uint16_t weight_scales[8] = {};
+    for (int i = 0; i < block_count; ++i)
+      std::memcpy(&weight_scales[i],
+                  weights + static_cast<size_t>(block_base + i) *
+                                kQ2BlockBytes,
+                  sizeof(weight_scales[i]));
+
+    const __m512 unpacked_scales = _mm512_castps256_ps512(
+        _mm256_cvtph_ps(_mm_load_si128(
+            reinterpret_cast<const __m128i *>(weight_scales))));
+    const __m512 weight_scale_pairs = _mm512_maskz_mov_ps(
+        pair_mask, _mm512_permutexvar_ps(scale_indices, unpacked_scales));
+    const __m512 activation_scale_pairs =
+        _mm512_maskz_loadu_ps(pair_mask, activation_scales + 2 * block_base);
+    const __m512 scale_products =
+        _mm512_mul_ps(weight_scale_pairs, activation_scale_pairs);
+    correction = _mm512_fmadd_ps(
+        weight_scale_pairs,
+        _mm512_maskz_loadu_ps(pair_mask, activation_hx + 2 * block_base),
+        correction);
+
+    for (int i = 0; i < block_count; ++i) {
+      const int block = block_base + i;
+      const uint8_t *packed =
+          weights + static_cast<size_t>(block) * kQ2BlockBytes + 2;
+      const __m128i packed_codes = _mm_loadu_si128(
+          reinterpret_cast<const __m128i *>(packed));
+      const __m512i code_lanes = _mm512_cvtepu16_epi64(packed_codes);
+      const __m512i weight_values = _mm512_and_si512(
+          _mm512_multishift_epi64_epi8(multishift_control, code_lanes),
+          code_mask);
+      const block_q8_0 &x0 = activations[2 * block];
+      const block_q8_0 &x1 = activations[2 * block + 1];
+      const __m512i activation_values = _mm512_inserti64x4(
+          _mm512_castsi256_si512(_mm256_loadu_si256(
+              reinterpret_cast<const __m256i *>(x0.qs))),
+          _mm256_loadu_si256(reinterpret_cast<const __m256i *>(x1.qs)), 1);
+      const __m512i dot = _mm512_dpbusd_epi32(
+          _mm512_setzero_si512(), weight_values, activation_values);
+      const __m512i indices = _mm512_add_epi32(
+          activation_indices, _mm512_set1_epi32(2 * i));
+      const __m512 scales =
+          _mm512_permutexvar_ps(indices, scale_products);
+      accum = _mm512_fmadd_ps(_mm512_cvtepi32_ps(dot), scales, accum);
+    }
+  }
+
+  return _mm512_reduce_add_ps(accum) - _mm512_reduce_add_ps(correction);
+}
+
+} // namespace
+
+float dot_q2_0_q8_0_cpu(const uint8_t *weights,
+                        const block_q8_0 *activations, int n,
+                        bool use_vnni) {
+  if (use_vnni && cpu_has_avx512_vnni())
+    return dot_q2_0_q8_0_vnni(weights, activations, n);
+  float result = 0.0f;
+  ggml_vec_dot_q2_0_q8_0(n, &result, 0, weights, 0, activations, 0, 1);
+  return result;
+}
+
+bool matmul_qwen_q2_0_q2_0_fused(
+    float *const *gate_y, float *const *up_y, float *const *down_y,
+    const float *x, const uint8_t *const *gate_weights,
+    const uint8_t *const *up_weights, const uint8_t *const *down_weights,
+    int n_matrices, int I, int gate_O, int down_O, int n_threads) {
+#if defined(MOESTREAM_USE_GGML)
+  constexpr int kBlock = 64;
+  if (!gate_y || !up_y || !down_y || !x || !gate_weights || !up_weights ||
+      !down_weights || n_matrices <= 0 || I <= 0 || gate_O <= 0 ||
+      down_O <= 0 || I % kBlock != 0 || gate_O % kBlock != 0)
+    return false;
+
+  ensure_ggml_cpu_initialized();
+  const int input_blocks = I / kBlock;
+  const int down_blocks = gate_O / kBlock;
+  const size_t gate_row_bytes = static_cast<size_t>(input_blocks) * 18;
+  const size_t down_row_bytes = static_cast<size_t>(down_blocks) * 18;
+  static thread_local std::vector<block_q8_0> input_q;
+  static thread_local std::vector<block_q8_0> down_input_q;
+  input_q.resize(static_cast<size_t>(I / 32));
+  down_input_q.resize(static_cast<size_t>(n_matrices) * gate_O / 32);
+  quantize_row_q8_0(x, input_q.data(), I);
+  auto *down_q = down_input_q.data();
+  const auto *input_q_data = input_q.data();
+  const int threads = n_threads > 0 ? n_threads : qwen_cpu_grouped_threads();
+  const bool use_vnni = q2_0_vnni_enabled();
+  const bool use_vbmi = use_vnni && cpu_has_avx512_vbmi();
+  static thread_local Q2_0ActivationSummary input_summary_storage;
+  static thread_local Q2_0ActivationSummary down_summary_storage;
+  Q2_0ActivationSummary &input_summary = input_summary_storage;
+  Q2_0ActivationSummary &down_summary = down_summary_storage;
+  if (use_vbmi) {
+    summarize_q8_0_activations(input_q_data, I / 32, input_summary);
+    down_summary.scales.resize(static_cast<size_t>(n_matrices) * gate_O / 32);
+    down_summary.hx.resize(static_cast<size_t>(n_matrices) * gate_O / 32);
+  }
+
+#pragma omp parallel num_threads(threads)
+  {
+#pragma omp for schedule(static) nowait
+    for (int64_t flat = 0; flat < static_cast<int64_t>(n_matrices) * gate_O;
+         ++flat) {
+      const int m = static_cast<int>(flat / gate_O);
+      const int o = static_cast<int>(flat % gate_O);
+      const size_t offset = static_cast<size_t>(o) * gate_row_bytes;
+      if (use_vbmi) {
+        gate_y[m][o] = dot_q2_0_q8_0_vnni_vbmi_batched(
+            gate_weights[m] + offset, input_q_data, input_summary.scales.data(),
+            input_summary.hx.data(), I);
+        up_y[m][o] = dot_q2_0_q8_0_vnni_vbmi_batched(
+            up_weights[m] + offset, input_q_data, input_summary.scales.data(),
+            input_summary.hx.data(), I);
+      } else {
+        gate_y[m][o] = dot_q2_0_q8_0_cpu(gate_weights[m] + offset,
+                                          input_q_data, I, use_vnni);
+        up_y[m][o] = dot_q2_0_q8_0_cpu(up_weights[m] + offset, input_q_data,
+                                        I, use_vnni);
+      }
+    }
+#pragma omp barrier
+#pragma omp for schedule(static) nowait
+    for (int m = 0; m < n_matrices; ++m) {
+      silu_inplace(gate_y[m], gate_O);
+      elem_mul(gate_y[m], gate_y[m], up_y[m], gate_O);
+    }
+#pragma omp barrier
+#pragma omp single
+    {
+      for (int m = 0; m < n_matrices; ++m)
+        quantize_row_q8_0(gate_y[m],
+                          down_q + static_cast<size_t>(m) * gate_O / 32,
+                          gate_O);
+      if (use_vbmi)
+        summarize_q8_0_activations(
+            down_q, n_matrices * gate_O / 32, down_summary);
+    }
+#pragma omp for schedule(static) nowait
+    for (int64_t flat = 0; flat < static_cast<int64_t>(n_matrices) * down_O;
+         ++flat) {
+      const int m = static_cast<int>(flat / down_O);
+      const int o = static_cast<int>(flat % down_O);
+      const size_t offset = static_cast<size_t>(o) * down_row_bytes;
+      const size_t summary_offset = static_cast<size_t>(m) * gate_O / 32;
+      const block_q8_0 *expert_activations = down_q + summary_offset;
+      if (use_vbmi) {
+        down_y[m][o] = dot_q2_0_q8_0_vnni_vbmi_batched(
+            down_weights[m] + offset, expert_activations,
+            down_summary.scales.data() + summary_offset,
+            down_summary.hx.data() + summary_offset, gate_O);
+      } else {
+        down_y[m][o] = dot_q2_0_q8_0_cpu(down_weights[m] + offset,
+                                          expert_activations, gate_O, use_vnni);
+      }
+    }
+  }
+  return true;
+#else
+  (void)gate_y;
+  (void)up_y;
+  (void)down_y;
+  (void)x;
+  (void)gate_weights;
+  (void)up_weights;
+  (void)down_weights;
+  (void)n_matrices;
+  (void)I;
+  (void)gate_O;
+  (void)down_O;
+  (void)n_threads;
   return false;
 #endif
 }

@@ -489,7 +489,7 @@ struct PerfCounters {
     // GGML Qwen4Exp router boundary diagnostics. The host route path must
     // wait for the device router before it can select DDR expert addresses;
     // split that wait from the graph submission/readback for comparison with
-    // Bee's scheduler trace.
+    // llama.cpp's scheduler trace.
     std::atomic<double> t_ggml_router_host_call{0};
     std::atomic<double> t_ggml_router_host_sync{0};
     std::atomic<double> t_ggml_router_host_get{0};

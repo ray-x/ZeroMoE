@@ -12,7 +12,7 @@
 // ONE of topk (10) x n_layers (48) = 480 expert lookups, every decode
 // token -- even when the whole expert set is already 100% resident
 // (host_ram_gb + ram_preload_all_experts => no possible miss for the
-// session's lifetime). beellama/llama.cpp instead decides weight placement
+// session's lifetime). llama.cpp instead decides weight placement
 // ONCE at load time (`-ncmoe`) and runs one static ggml_mul_mat_id graph
 // per layer with zero per-token placement decisions
 // (llm_graph_context::build_moe_ffn, llama-graph.cpp) -- see this

@@ -21,7 +21,7 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine);
 int glm5next_full_graph_device_expert_layers();
 
 // Build or reuse a graph for a position-zero prompt of length S.  Preparation
-// is deliberately outside the measured prefill window, like Bee's graph
+// is deliberately outside the measured prefill window, like llama.cpp's graph
 // construction and static weight upload.
 bool glm5next_full_graph_prepare(StreamingEngine &engine, int S,
                                  int pos_base, const int *token_ids);

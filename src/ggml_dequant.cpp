@@ -101,6 +101,9 @@ extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
   case 40:
     dequantize_row_nvfp4((const block_nvfp4 *)src, out, n);
     return 1;
+  case 42:
+    dequantize_row_q2_0((const block_q2_0 *)src, out, n);
+    return 1;
   // F32/F16/BF16 are handled inline by dequant_row() (no ggml call).
   // IQ2_M: no real GGML_TYPE_* slot in the currently-linked ggml at all
   // (see gguf_loader.hpp's GGUFType enum comment) -- nothing to case on.
@@ -264,6 +267,13 @@ extern "C" int ggml_quantize_row_ref(uint32_t type, const float *src, void *dst,
     return 1;
   case 8:
     quantize_row_q8_0_ref(src, (block_q8_0 *)dst, n);
+    return 1;
+  // Q2_0: a real single-row _ref quantizer (block_q2_0, 64-element block),
+  // same simple shape as Q5_1/Q8_0 above -- no imatrix, no init call.
+  // Added alongside the case 42 dequant bridge above so a Test-5-style
+  // correctness check can round-trip real ggml-valid bytes.
+  case 42:
+    quantize_row_q2_0_ref(src, (block_q2_0 *)dst, n);
     return 1;
   default:
     return 0;

@@ -989,7 +989,7 @@ public:
     // Qwen router pilot remains independently GPU-backed for prediction.
     bool qwen4exp_decode_gpu_router = false;
     // Qwen4Exp-only CPU affinity fast path: group IQ1_M expert projections
-    // with the same ggml Q8_K dot kernel used by BeeLlama. It is consulted
+    // with the same ggml Q8_K dot kernel used by llama.cpp. It is consulted
     // only when cpu_affinity_layers selects a layer, so other models and the
     // normal GPU route are unchanged.
     bool qwen4exp_cpu_ggml_moe = false;
@@ -2843,7 +2843,7 @@ public:
                 continue;
             }
 
-            // Bee's CPU-mapped GGUF tensors are normally offset by 32 bytes
+            // llama.cpp's CPU-mapped GGUF tensors are normally offset by 32 bytes
             // from their mmap page base.  MoEStream's graph arenas are
             // allocated separately, so reproduce that host pointer phase by
             // default; the logical tensor layout is unchanged.  Set
@@ -2883,7 +2883,7 @@ public:
             arena.projection_compact = projection_compact;
             arena.host_reservation_bytes = bytes;
 
-            // Bee's fast CPU path uses mmap+mlock for its host expert source.
+            // llama.cpp's fast CPU path uses mmap+mlock for its host expert source.
             // Keep MoEStream's explicit preloaded DDR arena as the default,
             // but expose the same page-residency property as a controlled A/B.
             // This is deliberately opt-in: locking the complete graph-RAM

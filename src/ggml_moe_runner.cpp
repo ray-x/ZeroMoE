@@ -768,7 +768,7 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
   // an external 512-expert layer is common, while the next scattered layer
   // may route only ~300 experts.  Letting the external shape raise
   // slot_capacity_ strands hundreds of MiB in the compact planar weight
-  // buffer and is exactly the VRAM pressure that prevents Bee-like resident
+  // buffer and is exactly the VRAM pressure that prevents llama.cpp-like resident
   // layers.  Compact layers still retain their own rounded grow-only shape.
   if (!plan.external_weights)
     slot_capacity_ = std::max(slot_capacity_, rounded_slots);
@@ -781,7 +781,7 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
       weight_external_ == plan.external_weights;
 
   if (plan.external_weights) {
-    // This is the Bee-style path: the graph's weight tensors borrow the
+    // This is the full graph path: the graph's weight tensors borrow the
     // already resident VRAM slabs.  No compact weight buffer, staging pool,
     // D2D repack, or H2D is allocated for this layer.
     if (!same_weight_shape) {
@@ -1607,7 +1607,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
 
   // Opt-in Layer-0 A/A diagnostic.  The first runner invocation in the
   // unbatched Qwen replay is layer 0; export the native GGML intermediates so
-  // the routed FFN can be compared against Bee's ffn_moe_down dump.  This is
+  // the routed FFN can be compared against llama.cpp's ffn_moe_down dump.  This is
   // intentionally synchronizing and never runs without the diagnostic flag.
   if (const char *dump_base = std::getenv("MOESTREAM_GGML_MOE_DUMP")) {
     static std::atomic<bool> dumped_first_runner{false};

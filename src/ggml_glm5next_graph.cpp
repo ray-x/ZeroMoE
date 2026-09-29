@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -57,6 +58,8 @@ struct HostAllocation {
 struct PartialExpertLayer {
   std::vector<int> hot;
   std::vector<int> cold;
+  std::vector<int> slot_last_use;
+  std::vector<uint32_t> miss_count;
   ggml_tensor *hot_gate_up = nullptr;
   ggml_tensor *hot_gate = nullptr;
   ggml_tensor *hot_up = nullptr;
@@ -67,10 +70,29 @@ struct PartialExpertLayer {
   ggml_tensor *hot_mask = nullptr;
 };
 
+struct Glm5nextIndexerSeed {
+  int layer = -1;
+  int token_count = 0;
+  int pool_count = 0;
+  std::vector<float> key_gate;
+  std::vector<float> pooled_keys;
+};
+
+struct Glm5nextIndexerLayer {
+  int layer = -1;
+  ggml_tensor *key_gate_out = nullptr; // prefill: [2*key_length, S]
+  ggml_tensor *pooled_out = nullptr;   // prefill: [key_length, S/kpool]
+  ggml_tensor *key_gate_cache = nullptr; // decode: [2*key_length, capacity]
+  ggml_tensor *pooled_cache = nullptr;   // decode: [key_length, capacity/kpool]
+};
+
 struct FullGraph {
   StreamingEngine *engine = nullptr;
   int device = -1;
   int S = 0;
+  bool decode_mode = false;
+  int kv_capacity = 0;
+  int decode_last_pos = -1;
   int D = 0;
   int HC = 0;
   int n_layers = 0;
@@ -87,7 +109,14 @@ struct FullGraph {
   int sliding_window = 0;
   int first_dense = 0;
   int device_expert_layers = 0;
+  int indexer_heads = 0;
+  int indexer_key_length = 0;
+  int indexer_top_k = 0;
+  int indexer_kpool = 0;
+  bool indexer_select_tail = false;
+  bool sparse_decode = false;
   bool partial_expert_residency = false;
+  bool dynamic_expert_cache = false;
   bool partial_sources_compacted = false;
   size_t partial_hot_bytes = 0;
   size_t partial_cold_bytes = 0;
@@ -107,6 +136,10 @@ struct FullGraph {
   void *expert_base = nullptr;
   size_t expert_capacity = 0;
   size_t expert_used = 0;
+  ggml_backend_buffer_t device_state_buffer = nullptr;
+  void *device_state_base = nullptr;
+  size_t device_state_capacity = 0;
+  size_t device_state_used = 0;
   ggml_context *ctx = nullptr;
   ggml_cgraph *graph = nullptr;
 
@@ -114,6 +147,13 @@ struct FullGraph {
   ggml_tensor *output = nullptr; // [D, S], after HC mean; LM head norms
   ggml_tensor *final_streams = nullptr;
   ggml_tensor *attn_mask = nullptr; // [S, S, 1, 1], F16 causal mask
+  ggml_tensor *decode_indices = nullptr; // [1], I32 DSA KV-cache row
+  ggml_tensor *indexer_pool_member_ids = nullptr; // [kpool, n_pools], I32
+  ggml_tensor *indexer_pool_mask = nullptr; // [n_pools], F32, per-token
+  ggml_tensor *indexer_pool_update_rows = nullptr; // [kpool], I32
+  ggml_tensor *indexer_pool_update_index = nullptr; // [1], I32
+  ggml_tensor *indexer_tail_indices = nullptr; // [kpool-1], I32
+  ggml_tensor *indexer_tail_mask = nullptr; // [kpool-1], F16
   ggml_tensor *positions = nullptr; // [S], I32 token positions
   ggml_tensor *positions_mod4 = nullptr;
   ggml_tensor *positions_mod128 = nullptr;
@@ -144,7 +184,15 @@ struct FullGraph {
   std::vector<float *> kda_state_inputs;
   std::vector<float *> kda_hist_inputs;
   std::vector<ggml_tensor *> dsa_kv_out;
+  std::vector<ggml_tensor *> dsa_kv_storage;
+  std::vector<ggml_tensor *> kda_state_storage;
+  std::vector<ggml_tensor *> kda_hist_storage;
+  std::vector<ggml_tensor *> kda_state_updates;
+  std::vector<ggml_tensor *> kda_hist_updates;
   std::vector<int> dsa_layers;
+  std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
+  std::vector<Glm5nextIndexerLayer> glm5next_indexer_layers;
+  std::vector<Glm5nextIndexerSeed> glm5next_indexer_seeds;
 
   std::vector<HostAllocation> owned;
   std::vector<ggml_backend_buffer_t> host_buffers;
@@ -193,7 +241,24 @@ struct FullGraph {
   // residency's tensor pointers belong to the old GGML context, so preserve
   // only its layer/expert lists and clear those pointers before the old graph
   // is destroyed.
-  void move_expert_source_to(FullGraph &dst) {
+  bool move_expert_source_to(FullGraph &dst) {
+    if (!has_expert_source() || dst.has_expert_source())
+      return false;
+    const auto owner = std::find_if(
+        owned.begin(), owned.end(), [this](const HostAllocation &allocation) {
+          return allocation.ptr == expert_source_base;
+        });
+    if (owner == owned.end()) {
+      LOG_ERROR("[GGML-GLM5NEXT-FULL] expert source arena has no tracked "
+                "owner; refusing graph handoff\n");
+      return false;
+    }
+    // The source views are non-owning slices into this allocation. Transfer
+    // the allocation itself before the old prompt graph is destroyed, or the
+    // reusable decode graph will retain dangling expert pointers.
+    dst.owned.push_back(std::move(*owner));
+    owned.erase(owner);
+
     dst.expert_source_base = expert_source_base;
     dst.expert_source_capacity = expert_source_capacity;
     dst.expert_source_used = expert_source_used;
@@ -207,6 +272,7 @@ struct FullGraph {
     dst.host_reservation_bytes = host_reservation_bytes;
 
     dst.partial_expert_residency = partial_expert_residency;
+    dst.dynamic_expert_cache = dynamic_expert_cache;
     dst.partial_sources_compacted = partial_sources_compacted;
     dst.partial_hot_bytes = partial_hot_bytes;
     dst.partial_cold_bytes = partial_cold_bytes;
@@ -231,12 +297,14 @@ struct FullGraph {
     expert_source_pinned_ranges.clear();
     host_reservation_bytes = 0;
     partial_expert_residency = false;
+    dynamic_expert_cache = false;
     partial_sources_compacted = false;
     partial_hot_bytes = 0;
     partial_cold_bytes = 0;
     partial_hot_records = 0;
     partial_usage_file.clear();
     partial_experts.clear();
+    return true;
   }
 
   ~FullGraph() { destroy(); }
@@ -254,11 +322,16 @@ struct FullGraph {
       ggml_backend_buffer_free(expert_buffer);
       expert_buffer = nullptr;
     }
+    if (device_state_buffer) {
+      ggml_backend_buffer_free(device_state_buffer);
+      device_state_buffer = nullptr;
+    }
     if (dense_buffer) {
       ggml_backend_buffer_free(dense_buffer);
       dense_buffer = nullptr;
     }
     partial_expert_residency = false;
+    dynamic_expert_cache = false;
     partial_sources_compacted = false;
     partial_hot_bytes = 0;
     partial_cold_bytes = 0;
@@ -295,7 +368,11 @@ struct FullGraph {
     expert_source_pinned_ranges.clear();
     cuda = nullptr;
     graph = nullptr;
-    input = output = final_streams = attn_mask = positions = nullptr;
+    input = output = final_streams = attn_mask = decode_indices = positions =
+        nullptr;
+    indexer_pool_member_ids = indexer_pool_mask =
+        indexer_pool_update_rows = indexer_pool_update_index =
+            indexer_tail_indices = indexer_tail_mask = nullptr;
     positions_mod4 = positions_mod128 = block_positions4 = block_positions128 =
         nullptr;
     csa_zero_values = csa_zero_scores = nullptr;
@@ -305,7 +382,15 @@ struct FullGraph {
     kda_state_inputs.clear();
     kda_hist_inputs.clear();
     dsa_kv_out.clear();
+    dsa_kv_storage.clear();
+    kda_state_storage.clear();
+    kda_hist_storage.clear();
+    kda_state_updates.clear();
+    kda_hist_updates.clear();
     dsa_layers.clear();
+    moe_route_ids.clear();
+    glm5next_indexer_layers.clear();
+    glm5next_indexer_seeds.clear();
     dsv4_layers.clear();
     dsv4_stage_outputs.clear();
     MemoryGuard::release_host_bytes(host_reservation_bytes);
@@ -322,6 +407,7 @@ std::unique_ptr<FullGraph> g_graph;
 // a source-only container while the prompt-shaped GGML graph is rebuilt or
 // before the first prompt arrives.
 std::unique_ptr<FullGraph> g_glm5next_source;
+StreamingEngine *g_glm5next_decode_disabled_engine = nullptr;
 
 bool env_enabled() {
   static const bool enabled = [] {
@@ -446,9 +532,11 @@ ggml_tensor *host_input(FullGraph &g, ggml_context *ctx, ggml_type type,
 
 bool graph_dense_weight_name(const std::string &name) {
   if (name.find("_exps.weight") != std::string::npos ||
-      name.find("indexer") != std::string::npos ||
       name.find("nextn") != std::string::npos)
     return false;
+  if (name.find("indexer.") != std::string::npos ||
+      name.find("indexer_compressor_") != std::string::npos)
+    return true;
   return name.find("attn") != std::string::npos ||
          name.find("hc_") != std::string::npos ||
          name.find("ssm_") != std::string::npos ||
@@ -650,7 +738,7 @@ ggml_tensor *dsv4_compressed_keys(FullGraph &g, ggml_context *ctx,
       for (int i = 0; i < ratio; ++i) {
         const int j = b * ratio + i;
         // The appended row at index S is the zero/-inf history used for the
-        // first CSA block, exactly as dsv4_append_zero_row() in Bee.
+        // first CSA block, exactly as dsv4_append_zero_row() in llama.cpp.
         index_data[j] = b == 0 ? g.S : (b - 1) * ratio + i;
         index_data[n_read + j] = j;
       }
@@ -663,7 +751,7 @@ ggml_tensor *dsv4_compressed_keys(FullGraph &g, ggml_context *ctx,
     // Use a graph-derived row so this works for both the normal qh-wide CSA
     // compressor and the narrower indexer compressor.  It avoids a separate
     // fixed-width host zero buffer and is the same value-wise operation as
-    // Bee's dsv4_append_zero_row().
+    // llama.cpp's dsv4_append_zero_row().
     ggml_tensor *kv_zero = ggml_reshape_2d(
         ctx, ggml_scale(ctx, ggml_view_1d(ctx, comp_kv, width, 0), 0.0f), width,
         1);
@@ -688,7 +776,7 @@ ggml_tensor *dsv4_compressed_keys(FullGraph &g, ggml_context *ctx,
     scores = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
   } else {
     // Each row has [previous/current] channels.  Split the gathered rows
-    // before concatenating along the position dimension, as in Bee's
+    // before concatenating along the position dimension, as in llama.cpp's
     // build_overlap_compressed_kv_from_state().
     ggml_tensor *kv_prev = ggml_cont(
         ctx, ggml_view_2d(ctx, kv_rows, key_dim, n_read, kv_rows->nb[1], 0));
@@ -903,7 +991,7 @@ ggml_tensor *build_dsv4_attention(FullGraph &g, ggml_context *ctx,
   // restored and made contiguous for wo_b.  The previous loop emitted one
   // matmul and concat per group, creating eight extra graph boundaries.
   ggml_tensor *woa3 = ggml_reshape_3d(ctx, woa, group_in, rank, groups);
-  // context is already Bee's [head_dim, n_head, tokens] tensor.  Reshape it
+  // context is already llama.cpp's [head_dim, n_head, tokens] tensor.  Reshape it
   // directly so the group and token strides are derived from that layout;
   // flattening to 2D first loses the explicit head axis around rope_back.
   ggml_tensor *grouped_input =
@@ -1702,6 +1790,130 @@ bool read_pack_gate_up(const StreamingEngine &engine, const GGUFTensor &gate,
   return true;
 }
 
+bool read_tensor_range_direct(const StreamingEngine &engine,
+                              const GGUFTensor &meta, size_t relative_offset,
+                              void *dst, size_t bytes) {
+  if (!dst || relative_offset > (size_t)meta.size_bytes ||
+      bytes > (size_t)meta.size_bytes - relative_offset ||
+      meta.offset > UINT64_MAX - relative_offset)
+    return false;
+  const int fd = engine.model_file.fd_for_tensor(meta);
+  const bool is_direct = engine.model_file.direct_io_active_for(meta);
+  const uint64_t offset = meta.offset + relative_offset;
+  const ssize_t got = direct_io::pread_direct_aware(
+      fd, is_direct, engine.model_file.direct_io_alignment, dst, bytes, offset);
+  const bool ok = got == (ssize_t)bytes;
+#if defined(__linux__)
+  if (ok && !is_direct)
+    (void)posix_fadvise(fd, (off_t)offset, (off_t)bytes,
+                        POSIX_FADV_DONTNEED);
+#endif
+  return ok;
+}
+
+bool read_tensor_selected_experts(const StreamingEngine &engine,
+                                  const GGUFTensor &meta, int n_experts,
+                                  const std::vector<int> &selected,
+                                  void *dst) {
+  if (selected.empty())
+    return true;
+  if (!dst || n_experts <= 0 || meta.shape.size() != 3 ||
+      meta.shape[2] != (uint64_t)n_experts ||
+      meta.size_bytes % (size_t)n_experts != 0)
+    return false;
+  const size_t record_bytes = (size_t)meta.size_bytes / (size_t)n_experts;
+  constexpr size_t kMaxBatchExperts = 8;
+  size_t i = 0;
+  while (i < selected.size()) {
+    if (selected[i] < 0 || selected[i] >= n_experts)
+      return false;
+    size_t run_end = i + 1;
+    while (run_end < selected.size() &&
+           selected[run_end] == selected[run_end - 1] + 1)
+      ++run_end;
+    while (i < run_end) {
+      const size_t count = std::min(kMaxBatchExperts, run_end - i);
+      const size_t file_offset = (size_t)selected[i] * record_bytes;
+      const size_t bytes = count * record_bytes;
+      auto *out = static_cast<uint8_t *>(dst) + i * record_bytes;
+      if (!read_tensor_range_direct(engine, meta, file_offset, out, bytes))
+        return false;
+      i += count;
+    }
+  }
+  return true;
+}
+
+bool read_pack_gate_up_selected(const StreamingEngine &engine,
+                               const GGUFTensor &gate, const GGUFTensor &up,
+                               int n_experts,
+                               const std::vector<int> &selected, void *dst) {
+  if (selected.empty())
+    return true;
+  if (!dst || gate.shape.size() != 3 || up.shape != gate.shape ||
+      n_experts <= 0 || gate.shape[2] != (uint64_t)n_experts ||
+      gate.size_bytes % (size_t)n_experts != 0 ||
+      up.size_bytes % (size_t)n_experts != 0)
+    return false;
+
+  const size_t gate_record = (size_t)gate.size_bytes / (size_t)n_experts;
+  const size_t up_record = (size_t)up.size_bytes / (size_t)n_experts;
+  constexpr size_t kMaxBatchExperts = 8;
+  const size_t max_batch = std::min(kMaxBatchExperts, selected.size());
+  if (gate_record > SIZE_MAX / max_batch ||
+      up_record > SIZE_MAX / max_batch)
+    return false;
+  const size_t gate_scratch_bytes = gate_record * max_batch;
+  const size_t up_scratch_bytes = up_record * max_batch;
+  if (gate_scratch_bytes > SIZE_MAX - up_scratch_bytes)
+    return false;
+  const size_t scratch_bytes = gate_scratch_bytes + up_scratch_bytes;
+  if (!MemoryGuard::try_reserve_host_bytes(scratch_bytes))
+    return false;
+  void *scratch = nullptr;
+  if (posix_memalign(&scratch, 4096, scratch_bytes) != 0 || !scratch) {
+    MemoryGuard::release_host_bytes(scratch_bytes);
+    return false;
+  }
+
+  auto *gate_scratch = static_cast<uint8_t *>(scratch);
+  auto *up_scratch = gate_scratch + gate_scratch_bytes;
+  auto *out = static_cast<uint8_t *>(dst);
+  size_t i = 0;
+  bool ok = true;
+  while (i < selected.size() && ok) {
+    if (selected[i] < 0 || selected[i] >= n_experts) {
+      ok = false;
+      break;
+    }
+    size_t run_end = i + 1;
+    while (run_end < selected.size() &&
+           selected[run_end] == selected[run_end - 1] + 1)
+      ++run_end;
+    while (i < run_end && ok) {
+      const size_t count = std::min(kMaxBatchExperts, run_end - i);
+      const size_t file_offset = (size_t)selected[i] * gate_record;
+      ok = read_tensor_range_direct(engine, gate, file_offset, gate_scratch,
+                                    count * gate_record) &&
+           read_tensor_range_direct(engine, up,
+                                    (size_t)selected[i] * up_record,
+                                    up_scratch, count * up_record);
+      if (!ok)
+        break;
+      for (size_t j = 0; j < count; ++j) {
+        uint8_t *record = out + (i + j) * (gate_record + up_record);
+        std::memcpy(record, gate_scratch + j * gate_record, gate_record);
+        std::memcpy(record + gate_record, up_scratch + j * up_record,
+                    up_record);
+      }
+      i += count;
+    }
+  }
+  std::free(scratch);
+  MemoryGuard::release_host_bytes(scratch_bytes);
+  return ok;
+}
+
 ggml_tensor *load_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
                                  bool device_expert) {
   PackedGateUpMeta meta;
@@ -1811,18 +2023,11 @@ ggml_tensor *load_cold_weight(FullGraph &g, ggml_context *ctx, int layer,
   return t;
 }
 
-bool arena_copy_selected(FullGraph &g, ggml_tensor *t, const void *full_src,
-                         size_t full_bytes, const std::vector<int> &selected) {
-  const auto &c = g.engine->model_file.architecture_config;
-  if (!t || !full_src || c.n_experts <= 0 ||
-      full_bytes % (size_t)c.n_experts != 0 || selected.empty())
+template <typename Loader>
+bool arena_load_selected(FullGraph &g, ggml_tensor *t, Loader &&load) {
+  if (!t)
     return false;
-  const size_t record = full_bytes / (size_t)c.n_experts;
-  if (record > SIZE_MAX / selected.size())
-    return false;
-  const size_t bytes = record * selected.size();
-  if (bytes != ggml_nbytes(t))
-    return false;
+  const size_t bytes = ggml_nbytes(t);
   if (!MemoryGuard::try_reserve_host_bytes(bytes))
     return false;
   void *scratch = nullptr;
@@ -1830,12 +2035,10 @@ bool arena_copy_selected(FullGraph &g, ggml_tensor *t, const void *full_src,
     MemoryGuard::release_host_bytes(bytes);
     return false;
   }
-  uint8_t *dst = static_cast<uint8_t *>(scratch);
-  const uint8_t *src = static_cast<const uint8_t *>(full_src);
-  for (size_t i = 0; i < selected.size(); ++i)
-    std::memcpy(dst + i * record, src + (size_t)selected[i] * record, record);
-  const bool ok = arena_alloc(g.expert_buffer, g.expert_base, g.expert_capacity,
-                              g.expert_used, t, scratch, bytes);
+  const bool ok = load(scratch) &&
+                  arena_alloc(g.expert_buffer, g.expert_base,
+                              g.expert_capacity, g.expert_used, t, scratch,
+                              bytes);
   std::free(scratch);
   MemoryGuard::release_host_bytes(bytes);
   return ok;
@@ -1848,18 +2051,18 @@ ggml_tensor *make_hot_weight(FullGraph &g, ggml_context *ctx, int layer,
     return nullptr;
   const std::string name = "blk." + std::to_string(layer) + "." + stem;
   const GGUFTensor *m = model_tensor(*g.engine, name);
-  auto ptr_it = g.expert_source_full_views.find(name);
-  auto bytes_it = g.expert_source_full_view_bytes.find(name);
-  if (!m || ptr_it == g.expert_source_full_views.end() ||
-      bytes_it == g.expert_source_full_view_bytes.end() || m->shape.size() != 3)
+  if (!m || m->shape.size() != 3)
     return nullptr;
   std::vector<int64_t> shape;
   for (uint64_t d : m->shape)
     shape.push_back((int64_t)d);
   shape[2] = (int64_t)p->hot.size();
   ggml_tensor *t = new_tensor(ctx, (ggml_type)m->type, shape);
-  if (!t ||
-      !arena_copy_selected(g, t, ptr_it->second, bytes_it->second, p->hot))
+  if (!t || !arena_load_selected(g, t, [&](void *dst) {
+        return read_tensor_selected_experts(
+            *g.engine, *m, g.engine->model_file.architecture_config.n_experts,
+            p->hot, dst);
+      }))
     return nullptr;
   ggml_set_name(t, (name + ".hot").c_str());
   return t;
@@ -1872,16 +2075,14 @@ ggml_tensor *make_hot_gate_up(FullGraph &g, ggml_context *ctx, int layer) {
   PackedGateUpMeta meta;
   if (!packed_gate_up_meta(*g.engine, layer, &meta))
     return nullptr;
-  auto ptr_it = g.expert_source_full_views.find(meta.name);
-  auto bytes_it = g.expert_source_full_view_bytes.find(meta.name);
-  if (ptr_it == g.expert_source_full_views.end() ||
-      bytes_it == g.expert_source_full_view_bytes.end())
-    return nullptr;
   ggml_tensor *t = ggml_new_tensor_3d(
       ctx, (ggml_type)meta.gate->type, (int64_t)meta.gate->shape[0],
       (int64_t)meta.gate->shape[1] * 2, (int64_t)p->hot.size());
-  if (!t ||
-      !arena_copy_selected(g, t, ptr_it->second, bytes_it->second, p->hot))
+  if (!t || !arena_load_selected(g, t, [&](void *dst) {
+        return read_pack_gate_up_selected(
+            *g.engine, *meta.gate, *meta.up,
+            g.engine->model_file.architecture_config.n_experts, p->hot, dst);
+      }))
     return nullptr;
   ggml_set_name(t, (meta.name + ".hot").c_str());
   return t;
@@ -1937,7 +2138,11 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
             is_hot[(size_t)e] == (hot ? 1 : 0) ? 1.0f : 0.0f;
     data = mask_values.data();
   } else {
-    map_values.assign(n * (size_t)g.S, 0);
+    // Both partial-residency branches share the same dynamic top-k shape.
+    // GGML's CUDA and CPU MUL_MAT_ID kernels treat a negative expert id as an
+    // inactive route, so do not send a non-member route through expert slot 0:
+    // that computes a dummy expert and only masks its result afterward.
+    map_values.assign(n * (size_t)g.S, -1);
     const auto &ids = hot ? p->hot : p->cold;
     for (size_t i = 0; i < ids.size(); ++i)
       for (int s = 0; s < g.S; ++s)
@@ -2095,6 +2300,37 @@ size_t expert_source_bytes(const StreamingEngine &engine,
   return total;
 }
 
+size_t expert_source_bytes(const FullGraph &g) {
+  if (!g.partial_expert_residency)
+    return expert_source_bytes(*g.engine, g.device_expert_layers);
+
+  const auto &c = g.engine->model_file.architecture_config;
+  size_t total = 0;
+  for (int l = c.first_dense; l < c.n_layers; ++l) {
+    if (l < c.first_dense + g.device_expert_layers ||
+        g.engine->graph_ram_layer_ready(l))
+      continue;
+    if (c.n_experts <= 0 || l >= (int)g.partial_experts.size())
+      return 0;
+    const size_t cold = g.partial_experts[(size_t)l].cold.size();
+    if (cold == 0)
+      continue;
+    for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                             "ffn_down_exps.weight"}) {
+      const GGUFTensor *m =
+          model_tensor(*g.engine, "blk." + std::to_string(l) + "." + stem);
+      if (!m || m->size_bytes % (size_t)c.n_experts != 0)
+        return 0;
+      const size_t record = (size_t)m->size_bytes / (size_t)c.n_experts;
+      if (record > SIZE_MAX / cold ||
+          total > SIZE_MAX - record * cold)
+        return 0;
+      total += record * cold;
+    }
+  }
+  return total;
+}
+
 bool compact_partial_source(FullGraph &g) {
   if (!g.partial_expert_residency || g.partial_sources_compacted)
     return true;
@@ -2183,6 +2419,7 @@ bool preload_expert_source(FullGraph &g) {
     void *dst = nullptr;
     std::string name;
     const GGUFTensor *packed_meta = nullptr;
+    const std::vector<int> *selected_experts = nullptr;
   };
   std::vector<Job> jobs;
   jobs.reserve((size_t)std::max(0, c.n_layers - c.first_dense) * 3);
@@ -2193,35 +2430,61 @@ bool preload_expert_source(FullGraph &g) {
       continue;
     if (g.engine->graph_ram_layer_ready(l))
       continue;
+    const std::vector<int> *selected_experts = nullptr;
+    if (g.partial_expert_residency) {
+      if (l >= (int)g.partial_experts.size())
+        return false;
+      selected_experts = &g.partial_experts[(size_t)l].cold;
+    }
     PackedGateUpMeta packed;
     if (packed_gate_up_meta(*g.engine, l, &packed)) {
-      void *dst = alloc_expert_source(g, packed.bytes);
-      if (!dst) {
-        LOG_ERROR("[GGML-GLM5NEXT-FULL] DDR source arena exhausted at %s\n",
-                  packed.name.c_str());
-        return false;
+      size_t bytes = packed.bytes;
+      if (selected_experts) {
+        if (c.n_experts <= 0 || packed.bytes % (size_t)c.n_experts != 0)
+          return false;
+        bytes = packed.bytes / (size_t)c.n_experts *
+                selected_experts->size();
       }
-      g.expert_source_views.emplace(packed.name, dst);
-      g.expert_source_view_bytes.emplace(packed.name, packed.bytes);
-      jobs.push_back({packed.gate, dst, packed.name, packed.up});
+      if (bytes > 0) {
+        void *dst = alloc_expert_source(g, bytes);
+        if (!dst) {
+          LOG_ERROR("[GGML-GLM5NEXT-FULL] DDR source arena exhausted at %s\n",
+                    packed.name.c_str());
+          return false;
+        }
+        g.expert_source_views.emplace(packed.name, dst);
+        g.expert_source_view_bytes.emplace(packed.name, bytes);
+        jobs.push_back(
+            {packed.gate, dst, packed.name, packed.up, selected_experts});
+      }
     } else {
       for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight"}) {
         const std::string name = "blk." + std::to_string(l) + "." + stem;
         const GGUFTensor *m = model_tensor(*g.engine, name);
         if (!m || !type_ok(m->type) || m->size_bytes == 0) {
           LOG_ERROR("[GGML-GLM5NEXT-FULL] missing routed tensor %s\n",
-                    name.c_str());
+                  name.c_str());
           return false;
         }
-        void *dst = alloc_expert_source(g, (size_t)m->size_bytes);
-        if (!dst) {
-          LOG_ERROR("[GGML-GLM5NEXT-FULL] DDR source arena exhausted at %s\n",
-                    name.c_str());
-          return false;
+        size_t bytes = (size_t)m->size_bytes;
+        if (selected_experts) {
+          if (c.n_experts <= 0 || m->size_bytes % (size_t)c.n_experts != 0)
+            return false;
+          bytes = (size_t)m->size_bytes / (size_t)c.n_experts *
+                  selected_experts->size();
         }
-        g.expert_source_views.emplace(name, dst);
-        g.expert_source_view_bytes.emplace(name, (size_t)m->size_bytes);
-        jobs.push_back({m, dst, name});
+        if (bytes > 0) {
+          void *dst = alloc_expert_source(g, bytes);
+          if (!dst) {
+            LOG_ERROR(
+                "[GGML-GLM5NEXT-FULL] DDR source arena exhausted at %s\n",
+                name.c_str());
+            return false;
+          }
+          g.expert_source_views.emplace(name, dst);
+          g.expert_source_view_bytes.emplace(name, bytes);
+          jobs.push_back({m, dst, name, nullptr, selected_experts});
+        }
       }
     }
 
@@ -2233,18 +2496,31 @@ bool preload_expert_source(FullGraph &g) {
                 down_name.c_str());
       return false;
     }
-    void *down_dst = alloc_expert_source(g, (size_t)down->size_bytes);
-    if (!down_dst) {
-      LOG_ERROR("[GGML-GLM5NEXT-FULL] DDR source arena exhausted at %s\n",
-                down_name.c_str());
-      return false;
+    size_t down_bytes = (size_t)down->size_bytes;
+    if (selected_experts) {
+      if (c.n_experts <= 0 || down->size_bytes % (size_t)c.n_experts != 0)
+        return false;
+      down_bytes = (size_t)down->size_bytes / (size_t)c.n_experts *
+                   selected_experts->size();
     }
-    g.expert_source_views.emplace(down_name, down_dst);
-    g.expert_source_view_bytes.emplace(down_name, (size_t)down->size_bytes);
-    jobs.push_back({down, down_dst, down_name});
+    if (down_bytes > 0) {
+      void *down_dst = alloc_expert_source(g, down_bytes);
+      if (!down_dst) {
+        LOG_ERROR("[GGML-GLM5NEXT-FULL] DDR source arena exhausted at %s\n",
+                  down_name.c_str());
+        return false;
+      }
+      g.expert_source_views.emplace(down_name, down_dst);
+      g.expert_source_view_bytes.emplace(down_name, down_bytes);
+      jobs.push_back({down, down_dst, down_name, nullptr, selected_experts});
+    }
   }
   if (jobs.empty())
+  {
+    if (g.partial_expert_residency)
+      g.partial_sources_compacted = true;
     return true;
+  }
 
   const auto start = std::chrono::steady_clock::now();
   std::atomic<size_t> next{0};
@@ -2284,10 +2560,20 @@ bool preload_expert_source(FullGraph &g) {
         return;
       }
       const Job &job = jobs[i];
-      const bool ok = job.packed_meta
-                          ? read_pack_gate_up(*g.engine, *job.meta,
-                                              *job.packed_meta, job.dst)
-                          : read_tensor_direct(*g.engine, *job.meta, job.dst);
+      const bool ok = job.selected_experts
+                          ? (job.packed_meta
+                                 ? read_pack_gate_up_selected(
+                                       *g.engine, *job.meta, *job.packed_meta,
+                                       c.n_experts, *job.selected_experts,
+                                       job.dst)
+                                 : read_tensor_selected_experts(
+                                       *g.engine, *job.meta, c.n_experts,
+                                       *job.selected_experts, job.dst))
+                          : (job.packed_meta
+                                 ? read_pack_gate_up(*g.engine, *job.meta,
+                                                     *job.packed_meta, job.dst)
+                                 : read_tensor_direct(*g.engine, *job.meta,
+                                                      job.dst));
       if (!ok) {
         if (!failed.exchange(true, std::memory_order_relaxed)) {
           std::lock_guard<std::mutex> lock(error_mutex);
@@ -2319,6 +2605,12 @@ bool preload_expert_source(FullGraph &g) {
                          : 0.0,
            jobs.size(), n_threads);
 
+  // Partial residency is now read directly into the compact cold layout;
+  // the hot records are loaded from GGUF into the device arena during graph
+  // construction.  Avoid allocating the former full-weight source and
+  // compacting it only after peak memory has already been committed.
+  if (g.partial_expert_residency)
+    g.partial_sources_compacted = true;
   if (!compact_partial_source(g)) {
     LOG_ERROR("[GGML-FULL] partial expert source compaction failed\n");
     return false;
@@ -2568,6 +2860,102 @@ bool init_dense_arena(FullGraph &g) {
   return true;
 }
 
+bool init_decode_state_arena(FullGraph &g) {
+  if (!g.decode_mode || !g.cuda || g.kv_capacity <= 0 || g.kv_lora <= 0)
+    return false;
+  const auto &c = g.engine->model_file.architecture_config;
+  size_t bytes = 1ull << 20; // alignment/slack for backend tensor allocations
+  auto add_tensor = [&bytes](size_t tensor_bytes) {
+    constexpr size_t kAlignment = 4096;
+    if (tensor_bytes > SIZE_MAX - bytes - kAlignment)
+      return false;
+    bytes += tensor_bytes + kAlignment;
+    return true;
+  };
+  for (int l = 0; l < g.n_layers; ++l) {
+    if (glm5next_is_kda_layer(c, l)) {
+      const size_t state_n = (size_t)g.hd * g.hd * g.H;
+      const size_t hist_n = (size_t)(g.d_conv - 1) * 3 * g.d_inner;
+      if (state_n > SIZE_MAX / sizeof(float) ||
+          hist_n > SIZE_MAX / sizeof(float) ||
+          !add_tensor(state_n * sizeof(float)) ||
+          !add_tensor(hist_n * sizeof(float)))
+        return false;
+    } else {
+      if ((size_t)g.kv_capacity >
+          SIZE_MAX / (size_t)g.kv_lora / sizeof(ggml_fp16_t) ||
+          !add_tensor((size_t)g.kv_capacity * g.kv_lora *
+                      sizeof(ggml_fp16_t)))
+        return false;
+    }
+  }
+  if (g.sparse_decode) {
+    if (g.indexer_key_length <= 0 || g.indexer_kpool <= 1 ||
+        g.kv_capacity % g.indexer_kpool != 0)
+      return false;
+    const size_t capacity = (size_t)g.kv_capacity;
+    const size_t key_length = (size_t)g.indexer_key_length;
+    const size_t pool_count = capacity / (size_t)g.indexer_kpool;
+    if (key_length > SIZE_MAX / 2 / sizeof(float) / capacity ||
+        key_length > SIZE_MAX / sizeof(float) / pool_count)
+      return false;
+    for (int l = 0; l < g.n_layers; ++l) {
+      if (glm5next_is_kda_layer(c, l))
+        continue;
+      const std::string prefix = "blk." + std::to_string(l) + ".";
+      if (!model_tensor(*g.engine, prefix + "indexer.proj.weight"))
+        continue;
+      if (!add_tensor(2 * key_length * capacity * sizeof(float)) ||
+          !add_tensor(key_length * pool_count * sizeof(float)))
+        return false;
+    }
+  }
+  const auto buft = ggml_backend_get_default_buffer_type(g.cuda);
+  g.device_state_buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+  if (!g.device_state_buffer) {
+    LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] device state arena declined: "
+             "%.2f GiB (KV capacity=%d)\n",
+             (double)bytes / (1024.0 * 1024.0 * 1024.0), g.kv_capacity);
+    return false;
+  }
+  ggml_backend_buffer_set_usage(g.device_state_buffer,
+                                GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+  g.device_state_base = ggml_backend_buffer_get_base(g.device_state_buffer);
+  g.device_state_capacity = ggml_backend_buffer_get_size(g.device_state_buffer);
+  g.device_state_used = 0;
+  LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] device state arena=%.2f GiB, "
+           "KV capacity=%d\n",
+           (double)g.device_state_capacity / (1024.0 * 1024.0 * 1024.0),
+           g.kv_capacity);
+  return true;
+}
+
+ggml_tensor *new_decode_state_tensor(FullGraph &g, ggml_context *ctx,
+                                     ggml_type type,
+                                     const std::vector<int64_t> &shape,
+                                     const char *name) {
+  ggml_tensor *t = new_tensor(ctx, type, shape);
+  if (!t || !g.device_state_buffer)
+    return nullptr;
+  const ggml_backend_buffer_type_t buft =
+      ggml_backend_buffer_get_type(g.device_state_buffer);
+  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+  const size_t alignment =
+      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+  const size_t aligned =
+      (g.device_state_used + alignment - 1) & ~(alignment - 1);
+  if (aligned > g.device_state_capacity ||
+      alloc_size > g.device_state_capacity - aligned)
+    return nullptr;
+  void *addr = static_cast<uint8_t *>(g.device_state_base) + aligned;
+  if (ggml_backend_tensor_alloc(g.device_state_buffer, t, addr) !=
+      GGML_STATUS_SUCCESS)
+    return nullptr;
+  g.device_state_used = aligned + alloc_size;
+  ggml_set_name(t, name);
+  return t;
+}
+
 bool init_expert_arena(FullGraph &g) {
   if (!g.partial_expert_residency && g.device_expert_layers <= 0)
     return true;
@@ -2635,7 +3023,7 @@ bool source_configuration_matches(const FullGraph &source,
 }
 
 bool prepare_expert_source_only(FullGraph &g, const char *tag) {
-  const size_t source = expert_source_bytes(*g.engine, g.device_expert_layers);
+  const size_t source = expert_source_bytes(g);
   constexpr size_t kSourceSlack = 1ull << 20;
   // 10 GiB, per explicit user instruction after the 2026-09-09 crash (was
   // 8 GiB) -- align every host-memory watermark in this file to the same
@@ -2840,7 +3228,8 @@ ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *state_raw =
       ggml_view_4d(ctx, scan, g.hd, g.hd, g.H, 1, head_row, state_row,
                    state_row * g.H, (size_t)g.d_inner * g.S * sizeof(float));
-  *state_out = ggml_cont(ctx, ggml_transpose(ctx, state_raw));
+  *state_out = g.decode_mode ? ggml_cont(ctx, state_raw)
+                             : ggml_cont(ctx, ggml_transpose(ctx, state_raw));
   ggml_tensor *core = ggml_view_4d(ctx, scan, g.hd, g.H, g.S, 1, head_row,
                                    value_row, value_row * g.S, 0);
   ggml_tensor *norm = ggml_mul(ctx, ggml_rms_norm(ctx, core, c.eps), norm_w);
@@ -2857,11 +3246,236 @@ ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   return out;
 }
 
+Glm5nextIndexerLayer *glm5next_indexer_state(FullGraph &g, int layer) {
+  for (Glm5nextIndexerLayer &state : g.glm5next_indexer_layers)
+    if (state.layer == layer)
+      return &state;
+  return nullptr;
+}
+
+bool glm5next_indexer_owner(const FullGraph &g, int layer) {
+  const std::string prefix = "blk." + std::to_string(layer) + ".";
+  return model_tensor(*g.engine, prefix + "indexer.proj.weight") != nullptr;
+}
+
+ggml_tensor *glm5next_indexer_pool(ggml_context *ctx, ggml_tensor *keys,
+                                   ggml_tensor *gates, ggml_tensor *ape,
+                                   int key_length, int kpool, int n_pools) {
+  if (!keys || !gates || !ape || key_length <= 0 || kpool <= 1 ||
+      n_pools <= 0)
+    return nullptr;
+  const int64_t pooled_tokens = (int64_t)kpool * n_pools;
+  const int64_t pooled_elements = (int64_t)key_length * pooled_tokens;
+  const auto complete_pool_prefix = [&](ggml_tensor *t) -> ggml_tensor * {
+    if (!t || t->ne[0] != key_length || t->ne[2] != 1 || t->ne[3] != 1 ||
+        t->ne[1] < pooled_tokens)
+      return nullptr;
+    if (ggml_nelements(t) == pooled_elements)
+      return t;
+    // Prefill also caches key/gate rows for an incomplete tail so decode can
+    // finish that pool later.  Pool summaries cover only complete KPool
+    // blocks; trim the trailing token(s) before reshaping instead of asking
+    // GGML to reshape key_length*S elements into key_length*kpool*n_pools.
+    ggml_tensor *prefix =
+        ggml_view_2d(ctx, t, key_length, pooled_tokens, t->nb[1], 0);
+    return prefix ? ggml_cont(ctx, prefix) : nullptr;
+  };
+  keys = complete_pool_prefix(keys);
+  gates = complete_pool_prefix(gates);
+  if (!keys || !gates)
+    return nullptr;
+  ggml_tensor *key_blocks =
+      ggml_reshape_3d(ctx, keys, key_length, kpool, n_pools);
+  ggml_tensor *gate_blocks =
+      ggml_reshape_3d(ctx, gates, key_length, kpool, n_pools);
+  ggml_tensor *logits = ggml_add(ctx, gate_blocks, ape);
+  logits = ggml_cont(ctx, ggml_permute(ctx, logits, 1, 0, 2, 3));
+  ggml_tensor *prob = ggml_soft_max(ctx, logits);
+  ggml_tensor *values =
+      ggml_cont(ctx, ggml_permute(ctx, key_blocks, 1, 0, 2, 3));
+  ggml_tensor *pooled = ggml_sum_rows(ctx, ggml_mul(ctx, prob, values));
+  return ggml_reshape_2d(ctx, pooled, key_length, n_pools);
+}
+
+bool build_glm5next_indexer_prefill(FullGraph &g, ggml_context *ctx,
+                                    ggml_tensor *cur, int layer) {
+  const int key_length = g.indexer_key_length;
+  const int kpool = g.indexer_kpool;
+  const int n_pools = key_length > 0 && kpool > 1 ? g.S / kpool : 0;
+  if (key_length <= 0 || kpool <= 1)
+    return false;
+  const std::string prefix = "blk." + std::to_string(layer) + ".";
+  ggml_tensor *w_key = resident_tensor(g, ctx, prefix + "indexer.attn_k.weight");
+  ggml_tensor *w_norm =
+      resident_tensor(g, ctx, prefix + "indexer.k_norm.weight");
+  ggml_tensor *w_gate =
+      resident_tensor(g, ctx, prefix + "indexer_compressor_gate.weight");
+  ggml_tensor *w_ape =
+      resident_tensor(g, ctx, prefix + "indexer_compressor_ape.weight");
+  ggml_tensor *w_bias = nullptr;
+  if (model_tensor(*g.engine, prefix + "indexer.k_norm.bias"))
+    w_bias = resident_tensor(g, ctx, prefix + "indexer.k_norm.bias");
+  if (!w_key || !w_norm || !w_gate || !w_ape ||
+      (model_tensor(*g.engine, prefix + "indexer.k_norm.bias") && !w_bias))
+    return false;
+
+  const auto &c = g.engine->model_file.architecture_config;
+  const float norm_eps = g.engine->model_file.get_config_float(
+      "attention.layer_norm_epsilon", c.eps);
+  ggml_tensor *keys = ggml_norm(ctx, ggml_mul_mat(ctx, w_key, cur), norm_eps);
+  keys = ggml_mul(ctx, keys, w_norm);
+  if (w_bias)
+    keys = ggml_add(ctx, keys, w_bias);
+  ggml_tensor *gates = ggml_mul_mat(ctx, w_gate, cur);
+  ggml_tensor *packed = ggml_concat(ctx, keys, gates, 0);
+  ggml_tensor *pooled = n_pools > 0
+                            ? glm5next_indexer_pool(ctx, keys, gates, w_ape,
+                                                    key_length, kpool, n_pools)
+                            : nullptr;
+  if (!packed || (n_pools > 0 && !pooled))
+    return false;
+  g.glm5next_indexer_layers.push_back(
+      {layer, packed, pooled, nullptr, nullptr});
+  return true;
+}
+
+bool build_glm5next_indexer_decode(FullGraph &g, ggml_context *ctx,
+                                   ggml_tensor *cur, ggml_tensor *qr,
+                                   int layer, ggml_tensor **sel_out,
+                                   ggml_tensor **mask_out) {
+  Glm5nextIndexerLayer *state = glm5next_indexer_state(g, layer);
+  if (!state || !state->key_gate_cache || !state->pooled_cache ||
+      !g.decode_indices || !g.indexer_pool_mask ||
+      !g.indexer_pool_member_ids || !g.indexer_pool_update_rows ||
+      !g.indexer_pool_update_index ||
+      (g.indexer_select_tail &&
+       (!g.indexer_tail_indices || !g.indexer_tail_mask)))
+    return false;
+  const std::string prefix = "blk." + std::to_string(layer) + ".";
+  ggml_tensor *w_key = resident_tensor(g, ctx, prefix + "indexer.attn_k.weight");
+  ggml_tensor *w_norm =
+      resident_tensor(g, ctx, prefix + "indexer.k_norm.weight");
+  ggml_tensor *w_bias = nullptr;
+  if (model_tensor(*g.engine, prefix + "indexer.k_norm.bias"))
+    w_bias = resident_tensor(g, ctx, prefix + "indexer.k_norm.bias");
+  ggml_tensor *w_gate =
+      resident_tensor(g, ctx, prefix + "indexer_compressor_gate.weight");
+  ggml_tensor *w_ape =
+      resident_tensor(g, ctx, prefix + "indexer_compressor_ape.weight");
+  ggml_tensor *w_q =
+      resident_tensor(g, ctx, prefix + "indexer.attn_q_b.weight");
+  ggml_tensor *w_proj =
+      resident_tensor(g, ctx, prefix + "indexer.proj.weight");
+  if (!w_key || !w_norm || !w_gate || !w_ape || !w_q || !w_proj ||
+      (model_tensor(*g.engine, prefix + "indexer.k_norm.bias") && !w_bias))
+    return false;
+
+  const auto &c = g.engine->model_file.architecture_config;
+  const float norm_eps = g.engine->model_file.get_config_float(
+      "attention.layer_norm_epsilon", c.eps);
+  ggml_tensor *keys = ggml_norm(ctx, ggml_mul_mat(ctx, w_key, cur), norm_eps);
+  keys = ggml_mul(ctx, keys, w_norm);
+  if (w_bias)
+    keys = ggml_add(ctx, keys, w_bias);
+  ggml_tensor *gates = ggml_mul_mat(ctx, w_gate, cur);
+  ggml_tensor *packed = ggml_concat(ctx, keys, gates, 0);
+  ggml_tensor *raw_updated =
+      ggml_set_rows(ctx, state->key_gate_cache, packed, g.decode_indices);
+  if (!raw_updated)
+    return false;
+  ggml_tensor *pool_rows =
+      ggml_get_rows(ctx, raw_updated, g.indexer_pool_update_rows);
+  const int key_length = g.indexer_key_length;
+  const size_t gate_offset = ggml_row_size(pool_rows->type, key_length);
+  ggml_tensor *pool_keys =
+      ggml_cont(ctx, ggml_view_2d(ctx, pool_rows, key_length, g.indexer_kpool,
+                                  pool_rows->nb[1], 0));
+  ggml_tensor *pool_gates =
+      ggml_cont(ctx, ggml_view_2d(ctx, pool_rows, key_length, g.indexer_kpool,
+                                  pool_rows->nb[1], gate_offset));
+  ggml_tensor *pool = glm5next_indexer_pool(ctx, pool_keys, pool_gates, w_ape,
+                                           key_length, g.indexer_kpool, 1);
+  if (!pool)
+    return false;
+  ggml_tensor *pool_updated = ggml_set_rows(
+      ctx, state->pooled_cache, pool, g.indexer_pool_update_index);
+
+  ggml_tensor *indexer_q = ggml_mul_mat(ctx, w_q, qr);
+  indexer_q = ggml_reshape_3d(ctx, indexer_q, key_length,
+                              g.indexer_heads, 1);
+  ggml_tensor *indexer_weights = ggml_mul_mat(ctx, w_proj, cur);
+  indexer_weights = ggml_scale(
+      ctx, indexer_weights,
+      1.0f / std::sqrt((float)key_length * g.indexer_heads));
+
+  const int pool_count = g.kv_capacity / g.indexer_kpool;
+  ggml_tensor *pool_keys_all =
+      ggml_reshape_3d(ctx, pool_updated, key_length, 1, pool_count);
+  ggml_tensor *k_p = ggml_permute(ctx, pool_keys_all, 0, 2, 1, 3);
+  ggml_tensor *q_p = ggml_permute(ctx, indexer_q, 0, 2, 1, 3);
+  ggml_tensor *kq = ggml_mul_mat(ctx, k_p, q_p);
+  kq = ggml_cont(ctx, ggml_permute(ctx, kq, 2, 1, 0, 3));
+  ggml_tensor *weights_3d =
+      ggml_reshape_3d(ctx, indexer_weights, g.indexer_heads, 1, 1);
+  ggml_tensor *score = ggml_mul(ctx, ggml_relu(ctx, kq), weights_3d);
+  score = ggml_sum_rows(ctx, score);
+  score = ggml_cont(ctx, ggml_permute(ctx, score, 2, 1, 0, 3));
+  score = ggml_add(ctx, score, g.indexer_pool_mask);
+  const int n_top_pools =
+      std::min(pool_count, g.indexer_top_k / g.indexer_kpool);
+  if (n_top_pools <= 0)
+    return false;
+  ggml_tensor *top_pools = ggml_top_k(ctx, score, n_top_pools);
+  ggml_tensor *selected_scores = ggml_get_rows(
+      ctx, ggml_reshape_3d(ctx, score, 1, pool_count, 1), top_pools);
+  ggml_tensor *selection_order = ggml_argsort(
+      ctx, ggml_reshape_2d(ctx, selected_scores, n_top_pools, 1),
+      GGML_SORT_ORDER_DESC);
+  top_pools = ggml_get_rows(
+      ctx,
+      ggml_reshape_3d(ctx, ggml_cast(ctx, top_pools, GGML_TYPE_F32), 1,
+                      n_top_pools, 1),
+      selection_order);
+  top_pools = ggml_cast(
+      ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, top_pools, n_top_pools, 1)),
+      GGML_TYPE_I32);
+  ggml_tensor *selected_rows =
+      ggml_get_rows(ctx, g.indexer_pool_member_ids, top_pools);
+  selected_rows = ggml_reshape_2d(
+      ctx, selected_rows, n_top_pools * g.indexer_kpool, 1);
+
+  ggml_tensor *pool_mask_2d =
+      ggml_reshape_2d(ctx, g.indexer_pool_mask, 1, pool_count);
+  ggml_tensor *selected_pool_mask =
+      ggml_get_rows(ctx, pool_mask_2d, top_pools);
+  selected_pool_mask = ggml_reshape_4d(ctx, selected_pool_mask, 1,
+                                       n_top_pools, 1, 1);
+  selected_pool_mask = ggml_repeat_4d(
+      ctx, selected_pool_mask, g.indexer_kpool, n_top_pools, 1, 1);
+  selected_pool_mask = ggml_reshape_2d(
+      ctx, selected_pool_mask, n_top_pools * g.indexer_kpool, 1);
+  ggml_tensor *selected = selected_rows;
+  ggml_tensor *gather_mask = selected_pool_mask;
+  const int tail_rows =
+      g.indexer_select_tail ? g.indexer_kpool - 1 : 0;
+  if (tail_rows > 0) {
+    selected = ggml_concat(ctx, selected, g.indexer_tail_indices, 0);
+    gather_mask = ggml_concat(ctx, gather_mask, g.indexer_tail_mask, 0);
+  }
+  const int n_selected = n_top_pools * g.indexer_kpool + tail_rows;
+  *sel_out = selected;
+  *mask_out = ggml_reshape_4d(ctx, gather_mask, n_selected, 1, 1, 1);
+  return *mask_out != nullptr;
+}
+
 ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *wqa, ggml_tensor *wqan,
                        ggml_tensor *wqb, ggml_tensor *wkva, ggml_tensor *wkvan,
                        ggml_tensor *wkb, ggml_tensor *wvb, ggml_tensor *wo,
-                       ggml_tensor **kv_out) {
+                       ggml_tensor **kv_out,
+                       ggml_tensor *kv_cache = nullptr,
+                       ggml_tensor **prev_indexer_selection = nullptr,
+                       ggml_tensor **prev_indexer_mask = nullptr) {
   const auto &c = g.engine->model_file.architecture_config;
   ggml_tensor *qr = ggml_rms_norm(ctx, ggml_mul_mat(ctx, wqa, cur), c.eps);
   qr = ggml_mul(ctx, qr, wqan);
@@ -2871,14 +3485,33 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   kv = ggml_mul(ctx, ggml_rms_norm(ctx, kv, c.eps), wkvan);
   *kv_out = kv;
 
+  if (!g.decode_mode && glm5next_indexer_owner(g, layer) &&
+      !build_glm5next_indexer_prefill(g, ctx, cur, layer))
+    return nullptr;
+
   q = ggml_permute(ctx, q, 0, 2, 1, 3);
   q = ggml_mul_mat(ctx, wkb, q);
   q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
-  const int64_t kv_tokens = ((int64_t)g.S + 255) & ~((int64_t)255);
-  ggml_tensor *latent = ggml_reshape_3d(ctx, kv, g.kv_lora, 1, g.S);
-  if (kv_tokens > g.S) {
+  const int64_t kv_tokens = g.decode_mode
+                                ? g.kv_capacity
+                                : (((int64_t)g.S + 255) & ~((int64_t)255));
+  ggml_tensor *latent = nullptr;
+  ggml_tensor *kv_cache_updated = nullptr;
+  if (g.decode_mode) {
+    if (!kv_cache || !g.decode_indices)
+      return nullptr;
+    ggml_tensor *cache_row = ggml_reshape_2d(ctx, kv, g.kv_lora, 1);
+    kv_cache_updated = ggml_set_rows(ctx, kv_cache, cache_row, g.decode_indices);
+    if (!kv_cache_updated)
+      return nullptr;
+    latent = ggml_reshape_3d(ctx, kv_cache_updated, g.kv_lora, 1,
+                             g.kv_capacity);
+  } else {
+    latent = ggml_reshape_3d(ctx, kv, g.kv_lora, 1, g.S);
+  }
+  if (!g.decode_mode && kv_tokens > g.S) {
     // ggml-cuda's 512-wide FATTN kernels require the KV sequence length to
-    // be a multiple of FATTN_KQ_STRIDE (256).  Bee's normal KV-cache path
+    // be a multiple of FATTN_KQ_STRIDE (256).  llama.cpp's normal KV-cache path
     // already supplies a padded cache.  This standalone no-cache graph must
     // provide the same layout explicitly; zero padding is masked out below.
     latent = ggml_pad(ctx, latent, 0, 0, (int)(kv_tokens - g.S), 0);
@@ -2904,10 +3537,45 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (v->type == GGML_TYPE_F32)
     v = ggml_cast(ctx, v, GGML_TYPE_F16);
 
-  ggml_tensor *attn = ggml_flash_attn_ext(
-      ctx, q, k, v, g.attn_mask,
-      1.0f / std::sqrt((float)(g.qk_nope > 0 ? g.qk_nope : 1)), 0.0f, 0.0f);
-  if (g.dsa_layers.empty()) {
+  ggml_tensor *attn = nullptr;
+  if (g.decode_mode && g.sparse_decode) {
+    if (!prev_indexer_selection || !prev_indexer_mask)
+      return nullptr;
+    if (glm5next_indexer_owner(g, layer)) {
+      ggml_tensor *selection = nullptr;
+      ggml_tensor *selection_mask = nullptr;
+      if (!build_glm5next_indexer_decode(g, ctx, cur, qr, layer, &selection,
+                                         &selection_mask))
+        return nullptr;
+      *prev_indexer_selection = selection;
+      *prev_indexer_mask = selection_mask;
+    }
+    ggml_tensor *selection = *prev_indexer_selection;
+    ggml_tensor *selection_mask = *prev_indexer_mask;
+    if (!selection || !selection_mask)
+      return nullptr;
+    ggml_tensor *gathered = ggml_get_rows(ctx, kv_cache_updated, selection);
+    gathered = ggml_cast(ctx, gathered, GGML_TYPE_F32);
+    const int64_t n_selected = selection->ne[0];
+    ggml_tensor *k_g =
+        ggml_reshape_4d(ctx, gathered, g.kv_lora, n_selected, 1, 1);
+    ggml_tensor *kq = ggml_mul_mat(ctx, k_g, q);
+    ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+    kq = ggml_soft_max_ext(
+        ctx, kq, selection_mask,
+        1.0f / std::sqrt((float)(g.qk_nope > 0 ? g.qk_nope : 1)), 0.0f);
+    ggml_tensor *v_t = ggml_cont(ctx, ggml_transpose(ctx, k_g));
+    ggml_tensor *kqv = ggml_mul_mat(ctx, v_t, kq);
+    kqv = ggml_mul_mat(ctx, wvb, kqv);
+    attn = ggml_cont(ctx, ggml_permute(ctx, kqv, 0, 2, 1, 3));
+    attn = ggml_reshape_2d(ctx, attn, g.v_head * g.H, g.S);
+  } else {
+    attn = ggml_flash_attn_ext(
+        ctx, q, k, v, g.attn_mask,
+        1.0f / std::sqrt((float)(g.qk_nope > 0 ? g.qk_nope : 1)), 0.0f,
+        0.0f);
+  }
+  if (!g.sparse_decode && g.dsa_layers.empty()) {
     LOG_INFO("[GGML-GLM5NEXT-FULL] DSA FATTN layer=%d support_cuda=%d "
              "q=(%lld,%lld,%lld,%lld)/%s k=(%lld,%lld,%lld,%lld)/%s "
              "v=(%lld,%lld,%lld,%lld)/%s mask=(%lld,%lld,%lld,%lld)/%s\n",
@@ -2923,11 +3591,14 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
   // Same v_mla path as build_attn_mha(): FATTN [kv_lora,S,H] is interpreted
   // as [kv_lora,H,S] for WUV, then made contiguous before the 2D projection.
-  ggml_tensor *value = ggml_permute(ctx, attn, 0, 2, 1, 3);
-  value = ggml_mul_mat(ctx, wvb, value);
-  value = ggml_permute(ctx, value, 0, 2, 1, 3);
-  value = ggml_cont(ctx, value);
-  value = ggml_reshape_2d(ctx, value, g.v_head * g.H, g.S);
+  ggml_tensor *value = attn;
+  if (!(g.decode_mode && g.sparse_decode)) {
+    value = ggml_permute(ctx, attn, 0, 2, 1, 3);
+    value = ggml_mul_mat(ctx, wvb, value);
+    value = ggml_permute(ctx, value, 0, 2, 1, 3);
+    value = ggml_cont(ctx, value);
+    value = ggml_reshape_2d(ctx, value, g.v_head * g.H, g.S);
+  }
   (void)layer;
   return ggml_mul_mat(ctx, wo, value);
 }
@@ -3165,19 +3836,71 @@ bool build_graph(FullGraph &g) {
   g.input = host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.HC, g.S},
                        (size_t)g.D * g.HC * g.S * sizeof(float),
                        "glm5next_full_input");
-  const int64_t kv_tokens = ((int64_t)g.S + 255) & ~((int64_t)255);
+  const int64_t kv_tokens = g.decode_mode
+                                ? g.kv_capacity
+                                : (((int64_t)g.S + 255) & ~((int64_t)255));
   g.attn_mask = host_input(g, g.ctx, GGML_TYPE_F16, {kv_tokens, g.S, 1, 1},
                            (size_t)kv_tokens * g.S * sizeof(ggml_fp16_t),
                            "glm5next_full_causal_mask");
-  if (!g.input || !g.attn_mask)
+  if (g.decode_mode)
+    g.decode_indices = host_input(g, g.ctx, GGML_TYPE_I32, {1}, sizeof(int32_t),
+                                  "glm5next_full_decode_kv_index");
+  if (!g.input || !g.attn_mask || (g.decode_mode && !g.decode_indices))
     return false;
-  auto *mask = static_cast<ggml_fp16_t *>(g.host_inputs[1]);
+  auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int q = 0; q < g.S; ++q)
     for (int k = 0; k < kv_tokens; ++k)
       mask[(size_t)q * kv_tokens + k] =
-          ggml_fp32_to_fp16(k < g.S && k <= q ? 0.0f : -INFINITY);
+          ggml_fp32_to_fp16(g.decode_mode ? -INFINITY
+                                          : (k < g.S && k <= q ? 0.0f
+                                                               : -INFINITY));
+
+  if (g.decode_mode && g.sparse_decode) {
+    if (g.indexer_kpool <= 1 || g.kv_capacity % g.indexer_kpool != 0 ||
+        g.indexer_key_length <= 0 || g.indexer_heads <= 0 ||
+        g.indexer_top_k <= 0)
+      return false;
+    const int pool_count = g.kv_capacity / g.indexer_kpool;
+    const int tail_rows =
+        g.indexer_select_tail ? g.indexer_kpool - 1 : 0;
+    g.indexer_pool_member_ids = host_input(
+        g, g.ctx, GGML_TYPE_I32, {g.indexer_kpool, pool_count},
+        (size_t)g.indexer_kpool * pool_count * sizeof(int32_t),
+        "glm5next_indexer_pool_member_ids");
+    g.indexer_pool_mask = host_input(
+        g, g.ctx, GGML_TYPE_F32, {pool_count},
+        (size_t)pool_count * sizeof(float), "glm5next_indexer_pool_mask");
+    g.indexer_pool_update_rows = host_input(
+        g, g.ctx, GGML_TYPE_I32, {g.indexer_kpool},
+        (size_t)g.indexer_kpool * sizeof(int32_t),
+        "glm5next_indexer_pool_update_rows");
+    g.indexer_pool_update_index = host_input(
+        g, g.ctx, GGML_TYPE_I32, {1}, sizeof(int32_t),
+        "glm5next_indexer_pool_update_index");
+    if (tail_rows > 0) {
+      g.indexer_tail_indices = host_input(
+          g, g.ctx, GGML_TYPE_I32, {tail_rows},
+          (size_t)tail_rows * sizeof(int32_t),
+          "glm5next_indexer_tail_indices");
+      g.indexer_tail_mask = host_input(
+          g, g.ctx, GGML_TYPE_F32, {tail_rows},
+          (size_t)tail_rows * sizeof(float), "glm5next_indexer_tail_mask");
+    }
+    if (!g.indexer_pool_member_ids || !g.indexer_pool_mask ||
+        !g.indexer_pool_update_rows || !g.indexer_pool_update_index ||
+        (tail_rows > 0 &&
+         (!g.indexer_tail_indices || !g.indexer_tail_mask)))
+      return false;
+    auto *members = static_cast<int32_t *>(g.indexer_pool_member_ids->data);
+    for (int pool = 0; pool < pool_count; ++pool)
+      for (int i = 0; i < g.indexer_kpool; ++i)
+        members[(size_t)pool * g.indexer_kpool + i] =
+            pool * g.indexer_kpool + i;
+  }
 
   ggml_tensor *res = g.input;
+  ggml_tensor *previous_indexer_selection = nullptr;
+  ggml_tensor *previous_indexer_mask = nullptr;
   for (int l = 0; l < g.n_layers; ++l) {
     // The graph owns a complete DDR source arena, so this is a coarse
     // per-layer admission point rather than a check on every tensor/alloc.
@@ -3225,24 +3948,49 @@ bool build_graph(FullGraph &g) {
           !be || !aa || !dt || !nm || !ow)
         return false;
       const int hist = g.d_conv - 1;
-      ggml_tensor *hi = host_input(
-          g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
-          (size_t)hist * 3 * g.d_inner * sizeof(float), "glm5next_kda_history");
-      ggml_tensor *si = host_input(
-          g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
-          (size_t)g.hd * g.hd * g.H * sizeof(float), "glm5next_kda_state");
+      ggml_tensor *hi = nullptr;
+      ggml_tensor *si = nullptr;
+      if (g.decode_mode) {
+        hi = new_decode_state_tensor(
+            g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
+            "glm5next_decode_kda_history");
+        si = new_decode_state_tensor(
+            g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
+            "glm5next_decode_kda_state");
+        if (hi && si) {
+          g.kda_hist_storage.push_back(hi);
+          g.kda_state_storage.push_back(si);
+        }
+      } else {
+        hi = host_input(
+            g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
+            (size_t)hist * 3 * g.d_inner * sizeof(float),
+            "glm5next_kda_history");
+        si = host_input(
+            g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
+            (size_t)g.hd * g.hd * g.H * sizeof(float), "glm5next_kda_state");
+      }
       if (!hi || !si)
         return false;
-      g.kda_hist_inputs.push_back((float *)hi->data);
-      g.kda_state_inputs.push_back((float *)si->data);
+      if (!g.decode_mode) {
+        g.kda_hist_inputs.push_back((float *)hi->data);
+        g.kda_state_inputs.push_back((float *)si->data);
+      }
       ggml_tensor *so = nullptr;
       ggml_tensor *ho = nullptr;
       attn = build_kda(g, g.ctx, cur, l, wq, wk, wv, cq, ck, cv, fa, fb, ga, gb,
                        be, aa, dt, nm, ow, hi, si, &so, &ho);
       if (!attn || !so || !ho)
         return false;
-      g.kda_state_out.push_back(so);
-      g.kda_hist_out.push_back(ho);
+      if (g.decode_mode) {
+        g.kda_state_updates.push_back(ggml_cpy(g.ctx, so, si));
+        g.kda_hist_updates.push_back(ggml_cpy(g.ctx, ho, hi));
+        if (!g.kda_state_updates.back() || !g.kda_hist_updates.back())
+          return false;
+      } else {
+        g.kda_state_out.push_back(so);
+        g.kda_hist_out.push_back(ho);
+      }
       g.kda_layers.push_back(l);
     } else {
       ggml_tensor *wqa = resident_tensor(g, g.ctx, p + "attn_q_a.weight");
@@ -3256,12 +4004,38 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *wo = resident_tensor(g, g.ctx, p + "attn_output.weight");
       if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo)
         return false;
+      ggml_tensor *kv_cache = nullptr;
+      if (g.decode_mode) {
+        kv_cache = new_decode_state_tensor(
+            g, g.ctx, GGML_TYPE_F16, {g.kv_lora, g.kv_capacity},
+            "glm5next_decode_dsa_kv");
+        if (!kv_cache)
+          return false;
+        g.dsa_kv_storage.push_back(kv_cache);
+        if (g.sparse_decode && glm5next_indexer_owner(g, l)) {
+          Glm5nextIndexerLayer indexer_state;
+          indexer_state.layer = l;
+          indexer_state.key_gate_cache = new_decode_state_tensor(
+              g, g.ctx, GGML_TYPE_F32,
+              {2 * g.indexer_key_length, g.kv_capacity},
+              "glm5next_decode_indexer_key_gate");
+          indexer_state.pooled_cache = new_decode_state_tensor(
+              g, g.ctx, GGML_TYPE_F32,
+              {g.indexer_key_length, g.kv_capacity / g.indexer_kpool},
+              "glm5next_decode_indexer_pooled_keys");
+          if (!indexer_state.key_gate_cache || !indexer_state.pooled_cache)
+            return false;
+          g.glm5next_indexer_layers.push_back(indexer_state);
+        }
+      }
       ggml_tensor *kv = nullptr;
       attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb,
-                       wo, &kv);
+                       wo, &kv, kv_cache, &previous_indexer_selection,
+                       &previous_indexer_mask);
       if (!attn || !kv)
         return false;
-      g.dsa_kv_out.push_back(kv);
+      if (!g.decode_mode)
+        g.dsa_kv_out.push_back(kv);
       g.dsa_layers.push_back(l);
     }
     res = hc_post(g, g.ctx, attn, residual, post, comb);
@@ -3310,17 +4084,36 @@ bool build_graph(FullGraph &g) {
   ggml_build_forward_expand(g.graph, g.final_streams);
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  for (ggml_tensor *t : g.kda_state_out) {
-    ggml_set_output(t);
-    ggml_build_forward_expand(g.graph, t);
-  }
-  for (ggml_tensor *t : g.kda_hist_out) {
-    ggml_set_output(t);
-    ggml_build_forward_expand(g.graph, t);
+  if (g.decode_mode) {
+    for (ggml_tensor *t : g.kda_state_updates)
+      ggml_build_forward_expand(g.graph, t);
+    for (ggml_tensor *t : g.kda_hist_updates)
+      ggml_build_forward_expand(g.graph, t);
+  } else {
+    for (ggml_tensor *t : g.kda_state_out) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(g.graph, t);
+    }
+    for (ggml_tensor *t : g.kda_hist_out) {
+      ggml_set_output(t);
+      ggml_build_forward_expand(g.graph, t);
+    }
   }
   for (ggml_tensor *t : g.dsa_kv_out) {
     ggml_set_output(t);
     ggml_build_forward_expand(g.graph, t);
+  }
+  if (!g.decode_mode) {
+    for (const Glm5nextIndexerLayer &state : g.glm5next_indexer_layers) {
+      if (!state.key_gate_out)
+        return false;
+      ggml_set_output(state.key_gate_out);
+      ggml_build_forward_expand(g.graph, state.key_gate_out);
+      if (state.pooled_out) {
+        ggml_set_output(state.pooled_out);
+        ggml_build_forward_expand(g.graph, state.pooled_out);
+      }
+    }
   }
   if (!graph_alloc_vram_headroom_ok(g, "[GGML-GLM5NEXT-FULL]"))
     return false;
@@ -3465,6 +4258,7 @@ int glm5next_full_graph_device_expert_layers() {
 void glm5next_full_graph_shutdown() {
   g_graph.reset();
   g_glm5next_source.reset();
+  g_glm5next_decode_disabled_engine = nullptr;
 }
 
 bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
@@ -3476,6 +4270,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->S == S)
     return true;
+  g_glm5next_decode_disabled_engine = nullptr;
 
   // Keep the large source arena alive while releasing only the old
   // prompt-shaped graph.  This is what makes boot preload useful for a later
@@ -3483,7 +4278,8 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (g_graph && g_graph->has_expert_source()) {
     if (!g_glm5next_source)
       g_glm5next_source = std::make_unique<FullGraph>();
-    g_graph->move_expert_source_to(*g_glm5next_source);
+    if (!g_graph->move_expert_source_to(*g_glm5next_source))
+      return false;
   }
   g_graph.reset();
   auto g = std::make_unique<FullGraph>();
@@ -3499,6 +4295,12 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->d_conv = c.ssm_conv_kernel;
   g->qk_nope = c.qk_nope;
   g->kv_lora = c.kv_lora;
+  g->indexer_heads = c.glm5next_indexer_head_count;
+  g->indexer_key_length = c.glm5next_indexer_key_length;
+  g->indexer_top_k = c.glm5next_indexer_top_k;
+  g->indexer_kpool = c.glm5next_indexer_kpool;
+  g->indexer_select_tail =
+      engine.model_file.get_config_int("attention.indexer.kpool_select_tail", 0) != 0;
   g->v_head = c.v_head;
   g->first_dense = c.first_dense;
   g->device_expert_layers = std::min(glm5next_full_graph_device_expert_layers(),
@@ -3512,7 +4314,8 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
 
   if (g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, *g)) {
-    g_glm5next_source->move_expert_source_to(*g);
+    if (!g_glm5next_source->move_expert_source_to(*g))
+      return false;
     LOG_INFO("[GGML-GLM5NEXT-FULL] reusing boot expert source: %.2f GiB DDR; "
              "no SSD reload for prompt S=%d\n",
              (double)g->expert_source_used / (1024.0 * 1024.0 * 1024.0), S);
@@ -3533,6 +4336,380 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   }
   g_graph = std::move(g);
   LOG_INFO("[GGML-GLM5NEXT-FULL] graph prepared for S=%d\n", S);
+  return true;
+}
+
+static void transpose_glm5next_state(float *dst, const float *src, int hd,
+                                      int heads) {
+  const size_t plane = (size_t)hd * hd;
+  for (int h = 0; h < heads; ++h)
+    for (int row = 0; row < hd; ++row)
+      for (int col = 0; col < hd; ++col)
+        dst[(size_t)h * plane + (size_t)row * hd + col] =
+            src[(size_t)h * plane + (size_t)col * hd + row];
+}
+
+static bool sync_glm5next_decode_state_to_host(FullGraph &g) {
+  if (!g.decode_mode || !g.ready || !g.engine || g.decode_last_pos < 0)
+    return false;
+  StreamingEngine &engine = *g.engine;
+  const size_t state_n = (size_t)g.hd * g.hd * g.H;
+  const size_t hist_n = (size_t)(g.d_conv - 1) * 3 * g.d_inner;
+  std::vector<float> state(state_n);
+  for (size_t i = 0; i < g.kda_layers.size(); ++i) {
+    const int layer = g.kda_layers[i];
+    if (layer < 0 || layer >= (int)engine.glm5next_recur_state.size() ||
+        layer >= (int)engine.glm5next_conv_history.size() ||
+        engine.glm5next_recur_state[layer].size() != state_n ||
+        engine.glm5next_conv_history[layer].size() != hist_n ||
+        i >= g.kda_state_storage.size() || i >= g.kda_hist_storage.size())
+      return false;
+    ggml_backend_tensor_get(g.kda_state_storage[i], state.data(), 0,
+                            state_n * sizeof(float));
+    transpose_glm5next_state(engine.glm5next_recur_state[layer].data(),
+                             state.data(), g.hd, g.H);
+    ggml_backend_tensor_get(g.kda_hist_storage[i],
+                            engine.glm5next_conv_history[layer].data(), 0,
+                            hist_n * sizeof(float));
+  }
+
+  const int valid_rows =
+      std::min(g.decode_last_pos + 1, std::max(0, engine.max_t));
+  const size_t kv_n = (size_t)valid_rows * g.kv_lora;
+  std::vector<ggml_fp16_t> half_cache(kv_n);
+  std::vector<float> cache(kv_n);
+  for (size_t i = 0; i < g.dsa_layers.size(); ++i) {
+    const int layer = g.dsa_layers[i];
+    if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        i >= g.dsa_kv_storage.size())
+      return false;
+    if (kv_n == 0)
+      continue;
+    ggml_backend_tensor_get(g.dsa_kv_storage[i], half_cache.data(), 0,
+                            kv_n * sizeof(ggml_fp16_t));
+    for (size_t j = 0; j < kv_n; ++j)
+      cache[j] = ggml_fp16_to_fp32(half_cache[j]);
+    std::memcpy(engine.Lc[layer], cache.data(), kv_n * sizeof(float));
+  }
+  return true;
+}
+
+bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
+                                        const int *) {
+  if (!env_enabled() || engine.mtp_enabled || pos_base < 0 ||
+      engine.family_ops.family != ModelFamily::GLM5NEXT || engine.max_t <= 0 ||
+      pos_base >= engine.max_t)
+    return false;
+  if (g_glm5next_decode_disabled_engine == &engine)
+    return false;
+  const auto &c = engine.model_file.architecture_config;
+  const int64_t rounded_capacity =
+      ((int64_t)engine.max_t + 255) & ~((int64_t)255);
+  if (rounded_capacity <= 0 || rounded_capacity > INT_MAX)
+    return false;
+  const int capacity = static_cast<int>(rounded_capacity);
+
+  if (g_graph && g_graph->ready && g_graph->engine == &engine &&
+      g_graph->decode_mode && g_graph->kv_capacity >= pos_base + 1 &&
+      g_graph->decode_last_pos + 1 == pos_base)
+    return true;
+
+  if (g_graph && g_graph->ready && g_graph->decode_mode &&
+      g_graph->engine == &engine &&
+      !sync_glm5next_decode_state_to_host(*g_graph)) {
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  }
+
+  auto g = std::make_unique<FullGraph>();
+  g->engine = &engine;
+  g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+  g->S = 1;
+  g->decode_mode = true;
+  g->kv_capacity = capacity;
+  g->decode_last_pos = pos_base - 1;
+  g->D = c.hidden;
+  g->HC = std::max(1, c.hc_mult);
+  g->n_layers = c.n_layers;
+  g->H = c.n_heads;
+  g->hd = c.kda_head_dim;
+  g->d_inner = g->H * g->hd;
+  g->d_conv = c.ssm_conv_kernel;
+  g->qk_nope = c.qk_nope;
+  g->kv_lora = c.kv_lora;
+  g->indexer_heads = c.glm5next_indexer_head_count;
+  g->indexer_key_length = c.glm5next_indexer_key_length;
+  g->indexer_top_k = c.glm5next_indexer_top_k;
+  g->indexer_kpool = c.glm5next_indexer_kpool;
+  g->indexer_select_tail =
+      engine.model_file.get_config_int("attention.indexer.kpool_select_tail", 0) != 0;
+  g->v_head = c.v_head;
+  g->first_dense = c.first_dense;
+  g->device_expert_layers = std::min(
+      glm5next_full_graph_device_expert_layers(),
+      std::max(0, c.n_layers - c.first_dense));
+  if (configure_partial_experts(*g))
+    g->device_expert_layers = 0;
+
+  // Sparse decode requires prompt-computed indexer keys and complete KPool
+  // summaries. Carry those across the prompt->decode graph replacement only
+  // when the prompt graph actually produced a matching seed for every owner.
+  std::vector<Glm5nextIndexerSeed> indexer_seeds;
+  int expected_indexer_owners = 0;
+  if (g->indexer_kpool > 1 && g->indexer_top_k > 0 &&
+      g->indexer_top_k % g->indexer_kpool == 0 &&
+      g_graph && g_graph->ready && !g_graph->decode_mode &&
+      g_graph->engine == &engine && g_graph->S == pos_base &&
+      g_graph->indexer_key_length == g->indexer_key_length &&
+      g_graph->indexer_kpool == g->indexer_kpool) {
+    for (int l = 0; l < g->n_layers; ++l) {
+      if (!glm5next_is_kda_layer(c, l) && glm5next_indexer_owner(*g, l))
+        ++expected_indexer_owners;
+    }
+    bool seeds_match = expected_indexer_owners > 0 &&
+                       (int)g_graph->glm5next_indexer_seeds.size() ==
+                           expected_indexer_owners;
+    const int expected_pools = pos_base / g->indexer_kpool;
+    for (const Glm5nextIndexerSeed &seed : g_graph->glm5next_indexer_seeds) {
+      seeds_match = seeds_match && seed.token_count == pos_base &&
+                    seed.pool_count == expected_pools &&
+                    seed.key_gate.size() ==
+                        (size_t)2 * g->indexer_key_length * pos_base &&
+                    seed.pooled_keys.size() ==
+                        (size_t)g->indexer_key_length * expected_pools;
+    }
+    if (seeds_match) {
+      g->sparse_decode = true;
+      indexer_seeds = std::move(g_graph->glm5next_indexer_seeds);
+      LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] enabling sparse KPool decode: "
+               "owners=%d top_k=%d kpool=%d prompt=%d\n",
+               expected_indexer_owners, g->indexer_top_k,
+               g->indexer_kpool, pos_base);
+    } else {
+      LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] prompt indexer seeds missing or "
+               "incompatible; keeping dense DSA decode\n");
+    }
+  }
+
+  // Preserve the large, reusable DDR expert source while replacing the
+  // prompt-shaped graph with the fixed S=1 decode topology.
+  bool source_transferred = false;
+  if (g_graph && g_graph->has_expert_source() &&
+      source_configuration_matches(*g_graph, *g)) {
+    if (!g_graph->move_expert_source_to(*g))
+      return false;
+    source_transferred = true;
+  } else if (g_glm5next_source &&
+             source_configuration_matches(*g_glm5next_source, *g)) {
+    if (!g_glm5next_source->move_expert_source_to(*g))
+      return false;
+    source_transferred = true;
+  }
+  g_graph.reset();
+  if (g_glm5next_source && !g_glm5next_source->has_expert_source())
+    g_glm5next_source.reset();
+
+  auto retain_source_on_failure = [&]() {
+    if (!g->has_expert_source())
+      return;
+    if (g_glm5next_source && g_glm5next_source->has_expert_source())
+      g_glm5next_source.reset();
+    if (!g_glm5next_source)
+      g_glm5next_source = std::make_unique<FullGraph>();
+    if (!g->move_expert_source_to(*g_glm5next_source))
+      LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] failed to retain expert "
+                "source after graph decline\n");
+  };
+  auto decline_decode_graph = [&]() {
+    retain_source_on_failure();
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  };
+
+  g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
+  g->cpu = ggml_backend_cpu_init();
+  if (!g->cuda || !g->cpu)
+    return decline_decode_graph();
+  if (!source_transferred && g_glm5next_source &&
+      source_configuration_matches(*g_glm5next_source, *g)) {
+    if (!g_glm5next_source->move_expert_source_to(*g))
+      return decline_decode_graph();
+    source_transferred = true;
+  }
+  if (!source_transferred &&
+      !prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL-DECODE"))
+    return decline_decode_graph();
+  if (!init_expert_arena(*g) || !init_dense_arena(*g) ||
+      !init_decode_state_arena(*g)) {
+    return decline_decode_graph();
+  }
+  ggml_backend_t backends[] = {g->cuda, g->cpu};
+  g->sched =
+      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, true);
+  if (!g->sched || !build_graph(*g)) {
+    LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] graph construction declined; "
+             "using legacy decode\n");
+    return decline_decode_graph();
+  }
+
+  const size_t state_n = (size_t)g->hd * g->hd * g->H;
+  const size_t hist_n = (size_t)(g->d_conv - 1) * 3 * g->d_inner;
+  for (size_t i = 0; i < g->kda_layers.size(); ++i) {
+    const int layer = g->kda_layers[i];
+    if (layer < 0 || layer >= (int)engine.glm5next_recur_state.size() ||
+        layer >= (int)engine.glm5next_conv_history.size() ||
+        engine.glm5next_recur_state[layer].size() != state_n ||
+        engine.glm5next_conv_history[layer].size() != hist_n ||
+        i >= g->kda_state_storage.size() || i >= g->kda_hist_storage.size()) {
+      return decline_decode_graph();
+    }
+    std::vector<float> native_state(state_n);
+    transpose_glm5next_state(native_state.data(),
+                             engine.glm5next_recur_state[layer].data(), g->hd,
+                             g->H);
+    ggml_backend_tensor_set(g->kda_state_storage[i], native_state.data(), 0,
+                            state_n * sizeof(float));
+    ggml_backend_tensor_set(g->kda_hist_storage[i],
+                            engine.glm5next_conv_history[layer].data(), 0,
+                            hist_n * sizeof(float));
+  }
+
+  for (size_t i = 0; i < g->dsa_layers.size(); ++i) {
+    const int layer = g->dsa_layers[i];
+    if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        i >= g->dsa_kv_storage.size()) {
+      return decline_decode_graph();
+    }
+    ggml_tensor *cache = g->dsa_kv_storage[i];
+    if (cudaMemset(cache->data, 0, ggml_nbytes(cache)) != cudaSuccess) {
+      return decline_decode_graph();
+    }
+    const size_t seed_rows = (size_t)pos_base * g->kv_lora;
+    if (seed_rows > 0) {
+      std::vector<ggml_fp16_t> half_cache(seed_rows);
+      const float *src = engine.Lc[layer];
+      for (size_t j = 0; j < seed_rows; ++j)
+        half_cache[j] = ggml_fp32_to_fp16(src[j]);
+      ggml_backend_tensor_set(cache, half_cache.data(), 0,
+                              seed_rows * sizeof(ggml_fp16_t));
+    }
+  }
+
+  for (Glm5nextIndexerLayer &state : g->glm5next_indexer_layers) {
+    if (!state.key_gate_cache || !state.pooled_cache ||
+        cudaMemset(state.key_gate_cache->data, 0,
+                   ggml_nbytes(state.key_gate_cache)) != cudaSuccess ||
+        cudaMemset(state.pooled_cache->data, 0,
+                   ggml_nbytes(state.pooled_cache)) != cudaSuccess)
+      return decline_decode_graph();
+    const auto seed = std::find_if(
+        indexer_seeds.begin(), indexer_seeds.end(),
+        [&state](const Glm5nextIndexerSeed &candidate) {
+          return candidate.layer == state.layer;
+        });
+    if (seed == indexer_seeds.end() ||
+        seed->key_gate.size() !=
+            (size_t)2 * g->indexer_key_length * pos_base ||
+        seed->pooled_keys.size() !=
+            (size_t)g->indexer_key_length * (pos_base / g->indexer_kpool))
+      return decline_decode_graph();
+    if (!seed->key_gate.empty())
+      ggml_backend_tensor_set(state.key_gate_cache, seed->key_gate.data(), 0,
+                              seed->key_gate.size() * sizeof(float));
+    if (!seed->pooled_keys.empty())
+      ggml_backend_tensor_set(state.pooled_cache, seed->pooled_keys.data(), 0,
+                              seed->pooled_keys.size() * sizeof(float));
+  }
+
+  g->ready = true;
+  g_graph = std::move(g);
+  LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] reusable graph prepared: "
+           "position=%d capacity=%d KDA=%zu DSA=%zu\n",
+           pos_base, capacity, g_graph->kda_layers.size(),
+           g_graph->dsa_layers.size());
+  return true;
+}
+
+bool glm5next_full_graph_decode_run(StreamingEngine &engine,
+                                    float *hidden_states, int pos_base,
+                                    const int *) {
+  if (!env_enabled() || !hidden_states || pos_base < 0 || !g_graph ||
+      !g_graph->ready || !g_graph->decode_mode || g_graph->engine != &engine ||
+      g_graph->S != 1 || pos_base >= g_graph->kv_capacity ||
+      g_graph->decode_last_pos + 1 != pos_base)
+    return false;
+  FullGraph &g = *g_graph;
+  if (engine.hc_stream_buf.size() < (size_t)g.D * g.HC ||
+      !g.input || !g.attn_mask || !g.decode_indices)
+    return false;
+
+  std::memcpy(g.input->data, engine.hc_stream_buf.data(),
+              (size_t)g.D * g.HC * sizeof(float));
+  *static_cast<int32_t *>(g.decode_indices->data) = pos_base;
+  auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
+  for (int k = 0; k < g.kv_capacity; ++k)
+    mask[k] = ggml_fp32_to_fp16(k <= pos_base ? 0.0f : -INFINITY);
+
+  if (g.sparse_decode) {
+    const int kpool = g.indexer_kpool;
+    const int pool_count = g.kv_capacity / kpool;
+    const int complete_pools = (pos_base + 1) / kpool;
+    const int tail_count = (pos_base + 1) % kpool;
+    const int pool_start = (pos_base / kpool) * kpool;
+    auto *pool_mask = static_cast<float *>(g.indexer_pool_mask->data);
+    for (int pool = 0; pool < pool_count; ++pool)
+      pool_mask[pool] = pool < complete_pools ? 0.0f : -INFINITY;
+    auto *update_rows =
+        static_cast<int32_t *>(g.indexer_pool_update_rows->data);
+    for (int i = 0; i < kpool; ++i)
+      update_rows[i] = std::min(pool_start + i, pos_base);
+    *static_cast<int32_t *>(g.indexer_pool_update_index->data) =
+        pos_base / kpool;
+    if (g.indexer_select_tail) {
+      auto *tail_indices =
+          static_cast<int32_t *>(g.indexer_tail_indices->data);
+      auto *tail_mask = static_cast<float *>(g.indexer_tail_mask->data);
+      const int tail_start = complete_pools * kpool;
+      for (int i = 0; i < kpool - 1; ++i) {
+        const bool valid = i < tail_count;
+        tail_indices[i] = valid ? tail_start + i : 0;
+        tail_mask[i] = valid ? 0.0f : -INFINITY;
+      }
+    }
+  }
+
+  const long avail_mb = MemoryGuard::read_available_mb();
+  constexpr long kMinComputeHeadroomMb = 10240;
+  if (avail_mb >= 0 && avail_mb < kMinComputeHeadroomMb) {
+    LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] refusing graph compute: "
+              "MemAvailable=%ld MiB < %ld MiB; falling back to legacy decode\n",
+              avail_mb, kMinComputeHeadroomMb);
+    if (!sync_glm5next_decode_state_to_host(g))
+      LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] host state handoff failed\n");
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  }
+
+  const auto start = std::chrono::steady_clock::now();
+  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
+      GGML_STATUS_SUCCESS) {
+    g.ready = false;
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  }
+  ggml_backend_sched_synchronize(g.sched);
+  const auto synced = std::chrono::steady_clock::now();
+  ggml_backend_tensor_get(g.output, hidden_states, 0,
+                          (size_t)g.D * sizeof(float));
+  g.decode_last_pos = pos_base;
+  engine.glm5next_full_graph_output_ready = true;
+  const auto done = std::chrono::steady_clock::now();
+  const auto ms = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE-TIME] pos=%d sync=%.3f ms "
+           "output_get=%.3f ms total=%.3f ms\n",
+           pos_base, ms(start, synced), ms(synced, done), ms(start, done));
   return true;
 }
 
@@ -3622,6 +4799,38 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                             kv_n * sizeof(float));
     std::memcpy(engine.Lc[l], kv.data(), kv_n * sizeof(float));
   }
+  g.glm5next_indexer_seeds.clear();
+  g.glm5next_indexer_seeds.reserve(g.glm5next_indexer_layers.size());
+  bool indexer_seeds_ok = true;
+  for (const Glm5nextIndexerLayer &state : g.glm5next_indexer_layers) {
+    if (!state.key_gate_out) {
+      indexer_seeds_ok = false;
+      break;
+    }
+    Glm5nextIndexerSeed seed;
+    seed.layer = state.layer;
+    seed.token_count = g.S;
+    seed.pool_count = g.indexer_kpool > 1 ? g.S / g.indexer_kpool : 0;
+    seed.key_gate.resize((size_t)2 * g.indexer_key_length * g.S);
+    seed.pooled_keys.resize(
+        (size_t)g.indexer_key_length * seed.pool_count);
+    ggml_backend_tensor_get(state.key_gate_out, seed.key_gate.data(), 0,
+                            seed.key_gate.size() * sizeof(float));
+    if (seed.pool_count > 0) {
+      if (!state.pooled_out) {
+        indexer_seeds_ok = false;
+        break;
+      }
+      ggml_backend_tensor_get(state.pooled_out, seed.pooled_keys.data(), 0,
+                              seed.pooled_keys.size() * sizeof(float));
+    }
+    g.glm5next_indexer_seeds.push_back(std::move(seed));
+  }
+  if (!indexer_seeds_ok) {
+    g.glm5next_indexer_seeds.clear();
+    LOG_WARN("[GGML-GLM5NEXT-FULL] indexer seed capture unavailable; "
+             "decode will retain dense attention\n");
+  }
   const auto done = std::chrono::steady_clock::now();
   const auto ms = [](auto a, auto b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
@@ -3629,6 +4838,11 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   LOG_INFO("[GGML-GLM5NEXT-FULL-TIME] sync=%.3f ms state_get=%.3f ms "
            "total=%.3f ms\n",
            ms(start, synced), ms(synced, done), ms(start, done));
+  if (!g.glm5next_indexer_seeds.empty())
+    LOG_INFO("[GGML-GLM5NEXT-FULL] captured KPool prompt seeds: layers=%zu "
+             "tokens=%d pools=%d\n",
+             g.glm5next_indexer_seeds.size(), g.S,
+             g.S / std::max(1, g.indexer_kpool));
   engine.glm5next_full_graph_output_ready = true;
   (void)c;
   return true;
@@ -3908,6 +5122,13 @@ bool glm5next_full_graph_prepare(StreamingEngine &, int, int, const int *) {
 }
 bool glm5next_full_graph_run(StreamingEngine &, float *, int, int,
                              const int *) {
+  return false;
+}
+bool glm5next_full_graph_decode_prepare(StreamingEngine &, int, const int *) {
+  return false;
+}
+bool glm5next_full_graph_decode_run(StreamingEngine &, float *, int,
+                                    const int *) {
   return false;
 }
 void glm5next_full_graph_shutdown() {}

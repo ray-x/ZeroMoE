@@ -273,7 +273,7 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
   // graph_ram_arenas for the Qwen CPU/GPU parity path.  Do not reject them
   // here: the validation below supplies the three plane bases and strides
   // consumed by the CPU runner.  The old layer_is_unpacked() guard made the
-  // Bee-style scheduler candidate decline before construction, silently
+  // full graph scheduler candidate decline before construction, silently
   // sending Layer 0 back through the legacy host shared-expert path.
   if (layer_idx < 0 || n_experts <= 0 ||
       !engine.graph_ram_layer_ready(layer_idx))
@@ -425,6 +425,14 @@ static bool qwen_cpu_fused_iq2_iq4_enabled() {
   return enabled;
 }
 
+static bool qwen_cpu_fused_q4_0_enabled() {
+  static const bool enabled = [] {
+    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_Q4_0");
+    return env && env[0] == '1';
+  }();
+  return enabled;
+}
+
 static bool qwen4exp_cpu_strided_grouped_quantized(
     const StreamingEngine &engine, const float *input, float *output,
     const QwenRamCpuMoeLayer &layer,
@@ -439,16 +447,21 @@ static bool qwen4exp_cpu_strided_grouped_quantized(
   const GGUFType gate_type = static_cast<GGUFType>(layer.meta.gate_type);
   const GGUFType up_type = static_cast<GGUFType>(layer.meta.up_type);
   const GGUFType down_type = static_cast<GGUFType>(layer.meta.down_type);
-  if (down_type != GGUFType::IQ4_NL)
-    return false;
+  const bool is_q4_0_combo = gate_type == GGUFType::Q4_0 &&
+                             up_type == GGUFType::Q4_0 &&
+                             down_type == GGUFType::Q4_0;
+  if (!is_q4_0_combo) {
+    if (down_type != GGUFType::IQ4_NL)
+      return false;
 
-  auto grouped_gate_up_supported = [](GGUFType type) {
-    return type == GGUFType::IQ1_M || type == GGUFType::IQ2_XXS ||
-           type == GGUFType::IQ3_XXS;
-  };
-  if (!grouped_gate_up_supported(gate_type) ||
-      !grouped_gate_up_supported(up_type))
-    return false;
+    auto grouped_gate_up_supported = [](GGUFType type) {
+      return type == GGUFType::IQ1_M || type == GGUFType::IQ2_XXS ||
+             type == GGUFType::IQ3_XXS;
+    };
+    if (!grouped_gate_up_supported(gate_type) ||
+        !grouped_gate_up_supported(up_type))
+      return false;
+  }
 
   // Decode has one caller at a time.  Retain capacity across layers/tokens
   // so the fast path does not turn its own dispatch overhead into repeated
@@ -531,6 +544,21 @@ static bool qwen4exp_cpu_strided_grouped_quantized(
         !logged_fused_iq2_iq4.exchange(true, std::memory_order_relaxed))
       LOG_INFO("[CPU-MOE] Qwen fused IQ2_XXS gate/up + SwiGLU + IQ4_NL "
                "down probe active (one OpenMP team)\n");
+  }
+  const bool fused_q4_0 =
+      (qwen_cpu_fused_grouped_enabled(engine) ||
+       qwen_cpu_fused_q4_0_enabled()) &&
+      is_q4_0_combo;
+  if (!fused_done && fused_q4_0) {
+    fused_done = matmul_qwen_q4_0_q4_0_fused(
+        scratch.gate.data(), scratch.up.data(), scratch.down.data(), input,
+        scratch.gate_w.data(), scratch.up_w.data(), scratch.down_w.data(),
+        topk, D, moe_inter, D);
+    static std::atomic<bool> logged_fused_q4_0{false};
+    if (fused_done &&
+        !logged_fused_q4_0.exchange(true, std::memory_order_relaxed))
+      LOG_INFO("[CPU-MOE] Qwen fused Q4_0 gate/up + SwiGLU + Q4_0 down "
+               "probe active (one OpenMP team)\n");
   }
 
   StageClock::time_point stage_start;
@@ -760,7 +788,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       bool qwen_cpu_direct_grouped = false;
 
       // The compact A/B keeps the source in the preloaded DDR slabs but gives
-      // GGML the same per-projection contiguous expert layout that Bee uses.
+      // GGML the same per-projection contiguous expert layout that llama.cpp uses.
       // It is intentionally constructed from the exact routed IDs, so this
       // does not copy the other 502 experts in a Qwen layer.
       auto run_qwen_cpu_graph = [&](float *result) {
@@ -815,7 +843,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // Keep the actual DDR-backed routed expert work separate from the
       // device shared-FFN enqueue and HC event handoff.  The ordinary
       // t_moe_expert bucket intentionally includes both, which is useful for
-      // request throughput but cannot explain the gap to Bee's CPU split.
+      // request throughput but cannot explain the gap to llama.cpp's CPU split.
       auto run_qwen_cpu_graph_timed = [&](float *result) {
         const auto start = std::chrono::high_resolution_clock::now();
         // Keep the first non-finite value visible at the CPU/GPU MoE seam.

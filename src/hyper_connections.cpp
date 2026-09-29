@@ -430,7 +430,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   // Diagnostic-only: mirror ggml_hc_backend.cpp's internal-dump instrument
   // (same env var, same file-naming scheme) for this CPU path, so a run with
   // hc_ggml=false is directly diffable against the GPU path's dumps and
-  // against Bee/llama.cpp's own captures. Restricted to S=1 / layers 0-1,
+  // against llama.cpp's own captures. Restricted to S=1 / layers 0-1,
   // like the GPU path; a no-op cost (one getenv + string compares) when the
   // env var is unset.
   const bool sub0 = norm_name.find("hc_attn_") != std::string::npos;

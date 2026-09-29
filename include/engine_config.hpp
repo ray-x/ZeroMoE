@@ -1562,7 +1562,7 @@ struct EngineConfig {
   // (a pure global ranking, some layers may get zero pins).
   int pin_global_floor_per_layer = 1;
 
-  // Experimental BeeLLama-style placement: fill the VRAM expert cache in
+  // Experimental llama.cpp-style placement: fill the VRAM expert cache in
   // ascending layer order, starting at layer 0, until the cache is full.
   // The value is an exclusive layer boundary; zero keeps the normal
   // usage-ranked preload strategy.
@@ -1869,7 +1869,7 @@ struct EngineConfig {
   bool cpu_dot_ggml_avx2 = false;
 
   // Qwen4Exp-only CPU expert fallback: use ggml's IQ1_M x Q8_K kernel
-  // (the same family used by BeeLlama) instead of row dequant + FP32 dot.
+  // (the same family used by llama.cpp) instead of row dequant + FP32 dot.
   // Off by default so other model families and their existing CPU paths are
   // unchanged; enable only after an end-to-end Qwen CPU-layer A/B.
   bool cpu_dot_ggml_iq1m = false;

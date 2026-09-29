@@ -642,7 +642,7 @@ inline bool& cpu_dot_ggml_avx2_flag() {
 inline bool cpu_dot_ggml_avx2_enabled() { return cpu_dot_ggml_avx2_flag(); }
 inline void enable_cpu_dot_ggml_avx2() { cpu_dot_ggml_avx2_flag() = true; }
 
-// Qwen4Exp-only CPU path.  It mirrors BeeLlama's ggml IQ1_M x Q8_K route
+// Qwen4Exp-only CPU path.  It mirrors llama.cpp's ggml IQ1_M x Q8_K route
 // and is deliberately independent of the GLM IQ2/IQ3 AVX2 experiment above.
 // Note that GGML's IQ1_M kernel is AVX2-width in the current dependency even
 // when the process was built with AVX-512/VNNI enabled; the Qwen-only

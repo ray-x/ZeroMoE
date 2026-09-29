@@ -434,7 +434,7 @@ static bool qwen4exp_decode_device_router_gemv_enabled() {
   return enabled;
 }
 
-// Bee-style whole-graph decode topology is deliberately Qwen-only and
+// Full-graph decode topology is deliberately Qwen-only and
 // config-gated while it is being validated.  It is safe only for a layer
 // backed by the immutable fixed-stride DDR arena: a scheduler graph cannot
 // point one MUL_MAT_ID tensor at a changing set of lazy cache slots.  If the
@@ -668,7 +668,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
     }
   }
 
-  // Bee-style decode topology experiment.  This is placed before the
+  // Full-graph decode topology experiment.  This is placed before the
   // ordinary host-router block so the CUDA router and the DDR-backed CPU
   // MUL_MAT_ID expert graph are submitted as one scheduler graph.  It is
   // intentionally conservative:
@@ -705,7 +705,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       engine.qwen4exp_device_hc_ffn_input &&
       moe_ggml_shared_expert() && c.n_expert_shared > 0 &&
       // Projection-compact arenas have independent gate/up/down expert
-      // strides.  The Bee-style scheduler graph has one common stride
+      // strides.  The full graph scheduler has one common stride
       // contract, so declining here avoids repeated rebuild/reject attempts
       // and routes these layers through the parity-verified per-expert CPU
       // references in token_dispatch_pipeline.cpp.
@@ -925,7 +925,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
             static std::atomic<bool> logged_scheduler{false};
             if (!logged_scheduler.exchange(true, std::memory_order_relaxed))
               LOG_INFO(
-                  "[GGML-QWEN-DECODE-SCHED] Bee-style CUDA-router + "
+                  "[GGML-QWEN-DECODE-SCHED] full-graph CUDA-router + "
                   "DDR-CPU-expert topology active; lazy layers fall back to "
                   "the existing cache path\n");
             return true;
@@ -1071,7 +1071,7 @@ bool MoeRouterService::route(MoePipelineContext &context) {
     // any future norm-bearing variant remain on the established host route.
     // The graph also implements only the Qwen softmax semantics.
     // CPU-affinity controls expert execution, not necessarily route
-    // selection.  BeeLlama's CPU expert split receives IDs/weights produced
+    // selection.  llama.cpp's CPU expert split receives IDs/weights produced
     // by the CUDA graph.  Keep that option available for Qwen too: when
     // qwen4exp_decode_gpu_router is enabled during S==1 decode, a
     // CPU-affinity layer still executes all routed expert projections on the

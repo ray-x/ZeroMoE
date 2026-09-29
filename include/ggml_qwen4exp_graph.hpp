@@ -26,7 +26,7 @@ int qwen4exp_full_graph_device_expert_layers();
 bool qwen4exp_full_graph_device_expert_trailing();
 
 // Build/rebuild the graph for a prompt shape.  This is intended to run before
-// the measured prefill window, just as Bee builds its graph before execution.
+// the measured prefill window, just as llama.cpp builds its graph before execution.
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S,
                                  int pos_base, const int *token_ids);
 

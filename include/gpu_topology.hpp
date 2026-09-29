@@ -877,15 +877,15 @@ public:
             // graph capture/replay, see MOESTREAM_ENABLE_CUDA_GRAPHS),
             // BlockingSync's per-call OS wake-up/context-switch latency
             // (~40us median) was directly measured -- via nsys cuda_api_sum,
-            // matched 22/48-GPU-resident-layer config against beellama's own
+            // matched 22/48-GPU-resident-layer config against llama.cpp's own
             // reference (~3.9us median for the equivalent call) -- to cost
             // ~4-5ms of every ~50ms decode step with NO corresponding GPU
             // work to show for it (kernel-busy + memcpy time per token
             // together only account for ~1.8ms of that gap). Switching to
-            // Auto closed the entire remaining throughput gap to beellama on
+            // Auto closed the entire remaining throughput gap to llama.cpp on
             // that path: full-graph decode went from ~20 tok/s to ~26 tok/s
-            // (beellama's own reference: ~25.2 tok/s), reproduced twice.
-            // BeeLlama itself never overrides CUDA scheduling mode at all,
+            // (llama.cpp's own reference: ~25.2 tok/s), reproduced twice.
+            // llama.cpp itself never overrides CUDA scheduling mode at all,
             // i.e. its equivalent is already cudaDeviceScheduleAuto.
             // Defaulting to Auto here matches that and wins on the now-
             // primary full-graph path; MOESTREAM_CUDA_SCHEDULE=blocking

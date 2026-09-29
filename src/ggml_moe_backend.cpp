@@ -188,7 +188,7 @@ bool copy_router_tensor_to_host(int device, const ggml_tensor *tensor,
 
 bool backend_stream_copy_override = false;
 
-// "Bee-style" H2D-queued-on-shared-GGML-stream mode (MOESTREAM_GGML_BACKEND_
+// H2D-queued-on-shared-GGML-stream mode (MOESTREAM_GGML_BACKEND_
 // STREAM_COPY=1 or the override flag above). TRIED earlier this session:
 // gave no measurable improvement over the plain copy_stream_ path (61.70 vs
 // 62.72 tok/s baseline) -- left OFF by default. RE-VERIFIED 2026-09-10
@@ -209,7 +209,7 @@ bool use_backend_stream_copies() {
 
 // The HC runner and the router share the same CUDA backend.  In the normal
 // path the router copies HC's [D,S] result into one persistent input tensor
-// before every route graph.  Bee's full graph passes the preceding activation
+// before every route graph.  llama.cpp's full graph passes the preceding activation
 // directly to the router node, so the copy is unnecessary when the producer
 // tensor is already on this device.  Keep this as an A/B switch until the
 // direct-input lifetime and numerical result have been verified on the real

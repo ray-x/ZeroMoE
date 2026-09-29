@@ -103,7 +103,7 @@ void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
            sum, tensor->data);
 
   // Optional one-shot binary snapshots make the CPU graph boundary directly
-  // comparable with Bee's per-expert dumps.  Keep this opt-in and write only
+  // comparable with llama.cpp's per-expert dumps.  Keep this opt-in and write only
   // the first instance of each role: a diagnostic prefill may execute many
   // S=1 positions, but position 0 is the parity boundary we are auditing.
   const char *dump_dir = std::getenv("MOESTREAM_QWEN4EXP_DIAG_DUMP_DIR");
@@ -367,10 +367,23 @@ inline uint64_t direct_next_phase(uint64_t phase, int command) {
 
 bool qwen_cpu_direct_gate_type(uint32_t type) {
   return type == GGML_TYPE_IQ1_M || type == GGML_TYPE_IQ2_XXS ||
-         type == GGML_TYPE_IQ3_XXS;
+         type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_Q4_0 ||
+         type == GGML_TYPE_Q2_0;
 }
 
 size_t qwen_cpu_direct_gate_row_bytes(uint32_t type, int d_model) {
+  // Q2_0 uses 64 weights per 18-byte block.
+  if (type == GGML_TYPE_Q2_0)
+    return (d_model > 0 && d_model % 64 == 0)
+               ? static_cast<size_t>(d_model / 64) * 18
+               : 0;
+  // Q4_0 has a 32-element block (not the 256-element Q8_K-style block the
+  // IQ1_M/IQ2_XXS/IQ3_XXS cases below use), so it needs its own precondition
+  // rather than sharing the "d_model % 256" guard.
+  if (type == GGML_TYPE_Q4_0)
+    return (d_model > 0 && d_model % 32 == 0)
+               ? static_cast<size_t>(d_model / 32) * sizeof(block_q4_0)
+               : 0;
   if (d_model <= 0 || d_model % 256 != 0)
     return 0;
   const size_t blocks = static_cast<size_t>(d_model / 256);
@@ -388,6 +401,14 @@ size_t qwen_cpu_direct_gate_row_bytes(uint32_t type, int d_model) {
 
 bool qwen_cpu_direct_is_iq4_nl(uint32_t type, int d_ff) {
   return type == GGML_TYPE_IQ4_NL && d_ff > 0 && d_ff % 32 == 0;
+}
+
+bool qwen_cpu_direct_is_q4_0(uint32_t type, int d_ff) {
+  return type == GGML_TYPE_Q4_0 && d_ff > 0 && d_ff % 32 == 0;
+}
+
+bool qwen_cpu_direct_is_q2_0(uint32_t type, int d_ff) {
+  return type == GGML_TYPE_Q2_0 && d_ff > 0 && d_ff % 64 == 0;
 }
 
 inline void qwen_cpu_direct_pause() {
@@ -785,11 +806,22 @@ bool GgmlQwenCpuMoeRunner::direct_signature_supported(
       qwen_cpu_direct_gate_row_bytes(ref.gate_type, d_model);
   const size_t up_row_bytes =
       qwen_cpu_direct_gate_row_bytes(ref.up_type, d_model);
-  const size_t down_row_bytes =
-      d_ff > 0 && d_ff % 32 == 0 ? static_cast<size_t>(d_ff / 32) * 18 : 0;
+  const bool q2_0_pair = ref.gate_type == GGML_TYPE_Q2_0 &&
+                         ref.up_type == GGML_TYPE_Q2_0 &&
+                         ref.down_type == GGML_TYPE_Q2_0;
+  const bool has_q2_0 = ref.gate_type == GGML_TYPE_Q2_0 ||
+                        ref.up_type == GGML_TYPE_Q2_0 ||
+                        ref.down_type == GGML_TYPE_Q2_0;
+  const size_t down_row_bytes = qwen_cpu_direct_is_q2_0(ref.down_type, d_ff)
+                                    ? static_cast<size_t>(d_ff / 64) * 18
+                                    : (d_ff > 0 && d_ff % 32 == 0
+                                           ? static_cast<size_t>(d_ff / 32) * 18
+                                           : 0);
   const bool gate_type_ok = qwen_cpu_direct_gate_type(ref.gate_type);
   const bool up_type_ok = qwen_cpu_direct_gate_type(ref.up_type);
-  const bool down_type_ok = qwen_cpu_direct_is_iq4_nl(ref.down_type, d_ff);
+  const bool down_type_ok = qwen_cpu_direct_is_iq4_nl(ref.down_type, d_ff) ||
+                            qwen_cpu_direct_is_q4_0(ref.down_type, d_ff) ||
+                            qwen_cpu_direct_is_q2_0(ref.down_type, d_ff);
   const bool dims_ok = d_model > 0 && d_ff > 0 && topk > 0;
   const bool row_bytes_ok = gate_row_bytes != 0 && up_row_bytes != 0 &&
                             down_row_bytes != 0;
@@ -803,6 +835,10 @@ bool GgmlQwenCpuMoeRunner::direct_signature_supported(
                                ref.down_bytes >= down_row_bytes * d_model;
   const bool supported = gate_type_ok && up_type_ok && down_type_ok &&
                          dims_ok && stride_ok && source_bytes_ok;
+  // Q2_0 bypasses the worker-pool graph only through its complete fused
+  // implementation; otherwise the regular GGML graph remains the fallback.
+  const bool q2_0_route_ok =
+      !has_q2_0 || (q2_0_pair && qwen_cpu_direct_fused_enabled());
   if (!supported && qwen_cpu_direct_diag_enabled()) {
     static std::atomic<int> diagnostic_count{0};
     if (diagnostic_count.fetch_add(1, std::memory_order_relaxed) < 64) {
@@ -824,7 +860,7 @@ bool GgmlQwenCpuMoeRunner::direct_signature_supported(
           dims_ok, row_bytes_ok, stride_ok, source_bytes_ok);
     }
   }
-  return supported;
+  return supported && q2_0_route_ok;
 }
 
 bool GgmlQwenCpuMoeRunner::ensure_direct_signature(
@@ -899,11 +935,21 @@ bool GgmlQwenCpuMoeRunner::ensure_direct_signature(
 
 bool GgmlQwenCpuMoeRunner::run_direct_fused_request(
     const AsyncStridedRequest &request) {
+  const bool is_iq_iq4_nl_combo =
+      (request.layer.gate_type == GGML_TYPE_IQ1_M ||
+       request.layer.gate_type == GGML_TYPE_IQ2_XXS) &&
+      request.layer.up_type == request.layer.gate_type &&
+      request.layer.down_type == GGML_TYPE_IQ4_NL;
+  const bool is_q4_0_combo =
+      request.layer.gate_type == GGML_TYPE_Q4_0 &&
+      request.layer.up_type == GGML_TYPE_Q4_0 &&
+      request.layer.down_type == GGML_TYPE_Q4_0;
+  const bool is_q2_0_combo =
+      request.layer.gate_type == GGML_TYPE_Q2_0 &&
+      request.layer.up_type == GGML_TYPE_Q2_0 &&
+      request.layer.down_type == GGML_TYPE_Q2_0;
   if (!qwen_cpu_direct_fused_enabled() ||
-      (request.layer.gate_type != GGML_TYPE_IQ1_M &&
-       request.layer.gate_type != GGML_TYPE_IQ2_XXS) ||
-      request.layer.up_type != request.layer.gate_type ||
-      request.layer.down_type != GGML_TYPE_IQ4_NL ||
+      (!is_iq_iq4_nl_combo && !is_q4_0_combo && !is_q2_0_combo) ||
       !direct_ready_ || request.topk <= 0 ||
       request.topk > static_cast<int>(direct_fused_gate_output_ptrs_.size()))
     return false;
@@ -932,7 +978,25 @@ bool GgmlQwenCpuMoeRunner::run_direct_fused_request(
 
   const int team_threads = std::max(1, direct_threads_);
   bool ok = false;
-  if (request.layer.gate_type == GGML_TYPE_IQ1_M) {
+  if (request.layer.gate_type == GGML_TYPE_Q2_0) {
+    ok = matmul_qwen_q2_0_q2_0_fused(
+        direct_fused_gate_output_ptrs_.data(),
+        direct_fused_up_output_ptrs_.data(),
+        direct_fused_down_output_ptrs_.data(), request.input,
+        direct_fused_gate_weight_ptrs_.data(),
+        direct_fused_up_weight_ptrs_.data(),
+        direct_fused_down_weight_ptrs_.data(), request.topk, request.d_model,
+        request.d_ff, request.d_model, team_threads);
+  } else if (request.layer.gate_type == GGML_TYPE_Q4_0) {
+    ok = matmul_qwen_q4_0_q4_0_fused(
+        direct_fused_gate_output_ptrs_.data(),
+        direct_fused_up_output_ptrs_.data(),
+        direct_fused_down_output_ptrs_.data(), request.input,
+        direct_fused_gate_weight_ptrs_.data(),
+        direct_fused_up_weight_ptrs_.data(),
+        direct_fused_down_weight_ptrs_.data(), request.topk, request.d_model,
+        request.d_ff, request.d_model, team_threads);
+  } else if (request.layer.gate_type == GGML_TYPE_IQ1_M) {
     ok = matmul_qwen_iq1_m_iq4_nl_fused(
         direct_fused_gate_output_ptrs_.data(),
         direct_fused_up_output_ptrs_.data(),
@@ -976,7 +1040,11 @@ bool GgmlQwenCpuMoeRunner::run_direct_fused_request(
     LOG_INFO("[QWEN-CPU-DIRECT-FUSED] math=%.3f reduce=%.3f total=%.3f "
              "threads=%d type=%s topk=%d\n",
              math_ms, reduce_ms, total_ms, team_threads,
-             request.layer.gate_type == GGML_TYPE_IQ1_M ? "IQ1_M" : "IQ2_XXS",
+             request.layer.gate_type == GGML_TYPE_Q2_0
+                 ? "Q2_0"
+                 : (request.layer.gate_type == GGML_TYPE_Q4_0 ? "Q4_0"
+                 : (request.layer.gate_type == GGML_TYPE_IQ1_M ? "IQ1_M"
+                                                                : "IQ2_XXS")),
              request.topk);
   }
   if (request.completion)
@@ -1016,7 +1084,9 @@ bool GgmlQwenCpuMoeRunner::submit_direct_request(
   const size_t up_row_bytes =
       qwen_cpu_direct_gate_row_bytes(request.layer.up_type, request.d_model);
   const size_t down_row_bytes =
-      static_cast<size_t>(request.d_ff / 32) * 18;
+      request.layer.down_type == GGML_TYPE_Q2_0
+          ? static_cast<size_t>(request.d_ff / 64) * 18
+          : static_cast<size_t>(request.d_ff / 32) * 18;
   for (int m = 0; m < request.topk; ++m) {
     const int expert_id = request.expert_ids[m];
     const uint8_t *gate_base = static_cast<const uint8_t *>(request.gate_plane) +
@@ -1295,11 +1365,16 @@ void GgmlQwenCpuMoeRunner::run_direct_caller_phases(
 
 bool GgmlQwenCpuMoeRunner::run_direct_request(
     const AsyncStridedRequest &request) {
-  if (qwen_cpu_direct_fused_enabled() &&
-      (request.layer.gate_type == GGML_TYPE_IQ1_M ||
-       request.layer.gate_type == GGML_TYPE_IQ2_XXS) &&
+  const bool fused_eligible =
       request.layer.gate_type == request.layer.up_type &&
-      request.layer.down_type == GGML_TYPE_IQ4_NL) {
+      ((request.layer.gate_type == GGML_TYPE_Q4_0 &&
+        request.layer.down_type == GGML_TYPE_Q4_0) ||
+       (request.layer.gate_type == GGML_TYPE_Q2_0 &&
+        request.layer.down_type == GGML_TYPE_Q2_0) ||
+       ((request.layer.gate_type == GGML_TYPE_IQ1_M ||
+         request.layer.gate_type == GGML_TYPE_IQ2_XXS) &&
+        request.layer.down_type == GGML_TYPE_IQ4_NL));
+  if (qwen_cpu_direct_fused_enabled() && fused_eligible) {
     if (run_direct_fused_request(request))
       return true;
   }
@@ -1836,7 +1911,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
     // The Qwen DDR arena stores each expert as [gate|up|down].  When gate and
     // up have the same quantization/layout, the first two planes are already
     // one contiguous [d_model, 2*d_ff] matrix per expert.  This mirrors
-    // BeeLlama's merged gate_up MUL_MAT_ID without copying or changing the
+    // llama.cpp's merged gate_up MUL_MAT_ID without copying or changing the
     // arena ownership contract.
     gate_up = ggml_new_tensor_3d(wctx, gate_type, d_model,
                                  static_cast<int64_t>(d_ff) * 2, n_experts);

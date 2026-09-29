@@ -17,7 +17,7 @@ bool deepseek_v4_full_graph_enabled();
 int deepseek_v4_full_graph_device_expert_layers();
 
 // Build or reuse a graph for a position-zero prefill of length S.  Preparation
-// is outside the measured prefill window, matching BeeLLama's graph setup.
+// is outside the measured prefill window, matching llama.cpp's graph setup.
 bool deepseek_v4_full_graph_prepare(StreamingEngine &engine, int S,
                                     int pos_base, const int *token_ids);
 

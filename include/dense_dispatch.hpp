@@ -86,7 +86,7 @@ inline void set_moe_prefill_batched(bool v) { moe_prefill_batched_flag() = v; }
 
 // --- moe_decode_batched (EngineConfig, default OFF) -----------------------
 // Decode-time (S==1) counterpart to moe_prefill_batched, from the
-// MoEStream-vs-beellama decode-gap investigation (2026-09-10). A live
+// MoEStream-vs-llama.cpp decode-gap investigation (2026-09-10). A live
 // measurement found the `expert` dispatch bucket at ~77% of decode wall
 // time, with the actual GPU matmul inside it only ~7% of that bucket --
 // the rest is dispatch_expert_k's per-expert VRAM-cache bookkeeping
@@ -95,7 +95,7 @@ inline void set_moe_prefill_batched(bool v) { moe_prefill_batched_flag() = v; }
 // for EVERY one of topk x n_layers expert lookups, every decode token --
 // even when the whole expert set is already 100% RAM-resident
 // (ram_preload_all_experts) and no miss is possible for the session's
-// lifetime. beellama/llama.cpp instead decide weight placement ONCE at
+// lifetime. llama.cpp instead decide weight placement ONCE at
 // load time (`-ncmoe`) and never revisit it per token (see this
 // project's own [[llamacpp-op-offload-is-the-lever]] /
 // [[moe-expert-dispatch-not-batched]] memory).

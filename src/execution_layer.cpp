@@ -1006,15 +1006,19 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // unrelated token rediscovering an earlier token's stale fetch record.
   advance_token_step();
 
-  // The Bee-style full graph paths submit the complete trunk in one GGML
+  // The full graph paths submit the complete trunk in one GGML
   // scheduler call.  They return true only after producing final [S,D]
   // output; otherwise the established layer loop remains the fallback.
   engine.qwen4exp_full_graph_output_ready = false;
   engine.qwen4exp_full_graph_logits_ready = false;
   engine.glm5next_full_graph_output_ready = false;
   engine.deepseek_v4_full_graph_output_ready = false;
-  if (S > 1 && pos_base == 0 && qwen4exp_full_graph_enabled() &&
-      qwen4exp_full_graph_run(engine, hidden_states, S, pos_base, token_ids)) {
+  const auto &graph_ops = engine.family_ops.graph_ops;
+  const ModelGraphRequest prefill_graph_request{
+      ModelGraphPhase::Prefill, S, pos_base, token_ids, hidden_states};
+  if (S > 1 && pos_base == 0 && graph_ops.enabled && graph_ops.run &&
+      graph_ops.enabled(engine, ModelGraphPhase::Prefill) &&
+      graph_ops.run(engine, prefill_graph_request)) {
     return;
   }
   // Run the diagnostic before the production decode graph's early return;
@@ -1023,22 +1027,18 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // the live recurrent/KV owners.
   if (S == 1 && pos_base >= 0)
     qwen4exp_two_layer_s1_diag_run(engine, pos_base, token_ids);
-  if (S == 1 && pos_base >= 0 && qwen4exp_full_graph_decode_enabled() &&
-      qwen4exp_full_graph_decode_prepare(engine, pos_base, token_ids) &&
-      qwen4exp_full_graph_decode_run(engine, hidden_states, pos_base,
-                                     token_ids,
-                                     engine.qwen4exp_full_graph_logits_target,
-                                     engine.qwen4exp_full_graph_logits_target_size)) {
-    return;
-  }
-  if (S > 1 && pos_base == 0 && glm5next_full_graph_enabled() &&
-      !engine.mtp_enabled &&
-      glm5next_full_graph_run(engine, hidden_states, S, pos_base, token_ids)) {
-    return;
-  }
-  if (S > 1 && pos_base == 0 && deepseek_v4_full_graph_enabled() &&
-      deepseek_v4_full_graph_run(engine, hidden_states, S, pos_base,
-                                 token_ids)) {
+  const ModelGraphRequest decode_graph_request{
+      ModelGraphPhase::Decode,
+      S,
+      pos_base,
+      token_ids,
+      hidden_states,
+      engine.qwen4exp_full_graph_logits_target,
+      engine.qwen4exp_full_graph_logits_target_size};
+  if (S == 1 && pos_base >= 0 && graph_ops.enabled && graph_ops.build &&
+      graph_ops.run && graph_ops.enabled(engine, ModelGraphPhase::Decode) &&
+      graph_ops.build(engine, decode_graph_request) &&
+      graph_ops.run(engine, decode_graph_request)) {
     return;
   }
 
@@ -1108,7 +1108,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // A/A diagnostic: after a sparse Qwen PLE layer has modified the
       // host HC copy and committed it back to the device-authoritative
       // runner, capture the actual wide state before hc_pre.  This is the
-      // exact boundary that must equal Bee's previous l_last plus its PLE
+      // exact boundary that must equal llama.cpp's previous l_last plus its PLE
       // gated-value and causal-convolution outputs.  The helper is fully
       // gated by MOESTREAM_PREFILL_BOUNDARY_DUMP and is a no-op normally.
       dump_prefill_hc_streams("hc_streams_post_layer_input", l, pos_base, S,
@@ -1367,7 +1367,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
               diag_ffn_call_start)
               .count();
     // A/A prefill diagnostic: capture the plain routed FFN result before HC
-    // post-combine.  Bee's qwen4exp graph exposes the corresponding
+      // post-combine.  llama.cpp's qwen4exp graph exposes the corresponding
     // ffn_moe_out tensor, so this separates CPU-MoE math from the subsequent
     // HC reduction.  Opt-in through MOESTREAM_PREFILL_BOUNDARY_DUMP; the
     // normal path does no dump or extra device copy.

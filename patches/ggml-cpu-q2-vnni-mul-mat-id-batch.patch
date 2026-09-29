@@ -1,0 +1,28 @@
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
+@@ -1549,8 +1549,22 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+ 
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+ 
+-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+-                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
++                const int64_t ir0_chunk_end = MIN(iir0 + blck_0, ir0_end);
++                if (type == GGML_TYPE_Q2_0) {
++                    int64_t ir0 = iir0;
++                    for (; ir0 + 3 < ir0_chunk_end; ir0 += 4) {
++                        vec_dot(ne00, &tmp[ir0 - iir0], sizeof(float),
++                                src0_cur + ir0*nb01, nb01, src1_col, 0, 4);
++                    }
++                    for (; ir0 < ir0_chunk_end; ++ir0) {
++                        vec_dot(ne00, &tmp[ir0 - iir0], 0,
++                                src0_cur + ir0*nb01, 0, src1_col, 0, 1);
++                    }
++                } else {
++                    for (int64_t ir0 = iir0; ir0 < ir0_chunk_end; ++ir0) {
++                        vec_dot(ne00, &tmp[ir0 - iir0], 0,
++                                src0_cur + ir0*nb01, 0, src1_col, 0, 1);
++                    }
+                 }
+ 
+                 memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));

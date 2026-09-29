@@ -32,7 +32,7 @@
 #endif
 using namespace moe::detail;
 
-// Qwen decode scheduler graph (Bee-style CPU-affinity topology)
+// Qwen decode scheduler graph (full-graph CPU-affinity topology)
 // ---------------------------------------------------------------------------
 
 GgmlQwenDecodeGraphRunner &GgmlQwenDecodeGraphRunner::instance() {
@@ -171,7 +171,7 @@ bool GgmlQwenDecodeGraphRunner::ensure(int device, int d_model,
     shutdown();
     return false;
   }
-  // Bee's whole-model scheduler explicitly gives its CPU backend the same
+  // llama.cpp's whole-model scheduler explicitly gives its CPU backend the same
   // decode threadpool as the rest of the inference graph.  Without this,
   // MoEStream's opt-in Qwen topology silently executes CPU MUL_MAT_ID with
   // the backend default (effectively one worker), which is why the first

@@ -73,7 +73,7 @@ inline void dump_decode_logits_if_enabled(int step, const float *logits,
 
 // Diagnostic-only capture of the final collapsed hidden row immediately
 // before output.weight. This separates prefill/trunk drift from an
-// output-projection-only difference during Bee/llama parity checks.
+// output-projection-only difference during llama.cpp parity checks.
 inline void dump_prefill_final_hidden_if_enabled(int step, const float *hidden,
                                                   size_t n) {
     static const char *path = std::getenv("MOESTREAM_PREFILL_FINAL_HIDDEN_DUMP");
@@ -395,12 +395,12 @@ public:
 // Keep the historical default unchanged, but allow controlled benchmark runs
 // to match another runtime's sampling policy.  In particular, applying a
 // 1.3 penalty to the prompt's special tokens can change the very first decode
-// token, so it must not be silently mixed into a BeeLlama parity comparison.
+// token, so it must not be silently mixed into a llama.cpp parity comparison.
 // This is intentionally an environment override rather than a model-wide
 // default/config change: existing models retain exactly the old behavior.
 inline float moestream_repetition_penalty() {
     static const float penalty = [] {
-        // Default matches official llama.cpp/bee's own `repeat_penalty`
+        // Default matches llama.cpp's official `repeat_penalty` behavior.
         // default (1.0 == disabled). The prior default (1.3) does not exist
         // upstream and was confirmed as the root cause of a real, reproducible
         // switch-to-non-English defect on Qwen4Exp/UD-IQ1_M: the penalty
@@ -410,7 +410,7 @@ inline float moestream_repetition_penalty() {
         // steps -- confirmed via raw pre-penalty logit dumps
         // (MOESTREAM_DECODE_LOGITS_DUMP) showing the correct English
         // continuation winning by a clear margin pre-penalty, then losing to
-        // a non-English token post-penalty, and via bee/llama.cpp itself
+        // a non-English token post-penalty, and via llama.cpp itself
         // (same weights, same quant, same prompt, temp=0) staying coherent
         // throughout where MoEStream did not. Still available and
         // configurable via MOESTREAM_REPETITION_PENALTY for anyone who wants
@@ -670,7 +670,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         return;
     }
 
-    // Bee builds its complete model graph before entering the measured
+    // llama.cpp builds its complete model graph before entering the measured
     // prefill.  The prompt IDs are needed only by Qwen's PLE path; graph
     // construction and static weight upload are outside PERF_START.
     const bool unbatched_prefill = prefill_unbatched_enabled();

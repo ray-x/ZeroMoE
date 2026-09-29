@@ -559,7 +559,7 @@ static bool run_ggml_moe_layer(
       device_route_ids && device_route_weights && device_input;
   // The runner normally rounds this request to a grow-only compact-slot
   // high-water mark (64-expert increments).  A fixed slot count is an opt-in
-  // Bee-style graph-shape experiment: it keeps the graph/allocator stable
+  // Full-graph shape experiment: it keeps the graph/allocator stable
   // across all layers of a quantization signature.  ids still address only
   // [0,n_used), so the unused tail is dead storage rather than extra work.
   const int fixed_expert_slots = ggml_fixed_expert_slots();
@@ -574,7 +574,7 @@ static bool run_ggml_moe_layer(
   plan.down_type = (uint32_t)d0->type;
   plan.chunk_experts = std::min(chunk_experts > 0 ? chunk_experts : 32, n_used);
 
-  // Bee's resident-layer representation is a single expert tensor.  A
+  // llama.cpp's resident-layer representation is a single expert tensor.  A
   // compact cache can provide the same view only when an explicitly selected
   // full-layer region was allocated and every expert is currently resident.
   // Host-routed Qwen decode is allowed to use this path too; other model
