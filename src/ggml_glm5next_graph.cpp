@@ -15,6 +15,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "ggml_moe_backend.hpp"
+#include "gpu_topology.hpp"
 #include "kquant_dequant.hpp"
 #include "logger.hpp"
 #include "memory_guard.hpp"
@@ -24,11 +25,14 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fcntl.h>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -52,22 +56,86 @@ struct HostAllocation {
   size_t reservation_bytes = 0;
 };
 
+struct DynamicUploadCopy {
+  const void *source = nullptr;
+  void *destination = nullptr;
+  size_t bytes = 0;
+  size_t staging_offset = 0;
+};
+
+struct DynamicUploadJob {
+  int layer = -1;
+  int hot_slot = -1;
+  int incoming_expert = -1;
+  int evicted_expert = -1;
+  std::vector<DynamicUploadCopy> copies;
+};
+
+struct DynamicUploadResult {
+  int layer = -1;
+  int hot_slot = -1;
+  int incoming_expert = -1;
+  bool success = false;
+  size_t bytes = 0;
+  double elapsed_ms = 0.0;
+};
+
+struct DynamicUploadState {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<DynamicUploadJob> queue;
+  std::vector<DynamicUploadResult> completed;
+  std::thread worker;
+  bool stopping = false;
+  bool active = false;
+  cudaStream_t stream = nullptr;
+  void *staging = nullptr;
+  size_t staging_capacity = 0;
+  size_t host_reservation_bytes = 0;
+};
+
 // A graph can keep historically hot experts in a compact CUDA tensor while
 // presenting the remaining experts as a compact host tensor.  Device maps
 // translate the model's original expert IDs, so routing stays inside GGML.
 struct PartialExpertLayer {
   std::vector<int> hot;
   std::vector<int> cold;
+  // Physical cache-slot lookup used by the graph's no-copy VRAM hot branch.
+  std::vector<int32_t> vram_slot_by_expert;
+  uint8_t *vram_layer_base = nullptr;
+  size_t vram_layer_slots = 0;
+  size_t vram_slot_stride = 0;
   std::vector<int> slot_last_use;
   std::vector<uint32_t> miss_count;
+  std::vector<uint8_t> slot_in_flight;
+  std::vector<uint8_t> expert_in_flight;
+  uint64_t route_count = 0;
+  uint64_t hot_route_count = 0;
   ggml_tensor *hot_gate_up = nullptr;
   ggml_tensor *hot_gate = nullptr;
   ggml_tensor *hot_up = nullptr;
   ggml_tensor *hot_down = nullptr;
+  ggml_tensor *cold_gate_up = nullptr;
+  ggml_tensor *cold_gate = nullptr;
+  ggml_tensor *cold_up = nullptr;
+  ggml_tensor *cold_down = nullptr;
   ggml_tensor *cold_map = nullptr;
   ggml_tensor *hot_map = nullptr;
   ggml_tensor *cold_mask = nullptr;
   ggml_tensor *hot_mask = nullptr;
+  // -1 = not yet decided for this build_graph() pass. Caches
+  // engine->graph_ram_layer_ready(layer) the first time it is consulted for
+  // this layer during a single graph build. Background prefetch/promotion
+  // worker threads mutate the live RAM-tier state concurrently with graph
+  // construction, so partial_map()'s cold-branch indexing scheme (full
+  // arena vs. compacted load_cold_weight) and expert_weight()'s/
+  // expert_gate_up_weight()'s tensor-shape choice must agree on ONE
+  // snapshot of readiness, not two independent live reads taken moments
+  // apart -- a disagreement bakes a map that indexes an expert id past the
+  // end of a smaller compacted weight tensor, which crashes CPU
+  // ggml_compute_forward_mul_mat_id (assert(i02 < n_as) is compiled out in
+  // release builds).
+  int ram_ready_cached = -1;
 };
 
 struct Glm5nextIndexerSeed {
@@ -88,6 +156,7 @@ struct Glm5nextIndexerLayer {
 
 struct FullGraph {
   StreamingEngine *engine = nullptr;
+  GpuTopology *topology = nullptr;
   int device = -1;
   int S = 0;
   bool decode_mode = false;
@@ -109,6 +178,10 @@ struct FullGraph {
   int sliding_window = 0;
   int first_dense = 0;
   int device_expert_layers = 0;
+  ggml_backend_t gpu1 = nullptr; // optional second CUDA device for expert layers
+  int gpu1_first = -1, gpu1_last = -2;
+  std::vector<ggml_backend_buffer_t> gpu1_buffers;
+  size_t gpu1_bytes = 0;
   int indexer_heads = 0;
   int indexer_key_length = 0;
   int indexer_top_k = 0;
@@ -116,13 +189,21 @@ struct FullGraph {
   bool indexer_select_tail = false;
   bool sparse_decode = false;
   bool partial_expert_residency = false;
+  bool vram_reference_experts = false;
   bool dynamic_expert_cache = false;
+  bool dynamic_upload_disabled = false;
   bool partial_sources_compacted = false;
   size_t partial_hot_bytes = 0;
   size_t partial_cold_bytes = 0;
   size_t partial_hot_records = 0;
+  size_t vram_reference_bytes = 0;
   std::string partial_usage_file;
   std::vector<PartialExpertLayer> partial_experts;
+  uint64_t dynamic_clock = 0;
+  uint64_t dynamic_promotions = 0;
+  double dynamic_compute_ms_ema = 0.0;
+  double dynamic_upload_ms_per_job = 0.0;
+  std::unique_ptr<DynamicUploadState> dynamic_upload;
 
   ggml_backend_t cuda = nullptr;
   ggml_backend_t cpu = nullptr;
@@ -144,6 +225,7 @@ struct FullGraph {
   ggml_cgraph *graph = nullptr;
 
   ggml_tensor *input = nullptr;  // [D, HC, S], host input
+  ggml_tensor *logits = nullptr; // decode only: LM-head output [V]
   ggml_tensor *output = nullptr; // [D, S], after HC mean; LM head norms
   ggml_tensor *final_streams = nullptr;
   ggml_tensor *attn_mask = nullptr; // [S, S, 1, 1], F16 causal mask
@@ -176,6 +258,9 @@ struct FullGraph {
   };
   std::vector<Dsv4LayerTensors> dsv4_layers;
   std::vector<ggml_tensor *> dsv4_layer_outputs;
+  // Decode-only per-layer timing marks (MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1):
+  // node -> {layer, 0=after attention, 1=after FFN}.
+  std::unordered_map<const ggml_tensor *, std::pair<int, int>> layer_marks;
   std::vector<std::pair<std::string, ggml_tensor *>> dsv4_stage_outputs;
 
   std::vector<ggml_tensor *> kda_state_out;
@@ -191,6 +276,12 @@ struct FullGraph {
   std::vector<ggml_tensor *> kda_hist_updates;
   std::vector<int> dsa_layers;
   std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
+  struct VramExpertHold {
+    int layer = -1;
+    int expert = -1;
+    const uint8_t *device_ptr = nullptr;
+  };
+  std::vector<VramExpertHold> vram_expert_holds;
   std::vector<Glm5nextIndexerLayer> glm5next_indexer_layers;
   std::vector<Glm5nextIndexerSeed> glm5next_indexer_seeds;
 
@@ -199,13 +290,18 @@ struct FullGraph {
   std::vector<void *> host_inputs;
 
   size_t host_weight_bytes = 0;
+  size_t host_reference_bytes = 0;
   size_t host_pinned_bytes = 0;
   size_t host_pin_failures = 0;
-  // Routed projections are kept in one graph-owned DDR arena.  Keeping the
-  // 126 large projections as individual malloc/cudaHostRegister allocations
-  // made graph preparation spend minutes in allocator/page registration and
-  // made the host RSS curve needlessly jagged.  The GGML descriptors still
-  // point at each projection's own slice, so MUL_MAT_ID sees the same layout.
+  // Any routed projections that lack a stable engine-owned DDR arena are
+  // kept in one graph-owned DDR source arena. Keeping the large projections
+  // as individual malloc/cudaHostRegister allocations made graph preparation
+  // spend minutes in allocator/page registration. Existing graph-RAM arenas
+  // and VRAM cache slots are referenced directly instead of copied here.
+  // GLM's dynamic cache can instead keep read-only views into GGUF shard
+  // mappings; those pages remain reclaimable by the OS and avoid duplicating
+  // the full expert set in a second anonymous allocation.
+  bool expert_source_mmap = false;
   void *expert_source_base = nullptr;
   size_t expert_source_capacity = 0;
   size_t expert_source_used = 0;
@@ -232,6 +328,8 @@ struct FullGraph {
   bool ready = false;
 
   bool has_expert_source() const {
+    if (expert_source_mmap)
+      return !expert_source_views.empty();
     return expert_source_base != nullptr && expert_source_capacity != 0;
   }
 
@@ -244,21 +342,24 @@ struct FullGraph {
   bool move_expert_source_to(FullGraph &dst) {
     if (!has_expert_source() || dst.has_expert_source())
       return false;
-    const auto owner = std::find_if(
-        owned.begin(), owned.end(), [this](const HostAllocation &allocation) {
-          return allocation.ptr == expert_source_base;
-        });
-    if (owner == owned.end()) {
-      LOG_ERROR("[GGML-GLM5NEXT-FULL] expert source arena has no tracked "
-                "owner; refusing graph handoff\n");
-      return false;
+    if (!expert_source_mmap) {
+      const auto owner = std::find_if(
+          owned.begin(), owned.end(), [this](const HostAllocation &allocation) {
+            return allocation.ptr == expert_source_base;
+          });
+      if (owner == owned.end()) {
+        LOG_ERROR("[GGML-GLM5NEXT-FULL] expert source arena has no tracked "
+                  "owner; refusing graph handoff\n");
+        return false;
+      }
+      // The source views are non-owning slices into this allocation. Transfer
+      // the allocation itself before the old prompt graph is destroyed, or
+      // the reusable decode graph will retain dangling expert pointers.
+      dst.owned.push_back(std::move(*owner));
+      owned.erase(owner);
     }
-    // The source views are non-owning slices into this allocation. Transfer
-    // the allocation itself before the old prompt graph is destroyed, or the
-    // reusable decode graph will retain dangling expert pointers.
-    dst.owned.push_back(std::move(*owner));
-    owned.erase(owner);
 
+    dst.expert_source_mmap = expert_source_mmap;
     dst.expert_source_base = expert_source_base;
     dst.expert_source_capacity = expert_source_capacity;
     dst.expert_source_used = expert_source_used;
@@ -272,24 +373,40 @@ struct FullGraph {
     dst.host_reservation_bytes = host_reservation_bytes;
 
     dst.partial_expert_residency = partial_expert_residency;
+    dst.vram_reference_experts = vram_reference_experts;
+    dst.topology = topology;
     dst.dynamic_expert_cache = dynamic_expert_cache;
+    dst.dynamic_upload_disabled = dynamic_upload_disabled;
     dst.partial_sources_compacted = partial_sources_compacted;
     dst.partial_hot_bytes = partial_hot_bytes;
     dst.partial_cold_bytes = partial_cold_bytes;
     dst.partial_hot_records = partial_hot_records;
+    dst.vram_reference_bytes = vram_reference_bytes;
     dst.partial_usage_file = std::move(partial_usage_file);
     dst.partial_experts = std::move(partial_experts);
+    dst.vram_expert_holds = std::move(vram_expert_holds);
+    dst.host_reference_bytes = host_reference_bytes;
+    dst.dynamic_clock = dynamic_clock;
+    dst.dynamic_promotions = dynamic_promotions;
+    dst.dynamic_compute_ms_ema = dynamic_compute_ms_ema;
+    dst.dynamic_upload_ms_per_job = dynamic_upload_ms_per_job;
+    dst.dynamic_upload = std::move(dynamic_upload);
     for (PartialExpertLayer &p : dst.partial_experts) {
       p.hot_gate_up = nullptr;
       p.hot_gate = nullptr;
       p.hot_up = nullptr;
       p.hot_down = nullptr;
+      p.cold_gate_up = nullptr;
+      p.cold_gate = nullptr;
+      p.cold_up = nullptr;
+      p.cold_down = nullptr;
       p.cold_map = nullptr;
       p.hot_map = nullptr;
       p.cold_mask = nullptr;
       p.hot_mask = nullptr;
     }
 
+    expert_source_mmap = false;
     expert_source_base = nullptr;
     expert_source_capacity = 0;
     expert_source_used = 0;
@@ -297,19 +414,49 @@ struct FullGraph {
     expert_source_pinned_ranges.clear();
     host_reservation_bytes = 0;
     partial_expert_residency = false;
+    vram_reference_experts = false;
     dynamic_expert_cache = false;
+    dynamic_upload_disabled = false;
     partial_sources_compacted = false;
     partial_hot_bytes = 0;
     partial_cold_bytes = 0;
     partial_hot_records = 0;
+    vram_reference_bytes = 0;
     partial_usage_file.clear();
     partial_experts.clear();
+    vram_expert_holds.clear();
+    dynamic_clock = 0;
+    dynamic_promotions = 0;
+    dynamic_compute_ms_ema = 0.0;
+    dynamic_upload_ms_per_job = 0.0;
     return true;
   }
 
   ~FullGraph() { destroy(); }
 
   void destroy() {
+    if (dynamic_upload) {
+      {
+        std::lock_guard<std::mutex> lock(dynamic_upload->mutex);
+        dynamic_upload->stopping = true;
+      }
+      dynamic_upload->cv.notify_all();
+      if (dynamic_upload->worker.joinable())
+        dynamic_upload->worker.join();
+      if (device >= 0)
+        cudaSetDevice(device);
+      if (dynamic_upload->stream) {
+        cudaStreamSynchronize(dynamic_upload->stream);
+        cudaStreamDestroy(dynamic_upload->stream);
+      }
+      if (dynamic_upload->staging) {
+        cudaHostUnregister(dynamic_upload->staging);
+        std::free(dynamic_upload->staging);
+      }
+      MemoryGuard::release_host_bytes(
+          dynamic_upload->host_reservation_bytes);
+      dynamic_upload.reset();
+    }
     if (sched) {
       ggml_backend_sched_free(sched);
       sched = nullptr;
@@ -318,6 +465,10 @@ struct FullGraph {
       ggml_backend_free(cpu);
       cpu = nullptr;
     }
+    for (ggml_backend_buffer_t b : gpu1_buffers)
+      if (b)
+        ggml_backend_buffer_free(b);
+    gpu1_buffers.clear();
     if (expert_buffer) {
       ggml_backend_buffer_free(expert_buffer);
       expert_buffer = nullptr;
@@ -332,10 +483,12 @@ struct FullGraph {
     }
     partial_expert_residency = false;
     dynamic_expert_cache = false;
+    dynamic_upload_disabled = false;
     partial_sources_compacted = false;
     partial_hot_bytes = 0;
     partial_cold_bytes = 0;
     partial_hot_records = 0;
+    vram_reference_bytes = 0;
     partial_usage_file.clear();
     partial_experts.clear();
     for (ggml_backend_buffer_t b : host_buffers)
@@ -354,6 +507,7 @@ struct FullGraph {
     }
     owned.clear();
     host_inputs.clear();
+    expert_source_mmap = false;
     expert_source_base = nullptr;
     expert_source_capacity = 0;
     expert_source_used = 0;
@@ -398,6 +552,7 @@ struct FullGraph {
     MemoryGuard::release_host_bytes(context_reservation_bytes);
     context_reservation_bytes = 0;
     engine = nullptr;
+    topology = nullptr;
     ready = false;
   }
 };
@@ -407,12 +562,29 @@ std::unique_ptr<FullGraph> g_graph;
 // a source-only container while the prompt-shaped GGML graph is rebuilt or
 // before the first prompt arrives.
 std::unique_ptr<FullGraph> g_glm5next_source;
+GpuTopology *g_glm5next_vram_cache = nullptr;
 StreamingEngine *g_glm5next_decode_disabled_engine = nullptr;
 
 bool env_enabled() {
   static const bool enabled = [] {
     const char *v = std::getenv("MOESTREAM_GLM5NEXT_FULL_GRAPH");
     return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
+bool dynamic_cache_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
+    return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
+bool route_stats_enabled() {
+  static const bool enabled = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_CACHE_STATS");
+    return (v && v[0] == '1') || dynamic_cache_enabled();
   }();
   return enabled;
 }
@@ -537,7 +709,7 @@ bool graph_dense_weight_name(const std::string &name) {
   if (name.find("indexer.") != std::string::npos ||
       name.find("indexer_compressor_") != std::string::npos)
     return true;
-  return name.find("attn") != std::string::npos ||
+  return name == "output.weight" || name.find("attn") != std::string::npos ||
          name.find("hc_") != std::string::npos ||
          name.find("ssm_") != std::string::npos ||
          name.find("norm") != std::string::npos ||
@@ -574,6 +746,14 @@ bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity,
 // existing GLM builder's tensor/FFN helpers are defined below it.
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name);
+static bool layer_timing_env() {
+  static const bool on = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *forced_ids);
 ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
@@ -1061,8 +1241,10 @@ bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag) {
   const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
   if (prev_device >= 0)
     cudaSetDevice(prev_device);
-  constexpr size_t kMinGraphAllocHeadroomBytes =
+  size_t kMinGraphAllocHeadroomBytes =
       2ull * 1024ull * 1024ull * 1024ull; // 2 GiB
+  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
+    kMinGraphAllocHeadroomBytes = (size_t)std::max(0, std::atoi(e)) << 20;
   if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
     LOG_ERROR("%s refusing graph allocator reserve: device %d free=%.2f GiB "
               "< %.2f GiB safety floor (expert arena + dense arena already "
@@ -1592,7 +1774,183 @@ const PartialExpertLayer *partial_layer(const FullGraph &g, int layer) {
   return p.hot.empty() && p.cold.empty() ? nullptr : &p;
 }
 
+// Single-snapshot replacement for engine->graph_ram_layer_ready(layer) for
+// layers that have a PartialExpertLayer. See PartialExpertLayer::
+// ram_ready_cached for why: partial_map(), expert_weight() and
+// expert_gate_up_weight() must all see the same answer for one layer within
+// one build_graph() call, even though the underlying state is live and
+// mutated by background threads. Falls back to the live check for layers
+// with no partial residency, where no second tensor's shape depends on the
+// same decision.
+bool partial_layer_ram_ready(FullGraph &g, int layer) {
+  PartialExpertLayer *p = partial_layer(g, layer);
+  if (!p)
+    return g.engine->graph_ram_layer_ready(layer);
+  if (p->ram_ready_cached < 0)
+    p->ram_ready_cached = g.engine->graph_ram_layer_ready(layer) ? 1 : 0;
+  return p->ram_ready_cached != 0;
+}
+
+bool configure_vram_reference_experts(FullGraph &g) {
+  if (!g.topology || !g.engine ||
+      g.engine->family_ops.family != ModelFamily::GLM5NEXT)
+    return false;
+  const auto &c = g.engine->model_file.architecture_config;
+  if (c.n_experts <= 0 || c.n_layers <= c.first_dense) {
+    LOG_WARN("[GGML-GLM5NEXT-CACHE] VRAM reference mode needs the compact, "
+             "layer-partitioned expert cache geometry\n");
+    return false;
+  }
+  if (!g.topology->expert_compact_layout)
+    LOG_WARN("[GGML-GLM5NEXT-CACHE] cache is not layer-partitioned; using "
+             "DDR references only for the graph hot/cold split\n");
+
+  g.partial_experts.assign((size_t)c.n_layers, {});
+  size_t aliased_bytes = 0;
+  size_t hot_records = 0;
+  std::lock_guard<std::recursive_mutex> lock(g.topology->cache_mutex);
+  for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
+    const size_t raw_stride = g.engine->compute_expert_slab_bytes(layer);
+    if (raw_stride == 0)
+      continue;
+    // Cache slots are padded (4 KiB, or row alignment inside the full-layer
+    // prefix), so the physical slot stride is the slot's own size, not the
+    // raw slab size.
+    size_t stride = raw_stride;
+    for (const ExpertLocation &loc : g.topology->expert_vram_cache) {
+      if (g.topology->expert_compact_layout && loc.pool_layer == layer &&
+          loc.gpu_id == g.device && loc.device_ptr && loc.size >= raw_stride) {
+        stride = loc.size;
+        break;
+      }
+    }
+    PartialExpertLayer &p = g.partial_experts[(size_t)layer];
+    p.vram_slot_by_expert.assign((size_t)c.n_experts, -1);
+    p.vram_slot_stride = stride;
+
+    size_t first_offset = SIZE_MAX;
+    size_t slot_count = 0;
+    for (const ExpertLocation &loc : g.topology->expert_vram_cache) {
+      if (g.topology->expert_compact_layout && loc.pool_layer == layer &&
+          loc.gpu_id == g.device &&
+          loc.device_ptr && loc.size == stride) {
+        first_offset = std::min(first_offset, loc.offset);
+        ++slot_count;
+      }
+    }
+    if (slot_count > 0) {
+      bool region_valid =
+          first_offset != SIZE_MAX && slot_count <= SIZE_MAX / stride &&
+          first_offset <= SIZE_MAX - slot_count * stride;
+      if (region_valid) {
+        p.vram_layer_base = nullptr;
+        p.vram_layer_slots = slot_count;
+        size_t expected_offset = first_offset;
+        for (const ExpertLocation &loc : g.topology->expert_vram_cache) {
+          if (!g.topology->expert_compact_layout || loc.pool_layer != layer ||
+              loc.gpu_id != g.device || !loc.device_ptr || loc.size != stride)
+            continue;
+          if (loc.offset < first_offset ||
+              (loc.offset - first_offset) % stride != 0 ||
+              loc.offset >= first_offset + slot_count * stride ||
+              loc.offset > SIZE_MAX - stride) {
+            region_valid = false;
+            break;
+          }
+          if (!p.vram_layer_base || loc.offset == first_offset) {
+            const size_t delta = loc.offset - first_offset;
+            const uintptr_t address =
+                reinterpret_cast<uintptr_t>(loc.device_ptr);
+            if (address < delta) {
+              region_valid = false;
+              break;
+            }
+            p.vram_layer_base = reinterpret_cast<uint8_t *>(address - delta);
+          }
+          expected_offset = std::max(expected_offset, loc.offset + stride);
+        }
+        region_valid = region_valid && p.vram_layer_base &&
+                       expected_offset == first_offset + slot_count * stride;
+      }
+      if (!region_valid) {
+        LOG_WARN("[GGML-GLM5NEXT-CACHE] invalid VRAM cache geometry for "
+                 "layer=%d; graph will leave its experts in the cold DDR "
+                 "path\n", layer);
+        p.vram_layer_base = nullptr;
+        p.vram_layer_slots = 0;
+        slot_count = 0;
+      }
+    }
+
+    for (const ExpertLocation &loc : g.topology->expert_vram_cache) {
+      if (!g.topology->expert_compact_layout || loc.pool_layer != layer ||
+          loc.gpu_id != g.device ||
+          loc.layer_idx != layer || loc.expert_id < 0 ||
+          loc.expert_id >= c.n_experts || !loc.upload_ready ||
+          !loc.device_ptr || loc.size != stride || !p.vram_layer_base)
+        continue;
+      const size_t delta = loc.offset - first_offset;
+      if (delta % stride != 0 || delta / stride >= slot_count) {
+        LOG_WARN("[GGML-GLM5NEXT-CACHE] invalid pinned slot map for "
+                 "layer=%d expert=%d; leaving it on the cold DDR path\n",
+                 layer, loc.expert_id);
+        continue;
+      }
+      const int expert = loc.expert_id;
+      if (p.vram_slot_by_expert[(size_t)expert] >= 0)
+        continue;
+      p.vram_slot_by_expert[(size_t)expert] = (int32_t)(delta / stride);
+      p.hot.push_back(expert);
+      g.vram_expert_holds.push_back({layer, expert, loc.device_ptr});
+      ++hot_records;
+      aliased_bytes += stride;
+    }
+
+    if (std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
+      size_t n_pool = 0, n_ready = 0, n_ptr = 0, n_size = 0, n_gpu = 0;
+      for (const ExpertLocation &l2 : g.topology->expert_vram_cache) {
+        if (l2.pool_layer != layer) continue;
+        ++n_pool; n_ready += l2.upload_ready; n_ptr += l2.device_ptr != nullptr;
+        n_size += l2.size == stride; n_gpu += l2.gpu_id == g.device;
+      }
+      LOG_WARN("[ALIAS-DEBUG] layer=%d compact=%d stride=%zu slot_count=%zu "
+               "base=%d pool=%zu ready=%zu ptr=%zu size_ok=%zu gpu_ok=%zu hot=%zu\n",
+               layer, (int)g.topology->expert_compact_layout, stride, slot_count,
+               p.vram_layer_base != nullptr, n_pool, n_ready, n_ptr, n_size, n_gpu,
+               p.hot.size());
+    }
+    std::vector<uint8_t> is_hot((size_t)c.n_experts, 0);
+    for (int expert : p.hot)
+      is_hot[(size_t)expert] = 1;
+    for (int expert = 0; expert < c.n_experts; ++expert)
+      if (!is_hot[(size_t)expert])
+        p.cold.push_back(expert);
+    p.slot_last_use.assign(p.hot.size(), 0);
+    p.slot_in_flight.assign(p.hot.size(), 0);
+    p.miss_count.assign((size_t)c.n_experts, 0);
+    p.expert_in_flight.assign((size_t)c.n_experts, 0);
+  }
+
+  g.partial_expert_residency = true;
+  g.vram_reference_experts = true;
+  g.dynamic_expert_cache = false;
+  g.partial_sources_compacted = false;
+  g.partial_hot_bytes = 0; // aliased memory is not a graph allocation
+  g.partial_cold_bytes = 0;
+  g.partial_hot_records = hot_records;
+  g.vram_reference_bytes = aliased_bytes;
+  g.partial_usage_file = "<resident-vram-cache>";
+  LOG_INFO("[GGML-GLM5NEXT-CACHE] expert storage aliases: %zu resident VRAM "
+           "records (%.2f GiB referenced, not copied); DDR cold experts "
+           "use existing graph-RAM slabs where available\n",
+           hot_records,
+           (double)aliased_bytes / (1024.0 * 1024.0 * 1024.0));
+  return true;
+}
+
 bool configure_partial_experts(FullGraph &g) {
+  if (configure_vram_reference_experts(g))
+    return true;
   const double requested_gb =
       full_graph_resident_gb("MOESTREAM_FULL_GRAPH_RESIDENT_GB");
   if (requested_gb <= 0.0)
@@ -1709,18 +2067,42 @@ bool configure_partial_experts(FullGraph &g) {
     for (int e = 0; e < c.n_experts; ++e)
       if (!is_hot[(size_t)e])
         p.cold.push_back(e);
+    p.slot_last_use.assign(p.hot.size(), 0);
+    p.slot_in_flight.assign(p.hot.size(), 0);
+    p.miss_count.assign((size_t)c.n_experts, 0);
+    p.expert_in_flight.assign((size_t)c.n_experts, 0);
+    for (size_t slot = 0; slot < p.hot.size(); ++slot) {
+      const int expert = p.hot[slot];
+      const auto usage = std::find_if(
+          by_layer[(size_t)l].begin(), by_layer[(size_t)l].end(),
+          [expert](const StreamingEngine::UsageEntry &entry) {
+            return entry.expert == expert;
+          });
+      if (usage != by_layer[(size_t)l].end()) {
+        const size_t rank = (size_t)std::distance(
+            by_layer[(size_t)l].begin(), usage);
+        const uint64_t initial =
+            by_layer[(size_t)l].size() - std::min(
+                rank, by_layer[(size_t)l].size());
+        p.slot_last_use[slot] = (int)std::min<uint64_t>(initial, INT_MAX);
+        g.dynamic_clock = std::max<uint64_t>(
+            g.dynamic_clock, by_layer[(size_t)l].size() + 1);
+      }
+    }
     cold_bytes += record_bytes[(size_t)l] * p.cold.size();
   }
   g.partial_expert_residency = true;
+  g.dynamic_expert_cache = dynamic_cache_enabled();
   g.partial_hot_bytes = used;
   g.partial_cold_bytes = cold_bytes;
   g.partial_hot_records = hot_records;
   g.partial_usage_file = partial_usage_path(g);
   LOG_INFO("[GGML-FULL] partial resident set: %.2f GiB hot, %.2f GiB cold, "
-           "%zu hot expert records across %d layers, usage=%s\n",
+           "%zu hot expert records across %d layers, usage=%s%s\n",
            (double)used / (1024.0 * 1024.0 * 1024.0),
            (double)cold_bytes / (1024.0 * 1024.0 * 1024.0), hot_records,
-           c.n_layers - c.first_dense, g.partial_usage_file.c_str());
+           c.n_layers - c.first_dense, g.partial_usage_file.c_str(),
+           g.dynamic_expert_cache ? ", dynamic LRU enabled" : "");
   return true;
 }
 
@@ -1923,14 +2305,19 @@ ggml_tensor *load_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
   if (const PartialExpertLayer *p = partial_layer(g, layer)) {
     if (p->cold.empty())
       return nullptr;
+    if (g.dynamic_expert_cache && g.expert_source_mmap)
+      return nullptr;
     auto ptr_it = g.expert_source_views.find(meta.name);
     auto bytes_it = g.expert_source_view_bytes.find(meta.name);
     if (ptr_it == g.expert_source_views.end() ||
         bytes_it == g.expert_source_view_bytes.end())
       return nullptr;
+    const int64_t cold_experts =
+        g.dynamic_expert_cache ? (int64_t)meta.gate->shape[2]
+                               : (int64_t)p->cold.size();
     ggml_tensor *cold = ggml_new_tensor_3d(
         ctx, (ggml_type)meta.gate->type, (int64_t)meta.gate->shape[0],
-        (int64_t)meta.gate->shape[1] * 2, (int64_t)p->cold.size());
+        (int64_t)meta.gate->shape[1] * 2, cold_experts);
     if (!cold || bytes_it->second < ggml_nbytes(cold) ||
         !bind_host(g, cold, ptr_it->second, bytes_it->second,
                    GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
@@ -2012,7 +2399,8 @@ ggml_tensor *load_cold_weight(FullGraph &g, ggml_context *ctx, int layer,
   std::vector<int64_t> shape;
   for (uint64_t d : m->shape)
     shape.push_back((int64_t)d);
-  shape[2] = (int64_t)p->cold.size();
+  shape[2] = g.dynamic_expert_cache ? (int64_t)m->shape[2]
+                                    : (int64_t)p->cold.size();
   ggml_tensor *t = new_tensor(ctx, (ggml_type)m->type, shape);
   if (!t || bytes_it->second < ggml_nbytes(t) ||
       !bind_host(g, t, ptr_it->second, bytes_it->second,
@@ -2088,13 +2476,114 @@ ggml_tensor *make_hot_gate_up(FullGraph &g, ggml_context *ctx, int layer) {
   return t;
 }
 
+ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer,
+                                  const char *stem) {
+  const PartialExpertLayer *p = partial_layer(g, layer);
+  if (!p || p->hot.empty() || !p->vram_layer_base ||
+      p->vram_layer_slots == 0 || p->vram_slot_stride == 0 ||
+      !g.expert_buffer)
+    return nullptr;
+  const std::string name = "blk." + std::to_string(layer) + "." + stem;
+  const GGUFTensor *meta = model_tensor(*g.engine, name);
+  const size_t n_experts =
+      (size_t)g.engine->model_file.architecture_config.n_experts;
+  if (!meta || meta->shape.size() != 3 || n_experts == 0 ||
+      meta->size_bytes % n_experts != 0)
+    return nullptr;
+  size_t offset = 0;
+  if (std::strcmp(stem, "ffn_up_exps.weight") == 0) {
+    const GGUFTensor *gate = model_tensor(
+        *g.engine, "blk." + std::to_string(layer) + ".ffn_gate_exps.weight");
+    if (!gate || gate->size_bytes % n_experts != 0)
+      return nullptr;
+    offset = (size_t)gate->size_bytes / n_experts;
+  } else if (std::strcmp(stem, "ffn_down_exps.weight") == 0) {
+    const GGUFTensor *gate = model_tensor(
+        *g.engine, "blk." + std::to_string(layer) + ".ffn_gate_exps.weight");
+    const GGUFTensor *up = model_tensor(
+        *g.engine, "blk." + std::to_string(layer) + ".ffn_up_exps.weight");
+    if (!gate || !up || gate->size_bytes % n_experts != 0 ||
+        up->size_bytes % n_experts != 0)
+      return nullptr;
+    const size_t gate_bytes = (size_t)gate->size_bytes / n_experts;
+    const size_t up_bytes = (size_t)up->size_bytes / n_experts;
+    if (gate_bytes > SIZE_MAX - up_bytes)
+      return nullptr;
+    offset = gate_bytes + up_bytes;
+  } else if (std::strcmp(stem, "ffn_gate_exps.weight") != 0) {
+    return nullptr;
+  }
+  const size_t per_expert_bytes = (size_t)meta->size_bytes / n_experts;
+  if (offset > p->vram_slot_stride ||
+      per_expert_bytes > p->vram_slot_stride - offset ||
+      p->vram_layer_slots > SIZE_MAX / p->vram_slot_stride)
+    return nullptr;
+  std::vector<int64_t> shape;
+  for (uint64_t dim : meta->shape)
+    shape.push_back((int64_t)dim);
+  shape[2] = (int64_t)p->vram_layer_slots;
+  ggml_tensor *t = new_tensor(ctx, (ggml_type)meta->type, shape);
+  if (!t)
+    return nullptr;
+  // ggml-cuda mmvq derives the per-expert offset as nb[2]/type_size in block
+  // units, so a stride that is not a whole number of rows silently misaddresses
+  // every nonzero slot (NaN decode output). Refuse the alias instead.
+  // Only nb[2] must be a whole number of rows; the offset just positions the
+  // base pointer inside the slot (down starts after gate+up, whose row size
+  // differs), so it only needs the block struct's 2-byte alignment.
+  if (p->vram_slot_stride % ggml_row_size(t->type, t->ne[0]) != 0 ||
+      offset % 2 != 0) {
+    static bool warned = false;
+    if (!warned) {
+      warned = true;
+      LOG_STREAM_WARN() << "[GLM5NEXT-GRAPH] (stride=" << p->vram_slot_stride
+                        << " offset=" << offset << " row_size="
+                        << ggml_row_size(t->type, t->ne[0]) << " type_size="
+                        << ggml_type_size(t->type) << " type="
+                        << ggml_type_name(t->type) << ")\n";
+      LOG_STREAM_WARN() << "[GLM5NEXT-GRAPH] VRAM slot stride "
+                        << p->vram_slot_stride << " is not row-aligned for "
+                        << name << "; set vram_cache_full_layer_prefix to "
+                        << "cover all MoE layers. Not aliasing resident slots.\n";
+    }
+    return nullptr;
+  }
+  t->nb[2] = p->vram_slot_stride;
+  t->nb[3] = t->nb[2] * (size_t)t->ne[2];
+  t->data = p->vram_layer_base + offset;
+  // The buffer type tags this tensor for the graph CUDA backend. The actual
+  // data pointer remains owned by GpuTopology's expert cache pool.
+  t->buffer = g.expert_buffer;
+  ggml_set_name(t, (name + ".vram_cache_ref").c_str());
+  return t;
+}
+
 bool prepare_partial_hot(FullGraph &g, ggml_context *ctx, int layer) {
   PartialExpertLayer *p = partial_layer(g, layer);
   if (!p || p->hot.empty())
     return true;
   if (p->hot_down || p->hot_gate_up || p->hot_gate)
     return true;
+  if (g.vram_reference_experts) {
+    p->hot_gate = make_vram_ref_weight(g, ctx, layer,
+                                       "ffn_gate_exps.weight");
+    p->hot_up = make_vram_ref_weight(g, ctx, layer,
+                                     "ffn_up_exps.weight");
+    p->hot_down = make_vram_ref_weight(g, ctx, layer,
+                                       "ffn_down_exps.weight");
+    return p->hot_gate && p->hot_up && p->hot_down;
+  }
   PackedGateUpMeta packed;
+  // The mmap-backed dynamic source intentionally retains gate and up as
+  // separate read-only file views.  Keep the hot slots in the same layout so
+  // asynchronous promotion can copy each projection directly into its slot;
+  // a packed hot tensor cannot be paired with separate cold source tensors.
+  if (g.dynamic_expert_cache && g.expert_source_mmap) {
+    p->hot_gate = make_hot_weight(g, ctx, layer, "ffn_gate_exps.weight");
+    p->hot_up = make_hot_weight(g, ctx, layer, "ffn_up_exps.weight");
+    p->hot_down = make_hot_weight(g, ctx, layer, "ffn_down_exps.weight");
+    return p->hot_gate && p->hot_up && p->hot_down;
+  }
   if (packed_gate_up_meta(*g.engine, layer, &packed)) {
     p->hot_gate_up = make_hot_gate_up(g, ctx, layer);
     p->hot_down = make_hot_weight(g, ctx, layer, "ffn_down_exps.weight");
@@ -2139,14 +2628,60 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
     data = mask_values.data();
   } else {
     // Both partial-residency branches share the same dynamic top-k shape.
-    // GGML's CUDA and CPU MUL_MAT_ID kernels treat a negative expert id as an
-    // inactive route, so do not send a non-member route through expert slot 0:
-    // that computes a dummy expert and only masks its result afterward.
-    map_values.assign(n * (size_t)g.S, -1);
-    const auto &ids = hot ? p->hot : p->cold;
-    for (size_t i = 0; i < ids.size(); ++i)
-      for (int s = 0; s < g.S; ++s)
-        map_values[(size_t)s * n + (size_t)ids[i]] = (int32_t)i;
+    // CUDA's mm_ids_helper tolerates a negative ID (it never matches any real
+    // expert bucket, so the row is silently skipped), but the CPU backend's
+    // ggml_compute_forward_mul_mat_id has no such check -- i02 is used
+    // directly as an array index (`assert(i02 < n_as)` is compiled out under
+    // NDEBUG), so a -1 there is an out-of-bounds read/write, not a no-op.
+    // The cold branch's weights can be CPU-resident (graph_ram_weight /
+    // load_cold_weight / load_full_weight with on_device=false), so we can't
+    // rely on the CUDA-only tolerance here. Use 0 (always a valid in-bounds
+    // slot whenever this branch actually runs, since has_hot/has_cold gate
+    // on a non-empty partition) as the "inactive route" sentinel instead;
+    // hot_weights/cold_weights already multiply by a 0/1 mask before the
+    // rows are summed, so a row computed against the wrong expert is
+    // harmless -- it just contributes zero to the final output.
+    map_values.assign(n * (size_t)g.S, 0);
+    if (g.dynamic_expert_cache && !hot) {
+      for (size_t expert = 0; expert < n; ++expert) {
+        if (is_hot[expert])
+          continue;
+        for (int s = 0; s < g.S; ++s)
+          map_values[(size_t)s * n + expert] = (int32_t)expert;
+      }
+    } else if (g.vram_reference_experts) {
+      if (hot) {
+        for (int expert : p->hot) {
+          if (expert < 0 || (size_t)expert >= n ||
+              (size_t)expert >= p->vram_slot_by_expert.size())
+            continue;
+          const int32_t physical_slot =
+              p->vram_slot_by_expert[(size_t)expert];
+          if (physical_slot < 0)
+            return nullptr;
+          for (int s = 0; s < g.S; ++s)
+            map_values[(size_t)s * n + (size_t)expert] = physical_slot;
+        }
+      } else {
+        int32_t cold_slot = 0;
+        const bool full_ddr_view = partial_layer_ram_ready(g, layer);
+        for (int expert : p->cold) {
+          if (expert < 0 || (size_t)expert >= n)
+            return nullptr;
+          const int32_t index = full_ddr_view ? expert : cold_slot++;
+          for (int s = 0; s < g.S; ++s)
+            map_values[(size_t)s * n + (size_t)expert] = index;
+        }
+      }
+    } else {
+      const auto &ids = hot ? p->hot : p->cold;
+      for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] < 0 || (size_t)ids[i] >= n)
+          continue;
+        for (int s = 0; s < g.S; ++s)
+          map_values[(size_t)s * n + (size_t)ids[i]] = (int32_t)i;
+      }
+    }
     data = map_values.data();
   }
   if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used,
@@ -2157,6 +2692,603 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
                        .c_str());
   slot = t;
   return slot;
+}
+
+bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p) {
+  const auto &c = g.engine->model_file.architecture_config;
+  const int layer = (int)(&p - g.partial_experts.data());
+  if (c.n_experts <= 0 || g.S <= 0 || !p.hot_map || !p.hot_mask ||
+      !p.cold_map || !p.cold_mask)
+    return false;
+  const size_t n = (size_t)c.n_experts;
+  const size_t count = n * (size_t)g.S;
+  std::vector<int32_t> hot_map(count, -1), cold_map(count, -1);
+  std::vector<float> hot_mask(count, 0.0f), cold_mask(count, 0.0f);
+  std::vector<int32_t> hot_slots(n, -1), cold_slots(n, -1);
+  for (size_t slot = 0; slot < p.hot.size(); ++slot) {
+    const int expert = p.hot[slot];
+    if (expert == -1 && g.dynamic_expert_cache)
+      continue;
+    if (expert < 0 || expert >= c.n_experts)
+      return false;
+    hot_slots[(size_t)expert] =
+        g.vram_reference_experts &&
+                (size_t)expert < p.vram_slot_by_expert.size()
+            ? p.vram_slot_by_expert[(size_t)expert]
+            : (int32_t)slot;
+  }
+  if (!g.dynamic_expert_cache) {
+    for (size_t slot = 0; slot < p.cold.size(); ++slot) {
+      const int expert = p.cold[slot];
+      if (expert < 0 || expert >= c.n_experts ||
+          hot_slots[(size_t)expert] >= 0)
+        return false;
+      cold_slots[(size_t)expert] =
+          g.vram_reference_experts && partial_layer_ram_ready(g, layer)
+              ? expert
+              : (int32_t)slot;
+    }
+  }
+  for (size_t expert = 0; expert < n; ++expert) {
+    const int32_t hs = hot_slots[expert];
+    const int32_t cs = g.dynamic_expert_cache ? (int32_t)expert
+                                             : cold_slots[expert];
+    if (!g.dynamic_expert_cache && ((hs >= 0) == (cs >= 0)))
+      return false;
+    for (int s = 0; s < g.S; ++s) {
+      const size_t i = (size_t)s * n + expert;
+      if (hs >= 0) {
+        hot_map[i] = hs;
+        hot_mask[i] = 1.0f;
+      } else {
+        cold_map[i] = cs;
+        cold_mask[i] = 1.0f;
+      }
+    }
+  }
+
+  const auto set = [](ggml_tensor *tensor, const void *data, size_t bytes) {
+    return tensor && tensor->data && ggml_nbytes(tensor) == bytes &&
+           cudaMemcpy(tensor->data, data, bytes, cudaMemcpyHostToDevice) ==
+               cudaSuccess;
+  };
+  if (!set(p.hot_map, hot_map.data(), count * sizeof(int32_t)) ||
+      !set(p.hot_mask, hot_mask.data(), count * sizeof(float)) ||
+      !set(p.cold_map, cold_map.data(), count * sizeof(int32_t)) ||
+      !set(p.cold_mask, cold_mask.data(), count * sizeof(float))) {
+    const cudaError_t err = cudaGetLastError();
+    LOG_WARN("[GGML-GLM5NEXT-CACHE] route-map upload failed: %s\n",
+             cudaGetErrorString(err));
+    return false;
+  }
+  return true;
+}
+
+int dynamic_upload_budget_override() {
+  const char *value =
+      std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN");
+  if (!value || !value[0])
+    return -1;
+  char *end = nullptr;
+  const long parsed = std::strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < 0)
+    return -1;
+  return (int)std::min<long>(parsed, 128);
+}
+
+double dynamic_upload_fraction() {
+  const char *value =
+      std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC");
+  if (!value || !value[0])
+    return 0.25;
+  char *end = nullptr;
+  const double parsed = std::strtod(value, &end);
+  return end != value && *end == '\0' && parsed >= 0.0 && parsed <= 1.0
+             ? parsed
+             : 0.25;
+}
+
+bool ensure_dynamic_upload_worker(FullGraph &g) {
+  if (g.dynamic_upload)
+    return true;
+  size_t staging_capacity = 0;
+  const auto add_layer = [&](const PartialExpertLayer &p) {
+    size_t bytes = 0;
+    const auto add_pair = [&](const ggml_tensor *hot,
+                              const ggml_tensor *source) -> bool {
+      if (!hot || !source || !hot->data || !source->data ||
+          hot->nb[2] == 0 || hot->nb[2] != source->nb[2] ||
+          hot->nb[2] > SIZE_MAX - bytes)
+        return false;
+      bytes += hot->nb[2];
+      return true;
+    };
+    bool valid = false;
+    if (p.hot_gate_up || p.cold_gate_up) {
+      valid = add_pair(p.hot_gate_up, p.cold_gate_up) &&
+              add_pair(p.hot_down, p.cold_down);
+    } else {
+      valid = add_pair(p.hot_gate, p.cold_gate) &&
+              add_pair(p.hot_up, p.cold_up) &&
+              add_pair(p.hot_down, p.cold_down);
+    }
+    if (valid)
+      staging_capacity = std::max(staging_capacity, bytes);
+  };
+  for (int layer = 0; layer < (int)g.partial_experts.size(); ++layer)
+    if (!g.partial_experts[(size_t)layer].hot.empty())
+      add_layer(g.partial_experts[(size_t)layer]);
+  if (staging_capacity == 0 ||
+      !MemoryGuard::try_reserve_host_bytes(staging_capacity)) {
+    LOG_WARN("[GGML-GLM5NEXT-CACHE] async upload staging admission refused "
+             "(%.2f MiB)\n",
+             (double)staging_capacity / (1024.0 * 1024.0));
+    return false;
+  }
+
+  auto state = std::make_unique<DynamicUploadState>();
+  state->host_reservation_bytes = staging_capacity;
+  if (posix_memalign(&state->staging, 4096, staging_capacity) != 0 ||
+      !state->staging) {
+    MemoryGuard::release_host_bytes(state->host_reservation_bytes);
+    state->host_reservation_bytes = 0;
+    return false;
+  }
+  state->staging_capacity = staging_capacity;
+  if (cudaSetDevice(g.device) != cudaSuccess ||
+      cudaHostRegister(state->staging, state->staging_capacity,
+                       cudaHostRegisterPortable) != cudaSuccess) {
+    const cudaError_t err = cudaGetLastError();
+    LOG_WARN("[GGML-GLM5NEXT-CACHE] pinned upload staging unavailable: %s\n",
+             cudaGetErrorString(err));
+    std::free(state->staging);
+    MemoryGuard::release_host_bytes(state->host_reservation_bytes);
+    return false;
+  }
+  if (cudaStreamCreateWithFlags(&state->stream, cudaStreamNonBlocking) !=
+      cudaSuccess) {
+    const cudaError_t err = cudaGetLastError();
+    LOG_WARN("[GGML-GLM5NEXT-CACHE] upload stream creation failed: %s\n",
+             cudaGetErrorString(err));
+    cudaHostUnregister(state->staging);
+    std::free(state->staging);
+    MemoryGuard::release_host_bytes(state->host_reservation_bytes);
+    return false;
+  }
+
+  DynamicUploadState *raw = state.get();
+  const int device = g.device;
+  try {
+    state->worker = std::thread([raw, device]() {
+      if (cudaSetDevice(device) != cudaSuccess) {
+        std::lock_guard<std::mutex> lock(raw->mutex);
+        raw->stopping = true;
+        return;
+      }
+      for (;;) {
+        DynamicUploadJob job;
+        {
+          std::unique_lock<std::mutex> lock(raw->mutex);
+          raw->cv.wait(lock, [&]() {
+            return raw->stopping || !raw->queue.empty();
+          });
+          if (raw->stopping)
+            return;
+          job = std::move(raw->queue.front());
+          raw->queue.pop_front();
+          raw->active = true;
+        }
+
+        const auto upload_start = std::chrono::steady_clock::now();
+        bool success = true;
+        size_t upload_bytes = 0;
+        for (const DynamicUploadCopy &copy : job.copies) {
+          if (!copy.source || !copy.destination || copy.bytes == 0 ||
+              copy.staging_offset > raw->staging_capacity ||
+              copy.bytes > raw->staging_capacity - copy.staging_offset ||
+              copy.bytes > SIZE_MAX - upload_bytes) {
+            success = false;
+            break;
+          }
+          upload_bytes += copy.bytes;
+          auto *stage = static_cast<uint8_t *>(raw->staging) +
+                        copy.staging_offset;
+          std::memcpy(stage, copy.source, copy.bytes);
+          if (cudaMemcpyAsync(copy.destination, stage, copy.bytes,
+                              cudaMemcpyHostToDevice, raw->stream) !=
+              cudaSuccess) {
+            success = false;
+            break;
+          }
+        }
+        // Some copies may already be queued when a later enqueue fails. The
+        // staging buffer must not be reused until every submitted copy has
+        // stopped reading from it, even on this error path.
+        if (cudaStreamSynchronize(raw->stream) != cudaSuccess)
+          success = false;
+        if (!success) {
+          const cudaError_t err = cudaGetLastError();
+          LOG_WARN("[GGML-GLM5NEXT-CACHE] async expert upload failed "
+                   "layer=%d expert=%d: %s\n",
+                   job.layer, job.incoming_expert, cudaGetErrorString(err));
+        }
+        const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                      std::chrono::steady_clock::now() -
+                                      upload_start)
+                                      .count();
+        {
+          std::lock_guard<std::mutex> lock(raw->mutex);
+          raw->completed.push_back({job.layer, job.hot_slot,
+                                    job.incoming_expert, success,
+                                    upload_bytes, elapsed_ms});
+          raw->active = false;
+          if (!success)
+            raw->stopping = true;
+        }
+      }
+    });
+  } catch (...) {
+    cudaStreamDestroy(state->stream);
+    cudaHostUnregister(state->staging);
+    std::free(state->staging);
+    MemoryGuard::release_host_bytes(state->host_reservation_bytes);
+    return false;
+  }
+  LOG_INFO("[GGML-GLM5NEXT-CACHE] async H2D worker ready: staging=%.2f MiB "
+           "device=%d\n",
+           (double)staging_capacity / (1024.0 * 1024.0), g.device);
+  g.dynamic_upload = std::move(state);
+  return true;
+}
+
+bool make_dynamic_upload_job(PartialExpertLayer &p, int layer, int hot_slot,
+                             int incoming_expert, int evicted_expert,
+                             DynamicUploadJob *job) {
+  if (!job || hot_slot < 0 || (size_t)hot_slot >= p.hot.size() ||
+      incoming_expert < 0)
+    return false;
+  job->layer = layer;
+  job->hot_slot = hot_slot;
+  job->incoming_expert = incoming_expert;
+  job->evicted_expert = evicted_expert;
+  size_t offset = 0;
+  const auto add_pair = [&](ggml_tensor *hot, ggml_tensor *source) -> bool {
+    if (!hot || !source || !hot->data || !source->data ||
+        hot->nb[2] == 0 || hot->nb[2] != source->nb[2] ||
+        incoming_expert >= source->ne[2] || hot_slot >= hot->ne[2] ||
+        (size_t)incoming_expert > SIZE_MAX / source->nb[2] ||
+        (size_t)hot_slot > SIZE_MAX / hot->nb[2] ||
+        hot->nb[2] > SIZE_MAX - offset)
+      return false;
+    const size_t bytes = hot->nb[2];
+    const auto *src = static_cast<const uint8_t *>(source->data) +
+                      (size_t)incoming_expert * source->nb[2];
+    auto *dst = static_cast<uint8_t *>(hot->data) +
+                (size_t)hot_slot * hot->nb[2];
+    job->copies.push_back({src, dst, bytes, offset});
+    offset += bytes;
+    return true;
+  };
+  if (p.hot_gate_up || p.cold_gate_up) {
+    return add_pair(p.hot_gate_up, p.cold_gate_up) &&
+           add_pair(p.hot_down, p.cold_down);
+  }
+  return add_pair(p.hot_gate, p.cold_gate) &&
+         add_pair(p.hot_up, p.cold_up) &&
+         add_pair(p.hot_down, p.cold_down);
+}
+
+bool publish_dynamic_uploads(FullGraph &g) {
+  if (!g.dynamic_upload)
+    return true;
+  std::vector<DynamicUploadResult> completed;
+  {
+    std::lock_guard<std::mutex> lock(g.dynamic_upload->mutex);
+    completed.swap(g.dynamic_upload->completed);
+  }
+  for (const DynamicUploadResult &result : completed) {
+    if (result.layer < 0 ||
+        (size_t)result.layer >= g.partial_experts.size())
+      continue;
+    PartialExpertLayer &p = g.partial_experts[(size_t)result.layer];
+    if (result.hot_slot < 0 || (size_t)result.hot_slot >= p.hot.size() ||
+        (size_t)result.hot_slot >= p.slot_in_flight.size() ||
+        result.incoming_expert < 0 ||
+        (size_t)result.incoming_expert >= p.expert_in_flight.size()) {
+      g.ready = false;
+      return false;
+    }
+    p.slot_in_flight[(size_t)result.hot_slot] = 0;
+    p.expert_in_flight[(size_t)result.incoming_expert] = 0;
+    if (!result.success) {
+      // The slot was invalidated before the worker started. Keep it empty and
+      // let the unchanged full host source serve both the evicted and incoming
+      // routes; it can be reused by a later upload.
+      continue;
+    }
+    if (result.elapsed_ms > 0.0 && std::isfinite(result.elapsed_ms)) {
+      g.dynamic_upload_ms_per_job =
+          g.dynamic_upload_ms_per_job > 0.0
+              ? 0.8 * g.dynamic_upload_ms_per_job + 0.2 * result.elapsed_ms
+              : result.elapsed_ms;
+    }
+    if (p.hot[(size_t)result.hot_slot] != -1) {
+      LOG_ERROR("[GGML-GLM5NEXT-CACHE] completed upload targeted a live slot "
+                "layer=%d slot=%d\n",
+                result.layer, result.hot_slot);
+      g.ready = false;
+      return false;
+    }
+    const auto cold = std::find(p.cold.begin(), p.cold.end(),
+                                result.incoming_expert);
+    if (cold == p.cold.end()) {
+      LOG_ERROR("[GGML-GLM5NEXT-CACHE] completed expert missing from cold "
+                "set layer=%d expert=%d\n",
+                result.layer, result.incoming_expert);
+      g.ready = false;
+      return false;
+    }
+    p.hot[(size_t)result.hot_slot] = result.incoming_expert;
+    p.cold.erase(cold);
+    p.slot_last_use[(size_t)result.hot_slot] =
+        (int)std::min<uint64_t>(g.dynamic_clock, INT_MAX);
+    p.miss_count[(size_t)result.incoming_expert] = 0;
+    if (!upload_partial_maps(g, p)) {
+      g.ready = false;
+      return false;
+    }
+    ++g.dynamic_promotions;
+  }
+  return true;
+}
+
+void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
+  if (!g.partial_expert_residency || g.moe_route_ids.empty())
+    return;
+  const auto &c = g.engine->model_file.architecture_config;
+  const uint64_t clock = ++g.dynamic_clock;
+  for (const auto &[layer, route_tensor] : g.moe_route_ids) {
+    if (!route_tensor || layer < 0 ||
+        (size_t)layer >= g.partial_experts.size())
+      continue;
+    std::vector<int32_t> route_ids((size_t)c.topk);
+    ggml_backend_tensor_get(route_tensor, route_ids.data(), 0,
+                            route_ids.size() * sizeof(int32_t));
+    PartialExpertLayer &p = g.partial_experts[(size_t)layer];
+    for (int32_t expert : route_ids) {
+      if (expert < 0 || expert >= c.n_experts)
+        continue;
+      ++p.route_count;
+      if ((size_t)expert < p.expert_in_flight.size() &&
+          p.expert_in_flight[(size_t)expert]) {
+        if (p.miss_count[(size_t)expert] < UINT32_MAX)
+          ++p.miss_count[(size_t)expert];
+        continue;
+      }
+      const auto hot = std::find(p.hot.begin(), p.hot.end(), expert);
+      if (hot != p.hot.end()) {
+        ++p.hot_route_count;
+        const size_t slot = (size_t)(hot - p.hot.begin());
+        if (slot < p.slot_last_use.size())
+          p.slot_last_use[slot] = (int)std::min<uint64_t>(clock, INT_MAX);
+        if ((size_t)expert < p.miss_count.size())
+          p.miss_count[(size_t)expert] = 0;
+      } else if ((size_t)expert < p.miss_count.size() &&
+                 p.miss_count[(size_t)expert] < UINT32_MAX) {
+        ++p.miss_count[(size_t)expert];
+      }
+    }
+  }
+
+  if (g.dynamic_expert_cache) {
+    if (compute_ms > 0.0 && std::isfinite(compute_ms)) {
+      g.dynamic_compute_ms_ema =
+          g.dynamic_compute_ms_ema > 0.0
+              ? 0.8 * g.dynamic_compute_ms_ema + 0.2 * compute_ms
+              : compute_ms;
+    }
+    // Publish only at this post-compute boundary. The just-finished token's
+    // route statistics then reflect the map it actually executed with.
+    if (!publish_dynamic_uploads(g))
+      return;
+    if (g.dynamic_upload) {
+      std::lock_guard<std::mutex> lock(g.dynamic_upload->mutex);
+      if (g.dynamic_upload->stopping)
+        g.dynamic_upload_disabled = true;
+    }
+    int budget = dynamic_upload_budget_override();
+    if (budget < 0 && !g.dynamic_upload_disabled) {
+      if (!ensure_dynamic_upload_worker(g)) {
+        g.dynamic_upload_disabled = true;
+      } else {
+        size_t active_layers = 0;
+        for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
+          const PartialExpertLayer &p = g.partial_experts[(size_t)layer];
+          active_layers += !p.hot.empty() && !p.cold.empty();
+        }
+        if (g.dynamic_upload_ms_per_job <= 0.0) {
+          // Neurall-style bootstrap: enqueue one initial candidate per layer,
+          // then derive the steady-state budget from observed copy time.
+          budget = (int)std::min<size_t>(active_layers, 128);
+        } else {
+          size_t pending = 0;
+          {
+            std::lock_guard<std::mutex> lock(g.dynamic_upload->mutex);
+            pending = g.dynamic_upload->queue.size() +
+                      g.dynamic_upload->completed.size() +
+                      (g.dynamic_upload->active ? 1 : 0);
+          }
+          const double affordable =
+              dynamic_upload_fraction() * g.dynamic_compute_ms_ema /
+              g.dynamic_upload_ms_per_job;
+          const size_t total_budget =
+              std::min<size_t>(active_layers,
+                               (size_t)std::max(0.0, std::floor(affordable)));
+          budget = total_budget > pending
+                       ? (int)std::min<size_t>(total_budget - pending, 128)
+                       : 0;
+        }
+      }
+    }
+    if (budget < 0)
+      budget = 0;
+    if (budget > 0 && !g.dynamic_upload_disabled) {
+      if (!g.dynamic_upload && !ensure_dynamic_upload_worker(g)) {
+        g.dynamic_upload_disabled = true;
+      } else {
+      int scheduled = 0;
+      DynamicUploadState &state = *g.dynamic_upload;
+      size_t queued = 0;
+      {
+        std::lock_guard<std::mutex> lock(state.mutex);
+        queued = state.queue.size() + (state.active ? 1 : 0);
+      }
+      const size_t queue_limit = (size_t)std::max(2, budget * 2);
+      for (int layer = c.first_dense;
+           layer < c.n_layers && scheduled < budget &&
+           queued < queue_limit;
+           ++layer) {
+        PartialExpertLayer &p = g.partial_experts[(size_t)layer];
+        if (p.hot.empty() || p.cold.empty() ||
+            p.slot_last_use.size() != p.hot.size() ||
+            p.slot_in_flight.size() != p.hot.size() ||
+            p.miss_count.size() != (size_t)c.n_experts ||
+            p.expert_in_flight.size() != (size_t)c.n_experts)
+          continue;
+        int candidate_index = -1;
+        uint32_t candidate_hits = 1; // Ignore one-off routes.
+        for (size_t i = 0; i < p.cold.size(); ++i) {
+          const int expert = p.cold[i];
+          if (expert < 0 || expert >= c.n_experts ||
+              p.expert_in_flight[(size_t)expert])
+            continue;
+          const uint32_t hits = p.miss_count[(size_t)expert];
+          if (hits > candidate_hits) {
+            candidate_hits = hits;
+            candidate_index = (int)i;
+          }
+        }
+        if (candidate_index < 0)
+          continue;
+
+        int hot_slot = -1;
+        for (size_t i = 0; i < p.hot.size(); ++i) {
+          if (p.hot[i] < 0 && !p.slot_in_flight[i]) {
+            hot_slot = (int)i;
+            break;
+          }
+        }
+        if (hot_slot < 0) {
+          int oldest = INT_MAX;
+          for (size_t i = 0; i < p.hot.size(); ++i) {
+            if (p.slot_in_flight[i] || p.hot[i] < 0)
+              continue;
+            if (p.slot_last_use[i] < oldest) {
+              oldest = p.slot_last_use[i];
+              hot_slot = (int)i;
+            }
+          }
+        }
+        if (hot_slot < 0)
+          continue;
+
+        const int incoming = p.cold[(size_t)candidate_index];
+        const int evicted = p.hot[(size_t)hot_slot];
+        DynamicUploadJob job;
+        if (!make_dynamic_upload_job(p, layer, hot_slot, incoming, evicted,
+                                     &job)) {
+          LOG_WARN("[GGML-GLM5NEXT-CACHE] unable to form full-source upload "
+                   "layer=%d incoming=%d\n",
+                   layer, incoming);
+          continue;
+        }
+        if (evicted >= 0 &&
+            std::find(p.cold.begin(), p.cold.end(), evicted) == p.cold.end())
+          p.cold.push_back(evicted);
+        p.hot[(size_t)hot_slot] = -1;
+        p.slot_in_flight[(size_t)hot_slot] = 1;
+        p.expert_in_flight[(size_t)incoming] = 1;
+        if (!upload_partial_maps(g, p)) {
+          g.ready = false;
+          return;
+        }
+        {
+          std::lock_guard<std::mutex> lock(state.mutex);
+          if (state.stopping || state.queue.size() >= queue_limit) {
+            p.hot[(size_t)hot_slot] = evicted;
+            p.slot_in_flight[(size_t)hot_slot] = 0;
+            p.expert_in_flight[(size_t)incoming] = 0;
+            if (evicted >= 0)
+              p.cold.erase(std::remove(p.cold.begin(), p.cold.end(), evicted),
+                           p.cold.end());
+            if (!upload_partial_maps(g, p))
+              g.ready = false;
+            continue;
+          }
+          state.queue.push_back(std::move(job));
+          state.cv.notify_one();
+        }
+        ++scheduled;
+        ++queued;
+      }
+      if (scheduled > 0)
+        LOG_INFO("[GGML-GLM5NEXT-CACHE] pos=%d queued=%d/%d async expert "
+                 "uploads\n",
+                 pos_base, scheduled, budget);
+      }
+    }
+  }
+
+  if ((pos_base + 1) % 32 == 0) {
+    uint64_t routes = 0;
+    uint64_t hot_routes = 0;
+    for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
+      const PartialExpertLayer &p = g.partial_experts[(size_t)layer];
+      routes += p.route_count;
+      hot_routes += p.hot_route_count;
+    }
+    LOG_INFO("[GGML-GLM5NEXT-CACHE] pos=%d route hit=%.1f%% (%llu/%llu) "
+             "dynamic_promotions=%llu h2d_ema=%.3f ms/job "
+             "compute_ema=%.3f ms/token\n",
+             pos_base,
+             routes ? 100.0 * (double)hot_routes / routes : 0.0,
+             (unsigned long long)hot_routes,
+             (unsigned long long)routes,
+             (unsigned long long)g.dynamic_promotions,
+             g.dynamic_upload_ms_per_job, g.dynamic_compute_ms_ema);
+  }
+}
+
+bool hold_graph_vram_experts(FullGraph &g) {
+  if (!g.vram_reference_experts || g.vram_expert_holds.empty())
+    return true;
+  if (!g.topology)
+    return false;
+  size_t held = 0;
+  for (const FullGraph::VramExpertHold &ref : g.vram_expert_holds) {
+    if (!g.topology->hold_for_compute(ref.layer, ref.expert,
+                                      ref.device_ptr, false)) {
+      while (held > 0) {
+        const auto &prior = g.vram_expert_holds[--held];
+        g.topology->release_hold(prior.layer, prior.expert,
+                                 prior.device_ptr, false);
+      }
+      LOG_ERROR("[GGML-GLM5NEXT-CACHE] unable to hold aliased VRAM expert "
+                "layer=%d expert=%d for graph compute\n",
+                ref.layer, ref.expert);
+      return false;
+    }
+    ++held;
+  }
+  return true;
+}
+
+void release_graph_vram_experts(FullGraph &g) {
+  if (!g.vram_reference_experts || !g.topology)
+    return;
+  for (auto it = g.vram_expert_holds.rbegin();
+       it != g.vram_expert_holds.rend(); ++it)
+    g.topology->release_hold(it->layer, it->expert, it->device_ptr, false);
 }
 
 ggml_tensor *static_full_weight(FullGraph &g, ggml_context *ctx,
@@ -2246,16 +3378,17 @@ ggml_tensor *graph_ram_weight(FullGraph &g, ggml_context *ctx, int layer,
     return fail("CPU external buffer tensor initialization failed");
   }
   g.host_buffers.push_back(buffer);
-  g.host_weight_bytes += meta->size_bytes;
+  g.host_reference_bytes += meta->size_bytes;
   ggml_set_name(t, (name + ".graph_ram").c_str());
   return t;
 }
 
-ggml_tensor *expert_weight(FullGraph &g, ggml_context *ctx, int layer,
-                           const char *stem) {
-  if (partial_layer(g, layer))
+ggml_tensor *expert_weight_impl(FullGraph &g, ggml_context *ctx, int layer,
+                               const char *stem) {
+  if (partial_layer(g, layer) &&
+      !(g.vram_reference_experts && partial_layer_ram_ready(g, layer)))
     return load_cold_weight(g, ctx, layer, stem);
-  if (g.engine->graph_ram_layer_ready(layer)) {
+  if (partial_layer_ram_ready(g, layer)) {
     if (ggml_tensor *t = graph_ram_weight(g, ctx, layer, stem))
       return t;
   }
@@ -2265,17 +3398,74 @@ ggml_tensor *expert_weight(FullGraph &g, ggml_context *ctx, int layer,
                           on_device, true);
 }
 
-ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer) {
+ggml_tensor *expert_gate_up_weight_impl(FullGraph &g, ggml_context *ctx,
+                                       int layer) {
+  if (g.vram_reference_experts && partial_layer_ram_ready(g, layer))
+    return nullptr;
   if (partial_layer(g, layer))
     return load_gate_up_weight(g, ctx, layer, false);
   // The shared RAM arena stores gate and up as separate planes inside each
   // expert slice. Force the separate projection views so expert e's gate and
   // up bytes are addressed with the same fixed stride.
-  if (g.engine->graph_ram_layer_ready(layer))
+  if (partial_layer_ram_ready(g, layer))
     return nullptr;
   const bool on_device =
       layer >= g.first_dense && layer < g.first_dense + g.device_expert_layers;
   return load_gate_up_weight(g, ctx, layer, on_device);
+}
+
+
+// Optional second-GPU expert residency (env MOESTREAM_GLM5NEXT_GPU1_LAYERS,
+// "first-last"): decode-graph expert tensors of those layers are copied to a
+// CUDA buffer on device 1 so the scheduler runs their MUL_MAT_ID there.
+bool gpu1_layer(const FullGraph &g, int layer) {
+  return g.decode_mode && g.gpu1 && layer >= g.gpu1_first &&
+         layer <= g.gpu1_last;
+}
+
+ggml_tensor *move_expert_to_gpu1(FullGraph &g, ggml_context *ctx, int layer,
+                                 ggml_tensor *host) {
+  if (!host || !gpu1_layer(g, layer) || host->ne[3] != 1)
+    return host;
+  ggml_tensor *t = ggml_new_tensor_3d(ctx, host->type, host->ne[0], host->ne[1],
+                                      host->ne[2]);
+  if (!t)
+    return host;
+  const auto buft = ggml_backend_get_default_buffer_type(g.gpu1);
+  ggml_backend_buffer_t buf =
+      ggml_backend_buft_alloc_buffer(buft, ggml_nbytes(t) + 4096);
+  if (!buf) {
+    LOG_WARN("[GGML-GLM5NEXT-FULL] GPU1 expert buffer declined layer=%d "
+             "(%.2f GiB); keeping host tensor\n",
+             layer, (double)ggml_nbytes(t) / (1024.0 * 1024.0 * 1024.0));
+    return host;
+  }
+  ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) !=
+      GGML_STATUS_SUCCESS) {
+    ggml_backend_buffer_free(buf);
+    return host;
+  }
+  const size_t per_expert = ggml_row_size(host->type, host->ne[0]) *
+                            (size_t)host->ne[1];
+  for (int64_t e = 0; e < host->ne[2]; ++e)
+    ggml_backend_tensor_set(t, (const char *)host->data + (size_t)e * host->nb[2],
+                            (size_t)e * t->nb[2], per_expert);
+  ggml_set_name(t, host->name);
+  g.gpu1_buffers.push_back(buf);
+  g.gpu1_bytes += ggml_nbytes(t);
+  return t;
+}
+
+ggml_tensor *expert_weight(FullGraph &g, ggml_context *ctx, int layer,
+                           const char *stem) {
+  return move_expert_to_gpu1(g, ctx, layer,
+                             expert_weight_impl(g, ctx, layer, stem));
+}
+
+ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer) {
+  return move_expert_to_gpu1(g, ctx, layer,
+                             expert_gate_up_weight_impl(g, ctx, layer));
 }
 
 size_t expert_source_bytes(const StreamingEngine &engine,
@@ -2302,6 +3492,13 @@ size_t expert_source_bytes(const StreamingEngine &engine,
 
 size_t expert_source_bytes(const FullGraph &g) {
   if (!g.partial_expert_residency)
+    return expert_source_bytes(*g.engine, g.device_expert_layers);
+
+  // Neurall-style dynamic caching keeps the original expert records in the
+  // host source arena while hot copies come and go in VRAM. This avoids the
+  // old eviction path's device-to-host readback and keeps every cold fallback
+  // address stable across cache updates.
+  if (g.dynamic_expert_cache)
     return expert_source_bytes(*g.engine, g.device_expert_layers);
 
   const auto &c = g.engine->model_file.architecture_config;
@@ -2334,6 +3531,13 @@ size_t expert_source_bytes(const FullGraph &g) {
 bool compact_partial_source(FullGraph &g) {
   if (!g.partial_expert_residency || g.partial_sources_compacted)
     return true;
+  if (g.dynamic_expert_cache) {
+    // Dynamic mode deliberately retains full-expert source views. The cold
+    // graph maps routed IDs to their original expert indices, so no in-place
+    // cold-only compaction is appropriate here.
+    g.partial_sources_compacted = true;
+    return true;
+  }
   const auto &c = g.engine->model_file.architecture_config;
   g.expert_source_full_views = g.expert_source_views;
   g.expert_source_full_view_bytes = g.expert_source_view_bytes;
@@ -2412,7 +3616,79 @@ bool compact_partial_source(FullGraph &g) {
   return true;
 }
 
+bool preload_mmap_expert_source(FullGraph &g) {
+  if (!g.dynamic_expert_cache ||
+      (!g.engine->model_file.mmap_active() &&
+       !g.engine->model_file.enable_mmap()))
+    return false;
+
+  const auto &c = g.engine->model_file.architecture_config;
+  const int device_end = c.first_dense + g.device_expert_layers;
+  size_t mapped_bytes = 0;
+  const auto add_view = [&](const GGUFTensor *meta) -> bool {
+    if (!meta || !type_ok(meta->type) || meta->size_bytes == 0 ||
+        meta->size_bytes > SIZE_MAX ||
+        (size_t)meta->size_bytes > SIZE_MAX - mapped_bytes)
+      return false;
+    const uint8_t *mapped = g.engine->model_file.mmap_bytes(
+        *meta, meta->offset, (size_t)meta->size_bytes);
+    if (!mapped)
+      return false;
+    const bool inserted = g.expert_source_views
+                              .emplace(meta->name,
+                                       const_cast<uint8_t *>(mapped))
+                              .second;
+    if (!inserted ||
+        !g.expert_source_view_bytes
+             .emplace(meta->name, (size_t)meta->size_bytes)
+             .second)
+      return false;
+    mapped_bytes += (size_t)meta->size_bytes;
+    ++g.expert_source_tensors;
+    return true;
+  };
+
+  for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
+    if (layer < device_end || g.engine->graph_ram_layer_ready(layer))
+      continue;
+    PackedGateUpMeta packed;
+    if (packed_gate_up_meta(*g.engine, layer, &packed)) {
+      // Keep the file's native separate gate/up planes.  Interleaving them
+      // into a temporary packed tensor would recreate the full-size host
+      // allocation this mmap path is specifically avoiding.
+      if (!add_view(packed.gate) || !add_view(packed.up))
+        return false;
+    } else {
+      const std::string prefix = "blk." + std::to_string(layer) + ".";
+      if (!add_view(model_tensor(*g.engine, prefix + "ffn_gate_exps.weight")) ||
+          !add_view(model_tensor(*g.engine, prefix + "ffn_up_exps.weight")))
+        return false;
+    }
+    const std::string down_name =
+        "blk." + std::to_string(layer) + ".ffn_down_exps.weight";
+    if (!add_view(model_tensor(*g.engine, down_name)))
+      return false;
+  }
+
+  if (mapped_bytes == 0 || mapped_bytes != g.expert_source_capacity) {
+    LOG_WARN("[GGML-GLM5NEXT-FULL] mapped source size mismatch: mapped=%.2f "
+             "GiB expected=%.2f GiB\n",
+             (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
+             (double)g.expert_source_capacity / (1024.0 * 1024.0 * 1024.0));
+    return false;
+  }
+  g.expert_source_used = mapped_bytes;
+  LOG_INFO("[GGML-GLM5NEXT-FULL] dynamic expert source mapped read-only: "
+           "%.2f GiB across %zu tensors; pages remain OS-reclaimable\n",
+           (double)mapped_bytes / (1024.0 * 1024.0 * 1024.0),
+           g.expert_source_tensors);
+  return true;
+}
+
 bool preload_expert_source(FullGraph &g) {
+  if (g.expert_source_mmap)
+    return preload_mmap_expert_source(g);
+
   const auto &c = g.engine->model_file.architecture_config;
   struct Job {
     const GGUFTensor *meta = nullptr;
@@ -2431,7 +3707,7 @@ bool preload_expert_source(FullGraph &g) {
     if (g.engine->graph_ram_layer_ready(l))
       continue;
     const std::vector<int> *selected_experts = nullptr;
-    if (g.partial_expert_residency) {
+    if (g.partial_expert_residency && !g.dynamic_expert_cache) {
       if (l >= (int)g.partial_experts.size())
         return false;
       selected_experts = &g.partial_experts[(size_t)l].cold;
@@ -2605,11 +3881,10 @@ bool preload_expert_source(FullGraph &g) {
                          : 0.0,
            jobs.size(), n_threads);
 
-  // Partial residency is now read directly into the compact cold layout;
-  // the hot records are loaded from GGUF into the device arena during graph
-  // construction.  Avoid allocating the former full-weight source and
-  // compacting it only after peak memory has already been committed.
-  if (g.partial_expert_residency)
+  // Static partial residency is read directly into the compact cold layout.
+  // Dynamic mode intentionally retains every original record as the stable
+  // host backing store for asynchronous H2D cache fills.
+  if (g.partial_expert_residency && !g.dynamic_expert_cache)
     g.partial_sources_compacted = true;
   if (!compact_partial_source(g)) {
     LOG_ERROR("[GGML-FULL] partial expert source compaction failed\n");
@@ -2740,6 +4015,8 @@ bool preload_expert_source(FullGraph &g) {
 }
 
 size_t device_expert_bytes(const FullGraph &g) {
+  if (g.vram_reference_experts)
+    return 0;
   const auto &c = g.engine->model_file.architecture_config;
   size_t total = 0;
   if (g.partial_expert_residency) {
@@ -2802,6 +4079,8 @@ size_t dense_arena_bytes(const FullGraph &g) {
   size_t total = 0;
   for (const auto &[name, q] : g.engine->resident_layers) {
     if (!q.host_ptr || !graph_dense_weight_name(name))
+      continue;
+    if (name == "output.weight" && !g.decode_mode)
       continue;
     if (total > std::numeric_limits<size_t>::max() - q.meta.size_bytes - 4096)
       return 0;
@@ -2959,6 +4238,35 @@ ggml_tensor *new_decode_state_tensor(FullGraph &g, ggml_context *ctx,
 bool init_expert_arena(FullGraph &g) {
   if (!g.partial_expert_residency && g.device_expert_layers <= 0)
     return true;
+  if (g.vram_reference_experts) {
+    const bool has_hot_refs = std::any_of(
+        g.partial_experts.begin(), g.partial_experts.end(),
+        [](const PartialExpertLayer &p) { return !p.hot.empty(); });
+    if (!has_hot_refs)
+      return true;
+    // GGML needs a CUDA buffer handle to classify these immutable source
+    // tensors, but their data pointers belong to GpuTopology's cache pool.
+    // This tiny owned allocation is metadata/handle backing only; no expert
+    // weights are copied into it.
+    constexpr size_t kReferenceBufferBytes = 1ull << 20;
+    const auto buft = ggml_backend_get_default_buffer_type(g.cuda);
+    g.expert_buffer = ggml_backend_buft_alloc_buffer(
+        buft, kReferenceBufferBytes);
+    if (!g.expert_buffer) {
+      LOG_WARN("[GGML-GLM5NEXT-FULL] could not create CUDA buffer handle for "
+               "VRAM expert references\n");
+      return false;
+    }
+    ggml_backend_buffer_set_usage(g.expert_buffer,
+                                  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    g.expert_base = ggml_backend_buffer_get_base(g.expert_buffer);
+    g.expert_capacity = ggml_backend_buffer_get_size(g.expert_buffer);
+      LOG_INFO("[GGML-GLM5NEXT-FULL] VRAM expert weights are aliased from "
+               "resident cache slots; graph-owned weight bytes=0, descriptor "
+             "buffer=%.2f MiB\n",
+             (double)g.expert_capacity / (1024.0 * 1024.0));
+    return true;
+  }
   const size_t bytes = device_expert_bytes(g);
   if (bytes == 0)
     return false;
@@ -3015,11 +4323,28 @@ bool init_expert_source(FullGraph &g, size_t source_bytes) {
 
 bool source_configuration_matches(const FullGraph &source,
                                   const FullGraph &candidate) {
-  return source.has_expert_source() && source.engine == candidate.engine &&
-         source.device_expert_layers == candidate.device_expert_layers &&
-         source.partial_expert_residency ==
-             candidate.partial_expert_residency &&
-         source.partial_usage_file == candidate.partial_usage_file;
+  if (!source.has_expert_source() || source.engine != candidate.engine ||
+      source.topology != candidate.topology ||
+      source.vram_reference_experts != candidate.vram_reference_experts ||
+      source.device_expert_layers != candidate.device_expert_layers ||
+      source.partial_expert_residency != candidate.partial_expert_residency ||
+      source.dynamic_expert_cache != candidate.dynamic_expert_cache ||
+      source.partial_usage_file != candidate.partial_usage_file ||
+      source.partial_experts.size() != candidate.partial_experts.size())
+    return false;
+  for (size_t i = 0; i < source.partial_experts.size(); ++i) {
+    const PartialExpertLayer &a = source.partial_experts[i];
+    const PartialExpertLayer &b = candidate.partial_experts[i];
+    if (a.hot != b.hot || a.cold != b.cold ||
+        a.vram_slot_by_expert != b.vram_slot_by_expert ||
+        a.vram_layer_base != b.vram_layer_base ||
+        a.vram_layer_slots != b.vram_layer_slots ||
+        a.vram_slot_stride != b.vram_slot_stride)
+      return false;
+  }
+  if (source.vram_reference_bytes != candidate.vram_reference_bytes)
+    return false;
+  return true;
 }
 
 bool prepare_expert_source_only(FullGraph &g, const char *tag) {
@@ -3030,17 +4355,66 @@ bool prepare_expert_source_only(FullGraph &g, const char *tag) {
   // floor rather than several different ad hoc numbers.
   constexpr size_t kWatermark = 10ull * 1024ull * 1024ull * 1024ull;
   const size_t host_live = graph_host_live_bytes(*g.engine);
+  const long pre_call_available_mb = MemoryGuard::read_available_mb();
+  const size_t pre_call_reserved = MemoryGuard::reserved_host_bytes();
+  LOG_INFO("[%s] admission attempt: source=%.2f GiB existing(host_live)=%.2f "
+           "GiB ledger_reserved=%.2f GiB MemAvailable=%ld MiB (sampled "
+           "immediately before the try_reserve_host_bytes call)\n",
+           tag, (double)source / (1024.0 * 1024.0 * 1024.0),
+           (double)host_live / (1024.0 * 1024.0 * 1024.0),
+           (double)pre_call_reserved / (1024.0 * 1024.0 * 1024.0),
+           pre_call_available_mb);
+  if (g.dynamic_expert_cache) {
+    // The per-token GLM cache needs an immutable source for every expert, but
+    // that source need not be another eagerly populated 78 GiB anonymous
+    // arena. Keep GGUF shard pages file-backed and reclaimable; the cold CPU
+    // branch and the pinned H2D staging worker fault only the ranges they use.
+    if (source == 0 || source > SIZE_MAX - kSourceSlack ||
+        !MemoryGuard::try_reserve_host_bytes(1, kWatermark)) {
+      LOG_WARN(
+          "[%s] mapped-source admission refused source=%.2f GiB existing="
+          "%.2f GiB reserve=%.2f GiB budget=%.2f GB MemAvailable=%ld MiB "
+          "(live, not watchdog-stale) stop_mb=%ld\n",
+          tag, (double)source / (1024.0 * 1024.0 * 1024.0),
+          (double)host_live / (1024.0 * 1024.0 * 1024.0),
+          (double)kWatermark / (1024.0 * 1024.0 * 1024.0),
+          (double)MemoryGuard::host_budget_bytes() / 1.0e9,
+          MemoryGuard::read_available_mb(), MemoryGuard::stop_limit_mb());
+      return false;
+    }
+    MemoryGuard::release_host_bytes(1);
+    g.expert_source_mmap = true;
+    g.expert_source_capacity = source; // logical bytes, not one contiguous span
+    if (!preload_expert_source(g)) {
+      LOG_WARN("[%s] could not establish mapped expert views; graph will "
+               "use the legacy path\n",
+               tag);
+      return false;
+    }
+    LOG_INFO("[%s] mapped-source admission: %.2f GiB logical source, "
+             "existing=%.2f GiB reserve=%.2f GiB budget=%.2f GB; no full "
+             "anonymous source copy\n",
+             tag, (double)source / (1024.0 * 1024.0 * 1024.0),
+             (double)host_live / (1024.0 * 1024.0 * 1024.0),
+             (double)kWatermark / (1024.0 * 1024.0 * 1024.0),
+             (double)MemoryGuard::host_budget_bytes() / 1.0e9);
+    return true;
+  }
   if (source > SIZE_MAX - kSourceSlack ||
       (source > 0 && !MemoryGuard::try_reserve_host_bytes(source + kSourceSlack,
                                                           kWatermark))) {
     LOG_WARN(
-        "[%s] boot host admission refused source=%.2f GiB existing=%.2f GiB "
-        "reserve=%.2f GiB budget=%.2f GB MemAvailable=%ld MiB\n",
+        "[%s] boot host admission refused source=%.2f GiB existing(host_live)="
+        "%.2f GiB ledger_reserved=%.2f GiB reserve=%.2f GiB budget=%.2f GB "
+        "MemAvailable=%ld MiB (live, not watchdog-stale) stop_mb=%ld "
+        "blocked=%d\n",
         tag, (double)source / (1024.0 * 1024.0 * 1024.0),
         (double)host_live / (1024.0 * 1024.0 * 1024.0),
+        (double)MemoryGuard::reserved_host_bytes() / (1024.0 * 1024.0 * 1024.0),
         (double)kWatermark / (1024.0 * 1024.0 * 1024.0),
         (double)MemoryGuard::host_budget_bytes() / 1.0e9,
-        MemoryGuard::last_available_mb());
+        MemoryGuard::read_available_mb(), MemoryGuard::stop_limit_mb(),
+        (int)MemoryGuard::allocation_blocked());
     return false;
   }
   g.host_reservation_bytes = source + (source ? kSourceSlack : 0);
@@ -3077,6 +4451,23 @@ ggml_tensor *hc_mean(FullGraph &g, ggml_context *ctx, ggml_tensor *x) {
   return ggml_scale(ctx, out, 1.0f / (float)g.HC);
 }
 
+ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t) {
+  return t && !ggml_is_contiguous(t) ? ggml_cont(ctx, t) : t;
+}
+
+// MOESTREAM_GLM5NEXT_FUSED_HC: unset/"1" = all fused ops; otherwise any of
+// the letters c (hc_comb), p (hc_pre sum), o (hc_post) enables just those.
+bool fused_hc_op(char which) {
+  // Default ON. MOESTREAM_GLM5NEXT_UNFUSED_HC=1 restores the composed-op path.
+  static const bool off = std::getenv("MOESTREAM_GLM5NEXT_UNFUSED_HC") != nullptr;
+  if (off)
+    return false;
+  static const char *e = std::getenv("MOESTREAM_GLM5NEXT_FUSED_HC");
+  if (!e || e[0] == '1')
+    return true;
+  return std::strchr(e, which) != nullptr;
+}
+
 ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base,
                     ggml_tensor **post, ggml_tensor **comb) {
@@ -3103,31 +4494,37 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
   *post = ggml_scale(
       ctx, ggml_sigmoid(ctx, hc_affine(ctx, *post, scale_post, base_post)),
       2.0f);
-  *comb = ggml_view_2d(ctx, mixes, g.HC * g.HC, g.S, mixes->nb[1],
-                       (size_t)2 * g.HC * mixes->nb[0]);
-  *comb = hc_affine(ctx, *comb, scale_comb, base_comb);
-  *comb = ggml_reshape_3d(ctx, *comb, g.HC, g.HC, g.S);
-
-  // Exact DeepSeek-V4/GLM reference order: row softmax, epsilon, one column
-  // normalization, then row/column Sinkhorn iterations.
-  ggml_tensor *eps = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-  eps = ggml_fill(ctx, eps, c.hc_eps);
-  *comb = ggml_add(ctx, ggml_soft_max(ctx, *comb), eps);
-  auto norm_cols = [&]() {
-    ggml_tensor *p = ggml_cont(ctx, ggml_permute(ctx, *comb, 1, 0, 2, 3));
-    ggml_tensor *sum = ggml_add(ctx, ggml_sum_rows(ctx, p), eps);
-    sum = ggml_permute(ctx, sum, 1, 0, 2, 3);
-    *comb = ggml_div(ctx, *comb, sum);
-  };
-  auto norm_rows = [&]() {
-    ggml_tensor *sum = ggml_add(ctx, ggml_sum_rows(ctx, *comb), eps);
-    *comb = ggml_div(ctx, *comb, sum);
-  };
-  norm_cols();
-  for (int i = 1; i < c.hc_sinkhorn_iters; ++i) {
-    norm_rows();
+  const bool f_comb = fused_hc_op('c'), f_pre = fused_hc_op('p');
+  if (f_comb) {
+    *comb = ggml_dsv4_hc_comb(ctx, hc_contig(ctx, mixes), hc_contig(ctx, scale),
+                              hc_contig(ctx, base), c.hc_eps,
+                              (int32_t)c.hc_sinkhorn_iters);
+  } else {
+    *comb = ggml_view_2d(ctx, mixes, g.HC * g.HC, g.S, mixes->nb[1],
+                         (size_t)2 * g.HC * mixes->nb[0]);
+    *comb = hc_affine(ctx, *comb, scale_comb, base_comb);
+    *comb = ggml_reshape_3d(ctx, *comb, g.HC, g.HC, g.S);
+    ggml_tensor *eps = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    eps = ggml_fill(ctx, eps, c.hc_eps);
+    *comb = ggml_add(ctx, ggml_soft_max(ctx, *comb), eps);
+    auto norm_cols = [&]() {
+      ggml_tensor *p = ggml_cont(ctx, ggml_permute(ctx, *comb, 1, 0, 2, 3));
+      ggml_tensor *sum = ggml_add(ctx, ggml_sum_rows(ctx, p), eps);
+      sum = ggml_permute(ctx, sum, 1, 0, 2, 3);
+      *comb = ggml_div(ctx, *comb, sum);
+    };
+    auto norm_rows = [&]() {
+      ggml_tensor *sum = ggml_add(ctx, ggml_sum_rows(ctx, *comb), eps);
+      *comb = ggml_div(ctx, *comb, sum);
+    };
     norm_cols();
+    for (int i = 1; i < c.hc_sinkhorn_iters; ++i) {
+      norm_rows();
+      norm_cols();
+    }
   }
+  if (f_pre)
+    return ggml_dsv4_hc_pre(ctx, hc_contig(ctx, x), hc_contig(ctx, pre));
 
   ggml_tensor *result = nullptr;
   for (int h = 0; h < g.HC; ++h) {
@@ -3144,6 +4541,9 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
 ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                      ggml_tensor *residual, ggml_tensor *post,
                      ggml_tensor *comb) {
+  if (fused_hc_op('o'))
+    return ggml_dsv4_hc_post(ctx, hc_contig(ctx, x), hc_contig(ctx, residual),
+                             hc_contig(ctx, post), hc_contig(ctx, comb));
   ggml_tensor *out = nullptr;
   for (int dst = 0; dst < g.HC; ++dst) {
     ggml_tensor *pd =
@@ -3633,7 +5033,13 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ue = expert_weight(g, ctx, layer, "ffn_up_exps.weight");
   }
   ggml_tensor *de = expert_weight(g, ctx, layer, "ffn_down_exps.weight");
-  const PartialExpertLayer *partial_weights = partial_layer(g, layer);
+  PartialExpertLayer *partial_weights = partial_layer(g, layer);
+  if (g.decode_mode && g.dynamic_expert_cache && partial_weights) {
+    partial_weights->cold_gate_up = gate_up;
+    partial_weights->cold_gate = ge;
+    partial_weights->cold_up = ue;
+    partial_weights->cold_down = de;
+  }
   if (!router)
     return nullptr;
   if (!partial_weights && (!gate_up && (!ge || !ue)) ||
@@ -3642,6 +5048,18 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (partial_weights && !partial_weights->cold.empty() &&
       ((!gate_up && (!ge || !ue)) || !de))
     return nullptr;
+  if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+    const bool ready = partial_layer_ram_ready(g, layer);
+    LOG_WARN(
+        "[PARTIAL-DEBUG] layer=%d n_experts=%d hot=%zu cold=%zu ready=%d "
+        "vram_slots=%zu de_ne2=%lld ge_ne2=%lld ue_ne2=%lld gate_up_ne2=%lld "
+        "hot_down_ne2=%lld\n",
+        layer, c.n_experts, partial_weights->hot.size(),
+        partial_weights->cold.size(), ready ? 1 : 0,
+        partial_weights->vram_layer_slots, de ? (long long)de->ne[2] : -1,
+        ge ? (long long)ge->ne[2] : -1, ue ? (long long)ue->ne[2] : -1,
+        gate_up ? (long long)gate_up->ne[2] : -1);
+  }
 
   ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
   ggml_tensor *probs = nullptr;
@@ -3664,6 +5082,27 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // every other layer keeps GGML's normal biased top-k node.
   ggml_tensor *ids =
       forced_ids ? forced_ids : ggml_argsort_top_k(ctx, selection, c.topk);
+  if (route_stats_enabled() && g.decode_mode &&
+      g.partial_expert_residency && ids) {
+    // Keep a graph output copy of each layer's IDs.  The scheduler may
+    // recycle the original intermediate after MUL_MAT_ID consumes it, so
+    // reading `ids` after the whole graph finishes can otherwise return
+    // overwritten values for earlier layers.
+    ggml_tensor *snapshot = ggml_dup(ctx, ids);
+    if (!snapshot)
+      return nullptr;
+    ggml_set_name(snapshot,
+                  ("glm5next_route_snapshot_" + std::to_string(layer)).c_str());
+    // Keep the route copy in the CUDA split when the backend supports it.
+    // Besides making the runtime readback explicit, this prevents 42 small
+    // DUP nodes from doubling the scheduler split count in dynamic-cache
+    // mode. Conditional graph harvesting will still independently enforce
+    // Qwen's one-split safety gate on whichever GLM segment is considered.
+    if (g.sched && ggml_backend_supports_op(g.cuda, snapshot))
+      ggml_backend_sched_set_tensor_backend(g.sched, snapshot, g.cuda);
+    ggml_build_forward_expand(g.graph, snapshot);
+    g.moe_route_ids.emplace_back(layer, snapshot);
+  }
   ggml_tensor *weights =
       ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, c.n_experts, g.S), ids);
   ggml_tensor *weights2 = ggml_reshape_2d(ctx, weights, c.topk, g.S);
@@ -3683,6 +5122,22 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
   if (g.partial_expert_residency && !prepare_partial_hot(g, ctx, layer))
     return nullptr;
+  if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+    LOG_WARN(
+        "[PARTIAL-DEBUG-HOT] layer=%d hot=%zu vram_slots=%zu "
+        "hot_gate_ne2=%lld hot_up_ne2=%lld hot_down_ne2=%lld "
+        "hot_gate_up_ne2=%lld\n",
+        layer, partial_weights->hot.size(), partial_weights->vram_layer_slots,
+        partial_weights->hot_gate ? (long long)partial_weights->hot_gate->ne[2]
+                                  : -1,
+        partial_weights->hot_up ? (long long)partial_weights->hot_up->ne[2]
+                                : -1,
+        partial_weights->hot_down ? (long long)partial_weights->hot_down->ne[2]
+                                  : -1,
+        partial_weights->hot_gate_up
+            ? (long long)partial_weights->hot_gate_up->ne[2]
+            : -1);
+  }
 
   const auto run_branch = [&](ggml_tensor *branch_gate_up,
                               ggml_tensor *branch_gate, ggml_tensor *branch_up,
@@ -4039,6 +5494,8 @@ bool build_graph(FullGraph &g) {
       g.dsa_layers.push_back(l);
     }
     res = hc_post(g, g.ctx, attn, residual, post, comb);
+    if (g.decode_mode && layer_timing_env())
+      g.layer_marks[res] = {l, 0};
 
     residual = res;
     post = comb = nullptr;
@@ -4064,6 +5521,8 @@ bool build_graph(FullGraph &g) {
       return false;
     }
     res = hc_post(g, g.ctx, ffn, residual, post, comb);
+    if (g.decode_mode && layer_timing_env())
+      g.layer_marks[res] = {l, 1};
     if (l >= c.first_dense && (l == c.first_dense || l + 1 == g.n_layers ||
                                ((l - c.first_dense + 1) % 4) == 0)) {
       LOG_INFO("[GGML-GLM5NEXT-FULL] graph source progress layer=%d/%d "
@@ -4084,6 +5543,20 @@ bool build_graph(FullGraph &g) {
   ggml_build_forward_expand(g.graph, g.final_streams);
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
+  if (g.decode_mode && !std::getenv("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
+    ggml_tensor *out_norm = resident_tensor(g, g.ctx, "output_norm.weight");
+    ggml_tensor *out_w = resident_tensor(g, g.ctx, "output.weight");
+    if (out_norm && out_w) {
+      ggml_tensor *lm_in = ggml_mul(
+          g.ctx,
+          ggml_rms_norm(g.ctx, g.output,
+                        g.engine->model_file.architecture_config.eps),
+          out_norm);
+      g.logits = ggml_mul_mat(g.ctx, out_w, lm_in);
+      ggml_set_output(g.logits);
+      ggml_build_forward_expand(g.graph, g.logits);
+    }
+  }
   if (g.decode_mode) {
     for (ggml_tensor *t : g.kda_state_updates)
       ggml_build_forward_expand(g.graph, t);
@@ -4174,21 +5647,24 @@ bool build_graph(FullGraph &g) {
     LOG_INFO("[GGML-GLM5NEXT-FULL] non-CUDA nodes: %s\n", detail.c_str());
   }
   LOG_INFO("[GGML-GLM5NEXT-FULL] graph built layers=%d nodes=%d splits=%d "
-           "workspace=%.2f GiB "
-           "KDA=%zu DSA=%zu\n",
+           "workspace=%.2f GiB KDA=%zu DSA=%zu route_snapshots=%zu\n",
            g.n_layers, ggml_graph_n_nodes(g.graph),
            ggml_backend_sched_get_n_splits(g.sched),
            (double)g.graph_workspace_bytes / (1024.0 * 1024.0 * 1024.0),
-           g.kda_layers.size(), g.dsa_layers.size());
+           g.kda_layers.size(), g.dsa_layers.size(), g.moe_route_ids.size());
   LOG_INFO(
       "[GGML-GLM5NEXT-FULL] dense arena=%.2f/%.2f GiB tensors=%d; "
-      "expert arena used=%.2f/%.2f GiB; host source=%.2f GiB pinned=%.2f GiB "
+      "graph-owned expert weights=%.2f/%.2f GiB; VRAM cache aliases=%.2f "
+      "GiB (included in cache, not additional); host source=%.2f GiB, "
+      "DDR refs=%.2f GiB (not additional), pinned=%.2f GiB "
       "pin_failures=%zu\n",
       (double)g.dense_used / (1024.0 * 1024.0 * 1024.0),
       (double)g.dense_capacity / (1024.0 * 1024.0 * 1024.0), g.dense_tensors,
       (double)g.expert_used / (1024.0 * 1024.0 * 1024.0),
       (double)g.expert_capacity / (1024.0 * 1024.0 * 1024.0),
+      (double)g.vram_reference_bytes / (1024.0 * 1024.0 * 1024.0),
       (double)g.host_weight_bytes / (1024.0 * 1024.0 * 1024.0),
+      (double)g.host_reference_bytes / (1024.0 * 1024.0 * 1024.0),
       (double)g.host_pinned_bytes / (1024.0 * 1024.0 * 1024.0),
       g.host_pin_failures);
   LOG_INFO("[GGML-GLM5NEXT-FULL-MEM] host ledger=%.2f/%.2f GB; graph source="
@@ -4211,12 +5687,17 @@ bool build_graph(FullGraph &g) {
 
 bool glm5next_full_graph_enabled() { return env_enabled(); }
 
+void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
+  g_glm5next_vram_cache = topology;
+}
+
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
 
   FullGraph candidate;
   candidate.engine = &engine;
+  candidate.topology = g_glm5next_vram_cache;
   candidate.device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   candidate.first_dense = engine.model_file.architecture_config.first_dense;
   candidate.device_expert_layers =
@@ -4235,16 +5716,21 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   g_glm5next_source.reset();
   auto source = std::make_unique<FullGraph>();
   source->engine = candidate.engine;
+  source->topology = candidate.topology;
   source->device = candidate.device;
   source->first_dense = candidate.first_dense;
   source->device_expert_layers = candidate.device_expert_layers;
   source->partial_expert_residency = candidate.partial_expert_residency;
+  source->vram_reference_experts = candidate.vram_reference_experts;
+  source->dynamic_expert_cache = candidate.dynamic_expert_cache;
   source->partial_sources_compacted = candidate.partial_sources_compacted;
   source->partial_hot_bytes = candidate.partial_hot_bytes;
   source->partial_cold_bytes = candidate.partial_cold_bytes;
   source->partial_hot_records = candidate.partial_hot_records;
+  source->vram_reference_bytes = candidate.vram_reference_bytes;
   source->partial_usage_file = std::move(candidate.partial_usage_file);
   source->partial_experts = std::move(candidate.partial_experts);
+  source->vram_expert_holds = std::move(candidate.vram_expert_holds);
   if (!prepare_expert_source_only(*source, "GGML-GLM5NEXT-FULL"))
     return false;
   g_glm5next_source = std::move(source);
@@ -4284,6 +5770,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g_graph.reset();
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
+  g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = S;
   g->D = c.hidden;
@@ -4309,6 +5796,10 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     g->device_expert_layers = 0;
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
+  if (g->cpu) {
+    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
+  }
   if (!g->cuda || !g->cpu)
     return false;
 
@@ -4423,6 +5914,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
+  g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = 1;
   g->decode_mode = true;
@@ -4528,6 +6020,10 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
+  if (g->cpu) {
+    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
+  }
   if (!g->cuda || !g->cpu)
     return decline_decode_graph();
   if (!source_transferred && g_glm5next_source &&
@@ -4543,9 +6039,22 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !init_decode_state_arena(*g)) {
     return decline_decode_graph();
   }
-  ggml_backend_t backends[] = {g->cuda, g->cpu};
-  g->sched =
-      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, true);
+  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
+    int a = -1, b = -2;
+    if (std::sscanf(e, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a) {
+      g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
+      if (g->gpu1) {
+        g->gpu1_first = a;
+        g->gpu1_last = b;
+        LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] GPU1 expert layers %d-%d\n", a, b);
+      }
+    }
+  }
+  ggml_backend_t backends[] = {g->cuda, g->gpu1, g->cpu};
+  if (!g->gpu1)
+    backends[1] = g->cpu;
+  g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2,
+                                    kGraphSize, false, true);
   if (!g->sched || !build_graph(*g)) {
     LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] graph construction declined; "
              "using legacy decode\n");
@@ -4639,6 +6148,142 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
       g_graph->decode_last_pos + 1 != pos_base)
     return false;
   FullGraph &g = *g_graph;
+  struct NanProbe {
+    int reported = 0;
+    int seen = 0;
+  };
+  static NanProbe probe;
+  const bool nan_probe_on =
+      std::getenv("MOESTREAM_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
+      probe.reported == 0;
+  if (nan_probe_on) {
+    probe.seen = 0;
+    ggml_backend_sched_set_eval_callback(
+        g.sched,
+        [](ggml_tensor *t, bool ask, void *ud) -> bool {
+          auto *p = static_cast<NanProbe *>(ud);
+          if (ask)
+            return p->reported < 6 && (t->type == GGML_TYPE_F32 ||
+                                       t->type == GGML_TYPE_F16);
+          const int idx = p->seen++;
+          if (p->reported >= 6)
+            return true;
+          const size_t n = ggml_nelements(t);
+          std::vector<uint8_t> raw(ggml_nbytes(t));
+          ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+          size_t bad = 0;
+          if (t->type == GGML_TYPE_F32) {
+            for (size_t i = 0; i < n; ++i)
+              if (!std::isfinite(reinterpret_cast<const float *>(raw.data())[i]))
+                ++bad;
+          } else {
+            for (size_t i = 0; i < n; ++i)
+              if (!std::isfinite(ggml_fp16_to_fp32(
+                      reinterpret_cast<const ggml_fp16_t *>(raw.data())[i])))
+                ++bad;
+          }
+          if (bad) {
+            ++p->reported;
+            if (t->op == GGML_OP_MUL_MAT_ID && t->src[2] &&
+                t->src[2]->type == GGML_TYPE_I32 && t->type == GGML_TYPE_F32) {
+              const size_t nid = ggml_nelements(t->src[2]);
+              std::vector<int32_t> ids(nid);
+              ggml_backend_tensor_get(t->src[2], ids.data(), 0,
+                                      nid * sizeof(int32_t));
+              std::string line;
+              const size_t row_len = (size_t)t->ne[0];
+              for (size_t r = 0; r < (size_t)t->ne[1] && r < nid; ++r) {
+                size_t rb = 0;
+                for (size_t i = 0; i < row_len; ++i)
+                  if (!std::isfinite(reinterpret_cast<const float *>(
+                          raw.data())[r * row_len + i]))
+                    ++rb;
+                line += " [row" + std::to_string(r) + " id=" +
+                        std::to_string(ids[r]) + " bad=" + std::to_string(rb) +
+                        "]";
+              }
+              LOG_WARN("[NAN-NODE-IDS] w_ne2=%lld w_type=%s%s\n",
+                       (long long)t->src[0]->ne[2],
+                       ggml_type_name(t->src[0]->type), line.c_str());
+              const ggml_tensor *w = t->src[0];
+              const size_t blk_bytes = ggml_type_size(w->type);
+              const size_t blk_elems = (size_t)ggml_blck_size(w->type);
+              const size_t slot_blocks =
+                  (size_t)w->ne[0] * (size_t)w->ne[1] / blk_elems;
+              for (size_t r = 0; r < 8 && r < nid; ++r) {
+                if (ids[r] < 0 || ids[r] >= w->ne[2])
+                  continue;
+                std::vector<uint8_t> wb(slot_blocks * blk_bytes);
+                ggml_backend_tensor_get(w, wb.data(),
+                                        (size_t)ids[r] * w->nb[2], wb.size());
+                size_t bad_d = 0;
+                for (size_t b = 0; b < slot_blocks; ++b) {
+                  const ggml_fp16_t d = *reinterpret_cast<const ggml_fp16_t *>(
+                      wb.data() + b * blk_bytes);
+                  if (!std::isfinite(ggml_fp16_to_fp32(d)))
+                    ++bad_d;
+                }
+                LOG_WARN("[NAN-NODE-W] row=%zu slot=%d blocks=%zu bad_d=%zu "
+                         "nb2=%zu buft=%s\n",
+                         r, ids[r], slot_blocks, bad_d, (size_t)w->nb[2],
+                         w->buffer ? ggml_backend_buffer_name(w->buffer) : "-");
+                if (r == 0 && t->src[1] && t->src[1]->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(t->src[1]) &&
+                    t->src[1]->ne[0] == w->ne[0]) {
+                  const auto *tr = ggml_get_type_traits(w->type);
+                  std::vector<float> x((size_t)w->ne[0]);
+                  ggml_backend_tensor_get(t->src[1], x.data(), 0,
+                                          x.size() * sizeof(float));
+                  double xmax = 0;
+                  size_t xbad = 0;
+                  for (float v : x) {
+                    if (!std::isfinite(v)) ++xbad;
+                    else xmax = std::max(xmax, (double)std::fabs(v));
+                  }
+                  std::vector<float> wrow((size_t)w->ne[0]);
+                  const size_t row_bytes = ggml_row_size(w->type, w->ne[0]);
+                  int shown = 0, ref_finite_of_bad = 0, bad_rows = 0;
+                  for (size_t j = 0; j < (size_t)t->ne[0]; ++j) {
+                    const float got =
+                        reinterpret_cast<const float *>(raw.data())[j];
+                    if (std::isfinite(got)) continue;
+                    ++bad_rows;
+                    tr->to_float(wb.data() + j * row_bytes, wrow.data(),
+                                 w->ne[0]);
+                    double ref = 0;
+                    for (size_t i = 0; i < x.size(); ++i)
+                      ref += (double)wrow[i] * x[i];
+                    if (std::isfinite(ref)) ++ref_finite_of_bad;
+                    if (shown < 3) {
+                      ++shown;
+                      LOG_WARN("[NAN-NODE-REF] out_idx=%zu got=%g cpu_ref=%g\n",
+                               j, got, ref);
+                    }
+                  }
+                  LOG_WARN("[NAN-NODE-REF] src1 nonfinite=%zu absmax=%g "
+                           "bad_rows=%d cpu_ref_finite=%d\n",
+                           xbad, xmax, bad_rows, ref_finite_of_bad);
+                }
+              }
+            }
+            LOG_WARN("[NAN-NODE] #%d op=%s name=%s bad=%zu/%zu ne=%lld,%lld,%lld,%lld "
+                     "src0=%s src1=%s\n",
+                     idx, ggml_op_name(t->op), t->name, bad, n,
+                     (long long)t->ne[0], (long long)t->ne[1],
+                     (long long)t->ne[2], (long long)t->ne[3],
+                     t->src[0] ? t->src[0]->name : "-",
+                     t->src[1] ? t->src[1]->name : "-");
+          }
+          return true;
+        },
+        &probe);
+  }
+  if (g.dynamic_expert_cache && !publish_dynamic_uploads(g)) {
+    if (!sync_glm5next_decode_state_to_host(g))
+      LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] cache-map handoff failed\n");
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  }
   if (engine.hc_stream_buf.size() < (size_t)g.D * g.HC ||
       !g.input || !g.attn_mask || !g.decode_indices)
     return false;
@@ -4690,26 +6335,180 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     return false;
   }
 
+  if (!hold_graph_vram_experts(g)) {
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  }
+  struct LayerTimer {
+    const FullGraph *g = nullptr;
+    std::chrono::steady_clock::time_point last;
+    std::vector<double> attn_ms, ffn_ms;
+    int tokens = 0;
+  };
+  static LayerTimer lt;
+  const bool layer_timing_on = layer_timing_env() && !nan_probe_on;
+  if (layer_timing_on) {
+    lt.g = &g;
+    if (lt.attn_ms.size() != (size_t)g.n_layers) {
+      lt.attn_ms.assign((size_t)g.n_layers, 0.0);
+      lt.ffn_ms.assign((size_t)g.n_layers, 0.0);
+      lt.tokens = 0;
+    }
+    ggml_backend_sched_set_eval_callback(
+        g.sched,
+        [](ggml_tensor *t, bool ask, void *ud) -> bool {
+          auto *l = static_cast<LayerTimer *>(ud);
+          auto it = l->g->layer_marks.find(t);
+          if (it == l->g->layer_marks.end())
+            return false;
+          if (ask)
+            return true;
+          const auto now = std::chrono::steady_clock::now();
+          const double ms =
+              std::chrono::duration<double, std::milli>(now - l->last).count();
+          l->last = now;
+          (it->second.second == 0 ? l->attn_ms : l->ffn_ms)[(size_t)it->second.first] += ms;
+          return true;
+        },
+        &lt);
+    lt.last = std::chrono::steady_clock::now();
+  }
+  struct OpProf {
+    std::chrono::steady_clock::time_point last;
+    std::map<std::string, std::pair<double, int>> agg;
+    int tokens = 0;
+    ggml_backend_sched_t sched = nullptr;
+  };
+  static OpProf op;
+  static const bool op_prof_env =
+      std::getenv("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
+  const bool op_prof_on = op_prof_env && !layer_timing_on && !nan_probe_on &&
+                          op.tokens < 30;
+  if (op_prof_on) {
+    ggml_backend_sched_set_eval_callback(
+        g.sched,
+        [](ggml_tensor *t, bool ask, void *ud) -> bool {
+          if (ask)
+            return true;
+          auto *o = static_cast<OpProf *>(ud);
+          const auto now = std::chrono::steady_clock::now();
+          const double ms =
+              std::chrono::duration<double, std::milli>(now - o->last).count();
+          o->last = now;
+          std::string key = ggml_op_name(t->op);
+          if (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT)
+            key += std::string("(") + ggml_type_name(t->src[0]->type) + ")" +
+                   (t->src[0]->buffer
+                        ? ggml_backend_buffer_name(t->src[0]->buffer)
+                        : "nobuf") +
+                   "/" +
+                   ggml_backend_name(
+                       ggml_backend_sched_get_tensor_backend(o->sched, t));
+          auto &e = o->agg[key];
+          e.first += ms;
+          ++e.second;
+          return true;
+        },
+        &op);
+    op.sched = g.sched;
+    op.last = std::chrono::steady_clock::now();
+  }
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
+    ggml_backend_sched_synchronize(g.sched);
+    release_graph_vram_experts(g);
     g.ready = false;
     g_glm5next_decode_disabled_engine = &engine;
     return false;
   }
   ggml_backend_sched_synchronize(g.sched);
+  release_graph_vram_experts(g);
+  if (op_prof_on) {
+    ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
+    if (++op.tokens == 30) {
+      std::vector<std::pair<std::string, std::pair<double, int>>> v(
+          op.agg.begin(), op.agg.end());
+      std::sort(v.begin(), v.end(), [](auto &a, auto &b) {
+        return a.second.first > b.second.first;
+      });
+      for (size_t i = 0; i < v.size() && i < 25; ++i)
+        LOG_WARN("[GLM5NEXT-OP-PROFILE] %-28s total/token=%.2fms nodes/token=%.1f avg=%.1fus\n",
+                 v[i].first.c_str(), v[i].second.first / 30,
+                 v[i].second.second / 30.0,
+                 1000.0 * v[i].second.first / v[i].second.second);
+    }
+  }
+  if (nan_probe_on) {
+    ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
+    probe.reported = std::max(probe.reported, 1);
+  }
+  if (layer_timing_on) {
+    ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
+    if (++lt.tokens % 100 == 0) {
+      double ta = 0, tf = 0;
+      std::string line;
+      for (int l = 0; l < g.n_layers; ++l) {
+        ta += lt.attn_ms[(size_t)l];
+        tf += lt.ffn_ms[(size_t)l];
+        char b[64];
+        std::snprintf(b, sizeof(b), " L%d=%.2f/%.2f", l,
+                      lt.attn_ms[(size_t)l] / lt.tokens,
+                      lt.ffn_ms[(size_t)l] / lt.tokens);
+        line += b;
+      }
+      LOG_WARN("[GLM5NEXT-LAYER-TIMING] tokens=%d mean per token: attn=%.1fms "
+               "ffn=%.1fms (marked-node sync inflates absolute time)\n"
+               "[GLM5NEXT-LAYER-TIMING] attn/ffn ms per layer:%s\n",
+               lt.tokens, ta / lt.tokens, tf / lt.tokens, line.c_str());
+    }
+  }
   const auto synced = std::chrono::steady_clock::now();
+  const double compute_ms = std::chrono::duration<double, std::milli>(
+                                synced - start)
+                                .count();
+  const auto cache_update_start = std::chrono::steady_clock::now();
+  if (route_stats_enabled())
+    update_partial_routes(g, pos_base, compute_ms);
+  const auto cache_update_done = std::chrono::steady_clock::now();
+  if (!g.ready) {
+    if (!sync_glm5next_decode_state_to_host(g))
+      LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] cache update state handoff "
+                "failed\n");
+    g_glm5next_decode_disabled_engine = &engine;
+    return false;
+  }
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * sizeof(float));
+  if (std::getenv("MOESTREAM_GLM5NEXT_DEBUG_DECODE_OUT")) {
+    size_t bad = 0;
+    double sum = 0.0, mx = 0.0;
+    for (int i = 0; i < g.D; ++i) {
+      const float v = hidden_states[i];
+      if (!std::isfinite(v)) { ++bad; continue; }
+      sum += v; mx = std::max(mx, (double)std::fabs(v));
+    }
+    LOG_WARN("[GLM5NEXT-DECODE-OUT] pos=%d nonfinite=%zu/%d mean=%g absmax=%g "
+             "h[0..3]=%g %g %g %g\n",
+             pos_base, bad, g.D, sum / g.D, mx, hidden_states[0],
+             hidden_states[1], hidden_states[2], hidden_states[3]);
+  }
   g.decode_last_pos = pos_base;
   engine.glm5next_full_graph_output_ready = true;
+  if (g.logits && engine.qwen4exp_full_graph_logits_target &&
+      engine.qwen4exp_full_graph_logits_target_size == (int)g.logits->ne[0]) {
+    ggml_backend_tensor_get(g.logits, engine.qwen4exp_full_graph_logits_target,
+                            0, ggml_nbytes(g.logits));
+    engine.qwen4exp_full_graph_logits_ready = true;
+  }
   const auto done = std::chrono::steady_clock::now();
   const auto ms = [](auto a, auto b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
   };
   LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE-TIME] pos=%d sync=%.3f ms "
-           "output_get=%.3f ms total=%.3f ms\n",
-           pos_base, ms(start, synced), ms(synced, done), ms(start, done));
+           "cache_update=%.3f ms output_get=%.3f ms total=%.3f ms\n",
+           pos_base, ms(start, synced), ms(cache_update_start, cache_update_done),
+           ms(cache_update_done, done), ms(start, done));
   return true;
 }
 
@@ -4771,11 +6570,17 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     }
   }
 
+  if (!hold_graph_vram_experts(g))
+    return false;
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
-      GGML_STATUS_SUCCESS)
+      GGML_STATUS_SUCCESS) {
+    ggml_backend_sched_synchronize(g.sched);
+    release_graph_vram_experts(g);
     return false;
+  }
   ggml_backend_sched_synchronize(g.sched);
+  release_graph_vram_experts(g);
   const auto synced = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * S * sizeof(float));
@@ -4899,6 +6704,10 @@ bool deepseek_v4_full_graph_prepare(StreamingEngine &engine, int S,
     g->device_expert_layers = 0;
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
+  if (g->cpu) {
+    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
+  }
   if (!g->cuda || !g->cpu)
     return false;
 
@@ -5116,6 +6925,7 @@ bool deepseek_v4_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
 bool glm5next_full_graph_enabled() { return false; }
 bool glm5next_full_graph_bootstrap(StreamingEngine &) { return false; }
+void glm5next_full_graph_set_vram_cache(GpuTopology *) {}
 int glm5next_full_graph_device_expert_layers() { return 0; }
 bool glm5next_full_graph_prepare(StreamingEngine &, int, int, const int *) {
   return false;

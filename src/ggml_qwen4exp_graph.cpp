@@ -315,6 +315,9 @@ struct Qwen4ExpUsageTrackContext {
   int32_t *host_ids = nullptr; // pinned, n_layers * topk entries
   size_t ids_bytes = 0;
   std::atomic<double> last_callback_ms{0.0};
+  // Per-layer hot-set membership (empty = layer has no static split).
+  std::vector<std::vector<uint8_t>> hot_mask;
+  uint64_t token_count = 0;
 };
 
 static void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
@@ -323,14 +326,27 @@ static void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
       !ctx->host_ids)
     return;
   const auto start = std::chrono::steady_clock::now();
+  const bool hit_log = std::getenv("MOESTREAM_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
+  std::string hit_line;
   for (int l = 0; l < ctx->n_layers; ++l) {
+    int hits = 0;
+    const bool has_mask =
+        l < static_cast<int>(ctx->hot_mask.size()) && !ctx->hot_mask[l].empty();
     for (int k = 0; k < ctx->topk; ++k) {
       const int32_t expert = ctx->host_ids[static_cast<size_t>(l) * ctx->topk + k];
       if (expert < 0 || expert >= ctx->n_experts)
         continue; // defensive only -- real routing always produces valid ids
       ctx->engine->bump_route_freq(l, expert);
+      if (has_mask && ctx->hot_mask[l][expert])
+        ++hits;
     }
+    if (hit_log)
+      hit_line += (has_mask ? std::to_string(hits) : std::string("-")) + ",";
   }
+  if (hit_log)
+    LOG_INFO("[ROUTE-HIT] tok=%llu hits=%s\n",
+             static_cast<unsigned long long>(ctx->token_count++),
+             hit_line.c_str());
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start)
                         .count();
@@ -4885,13 +4901,27 @@ struct ExpertSplitTables {
   ggml_tensor *mask_cpu = nullptr;
 };
 
+// `safe_dummy_fill`: a literal -1 ("skip this route") id is only honored on
+// stock ggml when the MoEStream negative-skip patch is applied
+// (patches/ggml-mul-mat-id-negative-skip.patch, CPU op + CUDA MMVQ decode
+// kernels). Unpatched, ggml-cuda's mul_mat_vec_q reads `ids[channel_dst]` as
+// an unsigned offset (illegal memory access, reproduced 2026-09-29) and the
+// CPU op's `assert(i02 >= 0 ...)` is compiled out by NDEBUG. Even patched,
+// prefill's mmq/mmf/sorted paths are not covered. When `safe_dummy_fill` is
+// true, both remap tables use a valid dummy index (0) instead of -1 and the
+// mask zeroes the contribution, at the price of every branch computing all
+// topk routes (~2x expert compute). Default false is used by
+// build_moe_partial_gpu's Phase 1/2 caller, which ignores the masks.
 ExpertSplitTables build_expert_split_tables(FullGraph &g, ggml_context *ctx,
                                             int n_experts,
-                                            const std::vector<int> &gpu_ids) {
+                                            const std::vector<int> &gpu_ids,
+                                            bool safe_dummy_fill = false) {
   ExpertSplitTables r;
   if (n_experts <= 0)
     return r;
-  std::vector<int32_t> remap_gpu(static_cast<size_t>(n_experts), -1);
+  const int32_t skip_gpu = safe_dummy_fill ? 0 : -1;
+  const int32_t skip_cpu = safe_dummy_fill ? 0 : -1;
+  std::vector<int32_t> remap_gpu(static_cast<size_t>(n_experts), skip_gpu);
   std::vector<int32_t> remap_cpu(static_cast<size_t>(n_experts), 0);
   std::vector<float> mgpu(static_cast<size_t>(n_experts), 0.0f);
   std::vector<float> mcpu(static_cast<size_t>(n_experts), 1.0f);
@@ -4902,7 +4932,7 @@ ExpertSplitTables build_expert_split_tables(FullGraph &g, ggml_context *ctx,
     if (e < 0 || e >= n_experts)
       continue;
     remap_gpu[static_cast<size_t>(e)] = static_cast<int32_t>(k);
-    remap_cpu[static_cast<size_t>(e)] = -1;
+    remap_cpu[static_cast<size_t>(e)] = skip_cpu;
     mgpu[static_cast<size_t>(e)] = 1.0f;
     mcpu[static_cast<size_t>(e)] = 0.0f;
   }
@@ -5194,14 +5224,20 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *experts = nullptr;
 
   // Genuine per-expert split path: route IDs are remapped independently for
-  // each backend. Negative IDs are inactive slots understood by the GGML
-  // MUL_MAT_ID kernels, so each branch computes only its assigned routes.
-  // The masks remain as a defensive numerical guard at the merge. Every
-  // other layer/config takes the unchanged single-mul_mat_id path below.
+  // each backend, over the FULL topk width. See the S==1 note below for how
+  // foreign routes are neutralized; the mask_gpu/mask_cpu multiply zeroes
+  // their contribution either way. Every other layer/config takes the
+  // unchanged single-mul_mat_id path below.
   if (split_gpu_ids && !split_gpu_ids->empty() && gate_exps_gpu &&
       up_exps_gpu && down_exps_gpu) {
-    ExpertSplitTables tab =
-        build_expert_split_tables(g, ctx, c.n_experts, *split_gpu_ids);
+    // Decode (S==1): a real -1 id makes each backend skip the foreign route
+    // and write zeros (patches/ggml-mul-mat-id-negative-skip.patch covers the
+    // CPU op and the CUDA MMVQ decode kernels), so each branch does only its
+    // own share of the expert compute. Prefill (S>1) goes through mmq/mmf/
+    // sorted paths the patch does not cover, so it keeps the valid dummy id
+    // and relies on the mask multiply to zero the foreign contribution.
+    ExpertSplitTables tab = build_expert_split_tables(
+        g, ctx, c.n_experts, *split_gpu_ids, /*safe_dummy_fill=*/g.S != 1);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
       ggml_tensor *ids_gpu_raw = ggml_get_rows(ctx, tab.remap_gpu, ids);
       ggml_tensor *ids_gpu = ggml_reshape_2d(ctx, ids_gpu_raw, c.topk, g.S);
@@ -6722,6 +6758,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     usage_ctx->n_experts = c.n_experts;
     usage_ctx->topk = c.topk;
     usage_ctx->ids_bytes = static_cast<size_t>(total_ids) * sizeof(int32_t);
+    usage_ctx->hot_mask.assign(g.n_layers, {});
+    for (const auto &[layer, ids] : g.split_gpu_expert_ids) {
+      if (layer < 0 || layer >= g.n_layers)
+        continue;
+      usage_ctx->hot_mask[layer].assign(c.n_experts, 0);
+      for (int e : ids)
+        if (e >= 0 && e < c.n_experts)
+          usage_ctx->hot_mask[layer][e] = 1;
+    }
     usage_ctx->host_ids = static_cast<int32_t *>(
         alloc_registered_host(g, usage_ctx->ids_bytes));
     if (usage_ctx->host_ids) {

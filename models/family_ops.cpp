@@ -141,9 +141,19 @@ bool qwen4exp_graph_run(StreamingEngine &engine,
 
 bool glm5next_graph_enabled(const StreamingEngine &engine,
                             ModelGraphPhase phase) {
-  return !engine.mtp_enabled && glm5next_full_graph_enabled() &&
-         (phase == ModelGraphPhase::Prefill ||
-          phase == ModelGraphPhase::Decode);
+  if (engine.mtp_enabled || !glm5next_full_graph_enabled())
+    return false;
+  if (phase == ModelGraphPhase::Prefill) {
+    // The batched sparse hot/cold MUL_MAT_ID split currently reaches a CUDA
+    // MMQ route-compaction limitation for inactive branch slots. Keep the
+    // established prefill path while independently validating reusable S=1
+    // decode, whose MMVQ kernels support negative inactive IDs.
+    const char *prefill = std::getenv("MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL");
+    // Keep the known-unsafe batched MMQ route compaction opt-in until the
+    // upstream sparse-ID limitation is fixed and revalidated on CUDA.
+    return prefill && prefill[0] == '1';
+  }
+  return phase == ModelGraphPhase::Decode;
 }
 
 bool glm5next_graph_bootstrap(StreamingEngine &engine) {

@@ -5,6 +5,7 @@
 // back to the established layer-at-a-time implementation.
 
 struct StreamingEngine;
+class GpuTopology;
 
 // Enabled only when MOESTREAM_GLM5NEXT_FULL_GRAPH=1 is present.
 bool glm5next_full_graph_enabled();
@@ -14,6 +15,10 @@ bool glm5next_full_graph_enabled();
 // the first prompt, but the 70--78 GiB routed-weight source is loaded once and
 // retained for later prompt shapes.
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine);
+
+// Supply the engine-owned VRAM expert cache before bootstrap.  GLM graph
+// tensors alias its resident slots rather than uploading another expert copy.
+void glm5next_full_graph_set_vram_cache(GpuTopology *topology);
 
 // Number of complete MoE layers whose three expert projection tensors are
 // placed in the graph's CUDA arena.  Zero leaves all expert weights backed by

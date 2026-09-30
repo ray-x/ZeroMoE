@@ -1158,7 +1158,8 @@ public:
         for (int l = 0; l < prefix_end; ++l) {
             if (is_excluded((size_t)l)) continue;
             const size_t bytes = layer_slab_bytes[(size_t)l];
-            if (bytes == 0 || bytes > cache_bytes - used ||
+            if (bytes == 0) continue;  // dense layer: no routed experts
+            if (bytes > cache_bytes - used ||
                 (size_t)n_experts_total > (cache_bytes - used) / bytes)
                 break;
             counts[(size_t)l] = n_experts_total;

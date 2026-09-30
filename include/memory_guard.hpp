@@ -240,6 +240,7 @@ public:
     static long last_available_mb() { return last_mb_.load(std::memory_order_relaxed); }
     static uint64_t block_events() { return n_block_.load(std::memory_order_relaxed); }
     static long min_seen_mb() { return min_mb_.load(std::memory_order_relaxed); }
+    static long stop_limit_mb() { return stop_limit_mb_.load(std::memory_order_relaxed); }
 
 private:
     void loop() {

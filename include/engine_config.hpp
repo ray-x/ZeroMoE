@@ -660,6 +660,10 @@ struct EngineConfig {
   // Start selected layers at top_n and use remaining graph-arena capacity for
   // additional lower-ranked experts, subject to the VRAM safety floor.
   bool qwen4exp_option_b_fill_vram = false;
+  // Explicitly omit the legacy GPU LRU for Option-B full-graph runs. This
+  // preserves a configured zero cache instead of treating it as auto-size;
+  // if graph execution is declined, the legacy fallback has no GPU cache.
+  bool qwen4exp_option_b_disable_legacy_cache = false;
   // When true and qwen4exp_option_b_layer is -1, rank every layer from
   // pin_file and apply Option B only where top_n experts cover at least the
   // requested historical route share. Flat layers remain on the CPU path.
@@ -2554,6 +2558,9 @@ inline bool EngineConfig::load(const std::string &path) {
       "qwen4exp_option_b_max_layers", qwen4exp_option_b_max_layers);
   qwen4exp_option_b_fill_vram = doc.root.get_bool(
       "qwen4exp_option_b_fill_vram", qwen4exp_option_b_fill_vram);
+  qwen4exp_option_b_disable_legacy_cache = doc.root.get_bool(
+      "qwen4exp_option_b_disable_legacy_cache",
+      qwen4exp_option_b_disable_legacy_cache);
   qwen4exp_option_b_concentrated_only = doc.root.get_bool(
       "qwen4exp_option_b_concentrated_only",
       qwen4exp_option_b_concentrated_only);
@@ -3188,14 +3195,16 @@ inline bool EngineConfig::validate() {
         gc.dense_gb = std::min(8.0, available * 0.5);
       if (gc.kv_cache_gb <= 0)
         gc.kv_cache_gb = std::min(5.0, available * 0.3);
-      if (gc.role == "dense+moe" && gc.moe_cache_gb <= 0) {
+      if (gc.role == "dense+moe" && gc.moe_cache_gb <= 0 &&
+          !qwen4exp_option_b_disable_legacy_cache) {
         gc.moe_cache_gb = available - gc.dense_gb - gc.kv_cache_gb;
         if (gc.moe_cache_gb < 0)
           gc.moe_cache_gb = 0;
       }
     }
     if (gc.role == "moe") {
-      if (gc.moe_cache_gb <= 0)
+      if (gc.moe_cache_gb <= 0 &&
+          !qwen4exp_option_b_disable_legacy_cache)
         gc.moe_cache_gb = gc.vram_gb - 1.0;
     }
   }

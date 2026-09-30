@@ -129,6 +129,7 @@ std::string gguf_type_name(GGUFType t) {
   case GGUFType::IQ4_XS: return "IQ4_XS";
   case GGUFType::IQ1_M: return "IQ1_M";
   case GGUFType::BF16: return "BF16";
+  case GGUFType::Q2_0: return "Q2_0";
   default: return "TYPE" + std::to_string((uint32_t)t);
   }
 }

@@ -24,6 +24,10 @@
 #include <chrono>
 #include <iomanip>
 #include <omp.h>
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 // Defined (non-static) in src/attention_layer.cpp specifically so Test 28
 // can compare qwen4exp_conv1d_silu_gpu_host's GPU kernel directly against
@@ -46,6 +50,10 @@ extern void extract_gguf_row_q4_0(const QuantizedTensor& tensor, int row_idx, fl
 extern "C" int ggml_quantize_row_ref(uint32_t type, const float* src, void* dst, int64_t n);
 extern "C" int ggml_dequant_row(uint32_t type, const void* src, float* out, int n);
 extern "C" void quantize_row_q8_0(const float *x, void *y, int64_t k);
+extern "C" void quantize_row_q8_K(const float *x, void *y, int64_t k);
+extern "C" void ggml_vec_dot_q3_K_q8_K(
+    int n, float *s, size_t bs, const void *vx, size_t bx, const void *vy,
+    size_t by, int nrc);
 extern "C" void ggml_vec_dot_q2_0_q8_0(
     int n, float *s, size_t bs, const void *vx, size_t bx, const void *vy,
     size_t by, int nrc);
@@ -2210,6 +2218,199 @@ static void bench_one_case(GGUFType type, int I, int O, int nthreads) {
               << ":  " << std::fixed << std::setprecision(3) << std::setw(8) << (elapsed_s * 1000.0)
               << " ms/call  " << std::setprecision(2) << gbs << " GB/s\n";
 }
+
+static void bench_q3k_cpu_only() {
+    std::cout << "\n[BENCH] Q3_K CPU dequant+matmul (S=1, I=5120, O=1536)\n";
+    ggml_cpu_init();
+    constexpr int hidden = 5120;
+    constexpr int output = 1536;
+    constexpr int iterations = 20;
+    const size_t rb = (size_t)row_bytes(GGUFType::Q3_K, hidden);
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> weights_f32((size_t)output * hidden);
+    std::vector<float> x((size_t)hidden);
+    for (float &v : weights_f32) v = dist(rng);
+    for (float &v : x) v = dist(rng);
+    std::vector<uint8_t> weights((size_t)output * rb);
+    for (int o = 0; o < output; ++o) {
+        const int ok = ggml_quantize_row_ref(
+            (uint32_t)GGUFType::Q3_K,
+            weights_f32.data() + (size_t)o * hidden,
+            weights.data() + (size_t)o * rb, hidden);
+        assert(ok && "GGML Q3_K reference quantizer should be available");
+    }
+    std::vector<float> y_moe((size_t)output), y_ggml((size_t)output);
+    std::vector<block_q8_K_local> x_q8((size_t)hidden / 256);
+
+    for (int nthreads : {1, 2, 4, 6, 8}) {
+        omp_set_num_threads(nthreads);
+        quantize_row_q8_K(x.data(), x_q8.data(), hidden);
+        cpu_quant_matmul(GGUFType::Q3_K, weights.data(), x.data(),
+                         y_moe.data(), 1, hidden, output);
+        #pragma omp parallel for schedule(static)
+        for (int o = 0; o < output; ++o) {
+            float dot = 0.0f;
+            ggml_vec_dot_q3_K_q8_K(hidden, &dot, 0,
+                weights.data() + (size_t)o * rb, 0,
+                x_q8.data(), 0, 1);
+            y_ggml[o] = dot;
+        }
+        double max_abs_diff = 0.0;
+        double max_abs_output = 0.0;
+        for (int o = 0; o < output; ++o)
+        {
+            max_abs_diff = std::max(max_abs_diff,
+                std::abs((double)y_moe[o] - (double)y_ggml[o]));
+            max_abs_output = std::max(max_abs_output,
+                std::abs((double)y_moe[o]));
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iterations; ++it)
+            cpu_quant_matmul(GGUFType::Q3_K, weights.data(), x.data(),
+                             y_moe.data(), 1, hidden, output);
+        const double moe_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - start).count() / iterations;
+
+        start = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iterations; ++it) {
+            #pragma omp parallel for schedule(static)
+            for (int o = 0; o < output; ++o) {
+                float dot = 0.0f;
+                ggml_vec_dot_q3_K_q8_K(hidden, &dot, 0,
+                    weights.data() + (size_t)o * rb, 0,
+                    x_q8.data(), 0, 1);
+                y_ggml[o] = dot;
+            }
+        }
+        const double ggml_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::high_resolution_clock::now() - start).count() / iterations;
+
+        start = std::chrono::high_resolution_clock::now();
+        for (int it = 0; it < iterations; ++it)
+            quantize_row_q8_K(x.data(), x_q8.data(), hidden);
+        const double quant_us = std::chrono::duration<double, std::micro>(
+            std::chrono::high_resolution_clock::now() - start).count() / iterations;
+        std::cout << "  threads=" << nthreads << " MoEStream-FP32=" << std::fixed
+                  << std::setprecision(3) << moe_ms << " ms, GGML-Q8_K-dot="
+                  << ggml_ms << " ms (+ activation quant " << quant_us
+                  << " us), speedup=" << (moe_ms / ggml_ms)
+                  << "x, max_abs_diff=" << max_abs_diff
+                  << " (max |MoE output|=" << max_abs_output << ")\n";
+    }
+}
+
+#ifdef __linux__
+static size_t smaps_anon_huge_kb(const void *address) {
+    std::ifstream smaps("/proc/self/smaps");
+    std::string line;
+    const uintptr_t target = reinterpret_cast<uintptr_t>(address);
+    bool in_mapping = false;
+    while (std::getline(smaps, line)) {
+        unsigned long long begin = 0, end = 0;
+        if (std::sscanf(line.c_str(), "%llx-%llx", &begin, &end) == 2) {
+            if (in_mapping) break;
+            in_mapping = target >= begin && target < end;
+            continue;
+        }
+        if (in_mapping && line.rfind("AnonHugePages:", 0) == 0) {
+            unsigned long long kb = 0;
+            if (std::sscanf(line.c_str(), "AnonHugePages: %llu kB", &kb) == 1)
+                return (size_t)kb;
+        }
+    }
+    return 0;
+}
+
+static void bench_q3k_thp_cpu_only() {
+    std::cout << "\n[BENCH] Q3_K 2 MiB THP A/B (CPU only, 4 threads)\n";
+    constexpr int hidden = 5120;
+    constexpr int output = 8192; // 18 MiB Q3_K weights; larger than this CPU's LLC
+    constexpr int samples = 9;
+    constexpr int threads = 4;
+    const size_t rb = (size_t)row_bytes(GGUFType::Q3_K, hidden);
+    const size_t bytes = (size_t)output * rb;
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        std::cerr << "  ERROR: cannot determine system page size\n";
+        return;
+    }
+    const size_t map_bytes = (bytes + (size_t)page_size - 1) /
+                             (size_t)page_size * (size_t)page_size;
+    enum class Advice { NoHuge, Huge };
+    struct Mapping { const char *name; Advice advice; uint8_t *ptr; };
+    Mapping maps[] = {{"4K forced", Advice::NoHuge, nullptr},
+                      {"2M THP", Advice::Huge, nullptr}};
+
+    std::mt19937 rng(901);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> source((size_t)output * hidden);
+    std::vector<float> x((size_t)hidden), y((size_t)output);
+    for (float &v : source) v = dist(rng);
+    for (float &v : x) v = dist(rng);
+
+    for (auto &m : maps) {
+        void *p = mmap(nullptr, map_bytes, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            std::cerr << "  ERROR: mmap failed for " << m.name << "\n";
+            for (auto &old : maps) if (old.ptr) munmap(old.ptr, map_bytes);
+            return;
+        }
+        m.ptr = static_cast<uint8_t *>(p);
+        const int advice = m.advice == Advice::Huge ? MADV_HUGEPAGE
+                                                    : MADV_NOHUGEPAGE;
+        if (madvise(m.ptr, map_bytes, advice) != 0) {
+            std::cerr << "  ERROR: madvise failed for " << m.name << "\n";
+            for (auto &old : maps) if (old.ptr) munmap(old.ptr, map_bytes);
+            return;
+        }
+        for (int o = 0; o < output; ++o) {
+            const int ok = ggml_quantize_row_ref(
+                (uint32_t)GGUFType::Q3_K,
+                source.data() + (size_t)o * hidden,
+                m.ptr + (size_t)o * rb, hidden);
+            assert(ok && "GGML Q3_K reference quantizer should be available");
+        }
+    }
+
+    ggml_cpu_init();
+    omp_set_num_threads(threads);
+    std::cout << "  global THP policy: ";
+    { std::ifstream f("/sys/kernel/mm/transparent_hugepage/enabled");
+      std::string s; std::getline(f, s); std::cout << s << "\n"; }
+    for (auto &m : maps)
+        std::cout << "  " << m.name << " resident AnonHugePages="
+                  << (smaps_anon_huge_kb(m.ptr) / 1024.0) << " MiB\n";
+
+    // Warm both mappings, then rotate their measurement order each round
+    // so one advice mode does not always benefit from being measured first.
+    for (auto &m : maps)
+        cpu_quant_matmul(GGUFType::Q3_K, m.ptr, x.data(), y.data(), 1,
+                         hidden, output);
+    std::vector<double> times[2];
+    for (int sample = 0; sample < samples; ++sample) {
+        for (int j = 0; j < 2; ++j) {
+            const int idx = (j + sample) % 2;
+            auto start = std::chrono::steady_clock::now();
+            cpu_quant_matmul(GGUFType::Q3_K, maps[idx].ptr, x.data(), y.data(),
+                             1, hidden, output);
+            times[idx].push_back(std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count());
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        std::sort(times[i].begin(), times[i].end());
+        const double median_ms = times[i][times[i].size() / 2];
+        const double gbps = (bytes / 1e9) / (median_ms / 1000.0);
+        std::cout << "  " << maps[i].name << ": median=" << std::fixed
+                  << std::setprecision(3) << median_ms << " ms, "
+                  << std::setprecision(2) << gbps << " GB/s\n";
+    }
+    for (auto &m : maps) munmap(m.ptr, map_bytes);
+}
+#endif
 
 // Isolates dequant WIDTH as the only variable: mirrors cpu_quant_matmul's
 // own per-row dequant+dot loop (kquant_dequant.hpp) exactly -- same OMP
@@ -6322,6 +6523,16 @@ int main() {
         bool ok = bench_qwen_cpu_moe();
         return ok ? 0 : 1;
     }
+    if (std::getenv("MOESTREAM_TEST_ONLY_Q3K_CPU_BENCH")) {
+        bench_q3k_cpu_only();
+        return 0;
+    }
+#ifdef __linux__
+    if (std::getenv("MOESTREAM_TEST_ONLY_Q3K_THP_BENCH")) {
+        bench_q3k_thp_cpu_only();
+        return 0;
+    }
+#endif
     if (std::getenv("MOESTREAM_TEST_ONLY_CPU_IQ")) {
         // Keep both diagnostics independent.  In particular, an IQ1_M
         // failure must not hide the Qwen graph test, and a graph failure must
