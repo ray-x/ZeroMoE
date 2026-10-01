@@ -17,6 +17,12 @@ bool qwen4exp_full_graph_decode_enabled();
 // variables remain supported and take precedence in the query functions.
 void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled);
 
+// Optional startup warmup for benchmark profiles that want graph creation and
+// static weight upload outside request timing. Enable with
+// MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP=1; the prompt shape defaults to 16 and
+// can be set with MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS.
+bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine);
+
 // Number of complete early MoE layers whose expert tensors should be placed
 // in the graph CUDA weight arena. Zero keeps all routed experts host-backed.
 int qwen4exp_full_graph_device_expert_layers();

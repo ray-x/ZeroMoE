@@ -170,6 +170,15 @@ inline const std::vector<int> & teacher_force_tokens_if_enabled() {
     }();
     return tokens;
 }
+
+inline bool teacher_force_skip_sampling_enabled() {
+    static const bool enabled = [] {
+        const char *value =
+            std::getenv("MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
 // token_ids: the S current input token ids that produced hidden_states'
 // S rows (one per row, same order) -- needed by DeepSeek-V4 hash-routed MoE
 // layers (moe_forward_gguf's ffn_gate_tid2eid lookup, per-token, per-layer
@@ -463,9 +472,25 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         const char *env = std::getenv("MOESTREAM_BENCH_IGNORE_STOP");
         return env && env[0] == '1';
     }();
+    // llama-bench measures token generation without decoding/printing every
+    // token or sampling device memory on every step. This opt-in mode keeps
+    // MoEStream's compute path and request summary while removing that CLI
+    // streaming work from apples-to-apples throughput measurements.
+    const bool bench_silent = [] {
+        const char *env = std::getenv("MOESTREAM_BENCH_SILENT");
+        return env && env[0] == '1';
+    }();
+    const bool token_loop_diag_enabled = [] {
+        const char *env = std::getenv("MOESTREAM_TOKEN_LOOP_DIAG");
+        return env && env[0] == '1';
+    }();
     if (bench_ignore_stop) {
         LOG_STREAM_INFO() << "[BENCH] MOESTREAM_BENCH_IGNORE_STOP=1: "
                              "EOS/stop tokens will not end this bounded decode\n";
+    }
+    if (bench_silent) {
+        LOG_STREAM_INFO() << "[BENCH] MOESTREAM_BENCH_SILENT=1: token text output, "
+                             "per-token VRAM sampling, and token diagnostics are disabled\n";
     }
 
     // TEMPORARY DIAGNOSTIC (2026-09-12, deepseek-v41-decode-speed-session):
@@ -688,7 +713,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         graph_ops.build(engine, request);
     }
 
-    std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
+    if (!bench_silent) {
+        std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
+    }
     // Brackets the SAME window PERF_START(prefill)/PERF_END(prefill, ...)
     // measures, reusing the exact Snapshot/operator-/print_summary
     // machinery the whole-REQUEST line already uses (request_snap_start
@@ -867,7 +894,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     if (engine.gpu) engine.gpu->shrink_dense_scratch();
     shrink_moe_gpu_scratch();
 
-    std::cout << " Done.\n\nOutput: ";
+    if (!bench_silent) {
+        std::cout << " Done.\n\nOutput: ";
+    }
 
     // Pre-allocate decode buffers (single token at a time)
     std::vector<float> decode_hidden(D);
@@ -889,7 +918,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             // detected stop token's own string isn't echoed to the user.
             const bool is_stop =
                 next_token == eos_id || tokenizer.is_stop_token(next_token);
-            if (!is_stop) {
+            if (!is_stop && !bench_silent) {
                 std::string token_str = tokenizer.decode(next_token);
                 int parse_result = reasoning.feed(token_str);
                 if (parse_result == 0) {
@@ -999,7 +1028,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // noise -> attention/FFN/dim bug). Printed only for the first couple of
         // tokens. This is the fastest way to tell "model is confidently wrong"
         // from "model has no signal at all" without a full llama.cpp parity run.
-        if (step < 2) {
+        if (step < 2 && !bench_silent) {
             std::vector<int> idx(V);
             std::iota(idx.begin(), idx.end(), 0);
             std::partial_sort(idx.begin(), idx.begin() + std::min(5, V), idx.end(),
@@ -1054,12 +1083,18 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             }
         }
 
-        const int sampled_token = sampler.sample(logits, temperature, top_p);
+        const auto &teacher_tokens = teacher_force_tokens_if_enabled();
+        const bool has_teacher_token =
+            step < static_cast<int>(teacher_tokens.size());
+        const bool skip_teacher_sampling =
+            has_teacher_token && teacher_force_skip_sampling_enabled();
+        const int sampled_token = skip_teacher_sampling
+                                      ? teacher_tokens[step]
+                                      : sampler.sample(logits, temperature, top_p);
         dump_generated_token_if_enabled(step, sampled_token);
 
         int next_token = sampled_token;
-        const auto & teacher_tokens = teacher_force_tokens_if_enabled();
-        if (step < static_cast<int>(teacher_tokens.size())) {
+        if (has_teacher_token) {
             next_token = teacher_tokens[step];
             if (step == 0) {
                 LOG_STREAM_INFO() << "[TEACHER-FORCE] using " << teacher_tokens.size()
@@ -1091,7 +1126,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         const bool is_stop_now = !bench_ignore_stop &&
             (next_token == eos_id || tokenizer.is_stop_token(next_token));
 
-        if (!is_stop_now) {
+        if (!is_stop_now && !bench_silent) {
             // Reasoning-aware output: decode to real text, then parse
             // <think>...</think> tags out of the decoded stream (the tag
             // detection only works against actual text -- it never matched
@@ -1151,13 +1186,15 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         auto token_snap_after = perf().snapshot();
         char token_label[32];
         snprintf(token_label, sizeof(token_label), "TOKEN %5d", step);
-        PerfCounters::print_delta(token_label, token_wall_ms, token_snap_after - token_snap_before);
+        if (!bench_silent) {
+            PerfCounters::print_delta(token_label, token_wall_ms, token_snap_after - token_snap_before);
+        }
         check_hidden_finite(token_label, decode_hidden.data(), decode_hidden.size());
         // Real per-GPU VRAM usage (cudaMemGetInfo), sampled once per token
         // to track actual usage over the run -- distinct from the one-time
         // startup topology dump and from the logical cache-fill heatmaps
         // below (this is raw memory, those are "what's actually resident").
-        {
+        if (!bench_silent) {
             auto diag_vramlog_start = std::chrono::high_resolution_clock::now();
             if (ram_mgr.vram_cache) ram_mgr.vram_cache->log_vram_usage(token_label);
             diag_vramlog_ms += std::chrono::duration<double, std::milli>(
@@ -1172,16 +1209,18 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             std::chrono::high_resolution_clock::now() - diag_loop_iter_start).count();
         double diag_vramlog_delta_ms = diag_vramlog_ms - diag_vramlog_ms_prev;
         diag_vramlog_ms_prev = diag_vramlog_ms;
-        LOG_INFO("[TOKEN-LOOP-DIAG] step=%d iter_total=%.3fms preproc(sample+decode+print)=%.3fms "
-                 "embed=%.3fms core(hc+forward)=%.3fms vramlog=%.3fms tail=%.3fms\n",
-                 step, diag_loop_iter_ms, diag_preproc_ms, diag_embed_ms, token_wall_ms,
-                 diag_vramlog_delta_ms,
-                 diag_loop_iter_ms - diag_preproc_ms - diag_embed_ms - token_wall_ms - diag_vramlog_delta_ms);
+        if (token_loop_diag_enabled && !bench_silent) {
+            LOG_INFO("[TOKEN-LOOP-DIAG] step=%d iter_total=%.3fms preproc(sample+decode+print)=%.3fms "
+                     "embed=%.3fms core(hc+forward)=%.3fms vramlog=%.3fms tail=%.3fms\n",
+                     step, diag_loop_iter_ms, diag_preproc_ms, diag_embed_ms, token_wall_ms,
+                     diag_vramlog_delta_ms,
+                     diag_loop_iter_ms - diag_preproc_ms - diag_embed_ms - token_wall_ms - diag_vramlog_delta_ms);
+        }
     }
     
     // prefetcher is caller-owned (started once for the whole session by
     // main.cpp) -- not stopped here.
-    if (reasoning.think_tokens > 0) {
+    if (!bench_silent && reasoning.think_tokens > 0) {
         std::cout << "\n[Reasoning: " << reasoning.think_tokens << " tokens | Output: "
                   << reasoning.output_tokens << " tokens]\n";
     }
@@ -1387,5 +1426,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     if (ram_mgr.vram_cache) ram_mgr.vram_cache->log_expert_heatmap(engine.model_file.architecture_config.n_layers);
     ram_mgr.log_host_cache_heatmap(engine);
 
-    std::cout << "\n[Generation Complete]\n";
+    if (!bench_silent) {
+        std::cout << "\n[Generation Complete]\n";
+    }
 }

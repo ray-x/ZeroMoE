@@ -101,6 +101,10 @@ bool qwen4exp_graph_enabled(const StreamingEngine &, ModelGraphPhase phase) {
              : qwen4exp_full_graph_enabled();
 }
 
+bool qwen4exp_graph_bootstrap(StreamingEngine &engine) {
+  return qwen4exp_full_graph_bootstrap(engine);
+}
+
 bool qwen4exp_graph_build(StreamingEngine &engine,
                           const ModelGraphRequest &request) {
   if (!request.token_ids || request.n_tokens <= 0)
@@ -223,7 +227,7 @@ ModelGraphOps model_graph_ops_for(ModelFamily fam) {
   switch (fam) {
   case ModelFamily::Qwen4Exp:
     return {&qwen4exp_graph_enabled,
-            nullptr,
+            &qwen4exp_graph_bootstrap,
             &qwen4exp_graph_build,
             &qwen4exp_graph_run,
             &qwen4exp_full_graph_device_expert_layers,
