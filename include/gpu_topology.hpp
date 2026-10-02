@@ -892,6 +892,14 @@ public:
             // remains available for anyone who needs to A/B the legacy path
             // against the old default.
             const char * schedule_env = std::getenv("MOESTREAM_CUDA_SCHEDULE");
+            // Host-node mode (MOESTREAM_QWEN4EXP_HOST_NODE=1) runs the CPU MoE from a CUDA host callback while the
+            // generation thread waits in cudaStreamSynchronize. With the Auto (spin) schedule that waiting thread
+            // burns a logical CPU the 12-thread OpenMP team needs, stalling every barrier: measured 18.2 vs 22.6
+            // tok/s (+24%) with a blocking wait (see tests/option_b_split_reverify_howto.md section 16). An explicit
+            // MOESTREAM_CUDA_SCHEDULE still wins; every other mode keeps Auto.
+            const char * host_node_env = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+            if ((!schedule_env || !schedule_env[0]) && host_node_env && std::strcmp(host_node_env, "1") == 0)
+                schedule_env = "blocking";
             unsigned schedule_flags = cudaDeviceScheduleAuto;
             const char * schedule_name = "auto";
             if (schedule_env && std::strcmp(schedule_env, "blocking") == 0) {
