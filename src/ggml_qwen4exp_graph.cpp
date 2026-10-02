@@ -40,6 +40,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <sched.h>
 #include <vector>
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -2143,6 +2144,42 @@ int env_decode_kv_capacity(int max_t, int required) {
       requested = static_cast<int>(std::min<long>(parsed, max_t));
   }
   return std::min(max_t, std::max(required, requested));
+}
+
+// Host-node mode runs the CPU MoE inside a CUDA host callback, so a CUDA driver thread
+// leads the OpenMP team. Left to the scheduler, the team's workers land on arbitrary logical
+// CPUs and the identical graph computes ~33% slower than it does from the main thread
+// (standalone repro, tests/option_b_split_reverify_howto.md section 19). Pinning thread i to
+// the i-th allowed CPU recovers most of it: host-node 22.75 -> 25.37 tok/s. Applied only in
+// host-node mode (binding hurts the plain scheduler-split modes);
+// MOESTREAM_QWEN4EXP_HOST_NODE_PIN=0 disables it.
+void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
+  if (!env_qwen4exp_host_node_enabled())
+    return;
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_PIN");
+  if (v && v[0] == '0')
+    return;
+  cpu_set_t allowed;
+  CPU_ZERO(&allowed);
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+    return;
+  bool mask[GGML_MAX_N_THREADS] = {};
+  int got = 0;
+  for (int cpu = 0; cpu < CPU_SETSIZE && cpu < GGML_MAX_N_THREADS &&
+                    got < n_threads;
+       ++cpu) {
+    if (CPU_ISSET(cpu, &allowed)) {
+      mask[cpu] = true;
+      ++got;
+    }
+  }
+  if (got < n_threads)
+    return; // not enough distinct CPUs: leave placement to the scheduler
+  std::memcpy(p.cpumask, mask, sizeof(mask));
+  p.strict_cpu = true;
+  LOG_INFO("[GGML-QWEN-FULL] host-node mode: pinning %d CPU worker threads "
+           "to distinct logical CPUs\n",
+           n_threads);
 }
 
 int graph_cpu_threads() {
@@ -8484,6 +8521,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     ggml_backend_cpu_set_n_threads(g->cpu, g->cpu_threads);
     ggml_threadpool_params cpu_tp_params =
         ggml_threadpool_params_default(g->cpu_threads);
+    pin_host_node_threads(cpu_tp_params, g->cpu_threads);
     // 2026-09-15: tested ggml's own threadpool .poll (default 50 -- NOT
     // controlled by OMP_WAIT_POLICY/GOMP_SPINCOUNT, which only affect
     // libgomp's separate pool) as a candidate for the mixed CPU/GPU decode
@@ -8503,7 +8541,15 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       if (end != poll_env && v >= 0 && v <= 100)
         cpu_tp_params.poll = static_cast<uint32_t>(v);
     }
+    // ggml pins the creating thread to the pool's first CPU; keep the main
+    // thread's own affinity unchanged (only the callback team should be pinned).
+    cpu_set_t main_affinity;
+    CPU_ZERO(&main_affinity);
+    const bool have_main_affinity =
+        sched_getaffinity(0, sizeof(main_affinity), &main_affinity) == 0;
     g->cpu_threadpool = ggml_threadpool_new(&cpu_tp_params);
+    if (have_main_affinity && cpu_tp_params.strict_cpu)
+      sched_setaffinity(0, sizeof(main_affinity), &main_affinity);
     if (g->cpu_threadpool)
       ggml_backend_cpu_set_threadpool(g->cpu, g->cpu_threadpool);
     cpu_setup_ms = std::chrono::duration<double, std::milli>(
