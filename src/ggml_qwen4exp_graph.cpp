@@ -1445,6 +1445,14 @@ std::unique_ptr<FullGraph> g_graph;
 // Keep the owner alive until the borrower has been destroyed.
 std::unique_ptr<FullGraph> g_graph_prefill_arena_owner;
 
+// Owner of the decode-only per-expert split arena (Option-B hot experts gathered
+// into compact VRAM tensors). The prefill graph never allocates it (split tensors
+// exist only for S == 1), so the prefill arena owner cannot lend it to decode. It
+// is built once at startup (qwen4exp_full_graph_bootstrap) so the first request's
+// decode graph rebinds the already-uploaded device addresses instead of re-uploading
+// ~13 GiB (~2.7 s). Holds only the expert arena and its address map.
+std::unique_ptr<FullGraph> g_graph_decode_arena_owner;
+
 // Standalone two-layer diagnostic owner. It is intentionally separate from
 // g_graph so enabling the diagnostic cannot alter the production full-graph
 // cache or its phase-2 sibling ownership.
@@ -1479,8 +1487,8 @@ bool env_enabled() {
 
 bool env_decode_borrow_prefill_arenas() {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_DECODE_BORROW_PREFILL_ARENAS");
-  return v && std::strcmp(v, "1") == 0;
+      std::getenv("MOESTREAM_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
+  return !(v && std::strcmp(v, "1") == 0);
 }
 
 int env_device_expert_layers() {
@@ -7642,8 +7650,103 @@ void qwen4exp_full_graph_shutdown() {
   g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
   g_graph_prefill_arena_owner.reset();
+  g_graph_decode_arena_owner.reset();
   g_two_layer_diag_graph.reset();
   g_two_layer_diag_done = false;
+}
+
+// True when the decode graph will build a per-expert hot/cold split (Option B):
+// the same condition plan_expert_vram_split() uses to decide it has work to do.
+static bool engine_plans_decode_expert_split(const StreamingEngine &engine) {
+  const bool option_b_auto = engine.qwen4exp_option_b_concentrated_only &&
+                             engine.qwen4exp_option_b_layer < 0;
+  return engine.qwen4exp_option_b_layer >= 0 || option_b_auto ||
+         !engine.qwen4exp_option_b_layers.empty();
+}
+
+// Moves the per-expert split arena (and its address map) out of a decode graph
+// into a standalone owner so it can outlive that graph. Returns null when the
+// graph does not own such an arena. The graph must not free the arena afterwards.
+static std::unique_ptr<FullGraph> extract_decode_arena_owner(
+    FullGraph &g, StreamingEngine &engine) {
+  if (!g.ready || !g.decode_mode || !g.device_expert_buffer ||
+      g.phase2_expert_source_graph || g.device_expert_capacity == 0)
+    return nullptr;
+  auto owner = std::make_unique<FullGraph>();
+  owner->engine = &engine;
+  owner->device = g.device;
+  owner->ready = true;
+  owner->device_expert_buffer = g.device_expert_buffer;
+  owner->device_expert_base = g.device_expert_base;
+  owner->device_expert_capacity = g.device_expert_capacity;
+  owner->device_expert_used = g.device_expert_used;
+  owner->phase2_expert_addrs = std::move(g.phase2_expert_addrs);
+  owner->split_gpu_expert_ids = g.split_gpu_expert_ids;
+  owner->device_expert_layers = g.device_expert_layers;
+  owner->device_expert_trailing = g.device_expert_trailing;
+  owner->device_expert_partial_gate_up = g.device_expert_partial_gate_up;
+  g.device_expert_buffer = nullptr;
+  g.device_expert_base = nullptr;
+  g.device_expert_capacity = 0;
+  g.device_expert_used = 0;
+  return owner;
+}
+
+// Prefill workspace grows with the prompt: measured 0.69 GiB at S=20 and
+// 13.18 GiB at S=1747 on Qwen3.8-Flash-Next (scheduler activation copies), i.e.
+// roughly 0.5 GiB + 7.5 MiB per token (slightly conservative).
+static size_t estimate_prefill_workspace_bytes(int S) {
+  return (static_cast<size_t>(512) << 20) +
+         static_cast<size_t>(S) * (static_cast<size_t>(15) << 19);
+}
+
+// The retained per-expert split arena (~13 GiB) makes the next decode graph
+// cheap to build, but it competes with the prefill workspace for VRAM. Keep it
+// resident for prompts whose workspace fits (and recover it from the live
+// decode graph after a long prompt), release it before a prefill that needs the
+// space. Called before the prefill graph is built.
+static void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
+  const bool live_owned =
+      g_graph && g_graph->decode_mode && g_graph->device_expert_buffer &&
+      !g_graph->phase2_expert_source_graph && g_graph->device_expert_capacity > 0;
+  if (!g_graph_decode_arena_owner && !live_owned)
+    return;
+  size_t free_bytes = 0, total_bytes = 0;
+  cudaMemGetInfo(&free_bytes, &total_bytes);
+  // The live decode graph (state, workspace) is destroyed before the prefill
+  // graph is built, so credit its small footprint.
+  const size_t live_credit =
+      (g_graph && g_graph->decode_mode) ? (static_cast<size_t>(512) << 20) : 0;
+  const size_t need =
+      estimate_prefill_workspace_bytes(S) + (static_cast<size_t>(1) << 30);
+  const bool keep = free_bytes + live_credit >= need;
+  if (keep) {
+    if (!g_graph_decode_arena_owner && live_owned) {
+      auto owner = extract_decode_arena_owner(*g_graph, engine);
+      g_graph.reset(); // borrower-free: owns no arena any more
+      if (owner) {
+        g_graph_decode_arena_owner = std::move(owner);
+        LOG_INFO("[GGML-QWEN-FULL] retaining the per-expert split arena for the "
+                 "next decode (prompt S=%d fits: %.2f GiB free, ~%.2f GiB "
+                 "needed)\n",
+                 S, static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0),
+                 static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0));
+      }
+    }
+    return;
+  }
+  // The prefill needs the space: destroy the decode borrower first (it aliases
+  // the arena), then the arena itself.
+  if (g_graph && g_graph->decode_mode)
+    g_graph.reset();
+  if (g_graph_decode_arena_owner) {
+    g_graph_decode_arena_owner.reset();
+    LOG_INFO("[GGML-QWEN-FULL] released the per-expert split arena before a "
+             "long prefill (S=%d needs ~%.2f GiB, only %.2f GiB free); the "
+             "next decode will rebuild it\n",
+             S, static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0),
+             static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0));
+  }
 }
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
@@ -7698,6 +7801,8 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     }
   }
   const int dev = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+  if (reuse_prefill_weight_arenas)
+    manage_decode_arena_for_prefill(engine, S);
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->sched && !g_graph->decode_mode && g_graph->S == S) {
     // PLE rows are request data, so refresh that input when the graph shape
@@ -7791,7 +7896,8 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       g_graph_prefill_arena_owner->engine == &engine &&
       g_graph_prefill_arena_owner->device == dev &&
       g_graph_prefill_arena_owner->device_dense_buffer &&
-      g_graph_prefill_arena_owner->device_expert_buffer &&
+      (g_graph_prefill_arena_owner->device_expert_buffer ||
+       g->device_expert_layers == 0) &&
       g_graph_prefill_arena_owner->device_expert_layers ==
           g->device_expert_layers &&
       g_graph_prefill_arena_owner->device_expert_trailing ==
@@ -7806,10 +7912,13 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       prefill_weight_source->sched = nullptr;
     }
     g->phase2_dense_source_graph = prefill_weight_source;
-    g->phase2_expert_source_graph = prefill_weight_source;
-    LOG_INFO("[GGML-QWEN-FULL] reusing retained dense/expert weight arenas "
+    // A split config has no resident expert layers in the prefill graph, so the
+    // owner has no expert arena to lend; borrow the dense arena only.
+    if (prefill_weight_source->device_expert_buffer)
+      g->phase2_expert_source_graph = prefill_weight_source;
+    LOG_INFO("[GGML-QWEN-FULL] reusing retained dense%s weight arenas "
              "for new prompt shape S=%d\n",
-             S);
+             prefill_weight_source->device_expert_buffer ? "/expert" : "", S);
   } else if (g_graph_prefill_arena_owner) {
     // A different engine/device/residency layout cannot safely bind to these
     // addresses. g_graph (the borrower) was destroyed above, so the owner is
@@ -7949,10 +8058,12 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
 bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
   const char *bootstrap =
       std::getenv("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP");
-  // This moves a measured one-time cost into engine startup, so keep it
-  // explicit. The ordinary lazy path remains available for profiles that
-  // include startup-to-first-token in their timing boundary.
-  if (!bootstrap || std::strcmp(bootstrap, "1") != 0)
+  // Build and retain the prompt-independent dense/expert arenas during
+  // startup. Graph construction must not hide a multi-second GGUF read and
+  // VRAM upload inside the first prefill. Keep the old lazy behavior as an
+  // explicit diagnostic override for profiles that include startup-to-first-
+  // token in their timing boundary.
+  if (bootstrap && std::strcmp(bootstrap, "0") == 0)
     return true;
 
   // The arenas are only reusable across the prefill/decode graph swap when
@@ -8024,6 +8135,59 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
                                    ->device_expert_used) /
                (1024.0 * 1024.0 * 1024.0),
            bootstrap_tokens);
+
+  // Per-expert split configs (Option B): the decode-only split arena (~13 GiB of
+  // hot experts) cannot be borrowed from the prefill graph, so without this the
+  // first request pays the whole gather + upload (~2.7 s) inside decode setup.
+  // Build the decode graph once here, keep only its expert arena (and address
+  // map) in g_graph_decode_arena_owner, and let every later decode graph rebind
+  // those addresses with no re-upload.
+  if (engine_plans_decode_expert_split(engine) && !g_graph_decode_arena_owner) {
+    const auto split_started = std::chrono::steady_clock::now();
+    // decode_prepare expects the live prefill graph in g_graph and re-retains it
+    // as the dense-arena owner itself.
+    g_graph = std::move(g_graph_prefill_arena_owner);
+    const bool built = qwen4exp_full_graph_decode_prepare(
+        engine, bootstrap_tokens, bootstrap_token_ids.data());
+    if (!built) {
+      LOG_WARN("[GGML-QWEN-FULL-BOOTSTRAP] per-expert split arena preparation "
+               "failed; the first decode will build it lazily\n");
+    } else if (g_graph) {
+      auto owner = extract_decode_arena_owner(*g_graph, engine);
+      // Destroy the throwaway decode graph (the arena borrower) first, then
+      // check how much VRAM the retained arena leaves for prefill workspaces.
+      g_graph.reset();
+      if (owner) {
+        size_t free_bytes = 0, total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        const double free_gib =
+            static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0);
+        constexpr size_t kMinHeadroomBytes = static_cast<size_t>(1) << 30;
+        if (free_bytes >= kMinHeadroomBytes) {
+          const double arena_gib =
+              static_cast<double>(owner->device_expert_capacity) /
+              (1024.0 * 1024.0 * 1024.0);
+          const size_t bound = owner->phase2_expert_addrs.size();
+          g_graph_decode_arena_owner = std::move(owner);
+          LOG_INFO("[GGML-QWEN-FULL-BOOTSTRAP] prepared the per-expert split "
+                   "arena (%.2f GiB, %zu bound tensors) in %.1fms, %.2f GiB "
+                   "VRAM left free; decode graph construction will rebind it "
+                   "without re-uploading\n",
+                   arena_gib, bound,
+                   std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - split_started)
+                       .count(),
+                   free_gib);
+        } else {
+          LOG_WARN("[GGML-QWEN-FULL-BOOTSTRAP] not retaining the per-expert "
+                   "split arena: only %.2f GiB of VRAM would remain free for "
+                   "prefill\n",
+                   free_gib);
+        }
+      }
+    }
+    g_graph.reset(); // no throwaway graph may survive bootstrap
+  }
   return true;
 }
 
@@ -8587,16 +8751,37 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // ordinary retry loop cannot shrink device_expert_layers meaningfully.
     // If the borrower graph does not fit or fails to build, release the owner
     // before returning to the established layered path.
+    // Borrow only what an owner really holds. The prefill owner has an expert
+    // arena only for whole-layer residency; a per-expert split arena is
+    // decode-only and comes from the decode arena owner (built at bootstrap).
+    // With neither, the expert arena is allocated fresh below (same as the
+    // recreate path) while the dense arena is still borrowed.
+    FullGraph *expert_source = nullptr;
+    if (prefill_arena_source->device_expert_buffer) {
+      expert_source = prefill_arena_source;
+    } else if (g_graph_decode_arena_owner && g_graph_decode_arena_owner->ready &&
+               g_graph_decode_arena_owner->engine == &engine &&
+               g_graph_decode_arena_owner->device == dev &&
+               g_graph_decode_arena_owner->device_expert_buffer) {
+      expert_source = g_graph_decode_arena_owner.get();
+      LOG_INFO("[GGML-QWEN-FULL-DECODE] rebinding the per-expert split arena "
+               "prepared at startup (no re-upload)\n");
+    }
     g = build_one(FullGraph::Phase2Mode::Off, -1,
                   prefill_state_handoff ? prefill_arena_source : nullptr,
-                  prefill_arena_source, prefill_arena_source);
+                  prefill_arena_source, expert_source);
     if (!g) {
+      // Never fall to the layered path with half-reused arenas (that produced
+      // garbled output on split configs): drop every owner and rebuild fresh.
       g_graph_prefill_arena_owner.reset();
+      g_graph_decode_arena_owner.reset();
+      prefill_arena_source = nullptr;
       LOG_WARN("[GGML-QWEN-FULL-DECODE] borrowed-arena graph build failed; "
-               "released retained prefill arenas and using layered decode\n");
-      return false;
+               "released retained arenas and rebuilding the decode graph "
+               "with fresh arenas\n");
     }
-  } else {
+  }
+  if (!g) {
     constexpr int kMaxExpertLayerShrinkRetries = 8;
     for (int attempt = 0; attempt <= kMaxExpertLayerShrinkRetries; ++attempt) {
       g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr, nullptr, nullptr);
@@ -8822,18 +9007,35 @@ bool try_launch(StreamingEngine &engine, FullGraph &prefix, FullGraph &sgpu,
       cudaGraphDestroy(st.master_graph);
       st.master_graph = nullptr;
     }
-    if (cudaGraphCreate(&st.master_graph, 0) != cudaSuccess)
+    // A rejected build step must not leave a sticky CUDA error behind (the
+    // next ggml kernel launch would abort on it) and must not be retried
+    // every token. Known cause: CUDA refuses to instantiate a conditional
+    // body graph that contains host nodes, e.g. a sgpu graph whose CPU layers
+    // are cudaLaunchHostFunc callbacks (MOESTREAM_QWEN4EXP_HOST_NODE).
+    auto build_ok = [&st](cudaError_t e, const char *what) {
+      if (e == cudaSuccess)
+        return true;
+      cudaGetLastError();
+      st.safety_ok = false;
+      LOG_WARN("[QWEN4EXP-MASTER-GRAPH] disabled for this session: %s failed "
+               "(%s); falling back to the two-graph host-branch dispatch\n",
+               what, cudaGetErrorString(e));
+      return false;
+    };
+    if (!build_ok(cudaGraphCreate(&st.master_graph, 0), "cudaGraphCreate"))
       return false;
 
     cudaGraphNode_t prefix_node = nullptr;
-    if (cudaGraphAddChildGraphNode(&prefix_node, st.master_graph, nullptr, 0,
-                                   prefix_handle) != cudaSuccess)
+    if (!build_ok(cudaGraphAddChildGraphNode(&prefix_node, st.master_graph,
+                                             nullptr, 0, prefix_handle),
+                  "adding the prefix child graph"))
       return false;
 
     cudaGraphConditionalHandle cond_handle{};
-    if (cudaGraphConditionalHandleCreate(&cond_handle, st.master_graph, 0,
-                                         cudaGraphCondAssignDefault) !=
-        cudaSuccess)
+    if (!build_ok(cudaGraphConditionalHandleCreate(
+                      &cond_handle, st.master_graph, 0,
+                      cudaGraphCondAssignDefault),
+                  "creating the conditional handle"))
       return false;
 
     ggml_tensor *routed_ids_tensor = prefix.partial_layer_ids_out;
@@ -8850,9 +9052,9 @@ bool try_launch(StreamingEngine &engine, FullGraph &prefix, FullGraph &sgpu,
     predicate_kernel.blockDim = dim3(1, 1, 1);
     predicate_kernel.kernelParams = predicate_args;
     cudaGraphNode_t predicate_node = nullptr;
-    if (cudaGraphAddKernelNode(&predicate_node, st.master_graph,
-                              &prefix_node, 1, &predicate_kernel) !=
-        cudaSuccess)
+    if (!build_ok(cudaGraphAddKernelNode(&predicate_node, st.master_graph,
+                                         &prefix_node, 1, &predicate_kernel),
+                  "adding the predicate kernel"))
       return false;
 
     // size=1: cudaGraphCondTypeIf with only a true-body. When the predicate
@@ -8864,18 +9066,21 @@ bool try_launch(StreamingEngine &engine, FullGraph &prefix, FullGraph &sgpu,
     cond_params.conditional.type = cudaGraphCondTypeIf;
     cond_params.conditional.size = 1;
     cudaGraphNode_t cond_node = nullptr;
-    if (cudaGraphAddNode(&cond_node, st.master_graph, &predicate_node,
-                        nullptr, 1, &cond_params) != cudaSuccess)
+    if (!build_ok(cudaGraphAddNode(&cond_node, st.master_graph, &predicate_node,
+                                   nullptr, 1, &cond_params),
+                  "adding the conditional node"))
       return false;
 
     cudaGraphNode_t sgpu_child = nullptr;
-    if (cudaGraphAddChildGraphNode(
-            &sgpu_child, cond_params.conditional.phGraph_out[0], nullptr, 0,
-            sgpu_handle) != cudaSuccess)
+    if (!build_ok(cudaGraphAddChildGraphNode(
+                      &sgpu_child, cond_params.conditional.phGraph_out[0],
+                      nullptr, 0, sgpu_handle),
+                  "adding the sgpu body graph"))
       return false;
 
-    if (cudaGraphInstantiate(&st.master_exec, st.master_graph, 0) !=
-        cudaSuccess)
+    if (!build_ok(cudaGraphInstantiate(&st.master_exec, st.master_graph, 0),
+                  "instantiating the master graph (a conditional body cannot "
+                  "contain host nodes)"))
       return false;
 
     st.last_prefix_handle = prefix_handle;
