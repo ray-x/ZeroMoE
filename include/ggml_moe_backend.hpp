@@ -956,6 +956,15 @@ class GgmlQwenCpuMoeRunner {
       int d_model, int d_ff, int topk, size_t gate_stride, size_t up_stride,
       size_t down_stride);
 
+  // Per-expert (unweighted) output variant of run_strided_planes for the
+  // projection-compact layout; weighting/reduction happens on the GPU.
+  bool run_strided_planes_down(
+      const float *input, float *expert_output,
+      const GgmlQwenCpuExpertRef &layer, const void *gate_plane,
+      const void *up_plane, const void *down_plane, const int *expert_ids,
+      int n_experts, int d_model, int d_ff, int topk, size_t gate_stride,
+      size_t up_stride, size_t down_stride);
+
   // Qwen-only CPU/GPU partition: run the CPU graph through the down
   // projection, returning the unweighted [d_model, topk] expert outputs.
   // The top-k weighting and reduction are performed by

@@ -394,3 +394,12 @@ Host-node mode (CPU MoE as CUDA host callbacks) ran at 22.7 tok/s vs 28.0 for pl
   Result (2 interleaved reps): in-engine pin **26.25 tok/s (+15.6%)** vs 22.70 opt-out vs 25.57 env binding; output identical. `MOESTREAM_QWEN4EXP_HOST_NODE_PIN=0` disables it. Host-node is now within ~1.75 tok/s of plain splits.
 - Answer to "wait for all CPU work, then signal once": already the case within a layer (one callback runs gate+up+swiglu+down+reduce, then the H2D copy releases the GPU). Across layers it cannot be batched: layer L+1's GPU attention/router needs layer L's MoE output.
 - Remaining gap (~2.4 ms/token): handoff ~1.6 ms (doorbell -0.4, packing 2.5 D2H copies into one ~-0.4), CPU reduce tail ~0.9 ms (`output_per_expert`), residual placement effect ~1.3 ms. Not implemented.
+
+## 20. Host-node GPU weighted reduce (+1.65%)
+
+`MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE` (default on; `=0` opts out). The callback runs the CPU graph through the down projection
+(`run_strided_planes_down` / `run_strided_down`, runner `output_per_expert`), H2D copies `[D, topk]`, and the GPU applies
+`mul(route_weights)` -> `permute+cont` -> `sum_rows`. Removes the CPU reduce tail and the weights D2H.
+A/B on `cond.toml`, HOST_NODE=1, 6 interleaved runs each: ON 26.58/26.28/26.38/26.58/26.55/26.40 (mean 26.46),
+OFF 26.06/26.30/26.04/25.61/26.04/26.16 (mean 26.03) tok/s. Output text identical. Remaining gap to plain 22/26 (28.0): ~1.5 tok/s,
+mostly the fixed cudaLaunchHostFunc handoff (~29 us/layer) and residual callback-thread placement.

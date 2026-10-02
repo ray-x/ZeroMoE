@@ -2595,6 +2595,48 @@ bool GgmlQwenCpuMoeRunner::run_strided_planes(
   return true;
 }
 
+bool GgmlQwenCpuMoeRunner::run_strided_planes_down(
+    const float *input, float *expert_output,
+    const GgmlQwenCpuExpertRef &layer, const void *gate_plane,
+    const void *up_plane, const void *down_plane, const int *expert_ids,
+    int n_experts, int d_model, int d_ff, int topk, size_t gate_stride,
+    size_t up_stride, size_t down_stride) {
+  if (!input || !expert_output || !gate_plane || !up_plane || !down_plane ||
+      !expert_ids || n_experts <= 0 || topk <= 0 || topk > n_experts ||
+      d_model <= 0 || d_ff <= 0 || layer.gate_bytes == 0 ||
+      layer.up_bytes == 0 || layer.down_bytes == 0 || gate_stride == 0 ||
+      up_stride == 0 || down_stride == 0 || !type_is_valid(layer.gate_type) ||
+      !type_is_valid(layer.up_type) || !type_is_valid(layer.down_type))
+    return false;
+  for (int k = 0; k < topk; ++k) {
+    if (expert_ids[k] < 0 || expert_ids[k] >= n_experts)
+      return false;
+  }
+  if (!ensure_graph(layer, n_experts, d_model, d_ff, topk, true, gate_plane,
+                    up_plane, down_plane, gate_stride, true, false, up_stride,
+                    down_stride))
+    return false;
+  static_cast<ggml_tensor *>(gate_)->data = const_cast<void *>(gate_plane);
+  static_cast<ggml_tensor *>(up_)->data = const_cast<void *>(up_plane);
+  static_cast<ggml_tensor *>(down_)->data = const_cast<void *>(down_plane);
+  std::memcpy(static_cast<ggml_tensor *>(x_)->data, input,
+              static_cast<size_t>(d_model_) * sizeof(float));
+  auto *ids = static_cast<int32_t *>(static_cast<ggml_tensor *>(ids_)->data);
+  for (int k = 0; k < topk_; ++k)
+    ids[k] = static_cast<int32_t>(expert_ids[k]);
+  if (!compute_graph())
+    return false;
+  const ggml_tensor *result = static_cast<const ggml_tensor *>(output_);
+  if (!result || result->ne[0] != d_model_ || result->ne[1] != topk_ ||
+      result->nb[0] != sizeof(float) ||
+      result->nb[1] != static_cast<size_t>(d_model_) * sizeof(float))
+    return false;
+  std::memcpy(expert_output, result->data,
+              static_cast<size_t>(d_model_) * static_cast<size_t>(topk_) *
+                  sizeof(float));
+  return true;
+}
+
 bool GgmlQwenCpuMoeRunner::run_strided_down(
     const float *input, float *expert_output,
     const GgmlQwenCpuExpertRef &layer, const void *gate_plane,
@@ -2799,6 +2841,12 @@ bool GgmlQwenCpuMoeRunner::run_strided_planes(
     const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
     const void *, const void *, const int *, int, const float *, int, int, int,
     size_t, size_t, size_t) {
+  return false;
+}
+bool GgmlQwenCpuMoeRunner::run_strided_planes_down(
+    const float *, float *, const GgmlQwenCpuExpertRef &, const void *,
+    const void *, const void *, const int *, int, int, int, int, size_t,
+    size_t, size_t) {
   return false;
 }
 bool GgmlQwenCpuMoeRunner::run_strided_down(

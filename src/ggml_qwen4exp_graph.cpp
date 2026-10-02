@@ -75,6 +75,9 @@ struct Qwen4ExpCudaHostNodeContext {
   size_t up_stride = 0;
   size_t down_stride = 0;
   bool projection_compact = false;
+  // CPU returns unweighted [D, topk] expert outputs; the GPU weights and
+  // reduces them after the marker (saves the CPU reduce tail).
+  bool gpu_reduce = false;
   // The full graph owns this pool. The host-node runner borrows it for the
   // callback and never frees or pauses it.
   ggml_threadpool_t shared_cpu_threadpool = nullptr;
@@ -379,6 +382,11 @@ static bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
   return true;
 }
 
+static bool env_host_node_gpu_reduce() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE");
+  return !(v && v[0] == '0');
+}
+
 static bool env_host_node_skip_cpu() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_SKIP_CPU");
   return v && v[0] == '1';
@@ -621,9 +629,17 @@ static void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
     if (!runner)
       runner = &GgmlQwenCpuMoeRunner::instance_for_strided_planes(
           ctx->layer, ctx->n_experts, ctx->d_model, ctx->d_ff, ctx->topk,
-          ctx->gate_stride, ctx->up_stride, ctx->down_stride, false);
+          ctx->gate_stride, ctx->up_stride, ctx->down_stride,
+          ctx->gpu_reduce);
     if (!runner->uses_external_threadpool())
       runner->resume_workers();
+    if (ctx->gpu_reduce)
+      ok = runner->run_strided_planes_down(
+          ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
+          ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
+          ctx->d_model, ctx->d_ff, ctx->topk, ctx->gate_stride,
+          ctx->up_stride, ctx->down_stride);
+    else
     ok = runner->run_strided_planes(
         ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
         ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
@@ -634,9 +650,15 @@ static void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
     if (!runner)
       runner = &GgmlQwenCpuMoeRunner::instance_for_strided(
           ctx->layer, ctx->n_experts, ctx->d_model, ctx->d_ff, ctx->topk,
-          ctx->expert_stride, false);
+          ctx->expert_stride, ctx->gpu_reduce);
     if (!runner->uses_external_threadpool())
       runner->resume_workers();
+    if (ctx->gpu_reduce)
+      ok = runner->run_strided_down(
+          ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
+          ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
+          ctx->d_model, ctx->d_ff, ctx->topk, ctx->expert_stride);
+    else
     ok = runner->run_strided(
         ctx->host_input, ctx->host_output, ctx->layer, ctx->gate_plane,
         ctx->up_plane, ctx->down_plane, ctx->host_ids, ctx->n_experts,
@@ -746,8 +768,10 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
   }
   auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(node->extra);
   if (ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
-      !node->data || !node->src[0] || !node->src[2] || !node->src[3] ||
-      !node->src[0]->data || !node->src[2]->data || !node->src[3]->data ||
+      !node->data || !node->src[0] || !node->src[2] ||
+      (!ctx->gpu_reduce && !node->src[3]) ||
+      !node->src[0]->data || !node->src[2]->data ||
+      (!ctx->gpu_reduce && !node->src[3]->data) ||
       !ctx->host_input || !ctx->host_output || !ctx->host_ids ||
       !ctx->host_weights || !ctx->d2h_start || !ctx->d2h_end ||
       !ctx->h2d_start || !ctx->h2d_end)
@@ -770,9 +794,10 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
       cudaMemcpyAsync(ctx->host_ids, node->src[2]->data, ctx->ids_bytes,
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-      cudaMemcpyAsync(ctx->host_weights, node->src[3]->data,
-                      ctx->weights_bytes, cudaMemcpyDeviceToHost, stream) !=
-          cudaSuccess ||
+      (!ctx->gpu_reduce &&
+       cudaMemcpyAsync(ctx->host_weights, node->src[3]->data,
+                       ctx->weights_bytes, cudaMemcpyDeviceToHost, stream) !=
+           cudaSuccess) ||
       cudaEventRecord(ctx->d2h_end, stream) != cudaSuccess ||
       cudaLaunchHostFunc(stream, qwen4exp_cuda_host_node_callback, ctx) !=
           cudaSuccess ||
@@ -4761,7 +4786,10 @@ ggml_tensor *build_qwen4exp_host_node(
   node_ctx->up_stride = arena->up_stride;
   node_ctx->down_stride = arena->down_stride;
   node_ctx->input_bytes = static_cast<size_t>(g.D) * sizeof(float);
-  node_ctx->output_bytes = node_ctx->input_bytes;
+  node_ctx->gpu_reduce = env_host_node_gpu_reduce();
+  node_ctx->output_bytes =
+      node_ctx->input_bytes *
+      (node_ctx->gpu_reduce ? static_cast<size_t>(c.topk) : 1);
   node_ctx->ids_bytes = static_cast<size_t>(c.topk) * sizeof(int32_t);
   node_ctx->weights_bytes = static_cast<size_t>(c.topk) * sizeof(float);
   node_ctx->host_input = static_cast<float *>(
@@ -4800,7 +4828,8 @@ ggml_tensor *build_qwen4exp_host_node(
   // Warm the persistent CPU GGML plan before capture. The graph callback must
   // not be the first call that allocates/builds the CPU plan.
   std::fill_n(node_ctx->host_input, g.D, 0.0f);
-  std::fill_n(node_ctx->host_output, g.D, 0.0f);
+  std::fill_n(node_ctx->host_output, node_ctx->output_bytes / sizeof(float),
+              0.0f);
   std::fill_n(node_ctx->host_ids, c.topk, 0);
   std::fill_n(node_ctx->host_weights, c.topk,
               1.0f / static_cast<float>(std::max(1, c.topk)));
@@ -4819,7 +4848,16 @@ ggml_tensor *build_qwen4exp_host_node(
     warm_runner = &GgmlQwenCpuMoeRunner::instance_for_strided_planes(
             node_ctx->layer, node_ctx->n_experts, node_ctx->d_model,
             node_ctx->d_ff, node_ctx->topk, node_ctx->gate_stride,
-            node_ctx->up_stride, node_ctx->down_stride, false);
+            node_ctx->up_stride, node_ctx->down_stride,
+            node_ctx->gpu_reduce);
+    if (node_ctx->gpu_reduce)
+      warm_ok = warm_runner->run_strided_planes_down(
+          node_ctx->host_input, node_ctx->host_output, node_ctx->layer,
+          node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
+          node_ctx->host_ids, node_ctx->n_experts, node_ctx->d_model,
+          node_ctx->d_ff, node_ctx->topk, node_ctx->gate_stride,
+          node_ctx->up_stride, node_ctx->down_stride);
+    else
     warm_ok = warm_runner->run_strided_planes(
         node_ctx->host_input, node_ctx->host_output, node_ctx->layer,
         node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
@@ -4829,7 +4867,15 @@ ggml_tensor *build_qwen4exp_host_node(
   } else {
     warm_runner = &GgmlQwenCpuMoeRunner::instance_for_strided(
             node_ctx->layer, node_ctx->n_experts, node_ctx->d_model,
-            node_ctx->d_ff, node_ctx->topk, node_ctx->expert_stride, false);
+            node_ctx->d_ff, node_ctx->topk, node_ctx->expert_stride,
+            node_ctx->gpu_reduce);
+    if (node_ctx->gpu_reduce)
+      warm_ok = warm_runner->run_strided_down(
+          node_ctx->host_input, node_ctx->host_output, node_ctx->layer,
+          node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
+          node_ctx->host_ids, node_ctx->n_experts, node_ctx->d_model,
+          node_ctx->d_ff, node_ctx->topk, node_ctx->expert_stride);
+    else
     warm_ok = warm_runner->run_strided(
         node_ctx->host_input, node_ctx->host_output, node_ctx->layer,
         node_ctx->gate_plane, node_ctx->up_plane, node_ctx->down_plane,
@@ -4891,13 +4937,20 @@ ggml_tensor *build_qwen4exp_host_node(
   if (!input3 || !route_ids || !route_weights)
     return nullptr;
 
-  ggml_tensor *destination = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, g.D, g.S);
+  const bool gpu_reduce = node_ctx->gpu_reduce;
+  ggml_tensor *destination = ggml_new_tensor_2d(
+      ctx, GGML_TYPE_F32, g.D, gpu_reduce ? c.topk : g.S);
   if (!destination)
     return nullptr;
   ggml_set_name(destination,
                 ("qwen4exp_host_moe_output_l" + std::to_string(layer))
                     .c_str());
-  ggml_tensor *marker = ggml_cpy(ctx, input3, destination);
+  // In GPU-reduce mode only row 0 is a real copy target; the bridge H2D
+  // fills all topk rows of the destination from the callback's output.
+  ggml_tensor *copy_dst =
+      gpu_reduce ? ggml_view_2d(ctx, destination, g.D, 1, destination->nb[1], 0)
+                 : destination;
+  ggml_tensor *marker = ggml_cpy(ctx, input3, copy_dst);
   if (!marker)
     return nullptr;
   marker->extra = node_ctx.get();
@@ -4905,10 +4958,30 @@ ggml_tensor *build_qwen4exp_host_node(
   // pinned route buffers before the callback; the ordinary CPY backend never
   // sees this marker because the bridge consumes it first.
   marker->src[2] = route_ids;
-  marker->src[3] = route_weights;
+  if (!gpu_reduce)
+    marker->src[3] = route_weights;
   ggml_set_name(marker,
                 ("qwen4exp_host_moe_marker_l" + std::to_string(layer))
                     .c_str());
+  ggml_tensor *result = marker;
+  if (gpu_reduce) {
+    // [D, topk] unweighted expert outputs -> weight and sum over topk.
+    ggml_tensor *per_expert =
+        ggml_view_3d(ctx, marker, g.D, c.topk, 1, destination->nb[1],
+                     destination->nb[1] * c.topk, 0);
+    ggml_tensor *prod = ggml_mul(ctx, per_expert, route_weights);
+    ggml_tensor *t = ggml_cont(ctx, ggml_permute(ctx, prod, 1, 0, 2, 3));
+    ggml_tensor *sum = ggml_sum_rows(ctx, t);
+    result = ggml_reshape_2d(ctx, sum, g.D, g.S);
+    if (!per_expert || !prod || !t || !sum || !result)
+      return nullptr;
+    if (g.sched) {
+      ggml_backend_sched_set_tensor_backend(g.sched, per_expert, g.cuda);
+      ggml_backend_sched_set_tensor_backend(g.sched, prod, g.cuda);
+      ggml_backend_sched_set_tensor_backend(g.sched, t, g.cuda);
+      ggml_backend_sched_set_tensor_backend(g.sched, sum, g.cuda);
+    }
+  }
   if (g.sched) {
     ggml_backend_sched_set_tensor_backend(g.sched, destination, g.cuda);
     ggml_backend_sched_set_tensor_backend(g.sched, marker, g.cuda);
@@ -4917,7 +4990,7 @@ ggml_tensor *build_qwen4exp_host_node(
   LOG_INFO("[QWEN4EXP-HOST-NODE] captured CPU MoE marker for layer=%d "
            "(D=%d topk=%d stride=%zu)\n",
            layer, g.D, c.topk, arena->stride);
-  return marker;
+  return result;
 }
 
 // Generalizes Option-B's layer-13 staging proof

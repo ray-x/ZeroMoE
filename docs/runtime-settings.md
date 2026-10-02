@@ -48,6 +48,16 @@ than from the main thread. Pinning gave host-node mode 22.70 -> 26.25 tok/s (+15
 (0/44/4 got ~4% slower with binding, 22/26 ~4% faster, both within noise-to-negative). Do not combine host-node mode with `OMP_WAIT_POLICY=active`:
 spinning workers plus a busy main thread can starve the callback thread (measured 7x slower in isolation).
 
+### `MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE`
+
+| | |
+|---|---|
+| Values | `0` disables; anything else / unset = enabled |
+| Default | on, only takes effect when `MOESTREAM_QWEN4EXP_HOST_NODE=1` |
+| Effect | The callback returns the unweighted `[D, topk]` expert outputs (no CPU weighted-reduce tail, no weights D2H); the GPU does mul by router weights + sum over topk after the marker. |
+
+Measured (6 interleaved runs each, idle box): 26.46 vs 26.03 tok/s (+1.65%, every ON run >= every OFF run except one). Output text identical in the checked pair; the reduction order differs from the CPU path so it is not guaranteed bit-identical.
+
 ## `MOESTREAM_QWEN_CPU_THREADS`
 
 | | |
