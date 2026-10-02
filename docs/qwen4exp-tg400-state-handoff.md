@@ -100,8 +100,6 @@ MOESTREAM_QWEN4EXP_FULL_GRAPH=1
 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40
 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
-MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP=1
-MOESTREAM_QWEN4EXP_DECODE_BORROW_PREFILL_ARENAS=1
 MOESTREAM_PROMPT_TOKEN_INPUT_FILE=/tmp/tg400_qwen_prompt_tokens.txt
 MOESTREAM_TEACHER_FORCE_TOKEN_FILE=<quantization-specific 400-token file>
 MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING=1
@@ -124,8 +122,6 @@ The MoEStream measured-run shape is:
   MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 \
   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-  MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP=1 \
-  MOESTREAM_QWEN4EXP_DECODE_BORROW_PREFILL_ARENAS=1 \
   MOESTREAM_PROMPT_TOKEN_INPUT_FILE=/tmp/tg400_qwen_prompt_tokens.txt \
   MOESTREAM_TEACHER_FORCE_TOKEN_FILE=/tmp/moestream_q2_0_tg400_decode_tokens_20261002.txt \
   MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING=1 \
@@ -133,6 +129,13 @@ The MoEStream measured-run shape is:
   MOESTREAM_BENCH_IGNORE_STOP=1 \
   ./build-tg400/moestream --config configs/qwen4exp_tg400_q2_0_22_26.toml
 ```
+
+Decode borrows the completed prefill graph's dense/expert arenas by default.
+Set `MOESTREAM_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` to explicitly use the
+older behavior and create a separate decode arena.
+Full-graph decode also prepares those prompt-independent arenas during startup
+by default; set `MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP=0` to restore lazy
+preparation for a diagnostic run.
 
 For IQ1_M, switch to its config and continuation file. To capture a fresh
 continuation, set `MOESTREAM_GENERATED_TOKEN_FILE` and omit both teacher-force
@@ -216,3 +219,24 @@ depends on the quantization and resident layer size. For example, the final
 Q2_0 cold graph build copied 14.50 GiB of experts, while IQ1_M copied 17.74
 GiB. The quantization-independent graph-transition comparison is the warm
 decode setup and its recurrent-state seed above.
+
+## Reproduction notes (2026-10-02, upstream integration ggml)
+
+- The fixed token files and the teacher-force/silent harness were not preserved; the hooks
+  (`MOESTREAM_BENCH_SILENT`, `_IGNORE_STOP`, `MOESTREAM_TEACHER_FORCE_*`) exist in
+  `include/generation_loop.hpp`, but a plain free-running 400-token decode is enough.
+- **The prompt must tokenize to exactly 16 tokens** (the chat template adds 12, so use a
+  4-token prompt such as "Tell a story."). The profile's `context_size` is 416: with a 17-token
+  prompt the last token overflows the KV capacity, drops to the legacy path (~1.4 s) and the run
+  reads ~24 tok/s, a fake ~11% gap. Check `[PREFILL-DONE] 16 tokens`.
+- Required switches beyond the doc's list: `MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40`,
+  `MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1`, `MOESTREAM_QWEN4EXP_FULL_GRAPH=1`,
+  `MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1`, plus `..._BORROW_PREFILL_ARENAS=1` and
+  `..._GRAPH_BOOTSTRAP=1` for the 54 ms setup (borrow alone fails the 1 GiB VRAM floor and falls
+  back to a degenerate layered decode; neither flag works on per-expert split configs).
+- Measured: MoEStream 26.17 / 26.44 / 26.89 tok/s over 400 tokens (setup included) vs Bee
+  `llama-bench -p 0 -n 400 -r 3` 26.96-27.06 (build 43fed6726, same 26-layer CPU mask).
+  Per token: graph run ~36.3 ms + ~0.5 ms sampling. GPU kernels ~12.9 ms (about 3,900 kernels),
+  CPU MoE ~19 ms, ~5 ms across 53 CPU/GPU transitions.
+- Tried and rejected here (no gain or slower): AVX-512 gather iq2_xxs kernel (3.6x slower),
+  HC stream-mean fusion (0%), AVX-512 VNNI iq4_nl (memory-bound, ~8.3 GB/s per core).

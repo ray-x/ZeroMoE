@@ -66,6 +66,11 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
+AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
+AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
+failure. Configure with `-DMOESTREAM_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
+both MoEStream and ggml CPU kernels.
+
 ### macOS / CPU-only build
 
 The main `moestream` engine requires NVIDIA CUDA and cannot build on macOS.
@@ -109,6 +114,12 @@ cmake --build build -j$(nproc)
 ```
 
 `MOESTREAM_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `MOESTREAM_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DMOESTREAM_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
+
+#### Runtime settings (host-node mode, CPU threads, CUDA schedule)
+
+`MOESTREAM_QWEN4EXP_HOST_NODE`, `MOESTREAM_QWEN_CPU_THREADS` and `MOESTREAM_CUDA_SCHEDULE` change how the Qwen4Exp CPU/GPU
+decode path executes and interact with each other (host-node mode automatically selects a blocking CUDA wait, +24%). Values,
+defaults, measurements and recommended combinations are in [docs/runtime-settings.md](docs/runtime-settings.md).
 
 ### Interactive Terminal Generation
 

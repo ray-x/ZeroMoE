@@ -1,0 +1,107 @@
+# Runtime settings: host-node mode, CPU threads, CUDA schedule
+
+Three environment variables control how the Qwen4Exp CPU/GPU decode path executes. They interact, so they are
+documented together. All numbers below were measured on the project's reference box (Xeon W-2235, 6 cores / 12 threads,
+RTX 3090, Qwen3.8-Flash-Next UD-IQ1_M, plain 22 GPU / 26 CPU layers unless stated), 80-token decode, idle machine,
+interleaved repetitions. Methodology and raw results: `tests/option_b_split_reverify_howto.md` sections 14-16.
+
+## `MOESTREAM_QWEN4EXP_HOST_NODE`
+
+| | |
+|---|---|
+| Values | `1` enables. Unset or anything else = off (only the first character `1` counts). |
+| Default | off |
+| Scope | Qwen4Exp full-graph **decode** only (`S == 1`). Prefill is unaffected. |
+| Needs | `MOESTREAM_QWEN4EXP_FULL_GRAPH=1` and `MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1`; TOML `qwen4exp_cpu_offload = true` and `qwen4exp_cpu_offload_layers = [...]`; complete preloaded DDR expert arenas for those layers (`ram_preload_all_experts = true`). |
+
+**What it does.** Each layer listed in `qwen4exp_cpu_offload_layers` has its routed-MoE FFN replaced by a `GGML_OP_CPY`
+marker. While the CUDA graph is captured, the marker expands to *device-to-host copy -> `cudaLaunchHostFunc` callback ->
+host-to-device copy*. The callback runs the CPU MoE (a ggml `MUL_MAT_ID` graph over the DDR arena) and returns the already
+weighted, reduced result. The CPU work therefore lives *inside* the captured CUDA graph, so the whole decode graph is a
+single backend split (`splits=1`, `transitions=0` in the `[GGML-QWEN-FULL]` log) instead of ~50-100 scheduler splits.
+
+**Important behaviours**
+
+* Offload layers configured but this variable unset: full-graph decode is disabled with
+  `[GGML-QWEN-FULL-DECODE] disabled: CPUOffload layers are configured, but the opt-in cudaHostNode bridge is disabled`
+  and decode falls back to the layered path.
+* A layer that also has a planned Option-B static hot/cold split keeps the split; the whole-layer marker is bypassed for it.
+* Enabling it makes the CUDA schedule default to `blocking` (see below).
+* A CUDA *conditional* node cannot contain host nodes (instantiate fails with `invalid argument`), so host-node mode cannot
+  be combined with `MOESTREAM_QWEN4EXP_MASTER_GRAPH` conditional bodies. See howto section 10.
+* `MOESTREAM_QWEN4EXP_GRAPH_REPLAY_TIMING=1` crashes the Phase 2 + host-node path; use `MOESTREAM_TOKEN_LOOP_DIAG=1` for timing.
+
+**Performance.** Not a throughput feature today. Plain scheduler-split decode: **28.0 tok/s**. All 26 CPU layers as host
+nodes: **22.6 tok/s** (81%) with the blocking schedule, 18.2 tok/s with the old spinning schedule. Use it when you need a
+single captured graph (the Phase 2 master-graph gate requires it), not for speed.
+
+## `MOESTREAM_QWEN_CPU_THREADS`
+
+| | |
+|---|---|
+| Values | Positive integer N. Unset, empty, non-numeric or <= 0 = ignored. |
+| Default | all OpenMP threads (`omp_get_max_threads()`: the `omp_max_threads` config key / `OMP_NUM_THREADS`; 12 on the reference box) |
+| Effect | **Caps** (never raises) the threads used for Qwen4Exp CPU MoE work: the full-graph CPU backend, the host-node CPU runner, and the grouped CPU kernels. Effective value = `min(N, available)`. |
+
+It is applied per call site and never calls `omp_set_num_threads()`, so attention and other model families keep the global
+OpenMP setting.
+
+Related: `MOESTREAM_QWEN_HOST_NODE_THREADS` caps only the host-node runner. It is consulted only when
+`MOESTREAM_QWEN_CPU_THREADS` is unset.
+
+**Guidance**
+
+* Plain scheduler-split decode: leave unset (12). More threads were better in the earlier sweep (2 -> 6.9, 4 -> 8.3, 8 -> 14.0,
+  12 -> 15.6-15.9 tok/s on the older configuration).
+* Host-node mode with a *spinning* CUDA schedule: `11` recovers most of the loss (18.18 -> 22.10 tok/s, +21.6%) by leaving a
+  logical CPU for the generation thread. With the blocking schedule (now the host-node default) it is not needed, and the two
+  are not additive (22.03 combined).
+* Do not combine with `GOMP_CPU_AFFINITY` pinning (measured slower).
+
+## `MOESTREAM_CUDA_SCHEDULE`
+
+| | |
+|---|---|
+| Values | `auto`, `blocking`, `spin`. Anything else, including unset or empty, selects the default. |
+| Default | `auto` (`cudaDeviceScheduleAuto`). **Exception:** `blocking` when `MOESTREAM_QWEN4EXP_HOST_NODE=1` and this variable is unset/empty. An explicit value always wins. |
+| Effect | Sets the CUDA device scheduling flags once per device at startup (`cudaSetDeviceFlags`). Logged as `[CUDA-SCHEDULE] device=N mode=...`. Controls how a thread waits in `cudaStreamSynchronize`/event waits: `auto` and `spin` busy-wait, `blocking` sleeps and is woken by an interrupt. |
+
+**Why `auto` is the default.** With CUDA graphs on, blocking wake-up latency hurt full-graph decode (about 5.8 ms/token in
+`cudaStreamSynchronize` vs 0.9 ms with `auto`), and llama.cpp itself never overrides the mode. In plain scheduler-split mode the
+generation thread is part of the OpenMP team, so spinning costs nothing extra.
+
+**Why host-node mode uses `blocking`.** The CPU callback runs on a CUDA driver thread that acts as OpenMP team master while the
+generation thread waits in `cudaStreamSynchronize`. A spinning wait burns a 13th runnable thread on a 12-logical-CPU machine and
+every OpenMP barrier stalls on stragglers. The wait happens once per token here, so the wake-up latency is irrelevant.
+Measured: 18.18 -> 22.63 tok/s (+24.4%).
+
+`spin` is available but has no measured use case.
+
+## Recommended combinations
+
+| Mode | `HOST_NODE` | `QWEN_CPU_THREADS` | `CUDA_SCHEDULE` | `OMP_WAIT_POLICY` |
+|---|---|---|---|---|
+| Plain scheduler-split decode (22/26, Option-B 0/44/4) | unset | unset | unset (`auto`) | leave default (spinning) |
+| Host-node / single-graph capture | `1` | unset | unset (auto-selects `blocking`) | leave default |
+| A/B a host-node build without the fix | `1` | `11` | `auto` | leave default |
+
+Leave `OMP_WAIT_POLICY` and `GOMP_SPINCOUNT` at their defaults: on 0/44/4, passive waiting cost 11% (30.43 vs 34.31 tok/s) and
+`GOMP_SPINCOUNT=1000` cost 6%, even though a CPU-only microbenchmark favours passive (threads idle during GPU phases between CPU
+splits, so waking them every split costs more than spinning saves).
+
+Also check before benchmarking: another process using the CPU or GPU (a compile, `llama-bench`, a second `moestream`) inflates
+or blocks results; the engine's preflight refuses to start if free RAM/VRAM is insufficient.
+
+## Decode graph setup: arena borrowing and bootstrap (defaults)
+
+By default the engine prepares reusable device arenas at startup and the first decode graph borrows them, so decode graph construction
+takes ~0.1 s instead of 3+ s. This is controlled by two switches in the opt-out direction:
+
+| Variable | Effect |
+|---|---|
+| `MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP=0` | Skip the startup preparation (lazy: the first request pays the upload). |
+| `MOESTREAM_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA=1` | Do not borrow arenas: every decode graph recreates and re-uploads its own (slow, ~3.2 s on Option-B splits). |
+
+For Option-B per-expert split configs the startup step also uploads the ~13 GiB split arena once (+~2.7 s startup) and keeps it resident while prompts
+are short; a long prompt (roughly more than ~120 tokens on a 24 GiB card) releases it before prefill and rebuilds it for that request's decode.
+See `tests/option_b_split_reverify_howto.md` section 18 for measurements.
