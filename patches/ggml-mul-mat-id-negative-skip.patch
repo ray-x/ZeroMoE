@@ -1,7 +1,7 @@
-diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
-index 0138469a9..a85573ef8 100644
---- a/ggml/src/ggml-cpu/ggml-cpu.c
-+++ b/ggml/src/ggml-cpu/ggml-cpu.c
+diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
+index 0138469a9..d5e5b4a93 100644
+--- a/src/ggml-cpu/ggml-cpu.c
++++ b/src/ggml-cpu/ggml-cpu.c
 @@ -1668,6 +1668,12 @@ static void ggml_compute_forward_mul_mat_id(
              for (int id = 0; id < n_ids; ++id) {
                  const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -15,10 +15,26 @@ index 0138469a9..a85573ef8 100644
                  assert(i02 >= 0 && i02 < n_as);
  
                  MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+@@ -3694,6 +3700,15 @@ int ggml_cpu_has_avx512_vbmi(void) {
+ #endif
+ }
+ 
++// MoEStream: advertises that GGML_OP_MUL_MAT_ID treats a negative expert id as an inactive route
++// (CPU: zero the output row, read no weights -- see moestream_mmid_negative_skip above; CUDA: the
++// MMVQ decode kernels do the same). include/mmid_route_skip.hpp weak-links this symbol: when it is
++// absent the split-layer graph builders fall back to a dummy expert id + mask and every branch
++// computes all top-k routes.
++GGML_BACKEND_API int ggml_cpu_mul_mat_id_negative_skip(void) {
++    return 1;
++}
++
+ int ggml_cpu_has_avx512_vnni(void) {
+ #if defined(__AVX512VNNI__)
+     return 1;
+diff --git a/src/ggml-cuda/mmvq.cu b/src/ggml-cuda/mmvq.cu
 index 07787eff4..7db3ca840 100644
---- a/ggml/src/ggml-cuda/mmvq.cu
-+++ b/ggml/src/ggml-cuda/mmvq.cu
+--- a/src/ggml-cuda/mmvq.cu
++++ b/src/ggml-cuda/mmvq.cu
 @@ -620,6 +620,15 @@ static __global__ void mul_mat_vec_q(
      channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
      sample_dst = blockIdx.z;
