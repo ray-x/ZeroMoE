@@ -4,6 +4,8 @@
 #include "qwen4exp_gdn.hpp"
 #include "ple_hash.hpp"
 #include "rope.hpp"
+#include "exl3_cpu.hpp"
+#include <stdexcept>
 
 #include <algorithm>
 #include <cerrno>
@@ -107,13 +109,31 @@ bool CPUQwen4ExpBackend::dense_matmul(const CPUEngine &engine,
                                       const std::string &name, const float *x,
                                       float *y, int S, int I, int O) {
   const auto *t = engine.find_layer(name);
-  if (!t || !t->host_ptr || S <= 0 || I <= 0 || O <= 0)
+  if (!t || !t->host_ptr || S <= 0 || I <= 0 || O <= 0) {
+    if (!engine.exl3_model.tensors.empty())
+      throw std::runtime_error("Missing EXL3 projection: " + name);
     return false;
+  }
+  if (!engine.exl3_model.tensors.empty() &&
+      (t->meta.shape.size() != 2 || t->meta.shape[0] != static_cast<uint64_t>(I) ||
+       t->meta.shape[1] != static_cast<uint64_t>(O)))
+    throw std::runtime_error("EXL3 projection shape mismatch: " + name);
+  if (t->meta.type == GGUFType::EXL3) {
+    const bool success = exl3_mul1_matmul_packed(t->host_ptr, x, y, S, I, O);
+    if (!success) throw std::runtime_error("EXL3 dense matmul failed: " + name);
+    for (size_t index = 0; index < static_cast<size_t>(S) * O; ++index)
+      if (!std::isfinite(y[index]))
+        throw std::runtime_error("Non-finite EXL3 projection: " + name);
+    return true;
+  }
   if (t->meta.type == GGUFType::F32) {
     matmul(y, x, reinterpret_cast<const float *>(t->host_ptr), S, I, O);
     for (int i = 0; i < S * O; ++i)
-      if (!std::isfinite(y[i]))
+      if (!std::isfinite(y[i])) {
+        if (!engine.exl3_model.tensors.empty())
+          throw std::runtime_error("Non-finite EXL3 dense projection: " + name);
         y[i] = 0.0f;
+      }
     return true;
   }
   std::vector<float> row(static_cast<size_t>(I));
@@ -301,7 +321,7 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
           c.ple_ngram_size < 2)
         return false;
 
-      if (!ple_table_) {
+      if (!ple_table_ && engine.exl3_model.tensors.empty()) {
         auto it = engine.model_file.tensors.find("per_layer_token_embd.weight");
         if (it == engine.model_file.tensors.end() ||
             it->second.shard_idx >=
@@ -372,6 +392,10 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
                 ctx.data(), n, c.ple_layer_multipliers.data(),
                 c.ple_head_vocab_sizes[static_cast<size_t>(h)],
                 c.ple_head_offsets[static_cast<size_t>(h)]);
+        if (!engine.exl3_model.tensors.empty()) {
+          if (!engine.exl3_ngram_row(h, mixed, row.data(), head_dim))
+            throw std::runtime_error("EXL3 PLE embedding read failed");
+        } else {
         if (mixed < 0 || static_cast<uint64_t>(mixed) >= ple_rows_)
           return false;
             const uint8_t *src =
@@ -387,6 +411,7 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
               for (int i = 0; i < head_dim; ++i)
                 row[static_cast<size_t>(i)] = bf16_to_float(v[i]);
             }
+        }
             std::memcpy(emb.data() + static_cast<size_t>(s) * D + h * head_dim,
                         row.data(), row.size() * sizeof(float));
           }
@@ -420,17 +445,18 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
       grouped_norm(engine.qwen4exp_hc_stream_buf.data(), nq.data(), query.data());
       std::vector<float> gated(key.size());
       for (int s = 0; s < S; ++s) {
+        for (int h = 0; h < HC; ++h) {
         double dot = 0.0;
-        for (int i = 0; i < HC * D; ++i)
-          dot += static_cast<double>(kn[static_cast<size_t>(s) * HC * D + i]) *
-                 query[static_cast<size_t>(s) * HC * D + i];
+        const size_t base = (static_cast<size_t>(s) * HC + h) * D;
+        for (int i = 0; i < D; ++i)
+          dot += static_cast<double>(kn[base + i]) * query[base + i];
         const float score = static_cast<float>(dot) / std::sqrt(static_cast<float>(D));
         const float mag = std::sqrt(std::max(std::fabs(score), 1e-6f));
         const float g = 1.0f / (1.0f + std::exp(-std::copysign(mag, score)));
-        for (int h = 0; h < HC; ++h)
           for (int d = 0; d < D; ++d)
             gated[(static_cast<size_t>(s) * HC + h) * D + d] =
                 value[static_cast<size_t>(s) * D + d] * g;
+        }
       }
       const auto *conv_t = engine.find_layer(p + "ple_conv1d.weight");
       if (!conv_t)
@@ -557,7 +583,7 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
     return;
   for (int s = 0; s < S; ++s) {
     for (int h = 0; h < Hv; ++h) {
-      const int hk = h % Hk;
+      const int hk = engine.exl3_model.tensors.empty() ? h % Hk : h / (Hv / Hk);
       float *st = persistent.data() + static_cast<size_t>(h) * hd * hd;
       float *q = conv_out.data() + (static_cast<size_t>(s) * conv_dim) +
                  hk * hd;
@@ -727,6 +753,15 @@ void CPUQwen4ExpBackend::forward_moe(CPUEngine &engine, int layer_idx,
       sum += ls[order[k]];
     for (int k = 0; k < topk; ++k) {
       const int e = order[k];
+      if (!engine.exl3_model.tensors.empty()) {
+        std::vector<float> expert_output(D);
+        engine.exl3_expert(layer_idx, e, hidden_states + static_cast<size_t>(s) * D,
+                           expert_output.data());
+        const float weight = c.expert_weights_norm && sum > 0.0f ? ls[e] / sum : ls[e];
+        for (int index = 0; index < D; ++index)
+          out[static_cast<size_t>(s) * D + index] += weight * expert_output[index];
+        continue;
+      }
       CPUExpertSlot *slot = engine.expert_cache.get(layer_idx, e);
       if (!slot)
         continue;
@@ -834,7 +869,8 @@ void CPUQwen4ExpBackend::forward_layer(CPUEngine &engine, int layer_idx,
                     hidden_states + static_cast<size_t>(s) * D,
                     static_cast<size_t>(D) * sizeof(float));
   }
-  ple_layer_input(engine, layer_idx, S, pos_base);
+  if (!ple_layer_input(engine, layer_idx, S, pos_base) && !engine.exl3_model.tensors.empty())
+    throw std::runtime_error("EXL3 PLE layer failed: " + std::to_string(layer_idx));
   hc_mix(engine, layer_idx, 0, hidden_states, S);
   std::vector<float> attn(static_cast<size_t>(S) *
                           engine.model_file.architecture_config.hidden);

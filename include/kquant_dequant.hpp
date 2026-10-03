@@ -7,6 +7,7 @@
 // dense/expert K-quants and must produce identical output.
 #pragma once
 #include "kernels_cpu.hpp"   // fp16_to_fp32, matmul
+#include "exl3_cpu.hpp"
 #include "engine.hpp"        // QuantizedTensor, GGUFType
 #include "logger.hpp"
 #include "perf_timer.hpp"    // t_cpu_dequant/t_cpu_dot breakdown
@@ -659,6 +660,8 @@ inline void enable_cpu_dot_ggml_iq1m() { cpu_dot_ggml_iq1m_flag() = true; }
 // dequant_row handles; rows of unsupported types are zeroed (returns false).
 inline bool cpu_quant_matmul(GGUFType type, const uint8_t* W,
                              const float* x, float* y, int S, int I, int O) {
+    if (type == GGUFType::EXL3)
+        return exl3_mul1_matmul_packed(W, x, y, S, I, O);
                              
     // ----------------------------------------------------
     // 1. FAST PATH: Fused AVX-512 In-Register Matmuls

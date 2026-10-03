@@ -6526,7 +6526,37 @@ bool test_qwen_prefill_state_handoff_config() {
     return ok;
 }
 
+bool test_exl3_cpu_dispatch() {
+    std::cout << "[Test] EXL3 CPU dispatch and reconstruction...\n";
+    constexpr int width = 128;
+    std::vector<uint16_t> signs(width, fp32_to_fp16(1.0f));
+    std::vector<float> input(width, 1.0f), output(width), weight(width * width);
+    for (int bits : {4, 5, 6}) {
+        std::vector<uint16_t> trellis(8 * 8 * 16 * bits, 0);
+        Exl3Mul1MatrixView matrix{trellis.data(), signs.data(), signs.data(),
+                                  nullptr, width, width, bits};
+        const auto packed = exl3_mul1_pack_matrix(matrix);
+        if (!cpu_quant_matmul(GGUFType::EXL3, packed.data(), input.data(),
+                               output.data(), 1, width, width) ||
+            !exl3_mul1_reconstruct(matrix, weight.data())) return false;
+        const float expected = width * fp16_to_fp32(fp32_to_fp16(
+            std::fma(1024.0f, fp16_to_fp32(0x1eee), fp16_to_fp32(0xc931))));
+        if (std::abs(output[0] - expected) > 1e-3f) return false;
+        for (int column = 1; column < width; ++column)
+            if (std::abs(output[column]) > 1e-3f) return false;
+        for (int column = 0; column < width; ++column) {
+            float total = 0.0f;
+            for (int row = 0; row < width; ++row)
+                total += weight[row * width + column];
+            if (std::abs(output[column] - total) > 1e-3f) return false;
+        }
+    }
+    std::cout << "  -> PASSED\n";
+    return true;
+}
+
 int main() {
+    if (!test_exl3_cpu_dispatch()) return 1;
     std::cout << "========================================\n";
     std::cout << "  MoeStream Native Test Harness\n";
     std::cout << "========================================\n";

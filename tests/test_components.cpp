@@ -9,6 +9,8 @@
 #include "hyper_connections.hpp" // the REAL Sinkhorn normalization (DeepSeek-V4)
 #include "route_usage.hpp" // CUDA-free routing histogram used by CPU and GPU paths
 #include "safetensors_adapter.hpp" // DFlash/DSpark safetensors adapter boundary
+#include "exl3_cpu.hpp"
+#include "exl3_model_loader.hpp"
 #include "tensor_trace.hpp" // TraceFilter (pure C++, no CUDA deps -- see logger.hpp)
 #include "qwen4exp_gdn.hpp" // the REAL Qwen4Exp GDN delta-rule step (no CUDA deps)
 #include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
@@ -2406,6 +2408,131 @@ void test_safetensors_adapter() {
       "model.layers.0.self_attn.q_proj.weight", "dflash");
   assert(canonical == "blk.0.attn_q.weight");
 
+  static const std::string exl3_header = R"({
+    "__metadata__": {"format": "exl3"},
+    "model.layers.0.self_attn.q_proj.trellis": {"dtype": "I16", "shape": [8, 16, 32], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.q_proj.suh": {"dtype": "F16", "shape": [128], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.q_proj.svh": {"dtype": "F16", "shape": [256], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.q_proj.mul1": {"dtype": "I32", "shape": [1], "data_offsets": [0, 0]},
+    "model.layers.0.self_attn.q_proj.bias": {"dtype": "F16", "shape": [256], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.experts.3.up_proj.trellis": {"dtype": "I16", "shape": [16, 32, 24], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.experts.3.up_proj.suh": {"dtype": "F16", "shape": [256], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.experts.3.up_proj.svh": {"dtype": "F16", "shape": [512], "data_offsets": [0, 0]},
+    "model.layers.0.mlp.experts.3.up_proj.mul1": {"dtype": "I32", "shape": [1], "data_offsets": [0, 0]}
+  })";
+  SafetensorsModelInfo exl3_model;
+  assert(SafetensorsAdapter::parse_header_bytes(exl3_header, exl3_model));
+  assert(SafetensorsAdapter::detect_format(exl3_model) == "exl3");
+  assert(SafetensorsAdapter::detect_family(exl3_model) == SafetensorsFamily::EXL3);
+  const Exl3Contract exl3 = SafetensorsAdapter::map_exl3_contract(exl3_model);
+  assert(exl3.complete);
+  assert(exl3.linears.size() == 2);
+  assert(exl3.n_layers == 1);
+  assert(exl3.n_experts == 4);
+  assert(exl3.linears[0].bits_per_weight == 2.0 ||
+         exl3.linears[1].bits_per_weight == 2.0);
+  assert(exl3.linears[0].codebook == Exl3Codebook::MUL1 ||
+         exl3.linears[1].codebook == Exl3Codebook::MUL1);
+
+  std::cout << " PASSED\n";
+}
+
+void test_exl3_mul1_matmul() {
+  std::cout << "[TEST] EXL3 mul1 reconstruct/matmul..." << std::flush;
+
+  constexpr int input_features = 128;
+  constexpr int output_features = 128;
+  constexpr int rows = 2;
+  for (int bits : {4, 5, 6}) {
+    const size_t trellis_words = static_cast<size_t>(input_features / 16) *
+                                  (output_features / 16) * 16 * bits;
+    std::vector<uint16_t> trellis(trellis_words);
+    uint32_t state = 0x12345678u + static_cast<uint32_t>(bits);
+    for (uint16_t &word : trellis) {
+      state = state * 1664525u + 1013904223u;
+      word = static_cast<uint16_t>(state >> 16);
+    }
+
+    std::vector<uint16_t> suh(input_features);
+    std::vector<uint16_t> svh(output_features);
+    std::vector<uint16_t> bias(output_features);
+    for (int index = 0; index < input_features; ++index)
+      suh[index] = fp32_to_fp16(0.75f + 0.5f * ((index % 17) / 16.0f));
+    for (int index = 0; index < output_features; ++index) {
+      svh[index] = fp32_to_fp16(0.8f + 0.4f * ((index % 13) / 12.0f));
+      bias[index] = fp32_to_fp16((index % 7 - 3) * 0.01f);
+    }
+
+    Exl3Mul1MatrixView matrix{
+        .trellis = trellis.data(),
+        .suh = suh.data(),
+        .svh = svh.data(),
+        .bias = bias.data(),
+        .input_features = input_features,
+        .output_features = output_features,
+        .bits = bits,
+    };
+    std::vector<float> input(rows * input_features);
+    for (size_t index = 0; index < input.size(); ++index)
+      input[index] = std::sin(static_cast<float>(index) * 0.071f);
+
+    std::vector<float> direct(rows * output_features);
+    assert(exl3_mul1_matmul(matrix, input.data(), direct.data(), rows));
+
+    std::vector<uint8_t> packed = exl3_mul1_pack_matrix(matrix);
+    assert(!packed.empty());
+    Exl3Mul1MatrixView packed_view;
+    assert(exl3_mul1_view_from_packed(packed.data(), packed.size(),
+                                      packed_view));
+    std::vector<float> packed_output(rows * output_features);
+    assert(exl3_mul1_matmul_packed(
+        packed.data(), input.data(), packed_output.data(), rows,
+        input_features, output_features));
+    for (size_t index = 0; index < direct.size(); ++index)
+      assert(std::abs(direct[index] - packed_output[index]) < 1e-6f);
+
+    std::vector<float> weight(input_features * output_features);
+    assert(exl3_mul1_reconstruct(matrix, weight.data()));
+    std::vector<float> reference(rows * output_features);
+    for (int row = 0; row < rows; ++row) {
+      for (int output = 0; output < output_features; ++output) {
+        float sum = fp16_to_fp32(bias[output]);
+        for (int input_index = 0; input_index < input_features; ++input_index) {
+          sum += input[static_cast<size_t>(row) * input_features + input_index] *
+                 weight[static_cast<size_t>(input_index) * output_features +
+                        output];
+        }
+        reference[static_cast<size_t>(row) * output_features + output] = sum;
+      }
+    }
+
+    float max_error = 0.0f;
+    for (size_t index = 0; index < direct.size(); ++index)
+      max_error = std::max(max_error, std::abs(direct[index] - reference[index]));
+    assert(max_error < 2e-3f);
+
+    std::fill(trellis.begin(), trellis.end(), 0);
+    std::fill(suh.begin(), suh.end(), fp32_to_fp16(1.0f));
+    std::fill(svh.begin(), svh.end(), fp32_to_fp16(1.0f));
+    std::fill(bias.begin(), bias.end(), fp32_to_fp16(0.0f));
+    std::fill(input.begin(), input.end(), 1.0f);
+    assert(exl3_mul1_matmul(matrix, input.data(), direct.data(), rows));
+    const float expected_dc = 128.0f * fp16_to_fp32(fp32_to_fp16(
+        std::fma(1024.0f, fp16_to_fp32(0x1eee), fp16_to_fp32(0xc931))));
+    for (int row = 0; row < rows; ++row) {
+      assert(std::abs(direct[row * output_features] - expected_dc) < 1e-3f);
+      for (int column = 1; column < output_features; ++column)
+        assert(std::abs(direct[row * output_features + column]) < 1e-3f);
+    }
+  }
+
+  assert(exl3_qwen_tensor_name("model.language_model.layers.1.ple.key_proj.weight") ==
+         "blk.1.ple_key.weight");
+  assert(exl3_qwen_tensor_name("model.language_model.layers.3.self_attn.q_proj") ==
+         "blk.3.attn_q.weight");
+  assert(exl3_qwen_tensor_name("model.language_model.hyper_connection_mixer.hc_norm.weight") ==
+         "output_hc_norm.weight");
+
   std::cout << " PASSED\n";
 }
 
@@ -2873,6 +3000,7 @@ int main(int argc, char **argv) {
       {"host_budget_admission", test_host_budget_admission},
       {"moe_decode_batch", test_moe_decode_batch},
       {"safetensors_adapter", test_safetensors_adapter},
+      {"exl3_mul1_matmul", test_exl3_mul1_matmul},
   };
   const bool filtered = argc > 1;
   auto matches = [&](const char *name) {

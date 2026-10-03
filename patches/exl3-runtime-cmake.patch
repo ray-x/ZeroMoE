@@ -1,0 +1,67 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -382,7 +382,11 @@
+         string(FIND "${_moestream_mmvq_source}"
+                "moestream_mmid_negative_skip"
+                _moestream_mmid_negskip_marker)
+-        if(_moestream_mmid_negskip_marker EQUAL -1)
++        string(FIND "${_moestream_mmvq_source}"
++               "if (channel_x_id < 0)"
++               _moestream_mmid_negskip_behavior)
++        if(_moestream_mmid_negskip_marker EQUAL -1 AND
++           _moestream_mmid_negskip_behavior EQUAL -1)
+             execute_process(
+                 COMMAND git apply --whitespace=nowarn
+                         ${_moestream_ggml_apply_prefix_args}
+@@ -819,6 +823,15 @@
+     add_executable(moestream
+         src/main.cpp
+         src/execution_layer.cpp
++        src/exl3_cpu.cpp
++        src/exl3_model_loader.cpp
++        src/exl3_decode.cpp
++        src/cpu_dense.cpp
++        src/cpu_engine.cpp
++        src/cpu_forward.cpp
++        src/cpu_model_backend.cpp
++        src/cpu_qwen_moe.cpp
++        src/cpu_qwen4exp.cpp
+         src/scratch_buffers.cpp
+         src/cuda_kernel_dispatcher.cpp
+         src/gpu_expert_executor.cpp
+@@ -836,6 +849,7 @@
+         src/graph_initializer.cpp
+         src/hyper_connections.cpp
+         src/ple_ngram.cpp
++        src/safetensors_adapter.cpp
+         src/deepseek41_engram.cpp
+         src/gpu_topology.cpp
+         src/ggml_dequant.cpp
+@@ -895,6 +909,7 @@
+     # Native test harness
+     add_executable(moestream_tests
+         src/main_test.cpp
++        src/exl3_cpu.cpp
+         src/execution_layer.cpp
+         src/scratch_buffers.cpp
+         src/cuda_kernel_dispatcher.cpp
+@@ -1083,7 +1098,10 @@
+     # directly -- test_components (and any other target linking
+     # kernels_cpu) failed to link with undefined SafetensorsAdapter symbols
+     # regardless of platform, unrelated to Apple Silicon vs x86 below.
+-    list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/safetensors_adapter.cpp)
++    list(APPEND MOESTREAM_CPU_KERNEL_SRCS
++        src/exl3_cpu.cpp
++        src/exl3_model_loader.cpp
++        src/safetensors_adapter.cpp)
+     if(MOESTREAM_APPLE_SILICON)
+         list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/kernels_cpu_neon.cpp)
+         message(STATUS "MoEStream: using ARM NEON CPU kernel backend")
+@@ -1142,6 +1160,7 @@
+     # CPU-only inference binary (moestream_cpu)
+     add_executable(moestream_cpu
+         src/cpu_main.cpp
++        src/exl3_decode.cpp
+         src/cpu_dense.cpp
+         src/cpu_engine.cpp
+         src/cpu_forward.cpp

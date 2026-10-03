@@ -3,6 +3,9 @@
 #include "cuda_manager.hpp"
 #include "engine.hpp"
 #include "engine_config.hpp"
+#include "exl3_cpu.hpp"
+#include "exl3_model_loader.hpp"
+#include "exl3_decode.hpp"
 #include "generation_loop.hpp"
 #include "thread_profile.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
@@ -17,6 +20,7 @@
 #include "logger.hpp"
 #include "perf_timer.hpp"
 #include "ram_manager.hpp"
+#include "safetensors_adapter.hpp"
 #include "shutdown.hpp"
 #include "startup_preflight.hpp"
 #include "tensor_trace.hpp"
@@ -32,11 +36,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <omp.h>
+#include <regex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -46,6 +53,117 @@ class GGUFGraphInitializer {
 public:
   static bool build_model_graph(StreamingEngine &engine, int max_ctx);
 };
+
+static std::expected<void, std::string>
+load_exl3_model_only(const std::string &path) {
+  SafetensorsModelInfo model;
+  const bool parsed = std::filesystem::is_directory(path)
+                          ? SafetensorsAdapter::parse_directory(path, model)
+                          : SafetensorsAdapter::parse_file(path, model);
+  if (!parsed)
+    return std::unexpected("Failed to parse EXL3 safetensors model: " + path);
+  if (!SafetensorsAdapter::is_exl3_model(model))
+    return std::unexpected("No EXL3 trellis tensors found: " + path);
+
+  Exl3Contract contract = SafetensorsAdapter::map_exl3_contract(model);
+  if (!contract.complete)
+    return std::unexpected("EXL3 tensor groups are incomplete or inconsistent");
+
+  std::map<std::string, std::set<std::string>> sampled;
+  std::set<int> shard_indices;
+  int expected_shards = 0;
+  const std::regex shard_pattern(R"(.*-([0-9]+)-of-([0-9]+)\.safetensors$)");
+  for (const auto &entry : model.tensors) {
+    const SafetensorsTensorInfo &info = entry.second;
+    if (info.file_path.empty())
+      return std::unexpected("EXL3 tensor has no backing shard: " + entry.first);
+
+    std::smatch match;
+    const std::string filename =
+        std::filesystem::path(info.file_path).filename().string();
+    if (std::regex_match(filename, match, shard_pattern)) {
+      shard_indices.insert(std::stoi(match[1].str()));
+      expected_shards = std::max(expected_shards, std::stoi(match[2].str()));
+    }
+
+    std::string kind;
+    if (entry.first.ends_with(".trellis"))
+      kind = "trellis";
+    else if (entry.first.ends_with(".suh"))
+      kind = "suh";
+    else if (entry.first.ends_with(".svh"))
+      kind = "svh";
+    else
+      continue;
+    if (!sampled[info.file_path].insert(kind).second)
+      continue;
+
+    std::ifstream shard(info.file_path, std::ios::binary);
+    if (!shard)
+      return std::unexpected("Cannot open EXL3 shard: " + info.file_path);
+    shard.seekg(static_cast<std::streamoff>(info.offset));
+    const size_t bytes =
+        static_cast<size_t>(std::min<std::uint64_t>(info.length, 4096));
+    std::vector<char> buffer(bytes);
+    shard.read(buffer.data(), static_cast<std::streamsize>(bytes));
+    if (shard.gcount() != static_cast<std::streamsize>(bytes))
+      return std::unexpected("Short EXL3 tensor read: " + entry.first);
+  }
+
+  if (expected_shards > 0 &&
+      static_cast<int>(shard_indices.size()) != expected_shards)
+    return std::unexpected("EXL3 shard set is incomplete: " +
+                           std::to_string(shard_indices.size()) + "/" +
+                           std::to_string(expected_shards));
+
+  LOG_STREAM_INFO() << "[EXL3] Model catalog loaded: tensors="
+                    << model.tensors.size() << " linears="
+                    << contract.linears.size() << " layers="
+                    << contract.n_layers << " experts=" << contract.n_experts
+                    << " shards=" << shard_indices.size() << "/"
+                    << expected_shards << "\n";
+  LOG_STREAM_INFO() << "[EXL3] Representative trellis/suh/svh payload reads "
+                       "passed for "
+                    << sampled.size() << " safetensors files.\n";
+
+  const Exl3LinearInfo *smoke_matrix = nullptr;
+  for (const Exl3LinearInfo &linear : contract.linears) {
+    if (!linear.valid || linear.codebook != Exl3Codebook::MUL1)
+      continue;
+    if (!smoke_matrix ||
+        linear.in_features * linear.out_features <
+            smoke_matrix->in_features * smoke_matrix->out_features)
+      smoke_matrix = &linear;
+  }
+  if (!smoke_matrix)
+    return std::unexpected("No dispatchable EXL3 mul1 matrix found");
+
+  std::vector<uint8_t> packed_matrix;
+  std::string matrix_error;
+  if (!load_exl3_mul1_matrix(model, *smoke_matrix, packed_matrix,
+                             matrix_error))
+    return std::unexpected(matrix_error);
+  std::vector<float> input(static_cast<size_t>(smoke_matrix->in_features));
+  std::vector<float> output(static_cast<size_t>(smoke_matrix->out_features));
+  for (size_t index = 0; index < input.size(); ++index)
+    input[index] = std::sin(static_cast<float>(index) * 0.013f);
+  if (!exl3_mul1_matmul_packed(
+          packed_matrix.data(), input.data(), output.data(), 1,
+          static_cast<int>(smoke_matrix->in_features),
+          static_cast<int>(smoke_matrix->out_features)))
+    return std::unexpected("EXL3 dispatch smoke matmul failed: " +
+                           smoke_matrix->key);
+  if (!std::all_of(output.begin(), output.end(),
+                   [](float value) { return std::isfinite(value); }))
+    return std::unexpected("EXL3 dispatch produced non-finite output: " +
+                           smoke_matrix->key);
+  LOG_STREAM_INFO() << "[EXL3] CPU dispatch smoke passed: "
+                    << smoke_matrix->key << " ["
+                    << smoke_matrix->in_features << ","
+                    << smoke_matrix->out_features << "] "
+                    << smoke_matrix->bits_per_weight << " bpw mul1.\n";
+  return {};
+}
 
 #if defined(MOESTREAM_USE_GGML)
 // The ggml tree used by the CUDA build is also shared with llama.cpp and emits
@@ -302,6 +420,26 @@ static bool preload_batch_load(
 }
 
 std::expected<void, std::string> run_engine(const EngineConfig &config) {
+  if (config.model_format == "exl3") {
+    if (!config.model_load_only) {
+      return run_exl3_decode({
+          .model_path = config.model_path,
+          .metadata_model_path = config.metadata_model_path,
+          .prompt = config.prompt,
+          .context_size = config.context_size,
+          .max_new_tokens = config.max_new_tokens,
+          .threads = config.omp_max_threads > 0 ? config.omp_max_threads : 4,
+          .temperature = config.temperature,
+          .top_p = config.top_p,
+          .raw_prompt = config.raw_prompt,
+          .enable_thinking = config.enable_thinking});
+    }
+    auto loaded = load_exl3_model_only(config.model_path);
+    if (!loaded)
+      return loaded;
+    return {};
+  }
+
   // Process-wide default OpenMP team size -- MUST run before anything
   // else, since every #pragma omp parallel for without its own
   // num_threads() clause (attention_layer.cpp's dense/attention
@@ -4243,6 +4381,7 @@ int main(int argc, char *argv[]) {
                                // shutdown.hpp)
 
   std::string config_path = "";
+  std::string prompt_cli;
   std::string model_path = "";
   std::string gen_config_path = "";
   double ram_budget_gb = 0.0;
@@ -4295,6 +4434,8 @@ int main(int argc, char *argv[]) {
     std::string arg = argv[i];
     if (arg == "--config" && i + 1 < argc)
       config_path = argv[++i];
+    else if (arg == "--prompt" && i + 1 < argc)
+      prompt_cli = argv[++i];
     else if (arg == "--gen-config") {
       gen_config_path = (i + 1 < argc && argv[i + 1][0] != '-')
                             ? argv[++i]
@@ -4399,6 +4540,8 @@ int main(int argc, char *argv[]) {
   // --ram / --verbose-moe always override the config file's values, if given
   if (ram_budget_gb > 0)
     config.host_ram_gb = ram_budget_gb;
+  if (!prompt_cli.empty())
+    config.prompt = prompt_cli;
   if (verbose_moe)
     config.verbose_moe_log = true;
   if (raw_prompt_cli)

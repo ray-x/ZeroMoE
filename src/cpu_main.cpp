@@ -1,6 +1,7 @@
 // src/cpu_main.cpp — Host-only inference entry point for moestream_cpu.
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
+#include "exl3_decode.hpp"
 #include "logger.hpp"
 #include "models/model_family.hpp"
 
@@ -56,6 +57,22 @@ int main(int argc, char **argv) {
 
   Logger::instance().init(cfg.log_path, cfg.log_level);
   cfg.print();
+
+  if (cfg.model_format == "exl3") {
+    auto result = run_exl3_decode({
+        .model_path = cfg.model_path,
+        .metadata_model_path = cfg.metadata_model_path,
+        .prompt = parse_arg(argc, argv, "--prompt", ""),
+        .context_size = cfg.context_size,
+        .max_new_tokens = parse_int_arg(argc, argv, "--ngen", cfg.max_new_tokens),
+        .threads = cfg.omp_max_threads > 0 ? cfg.omp_max_threads : 4,
+        .temperature = cfg.temperature,
+        .top_p = cfg.top_p,
+        .raw_prompt = cfg.raw_prompt,
+        .enable_thinking = cfg.enable_thinking});
+    if (!result) std::cerr << "[EXL3] " << result.error() << "\n";
+    return result ? 0 : 1;
+  }
 
   CPUEngine engine;
   engine.config = std::move(cfg);

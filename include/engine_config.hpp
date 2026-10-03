@@ -57,6 +57,10 @@ struct GpuConfig {
 struct EngineConfig {
   // Model paths
   std::string model_path; // Primary model GGUF (experts + architecture)
+  std::string model_format = "gguf";
+  bool model_load_only = false;
+  std::string metadata_model_path;
+  std::string prompt;
   std::string
       dense_model_path; // Optional: separate GGUF for dense layers (e.g. 4-bit)
   // Optional: a standalone "shared" MTP/NextN checkpoint (Qwen4Exp's own
@@ -2532,6 +2536,10 @@ inline bool EngineConfig::load(const std::string &path) {
   auto doc = toml::parse_file(path);
 
   model_path = doc.root.get_str("model_path");
+  model_format = doc.root.get_str("model_format", model_format);
+  model_load_only = doc.root.get_bool("model_load_only", model_load_only);
+  metadata_model_path = doc.root.get_str("metadata_model_path", metadata_model_path);
+  prompt = doc.root.get_str("prompt", prompt);
   dense_model_path = doc.root.get_str("dense_model_path");
   mtp_model_path = doc.root.get_str("mtp_model_path");
   context_size = doc.root.get_int("context_size", context_size);
@@ -3123,6 +3131,14 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
 }
 
 inline bool EngineConfig::validate() {
+  if (model_format != "gguf" && model_format != "exl3") {
+    std::cerr << "[CONFIG] model_format must be 'gguf' or 'exl3', got: "
+              << model_format << "\n";
+    return false;
+  }
+  if (model_format == "exl3")
+    return true;
+
   int hw_count = 0;
   const cudaError_t device_count_status = cudaGetDeviceCount(&hw_count);
   if (device_count_status != cudaSuccess) {
@@ -3312,6 +3328,9 @@ inline void EngineConfig::print() const {
                     << (qwen4exp_prefill_state_handoff ? "ON" : "off")
                     << " (retains prefill workspace when enabled)\n";
   LOG_STREAM_INFO() << "[CONFIG] Model: " << model_path << "\n";
+  LOG_STREAM_INFO() << "[CONFIG] Model format: " << model_format
+                    << " | load-only: " << (model_load_only ? "yes" : "no")
+                    << "\n";
   if (!dense_model_path.empty() && dense_model_path != model_path)
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";
   if (!mtp_model_path.empty())
@@ -3823,6 +3842,8 @@ inline void EngineConfig::write_sample(const std::string &path) {
 # See configs/ for example profiles (single_gpu, dual_gpu, triple_gpu)
 
 model_path = "/models/GLM-5.2-UD-IQ2_M/"
+model_format = "gguf"       # "gguf" or "exl3"
+model_load_only = false      # EXL3 metadata/payload load smoke; no inference
 # dense_model_path = "/models/GLM-5.2-Q4_K/"  # optional: separate dense weights
 # mtp_model_path = "/models/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf"  # optional: a
 #   standalone "shared" MTP/NextN checkpoint (Qwen4Exp convention) -- omits

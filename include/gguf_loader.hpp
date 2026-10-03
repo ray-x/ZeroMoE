@@ -158,6 +158,7 @@ enum class GGUFType : uint32_t {
   // through calculate_size()'s `return numel;` 1-byte/element fallback,
   // a ~18x undersized read.
   Q2_0 = 42,
+  EXL3 = 0x1000,
 };
 
 struct GGUFTensor {

@@ -2,6 +2,8 @@
 // KV cache, and tokenizer setup for moestream_cpu.
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
+#include "exl3_model_loader.hpp"
+#include "exl3_cpu.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -338,7 +340,7 @@ static bool is_qwen4exp_deferred_tensor(const GGUFFile &model,
          name.find(".indexer.") != std::string::npos;
 }
 
-bool CPUEngine::build(int max_ctx) {
+bool CPUEngine::build(int max_ctx, bool load_weights) {
   max_t = max_ctx;
 
   // 1. Fill architecture_config from KV metadata (mirror of graph_initializer).
@@ -442,6 +444,11 @@ bool CPUEngine::build(int max_ctx) {
   if (!tokenizer.load(model_file)) {
     std::cerr << "[CPU-ENGINE] Tokenizer load failed.\n";
     return false;
+  }
+
+  if (!load_weights) {
+    backend = CPUModelBackend::create(model_file);
+    return backend && kv_cache.init(max_t, c.n_layers, c.n_head_kv, c.head_dim);
   }
 
   // 3. Load dense weights (everything except routed expert slabs).
@@ -562,6 +569,136 @@ static GGUFType gguf_type_from_safetensors_dtype(const std::string &dtype) {
   return GGUFType::F32;
 }
 
+bool CPUEngine::build_from_exl3(const std::string &path,
+                               const std::string &metadata_path, int max_ctx) {
+  if (metadata_path.empty() || !model_file.load_header(metadata_path))
+    throw std::runtime_error("EXL3 Qwen requires metadata_model_path to a matching GGUF");
+  if (detect_model_family(model_file) != ModelFamily::Qwen4Exp)
+    throw std::runtime_error("EXL3 metadata model must be Qwen4Exp");
+  if (!SafetensorsAdapter::parse_directory(path, exl3_model))
+    throw std::runtime_error("Cannot parse EXL3 model directory: " + path);
+  const auto contract = SafetensorsAdapter::map_exl3_contract(exl3_model);
+  if (!contract.complete)
+    throw std::runtime_error("EXL3 linear component groups are incomplete");
+  for (const auto &linear : contract.linears) {
+    if (linear.key.find(".mlp.experts.") != std::string::npos)
+      exl3_linears.emplace(linear.key, linear);
+    else {
+      const std::string canonical = exl3_qwen_tensor_name(linear.key);
+      if (!canonical.empty() && !exl3_linears.emplace(canonical, linear).second)
+        throw std::runtime_error("Duplicate Qwen matrix mapping: " + canonical);
+    }
+  }
+  for (const auto &[name, info] : exl3_model.tensors) {
+    if (!name.ends_with(".weight") && !name.ends_with(".A_log") &&
+        !name.ends_with(".dt_bias")) continue;
+    const std::string canonical = exl3_qwen_tensor_name(name);
+    if (!canonical.empty() && !exl3_raw_names.emplace(canonical, name).second)
+      throw std::runtime_error("Duplicate Qwen weight mapping: " + canonical);
+  }
+  if (!build(max_ctx, false)) return false;
+  const auto &cfg = model_file.architecture_config;
+  if (contract.n_layers != cfg.n_layers || contract.n_experts != cfg.n_experts)
+    throw std::runtime_error("EXL3 checkpoint architecture differs from metadata model");
+  for (const auto &[name, meta] : model_file.tensors) {
+    if (is_routed_expert_tensor(name) || is_qwen4exp_deferred_tensor(model_file, name) ||
+        name.starts_with("blk." + std::to_string(cfg.n_layers) + ".")) continue;
+    if (!exl3_raw_names.contains(name) && !exl3_linears.contains(name))
+      throw std::runtime_error("Required EXL3 Qwen tensor missing: " + name);
+  }
+  for (int layer = 0; layer < cfg.n_layers; ++layer) {
+    for (int expert = 0; expert < cfg.n_experts; ++expert) {
+      const std::string prefix = "model.language_model.layers." +
+          std::to_string(layer) + ".mlp.experts." + std::to_string(expert) + ".";
+      for (const char *projection : {"gate_proj", "up_proj", "down_proj"})
+        if (!exl3_linears.contains(prefix + projection))
+          throw std::runtime_error("Missing EXL3 routed expert: " + prefix + projection);
+    }
+  }
+  LOG_STREAM_INFO() << "[EXL3] Qwen decode backend enabled: " << cfg.n_layers
+                    << " layers, " << cfg.n_experts << " experts; weights read from "
+                    << path << "\n";
+  return true;
+}
+
+bool CPUEngine::exl3_expert(int layer, int expert, const float *input, float *output) {
+  const auto &cfg = model_file.architecture_config;
+  const std::string prefix = "model.language_model.layers." + std::to_string(layer) +
+      ".mlp.experts." + std::to_string(expert) + ".";
+  std::vector<float> gate(cfg.moe_inter), up(cfg.moe_inter);
+  std::string error;
+  std::vector<uint8_t> packed;
+  const auto project = [&](const char *suffix, const float *source, float *target,
+                            int input_dim, int output_dim) {
+    auto found = exl3_linears.find(prefix + suffix);
+    if (found == exl3_linears.end())
+      throw std::runtime_error("Missing EXL3 expert projection: " + prefix + suffix);
+    if (!load_exl3_mul1_matrix(exl3_model, found->second, packed, error))
+      throw std::runtime_error(error);
+    if (!exl3_mul1_matmul_packed(packed.data(), source, target, 1, input_dim, output_dim))
+      throw std::runtime_error("EXL3 expert matmul failed: " + prefix + suffix);
+  };
+  project("gate_proj", input, gate.data(), cfg.hidden, cfg.moe_inter);
+  project("up_proj", input, up.data(), cfg.hidden, cfg.moe_inter);
+  for (size_t index = 0; index < gate.size(); ++index)
+    gate[index] = gate[index] / (1.0f + std::exp(-gate[index])) * up[index];
+  project("down_proj", gate.data(), output, cfg.moe_inter, cfg.hidden);
+  return true;
+}
+
+bool CPUEngine::exl3_ngram_row(int head, int64_t row, float *output, int dimensions) {
+  const SafetensorsTensorInfo *table = nullptr;
+  int64_t local_row = row;
+  std::vector<const SafetensorsTensorInfo *> tables;
+  std::string bias_name;
+  for (const auto &[name, info] : exl3_model.tensors) {
+    if (name.find("ngram_embedding") == std::string::npos) continue;
+    if (name.ends_with(".head_bias")) bias_name = name;
+    if (name.ends_with(".trellis") && info.shape.size() == 2)
+      tables.push_back(&info);
+  }
+  std::sort(tables.begin(), tables.end(), [](const auto *left, const auto *right) {
+    return left->data_offset < right->data_offset;
+  });
+  for (const auto *candidate : tables) {
+    if (local_row < candidate->shape[0]) { table = candidate; break; }
+    local_row -= candidate->shape[0];
+  }
+  if (!table || local_row < 0 || dimensions != 160 || bias_name.empty()) return false;
+  const int words = static_cast<int>(table->shape[1]);
+  const int bits = (words - 1) / 10;
+  if (bits < 1 || bits > 8 || words != 1 + bits * 10) return false;
+  std::ifstream file(table->file_path, std::ios::binary);
+  std::vector<uint16_t> packed(words);
+  file.seekg(table->offset + static_cast<uint64_t>(local_row) * words * 2);
+  file.read(reinterpret_cast<char *>(packed.data()), words * 2);
+  if (!file) return false;
+  const auto &bias_info = exl3_model.tensors.at(bias_name);
+  if (bias_info.dtype != "F16" || head < 0 || bias_info.shape.size() != 2 ||
+      head >= bias_info.shape[0] || bias_info.shape[1] != dimensions) return false;
+  std::ifstream bias_file(bias_info.file_path, std::ios::binary);
+  std::vector<uint16_t> bias(dimensions);
+  bias_file.seekg(bias_info.offset + static_cast<uint64_t>(head) * dimensions * 2);
+  bias_file.read(reinterpret_cast<char *>(bias.data()), dimensions * 2);
+  if (!bias_file) return false;
+  const float scale = fp16_to_fp32(packed[0]);
+  for (int index = 0; index < dimensions; ++index) {
+    uint32_t state = 0;
+    for (int bit = 0; bit < 16; ++bit) {
+      const int position = (index - bit / bits + dimensions) % dimensions;
+      const int stream_bit = position * bits + bit % bits;
+      state |= ((packed[1 + stream_bit / 16] >> (stream_bit % 16)) & 1u) << bit;
+    }
+    const uint32_t product = state * 0x83DCD12Du;
+    const int sum = (product & 255u) + ((product >> 8) & 255u) +
+                    ((product >> 16) & 255u) + (product >> 24);
+    const float code = fp16_to_fp32(fp32_to_fp16(std::fma(
+        static_cast<float>(1024 + sum), fp16_to_fp32(0x1eee), fp16_to_fp32(0xc931))));
+    output[index] = fp16_to_fp32(fp32_to_fp16(code * scale + fp16_to_fp32(bias[index])));
+  }
+  return true;
+}
+
 bool CPUEngine::build_from_safetensors(const std::string &path, int max_ctx) {
   max_t = max_ctx;
 
@@ -680,14 +817,71 @@ bool CPUEngine::build_from_safetensors(const std::string &path, int max_ctx) {
 
 CPUQuantizedTensor *CPUEngine::find_layer(const std::string &name) {
   auto it = resident_layers.find(name);
+  if (it == resident_layers.end() && !exl3_model.tensors.empty()) {
+    CPUQuantizedTensor tensor;
+    std::vector<uint8_t> bytes;
+    std::string error;
+    auto linear = exl3_linears.find(name);
+    if (linear != exl3_linears.end()) {
+      if (!load_exl3_mul1_matrix(exl3_model, linear->second, bytes, error))
+        throw std::runtime_error(error);
+      tensor.meta.type = GGUFType::EXL3;
+      tensor.meta.shape = {static_cast<uint64_t>(linear->second.in_features),
+                            static_cast<uint64_t>(linear->second.out_features)};
+    } else {
+      auto raw = exl3_raw_names.find(name);
+      if (raw == exl3_raw_names.end()) return nullptr;
+      if (!read_exl3_tensor(exl3_model, raw->second, bytes, error))
+        throw std::runtime_error(error);
+      const auto &info = exl3_model.tensors.at(raw->second);
+      if (info.dtype != "F32" && info.dtype != "BF16" && info.dtype != "F16")
+        throw std::runtime_error("Unsupported Qwen weight dtype: " + raw->second);
+      const size_t elements = bytes.size() / (info.dtype == "F32" ? 4 : 2);
+      std::vector<float> values(elements);
+      for (size_t index = 0; index < elements; ++index) {
+        if (info.dtype == "F32") {
+          std::memcpy(&values[index], bytes.data() + index * 4, 4);
+        } else {
+          uint16_t word;
+          std::memcpy(&word, bytes.data() + index * 2, 2);
+          if (info.dtype == "F16") values[index] = fp16_to_fp32(word);
+          else {
+            const uint32_t bits = static_cast<uint32_t>(word) << 16;
+            std::memcpy(&values[index], &bits, 4);
+          }
+        }
+        if (name.ends_with("attn_q_norm.weight") ||
+            name.ends_with("attn_k_norm.weight") ||
+            name.find(".ple_norm_") != std::string::npos ||
+            name.ends_with("hc_attn_norm.weight") ||
+            name.ends_with("hc_ffn_norm.weight") ||
+            name == "output_hc_norm.weight")
+          values[index] += 1.0f;
+        if (name.ends_with(".ssm_a")) values[index] = -std::exp(values[index]);
+      }
+      bytes.resize(elements * sizeof(float));
+      std::memcpy(bytes.data(), values.data(), bytes.size());
+      tensor.meta.type = GGUFType::F32;
+      tensor.meta.shape.assign(info.shape.rbegin(), info.shape.rend());
+      if (name.ends_with("ssm_conv1d.weight") || name.ends_with("ple_conv1d.weight"))
+        tensor.meta.shape = {static_cast<uint64_t>(info.shape.back()),
+                             static_cast<uint64_t>(info.shape.front())};
+    }
+    tensor.meta.name = name;
+    tensor.meta.size_bytes = bytes.size();
+    tensor.host_size = bytes.size();
+    if (posix_memalign(reinterpret_cast<void **>(&tensor.host_ptr), 4096,
+                        bytes.size()) != 0)
+      throw std::runtime_error("EXL3 weight allocation failed: " + name);
+    std::memcpy(tensor.host_ptr, bytes.data(), bytes.size());
+    it = resident_layers.emplace(name, std::move(tensor)).first;
+  }
   return (it != resident_layers.end() && it->second.host_ptr) ? &it->second
                                                               : nullptr;
 }
 
 const CPUQuantizedTensor *CPUEngine::find_layer(const std::string &name) const {
-  auto it = resident_layers.find(name);
-  return (it != resident_layers.end() && it->second.host_ptr) ? &it->second
-                                                              : nullptr;
+  return const_cast<CPUEngine *>(this)->find_layer(name);
 }
 
 // ----------------------------------------------------------------------------

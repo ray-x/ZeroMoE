@@ -1,12 +1,16 @@
 #include "safetensors_adapter.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 
 namespace {
@@ -266,7 +270,7 @@ bool parse_shape_from_json(const JsonValue &object_entry, SafetensorsTensorInfo 
       return false;
     info.shape.push_back(static_cast<int64_t>(entry.number_value));
   }
-  return !info.shape.empty();
+  return true;
 }
 
 bool parse_dtype_from_json(const JsonValue &object_entry, SafetensorsTensorInfo &info) {
@@ -331,9 +335,71 @@ int infer_layer_index(const std::string &name) {
 std::uint64_t dtype_size_bytes(const std::string &dtype) {
   static const std::unordered_map<std::string, std::uint64_t> sizes = {
       {"F32", 4}, {"F16", 2}, {"BF16", 2}, {"I32", 4}, {"I64", 8},
-      {"U8", 1},  {"I8", 1},  {"BOOL", 1}, {"F64", 8}};
+      {"I16", 2}, {"U16", 2}, {"U32", 4}, {"U8", 1},  {"I8", 1}, {"BOOL", 1},
+      {"F64", 8}, {"F8_E4M3", 1}, {"F8_E5M2", 1}, {"F8_E8M0", 1}};
   auto it = sizes.find(dtype);
   return it != sizes.end() ? it->second : 1;
+}
+
+bool is_known_dtype(const std::string &dtype) {
+  static const std::unordered_set<std::string> known = {
+      "F32", "F16", "BF16", "I32", "I64", "I16", "U16", "U32", "U8",
+      "I8", "BOOL", "F64", "F8_E4M3", "F8_E5M2", "F8_E8M0"};
+  return known.find(dtype) != known.end();
+}
+
+bool has_suffix(const std::string &value, const std::string &suffix) {
+  return value.size() >= suffix.size() &&
+         value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string exl3_base_name(const std::string &name) {
+  static const std::array<const char *, 7> suffixes = {
+      ".trellis", ".suh", ".svh", ".su", ".sv", ".bias", ".mcg"};
+  for (const char *suffix : suffixes) {
+    if (has_suffix(name, suffix))
+      return name.substr(0, name.size() - std::strlen(suffix));
+  }
+  if (has_suffix(name, ".mul1"))
+    return name.substr(0, name.size() - 5);
+  return {};
+}
+
+bool valid_exl3_marker(const SafetensorsTensorInfo &info) {
+  return (info.shape.empty() || (info.shape.size() == 1 && info.shape[0] == 1)) &&
+         (info.dtype == "I32" || info.dtype == "U32");
+}
+
+bool valid_exl3_scale(const SafetensorsTensorInfo &info, int64_t elements,
+                      bool packed) {
+  if (packed)
+    return info.shape.size() == 1 && info.shape[0] == elements / 16 &&
+           (info.dtype == "I16" || info.dtype == "U16");
+  return info.shape.size() == 1 && info.shape[0] == elements &&
+         (info.dtype == "F16" || info.dtype == "BF16" || info.dtype == "F32");
+}
+
+bool infer_exl3_rate(int64_t words, double &rate) {
+  if (words >= 16 && words <= 128 && words % 16 == 0) {
+    rate = static_cast<double>(words) / 16.0;
+    return true;
+  }
+  if (words == 24 || words == 40 || words == 56) {
+    rate = static_cast<double>(words) / 16.0;
+    return true;
+  }
+  return false;
+}
+
+bool is_regular_model_file(const std::filesystem::directory_entry &entry,
+                           std::error_code &ec) {
+  ec.clear();
+  if (entry.is_regular_file(ec))
+    return true;
+  if (ec || !entry.is_symlink(ec))
+    return false;
+  ec.clear();
+  return std::filesystem::is_regular_file(entry.status(ec));
 }
 
 std::string canonical_qwen_generic(const std::string &raw_name) {
@@ -383,18 +449,73 @@ bool SafetensorsAdapter::parse_file(const std::string &path,
   if (!in)
     return false;
 
-  std::string bytes((std::istreambuf_iterator<char>(in)),
-                    std::istreambuf_iterator<char>());
-  if (bytes.size() < 8)
+  in.seekg(0, std::ios::end);
+  const std::streamoff file_size = in.tellg();
+  if (file_size < 8)
+    return false;
+  in.seekg(0, std::ios::beg);
+  std::uint64_t header_len = 0;
+  in.read(reinterpret_cast<char *>(&header_len), sizeof(header_len));
+  if (!in || header_len == 0 || header_len > 100 * 1024 * 1024 ||
+      header_len > static_cast<std::uint64_t>(file_size - 8))
     return false;
 
-  uint64_t header_len = 0;
-  std::memcpy(&header_len, bytes.data(), sizeof(header_len));
-  if (header_len == 0 || header_len > bytes.size() - 8)
+  std::string header_json(static_cast<size_t>(header_len), '\0');
+  in.read(header_json.data(), static_cast<std::streamsize>(header_len));
+  if (!in)
     return false;
 
-  const std::string header_json = bytes.substr(8, header_len);
-  return parse_header_bytes(header_json, out);
+  if (!parse_header_bytes(header_json, out))
+    return false;
+  const std::uint64_t data_base = 8 + header_len;
+  for (auto &entry : out.tensors) {
+    auto &info = entry.second;
+    if (info.data_end < info.data_offset ||
+        info.data_end - info.data_offset != info.length ||
+        data_base > static_cast<std::uint64_t>(file_size) ||
+        info.data_end > static_cast<std::uint64_t>(file_size) - data_base)
+      return false;
+    info.offset = data_base + info.data_offset;
+    info.file_path = path;
+  }
+  return true;
+}
+
+bool SafetensorsAdapter::parse_directory(const std::string &path,
+                                         SafetensorsModelInfo &out) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (!fs::is_directory(path, ec))
+    return false;
+
+  std::vector<fs::path> files;
+  for (const auto &entry : fs::directory_iterator(path, ec)) {
+    if (ec)
+      return false;
+    if (is_regular_model_file(entry, ec) &&
+        entry.path().extension() == ".safetensors")
+      files.push_back(entry.path());
+  }
+  if (ec || files.empty())
+    return false;
+  std::sort(files.begin(), files.end());
+
+  out = SafetensorsModelInfo{};
+  for (const fs::path &file : files) {
+    SafetensorsModelInfo shard;
+    if (!parse_file(file.string(), shard))
+      return false;
+    if (out.format == "generic" && shard.format != "generic")
+      out.format = shard.format;
+    for (const auto &metadata : shard.metadata)
+      out.metadata.emplace(metadata.first, metadata.second);
+    for (auto &tensor : shard.tensors) {
+      if (out.tensors.find(tensor.first) != out.tensors.end())
+        return false;
+      out.tensors.emplace(tensor.first, std::move(tensor.second));
+    }
+  }
+  return !out.tensors.empty();
 }
 
 bool SafetensorsAdapter::parse_header_bytes(const std::string &header_json,
@@ -414,7 +535,6 @@ bool SafetensorsAdapter::parse_header_bytes(const std::string &header_json,
         else if (kv.second.type == JsonType::Number)
           out.metadata[kv.first] = std::to_string(kv.second.number_value);
       }
-      // Normalize the export family if the header advertises it.
       const auto format_it = out.metadata.find("format");
       if (format_it != out.metadata.end())
         out.format = format_it->second;
@@ -427,16 +547,26 @@ bool SafetensorsAdapter::parse_header_bytes(const std::string &header_json,
         continue;
       SafetensorsTensorInfo info;
       info.name = kv.first;
-      parse_shape_from_json(kv.second, info);
-      parse_dtype_from_json(kv.second, info);
-      if (info.shape.empty() || info.dtype.empty())
-        continue;
-      info.length = static_cast<std::uint64_t>(info.shape.empty() ? 1 : 1);
-      for (int64_t dim : info.shape)
+      if (!parse_shape_from_json(kv.second, info) ||
+          !parse_dtype_from_json(kv.second, info) ||
+          !parse_data_offsets_from_json(kv.second, info))
+        return false;
+      if (!is_known_dtype(info.dtype) || info.data_end < info.data_offset)
+        return false;
+      info.length = 1;
+      for (int64_t dim : info.shape) {
+        if (dim < 0 || static_cast<std::uint64_t>(dim) >
+                            std::numeric_limits<std::uint64_t>::max() / info.length)
+          return false;
         info.length *= static_cast<std::uint64_t>(dim);
+      }
+      if (info.shape.empty())
+        info.length = 1;
+      if (info.length > std::numeric_limits<std::uint64_t>::max() /
+                            dtype_size_bytes(info.dtype))
+        return false;
       info.length *= dtype_size_bytes(info.dtype);
-      parse_data_offsets_from_json(kv.second, info);
-      out.tensors[info.name] = info;
+      out.tensors[info.name] = std::move(info);
     }
     return !out.tensors.empty();
   } catch (...) {
@@ -445,6 +575,9 @@ bool SafetensorsAdapter::parse_header_bytes(const std::string &header_json,
 }
 
 SafetensorsFamily SafetensorsAdapter::detect_family(const SafetensorsModelInfo &model) {
+  if (is_exl3_model(model))
+    return SafetensorsFamily::EXL3;
+
   bool has_qwen_hybrid_marker = false;
   bool has_dense_gqa_marker = false;
   bool has_moe_experts = false;
@@ -497,6 +630,9 @@ std::string SafetensorsAdapter::detect_format(const SafetensorsModelInfo &model)
   if (lower.find("dspark") != std::string::npos)
     return "dspark";
 
+  if (is_exl3_model(model))
+    return "exl3";
+
   for (const auto &kv : model.tensors) {
     std::string name = kv.first;
     std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) {
@@ -509,6 +645,135 @@ std::string SafetensorsAdapter::detect_format(const SafetensorsModelInfo &model)
   }
 
   return model.tensors.empty() ? "generic" : "generic";
+}
+
+bool SafetensorsAdapter::is_exl3_model(const SafetensorsModelInfo &model) {
+  for (const auto &entry : model.tensors) {
+    if (has_suffix(entry.first, ".trellis"))
+      return true;
+  }
+  return false;
+}
+
+Exl3Contract SafetensorsAdapter::map_exl3_contract(
+    const SafetensorsModelInfo &model) {
+  Exl3Contract contract;
+  std::vector<std::string> bases;
+  for (const auto &entry : model.tensors) {
+    if (has_suffix(entry.first, ".trellis"))
+      bases.push_back(exl3_base_name(entry.first));
+  }
+  std::sort(bases.begin(), bases.end());
+  bases.erase(std::unique(bases.begin(), bases.end()), bases.end());
+  contract.complete = !bases.empty();
+
+  for (const std::string &base : bases) {
+    if (base.find("ngram_embedding") != std::string::npos)
+      continue;
+    Exl3LinearInfo linear;
+    linear.key = base;
+    linear.trellis_name = base + ".trellis";
+    auto trellis_it = model.tensors.find(linear.trellis_name);
+    if (trellis_it == model.tensors.end())
+      continue;
+    const SafetensorsTensorInfo &trellis = trellis_it->second;
+    linear.trellis_shape = trellis.shape;
+    bool valid = trellis.dtype == "I16" && trellis.shape.size() == 3 &&
+                 trellis.shape[0] > 0 && trellis.shape[1] > 0 &&
+                 trellis.shape[2] > 0;
+    if (valid) {
+      linear.in_features = trellis.shape[0] * 16;
+      linear.out_features = trellis.shape[1] * 16;
+      linear.trellis_words = trellis.shape[2];
+      valid = infer_exl3_rate(linear.trellis_words, linear.bits_per_weight);
+    }
+
+    const std::string suh_name = base + ".suh";
+    const std::string su_name = base + ".su";
+    const std::string svh_name = base + ".svh";
+    const std::string sv_name = base + ".sv";
+    auto suh_it = model.tensors.find(suh_name);
+    auto su_it = model.tensors.find(su_name);
+    auto svh_it = model.tensors.find(svh_name);
+    auto sv_it = model.tensors.find(sv_name);
+    const bool has_suh = suh_it != model.tensors.end();
+    const bool has_su = su_it != model.tensors.end();
+    const bool has_svh = svh_it != model.tensors.end();
+    const bool has_sv = sv_it != model.tensors.end();
+    valid = valid && (has_suh || has_su) && (has_svh || has_sv) &&
+            !(has_suh && has_su) && !(has_svh && has_sv);
+    if (valid) {
+      if (has_suh) {
+        linear.suh_name = suh_name;
+        valid = valid && valid_exl3_scale(suh_it->second, linear.in_features, false);
+      } else {
+        linear.su_name = su_name;
+        valid = valid && valid_exl3_scale(su_it->second, linear.in_features, true);
+      }
+      if (has_svh) {
+        linear.svh_name = svh_name;
+        valid = valid && valid_exl3_scale(svh_it->second, linear.out_features, false);
+      } else {
+        linear.sv_name = sv_name;
+        valid = valid && valid_exl3_scale(sv_it->second, linear.out_features, true);
+      }
+    }
+
+    const std::string bias_name = base + ".bias";
+    const std::string mcg_name = base + ".mcg";
+    const std::string mul1_name = base + ".mul1";
+    auto bias_it = model.tensors.find(bias_name);
+    auto mcg_it = model.tensors.find(mcg_name);
+    auto mul1_it = model.tensors.find(mul1_name);
+    if (bias_it != model.tensors.end()) {
+      linear.bias_name = bias_name;
+      valid = valid && bias_it->second.shape.size() == 1 &&
+              bias_it->second.shape[0] == linear.out_features &&
+              (bias_it->second.dtype == "F16" || bias_it->second.dtype == "BF16" ||
+               bias_it->second.dtype == "F32");
+    }
+    valid = valid && !(mcg_it != model.tensors.end() && mul1_it != model.tensors.end());
+    if (mcg_it != model.tensors.end()) {
+      valid = valid && valid_exl3_marker(mcg_it->second);
+      linear.mcg_name = mcg_name;
+      linear.codebook = Exl3Codebook::MCG;
+    } else if (mul1_it != model.tensors.end()) {
+      valid = valid && valid_exl3_marker(mul1_it->second);
+      linear.mul1_name = mul1_name;
+      linear.codebook = Exl3Codebook::MUL1;
+    }
+
+    linear.valid = valid;
+    contract.linears.push_back(std::move(linear));
+    if (!valid)
+      contract.complete = false;
+    const int layer = infer_layer_index(base);
+    if (layer >= 0)
+      contract.n_layers = std::max(contract.n_layers, layer + 1);
+    const size_t expert_pos = base.find("experts.");
+    if (expert_pos != std::string::npos) {
+      const size_t start = expert_pos + 8;
+      const size_t end = base.find('.', start);
+      if (end != std::string::npos) {
+        try {
+          contract.n_experts = std::max(contract.n_experts,
+                                       std::stoi(base.substr(start, end - start)) + 1);
+        } catch (...) {
+          contract.complete = false;
+        }
+      }
+    }
+    if (linear.in_features > 0)
+      contract.hidden = std::max(contract.hidden, static_cast<int>(linear.in_features));
+    if (linear.out_features > 0)
+      contract.intermediate = std::max(contract.intermediate,
+                                       static_cast<int>(linear.out_features));
+  }
+
+  contract.complete = !contract.linears.empty() && contract.complete;
+  if (contract.linears.empty())
+    contract.complete = false;
+  return contract;
 }
 
 std::vector<NormalizedTensor>

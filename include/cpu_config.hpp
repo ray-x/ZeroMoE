@@ -176,6 +176,8 @@ inline Document parse_file(const std::string &path) {
 
 struct CPUConfig {
   std::string model_path;
+  std::string model_format = "gguf";
+  std::string metadata_model_path;
   int context_size = 4096;
   int max_new_tokens = 512;
   float temperature = 0.7f;
@@ -218,6 +220,8 @@ struct CPUConfig {
       return false;
 
     model_path = doc.root.get_str("model_path", model_path);
+    model_format = doc.root.get_str("model_format", model_format);
+    metadata_model_path = doc.root.get_str("metadata_model_path", metadata_model_path);
     context_size = doc.root.get_int("context_size", context_size);
     max_new_tokens = doc.root.get_int("max_new_tokens", max_new_tokens);
     temperature = doc.root.get_float("temperature", temperature);

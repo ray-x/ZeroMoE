@@ -1,0 +1,8 @@
+model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
+model_format = "exl3"
+model_load_only = true
+
+log_path = ""
+log_level = "INFO"
+context_size = 256
+max_new_tokens = 0

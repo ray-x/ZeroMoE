@@ -39,6 +39,21 @@ cmake -S . -B build && cmake --build build --target gguf_tool
 # binary lands at ./build/gguf_tool
 ```
 
+## EXL3 safetensors
+
+ExLlamav3 exports are directories of safetensors files containing groups such
+as `<linear>.trellis`, `<linear>.suh`/`<linear>.su`, and
+`<linear>.svh`/`<linear>.sv`. Validate the complete directory before using it:
+
+```bash
+cmake --build build --target exl3_tool
+./build/exl3_tool verify /path/to/model-exl3/
+```
+
+The verifier checks shard uniqueness, safetensors byte ranges, trellis bitrate,
+scale dimensions, optional bias dimensions, and the `mcg`/`mul1` codebook
+marker. It returns nonzero for an incomplete or inconsistent EXL3 export.
+
 ## End-to-end workflow
 
 The workflow is: **pack → verify → (A/B test with `io`)**.

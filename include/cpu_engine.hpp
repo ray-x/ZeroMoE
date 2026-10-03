@@ -13,6 +13,7 @@
 #include "kernels_cpu.hpp"
 #include "logger.hpp"
 #include "route_usage.hpp"
+#include "safetensors_adapter.hpp"
 
 // Forward declaration to break the include cycle with cpu_model_backend.hpp.
 class CPUModelBackend;
@@ -195,6 +196,9 @@ struct CPUEngine {
 
   // All dense weights loaded into host memory at startup.
   std::unordered_map<std::string, CPUQuantizedTensor> resident_layers;
+  SafetensorsModelInfo exl3_model;
+  std::unordered_map<std::string, Exl3LinearInfo> exl3_linears;
+  std::unordered_map<std::string, std::string> exl3_raw_names;
 
   // Qwen4Exp recurrent/HC state. These are allocated lazily by the CPU
   // backend so non-Qwen models pay no memory cost.
@@ -212,7 +216,11 @@ struct CPUEngine {
 
   // Build the model graph: load architecture config, dense weights, KV cache,
   // and model backend.
-  bool build(int max_ctx);
+  bool build(int max_ctx, bool load_weights = true);
+  bool build_from_exl3(const std::string &path, const std::string &metadata_path,
+                       int max_ctx);
+  bool exl3_expert(int layer, int expert, const float *input, float *output);
+  bool exl3_ngram_row(int head, int64_t row, float *output, int dimensions);
 
   // Alternate build path for .safetensors exports. Parses the file, creates the
   // right backend, and loads raw tensor bytes into resident host memory using

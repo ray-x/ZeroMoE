@@ -121,7 +121,29 @@ cmake --build build -j$(nproc)
 decode path executes and interact with each other (host-node mode automatically selects a blocking CUDA wait, +24%). Values,
 defaults, measurements and recommended combinations are in [docs/runtime-settings.md](docs/runtime-settings.md).
 
-### Interactive Terminal Generation
+### Qwen EXL3 safetensors decode
+
+Qwen3.8-Flash-Next EXL3 checkpoints can run through the CPU reference dispatch
+with `model_format = "exl3"` and `model_load_only = false`. The decoder reads
+EXL3 `mul1` weights directly from safetensors, supports integer bitrates 1–8,
+and streams the selected routed experts and PLE embedding rows from disk.
+Dense weights are loaded lazily into host memory. Symlinked shards are accepted.
+
+This checkpoint directory has no HF `config.json`, so the provided profile uses
+`metadata_model_path` to read architecture and tokenizer metadata from a matching
+Qwen GGUF. Its GGUF weight payloads are not used for EXL3 inference.
+
+```bash
+./build_ggmlcuda/moestream --config configs/qwen4exp_exl3_decode.toml \
+    --prompt "Hello" --ngen 8
+```
+
+`configs/qwen4exp_exl3_load.toml` retains the catalog/payload smoke mode.
+Decode currently uses CPU reconstruction/matmul, including in a CUDA build;
+it does not enable fused EXL3 CUDA kernels. Full-attention layers use the existing
+dense Qwen CPU attention path, with its QSA indexer deferral.
+
+### GGUF generation
 
 Launch the standalone engine directly by pointing it at your local GGUF model, either via a TOML config (preferred) or legacy CLI flags:
 

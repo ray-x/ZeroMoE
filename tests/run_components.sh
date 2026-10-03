@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 CXX="${CXX:-c++}"                 # c++ -> clang++ on macOS, g++ on most Linux
 BIN="${BIN:-./build/test_components}"
 SRC="tests/test_components.cpp"
-SUPPORT_SRC="src/safetensors_adapter.cpp"
+SUPPORT_SRCS="src/exl3_cpu.cpp src/exl3_model_loader.cpp src/safetensors_adapter.cpp"
 
 if [ ! -f "$SRC" ]; then
     echo "FATAL: $SRC not found (run from the MoEStream repo root)" >&2
@@ -100,8 +100,8 @@ if "$CXX" -std=c++23 -fopenmp -c -x c++ /dev/null -o /dev/null 2>/dev/null; then
 fi
 
 mkdir -p "$(dirname "$BIN")"
-echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRC $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
-"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" "$SUPPORT_SRC" "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
+echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
+"$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
 
 echo "[run_components] running: $BIN $*"
 exec "$BIN" "$@"

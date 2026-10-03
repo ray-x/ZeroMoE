@@ -13,6 +13,7 @@
 
 struct SafetensorsTensorInfo {
   std::string name;
+  std::string file_path;
   std::vector<int64_t> shape;
   std::string dtype;
   // File offset and length of the raw tensor bytes.
@@ -41,6 +42,41 @@ enum class SafetensorsFamily {
   Unknown,
   QwenHybridMoE, // Qwen3.6-A3B style hybrid linear-attention + dense MoE
   DenseGQA,      // Standard HF-style dense transformer with GQA (the real file)
+  EXL3,          // ExLlamav3 trellis/codebook safetensors export
+};
+
+enum class Exl3Codebook {
+  Default,
+  MCG,
+  MUL1,
+};
+
+struct Exl3LinearInfo {
+  std::string key;
+  std::string trellis_name;
+  std::string suh_name;
+  std::string svh_name;
+  std::string su_name;
+  std::string sv_name;
+  std::string bias_name;
+  std::string mcg_name;
+  std::string mul1_name;
+  std::vector<int64_t> trellis_shape;
+  int64_t in_features = 0;
+  int64_t out_features = 0;
+  int64_t trellis_words = 0;
+  double bits_per_weight = 0.0;
+  Exl3Codebook codebook = Exl3Codebook::Default;
+  bool valid = false;
+};
+
+struct Exl3Contract {
+  std::vector<Exl3LinearInfo> linears;
+  int n_layers = 0;
+  int n_experts = 0;
+  int hidden = 0;
+  int intermediate = 0;
+  bool complete = false;
 };
 
 struct QwenCpuContract {
@@ -95,6 +131,10 @@ class SafetensorsAdapter {
   // Parse a full safetensors file on disk.
   static bool parse_file(const std::string &path, SafetensorsModelInfo &out);
 
+  // Parse all *.safetensors files in a model directory. Tensor names must be
+  // unique across files; this mirrors ExLlamav3's collection loader.
+  static bool parse_directory(const std::string &path, SafetensorsModelInfo &out);
+
   // Parse the file header bytes directly. The header is the JSON metadata blob
   // that precedes the raw tensor payload in a safetensors export.
   static bool parse_header_bytes(const std::string &header_json,
@@ -105,6 +145,13 @@ class SafetensorsAdapter {
 
   // Detect whether the tensor layout is a Qwen hybrid MoE or a dense HF model.
   static SafetensorsFamily detect_family(const SafetensorsModelInfo &model);
+
+  // Build and validate the EXL3 tensor groups. An empty result means that no
+  // EXL3 trellis tensors were present; incomplete groups are reported through
+  // complete=false rather than silently treated as ordinary tensors.
+  static Exl3Contract map_exl3_contract(const SafetensorsModelInfo &model);
+
+  static bool is_exl3_model(const SafetensorsModelInfo &model);
 
   // Return all tensor names normalized to a generic canonical form. This is the
   // seam for DFlash/DSpark alias resolution.

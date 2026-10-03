@@ -15,6 +15,15 @@ add_executable(gguf_tool
     gguf_dma.cpp
     gguf_mix.cpp
 )
+
+add_executable(exl3_tool
+    exl3_tool.cpp
+    ../src/safetensors_adapter.cpp
+)
+target_include_directories(exl3_tool PRIVATE ../include)
+set_target_properties(exl3_tool PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+)
 target_include_directories(gguf_tool PRIVATE ../include)
 
 # Put the binary at the build root so `make build` and the shell wrapper both
