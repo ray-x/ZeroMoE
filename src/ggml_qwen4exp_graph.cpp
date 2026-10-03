@@ -1193,6 +1193,9 @@ struct FullGraph {
   // this table because a decode graph's larger KV capacity cannot alias the
   // small S-token prefill allocation and is seeded from the host cache.
   bool state_handoff_ready = false;
+  bool prefill_host_state_deferred = false;
+  bool decode_host_state_dirty = false;
+  bool prefill_device_state_inputs = false;
   std::vector<void *> state_handoff_addrs;
   std::vector<ggml_backend_buffer_t> state_handoff_buffers;
   size_t state_handoff_cursor = 0;
@@ -1368,6 +1371,9 @@ struct FullGraph {
     phase2_state_addrs.clear();
     phase2_state_replay_cursor = 0;
     state_handoff_ready = false;
+    prefill_host_state_deferred = false;
+    decode_host_state_dirty = false;
+    prefill_device_state_inputs = false;
     state_handoff_addrs.clear();
     state_handoff_buffers.clear();
     state_handoff_cursor = 0;
@@ -1470,6 +1476,7 @@ std::unique_ptr<FullGraph> g_graph;
 // buffers through the same source-graph bindings used by Phase 2 siblings.
 // Keep the owner alive until the borrower has been destroyed.
 std::unique_ptr<FullGraph> g_graph_prefill_arena_owner;
+std::unique_ptr<FullGraph> g_graph_prefill_state_owner;
 
 // Owner of the decode-only per-expert split arena (Option-B hot experts gathered
 // into compact VRAM tensors). The prefill graph never allocates it (split tensors
@@ -1503,6 +1510,23 @@ std::unique_ptr<FullGraph> g_graph_p2_suffix_cpu;
 
 bool g_config_full_graph = false;
 bool g_config_full_graph_decode = false;
+bool g_config_prefill_state_handoff = false;
+
+bool env_prefill_state_handoff_enabled() {
+  const char *value =
+      std::getenv("MOESTREAM_QWEN4EXP_PREFILL_STATE_HANDOFF");
+  if (value && value[0])
+    return value[0] == '1';
+  return g_config_prefill_state_handoff;
+}
+
+bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
+  const char *value = std::getenv("MOESTREAM_QWEN4EXP_PREFILL_DEVICE_STATE");
+  return !(value && value[0] == '0') && env_prefill_state_handoff_enabled() &&
+         !engine.prompt_cache && !engine.mtp_enabled &&
+         engine.qwen4exp_partial_layer < 0 &&
+         engine.qwen4exp_gpu_stage_layers.empty();
+}
 
 bool env_enabled() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH");
@@ -2264,17 +2288,14 @@ bool graph_cuda_host_buffers() {
   return !(v && v[0] == '0');
 }
 
-// llama.cpp's full graph begins with the CPU token-embedding GET_ROWS node, then
-// crosses to CUDA for the first transformer block.  MoEStream receives the
-// already-expanded hidden state from the engine, so it cannot include that
-// embedding operation without duplicating model work.  Keep the same
-// CPU->GPU graph boundary with one CPU contiguous staging node instead.  This
-// is a topology-compatibility node, not a numerical transformation; set the
-// variable to 0 for the original MoEStream graph shape when doing an A/B.
-bool graph_match_llama_cpp_topology() {
+int device_expert_resident_layer_count(const FullGraph &graph);
+
+bool graph_match_llama_cpp_topology(const FullGraph &graph) {
   const char *v =
       std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
-  return !(v && v[0] == '0');
+  if (v && v[0])
+    return v[0] != '0';
+  return device_expert_resident_layer_count(graph) < graph.n_layers;
 }
 
 // Emit one-time tensor metadata for CPU MoE comparisons.  The same
@@ -2646,7 +2667,10 @@ bool init_device_dense_arena(FullGraph &g) {
 }
 
 bool init_device_state_arena(FullGraph &g) {
-  if (!g.decode_mode || g.kv_capacity <= 0)
+  g.prefill_device_state_inputs =
+      !g.decode_mode && prefill_device_state_inputs_enabled(*g.engine);
+  if ((!g.decode_mode || g.kv_capacity <= 0) &&
+      !g.prefill_device_state_inputs)
     return true;
   const auto &c = g.engine->model_file.architecture_config;
   size_t bytes = 0;
@@ -2658,12 +2682,12 @@ bool init_device_state_arena(FullGraph &g) {
     return true;
   };
   for (int l = 0; l < g.n_layers; ++l) {
-    if (!qwen4exp_is_gdn_layer(c, l)) {
+    if (!qwen4exp_is_gdn_layer(c, l) && g.decode_mode) {
       const size_t kv = static_cast<size_t>(g.kv_capacity) * g.Hkv * g.hd *
                         sizeof(float);
       if (!add(kv) || !add(kv))
         return false;
-    } else {
+    } else if (qwen4exp_is_gdn_layer(c, l)) {
       const size_t state = static_cast<size_t>(g.gdn_hd) * g.gdn_hd *
                            g.Hv_gdn * sizeof(float);
       const size_t hist = static_cast<size_t>(g.d_conv - 1) * g.conv_dim *
@@ -2671,7 +2695,7 @@ bool init_device_state_arena(FullGraph &g) {
       if (!add(state) || !add(hist))
         return false;
     }
-    if (qwen4exp_is_ple_layer(c, l)) {
+    if (g.decode_mode && qwen4exp_is_ple_layer(c, l)) {
       const size_t ple_hist = static_cast<size_t>(c.ple_conv_kernel - 1) *
                               c.ple_ngram_size * g.D * g.HC * sizeof(float);
       if (!add(ple_hist))
@@ -2695,10 +2719,15 @@ bool init_device_state_arena(FullGraph &g) {
   g.device_state_base = ggml_backend_buffer_get_base(g.device_state_buffer);
   g.device_state_capacity = ggml_backend_buffer_get_size(g.device_state_buffer);
   g.device_state_used = 0;
+  if (g.prefill_device_state_inputs)
+    ggml_backend_buffer_clear(g.device_state_buffer, 0);
   LOG_INFO("[GGML-QWEN-FULL-DECODE] device state arena=%.2f GiB, KV capacity=%d\n",
            static_cast<double>(g.device_state_capacity) /
                (1024.0 * 1024.0 * 1024.0),
            g.kv_capacity);
+  if (g.prefill_device_state_inputs)
+    LOG_INFO("[GGML-QWEN-FULL] immutable zero GDN inputs on CUDA: "
+             "no per-prompt host clearing or H2D state upload\n");
   return true;
 }
 
@@ -6352,7 +6381,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   if (g.phase2_mode != FullGraph::Phase2Mode::SuffixGpu &&
       g.phase2_mode != FullGraph::Phase2Mode::SuffixCpu &&
-      graph_match_llama_cpp_topology()) {
+      graph_match_llama_cpp_topology(g)) {
     // The scheduler normally starts directly on the first GPU-weighted
     // operation because g.input is already a CPU buffer.  An explicit CPU
     // CONT makes the initial CPU->GPU handoff visible as the same leading
@@ -6677,7 +6706,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       const int hist = g.d_conv - 1;
       ggml_tensor *hi = nullptr;
       ggml_tensor *si = nullptr;
-      if (g.decode_mode) {
+      if (g.decode_mode || g.prefill_device_state_inputs) {
         hi = new_device_state_tensor(g, GGML_TYPE_F32, {hist, g.conv_dim, 1},
                                       "qwen_full_decode_gdn_history");
         si = new_device_state_tensor(
@@ -6701,7 +6730,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       if (g.decode_mode) {
         g.gdn_hist_updates.push_back(nullptr);
         g.gdn_state_updates.push_back(nullptr);
-      } else {
+      } else if (!g.prefill_device_state_inputs) {
         g.gdn_hist_inputs.push_back(static_cast<float *>(hi->data));
         g.gdn_state_inputs.push_back(static_cast<float *>(si->data));
         if (l < static_cast<int>(g.engine->qwen4exp_conv_history.size()) &&
@@ -7180,8 +7209,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode && !g.two_layer_diag) {
-    ggml_tensor *lm_in = g.output;
+  if (!g.two_layer_diag &&
+      (g.decode_mode || qwen4exp_full_graph_decode_enabled())) {
+    ggml_tensor *lm_in = g.decode_mode
+                            ? g.output
+                            : ggml_view_2d(g.ctx, g.output, g.D, 1,
+                                           g.output->nb[1],
+                                           (g.S - 1) * g.output->nb[1]);
     ggml_tensor *out_norm =
         resident_tensor(g, g.ctx, "output_norm.weight");
     if (out_norm) {
@@ -7605,6 +7639,34 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   return true;
 }
 
+bool sync_prefill_recurrent_state_to_host(FullGraph &g) {
+  if (g.decode_mode || !g.ready || !g.engine)
+    return false;
+  StreamingEngine &engine = *g.engine;
+  const size_t state_n = static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
+  const size_t hist_n = static_cast<size_t>(g.d_conv - 1) * g.conv_dim;
+  std::vector<float> native_state(state_n);
+  for (size_t index = 0; index < g.gdn_layers.size(); ++index) {
+    const int layer = g.gdn_layers[index];
+    if (index >= g.gdn_state_out.size() || index >= g.gdn_hist_out.size() ||
+        layer < 0 ||
+        layer >= static_cast<int>(engine.qwen4exp_recur_state.size()) ||
+        layer >= static_cast<int>(engine.qwen4exp_conv_history.size()) ||
+        engine.qwen4exp_recur_state[layer].size() != state_n ||
+        engine.qwen4exp_conv_history[layer].size() != hist_n)
+      return false;
+    ggml_backend_tensor_get(g.gdn_state_out[index], native_state.data(), 0,
+                            state_n * sizeof(float));
+    gdn_state_transpose_host(engine.qwen4exp_recur_state[layer].data(),
+                             native_state.data(), g.gdn_hd, g.Hv_gdn);
+    ggml_backend_tensor_get(g.gdn_hist_out[index],
+                            engine.qwen4exp_conv_history[layer].data(), 0,
+                            hist_n * sizeof(float));
+  }
+  g.prefill_host_state_deferred = false;
+  return true;
+}
+
 bool sync_decode_state_to_host(FullGraph &g) {
   if (!g.decode_mode || !g.ready || !g.engine)
     return true;
@@ -7657,6 +7719,7 @@ bool sync_decode_state_to_host(FullGraph &g) {
                             engine.qwen4exp_ple_conv_history[g.ple_layer].data(),
                             0, ple_n * sizeof(float));
   }
+  g.decode_host_state_dirty = false;
   return true;
 }
 
@@ -7680,11 +7743,21 @@ bool prepare_prefill_state_handoff(FullGraph &source) {
   size_t gdn_index = 0;
   size_t kv_index = 0;
   size_t compatible = 0;
+  size_t expected = 0;
   auto add = [&](ggml_tensor *t, bool compatible_shape) {
-    if (compatible_shape && t && t->data && t->buffer &&
-        !ggml_backend_buffer_is_host(t->buffer)) {
+    ggml_backend_buffer_t buffer = nullptr;
+    for (ggml_tensor *storage = t; storage; storage = storage->view_src) {
+      if (storage->buffer) {
+        buffer = storage->buffer;
+        break;
+      }
+    }
+    if (compatible_shape)
+      ++expected;
+    if (compatible_shape && t && t->data && buffer &&
+        ggml_is_contiguous(t) && !ggml_backend_buffer_is_host(buffer)) {
       source.state_handoff_addrs.push_back(t->data);
-      source.state_handoff_buffers.push_back(t->buffer);
+      source.state_handoff_buffers.push_back(buffer);
       ++compatible;
     } else {
       source.state_handoff_addrs.push_back(nullptr);
@@ -7712,10 +7785,14 @@ bool prepare_prefill_state_handoff(FullGraph &source) {
       ++kv_index;
     }
   }
-  if (compatible == 0 || source.state_handoff_addrs.size() !=
+  if (compatible == 0 || compatible != expected ||
+      source.state_handoff_addrs.size() !=
                               source.state_handoff_buffers.size()) {
     source.state_handoff_addrs.clear();
     source.state_handoff_buffers.clear();
+    LOG_WARN("[GGML-QWEN-FULL-STATE-HANDOFF] unavailable: %zu/%zu "
+             "recurrent/PLE tensors have contiguous device storage; "
+             "using host readback\n", compatible, expected);
     return false;
   }
   source.state_handoff_ready = true;
@@ -7742,9 +7819,51 @@ bool qwen4exp_full_graph_decode_enabled() {
   return env_enabled() && env_decode_enabled();
 }
 
-void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled) {
+void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled,
+                                   bool prefill_state_handoff) {
   g_config_full_graph = enabled;
   g_config_full_graph_decode = decode_enabled;
+  g_config_prefill_state_handoff = prefill_state_handoff;
+}
+
+bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine) {
+  FullGraph *prefill_state = g_graph_prefill_state_owner
+                                 ? g_graph_prefill_state_owner.get()
+                                 : g_graph_prefill_arena_owner.get();
+  const bool deferred_prefill =
+      prefill_state && prefill_state->engine == &engine &&
+      prefill_state->prefill_host_state_deferred;
+  if (g_graph && g_graph->ready && g_graph->engine == &engine) {
+    if (g_graph->decode_mode &&
+        (g_graph->decode_host_state_dirty || deferred_prefill)) {
+      if (!sync_decode_state_to_host(*g_graph) ||
+          (g_graph_p2_suffix_gpu &&
+           !sync_decode_state_to_host(*g_graph_p2_suffix_gpu)))
+        return false;
+      if (deferred_prefill)
+        prefill_state->prefill_host_state_deferred = false;
+      g_graph_p2_suffix_cpu.reset();
+      g_graph_p2_suffix_gpu.reset();
+      g_graph.reset();
+      LOG_INFO("[GGML-QWEN-FULL-STATE-HANDOFF] materialized decode state; "
+               "remaining tokens use layered fallback\n");
+      return true;
+    }
+    if (!g_graph->decode_mode && g_graph->prefill_host_state_deferred) {
+      if (!sync_prefill_recurrent_state_to_host(*g_graph))
+        return false;
+      if (!g_graph_prefill_arena_owner)
+        g_graph_prefill_arena_owner = std::move(g_graph);
+      else
+        g_graph_prefill_state_owner = std::move(g_graph);
+      LOG_INFO("[GGML-QWEN-FULL-STATE-HANDOFF] materialized prefill state; "
+               "remaining tokens use layered fallback\n");
+      return true;
+    }
+  }
+  if (deferred_prefill)
+    return sync_prefill_recurrent_state_to_host(*prefill_state);
+  return true;
 }
 
 void qwen4exp_full_graph_shutdown() {
@@ -7759,6 +7878,7 @@ void qwen4exp_full_graph_shutdown() {
   g_graph_p2_suffix_cpu.reset();
   g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
+  g_graph_prefill_state_owner.reset();
   g_graph_prefill_arena_owner.reset();
   g_graph_decode_arena_owner.reset();
   g_two_layer_diag_graph.reset();
@@ -7935,6 +8055,26 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // instead of rebuilding its thousands of nodes and re-uploading weights.
   // The decode borrower must be destroyed first because it aliases the
   // retained graph's CUDA arenas.
+  if (reuse_prefill_weight_arenas && g_graph_prefill_state_owner &&
+      g_graph_prefill_state_owner->ready &&
+      g_graph_prefill_state_owner->sched &&
+      g_graph_prefill_state_owner->engine == &engine &&
+      g_graph_prefill_state_owner->S == S) {
+    g_graph.reset();
+    g_graph = std::move(g_graph_prefill_state_owner);
+    LOG_INFO("[GGML-QWEN-FULL] reusing retained prefill state graph for "
+             "matching prompt shape S=%d\n", S);
+    if (has_ple_layer(c)) {
+      std::vector<float> ple;
+      if (!prepare_ple_embedding(*g_graph, ple, S, pos_base, token_ids) ||
+          !g_graph->ple_embedding ||
+          ple.size() * sizeof(float) > ggml_nbytes(g_graph->ple_embedding))
+        return false;
+      std::memcpy(g_graph->ple_embedding->data, ple.data(),
+                  ple.size() * sizeof(float));
+    }
+    return true;
+  }
   if (reuse_prefill_weight_arenas && g_graph_prefill_arena_owner &&
       g_graph_prefill_arena_owner->ready &&
       g_graph_prefill_arena_owner->sched &&
@@ -7964,6 +8104,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g_graph_p2_suffix_cpu.reset();
   g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
+  g_graph_prefill_state_owner.reset();
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
   g->device = dev;
@@ -8084,7 +8225,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
            static_cast<double>(expert_bytes) / (1024.0 * 1024.0 * 1024.0),
            static_cast<double>(kGraphHostWatermark) /
                (1024.0 * 1024.0 * 1024.0));
-  if (!init_device_dense_arena(*g))
+  if (!init_device_dense_arena(*g) || !init_device_state_arena(*g))
     return false;
   // Reserve fixed dense weights before choosing the variable-size expert
   // arena. Otherwise an oversized all-GPU request can consume the remaining
@@ -8419,6 +8560,12 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                "KV capacity; using layered decode\n");
       return false;
     }
+    if (g_graph_prefill_arena_owner &&
+        g_graph_prefill_arena_owner->engine == &engine)
+      g_graph_prefill_arena_owner->prefill_host_state_deferred = false;
+    if (g_graph_prefill_state_owner &&
+        g_graph_prefill_state_owner->engine == &engine)
+      g_graph_prefill_state_owner->prefill_host_state_deferred = false;
     // Phase 2's SuffixGpu instance holds its own GDN/KV/PLE state for
     // layers this prefix doesn't own (SuffixCpu shares the SAME physical
     // memory via phase2_state_source_graph -- downloading it a second
@@ -8442,6 +8589,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // (confirmed: freed amount here matched the prefill arena's own tracked
   // size almost exactly). Kept as a permanent low-cost sanity check.
   FullGraph *prefill_arena_source = nullptr;
+  FullGraph *prefill_state_source = nullptr;
   const bool decode_compact_arena_needed =
       (engine.qwen4exp_partial_layer >= 0 &&
        !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
@@ -8455,6 +8603,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
              "decode graph needs decode-only compact expert storage\n");
   }
   if (borrow_prefill_arenas) {
+    if (has_graph_prefill && g_graph->prefill_host_state_deferred &&
+        g_graph_prefill_arena_owner)
+      g_graph_prefill_state_owner = std::move(g_graph);
     if (g_graph_prefill_arena_owner &&
         g_graph_prefill_arena_owner->ready &&
         g_graph_prefill_arena_owner->engine == &engine &&
@@ -8474,6 +8625,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                "the completed prefill graph\n");
     }
   }
+  prefill_state_source = g_graph_prefill_state_owner
+                             ? g_graph_prefill_state_owner.get()
+                             : prefill_arena_source;
   // The prefill graph has finished executing.  When its recurrent/PLE output
   // tensors can be handed directly to decode, keep the scheduler alive: its
   // activation buffer owns those physical addresses.  Otherwise release the
@@ -8481,7 +8635,13 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // path.  The latter remains necessary for KV because prefill allocates only
   // S rows while decode reserves the full context capacity.
   const bool prefill_state_handoff =
-      prefill_arena_source && prepare_prefill_state_handoff(*prefill_arena_source);
+      env_prefill_state_handoff_enabled() && prefill_state_source &&
+      prefill_state_source->prefill_host_state_deferred &&
+      prepare_prefill_state_handoff(*prefill_state_source);
+  if (prefill_state_source && prefill_state_source->prefill_host_state_deferred &&
+      !prefill_state_handoff &&
+      !sync_prefill_recurrent_state_to_host(*prefill_state_source))
+    return false;
   if (prefill_arena_source && prefill_arena_source->sched &&
       !prefill_state_handoff) {
     ggml_backend_sched_free(prefill_arena_source->sched);
@@ -8887,11 +9047,15 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                "prepared at startup (no re-upload)\n");
     }
     g = build_one(FullGraph::Phase2Mode::Off, -1,
-                  prefill_state_handoff ? prefill_arena_source : nullptr,
+                  prefill_state_handoff ? prefill_state_source : nullptr,
                   prefill_arena_source, expert_source);
     if (!g) {
+      if (prefill_state_source && prefill_state_source->prefill_host_state_deferred &&
+          !sync_prefill_recurrent_state_to_host(*prefill_state_source))
+        return false;
       // Never fall to the layered path with half-reused arenas (that produced
       // garbled output on split configs): drop every owner and rebuild fresh.
+      g_graph_prefill_state_owner.reset();
       g_graph_prefill_arena_owner.reset();
       g_graph_decode_arena_owner.reset();
       prefill_arena_source = nullptr;
@@ -10017,6 +10181,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                             static_cast<size_t>(vocab) * sizeof(float));
   }
   g.decode_last_pos = pos_base;
+  g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
 
   // The PLE hash window is host metadata, not numerical recurrent state. Keep
   // it current so a later graph disable/capacity growth can seed the layered
@@ -10103,22 +10268,30 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
       !g_graph->ready || g_graph->engine != &engine || g_graph->S != S)
     return false;
   FullGraph &g = *g_graph;
+  const auto reset_host_recurrent_state = [&]() {
+    for (auto &history : engine.qwen4exp_conv_history)
+      std::fill(history.begin(), history.end(), 0.0f);
+    for (auto &state : engine.qwen4exp_recur_state)
+      std::fill(state.begin(), state.end(), 0.0f);
+  };
   auto fail = [&](const char *why) {
+    if (g.prefill_device_state_inputs)
+      reset_host_recurrent_state();
     LOG_WARN("[GGML-QWEN-FULL] execution declined: %s\n", why);
     return false;
   };
+  if (engine.qwen4exp_full_graph_logits_target && g.logits &&
+      engine.qwen4exp_full_graph_logits_target_size <
+          ggml_nelements(g.logits))
+    return fail("prefill logits destination is too small");
   LOG_INFO(
       "[GGML-QWEN-FULL] execute candidate S=%d gdn=%zu kv=%zu ple_layer=%d\n",
       S, g.gdn_layers.size(), g.kv_layers.size(), g.ple_layer);
 
   // A fresh position-zero graph starts a new recurrent/KV stream.  This is
   // the same reset boundary used by the established Qwen attention path.
-  for (size_t i = 0; i < engine.qwen4exp_conv_history.size(); ++i)
-    std::fill(engine.qwen4exp_conv_history[i].begin(),
-              engine.qwen4exp_conv_history[i].end(), 0.0f);
-  for (size_t i = 0; i < engine.qwen4exp_recur_state.size(); ++i)
-    std::fill(engine.qwen4exp_recur_state[i].begin(),
-              engine.qwen4exp_recur_state[i].end(), 0.0f);
+  if (!g.prefill_device_state_inputs)
+    reset_host_recurrent_state();
   std::fill(engine.qwen4exp_ple_tok_hist.begin(),
             engine.qwen4exp_ple_tok_hist.end(),
             static_cast<int32_t>(
@@ -10127,7 +10300,8 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
   for (size_t i = 0; i < g.gdn_layers.size(); ++i) {
     const int l = g.gdn_layers[i];
-    if (i >= g.gdn_state_inputs.size() || i >= g.gdn_hist_inputs.size())
+    if (!g.prefill_device_state_inputs &&
+        (i >= g.gdn_state_inputs.size() || i >= g.gdn_hist_inputs.size()))
       return fail("GDN input bookkeeping mismatch");
     const size_t state_n = static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
     const size_t hist_n = static_cast<size_t>(g.d_conv - 1) * g.conv_dim;
@@ -10136,10 +10310,12 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
         engine.qwen4exp_recur_state[l].size() != state_n ||
         engine.qwen4exp_conv_history[l].size() != hist_n)
       return fail("GDN state/history size mismatch");
-    std::memcpy(g.gdn_state_inputs[i], engine.qwen4exp_recur_state[l].data(),
-                state_n * sizeof(float));
-    std::memcpy(g.gdn_hist_inputs[i], engine.qwen4exp_conv_history[l].data(),
-                hist_n * sizeof(float));
+    if (!g.prefill_device_state_inputs) {
+      std::memcpy(g.gdn_state_inputs[i], engine.qwen4exp_recur_state[l].data(),
+                  state_n * sizeof(float));
+      std::memcpy(g.gdn_hist_inputs[i], engine.qwen4exp_conv_history[l].data(),
+                  hist_n * sizeof(float));
+    }
   }
   if (g.ple_layer >= 0 && g.ple_hist_input) {
     const auto &c = engine.model_file.architecture_config;
@@ -10187,7 +10363,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
       LOG_ERROR("[GGML-QWEN-FULL] refusing graph compute: MemAvailable=%ld MiB "
                 "< %ld MiB safety floor -- falling back to the legacy path\n",
                 avail_mb, kMinComputeHeadroomMb);
-      return false;
+      return fail("host memory safety floor");
     }
   }
 
@@ -10196,12 +10372,18 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   const auto t_submit_end = std::chrono::steady_clock::now();
   if (st != GGML_STATUS_SUCCESS) {
     LOG_ERROR("[GGML-QWEN-FULL] graph compute failed: status=%d\n", (int)st);
-    return false;
+    return fail("scheduler compute failed");
   }
   ggml_backend_sched_synchronize(g.sched);
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));
+  if (g.logits && engine.qwen4exp_full_graph_logits_target) {
+    ggml_backend_tensor_get(g.logits,
+                            engine.qwen4exp_full_graph_logits_target, 0,
+                            ggml_nbytes(g.logits));
+    engine.qwen4exp_full_graph_logits_ready = true;
+  }
   // Prefill's own all-layers dump: build_graph() populates
   // g.all_layers_snapshot identically for prefill and decode (same shared
   // per-layer loop), but this compute call -- unlike the two decode call
@@ -10237,21 +10419,20 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   const auto t_output_end = std::chrono::steady_clock::now();
   dump_layer0_diag_values(g);
 
-  for (size_t i = 0; i < g.gdn_layers.size(); ++i) {
-    const int l = g.gdn_layers[i];
-    const size_t state_n = static_cast<size_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
-    const size_t hist_n = static_cast<size_t>(g.d_conv - 1) * g.conv_dim;
-    // gdn_state_out (build_gdn's *state_out) is native layout;
-    // qwen4exp_recur_state is host-legacy layout for legacy CPU consumption.
-    // See gdn_state_transpose_host.
-    std::vector<float> native_state(state_n);
-    ggml_backend_tensor_get(g.gdn_state_out[i], native_state.data(), 0,
-                            state_n * sizeof(float));
-    gdn_state_transpose_host(engine.qwen4exp_recur_state[l].data(),
-                             native_state.data(), g.gdn_hd, g.Hv_gdn);
-    ggml_backend_tensor_get(g.gdn_hist_out[i],
-                            engine.qwen4exp_conv_history[l].data(), 0,
-                            hist_n * sizeof(float));
+
+  g.prefill_host_state_deferred =
+      env_prefill_state_handoff_enabled() &&
+      qwen4exp_full_graph_decode_enabled() &&
+      env_decode_borrow_prefill_arenas() && !engine.prompt_cache &&
+      !engine.mtp_enabled && engine.qwen4exp_partial_layer < 0 &&
+      engine.qwen4exp_gpu_stage_layers.empty() &&
+      prepare_prefill_state_handoff(g);
+  if (g.prefill_host_state_deferred) {
+    LOG_INFO("[GGML-QWEN-FULL-STATE-HANDOFF] deferred GDN host readback; "
+             "retaining %.3f GiB prefill workspace for decode\n",
+             static_cast<double>(g.graph_bytes) / (1024.0 * 1024.0 * 1024.0));
+  } else if (!sync_prefill_recurrent_state_to_host(g)) {
+    return fail("GDN host state readback failed");
   }
   for (size_t i = 0; i < g.kv_layers.size(); ++i) {
     const int l = g.kv_layers[i];
@@ -10686,7 +10867,8 @@ bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine, int pos_base,
 
 bool qwen4exp_full_graph_enabled() { return false; }
 bool qwen4exp_full_graph_decode_enabled() { return false; }
-void qwen4exp_full_graph_configure(bool, bool) {}
+void qwen4exp_full_graph_configure(bool, bool, bool) {}
+bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &) { return true; }
 int qwen4exp_full_graph_device_expert_layers() { return 0; }
 bool qwen4exp_full_graph_device_expert_trailing() { return false; }
 bool qwen4exp_full_graph_prepare(StreamingEngine &, int, int, const int *) {

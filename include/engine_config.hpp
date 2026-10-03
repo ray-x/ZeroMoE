@@ -682,6 +682,7 @@ struct EngineConfig {
   // Option B profile self-contained.
   bool qwen4exp_full_graph = false;
   bool qwen4exp_full_graph_decode = false;
+  bool qwen4exp_prefill_state_handoff = false;
 
   // Decode-time (S==1) CPU-offload cap for genuine disk-cold misses:
   // instead of a REAL cache miss (not RAM- nor VRAM-resident, would need
@@ -2572,6 +2573,8 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("qwen4exp_full_graph", qwen4exp_full_graph);
   qwen4exp_full_graph_decode = doc.root.get_bool(
       "qwen4exp_full_graph_decode", qwen4exp_full_graph_decode);
+  qwen4exp_prefill_state_handoff = doc.root.get_bool(
+      "qwen4exp_prefill_state_handoff", qwen4exp_prefill_state_handoff);
   if (qwen4exp_option_b_layer < -1) {
     LOG_WARN("[CONFIG] qwen4exp_option_b_layer=%d is invalid -- disabling\n",
              qwen4exp_option_b_layer);
@@ -3305,6 +3308,9 @@ inline bool EngineConfig::validate() {
 
 inline void EngineConfig::print() const {
   LOG_STREAM_INFO() << "[CONFIG] ========== Engine Configuration ==========\n";
+  LOG_STREAM_INFO() << "[CONFIG] Qwen prefill device-state handoff: "
+                    << (qwen4exp_prefill_state_handoff ? "ON" : "off")
+                    << " (retains prefill workspace when enabled)\n";
   LOG_STREAM_INFO() << "[CONFIG] Model: " << model_path << "\n";
   if (!dense_model_path.empty() && dense_model_path != model_path)
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";
@@ -3837,6 +3843,13 @@ drop_pages     = false    # true = evict expert pages from OS cache after use
 # upload, and that upload just steals cache capacity from layers where it
 # DOES help). Empty (default) = no layers affected.
 # cpu_affinity_layers = [4, 5, 7]
+
+# Qwen full-graph prefill/decode may hand recurrent state directly to CUDA
+# decode instead of exporting it to host RAM. This retains the prefill
+# workspace during decode; prompt caching and MTP keep host snapshots.
+# qwen4exp_full_graph = true
+# qwen4exp_full_graph_decode = true
+qwen4exp_prefill_state_handoff = false
 
 # qwen4exp_graph_expert_vram_budget_gb: full-graph decode only. Generalizes
 # cpu_affinity_layers/device_expert_layers' whole-layer choice into a real

@@ -1,0 +1,99 @@
+--- a/tools/llama-bench/llama-bench.cpp
++++ b/tools/llama-bench/llama-bench.cpp
+@@ -2771,6 +2771,15 @@
+     }
+
+     llama_synchronize(ctx);
++    if (const char * path = std::getenv("BEE_LLAMA_BENCH_PREFILL_LOGITS_DUMP")) {
++        if (path[0]) {
++            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
++            const float * logits = llama_get_logits_ith(ctx, -1);
++            std::ofstream output(path, std::ios::binary | std::ios::trunc);
++            output.write(reinterpret_cast<const char *>(logits),
++                         llama_vocab_n_tokens(vocab) * sizeof(float));
++        }
++    }
+     return true;
+ }
+
+@@ -2781,9 +2790,40 @@
+     const llama_vocab * vocab   = llama_model_get_vocab(model);
+     const int32_t       n_vocab = llama_vocab_n_tokens(vocab);
+
++    static const std::vector<llama_token> forced_tokens = [] {
++        std::vector<llama_token> result;
++        const char * path = std::getenv("BEE_LLAMA_BENCH_DECODE_TOKEN_FILE");
++        if (!path || !path[0]) {
++            return result;
++        }
++        std::ifstream input(path);
++        llama_token next_token = 0;
++        while (input >> next_token) {
++            result.push_back(next_token);
++        }
++        if (!input.eof() || result.empty()) {
++            fprintf(stderr, "[BEE-DECODE] malformed or empty token file=%s\n", path);
++            std::exit(1);
++        }
++        fprintf(stderr, "[BEE-DECODE] token_file=%s tokens=%zu fnv64=0x%016" PRIx64 "\n",
++                path, result.size(), bee_prompt_hash(result));
++        return result;
++    }();
++    if (!forced_tokens.empty() && forced_tokens.size() < static_cast<size_t>(n_gen)) {
++        fprintf(stderr, "[BEE-DECODE] token file is shorter than requested generation\n");
++        return false;
++    }
++
+     llama_token token = llama_vocab_get_add_bos(vocab) ? llama_vocab_bos(vocab) : std::rand() % n_vocab;
+
+     for (int i = 0; i < n_gen; i++) {
++        if (!forced_tokens.empty()) {
++            token = forced_tokens[i];
++            if (token < 0 || token >= n_vocab) {
++                fprintf(stderr, "[BEE-DECODE] out-of-vocabulary token=%d\n", token);
++                return false;
++            }
++        }
+         int res = llama_decode(ctx, llama_batch_get_one(&token, 1));
+         if (res != 0) {
+             fprintf(stderr, "%s: failed to decode generation batch, res = %d\n", __func__, res);
+@@ -3309,6 +3349,8 @@
+
+             llama_kv_tail_planner_timing_reset(ctx);
+             uint64_t t_start = get_time_ns();
++            uint64_t prompt_ns = 0;
++            uint64_t generation_ns = 0;
+
+             if (t.n_prompt > 0) {
+                 bee_trace_phase("prompt_begin", i + 1);
+@@ -3323,6 +3365,7 @@
+                     llama_model_free(lmodel);
+                     exit(1);
+                 }
++                prompt_ns = get_time_ns() - t_start;
+             }
+             if (t.n_gen > 0) {
+                 bee_trace_phase("generation_begin", i + 1);
+@@ -3330,7 +3373,9 @@
+                     fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
+                             i + 1, params.reps);
+                 }
++                const uint64_t generation_start = get_time_ns();
+                 bool res = test_gen(ctx, t.n_gen, t.n_threads);
++                generation_ns = get_time_ns() - generation_start;
+                 if (!res) {
+                     fprintf(stderr, "%s: error: failed to run gen\n", __func__);
+                     llama_free(ctx);
+@@ -3340,6 +3385,12 @@
+             }
+
+             uint64_t t_ns = get_time_ns() - t_start;
++            if (std::getenv("BEE_LLAMA_BENCH_ISOLATED_PHASE_TIMING")) {
++                fprintf(stderr, "[BEE-PHASE-TIME] repetition=%d prompt_tokens=%d "
++                        "decode_tokens=%d prefill_ms=%.6f decode_ms=%.6f\n",
++                        i + 1, t.n_prompt, t.n_gen,
++                        prompt_ns / 1.0e6, generation_ns / 1.0e6);
++            }
+             t.samples_ns.push_back(t_ns);
+             t.planner_ns.push_back(llama_kv_tail_planner_timing_ns(ctx));
+             if (params.kv_memory) {

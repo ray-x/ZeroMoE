@@ -15,7 +15,9 @@ bool qwen4exp_full_graph_decode_enabled();
 
 // Configure full-graph enablement from the TOML profile. Environment
 // variables remain supported and take precedence in the query functions.
-void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled);
+void qwen4exp_full_graph_configure(bool enabled, bool decode_enabled,
+                                   bool prefill_state_handoff = false);
+bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine);
 
 // Startup warmup that loads prompt-independent static weight arenas before the
 // first request. Enabled by default for full-graph decode; set

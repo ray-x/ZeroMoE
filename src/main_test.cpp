@@ -8,6 +8,7 @@
 #include "engine.hpp"
 #include "cuda_manager.hpp"
 #include "kquant_dequant.hpp"
+#include "engine_config.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -16,6 +17,7 @@
 #include <array>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <numeric>
@@ -6494,6 +6496,36 @@ bool test_gpu_device_allowlist() {
     return ok;
 }
 
+bool test_qwen_prefill_state_handoff_config() {
+    std::cout << "[Test] Qwen prefill state handoff config...\n";
+    char config_path[] = "/tmp/moestream_state_handoff_config_XXXXXX";
+    const int config_fd = mkstemp(config_path);
+    if (config_fd < 0)
+        return false;
+    close(config_fd);
+    bool ok = !EngineConfig{}.qwen4exp_prefill_state_handoff;
+    for (const std::string& setting : {std::string(),
+                                     std::string("qwen4exp_prefill_state_handoff = true\n"),
+                                     std::string("qwen4exp_prefill_state_handoff = false\n")}) {
+        {
+            std::ofstream output(config_path);
+            output << "model_path = \"/test/model.gguf\"\n" << setting;
+            ok = ok && output.good();
+        }
+        EngineConfig config;
+        const bool loaded = config.load(config_path);
+        ok = ok && loaded &&
+             config.qwen4exp_prefill_state_handoff ==
+                 (setting.find("true") != std::string::npos);
+    }
+    EngineConfig::write_sample(config_path);
+    EngineConfig sample;
+    ok = sample.load(config_path) && !sample.qwen4exp_prefill_state_handoff && ok;
+    std::remove(config_path);
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "  MoeStream Native Test Harness\n";
@@ -6501,6 +6533,9 @@ int main() {
 
     if (std::getenv("MOESTREAM_TEST_ONLY_Q2_0_VNNI")) {
         return test_qwen_q2_0_vnni_kernel() ? 0 : 1;
+    }
+    if (std::getenv("MOESTREAM_TEST_ONLY_QWEN_STATE_HANDOFF_CONFIG")) {
+        return test_qwen_prefill_state_handoff_config() ? 0 : 1;
     }
 
     // Diagnostic-only escape hatch (2026-09-10): run just Test 35 in
@@ -6615,6 +6650,7 @@ int main() {
     bool glm5next_dense_projection_fusion_ok =
         test_glm5next_dense_projection_fusion();
     bool gpu_device_allowlist_ok = test_gpu_device_allowlist();
+    bool qwen_state_handoff_config_ok = test_qwen_prefill_state_handoff_config();
 
     std::cout << "========================================\n";
     if (!fused_kernels_ok) {
@@ -6773,6 +6809,10 @@ int main() {
     }
     if (!gpu_device_allowlist_ok) {
         std::cout << "❌ GPU config allow-list test FAILED -- see [Test 32] output above.\n";
+        return 1;
+    }
+    if (!qwen_state_handoff_config_ok) {
+        std::cout << "❌ Qwen prefill state handoff config test FAILED.\n";
         return 1;
     }
     std::cout << "✅ All core engine tests passed successfully!\n";

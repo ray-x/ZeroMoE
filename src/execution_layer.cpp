@@ -1042,6 +1042,13 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     return;
   }
 
+  if (S == 1 && engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      !qwen4exp_full_graph_sync_state_to_host(engine)) {
+    LOG_STREAM_ERROR() << "[GGML-QWEN-FULL] cannot materialize device state "
+                         "for layered fallback\n";
+    return;
+  }
+
   LayerScratch &scratch = g_layer_scratch;
   if (!scratch.resize(S, D, c.n_experts, c.moe_inter, c.topk, c.n_expert_shared,
                       c.dense_inter)) {

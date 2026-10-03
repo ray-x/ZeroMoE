@@ -671,6 +671,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
     // Embed the prompt tokens
     std::vector<float> hidden_states(pc_n_new * D, 0.0f);
+    std::vector<float> logits(V);
+    engine.qwen4exp_full_graph_logits_ready = false;
     auto emb_it = engine.resident_layers.find("token_embd.weight");
     if (emb_it != engine.resident_layers.end() && emb_it->second.host_ptr) {
         LOG_STREAM_INFO() << "[EMBED] token_embd.weight type=" << (unsigned)emb_it->second.meta.type
@@ -771,8 +773,12 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             // pos_base = pc_reuse: the reused prefix's dense KV rows are already in
             // place (position-indexed and untouched since they were written), so the
             // causal attention below still sees the full context.
+            engine.qwen4exp_full_graph_logits_target = logits.data();
+            engine.qwen4exp_full_graph_logits_target_size = V;
             layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), pc_n_new,
                                 pc_reuse, prompt_ids.data() + pc_reuse);
+            engine.qwen4exp_full_graph_logits_target = nullptr;
+            engine.qwen4exp_full_graph_logits_target_size = 0;
             if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
                 !engine.glm5next_full_graph_output_ready &&
                 !engine.deepseek_v4_full_graph_output_ready)
@@ -900,12 +906,14 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
     // Pre-allocate decode buffers (single token at a time)
     std::vector<float> decode_hidden(D);
-    std::vector<float> logits(V);
     std::vector<float> normed_last(D);
 
     // Reasoning state machine for <think>...</think> tag parsing
     ReasoningParser reasoning;
 
+    size_t timed_output_tokens = 0;
+    std::chrono::steady_clock::time_point first_token_output;
+    std::chrono::steady_clock::time_point last_token_output;
     bool mtp_started = false;
     const bool mtp_context_ready =
         engine.mtp_enabled && pc_reuse == 0 && pc_n_new == prompt_ids.size() &&
@@ -1126,6 +1134,16 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         const bool is_stop_now = !bench_ignore_stop &&
             (next_token == eos_id || tokenizer.is_stop_token(next_token));
 
+        if (step == 0 && !is_stop_now && max_new_tokens > 1 &&
+            engine.family_ops.family == ModelFamily::Qwen4Exp &&
+            graph_ops.enabled && graph_ops.build &&
+            graph_ops.enabled(engine, ModelGraphPhase::Decode)) {
+            const ModelGraphRequest first_decode_request{
+                ModelGraphPhase::Decode, 1, static_cast<int>(prompt_ids.size()),
+                &next_token, decode_hidden.data(), logits.data(), V};
+            graph_ops.build(engine, first_decode_request);
+        }
+
         if (!is_stop_now && !bench_silent) {
             // Reasoning-aware output: decode to real text, then parse
             // <think>...</think> tags out of the decoded stream (the tag
@@ -1143,7 +1161,13 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             // parse_result == 2: tag consumed, don't print
         }
 
-        if (is_stop_now)
+        if (!is_stop_now) {
+            last_token_output = std::chrono::steady_clock::now();
+            if (timed_output_tokens++ == 0)
+                first_token_output = last_token_output;
+        }
+
+        if (is_stop_now || step + 1 >= max_new_tokens)
             break;
 
         double diag_preproc_ms = std::chrono::duration<double, std::milli>(
@@ -1243,6 +1267,19 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                  (unsigned long)request_delta.n_tokens_generated,
                  decode_boundary_s,
                  (double)request_delta.n_tokens_generated / decode_boundary_s);
+    }
+    if (timed_output_tokens > 1) {
+        const double output_wall_s = std::chrono::duration<double>(
+            last_token_output - first_token_output).count();
+        if (output_wall_s > 0.0) {
+            LOG_INFO("[REQUEST-DECODE-OUTPUT] tokens=%zu intervals=%zu "
+                     "wall=%.6fs rate=%.2f tok/s "
+                     "(first output to last output; Qwen graph setup "
+                     "precedes first output)\n",
+                     timed_output_tokens, timed_output_tokens - 1,
+                     output_wall_s,
+                     static_cast<double>(timed_output_tokens - 1) / output_wall_s);
+        }
     }
     // TEMPORARY DIAGNOSTIC -- see this function's top-of-function comment.
     LOG_INFO("[REQUEST-DIAG] lmhead(norm+proj)=%.3fs vramlog(cudaMemGetInfo)=%.3fs\n",

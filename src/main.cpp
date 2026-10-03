@@ -402,7 +402,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_option_b_stage_count =
       config.qwen4exp_option_b_stage_count;
   qwen4exp_full_graph_configure(config.qwen4exp_full_graph,
-                                config.qwen4exp_full_graph_decode);
+                                config.qwen4exp_full_graph_decode,
+                                config.qwen4exp_prefill_state_handoff);
   ram_mgr.configured_total_experts =
       std::max(0, config.ram_cache_total_experts);
   // Must be set BEFORE the [PIN] preload block below -- that's where the
@@ -969,8 +970,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   const bool glm_graph_aliases_vram_cache =
       graph_mode && engine.family_ops.family == ModelFamily::GLM5NEXT &&
       glm5next_full_graph_enabled();
-  if (graph_mode && graph_ram_cache && config.ram_preload_all_experts &&
-      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+  if (graph_mode && engine.family_ops.family == ModelFamily::Qwen4Exp &&
       qwen4exp_full_graph_decode_enabled()) {
     const int n_layers =
         std::max(0, engine.model_file.architecture_config.n_layers);
@@ -1000,11 +1000,11 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       LOG_STREAM_INFO()
           << "[MOE-OWNERSHIP] full-graph device block [" << first_layer
           << ", " << (first_layer + device_layers)
-          << ") excludes " << vram_only_layer_count
-          << " non-CPU-affinity layer(s) from persistent DDR"
-          << " preload and graph-RAM arenas (VRAM-only), approximately "
+          << ") marks " << vram_only_layer_count
+          << " non-CPU-affinity layer(s) as VRAM-only, approximately "
           << (double)vram_only_bytes / (1024.0 * 1024.0 * 1024.0)
-          << " GiB\n";
+          << " GiB; persistent DDR preload/graph-RAM exclusion applies "
+             "when those tiers are enabled\n";
     }
   }
   // GLM5NEXT's device-resident expert layers (glm5next_full_graph's own
