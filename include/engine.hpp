@@ -469,6 +469,8 @@ public:
     int qwen4exp_option_b_top_n = 0;
     float qwen4exp_option_b_min_coverage = 0.80f;
     bool qwen4exp_option_b_right_size_top_n = false;
+    int qwen4exp_option_b_global_top_k = 0;
+    int qwen4exp_option_b_global_floor_per_layer = 1;
     // Finalized selected layers after startup usage-file filtering.  This is
     // distinct from the config allow-list, which remains available to main's
     // preload/coverage selection pass.

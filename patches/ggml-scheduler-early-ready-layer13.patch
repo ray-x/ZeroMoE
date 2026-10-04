@@ -1,0 +1,59 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1701,6 +1701,17 @@
+ };
+ static moestream_sched_prof g_sprof;
+
++// Private-buffer CPU markers may run after an application-owned input event.
++// The hook must reject every ordinary split; those retain allocator barriers.
++#if defined(__GNUC__) && !defined(_WIN32)
++extern "C" int moestream_ggml_sched_early_cpu(
++    ggml_backend_t, ggml_cgraph *, int64_t *, int64_t *) __attribute__((weak));
++extern "C" {
++GGML_BACKEND_API int ggml_backend_sched_early_cpu_supported();
++int ggml_backend_sched_early_cpu_supported() { return 1; }
++}
++#endif
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1719,9 +1730,20 @@
+         const bool sp_cpu = g_sprof.on &&
+             ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+
++        bool early_cpu = false;
++        int64_t early_wait_us = 0, early_compute_us = 0;
++#if defined(__GNUC__) && !defined(_WIN32)
++        if (!sched->callback_eval && split->n_inputs == 0 &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
++            moestream_ggml_sched_early_cpu) {
++            early_cpu = moestream_ggml_sched_early_cpu(split_backend, &split->graph,
++                &early_wait_us, &early_compute_us) == 1;
++        }
++#endif
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        if (!early_cpu && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+@@ -1858,13 +1880,14 @@
+
+         if (!sched->callback_eval) {
+             const int64_t sp_t1 = g_sprof.on ? ggml_time_us() : 0;
+-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            enum ggml_status ec = early_cpu ? GGML_STATUS_SUCCESS :
++                ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
+             if (g_sprof.on) {
+                 const int64_t sp_t2 = ggml_time_us();
+-                if (sp_cpu) { g_sprof.wait_cpu += sp_t1 - sp_t0; g_sprof.cpu_compute += sp_t2 - sp_t1; g_sprof.n_cpu_splits++; }
++                if (sp_cpu) { g_sprof.wait_cpu += early_cpu ? early_wait_us : sp_t1 - sp_t0; g_sprof.cpu_compute += early_cpu ? early_compute_us : sp_t2 - sp_t1; g_sprof.n_cpu_splits++; }
+                 else        { g_sprof.wait_gpu += sp_t1 - sp_t0; g_sprof.gpu_launch  += sp_t2 - sp_t1; g_sprof.n_gpu_splits++; }
+             }
+         } else {

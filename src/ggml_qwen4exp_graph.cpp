@@ -9,6 +9,7 @@
 // shape for MoEStream's model representation.
 
 #include "ggml_qwen4exp_graph.hpp"
+#include "option_b_global_hot.hpp"
 
 #include "dense_dispatch.hpp" // is_cpu_affinity_layer (cpu_affinity_layers config)
 #include "cuda_manager.hpp"
@@ -50,6 +51,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "qwen4exp_early_ready.hpp"
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -747,6 +749,11 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
     const ggml_tensor *node, cudaStream_t stream) {
   if (!node || node->op != GGML_OP_CPY || !node->extra || !stream)
     return false;
+  auto *early = static_cast<Qwen4ExpEarlyReady *>(node->extra);
+  if (early->magic == Qwen4ExpEarlyReady::kMagic) {
+    GGML_ASSERT(early->enqueue(node, stream));
+    return true;
+  }
   // Two distinct marker context types share this one ggml-cuda weak-symbol
   // hook (see patches/ggml-backend-host-node-*.patch's own wiring) rather
   // than each needing its own patch to ggml-cuda.cu: the CPU-offload bridge
@@ -878,6 +885,9 @@ struct FullGraph {
   ggml_threadpool_t cpu_threadpool = nullptr;
   int cpu_threads = 0;
   ggml_backend_sched_t sched = nullptr;
+  std::unordered_map<int, std::unique_ptr<Qwen4ExpEarlyReady>> early_ready;
+  std::unique_ptr<std::ofstream> early_route_trace;
+  std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
   // Per-layer CPU timing instrumentation (env: MOESTREAM_QWEN4EXP_GRAPH_
   // LAYER_TIMING=1). Uses ggml_backend_sched_set_eval_callback, which fires
   // synchronously around each CPU-backend node's real compute (ggml-cpu has
@@ -1275,6 +1285,9 @@ struct FullGraph {
       ggml_backend_sched_free(sched);
       sched = nullptr;
     }
+    early_stage_pools.clear();
+    early_ready.clear();
+    early_route_trace.reset();
     // Host-node CPU runners borrow this graph-owned pool.  Detach them after
     // the scheduler is gone, but before the pool itself is destroyed.  The
     // runner's graph plan is synchronous, so no callback can still be using
@@ -2891,6 +2904,32 @@ void plan_expert_vram_split(FullGraph &g) {
         option_layers.push_back(layer);
     }
 
+    // Global pool mode: one ranking over every eligible layer's experts (the
+    // startup pass in main.cpp runs the same helper, so the layer list and the
+    // hot sets agree). Per-layer top_n, right-sizing and the coverage gate do
+    // not apply; top_n is only a per-layer ceiling.
+    const bool global_mode = g.engine->qwen4exp_option_b_global_top_k > 0;
+    option_b_global::Result global_sel;
+    if (global_mode) {
+      std::vector<int> live_layers;
+      for (int layer : option_layers) {
+        if (layer < 0 || layer >= c.n_layers || c.n_experts <= 0)
+          continue;
+        if (is_cpu_affinity_layer(layer) || device_expert_block_covers(g, layer))
+          continue;
+        live_layers.push_back(layer);
+      }
+      global_sel = option_b_global::select(
+          entries, live_layers, c.n_layers, c.n_experts,
+          g.engine->qwen4exp_option_b_global_top_k,
+          g.engine->qwen4exp_option_b_global_floor_per_layer, option_top_n);
+      LOG_INFO("[OPTION-B] global pool: top-%d over %zu layer(s) -> %zu "
+               "expert(s) in %zu layer(s), pooled coverage=%.2f%%\n",
+               g.engine->qwen4exp_option_b_global_top_k, live_layers.size(),
+               global_sel.total_hot, global_sel.hot.size(),
+               global_sel.pool_coverage * 100.0);
+    }
+
     int committed_layers = 0;
     for (int layer : option_layers) {
       if (layer < 0 || layer >= c.n_layers || c.n_experts <= 0) {
@@ -2947,10 +2986,21 @@ void plan_expert_vram_split(FullGraph &g) {
         }
       }
       std::vector<int> hot_ids(ranked.begin(), ranked.begin() + hot_count);
+      if (global_mode) {
+        const auto it = global_sel.hot.find(layer);
+        if (it == global_sel.hot.end()) {
+          LOG_INFO("[OPTION-B] Layer %d remains CPU/DDR: no expert of this "
+                   "layer made the global top-%d\n",
+                   layer, g.engine->qwen4exp_option_b_global_top_k);
+          continue;
+        }
+        hot_ids = it->second;
+        hot_count = static_cast<int>(hot_ids.size());
+      }
       uint64_t hot_route_count = 0;
       for (int expert : hot_ids)
         hot_route_count += counts[static_cast<size_t>(expert)];
-      if (g.engine->qwen4exp_option_b_fill_vram) {
+      if (g.engine->qwen4exp_option_b_fill_vram && !global_mode) {
         // Start with the requested coverage floor, then let the arena
         // planner trim the least-used tail if the remaining VRAM cannot hold
         // every expert from every selected layer.
@@ -2959,7 +3009,7 @@ void plan_expert_vram_split(FullGraph &g) {
       }
       const double coverage = static_cast<double>(hot_route_count) /
                               static_cast<double>(total_count);
-      if (coverage < g.engine->qwen4exp_option_b_min_coverage) {
+      if (!global_mode && coverage < g.engine->qwen4exp_option_b_min_coverage) {
         LOG_INFO("[OPTION-B] Layer %d remains CPU/DDR: top-%d coverage=%.2f%% "
                  "is below %.2f%%\n",
                  layer, hot_count, coverage * 100.0,
@@ -3477,7 +3527,8 @@ bool init_device_expert_arena(FullGraph &g) {
     }
   };
 
-  if (split_active && g.engine && g.engine->qwen4exp_option_b_fill_vram) {
+  if (split_active && g.engine && g.engine->qwen4exp_option_b_fill_vram &&
+      g.engine->qwen4exp_option_b_global_top_k <= 0) {
     const auto &c = g.engine->model_file.architecture_config;
     const int minimum = std::min(g.engine->qwen4exp_option_b_top_n,
                                  c.n_experts);
@@ -5617,14 +5668,115 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ExpertSplitTables tab = build_expert_split_tables(
         g, ctx, c.n_experts, *split_gpu_ids, /*safe_dummy_fill=*/g.S != 1);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
-      ggml_tensor *ids_gpu_raw = ggml_get_rows(ctx, tab.remap_gpu, ids);
+      const char *early_env = std::getenv("MOESTREAM_QWEN_EARLY_READY_LAYER13");
+      const char *all_early_env = std::getenv("MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT");
+      const bool early_requested =
+          ((early_env && early_env[0] == '1' && layer == 13) ||
+           (all_early_env && all_early_env[0] == '1')) &&
+          g.decode_mode && g.S == 1 &&
+          g.phase2_mode == FullGraph::Phase2Mode::Off;
+      std::unique_ptr<Qwen4ExpEarlyReady> early;
+      ExpertSplitTables route_tab = tab;
+      if (early_requested) {
+        GGML_ASSERT(ggml_backend_sched_early_cpu_supported &&
+                    ggml_backend_sched_early_cpu_supported() == 1);
+        GGML_ASSERT(!g.layer_timing_enabled && g.early_ready.count(layer) == 0);
+        early = std::make_unique<Qwen4ExpEarlyReady>();
+        GGML_ASSERT(early->prepare(g.cpu, g.device, g.D, c.topk,
+                    gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu));
+        if (early->resident_tables) {
+          GGML_ASSERT(early->prepare_gpu_tables(g.cuda, ctx,
+                      tab.remap_gpu, tab.remap_cpu, tab.mask_gpu, tab.mask_cpu));
+          route_tab = {early->gpu_tables[0], early->gpu_tables[1],
+                       early->gpu_tables[2], early->gpu_tables[3]};
+          for (auto *table : early->gpu_tables)
+            ggml_backend_sched_set_tensor_backend(g.sched, table, g.cuda);
+        }
+        const char *stage = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
+        if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
+            (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
+          auto pool = std::make_unique<Qwen4ExpStagePool>();
+          GGML_ASSERT(layer > 0 && g.split_gpu_expert_ids.count(layer - 1));
+          GGML_ASSERT(pool->prepare(g.cuda, ctx, g.device, c.topk,
+                      gate_exps, up_exps, down_exps, early->cold_mask));
+          early->stage_target = pool.get();
+          GGML_ASSERT(early->prepare_stage_routes(g.cuda, ctx));
+          for (auto *weight : pool->weights)
+            ggml_backend_sched_set_tensor_backend(g.sched, weight, g.cuda);
+          ggml_backend_sched_set_tensor_backend(g.sched, early->stage_gpu_ids, g.cuda);
+          ggml_backend_sched_set_tensor_backend(g.sched, early->stage_gpu_mask, g.cuda);
+          g.early_stage_pools.push_back(std::move(pool));
+        }
+      }
+      ggml_tensor *ids_gpu_raw = ggml_get_rows(ctx, route_tab.remap_gpu, ids);
       ggml_tensor *ids_gpu = ggml_reshape_2d(ctx, ids_gpu_raw, c.topk, g.S);
-      ggml_tensor *ids_cpu_raw = ggml_get_rows(ctx, tab.remap_cpu, ids);
+      ggml_tensor *ids_cpu_raw = ggml_get_rows(ctx, route_tab.remap_cpu, ids);
       ggml_tensor *ids_cpu = ggml_reshape_2d(ctx, ids_cpu_raw, c.topk, g.S);
       ggml_tensor *weights_gpu =
-          ggml_mul(ctx, weights, ggml_get_rows(ctx, tab.mask_gpu, ids));
+          ggml_mul(ctx, weights, ggml_get_rows(ctx, route_tab.mask_gpu, ids));
       ggml_tensor *weights_cpu =
-          ggml_mul(ctx, weights, ggml_get_rows(ctx, tab.mask_cpu, ids));
+          ggml_mul(ctx, weights, ggml_get_rows(ctx, route_tab.mask_cpu, ids));
+
+      ggml_tensor *cold_weighted = nullptr;
+      if (early) {
+        auto *dst = ggml_dup_tensor(ctx, cur);
+        early->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));
+        GGML_ASSERT(early->device_buffer);
+        GGML_ASSERT(ggml_backend_tensor_alloc(early->device_buffer, dst,
+                    ggml_backend_buffer_get_base(early->device_buffer)) == GGML_STATUS_SUCCESS);
+        auto *fork = ggml_cpy(ctx, cur, dst);
+        fork->src[2] = ggml_cont(ctx, ids);
+        fork->src[3] = ggml_cont(ctx, weights);
+        fork->src[4] = g.positions;
+        fork->extra = early.get();
+        ggml_set_name(fork, ("qwen_early_ready_fork_l" + std::to_string(layer)).c_str());
+        ggml_backend_sched_set_tensor_backend(g.sched, dst, g.cuda);
+        ggml_backend_sched_set_tensor_backend(g.sched, fork, g.cuda);
+        early->gpu_input = fork;
+        input3 = ggml_reshape_3d(ctx, fork, g.D, 1, 1);
+        ggml_build_forward_expand(g.graph, fork);
+        const char *predict = std::getenv("MOESTREAM_QWEN_EARLY_READY_PREDICT");
+        const char *target = std::getenv("MOESTREAM_QWEN_EARLY_READY_PREDICT_LAYER");
+        const char *stage = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
+        const bool stage_next = stage &&
+            (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer + 1);
+        const bool predict_this_layer = !target || std::atoi(target) == layer + 1;
+        if (((predict && predict[0] == '1' && predict_this_layer) || stage_next) &&
+            g.split_gpu_expert_ids.count(layer + 1)) {
+          const std::string next = "blk." + std::to_string(layer + 1) + ".";
+          auto *next_router = resident_tensor(g, ctx, next + "ffn_gate_inp.weight");
+          auto *next_bias = resident_tensor(g, ctx, next + "exp_probs_b.bias");
+          GGML_ASSERT(next_router && early->prepare_prediction(g.cuda, ctx,
+                      next_router, next_bias, layer + 1));
+          ggml_backend_sched_set_tensor_backend(g.sched, early->prediction, g.cuda);
+          if (stage_next) {
+            GGML_ASSERT(early->prepare_prediction_readback(g.cuda, ctx));
+            ggml_backend_sched_set_tensor_backend(g.sched, early->prediction_marker, g.cuda);
+            ggml_build_forward_expand(g.graph, early->prediction_marker);
+          } else {
+            ggml_build_forward_expand(g.graph, early->prediction);
+          }
+        }
+        auto *cold_leaf = ggml_dup_tensor(ctx, early->output);
+        cold_leaf->buffer = early->output->buffer;
+        cold_leaf->data = early->output->data;
+        cold_weighted = ggml_map_custom1_inplace(ctx, cold_leaf,
+                         Qwen4ExpEarlyReady::fallback, 1, early.get());
+        cold_weighted->extra = early.get();
+        ggml_set_name(cold_weighted, ("qwen_early_ready_cold_l" + std::to_string(layer)).c_str());
+        ggml_backend_sched_set_tensor_backend(g.sched, cold_leaf, g.cpu);
+        ggml_backend_sched_set_tensor_backend(g.sched, cold_weighted, g.cpu);
+        if (early->async_output_copy) {
+          early->cpu_marker = cold_weighted;
+          GGML_ASSERT(early->prepare_gpu_output(g.cuda, ctx));
+          ggml_set_name(early->gpu_output,
+                        ("qwen_early_ready_output_l" + std::to_string(layer)).c_str());
+          ggml_backend_sched_set_tensor_backend(g.sched, early->gpu_output, g.cuda);
+          cold_weighted = early->gpu_output;
+        }
+        g.early_ready.emplace(layer, std::move(early));
+        LOG_INFO("[OPTION-B-EARLY-READY] layer=%d private CPU graph enabled\n", layer);
+      }
 
       ggml_tensor *up_g = ggml_mul_mat_id(ctx, up_exps_gpu, input3, ids_gpu);
       ggml_tensor *gate_g = ggml_mul_mat_id(ctx, gate_exps_gpu, input3, ids_gpu);
@@ -5632,14 +5784,32 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_tensor *experts_gpu =
           ggml_mul_mat_id(ctx, down_exps_gpu, act_g, ids_gpu);
 
-      ggml_tensor *up_c = ggml_mul_mat_id(ctx, up_exps, input3, ids_cpu);
-      ggml_tensor *gate_c = ggml_mul_mat_id(ctx, gate_exps, input3, ids_cpu);
-      ggml_tensor *act_c = ggml_swiglu_split(ctx, gate_c, up_c);
-      ggml_tensor *experts_cpu =
-          ggml_mul_mat_id(ctx, down_exps, act_c, ids_cpu);
-
-      experts = ggml_add(ctx, ggml_mul(ctx, experts_gpu, weights_gpu),
-                         ggml_mul(ctx, experts_cpu, weights_cpu));
+      ggml_tensor *hot_weighted = ggml_mul(ctx, experts_gpu, weights_gpu);
+      const auto stage = g.early_ready.find(layer);
+      if (stage != g.early_ready.end() && stage->second->stage_target) {
+        auto &early = *stage->second;
+        auto &pool = *early.stage_target;
+        auto *up = ggml_mul_mat_id(ctx, pool.weights[1], input3, early.stage_gpu_ids);
+        auto *gate = ggml_mul_mat_id(ctx, pool.weights[0], input3, early.stage_gpu_ids);
+        auto *act = ggml_swiglu_split(ctx, gate, up);
+        auto *down = ggml_mul_mat_id(ctx, pool.weights[2], act, early.stage_gpu_ids);
+        auto *staged_weighted = ggml_mul(ctx, down, ggml_mul(ctx, weights, early.stage_gpu_mask));
+        if (pool.verify_enabled)
+          GGML_ASSERT(pool.prepare_verification(staged_weighted, g.early_stage_pools.front().get()));
+        hot_weighted = ggml_add(ctx, hot_weighted, staged_weighted);
+      }
+      if (cold_weighted) {
+        // Submit hot work before the independent private CPU marker.
+        ggml_build_forward_expand(g.graph, hot_weighted);
+      } else {
+        ggml_tensor *up_c = ggml_mul_mat_id(ctx, up_exps, input3, ids_cpu);
+        ggml_tensor *gate_c = ggml_mul_mat_id(ctx, gate_exps, input3, ids_cpu);
+        ggml_tensor *act_c = ggml_swiglu_split(ctx, gate_c, up_c);
+        ggml_tensor *experts_cpu =
+            ggml_mul_mat_id(ctx, down_exps, act_c, ids_cpu);
+        cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
+      }
+      experts = ggml_add(ctx, hot_weighted, cold_weighted);
     }
   }
 
@@ -7071,8 +7241,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *sup = resident_tensor(g, g.ctx, p + "ffn_up_shexp.weight");
     ggml_tensor *sdo = resident_tensor(g, g.ctx, p + "ffn_down_shexp.weight");
     if (sge && sup && sdo) {
+      const auto early = g.early_ready.find(l);
       ggml_tensor *shared =
-          build_shared(g, g.ctx, ffn_in, l, sge, sup, sdo, sg);
+          build_shared(g, g.ctx,
+                       early != g.early_ready.end() ? early->second->gpu_input : ffn_in,
+                       l, sge, sup, sdo, sg);
+      if (early != g.early_ready.end())
+        ggml_build_forward_expand(g.graph, shared);
       if (l == 0 && g.layer0_diag_enabled)
         g.layer0_diag_shared = shared;
       if (l == 0 && g.layer0_diag_enabled &&
@@ -7088,6 +7263,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       if (l == 0 && g.layer0_diag_enabled)
         g.layer0_diag_moe_plus_shared_snapshot = layer0_diag_snapshot(
             g, g.ctx, moe, "qwen_layer0_diag_moe_plus_shared");
+    }
+    const auto early_output = g.early_ready.find(l);
+    if (early_output != g.early_ready.end() && early_output->second->cpu_marker) {
+      // The private GPU leaf is filled by the CPU hook. Preserve the explicit
+      // fork -> hot/shared -> CPU -> merge order; its upload joins this stream.
+      ggml_build_forward_expand(g.graph, early_output->second->cpu_marker);
     }
     if (l == 0 && g.layer0_diag_enabled &&
         env_layer0_split_dump_path()) {
@@ -7509,6 +7690,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                                        t_build_graph_start)
                                        .count();
   const auto t_alloc_start = std::chrono::steady_clock::now();
+  for (const auto &entry : g.early_ready) {
+    if (!entry.second->stage_target) continue;
+    const auto producer = g.early_ready.find(entry.first - 1);
+    GGML_ASSERT(producer != g.early_ready.end() && producer->second->prediction_marker &&
+                producer->second->prediction_layer == entry.first);
+    producer->second->stage_source = entry.second->stage_target;
+  }
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
     return false;
   const double t_alloc_ms = std::chrono::duration<double, std::milli>(
@@ -9901,6 +10089,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
              "staging proof could not be queued\n");
     return false;
   }
+  for (auto &entry : g.early_ready) {
+    entry.second->expected_pos = pos_base;
+    entry.second->completed = false;
+  }
   const auto start = std::chrono::steady_clock::now();
   const auto replay_start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
@@ -9917,6 +10109,84 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   }
   ggml_backend_sched_synchronize(g.sched);
   const auto replay_sync_end = std::chrono::steady_clock::now();
+  for (const auto &entry : g.early_ready) {
+    if (entry.second->stage_source)
+      entry.second->stage_source->token_complete(entry.second->calls);
+    if (entry.second->stage_target) {
+      auto &early = *entry.second;
+      early.stage_target->verify(early.input, early.weights, early.ids, early.stage_ids);
+    }
+  }
+  const char *route_trace = std::getenv("MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE");
+  if (route_trace && route_trace[0] && !g.early_ready.empty()) {
+    if (!g.early_route_trace) {
+      g.early_route_trace = std::make_unique<std::ofstream>(route_trace);
+      GGML_ASSERT(g.early_route_trace->is_open());
+      for (int layer = 0; layer < g.n_layers; ++layer) {
+        const auto entry = g.early_ready.find(layer);
+        if (entry == g.early_ready.end()) continue;
+        auto &trace = *g.early_route_trace;
+        const auto &mask = entry->second->cold_mask;
+        trace << "{\"kind\":\"layer\",\"layer\":" << layer
+              << ",\"expert_bytes\":" << entry->second->expert_bytes << ",\"cold_mask\":[";
+        for (size_t e = 0; e < mask.size(); ++e)
+          trace << (e ? "," : "") << int(mask[e]);
+        trace << "]}\n";
+      }
+    }
+    auto &trace = *g.early_route_trace;
+    for (int layer = 0; layer < g.n_layers; ++layer) {
+      const auto entry = g.early_ready.find(layer);
+      if (entry == g.early_ready.end()) continue;
+      const auto &early = *entry->second;
+      trace << "{\"position\":" << pos_base << ",\"layer\":" << layer << ",\"ids\":[";
+      for (int k = 0; k < early.k; ++k)
+        trace << (k ? "," : "") << early.ids[k];
+      trace << "],\"cold\":[";
+      for (int k = 0; k < early.k; ++k)
+        trace << (k ? "," : "") << int(early.cold_mask[early.ids[k]]);
+      trace << "],\"epoch\":" << early.calls << ",\"stage_ids\":[";
+      if (early.stage_target)
+        for (int k = 0; k < early.k; ++k)
+          trace << (k ? "," : "") << early.stage_ids[k];
+      trace << "],\"prediction_layer\":" << early.prediction_layer << ",\"prediction\":[";
+      if (early.prediction) {
+        std::vector<int32_t> ids(early.k);
+        ggml_backend_tensor_get(early.prediction, ids.data(), 0, ids.size() * sizeof(int32_t));
+        for (int k = 0; k < early.k; ++k)
+          trace << (k ? "," : "") << ids[k];
+      }
+      trace << "]}\n";
+    }
+    trace.flush();
+    GGML_ASSERT(trace.good());
+  }
+  for (const auto &entry : g.early_ready) {
+    const auto &early = *entry.second;
+    GGML_ASSERT(early.completed);
+    if (early.calls % 32 == 0)
+      LOG_INFO("[OPTION-B-EARLY-READY] calls=%llu early=%llu gpu_pending=%llu wait=%.2fus cpu=%.2fus layer=%d all_hot=%llu skipped=%llu uploads=%llu staged=%llu\n",
+               (unsigned long long)early.calls,
+               (unsigned long long)early.early_calls,
+               (unsigned long long)early.gpu_pending,
+               double(early.wait_us) / early.calls,
+               double(early.compute_us) / early.calls, entry.first,
+               (unsigned long long)early.all_hot_visits,
+               (unsigned long long)early.all_hot_skips,
+               (unsigned long long)early.output_uploads,
+               (unsigned long long)early.staged_routes);
+    if (early.calls % 32 == 0 && early.stage_target) {
+      const auto &pool = *early.stage_target;
+      LOG_INFO("[OPTION-B-STAGE-PREDICT] layer=%d requested=%llu dropped=%llu "
+               "predicted=%llu uploaded=%llu late=%llu verified=%llu max_delta=%.9g\n", entry.first,
+               (unsigned long long)pool.requests.load(),
+               (unsigned long long)pool.dropped.load(),
+               (unsigned long long)pool.predicted.load(),
+               (unsigned long long)pool.uploaded.load(),
+               (unsigned long long)pool.late.load(),
+               (unsigned long long)pool.verified, pool.verify_max_delta);
+    }
+  }
   dump_layer0_diag_values(g);
   if (env_alllayers_dump_path())
     dump_all_layers_snapshot(g, pos_base);
