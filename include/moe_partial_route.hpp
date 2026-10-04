@@ -18,9 +18,113 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <vector>
 
 namespace moe_partial {
+
+// The execution target is decided once for one layer invocation.  The route
+// slot, rather than the expert ID, is the unit of ownership: a router may
+// select the same expert more than once and every selected slot still carries
+// its own probability contribution.
+enum class RouteTarget : uint8_t {
+  ResidentGpu,
+  StagedGpu,
+  Cpu,
+};
+
+struct RouteAssignment {
+  int32_t expert_id = -1;
+  int32_t original_route_slot = -1;
+  float router_weight = 0.0f;
+  RouteTarget target = RouteTarget::Cpu;
+  int32_t weight_slot = -1;
+  uint64_t slot_generation = 0;
+};
+
+// Immutable per-layer classification.  `resident_index[e]` and
+// `staged_index[e]` contain branch-local weight slots, or -1 when that branch
+// cannot execute expert e.  A route not resident or staged is assigned to CPU;
+// this is the exact fallback for a DDR/SSD service that has not published a
+// usable staged slot yet.  Construction rejects invalid IDs, non-finite
+// router weights, and overlapping resident/staged ownership.
+class RouteClassification {
+public:
+  static bool build(const std::vector<int32_t> &route_ids,
+                    const std::vector<float> &router_weights,
+                    const std::vector<int32_t> &resident_index,
+                    const std::vector<int32_t> &staged_index,
+                    uint64_t slot_generation, RouteClassification *out) {
+    if (!out || route_ids.size() != router_weights.size() ||
+        resident_index.size() != staged_index.size())
+      return false;
+    RouteClassification candidate;
+    candidate.assignments_.reserve(route_ids.size());
+    for (size_t slot = 0; slot < route_ids.size(); ++slot) {
+      const int32_t expert = route_ids[slot];
+      if (expert < 0 || static_cast<size_t>(expert) >= resident_index.size() ||
+          !std::isfinite(router_weights[slot]))
+        return false;
+      const int32_t resident = resident_index[static_cast<size_t>(expert)];
+      const int32_t staged = staged_index[static_cast<size_t>(expert)];
+      if (resident >= 0 && staged >= 0)
+        return false;
+      RouteAssignment assignment;
+      assignment.expert_id = expert;
+      assignment.original_route_slot = static_cast<int32_t>(slot);
+      assignment.router_weight = router_weights[slot];
+      assignment.slot_generation = slot_generation;
+      if (resident >= 0) {
+        assignment.target = RouteTarget::ResidentGpu;
+        assignment.weight_slot = resident;
+      } else if (staged >= 0) {
+        assignment.target = RouteTarget::StagedGpu;
+        assignment.weight_slot = staged;
+      }
+      candidate.assignments_.push_back(assignment);
+    }
+    // The construction loop appends exactly one assignment for every input
+    // slot. Keep this explicit so future target additions cannot silently
+    // drop a route while refactoring the classifier.
+    if (candidate.assignments_.size() != route_ids.size())
+      return false;
+    *out = std::move(candidate);
+    return true;
+  }
+
+  const std::vector<RouteAssignment> &assignments() const { return assignments_; }
+  size_t size() const { return assignments_.size(); }
+
+  size_t count(RouteTarget target) const {
+    size_t result = 0;
+    for (const auto &assignment : assignments_)
+      result += assignment.target == target;
+    return result;
+  }
+
+  // True means every original route slot appears exactly once and no target
+  // carries an invalid branch slot. This is the merge invariant checked by
+  // graph code before it can submit branch work.
+  bool exact_once() const {
+    std::vector<uint8_t> seen(assignments_.size(), 0);
+    for (const auto &assignment : assignments_) {
+      if (assignment.original_route_slot < 0 ||
+          static_cast<size_t>(assignment.original_route_slot) >= seen.size() ||
+          seen[static_cast<size_t>(assignment.original_route_slot)] ||
+          !std::isfinite(assignment.router_weight))
+        return false;
+      if (assignment.target != RouteTarget::Cpu && assignment.weight_slot < 0)
+        return false;
+      seen[static_cast<size_t>(assignment.original_route_slot)] = 1;
+    }
+    for (uint8_t value : seen)
+      if (!value) return false;
+    return true;
+  }
+
+private:
+  std::vector<RouteAssignment> assignments_;
+};
 
 enum class SentinelPolicy {
   Auto,       // default: negative skip when supported for this shape, else dummy 0

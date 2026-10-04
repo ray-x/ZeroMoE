@@ -109,6 +109,37 @@ CUDA_VISIBLE_DEVICES=0 make test BUILD_DIR=../moestream-build-upstream-master JO
 
 The retained log is `logs/option_b_scheduler_final_native.log`.
 
+## Milestone 1: immutable route classification
+
+The first follow-up improvement adds `moe_partial::RouteClassification` to
+`include/moe_partial_route.hpp`. It creates an immutable assignment for each
+original router slot, carrying the expert ID, original slot, router weight,
+execution target, branch-local weight slot and slot generation. Resident,
+staged and CPU ownership are mutually exclusive; a CPU assignment is the
+explicit fallback when no published staged slot exists. Duplicate expert IDs
+remain separate route slots, so their router weights cannot be accidentally
+collapsed.
+
+The classifier currently sits beside the graph code and is not yet wired into
+the accepted decode path. That keeps the production baseline unchanged while
+the exact-once contract is tested before adding conditional or host-node
+branches.
+
+The focused test covers all-hot, all-cold, mixed, duplicate-route, overlapping
+ownership, invalid IDs, generation propagation and both negative-sentinel and
+dummy-route modes:
+
+```bash
+g++ -std=c++23 -O2 -Iinclude tests/test_moe_partial_route.cpp \
+  -o /tmp/test_moe_partial_route_route_classification
+for mode in capable stock optout; do
+  /tmp/test_moe_partial_route_route_classification "$mode"
+done
+```
+
+All three modes passed. The next milestone can consume this descriptor from a
+DDR-only partial-layer graph without mutating shared remap or mask tables.
+
 ## Scope and reproducibility
 
 The scoped graph files are:

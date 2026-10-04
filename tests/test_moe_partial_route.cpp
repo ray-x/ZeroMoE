@@ -1,0 +1,168 @@
+// Unit test for include/moe_partial_route.hpp (no ggml, no model, no GPU).
+//   g++ -std=c++20 -Iinclude tests/test_moe_partial_route.cpp -o /tmp/test_moe_partial_route
+//   /tmp/test_moe_partial_route capable    # patched ggml advertises the negative-id skip
+//   /tmp/test_moe_partial_route stock      # stock ggml: capability function reports 0
+//   /tmp/test_moe_partial_route optout     # capable ggml but MOESTREAM_MMID_NO_NEGATIVE_SKIP=1
+//   /tmp/test_moe_partial_route missing    # capability symbol absent is covered by the weak link (compile check only)
+// The capability result is cached once per process, so each mode runs in its own process.
+
+#include "moe_partial_route.hpp"
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static int g_capability = 0;
+extern "C" int ggml_cpu_mul_mat_id_negative_skip(void) { return g_capability; }
+
+static int g_failures = 0;
+#define CHECK(cond, msg)                                                       \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      std::fprintf(stderr, "FAIL: %s  [%s:%d]\n", msg, __FILE__, __LINE__);    \
+      ++g_failures;                                                            \
+    }                                                                          \
+  } while (0)
+
+using moe_partial::ExpertBranchMap;
+using moe_partial::HotColdSplit;
+using moe_partial::RouteClassification;
+using moe_partial::RouteTarget;
+using moe_partial::SentinelPolicy;
+
+int main(int argc, char **argv) {
+  const char *mode = argc > 1 ? argv[1] : "capable";
+  bool expect_skip = false;
+  if (!std::strcmp(mode, "capable")) {
+    g_capability = 1;
+    expect_skip = true;
+  } else if (!std::strcmp(mode, "stock")) {
+    g_capability = 0;
+  } else if (!std::strcmp(mode, "optout")) {
+    g_capability = 1;
+    setenv("MOESTREAM_MMID_NO_NEGATIVE_SKIP", "1", 1);
+  } else {
+    std::fprintf(stderr, "unknown mode %s\n", mode);
+    return 2;
+  }
+
+  // 6 experts; hot holds {1,4} at compact positions 0,1; cold holds the other four at positions 0..3.
+  const std::vector<int32_t> hot_index = {-1, 0, -1, -1, 1, -1};
+  const std::vector<int32_t> cold_index = {0, -1, 1, 2, -1, 3};
+
+  // ---- single-token decode -------------------------------------------------------------------
+  HotColdSplit dec;
+  CHECK(HotColdSplit::build(hot_index, cold_index, 1, true, true, &dec),
+        "exact partition accepted");
+  const int32_t want_inactive = expect_skip ? -1 : 0;
+  CHECK(dec.hot().inactive_id() == want_inactive, "decode hot inactive id");
+  CHECK(dec.cold().inactive_id() == want_inactive, "decode cold inactive id");
+  CHECK(dec.hot().skips_inactive_routes() == expect_skip, "skip flag");
+  const auto &h = dec.hot().route_ids();
+  CHECK(h.size() == 6, "decode table size");
+  CHECK(h[1] == 0 && h[4] == 1, "hot owned experts keep their branch index");
+  CHECK(h[0] == want_inactive && h[2] == want_inactive && h[3] == want_inactive &&
+            h[5] == want_inactive,
+        "hot non-owned routes use the inactive id");
+  const auto &c = dec.cold().route_ids();
+  CHECK(c[0] == 0 && c[2] == 1 && c[3] == 2 && c[5] == 3, "cold indices");
+  CHECK(c[1] == want_inactive && c[4] == want_inactive, "cold non-owned inactive");
+  const auto &hm = dec.hot().route_mask();
+  const auto &cm = dec.cold().route_mask();
+  for (int e = 0; e < 6; ++e)
+    CHECK(hm[e] + cm[e] == 1.0f, "every expert is owned by exactly one branch (mask)");
+  CHECK(hm[1] == 1.0f && hm[0] == 0.0f, "hot mask");
+
+  // ---- prefill (S > 1): never negative, tables repeated per token, token-major ----------------
+  HotColdSplit pre;
+  CHECK(HotColdSplit::build(hot_index, cold_index, 3, false, true, &pre), "prefill build");
+  CHECK(pre.hot().inactive_id() == 0, "prefill uses the valid dummy id, never negative");
+  CHECK(pre.hot().route_ids().size() == 18, "prefill table repeated per token");
+  CHECK(pre.hot().route_ids()[6 + 1] == 0 && pre.hot().route_ids()[12 + 4] == 1,
+        "token-major layout keeps per-token copies");
+  HotColdSplit pre_claim;  // even if a caller claims decode with S>1, the class refuses the skip
+  CHECK(HotColdSplit::build(hot_index, cold_index, 3, true, true, &pre_claim), "build");
+  CHECK(pre_claim.hot().inactive_id() == 0, "single_token_decode with n_tokens>1 still safe");
+
+  // ---- policy override ------------------------------------------------------------------------
+  HotColdSplit forced;
+  CHECK(HotColdSplit::build(hot_index, cold_index, 1, true, true, &forced,
+                            SentinelPolicy::ForceDummy),
+        "forced build");
+  CHECK(forced.hot().inactive_id() == 0, "ForceDummy is always 0");
+
+  // ---- partition validation -------------------------------------------------------------------
+  HotColdSplit bad;
+  CHECK(!HotColdSplit::build({0, 1, -1}, {-1, 0, 1}, 1, true, true, &bad),
+        "expert held by both branches rejected");
+  CHECK(!HotColdSplit::build({0, -1, -1}, {-1, -1, 0}, 1, true, true, &bad),
+        "expert held by neither branch rejected");
+  HotColdSplit dyn;  // dynamic residency: overlap allowed, no exactness requirement
+  CHECK(HotColdSplit::build({0, 1, -1}, {0, 1, 2}, 1, true, false, &dyn),
+        "non-exact (dynamic) partition accepted");
+  CHECK(!HotColdSplit::build({0, 1}, {0, 1, 2}, 1, true, false, &dyn),
+        "size mismatch rejected");
+
+  // ---- explicit ownership (hot expert whose physical slot is missing) --------------------------
+  ExpertBranchMap m = ExpertBranchMap::build({-1, 0}, 1, true, {1, 1});
+  CHECK(m.route_mask()[0] == 1.0f && m.route_ids()[0] == want_inactive,
+        "owned-but-unaddressable route: masked-in, inactive id");
+
+  // ---- immutable per-layer route classification ----------------------------------------------
+  // The classification is slot-based: duplicate expert IDs retain two
+  // independent router contributions and both must be assigned exactly once.
+  const std::vector<float> weights = {0.10f, 0.20f, 0.30f, 0.40f};
+  RouteClassification classification;
+  CHECK(RouteClassification::build({0, 1, 2, 3}, weights,
+                                   {0, 1, 2, 3}, {-1, -1, -1, -1}, 7,
+                                   &classification),
+        "all-hot classification builds");
+  CHECK(classification.exact_once() && classification.size() == 4,
+        "all-hot routes execute exactly once");
+  CHECK(classification.count(RouteTarget::ResidentGpu) == 4 &&
+            classification.count(RouteTarget::StagedGpu) == 0 &&
+            classification.count(RouteTarget::Cpu) == 0,
+        "all-hot target counts");
+
+  CHECK(RouteClassification::build({0, 1, 2, 3}, weights,
+                                   {-1, -1, -1, -1}, {-1, -1, -1, -1}, 8,
+                                   &classification),
+        "all-cold classification builds");
+  CHECK(classification.exact_once() && classification.count(RouteTarget::Cpu) == 4,
+        "all-cold routes execute exactly once on CPU");
+
+  CHECK(RouteClassification::build({0, 1, 2, 3}, weights,
+                                   {0, -1, -1, 1}, {-1, 0, 1, -1}, 9,
+                                   &classification),
+        "mixed classification builds");
+  CHECK(classification.exact_once() &&
+            classification.count(RouteTarget::ResidentGpu) == 2 &&
+            classification.count(RouteTarget::StagedGpu) == 2,
+        "mixed target counts");
+  for (const auto &assignment : classification.assignments())
+    CHECK(assignment.slot_generation == 9, "generation is carried by every slot");
+
+  CHECK(RouteClassification::build({1, 1, 2, 1}, weights,
+                                   {-1, 4, 5, -1}, {-1, -1, -1, -1}, 10,
+                                   &classification),
+        "duplicate-route classification builds");
+  CHECK(classification.exact_once() && classification.size() == 4 &&
+            classification.assignments()[0].original_route_slot == 0 &&
+            classification.assignments()[1].original_route_slot == 1 &&
+            classification.assignments()[3].original_route_slot == 3 &&
+            classification.count(RouteTarget::ResidentGpu) == 4,
+        "duplicate expert slots are preserved independently");
+
+  CHECK(!RouteClassification::build({0, 1}, {0.5f, 0.5f},
+                                    {0, 1}, {3, -1}, 11,
+                                    &classification),
+        "overlapping resident and staged ownership is rejected");
+  CHECK(!RouteClassification::build({0, 4}, {0.5f, 0.5f},
+                                    {0, 1}, {-1, -1}, 12,
+                                    &classification),
+        "out-of-range route ID is rejected");
+
+  if (g_failures == 0)
+    std::printf("PASS (%s): inactive id=%d for decode, 0 for prefill\n", mode, want_inactive);
+  return g_failures == 0 ? 0 : 1;
+}
