@@ -84,6 +84,8 @@ so prepare/reset changes cannot leave a stale child graph attached.
 validated runtime dispatch; it is intentionally not the production default.
 `202b440` adds the measured opt-in adaptive CPU/staged-GPU decision and its
 warmup counters.
+`3eaa43b` factors uniform payload-slot validation into the storage boundary and
+tests duplicate route slots plus malformed offsets.
 
 ## Selected runtime
 
