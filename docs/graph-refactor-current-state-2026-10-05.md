@@ -76,6 +76,8 @@ completion boundary), `3ee2feb` (atomic completion consumption), `cfec8d1`
 and `62527d1` (captured completion-graph payload upload), `18d2903`
 (payload offsets), `ee621b6` (external-event join fix and RTX 3090 runtime
 evidence), and `dc6896a` (runtime conditional topology contract).
+The persistent completion-graph handle is `d468d64`; `a196237` composes its
+captured payload child before the staged route predicate.
 
 ## Selected runtime
 
@@ -123,7 +125,10 @@ than placed inside a conditional body. The engine carries a separate staged
 expert-ID publication vector, and `publish_qwen4exp_staged_completion` now
 validates a Ready completion before publishing it. The opt-in pread service
 does not submit staged completions to this method yet, so the composer remains
-inactive by default.
+inactive by default. When a completion graph is prepared, its captured payload
+copy is available as a parent-graph child between the prefix and route
+predicate. This supplies the stable H2D/event boundary only; the staged GGML
+child is not yet bound to those payload planes.
 
 The topology contract is executable in
 `tests/test_qwen4exp_conditional_graph.cu`: it runs all-resident, all-staged,
