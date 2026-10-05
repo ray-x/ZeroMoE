@@ -1470,20 +1470,6 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                                est_gpu_stage_gb - graph_overhead_reserve_gb;
     const double fallback_gb = std::max(headroom_gb, 0.0);
 
-    const bool option_b_disable_legacy_cache =
-        qwen_full_graph_decode ||
-        (config.qwen4exp_option_b_disable_legacy_cache &&
-         config.qwen4exp_option_b_top_n > 0 &&
-         engine.family_ops.family == ModelFamily::Qwen4Exp);
-    EngineConfig fallback_config = config;
-    if (option_b_disable_legacy_cache) {
-      for (auto &gc : fallback_config.gpus) {
-        if (gc.device_id == gpu.get_core_device())
-          gc.moe_cache_gb = 0.0;
-      }
-      fallback_config.use_active_layer_area = false;
-      LOG_INFO("[GPU] Option-B full graph: explicitly disabling the legacy "
-               "VRAM LRU and active-layer area; selected experts use the "
     // Design policy (2026-10-05): Qwen4Exp has no layered decode. With the
     // full-graph decode enabled the graph reads only its own device arena
     // (Option-B hot experts / resident layers) and computes the rest on the
@@ -1496,7 +1482,21 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     const bool qwen_full_graph_decode =
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         qwen4exp_full_graph_decode_enabled();
-               "static graph arena\n");
+    const bool option_b_disable_legacy_cache =
+        qwen_full_graph_decode ||
+        (config.qwen4exp_option_b_disable_legacy_cache &&
+         config.qwen4exp_option_b_top_n > 0 &&
+         engine.family_ops.family == ModelFamily::Qwen4Exp);
+    EngineConfig fallback_config = config;
+    if (option_b_disable_legacy_cache) {
+      for (auto &gc : fallback_config.gpus) {
+        if (gc.device_id == gpu.get_core_device())
+          gc.moe_cache_gb = 0.0;
+      }
+      fallback_config.use_active_layer_area = false;
+      LOG_INFO("[GPU] Qwen4Exp full graph: legacy VRAM expert cache and "
+               "active-layer area disabled (no layered decode); experts "
+               "come from the static graph arena or the DDR arenas\n");
     }
     for (auto &gc : fallback_config.gpus) {
       if (gc.moe_cache_gb > fallback_gb)
