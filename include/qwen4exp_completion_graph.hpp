@@ -132,6 +132,8 @@ class CompletionGraph {
   uint64_t request_generation() const { return request_generation_; }
   int layer() const { return layer_; }
   cudaEvent_t ready_event() const { return ready_event_; }
+  cudaGraph_t captured_graph() const { return graph_; }
+  cudaStream_t upload_stream() const { return upload_stream_; }
   cudaError_t last_error() const { return last_error_; }
   const char *last_error_operation() const { return last_error_operation_; }
 
