@@ -72,7 +72,8 @@ shared worktree. Graph commits are authored by `ray-x`; the latest scoped
 follow-ups are `c9685b9` (partial activation and staged conditional composer),
 `8a5cd68` (shared shape-class worker test), `db35ec8` (opt-in storage
 completion boundary), `3ee2feb` (atomic completion consumption), `cfec8d1`
-(pread-backed shard loader), and `b945d47` (host completion dispatcher hook).
+(pread-backed shard loader), `b945d47` (host completion dispatcher hook),
+and `62527d1` (captured completion-graph payload upload).
 
 ## Selected runtime
 
