@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -27,6 +28,14 @@ struct StorageRequest {
   uint64_t request_generation = 0;
   int layer = -1;
   std::vector<int32_t> experts;
+  // Optional caller-owned destination. The loader may fill this buffer while
+  // the request is pending; the completion returns the same shared object so
+  // a later graph submission can consume it without copying an SSD/DDR slab.
+  struct Payload {
+    std::vector<uint8_t> bytes;
+    std::vector<size_t> offsets;
+  };
+  std::shared_ptr<Payload> payload;
 };
 
 struct StorageCompletion {
@@ -41,6 +50,7 @@ struct StorageCompletion {
   double queue_ms = 0.0;
   double service_ms = 0.0;
   std::vector<int32_t> experts;
+  std::shared_ptr<StorageRequest::Payload> payload;
 };
 
 struct StorageStats {
@@ -209,6 +219,7 @@ class StorageService {
       completion.request_generation = request.request_generation;
       completion.layer = request.layer;
       completion.experts = request.experts;
+      completion.payload = request.payload;
       const auto service_start = std::chrono::steady_clock::now();
       completion.queue_ms = std::chrono::duration<double, std::milli>(
           service_start - enqueued_at).count();

@@ -432,6 +432,8 @@ while each layer keeps its own GPU weights and epoch banks so uploads cannot
 overwrite a different layer's in-flight consumer. `StorageService` provides a
 host-only SSD/DDR dispatch boundary with explicit `Ready`/`Error` completions,
 model/request generations, stale-handle rejection and queue/service timing.
+Requests can carry a shared payload buffer, so a loader can publish filled
+expert bytes with the matching completion without another host copy.
 `qwen4exp_adaptive_policy.hpp` records the later CPU-versus-staged-GPU timing
 rule but is deliberately not wired into production. GDS/cuFile is excluded.
 

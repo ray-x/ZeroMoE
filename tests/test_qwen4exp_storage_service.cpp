@@ -7,6 +7,8 @@ using namespace moestream::qwen4exp;
 
 int main() {
   int loads = 0;
+  auto payload = std::make_shared<StorageRequest::Payload>();
+  payload->bytes.resize(4);
   StorageService service(2, 2, [&](const StorageRequest &request,
                                   StorageCompletion &completion) {
     ++loads;
@@ -15,10 +17,14 @@ int main() {
       return false;
     }
     completion.experts = request.experts;
+    if (request.payload) {
+      request.payload->bytes[0] = 0x5a;
+      request.payload->offsets = {0, request.payload->bytes.size()};
+    }
     return true;
   });
 
-  auto ready = service.submit(StorageRequest{11, 1, 3, {4, 9}});
+  auto ready = service.submit(StorageRequest{11, 1, 3, {4, 9}, payload});
   auto error = service.submit(StorageRequest{11, 2, 7, {2}});
   assert(ready && error);
   auto ready_result = service.wait(*ready);
@@ -31,6 +37,7 @@ int main() {
   assert(error_result->queue_ms >= 0.0 && error_result->service_ms >= 0.0);
   assert(ready_result->model_generation == 11 &&
          ready_result->request_generation == 1);
+  assert(ready_result->payload == payload && payload->bytes[0] == 0x5a);
   assert(service.release(*ready));
   assert(service.release(*error));
 

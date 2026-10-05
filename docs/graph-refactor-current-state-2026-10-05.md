@@ -235,6 +235,9 @@ an SSD/DDR completion graph can reject a stale result before it touches a
 staging slot. Loader exceptions are converted to an explicit error completion.
 The service remains host-only: a CUDA host callback may enqueue an immutable
 request, but the worker does not call CUDA or wait for a graph operation.
+Requests may optionally carry a shared payload buffer; the loader fills it and
+the matching completion returns the same object for a later graph submission,
+avoiding a second SSD/DDR copy.
 
 `include/qwen4exp_adaptive_policy.hpp` contains the later decision rule and is
 not wired into the default scheduler. It chooses staged GPU only when its
