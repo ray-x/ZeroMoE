@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 
+extern "C" void *moestream_qwen4exp_unpack_staged_payload_kernel_ptr();
+
 namespace {
 
 __global__ void classify_routes(cudaGraphConditionalHandle resident,
@@ -61,12 +63,18 @@ void check(cudaError_t status, const char *what) {
 int main() {
   int *ids = nullptr, *mode = nullptr, *output = nullptr;
   unsigned char *hot = nullptr, *staged = nullptr;
+  unsigned char *payload = nullptr, *gate_dst = nullptr, *up_dst = nullptr,
+                *down_dst = nullptr;
   int *host_mode = nullptr;
   check(cudaMalloc(&ids, 2 * sizeof(int)), "cudaMalloc ids");
   check(cudaMalloc(&mode, sizeof(int)), "cudaMalloc mode");
   check(cudaMalloc(&output, sizeof(int)), "cudaMalloc output");
   check(cudaMalloc(&hot, 8), "cudaMalloc hot");
   check(cudaMalloc(&staged, 8), "cudaMalloc staged");
+  check(cudaMalloc(&payload, 18), "cudaMalloc payload");
+  check(cudaMalloc(&gate_dst, 6), "cudaMalloc gate destination");
+  check(cudaMalloc(&up_dst, 4), "cudaMalloc up destination");
+  check(cudaMalloc(&down_dst, 8), "cudaMalloc down destination");
   check(cudaMallocHost(&host_mode, sizeof(int)), "cudaMallocHost mode");
   unsigned char hot_host[8] = {}, staged_host[8] = {};
   hot_host[1] = hot_host[2] = 1;
@@ -74,6 +82,14 @@ int main() {
   check(cudaMemcpy(hot, hot_host, 8, cudaMemcpyHostToDevice), "copy hot");
   check(cudaMemcpy(staged, staged_host, 8, cudaMemcpyHostToDevice),
         "copy staged");
+  unsigned char payload_host[18];
+  for (int i = 0; i < 18; ++i) payload_host[i] = static_cast<unsigned char>(i + 1);
+  check(cudaMemcpy(payload, payload_host, sizeof(payload_host),
+                   cudaMemcpyHostToDevice),
+        "copy payload");
+  check(cudaMemset(gate_dst, 0, 6), "clear gate destination");
+  check(cudaMemset(up_dst, 0, 4), "clear up destination");
+  check(cudaMemset(down_dst, 0, 8), "clear down destination");
 
   cudaGraph_t resident_graph = nullptr, staged_graph = nullptr,
               parent_graph = nullptr;
@@ -98,8 +114,27 @@ int main() {
   int staged_value = 22;
   void *staged_args[] = {&output, &staged_value};
   staged_params.kernelParams = staged_args;
+  void *payload_base = payload;
+  void *gate_base = gate_dst;
+  void *up_base = up_dst;
+  void *down_base = down_dst;
+  size_t gate_bytes = 3, up_bytes = 2, down_bytes = 4;
+  size_t gate_stride = 3, up_stride = 2, down_stride = 4;
+  int payload_topk = 2;
+  void *unpack_args[] = {&payload_base, &gate_base, &up_base, &down_base,
+                         &gate_bytes, &up_bytes, &down_bytes, &gate_stride,
+                         &up_stride, &down_stride, &payload_topk};
+  cudaKernelNodeParams unpack_params{};
+  unpack_params.func = moestream_qwen4exp_unpack_staged_payload_kernel_ptr();
+  unpack_params.gridDim = dim3(2);
+  unpack_params.blockDim = dim3(32);
+  unpack_params.kernelParams = unpack_args;
+  cudaGraphNode_t unpack_node = nullptr;
+  check(cudaGraphAddKernelNode(&unpack_node, staged_graph, nullptr, 0,
+                               &unpack_params),
+        "staged payload unpack");
   cudaGraphNode_t staged_kernel = nullptr;
-  check(cudaGraphAddKernelNode(&staged_kernel, staged_graph, nullptr, 0,
+  check(cudaGraphAddKernelNode(&staged_kernel, staged_graph, &unpack_node, 1,
                                &staged_params),
         "staged child kernel");
 
@@ -190,6 +225,24 @@ int main() {
           "output readback");
     assert(*host_mode == expected_mode[i]);
     assert(output_host == expected_output[i]);
+    if (expected_mode[i] == 2) {
+      unsigned char gate_host[6] = {}, up_host[4] = {}, down_host[8] = {};
+      check(cudaMemcpy(gate_host, gate_dst, sizeof(gate_host),
+                       cudaMemcpyDeviceToHost),
+            "read gate payload");
+      check(cudaMemcpy(up_host, up_dst, sizeof(up_host),
+                       cudaMemcpyDeviceToHost),
+            "read up payload");
+      check(cudaMemcpy(down_host, down_dst, sizeof(down_host),
+                       cudaMemcpyDeviceToHost),
+            "read down payload");
+      const unsigned char expected_gate[] = {1, 2, 3, 10, 11, 12};
+      const unsigned char expected_up[] = {4, 5, 13, 14};
+      const unsigned char expected_down[] = {6, 7, 8, 9, 15, 16, 17, 18};
+      assert(std::memcmp(gate_host, expected_gate, sizeof(gate_host)) == 0);
+      assert(std::memcmp(up_host, expected_up, sizeof(up_host)) == 0);
+      assert(std::memcmp(down_host, expected_down, sizeof(down_host)) == 0);
+    }
   }
   assert(callback_calls.load(std::memory_order_relaxed) == 3);
 
@@ -199,6 +252,10 @@ int main() {
   cudaGraphDestroy(resident_graph);
   cudaGraphDestroy(staged_graph);
   cudaFreeHost(host_mode);
+  cudaFree(down_dst);
+  cudaFree(up_dst);
+  cudaFree(gate_dst);
+  cudaFree(payload);
   cudaFree(staged);
   cudaFree(hot);
   cudaFree(output);
