@@ -164,7 +164,10 @@ constructed all three graph instances but declined the extra 11.17-GiB expert
 arena; a top-64 retry still declined a 10.93-GiB arena. Preserve
 `logs/option_b_partial_phase2_layer13_logits/` and
 `logs/option_b_partial_phase2_layer13_top64_logits/`. Resource sharing must be
-fixed before treating the conditional proof as runnable. The prototype remains
+fixed before treating the conditional proof as runnable. Prefix construction
+now prebinds the compact expert planes into its owner graph so suffixes can
+reuse stable addresses; the remaining failure is allocator admission before
+that borrowed ownership is reached. The prototype remains
 opt-in and the production profile is unchanged.
 
 ## Milestone 4 foundation: storage dispatch/completion boundary

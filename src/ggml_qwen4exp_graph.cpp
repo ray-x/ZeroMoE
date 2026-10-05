@@ -7146,6 +7146,28 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       // a fresh leaf to at the same address (see build_graph's own
       // res-seeding branch for SuffixGpu/SuffixCpu, and
       // split_graph_spike.cpp for the validated mechanism).
+      // Reserve and bind the compact resident expert planes in the prefix
+      // owner even though the prefix does not execute their FFN. SuffixGpu
+      // and the conditional body reuse these stable addresses through
+      // phase2_expert_source_graph; allocating a second full expert arena in
+      // the suffix was the reason the first Phase-2 proof exceeded VRAM.
+      if (g.engine->qwen4exp_partial_layer_gpu_ids.empty())
+        return false;
+      const std::string gate_name = p + "ffn_gate_exps.weight";
+      const std::string up_name = p + "ffn_up_exps.weight";
+      const std::string down_name = p + "ffn_down_exps.weight";
+      const GGUFTensor *gate_meta = model_tensor(*g.engine, gate_name);
+      const GGUFTensor *up_meta = model_tensor(*g.engine, up_name);
+      const GGUFTensor *down_meta = model_tensor(*g.engine, down_name);
+      if (!gate_meta || !up_meta || !down_meta ||
+          !build_split_gpu_tensor(g, g.ctx, gate_name, *gate_meta,
+                                  g.engine->qwen4exp_partial_layer_gpu_ids) ||
+          !build_split_gpu_tensor(g, g.ctx, up_name, *up_meta,
+                                  g.engine->qwen4exp_partial_layer_gpu_ids) ||
+          !build_split_gpu_tensor(g, g.ctx, down_name, *down_meta,
+                                  g.engine->qwen4exp_partial_layer_gpu_ids))
+        return false;
+
       build_moe(g, g.ctx, ffn_in, l, router, bias, nullptr, nullptr, nullptr,
                 nullptr, nullptr, nullptr, nullptr, nullptr,
                 &g.partial_layer_ids_out, &g.partial_layer_probs_out,
