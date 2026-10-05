@@ -167,6 +167,28 @@ arena; a top-64 retry still declined a 10.93-GiB arena. Preserve
 fixed before treating the conditional proof as runnable. The prototype remains
 opt-in and the production profile is unchanged.
 
+## Milestone 4 foundation: storage dispatch/completion boundary
+
+`include/qwen4exp_storage_service.hpp` adds a host-only bounded service with
+immutable `StorageRequest` records and explicit `Ready`/`Error` completions.
+Every completion carries both `model_generation` and `request_generation`; a
+stale handle cannot consume a later request's result. A callback may submit a
+request and return immediately. The worker owns the DDR/SSD loader operation,
+and a later completion graph can consume the matching result. The service does
+not call CUDA or wait for I/O from a CUDA host callback.
+
+The focused test is `tests/test_qwen4exp_storage_service.cpp`:
+
+```bash
+g++ -std=c++23 -O2 -pthread -Iinclude \
+  tests/test_qwen4exp_storage_service.cpp -o /tmp/test_qwen4exp_storage_service
+/tmp/test_qwen4exp_storage_service
+```
+
+It passed ready, error, stale-generation and release cases. Runtime SSD
+loading and completion-graph submission are still separate work; the current
+production profile does not use this service yet.
+
 ## Scope and reproducibility
 
 The scoped graph files are:
