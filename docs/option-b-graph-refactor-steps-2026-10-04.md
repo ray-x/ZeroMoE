@@ -471,3 +471,8 @@ The shared stage service now reports worker queue/run time, and each stage pool
 reports completed copy-stream DMA time. These measurements feed future adaptive
 selection experiments but remain observational; no adaptive route choice is
 enabled in the production profile.
+
+The service is selected through a shape-class registry keyed by top-k, the
+three projection dimensions and their quantization types. Compatible layers
+share one worker; their GPU arenas and epoch banks remain private so a queued
+upload cannot overwrite another layer's in-flight result.

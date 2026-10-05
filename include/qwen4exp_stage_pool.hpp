@@ -1,12 +1,15 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
+#include <tuple>
 #include <thread>
 #include <vector>
 
@@ -104,6 +107,39 @@ class Qwen4ExpStageWorkService {
   bool stopping_ = false;
   std::atomic<uint64_t> submitted_{0}, rejected_{0}, completed_{0};
   std::atomic<double> queue_ms_total_{0.0}, run_ms_total_{0.0};
+};
+
+// One shared worker service per compatible expert shape. The service is only
+// an execution queue: GPU weight arenas and epoch banks remain per layer so a
+// later layer can never overwrite a prior layer's in-flight consumer.
+class Qwen4ExpStageShapeClassPool {
+ public:
+  struct Key {
+    int topk = 0;
+    std::array<int64_t, 6> shape{};
+    std::array<uint32_t, 3> type{};
+
+    bool operator<(const Key &other) const {
+      return std::tie(topk, shape, type) <
+             std::tie(other.topk, other.shape, other.type);
+    }
+  };
+
+  Qwen4ExpStageWorkService *service_for(const Key &key) {
+    auto it = services_.find(key);
+    if (it != services_.end()) return it->second.get();
+    auto service = std::make_unique<Qwen4ExpStageWorkService>(1);
+    auto *result = service.get();
+    services_.emplace(key, std::move(service));
+    return result;
+  }
+
+  void shutdown() {
+    for (auto &entry : services_) entry.second->shutdown();
+  }
+
+ private:
+  std::map<Key, std::unique_ptr<Qwen4ExpStageWorkService>> services_;
 };
 
 // Each bank is held until both its DMA and the token that could consume it

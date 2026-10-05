@@ -249,6 +249,11 @@ The shared stage worker now exposes queue/run aggregates and each pool reports
 completed DMA time. These are diagnostic inputs for the policy; they do not
 change route selection yet.
 
+The worker topology is now a shape-class registry: layers with matching
+`topk`, projection dimensions and quantization types share one worker service;
+layers with different shapes get separate services. Weight arenas, bounce
+banks and epoch metadata remain per layer to preserve consumer lifetimes.
+
 ## Scope and reproducibility
 
 The scoped graph files are:

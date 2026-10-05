@@ -33,6 +33,10 @@ use by an earlier layer in the captured graph. The storage completion service
 and adaptive timing policy are foundations for a future partial-layer path;
 they are not enabled by the production profile.
 
+Staged worker ownership is grouped by a shape-class registry keyed by top-k,
+projection dimensions and quantization types. Compatible layers share the
+worker service while retaining private GPU arenas and epoch banks.
+
 The staged route prototype also has an explicit copy-stream completion join and
 uses valid masked dummy IDs for inactive GPU slots. A no-request control is
 byte-identical, but real layer-13 staging still changes the later hidden states

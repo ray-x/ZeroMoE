@@ -942,7 +942,7 @@ struct FullGraph {
   ggml_backend_sched_t sched = nullptr;
   std::unordered_map<int, std::unique_ptr<Qwen4ExpEarlyReady>> early_ready;
   std::unique_ptr<std::ofstream> early_route_trace;
-  std::unique_ptr<Qwen4ExpStageWorkService> early_stage_service;
+  std::unique_ptr<Qwen4ExpStageShapeClassPool> early_stage_shapes;
   std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
   // Per-layer CPU timing instrumentation (env: MOESTREAM_QWEN4EXP_GRAPH_
   // LAYER_TIMING=1). Uses ggml_backend_sched_set_eval_callback, which fires
@@ -1341,9 +1341,9 @@ struct FullGraph {
       ggml_backend_sched_free(sched);
       sched = nullptr;
     }
-    if (early_stage_service) early_stage_service->shutdown();
+    if (early_stage_shapes) early_stage_shapes->shutdown();
     early_stage_pools.clear();
-    early_stage_service.reset();
+    early_stage_shapes.reset();
     early_ready.clear();
     early_route_trace.reset();
     // Host-node CPU runners borrow this graph-owned pool.  Detach them after
@@ -5782,13 +5782,22 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         const char *stage = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
-          if (!g.early_stage_service)
-            g.early_stage_service = std::make_unique<Qwen4ExpStageWorkService>(1);
+          if (!g.early_stage_shapes)
+            g.early_stage_shapes = std::make_unique<Qwen4ExpStageShapeClassPool>();
+          Qwen4ExpStageShapeClassPool::Key shape_key;
+          shape_key.topk = c.topk;
+          shape_key.shape = {gate_exps->ne[0], gate_exps->ne[1],
+                             up_exps->ne[0], up_exps->ne[1],
+                             down_exps->ne[0], down_exps->ne[1]};
+          shape_key.type = {static_cast<uint32_t>(gate_exps->type),
+                            static_cast<uint32_t>(up_exps->type),
+                            static_cast<uint32_t>(down_exps->type)};
+          auto *shape_service = g.early_stage_shapes->service_for(shape_key);
           auto pool = std::make_unique<Qwen4ExpStagePool>();
           GGML_ASSERT(layer > 0 && g.split_gpu_expert_ids.count(layer - 1));
           GGML_ASSERT(pool->prepare(g.cuda, ctx, g.device, c.topk,
                       gate_exps, up_exps, down_exps, early->cold_mask,
-                      g.early_stage_service.get()));
+                      shape_service));
           early->stage_target = pool.get();
           GGML_ASSERT(early->prepare_stage_routes(g.cuda, ctx));
           for (auto *weight : pool->weights)
@@ -10309,8 +10318,8 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     if (early.calls % 32 == 0 && early.stage_target) {
       const auto &pool = *early.stage_target;
       const auto pt = pool.timing();
-      const auto wt = g.early_stage_service
-                          ? g.early_stage_service->stats()
+      const auto wt = pool.service
+                          ? pool.service->stats()
                           : Qwen4ExpStageWorkService::Stats{};
       LOG_INFO("[OPTION-B-STAGE-PREDICT] layer=%d requested=%llu dropped=%llu "
                "predicted=%llu uploaded=%llu late=%llu verified=%llu max_delta=%.9g "
