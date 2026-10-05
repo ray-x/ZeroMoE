@@ -9976,6 +9976,19 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
                                              nullptr, 0, prefix_handle),
                   "adding prefix child"))
       return false;
+    cudaGraphNode_t predecessor = prefix_node;
+    if (engine.qwen4exp_completion_graph &&
+        engine.qwen4exp_completion_graph->captured_graph()) {
+      cudaGraphNode_t completion_node = nullptr;
+      if (!build_ok(cudaGraphAddChildGraphNode(
+                        &completion_node, st.master_graph, &predecessor, 1,
+                        engine.qwen4exp_completion_graph->captured_graph()),
+                    "adding completion payload child"))
+        return false;
+      predecessor = completion_node;
+      LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] completion payload child "
+               "inserted before route predicate\n");
+    }
     cudaGraphConditionalHandle resident_cond{}, staged_cond{};
     if (!build_ok(cudaGraphConditionalHandleCreate(
                       &resident_cond, st.master_graph, 0,
@@ -10002,7 +10015,7 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
     predicate.kernelParams = args;
     cudaGraphNode_t predicate_node = nullptr;
     if (!build_ok(cudaGraphAddKernelNode(&predicate_node, st.master_graph,
-                                         &prefix_node, 1, &predicate),
+                                         &predecessor, 1, &predicate),
                   "adding route-mode predicate"))
       return false;
     auto add_child_if = [&](cudaGraphConditionalHandle handle,
