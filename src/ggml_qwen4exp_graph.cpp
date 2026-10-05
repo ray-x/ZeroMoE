@@ -1293,7 +1293,10 @@ struct FullGraph {
   // DISTINCT FullGraph instances (own ctx/graph/sched) built once at
   // decode-prepare time, chosen per token by a cheap host-side readback of
   // the prefix's own layer routing.
-  enum class Phase2Mode { Off, Prefix, SuffixGpu, SuffixCpu, SuffixStaged };
+  enum class Phase2Mode {
+    Off, Prefix, SuffixGpu, SuffixCpu, SuffixStaged,
+    SplitGpu, SplitStaged, Tail
+  };
   Phase2Mode phase2_mode = Phase2Mode::Off;
   int phase2_split_layer = -1;
   // Prefix-only: the persistent handoff buffer this instance writes `res`
@@ -1304,6 +1307,12 @@ struct FullGraph {
   // SAME address in their own ctx -- never touch this pair themselves.
   ggml_backend_buffer_t phase2_handoff_buf = nullptr;
   void *phase2_handoff_addr = nullptr;
+  ggml_tensor *phase2_handoff_output_tensor = nullptr;
+  // SplitGpu/SplitStaged write the post-FFN residual here; Tail starts from
+  // this address after the conditional child has completed.
+  ggml_backend_buffer_t phase2_ffn_handoff_buf = nullptr;
+  void *phase2_ffn_handoff_addr = nullptr;
+  FullGraph *phase2_ffn_source_graph = nullptr;
   // SuffixGpu and SuffixCpu build the SAME layer range [split_layer+1,
   // n_layers) and therefore issue new_device_state_tensor() calls in an
   // IDENTICAL sequence (GDN/dense-attn/PLE classification per layer is a
@@ -1519,6 +1528,12 @@ struct FullGraph {
     }
     phase2_handoff_buf = nullptr;
     phase2_handoff_addr = nullptr;
+    phase2_handoff_output_tensor = nullptr;
+    if (phase2_mode == Phase2Mode::Prefix && phase2_ffn_handoff_buf)
+      ggml_backend_buffer_free(phase2_ffn_handoff_buf);
+    phase2_ffn_handoff_buf = nullptr;
+    phase2_ffn_handoff_addr = nullptr;
+    phase2_ffn_source_graph = nullptr;
     phase2_mode = Phase2Mode::Off;
     phase2_split_layer = -1;
     phase2_state_source_graph = nullptr;
@@ -1662,6 +1677,7 @@ bool g_two_layer_diag_done = false;
 std::unique_ptr<FullGraph> g_graph_p2_suffix_gpu;
 std::unique_ptr<FullGraph> g_graph_p2_suffix_cpu;
 std::unique_ptr<FullGraph> g_graph_p2_suffix_staged;
+std::unique_ptr<FullGraph> g_graph_p2_tail;
 
 bool g_config_full_graph = false;
 bool g_config_full_graph_decode = false;
@@ -1677,9 +1693,12 @@ bool env_prefill_state_handoff_enabled() {
 
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
   const char *value = std::getenv("MOESTREAM_QWEN4EXP_PREFILL_DEVICE_STATE");
+  const char *phase2 =
+      std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
+  const bool phase2_enabled = phase2 && phase2[0] == '1';
   return !(value && value[0] == '0') && env_prefill_state_handoff_enabled() &&
          !engine.prompt_cache && !engine.mtp_enabled &&
-         engine.qwen4exp_partial_layer < 0 &&
+         (engine.qwen4exp_partial_layer < 0 || phase2_enabled) &&
          engine.qwen4exp_gpu_stage_layers.empty();
 }
 
@@ -6904,7 +6923,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   bool phase2_prefix_stopped = false;
   if (g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
       g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu ||
-      g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged) {
+      g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged ||
+      g.phase2_mode == FullGraph::Phase2Mode::SplitGpu ||
+      g.phase2_mode == FullGraph::Phase2Mode::SplitStaged ||
+      g.phase2_mode == FullGraph::Phase2Mode::Tail) {
     // Suffix graphs never read g.input at all -- they resume from the
     // prefix instance's own persistent device-resident handoff tensor
     // (the residual right after phase2_split_layer's attention,
@@ -6918,14 +6940,26 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // decode step, before either suffix graph is computed.
     if (!g_graph || !g_graph->phase2_handoff_buf || !g_graph->phase2_handoff_addr)
       return false;
+    ggml_backend_buffer_t handoff_buf =
+        g.phase2_mode == FullGraph::Phase2Mode::Tail
+            ? g_graph->phase2_ffn_handoff_buf
+            : g_graph->phase2_handoff_buf;
+    void *handoff_addr =
+        g.phase2_mode == FullGraph::Phase2Mode::Tail
+            ? g_graph->phase2_ffn_handoff_addr
+            : g_graph->phase2_handoff_addr;
+    if (!handoff_buf || !handoff_addr)
+      return false;
     res = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, g.D, g.HC, g.S);
-    ggml_backend_tensor_alloc(g_graph->phase2_handoff_buf, res,
-                              g_graph->phase2_handoff_addr);
+    ggml_backend_tensor_alloc(handoff_buf, res, handoff_addr);
     ggml_set_name(res, "qwen_full_phase2_handoff_in");
   }
   if (g.phase2_mode != FullGraph::Phase2Mode::SuffixGpu &&
       g.phase2_mode != FullGraph::Phase2Mode::SuffixCpu &&
       g.phase2_mode != FullGraph::Phase2Mode::SuffixStaged &&
+      g.phase2_mode != FullGraph::Phase2Mode::SplitGpu &&
+      g.phase2_mode != FullGraph::Phase2Mode::SplitStaged &&
+      g.phase2_mode != FullGraph::Phase2Mode::Tail &&
       graph_match_llama_cpp_topology(g)) {
     // The scheduler normally starts directly on the first GPU-weighted
     // operation because g.input is already a CPU buffer.  An explicit CPU
@@ -6970,19 +7004,25 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // g.kv_layers end up holding only this instance's own indices, which
     // the existing state-seed/extract code already iterates
     // instance-locally (no special-casing needed there).
-    if ((g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
-         g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu ||
-         g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged) &&
-        l < g.phase2_split_layer)
+    const bool phase2_tail_mode =
+        g.phase2_mode == FullGraph::Phase2Mode::Tail;
+    const bool phase2_split_child_mode =
+        g.phase2_mode == FullGraph::Phase2Mode::SplitGpu ||
+        g.phase2_mode == FullGraph::Phase2Mode::SplitStaged;
+    const bool phase2_suffix_mode =
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu ||
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged;
+    if ((phase2_tail_mode && l <= g.phase2_split_layer) ||
+        ((phase2_split_child_mode || phase2_suffix_mode) &&
+         l < g.phase2_split_layer))
       continue;
     // True only for the split layer, in a suffix instance: skip PLE/
     // attention entirely (the prefix graph already built and applied
     // them into the `res` this instance resumed from via the handoff
     // tensor) and fall straight through to the FFN section below.
     const bool phase2_suffix_skip_attn =
-        (g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
-         g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu ||
-         g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged) &&
+        (phase2_split_child_mode || phase2_suffix_mode) &&
         l == g.phase2_split_layer;
     const std::string p = "blk." + std::to_string(l) + ".";
     if (l == 1 && g.layer0_diag_enabled &&
@@ -7457,17 +7497,44 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         return false;
       g.phase2_handoff_addr =
           ggml_backend_buffer_get_base(g.phase2_handoff_buf);
+      g.phase2_ffn_handoff_buf = ggml_backend_buft_alloc_buffer(
+          cuda_buft,
+          static_cast<size_t>(g.D) * g.HC * g.S * sizeof(float));
+      if (!g.phase2_ffn_handoff_buf)
+        return false;
+      g.phase2_ffn_handoff_addr =
+          ggml_backend_buffer_get_base(g.phase2_ffn_handoff_buf);
       ggml_tensor *handoff_out =
           ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, g.D, g.HC, g.S);
-      ggml_backend_tensor_alloc(g.phase2_handoff_buf, handoff_out,
-                                g.phase2_handoff_addr);
+      const ggml_status handoff_status = ggml_backend_tensor_alloc(
+          g.phase2_handoff_buf, handoff_out, g.phase2_handoff_addr);
+      if (handoff_status != GGML_STATUS_SUCCESS ||
+          handoff_out->data != g.phase2_handoff_addr) {
+        LOG_ERROR("[GGML-QWEN-FULL-P2] handoff allocation failed status=%d "
+                  "buffer=%p tensor=%p expected=%p\n",
+                  static_cast<int>(handoff_status),
+                  static_cast<void *>(g.phase2_handoff_buf),
+                  handoff_out ? handoff_out->data : nullptr,
+                  g.phase2_handoff_addr);
+        return false;
+      }
+      LOG_INFO("[GGML-QWEN-FULL-P2] handoff bound addr=%p bytes=%zu\n",
+               g.phase2_handoff_addr, ggml_nbytes(handoff_out));
       ggml_set_name(handoff_out, "qwen_full_phase2_handoff_out");
+      g.phase2_handoff_output_tensor = handoff_out;
       ggml_tensor *handoff_cpy = ggml_cpy(g.ctx, res, handoff_out);
+      if (g.sched) {
+        ggml_backend_sched_set_tensor_backend(g.sched, handoff_out, g.cuda);
+        ggml_backend_sched_set_tensor_backend(g.sched, handoff_cpy, g.cuda);
+      }
       ggml_set_output(handoff_cpy);
       ggml_build_forward_expand(g.graph, handoff_cpy);
 
       g.final_streams = res;
-      g.output = nullptr;
+      // Keep the handoff as the graph's explicit output as well as marking
+      // the node. Some scheduler versions prune a terminal CPY with no
+      // consumer unless FullGraph::output retains the tensor handle.
+      g.output = handoff_cpy;
       g.logits = nullptr;
       g.moe_construction_ms_total += std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - t_moe_start).count();
@@ -7502,10 +7569,12 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // before ever choosing to submit this graph at all. Being asked to
     // build at all IS the decision for this instance.
     const bool phase2_suffix_gpu_here =
-        g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu &&
+        (g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
+         g.phase2_mode == FullGraph::Phase2Mode::SplitGpu) &&
         l == g.phase2_split_layer;
     const bool phase2_suffix_staged_here =
-        g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged &&
+        (g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged ||
+         g.phase2_mode == FullGraph::Phase2Mode::SplitStaged) &&
         l == g.phase2_split_layer;
     if (phase2_suffix_staged_here) {
       const std::string gname = p + "ffn_gate_exps.weight";
@@ -7722,6 +7791,37 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                                "qwen_layer0_split_ffn_output"));
     }
     res = hc_combine(g, g.ctx, res, moe, inject);
+    if ((g.phase2_mode == FullGraph::Phase2Mode::SplitGpu ||
+         g.phase2_mode == FullGraph::Phase2Mode::SplitStaged) &&
+        l == g.phase2_split_layer) {
+      FullGraph *source = g.phase2_ffn_source_graph;
+      if (!source || !source->phase2_ffn_handoff_buf ||
+          !source->phase2_ffn_handoff_addr)
+        return false;
+      ggml_tensor *handoff_out =
+          ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, g.D, g.HC, g.S);
+      if (!handoff_out ||
+          ggml_backend_tensor_alloc(source->phase2_ffn_handoff_buf,
+                                    handoff_out,
+                                    source->phase2_ffn_handoff_addr) !=
+              GGML_STATUS_SUCCESS)
+        return false;
+      ggml_set_name(handoff_out, "qwen_full_phase2_ffn_handoff_out");
+      ggml_tensor *handoff_cpy = ggml_cpy(g.ctx, res, handoff_out);
+      if (!handoff_cpy)
+        return false;
+      if (g.sched) {
+        ggml_backend_sched_set_tensor_backend(g.sched, handoff_out, g.cuda);
+        ggml_backend_sched_set_tensor_backend(g.sched, handoff_cpy, g.cuda);
+      }
+      ggml_set_output(handoff_cpy);
+      ggml_build_forward_expand(g.graph, handoff_cpy);
+      g.final_streams = res;
+      g.output = handoff_cpy;
+      g.logits = nullptr;
+      phase2_prefix_stopped = true;
+      break;
+    }
     if (g.two_layer_diag && l == 0)
       g.two_layer_l0_post_ffn = g.layer0_diag_enabled
                                     ? layer0_diag_snapshot(
@@ -8065,7 +8165,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     const bool borrowed_phase2_suffix =
         g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
         g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu ||
-        g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged;
+        g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged ||
+        g.phase2_mode == FullGraph::Phase2Mode::SplitGpu ||
+        g.phase2_mode == FullGraph::Phase2Mode::SplitStaged ||
+        g.phase2_mode == FullGraph::Phase2Mode::Tail;
     size_t kMinGraphAllocHeadroomBytes =
         borrowed_phase2_suffix ? 512ull * 1024ull * 1024ull
                                : 1ull * 1024ull * 1024ull * 1024ull;
@@ -8488,12 +8591,14 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine) {
       if (!sync_decode_state_to_host(*g_graph) ||
           (g_graph_p2_suffix_gpu &&
            !sync_decode_state_to_host(*g_graph_p2_suffix_gpu)) ||
-          (g_graph_p2_suffix_staged &&
-           !sync_decode_state_to_host(*g_graph_p2_suffix_staged)))
+           (g_graph_p2_suffix_staged &&
+            !sync_decode_state_to_host(*g_graph_p2_suffix_staged)) ||
+           (g_graph_p2_tail && !sync_decode_state_to_host(*g_graph_p2_tail)))
         return false;
       if (deferred_prefill)
         prefill_state->prefill_host_state_deferred = false;
       g_graph_p2_suffix_cpu.reset();
+      g_graph_p2_tail.reset();
       g_graph_p2_suffix_staged.reset();
       g_graph_p2_suffix_gpu.reset();
       g_graph.reset();
@@ -8528,6 +8633,7 @@ void qwen4exp_full_graph_shutdown() {
   // device_state_buffer (see FullGraph::phase2_state_source_graph), so
   // SuffixGpu must outlive SuffixCpu's teardown.
   g_graph_p2_suffix_cpu.reset();
+  g_graph_p2_tail.reset();
   g_graph_p2_suffix_staged.reset();
   g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
@@ -8754,6 +8860,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // otherwise a persistent multi-prompt run can leave suffix instances with
   // dangling ggml/CUDA buffer views during the next rebuild.
   g_graph_p2_suffix_cpu.reset();
+  g_graph_p2_tail.reset();
   g_graph_p2_suffix_staged.reset();
   g_graph_p2_suffix_gpu.reset();
   g_graph.reset();
@@ -9179,7 +9286,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                            g_graph_p2_suffix_cpu && g_graph_p2_suffix_cpu->ready;
   const bool completion_staged_live =
       !completion_staged_wanted ||
-      (g_graph_p2_suffix_staged && g_graph_p2_suffix_staged->ready);
+      (g_graph_p2_suffix_staged && g_graph_p2_suffix_staged->ready &&
+       g_graph_p2_tail && g_graph_p2_tail->ready);
 
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->decode_mode && g_graph->kv_capacity >= required &&
@@ -9192,13 +9300,16 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       // not just the prefix's. Both suffix candidates are refreshed
       // (only one will actually run this token) since it's cheap and
       // keeps whichever gets chosen already current.
-      FullGraph *targets[4] = {g_graph.get(),
+      FullGraph *targets[5] = {g_graph.get(),
                                phase2_live ? g_graph_p2_suffix_gpu.get()
                                            : nullptr,
                                phase2_live ? g_graph_p2_suffix_cpu.get()
                                             : nullptr,
                                (phase2_live && completion_staged_live)
                                    ? g_graph_p2_suffix_staged.get()
+                                   : nullptr,
+                               (phase2_live && completion_staged_live)
+                                   ? g_graph_p2_tail.get()
                                    : nullptr};
       for (FullGraph *t : targets) {
         if (!t || t->ple_layer < 0)
@@ -9243,6 +9354,12 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         !sync_decode_state_to_host(*g_graph_p2_suffix_staged)) {
       LOG_ERROR("[GGML-QWEN-FULL-DECODE-P2] refusing request: suffix_staged "
                 "state download failed while growing KV capacity\n");
+      return false;
+    }
+    if (g_graph_p2_tail && g_graph_p2_tail->ready &&
+        !sync_decode_state_to_host(*g_graph_p2_tail)) {
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE-P2] refusing request: tail state "
+                "download failed while growing KV capacity\n");
       return false;
     }
   }
@@ -9327,6 +9444,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // device_state_buffer (see FullGraph::phase2_state_source_graph) --
     // free it first, then the instance that actually owns that memory.
     g_graph_p2_suffix_cpu.reset();
+    g_graph_p2_tail.reset();
     g_graph_p2_suffix_staged.reset();
     g_graph_p2_suffix_gpu.reset();
     g_graph.reset();
@@ -9414,7 +9532,15 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     g->phase2_dense_source_graph = dense_source;
     g->phase2_expert_source_graph = expert_source;
     g->phase2_route_source_graph =
-        mode == FullGraph::Phase2Mode::SuffixStaged ? g_graph.get() : nullptr;
+        (mode == FullGraph::Phase2Mode::SuffixStaged ||
+         mode == FullGraph::Phase2Mode::SplitStaged)
+            ? g_graph.get()
+            : nullptr;
+    g->phase2_ffn_source_graph =
+        (mode == FullGraph::Phase2Mode::SplitGpu ||
+         mode == FullGraph::Phase2Mode::SplitStaged)
+            ? g_graph.get()
+            : nullptr;
     plan_expert_vram_split(*g); // must run before init_device_expert_arena
     g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
     g->cpu = ggml_backend_cpu_init();
@@ -9667,6 +9793,44 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       // the prefix's phase2_handoff_buf/addr for the res-seeding branch
       // (see build_graph's own comment on that lookup).
       g_graph = std::move(prefix);
+      if (completion_staged_wanted) {
+        auto split_gpu = build_one(FullGraph::Phase2Mode::SplitGpu,
+                                   engine.qwen4exp_partial_layer, nullptr,
+                                   g_graph.get(), g_graph.get());
+        auto split_staged =
+            split_gpu
+                ? build_one(FullGraph::Phase2Mode::SplitStaged,
+                            engine.qwen4exp_partial_layer, nullptr,
+                            g_graph.get(), g_graph.get())
+                : nullptr;
+        auto tail = split_gpu
+                        ? build_one(FullGraph::Phase2Mode::Tail,
+                                    engine.qwen4exp_partial_layer, nullptr,
+                                    g_graph.get(), g_graph.get())
+                        : nullptr;
+        auto suffix_cpu = build_one(FullGraph::Phase2Mode::SuffixCpu,
+                                    engine.qwen4exp_partial_layer, nullptr,
+                                    g_graph.get(), g_graph.get());
+        if (split_gpu && split_staged && tail && suffix_cpu) {
+          LOG_INFO("[GGML-QWEN-FULL-DECODE-P2] enabled staged split child: "
+                   "prefix/split_gpu/split_staged/tail/suffix_cpu, "
+                   "KV capacity=%d\n",
+                   g_graph->kv_capacity);
+          g_graph_p2_suffix_gpu = std::move(split_gpu);
+          g_graph_p2_suffix_staged = std::move(split_staged);
+          g_graph_p2_tail = std::move(tail);
+          g_graph_p2_suffix_cpu = std::move(suffix_cpu);
+          return true;
+        }
+        g_graph_p2_suffix_cpu.reset();
+        g_graph_p2_tail.reset();
+        g_graph_p2_suffix_staged.reset();
+        g_graph_p2_suffix_gpu.reset();
+        g_graph.reset();
+        LOG_ERROR("[GGML-QWEN-FULL-DECODE-P2] staged split child graph "
+                  "construction failed\n");
+        return false;
+      }
       auto suffix_gpu = build_one(FullGraph::Phase2Mode::SuffixGpu,
                                   engine.qwen4exp_partial_layer, nullptr,
                                   g_graph.get(), g_graph.get());
@@ -9698,6 +9862,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       }
       g_graph_p2_suffix_staged.reset();
       g_graph_p2_suffix_cpu.reset();
+      g_graph_p2_tail.reset();
       g_graph_p2_suffix_gpu.reset();
     }
     g_graph.reset();
@@ -10173,14 +10338,22 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
   *needs_staged = false;
   *needs_cpu = true;
   const char *enabled = std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED");
+  LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] enter enabled=%d staged_ids=%zu "
+           "include_prefix=%d\n",
+           enabled && enabled[0] == '1' ? 1 : 0,
+           engine.qwen4exp_partial_layer_staged_ids.size(),
+           include_prefix ? 1 : 0);
   if (!enabled || enabled[0] != '1' ||
-      engine.qwen4exp_partial_layer_staged_ids.empty())
+      engine.qwen4exp_partial_layer_staged_ids.empty()) {
+    LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] unavailable by flag/publication\n");
     return false;
+  }
   State &st = state();
   const int prefix_splits = ggml_backend_sched_get_n_splits(prefix.sched);
   const int resident_splits = ggml_backend_sched_get_n_splits(resident.sched);
   const int staged_splits = ggml_backend_sched_get_n_splits(staged.sched);
-  if (prefix_splits != 1 || resident_splits != 1 || staged_splits != 1) {
+  if ((include_prefix && prefix_splits != 1) || resident_splits != 1 ||
+      staged_splits != 1) {
     LOG_WARN("[QWEN4EXP-MASTER-GRAPH-3WAY] disabled: conditional children "
              "must be single CUDA graphs (splits=%d/%d/%d); staged graph "
              "may not contain a host callback\n",
@@ -10190,8 +10363,10 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
   const auto &c = engine.model_file.architecture_config;
   cudaStream_t stream = moestream_ggml_backend_cuda_get_stream(prefix.cuda);
   if (!stream || !ensure_hot_bitmap(engine, c.n_experts, stream) ||
-      !ensure_staged_bitmap(engine, c.n_experts, stream))
+      !ensure_staged_bitmap(engine, c.n_experts, stream)) {
+    LOG_WARN("[QWEN4EXP-MASTER-GRAPH-3WAY] bitmap/stream preparation failed\n");
     return false;
+  }
   for (int id : engine.qwen4exp_partial_layer_staged_ids)
     if (std::find(engine.qwen4exp_partial_layer_gpu_ids.begin(),
                   engine.qwen4exp_partial_layer_gpu_ids.end(), id) !=
@@ -10207,8 +10382,14 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
       resident.cuda, ggml_graph_node(resident.graph, 0));
   cudaGraph_t staged_handle = moestream_ggml_cuda_get_captured_graph(
       staged.cuda, ggml_graph_node(staged.graph, 0));
-  if (!prefix_handle || !resident_handle || !staged_handle)
+  if ((include_prefix && !prefix_handle) || !resident_handle ||
+      !staged_handle) {
+    LOG_WARN("[QWEN4EXP-MASTER-GRAPH-3WAY] captured child unavailable "
+             "prefix=%p resident=%p staged=%p\n",
+             (void *)prefix_handle, (void *)resident_handle,
+             (void *)staged_handle);
     return false;
+  }
   const cudaGraph_t completion_handle =
       engine.qwen4exp_completion_graph
           ? engine.qwen4exp_completion_graph->captured_graph()
@@ -10400,37 +10581,74 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
   FullGraph &sgpu = *g_graph_p2_suffix_gpu;
   FullGraph &scpu = *g_graph_p2_suffix_cpu;
   FullGraph *sstaged = g_graph_p2_suffix_staged.get();
+  FullGraph *tail = g_graph_p2_tail.get();
+  const bool split_child_mode =
+      sgpu.phase2_mode == FullGraph::Phase2Mode::SplitGpu;
+  if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG"))
+    LOG_INFO("[QWEN4EXP-P2-ENTRY] pos=%d split_child=%d prefix_ready=%d "
+             "split_ready=%d cpu_ready=%d staged_ready=%d tail_ready=%d\n",
+             pos_base, split_child_mode ? 1 : 0, prefix.ready ? 1 : 0,
+             sgpu.ready ? 1 : 0, scpu.ready ? 1 : 0,
+             sstaged && sstaged->ready ? 1 : 0,
+             tail && tail->ready ? 1 : 0);
   if (pos_base >= sgpu.kv_capacity || pos_base >= scpu.kv_capacity ||
-      !prefix.input || !prefix.partial_layer_ids_out)
+      !prefix.input || !prefix.partial_layer_ids_out) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] invalid prefix/suffix capacity or input\n");
     return false;
+  }
   if (sstaged && pos_base >= sstaged->kv_capacity)
     return false;
+  if (split_child_mode && (!tail || pos_base >= tail->kv_capacity))
+    return false;
   if (engine.hc_stream_buf.size() <
-      static_cast<size_t>(prefix.D) * prefix.HC)
+      static_cast<size_t>(prefix.D) * prefix.HC) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] hc input buffer too small\n");
     return false;
-  if (has_ple_layer(engine.model_file.architecture_config) && !token_ids)
+  }
+  if (has_ple_layer(engine.model_file.architecture_config) && !token_ids) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] PLE token IDs missing\n");
     return false;
-  if (logits && (!sgpu.logits || !scpu.logits ||
+  }
+  if (logits && !split_child_mode &&
+      (!sgpu.logits || !scpu.logits ||
                 ggml_nelements(sgpu.logits) < vocab ||
-                ggml_nelements(scpu.logits) < vocab))
+                ggml_nelements(scpu.logits) < vocab)) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] logits output unavailable\n");
     return false;
-  if (logits && sstaged &&
-      (!sstaged->logits || ggml_nelements(sstaged->logits) < vocab))
+  }
+  if (logits && !split_child_mode && sstaged &&
+      (!sstaged->logits || ggml_nelements(sstaged->logits) < vocab)) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] staged logits output unavailable\n");
     return false;
+  }
+  if (logits && split_child_mode &&
+      (!tail->logits || ggml_nelements(tail->logits) < vocab)) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] tail logits output unavailable tail=%p "
+              "logits=%p vocab=%d\n",
+              static_cast<void *>(tail), static_cast<void *>(tail->logits),
+              vocab);
+    return false;
+  }
 
   std::memcpy(prefix.input->data, engine.hc_stream_buf.data(),
               static_cast<size_t>(prefix.D) * prefix.HC * sizeof(float));
-  if (!phase2_feed_common_inputs(prefix, pos_base) ||
-      !phase2_feed_common_inputs(sgpu, pos_base) ||
-      !phase2_feed_common_inputs(scpu, pos_base) ||
-      (sstaged && !phase2_feed_common_inputs(*sstaged, pos_base)))
+  const bool common_inputs_ok =
+      phase2_feed_common_inputs(prefix, pos_base) &&
+      phase2_feed_common_inputs(sgpu, pos_base) &&
+      phase2_feed_common_inputs(scpu, pos_base) &&
+      (!sstaged || phase2_feed_common_inputs(*sstaged, pos_base)) &&
+      (!split_child_mode || phase2_feed_common_inputs(*tail, pos_base));
+  if (!common_inputs_ok) {
+    LOG_ERROR("[QWEN4EXP-P2-GUARD] common input feed failed\n");
     return false;
+  }
 
   // Per-layer/per-op CPU timing (env: MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING=1),
   // mirroring qwen4exp_full_graph_decode_run's own reset -- each of the
   // (up to) two graphs submitted this token needs its own reset, since
   // each has its own independent eval-callback state.
-  for (FullGraph *g : {&prefix, &sgpu, &scpu, sstaged}) {
+  for (FullGraph *g : {&prefix, &sgpu, &scpu, sstaged,
+                       split_child_mode ? tail : nullptr}) {
     if (!g)
       continue;
     if (g->layer_timing_enabled) {
@@ -10461,9 +10679,13 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
   auto run_timed_replay = [](FullGraph &graph, double &submit_ms,
                              double &sync_ms, double &total_ms) {
     const auto replay_start = std::chrono::steady_clock::now();
-    if (ggml_backend_sched_graph_compute_async(graph.sched, graph.graph) !=
-        GGML_STATUS_SUCCESS)
+    const ggml_status status =
+        ggml_backend_sched_graph_compute_async(graph.sched, graph.graph);
+    if (status != GGML_STATUS_SUCCESS) {
+      LOG_ERROR("[QWEN4EXP-P2-REPLAY] scheduler compute failed status=%d\n",
+                static_cast<int>(status));
       return false;
+    }
     const auto replay_submit_end = std::chrono::steady_clock::now();
     ggml_backend_sched_synchronize(graph.sched);
     const auto replay_end = std::chrono::steady_clock::now();
@@ -10483,6 +10705,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
   bool used_master_graph = false;
   bool needs_scpu_fallback = true;
   bool handled_completion_staged = false;
+  bool selected_staged_child = false;
 
   // The payload-backed tier must run the prefix once before it knows which
   // experts to request. It then submits one generation-tagged storage
@@ -10492,11 +10715,66 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED")) {
     const auto phase_start = std::chrono::steady_clock::now();
     if (!run_timed_replay(prefix, prefix_replay_submit_ms,
-                          prefix_replay_sync_ms, prefix_submit_ms))
+                          prefix_replay_sync_ms, prefix_submit_ms)) {
+      LOG_ERROR("[QWEN4EXP-STAGED-DISPATCH] prefix replay failed\n");
       return false;
+    }
     prefix_submit_ms = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - phase_start)
                            .count();
+    if (split_child_mode && prefix.final_streams &&
+        prefix.phase2_handoff_addr) {
+      cudaStream_t prefix_stream =
+          moestream_ggml_backend_cuda_get_stream(prefix.cuda);
+      const size_t handoff_bytes =
+          static_cast<size_t>(prefix.D) * prefix.HC * sizeof(float);
+      if (!prefix_stream ||
+          cudaMemcpyAsync(prefix.phase2_handoff_addr,
+                          prefix.final_streams->data, handoff_bytes,
+                          cudaMemcpyDeviceToDevice, prefix_stream) !=
+              cudaSuccess ||
+          cudaStreamSynchronize(prefix_stream) != cudaSuccess) {
+        LOG_ERROR("[QWEN4EXP-P2] explicit prefix handoff copy failed\n");
+        return false;
+      }
+    }
+    if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG")) {
+      const size_t debug_n = static_cast<size_t>(prefix.D) * prefix.HC;
+      std::vector<float> debug_prefix(debug_n);
+      const cudaError_t debug_copy = cudaMemcpy(
+          debug_prefix.data(), prefix.phase2_handoff_addr,
+          debug_n * sizeof(float), cudaMemcpyDeviceToHost);
+      size_t nonfinite = 0;
+      for (float value : debug_prefix)
+        if (!std::isfinite(value))
+          ++nonfinite;
+      LOG_INFO("[QWEN4EXP-STAGED-DEBUG] post-prefix handoff copy=%s "
+               "nonfinite=%zu/%zu\n",
+               cudaGetErrorString(debug_copy), nonfinite, debug_n);
+      if (prefix.final_streams) {
+        std::vector<float> debug_final(debug_n);
+        ggml_backend_tensor_get(prefix.final_streams, debug_final.data(), 0,
+                                debug_n * sizeof(float));
+        size_t final_nonfinite = 0;
+        for (float value : debug_final)
+          if (!std::isfinite(value))
+            ++final_nonfinite;
+        LOG_INFO("[QWEN4EXP-STAGED-DEBUG] prefix final_streams nonfinite=%zu/%zu\n",
+                 final_nonfinite, debug_n);
+      }
+      if (prefix.phase2_handoff_output_tensor) {
+        std::vector<float> debug_tensor(debug_n);
+        ggml_backend_tensor_get(prefix.phase2_handoff_output_tensor,
+                                debug_tensor.data(), 0,
+                                debug_n * sizeof(float));
+        size_t tensor_nonfinite = 0;
+        for (float value : debug_tensor)
+          if (!std::isfinite(value))
+            ++tensor_nonfinite;
+        LOG_INFO("[QWEN4EXP-STAGED-DEBUG] handoff tensor nonfinite=%zu/%zu\n",
+                 tensor_nonfinite, debug_n);
+      }
+    }
     const auto &c = engine.model_file.architecture_config;
     std::vector<int32_t> ids_host(static_cast<size_t>(c.topk));
     ggml_backend_tensor_get(prefix.partial_layer_ids_out, ids_host.data(), 0,
@@ -10511,15 +10789,26 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
         break;
       }
     }
+    LOG_INFO("[QWEN4EXP-STAGED-DISPATCH] pos=%d all_resident=%d topk=%d "
+             "resident_set=%zu\n",
+             pos_base, all_resident ? 1 : 0, c.topk,
+             engine.qwen4exp_partial_layer_gpu_ids.size());
     if (all_resident) {
       const auto suffix_start = std::chrono::steady_clock::now();
       if (!run_timed_replay(sgpu, suffix_replay_submit_ms,
                             suffix_replay_sync_ms, suffix_submit_ms))
         return false;
+      if (split_child_mode) {
+        if (!run_timed_replay(*tail, suffix_replay_submit_ms,
+                              suffix_replay_sync_ms, suffix_submit_ms))
+          return false;
+        chosen = tail;
+      } else {
+        chosen = &sgpu;
+      }
       suffix_submit_ms = std::chrono::duration<double, std::milli>(
                              std::chrono::steady_clock::now() - suffix_start)
                              .count();
-      chosen = &sgpu;
       handled_completion_staged = true;
     } else if (engine.qwen4exp_storage_service) {
       const bool adaptive_policy = env_adaptive_completion_policy_enabled();
@@ -10588,6 +10877,12 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
           completion_seen &&
           engine.publish_qwen4exp_staged_completion(
               completion, engine.qwen4exp_storage_model_generation);
+      LOG_INFO("[QWEN4EXP-STAGED-DISPATCH] completion_seen=%d state=%d "
+               "experts=%zu bytes=%zu published=%d\n",
+               completion_seen ? 1 : 0, static_cast<int>(completion.state),
+               completion.experts.size(),
+               completion.payload ? completion.payload->bytes.size() : 0,
+               staged_ready ? 1 : 0);
       if (staged_ready && engine.qwen4exp_completion_graph) {
         staged_ready =
             engine.qwen4exp_completion_graph->submit(
@@ -10656,6 +10951,23 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       if (handled_completion_staged)
         goto completion_staged_done;
       if (staged_ready) {
+        // GGML publishes a captured child handle after a graph's first
+        // replay. Warm the split-only children once before harvesting their
+        // handles for the parent conditional graph. These graphs have no KV
+        // or recurrent state; they only refresh the temporary FFN handoff,
+        // which the conditional replay overwrites with the selected branch.
+        if (split_child_mode) {
+          if (!run_timed_replay(sgpu, suffix_replay_submit_ms,
+                                suffix_replay_sync_ms, suffix_submit_ms))
+            return false;
+          if (engine.qwen4exp_completion_graph &&
+              !engine.qwen4exp_completion_graph->wait_on(
+                  moestream_ggml_backend_cuda_get_stream(sstaged->cuda)))
+            return false;
+          if (!run_timed_replay(*sstaged, suffix_replay_submit_ms,
+                                suffix_replay_sync_ms, suffix_submit_ms))
+            return false;
+        }
         bool needs_staged = false;
         bool needs_cpu = true;
         const auto continuation_start = std::chrono::steady_clock::now();
@@ -10666,7 +10978,39 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
         if (qwen4exp_master_graph::try_launch_three_way(
                 engine, prefix, sgpu, *sstaged, &needs_staged, &needs_cpu,
                 /*include_prefix=*/false)) {
-          chosen = needs_staged ? sstaged : (needs_cpu ? &scpu : &sgpu);
+          if (!needs_cpu && split_child_mode) {
+            if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG")) {
+              const size_t debug_n = static_cast<size_t>(prefix.D) * prefix.HC;
+              std::vector<float> debug_handoff(debug_n);
+              const cudaError_t debug_copy = cudaMemcpy(
+                  debug_handoff.data(), prefix.phase2_ffn_handoff_addr,
+                  debug_n * sizeof(float), cudaMemcpyDeviceToHost);
+              size_t nonfinite = 0;
+              for (float value : debug_handoff)
+                if (!std::isfinite(value))
+                  ++nonfinite;
+              LOG_INFO("[QWEN4EXP-STAGED-DEBUG] post-child handoff copy=%s "
+                       "nonfinite=%zu/%zu\n",
+                       cudaGetErrorString(debug_copy), nonfinite, debug_n);
+              const auto &binding = sstaged->completion_payload_binding;
+              unsigned char debug_bytes[16] = {};
+              const cudaError_t payload_copy = cudaMemcpy(
+                  debug_bytes, binding.gate, sizeof(debug_bytes),
+                  cudaMemcpyDeviceToHost);
+              LOG_INFO("[QWEN4EXP-STAGED-DEBUG] staged gate copy=%s "
+                       "bytes=%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       cudaGetErrorString(payload_copy), debug_bytes[0],
+                       debug_bytes[1], debug_bytes[2], debug_bytes[3],
+                       debug_bytes[4], debug_bytes[5], debug_bytes[6],
+                       debug_bytes[7]);
+            }
+            if (!run_timed_replay(*tail, suffix_replay_submit_ms,
+                                  suffix_replay_sync_ms, suffix_submit_ms))
+              return false;
+            chosen = tail;
+          } else {
+            chosen = needs_staged ? sstaged : (needs_cpu ? &scpu : &sgpu);
+          }
           used_master_graph = true;
           needs_scpu_fallback = needs_cpu;
           suffix_submit_ms = std::chrono::duration<double, std::milli>(
@@ -10693,6 +11037,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
             engine.qwen4exp_partial_layer_staged_ids.clear();
             engine.qwen4exp_partial_layer_staged_generation = 0;
           }
+          selected_staged_child = needs_staged;
           handled_completion_staged = true;
         }
       }
@@ -10810,7 +11155,8 @@ completion_staged_done:
                          std::chrono::steady_clock::now() - start)
                          .count();
   const char *dispatch_label =
-      chosen == &sgpu ? "resident-gpu"
+      selected_staged_child ? "staged-gpu"
+      : chosen == &sgpu ? "resident-gpu"
       : chosen == sstaged ? "staged-gpu"
                           : "cpu";
   LOG_INFO("[GGML-QWEN-FULL-DECODE-P2-TIME] pos=%d dispatch=%s total=%.3f "
