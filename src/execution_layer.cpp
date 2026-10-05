@@ -1214,19 +1214,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     }
     bool attn_device_consumed = false;
     if (engine.qwen4exp_device_attn_output_ready) {
-      if (engine.qwen4exp_device_attn_output_raw) {
-        attn_device_consumed = qwen4exp_hc_post_combine_device_raw(
-            engine, l, /*sub_block=*/0, S, D,
-            engine.qwen4exp_device_attn_output);
-        if (!attn_device_consumed && engine.gpu &&
-            !engine.gpu->qwen4exp_attn_gpu_copy_device_output(
-                engine.qwen4exp_device_attn_output, scratch.attn_out.data(),
-                (size_t)S * D * sizeof(float))) {
-          LOG_ERROR("[QWEN4EXP-ATTN] failed to recover raw device attention "
-                    "output at layer=%d\n",
-                    l);
-        }
-      } else {
+      {
         attn_device_consumed =
             qwen4exp_hc_post_combine_device(engine, l, /*sub_block=*/0, S, D,
                                             engine.qwen4exp_device_attn_output,

@@ -316,25 +316,11 @@ struct EngineConfig {
   // families and provide a clean A/B.
   bool glm5next_dense_prefill_fusion = false;
 
-  // qwen4exp_attn_gpu: move the 12 dense full-attention layers' causal GQA
-  // softmax(Q*K^T)*V off the CPU and onto the GPU (two cuBLAS strided-batched
-  // GEMMs + one softmax kernel, CudaManager::qwen4exp_attn_gpu_host).
-  // MEASURED 2026-09-04: on a 3511-token qwen4exp prefill the dense-attention
-  // half costs 46-50s of a ~300s prefill, against 0.35s for ALL routed-expert
-  // GPU compute -- the dominant remaining prefill cost once
-  // moe_prefill_batched landed. Qwen4Exp only (the flag is read in
-  // qwen4exp_full_attention_gguf); no effect on GLM/DeepSeek, whose MLA score
-  // path is attn_score_gpu above. Falls back to the byte-identical CPU loop on
-  // any allocation or cuBLAS failure. Default off pending real-hardware
-  // verification of generated text.
+  // qwen4exp_attn_gpu / qwen4exp_gdn_gpu: DEPRECATED NO-OPS. The layered
+  // dense-attention and chunkwise-GDN CUDA paths were removed (Qwen4Exp runs
+  // as a ggml full graph; kernels are in obsolete/cuda). The keys are still
+  // parsed so existing configs load; the values are ignored.
   bool qwen4exp_attn_gpu = false;
-
-  // qwen4exp_gdn_gpu: chunkwise-parallel gated delta rule on the GPU for the
-  // 36 GDN (recurrent) layers -- the single largest remaining prefill bucket
-  // (82.8s of a 263.8s prefill, 31%, once qwen4exp_attn_gpu landed).
-  // Prefill only (S>1); decode stays on the sequential recurrence, mirroring
-  // llama.cpp, which dispatches build_delta_net_autoregressive only at
-  // n_tokens==1. Falls back to the CPU path on any failure.
   bool qwen4exp_gdn_gpu = false;
 
   // qwen4exp_gdn_conv_gpu: GDN's causal short conv + SiLU on the GPU
@@ -346,8 +332,7 @@ struct EngineConfig {
   // dependency beyond the kernel width, so it's embarrassingly parallel
   // across (token, channel) -- a clean fit for GPU HBM bandwidth instead.
   // Falls back to the byte-identical CPU path on any allocation/H2D/D2H
-  // failure. Independent of qwen4exp_gdn_gpu (that flag covers the
-  // recurrent delta-rule step only, not this conv step).
+  // failure. Also used by the GLM5Next KDA path.
   bool qwen4exp_gdn_conv_gpu = false;
 
   // Qwen4Exp-only router pilot. The pilot projects the current layer's

@@ -608,8 +608,6 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.attn_qabsorb_gpu = config.attn_qabsorb_gpu;
   engine.attn_qabsorb_gpu_max_vram_gb = config.attn_qabsorb_gpu_max_vram_gb;
   engine.attn_score_gpu = config.attn_score_gpu;
-  engine.qwen4exp_attn_gpu = config.qwen4exp_attn_gpu;
-  engine.qwen4exp_gdn_gpu = config.qwen4exp_gdn_gpu;
   engine.qwen4exp_gdn_conv_gpu = config.qwen4exp_gdn_conv_gpu;
   engine.qwen4exp_router_pilot = config.qwen4exp_router_pilot;
   engine.qwen4exp_router_pilot_k = config.qwen4exp_router_pilot_k;

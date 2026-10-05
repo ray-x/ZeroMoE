@@ -807,9 +807,6 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         !force_hc_gdn_pre_host();
     const bool dual_gdn_pre_output =
         device_gdn_input && dual_hc_gdn_pre_output();
-    const bool device_full_attn_input =
-        engine.qwen4exp_attn_gpu && sub_block == 0 && S > 0 &&
-        !qwen4exp_is_gdn_layer(c, layer_idx);
     // Keep the Qwen decode MoE input on the device independently of where
     // routing is performed.  The host-router A/B path still needs a host
     // copy of the mixed [D] row for the AVX-512 projection, but the grouped
@@ -827,7 +824,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
         moe_ggml_mul_mat_id() && sub_block == 1 &&
         layer_idx >= c.first_dense && (S > 1 || decode_device_moe_input);
     const bool need_device_input =
-        device_gdn_input || device_full_attn_input || device_moe_input;
+        device_gdn_input || device_moe_input;
     const bool qwen_decode_gpu_layer =
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         engine.family_ops.uses_hyper_connections &&
@@ -848,7 +845,6 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
                                          dual_gdn_pre_output
                                              ? hidden_states
                                              : ((device_gdn_input ||
-                                                 device_full_attn_input ||
                                                  keep_moe_input_on_device)
                                          ? nullptr
                                          : hidden_states),
@@ -905,8 +901,6 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
       const void *mixed_tensor =
           GgmlHcRunner::instance().device_mixed_tensor();
       if (device_gdn_input)
-        engine.qwen4exp_device_hc_input = mixed_tensor;
-      if (device_full_attn_input)
         engine.qwen4exp_device_hc_input = mixed_tensor;
       if (device_moe_input)
         engine.qwen4exp_device_hc_ffn_input = mixed_tensor;

@@ -948,11 +948,6 @@ public:
     // so it's structurally cheaper there than GLM-5.2's unbounded version
     // this GPU path targets.
     bool attn_score_gpu = false;
-    // Set from EngineConfig::qwen4exp_attn_gpu -- read by
-    // qwen4exp_full_attention_gguf's dense-attention step.
-    bool qwen4exp_attn_gpu = false;
-    // Set from EngineConfig::qwen4exp_gdn_gpu.
-    bool qwen4exp_gdn_gpu = false;
     // Set from EngineConfig::qwen4exp_gdn_conv_gpu.
     bool qwen4exp_gdn_conv_gpu = false;
     // Set from EngineConfig::qwen4exp_router_pilot. Qwen-only HC stream-0

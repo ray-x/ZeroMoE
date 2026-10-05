@@ -131,18 +131,6 @@ static bool score_prefill_legacy_forced() {
   return forced;
 }
 
-// A/B control for the Qwen4Exp prefill QKV device path.  The default is ON;
-// setting MOESTREAM_QWEN4EXP_DEVICE_QKV=0 restores the previous projection ->
-// host norm/RoPE -> attention-upload path in the same binary, so performance
-// and routing differences can be separated without rebuilding another code
-// path.
-static bool qwen4exp_device_qkv_enabled() {
-  static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_QWEN4EXP_DEVICE_QKV");
-    return !(v && v[0] == '0');
-  }();
-  return enabled;
-}
 
 // Diagnostic A/B only.  The normal Qwen4Exp prefill path keeps HC -> GDN on
 // the CUDA backend.  This switch recovers the HC result and uses the existing
@@ -1955,8 +1943,7 @@ static std::vector<std::vector<float>> g_qwen4exp_conv_w_cache;
 static void qwen4exp_gdn_delta_rule(const float *Q, const float *K,
                                     const float *V, const float *beta,
                                     const float *g_log, float *state,
-                                    float *out, int S, int H_k, int H_v, int hd,
-                                    CudaManager *gpu, bool gdn_gpu) {
+                                    float *out, int S, int H_k, int H_v, int hd) {
   // Heads are fully independent (own state region) -- one OMP team per
   // call, real work per head (hd*hd state), matching this project's "one
   // spawn per real workload" discipline.
@@ -1982,13 +1969,6 @@ static void qwen4exp_gdn_delta_rule(const float *Q, const float *K,
   // sequential (the state carries) but all H_v heads and hd columns run in
   // parallel, which the CPU form cannot do. Prefill only, matching
   // llama.cpp's own n_tokens==1 dispatch rule for the sequential variant.
-  if (gdn_gpu && gpu && S > 1) {
-    if (gpu->qwen4exp_gdn_gpu_host(Q, K, V, beta, g_log, state, out, S, H_k,
-                                   H_v, hd, kGdnChunk))
-      return;
-    perf().n_qwen4exp_gdn_gpu_fallback_cpu.fetch_add(1,
-                                                     std::memory_order_relaxed);
-  }
 
 #pragma omp parallel for schedule(static)
   for (int h = 0; h < H_v; ++h) {
@@ -2507,7 +2487,7 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
   float *const core_out = gdn_grow(gdn_core_b, (size_t)S * value_dim);
   PERF_START(gdndelta);
   qwen4exp_gdn_delta_rule(Q, K, V, beta, g_log, state.data(), core_out, S, H_k,
-                          H_v, hd, engine.gpu, engine.qwen4exp_gdn_gpu);
+                          H_v, hd);
   PERF_END(gdndelta, t_gdn_delta);
   check_finite_attn("GDN core_out (post delta rule, pre gate/norm)", layer_idx,
                     core_out, (size_t)S * value_dim);
@@ -2611,43 +2591,8 @@ void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
   if (engine.qwen4exp_device_hc_input)
     device_hidden =
         GgmlHcRunner::instance().device_data(engine.qwen4exp_device_hc_input);
-  const void *device_Q = nullptr, *device_gate = nullptr;
-  const void *device_K = nullptr, *device_V = nullptr;
-  bool device_qkv = false;
-  // The Qwen4Exp checkpoint uses plain interleaved RoPE.  Keep the
-  // established host path for a future YaRN variant until its exact
-  // mscale/correction-ramp parameters are represented by the CUDA kernel.
-  const bool plain_rope =
-      c.rope_ext_factor == 0.0f && c.rope_freq_scale == 1.0f &&
-      c.rope_attn_factor == 1.0f && c.rope_yarn_log_mul == 0.0f;
-  if (qwen4exp_device_qkv_enabled() && engine.qwen4exp_attn_gpu &&
-      device_hidden && engine.gpu && S > 0 && plain_rope) {
-    auto q_it = engine.resident_layers.find(p + "attn_q.weight");
-    auto k_it = engine.resident_layers.find(p + "attn_k.weight");
-    auto v_it = engine.resident_layers.find(p + "attn_v.weight");
-    if (q_it != engine.resident_layers.end() &&
-        k_it != engine.resident_layers.end() &&
-        v_it != engine.resident_layers.end() && q_it->second.device_ptr &&
-        k_it->second.device_ptr && v_it->second.device_ptr) {
-      device_qkv = engine.gpu->qwen4exp_prepare_qkv_device(
-          q_it->second.meta.type, q_it->second.device_ptr,
-          k_it->second.meta.type, k_it->second.device_ptr,
-          v_it->second.meta.type, v_it->second.device_ptr,
-          (const float *)device_hidden, qn_w.data(), kn_w.data(), S, D, H, Hkv,
-          hd, n_rot, pos_base, rope_theta, c.eps, &device_Q, &device_gate,
-          &device_K, &device_V);
-      if (device_qkv) {
-        static bool logged_device_qkv = false;
-        if (!logged_device_qkv) {
-          logged_device_qkv = true;
-          LOG_INFO("[QWEN4EXP-ATTN] prefill Q/K/V projection, "
-                   "QK norm, and RoPE stay on CUDA\n");
-        }
-      }
-    }
-  }
   bool direct_qkv = false;
-  if (!device_qkv && device_hidden && engine.gpu && S > 1) {
+  if (device_hidden && engine.gpu && S > 1) {
     auto device_projection = [&](const std::string &name, float *out,
                                  int O) -> bool {
       auto it = engine.resident_layers.find(name);
@@ -2669,7 +2614,7 @@ void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
       }
     }
   }
-  if (!device_qkv && !direct_qkv) {
+  if (!direct_qkv) {
     // A partial device projection attempt may have failed after HC kept
     // its result off-host. Recover the authoritative activation before
     // using the established host dense_proj fallback.
@@ -2691,7 +2636,7 @@ void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
   // (qwen4exp.cpp's ggml_view_3d calls on Qcur_full).  The CUDA QKV path
   // already performed this split and the following normalization/RoPE.
   std::vector<float> Q((size_t)S * H * hd), gate((size_t)S * H * hd);
-  if (!device_qkv) {
+  {
     for (int s = 0; s < S; ++s)
       for (int h = 0; h < H; ++h) {
         const float *row = q_full.data() + ((size_t)s * H + h) * 2 * hd;
@@ -2726,7 +2671,7 @@ void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
 
   // ---- 3. write K/V into the dense cache ----
   const int kvd = Hkv * hd;
-  if (!device_qkv) {
+  {
     for (int s = 0; s < S; ++s) {
       int pos = pos_base + s;
       if (pos >= engine.max_t)
@@ -2744,127 +2689,7 @@ void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
   const float kq_scale = 1.0f / std::sqrt((float)hd);
   std::vector<float> head_contexts((size_t)S * H * hd, 0.0f);
 
-  // GPU fast path (EngineConfig::qwen4exp_attn_gpu): two cuBLAS strided-
-  // batched GEMMs + one softmax kernel replace the per-(token,head) CPU loop
-  // below. T is the real context length -- every query in this batch may
-  // attend up to its own absolute position, and the kernel applies that
-  // causal bound per row, so the largest key index any of them reaches is
-  // pos_base+S-1 (clamped to the cache bound, exactly as the CPU loop's own
-  // `context_len` clamp does).
-  bool attn_done_gpu = false;
-  const void *attn_device_output = nullptr;
-  if (engine.qwen4exp_attn_gpu && engine.gpu && S > 0) {
-    int T = pos_base + S;
-    if (T > engine.max_t)
-      T = engine.max_t;
-    if (T > 0) {
-      // With device-live HC, retain the result in the CUDA attention
-      // buffer so HC post-combine can consume it without a D2H copy.
-      if (device_qkv) {
-        attn_done_gpu = engine.gpu->qwen4exp_attn_gpu_device_cached(
-            layer_idx, device_Q, device_K, device_V, S, T, H, Hkv, hd, pos_base,
-            engine.max_t, kq_scale, &attn_device_output);
-      } else if (qwen4exp_hc_device_live()) {
-        attn_done_gpu = engine.gpu->qwen4exp_attn_gpu_device(
-            Q.data(), engine.Kc[layer_idx], engine.Vc[layer_idx], S, T, H, Hkv,
-            hd, pos_base, kq_scale, &attn_device_output);
-      } else {
-        attn_done_gpu = engine.gpu->qwen4exp_attn_gpu_host(
-            Q.data(), engine.Kc[layer_idx], engine.Vc[layer_idx],
-            head_contexts.data(), S, T, H, Hkv, hd, pos_base, kq_scale);
-      }
-      if (!attn_done_gpu)
-        perf().n_qwen4exp_attn_gpu_fallback_cpu.fetch_add(
-            1, std::memory_order_relaxed);
-    }
-  }
-
-  if (attn_done_gpu && attn_device_output) {
-    // The raw score*V result is not yet the Qwen attention output: it
-    // still needs the sigmoid gate and attn_output projection. Keep both
-    // operations on CUDA before publishing the final [S,D] buffer to HC.
-    auto out_it = engine.resident_layers.find(p + "attn_output.weight");
-    const void *projected = nullptr;
-    bool post_ok =
-        out_it != engine.resident_layers.end() && out_it->second.device_ptr &&
-        (device_qkv
-             ? engine.gpu->qwen4exp_attn_gpu_post_device_gate(
-                   attn_device_output, device_gate, out_it->second.meta.type,
-                   out_it->second.device_ptr, S, H, hd, D, &projected)
-             : engine.gpu->qwen4exp_attn_gpu_post_device(
-                   attn_device_output, gate.data(), out_it->second.meta.type,
-                   out_it->second.device_ptr, S, H, hd, D, &projected));
-    if (post_ok) {
-      attn_device_output = projected;
-      engine.qwen4exp_device_attn_output = projected;
-      engine.qwen4exp_device_attn_output_ready = true;
-      engine.qwen4exp_device_attn_output_raw = true;
-      static bool logged_device_handoff = false;
-      if (!logged_device_handoff) {
-        logged_device_handoff = true;
-        LOG_INFO("[QWEN4EXP-ATTN] full-attention output stays on CUDA "
-                 "through sigmoid/output projection and HC handoff\n");
-      }
-    } else {
-      // Recover the un-gated score*V context and let the existing host
-      // gate + dense projection path finish this layer. The device
-      // post helper preserves the raw buffer specifically so this
-      // fallback remains numerically correct.
-      if (!engine.gpu->qwen4exp_attn_gpu_copy_device_output(
-              attn_device_output, head_contexts.data(),
-              (size_t)S * H * hd * sizeof(float))) {
-        attn_done_gpu = false;
-      }
-      attn_device_output = nullptr;
-      if (device_qkv) {
-        const size_t q_bytes = (size_t)S * H * hd * sizeof(float);
-        if (cudaMemcpy(Q.data(), device_Q, q_bytes, cudaMemcpyDeviceToHost) !=
-                cudaSuccess ||
-            cudaMemcpy(gate.data(), device_gate, q_bytes,
-                       cudaMemcpyDeviceToHost) != cudaSuccess)
-          attn_done_gpu = false;
-      }
-      attn_done_gpu = false;
-    }
-  }
-
-  if (!attn_done_gpu) {
-    if (device_qkv) {
-      int host_T = pos_base + S;
-      if (host_T > engine.max_t)
-        host_T = engine.max_t;
-      bool host_kv_ok =
-          host_T > 0 && engine.gpu->qwen4exp_attn_gpu_device_kv_to_host(
-                            layer_idx, engine.Kc[layer_idx],
-                            engine.Vc[layer_idx], host_T, Hkv, hd);
-      if (!host_kv_ok) {
-        // The cache should exist whenever a preceding device decode
-        // succeeded.  Preserve a correct first-call fallback if a cache
-        // allocation or CUDA copy failed before it became available.
-        const size_t current_bytes = (size_t)S * kvd * sizeof(float);
-        host_kv_ok =
-            cudaMemcpy(engine.Kc[layer_idx] + (size_t)pos_base * kvd, device_K,
-                       current_bytes, cudaMemcpyDeviceToHost) == cudaSuccess &&
-            cudaMemcpy(engine.Vc[layer_idx] + (size_t)pos_base * kvd, device_V,
-                       current_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
-      }
-      if (!host_kv_ok) {
-        LOG_ERROR("[QWEN4EXP-ATTN] device KV recovery failed at layer=%d\n",
-                  layer_idx);
-        std::memset(out_context, 0, (size_t)S * D * sizeof(float));
-        return;
-      }
-    }
-    if (device_qkv) {
-      const size_t q_bytes = (size_t)S * H * hd * sizeof(float);
-      if (cudaMemcpy(Q.data(), device_Q, q_bytes, cudaMemcpyDeviceToHost) !=
-              cudaSuccess ||
-          cudaMemcpy(gate.data(), device_gate, q_bytes,
-                     cudaMemcpyDeviceToHost) != cudaSuccess) {
-        std::memset(out_context, 0, (size_t)S * D * sizeof(float));
-        return;
-      }
-    }
+  {
 #pragma omp parallel for collapse(2) schedule(dynamic, 1)                      \
     num_threads(attn_score_threads())
     for (int s = 0; s < S; ++s) {
@@ -2920,13 +2745,12 @@ void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
         }
       }
     }
-  } // !attn_done_gpu
-  if (!attn_device_output)
-    check_finite_attn("ATTN head_contexts (post attention, pre gate)",
+  }
+  check_finite_attn("ATTN head_contexts (post attention, pre gate)",
                       layer_idx, head_contexts.data(), head_contexts.size());
 
   // ---- 5. sigmoid output gate (from the fused Q projection), then wo ----
-  if (!attn_device_output) {
+  {
     for (size_t i = 0; i < head_contexts.size(); ++i)
       head_contexts[i] /= (1.0f + std::exp(-gate[i]));
     check_finite_attn("ATTN gated (sigmoid output gate)", layer_idx,
