@@ -10722,7 +10722,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
     prefix_submit_ms = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - phase_start)
                            .count();
-    if (split_child_mode && prefix.final_streams &&
+    if (prefix.final_streams &&
         prefix.phase2_handoff_addr) {
       cudaStream_t prefix_stream =
           moestream_ggml_backend_cuda_get_stream(prefix.cuda);
