@@ -43,7 +43,7 @@ nodes and TMA, and distinguishes captured external events from host callbacks.
 | Requirement | Status and evidence |
 | --- | --- |
 | Immutable route classification and exact-once cases | The classifier, fixed-buffer branch projection and all-hot/all-cold/mixed/duplicate tests are implemented. The opt-in DDR callback now consumes a per-replay classification for its CPU branch; the accepted path is unchanged and staged ownership is not yet populated by the runtime graph. |
-| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Implemented behind opt-in flags; end-to-end GPU validation pending.** The DDR graph retains the bounded CPU callback. `SuffixStaged` now owns compact top-k CUDA tensors, aliases the prefix route IDs, and consumes a device-only `[gate|up|down]` payload unpack inside the staged conditional body. The composer remains fail-closed unless all children are single-CUDA graphs. |
+| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Implemented behind opt-in flags; smoke-validated on RTX 3090.** The DDR graph retains the bounded CPU callback. The split-only `SplitStaged` child owns compact top-k CUDA tensors, aliases the prefix route IDs, and consumes a device-only `[gate|up|down]` payload unpack inside the staged conditional body; the mixed CPU/GPU tail runs afterward. The composer remains fail-closed unless the conditional children are single-CUDA graphs. |
 | A/B partial graph against accepted early-ready | **A/B completed; candidate rejected.** After fixing both the per-token weight transfer and activation dependency, the corrected six-pair decode comparison measured 34.05 tok/s for early-ready and 26.70 tok/s for the partial callback: −21.61% mean paired gain, 0/6 wins. The 64-step correctness gate is byte-identical, generated tokens match in all six pairs, and all 63 partial callbacks per run succeeded. See `logs/option_b_partial_layer13_activation_fix_perf_tty/results.json`. |
 | SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. The opt-in Qwen owner reads expert planes with `pread` from model shards (SSD→host; no GDS), and the completion graph uploads a stable payload. The staged suffix now consumes that payload through the conditional graph; RTX runtime validation is still pending. |
 | Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
@@ -91,6 +91,9 @@ tests duplicate route slots plus malformed offsets.
 of allocating a second copy; the first RTX run exposed this 10.93-GiB OOM.
 `ee1c8dc` extends the CUDA topology contract to execute the production payload
 unpack kernel inside the staged conditional body.
+`0f958dd` separates the pure-GPU split child from the mixed CPU/GPU tail, and
+`8a733af` allows the continuation graph to omit the already-executed prefix
+child handle.
 
 ## Selected runtime
 
@@ -166,6 +169,7 @@ MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1 \
 MOESTREAM_QWEN4EXP_COMPLETION_GRAPH=1 \
 MOESTREAM_QWEN4EXP_COMPLETION_STAGED=1 \
 MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED=1 \
+MOESTREAM_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL=1 \
 MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1 \
 MOESTREAM_QWEN4EXP_PARTIAL_LAYER=13 \
 MOESTREAM_QWEN4EXP_FULL_GRAPH=1 \
@@ -179,6 +183,12 @@ The first integration uses synchronous request completion so generation and
 ownership correctness can be measured before adding overlap. A CUDA runtime
 measurement of this new path is still required; the existing storage self-test
 and synthetic conditional topology test do not substitute for that A/B.
+
+The first RTX 3090 smoke run of the split-child path reached `route mode=2`
+(all routes staged), published a Ready completion with 10 route slots and
+13,824,000 payload bytes, and completed the common tail without hidden-state
+NaNs. This is a correctness smoke result using a top-1 resident set; it is
+not a throughput comparison against the production 0/44/4 profile.
 
 ## Measurements
 
