@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <stdexcept>
 
 using namespace moestream::qwen4exp;
 
@@ -54,5 +55,20 @@ int main() {
   assert(stats.submitted == 3 && stats.rejected == 0);
   assert(stats.ready == 2 && stats.errors == 1);
   assert(stats.queue_ms_total >= 0.0 && stats.service_ms_total >= 0.0);
+
+  // Loader exceptions are converted into an explicit Error completion rather
+  // than leaving a pending slot that a later completion graph could mistake
+  // for a ready payload.
+  StorageService throwing(1, 1, [](const StorageRequest &, StorageCompletion &) {
+    throw std::runtime_error("simulated I/O failure");
+    return true;
+  });
+  auto thrown = throwing.submit(StorageRequest{20, 1, 2, {3}});
+  assert(thrown);
+  auto thrown_result = throwing.wait(*thrown);
+  assert(thrown_result && thrown_result->state == StorageState::Error &&
+         thrown_result->error_code == -2);
+  assert(throwing.release(*thrown));
+  assert(!throwing.submit(StorageRequest{0, 1, 2, {3}}));
   std::puts("PASS: storage service ready/error generations and stale handles");
 }
