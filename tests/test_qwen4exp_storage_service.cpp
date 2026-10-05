@@ -39,6 +39,19 @@ int main() {
   assert(ready_result->model_generation == 11 &&
          ready_result->request_generation == 1);
   assert(ready_result->payload == payload && payload->bytes[0] == 0x5a);
+  // The staged unpack boundary requires fixed router-order slots. Duplicate
+  // route IDs remain valid because exact-once applies to route slots, not
+  // unique expert ownership.
+  StorageCompletion shaped = *ready_result;
+  shaped.experts = {4, 4};
+  shaped.payload = std::make_shared<StorageRequest::Payload>();
+  shaped.payload->bytes.resize(6);
+  shaped.payload->offsets = {0, 3, 6};
+  assert(storage_payload_uniform_slots(shaped, 2));
+  shaped.payload->offsets = {0, 2, 6};
+  assert(!storage_payload_uniform_slots(shaped, 2));
+  shaped.payload->offsets = {0, 3};
+  assert(!storage_payload_uniform_slots(shaped, 2));
   assert(service.release(*ready));
   assert(service.release(*error));
 

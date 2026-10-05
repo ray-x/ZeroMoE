@@ -561,23 +561,13 @@ public:
           completion.model_generation != expected_model_generation ||
           completion.request_generation == 0 || completion.layer < 0 ||
           completion.experts.empty() ||
-          completion.experts.size() !=
-              static_cast<size_t>(std::max(1, model_file.architecture_config.topk)) ||
-          !completion.payload || completion.payload->offsets.size() !=
-              completion.experts.size() + 1 ||
-          completion.payload->offsets.empty() ||
-          completion.payload->offsets.front() != 0 ||
-          completion.payload->offsets.back() != completion.payload->bytes.size() ||
+          !moestream::qwen4exp::storage_payload_uniform_slots(
+              completion,
+              static_cast<size_t>(
+                  std::max(1, model_file.architecture_config.topk))) ||
           (qwen4exp_partial_layer >= 0 &&
            completion.layer != qwen4exp_partial_layer))
         return false;
-      const size_t slot_bytes = completion.payload->offsets[1];
-      if (slot_bytes == 0)
-        return false;
-      for (size_t i = 1; i < completion.payload->offsets.size(); ++i)
-        if (completion.payload->offsets[i] - completion.payload->offsets[i - 1] !=
-            slot_bytes)
-          return false;
       const int n_experts = model_file.architecture_config.n_experts;
       std::vector<int> candidate;
       candidate.reserve(completion.experts.size());

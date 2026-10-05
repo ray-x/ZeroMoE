@@ -53,6 +53,28 @@ struct StorageCompletion {
   std::shared_ptr<StorageRequest::Payload> payload;
 };
 
+// The staged CUDA unpack kernel consumes fixed-size router-order slots. Keep
+// this structural check independent of CUDA so the storage boundary can reject
+// a mixed-geometry or truncated completion before it is published.
+inline bool storage_payload_uniform_slots(const StorageCompletion &completion,
+                                          size_t expected_slots) {
+  if (completion.state != StorageState::Ready || !completion.payload ||
+      expected_slots == 0 || completion.experts.size() != expected_slots ||
+      completion.payload->offsets.size() != expected_slots + 1 ||
+      completion.payload->offsets.empty() ||
+      completion.payload->offsets.front() != 0 ||
+      completion.payload->offsets.back() != completion.payload->bytes.size())
+    return false;
+  const size_t slot_bytes = completion.payload->offsets[1];
+  if (slot_bytes == 0)
+    return false;
+  for (size_t i = 1; i < completion.payload->offsets.size(); ++i)
+    if (completion.payload->offsets[i] - completion.payload->offsets[i - 1] !=
+        slot_bytes)
+      return false;
+  return true;
+}
+
 struct StorageStats {
   uint64_t submitted = 0;
   uint64_t rejected = 0;
