@@ -43,9 +43,9 @@ nodes and TMA, and distinguishes captured external events from host callbacks.
 | Requirement | Status and evidence |
 | --- | --- |
 | Immutable route classification and exact-once cases | The classifier, fixed-buffer branch projection and all-hot/all-cold/mixed/duplicate tests are implemented. The opt-in DDR callback now consumes a per-replay classification for its CPU branch; the accepted path is unchanged and staged ownership is not yet populated by the runtime graph. |
-| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Partially implemented.** The opt-in DDR graph combines resident GPU work with a cold-only CPU host callback, and now has a fail-closed three-way conditional composer (`MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED`) with separate resident/staged child handles and a device route-mode predicate. It will only instantiate single-CUDA child graphs; no staged generation currently publishes a pure-GPU child, so the three-way composer remains inactive. The existing Phase-2 prototype's 28/69 scheduler splits still prevent its ordinary master conditional from running. |
+| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Implemented behind opt-in flags; end-to-end GPU validation pending.** The DDR graph retains the bounded CPU callback. `SuffixStaged` now owns compact top-k CUDA tensors, aliases the prefix route IDs, and consumes a device-only `[gate|up|down]` payload unpack inside the staged conditional body. The composer remains fail-closed unless all children are single-CUDA graphs. |
 | A/B partial graph against accepted early-ready | **A/B completed; candidate rejected.** After fixing both the per-token weight transfer and activation dependency, the corrected six-pair decode comparison measured 34.05 tok/s for early-ready and 26.70 tok/s for the partial callback: −21.61% mean paired gain, 0/6 wins. The 64-step correctness gate is byte-identical, generated tokens match in all six pairs, and all 63 partial callbacks per run succeeded. See `logs/option_b_partial_layer13_activation_fix_perf_tty/results.json`. |
-| SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. An opt-in Qwen runtime owner reads expert planes with `pread` from model shards, and the captured completion graph uploads a stable payload and joins a consumer stream. **The staged expert conditional child is still not integrated.** |
+| SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. The opt-in Qwen owner reads expert planes with `pread` from model shards (SSD→host; no GDS), and the completion graph uploads a stable payload. The staged suffix now consumes that payload through the conditional graph; RTX runtime validation is still pending. |
 | Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
 | Adaptive CPU versus staged-GPU selection | A timing policy helper and queue/run/DMA/storage telemetry exist. The policy is not wired to live selection or measured in an A/B; the measured staged route path also fails CPU-baseline numerical parity. |
 | Full-graph-only policy | Qwen graph prefill/decode now default on and an enabled Qwen graph failure aborts the request rather than entering layered execution. The native suite passes (`logs/fullgraph_only_policy_final_native.log`). **The all-family migration is incomplete:** GLM5NEXT and DeepSeek-V4 have partial graph adapters, and other families still use the layered path. |
@@ -80,6 +80,8 @@ The persistent completion-graph handle is `d468d64`; `a196237` composes its
 captured payload child before the staged route predicate.
 `66f8d18` also includes the completion child in the master-graph rebuild key,
 so prepare/reset changes cannot leave a stale child graph attached.
+`080b65e` wires the payload-backed `SuffixStaged` child and its generation-
+validated runtime dispatch; it is intentionally not the production default.
 
 ## Selected runtime
 
@@ -126,18 +128,39 @@ graphs, so a staged child containing the DDR gather callback is rejected rather
 than placed inside a conditional body. The engine carries a separate staged
 expert-ID publication vector, and `publish_qwen4exp_staged_completion` now
 validates a Ready completion before publishing it. The opt-in pread service
-does not submit staged completions to this method yet, so the composer remains
-inactive by default. When a completion graph is prepared, its captured payload
-copy is available as a parent-graph child between the prefix and route
-predicate. This supplies the stable H2D/event boundary only; the staged GGML
-child is not yet bound to those payload planes.
+submits a matching completion before the continuation graph is launched. When
+a completion graph is prepared, its captured payload copy is a parent-graph
+child before the route predicate, and a device-only unpack kernel fills the
+staged tensors only in the staged conditional body. Any storage, generation,
+topology, or graph-admission failure clears publication and runs the existing
+CPU suffix instead.
 
 The topology contract is executable in
 `tests/test_qwen4exp_conditional_graph.cu`: it runs all-resident, all-staged,
 and mixed route sets through pure-GPU conditional children and verifies an
 unconditional parent host node runs after the branch. On the RTX 3090 it
 reports `PASS: resident/staged conditionals with parent host node`. This test
-does not claim that model payload planes are bound into the staged child yet.
+covers topology only; it does not replace the model runtime A/B.
+
+The payload-backed staged A/B is enabled only for an explicit experiment:
+
+```bash
+MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1 \
+MOESTREAM_QWEN4EXP_COMPLETION_GRAPH=1 \
+MOESTREAM_QWEN4EXP_COMPLETION_STAGED=1 \
+MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED=1 \
+MOESTREAM_QWEN4EXP_PARTIAL_LAYER=13 \
+MOESTREAM_QWEN4EXP_FULL_GRAPH=1 \
+MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+./build_ggmlcuda/moestream --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+```
+
+The prefix runs once, the storage worker loads the exact route slots with
+`pread`, and a continuation graph selects resident, staged, or CPU fallback.
+The first integration uses synchronous request completion so generation and
+ownership correctness can be measured before adding overlap. A CUDA runtime
+measurement of this new path is still required; the existing storage self-test
+and synthetic conditional topology test do not substitute for that A/B.
 
 ## Measurements
 
