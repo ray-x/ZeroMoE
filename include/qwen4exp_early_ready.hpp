@@ -357,6 +357,35 @@ struct Qwen4ExpEarlyReady {
     GGML_ABORT("early-ready marker requires the scheduler bridge");
     (void)userdata;
   }
+
+  // Host-node variant: D2H copies are already complete when this is called,
+  // so it must only execute the prepared CPU graph. It performs no CUDA calls
+  // and leaves the result in the owned pinned `output` buffer.
+  bool compute_host_callback() {
+    if (!cpu || !graph || !output ||
+        ggml_backend_graph_compute(cpu, graph) != GGML_STATUS_SUCCESS)
+      return false;
+    const size_t n = static_cast<size_t>(ggml_nelements(output));
+    const auto *values = static_cast<const float *>(output->data);
+    for (size_t i = 0; i < n; ++i)
+      if (!std::isfinite(values[i])) return false;
+    return true;
+  }
+
+  bool compute_host_callback_reduced(float *destination, int width) {
+    if (!destination || !compute_host_callback() || output->type != GGML_TYPE_F32 ||
+        output->ne[0] != width || output->ne[1] <= 0)
+      return false;
+    const auto *values = static_cast<const float *>(output->data);
+    const size_t row_stride = output->nb[1] / sizeof(float);
+    for (int i = 0; i < width; ++i) {
+      float sum = 0.0f;
+      for (int row = 0; row < output->ne[1]; ++row)
+        sum += values[static_cast<size_t>(row) * row_stride + i];
+      destination[i] = sum;
+    }
+    return true;
+  }
 };
 
 extern "C" int moestream_ggml_sched_early_cpu(

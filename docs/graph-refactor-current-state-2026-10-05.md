@@ -140,6 +140,33 @@ done
 All three modes passed. The next milestone can consume this descriptor from a
 DDR-only partial-layer graph without mutating shared remap or mask tables.
 
+## Milestone 2: DDR-only partial-layer graph prototype
+
+An opt-in prototype now uses `MOESTREAM_QWEN4EXP_PARTIAL_GRAPH=1` together
+with `MOESTREAM_QWEN4EXP_PARTIAL_GRAPH_LAYER=13`. It keeps the static resident
+CUDA branch and inserts a bounded `cudaLaunchHostFunc` callback for the DDR
+complement. The callback uses a prepared GGML CPU graph with immutable CPU
+route tables, then uploads a per-route weighted cold result for the graph
+merge. It does not read SSD, use speculative staging, or alter the accepted
+early-ready path.
+
+The first parity comparison against the original static split path produced
+63/64 top-1 agreement and mean KL 0.00129. This is diagnostic evidence only;
+the path is not accepted as numerically identical yet. The guarded six-pair
+comparison against the accepted early-ready/resident-table/async-output bundle
+measured 33.451 -> 26.526 tok/s (-20.70%, 0/6 wins):
+`logs/option_b_partial_layer13_ddr_perf/summary.json`. The callback is
+serialized on the graph stream and currently adds too much latency.
+
+The existing Phase-2 prefix/suffix graph can provide the pure-CUDA conditional
+body while the suffix CPU graph carries the host callback. A top-256 proof
+constructed all three graph instances but declined the extra 11.17-GiB expert
+arena; a top-64 retry still declined a 10.93-GiB arena. Preserve
+`logs/option_b_partial_phase2_layer13_logits/` and
+`logs/option_b_partial_phase2_layer13_top64_logits/`. Resource sharing must be
+fixed before treating the conditional proof as runnable. The prototype remains
+opt-in and the production profile is unchanged.
+
 ## Scope and reproducibility
 
 The scoped graph files are:

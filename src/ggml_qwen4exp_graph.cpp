@@ -80,6 +80,11 @@ struct Qwen4ExpCudaHostNodeContext {
   // CPU returns unweighted [D, topk] expert outputs; the GPU weights and
   // reduces them after the marker (saves the CPU reduce tail).
   bool gpu_reduce = false;
+  // The milestone-2 callback receives the original route weights but zeros
+  // resident slots before CPU reduction. This gives the callback the exact
+  // cold complement while the resident branch runs on CUDA.
+  bool partial_cold_only = false;
+  std::unique_ptr<Qwen4ExpEarlyReady> partial_cpu_graph;
   // The full graph owns this pool. The host-node runner borrows it for the
   // callback and never frees or pauses it.
   ggml_threadpool_t shared_cpu_threadpool = nullptr;
@@ -394,6 +399,24 @@ static bool env_host_node_skip_cpu() {
   return v && v[0] == '1';
 }
 
+// Experimental milestone-2 graph: one static split layer keeps its resident
+// GPU branch in the graph and sends the complement through a bounded DDR host
+// callback. It is deliberately separate from the validated early-ready path.
+static int env_partial_graph_layer() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH_LAYER");
+  if (!v || !v[0]) return -1;
+  char *end = nullptr;
+  const long layer = std::strtol(v, &end, 10);
+  return end != v && *end == '\0' && layer >= 0 && layer < 10000
+             ? static_cast<int>(layer)
+             : -1;
+}
+
+static bool env_partial_graph_enabled(int layer) {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH");
+  return v && v[0] == '1' && env_partial_graph_layer() == layer;
+}
+
 // Diagnostic topology switch: keep the initial CPU->GPU contiguous handoff
 // on the CPU backend while retaining the CUDA-owned host-node markers.  This
 // lets A/B runs separate the prologue/backend-edge cost from host-callback
@@ -622,6 +645,37 @@ static void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
   }
   qwen_cpu_moe_diag_set_layer(ctx->layer_index);
   bool ok = false;
+  if (ctx->partial_cpu_graph) {
+    auto &cpu_graph = *ctx->partial_cpu_graph;
+    std::memcpy(cpu_graph.input, ctx->host_input, ctx->input_bytes);
+    std::memcpy(cpu_graph.ids, ctx->host_ids, ctx->ids_bytes);
+    std::memcpy(cpu_graph.weights, ctx->host_weights, ctx->weights_bytes);
+    ok = cpu_graph.compute_host_callback();
+    if (ok)
+      std::memcpy(ctx->host_output, cpu_graph.output->data,
+                  ctx->output_bytes);
+  } else {
+  if (ctx->partial_cold_only) {
+    // The host callback owns only the cold complement. Use a valid dummy
+    // route and zero weight for resident slots so this remains safe for both
+    // interleaved and projection-compact CPU runners.
+    int resident_routes = 0;
+    for (int k = 0; k < ctx->topk; ++k) {
+      const int expert = ctx->host_ids[k];
+      if (std::find(ctx->gpu_resident_experts.begin(),
+                    ctx->gpu_resident_experts.end(), expert) !=
+          ctx->gpu_resident_experts.end()) {
+        ++resident_routes;
+        ctx->host_ids[k] = 0;
+        ctx->host_weights[k] = 0.0f;
+      }
+    }
+    if (qwen4exp_host_node_timing_enabled())
+      LOG_INFO("[QWEN4EXP-PARTIAL-ROUTES] layer=%d resident_set=%zu "
+               "resident_routes=%d cold_routes=%d\n",
+               ctx->layer_index, ctx->gpu_resident_experts.size(),
+               resident_routes, ctx->topk - resident_routes);
+  }
   GgmlQwenCpuMoeRunner *runner = nullptr;
   if (env_host_node_skip_cpu()) {
     std::fill_n(ctx->host_output, ctx->output_bytes / sizeof(float), 0.0f);
@@ -669,6 +723,7 @@ static void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
   }
   if (runner && !runner->uses_external_threadpool())
     runner->pause_workers();
+  }
   const double cpu_ms = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - start)
                             .count();
@@ -4793,9 +4848,15 @@ void *alloc_registered_host(FullGraph &g, size_t bytes) {
 // single-token contract and the scheduler-split prefill path remains unchanged.
 ggml_tensor *build_qwen4exp_host_node(
     FullGraph &g, ggml_context *ctx, ggml_tensor *cur, ggml_tensor *ids,
-    ggml_tensor *weights, int layer) {
+    ggml_tensor *weights, int layer, bool partial_cold_only = false,
+    ggml_tensor *gate_exps_for_cpu = nullptr,
+    ggml_tensor *up_exps_for_cpu = nullptr,
+    ggml_tensor *down_exps_for_cpu = nullptr,
+    ggml_tensor *remap_cpu_for_cpu = nullptr,
+    ggml_tensor *mask_cpu_for_cpu = nullptr) {
   if (!g.decode_mode || g.S != 1 || !g.engine ||
-      !g.engine->qwen4exp_cpu_offload_layer_enabled(layer))
+      (!partial_cold_only &&
+       !g.engine->qwen4exp_cpu_offload_layer_enabled(layer)))
     return nullptr;
 
   const auto &c = g.engine->model_file.architecture_config;
@@ -4828,6 +4889,18 @@ ggml_tensor *build_qwen4exp_host_node(
 
   auto node_ctx = std::make_unique<Qwen4ExpCudaHostNodeContext>();
   node_ctx->layer_index = layer;
+  node_ctx->partial_cold_only = partial_cold_only;
+  if (partial_cold_only) {
+    if (!gate_exps_for_cpu || !up_exps_for_cpu || !down_exps_for_cpu ||
+        !remap_cpu_for_cpu || !mask_cpu_for_cpu)
+      return nullptr;
+    node_ctx->partial_cpu_graph = std::make_unique<Qwen4ExpEarlyReady>();
+    if (!node_ctx->partial_cpu_graph->prepare(
+            g.cpu, g.device, g.D, c.topk, gate_exps_for_cpu,
+            up_exps_for_cpu, down_exps_for_cpu, remap_cpu_for_cpu,
+            mask_cpu_for_cpu))
+      return nullptr;
+  }
   const auto split_resident_it = g.split_gpu_expert_ids.find(layer);
   if (split_resident_it != g.split_gpu_expert_ids.end())
     node_ctx->gpu_resident_experts = split_resident_it->second;
@@ -4866,7 +4939,7 @@ ggml_tensor *build_qwen4exp_host_node(
   node_ctx->up_stride = arena->up_stride;
   node_ctx->down_stride = arena->down_stride;
   node_ctx->input_bytes = static_cast<size_t>(g.D) * sizeof(float);
-  node_ctx->gpu_reduce = env_host_node_gpu_reduce();
+  node_ctx->gpu_reduce = partial_cold_only ? true : env_host_node_gpu_reduce();
   node_ctx->output_bytes =
       node_ctx->input_bytes *
       (node_ctx->gpu_reduce ? static_cast<size_t>(c.topk) : 1);
@@ -5028,9 +5101,12 @@ ggml_tensor *build_qwen4exp_host_node(
   // In GPU-reduce mode only row 0 is a real copy target; the bridge H2D
   // fills all topk rows of the destination from the callback's output.
   ggml_tensor *copy_dst =
-      gpu_reduce ? ggml_view_2d(ctx, destination, g.D, 1, destination->nb[1], 0)
-                 : destination;
-  ggml_tensor *marker = ggml_cpy(ctx, input3, copy_dst);
+      (gpu_reduce && !partial_cold_only)
+          ? ggml_view_2d(ctx, destination, g.D, 1, destination->nb[1], 0)
+          : destination;
+  ggml_tensor *marker_source =
+      partial_cold_only ? ggml_dup_tensor(ctx, destination) : input3;
+  ggml_tensor *marker = ggml_cpy(ctx, marker_source, copy_dst);
   if (!marker)
     return nullptr;
   marker->extra = node_ctx.get();
@@ -5038,13 +5114,13 @@ ggml_tensor *build_qwen4exp_host_node(
   // pinned route buffers before the callback; the ordinary CPY backend never
   // sees this marker because the bridge consumes it first.
   marker->src[2] = route_ids;
-  if (!gpu_reduce)
+  if (!gpu_reduce || partial_cold_only)
     marker->src[3] = route_weights;
   ggml_set_name(marker,
                 ("qwen4exp_host_moe_marker_l" + std::to_string(layer))
                     .c_str());
   ggml_tensor *result = marker;
-  if (gpu_reduce) {
+  if (gpu_reduce && !partial_cold_only) {
     // [D, topk] unweighted expert outputs -> weight and sum over topk.
     ggml_tensor *per_expert =
         ggml_view_3d(ctx, marker, g.D, c.topk, 1, destination->nb[1],
@@ -5675,6 +5751,14 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
            (all_early_env && all_early_env[0] == '1')) &&
           g.decode_mode && g.S == 1 &&
           g.phase2_mode == FullGraph::Phase2Mode::Off;
+      const bool partial_requested =
+          g.decode_mode && g.S == 1 && env_partial_graph_enabled(layer);
+      if (partial_requested && early_requested) {
+        LOG_WARN("[QWEN4EXP-PARTIAL-GRAPH] layer=%d cannot combine "
+                 "partial host callback with early-ready in one A/B\n",
+                 layer);
+        return nullptr;
+      }
       std::unique_ptr<Qwen4ExpEarlyReady> early;
       ExpertSplitTables route_tab = tab;
       if (early_requested) {
@@ -5718,6 +5802,24 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           ggml_mul(ctx, weights, ggml_get_rows(ctx, route_tab.mask_cpu, ids));
 
       ggml_tensor *cold_weighted = nullptr;
+      if (partial_requested) {
+        // DDR-only partial milestone: the callback reduces the cold
+        // complement while the resident CUDA branch below computes hot
+        // routes. SSD service and staged publication are intentionally absent
+        // from this first graph; a missing DDR arena declines the build.
+        cold_weighted = build_qwen4exp_host_node(
+            g, ctx, cur, ids, weights, layer, /*partial_cold_only=*/true,
+            gate_exps, up_exps, down_exps, tab.remap_cpu, tab.mask_cpu);
+        if (!cold_weighted) {
+          LOG_WARN("[QWEN4EXP-PARTIAL-GRAPH] layer=%d declined: DDR "
+                   "cold callback could not be built\n",
+                   layer);
+          return nullptr;
+        }
+        LOG_INFO("[QWEN4EXP-PARTIAL-GRAPH] layer=%d resident CUDA + "
+                 "cold DDR host callback\n",
+                 layer);
+      }
       if (early) {
         auto *dst = ggml_dup_tensor(ctx, cur);
         early->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));

@@ -206,8 +206,11 @@ def main():
             steady = [(total, core) for step, total, core in times if step >= 3]
             if [step for step, _, _ in times] not in (list(range(ngen)), list(range(ngen - 1))):
                 raise RuntimeError(f'{tag}: incomplete timing')
-            if arm != 'baseline' and '[OPTION-B-EARLY-READY] calls=' not in contents:
-                raise RuntimeError(f'{tag}: bridge not exercised')
+            if arm != 'baseline':
+                exercised = ('[OPTION-B-EARLY-READY] calls=' in contents or
+                             '[QWEN4EXP-PARTIAL-GRAPH]' in contents)
+                if not exercised:
+                    raise RuntimeError(f'{tag}: graph bridge not exercised')
             totals, cores = zip(*steady)
             row = {'arm': arm, 'rep': rep, 'tps': 1000 / statistics.mean(totals),
                    'loop_ms': statistics.mean(totals), 'core_ms': statistics.mean(cores)}
