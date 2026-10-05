@@ -7,6 +7,7 @@
 #include "memory_guard.hpp"  // MemoryGuard::allocation_blocked() -- see ensure_slab_capacity
 #include "family_ops.hpp" // FamilyOps -- see StreamingEngine::family_ops below
 #include "dsv4_compressed_attention.hpp" // Dsv4CompressedLayerState -- see StreamingEngine::dsv4_compressed below
+#include "qwen4exp_storage_service.hpp"
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -565,6 +566,11 @@ public:
     // an empty set keeps the staged conditional disabled and preserves the
     // existing resident/CPU path.
     std::vector<int> qwen4exp_partial_layer_staged_ids;
+    // Optional host storage boundary for staged expert payloads. It is
+    // constructed only when explicitly enabled; the production scheduler
+    // keeps this null and follows the existing DDR/early-ready path.
+    std::unique_ptr<moestream::qwen4exp::StorageService>
+        qwen4exp_storage_service;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
     // Phase 2 owns three decode graph instances.  If their additional arena

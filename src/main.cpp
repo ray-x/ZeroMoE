@@ -4016,6 +4016,91 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     }
   }
 
+  // Optional storage dispatch/completion boundary for the future staged
+  // completion graph. The loader deliberately consumes only already-published
+  // host expert views here; it performs no CUDA calls and can later be
+  // replaced by an SSD reader without changing the generation graph. The
+  // default remains off so the accepted early-ready scheduler has no extra
+  // worker or queue.
+  if (std::getenv("MOESTREAM_QWEN4EXP_STORAGE_SERVICE") &&
+      engine.family_ops.family == ModelFamily::Qwen4Exp) {
+    engine.qwen4exp_storage_service =
+        std::make_unique<moestream::qwen4exp::StorageService>(
+            /*slots=*/8, /*queue_capacity=*/8,
+            [&engine](const moestream::qwen4exp::StorageRequest &request,
+                      moestream::qwen4exp::StorageCompletion &completion) {
+              if (request.layer < 0 ||
+                  static_cast<size_t>(request.layer) >=
+                      engine.layers_experts.size() || request.experts.empty()) {
+                completion.error_code = 400;
+                return false;
+              }
+              auto payload = request.payload;
+              if (!payload)
+                payload = std::make_shared<
+                    moestream::qwen4exp::StorageRequest::Payload>();
+              payload->bytes.clear();
+              payload->offsets.clear();
+              payload->offsets.push_back(0);
+              const auto &layer = engine.layers_experts[
+                  static_cast<size_t>(request.layer)];
+              for (int expert : request.experts) {
+                if (expert < 0 || static_cast<size_t>(expert) >= layer.size()) {
+                  completion.error_code = 404;
+                  return false;
+                }
+                const auto &slot = layer[static_cast<size_t>(expert)];
+                for (const auto *plane : {&slot.gate_proj, &slot.up_proj,
+                                          &slot.down_proj}) {
+                  const size_t bytes =
+                      static_cast<size_t>(std::max<int64_t>(0, plane->meta.size_bytes));
+                  if (!plane->host_ptr || bytes == 0) {
+                    completion.error_code = 409;
+                    return false;
+                  }
+                  const size_t old_size = payload->bytes.size();
+                  payload->bytes.resize(old_size + bytes);
+                  std::memcpy(payload->bytes.data() + old_size,
+                              plane->host_ptr, bytes);
+                  payload->offsets.push_back(payload->bytes.size());
+                }
+              }
+              completion.experts = request.experts;
+              completion.payload = std::move(payload);
+              return true;
+            });
+    LOG_STREAM_INFO()
+        << "[QWEN4EXP-STORAGE] opt-in host storage service enabled "
+           "(8 generation-tagged slots; CUDA/SSD work remains outside the "
+           "callback)\n";
+
+    if (std::getenv("MOESTREAM_QWEN4EXP_STORAGE_SELFTEST") &&
+        !engine.layers_experts.empty() &&
+        !engine.layers_experts.front().empty()) {
+      auto payload = std::make_shared<
+          moestream::qwen4exp::StorageRequest::Payload>();
+      auto handle = engine.qwen4exp_storage_service->submit(
+          moestream::qwen4exp::StorageRequest{1, 1, 0, {0}, payload});
+      auto result = handle ? engine.qwen4exp_storage_service->wait(*handle)
+                           : std::nullopt;
+      const bool ready = result &&
+                         result->state ==
+                             moestream::qwen4exp::StorageState::Ready &&
+                         result->model_generation == 1 &&
+                         result->request_generation == 1 &&
+                         result->payload == payload;
+      LOG_STREAM_INFO() << "[QWEN4EXP-STORAGE-SELFTEST] state="
+                        << (result ? static_cast<int>(result->state) : -1)
+                        << " ready=" << (ready ? 1 : 0)
+                        << " queue_ms="
+                        << (result ? result->queue_ms : -1.0)
+                        << " service_ms="
+                        << (result ? result->service_ms : -1.0) << "\n";
+      if (handle)
+        engine.qwen4exp_storage_service->release(*handle);
+    }
+  }
+
   // 2026-08-29: EngineConfig::ram_pin_eager_preregister's FIRST
   // implementation lived here -- RAMSafetyManager::eager_preregister_
   // remaining_slots, which eagerly grew+registered GENERIC (identity-
