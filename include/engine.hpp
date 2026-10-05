@@ -636,6 +636,18 @@ public:
     // are validated before staged ownership is published.
     uint64_t qwen4exp_storage_model_generation = 1;
     uint64_t qwen4exp_storage_next_request_generation = 1;
+    // Runtime timing samples used only by the opt-in adaptive staged policy.
+    // The first few cold routes remain on CPU to seed a measured baseline;
+    // no guessed throughput is used to change the production default.
+    uint64_t qwen4exp_adaptive_cpu_samples = 0;
+    uint64_t qwen4exp_adaptive_staged_samples = 0;
+    double qwen4exp_adaptive_cpu_queue_ms = 0.0;
+    double qwen4exp_adaptive_cpu_compute_ms = 0.0;
+    double qwen4exp_adaptive_cpu_ms = 0.0;
+    double qwen4exp_adaptive_staged_queue_ms = 0.0;
+    double qwen4exp_adaptive_staged_h2d_ms = 0.0;
+    double qwen4exp_adaptive_staged_storage_ms = 0.0;
+    double qwen4exp_adaptive_staged_gpu_ms = 0.0;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
     // Phase 2 owns three decode graph instances.  If their additional arena

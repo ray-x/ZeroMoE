@@ -10,6 +10,7 @@
 
 #include "ggml_qwen4exp_graph.hpp"
 #include "option_b_global_hot.hpp"
+#include "qwen4exp_adaptive_policy.hpp"
 
 #include "dense_dispatch.hpp" // is_cpu_affinity_layer (cpu_affinity_layers config)
 #include "cuda_manager.hpp"
@@ -2208,6 +2209,11 @@ bool env_partial_layer_phase2_enabled() {
 // persistent CompletionGraph, and remains disabled in the production profile.
 bool env_completion_staged_enabled() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_COMPLETION_STAGED");
+  return v && v[0] == '1';
+}
+
+bool env_adaptive_completion_policy_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY");
   return v && v[0] == '1';
 }
 
@@ -10506,6 +10512,40 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       chosen = &sgpu;
       handled_completion_staged = true;
     } else if (engine.qwen4exp_storage_service) {
+      const bool adaptive_policy = env_adaptive_completion_policy_enabled();
+      constexpr uint64_t kAdaptiveCpuWarmup = 4;
+      if (adaptive_policy &&
+          engine.qwen4exp_adaptive_cpu_samples < kAdaptiveCpuWarmup) {
+        const auto suffix_start = std::chrono::steady_clock::now();
+        if (!run_timed_replay(scpu, suffix_replay_submit_ms,
+                              suffix_replay_sync_ms, suffix_submit_ms))
+          return false;
+        suffix_submit_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - suffix_start)
+                               .count();
+        engine.qwen4exp_adaptive_cpu_ms =
+            (engine.qwen4exp_adaptive_cpu_ms *
+                 static_cast<double>(engine.qwen4exp_adaptive_cpu_samples) +
+             suffix_submit_ms) /
+            static_cast<double>(engine.qwen4exp_adaptive_cpu_samples + 1);
+        engine.qwen4exp_adaptive_cpu_queue_ms =
+            (engine.qwen4exp_adaptive_cpu_queue_ms *
+                 static_cast<double>(engine.qwen4exp_adaptive_cpu_samples) +
+             suffix_replay_submit_ms) /
+            static_cast<double>(engine.qwen4exp_adaptive_cpu_samples + 1);
+        engine.qwen4exp_adaptive_cpu_compute_ms =
+            std::max(0.0, engine.qwen4exp_adaptive_cpu_ms -
+                              engine.qwen4exp_adaptive_cpu_queue_ms);
+        ++engine.qwen4exp_adaptive_cpu_samples;
+        chosen = &scpu;
+        handled_completion_staged = true;
+        LOG_INFO("[QWEN4EXP-ADAPTIVE] warmup cpu sample=%llu ms=%.3f\n",
+                 static_cast<unsigned long long>(
+                     engine.qwen4exp_adaptive_cpu_samples),
+                 suffix_submit_ms);
+      }
+      if (handled_completion_staged)
+        goto completion_staged_done;
       engine.qwen4exp_partial_layer_staged_ids.clear();
       engine.qwen4exp_partial_layer_staged_generation = 0;
       if (engine.qwen4exp_completion_graph &&
@@ -10545,6 +10585,62 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                 request_generation);
       }
       if (staged_ready) {
+        if (adaptive_policy) {
+          moestream::qwen4exp::AdaptiveTiming timing;
+          timing.cpu_queue_ms = engine.qwen4exp_adaptive_cpu_queue_ms;
+          timing.cpu_compute_ms = engine.qwen4exp_adaptive_cpu_compute_ms;
+          timing.cpu_ready = engine.qwen4exp_adaptive_cpu_samples > 0;
+          timing.transfer_queue_ms =
+              engine.qwen4exp_adaptive_staged_queue_ms;
+          timing.h2d_ms = engine.qwen4exp_adaptive_staged_h2d_ms;
+          timing.gpu_compute_ms = engine.qwen4exp_adaptive_staged_gpu_ms;
+          timing.storage_ms = completion.queue_ms + completion.service_ms;
+          timing.storage_required = true;
+          timing.staged_ready = true;
+          const auto decision =
+              moestream::qwen4exp::choose_adaptive_target(timing);
+          LOG_INFO("[QWEN4EXP-ADAPTIVE] layer=%d cpu=%.3f staged=%.3f "
+                   "target=%s queue=%.3f storage=%.3f\n",
+                   engine.qwen4exp_partial_layer, decision.cpu_ms,
+                   decision.staged_gpu_ms,
+                   decision.target ==
+                           moestream::qwen4exp::AdaptiveTarget::StagedGpu
+                       ? "staged-gpu"
+                       : "cpu",
+                   completion.queue_ms, completion.service_ms);
+          if (decision.target ==
+              moestream::qwen4exp::AdaptiveTarget::Cpu) {
+            engine.qwen4exp_partial_layer_staged_ids.clear();
+            engine.qwen4exp_partial_layer_staged_generation = 0;
+            const auto suffix_start = std::chrono::steady_clock::now();
+            if (!run_timed_replay(scpu, suffix_replay_submit_ms,
+                                  suffix_replay_sync_ms, suffix_submit_ms))
+              return false;
+            suffix_submit_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - suffix_start)
+                                   .count();
+            engine.qwen4exp_adaptive_cpu_ms =
+                (engine.qwen4exp_adaptive_cpu_ms *
+                     static_cast<double>(engine.qwen4exp_adaptive_cpu_samples) +
+                 suffix_submit_ms) /
+                static_cast<double>(engine.qwen4exp_adaptive_cpu_samples + 1);
+            engine.qwen4exp_adaptive_cpu_queue_ms =
+                (engine.qwen4exp_adaptive_cpu_queue_ms *
+                     static_cast<double>(engine.qwen4exp_adaptive_cpu_samples) +
+                 suffix_replay_submit_ms) /
+                static_cast<double>(engine.qwen4exp_adaptive_cpu_samples + 1);
+            engine.qwen4exp_adaptive_cpu_compute_ms =
+                std::max(0.0, engine.qwen4exp_adaptive_cpu_ms -
+                                  engine.qwen4exp_adaptive_cpu_queue_ms);
+            ++engine.qwen4exp_adaptive_cpu_samples;
+            chosen = &scpu;
+            handled_completion_staged = true;
+          }
+        }
+      }
+      if (handled_completion_staged)
+        goto completion_staged_done;
+      if (staged_ready) {
         bool needs_staged = false;
         bool needs_cpu = true;
         const auto continuation_start = std::chrono::steady_clock::now();
@@ -10562,6 +10658,26 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                                  std::chrono::steady_clock::now() -
                                  continuation_start)
                                  .count();
+          if (needs_staged && engine.qwen4exp_completion_graph) {
+            if (!engine.qwen4exp_completion_graph->synchronize())
+              return false;
+          }
+          if (adaptive_policy && needs_staged) {
+            engine.qwen4exp_adaptive_staged_queue_ms = completion.queue_ms;
+            engine.qwen4exp_adaptive_staged_storage_ms = completion.service_ms;
+            engine.qwen4exp_adaptive_staged_h2d_ms =
+                engine.qwen4exp_completion_graph
+                    ? engine.qwen4exp_completion_graph->upload_wait_ms()
+                    : 0.0;
+            engine.qwen4exp_adaptive_staged_gpu_ms = std::max(
+                0.0, suffix_submit_ms -
+                         engine.qwen4exp_adaptive_staged_h2d_ms);
+            ++engine.qwen4exp_adaptive_staged_samples;
+          }
+          if (!needs_staged) {
+            engine.qwen4exp_partial_layer_staged_ids.clear();
+            engine.qwen4exp_partial_layer_staged_generation = 0;
+          }
           handled_completion_staged = true;
         }
       }
@@ -10582,6 +10698,8 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       }
     }
   }
+
+completion_staged_done:
 
   if (!handled_completion_staged) {
     // Fast path: prefix + predicate + sgpu unified into one captured graph

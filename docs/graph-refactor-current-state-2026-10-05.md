@@ -47,7 +47,7 @@ nodes and TMA, and distinguishes captured external events from host callbacks.
 | A/B partial graph against accepted early-ready | **A/B completed; candidate rejected.** After fixing both the per-token weight transfer and activation dependency, the corrected six-pair decode comparison measured 34.05 tok/s for early-ready and 26.70 tok/s for the partial callback: −21.61% mean paired gain, 0/6 wins. The 64-step correctness gate is byte-identical, generated tokens match in all six pairs, and all 63 partial callbacks per run succeeded. See `logs/option_b_partial_layer13_activation_fix_perf_tty/results.json`. |
 | SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. The opt-in Qwen owner reads expert planes with `pread` from model shards (SSD→host; no GDS), and the completion graph uploads a stable payload. The staged suffix now consumes that payload through the conditional graph; RTX runtime validation is still pending. |
 | Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
-| Adaptive CPU versus staged-GPU selection | A timing policy helper and queue/run/DMA/storage telemetry exist. The policy is not wired to live selection or measured in an A/B; the measured staged route path also fails CPU-baseline numerical parity. |
+| Adaptive CPU versus staged-GPU selection | The timing policy is now wired behind `MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1`. It warms four CPU suffix samples, then compares measured CPU queue/compute against storage queue/service, completion upload wait, and staged continuation time. It remains opt-in and has not yet had an RTX runtime A/B. |
 | Full-graph-only policy | Qwen graph prefill/decode now default on and an enabled Qwen graph failure aborts the request rather than entering layered execution. The native suite passes (`logs/fullgraph_only_policy_final_native.log`). **The all-family migration is incomplete:** GLM5NEXT and DeepSeek-V4 have partial graph adapters, and other families still use the layered path. |
 
 The latest VRAM handoff changes the performance baseline for placement work.
@@ -149,6 +149,7 @@ MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1 \
 MOESTREAM_QWEN4EXP_COMPLETION_GRAPH=1 \
 MOESTREAM_QWEN4EXP_COMPLETION_STAGED=1 \
 MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED=1 \
+MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1 \
 MOESTREAM_QWEN4EXP_PARTIAL_LAYER=13 \
 MOESTREAM_QWEN4EXP_FULL_GRAPH=1 \
 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \

@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
 #include <vector>
 
 namespace moestream::qwen4exp {
@@ -96,6 +97,8 @@ class CompletionGraph {
     model_generation_ = completion.model_generation;
     request_generation_ = completion.request_generation;
     layer_ = completion.layer;
+    submit_started_ = std::chrono::steady_clock::now();
+    upload_wait_ms_ = 0.0;
     const cudaError_t launch = cudaGraphLaunch(graph_exec_, upload_stream_);
     state_ = launch == cudaSuccess ? CompletionGraphState::Pending
                                    : CompletionGraphState::Error;
@@ -120,6 +123,9 @@ class CompletionGraph {
       state_ = CompletionGraphState::Error;
       return false;
     }
+    upload_wait_ms_ = std::chrono::duration<double, std::milli>(
+                          std::chrono::steady_clock::now() - submit_started_)
+                          .count();
     state_ = CompletionGraphState::Ready;
     return true;
   }
@@ -127,6 +133,7 @@ class CompletionGraph {
   CompletionGraphState state() const { return state_; }
   void *device_payload() const { return device_payload_; }
   size_t payload_bytes() const { return payload_bytes_; }
+  double upload_wait_ms() const { return upload_wait_ms_; }
   size_t capacity_bytes() const { return capacity_bytes_; }
   const std::vector<size_t> &payload_offsets() const { return payload_offsets_; }
   uint64_t model_generation() const { return model_generation_; }
@@ -153,6 +160,8 @@ class CompletionGraph {
     upload_stream_ = nullptr;
     capacity_bytes_ = 0;
     payload_bytes_ = 0;
+    upload_wait_ms_ = 0.0;
+    submit_started_ = {};
     payload_offsets_.clear();
     model_generation_ = 0;
     request_generation_ = 0;
@@ -181,6 +190,8 @@ class CompletionGraph {
   void *device_payload_ = nullptr;
   size_t capacity_bytes_ = 0;
   size_t payload_bytes_ = 0;
+  double upload_wait_ms_ = 0.0;
+  std::chrono::steady_clock::time_point submit_started_{};
   std::vector<size_t> payload_offsets_;
   uint64_t model_generation_ = 0;
   uint64_t request_generation_ = 0;
