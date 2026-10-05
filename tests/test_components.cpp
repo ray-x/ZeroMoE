@@ -16,9 +16,9 @@
 #include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
 #include "moe_decode_batch.hpp" // decode-gap prototype: grouped per-token expert dispatch (no CUDA deps)
 #include "memory_guard.hpp" // deterministic host-budget admission arithmetic
+#include "option_b_global_hot.hpp" // Option-B global-pool hot-set selection (header-only)
 #include <algorithm>
 #include <cassert>
-#include "option_b_global_hot.hpp" // Option-B global-pool hot-set selection (header-only)
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -137,13 +137,6 @@ void test_topk_selection() {
 }
 
 // ============================================================
-// Test 3: Softmax normalization (used for routing weights)
-// ============================================================
-void test_softmax_routing() {
-  std::cout << "[TEST] Softmax Routing Weights..." << std::flush;
-  const int K = 8;
-
-// ============================================================
 // Option-B global pool: pooled top-K across layers (include/option_b_global_hot.hpp)
 // ============================================================
 void test_option_b_global_pool() {
@@ -213,6 +206,12 @@ void test_option_b_global_pool() {
   std::cout << " PASSED\n";
 }
 
+// ============================================================
+// Test 3: Softmax normalization (used for routing weights)
+// ============================================================
+void test_softmax_routing() {
+  std::cout << "[TEST] Softmax Routing Weights..." << std::flush;
+  const int K = 8;
   float logits[8] = {2.0f, 1.5f, 1.0f, 0.5f, 0.2f, 0.1f, -0.5f, -1.0f};
   float weights[8];
 
@@ -3042,6 +3041,7 @@ int main(int argc, char **argv) {
       {"dsv4_compressed_state", test_dsv4_compressed_state_helpers},
       {"tid2eid_lookup", test_tid2eid_lookup},
       {"topk_selection", test_topk_selection},
+      {"option_b_global_pool", test_option_b_global_pool},
       {"softmax_routing", test_softmax_routing},
       {"calculate_size", test_calculate_size},
       {"spsc_ring", test_spsc_ring},
@@ -3105,4 +3105,3 @@ int main(int argc, char **argv) {
             << " PASSED.\n";
   return 0;
 }
-      {"option_b_global_pool", test_option_b_global_pool},
