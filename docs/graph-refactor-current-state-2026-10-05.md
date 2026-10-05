@@ -70,8 +70,8 @@ This file records the committed graph work and the remaining unrelated
 ExLlamaV3, CPU, configuration, test and generated-artifact changes in the
 shared worktree. Graph commits are authored by `ray-x`; the latest scoped
 follow-ups are `c9685b9` (partial activation and staged conditional composer),
-`8a5cd68` (shared shape-class worker test), and `db35ec8` (opt-in storage
-completion boundary).
+`8a5cd68` (shared shape-class worker test), `db35ec8` (opt-in storage
+completion boundary), and `57427c6` (Ready/Error runtime self-test).
 
 ## Selected runtime
 
