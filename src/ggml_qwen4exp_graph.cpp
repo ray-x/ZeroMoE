@@ -10610,6 +10610,11 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                    completion.queue_ms, completion.service_ms);
           if (decision.target ==
               moestream::qwen4exp::AdaptiveTarget::Cpu) {
+            if (engine.qwen4exp_completion_graph &&
+                engine.qwen4exp_completion_graph->state() ==
+                    moestream::qwen4exp::CompletionGraphState::Pending &&
+                !engine.qwen4exp_completion_graph->synchronize())
+              return false;
             engine.qwen4exp_partial_layer_staged_ids.clear();
             engine.qwen4exp_partial_layer_staged_generation = 0;
             const auto suffix_start = std::chrono::steady_clock::now();
