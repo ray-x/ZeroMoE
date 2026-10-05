@@ -73,8 +73,9 @@ follow-ups are `c9685b9` (partial activation and staged conditional composer),
 `8a5cd68` (shared shape-class worker test), `db35ec8` (opt-in storage
 completion boundary), `3ee2feb` (atomic completion consumption), `cfec8d1`
 (pread-backed shard loader), `b945d47` (host completion dispatcher hook),
-and `62527d1` (captured completion-graph payload upload), with `ee621b6`
-(external-event join fix and RTX 3090 runtime evidence).
+and `62527d1` (captured completion-graph payload upload), `18d2903`
+(payload offsets), `ee621b6` (external-event join fix and RTX 3090 runtime
+evidence), and `dc6896a` (runtime conditional topology contract).
 
 ## Selected runtime
 
