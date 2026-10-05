@@ -352,9 +352,10 @@ avoiding a second SSD/DDR copy.
 The optional runtime owner is created after graph-RAM preload, before the
 prefetch workers start. It copies published DDR expert planes into the shared
 payload and preserves the same Ready/Error generation contract. Enable
-`MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1` and, for a one-request check,
-`MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. This does not change the production
-profile and intentionally does not claim SSD or CUDA completion integration.
+`MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1` and, for a one-request Ready/Error
+check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. This does not change the
+production profile and intentionally does not claim SSD or CUDA completion
+integration.
 
 `include/qwen4exp_adaptive_policy.hpp` contains the later decision rule and is
 not wired into the default scheduler. It chooses staged GPU only when its

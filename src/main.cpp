@@ -4098,6 +4098,27 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                         << (result ? result->service_ms : -1.0) << "\n";
       if (handle)
         engine.qwen4exp_storage_service->release(*handle);
+      const int invalid_expert =
+          engine.model_file.architecture_config.n_experts;
+      auto error_handle = engine.qwen4exp_storage_service->submit(
+          moestream::qwen4exp::StorageRequest{1, 2, 0, {invalid_expert},
+                                              std::make_shared<
+                                                  moestream::qwen4exp::StorageRequest::Payload>()});
+      auto error_result =
+          error_handle ? engine.qwen4exp_storage_service->wait(*error_handle)
+                       : std::nullopt;
+      const bool error_seen =
+          error_result &&
+          error_result->state == moestream::qwen4exp::StorageState::Error &&
+          error_result->model_generation == 1 &&
+          error_result->request_generation == 2;
+      LOG_STREAM_INFO() << "[QWEN4EXP-STORAGE-SELFTEST] error="
+                        << (error_seen ? 1 : 0)
+                        << " error_code="
+                        << (error_result ? error_result->error_code : 0)
+                        << "\n";
+      if (error_handle)
+        engine.qwen4exp_storage_service->release(*error_handle);
     }
   }
 
