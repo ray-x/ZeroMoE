@@ -7761,9 +7761,25 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     const bool borrowed_phase2_suffix =
         g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
         g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu;
-    const size_t kMinGraphAllocHeadroomBytes =
+    size_t kMinGraphAllocHeadroomBytes =
         borrowed_phase2_suffix ? 512ull * 1024ull * 1024ull
                                : 1ull * 1024ull * 1024ull * 1024ull;
+    // Opt-in override of the admission floor (MiB, 64..4096). The default is
+    // unchanged. The measured S=1 decode workspace is ~0.13 GiB, so a large
+    // Option-B arena that leaves 0.5-1 GiB free can still build; the caller
+    // owns the risk of the allocator reserve itself running out of memory.
+    if (const char *floor_env =
+            std::getenv("MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB")) {
+      char *end = nullptr;
+      const long mib = std::strtol(floor_env, &end, 10);
+      if (end != floor_env && *end == '\0' && mib >= 64 && mib <= 4096) {
+        kMinGraphAllocHeadroomBytes =
+            static_cast<size_t>(mib) * 1024ull * 1024ull;
+        LOG_WARN("[GGML-QWEN-FULL] graph allocator admission floor overridden "
+                 "to %ld MiB by MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB\n",
+                 mib);
+      }
+    }
     if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
       LOG_ERROR(
           "[GGML-QWEN-FULL] refusing graph allocator reserve: device %d "
