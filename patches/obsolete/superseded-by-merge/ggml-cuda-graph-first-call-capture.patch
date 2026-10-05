@@ -1,0 +1,26 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4603,10 +4603,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+             if (!graph->warmup_complete) {
+                 // Warmup: need at least 2 calls with no property change on the 2nd call
+                 if (!properties_changed) {
+                     graph->warmup_complete = true;
+                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                     use_cuda_graph = true;
+                     cuda_graph_update_required = true;
++                } else if (graph->instance == nullptr &&
++                           std::getenv("MOESTREAM_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL") != nullptr) {
++                    // MoEStream's full prefill/decode graphs have a single long-lived
++                    // layout and already own stable tensor buffers before compute.
++                    // In this opt-in mode, capture and launch the first real call
++                    // instead of first evaluating every CUDA node individually.
++                    // This can remove a large cold-path penalty; keep the default
++                    // warmup path available until workloads verify capture safety.
++                    graph->warmup_complete = true;
++                    use_cuda_graph = true;
++                    cuda_graph_update_required = true;
++                    GGML_LOG_INFO("%s: capturing CUDA graph on first call (MoEStream opt-in)\n", __func__);
+                 }
+                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+             } else {

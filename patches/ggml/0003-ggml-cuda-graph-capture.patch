@@ -1,0 +1,62 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index a9038f1f4..b42bf4132 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4444,6 +4444,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                     use_cuda_graph = true;
+                     cuda_graph_update_required = true;
++                } else if (graph->instance == nullptr &&
++                           std::getenv("MOESTREAM_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL") != nullptr) {
++                    // MoEStream's full prefill/decode graphs have a single long-lived
++                    // layout and already own stable tensor buffers before compute.
++                    // In this opt-in mode, capture and launch the first real call
++                    // instead of first evaluating every CUDA node individually.
++                    // This can remove a large cold-path penalty; keep the default
++                    // warmup path available until workloads verify capture safety.
++                    graph->warmup_complete = true;
++                    use_cuda_graph = true;
++                    cuda_graph_update_required = true;
++                    GGML_LOG_INFO("%s: capturing CUDA graph on first call (MoEStream opt-in)\n", __func__);
+                 }
+                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+             } else {
+@@ -5783,3 +5795,38 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
+ }
+ 
+ GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
++// MoEStream's Layer-13 staging proof needs to place a CUDA event dependency
++// on the exact stream used by this backend.  The normal ggml public API does
++// not expose that stream, while using the legacy default stream here would
++// not order a non-blocking ggml stream.  Keep this tiny bridge local to the
++// CUDA backend; it does not change normal ggml scheduling semantics.
++extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
++    ggml_backend_t backend) {
++    if (!backend || backend->iface.graph_compute != ggml_backend_cuda_graph_compute)
++        return nullptr;
++    auto *ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    return ctx ? ctx->stream() : nullptr;
++}
++
++// MoEStream's Phase2 master-graph unification needs the actual captured
++// cudaGraph_t for a single-backend-split ggml graph, so it can splice it in
++// as a child-graph node inside an externally-built conditional node (see
++// patches/ggml-cuda-conditional-graph-harvest.patch's caller). ggml keys its
++// internal graph cache the same way ggml_cuda_graph_get_key does (the
++// cgraph's first node pointer); callers must pass that same pointer here.
++// The returned handle is only valid as long as ggml does not recapture it
++// (a properties/shape change) -- callers must re-harvest after every call
++// and must not hold this across a call where the underlying cgraph's
++// properties changed.
++#ifdef USE_CUDA_GRAPH
++extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(
++    ggml_backend_t backend, const ggml_tensor *first_node) {
++    if (!backend || backend->iface.graph_compute != ggml_backend_cuda_graph_compute || !first_node)
++        return nullptr;
++    auto *ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    if (!ctx)
++        return nullptr;
++    ggml_cuda_graph *g = ctx->cuda_graph(first_node);
++    return g ? g->graph : nullptr;
++}
++#endif // USE_CUDA_GRAPH

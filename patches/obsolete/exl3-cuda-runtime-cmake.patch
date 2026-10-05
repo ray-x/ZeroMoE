@@ -1,0 +1,34 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -777,6 +777,7 @@
+     # between both executables the same way models/model_factory.cpp
+     # already is, since both need the identical GPU dispatch surface.
+     set(MOESTREAM_CUDA_SRCS
++        cuda/exl3_matmul.cu
+         cuda/attn_score_softmax.cu
+         cuda/dsv4_score_softmax.cu
+         cuda/dequant_bf16.cu
+@@ -826,6 +827,7 @@
+         src/exl3_cpu.cpp
+         src/exl3_model_loader.cpp
+         src/exl3_decode.cpp
++        src/exl3_gpu.cpp
+         src/cpu_dense.cpp
+         src/cpu_engine.cpp
+         src/cpu_forward.cpp
+@@ -881,6 +883,7 @@
+         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
+     )
+     target_compile_options(moestream PRIVATE ${MOESTREAM_AVX512_FLAGS})
++    target_compile_definitions(moestream PRIVATE MOESTREAM_EXL3_CUDA=1)
+     set_target_properties(moestream PROPERTIES
+         CUDA_SEPARABLE_COMPILATION OFF
+         CUDA_ARCHITECTURES 86        # Ampere; adjust via -DCMAKE_CUDA_ARCHITECTURES
+@@ -910,6 +913,7 @@
+     add_executable(moestream_tests
+         src/main_test.cpp
+         src/exl3_cpu.cpp
++        src/exl3_gpu.cpp
+         src/execution_layer.cpp
+         src/scratch_buffers.cpp
+         src/cuda_kernel_dispatcher.cpp

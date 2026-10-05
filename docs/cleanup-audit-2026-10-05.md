@@ -95,6 +95,39 @@ quantization; tests at `main_test.cpp` ~205-420 pin tolerances against them)
 and per-type performance may differ. Needs an A/B on real GLM-5.x CPU-expert
 layers, so it was NOT done in this cleanup pass.
 
+## Native CUDA matmul kernels — no technical reason to keep them
+
+Question raised by the owner: if ggml/exllamav3 are the tensor libraries, why keep
+hand-written mat-mul kernels? Answer: only because two call sites still route to them.
+
+- Matmul-family files: `q2_0 88, mxfp4 126, matmul 127, q5_1 181, iq2 190, iq4xs 213,
+  q8_0 221, iq3 252, iq1_dequant 404, kquant 524` = ~2,330 lines (+ `dequant_bf16` 251
+  as the cuBLAS BF16 prepack).
+- ggml-cuda (upstream 3cf03257f) supports every type they cover in its `mmvq` decode
+  path (Q4_0 Q5_1 Q8_0 Q2_K..Q6_K IQ1_S/M IQ2_XXS/XS/S IQ3_XXS/S IQ4_NL/XS MXFP4 Q2_0),
+  and all but IQ1_M in `mmq` (prefill). Coverage is not a reason.
+- Two choke points, both `(type, device y, device x, device w, S, I, O)`:
+  1. `CudaKernelDispatcher::matmul` (`cuda_kernel_dispatcher.cpp:109`) — called only by
+     `gpu_expert_executor.cpp` (legacy routed-expert GPU compute).
+  2. `CudaManager::dense_matmul_device_host` (`cuda_manager.hpp` ~2851, ~3139) — dense
+     attention/FFN projections.
+- Who still reaches them: GLM-5.x and DeepSeek-V4 only. `configs/glm53_*` do not enable
+  `moe_ggml_mul_mat_id` (default false), so the legacy per-expert native path is live there.
+  Qwen4Exp (full graph) and GLM-5.3-Flash (full graph) do not use them.
+- exl3: `exl3_matmul.cu` stays (separate library, not a ggml type).
+
+Proposed replacement (not done): one ggml-backed single-op `mul_mat` helper behind both
+choke points — weights/x/y bound as external-pointer tensors (the HC backend already does
+this; patch `0004-ggml-cuda-external-pointer-padding` exists for it), graph + gallocr cached
+per (type, I, O, S), CUDA-graph replay for S=1. ~150 lines replaces ~2,330.
+Risks to measure, not assume:
+- numerics: native kernels use fp32 activations; ggml mmvq quantizes x to Q8_1 (what
+  llama.cpp does). Needs a coherent-text + logit A/B on real GLM-5.x, not a unit tolerance.
+- S=1 decode overhead: ~8 experts x 3 projections x 78 layers = ~1,900 calls/token on the
+  legacy path; per-call graph launch cost must be small next to GLM-5.x's ~1 s/token.
+This is the same GLM/DSV4 work as the `cpu_quant_matmul` replacement above and should be
+done together (one A/B on real model runs).
+
 ## Not yet audited
 
 - Other `src/*.cpp` / `include/*.hpp` classification (native-stack vs ggml vs shared).

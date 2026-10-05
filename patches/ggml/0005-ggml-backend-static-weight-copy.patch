@@ -1,0 +1,80 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index 20bf96501..b7e339fa1 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -1400,7 +1400,45 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                     // create a copy of the input in the split's backend
+                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                         ggml_backend_t backend = sched->backends[cur_backend_id];
+-                        for (int c = 0; c < sched->n_copies; c++) {
++                        // MOESTREAM FIX 2026-09-25: a cross-backend copy only
++                        // needs sched->n_copies independent destination
++                        // buffers when its VALUE can legitimately differ
++                        // between overlapping in-flight submissions -- i.e.
++                        // when the SOURCE is itself flagged as a genuine
++                        // per-call graph INPUT/activation. A static model
++                        // weight leaf (op==NONE, no INPUT flag -- e.g. an
++                        // *_exps.weight tensor bridged from a host/DDR arena
++                        // into a CUDA split for GGML_OP_MUL_MAT_ID) always
++                        // copies from the SAME source bytes on every
++                        // submission, and the execution path (the "wait for
++                        // the split backend to finish using the input before
++                        // overwriting it" branch, gated on this same
++                        // !INPUT-flag condition) already synchronizes before
++                        // every reuse -- so quad-buffering it gives ZERO
++                        // additional correctness benefit and just wastes
++                        // (n_copies-1)x its FULL declared size (the selective
++                        // MoE copy_experts() optimization only reduces bytes
++                        // actually TRANSFERRED per copy, not the buffer's
++                        // allocated size, since it writes at the routed
++                        // experts' ORIGINAL offsets within the full tensor).
++                        // At MoE-expert scale this reliably blows the VRAM
++                        // budget: observed 90.6 GB requested on a 24 GB card
++                        // for 26 *_exps.weight tensors x 4 copies on a real
++                        // qwen4exp full-graph decode session with
++                        // op_offload=true (the actual root cause, since
++                        // fixed on the MoEStream side to keep op_offload
++                        // false -- see ggml_qwen4exp_graph.cpp's
++                        // qwen4exp_full_graph_prepare). Kept as an
++                        // independent hardening fix regardless: give a
++                        // static source exactly one persistent copy,
++                        // mirroring the SAME distinction ggml already makes
++                        // for same-backend inputs a few lines above. The
++                        // matching leaf-registration loop below (search
++                        // "MOESTREAM FIX" again) must stay consistent with
++                        // this same per-tensor copy count.
++                        const int n_copies_for_src =
++                            (src->flags & GGML_TENSOR_FLAG_INPUT) ? sched->n_copies : 1;
++                        for (int c = 0; c < n_copies_for_src; c++) {
+                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
+                             ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                             if (sched->n_copies > 1) {
+@@ -1416,7 +1454,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+                         }
+                         split->inputs[n_inputs] = src;
+                     }
+-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
++                    node->src[j] = tensor_id_copy(src_id, cur_backend_id,
++                        (src->flags & GGML_TENSOR_FLAG_INPUT) ? sched->cur_copy : 0);
+                 }
+             }
+         }
+@@ -1564,7 +1603,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+             for (int j = 0; j < split->n_inputs; j++) {
+                 struct ggml_tensor * input = split->inputs[j];
+                 size_t id = hash_id(input);
+-                for (int c = 0; c < sched->n_copies; c++) {
++                // MOESTREAM FIX 2026-09-25: mirror the reduced per-tensor
++                // copy count used when these copies were created (see
++                // "MOESTREAM FIX" above, in the cross-backend-copy creation
++                // site). A static (non-INPUT-flagged) source only ever
++                // populated copy slot 0; iterating the full sched->n_copies
++                // here would push NULL leaves (slots 1..n_copies-1 stay
++                // zero-initialized, see hv_tensor_copies' memset) into
++                // graph_copy, corrupting the allocator pass.
++                const int n_copies_for_input =
++                    (input->flags & GGML_TENSOR_FLAG_INPUT) ? sched->n_copies : 1;
++                for (int c = 0; c < n_copies_for_input; c++) {
+                     struct ggml_tensor * input_cpy = tensor_id_copy(id, backend_id, c);
+                     sched->leaf_backend_ids[graph_copy->n_leafs] = backend_id;
+                     assert(graph_copy->size > graph_copy->n_leafs);

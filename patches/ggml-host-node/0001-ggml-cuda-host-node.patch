@@ -1,0 +1,111 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+index 91d551bbb..84f45d704 100644
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -2065,6 +2065,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++// Optional strong implementation is supplied by MoEStream's Qwen graph
++// bridge. Undefined weak symbols resolve to null, preserving ordinary ggml
++// CPY behavior for every other application.
++extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
++    const ggml_tensor * node, cudaStream_t stream) __attribute__((weak));
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+@@ -2095,6 +2101,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+             ggml_cuda_dup(ctx, dst);
+             break;
+         case GGML_OP_CPY:
++            // MoEStream's opt-in CPUOffload Phase 4 marker is represented as
++            // a normal CPY node so the scheduler keeps it in the CUDA
++            // capture. The strong bridge expands it to explicit D2H, host
++            // callback, and H2D operations.
++            if (dst->extra && moestream_qwen4exp_cuda_host_node_enqueue &&
++                moestream_qwen4exp_cuda_host_node_enqueue(
++                    dst, ctx.stream())) {
++                break;
++            }
+             ggml_cuda_cpy(ctx, dst->src[0], dst->src[1]);
+             break;
+         case GGML_OP_CONT:
+@@ -4576,6 +4591,77 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
+                node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
+     };
+ 
++    // MoEStream's host-node branch is enabled together with the existing
++    // GGML_CUDA_GRAPH_OPT switch. It only recognizes the explicit
++    // qwen4exp_host_moe_marker -> shared-expert -> add topology.
++    if (getenv("MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL") != nullptr) {
++        const auto & is_moestream_host_marker = [](const ggml_tensor * node) {
++            return node != nullptr && node->op == GGML_OP_CPY &&
++                   strstr(node->name, "qwen4exp_host_moe_marker_l") != nullptr;
++        };
++        for (int marker_idx = 0; marker_idx < cgraph->n_nodes; ++marker_idx) {
++            const ggml_tensor * marker = cgraph->nodes[marker_idx];
++            if (!is_moestream_host_marker(marker)) {
++                continue;
++            }
++            int join_idx = -1;
++            for (int i = marker_idx + 1; i < cgraph->n_nodes; ++i) {
++                const ggml_tensor * candidate = cgraph->nodes[i];
++                if (is_noop(candidate)) {
++                    continue;
++                }
++                for (int s = 0; s < GGML_MAX_SRC; ++s) {
++                    if (candidate->src[s] == marker) {
++                        join_idx = i;
++                        break;
++                    }
++                }
++                if (join_idx >= 0) {
++                    break;
++                }
++            }
++            if (join_idx < 0) {
++                GGML_LOG_DEBUG("Skipping MoEStream host marker %s: no direct join\n", marker->name);
++                continue;
++            }
++            int fork_idx = marker_idx - 1;
++            while (fork_idx >= 0 && is_noop(cgraph->nodes[fork_idx])) {
++                --fork_idx;
++            }
++            if (fork_idx < 0) {
++                continue;
++            }
++            bool only_noops_before_marker = true;
++            for (int i = fork_idx + 1; i < marker_idx; ++i) {
++                if (!is_noop(cgraph->nodes[i])) {
++                    only_noops_before_marker = false;
++                    break;
++                }
++            }
++            if (!only_noops_before_marker || join_idx <= marker_idx + 1) {
++                GGML_LOG_DEBUG("Skipping MoEStream host marker %s: non-contiguous fork/join interval\n", marker->name);
++                continue;
++            }
++            ggml_cuda_concurrent_event event(2);
++            event.join_node = cgraph->nodes[join_idx];
++            event.original_order.reserve(join_idx - fork_idx - 1);
++            for (int i = fork_idx + 1; i < join_idx; ++i) {
++                const ggml_tensor * node = cgraph->nodes[i];
++                event.original_order.push_back(node);
++                event.stream_mapping[node] = (i == marker_idx) ? 1 : 2;
++            }
++            if (!event.is_valid()) {
++                GGML_LOG_DEBUG("Skipping MoEStream host marker %s: branch validation failed\n", marker->name);
++                continue;
++            }
++            auto & events = cuda_ctx->stream_context().concurrent_events;
++            if (events.find(cgraph->nodes[fork_idx]) != events.end()) {
++                continue;
++            }
++            events.emplace(cgraph->nodes[fork_idx], std::move(event));
++            GGML_LOG_INFO("MoEStream: parallel host-node branch marker=%s fork=%s join=%s\n", marker->name, cgraph->nodes[fork_idx]->name, cgraph->nodes[join_idx]->name);
++        }
++    }
+     const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
+         for (uint32_t s = 0; s < GGML_MAX_SRC; ++s) {
+             if (dst->src[s] == src) {

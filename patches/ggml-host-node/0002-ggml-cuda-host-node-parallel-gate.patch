@@ -1,0 +1,26 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -4568,7 +4568,11 @@
+         return env != nullptr && atoi(env) == 1;
+     }();
+ 
+-    if (!enable_graph_optimization) {
++    // MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL_PREFILL_SAFE keeps the
++    // host-marker optimizer off the prefill graph unless explicitly enabled.
++    const bool enable_moestream_host_node_parallel =
++        getenv("MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL") != nullptr;
++    if (!enable_graph_optimization && !enable_moestream_host_node_parallel) {
+         return;
+     }
+ 
+@@ -4660,6 +4664,9 @@
+             }
+             events.emplace(cgraph->nodes[fork_idx], std::move(event));
+             GGML_LOG_INFO("MoEStream: parallel host-node branch marker=%s fork=%s join=%s\n", marker->name, cgraph->nodes[fork_idx]->name, cgraph->nodes[join_idx]->name);
++    if (!enable_graph_optimization) {
++        return;
++    }
+         }
+     }
+     const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {
