@@ -359,9 +359,11 @@ prefetch workers start. It reads packed or unpacked expert planes with
 generation-safe `pread` requests into the shared payload and preserves the same
 Ready/Error generation contract. Enable
 `MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1` and, for a one-request Ready/Error
-check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. This does not change the
-production profile and intentionally does not claim SSD or CUDA completion
-integration.
+check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. Add
+`MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1` to capture and launch the
+stable-address H2D completion graph and join its consumer event. These remain
+opt-in and do not change the production profile; the graph currently uploads a
+prepared payload but does not yet run the staged expert conditional child.
 
 `include/qwen4exp_adaptive_policy.hpp` contains the later decision rule and is
 not wired into the default scheduler. It chooses staged GPU only when its

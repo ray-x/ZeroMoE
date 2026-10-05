@@ -17,6 +17,7 @@
 #include "ggml_hc_backend.hpp"
 #include "ggml_moe_backend.hpp"
 #include "ggml_qwen4exp_graph.hpp"
+#include "qwen4exp_completion_graph.hpp"
 #include "gguf_loader.hpp"
 #include "gguf_tokenizer.hpp"
 #include "logger.hpp"
@@ -4113,9 +4114,31 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       moestream::qwen4exp::StorageCompletion result;
       moestream::qwen4exp::StorageCompletionDispatcher dispatcher(
           *engine.qwen4exp_storage_service);
+      moestream::qwen4exp::CompletionGraph completion_graph;
+      const bool completion_graph_requested =
+          std::getenv("MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST") != nullptr;
       const bool submitted_ready = handle && dispatcher.wait_and_submit(
-          *handle, [](const moestream::qwen4exp::StorageCompletion &) {
-            return true; // Host scheduler hook; CUDA completion graph is future work.
+          *handle, [&](const moestream::qwen4exp::StorageCompletion &completion) {
+            if (!completion_graph_requested)
+              return true; // Host scheduler hook; graph self-test is opt-in.
+            if (!completion.payload ||
+                !completion_graph.prepare(completion.payload->bytes.size()) ||
+                !completion_graph.submit(completion, 1, 1))
+              return false;
+            cudaStream_t consumer = nullptr;
+            if (cudaStreamCreateWithFlags(&consumer, cudaStreamNonBlocking) !=
+                cudaSuccess)
+              return false;
+            const bool joined = completion_graph.wait_on(consumer) &&
+                                cudaStreamSynchronize(consumer) == cudaSuccess &&
+                                completion_graph.synchronize();
+            cudaStreamDestroy(consumer);
+            LOG_STREAM_INFO() << "[QWEN4EXP-COMPLETION-GRAPH] submitted="
+                              << (joined ? 1 : 0)
+                              << " bytes=" << completion.payload->bytes.size()
+                              << " generation=" << completion.request_generation
+                              << "\n";
+            return joined;
           }, &result);
       const bool ready =
           submitted_ready &&
