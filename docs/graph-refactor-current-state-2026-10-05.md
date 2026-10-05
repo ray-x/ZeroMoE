@@ -303,6 +303,12 @@ upload overwrite weights still consumed by an earlier layer in the same graph.
 The shared queue removes the per-layer worker-thread overhead without creating
 that lifetime race. The production profile still keeps staging disabled.
 
+The shape registry has a CPU-only focused test at
+`tests/test_qwen4exp_stage_shape_pool.cpp`. It confirms that identical
+`(top-k, projection shape, quantization type)` keys share one worker service,
+different keys remain isolated, and all submitted jobs complete. Compile it
+with the integration GGML headers and run it before any CUDA staging A/B.
+
 The all-layer verifier remains the required next runtime check. The Python A/B
 harness currently cannot be run from this restricted session because a CUDA
 process spawned by Python cannot see the driver, while the same binary launched
