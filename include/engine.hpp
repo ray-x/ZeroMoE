@@ -560,6 +560,11 @@ public:
     int qwen4exp_partial_layer_top_n = 256;
     float qwen4exp_partial_layer_min_coverage = 1.0f;
     std::vector<int> qwen4exp_partial_layer_gpu_ids; // top-N experts, ranked by usage
+    // Optional published staged set for the three-way pure-GPU conditional
+    // graph. It is populated only after a stable staging generation is ready;
+    // an empty set keeps the staged conditional disabled and preserves the
+    // existing resident/CPU path.
+    std::vector<int> qwen4exp_partial_layer_staged_ids;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
     // Phase 2 owns three decode graph instances.  If their additional arena

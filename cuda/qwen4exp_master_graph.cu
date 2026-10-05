@@ -32,6 +32,35 @@ __global__ void qwen4exp_master_predicate_kernel(
     *fallback_flag = all_in_gpu_set ? 0 : 1;
 }
 
+// Three-way route classifier for the partial-layer graph. A route set is
+// eligible for a pure resident child only when every selected expert is in
+// the immutable resident bitmap. Otherwise it may take the staged child only
+// when every selected expert is in the published staged bitmap. Mixed sets
+// deliberately select neither child; the host CPU fallback then owns every
+// route exactly once. The two conditional handles are written by this one
+// thread, so no concurrent cudaGraphSetConditional calls race.
+__global__ void qwen4exp_master_route_mode_kernel(
+    cudaGraphConditionalHandle resident_handle,
+    cudaGraphConditionalHandle staged_handle, const int32_t *routed_ids,
+    const uint8_t *resident_bitmap, const uint8_t *staged_bitmap, int topk,
+    int n_experts, int32_t *route_mode) {
+    bool all_resident = true;
+    bool all_staged = true;
+    for (int k = 0; k < topk; ++k) {
+        const int32_t id = routed_ids[k];
+        if (id < 0) continue;
+        if (id >= n_experts || !resident_bitmap[id]) all_resident = false;
+        if (id >= n_experts || !staged_bitmap[id]) all_staged = false;
+    }
+    // Resident wins if a malformed publication marks both branches. The
+    // host-side RouteClassification rejects overlapping maps; this tie-break
+    // keeps the device predicate fail-safe during an in-flight bitmap update.
+    const int32_t mode = all_resident ? 1 : (all_staged ? 2 : 0);
+    cudaGraphSetConditional(resident_handle, mode == 1 ? 1u : 0u);
+    cudaGraphSetConditional(staged_handle, mode == 2 ? 1u : 0u);
+    *route_mode = mode;
+}
+
 } // namespace
 
 // extern "C" so the .cpp caller (compiled by the host compiler, this file
@@ -43,6 +72,10 @@ __global__ void qwen4exp_master_predicate_kernel(
 // master graph's predicate node with the explicit graph API.
 extern "C" void *moestream_qwen4exp_master_predicate_kernel_ptr() {
     return reinterpret_cast<void *>(&qwen4exp_master_predicate_kernel);
+}
+
+extern "C" void *moestream_qwen4exp_master_route_mode_kernel_ptr() {
+    return reinterpret_cast<void *>(&qwen4exp_master_route_mode_kernel);
 }
 
 namespace {

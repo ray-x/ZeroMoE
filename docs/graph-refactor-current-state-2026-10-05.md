@@ -43,8 +43,8 @@ nodes and TMA, and distinguishes captured external events from host callbacks.
 | Requirement | Status and evidence |
 | --- | --- |
 | Immutable route classification and exact-once cases | The classifier, fixed-buffer branch projection and all-hot/all-cold/mixed/duplicate tests are implemented. The opt-in DDR callback now consumes a per-replay classification for its CPU branch; the accepted path is unchanged and staged ownership is not yet populated by the runtime graph. |
-| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Incomplete.** The `MOESTREAM_QWEN4EXP_PARTIAL_GRAPH` prototype combines resident GPU work with a cold-only CPU host callback, but has no staged conditional. The separate Phase-2 prototype built prefix/GPU-suffix/CPU-suffix graphs, but its master conditional was disabled because the captured prefix/suffix had 28/69 scheduler splits. The no-Option-B top-64 run in `logs/phase2_conditional_no_optionb_top64_v5.*` therefore tested host-side dispatch between full-graph submissions, not a CUDA conditional body. |
-| A/B partial graph against accepted early-ready | **Performance A/B still pending.** The historical host-callback run reported 33.451 -> 26.526 tok/s (-20.70%, 0/6) and 63/64 top-1 agreement, but it omitted the per-token router-weight D2H copy and does not validate the corrected candidate. The corrected candidate was directly compared against the same binary's static full-graph path: 64/64 top-1 agreement, mean KL 0.00120, and byte-identical generated tokens. The cached local GGML library lacks `ggml_backend_sched_early_cpu_supported()`, so the accepted early-ready arm asserts before inference; cross-build comparisons are retained as correctness context only. |
+| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Partially implemented.** The opt-in DDR graph combines resident GPU work with a cold-only CPU host callback, and now has a fail-closed three-way conditional composer (`MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED`) with separate resident/staged child handles and a device route-mode predicate. It will only instantiate single-CUDA child graphs; no staged generation currently publishes a pure-GPU child, so the three-way composer remains inactive. The existing Phase-2 prototype's 28/69 scheduler splits still prevent its ordinary master conditional from running. |
+| A/B partial graph against accepted early-ready | **A/B completed; candidate rejected.** After fixing both the per-token weight transfer and activation dependency, the corrected six-pair decode comparison measured 34.05 tok/s for early-ready and 26.70 tok/s for the partial callback: −21.61% mean paired gain, 0/6 wins. The 64-step correctness gate is byte-identical, generated tokens match in all six pairs, and all 63 partial callbacks per run succeeded. See `logs/option_b_partial_layer13_activation_fix_perf_tty/results.json`. |
 | SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing and shared payload ownership, with focused ready/error tests. **Runtime SSD loader and separate completion-graph submission are not integrated.** |
 | Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
 | Adaptive CPU versus staged-GPU selection | A timing policy helper and queue/run/DMA/storage telemetry exist. The policy is not wired to live selection or measured in an A/B; the measured staged route path also fails CPU-baseline numerical parity. |
@@ -107,6 +107,15 @@ The CUDA conditional graph remains an optional pure-GPU all-or-nothing path.
 Conditional bodies contain no host callbacks. The current early-ready path is
 the accepted scheduler design; the conditional path is not combined with a
 host callback in one child graph.
+
+The current tree also contains a fail-closed three-way composer for a future
+published staged generation. `cuda/qwen4exp_master_graph.cu` classifies each
+route set on-device as resident, staged, or CPU fallback and writes two
+conditional handles. `try_launch_three_way` accepts only single-CUDA child
+graphs, so a staged child containing the DDR gather callback is rejected rather
+than placed inside a conditional body. The engine carries a separate staged
+expert-ID publication vector, but no runtime completion path fills it yet;
+therefore this composer is inactive by default.
 
 ## Measurements
 
@@ -235,25 +244,19 @@ speed numbers remain historical and do not judge the corrected graph. It also
 skips CPU graph compute for an all-GPU route set and uploads a freshly
 zero-initialized cold contribution.
 
-The corrected implementation was built and run on the RTX 3090. A 64-step
-forced-history comparison against the same binary's static full-graph path
-produced byte-identical generated tokens, 100% top-1 agreement, mean KL
-0.0012007 and maximum KL 0.0090844. A separate eight-step diagnostic observed
-both all-resident routes (10/10) with CPU compute skipped and mixed routes
-(8/10, 9/10 resident) with the cold CPU graph running. The 64-step candidate
-reported successful host callbacks on all 63 replayed tokens. Artifacts and
-input hashes are in
-`logs/option_b_partial_layer13_route_classified_direct_logits/manifest.json`.
-The four focused classifier modes pass, and the graph source compiles.
-
-This is correctness evidence against the static full-graph path, not the
-required performance comparison against accepted early-ready. The cached
-`build_b11401` GGML library lacks `ggml_backend_sched_early_cpu_supported()`;
-enabling early-ready hits its support assertion before inference. The prior
-Python benchmark harness also cannot expose the GPU to its nested engine
-subprocess in this sandbox, so the successful runs used direct TTY launches
-with `CUDA_VISIBLE_DEVICES=0`. The old 33.451 -> 26.526 tok/s result remains
-invalid for the corrected graph. No corrected performance A/B has been run.
+The corrected implementation was built and run on the RTX 3090. Two defects
+found during validation were fixed before the final A/B: the CUDA marker now
+copies the current token's router weights, and the partial marker carries the
+real post-attention activation as a separate graph dependency instead of
+reading its dummy output source. The corrected 64-step forced-history
+comparison against early-ready is byte-identical (zero KL, total variation and
+maximum delta). The final six-pair order-balanced decode run measured 34.05
+tok/s early-ready versus 26.70 tok/s partial, −21.61% mean paired gain, 0/6
+wins. All six token files match and every partial run reports 63 successful
+host callbacks. Full data and input hashes are in
+`logs/option_b_partial_layer13_activation_fix_perf_tty/manifest.json` and
+`results.json`. The partial graph remains opt-in and rejected for production
+because its bounded callback and graph-stream serialization cost about 21.6%.
 
 The existing Phase-2 prefix/suffix graph can provide the pure-CUDA conditional
 body while the suffix CPU graph carries the host callback. A top-256 proof

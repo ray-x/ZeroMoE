@@ -885,10 +885,17 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
   }
   auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(node->extra);
   const bool needs_host_weights = !ctx->gpu_reduce || ctx->partial_cold_only;
+  // The partial cold-only marker uses a dummy CPY source with the same
+  // [D, topk] shape as its per-route output. Its real [D] activation is an
+  // additional graph dependency at src[4]; reading src[0] here would compute
+  // the cold experts from that uninitialized dummy instead of this token's
+  // post-attention hidden state.
+  ggml_tensor *activation =
+      ctx->partial_cold_only ? node->src[4] : node->src[0];
   if (ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
-      !node->data || !node->src[0] || !node->src[2] ||
+      !node->data || !activation || !node->src[2] ||
       (needs_host_weights && !node->src[3]) ||
-      !node->src[0]->data || !node->src[2]->data ||
+      !activation->data || !node->src[2]->data ||
       (needs_host_weights && !node->src[3]->data) ||
       !ctx->host_input || !ctx->host_output || !ctx->host_ids ||
       !ctx->host_weights || !ctx->d2h_start || !ctx->d2h_end ||
@@ -908,7 +915,7 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
                          ctx) != cudaSuccess)
     return false;
   if (cudaEventRecord(ctx->d2h_start, stream) != cudaSuccess ||
-      cudaMemcpyAsync(ctx->host_input, node->src[0]->data, ctx->input_bytes,
+      cudaMemcpyAsync(ctx->host_input, activation->data, ctx->input_bytes,
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
       cudaMemcpyAsync(ctx->host_ids, node->src[2]->data, ctx->ids_bytes,
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
@@ -942,6 +949,7 @@ extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
 extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(
     ggml_backend_t backend, const ggml_tensor *first_node);
 extern "C" void *moestream_qwen4exp_master_predicate_kernel_ptr();
+extern "C" void *moestream_qwen4exp_master_route_mode_kernel_ptr();
 
 constexpr int kGraphSize = 50000;
 constexpr size_t kTensorContextBytes = 128ull * 1024ull * 1024ull;
@@ -5201,6 +5209,8 @@ ggml_tensor *build_qwen4exp_host_node(
   marker->src[2] = route_ids;
   if (!gpu_reduce || partial_cold_only)
     marker->src[3] = route_weights;
+  if (partial_cold_only)
+    marker->src[4] = input3;
   ggml_set_name(marker,
                 ("qwen4exp_host_moe_marker_l" + std::to_string(layer))
                     .c_str());
@@ -9570,14 +9580,19 @@ struct State {
   cudaGraphExec_t master_exec = nullptr;
   cudaGraph_t last_prefix_handle = nullptr;
   cudaGraph_t last_sgpu_handle = nullptr;
+  cudaGraph_t last_staged_handle = nullptr;
   // The predicate kernel writes the device copy.  The host copy is only a
   // pinned destination for the same-stream D2H readback after the graph
   // completes; cudaMallocHost() memory is not necessarily device-mapped and
   // must not be dereferenced by a kernel directly.
   int32_t *device_fallback_flag = nullptr;
   int32_t *host_fallback_flag = nullptr;
+  int32_t *device_route_mode = nullptr;
+  int32_t *host_route_mode = nullptr;
   uint8_t *device_hot_bitmap = nullptr;
+  uint8_t *device_staged_bitmap = nullptr;
   int hot_bitmap_capacity = 0;
+  int staged_bitmap_capacity = 0;
   size_t last_gpu_ids_hash = 0;
   cudaEvent_t phase_start_event = nullptr;
   cudaEvent_t phase_end_event = nullptr;
@@ -9642,6 +9657,35 @@ bool ensure_hot_bitmap(StreamingEngine &engine, int n_experts,
     return false;
   st.last_gpu_ids_hash = h;
   return true;
+}
+
+bool ensure_staged_bitmap(StreamingEngine &engine, int n_experts,
+                          cudaStream_t stream) {
+  State &st = state();
+  if (n_experts <= 0 || engine.qwen4exp_partial_layer_staged_ids.empty())
+    return false;
+  if (!st.device_staged_bitmap || st.staged_bitmap_capacity != n_experts) {
+    if (st.device_staged_bitmap) {
+      cudaFree(st.device_staged_bitmap);
+      st.device_staged_bitmap = nullptr;
+    }
+    if (cudaMalloc(&st.device_staged_bitmap,
+                   static_cast<size_t>(n_experts)) != cudaSuccess) {
+      st.device_staged_bitmap = nullptr;
+      st.staged_bitmap_capacity = 0;
+      return false;
+    }
+    st.staged_bitmap_capacity = n_experts;
+  }
+  std::vector<uint8_t> host_bitmap(static_cast<size_t>(n_experts), 0);
+  for (int id : engine.qwen4exp_partial_layer_staged_ids)
+    if (id >= 0 && id < n_experts)
+      host_bitmap[static_cast<size_t>(id)] = 1;
+  if (cudaMemcpyAsync(st.device_staged_bitmap, host_bitmap.data(),
+                      host_bitmap.size(), cudaMemcpyHostToDevice,
+                      stream) != cudaSuccess)
+    return false;
+  return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
 // Returns false if the fast path cannot be used this token (falls back to
@@ -9852,6 +9896,160 @@ bool try_launch(StreamingEngine &engine, FullGraph &prefix, FullGraph &sgpu,
         elapsed == cudaSuccess ? "ok" : cudaGetErrorString(elapsed));
   }
   return true;
+}
+
+// Three-way variant of the master graph. This is deliberately separate from
+// the two-way resident/CPU path above: the staged child is admitted only when
+// its graph is a single CUDA backend with no host callback. The host callback
+// that publishes staged weights must remain outside this conditional body;
+// once publication is complete, this graph contains only the resident child,
+// staged child, and their device-side route predicate.
+bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
+                          FullGraph &resident, FullGraph &staged,
+                          bool *needs_staged, bool *needs_cpu) {
+  *needs_staged = false;
+  *needs_cpu = true;
+  const char *enabled = std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED");
+  if (!enabled || enabled[0] != '1' ||
+      engine.qwen4exp_partial_layer_staged_ids.empty() || env_enabled())
+    return false;
+  State &st = state();
+  const int prefix_splits = ggml_backend_sched_get_n_splits(prefix.sched);
+  const int resident_splits = ggml_backend_sched_get_n_splits(resident.sched);
+  const int staged_splits = ggml_backend_sched_get_n_splits(staged.sched);
+  if (prefix_splits != 1 || resident_splits != 1 || staged_splits != 1) {
+    LOG_WARN("[QWEN4EXP-MASTER-GRAPH-3WAY] disabled: conditional children "
+             "must be single CUDA graphs (splits=%d/%d/%d); staged graph "
+             "may not contain a host callback\n",
+             prefix_splits, resident_splits, staged_splits);
+    return false;
+  }
+  const auto &c = engine.model_file.architecture_config;
+  cudaStream_t stream = moestream_ggml_backend_cuda_get_stream(prefix.cuda);
+  if (!stream || !ensure_hot_bitmap(engine, c.n_experts, stream) ||
+      !ensure_staged_bitmap(engine, c.n_experts, stream))
+    return false;
+  for (int id : engine.qwen4exp_partial_layer_staged_ids)
+    if (std::find(engine.qwen4exp_partial_layer_gpu_ids.begin(),
+                  engine.qwen4exp_partial_layer_gpu_ids.end(), id) !=
+        engine.qwen4exp_partial_layer_gpu_ids.end()) {
+      LOG_WARN("[QWEN4EXP-MASTER-GRAPH-3WAY] disabled: resident/staged "
+               "expert ownership overlaps at id=%d\n",
+               id);
+      return false;
+    }
+  cudaGraph_t prefix_handle = moestream_ggml_cuda_get_captured_graph(
+      prefix.cuda, ggml_graph_node(prefix.graph, 0));
+  cudaGraph_t resident_handle = moestream_ggml_cuda_get_captured_graph(
+      resident.cuda, ggml_graph_node(resident.graph, 0));
+  cudaGraph_t staged_handle = moestream_ggml_cuda_get_captured_graph(
+      staged.cuda, ggml_graph_node(staged.graph, 0));
+  if (!prefix_handle || !resident_handle || !staged_handle)
+    return false;
+  if (!st.device_route_mode &&
+      cudaMalloc(&st.device_route_mode, sizeof(int32_t)) != cudaSuccess)
+    return false;
+  if (!st.host_route_mode &&
+      cudaMallocHost(&st.host_route_mode, sizeof(int32_t)) != cudaSuccess)
+    return false;
+  const bool graph_changed =
+      st.last_prefix_handle != prefix_handle ||
+      st.last_sgpu_handle != resident_handle ||
+      st.last_staged_handle != staged_handle;
+  if (graph_changed || !st.master_exec) {
+    if (st.master_exec) cudaGraphExecDestroy(st.master_exec);
+    if (st.master_graph) cudaGraphDestroy(st.master_graph);
+    st.master_exec = nullptr;
+    st.master_graph = nullptr;
+    auto build_ok = [&st](cudaError_t status, const char *what) {
+      if (status == cudaSuccess) return true;
+      cudaGetLastError();
+      LOG_WARN("[QWEN4EXP-MASTER-GRAPH-3WAY] %s failed (%s); "
+               "falling back to host dispatch\n",
+               what, cudaGetErrorString(status));
+      return false;
+    };
+    if (!build_ok(cudaGraphCreate(&st.master_graph, 0), "cudaGraphCreate"))
+      return false;
+    cudaGraphNode_t prefix_node = nullptr;
+    if (!build_ok(cudaGraphAddChildGraphNode(&prefix_node, st.master_graph,
+                                             nullptr, 0, prefix_handle),
+                  "adding prefix child"))
+      return false;
+    cudaGraphConditionalHandle resident_cond{}, staged_cond{};
+    if (!build_ok(cudaGraphConditionalHandleCreate(
+                      &resident_cond, st.master_graph, 0,
+                      cudaGraphCondAssignDefault),
+                  "creating resident handle") ||
+        !build_ok(cudaGraphConditionalHandleCreate(
+                      &staged_cond, st.master_graph, 0,
+                      cudaGraphCondAssignDefault),
+                  "creating staged handle"))
+      return false;
+    auto *routed_ids = static_cast<int32_t *>(prefix.partial_layer_ids_out->data);
+    auto *resident_bitmap = st.device_hot_bitmap;
+    auto *staged_bitmap = st.device_staged_bitmap;
+    int topk = c.topk;
+    int n_experts = c.n_experts;
+    int32_t *route_mode = st.device_route_mode;
+    cudaKernelNodeParams predicate{};
+    predicate.func = moestream_qwen4exp_master_route_mode_kernel_ptr();
+    void *args[] = {&resident_cond, &staged_cond, &routed_ids,
+                    &resident_bitmap, &staged_bitmap, &topk, &n_experts,
+                    &route_mode};
+    predicate.gridDim = dim3(1, 1, 1);
+    predicate.blockDim = dim3(1, 1, 1);
+    predicate.kernelParams = args;
+    cudaGraphNode_t predicate_node = nullptr;
+    if (!build_ok(cudaGraphAddKernelNode(&predicate_node, st.master_graph,
+                                         &prefix_node, 1, &predicate),
+                  "adding route-mode predicate"))
+      return false;
+    auto add_child_if = [&](cudaGraphConditionalHandle handle,
+                            cudaGraph_t child, const char *label) {
+      cudaGraphNodeParams params{};
+      params.type = cudaGraphNodeTypeConditional;
+      params.conditional.handle = handle;
+      params.conditional.type = cudaGraphCondTypeIf;
+      params.conditional.size = 1;
+      cudaGraphNode_t conditional = nullptr;
+      if (!build_ok(cudaGraphAddNode(&conditional, st.master_graph,
+                                     &predicate_node, nullptr, 1, &params),
+                    label))
+        return false;
+      cudaGraphNode_t child_node = nullptr;
+      return build_ok(cudaGraphAddChildGraphNode(
+                          &child_node, params.conditional.phGraph_out[0],
+                          nullptr, 0, child),
+                      "adding conditional child graph");
+    };
+    if (!add_child_if(resident_cond, resident_handle,
+                      "adding resident conditional") ||
+        !add_child_if(staged_cond, staged_handle,
+                      "adding staged conditional") ||
+        !build_ok(cudaGraphInstantiate(&st.master_exec, st.master_graph, 0),
+                  "instantiating three-way graph"))
+      return false;
+    st.last_prefix_handle = prefix_handle;
+    st.last_sgpu_handle = resident_handle;
+    st.last_staged_handle = staged_handle;
+    LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] built resident/staged pure-GPU "
+             "conditional children (prefix=%p resident=%p staged=%p)\n",
+             (void *)prefix_handle, (void *)resident_handle,
+             (void *)staged_handle);
+  }
+  if (cudaGraphLaunch(st.master_exec, stream) != cudaSuccess ||
+      cudaMemcpyAsync(st.host_route_mode, st.device_route_mode,
+                      sizeof(int32_t), cudaMemcpyDeviceToHost, stream) !=
+          cudaSuccess ||
+      cudaStreamSynchronize(stream) != cudaSuccess)
+    return false;
+  const int mode = *st.host_route_mode;
+  *needs_staged = mode == 2;
+  *needs_cpu = mode == 0;
+  LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] route mode=%d (resident=%d staged=%d cpu=%d)\n",
+           mode, mode == 1, mode == 2, mode == 0);
+  return mode >= 0 && mode <= 2;
 }
 
 } // namespace qwen4exp_master_graph
