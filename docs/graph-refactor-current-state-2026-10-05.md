@@ -1,11 +1,9 @@
 # Qwen graph refactor: recorded state
 
-This file records the graph worktree state before the scoped commit. The
-repository also contains unrelated ExLlamaV3, CPU, configuration, test and
-generated-artifact changes; those remain outside the graph commit.
-
-The scoped commit is `54c9c64de668f472eb55b8e97b880aaa799b2f0a`
-(`Refactor Qwen graph scheduler overlap`, author `ray-x`).
+This file records the committed graph work and the remaining unrelated
+ExLlamaV3, CPU, configuration, test and generated-artifact changes in the
+shared worktree. Graph commits are authored by `ray-x`; the latest foundation
+commit is `490380a` (`Add graph tier telemetry and adaptive policy foundation`).
 
 ## Selected runtime
 
@@ -192,15 +190,48 @@ It passed ready, error, stale-generation and release cases. Runtime SSD
 loading and completion-graph submission are still separate work; the current
 production profile does not use this service yet.
 
-## Milestone 5 foundation: shared staging workers
+## Milestone 5: shared staging worker service
 
-`Qwen4ExpStageWorkService` now owns the worker queue for staged layers.
-`FullGraph` creates one service and all stage pools submit bank jobs to it;
-pool-specific CUDA buffers and epoch ownership remain stable. This removes the
-one-worker-thread-per-layer topology that inflated all-layer staging overhead.
-The next refinement is to let compatible layers share the same shape-class
-weight/bounce banks as well as the worker queue. The production profile still
-keeps staging disabled.
+`Qwen4ExpStageWorkService` owns one bounded worker queue for all staged layers.
+`FullGraph` creates one service and every stage pool submits bank jobs to it;
+each layer retains independent CUDA weights, metadata, copy stream and
+double-buffered bounce storage. The independent GPU storage is deliberate:
+sharing one shape-compatible weight arena across layers would let a later
+upload overwrite weights still consumed by an earlier layer in the same graph.
+The shared queue removes the per-layer worker-thread overhead without creating
+that lifetime race. The production profile still keeps staging disabled.
+
+The all-layer verifier remains the required next runtime check. The Python A/B
+harness currently cannot be run from this restricted session because a CUDA
+process spawned by Python cannot see the driver, while the same binary launched
+directly from a shell does; this is an execution-environment limitation rather
+than a graph result. No staging speed claim is made from that failed attempt.
+
+A later escalated one-repetition run did reach the GPU. The shared worker
+reported `verified=32` and `max_delta=0` for every staged layer, but the full
+token logits were not parity-safe: 96.875% top-1 agreement, mean KL 0.000967,
+and 33.15 -> 22.07 tok/s. This is retained in
+`logs/option_b_stage_all_shared_worker_verified_v5/` as a rejected staging
+candidate; it does not change the production baseline.
+
+## Milestone 6: storage telemetry and deferred adaptive policy
+
+`StorageService` now publishes queue and service durations with every
+`Ready`/`Error` completion and exposes aggregate submitted/rejected/ready/error
+counters. The model and request generations remain part of the completion, so
+an SSD/DDR completion graph can reject a stale result before it touches a
+staging slot. Loader exceptions are converted to an explicit error completion.
+The service remains host-only: a CUDA host callback may enqueue an immutable
+request, but the worker does not call CUDA or wait for a graph operation.
+
+`include/qwen4exp_adaptive_policy.hpp` contains the later decision rule and is
+not wired into the default scheduler. It chooses staged GPU only when its
+measured transfer queue, H2D, GPU compute and (when needed) storage time is
+strictly below measured CPU queue plus CPU compute time. A pending or invalid
+staging/storage estimate falls back to CPU. This policy is covered by a
+focused test and must be connected to real stage/storage samples only after a
+DDR partial-layer completion graph has passed exact-once and logits parity
+checks.
 
 ## Scope and reproducibility
 

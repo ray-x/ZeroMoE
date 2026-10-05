@@ -27,6 +27,8 @@ int main() {
   assert(ready_result->state == StorageState::Ready);
   assert(error_result->state == StorageState::Error);
   assert(error_result->error_code == 404);
+  assert(ready_result->queue_ms >= 0.0 && ready_result->service_ms >= 0.0);
+  assert(error_result->queue_ms >= 0.0 && error_result->service_ms >= 0.0);
   assert(ready_result->model_generation == 11 &&
          ready_result->request_generation == 1);
   assert(service.release(*ready));
@@ -41,5 +43,9 @@ int main() {
   assert(stale_result && stale_result->model_generation == 12);
   assert(service.release(*stale));
   assert(loads == 3);
+  const auto stats = service.stats();
+  assert(stats.submitted == 3 && stats.rejected == 0);
+  assert(stats.ready == 2 && stats.errors == 1);
+  assert(stats.queue_ms_total >= 0.0 && stats.service_ms_total >= 0.0);
   std::puts("PASS: storage service ready/error generations and stale handles");
 }

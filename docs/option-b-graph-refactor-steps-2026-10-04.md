@@ -417,3 +417,36 @@ byte. The refreshed binary hash matches this manifest. Heavy compilation
 from a separate session explains the slow dump run; its timing is invalid
 and does not replace the guarded throughput result. No further graph-scheduler
 acceptance check is pending for the selected profile.
+
+## Follow-up tier foundations (2026-10-05)
+
+The next design pass is staged behind the accepted profile. The immutable route
+classifier is in `include/moe_partial_route.hpp` with exact-once tests for
+all-hot, all-cold, mixed and duplicate routes. The DDR partial-layer host-node
+prototype remains opt-in because its first parity run was 63/64 top-choice
+agreement with mean KL 0.00129 and its six-pair timing was 33.451 -> 26.526
+tok/s. It has not replaced early-ready.
+
+`Qwen4ExpStageWorkService` now supplies one worker queue to all staged layers,
+while each layer keeps its own GPU weights and epoch banks so uploads cannot
+overwrite a different layer's in-flight consumer. `StorageService` provides a
+host-only SSD/DDR dispatch boundary with explicit `Ready`/`Error` completions,
+model/request generations, stale-handle rejection and queue/service timing.
+`qwen4exp_adaptive_policy.hpp` records the later CPU-versus-staged-GPU timing
+rule but is deliberately not wired into production. GDS/cuFile is excluded.
+
+The focused checks are:
+
+```bash
+g++ -std=c++23 -O2 -Iinclude tests/test_moe_partial_route.cpp \
+  -o /tmp/test_moe_partial_route && /tmp/test_moe_partial_route capable
+g++ -std=c++23 -O2 -pthread -Iinclude tests/test_qwen4exp_storage_service.cpp \
+  -o /tmp/test_qwen4exp_storage_service && /tmp/test_qwen4exp_storage_service
+g++ -std=c++23 -O2 -Iinclude tests/test_qwen4exp_adaptive_policy.cpp \
+  -o /tmp/test_qwen4exp_adaptive_policy && /tmp/test_qwen4exp_adaptive_policy
+```
+
+The next runtime gate is a DDR-only partial graph with exact byte/logit parity,
+followed by an A/B against the accepted early-ready bundle. Only after that
+gate should the storage service be connected to a completion submission and the
+adaptive policy receive live measurements.

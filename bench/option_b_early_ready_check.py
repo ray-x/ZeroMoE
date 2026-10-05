@@ -38,8 +38,16 @@ def competing_cpu(exclude=None):
 
 def competing_gpu(exclude=None):
     # Other adapters share CPU and PCIe resources, too.
-    rows = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid,process_name',
-                                   '--format=csv,noheader'], text=True).splitlines()
+    probe = subprocess.run(
+        ['nvidia-smi', '--query-compute-apps=pid,process_name', '--format=csv,noheader'],
+        text=True, stdout=subprocess.PIPE, check=False)
+    # nvidia-smi returns 9 when the query has no active compute processes.
+    # That is the idle state the admission check is trying to detect.
+    if probe.returncode == 9:
+        return []
+    if probe.returncode:
+        raise subprocess.CalledProcessError(probe.returncode, probe.args)
+    rows = probe.stdout.splitlines()
     return [row for row in rows if row.strip() and int(row.split(',', 1)[0]) != exclude]
 
 

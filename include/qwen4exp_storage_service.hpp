@@ -7,6 +7,7 @@
 // graph (or the existing host scheduler) consumes only a matching generation.
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -34,7 +35,21 @@ struct StorageCompletion {
   int layer = -1;
   StorageState state = StorageState::Error;
   int error_code = 0;
+  // Host-side scheduling telemetry. These values are advisory and are
+  // intentionally published with the completion so a later completion graph
+  // can choose CPU versus staged-GPU without reading mutable service state.
+  double queue_ms = 0.0;
+  double service_ms = 0.0;
   std::vector<int32_t> experts;
+};
+
+struct StorageStats {
+  uint64_t submitted = 0;
+  uint64_t rejected = 0;
+  uint64_t ready = 0;
+  uint64_t errors = 0;
+  double queue_ms_total = 0.0;
+  double service_ms_total = 0.0;
 };
 
 struct StorageHandle {
@@ -69,22 +84,26 @@ class StorageService {
 
   std::optional<StorageHandle> submit(StorageRequest request) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopping_ || queue_.size() >= queue_capacity_)
+    if (stopping_ || queue_.size() >= queue_capacity_) {
+      ++rejected_;
       return std::nullopt;
+    }
     for (uint32_t slot = 0; slot < records_.size(); ++slot) {
       auto &record = records_[slot];
       if (record.state != StorageState::Free)
         continue;
       if (request.model_generation == 0 || request.request_generation == 0 ||
           request.layer < 0 || request.experts.empty())
-        return std::nullopt;
+        { ++rejected_; return std::nullopt; }
       record.request = std::move(request);
       record.completion = {};
       record.completion.model_generation = record.request.model_generation;
       record.completion.request_generation = record.request.request_generation;
       record.completion.layer = record.request.layer;
+      record.enqueued_at = std::chrono::steady_clock::now();
       record.state = StorageState::Pending;
       queue_.push_back(slot);
+      ++submitted_;
       wake_.notify_one();
       return StorageHandle{slot, record.request.model_generation,
                            record.request.request_generation};
@@ -138,6 +157,17 @@ class StorageService {
     return true;
   }
 
+  StorageStats stats() const {
+    StorageStats result;
+    result.submitted = submitted_.load(std::memory_order_relaxed);
+    result.rejected = rejected_.load(std::memory_order_relaxed);
+    result.ready = ready_.load(std::memory_order_relaxed);
+    result.errors = errors_.load(std::memory_order_relaxed);
+    result.queue_ms_total = queue_ms_total_.load(std::memory_order_relaxed);
+    result.service_ms_total = service_ms_total_.load(std::memory_order_relaxed);
+    return result;
+  }
+
   void shutdown() {
     {
       std::lock_guard<std::mutex> lock(mutex_);
@@ -154,6 +184,7 @@ class StorageService {
     StorageState state = StorageState::Free;
     StorageRequest request;
     StorageCompletion completion;
+    std::chrono::steady_clock::time_point enqueued_at{};
   };
 
   void run() {
@@ -167,23 +198,41 @@ class StorageService {
         queue_.pop_front();
       }
       StorageRequest request;
+      std::chrono::steady_clock::time_point enqueued_at;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         request = records_[slot].request;
+        enqueued_at = records_[slot].enqueued_at;
       }
       StorageCompletion completion;
       completion.model_generation = request.model_generation;
       completion.request_generation = request.request_generation;
       completion.layer = request.layer;
       completion.experts = request.experts;
-      bool ok = loader_ && loader_(request, completion);
+      const auto service_start = std::chrono::steady_clock::now();
+      completion.queue_ms = std::chrono::duration<double, std::milli>(
+          service_start - enqueued_at).count();
+      bool ok = false;
+      try {
+        ok = loader_ && loader_(request, completion);
+      } catch (...) {
+        completion.error_code = -2;
+        ok = false;
+      }
+      completion.service_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - service_start).count();
       completion.state = ok ? StorageState::Ready : StorageState::Error;
       if (!ok && completion.error_code == 0) completion.error_code = -1;
+      const double queue_ms = completion.queue_ms;
+      const double service_ms = completion.service_ms;
       {
         std::lock_guard<std::mutex> lock(mutex_);
         records_[slot].completion = std::move(completion);
         records_[slot].state = ok ? StorageState::Ready : StorageState::Error;
       }
+      queue_ms_total_.fetch_add(queue_ms, std::memory_order_relaxed);
+      service_ms_total_.fetch_add(service_ms, std::memory_order_relaxed);
+      (ok ? ready_ : errors_).fetch_add(1, std::memory_order_relaxed);
       done_.notify_all();
     }
   }
@@ -198,6 +247,8 @@ class StorageService {
   StorageLoader loader_;
   std::thread worker_;
   bool stopping_ = false;
+  std::atomic<uint64_t> submitted_{0}, rejected_{0}, ready_{0}, errors_{0};
+  std::atomic<double> queue_ms_total_{0.0}, service_ms_total_{0.0};
 };
 
 }  // namespace moestream::qwen4exp

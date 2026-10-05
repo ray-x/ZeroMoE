@@ -1,9 +1,10 @@
 # Graph refactor — final handoff, 2026-10-05
 
 The reviewed graph/scheduler work and staged A/B sequence are complete for the
-Q2_0 Option-B 0/44/4 profile on the RTX 3090. Changes remain uncommitted.
-All generated tests, logs, captured histories, and discarded attempts are
-preserved. Other ongoing work in the shared tree was preserved.
+Q2_0 Option-B 0/44/4 profile on the RTX 3090. The graph work is committed
+through `490380a`; unrelated ongoing work in the shared tree remains outside
+those commits. All generated tests, logs, captured histories, and discarded
+attempts are preserved.
 
 ## Selected design
 
@@ -24,6 +25,13 @@ The graph and buffer addresses remain stable during decode. GGML owns GPU
 capture/replay; this path does not reconstruct the graph per token. The hook
 is opt-in and requires the patched integration fork, so global defaults remain
 off. GDS/cuFile is excluded and the BF16 dispatch experiment remains deferred.
+
+The later staging refactor uses one shared worker service while retaining
+independent per-layer GPU weight arenas and epoch mailboxes. Sharing one
+shape-compatible arena would let a later upload overwrite weights still in
+use by an earlier layer in the captured graph. The storage completion service
+and adaptive timing policy are foundations for a future partial-layer path;
+they are not enabled by the production profile.
 
 ## Final results and evidence
 
