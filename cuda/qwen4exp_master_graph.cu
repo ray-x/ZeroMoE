@@ -61,6 +61,29 @@ __global__ void qwen4exp_master_route_mode_kernel(
     *route_mode = mode;
 }
 
+// Unpack one Ready storage payload into the fixed top-k compact tensors used
+// by the staged GGML child. StorageService serializes each slot as
+// [gate|up|down], in router order. The kernel is deliberately device-only so
+// it can live in a conditional child graph; no host callback or dynamic
+// address calculation is required during replay.
+__global__ void qwen4exp_unpack_staged_payload_kernel(
+    const uint8_t *payload, uint8_t *gate, uint8_t *up, uint8_t *down,
+    size_t gate_bytes, size_t up_bytes, size_t down_bytes,
+    size_t gate_stride, size_t up_stride, size_t down_stride, int topk) {
+    const int slot = static_cast<int>(blockIdx.x);
+    if (slot >= topk) return;
+    const size_t slot_bytes = gate_bytes + up_bytes + down_bytes;
+    const uint8_t *src = payload + static_cast<size_t>(slot) * slot_bytes;
+    for (size_t i = threadIdx.x; i < gate_bytes; i += blockDim.x)
+        gate[static_cast<size_t>(slot) * gate_stride + i] = src[i];
+    for (size_t i = threadIdx.x; i < up_bytes; i += blockDim.x)
+        up[static_cast<size_t>(slot) * up_stride + i] =
+            src[gate_bytes + i];
+    for (size_t i = threadIdx.x; i < down_bytes; i += blockDim.x)
+        down[static_cast<size_t>(slot) * down_stride + i] =
+            src[gate_bytes + up_bytes + i];
+}
+
 } // namespace
 
 // extern "C" so the .cpp caller (compiled by the host compiler, this file
@@ -76,6 +99,10 @@ extern "C" void *moestream_qwen4exp_master_predicate_kernel_ptr() {
 
 extern "C" void *moestream_qwen4exp_master_route_mode_kernel_ptr() {
     return reinterpret_cast<void *>(&qwen4exp_master_route_mode_kernel);
+}
+
+extern "C" void *moestream_qwen4exp_unpack_staged_payload_kernel_ptr() {
+    return reinterpret_cast<void *>(&qwen4exp_unpack_staged_payload_kernel);
 }
 
 namespace {

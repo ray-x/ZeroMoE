@@ -81,7 +81,8 @@ class CompletionGraph {
               uint64_t expected_model_generation,
               uint64_t expected_request_generation) {
     if (state_ == CompletionGraphState::Unprepared || !upload_stream_ ||
-        !graph_exec_ || completion.state != StorageState::Ready ||
+        state_ == CompletionGraphState::Pending || !graph_exec_ ||
+        completion.state != StorageState::Ready ||
         completion.model_generation != expected_model_generation ||
         completion.request_generation != expected_request_generation ||
         !completion.payload || completion.payload->bytes.size() > capacity_bytes_)

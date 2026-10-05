@@ -561,9 +561,23 @@ public:
           completion.model_generation != expected_model_generation ||
           completion.request_generation == 0 || completion.layer < 0 ||
           completion.experts.empty() ||
+          completion.experts.size() !=
+              static_cast<size_t>(std::max(1, model_file.architecture_config.topk)) ||
+          !completion.payload || completion.payload->offsets.size() !=
+              completion.experts.size() + 1 ||
+          completion.payload->offsets.empty() ||
+          completion.payload->offsets.front() != 0 ||
+          completion.payload->offsets.back() != completion.payload->bytes.size() ||
           (qwen4exp_partial_layer >= 0 &&
            completion.layer != qwen4exp_partial_layer))
         return false;
+      const size_t slot_bytes = completion.payload->offsets[1];
+      if (slot_bytes == 0)
+        return false;
+      for (size_t i = 1; i < completion.payload->offsets.size(); ++i)
+        if (completion.payload->offsets[i] - completion.payload->offsets[i - 1] !=
+            slot_bytes)
+          return false;
       const int n_experts = model_file.architecture_config.n_experts;
       std::vector<int> candidate;
       candidate.reserve(completion.experts.size());
@@ -571,11 +585,15 @@ public:
         if (expert < 0 || expert >= n_experts ||
             std::find(qwen4exp_partial_layer_gpu_ids.begin(),
                       qwen4exp_partial_layer_gpu_ids.end(), expert) !=
-                qwen4exp_partial_layer_gpu_ids.end() ||
-            std::find(candidate.begin(), candidate.end(), expert) !=
-                candidate.end())
+                qwen4exp_partial_layer_gpu_ids.end())
           return false;
-        candidate.push_back(expert);
+        // Duplicate route slots are valid: they carry distinct router
+        // weights but consume the same staged expert bytes. Publish one
+        // bitmap owner per expert while preserving the payload's original
+        // slot order for the staged child.
+        if (std::find(candidate.begin(), candidate.end(), expert) ==
+            candidate.end())
+          candidate.push_back(expert);
       }
       std::sort(candidate.begin(), candidate.end());
       qwen4exp_partial_layer_staged_ids = std::move(candidate);
@@ -613,6 +631,11 @@ public:
     // rebuilds for the session.
     std::unique_ptr<moestream::qwen4exp::CompletionGraph>
         qwen4exp_completion_graph;
+    // Generation counters for the opt-in storage/completion path. A model
+    // load owns one model generation; request generations are monotonic and
+    // are validated before staged ownership is published.
+    uint64_t qwen4exp_storage_model_generation = 1;
+    uint64_t qwen4exp_storage_next_request_generation = 1;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
     // Phase 2 owns three decode graph instances.  If their additional arena
