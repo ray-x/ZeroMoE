@@ -78,6 +78,8 @@ and `62527d1` (captured completion-graph payload upload), `18d2903`
 evidence), and `dc6896a` (runtime conditional topology contract).
 The persistent completion-graph handle is `d468d64`; `a196237` composes its
 captured payload child before the staged route predicate.
+`66f8d18` also includes the completion child in the master-graph rebuild key,
+so prepare/reset changes cannot leave a stale child graph attached.
 
 ## Selected runtime
 
