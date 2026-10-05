@@ -68,8 +68,9 @@ The four-step overlap plan is complete as an experiment sequence:
 
 This file records the committed graph work and the remaining unrelated
 ExLlamaV3, CPU, configuration, test and generated-artifact changes in the
-shared worktree. Graph commits are authored by `ray-x`; the latest foundation
-commit is `490380a` (`Add graph tier telemetry and adaptive policy foundation`).
+shared worktree. Graph commits are authored by `ray-x`; the latest scoped
+follow-ups are `c9685b9` (partial activation and staged conditional composer)
+and `8a5cd68` (shared shape-class worker test).
 
 ## Selected runtime
 
