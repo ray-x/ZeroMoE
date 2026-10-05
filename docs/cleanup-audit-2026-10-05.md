@@ -62,19 +62,42 @@ Verification (build_ggmlcuda, `configs/qwen4exp_tg400_iq1m_22_26.toml`,
 Logs: `logs/qwen_flash_decode_{baseline,after}_*_2026-10-05.log`,
 pre-edit copies `logs/*.pre_qwen_removal`.
 
+## `kernels_cpu.cpp` (4,033 lines) — audit result: do NOT hand-delete
+
+Method: for each of the 63 public symbols in `include/kernels_cpu.hpp`, callers
+split into ggml-stack files (`ggml_*`, `cpu_qwen*`, `qwen_*`), legacy files
+(`attention_layer`, `execution_layer`, `*_dispatch_pipeline`, `moe_*`,
+`*_expert_executor`, ...) and tests. Intra-file references checked too.
+
+Findings
+- **Qwen's CPU experts already use ggml directly.** `ggml_qwen_cpu_moe.cpp`
+  calls `ggml_vec_dot_iq1_m_q8_K / iq2_xxs_q8_K / iq3_xxs_q8_K / iq4_nl_q8_0`.
+  The hand kernels are not on the Qwen decode hot path.
+- **The hand kernels' real consumer is `cpu_quant_matmul`** (`kquant_dequant.hpp:663`),
+  called by `cpu_expert_executor`, `moe_router_service`, `shared_expert_executor`,
+  `dense_dispatch`, `token_dispatch_pipeline` — i.e. the legacy GLM/DeepSeek stack.
+- ~50 of the 63 symbols have **no external caller**, but most are reached through
+  `cpu_quant_matmul`'s per-type `switch` or `kquant_dequant.hpp` (2 refs inside
+  the .cpp means "definition + dispatch"). Name-grep alone cannot prove them
+  dead, and deleting by that list would break GLM/DeepSeek CPU paths.
+- Truly unreferenced (0 refs anywhere): `dot_f32` only. Everything else is
+  either dispatched or used by tests / the NEON file.
+- Keep regardless: `matmul_qwen_q2_0_q2_0_fused` (ggml-stack only, Q2_0 VNNI),
+  `matmul_qwen_iq1_m/iq2_xxs/q4_0_*_fused`, `cpu_*_enabled` gates.
+
+Recommendation (belongs with step 5, GLM/DSV4 -> ggml)
+Replace `cpu_quant_matmul`'s hand-written per-type kernels with one generic
+ggml-backed routine: `ggml_get_type_traits_cpu(type)` -> `from_float` for the
+activation into `vec_dot_type`, then `vec_dot` per output row (OpenMP over rows).
+That is ~100 lines and would make ~3,000 lines of `kernels_cpu.cpp` removable.
+Risk: numerics change (the hand kernels use their own int8 activation
+quantization; tests at `main_test.cpp` ~205-420 pin tolerances against them)
+and per-type performance may differ. Needs an A/B on real GLM-5.x CPU-expert
+layers, so it was NOT done in this cleanup pass.
+
 ## Not yet audited
 
-- `src/*.cpp` / `include/*.hpp` classification (native-stack vs ggml vs shared).
-- `kernels_cpu.cpp` (4,033 lines) — which functions ggml's CPU backend can replace.
+- Other `src/*.cpp` / `include/*.hpp` classification (native-stack vs ggml vs shared).
 - `cpu_*` engine files, `models/*` (`cpu_qwen_moe.hpp` etc.).
-- `main_test.cpp` / `test_components.cpp` tests tied to removed code.
+- Remaining `main_test.cpp` / `test_components.cpp` tests tied to removed code.
 - Configs: only GLM-5.2 (deferred by owner) and root clutter handled so far.
-
-## Already moved to `obsolete/` (step 1)
-
-Root debug logs, scratch dumps, one-off scripts, perf data, tgz archives,
-CLAUDE.v1-4, session transcripts, unreferenced build dirs (`build_lf`,
-`build_prof`, `build_verify`, `build_llamacpp_ggml`, `.lcb-run`, `llama_logs`).
-Left in place because scripts/docs reference them: `build_b11401`,
-`build-bee-instrumented`, `build_fork_diag`, `bench_tmp`, `doc`, `Testing`.
-`CMakeLists.txt` backup before edits: `obsolete/cmake_backup/`.
