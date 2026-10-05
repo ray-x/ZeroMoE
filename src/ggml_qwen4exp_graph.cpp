@@ -9648,9 +9648,19 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   };
 
   if (phase2_any_wanted) {
+    // The bootstrap owner already contains the compact Option-B expert arena
+    // needed by every Phase-2 sibling. Prefix executes routing only, but it
+    // still materializes the resident tensor handles for graph construction;
+    // make it borrow the owner instead of allocating a second 10+ GiB arena
+    // after prefill has consumed the remaining VRAM headroom.
+    FullGraph *phase2_expert_owner =
+        g_graph_decode_arena_owner && g_graph_decode_arena_owner->ready &&
+                g_graph_decode_arena_owner->engine == &engine
+            ? g_graph_decode_arena_owner.get()
+            : nullptr;
     auto prefix = build_one(FullGraph::Phase2Mode::Prefix,
                             engine.qwen4exp_partial_layer, nullptr, nullptr,
-                            nullptr);
+                            phase2_expert_owner);
     if (prefix) {
       // Must be visible via the g_graph global BEFORE building either
       // suffix instance: their own build_graph() reads g_graph to find
