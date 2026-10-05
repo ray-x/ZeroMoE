@@ -22,6 +22,14 @@ extern "C" cudaError_t moestream_qwen_stage_delay(unsigned int, cudaStream_t);
 // target pool's stable bank and shape-specific CUDA tensors.
 class Qwen4ExpStageWorkService {
  public:
+  struct Stats {
+    uint64_t submitted = 0;
+    uint64_t rejected = 0;
+    uint64_t completed = 0;
+    double queue_ms_total = 0.0;
+    double run_ms_total = 0.0;
+  };
+
   explicit Qwen4ExpStageWorkService(size_t workers = 1) {
     workers = std::max<size_t>(1, workers);
     for (size_t i = 0; i < workers; ++i)
@@ -33,10 +41,22 @@ class Qwen4ExpStageWorkService {
 
   bool submit(std::function<void()> job) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (stopping_) return false;
-    jobs_.push_back(std::move(job));
+    if (stopping_) {
+      rejected_.fetch_add(1, std::memory_order_relaxed);
+      return false;
+    }
+    jobs_.push_back({std::move(job), std::chrono::steady_clock::now()});
+    submitted_.fetch_add(1, std::memory_order_relaxed);
     wake_.notify_one();
     return true;
+  }
+
+  Stats stats() const {
+    return {submitted_.load(std::memory_order_relaxed),
+            rejected_.load(std::memory_order_relaxed),
+            completed_.load(std::memory_order_relaxed),
+            queue_ms_total_.load(std::memory_order_relaxed),
+            run_ms_total_.load(std::memory_order_relaxed)};
   }
 
   void shutdown() {
@@ -54,7 +74,7 @@ class Qwen4ExpStageWorkService {
  private:
   void run() {
     for (;;) {
-      std::function<void()> job;
+      Job job;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         wake_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
@@ -62,15 +82,28 @@ class Qwen4ExpStageWorkService {
         job = std::move(jobs_.front());
         jobs_.pop_front();
       }
-      job();
+      const auto start = std::chrono::steady_clock::now();
+      queue_ms_total_.fetch_add(std::chrono::duration<double, std::milli>(
+          start - job.enqueued_at).count(), std::memory_order_relaxed);
+      job.fn();
+      run_ms_total_.fetch_add(std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - start).count(),
+          std::memory_order_relaxed);
+      completed_.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
+  struct Job {
+    std::function<void()> fn;
+    std::chrono::steady_clock::time_point enqueued_at;
+  };
   std::mutex mutex_;
   std::condition_variable wake_;
-  std::deque<std::function<void()>> jobs_;
+  std::deque<Job> jobs_;
   std::vector<std::thread> threads_;
   bool stopping_ = false;
+  std::atomic<uint64_t> submitted_{0}, rejected_{0}, completed_{0};
+  std::atomic<double> queue_ms_total_{0.0}, run_ms_total_{0.0};
 };
 
 // Each bank is held until both its DMA and the token that could consume it
@@ -83,6 +116,7 @@ struct Qwen4ExpStagePool {
     const unsigned long long *prediction_epoch = nullptr;
     cudaEvent_t prediction_ready = nullptr, copied = nullptr;
     uint8_t *bounce = nullptr;
+    std::chrono::steady_clock::time_point copy_enqueued_at{};
   } banks[2];
   ggml_tensor *source[3] = {}, *weights[3] = {};
   ggml_backend_t backend = nullptr;
@@ -113,6 +147,24 @@ struct Qwen4ExpStagePool {
   std::deque<int> jobs;
   unsigned long long completed_epoch = 0;
   std::atomic<uint64_t> requests{0}, dropped{0}, predicted{0}, uploaded{0}, late{0};
+  std::atomic<uint64_t> dma_completed{0};
+  std::atomic<double> dma_ms_total{0.0};
+
+  struct Timing {
+    uint64_t requests = 0, dropped = 0, predicted = 0, uploaded = 0,
+             late = 0, dma_completed = 0;
+    double dma_ms_total = 0.0;
+  };
+
+  Timing timing() const {
+    return {requests.load(std::memory_order_relaxed),
+            dropped.load(std::memory_order_relaxed),
+            predicted.load(std::memory_order_relaxed),
+            uploaded.load(std::memory_order_relaxed),
+            late.load(std::memory_order_relaxed),
+            dma_completed.load(std::memory_order_relaxed),
+            dma_ms_total.load(std::memory_order_relaxed)};
+  }
 
   ~Qwen4ExpStagePool() {
     if (device >= 0) cudaSetDevice(device);
@@ -283,8 +335,10 @@ struct Qwen4ExpStagePool {
     for (auto &bank : banks) {
       if (bank.busy.load(std::memory_order_acquire) &&
           bank.dma_queued.load(std::memory_order_acquire) && bank.epoch <= tag &&
-          cudaEventQuery(bank.copied) == cudaSuccess)
+          cudaEventQuery(bank.copied) == cudaSuccess) {
+        account_dma_completion(bank);
         bank.busy.store(false, std::memory_order_release);
+      }
     }
   }
 
@@ -302,14 +356,24 @@ struct Qwen4ExpStagePool {
     return cudaStreamWaitEvent(stream, bank.copied, 0) == cudaSuccess;
   }
 
+  void account_dma_completion(Bank &bank) {
+    if (!bank.dma_queued.exchange(false, std::memory_order_acq_rel)) return;
+    dma_ms_total.fetch_add(std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - bank.copy_enqueued_at).count(),
+        std::memory_order_relaxed);
+    dma_completed.fetch_add(1, std::memory_order_relaxed);
+  }
+
   void request(unsigned long long tag, const int32_t *predictions,
                const unsigned long long *prediction_epoch, cudaEvent_t ready) {
     const int index = tag & 1;
     auto &bank = banks[index];
     if (bank.busy.load(std::memory_order_acquire) &&
         bank.dma_queued.load(std::memory_order_acquire) && bank.epoch <= completed_epoch &&
-        cudaEventQuery(bank.copied) == cudaSuccess)
+        cudaEventQuery(bank.copied) == cudaSuccess) {
+      account_dma_completion(bank);
       bank.busy.store(false, std::memory_order_release);
+    }
     bool idle = false;
     if (!bank.busy.compare_exchange_strong(idle, true, std::memory_order_acq_rel)) {
       ++dropped;
@@ -384,6 +448,7 @@ struct Qwen4ExpStagePool {
         ++uploaded;
       }
       GGML_ASSERT(cudaEventRecord(bank.copied, copy_stream) == cudaSuccess);
+      bank.copy_enqueued_at = std::chrono::steady_clock::now();
       bank.dma_queued.store(true, std::memory_order_release);
   }
 

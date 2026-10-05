@@ -466,3 +466,8 @@ mean KL 0.000589 in the captured 64-token comparison. The staged verifier's
 zero delta is only GPU-reference parity and cannot certify CPU-baseline parity.
 Keep the path rejected until the CPU/GPU arithmetic difference is either
 eliminated or an explicit quality contract accepts it.
+
+The shared stage service now reports worker queue/run time, and each stage pool
+reports completed copy-stream DMA time. These measurements feed future adaptive
+selection experiments but remain observational; no adaptive route choice is
+enabled in the production profile.

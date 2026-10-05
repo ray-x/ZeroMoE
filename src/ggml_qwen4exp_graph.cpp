@@ -10308,16 +10308,24 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                (unsigned long long)early.staged_routes);
     if (early.calls % 32 == 0 && early.stage_target) {
       const auto &pool = *early.stage_target;
+      const auto pt = pool.timing();
+      const auto wt = g.early_stage_service
+                          ? g.early_stage_service->stats()
+                          : Qwen4ExpStageWorkService::Stats{};
       LOG_INFO("[OPTION-B-STAGE-PREDICT] layer=%d requested=%llu dropped=%llu "
                "predicted=%llu uploaded=%llu late=%llu verified=%llu max_delta=%.9g "
-               "expected_max=%.9g actual_max=%.9g\n", entry.first,
+               "expected_max=%.9g actual_max=%.9g dma_avg=%.3fms "
+               "worker_queue_avg=%.3fms worker_run_avg=%.3fms\n", entry.first,
                (unsigned long long)pool.requests.load(),
                (unsigned long long)pool.dropped.load(),
                (unsigned long long)pool.predicted.load(),
                (unsigned long long)pool.uploaded.load(),
                (unsigned long long)pool.late.load(),
                (unsigned long long)pool.verified, pool.verify_max_delta,
-               pool.verify_expected_max_abs, pool.verify_actual_max_abs);
+               pool.verify_expected_max_abs, pool.verify_actual_max_abs,
+               pt.dma_completed ? pt.dma_ms_total / pt.dma_completed : 0.0,
+               wt.completed ? wt.queue_ms_total / wt.completed : 0.0,
+               wt.completed ? wt.run_ms_total / wt.completed : 0.0);
     }
   }
   dump_layer0_diag_values(g);

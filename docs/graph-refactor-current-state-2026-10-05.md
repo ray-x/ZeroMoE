@@ -245,6 +245,10 @@ focused test and must be connected to real stage/storage samples only after a
 DDR partial-layer completion graph has passed exact-once and logits parity
 checks.
 
+The shared stage worker now exposes queue/run aggregates and each pool reports
+completed DMA time. These are diagnostic inputs for the policy; they do not
+change route selection yet.
+
 ## Scope and reproducibility
 
 The scoped graph files are:
