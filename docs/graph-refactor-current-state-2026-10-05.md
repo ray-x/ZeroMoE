@@ -82,6 +82,8 @@ captured payload child before the staged route predicate.
 so prepare/reset changes cannot leave a stale child graph attached.
 `080b65e` wires the payload-backed `SuffixStaged` child and its generation-
 validated runtime dispatch; it is intentionally not the production default.
+`202b440` adds the measured opt-in adaptive CPU/staged-GPU decision and its
+warmup counters.
 
 ## Selected runtime
 
