@@ -73,8 +73,8 @@ follow-ups are `c9685b9` (partial activation and staged conditional composer),
 `8a5cd68` (shared shape-class worker test), `db35ec8` (opt-in storage
 completion boundary), `3ee2feb` (atomic completion consumption), `cfec8d1`
 (pread-backed shard loader), `b945d47` (host completion dispatcher hook),
-and `62527d1` (captured completion-graph payload upload), with the latest
-external-event fix and runtime evidence in the next completion-graph commit.
+and `62527d1` (captured completion-graph payload upload), with `ee621b6`
+(external-event join fix and RTX 3090 runtime evidence).
 
 ## Selected runtime
 
