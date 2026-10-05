@@ -339,9 +339,19 @@ g++ -std=c++23 -O2 -pthread -Iinclude \
 /tmp/test_qwen4exp_storage_service
 ```
 
-It passed ready, error, stale-generation and release cases. Runtime SSD
-loading and completion-graph submission are still separate work; the current
-production profile does not use this service yet.
+It passed ready, error, stale-generation, release, duplicate-route and malformed
+payload-slot cases. Runtime SSD loading and completion-graph submission are
+implemented behind opt-in flags; the current production profile does not use
+this service.
+
+The host-only staged boundary simulation is
+`tests/test_qwen4exp_staged_boundary.cpp`:
+
+```bash
+g++ -std=c++23 -O2 -pthread -Iinclude \
+  tests/test_qwen4exp_staged_boundary.cpp -o /tmp/test_qwen4exp_staged_boundary
+/tmp/test_qwen4exp_staged_boundary
+```
 
 ## Milestone 5: shared staging worker service
 
@@ -385,7 +395,7 @@ branch used by the accepted scheduler. The evidence is in
 `logs/option_b_stage_layer13_no_request_v1/`. This path is therefore rejected
 for production until its CPU/GPU arithmetic contract is resolved.
 
-## Milestone 6: storage telemetry and deferred adaptive policy
+## Milestone 6: storage telemetry and opt-in adaptive policy
 
 `StorageService` now publishes queue and service durations with every
 `Ready`/`Error` completion and exposes aggregate submitted/rejected/ready/error
@@ -411,24 +421,25 @@ check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. Add
 before Qwen graph bootstrap, and `MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1`
 captures and launches the stable-address H2D completion graph and joins its
 consumer event. These remain opt-in and do not change the production profile;
-the graph currently uploads a prepared payload but does not yet run the staged
-expert conditional child. A
+the continuation graph now unpacks the prepared payload in the staged
+conditional body, while malformed, stale, mixed-geometry or graph-admission
+failures use the CPU suffix. A
 direct RTX 3090 self-test produced `submitted=1`, `bytes=1382400`, `ready=1`
 and a separate generation-tagged `error=1 error_code=404` record in
 `logs/qwen4exp_q2_0_option_b_split44_x0_cov80.log`.
 
-`include/qwen4exp_adaptive_policy.hpp` contains the later decision rule and is
-not wired into the default scheduler. It chooses staged GPU only when its
-measured transfer queue, H2D, GPU compute and (when needed) storage time is
-strictly below measured CPU queue plus CPU compute time. A pending or invalid
-staging/storage estimate falls back to CPU. This policy is covered by a
-focused test and must be connected to real stage/storage samples only after a
-DDR partial-layer completion graph has passed exact-once and logits parity
-checks.
+`include/qwen4exp_adaptive_policy.hpp` contains the opt-in decision rule. With
+`MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1`, four CPU suffix samples seed a measured
+baseline, then the runtime compares CPU queue/compute with storage queue/service,
+completion upload wait and staged continuation time. A pending or invalid
+staging/storage estimate falls back to CPU. The policy and the host-only
+storage/staged-boundary simulation are covered by focused tests; an RTX
+runtime A/B and logits-parity result for the new staged route are still
+required.
 
 The shared stage worker now exposes queue/run aggregates and each pool reports
-completed DMA time. These are diagnostic inputs for the policy; they do not
-change route selection yet.
+completed DMA time. These are diagnostic inputs for the opt-in policy; the
+production route selection remains unchanged.
 
 The worker topology is now a shape-class registry: layers with matching
 `topk`, projection dimensions and quantization types share one worker service;
