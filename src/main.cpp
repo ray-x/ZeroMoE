@@ -4110,40 +4110,45 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           moestream::qwen4exp::StorageRequest::Payload>();
       auto handle = engine.qwen4exp_storage_service->submit(
           moestream::qwen4exp::StorageRequest{1, 1, 0, {0}, payload});
-      auto result = handle ? engine.qwen4exp_storage_service->wait_consume(*handle)
-                           : std::nullopt;
-      const bool ready = result &&
-                         result->state ==
-                             moestream::qwen4exp::StorageState::Ready &&
-                         result->model_generation == 1 &&
-                         result->request_generation == 1 &&
-                         result->payload == payload;
+      moestream::qwen4exp::StorageCompletion result;
+      moestream::qwen4exp::StorageCompletionDispatcher dispatcher(
+          *engine.qwen4exp_storage_service);
+      const bool submitted_ready = handle && dispatcher.wait_and_submit(
+          *handle, [](const moestream::qwen4exp::StorageCompletion &) {
+            return true; // Host scheduler hook; CUDA completion graph is future work.
+          }, &result);
+      const bool ready =
+          submitted_ready &&
+          result.state == moestream::qwen4exp::StorageState::Ready &&
+          result.model_generation == 1 && result.request_generation == 1 &&
+          result.payload == payload;
       LOG_STREAM_INFO() << "[QWEN4EXP-STORAGE-SELFTEST] state="
-                        << (result ? static_cast<int>(result->state) : -1)
+                        << (submitted_ready ? static_cast<int>(result.state) : -1)
                         << " ready=" << (ready ? 1 : 0)
                         << " queue_ms="
-                        << (result ? result->queue_ms : -1.0)
+                        << (submitted_ready ? result.queue_ms : -1.0)
                         << " service_ms="
-                        << (result ? result->service_ms : -1.0) << "\n";
+                        << (submitted_ready ? result.service_ms : -1.0) << "\n";
       const int invalid_expert =
           engine.model_file.architecture_config.n_experts;
       auto error_handle = engine.qwen4exp_storage_service->submit(
           moestream::qwen4exp::StorageRequest{1, 2, 0, {invalid_expert},
                                               std::make_shared<
                                                   moestream::qwen4exp::StorageRequest::Payload>()});
-      auto error_result = error_handle
-                              ? engine.qwen4exp_storage_service->wait_consume(
-                                    *error_handle)
-                              : std::nullopt;
+      moestream::qwen4exp::StorageCompletion error_result;
+      const bool submitted_error = error_handle && dispatcher.wait_and_submit(
+          *error_handle, [](const moestream::qwen4exp::StorageCompletion &) {
+            return true;
+          }, &error_result);
       const bool error_seen =
-          error_result &&
-          error_result->state == moestream::qwen4exp::StorageState::Error &&
-          error_result->model_generation == 1 &&
-          error_result->request_generation == 2;
+          submitted_error &&
+          error_result.state == moestream::qwen4exp::StorageState::Error &&
+          error_result.model_generation == 1 &&
+          error_result.request_generation == 2;
       LOG_STREAM_INFO() << "[QWEN4EXP-STORAGE-SELFTEST] error="
                         << (error_seen ? 1 : 0)
                         << " error_code="
-                        << (error_result ? error_result->error_code : 0)
+                        << (submitted_error ? error_result.error_code : 0)
                         << "\n";
     }
   }

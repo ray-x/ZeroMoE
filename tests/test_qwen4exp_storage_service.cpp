@@ -82,5 +82,24 @@ int main() {
   assert(consumed && consumed->state == StorageState::Ready &&
          consumed->model_generation == 30 && consumed->request_generation == 1);
   assert(!atomic_consume.poll(*consumable));
+
+  StorageService dispatched(1, 1, [](const StorageRequest &,
+                                     StorageCompletion &) { return true; });
+  auto dispatch_handle =
+      dispatched.submit(StorageRequest{40, 1, 2, {5}});
+  assert(dispatch_handle);
+  StorageCompletion dispatched_completion;
+  bool submit_called = false;
+  StorageCompletionDispatcher dispatcher(dispatched);
+  assert(dispatcher.wait_and_submit(
+      *dispatch_handle,
+      [&](const StorageCompletion &completion) {
+        submit_called = true;
+        return completion.state == StorageState::Ready &&
+               completion.model_generation == 40 &&
+               completion.request_generation == 1;
+      },
+      &dispatched_completion));
+  assert(submit_called && dispatched_completion.state == StorageState::Ready);
   std::puts("PASS: storage service ready/error generations and stale handles");
 }

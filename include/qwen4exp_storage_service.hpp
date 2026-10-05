@@ -289,4 +289,32 @@ class StorageService {
   std::atomic<double> queue_ms_total_{0.0}, service_ms_total_{0.0};
 };
 
+// Host-side bridge between storage completion and a later graph submission.
+// The submitter is deliberately abstract: the current implementation can
+// hand the payload to the host scheduler, while a future CUDA completion graph
+// can enqueue its upload/conditional replay there. The storage slot is already
+// consumed and generation-validated before submitter() runs.
+class StorageCompletionDispatcher {
+ public:
+  using Submitter = std::function<bool(const StorageCompletion &)>;
+
+  explicit StorageCompletionDispatcher(StorageService &service)
+      : service_(service) {}
+
+  bool wait_and_submit(StorageHandle handle, Submitter submitter,
+                       StorageCompletion *consumed = nullptr) {
+    if (!submitter)
+      return false;
+    auto completion = service_.wait_consume(handle);
+    if (!completion)
+      return false;
+    if (consumed)
+      *consumed = *completion;
+    return submitter(*completion);
+  }
+
+ private:
+  StorageService &service_;
+};
+
 }  // namespace moestream::qwen4exp
