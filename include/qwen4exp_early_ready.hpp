@@ -36,7 +36,11 @@ struct Qwen4ExpEarlyReady {
   cudaEvent_t prediction_ready = nullptr;
   Qwen4ExpStagePool *stage_source = nullptr, *stage_target = nullptr;
   ggml_backend_buffer_t stage_routes_buffer = nullptr;
-  ggml_tensor *stage_gpu_ids = nullptr, *stage_gpu_mask = nullptr;
+  // stage_gpu_ids contains valid dispatch IDs for every slot (inactive slots
+  // use expert 0 and are zeroed by stage_gpu_mask). stage_gpu_slots retains
+  // the selected staging slot or -1 for host bookkeeping and verification.
+  ggml_tensor *stage_gpu_ids = nullptr, *stage_gpu_slots = nullptr,
+              *stage_gpu_mask = nullptr;
   int32_t *cpu_remap = nullptr;
   float *cpu_mask = nullptr;
   std::vector<int32_t> original_remap;
@@ -227,11 +231,13 @@ struct Qwen4ExpEarlyReady {
 
   bool prepare_stage_routes(ggml_backend_t backend, ggml_context *outer_ctx) {
     stage_gpu_ids = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_I32, k, 1);
+    stage_gpu_slots = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_I32, k, 1);
     stage_gpu_mask = ggml_new_tensor_3d(outer_ctx, GGML_TYPE_F32, 1, k, 1);
     stage_routes_buffer = ggml_backend_alloc_buffer(backend, 512);
     if (!stage_routes_buffer) return false;
     auto *base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(stage_routes_buffer));
     if (ggml_backend_tensor_alloc(stage_routes_buffer, stage_gpu_ids, base) != GGML_STATUS_SUCCESS ||
+        ggml_backend_tensor_alloc(stage_routes_buffer, stage_gpu_slots, base + 128) != GGML_STATUS_SUCCESS ||
         ggml_backend_tensor_alloc(stage_routes_buffer, stage_gpu_mask, base + 256) != GGML_STATUS_SUCCESS)
       return false;
     // Prediction storage is otherwise unused on the target; keep the mapped
@@ -268,9 +274,11 @@ struct Qwen4ExpEarlyReady {
     if (stage_target) {
       checked(moestream_qwen_stage_map(static_cast<const int *>(node->src[2]->data),
           stage_target->epoch, stage_target->slot_ids, stage_target->slot_epochs,
-          static_cast<int *>(stage_gpu_ids->data), static_cast<float *>(stage_gpu_mask->data),
+          static_cast<int *>(stage_gpu_ids->data),
+          static_cast<int *>(stage_gpu_slots->data),
+          static_cast<float *>(stage_gpu_mask->data),
           k, stage_target->slots, stream), "stage route map");
-      checked(cudaMemcpyAsync(stage_ids, stage_gpu_ids->data, k * sizeof(int32_t),
+      checked(cudaMemcpyAsync(stage_ids, stage_gpu_slots->data, k * sizeof(int32_t),
                                cudaMemcpyDeviceToHost, stream), "stage route readback");
     }
     checked(cudaMemcpyAsync(node->data, node->src[0]->data, d * sizeof(float),
@@ -301,11 +309,16 @@ struct Qwen4ExpEarlyReady {
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(*position == expected_pos);
-    if (stage_source)
+    const char *stage_no_request_env =
+        std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_NO_REQUEST");
+    const bool stage_no_request =
+        stage_no_request_env && stage_no_request_env[0] == '1';
+    if (stage_source && !stage_no_request)
       stage_source->request(calls + 1, prediction_ids, prediction_epoch, prediction_ready);
     if (stage_target) {
       std::copy(original_remap.begin(), original_remap.end(), cpu_remap);
       std::copy(original_mask.begin(), original_mask.end(), cpu_mask);
+      bool staged_ready = false;
       for (int i = 0; i < k; ++i) {
         GGML_ASSERT(ids[i] >= 0 && ids[i] < n_experts);
         GGML_ASSERT(stage_ids[i] >= -1 && stage_ids[i] < stage_target->slots);
@@ -313,9 +326,12 @@ struct Qwen4ExpEarlyReady {
           GGML_ASSERT(cold_mask[ids[i]]);
           cpu_remap[ids[i]] = -1;
           cpu_mask[ids[i]] = 0.0f;
+          staged_ready = true;
           ++staged_routes;
         }
       }
+      if (staged_ready)
+        GGML_ASSERT(stage_target->wait_for_epoch(calls + 1, producer_stream));
     }
     int cold_count = 0;
     for (int i = 0; i < k; ++i) {

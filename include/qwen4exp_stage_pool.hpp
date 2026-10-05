@@ -14,7 +14,7 @@ extern "C" cudaError_t moestream_qwen_stage_begin(unsigned long long *, cudaStre
 extern "C" cudaError_t moestream_qwen_stage_publish(int *, unsigned long long *, int,
                                                     int, unsigned long long, cudaStream_t);
 extern "C" cudaError_t moestream_qwen_stage_map(const int *, const unsigned long long *,
-    const int *, unsigned long long *, int *, float *, int, int, cudaStream_t);
+    const int *, unsigned long long *, int *, int *, float *, int, int, cudaStream_t);
 extern "C" cudaError_t moestream_qwen_stage_delay(unsigned int, cudaStream_t);
 
 // Shared host worker service for all staged layers. A single queue avoids one
@@ -96,6 +96,8 @@ struct Qwen4ExpStagePool {
   bool verify_enabled = false;
   uint64_t verified = 0;
   double verify_max_delta = 0.0;
+  double verify_expected_max_abs = 0.0;
+  double verify_actual_max_abs = 0.0;
   ggml_backend_buffer_t buffers[3] = {}, metadata = nullptr;
   unsigned long long *epoch = nullptr, *slot_epochs = nullptr;
   int32_t *slot_ids = nullptr;
@@ -253,6 +255,10 @@ struct Qwen4ExpStagePool {
     ggml_backend_tensor_get(verify_output, got.data(), 0, ggml_nbytes(verify_output));
     for (size_t i = 0; i < expected.size(); ++i) {
       GGML_ASSERT(std::isfinite(expected[i]) && std::isfinite(got[i]));
+      verify_expected_max_abs = std::max(verify_expected_max_abs,
+                                         std::abs(double(expected[i])));
+      verify_actual_max_abs = std::max(verify_actual_max_abs,
+                                       std::abs(double(got[i])));
       const double delta = std::abs(double(expected[i]) - got[i]);
       verify_max_delta = std::max(verify_max_delta, delta);
       GGML_ASSERT(delta <= 1e-5 * (1.0 + std::abs(expected[i])));
@@ -280,6 +286,20 @@ struct Qwen4ExpStagePool {
           cudaEventQuery(bank.copied) == cudaSuccess)
         bank.busy.store(false, std::memory_order_release);
     }
+  }
+
+  // The publication bitmap is a device-side readiness check, but it does not
+  // by itself create a dependency from this pool's copy stream to the graph
+  // stream that consumes the staged weights.  Once the mapper has selected a
+  // slot for this epoch, the worker has already queued the bank's completion
+  // event after all three plane copies and publication stores.  Joining that
+  // event here prevents the consumer GEMM from racing the H2D DMA.
+  bool wait_for_epoch(unsigned long long tag, cudaStream_t stream) {
+    if (!stream) return false;
+    auto &bank = banks[tag & 1];
+    if (!bank.busy.load(std::memory_order_acquire) || bank.epoch != tag)
+      return false;
+    return cudaStreamWaitEvent(stream, bank.copied, 0) == cudaSuccess;
   }
 
   void request(unsigned long long tag, const int32_t *predictions,

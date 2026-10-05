@@ -450,3 +450,19 @@ The next runtime gate is a DDR-only partial graph with exact byte/logit parity,
 followed by an A/B against the accepted early-ready bundle. Only after that
 gate should the storage service be connected to a completion submission and the
 adaptive policy receive live measurements.
+
+### Staging parity diagnosis (2026-10-05)
+
+The staged path now joins each selected bank's copy-stream completion event
+before the consumer graph stream uses its weights. Its mapper also emits valid
+dummy dispatch IDs plus a separate selected-slot array, so inactive routes are
+masked without relying on negative-ID behavior. These are opt-in correctness
+fixes; the production profile remains unchanged.
+
+The control with stage requests disabled is byte-identical. Real layer-13
+staging is not: the first staged layer snapshot differs by roughly 3.7e-9 and
+later layers amplify the difference, producing 98.4375% top-1 agreement and
+mean KL 0.000589 in the captured 64-token comparison. The staged verifier's
+zero delta is only GPU-reference parity and cannot certify CPU-baseline parity.
+Keep the path rejected until the CPU/GPU arithmetic difference is either
+eliminated or an explicit quality contract accepts it.

@@ -214,6 +214,18 @@ and 33.15 -> 22.07 tok/s. This is retained in
 `logs/option_b_stage_all_shared_worker_verified_v5/` as a rejected staging
 candidate; it does not change the production baseline.
 
+The isolated layer-13 diagnosis is now complete. With stage requests disabled,
+the prediction graph and dummy staged branch are byte-identical to the
+no-staging control. With real requests, the first selected staged route changes
+the layer-13 snapshot by only about 3.7e-9, but later layers amplify that
+quantization-path difference; the one-repetition run reached 98.4375% top-1
+agreement and mean KL 0.000589. The staged verifier still reports zero delta
+because it compares GPU staging with a GPU reference, not with the CPU cold
+branch used by the accepted scheduler. The evidence is in
+`logs/option_b_stage_layer13_alllayers_v1/` and
+`logs/option_b_stage_layer13_no_request_v1/`. This path is therefore rejected
+for production until its CPU/GPU arithmetic contract is resolved.
+
 ## Milestone 6: storage telemetry and deferred adaptive policy
 
 `StorageService` now publishes queue and service durations with every

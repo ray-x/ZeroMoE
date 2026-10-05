@@ -5794,6 +5794,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           for (auto *weight : pool->weights)
             ggml_backend_sched_set_tensor_backend(g.sched, weight, g.cuda);
           ggml_backend_sched_set_tensor_backend(g.sched, early->stage_gpu_ids, g.cuda);
+          ggml_backend_sched_set_tensor_backend(g.sched, early->stage_gpu_slots, g.cuda);
           ggml_backend_sched_set_tensor_backend(g.sched, early->stage_gpu_mask, g.cuda);
           g.early_stage_pools.push_back(std::move(pool));
         }
@@ -10308,13 +10309,15 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     if (early.calls % 32 == 0 && early.stage_target) {
       const auto &pool = *early.stage_target;
       LOG_INFO("[OPTION-B-STAGE-PREDICT] layer=%d requested=%llu dropped=%llu "
-               "predicted=%llu uploaded=%llu late=%llu verified=%llu max_delta=%.9g\n", entry.first,
+               "predicted=%llu uploaded=%llu late=%llu verified=%llu max_delta=%.9g "
+               "expected_max=%.9g actual_max=%.9g\n", entry.first,
                (unsigned long long)pool.requests.load(),
                (unsigned long long)pool.dropped.load(),
                (unsigned long long)pool.predicted.load(),
                (unsigned long long)pool.uploaded.load(),
                (unsigned long long)pool.late.load(),
-               (unsigned long long)pool.verified, pool.verify_max_delta);
+               (unsigned long long)pool.verified, pool.verify_max_delta,
+               pool.verify_expected_max_abs, pool.verify_actual_max_abs);
     }
   }
   dump_layer0_diag_values(g);

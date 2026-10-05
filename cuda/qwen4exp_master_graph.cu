@@ -62,7 +62,8 @@ __global__ void qwen_stage_publish_kernel(int *slot_ids,
 
 __global__ void qwen_stage_map_kernel(const int *actual_ids,
     const unsigned long long *epoch, const int *slot_ids,
-    unsigned long long *slot_epochs, int *stage_ids, float *stage_mask,
+    unsigned long long *slot_epochs, int *dispatch_ids, int *stage_slots,
+    float *stage_mask,
     int topk, int slots) {
     const int k = threadIdx.x;
     if (k >= topk) return;
@@ -76,7 +77,12 @@ __global__ void qwen_stage_map_kernel(const int *actual_ids,
             break;
         }
     }
-    stage_ids[k] = found;
+    stage_slots[k] = found;
+    // Keep the GPU dispatch path on a valid expert even when this route is
+    // not staged. The following mask multiply removes the dummy result. This
+    // avoids relying on quant-kernel negative-ID behavior for an inactive
+    // branch and makes the zero contribution deterministic across formats.
+    dispatch_ids[k] = found >= 0 ? found : 0;
     stage_mask[k] = found >= 0 ? 1.0f : 0.0f;
 }
 
@@ -107,10 +113,11 @@ extern "C" cudaError_t moestream_qwen_stage_publish(int *slot_ids,
 
 extern "C" cudaError_t moestream_qwen_stage_map(const int *actual_ids,
     const unsigned long long *epoch, const int *slot_ids,
-    unsigned long long *slot_epochs, int *stage_ids, float *stage_mask,
+    unsigned long long *slot_epochs, int *dispatch_ids, int *stage_slots,
+    float *stage_mask,
     int topk, int slots, cudaStream_t stream) {
     qwen_stage_map_kernel<<<1, 32, 0, stream>>>(actual_ids, epoch, slot_ids,
-        slot_epochs, stage_ids, stage_mask, topk, slots);
+        slot_epochs, dispatch_ids, stage_slots, stage_mask, topk, slots);
     return cudaPeekAtLastError();
 }
 

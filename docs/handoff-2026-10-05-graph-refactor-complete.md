@@ -33,6 +33,13 @@ use by an earlier layer in the captured graph. The storage completion service
 and adaptive timing policy are foundations for a future partial-layer path;
 they are not enabled by the production profile.
 
+The staged route prototype also has an explicit copy-stream completion join and
+uses valid masked dummy IDs for inactive GPU slots. A no-request control is
+byte-identical, but real layer-13 staging still changes the later hidden states
+through a small CPU-versus-GPU quantization arithmetic difference. Its verifier
+compares against a GPU reference and is therefore insufficient for production
+parity; the path remains rejected.
+
 ## Final results and evidence
 
 Six balanced permutations, ten CPU threads, identical forced 64-token history,
