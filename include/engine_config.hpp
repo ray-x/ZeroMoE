@@ -668,6 +668,18 @@ struct EngineConfig {
   // preserves a configured zero cache instead of treating it as auto-size;
   // if graph execution is declined, the legacy fallback has no GPU cache.
   bool qwen4exp_option_b_disable_legacy_cache = false;
+  // Global pool mode (0 = off, the per-layer behaviour above). When > 0 the
+  // selected layers' (layer, expert) pairs are ranked together by usage and
+  // the top K of the whole pool become the static hot sets, so concentrated
+  // layers get many hot experts and flat layers few (see
+  // include/option_b_global_hot.hpp). qwen4exp_option_b_top_n then acts only as
+  // a per-layer ceiling (set it to the model's expert count for no ceiling);
+  // min_coverage, right_size_top_n and fill_vram are ignored. Each eligible
+  // layer with usage keeps its own hottest experts up to the requested
+  // floor, clamped to the ceiling and available K/layer budget. Listing all
+  // layers with floor >= 1 and K >= the eligible layer count gives 0/N/0.
+  int qwen4exp_option_b_global_top_k = 0;
+  int qwen4exp_option_b_global_floor_per_layer = 1;
   // When true and qwen4exp_option_b_layer is -1, rank every layer from
   // pin_file and apply Option B only where top_n experts cover at least the
   // requested historical route share. Flat layers remain on the CPU path.
@@ -2594,6 +2606,15 @@ inline bool EngineConfig::load(const std::string &path) {
     qwen4exp_option_b_top_n = 0;
   }
   if (qwen4exp_option_b_max_layers < 0) {
+  qwen4exp_option_b_global_top_k = doc.root.get_int(
+      "qwen4exp_option_b_global_top_k", qwen4exp_option_b_global_top_k);
+  qwen4exp_option_b_global_floor_per_layer = doc.root.get_int(
+      "qwen4exp_option_b_global_floor_per_layer",
+      qwen4exp_option_b_global_floor_per_layer);
+  if (qwen4exp_option_b_global_top_k < 0)
+    qwen4exp_option_b_global_top_k = 0;
+  if (qwen4exp_option_b_global_floor_per_layer < 0)
+    qwen4exp_option_b_global_floor_per_layer = 0;
     LOG_WARN("[CONFIG] qwen4exp_option_b_max_layers=%d is invalid -- "
              "disabling the layer cap\n",
              qwen4exp_option_b_max_layers);

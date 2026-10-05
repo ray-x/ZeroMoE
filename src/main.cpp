@@ -2,6 +2,7 @@
 #include "async_prefetcher.hpp"
 #include "cuda_manager.hpp"
 #include "engine.hpp"
+#include "option_b_global_hot.hpp"
 #include "engine_config.hpp"
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
@@ -544,6 +545,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                                 config.qwen4exp_prefill_state_handoff);
   ram_mgr.configured_total_experts =
       std::max(0, config.ram_cache_total_experts);
+  engine.qwen4exp_option_b_global_top_k =
+      config.qwen4exp_option_b_global_top_k;
+  engine.qwen4exp_option_b_global_floor_per_layer =
+      config.qwen4exp_option_b_global_floor_per_layer;
   // Must be set BEFORE the [PIN] preload block below -- that's where the
   // bulk of the RAM tier's slabs are first allocated, and each slab is
   // pinned exactly once at its own allocation (ensure_slab_capacity).
@@ -1361,7 +1366,37 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       (void)usage_maxc;
       if (!usage_entries.empty() && cfg.n_experts > 0) {
         size_t option_b_bytes = 0;
-        for (int layer : option_b_layers) {
+        // Global pool mode: estimate from the same selection the planner will
+        // commit (option_b_global::select), not from a per-layer top_n.
+        const bool est_global = config.qwen4exp_option_b_global_top_k > 0;
+        if (est_global) {
+          std::vector<int> live_layers;
+          for (int layer : option_b_layers) {
+            if (layer < 0 || layer >= cfg.n_layers ||
+                is_cpu_affinity_layer(layer))
+              continue;
+            if (dev_layers > 0) {
+              const bool in_baseline_block =
+                  qwen4exp_full_graph_device_expert_trailing()
+                      ? layer >= cfg.n_layers - dev_layers
+                      : layer < dev_layers;
+              if (in_baseline_block)
+                continue;
+            }
+            live_layers.push_back(layer);
+          }
+          const auto sel = option_b_global::select(
+              usage_entries, live_layers, cfg.n_layers, cfg.n_experts,
+              config.qwen4exp_option_b_global_top_k,
+              config.qwen4exp_option_b_global_floor_per_layer,
+              config.qwen4exp_option_b_top_n);
+          for (const auto &[layer, ids] : sel.hot) {
+            const size_t expert_bytes = engine.compute_expert_slab_bytes(layer);
+            if (expert_bytes > 0 && ids.size() <= SIZE_MAX / expert_bytes)
+              option_b_bytes += expert_bytes * ids.size();
+          }
+        }
+        for (int layer : est_global ? std::vector<int>{} : option_b_layers) {
           if (layer < 0 || layer >= cfg.n_layers ||
               is_cpu_affinity_layer(layer))
             continue;
@@ -2887,7 +2922,62 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
               << " traffic coverage (cap="
               << config.qwen4exp_option_b_max_layers << ")\n";
         }
-        for (int layer : option_layers) {
+        // Global pool mode: rank all selected layers' experts together and keep
+        // the top K of the pool (see include/option_b_global_hot.hpp). The
+        // per-layer loop below is skipped; the graph planner calls the same
+        // helper, so both passes agree on every layer's hot set.
+        const bool option_b_global =
+            config.qwen4exp_option_b_global_top_k > 0;
+        if (option_b_global) {
+          std::vector<int> live_layers;
+          for (int layer : option_layers) {
+            if (layer < 0 || layer >= n_layers || is_cpu_affinity_layer(layer))
+              continue;
+            if (baseline_gpu_layer(layer)) {
+              LOG_STREAM_INFO()
+                  << "[OPTION-B] Layer " << layer
+                  << " skipped: already covered by the complete GPU block\n";
+              continue;
+            }
+            live_layers.push_back(layer);
+          }
+          // The decode planner and its VRAM estimate read pin_file alone.
+          // by_layer also contains prefill-exclusive records for RAM preload;
+          // including them here can change membership and disagree with the
+          // compact GPU tensors' actual hot set.
+          const auto sel = option_b_global::select(
+              entries, live_layers, n_layers, n_experts,
+              config.qwen4exp_option_b_global_top_k,
+              config.qwen4exp_option_b_global_floor_per_layer,
+              config.qwen4exp_option_b_top_n);
+          for (const auto &[layer, ids] : sel.hot) {
+            std::vector<uint8_t> hot_mask(static_cast<size_t>(n_experts), 0);
+            for (int expert : ids)
+              hot_mask[static_cast<size_t>(expert)] = 1;
+            const double coverage = sel.layer_coverage.at(layer);
+            engine.qwen4exp_option_b_hot_masks[layer] = hot_mask;
+            engine.qwen4exp_option_b_layers.push_back(layer);
+            engine.qwen4exp_option_b_layer_coverage[layer] = coverage;
+            if (layer == config.qwen4exp_option_b_layer)
+              engine.qwen4exp_option_b_hot_mask = hot_mask;
+            LOG_STREAM_INFO()
+                << "[OPTION-B] Layer " << layer
+                << " global-pool hot set: hot=" << ids.size()
+                << " cold=" << (n_experts - static_cast<int>(ids.size()))
+                << " history coverage=" << (coverage * 100.0) << "%\n";
+          }
+          LOG_STREAM_INFO()
+              << "[OPTION-B] global pool: top-"
+              << config.qwen4exp_option_b_global_top_k << " of "
+              << live_layers.size() << " layer(s) -> " << sel.total_hot
+              << " expert(s) in " << sel.hot.size()
+              << " layer(s), pooled history coverage="
+              << (sel.pool_coverage * 100.0) << "% (floor="
+              << config.qwen4exp_option_b_global_floor_per_layer
+              << "/layer, per-layer ceiling="
+              << config.qwen4exp_option_b_top_n << ")\n";
+        }
+        for (int layer : option_b_global ? std::vector<int>{} : option_layers) {
           if (layer < 0 || layer >= n_layers || n_experts <= 0)
             continue;
           if (baseline_gpu_layer(layer)) {

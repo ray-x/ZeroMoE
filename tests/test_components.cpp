@@ -18,6 +18,7 @@
 #include "memory_guard.hpp" // deterministic host-budget admission arithmetic
 #include <algorithm>
 #include <cassert>
+#include "option_b_global_hot.hpp" // Option-B global-pool hot-set selection (header-only)
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -141,6 +142,77 @@ void test_topk_selection() {
 void test_softmax_routing() {
   std::cout << "[TEST] Softmax Routing Weights..." << std::flush;
   const int K = 8;
+
+// ============================================================
+// Option-B global pool: pooled top-K across layers (include/option_b_global_hot.hpp)
+// ============================================================
+void test_option_b_global_pool() {
+  std::cout << "[TEST] Option-B Global Pool Selection..." << std::flush;
+  struct U { int layer; int expert; uint64_t count; };
+  // 3 layers x 4 experts. Layer 0 is concentrated (one dominant expert),
+  // layer 1 is flat, layer 2 is concentrated on two experts. Every layer
+  // routes the same total (100) so counts are comparable across layers.
+  std::vector<U> u = {
+      {0, 0, 85}, {0, 1, 5}, {0, 2, 5}, {0, 3, 5},
+      {1, 0, 25}, {1, 1, 25}, {1, 2, 25}, {1, 3, 25},
+      {2, 0, 45}, {2, 1, 45}, {2, 2, 5}, {2, 3, 5}};
+  std::vector<int> layers = {0, 1, 2};
+
+  // per-layer would give each layer K/3; the pool follows the counts instead.
+  auto r = option_b_global::select(u, layers, 3, 4, /*top_k=*/6,
+                                   /*floor=*/1, /*ceiling=*/0);
+  assert(r.total_hot == 6);
+  // Top 6 of the pool: 85 (L0e0), 45,45 (L2e0,e1), then the 25s (L1) fill 3.
+  assert(r.hot.at(0).size() == 1 && r.hot.at(0)[0] == 0);
+  assert(r.hot.at(2).size() == 2);
+  assert(r.hot.at(1).size() == 3);
+  // Hot list is ordered by the layer's own descending usage, ties by id.
+  assert(r.hot.at(2)[0] == 0 && r.hot.at(2)[1] == 1);
+  assert(std::abs(r.layer_coverage.at(0) - 0.85) < 1e-9);
+  assert(std::abs(r.pool_coverage - (85 + 90 + 75) / 300.0) < 1e-9);
+
+  // Floor: with floor=2 every layer keeps its 2 hottest regardless of rank.
+  auto f = option_b_global::select(u, layers, 3, 4, 6, 2, 0);
+  assert(f.hot.at(0).size() >= 2 && f.hot.at(1).size() >= 2 &&
+         f.hot.at(2).size() >= 2);
+  assert(f.total_hot == 6);
+
+  // Ceiling: no layer may exceed it even if it dominates the pool.
+  auto c = option_b_global::select(u, layers, 3, 4, 6, 1, 1);
+  for (const auto &kv : c.hot)
+    assert(kv.second.size() <= 1);
+  assert(c.total_hot == 3);
+
+  // A floor larger than top_k / layers is clamped (never exceeds top_k).
+  auto g = option_b_global::select(u, layers, 3, 4, 3, 4, 0);
+  assert(g.total_hot == 3);
+
+  // Layers without usage get no hot set; invalid/duplicate ids are ignored.
+  std::vector<int> odd = {0, 0, 7, -1, 2, 9};
+  auto o = option_b_global::select(u, odd, 3, 4, 4, 1, 0);
+  assert(o.hot.count(1) == 0 && o.hot.count(7) == 0);
+
+  // Deterministic for any entry order.
+  auto rev = u;
+  std::reverse(rev.begin(), rev.end());
+  auto r2 = option_b_global::select(rev, layers, 3, 4, 6, 1, 0);
+  assert(r2.hot == r.hot);
+
+  // top_k beyond the pool keeps everything.
+  auto all = option_b_global::select(u, layers, 3, 4, 1000, 1, 0);
+  assert(all.total_hot == 12);
+
+  // A budget below the layer count cannot satisfy the floor; coverage must
+  // still include the traffic of layers that receive no resident experts.
+  auto sparse = option_b_global::select(u, layers, 3, 4, 1, 1, 0);
+  assert(sparse.total_hot == 1 && sparse.hot.size() == 1);
+  assert(std::abs(sparse.pool_coverage - 85.0 / 300.0) < 1e-9);
+  assert(sparse.layer_coverage.at(1) == 0.0);
+  assert(sparse.layer_coverage.at(2) == 0.0);
+
+  std::cout << " PASSED\n";
+}
+
   float logits[8] = {2.0f, 1.5f, 1.0f, 0.5f, 0.2f, 0.1f, -0.5f, -1.0f};
   float weights[8];
 
@@ -3033,3 +3105,4 @@ int main(int argc, char **argv) {
             << " PASSED.\n";
   return 0;
 }
+      {"option_b_global_pool", test_option_b_global_pool},
