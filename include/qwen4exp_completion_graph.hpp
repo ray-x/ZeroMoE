@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <vector>
 
 namespace moestream::qwen4exp {
 
@@ -83,6 +84,7 @@ class CompletionGraph {
       std::memcpy(host_payload_, completion.payload->bytes.data(),
                   completion.payload->bytes.size());
     payload_bytes_ = completion.payload->bytes.size();
+    payload_offsets_ = completion.payload->offsets;
     model_generation_ = completion.model_generation;
     request_generation_ = completion.request_generation;
     layer_ = completion.layer;
@@ -114,6 +116,7 @@ class CompletionGraph {
   void *device_payload() const { return device_payload_; }
   size_t payload_bytes() const { return payload_bytes_; }
   size_t capacity_bytes() const { return capacity_bytes_; }
+  const std::vector<size_t> &payload_offsets() const { return payload_offsets_; }
   uint64_t model_generation() const { return model_generation_; }
   uint64_t request_generation() const { return request_generation_; }
   int layer() const { return layer_; }
@@ -134,6 +137,7 @@ class CompletionGraph {
     upload_stream_ = nullptr;
     capacity_bytes_ = 0;
     payload_bytes_ = 0;
+    payload_offsets_.clear();
     model_generation_ = 0;
     request_generation_ = 0;
     layer_ = -1;
@@ -149,6 +153,7 @@ class CompletionGraph {
   void *device_payload_ = nullptr;
   size_t capacity_bytes_ = 0;
   size_t payload_bytes_ = 0;
+  std::vector<size_t> payload_offsets_;
   uint64_t model_generation_ = 0;
   uint64_t request_generation_ = 0;
   int layer_ = -1;
