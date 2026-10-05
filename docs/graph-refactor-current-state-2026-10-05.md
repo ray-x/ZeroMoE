@@ -117,8 +117,10 @@ route set on-device as resident, staged, or CPU fallback and writes two
 conditional handles. `try_launch_three_way` accepts only single-CUDA child
 graphs, so a staged child containing the DDR gather callback is rejected rather
 than placed inside a conditional body. The engine carries a separate staged
-expert-ID publication vector, but no runtime completion path fills it yet;
-therefore this composer is inactive by default.
+expert-ID publication vector, and `publish_qwen4exp_staged_completion` now
+validates a Ready completion before publishing it. The opt-in pread service
+does not submit staged completions to this method yet, so the composer remains
+inactive by default.
 
 ## Measurements
 

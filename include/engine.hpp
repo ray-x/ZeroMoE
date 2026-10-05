@@ -549,6 +549,40 @@ public:
                                 qwen4exp_gpu_stage_layers.end(), layer);
     }
 
+    // Publish one completed storage request as the staged ownership map used
+    // by the three-way conditional composer. Ready state, model/request
+    // generations, layer identity, expert bounds and resident/staged
+    // disjointness are all checked before the vector becomes visible.
+    bool publish_qwen4exp_staged_completion(
+        const moestream::qwen4exp::StorageCompletion &completion,
+        uint64_t expected_model_generation) {
+      if (completion.state != moestream::qwen4exp::StorageState::Ready ||
+          completion.model_generation != expected_model_generation ||
+          completion.request_generation == 0 || completion.layer < 0 ||
+          completion.experts.empty() ||
+          (qwen4exp_partial_layer >= 0 &&
+           completion.layer != qwen4exp_partial_layer))
+        return false;
+      const int n_experts = model_file.architecture_config.n_experts;
+      std::vector<int> candidate;
+      candidate.reserve(completion.experts.size());
+      for (int expert : completion.experts) {
+        if (expert < 0 || expert >= n_experts ||
+            std::find(qwen4exp_partial_layer_gpu_ids.begin(),
+                      qwen4exp_partial_layer_gpu_ids.end(), expert) !=
+                qwen4exp_partial_layer_gpu_ids.end() ||
+            std::find(candidate.begin(), candidate.end(), expert) !=
+                candidate.end())
+          return false;
+        candidate.push_back(expert);
+      }
+      std::sort(candidate.begin(), candidate.end());
+      qwen4exp_partial_layer_staged_ids = std::move(candidate);
+      qwen4exp_partial_layer_staged_generation =
+          completion.request_generation;
+      return true;
+    }
+
     // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not
     // per-token -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
     // follow-on note for why per-token was ruled out: ggml has no in-graph
@@ -566,6 +600,7 @@ public:
     // an empty set keeps the staged conditional disabled and preserves the
     // existing resident/CPU path.
     std::vector<int> qwen4exp_partial_layer_staged_ids;
+    uint64_t qwen4exp_partial_layer_staged_generation = 0;
     // Optional host storage boundary for staged expert payloads. It is
     // constructed only when explicitly enabled; the production scheduler
     // keeps this null and follows the existing DDR/early-ready path.
