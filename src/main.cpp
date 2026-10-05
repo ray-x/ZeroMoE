@@ -1471,9 +1471,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     const double fallback_gb = std::max(headroom_gb, 0.0);
 
     const bool option_b_disable_legacy_cache =
-        config.qwen4exp_option_b_disable_legacy_cache &&
-        config.qwen4exp_option_b_top_n > 0 &&
-        engine.family_ops.family == ModelFamily::Qwen4Exp;
+        qwen_full_graph_decode ||
+        (config.qwen4exp_option_b_disable_legacy_cache &&
+         config.qwen4exp_option_b_top_n > 0 &&
+         engine.family_ops.family == ModelFamily::Qwen4Exp);
     EngineConfig fallback_config = config;
     if (option_b_disable_legacy_cache) {
       for (auto &gc : fallback_config.gpus) {
@@ -1483,6 +1484,18 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       fallback_config.use_active_layer_area = false;
       LOG_INFO("[GPU] Option-B full graph: explicitly disabling the legacy "
                "VRAM LRU and active-layer area; selected experts use the "
+    // Design policy (2026-10-05): Qwen4Exp has no layered decode. With the
+    // full-graph decode enabled the graph reads only its own device arena
+    // (Option-B hot experts / resident layers) and computes the rest on the
+    // CPU from the DDR arenas, so the legacy VRAM expert cache (pinned + LRU
+    // tiers) and the active-layer area are never filled or consulted: a run
+    // measured 0 / 4650 slots filled and 0 hits while reserving 6.4 GiB.
+    // Disable them whenever the Qwen4Exp decode graph is requested; the
+    // explicit qwen4exp_option_b_disable_legacy_cache key stays honoured for
+    // runs that still use the older prefill-only graph.
+    const bool qwen_full_graph_decode =
+        engine.family_ops.family == ModelFamily::Qwen4Exp &&
+        qwen4exp_full_graph_decode_enabled();
                "static graph arena\n");
     }
     for (auto &gc : fallback_config.gpus) {
