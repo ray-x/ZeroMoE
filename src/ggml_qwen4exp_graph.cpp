@@ -9581,6 +9581,7 @@ struct State {
   cudaGraph_t last_prefix_handle = nullptr;
   cudaGraph_t last_sgpu_handle = nullptr;
   cudaGraph_t last_staged_handle = nullptr;
+  cudaGraph_t last_completion_handle = nullptr;
   // The predicate kernel writes the device copy.  The host copy is only a
   // pinned destination for the same-stream D2H readback after the graph
   // completes; cudaMallocHost() memory is not necessarily device-mapped and
@@ -9946,6 +9947,10 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
       staged.cuda, ggml_graph_node(staged.graph, 0));
   if (!prefix_handle || !resident_handle || !staged_handle)
     return false;
+  const cudaGraph_t completion_handle =
+      engine.qwen4exp_completion_graph
+          ? engine.qwen4exp_completion_graph->captured_graph()
+          : nullptr;
   if (!st.device_route_mode &&
       cudaMalloc(&st.device_route_mode, sizeof(int32_t)) != cudaSuccess)
     return false;
@@ -9955,7 +9960,8 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
   const bool graph_changed =
       st.last_prefix_handle != prefix_handle ||
       st.last_sgpu_handle != resident_handle ||
-      st.last_staged_handle != staged_handle;
+      st.last_staged_handle != staged_handle ||
+      st.last_completion_handle != completion_handle;
   if (graph_changed || !st.master_exec) {
     if (st.master_exec) cudaGraphExecDestroy(st.master_exec);
     if (st.master_graph) cudaGraphDestroy(st.master_graph);
@@ -9977,12 +9983,11 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
                   "adding prefix child"))
       return false;
     cudaGraphNode_t predecessor = prefix_node;
-    if (engine.qwen4exp_completion_graph &&
-        engine.qwen4exp_completion_graph->captured_graph()) {
+    if (completion_handle) {
       cudaGraphNode_t completion_node = nullptr;
       if (!build_ok(cudaGraphAddChildGraphNode(
                         &completion_node, st.master_graph, &predecessor, 1,
-                        engine.qwen4exp_completion_graph->captured_graph()),
+                        completion_handle),
                     "adding completion payload child"))
         return false;
       predecessor = completion_node;
@@ -10046,6 +10051,7 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
     st.last_prefix_handle = prefix_handle;
     st.last_sgpu_handle = resident_handle;
     st.last_staged_handle = staged_handle;
+    st.last_completion_handle = completion_handle;
     LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] built resident/staged pure-GPU "
              "conditional children (prefix=%p resident=%p staged=%p)\n",
              (void *)prefix_handle, (void *)resident_handle,
