@@ -1,8 +1,14 @@
 #pragma once
 
+#include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <chrono>
 #include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 extern "C" cudaError_t moestream_qwen_stage_begin(unsigned long long *, cudaStream_t);
 extern "C" cudaError_t moestream_qwen_stage_publish(int *, unsigned long long *, int,
@@ -10,6 +16,62 @@ extern "C" cudaError_t moestream_qwen_stage_publish(int *, unsigned long long *,
 extern "C" cudaError_t moestream_qwen_stage_map(const int *, const unsigned long long *,
     const int *, unsigned long long *, int *, float *, int, int, cudaStream_t);
 extern "C" cudaError_t moestream_qwen_stage_delay(unsigned int, cudaStream_t);
+
+// Shared host worker service for all staged layers. A single queue avoids one
+// sleeping/waking thread per layer; each submitted closure still owns the
+// target pool's stable bank and shape-specific CUDA tensors.
+class Qwen4ExpStageWorkService {
+ public:
+  explicit Qwen4ExpStageWorkService(size_t workers = 1) {
+    workers = std::max<size_t>(1, workers);
+    for (size_t i = 0; i < workers; ++i)
+      threads_.emplace_back([this] { run(); });
+  }
+  Qwen4ExpStageWorkService(const Qwen4ExpStageWorkService &) = delete;
+  Qwen4ExpStageWorkService &operator=(const Qwen4ExpStageWorkService &) = delete;
+  ~Qwen4ExpStageWorkService() { shutdown(); }
+
+  bool submit(std::function<void()> job) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stopping_) return false;
+    jobs_.push_back(std::move(job));
+    wake_.notify_one();
+    return true;
+  }
+
+  void shutdown() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (stopping_) return;
+      stopping_ = true;
+    }
+    wake_.notify_all();
+    for (auto &thread : threads_)
+      if (thread.joinable()) thread.join();
+    threads_.clear();
+  }
+
+ private:
+  void run() {
+    for (;;) {
+      std::function<void()> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        wake_.wait(lock, [this] { return stopping_ || !jobs_.empty(); });
+        if (jobs_.empty() && stopping_) return;
+        job = std::move(jobs_.front());
+        jobs_.pop_front();
+      }
+      job();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable wake_;
+  std::deque<std::function<void()>> jobs_;
+  std::vector<std::thread> threads_;
+  bool stopping_ = false;
+};
 
 // Each bank is held until both its DMA and the token that could consume it
 // finish. Predictions may be late: an unpublished epoch always stays on CPU.
@@ -43,22 +105,14 @@ struct Qwen4ExpStagePool {
   unsigned int delay_us = 0;
   unsigned int worker_delay_us = 0;
   cudaStream_t copy_stream = nullptr;
-  std::thread worker;
+  Qwen4ExpStageWorkService *service = nullptr;
   std::mutex mutex;
-  std::condition_variable wake;
   std::condition_variable samples_finished;
   std::deque<int> jobs;
-  bool stopping = false;
   unsigned long long completed_epoch = 0;
   std::atomic<uint64_t> requests{0}, dropped{0}, predicted{0}, uploaded{0}, late{0};
 
   ~Qwen4ExpStagePool() {
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      stopping = true;
-    }
-    wake.notify_one();
-    if (worker.joinable()) worker.join();
     if (device >= 0) cudaSetDevice(device);
     if (copy_stream) {
       cudaStreamSynchronize(copy_stream);
@@ -78,8 +132,11 @@ struct Qwen4ExpStagePool {
 
   bool prepare(ggml_backend_t backend, ggml_context *ctx, int dev, int k,
                ggml_tensor *gate, ggml_tensor *up, ggml_tensor *down,
-               const std::vector<uint8_t> &mask) {
+               const std::vector<uint8_t> &mask,
+               Qwen4ExpStageWorkService *shared_service = nullptr) {
     device = dev; topk = k; slots = 2 * k; cold_mask = mask; this->backend = backend;
+    service = shared_service;
+    if (!service) return false;
     const char *verify = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY");
     verify_enabled = verify && verify[0] == '1';
     const char *delay = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_DELAY_US");
@@ -122,7 +179,6 @@ struct Qwen4ExpStagePool {
           cudaEventCreateWithFlags(&bank.copied, cudaEventDisableTiming) != cudaSuccess)
         return false;
     }
-    worker = std::thread([this] { work(); });
     return true;
   }
 
@@ -250,26 +306,29 @@ struct Qwen4ExpStagePool {
       jobs.push_back(index);
     }
     ++requests;
-    wake.notify_one();
+    if (!service || !service->submit([this] { work(); })) {
+      ++dropped;
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!jobs.empty()) jobs.pop_back();
+      bank.busy.store(false, std::memory_order_release);
+    }
   }
 
   void work() {
     cudaSetDevice(device);
-    while (true) {
-      int index;
-      {
-        std::unique_lock<std::mutex> lock(mutex);
-        wake.wait(lock, [this] { return stopping || !jobs.empty(); });
-        if (jobs.empty() && stopping) return;
-        index = jobs.front(); jobs.pop_front();
-      }
+    int index;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (jobs.empty()) return;
+      index = jobs.front(); jobs.pop_front();
+    }
       auto &bank = banks[index];
       GGML_ASSERT(cudaEventSynchronize(bank.prediction_ready) == cudaSuccess);
       if (*bank.prediction_epoch != bank.epoch) {
         ++late;
         finish_prediction_read(bank);
         bank.busy.store(false, std::memory_order_release);
-        continue;
+        return;
       }
       std::vector<int> candidates;
       for (int k = 0; k < topk; ++k) {
@@ -306,7 +365,6 @@ struct Qwen4ExpStagePool {
       }
       GGML_ASSERT(cudaEventRecord(bank.copied, copy_stream) == cudaSuccess);
       bank.dma_queued.store(true, std::memory_order_release);
-    }
   }
 
   void finish_prediction_read(Bank &bank) {

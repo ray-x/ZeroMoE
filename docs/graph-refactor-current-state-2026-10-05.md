@@ -189,6 +189,16 @@ It passed ready, error, stale-generation and release cases. Runtime SSD
 loading and completion-graph submission are still separate work; the current
 production profile does not use this service yet.
 
+## Milestone 5 foundation: shared staging workers
+
+`Qwen4ExpStageWorkService` now owns the worker queue for staged layers.
+`FullGraph` creates one service and all stage pools submit bank jobs to it;
+pool-specific CUDA buffers and epoch ownership remain stable. This removes the
+one-worker-thread-per-layer topology that inflated all-layer staging overhead.
+The next refinement is to let compatible layers share the same shape-class
+weight/bounce banks as well as the worker queue. The production profile still
+keeps staging disabled.
+
 ## Scope and reproducibility
 
 The scoped graph files are:

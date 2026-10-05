@@ -942,6 +942,7 @@ struct FullGraph {
   ggml_backend_sched_t sched = nullptr;
   std::unordered_map<int, std::unique_ptr<Qwen4ExpEarlyReady>> early_ready;
   std::unique_ptr<std::ofstream> early_route_trace;
+  std::unique_ptr<Qwen4ExpStageWorkService> early_stage_service;
   std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
   // Per-layer CPU timing instrumentation (env: MOESTREAM_QWEN4EXP_GRAPH_
   // LAYER_TIMING=1). Uses ggml_backend_sched_set_eval_callback, which fires
@@ -1340,7 +1341,9 @@ struct FullGraph {
       ggml_backend_sched_free(sched);
       sched = nullptr;
     }
+    if (early_stage_service) early_stage_service->shutdown();
     early_stage_pools.clear();
+    early_stage_service.reset();
     early_ready.clear();
     early_route_trace.reset();
     // Host-node CPU runners borrow this graph-owned pool.  Detach them after
@@ -5779,10 +5782,13 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         const char *stage = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
+          if (!g.early_stage_service)
+            g.early_stage_service = std::make_unique<Qwen4ExpStageWorkService>(1);
           auto pool = std::make_unique<Qwen4ExpStagePool>();
           GGML_ASSERT(layer > 0 && g.split_gpu_expert_ids.count(layer - 1));
           GGML_ASSERT(pool->prepare(g.cuda, ctx, g.device, c.topk,
-                      gate_exps, up_exps, down_exps, early->cold_mask));
+                      gate_exps, up_exps, down_exps, early->cold_mask,
+                      g.early_stage_service.get()));
           early->stage_target = pool.get();
           GGML_ASSERT(early->prepare_stage_routes(g.cuda, ctx));
           for (auto *weight : pool->weights)
