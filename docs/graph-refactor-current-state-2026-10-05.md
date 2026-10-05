@@ -371,10 +371,12 @@ generation-safe `pread` requests into the shared payload and preserves the same
 Ready/Error generation contract. Enable
 `MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1` and, for a one-request Ready/Error
 check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. Add
-`MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1` to capture and launch the
-stable-address H2D completion graph and join its consumer event. These remain
-opt-in and do not change the production profile; the graph currently uploads a
-prepared payload but does not yet run the staged expert conditional child. A
+`MOESTREAM_QWEN4EXP_COMPLETION_GRAPH=1` prepares a persistent payload arena
+before Qwen graph bootstrap, and `MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1`
+captures and launches the stable-address H2D completion graph and joins its
+consumer event. These remain opt-in and do not change the production profile;
+the graph currently uploads a prepared payload but does not yet run the staged
+expert conditional child. A
 direct RTX 3090 self-test produced `submitted=1`, `bytes=1382400`, `ready=1`
 and a separate generation-tagged `error=1 error_code=404` record in
 `logs/qwen4exp_q2_0_option_b_split44_x0_cov80.log`.

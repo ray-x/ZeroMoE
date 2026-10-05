@@ -4104,6 +4104,35 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
            "(8 generation-tagged slots; CUDA/SSD work remains outside the "
            "callback)\n";
 
+    if (std::getenv("MOESTREAM_QWEN4EXP_COMPLETION_GRAPH")) {
+      size_t per_expert = 0;
+      for (int layer = 0; layer < engine.model_file.architecture_config.n_layers;
+           ++layer) {
+        per_expert = engine.compute_expert_slab_bytes(layer);
+        if (per_expert != 0)
+          break;
+      }
+      const size_t topk = static_cast<size_t>(std::max(
+          1, engine.model_file.architecture_config.topk));
+      const size_t capacity =
+          per_expert != 0 && topk <= SIZE_MAX / per_expert
+              ? per_expert * topk
+              : 0;
+      engine.qwen4exp_completion_graph =
+          std::make_unique<moestream::qwen4exp::CompletionGraph>();
+      if (capacity == 0 ||
+          !engine.qwen4exp_completion_graph->prepare(capacity)) {
+        LOG_STREAM_WARN()
+            << "[QWEN4EXP-COMPLETION-GRAPH] persistent payload arena "
+               "preparation declined; self-test will use no graph arena\n";
+        engine.qwen4exp_completion_graph.reset();
+      } else {
+        LOG_STREAM_INFO()
+            << "[QWEN4EXP-COMPLETION-GRAPH] persistent payload arena "
+               "prepared capacity=" << capacity << " bytes\n";
+      }
+    }
+
     if (std::getenv("MOESTREAM_QWEN4EXP_STORAGE_SELFTEST") &&
         !engine.layers_experts.empty() &&
         !engine.layers_experts.front().empty()) {
@@ -4114,7 +4143,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       moestream::qwen4exp::StorageCompletion result;
       moestream::qwen4exp::StorageCompletionDispatcher dispatcher(
           *engine.qwen4exp_storage_service);
-      moestream::qwen4exp::CompletionGraph completion_graph;
+      moestream::qwen4exp::CompletionGraph local_completion_graph;
+      auto *completion_graph = engine.qwen4exp_completion_graph
+                                   ? engine.qwen4exp_completion_graph.get()
+                                   : &local_completion_graph;
       const bool completion_graph_requested =
           std::getenv("MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST") != nullptr;
       const bool submitted_ready = handle && dispatcher.wait_and_submit(
@@ -4122,16 +4154,18 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
             if (!completion_graph_requested)
               return true; // Host scheduler hook; graph self-test is opt-in.
             if (!completion.payload ||
-                !completion_graph.prepare(completion.payload->bytes.size()) ||
-                !completion_graph.submit(completion, 1, 1))
+                (completion_graph->state() ==
+                     moestream::qwen4exp::CompletionGraphState::Unprepared &&
+                 !completion_graph->prepare(completion.payload->bytes.size())) ||
+                !completion_graph->submit(completion, 1, 1))
               return false;
             cudaStream_t consumer = nullptr;
             if (cudaStreamCreateWithFlags(&consumer, cudaStreamNonBlocking) !=
                 cudaSuccess)
               return false;
-            const bool joined = completion_graph.wait_on(consumer) &&
+            const bool joined = completion_graph->wait_on(consumer) &&
                                 cudaStreamSynchronize(consumer) == cudaSuccess &&
-                                completion_graph.synchronize();
+                                completion_graph->synchronize();
             cudaStreamDestroy(consumer);
             LOG_STREAM_INFO() << "[QWEN4EXP-COMPLETION-GRAPH] submitted="
                               << (joined ? 1 : 0)
@@ -4155,12 +4189,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       if (completion_graph_requested && !submitted_ready)
         LOG_STREAM_WARN()
             << "[QWEN4EXP-COMPLETION-GRAPH] failed op="
-            << (completion_graph.last_error_operation()
-                    ? completion_graph.last_error_operation()
+            << (completion_graph->last_error_operation()
+                    ? completion_graph->last_error_operation()
                     : "completion validation")
-            << " status=" << static_cast<int>(completion_graph.last_error())
+            << " status=" << static_cast<int>(completion_graph->last_error())
             << " ("
-            << cudaGetErrorString(completion_graph.last_error()) << ")\n";
+            << cudaGetErrorString(completion_graph->last_error()) << ")\n";
       const int invalid_expert =
           engine.model_file.architecture_config.n_experts;
       auto error_handle = engine.qwen4exp_storage_service->submit(

@@ -8,6 +8,7 @@
 #include "family_ops.hpp" // FamilyOps -- see StreamingEngine::family_ops below
 #include "dsv4_compressed_attention.hpp" // Dsv4CompressedLayerState -- see StreamingEngine::dsv4_compressed below
 #include "qwen4exp_storage_service.hpp"
+#include "qwen4exp_completion_graph.hpp"
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -606,6 +607,12 @@ public:
     // keeps this null and follows the existing DDR/early-ready path.
     std::unique_ptr<moestream::qwen4exp::StorageService>
         qwen4exp_storage_service;
+    // Stable device payload arena created before Qwen graph bootstrap when
+    // completion-graph staging is explicitly enabled. Its address can be
+    // bound by a future pure-GPU staged child and remains valid across graph
+    // rebuilds for the session.
+    std::unique_ptr<moestream::qwen4exp::CompletionGraph>
+        qwen4exp_completion_graph;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
     // Phase 2 owns three decode graph instances.  If their additional arena
