@@ -87,6 +87,10 @@ warmup counters.
 `3eaa43b` factors uniform payload-slot validation into the storage boundary and
 tests duplicate route slots plus malformed offsets.
 `b7a5c2d` adds a host-only staged-storage/adaptive-boundary regression test.
+`441ccd4` makes the Phase-2 prefix borrow the bootstrap expert arena instead
+of allocating a second copy; the first RTX run exposed this 10.93-GiB OOM.
+`ee1c8dc` extends the CUDA topology contract to execute the production payload
+unpack kernel inside the staged conditional body.
 
 ## Selected runtime
 
@@ -145,7 +149,15 @@ The topology contract is executable in
 and mixed route sets through pure-GPU conditional children and verifies an
 unconditional parent host node runs after the branch. On the RTX 3090 it
 reports `PASS: resident/staged conditionals with parent host node`. This test
-covers topology only; it does not replace the model runtime A/B.
+covers topology and payload unpacking, but it does not replace the model
+runtime A/B. Build and run it with:
+
+```bash
+/opt/cuda/bin/nvcc -std=c++17 -O2 -arch=sm_86 \
+  tests/test_qwen4exp_conditional_graph.cu \
+  cuda/qwen4exp_master_graph.cu -o /tmp/test_qwen4exp_conditional_graph
+CUDA_VISIBLE_DEVICES=0 /tmp/test_qwen4exp_conditional_graph
+```
 
 The payload-backed staged A/B is enabled only for an explicit experiment:
 
