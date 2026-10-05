@@ -11,6 +11,8 @@
 #include "safetensors_adapter.hpp" // DFlash/DSpark safetensors adapter boundary
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
+#include "exllamav3_backend.hpp"
+#include "cpu_config.hpp"
 #include "tensor_trace.hpp" // TraceFilter (pure C++, no CUDA deps -- see logger.hpp)
 #include "qwen4exp_gdn.hpp" // the REAL Qwen4Exp GDN delta-rule step (no CUDA deps)
 #include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
@@ -18,15 +20,19 @@
 #include "memory_guard.hpp" // deterministic host-budget admission arithmetic
 #include "option_b_global_hot.hpp" // Option-B global-pool hot-set selection (header-only)
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <random>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <vector>
+#include <unistd.h>
 
 // ============================================================
 // Test 1: ReasoningParser state machine
@@ -135,6 +141,7 @@ void test_topk_selection() {
 
   std::cout << " PASSED\n";
 }
+
 
 // ============================================================
 // Option-B global pool: pooled top-K across layers (include/option_b_global_hot.hpp)
@@ -2508,13 +2515,213 @@ void test_safetensors_adapter() {
   std::cout << " PASSED\n";
 }
 
+void test_exl3_ngram_reader() {
+  std::cout << "[TEST] EXL3 indexed ngram reads/cache/symlinks..." << std::flush;
+  for (int bits = 1; bits <= 8; ++bits) {
+    char path[] = "/tmp/moestream_exl3_ngram_XXXXXX";
+    const int descriptor = mkstemp(path);
+    assert(descriptor >= 0);
+    close(descriptor);
+    const std::string alias = std::string(path) + ".link";
+    assert(symlink(path, alias.c_str()) == 0);
+    const int words = 1 + bits * 10;
+    std::vector<uint16_t> bias(320), packed(4 * words);
+    for (size_t index = 0; index < bias.size(); ++index)
+      bias[index] = fp32_to_fp16(static_cast<float>(index % 23) * 0.003f);
+    for (int row = 0; row < 4; ++row) {
+      packed[row * words] = fp32_to_fp16(0.5f + 0.25f * row);
+      for (int word = 1; word < words; ++word)
+        packed[row * words + word] = static_cast<uint16_t>(row * 12345 + word * 56789);
+    }
+    {
+      std::ofstream file(path, std::ios::binary | std::ios::trunc);
+      file.write(reinterpret_cast<const char *>(bias.data()), bias.size() * 2);
+      file.write(reinterpret_cast<const char *>(packed.data()), packed.size() * 2);
+      assert(file.good());
+    }
+    SafetensorsModelInfo model;
+    const std::string prefix = "model.ngram_embedding.";
+    SafetensorsTensorInfo bias_info;
+    bias_info.name = prefix + "head_bias";
+    bias_info.file_path = path;
+    bias_info.dtype = "F16";
+    bias_info.shape = {2, 160};
+    bias_info.length = bias.size() * 2;
+    model.tensors.emplace(bias_info.name, bias_info);
+    for (int segment = 0; segment < 2; ++segment) {
+      SafetensorsTensorInfo info;
+      info.name = prefix + std::to_string(segment) + ".trellis";
+      info.file_path = alias;
+      info.dtype = "I16";
+      info.shape = {2, words};
+      info.offset = bias_info.length + static_cast<uint64_t>(segment) * words * 4;
+      info.data_offset = info.offset;
+      info.length = words * 4;
+      model.tensors.emplace(info.name, info);
+    }
+    Exl3NgramReader reader(model);
+    assert(unlink(alias.c_str()) == 0);
+    assert(unlink(path) == 0);
+    const auto check_row = [&](int head, int row) {
+      std::array<float, 160> actual{};
+      assert(reader.read_row(head, row, actual.data(), actual.size()));
+      for (int index = 0; index < 160; ++index) {
+        uint32_t state = 0;
+        for (int bit = 0; bit < 16; ++bit) {
+          const int stream = ((index - bit / bits + 160) % 160) * bits + bit % bits;
+          state |= ((packed[row * words + 1 + stream / 16] >> (stream % 16)) & 1u) << bit;
+        }
+        const uint32_t product = state * 0x83DCD12Du;
+        const int sum = (product & 255u) + ((product >> 8) & 255u) +
+                        ((product >> 16) & 255u) + (product >> 24);
+        const float code = fp16_to_fp32(fp32_to_fp16(std::fma(
+            static_cast<float>(1024 + sum), fp16_to_fp32(0x1eee), fp16_to_fp32(0xc931))));
+        const float expected = fp16_to_fp32(fp32_to_fp16(
+            code * fp16_to_fp32(packed[row * words]) + fp16_to_fp32(bias[head * 160 + index])));
+        assert(actual[index] == expected);
+      }
+    };
+    check_row(0, 0);
+    for (int layer = 0; layer < 48; ++layer) check_row(0, 0);
+    check_row(0, 3);
+    check_row(1, 3);
+    check_row(0, 0);
+    assert(reader.row_reads() == 4 && reader.cache_hits() == 48);
+    std::array<float, 160> output{};
+    assert(!reader.read_row(0, 4, output.data(), 160));
+    assert(!reader.read_row(0, -1, output.data(), 160));
+    assert(!reader.read_row(-1, 0, output.data(), 160));
+    assert(!reader.read_row(2, 0, output.data(), 160));
+    assert(!reader.read_row(0, 0, nullptr, 160));
+    assert(!reader.read_row(0, 0, output.data(), 159));
+  }
+  std::cout << " PASSED\n";
+}
+
+void test_exllamav3_backend_launch() {
+  std::cout << "[TEST] ExLlamaV3 config/argv/no-shell handoff..." << std::flush;
+  const auto config_path = std::filesystem::absolute("configs/upstream.toml");
+  const std::string prompt = "Spaces; $(touch never-execute) 'quoted'";
+  const auto arguments = exllamav3_backend_arguments(
+      config_path.string(), "../runtime/bin/python", "../tools/run_exllamav3.py",
+      {"--prompt", prompt, "--ngen", "128"});
+  assert(arguments.size() == 8);
+  assert(arguments[0] == (config_path.parent_path().parent_path() / "runtime/bin/python").string());
+  assert(arguments[1] == (config_path.parent_path().parent_path() / "tools/run_exllamav3.py").string());
+  assert(arguments[3] == config_path.string());
+  assert(arguments[5] == prompt);
+  const auto path_python = exllamav3_backend_arguments(config_path.string(), "python3", "/runner.py", {});
+  assert(path_python[0] == "python3" && path_python[1] == "/runner.py");
+  assert(!exec_exllamav3_backend(config_path.string(), "/nonexistent-moestream-python", "/runner.py", {}));
+  assert(!exec_exllamav3_backend(config_path.string(), "", "/runner.py", {}));
+  char path[] = "/tmp/moestream_exllamav3_config_XXXXXX";
+  const int descriptor = mkstemp(path);
+  assert(descriptor >= 0);
+  close(descriptor);
+  const auto write_config = [&](const std::string &text) {
+    std::ofstream file(path);
+    file << text;
+  };
+  write_config("model_path = \"/model\"\nmodel_format = \"exl3\"\nexl3_backend = \"exllamav3\"\n"
+               "exllamav3_python = \"python3\"\nexllamav3_runner_path = \"/runner.py\"\n"
+               "exllamav3_cuda_schedule = \"blocking\"\n");
+  CPUConfig valid;
+  assert(valid.load(path) && valid.exl3_backend == "exllamav3" && valid.exllamav3_python == "python3" &&
+         valid.exllamav3_cuda_schedule == "blocking");
+  write_config("exl3_backend = \"typo\"\n");
+  CPUConfig invalid;
+  assert(!invalid.load(path));
+  write_config("model_format = \"gguf\"\nexl3_backend = \"exllamav3\"\n");
+  CPUConfig wrong_format;
+  assert(!wrong_format.load(path));
+  unlink(path);
+  std::cout << " PASSED\n";
+}
+
+void test_exl3_cpu_matrix_cache() {
+  std::cout << "[TEST] EXL3 CPU matrix cache/LRU/held entries..." << std::flush;
+  Exl3CpuMatrixCache cache(100);
+  const auto matrix = [](uint8_t value) {
+    Exl3Mul1MatrixData result;
+    result.trellis.resize(32, value);
+    result.suh.resize(4, value);
+    result.svh.resize(4, value);
+    return result;
+  };
+  cache.insert("a", matrix(1));
+  cache.insert("b", matrix(2));
+  assert(cache.get("a"));
+  cache.insert("c", matrix(3));
+  assert(cache.get("a") && !cache.get("b") && cache.get("c"));
+  {
+    auto held_a = cache.get("a");
+    auto held_c = cache.get("c");
+    auto uncached = cache.insert("d", matrix(4));
+    assert(uncached && cache.stats().resident_bytes == 80);
+  }
+  cache.insert("d", matrix(4));
+  assert(!cache.get("a") && cache.get("c") && cache.get("d"));
+  const auto stats = cache.stats();
+  assert(stats.resident_bytes == 80 && stats.evictions == 2 && stats.hits == 7 &&
+         stats.misses == 2);
+  Exl3CpuMatrixCache disabled(0);
+  auto uncached = disabled.insert("x", matrix(5));
+  assert(uncached && !disabled.get("x") && disabled.stats().resident_bytes == 0);
+  std::cout << " PASSED\n";
+}
+
+void test_exl3_parallel_shard_reader() {
+  std::cout << "[TEST] EXL3 concurrent shard reads/symlink..." << std::flush;
+  char path[] = "/tmp/moestream_exl3_shard_XXXXXX";
+  const int descriptor = mkstemp(path);
+  assert(descriptor >= 0);
+  std::array<uint8_t, 256> source{};
+  for (size_t index = 0; index < source.size(); ++index)
+    source[index] = static_cast<uint8_t>(index * 17 + 5);
+  assert(write(descriptor, source.data(), source.size()) ==
+         static_cast<ssize_t>(source.size()));
+  close(descriptor);
+  const std::string alias = std::string(path) + ".link";
+  assert(symlink(path, alias.c_str()) == 0);
+  SafetensorsModelInfo model;
+  SafetensorsTensorInfo info;
+  info.name = "model.layers.0.proj.trellis";
+  info.file_path = alias;
+  info.dtype = "I16";
+  info.shape = {8, 1};
+  info.offset = 23;
+  info.length = 16;
+  model.tensors.emplace(info.name, info);
+  constexpr int thread_count = 16;
+  std::array<std::array<uint8_t, 16>, thread_count> actual{};
+  std::array<int, thread_count> success{};
+  std::vector<std::thread> threads;
+  for (int thread = 0; thread < thread_count; ++thread) {
+    threads.emplace_back([&, thread] {
+      std::vector<uint8_t> bytes;
+      std::string error;
+      success[thread] = read_exl3_tensor(model, info.name, bytes, error) && bytes.size() == 16;
+      if (success[thread]) std::copy(bytes.begin(), bytes.end(), actual[thread].begin());
+    });
+  }
+  for (auto &thread : threads) thread.join();
+  for (int thread = 0; thread < thread_count; ++thread) {
+    assert(success[thread]);
+    for (int index = 0; index < 16; ++index)
+      assert(actual[thread][index] == source[23 + index]);
+  }
+  assert(unlink(alias.c_str()) == 0);
+  assert(unlink(path) == 0);
+  std::cout << " PASSED\n";
+}
+
 void test_exl3_mul1_matmul() {
   std::cout << "[TEST] EXL3 mul1 reconstruct/matmul..." << std::flush;
 
-  constexpr int input_features = 128;
-  constexpr int output_features = 128;
-  constexpr int rows = 2;
-  for (int bits : {4, 5, 6}) {
+  for (int bits = 1; bits <= 8; ++bits) {
+    const int input_features = bits >= 3 ? 640 : 128;
+    const int output_features = bits >= 3 ? 384 : 128;
+    constexpr int rows = 3;
     const size_t trellis_words = static_cast<size_t>(input_features / 16) *
                                   (output_features / 16) * 16 * bits;
     std::vector<uint16_t> trellis(trellis_words);
@@ -2549,6 +2756,43 @@ void test_exl3_mul1_matmul() {
 
     std::vector<float> direct(rows * output_features);
     assert(exl3_mul1_matmul(matrix, input.data(), direct.data(), rows));
+    std::vector<float> batch_output(2 * output_features);
+    const Exl3Mul1BatchItem batch_items[] = {
+        {matrix, input.data(), batch_output.data()},
+        {matrix, input.data() + input_features, batch_output.data() + output_features}};
+    assert(exl3_mul1_matmul_batch(batch_items, 2));
+    float batch_error = 0.0f;
+    for (int index = 0; index < 2 * output_features; ++index)
+      batch_error = std::max(batch_error, std::abs(batch_output[index] - direct[index]));
+    assert(batch_error < 1e-5f);
+    std::fill(batch_output.begin(), batch_output.end(), 0.0f);
+    assert(exl3_mul1_matmul_batch(batch_items, 2, true));
+    double quantized_error = 0.0, exact_energy = 0.0;
+    for (int index = 0; index < 2 * output_features; ++index) {
+      const double error = batch_output[index] - direct[index];
+      quantized_error += error * error;
+      exact_energy += static_cast<double>(direct[index]) * direct[index];
+    }
+    assert(std::sqrt(quantized_error / std::max(exact_energy, 1e-20)) < 0.03);
+
+    const auto predecoded = exl3_mul1_predecode_q8(matrix);
+    assert(predecoded.size() ==
+           static_cast<size_t>(input_features) * output_features);
+    const Exl3Mul1Q8MatrixView q8_matrix{
+        predecoded.data(), suh.data(), svh.data(), bias.data(),
+        input_features, output_features};
+    std::vector<float> q8_output(2 * output_features);
+    const Exl3Mul1Q8BatchItem q8_items[] = {
+        {q8_matrix, input.data(), q8_output.data()},
+        {q8_matrix, input.data() + input_features,
+         q8_output.data() + output_features}};
+    assert(exl3_mul1_q8_matmul_batch(q8_items, 2));
+    double predecoded_error = 0.0;
+    for (int index = 0; index < 2 * output_features; ++index) {
+      const double error = q8_output[index] - direct[index];
+      predecoded_error += error * error;
+    }
+    assert(std::sqrt(predecoded_error / std::max(exact_energy, 1e-20)) < 0.04);
 
     std::vector<uint8_t> packed = exl3_mul1_pack_matrix(matrix);
     assert(!packed.empty());
@@ -2588,12 +2832,19 @@ void test_exl3_mul1_matmul() {
     std::fill(bias.begin(), bias.end(), fp32_to_fp16(0.0f));
     std::fill(input.begin(), input.end(), 1.0f);
     assert(exl3_mul1_matmul(matrix, input.data(), direct.data(), rows));
-    const float expected_dc = 128.0f * fp16_to_fp32(fp32_to_fp16(
+    const float expected_dc = static_cast<float>(input_features) * fp16_to_fp32(fp32_to_fp16(
         std::fma(1024.0f, fp16_to_fp32(0x1eee), fp16_to_fp32(0xc931))));
     for (int row = 0; row < rows; ++row) {
       assert(std::abs(direct[row * output_features] - expected_dc) < 1e-3f);
-      for (int column = 1; column < output_features; ++column)
-        assert(std::abs(direct[row * output_features + column]) < 1e-3f);
+      for (int column = 1; column < output_features; ++column) {
+        const float expected = column % 128 == 0 ? expected_dc : 0.0f;
+        if (std::abs(direct[row * output_features + column] - expected) >= 1e-3f)
+          std::cerr << "EXL3 zero-state mismatch: VNNI=" << exl3_cpu_vnni_available()
+                    << " bits=" << bits << " row=" << row << " column=" << column
+                    << " actual=" << direct[row * output_features + column]
+                    << " expected=" << expected << "\n";
+        assert(std::abs(direct[row * output_features + column] - expected) < 1e-3f);
+      }
     }
   }
 
@@ -3073,6 +3324,10 @@ int main(int argc, char **argv) {
       {"moe_decode_batch", test_moe_decode_batch},
       {"safetensors_adapter", test_safetensors_adapter},
       {"exl3_mul1_matmul", test_exl3_mul1_matmul},
+      {"exl3_ngram_reader", test_exl3_ngram_reader},
+      {"exl3_cpu_matrix_cache", test_exl3_cpu_matrix_cache},
+      {"exl3_parallel_shard_reader", test_exl3_parallel_shard_reader},
+      {"exllamav3_backend_launch", test_exllamav3_backend_launch},
   };
   const bool filtered = argc > 1;
   auto matches = [&](const char *name) {

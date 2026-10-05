@@ -1,7 +1,7 @@
 // Apples-to-apples Qwen CPU MoE graph benchmark.
 //
 // This deliberately depends only on GGML's public CPU/backend API so the same
-// source can be linked against MoEStream's and BeeLlama's ggml libraries:
+// source can be linked against MoEStream's and llama.cpp's ggml libraries:
 //
 //   bench/run_qwen_cpu_moe_compare.sh
 //

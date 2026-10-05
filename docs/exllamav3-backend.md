@@ -355,6 +355,91 @@ All three trials clear 28 tok/s. This split with static placement is the
 recommended 4bpw profile: `configs/qwen4exp_exllamav3_4bpw_cpu_split_278.toml`.
 The key defaults to `true` (upstream dynamic swapping) when omitted.
 
+### 2.05bpw expert-split sweep (VRAM-first notation)
+
+Notation: **GPU / CPU routed experts per layer**, VRAM first. Each layer has 512
+experts, 24,576 in the model. "Split layers / CPU-only layers" counts layers.
+Earlier docs and configs wrote `0/44/4` and `44/4` for whole-layer offload, where
+the first number was the CPU side; those numbers are not comparable to the
+tables here. Pack: `/mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw`. Settings: six CPU
+threads, blocking CUDA waits, eight warmup tokens, 42-token prompt, fixed
+128-token output, `context_size = 256`, static placement. Each row is one trial.
+
+Expert size, read from the shard headers: about 1.19 MiB per expert in layers
+1-47 (2bpw) and 2.38 MiB in layer 0 (4bpw). One extra GPU expert per layer
+across all 48 layers costs about 58 MiB of VRAM; measured steps matched
+(about 56 MiB).
+
+Layer mix at 256 GPU / 256 CPU experts on split layers (needs
+`exllamav3_cpu_mixed = true` unless all 48 layers are split):
+
+| Split layers / CPU-only layers | Experts in VRAM | Free on 3090 | Decode |
+| :--- | ---: | ---: | ---: |
+| 44 / 4 | 11,264 | 4,534 MiB | 34.25 tok/s |
+| 45 / 3 | 11,520 | 4,154 MiB | 34.75 tok/s |
+| 46 / 2 | 11,776 | 3,894 MiB | 35.18 tok/s |
+| 47 / 1 | 12,032 | 3,634 MiB | 35.86 tok/s |
+| 48 / 0 | 12,288 | 3,252 MiB | 36.55 tok/s |
+
+Shifting more experts to the GPU in all 48 layers (3090 only):
+
+| GPU / CPU per layer | Experts in VRAM | Budget | Free on 3090 | Decode |
+| :--- | ---: | :--- | ---: | ---: |
+| 256 / 256 | 12,288 | 22 GiB | 3,252 MiB | 36.55 tok/s |
+| 272 / 240 | 13,056 | 22 GiB | 2,372 MiB | 38.05 tok/s |
+| 288 / 224 | 13,824 | 22 GiB | 1,472 MiB | 39.45 tok/s |
+| **296 / 216** | **14,208** | **23 GiB** | **1,092 MiB** | **40.42 tok/s** |
+
+Findings:
+
+- Decode rises monotonically with GPU-resident experts; 296/216 is +10.6% over
+  256/256. No row is repeated yet, so differences under about 0.5 tok/s are
+  within the noise seen elsewhere.
+- **304 / 208 is not a valid result.** With a 22 GiB budget and the 5060 Ti
+  available, autosplit hit CUDA out of memory on layer 46 and moved layers 46-47
+  to the 5060 Ti (40.25 tok/s, prefill 1.68 s). Cross-device spill is a
+  different configuration. For 3090-only tests set the second budget to 0 so a
+  spill fails loudly, and confirm every placement entry is `cuda:0`.
+- 296/216 needs `exllamav3_gpu_memory_gb = [23.0, 0.0]`. At 22.0 it failed with
+  OOM on `lm_head` (22.02 GiB allocated against the budget; the card has
+  23.56 GiB). Only about 0.5 GiB of device headroom remains, so a longer
+  context or larger chunk may not fit. This was not tested.
+- The 5060 Ti held no routed experts in any 3090-only run.
+- In all rows output was coherent and shared the same opening text; tails
+  differed after about 90 characters, as in the earlier variance note.
+
+How to run a split:
+
+```bash
+# 1. GPUs must be idle (the runner refuses otherwise)
+nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader
+pgrep -af 'llama|ollama|vllm|moestream'
+# 2. Validate the config without CUDA
+.exl3-runtime/bin/python tools/run_exllamav3.py --config <cfg>.toml --check
+# 3. Benchmark; the JSON records placement, footprint and token ids
+.exl3-runtime/bin/python tools/run_exllamav3.py --config <cfg>.toml \
+    --benchmark --warmup-tokens 8 --output-json logs/exllamav3_runtime/<name>.json
+```
+
+Config keys (root level, before any table header):
+
+```toml
+exl3_gpu_expert_layer_begin = 0    # CPU-only layers (whole-layer offload), taken from layer 0
+exllamav3_cpu_expert_split = 216   # CPU experts per split layer; GPU gets 512 - this
+exllamav3_cpu_mixed = true         # only when both keys above are nonzero
+exllamav3_cpu_expert_swap = false  # static placement (EXL3_MOE_CPU_SWAP=0)
+exllamav3_gpu_memory_gb = [23.0, 0.0]  # [3090, 5060 Ti]; 0 keeps the test 3090-only
+```
+
+`exllamav3_cpu_mixed` relies on an uncommitted patch in the upstream checkout
+(`moe_cpu_mixed` / `EXL3_MOE_CPU_MIXED` in `exllamav3/model/config.py` and
+`modules/block_sparse_mlp_cpu.py`) that lifts the offload-versus-split
+exclusion; the first N eligible layers go wholly to the CPU and later layers
+get the split. Configs are `configs/qwen4exp_exllamav3_2bpw_*.toml`
+(`mixed_0_44_4`, `mixed_0_45_3`, `mixed_0_46_2`, `mixed_0_47_1`,
+`split_256_48_0`, `split_240_48_0`, `split_224_48_0`, `split_208_48_0`,
+`split_216_48_0_3090only`); logs and JSON are in `logs/exllamav3_runtime/`.
+
 The 2.05bpw 26/22 profile reaches a repeatable 31.30 tok/s mean and exceeds
 the 28 tok/s objective. On the 4bpw pack, the post-graph blocking baseline was
 26.67 tok/s; CUDA `spin` reached 26.26 tok/s, disabling CPU pinning reached

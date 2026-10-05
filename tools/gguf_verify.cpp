@@ -65,6 +65,87 @@ static bool is_attention_or_norm(const std::string &suffix) {
          suffix.find("hc_") != std::string::npos;
 }
 
+static bool is_qwen4exp_mixed_attention_suffix(const std::string &suffix) {
+  return suffix == "attn_gate.weight" ||
+         suffix == "attn_k.weight" ||
+         suffix == "attn_k_norm.weight" ||
+         suffix == "attn_output.weight" ||
+         suffix == "attn_q.weight" ||
+         suffix == "attn_q_norm.weight" ||
+         suffix == "attn_qkv.weight" ||
+         suffix == "attn_v.weight" ||
+         suffix == "indexer.k_norm.weight" ||
+         suffix == "indexer.q_norm.weight" ||
+         suffix == "ssm_norm.weight";
+}
+
+static bool qwen4exp_has_tensor(const GGUFFile &M, int layer,
+                                const char *suffix) {
+  return M.tensors.find("blk." + std::to_string(layer) + "." + suffix) !=
+         M.tensors.end();
+}
+
+static int verify_qwen4exp_mixed_attention(const GGUFFile &M, int min_layer,
+                                           int max_layer) {
+  int missing = 0;
+  int gdn_layers = 0;
+  int full_attention_layers = 0;
+  for (int layer = min_layer; layer <= max_layer; ++layer) {
+    const bool has_qkv = qwen4exp_has_tensor(M, layer, "attn_qkv.weight");
+    const bool has_q = qwen4exp_has_tensor(M, layer, "attn_q.weight");
+    const bool has_k = qwen4exp_has_tensor(M, layer, "attn_k.weight");
+    const bool has_v = qwen4exp_has_tensor(M, layer, "attn_v.weight");
+    const bool has_separate_qkv = has_q && has_k && has_v;
+    const std::string prefix = "blk." + std::to_string(layer) + ".";
+
+    if (has_qkv && has_separate_qkv) {
+      printf("[verify] INVALID qwen4exp layer %d: both attn_qkv and "
+             "separate attn_q/k/v tensors are present\n",
+             layer);
+      ++missing;
+      continue;
+    }
+
+    if (has_qkv) {
+      ++gdn_layers;
+      for (const char *suffix : {"attn_gate.weight", "ssm_norm.weight"}) {
+        if (!qwen4exp_has_tensor(M, layer, suffix)) {
+          printf("[verify] MISSING %s%s on qwen4exp GDN layer %d\n",
+                 prefix.c_str(), suffix, layer);
+          ++missing;
+        }
+      }
+      continue;
+    }
+
+    if (has_separate_qkv) {
+      ++full_attention_layers;
+      for (const char *suffix : {"attn_k_norm.weight",
+                                 "attn_output.weight",
+                                 "attn_q_norm.weight",
+                                 "indexer.k_norm.weight",
+                                 "indexer.q_norm.weight"}) {
+        if (!qwen4exp_has_tensor(M, layer, suffix)) {
+          printf("[verify] MISSING %s%s on qwen4exp full-attention layer %d\n",
+                 prefix.c_str(), suffix, layer);
+          ++missing;
+        }
+      }
+      continue;
+    }
+
+    printf("[verify] INVALID qwen4exp layer %d: neither attn_qkv nor a "
+           "complete attn_q/k/v set is present\n",
+           layer);
+    ++missing;
+  }
+
+  printf("[verify] qwen4exp mixed attention layout: %d GDN layer(s), "
+         "%d full-attention layer(s)\n",
+         gdn_layers, full_attention_layers);
+  return missing;
+}
+
 static bool is_deepseek41_sparse_tensor(const std::string &suffix) {
   // DeepSeek-V4.1 publishes compressed-KV and indexer weights only on the
   // source layers named by attention.kv_source_layers and
@@ -144,6 +225,7 @@ int cmd_verify(int argc, char **argv) {
             "  - every per-layer attention/norm tensor must be present in ALL\n"
             "    layers (a layer missing e.g. attn_k_b zeroes attention in the\n"
             "    engine -> garbage output). Missing -> non-zero exit.\n"
+            "    qwen4exp mixed GDN/full-attention layouts are checked per layer.\n"
             "  - FFN experts reported (packed *_exps vs per-expert, n_experts,\n"
             "    per-layer counts); a layer legitimately lacking experts (a\n"
             "    leading dense layer) is noted, not failed.\n"
@@ -221,16 +303,21 @@ int cmd_verify(int argc, char **argv) {
 
     // (1) Attention + norm tensors: HARD-required in every layer. A layer
     // missing one is always a real error (the engine zeroes attention /
-    // skips). This is exactly the "blk.63.attn_k_b missing" failure mode.
+    // skips). Qwen4Exp is the exception to the one-schema rule: its GDN and
+    // full-attention layers intentionally use different tensor families.
     int hard_missing = 0;
+    const auto arch_it = M.kv_string.find("general.architecture");
+    const bool is_qwen4exp =
+        arch_it != M.kv_string.end() && arch_it->second == "qwen4exp";
     for (auto &kv : suffix_layers) {
       const std::string &suf = kv.first;
       const std::set<int> &layers = kv.second;
       if (!is_attention_or_norm(suf))
         continue;
-      const auto arch_it = M.kv_string.find("general.architecture");
       if (arch_it != M.kv_string.end() && arch_it->second == "deepseek41" &&
           is_deepseek41_sparse_tensor(suf))
+        continue;
+      if (is_qwen4exp && is_qwen4exp_mixed_attention_suffix(suf))
         continue;
       if ((int)layers.size() < 2)
         continue; // not a per-layer tensor
@@ -247,6 +334,9 @@ int cmd_verify(int argc, char **argv) {
         printf("  (present in %d/%d)\n", (int)layers.size(), layers_in_range);
       }
     }
+    if (is_qwen4exp)
+      hard_missing +=
+          verify_qwen4exp_mixed_attention(M, min_layer, max_layer);
 
     // (2) FFN expert reporting (informational; dense layers legitimately
     // lack experts, so not hard-failed).

@@ -17,6 +17,9 @@
 
 // Forward declaration to break the include cycle with cpu_model_backend.hpp.
 class CPUModelBackend;
+class Exl3GpuExecutor;
+class Exl3NgramReader;
+class Exl3CpuMatrixCache;
 
 #include <algorithm>
 #include <chrono>
@@ -199,6 +202,15 @@ struct CPUEngine {
   SafetensorsModelInfo exl3_model;
   std::unordered_map<std::string, Exl3LinearInfo> exl3_linears;
   std::unordered_map<std::string, std::string> exl3_raw_names;
+  std::shared_ptr<Exl3GpuExecutor> exl3_gpu;
+  std::shared_ptr<Exl3GpuExecutor> exl3_gpu_secondary;
+  std::shared_ptr<Exl3NgramReader> exl3_ngram;
+  std::shared_ptr<Exl3CpuMatrixCache> exl3_cpu_matrix_cache;
+  int exl3_gpu_expert_layer_begin = 0;
+  int exl3_gpu_expert_split_layer = -1;
+  uint64_t exl3_cpu_matmuls = 0;
+  double exl3_cpu_matmul_seconds = 0.0;
+  double exl3_cpu_weight_load_seconds = 0.0;
 
   // Qwen4Exp recurrent/HC state. These are allocated lazily by the CPU
   // backend so non-Qwen models pay no memory cost.
@@ -220,6 +232,10 @@ struct CPUEngine {
   bool build_from_exl3(const std::string &path, const std::string &metadata_path,
                        int max_ctx);
   bool exl3_expert(int layer, int expert, const float *input, float *output);
+  bool exl3_cpu_routed_ffn(int layer, const int *experts, const float *weights,
+                           int count, const float *input, float *output);
+  bool exl3_routed_ffn(int layer, const int *experts, const float *weights, int count,
+                       const float *input, float *output);
   bool exl3_ngram_row(int head, int64_t row, float *output, int dimensions);
 
   // Alternate build path for .safetensors exports. Parses the file, creates the

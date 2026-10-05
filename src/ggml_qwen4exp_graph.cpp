@@ -80,11 +80,15 @@ struct Qwen4ExpCudaHostNodeContext {
   // CPU returns unweighted [D, topk] expert outputs; the GPU weights and
   // reduces them after the marker (saves the CPU reduce tail).
   bool gpu_reduce = false;
-  // The milestone-2 callback receives the original route weights but zeros
-  // resident slots before CPU reduction. This gives the callback the exact
-  // cold complement while the resident branch runs on CUDA.
+  // The milestone-2 callback projects an immutable per-token classification
+  // into private CPU-graph inputs. The original D2H route snapshot remains
+  // untouched for diagnostics and exact-once accounting.
   bool partial_cold_only = false;
   std::unique_ptr<Qwen4ExpEarlyReady> partial_cpu_graph;
+  std::vector<int32_t> resident_expert_index;
+  std::vector<int32_t> staged_expert_index;
+  moe_partial::RouteClassification route_classification;
+  uint64_t route_slot_generation = 0;
   // The full graph owns this pool. The host-node runner borrows it for the
   // callback and never frees or pauses it.
   ggml_threadpool_t shared_cpu_threadpool = nullptr;
@@ -648,10 +652,61 @@ static void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
   if (ctx->partial_cpu_graph) {
     auto &cpu_graph = *ctx->partial_cpu_graph;
     std::memcpy(cpu_graph.input, ctx->host_input, ctx->input_bytes);
-    std::memcpy(cpu_graph.ids, ctx->host_ids, ctx->ids_bytes);
-    std::memcpy(cpu_graph.weights, ctx->host_weights, ctx->weights_bytes);
-    ok = cpu_graph.compute_host_callback();
-    if (ok)
+    bool routes_ready = true;
+    bool skip_cpu_compute = false;
+    if (ctx->partial_cold_only) {
+      routes_ready = moe_partial::RouteClassification::build(
+                         ctx->host_ids, ctx->host_weights,
+                         static_cast<size_t>(ctx->topk),
+                         ctx->resident_expert_index,
+                         ctx->staged_expert_index,
+                         ctx->route_slot_generation,
+                         &ctx->route_classification) &&
+                     ctx->route_classification.exact_once() &&
+                     ctx->route_classification.write_branch_routes(
+                         moe_partial::RouteTarget::Cpu, 0, cpu_graph.ids,
+                         cpu_graph.weights,
+                         static_cast<size_t>(ctx->topk),
+                         /*preserve_unowned_route_ids=*/true);
+      const size_t cpu_route_count =
+          routes_ready
+              ? ctx->route_classification.count(moe_partial::RouteTarget::Cpu)
+              : 0;
+      if (!routes_ready) {
+        LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d rejected invalid or "
+                  "non-exact route snapshot; refusing this graph replay\n",
+                  ctx->layer_index);
+        std::fill_n(ctx->host_output,
+                    ctx->output_bytes / sizeof(float), 0.0f);
+      } else if (qwen4exp_host_node_timing_enabled()) {
+        LOG_INFO("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d routes=%zu "
+                 "resident=%zu staged=%zu cpu=%zu cpu_compute=%s "
+                 "generation=%llu\n",
+                 ctx->layer_index, ctx->route_classification.size(),
+                 ctx->route_classification.count(
+                     moe_partial::RouteTarget::ResidentGpu),
+                 ctx->route_classification.count(
+                     moe_partial::RouteTarget::StagedGpu),
+                 cpu_route_count, cpu_route_count == 0 ? "skip" : "run",
+                 static_cast<unsigned long long>(
+                     ctx->route_slot_generation));
+      }
+      if (routes_ready && cpu_route_count == 0) {
+        // Keep the existing marker/copy/merge topology for this prototype,
+        // but avoid running the prepared CPU graph when every route belongs
+        // to a GPU branch. The zero contribution is freshly initialized for
+        // every replay, so it cannot expose a prior token's output.
+        skip_cpu_compute = true;
+        std::fill_n(ctx->host_output,
+                    ctx->output_bytes / sizeof(float), 0.0f);
+      }
+    } else {
+      std::memcpy(cpu_graph.ids, ctx->host_ids, ctx->ids_bytes);
+      std::memcpy(cpu_graph.weights, ctx->host_weights, ctx->weights_bytes);
+    }
+    ok = routes_ready &&
+         (skip_cpu_compute || cpu_graph.compute_host_callback());
+    if (ok && !skip_cpu_compute)
       std::memcpy(ctx->host_output, cpu_graph.output->data,
                   ctx->output_bytes);
   } else {
@@ -829,11 +884,12 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
       return qwen4exp_cuda_usage_track_node_enqueue(node, stream);
   }
   auto *ctx = static_cast<Qwen4ExpCudaHostNodeContext *>(node->extra);
+  const bool needs_host_weights = !ctx->gpu_reduce || ctx->partial_cold_only;
   if (ctx->magic != Qwen4ExpCudaHostNodeContext::kMagic ||
       !node->data || !node->src[0] || !node->src[2] ||
-      (!ctx->gpu_reduce && !node->src[3]) ||
+      (needs_host_weights && !node->src[3]) ||
       !node->src[0]->data || !node->src[2]->data ||
-      (!ctx->gpu_reduce && !node->src[3]->data) ||
+      (needs_host_weights && !node->src[3]->data) ||
       !ctx->host_input || !ctx->host_output || !ctx->host_ids ||
       !ctx->host_weights || !ctx->d2h_start || !ctx->d2h_end ||
       !ctx->h2d_start || !ctx->h2d_end)
@@ -856,7 +912,7 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
       cudaMemcpyAsync(ctx->host_ids, node->src[2]->data, ctx->ids_bytes,
                       cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-      (!ctx->gpu_reduce &&
+      (needs_host_weights &&
        cudaMemcpyAsync(ctx->host_weights, node->src[3]->data,
                        ctx->weights_bytes, cudaMemcpyDeviceToHost, stream) !=
            cudaSuccess) ||
@@ -4903,10 +4959,36 @@ ggml_tensor *build_qwen4exp_host_node(
             up_exps_for_cpu, down_exps_for_cpu, remap_cpu_for_cpu,
             mask_cpu_for_cpu))
       return nullptr;
+    node_ctx->resident_expert_index.assign(
+        static_cast<size_t>(c.n_experts), -1);
+    node_ctx->staged_expert_index.assign(
+        static_cast<size_t>(c.n_experts), -1);
+    node_ctx->route_classification.reserve(static_cast<size_t>(c.topk));
   }
   const auto split_resident_it = g.split_gpu_expert_ids.find(layer);
-  if (split_resident_it != g.split_gpu_expert_ids.end())
+  if (split_resident_it != g.split_gpu_expert_ids.end()) {
     node_ctx->gpu_resident_experts = split_resident_it->second;
+    if (partial_cold_only) {
+      for (size_t slot = 0; slot < node_ctx->gpu_resident_experts.size();
+           ++slot) {
+        const int expert = node_ctx->gpu_resident_experts[slot];
+        if (expert < 0 || expert >= c.n_experts ||
+            node_ctx->resident_expert_index[static_cast<size_t>(expert)] >= 0) {
+          LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d has invalid or "
+                    "duplicate resident expert id=%d; refusing graph build\n",
+                    layer, expert);
+          return nullptr;
+        }
+        node_ctx->resident_expert_index[static_cast<size_t>(expert)] =
+            static_cast<int32_t>(slot);
+      }
+    }
+  } else if (partial_cold_only) {
+    LOG_ERROR("[QWEN4EXP-PARTIAL-CLASSIFY] layer=%d has no resident expert "
+              "table; refusing partial graph build\n",
+              layer);
+    return nullptr;
+  }
   // Reuse the persistent CPU pool already owned by this FullGraph.  The
   // callback runner borrows it; FullGraph remains responsible for teardown.
   node_ctx->shared_cpu_threadpool = g.cpu_threadpool;
@@ -8337,10 +8419,9 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (engine.qwen4exp_cpu_offload &&
       !engine.qwen4exp_cpu_offload_layers.empty() &&
       !env_qwen4exp_host_node_enabled()) {
-    LOG_WARN(
-        "[GGML-QWEN-FULL] disabled: CPUOffload layers are configured, but "
-        "the opt-in cudaHostNode bridge is disabled; use "
-        "the tested layered CPUOffload path instead\n");
+    LOG_ERROR(
+        "[GGML-QWEN-FULL] refusing prefill: CPUOffload layers require the "
+        "cudaHostNode bridge under the full-graph-only Qwen policy\n");
     return false;
   }
   const auto &c = engine.model_file.architecture_config;
@@ -8799,10 +8880,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (engine.qwen4exp_cpu_offload &&
       !engine.qwen4exp_cpu_offload_layers.empty() &&
       !env_qwen4exp_host_node_enabled()) {
-    LOG_WARN(
-        "[GGML-QWEN-FULL-DECODE] disabled: CPUOffload layers are configured, "
-        "but the opt-in cudaHostNode bridge is disabled; falling back "
-        "to layered CPUOffload decode\n");
+    LOG_ERROR(
+        "[GGML-QWEN-FULL-DECODE] refusing decode: CPUOffload layers require "
+        "MOESTREAM_QWEN4EXP_HOST_NODE=1 under the full-graph-only Qwen policy\n");
     return false;
   }
   const auto &c = engine.model_file.architecture_config;
@@ -8821,8 +8901,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       g_graph && g_graph->ready && g_graph->engine == &engine &&
       !g_graph->decode_mode;
   if (!continuing_decode && !has_graph_prefill) {
-    LOG_WARN("[GGML-QWEN-FULL-DECODE] disabled: decode state has not been "
-             "seeded by the opt-in full-graph prefill\n");
+    LOG_ERROR("[GGML-QWEN-FULL-DECODE] refusing decode: state was not seeded "
+              "by a successful full-graph prefill\n");
     return false;
   }
 
@@ -8838,9 +8918,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (engine.qwen_ram_vram_only_layer(layer))
       continue;
     if (!engine.graph_ram_layer_ready(layer)) {
-      LOG_WARN("[GGML-QWEN-FULL-DECODE] disabled: layer=%d has no complete "
-               "preloaded host DDR expert arena; layered decode remains "
-               "active\n",
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE] refusing decode: layer=%d has no "
+                "complete preloaded host DDR expert arena\n",
                layer);
       return false;
     }
@@ -8900,8 +8979,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (g_graph && g_graph->ready && g_graph->decode_mode &&
       g_graph->engine == &engine) {
     if (!sync_decode_state_to_host(*g_graph)) {
-      LOG_WARN("[GGML-QWEN-FULL-DECODE] state download failed while growing "
-               "KV capacity; using layered decode\n");
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE] refusing request: state download "
+                "failed while growing KV capacity\n");
       return false;
     }
     if (g_graph_prefill_arena_owner &&
@@ -8917,8 +8996,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // handle, so it's skipped).
     if (g_graph_p2_suffix_gpu && g_graph_p2_suffix_gpu->ready &&
         !sync_decode_state_to_host(*g_graph_p2_suffix_gpu)) {
-      LOG_WARN("[GGML-QWEN-FULL-DECODE-P2] suffix_gpu state download failed "
-               "while growing KV capacity; using layered decode\n");
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE-P2] refusing request: suffix_gpu state "
+                "download failed while growing KV capacity\n");
       return false;
     }
   }
@@ -9196,7 +9275,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     std::vector<float> ple;
     if (!prepare_ple_embedding(*g, ple, 1, pos_base, token_ids) &&
         has_ple_layer(c)) {
-      LOG_WARN("[GGML-QWEN-FULL-DECODE] PLE embedding preparation declined\n");
+      LOG_ERROR("[GGML-QWEN-FULL-DECODE] graph preparation failed: PLE "
+                "embedding preparation declined\n");
       return nullptr;
     }
     ple_setup_ms = std::chrono::duration<double, std::milli>(
@@ -9217,8 +9297,8 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                  "decode\n",
                  static_cast<int>(mode));
       } else {
-        LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined "
-                 "(phase2_mode=%d); layered decode remains active\n",
+        LOG_ERROR("[GGML-QWEN-FULL-DECODE] graph construction failed "
+                  "(phase2_mode=%d); request cannot continue\n",
                  static_cast<int>(mode));
       }
       return nullptr;
@@ -9351,10 +9431,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       g_graph_p2_suffix_cpu.reset();
     }
     g_graph.reset();
-    engine.qwen4exp_partial_layer_phase2_disabled = true;
-    LOG_WARN("[GGML-QWEN-FULL-DECODE-P2] phase2 graph construction failed; "
-             "disabling Phase 2 for this session and falling back to the "
-             "ordinary single-graph decode path\n");
+    LOG_ERROR("[GGML-QWEN-FULL-DECODE-P2] phase2 graph construction failed; "
+              "refusing this request under the full-graph-only policy\n");
+    return false;
   }
 
   // device_expert_layers's arena-allocation stage already retries at a

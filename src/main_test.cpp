@@ -9,6 +9,10 @@
 #include "cuda_manager.hpp"
 #include "kquant_dequant.hpp"
 #include "engine_config.hpp"
+#include "exl3_cuda.hpp"
+#include "exl3_gpu.hpp"
+#include "cuda_kernel_dispatcher.hpp"
+#include "exl3_format.hpp"
 
 #include <iostream>
 #include <cassert>
@@ -5033,7 +5037,13 @@ bool test_upload_async_already_pinned_src() {
     gpu.topology.vault_gpus = {gpu.device_id};
     const size_t buf_bytes = 128 * 1024;  // small and arbitrary -- only the
                                            // cudaHostRegister interaction matters here
-    gpu.topology.allocate_expert_cache(buf_bytes, 2, nullptr);
+    EngineConfig cache_config;
+    cache_config.gpus.emplace_back();
+    cache_config.gpus.back().device_id = gpu.device_id;
+    // This pinning test needs two tiny experts, not the allocator's default
+    // whole-card cache. Leave headroom for other native GPU fixtures.
+    cache_config.gpus.back().moe_cache_gb = double(4 * buf_bytes) / 1e9;
+    gpu.topology.allocate_expert_cache(buf_bytes, 2, &cache_config);
 
     auto make_registered_buf = [&](uint32_t seed) -> std::vector<uint8_t> {
         std::vector<uint8_t> buf(buf_bytes);
@@ -6555,8 +6565,293 @@ bool test_exl3_cpu_dispatch() {
     return true;
 }
 
+bool test_exl3_gpu_hc(int device) {
+    constexpr int width = 37, streams = 3, rank = 17, rows = 3;
+    constexpr int expanded = width * streams;
+    std::mt19937 random(8001);
+    std::uniform_real_distribution<float> distribution(-0.5f, 0.5f);
+    std::vector<float> down(expanded * rank), up(rank * expanded), inject(expanded * streams);
+    std::vector<float> normed(rows * expanded);
+    for (auto *values : {&down, &up, &inject, &normed})
+        for (float &value : *values) value = distribution(random);
+    const size_t bytes = (down.size() + up.size() + inject.size()) * sizeof(float);
+    Exl3GpuExecutor reference(device, 2 * bytes);
+    std::vector<float> low(rows * rank), gate(rows * expanded), expected_injection(rows * streams);
+    reference.matmul("hc.down", static_cast<uint32_t>(GGUFType::F32),
+                     reinterpret_cast<const uint8_t *>(down.data()), down.size() * sizeof(float),
+                     normed.data(), low.data(), rows, expanded, rank);
+    for (float &value : low) {
+        value /= static_cast<float>(streams);
+        value /= 1.0f + std::exp(-value);
+    }
+    reference.matmul("hc.up", static_cast<uint32_t>(GGUFType::F32),
+                     reinterpret_cast<const uint8_t *>(up.data()), up.size() * sizeof(float),
+                     low.data(), gate.data(), rows, rank, expanded);
+    for (float &value : gate) value = 1.0f / (1.0f + std::exp(-value));
+    reference.matmul("hc.inject", static_cast<uint32_t>(GGUFType::F32),
+                     reinterpret_cast<const uint8_t *>(inject.data()), inject.size() * sizeof(float),
+                     normed.data(), expected_injection.data(), rows, expanded, streams);
+    const auto expected = [&](bool divide_each_stream) {
+        std::vector<float> output(rows * width, 0.0f);
+        for (int row = 0; row < rows; ++row) {
+            for (int column = 0; column < width; ++column) {
+                for (int stream_index = 0; stream_index < streams; ++stream_index) {
+                    const size_t offset = (static_cast<size_t>(row) * streams + stream_index) * width + column;
+                    float value = normed[offset] * gate[offset];
+                    if (divide_each_stream) value /= static_cast<float>(streams);
+                    output[row * width + column] += value;
+                }
+                if (!divide_each_stream) output[row * width + column] /= static_cast<float>(streams);
+            }
+        }
+        return output;
+    };
+    const auto close = [](const std::vector<float> &actual, const std::vector<float> &reference_values) {
+        double error = 0.0, energy = 0.0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            if (!std::isfinite(actual[index])) return false;
+            const double difference = actual[index] - reference_values[index];
+            error += difference * difference;
+            energy += static_cast<double>(reference_values[index]) * reference_values[index];
+        }
+        return std::sqrt(error / std::max(energy, 1e-20)) < 1e-5;
+    };
+    const Exl3GpuF32Weight down_weight{"hc.down", down.data(), expanded, rank};
+    const Exl3GpuF32Weight up_weight{"hc.up", up.data(), rank, expanded};
+    const Exl3GpuF32Weight inject_weight{"hc.inject", inject.data(), expanded, streams};
+    Exl3GpuExecutor executor(device, 2 * bytes);
+    std::vector<float> actual(rows * width), actual_injection(rows * streams);
+    executor.hc_mix(down_weight, up_weight, &inject_weight, normed.data(), actual.data(),
+                    actual_injection.data(), rows, width, streams, true);
+    if (!close(actual, expected(true)) || !close(actual_injection, expected_injection)) return false;
+    executor.hc_mix(down_weight, up_weight, nullptr, normed.data(), actual.data(),
+                    nullptr, rows, width, streams, false);
+    if (!close(actual, expected(false))) return false;
+    const auto stats = executor.stats();
+    if (stats.hc_mixes != 2 || stats.uploads != 3 || stats.cache_hits != 2) return false;
+    bool rejected = false;
+    try {
+        executor.hc_mix(down_weight, up_weight, nullptr, normed.data(), actual.data(),
+                        nullptr, 0, width, streams, false);
+    } catch (const std::runtime_error &) { rejected = true; }
+    std::cout << "  device=" << device << " HC device chain "
+              << (rejected ? "PASSED" : "FAILED") << "\n";
+    return rejected;
+}
+
+bool test_exl3_cuda_kernels() {
+    std::cout << "[Test] EXL3 CUDA matmul/reconstruction/cache...\n";
+    int device_count = 0;
+    int original_device = 0;
+    if (cudaGetDevice(&original_device) != cudaSuccess) return false;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0)
+        return false;
+    const int width = 128;
+    std::mt19937 random(4242);
+    std::uniform_real_distribution<float> distribution(-1.0f, 1.0f);
+    for (int device = 0; device < device_count; ++device) {
+        if (cudaSetDevice(device) != cudaSuccess) return false;
+        for (int bits = 1; bits <= 8; ++bits) {
+            const int input_width = bits <= 3 ? width : 640;
+            const int output_width = bits <= 3 ? 256 : 384;
+            const int rows = bits == 5 ? 17 : bits == 6 ? 3 : 1;
+            std::vector<uint16_t> trellis(input_width / 16 * (output_width / 16) * 16 * bits);
+            std::vector<uint16_t> suh(input_width), svh(output_width), bias(output_width);
+            for (auto &word : trellis) word = static_cast<uint16_t>(random());
+            for (auto &value : suh) value = fp32_to_fp16(distribution(random));
+            for (auto &value : svh) value = fp32_to_fp16(distribution(random));
+            for (auto &value : bias) value = fp32_to_fp16(distribution(random) * 0.01f);
+            Exl3Mul1MatrixView host{trellis.data(), suh.data(), svh.data(), bits % 2 ? bias.data() : nullptr,
+                                    input_width, output_width, bits};
+            auto packed = exl3_mul1_pack_matrix(host);
+            Exl3PackedMatrixHeader header{};
+            std::memcpy(&header, packed.data(), sizeof(header));
+            std::vector<float> input(rows * input_width), expected(rows * output_width);
+            for (auto &value : input) value = distribution(random);
+            if (!exl3_mul1_matmul(host, input.data(), expected.data(), rows)) return false;
+            void *device_packed = nullptr;
+            float *device_input = nullptr, *device_output = nullptr;
+            float *partials = nullptr, *device_weight = nullptr;
+            float *device_accumulator = nullptr;
+            const auto release = [&] {
+                cudaFree(device_packed); cudaFree(device_input); cudaFree(device_output);
+                cudaFree(partials); cudaFree(device_weight); cudaFree(device_accumulator);
+            };
+            if (cudaMalloc(&device_packed, packed.size()) != cudaSuccess ||
+                cudaMalloc(&device_input, input.size() * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&device_output, expected.size() * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&partials, 2 * expected.size() * exl3_cuda_key_splits(input_width) * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&device_weight, static_cast<size_t>(input_width) * output_width * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&device_accumulator, expected.size() * sizeof(float)) != cudaSuccess) {
+                release(); return false;
+            }
+            cudaMemcpy(device_packed, packed.data(), packed.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(device_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice);
+            const auto *base = static_cast<const uint8_t *>(device_packed);
+            Exl3CudaMatrixView gpu{
+                reinterpret_cast<const uint16_t *>(base + header.trellis_offset),
+                reinterpret_cast<const uint16_t *>(base + header.suh_offset),
+                reinterpret_cast<const uint16_t *>(base + header.svh_offset),
+                host.bias ? reinterpret_cast<const uint16_t *>(base + header.bias_offset) : nullptr,
+                input_width, output_width, bits};
+            if (launch_exl3_mul1_matmul(gpu, device_input, device_output, rows,
+                                          partials) != cudaSuccess) {
+                release(); return false;
+            }
+            std::vector<float> actual(expected.size());
+            if (cudaMemcpy(actual.data(), device_output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                release(); return false;
+            }
+            const auto close = [](const std::vector<float> &left, const std::vector<float> &right) {
+                double error = 0.0, energy = 0.0;
+                for (size_t index = 0; index < left.size(); ++index) {
+                    if (!std::isfinite(left[index])) return false;
+                    const double difference = left[index] - right[index];
+                    error += difference * difference;
+                    energy += static_cast<double>(right[index]) * right[index];
+                }
+                return std::sqrt(error / std::max(energy, 1e-20)) < 1e-5;
+            };
+            bool ok = close(actual, expected);
+            std::vector<float> expected_activation = expected;
+            for (float &value : expected_activation)
+                value = value / (1.0f + std::exp(-value)) * value;
+            if (launch_exl3_mul1_gate_up(
+                    gpu, gpu, device_input, device_output, rows, partials,
+                    partials + expected.size() * exl3_cuda_key_splits(input_width)) != cudaSuccess ||
+                cudaMemcpy(actual.data(), device_output,
+                           actual.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+                ok = false;
+            ok = ok && close(actual, expected_activation);
+            if (!CudaKernelDispatcher::matmul(GGUFType::EXL3, device_output, device_input,
+                                                device_packed, rows, input_width, output_width)) ok = false;
+            if (cudaMemcpy(actual.data(), device_output, actual.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+                ok = false;
+            ok = ok && close(actual, expected);
+            std::vector<float> expected_accumulation = expected;
+            for (float &value : expected_accumulation) value *= 0.25f;
+            cudaMemset(device_accumulator, 0, expected.size() * sizeof(float));
+            if (launch_exl3_mul1_matmul_accumulate(
+                    gpu, device_input, device_accumulator, 0.75f, rows,
+                    partials) != cudaSuccess ||
+                launch_exl3_mul1_matmul_accumulate(
+                    gpu, device_input, device_accumulator, -0.5f, rows,
+                    partials) != cudaSuccess ||
+                cudaMemcpy(actual.data(), device_accumulator,
+                           actual.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+                ok = false;
+            ok = ok && close(actual, expected_accumulation);
+            std::vector<float> weight(static_cast<size_t>(input_width) * output_width), gpu_weight(weight.size());
+            if (!exl3_mul1_reconstruct(host, weight.data()) ||
+                launch_exl3_mul1_reconstruct(gpu, device_weight) != cudaSuccess ||
+                cudaMemcpy(gpu_weight.data(), device_weight, gpu_weight.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+                ok = false;
+            ok = ok && close(gpu_weight, weight);
+            auto malformed = header;
+            malformed.trellis_offset += 2;
+            cudaMemcpy(device_packed, &malformed, sizeof(malformed), cudaMemcpyHostToDevice);
+            if (exl3_valid_packed_header(malformed, packed.size()) ||
+                CudaKernelDispatcher::matmul(GGUFType::EXL3, device_output, device_input,
+                                              device_packed, rows, input_width, output_width))
+                ok = false;
+            if (launch_exl3_mul1_matmul(gpu, device_input, device_output, 0,
+                                          partials) != cudaErrorInvalidValue)
+                ok = false;
+            release();
+            Exl3GpuExecutor executor(device, 2 * packed.size());
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                const std::string key = "expert" + std::to_string(attempt);
+                executor.matmul(key, static_cast<uint32_t>(GGUFType::EXL3), packed.data(),
+                                  packed.size(), input.data(), actual.data(), rows,
+                                  input_width, output_width, false);
+                ok = ok && close(actual, expected);
+            }
+            ok = ok && executor.matmul_cached("expert3", input.data(), actual.data(), rows, input_width, output_width);
+            ok = ok && close(actual, expected);
+            const auto stats = executor.stats();
+            ok = ok && stats.matmuls == 5 && stats.cache_hits == 1 && stats.evictions == 2 &&
+                 stats.buffer_reuses == 2 &&
+                 stats.resident_bytes <= 2 * packed.size();
+            Exl3Mul1MatrixView down_matrix{host.trellis, host.svh, host.suh, nullptr,
+                                            output_width, input_width, bits};
+            const auto down_packed = exl3_mul1_pack_matrix(down_matrix);
+            std::vector<float> activated(output_width), expert_result(input_width);
+            for (int column = 0; column < output_width; ++column)
+                activated[column] = expected[column] / (1.0f + std::exp(-expected[column])) * expected[column];
+            if (!exl3_mul1_matmul(down_matrix, activated.data(), expert_result.data(), 1)) return false;
+            std::vector<float> combined(input_width), combined_expected(input_width);
+            for (int column = 0; column < input_width; ++column)
+                combined_expected[column] = 0.25f * expert_result[column] + 0.75f * expert_result[column];
+            const float routing_weights[] = {0.25f, 0.75f};
+            size_t load_count = 0;
+            const auto load = [&](const std::string &key) {
+                ++load_count;
+                return key.ends_with("down_proj") ? down_packed : packed;
+            };
+            const size_t ffn_budget = 4 * packed.size() + 2 * down_packed.size();
+            Exl3GpuExecutor ffn_executor(device, ffn_budget);
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                const std::vector<std::string> prefixes = attempt < 2
+                    ? std::vector<std::string>{"expert0.", "expert1."}
+                    : std::vector<std::string>{"expert1.", "expert2."};
+                ffn_executor.routed_ffn(prefixes, routing_weights, input.data(), combined.data(),
+                                         input_width, output_width, load);
+                ok = ok && close(combined, combined_expected);
+            }
+            const auto ffn_stats = ffn_executor.stats();
+            ok = ok && load_count == 9 && ffn_stats.routed_ffns == 3 && ffn_stats.matmuls == 18 &&
+                 ffn_stats.evictions == 3 && ffn_stats.resident_bytes <= ffn_budget;
+            Exl3GpuExecutor held_executor(device, 2 * packed.size());
+            bool held_rejected = false;
+            try {
+                held_executor.routed_ffn({"held."}, routing_weights, input.data(), combined.data(),
+                                          input_width, output_width, load);
+            } catch (const std::runtime_error &) { held_rejected = true; }
+            held_executor.matmul("after-failure", static_cast<uint32_t>(GGUFType::EXL3),
+                                   packed.data(), packed.size(), input.data(), actual.data(), rows,
+                                   input_width, output_width, false);
+            ok = ok && held_rejected && close(actual, expected);
+            std::cout << "  device=" << device << " bits=" << bits << " rows=" << rows
+                      << " " << (ok ? "PASSED" : "FAILED") << "\n";
+            if (!ok) return false;
+        }
+        const int input_width = 7, output_width = 11, rows = 3;
+        std::vector<float> weights(input_width * output_width), input(rows * input_width);
+        std::vector<float> expected(rows * output_width, 0.0f), actual(expected.size());
+        for (auto &value : weights) value = distribution(random);
+        for (auto &value : input) value = distribution(random);
+        for (int row = 0; row < rows; ++row)
+            for (int column = 0; column < output_width; ++column)
+                for (int feature = 0; feature < input_width; ++feature)
+                    expected[row * output_width + column] +=
+                        input[row * input_width + feature] * weights[column * input_width + feature];
+        Exl3GpuExecutor dense_executor(device, weights.size() * sizeof(float));
+        dense_executor.matmul("dense", static_cast<uint32_t>(GGUFType::F32),
+                              reinterpret_cast<const uint8_t *>(weights.data()), weights.size() * sizeof(float),
+                              input.data(), actual.data(), rows, input_width, output_width);
+        for (size_t index = 0; index < expected.size(); ++index)
+            if (!std::isfinite(actual[index]) || std::abs(actual[index] - expected[index]) > 1e-5f)
+                return false;
+        if (!dense_executor.matmul_cached("dense", input.data(), actual.data(), rows, input_width, output_width) ||
+            dense_executor.matmul_cached("missing", input.data(), actual.data(), rows, input_width, output_width))
+            return false;
+        bool rejected = false;
+        try {
+            dense_executor.matmul("over-budget", static_cast<uint32_t>(GGUFType::F32),
+                                  reinterpret_cast<const uint8_t *>(weights.data()), weights.size() * sizeof(float),
+                                  input.data(), actual.data(), rows, input_width, output_width, false);
+        } catch (const std::runtime_error &) { rejected = true; }
+        if (!rejected || dense_executor.stats().evictions != 0) return false;
+        std::cout << "  device=" << device << " F32 dispatch and pinned-cache budget PASSED\n";
+        if (!test_exl3_gpu_hc(device)) return false;
+    }
+    return cudaSetDevice(original_device) == cudaSuccess;
+}
+
 int main() {
     if (!test_exl3_cpu_dispatch()) return 1;
+    if (!test_exl3_cuda_kernels()) return 1;
+    if (std::getenv("MOESTREAM_TEST_EXL3_ONLY")) return 0;
     std::cout << "========================================\n";
     std::cout << "  MoeStream Native Test Harness\n";
     std::cout << "========================================\n";

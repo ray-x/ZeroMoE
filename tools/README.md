@@ -264,12 +264,13 @@ directory.
 
 ### What it checks
 
-1. **Attention + norm completeness (hard-required).** For every per-layer
-   tensor-name suffix under `attn`/`norm`, the suffix must appear in
-   _every_ `blk.<L>` from the model's min to max layer. Any layer missing
-   one is reported and the process exits non-zero — this is exactly the
-   failure mode where the engine silently zeroes attention instead of
-   erroring.
+1. **Attention + norm completeness (hard-required).** For ordinary models,
+   every per-layer tensor-name suffix under `attn`/`norm` must appear in
+   _every_ `blk.<L>` from the model's min to max layer. Qwen4Exp is checked
+   architecture-aware: GDN layers use `attn_qkv`/`attn_gate`/`ssm_norm`,
+   while full-attention layers use separate `attn_q/k/v` and indexer norms.
+   Any tensor missing from its required layer type is reported and the
+   process exits non-zero.
 2. **FFN expert reporting (informational).** Detects packed `*_exps` vs
    per-expert format and `n_experts` purely from tensor names (no
    architecture/KV parsing needed). A layer legitimately lacking experts

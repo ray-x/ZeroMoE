@@ -19,6 +19,9 @@
 #include "kquant_dequant.hpp"
 #include "logger.hpp"
 #include "memory_guard.hpp"
+#include "mmid_route_skip.hpp"
+#include "moe_partial_route.hpp"
+#include "moe_partial_route_ggml.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -2616,74 +2619,69 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   for (int e : p->hot)
     if (e >= 0 && (size_t)e < n)
       is_hot[(size_t)e] = 1;
-  std::vector<float> mask_values;
-  std::vector<int32_t> map_values;
-  const void *data = nullptr;
-  if (mask) {
-    mask_values.assign(n * (size_t)g.S, 0.0f);
-    for (int s = 0; s < g.S; ++s)
-      for (int e = 0; e < c.n_experts; ++e)
-        mask_values[(size_t)s * n + (size_t)e] =
-            is_hot[(size_t)e] == (hot ? 1 : 0) ? 1.0f : 0.0f;
-    data = mask_values.data();
-  } else {
-    // Both partial-residency branches share the same dynamic top-k shape.
-    // CUDA's mm_ids_helper tolerates a negative ID (it never matches any real
-    // expert bucket, so the row is silently skipped), but the CPU backend's
-    // ggml_compute_forward_mul_mat_id has no such check -- i02 is used
-    // directly as an array index (`assert(i02 < n_as)` is compiled out under
-    // NDEBUG), so a -1 there is an out-of-bounds read/write, not a no-op.
-    // The cold branch's weights can be CPU-resident (graph_ram_weight /
-    // load_cold_weight / load_full_weight with on_device=false), so we can't
-    // rely on the CUDA-only tolerance here. Use 0 (always a valid in-bounds
-    // slot whenever this branch actually runs, since has_hot/has_cold gate
-    // on a non-empty partition) as the "inactive route" sentinel instead;
-    // hot_weights/cold_weights already multiply by a 0/1 mask before the
-    // rows are summed, so a row computed against the wrong expert is
-    // harmless -- it just contributes zero to the final output.
-    map_values.assign(n * (size_t)g.S, 0);
-    if (g.dynamic_expert_cache && !hot) {
-      for (size_t expert = 0; expert < n; ++expert) {
-        if (is_hot[expert])
+
+  // How each expert is addressed inside THIS branch's weight tensor (-1 = the
+  // branch does not hold it).  The sentinel for routes it does not own, the
+  // 0/1 ownership mask and the per-token repetition all come from
+  // moe_partial::ExpertBranchMap, so every model inherits the same default
+  // (negative-id skip for single-token decode on a capable ggml, valid dummy id
+  // otherwise) -- see include/moe_partial_route.hpp.
+  std::vector<int32_t> index_of_expert(n, -1);
+  if (g.dynamic_expert_cache && !hot) {
+    for (size_t expert = 0; expert < n; ++expert)
+      if (!is_hot[expert])
+        index_of_expert[expert] = (int32_t)expert;
+  } else if (g.vram_reference_experts) {
+    if (hot) {
+      for (int expert : p->hot) {
+        if (expert < 0 || (size_t)expert >= n ||
+            (size_t)expert >= p->vram_slot_by_expert.size())
           continue;
-        for (int s = 0; s < g.S; ++s)
-          map_values[(size_t)s * n + expert] = (int32_t)expert;
-      }
-    } else if (g.vram_reference_experts) {
-      if (hot) {
-        for (int expert : p->hot) {
-          if (expert < 0 || (size_t)expert >= n ||
-              (size_t)expert >= p->vram_slot_by_expert.size())
-            continue;
-          const int32_t physical_slot =
-              p->vram_slot_by_expert[(size_t)expert];
-          if (physical_slot < 0)
-            return nullptr;
-          for (int s = 0; s < g.S; ++s)
-            map_values[(size_t)s * n + (size_t)expert] = physical_slot;
-        }
-      } else {
-        int32_t cold_slot = 0;
-        const bool full_ddr_view = partial_layer_ram_ready(g, layer);
-        for (int expert : p->cold) {
-          if (expert < 0 || (size_t)expert >= n)
-            return nullptr;
-          const int32_t index = full_ddr_view ? expert : cold_slot++;
-          for (int s = 0; s < g.S; ++s)
-            map_values[(size_t)s * n + (size_t)expert] = index;
-        }
+        const int32_t physical_slot = p->vram_slot_by_expert[(size_t)expert];
+        if (physical_slot < 0)
+          return nullptr;
+        index_of_expert[(size_t)expert] = physical_slot;
       }
     } else {
-      const auto &ids = hot ? p->hot : p->cold;
-      for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] < 0 || (size_t)ids[i] >= n)
-          continue;
-        for (int s = 0; s < g.S; ++s)
-          map_values[(size_t)s * n + (size_t)ids[i]] = (int32_t)i;
+      int32_t cold_slot = 0;
+      const bool full_ddr_view = partial_layer_ram_ready(g, layer);
+      for (int expert : p->cold) {
+        if (expert < 0 || (size_t)expert >= n)
+          return nullptr;
+        index_of_expert[(size_t)expert] = full_ddr_view ? expert : cold_slot++;
       }
     }
-    data = map_values.data();
+  } else {
+    const auto &ids = hot ? p->hot : p->cold;
+    for (size_t i = 0; i < ids.size(); ++i) {
+      if (ids[i] < 0 || (size_t)ids[i] >= n)
+        continue;
+      index_of_expert[(size_t)ids[i]] = (int32_t)i;
+    }
   }
+  std::vector<uint8_t> owned(n, 0);
+  for (size_t e = 0; e < n; ++e)
+    owned[e] = (is_hot[e] != 0) == hot ? 1 : 0;
+
+  // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
+  static const bool force_dummy =
+      std::getenv("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
+  const moe_partial::ExpertBranchMap branch_map =
+      moe_partial::ExpertBranchMap::build(
+          index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
+          force_dummy ? moe_partial::SentinelPolicy::ForceDummy
+                      : moe_partial::SentinelPolicy::Auto);
+  static bool logged_inactive = false;
+  if (!logged_inactive) {
+    logged_inactive = true;
+    LOG_INFO("[GGML-GLM5NEXT-FULL] partial-layer inactive route id=%d "
+             "(mmid negative-skip %s%s)\n",
+             (int)branch_map.inactive_id(),
+             mmid_negative_skip_available() ? "available" : "unavailable",
+             force_dummy ? ", forced dummy by env" : "");
+  }
+  const void *data = mask ? (const void *)branch_map.route_mask().data()
+                          : (const void *)branch_map.route_ids().data();
   if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used,
                    t, data, ggml_nbytes(t)))
     return nullptr;
@@ -2702,8 +2700,6 @@ bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p) {
     return false;
   const size_t n = (size_t)c.n_experts;
   const size_t count = n * (size_t)g.S;
-  std::vector<int32_t> hot_map(count, -1), cold_map(count, -1);
-  std::vector<float> hot_mask(count, 0.0f), cold_mask(count, 0.0f);
   std::vector<int32_t> hot_slots(n, -1), cold_slots(n, -1);
   for (size_t slot = 0; slot < p.hot.size(); ++slot) {
     const int expert = p.hot[slot];
@@ -2729,23 +2725,30 @@ bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p) {
               : (int32_t)slot;
     }
   }
+  // Per-expert addressing for each branch: an expert is held by the hot branch
+  // when it has a physical slot, otherwise by the cold branch.  The sentinel and
+  // mask semantics come from moe_partial::HotColdSplit (include/moe_partial_route.hpp).
+  std::vector<int32_t> hot_index(n, -1), cold_index(n, -1);
   for (size_t expert = 0; expert < n; ++expert) {
     const int32_t hs = hot_slots[expert];
     const int32_t cs = g.dynamic_expert_cache ? (int32_t)expert
                                              : cold_slots[expert];
     if (!g.dynamic_expert_cache && ((hs >= 0) == (cs >= 0)))
       return false;
-    for (int s = 0; s < g.S; ++s) {
-      const size_t i = (size_t)s * n + expert;
-      if (hs >= 0) {
-        hot_map[i] = hs;
-        hot_mask[i] = 1.0f;
-      } else {
-        cold_map[i] = cs;
-        cold_mask[i] = 1.0f;
-      }
-    }
+    if (hs >= 0)
+      hot_index[expert] = hs;
+    else
+      cold_index[expert] = cs;
   }
+  moe_partial::HotColdSplit split;
+  if (!moe_partial::HotColdSplit::build(hot_index, cold_index, g.S,
+                                        g.S == 1, /*exact_partition=*/true,
+                                        &split))
+    return false;
+  const std::vector<int32_t> &hot_map = split.hot().route_ids();
+  const std::vector<int32_t> &cold_map = split.cold().route_ids();
+  const std::vector<float> &hot_mask = split.hot().route_mask();
+  const std::vector<float> &cold_mask = split.cold().route_mask();
 
   const auto set = [](ggml_tensor *tensor, const void *data, size_t bytes) {
     return tensor && tensor->data && ggml_nbytes(tensor) == bytes &&
@@ -3042,11 +3045,57 @@ bool publish_dynamic_uploads(FullGraph &g) {
   return true;
 }
 
+// MOESTREAM_GLM5NEXT_ROUTE_TAP=<file>: accumulate per-(layer,expert) decode
+// routing counts and rewrite <file> ("layer expert count" lines, the same
+// format as the .moestream_usage files) every 25 tokens.  Needs
+// MOESTREAM_GLM5NEXT_CACHE_STATS=1 (which creates the per-layer id snapshots).
+// Existing counts in <file> are loaded first so runs accumulate.
+struct RouteTap {
+  std::string path;
+  std::vector<std::vector<uint32_t>> counts;
+  int tokens = 0;
+  bool loaded = false;
+};
+
+RouteTap &route_tap() {
+  static RouteTap t = [] {
+    RouteTap r;
+    if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_ROUTE_TAP"))
+      r.path = e;
+    return r;
+  }();
+  return t;
+}
+
+void route_tap_flush(RouteTap &t) {
+  std::FILE *f = std::fopen(t.path.c_str(), "w");
+  if (!f)
+    return;
+  for (size_t l = 0; l < t.counts.size(); ++l)
+    for (size_t e = 0; e < t.counts[l].size(); ++e)
+      if (t.counts[l][e])
+        std::fprintf(f, "%zu %zu %u\n", l, e, t.counts[l][e]);
+  std::fclose(f);
+}
+
 void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
   if (!g.partial_expert_residency || g.moe_route_ids.empty())
     return;
   const auto &c = g.engine->model_file.architecture_config;
   const uint64_t clock = ++g.dynamic_clock;
+  RouteTap &tap = route_tap();
+  if (!tap.path.empty() && !tap.loaded) {
+    tap.loaded = true;
+    tap.counts.assign((size_t)c.n_layers,
+                      std::vector<uint32_t>((size_t)c.n_experts, 0));
+    if (std::FILE *f = std::fopen(tap.path.c_str(), "r")) {
+      unsigned l, e, n;
+      while (std::fscanf(f, "%u %u %u", &l, &e, &n) == 3)
+        if (l < tap.counts.size() && e < tap.counts[l].size())
+          tap.counts[l][e] += n;
+      std::fclose(f);
+    }
+  }
   for (const auto &[layer, route_tensor] : g.moe_route_ids) {
     if (!route_tensor || layer < 0 ||
         (size_t)layer >= g.partial_experts.size())
@@ -3058,6 +3107,8 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
     for (int32_t expert : route_ids) {
       if (expert < 0 || expert >= c.n_experts)
         continue;
+      if (!tap.path.empty() && (size_t)layer < tap.counts.size())
+        ++tap.counts[(size_t)layer][(size_t)expert];
       ++p.route_count;
       if ((size_t)expert < p.expert_in_flight.size() &&
           p.expert_in_flight[(size_t)expert]) {
@@ -3078,6 +3129,24 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
         ++p.miss_count[(size_t)expert];
       }
     }
+  }
+
+  if (!tap.path.empty() && ++tap.tokens % 25 == 0)
+    route_tap_flush(tap);
+  if (tap.tokens > 0 && tap.tokens % 100 == 0 && !tap.path.empty()) {
+    std::string line;
+    for (int l = c.first_dense; l < c.n_layers; ++l) {
+      const PartialExpertLayer &p = g.partial_experts[(size_t)l];
+      if (!p.hot.empty() && !p.cold.empty() && p.route_count) {
+        char b[64];
+        std::snprintf(b, sizeof(b), " L%d=%.1f%%", l,
+                      100.0 * (double)p.hot_route_count / (double)p.route_count);
+        line += b;
+      }
+    }
+    if (!line.empty())
+      LOG_WARN("[GLM5NEXT-PARTIAL-HIT] tokens=%d per-layer hot-route hit:%s\n",
+               tap.tokens, line.c_str());
   }
 
   if (g.dynamic_expert_cache) {
@@ -5189,47 +5258,38 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (PartialExpertLayer *partial = partial_layer(g, layer)) {
     const bool has_hot = !partial->hot.empty();
     const bool has_cold = !partial->cold.empty();
-    ggml_tensor *hot_ids = nullptr;
-    ggml_tensor *cold_ids = nullptr;
-    ggml_tensor *hot_weights = nullptr;
-    ggml_tensor *cold_weights = nullptr;
+    // Route inputs and the hot+cold merge come from the shared adapter
+    // (include/moe_partial_route_ggml.hpp) so every model gets the same
+    // inactive-route default.
+    moe_partial::BranchInputs hot_in, cold_in;
     if (has_hot) {
       ggml_tensor *hot_map = partial_map(g, ctx, layer, true, false);
       ggml_tensor *hot_mask = partial_map(g, ctx, layer, true, true);
       if (!hot_map || !hot_mask)
         return nullptr;
-      ggml_tensor *mapped = ggml_get_rows(ctx, hot_map, ids);
-      ggml_tensor *mask = ggml_get_rows(ctx, hot_mask, ids);
-      hot_ids = ggml_reshape_2d(ctx, mapped, c.topk, g.S);
-      hot_weights =
-          ggml_mul(ctx, weights, ggml_reshape_3d(ctx, mask, 1, c.topk, g.S));
+      hot_in = moe_partial::make_branch_inputs(ctx, hot_map, hot_mask, ids,
+                                               weights, c.topk, g.S);
     }
     if (has_cold) {
       ggml_tensor *cold_map = partial_map(g, ctx, layer, false, false);
       ggml_tensor *cold_mask = partial_map(g, ctx, layer, false, true);
       if (!cold_map || !cold_mask)
         return nullptr;
-      ggml_tensor *mapped = ggml_get_rows(ctx, cold_map, ids);
-      ggml_tensor *mask = ggml_get_rows(ctx, cold_mask, ids);
-      cold_ids = ggml_reshape_2d(ctx, mapped, c.topk, g.S);
-      cold_weights =
-          ggml_mul(ctx, weights, ggml_reshape_3d(ctx, mask, 1, c.topk, g.S));
+      cold_in = moe_partial::make_branch_inputs(ctx, cold_map, cold_mask, ids,
+                                                weights, c.topk, g.S);
     }
-    if (has_hot) {
-      ggml_tensor *hot =
-          run_branch(partial->hot_gate_up, partial->hot_gate, partial->hot_up,
-                     partial->hot_down, hot_ids, hot_weights);
-      if (!hot)
-        return nullptr;
-      out = hot;
-    }
-    if (has_cold) {
-      ggml_tensor *cold =
-          run_branch(gate_up, ge, ue, de, cold_ids, cold_weights);
-      if (!cold)
-        return nullptr;
-      out = out ? ggml_add(ctx, out, cold) : cold;
-    }
+    out = moe_partial::combine_hot_cold(
+        ctx, has_hot, has_cold, hot_in, cold_in,
+        [&](const moe_partial::BranchInputs &in) {
+          return run_branch(partial->hot_gate_up, partial->hot_gate,
+                            partial->hot_up, partial->hot_down, in.ids,
+                            in.weights);
+        },
+        [&](const moe_partial::BranchInputs &in) {
+          return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
+        });
+    if (!out)
+      return nullptr;
   } else {
     out = run_branch(gate_up, ge, ue, de, ids, weights);
     if (!out)

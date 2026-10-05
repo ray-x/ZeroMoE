@@ -99,17 +99,20 @@ static int ggml_fixed_expert_slots() {
   return value;
 }
 
-// Qwen's `ram_preload_all_experts` is a source-ownership contract, not merely
-// a hint to improve the file-backed path.  Once enabled, every Qwen expert
-// miss must come from the already-populated RAM tier.  In particular, do not
-// silently fall back to the GGUF mmap when an optional grouped/chunked path
-// rejects a layer: mmap is file-backed model storage (and can fault from the
-// SSD), whereas the resident DDR tier is the source selected by the config.
-// This is deliberately Qwen-only so GLM/DeepSeek/other model families retain
-// their existing mmap fallback behavior.
-static bool qwen_ddr_only_expert_source(const StreamingEngine &engine) {
+// Qwen's `ram_preload_all_experts` is a source-ownership contract for layers
+// assigned to the host-RAM tier, not for layers explicitly assigned to the
+// full-graph VRAM block.  Those VRAM-only layers are excluded from the DDR
+// preload manifest, so a cold GPU-cache miss there must retain the normal
+// GGUF mmap staging source.  Applying the DDR-only rule globally made the
+// first miss in a VRAM-only layer reject the grouped path and fall back to
+// per-expert dispatch, even though that layer was never supposed to have a
+// DDR copy.  Keep the strict no-mmap rule for host-owned layers and preserve
+// existing behavior for other model families.
+static bool qwen_ddr_only_expert_source(const StreamingEngine &engine,
+                                        int layer_idx) {
   return engine.family_ops.family == ModelFamily::Qwen4Exp &&
-         engine.qwen_ram_preload_all_experts;
+         engine.qwen_ram_preload_all_experts &&
+         !engine.qwen_ram_vram_only_layer(layer_idx);
 }
 
 // Qwen-only transfer A/B.  Packed VRAM-cache copies can be landed as a
@@ -280,7 +283,8 @@ static bool run_ggml_moe_layer_chunked(
           ? std::min(engine.layers_experts[(size_t)layer_idx].size(),
                      (size_t)std::max(1, ram_mgr.cap_for_layer(layer_idx)))
           : 0;
-  const bool qwen_ddr_only_source = qwen_ddr_only_expert_source(engine);
+  const bool qwen_ddr_only_source =
+      qwen_ddr_only_expert_source(engine, layer_idx);
 
   for (int ci = 0; ci < n_chunks; ++ci) {
     const int first = ci * chunk;
@@ -880,7 +884,8 @@ static bool run_ggml_moe_layer(
             ? std::min(engine.layers_experts[(size_t)layer_idx].size(),
                        (size_t)std::max(1, ram_mgr.cap_for_layer(layer_idx)))
             : 0;
-    const bool qwen_ddr_only_source = qwen_ddr_only_expert_source(engine);
+    const bool qwen_ddr_only_source =
+        qwen_ddr_only_expert_source(engine, layer_idx);
     static std::atomic<bool> logged_qwen_ddr_miss{false};
     const bool can_coalesce_direct =
         !force_batch_stage && ram_arena && ram_arena->base &&
@@ -1663,7 +1668,8 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       // 0% hit by arithmetic and all of its machinery is pure overhead.
       static thread_local PrefillExpertStream pstream;
       const bool unpacked_layer = engine.layer_is_unpacked(layer_idx);
-      const bool qwen_ddr_only_source = qwen_ddr_only_expert_source(engine);
+      const bool qwen_ddr_only_source =
+          qwen_ddr_only_expert_source(engine, layer_idx);
 
       // ---- ggml MUL_MAT_ID path (opt-in) -----------------------------
       // Computes this layer's ENTIRE routed contribution in one backend

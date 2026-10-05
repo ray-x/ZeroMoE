@@ -113,6 +113,7 @@ int main(int argc, char **argv) {
   // independent router contributions and both must be assigned exactly once.
   const std::vector<float> weights = {0.10f, 0.20f, 0.30f, 0.40f};
   RouteClassification classification;
+  classification.reserve(4);
   CHECK(RouteClassification::build({0, 1, 2, 3}, weights,
                                    {0, 1, 2, 3}, {-1, -1, -1, -1}, 7,
                                    &classification),
@@ -123,6 +124,14 @@ int main(int argc, char **argv) {
             classification.count(RouteTarget::StagedGpu) == 0 &&
             classification.count(RouteTarget::Cpu) == 0,
         "all-hot target counts");
+  std::vector<int32_t> projected_ids(4);
+  std::vector<float> projected_weights(4);
+  CHECK(classification.write_branch_routes(RouteTarget::Cpu, 0,
+                                           projected_ids.data(),
+                                           projected_weights.data(), 4),
+        "all-hot CPU branch projection succeeds");
+  for (float weight : projected_weights)
+    CHECK(weight == 0.0f, "all-hot CPU branch has a fresh zero contribution");
 
   CHECK(RouteClassification::build({0, 1, 2, 3}, weights,
                                    {-1, -1, -1, -1}, {-1, -1, -1, -1}, 8,
@@ -153,6 +162,40 @@ int main(int argc, char **argv) {
             classification.count(RouteTarget::ResidentGpu) == 4,
         "duplicate expert slots are preserved independently");
 
+  const std::vector<int32_t> dynamic_ids = {0, 1, 2, 1};
+  const std::vector<float> dynamic_weights = {0.1f, 0.2f, 0.3f, 0.4f};
+  CHECK(RouteClassification::build(dynamic_ids.data(), dynamic_weights.data(),
+                                   dynamic_ids.size(),
+                                   {0, -1, -1}, {-1, 5, -1}, 11,
+                                   &classification),
+        "resident/staged/CPU classification builds without changing route slots");
+  for (RouteTarget target : {RouteTarget::ResidentGpu, RouteTarget::StagedGpu,
+                             RouteTarget::Cpu}) {
+    CHECK(classification.write_branch_routes(target, 0, projected_ids.data(),
+                                             projected_weights.data(), 4),
+          "branch projection writes into preallocated route buffers");
+    for (size_t slot = 0; slot < dynamic_ids.size(); ++slot) {
+      const bool owns = classification.assignments()[slot].target == target;
+      CHECK(projected_ids[slot] == (owns ? dynamic_ids[slot] : 0),
+            "branch projection preserves owned IDs and masks others");
+      CHECK(projected_weights[slot] == (owns ? dynamic_weights[slot] : 0.0f),
+            "original router weight is contributed by exactly one branch");
+    }
+  }
+  CHECK(classification.write_branch_routes(RouteTarget::Cpu, 0,
+                                           projected_ids.data(),
+                                           projected_weights.data(), 4, true),
+        "CPU projection can preserve IDs for its immutable remap table");
+  for (size_t slot = 0; slot < dynamic_ids.size(); ++slot) {
+    const bool owns =
+        classification.assignments()[slot].target == RouteTarget::Cpu;
+    CHECK(projected_ids[slot] == dynamic_ids[slot],
+          "preserved IDs retain the CPU remap table's negative-skip path");
+    CHECK(projected_weights[slot] ==
+              (owns ? dynamic_weights[slot] : 0.0f),
+          "preserved-ID projection still weights exactly one branch");
+  }
+
   CHECK(!RouteClassification::build({0, 1}, {0.5f, 0.5f},
                                     {0, 1}, {3, -1}, 11,
                                     &classification),
@@ -161,6 +204,8 @@ int main(int argc, char **argv) {
                                     {0, 1}, {-1, -1}, 12,
                                     &classification),
         "out-of-range route ID is rejected");
+  CHECK(classification.size() == 4 && classification.exact_once(),
+        "rejected input leaves the prior immutable snapshot intact");
 
   if (g_failures == 0)
     std::printf("PASS (%s): inactive id=%d for decode, 0 for prefill\n", mode, want_inactive);

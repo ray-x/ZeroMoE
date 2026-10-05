@@ -1,5 +1,5 @@
 # Qwen3.8-Flash-Next (GGUF arch "qwen4exp") -- Linux/CUDA dual-GPU bring-up.
-# For a single-3090 config (matching BeeLlama's own -dev CUDA0 llama-bench
+# For a single-3090 config (matching llama.cpp's own -dev CUDA0 llama-bench
 # setup, so the two can be A/B'd on equal hardware), see the sibling
 # configs/qwen4exp_3090_only.toml -- same tuning, one [[gpus]] entry.
 #
@@ -272,7 +272,7 @@ qwen4exp_gdn_gpu = true
 # MEASURED 2026-09-05 on the single-GPU sibling config (504-token prefill,
 # position-controlled A/B, 0 errors both arms): conv 0.44-0.48s -> 0.00s,
 # prefill mean 98.81 -> 105.88 tok/s (~7.2%). See qwen4exp_3090_only.toml
-# for the full comment, including the BeeLlama-profile evidence that
+# for the full comment, including the llama.cpp-profile evidence that
 # motivated this and the ggml-cuda 128-channel-multiple constraint found
 # along the way (checked, not left to crash for a non-conforming model).
 qwen4exp_gdn_conv_gpu = true

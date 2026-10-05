@@ -58,9 +58,23 @@ struct EngineConfig {
   // Model paths
   std::string model_path; // Primary model GGUF (experts + architecture)
   std::string model_format = "gguf";
+  std::string exl3_backend = "native";
+  std::string exllamav3_python;
+  std::string exllamav3_runner_path;
+  std::string exllamav3_cuda_schedule = "auto";
   bool model_load_only = false;
   std::string metadata_model_path;
   std::string prompt;
+  bool exl3_gpu = false;
+  bool exl3_gpu_hc = false;
+  int exl3_gpu_device = 0;
+  double exl3_gpu_cache_gb = 8.0;
+  int exl3_gpu_expert_layer_begin = 0;
+  int exl3_gpu_expert_split_layer = -1;
+  int exl3_gpu_split_device = 1;
+  double exl3_gpu_split_cache_gb = 8.0;
+  double exl3_cpu_expert_cache_gb = 24.0;
+  bool exl3_cpu_expert_int8_vnni = false;
   std::string
       dense_model_path; // Optional: separate GGUF for dense layers (e.g. 4-bit)
   // Optional: a standalone "shared" MTP/NextN checkpoint (Qwen4Exp's own
@@ -654,6 +668,18 @@ struct EngineConfig {
   // that rely on a fixed, deterministic per-layer VRAM cost keep that
   // behavior unchanged.
   bool qwen4exp_option_b_right_size_top_n = false;
+  // Global pool mode (0 = off, the per-layer behaviour above). When > 0 the
+  // selected layers' (layer, expert) pairs are ranked together by usage and
+  // the top K of the whole pool become the static hot sets, so concentrated
+  // layers get many hot experts and flat layers few (see
+  // include/option_b_global_hot.hpp). qwen4exp_option_b_top_n then acts only as
+  // a per-layer ceiling (set it to the model's expert count for no ceiling);
+  // min_coverage, right_size_top_n and fill_vram are ignored. Each eligible
+  // layer with usage keeps its own hottest experts up to the requested
+  // floor, clamped to the ceiling and available K/layer budget. Listing all
+  // layers with floor >= 1 and K >= the eligible layer count gives 0/N/0.
+  int qwen4exp_option_b_global_top_k = 0;
+  int qwen4exp_option_b_global_floor_per_layer = 1;
   // Optional explicit layer allow-list for the multi-layer Option B test.
   // When non-empty, only these CPU-side layers receive the static hot set;
   // expert ranking within each selected layer still comes from pin_file.
@@ -668,18 +694,6 @@ struct EngineConfig {
   // preserves a configured zero cache instead of treating it as auto-size;
   // if graph execution is declined, the legacy fallback has no GPU cache.
   bool qwen4exp_option_b_disable_legacy_cache = false;
-  // Global pool mode (0 = off, the per-layer behaviour above). When > 0 the
-  // selected layers' (layer, expert) pairs are ranked together by usage and
-  // the top K of the whole pool become the static hot sets, so concentrated
-  // layers get many hot experts and flat layers few (see
-  // include/option_b_global_hot.hpp). qwen4exp_option_b_top_n then acts only as
-  // a per-layer ceiling (set it to the model's expert count for no ceiling);
-  // min_coverage, right_size_top_n and fill_vram are ignored. Each eligible
-  // layer with usage keeps its own hottest experts up to the requested
-  // floor, clamped to the ceiling and available K/layer budget. Listing all
-  // layers with floor >= 1 and K >= the eligible layer count gives 0/N/0.
-  int qwen4exp_option_b_global_top_k = 0;
-  int qwen4exp_option_b_global_floor_per_layer = 1;
   // When true and qwen4exp_option_b_layer is -1, rank every layer from
   // pin_file and apply Option B only where top_n experts cover at least the
   // requested historical route share. Flat layers remain on the CPU path.
@@ -696,8 +710,12 @@ struct EngineConfig {
   // Configurable full-graph switches.  Environment variables remain valid
   // overrides for existing A/B scripts; these fields make the master-based
   // Option B profile self-contained.
-  bool qwen4exp_full_graph = false;
-  bool qwen4exp_full_graph_decode = false;
+  // Qwen4Exp execution policy: full-graph prefill/decode are the defaults.
+  // A config may explicitly disable them only for a documented exemption or
+  // a diagnostic; the runtime must not silently select layered decode after
+  // a requested full graph fails to build or execute.
+  bool qwen4exp_full_graph = true;
+  bool qwen4exp_full_graph_decode = true;
   bool qwen4exp_prefill_state_handoff = false;
 
   // Decode-time (S==1) CPU-offload cap for genuine disk-cold misses:
@@ -2549,9 +2567,28 @@ inline bool EngineConfig::load(const std::string &path) {
 
   model_path = doc.root.get_str("model_path");
   model_format = doc.root.get_str("model_format", model_format);
+  exl3_backend = doc.root.get_str("exl3_backend", exl3_backend);
+  exllamav3_python = doc.root.get_str("exllamav3_python", exllamav3_python);
+  exllamav3_runner_path = doc.root.get_str("exllamav3_runner_path", exllamav3_runner_path);
+  exllamav3_cuda_schedule = doc.root.get_str("exllamav3_cuda_schedule", exllamav3_cuda_schedule);
   model_load_only = doc.root.get_bool("model_load_only", model_load_only);
   metadata_model_path = doc.root.get_str("metadata_model_path", metadata_model_path);
   prompt = doc.root.get_str("prompt", prompt);
+  exl3_gpu = doc.root.get_bool("exl3_gpu", exl3_gpu);
+  exl3_gpu_hc = doc.root.get_bool("exl3_gpu_hc", exl3_gpu_hc);
+  exl3_gpu_device = doc.root.get_int("exl3_gpu_device", exl3_gpu_device);
+  exl3_gpu_cache_gb = doc.root.get_double("exl3_gpu_cache_gb", exl3_gpu_cache_gb);
+  exl3_gpu_expert_layer_begin =
+      doc.root.get_int("exl3_gpu_expert_layer_begin", exl3_gpu_expert_layer_begin);
+  exl3_gpu_expert_split_layer =
+      doc.root.get_int("exl3_gpu_expert_split_layer", exl3_gpu_expert_split_layer);
+  exl3_gpu_split_device = doc.root.get_int("exl3_gpu_split_device", exl3_gpu_split_device);
+  exl3_gpu_split_cache_gb =
+      doc.root.get_double("exl3_gpu_split_cache_gb", exl3_gpu_split_cache_gb);
+  exl3_cpu_expert_cache_gb =
+      doc.root.get_double("exl3_cpu_expert_cache_gb", exl3_cpu_expert_cache_gb);
+  exl3_cpu_expert_int8_vnni =
+      doc.root.get_bool("exl3_cpu_expert_int8_vnni", exl3_cpu_expert_int8_vnni);
   dense_model_path = doc.root.get_str("dense_model_path");
   mtp_model_path = doc.root.get_str("mtp_model_path");
   context_size = doc.root.get_int("context_size", context_size);
@@ -2573,6 +2610,15 @@ inline bool EngineConfig::load(const std::string &path) {
   qwen4exp_option_b_right_size_top_n = doc.root.get_bool(
       "qwen4exp_option_b_right_size_top_n",
       qwen4exp_option_b_right_size_top_n);
+  qwen4exp_option_b_global_top_k = doc.root.get_int(
+      "qwen4exp_option_b_global_top_k", qwen4exp_option_b_global_top_k);
+  qwen4exp_option_b_global_floor_per_layer = doc.root.get_int(
+      "qwen4exp_option_b_global_floor_per_layer",
+      qwen4exp_option_b_global_floor_per_layer);
+  if (qwen4exp_option_b_global_top_k < 0)
+    qwen4exp_option_b_global_top_k = 0;
+  if (qwen4exp_option_b_global_floor_per_layer < 0)
+    qwen4exp_option_b_global_floor_per_layer = 0;
   qwen4exp_option_b_selected_layers = doc.root.get_int_array(
       "qwen4exp_option_b_selected_layers");
   qwen4exp_option_b_max_layers = (int)doc.root.get_int(
@@ -2606,15 +2652,6 @@ inline bool EngineConfig::load(const std::string &path) {
     qwen4exp_option_b_top_n = 0;
   }
   if (qwen4exp_option_b_max_layers < 0) {
-  qwen4exp_option_b_global_top_k = doc.root.get_int(
-      "qwen4exp_option_b_global_top_k", qwen4exp_option_b_global_top_k);
-  qwen4exp_option_b_global_floor_per_layer = doc.root.get_int(
-      "qwen4exp_option_b_global_floor_per_layer",
-      qwen4exp_option_b_global_floor_per_layer);
-  if (qwen4exp_option_b_global_top_k < 0)
-    qwen4exp_option_b_global_top_k = 0;
-  if (qwen4exp_option_b_global_floor_per_layer < 0)
-    qwen4exp_option_b_global_floor_per_layer = 0;
     LOG_WARN("[CONFIG] qwen4exp_option_b_max_layers=%d is invalid -- "
              "disabling the layer cap\n",
              qwen4exp_option_b_max_layers);
@@ -3152,6 +3189,22 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
 }
 
 inline bool EngineConfig::validate() {
+  if (exllamav3_cuda_schedule != "auto" && exllamav3_cuda_schedule != "spin" &&
+      exllamav3_cuda_schedule != "yield" && exllamav3_cuda_schedule != "blocking") {
+    std::cerr << "[CONFIG] exllamav3_cuda_schedule must be auto, spin, yield or blocking\n";
+    return false;
+  }
+  if (exl3_backend != "native" && exl3_backend != "exllamav3") {
+    std::cerr << "[CONFIG] exl3_backend must be 'native' or 'exllamav3'\n";
+    return false;
+  }
+  if (exl3_backend == "exllamav3" &&
+      (model_format != "exl3" || model_load_only || exllamav3_python.empty() ||
+       exllamav3_runner_path.empty())) {
+    std::cerr << "[CONFIG] ExLlamaV3 requires EXL3 inference mode, exllamav3_python "
+                 "and exllamav3_runner_path\n";
+    return false;
+  }
   if (model_format != "gguf" && model_format != "exl3") {
     std::cerr << "[CONFIG] model_format must be 'gguf' or 'exl3', got: "
               << model_format << "\n";

@@ -100,6 +100,19 @@ Measured: 18.18 -> 22.63 tok/s (+24.4%).
 
 `spin` is available but has no measured use case.
 
+The EXL3 executor also honors an explicit `MOESTREAM_CUDA_SCHEDULE` value.
+With the variable unset, it preserves the current device flags. Its many
+per-projection waits differ from the GGUF graph workload measured here;
+use `exl3_hc_bench --omp-threads 12` to compare waiting policies with OpenMP
+workers active before each HC dispatch.
+
+For the standard EXL3 hybrid 26/22 profile, a warmed full-checkpoint check
+measured about 6.40 tok/s with default OpenMP waiting and 7.10 tok/s with
+`OMP_WAIT_POLICY=PASSIVE`, with all 128 generated token IDs preserved.
+Use passive OpenMP waiting and CUDA `auto` for this measured EXL3 profile;
+[the EXL3 comparison](exl3-wait-policy-2026-10-05.md) records the commands,
+cache conditions and raw logs. The GGUF recommendations below are unchanged.
+
 ## Recommended combinations
 
 | Mode | `HOST_NODE` | `QWEN_CPU_THREADS` | `CUDA_SCHEDULE` | `OMP_WAIT_POLICY` |

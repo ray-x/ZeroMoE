@@ -714,11 +714,16 @@ public:
     std::vector<float> hc_attn_pre_mix;
     std::vector<float> hc_final_pre_mix;
 
-    // Set by the opt-in Qwen4Exp full GGML prefill graph after it has
+    // Set by the Qwen4Exp full GGML prefill graph after it has
     // produced the final model-level HC output directly into the caller's
     // [S,D] buffer.  The generation loop must not run the legacy HC collapse
     // a second time for that result.
     bool qwen4exp_full_graph_output_ready = false;
+    // Set after model-family detection when Qwen full-graph decode is the
+    // effective policy. A graph failure is surfaced to the request loop;
+    // execution_layer must not continue into the layered token loop.
+    bool qwen4exp_full_graph_required = false;
+    std::string qwen4exp_full_graph_failure;
     // The Qwen full decode graph may also produce the next-token logits in
     // the same one-submission graph.  The generation loop consumes this once
     // on the following sampling iteration to avoid a separate lm-head H2D/D2H

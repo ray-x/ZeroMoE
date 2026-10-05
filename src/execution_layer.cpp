@@ -1006,9 +1006,10 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   // unrelated token rediscovering an earlier token's stale fetch record.
   advance_token_step();
 
-  // The full graph paths submit the complete trunk in one GGML
-  // scheduler call.  They return true only after producing final [S,D]
-  // output; otherwise the established layer loop remains the fallback.
+  // Full graph paths submit the complete trunk in one GGML scheduler call.
+  // Families with the full-graph-only policy turn build/run failure into a
+  // request error below; other families retain their explicitly supported
+  // layered path during migration.
   engine.qwen4exp_full_graph_output_ready = false;
   engine.qwen4exp_full_graph_logits_ready = false;
   engine.glm5next_full_graph_output_ready = false;
@@ -1035,6 +1036,44 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       hidden_states,
       engine.qwen4exp_full_graph_logits_target,
       engine.qwen4exp_full_graph_logits_target_size};
+  if (engine.qwen4exp_full_graph_required) {
+    auto fail_graph = [&engine](const char *reason) {
+      engine.qwen4exp_full_graph_failure = reason;
+      LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; layered execution is disabled\n",
+                reason);
+    };
+    if (S == 1 && pos_base >= 0) {
+      if (!graph_ops.enabled || !graph_ops.build || !graph_ops.run ||
+          !graph_ops.enabled(engine, ModelGraphPhase::Decode)) {
+        fail_graph("Qwen4Exp full-graph decode adapter is unavailable");
+        return;
+      }
+      if (!graph_ops.build(engine, decode_graph_request)) {
+        fail_graph("Qwen4Exp full-graph decode construction failed");
+        return;
+      }
+      if (!graph_ops.run(engine, decode_graph_request)) {
+        fail_graph("Qwen4Exp full-graph decode execution failed");
+        return;
+      }
+      return;
+    }
+    if (S > 1) {
+      if (pos_base != 0 || !graph_ops.enabled || !graph_ops.run ||
+          !graph_ops.enabled(engine, ModelGraphPhase::Prefill)) {
+        fail_graph("Qwen4Exp full-graph prefill adapter is unavailable for "
+                   "this request shape");
+        return;
+      }
+      if (!graph_ops.run(engine, prefill_graph_request)) {
+        fail_graph("Qwen4Exp full-graph prefill execution failed");
+        return;
+      }
+      return;
+    }
+    fail_graph("Qwen4Exp full-graph received an unsupported token shape");
+    return;
+  }
   if (S == 1 && pos_base >= 0 && graph_ops.enabled && graph_ops.build &&
       graph_ops.run && graph_ops.enabled(engine, ModelGraphPhase::Decode) &&
       graph_ops.build(engine, decode_graph_request) &&

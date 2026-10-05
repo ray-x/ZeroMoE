@@ -4,8 +4,12 @@
 #include "cpu_model_backend.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_cpu.hpp"
+#ifdef MOESTREAM_EXL3_CUDA
+#include "exl3_gpu.hpp"
+#endif
 
 #include <cmath>
+#include <chrono>
 #include <cstring>
 #include <numeric>
 
@@ -600,6 +604,14 @@ bool CPUEngine::build_from_exl3(const std::string &path,
   const auto &cfg = model_file.architecture_config;
   if (contract.n_layers != cfg.n_layers || contract.n_experts != cfg.n_experts)
     throw std::runtime_error("EXL3 checkpoint architecture differs from metadata model");
+  if (cfg.ple_n_heads > 0)
+    exl3_ngram = std::make_shared<Exl3NgramReader>(exl3_model);
+  if (!std::isfinite(config.exl3_cpu_expert_cache_gb) ||
+      config.exl3_cpu_expert_cache_gb < 0.0 || config.exl3_cpu_expert_cache_gb > 1024.0)
+    throw std::runtime_error("exl3_cpu_expert_cache_gb must be in [0, 1024]");
+  if (config.exl3_cpu_expert_cache_gb > 0.0)
+    exl3_cpu_matrix_cache = std::make_shared<Exl3CpuMatrixCache>(
+        static_cast<size_t>(config.exl3_cpu_expert_cache_gb * 1024.0 * 1024.0 * 1024.0));
   for (const auto &[name, meta] : model_file.tensors) {
     if (is_routed_expert_tensor(name) || is_qwen4exp_deferred_tensor(model_file, name) ||
         name.starts_with("blk." + std::to_string(cfg.n_layers) + ".")) continue;
@@ -630,13 +642,50 @@ bool CPUEngine::exl3_expert(int layer, int expert, const float *input, float *ou
   std::vector<uint8_t> packed;
   const auto project = [&](const char *suffix, const float *source, float *target,
                             int input_dim, int output_dim) {
+    bool gpu_expert = false;
+#ifdef MOESTREAM_EXL3_CUDA
+    gpu_expert = exl3_gpu && layer >= exl3_gpu_expert_layer_begin;
+    auto expert_executor = exl3_gpu_secondary && layer >= exl3_gpu_expert_split_layer
+        ? exl3_gpu_secondary : exl3_gpu;
+    if (gpu_expert && expert_executor->matmul_cached(prefix + suffix, source, target,
+                                                     1, input_dim, output_dim))
+      return;
+#endif
     auto found = exl3_linears.find(prefix + suffix);
     if (found == exl3_linears.end())
       throw std::runtime_error("Missing EXL3 expert projection: " + prefix + suffix);
+    if (!gpu_expert) {
+      std::shared_ptr<const Exl3Mul1MatrixData> matrix =
+          exl3_cpu_matrix_cache ? exl3_cpu_matrix_cache->get(prefix + suffix) : nullptr;
+      if (!matrix) {
+        Exl3Mul1MatrixData loaded;
+        const auto load_begin = std::chrono::steady_clock::now();
+        if (!load_exl3_mul1_components(exl3_model, found->second, loaded, error))
+          throw std::runtime_error(error);
+        exl3_cpu_weight_load_seconds +=
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - load_begin).count();
+        matrix = exl3_cpu_matrix_cache
+            ? exl3_cpu_matrix_cache->insert(prefix + suffix, std::move(loaded))
+            : std::make_shared<Exl3Mul1MatrixData>(std::move(loaded));
+      }
+      const auto cpu_matmul_begin = std::chrono::steady_clock::now();
+      if (!exl3_mul1_matmul(matrix->view(), source, target, 1))
+        throw std::runtime_error("EXL3 expert matmul failed: " + prefix + suffix);
+      ++exl3_cpu_matmuls;
+      exl3_cpu_matmul_seconds +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_matmul_begin).count();
+      return;
+    }
     if (!load_exl3_mul1_matrix(exl3_model, found->second, packed, error))
       throw std::runtime_error(error);
-    if (!exl3_mul1_matmul_packed(packed.data(), source, target, 1, input_dim, output_dim))
-      throw std::runtime_error("EXL3 expert matmul failed: " + prefix + suffix);
+#ifdef MOESTREAM_EXL3_CUDA
+    if (gpu_expert) {
+      expert_executor->matmul(prefix + suffix, static_cast<uint32_t>(GGUFType::EXL3),
+                        packed.data(), packed.size(), source, target, 1,
+                        input_dim, output_dim, false);
+      return;
+    }
+#endif
   };
   project("gate_proj", input, gate.data(), cfg.hidden, cfg.moe_inter);
   project("up_proj", input, up.data(), cfg.hidden, cfg.moe_inter);
@@ -646,57 +695,155 @@ bool CPUEngine::exl3_expert(int layer, int expert, const float *input, float *ou
   return true;
 }
 
-bool CPUEngine::exl3_ngram_row(int head, int64_t row, float *output, int dimensions) {
-  const SafetensorsTensorInfo *table = nullptr;
-  int64_t local_row = row;
-  std::vector<const SafetensorsTensorInfo *> tables;
-  std::string bias_name;
-  for (const auto &[name, info] : exl3_model.tensors) {
-    if (name.find("ngram_embedding") == std::string::npos) continue;
-    if (name.ends_with(".head_bias")) bias_name = name;
-    if (name.ends_with(".trellis") && info.shape.size() == 2)
-      tables.push_back(&info);
+bool CPUEngine::exl3_routed_ffn(int layer, const int *experts, const float *weights,
+                                int count, const float *input, float *output) {
+#ifdef MOESTREAM_EXL3_CUDA
+  if (!exl3_gpu || layer < exl3_gpu_expert_layer_begin) return false;
+  const auto &cfg = model_file.architecture_config;
+  if (!experts || !weights || count <= 0 || count > cfg.n_experts)
+    throw std::runtime_error("Invalid EXL3 expert routing");
+  std::vector<std::string> prefixes;
+  prefixes.reserve(count);
+  for (int index = 0; index < count; ++index) {
+    if (experts[index] < 0 || experts[index] >= cfg.n_experts)
+      throw std::runtime_error("EXL3 routed expert ID out of range");
+    prefixes.push_back("model.language_model.layers." + std::to_string(layer) +
+                       ".mlp.experts." + std::to_string(experts[index]) + ".");
   }
-  std::sort(tables.begin(), tables.end(), [](const auto *left, const auto *right) {
-    return left->data_offset < right->data_offset;
-  });
-  for (const auto *candidate : tables) {
-    if (local_row < candidate->shape[0]) { table = candidate; break; }
-    local_row -= candidate->shape[0];
-  }
-  if (!table || local_row < 0 || dimensions != 160 || bias_name.empty()) return false;
-  const int words = static_cast<int>(table->shape[1]);
-  const int bits = (words - 1) / 10;
-  if (bits < 1 || bits > 8 || words != 1 + bits * 10) return false;
-  std::ifstream file(table->file_path, std::ios::binary);
-  std::vector<uint16_t> packed(words);
-  file.seekg(table->offset + static_cast<uint64_t>(local_row) * words * 2);
-  file.read(reinterpret_cast<char *>(packed.data()), words * 2);
-  if (!file) return false;
-  const auto &bias_info = exl3_model.tensors.at(bias_name);
-  if (bias_info.dtype != "F16" || head < 0 || bias_info.shape.size() != 2 ||
-      head >= bias_info.shape[0] || bias_info.shape[1] != dimensions) return false;
-  std::ifstream bias_file(bias_info.file_path, std::ios::binary);
-  std::vector<uint16_t> bias(dimensions);
-  bias_file.seekg(bias_info.offset + static_cast<uint64_t>(head) * dimensions * 2);
-  bias_file.read(reinterpret_cast<char *>(bias.data()), dimensions * 2);
-  if (!bias_file) return false;
-  const float scale = fp16_to_fp32(packed[0]);
-  for (int index = 0; index < dimensions; ++index) {
-    uint32_t state = 0;
-    for (int bit = 0; bit < 16; ++bit) {
-      const int position = (index - bit / bits + dimensions) % dimensions;
-      const int stream_bit = position * bits + bit % bits;
-      state |= ((packed[1 + stream_bit / 16] >> (stream_bit % 16)) & 1u) << bit;
+  auto executor = exl3_gpu_secondary && layer >= exl3_gpu_expert_split_layer
+      ? exl3_gpu_secondary : exl3_gpu;
+  executor->routed_ffn(prefixes, weights, input, output, cfg.hidden, cfg.moe_inter,
+      [&](const std::string &key) {
+        auto found = exl3_linears.find(key);
+        if (found == exl3_linears.end())
+          throw std::runtime_error("Missing EXL3 expert projection: " + key);
+        std::string error;
+        std::vector<uint8_t> packed;
+        if (!load_exl3_mul1_matrix(exl3_model, found->second, packed, error))
+          throw std::runtime_error(error);
+        return packed;
+      });
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool CPUEngine::exl3_cpu_routed_ffn(int layer, const int *experts, const float *weights,
+                                    int count, const float *input, float *output) {
+  const auto &cfg = model_file.architecture_config;
+  if (exl3_model.tensors.empty() || !experts || !weights || !input || !output ||
+      count <= 0 || count > cfg.n_experts ||
+      (exl3_gpu && layer >= exl3_gpu_expert_layer_begin)) return false;
+  if (config.exl3_cpu_expert_int8_vnni && !exl3_cpu_vnni_available())
+    throw std::runtime_error("exl3_cpu_expert_int8_vnni requires AVX-512 VNNI");
+  for (int expert = 0; expert < count; ++expert)
+    if (experts[expert] < 0 || experts[expert] >= cfg.n_experts)
+      throw std::runtime_error("EXL3 routed expert ID out of range");
+  std::vector<std::shared_ptr<const Exl3Mul1MatrixData>> matrices(count * 3);
+  std::vector<std::string> keys(count * 3);
+  std::vector<int> missing;
+  missing.reserve(count * 3);
+  const auto load_begin = std::chrono::steady_clock::now();
+  const std::string layer_prefix = "model.language_model.layers." +
+      std::to_string(layer) + ".mlp.experts.";
+  const char *suffix[] = {"gate_proj", "up_proj", "down_proj"};
+  for (int expert = 0; expert < count; ++expert) {
+    const std::string prefix = layer_prefix + std::to_string(experts[expert]) + ".";
+    for (int projection = 0; projection < 3; ++projection) {
+      const int index = expert * 3 + projection;
+      keys[index] = prefix + suffix[projection];
+      if (exl3_cpu_matrix_cache)
+        matrices[index] = exl3_cpu_matrix_cache->get(keys[index]);
+      if (!matrices[index]) missing.push_back(index);
     }
-    const uint32_t product = state * 0x83DCD12Du;
-    const int sum = (product & 255u) + ((product >> 8) & 255u) +
-                    ((product >> 16) & 255u) + (product >> 24);
-    const float code = fp16_to_fp32(fp32_to_fp16(std::fma(
-        static_cast<float>(1024 + sum), fp16_to_fp32(0x1eee), fp16_to_fp32(0xc931))));
-    output[index] = fp16_to_fp32(fp32_to_fp16(code * scale + fp16_to_fp32(bias[index])));
+  }
+  const auto load_matrix = [&](int index) {
+    const std::string &key = keys[index];
+    const auto found = exl3_linears.find(key);
+    if (found == exl3_linears.end())
+      throw std::runtime_error("Missing EXL3 expert projection: " + key);
+    Exl3Mul1MatrixData data;
+    std::string error;
+    if (!load_exl3_mul1_components(exl3_model, found->second, data, error))
+      throw std::runtime_error(error);
+    matrices[index] = exl3_cpu_matrix_cache
+        ? exl3_cpu_matrix_cache->insert(key, std::move(data))
+        : std::make_shared<Exl3Mul1MatrixData>(std::move(data));
+  };
+  std::exception_ptr load_failure;
+  std::mutex load_failure_mutex;
+  if (!missing.empty()) {
+    const int missing_count = static_cast<int>(missing.size());
+    #pragma omp parallel for schedule(dynamic) if(missing_count >= 4)
+    for (int job = 0; job < missing_count; ++job) {
+      try {
+        load_matrix(missing[job]);
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(load_failure_mutex);
+        if (!load_failure) load_failure = std::current_exception();
+      }
+    }
+  }
+  if (load_failure) std::rethrow_exception(load_failure);
+  exl3_cpu_weight_load_seconds +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - load_begin).count();
+  std::vector<float> gate(static_cast<size_t>(count) * cfg.moe_inter);
+  std::vector<float> up(gate.size());
+  std::vector<float> activated(gate.size());
+  std::vector<float> expert_output(static_cast<size_t>(count) * cfg.hidden);
+  std::vector<Exl3Mul1BatchItem> projections(static_cast<size_t>(count) * 2);
+  for (int expert = 0; expert < count; ++expert) {
+    const auto gate_matrix = matrices[expert * 3]->view();
+    const auto up_matrix = matrices[expert * 3 + 1]->view();
+    if (gate_matrix.input_features != cfg.hidden || gate_matrix.output_features != cfg.moe_inter ||
+        up_matrix.input_features != cfg.hidden || up_matrix.output_features != cfg.moe_inter)
+      throw std::runtime_error("EXL3 gate/up expert projection shape mismatch");
+    projections[expert * 2] = {gate_matrix, input,
+        gate.data() + static_cast<size_t>(expert) * cfg.moe_inter};
+    projections[expert * 2 + 1] = {up_matrix, input,
+        up.data() + static_cast<size_t>(expert) * cfg.moe_inter};
+  }
+  const auto gate_begin = std::chrono::steady_clock::now();
+  if (!exl3_mul1_matmul_batch(projections.data(), static_cast<int>(projections.size()),
+                              config.exl3_cpu_expert_int8_vnni))
+    throw std::runtime_error("EXL3 batched gate/up matmul failed");
+  exl3_cpu_matmuls += projections.size();
+  exl3_cpu_matmul_seconds +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - gate_begin).count();
+  #pragma omp parallel for schedule(static)
+  for (int index = 0; index < count * cfg.moe_inter; ++index) {
+    const float value = gate[index];
+    activated[index] = value / (1.0f + std::exp(-value)) * up[index];
+  }
+  projections.resize(count);
+  for (int expert = 0; expert < count; ++expert) {
+    const auto down_matrix = matrices[expert * 3 + 2]->view();
+    if (down_matrix.input_features != cfg.moe_inter || down_matrix.output_features != cfg.hidden)
+      throw std::runtime_error("EXL3 down expert projection shape mismatch");
+    projections[expert] = {down_matrix,
+        activated.data() + static_cast<size_t>(expert) * cfg.moe_inter,
+        expert_output.data() + static_cast<size_t>(expert) * cfg.hidden};
+  }
+  const auto down_begin = std::chrono::steady_clock::now();
+  if (!exl3_mul1_matmul_batch(projections.data(), count,
+                              config.exl3_cpu_expert_int8_vnni))
+    throw std::runtime_error("EXL3 batched down matmul failed");
+  exl3_cpu_matmuls += count;
+  exl3_cpu_matmul_seconds +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - down_begin).count();
+  std::fill(output, output + cfg.hidden, 0.0f);
+  for (int expert = 0; expert < count; ++expert) {
+    const float weight = weights[expert];
+    const float *source = expert_output.data() + static_cast<size_t>(expert) * cfg.hidden;
+    for (int index = 0; index < cfg.hidden; ++index)
+      output[index] += weight * source[index];
   }
   return true;
+}
+
+bool CPUEngine::exl3_ngram_row(int head, int64_t row, float *output, int dimensions) {
+  return exl3_ngram && exl3_ngram->read_row(head, row, output, dimensions);
 }
 
 bool CPUEngine::build_from_safetensors(const std::string &path, int max_ctx) {

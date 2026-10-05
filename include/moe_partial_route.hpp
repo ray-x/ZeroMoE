@@ -50,17 +50,34 @@ struct RouteAssignment {
 // router weights, and overlapping resident/staged ownership.
 class RouteClassification {
 public:
+  // Reserve once while building a reusable graph context. A replay can then
+  // classify its small fixed top-k route list without allocating in a CUDA
+  // host callback.
+  void reserve(size_t capacity) { assignments_.reserve(capacity); }
+
   static bool build(const std::vector<int32_t> &route_ids,
                     const std::vector<float> &router_weights,
                     const std::vector<int32_t> &resident_index,
                     const std::vector<int32_t> &staged_index,
                     uint64_t slot_generation, RouteClassification *out) {
-    if (!out || route_ids.size() != router_weights.size() ||
+    if (route_ids.size() != router_weights.size())
+      return false;
+    return build(route_ids.data(), router_weights.data(), route_ids.size(),
+                 resident_index, staged_index, slot_generation, out);
+  }
+
+  static bool build(const int32_t *route_ids, const float *router_weights,
+                    size_t route_count,
+                    const std::vector<int32_t> &resident_index,
+                    const std::vector<int32_t> &staged_index,
+                    uint64_t slot_generation, RouteClassification *out) {
+    if (!out || (!route_ids && route_count != 0) ||
+        (!router_weights && route_count != 0) ||
         resident_index.size() != staged_index.size())
       return false;
-    RouteClassification candidate;
-    candidate.assignments_.reserve(route_ids.size());
-    for (size_t slot = 0; slot < route_ids.size(); ++slot) {
+    // Validate before mutating the reusable output so a rejected routing
+    // snapshot cannot leave a partial classification behind.
+    for (size_t slot = 0; slot < route_count; ++slot) {
       const int32_t expert = route_ids[slot];
       if (expert < 0 || static_cast<size_t>(expert) >= resident_index.size() ||
           !std::isfinite(router_weights[slot]))
@@ -69,6 +86,15 @@ public:
       const int32_t staged = staged_index[static_cast<size_t>(expert)];
       if (resident >= 0 && staged >= 0)
         return false;
+    }
+
+    out->assignments_.clear();
+    if (out->assignments_.capacity() < route_count)
+      out->assignments_.reserve(route_count);
+    for (size_t slot = 0; slot < route_count; ++slot) {
+      const int32_t expert = route_ids[slot];
+      const int32_t resident = resident_index[static_cast<size_t>(expert)];
+      const int32_t staged = staged_index[static_cast<size_t>(expert)];
       RouteAssignment assignment;
       assignment.expert_id = expert;
       assignment.original_route_slot = static_cast<int32_t>(slot);
@@ -81,14 +107,13 @@ public:
         assignment.target = RouteTarget::StagedGpu;
         assignment.weight_slot = staged;
       }
-      candidate.assignments_.push_back(assignment);
+      out->assignments_.push_back(assignment);
     }
     // The construction loop appends exactly one assignment for every input
     // slot. Keep this explicit so future target additions cannot silently
     // drop a route while refactoring the classifier.
-    if (candidate.assignments_.size() != route_ids.size())
+    if (out->assignments_.size() != route_count)
       return false;
-    *out = std::move(candidate);
     return true;
   }
 
@@ -119,6 +144,36 @@ public:
     }
     for (uint8_t value : seen)
       if (!value) return false;
+    return true;
+  }
+
+  // Project this immutable invocation's assignments into one branch's fixed
+  // top-k inputs. Non-owned slots receive zero weight and normally a valid
+  // dummy expert ID. A branch that has its own immutable remap/mask tables may
+  // preserve the original ID so those tables keep their exact sentinel path.
+  // The caller supplies graph-owned buffers so this operation allocates
+  // nothing and is safe inside a bounded host callback.
+  bool write_branch_routes(RouteTarget target, int32_t dummy_expert_id,
+                           int32_t *route_ids_out,
+                           float *router_weights_out,
+                           size_t capacity,
+                           bool preserve_unowned_route_ids = false) const {
+    if ((!route_ids_out || !router_weights_out) && !assignments_.empty())
+      return false;
+    if (capacity < assignments_.size() || dummy_expert_id < 0)
+      return false;
+    for (const auto &assignment : assignments_) {
+      if (assignment.original_route_slot < 0 ||
+          static_cast<size_t>(assignment.original_route_slot) >= capacity)
+        return false;
+      const size_t slot =
+          static_cast<size_t>(assignment.original_route_slot);
+      const bool owns = assignment.target == target;
+      route_ids_out[slot] =
+          owns || preserve_unowned_route_ids ? assignment.expert_id
+                                             : dummy_expert_id;
+      router_weights_out[slot] = owns ? assignment.router_weight : 0.0f;
+    }
     return true;
   }
 

@@ -2,6 +2,7 @@
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
 #include "exl3_decode.hpp"
+#include "exllamav3_backend.hpp"
 #include "logger.hpp"
 #include "models/model_family.hpp"
 
@@ -59,6 +60,27 @@ int main(int argc, char **argv) {
   cfg.print();
 
   if (cfg.model_format == "exl3") {
+    if (cfg.exl3_backend == "exllamav3") {
+      std::vector<std::string> overrides{
+          "--ngen", std::to_string(parse_int_arg(argc, argv, "--ngen", cfg.max_new_tokens)),
+          "--ctx", std::to_string(cfg.context_size),
+          "--threads", std::to_string(cfg.omp_max_threads > 0 ? cfg.omp_max_threads : 4),
+          "--cuda-schedule", cfg.exllamav3_cuda_schedule,
+          "--temperature", std::to_string(cfg.temperature),
+          "--top-p", std::to_string(cfg.top_p),
+          cfg.raw_prompt ? "--raw-prompt" : "--no-raw-prompt",
+          cfg.enable_thinking ? "--thinking" : "--no-thinking"};
+      const auto prompt = parse_arg(argc, argv, "--prompt", "");
+      if (!prompt.empty()) {
+        overrides.push_back("--prompt");
+        overrides.push_back(prompt);
+      }
+      std::cout << "[EXLLAMAV3] Delegating to upstream CUDA/CPU runtime\n" << std::flush;
+      auto result = exec_exllamav3_backend(config_path, cfg.exllamav3_python,
+                                          cfg.exllamav3_runner_path, overrides);
+      if (!result) std::cerr << result.error() << "\n";
+      return result ? 0 : 1;
+    }
     auto result = run_exl3_decode({
         .model_path = cfg.model_path,
         .metadata_model_path = cfg.metadata_model_path,
@@ -69,7 +91,17 @@ int main(int argc, char **argv) {
         .temperature = cfg.temperature,
         .top_p = cfg.top_p,
         .raw_prompt = cfg.raw_prompt,
-        .enable_thinking = cfg.enable_thinking});
+        .enable_thinking = cfg.enable_thinking,
+        .gpu = cfg.exl3_gpu,
+        .gpu_hc = cfg.exl3_gpu_hc,
+        .gpu_device = cfg.exl3_gpu_device,
+        .gpu_cache_gb = cfg.exl3_gpu_cache_gb,
+        .gpu_expert_layer_begin = cfg.exl3_gpu_expert_layer_begin,
+        .gpu_expert_split_layer = cfg.exl3_gpu_expert_split_layer,
+        .gpu_split_device = cfg.exl3_gpu_split_device,
+        .gpu_split_cache_gb = cfg.exl3_gpu_split_cache_gb,
+        .cpu_expert_cache_gb = cfg.exl3_cpu_expert_cache_gb,
+        .cpu_expert_int8_vnni = cfg.exl3_cpu_expert_int8_vnni});
     if (!result) std::cerr << "[EXL3] " << result.error() << "\n";
     return result ? 0 : 1;
   }

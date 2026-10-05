@@ -403,3 +403,15 @@ Host-node mode (CPU MoE as CUDA host callbacks) ran at 22.7 tok/s vs 28.0 for pl
 A/B on `cond.toml`, HOST_NODE=1, 6 interleaved runs each: ON 26.58/26.28/26.38/26.58/26.55/26.40 (mean 26.46),
 OFF 26.06/26.30/26.04/25.61/26.04/26.16 (mean 26.03) tok/s. Output text identical. Remaining gap to plain 22/26 (28.0): ~1.5 tok/s,
 mostly the fixed cudaLaunchHostFunc handoff (~29 us/layer) and residual callback-thread placement.
+
+## 21. Q2_0 versus UD-IQ1_M: compare identical work (2026-10-04)
+
+[The controlled quantization check](../docs/q2-vs-ud-iq1m-decode-check-2026-10-04.md)
+finds Q2_0 faster for routed experts on both CPU and CUDA at fixed route
+counts. The Q2 checkpoint's BF16 HC tensors are slower than UD's Q8_0 HC
+tensors, so the entire checkpoint cannot be modeled by its expert bit width.
+The 31.76 tok/s Q2 smoke row and the historical 35–37 tok/s UD hello-world
+rows use different continuations and are not a controlled quantization A/B.
+The new matched whole-model series had substantial background-load variation
+and does not establish a replacement baseline. Use its fixed-input harness
+in a quiet resource window for a defensible comparison.

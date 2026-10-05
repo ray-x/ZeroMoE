@@ -5,6 +5,9 @@
 #include "ple_hash.hpp"
 #include "rope.hpp"
 #include "exl3_cpu.hpp"
+#ifdef MOESTREAM_EXL3_CUDA
+#include "exl3_gpu.hpp"
+#endif
 #include <stdexcept>
 
 #include <algorithm>
@@ -28,6 +31,49 @@ static inline float bf16_to_float(uint16_t v) {
   float out;
   std::memcpy(&out, &bits, sizeof(out));
   return out;
+}
+
+bool try_exl3_gpu_hc_mix(const CPUEngine &engine,
+                          const std::string &down_name, const std::string &up_name,
+                          const std::string &inject_name, const float *normed,
+                          float *hidden, float *injection, int rows, int width,
+                          int streams, int rank, bool divide_each_stream) {
+#ifdef MOESTREAM_EXL3_CUDA
+  if (!engine.exl3_gpu || !engine.config.exl3_gpu_hc) return false;
+  const auto *down = engine.find_layer(down_name);
+  const auto *up = engine.find_layer(up_name);
+  const auto *inject = inject_name.empty() ? nullptr : engine.find_layer(inject_name);
+  const auto matches = [](const CPUQuantizedTensor *weight, int input, int output) {
+    return weight && weight->host_ptr && weight->meta.type == GGUFType::F32 &&
+           weight->meta.shape.size() == 2 &&
+           weight->meta.shape[0] == static_cast<uint64_t>(input) &&
+           weight->meta.shape[1] == static_cast<uint64_t>(output) &&
+           weight->host_size == static_cast<size_t>(input) * output * sizeof(float);
+  };
+  const int expanded_width = streams * width;
+  if (!matches(down, expanded_width, rank) || !matches(up, rank, expanded_width) ||
+      (!inject_name.empty() && !matches(inject, expanded_width, streams)))
+    return false;
+  const Exl3GpuF32Weight down_weight{
+      down_name, reinterpret_cast<const float *>(down->host_ptr), expanded_width, rank};
+  const Exl3GpuF32Weight up_weight{
+      up_name, reinterpret_cast<const float *>(up->host_ptr), rank, expanded_width};
+  Exl3GpuF32Weight inject_weight;
+  if (inject)
+    inject_weight = {inject_name, reinterpret_cast<const float *>(inject->host_ptr),
+                     expanded_width, streams};
+  engine.exl3_gpu->hc_mix(down_weight, up_weight, inject ? &inject_weight : nullptr,
+                          normed, hidden, injection, rows, width, streams,
+                          divide_each_stream);
+  if (!std::all_of(hidden, hidden + static_cast<size_t>(rows) * width,
+                    [](float value) { return std::isfinite(value); }) ||
+      (inject && !std::all_of(injection, injection + static_cast<size_t>(rows) * streams,
+                               [](float value) { return std::isfinite(value); })))
+    throw std::runtime_error("Non-finite EXL3 GPU HyperConnection output: " + down_name);
+  return true;
+#else
+  return false;
+#endif
 }
 
 } // namespace
@@ -118,6 +164,16 @@ bool CPUQwen4ExpBackend::dense_matmul(const CPUEngine &engine,
       (t->meta.shape.size() != 2 || t->meta.shape[0] != static_cast<uint64_t>(I) ||
        t->meta.shape[1] != static_cast<uint64_t>(O)))
     throw std::runtime_error("EXL3 projection shape mismatch: " + name);
+#ifdef MOESTREAM_EXL3_CUDA
+  if (engine.exl3_gpu) {
+    engine.exl3_gpu->matmul(name, static_cast<uint32_t>(t->meta.type), t->host_ptr,
+                            t->host_size, x, y, S, I, O);
+    for (size_t index = 0; index < static_cast<size_t>(S) * O; ++index)
+      if (!std::isfinite(y[index]))
+        throw std::runtime_error("Non-finite EXL3 GPU projection: " + name);
+    return true;
+  }
+#endif
   if (t->meta.type == GGUFType::EXL3) {
     const bool success = exl3_mul1_matmul_packed(t->host_ptr, x, y, S, I, O);
     if (!success) throw std::runtime_error("EXL3 dense matmul failed: " + name);
@@ -251,6 +307,13 @@ void CPUQwen4ExpBackend::hc_mix(CPUEngine &engine, int layer_idx,
                   (static_cast<size_t>(s) * HC + h) * D,
               norm_w ? norm_w + h * D : nullptr, D, c.eps);
 
+  engine.qwen4exp_hc_inject.resize(static_cast<size_t>(S) * HC);
+  if (try_exl3_gpu_hc_mix(engine, p + base + "down.weight", p + base + "up.weight",
+                           p + base + "inject.weight", normed.data(), hidden_states,
+                           engine.qwen4exp_hc_inject.data(), S, D, HC,
+                           c.hc_low_rank, true))
+    return;
+
   std::vector<float> low(static_cast<size_t>(S) * c.hc_low_rank);
   std::vector<float> gate(static_cast<size_t>(S) * HCD);
   if (!dense_matmul(engine, p + base + "down.weight", normed.data(),
@@ -279,7 +342,6 @@ void CPUQwen4ExpBackend::hc_mix(CPUEngine &engine, int layer_idx,
                   gate[(static_cast<size_t>(s) * HC + h) * D + d] /
                   static_cast<float>(HC);
   }
-  engine.qwen4exp_hc_inject.resize(static_cast<size_t>(S) * HC);
   dense_matmul(engine, p + base + "inject.weight", normed.data(),
                engine.qwen4exp_hc_inject.data(), S, HCD, HC);
 }
@@ -570,10 +632,10 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
               : qkv[static_cast<size_t>(pos - (kernel - 1)) * conv_dim + ch];
     }
 
-  std::vector<float> state(static_cast<size_t>(Hv) * hd * hd);
+  const size_t state_size = static_cast<size_t>(Hv) * hd * hd;
   auto &persistent = engine.qwen4exp_recur_state[static_cast<size_t>(layer_idx)];
-  if (persistent.size() != state.size())
-    persistent.assign(state.size(), 0.0f);
+  if (persistent.size() != state_size)
+    persistent.assign(state_size, 0.0f);
   std::vector<float> out(static_cast<size_t>(S) * value_dim);
   const auto *a_t = engine.find_layer(p + "ssm_a");
   const auto *dt_t = engine.find_layer(p + "ssm_dt.bias");
@@ -582,6 +644,12 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
       !dequant_row(*dt_t, 0, dt.data(), Hv))
     return;
   for (int s = 0; s < S; ++s) {
+    for (int hk = 0; hk < Hk; ++hk) {
+      float *query = conv_out.data() + static_cast<size_t>(s) * conv_dim + hk * hd;
+      l2norm(query, hd, c.eps);
+      l2norm(query + key_dim, hd, c.eps);
+    }
+    #pragma omp parallel for schedule(static) if(Hv >= 8)
     for (int h = 0; h < Hv; ++h) {
       const int hk = engine.exl3_model.tensors.empty() ? h % Hk : h / (Hv / Hk);
       float *st = persistent.data() + static_cast<size_t>(h) * hd * hd;
@@ -590,30 +658,12 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
       float *k = q + key_dim;
       const float *v = conv_out.data() + static_cast<size_t>(s) * conv_dim +
                        key_dim * 2 + h * hd;
-      l2norm(q, hd, c.eps);
-      l2norm(k, hd, c.eps);
-      const float decay = std::exp(
-          qwen4exp_gdn_decay_log(alpha[static_cast<size_t>(s) * Hv + h],
-                                 dt[h], av[h]));
-      for (int i = 0; i < hd * hd; ++i)
-        st[i] *= decay;
-      std::vector<float> kv(hd, 0.0f);
-      for (int ki = 0; ki < hd; ++ki)
-        for (int vi = 0; vi < hd; ++vi)
-          kv[vi] += st[static_cast<size_t>(ki) * hd + vi] * k[ki];
+      const float decay_log = qwen4exp_gdn_decay_log(
+          alpha[static_cast<size_t>(s) * Hv + h], dt[h], av[h]);
       const float b =
           1.0f / (1.0f + std::exp(-beta[static_cast<size_t>(s) * Hv + h]));
-      for (int ki = 0; ki < hd; ++ki)
-        for (int vi = 0; vi < hd; ++vi)
-          st[static_cast<size_t>(ki) * hd + vi] +=
-              k[ki] * (v[vi] - kv[vi]) * b;
       float *dst = out.data() + (static_cast<size_t>(s) * Hv + h) * hd;
-      for (int vi = 0; vi < hd; ++vi) {
-        dst[vi] = 0.0f;
-        for (int ki = 0; ki < hd; ++ki)
-          dst[vi] += st[static_cast<size_t>(ki) * hd + vi] * q[ki] /
-                     std::sqrt(static_cast<float>(hd));
-      }
+      qwen4exp_gdn_delta_step(q, k, v, b, decay_log, st, dst, hd);
     }
   }
   std::vector<float> norm_w(hd);
@@ -751,6 +801,20 @@ void CPUQwen4ExpBackend::forward_moe(CPUEngine &engine, int layer_idx,
     float sum = 0.0f;
     for (int k = 0; k < topk; ++k)
       sum += ls[order[k]];
+    if (!engine.exl3_model.tensors.empty()) {
+      std::vector<float> routing_weights(topk);
+      for (int index = 0; index < topk; ++index)
+        routing_weights[index] = c.expert_weights_norm && sum > 0.0f
+            ? ls[order[index]] / sum : ls[order[index]];
+      if (engine.exl3_routed_ffn(layer_idx, order.data(), routing_weights.data(), topk,
+                                 hidden_states + static_cast<size_t>(s) * D,
+                                 out.data() + static_cast<size_t>(s) * D))
+        continue;
+      if (engine.exl3_cpu_routed_ffn(layer_idx, order.data(), routing_weights.data(), topk,
+                                     hidden_states + static_cast<size_t>(s) * D,
+                                     out.data() + static_cast<size_t>(s) * D))
+        continue;
+    }
     for (int k = 0; k < topk; ++k) {
       const int e = order[k];
       if (!engine.exl3_model.tensors.empty()) {
@@ -906,26 +970,30 @@ bool CPUQwen4ExpBackend::lm_head(CPUEngine &engine, const float *hidden,
                 engine.qwen4exp_hc_stream_buf.data() +
                     (static_cast<size_t>(s) * HC + h) * D,
                 w ? w + h * D : nullptr, D, c.eps);
-    std::vector<float> low(static_cast<size_t>(S) * c.hc_low_rank);
-    std::vector<float> gate(static_cast<size_t>(S) * HCD);
-    if (!dense_matmul(engine, "output_hc_down.weight", normed.data(),
-                      low.data(), S, HCD, c.hc_low_rank))
-      return false;
-    for (float &v : low)
-      v /= static_cast<float>(HC);
-    silu(low.data(), static_cast<int>(low.size()));
-    if (!dense_matmul(engine, "output_hc_up.weight", low.data(), gate.data(),
-                      S, c.hc_low_rank, HCD))
-      return false;
-    sigmoid(gate.data(), static_cast<int>(gate.size()));
-    for (int s = 0; s < S; ++s)
-      for (int d = 0; d < D; ++d) {
-        float v = 0.0f;
-        for (int h = 0; h < HC; ++h)
-          v += normed[(static_cast<size_t>(s) * HC + h) * D + d] *
-               gate[(static_cast<size_t>(s) * HC + h) * D + d];
-        tmp[static_cast<size_t>(s) * D + d] = v / static_cast<float>(HC);
-      }
+    if (!try_exl3_gpu_hc_mix(engine, "output_hc_down.weight", "output_hc_up.weight",
+                              "", normed.data(), tmp.data(), nullptr, S, D, HC,
+                              c.hc_low_rank, false)) {
+      std::vector<float> low(static_cast<size_t>(S) * c.hc_low_rank);
+      std::vector<float> gate(static_cast<size_t>(S) * HCD);
+      if (!dense_matmul(engine, "output_hc_down.weight", normed.data(),
+                        low.data(), S, HCD, c.hc_low_rank))
+        return false;
+      for (float &v : low)
+        v /= static_cast<float>(HC);
+      silu(low.data(), static_cast<int>(low.size()));
+      if (!dense_matmul(engine, "output_hc_up.weight", low.data(), gate.data(),
+                        S, c.hc_low_rank, HCD))
+        return false;
+      sigmoid(gate.data(), static_cast<int>(gate.size()));
+      for (int s = 0; s < S; ++s)
+        for (int d = 0; d < D; ++d) {
+          float v = 0.0f;
+          for (int h = 0; h < HC; ++h)
+            v += normed[(static_cast<size_t>(s) * HC + h) * D + d] *
+                 gate[(static_cast<size_t>(s) * HC + h) * D + d];
+          tmp[static_cast<size_t>(s) * D + d] = v / static_cast<float>(HC);
+        }
+    }
   } else {
     std::memcpy(tmp.data(), hidden, tmp.size() * sizeof(float));
   }

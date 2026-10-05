@@ -61,8 +61,15 @@ def read_settings(config_path, prompt=None, new_tokens=None, overrides=None, use
             raise ValueError("HF config.json must specify num_experts for per-layer CPU split")
         if cpu_expert_split >= num_experts:
             raise ValueError("exllamav3_cpu_expert_split must leave at least one GPU expert")
-        if cpu_layers:
-            raise ValueError("whole-layer CPU offload and per-layer CPU expert split are exclusive")
+        if cpu_layers and not settings.get("exllamav3_cpu_mixed", False):
+            raise ValueError("whole-layer CPU offload and per-layer CPU expert split are exclusive "
+                             "unless exllamav3_cpu_mixed = true")
+    cpu_mixed = settings.get("exllamav3_cpu_mixed", False)
+    if not isinstance(cpu_mixed, bool):
+        raise ValueError("exllamav3_cpu_mixed must be a boolean")
+    if cpu_mixed and not (cpu_layers and cpu_expert_split):
+        raise ValueError("exllamav3_cpu_mixed needs both exl3_gpu_expert_layer_begin and exllamav3_cpu_expert_split")
+    settings["cpu_mixed"] = cpu_mixed
     cpu_swap = settings.get("exllamav3_cpu_expert_swap", True)
     if not isinstance(cpu_swap, bool):
         raise ValueError("exllamav3_cpu_expert_swap must be a boolean")
@@ -170,7 +177,10 @@ def verify_placement(model, settings):
         raise ValueError("Cannot verify one routed-expert module for each model layer")
     if settings["cpu_expert_split"]:
         split_layers = [entry for entry in placement if entry["experts"] == "split"]
-        expected_layers = list(range(settings["layer_count"]))
+        expected_layers = list(range(settings["cpu_layers"], settings["layer_count"]))
+        cpu_only = [entry["layer"] for entry in placement if entry["experts"] == "cpu"]
+        if cpu_only != list(range(settings["cpu_layers"])):
+            raise ValueError(f"Upstream CPU-only layers differ from requested split: {cpu_only}")
         if ([entry["layer"] for entry in split_layers] != expected_layers or
                 any(entry["cpu_experts"] != settings["cpu_expert_split"] or
                     entry["gpu_experts"] != settings["num_experts"] - settings["cpu_expert_split"]
@@ -250,7 +260,9 @@ def run_runtime(settings, view, benchmark, warmup_tokens, output_path):
     config = Config.from_directory(str(view))
     bitrates = trellis_bitrates(config.stc)
     print("[EXLLAMAV3-TRELLIS-RATES] " + json.dumps(bitrates), flush=True)
-    config.infer_params.moe_cpu_offload = 0 if settings["cpu_expert_split"] else settings["cpu_layers"]
+    config.infer_params.moe_cpu_offload = (
+        settings["cpu_layers"] if settings["cpu_mixed"] or not settings["cpu_expert_split"] else 0)
+    config.infer_params.moe_cpu_mixed = settings["cpu_mixed"]
     config.infer_params.moe_cpu_split = settings["cpu_expert_split"]
     if not settings["cpu_expert_swap"]:
         os.environ["EXL3_MOE_CPU_SWAP"] = "0"
@@ -327,7 +339,8 @@ def run_runtime(settings, view, benchmark, warmup_tokens, output_path):
         dirty = bool(subprocess.run(["git", "-C", str(source), "status", "--porcelain"],
                                     capture_output=True, text=True, check=True).stdout.strip())
         split_layers = [entry for entry in placement if entry["experts"] == "split"]
-        cpu_equivalent_layers = (sum(entry["cpu_experts"] for entry in split_layers) /
+        cpu_only_layers = sum(entry["experts"] == "cpu" for entry in placement)
+        cpu_equivalent_layers = (cpu_only_layers + sum(entry["cpu_experts"] for entry in split_layers) /
                                  settings["num_experts"] if split_layers else float(settings["cpu_layers"]))
         gpu_equivalent_layers = (sum(entry["gpu_experts"] for entry in split_layers) /
                                  settings["num_experts"] if split_layers else float(settings["layer_count"] - settings["cpu_layers"]))
@@ -342,6 +355,9 @@ def run_runtime(settings, view, benchmark, warmup_tokens, output_path):
                   "cpu_split_layers": len(split_layers),
                   "cpu_experts_per_split_layer": settings["cpu_expert_split"],
                   "cpu_expert_swap": settings["cpu_expert_swap"],
+                  "cpu_mixed": settings["cpu_mixed"],
+                  "embedding_devices": {module.key: str(module.device) for module in model
+                                        if type(module).__name__ == "Embedding"},
                   "cpu_expert_weight_equivalent_layers": cpu_equivalent_layers,
                   "gpu_expert_weight_equivalent_layers": gpu_equivalent_layers,
                   "placement": placement, "load_seconds": load_seconds,

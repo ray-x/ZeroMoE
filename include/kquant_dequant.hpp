@@ -85,6 +85,8 @@ inline void set_dense_bf16_prefill_gemm(bool v) { dense_bf16_prefill_gemm_flag()
 
 inline bool gpu_type_supported(GGUFType type) {
     switch (type) {
+        case GGUFType::EXL3:
+            return true;
         case GGUFType::Q4_0: case GGUFType::Q2_0: case GGUFType::Q2_K: case GGUFType::Q3_K:
         case GGUFType::Q4_K: case GGUFType::Q5_K: case GGUFType::Q6_K:
         case GGUFType::IQ2_XXS: case GGUFType::IQ2_XS: case GGUFType::IQ2_S:

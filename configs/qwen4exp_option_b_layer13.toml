@@ -7,10 +7,14 @@
 
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
 
-# Match the documented master 22-GPU/26-CPU decode topology. Layer 13 is
-# intentionally omitted: Option B's full-graph split owns that layer's hot
-# GPU set and cold DDR/CPU complement.
-cpu_affinity_layers = [0,1,2,3,4,5,6,7,14,20,21,22,24,28,30,33,34,36,38,40,41,42,43,46]
+# Preserve the baseline full-graph topology. The 22 complete GPU-resident
+# layers are selected at launch with:
+#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
+# The Option-B planner then adds only Layer 13's per-expert split. Do not
+# populate cpu_affinity_layers here: doing so would override the baseline
+# graph placement for those layers.
+cpu_affinity_layers = []
 log_path = "logs/qwen4exp_option_b_layer13.log"
 log_level = "INFO"
 
@@ -43,6 +47,19 @@ freeze_usage_stats = true
 qwen4exp_option_b_layer = 13
 qwen4exp_option_b_top_n = 128
 qwen4exp_option_b_min_coverage = 0.80
+# Disabled by default (-1): the H2D staging proof below forces cold-expert
+# copies into VRAM on EVERY decode token regardless of real routing, which
+# measured ~7% slower than real Option-B throughput (verified 2026-09-25,
+# see fullgraph-regression-report memory) -- it's a wiring-correctness
+# proof, not representative decode behavior. Set qwen4exp_option_b_stage_
+# expert >= 0 explicitly to re-enable it for that proof.
+#
+# Single-slot Layer-13 H2D proof: expert 0 has zero historical routes in the
+# isolated seven-prompt usage file and is therefore a known cold expert.
+qwen4exp_option_b_stage_expert = -1
+# Multi-slot H2D stress proof: select ten cold experts starting from the
+# configured seed, skipping any expert already in the static hot set.
+qwen4exp_option_b_stage_count = 10
 
 # Enable the master full-graph decode path. Its split planner applies Option B
 # only to Layer 13; the other layers retain the documented 22-GPU/26-CPU
@@ -78,7 +95,8 @@ dense_bf16_kquant = true
 moe_gpu_accum = true
 expert_gpu_activation = true
 
-use_active_layer_area = false
+use_active_layer_area = true
+active_layer_capacity = 10
 decode_async_prewarm = false
 prefetch_pilot_depth = 1
 prefetch_pilot_k = 10

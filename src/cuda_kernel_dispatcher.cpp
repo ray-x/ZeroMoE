@@ -2,6 +2,7 @@
 
 #include "dense_dispatch.hpp"
 #include "logger.hpp"
+#include "exl3_cuda.hpp"
 
 #include <atomic>
 #include <cstdint>
@@ -123,6 +124,8 @@ bool CudaKernelDispatcher::matmul(GGUFType type, float *y, const float *x,
   }
 
   switch (type) {
+  case GGUFType::EXL3:
+    return exl3_cuda_matmul_packed(y, x, w, S, I, O);
   case GGUFType::Q4_0:
     launch_gguf_q4_0_dp4a(y, x, w, S, I, O);
     return true;

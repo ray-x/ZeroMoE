@@ -136,6 +136,23 @@ class ExllamaBackendTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "per-layer CPU expert placement"):
             backend.verify_placement(modules, settings)
 
+    def test_mixed_split_places_cpu_only_layers_then_split_layers(self):
+        settings = backend.read_settings(self.config_path, overrides={
+            "exl3_gpu_expert_layer_begin": 4, "exllamav3_cpu_expert_split": 256,
+            "exllamav3_cpu_mixed": True})
+        modules = [SimpleNamespace(key=f"model.language_model.layers.{layer}.mlp",
+                                   cpu_offload=layer < 4, device="cuda:0",
+                                   **({} if layer < 4 else {"cpu_split_first": 256, "num_experts": 512}))
+                   for layer in range(48)]
+        placement = backend.verify_placement(modules, settings)
+        self.assertEqual([e["experts"] for e in placement].count("cpu"), 4)
+        self.assertEqual([e["experts"] for e in placement].count("split"), 44)
+        modules[10].cpu_split_first = 200
+        with self.assertRaisesRegex(ValueError, "per-layer CPU expert placement"):
+            backend.verify_placement(modules, settings)
+        with self.assertRaisesRegex(ValueError, "needs both"):
+            backend.read_settings(self.config_path, overrides={"exllamav3_cpu_mixed": True})
+
     def test_cpu_expert_swap_defaults_on_and_must_be_boolean(self):
         self.assertTrue(self.settings()["cpu_expert_swap"])
         self.assertFalse(self.settings("exllamav3_cpu_expert_swap = false")["cpu_expert_swap"])

@@ -460,6 +460,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                    LockFreePrefetcher& prefetcher,
                    const std::vector<int>& prompt_ids, int max_new_tokens, int eos_id,
                    float temperature = 0.7f, float top_p = 0.90f) {
+    engine.qwen4exp_full_graph_failure.clear();
     int max_ctx = prompt_ids.size() + max_new_tokens;
     ram_mgr.calculate_safe_cache_capacity(engine, max_ctx);
 
@@ -712,7 +713,21 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             prompt_ids.data() + pc_reuse,
             nullptr,
         };
-        graph_ops.build(engine, request);
+        if (!graph_ops.build(engine, request) &&
+            engine.qwen4exp_full_graph_required) {
+            engine.qwen4exp_full_graph_failure =
+                "prefill graph construction failed";
+            LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; aborting request\n",
+                      engine.qwen4exp_full_graph_failure.c_str());
+            return;
+        }
+    } else if (engine.qwen4exp_full_graph_required && pc_n_new > 1 &&
+               !unbatched_prefill && pc_reuse == 0) {
+        engine.qwen4exp_full_graph_failure =
+            "prefill graph operation is unavailable or disabled";
+        LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; aborting request\n",
+                  engine.qwen4exp_full_graph_failure.c_str());
+        return;
     }
 
     if (!bench_silent) {
@@ -759,6 +774,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                 layers_forward_gguf(engine, ram_mgr, prefetcher, row, 1,
                                     pc_reuse + (int)t,
                                     prompt_ids.data() + pc_reuse + t);
+                if (!engine.qwen4exp_full_graph_failure.empty())
+                    return;
                 if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
                     !engine.glm5next_full_graph_output_ready &&
                     !engine.deepseek_v4_full_graph_output_ready)
@@ -779,6 +796,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                                 pc_reuse, prompt_ids.data() + pc_reuse);
             engine.qwen4exp_full_graph_logits_target = nullptr;
             engine.qwen4exp_full_graph_logits_target_size = 0;
+            if (!engine.qwen4exp_full_graph_failure.empty())
+                return;
             if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
                 !engine.glm5next_full_graph_output_ready &&
                 !engine.deepseek_v4_full_graph_output_ready)
@@ -1141,7 +1160,14 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             const ModelGraphRequest first_decode_request{
                 ModelGraphPhase::Decode, 1, static_cast<int>(prompt_ids.size()),
                 &next_token, decode_hidden.data(), logits.data(), V};
-            graph_ops.build(engine, first_decode_request);
+            if (!graph_ops.build(engine, first_decode_request) &&
+                engine.qwen4exp_full_graph_required) {
+                engine.qwen4exp_full_graph_failure =
+                    "decode graph construction failed before first token";
+                LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; aborting request\n",
+                          engine.qwen4exp_full_graph_failure.c_str());
+                return;
+            }
         }
 
         if (!is_stop_now && !bench_silent) {
@@ -1201,6 +1227,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         layers_forward_gguf(engine, ram_mgr, prefetcher, decode_hidden.data(), 1, pos, &next_token);
         engine.qwen4exp_full_graph_logits_target = nullptr;
         engine.qwen4exp_full_graph_logits_target_size = 0;
+        if (!engine.qwen4exp_full_graph_failure.empty())
+            return;
         if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
             !engine.glm5next_full_graph_output_ready &&
             !engine.deepseek_v4_full_graph_output_ready)

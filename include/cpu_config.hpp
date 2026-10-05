@@ -177,7 +177,21 @@ inline Document parse_file(const std::string &path) {
 struct CPUConfig {
   std::string model_path;
   std::string model_format = "gguf";
+  std::string exl3_backend = "native";
+  std::string exllamav3_python;
+  std::string exllamav3_runner_path;
+  std::string exllamav3_cuda_schedule = "auto";
   std::string metadata_model_path;
+  bool exl3_gpu = false;
+  bool exl3_gpu_hc = false;
+  int exl3_gpu_device = 0;
+  double exl3_gpu_cache_gb = 8.0;
+  int exl3_gpu_expert_layer_begin = 0;
+  int exl3_gpu_expert_split_layer = -1;
+  int exl3_gpu_split_device = 1;
+  double exl3_gpu_split_cache_gb = 8.0;
+  double exl3_cpu_expert_cache_gb = 24.0;
+  bool exl3_cpu_expert_int8_vnni = false;
   int context_size = 4096;
   int max_new_tokens = 512;
   float temperature = 0.7f;
@@ -221,7 +235,40 @@ struct CPUConfig {
 
     model_path = doc.root.get_str("model_path", model_path);
     model_format = doc.root.get_str("model_format", model_format);
+    exl3_backend = doc.root.get_str("exl3_backend", exl3_backend);
+    exllamav3_python = doc.root.get_str("exllamav3_python", exllamav3_python);
+    exllamav3_runner_path = doc.root.get_str("exllamav3_runner_path", exllamav3_runner_path);
+    exllamav3_cuda_schedule = doc.root.get_str("exllamav3_cuda_schedule", exllamav3_cuda_schedule);
+    if (exllamav3_cuda_schedule != "auto" && exllamav3_cuda_schedule != "spin" &&
+        exllamav3_cuda_schedule != "yield" && exllamav3_cuda_schedule != "blocking") {
+      std::cerr << "[CPU-CONFIG] Invalid exllamav3_cuda_schedule\n";
+      return false;
+    }
+    if (exl3_backend != "native" && exl3_backend != "exllamav3") {
+      std::cerr << "[CPU-CONFIG] Invalid exl3_backend\n";
+      return false;
+    }
+    if (exl3_backend == "exllamav3" &&
+        (model_format != "exl3" || exllamav3_python.empty() || exllamav3_runner_path.empty())) {
+      std::cerr << "[CPU-CONFIG] ExLlamaV3 requires EXL3 mode and Python/runner paths\n";
+      return false;
+    }
     metadata_model_path = doc.root.get_str("metadata_model_path", metadata_model_path);
+    exl3_gpu = doc.root.get_bool("exl3_gpu", exl3_gpu);
+    exl3_gpu_hc = doc.root.get_bool("exl3_gpu_hc", exl3_gpu_hc);
+    exl3_gpu_device = doc.root.get_int("exl3_gpu_device", exl3_gpu_device);
+    exl3_gpu_cache_gb = doc.root.get_double("exl3_gpu_cache_gb", exl3_gpu_cache_gb);
+    exl3_gpu_expert_layer_begin =
+        doc.root.get_int("exl3_gpu_expert_layer_begin", exl3_gpu_expert_layer_begin);
+    exl3_gpu_expert_split_layer =
+        doc.root.get_int("exl3_gpu_expert_split_layer", exl3_gpu_expert_split_layer);
+    exl3_gpu_split_device = doc.root.get_int("exl3_gpu_split_device", exl3_gpu_split_device);
+    exl3_gpu_split_cache_gb =
+        doc.root.get_double("exl3_gpu_split_cache_gb", exl3_gpu_split_cache_gb);
+    exl3_cpu_expert_cache_gb =
+        doc.root.get_double("exl3_cpu_expert_cache_gb", exl3_cpu_expert_cache_gb);
+    exl3_cpu_expert_int8_vnni =
+        doc.root.get_bool("exl3_cpu_expert_int8_vnni", exl3_cpu_expert_int8_vnni);
     context_size = doc.root.get_int("context_size", context_size);
     max_new_tokens = doc.root.get_int("max_new_tokens", max_new_tokens);
     temperature = doc.root.get_float("temperature", temperature);

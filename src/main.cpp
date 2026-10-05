@@ -7,6 +7,7 @@
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_decode.hpp"
+#include "exllamav3_backend.hpp"
 #include "generation_loop.hpp"
 #include "thread_profile.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
@@ -421,6 +422,8 @@ static bool preload_batch_load(
 }
 
 std::expected<void, std::string> run_engine(const EngineConfig &config) {
+  if (config.exl3_backend == "exllamav3")
+    return std::unexpected("ExLlamaV3 must be launched through the config-mode CLI");
   if (config.model_format == "exl3") {
     if (!config.model_load_only) {
       return run_exl3_decode({
@@ -433,7 +436,17 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
           .temperature = config.temperature,
           .top_p = config.top_p,
           .raw_prompt = config.raw_prompt,
-          .enable_thinking = config.enable_thinking});
+          .enable_thinking = config.enable_thinking,
+          .gpu = config.exl3_gpu,
+          .gpu_hc = config.exl3_gpu_hc,
+          .gpu_device = config.exl3_gpu_device,
+          .gpu_cache_gb = config.exl3_gpu_cache_gb,
+          .gpu_expert_layer_begin = config.exl3_gpu_expert_layer_begin,
+          .gpu_expert_split_layer = config.exl3_gpu_expert_split_layer,
+          .gpu_split_device = config.exl3_gpu_split_device,
+          .gpu_split_cache_gb = config.exl3_gpu_split_cache_gb,
+          .cpu_expert_cache_gb = config.exl3_cpu_expert_cache_gb,
+          .cpu_expert_int8_vnni = config.exl3_cpu_expert_int8_vnni});
     }
     auto loaded = load_exl3_model_only(config.model_path);
     if (!loaded)
@@ -532,6 +545,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       config.qwen4exp_option_b_min_coverage;
   engine.qwen4exp_option_b_right_size_top_n =
       config.qwen4exp_option_b_right_size_top_n;
+  engine.qwen4exp_option_b_global_top_k =
+      config.qwen4exp_option_b_global_top_k;
+  engine.qwen4exp_option_b_global_floor_per_layer =
+      config.qwen4exp_option_b_global_floor_per_layer;
   engine.qwen4exp_option_b_max_layers = config.qwen4exp_option_b_max_layers;
   engine.qwen4exp_option_b_fill_vram = config.qwen4exp_option_b_fill_vram;
   engine.qwen4exp_option_b_concentrated_only =
@@ -545,10 +562,6 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                                 config.qwen4exp_prefill_state_handoff);
   ram_mgr.configured_total_experts =
       std::max(0, config.ram_cache_total_experts);
-  engine.qwen4exp_option_b_global_top_k =
-      config.qwen4exp_option_b_global_top_k;
-  engine.qwen4exp_option_b_global_floor_per_layer =
-      config.qwen4exp_option_b_global_floor_per_layer;
   // Must be set BEFORE the [PIN] preload block below -- that's where the
   // bulk of the RAM tier's slabs are first allocated, and each slab is
   // pinned exactly once at its own allocation (ensure_slab_capacity).
@@ -815,6 +828,24 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   if (!GGUFGraphInitializer::build_model_graph(engine, max_ctx)) {
     return std::unexpected(
         "Failure triggered during topological model graph initialization pass");
+  }
+  engine.qwen4exp_full_graph_required =
+      engine.family_ops.family == ModelFamily::Qwen4Exp &&
+      qwen4exp_full_graph_decode_enabled();
+  if (engine.qwen4exp_full_graph_required &&
+      !qwen4exp_full_graph_enabled()) {
+    return std::unexpected(
+        "Qwen4Exp full-graph decode is enabled but full-graph prefill is "
+        "disabled; configure both graph phases or explicitly exempt this run");
+  }
+  if (engine.qwen4exp_full_graph_required && engine.mtp_enabled) {
+    return std::unexpected(
+        "Qwen4Exp MTP is not integrated with the full-graph-only trunk; "
+        "disable MTP explicitly or use a graph-enabled MTP implementation");
+  }
+  if (engine.qwen4exp_full_graph_required) {
+    LOG_INFO("[QWEN4EXP-GRAPH-POLICY] full-graph prefill/decode required; "
+             "a graph build or replay failure aborts the request\n");
   }
   engine.init_route_freq();
 
@@ -4103,6 +4134,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   auto session_start = std::chrono::high_resolution_clock::now();
 
   std::string user_input;
+  std::string request_failure;
   while (true) {
     if (g_shutdown_requested.load(std::memory_order_relaxed))
       break;
@@ -4394,6 +4426,17 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens,
                   max_new_tokens, tokenizer.eos_token_id, config.temperature,
                   config.top_p);
+    if (!engine.qwen4exp_full_graph_failure.empty()) {
+      const std::string reason = engine.qwen4exp_full_graph_failure;
+      engine.qwen4exp_full_graph_failure.clear();
+      request_failure = "Qwen4Exp full-graph request failed: " + reason;
+      std::cout << "\n";
+      LOG_STREAM_ERROR() << request_failure << "\n";
+      // Leave through the normal teardown path below so the prefetch worker
+      // is joined and graph-owned CUDA allocations are released before the
+      // request error reaches main().
+      break;
+    }
 
     std::cout << "\n";
   }
@@ -4476,6 +4519,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                                     session_start)
           .count();
   perf().dump_report(session_elapsed_s);
+  if (!request_failure.empty())
+    return std::unexpected(request_failure);
   return {};
 }
 
@@ -4730,6 +4775,27 @@ int main(int argc, char *argv[]) {
   // cpu_only (TOML `cpu_only = true` or MOESTREAM_CPU_ONLY env var) forces all
   // compute onto the CPU reference path. Enable it BEFORE run_engine so every
   // dense_proj / rmsnorm_proj / expert_ffn dispatch sees the flag.
+  if (config.exl3_backend == "exllamav3") {
+    std::vector<std::string> overrides{
+        "--ngen", std::to_string(config.max_new_tokens),
+        "--ctx", std::to_string(config.context_size),
+        "--threads", std::to_string(config.omp_max_threads > 0 ? config.omp_max_threads : 4),
+        "--cuda-schedule", config.exllamav3_cuda_schedule,
+        "--temperature", std::to_string(config.temperature),
+        "--top-p", std::to_string(config.top_p),
+        config.raw_prompt ? "--raw-prompt" : "--no-raw-prompt",
+        config.enable_thinking ? "--thinking" : "--no-thinking"};
+    if (!config.prompt.empty()) {
+      overrides.push_back("--prompt");
+      overrides.push_back(config.prompt);
+    }
+    std::cout << "[EXLLAMAV3] Delegating model, KV cache and decode to upstream runtime\n"
+              << std::flush;
+    auto result = exec_exllamav3_backend(config_path, config.exllamav3_python,
+                                        config.exllamav3_runner_path, overrides);
+    if (!result) std::cerr << result.error() << "\n";
+    return result ? 0 : 1;
+  }
   if (config.cpu_only)
     enable_cpu_only_mode();
   if (config.dsv4_outproj_gpu)

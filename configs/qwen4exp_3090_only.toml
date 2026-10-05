@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next (GGUF arch "qwen4exp"), UD-IQ1_M -- SINGLE-GPU (RTX 3090
 # only). Same tuning as the dual-GPU sibling (configs/qwen4exp_3090_5060.toml),
 # collapsed to one [[gpus]] entry, specifically so this engine can be A/B'd
-# against BeeLlama's own single-GPU llama-bench runs (`CUDA_VISIBLE_DEVICES=0`
+# against llama.cpp's own single-GPU llama-bench runs (`CUDA_VISIBLE_DEVICES=0`
 # / `-dev CUDA0`) on equal hardware -- the dual-GPU config is not a fair
-# comparison point for that, since BeeLlama's reference numbers never used the
+# comparison point for that, since llama.cpp's reference numbers never used the
 # 5060 Ti at all.
 #
 # VRAM budget (24 GB, role="dense+moe", all on device 0). VERIFIED ON REAL
@@ -116,7 +116,7 @@ qwen4exp_router_pilot_skip_prefetch_excluded_layers = true
 # remain excluded from estimation-based prefetch in performance mode.
 qwen4exp_router_pilot_predict_layers = [2, 4, 5, 6, 7, 12, 13, 14, 40]
 # If a Qwen expert is deliberately routed to the CPU, use ggml's optimized
-# IQ1_M x Q8_K path (the same kernel family used by BeeLlama). This has no
+# IQ1_M x Q8_K path (the same kernel family used by llama.cpp). This has no
 # effect while all IQ1_M experts use the verified CUDA kernel.
 cpu_dot_ggml_iq1m = true
 prefill_warm_via_prefetcher = true
@@ -299,8 +299,8 @@ gdn_proj_ggml       = true
 # instead of the split path above which still does l2norm/out_norm on CPU
 # (plain OMP-parallel scalar loops, no GPU kernel exists for them at all)
 # and out_proj through a per-layer dense_proj round trip. Was OFF, untested
-# (no unit test, no CLAUDE.md history) until 2026-09-10's real-vs-BeeLlama
-# stage-by-stage comparison found attn=1.9s vs BeeLlama's 70ms GPU kernel
+# (no unit test, no CLAUDE.md history) until 2026-09-10's real-vs-llama.cpp
+# stage-by-stage comparison found attn=1.9s vs llama.cpp's 70ms GPU kernel
 # time for the equivalent work -- a 27x gap, larger than the expert-dispatch
 # gap this session had been chasing.
 # MEASURED, 488-token real-text prefill, same prompt/config otherwise:
@@ -322,7 +322,7 @@ gdn_full_ggml = true
 # CLAUDE.md documents that exact trap costing real wasted A/B runs.
 pin_strategy = "global_topn"
 pin_global_floor_per_layer = 1
-# vram_preload_prefix_layers: "Experimental BeeLLama-style placement: fill
+# vram_preload_prefix_layers: "Experimental llama.cpp-style placement: fill
 # the VRAM expert cache in ascending layer order, starting at layer 0, until
 # the cache is full" -- an existing, never-enabled-before mechanism, same
 # discovery pattern as gdn_full_ggml above. Real, DEPENDENT chain of two
@@ -437,7 +437,7 @@ qwen4exp_gdn_gpu = true
 # chains the conv1d+SiLU DIRECTLY onto the qkv tensor that graph already
 # produces on-device -- zero host round trip for qkv at all, not even the
 # original standalone cuda/gdn_conv1d.cu kernel's own H2D+D2H pair. Real
-# external evidence motivated this: a BeeLlama nsys profile (same model,
+# external evidence motivated this: a llama.cpp nsys profile (same model,
 # same box) showed their own fused ssm_conv kernel costs 2.80ms for all 36
 # layers at S=512, vs. our OWN standalone-kernel version's 180-190ms for the
 # same 36 layers -- almost entirely the round trip this fusion removes.

@@ -1,5 +1,71 @@
 # Qwen graph refactor: recorded state
 
+## Cross-session update: graph API review and execution policy
+
+The legacy-cache/VRAM handoff changes the current placement context. The
+earlier 33.87 tok/s graph A/B used the right-sized 0/44/4 set (8,421 experts).
+The later VRAM sweep removed a 6.44-GiB empty legacy cache and measured a
+global 48-layer set of roughly 14.5k experts at about 39 tok/s in single-run
+probes. The two results have not been stacked: no six-pair early-ready A/B
+against the 48-layer, 14.5k placement exists yet. Treat +2.28% in the
+2026-10-04 handoff as early-ready over its 0/44/4 baseline; the later
+contemporaneous three-arm run measured +4.54% with resident route tables and
++6.36% with asynchronous output added. See
+`docs/handoff-2026-10-05-legacy-cache-and-vram-budget.md` before choosing the
+next production placement.
+
+The user's current architecture rule is full-graph execution for every model
+MoEStream continues to support; layered execution is not a future support
+path. Qwen full-graph prefill/decode now default on, and an enabled Qwen graph
+failure is returned as a request error instead of silently entering the layer
+loop. Native tests passed after this change. This enforcement is currently
+Qwen-specific: GLM5NEXT has conditional graph coverage, DeepSeek-V4 has only
+prefill graph coverage, and other families still use layered execution. The
+all-family graph-only migration remains open; do not describe it as complete.
+
+The attempted no-Option-B top-64 Phase-2 run is under
+`logs/phase2_conditional_no_optionb_top64_v5.*`. All three full-graph instances
+built, but the CUDA master conditional rejected prefix/suffix embedding because
+their scheduler graphs had 28/69 splits, not single CUDA backends. It therefore
+used the host branch between separate full-graph submissions; this did not
+exercise a CUDA conditional body. The 64-step forced-history comparison had
+93.75% top-1 agreement and mean KL 0.00285; token IDs match because they were
+teacher-forced. This is correctness evidence for the split execution only,
+not a conditional-graph pass or a valid throughput A/B.
+
+The CUDA API review is recorded in
+`docs/cuda-graph-api-review-2026-10-05.md`. It rejects stream priority as a DMA
+priority mechanism, retains GGML-owned stream capture, defers graph memory
+nodes and TMA, and distinguishes captured external events from host callbacks.
+
+## Original graph-tier requirements: current audit
+
+| Requirement | Status and evidence |
+| --- | --- |
+| Immutable route classification and exact-once cases | The classifier, fixed-buffer branch projection and all-hot/all-cold/mixed/duplicate tests are implemented. The opt-in DDR callback now consumes a per-replay classification for its CPU branch; the accepted path is unchanged and staged ownership is not yet populated by the runtime graph. |
+| Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Incomplete.** The `MOESTREAM_QWEN4EXP_PARTIAL_GRAPH` prototype combines resident GPU work with a cold-only CPU host callback, but has no staged conditional. The separate Phase-2 prototype built prefix/GPU-suffix/CPU-suffix graphs, but its master conditional was disabled because the captured prefix/suffix had 28/69 scheduler splits. The no-Option-B top-64 run in `logs/phase2_conditional_no_optionb_top64_v5.*` therefore tested host-side dispatch between full-graph submissions, not a CUDA conditional body. |
+| A/B partial graph against accepted early-ready | **Performance A/B still pending.** The historical host-callback run reported 33.451 -> 26.526 tok/s (-20.70%, 0/6) and 63/64 top-1 agreement, but it omitted the per-token router-weight D2H copy and does not validate the corrected candidate. The corrected candidate was directly compared against the same binary's static full-graph path: 64/64 top-1 agreement, mean KL 0.00120, and byte-identical generated tokens. The cached local GGML library lacks `ggml_backend_sched_early_cpu_supported()`, so the accepted early-ready arm asserts before inference; cross-build comparisons are retained as correctness context only. |
+| SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing and shared payload ownership, with focused ready/error tests. **Runtime SSD loader and separate completion-graph submission are not integrated.** |
+| Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
+| Adaptive CPU versus staged-GPU selection | A timing policy helper and queue/run/DMA/storage telemetry exist. The policy is not wired to live selection or measured in an A/B; the measured staged route path also fails CPU-baseline numerical parity. |
+| Full-graph-only policy | Qwen graph prefill/decode now default on and an enabled Qwen graph failure aborts the request rather than entering layered execution. The native suite passes (`logs/fullgraph_only_policy_final_native.log`). **The all-family migration is incomplete:** GLM5NEXT and DeepSeek-V4 have partial graph adapters, and other families still use the layered path. |
+
+The latest VRAM handoff changes the performance baseline for placement work.
+It reports 14.5k globally selected experts across 48 layers at about 39 tok/s
+in single-run probes, while the current graph A/B's 2.28% early-ready result
+was on 0/44/4. The early-ready scheduler has not yet been A/B tested on the
+48-layer 14.5k placement. The newer result therefore does not close the
+partial-graph or conditional-body requirements.
+
+The four-step overlap plan is complete as an experiment sequence:
+
+| Step | Result |
+| --- | --- |
+| Skip prepared CPU graph on all-hot routes | Implemented with copy/merge retained; +0.029%, 2/6 wins; disabled. |
+| Measure transfer/join cost | Measured. Async output alone +1.356%, 6/6; with resident tables it added +1.744%, 6/6, and remains in the accepted bundle. No `cudaEventQuery` polling variant was tested. |
+| Evaluate next-layer prediction | Measured offline: 62.72% proxy cold recall, 53.87% precision, 4.51 GB estimated unused bytes of 9.77 GB candidates over 2,646 visits; predictor throughput −0.05%, 3/6. These traces do not establish deadline success by themselves. |
+| Add stable-slot dynamic staging | Slot generations, post-copy publication, copy-stream joins, and token-lifetime holds are implemented. Late-transfer fallback passes. Staged outputs match a GPU oracle, but CPU/GPU placement arithmetic shifts later hidden states; dynamic staging is rejected and off. |
+
 This file records the committed graph work and the remaining unrelated
 ExLlamaV3, CPU, configuration, test and generated-artifact changes in the
 shared worktree. Graph commits are authored by `ray-x`; the latest foundation
@@ -118,10 +184,12 @@ explicit fallback when no published staged slot exists. Duplicate expert IDs
 remain separate route slots, so their router weights cannot be accidentally
 collapsed.
 
-The classifier currently sits beside the graph code and is not yet wired into
-the accepted decode path. That keeps the production baseline unchanged while
-the exact-once contract is tested before adding conditional or host-node
-branches.
+The classifier remains outside the accepted decode path. The opt-in DDR
+partial-layer callback now builds a per-replay classification from its D2H
+route snapshot and projects the CPU-owned routes into preallocated CPU-graph
+inputs. The current prototype supplies only the resident map; its staged map
+is empty until staged-slot publication is integrated. The production baseline
+therefore remains unchanged.
 
 The focused test covers all-hot, all-cold, mixed, duplicate-route, overlapping
 ownership, invalid IDs, generation propagation and both negative-sentinel and
@@ -135,8 +203,10 @@ for mode in capable stock optout; do
 done
 ```
 
-All three modes passed. The next milestone can consume this descriptor from a
-DDR-only partial-layer graph without mutating shared remap or mask tables.
+All three modes passed, including branch projection that preserves each
+original router weight on exactly one target and reuses preallocated output
+buffers. The opt-in callback uses that projection without mutating the raw
+D2H IDs/weights or the graph's immutable remap/mask tables.
 
 ## Milestone 2: DDR-only partial-layer graph prototype
 
@@ -155,6 +225,35 @@ comparison against the accepted early-ready/resident-table/async-output bundle
 measured 33.451 -> 26.526 tok/s (-20.70%, 0/6 wins):
 `logs/option_b_partial_layer13_ddr_perf/summary.json`. The callback is
 serialized on the graph stream and currently adds too much latency.
+
+Current code review found a correctness defect in that run: the partial CPU
+graph multiplies by its per-token router weights, but the CUDA marker bridge
+previously skipped the D2H weight copy whenever `gpu_reduce` was enabled. The
+opt-in partial callback now copies weights, classifies every route slot, and
+projects only CPU-owned slots into its private CPU inputs. The old parity and
+speed numbers remain historical and do not judge the corrected graph. It also
+skips CPU graph compute for an all-GPU route set and uploads a freshly
+zero-initialized cold contribution.
+
+The corrected implementation was built and run on the RTX 3090. A 64-step
+forced-history comparison against the same binary's static full-graph path
+produced byte-identical generated tokens, 100% top-1 agreement, mean KL
+0.0012007 and maximum KL 0.0090844. A separate eight-step diagnostic observed
+both all-resident routes (10/10) with CPU compute skipped and mixed routes
+(8/10, 9/10 resident) with the cold CPU graph running. The 64-step candidate
+reported successful host callbacks on all 63 replayed tokens. Artifacts and
+input hashes are in
+`logs/option_b_partial_layer13_route_classified_direct_logits/manifest.json`.
+The four focused classifier modes pass, and the graph source compiles.
+
+This is correctness evidence against the static full-graph path, not the
+required performance comparison against accepted early-ready. The cached
+`build_b11401` GGML library lacks `ggml_backend_sched_early_cpu_supported()`;
+enabling early-ready hits its support assertion before inference. The prior
+Python benchmark harness also cannot expose the GPU to its nested engine
+subprocess in this sandbox, so the successful runs used direct TTY launches
+with `CUDA_VISIBLE_DEVICES=0`. The old 33.451 -> 26.526 tok/s result remains
+invalid for the corrected graph. No corrected performance A/B has been run.
 
 The existing Phase-2 prefix/suffix graph can provide the pure-CUDA conditional
 body while the suffix CPU graph carries the host callback. A top-256 proof
