@@ -189,6 +189,10 @@ The first RTX 3090 smoke run of the split-child path reached `route mode=2`
 13,824,000 payload bytes, and completed the common tail without hidden-state
 NaNs. This is a correctness smoke result using a top-1 resident set; it is
 not a throughput comparison against the production 0/44/4 profile.
+The matched no-storage Phase-2 control on this binary currently reports
+all-NaN hidden states, so its timing is rejected as an A/B baseline. Use the
+already validated early-ready results for production comparison until that
+control is repaired.
 
 ## Measurements
 
