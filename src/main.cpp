@@ -35,6 +35,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
@@ -4042,28 +4043,56 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
               payload->bytes.clear();
               payload->offsets.clear();
               payload->offsets.push_back(0);
-              const auto &layer = engine.layers_experts[
-                  static_cast<size_t>(request.layer)];
+              const bool unpacked = engine.layer_is_unpacked(request.layer);
               for (int expert : request.experts) {
-                if (expert < 0 || static_cast<size_t>(expert) >= layer.size()) {
+                if (expert < 0 ||
+                    expert >= engine.model_file.architecture_config.n_experts) {
                   completion.error_code = 404;
                   return false;
                 }
-                const auto &slot = layer[static_cast<size_t>(expert)];
-                for (const auto *plane : {&slot.gate_proj, &slot.up_proj,
-                                          &slot.down_proj}) {
-                  const size_t bytes =
-                      static_cast<size_t>(std::max<int64_t>(0, plane->meta.size_bytes));
-                  if (!plane->host_ptr || bytes == 0) {
-                    completion.error_code = 409;
-                    return false;
-                  }
-                  const size_t old_size = payload->bytes.size();
-                  payload->bytes.resize(old_size + bytes);
-                  std::memcpy(payload->bytes.data() + old_size,
-                              plane->host_ptr, bytes);
-                  payload->offsets.push_back(payload->bytes.size());
+                size_t gate_bytes = 0, up_bytes = 0, down_bytes = 0;
+                const GGUFTensor *gate = nullptr, *up = nullptr, *down = nullptr;
+                const bool geometry = unpacked
+                    ? engine.unpacked_expert_geometry(
+                          request.layer, expert, gate_bytes, up_bytes,
+                          down_bytes, gate, up, down)
+                    : engine.packed_slab_geometry(
+                          request.layer, gate_bytes, up_bytes, down_bytes,
+                          gate, up, down);
+                if (!geometry || !gate || !up || !down || gate_bytes == 0 ||
+                    up_bytes == 0 || down_bytes == 0) {
+                  completion.error_code = 409;
+                  return false;
                 }
+                const size_t old_size = payload->bytes.size();
+                payload->bytes.resize(old_size + gate_bytes + up_bytes + down_bytes);
+                auto read_plane = [&](const GGUFTensor &meta, size_t bytes,
+                                      uint64_t offset, size_t dst) {
+                  const int fd = engine.model_file.fd_for_tensor(meta);
+                  if (fd < 0)
+                    return false;
+                  const ssize_t got = pread(
+                      fd, payload->bytes.data() + old_size + dst, bytes,
+                      static_cast<off_t>(offset));
+                  return got == static_cast<ssize_t>(bytes);
+                };
+                const uint64_t gate_offset =
+                    gate->offset + (unpacked ? 0ull
+                                             : static_cast<uint64_t>(expert) * gate_bytes);
+                const uint64_t up_offset =
+                    up->offset + (unpacked ? 0ull
+                                           : static_cast<uint64_t>(expert) * up_bytes);
+                const uint64_t down_offset =
+                    down->offset + (unpacked ? 0ull
+                                             : static_cast<uint64_t>(expert) * down_bytes);
+                if (!read_plane(*gate, gate_bytes, gate_offset, 0) ||
+                    !read_plane(*up, up_bytes, up_offset, gate_bytes) ||
+                    !read_plane(*down, down_bytes, down_offset,
+                                gate_bytes + up_bytes)) {
+                  completion.error_code = EIO;
+                  return false;
+                }
+                payload->offsets.push_back(payload->bytes.size());
               }
               completion.experts = request.experts;
               completion.payload = std::move(payload);
