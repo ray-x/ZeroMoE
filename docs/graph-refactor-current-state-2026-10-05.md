@@ -45,7 +45,7 @@ nodes and TMA, and distinguishes captured external events from host callbacks.
 | Immutable route classification and exact-once cases | The classifier, fixed-buffer branch projection and all-hot/all-cold/mixed/duplicate tests are implemented. The opt-in DDR callback now consumes a per-replay classification for its CPU branch; the accepted path is unchanged and staged ownership is not yet populated by the runtime graph. |
 | Reusable DDR partial-layer graph with resident conditional, cold-only host callback and staged conditional | **Partially implemented.** The opt-in DDR graph combines resident GPU work with a cold-only CPU host callback, and now has a fail-closed three-way conditional composer (`MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED`) with separate resident/staged child handles and a device route-mode predicate. It will only instantiate single-CUDA child graphs; no staged generation currently publishes a pure-GPU child, so the three-way composer remains inactive. The existing Phase-2 prototype's 28/69 scheduler splits still prevent its ordinary master conditional from running. |
 | A/B partial graph against accepted early-ready | **A/B completed; candidate rejected.** After fixing both the per-token weight transfer and activation dependency, the corrected six-pair decode comparison measured 34.05 tok/s for early-ready and 26.70 tok/s for the partial callback: −21.61% mean paired gain, 0/6 wins. The 64-step correctness gate is byte-identical, generated tokens match in all six pairs, and all 63 partial callbacks per run succeeded. See `logs/option_b_partial_layer13_activation_fix_perf_tty/results.json`. |
-| SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. An opt-in Qwen runtime owner now reads expert planes with `pread` from the model shards into shared payloads (`MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1`) and has a generation-tagged Ready/Error self-test. **A separate CUDA completion-graph submission is still not integrated.** |
+| SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. An opt-in Qwen runtime owner reads expert planes with `pread` from model shards, and the captured completion graph uploads a stable payload and joins a consumer stream. **The staged expert conditional child is still not integrated.** |
 | Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
 | Adaptive CPU versus staged-GPU selection | A timing policy helper and queue/run/DMA/storage telemetry exist. The policy is not wired to live selection or measured in an A/B; the measured staged route path also fails CPU-baseline numerical parity. |
 | Full-graph-only policy | Qwen graph prefill/decode now default on and an enabled Qwen graph failure aborts the request rather than entering layered execution. The native suite passes (`logs/fullgraph_only_policy_final_native.log`). **The all-family migration is incomplete:** GLM5NEXT and DeepSeek-V4 have partial graph adapters, and other families still use the layered path. |
@@ -73,7 +73,8 @@ follow-ups are `c9685b9` (partial activation and staged conditional composer),
 `8a5cd68` (shared shape-class worker test), `db35ec8` (opt-in storage
 completion boundary), `3ee2feb` (atomic completion consumption), `cfec8d1`
 (pread-backed shard loader), `b945d47` (host completion dispatcher hook),
-and `62527d1` (captured completion-graph payload upload).
+and `62527d1` (captured completion-graph payload upload), with the latest
+external-event fix and runtime evidence in the next completion-graph commit.
 
 ## Selected runtime
 
@@ -347,8 +348,9 @@ for production until its CPU/GPU arithmetic contract is resolved.
 counters. The model and request generations remain part of the completion, so
 an SSD/DDR completion graph can reject a stale result before it touches a
 staging slot. Loader exceptions are converted to an explicit error completion.
-The service remains host-only: a CUDA host callback may enqueue an immutable
-request, but the worker does not call CUDA or wait for a graph operation.
+The storage worker remains host-only: a CUDA host callback may enqueue an
+immutable request, but the worker does not call CUDA or wait for a graph
+operation. The separate completion graph owns only the post-Ready H2D copy.
 Requests may optionally carry a shared payload buffer; the loader fills it and
 the matching completion returns the same object for a later graph submission,
 avoiding a second SSD/DDR copy. `StorageCompletionDispatcher` provides the
@@ -364,7 +366,10 @@ check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. Add
 `MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1` to capture and launch the
 stable-address H2D completion graph and join its consumer event. These remain
 opt-in and do not change the production profile; the graph currently uploads a
-prepared payload but does not yet run the staged expert conditional child.
+prepared payload but does not yet run the staged expert conditional child. A
+direct RTX 3090 self-test produced `submitted=1`, `bytes=1382400`, `ready=1`
+and a separate generation-tagged `error=1 error_code=404` record in
+`logs/qwen4exp_q2_0_option_b_split44_x0_cov80.log`.
 
 `include/qwen4exp_adaptive_policy.hpp` contains the later decision rule and is
 not wired into the default scheduler. It chooses staged GPU only when its

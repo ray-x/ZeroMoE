@@ -4152,6 +4152,15 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                         << (submitted_ready ? result.queue_ms : -1.0)
                         << " service_ms="
                         << (submitted_ready ? result.service_ms : -1.0) << "\n";
+      if (completion_graph_requested && !submitted_ready)
+        LOG_STREAM_WARN()
+            << "[QWEN4EXP-COMPLETION-GRAPH] failed op="
+            << (completion_graph.last_error_operation()
+                    ? completion_graph.last_error_operation()
+                    : "completion validation")
+            << " status=" << static_cast<int>(completion_graph.last_error())
+            << " ("
+            << cudaGetErrorString(completion_graph.last_error()) << ")\n";
       const int invalid_expert =
           engine.model_file.architecture_config.n_experts;
       auto error_handle = engine.qwen4exp_storage_service->submit(

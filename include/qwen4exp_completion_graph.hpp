@@ -29,29 +29,33 @@ class CompletionGraph {
 
   bool prepare(size_t capacity_bytes) {
     reset();
+    last_error_ = cudaSuccess;
+    last_error_operation_ = nullptr;
     if (capacity_bytes == 0)
       return false;
     capacity_bytes_ = capacity_bytes;
-    if (cudaStreamCreateWithFlags(&upload_stream_, cudaStreamNonBlocking) !=
-            cudaSuccess ||
-        cudaMallocHost(reinterpret_cast<void **>(&host_payload_),
-                       capacity_bytes_) != cudaSuccess ||
-        cudaMalloc(&device_payload_, capacity_bytes_) != cudaSuccess ||
-        cudaEventCreateWithFlags(&ready_event_, cudaEventDisableTiming) !=
-            cudaSuccess)
+    if (!check(cudaStreamCreateWithFlags(&upload_stream_, cudaStreamNonBlocking),
+               "cudaStreamCreateWithFlags") ||
+        !check(cudaMallocHost(reinterpret_cast<void **>(&host_payload_),
+                              capacity_bytes_),
+               "cudaMallocHost") ||
+        !check(cudaMalloc(&device_payload_, capacity_bytes_), "cudaMalloc") ||
+        !check(cudaEventCreateWithFlags(&ready_event_, cudaEventDisableTiming),
+               "cudaEventCreateWithFlags"))
       return false;
 
     std::memset(host_payload_, 0, capacity_bytes_);
-    if (cudaStreamBeginCapture(upload_stream_,
-                               cudaStreamCaptureModeThreadLocal) !=
-        cudaSuccess) {
+    if (!check(cudaStreamBeginCapture(upload_stream_,
+                                      cudaStreamCaptureModeThreadLocal),
+               "cudaStreamBeginCapture")) {
       reset();
       return false;
     }
     const bool captured =
         cudaMemcpyAsync(device_payload_, host_payload_, capacity_bytes_,
                         cudaMemcpyHostToDevice, upload_stream_) == cudaSuccess &&
-        cudaEventRecord(ready_event_, upload_stream_) == cudaSuccess;
+        cudaEventRecordWithFlags(ready_event_, upload_stream_,
+                                 cudaEventRecordExternal) == cudaSuccess;
     cudaError_t end_status = cudaSuccess;
     if (captured)
       end_status = cudaStreamEndCapture(upload_stream_, &graph_);
@@ -62,7 +66,10 @@ class CompletionGraph {
         cudaGraphDestroy(discarded);
     }
     if (!captured || end_status != cudaSuccess || !graph_ ||
-        cudaGraphInstantiate(&graph_exec_, graph_, 0) != cudaSuccess) {
+        !check(cudaGraphInstantiate(&graph_exec_, graph_, 0),
+               "cudaGraphInstantiate")) {
+      if (end_status != cudaSuccess)
+        fail(end_status, "cudaStreamEndCapture");
       reset();
       return false;
     }
@@ -88,16 +95,19 @@ class CompletionGraph {
     model_generation_ = completion.model_generation;
     request_generation_ = completion.request_generation;
     layer_ = completion.layer;
-    state_ = cudaGraphLaunch(graph_exec_, upload_stream_) == cudaSuccess
-                 ? CompletionGraphState::Pending
-                 : CompletionGraphState::Error;
+    const cudaError_t launch = cudaGraphLaunch(graph_exec_, upload_stream_);
+    state_ = launch == cudaSuccess ? CompletionGraphState::Pending
+                                   : CompletionGraphState::Error;
+    if (launch != cudaSuccess)
+      fail(launch, "cudaGraphLaunch");
     return state_ == CompletionGraphState::Pending;
   }
 
-  bool wait_on(cudaStream_t consumer_stream) const {
-    return state_ == CompletionGraphState::Pending && consumer_stream &&
-           cudaStreamWaitEvent(consumer_stream, ready_event_, 0) ==
-               cudaSuccess;
+  bool wait_on(cudaStream_t consumer_stream) {
+    if (state_ != CompletionGraphState::Pending || !consumer_stream)
+      return false;
+    return check(cudaStreamWaitEvent(consumer_stream, ready_event_, 0),
+                 "cudaStreamWaitEvent");
   }
 
   bool synchronize() {
@@ -105,6 +115,7 @@ class CompletionGraph {
       return false;
     const cudaError_t status = cudaEventSynchronize(ready_event_);
     if (status != cudaSuccess) {
+      fail(status, "cudaEventSynchronize");
       state_ = CompletionGraphState::Error;
       return false;
     }
@@ -121,6 +132,8 @@ class CompletionGraph {
   uint64_t request_generation() const { return request_generation_; }
   int layer() const { return layer_; }
   cudaEvent_t ready_event() const { return ready_event_; }
+  cudaError_t last_error() const { return last_error_; }
+  const char *last_error_operation() const { return last_error_operation_; }
 
   void reset() {
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
@@ -145,6 +158,18 @@ class CompletionGraph {
   }
 
  private:
+  bool check(cudaError_t status, const char *operation) {
+    if (status == cudaSuccess)
+      return true;
+    return fail(status, operation);
+  }
+
+  bool fail(cudaError_t status, const char *operation) {
+    last_error_ = status;
+    last_error_operation_ = operation;
+    return false;
+  }
+
   cudaStream_t upload_stream_ = nullptr;
   cudaEvent_t ready_event_ = nullptr;
   cudaGraph_t graph_ = nullptr;
@@ -158,6 +183,8 @@ class CompletionGraph {
   uint64_t request_generation_ = 0;
   int layer_ = -1;
   CompletionGraphState state_ = CompletionGraphState::Unprepared;
+  cudaError_t last_error_ = cudaSuccess;
+  const char *last_error_operation_ = nullptr;
 };
 
 }  // namespace moestream::qwen4exp
