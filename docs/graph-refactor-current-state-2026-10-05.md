@@ -124,6 +124,13 @@ validates a Ready completion before publishing it. The opt-in pread service
 does not submit staged completions to this method yet, so the composer remains
 inactive by default.
 
+The topology contract is executable in
+`tests/test_qwen4exp_conditional_graph.cu`: it runs all-resident, all-staged,
+and mixed route sets through pure-GPU conditional children and verifies an
+unconditional parent host node runs after the branch. On the RTX 3090 it
+reports `PASS: resident/staged conditionals with parent host node`. This test
+does not claim that model payload planes are bound into the staged child yet.
+
 ## Measurements
 
 The final six-permutation, order-balanced decode comparison used the same

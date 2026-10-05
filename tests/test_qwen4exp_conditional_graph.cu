@@ -1,0 +1,208 @@
+// CUDA graph topology contract for the partial-layer tier.
+//
+// The parent graph classifies routes on-device, selects exactly one pure-GPU
+// child (resident or staged), and then runs an unconditional host node AFTER
+// both conditional bodies. The host node is deliberately outside the
+// conditional bodies, matching CUDA's host-node restriction.
+#include <cuda_runtime.h>
+
+#include <atomic>
+#include <cassert>
+#include <cstdio>
+#include <cstring>
+
+namespace {
+
+__global__ void classify_routes(cudaGraphConditionalHandle resident,
+                                cudaGraphConditionalHandle staged,
+                                const int *ids, const unsigned char *hot,
+                                const unsigned char *staged_bitmap, int topk,
+                                int n_experts, int *mode) {
+  bool all_hot = true;
+  bool all_staged = true;
+  for (int k = 0; k < topk; ++k) {
+    const int id = ids[k];
+    if (id < 0 || id >= n_experts) {
+      all_hot = false;
+      all_staged = false;
+      continue;
+    }
+    all_hot = all_hot && hot[id];
+    all_staged = all_staged && staged_bitmap[id];
+  }
+  const int selected = all_hot ? 1 : (all_staged ? 2 : 0);
+  cudaGraphSetConditional(resident, selected == 1);
+  cudaGraphSetConditional(staged, selected == 2);
+  *mode = selected;
+}
+
+__global__ void write_branch(int *output, int value) { *output = value; }
+
+struct HostContext {
+  int *mode = nullptr;
+  std::atomic<int> *calls = nullptr;
+};
+
+void CUDART_CB parent_host_node(void *opaque) {
+  auto *ctx = static_cast<HostContext *>(opaque);
+  if (ctx && ctx->mode && ctx->calls)
+    ctx->calls->fetch_add(1, std::memory_order_relaxed);
+}
+
+void check(cudaError_t status, const char *what) {
+  if (status != cudaSuccess) {
+    std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(status));
+    std::abort();
+  }
+}
+
+}  // namespace
+
+int main() {
+  int *ids = nullptr, *mode = nullptr, *output = nullptr;
+  unsigned char *hot = nullptr, *staged = nullptr;
+  int *host_mode = nullptr;
+  check(cudaMalloc(&ids, 2 * sizeof(int)), "cudaMalloc ids");
+  check(cudaMalloc(&mode, sizeof(int)), "cudaMalloc mode");
+  check(cudaMalloc(&output, sizeof(int)), "cudaMalloc output");
+  check(cudaMalloc(&hot, 8), "cudaMalloc hot");
+  check(cudaMalloc(&staged, 8), "cudaMalloc staged");
+  check(cudaMallocHost(&host_mode, sizeof(int)), "cudaMallocHost mode");
+  unsigned char hot_host[8] = {}, staged_host[8] = {};
+  hot_host[1] = hot_host[2] = 1;
+  staged_host[3] = staged_host[4] = 1;
+  check(cudaMemcpy(hot, hot_host, 8, cudaMemcpyHostToDevice), "copy hot");
+  check(cudaMemcpy(staged, staged_host, 8, cudaMemcpyHostToDevice),
+        "copy staged");
+
+  cudaGraph_t resident_graph = nullptr, staged_graph = nullptr,
+              parent_graph = nullptr;
+  cudaGraphExec_t parent_exec = nullptr;
+  check(cudaGraphCreate(&resident_graph, 0), "resident graph");
+  check(cudaGraphCreate(&staged_graph, 0), "staged graph");
+  check(cudaGraphCreate(&parent_graph, 0), "parent graph");
+
+  cudaKernelNodeParams resident_params{};
+  resident_params.func = reinterpret_cast<void *>(&write_branch);
+  int resident_value = 11;
+  void *resident_args[] = {&output, &resident_value};
+  resident_params.gridDim = dim3(1);
+  resident_params.blockDim = dim3(1);
+  resident_params.kernelParams = resident_args;
+  cudaGraphNode_t resident_kernel = nullptr;
+  check(cudaGraphAddKernelNode(&resident_kernel, resident_graph, nullptr, 0,
+                               &resident_params),
+        "resident child kernel");
+
+  cudaKernelNodeParams staged_params = resident_params;
+  int staged_value = 22;
+  void *staged_args[] = {&output, &staged_value};
+  staged_params.kernelParams = staged_args;
+  cudaGraphNode_t staged_kernel = nullptr;
+  check(cudaGraphAddKernelNode(&staged_kernel, staged_graph, nullptr, 0,
+                               &staged_params),
+        "staged child kernel");
+
+  cudaGraphNode_t prefix = nullptr;
+  check(cudaGraphAddEmptyNode(&prefix, parent_graph, nullptr, 0),
+        "parent prefix");
+  cudaGraphConditionalHandle resident_handle{}, staged_handle{};
+  check(cudaGraphConditionalHandleCreate(&resident_handle, parent_graph, 0,
+                                         cudaGraphCondAssignDefault),
+        "resident handle");
+  check(cudaGraphConditionalHandleCreate(&staged_handle, parent_graph, 0,
+                                         cudaGraphCondAssignDefault),
+        "staged handle");
+  cudaKernelNodeParams predicate{};
+  predicate.func = reinterpret_cast<void *>(&classify_routes);
+  int topk = 2, n_experts = 8;
+  void *predicate_args[] = {&resident_handle, &staged_handle, &ids, &hot,
+                            &staged, &topk, &n_experts, &mode};
+  predicate.gridDim = dim3(1);
+  predicate.blockDim = dim3(1);
+  predicate.kernelParams = predicate_args;
+  cudaGraphNode_t predicate_node = nullptr;
+  check(cudaGraphAddKernelNode(&predicate_node, parent_graph, &prefix, 1,
+                               &predicate),
+        "route predicate");
+
+  cudaGraphNodeParams resident_cond{};
+  resident_cond.type = cudaGraphNodeTypeConditional;
+  resident_cond.conditional.handle = resident_handle;
+  resident_cond.conditional.type = cudaGraphCondTypeIf;
+  resident_cond.conditional.size = 1;
+  cudaGraphNode_t resident_if = nullptr;
+  check(cudaGraphAddNode(&resident_if, parent_graph, &predicate_node, nullptr,
+                         1, &resident_cond),
+        "resident conditional");
+  cudaGraphNode_t resident_child = nullptr;
+  check(cudaGraphAddChildGraphNode(&resident_child,
+                                   resident_cond.conditional.phGraph_out[0],
+                                   nullptr, 0, resident_graph),
+        "resident child");
+
+  cudaGraphNodeParams staged_cond = resident_cond;
+  staged_cond.conditional.handle = staged_handle;
+  cudaGraphNode_t staged_if = nullptr;
+  check(cudaGraphAddNode(&staged_if, parent_graph, &predicate_node, nullptr, 1,
+                         &staged_cond),
+        "staged conditional");
+  cudaGraphNode_t staged_child = nullptr;
+  check(cudaGraphAddChildGraphNode(&staged_child,
+                                   staged_cond.conditional.phGraph_out[0],
+                                   nullptr, 0, staged_graph),
+        "staged child");
+
+  std::atomic<int> callback_calls{0};
+  HostContext host_context{host_mode, &callback_calls};
+  cudaGraphNode_t mode_copy = nullptr;
+  cudaGraphNode_t branch_deps[] = {resident_if, staged_if};
+  check(cudaGraphAddMemcpyNode1D(&mode_copy, parent_graph, branch_deps, 2,
+                                 host_mode, mode, sizeof(int),
+                                 cudaMemcpyDeviceToHost),
+        "mode readback");
+  cudaHostNodeParams host_params{};
+  host_params.fn = parent_host_node;
+  host_params.userData = &host_context;
+  cudaGraphNode_t host_node = nullptr;
+  check(cudaGraphAddHostNode(&host_node, parent_graph, &mode_copy, 1,
+                             &host_params),
+        "parent host node");
+  check(cudaGraphInstantiate(&parent_exec, parent_graph, 0),
+        "parent instantiate");
+
+  cudaStream_t stream = nullptr;
+  check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+        "stream create");
+  const int cases[][2] = {{1, 2}, {3, 4}, {1, 3}};
+  const int expected_mode[] = {1, 2, 0};
+  const int expected_output[] = {11, 22, 0};
+  for (int i = 0; i < 3; ++i) {
+    check(cudaMemcpyAsync(ids, cases[i], 2 * sizeof(int),
+                          cudaMemcpyHostToDevice, stream),
+          "route upload");
+    check(cudaMemsetAsync(output, 0, sizeof(int), stream), "output clear");
+    check(cudaGraphLaunch(parent_exec, stream), "parent launch");
+    check(cudaStreamSynchronize(stream), "parent sync");
+    int output_host = -1;
+    check(cudaMemcpy(&output_host, output, sizeof(int),
+                     cudaMemcpyDeviceToHost),
+          "output readback");
+    assert(*host_mode == expected_mode[i]);
+    assert(output_host == expected_output[i]);
+  }
+  assert(callback_calls.load(std::memory_order_relaxed) == 3);
+
+  cudaStreamDestroy(stream);
+  cudaGraphExecDestroy(parent_exec);
+  cudaGraphDestroy(parent_graph);
+  cudaGraphDestroy(resident_graph);
+  cudaGraphDestroy(staged_graph);
+  cudaFreeHost(host_mode);
+  cudaFree(staged);
+  cudaFree(hot);
+  cudaFree(output);
+  cudaFree(mode);
+  cudaFree(ids);
+  std::puts("PASS: resident/staged conditionals with parent host node");
+}
