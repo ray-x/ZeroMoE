@@ -86,6 +86,7 @@ validated runtime dispatch; it is intentionally not the production default.
 warmup counters.
 `3eaa43b` factors uniform payload-slot validation into the storage boundary and
 tests duplicate route slots plus malformed offsets.
+`b7a5c2d` adds a host-only staged-storage/adaptive-boundary regression test.
 
 ## Selected runtime
 
