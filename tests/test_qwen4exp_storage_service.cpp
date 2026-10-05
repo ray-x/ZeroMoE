@@ -70,5 +70,17 @@ int main() {
          thrown_result->error_code == -2);
   assert(throwing.release(*thrown));
   assert(!throwing.submit(StorageRequest{0, 1, 2, {3}}));
+
+  StorageService atomic_consume(1, 1, [](const StorageRequest &,
+                                         StorageCompletion &) { return true; });
+  auto consumable = atomic_consume.submit(StorageRequest{30, 1, 0, {0}});
+  assert(consumable);
+  auto wrong_consumer = *consumable;
+  wrong_consumer.request_generation = 99;
+  assert(!atomic_consume.wait_consume(wrong_consumer));
+  auto consumed = atomic_consume.wait_consume(*consumable);
+  assert(consumed && consumed->state == StorageState::Ready &&
+         consumed->model_generation == 30 && consumed->request_generation == 1);
+  assert(!atomic_consume.poll(*consumable));
   std::puts("PASS: storage service ready/error generations and stale handles");
 }

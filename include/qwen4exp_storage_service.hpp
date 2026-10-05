@@ -150,6 +150,33 @@ class StorageService {
     return record.completion;
   }
 
+  // Atomically wait for and consume a completion. This is the handoff used by
+  // a completion graph submission: generation validation, payload transfer
+  // and slot release happen under one lock, so a second consumer cannot take
+  // the same Ready/Error record or observe a slot being recycled halfway
+  // through validation.
+  std::optional<StorageCompletion> wait_consume(StorageHandle handle) {
+    if (!handle.valid() || handle.slot >= records_.size())
+      return std::nullopt;
+    std::unique_lock<std::mutex> lock(mutex_);
+    done_.wait(lock, [&] {
+      const auto state = records_[handle.slot].state;
+      return stopping_ || state == StorageState::Ready ||
+             state == StorageState::Error;
+    });
+    auto &record = records_[handle.slot];
+    if ((record.state != StorageState::Ready &&
+         record.state != StorageState::Error) ||
+        record.completion.model_generation != handle.model_generation ||
+        record.completion.request_generation != handle.request_generation)
+      return std::nullopt;
+    StorageCompletion completion = std::move(record.completion);
+    record.request = {};
+    record.completion = {};
+    record.state = StorageState::Free;
+    return completion;
+  }
+
   bool release(StorageHandle handle) {
     if (!handle.valid() || handle.slot >= records_.size())
       return false;
