@@ -3939,6 +3939,24 @@ std::string phase2_expert_ptr_text(const void *ptr) {
   return std::to_string(reinterpret_cast<uintptr_t>(ptr));
 }
 
+// Phase-2 siblings can borrow an expert buffer through another borrower.
+// Always use the graph that owns the buffer, address map, and bump cursor.
+// A direct borrower can have a reset cursor and otherwise allocate a staged
+// payload over resident expert weights in the shared arena.
+static FullGraph *phase2_expert_arena_owner(FullGraph &g) {
+  FullGraph *owner = &g;
+  for (int depth = 0; owner->phase2_expert_source_graph; ++depth) {
+    if (depth >= 16 || owner->phase2_expert_source_graph == owner) {
+      LOG_ERROR("[GGML-QWEN-FULL-ARENA-BIND-FAIL] cyclic/deep expert arena "
+                "owner chain graph=%p\n",
+                static_cast<void *>(&g));
+      return nullptr;
+    }
+    owner = owner->phase2_expert_source_graph;
+  }
+  return owner;
+}
+
 std::string device_expert_single_key(const void *host, size_t bytes,
                                     const std::string &source_tag) {
   // VRAM-only model layers are staged from GGUF into a temporary host buffer
@@ -3973,9 +3991,10 @@ ExistingDeviceExpertBind bind_existing_device_expert(
     const std::string &source_tag) {
   if (!g.device_expert_buffer || !t || source_tag.empty())
     return ExistingDeviceExpertBind::Missing;
-  FullGraph &owner = g.phase2_expert_source_graph
-                         ? *g.phase2_expert_source_graph
-                         : g;
+  FullGraph *owner_ptr = phase2_expert_arena_owner(g);
+  if (!owner_ptr || !owner_ptr->device_expert_buffer)
+    return ExistingDeviceExpertBind::Failed;
+  FullGraph &owner = *owner_ptr;
   const std::string key = device_expert_single_key(nullptr, bytes, source_tag);
   const auto existing = owner.phase2_expert_addrs.find(key);
   if (existing == owner.phase2_expert_addrs.end())
@@ -4002,9 +4021,10 @@ bool phase2_bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
     return false;
   ScopedGraphBuildTimer bind_timer(g.expert_weight_device_bind_ms_total);
   ++g.expert_weight_device_bind_calls;
-  FullGraph &owner = g.phase2_expert_source_graph
-                         ? *g.phase2_expert_source_graph
-                         : g;
+  FullGraph *owner_ptr = phase2_expert_arena_owner(g);
+  if (!owner_ptr || !owner_ptr->device_expert_buffer)
+    return false;
+  FullGraph &owner = *owner_ptr;
   auto existing = owner.phase2_expert_addrs.find(key);
   if (existing != owner.phase2_expert_addrs.end()) {
     *addr_out = existing->second;
@@ -4018,6 +4038,21 @@ bool phase2_bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
                 ggml_nbytes(t));
       return false;
     }
+    if (env_phase2_handoff_eval_trace() &&
+        key.rfind("completion_stage:", 0) == 0) {
+      const uintptr_t base =
+          reinterpret_cast<uintptr_t>(owner.device_expert_base);
+      const uintptr_t address = reinterpret_cast<uintptr_t>(*addr_out);
+      LOG_INFO("[QWEN4EXP-P2-STAGE-ALLOC] graph=%p direct_source=%p "
+               "arena_owner=%p new=0 used=%zu capacity=%zu addr=%p "
+               "arena_offset=%zu bytes=%zu key=%s\n",
+               static_cast<void *>(&g),
+               static_cast<void *>(g.phase2_expert_source_graph),
+               static_cast<void *>(&owner), owner.device_expert_used,
+               owner.device_expert_capacity, *addr_out,
+               address >= base ? static_cast<size_t>(address - base) : 0,
+               ggml_nbytes(t), key.c_str());
+    }
     return true;
   }
 
@@ -4027,6 +4062,7 @@ bool phase2_bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
   constexpr size_t kAlignment = 256;
   const size_t alignment =
       std::max<size_t>(kAlignment, ggml_backend_buft_get_alignment(buft));
+  const size_t used_before = owner.device_expert_used;
   const size_t aligned =
       (owner.device_expert_used + alignment - 1) & ~(alignment - 1);
   if (aligned > owner.device_expert_capacity ||
@@ -4052,6 +4088,17 @@ bool phase2_bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
   owner.phase2_expert_addrs.emplace(key, addr);
   *addr_out = addr;
   *new_allocation = true;
+  if (env_phase2_handoff_eval_trace() &&
+      key.rfind("completion_stage:", 0) == 0) {
+    LOG_INFO("[QWEN4EXP-P2-STAGE-ALLOC] graph=%p direct_source=%p "
+             "arena_owner=%p new=1 used_before=%zu used_after=%zu "
+             "capacity=%zu addr=%p arena_offset=%zu bytes=%zu key=%s\n",
+             static_cast<void *>(&g),
+             static_cast<void *>(g.phase2_expert_source_graph),
+             static_cast<void *>(&owner), used_before, owner.device_expert_used,
+             owner.device_expert_capacity, addr, aligned, alloc_size,
+             key.c_str());
+  }
   return true;
 }
 
