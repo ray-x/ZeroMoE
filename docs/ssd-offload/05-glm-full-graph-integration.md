@@ -66,3 +66,23 @@ Steady-state decode (RTX 3090 + 5060 Ti, 8 CPU threads, page cache dropped befor
 15 GiB is the GPU1 limit (15.5 OOMs). Output is coherent; it diverges from the pure-VRAM spread run at token 18 (different
 summation order), and from the whole-layer baseline at token 1 (the legacy prefill uses a different hot set).
 Below ~48 GiB of expert DDR the loads show up directly (2.9 ms each); hiding them behind a prefetch is the next lever.
+
+### Logits check (teacher-forced on the whole-layer baseline's 96 tokens; `MOESTREAM_DECODE_LOGITS_DUMP`, `docs/ssd-offload/cmp_logits.py`)
+
+| comparison | top-1 kept | step-0 max abs logit delta | median / max delta |
+|---|---|---|---|
+| spread (no offload) vs whole-layer baseline | 82/96 | 1.86 | 2.5 / 6.4 |
+| spread + offload vs spread (identical prefill) | 96/96 | 0.000 | **0.000 / 0.000** |
+| spread + offload + GPU1 hot 14.2 GiB vs whole-layer baseline | 87/96 | 1.86 | 2.2 / 6.7 |
+| same vs spread (identical prefill) | 86/96 | 0.000 | 2.2 / 5.5 |
+| spread + offload + GPU1 hot 0.3 GiB (48 experts) vs spread | - | 0.000 | ~0.7 / 1.5 (steps 1-11) |
+| whole-layer baseline vs all-CPU prefill (step 0) | - | 1.08 | - |
+| spread vs all-CPU prefill (step 0) | - | 1.74 | - |
+
+* The DDR/SSD offload itself is bit-exact (zero logit delta over 96 steps).
+* The deviation from the baseline starts in the legacy prefill: it grows with the number of layers whose experts run on the GPU
+  (8 layers: 1.08 off the all-CPU prefill; 42 layers: 1.74). It is GPU-vs-CPU quantized-matmul arithmetic (q8_1 vs q8_K
+  activation quantization), not an offload effect.
+* The GPU1 hot branch changes decode logits by a delta that grows with the number of experts moved (0.7 at 48 experts,
+  2.2 at 2,100+), the same direction and scale as the GPU-vs-CPU gap above; text stays coherent. This is consistent with
+  arithmetic noise but is NOT proof of correctness against an independent reference (e.g. llama.cpp on the same tokens).
