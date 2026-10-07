@@ -682,7 +682,8 @@ OffloadState *get_offload(const StreamingEngine &engine) {
     planes.push_back(pb);
   }
   o->arena = std::make_unique<moestream::offload::VirtualArena>(
-      o->first, o->n_layers, o->n_experts, planes, /*no_huge_pages=*/true);
+      o->first, o->n_layers, o->n_experts, planes,
+      /*no_huge_pages=*/offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") != "1");
   if (!o->arena->ok()) {
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] virtual arena mmap failed\n");
     return nullptr;
@@ -6062,6 +6063,9 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
+    return false;
+  // Build and seed the offload cache at boot, not inside the first decode token.
+  if (offload_first_layer() >= 0 && !get_offload(engine))
     return false;
 
   FullGraph candidate;

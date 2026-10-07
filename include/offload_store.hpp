@@ -282,6 +282,7 @@ private:
 
 class ModelReader final : public ExpertSource {
 public:
+  bool drop_page_cache = true;
   ModelReader() = default;
   ~ModelReader() override { for (int fd : fds_) if (fd >= 0) ::close(fd); }
   ModelReader(const ModelReader &) = delete;
@@ -323,7 +324,10 @@ public:
     if (!contains(layer, expert)) return ReadStatus::NotFound;
     for (int k = 0; k < 3; ++k) {
       const Proj &p = layers_.at(layer).p[k];
-      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert))) return ReadStatus::IoError;
+      const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
+      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return ReadStatus::IoError;
+      // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
+      if (drop_page_cache) ::posix_fadvise(p.fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
     }
     return ReadStatus::Ok;
   }

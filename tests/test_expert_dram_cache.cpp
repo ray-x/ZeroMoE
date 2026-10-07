@@ -447,6 +447,20 @@ static void test_residency_end_to_end(const std::string &dir) {
   const int32_t ids2[] = {0, 1};
   auto e2 = res2.ensure(3, ids2, 2);
   CHECK(e2.misses == 1 && e2.not_cached == 1 && e2.loads == 0 && e2.errors == 0 && arena2.resident_pages(3, 1) == 0);
+
+  // Prefill path: loads non-resident experts without touching the cache, and drops them at the next call.
+  ExpertCache lru({first, nl, ne, 4, ExpertCache::Policy::Lru, 0.0});
+  VirtualArena arena3(first, nl, ne, {{P, P, P}, {P, P, P}, {P, P, P}}, true);
+  ExpertResidency res3(lru, arena3, {&store, &model});
+  lru.seed({{3, 0}});
+  res3.load(3, 0);
+  const int32_t ids3[] = {0, 1, 1, 2, -1};
+  const auto t1 = res3.ensure_transient(3, ids3, 5);
+  CHECK(t1.misses == 2 && t1.loads == 2 && t1.errors == 0 && lru.size() == 1);
+  CHECK(arena3.resident_pages(3, 1) > 0 && arena3.resident_pages(3, 2) > 0 && arena3.resident_pages(3, 0) > 0);
+  const int32_t ids4[] = {4};
+  const auto t2 = res3.ensure_transient(4, ids4, 1);
+  CHECK(t2.loads == 1 && arena3.resident_pages(3, 1) == 0 && arena3.resident_pages(3, 2) == 0 && lru.size() == 1);
 }
 
 // ------------------------------------------------------------------------------------------ acceptance: trace replay
