@@ -138,6 +138,19 @@ echo "[run_components] compiling adaptive policy tests"
     -o "$ADAPTIVE_TEST_BIN" tests/test_qwen4exp_adaptive_policy.cpp
 "$ADAPTIVE_TEST_BIN"
 
+# Dynamic DDR expert cache (residency bitmap, LRU, seeding, aligned O_DIRECT store reader, virtual arena) and its
+# acceptance replay of the GLM-5.3-Flash router trace against the offline simulator's results. Linux only (O_DIRECT,
+# preadv, mincore). Optional real-data check: MOESTREAM_TEST_STORE=<store.gguf> MOESTREAM_TEST_MODEL=<shard,...>.
+if [ "$(uname -s)" = "Linux" ]; then
+    CACHE_TEST_BIN="$ROUTE_TEST_DIR/test_expert_dram_cache"
+    echo "[run_components] compiling dynamic expert cache tests"
+    "$CXX" -std=c++20 -O2 -pthread -Iinclude \
+        -o "$CACHE_TEST_BIN" tests/test_expert_dram_cache.cpp
+    "$CACHE_TEST_BIN"
+else
+    echo "[run_components] skipping dynamic expert cache tests (Linux only)"
+fi
+
 # The shared shape-class registry itself is CPU-only, but its public header
 # uses CUDA and GGML types. Run it where both SDK headers are present; retain
 # the pure C++ storage/policy tests on CPU-only hosts.

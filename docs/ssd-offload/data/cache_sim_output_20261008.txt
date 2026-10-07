@@ -1,5 +1,4 @@
 prompts parsed: 5; decode tokens per prompt: [159, 159, 159, 159, 80]; layers 11-44
-trace vs usage_decode (same run): trace hits 194752, usage hits 194752, sum|diff| 0 (0.00% of usage)
 
 working set (distinct experts used in decode):
   prompt 0: 6757 experts (69.0% of 9792), session so far 6757
