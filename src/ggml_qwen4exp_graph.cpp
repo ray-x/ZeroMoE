@@ -6087,7 +6087,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       const char *all_early_env = std::getenv("MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT");
       const bool early_requested =
           ((early_env && early_env[0] == '1' && layer == 13) ||
-           (all_early_env && all_early_env[0] == '1')) &&
+           (!all_early_env || all_early_env[0] != '0')) &&
           g.decode_mode && g.S == 1 &&
           g.phase2_mode == FullGraph::Phase2Mode::Off;
       const bool partial_requested =

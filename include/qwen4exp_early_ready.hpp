@@ -107,9 +107,11 @@ struct Qwen4ExpEarlyReady {
     const char *skip = std::getenv("MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT");
     skip_all_hot = skip && skip[0] == '1';
     const char *copy = std::getenv("MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT");
-    async_output_copy = copy && copy[0] == '1';
+    // Accepted production profile (early-ready + immutable resident route tables +
+    // asynchronous cold-output upload): on unless explicitly disabled with =0.
+    async_output_copy = !(copy && copy[0] == '0');
     const char *tables = std::getenv("MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES");
-    resident_tables = tables && tables[0] == '1';
+    resident_tables = !(tables && tables[0] == '0');
     cold_mask.resize(n_experts);
     for (int e = 0; e < n_experts; ++e)
       cold_mask[e] = static_cast<const float *>(mask->data)[e] != 0.0f;
