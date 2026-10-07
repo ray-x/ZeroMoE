@@ -129,6 +129,14 @@ struct PartialExpertLayer {
   ggml_tensor *hot_map = nullptr;
   ggml_tensor *cold_mask = nullptr;
   ggml_tensor *hot_mask = nullptr;
+  // Second-GPU hot set (MOESTREAM_GLM5NEXT_GPU1_HOT_GIB): experts moved out of `cold` that decode serves from the
+  // 5060 Ti. Prefill / no-GPU1 builds fold them back into the cold branch (identity-indexed full arena).
+  std::vector<int> hot1;
+  ggml_tensor *hot1_gate = nullptr;
+  ggml_tensor *hot1_up = nullptr;
+  ggml_tensor *hot1_down = nullptr;
+  ggml_tensor *hot1_map = nullptr;
+  ggml_tensor *hot1_mask = nullptr;
   // -1 = not yet decided for this build_graph() pass. Caches
   // engine->graph_ram_layer_ready(layer) the first time it is consulted for
   // this layer during a single graph build. Background prefetch/promotion
@@ -410,6 +418,11 @@ struct FullGraph {
       p.hot_map = nullptr;
       p.cold_mask = nullptr;
       p.hot_mask = nullptr;
+      p.hot1_gate = nullptr;
+      p.hot1_up = nullptr;
+      p.hot1_down = nullptr;
+      p.hot1_map = nullptr;
+      p.hot1_mask = nullptr;
     }
 
     expert_source_mmap = false;
@@ -753,11 +766,12 @@ OffloadState *get_offload(const StreamingEngine &engine,
       size_t n_hot = 0;
       for (size_t l = 0; l < partial->size() && l < hot.size(); ++l) {
         hot[l].assign((size_t)o->n_experts, 0);
-        for (int e : (*partial)[l].hot)
-          if (e >= 0 && e < o->n_experts) {
-            hot[l][(size_t)e] = 1;
-            ++n_hot;
-          }
+        for (const std::vector<int> *set : {&(*partial)[l].hot, &(*partial)[l].hot1})
+          for (int e : *set)
+            if (e >= 0 && e < o->n_experts) {
+              hot[l][(size_t)e] = 1;
+              ++n_hot;
+            }
       }
       ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
                                   [&](const moestream::offload::ExpertKey &k) {
@@ -798,6 +812,13 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
       ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
                                        i0 * a->nb[0]));
+  static const bool dbg = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
+  static std::atomic<int> dbg_lines{0};
+  if (dbg && !site->prefill)
+    for (size_t k = 0; k < ids.size(); ++k)
+      if (ids[k] >= 0 && !o.cache->resident({site->layer, ids[k]}) && dbg_lines.fetch_add(1) < 40)
+        LOG_INFO("[OFFLOAD-DEBUG] miss layer=%d expert=%d S=%lld k=%zu\n", site->layer, ids[k],
+                 (long long)a->ne[1], k);
   const auto r = site->prefill
                      ? o.residency->ensure_transient(site->layer, ids.data(),
                                                      (int)ids.size())
@@ -2206,7 +2227,7 @@ bool configure_vram_reference_experts(FullGraph &g) {
   return true;
 }
 
-bool configure_partial_experts(FullGraph &g) {
+bool configure_partial_experts_base(FullGraph &g) {
   if (configure_vram_reference_experts(g))
     return true;
   const double requested_gb =
@@ -2361,6 +2382,20 @@ bool configure_partial_experts(FullGraph &g) {
            (double)cold_bytes / (1024.0 * 1024.0 * 1024.0), hot_records,
            c.n_layers - c.first_dense, g.partial_usage_file.c_str(),
            g.dynamic_expert_cache ? ", dynamic LRU enabled" : "");
+  return true;
+}
+
+void assign_gpu1_hot(FullGraph &g, double gib);
+
+// Same hot/cold split for every caller (boot candidate, prompt graph, decode graph) so their layouts compare equal.
+bool configure_partial_experts(FullGraph &g) {
+  if (!configure_partial_experts_base(g))
+    return false;
+  if (g.partial_expert_residency && ggml_shared_backend(1)) {
+    const char *gh = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
+    if (gh && gh[0])
+      assign_gpu1_hot(g, std::atof(gh));
+  }
   return true;
 }
 
@@ -2853,6 +2888,178 @@ bool prepare_partial_hot(FullGraph &g, ggml_context *ctx, int layer) {
   return p->hot_gate && p->hot_up && p->hot_down;
 }
 
+
+ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer,
+                              bool mask) {
+  PartialExpertLayer *p = partial_layer(g, layer);
+  if (!p)
+    return nullptr;
+  ggml_tensor *&slot = mask ? p->hot1_mask : p->hot1_map;
+  if (slot)
+    return slot;
+  const size_t n = (size_t)std::max(0, g.engine->model_file.architecture_config.n_experts);
+  ggml_tensor *t = ggml_new_tensor_3d(ctx, mask ? GGML_TYPE_F32 : GGML_TYPE_I32, 1,
+                                      (int64_t)n, g.S);
+  if (!t)
+    return nullptr;
+  std::vector<int32_t> index_of_expert(n, -1);
+  std::vector<uint8_t> owned(n, 0);
+  for (size_t i = 0; i < p->hot1.size(); ++i) {
+    const int e = p->hot1[i];
+    if (e >= 0 && (size_t)e < n) {
+      index_of_expert[(size_t)e] = (int32_t)i;
+      owned[(size_t)e] = 1;
+    }
+  }
+  const moe_partial::ExpertBranchMap branch_map = moe_partial::ExpertBranchMap::build(
+      index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
+      moe_partial::SentinelPolicy::Auto);
+  const void *data = mask ? (const void *)branch_map.route_mask().data()
+                          : (const void *)branch_map.route_ids().data();
+  if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used,
+                   t, data, ggml_nbytes(t)))
+    return nullptr;
+  ggml_set_name(t, (std::string("full_graph_hot1_") + (mask ? "mask_" : "map_") +
+                    std::to_string(layer)).c_str());
+  slot = t;
+  return t;
+}
+
+// GPU1 hot weights live in buffers that outlive graph rebuilds (key: layer*3+plane).
+std::map<int, ggml_backend_buffer_t> g_hot1_buffers;
+
+ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
+                         const char *stem, int plane) {
+  PartialExpertLayer *p = partial_layer(g, layer);
+  const GGUFTensor *m = model_tensor(*g.engine, "blk." + std::to_string(layer) + "." + stem);
+  const size_t n_experts = (size_t)g.engine->model_file.architecture_config.n_experts;
+  if (!p || p->hot1.empty() || !m || !type_ok(m->type) || m->shape.size() != 3 ||
+      n_experts == 0 || m->size_bytes % n_experts != 0)
+    return nullptr;
+  const size_t per_expert = (size_t)m->size_bytes / n_experts;
+  std::vector<int64_t> shape;
+  for (uint64_t d : m->shape)
+    shape.push_back((int64_t)d);
+  shape[2] = (int64_t)p->hot1.size();
+  ggml_tensor *t = new_tensor(ctx, (ggml_type)m->type, shape);
+  if (!t || ggml_nbytes(t) != per_expert * p->hot1.size())
+    return nullptr;
+  const int key = layer * 3 + plane;
+  ggml_backend_buffer_t buf = nullptr;
+  auto it = g_hot1_buffers.find(key);
+  const bool fresh = it == g_hot1_buffers.end();
+  if (fresh) {
+    buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g.gpu1),
+                                         ggml_nbytes(t) + 4096);
+    if (!buf)
+      return nullptr;
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    g_hot1_buffers[key] = buf;
+  } else {
+    buf = it->second;
+  }
+  if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS)
+    return nullptr;
+  if (fresh) {
+    std::vector<char> stage(per_expert);
+    const int fd = g.engine->model_file.fd_for_tensor(*m);
+    for (size_t i = 0; i < p->hot1.size(); ++i) {
+      const ssize_t got = ::pread(fd, stage.data(), per_expert,
+                                  (off_t)(m->offset + (uint64_t)p->hot1[i] * per_expert));
+      if (got != (ssize_t)per_expert) {
+        LOG_ERROR("[GGML-GLM5NEXT-GPU1-HOT] short read layer %d expert %d\n", layer, p->hot1[i]);
+        return nullptr;
+      }
+      ggml_backend_tensor_set(t, stage.data(), i * per_expert, per_expert);
+      ::posix_fadvise(fd, (off_t)(m->offset + (uint64_t)p->hot1[i] * per_expert),
+                      (off_t)per_expert, POSIX_FADV_DONTNEED);
+    }
+    g.gpu1_bytes += ggml_nbytes(t);
+  }
+  ggml_set_name(t, (std::string("blk.") + std::to_string(layer) + "." + stem + ".gpu1_hot").c_str());
+  return t;
+}
+
+bool prepare_partial_hot1(FullGraph &g, ggml_context *ctx, int layer) {
+  PartialExpertLayer *p = partial_layer(g, layer);
+  if (!p || p->hot1.empty() || !(g.decode_mode && g.gpu1) || p->hot1_down)
+    return true;
+  p->hot1_gate = hot1_weight(g, ctx, layer, "ffn_gate_exps.weight", 0);
+  p->hot1_up = hot1_weight(g, ctx, layer, "ffn_up_exps.weight", 1);
+  p->hot1_down = hot1_weight(g, ctx, layer, "ffn_down_exps.weight", 2);
+  return p->hot1_gate && p->hot1_up && p->hot1_down;
+}
+
+// Move the next-hottest cold experts (by usage) into the GPU1 hot set until `gib` of expert bytes is reached.
+void assign_gpu1_hot(FullGraph &g, double gib) {
+  if (gib <= 0.0 || g.partial_experts.empty())
+    return;
+  const auto &c = g.engine->model_file.architecture_config;
+  const char *uenv = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE");
+  const std::string usage_path = uenv && uenv[0]
+                                     ? std::string(uenv)
+                                     : offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
+  auto [entries, max_count] = StreamingEngine::load_usage(usage_path);
+  (void)max_count;
+  std::vector<std::vector<uint8_t>> is_cold((size_t)c.n_layers);
+  std::vector<size_t> bytes((size_t)c.n_layers, 0);
+  for (int l = c.first_dense; l < c.n_layers; ++l) {
+    PartialExpertLayer &p = g.partial_experts[(size_t)l];
+    is_cold[(size_t)l].assign((size_t)c.n_experts, 0);
+    for (int e : p.cold)
+      if (e >= 0 && e < c.n_experts)
+        is_cold[(size_t)l][(size_t)e] = 1;
+    for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+      const GGUFTensor *m = model_tensor(*g.engine, "blk." + std::to_string(l) + "." + stem);
+      if (m && c.n_experts > 0)
+        bytes[(size_t)l] += (size_t)m->size_bytes / (size_t)c.n_experts;
+    }
+  }
+  std::vector<StreamingEngine::UsageEntry> cand;
+  for (const auto &e : entries)
+    if (e.layer >= c.first_dense && e.layer < c.n_layers && e.expert >= 0 &&
+        e.expert < c.n_experts && e.count > 0 && is_cold[(size_t)e.layer][(size_t)e.expert])
+      cand.push_back(e);
+  std::sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) {
+    if (a.count != b.count)
+      return a.count > b.count;
+    if (a.layer != b.layer)
+      return a.layer < b.layer;
+    return a.expert < b.expert;
+  });
+  const size_t budget = (size_t)(gib * 1024.0 * 1024.0 * 1024.0);
+  size_t used = 0, taken = 0;
+  for (const auto &e : cand) {
+    if (used + bytes[(size_t)e.layer] > budget)
+      continue;
+    PartialExpertLayer &p = g.partial_experts[(size_t)e.layer];
+    p.hot1.push_back(e.expert);
+    used += bytes[(size_t)e.layer];
+    ++taken;
+    is_cold[(size_t)e.layer][(size_t)e.expert] = 0;
+  }
+  for (int l = c.first_dense; l < c.n_layers; ++l) {
+    PartialExpertLayer &p = g.partial_experts[(size_t)l];
+    if (p.hot1.empty())
+      continue;
+    std::sort(p.hot1.begin(), p.hot1.end());
+    p.cold.erase(std::remove_if(p.cold.begin(), p.cold.end(),
+                                [&](int e) { return !is_cold[(size_t)l][(size_t)e]; }),
+                 p.cold.end());
+  }
+  if (std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG")) {
+    for (int l : {3, 4}) {
+      std::string a, b;
+      for (int e : g.partial_experts[(size_t)l].hot1) a += std::to_string(e) + ",";
+      for (int e : g.partial_experts[(size_t)l].hot) b += std::to_string(e) + ",";
+      LOG_INFO("[HOT1-DEBUG] layer %d hot1=%s\n[HOT1-DEBUG] layer %d hot=%s cold=%zu\n", l, a.c_str(), l, b.c_str(),
+               g.partial_experts[(size_t)l].cold.size());
+    }
+  }
+  LOG_INFO("[GGML-GLM5NEXT-GPU1-HOT] %zu experts (%.2f GiB) assigned to GPU1\n", taken,
+           (double)used / (1024.0 * 1024.0 * 1024.0));
+}
+
 ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
                          bool mask) {
   PartialExpertLayer *p = partial_layer(g, layer);
@@ -2918,6 +3125,20 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   std::vector<uint8_t> owned(n, 0);
   for (size_t e = 0; e < n; ++e)
     owned[e] = (is_hot[e] != 0) == hot ? 1 : 0;
+  if (!hot && !p->hot1.empty()) {
+    // hot1 experts left `cold`; decode serves them from GPU1, every other build keeps them here.
+    const bool on_gpu1 = g.decode_mode && g.gpu1;
+    for (int e : p->hot1) {
+      if (e < 0 || (size_t)e >= n)
+        continue;
+      if (on_gpu1) {
+        owned[(size_t)e] = 0;
+      } else {
+        index_of_expert[(size_t)e] = e; // full-arena identity view
+        owned[(size_t)e] = 1;
+      }
+    }
+  }
 
   // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
   static const bool force_dummy =
@@ -5506,6 +5727,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
   if (g.partial_expert_residency && !prepare_partial_hot(g, ctx, layer))
     return nullptr;
+  if (g.partial_expert_residency && !prepare_partial_hot1(g, ctx, layer))
+    return nullptr;
   if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
     LOG_WARN(
         "[PARTIAL-DEBUG-HOT] layer=%d hot=%zu vram_slots=%zu "
@@ -5613,6 +5836,19 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         });
     if (!out)
       return nullptr;
+    if (partial->hot1_down) {
+      ggml_tensor *m1 = partial_map_hot1(g, ctx, layer, false);
+      ggml_tensor *k1 = partial_map_hot1(g, ctx, layer, true);
+      if (!m1 || !k1)
+        return nullptr;
+      const moe_partial::BranchInputs in1 =
+          moe_partial::make_branch_inputs(ctx, m1, k1, route_ids, weights, c.topk, g.S);
+      ggml_tensor *b1 = run_branch(nullptr, partial->hot1_gate, partial->hot1_up,
+                                   partial->hot1_down, in1.ids, in1.weights);
+      if (!b1)
+        return nullptr;
+      out = ggml_add(ctx, out, b1);
+    }
   } else {
     ggml_tensor *branch_ids = route_ids;
     if (offload_layer(layer)) {
@@ -6137,6 +6373,9 @@ int glm5next_full_graph_device_expert_layers() {
 
 void glm5next_full_graph_shutdown() {
   g_graph.reset();
+  for (auto &kv : g_hot1_buffers)
+    ggml_backend_buffer_free(kv.second);
+  g_hot1_buffers.clear();
   g_glm5next_source.reset();
   g_glm5next_decode_disabled_engine = nullptr;
 }
@@ -6443,6 +6682,14 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
         LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] GPU1 expert layers %d-%d\n", a, b);
       }
     }
+  }
+  if (!g->gpu1) {
+    // GPU1 hot experts (MOESTREAM_GLM5NEXT_GPU1_HOT_GIB) need the second backend even without whole GPU1 layers.
+    for (const auto &pl : g->partial_experts)
+      if (!pl.hot1.empty()) {
+        g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
+        break;
+      }
   }
   ggml_backend_t backends[] = {g->cuda, g->gpu1, g->cpu};
   if (!g->gpu1)
