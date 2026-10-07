@@ -4067,6 +4067,29 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                 }
                 const size_t old_size = payload->bytes.size();
                 payload->bytes.resize(old_size + gate_bytes + up_bytes + down_bytes);
+                // Qwen is fully resident in DDR/VRAM: the expert planes are already
+                // published as host views in the graph RAM arena, so copy them
+                // instead of pread()ing the model file on every token. pread stays the
+                // path for layers that are NOT DDR-resident (NVMe-offloaded models
+                // such as the full GLM-5.3).
+                bool host_copied = false;
+                if (engine.graph_ram_layer_ready(request.layer)) {
+                  const auto *arena = engine.graph_ram_arena(request.layer);
+                  const auto &slot =
+                      engine.layers_experts[(size_t)request.layer][(size_t)expert];
+                  if (arena && arena->gate_bytes == gate_bytes &&
+                      arena->up_bytes == up_bytes &&
+                      arena->down_bytes == down_bytes &&
+                      slot.gate_proj.host_ptr && slot.up_proj.host_ptr &&
+                      slot.down_proj.host_ptr) {
+                    uint8_t *dst = payload->bytes.data() + old_size;
+                    std::memcpy(dst, slot.gate_proj.host_ptr, gate_bytes);
+                    std::memcpy(dst + gate_bytes, slot.up_proj.host_ptr, up_bytes);
+                    std::memcpy(dst + gate_bytes + up_bytes,
+                                slot.down_proj.host_ptr, down_bytes);
+                    host_copied = true;
+                  }
+                }
                 auto read_plane = [&](const GGUFTensor &meta, size_t bytes,
                                       uint64_t offset, size_t dst) {
                   const int fd = engine.model_file.fd_for_tensor(meta);
@@ -4086,10 +4109,11 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                 const uint64_t down_offset =
                     down->offset + (unpacked ? 0ull
                                              : static_cast<uint64_t>(expert) * down_bytes);
-                if (!read_plane(*gate, gate_bytes, gate_offset, 0) ||
-                    !read_plane(*up, up_bytes, up_offset, gate_bytes) ||
-                    !read_plane(*down, down_bytes, down_offset,
-                                gate_bytes + up_bytes)) {
+                if (!host_copied &&
+                    (!read_plane(*gate, gate_bytes, gate_offset, 0) ||
+                     !read_plane(*up, up_bytes, up_offset, gate_bytes) ||
+                     !read_plane(*down, down_bytes, down_offset,
+                                 gate_bytes + up_bytes))) {
                   completion.error_code = EIO;
                   return false;
                 }
