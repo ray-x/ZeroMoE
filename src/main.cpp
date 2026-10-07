@@ -1074,7 +1074,13 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       size_t layer_slot_bytes = raw_layer_bytes;
       if (layer_slot_bytes > 0) {
         size_t slot_alignment = COMPACT_REGION_ALIGNMENT;
-        if (config.vram_cache_full_layer_prefix > l) {
+        // The GLM5NEXT full graph aliases resident slots as MUL_MAT_ID views for ANY layer with
+        // hot experts, so every layer needs a row-aligned slot stride, not just the full-layer prefix.
+        static const bool glm_graph_rows = [] {
+          const char *v = std::getenv("MOESTREAM_GLM5NEXT_FULL_GRAPH");
+          return v && v[0] == '1';
+        }();
+        if (config.vram_cache_full_layer_prefix > l || glm_graph_rows) {
           const size_t row_alignment =
               engine.expert_cache_layer_stride_alignment(l);
           if (row_alignment == SIZE_MAX) {

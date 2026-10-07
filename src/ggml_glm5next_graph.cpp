@@ -642,7 +642,8 @@ void offload_report(OffloadState &o, const char *why) {
 }
 
 // Created on first use and shared by the prompt and decode graphs.
-OffloadState *get_offload(const StreamingEngine &engine) {
+OffloadState *get_offload(const StreamingEngine &engine,
+                          const std::vector<PartialExpertLayer> *partial = nullptr) {
   std::lock_guard<std::mutex> lock(g_offload_mutex);
   if (g_offload)
     return g_offload.get();
@@ -744,8 +745,31 @@ OffloadState *get_offload(const StreamingEngine &engine) {
   const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
   if (!usage.empty()) {
     const auto t0 = std::chrono::steady_clock::now();
-    o->cache->seed(moestream::offload::rank_hottest_first(
-        usage, o->first, o->n_layers, o->n_experts));
+    auto ranked = moestream::offload::rank_hottest_first(
+        usage, o->first, o->n_layers, o->n_experts);
+    if (partial) {
+      // Experts that live in VRAM are served by the GPU branch; do not spend DDR on them.
+      std::vector<std::vector<uint8_t>> hot((size_t)c.n_layers);
+      size_t n_hot = 0;
+      for (size_t l = 0; l < partial->size() && l < hot.size(); ++l) {
+        hot[l].assign((size_t)o->n_experts, 0);
+        for (int e : (*partial)[l].hot)
+          if (e >= 0 && e < o->n_experts) {
+            hot[l][(size_t)e] = 1;
+            ++n_hot;
+          }
+      }
+      ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
+                                  [&](const moestream::offload::ExpertKey &k) {
+                                    return (size_t)k.layer < hot.size() &&
+                                           !hot[(size_t)k.layer].empty() &&
+                                           hot[(size_t)k.layer][(size_t)k.expert];
+                                  }),
+                   ranked.end());
+      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] excluded %zu VRAM-hot experts from the "
+               "DDR seed\n", n_hot);
+    }
+    o->cache->seed(ranked);
     const size_t failed = o->residency->populate_resident();
     LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] seeded %zu/%zu experts (%zu failed) in "
              "%.1f s\n",
@@ -2875,7 +2899,8 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
       }
     } else {
       int32_t cold_slot = 0;
-      const bool full_ddr_view = partial_layer_ram_ready(g, layer);
+      const bool full_ddr_view =
+          offload_layer(layer) || partial_layer_ram_ready(g, layer);
       for (int expert : p->cold) {
         if (expert < 0 || (size_t)expert >= n)
           return nullptr;
@@ -5545,26 +5570,9 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   };
 
   ggml_tensor *out = nullptr;
-  // Offloaded layers: make the routed experts resident before any MUL_MAT_ID
-  // that consumes these ids.  The arena is indexed by expert id, so the cold
-  // map must be the identity for the layer.
+  // Offloaded layers: the miss node wraps the ids that reach the CPU (cold) MUL_MAT_IDs, so
+  // experts held in VRAM are never loaded into DDR; negative ids are skipped by ensure().
   ggml_tensor *route_ids = ids;
-  if (offload_layer(layer)) {
-    if (PartialExpertLayer *pl = partial_layer(g, layer)) {
-      bool identity = pl->hot.empty() && (int)pl->cold.size() == c.n_experts;
-      for (int e = 0; identity && e < c.n_experts; ++e)
-        identity = pl->cold[(size_t)e] == e;
-      if (!identity) {
-        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d is partially resident "
-                  "(hot=%zu cold=%zu); offload needs an all-cold layer\n",
-                  layer, pl->hot.size(), pl->cold.size());
-        return nullptr;
-      }
-    }
-    route_ids = offload_miss_node(g, ctx, layer, ids);
-    if (!route_ids)
-      return nullptr;
-  }
   if (PartialExpertLayer *partial = partial_layer(g, layer)) {
     const bool has_hot = !partial->hot.empty();
     const bool has_cold = !partial->cold.empty();
@@ -5587,6 +5595,11 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         return nullptr;
       cold_in = moe_partial::make_branch_inputs(ctx, cold_map, cold_mask, route_ids,
                                                 weights, c.topk, g.S);
+      if (offload_layer(layer)) {
+        cold_in.ids = offload_miss_node(g, ctx, layer, cold_in.ids);
+        if (!cold_in.ids)
+          return nullptr;
+      }
     }
     out = moe_partial::combine_hot_cold(
         ctx, has_hot, has_cold, hot_in, cold_in,
@@ -5601,7 +5614,13 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     if (!out)
       return nullptr;
   } else {
-    out = run_branch(gate_up, ge, ue, de, route_ids, weights);
+    ggml_tensor *branch_ids = route_ids;
+    if (offload_layer(layer)) {
+      branch_ids = offload_miss_node(g, ctx, layer, route_ids);
+      if (!branch_ids)
+        return nullptr;
+    }
+    out = run_branch(gate_up, ge, ue, de, branch_ids, weights);
     if (!out)
       return nullptr;
   }
@@ -6065,9 +6084,6 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
   // Build and seed the offload cache at boot, not inside the first decode token.
-  if (offload_first_layer() >= 0 && !get_offload(engine))
-    return false;
-
   FullGraph candidate;
   candidate.engine = &engine;
   candidate.topology = g_glm5next_vram_cache;
@@ -6079,6 +6095,11 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
                                candidate.first_dense));
   if (configure_partial_experts(candidate))
     candidate.device_expert_layers = 0;
+  if (offload_first_layer() >= 0 &&
+      !get_offload(engine, candidate.partial_expert_residency
+                               ? &candidate.partial_experts
+                               : nullptr))
+    return false;
 
   if (g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, candidate)) {

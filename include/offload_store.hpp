@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <future>
 #include <memory>
 #include <string>
 #include <sys/mman.h>
@@ -322,13 +323,21 @@ public:
   }
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
     if (!contains(layer, expert)) return ReadStatus::NotFound;
-    for (int k = 0; k < 3; ++k) {
+    // The three planes sit at unrelated file offsets: read them concurrently (queue depth 3) instead of back to back.
+    auto one = [&](int k) {
       const Proj &p = layers_.at(layer).p[k];
       const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
-      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return ReadStatus::IoError;
+      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
       // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
       if (drop_page_cache) ::posix_fadvise(p.fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
-    }
+      return true;
+    };
+    auto f1 = std::async(std::launch::async, one, 1);
+    auto f2 = std::async(std::launch::async, one, 2);
+    const bool ok0 = one(0);
+    const bool ok1 = f1.get();
+    const bool ok2 = f2.get();
+    if (!(ok0 && ok1 && ok2)) return ReadStatus::IoError;
     return ReadStatus::Ok;
   }
 
@@ -417,6 +426,7 @@ public:
   // rather than compute with a slot that does not hold the expert. `not_cached` counts misses of a Static policy cache.
   Ensure ensure(int layer, const int32_t *ids, int n) {
     Ensure r;
+    std::vector<int> to_load;
     for (int i = 0; i < n; ++i) {
       if (ids[i] < 0) continue;
       const ExpertKey key{layer, ids[i]};
@@ -426,13 +436,27 @@ public:
       if (cache_.config().policy == ExpertCache::Policy::Static) { ++r.not_cached; continue; }
       if (a.evicted) { arena_.evict(a.victim.layer, a.victim.expert); ++r.evictions; }
       if (!a.inserted) { ++r.errors; continue; }
-      const auto t0 = std::chrono::steady_clock::now();
-      const bool ok = load(layer, ids[i]);
-      r.load_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      if (ok) ++r.loads;
-      else { cache_.erase(key); arena_.evict(layer, ids[i]); ++r.errors; }
+      to_load.push_back(ids[i]);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<char> ok = load_many(layer, to_load);
+    r.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    for (size_t k = 0; k < to_load.size(); ++k) {
+      if (ok[k]) ++r.loads;
+      else { cache_.erase({layer, to_load[k]}); arena_.evict(layer, to_load[k]); ++r.errors; }
     }
     return r;
+  }
+
+  // Load several experts of one layer concurrently (the first on the calling thread).
+  std::vector<char> load_many(int layer, const std::vector<int> &experts) {
+    std::vector<char> ok(experts.size(), 0);
+    std::vector<std::future<bool>> fut;
+    for (size_t k = 1; k < experts.size(); ++k)
+      fut.push_back(std::async(std::launch::async, [this, layer, e = experts[k]] { return load(layer, e); }));
+    if (!experts.empty()) ok[0] = load(layer, experts[0]);
+    for (size_t k = 1; k < experts.size(); ++k) ok[k] = fut[k - 1].get();
+    return ok;
   }
 
   // Prefill path: make every id of `layer` readable without touching the cache (a prompt touches most experts of a
