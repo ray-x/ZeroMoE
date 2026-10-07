@@ -11,6 +11,8 @@
 #include "dense_dispatch.hpp"
 #include "direct_io.hpp"
 #include "engine.hpp"
+#include "expert_cache.hpp"
+#include "offload_store.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
@@ -24,6 +26,7 @@
 #include "moe_partial_route_ggml.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <climits>
@@ -574,6 +577,233 @@ bool env_enabled() {
     return v && v[0] == '1';
   }();
   return enabled;
+}
+
+
+// ---------------------------------------------------------------------------
+// SSD-offload routed experts (opt-in, MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER).
+// Layers >= that index do not get a fully resident DDR source.  Their experts
+// live in a virtual per-projection arena (slot == expert id, so MUL_MAT_ID needs
+// no remapping) that is filled on demand from the offload store / model by a
+// host-side LRU cache.  A custom CPU node in front of every MUL_MAT_ID makes the
+// routed experts resident before the matmul runs.
+// ---------------------------------------------------------------------------
+const GGUFTensor *model_tensor(const StreamingEngine &engine,
+                               const std::string &name);
+struct OffloadState;
+struct OffloadSite {
+  OffloadState *state = nullptr;
+  int layer = 0;
+  bool prefill = false;
+};
+struct OffloadState {
+  int first = 0, n_layers = 0, n_experts = 0;
+  std::unique_ptr<moestream::offload::ExpertCache> cache;
+  std::unique_ptr<moestream::offload::VirtualArena> arena;
+  moestream::offload::OffloadStore store;
+  moestream::offload::ModelReader model;
+  std::unique_ptr<moestream::offload::ExpertResidency> residency;
+  std::deque<OffloadSite> sites;
+  std::atomic<uint64_t> calls{0}, routes{0}, misses{0}, loads{0}, evictions{0},
+      errors{0}, load_us{0}, transient_loads{0}, cb_us{0};
+  std::atomic<uint64_t> last_report_calls{0};
+};
+std::unique_ptr<OffloadState> g_offload;
+std::mutex g_offload_mutex;
+
+int offload_first_layer() {
+  static const int first = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER");
+    return v && v[0] ? std::atoi(v) : -1;
+  }();
+  return first;
+}
+bool offload_layer(int layer) {
+  const int f = offload_first_layer();
+  return f >= 0 && layer >= f;
+}
+std::string offload_env(const char *name, const char *dflt = "") {
+  const char *v = std::getenv(name);
+  return v && v[0] ? v : dflt;
+}
+
+void offload_report(OffloadState &o, const char *why) {
+  LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s: calls=%llu routes=%llu misses=%llu "
+           "loads=%llu transient=%llu evictions=%llu errors=%llu load=%.1f ms "
+           "callback=%.1f ms\n",
+           why, (unsigned long long)o.calls.load(),
+           (unsigned long long)o.routes.load(),
+           (unsigned long long)o.misses.load(),
+           (unsigned long long)o.loads.load(),
+           (unsigned long long)o.transient_loads.load(),
+           (unsigned long long)o.evictions.load(),
+           (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
+           o.cb_us.load() / 1000.0);
+}
+
+// Created on first use and shared by the prompt and decode graphs.
+OffloadState *get_offload(const StreamingEngine &engine) {
+  std::lock_guard<std::mutex> lock(g_offload_mutex);
+  if (g_offload)
+    return g_offload.get();
+  const auto &c = engine.model_file.architecture_config;
+  auto o = std::make_unique<OffloadState>();
+  o->first = offload_first_layer();
+  o->n_layers = c.n_layers - o->first;
+  o->n_experts = c.n_experts;
+  if (o->first < c.first_dense || o->n_layers <= 0 || o->n_experts <= 0) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] bad first layer %d\n", o->first);
+    return nullptr;
+  }
+  std::vector<std::array<uint64_t, 3>> planes;
+  uint64_t expert_bytes_sum = 0;
+  for (int l = o->first; l < c.n_layers; ++l) {
+    std::array<uint64_t, 3> pb{};
+    int k = 0;
+    for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
+                             "ffn_down_exps.weight"}) {
+      const GGUFTensor *m =
+          model_tensor(engine, "blk." + std::to_string(l) + "." + stem);
+      if (!m || m->size_bytes % (uint64_t)o->n_experts != 0) {
+        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d %s missing/uneven\n", l,
+                  stem);
+        return nullptr;
+      }
+      pb[(size_t)k] = m->size_bytes / (uint64_t)o->n_experts;
+      if (pb[(size_t)k] % 4096 != 0) {
+        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d %s per-expert %llu is not "
+                  "a multiple of 4096\n",
+                  l, stem, (unsigned long long)pb[(size_t)k]);
+        return nullptr;
+      }
+      expert_bytes_sum += pb[(size_t)k];
+      ++k;
+    }
+    planes.push_back(pb);
+  }
+  o->arena = std::make_unique<moestream::offload::VirtualArena>(
+      o->first, o->n_layers, o->n_experts, planes, /*no_huge_pages=*/true);
+  if (!o->arena->ok()) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] virtual arena mmap failed\n");
+    return nullptr;
+  }
+
+  std::string err;
+  std::vector<moestream::offload::ExpertSource *> sources;
+  const std::string store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
+  if (!store_path.empty()) {
+    if (o->store.open(store_path, &err))
+      sources.push_back(&o->store);
+    else
+      LOG_WARN("[GGML-GLM5NEXT-OFFLOAD] store %s unusable (%s); model only\n",
+               store_path.c_str(), err.c_str());
+  }
+  std::vector<std::string> shards;
+  {
+    const std::string first_shard = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
+    if (first_shard.empty()) {
+      LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] MOESTREAM_GLM5NEXT_OFFLOAD_MODEL "
+                "(first shard) is required\n");
+      return nullptr;
+    }
+    const size_t pos = first_shard.rfind("-00001-of-");
+    if (pos == std::string::npos) {
+      shards.push_back(first_shard);
+    } else {
+      const std::string head = first_shard.substr(0, pos);
+      const int total = std::atoi(first_shard.c_str() + pos + 10);
+      char buf[64];
+      for (int i = 1; i <= std::max(1, total); ++i) {
+        std::snprintf(buf, sizeof buf, "-%05d-of-%05d.gguf", i, total);
+        shards.push_back(head + buf);
+      }
+    }
+  }
+  if (!o->model.open(shards, &err)) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] model reader: %s\n", err.c_str());
+    return nullptr;
+  }
+  sources.push_back(&o->model);
+
+  moestream::offload::ExpertCache::Config cc;
+  cc.first_layer = o->first;
+  cc.n_layers = o->n_layers;
+  cc.n_experts = o->n_experts;
+  const double ddr_gib =
+      std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "40").c_str());
+  cc.capacity = (size_t)(ddr_gib * 1024.0 * 1024.0 * 1024.0 /
+                         ((double)expert_bytes_sum / (double)o->n_layers));
+  cc.policy = moestream::offload::ExpertCache::Policy::Lru;
+  cc.pinned_fraction =
+      std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PINNED", "0.5").c_str());
+  o->cache = std::make_unique<moestream::offload::ExpertCache>(cc);
+  o->residency = std::make_unique<moestream::offload::ExpertResidency>(
+      *o->cache, *o->arena, sources);
+
+  const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
+  if (!usage.empty()) {
+    const auto t0 = std::chrono::steady_clock::now();
+    o->cache->seed(moestream::offload::rank_hottest_first(
+        usage, o->first, o->n_layers, o->n_experts));
+    const size_t failed = o->residency->populate_resident();
+    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] seeded %zu/%zu experts (%zu failed) in "
+             "%.1f s\n",
+             o->cache->size(), cc.capacity, failed,
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                 .count());
+  }
+  LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] layers %d..%d, capacity %zu experts "
+           "(%.1f GiB), pinned %.2f, store=%s\n",
+           o->first, c.n_layers - 1, cc.capacity, ddr_gib, cc.pinned_fraction,
+           store_path.empty() ? "<none>" : store_path.c_str());
+  g_offload = std::move(o);
+  return g_offload.get();
+}
+
+void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
+                     void *ud) {
+  if (ith != 0)
+    return;
+  OffloadSite *site = static_cast<OffloadSite *>(ud);
+  OffloadState &o = *site->state;
+  const auto cb_t0 = std::chrono::steady_clock::now();
+  std::vector<int32_t> ids;
+  ids.reserve((size_t)ggml_nelements(a));
+  for (int64_t i1 = 0; i1 < a->ne[1]; ++i1)
+    for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
+      ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
+                                       i0 * a->nb[0]));
+  const auto r = site->prefill
+                     ? o.residency->ensure_transient(site->layer, ids.data(),
+                                                     (int)ids.size())
+                     : o.residency->ensure(site->layer, ids.data(),
+                                           (int)ids.size());
+  o.calls.fetch_add(1, std::memory_order_relaxed);
+  o.routes.fetch_add(ids.size(), std::memory_order_relaxed);
+  o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+  o.loads.fetch_add((uint64_t)(site->prefill ? 0 : r.loads),
+                    std::memory_order_relaxed);
+  o.transient_loads.fetch_add((uint64_t)(site->prefill ? r.loads : 0),
+                              std::memory_order_relaxed);
+  o.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+  o.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+  if (r.errors > 0) {
+    o.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); "
+              "aborting rather than computing with missing experts\n",
+              site->layer, r.errors);
+    offload_report(o, "fatal");
+    std::abort();
+  }
+  // dst has the shape of `a` but is contiguous.
+  std::memcpy(dst->data, ids.data(), ids.size() * sizeof(int32_t));
+  o.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - cb_t0).count(),
+                    std::memory_order_relaxed);
+  if (!site->prefill && o.calls.load() - o.last_report_calls.load() >= 544) {
+    o.last_report_calls.store(o.calls.load());
+    offload_report(o, "progress");
+  }
 }
 
 bool dynamic_cache_enabled() {
@@ -3452,8 +3682,65 @@ ggml_tensor *graph_ram_weight(FullGraph &g, ggml_context *ctx, int layer,
   return t;
 }
 
+
+ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer,
+                            const char *stem) {
+  OffloadState *o = get_offload(*g.engine);
+  if (!o)
+    return nullptr;
+  const int plane = std::strcmp(stem, "ffn_gate_exps.weight") == 0   ? 0
+                    : std::strcmp(stem, "ffn_up_exps.weight") == 0   ? 1
+                    : std::strcmp(stem, "ffn_down_exps.weight") == 0 ? 2
+                                                                     : -1;
+  const std::string name = "blk." + std::to_string(layer) + "." + stem;
+  const GGUFTensor *meta = model_tensor(*g.engine, name);
+  if (plane < 0 || !meta || !type_ok(meta->type) || meta->shape.size() != 3)
+    return nullptr;
+  std::vector<int64_t> shape;
+  for (uint64_t d : meta->shape)
+    shape.push_back((int64_t)d);
+  ggml_tensor *t = new_tensor(ctx, (ggml_type)meta->type, shape);
+  if (!t || t->nb[2] != o->arena->stride(layer, plane) ||
+      (uint64_t)t->ne[2] != (uint64_t)o->n_experts) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s: tensor stride %zu != arena stride\n",
+              name.c_str(), t ? t->nb[2] : (size_t)0);
+    return nullptr;
+  }
+  const size_t len = (size_t)t->nb[2] * (size_t)t->ne[2];
+  ggml_backend_buffer_t buffer =
+      ggml_backend_cpu_buffer_from_ptr(o->arena->ptr(layer, 0, plane), len);
+  if (!buffer)
+    return nullptr;
+  ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  t->data = o->arena->ptr(layer, 0, plane);
+  t->buffer = buffer;
+  if (ggml_backend_buffer_init_tensor(buffer, t) != GGML_STATUS_SUCCESS) {
+    ggml_backend_buffer_free(buffer);
+    return nullptr;
+  }
+  g.host_buffers.push_back(buffer);
+  ggml_set_name(t, (name + ".offload").c_str());
+  return t;
+}
+
+ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer,
+                               ggml_tensor *ids) {
+  OffloadState *o = get_offload(*g.engine);
+  if (!o || !ids)
+    return nullptr;
+  std::lock_guard<std::mutex> lock(g_offload_mutex);
+  o->sites.push_back({o, layer, g.S > 1});
+  ggml_tensor *out =
+      ggml_map_custom1(ctx, ids, offload_miss_cb, 1, &o->sites.back());
+  if (out)
+    ggml_set_name(out, ("glm5next_offload_ids_" + std::to_string(layer)).c_str());
+  return out;
+}
+
 ggml_tensor *expert_weight_impl(FullGraph &g, ggml_context *ctx, int layer,
                                const char *stem) {
+  if (offload_layer(layer))
+    return offload_weight(g, ctx, layer, stem);
   if (partial_layer(g, layer) &&
       !(g.vram_reference_experts && partial_layer_ram_ready(g, layer)))
     return load_cold_weight(g, ctx, layer, stem);
@@ -3469,6 +3756,8 @@ ggml_tensor *expert_weight_impl(FullGraph &g, ggml_context *ctx, int layer,
 
 ggml_tensor *expert_gate_up_weight_impl(FullGraph &g, ggml_context *ctx,
                                        int layer) {
+  if (offload_layer(layer))
+    return nullptr; // separate projection planes inside the offload arena
   if (g.vram_reference_experts && partial_layer_ram_ready(g, layer))
     return nullptr;
   if (partial_layer(g, layer))
@@ -3544,7 +3833,7 @@ size_t expert_source_bytes(const StreamingEngine &engine,
   for (int l = c.first_dense; l < c.n_layers; ++l) {
     if (l < c.first_dense + device_expert_layers)
       continue;
-    if (engine.graph_ram_layer_ready(l))
+    if (offload_layer(l) || engine.graph_ram_layer_ready(l))
       continue;
     for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
                              "ffn_down_exps.weight"}) {
@@ -3573,7 +3862,7 @@ size_t expert_source_bytes(const FullGraph &g) {
   const auto &c = g.engine->model_file.architecture_config;
   size_t total = 0;
   for (int l = c.first_dense; l < c.n_layers; ++l) {
-    if (l < c.first_dense + g.device_expert_layers ||
+    if (l < c.first_dense + g.device_expert_layers || offload_layer(l) ||
         g.engine->graph_ram_layer_ready(l))
       continue;
     if (c.n_experts <= 0 || l >= (int)g.partial_experts.size())
@@ -3773,7 +4062,7 @@ bool preload_expert_source(FullGraph &g) {
   for (int l = c.first_dense; l < c.n_layers; ++l) {
     if (l < device_end)
       continue;
-    if (g.engine->graph_ram_layer_ready(l))
+    if (offload_layer(l) || g.engine->graph_ram_layer_ready(l))
       continue;
     const std::vector<int> *selected_experts = nullptr;
     if (g.partial_expert_residency && !g.dynamic_expert_cache) {
@@ -5255,6 +5544,26 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   };
 
   ggml_tensor *out = nullptr;
+  // Offloaded layers: make the routed experts resident before any MUL_MAT_ID
+  // that consumes these ids.  The arena is indexed by expert id, so the cold
+  // map must be the identity for the layer.
+  ggml_tensor *route_ids = ids;
+  if (offload_layer(layer)) {
+    if (PartialExpertLayer *pl = partial_layer(g, layer)) {
+      bool identity = pl->hot.empty() && (int)pl->cold.size() == c.n_experts;
+      for (int e = 0; identity && e < c.n_experts; ++e)
+        identity = pl->cold[(size_t)e] == e;
+      if (!identity) {
+        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d is partially resident "
+                  "(hot=%zu cold=%zu); offload needs an all-cold layer\n",
+                  layer, pl->hot.size(), pl->cold.size());
+        return nullptr;
+      }
+    }
+    route_ids = offload_miss_node(g, ctx, layer, ids);
+    if (!route_ids)
+      return nullptr;
+  }
   if (PartialExpertLayer *partial = partial_layer(g, layer)) {
     const bool has_hot = !partial->hot.empty();
     const bool has_cold = !partial->cold.empty();
@@ -5267,7 +5576,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_tensor *hot_mask = partial_map(g, ctx, layer, true, true);
       if (!hot_map || !hot_mask)
         return nullptr;
-      hot_in = moe_partial::make_branch_inputs(ctx, hot_map, hot_mask, ids,
+      hot_in = moe_partial::make_branch_inputs(ctx, hot_map, hot_mask, route_ids,
                                                weights, c.topk, g.S);
     }
     if (has_cold) {
@@ -5275,7 +5584,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_tensor *cold_mask = partial_map(g, ctx, layer, false, true);
       if (!cold_map || !cold_mask)
         return nullptr;
-      cold_in = moe_partial::make_branch_inputs(ctx, cold_map, cold_mask, ids,
+      cold_in = moe_partial::make_branch_inputs(ctx, cold_map, cold_mask, route_ids,
                                                 weights, c.topk, g.S);
     }
     out = moe_partial::combine_hot_cold(
@@ -5291,7 +5600,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     if (!out)
       return nullptr;
   } else {
-    out = run_branch(gate_up, ge, ue, de, ids, weights);
+    out = run_branch(gate_up, ge, ue, de, route_ids, weights);
     if (!out)
       return nullptr;
   }

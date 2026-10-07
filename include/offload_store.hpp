@@ -431,6 +431,30 @@ public:
     return r;
   }
 
+  // Prefill path: make every id of `layer` readable without touching the cache (a prompt touches most experts of a
+  // layer once, so caching them would only evict the decode working set). Experts loaded here are dropped again at the
+  // next ensure_transient() call, i.e. when the following layer starts.
+  Ensure ensure_transient(int layer, const int32_t *ids, int n) {
+    Ensure r;
+    for (const ExpertKey &k : transient_) arena_.evict(k.layer, k.expert);
+    transient_.clear();
+    for (int i = 0; i < n; ++i) {
+      if (ids[i] < 0) continue;
+      const ExpertKey key{layer, ids[i]};
+      if (cache_.resident(key)) continue;
+      bool dup = false;
+      for (const ExpertKey &t : transient_) if (t.layer == key.layer && t.expert == key.expert) { dup = true; break; }
+      if (dup) continue;
+      ++r.misses;
+      const auto t0 = std::chrono::steady_clock::now();
+      const bool ok = load(layer, ids[i]);
+      r.load_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      transient_.push_back(key);
+      if (ok) ++r.loads; else ++r.errors;
+    }
+    return r;
+  }
+
   // Fill an expert's three planes from the first source that has it.
   bool load(int layer, int expert) {
     for (ExpertSource *s : sources_) {
@@ -462,6 +486,7 @@ private:
   ExpertCache &cache_;
   VirtualArena &arena_;
   std::vector<ExpertSource *> sources_;
+  std::vector<ExpertKey> transient_;
 };
 
 } // namespace moestream::offload
