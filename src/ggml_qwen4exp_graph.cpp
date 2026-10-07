@@ -2226,6 +2226,21 @@ bool env_partial_layer_phase2_enabled() {
 // The payload-backed staged child is a separate opt-in from the validated
 // resident/CPU Phase-2 A/B. It requires the host storage boundary and a
 // persistent CompletionGraph, and remains disabled in the production profile.
+// Whether the PREFILL graph should capture the partial layer's router outputs
+// (ids/probs/bias) for the Phase-1 coverage gate. Those tensors have to be marked
+// ggml_set_output, which keeps them out of allocator reuse and backend fusion for the
+// whole graph and so perturbs prefill numerics from a later layer onward (diag: every
+// position diverges from early-ready from layer ~35, RMS 2.4e-2 at layer 47, while
+// skipping the capture is bit-identical). Phase 2 routes per token in decode and never
+// consumes the Phase-1 gate, so under Phase 2 the capture is skipped. Set
+// MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 to force the old behaviour.
+bool partial_prefill_capture_enabled() {
+  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE");
+  if (v && v[0])
+    return v[0] == '1';
+  return !env_partial_layer_phase2_enabled();
+}
+
 bool env_completion_staged_enabled() {
   const char *v = std::getenv("MOESTREAM_QWEN4EXP_COMPLETION_STAGED");
   return v && v[0] == '1';
@@ -7487,7 +7502,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
       return false;
-    if (!g.decode_mode && l == g.engine->qwen4exp_partial_layer && bias)
+    if (!g.decode_mode && l == g.engine->qwen4exp_partial_layer && bias &&
+        partial_prefill_capture_enabled())
       g.partial_layer_bias_out = bias;
 
     if (g.phase2_mode == FullGraph::Phase2Mode::Prefix &&
@@ -7705,14 +7721,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // Prefill-only: capture this layer's routing `ids` for a real per-prompt
     // readback in qwen4exp_full_graph_run, so decode can decide whether to
     // commit to the path above. Never set outside prefill.
+    const bool partial_capture_here =
+        !g.decode_mode && l == g.engine->qwen4exp_partial_layer &&
+        partial_prefill_capture_enabled();
     ggml_tensor **partial_ids_out =
-        (!g.decode_mode && l == g.engine->qwen4exp_partial_layer)
-            ? &g.partial_layer_ids_out
-            : nullptr;
+        partial_capture_here ? &g.partial_layer_ids_out : nullptr;
     ggml_tensor **partial_probs_out =
-        (!g.decode_mode && l == g.engine->qwen4exp_partial_layer)
-            ? &g.partial_layer_probs_out
-            : nullptr;
+        partial_capture_here ? &g.partial_layer_probs_out : nullptr;
 
     // Decode-only router-usage tap: captures this layer's real routed ids
     // via build_moe's own ids_out param. Safe to fold into partial_ids_out's
@@ -12323,6 +12338,13 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
         engine.qwen4exp_partial_layer_committed
             ? "GPU-ONLY (committed)"
             : "the normal CPU/GPU path (insufficient coverage)");
+  } else if (engine.qwen4exp_partial_layer >= 0 &&
+             !partial_prefill_capture_enabled()) {
+    LOG_INFO("[PARTIAL-LAYER] layer=%d prefill routing capture skipped "
+             "(Phase 2 routes per token; the capture would perturb prefill "
+             "numerics -- set MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 "
+             "to force it)\n",
+             engine.qwen4exp_partial_layer);
   }
   const auto t_state_end = std::chrono::steady_clock::now();
   const auto ms = [](const auto &a, const auto &b) {
