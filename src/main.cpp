@@ -7,6 +7,9 @@
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_decode.hpp"
+#if defined(MOESTREAM_EXL3_CUDA)
+#include "exl3_gpu.hpp"
+#endif
 #include "exllamav3_backend.hpp"
 #include "generation_loop.hpp"
 #include "thread_profile.hpp"
@@ -541,6 +544,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_graph_expert_vram_budget_gb =
       config.qwen4exp_graph_expert_vram_budget_gb;
   engine.qwen4exp_graph_pin_file = config.pin_file;
+  engine.exl3_ggml_bridge_model_path = config.exl3_ggml_bridge_model_path;
+  engine.exl3_ggml_bridge_layer = config.exl3_ggml_bridge_layer;
+  engine.exl3_ggml_bridge_layers = config.exl3_ggml_bridge_layers;
   engine.qwen4exp_option_b_layer = config.qwen4exp_option_b_layer;
   engine.qwen4exp_option_b_top_n = config.qwen4exp_option_b_top_n;
   engine.qwen4exp_option_b_min_coverage =
@@ -752,6 +758,23 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // of whether `gpu` (declared before `engine` above) has already been
   // destroyed by the time engine's destructor runs.
   engine.gpu_device_id = gpu.get_core_device();
+#if defined(MOESTREAM_EXL3_CUDA) && defined(MOESTREAM_USE_GGML_CUDA)
+  if (!engine.exl3_ggml_bridge_model_path.empty()) {
+    const size_t cache_bytes = static_cast<size_t>(
+        config.exl3_gpu_cache_gb * 1024.0 * 1024.0 * 1024.0);
+    try {
+      engine.exl3_gpu_executor_owner = std::make_shared<Exl3GpuExecutor>(
+          engine.gpu_device_id, cache_bytes);
+    } catch (const std::exception &error) {
+      return std::unexpected(std::string("Failed to initialize EXL3 GGML "
+                                         "bridge cache: ") + error.what());
+    }
+    engine.exl3_gpu_executor = engine.exl3_gpu_executor_owner.get();
+    LOG_STREAM_INFO() << "[EXL3-GGML-BRIDGE] cache executor initialized on GPU "
+                      << engine.gpu_device_id << " with "
+                      << config.exl3_gpu_cache_gb << " GiB cache budget\n";
+  }
+#endif
 
   if (!engine.model_file.load_header(model_path)) {
     return std::unexpected(
@@ -4067,6 +4090,19 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                 }
                 const size_t old_size = payload->bytes.size();
                 payload->bytes.resize(old_size + gate_bytes + up_bytes + down_bytes);
+                const bool resident_route =
+                    std::find(engine.qwen4exp_partial_layer_gpu_ids.begin(),
+                              engine.qwen4exp_partial_layer_gpu_ids.end(),
+                              expert) !=
+                    engine.qwen4exp_partial_layer_gpu_ids.end();
+                if (resident_route) {
+                  // Keep a fixed-size payload slot for original-route
+                  // indexing, but leave it zero-filled. The device predicate
+                  // masks this slot out of the staged child and the resident
+                  // child owns its contribution.
+                  payload->offsets.push_back(payload->bytes.size());
+                  continue;
+                }
                 // Qwen is fully resident in DDR/VRAM: the expert planes are already
                 // published as host views in the graph RAM arena, so copy them
                 // instead of pread()ing the model file on every token. pread stays the

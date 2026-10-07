@@ -273,6 +273,228 @@ Repeat the fixed-length measurement with:
 Q2_0 comparison work remains deferred until EXL3 performance tuning is
 complete, as requested.
 
+### Experimental GGML opaque EXL3 custom node
+
+The repository also contains an isolated proof of the proposed GGML bridge:
+`exl3_ggml_custom_bench` creates an `GGML_TYPE_I8` tensor containing one
+packed EXL3 trellis/header/scale payload and passes it, together with an F32
+activation tensor, through `ggml_map_custom2`. The custom callback validates
+the opaque header, obtains the packed EXL3 components, launches
+`launch_exl3_mul1_matmul`, and returns the F32 result. GGML owns the opaque
+tensor allocation and graph node; the callback owns only the CUDA staging
+buffers.
+
+Build and run the isolated bridge benchmark with a CUDA+GGML build:
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_custom_bench -j4
+./build_ggmlcuda/exl3_ggml_custom_bench 100
+```
+
+The corrected 2026-10-06 smoke benchmark measured 20.23 us through the GGML
+graph and 19.50 us through the same direct callback path, or 0.73 us of GGML
+graph/callback overhead for one synthetic projection. This validates the opaque
+tensor and callback mechanics, not full-model EXL3 inference. GGML's current
+custom operation is scheduled through the CPU backend; the callback enqueues
+the EXL3 CUDA work and synchronizes it. A production Qwen EXL3 graph still
+needs an EXL3 safetensors-to-GGML graph builder, persistent per-layer opaque
+buffers, and full attention/KV-cache/logit integration. The GPU adapter below
+supplies the CUDA-backend/custom-op handoff without modifying the external
+GGML checkout. These benchmarks remain separate from the validated upstream
+ExLlamaV3 path and do not replace it yet.
+
+The GPU-resident adapter is `exl3_ggml_cuda_adapter_bench`. It wraps the CUDA
+GGML backend without modifying the external GGML checkout, intercepts a custom
+node, and invokes the EXL3 kernel using activation, opaque packed-weight, and
+output device pointers directly. Its synthetic `2560 -> 640` projection
+measured **13.79 us device time** (13.71 us host enqueue time) on the RTX 3090
+on 2026-10-06; the adapter performs no per-node H2D/D2H copies.
+
+For a stable graph, enable adapter-level CUDA graph capture with:
+
+```bash
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_adapter_bench \
+    100 --capture
+```
+
+The capture-path smoke run measured **11.93 us device time** for the same
+single projection. Call `exl3_ggml_cuda_backend_reset_graph()` after changing
+tensor addresses or graph shape, then capture again; weight uploads and route
+buffer updates must remain outside the captured graph.
+
+`exl3_ggml_cuda_real_bench` exercises the same bridge with a real matrix loaded
+from `/data/sdb/models/qwen3.8-flash-next/exl3_3bpw`. The selected routed expert
+gate projection is `2560 -> 640`, 4-bit, and 825,728 packed bytes. It measured
+**12.88 us device time** (13.48 us enqueue-to-synchronize time), with a maximum
+absolute GPU-vs-CPU EXL3 result error of `1.23e-7`. This validates real
+safetensors loading, GPU-resident opaque storage, custom-node dispatch, and
+single-matrix numerical parity; it is not full-model decode. Replaying the
+same real node through adapter-level CUDA graph capture measured **11.06 us
+device time** with the same `1.23e-7` parity error.
+
+Run the real-loader check with:
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_bench -j4
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_bench \
+    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 100 0 --capture
+```
+
+The fused `exl3_ggml_cuda_fused_ffn_bench` reduces gate/up, SwiGLU, and down
+to one custom node with persistent CUDA intermediates. The captured synthetic
+FFN measured **23.49 us device time** on the same GPU. This is an FFN kernel
+fixture, not a Qwen layer because normalization, routing, residual, attention,
+and KV-cache work are absent.
+
+The reusable implementation is in `include/exl3_ggml_ffn.hpp` and
+`src/exl3_ggml_ffn.cpp`. `Exl3GgmlFfnState` provides a single-expert fused
+node, while `Exl3GgmlRoutedFfnState` accepts a compact top-k payload plus a
+GPU-resident F32 route-weight tensor through `MAP_CUSTOM3`. A real two-expert
+layer-0 check measured **61.05 us eagerly** and **52.03 us with adapter CUDA
+graph capture**, with `1.75e-9` maximum absolute error against CPU gate/up,
+SwiGLU, down, and weighted accumulation.
+`exl3_ggml_build_routed_payload()` supplies the fixed-stride opaque layout used
+by graph builders and validates all expert dimensions/bit metadata.
+
+The routed state also has a dynamic route-table mode. GGML route outputs
+(`I32` IDs and `F32` weights) feed `Exl3GgmlRoutePackState`, whose `MAP_CUSTOM3`
+node packs them on the CUDA stream into an opaque `GGML_TYPE_I8` table storing
+`[int32 route_ids[topk] | float route_weights[topk]]`. The captured EXL3 node
+reads both arrays directly from device memory. A real two-expert test changed
+the route from `[0,1]` to `[1,0]` after capture without rebuilding the graph,
+measuring `1.75e-9` and `1.89e-9` maximum errors for the two replays. The
+dynamic state now uses a validated uniform-bit fast path when all payload slots
+share a bit width; mixed-bit payloads retain the eight-variant fallback.
+Captured time for the real 4-bit test was **59.14 us**, versus **52.03 us** for
+compact host-resolved routes.
+
+The real routed check is reproducible with:
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_routed_ffn_bench -j4
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_routed_ffn_bench \
+    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 100 0 --capture
+```
+
+Dynamic device-ID validation uses:
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_dynamic_routed_bench -j4
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_dynamic_routed_bench \
+    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 20 0 --capture
+```
+
+`exl3_ggml_cuda_real_router_ffn_bench` extends this to the real layer-0 router:
+GGML CUDA computes the F16 router matmul, softmax, top-k, selected-route
+normalization, route-table packing, and dynamic EXL3 FFN. On the real pack it
+selected experts `481,27`, matched CPU logits and normalized weights, and
+measured **92.24 us** captured time with `1.31e-9` maximum FFN error. This is a
+real routed layer-0 FFN graph; attention, residual/HC, KV cache, and logits are
+still outside this bridge benchmark.
+
+`exl3_ggml_cuda_real_exl3_layer_bench` validates the next boundary using a real
+full-attention EXL3 layer. Custom Q/K/V/O projections, RoPE, device KV-cache
+write, GGML flash attention, Qwen HC mix/combine projections, residual adds,
+and the routed EXL3 FFN execute in one captured graph. Layer 3
+(`hidden=2560`, `heads=24`, `kv_heads=2`) measured **333.89 us** and produced
+finite output.
+
+The same graph accepts prefill rows (`S=2`), including row-strided route IDs,
+weights, and batched EXL3 projections; the captured check measured **414.72 us**
+with finite output.
+
+The production Qwen full-graph builder has an opt-in selected-layer hook. It
+replaces the selected GGML expert subtree with one cache-backed `MAP_CUSTOM3`
+node. The node consumes device-resident activations and a packed route table;
+the EXL3 projections live in the existing `Exl3GpuExecutor` LRU, not in a
+second all-experts layer payload. Cache misses load the selected MUL1 matrices
+from Safetensors and insert them into that LRU. The GGML bridge itself is
+implemented in C++ and CUDA; it does not call Python or modify the external
+GGML checkout.
+
+```bash
+export MOESTREAM_EXL3_GGML_BRIDGE_MODEL_PATH=/data/sdb/models/qwen3.8-flash-next/exl3_3bpw
+export MOESTREAM_EXL3_GGML_BRIDGE_LAYER=3
+```
+
+This hook is intended for full-graph bring-up and memory validation; all-layer
+payload residency, recurrent-state handoff, and production config dispatch are
+still pending.
+Bridge payload allocation is fail-closed when a layer would consume more than
+90% of currently free VRAM, preventing an all-layer experiment from turning
+an expected capacity miss into a process-wide CUDA OOM.
+
+The same hook can be configured directly in TOML:
+
+```toml
+exl3_ggml_bridge_model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
+exl3_ggml_bridge_layer = 3
+exl3_gpu_cache_gb = 8.0
+# Or replace the single layer with an explicit list:
+# exl3_ggml_bridge_layers = [3, 7, 11]
+```
+
+The bridge validates `exl3_gpu_cache_gb` in `(0, 1024]` and initializes one
+executor on the selected core GPU. Selected layers share a process-wide
+Safetensors tensor index, avoiding a full shard-header rescan per layer. The
+custom node keeps its activation and output on CUDA. For device-produced routes,
+it currently reads the small packed route table back to the host before loading
+cache misses. The FFN kernels are then enqueued asynchronously; a completion
+event keeps their expert-cache entries pinned and stream ordering protects the
+shared scratch buffers. The route-readback synchronization means the
+cache-backed path is not CUDA-graph-capture safe. If adapter capture is
+requested with this node, the
+adapter disables capture and uses eager dispatch rather than replaying stale
+expert pointers. The separate fixed-payload routed kernels described
+above can capture dynamic route-table contents, but do not represent this LRU
+cache integration.
+
+The earlier full-graph smoke runs below exercised a fixed opaque layer payload;
+they are historical evidence and do not verify this cache-backed implementation.
+The current cache-backed benchmark loads selected Safetensors experts lazily,
+alternates between two routed-expert sets across replays, compares each FFN
+output against its CPU EXL3 reference, and checks the upload count:
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_cuda_cache_graph_bench -j4
+./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
+    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 8 0 2
+```
+
+The benchmark target builds, but the current cache-backed path still needs a
+longer, repeatable GPU run. A one-iteration smoke on GPU 0 with `rows=1` passed
+CPU parity (`max_abs_error=1.35333e-9`) and reported `avg_us=97.05`, 12 uploads,
+and 6 cache hits. The prescribed `rows=2`, 8-iteration run has not completed:
+CUDA device enumeration has been intermittent in this environment. Full-model
+EXL3 logit parity, end-to-end decode throughput, and CUDA graph capture of the
+LRU-backed node are not verified. Do not use the historical fixed-payload
+throughput numbers as the performance result for this implementation.
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_exl3_layer_bench -j4
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_exl3_layer_bench \
+    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 5 0 --capture
+```
+
+Run it with:
+
+```bash
+cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_router_ffn_bench -j4
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_router_ffn_bench \
+    /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 10 0 --capture
+```
+
+The follow-up `exl3_ggml_cuda_moe_bench` exercises 48 chained routed-FFN nodes
+with top-k=10, keeping opaque payloads and intermediates on CUDA. On
+2026-10-06 it measured **11.00 ms device time eagerly** (90.9 synthetic
+MoE-only steps/s) and **9.30 ms with CUDA graph capture** (107.5 synthetic
+MoE-only steps/s). The synthetic chain intentionally omits Qwen normalization,
+residual, attention, router, and KV-cache operations, and its random weights
+overflow after repeated layers; `non_finite` is therefore expected. These
+figures measure bridge dispatch and kernel work, not end-to-end model decode.
+Full Qwen EXL3 graph construction, logit parity, and decode benchmarking remain
+outstanding.
+
 ## Tests
 
 ```bash

@@ -1,0 +1,268 @@
+# Qwen3.8-Flash-Next (GGUF arch "qwen4exp"), UD-IQ1_M -- SINGLE-GPU (RTX 3090
+# only). DECODE-TUNED FORK of configs/qwen4exp_3090_only.toml.
+#
+# 2026-09-10: split off during a decode-regression investigation (user
+# reported 10 -> 1-2 tok/s). Root cause: the sibling config was deliberately
+# repointed at PREFILL benchmarking (see its own header/comments -- every
+# recent GPU fast path added there, moe_ggml_mul_mat_id/gdn_full_ggml/
+# hc_ggml/qwen4exp_gdn_conv_gpu/dense_bf16_prefill_gemm, is gated on S>1 and
+# structurally cannot touch decode's S==1 path -- confirmed in main.cpp:
+# "decode, S==1, always falls through to the legacy per-token loop below,
+# unconditionally"), while three decode-relevant knobs were left off/zeroed
+# in that file. Live-measured on this box with a trivial 1-token prompt
+# (deliberately avoiding the prefill path, which another session owns):
+# decode=2.30 tok/s, matching the user's reported regression almost exactly.
+# Breakdown: attn ~58% of decode wall (36/48 layers are GDN/recurrent;
+# attention_layer.cpp:1753 hard-dispatches S==1 to the sequential CPU
+# recurrence by design, matching llama.cpp's own n_tokens==1 rule -- NOT
+# fixable by more GPU work), expert ~27%, dense_gpu ~12%.
+#
+# This fork changes exactly the three knobs below relative to the prefill
+# sibling and otherwise inherits its tuning unchanged (including moe_cache_gb
+# = 17 and the prefill-only ggml graph flags, which stay on here too since
+# they don't hurt decode -- they just don't help it either). Everything else
+# in this file, including the prefill-focused comments retained below,
+# describes state inherited from that sibling, not independently re-verified
+# for decode.
+#
+# NOT a revert to a known-good git state -- this repo's only commit already
+# had these three knobs at their "regressed" values, so there is no tracked
+# pre-regression baseline for this exact file. The restored values instead
+# come from this project's own settled decode-tuning conclusions (see
+# memory: active-layer-worker-pool-corruption-bugs.md,
+# prefetch-pilot-k-8-decode-win.md) and, for pin_vram_lru_fraction, from the
+# dual-GPU sibling configs/qwen4exp_3090_5060.toml's own live value (0.1) --
+# picked over re-deriving a number from scratch since raising this fraction
+# on this exact config was already tried at 1.0 and reverted for a real,
+# measured 2x prefill regression (see the pin_vram_lru_fraction comment
+# below); 0.1 is the only other real precedent in this codebase, not a
+# freshly-guessed number, and has NOT itself been re-measured for decode on
+# this exact file.
+#
+# VRAM budget (24 GB, role="dense+moe", all on device 0). VERIFIED ON REAL
+# HARDWARE not to OOM (0 "grow ... failed" lines, 2 real runs): a 2824-token
+# synthetic prefill landed at 20.43-... s, 138.2 tok/s -- see this file's
+# own settled numbers below once measured further.
+#   dense_gb=4.1 (this model's real dense-tensor requirement, per the
+#   startup [CONFIG] warning -- NOT the dual config's stale 6.3) +
+#   kv_cache_gb=2.0 (moved here from the dual config's GPU 1) + ~4.5 GB
+#   reserved for the ggml MUL_MAT_ID/HC graphs (moe_ggml_device=0 targets
+#   THIS device, same as the dual config's GPU 0) + moe_cache_gb=11.5 (down
+#   from the dual config's COMBINED 18.0+7.0=25.0 across two cards -- this
+#   is the real cost of one GPU instead of two: expert cache coverage drops
+#   accordingly, so DECODE throughput on this config will be materially
+#   worse than the dual-GPU one. This config is for PREFILL comparison;
+#   re-tune moe_cache_gb if decode is also measured here.
+#
+model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+
+log_path  = "debug_qwen4exp_3090only_decode_trace.log"
+log_level = "VERBOSE"
+trace_filter = "TRACE-ROUTER"
+
+context_size   = 2048
+max_new_tokens = 40
+temperature    = 0.0
+top_p          = 0.95
+enable_thinking = false
+
+# --- I/O ---------------------------------------------------------------
+# /data/sda is ntfs3 and this checkpoint has NOT been through
+# `gguf_tool pack` (no 4096-byte tensor alignment), so O_DIRECT/io_uring
+# are off for bring-up: one variable at a time. Revisit after correctness.
+direct_io  = false
+io_uring   = false
+# Expert slabs are copied into the explicit RAM tier during startup. Drop the
+# buffered source pages afterwards so the 75 GiB model is not duplicated in
+# the Linux page cache on top of those RAM slabs.
+drop_pages = true
+
+# --- Host RAM expert tier ---------------------------------------------
+# 60 GB (not the 108 GB GLM uses) because the 28.8 GB PLE table is mmap'd
+# with MADV_RANDOM on top of this -- its page cache competes for the same
+# 125 GB. See CLAUDE.md's zram/swap warning: pressure here collapses, it
+# does not degrade gracefully.
+host_ram_gb          = 100  # 12.0: if mmamp enabled
+ram_preload_all_experts = true
+# Persistent pinning is reused by the prefill GGML path for direct H2D. The
+# 45 GB cap is the measured safe aggregate cudaHostRegister size on this box.
+ram_pinned_budget_gb = 45.0
+expert_fetch_threads = 10
+omp_max_threads      = 12
+prefetch_worker_threads = 4
+
+# Model-specific usage/pin files. MUST NOT be .moestream_usage -- that one
+# is GLM-5.3's (75 layers vs this model's 48).
+#
+# 2026-09-10 (decode fork): switched from the "_480" files back to the
+# original (no-suffix) .moestream_usage_qwen4exp[_prefill]. The "_480"
+# files (used by the prefill sibling) were regenerated from a SINGLE
+# 480-token PREFILL run -- pure prefill routing data, zero real decode
+# traffic. This file (.moestream_usage_qwen4exp, 23967 layer/expert/count
+# rows across all 48 layers) was built from ~25 real prompts / 18723
+# DECODE pairs (see qwen4exp_3090_5060.toml's own header comment) -- the
+# genuinely decode-representative histogram pin_strategy=global_topn
+# needs to rank real decode hotness instead of prefill's. Using the wrong
+# file was silently defeating global_topn's whole purpose for this fork.
+pin_file           = ".moestream_usage_qwen4exp"
+prefill_pin_file   = ".moestream_usage_qwen4exp_prefill"
+freeze_usage_stats = true
+pin_topk_per_layer   = 1
+pinned_vram_capacity = 7680
+pin_threshold        = 6
+promote_hit_threshold = 6
+promote_h2d_threshold = 6
+
+ram_cache_layer_adaptive = false
+vram_evict_demote_to_ram = true
+prefetch_pilot_depth = 1
+prefetch_pilot_k     = 10  # MUST match expert_used_count (top-10). See header.
+prefill_warm_via_prefetcher = true
+
+use_active_layer_area = true
+active_layer_capacity = 128
+active_layer_promote_hit_threshold = 1
+# 2026-09-10 (decode fork): restored 0 -> 2. Memory
+# (active-layer-worker-pool-corruption-bugs.md) records the real
+# cudaHostRegister-race/NVRM-Xid-31 bugs behind this as fixed and this
+# setting as "live again" project-wide; the prefill sibling still has it at
+# 0 (all active-layer uploads issued inline, serializing decode-time misses
+# behind each H2D copy instead of overlapping them via the worker pool).
+active_layer_upload_worker_threads = 2
+decode_async_prewarm = true
+# 2026-09-10 (decode fork): restored false -> true. Memory
+# (prefetch-pilot-k-8-decode-win.md) records this as a settled decode win
+# once the real cause (an unpinned DMA source in
+# upload_expert_active_async, ~29.6% effective pinning coverage) was fixed
+# via ram_pinned_budget_gb (already 45 here) -- verified decode matching/
+# beating baseline with the full cache-hit gain kept. NOT independently
+# re-verified on this exact single-GPU file; re-measure before trusting the
+# number.
+speculative_promote_to_active_layer = true
+
+# moe_decode_batched: TRIED, REJECTED -- deliberately NOT set here (stays at
+# the engine default, false). VERIFIED ON REAL HARDWARE 2026-09-10: a real
+# ~41% DECODE REGRESSION for this model (5.03/4.97 tok/s baseline -> 2.93
+# tok/s with it on, see configs/qwen4exp_3090_only_decode_batched.toml and
+# dense_dispatch.hpp's own moe_decode_batched() accessor for the full
+# writeup). qwen4exp's routed experts (UD-IQ1_M) already have a fast GPU
+# kernel; forcing CPU dequant instead is strictly worse. Do not add this
+# flag here without re-measuring.
+
+# --- MLA-only GPU fast paths: qwen4exp is NOT an MLA family -----------
+attn_qabsorb_gpu = false
+attn_score_gpu   = false
+
+# --- startup preload -------------------------------------------------
+# Tier 1 = pin_topk_per_layer ranks      -> VRAM, pinned
+# Tier 2 = pin_vram_lru_fraction * slots -> VRAM, reactive LRU
+# Tier 3 = pin_ram_fraction * ram slots  -> host RAM preload
+# At host_ram_gb=95 the RAM tier holds ~495 of this model's 512 experts per
+# layer, so Tier 3 at 0.9 stages nearly the whole 77 GB expert set up front.
+# Measured effect: cache 31% -> 100% hit, disk 1.07s -> 0.00s per request.
+#
+# These MUST stay ABOVE the first
+# --- prefill expert source (2026-09-06) -----------------------------------
+# MUST stay ABOVE the first [[gpus]] header: everything after a [[table]]
+# header belongs to that table, and a root key placed below it is silently
+# parsed as a GPU field (this project's own documented TOML trap).
+#
+# Keep the MoE source in the host RAM tier. The GGML CUDA path copies
+# resident slabs into its pinned staging buffers and then queues batched H2D
+# transfers; it does not need whole-shard mmap. Set true only for the legacy
+# mmap streaming path.
+moe_prefill_stream = false
+# Experts staged per chunk. Swept on real hardware: 16 -> 11.51s,
+# 24 -> 11.33s, 32 -> 11.29s, 64 -> 11.64s, 128 -> 12.19s. Smaller chunks
+# pipeline more finely; below ~24 per-chunk overhead starts to win again.
+moe_prefill_stream_chunk = 32
+# Routed-expert GEMMs through dequant->BF16 + cuBLAS instead of the fused
+# GEMV-shaped kernel (whose (O,S) grid re-reads the whole weight per token
+# row). Per-expert GPU time 0.369 -> 0.133 ms. NOTE: this is a genuine
+# precision change -- BF16's ~8 mantissa bits can flip a close greedy
+# argmax, so generated text is coherent but not token-identical to the
+# fused path. Turn off if you need bit-comparability.
+moe_expert_bf16_gemm = true
+
+# --- ggml MUL_MAT_ID routed-expert FFN (EXPERIMENTAL) -------------------
+# Inherited unchanged from the prefill sibling. This graph only ever
+# handles S>1 prefill (decode's S==1 path always falls through to the
+# legacy per-token dispatch below, which is what the three knobs above
+# actually affect) -- kept ON here because it does not cost decode
+# anything by being enabled, not because it helps decode.
+# Needs a build with -DMOESTREAM_USE_GGML_CUDA=ON.
+moe_ggml_mul_mat_id = true
+moe_ggml_shared_expert = true
+moe_ggml_device     = 0
+moe_ggml_gpu_router = true
+ggml_async_graph_reuse = true
+
+hc_ggml             = true
+gdn_proj_ggml       = true
+gdn_full_ggml = true
+
+# MUST stay ABOVE the first [[gpus]] header. In TOML everything after
+# a [[table]] header belongs to that table, so a root key appended at the
+# END of this file is silently swallowed by gpus[1] and never read --
+# CLAUDE.md documents that exact trap costing real wasted A/B runs.
+pin_strategy = "global_topn"
+pin_global_floor_per_layer = 1
+# vram_preload_prefix_layers: DELIBERATELY DROPPED for this decode fork
+# (2026-09-10) -- inherited from the prefill sibling at first, but it's a
+# prefill-only mechanism (fills VRAM in ascending layer order, ignoring
+# real hotness) that was found DOMINATING the pin allocation: with it set
+# to 15, real startup logs showed ALL 3120 pinned slots going to layers
+# 0-14 (208 each, ascending order) and layers 15-47 (69% of the model)
+# getting 0-5 pins each -- global_topn's own hotness ranking never got to
+# run across the full model. Decode touches every layer every token, so
+# there's no reason to concentrate pins in the first 15 -- removing this
+# lets global_topn rank and pin the real hottest experts (per the
+# corrected pin_file above) across all 48 layers instead.
+# 2026-09-10 (decode fork): restored 0.0 -> 0.1 / 1.0 -> 0.9, matching the
+# dual-GPU sibling configs/qwen4exp_3090_5060.toml's own live values --
+# the only real precedent in this codebase, not a freshly-guessed number.
+# The prefill sibling's 0.0 exists because raising this to 1.0 on THAT file
+# caused a real, measured 2x prefill regression (RAM/VRAM tier preload used
+# to share one sequential candidate list per layer -- see that file's own
+# comment). That specific sharing bug was independently fixed the same day
+# (main.cpp's `ram_start_i` change, now unconditional), which may make a
+# higher fraction safe again, but 1.0 has not been re-tried since the fix
+# and touching prefill preload behavior is out of scope for this decode
+# fork -- 0.1 is a conservative middle ground, not a re-verified value.
+pin_vram_lru_fraction = 0.1
+pin_ram_fraction = 0.9
+
+# --- Prefill fast paths (2026-09-04) --------------------------------------
+# Inherited unchanged from the prefill sibling -- prefill-only, no decode
+# effect either way.
+moe_prefill_batched = true
+dense_bf16_prefill_gemm = true
+dense_bf16_kquant = true
+qwen4exp_attn_gpu = true
+qwen4exp_gdn_gpu = true
+qwen4exp_gdn_conv_gpu = true
+moe_gpu_accum = true
+expert_gpu_activation = true
+
+# --- Memory safety (added 2026-09-05) -------------------------------------
+mem_guard          = true
+mem_guard_warn_mb  = 16384  # log a warning below this
+mem_guard_stop_mb  = 10240  # refuse new host allocations below this low-water mark
+mem_guard_poll_ms  = 500
+
+vram_min_free_mb   = 256
+
+[[gpus]]
+device_id    = 0
+name         = "NVIDIA GeForce RTX 3090"
+role         = "dense+moe"
+vram_gb      = 24.0
+dense_gb     = 4.1
+kv_cache_gb  = 2.0
+kv_bits      = 4
+# This cache matters for DECODE (not prefill, which moe_ggml_mul_mat_id
+# bypasses): a bigger VRAM-resident expert set here means fewer decode-time
+# RAM-tier fetches. Inherited unchanged (17 GB) from the prefill sibling;
+# not re-tuned as part of this fork -- a real next step if decode is still
+# cache-constrained after the three knobs above, but out of scope here.
+moe_cache_gb = 17

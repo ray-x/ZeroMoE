@@ -33,6 +33,8 @@ int main() {
   timing.h2d_ms = 0.2;
   timing.gpu_compute_ms = 0.4;
   timing.storage_ms = completion->queue_ms + completion->service_ms;
+  timing.cpu_ready = true;
+  timing.staged_ready = true;
   timing.storage_required = true;
   const AdaptiveDecision decision = choose_adaptive_target(timing);
   assert(decision.target == AdaptiveTarget::StagedGpu);

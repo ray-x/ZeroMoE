@@ -38,6 +38,39 @@ The CUDA API review is recorded in
 priority mechanism, retains GGML-owned stream capture, defers graph memory
 nodes and TMA, and distinguishes captured external events from host callbacks.
 
+## 2026-10-06 staged-completion investigation
+
+The current uncommitted graph source now reserves the payload-backed staged
+child's additional `topk` expert planes in `device_expert_bytes()`. Before this
+reservation, the historical staged commits reached construction with an arena
+capacity error: the completion child needed about 4.6 MiB beyond the planned
+partial arena. After the reservation, the RTX 3090 run reaches
+`QWEN4EXP-COMPLETION-STAGED`, publishes a Ready payload, builds the resident /
+staged conditional parent, and exercises mixed and all-staged route modes
+without `ARENA-BIND-FAIL`.
+
+The parity blocker is separate from payload unpacking. A bounded four-token
+run with the current staged environment produces `8160, 8160, 271, 271`, while
+the full-graph control produces `8160, 369, 264, 4145`. Forcing the same
+phase-2 continuation through the CPU suffix produces the same mismatch, so the
+staged GPU child is not the first fault. The phase-2 / prefix handoff remains
+experimental and is not eligible for the production scheduler. The accepted
+early-ready path remains the default.
+
+The source now publishes Route-graph normalized weights and has explicit
+publication buffers for the Prefix/Route HC input and inject values. These
+changes are guarded by the phase-2 flags and are retained for the next state
+handoff probe; the runtime parity gate is still failing. `make test-components`
+passes all 44 tests and the CUDA engine target builds successfully after the
+allocator/publication changes.
+
+The opt-in `MOESTREAM_QWEN4EXP_PHASE2_STATE_TRACE=1` probe hashes recurrent and
+KV storage after each synchronized replay. It first exposed post-split GDN
+state writes stuck at their initial value; explicit phase-2 state terminals and
+host mirrors now make those source and destination hashes change. The phase-2
+path still diverges at the first continuation token, so the remaining fault is
+the split-layer HC/route continuation output rather than staged payload upload.
+
 ## Original graph-tier requirements: current audit
 
 | Requirement | Status and evidence |
@@ -47,8 +80,21 @@ nodes and TMA, and distinguishes captured external events from host callbacks.
 | A/B partial graph against accepted early-ready | **A/B completed; candidate rejected.** After fixing both the per-token weight transfer and activation dependency, the corrected six-pair decode comparison measured 34.05 tok/s for early-ready and 26.70 tok/s for the partial callback: −21.61% mean paired gain, 0/6 wins. The 64-step correctness gate is byte-identical, generated tokens match in all six pairs, and all 63 partial callbacks per run succeeded. See `logs/option_b_partial_layer13_activation_fix_perf_tty/results.json`. |
 | SSD dispatch/completion with ready/error generations | Host-only bounded `StorageService` has model/request generations, explicit Ready/Error, stale-handle rejection, timing, shared payload ownership, atomic `wait_consume`, and a completion submitter hook. The opt-in Qwen owner reads expert planes with `pread` from model shards (SSD→host; no GDS), and the completion graph uploads a stable payload. The staged suffix now consumes that payload through the conditional graph; RTX runtime validation is still pending. |
 | Shared shape-class staging pools | Layers sharing top-k, tensor shapes and quant types share a worker service. GPU expert storage, metadata and DMA banks remain per layer for consumer lifetime safety. A shared GPU slot arena is not implemented. |
-| Adaptive CPU versus staged-GPU selection | The timing policy is now wired behind `MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1`. It warms four CPU suffix samples, then compares measured CPU queue/compute against storage queue/service, completion upload wait, and staged continuation time. It remains opt-in and has not yet had an RTX runtime A/B. |
+| Adaptive CPU versus staged-GPU selection | The opt-in policy warms four measured CPU-suffix executions, then forces one staged calibration sample. Later decisions happen before storage submission, so a CPU choice skips the SSD read. Inputs use storage queue/service timings, CUDA-event H2D duration, device-event conditional-graph execution, measured tail execution, and host dispatch/payload-preparation time. CPU execution is synchronous with no separate request queue, so its measured queue component is zero and the complete suffix latency is recorded as execution. Runtime A/B and logits parity remain pending. |
 | Full-graph-only policy | Qwen graph prefill/decode now default on and an enabled Qwen graph failure aborts the request rather than entering layered execution. The native suite passes (`logs/fullgraph_only_policy_final_native.log`). **The all-family migration is incomplete:** GLM5NEXT and DeepSeek-V4 have partial graph adapters, and other families still use the layered path. |
+
+The cold-route host callback previously called `RouteClassification::exact_once()`,
+which allocated a temporary `seen` vector once per replay despite the
+allocation-free callback contract. The classifier stores its immutable records
+in original route-slot order, so `exact_once()` now validates slot `i` at
+position `i` in O(top-k) time without scratch allocation. The focused route
+test counts global allocations around the reserved classify/validate/project
+sequence and covers all-hot, all-cold, mixed and duplicate-route cases. It is
+now run by `make test-components` in all three negative-route capability
+modes. That CPU target also compiles and runs the storage-generation,
+staged-boundary and adaptive-policy tests, plus the shared shape-class pool
+test when CUDA/GGML headers are available. The latest `make test-components`
+run passed all 44 existing component tests and each focused graph-tier test.
 
 The latest VRAM handoff changes the performance baseline for placement work.
 It reports 14.5k globally selected experts across 48 layers at about 39 tok/s
@@ -455,13 +501,20 @@ and a separate generation-tagged `error=1 error_code=404` record in
 `logs/qwen4exp_q2_0_option_b_split44_x0_cov80.log`.
 
 `include/qwen4exp_adaptive_policy.hpp` contains the opt-in decision rule. With
-`MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1`, four CPU suffix samples seed a measured
-baseline, then the runtime compares CPU queue/compute with storage queue/service,
-completion upload wait and staged continuation time. A pending or invalid
-staging/storage estimate falls back to CPU. The policy and the host-only
-storage/staged-boundary simulation are covered by focused tests; an RTX
-runtime A/B and logits-parity result for the new staged route are still
-required.
+`MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1`, four CPU suffix executions seed the
+baseline. The first staged route is then run as a calibration sample; later
+decisions use those measurements before submitting storage work, so choosing
+CPU skips that request's SSD read. Storage queue/service come from the matching
+generation-tagged completion. H2D duration now comes from CUDA events around the
+captured upload, while the prior wall-clock `upload_wait_ms()` is retained only
+as submit-to-observation latency. Device events time the resident/staged
+conditional graph; a separate suffix replay measures the tail; host payload
+preparation and graph-dispatch overhead are recorded separately. CPU suffix
+execution is synchronous in GGML's backend, so its measured queue component is
+zero and its complete replay duration is used as execution cost. Invalid or
+unmeasured targets fail closed to CPU. Focused CPU tests cover unavailable
+samples and each cost component; an RTX runtime A/B and logits-parity result are
+still required.
 
 The shared stage worker now exposes queue/run aggregates and each pool reports
 completed DMA time. These are diagnostic inputs for the opt-in policy; the
@@ -471,6 +524,132 @@ The worker topology is now a shape-class registry: layers with matching
 `topk`, projection dimensions and quantization types share one worker service;
 layers with different shapes get separate services. Weight arenas, bounce
 banks and epoch metadata remain per layer to preserve consumer lifetimes.
+
+## Experimental staged-graph memory telemetry
+
+The staged graph now has an opt-in memory trace controlled by
+`MOESTREAM_QWEN4EXP_MEMORY_TRACE=1`. It records CUDA free/total VRAM,
+`MemAvailable`, process RSS/peak RSS, cgroup memory usage, graph-construction
+mode, storage completion, completion-graph submission, conditional graph
+instantiation and graph launch. CUDA allocation, graph-instantiation and
+graph-launch failures are tagged with a separate memory/OOM record. The trace
+is disabled by default and does not alter the accepted early-ready scheduler.
+
+The first post-reboot two-token diagnostic used the checked-in Q2_0 Option-B
+profile with the staged flags and the known finite fallback overrides. It
+completed without a driver reset or OOM: VRAM stayed above 7.67 GiB free at
+conditional launch, host `MemAvailable` stayed above 84 GiB, the 13.8 MB
+payload upload reached `Pending`, and route mode 3 executed. This is a memory
+stability smoke result, not a staged-vs-early-ready correctness or throughput
+result. The experimental path remains uncommitted pending logits parity.
+
+The first post-instrumentation bootstrap caught and fixed a classifier shape
+error: the raw `[hidden, HC]` residual was passed directly to the router,
+which expects the HC-mixed `[hidden]` shape. The corrected bootstrap now builds
+Prefix, Route, resident, staged and tail graphs with no GGML assertion. A full
+token replay remains gated until the staged route has a fresh parity result.
+
+A subsequent two-token replay completed with finite logits and route mode 3
+(mixed resident/staged). The trace reported RSS 36.8--37.5 GiB, peak RSS
+108.3 GiB, `MemAvailable` above 83.4 GiB and VRAM free above 7.67 GiB at the
+conditional launch. No OOM marker, CUDA error or hidden-state corruption was
+reported. This validates memory stability and graph execution only; it is not
+yet logits parity or a throughput acceptance result.
+
+## 2026-10-06 route-boundary investigation
+
+The clean bounded teacher-forced comparison used one 64-token repetition with
+all graph diagnostics disabled. The validated early-ready arm measured 32.40
+tok/s. The experimental staged arm measured 12.85 tok/s, and the logits were
+not identical (top-1 agreement 1.6%; first disagreement at decode step 1).
+The staged log proves Ready completion plus mixed/pure staged conditional
+dispatch, so this is a real correctness failure before any performance tuning;
+the production early-ready path remains the reference and the staged flags
+remain opt-in. An earlier 31.04/12.74 comparison used debug graph snapshots
+and is retained only as historical diagnosis.
+
+A control with the partial-layer planner enabled but Phase-2 disabled previously
+attempted to allocate an additional 10.9 GiB compact arena and hit CUDA OOM
+during graph setup. A pre-allocation admission guard now measures free VRAM
+against the compact-arena estimate plus a 768 MiB margin; the reproduced case
+now declines cleanly at 8.95 GiB free (`need=10.92 GiB`) before `cudaMalloc`
+and aborts the experimental request without a driver fault. The risky
+allocation can be explicitly forced for diagnosis with
+`MOESTREAM_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC=1`.
+
+The diagnostic then compared the same Prefix/Route handoff with a debug CPU
+suffix. The CPU suffix produced the same wrong next token as the staged path,
+so payload unpack and resident/staged merge are not the first failure. An
+ordinary full-graph control, with the same model and prompt and without
+Phase-2, produced the expected step-1 token (`369`). The isolated Route graph
+received a finite Layer-13 HC input, but its route IDs differed from the
+ordinary control (`[195,329,118,128,420,412,220,367,481,472]` versus the
+control route `[273,50,385,387,35,347,93,286,6,423]`). The Prefix route-output
+tensor itself was stale (`[0..9]` and zero probabilities), so it is not a
+valid classifier source. The Route graph is currently used as the staged
+classifier, while the stale Prefix output keeps the non-staged Phase-2 branch
+unvalidated.
+
+The Prefix handoff was finite (min `-2.058`, max `1.276`), and memory telemetry
+still showed about 7.67 GiB free VRAM, about 85 GiB `MemAvailable`, RSS around
+37.5 GiB and peak RSS around 108.3 GiB. No OOM, CUDA error, or hidden-state
+corruption marker appeared. The remaining correctness issue is therefore a
+split-boundary graph/state mismatch, observed before staged payload execution;
+no performance conclusion should be drawn from the 12.74 tok/s run. The route
+dependency chain is present and assigned to CUDA in Prefix (softmax → argsort
+→ view → contiguous), so the failure is deeper than a missing backend
+assignment. Prefix's captured HC classifier snapshots are zero while Route
+recomputation from the same residual handoff is finite; an opt-in attempt to
+omit the duplicate Prefix classifier was unsafe during bootstrap and was
+reverted.
+
+The investigation also fixed two lifecycle errors: the isolated Route graph
+now receives the per-token input handoff and its PLE embedding is refreshed
+with the other Phase-2 graphs. The generic F32 diagnostic snapshot now sizes
+its destination by element count, avoids under-allocation for BF16/F16 sources,
+and marks its copy nodes as graph outputs so allocator reuse cannot leave an
+uninitialized trace. These fixes are covered by a successful source build and
+the 44/44 CPU component tests, but a fresh logits-parity run is still required.
+
+The CPU continuation now has an explicit host-visible handoff: Prefix performs
+a D2H copy into the SuffixCpu input before replay, and that leaf is assigned to
+the CPU backend. The bounded smoke confirms the host handoff is finite, but
+the CPU HC result still does not match the ordinary full graph, so this tier is
+not accepted yet.
+
+The latest source inspection found a concrete lifetime hazard in the Prefix
+handoff refresh. The graph copies the residual into a separately allocated,
+persistent `handoff_out`, but after replay the host also copied from
+`prefix.final_streams` into that buffer. `final_streams` is an intermediate
+graph tensor; its allocator lifetime ends at its last graph consumer, so
+reading it after replay can observe storage reused by other graph outputs.
+This is a plausible cause of the split-boundary mismatch, not yet a proven
+sole cause. The diagnostic now marks the persistent destination as an output,
+removes an extra source-residual output that produced all-NaN probes, and adds
+`MOESTREAM_QWEN4EXP_P2_GRAPH_HANDOFF_ONLY=1` to test the graph-written buffer
+without the post-replay overwrite. A read-only pre-refresh dump is enabled by
+`MOESTREAM_QWEN4EXP_STAGED_DEBUG=1`. The modified graph translation unit
+compiles successfully. The current full target now also builds successfully:
+`cmake --build build_ggmlcuda -j2 --target moestream`. No new inference run has
+been made, so handoff parity remains unverified; the early-ready scheduler
+remains the default.
+
+The first guarded graph-handoff-only probe used a temporary binary linked from
+the updated graph object and cached objects. It stopped at `[MEM-GUARD] cache
+initialization exceeded the process host budget` before phase-2 graph setup and
+then exited with status `-11`. Host `MemAvailable` remained above 120 GiB and
+VRAM was initially 23.3 GiB free, so this was not a Linux OOM or measured CUDA
+allocation failure. The mixed-object probe is not correctness evidence. The
+full target now builds, but subsequent idle `nvidia-smi` checks have
+intermittently failed to contact the driver; no inference was retried. The next
+parity check must use the consistent `build_ggmlcuda/moestream` binary and the
+previously successful bounded Phase-2 configuration after driver health is
+stable.
+
+The storage-service unit test also covers a full bounded queue, rejection of a
+second request, and safe reuse of the freed slot under a new request
+generation. The test passes alongside the existing Ready/Error, stale-handle,
+exception, and payload-shape cases.
 
 ## Scope and reproducibility
 
@@ -493,3 +672,28 @@ The patch filename retains its historical Layer-13 name; the scheduler hook
 now supports all eligible split layers. The commit does not include generated
 logs, build directories, unrelated README changes, or unrelated ExLlamaV3 and
 native-test edits. Those files remain in the worktree for their owners.
+
+## 2026-10-07 update: staged-arena alias fixed
+
+The staged child previously followed only one `phase2_expert_source_graph`
+edge when allocating expert tensors. When Prefix borrowed the retained decode
+arena, a later staged child borrowed from Prefix and allocated with Prefix's
+reset bump cursor. Its 4.6 MiB staged up tensor landed inside the 91.2 MiB
+Layer-3 Option-B up tensor. This matched the 174/198 resident-plane corruption
+observed after Prefix replay and the staged decode's first-token divergence.
+
+`phase2_bind_or_allocate_expert()` and named expert lookups now resolve the
+full source chain to the true buffer owner before looking up or allocating an
+address. Two bounded teacher-forced runs verified the fix: all 198 resident
+planes remained byte-identical after Prefix, and the staged conditional path
+consumed a Ready payload on four consecutive decode steps. The five generated
+tokens matched the early-ready reference (`8160, 369, 264, 4145, 15673`); the
+five-step top-1 comparison was 100% with mean KL `0.000382`. No OOM kill or
+NVIDIA Xid was observed. Logs and resource samples are retained under
+`logs/phase2_layer3_up_weight_verify_20261007/run19_kernel_param_scan/`,
+`run20_forced_cold_stage/`, and `run21_forced_cold_stage_5tokens/`.
+
+This is a correctness result, not a throughput acceptance run. The staged
+path remains opt-in and early-ready remains the default. Next: run a
+representative paired performance comparison, then exercise the bounded CPU
+callback and mixed resident/staged routing cases before considering adoption.

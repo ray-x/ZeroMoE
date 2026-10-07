@@ -18,6 +18,9 @@
 // Forward declaration to break the include cycle with cpu_model_backend.hpp.
 class CPUModelBackend;
 class Exl3GpuExecutor;
+class Exl3GgmlRoutedFfnGraph;
+class Exl3GgmlDenseMatmulGraph;
+class Exl3GgmlCpuRoutedFfnGraph;
 class Exl3NgramReader;
 class Exl3CpuMatrixCache;
 
@@ -204,6 +207,16 @@ struct CPUEngine {
   std::unordered_map<std::string, std::string> exl3_raw_names;
   std::shared_ptr<Exl3GpuExecutor> exl3_gpu;
   std::shared_ptr<Exl3GpuExecutor> exl3_gpu_secondary;
+#if defined(MOESTREAM_USE_GGML_CUDA)
+  std::unordered_map<int, std::shared_ptr<Exl3GgmlRoutedFfnGraph>>
+      exl3_ggml_gpu_graphs;
+  std::unordered_map<int, std::shared_ptr<Exl3GgmlRoutedFfnGraph>>
+      exl3_ggml_gpu_secondary_graphs;
+  std::unordered_map<std::string, std::shared_ptr<Exl3GgmlDenseMatmulGraph>>
+      exl3_ggml_dense_graphs;
+  std::unordered_map<int, std::shared_ptr<Exl3GgmlCpuRoutedFfnGraph>>
+      exl3_ggml_cpu_graphs;
+#endif
   std::shared_ptr<Exl3NgramReader> exl3_ngram;
   std::shared_ptr<Exl3CpuMatrixCache> exl3_cpu_matrix_cache;
   int exl3_gpu_expert_layer_begin = 0;
@@ -234,8 +247,14 @@ struct CPUEngine {
   bool exl3_expert(int layer, int expert, const float *input, float *output);
   bool exl3_cpu_routed_ffn(int layer, const int *experts, const float *weights,
                            int count, const float *input, float *output);
+  bool exl3_cpu_routed_ffn_batch(int layer, const int *experts,
+                                 const float *weights, int rows,
+                                 const float *input, float *output);
   bool exl3_routed_ffn(int layer, const int *experts, const float *weights, int count,
                        const float *input, float *output);
+  bool exl3_routed_ffn_batch(int layer, const int *experts,
+                             const float *weights, int rows,
+                             const float *input, float *output);
   bool exl3_ngram_row(int head, int64_t row, float *output, int dimensions);
 
   // Alternate build path for .safetensors exports. Parses the file, creates the

@@ -9,6 +9,7 @@
 #include "cuda_manager.hpp"
 #include "kquant_dequant.hpp"
 #include "engine_config.hpp"
+#include "exl3_cpu.hpp"
 #include "exl3_cuda.hpp"
 #include "exl3_gpu.hpp"
 #include "cuda_kernel_dispatcher.hpp"
@@ -29,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <unordered_map>
 #include <omp.h>
 #ifdef __linux__
 #include <sys/mman.h>
@@ -6435,6 +6437,198 @@ bool test_exl3_gpu_hc(int device) {
     return rejected;
 }
 
+bool test_exl3_gpu_routed_device_async(int device) {
+    std::cout << "[Test] EXL3 asynchronous routed cache and shared scratch...\n";
+    constexpr int hidden = 128;
+    constexpr int intermediate = 128;
+    constexpr int bits = 4;
+    std::mt19937 random(90210);
+    std::uniform_real_distribution<float> distribution(-0.4f, 0.4f);
+    std::unordered_map<std::string, std::vector<uint8_t>> packed_matrices;
+    for (int expert = 0; expert < 3; ++expert) {
+        for (int projection = 0; projection < 3; ++projection) {
+            std::vector<uint16_t> trellis(8 * 8 * 16 * bits);
+            std::vector<uint16_t> suh(hidden), svh(intermediate);
+            for (uint16_t &word : trellis)
+                word = static_cast<uint16_t>(random());
+            for (uint16_t &value : suh)
+                value = fp32_to_fp16(distribution(random));
+            for (uint16_t &value : svh)
+                value = fp32_to_fp16(distribution(random));
+            Exl3Mul1MatrixView matrix{trellis.data(), suh.data(), svh.data(),
+                                      nullptr, hidden, intermediate, bits};
+            packed_matrices.emplace(
+                "model.language_model.layers.0.mlp.experts." +
+                    std::to_string(expert) + "." +
+                    (projection == 0 ? "gate_proj" :
+                     projection == 1 ? "up_proj" : "down_proj"),
+                exl3_mul1_pack_matrix(matrix));
+        }
+    }
+    const size_t matrix_bytes = packed_matrices.begin()->second.size();
+    for (const auto &[key, matrix] : packed_matrices)
+        if (matrix.size() != matrix_bytes)
+            return false;
+
+    const auto load = [&](const std::string &key) {
+        const auto found = packed_matrices.find(key);
+        if (found == packed_matrices.end())
+            throw std::runtime_error("missing async EXL3 matrix: " + key);
+        return found->second;
+    };
+    const auto reference = [&](const std::vector<int32_t> &route_ids,
+                               const std::vector<float> &route_weights,
+                               const std::vector<float> &input,
+                               std::vector<float> &output) {
+        output.assign(hidden, 0.0f);
+        for (size_t route = 0; route < route_ids.size(); ++route) {
+            const std::string prefix =
+                "model.language_model.layers.0.mlp.experts." +
+                std::to_string(route_ids[route]) + ".";
+            const auto gate = load(prefix + "gate_proj");
+            const auto up = load(prefix + "up_proj");
+            const auto down = load(prefix + "down_proj");
+            std::vector<float> gate_value(intermediate), up_value(intermediate);
+            std::vector<float> activation(intermediate), expert_output(hidden);
+            if (!exl3_mul1_matmul_packed(gate.data(), input.data(),
+                                        gate_value.data(), 1, hidden,
+                                        intermediate) ||
+                !exl3_mul1_matmul_packed(up.data(), input.data(),
+                                         up_value.data(), 1, hidden,
+                                         intermediate))
+                return false;
+            for (int index = 0; index < intermediate; ++index)
+                activation[index] = gate_value[index] /
+                    (1.0f + std::exp(-gate_value[index])) * up_value[index];
+            if (!exl3_mul1_matmul_packed(down.data(), activation.data(),
+                                        expert_output.data(), 1,
+                                        intermediate, hidden))
+                return false;
+            for (int index = 0; index < hidden; ++index)
+                output[index] += route_weights[route] * expert_output[index];
+        }
+        return true;
+    };
+    const auto close = [](const std::vector<float> &actual,
+                          const std::vector<float> &expected) {
+        double error = 0.0;
+        double energy = 0.0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            if (!std::isfinite(actual[index]))
+                return false;
+            const double difference = actual[index] - expected[index];
+            error += difference * difference;
+            energy += static_cast<double>(expected[index]) * expected[index];
+        }
+        return std::sqrt(error / std::max(energy, 1e-20)) < 1e-4;
+    };
+
+    struct DeviceResources {
+        cudaStream_t streams[2] = {};
+        float *inputs[3] = {};
+        float *outputs[3] = {};
+        ~DeviceResources() {
+            for (cudaStream_t stream : streams)
+                if (stream)
+                    cudaStreamSynchronize(stream);
+            for (float *pointer : inputs)
+                if (pointer)
+                    cudaFree(pointer);
+            for (float *pointer : outputs)
+                if (pointer)
+                    cudaFree(pointer);
+            for (cudaStream_t stream : streams)
+                if (stream)
+                    cudaStreamDestroy(stream);
+        }
+    } device_resources;
+
+    try {
+        if (cudaSetDevice(device) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&device_resources.streams[0],
+                                      cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&device_resources.streams[1],
+                                      cudaStreamNonBlocking) != cudaSuccess)
+            return false;
+        std::vector<std::vector<float>> host_inputs(3,
+                                                    std::vector<float>(hidden));
+        for (auto &input : host_inputs)
+            for (float &value : input)
+                value = distribution(random);
+        for (int index = 0; index < 3; ++index)
+            if (cudaMalloc(&device_resources.inputs[index],
+                           hidden * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&device_resources.outputs[index],
+                           hidden * sizeof(float)) != cudaSuccess)
+                return false;
+        if (cudaMemcpyAsync(device_resources.inputs[0], host_inputs[0].data(),
+                            hidden * sizeof(float), cudaMemcpyHostToDevice,
+                            device_resources.streams[0]) != cudaSuccess ||
+            cudaMemcpyAsync(device_resources.inputs[1], host_inputs[1].data(),
+                            hidden * sizeof(float), cudaMemcpyHostToDevice,
+                            device_resources.streams[1]) != cudaSuccess ||
+            cudaMemcpyAsync(device_resources.inputs[2], host_inputs[2].data(),
+                            hidden * sizeof(float), cudaMemcpyHostToDevice,
+                            device_resources.streams[0]) != cudaSuccess)
+            return false;
+
+        const std::vector<std::string> prefixes = {
+            "model.language_model.layers.0.mlp.experts.0.",
+            "model.language_model.layers.0.mlp.experts.1.",
+            "model.language_model.layers.0.mlp.experts.2."};
+        const std::vector<int32_t> routes_a = {0, 1};
+        const std::vector<float> weights_a = {0.3f, 0.7f};
+        const std::vector<int32_t> routes_b = {1, 0};
+        const std::vector<float> weights_b = {0.6f, 0.4f};
+        const std::vector<int32_t> routes_c = {2};
+        const std::vector<float> weights_c = {1.0f};
+        std::vector<float> expected_a, expected_b, expected_c;
+        if (!reference(routes_a, weights_a, host_inputs[0], expected_a) ||
+            !reference(routes_b, weights_b, host_inputs[1], expected_b) ||
+            !reference(routes_c, weights_c, host_inputs[2], expected_c))
+            return false;
+
+        Exl3GpuExecutor executor(device, 6 * matrix_bytes);
+        executor.routed_ffn_device(
+            prefixes, routes_a.data(), weights_a.data(),
+            device_resources.inputs[0], device_resources.outputs[0], 1, 2,
+            hidden, intermediate, device_resources.streams[0], false, load);
+        executor.routed_ffn_device(
+            prefixes, routes_b.data(), weights_b.data(),
+            device_resources.inputs[1], device_resources.outputs[1], 1, 2,
+            hidden, intermediate, device_resources.streams[1], false, load);
+        executor.routed_ffn_device(
+            prefixes, routes_c.data(), weights_c.data(),
+            device_resources.inputs[2], device_resources.outputs[2], 1, 1,
+            hidden, intermediate, device_resources.streams[0], false, load);
+        if (cudaStreamSynchronize(device_resources.streams[0]) != cudaSuccess ||
+            cudaStreamSynchronize(device_resources.streams[1]) != cudaSuccess)
+            return false;
+        std::vector<float> actual_a(hidden), actual_b(hidden), actual_c(hidden);
+        if (cudaMemcpy(actual_a.data(), device_resources.outputs[0],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(actual_b.data(), device_resources.outputs[1],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(actual_c.data(), device_resources.outputs[2],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+        const Exl3GpuStats stats = executor.stats();
+        const bool passed = close(actual_a, expected_a) &&
+                            close(actual_b, expected_b) &&
+                            close(actual_c, expected_c) &&
+                            stats.routed_ffns == 3 && stats.matmuls == 15 &&
+                            stats.uploads == 9 && stats.evictions == 3 &&
+                            stats.resident_bytes <= 6 * matrix_bytes;
+        std::cout << "  device=" << device << " async routed cache and "
+                  << "cross-stream scratch "
+                  << (passed ? "PASSED" : "FAILED") << "\n";
+        return passed;
+    } catch (const std::exception &error) {
+        std::cerr << "  async routed cache error: " << error.what() << "\n";
+        return false;
+    }
+}
+
 bool test_exl3_cuda_kernels() {
     std::cout << "[Test] EXL3 CUDA matmul/reconstruction/cache...\n";
     int device_count = 0;
@@ -6640,6 +6834,7 @@ bool test_exl3_cuda_kernels() {
         if (!rejected || dense_executor.stats().evictions != 0) return false;
         std::cout << "  device=" << device << " F32 dispatch and pinned-cache budget PASSED\n";
         if (!test_exl3_gpu_hc(device)) return false;
+        if (!test_exl3_gpu_routed_device_async(device)) return false;
     }
     return cudaSetDevice(original_device) == cudaSuccess;
 }

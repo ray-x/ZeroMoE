@@ -9,6 +9,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <algorithm>
 #ifdef _OPENMP
@@ -134,13 +135,47 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
         if (position == 0 && layer % 8 == 0)
           LOG_STREAM_INFO() << "[EXL3] Initial token layer " << layer << " complete\n";
       }
+      engine.qwen4exp_ple_next_pos = position + 1;
     };
     const auto start = std::chrono::steady_clock::now();
     LOG_STREAM_INFO() << "[EXL3] Prefill " << tokens.size() << " tokens\n";
-    for (size_t position = 0; position < tokens.size(); ++position) {
-      forward(tokens[position], static_cast<int>(position));
-      LOG_STREAM_INFO() << "[EXL3] Prefill position " << position << " complete\n";
+    const int prefill_rows = static_cast<int>(tokens.size());
+    std::vector<float> prefill_hidden(
+        static_cast<size_t>(prefill_rows) * cfg.hidden);
+    engine.qwen4exp_ple_token_history.clear();
+    engine.qwen4exp_ple_token_history.reserve(tokens.size());
+    for (int position = 0; position < prefill_rows; ++position) {
+      engine.qwen4exp_ple_token_history.push_back(
+          tokens[static_cast<size_t>(position)]);
+      if (!cpu_embed_token(
+              engine, tokens[static_cast<size_t>(position)],
+              prefill_hidden.data() + static_cast<size_t>(position) * cfg.hidden,
+              cfg.hidden))
+        throw std::runtime_error("EXL3 prefill embedding failed");
     }
+    for (int layer = 0; layer < cfg.n_layers; ++layer) {
+      const auto layer_begin = std::chrono::steady_clock::now();
+      if (!cpu_forward_layer(engine, layer, prefill_hidden.data(),
+                             prefill_rows, 0))
+        throw std::runtime_error("EXL3 prefill failed at layer " +
+                                 std::to_string(layer));
+      layer_seconds[static_cast<size_t>(layer)] +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        layer_begin)
+              .count();
+      for (float value : engine.qwen4exp_hc_stream_buf)
+        if (!std::isfinite(value))
+          throw std::runtime_error("Non-finite EXL3 prefill layer " +
+                                   std::to_string(layer));
+      if (layer % 8 == 0)
+        LOG_STREAM_INFO() << "[EXL3] Prefill layer " << layer
+                          << " complete for " << prefill_rows << " rows\n";
+    }
+    std::memcpy(hidden.data(),
+                prefill_hidden.data() +
+                    static_cast<size_t>(prefill_rows - 1) * cfg.hidden,
+                static_cast<size_t>(cfg.hidden) * sizeof(float));
+    engine.qwen4exp_ple_next_pos = prefill_rows;
     CPUSampler sampler;
     const double prefill_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     int output_tokens = 0;

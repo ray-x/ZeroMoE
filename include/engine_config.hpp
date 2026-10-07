@@ -4,6 +4,7 @@
 #pragma once
 #include "logger.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <fstream>
@@ -59,6 +60,9 @@ struct EngineConfig {
   std::string model_path; // Primary model GGUF (experts + architecture)
   std::string model_format = "gguf";
   std::string exl3_backend = "native";
+  std::string exl3_ggml_bridge_model_path;
+  int exl3_ggml_bridge_layer = -1;
+  std::vector<int> exl3_ggml_bridge_layers;
   std::string exllamav3_python;
   std::string exllamav3_runner_path;
   std::string exllamav3_cuda_schedule = "auto";
@@ -2553,6 +2557,13 @@ inline bool EngineConfig::load(const std::string &path) {
   model_path = doc.root.get_str("model_path");
   model_format = doc.root.get_str("model_format", model_format);
   exl3_backend = doc.root.get_str("exl3_backend", exl3_backend);
+  exl3_ggml_bridge_model_path =
+      doc.root.get_str("exl3_ggml_bridge_model_path",
+                      exl3_ggml_bridge_model_path);
+  exl3_ggml_bridge_layer =
+      doc.root.get_int("exl3_ggml_bridge_layer", exl3_ggml_bridge_layer);
+  exl3_ggml_bridge_layers =
+      doc.root.get_int_array("exl3_ggml_bridge_layers");
   exllamav3_python = doc.root.get_str("exllamav3_python", exllamav3_python);
   exllamav3_runner_path = doc.root.get_str("exllamav3_runner_path", exllamav3_runner_path);
   exllamav3_cuda_schedule = doc.root.get_str("exllamav3_cuda_schedule", exllamav3_cuda_schedule);
@@ -3179,6 +3190,36 @@ inline bool EngineConfig::validate() {
     std::cerr << "[CONFIG] exllamav3_cuda_schedule must be auto, spin, yield or blocking\n";
     return false;
   }
+  if (exl3_ggml_bridge_layer < -1 ||
+      (exl3_ggml_bridge_layer >= 0 && !exl3_ggml_bridge_layers.empty())) {
+    std::cerr << "[CONFIG] Use either exl3_ggml_bridge_layer or "
+                 "exl3_ggml_bridge_layers, not both.\n";
+    return false;
+  }
+  for (size_t index = 0; index < exl3_ggml_bridge_layers.size(); ++index) {
+    if (exl3_ggml_bridge_layers[index] < 0 ||
+        std::find(exl3_ggml_bridge_layers.begin(),
+                  exl3_ggml_bridge_layers.begin() + index,
+                  exl3_ggml_bridge_layers[index]) !=
+            exl3_ggml_bridge_layers.begin() + index) {
+      std::cerr << "[CONFIG] exl3_ggml_bridge_layers must contain unique "
+                   "non-negative layer indices.\n";
+      return false;
+    }
+  }
+  if ((!exl3_ggml_bridge_model_path.empty() || exl3_ggml_bridge_layer >= 0 ||
+       !exl3_ggml_bridge_layers.empty()) &&
+      exl3_ggml_bridge_model_path.empty()) {
+    std::cerr << "[CONFIG] EXL3 GGML bridge layers require "
+                 "exl3_ggml_bridge_model_path.\n";
+    return false;
+  }
+  if (!exl3_ggml_bridge_model_path.empty() &&
+      (!std::isfinite(exl3_gpu_cache_gb) || exl3_gpu_cache_gb <= 0.0 ||
+       exl3_gpu_cache_gb > 1024.0)) {
+    std::cerr << "[CONFIG] EXL3 GGML bridge requires exl3_gpu_cache_gb in (0, 1024].\n";
+    return false;
+  }
   if (exl3_backend != "native" && exl3_backend != "exllamav3") {
     std::cerr << "[CONFIG] exl3_backend must be 'native' or 'exllamav3'\n";
     return false;
@@ -3390,6 +3431,15 @@ inline void EngineConfig::print() const {
   LOG_STREAM_INFO() << "[CONFIG] Model format: " << model_format
                     << " | load-only: " << (model_load_only ? "yes" : "no")
                     << "\n";
+  if (!exl3_ggml_bridge_model_path.empty()) {
+    LOG_STREAM_INFO() << "[CONFIG] EXL3 GGML bridge model: "
+                      << exl3_ggml_bridge_model_path << " | layer="
+                      << exl3_ggml_bridge_layer << " | layers=";
+    for (size_t index = 0; index < exl3_ggml_bridge_layers.size(); ++index)
+      LOG_STREAM_INFO() << (index == 0 ? "" : ",")
+                        << exl3_ggml_bridge_layers[index];
+    LOG_STREAM_INFO() << "\n";
+  }
   if (!dense_model_path.empty() && dense_model_path != model_path)
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";
   if (!mtp_model_path.empty())

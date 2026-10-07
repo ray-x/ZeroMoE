@@ -1,0 +1,88 @@
+# Narrow Layer-0 host-node residual/consumer diagnostic.
+# Use MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2=1 for tensor snapshots and
+# MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL=1 for the diagnostic-only one-layer
+# DDR-arena admission used with this profile.
+model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+log_path = "logs/qwen4exp_cpu_offload_layer0_residual_diag.log"
+log_level = "INFO"
+
+context_size = 2048
+max_new_tokens = 1
+temperature = 0.0
+top_p = 0.95
+raw_prompt = false
+enable_thinking = false
+
+direct_io = false
+io_uring = false
+drop_pages = true
+host_ram_gb = 50
+ram_preload_all_experts = true
+ram_pinned_budget_gb = 2.0
+pinned_vram_capacity = 128
+expert_fetch_threads = 10
+omp_max_threads = 12
+prefetch_worker_threads = 4
+
+pin_file = ".moestream_usage_qwen4exp_7prompts_isolated"
+prefill_pin_file = ".moestream_usage_qwen4exp_prefill_7prompts_isolated"
+freeze_usage_stats = true
+move_on_promotion = false
+
+qwen4exp_option_b_layer = -1
+qwen4exp_option_b_top_n = 0
+qwen4exp_option_b_min_coverage = 0.80
+qwen4exp_option_b_fill_vram = false
+qwen4exp_option_b_stage_expert = -1
+qwen4exp_option_b_stage_count = 1
+
+qwen4exp_cpu_offload = true
+qwen4exp_cpu_offload_layers = [0]
+qwen4exp_cpu_offload_force_cold_count = 0
+qwen4exp_cpu_offload_force_expert = -1
+qwen4exp_cpu_offload_event_fence = false
+qwen4exp_cpu_offload_ring_slots = 2
+
+qwen4exp_full_graph = true
+qwen4exp_full_graph_decode = true
+qwen4exp_cpu_gpu_overlap = true
+qwen4exp_cpu_gpu_overlap_max_layers = 0
+qwen4exp_decode_device_hc = true
+qwen4exp_decode_gpu_router = false
+qwen4exp_decode_ggml_moe = true
+qwen4exp_cpu_ggml_moe = true
+qwen4exp_cpu_strided_grouped = false
+qwen4exp_cpu_fused_grouped = false
+qwen4exp_cpu_shared_device = true
+
+moe_ggml_mul_mat_id = true
+moe_ggml_shared_expert = true
+moe_ggml_planar_copies = true
+moe_ggml_gpu_router = true
+moe_ggml_device = 0
+hc_ggml = true
+gdn_full_ggml = true
+qwen4exp_attn_gpu = true
+qwen4exp_gdn_gpu = true
+qwen4exp_gdn_conv_gpu = true
+dense_bf16_prefill_gemm = true
+dense_bf16_kquant = true
+moe_gpu_accum = true
+expert_gpu_activation = true
+
+use_active_layer_area = true
+active_layer_capacity = 10
+decode_async_prewarm = false
+prefetch_pilot_depth = 1
+prefetch_pilot_k = 10
+pin_vram_lru_fraction = 0.1
+pin_ram_fraction = 0.9
+
+[[gpus]]
+device_id = 0
+name = "RTX 3090"
+role = "dense+moe"
+dense_gb = 4.1
+kv_cache_gb = 2.0
+moe_cache_gb = 11.0
+kv_bits = 4

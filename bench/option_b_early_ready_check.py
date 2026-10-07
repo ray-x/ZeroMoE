@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Compare the opt-in Layer-13 bridge on an identical token history.
+"""Compare an opt-in Qwen graph path on an identical token history.
 
-The checkpoint must pass gguf_tool verify before running. Both arms use the
-same binary/config; only MOESTREAM_QWEN_EARLY_READY_LAYER13 changes.
+The candidate checkpoint must pass gguf_tool verify before running. By
+default both arms use the same binary; --baseline-engine supports comparison
+against a previously validated scheduler build when the local GGML fork lacks
+its early-ready integration hook.
 """
 import argparse
 import hashlib
@@ -40,13 +42,17 @@ def competing_gpu(exclude=None):
     # Other adapters share CPU and PCIe resources, too.
     probe = subprocess.run(
         ['nvidia-smi', '--query-compute-apps=pid,process_name', '--format=csv,noheader'],
-        text=True, stdout=subprocess.PIPE, check=False)
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     # nvidia-smi returns 9 when the query has no active compute processes.
-    # That is the idle state the admission check is trying to detect.
-    if probe.returncode == 9:
+    # That is the idle state only when it produced no diagnostic output. Some
+    # driver failures also return 9; treating those as idle can start an engine
+    # while CUDA device discovery is unavailable.
+    if probe.returncode == 9 and not probe.stdout.strip():
         return []
     if probe.returncode:
-        raise subprocess.CalledProcessError(probe.returncode, probe.args)
+        raise RuntimeError(
+            f"nvidia-smi GPU admission query failed (status {probe.returncode}): "
+            f"{probe.stdout.strip()}")
     rows = probe.stdout.splitlines()
     return [row for row in rows if row.strip() and int(row.split(',', 1)[0]) != exclude]
 
@@ -54,6 +60,8 @@ def competing_gpu(exclude=None):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--engine', type=Path, required=True)
+    p.add_argument('--baseline-engine', type=Path,
+                   help='optional baseline binary; defaults to --engine')
     p.add_argument('--out-dir', type=Path, required=True)
     p.add_argument('--prompt-ids', type=Path, required=True)
     p.add_argument('--continuation', type=Path, required=True)
@@ -81,6 +89,10 @@ def main():
     out = args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=args.resume)
     engine = args.engine.resolve()
+    baseline_engine = (args.baseline_engine.resolve()
+                       if args.baseline_engine else engine)
+    if not baseline_engine.is_file():
+        p.error(f'baseline engine does not exist: {baseline_engine}')
     ngen = len(args.continuation.read_text().split())
     if ngen < 4 or args.reps < 1:
         p.error('need at least four continuation tokens and one repeat')
@@ -101,7 +113,7 @@ def main():
     if not args.free_running:
         env['MOESTREAM_TEACHER_FORCE_TOKEN_FILE'] = str(args.continuation.resolve())
     hashes = {str(f): hashlib.sha256(f.read_bytes()).hexdigest()
-              for f in (engine, A, args.prompt_ids, args.continuation)}
+              for f in (engine, baseline_engine, A, args.prompt_ids, args.continuation)}
     def check_inputs():
         for name, expected in hashes.items():
             if hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected:
@@ -144,12 +156,20 @@ def main():
                 print(f'Reusing valid {arm}_{rep}', flush=True)
                 continue
             deadline = time.monotonic() + args.wait_idle
+            waiting = False
             while True:
-                busy = competing_cpu()
-                if not busy or args.allow_busy_correctness:
+                cpu = competing_cpu()
+                gpu = competing_gpu()
+                if (not cpu and not gpu) or args.allow_busy_correctness:
                     break
                 if time.monotonic() >= deadline:
-                    raise RuntimeError(f'host busy before {arm}_{rep}: {busy}')
+                    raise RuntimeError(
+                        f'inference resources busy before {arm}_{rep}: '
+                        f'{"; ".join(gpu or cpu)}')
+                if not waiting:
+                    print(f'Waiting for inference resources before {arm}_{rep}: '
+                          f'{"; ".join(gpu or cpu)}', flush=True)
+                    waiting = True
                 time.sleep(5)
             processes = '\n'.join(competing_gpu())
             cpu = '\n'.join(competing_cpu())
@@ -183,7 +203,8 @@ def main():
             runtime['MOESTREAM_GENERATED_TOKEN_FILE'] = str(out / f'{tag}.tokens')
             print(f'Running {tag}', flush=True)
             with (out / f'{tag}.stdout').open('w') as output:
-                process = subprocess.Popen([str(engine), '--config', str(cfg), '--ngen', str(ngen)],
+                run_engine = baseline_engine if arm == 'baseline' else engine
+                process = subprocess.Popen([str(run_engine), '--config', str(cfg), '--ngen', str(ngen)],
                                stdin=subprocess.PIPE, text=True, cwd=ROOT, env=runtime,
                                stdout=output, stderr=subprocess.STDOUT)
                 prompt = 'Explain briefly the key concepts of neural networks and gradient descent in plain English.\n:q\n'
@@ -215,8 +236,29 @@ def main():
             if [step for step, _, _ in times] not in (list(range(ngen)), list(range(ngen - 1))):
                 raise RuntimeError(f'{tag}: incomplete timing')
             if arm != 'baseline':
-                exercised = ('[OPTION-B-EARLY-READY] calls=' in contents or
-                             '[QWEN4EXP-PARTIAL-GRAPH]' in contents)
+                staged_three_way = any(
+                    value == 'MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED=1'
+                    for value in args.candidate_env)
+                if staged_three_way:
+                    route_modes = re.findall(
+                        r'\[QWEN4EXP-MASTER-GRAPH-3WAY\] route mode=(\d+)',
+                        contents)
+                    staged_completion = re.search(
+                        r'\[QWEN4EXP-STAGED-DISPATCH\] completion_seen=1 state=2',
+                        contents)
+                    staged_dispatch = re.search(
+                        r'\[GGML-QWEN-FULL-DECODE-P2-TIME\].*dispatch=staged-gpu',
+                        contents)
+                    exercised = ('3' in route_modes and staged_completion is not None
+                                 and staged_dispatch is not None)
+                    if not exercised:
+                        raise RuntimeError(
+                            f'{tag}: staged graph did not prove a Ready completion, '
+                            'mixed route mode, and staged-GPU dispatch')
+                else:
+                    exercised = ('[OPTION-B-EARLY-READY] calls=' in contents or
+                                 '[QWEN4EXP-PARTIAL-GRAPH]' in contents)
+
                 if not exercised:
                     raise RuntimeError(f'{tag}: graph bridge not exercised')
             totals, cores = zip(*steady)

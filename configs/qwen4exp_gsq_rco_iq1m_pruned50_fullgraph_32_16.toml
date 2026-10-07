@@ -1,0 +1,92 @@
+# Qwen3.8-Flash-Next GSQ-RCO IQ1_M full graph: 32 complete GPU layers,
+# 16 DDR/CPU layers. Launch with GRAPH_PRELOAD_LAYERS=32 and TRAILING=1.
+model_path = "/data/models/qwen3.8-flash-next/GSQ-RCO-IQ1_M"
+log_path = "/tmp/qwen4exp_gsq_rco_iq1m_pruned50_fullgraph_32_16.log"
+log_level = "INFO"
+
+context_size = 416
+max_new_tokens = 400
+temperature = 0.0
+top_p = 0.95
+enable_thinking = false
+
+direct_io = false
+io_uring = false
+drop_pages = true
+host_ram_gb = 60.0
+ram_preload_all_experts = true
+ram_pinned_budget_gb = 4.0
+expert_fetch_threads = 10
+omp_max_threads = 12
+prefetch_worker_threads = 4
+
+pin_file = ".moestream_usage_qwen4exp_pruned50"
+prefill_pin_file = ".moestream_usage_qwen4exp_pruned50"
+freeze_usage_stats = true
+pinned_vram_capacity = 128
+pin_vram_lru_fraction = 0.1
+pin_ram_fraction = 0.9
+pin_threshold = 6
+promote_hit_threshold = 6
+promote_h2d_threshold = 6
+
+qwen4exp_option_b_layer = -1
+qwen4exp_option_b_selected_layers = []
+qwen4exp_option_b_top_n = 0
+qwen4exp_option_b_min_coverage = 0.80
+qwen4exp_option_b_fill_vram = false
+qwen4exp_option_b_disable_legacy_cache = true
+qwen4exp_option_b_stage_expert = -1
+qwen4exp_option_b_stage_count = 1
+
+qwen4exp_full_graph = true
+qwen4exp_full_graph_decode = true
+qwen4exp_cpu_gpu_overlap = true
+qwen4exp_cpu_gpu_overlap_max_layers = 0
+qwen4exp_decode_device_hc = true
+qwen4exp_decode_gpu_router = false
+qwen4exp_decode_ggml_moe = true
+qwen4exp_cpu_ggml_moe = true
+qwen4exp_cpu_strided_grouped = true
+qwen4exp_cpu_fused_grouped = true
+moe_ggml_mul_mat_id = true
+moe_ggml_shared_expert = true
+moe_ggml_planar_copies = true
+moe_ggml_gpu_router = true
+moe_ggml_device = 0
+qwen4exp_cpu_shared_device = true
+hc_ggml = true
+gdn_full_ggml = true
+gdn_proj_ggml = true
+qwen4exp_attn_gpu = true
+qwen4exp_gdn_gpu = true
+qwen4exp_gdn_conv_gpu = true
+dense_bf16_prefill_gemm = true
+dense_bf16_kquant = true
+moe_gpu_accum = true
+expert_gpu_activation = true
+
+use_active_layer_area = false
+active_layer_capacity = 0
+decode_async_prewarm = false
+prefetch_pilot_depth = 1
+prefetch_pilot_k = 10
+qwen4exp_gpu_stage_enabled = false
+qwen4exp_gpu_stage_layers = []
+qwen4exp_track_router_usage = false
+
+mem_guard = true
+mem_guard_warn_mb = 4096
+mem_guard_stop_mb = 2048
+mem_guard_poll_ms = 500
+vram_min_free_mb = 512
+
+[[gpus]]
+device_id = 0
+name = "RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+dense_gb = 4.5
+kv_cache_gb = 1.0
+kv_bits = 4
+moe_cache_gb = 0.0

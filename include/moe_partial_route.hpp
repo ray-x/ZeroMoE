@@ -129,21 +129,20 @@ public:
 
   // True means every original route slot appears exactly once and no target
   // carries an invalid branch slot. This is the merge invariant checked by
-  // graph code before it can submit branch work.
+  // graph code before it can submit branch work. Build appends assignments in
+  // original route-slot order, and assignments_ is private/immutable to
+  // callers, so checking slot i at vector position i proves a complete
+  // one-to-one mapping without allocating scratch inside a host callback.
   bool exact_once() const {
-    std::vector<uint8_t> seen(assignments_.size(), 0);
-    for (const auto &assignment : assignments_) {
+    for (size_t slot = 0; slot < assignments_.size(); ++slot) {
+      const auto &assignment = assignments_[slot];
       if (assignment.original_route_slot < 0 ||
-          static_cast<size_t>(assignment.original_route_slot) >= seen.size() ||
-          seen[static_cast<size_t>(assignment.original_route_slot)] ||
+          static_cast<size_t>(assignment.original_route_slot) != slot ||
           !std::isfinite(assignment.router_weight))
         return false;
       if (assignment.target != RouteTarget::Cpu && assignment.weight_slot < 0)
         return false;
-      seen[static_cast<size_t>(assignment.original_route_slot)] = 1;
     }
-    for (uint8_t value : seen)
-      if (!value) return false;
     return true;
   }
 

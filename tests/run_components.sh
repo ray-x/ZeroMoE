@@ -110,5 +110,58 @@ mkdir -p "$(dirname "$BIN")"
 echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $GGML_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
 "$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $GGML_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
 
+ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/moestream-route-test.XXXXXX")"
+trap 'rm -rf "$ROUTE_TEST_DIR"' EXIT
+ROUTE_TEST_BIN="$ROUTE_TEST_DIR/test_moe_partial_route"
+echo "[run_components] compiling allocation-free route classification tests"
+"$CXX" -std=c++20 -O2 -Iinclude -o "$ROUTE_TEST_BIN" tests/test_moe_partial_route.cpp
+for MODE in capable stock optout; do
+    echo "[run_components] route classification mode: $MODE"
+    "$ROUTE_TEST_BIN" "$MODE"
+done
+
+STORAGE_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_storage_service"
+echo "[run_components] compiling storage generation tests"
+"$CXX" -std=c++20 -O2 -pthread -Iinclude \
+    -o "$STORAGE_TEST_BIN" tests/test_qwen4exp_storage_service.cpp
+"$STORAGE_TEST_BIN"
+
+BOUNDARY_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_staged_boundary"
+echo "[run_components] compiling staged storage/adaptive boundary tests"
+"$CXX" -std=c++20 -O2 -pthread -Iinclude \
+    -o "$BOUNDARY_TEST_BIN" tests/test_qwen4exp_staged_boundary.cpp
+"$BOUNDARY_TEST_BIN"
+
+ADAPTIVE_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_adaptive_policy"
+echo "[run_components] compiling adaptive policy tests"
+"$CXX" -std=c++20 -O2 -Iinclude \
+    -o "$ADAPTIVE_TEST_BIN" tests/test_qwen4exp_adaptive_policy.cpp
+"$ADAPTIVE_TEST_BIN"
+
+# The shared shape-class registry itself is CPU-only, but its public header
+# uses CUDA and GGML types. Run it where both SDK headers are present; retain
+# the pure C++ storage/policy tests on CPU-only hosts.
+CUDA_INCLUDE_DIR=""
+for candidate in "${CUDA_HOME:-}/include" /usr/local/cuda/include \
+                 /opt/cuda/include /opt/cuda/targets/x86_64-linux/include; do
+    if [ -f "$candidate/cuda_runtime_api.h" ]; then
+        CUDA_INCLUDE_DIR="$candidate"
+        break
+    fi
+done
+if [ -n "${GGML_SRC_DIR:-}" ] && \
+   [ -f "$GGML_SRC_DIR/../include/ggml-backend.h" ] && \
+   [ -n "$CUDA_INCLUDE_DIR" ]; then
+    SHAPE_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_stage_shape_pool"
+    echo "[run_components] compiling shared shape-class pool tests"
+    "$CXX" -std=c++23 -O2 -pthread -Iinclude \
+        -I"$GGML_SRC_DIR/../include" -I"$GGML_SRC_DIR" \
+        -I"$CUDA_INCLUDE_DIR" \
+        -o "$SHAPE_TEST_BIN" tests/test_qwen4exp_stage_shape_pool.cpp
+    "$SHAPE_TEST_BIN"
+else
+    echo "[run_components] skipping shape-class pool test (CUDA/GGML headers unavailable)"
+fi
+
 echo "[run_components] running: $BIN $*"
-exec "$BIN" "$@"
+"$BIN" "$@"

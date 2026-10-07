@@ -6,6 +6,10 @@
 #include "exl3_cpu.hpp"
 #ifdef MOESTREAM_EXL3_CUDA
 #include "exl3_gpu.hpp"
+#include "exl3_format.hpp"
+#if defined(MOESTREAM_USE_GGML_CUDA)
+#include "exl3_ggml_model.hpp"
+#endif
 #endif
 
 #include <cmath>
@@ -697,32 +701,94 @@ bool CPUEngine::exl3_expert(int layer, int expert, const float *input, float *ou
 
 bool CPUEngine::exl3_routed_ffn(int layer, const int *experts, const float *weights,
                                 int count, const float *input, float *output) {
+  return exl3_routed_ffn_batch(layer, experts, weights, 1, input, output);
+}
+
+bool CPUEngine::exl3_routed_ffn_batch(int layer, const int *experts,
+                                     const float *weights, int rows,
+                                     const float *input, float *output) {
 #ifdef MOESTREAM_EXL3_CUDA
   if (!exl3_gpu || layer < exl3_gpu_expert_layer_begin) return false;
   const auto &cfg = model_file.architecture_config;
-  if (!experts || !weights || count <= 0 || count > cfg.n_experts)
+  const int topk = std::min(cfg.topk, cfg.n_experts);
+  if (!experts || !weights || !input || !output || rows <= 0 || topk <= 0)
     throw std::runtime_error("Invalid EXL3 expert routing");
-  std::vector<std::string> prefixes;
-  prefixes.reserve(count);
-  for (int index = 0; index < count; ++index) {
-    if (experts[index] < 0 || experts[index] >= cfg.n_experts)
+  const size_t route_count = static_cast<size_t>(rows) * topk;
+  for (size_t route = 0; route < route_count; ++route)
+    if (experts[route] < 0 || experts[route] >= cfg.n_experts)
       throw std::runtime_error("EXL3 routed expert ID out of range");
-    prefixes.push_back("model.language_model.layers." + std::to_string(layer) +
-                       ".mlp.experts." + std::to_string(experts[index]) + ".");
-  }
   auto executor = exl3_gpu_secondary && layer >= exl3_gpu_expert_split_layer
       ? exl3_gpu_secondary : exl3_gpu;
-  executor->routed_ffn(prefixes, weights, input, output, cfg.hidden, cfg.moe_inter,
-      [&](const std::string &key) {
-        auto found = exl3_linears.find(key);
-        if (found == exl3_linears.end())
-          throw std::runtime_error("Missing EXL3 expert projection: " + key);
+  const auto load = [&](const std::string &key) {
+    const auto found = exl3_linears.find(key);
+    if (found == exl3_linears.end())
+      throw std::runtime_error("Missing EXL3 expert projection: " + key);
+    if (exl3_cpu_matrix_cache) {
+      auto matrix = exl3_cpu_matrix_cache->get(key);
+      if (!matrix) {
+        Exl3Mul1MatrixData loaded;
         std::string error;
-        std::vector<uint8_t> packed;
-        if (!load_exl3_mul1_matrix(exl3_model, found->second, packed, error))
+        if (!load_exl3_mul1_components(exl3_model, found->second, loaded,
+                                       error))
           throw std::runtime_error(error);
-        return packed;
-      });
+        matrix = exl3_cpu_matrix_cache->insert(key, std::move(loaded));
+      }
+      return exl3_mul1_pack_matrix(matrix->view());
+    }
+    std::vector<uint8_t> packed;
+    std::string error;
+    if (!load_exl3_mul1_matrix(exl3_model, found->second, packed, error))
+      throw std::runtime_error(error);
+    return packed;
+  };
+
+#if defined(MOESTREAM_USE_GGML_CUDA)
+  const bool secondary = executor == exl3_gpu_secondary;
+  auto &graphs = secondary ? exl3_ggml_gpu_secondary_graphs
+                           : exl3_ggml_gpu_graphs;
+  auto found_graph = graphs.find(rows);
+  if (found_graph == graphs.end()) {
+    auto candidate = std::make_shared<Exl3GgmlRoutedFfnGraph>();
+    if (candidate->initialize(config.model_path, executor.get(),
+                              cfg.n_experts, topk, rows, cfg.hidden,
+                              cfg.moe_inter, executor->device()))
+      found_graph = graphs.emplace(rows, std::move(candidate)).first;
+    else
+      LOG_STREAM_WARN() << "[EXL3-GGML-FFN] CUDA custom-op graph init failed; "
+                           "using native routed FFN on device "
+                        << executor->device() << "\n";
+  }
+  if (found_graph != graphs.end() &&
+      found_graph->second->run(layer, experts, weights, input, output, load))
+      return true;
+  LOG_STREAM_WARN() << "[EXL3-GGML-FFN] custom-op graph unavailable for rows="
+                    << rows << "; using native routed FFN\n";
+#endif
+
+  std::vector<std::string> prefixes(static_cast<size_t>(topk));
+  for (int route = 0; route < topk; ++route) {
+    prefixes[static_cast<size_t>(route)] =
+        "model.language_model.layers." + std::to_string(layer) +
+        ".mlp.experts." + std::to_string(experts[route]) + ".";
+  }
+  if (rows == 1) {
+    executor->routed_ffn(prefixes, weights, input, output, cfg.hidden,
+                         cfg.moe_inter, load);
+    return true;
+  }
+  for (int row = 0; row < rows; ++row) {
+    for (int route = 0; route < topk; ++route)
+      prefixes[static_cast<size_t>(route)] =
+          "model.language_model.layers." + std::to_string(layer) +
+          ".mlp.experts." +
+          std::to_string(experts[static_cast<size_t>(row) * topk + route]) +
+          ".";
+    executor->routed_ffn(
+        prefixes, weights + static_cast<size_t>(row) * topk,
+        input + static_cast<size_t>(row) * cfg.hidden,
+        output + static_cast<size_t>(row) * cfg.hidden, cfg.hidden,
+        cfg.moe_inter, load);
+  }
   return true;
 #else
   return false;
@@ -839,6 +905,51 @@ bool CPUEngine::exl3_cpu_routed_ffn(int layer, const int *experts, const float *
     for (int index = 0; index < cfg.hidden; ++index)
       output[index] += weight * source[index];
   }
+  return true;
+}
+
+bool CPUEngine::exl3_cpu_routed_ffn_batch(
+    int layer, const int *experts, const float *weights, int rows,
+    const float *input, float *output) {
+  const auto &cfg = model_file.architecture_config;
+  const int topk = std::min(cfg.topk, cfg.n_experts);
+  if (exl3_model.tensors.empty() || !experts || !weights || !input || !output ||
+      rows <= 0 || topk <= 0 || layer < 0 || layer >= cfg.n_layers ||
+      (exl3_gpu && layer >= exl3_gpu_expert_layer_begin))
+    return false;
+  const size_t route_count = static_cast<size_t>(rows) * topk;
+  for (size_t route = 0; route < route_count; ++route)
+    if (experts[route] < 0 || experts[route] >= cfg.n_experts)
+      throw std::runtime_error("EXL3 CPU batch expert ID out of range");
+
+#if defined(MOESTREAM_USE_GGML_CUDA)
+  auto &graph = exl3_ggml_cpu_graphs[rows];
+  if (!graph) {
+    auto candidate = std::make_shared<Exl3GgmlCpuRoutedFfnGraph>();
+    const auto dispatch = [](void *context, int dispatch_layer,
+                             const int *dispatch_experts,
+                             const float *dispatch_weights, int count,
+                             const float *dispatch_input,
+                             float *dispatch_output) {
+      return static_cast<CPUEngine *>(context)->exl3_cpu_routed_ffn(
+          dispatch_layer, dispatch_experts, dispatch_weights, count,
+          dispatch_input, dispatch_output);
+    };
+    if (candidate->initialize(dispatch, this, cfg.n_layers, rows, topk,
+                              cfg.hidden))
+      graph = std::move(candidate);
+  }
+  if (graph && graph->run(layer, experts, weights, input, output))
+    return true;
+#endif
+
+  for (int row = 0; row < rows; ++row)
+    if (!exl3_cpu_routed_ffn(
+            layer, experts + static_cast<size_t>(row) * topk,
+            weights + static_cast<size_t>(row) * topk, topk,
+            input + static_cast<size_t>(row) * cfg.hidden,
+            output + static_cast<size_t>(row) * cfg.hidden))
+      return false;
   return true;
 }
 

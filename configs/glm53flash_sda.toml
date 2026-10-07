@@ -1,0 +1,171 @@
+# GLM-5.3 Flash (glm5next), UD-IQ4_XS -- dual-GPU starting profile.
+#
+# The model directory contains five GGUF shards. Keep model_path pointed at
+# the UD-IQ1_XS directory itself; MoEStream scans that directory for shards
+# and does not recurse into child directories.
+#
+# This profile assumes:
+#   GPU 0: GeForce RTX 3090 (expert/cache vault)
+#   GPU 1: GeForce RTX 5060 Ti (dense layers + KV cache)
+# Adjust the [[gpus]] blocks if the device IDs or available VRAM differ.
+
+model_path = "/data/sda/models/glm53flash/UD-IQ4_XS"
+reasoning_effort = "max"
+enable_thinking = true
+
+log_path = "debug_glm53flash_sda.log"
+log_level = "INFO"
+
+context_size = 4096
+max_new_tokens = 1024
+temperature = 0.7
+top_p = 0.95
+
+# Minimum free VRAM retained for dynamic CUDA workspaces. This is a root-level
+# setting; placing it inside [[gpus]] is ignored by EngineConfig parsing.
+vram_min_free_mb = 128
+
+# These source GGUFs report general.alignment=32 and their packed MoE tensor
+# bases are not 4096-aligned. Keep O_DIRECT off until the model is repacked;
+# io_uring remains useful independently for buffered batched reads.
+direct_io = false
+io_uring = true
+drop_pages = true
+
+# Keep enough system-memory headroom for the OS and file metadata. The model
+# plan reports about 9.3 GB of native dense tensors and 15.8 MB per expert.
+host_ram_gb = 100.0
+# Logical host-RAM MoE residency limit across all 42 MoE layers. This is a
+# count limit for the RAM cache/preload, while the byte-aware safety calculation
+# may lower the effective count if 108 GB cannot safely hold it. Set to 0 to
+# use the largest count that fits the byte budget automatically.
+ram_cache_total_experts = 8000
+ram_pinned_budget_gb = 65.0
+ram_preload_all_experts = true
+mem_guard = true
+# host_ram_gb is the total process host-memory cap (RAM tier + resident/KV
+# state + graph/MTP scratch), not a separate MoE-only allowance.
+mem_guard_warn_mb = 8192
+mem_guard_stop_mb = 4096
+mem_guard_poll_ms = 500
+
+# Normal inference should learn routing history for subsequent runs. These
+# names are model-specific: the generic files in this checkout contain 75-
+# layer history from another GLM model and must not be used for this 45-layer
+# checkpoint.
+freeze_usage_stats = false
+pin_file = ".moestream_usage_glm53flash"
+prefill_pin_file = ".moestream_usage_prefill_glm53flash"
+pin_threshold = 6
+pin_topk_per_layer = 12
+pin_strategy = "global_topn"
+pin_global_floor_per_layer = 1
+pinned_vram_capacity = 240
+pin_vram_lru_fraction = 0.1
+# Fill the safely calculated RAM-tier capacity with the learned hot set plus
+# history-missing experts. This still cannot preload the complete ~12k-expert
+# model; host_ram_gb and the memory guard remain the hard limits.
+pin_ram_fraction = 1.0
+ram_cache_layer_adaptive = false
+vram_evict_demote_to_ram = true
+
+# Streaming and active-layer cache settings from the existing GLM-5.3
+# dual-GPU profile.
+promote_hit_threshold = 6
+promote_h2d_threshold = 6
+prefetch_worker_threads = 6
+expert_fetch_threads = 10
+omp_max_threads = 10
+attn_score_threads = 8
+prefill_warm_via_prefetcher = true
+prefill_opportunistic_promote = false
+prefetch_pilot_depth = 1
+prefetch_pilot_k = 8
+prefetch_pilot_k_depth2 = 1
+prefetch_attn_pilot = false
+decode_async_prewarm = true
+decode_async_prewarm_nonblocking = true
+
+active_layer_capacity = 64
+use_active_layer_area = true
+active_layer_promote_hit_threshold = 1
+active_layer_upload_worker_threads = 2
+speculative_promote_to_active_layer = true
+speculative_active_layer_max_k = 4
+speculative_active_layer_promote_on_confirm = false
+move_on_promotion = true
+
+# The dynamic promotion policy is the validated default used by the existing
+# GLM-5.3 profile; the static top-k policy remains disabled.
+ram_vram_promote_top_k = 0
+ram_vram_promote_layer_gate = false
+ram_vram_promote_dynamic_layer = true
+ram_vram_promote_dynamic_threshold_4 = 0.90
+ram_vram_promote_dynamic_threshold_3 = 0.70
+ram_vram_promote_dynamic_threshold_2 = 0.60
+ram_vram_promote_dynamic_threshold_1 = 0.50
+ram_vram_promote_dynamic_k_tier4 = 5
+ram_vram_promote_dynamic_k_tier3 = 4
+ram_vram_promote_dynamic_k_tier2 = 3
+ram_vram_promote_dynamic_k_tier1 = 2
+ram_vram_promote_dynamic_k_floor = 1
+ram_vram_promote_dynamic_cold_start_k = 2
+ram_vram_promote_dynamic_min_samples = 30
+
+# MLA/DSA GPU paths are best-effort and fall back to CPU when their per-layer
+# VRAM budget is unavailable. The dense BF16 prefill path is verified on
+# GLM-5.3; leave K-quant BF16 conversion disabled on this tight setup.
+attn_qabsorb_gpu = true
+attn_qabsorb_gpu_max_vram_gb = 2.0
+attn_score_gpu = true
+attn_score_gpu_max_vram_gb = 2.0
+attn_score_gpu_max_context = 512
+dense_bf16_prefill_gemm = true
+dense_bf16_kquant = false
+glm5next_router_gpu = true
+glm5next_kda_gpu = true
+glm5next_moe_prefill_gpu = true
+glm5next_dense_prefill_fusion = true
+
+# Fast MoE prefill path. The shared token-batching path is verified for
+# GLM-5.3 in this checkout and avoids the per-token expert loop: it groups
+# prompt tokens by expert before dispatch. GPU accumulation and device-side
+# SwiGLU remove additional host/device round trips from that same path.
+# These do not change decode-time routing (S=1), but materially reduce
+# prefill orchestration and PCIe overhead.
+moe_prefill_batched = false
+expert_gpu_activation = true
+moe_gpu_accum = true
+
+prefill_window_cap = true
+prefill_window_extra_gb = 12.0
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "moe"
+vram_gb = 24.0
+kv_cache_gb = 0.0
+kv_bits = 4
+dense_gb = 0.0
+moe_cache_gb = 20.7
+active_layer_weight = 3
+active_layer_capacity_slots = 64
+
+[[gpus]]
+device_id = 1
+name = "NVIDIA GeForce RTX 5060 Ti"
+role = "dense+moe"
+vram_gb = 16.0
+kv_cache_gb = 3.0
+kv_bits = 4
+# The model plan estimates ~11.1 GB when the verified Q8_0 dense BF16 path
+# is active; this is a sizing note, not a hard allocation cap.
+dense_gb = 9.5
+# Use the unused VRAM on the dual-role 5060 Ti for a larger persistent MoE
+# cache. The startup log showed ~5.8 GB free after dense setup with the old
+# 0.9 GB cache; 4.5 GB adds roughly 3.6 GB of expert residency while keeping
+# runtime headroom for CUDA workspaces and transient buffers.
+moe_cache_gb = 6.5
+active_layer_weight = 1
+active_layer_capacity_slots = 28

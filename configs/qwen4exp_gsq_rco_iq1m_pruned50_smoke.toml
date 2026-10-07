@@ -1,0 +1,84 @@
+# Qwen3.8-Flash-Next GSQ-RCO IQ1_M smoke test.
+#
+# This release retains 256 of 512 routed experts in every one of its 48
+# layers. Keep this profile deliberately small: it is for loader/correctness
+# checks, not throughput tuning. The directory must contain both GGUF shards;
+# the .rco-allocation.txt file is only the pruning manifest.
+model_path = "/data/models/qwen3.8-flash-next/GSQ-RCO-IQ1_M"
+
+log_path = "/tmp/qwen4exp_gsq_rco_iq1m_pruned50_smoke.log"
+log_level = "INFO"
+
+context_size = 512
+max_new_tokens = 32
+temperature = 0.0
+top_p = 0.95
+enable_thinking = false
+
+# This model has not been repacked for O_DIRECT. Keep the first correctness
+# run on buffered reads and avoid filling RAM before the model is validated.
+direct_io = false
+io_uring = false
+drop_pages = false
+ram_preload_all_experts = false
+host_ram_gb = 16.0
+ram_pinned_budget_gb = 4.0
+expert_fetch_threads = 4
+omp_max_threads = 8
+prefetch_worker_threads = 2
+
+pin_file = ""
+prefill_pin_file = ""
+freeze_usage_stats = true
+pinned_vram_capacity = 0
+pin_threshold = 0
+promote_hit_threshold = 0
+promote_h2d_threshold = 0
+
+use_active_layer_area = false
+active_layer_capacity = 0
+active_layer_promote_hit_threshold = 1
+
+# Use the bounded legacy path for correctness smoke tests. The full Qwen4Exp
+# graph path is a separate performance mode that needs a larger VRAM/RAM
+# arena and is not required to validate the pruned shard layout.
+qwen4exp_full_graph = false
+qwen4exp_full_graph_decode = false
+qwen4exp_graph_expert_vram_budget_gb = 0.0
+qwen4exp_decode_device_hc = false
+qwen4exp_decode_gpu_router = false
+qwen4exp_decode_ggml_moe = false
+qwen4exp_cpu_strided_grouped = false
+qwen4exp_cpu_fused_grouped = false
+cpu_dot_ggml_iq1m = true
+moe_ggml_mul_mat_id = false
+moe_ggml_shared_expert = false
+moe_ggml_planar_copies = false
+moe_ggml_gpu_router = false
+moe_ggml_device = 0
+qwen4exp_attn_gpu = false
+qwen4exp_gdn_gpu = false
+qwen4exp_gdn_conv_gpu = false
+gdn_proj_ggml = false
+gdn_full_ggml = false
+hc_ggml = false
+moe_gpu_accum = false
+expert_gpu_activation = false
+dense_bf16_prefill_gemm = false
+dense_bf16_kquant = false
+
+mem_guard = true
+mem_guard_warn_mb = 4096
+mem_guard_stop_mb = 2048
+mem_guard_poll_ms = 500
+vram_min_free_mb = 512
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+dense_gb = 4.5
+kv_cache_gb = 1.0
+kv_bits = 4
+moe_cache_gb = 4.0

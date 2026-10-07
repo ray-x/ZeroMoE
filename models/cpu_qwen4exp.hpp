@@ -29,7 +29,7 @@ public:
 
 private:
   static const float *tensor(const CPUEngine &engine, const std::string &name);
-  static bool dense_matmul(const CPUEngine &engine, const std::string &name,
+  static bool dense_matmul(CPUEngine &engine, const std::string &name,
                            const float *x, float *y, int S, int I, int O);
   static bool dequant_row(const CPUQuantizedTensor &tensor, int row,
                           float *out, int n);

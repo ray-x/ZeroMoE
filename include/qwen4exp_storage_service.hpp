@@ -129,6 +129,7 @@ class StorageService {
         { ++rejected_; return std::nullopt; }
       record.request = std::move(request);
       record.completion = {};
+      record.discard_when_complete = false;
       record.completion.model_generation = record.request.model_generation;
       record.completion.request_generation = record.request.request_generation;
       record.completion.layer = record.request.layer;
@@ -162,14 +163,65 @@ class StorageService {
       return std::nullopt;
     std::unique_lock<std::mutex> lock(mutex_);
     done_.wait(lock, [&] {
-      const auto state = records_[handle.slot].state;
-      return stopping_ || state == StorageState::Ready || state == StorageState::Error;
+      const auto &record = records_[handle.slot];
+      return stopping_ || record.state == StorageState::Ready ||
+             record.state == StorageState::Error ||
+             record.request.model_generation != handle.model_generation ||
+             record.request.request_generation != handle.request_generation;
     });
     const auto &record = records_[handle.slot];
+    if (record.state != StorageState::Ready &&
+        record.state != StorageState::Error)
+      return std::nullopt;
     if (record.completion.model_generation != handle.model_generation ||
         record.completion.request_generation != handle.request_generation)
       return std::nullopt;
     return record.completion;
+  }
+
+  // Wait for one bounded interval. If the deadline expires while this exact
+  // generation is still pending, mark it for automatic retirement when its
+  // loader returns. The caller can then take an exact CPU fallback without
+  // leaving an unread Ready record occupying a bounded service slot later.
+  // The storage operation itself is not cancelled; its worker still owns the
+  // request and payload until it finishes.
+  std::optional<StorageCompletion> wait_consume_for(
+      StorageHandle handle, std::chrono::milliseconds timeout,
+      bool *timed_out = nullptr) {
+    if (timed_out)
+      *timed_out = false;
+    if (!handle.valid() || handle.slot >= records_.size())
+      return std::nullopt;
+    std::unique_lock<std::mutex> lock(mutex_);
+    const bool completed = done_.wait_for(lock, timeout, [&] {
+      const auto &record = records_[handle.slot];
+      return stopping_ || record.state == StorageState::Ready ||
+             record.state == StorageState::Error ||
+             record.request.model_generation != handle.model_generation ||
+             record.request.request_generation != handle.request_generation;
+    });
+    auto &record = records_[handle.slot];
+    if (!completed) {
+      if (record.state == StorageState::Pending &&
+          record.request.model_generation == handle.model_generation &&
+          record.request.request_generation == handle.request_generation) {
+        record.discard_when_complete = true;
+        if (timed_out)
+          *timed_out = true;
+      }
+      return std::nullopt;
+    }
+    if ((record.state != StorageState::Ready &&
+         record.state != StorageState::Error) ||
+        record.completion.model_generation != handle.model_generation ||
+        record.completion.request_generation != handle.request_generation)
+      return std::nullopt;
+    StorageCompletion completion = std::move(record.completion);
+    record.request = {};
+    record.completion = {};
+    record.state = StorageState::Free;
+    record.discard_when_complete = false;
+    return completion;
   }
 
   // Atomically wait for and consume a completion. This is the handoff used by
@@ -182,9 +234,11 @@ class StorageService {
       return std::nullopt;
     std::unique_lock<std::mutex> lock(mutex_);
     done_.wait(lock, [&] {
-      const auto state = records_[handle.slot].state;
-      return stopping_ || state == StorageState::Ready ||
-             state == StorageState::Error;
+      const auto &record = records_[handle.slot];
+      return stopping_ || record.state == StorageState::Ready ||
+             record.state == StorageState::Error ||
+             record.request.model_generation != handle.model_generation ||
+             record.request.request_generation != handle.request_generation;
     });
     auto &record = records_[handle.slot];
     if ((record.state != StorageState::Ready &&
@@ -196,6 +250,7 @@ class StorageService {
     record.request = {};
     record.completion = {};
     record.state = StorageState::Free;
+    record.discard_when_complete = false;
     return completion;
   }
 
@@ -213,6 +268,7 @@ class StorageService {
     record.request = {};
     record.completion = {};
     record.state = StorageState::Free;
+    record.discard_when_complete = false;
     return true;
   }
 
@@ -241,6 +297,7 @@ class StorageService {
  private:
   struct Record {
     StorageState state = StorageState::Free;
+    bool discard_when_complete = false;
     StorageRequest request;
     StorageCompletion completion;
     std::chrono::steady_clock::time_point enqueued_at{};
@@ -287,8 +344,15 @@ class StorageService {
       const double service_ms = completion.service_ms;
       {
         std::lock_guard<std::mutex> lock(mutex_);
-        records_[slot].completion = std::move(completion);
-        records_[slot].state = ok ? StorageState::Ready : StorageState::Error;
+        auto &record = records_[slot];
+        record.completion = std::move(completion);
+        record.state = ok ? StorageState::Ready : StorageState::Error;
+        if (record.discard_when_complete) {
+          record.request = {};
+          record.completion = {};
+          record.state = StorageState::Free;
+          record.discard_when_complete = false;
+        }
       }
       queue_ms_total_.fetch_add(queue_ms, std::memory_order_relaxed);
       service_ms_total_.fetch_add(service_ms, std::memory_order_relaxed);

@@ -1,0 +1,1171 @@
+# === V1 BASELINE (2026-08-26) ===
+# Identical to glm52_3090_5060_sdd2.toml EXCEPT speculative_promote_to_
+# active_layer=false (below) -- the pre-active-layer-redirect performance
+# starting point (~0.87-0.88 tok/s decode historically, though real
+# run-to-run noise on this hardware means treat that as a band, not a
+# fixed number -- see the multi-sample comparison in CLAUDE.md/memory).
+# This is the tuning baseline: the current file (glm52_3090_5060_sdd2.toml)
+# is V2 (speculative fills ON, better cache-hit rate, ~3-5% slower on
+# single-sample tests -- worth re-verifying with a proper multi-run A/B).
+# Flipping JUST this one flag is sufficient to reproduce V1 behavior --
+# every other speculative_* /ram_vram_promote_dynamic_* value is inert
+# when it's false (confirmed via source: the whole redirect branch is
+# skipped, falling back to the pre-existing main-cache promotion path).
+# === END V1 BASELINE NOTE ===
+#
+# MoEStream — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
+#
+# NOTE: UD-IQ2_M is a COMPLETE GLM-5.2 model (dense at Q5_K/Q6_K/Q8_0, experts at
+# Q2_K/Q3_K packed as *_exps). Run it alone — dense_model_path is commented
+# because UD-IQ4_XS on disk is a different (~13-layer) model, not GLM-5.2, which
+# caused "blk.13 missing". Re-enable dense_model_path only with a matching
+# GLM-5.2 (79-layer) dense file.
+
+# model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_pack"
+model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_align"
+# dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
+log_path = "debug.log"   # empty (default) = stderr
+# log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
+log_level = "INFO"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
+# Was DEBUG + verbose_moe_log=true for the pin_topk_per_layer A/B test below --
+# both are high-volume (one line per routed expert per token) and cost real
+# throughput; switched back to real-run defaults. Re-enable only when actively
+# debugging cache behavior.
+#
+# freeze_usage_stats: disable update pin file. used for benchmark only
+freeze_usage_stats = true
+
+# cpu_offload_max_experts: implemented + real hardware A/B'd (2026-08-25),
+# REVERTED to 0/off -- a real, clean, twice-confirmed REGRESSION on this
+# hardware, not a win. See CLAUDE.md's "CPU-offload feasibility" entries for
+# the full writeup: this codebase's own already-measured numbers (avg CPU
+# expert ~3.9ms/call vs avg GPU round-trip ~0.42ms/call, ~9x slower) predict
+# exactly this outcome in hindsight -- the DMA this feature skips is a much
+# smaller cost than the CPU compute it adds. Do not re-enable without a
+# structural change (e.g. only offloading GPU-unsupported quant types that
+# were headed to CPU anyway) -- see that entry before re-attempting.
+# cpu_dot_ggml_avx2: real A/B'd (2026-08-25) after wiring into production --
+# caught and fixed a real OMP-spawn-at-S=1 bug along the way (see kernels_
+# cpu.cpp's matmul_iq2/3_xxs_ggml_avx2), but even after that fix the real
+# decode-level impact was marginal (cpu= bucket -12.6% with cpu_offload_
+# max_experts=2, decode 0.81->0.82 tok/s, still well short of the 0.86
+# tok/s baseline) -- the isolated ~1.7-1.9x per-dot speedup doesn't survive
+# contact with the real per-call Q8_K activation-quantization cost at this
+# call pattern. Reverted to off. See CLAUDE.md for the full writeup.
+cpu_offload_max_experts = 0
+cpu_dot_ggml_avx2 = false
+# ATTN-PILOT real hint wiring (2026-08-25) -- real A/B (3 runs each): OFF
+# avg 0.84 tok/s decode (0.86/0.80/0.86), ON avg 0.86 (0.87/0.85/0.86) --
+# a small, consistent-direction signal (tighter band, never dipped as low
+# as OFF's worst run), not yet fully decisive given this hardware's own
+# documented run-to-run noise (non-bit-exact routing). Zero errors across
+# all 6 runs, mechanism confirmed engaging correctly (2449/2449 fetch-
+# worthy picks covered). Attempt 3 below (top-2 VRAM promote + this k=8
+# push, DEPTH-1 held at its own top-2) was NOT a regression -- unlike
+# attempts 1/2, a real improvement over the previous outright-regression
+# results -- but across 3 runs (0.88/0.88/0.83 decode) landed within this
+# hardware's own established baseline noise band, not clearly above it.
+# Left OFF pending more runs, same status as the plain-hint-push-only test
+# above. Attempt 4 (top_k=1, even more conservative) landed dead-center of
+# the baseline band, not above it -- see attn_pilot_vram_promote_top_k's
+# own comment for the full result. See CLAUDE.md for the full writeup.
+prefetch_attn_pilot = false
+prefetch_attn_pilot_k = 8
+# attn_pilot_vram_promote_top_k: two real attempts, both regressed, both
+# reverted -- see CLAUDE.md for the full writeup.
+# Attempt 1 (top_k=4, stacked on DEPTH-1's unchanged top_k=2 + DEPTH-2
+# k=4): decode 0.80 tok/s both runs (vs 0.84-0.87 baseline), cache hit
+# 56.0%/56.3% (vs 64-69%). Root cause: "Pilot RAM->VRAM promotion: ~9900
+# attempted" (vs ~2000 baseline) -- user correctly suspected duplicate
+# loading. CONFIRMED real: DEPTH-1 and ATTN-PILOT both predict l+1 from two
+# different inputs, top-K sets routinely overlap, and each independently
+# called promote_ram_to_vram for the SAME (layer,expert) within the SAME
+# transition before either's async copy was confirmed landed -- a genuine
+# second wasted evict_lru+upload, not a harmless re-check. FIXED via a new
+# per-transition cross-pilot dedup (execution_layer.cpp's vram_promoted_
+# this_transition / n_pilot_promote_dedup_skipped) -- confirmed working on
+# real hardware, ~30% (5316-5411/17491-17682) of raw attempts WERE genuine
+# duplicates.
+# Attempt 2 (this dedup fix + DEPTH-1 raised to top_k=8 "promote all" +
+# this key still at 4 + DEPTH-2 k=4): removing the duplicate-attempt waste
+# did NOT fix the deeper problem -- cache hit fell FURTHER, to 39-40% (two
+# runs), decode 0.75-0.76 tok/s, RAM waste ~50%. The dedup fix answers "why
+# was attempted-count so high" correctly; the over-promotion-VOLUME
+# regression (too many low-confidence speculative promotions -> VRAM/RAM
+# churn) is a separate, deeper mechanism it doesn't touch -- see
+# ram_vram_promote_top_k's own comment (reverted to 2 separately).
+# REVERTED to 0/off after attempts 1-2.
+# Attempt 3 (this key=2, DEPTH-1's ram_vram_promote_top_k HELD at its own
+# settled 2 -- not raised this time -- + DEPTH-2 k=4): the conservative
+# retry flagged after attempt 2 -- isolates whether a SMALL
+# attn_pilot_vram_promote_top_k alone, without also blowing up DEPTH-1's
+# own volume, behaves differently. Relies on the same cross-pilot dedup
+# fix from attempt 2 (n_pilot_promote_dedup_skipped) so DEPTH-1's own
+# top-2 promotion naturally skips anything ATTN-PILOT's top-2 already
+# promoted this transition, regardless of which of the two blocks runs
+# first in execution_layer.cpp (the dedup is symmetric -- whichever runs
+# first "wins" a shared pick, the other is skipped either way) -- exactly
+# the "DEPTH-1: top-2 again, if not loaded by ATTN-PILOT" semantics
+# requested, no code change needed beyond the dedup already shipped.
+# RESULT (3 runs): decode 0.88/0.88/0.83 tok/s (mean 0.863), cache hit
+# 64%/-/- (one run logged), promotion attempted 3322-3659 with 2254-2549
+# (~68-70%) caught by cross-pilot dedup, RAM waste 24.1-29.0% (elevated vs
+# the ~11-12% single-source baseline, but far from attempts 1/2's 40-50%).
+# NOT a regression -- unlike attempts 1/2, every run landed at or inside
+# the established 0.84-0.87 baseline band, no run fell dramatically below
+# it. But not a clearly confirmed win either: run 3 (0.83) sits at the
+# baseline band's low edge, not above it, so the two 0.88 runs could be
+# this hardware's own known run-to-run noise rather than a real uplift.
+# REVERTED to 0/off, same "promising, not yet decisive" status as the
+# plain ATTN-PILOT hint-push test above -- more runs (or a longer/
+# different prompt, per this session's own standing caution about
+# single-prompt conclusions) needed before treating either as settled.
+# Attempt 4: this key=1 (even more conservative than attempt 3's 2),
+# DEPTH-1 still held at its own settled top-2, DEPTH-2 top-4 unchanged.
+# RESULT (3 runs): decode 0.85/0.85/0.84 tok/s (mean 0.847) -- tighter and
+# MORE consistent than attempt 3's 0.88/0.88/0.83, but this time landing
+# dead-center of the 0.84-0.87 baseline band rather than at/above its top.
+# cache=63% hit (one run logged), promotion attempted 3059-3203 with
+# 1218-1341 (~40-42%) caught by cross-pilot dedup (lower dedup fraction
+# than attempt 3's ~68-70%, as expected -- ATTN-PILOT's own promotion pool
+# shrank from top-2 to top-1, so less of it overlaps DEPTH-1's own top-2),
+# RAM waste 26.2-27.8% -- essentially unchanged from attempt 3's 24.1-29.0%
+# despite the smaller VRAM-promotion cutoff, because RAM waste here is
+# driven mainly by the RAM-hint-push volume (DEPTH-2 top-4 + ATTN-PILOT's
+# k=8 wide push), which is identical between attempts 3 and 4 -- only the
+# VRAM promotion cutoff differs. Zero errors, not a regression. REVERTED
+# to 0/off. Between attempts 3 and 4, neither shows a clear win over
+# baseline; attempt 3's two 0.88 runs are the closest either got to a real
+# uplift, but its own third run (0.83) already showed that band isn't
+# fully separated from noise either. No further narrowing of THIS knob
+# alone looks likely to resolve the ambiguity -- more runs of whichever
+# variant, or a longer/different prompt, would be needed, not a smaller
+# top_k.
+attn_pilot_vram_promote_top_k = 0
+
+decode_async_prewarm = true
+# decode_async_prewarm_max_batch: real A/B tested at 6 (2026-08-19, vs the
+# default 3) specifically to see whether fewer/larger sync chunks amortize
+# active_layer_prewarm_issue's cost (the single largest decode bucket,
+# ~16-17s/req). No benefit: decode stayed at 0.85 tok/s (same band as
+# max_batch=3), sync= dropped 1.79->1.25s as expected (fewer barriers) but
+# issue= rose slightly (16.0->17.3s) -- a wash. Confirms issue= is bytes-
+# bound, not call-count-bound (consistent with the two earlier reverted
+# pinning/bounce-pool attempts at this same call site, see gpu_topology.hpp's
+# own comment). Left at the default (3).
+
+# Was 4096/16 for the quick pin_topk_per_layer A/B test referenced below.
+# Restored to real generation lengths -- adjust to your actual workload.
+context_size   = 4096
+max_new_tokens = 40   # 2048
+temperature    = 0.0
+top_p          = 0.95
+# drop_pages=true is REQUIRED here, not optional tuning: the primary model
+# copy above lives on btrfs (/home), and btrfs's O_DIRECT read path silently
+# falls back to buffered I/O for a real fraction of expert reads (COW/
+# checksum handling, extent-boundary crossings on this file's 616 extents) --
+# despite direct_io=true/io_uring=true being fully enabled and startup
+# confirming "[DIRECT-IO] Enabled on 6/6 shard(s)". Measured on real hardware:
+# with this off, the OS page cache for just the primary shards grows to
+# ~19-20GB over a single short run (matches [Inactive(file)]/[Cached] in
+# /proc/meminfo almost exactly -- confirmed via `fincore --bytes` per shard)
+# and never shrinks on its own. The mirror copy (xfs, /data) shows ZERO bytes
+# resident under the identical read pattern -- xfs's O_DIRECT has no such
+# fallback, so this is a btrfs-specific gap, not a general O_DIRECT/io_uring
+# issue. With this flag on, io_uring_backend.hpp's Ring::submit_and_wait
+# fadvise(DONTNEED)s every completed read's real on-disk range immediately,
+# holding primary-shard residency to ~2GB/run instead -- see
+# io_uring_backend.hpp's own comment on submit_and_wait for the fix (it used
+# to only cover the plain-pread fallback path, missing io_uring entirely,
+# which is why an EARLIER attempt at this same flag looked like a no-op).
+# See memory: btrfs-odirect-page-cache-leak.
+drop_pages     = true
+direct_io      = true
+io_uring       = true
+
+disk_batch_padding = false  # 2026-08-18: A/B test -- a real per-request [REQUEST] line
+# showed disk=11.76s (2.63 GB/s real-only / 3.67 GB/s incl. padding, 30.96 GB
+# real + 12.15 GB padding) with this =true: padding was 28% of phase_b's
+# bytes on the decode-blocking path, against the shutdown report's own
+# 51.1% payoff rate for padded reads (541/1059 later genuinely hit) --
+# testing whether phase_b/disk= genuinely improves with padding off, or
+# whether the lost future-hit rate offsets it. See CLAUDE.md's own
+# disk_batch_padding entry (still marked UNVERIFIED ON REAL HARDWARE) --
+# this is that verification. Restore to true if this A/B doesn't show a
+# clear win.
+disk_batch_padding_target = 8
+# Tested: engages fine mechanically (n_pad_evict_dup_used counter wired
+# correctly) but never actually reclaims anything under real GLM traffic --
+# root-caused to do_promote_ram_slot_to_vram's COPY branch never setting
+# also_in_vram=true at promotion time (a pre-existing gap, see CLAUDE.md),
+# so the population this feature draws from is nearly always empty in
+# practice. Turned off here (not just numerically inert but removed as a
+# variable entirely) while isolating the MoEStream_8.2 reference-vs-current
+# gap to a single-variable A/B -- re-enable only after the also_in_vram gap
+# is fixed and there's a real population for it to reclaim from.
+disk_batch_padding_evict_dup = false
+
+
+attn_score_threads = 8
+# Was `= true` (a boolean) -- silently ignored by the parser (which only
+# accepts an integer here) until a type-mismatch warning was added; this
+# config had actually been running DEPTH-1-only this whole time. Set to the
+# real default explicitly. Real A/B on this exact model found DEPTH-2
+# (prefetch_pilot_k_depth2=1) gave no measurable throughput benefit anyway
+# (see CLAUDE.md) -- left at 1, not raised to 2, pending a reason to revisit.
+# 2026-08-14: found live at depth=2/k_depth2=2 here, contradicting this
+# comment and never actually A/B'd at k_depth2=2 -- reverted to match the
+# comment's stated intent (depth-1 only) pending a fresh, deliberate test.
+# 2026-08-19: actually applying the revert this comment already decided on --
+# found still live at depth=2/k_depth2=2 despite the note above saying
+# "reverted", i.e. the config drifted from its own stated conclusion without
+# the value ever being changed (see memory: config-comment-drift-pattern).
+# CLAUDE.md's own DEPTH-2 entry is unambiguous: a real same-prompt A/B found
+# no throughput benefit from depth=2/k_depth2=1 (disk time UP 1.54s->1.82s,
+# Unified RAM waste roughly doubled 4.0%->7.9%, tok/s within noise both
+# ways) and k_depth2=2 was never validated at all. Reverting to the
+# validated default now.
+# 2026-08-25: re-enabled (depth=2, k_depth2=4) three times now as one tier
+# of a multi-tier pilot setup. Attempt 1 (DEPTH-2 top-4->RAM, ATTN-PILOT
+# top-4->VRAM, DEPTH-1 top-8->VRAM) regressed hard (cache hit 39-40%),
+# root-caused to DEPTH-1's own ram_vram_promote_top_k=8 and ATTN-PILOT's
+# attn_pilot_vram_promote_top_k, both reverted separately. Attempt 3 (this
+# value, DEPTH-1 held at its own settled top-2, ATTN-PILOT top-2) was NOT
+# a regression (decode 0.88/0.88/0.83, within/at the baseline band) but
+# not a clearly confirmed win either -- see attn_pilot_vram_promote_top_k's
+# own comment for the full result. DEPTH-2's own k_depth2=4 contribution
+# has never been isolated in any of these three tests (always combined
+# with the other tiers) -- reverted to 1 along with the rest each time.
+prefetch_pilot_depth = 1  # 1: layer + 1 only, 2: layer + 1 and 2
+# prefetch_pilot_k: raised 4->8 (2026-08-19), real same-prompt A/B on real
+# hardware. Root cause: the "Unified RAM claim" report line showed only
+# 2538/5546 decode misses (45.7%) were being served by a prefetch worker --
+# the other 3008 (54.3%) raced ahead of any worker and paid for a REAL
+# decode-thread-blocking disk read (phase_b's own cost, ~9.8s of decode
+# wall time that run). k=4 simply wasn't pushing enough candidate hints per
+# layer transition to cover the real miss population in time. Raising to 8
+# roughly doubled hint volume/layer and flipped the ratio: claimed-by-decode
+# dropped to ~970-990 (a ~3x reduction), phase_b collapsed ~9.8s->~4.5-4.9s,
+# decode 0.78-0.82->0.83-0.87 tok/s across 4 repeat runs (mean ~0.85,
+# consistently above the pre-change band), overall 0.64-0.66->0.68-0.71
+# tok/s. Prefetch worker health stayed good throughout (pickup ~2.1ms,
+# waste ~12%, no growing backlog) -- not worker-throughput-bound. Swept
+# 8/12/16 too: both landed in the same 0.85-0.87 band as 8 (diminishing
+# returns past 8, claimed-by-decode already near its floor by k=8) --
+# settled on 8 rather than paying the extra hint volume/RAM churn for no
+# further measured gain. active_layer_prewarm_issue (H2D pre-warm into the
+# active-layer area) is now the single largest remaining decode bucket
+# (~16-17s/req, unmoved by this change) -- see its own comment in
+# gpu_topology.hpp for why a dedicated stream and larger decode_async_
+# prewarm_max_batch were both tried and found not to help (genuinely
+# bytes-bound, not contention- or call-count-bound).
+prefetch_pilot_k = 8
+prefetch_pilot_k_depth2 = 1
+# unpacked_expert_format = false
+# Was 55.0 (86% of a 64GB machine) -- cut to 45.0 after a real run showed the
+# workstation freezing on larger prompts (fine on a trivial "hi" prompt,
+# frozen on a bigger one) while a smaller/simpler run stayed fine. Larger
+# prompts drive far more prefetch hints (11671 vs 3779 seen in this file's
+# own history), which grows prefetch_staging_slots' pinned host memory --
+# memory NOT counted against this budget (see that field's comment) -- on
+# top of an already-thin ~9GB of system slack. Restore real headroom first;
+# raise back only after confirming with free -h / dmesg that swap/OOM
+# wasn't the actual cause.
+# 2026-08-16: was 120.0 (95.6% of this box's real 125.5GB physical RAM,
+# WAY past the 86%-of-physical ratio this file's own comment above already
+# established as the safe target once before, at 64GB/55GB) -- real swap
+# activity DIRECTLY measured during a live run at 120.0: swap used peaked
+# at 5.87GB (from a resting ~0.4GB), MemAvailable dropped to a 13.27GB
+# minimum, 989174 major page faults in one 61s request. This exact data
+# (quantized expert weights) compresses at ~1.000x in zram -- see
+# zram-swap-pathological memory note -- so every byte swapped here is
+# real CPU cost for zero space benefit, not a graceful degrade. Matches
+# this file's own prior host_ram_gb incident (comment above) almost
+# exactly, just re-drifted after a RAM upgrade raised the ceiling without
+# re-deriving a safe margin. Cut to 108.0 (~86% of 125.5GB, restoring the
+# SAME ratio this file already validated once) -- user's own read: no
+# real performance difference expected across the 110-120GB range as long
+# as nothing swaps, so this trades a small, likely-unused cache ceiling
+# for real, measured headroom. Re-verify with the same swap/MemAvailable
+# sampling before raising this again.
+#
+# 2026-08-25: found live at 115.0 with no comment explaining a change from
+# the 108.0 the investigation above concluded was safe (91.6% of 125.5GB
+# physical vs the validated ~86% ratio) -- a live instance of this project's
+# own config-comment-drift-pattern, not a deliberate re-tune. Reverted to
+# the documented, validated value before attempting any further
+# ram_pinned_budget_gb increase below, so that experiment starts from a
+# clean, known-safe memory baseline instead of stacking on undocumented drift.
+host_ram_gb          = 108.0
+mirror_model_path = "/data/models/UD-IQ2_M_align"   # 2026-08-15: 2nd copy on the OTHER NVMe (KIOXIA). Stripes expert reads across both devices.
+# 2026-08-16 RETEST under the corrected host_ram_gb=108 -- REGRESSED, worse
+# than the original 40GB/host_ram_gb=120 test despite a much smaller 15GB
+# budget: overall 0.62->0.57 tok/s, hit rate 71.9%->67.0% (-4.9pp, bigger
+# drop than the original -3pp), major page faults 551682->1379430 (2.5x).
+# BUT: baseline's OWN major-fault count (551682) was itself ~40x higher
+# than a clean verification run a few turns earlier (13546, identical
+# config) -- yet the system tested clean/idle immediately after (122GB
+# available, 411MB swap). Likely confounded by many hours of repeated
+# large alloc/free cycles (dozens of ~100GB-RSS process launches this
+# session) causing some form of gradual memory-subsystem degradation not
+# visible in a coarse `free -h` snapshot -- NOT a clean read on this
+# feature specifically. That 15GB retest superseded, see below.
+#
+# 2026-08-17, at 10GB and moe_cache_gb(GPU1)=1.2: caught pinning to a REAL
+# causal bug, not the memory-subsystem confound above. 6/6 back-to-back
+# runs: pin=10 -> ensure_buffers' shared d_x/d_y dense scratch (cuda_
+# manager.hpp, attn_output's dense_proj + rmsnorm_gpu_host) hit `d_x grow
+# to 0.72 MB failed: out of memory` 78/78 times/run (every layer, all
+# during prefill's larger S); pin=0 -> 0/78 every time. Root cause: pinning
+# ~10GB of host memory (949 cudaHostRegister calls) contends with GPU1 for
+# some driver-level resource cudaMemGetInfo's "free" number doesn't
+# capture (likely BAR1/page-table aperture, not raw VRAM bytes) -- so it
+# starves ensure_buffers even though qabsorb/score/WUV's own VRAM budget
+# numbers look identical either way. Real cost: attn_output's outproj step
+# forced onto CPU fallback for part of every prefill layer, 6.48s (pinned)
+# vs 3.85s (unpinned) -- prefill 0.85 vs 1.09 tok/s. Decode was BETTER
+# pinned (0.83 vs 0.76-0.81) as originally intended (upload_expert_active_
+# async's DMA runs genuinely async off pinned host memory) -- the two
+# effects roughly canceled in the overall number, which is why this looked
+# like "no effect"/noise on the very first (single-run, moe_cache_gb=1.3,
+# no reserve) attempt.
+#
+# FIXED via a small VRAM margin reserve for qabsorb/score's own budget
+# checks (attention_layer.cpp, kDenseScratchReserveBytes=256MB, so their
+# cudaMemGetInfo-based sizing never claims the WHOLE currently-free margin
+# and leaves ensure_buffers' later prefill-time grow somewhere to go) --
+# NOT fixed by lowering moe_cache_gb alone (tried first: those budget
+# checks just claim more when more is free, reproducing the same near-zero
+# remainder). VERIFIED ON REAL HARDWARE, 3/3 runs with pin=10 AND the
+# reserve: d_x OOM 0/78 every run, outproj 3.88-3.90s (matches unpinned),
+# decode=0.81, prefill=1.06-1.07, overall=0.67 tok/s -- the best, tightest
+# result of every scenario tested (beats both the original broken-pinned
+# 0.65 and the unpinned-only 0.64-0.67). Costs some WUV coverage (33/78
+# layers vs 49/78 without the reserve, since WUV shares the same shrunken
+# budget) -- net still ahead. Kept ON at this value; see [[ensure-buffers-
+# dense-scratch-reserve-fix]] memory note for the full investigation.
+# 2026-08-25: re-attempted raising this further, now that two things have
+# changed since the 10GB value above was settled: (1) upload_expert_active_
+# async's H2D runs on its OWN dedicated active_layer_stream (2026-08-19), no
+# longer shared copy_stream -- removes the cross-stream-contention confound
+# that made the earlier per-call cudaHostRegister attempts (see gpu_
+# topology.cpp's own "Attempt 1/2" comment) hard to read cleanly; (2) host_
+# ram_gb's own drift back to 115.0 was just corrected to the validated 108.0
+# above, so this experiment started from a known-safe memory baseline. At
+# 10.0, only 949/8468 (~11%) of RAM-tier slabs were actually pinned
+# (shutdown report: "7519 slab(s) stayed pageable (budget exhausted)") --
+# most of what upload_expert_active_async reads from was never pinned, so
+# its DMA was mostly still paying the driver's internal synchronous bounce-
+# buffer tax.
+#
+# Real 3-way A/B on hardware, same prompt, host_ram_gb=108 throughout
+# (decode tok/s = 40/(request_wall - prefill_wall), from the [REQUEST]/
+# [PREFILL] lines; active_layer_prewarm = issue+sync combined):
+#   pin=10 (~11% pinned): decode 0.847, active_layer_prewarm 18.75s, MemAvail min 22.5GB, majflt delta 0
+#   pin=30 (~35% pinned): decode 0.870 (x2 repeat, 0.870/0.870), active_layer_prewarm 17.60s/17.67s, MemAvail min 16.3-16.4GB, majflt delta 0
+#   pin=60 (~70% pinned): decode 0.829, active_layer_prewarm 17.62s, MemAvail min 11.0GB, majflt delta +49 (first nonzero this session)
+# No [ERROR] ensure_buffers: d_x grow ... out of memory at ANY budget tested
+# (the GPU1 contention regression from the 10GB investigation, see [[ensure-
+# buffers-dense-scratch-reserve-fix]]) -- the 256MB reserve fix holds up to
+# 60GB pinned, not just the 10GB it was originally verified at.
+#
+# CONCLUSION: this reconfirms, rather than overturns, gpu_topology.cpp's own
+# "Attempt 1/2" finding -- persistent pinning does NOT reduce active_layer_
+# prewarm's total cost (bandwidth-bound: ~17.6-18.8s regardless of pin
+# level), it only moves WHERE that cost is paid (issue, CPU-blocking, vs
+# sync, the batch-wait) -- issue dropped 16.90s->14.00s->7.99s as more of
+# the source became genuinely pinned, but sync rose 1.85s->3.60s->9.63s in
+# lockstep. pin=30 is the one budget tested where the SHIFT itself bought a
+# small, real, twice-reproduced decode win (0.847->0.870, ~2.7%) with zero
+# regression signal; pin=60 pushed the shift far enough to start eroding
+# real memory headroom (majflt turned nonzero for the first time this
+# session, MemAvailable min fell to 11GB) for a net LOSS (decode 0.829,
+# below even the pin=10 baseline) -- not a stable improvement, a resource
+# squeeze. Settled at 30.0. Do not raise further without re-verifying both
+# the throughput number and majflt/MemAvailable together, per this file's
+# own repeated "measure the pair, not just one" lesson.
+ram_pinned_budget_gb = 30.0
+verbose_moe_log      = false
+promote_hit_threshold = 6
+promote_h2d_threshold = 6
+
+
+# Pinned-host staging pool for the async prefetcher (engine_config.hpp /
+# async_prefetcher.hpp). Was a hardcoded 64-slot compile-time array; a real
+# run's perf report showed "Staged-unused evict: 3659 / 4583 misses" -- i.e.
+# ~80% of misses were correctly predicted (Pilot recall 85.1%) and
+# successfully staged, then round-robin-evicted before the matching cache
+# miss ever consumed them, purely because the pool was too small relative to
+# in-flight hints. Doubled to 128 -- but a longer real run (32k context, 50
+# decode tokens) showed hint volume grows with workload size about as fast
+# as the pool did (11671 hints processed vs 3779 before), so the
+# staged-unused-evict RATIO barely moved (11387/11671 ~= 97.6% vs
+# 3659/3779 ~= 96.8% before). Raised again to 256, then cut back to 128
+# after a real workstation-freeze incident on a large prompt (see
+# host_ram_gb's comment) -- this pool's memory isn't counted against
+# host_ram_gb, and 256 slots at large-prompt hint volume was suspected to be
+# the actual overflow. Each slot lazily grows to the largest expert slab it
+# has held, so this still costs a few GB of additional pinned host RAM --
+# watch total system memory if you raise this again.
+# prefetch_staging_slots -- REMOVED from the parser entirely by the Unified
+# RAM-tier claim/publish rewrite (see CLAUDE.md): the prefetcher now claims
+# real RAMSafetyManager cache slots directly via claim_or_wait, there is no
+# separate staging pool left to size. This key is silently ignored; left
+# commented out so it doesn't look like a live knob.
+# prefetch_staging_slots = 256
+# Was 4 -- bumped to 6 (2026-08-14) to test whether the prefetch backlog
+# (peak 64 hints, avg pickup 8.36ms after the depth-2 fix) is throughput-
+# bound rather than latency-bound. 12 cores total, io_uring gives the
+# decode-thread ring 8 io-wq workers separately -- 6 here still leaves
+# headroom. Revert to 4 if this doesn't move claimed-by-decode/throughput.
+prefetch_worker_threads = 6
+# Against the CURRENT ~1322-slot pool (moe_cache_gb=19.5 on the 3090):
+# avg_vram_slots_per_layer = 1322/75 ~= 17.6, so 0.1 -> ~2/layer (~150
+# total) pre-warmed-but-unpinned, on top of Tier 1's 1050 pinned -- leaves
+# genuine reactive headroom (~1322 - 1050 - 150 ~= 122 slots). Same
+# caution as before applies: this fraction is of the WHOLE pool's average,
+# not of whatever Tier 1 leaves behind -- re-check both together whenever
+# pinned_vram_capacity or moe_cache_gb change.
+pin_vram_lru_fraction = 0.1
+pin_ram_fraction = 0.5
+ram_cache_layer_adaptive = true
+vram_evict_demote_to_ram = true
+# OMP threads for parallel disk reads of a layer's topk cache misses.
+# Was the default (4)
+# UNCAPPED omp parallel-for (bounded only by core count, 12 on this Xeon
+# W-2235) and gets ~3.7x our measured disk throughput (1.77 GB/s vs our
+# 0.48 GB/s) on the same NVMe -- suspiciously close to a 3-4x parallelism
+# ratio. Raised to 8 (not the full 12 cores) per explicit request to leave
+# headroom for other CPU work (OMP dequant/dot, prefetcher). See CLAUDE.md.
+#
+# 2026-08-13: real decode-side breakdown (a 40-token [REQUEST] line) showed
+# ram_scan=23.71s (43% of expert=54.91s), of which phase_b (real blocking
+# disk reads) alone was 15.28s (21% of the WHOLE request's wall time) --
+# the single largest still-open bucket (active_up, the other big one, is
+# already exhaustively investigated with no further win found, see
+# CLAUDE.md). Testing 8->10 (not the full 12) as a real A/B: the original
+# OS-unresponsiveness incident that justified capping this at 8 was tied
+# to a DIFFERENT config state (pinned_vram_capacity had been raised much
+# higher at the time) -- pinned_vram_capacity is now settled at 1000, a
+# more conservative value, so the specific trigger condition is less
+# likely to recur, but this is a real, unverified hypothesis, not a
+# certainty -- revert to 8 immediately if the machine becomes unresponsive
+# to other commands during a run.
+expert_fetch_threads = 10
+# NEW: process-wide default OpenMP team size for every OTHER parallel
+# region (attention/dense matmuls, the CPU expert-fallback dequant+dot
+# path, reference dequant) -- these had NO cap at all until now (only
+# expert_fetch_threads above, for its own one region, was ever capped),
+# defaulting to every available core with nothing to stop several regions
+# running concurrently. A real run made the OS itself become unresponsive
+# to other commands from exactly this, once the CPU expert-fallback path's
+# call volume grew large (a direct side effect of raising
+# pinned_vram_capacity elsewhere in this file -- see CLAUDE.md). Set
+# explicitly to 8 (matching expert_fetch_threads' own already-established
+# reasoning for this 12-core machine) rather than leaving the 0/auto
+# default (hardware_concurrency()-2 = 10 here), since the auto value is
+# less conservative than what's already been validated as safe headroom
+# on this exact hardware.
+#
+# 2026-08-13: raised to 10 alongside expert_fetch_threads above, same
+# reasoning -- pinned_vram_capacity's since-settled lower value (1000)
+# means the CPU expert-fallback path's call volume that caused the
+# original incident is less likely at this setting, UNVERIFIED. Still
+# leaves 2 of 12 cores as headroom, not the full auto default of 10
+# (hardware_concurrency()-2) stacked on top of expert_fetch_threads=10
+# concurrently -- revert both back to 8 together if problems recur.
+omp_max_threads = 10
+
+# Re-enabled for testing (was pin_file="" / pin_threshold=0 -- see
+# glm52_dual.toml's history for why it had been turned off, and re-verify
+# hit rate before/after on this checkpoint given that prior result).
+pin_file      = ".moestream_usage"
+pin_threshold = 6
+# prefill_pin_file: NEVER set in this config until now -- confirmed via a
+# filesystem-wide search that .moestream_usage_prefill has never existed
+# anywhere on this box, for GLM or DeepSeek, in this tree OR the 8.2/8.3_pb
+# reference trees (dump_usage_prefill() no-ops when this is empty). So this
+# is NOT part of the decode-throughput gap chased against the 8.2 reference
+# earlier -- that reference never had this on either. It's a distinct,
+# previously-untried lever specific to PREFILL, and the test prompt (11-token
+# "write a python hello world") is exactly the short-prefill case it targets:
+# without it, prefill-phase routing is invisible to startup preload (the
+# combined pin_file histogram is decode-dominated, since decode contributes
+# far more routing volume/run -- see this key's own doc comment above), so a
+# prefill-only hot expert can get starved out of the startup preload ranking
+# and instead gets loaded reactively DURING the timed prefill call (Phase 2
+# warm-up -- CLAUDE.md's own prior investigation found this filling 94% of
+# all remaining free VRAM slots reactively on an 11-token prompt).
+# NOTE: this file does not exist yet, so it will NOT help on the very next
+# run -- dump_usage_prefill() at shutdown will WRITE it for the first time;
+# preload can only READ it back starting the run after that. Expect two runs
+# needed: run 1 populates it (no prefill benefit yet), run 2+ preloads from
+# it and should show a prefill-specific (not decode-specific) improvement --
+# watch `prefill=X tok/s` and the `[PIN] prefill_pin_file (...)` startup log
+# line specifically, not the decode/overall numbers this session has mostly
+# been tracking so far.
+prefill_pin_file = ".moestream_usage_prefill"
+# 2026-08-12 finding: prefill_pin_file's merge fix correctly bounds prefill's
+# GUARANTEED share of pinned VRAM to pin_global_floor_per_layer (=1 below,
+# 75 slots total) -- real evidence: "Prefill warm-up: N attempted" in the
+# shutdown report has stayed flat at 249-251 across EVERY variant tried
+# (off / buggy merge / fixed merge / frozen usage file), meaning placement
+# ranking was never going to move prefill's ~249-expert-per-run cold-start
+# footprint; 75 protected slots can't cover it. prefill_warm_via_prefetcher
+# targets the actual bottleneck instead (in-critical-path blocking loads,
+# not WHICH experts are pre-pinned) -- moves Phase 2's reactive fetches
+# onto the background prefetcher (async, overlapped) instead of blocking
+# the timed prefill call for each one. UNVERIFIED for wall-clock impact on
+# this model -- real A/B needed (freeze_usage_stats=true above keeps this
+# a clean single-variable test against the current 0.70 decode / ~0.55
+# prefill baseline).
+prefill_warm_via_prefetcher = true
+# 2026-08-12: SETTLED, false, two real attempts tried. Original placement:
+# 420 hints pushed (vs ~930 baseline), prefill 0.56. Reordered (follow-up
+# runs after the per-layer candidate loop instead of before): only a
+# PARTIAL recovery, 498 hints / prefill 0.58 -- still short of the clean
+# 0.60 baseline `prefill_warm_via_prefetcher` alone already delivers.
+# Root cause of why the reorder was incomplete: it only removes the
+# same-layer race (negligible -- a hint essentially never lands within its
+# own layer's processing anyway); the DOMINANT race is cross-layer --
+# layer N's follow-up still runs before layer N+1's own candidate loop
+# regardless of where it sits inside layer N's own call, since Phase 2
+# fires exactly once per layer, strictly sequential. A real fix would need
+# a genuinely separate, non-competing free-slot budget for opportunistic
+# promotion, not a call-order tweak -- not attempted, ROI unclear against
+# a lever (prefill_warm_via_prefetcher alone) that already delivers the
+# full win for free. See CLAUDE.md.
+prefill_opportunistic_promote = false
+# Capped (was 0/auto-fill-available-capacity): a real run showed auto-fill
+# pinning 1579/1642 VRAM slots (96%) at startup from a prior run's usage
+# history, starving both the reactive cache and the decode-time GPU
+# fallback of evictable room -- GPU dispatch collapsed from 94.7% to 48.8%
+# and disk reads exploded to 133GB for 52 tokens. 8/layer caps the
+# worst-case startup preload to ~608 slots (76 layers x 8) instead of
+# nearly the whole cache. See CLAUDE.md.
+#
+# A/B test at 13 (975/1642 slots, ~59% of the VRAM cache) showed hit rate
+# went slightly DOWN (52.3% vs. 53.4-53.9% at 8/layer), not up, while
+# Pinned residents grew to ~60% of the whole cache -- no measured benefit
+# from pinning more given how thin .moestream_usage's history still is
+# (max count ~24-25). Reverted back to 8, with a note not to raise it again
+# until the usage file has a much richer history.
+#
+# Re-testing now that it does: latest run shows 10050 known experts, max
+# count 75 (3x richer than the last test). Raised back to 13/layer --
+# closest approach to the pinned_vram_capacity=1024 target below given
+# floor(1024/75)=13 and no per-layer remainder distribution exists (exact
+# 1024 is unreachable with a uniform per-layer count; max achievable is
+# 13*75=975). Confirmed working: 974 pinned in the real run that validated
+# the eviction-race and moe_cache_gb fixes above.
+#
+# Raised to 16 (1200 total) when the main pool was 1464 slots -- but
+# moe_cache_gb below has since dropped to 9.0, shrinking the pool to only
+# ~616 slots. A real run showed this: pinned_vram_capacity=1200 against a
+# 616-slot pool meant Tier 1's preload greedily pinned nearly the ENTIRE
+# pool (unpinned_slots=1 left), leaving virtually no room for evict_lru to
+# find a victim during actual generation -- a flood of "evict_lru found NO
+# victim" errors throughout the run, not just at startup. Worse, since
+# Tier 1 iterates layers in unordered_map order and stops once the pool
+# physically runs out, whichever layers get processed LAST can end up with
+# ZERO pinned experts while earlier ones get their full quota -- an
+# uneven, iteration-order-dependent shortfall, not a fair one.
+# Rebalanced against the CURRENT ~616-slot pool: 5/layer x 75 = 375 (~61%
+# of the pool), leaving ~241 slots (~39%) genuinely reactive -- a similar
+# ratio to the 974-pinned/1328-slot run that hit 42.3% hit rate before
+# pinning was pushed further. ALWAYS re-check this against moe_cache_gb
+# below whenever either value changes -- they must be sized together, not
+# independently; pinned_vram_capacity should target roughly 50-60% of
+# whatever cache_cap the log's "[GPU] Expert VRAM cache: N slots" line
+# actually reports for the CURRENT moe_cache_gb, not a number left over
+# from a previous experiment.
+#
+# CORRECTED: the [[gpus]] blocks below had drifted out of sync with this
+# file's own title comment and the "swapped back" note further down --
+# those describe 3090=vault/moe, 5060Ti=dense/CoreEngine (the validated
+# layout that measured 0.21 tok/s), but the actual [[gpus]] role= fields
+# were still set to the OPPOSITE (3090=dense, 5060Ti=moe) -- the slower
+# layout, confirmed by a real run's "[GPU] Active layer area allocated ...
+# on GPU 1" (GPU 1 = 5060 Ti = vault under that backwards config) and its
+# throughput (0.19 tok/s, 34.2% hit) trailing the validated 0.21 tok/s/35%
+# baseline. A config's comments describing an intended state is not proof
+# the fields below actually hold that state -- always check the real
+# [[gpus]] role= values, not just the surrounding prose. Fixed by putting
+# the [[gpus]] blocks back to match: 3090->moe (vault), 5060Ti->dense
+# (CoreEngine). Real pool size for moe_cache_gb=19.5 on the 3090: "[GPU]
+# Expert VRAM cache: 1322 slots (19.5 GB total)".
+#
+# DISPROVEN BY A CLEAN A/B ON THIS EXACT POOL: raised to 14/1050 (79% of
+# the 1322-slot pool) on the theory that ~80% pinned was historically
+# best -- but that "82% was best" data point came from a DIFFERENT, larger
+# 1464-slot pool with different usage history; it doesn't transfer here.
+# A same-pool, same-role-layout, single-variable comparison (only this
+# value changed) showed the OPPOSITE: 825/11 (62%) -> 0.21 tok/s/35% hit;
+# 1050/14 (79%) -> 0.19 tok/s/38% hit -- hit rate genuinely improved but
+# throughput got WORSE. Root cause, visible directly in the log: pinning
+# 1050/1322 slots leaves only ~122 reactive slots (vs 347 at 825 pinned)
+# for everything else, and that shrunk reactive pool has to
+# promote-then-immediately-CPU-fallback far more often to keep up --
+# "CPU fallback cause"/"Three-tier caching" showed promotions jumping
+# 1485->2053 (all attributed to just_promoted), and the extra CPU
+# dequant+dot cost (+15s/+5s) outweighed the hit-rate gain. Confirmed
+# 825/11 (~0.20-0.21 tok/s across two separate real runs, within normal
+# temp=0.7 sampling noise of each other) as the settled value on this
+# pool. General lesson: a pinned-fraction "sweet spot" found on one pool
+# size/usage-history combination does not transfer to a different pool
+# size -- re-verify with a real same-pool A/B every time, don't
+# extrapolate the ratio. See CLAUDE.md.
+#
+# CONFIRMED 12/900 (68%) via a real run -- matches or slightly beats the
+# 825/11 baseline: 0.21 tok/s (tying the best 825 run), 34.9% hit rate
+# (in the same band as 825's 33.6-35%), 1500 promotions (in the same
+# healthy band as 825's 1485-1537, nowhere near 1050's 2053), and the
+# FASTEST expert= time of every run tested so far (146.71s vs 825's
+# 148.20-154.53s). Reactive pool at 900 pinned: 1322-900-150(tier2
+# prewarm) = ~272 slots -- enough headroom to avoid 1050's promotion-churn
+# problem (~122 reactive slots there). 900 is now the settled value,
+# superseding 825 -- the margin over 825 is small enough that part of it
+# is likely normal temp=0.7 run-to-run noise, but it is clearly NOT worse,
+# and nowhere near the 1050 cliff. If tuning further, the next useful
+# probe is somewhere in [900, 1050) to find where the falloff actually
+# starts -- untested past this point.
+#
+# pin_topk_per_layer itself is now IGNORED -- pin_strategy below is set to
+# global_topn, which replaces the uniform-per-layer distribution this
+# value drove with a per-layer count derived from ranking every
+# (layer,expert,count) triple across ALL layers together. Left here,
+# unused, as the per_layer_topk fallback value in case pin_strategy is
+# ever reverted -- see that field's own comment.
+pin_topk_per_layer = 12
+
+# pin_strategy: CONFIRMED via a real same-budget A/B against the 900/12
+# per_layer_topk baseline (0.21 tok/s, 34.9% hit, 1500 promotions,
+# expert=146.71s, 191.96s total) -- global_topn matched throughput
+# (0.21 tok/s) while being faster on every other axis: 188.46s total (the
+# fastest run this session), expert=143.23s, only 1431 promotions, same
+# hit-rate band (34.6%). Margin is small enough that part of it is likely
+# temp=0.7 noise, but it was never worse on any metric. Confirmed working
+# as designed via [PIN-CONCENTRATION]: layer 4 (flattest layer) dropped to
+# just 7.4% coverage (its floor-of-1 pin only), while layer 31 (most
+# concentrated that run) got pinned up to 54.5% coverage -- real budget
+# reallocation from flat to concentrated layers, not just noise in the
+# aggregate numbers. Kept as the active strategy. If ever reverting to
+# per_layer_topk, pin_topk_per_layer=12 above is the proven fallback. See
+# CLAUDE.md's Pin Strategy entry.
+pin_strategy = "global_topn"
+# Every layer gets at least this many pinned slots (75 layers x 1 = 75,
+# taken off the top of pinned_vram_capacity) before the remaining budget
+# is spent on the global ranking -- confirmed this is enough to keep even
+# the flattest layer (layer 4, dropped to 7.4% coverage under this floor)
+# from losing protection entirely; a real run never showed it at 0 hits
+# skyrocketing or otherwise misbehaving. No evidence yet that raising this
+# would help -- untested past 1.
+pin_global_floor_per_layer = 1
+
+# Three-tier VRAM caching configuration
+# Sized for the REAL ~1322-slot pool (moe_cache_gb=19.5 on the 3090
+# below). 900 pinned (~68%) is the CONFIRMED settled TOTAL BUDGET via real
+# same-pool A/B under per_layer_topk against both 825 (62%, matched/
+# slightly beaten) and 1050 (79%, clearly worse -- promotion churn from a
+# starved reactive pool) -- see pin_topk_per_layer's comment above for the
+# full data. Kept unchanged while testing pin_strategy=global_topn above,
+# so only the DISTRIBUTION of this same 900-slot budget changes, not its
+# size.
+# Was raised to 2048 (likely at the same time as the host_ram_gb bump to
+# 120 after the RAM upgrade) -- but this value is VRAM-only and unrelated
+# to host RAM. 2048 exceeds the real ~1410-slot VRAM pool, so global_topn's
+# preload tried to pin nearly the entire cache, leaving unpinned_slots=0
+# and a flood of "evict_lru found NO victim" errors during generation --
+# the exact same failure mode already documented above for a 1200/616-slot
+# mismatch. Reverted to the previously-settled 900 (~68% of a ~1322-1410
+# slot pool). See CLAUDE.md.
+pinned_vram_capacity = 1200        # total pin budget -- confirmed via real A/B under per_layer_topk, now being redistributed via global_topn
+# 2026-08-19 A/B, REVERTED to the original 256 -- real hardware test at both
+# 128 (moe_cache_gb 19.5->20.5, +68 slots) and 64 (moe_cache_gb 19.5->22.0,
+# +169 slots, +12.9%) with the VRAM freed reallocated into the main cache.
+# 256 was confirmed massively oversized (0 "pool full" skips even at 64,
+# a 75% cut) -- but reallocating that freed VRAM produced ZERO measurable
+# effect either time: cache hit rate stayed flat at 66.0-66.2% (vs. the
+# 65-71% baseline band) despite up to 12.9% more main-cache capacity, and
+# active_layer_prewarm_issue (the bucket this was meant to shrink, by
+# reducing how much data ever needs to cross it) didn't move (16.1-16.5s,
+# same band as the untouched baseline). Conclusion: this workload's expert
+# access pattern isn't gated by marginal main-cache-size growth in this
+# range -- the reactive+pinned pool already captures whatever locality
+# exists at this scale; a closed lever, not just an untried one. Reverted
+# to the original, well-margined 256/19.5 rather than keeping the more
+# aggressive, less-margined split for zero measured benefit -- a single
+# short (40-token) test prompt shouldn't be trusted to generalize a smaller
+# active-layer safety margin to longer/different prompts with more diverse
+# per-token miss patterns. See CLAUDE.md's 2026-08-19 entry.
+active_layer_capacity = 256        # Active layer workspace size for current-layer experts
+use_active_layer_area = true       # Enable temporary layer area (prevents LRU eviction)
+# Promote an active-layer expert into the real VRAM LRU cache (D2D copy)
+# once it's re-accessed this many times while resident, instead of just
+# being freed when its layer's window closes. This whole promotion path
+# (and the hit-counting it depends on) didn't exist before -- the active
+# layer area used to be a pure temporary hold-and-discard buffer, and
+# n_active_layer_hits was never incremented anywhere, so 0 was expected
+# regardless of how often it was actually being used.
+active_layer_promote_hit_threshold = 1
+
+# 2026-08-26, REAL A/B COMPLETE, REVERTED TO OFF: redirects DEPTH-1/ATTN-
+# PILOT's speculative one-layer-ahead RAM->VRAM promotion into this same
+# active-layer pool instead of the main VRAM LRU cache -- motivation: a
+# real run showed rank-3's own recall accuracy at 93.3%, yet promoting it
+# into the main cache still dropped cache hit 67.5%->65.3%, because main-
+# cache promotion pays a real eviction cost from the whole shared 78-layer
+# pool even on a correct guess, while the alternative (do nothing) reaches
+# VRAM via this same active-layer pool for free. Mechanism fully validated
+# (cache hit 67.1%->70.6-71.7% across every width tested, waste a clean
+# 4.0-5.2%, main-cache eviction fully eliminated) across three real
+# attempts:
+#   Attempt 1 (sync upload_expert_active): cache-hit win, but a real,
+#   measured 3.10s/request synchronous-DMA blocking regression (decode
+#   0.87->0.79).
+#   Attempt 2 (async-batched -- upload_expert_active_async + ONE
+#   sync_active_layer_batch per transition, after both DEPTH-1 and ATTN-
+#   PILOT k-loops): active_up confirmed 0.00s (blocking bug fully fixed),
+#   but decode only recovered to 0.81 -- the async issues share decode_
+#   async_prewarm's own active_layer_prewarm_issue/sync bucket, this
+#   project's own most-investigated, conclusively bandwidth-bound decode
+#   cost. Batching fixes blocking, not bandwidth.
+#   Attempt 3 (speculative_active_layer_max_k, a SEPARATE narrower cutoff
+#   from ram_vram_promote_dynamic_layer's own width): max_k=3->0.81/70.8%,
+#   max_k=2->0.83/71.3%, max_k=1->0.83/71.7% (tied throughput, best cache-
+#   hit -- a real plateau, no further gain narrowing past 2).
+#   Diagnostic: disabled decode_async_prewarm alongside max_k=1 to test
+#   the "shared pipe" hypothesis directly -- DISPROVED simple zero-sum
+#   framing. active_layer_prewarm_issue/sync dropped as expected, but the
+#   plain synchronous reactive-path timer (active_up) jumped to 18.18s and
+#   decode came in WORSE (0.82) -- decode_async_prewarm was doing real
+#   necessary work, not just contending; the two features are
+#   complementary, not substitutable.
+# Net: every qualitative win is real, but decode throughput never beat the
+# 0.87 tok/s / 67.2% hit pre-feature baseline on this prompt/hardware.
+# REVERTED to off, re-confirmed clean (0.87 tok/s, 67.2% hit, zero
+# errors). Kept fully built/tested for a future revisit -- see CLAUDE.md's
+# 2026-08-26 entry for the complete writeup. Next real angle, not yet
+# tried: a combined per-transition DMA budget shared across both features
+# instead of each independently deciding its own volume.
+speculative_promote_to_active_layer = false
+# Best-found value if re-enabled (see the Attempt 3 sweep above) --
+# max_k=1 and max_k=2 were statistically tied on throughput; kept at the
+# narrower of the two.
+speculative_active_layer_max_k = 8
+
+# Reverted to true for a controlled A/B against the MoEStream_8.2 reference
+# (0.75 decode tok/s, 79% hit, host_ram_gb=120/pinned_vram_capacity=1300,
+# move_on_promotion=true) -- COPY semantics + ram_copy_reclaim_threshold was
+# never validated as a win for GLM specifically (only DeepSeek), and was
+# still the one uncontrolled variable left after host_ram_gb/
+# pinned_vram_capacity were already matched to the reference without fully
+# closing the gap (0.66 decode/73.3% hit vs the reference's 0.75/79%).
+move_on_promotion = true          # MOVE instead of COPY on RAM→VRAM promotion (eliminates tier overlap)
+# ram_copy_reclaim_threshold's own proactive threshold-based reclaim IS
+# gated !move_on_promotion (ram_manager.hpp), so it's correctly a no-op
+# here. BUT the comment that used to sit here ("moot while move_on_
+# promotion=true, no COPY-mode slots to reclaim") was factually wrong even
+# before this: ram_vram_promote_top_k's pilot promotion path is ALWAYS
+# COPY-mode internally (allow_move=false) regardless of this flag -- a real
+# run showed ~1900+ COPY-mode promotions/session even with move_on_
+# promotion=true. See CLAUDE.md's 2026-08-19 entry: those slots previously
+# only got marked also_in_vram=true (the SEPARATE, always-on passive
+# reclaim-priority signal every RAM eviction scan already uses, unrelated
+# to this threshold) on a later re-promotion call gated behind promote_
+# hit_threshold, which a once-per-token-per-layer expert access pattern can
+# easily never reach in one run -- fixed in do_promote_ram_slot_to_vram's
+# COPY branch to mark it immediately once the async copy is confirmed
+# issued, safe because copy_still_pending() is independently checked by
+# every reclaim site regardless of also_in_vram. If host RAM pressure is
+# still a concern after that fix, ram_copy_reclaim_threshold remains a
+# real, untried lever specifically for move_on_promotion=false.
+
+# ram_vram_promote_top_k: pilot-prediction-driven RAM->VRAM speculative
+# promotion (see CLAUDE.md's dedicated entry, validated for DeepSeek-V4 at
+# top_k=2). Never enabled for GLM before -- "Pilot RAM->VRAM promotion: 0
+# attempted" every single run until now. Chosen from a real GLM capture of
+# "Pilot recall by rank (DEPTH-1, ram-only)" -- the exact population this
+# feature acts on (RAM-resident, not-yet-VRAM-resident l+1 predictions):
+# k0=99.4%(n=1017) k1=97.3%(n=1112) k2=96.8%(n=1204) k3=92.9%(n=1332)
+# k4=87.4%(n=1476) k5=79.0%(n=1580) k6=65.7%(n=1567) k7=47.5%(n=1651) --
+# confidence stays high through k2, then genuinely breaks (k3 already a real
+# step down, k4+ a cliff). 2 chosen to capture the two highest-confidence
+# ranks without reaching into k3's meaningfully weaker territory -- lands on
+# the same value DeepSeek settled on, but derived from GLM's own curve, not
+# copied. Always COPY-mode internally (allow_move=false, do_promote_ram_
+# slot_to_vram) regardless of move_on_promotion above, so a wrong
+# speculative guess never deletes its own RAM fallback. UNVERIFIED ON REAL
+# HARDWARE for GLM specifically -- first real test, and GLM has a structural
+# wrinkle DeepSeek doesn't (use_active_layer_area=true sits a THIRD tier
+# between RAM and main VRAM), so the interaction is genuinely untested.
+# Watch cache-hit rate and Three-tier caching's active-layer-upload count
+# (a win here should show up as FEWER active-layer uploads, since decode
+# increasingly finds experts already in the main VRAM cache instead of
+# falling through to the reactive active-layer path).
+# 2026-08-14: found live at 3, contradicting this comment's own conclusion
+# and never actually tested at that value -- corrected to match.
+# 2026-08-19: re-tested at 3 against the NEW prefetch_pilot_k=8 baseline
+# (this value was last tuned before that change, on a different RAM-tier
+# coverage picture) -- reproduced the same over-promotion regression
+# documented above: cache hit dropped to 62.4% (below the 65-71% band),
+# decode within noise of 2's own band but not better. 2 remains correct at
+# every value tested SO FAR (1/2/3/4 all real-A/B'd against this baseline).
+# 2026-08-25: tried 8 (= prefetch_pilot_k, "promote ALL of DEPTH-1's
+# predictions") as part of a new three-tier setup alongside DEPTH-2 top-4
+# ->RAM and ATTN-PILOT top-4->VRAM/ranks4-7->RAM. Real cross-pilot
+# promotion-dedup was added the same session (n_pilot_promote_dedup_
+# skipped, execution_layer.cpp's vram_promoted_this_transition) and
+# confirmed working -- 5316-5411/17491-17682 (~30%) of promotion attempts
+# WERE genuine duplicates from DEPTH-1/ATTN-PILOT both targeting the same
+# l+1 expert, exactly as suspected from the earlier "9900 attempted" number.
+# But even with duplicates removed, the underlying over-promotion-VOLUME
+# regression (too many low-confidence speculative promotions -> VRAM/RAM
+# churn) was WORSE than any prior top_k test, not better: cache hit 39-40%
+# (two runs), decode 0.75-0.76 tok/s, RAM waste ~50% -- confirms the
+# monotonic-degradation pattern from 1/2/3/4 continues straight through 8,
+# with no floor found yet. REVERTED to 2 (the only value in this whole
+# 1/2/3/4/8 sweep that doesn't regress). Do not raise this again without a
+# structural change to how promotion volume is bounded (e.g. a shared
+# per-transition budget across ALL pilot sources, not independent per-
+# source cutoffs) -- see CLAUDE.md for the full writeup.
+# 2026-08-25 attempt 3: HELD at this settled value (not raised) alongside
+# ATTN-PILOT's own top-2 (attn_pilot_vram_promote_top_k=2) + DEPTH-2 top-4
+# -- the conservative retry, isolating whether a small ATTN-PILOT
+# contribution alone (without also inflating DEPTH-1's own volume, as
+# attempt 2 did) behaves differently. Result: not a regression this time
+# (decode 0.88/0.88/0.83 across 3 runs), but within/at the established
+# baseline band, not clearly above it -- see attn_pilot_vram_promote_top_k's
+# own comment for the full numbers.
+ram_vram_promote_top_k = 0  # 0 because ram_vram_promote_dynamic_layer below
+    # is now the live mode (mutually exclusive with top_k>0) -- this value
+    # was the settled flat baseline before that; restore to 2 if reverting
+    # ram_vram_promote_dynamic_layer to off.
+
+# 2026-08-26: per-layer accuracy veto, layered on top of whatever top_k is
+# set above. Real [PILOT-BY-LAYER] data (CLAUDE.md) shows a genuine 33-44pp
+# per-layer accuracy spread for all three pilots (early layers 3-20 much
+# less predictable than mid/late layers 40-77) -- this vetoes a promotion
+# the top_k cutoff above already allowed, per-layer, once that layer has
+# min_samples of live data, if that layer's OWN measured accuracy is below
+# threshold. Real A/B (see dense_dispatch.hpp's layer_promote_allowed and
+# CLAUDE.md for the full writeup):
+#   top_k=2 (this settled baseline) + gate on, threshold=0.65, min_samples=30,
+#   3 runs: decode 0.87/0.84/0.86 (matches the top_k=2 baseline band exactly),
+#   cache 68/66/68% (also matches) -- real, working (3/9/14 real vetoes, not
+#   zero), but too light-touch to move anything: top_k=2 is already
+#   conservative and min_samples=30 means most layers don't cross the floor
+#   until late in a 40-token run.
+#   top_k=3 (a value ALREADY KNOWN to regress under the flat cutoff, 62.4%
+#   cache hit) + gate on, min_samples=15 (to engage earlier): cache STILL 63%
+#   both runs (2x), decode 0.85/0.83 -- gate did NOT rescue the regression,
+#   only 9/3178 vetoes both times. Root cause: rank-3's own weakness (the
+#   thing driving that regression) is a PER-RANK effect (n_pilot_ram_only_
+#   hits_by_rank), not a per-LAYER one -- most layers' own aggregate DEPTH-1
+#   accuracy (hits/topk_sum, pooling all ranks) stays comfortably above 0.65
+#   even where a SPECIFIC rank within that layer is weak, so this per-layer-
+#   only gate can't see or veto that. A per-(layer,rank) gate would be needed
+#   to actually address top_k=3's own regression -- not built; the 128x8
+#   counter grid this would need doesn't exist yet. Left OFF (this settled
+#   top_k=2 baseline is unaffected either way -- the light-touch test above
+#   showed zero cost to leaving it on, but zero benefit either, so off by
+#   default per this project's own convention).
+ram_vram_promote_layer_gate = false
+ram_vram_promote_layer_gate_threshold = 0.65
+ram_vram_promote_layer_gate_min_samples = 30
+
+# 2026-08-26: direct graduation of the veto-only gate above into a smooth
+# per-layer WIDTH, per user feedback that the plain veto moved nothing
+# either way -- mutually exclusive with ram_vram_promote_top_k above (set
+# to 0 above to activate this mode instead).
+# REAL A/B history, 3-tier design (same prompt as every other test in this
+# file, 3-4 runs each), before the 5-tier widening below:
+#   threshold=0.80/max_k=4 (i.e. ANY layer >=80% got k=4): a real
+#   regression -- decode 0.86/0.80/0.80 (mean 0.82, vs the 0.84-0.87
+#   baseline band), cache 67/64/63% (below the 65-71% band in 2 of 3 runs).
+#   Same failure shape as this project's other over-aggressive promotion
+#   regressions (top_k=3/4/8 flat) -- a layer's own aggregate accuracy
+#   (hits/topk_sum, pooled across ALL ranks) doesn't guarantee every
+#   individual rank within it is strong, the same per-layer-vs-per-rank
+#   axis mismatch that made the plain veto gate unable to rescue top_k=3.
+#   threshold=0.80/max_k=3 (one step above the settled base of 2, not two):
+#   a real, consistent win -- 4 runs, decode 0.88/0.86/0.87/0.85 (mean
+#   0.865, at-or-above the baseline band's own top, never dipped low),
+#   cache 68/67/68/67% (mean 67.5%), zero errors.
+# 2026-08-26 follow-up: user asked whether a NARROWER, higher band (e.g.
+# >=90%) deserves an even wider k=4, given the >=80% population that
+# regressed above is broad (~60 of 75 tracked layers). A real
+# [PILOT-BY-LAYER] capture confirmed a genuine, much narrower >=90%
+# population exists (~11-15 of 75 tracked layers, run-to-run, mostly
+# layers 54-66 plus a few scattered ones like 24/51/52/69/75 -- routing
+# isn't bit-exact on this hardware, so this count varies slightly run to
+# run). Widened from 3 tiers to 5 to test this directly. Real A/B, 3 real
+# threshold_4 values tried, all a WASH against the clean k=3-only win
+# above -- none beat it, none severely regressed either (verified this
+# isn't a resource-non-release artifact between back-to-back runs: GPU
+# VRAM and host RAM both confirmed fully clean between runs, and the
+# sequence recovered to its best-ever value immediately after its worst,
+# ruling out a monotonic degradation):
+#   t4=0.90/t3=0.80 (~15 layers get k4): decode 0.87/0.86/0.86/0.80 (mean
+#   0.848), cache 67/67/67/64% (mean 66.25%) -- 1 real low outlier.
+#   t4=0.93/t3=0.80 (~6-7 layers get k4, narrower): decode 0.85/0.86/0.84
+#   (mean 0.85), cache 67/67/65% (mean 66.3%) -- no severe outlier, but
+#   still below the k3-only baseline's own mean.
+#   t4=0.93/t3=0.85 (also narrows the k3 band, ~38 layers instead of ~58):
+#   decode 0.88/0.86/0.84 (mean 0.86), cache 68/67/65% (mean 66.7%) --
+#   closest to the baseline, still not clearly better.
+# Honest conclusion: adding a k=4 tier hasn't demonstrated a real benefit
+# at ANY threshold tried on this prompt/hardware -- every variant landed
+# at or slightly below the clean k3-only win's own mean (0.865/67.5%,
+# zero outliers across 4 runs), never clearly above it. REVERTED to the
+# proven win as the live default: threshold_4=0.99 makes k=4 practically
+# unreachable (max observed DEPTH-1 accuracy on this model is ~95-96%),
+# threshold_3=0.80 matches the win's own validated value exactly -- so
+# live behavior is functionally identical to the clean k3-only result.
+# The 5-tier machinery is kept fully built/configurable (not reverted to
+# 3 tiers) so a future session can re-open this question cheaply -- e.g.
+# on a longer/different prompt, where the >=90% population's real value
+# might differ from what this one 40-token prompt showed.
+ram_vram_promote_dynamic_layer = true
+ram_vram_promote_dynamic_threshold_4 = 0.90
+ram_vram_promote_dynamic_threshold_3 = 0.80
+ram_vram_promote_dynamic_threshold_2 = 0.70
+ram_vram_promote_dynamic_threshold_1 = 0.55
+ram_vram_promote_dynamic_k_tier4 = 4
+ram_vram_promote_dynamic_k_tier3 = 3
+ram_vram_promote_dynamic_k_tier2 = 2
+ram_vram_promote_dynamic_k_tier1 = 1
+ram_vram_promote_dynamic_k_floor = 0
+ram_vram_promote_dynamic_cold_start_k = 2
+ram_vram_promote_dynamic_min_samples = 30
+
+# 2026-08-16 "Direction 1" REAL A/B TEST: route every Nth REACTIVE
+# (proven-hot, real hit_count crossed -- not speculative) promotion to
+# GPU1's dual-role slice instead of the general pool. See RAMSafetyManager::
+# reactive_promote_gpu1_every_n's own comment (ram_manager.hpp) and
+# doc/gpu-utilization-vram-analysis.md. Starting at 4 (every 4th qualifying
+# reactive promotion) as a first, moderate test -- NOT YET VALIDATED.
+reactive_promote_gpu1_every_n = 0
+
+# 2026-08-16 "Idea 1" REAL A/B TEST: prediction-based GPU1 dual-role-slice
+# loading, see doc/gpu-utilization-vram-analysis.md and the memory note
+# from this investigation. Narrowest possible first cut, per user's own
+# choice: rank 4 ONLY, capped at 1 promotion per layer transition. Targets
+# ONLY the dual-role slice (never the shared vault pool -- see
+# GpuTopology::dual_role_gpu_id/evict_lru's restrict_gpu_id). NOT YET
+# VALIDATED -- this is the config for the first real hardware run, results
+# to be recorded here once measured.
+predict_gpu1_rank_start = -1
+predict_gpu1_rank_end = 4
+predict_gpu1_cap_per_layer = 1
+
+# Real run data showed expert= (MoE dispatch, the vault role's job) is
+# ~92% of total wall time across every recent run, while attn=+dense_gpu=
+# (the dense/CoreEngine role's job) together are only ~16% and partly
+# overlap with expert via async dispatch anyway. Putting the faster 3090
+# on the ~16%-of-time job (dense) while leaving the slower 5060 Ti on the
+# ~92%-of-time job (moe/vault) made throughput WORSE despite the 3090
+# being the faster card overall -- optimizing the small slice, not the
+# dominant one. VALIDATED layout (0.21 tok/s real run): 3090 -> vault
+# (moe), 5060 Ti -> CoreEngine (dense). See pin_topk_per_layer's comment
+# above for the real 1322-slot pool size this moe_cache_gb=19.5 produces,
+# and CLAUDE.md's "GPU Role Assignment Matters More For the MoE-Dominant
+# GPU" entry for the full writeup.
+
+# attn_qabsorb_gpu: batched BF16 GPU GEMM for MLA's qabsorb step, replacing
+# the CPU per-head matmul() loop -- real isolated bench at GLM-5.2's actual
+# dims (H=64 nope=192 kvl=512) showed 4.38x at S=1 (decode, dominant call
+# volume), see CLAUDE.md for the full writeup. UNVERIFIED end-to-end on a
+# real generation run as of this writing -- this is the first real test.
+# WUK's BF16 copy lives on the CoreEngine GPU (RTX 5060 Ti here), the same
+# card CLAUDE.md flags as already tight on VRAM from the attn_output BF16
+# fast-path budget -- watch the startup "[MLA] qabsorb BF16 GPU fast-path:
+# N/78 layer(s) uploaded" line; if N < 78, some layers fell back to CPU
+# (safe, just less benefit than the isolated bench implies).
+# NOTE: this MUST live at root scope, before any [[gpus]] table header --
+# a prior placement after the second [[gpus]] block silently scoped it as
+# a field of gpus[1] instead of the root document (TOML: everything after
+# a [[table]] header belongs to that table until the next header), so
+# doc.root.get_bool() never saw it and two real runs silently ran the old
+# CPU path despite this file correctly showing "= true" on disk. Root-
+# caused via a direct grep of debug.log's own "[CONFIG] MLA qabsorb..."
+# line still reading "off" seconds after the file was confirmed edited.
+attn_qabsorb_gpu = true
+attn_qabsorb_gpu_max_vram_gb = 2.0
+
+# attn_score_gpu: 3-GEMM + softmax GPU path for MLA's score phase (decode
+# only), replacing the CPU AVX-512 per-head loop -- real isolated bench
+# (tests/bench_score_cpu_vs_gpu.cu) showed 5x-51x speedup, GROWING with
+# context length (unlike qabsorb, this phase's CPU cost is unbounded with
+# context for GLM-5.2), see CLAUDE.md for the full writeup. UNVERIFIED
+# end-to-end on a real generation run as of this writing. Watch the startup
+# "[MLA] score GPU fast-path: N/78 layer(s) KV mirror allocated" line (N
+# should be close to 78) and the shutdown "MLA score GPU path" report line
+# (real call count, near-zero CPU fallback).
+# ROOT-SCOPE PLACEMENT REMINDER (learned the hard way with attn_qabsorb_gpu
+# above): this MUST stay before the first [[gpus]] header below -- in TOML,
+# everything after a [[table]] header belongs to that table until the next
+# header, so a key placed after [[gpus]] silently becomes a field of that
+# GPU entry instead of the root config, and doc.root.get_bool() never sees
+# it. Confirmed by two real wasted test runs on attn_qabsorb_gpu before
+# this was understood -- see that flag's own comment above for the story.
+attn_score_gpu = true
+attn_score_gpu_max_vram_gb = 2.0
+# attn_score_gpu_max_context: real production run showed this GPU
+# (CoreEngine, RTX 5060 Ti) only had 1.82GB free at this point in startup --
+# qabsorb_gpu (0.98GB) + the UNCAPPED mirror at context_size=4096 (0.74GB)
+# left only 0.10GB for WUV's own 1.22GB need (78 layers), so only 6/78
+# layers got WUV coverage (see CLAUDE.md for the full writeup). Capping the
+# mirror to 512 tokens instead of the full 4096 frees most of that VRAM for
+# WUV WITHOUT reducing the model's real context_size -- the score GPU path
+# just falls back to CPU (correctness-safe, already-tested) for any decode
+# position beyond 512. Real ceiling on WUV coverage while qabsorb_gpu stays
+# enabled is ~50/78 layers (64%) even at cap=0 -- WUV's own footprint alone
+# already exceeds what's left after qabsorb. At cap=512: ~44/78 (57%),
+# chosen to comfortably cover a short-to-medium conversation (this config's
+# own test prompt only reaches ~50 tokens of context) while staying close
+# to that ceiling. Watch the startup "[MLA] WUV BF16 GPU fast-path: N/78"
+# line -- if real usage needs longer GPU-accelerated score coverage, raise
+# this at the cost of fewer WUV-covered layers (see the tradeoff table in
+# CLAUDE.md), or disable attn_qabsorb_gpu instead for full 78/78 coverage
+# of both mirror and WUV with zero context cap needed at all.
+attn_score_gpu_max_context = 512
+# 2026-08-25 re-check: real A/B swept 512(baseline)/256/128 on real hardware,
+# same prompt, looking for VRAM headroom to free for WUV/moe_cache_gb(GPU1).
+# Confirmed the mirror was never the constraining resource: its own budget
+# use is tiny next to WUV's (0.092GB->0.046GB->0.023GB as the cap dropped,
+# vs WUV's ~0.5-0.57GB) since WUV's per-layer footprint (16.8MB) dwarfs the
+# mirror's (~1.18MB at cap=512, even less below that) -- shrinking the cap
+# 4x only bought WUV +4 layers (30->34/78) and moved decode/cache-hit only
+# within this hardware's own established noise band (0.844-0.876 tok/s,
+# 66-69% hit -- no trend either direction). NOT a productive lever; kept at
+# 512. Also: this comment's own "~44/78 (57%) at cap=512" claim above no
+# longer matches (real run now shows 30/78=38.5%) -- stale relative to
+# whatever budget/config state it was written against; the CURRENT real
+# number is whatever the startup "[MLA] WUV BF16 GPU fast-path: N/78" line
+# reports for THIS session's config, not this comment's own historical
+# figure. See CLAUDE.md's 2026-08-25 WUV/GPU1-headroom entry and
+# [[prefetch-pilot-k-8-decode-win]] memory (Follow-up 6) for the full sweep.
+
+# GPU 0 (nvidia-smi): RTX 3090 — ExpertVault (MoE expert LRU in VRAM). The
+# expert-dispatch path dominates wall time, so the faster card goes here.
+[[gpus]]
+device_id    = 0
+name         = "NVIDIA GeForce RTX 3090"
+role         = "moe"
+vram_gb      = 24.0
+kv_cache_gb  = 0.0
+kv_bits      = 4
+dense_gb     = 0.0
+# 19.5 leaves ~4.7GB of the ~24.2GB real card free -- confirmed by a real
+# run to be enough for the active-layer pool's ~3.77GB request plus margin
+# ("[GPU] Active layer area allocated: 256 experts (3.77487 GB) on GPU 0",
+# not "allocation failed") -- this card carries no dense/KV burden at all
+# in this role, so headroom stays generous.
+# 2026-08-19: tried 20.5, then 22.0, paired with active_layer_capacity's own
+# 256->128->64 cuts (same A/B) -- REVERTED to 19.5, see that field's own
+# comment for the full real-hardware A/B data: reallocating up to 12.9%
+# more main-cache capacity from the active-layer pool produced ZERO
+# measurable hit-rate or throughput change. Not worth the reduced active-
+# layer safety margin for no benefit.
+moe_cache_gb = 19.5
+
+# GPU 1 (nvidia-smi): RTX 5060 Ti — CoreEngine (dense layers + KV cache +
+# activations). Only ~16% of wall time; the weaker card can absorb this.
+[[gpus]]
+device_id    = 1
+name         = "NVIDIA GeForce RTX 5060 Ti"
+role         = "dense+moe"
+vram_gb      = 16.0
+kv_cache_gb  = 3.0
+kv_bits      = 4
+# 2026-08-16: was 12.0, stale -- this model's real dense-tensor requirement
+# (native quant, gate_inp excluded since it's converted/budgeted
+# separately) is 12.9315 GB, confirmed both by the live engine's own new
+# startup warning (`[CONFIG] dense_gb=... looks stale`, main.cpp) and by
+# `gguf_tool plan` after fixing two real bugs there (NextN/MTP draft-block
+# inclusion, DSA indexer-tensor inclusion -- see tools/gguf_plan.cpp).
+# NOTE: dense_gb is NOT an enforced cap anywhere in the engine (confirmed
+# via grep -- only consumed by engine_config.hpp's auto-sizing branch,
+# which never runs once dense_gb/moe_cache_gb are both set explicitly, as
+# they are here) -- the real dense pool always requests the REAL tensor
+# bytes regardless of this value. Keeping it accurate matters only for
+# doing headroom math by hand (see this session's whole GPU1-VRAM
+# investigation) and for this warning itself to have a correct baseline.
+dense_gb     = 13.43
+# Dual-role CoreEngine expert-cache slice, kept SMALL (1.3GB) deliberately
+# -- 12 (dense) + 3 (kv_cache) = 15 of this card's 16GB, leaving only
+# ~1GB fixed margin. attn_output's own BF16 fast-path already can't fit
+# in that margin either (0/78 layers converted, needs a 12.93GB
+# worst-case reservation it will never get on a 16GB card).
+#
+# 2026-08-16 REAL A/B, same frozen-usage-stats prompt, GPU util sampled
+# via nvidia-smi through the whole session: raised 1.3 -> 2.5GB to see if
+# a bigger local slice raises GPU1 utilization/hit-share. Conclusively
+# NEGATIVE, not just a wash -- reverted to 1.3:
+#   overall 0.68->0.56 tok/s (-18%), decode 0.85->0.74, prefill 1.08->0.77
+#   GPU1 avg util actually DROPPED 11.9%->9.5% (not the intended direction)
+#   593 real "out of memory" errors on device 1 this run (0 at 1.3GB) --
+#   both GpuExpertScratch::ensure (the dual-role slice's OWN expert-FFN
+#   scratch buffers) and dense ensure_buffers (qabsorb/score GPU paths)
+#   started failing to grow, because the extra 1.2GB ate the ~1GB fixed
+#   margin those buffers rely on. CPU expert fallback calls 118->432 as a
+#   direct result. Root cause: this card's free margin is APPROXIMATE
+#   headroom for dynamically-growing scratch buffers, not a static
+#   allocation with slack to spare -- claiming more of it for a static
+#   pool starves the dynamic consumers that share the same margin.
+# Do not raise this again without first shrinking dense_gb/kv_cache_gb or
+# otherwise freeing real (not apparent) margin on this card.
+# 2026-08-16 follow-up REAL A/B: a smaller bump, 1.3 -> 1.8GB (matching
+# the ~1.8GB the startup snapshot showed "free"). No OOM this time, but
+# still net negative, same direction as the 2.5GB attempt just smaller:
+#   overall 0.68->0.62 tok/s (-9%), decode 0.85->0.77, prefill ~flat
+#   GPU1 avg util 11.9->11.5% (flat/slightly down, not the goal)
+#   GPU1 peak real mem barely moved (15.51->15.50GB) -- the extra 0.5GB
+#   static reservation just displaced dynamic scratch's own peak rather
+#   than growing total usage, at some cost elsewhere (active-layer
+#   prewarm sync ballooned 0.51s->3.45s that run, unconfirmed if noise).
+# Two independent real runs (1.8GB and 2.5GB) both regressed, no run
+# improved -- this card has no real headroom to give this pool at any
+# tested increment. Single run each; if revisiting, confirm with a
+# repeat run before trusting the exact magnitude, but don't expect the
+# direction to flip.
+# 2026-08-25: testing the OPPOSITE direction from every attempt above --
+# SHRINKING this pool (not growing it) to free real static VRAM margin for
+# qabsorb/score/WUV's own startup budget checks (attention_layer.cpp,
+# warm_mla_absorb_cache), which all target THIS GPU (engine.gpu->device_id).
+# Real measured shortfall: qabsorb(0.981GB)+mirror(0.092GB)+WUV(0.503GB) =
+# 1.576GB already consumes nearly all of this card's ~1.8-1.9GB real
+# post-static-pool margin, leaving WUV only 30/78 layers (38.5%) covered --
+# 1920/3120 of its calls fall back to CPU at ~6x the GPU per-call cost,
+# costing an estimated ~1.7s of the ~3.5s decode-time score= bucket per
+# request. Full WUV coverage needs ~1.31GB (78 layers), so total need with
+# qabsorb+mirror is ~2.38GB against the current ~1.8-1.9GB margin -- a
+# ~0.5-0.6GB shortfall. Unlike every GROWING attempt above (which claimed
+# MORE of the same margin and starved the dynamic scratch buffers that
+# share it), this frees a STATIC allocation before those dynamic checks
+# ever run, so it should show up as real usable headroom rather than
+# reproducing the same "no real slack" finding. Real A/B needed: does
+# WUV coverage/decode throughput improve enough to outweigh this slice's
+# own (small, ~50-100 slot) local cache-hit contribution.
+moe_cache_gb = 1.2
+# 2026-08-25 RESULT of the shrink experiment described in the comment block
+# above: real 3-point A/B (1.2 baseline / 0.9 / 0.6), same prompt, decode
+# tok/s = 40/(request_wall - prefill_wall):
+#   1.2 (baseline): WUV 30/78 (38.5%), attn score=3.52s, decode 0.847-0.870 (established band)
+#   0.9:            WUV 48/78 (61.5%), attn score=2.98-3.00s (x2 repeat), decode 0.870-0.871 (x2 repeat)
+#   0.6:            WUV 66/78 (84.6%), attn score=2.37s,      decode 0.821 -- cache hit 65% (vs 67-69%), disk/phase_b/phase_c all up
+# score= genuinely dropped as predicted at every point (the WUV GPU-path fix
+# itself works exactly as designed) -- but the freed VRAM comes out of this
+# card's own local expert-cache slice, and at 0.9 the resulting cache-hit
+# cost (disk/ram_scan crept up ~0.5-0.7s) almost exactly CANCELS the score=
+# saving (attn -0.5s, expert +0.6-0.7s, net wash, decode within noise of
+# the 1.2 baseline) -- and at 0.6 the cost overtakes the saving for a clear
+# net LOSS. Reverted to 1.2. This reconfirms, in the opposite direction,
+# the SAME finding this pool's own growing-attempts already established:
+# this card has no real spare margin to give ANY pool without taking it
+# from another -- shrinking moe_cache_gb doesn't create free lunch VRAM,
+# it just relocates the cost from attn=score to expert=ram_scan/disk. See
+# CLAUDE.md's 2026-08-25 WUV/GPU1-headroom entry for the full writeup and
+# why closing this gap for real would need moving qabsorb/score/WUV off
+# this GPU entirely (a real architecture change, not attempted).

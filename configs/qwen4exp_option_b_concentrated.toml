@@ -1,0 +1,88 @@
+# Option B Step 4: usage-driven concentrated CPU-side layers.
+#
+# This profile selects layers whose top-50% experts cover at least 90% of the
+# usage-file traffic, capped at 44 layers. The planner starts at 50% residency
+# in each selected layer and fills remaining VRAM with additional ranked
+# experts. Run with GRAPH_PRELOAD_LAYERS=0: selected layers are partial GPU
+# layers and the unselected layers remain on the CPU/DDR branch.
+
+model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+cpu_affinity_layers = []
+log_path = "logs/qwen4exp_option_b_concentrated.log"
+log_level = "INFO"
+
+context_size = 2048
+max_new_tokens = 80
+temperature = 0.0
+top_p = 0.95
+raw_prompt = false
+enable_thinking = false
+
+direct_io = false
+io_uring = false
+drop_pages = true
+
+# Keep every expert in the fixed-stride host arena for the graph's CPU branch.
+host_ram_gb = 100
+ram_preload_all_experts = true
+ram_pinned_budget_gb = 45.0
+pinned_vram_capacity = 128
+expert_fetch_threads = 10
+omp_max_threads = 12
+prefetch_worker_threads = 4
+
+# Decode usage is both the layer-selection and expert-ranking source.
+pin_file = ".moestream_usage_qwen4exp_7prompts_isolated"
+prefill_pin_file = ".moestream_usage_qwen4exp_prefill_7prompts_isolated"
+freeze_usage_stats = true
+qwen4exp_option_b_layer = -1
+qwen4exp_option_b_concentrated_only = true
+qwen4exp_option_b_top_n = 256
+qwen4exp_option_b_min_coverage = 0.90
+qwen4exp_option_b_max_layers = 44
+qwen4exp_option_b_fill_vram = true
+qwen4exp_option_b_stage_expert = -1
+qwen4exp_option_b_stage_count = 1
+
+qwen4exp_full_graph = true
+qwen4exp_full_graph_decode = true
+qwen4exp_cpu_gpu_overlap = true
+qwen4exp_cpu_gpu_overlap_max_layers = 0
+qwen4exp_decode_device_hc = true
+qwen4exp_decode_gpu_router = false
+qwen4exp_decode_ggml_moe = true
+qwen4exp_cpu_ggml_moe = true
+qwen4exp_cpu_strided_grouped = true
+qwen4exp_cpu_fused_grouped = true
+moe_ggml_mul_mat_id = true
+moe_ggml_shared_expert = true
+moe_ggml_planar_copies = true
+moe_ggml_gpu_router = true
+moe_ggml_device = 0
+qwen4exp_cpu_shared_device = true
+hc_ggml = true
+gdn_full_ggml = true
+qwen4exp_attn_gpu = true
+qwen4exp_gdn_gpu = true
+qwen4exp_gdn_conv_gpu = true
+dense_bf16_prefill_gemm = true
+dense_bf16_kquant = true
+moe_gpu_accum = true
+expert_gpu_activation = true
+
+use_active_layer_area = true
+active_layer_capacity = 10
+decode_async_prewarm = false
+prefetch_pilot_depth = 1
+prefetch_pilot_k = 10
+pin_vram_lru_fraction = 0.1
+pin_ram_fraction = 0.9
+
+[[gpus]]
+device_id = 0
+name = "RTX 3090"
+role = "dense+moe"
+dense_gb = 4.1
+kv_cache_gb = 2.0
+moe_cache_gb = 11.5
+kv_bits = 4

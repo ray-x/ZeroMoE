@@ -41,6 +41,7 @@ static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
 
 class CudaManager;  // forward decl — defined in cuda_manager.hpp; engine holds a pointer
 class StreamingEngine;
+class Exl3GpuExecutor;
 
 // GLM5NEXT KDA's production CUDA state is owned by CudaManager, but prompt
 // cache save/restore is owned by the generation loop. These narrow bridges
@@ -461,6 +462,11 @@ public:
     // copied here since the graph builder has no other route to
     // EngineConfig (it only receives StreamingEngine&).
     std::string qwen4exp_graph_pin_file;
+    std::string exl3_ggml_bridge_model_path;
+    int exl3_ggml_bridge_layer = -1;
+    std::vector<int> exl3_ggml_bridge_layers;
+    std::shared_ptr<Exl3GpuExecutor> exl3_gpu_executor_owner;
+    Exl3GpuExecutor *exl3_gpu_executor = nullptr;
 
     // Option B: static hot/cold expert split. The full graph places each
     // selected layer's top-N usage-ranked experts in its fixed CUDA arena and
@@ -550,10 +556,10 @@ public:
                                 qwen4exp_gpu_stage_layers.end(), layer);
     }
 
-    // Publish one completed storage request as the staged ownership map used
-    // by the three-way conditional composer. Ready state, model/request
-    // generations, layer identity, expert bounds and resident/staged
-    // disjointness are all checked before the vector becomes visible.
+    // Publish the cold subset of one completed route-slot payload. Resident
+    // expert IDs may appear in the completion because offsets and bytes stay
+    // aligned with the original route slots; they are omitted from the staged
+    // bitmap so the two GPU children remain disjoint.
     bool publish_qwen4exp_staged_completion(
         const moestream::qwen4exp::StorageCompletion &completion,
         uint64_t expected_model_generation) {
@@ -572,19 +578,22 @@ public:
       std::vector<int> candidate;
       candidate.reserve(completion.experts.size());
       for (int expert : completion.experts) {
-        if (expert < 0 || expert >= n_experts ||
-            std::find(qwen4exp_partial_layer_gpu_ids.begin(),
-                      qwen4exp_partial_layer_gpu_ids.end(), expert) !=
-                qwen4exp_partial_layer_gpu_ids.end())
+        if (expert < 0 || expert >= n_experts)
           return false;
         // Duplicate route slots are valid: they carry distinct router
         // weights but consume the same staged expert bytes. Publish one
         // bitmap owner per expert while preserving the payload's original
         // slot order for the staged child.
+        if (std::find(qwen4exp_partial_layer_gpu_ids.begin(),
+                      qwen4exp_partial_layer_gpu_ids.end(), expert) !=
+            qwen4exp_partial_layer_gpu_ids.end())
+          continue;
         if (std::find(candidate.begin(), candidate.end(), expert) ==
             candidate.end())
           candidate.push_back(expert);
       }
+      if (candidate.empty())
+        return false;
       std::sort(candidate.begin(), candidate.end());
       qwen4exp_partial_layer_staged_ids = std::move(candidate);
       qwen4exp_partial_layer_staged_generation =
@@ -636,6 +645,7 @@ public:
     double qwen4exp_adaptive_cpu_ms = 0.0;
     double qwen4exp_adaptive_staged_queue_ms = 0.0;
     double qwen4exp_adaptive_staged_h2d_ms = 0.0;
+    double qwen4exp_adaptive_staged_dispatch_ms = 0.0;
     double qwen4exp_adaptive_staged_storage_ms = 0.0;
     double qwen4exp_adaptive_staged_gpu_ms = 0.0;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once

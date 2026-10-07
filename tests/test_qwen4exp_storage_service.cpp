@@ -1,8 +1,11 @@
 #include "qwen4exp_storage_service.hpp"
 
 #include <cassert>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <stdexcept>
+#include <thread>
 
 using namespace moestream::qwen4exp;
 
@@ -68,6 +71,75 @@ int main() {
   assert(stats.submitted == 3 && stats.rejected == 0);
   assert(stats.ready == 2 && stats.errors == 1);
   assert(stats.queue_ms_total >= 0.0 && stats.service_ms_total >= 0.0);
+
+  // A full bounded queue rejects demand instead of allocating an unbounded
+  // request. Once the first generation is consumed, the same slot can be
+  // safely reused by a later generation.
+  StorageService bounded(1, 1, [](const StorageRequest &request,
+                                  StorageCompletion &completion) {
+    completion.experts = request.experts;
+    return true;
+  });
+  auto first = bounded.submit(StorageRequest{50, 1, 1, {8}});
+  assert(first);
+  auto rejected = bounded.submit(StorageRequest{50, 2, 1, {9}});
+  assert(!rejected);
+  auto first_completion = bounded.wait_consume(*first);
+  assert(first_completion && first_completion->state == StorageState::Ready &&
+         first_completion->request_generation == 1);
+  auto reused = bounded.submit(StorageRequest{50, 2, 1, {9}});
+  assert(reused && reused->slot == first->slot &&
+         reused->request_generation == 2);
+  auto reused_completion = bounded.wait_consume(*reused);
+  assert(reused_completion && reused_completion->state == StorageState::Ready &&
+         reused_completion->request_generation == 2);
+  const auto bounded_stats = bounded.stats();
+  assert(bounded_stats.submitted == 2 && bounded_stats.rejected == 1 &&
+         bounded_stats.ready == 2);
+  bounded.shutdown();
+
+  // A slow storage generation can be abandoned after a deadline while its
+  // worker safely finishes the read. The completed payload is discarded and
+  // the bounded slot becomes reusable for the next request generation.
+  std::atomic<bool> slow_started{false};
+  std::atomic<bool> release_slow{false};
+  StorageService timed(1, 1, [&](const StorageRequest &request,
+                                StorageCompletion &completion) {
+    slow_started.store(true, std::memory_order_release);
+    while (!release_slow.load(std::memory_order_acquire))
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    completion.experts = request.experts;
+    return true;
+  });
+  auto slow = timed.submit(StorageRequest{60, 1, 1, {12}});
+  assert(slow);
+  const auto start_deadline = std::chrono::steady_clock::now() +
+                              std::chrono::seconds(2);
+  while (!slow_started.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < start_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  assert(slow_started.load(std::memory_order_acquire));
+  bool timed_out = false;
+  auto late = timed.wait_consume_for(*slow, std::chrono::milliseconds(2),
+                                     &timed_out);
+  assert(!late && timed_out);
+  release_slow.store(true, std::memory_order_release);
+  const auto completion_deadline = std::chrono::steady_clock::now() +
+                                   std::chrono::seconds(2);
+  while (timed.stats().ready == 0 &&
+         std::chrono::steady_clock::now() < completion_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  assert(timed.stats().ready == 1);
+  assert(!timed.wait(*slow)); // retired generations cannot hang a waiter
+  auto after_timeout = timed.submit(StorageRequest{60, 2, 1, {13}});
+  assert(after_timeout && after_timeout->slot == slow->slot &&
+         after_timeout->request_generation == 2);
+  auto after_timeout_result = timed.wait_consume_for(
+      *after_timeout, std::chrono::seconds(2));
+  assert(after_timeout_result &&
+         after_timeout_result->state == StorageState::Ready &&
+         after_timeout_result->request_generation == 2);
+  timed.shutdown();
 
   // Loader exceptions are converted into an explicit Error completion rather
   // than leaving a pending slot that a later completion graph could mistake

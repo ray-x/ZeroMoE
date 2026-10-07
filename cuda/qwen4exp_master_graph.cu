@@ -43,22 +43,57 @@ __global__ void qwen4exp_master_route_mode_kernel(
     cudaGraphConditionalHandle resident_handle,
     cudaGraphConditionalHandle staged_handle, const int32_t *routed_ids,
     const uint8_t *resident_bitmap, const uint8_t *staged_bitmap, int topk,
-    int n_experts, int32_t *route_mode) {
-    bool all_resident = true;
-    bool all_staged = true;
+    int n_experts, int32_t *route_mode, float *staged_slot_mask,
+    int32_t *staged_dispatch_ids) {
+    bool any_resident = false;
+    bool any_staged = false;
+    bool any_cpu = false;
     for (int k = 0; k < topk; ++k) {
         const int32_t id = routed_ids[k];
-        if (id < 0) continue;
-        if (id >= n_experts || !resident_bitmap[id]) all_resident = false;
-        if (id >= n_experts || !staged_bitmap[id]) all_staged = false;
+        bool resident = false;
+        bool staged = false;
+        if (id >= 0 && id < n_experts) {
+            resident = resident_bitmap[id] != 0;
+            staged = !resident && staged_bitmap[id] != 0;
+        }
+        any_resident |= resident;
+        any_staged |= staged;
+        any_cpu |= !resident && !staged;
+        if (staged_slot_mask)
+            staged_slot_mask[k] = staged ? 1.0f : 0.0f;
+        if (staged_dispatch_ids)
+            staged_dispatch_ids[k] = staged ? k : -1;
     }
-    // Resident wins if a malformed publication marks both branches. The
-    // host-side RouteClassification rejects overlapping maps; this tie-break
-    // keeps the device predicate fail-safe during an in-flight bitmap update.
-    const int32_t mode = all_resident ? 1 : (all_staged ? 2 : 0);
-    cudaGraphSetConditional(resident_handle, mode == 1 ? 1u : 0u);
-    cudaGraphSetConditional(staged_handle, mode == 2 ? 1u : 0u);
+    // Branch presence is independent: resident and staged work may run while
+    // the sibling CPU host node computes only routes absent from both maps.
+    // Bits 0..2 report resident, staged and CPU route presence respectively.
+    // The original route-slot masks preserve exact-once weighted reduction.
+    const int32_t mode = (any_resident ? 1 : 0) |
+                         (any_staged ? 2 : 0) |
+                         (any_cpu ? 4 : 0);
+    cudaGraphSetConditional(resident_handle, any_resident ? 1u : 0u);
+    cudaGraphSetConditional(staged_handle, any_staged ? 1u : 0u);
     *route_mode = mode;
+}
+
+__global__ void qwen4exp_zero_moe_outputs_kernel(float *resident,
+                                                 float *staged, float *cpu,
+                                                 int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        resident[i] = 0.0f;
+        staged[i] = 0.0f;
+        cpu[i] = 0.0f;
+    }
+}
+
+__global__ void qwen4exp_merge_moe_outputs_kernel(const float *resident,
+                                                   const float *staged,
+                                                   const float *cpu,
+                                                   float *merged, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count)
+        merged[i] = resident[i] + staged[i] + cpu[i];
 }
 
 // Unpack one Ready storage payload into the fixed top-k compact tensors used
@@ -99,6 +134,14 @@ extern "C" void *moestream_qwen4exp_master_predicate_kernel_ptr() {
 
 extern "C" void *moestream_qwen4exp_master_route_mode_kernel_ptr() {
     return reinterpret_cast<void *>(&qwen4exp_master_route_mode_kernel);
+}
+
+extern "C" void *moestream_qwen4exp_zero_moe_outputs_kernel_ptr() {
+    return reinterpret_cast<void *>(&qwen4exp_zero_moe_outputs_kernel);
+}
+
+extern "C" void *moestream_qwen4exp_merge_moe_outputs_kernel_ptr() {
+    return reinterpret_cast<void *>(&qwen4exp_merge_moe_outputs_kernel);
 }
 
 extern "C" void *moestream_qwen4exp_unpack_staged_payload_kernel_ptr() {

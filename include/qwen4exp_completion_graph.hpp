@@ -42,7 +42,11 @@ class CompletionGraph {
                "cudaMallocHost") ||
         !check(cudaMalloc(&device_payload_, capacity_bytes_), "cudaMalloc") ||
         !check(cudaEventCreateWithFlags(&ready_event_, cudaEventDisableTiming),
-               "cudaEventCreateWithFlags"))
+               "cudaEventCreateWithFlags(ready)") ||
+        !check(cudaEventCreate(&upload_start_event_),
+               "cudaEventCreate(upload start)") ||
+        !check(cudaEventCreate(&upload_done_event_),
+               "cudaEventCreate(upload done)"))
       return false;
 
     std::memset(host_payload_, 0, capacity_bytes_);
@@ -88,6 +92,7 @@ class CompletionGraph {
         completion.request_generation != expected_request_generation ||
         !completion.payload || completion.payload->bytes.size() > capacity_bytes_)
       return false;
+    const auto payload_prepare_start = std::chrono::steady_clock::now();
     std::memset(host_payload_, 0, capacity_bytes_);
     if (!completion.payload->bytes.empty())
       std::memcpy(host_payload_, completion.payload->bytes.data(),
@@ -97,14 +102,35 @@ class CompletionGraph {
     model_generation_ = completion.model_generation;
     request_generation_ = completion.request_generation;
     layer_ = completion.layer;
+    payload_prepare_ms_ = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() -
+                              payload_prepare_start)
+                              .count();
     submit_started_ = std::chrono::steady_clock::now();
     upload_wait_ms_ = 0.0;
+    upload_transfer_ms_ = 0.0;
+    if (!check(cudaEventRecord(upload_start_event_, upload_stream_),
+               "cudaEventRecord(upload start)")) {
+      state_ = CompletionGraphState::Error;
+      return false;
+    }
     const cudaError_t launch = cudaGraphLaunch(graph_exec_, upload_stream_);
-    state_ = launch == cudaSuccess ? CompletionGraphState::Pending
-                                   : CompletionGraphState::Error;
-    if (launch != cudaSuccess)
+    if (launch != cudaSuccess) {
+      state_ = CompletionGraphState::Error;
       fail(launch, "cudaGraphLaunch");
-    return state_ == CompletionGraphState::Pending;
+      return false;
+    }
+    if (!check(cudaEventRecord(upload_done_event_, upload_stream_),
+               "cudaEventRecord(upload done)")) {
+      // The graph may already be in flight. Drain the dedicated stream on this
+      // error path before allowing any caller to reuse the fixed payload
+      // addresses.
+      cudaStreamSynchronize(upload_stream_);
+      state_ = CompletionGraphState::Error;
+      return false;
+    }
+    state_ = CompletionGraphState::Pending;
+    return true;
   }
 
   bool wait_on(cudaStream_t consumer_stream) {
@@ -117,12 +143,19 @@ class CompletionGraph {
   bool synchronize() {
     if (state_ != CompletionGraphState::Pending)
       return false;
-    const cudaError_t status = cudaEventSynchronize(ready_event_);
+    const cudaError_t status = cudaEventSynchronize(upload_done_event_);
     if (status != cudaSuccess) {
       fail(status, "cudaEventSynchronize");
       state_ = CompletionGraphState::Error;
       return false;
     }
+    float transfer_ms = 0.0f;
+    const cudaError_t timing = cudaEventElapsedTime(
+        &transfer_ms, upload_start_event_, upload_done_event_);
+    upload_transfer_ms_ =
+        timing == cudaSuccess
+            ? std::max(0.0, static_cast<double>(transfer_ms))
+            : -1.0;
     upload_wait_ms_ = std::chrono::duration<double, std::milli>(
                           std::chrono::steady_clock::now() - submit_started_)
                           .count();
@@ -133,7 +166,15 @@ class CompletionGraph {
   CompletionGraphState state() const { return state_; }
   void *device_payload() const { return device_payload_; }
   size_t payload_bytes() const { return payload_bytes_; }
+  // Wall time from submit() until the caller synchronizes. This can include
+  // unrelated consumer-graph execution if synchronize() is intentionally
+  // delayed, so adaptive decisions must use upload_transfer_ms() for H2D.
   double upload_wait_ms() const { return upload_wait_ms_; }
+  double payload_prepare_ms() const { return payload_prepare_ms_; }
+  // CUDA-event interval around the captured H2D copy. Unlike upload_wait_ms(),
+  // this excludes host time spent waiting for the completion graph after the
+  // consumer graph has already run.
+  double upload_transfer_ms() const { return upload_transfer_ms_; }
   size_t capacity_bytes() const { return capacity_bytes_; }
   const std::vector<size_t> &payload_offsets() const { return payload_offsets_; }
   uint64_t model_generation() const { return model_generation_; }
@@ -148,12 +189,16 @@ class CompletionGraph {
   void reset() {
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (graph_) cudaGraphDestroy(graph_);
+    if (upload_done_event_) cudaEventDestroy(upload_done_event_);
+    if (upload_start_event_) cudaEventDestroy(upload_start_event_);
     if (ready_event_) cudaEventDestroy(ready_event_);
     if (device_payload_) cudaFree(device_payload_);
     if (host_payload_) cudaFreeHost(host_payload_);
     if (upload_stream_) cudaStreamDestroy(upload_stream_);
     graph_exec_ = nullptr;
     graph_ = nullptr;
+    upload_done_event_ = nullptr;
+    upload_start_event_ = nullptr;
     ready_event_ = nullptr;
     device_payload_ = nullptr;
     host_payload_ = nullptr;
@@ -161,6 +206,8 @@ class CompletionGraph {
     capacity_bytes_ = 0;
     payload_bytes_ = 0;
     upload_wait_ms_ = 0.0;
+    upload_transfer_ms_ = 0.0;
+    payload_prepare_ms_ = 0.0;
     submit_started_ = {};
     payload_offsets_.clear();
     model_generation_ = 0;
@@ -186,11 +233,15 @@ class CompletionGraph {
   cudaEvent_t ready_event_ = nullptr;
   cudaGraph_t graph_ = nullptr;
   cudaGraphExec_t graph_exec_ = nullptr;
+  cudaEvent_t upload_start_event_ = nullptr;
+  cudaEvent_t upload_done_event_ = nullptr;
   uint8_t *host_payload_ = nullptr;
   void *device_payload_ = nullptr;
   size_t capacity_bytes_ = 0;
   size_t payload_bytes_ = 0;
   double upload_wait_ms_ = 0.0;
+  double upload_transfer_ms_ = 0.0;
+  double payload_prepare_ms_ = 0.0;
   std::chrono::steady_clock::time_point submit_started_{};
   std::vector<size_t> payload_offsets_;
   uint64_t model_generation_ = 0;

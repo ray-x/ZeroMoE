@@ -1,0 +1,74 @@
+diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
+index 2ecce68..0db00b2 100644
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -42,6 +42,17 @@ extern "C" void moestream_qwen4exp_cpu_split_exit(void)
+ extern "C" bool moestream_qwen4exp_cpu_offload_coordination_enabled(void)
+     __attribute__((weak));
+ 
++#if defined(__GNUC__) && !defined(_WIN32)
++extern "C" int moestream_ggml_sched_early_cpu(
++    ggml_backend_t, ggml_cgraph *, int64_t *, int64_t *) __attribute__((weak));
++extern "C" {
++GGML_BACKEND_API int ggml_backend_sched_early_cpu_supported();
++int ggml_backend_sched_early_cpu_supported() {
++    return moestream_ggml_sched_early_cpu != nullptr ? 1 : 0;
++}
++}
++#endif
++
+ static bool ggml_copy_call_trace_enabled() {
+     static const bool enabled = [] {
+         const char * env = std::getenv("BEE_GGML_COPY_CALL_TRACE");
+@@ -2415,9 +2426,27 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         const auto trace_split_start = trace_full_buckets ?
+             std::chrono::steady_clock::now() : trace_pass_start;
+ 
++        // Private-buffer early-ready CPU graphs can start as soon as their
++        // input event is ready, without first draining unrelated work queued
++        // on the previous backend. The marker graph has no scheduler inputs;
++        // its callback owns the CPU graph and publishes its result buffer.
++        bool early_cpu = false;
++        int64_t early_wait_us = 0;
++        int64_t early_compute_us = 0;
++#if defined(__GNUC__) && !defined(_WIN32)
++        if (!sched->callback_eval && split->n_inputs == 0 &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) ==
++                GGML_BACKEND_DEVICE_TYPE_CPU &&
++            moestream_ggml_sched_early_cpu != nullptr) {
++            early_cpu = moestream_ggml_sched_early_cpu(
++                split_backend, &split->graph, &early_wait_us,
++                &early_compute_us) == 1;
++        }
++#endif
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        if (!early_cpu && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             const auto profile_wait_start = std::chrono::steady_clock::now();
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 profile_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+@@ -2794,13 +2823,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         if (!sched->callback_eval) {
+             if (moestream_cpu_split_hooks)
+                 moestream_qwen4exp_cpu_split_enter();
+-            enum ggml_status ec;
+-            if (moe_trace_level > 0) {
+-                const auto trace_graph_submit_start = std::chrono::steady_clock::now();
+-                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+-                trace_split_graph_submit_ms += trace_elapsed_ms(trace_graph_submit_start);
+-            } else {
+-                ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            enum ggml_status ec = GGML_STATUS_SUCCESS;
++            if (!early_cpu) {
++                if (moe_trace_level > 0) {
++                    const auto trace_graph_submit_start = std::chrono::steady_clock::now();
++                    ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++                    trace_split_graph_submit_ms += trace_elapsed_ms(trace_graph_submit_start);
++                } else {
++                    ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++                }
+             }
+             if (moestream_cpu_split_hooks)
+                 moestream_qwen4exp_cpu_split_exit();

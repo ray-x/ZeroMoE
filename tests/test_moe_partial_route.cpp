@@ -8,12 +8,41 @@
 
 #include "moe_partial_route.hpp"
 
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 static int g_capability = 0;
 extern "C" int ggml_cpu_mul_mat_id_negative_skip(void) { return g_capability; }
+
+// The host-node route classifier is required to stay allocation-free. Count
+// scalar/array allocations only while exact_once() is running, after all test
+// fixtures have been prepared.
+static bool g_track_allocations = false;
+static size_t g_tracked_allocations = 0;
+
+void *operator new(std::size_t size) {
+  if (g_track_allocations)
+    ++g_tracked_allocations;
+  if (void *memory = std::malloc(size == 0 ? 1 : size))
+    return memory;
+  throw std::bad_alloc();
+}
+
+void *operator new[](std::size_t size) {
+  if (g_track_allocations)
+    ++g_tracked_allocations;
+  if (void *memory = std::malloc(size == 0 ? 1 : size))
+    return memory;
+  throw std::bad_alloc();
+}
+
+void operator delete(void *memory) noexcept { std::free(memory); }
+void operator delete[](void *memory) noexcept { std::free(memory); }
+void operator delete(void *memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void *memory, std::size_t) noexcept { std::free(memory); }
 
 static int g_failures = 0;
 #define CHECK(cond, msg)                                                       \
@@ -164,9 +193,12 @@ int main(int argc, char **argv) {
 
   const std::vector<int32_t> dynamic_ids = {0, 1, 2, 1};
   const std::vector<float> dynamic_weights = {0.1f, 0.2f, 0.3f, 0.4f};
+  const std::vector<int32_t> dynamic_resident_index = {0, -1, -1};
+  const std::vector<int32_t> dynamic_staged_index = {-1, 5, -1};
   CHECK(RouteClassification::build(dynamic_ids.data(), dynamic_weights.data(),
                                    dynamic_ids.size(),
-                                   {0, -1, -1}, {-1, 5, -1}, 11,
+                                   dynamic_resident_index,
+                                   dynamic_staged_index, 11,
                                    &classification),
         "resident/staged/CPU classification builds without changing route slots");
   for (RouteTarget target : {RouteTarget::ResidentGpu, RouteTarget::StagedGpu,
@@ -195,6 +227,26 @@ int main(int argc, char **argv) {
               (owns ? dynamic_weights[slot] : 0.0f),
           "preserved-ID projection still weights exactly one branch");
   }
+
+  const auto *classification_storage = classification.assignments().data();
+  int32_t callback_ids[4] = {};
+  float callback_weights[4] = {};
+  g_tracked_allocations = 0;
+  g_track_allocations = true;
+  const bool allocation_free_callback_path =
+      RouteClassification::build(
+          dynamic_ids.data(), dynamic_weights.data(), dynamic_ids.size(),
+          dynamic_resident_index, dynamic_staged_index, 12, &classification) &&
+      classification.exact_once() &&
+      classification.write_branch_routes(RouteTarget::Cpu, 0, callback_ids,
+                                          callback_weights, 4, true);
+  g_track_allocations = false;
+  CHECK(allocation_free_callback_path,
+        "reserved route classification and CPU projection succeed");
+  CHECK(g_tracked_allocations == 0,
+        "reserved classify/validate/project performs no callback allocation");
+  CHECK(classification.assignments().data() == classification_storage,
+        "classification reuses its immutable assignment storage");
 
   CHECK(!RouteClassification::build({0, 1}, {0.5f, 0.5f},
                                     {0, 1}, {3, -1}, 11,
