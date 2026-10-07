@@ -249,10 +249,29 @@ if(MOESTREAM_USE_GGML)
 
     # Apply MoEStream's ggml patch series (patches/README.md).  Idempotent:
     # already-applied patches are detected by a reverse apply check.
-    include(cmake/MoEStreamGgmlPatches.cmake)
-    moestream_apply_ggml_patches("${MOESTREAM_GGML_ROOT}")
-
-    add_subdirectory("${MOESTREAM_GGML_ROOT}" ggml-build)
+    # Link an already-built ggml instead of compiling it in-tree. The prebuilt tree must come
+    # from the same MOESTREAM_GGML_ROOT (its headers are used) and ggml patches are NOT re-applied.
+    set(MOESTREAM_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (skips building ggml)")
+    if(MOESTREAM_GGML_PREBUILT_DIR)
+        foreach(_lib ggml ggml-base ggml-cpu)
+            add_library(${_lib} SHARED IMPORTED GLOBAL)
+            set_target_properties(${_lib} PROPERTIES
+                IMPORTED_LOCATION "${MOESTREAM_GGML_PREBUILT_DIR}/src/lib${_lib}.so"
+                INTERFACE_INCLUDE_DIRECTORIES "${MOESTREAM_GGML_ROOT}/include")
+        endforeach()
+        set_property(TARGET ggml PROPERTY INTERFACE_LINK_LIBRARIES "ggml-cpu;ggml-base")
+        set_property(TARGET ggml-cpu PROPERTY INTERFACE_LINK_LIBRARIES "ggml-base")
+        add_library(ggml-cuda SHARED IMPORTED GLOBAL)
+        set_target_properties(ggml-cuda PROPERTIES
+            IMPORTED_LOCATION "${MOESTREAM_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
+            INTERFACE_INCLUDE_DIRECTORIES "${MOESTREAM_GGML_ROOT}/include"
+            INTERFACE_LINK_LIBRARIES "ggml-base")
+        message(STATUS "MoEStream: linking PREBUILT ggml from ${MOESTREAM_GGML_PREBUILT_DIR} (no ggml compile)")
+    else()
+        include(cmake/MoEStreamGgmlPatches.cmake)
+        moestream_apply_ggml_patches("${MOESTREAM_GGML_ROOT}")
+        add_subdirectory("${MOESTREAM_GGML_ROOT}" ggml-build)
+    endif()
     message(STATUS "MoEStream: using ggml at ${MOESTREAM_GGML_ROOT}")
 
     # ggml-quants.h lives in ggml/src/, not in the public include/ directory.
