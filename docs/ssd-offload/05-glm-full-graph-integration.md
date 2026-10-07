@@ -91,3 +91,12 @@ Below ~48 GiB of expert DDR the loads show up directly (2.9 ms each); hiding the
 make room) on the main GPU instead of the 5060 Ti, so the identical kernels run on a different device. Teacher-forced over 24
 steps the logits are bit-identical (max abs delta 0.000, top-1 24/24). The map, mask, weight-ordering and accumulation of the
 third branch are therefore correct; the delta against the CPU-cold placement is GPU-vs-CPU quantized-matmul arithmetic.
+
+### Prefetch estimate (decided not to build)
+
+Replaying the 716 decode tokens of the survey trace through the pinned+LRU cache at 3,900 and 5,245 experts, a predictor that
+prefetches "last token's (and the token before's) picks for this layer" covers 0-1% of the misses: consecutive tokens do not
+repeat their cold experts. Only a pilot-router predictor (next layer's router applied to this layer's hidden state, measured
+51-58% recall earlier in the engine) could help, and at 32 GiB (7 misses/token, ~21 ms) it would hide at most about half of
+that for new graph nodes plus a thread-safe prefetch path around the cache and arena. The lever that works is expert DDR
+(48 GiB: 0 misses, ~10 tok/s).
