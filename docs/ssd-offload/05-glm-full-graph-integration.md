@@ -37,3 +37,32 @@ Knobs: `..._OFFLOAD_DDR_GIB` (expert DDR budget, default 40), `..._OFFLOAD_PINNE
 * The store holds only 3,173 experts; the other ~2,000 seeded and most misses are served from the model through buffered
   reads. A larger store (or O_DIRECT model reads) would make every miss one aligned `preadv`.
 * Parallel seeding; per-layer capacity instead of one global LRU; graph-only policy for GLM5NEXT.
+
+## Update: no whole-layer VRAM, spread hot experts + DDR/SSD for every layer (10 tok/s)
+
+Config `configs/glm53flash_AJ_IQ2XXS_spread_offload.toml` (no `cpu_affinity_layers`, `vram_preload_prefix_layers = 0`,
+`host_ram_gb = 16`), launcher `docs/ssd-offload/run_spread_offload.sh`. Every MoE layer (3..44) is offloaded
+(`OFFLOAD_FIRST_LAYER=3`); VRAM holds each layer's hottest experts instead of whole layers.
+
+Changes: row-aligned VRAM slot stride on every layer under the GLM graph (hot aliasing needs it, so the full-layer prefix is
+no longer required); the miss node wraps only the cold-branch ids and the DDR seed skips VRAM-hot experts; model plane
+reads and per-call expert loads run concurrently (miss 4.6 -> 2.9 ms); `MOESTREAM_GLM5NEXT_OFFLOAD_THP=1` (huge pages on
+the arena, -22 ms/token of CPU matmul TLB cost); `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB` puts the next-hottest experts of every
+layer on the second GPU (third MUL_MAT_ID branch), assigned inside `configure_partial_experts` so every graph builder sees
+the same split.
+
+Steady-state decode (RTX 3090 + 5060 Ti, 8 CPU threads, page cache dropped before each run):
+
+| configuration | ms/token | tok/s |
+|---|---|---|
+| original whole-layer baseline (8 layers in VRAM, 6 threads) | 143 | 7.0 |
+| spread hot experts, 3090 only, no offload | 124 | 8.1 |
+| + offload, 48 GiB DDR, 3090 only (THP) | 139 | 7.2 |
+| + GPU1 hot 13 GiB, 48 GiB DDR (0 misses) | 104 | 9.6 |
+| + GPU1 hot 14.2 GiB, 48 GiB DDR | 100.6 | 9.9 |
+| same, 32 GiB DDR (7 misses/token) | 125 | 8.0 |
+| same, 24 GiB DDR (17 misses/token) | 161 | 6.2 |
+
+15 GiB is the GPU1 limit (15.5 OOMs). Output is coherent; it diverges from the pure-VRAM spread run at token 18 (different
+summation order), and from the whole-layer baseline at token 1 (the legacy prefill uses a different hot set).
+Below ~48 GiB of expert DDR the loads show up directly (2.9 ms each); hiding them behind a prefetch is the next lever.
