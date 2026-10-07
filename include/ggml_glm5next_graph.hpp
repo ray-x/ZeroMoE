@@ -7,7 +7,7 @@
 struct StreamingEngine;
 class GpuTopology;
 
-// Enabled only when MOESTREAM_GLM5NEXT_FULL_GRAPH=1 is present.
+// Enabled by default for GLM5NEXT; MOESTREAM_GLM5NEXT_FULL_GRAPH=0 selects the legacy layered path.
 bool glm5next_full_graph_enabled();
 
 // Load the graph's host expert source arena during engine startup.  This is

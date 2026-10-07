@@ -586,8 +586,9 @@ StreamingEngine *g_glm5next_decode_disabled_engine = nullptr;
 
 bool env_enabled() {
   static const bool enabled = [] {
+    // Full graph is the GLM5NEXT execution path; MOESTREAM_GLM5NEXT_FULL_GRAPH=0 opts out (legacy layered path).
     const char *v = std::getenv("MOESTREAM_GLM5NEXT_FULL_GRAPH");
-    return v && v[0] == '1';
+    return !v || !v[0] || v[0] != '0';
   }();
   return enabled;
 }
