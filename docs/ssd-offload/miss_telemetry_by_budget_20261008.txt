@@ -1,0 +1,13 @@
+CPU layers 11-44: 9792 experts x 6.49 MB = 59.2 GiB; survey hits 130832 (ranking from half, misses measured on the other half)
+ DDR GiB for experts  on SSD  SSD GiB route miss%  misses/tok  layers w/ miss/tok  SSD MB/tok  exposed ms/tok if 2.6ms/miss
+                59.3       0      0.0       0.00%         0.0                0.00           0                           0.0
+                56.0     525      3.2       0.37%         1.0                0.94           7                           2.6
+                52.0    1187      7.2       0.72%         2.0                1.83          13                           5.1
+                48.0    1849     11.2       1.03%         2.8                2.62          18                           7.3
+   worst layers (miss share of that layer's routes, #experts on SSD): L39:2.7%/94, L32:2.5%/94, L38:2.4%/108, L36:2.4%/113, L37:2.3%/98, L30:2.3%/99
+   layers with zero SSD experts: 15 of 34
+                44.0    2511     15.2       1.32%         3.6                3.35          23                           9.3
+                40.0    3173     19.2       1.59%         4.3                4.03          28                          11.2
+   worst layers (miss share of that layer's routes, #experts on SSD): L39:2.7%/94, L32:2.5%/94, L38:2.4%/108, L36:2.4%/113, L25:2.3%/150, L37:2.3%/98
+   layers with zero SSD experts: 5 of 34
+                32.0    4497     27.2       3.73%        10.1                8.78          66                          26.4
