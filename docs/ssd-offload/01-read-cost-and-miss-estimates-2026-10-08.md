@@ -1,5 +1,9 @@
 # SSD expert loading for GLM-5.3-Flash: read cost and miss estimates (2026-10-08)
 
+> **Correction (same day):** the miss estimates in section 2 come from a random split of one survey and are far too
+> optimistic. With independent prompts the route miss rate at 19 GiB on SSD is 15-25%, not 1.5%. See
+> `02-survey-offload-store-and-miss-correction-2026-10-08.md`. The read-cost numbers (section 1) are unaffected.
+
 Goal: SSD offload must be *optional* for GLM (conditional load on a miss), inside the full graph. This is the
 cost model that fixes how big the problem is before any graph code is written.
 

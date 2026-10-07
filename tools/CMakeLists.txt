@@ -14,6 +14,7 @@ add_executable(gguf_tool
     gguf_plan.cpp
     gguf_dma.cpp
     gguf_mix.cpp
+    gguf_offload.cpp
 )
 
 add_executable(exl3_tool

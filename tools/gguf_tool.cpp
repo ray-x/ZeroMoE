@@ -54,6 +54,13 @@ int usage(const char *prog) {
           "from <cold_dir>, the\n"
           "          rest stay on <baseline_dir>. Pure byte-copy, no "
           "requantization.\n"
+          "  offload <model_file_or_dir> <store.gguf> --usage-file <path> "
+          "(--count N | --fraction F) [options]\n"
+          "          Writes the coldest N experts (by real traffic) to a 4096-aligned "
+          "SSD offload store\n"
+          "          (gate+up+down back to back, one O_DIRECT read per expert); "
+          "'offload --verify <store> --against <model>'\n"
+          "          byte-compares a store with its source via O_DIRECT reads.\n"
           "\n"
           "Run '%s <subcommand>' with no further args for that "
           "subcommand's full usage.\n",
@@ -83,6 +90,8 @@ int main(int argc, char **argv) {
     return gguf_tool::cmd_dma(argc - 1, argv + 1);
   if (sub == "mix")
     return gguf_tool::cmd_mix(argc - 1, argv + 1);
+  if (sub == "offload")
+    return gguf_tool::cmd_offload(argc - 1, argv + 1);
   if (sub == "-h" || sub == "--help") {
     usage(argv[0]);
     return 0;
