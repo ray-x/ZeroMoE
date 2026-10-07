@@ -2949,8 +2949,11 @@ ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
   auto it = g_hot1_buffers.find(key);
   const bool fresh = it == g_hot1_buffers.end();
   if (fresh) {
-    buf = ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(g.gpu1),
-                                         ggml_nbytes(t) + 4096);
+    // MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0=1 is a verification aid: same branch, buffers on the main GPU, so its
+    // logits can be compared against the GPU1 placement with identical kernels.
+    static const bool on_gpu0 = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
+    buf = ggml_backend_buft_alloc_buffer(
+        ggml_backend_get_default_buffer_type(on_gpu0 ? g.cuda : g.gpu1), ggml_nbytes(t) + 4096);
     if (!buf)
       return nullptr;
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);

@@ -86,3 +86,8 @@ Below ~48 GiB of expert DDR the loads show up directly (2.9 ms each); hiding the
 * The GPU1 hot branch changes decode logits by a delta that grows with the number of experts moved (0.7 at 48 experts,
   2.2 at 2,100+), the same direction and scale as the GPU-vs-CPU gap above; text stays coherent. This is consistent with
   arithmetic noise but is NOT proof of correctness against an independent reference (e.g. llama.cpp on the same tokens).
+
+**GPU1 branch verified.** `MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0=1` puts the same hot1 expert set (0.6 GiB, 3090 cache shrunk to
+make room) on the main GPU instead of the 5060 Ti, so the identical kernels run on a different device. Teacher-forced over 24
+steps the logits are bit-identical (max abs delta 0.000, top-1 24/24). The map, mask, weight-ordering and accumulation of the
+third branch are therefore correct; the delta against the CPU-cold placement is GPU-vs-CPU quantized-matmul arithmetic.
