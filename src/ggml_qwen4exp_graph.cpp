@@ -1279,6 +1279,8 @@ struct FullGraph {
   bool layer13_moe_diag_dumped = false;
   ggml_tensor *layer13_moe_diag = nullptr;
   std::vector<std::pair<std::string, ggml_tensor *>> phase2_hc_debug_tensors;
+  // MOESTREAM_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
+  std::vector<std::tuple<int, ggml_tensor *, ggml_tensor *>> probe_taps;
   bool phase2_layer3_alias_scan_done = false;
   bool phase2_cuda_graph_write_scan_done = false;
   ggml_tensor *layer13_moe_input_diag = nullptr;
@@ -7374,6 +7376,22 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
   return true;
 }
 
+void qwen_probe_dump(FullGraph &g) {
+  const char *dir = std::getenv("MOESTREAM_QWEN4EXP_PROBE_DUMP");
+  if (!dir || !dir[0] || g.probe_taps.empty())
+    return;
+  for (auto &[l, x, p] : g.probe_taps) {
+    std::vector<float> a((size_t)ggml_nelements(x)), b((size_t)ggml_nelements(p));
+    ggml_backend_tensor_get(x, a.data(), 0, a.size() * sizeof(float));
+    ggml_backend_tensor_get(p, b.data(), 0, b.size() * sizeof(float));
+    const std::string base = std::string(dir) + "/L" + std::to_string(l);
+    std::ofstream xo(base + ".x.bin", std::ios::binary | std::ios::app);
+    xo.write(reinterpret_cast<const char *>(a.data()), (std::streamsize)(a.size() * sizeof(float)));
+    std::ofstream so(base + ".s.bin", std::ios::binary | std::ios::app);
+    so.write(reinterpret_cast<const char *>(b.data()), (std::streamsize)(b.size() * sizeof(float)));
+  }
+}
+
 ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *router,
                        ggml_tensor *selection_bias, ggml_tensor *gate_exps,
@@ -9330,6 +9348,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
       return false;
+    if (std::getenv("MOESTREAM_QWEN4EXP_PROBE_DUMP") && g.phase2_mode == FullGraph::Phase2Mode::Off) {
+      ggml_tensor *tap_x = ggml_cont(g.ctx, ffn_in);
+      ggml_tensor *tap_p = ggml_soft_max(g.ctx, ggml_mul_mat(g.ctx, router, ffn_in));
+      ggml_set_output(tap_x);
+      ggml_set_output(tap_p);
+      ggml_build_forward_expand(g.graph, tap_x);
+      ggml_build_forward_expand(g.graph, tap_p);
+      g.probe_taps.emplace_back(l, tap_x, tap_p);
+    }
     if (l == g.phase2_split_layer && env_layer13_moe_dump_path()) {
       g.layer13_moe_diag_enabled = true;
       g.layer13_pre_ffn_residual_diag = layer13_moe_diag_snapshot(
@@ -14960,6 +14987,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       return false;
   }
   ggml_backend_sched_synchronize(g.sched);
+  qwen_probe_dump(g);
   const auto replay_sync_end = std::chrono::steady_clock::now();
   for (const auto &entry : g.early_ready) {
     if (entry.second->stage_source)
@@ -15524,6 +15552,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return fail("scheduler compute failed");
   }
   ggml_backend_sched_synchronize(g.sched);
+  qwen_probe_dump(g);
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           static_cast<size_t>(g.D) * S * sizeof(float));

@@ -1382,6 +1382,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // MOESTREAM_PROBE_DUMP=<dir>: training data for a learned next-layer expert predictor (diagnostic only). For every
     // MoE layer l, append the post-attention residual rows x_l (S x D, f32) and layer l's REAL selection scores s_l
     // (S x n_experts, f32: gate(logits)+bias, what the router ranks) so x_l can be paired with s_{l+1} offline.
+    // Re-take the ATTN-PILOT snapshot right before the FFN. The copy taken as soon as attention returns (above) precedes the point
+    // where the post-attention residual is final in `hidden_states`, so it predicted from a stale vector: GLM-5.3-Flash ATTN-PILOT
+    // recall was 37.2% (rank 0: 71.6%) with the early copy and 70.6% (rank 0: 98.9%) with this one.
+    if (S >= 1 && !scratch.pilot_attn_snapshot.empty())
+      std::memcpy(scratch.pilot_attn_snapshot.data(), hidden_states + (size_t)(S - 1) * D, (size_t)D * sizeof(float));
+    std::vector<float> probe_last_scores; // layer l's score row of the last token (route-agreement check)
     if (static const char *probe_dir = std::getenv("MOESTREAM_PROBE_DUMP");
         probe_dir && probe_dir[0] && l >= c.first_dense && c.n_experts > 0 &&
         engine.family_ops.family != ModelFamily::Qwen4Exp) {
@@ -1406,6 +1412,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
             for (int e = 0; e < c.n_experts; ++e) row[e] += bias[e];
           }
         }
+        probe_last_scores.assign(sc.data() + (size_t)(S - 1) * c.n_experts, sc.data() + (size_t)S * c.n_experts);
         const std::string base = std::string(probe_dir) + "/L" + std::to_string(l);
         std::ofstream xo(base + ".x.bin", std::ios::binary | std::ios::app);
         xo.write(reinterpret_cast<const char *>(hidden_states), (std::streamsize)((size_t)S * D * sizeof(float)));
@@ -1423,6 +1430,20 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         moe_forward_gguf(engine, ram_mgr, async_io_queue, l, hidden_states, S,
                          scratch.moe_out.data(), scratch, token_ids);
       }
+    }
+    if (!probe_last_scores.empty() && S == 1 && (int)scratch.tok_topk_ids.size() >= c.topk) {
+      static std::atomic<uint64_t> agree{0}, total{0};
+      std::vector<int> idx((size_t)c.n_experts);
+      for (int e = 0; e < c.n_experts; ++e) idx[(size_t)e] = e;
+      std::partial_sort(idx.begin(), idx.begin() + c.topk, idx.end(),
+                        [&](int a, int b) { return probe_last_scores[(size_t)a] > probe_last_scores[(size_t)b]; });
+      for (int k = 0; k < c.topk; ++k)
+        for (int j = 0; j < c.topk; ++j)
+          if (idx[(size_t)k] == scratch.tok_topk_ids[(size_t)j]) { ++agree; break; }
+      total += (uint64_t)c.topk;
+      if (l == c.n_layers - 1)
+        LOG_INFO("[PROBE-ROUTE-CHECK] hook top-%d vs engine routed ids: %llu/%llu agree\n", c.topk,
+                 (unsigned long long)agree.load(), (unsigned long long)total.load());
     }
     g_diag_ffn_call_ms += std::chrono::duration<double, std::milli>(
                               std::chrono::high_resolution_clock::now() -
