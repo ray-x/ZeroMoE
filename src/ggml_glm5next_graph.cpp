@@ -32,11 +32,13 @@
 #include <climits>
 #include <cmath>
 #include <condition_variable>
+#include <shared_mutex>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -195,6 +197,7 @@ struct FullGraph {
   ggml_backend_t gpu1 = nullptr; // optional second CUDA device for expert layers
   int gpu1_first = -1, gpu1_last = -2;
   std::vector<ggml_backend_buffer_t> gpu1_buffers;
+  std::unordered_map<int, ggml_tensor *> stage_pred; // layer -> pilot ids predicted for it (built one layer earlier)
   size_t gpu1_bytes = 0;
   int indexer_heads = 0;
   int indexer_key_length = 0;
@@ -624,6 +627,7 @@ struct OffloadState {
 };
 std::unique_ptr<OffloadState> g_offload;
 std::mutex g_offload_mutex;
+std::shared_mutex g_arena_mu; // exclusive: cache eviction/loads (miss nodes); shared: the pilot-staging worker reading arena slots
 
 int offload_first_layer() {
   static const int first = [] {
@@ -820,6 +824,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
       if (ids[k] >= 0 && !o.cache->resident({site->layer, ids[k]}) && dbg_lines.fetch_add(1) < 40)
         LOG_INFO("[OFFLOAD-DEBUG] miss layer=%d expert=%d S=%lld k=%zu\n", site->layer, ids[k],
                  (long long)a->ne[1], k);
+  std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
   const auto r = site->prefill
                      ? o.residency->ensure_transient(site->layer, ids.data(),
                                                      (int)ids.size())
@@ -850,6 +855,351 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                         std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
   if (!site->prefill && o.calls.load() - o.last_report_calls.load() >= 544) {
+    o.last_report_calls.store(o.calls.load());
+    offload_report(o, "progress");
+  }
+}
+
+
+// ---------------------------------------------------------------------------
+// Pilot staging (MOESTREAM_GLM5NEXT_PILOT_STAGE=K): in decode, layer l's graph predicts the K most likely COLD experts of layer l+1
+// (layer l+1's router applied to layer l's FFN input, hot experts masked out), a worker copies them DDR -> pinned -> VRAM ring while
+// layer l's FFN and layer l+1's attention run, and layer l+1 computes them on the GPU; the CPU cold branch skips whatever was staged.
+// A staged expert that was not ready or not routed simply stays on the CPU branch, so correctness never depends on timing.
+// ---------------------------------------------------------------------------
+int pilot_stage_k() {
+  static const int k = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_STAGE");
+    return v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0;
+  }();
+  return k;
+}
+struct StageSite {
+  int layer = 0;
+  int set = 0;
+};
+struct StageMissSite;
+struct StageResult {
+  std::atomic<int> state{0}; // 0 none, 1 pending, 2 ready
+  int n = 0;
+  int32_t ids[8] = {};
+};
+struct StageRuntime {
+  int K = 0;
+  static constexpr int kSets = 2;
+  uint64_t plane_bytes[3] = {};
+  ggml_backend_buffer_t dev_buf[kSets][3] = {};
+  char *dev_base[kSets][3] = {};
+  void *pinned[kSets][3] = {};
+  cudaStream_t stream = nullptr;
+  cudaEvent_t done[kSets] = {};
+  std::thread worker;
+  std::mutex m;
+  std::condition_variable cv, done_cv;
+  struct Job {
+    int layer = 0, set = 0, n = 0;
+    int32_t ids[8] = {};
+  };
+  std::deque<Job> q;
+  bool stop = false;
+  // Small copy pool: the DDR -> pinned memcpy of a few multi-MB planes is the long pole of a staging job, so the worker thread and
+  // kCopyHelpers helpers split the (expert, plane) pieces.
+  static constexpr int kCopyHelpers = 3;
+  std::vector<std::thread> helpers;
+  std::mutex pm;
+  std::condition_variable pcv, pdone;
+  std::function<void(int)> pfn;
+  int pn = 0;
+  std::atomic<int> pnext{0}, pfinished{0};
+  uint64_t pgen = 0;
+  void run_pieces(int n, std::function<void(int)> fn) {
+    {
+      std::lock_guard<std::mutex> lock(pm);
+      pfn = std::move(fn);
+      pn = n;
+      pnext.store(0);
+      pfinished.store(0);
+      ++pgen;
+    }
+    pcv.notify_all();
+    for (;;) {
+      const int i = pnext.fetch_add(1);
+      if (i >= n)
+        break;
+      pfn(i);
+      pfinished.fetch_add(1);
+    }
+    std::unique_lock<std::mutex> lock(pm);
+    pdone.wait(lock, [&] { return pfinished.load() >= n; });
+  }
+  void helper_main() {
+    uint64_t seen = 0;
+    for (;;) {
+      std::function<void(int)> fn;
+      int n = 0;
+      {
+        std::unique_lock<std::mutex> lock(pm);
+        pcv.wait(lock, [&] { return stop || pgen != seen; });
+        if (stop)
+          return;
+        seen = pgen;
+        fn = pfn;
+        n = pn;
+      }
+      for (;;) {
+        const int i = pnext.fetch_add(1);
+        if (i >= n)
+          break;
+        fn(i);
+        if (pfinished.fetch_add(1) + 1 >= n) {
+          std::lock_guard<std::mutex> lock(pm);
+          pdone.notify_all();
+        }
+      }
+    }
+  }
+  StageResult result[128];
+  std::deque<StageSite> sites;
+  std::deque<StageMissSite> miss_sites;
+  std::atomic<uint64_t> jobs{0}, copied{0}, resolves{0}, staged_routes{0}, routes_seen{0}, wait_us{0}, skipped_not_resident{0};
+  ~StageRuntime() {
+    {
+      std::lock_guard<std::mutex> lock(m);
+      stop = true;
+    }
+    cv.notify_all();
+    pcv.notify_all();
+    if (worker.joinable())
+      worker.join();
+    for (auto &h : helpers)
+      if (h.joinable())
+        h.join();
+    for (int s = 0; s < kSets; ++s)
+      for (int k = 0; k < 3; ++k) {
+        if (pinned[s][k])
+          cudaFreeHost(pinned[s][k]);
+        if (dev_buf[s][k])
+          ggml_backend_buffer_free(dev_buf[s][k]);
+      }
+    for (int s = 0; s < kSets; ++s)
+      if (done[s])
+        cudaEventDestroy(done[s]);
+    if (stream)
+      cudaStreamDestroy(stream);
+  }
+};
+std::unique_ptr<StageRuntime> g_stage;
+bool g_stage_failed = false;
+
+void stage_worker_main(StageRuntime *st) {
+  for (;;) {
+    StageRuntime::Job job;
+    {
+      std::unique_lock<std::mutex> lock(st->m);
+      st->cv.wait(lock, [&] { return st->stop || !st->q.empty(); });
+      if (st->stop && st->q.empty())
+        return;
+      job = st->q.front();
+      st->q.pop_front();
+    }
+    OffloadState *o = g_offload.get();
+    StageResult &res = st->result[job.layer];
+    int staged = 0;
+    int32_t staged_ids[8] = {};
+    if (o) {
+      std::shared_lock<std::shared_mutex> arena_lock(g_arena_mu);
+      int chosen[8] = {};
+      for (int j = 0; j < job.n && staged < st->K; ++j) {
+        const int id = job.ids[j];
+        if (id < 0 || id >= o->n_experts || !o->cache->resident({job.layer, id})) {
+          st->skipped_not_resident.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+        chosen[staged] = id;
+        staged_ids[staged++] = id;
+      }
+      if (staged > 0) {
+        size_t pb[3];
+        for (int k = 0; k < 3; ++k)
+          pb[k] = (size_t)o->arena->plane_bytes(job.layer, k);
+        st->run_pieces(staged * 3, [&](int piece) {
+          const int slot = piece / 3, k = piece % 3;
+          char *src = static_cast<char *>(o->arena->ptr(job.layer, chosen[slot], k));
+          char *host = static_cast<char *>(st->pinned[job.set][k]) + (size_t)slot * pb[k];
+          std::memcpy(host, src, pb[k]);
+          cudaMemcpyAsync(st->dev_base[job.set][k] + (size_t)slot * pb[k], host, pb[k], cudaMemcpyHostToDevice, st->stream);
+        });
+      }
+    }
+    cudaEventRecord(st->done[job.set], st->stream);
+    st->copied.fetch_add((uint64_t)staged, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(st->m);
+      res.n = staged;
+      std::memcpy(res.ids, staged_ids, sizeof(staged_ids));
+      res.state.store(2, std::memory_order_release);
+    }
+    st->done_cv.notify_all();
+  }
+}
+
+StageRuntime *get_stage_impl(FullGraph &g);
+StageRuntime *get_stage(FullGraph &g) {
+  if (g_stage)
+    return g_stage.get();
+  if (g_stage_failed)
+    return nullptr;
+  StageRuntime *r = get_stage_impl(g);
+  if (!r)
+    g_stage_failed = true;
+  return r;
+}
+StageRuntime *get_stage_impl(FullGraph &g) {
+  OffloadState *o = g_offload.get();
+  const int K = pilot_stage_k();
+  if (!o || K <= 0 || !g.cuda)
+    return nullptr;
+  auto st = std::make_unique<StageRuntime>();
+  st->K = K;
+  // Per-layer quant types differ in this GGUF (e.g. the down projection), so the ring is sized for the largest plane and each layer
+  // addresses it with its own expert stride.
+  for (int k = 0; k < 3; ++k) {
+    st->plane_bytes[k] = 0;
+    for (int l = o->first; l < o->first + o->n_layers; ++l)
+      st->plane_bytes[k] = std::max<uint64_t>(st->plane_bytes[k], o->arena->plane_bytes(l, k));
+  }
+  if (cudaStreamCreateWithFlags(&st->stream, cudaStreamNonBlocking) != cudaSuccess)
+    return nullptr;
+  for (int s = 0; s < StageRuntime::kSets; ++s) {
+    if (cudaEventCreateWithFlags(&st->done[s], cudaEventDisableTiming) != cudaSuccess)
+      return nullptr;
+    for (int k = 0; k < 3; ++k) {
+      const size_t bytes = (size_t)K * st->plane_bytes[k];
+      st->dev_buf[s][k] = ggml_backend_alloc_buffer(g.cuda, bytes + 4096);
+      if (!st->dev_buf[s][k]) {
+        LOG_WARN("[GGML-GLM5NEXT-STAGE] VRAM ring allocation failed (%zu bytes); pilot staging disabled\n", bytes);
+        return nullptr;
+      }
+      ggml_backend_buffer_set_usage(st->dev_buf[s][k], GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+      st->dev_base[s][k] = static_cast<char *>(ggml_backend_buffer_get_base(st->dev_buf[s][k]));
+      if (cudaMallocHost(&st->pinned[s][k], bytes) != cudaSuccess) {
+        LOG_WARN("[GGML-GLM5NEXT-STAGE] pinned bounce allocation failed\n");
+        return nullptr;
+      }
+    }
+  }
+  st->worker = std::thread(stage_worker_main, st.get());
+  for (int h = 0; h < StageRuntime::kCopyHelpers; ++h)
+    st->helpers.emplace_back([p = st.get()] { p->helper_main(); });
+  LOG_INFO("[GGML-GLM5NEXT-STAGE] ring ready: K=%d, %d sets, expert planes %llu/%llu/%llu bytes\n", K, StageRuntime::kSets,
+           (unsigned long long)st->plane_bytes[0], (unsigned long long)st->plane_bytes[1], (unsigned long long)st->plane_bytes[2]);
+  g_stage = std::move(st);
+  return g_stage.get();
+}
+
+struct StageMissSite {
+  OffloadSite *off = nullptr; // this layer's offload state/site
+  int layer = 0, set = 0;
+  int next_layer = -1, next_set = 0; // layer whose experts the pilot input predicts (-1: last layer)
+};
+
+void stage_post_job(StageRuntime *st, int layer, int set, const ggml_tensor *pred) {
+  StageRuntime::Job job;
+  job.layer = layer;
+  job.set = set;
+  job.n = (int)std::min<int64_t>(pred->ne[0], 8);
+  for (int j = 0; j < job.n; ++j)
+    job.ids[j] = *(const int32_t *)((const char *)pred->data + j * pred->nb[0]);
+  {
+    std::lock_guard<std::mutex> lock(st->m);
+    st->result[layer].state.store(1, std::memory_order_release);
+    st->q.push_back(job);
+  }
+  st->jobs.fetch_add(1, std::memory_order_relaxed);
+  st->cv.notify_one();
+}
+
+// One CPU node per layer: (a) wait for the staged copy of this layer, (b) emit per route either the cold id for the CPU branch, or
+// -(slot+2) for a route served from the VRAM ring, (c) make the remaining cold experts resident, (d) start the copy for the next layer.
+// a: static cold ids [topk,1]; b: real routed ids [topk,1]; c: pilot ids of the next layer [K,1].
+void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b, const ggml_tensor *c, int ith, int, void *ud) {
+  if (ith != 0)
+    return;
+  StageMissSite *site = static_cast<StageMissSite *>(ud);
+  StageRuntime *st = g_stage.get();
+  OffloadState &o = *site->off->state;
+  const auto cb_t0 = std::chrono::steady_clock::now();
+  const int n = (int)a->ne[0];
+  int staged = 0;
+  int32_t staged_ids[8] = {};
+  StageResult &res = st->result[site->layer];
+  if (res.state.load(std::memory_order_acquire) != 0) {
+    const auto t0 = std::chrono::steady_clock::now();
+    {
+      std::unique_lock<std::mutex> lock(st->m);
+      st->done_cv.wait(lock, [&] { return res.state.load(std::memory_order_acquire) != 1; });
+      staged = res.n;
+      std::memcpy(staged_ids, res.ids, sizeof(staged_ids));
+      res.state.store(0, std::memory_order_release);
+    }
+    if (staged > 0)
+      cudaEventSynchronize(st->done[site->set]);
+    st->wait_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
+                          std::memory_order_relaxed);
+  }
+  std::vector<int32_t> ids((size_t)n);
+  int32_t *out = static_cast<int32_t *>(dst->data);
+  uint64_t hit = 0;
+  for (int i = 0; i < n; ++i) {
+    const int32_t cold = *(const int32_t *)((const char *)a->data + i * a->nb[0]);
+    const int32_t real = *(const int32_t *)((const char *)b->data + i * b->nb[0]);
+    int slot = -1;
+    for (int j = 0; j < staged; ++j)
+      if (staged_ids[j] == real) {
+        slot = j;
+        break;
+      }
+    if (slot >= 0 && cold >= 0) {
+      out[i] = -(slot + 2);
+      ids[(size_t)i] = -1;
+      ++hit;
+    } else {
+      out[i] = cold;
+      ids[(size_t)i] = cold;
+    }
+  }
+  st->staged_routes.fetch_add(hit, std::memory_order_relaxed);
+  st->routes_seen.fetch_add((uint64_t)n, std::memory_order_relaxed);
+  moestream::offload::ExpertResidency::Ensure r;
+  {
+    std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
+    r = o.residency->ensure(site->layer, ids.data(), n);
+  }
+  o.calls.fetch_add(1, std::memory_order_relaxed);
+  o.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+  o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
+  o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+  o.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
+  o.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+  o.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+  if (r.errors > 0) {
+    o.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting\n", site->layer, r.errors);
+    offload_report(o, "fatal");
+    std::abort();
+  }
+  if (site->next_layer >= 0)
+    stage_post_job(st, site->next_layer, site->next_set, c);
+  o.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
+                    std::memory_order_relaxed);
+  const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (rs % 4704 == 0)
+    LOG_INFO("[GGML-GLM5NEXT-STAGE] progress: jobs=%llu experts_copied=%llu resolves=%llu staged_routes=%llu/%llu not_resident=%llu "
+             "wait=%.1f ms\n",
+             (unsigned long long)st->jobs.load(), (unsigned long long)st->copied.load(), (unsigned long long)rs,
+             (unsigned long long)st->staged_routes.load(), (unsigned long long)st->routes_seen.load(),
+             (unsigned long long)st->skipped_not_resident.load(), st->wait_us.load() / 1000.0);
+  if (o.calls.load() - o.last_report_calls.load() >= 544) {
     o.last_report_calls.store(o.calls.load());
     offload_report(o, "progress");
   }
@@ -5614,6 +5964,129 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   return ggml_mul_mat(ctx, wo, value);
 }
 
+
+bool stage_layer_active(const FullGraph &g, int layer) {
+  const auto &c = g.engine->model_file.architecture_config;
+  return g.decode_mode && g.S == 1 && pilot_stage_k() > 0 && offload_layer(layer) && layer < c.n_layers &&
+         layer - 1 >= c.first_dense;
+}
+
+// 0 for cold experts, -1e9 for experts that live in VRAM (hot, GPU1 hot): the pilot only ranks what the CPU would otherwise compute.
+ggml_tensor *stage_hot_mask(FullGraph &g, ggml_context *ctx, int layer) {
+  const auto &c = g.engine->model_file.architecture_config;
+  ggml_tensor *t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.n_experts);
+  if (!t)
+    return nullptr;
+  std::vector<float> m((size_t)c.n_experts, 0.0f);
+  if (PartialExpertLayer *p = partial_layer(g, layer)) {
+    for (int e : p->hot)
+      if (e >= 0 && e < c.n_experts)
+        m[(size_t)e] = -1e9f;
+    if (g.gpu1)
+      for (int e : p->hot1)
+        if (e >= 0 && e < c.n_experts)
+          m[(size_t)e] = -1e9f;
+  }
+  if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used, t, m.data(), ggml_nbytes(t)))
+    return nullptr;
+  ggml_set_name(t, ("glm5next_stage_hot_mask_" + std::to_string(layer)).c_str());
+  return t;
+}
+
+bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, int l) {
+  const auto &c = g.engine->model_file.architecture_config;
+  const int next = l + 1;
+  if (!stage_layer_active(g, next))
+    return true;
+  StageRuntime *st = get_stage(g);
+  if (!st)
+    return true;
+  const std::string pn = "blk." + std::to_string(next) + ".";
+  ggml_tensor *fn = resident_tensor(g, ctx, pn + "ffn_norm.weight");
+  ggml_tensor *router = resident_tensor(g, ctx, pn + "ffn_gate_inp.weight");
+  ggml_tensor *bias = resident_tensor(g, ctx, pn + "exp_probs_b.bias");
+  if (!fn || !router) {
+    LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: missing next-layer norm/router tensor\n", l);
+    return false;
+  }
+  ggml_tensor *z = ggml_mul(ctx, ggml_rms_norm(ctx, cur_pre, c.eps), fn);
+  ggml_tensor *logits = ggml_mul_mat(ctx, router, z);
+  ggml_tensor *probs = nullptr;
+  switch (c.gating_func) {
+  case GatingFunc::Sigmoid:
+    probs = ggml_sigmoid(ctx, logits);
+    break;
+  case GatingFunc::SqrtSoftplus:
+    probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+    break;
+  case GatingFunc::Softmax:
+  default:
+    probs = ggml_soft_max(ctx, logits);
+    break;
+  }
+  ggml_tensor *score = bias ? ggml_add(ctx, probs, bias) : probs;
+  ggml_tensor *mask = stage_hot_mask(g, ctx, next);
+  if (!mask) {
+    LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: hot-mask allocation failed (dense arena %zu/%zu)\n", next, g.dense_used, g.dense_capacity);
+    return false;
+  }
+  score = ggml_add(ctx, score, mask);
+  ggml_tensor *pred = ggml_argsort_top_k(ctx, score, st->K);
+  ggml_set_name(pred, ("glm5next_stage_pred_" + std::to_string(next)).c_str());
+  g.stage_pred[next] = pred;
+  return true;
+}
+
+ggml_tensor *stage_ring_tensor(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, int plane) {
+  static const char *stems[3] = {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
+  const GGUFTensor *m = model_tensor(*g.engine, "blk." + std::to_string(layer) + "." + stems[plane]);
+  if (!m || !type_ok(m->type) || m->shape.size() != 3)
+    return nullptr;
+  std::vector<int64_t> shape;
+  for (uint64_t d : m->shape)
+    shape.push_back((int64_t)d);
+  shape[2] = st.K;
+  ggml_tensor *t = new_tensor(ctx, (ggml_type)m->type, shape);
+  const int set = layer % StageRuntime::kSets;
+  OffloadState *off = g_offload.get();
+  if (!t || !off || (uint64_t)t->nb[2] != off->arena->plane_bytes(layer, plane) || ggml_nbytes(t) > (size_t)st.K * st.plane_bytes[plane]) {
+    LOG_ERROR("[GGML-GLM5NEXT-STAGE] ring shape mismatch layer %d plane %d\n", layer, plane);
+    return nullptr;
+  }
+  if (ggml_backend_tensor_alloc(st.dev_buf[set][plane], t, st.dev_base[set][plane]) != GGML_STATUS_SUCCESS) {
+    LOG_WARN("[GGML-GLM5NEXT-STAGE] ring tensor alloc failed layer %d plane %d\n", layer, plane);
+    return nullptr;
+  }
+  ggml_set_name(t, ("glm5next_stage_ring_" + std::to_string(layer) + "_" + std::to_string(plane)).c_str());
+  return t;
+}
+
+ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, ggml_tensor *cold_ids, ggml_tensor *route_ids) {
+  OffloadState *o = get_offload(*g.engine);
+  if (!o || !cold_ids || !route_ids)
+    return nullptr;
+  std::lock_guard<std::mutex> lock(g_offload_mutex);
+  o->sites.push_back({o, layer, false});
+  StageMissSite ms;
+  ms.off = &o->sites.back();
+  ms.layer = layer;
+  ms.set = layer % StageRuntime::kSets;
+  ggml_tensor *pred_next = nullptr;
+  if (stage_layer_active(g, layer + 1)) {
+    auto it = g.stage_pred.find(layer + 1);
+    if (it != g.stage_pred.end()) {
+      pred_next = it->second;
+      ms.next_layer = layer + 1;
+      ms.next_set = (layer + 1) % StageRuntime::kSets;
+    }
+  }
+  st.miss_sites.push_back(ms);
+  ggml_tensor *out = ggml_map_custom3(ctx, cold_ids, route_ids, pred_next ? pred_next : route_ids, stage_miss_cb, 1, &st.miss_sites.back());
+  if (out)
+    ggml_set_name(out, ("glm5next_stage_miss_" + std::to_string(layer)).c_str());
+  return out;
+}
+
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *forced_ids = nullptr) {
   const std::string p = "blk." + std::to_string(layer) + ".";
@@ -5817,6 +6290,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       hot_in = moe_partial::make_branch_inputs(ctx, hot_map, hot_mask, route_ids,
                                                weights, c.topk, g.S);
     }
+    StageRuntime *stage = (has_cold && stage_layer_active(g, layer) && g.stage_pred.count(layer)) ? get_stage(g) : nullptr;
+    ggml_tensor *stage_slots = nullptr, *stage_m = nullptr, *stage_keep = nullptr;
     if (has_cold) {
       ggml_tensor *cold_map = partial_map(g, ctx, layer, false, false);
       ggml_tensor *cold_mask = partial_map(g, ctx, layer, false, true);
@@ -5825,9 +6300,23 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       cold_in = moe_partial::make_branch_inputs(ctx, cold_map, cold_mask, route_ids,
                                                 weights, c.topk, g.S);
       if (offload_layer(layer)) {
-        cold_in.ids = offload_miss_node(g, ctx, layer, cold_in.ids);
-        if (!cold_in.ids)
-          return nullptr;
+        if (stage) {
+          // Packed result: cold id (>= -1) for the CPU branch, or -(slot+2) for a route served from the VRAM ring.
+          ggml_tensor *packed = stage_miss_node(g, ctx, *stage, layer, cold_in.ids, route_ids);
+          if (!packed)
+            return nullptr;
+          ggml_tensor *pf = ggml_cast(ctx, packed, GGML_TYPE_F32);
+          cold_in.ids = ggml_cast(ctx, ggml_clamp(ctx, pf, -1.0f, 1.0e9f), GGML_TYPE_I32);
+          ggml_tensor *slots_f = ggml_clamp(ctx, ggml_scale_bias(ctx, pf, -1.0f, -2.0f), -1.0f, (float)stage->K);
+          stage_slots = ggml_cast(ctx, slots_f, GGML_TYPE_I32);
+          stage_m = ggml_reshape_3d(ctx, ggml_step(ctx, ggml_scale_bias(ctx, slots_f, 1.0f, 0.5f)), 1, c.topk, 1);
+          stage_keep = ggml_scale_bias(ctx, stage_m, -1.0f, 1.0f);
+          cold_in.weights = ggml_mul(ctx, cold_in.weights, stage_keep);
+        } else {
+          cold_in.ids = offload_miss_node(g, ctx, layer, cold_in.ids);
+          if (!cold_in.ids)
+            return nullptr;
+        }
       }
     }
     out = moe_partial::combine_hot_cold(
@@ -5854,6 +6343,17 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       if (!b1)
         return nullptr;
       out = ggml_add(ctx, out, b1);
+    }
+    if (stage_slots) {
+      ggml_tensor *rg = stage_ring_tensor(g, ctx, *stage, layer, 0);
+      ggml_tensor *ru = stage_ring_tensor(g, ctx, *stage, layer, 1);
+      ggml_tensor *rd = stage_ring_tensor(g, ctx, *stage, layer, 2);
+      if (!rg || !ru || !rd)
+        return nullptr;
+      ggml_tensor *bs = run_branch(nullptr, rg, ru, rd, stage_slots, ggml_mul(ctx, weights, stage_m));
+      if (!bs)
+        return nullptr;
+      out = ggml_add(ctx, out, bs);
     }
   } else {
     ggml_tensor *branch_ids = route_ids;
@@ -6137,6 +6637,7 @@ bool build_graph(FullGraph &g) {
     if (!ffn_fn || !ffn_base || !ffn_scale)
       return false;
     cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
+    ggml_tensor *cur_pre = cur;
     ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
     if (!fn)
       return false;
@@ -6144,6 +6645,8 @@ bool build_graph(FullGraph &g) {
     ggml_build_forward_expand(g.graph, residual);
     ggml_build_forward_expand(g.graph, post);
     ggml_build_forward_expand(g.graph, comb);
+    if (!build_pilot_stage(g, g.ctx, cur_pre, l))
+      return false;
     ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l);
     if (!ffn) {
       LOG_WARN("[GGML-GLM5NEXT-FULL] build_ffn failed at layer=%d "

@@ -219,3 +219,30 @@ Decode rows only (pilot): k=1 91.9, k=3 87.8, k=5 82.6, k=10 67.3. The two weake
 In the 48 GiB / GPU1-hot configuration 43.7% of routed experts are cold (17,131 of 39,168 over 120 tokens, i.e. ~3.5 cold experts per layer per token, each
 ~0.45 ms on the CPU). Restricting the pilot to non-hot experts (hot set approximated from the usage ranking at the same budget), staging the top-k:
 top-2 82.1% precision / 37% of cold routes, top-3 73.9% / 50%, top-4 66.1% / 60%, top-6 52.8% / 72%.
+
+### In-graph pilot + VRAM staging ring (`MOESTREAM_GLM5NEXT_PILOT_STAGE=K`, default off)
+
+Built in `src/ggml_glm5next_graph.cpp`. In decode, layer l's graph ranks layer l+1's COLD experts (next layer's norm + router + bias on layer l's
+pre-FFN activation, VRAM-hot experts masked with -1e9, `argsort_top_k` K) and ONE custom CPU node per layer (`stage_miss_cb`) does everything that needs the
+host: waits for the staged copy of this layer, emits per route either the cold id for the CPU branch or `-(slot+2)` for a route served from the ring, makes
+the remaining cold experts resident (the offload miss node), and starts the copy for layer l+1. A worker (+3 copy helpers) copies the predicted experts
+DDR arena -> pinned bounce -> VRAM ring (2 sets of K slots, sized for the largest plane because per-layer quant types differ) while layer l's FFN and layer
+l+1's attention run; layer l+1 computes them with a third `MUL_MAT_ID` branch over the ring and masks them out of the CPU branch. Correctness never depends
+on timing: a staged expert that was late/not routed simply stays on the CPU branch (the node waits for the copy event on the host, so the GPU never reads
+a half-copied slot). Shared arena access is guarded (`g_arena_mu`: exclusive for cache loads/evictions, shared for the worker).
+
+Measured on the best configuration (48 GiB DDR, GPU1 hot 14.2 GiB, 8 threads, 100-token steady state; no-staging runs 100.7-102.4 ms/token):
+
+| K | staged routes per layer-token | ms/token | note |
+|---|---|---|---|
+| 1 | 0.83 | **99.2** | ~3% faster than no staging (within a few ms of noise) |
+| 2 | 1.47 | 103.0 | no gain |
+| 3 (separate issue/resolve/miss nodes) | 1.96 | 150.4 | three CPU nodes per layer: +82 scheduler splits |
+| 3 (one merged node, single copy thread) | 1.96 | 110.9 | copy stalls 0.58 ms/layer |
+| 3 (merged node, 3 copy helpers) | 1.96 | 119.9 | stalls gone (308 ms total) but the copies steal the cores the CPU matmuls need |
+
+So prediction works (the in-graph pilot stages 83% correct at K=1) but the staging itself is CPU work on this box: moving an expert to VRAM costs a 6.7 MB
+DDR -> pinned memcpy (~0.77 GB per token at K=3, ~77 core-ms), taken from the same six cores that compute the cold experts, plus ~0.5 ms/layer of extra
+graph/scheduler overhead. At K=1 the saved CPU compute (0.83 x 0.45 ms per layer) roughly pays for that; at K>=2 it does not. A real win needs the copy to
+leave the CPU: a pinned (cudaHostRegister) arena so the DMA engine reads DDR directly (conflicts with MADV_DONTNEED eviction, needs unregister-before-evict
+bookkeeping) or a faster link. Output stays coherent; staging is left opt-in.
