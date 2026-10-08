@@ -246,3 +246,14 @@ DDR -> pinned memcpy (~0.77 GB per token at K=3, ~77 core-ms), taken from the sa
 graph/scheduler overhead. At K=1 the saved CPU compute (0.83 x 0.45 ms per layer) roughly pays for that; at K>=2 it does not. A real win needs the copy to
 leave the CPU: a pinned (cudaHostRegister) arena so the DMA engine reads DDR directly (conflicts with MADV_DONTNEED eviction, needs unregister-before-evict
 bookkeeping) or a faster link. Output stays coherent; staging is left opt-in.
+
+#### Staging follow-up: ABBA for K=1, and the pinned-arena variant
+
+ABBA (warm-up, none, K=1, K=1, none; same config, 100-token steady state): none 101.6 / 101.9 ms, K=1 100.9 / 100.6 ms, i.e. -1.0 ms (-1.0%), consistent but
+within what this box's run-to-run spread allows (100.7-102.4 ms for identical no-staging runs). Staging at K=1 is neutral, not a speedup.
+
+Pinned-arena variant (`MOESTREAM_GLM5NEXT_OFFLOAD_PIN=1`, now opt-in; `cudaHostRegister` on every populated expert slot, unregister before eviction, the staging
+worker DMAs straight from the arena with no CPU copy; all 3 planes of every seeded expert registered, 0 failures): works functionally (`direct_pieces` > 0), but at
+DDR=16 GiB it raised host memory in use from 57 GB to 80 GB (+23 GB for 2,607 pinned experts = 17.5 GB of data) at identical process RSS, and an earlier 48 GiB
+run drove the box to 124 GB used / 39 GB swap before I killed it. A pinned arena of the 48 GiB size does not fit next to the engine's other memory on this 125 GB host,
+so the CPU-copy-free variant could not be benchmarked at the size where it would matter. Do not enable it without a hard memory cap.

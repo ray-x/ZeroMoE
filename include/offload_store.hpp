@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -381,8 +382,13 @@ public:
   }
   uint64_t plane_bytes(int layer, int plane) const { return map(layer, plane).plane; }
   uint64_t stride(int layer, int plane) const { return map(layer, plane).stride; }
+  // Optional integration hooks (e.g. pinning the slot for DMA): after_populate runs once an expert's planes hold valid data,
+  // before_evict runs right before its pages are returned to the OS.
+  std::function<void(int, int)> after_populate, before_evict;
+  void populated(int layer, int expert) { if (after_populate) after_populate(layer, expert); }
   // Return one expert's pages to the OS; the slot reads as zeros until it is populated again.
   void evict(int layer, int expert) {
+    if (before_evict) before_evict(layer, expert);
     for (int k = 0; k < 3; ++k) {
       const Map &m = map(layer, k);
       if (m.base) ::madvise(m.base + static_cast<uint64_t>(expert) * m.stride, static_cast<size_t>(m.stride), MADV_DONTNEED);
@@ -442,7 +448,7 @@ public:
     const std::vector<char> ok = load_many(layer, to_load);
     r.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     for (size_t k = 0; k < to_load.size(); ++k) {
-      if (ok[k]) ++r.loads;
+      if (ok[k]) { ++r.loads; arena_.populated(layer, to_load[k]); }
       else { cache_.erase({layer, to_load[k]}); arena_.evict(layer, to_load[k]); ++r.errors; }
     }
     return r;
@@ -506,7 +512,10 @@ public:
     const ExpertCache::Config &c = cache_.config();
     for (int L = c.first_layer; L < c.first_layer + c.n_layers; ++L)
       for (int E = 0; E < c.n_experts; ++E)
-        if (cache_.resident({L, E}) && !load(L, E)) { cache_.erase({L, E}); ++failed; }
+        if (cache_.resident({L, E})) {
+          if (load(L, E)) arena_.populated(L, E);
+          else { cache_.erase({L, E}); ++failed; }
+        }
     return failed;
   }
 

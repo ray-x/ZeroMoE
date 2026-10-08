@@ -607,6 +607,7 @@ bool env_enabled() {
 // ---------------------------------------------------------------------------
 const GGUFTensor *model_tensor(const StreamingEngine &engine,
                                const std::string &name);
+int pilot_stage_k();
 struct OffloadState;
 struct OffloadSite {
   OffloadState *state = nullptr;
@@ -621,6 +622,46 @@ struct OffloadState {
   moestream::offload::ModelReader model;
   std::unique_ptr<moestream::offload::ExpertResidency> residency;
   std::deque<OffloadSite> sites;
+  // Pinned (cudaHostRegister) expert slots, so the pilot-staging DMA reads DDR directly instead of through a CPU bounce copy.
+  bool pin_slots = false;
+  std::vector<uint8_t> pinned; // [(layer - first) * n_experts + expert]
+  std::atomic<uint64_t> pin_calls{0}, pin_fail{0};
+  void pin_expert(int layer, int expert) {
+    uint8_t &f = pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert];
+    if (f)
+      return;
+    int ok = 0;
+    for (int k = 0; k < 3; ++k)
+      if (cudaHostRegister(arena->ptr(layer, expert, k), (size_t)arena->plane_bytes(layer, k), cudaHostRegisterPortable) == cudaSuccess)
+        ++ok;
+      else
+        cudaGetLastError();
+    if (ok == 3) {
+      f = 1;
+      pin_calls.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      pin_fail.fetch_add(1, std::memory_order_relaxed);
+      for (int k = 0; k < ok; ++k)
+        cudaHostUnregister(arena->ptr(layer, expert, k)); // partially registered: undo (the unregistered plane is the failed one)
+    }
+  }
+  void unpin_expert(int layer, int expert) {
+    uint8_t &f = pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert];
+    if (!f)
+      return;
+    for (int k = 0; k < 3; ++k)
+      cudaHostUnregister(arena->ptr(layer, expert, k));
+    f = 0;
+  }
+  bool is_pinned(int layer, int expert) const {
+    return pin_slots && pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert] != 0;
+  }
+  ~OffloadState() {
+    if (pin_slots && arena)
+      for (int l = first; l < first + n_layers; ++l)
+        for (int e = 0; e < n_experts; ++e)
+          unpin_expert(l, e);
+  }
   std::atomic<uint64_t> calls{0}, routes{0}, misses{0}, loads{0}, evictions{0},
       errors{0}, load_us{0}, transient_loads{0}, cb_us{0}, cold_routes{0};
   std::atomic<uint64_t> last_report_calls{0};
@@ -760,6 +801,13 @@ OffloadState *get_offload(const StreamingEngine &engine,
   o->residency = std::make_unique<moestream::offload::ExpertResidency>(
       *o->cache, *o->arena, sources);
 
+  if (pilot_stage_k() > 0 && offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", "0") == "1") {
+    o->pin_slots = true;
+    o->pinned.assign((size_t)o->n_layers * (size_t)o->n_experts, 0);
+    OffloadState *op = o.get();
+    o->arena->after_populate = [op](int l, int e) { op->pin_expert(l, e); };
+    o->arena->before_evict = [op](int l, int e) { op->unpin_expert(l, e); };
+  }
   const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
   if (!usage.empty()) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -790,6 +838,9 @@ OffloadState *get_offload(const StreamingEngine &engine,
     }
     o->cache->seed(ranked);
     const size_t failed = o->residency->populate_resident();
+    if (o->pin_slots)
+      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] pinned %llu experts (%llu failed) for direct DMA\n",
+               (unsigned long long)o->pin_calls.load(), (unsigned long long)o->pin_fail.load());
     LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] seeded %zu/%zu experts (%zu failed) in "
              "%.1f s\n",
              o->cache->size(), cc.capacity, failed,
@@ -961,7 +1012,7 @@ struct StageRuntime {
   StageResult result[128];
   std::deque<StageSite> sites;
   std::deque<StageMissSite> miss_sites;
-  std::atomic<uint64_t> jobs{0}, copied{0}, resolves{0}, staged_routes{0}, routes_seen{0}, wait_us{0}, skipped_not_resident{0};
+  std::atomic<uint64_t> direct{0}, jobs{0}, copied{0}, resolves{0}, staged_routes{0}, routes_seen{0}, wait_us{0}, skipped_not_resident{0};
   ~StageRuntime() {
     {
       std::lock_guard<std::mutex> lock(m);
@@ -1025,6 +1076,12 @@ void stage_worker_main(StageRuntime *st) {
         st->run_pieces(staged * 3, [&](int piece) {
           const int slot = piece / 3, k = piece % 3;
           char *src = static_cast<char *>(o->arena->ptr(job.layer, chosen[slot], k));
+          if (o->is_pinned(job.layer, chosen[slot])) {
+            // The arena slot is page-locked: the DMA engine reads DDR directly, no CPU copy.
+            cudaMemcpyAsync(st->dev_base[job.set][k] + (size_t)slot * pb[k], src, pb[k], cudaMemcpyHostToDevice, st->stream);
+            st->direct.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
           char *host = static_cast<char *>(st->pinned[job.set][k]) + (size_t)slot * pb[k];
           std::memcpy(host, src, pb[k]);
           cudaMemcpyAsync(st->dev_base[job.set][k] + (size_t)slot * pb[k], host, pb[k], cudaMemcpyHostToDevice, st->stream);
@@ -1195,10 +1252,10 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
   if (rs % 4704 == 0)
     LOG_INFO("[GGML-GLM5NEXT-STAGE] progress: jobs=%llu experts_copied=%llu resolves=%llu staged_routes=%llu/%llu not_resident=%llu "
-             "wait=%.1f ms\n",
+             "wait=%.1f ms direct_pieces=%llu\n",
              (unsigned long long)st->jobs.load(), (unsigned long long)st->copied.load(), (unsigned long long)rs,
              (unsigned long long)st->staged_routes.load(), (unsigned long long)st->routes_seen.load(),
-             (unsigned long long)st->skipped_not_resident.load(), st->wait_us.load() / 1000.0);
+             (unsigned long long)st->skipped_not_resident.load(), st->wait_us.load() / 1000.0, (unsigned long long)st->direct.load());
   if (o.calls.load() - o.last_report_calls.load() >= 544) {
     o.last_report_calls.store(o.calls.load());
     offload_report(o, "progress");
