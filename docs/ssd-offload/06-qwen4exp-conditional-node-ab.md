@@ -18,3 +18,25 @@ Staged phases (mean of the last 50 tokens): storage request 3.42 ms, payload_pre
 H2D 1.15 ms, conditional host 2.68 ms + device 1.60 ms, tail replay 22.8 ms (submit 21.7, sync 1.1). Storage + upload run serialized on
 the host before the tail graph launches (~5.8 ms); the conditional-node machinery is ~4.3 ms (whether it overlaps the tail replay
 is not separated by these timers).
+
+## No-op staged control (is the cost the conditional node, or the staging?)
+
+The conditional node itself needs no H2D: it is a one-thread device kernel that reads the routed ids and calls
+`cudaGraphSetConditional` (`cuda/qwen4exp_master_graph.cu`). The H2D in the profile above is the staged expert payload the
+staged child consumes (storage 3.4 ms + payload prepare 2.4 ms + H2D 1.2 ms), which happens before the node.
+
+Control arm: same candidate environment but `MOESTREAM_QWEN4EXP_PARTIAL_LAYER_TOP_N=512` (all 512 experts of layer 13 resident),
+so every token takes the `all_resident` dispatch (63/63 `resident-gpu`, no storage request, no payload, no H2D, staged branch
+never fires). Proof gates relaxed with `QWEN_AB_SKIP_STAGED_PROOF=1`; six order-balanced pairs:
+
+| arm | tok/s per rep | mean |
+|---|---|---|
+| early-ready | 31.4 33.7 32.4 32.6 32.0 34.1 | 32.70 |
+| two-graph / conditional composition, staged branch a no-op | 34.0 33.8 33.4 34.0 33.8 33.1 | 33.69 (+3.0%, 5/6, within the baseline's own spread) |
+
+So the two-graph split, route readback and resident child are free; the 25.8% loss comes from running the staged branch
+(storage + payload + H2D + three-way conditional launch), not from the graph structure. Caveat: with all experts resident the
+dispatcher replays the resident child directly and never reaches `try_launch_three_way`, so this control does not execute the
+conditional node; the node's own ~4.3 ms (host 2.7 + device 1.6) is only bounded by the staged-path profile. Isolating it needs a
+variant that launches the three-way graph with an empty payload (skip storage/upload, keep the launch), which has to keep the
+completion-graph ready event consistent to avoid a hang.

@@ -251,7 +251,7 @@ def main():
                         contents)
                     exercised = ('3' in route_modes and staged_completion is not None
                                  and staged_dispatch is not None)
-                    if not exercised:
+                    if not exercised and not os.environ.get('QWEN_AB_SKIP_STAGED_PROOF'):
                         raise RuntimeError(
                             f'{tag}: staged graph did not prove a Ready completion, '
                             'mixed route mode, and staged-GPU dispatch')
@@ -259,7 +259,7 @@ def main():
                     exercised = ('[OPTION-B-EARLY-READY] calls=' in contents or
                                  '[QWEN4EXP-PARTIAL-GRAPH]' in contents)
 
-                if not exercised:
+                if not exercised and not os.environ.get('QWEN_AB_SKIP_STAGED_PROOF'):
                     raise RuntimeError(f'{tag}: graph bridge not exercised')
             totals, cores = zip(*steady)
             row = {'arm': arm, 'rep': rep, 'tps': 1000 / statistics.mean(totals),
