@@ -6650,6 +6650,16 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                 "source after graph decline\n");
   };
   auto decline_decode_graph = [&]() {
+    // Design policy: a GLM5NEXT request is served by the full graph or it fails. MOESTREAM_GLM5NEXT_GRAPH_STRICT=1
+    // turns the legacy-decode fallback into a hard error (default stays permissive until prefill is graph-only too).
+    if (const char *strict = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_STRICT");
+        strict && strict[0] == '1') {
+      LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] decode graph declined and "
+                "MOESTREAM_GLM5NEXT_GRAPH_STRICT=1: failing the request "
+                "instead of falling back to the layered path\n");
+      std::fflush(nullptr);
+      std::abort();
+    }
     retain_source_on_failure();
     g_glm5next_decode_disabled_engine = &engine;
     return false;

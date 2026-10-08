@@ -100,3 +100,10 @@ repeat their cold experts. Only a pilot-router predictor (next layer's router ap
 51-58% recall earlier in the engine) could help, and at 32 GiB (7 misses/token, ~21 ms) it would hide at most about half of
 that for new graph nodes plus a thread-safe prefetch path around the cache and arena. The lever that works is expert DDR
 (48 GiB: 0 misses, ~10 tok/s).
+
+### Strict full-graph mode
+
+`MOESTREAM_GLM5NEXT_GRAPH_STRICT=1` turns a declined decode graph into a hard error ("failing the request") instead of the
+silent fallback to the layered path. Checked both ways: the best configuration runs normally under it (97.1 ms/token over 39
+tokens), and an oversized GPU1 hot set (15.5 GiB, which the graph declines) aborts with the error. It is opt-in because
+prefill still uses the layered path; making it the default needs a graph-only prefill first.
