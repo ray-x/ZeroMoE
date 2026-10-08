@@ -1379,6 +1379,40 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // GPU dispatch inside dense_ffn_gguf/moe_forward_gguf could return
     // before the work is really done, making t_moe_expert under-report
     // vs. this wall-clock measurement of the same call).
+    // MOESTREAM_PROBE_DUMP=<dir>: training data for a learned next-layer expert predictor (diagnostic only). For every
+    // MoE layer l, append the post-attention residual rows x_l (S x D, f32) and layer l's REAL selection scores s_l
+    // (S x n_experts, f32: gate(logits)+bias, what the router ranks) so x_l can be paired with s_{l+1} offline.
+    if (static const char *probe_dir = std::getenv("MOESTREAM_PROBE_DUMP");
+        probe_dir && probe_dir[0] && l >= c.first_dense && c.n_experts > 0 &&
+        engine.family_ops.family != ModelFamily::Qwen4Exp) {
+      const std::string norm_key = "blk." + std::to_string(l) + ".ffn_norm.weight";
+      const std::string router_key = "blk." + std::to_string(l) + ".ffn_gate_inp.weight";
+      const std::string bias_key = "blk." + std::to_string(l) + ".exp_probs_b.bias";
+      auto n_it = engine.resident_layers.find(norm_key);
+      auto r_it = engine.resident_layers.find(router_key);
+      if (n_it != engine.resident_layers.end() && r_it != engine.resident_layers.end() &&
+          n_it->second.host_ptr && r_it->second.host_ptr) {
+        std::vector<float> nrm((size_t)S * D), sc((size_t)S * c.n_experts);
+        for (int t = 0; t < S; ++t)
+          rmsnorm_row(nrm.data() + (size_t)t * D, hidden_states + (size_t)t * D,
+                      reinterpret_cast<float *>(n_it->second.host_ptr), D, c.eps);
+        dense_proj(engine, router_key, nrm.data(), sc.data(), S, D, c.n_experts);
+        for (int t = 0; t < S; ++t) {
+          float *row = sc.data() + (size_t)t * c.n_experts;
+          apply_gating_activation(c.gating_func, row, c.n_experts);
+          auto b_it = engine.resident_layers.find(bias_key);
+          if (b_it != engine.resident_layers.end() && b_it->second.host_ptr) {
+            const float *bias = reinterpret_cast<float *>(b_it->second.host_ptr);
+            for (int e = 0; e < c.n_experts; ++e) row[e] += bias[e];
+          }
+        }
+        const std::string base = std::string(probe_dir) + "/L" + std::to_string(l);
+        std::ofstream xo(base + ".x.bin", std::ios::binary | std::ios::app);
+        xo.write(reinterpret_cast<const char *>(hidden_states), (std::streamsize)((size_t)S * D * sizeof(float)));
+        std::ofstream so(base + ".s.bin", std::ios::binary | std::ios::app);
+        so.write(reinterpret_cast<const char *>(sc.data()), (std::streamsize)(sc.size() * sizeof(float)));
+      }
+    }
     auto diag_ffn_call_start = std::chrono::high_resolution_clock::now();
     {
       PERF_SCOPE(t_moe_expert);

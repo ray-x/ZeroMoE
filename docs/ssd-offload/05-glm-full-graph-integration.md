@@ -167,3 +167,24 @@ Two points of accuracy buy ~7x the lead, so the earlier input is the right one f
 residual stream. History-only predictors are much worse (`bench/next_layer_predictor_eval.py`, leave-one-prompt-out on the 5-prompt trace):
 co-occurrence from the current layer's routed set gives precision@4 = 20.1% (15.6% on cold experts), a static usage prior 5.4%
 (random is 2.8%).
+
+### Corrected: next-layer prediction from exact hidden states (probe dump, `MOESTREAM_PROBE_DUMP`)
+
+The engine's own pilot statistic (above, ~55% precision@4) turns out to be far below what the model's routing allows. Dumping the real
+post-attention residual of each layer and the real router scores of every layer (6 prompts, ~3.2k tokens per layer; code/docs prompts,
+layered prefill) and applying layer l+1's own norm+router to layer l's post-attention residual (the same input the ATTN-PILOT uses),
+precision@k against the real top-8 of layer l+1 (`bench/next_layer_probe_fit.py`, leave-one-prompt-out, 41 layer pairs):
+
+| method | k=1 | k=2 | k=3 | k=4 | k=5 | k=8 |
+|---|---|---|---|---|---|---|
+| pilot (next router on this layer's residual) | 97.0 | 93.8 | **89.7** | 85.0 | 80.1 | 65.6 |
+| ridge probe alone (4096 -> 288) | 89.3 | 82.2 | 75.0 | 68.4 | 62.5 | 49.1 |
+| pilot + ridge correction | 97.9 | 95.2 | 91.4 | 86.8 | 81.7 | 66.5 |
+
+Worst layer for the plain pilot at k=3: layer 24 at 72.0% (80.2% with the ridge correction). On decode rows only (one prompt, 99 tokens x 41
+layers, `bench/next_layer_pilot_decode_check.py`): k=1 96.2, k=2 92.9, k=3 88.8, k=4 83.9, k=5 78.8, k=8 64.6 (prefill rows of the same
+run: 98.2 / 96.0 / 93.1 / 89.2 / 84.8 / 70.2). The router reimplementation matches the engine's dumped scores to 9.5e-4 (max abs diff).
+
+So with exact hidden states the plain next-router reuse already reaches ~89% top-3 / ~84% top-4 / ~79% top-5, well above a 70% bar, and a learned probe adds
+only ~2 points on average (it helps the worst layers). The engine's built-in pilot recall (37-40% at k=8 vs 65-70% here) is therefore an
+engine-side measurement or input problem, not a property of the model; its cause is not yet identified.
