@@ -619,7 +619,7 @@ struct OffloadState {
   std::unique_ptr<moestream::offload::ExpertResidency> residency;
   std::deque<OffloadSite> sites;
   std::atomic<uint64_t> calls{0}, routes{0}, misses{0}, loads{0}, evictions{0},
-      errors{0}, load_us{0}, transient_loads{0}, cb_us{0};
+      errors{0}, load_us{0}, transient_loads{0}, cb_us{0}, cold_routes{0};
   std::atomic<uint64_t> last_report_calls{0};
 };
 std::unique_ptr<OffloadState> g_offload;
@@ -644,7 +644,7 @@ std::string offload_env(const char *name, const char *dflt = "") {
 void offload_report(OffloadState &o, const char *why) {
   LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s: calls=%llu routes=%llu misses=%llu "
            "loads=%llu transient=%llu evictions=%llu errors=%llu load=%.1f ms "
-           "callback=%.1f ms\n",
+           "callback=%.1f ms cold_routes=%llu\n",
            why, (unsigned long long)o.calls.load(),
            (unsigned long long)o.routes.load(),
            (unsigned long long)o.misses.load(),
@@ -652,7 +652,7 @@ void offload_report(OffloadState &o, const char *why) {
            (unsigned long long)o.transient_loads.load(),
            (unsigned long long)o.evictions.load(),
            (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
-           o.cb_us.load() / 1000.0);
+           o.cb_us.load() / 1000.0, (unsigned long long)o.cold_routes.load());
 }
 
 // Created on first use and shared by the prompt and decode graphs.
@@ -827,6 +827,8 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                                            (int)ids.size());
   o.calls.fetch_add(1, std::memory_order_relaxed);
   o.routes.fetch_add(ids.size(), std::memory_order_relaxed);
+  o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }),
+                          std::memory_order_relaxed);
   o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
   o.loads.fetch_add((uint64_t)(site->prefill ? 0 : r.loads),
                     std::memory_order_relaxed);

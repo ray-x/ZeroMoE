@@ -188,3 +188,34 @@ run: 98.2 / 96.0 / 93.1 / 89.2 / 84.8 / 70.2). The router reimplementation match
 So with exact hidden states the plain next-router reuse already reaches ~89% top-3 / ~84% top-4 / ~79% top-5, well above a 70% bar, and a learned probe adds
 only ~2 points on average (it helps the worst layers). The engine's built-in pilot recall (37-40% at k=8 vs 65-70% here) is therefore an
 engine-side measurement or input problem, not a property of the model; its cause is not yet identified.
+
+### Why the engine's pilot read low: a stale ATTN-PILOT snapshot (fixed)
+
+The engine's ATTN-PILOT copied the post-attention residual into `pilot_attn_snapshot` as soon as attention returned, before that residual was final in
+`hidden_states`; the prediction therefore ran on a stale vector. Taking the snapshot immediately before the FFN (where the probe hook reads it) moves the
+engine's own statistic on the same 96-token generation from **37.2% -> 70.6%** (rank 0: 71.6% -> 98.9%), matching the offline numbers (decode-row precision@8
+71.0%, top-1 98.9%). Verified first that the hook's top-8 equals the engine's actually routed ids (13,104/13,104). The DEPTH-1 pilot (post-FFN state) stays at
+39% because it predicts from a state that is further from layer l+1's router input than the post-attention one; the post-attention input is the one to use.
+The fix is in `src/execution_layer.cpp` (snapshot re-taken right before the FFN). Hook-side numbers (overlap of 8) were 4-7 per layer vs 1-6 for the engine's
+old snapshot on the same layers and token.
+
+### Qwen3.8-Flash-Next (Q2_0): pilot and pilot + ridge
+
+Probe taps in the Qwen full graph (`MOESTREAM_QWEN4EXP_PROBE_DUMP`: FFN input of every layer and its router probabilities), 6 prompts (~580-890 tokens, 64 decode
+tokens each) on the accepted early-ready profile; pilot = layer l+1's router applied to layer l's FFN input, precision vs the real top-10 of layer l+1,
+leave-one-prompt-out, 47 layer pairs (`bench/next_layer_probe_fit_qwen.py`):
+
+| method | k=1 | k=2 | k=3 | k=4 | k=5 | k=10 |
+|---|---|---|---|---|---|---|
+| pilot | 90.9 | 88.5 | 85.8 | 83.1 | 80.3 | 64.5 |
+| ridge probe alone | 89.1 | 85.7 | 82.5 | 79.4 | 76.2 | 61.3 |
+| **pilot + ridge** | **94.8** | **93.0** | **91.2** | **89.1** | **86.8** | **72.0** |
+
+Decode rows only (pilot): k=1 91.9, k=3 87.8, k=5 82.6, k=10 67.3. The two weakest layers for the plain pilot, 38 (44.4% at k=3) and 22 (58.6%), reach 71.6% and
+72.2% with the ridge correction. So Qwen's next-layer routing is not hard to predict either: the plain pilot already gives ~86% top-3, and pilot + ridge ~91%.
+
+### GLM cold-only budget (best configuration)
+
+In the 48 GiB / GPU1-hot configuration 43.7% of routed experts are cold (17,131 of 39,168 over 120 tokens, i.e. ~3.5 cold experts per layer per token, each
+~0.45 ms on the CPU). Restricting the pilot to non-hot experts (hot set approximated from the usage ranking at the same budget), staging the top-k:
+top-2 82.1% precision / 37% of cold routes, top-3 73.9% / 50%, top-4 66.1% / 60%, top-6 52.8% / 72%.
