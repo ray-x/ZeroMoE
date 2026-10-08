@@ -139,3 +139,16 @@ fixed whole-layer baseline's 96 tokens, `glm_runs/v2/`:
 The best configuration stays within 0.03 logprob of the baseline's distance to llama.cpp (3 fewer top-1 matches out of 96,
 on a model whose top-2 margins are often below 0.1). The remaining ~1.2 gap to llama.cpp exists in the untouched baseline
 too, so it is an engine-vs-engine difference outside this work; its cause is not diagnosed.
+
+### N+1 (pilot) prediction accuracy on GLM decode
+
+Engine pilot router, legacy decode of 96 tokens (4,032 layer checks, `spread_base.toml`, `FULL_GRAPH=0`), recall measured against the
+real router's top-8 of the next layer:
+
+| pilot_k (experts predicted per layer) | real top-8 slots covered | correct experts per prediction | by real rank (0 / 1 / 2 / 3 / 4 / 5 / 6 / 7) |
+|---|---|---|---|
+| 4 | 27.4% (2.19 of 8) | 2.19 of 4 = 54.8% precision | 73.2 / 60.6 / 47.8 / 37.4 / - |
+| 8 | 39.5% (3.16 of 8) | 3.16 of 8 = 39.5% precision | 73.5 / 60.5 / 47.7 / 36.9 / 32.1 / 24.1 / 21.9 / 18.9 |
+
+The predicted set is not restricted to cold experts, so some of the correct ones are already VRAM-hot; ranking only the non-hot experts
+would raise the useful hit rate but was not measured.
