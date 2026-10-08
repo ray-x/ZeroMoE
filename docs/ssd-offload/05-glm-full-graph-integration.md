@@ -152,3 +152,18 @@ real router's top-8 of the next layer:
 
 The predicted set is not restricted to cold experts, so some of the correct ones are already VRAM-hot; ranking only the non-hot experts
 would raise the useful hit rate but was not measured.
+
+#### Is the low accuracy a lead-time (input freshness) problem?
+
+No. The DEPTH-1 pilot ranks layer l+1's experts from the residual stream after layer l's FFN (lead ~ one attention block); the ATTN-PILOT
+variant uses the stream right after layer l's attention (lead ~ FFN(l) + attention(l+1), about 7x longer). Same 96 decode tokens, k=8:
+
+| input | real top-8 slots covered | by real rank 0 / 1 / 2 / 3 |
+|---|---|---|
+| after layer l FFN (DEPTH-1) | 39.5% | 73.5 / 60.5 / 47.7 / 36.9 |
+| after layer l attention (ATTN-PILOT) | 37.4% | 71.5 / 58.1 / 44.1 / 34.9 |
+
+Two points of accuracy buy ~7x the lead, so the earlier input is the right one for prefetch. The ceiling is reusing the next layer's router on this layer's
+residual stream. History-only predictors are much worse (`bench/next_layer_predictor_eval.py`, leave-one-prompt-out on the 5-prompt trace):
+co-occurrence from the current layer's routed set gives precision@4 = 20.1% (15.6% on cold experts), a static usage prior 5.4%
+(random is 2.8%).
