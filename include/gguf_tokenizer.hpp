@@ -30,6 +30,7 @@ public:
   std::unordered_map<std::string, int>
       merge_rank;         // "sym1 sym2" -> priority (lower = merge first)
   std::string model_type; // tokenizer.ggml.model, e.g. "gpt2", "llama"
+  std::string pre_type;   // tokenizer.ggml.pre, e.g. "glm4" (selects the pretokenizer regex)
   int bos_token_id = 1;
   int eos_token_id = 2;
   // tokenizer.ggml.add_bos_token: whether the model's OWN tokenizer config
@@ -194,6 +195,8 @@ public:
           stop_ids.push_back(eos_token_id);
         } else if (key == "tokenizer.ggml.model" && value_type == 8)
           model_type = read_string(f);
+        else if (key == "tokenizer.ggml.pre" && value_type == 8)
+          pre_type = read_string(f);
         else
           skip_kv_value(f, value_type);
       }
@@ -290,7 +293,8 @@ public:
   // for the pretokenizer's known limitations).
   std::vector<int> encode(const std::string &text) {
     std::vector<int> out;
-    for (const auto &chunk : pretokenize(text)) {
+    for (const auto &chunk :
+         (pre_type == "glm4" ? pretokenize_glm4(text) : pretokenize(text))) {
       if (chunk.empty())
         continue;
       std::vector<std::string> symbols = to_unicode_symbols(chunk);
@@ -444,6 +448,72 @@ private:
       symbols[best_i] += symbols[best_i + 1];
       symbols.erase(symbols.begin() + best_i + 1);
     }
+  }
+
+  // llama.cpp's LLAMA_VOCAB_PRE_TYPE_GLM4 split, implemented by hand (no \p{..} support in std::regex):
+  //   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
+  //   ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+  // \p{L} is approximated by ASCII letters plus any non-ASCII byte, \p{N} by ASCII digits, \s by ASCII whitespace.
+  static std::vector<std::string> pretokenize_glm4(const std::string &text) {
+    const size_t n = text.size();
+    auto is_ws = [&](size_t k) { return k < n && std::isspace((unsigned char)text[k]); };
+    auto is_nl = [&](size_t k) { return k < n && (text[k] == '\r' || text[k] == '\n'); };
+    auto is_digit = [&](size_t k) { return k < n && std::isdigit((unsigned char)text[k]); };
+    auto is_letter = [&](size_t k) {
+      return k < n && (std::isalpha((unsigned char)text[k]) || (unsigned char)text[k] >= 0x80);
+    };
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < n) {
+      size_t j = i;
+      // contractions
+      if (text[i] == '\'' && i + 1 < n) {
+        const char a = (char)std::tolower((unsigned char)text[i + 1]);
+        const char b = i + 2 < n ? (char)std::tolower((unsigned char)text[i + 2]) : '\0';
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') j = i + 2;
+        else if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) j = i + 3;
+        if (j > i) { out.push_back(text.substr(i, j - i)); i = j; continue; }
+      }
+      // [^\r\n\p{L}\p{N}]?\p{L}+
+      {
+        size_t k = i;
+        if (!is_nl(k) && !is_letter(k) && !is_digit(k) && is_letter(k + 1)) ++k;
+        if (is_letter(k)) {
+          while (is_letter(k)) ++k;
+          out.push_back(text.substr(i, k - i)); i = k; continue;
+        }
+      }
+      // \p{N}{1,3}
+      if (is_digit(i)) {
+        size_t k = i;
+        while (k < n && k - i < 3 && is_digit(k)) ++k;
+        out.push_back(text.substr(i, k - i)); i = k; continue;
+      }
+      // ' ?[^\s\p{L}\p{N}]+[\r\n]*'
+      {
+        size_t k = i;
+        if (text[k] == ' ') ++k;
+        const size_t body = k;
+        while (k < n && !is_ws(k) && !is_letter(k) && !is_digit(k)) ++k;
+        if (k > body) {
+          while (is_nl(k)) ++k;
+          out.push_back(text.substr(i, k - i)); i = k; continue;
+        }
+      }
+      // \s*[\r\n]+  (whitespace up to the last newline of the run)
+      if (is_ws(i)) {
+        size_t k = i, last_nl = n;
+        while (is_ws(k)) { if (is_nl(k)) last_nl = k; ++k; }
+        if (last_nl != n) { out.push_back(text.substr(i, last_nl + 1 - i)); i = last_nl + 1; continue; }
+        // \s+(?!\S): leave the final whitespace char for the next word when a non-space follows
+        size_t end = k;
+        if (end < n && end - i > 1) --end;
+        else if (end < n) end = k; // single space before a word: falls to \s+ below
+        out.push_back(text.substr(i, end - i)); i = end; continue;
+      }
+      out.push_back(text.substr(i, 1)); ++i;
+    }
+    return out;
   }
 
   // Approximate GPT-2-style pretokenizer: a leading run of whitespace
