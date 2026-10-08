@@ -126,3 +126,16 @@ picks `A`. The ~1.2 logprob gap to llama.cpp is common to all of them (a MoEStre
 **Tokenizer finding.** For the test prompt the engine tokenizes "mixture-of-experts" as `' mixture' '-' 'of' '-' 'exp' 'erts'`
 (20933 12 1055 12 4580 15534) whereas llama.cpp produces `' mixture' '-of' '-exp' 'erts'` (20933 8667 18347 15534). The engine's
 BPE misses merges, so the two engines never saw identical prompts before this comparison. Separate bug, not addressed here.
+
+**Update after the tokenizer fix** (engine pretokenizer now implements the glm4 split; 9/9 test strings, including CJK and
+mixed whitespace, tokenize identically to llama.cpp, so the 24 prompt ids are the same in both engines). Teacher-forced on the
+fixed whole-layer baseline's 96 tokens, `glm_runs/v2/`:
+
+| MoEStream configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta |
+|---|---|---|
+| original whole-layer baseline | 87/96 | 1.220 |
+| spread + DDR/SSD offload + GPU1 hot (best config, 9.57 tok/s on this prompt) | 84/96 | 1.250 |
+
+The best configuration stays within 0.03 logprob of the baseline's distance to llama.cpp (3 fewer top-1 matches out of 96,
+on a model whose top-2 margins are often below 0.1). The remaining ~1.2 gap to llama.cpp exists in the untouched baseline
+too, so it is an engine-vs-engine difference outside this work; its cause is not diagnosed.
