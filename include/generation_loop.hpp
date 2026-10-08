@@ -732,6 +732,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
     if (!bench_silent) {
         std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
+        if (const char *dump = std::getenv("MOESTREAM_DUMP_PROMPT_TOKENS"); dump && dump[0]) {
+            std::ofstream pf(dump, std::ios::trunc);
+            for (auto id : prompt_ids) pf << id << '\n';
+        }
     }
     // Brackets the SAME window PERF_START(prefill)/PERF_END(prefill, ...)
     // measures, reusing the exact Snapshot/operator-/print_summary

@@ -107,3 +107,22 @@ that for new graph nodes plus a thread-safe prefetch path around the cache and a
 silent fallback to the layered path. Checked both ways: the best configuration runs normally under it (97.1 ms/token over 39
 tokens), and an oversized GPU1 hot set (15.5 GiB, which the graph declines) aborts with the error. It is opt-in because
 prefill still uses the layered path; making it the default needs a graph-only prefill first.
+
+### Independent check against llama.cpp (neurall's llama-server, same GGUF, `--n-cpu-moe 99`)
+
+Teacher-forced on the same 96 tokens with the engine's own prompt ids (`MOESTREAM_DUMP_PROMPT_TOKENS`), comparing
+log-softmax of MoEStream's raw logits with llama.cpp's top-40 log-probs (`glm_runs/llama_ref.py`, `cmp_llama.py`):
+
+| MoEStream configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta (llama's top 10) |
+|---|---|---|
+| original whole-layer baseline | 74/96 | 1.222 |
+| spread hot experts, no offload | 79/96 | 1.222 |
+| spread + DDR/SSD offload + GPU1 hot (best config) | 74/96 | 1.208 |
+
+The offload and GPU1 branch do not move the engine further from the independent reference; the best configuration sits at the
+same distance as the original baseline, and at step 0 the spread variants pick `#` like llama.cpp while the whole-layer baseline
+picks `A`. The ~1.2 logprob gap to llama.cpp is common to all of them (a MoEStream-vs-llama.cpp difference, not introduced here).
+
+**Tokenizer finding.** For the test prompt the engine tokenizes "mixture-of-experts" as `' mixture' '-' 'of' '-' 'exp' 'erts'`
+(20933 12 1055 12 4580 15534) whereas llama.cpp produces `' mixture' '-of' '-exp' 'erts'` (20933 8667 18347 15534). The engine's
+BPE misses merges, so the two engines never saw identical prompts before this comparison. Separate bug, not addressed here.
