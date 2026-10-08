@@ -40,3 +40,19 @@ dispatcher replays the resident child directly and never reaches `try_launch_thr
 conditional node; the node's own ~4.3 ms (host 2.7 + device 1.6) is only bounded by the staged-path profile. Isolating it needs a
 variant that launches the three-way graph with an empty payload (skip storage/upload, keep the launch), which has to keep the
 completion-graph ready event consistent to avoid a hang.
+
+## CPU branch instead of H2D staging (forced-CPU arm)
+
+CUDA forbids host nodes inside a conditional body (`cudaGraphInstantiate` -> invalid argument with 12 host nodes in the child;
+see memory note `cuda-conditional-node-host-nodes-blocker`), so a CPU branch cannot live *inside* the node. The Phase-2
+dispatcher already has the equivalent as a host decision: `MOESTREAM_QWEN4EXP_STAGED_FORCE_CPU=1` skips the storage request,
+payload, H2D and both conditional children and runs the CPU suffix graph (63/63 tokens `dispatch=cpu`, output valid).
+
+| arm (six order-balanced pairs) | tok/s per rep | mean |
+|---|---|---|
+| early-ready | 34.2 33.5 32.2 34.4 33.3 34.1 | 33.62 |
+| Phase-2 structure, CPU suffix (no H2D, no conditional children) | 30.3 30.2 30.5 30.4 30.3 30.1 | 30.29 (-9.9%, 0/6) |
+| Phase-2 structure, staged-GPU (measured above) | 24.7 24.2 24.5 24.2 24.6 24.6 | 24.48 (-25.8%, 0/6) |
+
+Replacing the H2D staging by CPU compute recovers most of the loss (-25.8% -> -9.9%) but stays 3.3 ms/token behind early-ready: the
+CPU suffix starts only after the route readback instead of running concurrently with queued GPU work.
