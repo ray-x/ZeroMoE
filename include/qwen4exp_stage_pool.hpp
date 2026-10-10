@@ -176,6 +176,8 @@ struct Qwen4ExpStagePool {
   int device = -1, topk = 0, slots = 0;
   unsigned int delay_us = 0;
   unsigned int worker_delay_us = 0;
+  // Cap on predicted cold experts staged per layer (0 = no cap).
+  unsigned int stage_max = 0;
   cudaStream_t copy_stream = nullptr;
   Qwen4ExpStageWorkService *service = nullptr;
   std::mutex mutex;
@@ -232,6 +234,8 @@ struct Qwen4ExpStagePool {
     const char *delay = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_DELAY_US");
     if (delay) delay_us = std::min<unsigned long>(1000000, std::strtoul(delay, nullptr, 10));
     const char *worker_delay = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US");
+    const char *stage_cap = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_MAX");
+    if (stage_cap) stage_max = std::min<unsigned long>(32, std::strtoul(stage_cap, nullptr, 10));
     if (worker_delay)
       worker_delay_us = std::min<unsigned long>(1000000, std::strtoul(worker_delay, nullptr, 10));
     if (k <= 0 || k > 32) return false;
@@ -457,6 +461,7 @@ struct Qwen4ExpStagePool {
             std::find(candidates.begin(), candidates.end(), e) == candidates.end())
           candidates.push_back(e);
       }
+      if (stage_max && candidates.size() > stage_max) candidates.resize(stage_max);
       finish_prediction_read(bank);
       predicted += candidates.size();
       // Debug-only late-publication test without occupying GPU resources.

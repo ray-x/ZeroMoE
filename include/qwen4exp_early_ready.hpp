@@ -5,8 +5,53 @@
 // with the synchronous cold graph.
 #include "ggml-alloc.h"
 #include "qwen4exp_stage_pool.hpp"
+#include <cstdio>
+#include <map>
 
 extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
+
+// Optional learned correction for the next-layer pilot (bench/qwen_ridge_export.py):
+// scores = softmax(router x) + (x - mu) R + c. Loaded once from
+// MOESTREAM_QWEN_EARLY_READY_RIDGE; a missing/invalid file leaves the plain pilot.
+struct Qwen4ExpRidgeTable {
+  struct Record { std::vector<float> mu, c; std::vector<uint16_t> r; };
+  std::map<int, Record> by_layer;
+  int d = 0, e = 0;
+  static const Qwen4ExpRidgeTable &get() {
+    static const Qwen4ExpRidgeTable table = load();
+    return table;
+  }
+  const Record *find(int layer) const {
+    const auto it = by_layer.find(layer);
+    return it == by_layer.end() ? nullptr : &it->second;
+  }
+  static Qwen4ExpRidgeTable load() {
+    Qwen4ExpRidgeTable t;
+    const char *path = std::getenv("MOESTREAM_QWEN_EARLY_READY_RIDGE");
+    if (!path || !path[0]) return t;
+    FILE *f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "[QWEN-RIDGE] cannot open %s\n", path); return t; }
+    int32_t hdr[4];
+    bool ok = std::fread(hdr, 4, 4, f) == 4 && hdr[0] == 0x31474452 && hdr[1] > 0 && hdr[2] > 0;
+    if (ok) {
+      t.d = hdr[1]; t.e = hdr[2];
+      for (int i = 0; ok && i < hdr[3]; ++i) {
+        int32_t layer;
+        Record rec;
+        rec.mu.resize(t.d); rec.c.resize(t.e); rec.r.resize(size_t(t.d) * t.e);
+        ok = std::fread(&layer, 4, 1, f) == 1 &&
+             std::fread(rec.mu.data(), 4, t.d, f) == size_t(t.d) &&
+             std::fread(rec.r.data(), 2, rec.r.size(), f) == rec.r.size() &&
+             std::fread(rec.c.data(), 4, t.e, f) == size_t(t.e);
+        if (ok) t.by_layer.emplace(layer, std::move(rec));
+      }
+    }
+    std::fclose(f);
+    if (!ok) { std::fprintf(stderr, "[QWEN-RIDGE] invalid file %s\n", path); t.by_layer.clear(); }
+    else std::fprintf(stderr, "[QWEN-RIDGE] loaded %zu layer corrections from %s\n", t.by_layer.size(), path);
+    return t;
+  }
+};
 
 struct Qwen4ExpEarlyReady {
   static constexpr uint64_t kMagic = 0x514541524c593133ull;
@@ -19,6 +64,7 @@ struct Qwen4ExpEarlyReady {
   ggml_backend_buffer_t output_device_buffer = nullptr;
   ggml_backend_buffer_t tables_device_buffer = nullptr;
   ggml_backend_buffer_t prediction_buffer = nullptr;
+  ggml_backend_buffer_t ridge_buffer = nullptr;
   ggml_backend_buffer_t prediction_marker_buffer = nullptr;
   ggml_tensor *output = nullptr, *gpu_input = nullptr;
   ggml_tensor *gpu_output = nullptr, *cpu_marker = nullptr;
@@ -71,6 +117,7 @@ struct Qwen4ExpEarlyReady {
     if (output_device_buffer) ggml_backend_buffer_free(output_device_buffer);
     if (tables_device_buffer) ggml_backend_buffer_free(tables_device_buffer);
     if (prediction_buffer) ggml_backend_buffer_free(prediction_buffer);
+    if (ridge_buffer) ggml_backend_buffer_free(ridge_buffer);
     if (prediction_marker_buffer) ggml_backend_buffer_free(prediction_marker_buffer);
     if (stage_routes_buffer) ggml_backend_buffer_free(stage_routes_buffer);
     if (prediction_ready) cudaEventDestroy(prediction_ready);
@@ -204,7 +251,32 @@ struct Qwen4ExpEarlyReady {
   bool prepare_prediction(ggml_backend_t backend, ggml_context *outer_ctx,
                           ggml_tensor *router, ggml_tensor *bias, int target) {
     auto *probs = ggml_soft_max(outer_ctx, ggml_mul_mat(outer_ctx, router, gpu_input));
-    auto *selection = bias ? ggml_add(outer_ctx, probs, bias) : probs;
+    ggml_tensor *selection = probs;
+    const auto &ridge = Qwen4ExpRidgeTable::get();
+    if (const auto *rec = ridge.find(target); rec && ridge.d == int(gpu_input->ne[0]) &&
+                                                ridge.e == int(router->ne[1])) {
+      auto *mu_t = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_F32, ridge.d, 1);
+      auto *r_t = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_F16, ridge.d, ridge.e);
+      auto *c_t = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_F32, ridge.e, 1);
+      ggml_tensor *parts[3] = {mu_t, r_t, c_t};
+      size_t offsets[3], total = 0;
+      for (int i = 0; i < 3; ++i) {
+        offsets[i] = total;
+        total += (ggml_nbytes(parts[i]) + 255) & ~size_t(255);
+      }
+      ridge_buffer = ggml_backend_alloc_buffer(backend, total);
+      if (!ridge_buffer) return false;
+      auto *base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(ridge_buffer));
+      for (int i = 0; i < 3; ++i)
+        if (ggml_backend_tensor_alloc(ridge_buffer, parts[i], base + offsets[i]) != GGML_STATUS_SUCCESS)
+          return false;
+      ggml_backend_tensor_set(mu_t, rec->mu.data(), 0, ggml_nbytes(mu_t));
+      ggml_backend_tensor_set(r_t, rec->r.data(), 0, ggml_nbytes(r_t));
+      ggml_backend_tensor_set(c_t, rec->c.data(), 0, ggml_nbytes(c_t));
+      auto *corr = ggml_mul_mat(outer_ctx, r_t, ggml_sub(outer_ctx, gpu_input, mu_t));
+      selection = ggml_add(outer_ctx, ggml_add(outer_ctx, probs, corr), c_t);
+    }
+    if (bias) selection = ggml_add(outer_ctx, selection, bias);
     prediction = ggml_cont(outer_ctx, ggml_argsort_top_k(outer_ctx, selection, k));
     prediction_layer = target;
     prediction_buffer = ggml_backend_alloc_buffer(backend, ggml_nbytes(prediction));
