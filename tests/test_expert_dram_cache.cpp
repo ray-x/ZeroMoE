@@ -186,6 +186,198 @@ static void test_ranking(const std::string &dir) {
   CHECK(r[4] == ExpertKey({11, 1}) && r[5] == ExpertKey({11, 2}) && r[6] == ExpertKey({11, 5}) && r[7] == ExpertKey({12, 1}));
 }
 
+
+// ------------------------------------------------------------------------------------------ segmented LRU
+// Independent transcription of the SegmentedLru contract (two ordered lists + a pinned set, weights per layer), used as the
+// oracle for the random equivalence test below.
+struct RefSeg {
+  size_t cap;
+  double q;
+  int first;
+  std::vector<size_t> w; // weight per layer (index layer - first); empty = 1
+  std::list<ExpertKey> prot, prob;
+  std::set<ExpertKey> pinned;
+  size_t used = 0, prob_used = 0;
+  size_t weight(const ExpertKey &k) const { return w.empty() ? 1 : w[static_cast<size_t>(k.layer - first)]; }
+  static bool in(const std::list<ExpertKey> &l, const ExpertKey &k) { return std::find(l.begin(), l.end(), k) != l.end(); }
+  bool has(const ExpertKey &k) const { return in(prot, k) || in(prob, k) || pinned.count(k); }
+  void seed(const std::vector<ExpertKey> &hottest, double pin_frac) {
+    std::vector<ExpertKey> take;
+    size_t sum = 0;
+    for (const ExpertKey &k : hottest) {
+      if (std::find(take.begin(), take.end(), k) != take.end()) continue;
+      if (sum + weight(k) > cap) break;
+      take.push_back(k);
+      sum += weight(k);
+    }
+    const size_t budget = static_cast<size_t>(static_cast<double>(cap) * pin_frac);
+    size_t pins = 0, pw = 0;
+    while (pins < take.size() && pw + weight(take[pins]) <= budget) pw += weight(take[pins++]);
+    for (size_t i = 0; i < take.size(); ++i) {
+      used += weight(take[i]);
+      if (i < pins) pinned.insert(take[i]);
+    }
+    for (size_t i = take.size(); i > pins; --i) prot.push_back(take[i - 1]);
+  }
+  struct R { bool hit = false, inserted = false, promoted = false; std::vector<ExpertKey> victims; };
+  R access(const ExpertKey &k, bool prefetch) {
+    R r;
+    if (pinned.count(k)) { r.hit = true; return r; }
+    if (auto it = std::find(prot.begin(), prot.end(), k); it != prot.end()) {
+      r.hit = true;
+      if (!prefetch) { prot.erase(it); prot.push_back(k); }
+      return r;
+    }
+    if (auto it = std::find(prob.begin(), prob.end(), k); it != prob.end()) {
+      r.hit = true;
+      if (!prefetch) { prob.erase(it); prob_used -= weight(k); prot.push_back(k); r.promoted = true; }
+      return r;
+    }
+    const size_t wk = weight(k);
+    if (wk > cap) return r;
+    const size_t quota = static_cast<size_t>(static_cast<double>(cap) * q);
+    while (used + wk > cap) {
+      ExpertKey v;
+      if (!prob.empty() && (prob_used > quota || prot.empty())) {
+        v = prob.front(); prob.pop_front(); prob_used -= weight(v);
+      } else if (!prot.empty()) {
+        v = prot.front(); prot.pop_front();
+      } else {
+        return r; // nothing evictable: bypass
+      }
+      used -= weight(v);
+      r.victims.push_back(v);
+    }
+    used += wk;
+    if (prefetch) { prob.push_back(k); prob_used += wk; } else prot.push_back(k);
+    r.inserted = true;
+    return r;
+  }
+};
+
+static void test_segmented_equivalence() {
+  std::mt19937 rng(777);
+  const size_t caps_entries[] = {2, 5, 17, 40, 100};
+  const double pins[] = {0.0, 0.3};
+  const double quotas[] = {0.0, 0.25, 0.5};
+  for (int byte_mode = 0; byte_mode < 2; ++byte_mode)
+    for (size_t cap : caps_entries) for (double pf : pins) for (double q : quotas) for (int seed_mode = 0; seed_mode < 3; ++seed_mode) {
+      const int first = 2, nl = 3, ne = 20;
+      std::vector<uint64_t> lw;
+      size_t capacity = cap;
+      if (byte_mode) { lw = {1, 3, 2}; capacity = cap * 2; } // bytes: average weight 2
+      ExpertCache::Config cfg;
+      cfg.first_layer = first; cfg.n_layers = nl; cfg.n_experts = ne; cfg.capacity = capacity;
+      cfg.policy = ExpertCache::Policy::SegmentedLru; cfg.pinned_fraction = pf; cfg.probation_fraction = q;
+      cfg.layer_bytes = lw;
+      ExpertCache cache(cfg);
+      RefSeg ref{capacity, q, first, std::vector<size_t>(lw.begin(), lw.end()), {}, {}, {}, 0, 0};
+      std::vector<ExpertKey> keys = all_keys(first, nl, ne), hot = keys;
+      std::shuffle(hot.begin(), hot.end(), rng);
+      hot.resize(seed_mode == 0 ? 0 : seed_mode == 1 ? std::min<size_t>(cap / 2, hot.size()) : std::min<size_t>(cap * 2, hot.size()));
+      cache.seed(hot);
+      ref.seed(hot, pf);
+      CHECK(cache.used() == ref.used);
+      std::geometric_distribution<int> skew(0.05);
+      for (int step = 0; step < 3000; ++step) {
+        ExpertKey k = keys[static_cast<size_t>(std::min<int>(skew(rng), static_cast<int>(keys.size()) - 1))];
+        if (rng() % 5 == 0) k = keys[rng() % keys.size()];
+        const bool pre = rng() % 3 == 0;
+        auto a = cache.access(k, pre ? ExpertCache::Kind::Prefetch : ExpertCache::Kind::Demand);
+        auto r = ref.access(k, pre);
+        if (a.hit != r.hit || a.inserted != r.inserted || a.promoted != r.promoted || a.victims != r.victims) {
+          CHECK(false);
+          std::fprintf(stderr, "  segmented diverged: byte=%d cap=%zu pf=%.1f q=%.2f seed=%d step=%d\n", byte_mode, cap, pf, q, seed_mode, step);
+          break;
+        }
+        if (step % 61 == 0) {
+          CHECK(cache.used() == ref.used && cache.probation_used() == ref.prob_used);
+          CHECK(cache.used() <= capacity);
+          for (const ExpertKey &x : keys) CHECK(cache.resident(x) == ref.has(x));
+        }
+      }
+    }
+}
+
+static void test_segmented_behaviour() {
+  const auto D = ExpertCache::Kind::Demand, P = ExpertCache::Kind::Prefetch;
+  { // prefetch lands in probation; a demand hit promotes it; a prefetch access to a resident entry changes nothing
+    ExpertCache::Config cfg; cfg.n_layers = 1; cfg.n_experts = 16; cfg.capacity = 8; cfg.policy = ExpertCache::Policy::SegmentedLru;
+    ExpertCache c(cfg);
+    auto a = c.access({0, 1}, P);
+    CHECK(!a.hit && a.inserted && c.probationary({0, 1}) && c.probation_used() == 1);
+    CHECK(c.access({0, 1}, P).hit && c.probationary({0, 1}) && !c.access({0, 1}, P).promoted);
+    auto b = c.access({0, 1}, D);
+    CHECK(b.hit && b.promoted && !c.probationary({0, 1}) && c.probation_used() == 0 && c.stats().promotions == 1);
+    c.access({0, 2}, D);
+    CHECK(!c.probationary({0, 2}) && c.lru_order().size() == 2);
+  }
+  { // scan resistance: a long burst of one-off prefetches cannot flush the reused (protected) entries
+    ExpertCache::Config cfg; cfg.n_layers = 1; cfg.n_experts = 64; cfg.capacity = 8;
+    cfg.policy = ExpertCache::Policy::SegmentedLru; cfg.probation_fraction = 0.25;
+    ExpertCache c(cfg);
+    for (int e = 0; e < 4; ++e) c.access({0, e}, D);
+    for (int e = 10; e < 50; ++e) c.access({0, e}, P);
+    for (int e = 0; e < 4; ++e) CHECK(c.resident({0, e}) && !c.probationary({0, e}));
+    CHECK(c.size() == 8 && c.stats().prefetch_evicted_unused > 0);
+    // the same burst through plain LRU does flush them
+    cfg.policy = ExpertCache::Policy::Lru;
+    ExpertCache l(cfg);
+    for (int e = 0; e < 4; ++e) l.access({0, e}, D);
+    for (int e = 10; e < 50; ++e) l.access({0, e}, P);
+    int left = 0;
+    for (int e = 0; e < 4; ++e) left += l.resident({0, e});
+    CHECK(left == 0);
+  }
+  { // an unused prefetch is evicted before protected entries once probation is over quota
+    ExpertCache::Config cfg; cfg.n_layers = 1; cfg.n_experts = 16; cfg.capacity = 4;
+    cfg.policy = ExpertCache::Policy::SegmentedLru; cfg.probation_fraction = 0.25; // quota = 1
+    ExpertCache c(cfg);
+    c.access({0, 0}, D); c.access({0, 1}, D); c.access({0, 2}, P); c.access({0, 3}, P);
+    auto a = c.access({0, 4}, D); // full; probation holds 2 > quota 1: evict the oldest probationary entry, not protected 0
+    CHECK(a.evicted && a.victim == ExpertKey({0, 2}) && c.resident({0, 0}) && c.resident({0, 1}));
+  }
+  { // byte budget: one insertion can evict several entries; an entry larger than the budget is bypassed
+    ExpertCache::Config cfg; cfg.n_layers = 2; cfg.n_experts = 8; cfg.capacity = 10;
+    cfg.policy = ExpertCache::Policy::SegmentedLru; cfg.layer_bytes = {1, 6};
+    ExpertCache c(cfg);
+    for (int e = 0; e < 4; ++e) c.access({0, e}, D); // 4 bytes
+    auto a = c.access({1, 0}, D);                    // 6 bytes: fits exactly, no eviction
+    CHECK(a.inserted && !a.evicted && c.used() == 10);
+    auto b = c.access({1, 1}, D);                    // needs 6: evicts the 4 one-byte entries and not the 6-byte one first
+    CHECK(b.inserted && b.victims.size() >= 1 && c.used() <= 10);
+    cfg.layer_bytes = {1, 11};
+    ExpertCache d(cfg);
+    auto big = d.access({1, 0}, D);
+    CHECK(!big.hit && !big.inserted && d.stats().bypass == 1 && d.size() == 0);
+    cfg.layer_bytes = {1};                           // wrong shape falls back to entry counting
+    ExpertCache e(cfg);
+    for (int x = 0; x < 12; ++x) e.access({0, x % 8}, D);
+    CHECK(e.size() <= 10 && e.used() == e.size());
+  }
+  { // erase of a probationary entry keeps the probation byte count right
+    ExpertCache::Config cfg; cfg.n_layers = 1; cfg.n_experts = 8; cfg.capacity = 6; cfg.policy = ExpertCache::Policy::SegmentedLru;
+    ExpertCache c(cfg);
+    c.access({0, 1}, P); c.access({0, 2}, P); c.access({0, 3}, D);
+    CHECK(c.probation_used() == 2 && c.used() == 3);
+    c.erase({0, 1});
+    CHECK(c.probation_used() == 1 && c.used() == 2 && !c.resident({0, 1}) && c.probation_order().size() == 1);
+  }
+  { // plain LRU ignores Kind (prefetches go to MRU like demand misses): same behaviour as the reference LRU
+    std::mt19937 rng(5);
+    ExpertCache::Config cfg; cfg.first_layer = 0; cfg.n_layers = 2; cfg.n_experts = 16; cfg.capacity = 9; cfg.policy = ExpertCache::Policy::Lru;
+    ExpertCache c(cfg), plain(cfg);
+    RefLru ref{9, {}, {}};
+    for (int step = 0; step < 2000; ++step) {
+      ExpertKey k{static_cast<int>(rng() % 2), static_cast<int>(rng() % 16)};
+      auto a = c.access(k, rng() % 2 ? P : D);
+      auto b = plain.access(k);
+      auto r = ref.access(k);
+      CHECK(a.hit == b.hit && a.hit == r.hit && a.victim == b.victim && a.evicted == r.evicted);
+    }
+  }
+}
+
 // ------------------------------------------------------------------------------------------ synthetic GGUF files
 static uint8_t pat(int L, int E, int k, size_t j) { return static_cast<uint8_t>((L * 131 + E * 17 + k * 29 + static_cast<int>(j) * 7) & 0xff); }
 
@@ -609,6 +801,9 @@ int main() {
   std::fprintf(stderr, "[expert_dram_cache] temp dir %s\n", dir.c_str());
   test_random_equivalence();   std::fprintf(stderr, "  random equivalence with the reference LRU done\n");
   test_edge_cases();
+  test_segmented_equivalence();
+  test_segmented_behaviour();
+  std::fprintf(stderr, "  segmented LRU equivalence + behaviour done\n");
   test_bitmap_all_resident();
   test_ranking(dir);
   test_store_reader(dir);

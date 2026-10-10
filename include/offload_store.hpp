@@ -430,17 +430,18 @@ public:
   // Make every non-negative id of `layer` resident. Misses are loaded synchronously. A miss that cannot be loaded (no
   // source, size mismatch, I/O error) is removed from the cache and counted in `errors`: the caller must fail the request
   // rather than compute with a slot that does not hold the expert. `not_cached` counts misses of a Static policy cache.
-  Ensure ensure(int layer, const int32_t *ids, int n) {
+  // `kind` tells a segmented cache whether these ids were really routed (Demand) or only predicted (Prefetch).
+  Ensure ensure(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
     Ensure r;
     std::vector<int> to_load;
     for (int i = 0; i < n; ++i) {
       if (ids[i] < 0) continue;
       const ExpertKey key{layer, ids[i]};
-      const ExpertCache::Access a = cache_.access(key);
+      const ExpertCache::Access a = cache_.access(key, kind);
       if (a.hit) continue;
       ++r.misses;
       if (cache_.config().policy == ExpertCache::Policy::Static) { ++r.not_cached; continue; }
-      if (a.evicted) { arena_.evict(a.victim.layer, a.victim.expert); ++r.evictions; }
+      for (const ExpertKey &v : a.victims) { arena_.evict(v.layer, v.expert); ++r.evictions; }
       if (!a.inserted) { ++r.errors; continue; }
       to_load.push_back(ids[i]);
     }

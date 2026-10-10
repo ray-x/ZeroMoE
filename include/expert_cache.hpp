@@ -11,8 +11,16 @@
 //   * Policy::Lru: a hit moves the entry to most-recent; a miss inserts it, first evicting the least recent NON-PINNED
 //     entry when the cache already holds `capacity` entries. If nothing can be evicted (everything pinned) the miss is
 //     not cached and counted as a bypass.
-//   * seed(hottest_first): at most `capacity` entries become resident; the hottest floor(capacity * pinned_fraction)
-//     are pinned (never evicted); among the rest, hotter means more recent.
+//   * Policy::SegmentedLru: two LRU lists besides the pinned set. Experts that were actually used (a demand miss, or a
+//     prefetched expert that was then used) live in the PROTECTED list; experts that were only predicted (a Kind::Prefetch
+//     miss) live in the PROBATION list. A demand hit on a probationary entry promotes it to protected-MRU; a prefetch
+//     access to a resident entry changes nothing. Eviction takes the probation LRU end while probation holds more than
+//     probation_fraction * capacity (or protected is empty), otherwise the protected LRU end, so a burst of wrong
+//     predictions can only displace other predictions, not the experts that were really reused.
+//   * Capacity is counted in entries by default. With layer_bytes (one weight per layer) `capacity` is a byte budget and
+//     every entry weighs layer_bytes[layer - first_layer]; one access may then evict several entries (Access::victims).
+//   * seed(hottest_first): entries become resident while the weight fits `capacity`; the hottest entries whose weight
+//     fits floor(capacity * pinned_fraction) are pinned (never evicted); among the rest, hotter means more recent.
 //   * A residency bitmap per layer ((n_experts + 63) / 64 words, bit e set <=> expert e resident) is kept in sync so a
 //     graph node can test a layer's routed ids without calling into the cache.
 // Not thread-safe: use from the decode thread, or serialize externally.
@@ -34,23 +42,31 @@ struct ExpertKey {
 
 class ExpertCache {
 public:
-  enum class Policy { Static, Lru };
+  enum class Policy { Static, Lru, SegmentedLru };
+  enum class Kind { Demand, Prefetch };
   struct Config {
     int first_layer = 0;
     int n_layers = 0;
     int n_experts = 0;
-    size_t capacity = 0;
+    size_t capacity = 0; // entries, or bytes when layer_bytes is set
     Policy policy = Policy::Lru;
     double pinned_fraction = 0.0;
+    double probation_fraction = 0.25;   // SegmentedLru only: the probation list's share of capacity
+    std::vector<uint64_t> layer_bytes;  // optional per-layer entry weight (size n_layers); empty = every entry weighs 1
   };
   struct Access {
     bool hit = false;
     bool inserted = false; // a miss that became resident
     bool evicted = false;
-    ExpertKey victim{};
+    bool promoted = false; // a demand hit that moved a probationary entry to protected
+    ExpertKey victim{};    // first victim (compatibility); all victims are in `victims`
+    std::vector<ExpertKey> victims;
   };
   struct Stats {
     uint64_t hits = 0, misses = 0, evictions = 0, bypass = 0;
+    uint64_t promotions = 0;          // probationary -> protected on a demand hit (prefetches that were used)
+    uint64_t prefetch_inserts = 0;    // Kind::Prefetch misses that became resident
+    uint64_t prefetch_evicted_unused = 0; // probationary entries evicted before any demand hit
   };
 
   explicit ExpertCache(const Config &c) : cfg_(c) {
@@ -60,11 +76,15 @@ public:
     prev_.assign(universe_, kNil);
     next_.assign(universe_, kNil);
     flags_.assign(universe_, 0);
+    if (!cfg_.layer_bytes.empty() && cfg_.layer_bytes.size() != static_cast<size_t>(std::max(c.n_layers, 0)))
+      cfg_.layer_bytes.clear(); // wrong shape: fall back to entry counting rather than mis-weighing
   }
 
   const Config &config() const { return cfg_; }
   size_t capacity() const { return cfg_.capacity; }
   size_t size() const { return resident_; }
+  size_t used() const { return used_; }                 // weight of all resident entries (pinned included)
+  size_t probation_used() const { return prob_used_; }  // weight held by the probation list
   const Stats &stats() const { return stats_; }
   void reset_stats() { stats_ = {}; }
 
@@ -74,6 +94,7 @@ public:
   }
   bool resident(ExpertKey k) const { return in_range(k) && (flags_[idx(k)] & kResident); }
   bool pinned(ExpertKey k) const { return in_range(k) && (flags_[idx(k)] & kPinned); }
+  bool probationary(ExpertKey k) const { return in_range(k) && (flags_[idx(k)] & kProb); }
 
   // Residency bitmap of one layer (words_per_layer() words), or nullptr for an untracked layer.
   const uint64_t *layer_bitmap(int layer) const {
@@ -93,55 +114,90 @@ public:
     return true;
   }
 
-  // Make the first min(capacity, n) distinct in-range entries of `hottest_first` resident. Call on an empty cache.
+  // Make the leading distinct in-range entries of `hottest_first` resident while their weight fits capacity. Call on an
+  // empty cache.
   void seed(const std::vector<ExpertKey> &hottest_first) {
     std::vector<ExpertKey> take;
-    take.reserve(std::min(hottest_first.size(), cfg_.capacity));
+    size_t weight = 0;
     for (const ExpertKey &k : hottest_first) {
-      if (take.size() >= cfg_.capacity) break;
-      if (!in_range(k) || resident(k)) continue;
+      if (!in_range(k) || (flags_[idx(k)] & kTaken)) continue;
+      const size_t w = weight_of(k.layer);
+      if (weight + w > cfg_.capacity) break;
       take.push_back(k);
-      flags_[idx(k)] |= kResident; // provisional mark so duplicates are skipped; finalized below
+      weight += w;
+      flags_[idx(k)] |= kTaken; // provisional mark so duplicates are skipped; cleared below
     }
-    for (const ExpertKey &k : take) flags_[idx(k)] &= static_cast<uint8_t>(~kResident);
-    size_t pins = cfg_.policy == Policy::Lru
-                      ? std::min(take.size(), static_cast<size_t>(static_cast<double>(cfg_.capacity) * cfg_.pinned_fraction))
-                      : 0;
+    for (const ExpertKey &k : take) flags_[idx(k)] &= static_cast<uint8_t>(~kTaken);
+    size_t pins = 0;
+    if (cfg_.policy != Policy::Static) {
+      const size_t pin_budget = static_cast<size_t>(static_cast<double>(cfg_.capacity) * cfg_.pinned_fraction);
+      size_t pw = 0;
+      while (pins < take.size() && pw + weight_of(take[pins].layer) <= pin_budget) pw += weight_of(take[pins++].layer);
+    }
     for (size_t i = 0; i < take.size(); ++i) mark_resident(take[i]);
     for (size_t i = 0; i < pins; ++i) flags_[idx(take[i])] |= kPinned;
-    if (cfg_.policy == Policy::Lru)
-      for (size_t i = take.size(); i > pins; --i) push_mru(idx(take[i - 1])); // hottest of the unpinned ends up most recent
+    if (cfg_.policy != Policy::Static)
+      for (size_t i = take.size(); i > pins; --i) push_mru(prot_, idx(take[i - 1])); // hottest of the unpinned ends up most recent
   }
 
-  Access access(ExpertKey k) {
+  Access access(ExpertKey k, Kind kind = Kind::Demand) {
     Access r;
     if (!in_range(k)) return r;
     const size_t i = idx(k);
+    const bool segmented = cfg_.policy == Policy::SegmentedLru;
     if (flags_[i] & kResident) {
       ++stats_.hits;
-      if (cfg_.policy == Policy::Lru && !(flags_[i] & kPinned)) {
-        unlink(i);
-        push_mru(i);
+      if (cfg_.policy != Policy::Static && !(flags_[i] & kPinned)) {
+        if (segmented && (flags_[i] & kProb)) {
+          if (kind == Kind::Demand) {
+            unlink(prob_, i);
+            flags_[i] &= static_cast<uint8_t>(~kProb);
+            prob_used_ -= weight_of(k.layer);
+            push_mru(prot_, i);
+            r.promoted = true;
+            ++stats_.promotions;
+          }
+        } else if (kind == Kind::Demand || !segmented) {
+          unlink(prot_, i);
+          push_mru(prot_, i);
+        }
       }
       r.hit = true;
       return r;
     }
     ++stats_.misses;
     if (cfg_.policy == Policy::Static) return r;
-    if (resident_ >= cfg_.capacity) {
-      if (head_ == kNil) { // nothing evictable (cache empty of unpinned entries, or capacity 0)
+    const size_t w = weight_of(k.layer);
+    if (w > cfg_.capacity) { ++stats_.bypass; return r; }
+    while (used_ + w > cfg_.capacity) {
+      const size_t v = pick_victim();
+      if (v == kNil) { // nothing evictable (everything pinned, or capacity 0)
         ++stats_.bypass;
         return r;
       }
-      const size_t v = head_;
-      unlink(v);
-      r.victim = key_of(v);
+      const ExpertKey vk = key_of(v);
+      if (flags_[v] & kProb) {
+        unlink(prob_, v);
+        prob_used_ -= weight_of(vk.layer);
+        ++stats_.prefetch_evicted_unused;
+      } else {
+        unlink(prot_, v);
+      }
       mark_evicted(v);
+      if (!r.evicted) r.victim = vk;
       r.evicted = true;
+      r.victims.push_back(vk);
       ++stats_.evictions;
     }
     mark_resident(k);
-    push_mru(i);
+    if (segmented && kind == Kind::Prefetch) {
+      flags_[i] |= kProb;
+      prob_used_ += w;
+      push_mru(prob_, i);
+      ++stats_.prefetch_inserts;
+    } else {
+      push_mru(prot_, i);
+    }
     r.inserted = true;
     return r;
   }
@@ -150,7 +206,12 @@ public:
   void erase(ExpertKey k) {
     if (!resident(k)) return;
     const size_t i = idx(k);
-    if (!(flags_[i] & kPinned)) unlink(i);
+    if (flags_[i] & kProb) {
+      unlink(prob_, i);
+      prob_used_ -= weight_of(k.layer);
+    } else if (!(flags_[i] & kPinned)) {
+      unlink(prot_, i);
+    }
     mark_evicted(i);
   }
 
@@ -159,27 +220,45 @@ public:
     std::fill(prev_.begin(), prev_.end(), kNil);
     std::fill(next_.begin(), next_.end(), kNil);
     std::fill(flags_.begin(), flags_.end(), static_cast<uint8_t>(0));
-    head_ = tail_ = kNil;
-    resident_ = 0;
+    prot_ = prob_ = List{};
+    resident_ = used_ = prob_used_ = 0;
   }
 
-  // Resident keys, least recent first for the LRU list, then pinned ones (diagnostics/tests).
+  // Resident unpinned keys of the protected list, least recent first (diagnostics/tests).
   std::vector<ExpertKey> lru_order() const {
     std::vector<ExpertKey> out;
-    for (size_t i = head_; i != kNil; i = next_[i]) out.push_back(key_of(i));
+    for (size_t i = prot_.head; i != kNil; i = next_[i]) out.push_back(key_of(i));
+    return out;
+  }
+  // Probation list, least recent first (diagnostics/tests).
+  std::vector<ExpertKey> probation_order() const {
+    std::vector<ExpertKey> out;
+    for (size_t i = prob_.head; i != kNil; i = next_[i]) out.push_back(key_of(i));
     return out;
   }
 
 private:
   static constexpr size_t kNil = static_cast<size_t>(-1);
-  static constexpr uint8_t kResident = 1, kPinned = 2;
+  static constexpr uint8_t kResident = 1, kPinned = 2, kProb = 4, kTaken = 8;
+  struct List { size_t head = kNil, tail = kNil; }; // head = least recent
 
+  size_t weight_of(int layer) const {
+    return cfg_.layer_bytes.empty() ? 1 : static_cast<size_t>(cfg_.layer_bytes[static_cast<size_t>(layer - cfg_.first_layer)]);
+  }
   size_t idx(ExpertKey k) const {
     return static_cast<size_t>(k.layer - cfg_.first_layer) * static_cast<size_t>(cfg_.n_experts) + static_cast<size_t>(k.expert);
   }
   ExpertKey key_of(size_t i) const {
     return {static_cast<int32_t>(i / static_cast<size_t>(cfg_.n_experts)) + cfg_.first_layer,
             static_cast<int32_t>(i % static_cast<size_t>(cfg_.n_experts))};
+  }
+  // Victim choice: probation first while it is over its quota (or protected is empty), else the protected LRU end.
+  size_t pick_victim() const {
+    if (cfg_.policy == Policy::SegmentedLru && prob_.head != kNil) {
+      const size_t quota = static_cast<size_t>(static_cast<double>(cfg_.capacity) * cfg_.probation_fraction);
+      if (prob_used_ > quota || prot_.head == kNil) return prob_.head;
+    }
+    return prot_.head;
   }
   void set_bit(ExpertKey k, bool on) {
     uint64_t &w = bits_[static_cast<size_t>(k.layer - cfg_.first_layer) * words_ + static_cast<size_t>(k.expert >> 6)];
@@ -190,28 +269,31 @@ private:
     flags_[idx(k)] |= kResident;
     set_bit(k, true);
     ++resident_;
+    used_ += weight_of(k.layer);
   }
   void mark_evicted(size_t i) {
+    const ExpertKey k = key_of(i);
     flags_[i] = 0;
-    set_bit(key_of(i), false);
+    set_bit(k, false);
     --resident_;
+    used_ -= weight_of(k.layer);
   }
-  void push_mru(size_t i) {
-    prev_[i] = tail_;
+  void push_mru(List &l, size_t i) {
+    prev_[i] = l.tail;
     next_[i] = kNil;
-    if (tail_ != kNil) next_[tail_] = i; else head_ = i;
-    tail_ = i;
+    if (l.tail != kNil) next_[l.tail] = i; else l.head = i;
+    l.tail = i;
   }
-  void unlink(size_t i) {
+  void unlink(List &l, size_t i) {
     const size_t p = prev_[i], n = next_[i];
-    if (p != kNil) next_[p] = n; else head_ = n;
-    if (n != kNil) prev_[n] = p; else tail_ = p;
+    if (p != kNil) next_[p] = n; else l.head = n;
+    if (n != kNil) prev_[n] = p; else l.tail = p;
     prev_[i] = next_[i] = kNil;
   }
 
   Config cfg_;
-  size_t universe_ = 0, words_ = 0, resident_ = 0;
-  size_t head_ = kNil, tail_ = kNil; // head_ = least recent
+  size_t universe_ = 0, words_ = 0, resident_ = 0, used_ = 0, prob_used_ = 0;
+  List prot_, prob_;
   std::vector<uint64_t> bits_;
   std::vector<size_t> prev_, next_;
   std::vector<uint8_t> flags_;
