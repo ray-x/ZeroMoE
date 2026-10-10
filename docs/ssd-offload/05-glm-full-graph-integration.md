@@ -257,3 +257,40 @@ worker DMAs straight from the arena with no CPU copy; all 3 planes of every seed
 DDR=16 GiB it raised host memory in use from 57 GB to 80 GB (+23 GB for 2,607 pinned experts = 17.5 GB of data) at identical process RSS, and an earlier 48 GiB
 run drove the box to 124 GB used / 39 GB swap before I killed it. A pinned arena of the 48 GiB size does not fit next to the engine's other memory on this 125 GB host,
 so the CPU-copy-free variant could not be benchmarked at the size where it would matter. Do not enable it without a hard memory cap.
+
+### Microbenchmark: pinned DMA vs the CPU cold-expert kernel, and pinning footprint (2026-10-09)
+
+`bench/pinned_dma_vs_cpu_bench.cu` (3090, 8 CPU threads, cgroup MemoryMax=45G MemorySwapMax=0, nvtop sleeping in the background).
+CPU kernel = ggml IQ2_XXS gate/up/down MUL_MAT_ID, D=4096 F=1536, 8 experts of 4.87 MB (GLM-like shape, synthetic weights). DMA = 3 random
+4.87 MB slots per sync, 8 s per run.
+
+| mode | CPU layer (8 experts) | DMA |
+|---|---|---|
+| cpu only | 3094 / 3122 us | - |
+| dma only (pinned pool) | - | 12.2 GB/s |
+| cpu + pinned DMA | 3229 / 3214 us (+3.5%) | 12.2 GB/s |
+| cpu + pageable->GPU cudaMemcpyAsync | 3235 us (+4.5%) | 8.2 GB/s |
+| cpu + memcpy to pinned bounce, then DMA | 3265 us (+5.5%) | 7.9 GB/s |
+
+One expert costs ~390 us on the CPU kernel and ~400 us as a pinned DMA, so the DMA engine is a second lane of about the same speed as the whole
+CPU kernel, and running both costs the CPU kernel only ~3.5%. The bounce copy costs a further 2% and a third of the bandwidth.
+
+Footprint (2,607 experts x 4.9 MB = 12.8 GB, sparse random slots in a 59 GB virtual region, system used delta):
+
+| variant | THP off | THP on |
+|---|---|---|
+| unregistered | 11.97 GB | 15.94 GB |
+| per-plane cudaHostRegister | 12.53 GB | 16.53 GB |
+| cudaHostAlloc contiguous pool | 12.19 GB | - |
+
+Per-plane registration adds only ~0.5 GB. THP (system setting is `always`) inflates sparse random slots by ~4 GB with or without pinning.
+The +23 GB seen in the engine is therefore not explained by registration itself.
+
+#### Engine pinned-arena memory re-check (glm_runs/run_pin_smaps.sh, DDR=16 GiB, K=3, cgroup MemoryMax=100G, swap off)
+
+System "used" while running: pin off 51-53 GB, pin on 49-50 GB (2,607 experts pinned, 0 failed). The +23 GB reported earlier does not reproduce, and
+the microbenchmark above also shows registration itself costs ~0.5 GB. Treat the earlier 57 -> 80 GB reading as unexplained (probably a different
+sampling point); the 48 GiB blow-up is simply a 48 GiB arena next to the engine's other ~40 GB. Pinning is therefore not a memory problem at <= 24 GiB.
+Speed in the same runs: 215 ms/token with the bounce path vs 257 ms/token pinned (60 tokens, SSD misses at 16 GiB), so direct DMA from a pinned arena
+was slower here. cudaHostRegister/Unregister cost 75/48 us per 1.56 MB plane (~0.37 ms per expert load+evict), which is paid on every SSD-miss
+load while the arena churns; the share of the +42 ms/token it explains has not been measured.
