@@ -8,6 +8,7 @@
 // caller does not return to C++ after every layer.  This file reproduces that
 // shape for MoEStream's model representation.
 
+#include "graph_config.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "option_b_global_hot.hpp"
 #include "qwen4exp_adaptive_policy.hpp"
@@ -63,7 +64,7 @@
 // disabled unless MOESTREAM_QWEN4EXP_MEMORY_TRACE=1 is present; production
 // execution therefore pays no /proc or cudaMemGetInfo overhead.
 static bool qwen4exp_memory_trace_enabled() {
-  const char *value = std::getenv("MOESTREAM_QWEN4EXP_MEMORY_TRACE");
+  const char *value = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_MEMORY_TRACE");
   return value && value[0] == '1';
 }
 
@@ -339,7 +340,7 @@ qwen4exp_cuda_gpu_stage_callback(void *user_data) {
                                  t_end - start)
                                  .count();
   ctx->last_callback_ms.store(callback_ms, std::memory_order_release);
-  if (std::getenv("MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING"))
+  if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING"))
     LOG_INFO("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d gate_ms=%.4f up_ms=%.4f "
              "down_ms=%.4f callback_body_ms=%.4f\n",
              ctx->layer_index, gate_ms, up_ms, down_ms, callback_ms);
@@ -429,7 +430,7 @@ static void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
       !ctx->host_ids)
     return;
   const auto start = std::chrono::steady_clock::now();
-  const bool hit_log = std::getenv("MOESTREAM_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
+  const bool hit_log = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
   std::string hit_line;
   for (int l = 0; l < ctx->n_layers; ++l) {
     int hits = 0;
@@ -454,7 +455,7 @@ static void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
                         std::chrono::steady_clock::now() - start)
                         .count();
   ctx->last_callback_ms.store(ms, std::memory_order_release);
-  if (std::getenv("MOESTREAM_QWEN4EXP_USAGE_TRACK_TIMING"))
+  if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_USAGE_TRACK_TIMING"))
     LOG_INFO("[QWEN4EXP-USAGE-TRACK-TIMING] callback_body_ms=%.4f\n", ms);
 }
 
@@ -480,12 +481,12 @@ static bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
 }
 
 static bool env_host_node_gpu_reduce() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE");
   return !(v && v[0] == '0');
 }
 
 static bool env_host_node_skip_cpu() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_SKIP_CPU");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_SKIP_CPU");
   return v && v[0] == '1';
 }
 
@@ -493,7 +494,7 @@ static bool env_host_node_skip_cpu() {
 // GPU branch in the graph and sends the complement through a bounded DDR host
 // callback. It is deliberately separate from the validated early-ready path.
 static int env_partial_graph_layer() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH_LAYER");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH_LAYER");
   if (!v || !v[0]) return -1;
   char *end = nullptr;
   const long layer = std::strtol(v, &end, 10);
@@ -503,7 +504,7 @@ static int env_partial_graph_layer() {
 }
 
 static bool env_partial_graph_enabled(int layer) {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH");
   return v && v[0] == '1' && env_partial_graph_layer() == layer;
 }
 
@@ -513,7 +514,7 @@ static bool env_partial_graph_enabled(int layer) {
 // CPU contention without changing the default host-node topology.
 static bool env_host_node_keep_cpu_prologue() {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_KEEP_CPU_PROLOGUE");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_KEEP_CPU_PROLOGUE");
   return v && v[0] == '1';
 }
 
@@ -532,12 +533,12 @@ static std::atomic<uint64_t> g_qwen4exp_cpu_split_enter_wait_ns{0};
 static std::mutex g_qwen4exp_cpu_execution_mutex;
 
 static bool qwen4exp_host_node_timing_enabled() {
-  const char *env = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_TIMING");
+  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_TIMING");
   return env && env[0] == '1';
 }
 
 extern "C" bool moestream_qwen4exp_cpu_offload_coordination_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE");
   return v && v[0] == '1';
 }
 
@@ -643,25 +644,25 @@ static uint64_t qwen4exp_fnv64(const void *data, size_t bytes) {
 
 static const char *env_layer13_moe_dump_path() {
   const char *path =
-      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_DUMP");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_DUMP");
   return path && path[0] ? path : nullptr;
 }
 
 static const char *env_layer13_moe_input_dump_path() {
   const char *path =
-      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_INPUT_DUMP");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_INPUT_DUMP");
   return path && path[0] ? path : nullptr;
 }
 
 static const char *env_layer13_moe_host_input_dump_path() {
   const char *path =
-      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_HOST_INPUT_DUMP");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_HOST_INPUT_DUMP");
   return path && path[0] ? path : env_layer13_moe_input_dump_path();
 }
 
 static const char *env_layer13_moe_ordinary_input_dump_path() {
   const char *path =
-      std::getenv("MOESTREAM_QWEN4EXP_LAYER13_MOE_ORDINARY_INPUT_DUMP");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_ORDINARY_INPUT_DUMP");
   return path && path[0] ? path : env_layer13_moe_input_dump_path();
 }
 
@@ -1083,9 +1084,9 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
 
   ctx->device_output = node->data;
   const char *direct_pool_env =
-      std::getenv("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+      moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_POOL");
   const char *direct_fused_env =
-      std::getenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+      moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
   const bool direct_pool_requested =
       direct_pool_env && direct_pool_env[0] == '1' &&
       !(direct_fused_env && direct_fused_env[0] == '1');
@@ -2024,16 +2025,16 @@ bool g_config_prefill_state_handoff = false;
 
 bool env_prefill_state_handoff_enabled() {
   const char *value =
-      std::getenv("MOESTREAM_QWEN4EXP_PREFILL_STATE_HANDOFF");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PREFILL_STATE_HANDOFF");
   if (value && value[0])
     return value[0] == '1';
   return g_config_prefill_state_handoff;
 }
 
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
-  const char *value = std::getenv("MOESTREAM_QWEN4EXP_PREFILL_DEVICE_STATE");
+  const char *value = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PREFILL_DEVICE_STATE");
   const char *phase2 =
-      std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
   const bool phase2_enabled = phase2 && phase2[0] == '1';
   return !(value && value[0] == '0') && env_prefill_state_handoff_enabled() &&
          !engine.prompt_cache && !engine.mtp_enabled &&
@@ -2042,7 +2043,7 @@ bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
 }
 
 bool env_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_FULL_GRAPH");
   if (v && v[0])
     return v[0] == '1';
   return g_config_full_graph;
@@ -2050,12 +2051,12 @@ bool env_enabled() {
 
 bool env_decode_borrow_prefill_arenas() {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
   return !(v && std::strcmp(v, "1") == 0);
 }
 
 int env_device_expert_layers() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS");
   if (!v || !v[0])
     return 0;
   char *end = nullptr;
@@ -2069,13 +2070,13 @@ int env_device_expert_layers() {
 // of the model) instead of MoEStream's historical leading-N convention.
 // See FullGraph::device_expert_trailing's own comment.
 bool env_device_expert_trailing() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING");
   return v && v[0] == '1';
 }
 
 // See FullGraph::layer_timing_enabled's own comment.
 bool env_layer_timing_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING");
   return v && v[0] == '1';
 }
 
@@ -2084,7 +2085,7 @@ bool env_layer_timing_enabled() {
 // scheduler submission, route decision/readback, suffix submission, output
 // readback, and (for the master path) the actual device graph span.
 bool env_phase_timing_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PHASE_TIMING");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PHASE_TIMING");
   return v && v[0] == '1';
 }
 
@@ -2093,7 +2094,7 @@ bool env_phase_timing_enabled() {
 // configured CPU MoE nodes with the fused CPY markers; an unset variable must
 // retain the proven scheduler-split path byte-for-byte.
 bool env_qwen4exp_host_node_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE");
   return v && v[0] == '1';
 }
 
@@ -2154,7 +2155,7 @@ static void verify_cuda_graphs_compiled_in(ggml_backend_t cuda_backend) {
 // qwen4exp-phase2-gpu-branch-slower-than-cpu.md's own "not yet diagnosed"
 // note and the live investigation this answers.
 bool env_layer_timing_verbose() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING_VERBOSE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING_VERBOSE");
   return v && v[0] == '1';
 }
 
@@ -2162,7 +2163,7 @@ bool env_layer_timing_verbose() {
 // backend work.  Keep this disabled by default because it adds steady_clock
 // reads to the replay path.
 bool env_graph_replay_timing_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_REPLAY_TIMING");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_REPLAY_TIMING");
   return v && v[0] == '1';
 }
 
@@ -2172,45 +2173,45 @@ bool env_graph_replay_timing_enabled() {
 // matches the separate projection path; setting this to 1 enables it without
 // changing placement or routing.
 bool env_merged_gate_up_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MERGED_GATE_UP");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_MERGED_GATE_UP");
   return v && v[0] == '1';
 }
 
 bool env_layer0_iq2_diag_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
   return v && v[0] == '1';
 }
 
 static const char * env_hidden01_dump_path() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HIDDEN01_DUMP");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HIDDEN01_DUMP");
   return v && v[0] ? v : nullptr;
 }
 
 static const char * env_layer0_split_dump_path() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_LAYER0_SPLIT_DUMP");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER0_SPLIT_DUMP");
   return v && v[0] ? v : nullptr;
 }
 
 // All-layer, every-decode-step hidden-state dump for a full parity trace
 // against llama.cpp -- see all_layers_snapshot's own comment.
 static const char * env_alllayers_dump_path() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP");
   return v && v[0] ? v : nullptr;
 }
 
 static const char *env_phase2_handoff_dump_prefix() {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_P2_HANDOFF_DUMP_PREFIX");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_P2_HANDOFF_DUMP_PREFIX");
   return v && v[0] ? v : nullptr;
 }
 
 static bool env_phase2_handoff_eval_trace() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_P2_HANDOFF_EVAL_TRACE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_P2_HANDOFF_EVAL_TRACE");
   return v && v[0] == '1';
 }
 
 static bool env_phase2_handoff_bind_trace() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_P2_HANDOFF_BIND_TRACE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_P2_HANDOFF_BIND_TRACE");
   return v && v[0] == '1';
 }
 
@@ -2218,7 +2219,7 @@ static bool env_phase2_handoff_bind_trace() {
 // same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
 // applied to Layer 13 without enabling diagnostics for every callback.
 int env_host_node_diag_layer() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_DIAG_LAYER");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_DIAG_LAYER");
   if (!v || !v[0])
     return -1;
   char *end = nullptr;
@@ -2241,17 +2242,17 @@ bool env_host_node_transport_diag_enabled(int layer) {
 // boundary is required to use a complete arena; other layers keep the normal
 // graph-owned source path.
 bool env_layer0_narrow_graph_diag_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
   return v && v[0] == '1';
 }
 
 bool env_two_layer_s1_diag_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DIAG");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DIAG");
   return v && v[0] == '1';
 }
 
 const char *env_two_layer_s1_diag_dump_path() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DUMP");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DUMP");
   return v && v[0] ? v : nullptr;
 }
 
@@ -2263,7 +2264,7 @@ const char *env_two_layer_s1_diag_dump_path() {
 // from a QKV/MMQ implementation difference using the same bytes at the GEMM
 // boundary.
 const char *env_two_layer_s1_common_attn_input_path() {
-  const char *v = std::getenv(
+  const char *v = moestream::graphcfg::env(
       "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_ATTN_INPUT");
   return v && v[0] ? v : nullptr;
 }
@@ -2273,20 +2274,20 @@ const char *env_two_layer_s1_common_attn_input_path() {
 // down/up/gate projection path to be tested independently of its input
 // normalization and upstream hidden-state construction.
 const char *env_two_layer_s1_common_hc_norm_path() {
-  const char *v = std::getenv(
+  const char *v = moestream::graphcfg::env(
       "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_HC_NORM");
   return v && v[0] ? v : nullptr;
 }
 
 const char *env_two_layer_s1_common_hc_down_silu_path() {
-  const char *v = std::getenv(
+  const char *v = moestream::graphcfg::env(
       "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_HC_DOWN_SILU");
   return v && v[0] ? v : nullptr;
 }
 
 const char *env_layer0_common_attn_input_path() {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_LAYER0_COMMON_ATTN_INPUT");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER0_COMMON_ATTN_INPUT");
   return v && v[0] ? v : nullptr;
 }
 
@@ -2590,7 +2591,7 @@ void dump_layer0_diag_values(FullGraph &g) {
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
 // engine.hpp's qwen4exp_partial_layer field group for the full contract).
 int env_partial_layer() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER");
   if (!v || !v[0])
     return -1;
   char *end = nullptr;
@@ -2601,7 +2602,7 @@ int env_partial_layer() {
 }
 
 int env_partial_layer_top_n() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_TOP_N");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_TOP_N");
   if (!v || !v[0])
     return 256;
   char *end = nullptr;
@@ -2620,7 +2621,7 @@ int env_partial_layer_top_n() {
 // build_moe_partial_gpu's own comment. Lower this only to experiment; it
 // trades a small, measured accuracy risk for a higher commit rate.
 float env_partial_layer_min_coverage() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE");
   if (!v || !v[0])
     return 1.0f;
   char *end = nullptr;
@@ -2637,7 +2638,7 @@ float env_partial_layer_min_coverage() {
 // qwen4exp_partial_layer is configured; this flag opts into the dynamic
 // per-token variant instead for a direct A/B against Phase 1.
 bool env_partial_layer_phase2_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
   return v && v[0] == '1';
 }
 
@@ -2653,14 +2654,14 @@ bool env_partial_layer_phase2_enabled() {
 // consumes the Phase-1 gate, so under Phase 2 the capture is skipped. Set
 // MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 to force the old behaviour.
 bool partial_prefill_capture_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE");
   if (v && v[0])
     return v[0] == '1';
   return !env_partial_layer_phase2_enabled();
 }
 
 bool env_completion_staged_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_COMPLETION_STAGED");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_COMPLETION_STAGED");
   return v && v[0] == '1';
 }
 
@@ -2673,7 +2674,7 @@ std::chrono::milliseconds env_storage_wait_timeout() {
   constexpr long kDefaultMs = 100;
   constexpr long kMaximumMs = 30000;
   const char *value =
-      std::getenv("MOESTREAM_QWEN4EXP_STORAGE_TIMEOUT_MS");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STORAGE_TIMEOUT_MS");
   if (!value || !value[0])
     return std::chrono::milliseconds(kDefaultMs);
   char *end = nullptr;
@@ -2684,7 +2685,7 @@ std::chrono::milliseconds env_storage_wait_timeout() {
 }
 
 bool env_adaptive_completion_policy_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY");
   return v && v[0] == '1';
 }
 
@@ -3476,14 +3477,14 @@ bool phase2_handoff_eval_callback(struct ggml_tensor *t, bool ask,
 }
 
 bool env_decode_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE");
   if (v && v[0])
     return v[0] == '1';
   return g_config_full_graph_decode;
 }
 
 int env_decode_kv_capacity(int max_t, int required) {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY");
   int requested = 2048;
   if (v && v[0]) {
     char *end = nullptr;
@@ -3504,7 +3505,7 @@ int env_decode_kv_capacity(int max_t, int required) {
 void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
   if (!env_qwen4exp_host_node_enabled())
     return;
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE_PIN");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_PIN");
   if (v && v[0] == '0')
     return;
   cpu_set_t allowed;
@@ -3542,7 +3543,7 @@ int graph_cpu_threads() {
   const int available = std::max(
       1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
 #endif
-  const char *v = std::getenv("MOESTREAM_QWEN_CPU_THREADS");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_THREADS");
   if (v && v[0]) {
     char *end = nullptr;
     const long parsed = std::strtol(v, &end, 10);
@@ -3573,7 +3574,7 @@ int graph_cpu_threads() {
 // accidentally undone by that commit. Default back to true; set
 // MOESTREAM_QWEN4EXP_GRAPH_PARALLEL=0 for the blocking-sync A/B.
 bool graph_scheduler_parallel() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PARALLEL");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PARALLEL");
   return !(v && v[0] == '0');
 }
 
@@ -3583,7 +3584,7 @@ bool graph_scheduler_parallel() {
 // path. This is the normal full-graph mode; set the environment variable to
 // 0 for an explicit pageable-buffer A/B.
 bool graph_cuda_host_buffers() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_GRAPH_CUDA_HOST_BUFFERS");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_CUDA_HOST_BUFFERS");
   return !(v && v[0] == '0');
 }
 
@@ -3591,7 +3592,7 @@ int device_expert_resident_layer_count(const FullGraph &graph);
 
 bool graph_match_llama_cpp_topology(const FullGraph &graph) {
   const char *v =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
   if (v && v[0])
     return v[0] != '0';
   return device_expert_resident_layer_count(graph) < graph.n_layers;
@@ -3601,7 +3602,7 @@ bool graph_match_llama_cpp_topology(const FullGraph &graph) {
 // LLAMA_CPP_GGML_PROFILE_LAYOUT switch is consumed by llama.cpp's GGML scheduler so the
 // two implementations can be compared without changing their execution.
 bool graph_layout_debug() {
-  const char *v = std::getenv("LLAMA_CPP_GGML_PROFILE_LAYOUT");
+  const char *v = moestream::graphcfg::env("LLAMA_CPP_GGML_PROFILE_LAYOUT");
   return v && v[0] == '1';
 }
 
@@ -3659,7 +3660,7 @@ ggml_backend_buffer_t bind_host(FullGraph &g, ggml_tensor *t, void *ptr,
 void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
   static int moestream_bind_diag = -1;
   if (moestream_bind_diag < 0) {
-    const char *e = std::getenv("MOESTREAM_BIND_HOST_DIAG");
+    const char *e = moestream::graphcfg::env("MOESTREAM_BIND_HOST_DIAG");
     moestream_bind_diag = (e && e[0] == '1') ? 1 : 0;
   }
   if (moestream_bind_diag) {
@@ -6050,7 +6051,7 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
       g.phase2_mode == FullGraph::Phase2Mode::Prefix &&
       diag_layer == g.phase2_split_layer && diag_tag &&
       std::strcmp(diag_tag, "ffn") == 0 &&
-      std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_DEBUG");
   if (g.phase2_mode == FullGraph::Phase2Mode::Prefix &&
       diag_layer == g.phase2_split_layer && diag_tag &&
       std::strcmp(diag_tag, "ffn") == 0)
@@ -6491,9 +6492,9 @@ ggml_tensor *build_qwen4exp_host_node(
     LOG_WARN("[QWEN4EXP-HOST-NODE] layer=%d CPU plan warm-up failed\n", layer);
     return nullptr;
   }
-  const char *direct_pool_env = std::getenv("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+  const char *direct_pool_env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_POOL");
   const char *direct_fused_env =
-      std::getenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+      moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
   const bool direct_fused_requested =
       direct_fused_env && direct_fused_env[0] == '1';
   const bool direct_pool_requested =
@@ -6715,8 +6716,8 @@ bool prepare_phase2_cold_cpu_context(FullGraph &g, StreamingEngine &engine,
               layer);
     return false;
   }
-  const char *direct_pool = std::getenv("MOESTREAM_QWEN_CPU_DIRECT_POOL");
-  const char *direct_fused = std::getenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+  const char *direct_pool = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+  const char *direct_fused = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
   const bool direct_pool_requested =
       direct_pool && direct_pool[0] == '1' &&
       !(direct_fused && direct_fused[0] == '1');
@@ -7183,13 +7184,13 @@ ggml_tensor *phase2_ffn_inject_alias(FullGraph &g, ggml_context *ctx) {
 
 bool env_phase2_disable_frozen_ffn_debug() {
   const char *value =
-      std::getenv("MOESTREAM_QWEN4EXP_PHASE2_DISABLE_FROZEN_FFN");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PHASE2_DISABLE_FROZEN_FFN");
   return value && value[0] == '1';
 }
 
 bool env_phase2_disable_frozen_route_weights_debug() {
   const char *value =
-      std::getenv("MOESTREAM_QWEN4EXP_PHASE2_DISABLE_FROZEN_WEIGHTS");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PHASE2_DISABLE_FROZEN_WEIGHTS");
   return value && value[0] == '1';
 }
 
@@ -7385,8 +7386,8 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
     model_path = g.engine->exl3_ggml_bridge_model_path;
     return true;
   }
-  const char *path = std::getenv("MOESTREAM_EXL3_GGML_BRIDGE_MODEL_PATH");
-  const char *layer_text = std::getenv("MOESTREAM_EXL3_GGML_BRIDGE_LAYER");
+  const char *path = moestream::graphcfg::env("MOESTREAM_EXL3_GGML_BRIDGE_MODEL_PATH");
+  const char *layer_text = moestream::graphcfg::env("MOESTREAM_EXL3_GGML_BRIDGE_LAYER");
   if (!path || !path[0] || !layer_text || !layer_text[0])
     return false;
   char *end = nullptr;
@@ -7398,7 +7399,7 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
 }
 
 void qwen_probe_dump(FullGraph &g) {
-  const char *dir = std::getenv("MOESTREAM_QWEN4EXP_PROBE_DUMP");
+  const char *dir = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PROBE_DUMP");
   if (!dir || !dir[0] || g.probe_taps.empty())
     return;
   for (auto &[l, x, p] : g.probe_taps) {
@@ -7752,10 +7753,10 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ExpertSplitTables tab = build_expert_split_tables(
         g, ctx, c.n_experts, *split_gpu_ids, /*safe_dummy_fill=*/g.S != 1);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
-      const char *early_env = std::getenv("MOESTREAM_QWEN_EARLY_READY_LAYER13");
-      const char *all_early_env = std::getenv("MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT");
+      const char *early_env = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_LAYER13");
+      const char *all_early_env = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT");
       const char *phase2_early_env =
-          std::getenv("MOESTREAM_QWEN4EXP_PHASE2_EARLY_READY");
+          moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PHASE2_EARLY_READY");
       const bool phase2_early_requested =
           phase2_early_env && phase2_early_env[0] == '1' &&
           (g.phase2_mode == FullGraph::Phase2Mode::Prefix ||
@@ -7793,7 +7794,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           for (auto *table : early->gpu_tables)
             ggml_backend_sched_set_tensor_backend(g.sched, table, g.cuda);
         }
-        const char *stage = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *stage = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
           if (!g.early_stage_shapes)
@@ -7872,9 +7873,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         early->gpu_input = fork;
         input3 = ggml_reshape_3d(ctx, fork, g.D, 1, 1);
         ggml_build_forward_expand(g.graph, fork);
-        const char *predict = std::getenv("MOESTREAM_QWEN_EARLY_READY_PREDICT");
-        const char *target = std::getenv("MOESTREAM_QWEN_EARLY_READY_PREDICT_LAYER");
-        const char *stage = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *predict = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_PREDICT");
+        const char *target = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_PREDICT_LAYER");
+        const char *stage = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
         const bool stage_next = stage &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer + 1);
         const bool predict_this_layer = !target || std::atoi(target) == layer + 1;
@@ -9378,7 +9379,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
       return false;
-    if (std::getenv("MOESTREAM_QWEN4EXP_PROBE_DUMP") && g.phase2_mode == FullGraph::Phase2Mode::Off) {
+    if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PROBE_DUMP") && g.phase2_mode == FullGraph::Phase2Mode::Off) {
       ggml_tensor *tap_x = ggml_cont(g.ctx, ffn_in);
       ggml_tensor *tap_p = ggml_soft_max(g.ctx, ggml_mul_mat(g.ctx, router, ffn_in));
       ggml_set_output(tap_x);
@@ -10542,7 +10543,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // Option-B arena that leaves 0.5-1 GiB free can still build; the caller
     // owns the risk of the allocator reserve itself running out of memory.
     if (const char *floor_env =
-            std::getenv("MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB")) {
+            moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB")) {
       char *end = nullptr;
       const long mib = std::strtol(floor_env, &end, 10);
       if (end != floor_env && *end == '\0' && mib >= 64 && mib <= 4096) {
@@ -10587,7 +10588,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // the owning prepare path destroy it. This is intentionally opt-in because
   // it disables the full-graph instance for the diagnostic run.
   const char *reserve_diag =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_RESERVE_DIAG");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_RESERVE_DIAG");
   const bool reserve_diag_enabled =
       reserve_diag &&
       ((std::strcmp(reserve_diag, "1") == 0 ||
@@ -11122,6 +11123,7 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine) {
 }
 
 void qwen4exp_full_graph_shutdown() {
+  moestream::graphcfg::log_consulted("qwen4exp-full-graph");
   // Explicit, EARLY teardown (before the CUDA driver itself starts
   // shutting down) is why this function exists at all -- see g_graph's
   // own destroy()'s comment. The two Phase 2 suffix globals are exactly
@@ -11386,7 +11388,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
   g->device_expert_trailing = env_device_expert_trailing();
   const char *partial_gate_up =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
   // partial_gate_up's boundary math (layer==device_expert_layers, the
   // first CPU layer just past a LEADING block) has no trailing-mode
   // equivalent yet -- force it off rather than apply leading-only math
@@ -11569,8 +11571,9 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
 }
 
 bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
+  moestream::graphcfg::log_effective("qwen4exp-full-graph");
   const char *bootstrap =
-      std::getenv("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP");
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP");
   // Build and retain the prompt-independent dense/expert arenas during
   // startup. Graph construction must not hide a multi-second GGUF read and
   // VRAM upload inside the first prefill. Keep the old lazy behavior as an
@@ -11607,7 +11610,7 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
   }
   int bootstrap_tokens = std::min(16, engine.max_t);
   if (const char *value =
-          std::getenv("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS")) {
+          moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS")) {
     char *end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     if (end == value || *end != '\0' || parsed < 2 ||
@@ -12029,7 +12032,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                         device_expert_layers_shrink);
     g->device_expert_trailing = env_device_expert_trailing();
     const char *partial_gate_up =
-        std::getenv("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
+        moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
     // partial_gate_up's boundary math (layer==device_expert_layers, the
     // first CPU layer just past a LEADING block) has no trailing-mode
     // equivalent yet -- force it off rather than apply leading-only math
@@ -12090,7 +12093,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // throughput-only measurement's noise). Remove this override again if
     // inconclusive, per the original decision record's own discipline.
     if (const char *poll_env =
-            std::getenv("MOESTREAM_QWEN4EXP_CPU_POLL_RETEST")) {
+            moestream::graphcfg::env("MOESTREAM_QWEN4EXP_CPU_POLL_RETEST")) {
       char *end = nullptr;
       const long v = std::strtol(poll_env, &end, 10);
       if (end != poll_env && v >= 0 && v <= 100)
@@ -12135,7 +12138,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       constexpr size_t kPhase2ArenaMargin = 768ull * 1024ull * 1024ull;
       const size_t expert_need = device_expert_bytes(*g);
       const bool risky_override =
-          std::getenv("MOESTREAM_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC") != nullptr;
+          moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC") != nullptr;
       const bool insufficient =
           mem_status != cudaSuccess ||
           expert_need > SIZE_MAX - kPhase2ArenaMargin ||
@@ -12582,7 +12585,7 @@ bool phase2_feed_common_inputs(FullGraph &g, int pos_base) {
 }
 
 bool env_phase2_state_trace_enabled() {
-  const char *v = std::getenv("MOESTREAM_QWEN4EXP_PHASE2_STATE_TRACE");
+  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PHASE2_STATE_TRACE");
   return v && v[0] == '1';
 }
 
@@ -12731,7 +12734,7 @@ State &state() {
 
 bool env_enabled() {
   static const bool enabled =
-      std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH") != nullptr;
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_MASTER_GRAPH") != nullptr;
   return enabled;
 }
 
@@ -13048,7 +13051,7 @@ bool try_launch_three_way(StreamingEngine &engine, FullGraph &prefix,
     *device_graph_ms = -1.0;
   qwen4exp_memory_snapshot("three_way.enter", engine.gpu_device_id,
                            "conditional_graph");
-  const char *enabled = std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED");
+  const char *enabled = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED");
   LOG_INFO("[QWEN4EXP-MASTER-GRAPH-3WAY] enter enabled=%d staged_ids=%zu "
            "include_prefix=%d\n",
            enabled && enabled[0] == '1' ? 1 : 0,
@@ -13510,7 +13513,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       sgpu.phase2_mode == FullGraph::Phase2Mode::SplitGpu;
   const auto &c = engine.model_file.architecture_config;
   bool route_replayed = false;
-  if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG"))
+  if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_DEBUG"))
     LOG_INFO("[QWEN4EXP-P2-ENTRY] pos=%d split_child=%d prefix_ready=%d "
              "split_ready=%d cpu_ready=%d staged_ready=%d tail_ready=%d\n",
              pos_base, split_child_mode ? 1 : 0, prefix.ready ? 1 : 0,
@@ -13740,8 +13743,8 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       return false;
     const char *handoff_dump_prefix = env_phase2_handoff_dump_prefix();
     const bool inspect_graph_handoff =
-        std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG") != nullptr ||
-        std::getenv("MOESTREAM_QWEN4EXP_P2_GRAPH_HANDOFF_ONLY") != nullptr ||
+        moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_DEBUG") != nullptr ||
+        moestream::graphcfg::env("MOESTREAM_QWEN4EXP_P2_GRAPH_HANDOFF_ONLY") != nullptr ||
         handoff_dump_prefix != nullptr;
     const size_t count = static_cast<size_t>(prefix.D) * prefix.HC;
     const size_t handoff_bytes = count * sizeof(float);
@@ -13852,7 +13855,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
   // request and launches a continuation graph whose conditionals consume the
   // already-produced route IDs; the prefix is never replayed a second time.
   if (sstaged && env_completion_staged_enabled() &&
-      std::getenv("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED")) {
+      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED")) {
     const auto phase_start = std::chrono::steady_clock::now();
     if (!run_timed_replay(prefix, prefix_replay_submit_ms,
                           prefix_replay_sync_ms, prefix_submit_ms)) {
@@ -13881,7 +13884,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
     route_replayed = true;
     if (!refresh_cpu_route_and_frozen_ffn())
       return false;
-    if (std::getenv("MOESTREAM_QWEN4EXP_ROUTE_COMPARE") &&
+    if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ROUTE_COMPARE") &&
         route_graph->partial_layer_ids_out && prefix.partial_layer_ids_out) {
       auto describe_route_tensor = [](const char *label, FullGraph &graph,
                                       ggml_tensor *tensor) {
@@ -13969,7 +13972,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                pos_base, differing_slots, c.topk, prefix_text.str().c_str(),
                route_text.str().c_str());
     }
-    if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG")) {
+    if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_DEBUG")) {
       const size_t debug_n = static_cast<size_t>(prefix.D) * prefix.HC;
       std::vector<float> debug_prefix(debug_n);
       const cudaError_t debug_copy = cudaMemcpy(
@@ -14052,7 +14055,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                          route_graph->layer13_moe_input_diag);
       if (route_graph && route_graph->layer13_moe_input_diag) {
         if (const char *path =
-                std::getenv("MOESTREAM_QWEN4EXP_ROUTE_INPUT_DUMP")) {
+                moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ROUTE_INPUT_DUMP")) {
           const size_t n = static_cast<size_t>(ggml_nelements(
               route_graph->layer13_moe_input_diag));
           std::vector<float> values(n);
@@ -14087,7 +14090,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
     // Prefix/Route handoff, bypassing storage publication and both conditional
     // GPU children. This isolates classifier/handoff correctness from staged
     // payload unpack and resident+staged merge arithmetic.
-    if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_FORCE_CPU")) {
+    if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_FORCE_CPU")) {
       if (!run_timed_replay(scpu, suffix_replay_submit_ms,
                             suffix_replay_sync_ms, suffix_submit_ms))
         return false;
@@ -14098,7 +14101,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
       LOG_INFO("[QWEN4EXP-STAGED-DISPATCH] debug force-cpu suffix\n");
       goto completion_staged_done;
     }
-    if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_SOURCE_DEBUG")) {
+    if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_SOURCE_DEBUG")) {
       LOG_INFO("[QWEN4EXP-STAGED-DEBUG] split residual pointers x=%p final=%p "
                "data_x=%p data_final=%p\n",
                static_cast<void *>(prefix.phase2_ffn_residual_source_tensor),
@@ -14396,7 +14399,7 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
                   std::memory_order_acquire);
         if (parent_launched) {
           if (split_child_mode) {
-            if (std::getenv("MOESTREAM_QWEN4EXP_STAGED_DEBUG")) {
+            if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_DEBUG")) {
               const size_t debug_n = static_cast<size_t>(prefix.D) * prefix.HC;
               const size_t moe_n = static_cast<size_t>(prefix.D);
               debug_device_f32("resident_moe_output",
@@ -15035,7 +15038,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       early.stage_target->verify(early.input, early.weights, early.ids, early.stage_ids);
     }
   }
-  const char *route_trace = std::getenv("MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE");
+  const char *route_trace = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE");
   if (route_trace && route_trace[0] && !g.early_ready.empty()) {
     if (!g.early_route_trace) {
       g.early_route_trace = std::make_unique<std::ofstream>(route_trace);

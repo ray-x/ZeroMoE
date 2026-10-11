@@ -3,6 +3,7 @@
 // Private storage for the opt-in single-layer scheduler proof. The outer
 // scheduler never allocates these tensors, so GPU scratch reuse cannot race
 // with the synchronous cold graph.
+#include "graph_config.hpp"
 #include "ggml-alloc.h"
 #include "qwen4exp_stage_pool.hpp"
 #include <cstdio>
@@ -27,7 +28,7 @@ struct Qwen4ExpRidgeTable {
   }
   static Qwen4ExpRidgeTable load() {
     Qwen4ExpRidgeTable t;
-    const char *path = std::getenv("MOESTREAM_QWEN_EARLY_READY_RIDGE");
+    const char *path = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_RIDGE");
     if (!path || !path[0]) return t;
     FILE *f = std::fopen(path, "rb");
     if (!f) { std::fprintf(stderr, "[QWEN-RIDGE] cannot open %s\n", path); return t; }
@@ -151,13 +152,13 @@ struct Qwen4ExpEarlyReady {
     expert_bytes = ggml_row_size(gate->type, gate->ne[0]) * gate->ne[1] +
                    ggml_row_size(up->type, up->ne[0]) * up->ne[1] +
                    ggml_row_size(down->type, down->ne[0]) * down->ne[1];
-    const char *skip = std::getenv("MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT");
+    const char *skip = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT");
     skip_all_hot = skip && skip[0] == '1';
-    const char *copy = std::getenv("MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT");
+    const char *copy = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT");
     // Accepted production profile (early-ready + immutable resident route tables +
     // asynchronous cold-output upload): on unless explicitly disabled with =0.
     async_output_copy = !(copy && copy[0] == '0');
-    const char *tables = std::getenv("MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES");
+    const char *tables = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES");
     resident_tables = !(tables && tables[0] == '0');
     cold_mask.resize(n_experts);
     for (int e = 0; e < n_experts; ++e)
@@ -384,7 +385,7 @@ struct Qwen4ExpEarlyReady {
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(*position == expected_pos);
     const char *stage_no_request_env =
-        std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_NO_REQUEST");
+        moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_NO_REQUEST");
     const bool stage_no_request =
         stage_no_request_env && stage_no_request_env[0] == '1';
     if (stage_source && !stage_no_request)

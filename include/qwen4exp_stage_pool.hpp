@@ -1,5 +1,6 @@
 #pragma once
 
+#include "graph_config.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -229,12 +230,12 @@ struct Qwen4ExpStagePool {
     device = dev; topk = k; slots = 2 * k; cold_mask = mask; this->backend = backend;
     service = shared_service;
     if (!service) return false;
-    const char *verify = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY");
+    const char *verify = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY");
     verify_enabled = verify && verify[0] == '1';
-    const char *delay = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_DELAY_US");
+    const char *delay = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_DELAY_US");
     if (delay) delay_us = std::min<unsigned long>(1000000, std::strtoul(delay, nullptr, 10));
-    const char *worker_delay = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US");
-    const char *stage_cap = std::getenv("MOESTREAM_QWEN_EARLY_READY_STAGE_MAX");
+    const char *worker_delay = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US");
+    const char *stage_cap = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_MAX");
     if (stage_cap) stage_max = std::min<unsigned long>(32, std::strtoul(stage_cap, nullptr, 10));
     if (worker_delay)
       worker_delay_us = std::min<unsigned long>(1000000, std::strtoul(worker_delay, nullptr, 10));

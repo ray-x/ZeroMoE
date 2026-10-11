@@ -5,6 +5,7 @@
 // GGML graph.  Host backed expert tensors remain valid GGML weight nodes, so
 // the CUDA scheduler owns the required copies and dependency edges.
 
+#include "graph_config.hpp"
 #include "pilot_ridge.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
@@ -598,7 +599,7 @@ StreamingEngine *g_glm5next_decode_disabled_engine = nullptr;
 bool env_enabled() {
   static const bool enabled = [] {
     // Full graph is the GLM5NEXT execution path; MOESTREAM_GLM5NEXT_FULL_GRAPH=0 opts out (legacy layered path).
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_FULL_GRAPH");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_FULL_GRAPH");
     return !v || !v[0] || v[0] != '0';
   }();
   return enabled;
@@ -681,7 +682,7 @@ std::shared_mutex g_arena_mu; // exclusive: cache eviction/loads (miss nodes); s
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
     return v && v[0] == '1';
   }();
   return on;
@@ -704,7 +705,7 @@ offload_ensure(moestream::offload::ExpertResidency &res, int layer, const int32_
 
 int offload_first_layer() {
   static const int first = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER");
     return v && v[0] ? std::atoi(v) : -1;
   }();
   return first;
@@ -714,7 +715,7 @@ bool offload_layer(int layer) {
   return f >= 0 && layer >= f;
 }
 std::string offload_env(const char *name, const char *dflt = "") {
-  const char *v = std::getenv(name);
+  const char *v = moestream::graphcfg::env(name);
   return v && v[0] ? v : dflt;
 }
 
@@ -926,7 +927,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
       ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
                                        i0 * a->nb[0]));
-  static const bool dbg = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
+  static const bool dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
   static std::atomic<int> dbg_lines{0};
   if (dbg && !site->prefill)
     for (size_t k = 0; k < ids.size(); ++k)
@@ -980,7 +981,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
 // ---------------------------------------------------------------------------
 int pilot_stage_k() {
   static const int k = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_STAGE");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_STAGE");
     return v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0;
   }();
   return k;
@@ -989,7 +990,7 @@ int pilot_stage_k() {
 // of the layer that needs them; only the first pilot_stage_k() resident ones are copied into the VRAM ring.
 bool pilot_prefetch_on() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
     return v && std::atoi(v) > 0;
   }();
   return on;
@@ -998,14 +999,14 @@ bool pilot_prefetch_on() {
 // VRAM ring and no layer waits for the prefetch, so the CPU computes every cold route as without staging.
 bool pilot_copy_on() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_COPY");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_COPY");
     return !(v && v[0] == '0');
   }();
   return on;
 }
 int pilot_prefetch_k() {
   static const int k = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
     return std::max(pilot_stage_k(), v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0);
   }();
   return k;
@@ -1014,10 +1015,10 @@ int pilot_prefetch_k() {
 // router on layer l's FFN input) so the read has k layers of lead time. Staging copies keep k=1 (the ring has two sets).
 int pilot_lookahead() {
   static const int k = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD");
     int want = v && v[0] ? std::max(1, std::min(4, std::atoi(v))) : 1;
     if (want > 1) {
-      const char *cv = std::getenv("MOESTREAM_GLM5NEXT_PILOT_COPY");
+      const char *cv = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_COPY");
       if (!(cv && cv[0] == '0'))
         want = 1;
     }
@@ -1028,7 +1029,7 @@ int pilot_lookahead() {
 // MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE=x: only prefetch pilot candidates whose router score is >= x.
 float pilot_min_score() {
   static const float v = [] {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE");
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE");
     return e && e[0] ? (float)std::atof(e) : -1e30f;
   }();
   return v;
@@ -1465,7 +1466,7 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
 
 bool dynamic_cache_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -1473,14 +1474,14 @@ bool dynamic_cache_enabled() {
 
 bool route_stats_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_CACHE_STATS");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CACHE_STATS");
     return (v && v[0] == '1') || dynamic_cache_enabled();
   }();
   return enabled;
 }
 
 int env_device_expert_layers() {
-  const char *v = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_PRELOAD_LAYERS");
+  const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_PRELOAD_LAYERS");
   if (!v || !v[0])
     return 0;
   char *end = nullptr;
@@ -1638,7 +1639,7 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name);
 static bool layer_timing_env() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
     return v && v[0] == '1';
   }();
   return on;
@@ -1668,19 +1669,19 @@ ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
 
 bool dsv4_env_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_DEEPSEEK_V4_FULL_GRAPH");
+    const char *v = moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V4_FULL_GRAPH");
     return v && v[0] == '1';
   }();
   return enabled;
 }
 
 bool dsv4_graph_diagnostic_enabled() {
-  const char *v = std::getenv("MOESTREAM_DEEPSEEK_V4_GRAPH_DIAGNOSTIC");
+  const char *v = moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V4_GRAPH_DIAGNOSTIC");
   return v && v[0] == '1';
 }
 
 int dsv4_env_device_expert_layers() {
-  const char *v = std::getenv("MOESTREAM_DEEPSEEK_V4_GRAPH_PRELOAD_LAYERS");
+  const char *v = moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V4_GRAPH_PRELOAD_LAYERS");
   if (!v || !v[0])
     return 0;
   char *end = nullptr;
@@ -2133,7 +2134,7 @@ bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag) {
     cudaSetDevice(prev_device);
   size_t kMinGraphAllocHeadroomBytes =
       2ull * 1024ull * 1024ull * 1024ull; // 2 GiB
-  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
+  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
     kMinGraphAllocHeadroomBytes = (size_t)std::max(0, std::atoi(e)) << 20;
   if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
     LOG_ERROR("%s refusing graph allocator reserve: device %d free=%.2f GiB "
@@ -2585,7 +2586,7 @@ bool packed_gate_up_meta(const StreamingEngine &engine, int layer,
 }
 
 double full_graph_resident_gb(const char *name) {
-  const char *v = std::getenv(name);
+  const char *v = moestream::graphcfg::env(name);
   if (!v || !v[0])
     return 0.0;
   char *end = nullptr;
@@ -2640,7 +2641,7 @@ size_t graph_host_live_bytes(const StreamingEngine &engine) {
 }
 
 std::string partial_usage_path(const FullGraph &g) {
-  const char *env = std::getenv("MOESTREAM_FULL_GRAPH_USAGE_FILE");
+  const char *env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_USAGE_FILE");
   if (env && env[0])
     return env;
   return g.engine->family_ops.family == ModelFamily::DeepSeek_V4
@@ -2796,7 +2797,7 @@ bool configure_vram_reference_experts(FullGraph &g) {
       aliased_bytes += stride;
     }
 
-    if (std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
+    if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
       size_t n_pool = 0, n_ready = 0, n_ptr = 0, n_size = 0, n_gpu = 0;
       for (const ExpertLocation &l2 : g.topology->expert_vram_cache) {
         if (l2.pool_layer != layer) continue;
@@ -3003,7 +3004,7 @@ bool configure_partial_experts(FullGraph &g) {
   if (!configure_partial_experts_base(g))
     return false;
   if (g.partial_expert_residency && ggml_shared_backend(1)) {
-    const char *gh = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
+    const char *gh = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
     if (gh && gh[0])
       assign_gpu1_hot(g, std::atof(gh));
   }
@@ -3562,7 +3563,7 @@ ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
   if (fresh) {
     // MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0=1 is a verification aid: same branch, buffers on the main GPU, so its
     // logits can be compared against the GPU1 placement with identical kernels.
-    static const bool on_gpu0 = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
+    static const bool on_gpu0 = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
     buf = ggml_backend_buft_alloc_buffer(
         ggml_backend_get_default_buffer_type(on_gpu0 ? g.cuda : g.gpu1), ggml_nbytes(t) + 4096);
     if (!buf)
@@ -3609,7 +3610,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   if (gib <= 0.0 || g.partial_experts.empty())
     return;
   const auto &c = g.engine->model_file.architecture_config;
-  const char *uenv = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE");
+  const char *uenv = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE");
   const std::string usage_path = uenv && uenv[0]
                                      ? std::string(uenv)
                                      : offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
@@ -3661,7 +3662,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
                                 [&](int e) { return !is_cold[(size_t)l][(size_t)e]; }),
                  p.cold.end());
   }
-  if (std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG")) {
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG")) {
     for (int l : {3, 4}) {
       std::string a, b;
       for (int e : g.partial_experts[(size_t)l].hot1) a += std::to_string(e) + ",";
@@ -3756,7 +3757,7 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
 
   // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
   static const bool force_dummy =
-      std::getenv("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
   const moe_partial::ExpertBranchMap branch_map =
       moe_partial::ExpertBranchMap::build(
           index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
@@ -3860,7 +3861,7 @@ bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p) {
 
 int dynamic_upload_budget_override() {
   const char *value =
-      std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN");
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN");
   if (!value || !value[0])
     return -1;
   char *end = nullptr;
@@ -3872,7 +3873,7 @@ int dynamic_upload_budget_override() {
 
 double dynamic_upload_fraction() {
   const char *value =
-      std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC");
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC");
   if (!value || !value[0])
     return 0.25;
   char *end = nullptr;
@@ -4151,7 +4152,7 @@ struct RouteTap {
 RouteTap &route_tap() {
   static RouteTap t = [] {
     RouteTap r;
-    if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_ROUTE_TAP"))
+    if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TAP"))
       r.path = e;
     return r;
   }();
@@ -5029,7 +5030,7 @@ bool preload_expert_source(FullGraph &g) {
   // This is boot-time I/O, so cap the default at two; an explicit override is
   // available for a machine with more headroom.
   unsigned read_threads = 2;
-  if (const char *env = std::getenv("MOESTREAM_FULL_GRAPH_READ_THREADS")) {
+  if (const char *env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_READ_THREADS")) {
     char *end = nullptr;
     const long n = std::strtol(env, &end, 10);
     if (end != env && *end == '\0' && n > 0)
@@ -5121,7 +5122,7 @@ bool preload_expert_source(FullGraph &g) {
   // registration failure stops the pass and leaves the remaining slices
   // pageable rather than retrying until the machine is under pressure.
   size_t pin_budget = g.engine->ram_pinned_budget_bytes;
-  const char *pin_env = std::getenv("MOESTREAM_FULL_GRAPH_PIN_GB");
+  const char *pin_env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_PIN_GB");
   if (pin_env && pin_env[0]) {
     char *end = nullptr;
     const double gb = std::strtod(pin_env, &end);
@@ -5678,10 +5679,10 @@ ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t) {
 // the letters c (hc_comb), p (hc_pre sum), o (hc_post) enables just those.
 bool fused_hc_op(char which) {
   // Default ON. MOESTREAM_GLM5NEXT_UNFUSED_HC=1 restores the composed-op path.
-  static const bool off = std::getenv("MOESTREAM_GLM5NEXT_UNFUSED_HC") != nullptr;
+  static const bool off = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_UNFUSED_HC") != nullptr;
   if (off)
     return false;
-  static const char *e = std::getenv("MOESTREAM_GLM5NEXT_FUSED_HC");
+  static const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_FUSED_HC");
   if (!e || e[0] == '1')
     return true;
   return std::strchr(e, which) != nullptr;
@@ -6438,7 +6439,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (partial_weights && !partial_weights->cold.empty() &&
       ((!gate_up && (!ge || !ue)) || !de))
     return nullptr;
-  if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
     const bool ready = partial_layer_ram_ready(g, layer);
     LOG_WARN(
         "[PARTIAL-DEBUG] layer=%d n_experts=%d hot=%zu cold=%zu ready=%d "
@@ -6514,7 +6515,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return nullptr;
   if (g.partial_expert_residency && !prepare_partial_hot1(g, ctx, layer))
     return nullptr;
-  if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
     LOG_WARN(
         "[PARTIAL-DEBUG-HOT] layer=%d hot=%zu vram_slots=%zu "
         "hot_gate_ne2=%lld hot_up_ne2=%lld hot_down_ne2=%lld "
@@ -6945,7 +6946,7 @@ bool build_graph(FullGraph &g) {
       return false;
     cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
     ggml_tensor *cur_pre = cur;
-    if (g.decode_mode && std::getenv("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
+    if (g.decode_mode && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
       ggml_set_output(cur_pre);
       g.probe_x.push_back({l, cur_pre});
     }
@@ -6988,7 +6989,7 @@ bool build_graph(FullGraph &g) {
   ggml_build_forward_expand(g.graph, g.final_streams);
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode && !std::getenv("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
+  if (g.decode_mode && !moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
     ggml_tensor *out_norm = resident_tensor(g, g.ctx, "output_norm.weight");
     ggml_tensor *out_w = resident_tensor(g, g.ctx, "output.weight");
     if (out_norm && out_w) {
@@ -7091,7 +7092,7 @@ bool build_graph(FullGraph &g) {
     }
     LOG_INFO("[GGML-GLM5NEXT-FULL] non-CUDA nodes: %s\n", detail.c_str());
   }
-  if (const char *dl = std::getenv("MOESTREAM_GLM5NEXT_SPLIT_DUMP")) {
+  if (const char *dl = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_SPLIT_DUMP")) {
     // Debug: print the backend of every node of one MoE layer (from the previous layer's end to this layer's end).
     const std::string tag = std::string("_") + dl; // node names of the layer end with _<layer>
     int first = -1, last = -1;
@@ -7161,6 +7162,7 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
+  moestream::graphcfg::log_effective("glm5next-full-graph");
   // Build and seed the offload cache at boot, not inside the first decode token.
   FullGraph candidate;
   candidate.engine = &engine;
@@ -7214,6 +7216,7 @@ int glm5next_full_graph_device_expert_layers() {
 }
 
 void glm5next_full_graph_shutdown() {
+  moestream::graphcfg::log_consulted("glm5next-full-graph");
   g_graph.reset();
   for (auto &kv : g_hot1_buffers)
     ggml_backend_buffer_free(kv.second);
@@ -7272,7 +7275,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
@@ -7501,7 +7504,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   auto decline_decode_graph = [&]() {
     // Design policy: a GLM5NEXT request is served by the full graph or it fails. MOESTREAM_GLM5NEXT_GRAPH_STRICT=1
     // turns the legacy-decode fallback into a hard error (default stays permissive until prefill is graph-only too).
-    if (const char *strict = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_STRICT");
+    if (const char *strict = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_STRICT");
         strict && strict[0] == '1') {
       LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] decode graph declined and "
                 "MOESTREAM_GLM5NEXT_GRAPH_STRICT=1: failing the request "
@@ -7517,7 +7520,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
@@ -7535,7 +7538,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !init_decode_state_arena(*g)) {
     return decline_decode_graph();
   }
-  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
+  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
     int a = -1, b = -2;
     if (std::sscanf(e, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a) {
       g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
@@ -7658,7 +7661,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static NanProbe probe;
   const bool nan_probe_on =
-      std::getenv("MOESTREAM_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
       probe.reported == 0;
   if (nan_probe_on) {
     probe.seen = 0;
@@ -7885,7 +7888,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static OpProf op;
   static const bool op_prof_env =
-      std::getenv("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
   const bool op_prof_on = op_prof_env && !layer_timing_on && !nan_probe_on &&
                           op.tokens < 30;
   if (op_prof_on) {
@@ -7969,7 +7972,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   if (!g.probe_x.empty()) {
     // Training/diagnostic tap: the exact pilot input (pre-FFN hidden, f32 [D]) of every layer for this decode token.
-    const char *dir = std::getenv("MOESTREAM_GLM5NEXT_PROBE_DUMP");
+    const char *dir = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP");
     std::vector<float> row((size_t)g.D);
     for (const auto &lx : g.probe_x) {
       if (!dir || lx.second->type != GGML_TYPE_F32 || (size_t)lx.second->ne[0] != (size_t)g.D)
@@ -7996,7 +7999,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * sizeof(float));
-  if (std::getenv("MOESTREAM_GLM5NEXT_DEBUG_DECODE_OUT")) {
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_DECODE_OUT")) {
     size_t bad = 0;
     double sum = 0.0, mx = 0.0;
     for (int i = 0; i < g.D; ++i) {
@@ -8221,7 +8224,7 @@ bool deepseek_v4_full_graph_prepare(StreamingEngine &engine, int S,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
