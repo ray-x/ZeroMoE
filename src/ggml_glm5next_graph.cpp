@@ -14,6 +14,7 @@
 #include "direct_io.hpp"
 #include "engine.hpp"
 #include "expert_cache.hpp"
+#include "early_ready_lane.hpp"
 #include "expert_store.hpp"
 #include "offload_store.hpp"
 #include "ggml-backend.h"
@@ -299,6 +300,9 @@ struct FullGraph {
   std::vector<ggml_tensor *> kda_hist_updates;
   std::vector<int> dsa_layers;
   std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
+  // CPU lanes (MOESTREAM_GLM5NEXT_EARLY_READY): one per layer whose cold experts
+  // run concurrently with that layer's GPU work.
+  std::unordered_map<int, std::unique_ptr<EarlyReadyLane>> early_ready;
   struct VramExpertHold {
     int layer = -1;
     int expert = -1;
@@ -463,6 +467,7 @@ struct FullGraph {
   ~FullGraph() { destroy(); }
 
   void destroy() {
+    early_ready.clear();
     if (dynamic_upload) {
       {
         std::lock_guard<std::mutex> lock(dynamic_upload->mutex);
@@ -6287,6 +6292,128 @@ ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, 
   return out;
 }
 
+// MOESTREAM_GLM5NEXT_EARLY_READY=1: run each layer's cold (CPU) experts on a private
+// lane that starts as soon as the routed ids reach the host, instead of after the
+// layer's GPU work. Decode only; off by default until it is measured.
+bool early_ready_wanted() {
+  static const bool on = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_EARLY_READY");
+  return on;
+}
+
+// Builds the lane for one layer's cold experts and the graph nodes around it:
+// the fork (activation snapshot + route readback) is added to the graph here;
+// the caller consumes lane->gpu_input as the hot branches' input and lane->gpu_output
+// as the cold branch's per-route weighted output, and must expand lane->cpu_marker
+// after the layer's GPU work and before the merge. Returns nullptr when not applicable.
+EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
+                               ggml_tensor *cur, ggml_tensor *ids,
+                               ggml_tensor *weights, ggml_tensor *cold_map,
+                               ggml_tensor *cold_mask,
+                               const moe_routed::ExpertWeights &cold_w,
+                               float clamp = 0.0f) {
+  if (!g.decode_mode || g.S != 1 || !g.sched || !g.cuda || !g.cpu ||
+      !cold_w.valid() || !cold_map || !cold_mask || cur->type != GGML_TYPE_F32)
+    return nullptr;
+  if (!ggml_backend_sched_early_cpu_supported ||
+      ggml_backend_sched_early_cpu_supported() != 1) {
+    LOG_WARN("[GGML-GLM5NEXT-EARLY-READY] layer %d: linked ggml has no early-CPU scheduler hook\n", layer);
+    return nullptr;
+  }
+  const auto &c = g.engine->model_file.architecture_config;
+  auto lane = std::make_unique<EarlyReadyLane>();
+  lane->swiglu_clamp = clamp;
+  lane->swiglu_clamp_fused = swiglu_clamp_fused();
+  // The lane reads its routing tables on the host: copy them out of the graph's
+  // (device-resident) constant tensors once, at build time.
+  const auto host_table = [&](ggml_tensor *src) -> ggml_tensor * {
+    ggml_tensor *t = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2]);
+    if (!t)
+      return nullptr;
+    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(g.cpu, ggml_nbytes(t));
+    if (!buf)
+      return nullptr;
+    lane->extra_buffers.push_back(buf);
+    if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS)
+      return nullptr;
+    std::vector<uint8_t> tmp(ggml_nbytes(t));
+    ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+    ggml_backend_tensor_set(t, tmp.data(), 0, tmp.size());
+    return t;
+  };
+  ggml_tensor *remap = host_table(cold_map);
+  ggml_tensor *mask = host_table(cold_mask);
+  if (!remap || !mask)
+    return nullptr;
+  if (!lane->prepare(g.cpu, g.device, g.D, c.topk, cold_w, remap, mask))
+    return nullptr;
+
+  ggml_tensor *dst = ggml_dup_tensor(ctx, cur);
+  lane->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));
+  if (!lane->device_buffer ||
+      ggml_backend_tensor_alloc(lane->device_buffer, dst,
+                                ggml_backend_buffer_get_base(lane->device_buffer)) != GGML_STATUS_SUCCESS)
+    return nullptr;
+  ggml_tensor *fork = ggml_cpy(ctx, cur, dst);
+  fork->src[2] = ggml_cont(ctx, ids);
+  fork->src[3] = ggml_cont(ctx, weights);
+  fork->src[4] = nullptr;  // no positions tensor: skip the staleness check
+  fork->extra = lane.get();
+  ggml_set_name(fork, ("glm5next_early_ready_fork_l" + std::to_string(layer)).c_str());
+  ggml_backend_sched_set_tensor_backend(g.sched, dst, g.cuda);
+  ggml_backend_sched_set_tensor_backend(g.sched, fork, g.cuda);
+  lane->gpu_input = fork;
+  ggml_build_forward_expand(g.graph, fork);
+
+  ggml_tensor *cold_leaf = ggml_dup_tensor(ctx, lane->output);
+  cold_leaf->buffer = lane->output->buffer;
+  cold_leaf->data = lane->output->data;
+  ggml_tensor *marker = ggml_map_custom1_inplace(ctx, cold_leaf, EarlyReadyLane::fallback, 1, lane.get());
+  marker->extra = lane.get();
+  ggml_set_name(marker, ("glm5next_early_ready_cold_l" + std::to_string(layer)).c_str());
+  ggml_backend_sched_set_tensor_backend(g.sched, cold_leaf, g.cpu);
+  ggml_backend_sched_set_tensor_backend(g.sched, marker, g.cpu);
+  if (!lane->async_output_copy)
+    return nullptr;  // the GLM merge consumes the uploaded copy
+  lane->cpu_marker = marker;
+  if (!lane->prepare_gpu_output(g.cuda, ctx))
+    return nullptr;
+  ggml_set_name(lane->gpu_output, ("glm5next_early_ready_output_l" + std::to_string(layer)).c_str());
+  ggml_backend_sched_set_tensor_backend(g.sched, lane->gpu_output, g.cuda);
+
+  if (offload_layer(layer)) {
+    OffloadState *o = get_offload(*g.engine);
+    if (!o)
+      return nullptr;
+    lane->before_compute = [o, layer](const int32_t *experts, int n) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const auto r = o->store->ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
+      auto &ct = o->store->counters();
+      ct.calls.fetch_add(1, std::memory_order_relaxed);
+      ct.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+      ct.cold_routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+      ct.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+      ct.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
+      ct.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+      ct.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+      ct.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0).count(),
+                         std::memory_order_relaxed);
+      if (r.errors > 0) {
+        ct.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting rather than computing with "
+                  "missing experts\n", layer, r.errors);
+        o->store->report("fatal");
+        std::abort();
+      }
+      return true;
+    };
+  }
+  EarlyReadyLane *raw = lane.get();
+  g.early_ready.emplace(layer, std::move(lane));
+  LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);
+  return raw;
+}
+
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *forced_ids = nullptr) {
   const std::string p = "blk." + std::to_string(layer) + ".";
@@ -6439,6 +6566,37 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
   };
 
+  // Shared expert FFN output (nullptr when the layer has none). With a CPU lane it is built and
+  // scheduled before the lane's marker so the GPU runs it while the CPU computes the cold experts.
+  const auto build_shared = [&]() -> ggml_tensor * {
+    ggml_tensor *sg = resident_tensor(g, ctx, p + "ffn_gate_shexp.weight");
+    ggml_tensor *su = resident_tensor(g, ctx, p + "ffn_up_shexp.weight");
+    ggml_tensor *sd = resident_tensor(g, ctx, p + "ffn_down_shexp.weight");
+    if (!(sg && su && sd))
+      return nullptr;
+    ggml_tensor *gate_shared = ggml_mul_mat(ctx, sg, cur);
+    ggml_tensor *up_shared = ggml_mul_mat(ctx, su, cur);
+    const float clamp_shared =
+        (layer >= 0 && layer < (int)c.swiglu_clamp_shexp.size())
+            ? c.swiglu_clamp_shexp[(size_t)layer]
+            : 0.0f;
+    ggml_tensor *a = nullptr;
+    if (clamp_shared > 1e-6f && swiglu_clamp_fused()) {
+      // GLM5NEXT/reference ggml_swiglu_clamp semantics.
+      up_shared = ggml_clamp(ctx, up_shared, -clamp_shared, clamp_shared);
+      gate_shared = ggml_clamp(ctx, gate_shared, -INFINITY, clamp_shared);
+      a = ggml_mul(ctx, ggml_silu(ctx, gate_shared), up_shared);
+    } else {
+      a = ggml_swiglu_split(ctx, gate_shared, up_shared);
+      // DeepSeek-V4's established path clamps the completed SwiGLU product
+      // when the fused GLM5NEXT flag is not active.
+      if (clamp_shared > 1e-6f)
+        a = ggml_clamp(ctx, a, -clamp_shared, clamp_shared);
+    }
+    return ggml_mul_mat(ctx, sd, a);
+  };
+  ggml_tensor *shared_out = nullptr;
+
   ggml_tensor *out = nullptr;
   // Offloaded layers: the miss node wraps the ids that reach the CPU (cold) MUL_MAT_IDs, so
   // experts held in VRAM are never loaded into DDR; negative ids are skipped by ensure().
@@ -6488,16 +6646,52 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         }
       }
     }
-    out = moe_partial::combine_hot_cold(
-        ctx, has_hot, has_cold, hot_in, cold_in,
-        [&](const moe_partial::BranchInputs &in) {
-          return run_branch(partial->hot_gate_up, partial->hot_gate,
-                            partial->hot_up, partial->hot_down, in.ids,
-                            in.weights);
-        },
-        [&](const moe_partial::BranchInputs &in) {
-          return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
-        });
+    EarlyReadyLane *lane = nullptr;
+    if (has_cold && early_ready_wanted() && layer == c.first_dense + 1)
+      LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d conditions: stage=%d hot1=%zu clamp=%g\n",
+               layer, stage ? 1 : 0, partial->hot1.size(), (double)clamp);
+    if (has_cold && early_ready_wanted() && !stage && partial->hot1.empty()) {
+      moe_routed::ExpertWeights cold_w;
+      cold_w.gate_up = gate_up;
+      cold_w.gate = ge;
+      cold_w.up = ue;
+      cold_w.down = de;
+      lane = make_cold_lane(g, ctx, layer, cur, ids, weights,
+                            partial_map(g, ctx, layer, false, false),
+                            partial_map(g, ctx, layer, false, true), cold_w, clamp);
+    }
+    if (lane) {
+      // fork -> hot GPU work -> shared expert -> CPU lane marker -> merge. The marker
+      // is expanded after everything the GPU can do without the cold result.
+      input3 = ggml_reshape_3d(ctx, lane->gpu_input, g.D, 1, g.S);
+      ggml_tensor *hot_out = nullptr;
+      if (has_hot) {
+        hot_out = run_branch(partial->hot_gate_up, partial->hot_gate,
+                             partial->hot_up, partial->hot_down, hot_in.ids,
+                             hot_in.weights);
+        if (!hot_out)
+          return nullptr;
+        ggml_build_forward_expand(g.graph, hot_out);
+      }
+      shared_out = build_shared();
+      if (shared_out)
+        ggml_build_forward_expand(g.graph, shared_out);
+      ggml_build_forward_expand(g.graph, lane->cpu_marker);
+      ggml_tensor *cold_out =
+          moe_routed::sum_topk(ctx, lane->gpu_output, g.D, g.S, c.topk);
+      out = hot_out ? ggml_add(ctx, hot_out, cold_out) : cold_out;
+    } else {
+      out = moe_partial::combine_hot_cold(
+          ctx, has_hot, has_cold, hot_in, cold_in,
+          [&](const moe_partial::BranchInputs &in) {
+            return run_branch(partial->hot_gate_up, partial->hot_gate,
+                              partial->hot_up, partial->hot_down, in.ids,
+                              in.weights);
+          },
+          [&](const moe_partial::BranchInputs &in) {
+            return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
+          });
+    }
     if (!out)
       return nullptr;
     if (partial->hot1_down) {
@@ -6536,31 +6730,10 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       return nullptr;
   }
 
-  ggml_tensor *sg = resident_tensor(g, ctx, p + "ffn_gate_shexp.weight");
-  ggml_tensor *su = resident_tensor(g, ctx, p + "ffn_up_shexp.weight");
-  ggml_tensor *sd = resident_tensor(g, ctx, p + "ffn_down_shexp.weight");
-  if (sg && su && sd) {
-    ggml_tensor *gate_shared = ggml_mul_mat(ctx, sg, cur);
-    ggml_tensor *up_shared = ggml_mul_mat(ctx, su, cur);
-    const float clamp_shared =
-        (layer >= 0 && layer < (int)c.swiglu_clamp_shexp.size())
-            ? c.swiglu_clamp_shexp[(size_t)layer]
-            : 0.0f;
-    ggml_tensor *a = nullptr;
-    if (clamp_shared > 1e-6f && swiglu_clamp_fused()) {
-      // GLM5NEXT/reference ggml_swiglu_clamp semantics.
-      up_shared = ggml_clamp(ctx, up_shared, -clamp_shared, clamp_shared);
-      gate_shared = ggml_clamp(ctx, gate_shared, -INFINITY, clamp_shared);
-      a = ggml_mul(ctx, ggml_silu(ctx, gate_shared), up_shared);
-    } else {
-      a = ggml_swiglu_split(ctx, gate_shared, up_shared);
-      // DeepSeek-V4's established path clamps the completed SwiGLU product
-      // when the fused GLM5NEXT flag is not active.
-      if (clamp_shared > 1e-6f)
-        a = ggml_clamp(ctx, a, -clamp_shared, clamp_shared);
-    }
-    out = ggml_add(ctx, out, ggml_mul_mat(ctx, sd, a));
-  }
+  if (!shared_out)
+    shared_out = build_shared();
+  if (shared_out)
+    out = ggml_add(ctx, out, shared_out);
   return out;
 }
 
@@ -7781,6 +7954,8 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     op.sched = g.sched;
     op.last = std::chrono::steady_clock::now();
   }
+  for (auto &entry : g.early_ready)
+    entry.second->completed = false;
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
@@ -7952,6 +8127,8 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
   if (!hold_graph_vram_experts(g))
     return false;
+  for (auto &entry : g.early_ready)
+    entry.second->completed = false;
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {

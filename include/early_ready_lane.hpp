@@ -1,13 +1,29 @@
 #pragma once
 
-// Private storage for the opt-in single-layer scheduler proof. The outer
-// scheduler never allocates these tensors, so GPU scratch reuse cannot race
+// CPU lane that runs a layer's cold experts concurrently with its GPU work.
+//
+// The layer forks (activation, routed ids, router weights) to private pinned
+// buffers from inside the CUDA stream, then the patched scheduler runs the
+// lane's private CPU graph as soon as that fork event fires, instead of after
+// the layer's hot GPU matmuls. The cold result is uploaded on a side stream and
+// the merge waits on it. Private storage means GPU scratch reuse cannot race
 // with the synchronous cold graph.
+//
+// Owned by the graph builder of whichever model uses it (Qwen4Exp Option-B,
+// GLM5NEXT SSD offload). Optional extras (next-layer prediction, VRAM staging)
+// are Qwen-only and left null elsewhere.
 #include "graph_config.hpp"
+#include "ggml.h"
 #include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "memory_guard.hpp"
+#include <cuda_runtime.h>
 #include "qwen4exp_stage_pool.hpp"
+#include "moe_routed_ggml.hpp"
 #include <cstdio>
+#include <functional>
 #include <map>
+#include <vector>
 
 extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
 
@@ -54,7 +70,7 @@ struct Qwen4ExpRidgeTable {
   }
 };
 
-struct Qwen4ExpEarlyReady {
+struct EarlyReadyLane {
   static constexpr uint64_t kMagic = 0x514541524c593133ull;
   uint64_t magic = kMagic;
   ggml_context *ctx = nullptr;
@@ -104,13 +120,15 @@ struct Qwen4ExpEarlyReady {
   bool async_output_copy = false;
   bool resident_tables = false;
   std::vector<uint8_t> cold_mask;
+  // Buffers owned on behalf of the builder (e.g. host copies of routing tables).
+  std::vector<ggml_backend_buffer_t> extra_buffers;
   size_t reservation = 0;
   uint64_t calls = 0, early_calls = 0, gpu_pending = 0;
   uint64_t all_hot_visits = 0, all_hot_skips = 0;
   uint64_t output_uploads = 0;
   int64_t wait_us = 0, compute_us = 0;
 
-  ~Qwen4ExpEarlyReady() {
+  ~EarlyReadyLane() {
     if (device >= 0) cudaSetDevice(device);
     if (ready) cudaEventDestroy(ready);
     if (output_stream) cudaStreamDestroy(output_stream);
@@ -128,6 +146,7 @@ struct Qwen4ExpEarlyReady {
     if (scratch) ggml_backend_buffer_free(scratch);
     if (pinned_buffer) ggml_backend_buffer_free(pinned_buffer);
     if (ctx) ggml_free(ctx);
+    for (auto *b : extra_buffers) ggml_backend_buffer_free(b);
     if (pinned) cudaFreeHost(pinned);
     if (reservation) MemoryGuard::release_host_bytes(reservation);
   }
@@ -140,9 +159,31 @@ struct Qwen4ExpEarlyReady {
     return t;
   }
 
+  // Separate gate/up/down expert tensors (Qwen4Exp).
   bool prepare(ggml_backend_t backend, int dev, int dim, int topk,
                ggml_tensor *gate, ggml_tensor *up, ggml_tensor *down,
                ggml_tensor *remap, ggml_tensor *mask) {
+    moe_routed::ExpertWeights w;
+    w.gate = gate;
+    w.up = up;
+    w.down = down;
+    return prepare(backend, dev, dim, topk, w, remap, mask);
+  }
+
+  // Called on the CPU lane right before its graph runs with the routed experts
+  // this lane owns (mask != 0, deduplicated, in route order). Return false to
+  // fail the token. Used by the SSD-offload path to make them resident.
+  std::function<bool(const int32_t *experts, int n)> before_compute;
+  // SwiGLU clamp applied by the private graph (0 = none); set before prepare().
+  float swiglu_clamp = 0.0f;
+  bool swiglu_clamp_fused = false;
+
+  bool prepare(ggml_backend_t backend, int dev, int dim, int topk,
+               const moe_routed::ExpertWeights &w,
+               ggml_tensor *remap, ggml_tensor *mask) {
+    ggml_tensor *gate = w.gate_up ? w.gate_up : w.gate;
+    ggml_tensor *up = w.gate_up ? nullptr : w.up;
+    ggml_tensor *down = w.down;
     cpu = backend; device = dev; d = dim; k = topk;
     n_experts = gate->ne[2];
     cpu_remap = static_cast<int32_t *>(remap->data);
@@ -150,7 +191,7 @@ struct Qwen4ExpEarlyReady {
     original_remap.assign(cpu_remap, cpu_remap + n_experts);
     original_mask.assign(cpu_mask, cpu_mask + n_experts);
     expert_bytes = ggml_row_size(gate->type, gate->ne[0]) * gate->ne[1] +
-                   ggml_row_size(up->type, up->ne[0]) * up->ne[1] +
+                   (up ? ggml_row_size(up->type, up->ne[0]) * up->ne[1] : 0) +
                    ggml_row_size(down->type, down->ne[0]) * down->ne[1];
     const char *skip = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT");
     skip_all_hot = skip && skip[0] == '1';
@@ -200,11 +241,18 @@ struct Qwen4ExpEarlyReady {
         ggml_get_rows(ctx, alias(ctx, remap), route), k, 1);
     auto *cold_weights = ggml_mul(ctx, prob,
         ggml_get_rows(ctx, alias(ctx, mask), route));
-    auto *u = ggml_mul_mat_id(ctx, alias(ctx, up), x, cold_ids);
-    auto *g = ggml_mul_mat_id(ctx, alias(ctx, gate), x, cold_ids);
-    auto *act = ggml_swiglu_split(ctx, g, u);
-    output = ggml_mul(ctx,
-        ggml_mul_mat_id(ctx, alias(ctx, down), act, cold_ids), cold_weights);
+    moe_routed::ExpertWeights private_w;
+    if (w.gate_up) {
+      private_w.gate_up = alias(ctx, w.gate_up);
+    } else {
+      private_w.gate = alias(ctx, w.gate);
+      private_w.up = alias(ctx, w.up);
+    }
+    private_w.down = alias(ctx, down);
+    const moe_routed::FfnNodes ffn =
+        moe_routed::expert_ffn(ctx, private_w, x, cold_ids, swiglu_clamp,
+                                swiglu_clamp_fused);
+    output = ggml_mul(ctx, ffn.down, cold_weights);
     output->data = base + out_off; output->buffer = pinned_buffer;
     graph = ggml_new_graph_custom(ctx, 256, false);
     ggml_build_forward_expand(graph, output);
@@ -339,7 +387,9 @@ struct Qwen4ExpEarlyReady {
       GGML_ASSERT(record_external(prediction_ready, stream) == cudaSuccess);
       return true;
     }
-    GGML_ASSERT(node->src[0] && node->src[2] && node->src[3] && node->src[4]);
+    // src[4] (token position) is optional: lanes whose graph has no positions
+    // tensor skip the staleness check.
+    GGML_ASSERT(node->src[0] && node->src[2] && node->src[3]);
     const auto checked = [](cudaError_t status, const char *operation) {
       if (status != cudaSuccess)
         GGML_ABORT("early-ready %s: %s", operation, cudaGetErrorString(status));
@@ -364,8 +414,9 @@ struct Qwen4ExpEarlyReady {
                             cudaMemcpyDeviceToHost, stream), "route readback");
     checked(cudaMemcpyAsync(weights, node->src[3]->data, k * sizeof(float),
                             cudaMemcpyDeviceToHost, stream), "weight readback");
-    checked(cudaMemcpyAsync(position, node->src[4]->data, sizeof(int32_t),
-                            cudaMemcpyDeviceToHost, stream), "position readback");
+    if (node->src[4])
+      checked(cudaMemcpyAsync(position, node->src[4]->data, sizeof(int32_t),
+                              cudaMemcpyDeviceToHost, stream), "position readback");
     cudaStreamCaptureStatus capture;
     checked(cudaStreamIsCapturing(stream, &capture), "capture query");
     // External records survive capture as host-visible graph event nodes.
@@ -383,7 +434,7 @@ struct Qwen4ExpEarlyReady {
     const cudaError_t status = cudaEventSynchronize(ready);
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
-    GGML_ASSERT(*position == expected_pos);
+    GGML_ASSERT(expected_pos < 0 || *position == expected_pos);
     const char *stage_no_request_env =
         moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_NO_REQUEST");
     const bool stage_no_request =
@@ -417,6 +468,17 @@ struct Qwen4ExpEarlyReady {
     const cudaError_t tail = cudaStreamQuery(producer_stream);
     GGML_ASSERT(tail == cudaSuccess || tail == cudaErrorNotReady);
     gpu_pending += tail == cudaErrorNotReady;
+    if (before_compute && cold_count > 0) {
+      int32_t owned[64];
+      int n_owned = 0;
+      for (int i = 0; i < k && n_owned < 64; ++i) {
+        if (cpu_mask[ids[i]] == 0.0f) continue;
+        bool seen = false;
+        for (int j = 0; j < n_owned; ++j) seen = seen || owned[j] == ids[i];
+        if (!seen) owned[n_owned++] = ids[i];
+      }
+      GGML_ASSERT(before_compute(owned, n_owned));
+    }
     const int64_t copied = ggml_time_us();
     all_hot_visits += cold_count == 0;
     if (skip_all_hot && cold_count == 0) {
@@ -479,23 +541,8 @@ struct Qwen4ExpEarlyReady {
   }
 };
 
-extern "C" int moestream_ggml_sched_early_cpu(
-    ggml_backend_t backend, ggml_cgraph *graph,
-    int64_t *wait_us, int64_t *compute_us) {
-  Qwen4ExpEarlyReady *context = nullptr;
-  for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
-    auto *node = ggml_graph_node(graph, i);
-    if (node->op == GGML_OP_VIEW || node->op == GGML_OP_RESHAPE ||
-        node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE)
-      continue;
-    if (node->op != GGML_OP_MAP_CUSTOM1 || !node->extra || context) return 0;
-    auto *candidate = static_cast<Qwen4ExpEarlyReady *>(node->extra);
-    if (candidate->magic != Qwen4ExpEarlyReady::kMagic) return 0;
-    context = candidate;
-  }
-  if (!context || context->cpu != backend) return 0;
-  const int64_t w = context->wait_us, c = context->compute_us;
-  context->run(); ++context->early_calls;
-  *wait_us = context->wait_us - w; *compute_us = context->compute_us - c;
-  return 1;
-}
+// Scheduler hook (weak symbol in the patched ggml). Defined once, in
+// ggml_qwen4exp_graph.cpp: an `inline` definition is not emitted unless the
+// TU uses it, which silently disables early-ready.
+extern "C" int moestream_ggml_sched_early_cpu(ggml_backend_t backend, ggml_cgraph *graph,
+                                              int64_t *wait_us, int64_t *compute_us);

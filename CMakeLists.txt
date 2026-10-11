@@ -323,8 +323,8 @@ if(NOT MOESTREAM_CPU_ONLY)
         cuda/mla_attention.cu
         cuda/mxfp4_matmul.cu
         cuda/q5_1_matmul.cu
-        cuda/qwen4exp_master_graph.cu
         cuda/qwen4exp_hc_q8.cu
+        cuda/qwen_stage_kernels.cu
         cuda/q8_0_matmul.cu
         cuda/q2_0_matmul.cu
         cuda/rmsnorm.cu

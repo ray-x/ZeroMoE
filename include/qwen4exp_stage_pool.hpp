@@ -1,6 +1,11 @@
 #pragma once
 
 #include "graph_config.hpp"
+#include "ggml.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
+#include "memory_guard.hpp"
+#include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
