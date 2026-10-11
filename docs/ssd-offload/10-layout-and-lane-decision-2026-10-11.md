@@ -97,10 +97,9 @@ Striped store, DDR 32 GiB, 5,215 seeded experts, same 5-round / 475-token traffi
 | SEED_PAR=1 (a) | 18.5 s | 14,639 | 184.5 / 205.0 / 208.4 / 170.3 / 227.5 |
 | SEED_PAR=1 (b) | 12.5 s | 14,639 | 177.1 / 198.5 / 203.1 / 170.4 / 225.7 |
 | SEED_PAR=8 (a) | **6.5 s** | 14,639 | 177.5 / 199.5 / 204.7 / 171.3 / 226.9 |
-| SEED_PAR=8 (b) | not finished when this was written | | |
+| SEED_PAR=8 (b) | **7.4 s** | 14,639 | see the repeat run in pinab (same loads per round) |
 
-* Seeding is 2-3x faster (6.5 s vs 12.5-18.5 s; the serial arm itself varies by 6 s between runs, so the gain is quoted as a range,
-  one parallel sample so far). It only moves boot time; decode is unchanged, as expected.
+* Seeding is 1.7-2.5x faster (6.5 / 7.4 s vs 12.5 / 18.5 s; the serial arm itself varies by 6 s between runs). It only moves boot time; decode is unchanged, as expected.
 * Output is identical: the serial and parallel stdout differ only in the config path and available-RAM lines; demand loads and per-round
   loads match exactly.
 * Unit tests: tests/test_expert_dram_cache.cpp, 1,017,845 checks, 0 failed, with SEED_PAR=8 and 1.
