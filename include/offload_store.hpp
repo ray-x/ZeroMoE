@@ -20,6 +20,7 @@
 #include "expert_cache.hpp"
 
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -27,8 +28,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <functional>
+#include <condition_variable>
 #include <future>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -455,6 +459,115 @@ public:
     return r;
   }
 
+  // ---- Asynchronous protocol -------------------------------------------------------------------------------------
+  // ensure() above does all of its work (cache bookkeeping AND the slow reads) under the caller's arena lock, so a
+  // background prefetch and a demand miss serialize on I/O. begin()/finish() split it: bookkeeping stays under the lock,
+  // the reads run without it, and an expert another thread is still reading is marked "loading" so nobody computes with
+  // (or evicts) a half-filled slot.
+  struct Plan {
+    Ensure r;
+    std::vector<int> to_load; // misses this call must read
+    std::vector<int> to_wait; // experts another thread is reading that this (demand) call needs
+    int layer = 0;
+  };
+
+  // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
+  Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
+    Plan p;
+    p.layer = layer;
+    for (int i = 0; i < n; ++i) {
+      if (ids[i] < 0) continue;
+      const ExpertKey key{layer, ids[i]};
+      const bool ld = is_loading(key);
+      if (ld && !cache_.resident(key)) { // evicted while a read was in flight: wait for it, then load again
+        if (kind == ExpertCache::Kind::Demand) p.to_wait.push_back(ids[i]);
+        continue;
+      }
+      const ExpertCache::Access a = cache_.access(key, kind);
+      if (a.hit) {
+        if (ld && kind == ExpertCache::Kind::Demand) p.to_wait.push_back(ids[i]);
+        continue;
+      }
+      ++p.r.misses;
+      if (cache_.config().policy == ExpertCache::Policy::Static) { ++p.r.not_cached; continue; }
+      for (const ExpertKey &v : a.victims) {
+        if (!defer_evict_if_loading(v)) arena_.evict(v.layer, v.expert);
+        ++p.r.evictions;
+      }
+      if (!a.inserted) { ++p.r.errors; continue; }
+      mark_loading(key);
+      p.to_load.push_back(ids[i]);
+    }
+    return p;
+  }
+
+  // Phase 2. Call WITHOUT the arena lock. `lock()` must return an RAII holder of the exclusive arena lock; it is taken
+  // only for the short publish step after the reads. Waits for experts other threads are loading and re-loads any of
+  // those that failed or were evicted meanwhile.
+  template <class LockFn>
+  Ensure finish(Plan &p, LockFn &&lock, int depth = 0) {
+    Ensure r = p.r;
+    const auto t0 = std::chrono::steady_clock::now();
+    const std::vector<char> ok = load_many(p.layer, p.to_load);
+    r.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (!p.to_load.empty()) {
+      {
+        auto guard = lock();
+        for (size_t k = 0; k < p.to_load.size(); ++k) {
+          const ExpertKey key{p.layer, p.to_load[k]};
+          if (take_deferred(key)) { arena_.evict(key.layer, key.expert); if (ok[k]) ++r.loads; continue; }
+          if (ok[k]) { arena_.populated(key.layer, key.expert); ++r.loads; }
+          else { cache_.erase(key); arena_.evict(key.layer, key.expert); ++r.errors; }
+        }
+      }
+      {
+        std::lock_guard<std::mutex> g(ld_mu_);
+        for (int e : p.to_load) loading_.erase(kid({p.layer, e}));
+      }
+      ld_cv_.notify_all();
+    }
+    if (!p.to_wait.empty()) {
+      const auto w0 = std::chrono::steady_clock::now();
+      {
+        std::unique_lock<std::mutex> g(ld_mu_);
+        ld_cv_.wait(g, [&] {
+          for (int e : p.to_wait) if (loading_.count(kid({p.layer, e}))) return false;
+          return true;
+        });
+      }
+      waited_.fetch_add(p.to_wait.size(), std::memory_order_relaxed);
+      wait_us_.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - w0).count()), std::memory_order_relaxed);
+      std::vector<int> retry;
+      {
+        auto guard = lock();
+        for (int e : p.to_wait) if (!cache_.resident({p.layer, e})) retry.push_back(e);
+      }
+      if (!retry.empty()) {
+        if (depth >= 3) { r.errors += static_cast<int>(retry.size()); return r; }
+        Plan q;
+        {
+          auto guard = lock();
+          q = begin(p.layer, retry.data(), static_cast<int>(retry.size()), ExpertCache::Kind::Demand);
+        }
+        const Ensure e2 = finish(q, lock, depth + 1);
+        r.misses += e2.misses; r.evictions += e2.evictions; r.loads += e2.loads; r.errors += e2.errors;
+        r.not_cached += e2.not_cached; r.load_ms += e2.load_ms;
+      }
+    }
+    return r;
+  }
+
+  // Demand lookups that found their expert still being read by another thread, and the time spent waiting for them.
+  uint64_t waited_experts() const { return waited_.load(std::memory_order_relaxed); }
+  double wait_ms() const { return static_cast<double>(wait_us_.load(std::memory_order_relaxed)) / 1000.0; }
+  // True when the expert is resident AND its planes hold valid data (not mid-read). Caller holds the arena lock.
+  bool ready(ExpertKey k) const { return cache_.resident(k) && !is_loading(k); }
+  bool is_loading(ExpertKey k) const {
+    std::lock_guard<std::mutex> g(ld_mu_);
+    return loading_.count(kid(k)) != 0;
+  }
+
   // Load several experts of one layer concurrently (the first on the calling thread).
   std::vector<char> load_many(int layer, const std::vector<int> &experts) {
     std::vector<char> ok(experts.size(), 0);
@@ -521,10 +634,28 @@ public:
   }
 
 private:
+  static uint64_t kid(ExpertKey k) { return (static_cast<uint64_t>(static_cast<uint32_t>(k.layer)) << 32) | static_cast<uint32_t>(k.expert); }
+  void mark_loading(ExpertKey k) { std::lock_guard<std::mutex> g(ld_mu_); loading_.insert(kid(k)); }
+  // A victim whose read is still in flight cannot have its pages returned yet; the reader frees the slot when it ends.
+  bool defer_evict_if_loading(ExpertKey k) {
+    std::lock_guard<std::mutex> g(ld_mu_);
+    if (!loading_.count(kid(k))) return false;
+    deferred_.insert(kid(k));
+    return true;
+  }
+  bool take_deferred(ExpertKey k) {
+    std::lock_guard<std::mutex> g(ld_mu_);
+    return deferred_.erase(kid(k)) != 0;
+  }
+
   ExpertCache &cache_;
   VirtualArena &arena_;
   std::vector<ExpertSource *> sources_;
   std::vector<ExpertKey> transient_;
+  mutable std::mutex ld_mu_;          // leaf lock: never held while taking another lock
+  std::condition_variable ld_cv_;
+  std::unordered_set<uint64_t> loading_, deferred_;
+  std::atomic<uint64_t> waited_{0}, wait_us_{0};
 };
 
 } // namespace moestream::offload

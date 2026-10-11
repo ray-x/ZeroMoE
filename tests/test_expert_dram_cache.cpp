@@ -14,6 +14,7 @@
 #include <fstream>
 #include <list>
 #include <map>
+#include <numeric>
 #include <random>
 #include <set>
 #include <sstream>
@@ -375,6 +376,175 @@ static void test_segmented_behaviour() {
       auto r = ref.access(k);
       CHECK(a.hit == b.hit && a.hit == r.hit && a.victim == b.victim && a.evicted == r.evicted);
     }
+  }
+}
+
+
+// ------------------------------------------------------------------------------------------ async begin()/finish()
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
+
+static uint8_t pat(int L, int E, int k, size_t j); // defined with the synthetic GGUF helpers below
+
+// Source with deterministic pattern data. Reads of gated keys block until the test opens the gate, so interleavings
+// between a prefetch and a demand miss are forced, not hoped for.
+struct GateSource : ExpertSource {
+  static constexpr uint64_t kPlane = 4096;
+  std::mutex m;
+  std::condition_variable cv;
+  bool gate_open = true;
+  std::set<std::pair<int, int>> fail_once;
+  std::map<std::pair<int, int>, int> reads;
+  bool contains(int, int) const override { return true; }
+  bool plane_bytes(int, int, uint64_t out[3]) const override { out[0] = out[1] = out[2] = kPlane; return true; }
+  ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
+    {
+      std::unique_lock<std::mutex> l(m);
+      cv.wait(l, [&] { return gate_open; });
+      ++reads[{layer, expert}];
+      if (fail_once.erase({layer, expert})) return ReadStatus::IoError;
+    }
+    for (int k = 0; k < 3; ++k) {
+      uint8_t *d = static_cast<uint8_t *>(dst[k]);
+      for (uint64_t j = 0; j < kPlane; ++j) d[j] = pat(layer, expert, k, j);
+    }
+    return ReadStatus::Ok;
+  }
+  void open() { { std::lock_guard<std::mutex> l(m); gate_open = true; } cv.notify_all(); }
+  void close() { std::lock_guard<std::mutex> l(m); gate_open = false; }
+  int reads_of(int layer, int expert) { std::lock_guard<std::mutex> l(m); return reads[{layer, expert}]; }
+};
+
+static bool slot_valid(VirtualArena &a, int layer, int expert) {
+  for (int k = 0; k < 3; ++k) {
+    const uint8_t *d = static_cast<const uint8_t *>(a.ptr(layer, expert, k));
+    for (uint64_t j = 0; j < GateSource::kPlane; j += 97)
+      if (d[j] != pat(layer, expert, k, j)) return false;
+  }
+  return true;
+}
+
+static void test_async_residency() {
+  const int first = 5, nl = 1, ne = 16;
+  std::vector<std::array<uint64_t, 3>> planes(static_cast<size_t>(nl), {GateSource::kPlane, GateSource::kPlane, GateSource::kPlane});
+  std::shared_mutex arena_mu;
+  auto lock = [&] { return std::unique_lock<std::shared_mutex>(arena_mu); };
+  const auto D = ExpertCache::Kind::Demand, P = ExpertCache::Kind::Prefetch;
+
+  { // single thread: begin()+finish() behaves like ensure()
+    std::mt19937 rng(9);
+    for (int trial = 0; trial < 4; ++trial) {
+      ExpertCache::Config cfg;
+      cfg.first_layer = first; cfg.n_layers = nl; cfg.n_experts = ne; cfg.capacity = 5 + static_cast<size_t>(trial);
+      cfg.policy = trial & 1 ? ExpertCache::Policy::SegmentedLru : ExpertCache::Policy::Lru;
+      ExpertCache c1(cfg), c2(cfg);
+      VirtualArena a1(first, nl, ne, planes), a2(first, nl, ne, planes);
+      GateSource s1, s2;
+      ExpertResidency r1(c1, a1, {&s1}), r2(c2, a2, {&s2});
+      for (int step = 0; step < 300; ++step) {
+        int32_t ids[4];                       // distinct ids: a repeated id that its own call evicts is loaded once by
+        std::vector<int> pool(ne);            // begin()/finish() (waited for) but twice by ensure(), by design
+        std::iota(pool.begin(), pool.end(), 0);
+        std::shuffle(pool.begin(), pool.end(), rng);
+        for (int i = 0; i < 4; ++i) ids[i] = pool[static_cast<size_t>(i)];
+        const auto kind = rng() % 3 == 0 ? P : D;
+        const auto e1 = r1.ensure(first, ids, 4, kind);
+        auto plan = r2.begin(first, ids, 4, kind);
+        const auto e2 = r2.finish(plan, lock);
+        if (!(e1.misses == e2.misses && e1.loads == e2.loads && e1.evictions == e2.evictions && e1.errors == e2.errors))
+          std::fprintf(stderr, "  trial %d step %d kind %d ids %d %d %d %d: ensure m%d l%d e%d err%d | async m%d l%d e%d err%d\n", trial, step,
+                       kind == P, ids[0], ids[1], ids[2], ids[3], e1.misses, e1.loads, e1.evictions, e1.errors, e2.misses, e2.loads,
+                       e2.evictions, e2.errors);
+        CHECK(e1.misses == e2.misses && e1.loads == e2.loads && e1.evictions == e2.evictions && e1.errors == e2.errors);
+        if (step % 25 == 0)
+          for (int e = 0; e < ne; ++e) CHECK(c1.resident({first, e}) == c2.resident({first, e}));
+      }
+      for (int e = 0; e < ne; ++e) if (c2.resident({first, e})) CHECK(slot_valid(a2, first, e));
+    }
+  }
+
+  { // a demand miss on experts a prefetch is still reading waits for it, and nothing is read twice
+    ExpertCache::Config cfg;
+    cfg.first_layer = first; cfg.n_layers = nl; cfg.n_experts = ne; cfg.capacity = 12; cfg.policy = ExpertCache::Policy::SegmentedLru;
+    ExpertCache c(cfg);
+    VirtualArena a(first, nl, ne, planes);
+    GateSource s;
+    ExpertResidency r(c, a, {&s});
+    s.close();
+    const int32_t pre[3] = {1, 2, 3}, dem[3] = {2, 3, 4};
+    ExpertResidency::Plan pa;
+    { auto g = lock(); pa = r.begin(first, pre, 3, P); }
+    CHECK(pa.to_load.size() == 3 && pa.to_wait.empty());
+    ExpertResidency::Ensure ra, rb;
+    std::thread ta([&] { ra = r.finish(pa, lock); });
+    ExpertResidency::Plan pb;
+    { auto g = lock(); pb = r.begin(first, dem, 3, D); }
+    CHECK(pb.to_load.size() == 1 && pb.to_load[0] == 4 && pb.to_wait.size() == 2);
+    {
+      auto g = lock();
+      CHECK(c.resident({first, 2}) && !r.ready({first, 2}) && r.is_loading({first, 3}));
+    }
+    std::thread tb([&] { rb = r.finish(pb, lock); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    s.open();
+    ta.join(); tb.join();
+    CHECK(ra.loads == 3 && rb.loads == 1 && ra.errors == 0 && rb.errors == 0);
+    for (int e = 1; e <= 4; ++e) { CHECK(r.ready({first, e}) && slot_valid(a, first, e) && s.reads_of(first, e) == 1); }
+    CHECK(c.stats().promotions == 2); // experts 2 and 3 were prefetched and then used
+  }
+
+  { // the reader fails: the waiter loads the expert itself, the prefetch reports the error
+    ExpertCache::Config cfg;
+    cfg.first_layer = first; cfg.n_layers = nl; cfg.n_experts = ne; cfg.capacity = 12; cfg.policy = ExpertCache::Policy::Lru;
+    ExpertCache c(cfg);
+    VirtualArena a(first, nl, ne, planes);
+    GateSource s;
+    ExpertResidency r(c, a, {&s});
+    s.close();
+    s.fail_once.insert({first, 2});
+    const int32_t pre[2] = {1, 2}, dem[1] = {2};
+    ExpertResidency::Plan pa, pb;
+    { auto g = lock(); pa = r.begin(first, pre, 2, P); }
+    ExpertResidency::Ensure ra, rb;
+    std::thread ta([&] { ra = r.finish(pa, lock); });
+    { auto g = lock(); pb = r.begin(first, dem, 1, D); }
+    CHECK(pb.to_wait.size() == 1 && pb.to_load.empty());
+    std::thread tb([&] { rb = r.finish(pb, lock); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    s.open();
+    ta.join(); tb.join();
+    CHECK(ra.errors == 1 && rb.errors == 0 && rb.loads == 1);
+    CHECK(r.ready({first, 1}) && r.ready({first, 2}) && slot_valid(a, first, 2) && s.reads_of(first, 2) == 2);
+  }
+
+  { // a victim that is still being read is not evicted under the reader: the slot is freed when the read ends
+    ExpertCache::Config cfg;
+    cfg.first_layer = first; cfg.n_layers = nl; cfg.n_experts = ne; cfg.capacity = 2; cfg.policy = ExpertCache::Policy::Lru;
+    ExpertCache c(cfg);
+    VirtualArena a(first, nl, ne, planes);
+    GateSource s;
+    ExpertResidency r(c, a, {&s});
+    s.close();
+    const int32_t pre[2] = {1, 2}, dem[2] = {3, 4};
+    ExpertResidency::Plan pa, pb;
+    { auto g = lock(); pa = r.begin(first, pre, 2, P); }
+    ExpertResidency::Ensure ra, rb;
+    std::thread ta([&] { ra = r.finish(pa, lock); });
+    { auto g = lock(); pb = r.begin(first, dem, 2, D); } // evicts 1 and 2 from the cache while they are mid-read
+    CHECK(pb.r.evictions == 2 && pb.to_load.size() == 2);
+    // the reads of 3 and 4 are gated too; open and let everything finish
+    std::thread tb([&] { rb = r.finish(pb, lock); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    s.open();
+    ta.join(); tb.join();
+    CHECK(ra.errors == 0 && rb.errors == 0);
+    CHECK(c.resident({first, 3}) && c.resident({first, 4}) && !c.resident({first, 1}) && !c.resident({first, 2}));
+    CHECK(slot_valid(a, first, 3) && slot_valid(a, first, 4));
+    CHECK(a.resident_pages(first, 1) == 0 && a.resident_pages(first, 2) == 0);
   }
 }
 
@@ -803,6 +973,7 @@ int main() {
   test_edge_cases();
   test_segmented_equivalence();
   test_segmented_behaviour();
+  test_async_residency();
   std::fprintf(stderr, "  segmented LRU equivalence + behaviour done\n");
   test_bitmap_all_resident();
   test_ranking(dir);
