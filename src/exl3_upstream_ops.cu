@@ -122,9 +122,11 @@ cudaError_t gemm(Workspace &w, const Exl3CudaMatrixView &m, const float *input,
 
 } // namespace
 
-bool exl3_upstream_active() {
+// Fused exl3_moe_coop routed FFN (two launches per layer). Opt-out for A/B:
+// MOESTREAM_EXL3_MOE_COOP=0 uses one upstream exl3_gemm sequence per expert.
+bool exl3_upstream_moe_coop_enabled() {
   static const bool active = [] {
-    const char *v = std::getenv("MOESTREAM_EXL3_UPSTREAM");
+    const char *v = std::getenv("MOESTREAM_EXL3_MOE_COOP");
     return !v || v[0] != '0';
   }();
   return active;
@@ -335,4 +337,58 @@ cudaError_t exl3_upstream_routed_ffn(
     return cudaErrorInvalidValue;
   }
   return cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// Public EXL3 matmul API (declared in include/exl3_cuda.hpp). `partials`
+// arguments are kept for source compatibility with the previous in-tree
+// kernels and are unused: upstream's launchers manage their own workspace.
+namespace {
+
+bool matrix_ok(const Exl3CudaMatrixView &m) {
+  return m.trellis && m.suh && m.svh && m.input_features > 0 &&
+         m.output_features > 0 && m.input_features % 128 == 0 &&
+         m.output_features % 128 == 0 && m.bits >= 1 && m.bits <= 8;
+}
+
+} // namespace
+
+cudaError_t launch_exl3_mul1_matmul(const Exl3CudaMatrixView &matrix,
+                                    const float *input, float *output, int rows,
+                                    float * /*partials*/, cudaStream_t stream) {
+  if (!matrix_ok(matrix) || !input || !output || rows <= 0 || rows > 65535)
+    return cudaErrorInvalidValue;
+  return exl3_upstream_matmul(matrix, input, output, nullptr, 0.0f, nullptr,
+                              rows, stream);
+}
+
+cudaError_t launch_exl3_mul1_matmul_accumulate(
+    const Exl3CudaMatrixView &matrix, const float *input, float *accumulator,
+    float weight, int rows, float * /*partials*/, cudaStream_t stream) {
+  if (!matrix_ok(matrix) || !input || !accumulator || rows <= 0 || rows > 65535)
+    return cudaErrorInvalidValue;
+  return exl3_upstream_matmul(matrix, input, nullptr, accumulator, weight,
+                              nullptr, rows, stream);
+}
+
+cudaError_t launch_exl3_mul1_matmul_accumulate_device_weight(
+    const Exl3CudaMatrixView &matrix, const float *input, float *accumulator,
+    const float *weight, int rows, float * /*partials*/, cudaStream_t stream) {
+  if (!matrix_ok(matrix) || !input || !accumulator || !weight || rows <= 0 ||
+      rows > 65535)
+    return cudaErrorInvalidValue;
+  return exl3_upstream_matmul(matrix, input, nullptr, accumulator, 0.0f, weight,
+                              rows, stream);
+}
+
+cudaError_t launch_exl3_mul1_gate_up(
+    const Exl3CudaMatrixView &gate, const Exl3CudaMatrixView &up,
+    const float *input, float *activation, int rows, float * /*gate_partials*/,
+    float *up_partials, cudaStream_t stream) {
+  if (!matrix_ok(gate) || !matrix_ok(up) || !input || !activation ||
+      !up_partials || gate.input_features != up.input_features ||
+      gate.output_features != up.output_features || rows <= 0 || rows > 65535)
+    return cudaErrorInvalidValue;
+  return exl3_upstream_gate_up(gate, up, input, activation, rows, up_partials,
+                               stream);
 }

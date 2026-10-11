@@ -16,6 +16,7 @@
 #include "cuda_manager.hpp"
 #include "direct_io.hpp"
 #include "engine.hpp"
+#include "exl3_gpu.hpp"
 #include "exl3_ggml_model.hpp"
 #include "ggml_moe_backend.hpp"
 #include "kquant_dequant.hpp"
@@ -1184,6 +1185,7 @@ struct FullGraph {
   ggml_backend_t cuda = nullptr;
   ggml_backend_t cuda_raw = nullptr;
   ggml_backend_t exl3_cuda_adapter = nullptr;
+  bool exl3_bridge_failed = false;
   ggml_backend_t cpu = nullptr;
   ggml_threadpool_t cpu_threadpool = nullptr;
   int cpu_threads = 0;
@@ -1950,8 +1952,27 @@ struct FullGraph {
 ggml_backend_t full_graph_cuda_scheduler_backend(FullGraph &g) {
   if (!g.engine || !g.engine->exl3_gpu_executor)
     return g.cuda_raw;
-  if (!g.exl3_cuda_adapter)
+  if (!g.exl3_cuda_adapter) {
     g.exl3_cuda_adapter = exl3_ggml_cuda_backend_wrap(g.cuda_raw, false);
+    if (!g.exl3_cuda_adapter &&
+        !g.engine->exl3_ggml_bridge_model_path.empty()) {
+      LOG_ERROR("[EXL3-GGML-BRIDGE] CUDA backend adapter creation failed; "
+                "refusing to fall back to GGUF experts\n");
+      g.exl3_bridge_failed = true;
+    }
+    if (g.exl3_cuda_adapter && g.engine->exl3_ggml_graph_capture &&
+        !exl3_ggml_cuda_backend_set_graph_capture(
+            g.exl3_cuda_adapter, true)) {
+      LOG_ERROR("[EXL3-GGML-BRIDGE] failed to configure CUDA graph capture\n");
+      ggml_backend_free(g.exl3_cuda_adapter);
+      g.exl3_cuda_adapter = nullptr;
+      if (!g.engine->exl3_ggml_bridge_model_path.empty())
+        g.exl3_bridge_failed = true;
+    } else if (g.exl3_cuda_adapter &&
+               g.engine->exl3_ggml_graph_capture) {
+      LOG_INFO("[EXL3-GGML-BRIDGE] segmented CUDA graph capture enabled\n");
+    }
+  }
   return g.exl3_cuda_adapter ? g.exl3_cuda_adapter : g.cuda_raw;
 }
 
@@ -7581,12 +7602,14 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
 
   std::string exl3_bridge_path;
-  if (g.exl3_cuda_adapter &&
+  if (g.exl3_cuda_adapter && g.engine && g.engine->gpu &&
       exl3_ggml_bridge_requested(g, layer, exl3_bridge_path)) {
     auto bridge = std::make_unique<Exl3GgmlBridgeLayer>();
     if (bridge->initialize(exl3_bridge_path, ctx, g.cuda,
                            g.engine->exl3_gpu_executor, layer, c.n_experts,
-                           c.topk, g.S, g.device, true)) {
+                           c.topk, g.S, g.device, true,
+                           g.engine->exl3_cpu_matrix_cache,
+                           &g.engine->gpu->topology, g.engine)) {
       ggml_tensor *bridge_output =
           bridge->build(ctx, cur, ids, weights, g.sched,
                         g.exl3_cuda_adapter);
@@ -7597,10 +7620,17 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         g.exl3_bridge_layers.push_back(std::move(bridge));
         return bridge_output;
       }
+      LOG_ERROR("[EXL3-GGML-BRIDGE] layer=%d custom node construction failed; "
+                "refusing to substitute GGUF expert weights\n",
+                layer);
+      g.exl3_bridge_failed = true;
+      return nullptr;
     }
-    LOG_WARN("[EXL3-GGML-BRIDGE] layer=%d initialization failed; using "
-             "the configured GGML expert path\n",
-             layer);
+    LOG_ERROR("[EXL3-GGML-BRIDGE] layer=%d initialization failed; refusing "
+              "to substitute GGUF expert weights\n",
+              layer);
+    g.exl3_bridge_failed = true;
+    return nullptr;
   }
 
   // Generalized GPU staging for host-resident decode layers (see
@@ -9948,6 +9978,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     }
 
     if (!moe) {
+      if (g.exl3_bridge_failed)
+        return false;
       const auto t_wlookup_start = std::chrono::steady_clock::now();
       SplitExpertWeight ge =
           expert_weight_split(g, g.ctx, l, "ffn_gate_exps.weight");
@@ -9980,6 +10012,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                       fixed_phase2_route_ids,
                       fixed_phase2_route_weights);
     }
+    if (g.exl3_bridge_failed)
+      return false;
     trace_phase2_layer("moe_routed", l, moe);
     if (g.phase2_mode == FullGraph::Phase2Mode::SplitGpu ||
         g.phase2_mode == FullGraph::Phase2Mode::SplitStaged) {
@@ -13633,6 +13667,8 @@ bool qwen4exp_full_graph_decode_run_phase2(StreamingEngine &engine,
     }
     const auto replay_submit_end = std::chrono::steady_clock::now();
     ggml_backend_sched_synchronize(graph.sched);
+    if (graph.engine && graph.engine->exl3_gpu_executor)
+      (void)graph.engine->exl3_gpu_executor->stats();
     const auto replay_end = std::chrono::steady_clock::now();
     submit_ms = std::chrono::duration<double, std::milli>(
                     replay_submit_end - replay_start)
@@ -14987,6 +15023,8 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       return false;
   }
   ggml_backend_sched_synchronize(g.sched);
+  if (g.engine && g.engine->exl3_gpu_executor)
+    (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);
   const auto replay_sync_end = std::chrono::steady_clock::now();
   for (const auto &entry : g.early_ready) {
@@ -15552,6 +15590,8 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return fail("scheduler compute failed");
   }
   ggml_backend_sched_synchronize(g.sched);
+  if (g.engine && g.engine->exl3_gpu_executor)
+    (void)g.engine->exl3_gpu_executor->stats();
   qwen_probe_dump(g);
   const auto t_sync_end = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
@@ -16007,6 +16047,8 @@ bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine, int pos_base,
       GGML_STATUS_SUCCESS)
     return false;
   ggml_backend_sched_synchronize(g->sched);
+  if (g->engine && g->engine->exl3_gpu_executor)
+    (void)g->engine->exl3_gpu_executor->stats();
   if (g->layer0_diag_enabled)
     dump_layer0_diag_values(*g);
   if (env_alllayers_dump_path())

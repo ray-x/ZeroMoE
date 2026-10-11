@@ -987,8 +987,7 @@ void Exl3GpuExecutor::routed_ffn_device_external(
 
   const auto enqueue_sequence = [&] {
 #ifdef MOESTREAM_EXL3_UPSTREAM
-    if (&exl3_upstream_active && exl3_upstream_active() &&
-        &exl3_upstream_routed_ffn) {
+    if (exl3_upstream_moe_coop_enabled()) {
       std::vector<const Exl3CudaMatrixView *> gates(route_count),
           ups(route_count), downs(route_count);
       for (size_t route = 0; route < route_count; ++route) {

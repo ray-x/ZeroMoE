@@ -8,7 +8,7 @@ find_package(CUDAToolkit REQUIRED)
 include("${MOESTREAM_REPO_DIR}/cmake/MoEStreamExl3Upstream.cmake")
 add_executable(exl3_upstream_parity
     ../exl3_upstream_parity.cu
-    ../../cuda/exl3_matmul.cu)
+    ../exl3_reference_matmul.cu)
 target_include_directories(exl3_upstream_parity PRIVATE
     "${MOESTREAM_REPO_DIR}/include" "${MOESTREAM_EXLLAMAV3_SRC}")
 target_link_libraries(exl3_upstream_parity PRIVATE moestream_exl3_upstream CUDA::cudart)

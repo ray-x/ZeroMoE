@@ -25,6 +25,8 @@ static std::vector<uint16_t> rand_half(std::mt19937 &g, size_t n, bool signs) {
   return v;
 }
 
+// Bound: fp16 activations give ~5e-4 relative RMS; upstream's default int8
+// activation GEMV (one row, K <= 5 on Ampere, EXL3_INT8_GEMV=0 disables) ~7e-3.
 int run(int bits, int k, int n, int rows) {
   std::mt19937 g(1234 + bits * 31 + rows);
   const size_t trellis_words = static_cast<size_t>(k) / 16 * (n / 16) * 16 * bits;
@@ -81,10 +83,10 @@ int run(int bits, int k, int n, int rows) {
   }
   const double rel = std::sqrt(num / (den > 0 ? den : 1));
   std::printf("bits=%d k=%d n=%d rows=%d shape=%d rel_rms=%.3e max_abs=%.3e %s\n",
-              bits, k, n, rows, shape, rel, maxabs, rel < 5e-3 ? "OK" : "MISMATCH");
+              bits, k, n, rows, shape, rel, maxabs, rel < 1e-2 ? "OK" : "MISMATCH");
   cudaFree(d_tr); cudaFree(d_suh); cudaFree(d_svh); cudaFree(d_in); cudaFree(d_in_h);
   cudaFree(d_had); cudaFree(d_out_old); cudaFree(d_out_new); cudaFree(d_part);
-  return rel < 5e-3 ? 0 : 1;
+  return rel < 1e-2 ? 0 : 1;
 }
 
 int main() {
