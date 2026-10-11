@@ -20,6 +20,7 @@
 #include "expert_cache.hpp"
 
 #include <array>
+#include <filesystem>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -225,15 +226,78 @@ public:
       slabs_[key] = s;
     }
     if (h.offload_layer.size() != h.offload_expert.size() || h.offload_layer.size() != slabs_.size()) return fail("index/tensor count mismatch");
-    fd_buf_ = ::open(path.c_str(), O_RDONLY);
-    if (fd_buf_ < 0) return fail("cannot open for reading");
-    if (try_direct) fd_dir_ = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    const int fb = ::open(path.c_str(), O_RDONLY);
+    if (fb < 0) return fail("cannot open for reading");
+    fds_buf_.push_back(fb);
+    fds_dir_.push_back(try_direct ? ::open(path.c_str(), O_RDONLY | O_DIRECT) : -1);
     return true;
+  }
+
+  // Embedded mode: the tight per-expert blocks (offload.blk.<L>.ffn_<k>.<E>.weight) that `gguf_tool pack --expert-interleave`
+  // writes INTO the model shards, next to the normal tensors. Every shard is scanned; tensors that are not offload.* are ignored.
+  // An expert whose three planes are not all present in one shard is an error (the tool never splits a layer across shards).
+  bool open_embedded(const std::vector<std::string> &paths, std::string *err = nullptr, bool try_direct = true) {
+    close_fds();
+    slabs_.clear();
+    auto fail = [&](const std::string &m) { close_fds(); slabs_.clear(); if (err) *err = m; return false; };
+    for (size_t f = 0; f < paths.size(); ++f) {
+      GgufHeader h;
+      if (!read_gguf_header(paths[f], h, err)) return fail(err && !err->empty() ? *err : "cannot read " + paths[f]);
+      if (f == 0 || h.alignment > align_) align_ = f == 0 ? h.alignment : std::max(align_, h.alignment);
+      struct Part { uint64_t off[3] = {0, 0, 0}, bytes[3] = {0, 0, 0}; int seen = 0; };
+      std::unordered_map<uint64_t, Part> parts;
+      for (const GgufTensorInfo &t : h.tensors) {
+        int L = 0, E = 0;
+        char kind[8] = {0};
+        if (t.name.rfind("offload.blk.", 0) != 0) continue;
+        if (std::sscanf(t.name.c_str(), "offload.blk.%d.ffn_%7[a-z].%d.weight", &L, kind, &E) != 3) continue;
+        const int k = !std::strcmp(kind, "gate") ? 0 : !std::strcmp(kind, "up") ? 1 : !std::strcmp(kind, "down") ? 2 : -1;
+        if (k < 0 || t.dims.size() < 2) return fail("bad tensor " + t.name + " in " + paths[f]);
+        const uint64_t bytes = ggml_row_bytes(t.type, t.dims[0]) * t.dims[1];
+        if (bytes == 0) return fail("unknown quant type in " + t.name);
+        Part &p = parts[detail::key(L, E)];
+        p.off[k] = h.data_start + t.offset;
+        p.bytes[k] = bytes;
+        p.seen |= 1 << k;
+      }
+      if (parts.empty()) continue;
+      const int fb = ::open(paths[f].c_str(), O_RDONLY);
+      if (fb < 0) return fail("cannot open " + paths[f]);
+      fds_buf_.push_back(fb);
+      fds_dir_.push_back(try_direct ? ::open(paths[f].c_str(), O_RDONLY | O_DIRECT) : -1);
+      const int file = static_cast<int>(fds_buf_.size()) - 1;
+      for (auto &[key, p] : parts) {
+        if (p.seen != 7) return fail("an expert is missing a projection in " + paths[f]);
+        Slab s;
+        for (int k = 0; k < 3; ++k) { s.off[k] = p.off[k]; s.bytes[k] = p.bytes[k]; }
+        s.tight = p.off[1] == p.off[0] + p.bytes[0] && p.off[2] == p.off[1] + p.bytes[1];
+        s.file = file;
+        slabs_[key] = s;
+      }
+    }
+    if (slabs_.empty()) return fail("no offload.* expert blocks in the given files");
+    return true;
+  }
+
+  // Open either a stand-alone store (architecture moestream-offload) or the shards of a model that embeds the blocks. `path` may be a
+  // file or a directory of shards.
+  bool open_auto(const std::string &path, std::string *err = nullptr, bool try_direct = true) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+      std::vector<std::string> files;
+      for (const auto &e : std::filesystem::directory_iterator(path))
+        if (e.is_regular_file() && e.path().extension() == ".gguf") files.push_back(e.path().string());
+      std::sort(files.begin(), files.end());
+      return open_embedded(files, err, try_direct);
+    }
+    GgufHeader h;
+    if (read_gguf_header(path, h, nullptr) && h.architecture == "moestream-offload") return open(path, err, try_direct);
+    return open_embedded({path}, err, try_direct);
   }
 
   size_t size() const { return slabs_.size(); }
   uint32_t alignment() const { return align_; }
-  bool direct() const { return fd_dir_ >= 0; }
+  bool direct() const { return !fds_dir_.empty() && fds_dir_[0] >= 0; }
   std::vector<ExpertKey> keys() const {
     std::vector<ExpertKey> out;
     out.reserve(slabs_.size());
@@ -256,16 +320,17 @@ public:
     auto it = slabs_.find(detail::key(layer, expert));
     if (it == slabs_.end()) return ReadStatus::NotFound;
     const Slab &s = it->second;
-    bool fast = fd_dir_ >= 0 && s.tight && s.off[0] % align_ == 0;
+    const int fd_dir = fds_dir_[static_cast<size_t>(s.file)], fd_buf = fds_buf_[static_cast<size_t>(s.file)];
+    bool fast = fd_dir >= 0 && s.tight && s.off[0] % align_ == 0;
     for (int k = 0; k < 3 && fast; ++k)
       if (reinterpret_cast<uintptr_t>(dst[k]) % align_ != 0 || s.bytes[k] % align_ != 0) fast = false;
     if (fast) {
       struct iovec iov[3] = {{dst[0], static_cast<size_t>(s.bytes[0])}, {dst[1], static_cast<size_t>(s.bytes[1])}, {dst[2], static_cast<size_t>(s.bytes[2])}};
-      if (detail::preadv_all(fd_dir_, iov, 3, static_cast<off_t>(s.off[0]))) { ++direct_reads_; return ReadStatus::Ok; }
+      if (detail::preadv_all(fd_dir, iov, 3, static_cast<off_t>(s.off[0]))) { ++direct_reads_; return ReadStatus::Ok; }
       // fall through to the buffered path (O_DIRECT can refuse on some filesystems)
     }
     for (int k = 0; k < 3; ++k) // each plane at its own offset: a store need not be tight
-      if (!detail::pread_all(fd_buf_, dst[k], static_cast<size_t>(s.bytes[k]), static_cast<off_t>(s.off[k]))) return ReadStatus::IoError;
+      if (!detail::pread_all(fd_buf, dst[k], static_cast<size_t>(s.bytes[k]), static_cast<off_t>(s.off[k]))) return ReadStatus::IoError;
     ++buffered_reads_;
     return ReadStatus::Ok;
   }
@@ -274,15 +339,17 @@ private:
   struct Slab {
     uint64_t off[3] = {0, 0, 0}, bytes[3] = {0, 0, 0}; // absolute file offset and size of each plane
     bool tight = false;                                 // planes back to back: one preadv can fetch the whole expert
+    int file = 0;                                       // index into fds_dir_/fds_buf_ (embedded mode spans several shards)
   };
   void close_fds() {
-    if (fd_dir_ >= 0) ::close(fd_dir_);
-    if (fd_buf_ >= 0) ::close(fd_buf_);
-    fd_dir_ = fd_buf_ = -1;
+    for (int fd : fds_dir_) if (fd >= 0) ::close(fd);
+    for (int fd : fds_buf_) if (fd >= 0) ::close(fd);
+    fds_dir_.clear();
+    fds_buf_.clear();
   }
   std::unordered_map<uint64_t, Slab> slabs_;
   uint32_t align_ = 4096;
-  int fd_dir_ = -1, fd_buf_ = -1;
+  std::vector<int> fds_dir_, fds_buf_;
   uint64_t direct_reads_ = 0, buffered_reads_ = 0;
 };
 

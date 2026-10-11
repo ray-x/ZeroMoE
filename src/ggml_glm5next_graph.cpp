@@ -795,7 +795,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
   std::vector<moestream::offload::ExpertSource *> sources;
   const std::string store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
   if (!store_path.empty()) {
-    if (o->store.open(store_path, &err))
+    if (o->store.open_auto(store_path, &err))
       sources.push_back(&o->store);
     else
       LOG_WARN("[GGML-GLM5NEXT-OFFLOAD] store %s unusable (%s); model only\n",
