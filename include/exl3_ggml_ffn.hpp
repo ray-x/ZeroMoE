@@ -4,12 +4,14 @@
 
 #include "exl3_format.hpp"
 #include "exl3_ggml_backend.hpp"
+#include "exl3_gpu.hpp"
 
 #include "ggml.h"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <vector>
@@ -126,20 +128,37 @@ ggml_tensor *exl3_ggml_map_dynamic_routed_ffn(
     ggml_context *ctx, ggml_tensor *input, ggml_tensor *opaque,
     ggml_tensor *route_table, Exl3GgmlRoutedFfnState *state);
 
-class Exl3GpuExecutor;
-
 struct Exl3GgmlCachedRoutedFfnState {
+  using ExternalExpertResolver = std::function<Exl3GpuExternalExpert(
+      const std::string &, int, int, int,
+      const std::function<std::vector<uint8_t>(const std::string &)> &)>;
+
   Exl3GgmlCustomNode custom;
   Exl3GpuExecutor *gpu_executor = nullptr;
   std::vector<std::string> expert_prefixes_by_id;
   std::function<std::vector<uint8_t>(const std::string &)> matrix_loader;
-  std::vector<int32_t> route_ids_host;
-  std::vector<float> route_weights_host;
+  ExternalExpertResolver external_expert_resolver;
+  std::vector<Exl3GpuExternalExpert> external_experts;
+  void *route_host_storage = nullptr;
+  int32_t *route_ids_host = nullptr;
+  float *route_weights_host = nullptr;
   bool routes_from_host = false;
+  bool route_tensors_on_device = false;
+  bool verify_cpu_reference = false;
+  int model_layer = -1;
+  size_t external_matrix_slot_capacity = 0;
+  uint64_t route_readback_calls = 0;
+  size_t route_readback_bytes = 0;
+  double route_readback_ms = 0.0;
+  double expert_resolution_ms = 0.0;
+  double ffn_enqueue_ms = 0.0;
+  double row_batch_wait_ms = 0.0;
   int rows = 0;
   int topk = 0;
   int hidden = 0;
   int intermediate = 0;
+
+  ~Exl3GgmlCachedRoutedFfnState();
 
   bool initialize(
       Exl3GpuExecutor *executor,
@@ -148,6 +167,7 @@ struct Exl3GgmlCachedRoutedFfnState {
       int matrix_intermediate);
   void set_matrix_loader(
       std::function<std::vector<uint8_t>(const std::string &)> loader);
+  void set_external_expert_resolver(ExternalExpertResolver resolver);
   bool set_host_routes(const int32_t *route_ids, const float *route_weights);
   static void compute(ggml_backend_t cuda_backend, ggml_tensor *node,
                       void *user_data);
@@ -157,6 +177,9 @@ ggml_tensor *exl3_ggml_map_cached_routed_ffn(
     ggml_context *ctx, ggml_tensor *input, ggml_tensor *route_table,
     Exl3GgmlCachedRoutedFfnState *state);
 ggml_tensor *exl3_ggml_map_cached_routed_ffn_host_routes(
+    ggml_context *ctx, ggml_tensor *input, ggml_tensor *route_ids,
+    ggml_tensor *route_weights, Exl3GgmlCachedRoutedFfnState *state);
+ggml_tensor *exl3_ggml_map_cached_routed_ffn_device_routes(
     ggml_context *ctx, ggml_tensor *input, ggml_tensor *route_ids,
     ggml_tensor *route_weights, Exl3GgmlCachedRoutedFfnState *state);
 

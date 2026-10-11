@@ -1548,7 +1548,7 @@ ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,
 
     // Same VRAM->RAM salvage as upload_expert() -- must run before the
     // device-to-device copy below overwrites this slot's outgoing data.
-    if (on_vram_evict && old_layer != -1) {
+    if (on_vram_evict && old_layer != -1 && old_expert >= 0) {
         on_vram_evict(old_layer, old_expert, slot->device_ptr, slot->size, slot->gpu_id);
     }
 

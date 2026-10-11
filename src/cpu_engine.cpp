@@ -759,12 +759,15 @@ bool CPUEngine::exl3_routed_ffn_batch(int layer, const int *experts,
                         << executor->device() << "\n";
   }
   if (found_graph != graphs.end() &&
-      found_graph->second->run(layer, experts, weights, input, output, load))
-      return true;
+      found_graph->second->run(layer, experts, weights, input, output, load)) {
+    ++exl3_ggml_custom_ffns;
+    return true;
+  }
   LOG_STREAM_WARN() << "[EXL3-GGML-FFN] custom-op graph unavailable for rows="
                     << rows << "; using native routed FFN\n";
 #endif
 
+  ++exl3_native_gpu_fallback_ffns;
   std::vector<std::string> prefixes(static_cast<size_t>(topk));
   for (int route = 0; route < topk; ++route) {
     prefixes[static_cast<size_t>(route)] =

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <cuda_runtime_api.h>
+#include "exl3_cuda.hpp"
 
 struct Exl3GpuStats {
   uint64_t matmuls = 0;
@@ -21,6 +22,9 @@ struct Exl3GpuStats {
   double routed_ffn_seconds = 0.0;
   double upload_seconds = 0.0;
   uint64_t routed_ffns = 0;
+  uint64_t routed_graph_captures = 0;
+  uint64_t routed_graph_replays = 0;
+  uint64_t routed_graph_eager_fallbacks = 0;
   uint64_t buffer_reuses = 0;
   uint64_t hc_mixes = 0;
 };
@@ -30,6 +34,13 @@ struct Exl3GpuF32Weight {
   const float *values = nullptr;
   int input_features = 0;
   int output_features = 0;
+};
+
+struct Exl3GpuExternalExpert {
+  Exl3CudaMatrixView gate;
+  Exl3CudaMatrixView up;
+  Exl3CudaMatrixView down;
+  std::shared_ptr<void> hold;
 };
 
 class Exl3GpuExecutor {
@@ -69,7 +80,14 @@ public:
       const float *device_input, float *device_output, int rows, int topk,
       int hidden, int intermediate, cudaStream_t stream,
       bool require_cache_hit,
-      const std::function<std::vector<uint8_t>(const std::string &)> &load);
+      const std::function<std::vector<uint8_t>(const std::string &)> &load,
+      const float *device_routing_weights = nullptr);
+  void routed_ffn_device_external(
+      const Exl3GpuExternalExpert *experts_by_route,
+      const float *routing_weights, const float *device_routing_weights,
+      const float *device_input, float *device_output, int rows, int topk,
+      int hidden, int intermediate, cudaStream_t stream);
+  void set_routed_graph_capture(bool enabled);
   void prepare_routed_cache(
       const std::vector<std::string> &expert_prefixes_by_id,
       const int32_t *route_ids, int count, int hidden, int intermediate,

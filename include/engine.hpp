@@ -42,6 +42,7 @@ static inline int posix_fadvise(int, off_t, off_t, int) { return 0; }
 class CudaManager;  // forward decl — defined in cuda_manager.hpp; engine holds a pointer
 class StreamingEngine;
 class Exl3GpuExecutor;
+class Exl3CpuMatrixCache;
 
 // GLM5NEXT KDA's production CUDA state is owned by CudaManager, but prompt
 // cache save/restore is owned by the generation loop. These narrow bridges
@@ -465,7 +466,10 @@ public:
     std::string exl3_ggml_bridge_model_path;
     int exl3_ggml_bridge_layer = -1;
     std::vector<int> exl3_ggml_bridge_layers;
+    bool exl3_ggml_graph_capture = false;
+    bool exl3_ggml_routed_graph_capture = false;
     std::shared_ptr<Exl3GpuExecutor> exl3_gpu_executor_owner;
+    std::shared_ptr<Exl3CpuMatrixCache> exl3_cpu_matrix_cache;
     Exl3GpuExecutor *exl3_gpu_executor = nullptr;
 
     // Option B: static hot/cold expert split. The full graph places each

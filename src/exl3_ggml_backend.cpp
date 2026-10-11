@@ -8,9 +8,11 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
+#include <vector>
 
 extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
@@ -18,12 +20,28 @@ extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
 namespace {
 
 struct Adapter {
+  struct CapturedSegment {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+  };
+  struct TensorSignature {
+    const ggml_tensor *node = nullptr;
+    const void *data = nullptr;
+    ggml_op op = GGML_OP_NONE;
+    ggml_type type = GGML_TYPE_F32;
+    std::array<int64_t, GGML_MAX_DIMS> ne{};
+    std::array<size_t, GGML_MAX_DIMS> nb{};
+    std::array<const ggml_tensor *, GGML_MAX_SRC> sources{};
+    std::array<const void *, GGML_MAX_SRC> source_data{};
+  };
+
   ggml_backend backend{};
   ggml_backend_t cuda_backend = nullptr;
   bool take_ownership = false;
   bool graph_capture_enabled = false;
-  cudaGraph_t graph = nullptr;
-  cudaGraphExec_t graph_exec = nullptr;
+  bool graph_captured = false;
+  std::vector<CapturedSegment> captured_segments;
+  std::vector<TensorSignature> captured_signature;
 };
 
 const char *adapter_name(ggml_backend_t) { return "EXL3-CUDA-ADAPTER"; }
@@ -35,10 +53,12 @@ ggml_backend_t inner_backend(ggml_backend_t backend) {
 
 void adapter_free(ggml_backend_t backend) {
   auto *adapter = static_cast<Adapter *>(backend->context);
-  if (adapter->graph_exec)
-    cudaGraphExecDestroy(adapter->graph_exec);
-  if (adapter->graph)
-    cudaGraphDestroy(adapter->graph);
+  for (const auto &segment : adapter->captured_segments) {
+    if (segment.executable)
+      cudaGraphExecDestroy(segment.executable);
+    if (segment.graph)
+      cudaGraphDestroy(segment.graph);
+  }
   if (adapter->take_ownership)
     ggml_backend_free(adapter->cuda_backend);
   delete adapter;
@@ -178,55 +198,175 @@ enum ggml_status adapter_graph_compute_eager(ggml_backend_t backend,
   return GGML_STATUS_SUCCESS;
 }
 
+enum ggml_status run_exl3_custom(ggml_backend_t cuda_backend,
+                                 ggml_tensor *node) {
+  auto *custom = static_cast<Exl3GgmlCustomNode *>(node->extra);
+  try {
+    custom->compute(cuda_backend, node, custom->user_data);
+  } catch (const std::exception &error) {
+    std::fprintf(stderr, "[EXL3-GGML] custom op failed: %s\n", error.what());
+    return GGML_STATUS_FAILED;
+  } catch (...) {
+    std::fprintf(stderr, "[EXL3-GGML] custom op failed: unknown error\n");
+    return GGML_STATUS_FAILED;
+  }
+  return GGML_STATUS_SUCCESS;
+}
+
+bool graph_signature_matches(const Adapter *adapter,
+                             const ggml_cgraph *graph) {
+  if (!adapter->graph_captured ||
+      adapter->captured_signature.size() !=
+          static_cast<size_t>(graph->n_nodes))
+    return false;
+  for (int index = 0; index < graph->n_nodes; ++index) {
+    const auto *node = graph->nodes[index];
+    const auto &signature =
+        adapter->captured_signature[static_cast<size_t>(index)];
+    if (signature.node != node || signature.data != node->data ||
+        signature.op != node->op || signature.type != node->type)
+      return false;
+    for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension)
+      if (signature.ne[static_cast<size_t>(dimension)] != node->ne[dimension] ||
+          signature.nb[static_cast<size_t>(dimension)] != node->nb[dimension])
+        return false;
+    for (int source = 0; source < GGML_MAX_SRC; ++source) {
+      const ggml_tensor *source_node = node->src[source];
+      if (signature.sources[static_cast<size_t>(source)] != source_node ||
+          signature.source_data[static_cast<size_t>(source)] !=
+              (source_node ? source_node->data : nullptr))
+        return false;
+    }
+  }
+  return true;
+}
+
+Adapter::TensorSignature tensor_signature(const ggml_tensor *node) {
+  Adapter::TensorSignature signature;
+  signature.node = node;
+  signature.data = node->data;
+  signature.op = node->op;
+  signature.type = node->type;
+  for (int dimension = 0; dimension < GGML_MAX_DIMS; ++dimension) {
+    signature.ne[static_cast<size_t>(dimension)] = node->ne[dimension];
+    signature.nb[static_cast<size_t>(dimension)] = node->nb[dimension];
+  }
+  for (int source = 0; source < GGML_MAX_SRC; ++source) {
+    const ggml_tensor *source_node = node->src[source];
+    signature.sources[static_cast<size_t>(source)] = source_node;
+    signature.source_data[static_cast<size_t>(source)] =
+        source_node ? source_node->data : nullptr;
+  }
+  return signature;
+}
+
+enum ggml_status run_captured_segment(ggml_backend_t backend,
+                                      ggml_cgraph *graph, int begin, int end,
+                                      size_t segment_index, bool capture) {
+  auto *adapter = static_cast<Adapter *>(backend->context);
+  if (begin == end) {
+    if (capture)
+      adapter->captured_segments.emplace_back();
+    return GGML_STATUS_SUCCESS;
+  }
+  const cudaStream_t stream =
+      moestream_ggml_backend_cuda_get_stream(adapter->cuda_backend);
+  if (!stream)
+    return GGML_STATUS_FAILED;
+  if (!capture) {
+    if (segment_index >= adapter->captured_segments.size())
+      return GGML_STATUS_FAILED;
+    const cudaGraphExec_t executable =
+        adapter->captured_segments[segment_index].executable;
+    return executable && cudaGraphLaunch(executable, stream) == cudaSuccess
+               ? GGML_STATUS_SUCCESS
+               : GGML_STATUS_FAILED;
+  }
+
+  ggml_cgraph view = ggml_graph_view(graph, begin, end);
+  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) !=
+      cudaSuccess)
+    return GGML_STATUS_FAILED;
+  const enum ggml_status compute_status =
+      adapter_graph_compute_eager(backend, &view);
+  cudaGraph_t captured_graph = nullptr;
+  const cudaError_t end_status = cudaStreamEndCapture(stream, &captured_graph);
+  if (compute_status != GGML_STATUS_SUCCESS || end_status != cudaSuccess ||
+      !captured_graph) {
+    if (captured_graph)
+      cudaGraphDestroy(captured_graph);
+    return GGML_STATUS_FAILED;
+  }
+  cudaGraphExec_t executable = nullptr;
+  const cudaError_t instantiate_status =
+      cudaGraphInstantiate(&executable, captured_graph, nullptr, nullptr, 0);
+  if (instantiate_status != cudaSuccess) {
+    cudaGraphDestroy(captured_graph);
+    return GGML_STATUS_FAILED;
+  }
+  adapter->captured_segments.push_back({captured_graph, executable});
+  return cudaGraphLaunch(executable, stream) == cudaSuccess
+             ? GGML_STATUS_SUCCESS
+             : GGML_STATUS_FAILED;
+}
+
 enum ggml_status adapter_graph_compute(ggml_backend_t backend,
                                        ggml_cgraph *graph) {
   auto *adapter = static_cast<Adapter *>(backend->context);
   if (!adapter->graph_capture_enabled)
     return adapter_graph_compute_eager(backend, graph);
 
-  for (int index = 0; index < graph->n_nodes; ++index) {
-    if (is_exl3_custom(graph->nodes[index]) &&
-        !static_cast<const Exl3GgmlCustomNode *>(graph->nodes[index]->extra)
-             ->graph_capture_safe) {
-      adapter->graph_capture_enabled = false;
+  if (adapter->graph_captured && !graph_signature_matches(adapter, graph))
+    exl3_ggml_cuda_backend_reset_graph(backend);
+
+  const bool capture = !adapter->graph_captured;
+  const bool signature_matches = graph_signature_matches(adapter, graph);
+  if (!capture && !signature_matches)
+    return GGML_STATUS_FAILED;
+
+  if (capture)
+    adapter->captured_segments.clear();
+  const auto fail = [&](enum ggml_status status) {
+    if (capture)
       exl3_ggml_cuda_backend_reset_graph(backend);
-      std::fprintf(stderr,
-                   "[EXL3-GGML] graph capture disabled for a dynamic custom "
-                   "node; using eager dispatch\n");
-      return adapter_graph_compute_eager(backend, graph);
-    }
-  }
+    return status;
+  };
 
-  const cudaStream_t stream =
-      moestream_ggml_backend_cuda_get_stream(adapter->cuda_backend);
-  if (!stream)
-    return GGML_STATUS_FAILED;
-  if (adapter->graph_exec)
-    return cudaGraphLaunch(adapter->graph_exec, stream) == cudaSuccess
-               ? GGML_STATUS_SUCCESS
-               : GGML_STATUS_FAILED;
+  size_t segment_index = 0;
+  int segment_begin = 0;
+  for (int index = 0; index < graph->n_nodes; ++index) {
+    if (!is_exl3_custom(graph->nodes[index]) ||
+        static_cast<const Exl3GgmlCustomNode *>(graph->nodes[index]->extra)
+            ->graph_capture_safe)
+      continue;
+    const enum ggml_status segment_status = run_captured_segment(
+        backend, graph, segment_begin, index, segment_index++, capture);
+    if (segment_status != GGML_STATUS_SUCCESS)
+      return fail(segment_status);
+    const enum ggml_status custom_status =
+        run_exl3_custom(adapter->cuda_backend, graph->nodes[index]);
+    if (custom_status != GGML_STATUS_SUCCESS)
+      return fail(custom_status);
+    segment_begin = index + 1;
+  }
+  const enum ggml_status final_status = run_captured_segment(
+      backend, graph, segment_begin, graph->n_nodes, segment_index, capture);
+  if (final_status != GGML_STATUS_SUCCESS)
+    return fail(final_status);
 
-  if (cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) !=
-      cudaSuccess)
-    return GGML_STATUS_FAILED;
-  const enum ggml_status status = adapter_graph_compute_eager(backend, graph);
-  cudaGraph_t cuda_graph = nullptr;
-  const cudaError_t end_status = cudaStreamEndCapture(stream, &cuda_graph);
-  if (status != GGML_STATUS_SUCCESS || end_status != cudaSuccess ||
-      !cuda_graph) {
-    if (cuda_graph)
-      cudaGraphDestroy(cuda_graph);
-    return GGML_STATUS_FAILED;
+  if (capture) {
+    adapter->captured_signature.clear();
+    adapter->captured_signature.reserve(static_cast<size_t>(graph->n_nodes));
+    for (int index = 0; index < graph->n_nodes; ++index)
+      adapter->captured_signature.push_back(
+          tensor_signature(graph->nodes[index]));
+    adapter->graph_captured = true;
+    std::fprintf(stderr,
+                 "[EXL3-GGML] captured %zu static graph segments around "
+                 "%zu eager custom callbacks (%d graph nodes)\n",
+                 adapter->captured_segments.size(), segment_index,
+                 graph->n_nodes);
   }
-  cudaGraphExec_t executable = nullptr;
-  const cudaError_t instantiate_status =
-      cudaGraphInstantiate(&executable, cuda_graph, nullptr, nullptr, 0);
-  if (instantiate_status != cudaSuccess) {
-    cudaGraphDestroy(cuda_graph);
-    return GGML_STATUS_FAILED;
-  }
-  adapter->graph = cuda_graph;
-  adapter->graph_exec = executable;
   return GGML_STATUS_SUCCESS;
 }
 
@@ -281,14 +421,15 @@ void exl3_ggml_cuda_backend_reset_graph(ggml_backend_t backend) {
     return;
   auto *adapter = static_cast<Adapter *>(backend->context);
   ggml_backend_synchronize(adapter->cuda_backend);
-  if (adapter->graph_exec) {
-    cudaGraphExecDestroy(adapter->graph_exec);
-    adapter->graph_exec = nullptr;
+  for (const auto &segment : adapter->captured_segments) {
+    if (segment.executable)
+      cudaGraphExecDestroy(segment.executable);
+    if (segment.graph)
+      cudaGraphDestroy(segment.graph);
   }
-  if (adapter->graph) {
-    cudaGraphDestroy(adapter->graph);
-    adapter->graph = nullptr;
-  }
+  adapter->captured_segments.clear();
+  adapter->captured_signature.clear();
+  adapter->graph_captured = false;
 }
 
 ggml_tensor *exl3_ggml_map_custom2(ggml_context *ctx, ggml_tensor *input,

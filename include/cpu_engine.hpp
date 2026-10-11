@@ -224,6 +224,8 @@ struct CPUEngine {
   uint64_t exl3_cpu_matmuls = 0;
   double exl3_cpu_matmul_seconds = 0.0;
   double exl3_cpu_weight_load_seconds = 0.0;
+  uint64_t exl3_ggml_custom_ffns = 0;
+  uint64_t exl3_native_gpu_fallback_ffns = 0;
 
   // Qwen4Exp recurrent/HC state. These are allocated lazily by the CPU
   // backend so non-Qwen models pay no memory cost.

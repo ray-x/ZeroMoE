@@ -195,6 +195,138 @@ __global__ void rotated_matmul_staged(const uint16_t *trellis,
   }
 }
 
+template <int GateBits, int UpBits>
+__global__ void gate_up_rotated_matmul_fused(
+    Exl3CudaMatrixView gate, Exl3CudaMatrixView up, const float *input,
+    float *gate_partials, float *up_partials, int rows) {
+  constexpr int kGateVectorsPerTile = 2 * GateBits;
+  constexpr int kUpVectorsPerTile = 2 * UpBits;
+  __shared__ uint4 gate_packed_tiles[kKeyTilesPerSplit * kGateVectorsPerTile];
+  __shared__ uint4 up_packed_tiles[kKeyTilesPerSplit * kUpVectorsPerTile];
+  __shared__ float gate_transformed_input[kKeyTilesPerSplit * 16];
+  __shared__ float up_transformed_input[kKeyTilesPerSplit * 16];
+  __shared__ float gate_hadamard_scratch[256];
+  __shared__ float up_hadamard_scratch[256];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x / 32;
+  const int native_thread = threadIdx.x / 8;
+  const int component = threadIdx.x % 8;
+  const int input_row = (native_thread % 4) * 2 + (component % 2) +
+                        ((component % 4) >= 2 ? 8 : 0);
+  const int output_column = warp + (component >= 4 ? 8 : 0);
+  const int output_tiles = gate.output_features / 16;
+  const int first_key_tile = blockIdx.y * kKeyTilesPerSplit;
+  const int last_key_tile = min(first_key_tile + kKeyTilesPerSplit,
+                                gate.input_features / 16);
+  const int key_tile_count = last_key_tile - first_key_tile;
+  const int input_groups = key_tile_count / 8;
+  const int waves = (input_groups + 1) / 2;
+  const float *input_row_data =
+      input + static_cast<size_t>(blockIdx.z) * gate.input_features;
+
+  for (int wave = 0; wave < waves; ++wave) {
+    const int part = threadIdx.x / 128;
+    const int element = threadIdx.x & 127;
+    const int group = wave * 2 + part;
+    float gate_value = 0.0f;
+    float up_value = 0.0f;
+    if (group < input_groups) {
+      const int index = first_key_tile * 16 + group * 128 + element;
+      const float input_value = input_row_data[index];
+      gate_value = input_value *
+                   __half2float(__ushort_as_half(gate.suh[index]));
+      up_value = input_value *
+                 __half2float(__ushort_as_half(up.suh[index]));
+    }
+    const int warp_lane = threadIdx.x & 31;
+    for (int distance = 1; distance <= 16; distance *= 2) {
+      const float gate_other =
+          __shfl_xor_sync(0xffffffffu, gate_value, distance);
+      const float up_other = __shfl_xor_sync(0xffffffffu, up_value, distance);
+      gate_value = (warp_lane & distance) ? gate_other - gate_value
+                                           : gate_value + gate_other;
+      up_value = (warp_lane & distance) ? up_other - up_value
+                                         : up_value + up_other;
+    }
+    for (int distance = 32; distance < 128; distance *= 2) {
+      gate_hadamard_scratch[part * 128 + element] = gate_value;
+      up_hadamard_scratch[part * 128 + element] = up_value;
+      __syncthreads();
+      const float gate_other =
+          gate_hadamard_scratch[part * 128 + (element ^ distance)];
+      const float up_other =
+          up_hadamard_scratch[part * 128 + (element ^ distance)];
+      gate_value = (element & distance) ? gate_other - gate_value
+                                         : gate_other + gate_value;
+      up_value = (element & distance) ? up_other - up_value
+                                       : up_other + up_value;
+      __syncthreads();
+    }
+    gate_transformed_input[group * 128 + element] =
+        gate_value * kHadamardScale;
+    up_transformed_input[group * 128 + element] = up_value * kHadamardScale;
+    __syncthreads();
+  }
+
+  const uint4 *gate_vectors = reinterpret_cast<const uint4 *>(gate.trellis);
+  const uint4 *up_vectors = reinterpret_cast<const uint4 *>(up.trellis);
+  const int gate_vector_count = key_tile_count * kGateVectorsPerTile;
+  const int up_vector_count = key_tile_count * kUpVectorsPerTile;
+  for (int vector_index = threadIdx.x; vector_index < gate_vector_count;
+       vector_index += blockDim.x) {
+    const int key_offset = vector_index / kGateVectorsPerTile;
+    const int vector_offset = vector_index % kGateVectorsPerTile;
+    const size_t tile =
+        static_cast<size_t>(first_key_tile + key_offset) * output_tiles +
+        blockIdx.x;
+    gate_packed_tiles[vector_index] =
+        gate_vectors[tile * kGateVectorsPerTile + vector_offset];
+  }
+  for (int vector_index = threadIdx.x; vector_index < up_vector_count;
+       vector_index += blockDim.x) {
+    const int key_offset = vector_index / kUpVectorsPerTile;
+    const int vector_offset = vector_index % kUpVectorsPerTile;
+    const size_t tile =
+        static_cast<size_t>(first_key_tile + key_offset) * output_tiles +
+        blockIdx.x;
+    up_packed_tiles[vector_index] =
+        up_vectors[tile * kUpVectorsPerTile + vector_offset];
+  }
+  __syncthreads();
+
+  float gate_sum = 0.0f;
+  float up_sum = 0.0f;
+  for (int key_tile = 0; key_tile < key_tile_count; ++key_tile) {
+    const uint16_t *gate_packed = reinterpret_cast<const uint16_t *>(
+        gate_packed_tiles + key_tile * kGateVectorsPerTile);
+    const uint16_t *up_packed = reinterpret_cast<const uint16_t *>(
+        up_packed_tiles + key_tile * kUpVectorsPerTile);
+    gate_sum = __fmaf_rn(
+        decode_mul1(decode_state<GateBits>(gate_packed, threadIdx.x)),
+        gate_transformed_input[key_tile * 16 + input_row], gate_sum);
+    up_sum = __fmaf_rn(
+        decode_mul1(decode_state<UpBits>(up_packed, threadIdx.x)),
+        up_transformed_input[key_tile * 16 + input_row], up_sum);
+  }
+  gate_sum += __shfl_xor_sync(0xffffffffu, gate_sum, 1);
+  gate_sum += __shfl_xor_sync(0xffffffffu, gate_sum, 2);
+  gate_sum += __shfl_xor_sync(0xffffffffu, gate_sum, 8);
+  gate_sum += __shfl_xor_sync(0xffffffffu, gate_sum, 16);
+  up_sum += __shfl_xor_sync(0xffffffffu, up_sum, 1);
+  up_sum += __shfl_xor_sync(0xffffffffu, up_sum, 2);
+  up_sum += __shfl_xor_sync(0xffffffffu, up_sum, 8);
+  up_sum += __shfl_xor_sync(0xffffffffu, up_sum, 16);
+  if (lane == 0 || lane == 4) {
+    const size_t base =
+        (static_cast<size_t>(blockIdx.y) * rows + blockIdx.z) *
+        gate.output_features;
+    const size_t output_index = blockIdx.x * 16 + output_column;
+    gate_partials[base + output_index] = gate_sum;
+    up_partials[base + output_index] = up_sum;
+  }
+}
+
 __global__ void output_hadamard(const float *partials, const uint16_t *scales,
                                  const uint16_t *bias, float *output,
                                  float *accumulator, float weight,
@@ -479,6 +611,57 @@ static cudaError_t launch_rotated_matmul(
   return cudaGetLastError();
 }
 
+template <int GateBits, int UpBits>
+static cudaError_t launch_gate_up_rotated_matmul_fused(
+    const Exl3CudaMatrixView &gate, const Exl3CudaMatrixView &up,
+    const float *input, float *gate_partials, float *up_partials, int rows,
+    cudaStream_t stream) {
+  const dim3 grid(gate.output_features / 16,
+                  exl3_cuda_key_splits(gate.input_features), rows);
+  gate_up_rotated_matmul_fused<GateBits, UpBits>
+      <<<grid, 256, 0, stream>>>(gate, up, input, gate_partials, up_partials,
+                                rows);
+  return cudaGetLastError();
+}
+
+#define EXL3_UP_BITS_CASE(GateBits, UpBits)                                 \
+  case UpBits:                                                              \
+    return launch_gate_up_rotated_matmul_fused<GateBits, UpBits>(           \
+        gate, up, input, gate_partials, up_partials, rows, stream)
+#define EXL3_GATE_BITS_CASE(GateBits)                                       \
+  case GateBits:                                                            \
+    switch (up.bits) {                                                      \
+      EXL3_UP_BITS_CASE(GateBits, 1);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 2);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 3);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 4);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 5);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 6);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 7);                                       \
+      EXL3_UP_BITS_CASE(GateBits, 8);                                       \
+    default:                                                                \
+      return cudaErrorInvalidValue;                                         \
+    }
+static cudaError_t launch_gate_up_rotated_matmul_fused(
+    const Exl3CudaMatrixView &gate, const Exl3CudaMatrixView &up,
+    const float *input, float *gate_partials, float *up_partials, int rows,
+    cudaStream_t stream) {
+  switch (gate.bits) {
+    EXL3_GATE_BITS_CASE(1);
+    EXL3_GATE_BITS_CASE(2);
+    EXL3_GATE_BITS_CASE(3);
+    EXL3_GATE_BITS_CASE(4);
+    EXL3_GATE_BITS_CASE(5);
+    EXL3_GATE_BITS_CASE(6);
+    EXL3_GATE_BITS_CASE(7);
+    EXL3_GATE_BITS_CASE(8);
+  default:
+    return cudaErrorInvalidValue;
+  }
+}
+#undef EXL3_GATE_BITS_CASE
+#undef EXL3_UP_BITS_CASE
+
 static cudaError_t launch_exl3_mul1_matmul_impl(
     const Exl3CudaMatrixView &matrix, const float *input, float *output,
     float *accumulator, float weight, int rows, float *partials,
@@ -498,6 +681,13 @@ static cudaError_t launch_exl3_mul1_matmul_impl(
 cudaError_t launch_exl3_mul1_matmul(const Exl3CudaMatrixView &matrix,
                                    const float *input, float *output, int rows,
                                    float *partials, cudaStream_t stream) {
+#ifdef MOESTREAM_EXL3_UPSTREAM
+  if (&exl3_upstream_active && exl3_upstream_active()) {
+    const cudaError_t e = exl3_upstream_matmul(matrix, input, output, nullptr,
+                                               0.0f, nullptr, rows, stream);
+    if (e != cudaErrorNotSupported) return e;
+  }
+#endif
   return launch_exl3_mul1_matmul_impl(matrix, input, output, nullptr, 0.0f,
                                       rows, partials, stream);
 }
@@ -506,6 +696,14 @@ cudaError_t launch_exl3_mul1_matmul_accumulate(
     const Exl3CudaMatrixView &matrix, const float *input, float *accumulator,
     float weight, int rows, float *partials, cudaStream_t stream) {
   if (!accumulator) return cudaErrorInvalidValue;
+#ifdef MOESTREAM_EXL3_UPSTREAM
+  if (&exl3_upstream_active && exl3_upstream_active()) {
+    const cudaError_t e = exl3_upstream_matmul(matrix, input, nullptr,
+                                               accumulator, weight, nullptr,
+                                               rows, stream);
+    if (e != cudaErrorNotSupported) return e;
+  }
+#endif
   return launch_exl3_mul1_matmul_impl(matrix, input, nullptr, accumulator,
                                       weight, rows, partials, stream);
 }
@@ -513,6 +711,14 @@ cudaError_t launch_exl3_mul1_matmul_accumulate(
 cudaError_t launch_exl3_mul1_matmul_accumulate_device_weight(
     const Exl3CudaMatrixView &matrix, const float *input, float *accumulator,
     const float *weight, int rows, float *partials, cudaStream_t stream) {
+#ifdef MOESTREAM_EXL3_UPSTREAM
+  if (&exl3_upstream_active && exl3_upstream_active() && accumulator && weight) {
+    const cudaError_t e = exl3_upstream_matmul(matrix, input, nullptr,
+                                               accumulator, 0.0f, weight, rows,
+                                               stream);
+    if (e != cudaErrorNotSupported) return e;
+  }
+#endif
   if (!valid(matrix) || !input || !accumulator || !weight || !partials ||
       rows <= 0 || rows > 65535)
     return cudaErrorInvalidValue;
@@ -530,14 +736,20 @@ cudaError_t launch_exl3_mul1_gate_up(
     const Exl3CudaMatrixView &gate, const Exl3CudaMatrixView &up,
     const float *input, float *activation, int rows, float *gate_partials,
     float *up_partials, cudaStream_t stream) {
+#ifdef MOESTREAM_EXL3_UPSTREAM
+  if (&exl3_upstream_active && exl3_upstream_active() && up_partials) {
+    const cudaError_t e = exl3_upstream_gate_up(gate, up, input, activation,
+                                                rows, up_partials, stream);
+    if (e != cudaErrorNotSupported) return e;
+  }
+#endif
   if (!valid(gate) || !valid(up) || !input || !activation ||
       !gate_partials || !up_partials || gate_partials == up_partials ||
       gate.input_features != up.input_features ||
       gate.output_features != up.output_features || rows <= 0 || rows > 65535)
     return cudaErrorInvalidValue;
-  cudaError_t error = launch_rotated_matmul(gate, input, rows, gate_partials, stream);
-  if (error != cudaSuccess) return error;
-  error = launch_rotated_matmul(up, input, rows, up_partials, stream);
+  cudaError_t error = launch_gate_up_rotated_matmul_fused(
+      gate, up, input, gate_partials, up_partials, rows, stream);
   if (error != cudaSuccess) return error;
   gate_up_hadamard_swiglu<<<dim3(gate.output_features / 128, rows), 128, 0, stream>>>(
       gate_partials, up_partials, gate.svh, up.svh, gate.bias, up.bias,

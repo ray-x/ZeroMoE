@@ -63,6 +63,8 @@ struct EngineConfig {
   std::string exl3_ggml_bridge_model_path;
   int exl3_ggml_bridge_layer = -1;
   std::vector<int> exl3_ggml_bridge_layers;
+  bool exl3_ggml_graph_capture = false;
+  bool exl3_ggml_routed_graph_capture = false;
   std::string exllamav3_python;
   std::string exllamav3_runner_path;
   std::string exllamav3_cuda_schedule = "auto";
@@ -2564,6 +2566,10 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_int("exl3_ggml_bridge_layer", exl3_ggml_bridge_layer);
   exl3_ggml_bridge_layers =
       doc.root.get_int_array("exl3_ggml_bridge_layers");
+  exl3_ggml_graph_capture =
+      doc.root.get_bool("exl3_ggml_graph_capture", exl3_ggml_graph_capture);
+  exl3_ggml_routed_graph_capture = doc.root.get_bool(
+      "exl3_ggml_routed_graph_capture", exl3_ggml_routed_graph_capture);
   exllamav3_python = doc.root.get_str("exllamav3_python", exllamav3_python);
   exllamav3_runner_path = doc.root.get_str("exllamav3_runner_path", exllamav3_runner_path);
   exllamav3_cuda_schedule = doc.root.get_str("exllamav3_cuda_schedule", exllamav3_cuda_schedule);
@@ -3214,10 +3220,29 @@ inline bool EngineConfig::validate() {
                  "exl3_ggml_bridge_model_path.\n";
     return false;
   }
+  if (exl3_ggml_graph_capture && exl3_ggml_bridge_model_path.empty()) {
+    std::cerr << "[CONFIG] exl3_ggml_graph_capture requires "
+                 "exl3_ggml_bridge_model_path.\n";
+    return false;
+  }
+  if (exl3_ggml_routed_graph_capture &&
+      (!exl3_ggml_graph_capture ||
+       exl3_ggml_bridge_model_path.empty())) {
+    std::cerr << "[CONFIG] exl3_ggml_routed_graph_capture requires "
+                 "exl3_ggml_graph_capture and exl3_ggml_bridge_model_path.\n";
+    return false;
+  }
   if (!exl3_ggml_bridge_model_path.empty() &&
       (!std::isfinite(exl3_gpu_cache_gb) || exl3_gpu_cache_gb <= 0.0 ||
        exl3_gpu_cache_gb > 1024.0)) {
     std::cerr << "[CONFIG] EXL3 GGML bridge requires exl3_gpu_cache_gb in (0, 1024].\n";
+    return false;
+  }
+  if (!exl3_ggml_bridge_model_path.empty() &&
+      (!std::isfinite(exl3_cpu_expert_cache_gb) ||
+       exl3_cpu_expert_cache_gb < 0.0 ||
+       exl3_cpu_expert_cache_gb > 1024.0)) {
+    std::cerr << "[CONFIG] EXL3 GGML bridge requires exl3_cpu_expert_cache_gb in [0, 1024].\n";
     return false;
   }
   if (exl3_backend != "native" && exl3_backend != "exllamav3") {
@@ -3438,7 +3463,11 @@ inline void EngineConfig::print() const {
     for (size_t index = 0; index < exl3_ggml_bridge_layers.size(); ++index)
       LOG_STREAM_INFO() << (index == 0 ? "" : ",")
                         << exl3_ggml_bridge_layers[index];
-    LOG_STREAM_INFO() << "\n";
+    LOG_STREAM_INFO() << " | segmented CUDA graph capture: "
+                      << (exl3_ggml_graph_capture ? "ON" : "off")
+                      << " | routed FFN graph cache: "
+                      << (exl3_ggml_routed_graph_capture ? "ON" : "off")
+                      << "\n";
   }
   if (!dense_model_path.empty() && dense_model_path != model_path)
     LOG_STREAM_INFO() << "[CONFIG] Dense model: " << dense_model_path << "\n";

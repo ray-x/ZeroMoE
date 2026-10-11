@@ -14,12 +14,12 @@
 #include <vector>
 
 class Exl3GpuExecutor;
+class GpuTopology;
+struct StreamingEngine;
 struct CPUEngine;
 
 struct Exl3GgmlBridgeLayer {
   std::unique_ptr<Exl3GgmlCachedRoutedFfnState> ffn_state;
-  std::unique_ptr<Exl3GgmlRoutePackState> route_pack;
-  ggml_tensor *route_template = nullptr;
   Exl3GpuExecutor *gpu_executor = nullptr;
   int layer = -1;
   int device = -1;
@@ -36,7 +36,10 @@ struct Exl3GgmlBridgeLayer {
                   ggml_backend_t cuda_backend, Exl3GpuExecutor *executor,
                   int model_layer, int n_experts, int model_topk,
                   int model_rows, int cuda_device,
-                  bool load_cache_misses_from_safetensors = false);
+                  bool load_cache_misses_from_safetensors = false,
+                  std::shared_ptr<Exl3CpuMatrixCache> cpu_matrix_cache = {},
+                  GpuTopology *gpu_topology = nullptr,
+                  StreamingEngine *streaming_engine = nullptr);
   bool set_layer(int model_layer);
 
   ggml_tensor *build(ggml_context *ctx, ggml_tensor *input,

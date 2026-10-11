@@ -317,10 +317,19 @@ env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_adapter_bench \
     100 --capture
 ```
 
-The capture-path smoke run measured **11.93 us device time** for the same
-single projection. Call `exl3_ggml_cuda_backend_reset_graph()` after changing
-tensor addresses or graph shape, then capture again; weight uploads and route
-buffer updates must remain outside the captured graph.
+The adapter captures and replays static GGML spans on either side of a dynamic
+EXL3 callback, leaving route-dependent dispatch eager. Its replay signature
+checks node identities, op/type, shape/strides, and node/source data addresses;
+a mismatch clears the captured segments and recaptures. The adapter benchmark
+now brackets its dynamic custom node with CUDA SiLU nodes to exercise both
+captured spans. On 2026-10-08, the 10-iteration smoke confirmed **two captured
+static segments around one eager custom callback** and measured **16.26 us GPU
+time with segmented capture** versus **18.27 us eagerly** on the RTX 5060 Ti.
+This tiny synthetic graph proves the segmented path executes, not a meaningful
+full-Qwen speedup. The earlier **11.93 us** single-projection
+capture result predates this segmented test graph and is not comparable. Call
+`exl3_ggml_cuda_backend_reset_graph()` when replacing graph owners; weight
+uploads and route-dependent buffer updates remain outside capture.
 
 `exl3_ggml_cuda_real_bench` exercises the same bridge with a real matrix loaded
 from `/data/sdb/models/qwen3.8-flash-next/exl3_3bpw`. The selected routed expert
@@ -388,9 +397,10 @@ env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_real_dynamic_routed_
 GGML CUDA computes the F16 router matmul, softmax, top-k, selected-route
 normalization, route-table packing, and dynamic EXL3 FFN. On the real pack it
 selected experts `481,27`, matched CPU logits and normalized weights, and
-measured **92.24 us** captured time with `1.31e-9` maximum FFN error. This is a
-real routed layer-0 FFN graph; attention, residual/HC, KV cache, and logits are
-still outside this bridge benchmark.
+measured **97.28 us eager** and **82.43 us captured** in the 2026-10-08
+smoke, with `1.31e-9` maximum FFN error. This is a real routed layer-0 FFN
+graph; attention, residual/HC, KV cache, and logits are still outside this
+bridge benchmark.
 
 `exl3_ggml_cuda_real_exl3_layer_bench` validates the next boundary using a real
 full-attention EXL3 layer. Custom Q/K/V/O projections, RoPE, device KV-cache
@@ -405,24 +415,35 @@ with finite output.
 
 The production Qwen full-graph builder has an opt-in selected-layer hook. It
 replaces the selected GGML expert subtree with one cache-backed `MAP_CUSTOM3`
-node. The node consumes device-resident activations and a packed route table;
-the EXL3 projections live in the existing `Exl3GpuExecutor` LRU, not in a
-second all-experts layer payload. Cache misses load the selected MUL1 matrices
-from Safetensors and insert them into that LRU. The GGML bridge itself is
-implemented in C++ and CUDA; it does not call Python or modify the external
-GGML checkout.
+node. The node consumes device-resident activations and a packed route table.
+The full-graph path resolves its packed EXL3 projections into MoEStream's
+already allocated `GpuTopology` expert-cache slots (one slot per projection),
+using negative cache IDs to keep them separate from GGUF expert identities.
+It holds those slots until the graph stream completes; EXL3 eviction IDs are
+not sent through the GGUF-to-DDR demotion callback. The DDR cache also uses the
+already allocated selected-layer `GraphRamLayerArena`, divided into existing
+per-expert-sized slots; each slot caches one packed projection. On a DDR miss,
+the bridge reads Safetensors and fills an arena slot without allocating a new
+host tensor buffer. Because this selected layer is replaced by EXL3, its GGUF
+arena bytes are repurposed, and bridge construction fails closed rather than
+falling back to those overwritten weights. Slot size/device mismatch also
+fails closed. The GGML bridge is C++/CUDA and does not call Python or modify
+the external GGML checkout.
+
+This topology-backed full-graph path is separate from `model_format="exl3"`'s
+native `CPUEngine` route. The latter still uses the `Exl3GpuExecutor` weight
+LRU and `Exl3CpuMatrixCache`; the cache-graph benchmark below also tests that
+executor-owned cache path, not the full-graph topology adapter.
 
 ```bash
 export MOESTREAM_EXL3_GGML_BRIDGE_MODEL_PATH=/data/sdb/models/qwen3.8-flash-next/exl3_3bpw
 export MOESTREAM_EXL3_GGML_BRIDGE_LAYER=3
 ```
 
-This hook is intended for full-graph bring-up and memory validation; all-layer
-payload residency, recurrent-state handoff, and production config dispatch are
-still pending.
-Bridge payload allocation is fail-closed when a layer would consume more than
-90% of currently free VRAM, preventing an all-layer experiment from turning
-an expected capacity miss into a process-wide CUDA OOM.
+The full-graph bridge requires a complete preloaded DDR arena for each selected
+layer and an existing per-layer GPU slot region large enough for at least one
+top-k row. It reuses those arenas and fails closed when either tier is
+unavailable; no all-experts EXL3 payload is allocated.
 
 The same hook can be configured directly in TOML:
 
@@ -430,24 +451,153 @@ The same hook can be configured directly in TOML:
 exl3_ggml_bridge_model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
 exl3_ggml_bridge_layer = 3
 exl3_gpu_cache_gb = 8.0
+# Optional, experimental: capture static GGML spans around dynamic EXL3 FFNs.
+# Route-dependent cache lookup remains eager. Defaults to false.
+exl3_ggml_graph_capture = false
+# More experimental: cache CUDA graphs for repeated exact routed-FFN pointer
+# signatures. Requires segmented capture and defaults to false.
+exl3_ggml_routed_graph_capture = false
+# Topology-backed full graph uses its existing DDR arena; the CPU matrix-cache
+# budget is for model_format="exl3" native inference.
+exl3_cpu_expert_cache_gb = 0.0
 # Or replace the single layer with an explicit list:
 # exl3_ggml_bridge_layers = [3, 7, 11]
+# All routed FFNs can be selected with [0, 1, ..., 47] for this 48-layer Qwen.
 ```
 
-The bridge validates `exl3_gpu_cache_gb` in `(0, 1024]` and initializes one
-executor on the selected core GPU. Selected layers share a process-wide
-Safetensors tensor index, avoiding a full shard-header rescan per layer. The
-custom node keeps its activation and output on CUDA. For device-produced routes,
-it currently reads the small packed route table back to the host before loading
-cache misses. The FFN kernels are then enqueued asynchronously; a completion
-event keeps their expert-cache entries pinned and stream ordering protects the
-shared scratch buffers. The route-readback synchronization means the
-cache-backed path is not CUDA-graph-capture safe. If adapter capture is
-requested with this node, the
-adapter disables capture and uses eager dispatch rather than replaying stale
-expert pointers. The separate fixed-payload routed kernels described
-above can capture dynamic route-table contents, but do not represent this LRU
-cache integration.
+The bridge validates `exl3_gpu_cache_gb` in `(0, 1024]` and initializes an
+executor on the selected core GPU for persistent scratch and dispatch. Selected
+layers share a process-wide Safetensors tensor index, avoiding a full shard
+header rescan per layer. The custom node keeps its activation, route weights,
+and output on CUDA. GGML's I32 route-ID and F32 route-weight tensors feed the
+custom node directly; it no longer allocates an opaque route-table tensor or
+launches a route-pack kernel. For device-produced routes, it copies only expert
+IDs into a persistent pinned host buffer before resolving cache slots; route
+weights are copied back only when CPU parity checking is enabled. This
+synchronization is still a decode bottleneck. The focused EXL3 suite passes the
+pinned-buffer D2H staging test and host-route setup on the RTX 5060 Ti; this is
+not an end-to-end timing. The FFN kernels are then enqueued in
+row batches sized to the unpinned per-layer slot region
+(`slot_count / (3 * topk)`). Intermediate batches synchronize before reusing
+those slots; the final batch remains asynchronous on the GGML CUDA stream, with
+completion events retaining cache-slot holds until the work finishes. The next
+device-route readback synchronizes that stream and reaps completed holds before
+resolving new slots. This avoids a second end-of-node wait while preserving
+safe slot reuse. Route readback keeps the routed FFN callback itself outside
+CUDA graph capture. The adapter captures static GGML spans before and after
+that callback; it checks the graph's
+node signature before replay so changed graphs do not reuse stale segments.
+Set `MOESTREAM_EXL3_GGML_ROUTE_TIMING=1` to log per-layer route-readback count,
+bytes, cumulative host wait, and average synchronization time at teardown.
+The external path now computes the gate and up rotated matmuls in one CUDA
+kernel, staging both trellises and their input transforms together. This
+reduces the per-route sequence from five launches to four; SwiGLU/output
+transforms and weighted down projection remain separate. The updated kernel
+compiles, and `moestream_tests` includes a 3-bit gate / 5-bit up parity case.
+The external-pointer routed FFN and mixed-bit gate/up tests both pass on GPUs 0
+and 1 after this change. A capture-enabled full-graph smoke is measured below;
+it is not a stable performance comparison. A real full-graph attempt found
+router weights were rank-3
+`[1, topk, rows]`; the builder now makes them contiguous and reshapes to
+`[topk, rows]`. Requested bridge construction now fails instead of silently
+substituting GGUF expert weights.
+
+The 2026-10-08 single-layer topology-backed smoke completed a 13-token prefill
+and four generated tokens with EXL3 replacing layer 3 of the IQ1_M GGUF full
+graph. It referenced the existing 904,396,800-byte DDR arena (512
+1,766,400-byte slots) and GPU expert pool; shutdown reported 46 of 2,193 GPU
+slots filled. Decode measured **3.79 tok/s**.
+
+Set `MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER` to a layer number (for example `3`)
+to compare one layer, or to `all` to compare every bridged layer, against the
+CPU EXL3 reference. With `MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER=3`, the same
+full-graph custom node compared topology-slot GPU outputs against the CPU EXL3
+reference on all 13 prefill rows. Maximum absolute error was **7.83e-8**. This
+verifies the real Safetensors -> existing DDR slot -> existing GPU slot ->
+custom-op path for that layer, not just synthetic external-pointer dispatch.
+
+A follow-up enabled the hook for all 48 routed FFN layers. The 13-token prefill
+and four-token decode completed without bridge fallback or custom-op errors.
+Each layer reused its existing 512-slot DDR arena (1.64–1.77 MB per slot) and
+GPU cache region; the GPU cache ended at 6,635 of 6,749 slots filled (11.30
+GiB). This mixed run retains IQ1_M GGUF dense/attention weights and replaces
+the routed FFNs with EXL3, so it is not all-EXL3 logit parity. It measured
+**2.88 prefill tok/s** and **1.72 decode tok/s** over four tokens. The row batch
+was four at 140–141 available projection slots per layer; synchronization
+between batches is a correctness/capacity tradeoff and a clear performance
+optimization target, not an ExLlamaV3 comparison.
+
+After gate/up fusion and segmented capture wiring, a new three-token prompt
+with `exl3_ggml_graph_capture = true` completed prefill and three generated
+tokens with the bridge selected for all 48 routed FFNs. The mixed GGUF/EXL3
+run measured **1.56 prefill tok/s** and **1.55 decode tok/s** (0.78 overall
+tok/s including prefill). This short smoke confirms end-to-end execution with
+capture enabled; its duration and prompt are too small to establish a
+performance gain or compare fairly with the earlier four-token run. A separate
+adapter test confirms two static segments execute around an eager custom
+callback.
+
+The current direct-route path passed an all-layer run with
+`MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER=all`: 144 custom FFN checks across all 48
+layers, with maximum absolute error `2.75671e-7`. The three-token prompt and
+three generated tokens completed with capture enabled. The parity callback now
+waits for the asynchronous final FFN batch before reading its output. CPU
+reference matmuls and device readbacks make this run diagnostic, not a
+throughput measurement; it checks routed FFN outputs, not end-to-end logits
+against an all-EXL3 model.
+
+A non-parity run exercised the same direct I32/F32 route tensors, pinned ID
+readback, fused gate/up kernel, and `exl3_ggml_graph_capture = true` across all
+48 routed FFNs on the RTX 3090. It completed a three-token prompt and generated
+three tokens; logs show 144 routed-FFN calls and a 49-segment graph around 48
+eager routed callbacks. Measured rates were **1.55 prefill tok/s** and **3.27
+decode tok/s** (1.05 overall tok/s). Executor counters report 7,200 projection
+matmuls and **67.36 ms GPU FFN time** across those 144 calls, with zero executor
+cache uploads because production weights come from topology slots. Route-sync
+timings are around **0.3 ms per layer callback**, but include waiting for prior
+router/graph work on the CUDA stream, not just the 40-byte ID copy. This short
+mixed-format smoke is not a stable A/B performance claim or full-model
+logit-parity check.
+
+The all-layer smoke used `exl3_ggml_bridge_layers = [0, ..., 47]`,
+`ram_preload_all_experts = true`, and
+`MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0` so every layer retained its DDR
+arena for EXL3 slots. Reproduce with a Qwen4Exp GGUF metadata/model config,
+the EXL3 Safetensors path, and a short prompt; the rest of the model's dense
+and attention weights remain GGUF in this mixed-format integration test.
+
+After fixing routed output initialization, an all-48-layer topology-backed
+parity run completed a 13-token prefill and one decode token on the RTX 3090.
+The callback compared 192 routed FFN outputs across prefill row batches and
+decode, with maximum absolute error `4.17233e-7`; production slot-backed
+dispatch recorded zero executor cache uploads. This confirms the all-layer
+Safetensors -> existing DDR/GPU expert slots -> GGML custom-op path after the
+output-clear fix. The parity run is deliberately diagnostic: CPU references
+and readbacks reduced prefill to `0.60 tok/s`. The one-token decode interval
+was `3.85 tok/s`, too short for a stable performance claim. It verifies routed
+FFN outputs, not end-to-end logits against an all-EXL3 model.
+
+For an end-to-end same-history comparison, set
+`MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER=all` and
+`MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT=1` on the reference run. Each bridge
+callback still checks GPU FFN parity, then substitutes that callback's CPU
+reference output into the same full graph. Dump logits in both the ordinary
+GPU-output run and this CPU-reference-output run with
+`MOESTREAM_DECODE_LOGITS_DUMP`; use `MOESTREAM_GENERATED_TOKEN_FILE` on a
+deterministic warmup and `MOESTREAM_TEACHER_FORCE_TOKEN_FILE` plus
+`MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING=1` for both compared runs so every
+decode step sees the same token history. Compare the dumps with
+`python3 bench/compare_decode_logits.py`. The CPU-reference substitution has
+passed the focused routed-FFN benchmark, but a full-model logits comparison
+has not yet been run. The end-to-end sequence is automated by
+`python3 bench/exl3_ggml_logits_parity.py --out-dir /tmp/exl3-logit-parity`;
+it fails fast if another `moestream` process is running or less than 110 GiB
+of RAM is available, and verifies `nvidia-smi` is responsive before each run;
+it then writes both logits and a comparison report there.
+The CPU-reference-output hook was exercised on the RTX 5060 Ti with a single
+external routed FFN (`rows=1`, `topk=2`); its result matched the CPU output
+exactly (`max_abs_error=0`). The measured `30.5 ms` callback includes CPU
+reference recomputation and is a correctness check, not a speed result.
 
 The earlier full-graph smoke runs below exercised a fixed opaque layer payload;
 they are historical evidence and do not verify this cache-backed implementation.
@@ -457,18 +607,82 @@ output against its CPU EXL3 reference, and checks the upload count:
 
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_cache_graph_bench -j4
-./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
+env -u CUDA_VISIBLE_DEVICES ./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
     /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 8 0 2
 ```
 
-The benchmark target builds, but the current cache-backed path still needs a
-longer, repeatable GPU run. A one-iteration smoke on GPU 0 with `rows=1` passed
-CPU parity (`max_abs_error=1.35333e-9`) and reported `avg_us=97.05`, 12 uploads,
-and 6 cache hits. The prescribed `rows=2`, 8-iteration run has not completed:
-CUDA device enumeration has been intermittent in this environment. Full-model
-EXL3 logit parity, end-to-end decode throughput, and CUDA graph capture of the
-LRU-backed node are not verified. Do not use the historical fixed-payload
-throughput numbers as the performance result for this implementation.
+The 2026-10-08 direct-device-route rerun (`rows=1`, `topk=2`, two iterations,
+RTX 5060 Ti) passed CPU parity (`max_abs_error=1.28057e-9`) at `avg_us=91.78`.
+It performed four pinned route-ID readbacks (32 bytes total), averaging
+**7.07 us per synchronization**, with 12 GPU uploads and 12 GPU-cache hits.
+Route weights stayed on CUDA. This focused benchmark exercises the executor's
+weight cache rather than the production topology-slot resolver, so it measures
+route tensor staging and custom-op execution, not full topology-backed decode.
+It also does not establish DDR-cache-hit performance or full-model EXL3 logit
+parity. Do not use the historical fixed-payload throughput numbers as the
+performance result for this implementation.
+
+The same bench's `--external` mode drives `routed_ffn_device_external` with
+Safetensors matrices staged to external CUDA pointers, matching the bridge's
+non-owning-weight dispatch contract. On the RTX 5060 Ti (`rows=1`, Qwen
+`topk=10`, two route sets, two measured iterations after warmup), it passed CPU
+parity inside the custom callback for both warmup route sets (`max_abs_error`
+`7.79e-10` and `7.57e-10`). A short follow-up measured `avg_us=348.91` wall /
+`gpu_us=349.95`, with two pinned route-ID readbacks (80 bytes total) at
+`avg_us=6.35` and `0.212 ms` total FFN enqueue time for the two measured
+callbacks; executor cache uploads remained zero. These short runs varied
+(`gpu_us` 277–350), so treat them as correctness and callback-cost checks, not
+a stable performance result. The test allocates its own fixture pointers and
+does not exercise the production `GpuTopology` resolver or full-model speed.
+
+The same mode now runs its warmup route sets through the custom op's internal
+CPU parity checker before timing. With `topk=2`, both route sets passed
+(`max_abs_error=1.35e-9` and `1.28e-9`); route-readback synchronization averaged
+`6.68 us`. This specifically verifies pinned direct-ID readback and the
+parity-only output wait after asynchronous FFN dispatch.
+
+A follow-up on 2026-10-08 found and fixed an external-route output initialization
+bug: `cudaMemsetAsync` had its byte-count and fill-value arguments reversed,
+leaving the accumulation buffer uncleared. After correcting the argument order,
+the RTX 5060 Ti external-view benchmark passed both `topk=2` route sets
+(`max_abs_error=1.35333e-9` and `1.28057e-9`, `avg_us=106.67`,
+`gpu_us=109.52`). With `topk=1` and a repeated route signature, the opt-in
+per-FFN CUDA graph captured once and replayed three times with parity at
+`2.00089e-9` (`avg_us=82.17`, `gpu_us=85.42`). With `topk=2` and changing
+route signatures, the cached graph correctly fell back eagerly for the two
+unseen signatures; both still passed parity (`graph_captures=1`,
+`graph_replays=1`, `graph_fallbacks=2`). These are small single-FFN correctness
+checks, not full-model throughput or topology-backed decode validation.
+The EXL3-only test suite also repeats an external routed FFN into the same
+nonzero output buffer and checks that the second result does not accumulate the
+first call's output.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 MOESTREAM_EXL3_GGML_ROUTE_TIMING=1 \
+  ./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
+  /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 2 0 1 --external 10
+```
+
+An end-to-end smoke used `model_format="exl3"`, the EXL3 Safetensors folder,
+and the matching GGUF metadata, with GPU 0 enabled and one generated token.
+Prefill completed for 13 prompt rows; all 48 transformer layers ran, including
+the GGML custom-op routed FFN path on GPU layers 26–47 (22 routed FFNs). The
+run completed in 63.49 s and reported 7.67 GiB resident in the EXL3 GPU LRU.
+This proves the native EXL3 decoder's GGML custom-op path is reachable, but it
+is only a smoke: one generated token is not a decode-speed measurement, and
+there was no independent full-logit/token parity check. This path still uses
+`Exl3GpuExecutor`/`Exl3CpuMatrixCache`; it does not exercise the topology-backed
+full-graph hook above.
+
+A repeated four-token run with expert layers 0–25 on CPU and 26–47 on GPU
+completed three decode intervals at **1.56 tok/s** (`prefill_s=49.86`, total
+`52.10 s`). The GPU reported 88 routed FFNs total (22 for prefill plus 22 per
+decode interval),
+`gpu_routed_ffn_ms_per_interval=6.83`, and
+`cpu_matmul_ms_per_interval=53.52`. This confirms repeated execution through
+the custom-op path but also shows the current mixed CPU/GPU route is not
+performant; it is not a comparison against ExLlamaV3 or a fully GPU-resident
+MoE placement.
 
 ```bash
 cmake --build build_ggmlcuda --target exl3_ggml_cuda_real_exl3_layer_bench -j4

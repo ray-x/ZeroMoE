@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <list>
@@ -96,6 +97,18 @@ struct Exl3GpuExecutor::Impl {
     cudaEvent_t begin = nullptr;
     cudaEvent_t complete = nullptr;
     std::vector<Entry *> entries;
+    std::vector<std::shared_ptr<void>> external_holds;
+    uint64_t graph_id = 0;
+  };
+
+  struct CapturedExternalGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    std::vector<uintptr_t> key;
+    std::vector<uintptr_t> site_key;
+    uint64_t id = 0;
+    uint64_t last_used = 0;
+    size_t inflight = 0;
   };
 
   int device;
@@ -114,6 +127,11 @@ struct Exl3GpuExecutor::Impl {
   cudaStream_t scratch_stream = nullptr;
   std::vector<cudaEvent_t> available_events;
   std::vector<PendingRoutedUse> pending_routed;
+  std::vector<CapturedExternalGraph> external_routed_graphs;
+  bool capture_external_routed_graphs = false;
+  uint64_t next_external_graph_id = 1;
+  uint64_t external_graph_use_clock = 0;
+  static constexpr size_t kMaxExternalRoutedGraphs = 128;
   std::unordered_map<std::string, std::unique_ptr<Entry>> cache;
   std::list<std::string> lru;
   mutable std::mutex mutex;
@@ -122,6 +140,7 @@ struct Exl3GpuExecutor::Impl {
   Impl(int device_id, size_t cache_budget) : device(device_id), budget(cache_budget) {
     available_events.reserve(256);
     pending_routed.reserve(256);
+    external_routed_graphs.reserve(kMaxExternalRoutedGraphs);
     DeviceGuard guard(device);
     const char *schedule_env = std::getenv("MOESTREAM_CUDA_SCHEDULE");
     if (schedule_env && schedule_env[0]) {
@@ -171,6 +190,13 @@ struct Exl3GpuExecutor::Impl {
       cudaEventDestroy(pending.complete);
     }
     pending_routed.clear();
+    for (const auto &captured : external_routed_graphs) {
+      if (captured.executable)
+        cudaGraphExecDestroy(captured.executable);
+      if (captured.graph)
+        cudaGraphDestroy(captured.graph);
+    }
+    external_routed_graphs.clear();
     for (cudaEvent_t event : available_events)
       cudaEventDestroy(event);
     available_events.clear();
@@ -206,6 +232,78 @@ struct Exl3GpuExecutor::Impl {
       available_events.push_back(event);
     else
       cudaEventDestroy(event);
+  }
+
+  CapturedExternalGraph *find_external_graph(
+      const std::vector<uintptr_t> &key) {
+    for (auto &captured : external_routed_graphs) {
+      if (captured.key == key) {
+        captured.last_used = ++external_graph_use_clock;
+        ++captured.inflight;
+        ++counters.routed_graph_replays;
+        return &captured;
+      }
+    }
+    return nullptr;
+  }
+
+  bool has_external_graph_for_site(
+      const std::vector<uintptr_t> &site_key) const {
+    return std::any_of(external_routed_graphs.begin(),
+                       external_routed_graphs.end(),
+                       [&](const CapturedExternalGraph &captured) {
+                         return captured.site_key == site_key;
+                       });
+  }
+
+  bool make_external_graph_room() {
+    if (external_routed_graphs.size() < kMaxExternalRoutedGraphs)
+      return true;
+    auto victim = external_routed_graphs.end();
+    for (auto candidate = external_routed_graphs.begin();
+         candidate != external_routed_graphs.end(); ++candidate) {
+      if (candidate->inflight == 0 &&
+          (victim == external_routed_graphs.end() ||
+           candidate->last_used < victim->last_used))
+        victim = candidate;
+    }
+    if (victim == external_routed_graphs.end())
+      return false;
+    if (victim->executable)
+      cudaGraphExecDestroy(victim->executable);
+    if (victim->graph)
+      cudaGraphDestroy(victim->graph);
+    external_routed_graphs.erase(victim);
+    return true;
+  }
+
+  uint64_t store_external_graph(std::vector<uintptr_t> key,
+                                std::vector<uintptr_t> site_key,
+                                cudaGraph_t graph,
+                                cudaGraphExec_t executable) {
+    CapturedExternalGraph captured;
+    captured.graph = graph;
+    captured.executable = executable;
+    captured.key = std::move(key);
+    captured.site_key = std::move(site_key);
+    captured.id = next_external_graph_id++;
+    captured.last_used = ++external_graph_use_clock;
+    captured.inflight = 1;
+    external_routed_graphs.push_back(std::move(captured));
+    ++counters.routed_graph_captures;
+    return external_routed_graphs.back().id;
+  }
+
+  void release_external_graph_use(uint64_t graph_id) {
+    if (graph_id == 0)
+      return;
+    for (auto &captured : external_routed_graphs) {
+      if (captured.id == graph_id) {
+        if (captured.inflight > 0)
+          --captured.inflight;
+        return;
+      }
+    }
   }
 
   void wait_for_scratch(cudaStream_t target_stream) {
@@ -245,6 +343,15 @@ struct Exl3GpuExecutor::Impl {
       counters.routed_ffn_seconds += elapsed_ms * 0.001;
       for (Entry *entry : pending.entries)
         --entry->holds;
+      if (pending.graph_id != 0) {
+        for (auto &captured : external_routed_graphs) {
+          if (captured.id == pending.graph_id) {
+            if (captured.inflight > 0)
+              --captured.inflight;
+            break;
+          }
+        }
+      }
       if (scratch_tail == pending.complete) {
         scratch_tail = nullptr;
         scratch_stream = nullptr;
@@ -371,6 +478,27 @@ Exl3GpuExecutor::Exl3GpuExecutor(int device, size_t cache_budget)
 Exl3GpuExecutor::~Exl3GpuExecutor() = default;
 
 int Exl3GpuExecutor::device() const { return impl_->device; }
+
+void Exl3GpuExecutor::set_routed_graph_capture(bool enabled) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  DeviceGuard guard(impl_->device);
+  if (impl_->capture_external_routed_graphs == enabled)
+    return;
+  if (!enabled) {
+    for (const auto &pending : impl_->pending_routed)
+      check(cudaEventSynchronize(pending.complete),
+            "wait for external routed graph before disabling capture");
+    impl_->reap_completed();
+    for (const auto &captured : impl_->external_routed_graphs) {
+      if (captured.executable)
+        cudaGraphExecDestroy(captured.executable);
+      if (captured.graph)
+        cudaGraphDestroy(captured.graph);
+    }
+    impl_->external_routed_graphs.clear();
+  }
+  impl_->capture_external_routed_graphs = enabled;
+}
 
 bool Exl3GpuExecutor::matmul_cached(const std::string &key, const float *input,
                                     float *output, int rows, int input_features,
@@ -672,7 +800,8 @@ void Exl3GpuExecutor::routed_ffn_device(
     const float *device_input, float *device_output, int rows, int topk,
     int hidden, int intermediate, cudaStream_t stream,
     bool require_cache_hit,
-    const std::function<std::vector<uint8_t>(const std::string &)> &load) {
+    const std::function<std::vector<uint8_t>(const std::string &)> &load,
+    const float *device_routing_weights) {
   if (rows <= 0 || topk <= 0 || expert_prefixes_by_id.empty() ||
       !route_ids || !routing_weights || !device_input || !device_output || !stream ||
       hidden <= 0 || intermediate <= 0 || hidden % 128 ||
@@ -769,12 +898,21 @@ void Exl3GpuExecutor::routed_ffn_device(
                   impl_->activation.floats(), 1, impl_->partials.floats(),
                   up_partials, stream),
               "launch device fused gate/up projection");
-        check(launch_exl3_mul1_matmul_accumulate(
-                  device_view(down->weights.data, down->header),
-                  impl_->activation.floats(), row_output,
-                  routing_weights[route_index], 1, impl_->partials.floats(),
-                  stream),
-              "launch device weighted down projection");
+        if (device_routing_weights) {
+          check(launch_exl3_mul1_matmul_accumulate_device_weight(
+                    device_view(down->weights.data, down->header),
+                    impl_->activation.floats(), row_output,
+                    device_routing_weights + route_index, 1,
+                    impl_->partials.floats(), stream),
+                "launch device weighted down projection");
+        } else {
+          check(launch_exl3_mul1_matmul_accumulate(
+                    device_view(down->weights.data, down->header),
+                    impl_->activation.floats(), row_output,
+                    routing_weights[route_index], 1, impl_->partials.floats(),
+                    stream),
+                "launch device weighted down projection");
+        }
       }
     }
     check(cudaEventRecord(complete_event, stream),
@@ -791,6 +929,276 @@ void Exl3GpuExecutor::routed_ffn_device(
     held.deferred = true;
   } catch (...) {
     cudaStreamSynchronize(stream);
+    impl_->recycle_event(begin_event);
+    impl_->recycle_event(complete_event);
+    throw;
+  }
+  impl_->counters.matmuls += 3 * route_count;
+  ++impl_->counters.routed_ffns;
+}
+
+void Exl3GpuExecutor::routed_ffn_device_external(
+    const Exl3GpuExternalExpert *experts_by_route,
+    const float *routing_weights, const float *device_routing_weights,
+    const float *device_input, float *device_output, int rows, int topk,
+    int hidden, int intermediate, cudaStream_t stream) {
+  if (!experts_by_route || (!routing_weights && !device_routing_weights) ||
+      !device_input || !device_output || !stream || rows <= 0 || topk <= 0 ||
+      hidden <= 0 || intermediate <= 0 || hidden % 128 || intermediate % 128)
+    throw std::runtime_error("Invalid external EXL3 routed FFN arguments");
+
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  DeviceGuard guard(impl_->device);
+  impl_->reap_completed();
+  const size_t route_count = static_cast<size_t>(rows) * topk;
+  std::vector<std::shared_ptr<void>> external_holds;
+  external_holds.reserve(route_count);
+  for (size_t route = 0; route < route_count; ++route) {
+    const auto &expert = experts_by_route[route];
+    const auto valid = [&](const Exl3CudaMatrixView &matrix, int input_width,
+                           int output_width) {
+      return matrix.trellis && matrix.suh && matrix.svh &&
+             matrix.input_features == input_width &&
+             matrix.output_features == output_width && matrix.bits >= 1 &&
+             matrix.bits <= 8;
+    };
+    if (!valid(expert.gate, hidden, intermediate) ||
+        !valid(expert.up, hidden, intermediate) ||
+        !valid(expert.down, intermediate, hidden))
+      throw std::runtime_error("Invalid external EXL3 expert matrix view");
+    if (expert.hold)
+      external_holds.push_back(expert.hold);
+  }
+
+  const size_t hidden_bytes = static_cast<size_t>(hidden) * sizeof(float);
+  const size_t intermediate_bytes =
+      static_cast<size_t>(intermediate) * sizeof(float);
+  const size_t gate_partial_bytes =
+      intermediate_bytes * exl3_cuda_key_splits(hidden);
+  const size_t down_partial_bytes =
+      hidden_bytes * exl3_cuda_key_splits(intermediate);
+  impl_->prepare_scratch(
+      intermediate_bytes, std::max(2 * gate_partial_bytes, down_partial_bytes),
+      stream);
+  float *up_partials =
+      impl_->partials.floats() + gate_partial_bytes / sizeof(float);
+  if (impl_->pending_routed.size() == impl_->pending_routed.capacity())
+    impl_->pending_routed.reserve(impl_->pending_routed.size() + 1);
+
+  const auto enqueue_sequence = [&] {
+#ifdef MOESTREAM_EXL3_UPSTREAM
+    if (&exl3_upstream_active && exl3_upstream_active() &&
+        &exl3_upstream_routed_ffn) {
+      std::vector<const Exl3CudaMatrixView *> gates(route_count),
+          ups(route_count), downs(route_count);
+      for (size_t route = 0; route < route_count; ++route) {
+        gates[route] = &experts_by_route[route].gate;
+        ups[route] = &experts_by_route[route].up;
+        downs[route] = &experts_by_route[route].down;
+      }
+      const cudaError_t status = exl3_upstream_routed_ffn(
+          gates.data(), ups.data(), downs.data(), routing_weights,
+          device_routing_weights, device_input, device_output, rows, topk,
+          hidden, intermediate, stream);
+      if (status == cudaSuccess)
+        return;
+      if (status != cudaErrorNotSupported)
+        check(status, "upstream EXL3 routed FFN");
+    }
+#endif
+    check(cudaMemsetAsync(device_output, 0,
+                          static_cast<size_t>(rows) * hidden_bytes, stream),
+          "clear external routed FFN output");
+    for (int row = 0; row < rows; ++row) {
+      const float *row_input = device_input + static_cast<size_t>(row) * hidden;
+      float *row_output = device_output + static_cast<size_t>(row) * hidden;
+      for (int route = 0; route < topk; ++route) {
+        const size_t route_index = static_cast<size_t>(row) * topk + route;
+        const auto &expert = experts_by_route[route_index];
+        check(launch_exl3_mul1_gate_up(
+                  expert.gate, expert.up, row_input,
+                  impl_->activation.floats(), 1, impl_->partials.floats(),
+                  up_partials, stream),
+              "launch external device fused gate/up projection");
+        if (device_routing_weights) {
+          check(launch_exl3_mul1_matmul_accumulate_device_weight(
+                    expert.down, impl_->activation.floats(), row_output,
+                    device_routing_weights + route_index, 1,
+                    impl_->partials.floats(), stream),
+                "launch external device weighted down projection");
+        } else {
+          check(launch_exl3_mul1_matmul_accumulate(
+                    expert.down, impl_->activation.floats(), row_output,
+                    routing_weights[route_index], 1, impl_->partials.floats(),
+                    stream),
+                "launch external weighted down projection");
+        }
+      }
+    }
+  };
+
+  std::vector<uintptr_t> graph_key;
+  std::vector<uintptr_t> graph_site_key;
+  if (impl_->capture_external_routed_graphs) {
+    graph_key.reserve(12 + route_count * 24);
+    graph_site_key.reserve(10);
+    const auto add_pointer = [&](const void *pointer) {
+      graph_key.push_back(reinterpret_cast<uintptr_t>(pointer));
+    };
+    const auto add_matrix = [&](const Exl3CudaMatrixView &matrix) {
+      add_pointer(matrix.trellis);
+      add_pointer(matrix.suh);
+      add_pointer(matrix.svh);
+      add_pointer(matrix.bias);
+      graph_key.push_back(static_cast<uintptr_t>(matrix.input_features));
+      graph_key.push_back(static_cast<uintptr_t>(matrix.output_features));
+      graph_key.push_back(static_cast<uintptr_t>(matrix.bits));
+    };
+    graph_key.push_back(static_cast<uintptr_t>(rows));
+    graph_key.push_back(static_cast<uintptr_t>(topk));
+    graph_key.push_back(static_cast<uintptr_t>(hidden));
+    graph_key.push_back(static_cast<uintptr_t>(intermediate));
+    add_pointer(device_input);
+    add_pointer(device_output);
+    add_pointer(device_routing_weights);
+    add_pointer(impl_->activation.data);
+    add_pointer(impl_->partials.data);
+    add_pointer(up_partials);
+    graph_site_key.push_back(static_cast<uintptr_t>(rows));
+    graph_site_key.push_back(static_cast<uintptr_t>(topk));
+    graph_site_key.push_back(static_cast<uintptr_t>(hidden));
+    graph_site_key.push_back(static_cast<uintptr_t>(intermediate));
+    graph_site_key.push_back(reinterpret_cast<uintptr_t>(device_input));
+    graph_site_key.push_back(reinterpret_cast<uintptr_t>(device_output));
+    graph_site_key.push_back(
+        reinterpret_cast<uintptr_t>(device_routing_weights));
+    graph_site_key.push_back(reinterpret_cast<uintptr_t>(impl_->activation.data));
+    graph_site_key.push_back(reinterpret_cast<uintptr_t>(impl_->partials.data));
+    graph_site_key.push_back(reinterpret_cast<uintptr_t>(up_partials));
+    for (size_t route = 0; route < route_count; ++route) {
+      const auto &expert = experts_by_route[route];
+      add_matrix(expert.gate);
+      add_matrix(expert.up);
+      add_matrix(expert.down);
+      if (!device_routing_weights) {
+        uint32_t weight_bits = 0;
+        std::memcpy(&weight_bits, routing_weights + route, sizeof(weight_bits));
+        graph_key.push_back(static_cast<uintptr_t>(weight_bits));
+      }
+    }
+  }
+
+  cudaEvent_t begin_event = nullptr;
+  cudaEvent_t complete_event = nullptr;
+  uint64_t graph_id = 0;
+  bool graph_use_registered = false;
+  const bool trace_graph_capture =
+      std::getenv("MOESTREAM_EXL3_GRAPH_TRACE") != nullptr;
+  const auto capture_and_launch = [&] {
+    cudaGraph_t captured_graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    bool capture_started = false;
+    try {
+      if (trace_graph_capture)
+        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] begin capture routes=%zu\n",
+                     route_count);
+      check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal),
+            "begin external routed FFN capture");
+      capture_started = true;
+      enqueue_sequence();
+      if (trace_graph_capture)
+        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] enqueued routes=%zu\n",
+                     route_count);
+      const cudaError_t capture_status =
+          cudaStreamEndCapture(stream, &captured_graph);
+      capture_started = false;
+      check(capture_status, "end external routed FFN capture");
+      if (trace_graph_capture)
+        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] ended capture\n");
+      check(cudaGraphInstantiate(&executable, captured_graph, nullptr, nullptr,
+                                 0),
+            "instantiate external routed FFN graph");
+      if (trace_graph_capture)
+        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] instantiated graph\n");
+      graph_id = impl_->store_external_graph(
+          std::move(graph_key), std::move(graph_site_key), captured_graph,
+          executable);
+      captured_graph = nullptr;
+      executable = nullptr;
+      graph_use_registered = true;
+      const auto stored = std::find_if(
+          impl_->external_routed_graphs.begin(),
+          impl_->external_routed_graphs.end(),
+          [&](const Impl::CapturedExternalGraph &candidate) {
+            return candidate.id == graph_id;
+          });
+      if (stored == impl_->external_routed_graphs.end())
+        throw std::runtime_error("stored EXL3 routed graph disappeared");
+      if (trace_graph_capture)
+        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] stored graph=%llu\n",
+                     static_cast<unsigned long long>(graph_id));
+      check(cudaGraphLaunch(stored->executable, stream),
+            "launch captured external routed FFN graph");
+      if (trace_graph_capture)
+        std::fprintf(stderr, "[EXL3-GRAPH-TRACE] launched graph=%llu\n",
+                     static_cast<unsigned long long>(graph_id));
+    } catch (...) {
+      if (capture_started) {
+        cudaGraph_t aborted_graph = nullptr;
+        if (cudaStreamEndCapture(stream, &aborted_graph) == cudaSuccess &&
+            aborted_graph)
+          cudaGraphDestroy(aborted_graph);
+      }
+      if (executable)
+        cudaGraphExecDestroy(executable);
+      if (captured_graph)
+        cudaGraphDestroy(captured_graph);
+      throw;
+    }
+  };
+  try {
+    begin_event = impl_->acquire_event();
+    complete_event = impl_->acquire_event();
+    check(cudaEventRecord(begin_event, stream),
+          "record external routed FFN start event");
+    if (impl_->capture_external_routed_graphs) {
+      if (auto *captured = impl_->find_external_graph(graph_key)) {
+        graph_id = captured->id;
+        graph_use_registered = true;
+        if (trace_graph_capture)
+          std::fprintf(stderr, "[EXL3-GRAPH-TRACE] replay graph=%llu\n",
+                       static_cast<unsigned long long>(graph_id));
+        check(cudaGraphLaunch(captured->executable, stream),
+              "replay external routed FFN graph");
+      } else if (impl_->has_external_graph_for_site(graph_site_key)) {
+        ++impl_->counters.routed_graph_eager_fallbacks;
+        enqueue_sequence();
+      } else if (impl_->make_external_graph_room()) {
+        capture_and_launch();
+      } else {
+        ++impl_->counters.routed_graph_eager_fallbacks;
+        enqueue_sequence();
+      }
+    } else {
+      enqueue_sequence();
+    }
+    check(cudaEventRecord(complete_event, stream),
+          "record external routed FFN completion event");
+    Impl::PendingRoutedUse pending;
+    pending.begin = begin_event;
+    pending.complete = complete_event;
+    pending.external_holds = std::move(external_holds);
+    pending.graph_id = graph_id;
+    impl_->pending_routed.push_back(std::move(pending));
+    impl_->scratch_tail = complete_event;
+    impl_->scratch_stream = stream;
+    begin_event = nullptr;
+    complete_event = nullptr;
+    graph_use_registered = false;
+  } catch (...) {
+    cudaStreamSynchronize(stream);
+    if (graph_use_registered)
+      impl_->release_external_graph_use(graph_id);
     impl_->recycle_event(begin_event);
     impl_->recycle_event(complete_event);
     throw;

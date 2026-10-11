@@ -26,6 +26,22 @@
 
 namespace {
 
+void check(cudaError_t status, const char *operation) {
+  if (status != cudaSuccess)
+    throw std::runtime_error(std::string(operation) + ": " +
+                             cudaGetErrorString(status));
+}
+
+struct ExternalExpertStorage {
+  std::vector<uint8_t *> matrices;
+
+  ~ExternalExpertStorage() {
+    for (uint8_t *matrix : matrices)
+      if (matrix)
+        cudaFree(matrix);
+  }
+};
+
 const SafetensorsTensorInfo *find_router(const SafetensorsModelInfo &model) {
   for (const auto &[name, tensor] : model.tensors)
     if (name.find("mtp.") == std::string::npos &&
@@ -97,7 +113,11 @@ int main(int argc, char **argv) {
     const int iterations = argc > 2 ? std::max(1, std::atoi(argv[2])) : 8;
     const int device = argc > 3 ? std::atoi(argv[3]) : 0;
     const int rows = argc > 4 ? std::max(1, std::atoi(argv[4])) : 2;
-    constexpr int topk = 2;
+    const bool external = argc > 5 && std::string(argv[5]) == "--external";
+    const int topk = argc > 6 ? std::atoi(argv[6]) : 2;
+    const bool graph_capture = argc > 7 && std::string(argv[7]) == "--graph";
+    const bool repeat_route_set =
+        std::getenv("MOESTREAM_EXL3_GRAPH_REPEAT_ROUTE") != nullptr;
     int previous_device = 0;
     const cudaError_t current_device_status = cudaGetDevice(&previous_device);
     if (current_device_status != cudaSuccess)
@@ -128,6 +148,8 @@ int main(int argc, char **argv) {
       throw std::runtime_error(error);
     const int experts = static_cast<int>(router_info->shape[0]);
     const int hidden = static_cast<int>(router_info->shape[1]);
+    if (topk <= 0 || topk > experts)
+      throw std::runtime_error("topk must be in [1, expert_count]");
     const std::vector<float> router = decode_router(*router_info, router_bytes);
     std::unordered_map<std::string, const Exl3LinearInfo *> linears;
     for (const auto &linear : contract.linears)
@@ -170,13 +192,27 @@ int main(int argc, char **argv) {
                 route_ids.begin() + static_cast<size_t>(row) * topk);
     }
 
-    const auto load = [&](const std::string &key) {
+    const auto load_safetensors = [&](const std::string &key) {
       std::vector<uint8_t> packed;
       std::string load_error;
       if (!load_exl3_mul1_matrix(model, find_linear(linears, key), packed,
                                  load_error))
         throw std::runtime_error(load_error);
       return packed;
+    };
+    constexpr size_t ddr_cache_budget = 512ull * 1024 * 1024;
+    Exl3CpuMatrixCache ddr_cache(ddr_cache_budget);
+    const auto load = [&](const std::string &key) {
+      auto matrix = ddr_cache.get(key);
+      if (!matrix) {
+        Exl3Mul1MatrixData loaded;
+        std::string load_error;
+        if (!load_exl3_mul1_components(model, find_linear(linears, key),
+                                      loaded, load_error))
+          throw std::runtime_error(load_error);
+        matrix = ddr_cache.insert(key, std::move(loaded));
+      }
+      return exl3_mul1_pack_matrix(matrix->view());
     };
     const auto compute_reference = [&](const std::vector<int32_t> &ids,
                                        const std::vector<float> &weights) {
@@ -189,9 +225,11 @@ int main(int argc, char **argv) {
           const std::string prefix =
               "model.language_model.layers.0.mlp.experts." +
               std::to_string(ids[route]) + ".";
-          const std::vector<uint8_t> gate = load(prefix + "gate_proj");
-          const std::vector<uint8_t> up = load(prefix + "up_proj");
-          const std::vector<uint8_t> down = load(prefix + "down_proj");
+          const std::vector<uint8_t> gate =
+              load_safetensors(prefix + "gate_proj");
+          const std::vector<uint8_t> up = load_safetensors(prefix + "up_proj");
+          const std::vector<uint8_t> down =
+              load_safetensors(prefix + "down_proj");
           std::vector<float> gate_value(intermediate), up_value(intermediate);
           std::vector<float> down_input(intermediate), expert_output(hidden);
           if (!exl3_mul1_matmul_packed(gate.data(), input_row,
@@ -236,12 +274,70 @@ int main(int argc, char **argv) {
     const std::vector<float> reference =
         compute_reference(route_ids, route_weights);
     std::vector<int32_t> alternate_route_ids = route_ids;
-    for (int32_t &expert : alternate_route_ids)
-      expert = (expert + 1) % experts;
+    if (!repeat_route_set)
+      for (int32_t &expert : alternate_route_ids)
+        expert = (expert + 1) % experts;
     const std::vector<float> alternate_reference =
         compute_reference(alternate_route_ids, route_weights);
 
+    std::vector<Exl3GpuExternalExpert> external_experts(
+        static_cast<size_t>(experts));
+    std::vector<std::shared_ptr<ExternalExpertStorage>> external_storage(
+        static_cast<size_t>(experts));
+    if (external) {
+      std::unordered_map<int32_t, bool> selected_experts;
+      for (int32_t expert : route_ids)
+        selected_experts.emplace(expert, true);
+      for (int32_t expert : alternate_route_ids)
+        selected_experts.emplace(expert, true);
+      const char *projection_names[] = {"gate_proj", "up_proj", "down_proj"};
+      for (const auto &[expert_id, unused] : selected_experts) {
+        (void)unused;
+        const std::string prefix =
+            "model.language_model.layers.0.mlp.experts." +
+            std::to_string(expert_id) + ".";
+        auto storage = std::make_shared<ExternalExpertStorage>();
+        Exl3GpuExternalExpert view{};
+        Exl3CudaMatrixView *views[] = {&view.gate, &view.up, &view.down};
+        for (int projection = 0; projection < 3; ++projection) {
+          const std::string key = prefix + projection_names[projection];
+          const auto packed = load_safetensors(key);
+          Exl3PackedMatrixHeader header{};
+          if (packed.size() < sizeof(header))
+            throw std::runtime_error("truncated external EXL3 matrix");
+          std::memcpy(&header, packed.data(), sizeof(header));
+          if (!exl3_valid_packed_header(header, packed.size()))
+            throw std::runtime_error("invalid external EXL3 matrix header");
+          uint8_t *device_packed = nullptr;
+          check(cudaMalloc(&device_packed, packed.size()),
+                "allocate external EXL3 matrix");
+          storage->matrices.push_back(device_packed);
+          check(cudaMemcpy(device_packed, packed.data(), packed.size(),
+                           cudaMemcpyHostToDevice),
+                "upload external EXL3 matrix");
+          *views[projection] = {
+              reinterpret_cast<const uint16_t *>(device_packed +
+                                                 header.trellis_offset),
+              reinterpret_cast<const uint16_t *>(device_packed +
+                                                 header.suh_offset),
+              reinterpret_cast<const uint16_t *>(device_packed +
+                                                 header.svh_offset),
+              (header.flags & kExl3PackedHasBias)
+                  ? reinterpret_cast<const uint16_t *>(device_packed +
+                                                       header.bias_offset)
+                  : nullptr,
+              static_cast<int>(header.input_features),
+              static_cast<int>(header.output_features),
+              static_cast<int>(header.bits)};
+        }
+        view.hold = storage;
+        external_experts[static_cast<size_t>(expert_id)] = view;
+        external_storage[static_cast<size_t>(expert_id)] = std::move(storage);
+      }
+    }
+
     Exl3GpuExecutor executor(device, 8ull * 1024 * 1024 * 1024);
+    executor.set_routed_graph_capture(graph_capture);
     std::vector<std::string> prefixes(static_cast<size_t>(experts));
     for (int expert = 0; expert < experts; ++expert)
       prefixes[static_cast<size_t>(expert)] =
@@ -276,10 +372,23 @@ int main(int argc, char **argv) {
                            intermediate))
       throw std::runtime_error("cannot initialize cache graph state");
     state->set_matrix_loader(load);
+    if (external) {
+      state->set_external_expert_resolver(
+          [&external_experts](
+              const std::string &, int expert_id, int, int,
+              const std::function<std::vector<uint8_t>(const std::string &)> &)
+              -> Exl3GpuExternalExpert {
+            if (expert_id < 0 ||
+                static_cast<size_t>(expert_id) >= external_experts.size() ||
+                !external_experts[static_cast<size_t>(expert_id)].gate.trellis)
+              throw std::runtime_error("external route expert was not staged");
+            return external_experts[static_cast<size_t>(expert_id)];
+          });
+    }
     ggml_backend_sched_set_tensor_backend(scheduler, input_tensor, adapter);
     ggml_backend_sched_set_tensor_backend(scheduler, ids_tensor, adapter);
     ggml_backend_sched_set_tensor_backend(scheduler, weights_tensor, adapter);
-    ggml_tensor *output_tensor = exl3_ggml_map_cached_routed_ffn_host_routes(
+    ggml_tensor *output_tensor = exl3_ggml_map_cached_routed_ffn_device_routes(
         ctx, input_tensor, ids_tensor, weights_tensor, state.get());
     if (!output_tensor)
       throw std::runtime_error("cannot create cache-backed GGML node");
@@ -292,8 +401,6 @@ int main(int argc, char **argv) {
     const auto run = [&](const std::vector<int32_t> &ids,
                          const std::vector<float> &weights,
                          std::vector<float> &result) {
-      if (!state->set_host_routes(ids.data(), weights.data()))
-        throw std::runtime_error("cannot set cache graph routes");
       ggml_backend_tensor_set(input_tensor, input.data(), 0,
                               input.size() * sizeof(float));
       ggml_backend_tensor_set(ids_tensor, ids.data(), 0,
@@ -307,18 +414,49 @@ int main(int argc, char **argv) {
       ggml_backend_tensor_get(output_tensor, result.data(), 0,
                               result.size() * sizeof(float));
     };
+    const bool verify_external_parity =
+        external && !std::getenv("MOESTREAM_EXL3_SKIP_INTERNAL_PARITY");
+    const bool cpu_reference_output =
+        std::getenv("MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT") != nullptr;
+    state->verify_cpu_reference = verify_external_parity || cpu_reference_output;
+    state->model_layer = 0;
     run(route_ids, route_weights, output);
     run(alternate_route_ids, route_weights, output);
+    state->verify_cpu_reference = cpu_reference_output;
+    state->route_readback_calls = 0;
+    state->route_readback_bytes = 0;
+    state->route_readback_ms = 0.0;
+    state->expert_resolution_ms = 0.0;
+    state->ffn_enqueue_ms = 0.0;
+    state->row_batch_wait_ms = 0.0;
+    const cudaStream_t stream = exl3_ggml_cuda_stream(cuda_backend);
+    if (!stream)
+      throw std::runtime_error("cannot get cache graph CUDA stream");
+    cudaEvent_t gpu_begin = nullptr;
+    cudaEvent_t gpu_end = nullptr;
+    check(cudaEventCreate(&gpu_begin), "create cache graph begin event");
+    check(cudaEventCreate(&gpu_end), "create cache graph end event");
+    check(cudaEventRecord(gpu_begin, stream), "record cache graph begin event");
     const auto begin = std::chrono::steady_clock::now();
     for (int iteration = 0; iteration < iterations; ++iteration) {
       const bool alternate = iteration % 2 != 0;
       run(alternate ? alternate_route_ids : route_ids, route_weights, output);
     }
+    const auto end = std::chrono::steady_clock::now();
+    check(cudaEventRecord(gpu_end, stream), "record cache graph end event");
+    check(cudaEventSynchronize(gpu_end), "synchronize cache graph end event");
+    float gpu_elapsed_ms = 0.0f;
+    check(cudaEventElapsedTime(&gpu_elapsed_ms, gpu_begin, gpu_end),
+          "measure cache graph GPU time");
+    cudaEventDestroy(gpu_begin);
+    cudaEventDestroy(gpu_end);
     const double elapsed_us =
         std::chrono::duration<double, std::micro>(
-            std::chrono::steady_clock::now() - begin)
+            end - begin)
             .count() /
         iterations;
+    const double gpu_us =
+        static_cast<double>(gpu_elapsed_ms) * 1000.0 / iterations;
     float max_error = 0.0f;
     const std::vector<float> &expected =
         iterations % 2 == 0 ? alternate_reference : reference;
@@ -333,14 +471,33 @@ int main(int argc, char **argv) {
       active_experts.emplace(expert, true);
     for (int32_t expert : alternate_route_ids)
       active_experts.emplace(expert, true);
-    if (stats.uploads != active_experts.size() * 3)
+    if ((!external && stats.uploads != active_experts.size() * 3) ||
+        (external && stats.uploads != 0))
       throw std::runtime_error(
-          "routed cache did not retain exactly the active EXL3 projections");
-    std::printf("EXL3 GGML cached FFN rows=%d topk=%d route_sets=2 avg_us=%.2f "
-                "max_abs_error=%g uploads=%llu hits=%llu resident_GiB=%.3f\n",
-                rows, topk, elapsed_us, max_error,
+          "unexpected EXL3 projection uploads in routed-cache mode");
+    const Exl3CpuMatrixCacheStats ddr_stats = ddr_cache.stats();
+    const uint64_t expected_ddr_misses =
+        external && !verify_external_parity ? 0 : active_experts.size() * 3;
+    if (ddr_stats.misses != expected_ddr_misses ||
+        ddr_stats.resident_bytes > ddr_cache_budget)
+      throw std::runtime_error(
+          "unexpected DDR EXL3 cache activity in routed-cache mode");
+    std::printf("EXL3 GGML %s FFN rows=%d topk=%d route_sets=2 avg_us=%.2f "
+                "gpu_us=%.2f max_abs_error=%g routed_ffns=%llu "
+                "uploads=%llu hits=%llu DDR_misses=%llu DDR_hits=%llu "
+                "graph_captures=%llu graph_replays=%llu graph_fallbacks=%llu "
+                "resident_GiB=%.3f\n",
+                external ? "external-route" : "cached-route", rows, topk,
+                elapsed_us, gpu_us, max_error,
+                static_cast<unsigned long long>(stats.routed_ffns),
                 static_cast<unsigned long long>(stats.uploads),
                 static_cast<unsigned long long>(stats.cache_hits),
+                static_cast<unsigned long long>(ddr_stats.misses),
+                static_cast<unsigned long long>(ddr_stats.hits),
+                static_cast<unsigned long long>(stats.routed_graph_captures),
+                static_cast<unsigned long long>(stats.routed_graph_replays),
+                static_cast<unsigned long long>(
+                    stats.routed_graph_eager_fallbacks),
                 static_cast<double>(stats.resident_bytes) /
                     (1024.0 * 1024.0 * 1024.0));
     ggml_backend_sched_free(scheduler);

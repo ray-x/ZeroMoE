@@ -38,10 +38,23 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
       if (!std::isfinite(options.gpu_cache_gb) || options.gpu_cache_gb <= 0.0 ||
           options.gpu_cache_gb > 1024.0)
         return std::unexpected("exl3_gpu_cache_gb must be in (0, 1024]");
+      int device_count = 0;
+      const cudaError_t count_status = cudaGetDeviceCount(&device_count);
+      if (count_status != cudaSuccess)
+        return std::unexpected(std::string("EXL3 CUDA device enumeration failed: ") +
+                               cudaGetErrorString(count_status));
+      if (options.gpu_device < 0 || options.gpu_device >= device_count)
+        return std::unexpected("exl3_gpu_device is not an available CUDA device");
       if (options.gpu_expert_split_layer >= 0 &&
           (!std::isfinite(options.gpu_split_cache_gb) || options.gpu_split_cache_gb <= 0.0 ||
-           options.gpu_split_cache_gb > 1024.0 || options.gpu_split_device == options.gpu_device))
+           options.gpu_split_cache_gb > 1024.0 ||
+           options.gpu_split_device == options.gpu_device ||
+           options.gpu_split_device < 0 || options.gpu_split_device >= device_count))
         return std::unexpected("EXL3 GPU layer split needs a distinct device and positive cache");
+      const cudaError_t select_status = cudaSetDevice(options.gpu_device);
+      if (select_status != cudaSuccess)
+        return std::unexpected(std::string("EXL3 CUDA device selection failed: ") +
+                               cudaGetErrorString(select_status));
       engine.exl3_gpu = std::make_shared<Exl3GpuExecutor>(
           options.gpu_device, static_cast<size_t>(options.gpu_cache_gb * 1024.0 * 1024.0 * 1024.0));
 #else
@@ -265,6 +278,10 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
                         << " resident_GiB=" << cache.resident_bytes / (1024.0 * 1024.0 * 1024.0)
                         << "\n";
     }
+    LOG_STREAM_INFO() << "[EXL3-GGML-FFN] custom_op_calls="
+                      << engine.exl3_ggml_custom_ffns
+                      << " native_gpu_fallback_calls="
+                      << engine.exl3_native_gpu_fallback_ffns << "\n";
     if (intervals > 0 && last_cpu_matmuls > first_cpu_matmuls)
       LOG_STREAM_INFO() << "[EXL3-PERF] cpu_matmuls_per_interval="
                         << static_cast<double>(last_cpu_matmuls - first_cpu_matmuls) / intervals
