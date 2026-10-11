@@ -69,3 +69,19 @@ is CPU cold-expert compute and the graph, which prefetch and read layout cannot 
 
 Dynamic VRAM promotion (MOESTREAM_GLM5NEXT_DYNAMIC_CACHE, DYNAMIC_HEAT) is a no-op in this configuration: the aliased-VRAM path hard-sets
 dynamic_expert_cache=false, so those arms (196.5-198 ms) are run-to-run noise (about 4%).
+
+## 6. Why dynamic VRAM promotion was not wired into the aliased path (decision, 2026-10-11)
+The scheduler (heat admission, LRU victim, async H2D worker, map republish) works only for the non-aliased path, where the graph owns its hot
+tensors and the cold source is a full-expert view. In the spread/offload configuration the hot tensors are strided views over `GpuTopology`'s
+per-layer pool (`vram_layer_base`, `vram_slot_stride`), so promotion would have to retarget a pool slot behind the topology's back:
+
+* hot slots are permanently pinned (`pin_expert`, never a victim) and `hold_for_compute` holds are taken for every aliased expert, so the
+  topology's own `upload_expert_async` cannot be used to evict them;
+* `configure_partial_experts` rebuilds `p.hot` / `vram_slot_by_expert` from `expert_vram_cache` at every new graph (each request), and the legacy
+  prefill path resolves experts through `expert_index`; a slot that the graph retargeted but the topology still lists under the old expert would
+  be computed as the OLD expert, silently (finite, fluent, wrong). Doing it safely needs a topology-level "retarget slot" operation that updates
+  `expert_vram_cache`, `expert_index`, pin and hold bookkeeping, plus a source-validity check under `g_arena_mu` (shared) during the copy;
+* the expected gain is small: the offline replay gives about 6% at a 32 GiB pool (heat >= 4, half-life 30, 8 promotions/token) and less at 46-58 GiB
+  where misses are already gone, while every promotion costs a ~6.6 MB H2D plus a bounce copy.
+
+Not implemented. If it is ever picked up, start with the topology retarget operation and a unit test for it, then reuse the existing scheduler.
