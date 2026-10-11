@@ -9,10 +9,15 @@
 #include "cuda_manager.hpp"
 #include "kquant_dequant.hpp"
 #include "engine_config.hpp"
+#include "exl3_cpu.hpp"
 #include "exl3_cuda.hpp"
 #include "exl3_gpu.hpp"
 #include "cuda_kernel_dispatcher.hpp"
 #include "exl3_format.hpp"
+#include "exl3_model_loader.hpp"
+#if defined(MOESTREAM_USE_GGML_CUDA)
+#include "exl3_ggml_ffn.hpp"
+#endif
 
 #include <iostream>
 #include <cassert>
@@ -29,6 +34,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
+#include <unordered_map>
 #include <omp.h>
 #ifdef __linux__
 #include <sys/mman.h>
@@ -6329,6 +6335,48 @@ bool test_qwen_prefill_state_handoff_config() {
     ok = sample.load(config_path) && !sample.qwen4exp_prefill_state_handoff && ok;
     std::remove(config_path);
     std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
+  return ok;
+}
+
+bool test_exl3_ggml_graph_capture_config() {
+    std::cout << "[Test] EXL3 GGML graph-capture config...\n";
+    char config_path[] = "/tmp/moestream_exl3_graph_capture_config_XXXXXX";
+    const int config_fd = mkstemp(config_path);
+    if (config_fd < 0)
+        return false;
+    close(config_fd);
+    const auto write_config = [&](const std::string &extra) {
+        std::ofstream output(config_path);
+        output << "model_path = \"/test/model.gguf\"\n"
+                  << extra
+                  << "[[gpus]]\n"
+                     "device_id = 0\n"
+                     "name = \"test\"\n"
+                     "role = \"dense+moe\"\n"
+                     "vram_gb = 24.0\n"
+                     "dense_gb = 4.0\n"
+                     "kv_cache_gb = 2.0\n"
+                     "moe_cache_gb = 8.0\n";
+        return output.good();
+    };
+    bool ok = write_config("");
+    EngineConfig defaults;
+    ok = ok && defaults.load(config_path) &&
+         !defaults.exl3_ggml_graph_capture;
+    ok = ok && write_config("exl3_ggml_graph_capture = true\n");
+    EngineConfig invalid;
+    ok = ok && invalid.load(config_path) && !invalid.validate();
+    ok = ok && write_config(
+                  "exl3_ggml_bridge_model_path = \"/test/exl3\"\n"
+                  "exl3_ggml_bridge_layer = 0\n"
+                  "exl3_ggml_graph_capture = true\n"
+                  "exl3_gpu_cache_gb = 1.0\n"
+                  "exl3_cpu_expert_cache_gb = 0.0\n");
+    EngineConfig enabled;
+    ok = ok && enabled.load(config_path) && enabled.validate() &&
+         enabled.exl3_ggml_graph_capture;
+    std::remove(config_path);
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
     return ok;
 }
 
@@ -6359,6 +6407,36 @@ bool test_exl3_cpu_dispatch() {
     }
     std::cout << "  -> PASSED\n";
     return true;
+}
+
+bool test_exl3_cpu_matrix_cache() {
+    std::cout << "[Test] EXL3 DDR matrix cache LRU and held entries...\n";
+    const auto matrix = [](uint8_t fill) {
+        Exl3Mul1MatrixData value;
+        value.trellis.assign(16, fill);
+        value.suh.assign(8, fill);
+        value.svh.assign(8, fill);
+        value.input_features = 128;
+        value.output_features = 128;
+        value.bits = 4;
+        return value;
+    };
+    Exl3CpuMatrixCache cache(64);
+    auto held = cache.insert("expert-a.gate_proj", matrix(1));
+    cache.insert("expert-b.gate_proj", matrix(2));
+    auto hit = cache.get("expert-a.gate_proj");
+    if (!hit || hit->trellis.front() != 1 ||
+        cache.stats().resident_bytes != 64)
+        return false;
+    cache.insert("expert-c.gate_proj", matrix(3));
+    if (cache.get("expert-b.gate_proj") ||
+        held->trellis.front() != 1 || hit->trellis.front() != 1)
+      return false;
+    const auto stats = cache.stats();
+    const bool passed = stats.evictions == 1 && stats.resident_bytes == 64 &&
+                        stats.hits == 1 && stats.misses == 1;
+    std::cout << "  " << (passed ? "PASSED" : "FAILED") << "\n";
+    return passed;
 }
 
 bool test_exl3_gpu_hc(int device) {
@@ -6433,6 +6511,401 @@ bool test_exl3_gpu_hc(int device) {
     std::cout << "  device=" << device << " HC device chain "
               << (rejected ? "PASSED" : "FAILED") << "\n";
     return rejected;
+}
+
+bool test_exl3_gpu_routed_device_async(int device) {
+    std::cout << "[Test] EXL3 asynchronous routed cache and shared scratch...\n";
+    constexpr int hidden = 128;
+    constexpr int intermediate = 128;
+    constexpr int bits = 4;
+    std::mt19937 random(90210);
+    std::uniform_real_distribution<float> distribution(-0.4f, 0.4f);
+    std::unordered_map<std::string, std::vector<uint8_t>> packed_matrices;
+    for (int expert = 0; expert < 3; ++expert) {
+        for (int projection = 0; projection < 3; ++projection) {
+            std::vector<uint16_t> trellis(8 * 8 * 16 * bits);
+            std::vector<uint16_t> suh(hidden), svh(intermediate);
+            for (uint16_t &word : trellis)
+                word = static_cast<uint16_t>(random());
+            for (uint16_t &value : suh)
+                value = fp32_to_fp16(distribution(random));
+            for (uint16_t &value : svh)
+                value = fp32_to_fp16(distribution(random));
+            Exl3Mul1MatrixView matrix{trellis.data(), suh.data(), svh.data(),
+                                      nullptr, hidden, intermediate, bits};
+            packed_matrices.emplace(
+                "model.language_model.layers.0.mlp.experts." +
+                    std::to_string(expert) + "." +
+                    (projection == 0 ? "gate_proj" :
+                     projection == 1 ? "up_proj" : "down_proj"),
+                exl3_mul1_pack_matrix(matrix));
+        }
+    }
+    const size_t matrix_bytes = packed_matrices.begin()->second.size();
+    for (const auto &[key, matrix] : packed_matrices)
+        if (matrix.size() != matrix_bytes)
+            return false;
+
+    const auto load = [&](const std::string &key) {
+        const auto found = packed_matrices.find(key);
+        if (found == packed_matrices.end())
+            throw std::runtime_error("missing async EXL3 matrix: " + key);
+        return found->second;
+    };
+    const auto reference = [&](const std::vector<int32_t> &route_ids,
+                               const std::vector<float> &route_weights,
+                               const std::vector<float> &input,
+                               std::vector<float> &output) {
+        output.assign(hidden, 0.0f);
+        for (size_t route = 0; route < route_ids.size(); ++route) {
+            const std::string prefix =
+                "model.language_model.layers.0.mlp.experts." +
+                std::to_string(route_ids[route]) + ".";
+            const auto gate = load(prefix + "gate_proj");
+            const auto up = load(prefix + "up_proj");
+            const auto down = load(prefix + "down_proj");
+            std::vector<float> gate_value(intermediate), up_value(intermediate);
+            std::vector<float> activation(intermediate), expert_output(hidden);
+            if (!exl3_mul1_matmul_packed(gate.data(), input.data(),
+                                        gate_value.data(), 1, hidden,
+                                        intermediate) ||
+                !exl3_mul1_matmul_packed(up.data(), input.data(),
+                                         up_value.data(), 1, hidden,
+                                         intermediate))
+                return false;
+            for (int index = 0; index < intermediate; ++index)
+                activation[index] = gate_value[index] /
+                    (1.0f + std::exp(-gate_value[index])) * up_value[index];
+            if (!exl3_mul1_matmul_packed(down.data(), activation.data(),
+                                        expert_output.data(), 1,
+                                        intermediate, hidden))
+                return false;
+            for (int index = 0; index < hidden; ++index)
+                output[index] += route_weights[route] * expert_output[index];
+        }
+        return true;
+    };
+    const auto close = [](const std::vector<float> &actual,
+                          const std::vector<float> &expected) {
+        double error = 0.0;
+        double energy = 0.0;
+        for (size_t index = 0; index < actual.size(); ++index) {
+            if (!std::isfinite(actual[index]))
+                return false;
+            const double difference = actual[index] - expected[index];
+            error += difference * difference;
+            energy += static_cast<double>(expected[index]) * expected[index];
+        }
+        return std::sqrt(error / std::max(energy, 1e-20)) < 1e-4;
+    };
+
+    struct DeviceResources {
+        cudaStream_t streams[2] = {};
+        float *inputs[3] = {};
+        float *outputs[3] = {};
+        float *partials[2] = {};
+        std::vector<uint8_t *> packed_weights;
+        ~DeviceResources() {
+            for (cudaStream_t stream : streams)
+                if (stream)
+                    cudaStreamSynchronize(stream);
+            for (float *pointer : inputs)
+                if (pointer)
+                    cudaFree(pointer);
+            for (float *pointer : outputs)
+                if (pointer)
+                    cudaFree(pointer);
+            for (float *pointer : partials)
+                if (pointer)
+                    cudaFree(pointer);
+            for (uint8_t *pointer : packed_weights)
+                if (pointer)
+                    cudaFree(pointer);
+            for (cudaStream_t stream : streams)
+                if (stream)
+                    cudaStreamDestroy(stream);
+        }
+    } device_resources;
+
+    try {
+        if (cudaSetDevice(device) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&device_resources.streams[0],
+                                      cudaStreamNonBlocking) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&device_resources.streams[1],
+                                      cudaStreamNonBlocking) != cudaSuccess)
+            return false;
+        std::vector<std::vector<float>> host_inputs(3,
+                                                    std::vector<float>(hidden));
+        for (auto &input : host_inputs)
+            for (float &value : input)
+                value = distribution(random);
+        for (int index = 0; index < 3; ++index)
+            if (cudaMalloc(&device_resources.inputs[index],
+                           hidden * sizeof(float)) != cudaSuccess ||
+                cudaMalloc(&device_resources.outputs[index],
+                           hidden * sizeof(float)) != cudaSuccess)
+                return false;
+        if (cudaMemcpyAsync(device_resources.inputs[0], host_inputs[0].data(),
+                            hidden * sizeof(float), cudaMemcpyHostToDevice,
+                            device_resources.streams[0]) != cudaSuccess ||
+            cudaMemcpyAsync(device_resources.inputs[1], host_inputs[1].data(),
+                            hidden * sizeof(float), cudaMemcpyHostToDevice,
+                            device_resources.streams[1]) != cudaSuccess ||
+            cudaMemcpyAsync(device_resources.inputs[2], host_inputs[2].data(),
+                            hidden * sizeof(float), cudaMemcpyHostToDevice,
+                            device_resources.streams[0]) != cudaSuccess)
+            return false;
+
+        const std::vector<std::string> prefixes = {
+            "model.language_model.layers.0.mlp.experts.0.",
+            "model.language_model.layers.0.mlp.experts.1.",
+            "model.language_model.layers.0.mlp.experts.2."};
+        const std::vector<int32_t> routes_a = {0, 1};
+        const std::vector<float> weights_a = {0.3f, 0.7f};
+        const std::vector<int32_t> routes_b = {1, 0};
+        const std::vector<float> weights_b = {0.6f, 0.4f};
+        const std::vector<int32_t> routes_c = {2};
+        const std::vector<float> weights_c = {1.0f};
+        std::vector<float> expected_a, expected_b, expected_c;
+        if (!reference(routes_a, weights_a, host_inputs[0], expected_a) ||
+            !reference(routes_b, weights_b, host_inputs[1], expected_b) ||
+            !reference(routes_c, weights_c, host_inputs[2], expected_c))
+            return false;
+
+        Exl3GpuExecutor executor(device, 6 * matrix_bytes);
+        executor.routed_ffn_device(
+            prefixes, routes_a.data(), weights_a.data(),
+            device_resources.inputs[0], device_resources.outputs[0], 1, 2,
+            hidden, intermediate, device_resources.streams[0], false, load);
+        executor.routed_ffn_device(
+            prefixes, routes_b.data(), weights_b.data(),
+            device_resources.inputs[1], device_resources.outputs[1], 1, 2,
+            hidden, intermediate, device_resources.streams[1], false, load);
+        executor.routed_ffn_device(
+            prefixes, routes_c.data(), weights_c.data(),
+            device_resources.inputs[2], device_resources.outputs[2], 1, 1,
+            hidden, intermediate, device_resources.streams[0], false, load);
+        if (cudaStreamSynchronize(device_resources.streams[0]) != cudaSuccess ||
+            cudaStreamSynchronize(device_resources.streams[1]) != cudaSuccess)
+            return false;
+        std::vector<float> actual_a(hidden), actual_b(hidden), actual_c(hidden);
+        if (cudaMemcpy(actual_a.data(), device_resources.outputs[0],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(actual_b.data(), device_resources.outputs[1],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(actual_c.data(), device_resources.outputs[2],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+        const Exl3GpuStats stats = executor.stats();
+        const bool passed = close(actual_a, expected_a) &&
+                            close(actual_b, expected_b) &&
+                            close(actual_c, expected_c) &&
+                            stats.routed_ffns == 3 && stats.matmuls == 15 &&
+                            stats.uploads == 9 && stats.evictions == 3 &&
+                            stats.resident_bytes <= 6 * matrix_bytes;
+        std::cout << "  device=" << device << " async routed cache and "
+                  << "cross-stream scratch "
+                  << (passed ? "PASSED" : "FAILED") << "\n";
+        if (!passed)
+            return false;
+
+        const auto device_view = [&](const std::string &key, int input_width,
+                                     int output_width) {
+            const auto &packed = load(key);
+            Exl3PackedMatrixHeader header{};
+            if (packed.size() < sizeof(header))
+                throw std::runtime_error("truncated external test matrix");
+            std::memcpy(&header, packed.data(), sizeof(header));
+            if (!exl3_valid_packed_header(header, packed.size()) ||
+                header.input_features != input_width ||
+                header.output_features != output_width)
+                throw std::runtime_error("invalid external test matrix header");
+            uint8_t *device_packed = nullptr;
+            if (cudaMalloc(&device_packed, packed.size()) != cudaSuccess)
+                throw std::runtime_error("external test matrix allocation failed");
+            device_resources.packed_weights.push_back(device_packed);
+            if (cudaMemcpy(device_packed, packed.data(), packed.size(),
+                           cudaMemcpyHostToDevice) != cudaSuccess)
+                throw std::runtime_error("external test matrix upload failed");
+            return Exl3CudaMatrixView{
+                reinterpret_cast<const uint16_t *>(device_packed +
+                                                   header.trellis_offset),
+                reinterpret_cast<const uint16_t *>(device_packed +
+                                                   header.suh_offset),
+                reinterpret_cast<const uint16_t *>(device_packed +
+                                                   header.svh_offset),
+                (header.flags & kExl3PackedHasBias)
+                    ? reinterpret_cast<const uint16_t *>(device_packed +
+                                                         header.bias_offset)
+                    : nullptr,
+                input_width, output_width, static_cast<int>(header.bits)};
+        };
+        std::vector<Exl3GpuExternalExpert> external_experts(2);
+        std::vector<std::weak_ptr<int>> weak_holds(2);
+        for (int route = 0; route < 2; ++route) {
+            const std::string prefix = prefixes[static_cast<size_t>(route)];
+            external_experts[static_cast<size_t>(route)].gate = device_view(
+                prefix + "gate_proj", hidden, intermediate);
+            external_experts[static_cast<size_t>(route)].up = device_view(
+                prefix + "up_proj", hidden, intermediate);
+            external_experts[static_cast<size_t>(route)].down = device_view(
+                prefix + "down_proj", intermediate, hidden);
+            auto hold = std::make_shared<int>(route);
+            weak_holds[static_cast<size_t>(route)] = hold;
+            external_experts[static_cast<size_t>(route)].hold = hold;
+        }
+        Exl3GpuExecutor external_executor(device, matrix_bytes);
+        external_executor.routed_ffn_device_external(
+            external_experts.data(), weights_a.data(), nullptr,
+            device_resources.inputs[0], device_resources.outputs[0], 1, 2,
+            hidden, intermediate, device_resources.streams[0]);
+        external_executor.routed_ffn_device_external(
+            external_experts.data(), weights_a.data(), nullptr,
+            device_resources.inputs[0], device_resources.outputs[0], 1, 2,
+            hidden, intermediate, device_resources.streams[0]);
+        external_experts.clear();
+        if (cudaStreamSynchronize(device_resources.streams[0]) != cudaSuccess)
+            return false;
+        std::vector<float> external_output(hidden);
+        if (cudaMemcpy(external_output.data(), device_resources.outputs[0],
+                       hidden * sizeof(float), cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+            return false;
+        const Exl3GpuStats external_stats = external_executor.stats();
+        const bool external_passed =
+            close(external_output, expected_a) &&
+            weak_holds[0].expired() && weak_holds[1].expired() &&
+            external_stats.routed_ffns == 2 &&
+            external_stats.matmuls == 12 && external_stats.uploads == 0;
+        std::cout << "  device=" << device << " externally-owned routed weights "
+                  << (external_passed ? "PASSED" : "FAILED") << "\n";
+        if (!external_passed)
+            return false;
+
+        const auto make_packed = [&](int bits) {
+            std::vector<uint16_t> trellis(8 * 8 * 16 * bits);
+            std::vector<uint16_t> suh(hidden), svh(intermediate);
+            for (uint16_t &word : trellis)
+                word = static_cast<uint16_t>(random());
+            for (uint16_t &value : suh)
+                value = fp32_to_fp16(distribution(random));
+            for (uint16_t &value : svh)
+                value = fp32_to_fp16(distribution(random));
+            Exl3Mul1MatrixView matrix{trellis.data(), suh.data(), svh.data(),
+                                      nullptr, hidden, intermediate, bits};
+            return exl3_mul1_pack_matrix(matrix);
+        };
+        const auto mixed_gate_packed = make_packed(3);
+        const auto mixed_up_packed = make_packed(5);
+        const auto upload_view = [&](const std::vector<uint8_t> &packed) {
+            Exl3PackedMatrixHeader header{};
+            if (packed.size() < sizeof(header))
+                throw std::runtime_error("truncated mixed-bit test matrix");
+            std::memcpy(&header, packed.data(), sizeof(header));
+            if (!exl3_valid_packed_header(header, packed.size()))
+                throw std::runtime_error("invalid mixed-bit test matrix");
+            uint8_t *device_packed = nullptr;
+            if (cudaMalloc(&device_packed, packed.size()) != cudaSuccess)
+                throw std::runtime_error("mixed-bit matrix allocation failed");
+            device_resources.packed_weights.push_back(device_packed);
+            if (cudaMemcpy(device_packed, packed.data(), packed.size(),
+                           cudaMemcpyHostToDevice) != cudaSuccess)
+                throw std::runtime_error("mixed-bit matrix upload failed");
+            return Exl3CudaMatrixView{
+                reinterpret_cast<const uint16_t *>(device_packed +
+                                                   header.trellis_offset),
+                reinterpret_cast<const uint16_t *>(device_packed +
+                                                   header.suh_offset),
+                reinterpret_cast<const uint16_t *>(device_packed +
+                                                   header.svh_offset),
+                nullptr, hidden, intermediate, static_cast<int>(header.bits)};
+        };
+        const auto mixed_gate = upload_view(mixed_gate_packed);
+        const auto mixed_up = upload_view(mixed_up_packed);
+        if (cudaMalloc(&device_resources.partials[0],
+                       intermediate * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&device_resources.partials[1],
+                       intermediate * sizeof(float)) != cudaSuccess)
+            return false;
+        std::vector<float> mixed_gate_output(intermediate);
+        std::vector<float> mixed_up_output(intermediate);
+        std::vector<float> mixed_activation(intermediate);
+        if (!exl3_mul1_matmul_packed(
+                mixed_gate_packed.data(), host_inputs[0].data(),
+                mixed_gate_output.data(), 1, hidden, intermediate) ||
+            !exl3_mul1_matmul_packed(
+                mixed_up_packed.data(), host_inputs[0].data(),
+                mixed_up_output.data(), 1, hidden, intermediate))
+            return false;
+        for (int index = 0; index < intermediate; ++index)
+            mixed_activation[static_cast<size_t>(index)] =
+                mixed_gate_output[static_cast<size_t>(index)] /
+                (1.0f + std::exp(-mixed_gate_output[static_cast<size_t>(index)])) *
+                mixed_up_output[static_cast<size_t>(index)];
+        if (launch_exl3_mul1_gate_up(
+                mixed_gate, mixed_up, device_resources.inputs[0],
+                device_resources.outputs[1], 1, device_resources.partials[0],
+                device_resources.partials[1], device_resources.streams[0]) !=
+                cudaSuccess ||
+            cudaStreamSynchronize(device_resources.streams[0]) != cudaSuccess)
+            return false;
+        std::vector<float> mixed_actual(intermediate);
+        if (cudaMemcpy(mixed_actual.data(), device_resources.outputs[1],
+                       intermediate * sizeof(float), cudaMemcpyDeviceToHost) !=
+            cudaSuccess)
+            return false;
+        const bool mixed_passed = close(mixed_actual, mixed_activation);
+        std::cout << "  device=" << device << " mixed-bit gate/up (3/5) "
+                  << (mixed_passed ? "PASSED" : "FAILED") << "\n";
+        if (!mixed_passed)
+            return false;
+
+        Exl3GgmlCachedRoutedFfnState route_state;
+        if (!route_state.initialize(&external_executor, prefixes, 3, 2, hidden,
+                                    intermediate))
+            return false;
+        cudaPointerAttributes route_attributes{};
+        if (cudaPointerGetAttributes(&route_attributes,
+                                     route_state.route_ids_host) !=
+                cudaSuccess ||
+            route_attributes.type != cudaMemoryTypeHost)
+            return false;
+        const std::vector<int32_t> host_route_ids = {0, 1, 1, 2, 2, 0};
+        const std::vector<float> host_route_weights =
+            {0.2f, 0.8f, 0.3f, 0.7f, 0.4f, 0.6f};
+        if (!route_state.set_host_routes(host_route_ids.data(),
+                                         host_route_weights.data()))
+            return false;
+        int32_t *device_route_ids = nullptr;
+        cudaStream_t route_stream = nullptr;
+        if (cudaMalloc(&device_route_ids,
+                       host_route_ids.size() * sizeof(int32_t)) != cudaSuccess ||
+            cudaStreamCreateWithFlags(&route_stream, cudaStreamNonBlocking) !=
+                cudaSuccess) {
+            if (device_route_ids)
+                cudaFree(device_route_ids);
+            return false;
+        }
+        const bool route_copy_ok =
+            cudaMemcpy(device_route_ids, host_route_ids.data(),
+                       host_route_ids.size() * sizeof(int32_t),
+                       cudaMemcpyHostToDevice) == cudaSuccess &&
+            cudaMemcpyAsync(route_state.route_ids_host, device_route_ids,
+                            host_route_ids.size() * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost, route_stream) ==
+                cudaSuccess &&
+            cudaStreamSynchronize(route_stream) == cudaSuccess &&
+            std::equal(host_route_ids.begin(), host_route_ids.end(),
+                       route_state.route_ids_host);
+        cudaStreamDestroy(route_stream);
+        cudaFree(device_route_ids);
+        std::cout << "  device=" << device << " pinned route D2H staging "
+                  << (route_copy_ok ? "PASSED" : "FAILED") << "\n";
+        return route_copy_ok;
+    } catch (const std::exception &error) {
+        std::cerr << "  async routed cache error: " << error.what() << "\n";
+        return false;
+    }
 }
 
 bool test_exl3_cuda_kernels() {
@@ -6640,12 +7113,17 @@ bool test_exl3_cuda_kernels() {
         if (!rejected || dense_executor.stats().evictions != 0) return false;
         std::cout << "  device=" << device << " F32 dispatch and pinned-cache budget PASSED\n";
         if (!test_exl3_gpu_hc(device)) return false;
+        if (!test_exl3_gpu_routed_device_async(device)) return false;
     }
     return cudaSetDevice(original_device) == cudaSuccess;
 }
 
 int main() {
+    if (std::getenv("MOESTREAM_TEST_ONLY_EXL3_GGML_CONFIG"))
+        return test_exl3_ggml_graph_capture_config() ? 0 : 1;
     if (!test_exl3_cpu_dispatch()) return 1;
+    if (!test_exl3_cpu_matrix_cache()) return 1;
+    if (std::getenv("MOESTREAM_TEST_EXL3_CPU_ONLY")) return 0;
     if (!test_exl3_cuda_kernels()) return 1;
     if (std::getenv("MOESTREAM_TEST_EXL3_ONLY")) return 0;
     std::cout << "========================================\n";
@@ -6770,6 +7248,8 @@ int main() {
         test_glm5next_dense_projection_fusion();
     bool gpu_device_allowlist_ok = test_gpu_device_allowlist();
     bool qwen_state_handoff_config_ok = test_qwen_prefill_state_handoff_config();
+    bool exl3_graph_capture_config_ok =
+        test_exl3_ggml_graph_capture_config();
 
     std::cout << "========================================\n";
     if (!fused_kernels_ok) {
@@ -6924,6 +7404,10 @@ int main() {
     }
     if (!qwen_state_handoff_config_ok) {
         std::cout << "❌ Qwen prefill state handoff config test FAILED.\n";
+        return 1;
+    }
+    if (!exl3_graph_capture_config_ok) {
+        std::cout << "❌ EXL3 GGML graph-capture config test FAILED.\n";
         return 1;
     }
     std::cout << "✅ All core engine tests passed successfully!\n";

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <algorithm>
 #ifdef _OPENMP
@@ -37,10 +38,23 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
       if (!std::isfinite(options.gpu_cache_gb) || options.gpu_cache_gb <= 0.0 ||
           options.gpu_cache_gb > 1024.0)
         return std::unexpected("exl3_gpu_cache_gb must be in (0, 1024]");
+      int device_count = 0;
+      const cudaError_t count_status = cudaGetDeviceCount(&device_count);
+      if (count_status != cudaSuccess)
+        return std::unexpected(std::string("EXL3 CUDA device enumeration failed: ") +
+                               cudaGetErrorString(count_status));
+      if (options.gpu_device < 0 || options.gpu_device >= device_count)
+        return std::unexpected("exl3_gpu_device is not an available CUDA device");
       if (options.gpu_expert_split_layer >= 0 &&
           (!std::isfinite(options.gpu_split_cache_gb) || options.gpu_split_cache_gb <= 0.0 ||
-           options.gpu_split_cache_gb > 1024.0 || options.gpu_split_device == options.gpu_device))
+           options.gpu_split_cache_gb > 1024.0 ||
+           options.gpu_split_device == options.gpu_device ||
+           options.gpu_split_device < 0 || options.gpu_split_device >= device_count))
         return std::unexpected("EXL3 GPU layer split needs a distinct device and positive cache");
+      const cudaError_t select_status = cudaSetDevice(options.gpu_device);
+      if (select_status != cudaSuccess)
+        return std::unexpected(std::string("EXL3 CUDA device selection failed: ") +
+                               cudaGetErrorString(select_status));
       engine.exl3_gpu = std::make_shared<Exl3GpuExecutor>(
           options.gpu_device, static_cast<size_t>(options.gpu_cache_gb * 1024.0 * 1024.0 * 1024.0));
 #else
@@ -134,13 +148,47 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
         if (position == 0 && layer % 8 == 0)
           LOG_STREAM_INFO() << "[EXL3] Initial token layer " << layer << " complete\n";
       }
+      engine.qwen4exp_ple_next_pos = position + 1;
     };
     const auto start = std::chrono::steady_clock::now();
     LOG_STREAM_INFO() << "[EXL3] Prefill " << tokens.size() << " tokens\n";
-    for (size_t position = 0; position < tokens.size(); ++position) {
-      forward(tokens[position], static_cast<int>(position));
-      LOG_STREAM_INFO() << "[EXL3] Prefill position " << position << " complete\n";
+    const int prefill_rows = static_cast<int>(tokens.size());
+    std::vector<float> prefill_hidden(
+        static_cast<size_t>(prefill_rows) * cfg.hidden);
+    engine.qwen4exp_ple_token_history.clear();
+    engine.qwen4exp_ple_token_history.reserve(tokens.size());
+    for (int position = 0; position < prefill_rows; ++position) {
+      engine.qwen4exp_ple_token_history.push_back(
+          tokens[static_cast<size_t>(position)]);
+      if (!cpu_embed_token(
+              engine, tokens[static_cast<size_t>(position)],
+              prefill_hidden.data() + static_cast<size_t>(position) * cfg.hidden,
+              cfg.hidden))
+        throw std::runtime_error("EXL3 prefill embedding failed");
     }
+    for (int layer = 0; layer < cfg.n_layers; ++layer) {
+      const auto layer_begin = std::chrono::steady_clock::now();
+      if (!cpu_forward_layer(engine, layer, prefill_hidden.data(),
+                             prefill_rows, 0))
+        throw std::runtime_error("EXL3 prefill failed at layer " +
+                                 std::to_string(layer));
+      layer_seconds[static_cast<size_t>(layer)] +=
+          std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                        layer_begin)
+              .count();
+      for (float value : engine.qwen4exp_hc_stream_buf)
+        if (!std::isfinite(value))
+          throw std::runtime_error("Non-finite EXL3 prefill layer " +
+                                   std::to_string(layer));
+      if (layer % 8 == 0)
+        LOG_STREAM_INFO() << "[EXL3] Prefill layer " << layer
+                          << " complete for " << prefill_rows << " rows\n";
+    }
+    std::memcpy(hidden.data(),
+                prefill_hidden.data() +
+                    static_cast<size_t>(prefill_rows - 1) * cfg.hidden,
+                static_cast<size_t>(cfg.hidden) * sizeof(float));
+    engine.qwen4exp_ple_next_pos = prefill_rows;
     CPUSampler sampler;
     const double prefill_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     int output_tokens = 0;
@@ -230,6 +278,10 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
                         << " resident_GiB=" << cache.resident_bytes / (1024.0 * 1024.0 * 1024.0)
                         << "\n";
     }
+    LOG_STREAM_INFO() << "[EXL3-GGML-FFN] custom_op_calls="
+                      << engine.exl3_ggml_custom_ffns
+                      << " native_gpu_fallback_calls="
+                      << engine.exl3_native_gpu_fallback_ffns << "\n";
     if (intervals > 0 && last_cpu_matmuls > first_cpu_matmuls)
       LOG_STREAM_INFO() << "[EXL3-PERF] cpu_matmuls_per_interval="
                         << static_cast<double>(last_cpu_matmuls - first_cpu_matmuls) / intervals

@@ -318,6 +318,20 @@ if(NOT MOESTREAM_CPU_ONLY)
         list(APPEND MOESTREAM_CUDA_SRCS cuda/qwen4exp_layer13_staging.cu)
     endif()
 
+    # Upstream ExLlamaV3 EXL3 kernels behind the launch_exl3_mul1_* API.
+    # Runtime opt-out: MOESTREAM_EXL3_UPSTREAM=0 (legacy kernels).
+    include(cmake/MoEStreamExl3Upstream.cmake)
+    if(TARGET moestream_exl3_upstream)
+        list(APPEND MOESTREAM_CUDA_SRCS src/exl3_upstream_ops.cu)
+        set_source_files_properties(src/exl3_upstream_ops.cu PROPERTIES
+            INCLUDE_DIRECTORIES "${MOESTREAM_EXLLAMAV3_SRC}")
+        set_source_files_properties(cuda/exl3_matmul.cu src/exl3_gpu.cpp
+            src/exl3_ggml_ffn.cpp src/exl3_upstream_ops.cu
+            PROPERTIES COMPILE_DEFINITIONS MOESTREAM_EXL3_UPSTREAM=1)
+        set(MOESTREAM_EXL3_UPSTREAM_LIB moestream_exl3_upstream)
+        set(MOESTREAM_EXL3_UPSTREAM_OPS src/exl3_upstream_ops.cu)
+    endif()
+
     set(MOESTREAM_OPTIONAL_SRCS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen4exp_layer13_staging.cpp")
         list(APPEND MOESTREAM_OPTIONAL_SRCS src/qwen4exp_layer13_staging.cpp)
@@ -390,7 +404,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86        # Ampere; adjust via -DCMAKE_CUDA_ARCHITECTURES
     )
-    target_link_libraries(moestream PRIVATE
+    target_link_libraries(moestream PRIVATE ${MOESTREAM_EXL3_UPSTREAM_LIB}
         CUDA::cudart
         CUDA::cublas
         CUDA::cublasLt
@@ -409,6 +423,25 @@ if(NOT MOESTREAM_CPU_ONLY)
         endif()
         target_compile_definitions(moestream PRIVATE MOESTREAM_USE_GGML=1)
         target_include_directories(moestream PRIVATE ${MOESTREAM_GGML_SRC_DIR})
+        if(MOESTREAM_USE_GGML_CUDA)
+            target_sources(moestream PRIVATE
+                src/exl3_ggml_backend.cpp
+                src/exl3_ggml_ffn.cpp
+                src/exl3_ggml_model.cpp)
+            target_include_directories(moestream PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
+        endif()
+    endif()
+
+    # Synthetic parity: legacy EXL3 kernel vs upstream exl3_gemm (no model needed).
+    if(TARGET moestream_exl3_upstream)
+        add_executable(exl3_upstream_parity EXCLUDE_FROM_ALL
+            tests/exl3_upstream_parity.cu
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_upstream_parity PRIVATE
+            include "${MOESTREAM_EXLLAMAV3_SRC}")
+        target_link_libraries(exl3_upstream_parity PRIVATE
+            moestream_exl3_upstream CUDA::cudart)
+        set_target_properties(exl3_upstream_parity PROPERTIES CUDA_STANDARD 17)
     endif()
 
     # Native test harness
@@ -469,7 +502,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86
     )
-    target_link_libraries(moestream_tests PRIVATE
+    target_link_libraries(moestream_tests PRIVATE ${MOESTREAM_EXL3_UPSTREAM_LIB}
         CUDA::cudart
         CUDA::cublas
         CUDA::cublasLt
@@ -485,6 +518,15 @@ if(NOT MOESTREAM_CPU_ONLY)
         endif()
         target_compile_definitions(moestream_tests PRIVATE MOESTREAM_USE_GGML=1)
         target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR})
+        if(MOESTREAM_USE_GGML_CUDA)
+            target_sources(moestream_tests PRIVATE
+                src/exl3_ggml_backend.cpp
+                src/exl3_ggml_ffn.cpp
+                src/exl3_ggml_model.cpp
+                src/exl3_model_loader.cpp
+                src/safetensors_adapter.cpp)
+            target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
+        endif()
     endif()
 
     # GGML-only Qwen CPU MoE timing probe.  The same source is also compiled
@@ -509,6 +551,295 @@ if(NOT MOESTREAM_CPU_ONLY)
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86)
     target_link_libraries(exl3_kernel_bench PRIVATE CUDA::cudart)
+
+    if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
+        add_executable(exl3_ggml_custom_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_custom_bench.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_custom_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR})
+        target_compile_definitions(exl3_ggml_custom_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+        set_target_properties(exl3_ggml_custom_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_custom_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+
+        add_executable(exl3_ggml_cuda_adapter_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_adapter_bench.cpp
+            src/exl3_ggml_backend.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_adapter_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_definitions(exl3_ggml_cuda_adapter_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_adapter_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_adapter_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+
+        add_executable(exl3_ggml_cuda_real_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_real_ffn_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_ffn_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_ffn_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_ffn_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_ffn_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_ffn_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_ffn_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_ffn_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_real_routed_ffn_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_routed_ffn_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_routed_ffn_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_real_dynamic_routed_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_dynamic_routed_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_dynamic_routed_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_dynamic_routed_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_dynamic_routed_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_dynamic_routed_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_dynamic_routed_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_dynamic_routed_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_real_router_ffn_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_router_ffn_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_router_ffn_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_router_ffn_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_router_ffn_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_router_ffn_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_router_ffn_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_router_ffn_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_cache_graph_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_cache_graph_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu
+            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+        target_include_directories(exl3_ggml_cuda_cache_graph_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_cache_graph_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_cache_graph_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_cache_graph_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_cache_graph_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda
+            ${MOESTREAM_EXL3_UPSTREAM_LIB})
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_cache_graph_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_real_layer_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_layer_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_layer_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_layer_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_layer_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_layer_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_layer_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_layer_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_real_exl3_layer_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_real_exl3_layer_bench.cpp
+            src/exl3_ggml_backend.cpp
+            src/exl3_ggml_ffn.cpp
+            src/exl3_gpu.cpp
+            src/exl3_model_loader.cpp
+            src/safetensors_adapter.cpp
+            src/exl3_cpu.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_real_exl3_layer_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_ggml_cuda_real_exl3_layer_bench PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        target_compile_definitions(exl3_ggml_cuda_real_exl3_layer_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
+            MOESTREAM_EXL3_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_real_exl3_layer_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_real_exl3_layer_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(exl3_ggml_cuda_real_exl3_layer_bench PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+
+        add_executable(exl3_ggml_cuda_fused_ffn_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_fused_ffn_bench.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_fused_ffn_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_definitions(exl3_ggml_cuda_fused_ffn_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_fused_ffn_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_fused_ffn_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+
+        add_executable(exl3_ggml_cuda_moe_bench EXCLUDE_FROM_ALL
+            bench/exl3_ggml_cuda_moe_bench.cpp
+            cuda/exl3_matmul.cu)
+        target_include_directories(exl3_ggml_cuda_moe_bench PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_GGML_SRC_DIR}
+            ${MOESTREAM_GGML_SRC_DIR}/src)
+        target_compile_definitions(exl3_ggml_cuda_moe_bench PRIVATE
+            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+        set_target_properties(exl3_ggml_cuda_moe_bench PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(exl3_ggml_cuda_moe_bench PRIVATE
+            CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
+    endif()
 
     if(MOESTREAM_USE_GGML AND OpenMP_CXX_FOUND)
         add_executable(exl3_cpu_bench EXCLUDE_FROM_ALL

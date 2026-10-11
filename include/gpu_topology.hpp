@@ -2346,7 +2346,7 @@ public:
         // salvage. Must run strictly before the cudaMemcpy H2D a few lines
         // down, since that's the last point slot->device_ptr still holds
         // the OLD expert's data.
-        if (on_vram_evict && old_layer != -1) {
+        if (on_vram_evict && old_layer != -1 && old_expert >= 0) {
             on_vram_evict(old_layer, old_expert, slot->device_ptr, slot->size, slot->gpu_id);
         }
 
@@ -2583,7 +2583,7 @@ public:
         // upload_expert's own call, same reasoning (see on_vram_evict's
         // comment). Must run before the reads below overwrite this slot's
         // old VRAM content.
-        if (on_vram_evict && old_layer != -1) {
+        if (on_vram_evict && old_layer != -1 && old_expert >= 0) {
             on_vram_evict(old_layer, old_expert, slot->device_ptr, slot->size, slot->gpu_id);
         }
 

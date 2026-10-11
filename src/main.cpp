@@ -7,6 +7,9 @@
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_decode.hpp"
+#if defined(MOESTREAM_EXL3_CUDA)
+#include "exl3_gpu.hpp"
+#endif
 #include "exllamav3_backend.hpp"
 #include "generation_loop.hpp"
 #include "thread_profile.hpp"
@@ -541,6 +544,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   engine.qwen4exp_graph_expert_vram_budget_gb =
       config.qwen4exp_graph_expert_vram_budget_gb;
   engine.qwen4exp_graph_pin_file = config.pin_file;
+  engine.exl3_ggml_bridge_model_path = config.exl3_ggml_bridge_model_path;
+  engine.exl3_ggml_bridge_layer = config.exl3_ggml_bridge_layer;
+  engine.exl3_ggml_bridge_layers = config.exl3_ggml_bridge_layers;
+  engine.exl3_ggml_graph_capture = config.exl3_ggml_graph_capture;
+  engine.exl3_ggml_routed_graph_capture =
+      config.exl3_ggml_routed_graph_capture;
   engine.qwen4exp_option_b_layer = config.qwen4exp_option_b_layer;
   engine.qwen4exp_option_b_top_n = config.qwen4exp_option_b_top_n;
   engine.qwen4exp_option_b_min_coverage =
@@ -752,6 +761,31 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // of whether `gpu` (declared before `engine` above) has already been
   // destroyed by the time engine's destructor runs.
   engine.gpu_device_id = gpu.get_core_device();
+#if defined(MOESTREAM_EXL3_CUDA) && defined(MOESTREAM_USE_GGML_CUDA)
+  if (!engine.exl3_ggml_bridge_model_path.empty()) {
+    const size_t cache_bytes = static_cast<size_t>(
+        config.exl3_gpu_cache_gb * 1024.0 * 1024.0 * 1024.0);
+    try {
+    engine.exl3_gpu_executor_owner = std::make_shared<Exl3GpuExecutor>(
+        engine.gpu_device_id, cache_bytes);
+    engine.exl3_gpu_executor_owner->set_routed_graph_capture(
+        config.exl3_ggml_routed_graph_capture);
+    } catch (const std::exception &error) {
+      return std::unexpected(std::string("Failed to initialize EXL3 GGML "
+                                         "bridge cache: ") + error.what());
+    }
+    engine.exl3_gpu_executor = engine.exl3_gpu_executor_owner.get();
+    if (config.exl3_cpu_expert_cache_gb > 0.0) {
+      const size_t host_cache_bytes = static_cast<size_t>(
+          config.exl3_cpu_expert_cache_gb * 1024.0 * 1024.0 * 1024.0);
+      engine.exl3_cpu_matrix_cache =
+          std::make_shared<Exl3CpuMatrixCache>(host_cache_bytes);
+    }
+    LOG_STREAM_INFO() << "[EXL3-GGML-BRIDGE] cache executor initialized on GPU "
+                      << engine.gpu_device_id << " with "
+                      << config.exl3_gpu_cache_gb << " GiB cache budget\n";
+  }
+#endif
 
   if (!engine.model_file.load_header(model_path)) {
     return std::unexpected(
@@ -1507,14 +1541,17 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // CPU from the DDR arenas, so the legacy VRAM expert cache (pinned + LRU
     // tiers) and the active-layer area are never filled or consulted: a run
     // measured 0 / 4650 slots filled and 0 hits while reserving 6.4 GiB.
-    // Disable them whenever the Qwen4Exp decode graph is requested; the
-    // explicit qwen4exp_option_b_disable_legacy_cache key stays honoured for
-    // runs that still use the older prefill-only graph.
+    // Disable them whenever the Qwen4Exp decode graph is requested, except
+    // when its selected-layer EXL3 custom op explicitly borrows these slots.
+    // The explicit qwen4exp_option_b_disable_legacy_cache key stays honoured
+    // for runs that still use the older prefill-only graph.
     const bool qwen_full_graph_decode =
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         qwen4exp_full_graph_decode_enabled();
+    const bool exl3_ggml_bridge_enabled =
+        !engine.exl3_ggml_bridge_model_path.empty();
     const bool option_b_disable_legacy_cache =
-        qwen_full_graph_decode ||
+        (qwen_full_graph_decode && !exl3_ggml_bridge_enabled) ||
         (config.qwen4exp_option_b_disable_legacy_cache &&
          config.qwen4exp_option_b_top_n > 0 &&
          engine.family_ops.family == ModelFamily::Qwen4Exp);
@@ -4686,6 +4723,20 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     engine.dump_usage(config.pin_file);
     // Prefill-only histogram -- see route_freq_prefill's own comment.
     // No-op (dump_usage_histogram's own empty-path guard) if
+  if (!engine.exl3_ggml_bridge_model_path.empty() &&
+      engine.exl3_gpu_executor) {
+    const Exl3GpuStats exl3_stats = engine.exl3_gpu_executor->stats();
+    LOG_STREAM_INFO()
+        << "[EXL3-GGML-STATS] routed_ffns=" << exl3_stats.routed_ffns
+        << " matmuls=" << exl3_stats.matmuls
+        << " gpu_ffn_ms=" << exl3_stats.routed_ffn_seconds * 1000.0
+        << " routed_graph_captures=" << exl3_stats.routed_graph_captures
+        << " routed_graph_replays=" << exl3_stats.routed_graph_replays
+        << " routed_graph_eager_fallbacks="
+        << exl3_stats.routed_graph_eager_fallbacks
+        << " cache_uploads=" << exl3_stats.uploads
+        << " cache_hits=" << exl3_stats.cache_hits << "\n";
+  }
     // prefill_pin_file isn't configured.
     engine.dump_usage_prefill(config.prefill_pin_file);
   } else {

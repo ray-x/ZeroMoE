@@ -8,6 +8,9 @@
 #ifdef MOESTREAM_EXL3_CUDA
 #include "exl3_gpu.hpp"
 #endif
+#if defined(MOESTREAM_USE_GGML_CUDA)
+#include "exl3_ggml_model.hpp"
+#endif
 #include <stdexcept>
 
 #include <algorithm>
@@ -151,7 +154,7 @@ bool CPUQwen4ExpBackend::dequant_tensor(const CPUQuantizedTensor &t, float *out,
   return true;
 }
 
-bool CPUQwen4ExpBackend::dense_matmul(const CPUEngine &engine,
+bool CPUQwen4ExpBackend::dense_matmul(CPUEngine &engine,
                                       const std::string &name, const float *x,
                                       float *y, int S, int I, int O) {
   const auto *t = engine.find_layer(name);
@@ -166,6 +169,24 @@ bool CPUQwen4ExpBackend::dense_matmul(const CPUEngine &engine,
     throw std::runtime_error("EXL3 projection shape mismatch: " + name);
 #ifdef MOESTREAM_EXL3_CUDA
   if (engine.exl3_gpu) {
+#if defined(MOESTREAM_USE_GGML_CUDA)
+    const std::string graph_key = std::to_string(S) + ":" +
+                                  std::to_string(I) + ":" +
+                                  std::to_string(O);
+    auto &graph = engine.exl3_ggml_dense_graphs[graph_key];
+    if (!graph) {
+      auto candidate = std::make_shared<Exl3GgmlDenseMatmulGraph>();
+      if (candidate->initialize(engine.exl3_gpu.get(), S, I, O))
+        graph = std::move(candidate);
+    }
+    if (graph && graph->run(name, static_cast<uint32_t>(t->meta.type),
+                            t->host_ptr, t->host_size, x, y)) {
+      for (size_t index = 0; index < static_cast<size_t>(S) * O; ++index)
+        if (!std::isfinite(y[index]))
+          throw std::runtime_error("Non-finite EXL3 GGML projection: " + name);
+      return true;
+    }
+#endif
     engine.exl3_gpu->matmul(name, static_cast<uint32_t>(t->meta.type), t->host_ptr,
                             t->host_size, x, y, S, I, O);
     for (size_t index = 0; index < static_cast<size_t>(S) * O; ++index)
@@ -788,6 +809,58 @@ void CPUQwen4ExpBackend::forward_moe(CPUEngine &engine, int layer_idx,
                     logits.data(), S, D, c.n_experts))
     return;
   std::vector<float> out(static_cast<size_t>(S) * D, 0.0f);
+  if (!engine.exl3_model.tensors.empty()) {
+    const size_t route_count = static_cast<size_t>(S) * topk;
+    std::vector<int32_t> route_ids(route_count);
+    std::vector<float> route_weights(route_count);
+    for (int s = 0; s < S; ++s) {
+      float *ls = logits.data() + static_cast<size_t>(s) * c.n_experts;
+      for (int e = 0; e < c.n_experts; ++e)
+        if (!std::isfinite(ls[e]))
+          ls[e] = -1e30f;
+      softmax(ls, c.n_experts);
+      std::vector<int> order(c.n_experts);
+      std::iota(order.begin(), order.end(), 0);
+      std::partial_sort(order.begin(), order.begin() + topk, order.end(),
+                        [&](int a, int b) { return ls[a] > ls[b]; });
+      float sum = 0.0f;
+      for (int k = 0; k < topk; ++k)
+        sum += ls[order[k]];
+      for (int k = 0; k < topk; ++k) {
+        const size_t index = static_cast<size_t>(s) * topk + k;
+        route_ids[index] = order[k];
+        route_weights[index] = c.expert_weights_norm && sum > 0.0f
+                                   ? ls[order[k]] / sum
+                                   : ls[order[k]];
+      }
+    }
+    if (!engine.exl3_routed_ffn_batch(
+            layer_idx, route_ids.data(), route_weights.data(), S,
+            hidden_states, out.data()) &&
+        !engine.exl3_cpu_routed_ffn_batch(
+            layer_idx, route_ids.data(), route_weights.data(), S,
+            hidden_states, out.data())) {
+      for (int s = 0; s < S; ++s) {
+        const int32_t *ids = route_ids.data() + static_cast<size_t>(s) * topk;
+        const float *weights =
+            route_weights.data() + static_cast<size_t>(s) * topk;
+        if (engine.exl3_cpu_routed_ffn(
+                layer_idx, ids, weights, topk,
+                hidden_states + static_cast<size_t>(s) * D,
+                out.data() + static_cast<size_t>(s) * D))
+          continue;
+        for (int k = 0; k < topk; ++k) {
+          std::vector<float> expert_output(D);
+          engine.exl3_expert(
+              layer_idx, ids[k], hidden_states + static_cast<size_t>(s) * D,
+              expert_output.data());
+          for (int index = 0; index < D; ++index)
+            out[static_cast<size_t>(s) * D + index] +=
+                weights[k] * expert_output[index];
+        }
+      }
+    }
+  } else {
   for (int s = 0; s < S; ++s) {
     float *ls = logits.data() + static_cast<size_t>(s) * c.n_experts;
     for (int e = 0; e < c.n_experts; ++e)
@@ -883,6 +956,7 @@ void CPUQwen4ExpBackend::forward_moe(CPUEngine &engine, int layer_idx,
         out[static_cast<size_t>(s) * D + o] += weight * dp[o];
       }
     }
+  }
   }
   const auto *sg = engine.find_layer(p + "ffn_gate_shexp.weight");
   const auto *su = engine.find_layer(p + "ffn_up_shexp.weight");
