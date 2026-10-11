@@ -730,6 +730,9 @@ void offload_report(OffloadState &o, const char *why) {
            (unsigned long long)o.evictions.load(),
            (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
            o.cb_us.load() / 1000.0, (unsigned long long)o.cold_routes.load());
+  LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s sources: store direct=%llu store buffered=%llu model buffered=%llu\n", why,
+           (unsigned long long)o.store.direct_reads(), (unsigned long long)o.store.buffered_reads(),
+           (unsigned long long)o.model.reads.load());
   if (o.residency && offload_async())
     LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s async: demand lookups that waited on an in-flight read=%llu wait=%.1f ms\n", why,
              (unsigned long long)o.residency->waited_experts(), o.residency->wait_ms());

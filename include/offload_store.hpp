@@ -289,6 +289,7 @@ private:
 class ModelReader final : public ExpertSource {
 public:
   bool drop_page_cache = true;
+  std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
   ModelReader() = default;
   ~ModelReader() override { for (int fd : fds_) if (fd >= 0) ::close(fd); }
   ModelReader(const ModelReader &) = delete;
@@ -327,6 +328,7 @@ public:
     return true;
   }
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
+    reads.fetch_add(1, std::memory_order_relaxed);
     if (!contains(layer, expert)) return ReadStatus::NotFound;
     // The three planes sit at unrelated file offsets: read them concurrently (queue depth 3) instead of back to back.
     auto one = [&](int k) {

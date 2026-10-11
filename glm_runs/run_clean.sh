@@ -5,7 +5,8 @@ D=$(cd "$(dirname "$0")" && pwd); N=$1
 quiet() {
   until [ "$(pgrep -c -x 'cicc|ptxas|cc1plus|cc1|nvcc|cmake|ninja|make' 2>/dev/null || echo 0)" = 0 ] \
         && [ "$(awk '{print int($1)}' /proc/loadavg)" -lt 2 ] \
-        && [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ]; do sleep 20; done
+        && [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ] \
+        && ! pgrep -x gguf_tool >/dev/null && [ ! -e "$HOME/work/.no-arms" ]; do sleep 20; done
 }
 for k in 1 2 3; do
   quiet
