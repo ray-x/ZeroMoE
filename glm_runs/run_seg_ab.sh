@@ -11,11 +11,12 @@ for f in glob.glob('/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_
     fd=os.open(f,os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)
 PY
 sed "s#baseline.engine.log#pinab/$N.engine.log#" $B/spread_off.toml > $B/pinab/$N.toml
+[ -n "$MODEL_DIR" ] && sed -i "s#^model_path *=.*#model_path = \"$MODEL_DIR\"#" $B/pinab/$N.toml
 export MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=${DDR:-32}
 export MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=${PINNED:-0.5} MOESTREAM_GLM5NEXT_OFFLOAD_POLICY=${POLICY:-lru}
 export MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION=${PROBATION:-0.25} MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP=${BYTECAP:-0}
 export MOESTREAM_GLM5NEXT_OFFLOAD_STORE=${STORE:-/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf}
-export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf
+export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=${MODEL_DIR:-/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf}
 export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=$(dirname "$B")/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
 export MOESTREAM_GLM5NEXT_OFFLOAD_THP=${THP:-0}
 [ -n "$LAYER_TIMING" ] && export MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1

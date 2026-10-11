@@ -26,6 +26,7 @@
 #include "moe_partial_route.hpp"
 #include "moe_partial_route_ggml.hpp"
 
+#include <filesystem>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -813,7 +814,14 @@ OffloadState *get_offload(const StreamingEngine &engine,
       return nullptr;
     }
     const size_t pos = first_shard.rfind("-00001-of-");
-    if (pos == std::string::npos) {
+    std::error_code dir_ec;
+    if (std::filesystem::is_directory(first_shard, dir_ec)) {
+      // A directory of shards (what `gguf_tool pack` writes: repacked-<name>-partNNNNN-of-NNNNN.gguf): every .gguf, sorted.
+      for (const auto &entry : std::filesystem::directory_iterator(first_shard))
+        if (entry.is_regular_file() && entry.path().extension() == ".gguf")
+          shards.push_back(entry.path().string());
+      std::sort(shards.begin(), shards.end());
+    } else if (pos == std::string::npos) {
       shards.push_back(first_shard);
     } else {
       const std::string head = first_shard.substr(0, pos);
