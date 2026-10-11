@@ -3,7 +3,7 @@
 # job or another engine ran next to it. A contaminated attempt is kept as NAME.badK.* for the record and never used for timing.
 D=$(cd "$(dirname "$0")" && pwd); N=$1
 quiet() {
-  until [ "$(pgrep -c -x 'cicc|ptxas|cc1plus|cc1|nvcc|cmake|ninja|make' 2>/dev/null || echo 0)" = 0 ] \
+  until [ "$(pgrep -x 'cicc|ptxas|cc1plus|cc1|nvcc|cmake|ninja|make' | wc -l)" = 0 ] \
         && [ "$(awk '{print int($1)}' /proc/loadavg)" -lt 2 ] \
         && [ -z "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null)" ] \
         && ! pgrep -x gguf_tool >/dev/null && [ ! -e "$HOME/work/.no-arms" ]; do sleep 20; done

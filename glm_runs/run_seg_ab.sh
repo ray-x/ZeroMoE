@@ -31,7 +31,7 @@ export MOESTREAM_GLM5NEXT_CPU_THREADS=8 CUDA_VISIBLE_DEVICES=0 MOESTREAM_BENCH_I
     if [ -n "$pid" ] && [ -r /proc/$pid/stat ]; then
       awk -v t="$(date +%s.%N)" '{print t, $14, $15}' /proc/$pid/stat >> $B/pinab/$N.cpu.csv 2>/dev/null
       # contamination watch: compile jobs or other GPU/engine processes running next to the arm
-      nc=$(pgrep -c -x 'cicc|ptxas|cc1plus|cc1|nvcc|cmake|ninja|make|ld|as' 2>/dev/null); no=$(pgrep -x 'llama-bench|llama-cli|llama-server|ollama|vllm' 2>/dev/null | wc -l)
+      nc=$(pgrep -x 'cicc|ptxas|cc1plus|cc1|nvcc|cmake|ninja|make|ld|as' | wc -l); no=$(pgrep -x 'llama-bench|llama-cli|llama-server|ollama|vllm' 2>/dev/null | wc -l)
       echo "$(date +%s.%N) $(cut -d' ' -f1 /proc/loadavg) ${nc:-0} $no" >> $B/pinab/$N.load.csv 2>/dev/null
     fi
     sleep 1
