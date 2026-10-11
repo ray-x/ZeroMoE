@@ -981,6 +981,15 @@ static void test_embedded_store(const std::string &dir) {
     OffloadStore s2;
     CHECK(s2.open_auto(solo, nullptr) && s2.size() == a.size());
   }
+  { // a store striped over two "drives": a ':' list of a stand-alone store and a model with embedded blocks
+    const std::string sa = dir + "/stripe-a.gguf", sb = sub + "/model-00002-of-00002.gguf";
+    std::vector<ExpertKey> only_a;
+    for (int e = 0; e < 3; ++e) only_a.push_back({3, e});
+    write_store(sa, only_a, planes);
+    OffloadStore st;
+    CHECK(st.open_auto(sa + ":" + sb, nullptr) && st.size() == only_a.size() + b.size());
+    CHECK(st.contains(3, 2) && st.contains(5, 0) && !st.contains(4, 0));
+  }
   { // a file without any offload.* tensor is refused
     OffloadStore st;
     std::string err;

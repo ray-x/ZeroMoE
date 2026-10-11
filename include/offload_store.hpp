@@ -281,8 +281,31 @@ public:
 
   // Open either a stand-alone store (architecture moestream-offload) or the shards of a model that embeds the blocks. `path` may be a
   // file or a directory of shards.
+  // `path` may also be a ':'-separated list of files/directories (a store striped over several drives: each expert lives in exactly one
+  // of them, e.g. alternate layers on two NVMes so a demand miss and the next layer's prefetch read from different devices).
   bool open_auto(const std::string &path, std::string *err = nullptr, bool try_direct = true) {
     std::error_code ec;
+    if (path.find(':') != std::string::npos) {
+      std::vector<std::string> files;
+      size_t p = 0;
+      while (p <= path.size()) {
+        size_t q = path.find(':', p);
+        if (q == std::string::npos) q = path.size();
+        const std::string one = path.substr(p, q - p);
+        p = q + 1;
+        if (one.empty()) continue;
+        if (std::filesystem::is_directory(one, ec)) {
+          std::vector<std::string> in_dir;
+          for (const auto &e : std::filesystem::directory_iterator(one))
+            if (e.is_regular_file() && e.path().extension() == ".gguf") in_dir.push_back(e.path().string());
+          std::sort(in_dir.begin(), in_dir.end());
+          files.insert(files.end(), in_dir.begin(), in_dir.end());
+        } else {
+          files.push_back(one);
+        }
+      }
+      return open_embedded(files, err, try_direct);
+    }
     if (std::filesystem::is_directory(path, ec)) {
       std::vector<std::string> files;
       for (const auto &e : std::filesystem::directory_iterator(path))
