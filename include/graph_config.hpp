@@ -103,6 +103,18 @@ inline long integer(const char *name, long dflt) {
   return (end == v || *end != '\0' || errno != 0) ? dflt : n;
 }
 
+// Legacy readers: atoi/atof semantics (leading digits are parsed, trailing
+// junk ignored), `dflt` when unset or empty. Kept so call sites that used
+// `v && v[0] ? atoi(v) : dflt` convert without a behaviour change.
+inline int atoi_or(const char *name, int dflt) {
+  const char *v = env(name);
+  return v && v[0] ? std::atoi(v) : dflt;
+}
+inline double atof_or(const char *name, double dflt) {
+  const char *v = env(name);
+  return v && v[0] ? std::atof(v) : dflt;
+}
+
 inline double real(const char *name, double dflt) {
   const char *v = env(name);
   if (!v || !v[0])

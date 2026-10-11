@@ -9,6 +9,7 @@
 // shape for MoEStream's model representation.
 
 #include "graph_config.hpp"
+#include "../models/family_spec.hpp"
 #include "moe_routed_config.hpp"
 #include "moe_routed_ggml.hpp"
 #include "ggml_qwen4exp_graph.hpp"
@@ -6253,7 +6254,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     log_layer0_diag_tensor("gate_up_weight", gate_up_exps);
   }
   const moe_routed::RouterSpec rspec =
-      moe_routed::router_spec(c, g.S, /*honor_gating_func=*/false);
+      family_spec(g.engine->family_ops.family).router_spec(c, g.S);
   ggml_tensor *probs = nullptr;
   if (!fixed_route_ids || !fixed_route_weights || probs_out)
     probs = moe_routed::gate_probs(ctx, rspec, router, cur);

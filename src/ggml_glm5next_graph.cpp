@@ -28,6 +28,7 @@
 #include "mmid_route_skip.hpp"
 #include "moe_partial_route.hpp"
 #include "moe_partial_route_ggml.hpp"
+#include "../models/family_spec.hpp"
 #include "moe_routed_config.hpp"
 #include "moe_routed_ggml.hpp"
 
@@ -122,8 +123,7 @@ bool offload_async() {
 
 int offload_first_layer() {
   static const int first = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER");
-    return v && v[0] ? std::atoi(v) : -1;
+    return moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER", -1);
   }();
   return first;
 }
@@ -354,8 +354,7 @@ int pilot_stage_k() {
 // of the layer that needs them; only the first pilot_stage_k() resident ones are copied into the VRAM ring.
 bool pilot_prefetch_on() {
   static const bool on = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
-    return v && std::atoi(v) > 0;
+    return moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PILOT_PREFETCH", 0) > 0;
   }();
   return on;
 }
@@ -392,8 +391,7 @@ int pilot_lookahead() {
 // MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE=x: only prefetch pilot candidates whose router score is >= x.
 float pilot_min_score() {
   static const float v = [] {
-    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE");
-    return e && e[0] ? (float)std::atof(e) : -1e30f;
+    return (float)moestream::graphcfg::atof_or("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE", -1e30f);
   }();
   return v;
 }
@@ -4997,11 +4995,12 @@ ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, 
   return out;
 }
 
-// MOESTREAM_GLM5NEXT_EARLY_READY=1: run each layer's cold (CPU) experts on a private
-// lane that starts as soon as the routed ids reach the host, instead of after the
-// layer's GPU work. Decode only; off by default until it is measured.
+// Run each layer's cold (CPU) experts on a private lane that starts as soon as the
+// routed ids reach the host, instead of after the layer's GPU work. Decode only.
 bool early_ready_wanted() {
-  static const bool on = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_EARLY_READY");
+  // On by default (4-pair A/B: +1.9% decode, logits identical);
+  // MOESTREAM_GLM5NEXT_EARLY_READY=0 opts out.
+  static const bool on = moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_EARLY_READY");
   return on;
 }
 
@@ -5177,7 +5176,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         gate_up ? (long long)gate_up->ne[2] : -1);
   }
 
-  const moe_routed::RouterSpec rspec = moe_routed::router_spec(c, g.S);
+  const moe_routed::RouterSpec rspec =
+      family_spec(g.engine->family_ops.family).router_spec(c, g.S);
   ggml_tensor *probs = moe_routed::gate_probs(ctx, rspec, router, cur);
   // DeepSeek-V4's first hash-routed layers use a token-id -> expert table
   // for selection, while the learned router still supplies the unbiased
@@ -5335,10 +5335,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       }
     }
     EarlyReadyLane *lane = nullptr;
-    if (has_cold && early_ready_wanted() && layer == c.first_dense + 1)
-      LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d conditions: stage=%d hot1=%zu clamp=%g\n",
-               layer, stage ? 1 : 0, partial->hot1.size(), (double)clamp);
-    if (has_cold && early_ready_wanted() && !stage && partial->hot1.empty()) {
+    if (has_cold && early_ready_wanted() && !stage && partial->hot1.empty() &&
+        family_spec(g.engine->family_ops.family).supports_cpu_lane()) {
       moe_routed::ExpertWeights cold_w;
       cold_w.gate_up = gate_up;
       cold_w.gate = ge;
