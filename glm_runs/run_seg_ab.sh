@@ -3,7 +3,7 @@
 # GLM-5.3-Flash SSD offload, 3090 only, 5 prompt/decode rounds with different topics in one session. Refuses to run
 # while nvtop/htop or another moestream is up (they perturb timing).
 B=$(cd "$(dirname "$0")" && pwd); N=$1; cd "$(dirname "$B")"
-if pgrep -x nvtop >/dev/null || pgrep -x htop >/dev/null; then echo "refusing: nvtop/htop running" >&2; exit 3; fi
+if [ -z "$ALLOW_MONITORS" ] && { pgrep -x nvtop >/dev/null || pgrep -x htop >/dev/null; }; then echo "refusing: nvtop/htop running" >&2; exit 3; fi
 for w in $(seq 1 120); do pgrep -x moestream >/dev/null || break; sleep 5; done
 python3 - <<'PY'
 import os,glob
