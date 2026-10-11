@@ -402,6 +402,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen_cpu_moe.cpp
         src/ggml_qwen4exp_graph.cpp
         src/ggml_glm5next_graph.cpp
+        src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
         src/ggml_glm5next_proj_backend.cpp
@@ -501,6 +502,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen_cpu_moe.cpp
         src/ggml_qwen4exp_graph.cpp
         src/ggml_glm5next_graph.cpp
+        src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
         src/ggml_glm5next_proj_backend.cpp
