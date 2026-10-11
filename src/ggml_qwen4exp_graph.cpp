@@ -9,6 +9,7 @@
 // shape for MoEStream's model representation.
 
 #include "graph_config.hpp"
+#include "moe_routed_ggml.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "option_b_global_hot.hpp"
 #include "qwen4exp_adaptive_policy.hpp"
@@ -7481,19 +7482,20 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     log_layer0_diag_tensor("down_weight", down_exps);
     log_layer0_diag_tensor("gate_up_weight", gate_up_exps);
   }
+  moe_routed::RouterSpec rspec;
+  rspec.n_experts = c.n_experts;
+  rspec.topk = c.topk;
+  rspec.n_tokens = g.S;
+  rspec.weights_norm = c.expert_weights_norm;
+  rspec.weights_scale = c.expert_weights_scale;
   ggml_tensor *probs = nullptr;
-  if (!fixed_route_ids || !fixed_route_weights || probs_out) {
-    ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
-    probs = ggml_soft_max(ctx, logits);
-  }
+  if (!fixed_route_ids || !fixed_route_weights || probs_out)
+    probs = moe_routed::gate_probs(ctx, rspec, router, cur);
   if (probs_out)
     *probs_out = probs;
   ggml_tensor *ids = fixed_route_ids;
-  if (!ids) {
-    ggml_tensor *selection =
-        selection_bias ? ggml_add(ctx, probs, selection_bias) : probs;
-    ids = ggml_argsort_top_k(ctx, selection, c.topk);
-  }
+  if (!ids)
+    ids = moe_routed::select_ids(ctx, rspec, probs, selection_bias);
   if (!ids)
     return nullptr;
   if (!fixed_route_ids && g.decode_mode && g.stage_enabled &&
@@ -7551,19 +7553,8 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     *ids_out = ggml_cont(ctx, ids);
   }
   ggml_tensor *weights = fixed_route_weights;
-  if (!weights) {
-    ggml_tensor *probs3 = ggml_reshape_3d(ctx, probs, 1, c.n_experts, g.S);
-    weights = ggml_get_rows(ctx, probs3, ids);
-    ggml_tensor *weights2 = ggml_reshape_2d(ctx, weights, c.topk, g.S);
-    if (c.expert_weights_norm) {
-      ggml_tensor *sum = ggml_sum_rows(ctx, weights2);
-      sum = ggml_clamp(ctx, sum, 6.103515625e-5f, INFINITY);
-      weights2 = ggml_div(ctx, weights2, sum);
-    }
-    if (c.expert_weights_scale != 0.0f && c.expert_weights_scale != 1.0f)
-      weights2 = ggml_scale(ctx, weights2, c.expert_weights_scale);
-    weights = ggml_reshape_3d(ctx, weights2, 1, c.topk, g.S);
-  }
+  if (!weights)
+    weights = moe_routed::route_weights(ctx, rspec, probs, ids);
   if (!weights)
     return nullptr;
   trace_phase2_moe("router_weights", weights);
@@ -7678,14 +7669,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         // strategy that fully replaces the ordinary mul_mat_id chain.
         ggml_tensor *weighted_s = ggml_mul(ctx, down_s, weights);
         ggml_tensor *out_s =
-            ggml_view_2d(ctx, weighted_s, g.D, g.S, weighted_s->nb[2], 0);
-        out_s = ggml_cont(ctx, out_s);
-        for (int k = 1; k < c.topk; ++k) {
-          ggml_tensor *e = ggml_view_2d(
-              ctx, weighted_s, g.D, g.S, weighted_s->nb[2],
-              static_cast<size_t>(k) * weighted_s->nb[1]);
-          out_s = ggml_add(ctx, out_s, e);
-        }
+            moe_routed::sum_topk(ctx, weighted_s, g.D, g.S, c.topk);
         (void)layer;
         return out_s;
       }
@@ -7916,14 +7900,16 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         LOG_INFO("[OPTION-B-EARLY-READY] layer=%d private CPU graph enabled\n", layer);
       }
 
-      ggml_tensor *up_g = ggml_mul_mat_id(ctx, up_exps_gpu, input3, ids_gpu);
-      trace_phase2_moe("up_gpu", up_g);
-      ggml_tensor *gate_g = ggml_mul_mat_id(ctx, gate_exps_gpu, input3, ids_gpu);
-      trace_phase2_moe("gate_gpu", gate_g);
-      ggml_tensor *act_g = ggml_swiglu_split(ctx, gate_g, up_g);
-      trace_phase2_moe("activation_gpu", act_g);
-      ggml_tensor *experts_gpu =
-          ggml_mul_mat_id(ctx, down_exps_gpu, act_g, ids_gpu);
+      moe_routed::ExpertWeights hot_w;
+      hot_w.gate = gate_exps_gpu;
+      hot_w.up = up_exps_gpu;
+      hot_w.down = down_exps_gpu;
+      const moe_routed::FfnNodes hot_ffn =
+          moe_routed::expert_ffn(ctx, hot_w, input3, ids_gpu);
+      trace_phase2_moe("up_gpu", hot_ffn.up);
+      trace_phase2_moe("gate_gpu", hot_ffn.gate);
+      trace_phase2_moe("activation_gpu", hot_ffn.act);
+      ggml_tensor *experts_gpu = hot_ffn.down;
       trace_phase2_moe("down_gpu", experts_gpu);
 
       ggml_tensor *hot_weighted = ggml_mul(ctx, experts_gpu, weights_gpu);
@@ -7932,11 +7918,13 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       if (stage != g.early_ready.end() && stage->second->stage_target) {
         auto &early = *stage->second;
         auto &pool = *early.stage_target;
-        auto *up = ggml_mul_mat_id(ctx, pool.weights[1], input3, early.stage_gpu_ids);
-        auto *gate = ggml_mul_mat_id(ctx, pool.weights[0], input3, early.stage_gpu_ids);
-        auto *act = ggml_swiglu_split(ctx, gate, up);
-        auto *down = ggml_mul_mat_id(ctx, pool.weights[2], act, early.stage_gpu_ids);
-        auto *staged_weighted = ggml_mul(ctx, down, ggml_mul(ctx, weights, early.stage_gpu_mask));
+        moe_routed::ExpertWeights stage_w;
+        stage_w.gate = pool.weights[0];
+        stage_w.up = pool.weights[1];
+        stage_w.down = pool.weights[2];
+        const moe_routed::FfnNodes stage_ffn =
+            moe_routed::expert_ffn(ctx, stage_w, input3, early.stage_gpu_ids);
+        auto *staged_weighted = ggml_mul(ctx, stage_ffn.down, ggml_mul(ctx, weights, early.stage_gpu_mask));
         if (pool.verify_enabled)
           GGML_ASSERT(pool.prepare_verification(staged_weighted, g.early_stage_pools.front().get()));
         hot_weighted = ggml_add(ctx, hot_weighted, staged_weighted);
@@ -7945,14 +7933,16 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         // Submit hot work before the independent private CPU marker.
         ggml_build_forward_expand(g.graph, hot_weighted);
       } else {
-        ggml_tensor *up_c = ggml_mul_mat_id(ctx, up_exps, input3, ids_cpu);
-        trace_phase2_moe("up_cpu", up_c);
-        ggml_tensor *gate_c = ggml_mul_mat_id(ctx, gate_exps, input3, ids_cpu);
-        trace_phase2_moe("gate_cpu", gate_c);
-        ggml_tensor *act_c = ggml_swiglu_split(ctx, gate_c, up_c);
-        trace_phase2_moe("activation_cpu", act_c);
-        ggml_tensor *experts_cpu =
-            ggml_mul_mat_id(ctx, down_exps, act_c, ids_cpu);
+        moe_routed::ExpertWeights cold_w;
+        cold_w.gate = gate_exps;
+        cold_w.up = up_exps;
+        cold_w.down = down_exps;
+        const moe_routed::FfnNodes cold_ffn =
+            moe_routed::expert_ffn(ctx, cold_w, input3, ids_cpu);
+        trace_phase2_moe("up_cpu", cold_ffn.up);
+        trace_phase2_moe("gate_cpu", cold_ffn.gate);
+        trace_phase2_moe("activation_cpu", cold_ffn.act);
+        ggml_tensor *experts_cpu = cold_ffn.down;
         trace_phase2_moe("down_cpu", experts_cpu);
         cold_weighted = ggml_mul(ctx, experts_cpu, weights_cpu);
         trace_phase2_moe("weighted_cpu", cold_weighted);
@@ -7963,33 +7953,21 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
 
   if (!experts) {
-    ggml_tensor *up = nullptr;
-    ggml_tensor *gate = nullptr;
-    ggml_tensor *gate_up = nullptr; // only set on the fused path
-    if (gate_up_exps) {
-      // llama.cpp's Qwen graph and the CPU runner use one routed matmul for the
-      // adjacent gate+up planes, then split the result into two views.  The
-      // tensor is a zero-copy view over the shared DDR arena for CPU layers;
-      // GPU layers may use the same representation when available.
-      gate_up = ggml_mul_mat_id(ctx, gate_up_exps, input3, ids);
-      if (gate_up) {
-        gate = ggml_view_3d(ctx, gate_up, gate_up->ne[0] / 2,
-                            gate_up->ne[1], gate_up->ne[2], gate_up->nb[1],
-                            gate_up->nb[2], 0);
-        up = ggml_view_3d(ctx, gate_up, gate_up->ne[0] / 2,
-                          gate_up->ne[1], gate_up->ne[2], gate_up->nb[1],
-                          gate_up->nb[2],
-                          static_cast<size_t>(gate_up->ne[0] / 2) *
-                              gate_up->nb[0]);
-      }
-    } else {
-      // Separate-tensor fallback for layers whose source arena cannot be
-      // presented as adjacent, type-matched gate+up planes.
-      up = ggml_mul_mat_id(ctx, up_exps, input3, ids);
-      gate = ggml_mul_mat_id(ctx, gate_exps, input3, ids);
-    }
-    ggml_tensor *act = ggml_swiglu_split(ctx, gate, up);
-    ggml_tensor *down = ggml_mul_mat_id(ctx, down_exps, act, ids);
+    // llama.cpp's Qwen graph and the CPU runner use one routed matmul for the
+    // adjacent gate+up planes (a zero-copy view over the shared DDR arena for
+    // CPU layers); layers whose source arena cannot present adjacent,
+    // type-matched planes fall back to separate gate and up matmuls.
+    moe_routed::ExpertWeights ew;
+    ew.gate_up = gate_up_exps;
+    ew.gate = gate_exps;
+    ew.up = up_exps;
+    ew.down = down_exps;
+    const moe_routed::FfnNodes ffn = moe_routed::expert_ffn(ctx, ew, input3, ids);
+    ggml_tensor *up = ffn.up;
+    ggml_tensor *gate = ffn.gate;
+    ggml_tensor *gate_up = ffn.gate_up; // only set on the fused path
+    ggml_tensor *act = ffn.act;
+    ggml_tensor *down = ffn.down;
     experts = ggml_mul(ctx, down, weights);
     if (layer0_diag) {
       g.layer0_diag_gate = gate;
@@ -8026,13 +8004,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     }
   }
 
-  ggml_tensor *out = ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2], 0);
-  out = ggml_cont(ctx, out);
-  for (int k = 1; k < c.topk; ++k) {
-    ggml_tensor *e = ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2],
-                                  static_cast<size_t>(k) * experts->nb[1]);
-    out = ggml_add(ctx, out, e);
-  }
+  ggml_tensor *out = moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
   if (layer13_moe_diag)
     g.layer13_moe_diag = layer13_moe_diag_snapshot(
         g, ctx, out, GGML_TYPE_F32, {g.D, g.S},

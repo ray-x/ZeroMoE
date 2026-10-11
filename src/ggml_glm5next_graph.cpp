@@ -27,6 +27,7 @@
 #include "mmid_route_skip.hpp"
 #include "moe_partial_route.hpp"
 #include "moe_partial_route_ggml.hpp"
+#include "moe_routed_ggml.hpp"
 
 #include <algorithm>
 #include <array>
@@ -6344,27 +6345,31 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         gate_up ? (long long)gate_up->ne[2] : -1);
   }
 
-  ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
-  ggml_tensor *probs = nullptr;
+  moe_routed::RouterSpec rspec;
+  rspec.n_experts = c.n_experts;
+  rspec.topk = c.topk;
+  rspec.n_tokens = g.S;
+  rspec.weights_norm = c.expert_weights_norm;
+  rspec.weights_scale = c.expert_weights_scale;
   switch (c.gating_func) {
   case GatingFunc::Sigmoid:
-    probs = ggml_sigmoid(ctx, logits);
+    rspec.gating = moe_routed::Gating::Sigmoid;
     break;
   case GatingFunc::SqrtSoftplus:
-    probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
+    rspec.gating = moe_routed::Gating::SqrtSoftplus;
     break;
   case GatingFunc::Softmax:
   default:
-    probs = ggml_soft_max(ctx, logits);
+    rspec.gating = moe_routed::Gating::Softmax;
     break;
   }
-  ggml_tensor *selection = bias ? ggml_add(ctx, probs, bias) : probs;
+  ggml_tensor *probs = moe_routed::gate_probs(ctx, rspec, router, cur);
   // DeepSeek-V4's first hash-routed layers use a token-id -> expert table
   // for selection, while the learned router still supplies the unbiased
   // weights.  The table is prepared as a host input by the V4 graph builder;
   // every other layer keeps GGML's normal biased top-k node.
   ggml_tensor *ids =
-      forced_ids ? forced_ids : ggml_argsort_top_k(ctx, selection, c.topk);
+      forced_ids ? forced_ids : moe_routed::select_ids(ctx, rspec, probs, bias);
   if (route_stats_enabled() && g.decode_mode &&
       g.partial_expert_residency && ids) {
     // Keep a graph output copy of each layer's IDs.  The scheduler may
@@ -6386,17 +6391,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_build_forward_expand(g.graph, snapshot);
     g.moe_route_ids.emplace_back(layer, snapshot);
   }
-  ggml_tensor *weights =
-      ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, c.n_experts, g.S), ids);
-  ggml_tensor *weights2 = ggml_reshape_2d(ctx, weights, c.topk, g.S);
-  if (c.expert_weights_norm) {
-    ggml_tensor *sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights2),
-                                  6.103515625e-5f, INFINITY);
-    weights2 = ggml_div(ctx, weights2, sum);
-  }
-  if (c.expert_weights_scale != 0.0f && c.expert_weights_scale != 1.0f)
-    weights2 = ggml_scale(ctx, weights2, c.expert_weights_scale);
-  weights = ggml_reshape_3d(ctx, weights2, 1, c.topk, g.S);
+  ggml_tensor *weights = moe_routed::route_weights(ctx, rspec, probs, ids);
   ggml_build_forward_expand(g.graph, weights);
 
   float clamp = 0.0f;
@@ -6431,43 +6426,17 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     if (!branch_down || !branch_ids || !branch_weights ||
         (!branch_gate_up && (!branch_gate || !branch_up)))
       return nullptr;
-    ggml_tensor *up = nullptr;
-    ggml_tensor *gate = nullptr;
-    if (branch_gate_up) {
-      // Match Llama.cpp's merged gate_up graph: one routed projection produces
-      // [2*n_ff, top_k, S], then zero-copy views feed SwiGLU.
-      ggml_tensor *gate_up_out =
-          ggml_mul_mat_id(ctx, branch_gate_up, input3, branch_ids);
-      const int64_t n_ff = gate_up_out->ne[0] / 2;
-      gate = ggml_view_3d(ctx, gate_up_out, n_ff, gate_up_out->ne[1],
-                          gate_up_out->ne[2], gate_up_out->nb[1],
-                          gate_up_out->nb[2], 0);
-      up = ggml_view_3d(ctx, gate_up_out, n_ff, gate_up_out->ne[1],
-                        gate_up_out->ne[2], gate_up_out->nb[1],
-                        gate_up_out->nb[2], (size_t)n_ff * gate_up_out->nb[0]);
-    } else {
-      up = ggml_mul_mat_id(ctx, branch_up, input3, branch_ids);
-      gate = ggml_mul_mat_id(ctx, branch_gate, input3, branch_ids);
-    }
-    ggml_tensor *act = nullptr;
-    if (clamp > 1e-6f && swiglu_clamp_fused()) {
-      ggml_tensor *up_clamped = ggml_clamp(ctx, up, -clamp, clamp);
-      ggml_tensor *gate_clamped = ggml_clamp(ctx, gate, -INFINITY, clamp);
-      act = ggml_mul(ctx, ggml_silu(ctx, gate_clamped), up_clamped);
-    } else {
-      act = ggml_swiglu_split(ctx, gate, up);
-      if (clamp > 1e-6f)
-        act = ggml_clamp(ctx, act, -clamp, clamp);
-    }
-    ggml_tensor *experts = ggml_mul_mat_id(ctx, branch_down, act, branch_ids);
-    experts = ggml_mul(ctx, experts, branch_weights);
-    ggml_tensor *branch =
-        ggml_cont(ctx, ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2], 0));
-    for (int k = 1; k < c.topk; ++k)
-      branch = ggml_add(ctx, branch,
-                        ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2],
-                                     (size_t)k * experts->nb[1]));
-    return branch;
+    // Merged gate_up matches llama.cpp's graph: one routed projection, then
+    // zero-copy views feed SwiGLU.
+    moe_routed::ExpertWeights ew;
+    ew.gate_up = branch_gate_up;
+    ew.gate = branch_gate;
+    ew.up = branch_up;
+    ew.down = branch_down;
+    const moe_routed::FfnNodes ffn = moe_routed::expert_ffn(
+        ctx, ew, input3, branch_ids, clamp, swiglu_clamp_fused());
+    ggml_tensor *experts = ggml_mul(ctx, ffn.down, branch_weights);
+    return moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
   };
 
   ggml_tensor *out = nullptr;
