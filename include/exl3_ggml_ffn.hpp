@@ -86,7 +86,6 @@ struct Exl3GgmlRoutedFfnState {
   std::vector<size_t> offsets;
   std::vector<Exl3PackedMatrixHeader> headers;
   int rows = 0;
-  bool dynamic_route_table = false;
   size_t expert_stride = 0;
   size_t projection_offsets[3] = {};
   int expert_count = 0;
@@ -104,12 +103,6 @@ struct Exl3GgmlRoutedFfnState {
                   const std::vector<size_t> &matrix_offsets, int matrix_rows,
                   int device);
 
-  bool initialize_dynamic(size_t matrix_expert_stride,
-                          const size_t (&matrix_projection_offsets)[3],
-                          int matrix_expert_count, int matrix_topk,
-                          int matrix_hidden, int matrix_intermediate,
-                          const int (&matrix_bits)[3], int matrix_rows,
-                          int device);
 
   static void compute(ggml_backend_t cuda_backend, ggml_tensor *node,
                       void *user_data);
@@ -123,10 +116,6 @@ ggml_tensor *exl3_ggml_map_routed_ffn(ggml_context *ctx, ggml_tensor *input,
                                       ggml_tensor *opaque,
                                       ggml_tensor *route_weights,
                                       Exl3GgmlRoutedFfnState *state);
-
-ggml_tensor *exl3_ggml_map_dynamic_routed_ffn(
-    ggml_context *ctx, ggml_tensor *input, ggml_tensor *opaque,
-    ggml_tensor *route_table, Exl3GgmlRoutedFfnState *state);
 
 struct Exl3GgmlCachedRoutedFfnState {
   using ExternalExpertResolver = std::function<Exl3GpuExternalExpert(
@@ -200,27 +189,5 @@ struct Exl3GgmlCachedMatmulState {
 ggml_tensor *exl3_ggml_map_cached_matmul(
     ggml_context *ctx, ggml_tensor *input,
     Exl3GgmlCachedMatmulState *state);
-
-struct Exl3GgmlRoutePackState {
-  Exl3GgmlCustomNode custom;
-  int topk = 0;
-  int route_rows = 1;
-  int32_t *expert_remap_device = nullptr;
-  int expert_remap_count = 0;
-
-  ~Exl3GgmlRoutePackState();
-
-  bool initialize(int route_count, int rows = 1);
-  bool initialize_remap(int route_count, const std::vector<int32_t> &remap,
-                        int device, int rows = 1);
-  static void compute(ggml_backend_t cuda_backend, ggml_tensor *node,
-                      void *user_data);
-};
-
-ggml_tensor *exl3_ggml_map_route_table(ggml_context *ctx,
-                                       ggml_tensor *route_table,
-                                       ggml_tensor *route_ids,
-                                       ggml_tensor *route_weights,
-                                       Exl3GgmlRoutePackState *state);
 
 #endif

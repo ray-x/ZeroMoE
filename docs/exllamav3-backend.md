@@ -887,3 +887,48 @@ remains 26.86 tok/s for whole-layer placement, 4.1% short of 28; the 4bpw
 pack clears 28 only with the static per-layer expert split above. CPU expert gate/up GEMV remains the primary
 optimization target for the 4bpw pack. Resume Q2_0 comparisons after the EXL3
 performance work is complete.
+
+## Upstream ExLlamaV3 kernels for the in-graph EXL3 path (no libtorch)
+
+All EXL3 matmuls in the native path (`exl3_gpu`, the GGML custom-op bridge) run
+on ExLlamaV3's own CUDA kernels; MoEStream no longer carries its own EXL3
+matmul kernels. Build with the upstream extension sources:
+
+```bash
+cmake -S . -B build_ggmlcuda \
+    -DMOESTREAM_EXLLAMAV3_SRC=/home/ray/Projects/exllamav3/exllamav3/exllamav3_ext
+```
+
+- Upstream `exl3_gemm` / `exl3_gemv` / `exl3_moe_coop` are compiled unmodified
+  as `moestream_exl3_upstream`. `third_party/exl3_torch_stub` stands in for the
+  few ATen/c10 symbols their launchers use; libtorch is not required.
+- `src/exl3_upstream_ops.cu` implements the `launch_exl3_mul1_*` API on
+  `exl3_gemm` and the external routed FFN on `exl3_moe_coop` (two launches per
+  layer for up to 8 rows / 256 route slots). Larger or mixed-bit-width batches,
+  and biased matrices, use one upstream `exl3_gemm` sequence per expert.
+- Without `MOESTREAM_EXLLAMAV3_SRC` the matmul entry points return
+  `cudaErrorNotSupported` (`cuda/exl3_aux.cu`); the GPU EXL3 path is then
+  unavailable. `cuda/exl3_aux.cu` also holds the hyper-connection, SwiGLU and
+  accumulate helper kernels.
+- `MOESTREAM_EXL3_MOE_COOP=0` disables the fused routed-FFN path (A/B).
+  Upstream also defaults to an int8-activation GEMV for one row and K <= 5 on
+  Ampere; `EXL3_INT8_GEMV=0` disables it.
+- Upstream kernels take fp16 activations (about 5e-4 relative RMS against fp32;
+  ~7e-3 on the int8 GEMV path), so tolerances against the fp32 CPU reference
+  are wider than they were: 2e-2 of the output peak per routed FFN in the
+  bridge parity check, 2e-2 relative RMS in the in-tree matmul test.
+- `tests/exl3_reference_matmul.cu` keeps MoEStream's original fp32 kernels as a
+  test-only independent reference. `tests/exl3_upstream` (standalone CMake
+  project) builds `exl3_upstream_parity`, which compares it with upstream
+  `exl3_gemm` on random matrices without a model.
+- Removed with the legacy kernels: the payload-based dynamic route-table state
+  (`Exl3GgmlRoutedFfnState::initialize_dynamic`, `Exl3GgmlRoutePackState`) and
+  the benches that only exercised it (`exl3_ggml_cuda_real_dynamic_routed_bench`,
+  `exl3_ggml_cuda_real_layer_bench`, `exl3_ggml_cuda_real_router_ffn_bench`,
+  `exl3_ggml_cuda_real_exl3_layer_bench`). The cache-backed bridge, which
+  production uses, is unaffected.
+- Measured on the external-routed bench (topk=10, shared 3090) against the old
+  kernels: 323 -> 132 us at one row and 1115 -> 436 us at four rows. Bridged
+  all-48-layer decode on the 3090: 3.77 -> ~4.1 tok/s (64 tokens, ABBA).
+- Timings in `exl3-wait-policy-2026-10-05.md` predate this and used the old
+  kernels.

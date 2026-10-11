@@ -51,40 +51,22 @@ cudaError_t launch_exl3_mul1_gate_up(
     const float *input, float *activation, int rows, float *gate_partials,
     float *up_partials, cudaStream_t stream = nullptr);
 
-cudaError_t launch_exl3_routed_ffn(
-    const uint8_t *payload, size_t expert_stride, size_t gate_offset,
-    size_t up_offset, size_t down_offset, const int32_t *route_ids,
-    const float *route_weights, int topk, int expert_count, const float *input,
-    float *output, int rows, int hidden, int intermediate, float *activation,
-    float *partials, int gate_bits, int up_bits, int down_bits,
-    cudaStream_t stream = nullptr);
-
-cudaError_t launch_exl3_pack_route_table(uint8_t *table,
-                                         const int32_t *route_ids,
-                                         const float *route_weights, int topk,
-                                         int rows,
-                                         const int32_t *expert_remap = nullptr,
-                                         cudaStream_t stream = nullptr);
-
-cudaError_t launch_exl3_mul1_reconstruct(const Exl3CudaMatrixView &matrix,
-                                        float *weight,
-                                        cudaStream_t stream = nullptr);
-
 bool exl3_cuda_matmul_packed(float *output, const float *input,
                             const void *packed, int rows, int input_features,
                             int output_features);
 
-// Upstream ExLlamaV3 backed implementations (src/exl3_upstream_ops.cu, built
-// when MOESTREAM_EXLLAMAV3_SRC is set). Return cudaErrorNotSupported when the
-// matrix shape is outside upstream's contract so callers fall back.
+// Upstream ExLlamaV3 backed internals (src/exl3_upstream_ops.cu, built when
+// MOESTREAM_EXLLAMAV3_SRC is set). The public launch_exl3_mul1_* functions above
+// are implemented on top of them; without the option they return
+// cudaErrorNotSupported (cuda/exl3_aux.cu).
 #ifdef MOESTREAM_EXL3_UPSTREAM
-__attribute__((weak)) bool exl3_upstream_active();
-__attribute__((weak)) cudaError_t exl3_upstream_matmul(const Exl3CudaMatrixView &matrix,
+bool exl3_upstream_moe_coop_enabled();
+cudaError_t exl3_upstream_matmul(const Exl3CudaMatrixView &matrix,
                                  const float *input, float *output,
                                  float *accumulator, float weight,
                                  const float *device_weight, int rows,
                                  cudaStream_t stream);
-__attribute__((weak)) cudaError_t exl3_upstream_gate_up(const Exl3CudaMatrixView &gate,
+cudaError_t exl3_upstream_gate_up(const Exl3CudaMatrixView &gate,
                                   const Exl3CudaMatrixView &up,
                                   const float *input, float *activation,
                                   int rows, float *up_scratch,
@@ -92,7 +74,7 @@ __attribute__((weak)) cudaError_t exl3_upstream_gate_up(const Exl3CudaMatrixView
 // Whole routed FFN (rows <= 8, rows * topk <= 256) in two upstream launches.
 // gate/up/down are arrays of rows * topk matrix-view pointers. Output is
 // overwritten. Returns cudaErrorNotSupported if shapes/bit widths do not fit.
-__attribute__((weak)) cudaError_t exl3_upstream_routed_ffn(
+cudaError_t exl3_upstream_routed_ffn(
     const Exl3CudaMatrixView *const *gate, const Exl3CudaMatrixView *const *up,
     const Exl3CudaMatrixView *const *down, const float *host_weights,
     const float *device_weights, const float *input, float *output, int rows,
