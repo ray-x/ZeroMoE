@@ -11,6 +11,7 @@ for f in glob.glob('/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_
     fd=os.open(f,os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)
 PY
 sed "s#baseline.engine.log#pinab/$N.engine.log#" $B/spread_off.toml > $B/pinab/$N.toml
+if [ -n "$HOSTRAM" ]; then sed -i "s#^host_ram_gb *=.*#host_ram_gb = $HOSTRAM#; s#^ram_pinned_budget_gb *=.*#ram_pinned_budget_gb = $HOSTRAM#" $B/pinab/$N.toml; fi
 [ -n "$MODEL_DIR" ] && sed -i "s#^model_path *=.*#model_path = \"$MODEL_DIR\"#" $B/pinab/$N.toml
 export MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=${DDR:-32}
 export MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=${PINNED:-0.5} MOESTREAM_GLM5NEXT_OFFLOAD_POLICY=${POLICY:-lru}
@@ -43,7 +44,7 @@ printf '%s\n' \
  "Write a short story about a lighthouse keeper who finds a message in a bottle." \
  "Explain how TCP congestion control works, covering slow start and congestion avoidance." \
  "Write a bash script that finds the ten largest files under a directory and prints their sizes." \
- ":q" | systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
+ ":q" | systemd-run --user --scope -q -p MemoryMax=${MEMMAX:-80G} -p MemorySwapMax=0 \
    ${BIN:-./build_pf/moestream} --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
 kill $SAMPLER 2>/dev/null
 echo DONE > $B/pinab/$N.done
