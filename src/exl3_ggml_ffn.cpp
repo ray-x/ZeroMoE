@@ -297,7 +297,6 @@ bool Exl3GgmlRoutedFfnState::initialize(
   headers = matrix_headers;
   offsets = matrix_offsets;
   rows = matrix_rows;
-  dynamic_route_table = false;
   this->hidden = hidden;
   this->intermediate = intermediate;
   expert_count = static_cast<int>(matrix_headers.size() / 3);
@@ -323,75 +322,10 @@ bool Exl3GgmlRoutedFfnState::initialize(
   return true;
 }
 
-bool Exl3GgmlRoutedFfnState::initialize_dynamic(
-    size_t matrix_expert_stride,
-    const size_t (&matrix_projection_offsets)[3], int matrix_expert_count,
-    int matrix_topk, int matrix_hidden, int matrix_intermediate,
-    const int (&matrix_bits)[3], int matrix_rows, int device) {
-  if (matrix_expert_stride == 0 || matrix_expert_count <= 0 || matrix_topk <= 0 ||
-      matrix_topk > matrix_expert_count || matrix_hidden <= 0 ||
-      matrix_intermediate <= 0 || matrix_rows <= 0 || device < 0 ||
-      matrix_bits[0] < 0 || matrix_bits[0] > 8 || matrix_bits[1] < 0 ||
-      matrix_bits[1] > 8 || matrix_bits[2] < 0 || matrix_bits[2] > 8)
-    return false;
-  dynamic_route_table = true;
-  expert_stride = matrix_expert_stride;
-  projection_offsets[0] = matrix_projection_offsets[0];
-  projection_offsets[1] = matrix_projection_offsets[1];
-  projection_offsets[2] = matrix_projection_offsets[2];
-  expert_count = matrix_expert_count;
-  topk = matrix_topk;
-  hidden = matrix_hidden;
-  intermediate = matrix_intermediate;
-  bits[0] = matrix_bits[0];
-  bits[1] = matrix_bits[1];
-  bits[2] = matrix_bits[2];
-  rows = matrix_rows;
-  custom.compute = compute;
-  custom.user_data = this;
-  custom.graph_capture_safe = true;
-  const size_t gate_partials = static_cast<size_t>(intermediate) *
-                               exl3_cuda_key_splits(hidden);
-  cudaSetDevice(device);
-  if (cudaMalloc(&activation, static_cast<size_t>(intermediate) * matrix_rows *
-                                  sizeof(float)) !=
-      cudaSuccess)
-    return false;
-  if (cudaMalloc(&partials, std::max(2 * gate_partials * matrix_rows,
-                                    static_cast<size_t>(hidden) *
-                                        exl3_cuda_key_splits(intermediate) *
-                                        matrix_rows) *
-                               sizeof(float)) != cudaSuccess) {
-    cudaFree(activation);
-    activation = nullptr;
-    return false;
-  }
-  return true;
-}
-
 void Exl3GgmlRoutedFfnState::enqueue(const ggml_tensor *input,
                                      const ggml_tensor *opaque,
                                      const ggml_tensor *route_weights,
                                      ggml_tensor *output) {
-  if (dynamic_route_table) {
-    if (!input || !opaque || !route_weights || !output || input->ne[1] != rows ||
-        route_weights->type != GGML_TYPE_I8 ||
-        route_weights->ne[0] < static_cast<int64_t>(topk) *
-                                  rows * (sizeof(int32_t) + sizeof(float)))
-      throw std::runtime_error("invalid EXL3 GGML dynamic route table");
-    const auto *route_table = static_cast<const uint8_t *>(route_weights->data);
-    check(launch_exl3_routed_ffn(
-              static_cast<const uint8_t *>(opaque->data), expert_stride,
-              projection_offsets[0], projection_offsets[1],
-              projection_offsets[2], reinterpret_cast<const int32_t *>(route_table),
-              reinterpret_cast<const float *>(route_table +
-                                              topk * rows * sizeof(int32_t)),
-              topk, expert_count, static_cast<const float *>(input->data),
-              static_cast<float *>(output->data), rows, hidden, intermediate,
-              activation, partials, bits[0], bits[1], bits[2], stream),
-          "launch EXL3 GGML dynamic routed FFN");
-    return;
-  }
   if (!input || !opaque || !route_weights || !output || input->ne[1] != rows ||
       route_weights->type != GGML_TYPE_F32 || route_weights->ne[0] !=
           static_cast<int64_t>(headers.size() / 3) || route_weights->ne[1] != 1)
@@ -455,22 +389,6 @@ ggml_tensor *exl3_ggml_map_routed_ffn(ggml_context *ctx, ggml_tensor *input,
   node->ne[0] = state->headers[0].input_features;
   node->ne[1] = input->ne[1];
   node->nb[1] = static_cast<size_t>(node->ne[0]) * sizeof(float);
-  return node;
-}
-
-ggml_tensor *exl3_ggml_map_dynamic_routed_ffn(
-    ggml_context *ctx, ggml_tensor *input, ggml_tensor *opaque,
-    ggml_tensor *route_table, Exl3GgmlRoutedFfnState *state) {
-  if (!ctx || !input || !opaque || !route_table || !state ||
-      !state->dynamic_route_table)
-    return nullptr;
-  auto *node = exl3_ggml_map_custom3(ctx, input, opaque, route_table,
-                                     &state->custom);
-  if (!node)
-    return nullptr;
-  node->ne[0] = state->hidden;
-  node->ne[1] = input->ne[1];
-  node->nb[1] = static_cast<size_t>(state->hidden) * sizeof(float);
   return node;
 }
 
@@ -885,13 +803,12 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
                        "[EXL3-GRAPH-TRACE] parity compare loop done "
                        "max_error=%g max_expected=%g index=%zu\n",
                        max_abs_error, max_expected, max_error_index);
-        // Upstream ExLlamaV3 kernels take fp16 activations (about 0.6% of the
+        // EXL3 matmuls run on upstream ExLlamaV3 kernels, which take fp16 activations (about 0.6% of the
         // output peak after the gate/up/down chain), so their tolerance is
         // wider than the fp32-activation legacy kernels'.
         float relative_tolerance = 1e-3f;
 #ifdef MOESTREAM_EXL3_UPSTREAM
-        if (&exl3_upstream_active && exl3_upstream_active())
-          relative_tolerance = 2e-2f;
+        relative_tolerance = 2e-2f;
 #endif
         if (max_abs_error > 1e-3f + relative_tolerance * max_expected) {
           const size_t first_route =
@@ -1051,67 +968,6 @@ ggml_tensor *exl3_ggml_map_cached_matmul(
   node->ne[1] = state->rows;
   node->nb[1] = static_cast<size_t>(state->output_features) * sizeof(float);
   return node;
-}
-
-bool Exl3GgmlRoutePackState::initialize(int route_count, int rows) {
-  if (route_count <= 0 || rows <= 0)
-    return false;
-  topk = route_count;
-  route_rows = rows;
-  custom.compute = compute;
-  custom.user_data = this;
-  custom.graph_capture_safe = true;
-  return true;
-}
-
-Exl3GgmlRoutePackState::~Exl3GgmlRoutePackState() {
-  if (expert_remap_device)
-    cudaFree(expert_remap_device);
-}
-
-bool Exl3GgmlRoutePackState::initialize_remap(
-    int route_count, const std::vector<int32_t> &remap, int device, int rows) {
-  if (!initialize(route_count, rows) || remap.empty() || device < 0)
-    return false;
-  cudaSetDevice(device);
-  if (cudaMalloc(&expert_remap_device,
-                 remap.size() * sizeof(int32_t)) != cudaSuccess)
-    return false;
-  if (cudaMemcpy(expert_remap_device, remap.data(),
-                 remap.size() * sizeof(int32_t), cudaMemcpyHostToDevice) !=
-      cudaSuccess) {
-    cudaFree(expert_remap_device);
-    expert_remap_device = nullptr;
-    return false;
-  }
-  expert_remap_count = static_cast<int>(remap.size());
-  return true;
-}
-
-void Exl3GgmlRoutePackState::compute(ggml_backend_t cuda_backend,
-                                     ggml_tensor *node, void *user_data) {
-  auto *state = static_cast<Exl3GgmlRoutePackState *>(user_data);
-  const cudaStream_t stream = exl3_ggml_cuda_stream(cuda_backend);
-  if (!node || !node->data || !node->src[1] || !node->src[2])
-    throw std::runtime_error("invalid EXL3 GGML route pack node");
-  check(launch_exl3_pack_route_table(
-            static_cast<uint8_t *>(node->data),
-            static_cast<const int32_t *>(node->src[1]->data),
-            static_cast<const float *>(node->src[2]->data), state->topk,
-            state->route_rows, state->expert_remap_device, stream),
-        "pack EXL3 GGML route table");
-}
-
-ggml_tensor *exl3_ggml_map_route_table(ggml_context *ctx,
-                                       ggml_tensor *route_table,
-                                       ggml_tensor *route_ids,
-                                       ggml_tensor *route_weights,
-                                       Exl3GgmlRoutePackState *state) {
-  if (!ctx || !route_table || !route_ids || !route_weights || !state ||
-      state->topk <= 0)
-    return nullptr;
-  return exl3_ggml_map_custom3(ctx, route_table, route_ids, route_weights,
-                               &state->custom);
 }
 
 #endif

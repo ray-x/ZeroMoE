@@ -1,3 +1,6 @@
+// TEST-ONLY reference: MoEStream's original fp32 EXL3 mul1 matmul kernels.
+// Production uses upstream ExLlamaV3 (src/exl3_upstream_ops.cu); this file is
+// kept only as an independent implementation for tests/exl3_upstream_parity.cu.
 #include "exl3_cuda.hpp"
 #include "exl3_format.hpp"
 
@@ -681,13 +684,6 @@ static cudaError_t launch_exl3_mul1_matmul_impl(
 cudaError_t launch_exl3_mul1_matmul(const Exl3CudaMatrixView &matrix,
                                    const float *input, float *output, int rows,
                                    float *partials, cudaStream_t stream) {
-#ifdef MOESTREAM_EXL3_UPSTREAM
-  if (&exl3_upstream_active && exl3_upstream_active()) {
-    const cudaError_t e = exl3_upstream_matmul(matrix, input, output, nullptr,
-                                               0.0f, nullptr, rows, stream);
-    if (e != cudaErrorNotSupported) return e;
-  }
-#endif
   return launch_exl3_mul1_matmul_impl(matrix, input, output, nullptr, 0.0f,
                                       rows, partials, stream);
 }
@@ -696,14 +692,6 @@ cudaError_t launch_exl3_mul1_matmul_accumulate(
     const Exl3CudaMatrixView &matrix, const float *input, float *accumulator,
     float weight, int rows, float *partials, cudaStream_t stream) {
   if (!accumulator) return cudaErrorInvalidValue;
-#ifdef MOESTREAM_EXL3_UPSTREAM
-  if (&exl3_upstream_active && exl3_upstream_active()) {
-    const cudaError_t e = exl3_upstream_matmul(matrix, input, nullptr,
-                                               accumulator, weight, nullptr,
-                                               rows, stream);
-    if (e != cudaErrorNotSupported) return e;
-  }
-#endif
   return launch_exl3_mul1_matmul_impl(matrix, input, nullptr, accumulator,
                                       weight, rows, partials, stream);
 }
@@ -711,14 +699,6 @@ cudaError_t launch_exl3_mul1_matmul_accumulate(
 cudaError_t launch_exl3_mul1_matmul_accumulate_device_weight(
     const Exl3CudaMatrixView &matrix, const float *input, float *accumulator,
     const float *weight, int rows, float *partials, cudaStream_t stream) {
-#ifdef MOESTREAM_EXL3_UPSTREAM
-  if (&exl3_upstream_active && exl3_upstream_active() && accumulator && weight) {
-    const cudaError_t e = exl3_upstream_matmul(matrix, input, nullptr,
-                                               accumulator, 0.0f, weight, rows,
-                                               stream);
-    if (e != cudaErrorNotSupported) return e;
-  }
-#endif
   if (!valid(matrix) || !input || !accumulator || !weight || !partials ||
       rows <= 0 || rows > 65535)
     return cudaErrorInvalidValue;
@@ -736,13 +716,6 @@ cudaError_t launch_exl3_mul1_gate_up(
     const Exl3CudaMatrixView &gate, const Exl3CudaMatrixView &up,
     const float *input, float *activation, int rows, float *gate_partials,
     float *up_partials, cudaStream_t stream) {
-#ifdef MOESTREAM_EXL3_UPSTREAM
-  if (&exl3_upstream_active && exl3_upstream_active() && up_partials) {
-    const cudaError_t e = exl3_upstream_gate_up(gate, up, input, activation,
-                                                rows, up_partials, stream);
-    if (e != cudaErrorNotSupported) return e;
-  }
-#endif
   if (!valid(gate) || !valid(up) || !input || !activation ||
       !gate_partials || !up_partials || gate_partials == up_partials ||
       gate.input_features != up.input_features ||

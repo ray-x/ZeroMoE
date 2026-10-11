@@ -3,8 +3,8 @@
 # Replaces each routed-expert FFN of the Qwen4Exp GGUF full graph with the EXL3
 # custom op, reading the EXL3 safetensors experts through the existing DDR/GPU
 # slot arenas. Built with MOESTREAM_EXLLAMAV3_SRC, the op runs on upstream
-# ExLlamaV3's exl3_moe_coop (set MOESTREAM_EXL3_UPSTREAM=0 for the legacy
-# kernels). Root keys must stay before the first [[gpus]] table.
+# ExLlamaV3's exl3_moe_coop (MOESTREAM_EXL3_MOE_COOP=0 uses per-expert gemm).
+# Root keys must stay before the first [[gpus]] table.
 #
 # Run with:
 #   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ./build_ggmlcuda/moestream \
