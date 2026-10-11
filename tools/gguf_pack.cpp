@@ -290,7 +290,8 @@ struct OutTensor {
 int process_one_shard(const std::string &input_path,
                       const std::string &output_dir, uint64_t alignment,
                       uint64_t max_shard_bytes, int verify_samples,
-                      bool delete_source, bool unpack, bool verify_all) {
+                      bool delete_source, bool unpack, bool verify_all,
+                      bool expert_interleave = false) {
   // ---- Step 1: reuse the real, proven loader for the full, correctly-
   // offset tensor table. Deliberately NOT using src.architecture_config
   // here -- that struct is only ever populated by
@@ -520,6 +521,52 @@ int process_one_shard(const std::string &input_path,
            packed_tensors_found, packed_tensors_found * n_experts, n_experts);
   }
 
+  // --expert-interleave (align-only mode): ADD, next to the unchanged packed *_exps tensors, one tight [gate|up|down] block per expert
+  // under the names the SSD offload store uses (offload.blk.<L>.ffn_<k>.<E>.weight). Every block starts on `alignment`, so one
+  // O_DIRECT preadv fetches a whole expert, and the engine's OffloadStore can read them straight from the model shards. The names
+  // are deliberately NOT the --unpack names: a model that has blk.<L>.ffn_gate.<E>.weight tensors is treated as an unpacked layer.
+  int interleaved_layers = 0;
+  if (expert_interleave && !unpack) {
+    for (const auto &name : names) {
+      const std::string gate_suffix = ".ffn_gate_exps.weight";
+      if (name.rfind("blk.", 0) != 0 || name.size() < gate_suffix.size() ||
+          name.compare(name.size() - gate_suffix.size(), gate_suffix.size(), gate_suffix) != 0)
+        continue;
+      const std::string stem = name.substr(0, name.size() - gate_suffix.size()); // "blk.5"
+      const std::string up_name = stem + ".ffn_up_exps.weight", down_name = stem + ".ffn_down_exps.weight";
+      if (!src.tensors.count(up_name) || !src.tensors.count(down_name))
+        continue; // a layer missing a projection cannot form a block
+      const GGUFTensor *proj[3] = {&src.tensors.at(name), &src.tensors.at(up_name), &src.tensors.at(down_name)};
+      const char *kind[3] = {"gate", "up", "down"};
+      const int layer_num = std::atoi(stem.c_str() + 4);
+      const int ne = (int)proj[0]->shape.back();
+      bool ok = ne > 0;
+      for (int k = 0; k < 3 && ok; ++k)
+        ok = !proj[k]->shape.empty() && (int)proj[k]->shape.back() == ne && proj[k]->size_bytes % (uint64_t)ne == 0;
+      if (!ok) {
+        fprintf(stderr, "[pack] FATAL: layer %d's routed-expert tensors disagree on n_experts or are not divisible by it\n", layer_num);
+        return 1;
+      }
+      for (int e = 0; e < ne; ++e) {
+        for (int k = 0; k < 3; ++k) {
+          OutTensor ot;
+          ot.name = "offload." + stem + ".ffn_" + kind[k] + "." + std::to_string(e) + ".weight";
+          ot.type = proj[k]->type;
+          ot.shape.assign(proj[k]->shape.begin(), proj[k]->shape.end() - 1);
+          ot.src_shard_idx = proj[k]->shard_idx;
+          ot.size_bytes = proj[k]->size_bytes / (uint64_t)ne;
+          ot.src_offset = proj[k]->offset + (uint64_t)e * ot.size_bytes;
+          ot.sort_key = "P" + pad_sort(layer_num) + "." + pad_sort(e) + "." + char('0' + k);
+          ot.layer_for_grouping = layer_num;
+          out_tensors.push_back(std::move(ot));
+        }
+      }
+      ++interleaved_layers;
+    }
+    printf("[pack] expert-interleave: %d layer(s) get tight per-expert [gate|up|down] blocks (offload.blk.*), %d extra tensors\n",
+           interleaved_layers, interleaved_layers ? (int)out_tensors.size() : 0);
+  }
+
   // Every OTHER tensor passes through unchanged.
   int passthrough_count = 0;
   for (auto &name : names) {
@@ -655,7 +702,7 @@ int process_one_shard(const std::string &input_path,
   // bytes are still individually correct. Treat that as a pack-time fatal and
   // tell the caller to raise --max-shard-gb, rather than producing output the
   // unpacked_expert_format fast path can never legally consume.
-  if (unpack) {
+  if (unpack || expert_interleave) {
     for (size_t i = 0; i < out_tensors.size();) {
       if (out_tensors[i].sort_key.empty() || out_tensors[i].sort_key[0] != 'P') {
         ++i;
@@ -780,6 +827,8 @@ int process_one_shard(const std::string &input_path,
 
     shard_kv_out.push_back(
         make_uint32_kv("general.alignment", (uint32_t)alignment));
+    if (expert_interleave && !unpack)
+      shard_kv_out.push_back(make_uint32_kv("moestream.expert_interleave", 1));
     shard_kv_out.push_back(
         make_uint16_kv("split.count", (uint16_t)n_out_shards));      // UINT16
     shard_kv_out.push_back(make_uint16_kv("split.no", (uint16_t)s)); // UINT16
@@ -1135,6 +1184,12 @@ int cmd_pack(int argc, char **argv) {
             "EACH source file, in GB (default 40)\n"
             "  --verify-samples N     random tensors to byte-compare source vs "
             "output after writing (default 200, 0 = skip)\n"
+            "  --expert-interleave    keep the packed *_exps tensors (re-aligned) AND add one tight, `--align`-aligned\n"
+            "                         [gate|up|down] block per expert as offload.blk.<L>.ffn_<k>.<E>.weight tensors, so the\n"
+            "                         engine's OffloadStore can fetch a whole expert with ONE O_DIRECT preadv straight from\n"
+            "                         the model shards (output grows by the routed-expert bytes). Pass the FIRST shard file\n"
+            "                         of a multi-shard model, not its directory: the loader pulls in sibling shards, so\n"
+            "                         directory mode would write the whole model once per shard.\n"
             "  --verify-all           byte-compare ALL tensors (exhaustive; "
             "overrides --verify-samples)\n"
             "  -d, --delete-source    DESTRUCTIVE: delete each source shard "
@@ -1153,6 +1208,7 @@ int cmd_pack(int argc, char **argv) {
   bool delete_source = false;
   bool unpack = false;    // default --align-only; --unpack explodes *_exps
   bool verify_all = false; // --verify-all: byte-compare every tensor
+  bool expert_interleave = false; // --expert-interleave: embed tight per-expert [gate|up|down] blocks
   for (int i = 3; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--align" && i + 1 < argc)
@@ -1165,6 +1221,8 @@ int cmd_pack(int argc, char **argv) {
       verify_all = true;
     else if (a == "--unpack")
       unpack = true;
+    else if (a == "--expert-interleave")
+      expert_interleave = true;
     else if (a == "-d" || a == "--delete-source")
       delete_source = true;
     else {
@@ -1198,7 +1256,8 @@ int cmd_pack(int argc, char **argv) {
   }
   if (!is_dir) {
     return process_one_shard(input_path, output_dir, alignment, max_shard_bytes,
-                             verify_samples, delete_source, unpack, verify_all);
+                             verify_samples, delete_source, unpack, verify_all,
+                             expert_interleave);
   }
 
   // Directory mode: walk every .gguf file directly in input_path (not
@@ -1232,7 +1291,7 @@ int cmd_pack(int argc, char **argv) {
            shard_files.size(), shard_files[i].c_str());
     int rc = process_one_shard(shard_files[i], output_dir, alignment,
                                max_shard_bytes, verify_samples, delete_source,
-                               unpack, verify_all);
+                               unpack, verify_all, expert_interleave);
     if (rc != 0) {
       fprintf(stderr,
               "[pack] Directory mode: shard %zu/%zu FAILED (%s) -- stopping "

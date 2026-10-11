@@ -562,11 +562,12 @@ struct Wr {
 // F32 planes: ne0 = 1024 (a 4096-byte row), ne1 = plane_bytes / 4096 rows.
 static std::vector<uint64_t> plane_dims(uint64_t plane) { return {1024, plane / 4096}; }
 
-static void write_store(const std::string &path, const std::vector<ExpertKey> &experts, const std::map<int, uint64_t> &plane_of_layer, bool break_tightness = false) {
+static void write_store(const std::string &path, const std::vector<ExpertKey> &experts, const std::map<int, uint64_t> &plane_of_layer, bool break_tightness = false,
+                        const std::string &arch = "moestream-offload") {
   Wr w(path);
   w.o.write("GGUF", 4); w.put<uint32_t>(3); w.put<uint64_t>(experts.size() * 3); w.put<uint64_t>(4);
   w.str("general.alignment"); w.put<uint32_t>(4); w.put<uint32_t>(4096);
-  w.str("general.architecture"); w.put<uint32_t>(8); w.str("moestream-offload");
+  w.str("general.architecture"); w.put<uint32_t>(8); w.str(arch);
   for (int which = 0; which < 2; ++which) {
     w.str(which == 0 ? "moestream.offload.layer" : "moestream.offload.expert"); w.put<uint32_t>(9); w.put<uint32_t>(4); w.put<uint64_t>(experts.size());
     for (const ExpertKey &k : experts) w.put<uint32_t>(static_cast<uint32_t>(which == 0 ? k.layer : k.expert));
@@ -931,6 +932,73 @@ static void test_trace_replay_matches_simulator() {
 
 // ------------------------------------------------------------------------------------------ optional: real store + model
 // MOESTREAM_TEST_STORE=<store.gguf> MOESTREAM_TEST_MODEL=<shard1.gguf>[,<shard2.gguf>...] [MOESTREAM_TEST_SAMPLE=N]
+
+// The offload.* blocks that `gguf_tool pack --expert-interleave` embeds in model shards are read in place: several shards, one
+// preadv per expert, tensors of the shard that are not offload.* are ignored, and open_auto picks the right mode.
+static void test_embedded_store(const std::string &dir) {
+  const std::map<int, uint64_t> planes = {{3, 4096 * 2}, {4, 4096 * 3}, {5, 4096}};
+  std::vector<ExpertKey> a, b;
+  for (int e = 0; e < 5; ++e) { a.push_back({3, e}); a.push_back({4, e}); }
+  for (int e = 0; e < 4; ++e) b.push_back({5, e});
+  const std::string sub = dir + "/embedded";
+  ::mkdir(sub.c_str(), 0700);
+  const std::string fa = sub + "/model-00001-of-00002.gguf", fb = sub + "/model-00002-of-00002.gguf";
+  write_store(fa, a, planes, false, "glmtest");
+  write_store(fb, b, planes, false, "glmtest");
+  { // explicit file list
+    OffloadStore st;
+    std::string err;
+    CHECK(st.open_embedded({fa, fb}, &err));
+    CHECK(st.size() == a.size() + b.size());
+    CHECK(st.contains(3, 4) && st.contains(5, 3) && !st.contains(5, 4) && !st.contains(6, 0));
+    uint64_t pb[3];
+    CHECK(st.plane_bytes(4, 2, pb) && pb[0] == 4096 * 3 && pb[1] == 4096 * 3 && pb[2] == 4096 * 3);
+    CHECK(st.plane_bytes(5, 1, pb) && pb[0] == 4096);
+    for (const ExpertKey &k : {ExpertKey{3, 1}, ExpertKey{4, 4}, ExpertKey{5, 2}}) {
+      const uint64_t pl = planes.at(k.layer);
+      std::vector<uint8_t *> buf(3);
+      std::vector<std::unique_ptr<uint8_t, void (*)(void *)>> hold;
+      void *dst[3];
+      for (int i = 0; i < 3; ++i) {
+        void *p = nullptr;
+        CHECK(::posix_memalign(&p, 4096, pl) == 0);
+        hold.emplace_back(static_cast<uint8_t *>(p), std::free);
+        dst[i] = p;
+      }
+      CHECK(st.read_expert(k.layer, k.expert, dst) == ReadStatus::Ok);
+      bool same = true;
+      for (int kk = 0; kk < 3; ++kk)
+        for (size_t j = 0; j < pl && same; j += 61) same = static_cast<uint8_t *>(dst[kk])[j] == pat(k.layer, k.expert, kk, j);
+      CHECK(same);
+    }
+    CHECK(st.direct_reads() + st.buffered_reads() == 3);
+  }
+  { // a directory of shards, and a single stand-alone store still goes through open()
+    OffloadStore st;
+    CHECK(st.open_auto(sub, nullptr) && st.size() == a.size() + b.size());
+    const std::string solo = dir + "/solo-store.gguf";
+    write_store(solo, a, planes);
+    OffloadStore s2;
+    CHECK(s2.open_auto(solo, nullptr) && s2.size() == a.size());
+  }
+  { // a store striped over two "drives": a ':' list of a stand-alone store and a model with embedded blocks
+    const std::string sa = dir + "/stripe-a.gguf", sb = sub + "/model-00002-of-00002.gguf";
+    std::vector<ExpertKey> only_a;
+    for (int e = 0; e < 3; ++e) only_a.push_back({3, e});
+    write_store(sa, only_a, planes);
+    OffloadStore st;
+    CHECK(st.open_auto(sa + ":" + sb, nullptr) && st.size() == only_a.size() + b.size());
+    CHECK(st.contains(3, 2) && st.contains(5, 0) && !st.contains(4, 0));
+  }
+  { // a file without any offload.* tensor is refused
+    OffloadStore st;
+    std::string err;
+    write_model(dir + "/plain.gguf", {3}, 4, planes);
+    CHECK(!st.open_embedded({dir + "/plain.gguf"}, &err));
+    CHECK(!err.empty());
+  }
+}
+
 static void test_real_store() {
   const char *sp = std::getenv("MOESTREAM_TEST_STORE"), *mp = std::getenv("MOESTREAM_TEST_MODEL");
   if (!sp || !mp) { std::fprintf(stderr, "  real store/model test SKIPPED (set MOESTREAM_TEST_STORE and MOESTREAM_TEST_MODEL)\n"); return; }
@@ -981,6 +1049,7 @@ int main() {
   test_model_reader(dir);
   test_arena();
   test_residency_end_to_end(dir);
+  test_embedded_store(dir);
   test_trace_replay_matches_simulator();
   test_real_store();
   std::string rm = "rm -rf '" + dir + "'";

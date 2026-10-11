@@ -187,7 +187,7 @@ class ExpertStore {
     std::string e;
     std::vector<ExpertSource *> sources;
     if (!cfg_.store_path.empty()) {
-      if (store_.open(cfg_.store_path, &e)) {
+      if (store_.open_auto(cfg_.store_path, &e)) {
         store_open_ = true;
         sources.push_back(&store_);
       } else {
