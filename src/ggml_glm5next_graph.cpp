@@ -5,6 +5,7 @@
 // GGML graph.  Host backed expert tensors remain valid GGML weight nodes, so
 // the CUDA scheduler owns the required copies and dependency edges.
 
+#include "graph_config.hpp"
 #include "pilot_ridge.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
@@ -13,6 +14,8 @@
 #include "direct_io.hpp"
 #include "engine.hpp"
 #include "expert_cache.hpp"
+#include "early_ready_lane.hpp"
+#include "expert_store.hpp"
 #include "offload_store.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -25,6 +28,9 @@
 #include "mmid_route_skip.hpp"
 #include "moe_partial_route.hpp"
 #include "moe_partial_route_ggml.hpp"
+#include "../models/family_spec.hpp"
+#include "moe_routed_config.hpp"
+#include "moe_routed_ggml.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -54,541 +60,9 @@
 
 #include <cuda_runtime.h>
 
-namespace {
+#include "glm5next_graph_internal.hpp"
 
-constexpr int kGraphSize = 60000;
-constexpr size_t kTensorContextBytes = 192ull * 1024ull * 1024ull;
-
-struct HostAllocation {
-  void *ptr = nullptr;
-  size_t bytes = 0;
-  bool pinned = false;
-  size_t reservation_bytes = 0;
-};
-
-struct DynamicUploadCopy {
-  const void *source = nullptr;
-  void *destination = nullptr;
-  size_t bytes = 0;
-  size_t staging_offset = 0;
-};
-
-struct DynamicUploadJob {
-  int layer = -1;
-  int hot_slot = -1;
-  int incoming_expert = -1;
-  int evicted_expert = -1;
-  std::vector<DynamicUploadCopy> copies;
-};
-
-struct DynamicUploadResult {
-  int layer = -1;
-  int hot_slot = -1;
-  int incoming_expert = -1;
-  bool success = false;
-  size_t bytes = 0;
-  double elapsed_ms = 0.0;
-};
-
-struct DynamicUploadState {
-  std::mutex mutex;
-  std::condition_variable cv;
-  std::deque<DynamicUploadJob> queue;
-  std::vector<DynamicUploadResult> completed;
-  std::thread worker;
-  bool stopping = false;
-  bool active = false;
-  cudaStream_t stream = nullptr;
-  void *staging = nullptr;
-  size_t staging_capacity = 0;
-  size_t host_reservation_bytes = 0;
-};
-
-// A graph can keep historically hot experts in a compact CUDA tensor while
-// presenting the remaining experts as a compact host tensor.  Device maps
-// translate the model's original expert IDs, so routing stays inside GGML.
-struct PartialExpertLayer {
-  std::vector<int> hot;
-  std::vector<int> cold;
-  // Physical cache-slot lookup used by the graph's no-copy VRAM hot branch.
-  std::vector<int32_t> vram_slot_by_expert;
-  uint8_t *vram_layer_base = nullptr;
-  size_t vram_layer_slots = 0;
-  size_t vram_slot_stride = 0;
-  std::vector<int> slot_last_use;
-  std::vector<uint32_t> miss_count;
-  std::vector<float> heat;        // decayed re-reference score of each cold expert (MOESTREAM_GLM5NEXT_DYNAMIC_HEAT)
-  std::vector<uint64_t> heat_at;  // token clock of the last heat update
-  std::vector<uint8_t> slot_in_flight;
-  std::vector<uint8_t> expert_in_flight;
-  uint64_t route_count = 0;
-  uint64_t hot_route_count = 0;
-  ggml_tensor *hot_gate_up = nullptr;
-  ggml_tensor *hot_gate = nullptr;
-  ggml_tensor *hot_up = nullptr;
-  ggml_tensor *hot_down = nullptr;
-  ggml_tensor *cold_gate_up = nullptr;
-  ggml_tensor *cold_gate = nullptr;
-  ggml_tensor *cold_up = nullptr;
-  ggml_tensor *cold_down = nullptr;
-  ggml_tensor *cold_map = nullptr;
-  ggml_tensor *hot_map = nullptr;
-  ggml_tensor *cold_mask = nullptr;
-  ggml_tensor *hot_mask = nullptr;
-  // Second-GPU hot set (MOESTREAM_GLM5NEXT_GPU1_HOT_GIB): experts moved out of `cold` that decode serves from the
-  // 5060 Ti. Prefill / no-GPU1 builds fold them back into the cold branch (identity-indexed full arena).
-  std::vector<int> hot1;
-  ggml_tensor *hot1_gate = nullptr;
-  ggml_tensor *hot1_up = nullptr;
-  ggml_tensor *hot1_down = nullptr;
-  ggml_tensor *hot1_map = nullptr;
-  ggml_tensor *hot1_mask = nullptr;
-  // -1 = not yet decided for this build_graph() pass. Caches
-  // engine->graph_ram_layer_ready(layer) the first time it is consulted for
-  // this layer during a single graph build. Background prefetch/promotion
-  // worker threads mutate the live RAM-tier state concurrently with graph
-  // construction, so partial_map()'s cold-branch indexing scheme (full
-  // arena vs. compacted load_cold_weight) and expert_weight()'s/
-  // expert_gate_up_weight()'s tensor-shape choice must agree on ONE
-  // snapshot of readiness, not two independent live reads taken moments
-  // apart -- a disagreement bakes a map that indexes an expert id past the
-  // end of a smaller compacted weight tensor, which crashes CPU
-  // ggml_compute_forward_mul_mat_id (assert(i02 < n_as) is compiled out in
-  // release builds).
-  int ram_ready_cached = -1;
-};
-
-struct Glm5nextIndexerSeed {
-  int layer = -1;
-  int token_count = 0;
-  int pool_count = 0;
-  std::vector<float> key_gate;
-  std::vector<float> pooled_keys;
-};
-
-struct Glm5nextIndexerLayer {
-  int layer = -1;
-  ggml_tensor *key_gate_out = nullptr; // prefill: [2*key_length, S]
-  ggml_tensor *pooled_out = nullptr;   // prefill: [key_length, S/kpool]
-  ggml_tensor *key_gate_cache = nullptr; // decode: [2*key_length, capacity]
-  ggml_tensor *pooled_cache = nullptr;   // decode: [key_length, capacity/kpool]
-};
-
-struct FullGraph {
-  StreamingEngine *engine = nullptr;
-  GpuTopology *topology = nullptr;
-  int device = -1;
-  int S = 0;
-  bool decode_mode = false;
-  int kv_capacity = 0;
-  int decode_last_pos = -1;
-  int D = 0;
-  int HC = 0;
-  int n_layers = 0;
-  int H = 0;
-  int hd = 0;
-  int d_inner = 0;
-  int d_conv = 0;
-  int qk_nope = 0;
-  int qk_rope = 0;
-  int kv_lora = 0;
-  int v_head = 0;
-  int o_group_count = 0;
-  int o_lora_rank = 0;
-  int sliding_window = 0;
-  int first_dense = 0;
-  int device_expert_layers = 0;
-  ggml_backend_t gpu1 = nullptr; // optional second CUDA device for expert layers
-  int gpu1_first = -1, gpu1_last = -2;
-  std::vector<ggml_backend_buffer_t> gpu1_buffers;
-  std::unordered_map<int, ggml_tensor *> stage_pred; // layer -> pilot ids predicted for it (built one layer earlier)
-  std::vector<ggml_backend_buffer_t> ridge_buffers;   // device copies of the pilot ridge corrections (one per corrected layer)
-  std::vector<std::pair<int, ggml_tensor *>> probe_x;  // MOESTREAM_GLM5NEXT_PROBE_DUMP: (layer, pre-FFN hidden) read back after every decode token
-  size_t gpu1_bytes = 0;
-  int indexer_heads = 0;
-  int indexer_key_length = 0;
-  int indexer_top_k = 0;
-  int indexer_kpool = 0;
-  bool indexer_select_tail = false;
-  bool sparse_decode = false;
-  bool partial_expert_residency = false;
-  bool vram_reference_experts = false;
-  bool dynamic_expert_cache = false;
-  bool dynamic_upload_disabled = false;
-  bool partial_sources_compacted = false;
-  size_t partial_hot_bytes = 0;
-  size_t partial_cold_bytes = 0;
-  size_t partial_hot_records = 0;
-  size_t vram_reference_bytes = 0;
-  std::string partial_usage_file;
-  std::vector<PartialExpertLayer> partial_experts;
-  uint64_t dynamic_clock = 0;
-  uint64_t dynamic_promotions = 0;
-  double dynamic_compute_ms_ema = 0.0;
-  double dynamic_upload_ms_per_job = 0.0;
-  std::unique_ptr<DynamicUploadState> dynamic_upload;
-
-  ggml_backend_t cuda = nullptr;
-  ggml_backend_t cpu = nullptr;
-  ggml_backend_sched_t sched = nullptr;
-  ggml_backend_buffer_t dense_buffer = nullptr;
-  void *dense_base = nullptr;
-  size_t dense_capacity = 0;
-  size_t dense_used = 0;
-  int dense_tensors = 0;
-  ggml_backend_buffer_t expert_buffer = nullptr;
-  void *expert_base = nullptr;
-  size_t expert_capacity = 0;
-  size_t expert_used = 0;
-  ggml_backend_buffer_t device_state_buffer = nullptr;
-  void *device_state_base = nullptr;
-  size_t device_state_capacity = 0;
-  size_t device_state_used = 0;
-  ggml_context *ctx = nullptr;
-  ggml_cgraph *graph = nullptr;
-
-  ggml_tensor *input = nullptr;  // [D, HC, S], host input
-  ggml_tensor *logits = nullptr; // decode only: LM-head output [V]
-  ggml_tensor *output = nullptr; // [D, S], after HC mean; LM head norms
-  ggml_tensor *final_streams = nullptr;
-  ggml_tensor *attn_mask = nullptr; // [S, S, 1, 1], F16 causal mask
-  ggml_tensor *decode_indices = nullptr; // [1], I32 DSA KV-cache row
-  ggml_tensor *indexer_pool_member_ids = nullptr; // [kpool, n_pools], I32
-  ggml_tensor *indexer_pool_mask = nullptr; // [n_pools], F32, per-token
-  ggml_tensor *indexer_pool_update_rows = nullptr; // [kpool], I32
-  ggml_tensor *indexer_pool_update_index = nullptr; // [1], I32
-  ggml_tensor *indexer_tail_indices = nullptr; // [kpool-1], I32
-  ggml_tensor *indexer_tail_mask = nullptr; // [kpool-1], F16
-  ggml_tensor *positions = nullptr; // [S], I32 token positions
-  ggml_tensor *positions_mod4 = nullptr;
-  ggml_tensor *positions_mod128 = nullptr;
-  ggml_tensor *block_positions4 = nullptr;
-  ggml_tensor *block_positions128 = nullptr;
-  ggml_tensor *csa_zero_values = nullptr;
-  ggml_tensor *csa_zero_scores = nullptr;
-
-  struct Dsv4LayerTensors {
-    int layer = -1;
-    int ratio = 0;
-    ggml_tensor *raw_kv = nullptr;             // [qh, S], rotated K==V
-    ggml_tensor *comp_kv = nullptr;            // [width, S]
-    ggml_tensor *comp_score = nullptr;         // [width, S], incl. APE
-    ggml_tensor *indexer_comp_kv = nullptr;    // CSA only
-    ggml_tensor *indexer_comp_score = nullptr; // CSA only
-    ggml_tensor *keys = nullptr;               // [qh, floor(S/ratio)]
-    ggml_tensor *indexer_keys = nullptr;       // CSA only
-    ggml_tensor *mask = nullptr;               // [SWA + compressed + sink, S]
-  };
-  std::vector<Dsv4LayerTensors> dsv4_layers;
-  std::vector<ggml_tensor *> dsv4_layer_outputs;
-  // Decode-only per-layer timing marks (MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1):
-  // node -> {layer, 0=after attention, 1=after FFN}.
-  std::unordered_map<const ggml_tensor *, std::pair<int, int>> layer_marks;
-  std::vector<std::pair<std::string, ggml_tensor *>> dsv4_stage_outputs;
-
-  std::vector<ggml_tensor *> kda_state_out;
-  std::vector<ggml_tensor *> kda_hist_out;
-  std::vector<int> kda_layers;
-  std::vector<float *> kda_state_inputs;
-  std::vector<float *> kda_hist_inputs;
-  std::vector<ggml_tensor *> dsa_kv_out;
-  std::vector<ggml_tensor *> dsa_kv_storage;
-  std::vector<ggml_tensor *> kda_state_storage;
-  std::vector<ggml_tensor *> kda_hist_storage;
-  std::vector<ggml_tensor *> kda_state_updates;
-  std::vector<ggml_tensor *> kda_hist_updates;
-  std::vector<int> dsa_layers;
-  std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
-  struct VramExpertHold {
-    int layer = -1;
-    int expert = -1;
-    const uint8_t *device_ptr = nullptr;
-  };
-  std::vector<VramExpertHold> vram_expert_holds;
-  std::vector<Glm5nextIndexerLayer> glm5next_indexer_layers;
-  std::vector<Glm5nextIndexerSeed> glm5next_indexer_seeds;
-
-  std::vector<HostAllocation> owned;
-  std::vector<ggml_backend_buffer_t> host_buffers;
-  std::vector<void *> host_inputs;
-
-  size_t host_weight_bytes = 0;
-  size_t host_reference_bytes = 0;
-  size_t host_pinned_bytes = 0;
-  size_t host_pin_failures = 0;
-  // Any routed projections that lack a stable engine-owned DDR arena are
-  // kept in one graph-owned DDR source arena. Keeping the large projections
-  // as individual malloc/cudaHostRegister allocations made graph preparation
-  // spend minutes in allocator/page registration. Existing graph-RAM arenas
-  // and VRAM cache slots are referenced directly instead of copied here.
-  // GLM's dynamic cache can instead keep read-only views into GGUF shard
-  // mappings; those pages remain reclaimable by the OS and avoid duplicating
-  // the full expert set in a second anonymous allocation.
-  bool expert_source_mmap = false;
-  void *expert_source_base = nullptr;
-  size_t expert_source_capacity = 0;
-  size_t expert_source_used = 0;
-  size_t expert_source_tensors = 0;
-  std::unordered_map<std::string, void *> expert_source_views;
-  std::unordered_map<std::string, size_t> expert_source_view_bytes;
-  // Partial compaction is in-place, but hot uploads still need the original
-  // full-source addresses after the cold views have been rewritten.
-  std::unordered_map<std::string, void *> expert_source_full_views;
-  std::unordered_map<std::string, size_t> expert_source_full_view_bytes;
-  // Expert source slices are registered individually rather than registering
-  // the complete 67--78 GiB arena.  The latter can exceed this host's CUDA
-  // host-registration ceiling and would leave the whole graph on pageable
-  // memory.  Each entry here is a non-owning range inside expert_source_base;
-  // destroy() unregisters it before the arena is freed.
-  std::vector<HostAllocation> expert_source_pinned_ranges;
-  size_t host_reservation_bytes = 0;
-  // ggml_init(no_alloc=true) still owns a host-side context arena.  Keep it
-  // in the same admission ledger as the graph's explicit host buffers; the
-  // old watchdog only saw the latter and could therefore under-report the
-  // graph's host peak during construction.
-  size_t context_reservation_bytes = 0;
-  size_t graph_workspace_bytes = 0;
-  bool ready = false;
-
-  bool has_expert_source() const {
-    if (expert_source_mmap)
-      return !expert_source_views.empty();
-    return expert_source_base != nullptr && expert_source_capacity != 0;
-  }
-
-  // Transfer only the source-side state to a graph with a different prompt
-  // shape.  The graph context/scheduler and its prompt-sized tensors must be
-  // rebuilt, while the large DDR expert arena must remain alive.  Partial
-  // residency's tensor pointers belong to the old GGML context, so preserve
-  // only its layer/expert lists and clear those pointers before the old graph
-  // is destroyed.
-  bool move_expert_source_to(FullGraph &dst) {
-    if (!has_expert_source() || dst.has_expert_source())
-      return false;
-    if (!expert_source_mmap) {
-      const auto owner = std::find_if(
-          owned.begin(), owned.end(), [this](const HostAllocation &allocation) {
-            return allocation.ptr == expert_source_base;
-          });
-      if (owner == owned.end()) {
-        LOG_ERROR("[GGML-GLM5NEXT-FULL] expert source arena has no tracked "
-                  "owner; refusing graph handoff\n");
-        return false;
-      }
-      // The source views are non-owning slices into this allocation. Transfer
-      // the allocation itself before the old prompt graph is destroyed, or
-      // the reusable decode graph will retain dangling expert pointers.
-      dst.owned.push_back(std::move(*owner));
-      owned.erase(owner);
-    }
-
-    dst.expert_source_mmap = expert_source_mmap;
-    dst.expert_source_base = expert_source_base;
-    dst.expert_source_capacity = expert_source_capacity;
-    dst.expert_source_used = expert_source_used;
-    dst.expert_source_tensors = expert_source_tensors;
-    dst.expert_source_views = std::move(expert_source_views);
-    dst.expert_source_view_bytes = std::move(expert_source_view_bytes);
-    dst.expert_source_full_views = std::move(expert_source_full_views);
-    dst.expert_source_full_view_bytes =
-        std::move(expert_source_full_view_bytes);
-    dst.expert_source_pinned_ranges = std::move(expert_source_pinned_ranges);
-    dst.host_reservation_bytes = host_reservation_bytes;
-
-    dst.partial_expert_residency = partial_expert_residency;
-    dst.vram_reference_experts = vram_reference_experts;
-    dst.topology = topology;
-    dst.dynamic_expert_cache = dynamic_expert_cache;
-    dst.dynamic_upload_disabled = dynamic_upload_disabled;
-    dst.partial_sources_compacted = partial_sources_compacted;
-    dst.partial_hot_bytes = partial_hot_bytes;
-    dst.partial_cold_bytes = partial_cold_bytes;
-    dst.partial_hot_records = partial_hot_records;
-    dst.vram_reference_bytes = vram_reference_bytes;
-    dst.partial_usage_file = std::move(partial_usage_file);
-    dst.partial_experts = std::move(partial_experts);
-    dst.vram_expert_holds = std::move(vram_expert_holds);
-    dst.host_reference_bytes = host_reference_bytes;
-    dst.dynamic_clock = dynamic_clock;
-    dst.dynamic_promotions = dynamic_promotions;
-    dst.dynamic_compute_ms_ema = dynamic_compute_ms_ema;
-    dst.dynamic_upload_ms_per_job = dynamic_upload_ms_per_job;
-    dst.dynamic_upload = std::move(dynamic_upload);
-    for (PartialExpertLayer &p : dst.partial_experts) {
-      p.hot_gate_up = nullptr;
-      p.hot_gate = nullptr;
-      p.hot_up = nullptr;
-      p.hot_down = nullptr;
-      p.cold_gate_up = nullptr;
-      p.cold_gate = nullptr;
-      p.cold_up = nullptr;
-      p.cold_down = nullptr;
-      p.cold_map = nullptr;
-      p.hot_map = nullptr;
-      p.cold_mask = nullptr;
-      p.hot_mask = nullptr;
-      p.hot1_gate = nullptr;
-      p.hot1_up = nullptr;
-      p.hot1_down = nullptr;
-      p.hot1_map = nullptr;
-      p.hot1_mask = nullptr;
-    }
-
-    expert_source_mmap = false;
-    expert_source_base = nullptr;
-    expert_source_capacity = 0;
-    expert_source_used = 0;
-    expert_source_tensors = 0;
-    expert_source_pinned_ranges.clear();
-    host_reservation_bytes = 0;
-    partial_expert_residency = false;
-    vram_reference_experts = false;
-    dynamic_expert_cache = false;
-    dynamic_upload_disabled = false;
-    partial_sources_compacted = false;
-    partial_hot_bytes = 0;
-    partial_cold_bytes = 0;
-    partial_hot_records = 0;
-    vram_reference_bytes = 0;
-    partial_usage_file.clear();
-    partial_experts.clear();
-    vram_expert_holds.clear();
-    dynamic_clock = 0;
-    dynamic_promotions = 0;
-    dynamic_compute_ms_ema = 0.0;
-    dynamic_upload_ms_per_job = 0.0;
-    return true;
-  }
-
-  ~FullGraph() { destroy(); }
-
-  void destroy() {
-    if (dynamic_upload) {
-      {
-        std::lock_guard<std::mutex> lock(dynamic_upload->mutex);
-        dynamic_upload->stopping = true;
-      }
-      dynamic_upload->cv.notify_all();
-      if (dynamic_upload->worker.joinable())
-        dynamic_upload->worker.join();
-      if (device >= 0)
-        cudaSetDevice(device);
-      if (dynamic_upload->stream) {
-        cudaStreamSynchronize(dynamic_upload->stream);
-        cudaStreamDestroy(dynamic_upload->stream);
-      }
-      if (dynamic_upload->staging) {
-        cudaHostUnregister(dynamic_upload->staging);
-        std::free(dynamic_upload->staging);
-      }
-      MemoryGuard::release_host_bytes(
-          dynamic_upload->host_reservation_bytes);
-      dynamic_upload.reset();
-    }
-    if (sched) {
-      ggml_backend_sched_free(sched);
-      sched = nullptr;
-    }
-    if (cpu) {
-      ggml_backend_free(cpu);
-      cpu = nullptr;
-    }
-    for (ggml_backend_buffer_t b : gpu1_buffers)
-      if (b)
-        ggml_backend_buffer_free(b);
-    gpu1_buffers.clear();
-    for (ggml_backend_buffer_t b : ridge_buffers)
-      if (b)
-        ggml_backend_buffer_free(b);
-    ridge_buffers.clear();
-    probe_x.clear();
-    if (expert_buffer) {
-      ggml_backend_buffer_free(expert_buffer);
-      expert_buffer = nullptr;
-    }
-    if (device_state_buffer) {
-      ggml_backend_buffer_free(device_state_buffer);
-      device_state_buffer = nullptr;
-    }
-    if (dense_buffer) {
-      ggml_backend_buffer_free(dense_buffer);
-      dense_buffer = nullptr;
-    }
-    partial_expert_residency = false;
-    dynamic_expert_cache = false;
-    dynamic_upload_disabled = false;
-    partial_sources_compacted = false;
-    partial_hot_bytes = 0;
-    partial_cold_bytes = 0;
-    partial_hot_records = 0;
-    vram_reference_bytes = 0;
-    partial_usage_file.clear();
-    partial_experts.clear();
-    for (ggml_backend_buffer_t b : host_buffers)
-      if (b)
-        ggml_backend_buffer_free(b);
-    host_buffers.clear();
-    if (ctx) {
-      ggml_free(ctx);
-      ctx = nullptr;
-    }
-    for (HostAllocation &a : owned) {
-      if (a.pinned)
-        cudaHostUnregister(a.ptr);
-      std::free(a.ptr);
-      MemoryGuard::release_host_bytes(a.reservation_bytes);
-    }
-    owned.clear();
-    host_inputs.clear();
-    expert_source_mmap = false;
-    expert_source_base = nullptr;
-    expert_source_capacity = 0;
-    expert_source_used = 0;
-    expert_source_tensors = 0;
-    expert_source_views.clear();
-    expert_source_view_bytes.clear();
-    expert_source_full_views.clear();
-    expert_source_full_view_bytes.clear();
-    for (const HostAllocation &a : expert_source_pinned_ranges)
-      if (a.pinned)
-        cudaHostUnregister(a.ptr);
-    expert_source_pinned_ranges.clear();
-    cuda = nullptr;
-    graph = nullptr;
-    input = output = final_streams = attn_mask = decode_indices = positions =
-        nullptr;
-    indexer_pool_member_ids = indexer_pool_mask =
-        indexer_pool_update_rows = indexer_pool_update_index =
-            indexer_tail_indices = indexer_tail_mask = nullptr;
-    positions_mod4 = positions_mod128 = block_positions4 = block_positions128 =
-        nullptr;
-    csa_zero_values = csa_zero_scores = nullptr;
-    kda_state_out.clear();
-    kda_hist_out.clear();
-    kda_layers.clear();
-    kda_state_inputs.clear();
-    kda_hist_inputs.clear();
-    dsa_kv_out.clear();
-    dsa_kv_storage.clear();
-    kda_state_storage.clear();
-    kda_hist_storage.clear();
-    kda_state_updates.clear();
-    kda_hist_updates.clear();
-    dsa_layers.clear();
-    moe_route_ids.clear();
-    glm5next_indexer_layers.clear();
-    glm5next_indexer_seeds.clear();
-    dsv4_layers.clear();
-    dsv4_stage_outputs.clear();
-    MemoryGuard::release_host_bytes(host_reservation_bytes);
-    host_reservation_bytes = 0;
-    MemoryGuard::release_host_bytes(context_reservation_bytes);
-    context_reservation_bytes = 0;
-    engine = nullptr;
-    topology = nullptr;
-    ready = false;
-  }
-};
+namespace glm5next_graph {
 
 std::unique_ptr<FullGraph> g_graph;
 // The large host expert source is independent of prompt length.  Keep it in
@@ -601,7 +75,7 @@ StreamingEngine *g_glm5next_decode_disabled_engine = nullptr;
 bool env_enabled() {
   static const bool enabled = [] {
     // Full graph is the GLM5NEXT execution path; MOESTREAM_GLM5NEXT_FULL_GRAPH=0 opts out (legacy layered path).
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_FULL_GRAPH");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_FULL_GRAPH");
     return !v || !v[0] || v[0] != '0';
   }();
   return enabled;
@@ -625,90 +99,32 @@ struct OffloadSite {
   int layer = 0;
   bool prefill = false;
 };
+// The GLM graph's view of the DDR expert tier: the tier itself is
+// moestream::offload::ExpertStore; this adds the per-site records the miss
+// nodes point at and short aliases for the store's parts.
 struct OffloadState {
   int first = 0, n_layers = 0, n_experts = 0;
-  std::unique_ptr<moestream::offload::ExpertCache> cache;
-  std::unique_ptr<moestream::offload::VirtualArena> arena;
-  moestream::offload::OffloadStore store;
-  moestream::offload::ModelReader model;
-  std::unique_ptr<moestream::offload::ExpertResidency> residency;
+  std::unique_ptr<moestream::offload::ExpertStore> store;
+  moestream::offload::ExpertCache *cache = nullptr;
+  moestream::offload::VirtualArena *arena = nullptr;
+  moestream::offload::ExpertResidency *residency = nullptr;
   std::deque<OffloadSite> sites;
-  // Pinned (cudaHostRegister) expert slots, so the pilot-staging DMA reads DDR directly instead of through a CPU bounce copy.
-  bool pin_slots = false;
-  std::vector<uint8_t> pinned; // [(layer - first) * n_experts + expert]
-  std::atomic<uint64_t> pin_calls{0}, pin_fail{0};
-  void pin_expert(int layer, int expert) {
-    uint8_t &f = pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert];
-    if (f)
-      return;
-    int ok = 0;
-    for (int k = 0; k < 3; ++k)
-      if (cudaHostRegister(arena->ptr(layer, expert, k), (size_t)arena->plane_bytes(layer, k), cudaHostRegisterPortable) == cudaSuccess)
-        ++ok;
-      else
-        cudaGetLastError();
-    if (ok == 3) {
-      f = 1;
-      pin_calls.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      pin_fail.fetch_add(1, std::memory_order_relaxed);
-      for (int k = 0; k < ok; ++k)
-        cudaHostUnregister(arena->ptr(layer, expert, k)); // partially registered: undo (the unregistered plane is the failed one)
-    }
-  }
-  void unpin_expert(int layer, int expert) {
-    uint8_t &f = pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert];
-    if (!f)
-      return;
-    for (int k = 0; k < 3; ++k)
-      cudaHostUnregister(arena->ptr(layer, expert, k));
-    f = 0;
-  }
-  bool is_pinned(int layer, int expert) const {
-    return pin_slots && pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert] != 0;
-  }
-  ~OffloadState() {
-    if (pin_slots && arena)
-      for (int l = first; l < first + n_layers; ++l)
-        for (int e = 0; e < n_experts; ++e)
-          unpin_expert(l, e);
-  }
-  std::atomic<uint64_t> calls{0}, routes{0}, misses{0}, loads{0}, evictions{0},
-      errors{0}, load_us{0}, transient_loads{0}, cb_us{0}, cold_routes{0};
-  std::atomic<uint64_t> last_report_calls{0};
+  bool is_pinned(int layer, int expert) const { return store->is_pinned(layer, expert); }
 };
 std::unique_ptr<OffloadState> g_offload;
 std::mutex g_offload_mutex;
-std::shared_mutex g_arena_mu; // exclusive: cache eviction/loads (miss nodes); shared: the pilot-staging worker reading arena slots
 // MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
   }();
   return on;
-}
-// Run `ensure` for one layer, with or without the lock held across the reads.
-moestream::offload::ExpertResidency::Ensure
-offload_ensure(moestream::offload::ExpertResidency &res, int layer, const int32_t *ids, int n,
-               moestream::offload::ExpertCache::Kind kind) {
-  if (!offload_async()) {
-    std::unique_lock<std::shared_mutex> lock(g_arena_mu);
-    return res.ensure(layer, ids, n, kind);
-  }
-  moestream::offload::ExpertResidency::Plan p;
-  {
-    std::unique_lock<std::shared_mutex> lock(g_arena_mu);
-    p = res.begin(layer, ids, n, kind);
-  }
-  return res.finish(p, [] { return std::unique_lock<std::shared_mutex>(g_arena_mu); });
 }
 
 int offload_first_layer() {
   static const int first = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER");
-    return v && v[0] ? std::atoi(v) : -1;
+    return moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER", -1);
   }();
   return first;
 }
@@ -717,35 +133,8 @@ bool offload_layer(int layer) {
   return f >= 0 && layer >= f;
 }
 std::string offload_env(const char *name, const char *dflt = "") {
-  const char *v = std::getenv(name);
+  const char *v = moestream::graphcfg::env(name);
   return v && v[0] ? v : dflt;
-}
-
-void offload_report(OffloadState &o, const char *why) {
-  LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s: calls=%llu routes=%llu misses=%llu "
-           "loads=%llu transient=%llu evictions=%llu errors=%llu load=%.1f ms "
-           "callback=%.1f ms cold_routes=%llu\n",
-           why, (unsigned long long)o.calls.load(),
-           (unsigned long long)o.routes.load(),
-           (unsigned long long)o.misses.load(),
-           (unsigned long long)o.loads.load(),
-           (unsigned long long)o.transient_loads.load(),
-           (unsigned long long)o.evictions.load(),
-           (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
-           o.cb_us.load() / 1000.0, (unsigned long long)o.cold_routes.load());
-  LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s sources: store direct=%llu store buffered=%llu model buffered=%llu\n", why,
-           (unsigned long long)o.store.direct_reads(), (unsigned long long)o.store.buffered_reads(),
-           (unsigned long long)o.model.reads.load());
-  if (o.residency && offload_async())
-    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s async: demand lookups that waited on an in-flight read=%llu wait=%.1f ms\n", why,
-             (unsigned long long)o.residency->waited_experts(), o.residency->wait_ms());
-  if (o.cache && o.cache->config().policy == moestream::offload::ExpertCache::Policy::SegmentedLru) {
-    const auto &st = o.cache->stats();
-    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s segmented: prefetch_inserts=%llu promotions=%llu "
-             "prefetch_evicted_unused=%llu probation=%zu/%zu\n",
-             why, (unsigned long long)st.prefetch_inserts, (unsigned long long)st.promotions,
-             (unsigned long long)st.prefetch_evicted_unused, o.cache->probation_used(), o.cache->used());
-  }
 }
 
 // Created on first use and shared by the prompt and decode graphs.
@@ -763,8 +152,11 @@ OffloadState *get_offload(const StreamingEngine &engine,
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] bad first layer %d\n", o->first);
     return nullptr;
   }
-  std::vector<std::array<uint64_t, 3>> planes;
-  uint64_t expert_bytes_sum = 0;
+  moestream::offload::ExpertStoreConfig sc;
+  sc.first_layer = o->first;
+  sc.n_layers = o->n_layers;
+  sc.n_experts = o->n_experts;
+  sc.log_tag = "[GGML-GLM5NEXT-OFFLOAD]";
   for (int l = o->first; l < c.n_layers; ++l) {
     std::array<uint64_t, 3> pb{};
     int k = 0;
@@ -784,30 +176,12 @@ OffloadState *get_offload(const StreamingEngine &engine,
                   l, stem, (unsigned long long)pb[(size_t)k]);
         return nullptr;
       }
-      expert_bytes_sum += pb[(size_t)k];
       ++k;
     }
-    planes.push_back(pb);
+    sc.plane_bytes.push_back(pb);
   }
-  o->arena = std::make_unique<moestream::offload::VirtualArena>(
-      o->first, o->n_layers, o->n_experts, planes,
-      /*no_huge_pages=*/offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") != "1");
-  if (!o->arena->ok()) {
-    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] virtual arena mmap failed\n");
-    return nullptr;
-  }
-
-  std::string err;
-  std::vector<moestream::offload::ExpertSource *> sources;
-  const std::string store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
-  if (!store_path.empty()) {
-    if (o->store.open_auto(store_path, &err))
-      sources.push_back(&o->store);
-    else
-      LOG_WARN("[GGML-GLM5NEXT-OFFLOAD] store %s unusable (%s); model only\n",
-               store_path.c_str(), err.c_str());
-  }
-  std::vector<std::string> shards;
+  sc.huge_pages = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") == "1";
+  sc.store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
   {
     const std::string first_shard = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
     if (first_shard.empty()) {
@@ -821,64 +195,51 @@ OffloadState *get_offload(const StreamingEngine &engine,
       // A directory of shards (what `gguf_tool pack` writes: repacked-<name>-partNNNNN-of-NNNNN.gguf): every .gguf, sorted.
       for (const auto &entry : std::filesystem::directory_iterator(first_shard))
         if (entry.is_regular_file() && entry.path().extension() == ".gguf")
-          shards.push_back(entry.path().string());
-      std::sort(shards.begin(), shards.end());
+          sc.model_shards.push_back(entry.path().string());
+      std::sort(sc.model_shards.begin(), sc.model_shards.end());
     } else if (pos == std::string::npos) {
-      shards.push_back(first_shard);
+      sc.model_shards.push_back(first_shard);
     } else {
       const std::string head = first_shard.substr(0, pos);
       const int total = std::atoi(first_shard.c_str() + pos + 10);
       char buf[64];
       for (int i = 1; i <= std::max(1, total); ++i) {
         std::snprintf(buf, sizeof buf, "-%05d-of-%05d.gguf", i, total);
-        shards.push_back(head + buf);
+        sc.model_shards.push_back(head + buf);
       }
     }
   }
-  if (!o->model.open(shards, &err)) {
-    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] model reader: %s\n", err.c_str());
-    return nullptr;
-  }
-  sources.push_back(&o->model);
-
-  moestream::offload::ExpertCache::Config cc;
-  cc.first_layer = o->first;
-  cc.n_layers = o->n_layers;
-  cc.n_experts = o->n_experts;
-  const double ddr_gib =
+  sc.ddr_gib =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "40").c_str());
-  cc.capacity = (size_t)(ddr_gib * 1024.0 * 1024.0 * 1024.0 /
-                         ((double)expert_bytes_sum / (double)o->n_layers));
-  cc.policy = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg"
+  sc.policy = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg"
                   ? moestream::offload::ExpertCache::Policy::SegmentedLru
                   : moestream::offload::ExpertCache::Policy::Lru;
-  cc.pinned_fraction =
+  sc.pinned_fraction =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PINNED", "0.5").c_str());
-  cc.probation_fraction =
+  sc.probation_fraction =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION", "0.25").c_str());
-  if (offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1") {
-    // Weigh every entry by its real per-layer size instead of the average (layers can differ in quant type).
-    cc.layer_bytes.clear();
-    for (const auto &pb : planes)
-      cc.layer_bytes.push_back(pb[0] + pb[1] + pb[2]);
-    cc.capacity = (size_t)(ddr_gib * 1024.0 * 1024.0 * 1024.0);
-  }
-  o->cache = std::make_unique<moestream::offload::ExpertCache>(cc);
-  o->residency = std::make_unique<moestream::offload::ExpertResidency>(
-      *o->cache, *o->arena, sources);
-
+  sc.byte_capacity = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1";
+  sc.async_loads = offload_async();
   if (pilot_stage_k() > 0 && offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", "0") == "1") {
-    o->pin_slots = true;
-    o->pinned.assign((size_t)o->n_layers * (size_t)o->n_experts, 0);
-    OffloadState *op = o.get();
-    // Register only the cache's never-evicted experts: they are registered once at load and never unregistered, so there is no
-    // register/unregister churn (~0.4 ms per expert) on the LRU half. Those experts keep the bounce path.
-    o->arena->after_populate = [op](int l, int e) {
-      if (op->cache && op->cache->pinned({l, e}))
-        op->pin_expert(l, e);
+    sc.pin_fn = [](void *ptr, size_t bytes) {
+      if (cudaHostRegister(ptr, bytes, cudaHostRegisterPortable) == cudaSuccess)
+        return true;
+      cudaGetLastError();
+      return false;
     };
-    o->arena->before_evict = [op](int l, int e) { op->unpin_expert(l, e); };
+    sc.unpin_fn = [](void *ptr) { cudaHostUnregister(ptr); };
   }
+
+  std::string err;
+  o->store = moestream::offload::ExpertStore::create(sc, &err);
+  if (!o->store) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s\n", err.c_str());
+    return nullptr;
+  }
+  o->cache = &o->store->cache();
+  o->arena = &o->store->arena();
+  o->residency = &o->store->residency();
+
   const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
   if (!usage.empty()) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -907,21 +268,21 @@ OffloadState *get_offload(const StreamingEngine &engine,
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] excluded %zu VRAM-hot experts from the "
                "DDR seed\n", n_hot);
     }
-    o->cache->seed(ranked);
-    const size_t failed = o->residency->populate_resident();
-    if (o->pin_slots)
+    const size_t failed = o->store->seed(ranked);
+    if (o->store->pinning())
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] pinned %llu experts (%llu failed) for direct DMA\n",
-               (unsigned long long)o->pin_calls.load(), (unsigned long long)o->pin_fail.load());
+               (unsigned long long)o->store->pin_calls(), (unsigned long long)o->store->pin_failures());
     LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] seeded %zu/%zu experts (%zu failed) in "
              "%.1f s\n",
-             o->cache->size(), cc.capacity, failed,
+             o->cache->size(), o->store->capacity(), failed,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
                  .count());
   }
   LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] layers %d..%d, capacity %zu experts "
            "(%.1f GiB), pinned %.2f, store=%s\n",
-           o->first, c.n_layers - 1, cc.capacity, ddr_gib, cc.pinned_fraction,
-           store_path.empty() ? "<none>" : store_path.c_str());
+           o->first, c.n_layers - 1, o->store->capacity(), sc.ddr_gib,
+           sc.pinned_fraction,
+           sc.store_path.empty() ? "<none>" : sc.store_path.c_str());
   g_offload = std::move(o);
   return g_offload.get();
 }
@@ -939,7 +300,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
       ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
                                        i0 * a->nb[0]));
-  static const bool dbg = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
+  static const bool dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
   static std::atomic<int> dbg_lines{0};
   if (dbg && !site->prefill)
     for (size_t k = 0; k < ids.size(); ++k)
@@ -948,39 +309,38 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                  (long long)a->ne[1], k);
   moestream::offload::ExpertResidency::Ensure r;
   if (site->prefill) {
-    std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
-    r = o.residency->ensure_transient(site->layer, ids.data(), (int)ids.size());
+    r = o.store->ensure_transient(site->layer, ids.data(), (int)ids.size());
   } else {
-    r = offload_ensure(*o.residency, site->layer, ids.data(), (int)ids.size(),
-                       moestream::offload::ExpertCache::Kind::Demand);
+    r = o.store->ensure(site->layer, ids.data(), (int)ids.size(),
+                        moestream::offload::ExpertCache::Kind::Demand);
   }
-  o.calls.fetch_add(1, std::memory_order_relaxed);
-  o.routes.fetch_add(ids.size(), std::memory_order_relaxed);
-  o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }),
+  o.store->counters().calls.fetch_add(1, std::memory_order_relaxed);
+  o.store->counters().routes.fetch_add(ids.size(), std::memory_order_relaxed);
+  o.store->counters().cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }),
                           std::memory_order_relaxed);
-  o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
-  o.loads.fetch_add((uint64_t)(site->prefill ? 0 : r.loads),
+  o.store->counters().misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+  o.store->counters().loads.fetch_add((uint64_t)(site->prefill ? 0 : r.loads),
                     std::memory_order_relaxed);
-  o.transient_loads.fetch_add((uint64_t)(site->prefill ? r.loads : 0),
+  o.store->counters().transient_loads.fetch_add((uint64_t)(site->prefill ? r.loads : 0),
                               std::memory_order_relaxed);
-  o.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
-  o.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+  o.store->counters().evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+  o.store->counters().load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
   if (r.errors > 0) {
-    o.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+    o.store->counters().errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); "
               "aborting rather than computing with missing experts\n",
               site->layer, r.errors);
-    offload_report(o, "fatal");
+    o.store->report("fatal");
     std::abort();
   }
   // dst has the shape of `a` but is contiguous.
   std::memcpy(dst->data, ids.data(), ids.size() * sizeof(int32_t));
-  o.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+  o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
-  if (!site->prefill && o.calls.load() - o.last_report_calls.load() >= 544) {
-    o.last_report_calls.store(o.calls.load());
-    offload_report(o, "progress");
+  if (!site->prefill && o.store->counters().calls.load() - o.store->counters().last_report_calls.load() >= 544) {
+    o.store->counters().last_report_calls.store(o.store->counters().calls.load());
+    o.store->report("progress");
   }
 }
 
@@ -993,7 +353,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
 // ---------------------------------------------------------------------------
 int pilot_stage_k() {
   static const int k = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_STAGE");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_STAGE");
     return v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0;
   }();
   return k;
@@ -1002,8 +362,7 @@ int pilot_stage_k() {
 // of the layer that needs them; only the first pilot_stage_k() resident ones are copied into the VRAM ring.
 bool pilot_prefetch_on() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
-    return v && std::atoi(v) > 0;
+    return moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PILOT_PREFETCH", 0) > 0;
   }();
   return on;
 }
@@ -1011,14 +370,13 @@ bool pilot_prefetch_on() {
 // VRAM ring and no layer waits for the prefetch, so the CPU computes every cold route as without staging.
 bool pilot_copy_on() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_COPY");
-    return !(v && v[0] == '0');
+    return moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_PILOT_COPY");
   }();
   return on;
 }
 int pilot_prefetch_k() {
   static const int k = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_PREFETCH");
     return std::max(pilot_stage_k(), v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0);
   }();
   return k;
@@ -1027,10 +385,10 @@ int pilot_prefetch_k() {
 // router on layer l's FFN input) so the read has k layers of lead time. Staging copies keep k=1 (the ring has two sets).
 int pilot_lookahead() {
   static const int k = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD");
     int want = v && v[0] ? std::max(1, std::min(4, std::atoi(v))) : 1;
     if (want > 1) {
-      const char *cv = std::getenv("MOESTREAM_GLM5NEXT_PILOT_COPY");
+      const char *cv = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_COPY");
       if (!(cv && cv[0] == '0'))
         want = 1;
     }
@@ -1041,8 +399,7 @@ int pilot_lookahead() {
 // MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE=x: only prefetch pilot candidates whose router score is >= x.
 float pilot_min_score() {
   static const float v = [] {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE");
-    return e && e[0] ? (float)std::atof(e) : -1e30f;
+    return (float)moestream::graphcfg::atof_or("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE", -1e30f);
   }();
   return v;
 }
@@ -1198,7 +555,7 @@ void stage_worker_main(StageRuntime *st) {
       int32_t missing[8];
       int nm = 0;
       {
-        std::shared_lock<std::shared_mutex> arena_lock(g_arena_mu);
+        auto arena_lock = o->store->reader_lock();
         for (int j = 0; j < job.n; ++j) {
           const int id = job.ids[j];
           if (id >= 0 && id < o->n_experts && !o->cache->resident({job.layer, id}))
@@ -1208,8 +565,8 @@ void stage_worker_main(StageRuntime *st) {
       if (nm > 0) {
         const auto t0 = std::chrono::steady_clock::now();
         const moestream::offload::ExpertResidency::Ensure r =
-            offload_ensure(*o->residency, job.layer, missing, nm,
-                           moestream::offload::ExpertCache::Kind::Prefetch);
+            o->store->ensure(job.layer, missing, nm,
+                             moestream::offload::ExpertCache::Kind::Prefetch);
         st->prefetch_loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
         st->prefetch_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
                                   std::memory_order_relaxed);
@@ -1220,7 +577,7 @@ void stage_worker_main(StageRuntime *st) {
     if (!pilot_copy_on())
       continue;
     if (o) {
-      std::shared_lock<std::shared_mutex> arena_lock(g_arena_mu);
+      auto arena_lock = o->store->reader_lock();
       int chosen[8] = {};
       for (int j = 0; j < job.n && staged < st->K; ++j) {
         const int id = job.ids[j];
@@ -1428,23 +785,23 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   st->staged_routes.fetch_add(hit, std::memory_order_relaxed);
   st->routes_seen.fetch_add((uint64_t)n, std::memory_order_relaxed);
   const moestream::offload::ExpertResidency::Ensure r =
-      offload_ensure(*o.residency, site->layer, ids.data(), n, moestream::offload::ExpertCache::Kind::Demand);
-  o.calls.fetch_add(1, std::memory_order_relaxed);
-  o.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
-  o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
-  o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
-  o.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
-  o.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
-  o.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+      o.store->ensure(site->layer, ids.data(), n, moestream::offload::ExpertCache::Kind::Demand);
+  o.store->counters().calls.fetch_add(1, std::memory_order_relaxed);
+  o.store->counters().routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+  o.store->counters().cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
+  o.store->counters().misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+  o.store->counters().loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
+  o.store->counters().evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+  o.store->counters().load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
   if (r.errors > 0) {
-    o.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+    o.store->counters().errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting\n", site->layer, r.errors);
-    offload_report(o, "fatal");
+    o.store->report("fatal");
     std::abort();
   }
   if (site->next_layer >= 0)
     stage_post_job(st, site->next_layer, site->next_set, c);
-  o.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
+  o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
   const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
   if (rs % 4704 == 0)
@@ -1470,30 +827,29 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
     }
     LOG_INFO("[GGML-GLM5NEXT-STAGE] %s\n[GGML-GLM5NEXT-STAGE] %s\n", pr.c_str(), ps.c_str());
   }
-  if (o.calls.load() - o.last_report_calls.load() >= 544) {
-    o.last_report_calls.store(o.calls.load());
-    offload_report(o, "progress");
+  if (o.store->counters().calls.load() - o.store->counters().last_report_calls.load() >= 544) {
+    o.store->counters().last_report_calls.store(o.store->counters().calls.load());
+    o.store->report("progress");
   }
 }
 
 bool dynamic_cache_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
   }();
   return enabled;
 }
 
 bool route_stats_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_CACHE_STATS");
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CACHE_STATS");
     return (v && v[0] == '1') || dynamic_cache_enabled();
   }();
   return enabled;
 }
 
 int env_device_expert_layers() {
-  const char *v = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_PRELOAD_LAYERS");
+  const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_PRELOAD_LAYERS");
   if (!v || !v[0])
     return 0;
   char *end = nullptr;
@@ -1651,8 +1007,7 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name);
 static bool layer_timing_env() {
   static const bool on = [] {
-    const char *v = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
   }();
   return on;
 }
@@ -1665,764 +1020,6 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
 ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                      ggml_tensor *residual, ggml_tensor *post,
                      ggml_tensor *comb);
-
-// ---------------------------------------------------------------------------
-// DeepSeek-V4 full prefill graph.
-//
-// V4 cannot reuse GLM5NEXT's KDA/absorbed-MLA builder: its real Flash file
-// has raw SWA attention plus ratio-4 CSA and ratio-128 HCA layers.  The
-// builder below keeps the same graph-owned dense/expert arenas and HC/MoE
-// nodes, but expresses V4's compressed keys and attention sinks as GGML
-// nodes.  For the normal Flash prompt sizes (well below CSA top-k * 4), all
-// completed compressed blocks are visible, so the indexer only needs to be
-// carried forward for the subsequent decode path; no host top-k loop is
-// inserted into the prefill graph.
-// ---------------------------------------------------------------------------
-
-bool dsv4_env_enabled() {
-  static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_DEEPSEEK_V4_FULL_GRAPH");
-    return v && v[0] == '1';
-  }();
-  return enabled;
-}
-
-bool dsv4_graph_diagnostic_enabled() {
-  const char *v = std::getenv("MOESTREAM_DEEPSEEK_V4_GRAPH_DIAGNOSTIC");
-  return v && v[0] == '1';
-}
-
-int dsv4_env_device_expert_layers() {
-  const char *v = std::getenv("MOESTREAM_DEEPSEEK_V4_GRAPH_PRELOAD_LAYERS");
-  if (!v || !v[0])
-    return 0;
-  char *end = nullptr;
-  long n = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || n <= 0)
-    return 0;
-  return static_cast<int>(std::min<long>(n, 43));
-}
-
-ggml_tensor *dsv4_host_i32(FullGraph &g, ggml_context *ctx, int n,
-                           const char *name, int32_t **out) {
-  ggml_tensor *t =
-      host_input(g, ctx, GGML_TYPE_I32, {n}, (size_t)n * sizeof(int32_t), name);
-  if (t && out)
-    *out = static_cast<int32_t *>(t->data);
-  return t;
-}
-
-ggml_tensor *dsv4_host_i32_2d(FullGraph &g, ggml_context *ctx, int ne0, int ne1,
-                              const char *name, int32_t **out) {
-  ggml_tensor *t = host_input(g, ctx, GGML_TYPE_I32, {ne0, ne1},
-                              (size_t)ne0 * ne1 * sizeof(int32_t), name);
-  if (t && out)
-    *out = static_cast<int32_t *>(t->data);
-  return t;
-}
-
-ggml_tensor *dsv4_host_f32(FullGraph &g, ggml_context *ctx,
-                           const std::vector<int64_t> &shape, const char *name,
-                           float **out) {
-  size_t n = 1;
-  for (int64_t d : shape)
-    n *= (size_t)d;
-  ggml_tensor *t =
-      host_input(g, ctx, GGML_TYPE_F32, shape, n * sizeof(float), name);
-  if (t && out)
-    *out = static_cast<float *>(t->data);
-  return t;
-}
-
-struct Dsv4RopeParams {
-  float theta = 10000.0f;
-  float freq_scale = 1.0f;
-  float ext_factor = 0.0f;
-  float attn_factor = 1.0f;
-  int n_ctx_orig = 0;
-};
-
-Dsv4RopeParams dsv4_rope_params(const FullGraph &g, int ratio) {
-  const auto &c = g.engine->model_file.architecture_config;
-  Dsv4RopeParams p;
-  p.theta = ratio == 0 ? g.engine->model_file.get_config_float("rope.freq_base",
-                                                               10000.0f)
-                       : c.dsv4_compress_rope_freq_base;
-  if (ratio == 0)
-    return p;
-  p.freq_scale = c.rope_freq_scale;
-  p.ext_factor = c.rope_ext_factor;
-  p.n_ctx_orig = c.rope_n_ctx_orig;
-  // ggml's YaRN kernel multiplies the supplied attention factor by
-  // (1+0.1*log(1/freq_scale)) when ext_factor is enabled.  DeepSeek-V4's
-  // dsv4_mscale intentionally divides by that term instead, so pre-adjust
-  // the argument to make the GGML operation produce the V4 value.
-  if (p.ext_factor != 0.0f && p.freq_scale > 0.0f) {
-    const float f = 1.0f + 0.1f * std::log(1.0f / p.freq_scale);
-    p.attn_factor = c.rope_attn_factor / (f * f);
-  } else {
-    p.attn_factor = c.rope_attn_factor;
-  }
-  return p;
-}
-
-ggml_tensor *dsv4_rope_tail(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
-                            int nope, int rope, ggml_tensor *positions,
-                            int ratio, bool inverse) {
-  if (rope <= 0)
-    return x;
-  const Dsv4RopeParams p = dsv4_rope_params(g, ratio);
-  ggml_tensor *head =
-      ggml_view_3d(ctx, x, nope, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
-  ggml_tensor *tail = ggml_view_3d(ctx, x, rope, x->ne[1], x->ne[2], x->nb[1],
-                                   x->nb[2], (size_t)nope * x->nb[0]);
-  ggml_tensor *rot =
-      inverse ? ggml_rope_ext_back(ctx, tail, positions, nullptr, rope,
-                                   GGML_ROPE_TYPE_NORMAL, p.n_ctx_orig, p.theta,
-                                   p.freq_scale, p.ext_factor, p.attn_factor,
-                                   32.0f, 1.0f)
-              : ggml_rope_ext(ctx, tail, positions, nullptr, rope,
-                              GGML_ROPE_TYPE_NORMAL, p.n_ctx_orig, p.theta,
-                              p.freq_scale, p.ext_factor, p.attn_factor, 32.0f,
-                              1.0f);
-  return ggml_concat(ctx, head, rot, 0);
-}
-
-ggml_tensor *dsv4_compressed_keys(FullGraph &g, ggml_context *ctx,
-                                  ggml_tensor *comp_kv, ggml_tensor *comp_score,
-                                  ggml_tensor *comp_ape, ggml_tensor *comp_norm,
-                                  int ratio, int key_dim, bool csa,
-                                  ggml_tensor *mod_positions,
-                                  ggml_tensor *block_positions) {
-  const int blocks = g.S / ratio;
-  if (blocks <= 0)
-    return nullptr;
-  const int width = csa ? 2 * key_dim : key_dim;
-  const int n_read = blocks * ratio;
-
-  // Match Llama.cpp's state compressor.  The IDs are block-major: for HCA
-  // they select every prompt row once; for CSA they select the previous
-  // four-row window for every block followed by the current four-row window.
-  // This makes the following softmax operate over positions (the first
-  // dimension after permute), rather than over key channels.
-  const int n_indices = csa ? 2 * n_read : n_read;
-  int32_t *index_data = nullptr;
-  ggml_tensor *state_read_idxs = dsv4_host_i32(g, ctx, n_indices,
-                                               csa ? "dsv4_graph_csa_read_idxs"
-                                                   : "dsv4_graph_hca_read_idxs",
-                                               &index_data);
-  if (!state_read_idxs)
-    return nullptr;
-  if (!csa) {
-    for (int i = 0; i < n_read; ++i)
-      index_data[i] = i;
-  } else {
-    for (int b = 0; b < blocks; ++b) {
-      for (int i = 0; i < ratio; ++i) {
-        const int j = b * ratio + i;
-        // The appended row at index S is the zero/-inf history used for the
-        // first CSA block, exactly as dsv4_append_zero_row() in llama.cpp.
-        index_data[j] = b == 0 ? g.S : (b - 1) * ratio + i;
-        index_data[n_read + j] = j;
-      }
-    }
-  }
-
-  ggml_tensor *kv_source = comp_kv;
-  ggml_tensor *score_source = comp_score;
-  if (csa) {
-    // Use a graph-derived row so this works for both the normal qh-wide CSA
-    // compressor and the narrower indexer compressor.  It avoids a separate
-    // fixed-width host zero buffer and is the same value-wise operation as
-    // llama.cpp's dsv4_append_zero_row().
-    ggml_tensor *kv_zero = ggml_reshape_2d(
-        ctx, ggml_scale(ctx, ggml_view_1d(ctx, comp_kv, width, 0), 0.0f), width,
-        1);
-    ggml_tensor *score_zero = ggml_reshape_2d(
-        ctx,
-        ggml_scale_bias(ctx, ggml_view_1d(ctx, comp_score, width, 0), 0.0f,
-                        -INFINITY),
-        width, 1);
-    kv_source = ggml_concat(ctx, comp_kv, kv_zero, 1);
-    score_source = ggml_concat(ctx, comp_score, score_zero, 1);
-  }
-
-  ggml_tensor *kv_rows = ggml_get_rows(ctx, kv_source, state_read_idxs);
-  ggml_tensor *score_rows = ggml_get_rows(ctx, score_source, state_read_idxs);
-  ggml_tensor *values = nullptr;
-  ggml_tensor *scores = nullptr;
-  if (!csa) {
-    ggml_tensor *kv = ggml_reshape_3d(ctx, kv_rows, key_dim, ratio, blocks);
-    ggml_tensor *score =
-        ggml_reshape_3d(ctx, score_rows, key_dim, ratio, blocks);
-    values = ggml_cont(ctx, ggml_permute(ctx, kv, 1, 0, 2, 3));
-    scores = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
-  } else {
-    // Each row has [previous/current] channels.  Split the gathered rows
-    // before concatenating along the position dimension, as in llama.cpp's
-    // build_overlap_compressed_kv_from_state().
-    ggml_tensor *kv_prev = ggml_cont(
-        ctx, ggml_view_2d(ctx, kv_rows, key_dim, n_read, kv_rows->nb[1], 0));
-    ggml_tensor *score_prev =
-        ggml_cont(ctx, ggml_view_2d(ctx, score_rows, key_dim, n_read,
-                                    score_rows->nb[1], 0));
-    const size_t second_half =
-        (size_t)n_read * kv_rows->nb[1] + ggml_row_size(kv_rows->type, key_dim);
-    const size_t second_score_half = (size_t)n_read * score_rows->nb[1] +
-                                     ggml_row_size(score_rows->type, key_dim);
-    ggml_tensor *kv_cur =
-        ggml_cont(ctx, ggml_view_2d(ctx, kv_rows, key_dim, n_read,
-                                    kv_rows->nb[1], second_half));
-    ggml_tensor *score_cur =
-        ggml_cont(ctx, ggml_view_2d(ctx, score_rows, key_dim, n_read,
-                                    score_rows->nb[1], second_score_half));
-    ggml_tensor *kv =
-        ggml_concat(ctx, ggml_reshape_3d(ctx, kv_prev, key_dim, ratio, blocks),
-                    ggml_reshape_3d(ctx, kv_cur, key_dim, ratio, blocks), 1);
-    ggml_tensor *score = ggml_concat(
-        ctx, ggml_reshape_3d(ctx, score_prev, key_dim, ratio, blocks),
-        ggml_reshape_3d(ctx, score_cur, key_dim, ratio, blocks), 1);
-    values = ggml_cont(ctx, ggml_permute(ctx, kv, 1, 0, 2, 3));
-    scores = ggml_cont(ctx, ggml_permute(ctx, score, 1, 0, 2, 3));
-  }
-
-  ggml_tensor *weights = ggml_soft_max(ctx, scores);
-  ggml_tensor *comp = ggml_mul(ctx, values, weights);
-  comp = ggml_sum_rows(ctx, comp);
-  comp = ggml_cont(ctx, ggml_permute(ctx, comp, 1, 0, 2, 3));
-  comp = ggml_mul(
-      ctx,
-      ggml_rms_norm(ctx, comp, g.engine->model_file.architecture_config.eps),
-      comp_norm);
-  comp = dsv4_rope_tail(g, ctx, comp, key_dim - g.qk_rope, g.qk_rope,
-                        block_positions, ratio, false);
-  (void)mod_positions;
-  (void)comp_ape;
-  return ggml_cont_3d(ctx, comp, key_dim, 1, blocks);
-}
-
-ggml_tensor *build_dsv4_attention(FullGraph &g, ggml_context *ctx,
-                                  ggml_tensor *cur, int layer) {
-  const auto &c = g.engine->model_file.architecture_config;
-  const std::string p = "blk." + std::to_string(layer) + ".";
-  const int qh = g.qk_nope + g.qk_rope;
-  const int ratio =
-      c.dsv4_compress_ratios.empty()
-          ? 0
-          : static_cast<int>(c.dsv4_compress_ratios[(size_t)layer]);
-  const bool csa = ratio == 4;
-  FullGraph::Dsv4LayerTensors lt;
-  lt.layer = layer;
-  lt.ratio = ratio;
-
-  ggml_tensor *wqa = resident_tensor(g, ctx, p + "attn_q_a.weight");
-  ggml_tensor *wqan = resident_tensor(g, ctx, p + "attn_q_a_norm.weight");
-  ggml_tensor *wqb = resident_tensor(g, ctx, p + "attn_q_b.weight");
-  ggml_tensor *wkv = resident_tensor(g, ctx, p + "attn_kv.weight");
-  ggml_tensor *wkvn = resident_tensor(g, ctx, p + "attn_kv_a_norm.weight");
-  ggml_tensor *woa = resident_tensor(g, ctx, p + "attn_output_a.weight");
-  ggml_tensor *wob = resident_tensor(g, ctx, p + "attn_output_b.weight");
-  if (!wqa || !wqan || !wqb || !wkv || !wkvn || !woa || !wob)
-    return nullptr;
-
-  ggml_tensor *q_lora = ggml_mul_mat(ctx, wqa, cur);
-  q_lora = ggml_mul(ctx, ggml_rms_norm(ctx, q_lora, c.eps), wqan);
-  ggml_tensor *q =
-      ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wqb, q_lora), qh, g.H, g.S);
-  q = ggml_rms_norm(ctx, q, c.eps); // V4's weightless per-head Q norm
-  q = dsv4_rope_tail(g, ctx, q, g.qk_nope, g.qk_rope, g.positions, ratio,
-                     false);
-
-  ggml_tensor *kv =
-      ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wkv, cur), qh, 1, g.S);
-  kv = ggml_mul(ctx, ggml_rms_norm(ctx, kv, c.eps), wkvn);
-  kv = dsv4_rope_tail(g, ctx, kv, g.qk_nope, g.qk_rope, g.positions, ratio,
-                      false);
-  lt.raw_kv = kv;
-
-  ggml_tensor *compressed = nullptr;
-  int ncompressed = 0;
-  if (ratio != 0) {
-    ggml_tensor *ckv = resident_tensor(g, ctx, p + "attn_compressor_kv.weight");
-    ggml_tensor *cgate =
-        resident_tensor(g, ctx, p + "attn_compressor_gate.weight");
-    ggml_tensor *cape =
-        resident_tensor(g, ctx, p + "attn_compressor_ape.weight");
-    ggml_tensor *cnorm =
-        resident_tensor(g, ctx, p + "attn_compressor_norm.weight");
-    if (!ckv || !cgate || !cape || !cnorm)
-      return nullptr;
-    const int width = csa ? 2 * qh : qh;
-    lt.comp_kv = ggml_mul_mat(ctx, ckv, cur);
-    ggml_tensor *gate = ggml_mul_mat(ctx, cgate, cur);
-    ggml_tensor *ape_rows =
-        ggml_get_rows(ctx, cape, csa ? g.positions_mod4 : g.positions_mod128);
-    lt.comp_score = ggml_add(ctx, gate, ape_rows);
-    compressed = dsv4_compressed_keys(
-        g, ctx, lt.comp_kv, lt.comp_score, cape, cnorm, ratio, qh, csa,
-        csa ? g.positions_mod4 : g.positions_mod128,
-        csa ? g.block_positions4 : g.block_positions128);
-    ncompressed = g.S / ratio;
-    lt.keys = compressed;
-
-    if (csa) {
-      ggml_tensor *ikv =
-          resident_tensor(g, ctx, p + "indexer_compressor_kv.weight");
-      ggml_tensor *igate =
-          resident_tensor(g, ctx, p + "indexer_compressor_gate.weight");
-      ggml_tensor *iape =
-          resident_tensor(g, ctx, p + "indexer_compressor_ape.weight");
-      ggml_tensor *inorm =
-          resident_tensor(g, ctx, p + "indexer_compressor_norm.weight");
-      if (!ikv || !igate || !iape || !inorm)
-        return nullptr;
-      const int idim = c.dsv4_indexer_key_length;
-      lt.indexer_comp_kv = ggml_mul_mat(ctx, ikv, cur);
-      lt.indexer_comp_score =
-          ggml_add(ctx, ggml_mul_mat(ctx, igate, cur),
-                   ggml_get_rows(ctx, iape, g.positions_mod4));
-      lt.indexer_keys = dsv4_compressed_keys(
-          g, ctx, lt.indexer_comp_kv, lt.indexer_comp_score, iape, inorm, 4,
-          idim, true, g.positions_mod4, g.block_positions4);
-    }
-  }
-
-  ggml_tensor *seq = kv;
-  if (compressed) {
-    seq = ggml_concat(ctx, seq,
-                      ggml_reshape_3d(ctx, compressed, qh, 1, ncompressed), 2);
-  }
-  const int key_count = g.S + ncompressed;
-
-  // Use GGML's native attention-sink input.  Appending a synthetic K/V
-  // dimension would change V4's qh=512 head width to 513, which disables the
-  // CUDA FATTN kernel on RTX 3090 and sends every attention layer to the CPU.
-  ggml_tensor *sink_tensor = resident_tensor(g, ctx, p + "attn_sinks.weight");
-  if (!sink_tensor || sink_tensor->type != GGML_TYPE_F32 ||
-      sink_tensor->ne[0] != (int64_t)g.H)
-    return nullptr;
-  // FATTN's CUDA GQA path requires K->ne[1] to be a multiple of 256 for
-  // qh=512.  Pad with zero K/V rows and mask those rows out.  The padding is
-  // a graph-only workspace shape choice; it never enters the cache state.
-  const int padded_key_count = ((key_count + 255) / 256) * 256;
-  ggml_tensor *seq_padded = seq;
-  if (padded_key_count > key_count) {
-    float *pad_data = nullptr;
-    ggml_tensor *pad =
-        dsv4_host_f32(g, ctx, {qh, 1, padded_key_count - key_count},
-                      "dsv4_graph_attention_padding", &pad_data);
-    if (!pad)
-      return nullptr;
-    std::fill(pad_data, pad_data + (size_t)qh * (padded_key_count - key_count),
-              0.0f);
-    seq_padded = ggml_concat(ctx, seq, pad, 2);
-  }
-  ggml_tensor *real =
-      ggml_repeat_4d(ctx, seq_padded, qh, g.H, padded_key_count, 1);
-
-  float *mask_data = nullptr;
-  ggml_tensor *mask =
-      dsv4_host_f32(g, ctx, {padded_key_count, g.S, 1, 1},
-                    "dsv4_graph_attention_mask_f32", &mask_data);
-  if (!mask)
-    return nullptr;
-  const int window = g.sliding_window > 0 ? g.sliding_window : g.S;
-  for (int qpos = 0; qpos < g.S; ++qpos) {
-    for (int kpos = 0; kpos < padded_key_count; ++kpos) {
-      bool visible = false;
-      if (kpos < key_count && kpos < g.S)
-        visible = kpos <= qpos && kpos >= std::max(0, qpos - window + 1);
-      else if (kpos < key_count)
-        visible = (kpos - g.S) < (qpos + 1) / std::max(1, ratio);
-      mask_data[(size_t)qpos * padded_key_count + kpos] =
-          visible ? 0.0f : -INFINITY;
-    }
-  }
-  // FATTN's CUDA path expects an F16 additive mask.  Keep the host source as
-  // F32 while constructing it, then cast once as part of the graph.
-  ggml_tensor *mask_f16 = ggml_cast(ctx, mask, GGML_TYPE_F16);
-  lt.mask = mask_f16;
-
-  ggml_tensor *q_attn =
-      ggml_permute(ctx, ggml_reshape_4d(ctx, q, qh, g.H, g.S, 1), 0, 2, 1, 3);
-  ggml_tensor *k_attn = ggml_permute(ctx, real, 0, 2, 1, 3);
-  ggml_tensor *v_attn = ggml_permute(ctx, real, 0, 2, 1, 3);
-  if (k_attn->type == GGML_TYPE_F32)
-    k_attn = ggml_cast(ctx, k_attn, GGML_TYPE_F16);
-  if (v_attn->type == GGML_TYPE_F32)
-    v_attn = ggml_cast(ctx, v_attn, GGML_TYPE_F16);
-  ggml_tensor *attn =
-      ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, mask_f16,
-                          1.0f / std::sqrt((float)qh), 0.0f, 0.0f);
-  ggml_flash_attn_ext_add_sinks(attn, sink_tensor);
-  ggml_tensor *value = ggml_permute(ctx, attn, 0, 2, 1, 3);
-  ggml_tensor *context =
-      ggml_cont(ctx, ggml_view_3d(ctx, value, qh, g.H, g.S, value->nb[1],
-                                  value->nb[2], 0));
-  context = dsv4_rope_tail(g, ctx, context, g.qk_nope, g.qk_rope, g.positions,
-                           ratio, true);
-
-  const int groups = std::max(1, c.o_group_count);
-  const int rank = c.o_lora_rank;
-  const int group_in = (qh * g.H) / groups;
-  if (rank <= 0 || groups <= 0 || group_in * groups != qh * g.H ||
-      woa->ne[0] != group_in || woa->ne[1] != (int64_t)(groups * rank))
-    return nullptr;
-  // Keep the grouped output projection as one batched GGML matmul.  This is
-  // Llama.cpp's layout: [group_in, groups, tokens] is permuted to
-  // [group_in, tokens, groups], projected by [group_in, rank, groups], then
-  // restored and made contiguous for wo_b.  The previous loop emitted one
-  // matmul and concat per group, creating eight extra graph boundaries.
-  ggml_tensor *woa3 = ggml_reshape_3d(ctx, woa, group_in, rank, groups);
-  // context is already llama.cpp's [head_dim, n_head, tokens] tensor.  Reshape it
-  // directly so the group and token strides are derived from that layout;
-  // flattening to 2D first loses the explicit head axis around rope_back.
-  ggml_tensor *grouped_input =
-      ggml_reshape_3d(ctx, context, group_in, groups, g.S);
-  grouped_input = ggml_permute(ctx, grouped_input, 0, 2, 1, 3);
-  ggml_tensor *grouped = ggml_mul_mat(ctx, woa3, grouped_input);
-  grouped = ggml_permute(ctx, grouped, 0, 2, 1, 3);
-  grouped = ggml_cont_2d(ctx, grouped, rank * groups, g.S);
-  g.dsv4_layers.push_back(lt);
-  return ggml_mul_mat(ctx, wob, grouped);
-}
-
-ggml_tensor *dsv4_hash_ids(FullGraph &g, ggml_context *ctx, int layer,
-                           const int *token_ids) {
-  const auto &c = g.engine->model_file.architecture_config;
-  const std::string name =
-      "blk." + std::to_string(layer) + ".ffn_gate_tid2eid.weight";
-  const QuantizedTensor *table = resident(*g.engine, name);
-  if (!table || table->meta.type != GGUFType::I32 ||
-      table->meta.shape.size() < 2 ||
-      table->meta.shape[0] != (uint64_t)c.topk || !token_ids)
-    return nullptr;
-  const int64_t n_vocab = (int64_t)table->meta.shape[1];
-  const int32_t *src = reinterpret_cast<const int32_t *>(table->host_ptr);
-  int32_t *dst = nullptr;
-  // ggml_get_rows preserves the ID tensor's shape after its row dimension.
-  // Keep IDs as [topk,S], matching the normal argsort_top_k output.  A flat
-  // [topk*S] tensor is numerically equivalent for a host loop but changes the
-  // routed expert tensor layout and can make MUL_MAT_ID select the wrong
-  // token grouping on the CUDA backend.
-  ggml_tensor *ids =
-      dsv4_host_i32_2d(g, ctx, c.topk, g.S, "dsv4_graph_hash_ids", &dst);
-  if (!ids)
-    return nullptr;
-  for (int s = 0; s < g.S; ++s) {
-    const int tok = token_ids[s];
-    if (tok < 0 || (int64_t)tok >= n_vocab)
-      return nullptr;
-    for (int k = 0; k < c.topk; ++k) {
-      const int id = src[(size_t)tok * c.topk + k];
-      if (id < 0 || id >= c.n_experts)
-        return nullptr;
-      dst[(size_t)s * c.topk + k] = id;
-    }
-  }
-  return ids;
-}
-
-// Real, measured incident (2026-09-09, qwen4exp side, same ggml scheduler
-// code path this file also uses): ggml_backend_sched_alloc_graph's internal
-// ggml_gallocr_reserve_n_impl does not fail gracefully on a real cudaMalloc
-// OOM -- it logs "cudaMalloc failed: out of memory" and then segfaults the
-// whole process instead of returning a checkable failure. That happened when
-// main.cpp's fallback VRAM cache reservation (a fixed 4GB, unaware of
-// device_expert_layers' own VRAM use) left the scheduler's own reserve()
-// short by ~1.8GB. main.cpp now sizes that fallback cache against real free
-// VRAM and this family's own device_expert_layers estimate, but this check
-// stays as a second, independent line of defense: refuse to even attempt the
-// allocator call when real free VRAM on the graph's device is below a
-// generous floor, and decline to the legacy path instead of risking the same
-// crash again.
-bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag) {
-  size_t free_b = 0, total_b = 0;
-  int prev_device = -1;
-  cudaGetDevice(&prev_device);
-  cudaSetDevice(g.device);
-  const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
-  if (prev_device >= 0)
-    cudaSetDevice(prev_device);
-  size_t kMinGraphAllocHeadroomBytes =
-      2ull * 1024ull * 1024ull * 1024ull; // 2 GiB
-  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
-    kMinGraphAllocHeadroomBytes = (size_t)std::max(0, std::atoi(e)) << 20;
-  if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
-    LOG_ERROR("%s refusing graph allocator reserve: device %d free=%.2f GiB "
-              "< %.2f GiB safety floor (expert arena + dense arena already "
-              "committed %.2f GiB) -- falling back to the legacy path\n",
-              log_tag, g.device,
-              err == cudaSuccess
-                  ? static_cast<double>(free_b) / (1024.0 * 1024.0 * 1024.0)
-                  : -1.0,
-              static_cast<double>(kMinGraphAllocHeadroomBytes) /
-                  (1024.0 * 1024.0 * 1024.0),
-              static_cast<double>(g.expert_capacity + g.dense_capacity) /
-                  (1024.0 * 1024.0 * 1024.0));
-    return false;
-  }
-  return true;
-}
-
-bool build_dsv4_graph(FullGraph &g, const int *token_ids) {
-  const auto &c = g.engine->model_file.architecture_config;
-  ggml_init_params ip = {};
-  ip.mem_size = kTensorContextBytes;
-  ip.no_alloc = true;
-  if (!MemoryGuard::try_reserve_host_bytes(kTensorContextBytes)) {
-    LOG_WARN("[GGML-DSV4-FULL-MEM] host graph context refused: %.2f MiB "
-             "(reserved=%.2f GiB, budget=%.2f GB)\n",
-             (double)kTensorContextBytes / (1024.0 * 1024.0),
-             (double)MemoryGuard::reserved_host_bytes() / 1.0e9,
-             (double)MemoryGuard::host_budget_bytes() / 1.0e9);
-    return false;
-  }
-  g.context_reservation_bytes = kTensorContextBytes;
-  g.ctx = ggml_init(ip);
-  if (!g.ctx) {
-    MemoryGuard::release_host_bytes(g.context_reservation_bytes);
-    g.context_reservation_bytes = 0;
-    return false;
-  }
-  g.graph = ggml_new_graph_custom(g.ctx, kGraphSize, false);
-  if (!g.graph)
-    return false;
-
-  g.input =
-      host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.HC, g.S},
-                 (size_t)g.D * g.HC * g.S * sizeof(float), "dsv4_full_input");
-  if (!g.input)
-    return false;
-  int32_t *pos_data = nullptr;
-  g.positions = dsv4_host_i32(g, g.ctx, g.S, "dsv4_full_positions", &pos_data);
-  if (!g.positions)
-    return false;
-  for (int s = 0; s < g.S; ++s)
-    pos_data[s] = s;
-
-  bool need4 = false, need128 = false, need_csa = false;
-  for (int l = 0; l < g.n_layers; ++l) {
-    const int ratio = c.dsv4_compress_ratios.empty()
-                          ? 0
-                          : (int)c.dsv4_compress_ratios[(size_t)l];
-    need4 |= ratio == 4;
-    need128 |= ratio == 128;
-    need_csa |= ratio == 4;
-  }
-  auto make_mod = [&](int ratio, const char *name, ggml_tensor **out_t) {
-    int32_t *data = nullptr;
-    *out_t = dsv4_host_i32(g, g.ctx, g.S, name, &data);
-    if (!*out_t)
-      return false;
-    for (int s = 0; s < g.S; ++s)
-      data[s] = s % ratio;
-    return true;
-  };
-  if (need4 && !make_mod(4, "dsv4_full_positions_mod4", &g.positions_mod4))
-    return false;
-  if (need128 &&
-      !make_mod(128, "dsv4_full_positions_mod128", &g.positions_mod128))
-    return false;
-  auto make_blocks = [&](int ratio, const char *name, ggml_tensor **out_t) {
-    const int blocks = g.S / ratio;
-    if (blocks <= 0)
-      return true;
-    int32_t *data = nullptr;
-    *out_t = dsv4_host_i32(g, g.ctx, blocks, name, &data);
-    if (!*out_t)
-      return false;
-    for (int b = 0; b < blocks; ++b)
-      data[b] = b * ratio;
-    return true;
-  };
-  if (need4 &&
-      !make_blocks(4, "dsv4_full_block_positions4", &g.block_positions4))
-    return false;
-  if (need128 &&
-      !make_blocks(128, "dsv4_full_block_positions128", &g.block_positions128))
-    return false;
-  if (need_csa) {
-    float *zv = nullptr;
-    float *zs = nullptr;
-    g.csa_zero_values = dsv4_host_f32(g, g.ctx, {g.qk_nope + g.qk_rope, 4},
-                                      "dsv4_csa_zero_values", &zv);
-    g.csa_zero_scores = dsv4_host_f32(g, g.ctx, {g.qk_nope + g.qk_rope, 4},
-                                      "dsv4_csa_zero_scores", &zs);
-    if (!g.csa_zero_values || !g.csa_zero_scores)
-      return false;
-    const size_t zero_n = (size_t)(g.qk_nope + g.qk_rope) * 4;
-    std::fill(zv, zv + zero_n, 0.0f);
-    std::fill(zs, zs + zero_n, -INFINITY);
-  }
-
-  ggml_tensor *res = g.input;
-  for (int l = 0; l < g.n_layers; ++l) {
-    if (MemoryGuard::allocation_blocked())
-      return false;
-    const std::string p = "blk." + std::to_string(l) + ".";
-    ggml_tensor *post = nullptr;
-    ggml_tensor *comb = nullptr;
-    ggml_tensor *afn = resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
-    ggml_tensor *abase = resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
-    ggml_tensor *ascale = resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
-    if (!afn || !abase || !ascale)
-      return false;
-    ggml_tensor *residual = res;
-    ggml_tensor *cur = hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
-    ggml_tensor *an = resident_tensor(g, g.ctx, p + "attn_norm.weight");
-    if (!an)
-      return false;
-    cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), an);
-    ggml_tensor *attn = build_dsv4_attention(g, g.ctx, cur, l);
-    if (!attn || g.dsv4_layers.empty() || g.dsv4_layers.back().layer != l)
-      return false;
-    if (dsv4_graph_diagnostic_enabled())
-      g.dsv4_stage_outputs.emplace_back(
-          "layer=" + std::to_string(l) + " attention", attn);
-    res = hc_post(g, g.ctx, attn, residual, post, comb);
-
-    ggml_tensor *ffn_fn = resident_tensor(g, g.ctx, p + "hc_ffn_fn.weight");
-    ggml_tensor *ffn_base = resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
-    ggml_tensor *ffn_scale =
-        resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
-    ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
-    if (!ffn_fn || !ffn_base || !ffn_scale || !fn)
-      return false;
-    post = comb = nullptr;
-    cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
-    cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), fn);
-    ggml_tensor *forced_ids = l < c.hash_layer_count
-                                  ? dsv4_hash_ids(g, g.ctx, l, token_ids)
-                                  : nullptr;
-    if (l < c.hash_layer_count && !forced_ids)
-      return false;
-    ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l, forced_ids);
-    if (!ffn)
-      return false;
-    if (dsv4_graph_diagnostic_enabled())
-      g.dsv4_stage_outputs.emplace_back("layer=" + std::to_string(l) + " ffn",
-                                        ffn);
-    res = hc_post(g, g.ctx, ffn, res, post, comb);
-    if (dsv4_graph_diagnostic_enabled()) {
-      g.dsv4_stage_outputs.emplace_back(
-          "layer=" + std::to_string(l) + " residual", res);
-      g.dsv4_layer_outputs.push_back(res);
-    }
-  }
-
-  // DeepSeek-V4's model-level HC head is the learned gated collapse.  The
-  // surrounding generation loop still applies output_norm after this graph,
-  // exactly as it does after the legacy hc_collapse_output path.
-  ggml_tensor *flat = ggml_reshape_2d(g.ctx, res, g.D * g.HC, g.S);
-  ggml_tensor *normed = ggml_rms_norm(g.ctx, flat, c.eps);
-  ggml_tensor *head_fn = resident_tensor(g, g.ctx, "output_hc_fn.weight");
-  ggml_tensor *head_base = resident_tensor(g, g.ctx, "output_hc_base.weight");
-  ggml_tensor *head_scale = resident_tensor(g, g.ctx, "output_hc_scale.weight");
-  if (!head_fn || !head_base || !head_scale)
-    return false;
-  ggml_tensor *head_logits = ggml_mul_mat(g.ctx, head_fn, normed);
-  ggml_tensor *scale = ggml_view_1d(g.ctx, head_scale, 1, 0);
-  ggml_tensor *base = ggml_view_1d(g.ctx, head_base, g.HC, 0);
-  ggml_tensor *weights = ggml_scale_bias(
-      g.ctx,
-      ggml_sigmoid(g.ctx,
-                   ggml_add(g.ctx, ggml_mul(g.ctx, head_logits, scale), base)),
-      1.0f, c.hc_eps);
-  ggml_tensor *out = nullptr;
-  for (int h = 0; h < g.HC; ++h) {
-    ggml_tensor *stream =
-        ggml_view_2d(g.ctx, res, g.D, g.S, res->nb[2], (size_t)h * res->nb[1]);
-    ggml_tensor *weight = ggml_view_2d(g.ctx, weights, 1, g.S, weights->nb[1],
-                                       (size_t)h * weights->nb[0]);
-    ggml_tensor *term = ggml_mul(g.ctx, stream, weight);
-    out = out ? ggml_add(g.ctx, out, term) : term;
-  }
-  g.final_streams = res;
-  g.output = out;
-  ggml_set_output(g.final_streams);
-  ggml_build_forward_expand(g.graph, g.final_streams);
-  ggml_set_output(g.output);
-  ggml_build_forward_expand(g.graph, g.output);
-  for (ggml_tensor *layer_output : g.dsv4_layer_outputs) {
-    ggml_set_output(layer_output);
-    ggml_build_forward_expand(g.graph, layer_output);
-  }
-  for (const auto &lt : g.dsv4_layers) {
-    ggml_set_output(lt.raw_kv);
-    ggml_build_forward_expand(g.graph, lt.raw_kv);
-    if (lt.comp_kv) {
-      ggml_set_output(lt.comp_kv);
-      ggml_build_forward_expand(g.graph, lt.comp_kv);
-      ggml_set_output(lt.comp_score);
-      ggml_build_forward_expand(g.graph, lt.comp_score);
-      if (lt.keys) {
-        ggml_set_output(lt.keys);
-        ggml_build_forward_expand(g.graph, lt.keys);
-      }
-    }
-    if (lt.indexer_comp_kv) {
-      ggml_set_output(lt.indexer_comp_kv);
-      ggml_build_forward_expand(g.graph, lt.indexer_comp_kv);
-      ggml_set_output(lt.indexer_comp_score);
-      ggml_build_forward_expand(g.graph, lt.indexer_comp_score);
-      if (lt.indexer_keys) {
-        ggml_set_output(lt.indexer_keys);
-        ggml_build_forward_expand(g.graph, lt.indexer_keys);
-      }
-    }
-  }
-  if (!graph_alloc_vram_headroom_ok(g, "[GGML-DSV4-FULL]"))
-    return false;
-  if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
-    return false;
-  g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
-  int cuda_nodes = 0, cpu_nodes = 0, transitions = 0;
-  ggml_backend_t previous = nullptr;
-  std::unordered_map<std::string, int> non_cuda;
-  for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i) {
-    ggml_tensor *node = ggml_graph_node(g.graph, i);
-    ggml_backend_t b = ggml_backend_sched_get_tensor_backend(g.sched, node);
-    if (b == g.cuda)
-      ++cuda_nodes;
-    else if (b == g.cpu) {
-      ++cpu_nodes;
-      ++non_cuda[ggml_op_name(node->op)];
-    }
-    if (previous && previous != b)
-      ++transitions;
-    previous = b;
-  }
-  LOG_INFO("[GGML-DSV4-FULL] scheduler nodes cuda=%d cpu=%d transitions=%d\n",
-           cuda_nodes, cpu_nodes, transitions);
-  if (!non_cuda.empty()) {
-    std::string detail;
-    for (const auto &[name, count] : non_cuda) {
-      if (!detail.empty())
-        detail += ", ";
-      detail += name + "=" + std::to_string(count);
-    }
-    LOG_INFO("[GGML-DSV4-FULL] non-CUDA nodes: %s\n", detail.c_str());
-  }
-  LOG_INFO("[GGML-DSV4-FULL] graph built layers=%d nodes=%d splits=%d "
-           "workspace=%.2f GiB compressed=%zu\n",
-           g.n_layers, ggml_graph_n_nodes(g.graph),
-           ggml_backend_sched_get_n_splits(g.sched),
-           (double)g.graph_workspace_bytes / (1024.0 * 1024.0 * 1024.0),
-           std::count_if(g.dsv4_layers.begin(), g.dsv4_layers.end(),
-                         [](const auto &x) { return x.ratio != 0; }));
-  LOG_INFO(
-      "[GGML-DSV4-FULL-MEM] host ledger=%.2f/%.2f GB; graph context=%.2f MiB; "
-      "device workspace=%.2f GiB (GPU, outside host_ram_gb)\n",
-      (double)MemoryGuard::reserved_host_bytes() / 1.0e9,
-      (double)MemoryGuard::host_budget_bytes() / 1.0e9,
-      (double)g.context_reservation_bytes / (1024.0 * 1024.0),
-      (double)g.graph_workspace_bytes / (1024.0 * 1024.0 * 1024.0));
-  g.ready = true;
-  return true;
-}
-
-std::unique_ptr<FullGraph> g_dsv4_graph;
 
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name) {
@@ -2598,7 +1195,7 @@ bool packed_gate_up_meta(const StreamingEngine &engine, int layer,
 }
 
 double full_graph_resident_gb(const char *name) {
-  const char *v = std::getenv(name);
+  const char *v = moestream::graphcfg::env(name);
   if (!v || !v[0])
     return 0.0;
   char *end = nullptr;
@@ -2653,7 +1250,7 @@ size_t graph_host_live_bytes(const StreamingEngine &engine) {
 }
 
 std::string partial_usage_path(const FullGraph &g) {
-  const char *env = std::getenv("MOESTREAM_FULL_GRAPH_USAGE_FILE");
+  const char *env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_USAGE_FILE");
   if (env && env[0])
     return env;
   return g.engine->family_ops.family == ModelFamily::DeepSeek_V4
@@ -2809,7 +1406,7 @@ bool configure_vram_reference_experts(FullGraph &g) {
       aliased_bytes += stride;
     }
 
-    if (std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
+    if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
       size_t n_pool = 0, n_ready = 0, n_ptr = 0, n_size = 0, n_gpu = 0;
       for (const ExpertLocation &l2 : g.topology->expert_vram_cache) {
         if (l2.pool_layer != layer) continue;
@@ -3020,7 +1617,7 @@ bool configure_partial_experts(FullGraph &g) {
   if (!configure_partial_experts_base(g))
     return false;
   if (g.partial_expert_residency && ggml_shared_backend(1)) {
-    const char *gh = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
+    const char *gh = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
     if (gh && gh[0])
       assign_gpu1_hot(g, std::atof(gh));
   }
@@ -3579,7 +2176,7 @@ ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
   if (fresh) {
     // MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0=1 is a verification aid: same branch, buffers on the main GPU, so its
     // logits can be compared against the GPU1 placement with identical kernels.
-    static const bool on_gpu0 = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
+    static const bool on_gpu0 = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
     buf = ggml_backend_buft_alloc_buffer(
         ggml_backend_get_default_buffer_type(on_gpu0 ? g.cuda : g.gpu1), ggml_nbytes(t) + 4096);
     if (!buf)
@@ -3626,7 +2223,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   if (gib <= 0.0 || g.partial_experts.empty())
     return;
   const auto &c = g.engine->model_file.architecture_config;
-  const char *uenv = std::getenv("MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE");
+  const char *uenv = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE");
   const std::string usage_path = uenv && uenv[0]
                                      ? std::string(uenv)
                                      : offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
@@ -3678,7 +2275,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
                                 [&](int e) { return !is_cold[(size_t)l][(size_t)e]; }),
                  p.cold.end());
   }
-  if (std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG")) {
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG")) {
     for (int l : {3, 4}) {
       std::string a, b;
       for (int e : g.partial_experts[(size_t)l].hot1) a += std::to_string(e) + ",";
@@ -3773,7 +2370,7 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
 
   // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
   static const bool force_dummy =
-      std::getenv("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
   const moe_partial::ExpertBranchMap branch_map =
       moe_partial::ExpertBranchMap::build(
           index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
@@ -3877,7 +2474,7 @@ bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p) {
 
 int dynamic_upload_budget_override() {
   const char *value =
-      std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN");
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_UPLOADS_PER_TOKEN");
   if (!value || !value[0])
     return -1;
   char *end = nullptr;
@@ -3889,7 +2486,7 @@ int dynamic_upload_budget_override() {
 
 double dynamic_upload_fraction() {
   const char *value =
-      std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC");
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE_SWAP_FRAC");
   if (!value || !value[0])
     return 0.25;
   char *end = nullptr;
@@ -4168,7 +2765,7 @@ struct RouteTap {
 RouteTap &route_tap() {
   static RouteTap t = [] {
     RouteTap r;
-    if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_ROUTE_TAP"))
+    if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TAP"))
       r.path = e;
     return r;
   }();
@@ -5102,7 +3699,7 @@ bool preload_expert_source(FullGraph &g) {
   // This is boot-time I/O, so cap the default at two; an explicit override is
   // available for a machine with more headroom.
   unsigned read_threads = 2;
-  if (const char *env = std::getenv("MOESTREAM_FULL_GRAPH_READ_THREADS")) {
+  if (const char *env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_READ_THREADS")) {
     char *end = nullptr;
     const long n = std::strtol(env, &end, 10);
     if (end != env && *end == '\0' && n > 0)
@@ -5194,7 +3791,7 @@ bool preload_expert_source(FullGraph &g) {
   // registration failure stops the pass and leaves the remaining slices
   // pageable rather than retrying until the machine is under pressure.
   size_t pin_budget = g.engine->ram_pinned_budget_bytes;
-  const char *pin_env = std::getenv("MOESTREAM_FULL_GRAPH_PIN_GB");
+  const char *pin_env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_PIN_GB");
   if (pin_env && pin_env[0]) {
     char *end = nullptr;
     const double gb = std::strtod(pin_env, &end);
@@ -5751,10 +4348,10 @@ ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t) {
 // the letters c (hc_comb), p (hc_pre sum), o (hc_post) enables just those.
 bool fused_hc_op(char which) {
   // Default ON. MOESTREAM_GLM5NEXT_UNFUSED_HC=1 restores the composed-op path.
-  static const bool off = std::getenv("MOESTREAM_GLM5NEXT_UNFUSED_HC") != nullptr;
+  static const bool off = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_UNFUSED_HC") != nullptr;
   if (off)
     return false;
-  static const char *e = std::getenv("MOESTREAM_GLM5NEXT_FUSED_HC");
+  static const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_FUSED_HC");
   if (!e || e[0] == '1')
     return true;
   return std::strchr(e, which) != nullptr;
@@ -6466,6 +5063,129 @@ ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, 
   return out;
 }
 
+// Run each layer's cold (CPU) experts on a private lane that starts as soon as the
+// routed ids reach the host, instead of after the layer's GPU work. Decode only.
+bool early_ready_wanted() {
+  // On by default (4-pair A/B: +1.9% decode, logits identical);
+  // MOESTREAM_GLM5NEXT_EARLY_READY=0 opts out.
+  static const bool on = moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_EARLY_READY");
+  return on;
+}
+
+// Builds the lane for one layer's cold experts and the graph nodes around it:
+// the fork (activation snapshot + route readback) is added to the graph here;
+// the caller consumes lane->gpu_input as the hot branches' input and lane->gpu_output
+// as the cold branch's per-route weighted output, and must expand lane->cpu_marker
+// after the layer's GPU work and before the merge. Returns nullptr when not applicable.
+EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
+                               ggml_tensor *cur, ggml_tensor *ids,
+                               ggml_tensor *weights, ggml_tensor *cold_map,
+                               ggml_tensor *cold_mask,
+                               const moe_routed::ExpertWeights &cold_w,
+                               float clamp = 0.0f) {
+  if (!g.decode_mode || g.S != 1 || !g.sched || !g.cuda || !g.cpu ||
+      !cold_w.valid() || !cold_map || !cold_mask || cur->type != GGML_TYPE_F32)
+    return nullptr;
+  if (!ggml_backend_sched_early_cpu_supported ||
+      ggml_backend_sched_early_cpu_supported() != 1) {
+    LOG_WARN("[GGML-GLM5NEXT-EARLY-READY] layer %d: linked ggml has no early-CPU scheduler hook\n", layer);
+    return nullptr;
+  }
+  const auto &c = g.engine->model_file.architecture_config;
+  auto lane = std::make_unique<EarlyReadyLane>();
+  lane->swiglu_clamp = clamp;
+  lane->swiglu_clamp_fused = swiglu_clamp_fused();
+  // The lane reads its routing tables on the host: copy them out of the graph's
+  // (device-resident) constant tensors once, at build time.
+  const auto host_table = [&](ggml_tensor *src) -> ggml_tensor * {
+    ggml_tensor *t = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2]);
+    if (!t)
+      return nullptr;
+    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(g.cpu, ggml_nbytes(t));
+    if (!buf)
+      return nullptr;
+    lane->extra_buffers.push_back(buf);
+    if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS)
+      return nullptr;
+    std::vector<uint8_t> tmp(ggml_nbytes(t));
+    ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
+    ggml_backend_tensor_set(t, tmp.data(), 0, tmp.size());
+    return t;
+  };
+  ggml_tensor *remap = host_table(cold_map);
+  ggml_tensor *mask = host_table(cold_mask);
+  if (!remap || !mask)
+    return nullptr;
+  if (!lane->prepare(g.cpu, g.device, g.D, c.topk, cold_w, remap, mask))
+    return nullptr;
+
+  ggml_tensor *dst = ggml_dup_tensor(ctx, cur);
+  lane->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));
+  if (!lane->device_buffer ||
+      ggml_backend_tensor_alloc(lane->device_buffer, dst,
+                                ggml_backend_buffer_get_base(lane->device_buffer)) != GGML_STATUS_SUCCESS)
+    return nullptr;
+  ggml_tensor *fork = ggml_cpy(ctx, cur, dst);
+  fork->src[2] = ggml_cont(ctx, ids);
+  fork->src[3] = ggml_cont(ctx, weights);
+  fork->src[4] = nullptr;  // no positions tensor: skip the staleness check
+  fork->extra = lane.get();
+  ggml_set_name(fork, ("glm5next_early_ready_fork_l" + std::to_string(layer)).c_str());
+  ggml_backend_sched_set_tensor_backend(g.sched, dst, g.cuda);
+  ggml_backend_sched_set_tensor_backend(g.sched, fork, g.cuda);
+  lane->gpu_input = fork;
+  ggml_build_forward_expand(g.graph, fork);
+
+  ggml_tensor *cold_leaf = ggml_dup_tensor(ctx, lane->output);
+  cold_leaf->buffer = lane->output->buffer;
+  cold_leaf->data = lane->output->data;
+  ggml_tensor *marker = ggml_map_custom1_inplace(ctx, cold_leaf, EarlyReadyLane::fallback, 1, lane.get());
+  marker->extra = lane.get();
+  ggml_set_name(marker, ("glm5next_early_ready_cold_l" + std::to_string(layer)).c_str());
+  ggml_backend_sched_set_tensor_backend(g.sched, cold_leaf, g.cpu);
+  ggml_backend_sched_set_tensor_backend(g.sched, marker, g.cpu);
+  if (!lane->async_output_copy)
+    return nullptr;  // the GLM merge consumes the uploaded copy
+  lane->cpu_marker = marker;
+  if (!lane->prepare_gpu_output(g.cuda, ctx))
+    return nullptr;
+  ggml_set_name(lane->gpu_output, ("glm5next_early_ready_output_l" + std::to_string(layer)).c_str());
+  ggml_backend_sched_set_tensor_backend(g.sched, lane->gpu_output, g.cuda);
+
+  if (offload_layer(layer)) {
+    OffloadState *o = get_offload(*g.engine);
+    if (!o)
+      return nullptr;
+    lane->before_compute = [o, layer](const int32_t *experts, int n) {
+      const auto t0 = std::chrono::steady_clock::now();
+      const auto r = o->store->ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
+      auto &ct = o->store->counters();
+      ct.calls.fetch_add(1, std::memory_order_relaxed);
+      ct.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+      ct.cold_routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+      ct.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+      ct.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
+      ct.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+      ct.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+      ct.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - t0).count(),
+                         std::memory_order_relaxed);
+      if (r.errors > 0) {
+        ct.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting rather than computing with "
+                  "missing experts\n", layer, r.errors);
+        o->store->report("fatal");
+        std::abort();
+      }
+      return true;
+    };
+  }
+  EarlyReadyLane *raw = lane.get();
+  g.early_ready.emplace(layer, std::move(lane));
+  LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);
+  return raw;
+}
+
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *forced_ids = nullptr) {
   const std::string p = "blk." + std::to_string(layer) + ".";
@@ -6511,7 +5231,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (partial_weights && !partial_weights->cold.empty() &&
       ((!gate_up && (!ge || !ue)) || !de))
     return nullptr;
-  if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
     const bool ready = partial_layer_ram_ready(g, layer);
     LOG_WARN(
         "[PARTIAL-DEBUG] layer=%d n_experts=%d hot=%zu cold=%zu ready=%d "
@@ -6524,27 +5244,15 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         gate_up ? (long long)gate_up->ne[2] : -1);
   }
 
-  ggml_tensor *logits = ggml_mul_mat(ctx, router, cur);
-  ggml_tensor *probs = nullptr;
-  switch (c.gating_func) {
-  case GatingFunc::Sigmoid:
-    probs = ggml_sigmoid(ctx, logits);
-    break;
-  case GatingFunc::SqrtSoftplus:
-    probs = ggml_sqrt(ctx, ggml_softplus(ctx, logits));
-    break;
-  case GatingFunc::Softmax:
-  default:
-    probs = ggml_soft_max(ctx, logits);
-    break;
-  }
-  ggml_tensor *selection = bias ? ggml_add(ctx, probs, bias) : probs;
+  const moe_routed::RouterSpec rspec =
+      family_spec(g.engine->family_ops.family).router_spec(c, g.S);
+  ggml_tensor *probs = moe_routed::gate_probs(ctx, rspec, router, cur);
   // DeepSeek-V4's first hash-routed layers use a token-id -> expert table
   // for selection, while the learned router still supplies the unbiased
   // weights.  The table is prepared as a host input by the V4 graph builder;
   // every other layer keeps GGML's normal biased top-k node.
   ggml_tensor *ids =
-      forced_ids ? forced_ids : ggml_argsort_top_k(ctx, selection, c.topk);
+      forced_ids ? forced_ids : moe_routed::select_ids(ctx, rspec, probs, bias);
   if (route_stats_enabled() && g.decode_mode &&
       g.partial_expert_residency && ids) {
     // Keep a graph output copy of each layer's IDs.  The scheduler may
@@ -6566,17 +5274,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_build_forward_expand(g.graph, snapshot);
     g.moe_route_ids.emplace_back(layer, snapshot);
   }
-  ggml_tensor *weights =
-      ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, c.n_experts, g.S), ids);
-  ggml_tensor *weights2 = ggml_reshape_2d(ctx, weights, c.topk, g.S);
-  if (c.expert_weights_norm) {
-    ggml_tensor *sum = ggml_clamp(ctx, ggml_sum_rows(ctx, weights2),
-                                  6.103515625e-5f, INFINITY);
-    weights2 = ggml_div(ctx, weights2, sum);
-  }
-  if (c.expert_weights_scale != 0.0f && c.expert_weights_scale != 1.0f)
-    weights2 = ggml_scale(ctx, weights2, c.expert_weights_scale);
-  weights = ggml_reshape_3d(ctx, weights2, 1, c.topk, g.S);
+  ggml_tensor *weights = moe_routed::route_weights(ctx, rspec, probs, ids);
   ggml_build_forward_expand(g.graph, weights);
 
   float clamp = 0.0f;
@@ -6587,7 +5285,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return nullptr;
   if (g.partial_expert_residency && !prepare_partial_hot1(g, ctx, layer))
     return nullptr;
-  if (partial_weights && std::getenv("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
     LOG_WARN(
         "[PARTIAL-DEBUG-HOT] layer=%d hot=%zu vram_slots=%zu "
         "hot_gate_ne2=%lld hot_up_ne2=%lld hot_down_ne2=%lld "
@@ -6611,44 +5309,49 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     if (!branch_down || !branch_ids || !branch_weights ||
         (!branch_gate_up && (!branch_gate || !branch_up)))
       return nullptr;
-    ggml_tensor *up = nullptr;
-    ggml_tensor *gate = nullptr;
-    if (branch_gate_up) {
-      // Match Llama.cpp's merged gate_up graph: one routed projection produces
-      // [2*n_ff, top_k, S], then zero-copy views feed SwiGLU.
-      ggml_tensor *gate_up_out =
-          ggml_mul_mat_id(ctx, branch_gate_up, input3, branch_ids);
-      const int64_t n_ff = gate_up_out->ne[0] / 2;
-      gate = ggml_view_3d(ctx, gate_up_out, n_ff, gate_up_out->ne[1],
-                          gate_up_out->ne[2], gate_up_out->nb[1],
-                          gate_up_out->nb[2], 0);
-      up = ggml_view_3d(ctx, gate_up_out, n_ff, gate_up_out->ne[1],
-                        gate_up_out->ne[2], gate_up_out->nb[1],
-                        gate_up_out->nb[2], (size_t)n_ff * gate_up_out->nb[0]);
-    } else {
-      up = ggml_mul_mat_id(ctx, branch_up, input3, branch_ids);
-      gate = ggml_mul_mat_id(ctx, branch_gate, input3, branch_ids);
-    }
-    ggml_tensor *act = nullptr;
-    if (clamp > 1e-6f && swiglu_clamp_fused()) {
-      ggml_tensor *up_clamped = ggml_clamp(ctx, up, -clamp, clamp);
-      ggml_tensor *gate_clamped = ggml_clamp(ctx, gate, -INFINITY, clamp);
-      act = ggml_mul(ctx, ggml_silu(ctx, gate_clamped), up_clamped);
-    } else {
-      act = ggml_swiglu_split(ctx, gate, up);
-      if (clamp > 1e-6f)
-        act = ggml_clamp(ctx, act, -clamp, clamp);
-    }
-    ggml_tensor *experts = ggml_mul_mat_id(ctx, branch_down, act, branch_ids);
-    experts = ggml_mul(ctx, experts, branch_weights);
-    ggml_tensor *branch =
-        ggml_cont(ctx, ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2], 0));
-    for (int k = 1; k < c.topk; ++k)
-      branch = ggml_add(ctx, branch,
-                        ggml_view_2d(ctx, experts, g.D, g.S, experts->nb[2],
-                                     (size_t)k * experts->nb[1]));
-    return branch;
+    // Merged gate_up matches llama.cpp's graph: one routed projection, then
+    // zero-copy views feed SwiGLU.
+    moe_routed::ExpertWeights ew;
+    ew.gate_up = branch_gate_up;
+    ew.gate = branch_gate;
+    ew.up = branch_up;
+    ew.down = branch_down;
+    const moe_routed::FfnNodes ffn = moe_routed::expert_ffn(
+        ctx, ew, input3, branch_ids, clamp, swiglu_clamp_fused());
+    ggml_tensor *experts = ggml_mul(ctx, ffn.down, branch_weights);
+    return moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
   };
+
+  // Shared expert FFN output (nullptr when the layer has none). With a CPU lane it is built and
+  // scheduled before the lane's marker so the GPU runs it while the CPU computes the cold experts.
+  const auto build_shared = [&]() -> ggml_tensor * {
+    ggml_tensor *sg = resident_tensor(g, ctx, p + "ffn_gate_shexp.weight");
+    ggml_tensor *su = resident_tensor(g, ctx, p + "ffn_up_shexp.weight");
+    ggml_tensor *sd = resident_tensor(g, ctx, p + "ffn_down_shexp.weight");
+    if (!(sg && su && sd))
+      return nullptr;
+    ggml_tensor *gate_shared = ggml_mul_mat(ctx, sg, cur);
+    ggml_tensor *up_shared = ggml_mul_mat(ctx, su, cur);
+    const float clamp_shared =
+        (layer >= 0 && layer < (int)c.swiglu_clamp_shexp.size())
+            ? c.swiglu_clamp_shexp[(size_t)layer]
+            : 0.0f;
+    ggml_tensor *a = nullptr;
+    if (clamp_shared > 1e-6f && swiglu_clamp_fused()) {
+      // GLM5NEXT/reference ggml_swiglu_clamp semantics.
+      up_shared = ggml_clamp(ctx, up_shared, -clamp_shared, clamp_shared);
+      gate_shared = ggml_clamp(ctx, gate_shared, -INFINITY, clamp_shared);
+      a = ggml_mul(ctx, ggml_silu(ctx, gate_shared), up_shared);
+    } else {
+      a = ggml_swiglu_split(ctx, gate_shared, up_shared);
+      // DeepSeek-V4's established path clamps the completed SwiGLU product
+      // when the fused GLM5NEXT flag is not active.
+      if (clamp_shared > 1e-6f)
+        a = ggml_clamp(ctx, a, -clamp_shared, clamp_shared);
+    }
+    return ggml_mul_mat(ctx, sd, a);
+  };
+  ggml_tensor *shared_out = nullptr;
 
   ggml_tensor *out = nullptr;
   // Offloaded layers: the miss node wraps the ids that reach the CPU (cold) MUL_MAT_IDs, so
@@ -6699,16 +5402,50 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         }
       }
     }
-    out = moe_partial::combine_hot_cold(
-        ctx, has_hot, has_cold, hot_in, cold_in,
-        [&](const moe_partial::BranchInputs &in) {
-          return run_branch(partial->hot_gate_up, partial->hot_gate,
-                            partial->hot_up, partial->hot_down, in.ids,
-                            in.weights);
-        },
-        [&](const moe_partial::BranchInputs &in) {
-          return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
-        });
+    EarlyReadyLane *lane = nullptr;
+    if (has_cold && early_ready_wanted() && !stage && partial->hot1.empty() &&
+        family_spec(g.engine->family_ops.family).supports_cpu_lane()) {
+      moe_routed::ExpertWeights cold_w;
+      cold_w.gate_up = gate_up;
+      cold_w.gate = ge;
+      cold_w.up = ue;
+      cold_w.down = de;
+      lane = make_cold_lane(g, ctx, layer, cur, ids, weights,
+                            partial_map(g, ctx, layer, false, false),
+                            partial_map(g, ctx, layer, false, true), cold_w, clamp);
+    }
+    if (lane) {
+      // fork -> hot GPU work -> shared expert -> CPU lane marker -> merge. The marker
+      // is expanded after everything the GPU can do without the cold result.
+      input3 = ggml_reshape_3d(ctx, lane->gpu_input, g.D, 1, g.S);
+      ggml_tensor *hot_out = nullptr;
+      if (has_hot) {
+        hot_out = run_branch(partial->hot_gate_up, partial->hot_gate,
+                             partial->hot_up, partial->hot_down, hot_in.ids,
+                             hot_in.weights);
+        if (!hot_out)
+          return nullptr;
+        ggml_build_forward_expand(g.graph, hot_out);
+      }
+      shared_out = build_shared();
+      if (shared_out)
+        ggml_build_forward_expand(g.graph, shared_out);
+      ggml_build_forward_expand(g.graph, lane->cpu_marker);
+      ggml_tensor *cold_out =
+          moe_routed::sum_topk(ctx, lane->gpu_output, g.D, g.S, c.topk);
+      out = hot_out ? ggml_add(ctx, hot_out, cold_out) : cold_out;
+    } else {
+      out = moe_partial::combine_hot_cold(
+          ctx, has_hot, has_cold, hot_in, cold_in,
+          [&](const moe_partial::BranchInputs &in) {
+            return run_branch(partial->hot_gate_up, partial->hot_gate,
+                              partial->hot_up, partial->hot_down, in.ids,
+                              in.weights);
+          },
+          [&](const moe_partial::BranchInputs &in) {
+            return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
+          });
+    }
     if (!out)
       return nullptr;
     if (partial->hot1_down) {
@@ -6747,31 +5484,10 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       return nullptr;
   }
 
-  ggml_tensor *sg = resident_tensor(g, ctx, p + "ffn_gate_shexp.weight");
-  ggml_tensor *su = resident_tensor(g, ctx, p + "ffn_up_shexp.weight");
-  ggml_tensor *sd = resident_tensor(g, ctx, p + "ffn_down_shexp.weight");
-  if (sg && su && sd) {
-    ggml_tensor *gate_shared = ggml_mul_mat(ctx, sg, cur);
-    ggml_tensor *up_shared = ggml_mul_mat(ctx, su, cur);
-    const float clamp_shared =
-        (layer >= 0 && layer < (int)c.swiglu_clamp_shexp.size())
-            ? c.swiglu_clamp_shexp[(size_t)layer]
-            : 0.0f;
-    ggml_tensor *a = nullptr;
-    if (clamp_shared > 1e-6f && swiglu_clamp_fused()) {
-      // GLM5NEXT/reference ggml_swiglu_clamp semantics.
-      up_shared = ggml_clamp(ctx, up_shared, -clamp_shared, clamp_shared);
-      gate_shared = ggml_clamp(ctx, gate_shared, -INFINITY, clamp_shared);
-      a = ggml_mul(ctx, ggml_silu(ctx, gate_shared), up_shared);
-    } else {
-      a = ggml_swiglu_split(ctx, gate_shared, up_shared);
-      // DeepSeek-V4's established path clamps the completed SwiGLU product
-      // when the fused GLM5NEXT flag is not active.
-      if (clamp_shared > 1e-6f)
-        a = ggml_clamp(ctx, a, -clamp_shared, clamp_shared);
-    }
-    out = ggml_add(ctx, out, ggml_mul_mat(ctx, sd, a));
-  }
+  if (!shared_out)
+    shared_out = build_shared();
+  if (shared_out)
+    out = ggml_add(ctx, out, shared_out);
   return out;
 }
 
@@ -7018,7 +5734,7 @@ bool build_graph(FullGraph &g) {
       return false;
     cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
     ggml_tensor *cur_pre = cur;
-    if (g.decode_mode && std::getenv("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
+    if (g.decode_mode && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
       ggml_set_output(cur_pre);
       g.probe_x.push_back({l, cur_pre});
     }
@@ -7061,7 +5777,7 @@ bool build_graph(FullGraph &g) {
   ggml_build_forward_expand(g.graph, g.final_streams);
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode && !std::getenv("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
+  if (g.decode_mode && !moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
     ggml_tensor *out_norm = resident_tensor(g, g.ctx, "output_norm.weight");
     ggml_tensor *out_w = resident_tensor(g, g.ctx, "output.weight");
     if (out_norm && out_w) {
@@ -7164,7 +5880,7 @@ bool build_graph(FullGraph &g) {
     }
     LOG_INFO("[GGML-GLM5NEXT-FULL] non-CUDA nodes: %s\n", detail.c_str());
   }
-  if (const char *dl = std::getenv("MOESTREAM_GLM5NEXT_SPLIT_DUMP")) {
+  if (const char *dl = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_SPLIT_DUMP")) {
     // Debug: print the backend of every node of one MoE layer (from the previous layer's end to this layer's end).
     const std::string tag = std::string("_") + dl; // node names of the layer end with _<layer>
     int first = -1, last = -1;
@@ -7223,7 +5939,9 @@ bool build_graph(FullGraph &g) {
   return true;
 }
 
-} // namespace
+} // namespace glm5next_graph
+
+using namespace glm5next_graph;
 
 bool glm5next_full_graph_enabled() { return env_enabled(); }
 
@@ -7234,6 +5952,7 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
+  moestream::graphcfg::log_effective("glm5next-full-graph");
   // Build and seed the offload cache at boot, not inside the first decode token.
   FullGraph candidate;
   candidate.engine = &engine;
@@ -7287,6 +6006,7 @@ int glm5next_full_graph_device_expert_layers() {
 }
 
 void glm5next_full_graph_shutdown() {
+  moestream::graphcfg::log_consulted("glm5next-full-graph");
   g_graph.reset();
   for (auto &kv : g_hot1_buffers)
     ggml_backend_buffer_free(kv.second);
@@ -7345,7 +6065,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
@@ -7574,7 +6294,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   auto decline_decode_graph = [&]() {
     // Design policy: a GLM5NEXT request is served by the full graph or it fails. MOESTREAM_GLM5NEXT_GRAPH_STRICT=1
     // turns the legacy-decode fallback into a hard error (default stays permissive until prefill is graph-only too).
-    if (const char *strict = std::getenv("MOESTREAM_GLM5NEXT_GRAPH_STRICT");
+    if (const char *strict = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_STRICT");
         strict && strict[0] == '1') {
       LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] decode graph declined and "
                 "MOESTREAM_GLM5NEXT_GRAPH_STRICT=1: failing the request "
@@ -7590,7 +6310,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
@@ -7608,7 +6328,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !init_decode_state_arena(*g)) {
     return decline_decode_graph();
   }
-  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
+  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
     int a = -1, b = -2;
     if (std::sscanf(e, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a) {
       g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
@@ -7731,7 +6451,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static NanProbe probe;
   const bool nan_probe_on =
-      std::getenv("MOESTREAM_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
       probe.reported == 0;
   if (nan_probe_on) {
     probe.seen = 0;
@@ -7958,7 +6678,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static OpProf op;
   static const bool op_prof_env =
-      std::getenv("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
+      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
   const bool op_prof_on = op_prof_env && !layer_timing_on && !nan_probe_on &&
                           op.tokens < 30;
   if (op_prof_on) {
@@ -7990,6 +6710,8 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     op.sched = g.sched;
     op.last = std::chrono::steady_clock::now();
   }
+  for (auto &entry : g.early_ready)
+    entry.second->completed = false;
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
@@ -8042,7 +6764,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   if (!g.probe_x.empty()) {
     // Training/diagnostic tap: the exact pilot input (pre-FFN hidden, f32 [D]) of every layer for this decode token.
-    const char *dir = std::getenv("MOESTREAM_GLM5NEXT_PROBE_DUMP");
+    const char *dir = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP");
     std::vector<float> row((size_t)g.D);
     for (const auto &lx : g.probe_x) {
       if (!dir || lx.second->type != GGML_TYPE_F32 || (size_t)lx.second->ne[0] != (size_t)g.D)
@@ -8069,7 +6791,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * sizeof(float));
-  if (std::getenv("MOESTREAM_GLM5NEXT_DEBUG_DECODE_OUT")) {
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_DECODE_OUT")) {
     size_t bad = 0;
     double sum = 0.0, mx = 0.0;
     for (int i = 0; i < g.D; ++i) {
@@ -8161,6 +6883,8 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
   if (!hold_graph_vram_experts(g))
     return false;
+  for (auto &entry : g.early_ready)
+    entry.second->completed = false;
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
@@ -8242,274 +6966,6 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   return true;
 }
 
-bool deepseek_v4_full_graph_enabled() { return dsv4_env_enabled(); }
-
-int deepseek_v4_full_graph_device_expert_layers() {
-  return dsv4_env_enabled() ? dsv4_env_device_expert_layers() : 0;
-}
-
-void deepseek_v4_full_graph_shutdown() { g_dsv4_graph.reset(); }
-
-bool deepseek_v4_full_graph_prepare(StreamingEngine &engine, int S,
-                                    int pos_base, const int *token_ids) {
-  if (!dsv4_env_enabled() || S <= 1 || pos_base != 0 ||
-      engine.family_ops.family != ModelFamily::DeepSeek_V4)
-    return false;
-  const auto &c = engine.model_file.architecture_config;
-  // The graph deliberately attends every completed CSA block.  That is an
-  // exact match while the visible block count stays below the model's
-  // Lightning Indexer top-k; beyond that point the legacy path remains the
-  // correctness fallback until dynamic in-graph top-k selection is added.
-  if (c.dsv4_indexer_top_k > 0 && S > c.dsv4_indexer_top_k * 4) {
-    LOG_WARN(
-        "[GGML-DSV4-FULL] prompt S=%d exceeds CSA dense-selection limit %d; "
-        "using legacy indexed attention\n",
-        S, c.dsv4_indexer_top_k * 4);
-    return false;
-  }
-  if (g_dsv4_graph && g_dsv4_graph->ready && g_dsv4_graph->engine == &engine &&
-      g_dsv4_graph->S == S)
-    return true;
-
-  g_dsv4_graph.reset();
-  auto g = std::make_unique<FullGraph>();
-  g->engine = &engine;
-  g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
-  g->S = S;
-  g->D = c.hidden;
-  g->HC = std::max(1, c.hc_mult);
-  g->n_layers = c.n_layers;
-  g->H = c.n_heads;
-  g->qk_nope = c.qk_nope;
-  g->qk_rope = c.qk_rope;
-  g->o_group_count = c.o_group_count;
-  g->o_lora_rank = c.o_lora_rank;
-  g->sliding_window = c.sliding_window;
-  g->first_dense = c.first_dense;
-  g->device_expert_layers =
-      std::min(deepseek_v4_full_graph_device_expert_layers(),
-               std::max(0, c.n_layers - c.first_dense));
-  if (configure_partial_experts(*g))
-    g->device_expert_layers = 0;
-  g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
-  g->cpu = ggml_backend_cpu_init();
-  if (g->cpu) {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_CPU_THREADS");
-    ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
-  }
-  if (!g->cuda || !g->cpu)
-    return false;
-
-  const size_t source = expert_source_bytes(engine, g->device_expert_layers);
-  const size_t host_live = graph_host_live_bytes(engine);
-  constexpr size_t kSourceSlack = 1ull << 20;
-  // 10 GiB, per explicit user instruction after the 2026-09-09 crash.
-  constexpr size_t kWatermark = 10ull * 1024ull * 1024ull * 1024ull;
-  if (source == 0 || source > SIZE_MAX - kSourceSlack ||
-      !MemoryGuard::try_reserve_host_bytes(source + kSourceSlack, kWatermark)) {
-    LOG_WARN(
-        "[GGML-DSV4-FULL] host watermark refused source=%.2f GiB + existing "
-        "host=%.2f GiB + reserve=%.2f GiB; budget=%.2f GB MemAvailable=%ld "
-        "MiB\n",
-        (double)source / (1024.0 * 1024.0 * 1024.0),
-        (double)host_live / (1024.0 * 1024.0 * 1024.0),
-        (double)kWatermark / (1024.0 * 1024.0 * 1024.0),
-        (double)MemoryGuard::host_budget_bytes() / 1.0e9,
-        MemoryGuard::last_available_mb());
-    return false;
-  }
-  g->host_reservation_bytes = source + kSourceSlack;
-  LOG_INFO("[GGML-DSV4-FULL] host admission: source=%.2f GiB existing=%.2f GiB "
-           "reserve=%.2f GiB budget=%.2f GB\n",
-           (double)source / (1024.0 * 1024.0 * 1024.0),
-           (double)host_live / (1024.0 * 1024.0 * 1024.0),
-           (double)kWatermark / (1024.0 * 1024.0 * 1024.0),
-           (double)MemoryGuard::host_budget_bytes() / 1.0e9);
-  if (!init_expert_source(*g, source) || !preload_expert_source(*g) ||
-      !init_expert_arena(*g) || !init_dense_arena(*g))
-    return false;
-  ggml_backend_t backends[] = {g->cuda, g->cpu};
-  g->sched =
-      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, true);
-  if (!g->sched || !build_dsv4_graph(*g, token_ids)) {
-    LOG_WARN(
-        "[GGML-DSV4-FULL] graph construction declined; using legacy path\n");
-    return false;
-  }
-  g_dsv4_graph = std::move(g);
-  LOG_INFO("[GGML-DSV4-FULL] graph prepared for S=%d\n", S);
-  return true;
-}
-
-bool deepseek_v4_full_graph_run(StreamingEngine &engine, float *hidden_states,
-                                int S, int pos_base, const int *) {
-  if (!dsv4_env_enabled() || !hidden_states || S <= 1 || pos_base != 0 ||
-      !g_dsv4_graph || !g_dsv4_graph->ready ||
-      g_dsv4_graph->engine != &engine || g_dsv4_graph->S != S)
-    return false;
-  FullGraph &g = *g_dsv4_graph;
-  const auto &c = engine.model_file.architecture_config;
-  const int window = g.sliding_window > 0 ? g.sliding_window : engine.max_t;
-
-  // The graph starts a fresh MoEStream sequence.  Clear the state first so a
-  // failed/short graph run cannot leave the following legacy decode mixed
-  // with stale compressed rows from a prior request.
-  for (const auto &lt : g.dsv4_layers) {
-    if (lt.layer < 0 || lt.layer >= (int)engine.KVc.size() ||
-        !engine.KVc[lt.layer] || lt.layer >= (int)engine.dsv4_compressed.size())
-      return false;
-    const int ratio = lt.ratio;
-    if (ratio != 0 && engine.dsv4_compressed[lt.layer].ratio != ratio)
-      return false;
-    if (ratio != 0)
-      engine.dsv4_compressed[lt.layer].reset();
-  }
-  if (g.host_inputs.empty() ||
-      engine.hc_stream_buf.size() < (size_t)g.D * g.HC * S)
-    return false;
-  std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
-              (size_t)g.D * g.HC * S * sizeof(float));
-
-  // Same defense-in-depth backstop as glm5next_full_graph_run's own compute
-  // call (see that call site's own comment for the real-hardware incident
-  // that motivated it) -- DSV4's full graph hasn't been run on real hardware
-  // yet at all, so there is no evidence either way here, but the gap this
-  // closes (a fresh, synchronous MemAvailable check right before the one
-  // uncounted compute step in this whole admission chain) applies equally.
-  {
-    const long avail_mb = MemoryGuard::read_available_mb();
-    constexpr long kMinComputeHeadroomMb =
-        10240; // 10 GiB, per explicit user instruction after the 2026-09-09
-               // crash
-    if (avail_mb >= 0 && avail_mb < kMinComputeHeadroomMb) {
-      LOG_ERROR("[GGML-DSV4-FULL] refusing graph compute: MemAvailable=%ld MiB "
-                "< %ld MiB safety floor -- falling back to the legacy path\n",
-                avail_mb, kMinComputeHeadroomMb);
-      return false;
-    }
-  }
-
-  const auto start = std::chrono::steady_clock::now();
-  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
-      GGML_STATUS_SUCCESS)
-    return false;
-  ggml_backend_sched_synchronize(g.sched);
-  const auto synced = std::chrono::steady_clock::now();
-  ggml_backend_tensor_get(g.output, hidden_states, 0,
-                          (size_t)g.D * S * sizeof(float));
-
-  if (dsv4_graph_diagnostic_enabled()) {
-    for (const auto &stage : g.dsv4_stage_outputs) {
-      // Attention/FFN stages are [D,S] tensors, while residual stages are
-      // [D,HC,S].  Reading every stage into the residual-sized buffer used
-      // to over-read the former and triggered GGML's bounds assertion.
-      const size_t bytes = ggml_nbytes(stage.second);
-      if (bytes == 0 || bytes % sizeof(float) != 0) {
-        LOG_ERROR("[GGML-DSV4-DIAG] %s has unsupported byte size=%zu\n",
-                  stage.first.c_str(), bytes);
-        return false;
-      }
-      std::vector<float> layer_values(bytes / sizeof(float));
-      ggml_backend_tensor_get(stage.second, layer_values.data(), 0, bytes);
-      size_t finite = 0;
-      float min_value = INFINITY;
-      float max_value = -INFINITY;
-      for (float value : layer_values) {
-        if (std::isfinite(value)) {
-          ++finite;
-          min_value = std::min(min_value, value);
-          max_value = std::max(max_value, value);
-        }
-      }
-      LOG_INFO("[GGML-DSV4-DIAG] %s shape=(%lld,%lld,%lld,%lld) finite=%zu/%zu "
-               "min=%g max=%g\n",
-               stage.first.c_str(), (long long)stage.second->ne[0],
-               (long long)stage.second->ne[1], (long long)stage.second->ne[2],
-               (long long)stage.second->ne[3], finite, layer_values.size(),
-               min_value, max_value);
-      if (finite != layer_values.size())
-        break;
-    }
-  }
-
-  for (const auto &lt : g.dsv4_layers) {
-    const int l = lt.layer;
-    const size_t raw_n = (size_t)(g.qk_nope + g.qk_rope) * S;
-    std::vector<float> raw(raw_n);
-    ggml_backend_tensor_get(lt.raw_kv, raw.data(), 0, raw_n * sizeof(float));
-    for (int s = 0; s < S; ++s) {
-      const int slot = s % std::max(1, window);
-      std::memcpy(engine.KVc[l] + (size_t)slot * (g.qk_nope + g.qk_rope),
-                  raw.data() + (size_t)s * (g.qk_nope + g.qk_rope),
-                  (size_t)(g.qk_nope + g.qk_rope) * sizeof(float));
-    }
-    if (lt.ratio == 0)
-      continue;
-    auto &state = engine.dsv4_compressed[l];
-    const int width =
-        lt.ratio == 4 ? 2 * (g.qk_nope + g.qk_rope) : (g.qk_nope + g.qk_rope);
-    std::vector<float> comp((size_t)width * S);
-    std::vector<float> score((size_t)width * S);
-    ggml_backend_tensor_get(lt.comp_kv, comp.data(), 0,
-                            comp.size() * sizeof(float));
-    ggml_backend_tensor_get(lt.comp_score, score.data(), 0,
-                            score.size() * sizeof(float));
-    for (int s = 0; s < S; ++s) {
-      const int slot = s % state.state_size;
-      std::memcpy(state.state_kv.data() + (size_t)slot * width,
-                  comp.data() + (size_t)s * width,
-                  (size_t)width * sizeof(float));
-      std::memcpy(state.state_score.data() + (size_t)slot * width,
-                  score.data() + (size_t)s * width,
-                  (size_t)width * sizeof(float));
-    }
-    const int blocks = S / lt.ratio;
-    if (blocks > 0 && lt.keys) {
-      std::vector<float> keys((size_t)(g.qk_nope + g.qk_rope) * blocks);
-      ggml_backend_tensor_get(lt.keys, keys.data(), 0,
-                              keys.size() * sizeof(float));
-      std::memcpy(state.keys.data(), keys.data(),
-                  std::min(state.keys.size(), keys.size()) * sizeof(float));
-    }
-    if (lt.indexer_comp_kv) {
-      const int idim = c.dsv4_indexer_key_length;
-      const int iwidth = 2 * idim;
-      std::vector<float> ikv((size_t)iwidth * S);
-      std::vector<float> iscore((size_t)iwidth * S);
-      ggml_backend_tensor_get(lt.indexer_comp_kv, ikv.data(), 0,
-                              ikv.size() * sizeof(float));
-      ggml_backend_tensor_get(lt.indexer_comp_score, iscore.data(), 0,
-                              iscore.size() * sizeof(float));
-      for (int s = 0; s < S; ++s) {
-        const int slot = s % state.state_size;
-        std::memcpy(state.indexer_state_kv.data() + (size_t)slot * iwidth,
-                    ikv.data() + (size_t)s * iwidth,
-                    (size_t)iwidth * sizeof(float));
-        std::memcpy(state.indexer_state_score.data() + (size_t)slot * iwidth,
-                    iscore.data() + (size_t)s * iwidth,
-                    (size_t)iwidth * sizeof(float));
-      }
-      if (blocks > 0 && lt.indexer_keys) {
-        std::vector<float> keys((size_t)idim * blocks);
-        ggml_backend_tensor_get(lt.indexer_keys, keys.data(), 0,
-                                keys.size() * sizeof(float));
-        std::memcpy(state.indexer_keys.data(), keys.data(),
-                    std::min(state.indexer_keys.size(), keys.size()) *
-                        sizeof(float));
-      }
-    }
-  }
-  const auto done = std::chrono::steady_clock::now();
-  const auto ms = [](auto a, auto b) {
-    return std::chrono::duration<double, std::milli>(b - a).count();
-  };
-  LOG_INFO(
-      "[GGML-DSV4-FULL-TIME] sync=%.3f ms state_get=%.3f ms total=%.3f ms\n",
-      ms(start, synced), ms(synced, done), ms(start, done));
-  engine.deepseek_v4_full_graph_output_ready = true;
-  return true;
-}
-
 #else
 
 bool glm5next_full_graph_enabled() { return false; }
@@ -8531,15 +6987,5 @@ bool glm5next_full_graph_decode_run(StreamingEngine &, float *, int,
   return false;
 }
 void glm5next_full_graph_shutdown() {}
-bool deepseek_v4_full_graph_enabled() { return false; }
-int deepseek_v4_full_graph_device_expert_layers() { return 0; }
-bool deepseek_v4_full_graph_prepare(StreamingEngine &, int, int, const int *) {
-  return false;
-}
-bool deepseek_v4_full_graph_run(StreamingEngine &, float *, int, int,
-                                const int *) {
-  return false;
-}
-void deepseek_v4_full_graph_shutdown() {}
 
 #endif

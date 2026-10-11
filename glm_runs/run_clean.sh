@@ -12,6 +12,10 @@ for k in 1 2 3; do
   quiet
   rm -f $D/pinab/$N.done
   "$D/run_seg_ab.sh" "$N"
+  if [ ! -s "$D/pinab/$N.load.csv" ] || [ ! -s "$D/pinab/$N.stdout" ]; then
+    echo "$N did not run (no stdout/load samples; nvtop/htop up?) (attempt $k)" >> $D/pinab/clean_runs.log
+    sleep 30; continue
+  fi
   bad=$(awk '$3>0 || $4>0' $D/pinab/$N.load.csv 2>/dev/null | wc -l)
   if [ "$bad" = 0 ]; then echo "$N clean (attempt $k)" >> $D/pinab/clean_runs.log; exit 0; fi
   echo "$N contaminated in $bad samples (attempt $k)" >> $D/pinab/clean_runs.log

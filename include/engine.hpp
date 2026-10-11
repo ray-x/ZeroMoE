@@ -7,8 +7,6 @@
 #include "memory_guard.hpp"  // MemoryGuard::allocation_blocked() -- see ensure_slab_capacity
 #include "family_ops.hpp" // FamilyOps -- see StreamingEngine::family_ops below
 #include "dsv4_compressed_attention.hpp" // Dsv4CompressedLayerState -- see StreamingEngine::dsv4_compressed below
-#include "qwen4exp_storage_service.hpp"
-#include "qwen4exp_completion_graph.hpp"
 #include <cuda_runtime.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -560,51 +558,6 @@ public:
                                 qwen4exp_gpu_stage_layers.end(), layer);
     }
 
-    // Publish the cold subset of one completed route-slot payload. Resident
-    // expert IDs may appear in the completion because offsets and bytes stay
-    // aligned with the original route slots; they are omitted from the staged
-    // bitmap so the two GPU children remain disjoint.
-    bool publish_qwen4exp_staged_completion(
-        const moestream::qwen4exp::StorageCompletion &completion,
-        uint64_t expected_model_generation) {
-      if (completion.state != moestream::qwen4exp::StorageState::Ready ||
-          completion.model_generation != expected_model_generation ||
-          completion.request_generation == 0 || completion.layer < 0 ||
-          completion.experts.empty() ||
-          !moestream::qwen4exp::storage_payload_uniform_slots(
-              completion,
-              static_cast<size_t>(
-                  std::max(1, model_file.architecture_config.topk))) ||
-          (qwen4exp_partial_layer >= 0 &&
-           completion.layer != qwen4exp_partial_layer))
-        return false;
-      const int n_experts = model_file.architecture_config.n_experts;
-      std::vector<int> candidate;
-      candidate.reserve(completion.experts.size());
-      for (int expert : completion.experts) {
-        if (expert < 0 || expert >= n_experts)
-          return false;
-        // Duplicate route slots are valid: they carry distinct router
-        // weights but consume the same staged expert bytes. Publish one
-        // bitmap owner per expert while preserving the payload's original
-        // slot order for the staged child.
-        if (std::find(qwen4exp_partial_layer_gpu_ids.begin(),
-                      qwen4exp_partial_layer_gpu_ids.end(), expert) !=
-            qwen4exp_partial_layer_gpu_ids.end())
-          continue;
-        if (std::find(candidate.begin(), candidate.end(), expert) ==
-            candidate.end())
-          candidate.push_back(expert);
-      }
-      if (candidate.empty())
-        return false;
-      std::sort(candidate.begin(), candidate.end());
-      qwen4exp_partial_layer_staged_ids = std::move(candidate);
-      qwen4exp_partial_layer_staged_generation =
-          completion.request_generation;
-      return true;
-    }
-
     // Phase 1 "all-or-nothing" partial-layer GPU dispatch (per-session, not
     // per-token -- see qwen4exp-full-graph-decode-benchmark-baseline memory's
     // follow-on note for why per-token was ruled out: ggml has no in-graph
@@ -617,47 +570,8 @@ public:
     int qwen4exp_partial_layer_top_n = 256;
     float qwen4exp_partial_layer_min_coverage = 1.0f;
     std::vector<int> qwen4exp_partial_layer_gpu_ids; // top-N experts, ranked by usage
-    // Optional published staged set for the three-way pure-GPU conditional
-    // graph. It is populated only after a stable staging generation is ready;
-    // an empty set keeps the staged conditional disabled and preserves the
-    // existing resident/CPU path.
-    std::vector<int> qwen4exp_partial_layer_staged_ids;
-    uint64_t qwen4exp_partial_layer_staged_generation = 0;
-    // Optional host storage boundary for staged expert payloads. It is
-    // constructed only when explicitly enabled; the production scheduler
-    // keeps this null and follows the existing DDR/early-ready path.
-    std::unique_ptr<moestream::qwen4exp::StorageService>
-        qwen4exp_storage_service;
-    // Stable device payload arena created before Qwen graph bootstrap when
-    // completion-graph staging is explicitly enabled. Its address can be
-    // bound by a future pure-GPU staged child and remains valid across graph
-    // rebuilds for the session.
-    std::unique_ptr<moestream::qwen4exp::CompletionGraph>
-        qwen4exp_completion_graph;
-    // Generation counters for the opt-in storage/completion path. A model
-    // load owns one model generation; request generations are monotonic and
-    // are validated before staged ownership is published.
-    uint64_t qwen4exp_storage_model_generation = 1;
-    uint64_t qwen4exp_storage_next_request_generation = 1;
-    // Runtime timing samples used only by the opt-in adaptive staged policy.
-    // The first few cold routes remain on CPU to seed a measured baseline;
-    // no guessed throughput is used to change the production default.
-    uint64_t qwen4exp_adaptive_cpu_samples = 0;
-    uint64_t qwen4exp_adaptive_staged_samples = 0;
-    double qwen4exp_adaptive_cpu_queue_ms = 0.0;
-    double qwen4exp_adaptive_cpu_compute_ms = 0.0;
-    double qwen4exp_adaptive_cpu_ms = 0.0;
-    double qwen4exp_adaptive_staged_queue_ms = 0.0;
-    double qwen4exp_adaptive_staged_h2d_ms = 0.0;
-    double qwen4exp_adaptive_staged_dispatch_ms = 0.0;
-    double qwen4exp_adaptive_staged_storage_ms = 0.0;
-    double qwen4exp_adaptive_staged_gpu_ms = 0.0;
     bool qwen4exp_partial_layer_planned = false;      // gpu_ids computed at least once
     bool qwen4exp_partial_layer_committed = false;    // this session: use the GPU-only path
-    // Phase 2 owns three decode graph instances.  If their additional arena
-    // footprint cannot be allocated, disable Phase 2 for this session rather
-    // than retrying the same failed construction on every decode token.
-    bool qwen4exp_partial_layer_phase2_disabled = false;
 
     // Router-selection frequency histogram, [n_layers * n_experts], accumulated
     // across a run and dumped to the usage file at shutdown (Phase A 

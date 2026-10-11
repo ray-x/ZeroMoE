@@ -1,3 +1,4 @@
+#include "graph_config.hpp"
 #include "qwen4exp_gdn.hpp"   // qwen4exp_gdn_delta_chunk (CPU oracle for Test 25)
 #include "ggml_gdn_proj_backend.hpp"  // GgmlGdnProjRunner (Test 29)
 #include "ggml_glm5next_proj_backend.hpp"  // GLM5NEXT KDA fusion (Test 34)
@@ -6910,6 +6911,34 @@ bool test_exl3_gpu_routed_device_async(int device) {
     }
 }
 
+bool test_graph_config() {
+    std::cout << "[Test] graph_config env readers and registry...\n";
+    namespace gc = moestream::graphcfg;
+    const char *k = "MOESTREAM_TEST_GRAPH_CONFIG_KNOB";
+    unsetenv(k);
+    bool ok = !gc::present(k) && !gc::flag_on(k) && gc::flag_unless_off(k) &&
+              gc::integer(k, 7) == 7 && gc::real(k, 1.5) == 1.5 &&
+              gc::path(k) == nullptr;
+    setenv(k, "1", 1);
+    ok = ok && gc::present(k) && gc::flag_on(k) && gc::flag_unless_off(k) &&
+         gc::integer(k, 7) == 1 && std::string(gc::env(k)) == "1";
+    setenv(k, "0", 1);
+    ok = ok && !gc::flag_on(k) && !gc::flag_unless_off(k) && gc::integer(k, 7) == 0;
+    setenv(k, "12x", 1);  // strict whole-string parse, falls back to default
+    ok = ok && gc::integer(k, 7) == 7;
+    setenv(k, "", 1);     // empty is "set" for present() but not for path()
+    ok = ok && gc::present(k) && gc::path(k) == nullptr && gc::integer(k, 9) == 9;
+    setenv(k, "2.5", 1);
+    ok = ok && gc::real(k, 0.0) == 2.5;
+    // The registry saw the name once, with the value of the FIRST lookup.
+    const auto snap = gc::Registry::get().snapshot();
+    const auto it = snap.find(k);
+    ok = ok && it != snap.end() && !it->second.set && it->second.reads >= 1;
+    unsetenv(k);
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
 bool test_exl3_cuda_kernels() {
     std::cout << "[Test] EXL3 CUDA matmul/reconstruction/cache...\n";
     int device_count = 0;
@@ -7122,6 +7151,7 @@ int main() {
     if (!test_exl3_cpu_dispatch()) return 1;
     if (!test_exl3_cpu_matrix_cache()) return 1;
     if (std::getenv("MOESTREAM_TEST_EXL3_CPU_ONLY")) return 0;
+    if (!test_graph_config()) return 1;
     if (!test_exl3_cuda_kernels()) return 1;
     if (std::getenv("MOESTREAM_TEST_EXL3_ONLY")) return 0;
     std::cout << "========================================\n";

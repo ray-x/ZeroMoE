@@ -323,8 +323,8 @@ if(NOT MOESTREAM_CPU_ONLY)
         cuda/mla_attention.cu
         cuda/mxfp4_matmul.cu
         cuda/q5_1_matmul.cu
-        cuda/qwen4exp_master_graph.cu
         cuda/qwen4exp_hc_q8.cu
+        cuda/qwen_stage_kernels.cu
         cuda/q8_0_matmul.cu
         cuda/q2_0_matmul.cu
         cuda/rmsnorm.cu
@@ -402,6 +402,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen_cpu_moe.cpp
         src/ggml_qwen4exp_graph.cpp
         src/ggml_glm5next_graph.cpp
+        src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
         src/ggml_glm5next_proj_backend.cpp
@@ -501,6 +502,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen_cpu_moe.cpp
         src/ggml_qwen4exp_graph.cpp
         src/ggml_glm5next_graph.cpp
+        src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
         src/ggml_glm5next_proj_backend.cpp

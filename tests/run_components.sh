@@ -120,24 +120,6 @@ for MODE in capable stock optout; do
     "$ROUTE_TEST_BIN" "$MODE"
 done
 
-STORAGE_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_storage_service"
-echo "[run_components] compiling storage generation tests"
-"$CXX" -std=c++20 -O2 -pthread -Iinclude \
-    -o "$STORAGE_TEST_BIN" tests/test_qwen4exp_storage_service.cpp
-"$STORAGE_TEST_BIN"
-
-BOUNDARY_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_staged_boundary"
-echo "[run_components] compiling staged storage/adaptive boundary tests"
-"$CXX" -std=c++20 -O2 -pthread -Iinclude \
-    -o "$BOUNDARY_TEST_BIN" tests/test_qwen4exp_staged_boundary.cpp
-"$BOUNDARY_TEST_BIN"
-
-ADAPTIVE_TEST_BIN="$ROUTE_TEST_DIR/test_qwen4exp_adaptive_policy"
-echo "[run_components] compiling adaptive policy tests"
-"$CXX" -std=c++20 -O2 -Iinclude \
-    -o "$ADAPTIVE_TEST_BIN" tests/test_qwen4exp_adaptive_policy.cpp
-"$ADAPTIVE_TEST_BIN"
-
 # Dynamic DDR expert cache (residency bitmap, LRU, seeding, aligned O_DIRECT store reader, virtual arena) and its
 # acceptance replay of the GLM-5.3-Flash router trace against the offline simulator's results. Linux only (O_DIRECT,
 # preadv, mincore). Optional real-data check: MOESTREAM_TEST_STORE=<store.gguf> MOESTREAM_TEST_MODEL=<shard,...>.
