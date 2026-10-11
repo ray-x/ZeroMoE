@@ -669,6 +669,30 @@ struct OffloadState {
 std::unique_ptr<OffloadState> g_offload;
 std::mutex g_offload_mutex;
 std::shared_mutex g_arena_mu; // exclusive: cache eviction/loads (miss nodes); shared: the pilot-staging worker reading arena slots
+// MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
+// ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
+bool offload_async() {
+  static const bool on = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
+    return v && v[0] == '1';
+  }();
+  return on;
+}
+// Run `ensure` for one layer, with or without the lock held across the reads.
+moestream::offload::ExpertResidency::Ensure
+offload_ensure(moestream::offload::ExpertResidency &res, int layer, const int32_t *ids, int n,
+               moestream::offload::ExpertCache::Kind kind) {
+  if (!offload_async()) {
+    std::unique_lock<std::shared_mutex> lock(g_arena_mu);
+    return res.ensure(layer, ids, n, kind);
+  }
+  moestream::offload::ExpertResidency::Plan p;
+  {
+    std::unique_lock<std::shared_mutex> lock(g_arena_mu);
+    p = res.begin(layer, ids, n, kind);
+  }
+  return res.finish(p, [] { return std::unique_lock<std::shared_mutex>(g_arena_mu); });
+}
 
 int offload_first_layer() {
   static const int first = [] {
@@ -698,6 +722,9 @@ void offload_report(OffloadState &o, const char *why) {
            (unsigned long long)o.evictions.load(),
            (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
            o.cb_us.load() / 1000.0, (unsigned long long)o.cold_routes.load());
+  if (o.residency && offload_async())
+    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s async: demand lookups that waited on an in-flight read=%llu wait=%.1f ms\n", why,
+             (unsigned long long)o.residency->waited_experts(), o.residency->wait_ms());
   if (o.cache && o.cache->config().policy == moestream::offload::ExpertCache::Policy::SegmentedLru) {
     const auto &st = o.cache->stats();
     LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s segmented: prefetch_inserts=%llu promotions=%llu "
@@ -898,12 +925,14 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
       if (ids[k] >= 0 && !o.cache->resident({site->layer, ids[k]}) && dbg_lines.fetch_add(1) < 40)
         LOG_INFO("[OFFLOAD-DEBUG] miss layer=%d expert=%d S=%lld k=%zu\n", site->layer, ids[k],
                  (long long)a->ne[1], k);
-  std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
-  const auto r = site->prefill
-                     ? o.residency->ensure_transient(site->layer, ids.data(),
-                                                     (int)ids.size())
-                     : o.residency->ensure(site->layer, ids.data(),
-                                           (int)ids.size());
+  moestream::offload::ExpertResidency::Ensure r;
+  if (site->prefill) {
+    std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
+    r = o.residency->ensure_transient(site->layer, ids.data(), (int)ids.size());
+  } else {
+    r = offload_ensure(*o.residency, site->layer, ids.data(), (int)ids.size(),
+                       moestream::offload::ExpertCache::Kind::Demand);
+  }
   o.calls.fetch_add(1, std::memory_order_relaxed);
   o.routes.fetch_add(ids.size(), std::memory_order_relaxed);
   o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }),
@@ -972,6 +1001,29 @@ int pilot_prefetch_k() {
     return std::max(pilot_stage_k(), v && v[0] ? std::max(0, std::min(8, std::atoi(v))) : 0);
   }();
   return k;
+}
+// MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD=k (prefetch-only mode): layer l predicts the cold experts of layer l+k (using layer l+k's
+// router on layer l's FFN input) so the read has k layers of lead time. Staging copies keep k=1 (the ring has two sets).
+int pilot_lookahead() {
+  static const int k = [] {
+    const char *v = std::getenv("MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD");
+    int want = v && v[0] ? std::max(1, std::min(4, std::atoi(v))) : 1;
+    if (want > 1) {
+      const char *cv = std::getenv("MOESTREAM_GLM5NEXT_PILOT_COPY");
+      if (!(cv && cv[0] == '0'))
+        want = 1;
+    }
+    return want;
+  }();
+  return k;
+}
+// MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE=x: only prefetch pilot candidates whose router score is >= x.
+float pilot_min_score() {
+  static const float v = [] {
+    const char *e = std::getenv("MOESTREAM_GLM5NEXT_PILOT_MIN_SCORE");
+    return e && e[0] ? (float)std::atof(e) : -1e30f;
+  }();
+  return v;
 }
 struct StageSite {
   int layer = 0;
@@ -1058,6 +1110,20 @@ struct StageRuntime {
     }
   }
   StageResult result[128];
+  // Pilot candidates posted for each target layer, kept to score them against the layer's real routes (calibration telemetry).
+  struct Cand {
+    int n = 0;
+    int32_t ids[8] = {};
+    float score[8] = {};
+  } cand[128];
+  static constexpr int kScoreBuckets = 9;
+  std::atomic<uint64_t> rank_n[8] = {}, rank_hit[8] = {}, sb_n[kScoreBuckets] = {}, sb_hit[kScoreBuckets] = {};
+  static int score_bucket(float s) {
+    static const float edges[kScoreBuckets - 1] = {0.01f, 0.02f, 0.05f, 0.1f, 0.2f, 0.4f, 0.8f, 1.6f};
+    int b = 0;
+    while (b < kScoreBuckets - 1 && s >= edges[b]) ++b;
+    return b;
+  }
   std::deque<StageSite> sites;
   std::deque<StageMissSite> miss_sites;
   std::atomic<uint64_t> direct{0}, jobs{0}, copied{0}, resolves{0}, staged_routes{0}, routes_seen{0}, wait_us{0}, skipped_not_resident{0},
@@ -1120,12 +1186,9 @@ void stage_worker_main(StageRuntime *st) {
       }
       if (nm > 0) {
         const auto t0 = std::chrono::steady_clock::now();
-        moestream::offload::ExpertResidency::Ensure r;
-        {
-          std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
-          r = o->residency->ensure(job.layer, missing, nm,
-                                   moestream::offload::ExpertCache::Kind::Prefetch);
-        }
+        const moestream::offload::ExpertResidency::Ensure r =
+            offload_ensure(*o->residency, job.layer, missing, nm,
+                           moestream::offload::ExpertCache::Kind::Prefetch);
         st->prefetch_loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
         st->prefetch_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
                                   std::memory_order_relaxed);
@@ -1140,7 +1203,7 @@ void stage_worker_main(StageRuntime *st) {
       int chosen[8] = {};
       for (int j = 0; j < job.n && staged < st->K; ++j) {
         const int id = job.ids[j];
-        if (id < 0 || id >= o->n_experts || !o->cache->resident({job.layer, id})) {
+        if (id < 0 || id >= o->n_experts || !o->residency->ready({job.layer, id})) {
           st->skipped_not_resident.fetch_add(1, std::memory_order_relaxed);
           continue;
         }
@@ -1242,9 +1305,24 @@ void stage_post_job(StageRuntime *st, int layer, int set, const ggml_tensor *pre
   StageRuntime::Job job;
   job.layer = layer;
   job.set = set;
-  job.n = (int)std::min<int64_t>(pred->ne[0], 8);
-  for (int j = 0; j < job.n; ++j)
-    job.ids[j] = *(const int32_t *)((const char *)pred->data + j * pred->nb[0]);
+  const int K = (int)(pred->ne[0] / 2), nc = std::min(K, 8);
+  const float min_score = pilot_min_score();
+  StageRuntime::Cand &cd = st->cand[layer];
+  cd.n = nc;
+  job.n = 0;
+  for (int j = 0; j < nc; ++j) {
+    const int32_t id = (int32_t)*(const float *)((const char *)pred->data + (size_t)j * pred->nb[0]);
+    const float sc = *(const float *)((const char *)pred->data + (size_t)(K + j) * pred->nb[0]);
+    cd.ids[j] = id;
+    cd.score[j] = sc;
+    if (sc >= min_score)
+      job.ids[job.n++] = id;
+  }
+  static std::atomic<int> logged{0};
+  if (logged.fetch_add(1) < 4)
+    LOG_INFO("[GGML-GLM5NEXT-STAGE] pilot candidates for layer %d: scores %.4f %.4f %.4f %.4f (min_score %g, kept %d/%d)\n", layer,
+             nc > 0 ? cd.score[0] : 0.f, nc > 1 ? cd.score[1] : 0.f, nc > 2 ? cd.score[2] : 0.f, nc > 3 ? cd.score[3] : 0.f,
+             (double)min_score, job.n, nc);
   {
     std::lock_guard<std::mutex> lock(st->m);
     if (pilot_copy_on())
@@ -1271,6 +1349,22 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   int staged = 0;
   int32_t staged_ids[8] = {};
   StageResult &res = st->result[site->layer];
+  {
+    StageRuntime::Cand &cd = st->cand[site->layer];
+    for (int j = 0; j < cd.n; ++j) {
+      bool used = false;
+      for (int i = 0; i < n; ++i)
+        used = used || *(const int32_t *)((const char *)b->data + i * b->nb[0]) == cd.ids[j];
+      const int sb = StageRuntime::score_bucket(cd.score[j]);
+      st->rank_n[j].fetch_add(1, std::memory_order_relaxed);
+      st->sb_n[sb].fetch_add(1, std::memory_order_relaxed);
+      if (used) {
+        st->rank_hit[j].fetch_add(1, std::memory_order_relaxed);
+        st->sb_hit[sb].fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+    cd.n = 0;
+  }
   if (res.state.load(std::memory_order_acquire) != 0) {
     const auto t0 = std::chrono::steady_clock::now();
     {
@@ -1312,11 +1406,8 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   }
   st->staged_routes.fetch_add(hit, std::memory_order_relaxed);
   st->routes_seen.fetch_add((uint64_t)n, std::memory_order_relaxed);
-  moestream::offload::ExpertResidency::Ensure r;
-  {
-    std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
-    r = o.residency->ensure(site->layer, ids.data(), n);
-  }
+  const moestream::offload::ExpertResidency::Ensure r =
+      offload_ensure(*o.residency, site->layer, ids.data(), n, moestream::offload::ExpertCache::Kind::Demand);
   o.calls.fetch_add(1, std::memory_order_relaxed);
   o.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
   o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
@@ -1342,6 +1433,22 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
              (unsigned long long)st->staged_routes.load(), (unsigned long long)st->routes_seen.load(),
              (unsigned long long)st->skipped_not_resident.load(), st->wait_us.load() / 1000.0, (unsigned long long)st->direct.load(),
              (unsigned long long)st->prefetch_loads.load(), st->prefetch_us.load() / 1000.0);
+  if (rs % 4704 == 0) {
+    std::string pr = "pilot precision by rank:", ps = "by score bucket (<.01 <.02 <.05 <.1 <.2 <.4 <.8 <1.6 >=1.6):";
+    char buf[64];
+    for (int j = 0; j < 8; ++j)
+      if (st->rank_n[j].load() > 0) {
+        std::snprintf(buf, sizeof buf, " r%d %.0f%%(%llu)", j + 1, 100.0 * (double)st->rank_hit[j].load() / (double)st->rank_n[j].load(),
+                      (unsigned long long)st->rank_n[j].load());
+        pr += buf;
+      }
+    for (int j = 0; j < StageRuntime::kScoreBuckets; ++j) {
+      const uint64_t nn = st->sb_n[j].load();
+      std::snprintf(buf, sizeof buf, " %.0f%%(%llu)", nn ? 100.0 * (double)st->sb_hit[j].load() / (double)nn : 0.0, (unsigned long long)nn);
+      ps += buf;
+    }
+    LOG_INFO("[GGML-GLM5NEXT-STAGE] %s\n[GGML-GLM5NEXT-STAGE] %s\n", pr.c_str(), ps.c_str());
+  }
   if (o.calls.load() - o.last_report_calls.load() >= 544) {
     o.last_report_calls.store(o.calls.load());
     offload_report(o, "progress");
@@ -6138,7 +6245,7 @@ ggml_tensor *stage_hot_mask(FullGraph &g, ggml_context *ctx, int layer) {
 
 bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, int l) {
   const auto &c = g.engine->model_file.architecture_config;
-  const int next = l + 1;
+  const int next = l + pilot_lookahead();
   if (!stage_layer_active(g, next))
     return true;
   StageRuntime *st = get_stage(g);
@@ -6174,9 +6281,15 @@ bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, in
     return false;
   }
   score = ggml_add(ctx, score, mask);
-  ggml_tensor *pred = ggml_argsort_top_k(ctx, score, std::max(st->K, pilot_prefetch_k()));
-  ggml_set_name(pred, ("glm5next_stage_pred_" + std::to_string(next)).c_str());
-  g.stage_pred[next] = pred;
+  const int topk = std::max(st->K, pilot_prefetch_k());
+  ggml_tensor *pred = ggml_argsort_top_k(ctx, score, topk);
+  // Packed [ids as f32 (topk) | router scores of those ids (topk)] so the CPU node can rank, filter and calibrate candidates.
+  ggml_tensor *pred_c = ggml_cont(ctx, pred);
+  ggml_tensor *ids_f = ggml_cast(ctx, pred_c, GGML_TYPE_F32);
+  ggml_tensor *top_scores = ggml_get_rows(ctx, ggml_reshape_2d(ctx, ggml_cont(ctx, score), 1, c.n_experts), pred_c);
+  ggml_tensor *packed = ggml_concat(ctx, ggml_reshape_1d(ctx, ids_f, topk), ggml_reshape_1d(ctx, top_scores, topk), 0);
+  ggml_set_name(packed, ("glm5next_stage_pred_" + std::to_string(next)).c_str());
+  g.stage_pred[next] = packed;
   return true;
 }
 
@@ -6215,12 +6328,13 @@ ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, 
   ms.layer = layer;
   ms.set = layer % StageRuntime::kSets;
   ggml_tensor *pred_next = nullptr;
-  if (stage_layer_active(g, layer + 1)) {
-    auto it = g.stage_pred.find(layer + 1);
+  const int target = layer + pilot_lookahead();
+  if (stage_layer_active(g, target)) {
+    auto it = g.stage_pred.find(target);
     if (it != g.stage_pred.end()) {
       pred_next = it->second;
-      ms.next_layer = layer + 1;
-      ms.next_set = (layer + 1) % StageRuntime::kSets;
+      ms.next_layer = target;
+      ms.next_set = target % StageRuntime::kSets;
     }
   }
   st.miss_sites.push_back(ms);

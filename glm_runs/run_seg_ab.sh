@@ -30,5 +30,5 @@ printf '%s\n' \
  "Explain how TCP congestion control works, covering slow start and congestion avoidance." \
  "Write a bash script that finds the ten largest files under a directory and prints their sizes." \
  ":q" | systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
-   ./build_acc/moestream --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
+   ${BIN:-./build_acc/moestream} --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
 echo DONE > $B/pinab/$N.done
