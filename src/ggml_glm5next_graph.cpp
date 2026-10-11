@@ -5,6 +5,7 @@
 // GGML graph.  Host backed expert tensors remain valid GGML weight nodes, so
 // the CUDA scheduler owns the required copies and dependency edges.
 
+#include "pilot_ridge.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
 
@@ -198,6 +199,8 @@ struct FullGraph {
   int gpu1_first = -1, gpu1_last = -2;
   std::vector<ggml_backend_buffer_t> gpu1_buffers;
   std::unordered_map<int, ggml_tensor *> stage_pred; // layer -> pilot ids predicted for it (built one layer earlier)
+  std::vector<ggml_backend_buffer_t> ridge_buffers;   // device copies of the pilot ridge corrections (one per corrected layer)
+  std::vector<std::pair<int, ggml_tensor *>> probe_x;  // MOESTREAM_GLM5NEXT_PROBE_DUMP: (layer, pre-FFN hidden) read back after every decode token
   size_t gpu1_bytes = 0;
   int indexer_heads = 0;
   int indexer_key_length = 0;
@@ -491,6 +494,11 @@ struct FullGraph {
       if (b)
         ggml_backend_buffer_free(b);
     gpu1_buffers.clear();
+    for (ggml_backend_buffer_t b : ridge_buffers)
+      if (b)
+        ggml_backend_buffer_free(b);
+    ridge_buffers.clear();
+    probe_x.clear();
     if (expert_buffer) {
       ggml_backend_buffer_free(expert_buffer);
       expert_buffer = nullptr;
@@ -6259,7 +6267,8 @@ bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, in
     LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: missing next-layer norm/router tensor\n", l);
     return false;
   }
-  ggml_tensor *z = ggml_mul(ctx, ggml_rms_norm(ctx, cur_pre, c.eps), fn);
+  ggml_tensor *rn = ggml_rms_norm(ctx, cur_pre, c.eps);
+  ggml_tensor *z = ggml_mul(ctx, rn, fn);
   ggml_tensor *logits = ggml_mul_mat(ctx, router, z);
   ggml_tensor *probs = nullptr;
   switch (c.gating_func) {
@@ -6275,6 +6284,39 @@ bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, in
     break;
   }
   ggml_tensor *score = bias ? ggml_add(ctx, probs, bias) : probs;
+  // Learned correction (MOESTREAM_GLM5NEXT_PILOT_RIDGE): score += (rms(x) - mu) R + c, fitted offline on the pilot's residual.
+  static const PilotRidgeTable ridge = PilotRidgeTable::load("MOESTREAM_GLM5NEXT_PILOT_RIDGE", "GLM-PILOT-RIDGE");
+  if (const PilotRidgeTable::Record *rec = ridge.find(next);
+      rec && ridge.d == (int)rn->ne[0] && ridge.e == (int)router->ne[1] && g.cuda) {
+    ggml_tensor *mu_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ridge.d, 1);
+    ggml_tensor *r_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ridge.d, ridge.e);
+    ggml_tensor *c_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ridge.e, 1);
+    ggml_tensor *parts[3] = {mu_t, r_t, c_t};
+    size_t offsets[3], total = 0;
+    for (int i = 0; i < 3; ++i) {
+      offsets[i] = total;
+      total += (ggml_nbytes(parts[i]) + 255) & ~size_t(255);
+    }
+    ggml_backend_buffer_t rb = ggml_backend_alloc_buffer(g.cuda, total);
+    if (!rb) {
+      LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: pilot ridge buffer allocation failed; using the plain pilot\n", next);
+    } else {
+      auto *base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(rb));
+      bool placed = true;
+      for (int i = 0; i < 3 && placed; ++i)
+        placed = ggml_backend_tensor_alloc(rb, parts[i], base + offsets[i]) == GGML_STATUS_SUCCESS;
+      if (!placed) {
+        ggml_backend_buffer_free(rb);
+      } else {
+        g.ridge_buffers.push_back(rb);
+        ggml_backend_tensor_set(mu_t, rec->mu.data(), 0, ggml_nbytes(mu_t));
+        ggml_backend_tensor_set(r_t, rec->r.data(), 0, ggml_nbytes(r_t));
+        ggml_backend_tensor_set(c_t, rec->c.data(), 0, ggml_nbytes(c_t));
+        ggml_tensor *corr = ggml_mul_mat(ctx, r_t, ggml_sub(ctx, rn, mu_t));
+        score = ggml_add(ctx, ggml_add(ctx, score, corr), c_t);
+      }
+    }
+  }
   ggml_tensor *mask = stage_hot_mask(g, ctx, next);
   if (!mask) {
     LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: hot-mask allocation failed (dense arena %zu/%zu)\n", next, g.dense_used, g.dense_capacity);
@@ -6903,6 +6945,10 @@ bool build_graph(FullGraph &g) {
       return false;
     cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
     ggml_tensor *cur_pre = cur;
+    if (g.decode_mode && std::getenv("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
+      ggml_set_output(cur_pre);
+      g.probe_x.push_back({l, cur_pre});
+    }
     ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
     if (!fn)
       return false;
@@ -7919,6 +7965,18 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
                "ffn=%.1fms (marked-node sync inflates absolute time)\n"
                "[GLM5NEXT-LAYER-TIMING] attn/ffn ms per layer:%s\n",
                lt.tokens, ta / lt.tokens, tf / lt.tokens, line.c_str());
+    }
+  }
+  if (!g.probe_x.empty()) {
+    // Training/diagnostic tap: the exact pilot input (pre-FFN hidden, f32 [D]) of every layer for this decode token.
+    const char *dir = std::getenv("MOESTREAM_GLM5NEXT_PROBE_DUMP");
+    std::vector<float> row((size_t)g.D);
+    for (const auto &lx : g.probe_x) {
+      if (!dir || lx.second->type != GGML_TYPE_F32 || (size_t)lx.second->ne[0] != (size_t)g.D)
+        continue;
+      ggml_backend_tensor_get(lx.second, row.data(), 0, (size_t)g.D * sizeof(float));
+      std::ofstream xo(std::string(dir) + "/L" + std::to_string(lx.first) + ".x.bin", std::ios::binary | std::ios::app);
+      xo.write(reinterpret_cast<const char *>(row.data()), (std::streamsize)((size_t)g.D * sizeof(float)));
     }
   }
   const auto synced = std::chrono::steady_clock::now();

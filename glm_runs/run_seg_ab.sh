@@ -17,12 +17,22 @@ export MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION=${PROBATION:-0.25} MOESTREAM_GLM5NEX
 export MOESTREAM_GLM5NEXT_OFFLOAD_STORE=/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf
 export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf
 export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=/home/ray/work/moestream-graph/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
-export MOESTREAM_GLM5NEXT_OFFLOAD_THP=0
+export MOESTREAM_GLM5NEXT_OFFLOAD_THP=${THP:-0}
+[ -n "$LAYER_TIMING" ] && export MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1
 if [ "${PREFETCH:-0}" != "0" ]; then
   export MOESTREAM_GLM5NEXT_PILOT_STAGE=1 MOESTREAM_GLM5NEXT_PILOT_PREFETCH=$PREFETCH MOESTREAM_GLM5NEXT_PILOT_COPY=0
 else unset MOESTREAM_GLM5NEXT_PILOT_STAGE MOESTREAM_GLM5NEXT_PILOT_PREFETCH MOESTREAM_GLM5NEXT_PILOT_COPY; fi
-unset MOESTREAM_GLM5NEXT_FULL_GRAPH; export MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512
+unset MOESTREAM_GLM5NEXT_FULL_GRAPH; export MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=${FLOOR:-512}
 export MOESTREAM_GLM5NEXT_CPU_THREADS=8 CUDA_VISIBLE_DEVICES=0 MOESTREAM_BENCH_IGNORE_STOP=1
+# CPU sampler: process utime/stime ticks once a second (system time is where page zeroing and I/O syscalls show up)
+( while true; do
+    pid=$(pgrep -f "pinab/$N.toml" | while read p; do [ "$(readlink /proc/$p/exe 2>/dev/null | grep -c moestream)" = 1 ] && echo $p && break; done)
+    if [ -n "$pid" ] && [ -r /proc/$pid/stat ]; then
+      awk -v t="$(date +%s.%N)" '{print t, $14, $15}' /proc/$pid/stat >> $B/pinab/$N.cpu.csv 2>/dev/null
+    fi
+    sleep 1
+  done ) &
+SAMPLER=$!
 printf '%s\n' \
  "Explain how a mixture-of-experts transformer routes tokens, in a few clear paragraphs." \
  "Write a Python function that parses a CSV file and returns the average of a numeric column, with error handling." \
@@ -31,4 +41,5 @@ printf '%s\n' \
  "Write a bash script that finds the ten largest files under a directory and prints their sizes." \
  ":q" | systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
    ${BIN:-./build_acc/moestream} --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
+kill $SAMPLER 2>/dev/null
 echo DONE > $B/pinab/$N.done
