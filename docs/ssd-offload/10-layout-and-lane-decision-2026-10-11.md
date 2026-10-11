@@ -97,7 +97,7 @@ Striped store, DDR 32 GiB, 5,215 seeded experts, same 5-round / 475-token traffi
 | SEED_PAR=1 (a) | 18.5 s | 14,639 | 184.5 / 205.0 / 208.4 / 170.3 / 227.5 |
 | SEED_PAR=1 (b) | 12.5 s | 14,639 | 177.1 / 198.5 / 203.1 / 170.4 / 225.7 |
 | SEED_PAR=8 (a) | **6.5 s** | 14,639 | 177.5 / 199.5 / 204.7 / 171.3 / 226.9 |
-| SEED_PAR=8 (b) | **7.4 s** | 14,639 | see the repeat run in pinab (same loads per round) |
+| SEED_PAR=8 (b) | **7.4 s** | 14,639 | 188.6 / 208.6 / 214.4 / 176.8 / 235.2 (run-to-run spread about 6%) |
 
 * Seeding is 1.7-2.5x faster (6.5 / 7.4 s vs 12.5 / 18.5 s; the serial arm itself varies by 6 s between runs). It only moves boot time; decode is unchanged, as expected.
 * Output is identical: the serial and parallel stdout differ only in the config path and available-RAM lines; demand loads and per-round
