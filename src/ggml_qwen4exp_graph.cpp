@@ -12,7 +12,6 @@
 #include "moe_routed_ggml.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "option_b_global_hot.hpp"
-#include "qwen4exp_adaptive_policy.hpp"
 
 #include "dense_dispatch.hpp" // is_cpu_affinity_layer (cpu_affinity_layers config)
 #include "cuda_manager.hpp"
@@ -1299,11 +1298,8 @@ struct FullGraph {
   bool layer13_moe_diag_enabled = false;
   bool layer13_moe_diag_dumped = false;
   ggml_tensor *layer13_moe_diag = nullptr;
-  std::vector<std::pair<std::string, ggml_tensor *>> phase2_hc_debug_tensors;
   // MOESTREAM_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
   std::vector<std::tuple<int, ggml_tensor *, ggml_tensor *>> probe_taps;
-  bool phase2_layer3_alias_scan_done = false;
-  bool phase2_cuda_graph_write_scan_done = false;
   ggml_tensor *layer13_moe_input_diag = nullptr;
   ggml_tensor *layer13_moe_ids_diag = nullptr;
   ggml_tensor *layer13_moe_weights_diag = nullptr;
@@ -1388,8 +1384,8 @@ struct FullGraph {
   // prefix owner.  Expert tensors are keyed by their source layout because
   // the same logical layer can be represented as a full, strided, gathered,
   // or compact gate/up tensor depending on the graph path.
-  FullGraph *phase2_expert_source_graph = nullptr;
-  std::unordered_map<std::string, void *> phase2_expert_addrs;
+  FullGraph *expert_source_graph = nullptr;
+  std::unordered_map<std::string, void *> expert_addrs;
   // Layer-13 staging proof. The graph keeps fixed compact GPU tensors; each
   // decode token refreshes one or more cold expert records from the
   // active-layer pool before graph replay.
@@ -1422,7 +1418,6 @@ struct FullGraph {
   // Reusable exact-cold CPU branch for the Phase-2 parent graph. Its host node
   // is inserted directly into the parent graph, alongside (never inside) the
   // resident/staged conditional bodies.
-  std::unique_ptr<Qwen4ExpCudaHostNodeContext> phase2_cold_cpu_context;
   std::vector<std::unique_ptr<Exl3GgmlBridgeLayer>> exl3_bridge_layers;
   // Generalized GPU staging for host-resident decode layers (see
   // engine.qwen4exp_gpu_stage_enabled/_layers). One binding per staged
@@ -1511,64 +1506,21 @@ struct FullGraph {
   // DISTINCT FullGraph instances (own ctx/graph/sched) built once at
   // decode-prepare time, chosen per token by a cheap host-side readback of
   // the prefix's own layer routing.
-  enum class Phase2Mode {
-    Off, Prefix, Route, SuffixGpu, SuffixCpu, SuffixStaged,
-    SplitGpu, SplitStaged, Tail
-  };
-  Phase2Mode phase2_mode = Phase2Mode::Off;
-  int phase2_split_layer = -1;
   // Prefix-only: the persistent handoff buffer this instance writes `res`
   // (the residual right after the split layer's attention) into. Suffix
   // instances read the prefix instance's own phase2_handoff_buf/addr
   // directly (the prefix instance IS g_graph, phase2_mode==Prefix -- see
   // the g_graph global's own comment) and bind a fresh leaf tensor to the
   // SAME address in their own ctx -- never touch this pair themselves.
-  ggml_backend_buffer_t phase2_handoff_buf = nullptr;
-  void *phase2_handoff_addr = nullptr;
-  ggml_tensor *phase2_handoff_output_tensor = nullptr;
-  ggml_tensor *phase2_cpu_handoff_tensor = nullptr;
-  ggml_backend_buffer_t phase2_cpu_handoff_device_buf = nullptr;
-  ggml_tensor *phase2_cpu_handoff_device_tensor = nullptr;
   // Host mirrors used only by the CPU continuation.  Route/HC publication
   // buffers are CUDA-owned for GPU children; CPU MUL_MAT_ID and HC nodes must
   // receive explicit D2H materializations instead of reading those device
   // addresses through a mixed scheduler edge.
-  ggml_tensor *phase2_cpu_frozen_ffn_input_tensor = nullptr;
-  ggml_tensor *phase2_cpu_frozen_ffn_inject_tensor = nullptr;
-  ggml_tensor *phase2_cpu_route_ids_tensor = nullptr;
-  ggml_tensor *phase2_cpu_route_weights_tensor = nullptr;
   // Frozen split-layer HC/router inputs. The prefix publishes these once;
   // every Phase-2 branch aliases the same FFN input, injection vector, route
   // IDs and normalized route weights for this layer invocation.
-  ggml_backend_buffer_t phase2_ffn_input_buf = nullptr;
-  void *phase2_ffn_input_addr = nullptr;
-  ggml_tensor *phase2_ffn_input_source_tensor = nullptr;
-  ggml_tensor *phase2_ffn_residual_source_tensor = nullptr;
-  ggml_tensor *phase2_ffn_input_output_tensor = nullptr;
-  ggml_backend_buffer_t phase2_ffn_inject_buf = nullptr;
-  void *phase2_ffn_inject_addr = nullptr;
-  ggml_tensor *phase2_ffn_inject_source_tensor = nullptr;
-  ggml_tensor *phase2_ffn_inject_output_tensor = nullptr;
-  ggml_backend_buffer_t phase2_route_ids_buf = nullptr;
-  void *phase2_route_ids_addr = nullptr;
-  ggml_tensor *phase2_route_ids_source_tensor = nullptr;
-  ggml_backend_buffer_t phase2_route_weights_buf = nullptr;
-  void *phase2_route_weights_addr = nullptr;
-  ggml_tensor *phase2_route_weights_source_tensor = nullptr;
   // SplitGpu/SplitStaged write the post-FFN residual here; Tail starts from
   // this address after the conditional child has completed.
-  ggml_backend_buffer_t phase2_ffn_handoff_buf = nullptr;
-  void *phase2_ffn_handoff_addr = nullptr;
-  FullGraph *phase2_ffn_source_graph = nullptr;
-  ggml_backend_buffer_t phase2_moe_resident_buf = nullptr;
-  void *phase2_moe_resident_addr = nullptr;
-  ggml_backend_buffer_t phase2_moe_staged_buf = nullptr;
-  void *phase2_moe_staged_addr = nullptr;
-  ggml_backend_buffer_t phase2_moe_merged_buf = nullptr;
-  void *phase2_moe_merged_addr = nullptr;
-  ggml_backend_buffer_t phase2_moe_cpu_buf = nullptr;
-  void *phase2_moe_cpu_addr = nullptr;
-  FullGraph *phase2_moe_source_graph = nullptr;
   // SuffixGpu and SuffixCpu build the SAME layer range [split_layer+1,
   // n_layers) and therefore issue new_device_state_tensor() calls in an
   // IDENTICAL sequence (GDN/dense-attn/PLE classification per layer is a
@@ -1577,13 +1529,13 @@ struct FullGraph {
   // must be the SAME physical buffer, or it would silently diverge the
   // moment dispatch alternates between them. The instance built FIRST
   // (SuffixGpu) allocates for real and records each address in
-  // phase2_state_addrs, in call order; the instance built SECOND
-  // (SuffixCpu, via phase2_state_source_graph pointing at the first) replays
+  // state_addrs, in call order; the instance built SECOND
+  // (SuffixCpu, via state_source_graph pointing at the first) replays
   // that list instead of allocating its own arena slots, binding a fresh
   // leaf in ITS OWN ctx to each recorded address in turn.
-  FullGraph *phase2_state_source_graph = nullptr;
-  std::vector<void *> phase2_state_addrs;
-  size_t phase2_state_replay_cursor = 0;
+  FullGraph *state_source_graph = nullptr;
+  std::vector<void *> state_addrs;
+  size_t state_replay_cursor = 0;
   // A decode graph may borrow the recurrent/PLE state outputs of the
   // completed S>1 prefill graph directly.  The prefill scheduler remains
   // alive while those output buffers are borrowed; KV rows are left null in
@@ -1602,12 +1554,11 @@ struct FullGraph {
   // handles to the source addresses.  Unlike the state arena above, dense
   // weights are keyed by model tensor name because prefix and suffix graphs
   // do not materialize the same layer range.
-  FullGraph *phase2_dense_source_graph = nullptr;
-  std::unordered_map<std::string, void *> phase2_dense_addrs;
+  FullGraph *dense_source_graph = nullptr;
+  std::unordered_map<std::string, void *> dense_addrs;
   // Phase-2 continuations read immutable route/input outputs from the prefix
   // graph. Aliases are backed by its persistent output buffers and are
   // consumed only after the prefix has completed for this token.
-  FullGraph *phase2_route_source_graph = nullptr;
   struct CompletionPayloadBinding {
     void *gate = nullptr;
     void *up = nullptr;
@@ -1714,12 +1665,6 @@ struct FullGraph {
         host_node->cpu_runner = nullptr;
       }
     }
-    if (phase2_cold_cpu_context && phase2_cold_cpu_context->cpu_runner &&
-        phase2_cold_cpu_context->shared_cpu_threadpool) {
-      phase2_cold_cpu_context->cpu_runner->unbind_external_threadpool(
-          phase2_cold_cpu_context->shared_cpu_threadpool);
-      phase2_cold_cpu_context->cpu_runner = nullptr;
-    }
     if (stage_wait_done_event || stage_wait_start_event ||
         stage_d2d_start_event ||
         stage_d2d_end_event || stage_compute_start_event ||
@@ -1760,14 +1705,14 @@ struct FullGraph {
       ggml_backend_free(cpu);
       cpu = nullptr;
     }
-    if (device_expert_buffer && !phase2_expert_source_graph) {
+    if (device_expert_buffer && !expert_source_graph) {
       ggml_backend_buffer_free(device_expert_buffer);
     }
     device_expert_buffer = nullptr;
     device_expert_base = nullptr;
     device_expert_capacity = 0;
     device_expert_used = 0;
-    if (device_dense_buffer && !phase2_dense_source_graph) {
+    if (device_dense_buffer && !dense_source_graph) {
       ggml_backend_buffer_free(device_dense_buffer);
     }
     device_dense_buffer = nullptr;
@@ -1785,88 +1730,14 @@ struct FullGraph {
     device_expert_layers = 0;
     device_expert_partial_gate_up = false;
     split_gpu_expert_ids.clear();
-    phase2_expert_source_graph = nullptr;
-    phase2_expert_addrs.clear();
+    expert_source_graph = nullptr;
+    expert_addrs.clear();
     partial_layer_ids_out = nullptr;
     partial_layer_probs_out = nullptr;
     partial_layer_weights_out = nullptr;
-    phase2_hc_debug_tensors.clear();
-    phase2_layer3_alias_scan_done = false;
-    phase2_cuda_graph_write_scan_done = false;
-    // Only the Prefix instance owns phase2_handoff_buf (a standalone
-    // buffer, independent of ctx/sched -- see the field's own comment).
-    // Suffix instances only ever bind a leaf to it, never allocate or
-    // free it themselves.
-    if (phase2_mode == Phase2Mode::Prefix && phase2_handoff_buf) {
-      ggml_backend_buffer_free(phase2_handoff_buf);
-    }
-    phase2_handoff_buf = nullptr;
-    phase2_handoff_addr = nullptr;
-    phase2_handoff_output_tensor = nullptr;
-    phase2_cpu_handoff_tensor = nullptr;
-    if (phase2_cpu_handoff_device_buf)
-      ggml_backend_buffer_free(phase2_cpu_handoff_device_buf);
-    phase2_cpu_handoff_device_buf = nullptr;
-    phase2_cpu_handoff_device_tensor = nullptr;
-    phase2_cpu_frozen_ffn_input_tensor = nullptr;
-    phase2_cpu_frozen_ffn_inject_tensor = nullptr;
-    phase2_cpu_route_ids_tensor = nullptr;
-    phase2_cpu_route_weights_tensor = nullptr;
-    if ((phase2_mode == Phase2Mode::Prefix ||
-         phase2_mode == Phase2Mode::Route) && phase2_ffn_input_buf)
-      ggml_backend_buffer_free(phase2_ffn_input_buf);
-    phase2_ffn_input_buf = nullptr;
-    phase2_ffn_input_addr = nullptr;
-    phase2_ffn_input_source_tensor = nullptr;
-    phase2_ffn_residual_source_tensor = nullptr;
-    phase2_ffn_input_output_tensor = nullptr;
-    if ((phase2_mode == Phase2Mode::Prefix ||
-         phase2_mode == Phase2Mode::Route) && phase2_ffn_inject_buf)
-      ggml_backend_buffer_free(phase2_ffn_inject_buf);
-    phase2_ffn_inject_buf = nullptr;
-    phase2_ffn_inject_addr = nullptr;
-    phase2_ffn_inject_source_tensor = nullptr;
-    phase2_ffn_inject_output_tensor = nullptr;
-    if ((phase2_mode == Phase2Mode::Prefix ||
-         phase2_mode == Phase2Mode::Route) && phase2_route_weights_buf)
-      ggml_backend_buffer_free(phase2_route_weights_buf);
-    phase2_route_weights_buf = nullptr;
-    phase2_route_weights_addr = nullptr;
-    phase2_route_weights_source_tensor = nullptr;
-    if (phase2_mode == Phase2Mode::Route && phase2_route_ids_buf)
-      ggml_backend_buffer_free(phase2_route_ids_buf);
-    phase2_route_ids_buf = nullptr;
-    phase2_route_ids_addr = nullptr;
-    phase2_route_ids_source_tensor = nullptr;
-    if (phase2_mode == Phase2Mode::Prefix && phase2_ffn_handoff_buf)
-      ggml_backend_buffer_free(phase2_ffn_handoff_buf);
-    phase2_ffn_handoff_buf = nullptr;
-    phase2_ffn_handoff_addr = nullptr;
-    phase2_ffn_source_graph = nullptr;
-    if (phase2_mode == Phase2Mode::Prefix) {
-      if (phase2_moe_resident_buf)
-        ggml_backend_buffer_free(phase2_moe_resident_buf);
-      if (phase2_moe_staged_buf)
-        ggml_backend_buffer_free(phase2_moe_staged_buf);
-      if (phase2_moe_merged_buf)
-        ggml_backend_buffer_free(phase2_moe_merged_buf);
-      if (phase2_moe_cpu_buf)
-        ggml_backend_buffer_free(phase2_moe_cpu_buf);
-    }
-    phase2_moe_resident_buf = nullptr;
-    phase2_moe_resident_addr = nullptr;
-    phase2_moe_staged_buf = nullptr;
-    phase2_moe_staged_addr = nullptr;
-    phase2_moe_merged_buf = nullptr;
-    phase2_moe_merged_addr = nullptr;
-    phase2_moe_cpu_buf = nullptr;
-    phase2_moe_cpu_addr = nullptr;
-    phase2_moe_source_graph = nullptr;
-    phase2_mode = Phase2Mode::Off;
-    phase2_split_layer = -1;
-    phase2_state_source_graph = nullptr;
-    phase2_state_addrs.clear();
-    phase2_state_replay_cursor = 0;
+    state_source_graph = nullptr;
+    state_addrs.clear();
+    state_replay_cursor = 0;
     state_handoff_ready = false;
     prefill_host_state_deferred = false;
     decode_host_state_dirty = false;
@@ -1875,8 +1746,8 @@ struct FullGraph {
     state_handoff_buffers.clear();
     state_handoff_cursor = 0;
     state_handoff_tensors.clear();
-    phase2_dense_source_graph = nullptr;
-    phase2_dense_addrs.clear();
+    dense_source_graph = nullptr;
+    dense_addrs.clear();
     for (auto &host_node : host_node_contexts) {
       if (!host_node)
         continue;
@@ -3353,12 +3224,12 @@ ggml_tensor *resident_tensor(
     // A suffix may request a name the prefix never materialized; in that
     // case append it to the owner's pre-sized arena and record the address
     // for the remaining siblings.
-    FullGraph &owner = g.phase2_dense_source_graph
-                           ? *g.phase2_dense_source_graph
+    FullGraph &owner = g.dense_source_graph
+                           ? *g.dense_source_graph
                            : g;
-    auto existing = owner.phase2_dense_addrs.find(name);
+    auto existing = owner.dense_addrs.find(name);
     void *addr = nullptr;
-    if (existing != owner.phase2_dense_addrs.end()) {
+    if (existing != owner.dense_addrs.end()) {
       addr = existing->second;
       const ggml_status bind_status =
           ggml_backend_tensor_alloc(owner.device_dense_buffer, t, addr);
@@ -3408,7 +3279,7 @@ ggml_tensor *resident_tensor(
         return nullptr;
       }
       owner.device_dense_used = aligned + alloc_size;
-      owner.phase2_dense_addrs.emplace(name, addr);
+      owner.dense_addrs.emplace(name, addr);
     }
     ++g.device_dense_tensors;
   } else if (!bind_host(g, t, q->host_ptr, q->meta.size_bytes, usage)) {
@@ -3446,8 +3317,8 @@ bool graph_dense_weight_name(const std::string &name) {
 }
 
 bool init_device_dense_arena(FullGraph &g) {
-  if (g.phase2_dense_source_graph) {
-    FullGraph &source = *g.phase2_dense_source_graph;
+  if (g.dense_source_graph) {
+    FullGraph &source = *g.dense_source_graph;
     if (!source.device_dense_buffer || !source.device_dense_base ||
         source.device_dense_capacity == 0)
       return false;
@@ -3596,8 +3467,8 @@ ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
   // prefill handoff table deliberately contains null entries for KV tensors
   // whose decode capacity is larger than the S-token prefill allocation; such
   // entries fall through to the normal decode-state arena allocation below.
-  if (g.phase2_state_source_graph) {
-    FullGraph &src = *g.phase2_state_source_graph;
+  if (g.state_source_graph) {
+    FullGraph &src = *g.state_source_graph;
     if (src.state_handoff_ready) {
       if (g.state_handoff_cursor >= src.state_handoff_addrs.size() ||
           g.state_handoff_cursor >= src.state_handoff_buffers.size())
@@ -3617,9 +3488,9 @@ ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
       // private state arena (currently only expanded decode KV tensors).
     } else {
       if (!src.device_state_buffer ||
-          g.phase2_state_replay_cursor >= src.phase2_state_addrs.size())
+          g.state_replay_cursor >= src.state_addrs.size())
         return nullptr;
-      void *addr = src.phase2_state_addrs[g.phase2_state_replay_cursor++];
+      void *addr = src.state_addrs[g.state_replay_cursor++];
       if (ggml_backend_tensor_alloc(src.device_state_buffer, t, addr) !=
           GGML_STATUS_SUCCESS)
         return nullptr;
@@ -3648,7 +3519,7 @@ ggml_tensor *new_device_state_tensor(FullGraph &g, ggml_type type,
   // Record for a potential Phase 2 sibling built right after this one
   // (harmless no-op cost otherwise -- one pointer per call, freed with
   // the rest of this instance).
-  g.phase2_state_addrs.push_back(addr);
+  g.state_addrs.push_back(addr);
   ggml_set_name(t, name);
   return t;
 }
@@ -4291,8 +4162,8 @@ size_t device_expert_bytes(const FullGraph &g) {
 }
 
 bool init_device_expert_arena(FullGraph &g) {
-  if (g.phase2_expert_source_graph) {
-    FullGraph &source = *g.phase2_expert_source_graph;
+  if (g.expert_source_graph) {
+    FullGraph &source = *g.expert_source_graph;
     if (!source.device_expert_buffer || !source.device_expert_base ||
         source.device_expert_capacity == 0)
       return false;
@@ -4614,14 +4485,14 @@ std::string expert_ptr_text(const void *ptr) {
 // arena.
 static FullGraph *expert_arena_owner(FullGraph &g) {
   FullGraph *owner = &g;
-  for (int depth = 0; owner->phase2_expert_source_graph; ++depth) {
-    if (depth >= 16 || owner->phase2_expert_source_graph == owner) {
+  for (int depth = 0; owner->expert_source_graph; ++depth) {
+    if (depth >= 16 || owner->expert_source_graph == owner) {
       LOG_ERROR("[GGML-QWEN-FULL-ARENA-BIND-FAIL] cyclic/deep expert arena "
                 "owner chain graph=%p\n",
                 static_cast<void *>(&g));
       return nullptr;
     }
-    owner = owner->phase2_expert_source_graph;
+    owner = owner->expert_source_graph;
   }
   return owner;
 }
@@ -4665,8 +4536,8 @@ ExistingDeviceExpertBind bind_existing_device_expert(
     return ExistingDeviceExpertBind::Failed;
   FullGraph &owner = *owner_ptr;
   const std::string key = device_expert_single_key(nullptr, bytes, source_tag);
-  const auto existing = owner.phase2_expert_addrs.find(key);
-  if (existing == owner.phase2_expert_addrs.end())
+  const auto existing = owner.expert_addrs.find(key);
+  if (existing == owner.expert_addrs.end())
     return ExistingDeviceExpertBind::Missing;
   const ggml_status bind_status = ggml_backend_tensor_alloc(
       owner.device_expert_buffer, t, existing->second);
@@ -4694,8 +4565,8 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
   if (!owner_ptr || !owner_ptr->device_expert_buffer)
     return false;
   FullGraph &owner = *owner_ptr;
-  auto existing = owner.phase2_expert_addrs.find(key);
-  if (existing != owner.phase2_expert_addrs.end()) {
+  auto existing = owner.expert_addrs.find(key);
+  if (existing != owner.expert_addrs.end()) {
     *addr_out = existing->second;
     *new_allocation = false;
     const ggml_status bind_status =
@@ -4739,7 +4610,7 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
     return false;
   }
   owner.device_expert_used = aligned + alloc_size;
-  owner.phase2_expert_addrs.emplace(key, addr);
+  owner.expert_addrs.emplace(key, addr);
   *addr_out = addr;
   *new_allocation = true;
   return true;
@@ -5477,40 +5348,10 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *norm, ggml_tensor *down, ggml_tensor *up,
                     ggml_tensor *inject, ggml_tensor **inject_out,
                     int diag_layer = -1, const char *diag_tag = nullptr) {
-  const bool phase2_debug =
-      g.phase2_mode == FullGraph::Phase2Mode::Prefix &&
-      diag_layer == g.phase2_split_layer && diag_tag &&
-      std::strcmp(diag_tag, "ffn") == 0 &&
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STAGED_DEBUG");
-  if (g.phase2_mode == FullGraph::Phase2Mode::Prefix &&
-      diag_layer == g.phase2_split_layer && diag_tag &&
-      std::strcmp(diag_tag, "ffn") == 0)
-    g.phase2_ffn_residual_source_tensor = x;
-  auto capture_phase2_debug = [&](const char *name, ggml_tensor *tensor) {
-    if (!phase2_debug || !tensor)
-      return;
-    g.layer13_moe_diag_enabled = true;
-    ggml_tensor *snapshot_src = tensor;
-    if (snapshot_src->type != GGML_TYPE_F32)
-      snapshot_src = ggml_cast(ctx, snapshot_src, GGML_TYPE_F32);
-    const std::vector<int64_t> shape = {
-        snapshot_src->ne[0], snapshot_src->ne[1], snapshot_src->ne[2],
-        snapshot_src->ne[3]};
-    ggml_tensor *snapshot = layer13_moe_diag_snapshot(
-        g, ctx, snapshot_src, GGML_TYPE_F32, shape, name);
-    g.phase2_hc_debug_tensors.emplace_back(name,
-                                            snapshot ? snapshot : snapshot_src);
-  };
-  capture_phase2_debug("layer13_ffn_residual", x);
-  capture_phase2_debug("layer13_ffn_norm_weight", norm);
-  capture_phase2_debug("layer13_ffn_down_weight", down);
-  capture_phase2_debug("layer13_ffn_up_weight", up);
-  capture_phase2_debug("layer13_ffn_inject_weight", inject);
   ggml_tensor *xn =
       ggml_rms_norm(ctx, x, g.engine->model_file.architecture_config.eps);
   xn = ggml_reshape_2d(ctx, xn, g.D * g.HC, g.S);
   xn = ggml_mul(ctx, xn, norm);
-  capture_phase2_debug("layer13_ffn_normed", xn);
   if (g.two_layer_diag && diag_layer == 0 && diag_tag &&
       !std::strcmp(diag_tag, "attn")) {
     if (const char *common_path = env_two_layer_s1_common_hc_norm_path()) {
@@ -5566,7 +5407,6 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
         layer0_diag_snapshot(g, ctx, norm, weight_name.c_str()));
   }
   ggml_tensor *lo = ggml_mul_mat(ctx, down, xn);
-  capture_phase2_debug("layer13_ffn_hc_down", lo);
   if (capture_projection_diag) {
     const std::string name = std::string("qwen_layer0_split_") + diag_tag +
                              "_hc_down_raw";
@@ -5575,7 +5415,6 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
         layer0_diag_snapshot(g, ctx, lo, name.c_str()));
   }
   lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / static_cast<float>(g.HC)));
-  capture_phase2_debug("layer13_ffn_hc_down_silu", lo);
   if (g.two_layer_diag && diag_layer == 0 && diag_tag &&
       !std::strcmp(diag_tag, "attn")) {
     if (const char *common_path =
@@ -5618,7 +5457,6 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
         layer0_diag_snapshot(g, ctx, gate_logits, name.c_str()));
   }
   ggml_tensor *gate = ggml_sigmoid(ctx, gate_logits);
-  capture_phase2_debug("layer13_ffn_hc_gate", gate);
   if (capture_projection_diag) {
     const std::string name = std::string("qwen_layer0_split_") + diag_tag +
                              "_hc_gate";
@@ -5627,7 +5465,6 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
         layer0_diag_snapshot(g, ctx, gate, name.c_str()));
   }
   ggml_tensor *gated = ggml_mul(ctx, xn, gate);
-  capture_phase2_debug("layer13_ffn_hc_gated", gated);
   ggml_tensor *g3 = ggml_reshape_3d(ctx, gated, g.D, g.HC, g.S);
 
   ggml_tensor *mixed =
@@ -5640,10 +5477,8 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
     mixed = ggml_add(ctx, mixed, s);
   }
   mixed = ggml_scale(ctx, mixed, 1.0f / static_cast<float>(g.HC));
-  capture_phase2_debug("layer13_ffn_mixed", mixed);
   if (inject_out) {
     *inject_out = inject ? ggml_mul_mat(ctx, inject, xn) : nullptr;
-    capture_phase2_debug("layer13_ffn_inject", *inject_out);
     if (diag_layer >= 0 && diag_layer < 2 && diag_tag &&
         g.layer0_diag_enabled &&
         env_layer0_split_dump_path()) {
@@ -8311,44 +8146,15 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     for (size_t i = 0; i < g.gdn_state_updates.size(); ++i) {
       ggml_tensor *t = g.gdn_state_updates[i];
       if (t) {
-        // A Phase-2 suffix is submitted independently from the prefix and
-        // has no later graph node that consumes its recurrent destination in
-        // the same submission. Make the side-effect terminal explicit so
-        // GGML's scheduler/capture cannot prune the state write.
-        if (g.phase2_mode != FullGraph::Phase2Mode::Off)
-          ggml_set_output(t);
-        if (g.phase2_mode != FullGraph::Phase2Mode::Off && g.sched)
-          ggml_backend_sched_set_tensor_backend(g.sched, t, g.cuda);
         ggml_build_forward_expand(g.graph, t);
-        if (g.phase2_mode != FullGraph::Phase2Mode::Off &&
-            i < g.gdn_state_storage.size() && g.gdn_state_storage[i]) {
-          ggml_set_output(g.gdn_state_storage[i]);
-          ggml_build_forward_expand(g.graph, g.gdn_state_storage[i]);
-        }
       }
     }
     for (size_t i = 0; i < g.gdn_hist_updates.size(); ++i) {
       ggml_tensor *t = g.gdn_hist_updates[i];
       if (t) {
-        if (g.phase2_mode != FullGraph::Phase2Mode::Off)
-          ggml_set_output(t);
-        if (g.phase2_mode != FullGraph::Phase2Mode::Off && g.sched)
-          ggml_backend_sched_set_tensor_backend(g.sched, t, g.cuda);
         ggml_build_forward_expand(g.graph, t);
-        if (g.phase2_mode != FullGraph::Phase2Mode::Off &&
-            i < g.gdn_hist_storage.size() && g.gdn_hist_storage[i]) {
-          ggml_set_output(g.gdn_hist_storage[i]);
-          ggml_build_forward_expand(g.graph, g.gdn_hist_storage[i]);
-        }
       }
     }
-    if (g.ple_hist_update)
-      if (g.phase2_mode != FullGraph::Phase2Mode::Off)
-        ggml_set_output(g.ple_hist_update);
-    if (g.ple_hist_update && g.phase2_mode != FullGraph::Phase2Mode::Off &&
-        g.sched)
-      ggml_backend_sched_set_tensor_backend(g.sched, g.ple_hist_update,
-                                             g.cuda);
     if (g.ple_hist_update)
       ggml_build_forward_expand(g.graph, g.ple_hist_update);
   }
@@ -8489,21 +8295,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     const cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
     if (prev_device >= 0)
       cudaSetDevice(prev_device);
-    // A Phase-2 suffix borrows the already committed dense/expert arenas,
-    // so its only new CUDA allocation is the small scheduler activation
-    // workspace.  The measured ordinary 22-layer graph uses 0.13 GiB; keep
-    // 512 MiB of headroom for each borrowed suffix while retaining the
-    // established 1-GiB admission floor for ordinary/full graph instances.
-    const bool borrowed_phase2_suffix =
-        g.phase2_mode == FullGraph::Phase2Mode::SuffixGpu ||
-        g.phase2_mode == FullGraph::Phase2Mode::SuffixCpu ||
-        g.phase2_mode == FullGraph::Phase2Mode::SuffixStaged ||
-        g.phase2_mode == FullGraph::Phase2Mode::SplitGpu ||
-        g.phase2_mode == FullGraph::Phase2Mode::SplitStaged ||
-        g.phase2_mode == FullGraph::Phase2Mode::Tail;
-    size_t kMinGraphAllocHeadroomBytes =
-        borrowed_phase2_suffix ? 512ull * 1024ull * 1024ull
-                               : 1ull * 1024ull * 1024ull * 1024ull;
+    size_t kMinGraphAllocHeadroomBytes = 1ull * 1024ull * 1024ull * 1024ull;
     // Opt-in override of the admission floor (MiB, 64..4096). The default is
     // unchanged. The measured S=1 decode workspace is ~0.13 GiB, so a large
     // Option-B arena that leaves 0.5-1 GiB free can still build; the caller
@@ -8541,8 +8333,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       // this flag's own comment for why init_device_expert_arena's existing
       // allow_layer_clamp retry doesn't already cover it (that check runs
       // BEFORE the scheduler's own workspace is known to be needed).
-      if (err == cudaSuccess && !borrowed_phase2_suffix &&
-          g.device_expert_layers > 0)
+      if (err == cudaSuccess && g.device_expert_layers > 0)
         g_qwen4exp_build_graph_retry_smaller_expert_layers = true;
       return false;
     }
@@ -8672,7 +8463,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
            ggml_backend_sched_get_n_splits(g.sched),
            static_cast<double>(g.graph_bytes) / (1024.0 * 1024.0 * 1024.0));
   const FullGraph &dense_arena_owner =
-      g.phase2_dense_source_graph ? *g.phase2_dense_source_graph : g;
+      g.dense_source_graph ? *g.dense_source_graph : g;
   LOG_INFO(
       "[GGML-QWEN-FULL] dense device arena used=%.2f/%.2f GiB; %d tensors\n",
       static_cast<double>(dense_arena_owner.device_dense_used) /
@@ -8682,7 +8473,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       g.device_dense_tensors);
   if (g.device_expert_layers > 0) {
     const FullGraph &expert_arena_owner =
-        g.phase2_expert_source_graph ? *g.phase2_expert_source_graph : g;
+        g.expert_source_graph ? *g.expert_source_graph : g;
     const int resident_layers = device_expert_resident_layer_count(g);
     const int complete_records = resident_layers * c.n_experts;
     LOG_INFO(
@@ -8954,7 +8745,7 @@ void qwen4exp_full_graph_shutdown() {
   // as CUDA-backed as g_graph and must be reset here too, in this order
   // (suffix instances first): SuffixCpu's GDN/KV/PLE state tensors for
   // layers > split_layer are aliases into SuffixGpu's own
-  // device_state_buffer (see FullGraph::phase2_state_source_graph), so
+  // device_state_buffer (see FullGraph::state_source_graph), so
   // SuffixGpu must outlive SuffixCpu's teardown.
   g_graph.reset();
   g_graph_prefill_state_owner.reset();
@@ -8979,7 +8770,7 @@ static bool engine_plans_decode_expert_split(const StreamingEngine &engine) {
 static std::unique_ptr<FullGraph> extract_decode_arena_owner(
     FullGraph &g, StreamingEngine &engine) {
   if (!g.ready || !g.decode_mode || !g.device_expert_buffer ||
-      g.phase2_expert_source_graph || g.device_expert_capacity == 0)
+      g.expert_source_graph || g.device_expert_capacity == 0)
     return nullptr;
   auto owner = std::make_unique<FullGraph>();
   owner->engine = &engine;
@@ -8989,7 +8780,7 @@ static std::unique_ptr<FullGraph> extract_decode_arena_owner(
   owner->device_expert_base = g.device_expert_base;
   owner->device_expert_capacity = g.device_expert_capacity;
   owner->device_expert_used = g.device_expert_used;
-  owner->phase2_expert_addrs = std::move(g.phase2_expert_addrs);
+  owner->expert_addrs = std::move(g.expert_addrs);
   owner->split_gpu_expert_ids = g.split_gpu_expert_ids;
   owner->device_expert_layers = g.device_expert_layers;
   owner->device_expert_trailing = g.device_expert_trailing;
@@ -9017,7 +8808,7 @@ static size_t estimate_prefill_workspace_bytes(int S) {
 static void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
   const bool live_owned =
       g_graph && g_graph->decode_mode && g_graph->device_expert_buffer &&
-      !g_graph->phase2_expert_source_graph && g_graph->device_expert_capacity > 0;
+      !g_graph->expert_source_graph && g_graph->device_expert_capacity > 0;
   if (!g_graph_decode_arena_owner && !live_owned)
     return;
   size_t free_bytes = 0, total_bytes = 0;
@@ -9079,19 +8870,13 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   }
   const auto &c = engine.model_file.architecture_config;
   plan_partial_layer(engine);
-  const bool prefill_phase2_wanted =
-      env_partial_layer_phase2_enabled() &&
-      !engine.qwen4exp_partial_layer_phase2_disabled &&
-      engine.qwen4exp_partial_layer >= 0 &&
-      !engine.qwen4exp_partial_layer_gpu_ids.empty();
   const bool prefill_compact_arena_needed =
       (engine.qwen4exp_partial_layer >= 0 &&
        !engine.qwen4exp_partial_layer_gpu_ids.empty()) ||
       (engine.qwen4exp_gpu_stage_enabled &&
        !engine.qwen4exp_gpu_stage_layers.empty());
   const bool reuse_prefill_weight_arenas =
-      env_decode_borrow_prefill_arenas() && !prefill_phase2_wanted &&
-      !prefill_compact_arena_needed;
+      env_decode_borrow_prefill_arenas() && !prefill_compact_arena_needed;
   if (engine.qwen_ram_preload_all_experts) {
     const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
     for (int layer = 0; layer < c.n_layers; ++layer) {
@@ -9238,11 +9023,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       ggml_backend_sched_free(prefill_weight_source->sched);
       prefill_weight_source->sched = nullptr;
     }
-    g->phase2_dense_source_graph = prefill_weight_source;
+    g->dense_source_graph = prefill_weight_source;
     // A split config has no resident expert layers in the prefill graph, so the
     // owner has no expert arena to lend; borrow the dense arena only.
     if (prefill_weight_source->device_expert_buffer)
-      g->phase2_expert_source_graph = prefill_weight_source;
+      g->expert_source_graph = prefill_weight_source;
     LOG_INFO("[GGML-QWEN-FULL] reusing retained dense%s weight arenas "
              "for new prompt shape S=%d\n",
              prefill_weight_source->device_expert_buffer ? "/expert" : "", S);
@@ -9497,7 +9282,7 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
           const double arena_gib =
               static_cast<double>(owner->device_expert_capacity) /
               (1024.0 * 1024.0 * 1024.0);
-          const size_t bound = owner->phase2_expert_addrs.size();
+          const size_t bound = owner->expert_addrs.size();
           g_graph_decode_arena_owner = std::move(owner);
           LOG_INFO("[GGML-QWEN-FULL-BOOTSTRAP] prepared the per-expert split "
                    "arena (%.2f GiB, %zu bound tensors) in %.1fms, %.2f GiB "
@@ -9741,8 +9526,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // otherwise. Identical to the pre-Phase-2 body of this function in every
   // other respect (same backends/arenas/scheduler setup, same PLE/state
   // seeding), factored out only so Phase 2 can call it up to three times.
-  auto build_one = [&](FullGraph::Phase2Mode mode, int split_layer,
-                       FullGraph *state_source,
+  auto build_one = [&](FullGraph *state_source,
                        FullGraph *dense_source,
                        FullGraph *expert_source) -> std::unique_ptr<FullGraph> {
     const auto build_one_started = std::chrono::steady_clock::now();
@@ -9799,9 +9583,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                        !g->device_expert_trailing &&
                                        partial_gate_up &&
                                        partial_gate_up[0] == '1';
-    g->phase2_state_source_graph = state_source;
-    g->phase2_dense_source_graph = dense_source;
-    g->phase2_expert_source_graph = expert_source;
+    g->state_source_graph = state_source;
+    g->dense_source_graph = dense_source;
+    g->expert_source_graph = expert_source;
     plan_expert_vram_split(*g); // must run before init_device_expert_arena
     g->cuda_raw = static_cast<ggml_backend_t>(ggml_shared_backend(dev));
     g->cuda = full_graph_cuda_scheduler_backend(*g);
@@ -9849,10 +9633,9 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                        .count();
     setup_stage_started = std::chrono::steady_clock::now();
     LOG_INFO("[GGML-QWEN-FULL-DECODE] CPU backend configured with %d "
-             "threads%s (phase2_mode=%d)\n",
+             "threads%s\n",
              g->cpu_threads,
-             g->cpu_threadpool ? " (persistent threadpool)" : "",
-             static_cast<int>(mode));
+             g->cpu_threadpool ? " (persistent threadpool)" : "");
 
     // Every expert view aliases the already populated DDR graph arena, so
     // this mode has no graph-owned expert source admission or GGUF expert
@@ -9878,12 +9661,11 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
           expert_need > SIZE_MAX - kPhase2ArenaMargin ||
           free_bytes < expert_need + kPhase2ArenaMargin;
       if (insufficient && !risky_override) {
-        qwen4exp_memory_snapshot("phase2.vram_admission.declined", g->device,
+        qwen4exp_memory_snapshot("decode.vram_admission.declined", g->device,
                                  "compact_expert_arena");
-        LOG_WARN("[GGML-QWEN-FULL] declining mode=%d before expert "
+        LOG_WARN("[GGML-QWEN-FULL] declining decode graph before expert "
                  "arena allocation: free=%.3f GiB need=%.3f GiB margin="
                  "%.3f GiB status=%s\n",
-                 static_cast<int>(mode),
                  mem_status == cudaSuccess
                      ? static_cast<double>(free_bytes) /
                            (1024.0 * 1024.0 * 1024.0)
@@ -9958,32 +9740,26 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                        std::chrono::steady_clock::now() - setup_stage_started)
                        .count();
     setup_stage_started = std::chrono::steady_clock::now();
-    qwen4exp_memory_snapshot("phase2.build_graph.before", g->device,
-                             std::to_string(static_cast<int>(mode)).c_str());
+    qwen4exp_memory_snapshot("decode.build_graph.before", g->device, "");
     if (!build_graph(*g, has_ple_layer(c) ? &ple : nullptr)) {
-      qwen4exp_memory_snapshot("phase2.build_graph.failed", g->device,
-                               std::to_string(static_cast<int>(mode)).c_str());
+      qwen4exp_memory_snapshot("decode.build_graph.failed", g->device, "");
       // The plain (Phase2Mode::Off) caller retries at a smaller
       // device_expert_layers when this is set, so "layered decode remains
       // active" would be misleading here -- it only becomes true if that
       // retry loop itself gives up. Phase 2 callers never retry, so for them
       // the message is unconditionally accurate either way.
-      if (mode == FullGraph::Phase2Mode::Off &&
-          g_qwen4exp_build_graph_retry_smaller_expert_layers) {
+      if (g_qwen4exp_build_graph_retry_smaller_expert_layers) {
         LOG_WARN("[GGML-QWEN-FULL-DECODE] graph construction declined "
-                 "(phase2_mode=%d); retrying at a smaller "
+                 "retrying at a smaller "
                  "device_expert_layers before falling back to layered "
-                 "decode\n",
-                 static_cast<int>(mode));
+                 "decode\n");
       } else {
         LOG_ERROR("[GGML-QWEN-FULL-DECODE] graph construction failed "
-                  "(phase2_mode=%d); request cannot continue\n",
-                 static_cast<int>(mode));
+                  "request cannot continue\n");
       }
       return nullptr;
     }
-    qwen4exp_memory_snapshot("phase2.build_graph.after", g->device,
-                             std::to_string(static_cast<int>(mode)).c_str());
+    qwen4exp_memory_snapshot("decode.build_graph.after", g->device, "");
     graph_build_ms = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - setup_stage_started)
                          .count();
@@ -10071,10 +9847,10 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                       std::chrono::steady_clock::now() -
                                       build_one_started)
                                       .count();
-    LOG_INFO("[GGML-QWEN-FULL-DECODE-SETUP] phase2_mode=%d backend=%.1fms "
+    LOG_INFO("[GGML-QWEN-FULL-DECODE-SETUP] backend=%.1fms "
              "arenas=%.1fms scheduler=%.1fms ple=%.1fms graph=%.1fms "
              "state_seed=%.1fms total=%.1fms\n",
-             static_cast<int>(mode), cpu_setup_ms, arena_setup_ms,
+             cpu_setup_ms, arena_setup_ms,
              scheduler_setup_ms, ple_setup_ms, graph_build_ms, state_seed_ms,
              total_setup_ms);
     return g;
@@ -10114,8 +9890,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       LOG_INFO("[GGML-QWEN-FULL-DECODE] rebinding the per-expert split arena "
                "prepared at startup (no re-upload)\n");
     }
-    g = build_one(FullGraph::Phase2Mode::Off, -1,
-                  prefill_state_handoff ? prefill_state_source : nullptr,
+    g = build_one(prefill_state_handoff ? prefill_state_source : nullptr,
                   prefill_arena_source, expert_source);
     if (!g) {
       if (prefill_state_source && prefill_state_source->prefill_host_state_deferred &&
@@ -10135,7 +9910,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (!g) {
     constexpr int kMaxExpertLayerShrinkRetries = 8;
     for (int attempt = 0; attempt <= kMaxExpertLayerShrinkRetries; ++attempt) {
-      g = build_one(FullGraph::Phase2Mode::Off, -1, nullptr, nullptr, nullptr);
+      g = build_one(nullptr, nullptr, nullptr);
       if (g)
         break;
       if (!g_qwen4exp_build_graph_retry_smaller_expert_layers)
