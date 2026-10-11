@@ -212,6 +212,7 @@ int cmd_offload(int argc, char **argv) {
   std::string model, store, usage_file, prefill_file, against;
   double prefill_w = 0.0, fraction = 0.0; long count = 0; uint64_t align = 4096;
   std::set<int> layer_filter, layer_exclude; bool dry = false, verify = false; int sample = 0;
+  long expert_mod = 0, expert_rem = 0; // --expert-mod M --expert-rem R: only experts with id % M == R (one part of a store striped over M drives)
   std::vector<std::string> pos;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -221,6 +222,8 @@ int cmd_offload(int argc, char **argv) {
     else if (a == "--prefill-weight") prefill_w = atof(need("--prefill-weight"));
     else if (a == "--count") count = atol(need("--count"));
     else if (a == "--fraction") fraction = atof(need("--fraction"));
+    else if (a == "--expert-mod") expert_mod = atol(need("--expert-mod"));
+    else if (a == "--expert-rem") expert_rem = atol(need("--expert-rem"));
     else if (a == "--layers") layer_filter = parse_layers(need("--layers"));
     else if (a == "--exclude-layers") layer_exclude = parse_layers(need("--exclude-layers"));
     else if (a == "--align") align = (uint64_t)atoll(need("--align"));
@@ -237,7 +240,7 @@ int cmd_offload(int argc, char **argv) {
   }
   if (pos.size() != 2 || usage_file.empty() || (count <= 0 && fraction <= 0.0)) {
     fprintf(stderr, "Usage: gguf_tool offload <model_file_or_dir> <store.gguf> --usage-file <decode usage> [--prefill-usage-file <p>]\n"
-                    "         (--count N | --fraction F) [--layers 11-44] [--exclude-layers L,..] [--prefill-weight W] [--align 4096] [--dry-run]\n"
+                    "         (--count N | --fraction F) [--layers 11-44] [--exclude-layers L,..] [--expert-mod M --expert-rem R] [--prefill-weight W] [--align 4096] [--dry-run]\n"
                     "       gguf_tool offload --verify <store.gguf> --against <model_file_or_dir> [--sample N]\n");
     return 2;
   }
@@ -265,6 +268,7 @@ int cmd_offload(int argc, char **argv) {
   for (auto &[L, p] : layers) {
     std::vector<Cand> lc;
     for (uint64_t e = 0; e < p[0].n; ++e) {
+      if (expert_mod > 1 && (long)(e % (uint64_t)expert_mod) != expert_rem) continue;
       uint64_t d = dec.count({L, (int)e}) ? dec[{L, (int)e}] : 0, q = pre.count({L, (int)e}) ? pre[{L, (int)e}] : 0;
       lc.push_back({L, (int)e, (double)d + prefill_w * (double)q, d, 0}); total_hits += d;
     }
