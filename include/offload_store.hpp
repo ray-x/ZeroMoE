@@ -723,15 +723,28 @@ public:
   }
 
   // Load every currently resident (seeded) expert; returns how many could not be loaded (they are dropped).
+  // Reads run `par` at a time (MOESTREAM_OFFLOAD_SEED_PAR, default 8, 1 = serial) so a store striped over several drives
+  // is read by all of them at once.
   size_t populate_resident() {
     size_t failed = 0;
+    int par = 8;
+    if (const char *e = std::getenv("MOESTREAM_OFFLOAD_SEED_PAR")) par = std::max(1, std::atoi(e));
     const ExpertCache::Config &c = cache_.config();
-    for (int L = c.first_layer; L < c.first_layer + c.n_layers; ++L)
+    std::vector<int> batch;
+    for (int L = c.first_layer; L < c.first_layer + c.n_layers; ++L) {
+      batch.clear();
       for (int E = 0; E < c.n_experts; ++E)
-        if (cache_.resident({L, E})) {
-          if (load(L, E)) arena_.populated(L, E);
-          else { cache_.erase({L, E}); ++failed; }
+        if (cache_.resident({L, E})) batch.push_back(E);
+      for (size_t i = 0; i < batch.size(); i += static_cast<size_t>(par)) {
+        const std::vector<int> chunk(batch.begin() + static_cast<std::ptrdiff_t>(i),
+                                     batch.begin() + static_cast<std::ptrdiff_t>(std::min(batch.size(), i + static_cast<size_t>(par))));
+        const std::vector<char> ok = load_many(L, chunk);
+        for (size_t k = 0; k < chunk.size(); ++k) {
+          if (ok[k]) arena_.populated(L, chunk[k]);
+          else { cache_.erase({L, chunk[k]}); ++failed; }
         }
+      }
+    }
     return failed;
   }
 

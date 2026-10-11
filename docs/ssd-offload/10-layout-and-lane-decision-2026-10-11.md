@@ -85,3 +85,23 @@ per-layer pool (`vram_layer_base`, `vram_slot_stride`), so promotion would have 
   where misses are already gone, while every promotion costs a ~6.6 MB H2D plus a bounce copy.
 
 Not implemented. If it is ever picked up, start with the topology retarget operation and a unit test for it, then reuse the existing scheduler.
+
+## 7. Parallel boot seeding (2026-10-11)
+`ExpertResidency::populate_resident()` read the seeded experts one at a time, so on a striped store one NVMe idled at boot. It now keeps
+`MOESTREAM_OFFLOAD_SEED_PAR` reads in flight (default 8; 1 = the old serial behaviour), a chunk of one layer at a time through `load_many`.
+
+Striped store, DDR 32 GiB, 5,215 seeded experts, same 5-round / 475-token traffic (`glm_runs/run_seed_queue.sh`, alternating arms):
+
+| arm | seeding time | demand loads | decode ms/token (rounds 0-4) |
+|---|---|---|---|
+| SEED_PAR=1 (a) | 18.5 s | 14,639 | 184.5 / 205.0 / 208.4 / 170.3 / 227.5 |
+| SEED_PAR=1 (b) | 12.5 s | 14,639 | 177.1 / 198.5 / 203.1 / 170.4 / 225.7 |
+| SEED_PAR=8 (a) | **6.5 s** | 14,639 | 177.5 / 199.5 / 204.7 / 171.3 / 226.9 |
+| SEED_PAR=8 (b) | not finished when this was written | | |
+
+* Seeding is 2-3x faster (6.5 s vs 12.5-18.5 s; the serial arm itself varies by 6 s between runs, so the gain is quoted as a range,
+  one parallel sample so far). It only moves boot time; decode is unchanged, as expected.
+* Output is identical: the serial and parallel stdout differ only in the config path and available-RAM lines; demand loads and per-round
+  loads match exactly.
+* Unit tests: tests/test_expert_dram_cache.cpp, 1,017,845 checks, 0 failed, with SEED_PAR=8 and 1.
+* Cost: up to 8 reader threads at boot; no extra resident memory.
