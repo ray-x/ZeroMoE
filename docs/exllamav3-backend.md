@@ -887,3 +887,33 @@ remains 26.86 tok/s for whole-layer placement, 4.1% short of 28; the 4bpw
 pack clears 28 only with the static per-layer expert split above. CPU expert gate/up GEMV remains the primary
 optimization target for the 4bpw pack. Resume Q2_0 comparisons after the EXL3
 performance work is complete.
+
+## Upstream ExLlamaV3 kernels for the in-graph EXL3 path (no libtorch)
+
+The native EXL3 path (`exl3_gpu`, the GGML custom-op bridge) can run on
+ExLlamaV3's own CUDA kernels instead of `cuda/exl3_matmul.cu`:
+
+```bash
+cmake -S . -B build_ggmlcuda \
+    -DMOESTREAM_EXLLAMAV3_SRC=/home/ray/Projects/exllamav3/exllamav3/exllamav3_ext
+```
+
+- Upstream `exl3_gemm` / `exl3_gemv` / `exl3_moe_coop` are compiled unmodified
+  as `moestream_exl3_upstream`. `third_party/exl3_torch_stub` stands in for the
+  few ATen/c10 symbols their launchers use; libtorch is not required.
+- `src/exl3_upstream_ops.cu` implements the `launch_exl3_mul1_*` contract on
+  `exl3_gemm`, and the external routed FFN on `exl3_moe_coop` (two launches per
+  layer for up to 8 rows / 256 route slots; larger or mixed-bit shapes fall
+  back to the legacy kernels).
+- Runtime switch: `MOESTREAM_EXL3_UPSTREAM=0` forces the legacy kernels.
+  Upstream also defaults to an int8-activation GEMV for one row and K <= 5 on
+  Ampere; `EXL3_INT8_GEMV=0` disables it.
+- Upstream kernels take fp16 activations, so per-layer parity against the fp32
+  CPU reference is checked at a wider relative bound (2e-2 of the output peak).
+- Synthetic kernel parity (no model): `tests/exl3_upstream` (standalone CMake
+  project) builds `exl3_upstream_parity`.
+- Measured on the external-routed bench (topk=10, shared 3090): 323 -> 132 us
+  at one row and 1115 -> 436 us at four rows. End-to-end decode and full-model
+  logits parity are not yet measured.
+- Timings in `exl3-wait-policy-2026-10-05.md` predate this and used the legacy
+  kernels.
