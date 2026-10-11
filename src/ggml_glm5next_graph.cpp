@@ -14,6 +14,7 @@
 #include "direct_io.hpp"
 #include "engine.hpp"
 #include "expert_cache.hpp"
+#include "expert_store.hpp"
 #include "offload_store.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -623,61 +624,20 @@ struct OffloadSite {
   int layer = 0;
   bool prefill = false;
 };
+// The GLM graph's view of the DDR expert tier: the tier itself is
+// moestream::offload::ExpertStore; this adds the per-site records the miss
+// nodes point at and short aliases for the store's parts.
 struct OffloadState {
   int first = 0, n_layers = 0, n_experts = 0;
-  std::unique_ptr<moestream::offload::ExpertCache> cache;
-  std::unique_ptr<moestream::offload::VirtualArena> arena;
-  moestream::offload::OffloadStore store;
-  moestream::offload::ModelReader model;
-  std::unique_ptr<moestream::offload::ExpertResidency> residency;
+  std::unique_ptr<moestream::offload::ExpertStore> store;
+  moestream::offload::ExpertCache *cache = nullptr;
+  moestream::offload::VirtualArena *arena = nullptr;
+  moestream::offload::ExpertResidency *residency = nullptr;
   std::deque<OffloadSite> sites;
-  // Pinned (cudaHostRegister) expert slots, so the pilot-staging DMA reads DDR directly instead of through a CPU bounce copy.
-  bool pin_slots = false;
-  std::vector<uint8_t> pinned; // [(layer - first) * n_experts + expert]
-  std::atomic<uint64_t> pin_calls{0}, pin_fail{0};
-  void pin_expert(int layer, int expert) {
-    uint8_t &f = pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert];
-    if (f)
-      return;
-    int ok = 0;
-    for (int k = 0; k < 3; ++k)
-      if (cudaHostRegister(arena->ptr(layer, expert, k), (size_t)arena->plane_bytes(layer, k), cudaHostRegisterPortable) == cudaSuccess)
-        ++ok;
-      else
-        cudaGetLastError();
-    if (ok == 3) {
-      f = 1;
-      pin_calls.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      pin_fail.fetch_add(1, std::memory_order_relaxed);
-      for (int k = 0; k < ok; ++k)
-        cudaHostUnregister(arena->ptr(layer, expert, k)); // partially registered: undo (the unregistered plane is the failed one)
-    }
-  }
-  void unpin_expert(int layer, int expert) {
-    uint8_t &f = pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert];
-    if (!f)
-      return;
-    for (int k = 0; k < 3; ++k)
-      cudaHostUnregister(arena->ptr(layer, expert, k));
-    f = 0;
-  }
-  bool is_pinned(int layer, int expert) const {
-    return pin_slots && pinned[(size_t)(layer - first) * (size_t)n_experts + (size_t)expert] != 0;
-  }
-  ~OffloadState() {
-    if (pin_slots && arena)
-      for (int l = first; l < first + n_layers; ++l)
-        for (int e = 0; e < n_experts; ++e)
-          unpin_expert(l, e);
-  }
-  std::atomic<uint64_t> calls{0}, routes{0}, misses{0}, loads{0}, evictions{0},
-      errors{0}, load_us{0}, transient_loads{0}, cb_us{0}, cold_routes{0};
-  std::atomic<uint64_t> last_report_calls{0};
+  bool is_pinned(int layer, int expert) const { return store->is_pinned(layer, expert); }
 };
 std::unique_ptr<OffloadState> g_offload;
 std::mutex g_offload_mutex;
-std::shared_mutex g_arena_mu; // exclusive: cache eviction/loads (miss nodes); shared: the pilot-staging worker reading arena slots
 // MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
@@ -686,21 +646,6 @@ bool offload_async() {
     return v && v[0] == '1';
   }();
   return on;
-}
-// Run `ensure` for one layer, with or without the lock held across the reads.
-moestream::offload::ExpertResidency::Ensure
-offload_ensure(moestream::offload::ExpertResidency &res, int layer, const int32_t *ids, int n,
-               moestream::offload::ExpertCache::Kind kind) {
-  if (!offload_async()) {
-    std::unique_lock<std::shared_mutex> lock(g_arena_mu);
-    return res.ensure(layer, ids, n, kind);
-  }
-  moestream::offload::ExpertResidency::Plan p;
-  {
-    std::unique_lock<std::shared_mutex> lock(g_arena_mu);
-    p = res.begin(layer, ids, n, kind);
-  }
-  return res.finish(p, [] { return std::unique_lock<std::shared_mutex>(g_arena_mu); });
 }
 
 int offload_first_layer() {
@@ -719,30 +664,6 @@ std::string offload_env(const char *name, const char *dflt = "") {
   return v && v[0] ? v : dflt;
 }
 
-void offload_report(OffloadState &o, const char *why) {
-  LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s: calls=%llu routes=%llu misses=%llu "
-           "loads=%llu transient=%llu evictions=%llu errors=%llu load=%.1f ms "
-           "callback=%.1f ms cold_routes=%llu\n",
-           why, (unsigned long long)o.calls.load(),
-           (unsigned long long)o.routes.load(),
-           (unsigned long long)o.misses.load(),
-           (unsigned long long)o.loads.load(),
-           (unsigned long long)o.transient_loads.load(),
-           (unsigned long long)o.evictions.load(),
-           (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
-           o.cb_us.load() / 1000.0, (unsigned long long)o.cold_routes.load());
-  if (o.residency && offload_async())
-    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s async: demand lookups that waited on an in-flight read=%llu wait=%.1f ms\n", why,
-             (unsigned long long)o.residency->waited_experts(), o.residency->wait_ms());
-  if (o.cache && o.cache->config().policy == moestream::offload::ExpertCache::Policy::SegmentedLru) {
-    const auto &st = o.cache->stats();
-    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] %s segmented: prefetch_inserts=%llu promotions=%llu "
-             "prefetch_evicted_unused=%llu probation=%zu/%zu\n",
-             why, (unsigned long long)st.prefetch_inserts, (unsigned long long)st.promotions,
-             (unsigned long long)st.prefetch_evicted_unused, o.cache->probation_used(), o.cache->used());
-  }
-}
-
 // Created on first use and shared by the prompt and decode graphs.
 OffloadState *get_offload(const StreamingEngine &engine,
                           const std::vector<PartialExpertLayer> *partial = nullptr) {
@@ -758,8 +679,11 @@ OffloadState *get_offload(const StreamingEngine &engine,
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] bad first layer %d\n", o->first);
     return nullptr;
   }
-  std::vector<std::array<uint64_t, 3>> planes;
-  uint64_t expert_bytes_sum = 0;
+  moestream::offload::ExpertStoreConfig sc;
+  sc.first_layer = o->first;
+  sc.n_layers = o->n_layers;
+  sc.n_experts = o->n_experts;
+  sc.log_tag = "[GGML-GLM5NEXT-OFFLOAD]";
   for (int l = o->first; l < c.n_layers; ++l) {
     std::array<uint64_t, 3> pb{};
     int k = 0;
@@ -779,30 +703,12 @@ OffloadState *get_offload(const StreamingEngine &engine,
                   l, stem, (unsigned long long)pb[(size_t)k]);
         return nullptr;
       }
-      expert_bytes_sum += pb[(size_t)k];
       ++k;
     }
-    planes.push_back(pb);
+    sc.plane_bytes.push_back(pb);
   }
-  o->arena = std::make_unique<moestream::offload::VirtualArena>(
-      o->first, o->n_layers, o->n_experts, planes,
-      /*no_huge_pages=*/offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") != "1");
-  if (!o->arena->ok()) {
-    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] virtual arena mmap failed\n");
-    return nullptr;
-  }
-
-  std::string err;
-  std::vector<moestream::offload::ExpertSource *> sources;
-  const std::string store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
-  if (!store_path.empty()) {
-    if (o->store.open(store_path, &err))
-      sources.push_back(&o->store);
-    else
-      LOG_WARN("[GGML-GLM5NEXT-OFFLOAD] store %s unusable (%s); model only\n",
-               store_path.c_str(), err.c_str());
-  }
-  std::vector<std::string> shards;
+  sc.huge_pages = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") == "1";
+  sc.store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
   {
     const std::string first_shard = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
     if (first_shard.empty()) {
@@ -812,61 +718,48 @@ OffloadState *get_offload(const StreamingEngine &engine,
     }
     const size_t pos = first_shard.rfind("-00001-of-");
     if (pos == std::string::npos) {
-      shards.push_back(first_shard);
+      sc.model_shards.push_back(first_shard);
     } else {
       const std::string head = first_shard.substr(0, pos);
       const int total = std::atoi(first_shard.c_str() + pos + 10);
       char buf[64];
       for (int i = 1; i <= std::max(1, total); ++i) {
         std::snprintf(buf, sizeof buf, "-%05d-of-%05d.gguf", i, total);
-        shards.push_back(head + buf);
+        sc.model_shards.push_back(head + buf);
       }
     }
   }
-  if (!o->model.open(shards, &err)) {
-    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] model reader: %s\n", err.c_str());
-    return nullptr;
-  }
-  sources.push_back(&o->model);
-
-  moestream::offload::ExpertCache::Config cc;
-  cc.first_layer = o->first;
-  cc.n_layers = o->n_layers;
-  cc.n_experts = o->n_experts;
-  const double ddr_gib =
+  sc.ddr_gib =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "40").c_str());
-  cc.capacity = (size_t)(ddr_gib * 1024.0 * 1024.0 * 1024.0 /
-                         ((double)expert_bytes_sum / (double)o->n_layers));
-  cc.policy = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg"
+  sc.policy = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg"
                   ? moestream::offload::ExpertCache::Policy::SegmentedLru
                   : moestream::offload::ExpertCache::Policy::Lru;
-  cc.pinned_fraction =
+  sc.pinned_fraction =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PINNED", "0.5").c_str());
-  cc.probation_fraction =
+  sc.probation_fraction =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION", "0.25").c_str());
-  if (offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1") {
-    // Weigh every entry by its real per-layer size instead of the average (layers can differ in quant type).
-    cc.layer_bytes.clear();
-    for (const auto &pb : planes)
-      cc.layer_bytes.push_back(pb[0] + pb[1] + pb[2]);
-    cc.capacity = (size_t)(ddr_gib * 1024.0 * 1024.0 * 1024.0);
-  }
-  o->cache = std::make_unique<moestream::offload::ExpertCache>(cc);
-  o->residency = std::make_unique<moestream::offload::ExpertResidency>(
-      *o->cache, *o->arena, sources);
-
+  sc.byte_capacity = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1";
+  sc.async_loads = offload_async();
   if (pilot_stage_k() > 0 && offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", "0") == "1") {
-    o->pin_slots = true;
-    o->pinned.assign((size_t)o->n_layers * (size_t)o->n_experts, 0);
-    OffloadState *op = o.get();
-    // Register only the cache's never-evicted experts: they are registered once at load and never unregistered, so there is no
-    // register/unregister churn (~0.4 ms per expert) on the LRU half. Those experts keep the bounce path.
-    o->arena->after_populate = [op](int l, int e) {
-      if (op->cache && op->cache->pinned({l, e}))
-        op->pin_expert(l, e);
+    sc.pin_fn = [](void *ptr, size_t bytes) {
+      if (cudaHostRegister(ptr, bytes, cudaHostRegisterPortable) == cudaSuccess)
+        return true;
+      cudaGetLastError();
+      return false;
     };
-    o->arena->before_evict = [op](int l, int e) { op->unpin_expert(l, e); };
+    sc.unpin_fn = [](void *ptr) { cudaHostUnregister(ptr); };
   }
+
+  std::string err;
+  o->store = moestream::offload::ExpertStore::create(sc, &err);
+  if (!o->store) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s\n", err.c_str());
+    return nullptr;
+  }
+  o->cache = &o->store->cache();
+  o->arena = &o->store->arena();
+  o->residency = &o->store->residency();
+
   const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
   if (!usage.empty()) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -895,21 +788,21 @@ OffloadState *get_offload(const StreamingEngine &engine,
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] excluded %zu VRAM-hot experts from the "
                "DDR seed\n", n_hot);
     }
-    o->cache->seed(ranked);
-    const size_t failed = o->residency->populate_resident();
-    if (o->pin_slots)
+    const size_t failed = o->store->seed(ranked);
+    if (o->store->pinning())
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] pinned %llu experts (%llu failed) for direct DMA\n",
-               (unsigned long long)o->pin_calls.load(), (unsigned long long)o->pin_fail.load());
+               (unsigned long long)o->store->pin_calls(), (unsigned long long)o->store->pin_failures());
     LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] seeded %zu/%zu experts (%zu failed) in "
              "%.1f s\n",
-             o->cache->size(), cc.capacity, failed,
+             o->cache->size(), o->store->capacity(), failed,
              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
                  .count());
   }
   LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] layers %d..%d, capacity %zu experts "
            "(%.1f GiB), pinned %.2f, store=%s\n",
-           o->first, c.n_layers - 1, cc.capacity, ddr_gib, cc.pinned_fraction,
-           store_path.empty() ? "<none>" : store_path.c_str());
+           o->first, c.n_layers - 1, o->store->capacity(), sc.ddr_gib,
+           sc.pinned_fraction,
+           sc.store_path.empty() ? "<none>" : sc.store_path.c_str());
   g_offload = std::move(o);
   return g_offload.get();
 }
@@ -936,39 +829,38 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                  (long long)a->ne[1], k);
   moestream::offload::ExpertResidency::Ensure r;
   if (site->prefill) {
-    std::unique_lock<std::shared_mutex> arena_lock(g_arena_mu);
-    r = o.residency->ensure_transient(site->layer, ids.data(), (int)ids.size());
+    r = o.store->ensure_transient(site->layer, ids.data(), (int)ids.size());
   } else {
-    r = offload_ensure(*o.residency, site->layer, ids.data(), (int)ids.size(),
-                       moestream::offload::ExpertCache::Kind::Demand);
+    r = o.store->ensure(site->layer, ids.data(), (int)ids.size(),
+                        moestream::offload::ExpertCache::Kind::Demand);
   }
-  o.calls.fetch_add(1, std::memory_order_relaxed);
-  o.routes.fetch_add(ids.size(), std::memory_order_relaxed);
-  o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }),
+  o.store->counters().calls.fetch_add(1, std::memory_order_relaxed);
+  o.store->counters().routes.fetch_add(ids.size(), std::memory_order_relaxed);
+  o.store->counters().cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }),
                           std::memory_order_relaxed);
-  o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
-  o.loads.fetch_add((uint64_t)(site->prefill ? 0 : r.loads),
+  o.store->counters().misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+  o.store->counters().loads.fetch_add((uint64_t)(site->prefill ? 0 : r.loads),
                     std::memory_order_relaxed);
-  o.transient_loads.fetch_add((uint64_t)(site->prefill ? r.loads : 0),
+  o.store->counters().transient_loads.fetch_add((uint64_t)(site->prefill ? r.loads : 0),
                               std::memory_order_relaxed);
-  o.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
-  o.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+  o.store->counters().evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+  o.store->counters().load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
   if (r.errors > 0) {
-    o.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+    o.store->counters().errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); "
               "aborting rather than computing with missing experts\n",
               site->layer, r.errors);
-    offload_report(o, "fatal");
+    o.store->report("fatal");
     std::abort();
   }
   // dst has the shape of `a` but is contiguous.
   std::memcpy(dst->data, ids.data(), ids.size() * sizeof(int32_t));
-  o.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+  o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
-  if (!site->prefill && o.calls.load() - o.last_report_calls.load() >= 544) {
-    o.last_report_calls.store(o.calls.load());
-    offload_report(o, "progress");
+  if (!site->prefill && o.store->counters().calls.load() - o.store->counters().last_report_calls.load() >= 544) {
+    o.store->counters().last_report_calls.store(o.store->counters().calls.load());
+    o.store->report("progress");
   }
 }
 
@@ -1186,7 +1078,7 @@ void stage_worker_main(StageRuntime *st) {
       int32_t missing[8];
       int nm = 0;
       {
-        std::shared_lock<std::shared_mutex> arena_lock(g_arena_mu);
+        auto arena_lock = o->store->reader_lock();
         for (int j = 0; j < job.n; ++j) {
           const int id = job.ids[j];
           if (id >= 0 && id < o->n_experts && !o->cache->resident({job.layer, id}))
@@ -1196,8 +1088,8 @@ void stage_worker_main(StageRuntime *st) {
       if (nm > 0) {
         const auto t0 = std::chrono::steady_clock::now();
         const moestream::offload::ExpertResidency::Ensure r =
-            offload_ensure(*o->residency, job.layer, missing, nm,
-                           moestream::offload::ExpertCache::Kind::Prefetch);
+            o->store->ensure(job.layer, missing, nm,
+                             moestream::offload::ExpertCache::Kind::Prefetch);
         st->prefetch_loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
         st->prefetch_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
                                   std::memory_order_relaxed);
@@ -1208,7 +1100,7 @@ void stage_worker_main(StageRuntime *st) {
     if (!pilot_copy_on())
       continue;
     if (o) {
-      std::shared_lock<std::shared_mutex> arena_lock(g_arena_mu);
+      auto arena_lock = o->store->reader_lock();
       int chosen[8] = {};
       for (int j = 0; j < job.n && staged < st->K; ++j) {
         const int id = job.ids[j];
@@ -1416,23 +1308,23 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   st->staged_routes.fetch_add(hit, std::memory_order_relaxed);
   st->routes_seen.fetch_add((uint64_t)n, std::memory_order_relaxed);
   const moestream::offload::ExpertResidency::Ensure r =
-      offload_ensure(*o.residency, site->layer, ids.data(), n, moestream::offload::ExpertCache::Kind::Demand);
-  o.calls.fetch_add(1, std::memory_order_relaxed);
-  o.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
-  o.cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
-  o.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
-  o.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
-  o.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
-  o.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+      o.store->ensure(site->layer, ids.data(), n, moestream::offload::ExpertCache::Kind::Demand);
+  o.store->counters().calls.fetch_add(1, std::memory_order_relaxed);
+  o.store->counters().routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
+  o.store->counters().cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
+  o.store->counters().misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+  o.store->counters().loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
+  o.store->counters().evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+  o.store->counters().load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
   if (r.errors > 0) {
-    o.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+    o.store->counters().errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting\n", site->layer, r.errors);
-    offload_report(o, "fatal");
+    o.store->report("fatal");
     std::abort();
   }
   if (site->next_layer >= 0)
     stage_post_job(st, site->next_layer, site->next_set, c);
-  o.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
+  o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
   const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
   if (rs % 4704 == 0)
@@ -1458,9 +1350,9 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
     }
     LOG_INFO("[GGML-GLM5NEXT-STAGE] %s\n[GGML-GLM5NEXT-STAGE] %s\n", pr.c_str(), ps.c_str());
   }
-  if (o.calls.load() - o.last_report_calls.load() >= 544) {
-    o.last_report_calls.store(o.calls.load());
-    offload_report(o, "progress");
+  if (o.store->counters().calls.load() - o.store->counters().last_report_calls.load() >= 544) {
+    o.store->counters().last_report_calls.store(o.store->counters().calls.load());
+    o.store->report("progress");
   }
 }
 
