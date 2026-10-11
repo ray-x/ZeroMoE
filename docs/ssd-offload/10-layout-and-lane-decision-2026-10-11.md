@@ -52,4 +52,7 @@ Identical traffic in every arm (14,639 demand loads); outputs identical to the o
 
 Three quarters of the reads in the original setup were buffered per-plane reads of the main GGUF (the cold store only covers 3,173 experts).
 One direct read per expert recovers 4.4%; spreading the store over both NVMes (6.7 GB/s aggregate vs 3.1) recovers another 6.8%.
-Pending in the same queue: interleaved model with the default cold store (aligned-only) and a repeat of the original arm.
+Controls from the same queue: a repeat of the original arm gave 234.1 ms/token (run-to-run spread about 2%), and the interleaved
+(4 KiB-aligned) model with the default cold store, whose remaining reads are still buffered, gave 243.1 ms: alignment of the model file
+alone buys nothing while the model reader uses buffered per-plane preads (14,753 buffered reads); the gain comes from reading each expert
+with one direct preadv from a store that covers every expert, and from spreading that store over both NVMes.
