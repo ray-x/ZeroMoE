@@ -56,3 +56,16 @@ Controls from the same queue: a repeat of the original arm gave 234.1 ms/token b
 (4 KiB-aligned) model with the default cold store, whose remaining reads are still buffered, gave 243.1 ms: alignment of the model file
 alone buys nothing while the model reader uses buffered per-plane preads (14,753 buffered reads); the gain comes from reading each expert
 with one direct preadv from a store that covers every expert, and from spreading that store over both NVMes.
+
+## 5. Pool size (striped store, async lru, no prefetch, same 5 rounds / 475 tokens, outputs identical)
+| DDR MoE pool | pool experts | machine | demand loads | miss-node load time | ms/token | tok/s |
+|---|---|---|---|---|---|---|
+| 32 GiB | 5,215 (43% of 12,096) | any | 14,639 | 32.4 s | 204.7 | 4.89 |
+| 46 GiB | 7,497 (62%) | cgroup 64G (RSS = pool + ~17 GiB) | 4,838 | 10.5 s | **149.1** | **6.71** |
+| 58 GiB | 9,453 (78%) | cgroup 100G | 179 | 1.1 s | **125.1** | **7.99** |
+A 64 GiB machine fits a pool of about 46 GiB: 14,639 -> 4,838 demand loads and -27% ms/token. 58 GiB would need a ~75 GiB machine (host_ram_gb is the process-wide
+host cap: 2 and 6 GiB refuse the dense tensors and produce empty outputs; 16 GiB works). At 58 GiB almost every miss is gone; the remaining 125 ms/token
+is CPU cold-expert compute and the graph, which prefetch and read layout cannot touch.
+
+Dynamic VRAM promotion (MOESTREAM_GLM5NEXT_DYNAMIC_CACHE, DYNAMIC_HEAT) is a no-op in this configuration: the aliased-VRAM path hard-sets
+dynamic_expert_cache=false, so those arms (196.5-198 ms) are run-to-run noise (about 4%).
