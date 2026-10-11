@@ -4351,6 +4351,23 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
         queued = state.queue.size() + (state.active ? 1 : 0);
       }
       const size_t queue_limit = (size_t)std::max(2, budget * 2);
+      if (pos_base % 64 == 0) {
+        // Why nothing gets promoted: tally the per-layer gates once in a while.
+        int no_hot = 0, no_cold = 0, bad_vec = 0, no_cand = 0, ok = 0;
+        for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
+          const PartialExpertLayer &p = g.partial_experts[(size_t)layer];
+          if (p.hot.empty()) { ++no_hot; continue; }
+          if (p.cold.empty()) { ++no_cold; continue; }
+          if (p.slot_last_use.size() != p.hot.size() || p.slot_in_flight.size() != p.hot.size() ||
+              p.miss_count.size() != (size_t)c.n_experts || p.expert_in_flight.size() != (size_t)c.n_experts) { ++bad_vec; continue; }
+          bool cand = false;
+          for (int expert : p.cold)
+            if (expert >= 0 && expert < c.n_experts && p.miss_count[(size_t)expert] > 1) { cand = true; break; }
+          cand ? ++ok : ++no_cand;
+        }
+        LOG_INFO("[GGML-GLM5NEXT-CACHE] dynamic gates pos=%d budget=%d queued=%zu: layers without hot=%d, without cold=%d, bad vectors=%d, "
+                 "no candidate=%d, candidate available=%d\n", pos_base, budget, queued, no_hot, no_cold, bad_vec, no_cand, ok);
+      }
       for (int layer = c.first_dense;
            layer < c.n_layers && scheduled < budget &&
            queued < queue_limit;
