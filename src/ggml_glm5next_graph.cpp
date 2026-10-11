@@ -117,6 +117,8 @@ struct PartialExpertLayer {
   size_t vram_slot_stride = 0;
   std::vector<int> slot_last_use;
   std::vector<uint32_t> miss_count;
+  std::vector<float> heat;        // decayed re-reference score of each cold expert (MOESTREAM_GLM5NEXT_DYNAMIC_HEAT)
+  std::vector<uint64_t> heat_at;  // token clock of the last heat update
   std::vector<uint8_t> slot_in_flight;
   std::vector<uint8_t> expert_in_flight;
   uint64_t route_count = 0;
@@ -2829,6 +2831,8 @@ bool configure_vram_reference_experts(FullGraph &g) {
     p.slot_last_use.assign(p.hot.size(), 0);
     p.slot_in_flight.assign(p.hot.size(), 0);
     p.miss_count.assign((size_t)c.n_experts, 0);
+    p.heat.assign((size_t)c.n_experts, 0.0f);
+    p.heat_at.assign((size_t)c.n_experts, 0);
     p.expert_in_flight.assign((size_t)c.n_experts, 0);
   }
 
@@ -2971,6 +2975,8 @@ bool configure_partial_experts_base(FullGraph &g) {
     p.slot_last_use.assign(p.hot.size(), 0);
     p.slot_in_flight.assign(p.hot.size(), 0);
     p.miss_count.assign((size_t)c.n_experts, 0);
+    p.heat.assign((size_t)c.n_experts, 0.0f);
+    p.heat_at.assign((size_t)c.n_experts, 0);
     p.expert_in_flight.assign((size_t)c.n_experts, 0);
     for (size_t slot = 0; slot < p.hot.size(); ++slot) {
       const int expert = p.hot[slot];
@@ -4180,6 +4186,32 @@ void route_tap_flush(RouteTap &t) {
   std::fclose(f);
 }
 
+// MOESTREAM_GLM5NEXT_DYNAMIC_HEAT=theta (> 0): promote a cold expert into VRAM only when its decayed re-reference score (+1 per route,
+// halved every DYNAMIC_HEAT_HALFLIFE tokens, default 30) is >= theta, instead of the cumulative "missed twice" rule. Admission by reuse:
+// an upload costs about one CPU compute, so it only pays for experts that come back.
+float dynamic_heat_threshold() {
+  static const float v = [] {
+    const char *e = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_HEAT");
+    return e && e[0] ? (float)std::atof(e) : 0.0f;
+  }();
+  return v;
+}
+float dynamic_heat_halflife() {
+  static const float v = [] {
+    const char *e = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE");
+    const float h = e && e[0] ? (float)std::atof(e) : 30.0f;
+    return h > 0.5f ? h : 30.0f;
+  }();
+  return v;
+}
+float decayed_heat(const PartialExpertLayer &p, int expert, uint64_t clock) {
+  const float h = p.heat[(size_t)expert];
+  if (h <= 0.0f)
+    return 0.0f;
+  const float dt = (float)(clock - std::min<uint64_t>(clock, p.heat_at[(size_t)expert]));
+  return h * std::exp2(-dt / dynamic_heat_halflife());
+}
+
 void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
   if (!g.partial_expert_residency || g.moe_route_ids.empty())
     return;
@@ -4229,6 +4261,10 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
       } else if ((size_t)expert < p.miss_count.size() &&
                  p.miss_count[(size_t)expert] < UINT32_MAX) {
         ++p.miss_count[(size_t)expert];
+        if ((size_t)expert < p.heat.size()) {
+          p.heat[(size_t)expert] = decayed_heat(p, expert, clock) + 1.0f;
+          p.heat_at[(size_t)expert] = clock;
+        }
       }
     }
   }
@@ -4328,11 +4364,20 @@ void update_partial_routes(FullGraph &g, int pos_base, double compute_ms) {
           continue;
         int candidate_index = -1;
         uint32_t candidate_hits = 1; // Ignore one-off routes.
+        float best_heat = 0.0f;
         for (size_t i = 0; i < p.cold.size(); ++i) {
           const int expert = p.cold[i];
           if (expert < 0 || expert >= c.n_experts ||
               p.expert_in_flight[(size_t)expert])
             continue;
+          if (dynamic_heat_threshold() > 0.0f && p.heat.size() == (size_t)c.n_experts) {
+            const float h = decayed_heat(p, expert, g.dynamic_clock);
+            if (h >= dynamic_heat_threshold() && h > best_heat) {
+              best_heat = h;
+              candidate_index = (int)i;
+            }
+            continue;
+          }
           const uint32_t hits = p.miss_count[(size_t)expert];
           if (hits > candidate_hits) {
             candidate_hits = hits;
