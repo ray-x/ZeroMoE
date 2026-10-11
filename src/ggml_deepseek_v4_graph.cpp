@@ -22,15 +22,13 @@ namespace glm5next_graph {
 
 bool dsv4_env_enabled() {
   static const bool enabled = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V4_FULL_GRAPH");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V4_FULL_GRAPH");
   }();
   return enabled;
 }
 
 bool dsv4_graph_diagnostic_enabled() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V4_GRAPH_DIAGNOSTIC");
-  return v && v[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V4_GRAPH_DIAGNOSTIC");
 }
 
 int dsv4_env_device_expert_layers() {

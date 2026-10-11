@@ -254,8 +254,7 @@ void qwen_cpu_graph_timing_report(QwenCpuGraphTiming &state,
 bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
                        const void *gate_plane, const void *up_plane) {
   static const bool disabled = [] {
-    const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DISABLE_MERGED_GATE_UP");
-    return env && env[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DISABLE_MERGED_GATE_UP");
   }();
   if (disabled)
     return false;
@@ -266,23 +265,19 @@ bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
 }
 
 bool qwen_cpu_direct_pool_env_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_POOL");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_POOL");
 }
 
 bool qwen_cpu_direct_ephemeral_env_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_EPHEMERAL");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_EPHEMERAL");
 }
 
 bool qwen_cpu_direct_timing_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_TIMING");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_TIMING");
 }
 
 bool qwen_cpu_direct_fused_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
 }
 
 // Direct workers must remain scheduler-free while a request is active, but a
@@ -291,13 +286,11 @@ bool qwen_cpu_direct_fused_enabled() {
 // input/gate-up/down/reduce phases still use the generation counter and
 // _mm_pause() exclusively.
 bool qwen_cpu_direct_idle_wait_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_IDLE_WAIT");
-  return !(env && env[0] == '0');
+  return moestream::graphcfg::flag_unless_off("MOESTREAM_QWEN_CPU_DIRECT_IDLE_WAIT");
 }
 
 bool qwen_cpu_direct_caller_worker_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_CALLER_WORKER");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_CALLER_WORKER");
 }
 
 int qwen_cpu_direct_worker_count() {
@@ -329,13 +322,11 @@ int qwen_cpu_direct_worker_count() {
 }
 
 bool qwen_cpu_direct_prefetch_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_PREFETCH");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_PREFETCH");
 }
 
 bool qwen_cpu_direct_diag_enabled() {
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_DIAG");
-  return env && env[0] == '1';
+  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_DIAG");
 }
 
 enum : int {

@@ -301,8 +301,7 @@ bool GgmlQwenSharedRunner::ensure_layer(
     const GgmlSharedWeightRef &up, const GgmlSharedWeightRef &down,
     const GgmlSharedWeightRef *gate_inp) {
   const bool debug = [] {
-    const char *e = moestream::graphcfg::env("MOESTREAM_GGML_SHARED_DEBUG");
-    return e && e[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GGML_SHARED_DEBUG");
   }();
   auto fail = [&](const char *reason) {
     if (debug)
@@ -475,8 +474,7 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                                const void *routed_output,
                                const void **combined_output) {
   const bool debug = [] {
-    const char *e = moestream::graphcfg::env("MOESTREAM_GGML_SHARED_DEBUG");
-    return e && e[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GGML_SHARED_DEBUG");
   }();
   auto fail = [&](const char *reason, const ggml_tensor *input,
                   const ggml_tensor *routed_src) {
@@ -686,8 +684,7 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
                                            const float *host_routed,
                                            const void **combined_output) {
   const bool debug = [] {
-    const char *e = moestream::graphcfg::env("MOESTREAM_GGML_SHARED_DEBUG");
-    return e && e[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GGML_SHARED_DEBUG");
   }();
   if (combined_output)
     *combined_output = nullptr;

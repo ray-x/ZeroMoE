@@ -28,6 +28,7 @@
 #include "mmid_route_skip.hpp"
 #include "moe_partial_route.hpp"
 #include "moe_partial_route_ggml.hpp"
+#include "moe_routed_config.hpp"
 #include "moe_routed_ggml.hpp"
 
 #include <algorithm>
@@ -114,8 +115,7 @@ std::mutex g_offload_mutex;
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
   }();
   return on;
 }
@@ -363,8 +363,7 @@ bool pilot_prefetch_on() {
 // VRAM ring and no layer waits for the prefetch, so the CPU computes every cold route as without staging.
 bool pilot_copy_on() {
   static const bool on = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PILOT_COPY");
-    return !(v && v[0] == '0');
+    return moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_PILOT_COPY");
   }();
   return on;
 }
@@ -830,8 +829,7 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
 
 bool dynamic_cache_enabled() {
   static const bool enabled = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_DYNAMIC_CACHE");
   }();
   return enabled;
 }
@@ -1003,8 +1001,7 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name);
 static bool layer_timing_env() {
   static const bool on = [] {
-    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
-    return v && v[0] == '1';
+    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING");
   }();
   return on;
 }
@@ -5180,24 +5177,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         gate_up ? (long long)gate_up->ne[2] : -1);
   }
 
-  moe_routed::RouterSpec rspec;
-  rspec.n_experts = c.n_experts;
-  rspec.topk = c.topk;
-  rspec.n_tokens = g.S;
-  rspec.weights_norm = c.expert_weights_norm;
-  rspec.weights_scale = c.expert_weights_scale;
-  switch (c.gating_func) {
-  case GatingFunc::Sigmoid:
-    rspec.gating = moe_routed::Gating::Sigmoid;
-    break;
-  case GatingFunc::SqrtSoftplus:
-    rspec.gating = moe_routed::Gating::SqrtSoftplus;
-    break;
-  case GatingFunc::Softmax:
-  default:
-    rspec.gating = moe_routed::Gating::Softmax;
-    break;
-  }
+  const moe_routed::RouterSpec rspec = moe_routed::router_spec(c, g.S);
   ggml_tensor *probs = moe_routed::gate_probs(ctx, rspec, router, cur);
   // DeepSeek-V4's first hash-routed layers use a token-id -> expert table
   // for selection, while the learned router still supplies the unbiased
