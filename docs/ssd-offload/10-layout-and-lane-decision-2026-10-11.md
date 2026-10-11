@@ -40,3 +40,16 @@ never repay. This matches the measurements: K=1 staging was neutral (-1%), K>=2 
 
 Decision rule used from now on: keep cold experts on the CPU; consider the upload lane only for IQ1-IQ3 quants, a PCIe 4 card, a pinned
 (bounce-free) arena and a pilot precision >= 0.8 at the staged ranks; the first thing to remove is the 0.5 ms/layer fixed overhead.
+
+## 4. End to end (GLM-5.3-Flash, DDR 32 GiB, 50% pinned, async lru, no prefetch, 5 topic-shifting rounds, 475 decode tokens, clean arms)
+Identical traffic in every arm (14,639 demand loads); outputs identical to the original.
+
+| arm | ms/token | miss-node load time | reads served from | boot seeding |
+|---|---|---|---|---|
+| original shards + cold3173 store | 229.7 | 41.4 s | store direct 5,101; **main GGUF buffered 14,753** | 20.0 s |
+| interleaved model, embedded blocks | 219.7 (-4.4%) | 38.6 s | embedded direct 19,854; buffered 0 | 14.9 s |
+| store striped over two NVMes (even/odd experts) | **204.7 (-10.9%)** | 32.4 s | striped store direct 19,853; buffered 0 | 19.7 s |
+
+Three quarters of the reads in the original setup were buffered per-plane reads of the main GGUF (the cold store only covers 3,173 experts).
+One direct read per expert recovers 4.4%; spreading the store over both NVMes (6.7 GB/s aggregate vs 3.1) recovers another 6.8%.
+Pending in the same queue: interleaved model with the default cold store (aligned-only) and a repeat of the original arm.
