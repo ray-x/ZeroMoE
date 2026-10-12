@@ -1,7 +1,7 @@
-// Qwen4Exp full graph: Pilot staging: the prefetch/stage worker, stage miss callback, pilot
+// GLM5Next full graph: Pilot staging: the prefetch/stage worker, stage miss callback, pilot
 // stage graph nodes.
 //
-// Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
+// Split out of the former single-file ggml_glm5next_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
@@ -326,7 +326,7 @@ ggml_tensor *stage_hot_mask(FullGraph &g, ggml_context *ctx, int layer) {
         if (e >= 0 && e < c.n_experts)
           m[(size_t)e] = -1e9f;
   }
-  if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used, t, m.data(), ggml_nbytes(t)))
+  if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity, g.dense.used, t, m.data(), ggml_nbytes(t)))
     return nullptr;
   ggml_set_name(t, ("glm5next_stage_hot_mask_" + std::to_string(layer)).c_str());
   return t;
@@ -400,7 +400,7 @@ bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, in
   }
   ggml_tensor *mask = stage_hot_mask(g, ctx, next);
   if (!mask) {
-    LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: hot-mask allocation failed (dense arena %zu/%zu)\n", next, g.dense_used, g.dense_capacity);
+    LOG_WARN("[GGML-GLM5NEXT-STAGE] layer %d: hot-mask allocation failed (dense arena %zu/%zu)\n", next, g.dense.used, g.dense.capacity);
     return false;
   }
   score = ggml_add(ctx, score, mask);

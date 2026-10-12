@@ -587,12 +587,12 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // With neither, the expert arena is allocated fresh below (same as the
     // recreate path) while the dense arena is still borrowed.
     FullGraph *expert_source = nullptr;
-    if (prefill_arena_source->device_expert_buffer) {
+    if (prefill_arena_source->expert.buffer) {
       expert_source = prefill_arena_source;
     } else if (g_graph_decode_arena_owner && g_graph_decode_arena_owner->ready &&
                g_graph_decode_arena_owner->engine == &engine &&
                g_graph_decode_arena_owner->device == dev &&
-               g_graph_decode_arena_owner->device_expert_buffer) {
+               g_graph_decode_arena_owner->expert.buffer) {
       expert_source = g_graph_decode_arena_owner.get();
       LOG_INFO("[GGML-QWEN-FULL-DECODE] rebinding the per-expert split arena "
                "prepared at startup (no re-upload)\n");

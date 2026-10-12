@@ -201,26 +201,26 @@ bool engine_plans_decode_expert_split(const StreamingEngine &engine) {
 // graph does not own such an arena. The graph must not free the arena afterwards.
 std::unique_ptr<FullGraph> extract_decode_arena_owner(
     FullGraph &g, StreamingEngine &engine) {
-  if (!g.ready || !g.decode_mode || !g.device_expert_buffer ||
-      g.expert_source_graph || g.device_expert_capacity == 0)
+  if (!g.ready || !g.decode_mode || !g.expert.buffer ||
+      g.expert_source_graph || g.expert.capacity == 0)
     return nullptr;
   auto owner = std::make_unique<FullGraph>();
   owner->engine = &engine;
   owner->device = g.device;
   owner->ready = true;
-  owner->device_expert_buffer = g.device_expert_buffer;
-  owner->device_expert_base = g.device_expert_base;
-  owner->device_expert_capacity = g.device_expert_capacity;
-  owner->device_expert_used = g.device_expert_used;
+  owner->expert.buffer = g.expert.buffer;
+  owner->expert.base = g.expert.base;
+  owner->expert.capacity = g.expert.capacity;
+  owner->expert.used = g.expert.used;
   owner->expert_addrs = std::move(g.expert_addrs);
   owner->split_gpu_expert_ids = g.split_gpu_expert_ids;
   owner->device_expert_layers = g.device_expert_layers;
   owner->device_expert_trailing = g.device_expert_trailing;
   owner->device_expert_partial_gate_up = g.device_expert_partial_gate_up;
-  g.device_expert_buffer = nullptr;
-  g.device_expert_base = nullptr;
-  g.device_expert_capacity = 0;
-  g.device_expert_used = 0;
+  g.expert.buffer = nullptr;
+  g.expert.base = nullptr;
+  g.expert.capacity = 0;
+  g.expert.used = 0;
   return owner;
 }
 
@@ -239,8 +239,8 @@ size_t estimate_prefill_workspace_bytes(int S) {
 // space. Called before the prefill graph is built.
 void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
   const bool live_owned =
-      g_graph && g_graph->decode_mode && g_graph->device_expert_buffer &&
-      !g_graph->expert_source_graph && g_graph->device_expert_capacity > 0;
+      g_graph && g_graph->decode_mode && g_graph->expert.buffer &&
+      !g_graph->expert_source_graph && g_graph->expert.capacity > 0;
   if (!g_graph_decode_arena_owner && !live_owned)
     return;
   size_t free_bytes = 0, total_bytes = 0;
@@ -441,8 +441,8 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       g_graph_prefill_arena_owner->ready &&
       g_graph_prefill_arena_owner->engine == &engine &&
       g_graph_prefill_arena_owner->device == dev &&
-      g_graph_prefill_arena_owner->device_dense_buffer &&
-      (g_graph_prefill_arena_owner->device_expert_buffer ||
+      g_graph_prefill_arena_owner->dense.buffer &&
+      (g_graph_prefill_arena_owner->expert.buffer ||
        g->device_expert_layers == 0) &&
       g_graph_prefill_arena_owner->device_expert_layers ==
           g->device_expert_layers &&
@@ -460,11 +460,11 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     g->dense_source_graph = prefill_weight_source;
     // A split config has no resident expert layers in the prefill graph, so the
     // owner has no expert arena to lend; borrow the dense arena only.
-    if (prefill_weight_source->device_expert_buffer)
+    if (prefill_weight_source->expert.buffer)
       g->expert_source_graph = prefill_weight_source;
     LOG_INFO("[GGML-QWEN-FULL] reusing retained dense%s weight arenas "
              "for new prompt shape S=%d\n",
-             prefill_weight_source->device_expert_buffer ? "/expert" : "", S);
+             prefill_weight_source->expert.buffer ? "/expert" : "", S);
   } else if (g_graph_prefill_arena_owner) {
     // A different engine/device/residency layout cannot safely bind to these
     // addresses. g_graph (the borrower) was destroyed above, so the owner is
@@ -678,10 +678,10 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
            "one-time startup cost is reported separately from requests)\n",
            elapsed_ms,
            static_cast<double>(g_graph_prefill_arena_owner
-                                   ->device_dense_used) /
+                                   ->dense.used) /
                (1024.0 * 1024.0 * 1024.0),
            static_cast<double>(g_graph_prefill_arena_owner
-                                   ->device_expert_used) /
+                                   ->expert.used) /
                (1024.0 * 1024.0 * 1024.0),
            bootstrap_tokens);
 
@@ -714,7 +714,7 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
         constexpr size_t kMinHeadroomBytes = static_cast<size_t>(1) << 30;
         if (free_bytes >= kMinHeadroomBytes) {
           const double arena_gib =
-              static_cast<double>(owner->device_expert_capacity) /
+              static_cast<double>(owner->expert.capacity) /
               (1024.0 * 1024.0 * 1024.0);
           const size_t bound = owner->expert_addrs.size();
           g_graph_decode_arena_owner = std::move(owner);

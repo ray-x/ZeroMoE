@@ -1,5 +1,7 @@
 #pragma once
 
+#include "graph_core.hpp"
+
 // Internal declarations shared by the ggml_qwen4exp_graph*.cpp translation
 // units (namespace qwen4exp_graph).  The public entry points stay in
 // ggml_qwen4exp_graph.hpp; everything here is private to the Qwen4Exp
@@ -74,7 +76,6 @@ struct Qwen4ExpGpuStageContext;
 struct Qwen4ExpUsageTrackContext;
 struct Qwen4ExpHostNodeCpuExecutionGuard;
 struct Qwen4ExpHostNodeCpuActivityGuard;
-struct HostAllocation;
 struct FullGraph;
 enum class ExistingDeviceExpertBind;
 struct ScopedGraphBuildTimer;
@@ -168,12 +169,7 @@ ggml_tensor *layer13_moe_diag_snapshot( FullGraph &g, ggml_context *ctx, ggml_te
 void qwen_probe_dump(FullGraph &g);
 void log_qwen_layout_tensor(const FullGraph &g, int layer, bool cpu_only, const char *role, const ggml_tensor *tensor);
 void dump_qwen_moe_layout(const FullGraph &g);
-ggml_tensor *new_tensor(ggml_context *ctx, ggml_type type, const std::vector<int64_t> &shape);
-ggml_backend_buffer_t bind_host(FullGraph &g, ggml_tensor *t, void *ptr, size_t bytes, ggml_backend_buffer_usage usage);
 void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t);
-void *alloc_host(FullGraph &g, size_t bytes);
-ggml_tensor *host_input(FullGraph &g, ggml_context *ctx, ggml_type type, const std::vector<int64_t> &shape, size_t bytes, const char *name);
-const QuantizedTensor *resident(const StreamingEngine &engine, const std::string &name);
 ggml_tensor *resident_tensor( FullGraph &g, ggml_context *ctx, const std::string &name, ggml_backend_buffer_usage usage = GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
 bool graph_dense_weight_name(const std::string &name);
 bool init_device_dense_arena(FullGraph &g);
@@ -188,7 +184,6 @@ std::string device_expert_single_key(const void *host, size_t bytes, const std::
 void *alloc_registered_host(FullGraph &g, size_t bytes);
 void plan_expert_vram_split(FullGraph &g);
 void plan_partial_layer(StreamingEngine &engine);
-const GGUFTensor *model_tensor(const StreamingEngine &engine, const std::string &name);
 size_t full_expert_source_bytes(const StreamingEngine &engine, int layer_limit = -1);
 bool preloaded_ram_expert_source(FullGraph &g, const std::string &name, const GGUFTensor &meta, void *&ptr, size_t &bytes, size_t &expert_stride, size_t &arena_bytes);
 int device_expert_resident_layer_count(const FullGraph &g);
@@ -438,44 +433,33 @@ struct Qwen4ExpHostNodeCpuActivityGuard {
   }
 };
 
-struct HostAllocation {
-  void *ptr = nullptr;
-  size_t bytes = 0;
-  bool pinned = false;
-  size_t reservation_bytes = 0;
-};
 
-struct FullGraph {
-  StreamingEngine *engine = nullptr;
+using moestream::graph::DeviceArena;
+using moestream::graph::HostAllocation;
+using moestream::graph::alloc_host;
+using moestream::graph::bind_host;
+using moestream::graph::host_input;
+using moestream::graph::model_tensor;
+using moestream::graph::new_tensor;
+using moestream::graph::resident;
+
+struct FullGraph : moestream::graph::GraphCore {
+  FullGraph() { mem_tag = "GGML-QWEN-FULL-MEM"; }
+
   uint64_t graph_generation = 0;
-  int device = -1;
-  int S = 0;
-  int D = 0;
-  int HC = 0;
-  int n_layers = 0;
-  int H = 0;
   int Hkv = 0;
-  int hd = 0;
   int Hk_gdn = 0;
   int Hv_gdn = 0;
   int gdn_hd = 0;
   int key_dim = 0;
   int value_dim = 0;
   int conv_dim = 0;
-  int d_conv = 0;
-  bool decode_mode = false;
-  int kv_capacity = 0;
-  int decode_last_pos = -1;
 
-  ggml_backend_t cuda = nullptr;
   ggml_backend_t cuda_raw = nullptr;
   ggml_backend_t exl3_cuda_adapter = nullptr;
   bool exl3_bridge_failed = false;
-  ggml_backend_t cpu = nullptr;
   ggml_threadpool_t cpu_threadpool = nullptr;
   int cpu_threads = 0;
-  ggml_backend_sched_t sched = nullptr;
-  std::unordered_map<int, std::unique_ptr<EarlyReadyLane>> early_ready;
   std::unique_ptr<std::ofstream> early_route_trace;
   std::unique_ptr<Qwen4ExpStageShapeClassPool> early_stage_shapes;
   std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
@@ -571,15 +555,6 @@ struct FullGraph {
   ggml_tensor *layer13_moe_ids_diag = nullptr;
   ggml_tensor *layer13_moe_weights_diag = nullptr;
   ggml_tensor *layer13_pre_ffn_residual_diag = nullptr;
-  ggml_backend_buffer_t device_expert_buffer = nullptr;
-  void *device_expert_base = nullptr;
-  size_t device_expert_capacity = 0;
-  size_t device_expert_used = 0;
-  ggml_backend_buffer_t device_dense_buffer = nullptr;
-  void *device_dense_base = nullptr;
-  size_t device_dense_capacity = 0;
-  size_t device_dense_used = 0;
-  int device_dense_tensors = 0;
   // Diagnostic (2026-09-17): cumulative time inside resident_tensor()'s own
   // cudaMemcpy H2D calls, across this ONE build_graph() call -- see memory:
   // full-graph-decode-graph-construction-5s-latency.md. Reset to 0 at the
@@ -620,11 +595,6 @@ struct FullGraph {
   long expert_vram_file_read_calls = 0;
   long expert_weight_host_bind_calls = 0;
   long expert_weight_device_bind_calls = 0;
-  ggml_backend_buffer_t device_state_buffer = nullptr;
-  void *device_state_base = nullptr;
-  size_t device_state_capacity = 0;
-  size_t device_state_used = 0;
-  int device_expert_layers = 0;
   bool device_expert_partial_gate_up = false;
   // When true, the device_expert_layers-sized GPU-resident block sits at
   // the END of the model (layers [n_layers-N, n_layers)) instead of the
@@ -704,7 +674,7 @@ struct FullGraph {
     ggml_tensor *ids_dispatch_const = nullptr;
     // Fixed compact device tensors, shape [cols, rows, topk] (topk, not
     // n_experts), bound once via bind_or_allocate_expert into
-    // device_expert_buffer -- never re-bound, only their CONTENTS change
+    // expert.buffer -- never re-bound, only their CONTENTS change
     // per token.
     ggml_tensor *gate_dst = nullptr;
     ggml_tensor *up_dst = nullptr;
@@ -843,17 +813,8 @@ struct FullGraph {
     int topk = 0;
     int layer = -1;
   } completion_payload_binding;
-  ggml_context *ctx = nullptr;
-  ggml_cgraph *graph = nullptr;
 
-  ggml_tensor *input = nullptr;         // [D, HC, S], CPU input
   ggml_tensor *topology_cpu_prologue = nullptr;
-  ggml_tensor *output = nullptr;        // [D, S], final HC output
-  ggml_tensor *logits = nullptr;        // [vocab, S], decode-only output
-  ggml_tensor *final_streams = nullptr; // [D, HC, S], for state/debug writeback
-  ggml_tensor *positions = nullptr;     // [S], I32
-  ggml_tensor *attn_mask = nullptr;     // [S, S], F16 (flash-attn contract)
-  ggml_tensor *decode_indices = nullptr; // [Hkv], I32 row indices for KV append
   ggml_tensor *ple_embedding = nullptr;
   ggml_tensor *ple_hist_out = nullptr;
   ggml_tensor *ple_hist_storage = nullptr;
@@ -876,30 +837,20 @@ struct FullGraph {
   int ple_layer = -1;
   float *ple_hist_input = nullptr;
 
-  std::vector<HostAllocation> owned;
-  std::vector<ggml_backend_buffer_t> host_buffers;
-  std::vector<void *> host_inputs;
 
   size_t graph_bytes = 0;
-  size_t host_weight_bytes = 0;
   // Bytes/views borrowed from StreamingEngine's already-populated graph-RAM
   // arenas.  These are not owned by this graph and must not be counted as a
   // second host-side expert copy.
   size_t host_ram_alias_bytes = 0;
   size_t host_ram_alias_tensors = 0;
-  size_t host_pinned_bytes = 0;
-  size_t host_pin_failures = 0;
-  size_t host_reservation_bytes = 0;
   // ggml_init(no_alloc=true) still allocates a host-side context arena. Keep
   // that arena in the process-wide admission ledger as well, otherwise graph
   // construction can exceed host_ram_gb between explicit host-buffer
   // allocations.
-  size_t context_reservation_bytes = 0;
   // The source admission is made once before graph construction, while this
   // graph materializes that source as many individual host allocations.  This
   // remainder prevents alloc_host() from charging those same bytes twice.
-  size_t host_precharged_bytes = 0;
-  bool ready = false;
 
   ~FullGraph() { destroy(); }
 
@@ -972,28 +923,28 @@ struct FullGraph {
       ggml_backend_free(cpu);
       cpu = nullptr;
     }
-    if (device_expert_buffer && !expert_source_graph) {
-      ggml_backend_buffer_free(device_expert_buffer);
+    if (expert.buffer && !expert_source_graph) {
+      ggml_backend_buffer_free(expert.buffer);
     }
-    device_expert_buffer = nullptr;
-    device_expert_base = nullptr;
-    device_expert_capacity = 0;
-    device_expert_used = 0;
-    if (device_dense_buffer && !dense_source_graph) {
-      ggml_backend_buffer_free(device_dense_buffer);
+    expert.buffer = nullptr;
+    expert.base = nullptr;
+    expert.capacity = 0;
+    expert.used = 0;
+    if (dense.buffer && !dense_source_graph) {
+      ggml_backend_buffer_free(dense.buffer);
     }
-    device_dense_buffer = nullptr;
-    device_dense_base = nullptr;
-    device_dense_capacity = 0;
-    device_dense_used = 0;
-    device_dense_tensors = 0;
-    if (device_state_buffer) {
-      ggml_backend_buffer_free(device_state_buffer);
-      device_state_buffer = nullptr;
+    dense.buffer = nullptr;
+    dense.base = nullptr;
+    dense.capacity = 0;
+    dense.used = 0;
+    dense.tensors = 0;
+    if (state.buffer) {
+      ggml_backend_buffer_free(state.buffer);
+      state.buffer = nullptr;
     }
-    device_state_base = nullptr;
-    device_state_capacity = 0;
-    device_state_used = 0;
+    state.base = nullptr;
+    state.capacity = 0;
+    state.used = 0;
     device_expert_layers = 0;
     device_expert_partial_gate_up = false;
     split_gpu_expert_ids.clear();
@@ -1036,32 +987,9 @@ struct FullGraph {
     }
     host_node_contexts.clear();
     exl3_bridge_layers.clear();
-    for (ggml_backend_buffer_t b : host_buffers) {
-      if (b)
-        ggml_backend_buffer_free(b);
-    }
-    host_buffers.clear();
-    if (ctx) {
-      ggml_free(ctx);
-      ctx = nullptr;
-    }
-    for (HostAllocation &a : owned) {
-      if (a.pinned)
-        cudaHostUnregister(a.ptr);
-      if (a.ptr)
-        std::free(a.ptr);
-      MemoryGuard::release_host_bytes(a.reservation_bytes);
-      a.ptr = nullptr;
-      a.pinned = false;
-    }
-    owned.clear();
-    host_inputs.clear();
-    cuda = nullptr;
-    cpu = nullptr;
+    release_core(); // host buffers, context, owned host memory, counters
     cpu_threads = 0;
-    graph = nullptr;
-    input = output = logits = final_streams = positions = attn_mask =
-        decode_indices = ple_embedding = nullptr;
+    ple_embedding = nullptr;
     two_layer_diag = false;
     two_layer_l0_post_ffn = nullptr;
     two_layer_l1_pre_attn = nullptr;
@@ -1086,23 +1014,9 @@ struct FullGraph {
     gdn_hist_inputs.clear();
     ple_layer = -1;
     ple_hist_input = nullptr;
-    ready = false;
     graph_bytes = 0;
-    host_weight_bytes = 0;
     host_ram_alias_bytes = 0;
     host_ram_alias_tensors = 0;
-    host_pinned_bytes = 0;
-    host_pin_failures = 0;
-    MemoryGuard::release_host_bytes(host_reservation_bytes);
-    host_reservation_bytes = 0;
-    MemoryGuard::release_host_bytes(context_reservation_bytes);
-    context_reservation_bytes = 0;
-    host_precharged_bytes = 0;
-    engine = nullptr;
-    S = 0;
-    decode_mode = false;
-    kv_capacity = 0;
-    decode_last_pos = -1;
   }
 };
 

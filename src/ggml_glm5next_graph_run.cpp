@@ -1,4 +1,4 @@
-// Qwen4Exp full graph: Prefill execution of the built graph.
+// GLM5Next full graph: Prefill execution of the built graph.
 //
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.

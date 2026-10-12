@@ -1,4 +1,4 @@
-// Qwen4Exp full graph: FFN (cold lane, hot/cold split) and whole-model graph construction.
+// GLM5Next full graph: FFN (cold lane, hot/cold split) and whole-model graph construction.
 //
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
@@ -853,10 +853,10 @@ bool build_graph(FullGraph &g) {
       "GiB (included in cache, not additional); host source=%.2f GiB, "
       "DDR refs=%.2f GiB (not additional), pinned=%.2f GiB "
       "pin_failures=%zu\n",
-      (double)g.dense_used / (1024.0 * 1024.0 * 1024.0),
-      (double)g.dense_capacity / (1024.0 * 1024.0 * 1024.0), g.dense_tensors,
-      (double)g.expert_used / (1024.0 * 1024.0 * 1024.0),
-      (double)g.expert_capacity / (1024.0 * 1024.0 * 1024.0),
+      (double)g.dense.used / (1024.0 * 1024.0 * 1024.0),
+      (double)g.dense.capacity / (1024.0 * 1024.0 * 1024.0), g.dense.tensors,
+      (double)g.expert.used / (1024.0 * 1024.0 * 1024.0),
+      (double)g.expert.capacity / (1024.0 * 1024.0 * 1024.0),
       (double)g.vram_reference_bytes / (1024.0 * 1024.0 * 1024.0),
       (double)g.host_weight_bytes / (1024.0 * 1024.0 * 1024.0),
       (double)g.host_reference_bytes / (1024.0 * 1024.0 * 1024.0),

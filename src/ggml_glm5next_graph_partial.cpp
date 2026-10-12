@@ -1,7 +1,7 @@
-// Qwen4Exp full graph: Partial-layer expert placement: VRAM reference experts, hot1 (GPU1)
+// GLM5Next full graph: Partial-layer expert placement: VRAM reference experts, hot1 (GPU1)
 // assignment, dynamic upload worker, route tap.
 //
-// Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
+// Split out of the former single-file ggml_glm5next_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
@@ -344,7 +344,7 @@ ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer,
   const PartialExpertLayer *p = partial_layer(g, layer);
   if (!p || p->hot.empty() || !p->vram_layer_base ||
       p->vram_layer_slots == 0 || p->vram_slot_stride == 0 ||
-      !g.expert_buffer)
+      !g.expert.buffer)
     return nullptr;
   const std::string name = "blk." + std::to_string(layer) + "." + stem;
   const GGUFTensor *meta = model_tensor(*g.engine, name);
@@ -416,7 +416,7 @@ ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer,
   t->data = p->vram_layer_base + offset;
   // The buffer type tags this tensor for the graph CUDA backend. The actual
   // data pointer remains owned by GpuTopology's expert cache pool.
-  t->buffer = g.expert_buffer;
+  t->buffer = g.expert.buffer;
   ggml_set_name(t, (name + ".vram_cache_ref").c_str());
   return t;
 }
@@ -485,7 +485,7 @@ ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer,
       moe_partial::SentinelPolicy::Auto);
   const void *data = mask ? (const void *)branch_map.route_mask().data()
                           : (const void *)branch_map.route_ids().data();
-  if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used,
+  if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity, g.dense.used,
                    t, data, ggml_nbytes(t)))
     return nullptr;
   ggml_set_name(t, (std::string("full_graph_hot1_") + (mask ? "mask_" : "map_") +
@@ -728,7 +728,7 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   }
   const void *data = mask ? (const void *)branch_map.route_mask().data()
                           : (const void *)branch_map.route_ids().data();
-  if (!arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity, g.dense_used,
+  if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity, g.dense.used,
                    t, data, ggml_nbytes(t)))
     return nullptr;
   ggml_set_name(t, (std::string("full_graph_") + (hot ? "hot_" : "cold_") +

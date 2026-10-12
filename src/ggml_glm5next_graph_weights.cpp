@@ -1,7 +1,7 @@
-// Qwen4Exp full graph: Expert and dense weight loading: direct reads, gate/up packing, source
+// GLM5Next full graph: Expert and dense weight loading: direct reads, gate/up packing, source
 // compaction and preloading.
 //
-// Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
+// Split out of the former single-file ggml_glm5next_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
@@ -72,17 +72,17 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
   }
   bool ok = false;
   if (device_expert) {
-    ok = arena_alloc(g.expert_buffer, g.expert_base, g.expert_capacity,
-                     g.expert_used, t, p, bytes);
+    ok = arena_alloc(g.expert.buffer, g.expert.base, g.expert.capacity,
+                     g.expert.used, t, p, bytes);
     if (transient_device_source)
       std::free(p);
     if (transient_host_reserved)
       MemoryGuard::release_host_bytes(required);
   } else if (graph_dense_weight_name(name)) {
-    ok = arena_alloc(g.dense_buffer, g.dense_base, g.dense_capacity,
-                     g.dense_used, t, p, bytes);
+    ok = arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity,
+                     g.dense.used, t, p, bytes);
     if (ok)
-      ++g.dense_tensors;
+      ++g.dense.tensors;
   } else {
     ok = bind_host(g, t, p, required, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) !=
          nullptr;
@@ -512,8 +512,8 @@ ggml_tensor *load_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer,
 
   bool ok = false;
   if (device_expert) {
-    ok = arena_alloc(g.expert_buffer, g.expert_base, g.expert_capacity,
-                     g.expert_used, t, p, meta.bytes);
+    ok = arena_alloc(g.expert.buffer, g.expert.base, g.expert.capacity,
+                     g.expert.used, t, p, meta.bytes);
     if (transient)
       std::free(p);
     if (transient_reserved)
@@ -569,8 +569,8 @@ bool arena_load_selected(FullGraph &g, ggml_tensor *t, Loader &&load) {
     return false;
   }
   const bool ok = load(scratch) &&
-                  arena_alloc(g.expert_buffer, g.expert_base,
-                              g.expert_capacity, g.expert_used, t, scratch,
+                  arena_alloc(g.expert.buffer, g.expert.base,
+                              g.expert.capacity, g.expert.used, t, scratch,
                               bytes);
   std::free(scratch);
   MemoryGuard::release_host_bytes(bytes);

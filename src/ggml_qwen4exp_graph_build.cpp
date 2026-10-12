@@ -1105,8 +1105,8 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
               : -1.0,
           static_cast<double>(kMinGraphAllocHeadroomBytes) /
               (1024.0 * 1024.0 * 1024.0),
-          static_cast<double>(g.device_expert_capacity +
-                              g.device_dense_capacity) /
+          static_cast<double>(g.expert.capacity +
+                              g.dense.capacity) /
               (1024.0 * 1024.0 * 1024.0));
       // Signal to a caller that wants one: THIS specific failure (scheduler
       // admission floor, not some other construction error) may be fixed by
@@ -1176,7 +1176,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
            "expert_cudaMemcpy=%.1fms/%ld calls, attn_block=%.1fms, "
            "moe_block=%.1fms [weight_lookup=%.1fms]) sched_alloc_graph=%.1fms\n",
            t_construction_ms, g.dense_upload_ms_total,
-           g.device_dense_tensors, g.expert_upload_ms_total,
+           g.dense.tensors, g.expert_upload_ms_total,
            g.expert_upload_calls, g.attn_construction_ms_total,
            g.moe_construction_ms_total, g.moe_weight_lookup_ms_total,
            t_alloc_ms);
@@ -1247,11 +1247,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       g.dense_source_graph ? *g.dense_source_graph : g;
   LOG_INFO(
       "[GGML-QWEN-FULL] dense device arena used=%.2f/%.2f GiB; %d tensors\n",
-      static_cast<double>(dense_arena_owner.device_dense_used) /
+      static_cast<double>(dense_arena_owner.dense.used) /
           (1024.0 * 1024.0 * 1024.0),
-      static_cast<double>(dense_arena_owner.device_dense_capacity) /
+      static_cast<double>(dense_arena_owner.dense.capacity) /
           (1024.0 * 1024.0 * 1024.0),
-      g.device_dense_tensors);
+      g.dense.tensors);
   if (g.device_expert_layers > 0) {
     const FullGraph &expert_arena_owner =
         g.expert_source_graph ? *g.expert_source_graph : g;
@@ -1260,9 +1260,9 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     LOG_INFO(
         "[GGML-QWEN-FULL] device expert arena used=%.2f/%.2f GiB; "
         "%d complete layer(s), %d expert records, all 3 projections resident\n",
-        static_cast<double>(expert_arena_owner.device_expert_used) /
+        static_cast<double>(expert_arena_owner.expert.used) /
             (1024.0 * 1024.0 * 1024.0),
-        static_cast<double>(expert_arena_owner.device_expert_capacity) /
+        static_cast<double>(expert_arena_owner.expert.capacity) /
             (1024.0 * 1024.0 * 1024.0),
         resident_layers, complete_records);
   }

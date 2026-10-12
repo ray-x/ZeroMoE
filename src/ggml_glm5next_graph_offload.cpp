@@ -1,7 +1,7 @@
-// Qwen4Exp full graph: SSD-offload routed experts: the ExpertStore-backed miss node and
+// GLM5Next full graph: SSD-offload routed experts: the ExpertStore-backed miss node and
 // offload weight tensors.
 //
-// Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
+// Split out of the former single-file ggml_glm5next_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"

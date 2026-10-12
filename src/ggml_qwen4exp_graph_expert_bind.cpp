@@ -15,10 +15,10 @@ namespace qwen4exp_graph {
 ExistingDeviceExpertBind bind_existing_device_expert(
     FullGraph &g, ggml_tensor *t, size_t bytes,
     const std::string &source_tag) {
-  if (!g.device_expert_buffer || !t || source_tag.empty())
+  if (!g.expert.buffer || !t || source_tag.empty())
     return ExistingDeviceExpertBind::Missing;
   FullGraph *owner_ptr = expert_arena_owner(g);
-  if (!owner_ptr || !owner_ptr->device_expert_buffer)
+  if (!owner_ptr || !owner_ptr->expert.buffer)
     return ExistingDeviceExpertBind::Failed;
   FullGraph &owner = *owner_ptr;
   const std::string key = device_expert_single_key(nullptr, bytes, source_tag);
@@ -26,7 +26,7 @@ ExistingDeviceExpertBind bind_existing_device_expert(
   if (existing == owner.expert_addrs.end())
     return ExistingDeviceExpertBind::Missing;
   const ggml_status bind_status = ggml_backend_tensor_alloc(
-      owner.device_expert_buffer, t, existing->second);
+      owner.expert.buffer, t, existing->second);
   if (bind_status != GGML_STATUS_SUCCESS) {
     LOG_ERROR("[GGML-QWEN-FULL-ARENA-BIND-FAIL] arena=expert "
               "reason=named-reuse status=%d name=%s bytes=%zu\n",
@@ -43,12 +43,12 @@ ExistingDeviceExpertBind bind_existing_device_expert(
 bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
                                     const std::string &key, void **addr_out,
                                     bool *new_allocation) {
-  if (!g.device_expert_buffer || !t || !addr_out || !new_allocation)
+  if (!g.expert.buffer || !t || !addr_out || !new_allocation)
     return false;
   ScopedGraphBuildTimer bind_timer(g.expert_weight_device_bind_ms_total);
   ++g.expert_weight_device_bind_calls;
   FullGraph *owner_ptr = expert_arena_owner(g);
-  if (!owner_ptr || !owner_ptr->device_expert_buffer)
+  if (!owner_ptr || !owner_ptr->expert.buffer)
     return false;
   FullGraph &owner = *owner_ptr;
   auto existing = owner.expert_addrs.find(key);
@@ -56,7 +56,7 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
     *addr_out = existing->second;
     *new_allocation = false;
     const ggml_status bind_status =
-        ggml_backend_tensor_alloc(owner.device_expert_buffer, t, *addr_out);
+        ggml_backend_tensor_alloc(owner.expert.buffer, t, *addr_out);
     if (bind_status != GGML_STATUS_SUCCESS) {
       LOG_ERROR("[GGML-QWEN-FULL-ARENA-BIND-FAIL] arena=expert "
                 "reason=existing-address status=%d name=%s bytes=%zu\n",
@@ -68,26 +68,26 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
   }
 
   const ggml_backend_buffer_type_t buft =
-      ggml_backend_buffer_get_type(owner.device_expert_buffer);
+      ggml_backend_buffer_get_type(owner.expert.buffer);
   const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
   constexpr size_t kAlignment = 256;
   const size_t alignment =
       std::max<size_t>(kAlignment, ggml_backend_buft_get_alignment(buft));
-  const size_t used_before = owner.device_expert_used;
+  const size_t used_before = owner.expert.used;
   const size_t aligned =
-      (owner.device_expert_used + alignment - 1) & ~(alignment - 1);
-  if (aligned > owner.device_expert_capacity ||
-      alloc_size > owner.device_expert_capacity - aligned) {
+      (owner.expert.used + alignment - 1) & ~(alignment - 1);
+  if (aligned > owner.expert.capacity ||
+      alloc_size > owner.expert.capacity - aligned) {
     LOG_ERROR("[GGML-QWEN-FULL-ARENA-BIND-FAIL] arena=expert "
               "reason=capacity name=%s key=%s used=%zu capacity=%zu "
               "need=%zu\n",
-              ggml_get_name(t), key.c_str(), owner.device_expert_used,
-              owner.device_expert_capacity, alloc_size);
+              ggml_get_name(t), key.c_str(), owner.expert.used,
+              owner.expert.capacity, alloc_size);
     return false;
   }
-  void *addr = static_cast<uint8_t *>(owner.device_expert_base) + aligned;
+  void *addr = static_cast<uint8_t *>(owner.expert.base) + aligned;
   const ggml_status bind_status =
-      ggml_backend_tensor_alloc(owner.device_expert_buffer, t, addr);
+      ggml_backend_tensor_alloc(owner.expert.buffer, t, addr);
   if (bind_status != GGML_STATUS_SUCCESS) {
     LOG_ERROR("[GGML-QWEN-FULL-ARENA-BIND-FAIL] arena=expert "
               "reason=new-address status=%d name=%s bytes=%zu\n",
@@ -95,7 +95,7 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
               ggml_nbytes(t));
     return false;
   }
-  owner.device_expert_used = aligned + alloc_size;
+  owner.expert.used = aligned + alloc_size;
   owner.expert_addrs.emplace(key, addr);
   *addr_out = addr;
   *new_allocation = true;
@@ -105,7 +105,7 @@ bool bind_or_allocate_expert(FullGraph &g, ggml_tensor *t,
 bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host,
                         size_t bytes,
                         const std::string &source_tag)  {
-  if (!g.device_expert_buffer || !t || !host || bytes < ggml_nbytes(t))
+  if (!g.expert.buffer || !t || !host || bytes < ggml_nbytes(t))
     return false;
   const std::string key = device_expert_single_key(host, bytes, source_tag);
   void *addr = nullptr;
@@ -144,7 +144,7 @@ bool bind_device_expert(FullGraph &g, ggml_tensor *t, const void *host,
 bool bind_device_expert_strided(FullGraph &g, ggml_tensor *t, const void *base,
                                 size_t src_stride, size_t per_expert_bytes,
                                 int n_experts) {
-  if (!g.device_expert_buffer || !t || !base || src_stride == 0 ||
+  if (!g.expert.buffer || !t || !base || src_stride == 0 ||
       per_expert_bytes == 0 || n_experts <= 0 || src_stride < per_expert_bytes)
     return false;
   if (static_cast<size_t>(n_experts) > SIZE_MAX / per_expert_bytes)
@@ -190,7 +190,7 @@ bool bind_device_expert_strided(FullGraph &g, ggml_tensor *t, const void *base,
 bool bind_device_expert_gather(FullGraph &g, ggml_tensor *t,
                                const std::vector<const void *> &src_ptrs,
                                size_t per_expert_bytes) {
-  if (!g.device_expert_buffer || !t || src_ptrs.empty() ||
+  if (!g.expert.buffer || !t || src_ptrs.empty() ||
       per_expert_bytes == 0)
     return false;
   if (src_ptrs.size() > SIZE_MAX / per_expert_bytes)
@@ -245,7 +245,7 @@ bool bind_device_expert_strided_gate_up(FullGraph &g, ggml_tensor *t,
                                         size_t gate_stride, size_t gate_bytes,
                                         const void *up_base, size_t up_stride,
                                         size_t up_bytes, int n_experts) {
-  if (!g.device_expert_buffer || !t || !gate_base || !up_base ||
+  if (!g.expert.buffer || !t || !gate_base || !up_base ||
       gate_bytes == 0 || up_bytes == 0 || n_experts <= 0 ||
       gate_stride < gate_bytes || up_stride < up_bytes ||
       gate_bytes > SIZE_MAX - up_bytes)
