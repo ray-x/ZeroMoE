@@ -1,0 +1,155 @@
+// Qwen4Exp full graph: Prefill execution of the built graph.
+//
+// Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
+// declarations live in ggml_glm5next_graph_impl.hpp.
+
+#include "ggml_glm5next_graph_impl.hpp"
+
+#if defined(MOESTREAM_USE_GGML_CUDA)
+
+using namespace glm5next_graph;
+
+bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
+                             int S, int pos_base, const int *) {
+  if (!env_enabled() || !hidden_states || S <= 1 || pos_base != 0 || !g_graph ||
+      !g_graph->ready || g_graph->engine != &engine || g_graph->S != S)
+    return false;
+  FullGraph &g = *g_graph;
+  const auto &c = engine.model_file.architecture_config;
+  const size_t state_n = (size_t)g.hd * g.hd * g.H;
+  const size_t hist_n = (size_t)(g.d_conv - 1) * 3 * g.d_inner;
+
+  for (size_t i = 0; i < g.kda_layers.size(); ++i) {
+    const int l = g.kda_layers[i];
+    if (l < 0 || l >= (int)engine.glm5next_recur_state.size() ||
+        l >= (int)engine.glm5next_conv_history.size() ||
+        engine.glm5next_recur_state[l].size() != state_n ||
+        engine.glm5next_conv_history[l].size() != hist_n)
+      return false;
+    std::fill(g.kda_state_inputs[i], g.kda_state_inputs[i] + state_n, 0.0f);
+    std::fill(g.kda_hist_inputs[i], g.kda_hist_inputs[i] + hist_n, 0.0f);
+  }
+  if (engine.hc_stream_buf.size() < (size_t)g.D * g.HC * S ||
+      g.host_inputs.empty())
+    return false;
+  std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(),
+              (size_t)g.D * g.HC * S * sizeof(float));
+
+  // Real-hardware incident (2026-09-09): a 480-token prompt crashed the
+  // whole machine (hard reboot required, no surviving kernel/OOM log --
+  // this box has no persistent journald storage) with the last surviving
+  // application-log line being "graph prepared for S=...", i.e. somewhere
+  // in the gap between prepare() returning and this compute call. Every
+  // OTHER host allocation on this path (arena prep, expert source, graph
+  // context) goes through MemoryGuard::try_reserve_host_bytes first; this
+  // compute call did not, and it is the last real memory-relevant, cheaply
+  // avoidable step before the model correctness this session verified
+  // could otherwise be undone by a repeat crash. Re-check REAL, fresh
+  // MemAvailable (not the background watchdog's own possibly-500ms-stale
+  // allocation_blocked() flag) immediately before committing to it -- a
+  // large gap can open between the admission checks earlier in prepare()
+  // (preload alone took minutes) and this moment. Not a fix for whatever
+  // the real mechanism was (unconfirmed -- no kernel evidence survived),
+  // just a cheap, additional, defense-in-depth backstop.
+  {
+    const long avail_mb = MemoryGuard::read_available_mb();
+    constexpr long kMinComputeHeadroomMb =
+        10240; // 10 GiB, per explicit user instruction after the 2026-09-09
+               // crash
+    if (avail_mb >= 0 && avail_mb < kMinComputeHeadroomMb) {
+      LOG_ERROR(
+          "[GGML-GLM5NEXT-FULL] refusing graph compute: MemAvailable=%ld MiB "
+          "< %ld MiB safety floor -- falling back to the legacy path rather "
+          "than risk the host-memory incident this check was added for "
+          "(2026-09-09, see this call site's own comment)\n",
+          avail_mb, kMinComputeHeadroomMb);
+      return false;
+    }
+  }
+
+  if (!hold_graph_vram_experts(g))
+    return false;
+  for (auto &entry : g.early_ready)
+    entry.second->completed = false;
+  const auto start = std::chrono::steady_clock::now();
+  if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
+      GGML_STATUS_SUCCESS) {
+    ggml_backend_sched_synchronize(g.sched);
+    release_graph_vram_experts(g);
+    return false;
+  }
+  ggml_backend_sched_synchronize(g.sched);
+  release_graph_vram_experts(g);
+  const auto synced = std::chrono::steady_clock::now();
+  ggml_backend_tensor_get(g.output, hidden_states, 0,
+                          (size_t)g.D * S * sizeof(float));
+
+  for (size_t i = 0; i < g.kda_layers.size(); ++i) {
+    const int l = g.kda_layers[i];
+    ggml_backend_tensor_get(g.kda_state_out[i],
+                            engine.glm5next_recur_state[l].data(), 0,
+                            state_n * sizeof(float));
+    ggml_backend_tensor_get(g.kda_hist_out[i],
+                            engine.glm5next_conv_history[l].data(), 0,
+                            hist_n * sizeof(float));
+  }
+  const size_t kv_n = (size_t)g.S * g.kv_lora;
+  std::vector<float> kv(kv_n);
+  for (size_t i = 0; i < g.dsa_layers.size(); ++i) {
+    const int l = g.dsa_layers[i];
+    if (l < 0 || l >= (int)engine.Lc.size() || !engine.Lc[l])
+      return false;
+    ggml_backend_tensor_get(g.dsa_kv_out[i], kv.data(), 0,
+                            kv_n * sizeof(float));
+    std::memcpy(engine.Lc[l], kv.data(), kv_n * sizeof(float));
+  }
+  g.glm5next_indexer_seeds.clear();
+  g.glm5next_indexer_seeds.reserve(g.glm5next_indexer_layers.size());
+  bool indexer_seeds_ok = true;
+  for (const Glm5nextIndexerLayer &state : g.glm5next_indexer_layers) {
+    if (!state.key_gate_out) {
+      indexer_seeds_ok = false;
+      break;
+    }
+    Glm5nextIndexerSeed seed;
+    seed.layer = state.layer;
+    seed.token_count = g.S;
+    seed.pool_count = g.indexer_kpool > 1 ? g.S / g.indexer_kpool : 0;
+    seed.key_gate.resize((size_t)2 * g.indexer_key_length * g.S);
+    seed.pooled_keys.resize(
+        (size_t)g.indexer_key_length * seed.pool_count);
+    ggml_backend_tensor_get(state.key_gate_out, seed.key_gate.data(), 0,
+                            seed.key_gate.size() * sizeof(float));
+    if (seed.pool_count > 0) {
+      if (!state.pooled_out) {
+        indexer_seeds_ok = false;
+        break;
+      }
+      ggml_backend_tensor_get(state.pooled_out, seed.pooled_keys.data(), 0,
+                              seed.pooled_keys.size() * sizeof(float));
+    }
+    g.glm5next_indexer_seeds.push_back(std::move(seed));
+  }
+  if (!indexer_seeds_ok) {
+    g.glm5next_indexer_seeds.clear();
+    LOG_WARN("[GGML-GLM5NEXT-FULL] indexer seed capture unavailable; "
+             "decode will retain dense attention\n");
+  }
+  const auto done = std::chrono::steady_clock::now();
+  const auto ms = [](auto a, auto b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+  LOG_INFO("[GGML-GLM5NEXT-FULL-TIME] sync=%.3f ms state_get=%.3f ms "
+           "total=%.3f ms\n",
+           ms(start, synced), ms(synced, done), ms(start, done));
+  if (!g.glm5next_indexer_seeds.empty())
+    LOG_INFO("[GGML-GLM5NEXT-FULL] captured KPool prompt seeds: layers=%zu "
+             "tokens=%d pools=%d\n",
+             g.glm5next_indexer_seeds.size(), g.S,
+             g.S / std::max(1, g.indexer_kpool));
+  engine.glm5next_full_graph_output_ready = true;
+  (void)c;
+  return true;
+}
+
+#endif // MOESTREAM_USE_GGML_CUDA

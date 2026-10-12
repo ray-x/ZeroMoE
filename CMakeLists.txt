@@ -413,6 +413,16 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen4exp_graph_run.cpp
         src/ggml_qwen4exp_graph_settings.cpp
         src/ggml_glm5next_graph.cpp
+        src/ggml_glm5next_graph_arena.cpp
+        src/ggml_glm5next_graph_build.cpp
+        src/ggml_glm5next_graph_build_blocks.cpp
+        src/ggml_glm5next_graph_decode.cpp
+        src/ggml_glm5next_graph_offload.cpp
+        src/ggml_glm5next_graph_partial.cpp
+        src/ggml_glm5next_graph_run.cpp
+        src/ggml_glm5next_graph_settings.cpp
+        src/ggml_glm5next_graph_stage.cpp
+        src/ggml_glm5next_graph_weights.cpp
         src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
@@ -524,6 +534,16 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen4exp_graph_run.cpp
         src/ggml_qwen4exp_graph_settings.cpp
         src/ggml_glm5next_graph.cpp
+        src/ggml_glm5next_graph_arena.cpp
+        src/ggml_glm5next_graph_build.cpp
+        src/ggml_glm5next_graph_build_blocks.cpp
+        src/ggml_glm5next_graph_decode.cpp
+        src/ggml_glm5next_graph_offload.cpp
+        src/ggml_glm5next_graph_partial.cpp
+        src/ggml_glm5next_graph_run.cpp
+        src/ggml_glm5next_graph_settings.cpp
+        src/ggml_glm5next_graph_stage.cpp
+        src/ggml_glm5next_graph_weights.cpp
         src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
