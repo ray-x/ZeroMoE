@@ -141,28 +141,9 @@ struct ModelGraphRequest {
   int vocab = 0;
 };
 
-using ModelGraphEnabledFn = bool (*)(const StreamingEngine &engine,
-                                     ModelGraphPhase phase);
-using ModelGraphBootstrapFn = bool (*)(StreamingEngine &engine);
-using ModelGraphBuildFn = bool (*)(StreamingEngine &engine,
-                                   const ModelGraphRequest &request);
-using ModelGraphRunFn = bool (*)(StreamingEngine &engine,
-                                 const ModelGraphRequest &request);
-using ModelGraphDeviceExpertLayersFn = int (*)();
-using ModelGraphShutdownFn = void (*)();
-
-struct ModelGraphOps {
-  ModelGraphEnabledFn enabled = nullptr;
-  ModelGraphBootstrapFn bootstrap = nullptr;
-  ModelGraphBuildFn build = nullptr;
-  ModelGraphRunFn run = nullptr;
-  ModelGraphDeviceExpertLayersFn device_expert_layers = nullptr;
-  ModelGraphShutdownFn shutdown = nullptr;
-};
-
-// Resolved once with the rest of FamilyOps.  An empty table means that the
-// family uses the established layer-by-layer path.
-ModelGraphOps model_graph_ops_for(ModelFamily fam);
+// The family's whole-model graph (models/full_graph_model.hpp); nullptr means
+// the family uses the established layer-by-layer path.
+class FullGraphModel;
 
 struct FamilyOps {
   ModelFamily family = ModelFamily::Unknown;
@@ -177,7 +158,7 @@ struct FamilyOps {
   HcPreFn hc_pre_fn = &hc_pre_noop;
   HcPostFn hc_post_fn = &hc_post_plain_add;
   LayerInputFn layer_input_fn = nullptr; // optional; nullptr = no hook
-  ModelGraphOps graph_ops;               // optional whole-model graph path
+  const FullGraphModel *graph_model = nullptr; // optional whole-model graph
 };
 
 // The single place ModelFamily -> "what does this family actually do" gets
