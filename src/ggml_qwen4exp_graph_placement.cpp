@@ -380,12 +380,6 @@ void plan_partial_layer(StreamingEngine &engine) {
            engine.qwen4exp_partial_layer_gpu_ids.size());
 }
 
-const GGUFTensor *model_tensor(const StreamingEngine &engine,
-                               const std::string &name) {
-  auto it = engine.model_file.tensors.find(name);
-  return it == engine.model_file.tensors.end() ? nullptr : &it->second;
-}
-
 size_t full_expert_source_bytes(const StreamingEngine &engine,
                                 int layer_limit)  {
   const auto &c = engine.model_file.architecture_config;
@@ -567,11 +561,11 @@ size_t device_expert_bytes(const FullGraph &g) {
   // possibly build it -- Phase 1's g_graph when it might commit, and
   // ALL THREE Phase 2 instances (only SuffixGpu actually builds the
   // tensor, but reserving on Prefix/SuffixCpu too is a small, bounded,
-  // always-safe no-op there). Without this, g.device_expert_buffer is
+  // always-safe no-op there). Without this, g.expert.buffer is
   // never allocated at all when device_expert_layers<=0 and
   // split_gpu_expert_ids is empty (this feature's only two OTHER
   // consumers) -- build_split_gpu_tensor then silently fails via
-  // bind_device_expert_gather's own `!g.device_expert_buffer` guard,
+  // bind_device_expert_gather's own `!g.expert.buffer` guard,
   // and the whole compact path falls back to ordinary dispatch for
   // that layer (found via real hardware testing, 2026-09-18: the
   // [PARTIAL-LAYER] "compact GPU tensor construction failed... RAM

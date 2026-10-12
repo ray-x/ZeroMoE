@@ -1,5 +1,7 @@
 #pragma once
 
+#include "graph_core.hpp"
+
 // Shared internals of the GLM5NEXT / DeepSeek-V4 full-graph translation units.
 
 #include "graph_config.hpp"
@@ -55,12 +57,6 @@ namespace glm5next_graph {
 constexpr int kGraphSize = 60000;
 constexpr size_t kTensorContextBytes = 192ull * 1024ull * 1024ull;
 
-struct HostAllocation {
-  void *ptr = nullptr;
-  size_t bytes = 0;
-  bool pinned = false;
-  size_t reservation_bytes = 0;
-};
 
 struct DynamicUploadCopy {
   const void *source = nullptr;
@@ -168,21 +164,20 @@ struct Glm5nextIndexerLayer {
   ggml_tensor *pooled_cache = nullptr;   // decode: [key_length, capacity/kpool]
 };
 
-struct FullGraph {
-  StreamingEngine *engine = nullptr;
+using moestream::graph::DeviceArena;
+using moestream::graph::HostAllocation;
+using moestream::graph::alloc_host;
+using moestream::graph::bind_host;
+using moestream::graph::host_input;
+using moestream::graph::model_tensor;
+using moestream::graph::new_tensor;
+using moestream::graph::resident;
+
+struct FullGraph : moestream::graph::GraphCore {
+  FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
+
   GpuTopology *topology = nullptr;
-  int device = -1;
-  int S = 0;
-  bool decode_mode = false;
-  int kv_capacity = 0;
-  int decode_last_pos = -1;
-  int D = 0;
-  int HC = 0;
-  int n_layers = 0;
-  int H = 0;
-  int hd = 0;
   int d_inner = 0;
-  int d_conv = 0;
   int qk_nope = 0;
   int qk_rope = 0;
   int kv_lora = 0;
@@ -191,7 +186,6 @@ struct FullGraph {
   int o_lora_rank = 0;
   int sliding_window = 0;
   int first_dense = 0;
-  int device_expert_layers = 0;
   ggml_backend_t gpu1 = nullptr; // optional second CUDA device for expert layers
   int gpu1_first = -1, gpu1_last = -2;
   std::vector<ggml_backend_buffer_t> gpu1_buffers;
@@ -222,38 +216,13 @@ struct FullGraph {
   double dynamic_upload_ms_per_job = 0.0;
   std::unique_ptr<DynamicUploadState> dynamic_upload;
 
-  ggml_backend_t cuda = nullptr;
-  ggml_backend_t cpu = nullptr;
-  ggml_backend_sched_t sched = nullptr;
-  ggml_backend_buffer_t dense_buffer = nullptr;
-  void *dense_base = nullptr;
-  size_t dense_capacity = 0;
-  size_t dense_used = 0;
-  int dense_tensors = 0;
-  ggml_backend_buffer_t expert_buffer = nullptr;
-  void *expert_base = nullptr;
-  size_t expert_capacity = 0;
-  size_t expert_used = 0;
-  ggml_backend_buffer_t device_state_buffer = nullptr;
-  void *device_state_base = nullptr;
-  size_t device_state_capacity = 0;
-  size_t device_state_used = 0;
-  ggml_context *ctx = nullptr;
-  ggml_cgraph *graph = nullptr;
 
-  ggml_tensor *input = nullptr;  // [D, HC, S], host input
-  ggml_tensor *logits = nullptr; // decode only: LM-head output [V]
-  ggml_tensor *output = nullptr; // [D, S], after HC mean; LM head norms
-  ggml_tensor *final_streams = nullptr;
-  ggml_tensor *attn_mask = nullptr; // [S, S, 1, 1], F16 causal mask
-  ggml_tensor *decode_indices = nullptr; // [1], I32 DSA KV-cache row
   ggml_tensor *indexer_pool_member_ids = nullptr; // [kpool, n_pools], I32
   ggml_tensor *indexer_pool_mask = nullptr; // [n_pools], F32, per-token
   ggml_tensor *indexer_pool_update_rows = nullptr; // [kpool], I32
   ggml_tensor *indexer_pool_update_index = nullptr; // [1], I32
   ggml_tensor *indexer_tail_indices = nullptr; // [kpool-1], I32
   ggml_tensor *indexer_tail_mask = nullptr; // [kpool-1], F16
-  ggml_tensor *positions = nullptr; // [S], I32 token positions
   ggml_tensor *positions_mod4 = nullptr;
   ggml_tensor *positions_mod128 = nullptr;
   ggml_tensor *block_positions4 = nullptr;
@@ -295,7 +264,6 @@ struct FullGraph {
   std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
   // CPU lanes (MOESTREAM_GLM5NEXT_EARLY_READY): one per layer whose cold experts
   // run concurrently with that layer's GPU work.
-  std::unordered_map<int, std::unique_ptr<EarlyReadyLane>> early_ready;
   struct VramExpertHold {
     int layer = -1;
     int expert = -1;
@@ -305,14 +273,8 @@ struct FullGraph {
   std::vector<Glm5nextIndexerLayer> glm5next_indexer_layers;
   std::vector<Glm5nextIndexerSeed> glm5next_indexer_seeds;
 
-  std::vector<HostAllocation> owned;
-  std::vector<ggml_backend_buffer_t> host_buffers;
-  std::vector<void *> host_inputs;
 
-  size_t host_weight_bytes = 0;
   size_t host_reference_bytes = 0;
-  size_t host_pinned_bytes = 0;
-  size_t host_pin_failures = 0;
   // Any routed projections that lack a stable engine-owned DDR arena are
   // kept in one graph-owned DDR source arena. Keeping the large projections
   // as individual malloc/cudaHostRegister allocations made graph preparation
@@ -338,14 +300,11 @@ struct FullGraph {
   // memory.  Each entry here is a non-owning range inside expert_source_base;
   // destroy() unregisters it before the arena is freed.
   std::vector<HostAllocation> expert_source_pinned_ranges;
-  size_t host_reservation_bytes = 0;
   // ggml_init(no_alloc=true) still owns a host-side context arena.  Keep it
   // in the same admission ledger as the graph's explicit host buffers; the
   // old watchdog only saw the latter and could therefore under-report the
   // graph's host peak during construction.
-  size_t context_reservation_bytes = 0;
   size_t graph_workspace_bytes = 0;
-  bool ready = false;
 
   bool has_expert_source() const {
     if (expert_source_mmap)
@@ -500,17 +459,17 @@ struct FullGraph {
         ggml_backend_buffer_free(b);
     ridge_buffers.clear();
     probe_x.clear();
-    if (expert_buffer) {
-      ggml_backend_buffer_free(expert_buffer);
-      expert_buffer = nullptr;
+    if (expert.buffer) {
+      ggml_backend_buffer_free(expert.buffer);
+      expert.buffer = nullptr;
     }
-    if (device_state_buffer) {
-      ggml_backend_buffer_free(device_state_buffer);
-      device_state_buffer = nullptr;
+    if (state.buffer) {
+      ggml_backend_buffer_free(state.buffer);
+      state.buffer = nullptr;
     }
-    if (dense_buffer) {
-      ggml_backend_buffer_free(dense_buffer);
-      dense_buffer = nullptr;
+    if (dense.buffer) {
+      ggml_backend_buffer_free(dense.buffer);
+      dense.buffer = nullptr;
     }
     partial_expert_residency = false;
     dynamic_expert_cache = false;
@@ -522,22 +481,7 @@ struct FullGraph {
     vram_reference_bytes = 0;
     partial_usage_file.clear();
     partial_experts.clear();
-    for (ggml_backend_buffer_t b : host_buffers)
-      if (b)
-        ggml_backend_buffer_free(b);
-    host_buffers.clear();
-    if (ctx) {
-      ggml_free(ctx);
-      ctx = nullptr;
-    }
-    for (HostAllocation &a : owned) {
-      if (a.pinned)
-        cudaHostUnregister(a.ptr);
-      std::free(a.ptr);
-      MemoryGuard::release_host_bytes(a.reservation_bytes);
-    }
-    owned.clear();
-    host_inputs.clear();
+    release_core(); // host buffers, context, owned host memory, counters
     expert_source_mmap = false;
     expert_source_base = nullptr;
     expert_source_capacity = 0;
@@ -551,10 +495,6 @@ struct FullGraph {
       if (a.pinned)
         cudaHostUnregister(a.ptr);
     expert_source_pinned_ranges.clear();
-    cuda = nullptr;
-    graph = nullptr;
-    input = output = final_streams = attn_mask = decode_indices = positions =
-        nullptr;
     indexer_pool_member_ids = indexer_pool_mask =
         indexer_pool_update_rows = indexer_pool_update_index =
             indexer_tail_indices = indexer_tail_mask = nullptr;
@@ -578,24 +518,13 @@ struct FullGraph {
     glm5next_indexer_seeds.clear();
     dsv4_layers.clear();
     dsv4_stage_outputs.clear();
-    MemoryGuard::release_host_bytes(host_reservation_bytes);
-    host_reservation_bytes = 0;
-    MemoryGuard::release_host_bytes(context_reservation_bytes);
-    context_reservation_bytes = 0;
-    engine = nullptr;
     topology = nullptr;
-    ready = false;
   }
 };
 
 
 // Helpers defined in ggml_glm5next_graph.cpp and used by the DeepSeek-V4 builder.
 bool type_ok(GGUFType type);
-ggml_tensor *host_input(FullGraph &g, ggml_context *ctx, ggml_type type,
-                        const std::vector<int64_t> &shape, size_t bytes,
-                        const char *name);
-const QuantizedTensor *resident(const StreamingEngine &engine,
-                                const std::string &name);
 bool configure_partial_experts(FullGraph &g);
 size_t expert_source_bytes(const StreamingEngine &engine, int device_expert_layers);
 size_t graph_host_live_bytes(const StreamingEngine &engine);

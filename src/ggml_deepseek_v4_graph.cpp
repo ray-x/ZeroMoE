@@ -497,7 +497,7 @@ bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag) {
                   : -1.0,
               static_cast<double>(kMinGraphAllocHeadroomBytes) /
                   (1024.0 * 1024.0 * 1024.0),
-              static_cast<double>(g.expert_capacity + g.dense_capacity) /
+              static_cast<double>(g.expert.capacity + g.dense.capacity) /
                   (1024.0 * 1024.0 * 1024.0));
     return false;
   }
