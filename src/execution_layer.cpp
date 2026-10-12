@@ -4,6 +4,7 @@
 #include "gpu_expert_executor.hpp"
 #include "dense_dispatch.hpp"
 #include "engine.hpp"
+#include "../models/full_graph_model.hpp"
 #include "expert_activation.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_gdn_proj_backend.hpp"
@@ -1014,12 +1015,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   engine.qwen4exp_full_graph_logits_ready = false;
   engine.glm5next_full_graph_output_ready = false;
   engine.deepseek_v4_full_graph_output_ready = false;
-  const auto &graph_ops = engine.family_ops.graph_ops;
+  const FullGraphModel *graph_model = engine.family_ops.graph_model;
   const ModelGraphRequest prefill_graph_request{
       ModelGraphPhase::Prefill, S, pos_base, token_ids, hidden_states};
-  if (S > 1 && pos_base == 0 && graph_ops.enabled && graph_ops.run &&
-      graph_ops.enabled(engine, ModelGraphPhase::Prefill) &&
-      graph_ops.run(engine, prefill_graph_request)) {
+  if (S > 1 && pos_base == 0 && graph_model &&
+      graph_model->enabled(engine, ModelGraphPhase::Prefill) &&
+      graph_model->run(engine, prefill_graph_request)) {
     return;
   }
   // Run the diagnostic before the production decode graph's early return;
@@ -1043,29 +1044,29 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                 reason);
     };
     if (S == 1 && pos_base >= 0) {
-      if (!graph_ops.enabled || !graph_ops.build || !graph_ops.run ||
-          !graph_ops.enabled(engine, ModelGraphPhase::Decode)) {
+      if (!graph_model ||
+          !graph_model->enabled(engine, ModelGraphPhase::Decode)) {
         fail_graph("Qwen4Exp full-graph decode adapter is unavailable");
         return;
       }
-      if (!graph_ops.build(engine, decode_graph_request)) {
+      if (!graph_model->build(engine, decode_graph_request)) {
         fail_graph("Qwen4Exp full-graph decode construction failed");
         return;
       }
-      if (!graph_ops.run(engine, decode_graph_request)) {
+      if (!graph_model->run(engine, decode_graph_request)) {
         fail_graph("Qwen4Exp full-graph decode execution failed");
         return;
       }
       return;
     }
     if (S > 1) {
-      if (pos_base != 0 || !graph_ops.enabled || !graph_ops.run ||
-          !graph_ops.enabled(engine, ModelGraphPhase::Prefill)) {
+      if (pos_base != 0 || !graph_model ||
+          !graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
         fail_graph("Qwen4Exp full-graph prefill adapter is unavailable for "
                    "this request shape");
         return;
       }
-      if (!graph_ops.run(engine, prefill_graph_request)) {
+      if (!graph_model->run(engine, prefill_graph_request)) {
         fail_graph("Qwen4Exp full-graph prefill execution failed");
         return;
       }
@@ -1074,10 +1075,10 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     fail_graph("Qwen4Exp full-graph received an unsupported token shape");
     return;
   }
-  if (S == 1 && pos_base >= 0 && graph_ops.enabled && graph_ops.build &&
-      graph_ops.run && graph_ops.enabled(engine, ModelGraphPhase::Decode) &&
-      graph_ops.build(engine, decode_graph_request) &&
-      graph_ops.run(engine, decode_graph_request)) {
+  if (S == 1 && pos_base >= 0 && graph_model &&
+      graph_model->enabled(engine, ModelGraphPhase::Decode) &&
+      graph_model->build(engine, decode_graph_request) &&
+      graph_model->run(engine, decode_graph_request)) {
     return;
   }
 

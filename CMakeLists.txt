@@ -432,6 +432,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/qwen_moe.cpp
         models/model_factory.cpp
         models/family_ops.cpp
+        models/full_graph_models.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
     target_include_directories(moestream PRIVATE
@@ -553,6 +554,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/qwen_moe.cpp
         models/model_factory.cpp
         models/family_ops.cpp
+        models/full_graph_models.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
     target_include_directories(moestream_tests PRIVATE

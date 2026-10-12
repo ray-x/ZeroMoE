@@ -732,7 +732,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     log_layer0_diag_tensor("gate_up_weight", gate_up_exps);
   }
   const moe_routed::RouterSpec rspec =
-      family_spec(g.engine->family_ops.family).router_spec(c, g.S);
+      family_router_spec(g.engine->family_ops.family, c, g.S);
   ggml_tensor *probs = nullptr;
   if (!fixed_route_ids || !fixed_route_weights || probs_out)
     probs = moe_routed::gate_probs(ctx, rspec, router, cur);

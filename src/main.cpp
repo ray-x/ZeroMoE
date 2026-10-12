@@ -2,6 +2,7 @@
 #include "async_prefetcher.hpp"
 #include "cuda_manager.hpp"
 #include "engine.hpp"
+#include "../models/full_graph_model.hpp"
 #include "option_b_global_hot.hpp"
 #include "engine_config.hpp"
 #include "exl3_cpu.hpp"
@@ -1158,15 +1159,15 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // that the transposition is fixed (ggml_cont(ggml_transpose(...)) before
   // the state is copied out), there is no longer a known correctness
   // reason to keep the two mutually exclusive.
-  const auto &graph_ops = engine.family_ops.graph_ops;
+  const FullGraphModel *graph_model = engine.family_ops.graph_model;
   // Graph mode owns startup-time resources when either phase is graph-backed.
   // In particular, GLM can intentionally keep batched prefill on the legacy
   // path while using the reusable full graph for single-token decode; still
   // prepare its shared-cache references and reusable host source here.
   const bool graph_mode =
-      graph_ops.enabled &&
-      (graph_ops.enabled(engine, ModelGraphPhase::Prefill) ||
-       graph_ops.enabled(engine, ModelGraphPhase::Decode));
+      graph_model != nullptr &&
+      (graph_model->enabled(engine, ModelGraphPhase::Prefill) ||
+       graph_model->enabled(engine, ModelGraphPhase::Decode));
   // Full-graph host-resident expert layers use fixed-stride DDR arenas when
   // ram_preload_all_experts is enabled. GLM also aliases its usage-ranked
   // resident experts in the existing VRAM cache; other graph families retain
@@ -1362,9 +1363,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         glm5next_full_graph_enabled();
     // GLM's graph aliases the existing cache, so it owns no additional
     // device-resident expert block to reserve ahead of cache sizing.
-    const int dev_layers = !glm_shared_expert_cache &&
-                                   graph_ops.device_expert_layers
-                               ? graph_ops.device_expert_layers()
+    const int dev_layers = !glm_shared_expert_cache && graph_model
+                               ? graph_model->device_expert_layers()
                                : 0;
 
     double est_device_expert_gb = 0.0;
@@ -4140,7 +4140,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // established layer path available.
   if (engine.family_ops.family == ModelFamily::GLM5NEXT)
     glm5next_full_graph_set_vram_cache(&gpu.topology);
-  if (graph_mode && graph_ops.bootstrap && !graph_ops.bootstrap(engine)) {
+  if (graph_mode && !graph_model->bootstrap(engine)) {
     LOG_STREAM_WARN()
         << "[GRAPH] graph bootstrap unavailable; "
            "the graph will attempt bounded lazy preparation on the first "
@@ -4487,8 +4487,8 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // buffers. Release it through the model graph contract while CudaManager
   // is still alive; otherwise a static graph destructor can run after CUDA
   // driver teardown and cudaFree aborts.
-  if (engine.family_ops.graph_ops.shutdown)
-    engine.family_ops.graph_ops.shutdown();
+  if (engine.family_ops.graph_model)
+    engine.family_ops.graph_model->shutdown();
   // Phase A write this run's routing-frequency histogram so
   // the NEXT run's startup preload (above) has real data to work from.
   // Best-effort, matches dump_usage's own contract (a failed write just

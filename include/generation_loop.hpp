@@ -1,5 +1,6 @@
 #pragma once
 #include "engine.hpp"
+#include "../models/full_graph_model.hpp"
 #include "tensor_trace.hpp"
 #include "ram_manager.hpp"
 #include "kernels_cpu.hpp"
@@ -702,10 +703,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // prefill.  The prompt IDs are needed only by Qwen's PLE path; graph
     // construction and static weight upload are outside PERF_START.
     const bool unbatched_prefill = prefill_unbatched_enabled();
-    const auto &graph_ops = engine.family_ops.graph_ops;
+    const FullGraphModel *graph_model = engine.family_ops.graph_model;
     if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill &&
-        graph_ops.enabled && graph_ops.build &&
-        graph_ops.enabled(engine, ModelGraphPhase::Prefill)) {
+        graph_model &&
+        graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
         const ModelGraphRequest request{
             ModelGraphPhase::Prefill,
             (int)pc_n_new,
@@ -713,7 +714,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             prompt_ids.data() + pc_reuse,
             nullptr,
         };
-        if (!graph_ops.build(engine, request) &&
+        if (!graph_model->build(engine, request) &&
             engine.qwen4exp_full_graph_required) {
             engine.qwen4exp_full_graph_failure =
                 "prefill graph construction failed";
@@ -1159,12 +1160,12 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
         if (step == 0 && !is_stop_now && max_new_tokens > 1 &&
             engine.family_ops.family == ModelFamily::Qwen4Exp &&
-            graph_ops.enabled && graph_ops.build &&
-            graph_ops.enabled(engine, ModelGraphPhase::Decode)) {
+            graph_model &&
+            graph_model->enabled(engine, ModelGraphPhase::Decode)) {
             const ModelGraphRequest first_decode_request{
                 ModelGraphPhase::Decode, 1, static_cast<int>(prompt_ids.size()),
                 &next_token, decode_hidden.data(), logits.data(), V};
-            if (!graph_ops.build(engine, first_decode_request) &&
+            if (!graph_model->build(engine, first_decode_request) &&
                 engine.qwen4exp_full_graph_required) {
                 engine.qwen4exp_full_graph_failure =
                     "decode graph construction failed before first token";

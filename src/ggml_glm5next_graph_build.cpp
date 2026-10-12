@@ -184,7 +184,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
 
   const moe_routed::RouterSpec rspec =
-      family_spec(g.engine->family_ops.family).router_spec(c, g.S);
+      family_router_spec(g.engine->family_ops.family, c, g.S);
   ggml_tensor *probs = moe_routed::gate_probs(ctx, rspec, router, cur);
   // DeepSeek-V4's first hash-routed layers use a token-id -> expert table
   // for selection, while the learned router still supplies the unbiased
@@ -343,7 +343,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     }
     EarlyReadyLane *lane = nullptr;
     if (has_cold && early_ready_wanted() && !stage && partial->hot1.empty() &&
-        family_spec(g.engine->family_ops.family).supports_cpu_lane()) {
+        family_supports_cpu_lane(g.engine->family_ops.family)) {
       moe_routed::ExpertWeights cold_w;
       cold_w.gate_up = gate_up;
       cold_w.gate = ge;
