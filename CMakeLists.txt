@@ -401,6 +401,17 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen_decode_scheduler.cpp
         src/ggml_qwen_cpu_moe.cpp
         src/ggml_qwen4exp_graph.cpp
+        src/ggml_qwen4exp_graph_arena.cpp
+        src/ggml_qwen4exp_graph_build_blocks.cpp
+        src/ggml_qwen4exp_graph_build.cpp
+        src/ggml_qwen4exp_graph_build_moe.cpp
+        src/ggml_qwen4exp_graph_decode_prepare.cpp
+        src/ggml_qwen4exp_graph_diag.cpp
+        src/ggml_qwen4exp_graph_expert_bind.cpp
+        src/ggml_qwen4exp_graph_host_node.cpp
+        src/ggml_qwen4exp_graph_placement.cpp
+        src/ggml_qwen4exp_graph_run.cpp
+        src/ggml_qwen4exp_graph_settings.cpp
         src/ggml_glm5next_graph.cpp
         src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
@@ -501,6 +512,17 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_qwen_decode_scheduler.cpp
         src/ggml_qwen_cpu_moe.cpp
         src/ggml_qwen4exp_graph.cpp
+        src/ggml_qwen4exp_graph_arena.cpp
+        src/ggml_qwen4exp_graph_build_blocks.cpp
+        src/ggml_qwen4exp_graph_build.cpp
+        src/ggml_qwen4exp_graph_build_moe.cpp
+        src/ggml_qwen4exp_graph_decode_prepare.cpp
+        src/ggml_qwen4exp_graph_diag.cpp
+        src/ggml_qwen4exp_graph_expert_bind.cpp
+        src/ggml_qwen4exp_graph_host_node.cpp
+        src/ggml_qwen4exp_graph_placement.cpp
+        src/ggml_qwen4exp_graph_run.cpp
+        src/ggml_qwen4exp_graph_settings.cpp
         src/ggml_glm5next_graph.cpp
         src/ggml_deepseek_v4_graph.cpp
         src/ggml_hc_backend.cpp
