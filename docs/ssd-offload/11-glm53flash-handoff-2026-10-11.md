@@ -300,3 +300,13 @@ Held-out corpus prompts (not in either ranking), identical tokens, AJ IQ2_XXS, d
 benchmark sequence (steady state, last 30 tokens): baseline 14.85 tok/s, with the recipe 15.05-15.10. Second assist device alone:
 -0.4 ms; threads 10 vs 8: -0.3 ms; hot set 15.0 vs 14.2 GiB: -0.6 ms (15.3 does not fit: the dense arena is declined).
 Pool: auto sizing now reserves 36 GiB instead of 60 (75.9 GiB pool on this box); the Q2_K/Q3_K GSQ-RCO file needs ~74 GiB.
+
+### Lane time breakdown and a rebalancing experiment (2026-10-14)
+
+Per decode token (AJ, dual GPU, recipe): lane compute 39.7 ms = CPU graph 30.5 + assist launch 2.9 + assist join 9.1 (the part of
+the assist path not hidden behind the CPU graph); the CPU graph is ~0.73 ms per layer for ~1.15 cold experts per layer (1 expert =
+~400 us, 2 = ~720 us in `expert_cost_by_quant_bench`; the fixed part of each call is large). A cost-model split of the ready experts
+between the two assist devices and the CPU (copy time over each link vs learned CPU time per expert, launch cost 100-400 us) shifted
+time between those buckets (CPU graph 34-38 ms, join 2.4-7 ms) but not the total: 66.5-67.4 ms vs 66.4 ms. The lane is on a balanced
+plateau; reverted. Held-out ranking quality saturates too: training on 90 prompts instead of 31 moves the held-out cold share only
+from 35.8% to 34.8% (oracle 28%).
