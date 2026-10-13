@@ -11,12 +11,12 @@ USAGE=${GLM_USAGE:-$HOME/work/moestream-prefetch/docs/ssd-offload/data/glm53flas
 TOML_SRC=${GLM_TOML:-$HOME/work/moestream-prefetch/glm_runs/spread_off.toml}
 PROMPT=${PROMPT:-'Explain how a mixture-of-experts transformer routes tokens, in a few clear paragraphs.'}
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do sleep 5; done
-python3 -c '
+if [ "${NO_DROP:-0}" != 1 ]; then python3 -c '
 import os, sys
 for a in sys.argv[1:]:
     for f in a.split(":"):
         fd = os.open(f, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
-' "$MODEL" "${MODEL/-00001-of-00002/-00002-of-00002}" "$STORE"
+' "$MODEL" "${MODEL/-00001-of-00002/-00002-of-00002}" "$STORE"; fi
 sed "s#^log_path *=.*#log_path = \"$out/$tag.engine.log\"#" "$TOML_SRC" > "$out/$tag.toml"
 printf '%s\n:q\n' "$PROMPT" | env -u MOESTREAM_GLM5NEXT_FULL_GRAPH \
   MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=32 \

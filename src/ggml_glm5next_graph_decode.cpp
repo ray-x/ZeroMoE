@@ -207,7 +207,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (!g->gpu1)
     backends[1] = g->cpu;
   g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2,
-                                    kGraphSize, false, true);
+                                    kGraphSize, false, false);
   if (!g->sched || !build_graph(*g)) {
     LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] graph construction declined; "
              "using legacy decode\n");

@@ -178,7 +178,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
     return false;
   ggml_backend_t backends[] = {g->cuda, g->cpu};
   g->sched =
-      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, true);
+      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, false);
   if (!g->sched)
     return false;
   if (!build_graph(*g)) {

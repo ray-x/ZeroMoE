@@ -704,23 +704,38 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // construction and static weight upload are outside PERF_START.
     const bool unbatched_prefill = prefill_unbatched_enabled();
     const FullGraphModel *graph_model = engine.family_ops.graph_model;
+    // Tokens run as one batch through the prefill forward below. A family whose prefill graph has
+    // bounded buffers (max_prefill_tokens) runs only the first N tokens through the graph and the
+    // rest as S=1 steps; it applies only once the graph actually built, so a failed build keeps
+    // the whole-prompt fallback.
+    size_t pc_n_batched = pc_n_new;
     if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill &&
         graph_model &&
         graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
+        size_t pc_n_graph = pc_n_new;
+        const int cap = graph_model->max_prefill_tokens(engine);
+        if (cap > 1 && (size_t)cap < pc_n_new)
+            pc_n_graph = (size_t)cap;
         const ModelGraphRequest request{
             ModelGraphPhase::Prefill,
-            (int)pc_n_new,
+            (int)pc_n_graph,
             (int)pc_reuse,
             prompt_ids.data() + pc_reuse,
             nullptr,
         };
-        if (!graph_model->build(engine, request) &&
-            engine.qwen4exp_full_graph_required) {
+        const bool graph_built = graph_model->build(engine, request);
+        if (!graph_built && engine.qwen4exp_full_graph_required) {
             engine.qwen4exp_full_graph_failure =
                 "prefill graph construction failed";
             LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; aborting request\n",
                       engine.qwen4exp_full_graph_failure.c_str());
             return;
+        }
+        if (graph_built) {
+            pc_n_batched = pc_n_graph;
+        } else if (!bench_silent) {
+            std::cerr << "\n[WARN] prefill graph declined (see the engine log); falling back to the "
+                         "legacy whole-prompt prefill, which is much slower for long prompts\n";
         }
     } else if (engine.qwen4exp_full_graph_required && pc_n_new > 1 &&
                !unbatched_prefill && pc_reuse == 0) {
@@ -791,13 +806,13 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             }
         } else {
             if (hc_active)
-                hc_expand_embedding(engine, hidden_states.data(), (int)pc_n_new, D);
+                hc_expand_embedding(engine, hidden_states.data(), (int)pc_n_batched, D);
             // pos_base = pc_reuse: the reused prefix's dense KV rows are already in
             // place (position-indexed and untouched since they were written), so the
             // causal attention below still sees the full context.
             engine.qwen4exp_full_graph_logits_target = logits.data();
             engine.qwen4exp_full_graph_logits_target_size = V;
-            layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), pc_n_new,
+            layers_forward_gguf(engine, ram_mgr, prefetcher, hidden_states.data(), pc_n_batched,
                                 pc_reuse, prompt_ids.data() + pc_reuse);
             engine.qwen4exp_full_graph_logits_target = nullptr;
             engine.qwen4exp_full_graph_logits_target_size = 0;
@@ -806,10 +821,35 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
                 !engine.glm5next_full_graph_output_ready &&
                 !engine.deepseek_v4_full_graph_output_ready)
-                hc_collapse_output(engine, hidden_states.data(), (int)pc_n_new, D);
+                hc_collapse_output(engine, hidden_states.data(), (int)pc_n_batched, D);
             engine.qwen4exp_full_graph_output_ready = false;
             engine.glm5next_full_graph_output_ready = false;
             engine.deepseek_v4_full_graph_output_ready = false;
+
+            // Tokens beyond the bounded graph batch: the same S=1 steps the unbatched parity mode
+            // uses (the decode graph reads the KV/recurrent state the batched part just wrote).
+            if (pc_n_batched < pc_n_new) {
+                LOG_STREAM_INFO() << "[PREFILL] graph batch covers the first " << pc_n_batched
+                                  << " tokens; stepping the remaining "
+                                  << (pc_n_new - pc_n_batched) << " one token at a time\n";
+                for (size_t t = pc_n_batched; t < pc_n_new; ++t) {
+                    float *row = hidden_states.data() + t * (size_t)D;
+                    if (hc_active)
+                        hc_expand_embedding(engine, row, 1, D);
+                    layers_forward_gguf(engine, ram_mgr, prefetcher, row, 1,
+                                        pc_reuse + (int)t,
+                                        prompt_ids.data() + pc_reuse + t);
+                    if (!engine.qwen4exp_full_graph_failure.empty())
+                        return;
+                    if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+                        !engine.glm5next_full_graph_output_ready &&
+                        !engine.deepseek_v4_full_graph_output_ready)
+                        hc_collapse_output(engine, row, 1, D);
+                    engine.qwen4exp_full_graph_output_ready = false;
+                    engine.glm5next_full_graph_output_ready = false;
+                    engine.deepseek_v4_full_graph_output_ready = false;
+                }
+            }
         }
     }
     // Was `PERF_END(prefill, t_attn)` -- dumped this WHOLE prefill pass's
