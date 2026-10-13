@@ -150,3 +150,9 @@ After both: lane compute ~106 ms/token, residual load stall ~42 ms/token (about 
 id wait ~25 ms/token. Gathers (`vpgatherdq`) run 3-5x slower than scalar loads on this Cascade Lake (GDS mitigation):
 `bench/kernels/iq2xxs_dot_bench.cpp` has the exactness check and the rejected variants.
 `bench/glm_env_ab.sh` runs any two env/library setups order-balanced and compares logits + tokens.
+
+Measured negative (same day): pilot prefetch (K=4, copy off) feeding the overlapped lane. Demand misses fell 41%
+(936 -> 552 per 32 tokens) but each load got slower under contention (2.8 -> 3.9 ms), the residual stall did not move and steady-state
+decode went 165.8 -> 168.8 ms/token (A/B x2, same sign). Not kept. Other things tried and dropped: `MOESTREAM_OFFLOAD_EVICT=free`
+(2.85 -> 2.81 ms per load, noise), CPU threads 6/10/12 vs 8 (5.16/5.21/4.73 vs 5.29 tok/s), striped vs single store with the new lane
+(5.29 vs 5.27: raw QD1 read of one 6.6 MB expert is 2.3-2.8 ms on these drives, so loads are device-latency bound).

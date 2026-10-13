@@ -591,10 +591,19 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
         compute += entry.second->compute_us;
         stall += entry.second->split_stall_us;
       }
+      uint64_t misses = 0, loads = 0, load_us = 0;
+      if (OffloadState *o = g_offload.get()) {
+        const auto &ct = o->store->counters();
+        misses = ct.misses.load();
+        loads = ct.loads.load();
+        load_us = ct.load_us.load();
+      }
       LOG_INFO("[GLM5NEXT-LANE] tokens=%d lane calls=%llu split=%llu wait=%.1fms/token compute=%.1fms/token "
-               "split stall=%.1fms/token\n",
+               "split stall=%.1fms/token | misses=%llu loads=%llu read=%.1fms/token (%.2f ms per load)\n",
                lane_tokens, (unsigned long long)calls, (unsigned long long)split,
-               wait / 1000.0 / lane_tokens, compute / 1000.0 / lane_tokens, stall / 1000.0 / lane_tokens);
+               wait / 1000.0 / lane_tokens, compute / 1000.0 / lane_tokens, stall / 1000.0 / lane_tokens,
+               (unsigned long long)misses, (unsigned long long)loads, load_us / 1000.0 / lane_tokens,
+               loads ? load_us / 1000.0 / loads : 0.0);
     }
   }
   if (op_prof_on) {
