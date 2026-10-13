@@ -61,14 +61,6 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     const int *token_ids, float *logits,
                                     int vocab);
 
-// Diagnostic-only two-layer decode-shaped graph. It builds Layers 0 and 1
-// with S=1, retains their real inter-layer dependency, and publishes the
-// selected boundaries as graph outputs. It is active only when
-// MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DIAG=1 and never replaces production
-// execution.
-bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &engine,
-                                    int pos_base, const int *token_ids);
-
 // Destroy the graph while the shared CUDA backend is still alive.  The
 // bridge owns scheduler buffers, so leaving this to static destruction runs
 // after CudaManager has torn down the driver and makes cudaFree report

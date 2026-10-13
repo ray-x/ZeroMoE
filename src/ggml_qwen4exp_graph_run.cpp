@@ -168,75 +168,6 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                wt.completed ? wt.run_ms_total / wt.completed : 0.0);
     }
   }
-  dump_layer0_diag_values(g);
-  if (env_alllayers_dump_path())
-    dump_all_layers_snapshot(g, pos_base);
-  if (g.layer13_moe_diag_enabled && g.layer13_moe_input_diag &&
-      g.layer13_moe_ids_diag && g.layer13_moe_weights_diag) {
-    const size_t input_n = ggml_nelements(g.layer13_moe_input_diag);
-    const size_t ids_n = ggml_nelements(g.layer13_moe_ids_diag);
-    const size_t weights_n = ggml_nelements(g.layer13_moe_weights_diag);
-    std::vector<float> input(input_n), weights(weights_n);
-    std::vector<int32_t> ids(ids_n);
-    ggml_backend_tensor_get(g.layer13_moe_input_diag, input.data(), 0,
-                            input_n * sizeof(float));
-    ggml_backend_tensor_get(g.layer13_moe_ids_diag, ids.data(), 0,
-                            ids_n * sizeof(int32_t));
-    ggml_backend_tensor_get(g.layer13_moe_weights_diag, weights.data(), 0,
-                            weights_n * sizeof(float));
-    LOG_INFO("[QWEN4EXP-LAYER13-ROUTE-DIAG] ordinary input_fnv64=0x%016llx "
-             "ids_fnv64=0x%016llx weights_fnv64=0x%016llx "
-             "ids=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
-             static_cast<unsigned long long>(qwen4exp_fnv64(
-                 input.data(), input_n * sizeof(float))),
-             static_cast<unsigned long long>(qwen4exp_fnv64(
-                 ids.data(), ids_n * sizeof(int32_t))),
-             static_cast<unsigned long long>(qwen4exp_fnv64(
-                 weights.data(), weights_n * sizeof(float))),
-             ids_n > 0 ? ids[0] : -1, ids_n > 1 ? ids[1] : -1,
-             ids_n > 2 ? ids[2] : -1, ids_n > 3 ? ids[3] : -1,
-             ids_n > 4 ? ids[4] : -1, ids_n > 5 ? ids[5] : -1,
-             ids_n > 6 ? ids[6] : -1, ids_n > 7 ? ids[7] : -1,
-             ids_n > 8 ? ids[8] : -1, ids_n > 9 ? ids[9] : -1);
-    const char *input_dump = env_layer13_moe_ordinary_input_dump_path();
-    if (input_dump) {
-      const bool dumped = qwen4exp_dump_f32(input_dump, input.data(), input_n);
-      LOG_INFO("[QWEN4EXP-LAYER13-INPUT-DIAG] path=ordinary "
-               "dump=%s file=%s elements=%zu\n",
-               dumped ? "ok" : "failed", input_dump, input_n);
-    }
-  }
-  if (g.layer13_pre_ffn_residual_diag && env_layer13_moe_dump_path()) {
-    const size_t n = static_cast<size_t>(ggml_nelements(
-        g.layer13_pre_ffn_residual_diag));
-    std::vector<float> values(n);
-    ggml_backend_tensor_get(g.layer13_pre_ffn_residual_diag, values.data(), 0,
-                            n * sizeof(float));
-    std::string path = env_layer13_moe_dump_path();
-    path += ".pre_ffn_residual.f32";
-    const bool dumped = qwen4exp_dump_f32(path.c_str(), values.data(), n);
-    LOG_INFO("[QWEN4EXP-LAYER13-PRE-FFN-DIAG] dump=%d file=%s "
-             "fnv64=0x%016llx elements=%zu\n",
-             dumped ? 1 : 0, path.c_str(),
-             static_cast<unsigned long long>(qwen4exp_fnv64(
-                 values.data(), n * sizeof(float))),
-             n);
-  }
-  if (g.layer13_moe_diag_enabled && g.layer13_moe_diag &&
-      env_layer13_moe_dump_path() && !g.layer13_moe_diag_dumped) {
-    const size_t n = ggml_nelements(g.layer13_moe_diag);
-    std::vector<float> values(n);
-    ggml_backend_tensor_get(g.layer13_moe_diag, values.data(), 0,
-                            n * sizeof(float));
-    const uint64_t hash = qwen4exp_fnv64(values.data(), n * sizeof(float));
-    const bool dumped = qwen4exp_dump_f32(env_layer13_moe_dump_path(),
-                                          values.data(), n);
-    g.layer13_moe_diag_dumped = dumped;
-    LOG_INFO("[QWEN4EXP-LAYER13-MOE-DIAG] path=ordinary-ggml-dispatch "
-             "dump=%s file=%s fnv64=0x%016llx elements=%zu\n",
-             dumped ? "ok" : "failed", env_layer13_moe_dump_path(),
-             static_cast<unsigned long long>(hash), n);
-  }
   double host_node_d2h_ms = 0.0;
   double host_node_h2d_ms = 0.0;
   double host_node_callback_span_ms = 0.0;
@@ -286,10 +217,6 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
             qwen4exp_fnv64(host_node->host_output_gpu_check,
                            host_node->output_bytes);
         host_node->last_gpu_hash.store(gpu_hash, std::memory_order_release);
-        log_layer0_diag_host_values("cpu_output_pre_h2d",
-                                   host_node->host_output, n);
-        log_layer0_diag_host_values("gpu_output_post_h2d",
-                                   host_node->host_output_gpu_check, n);
         float max_abs_delta = 0.0f;
         double sum_delta = 0.0;
         for (size_t i = 0; i < n; ++i) {
@@ -313,18 +240,6 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                      ? 1
                      : 0,
                  max_abs_delta, sum_delta, host_node->output_bytes);
-        if (host_node->layer_index == 13 &&
-            env_layer13_moe_dump_path() && !g.layer13_moe_diag_dumped) {
-          const char *path = env_layer13_moe_dump_path();
-          const bool dumped = qwen4exp_dump_f32(
-              path, host_node->host_output,
-              host_node->output_bytes / sizeof(float));
-          g.layer13_moe_diag_dumped = dumped;
-          LOG_INFO("[QWEN4EXP-LAYER13-MOE-DIAG] path=host-node-CPU "
-                   "dump=%s file=%s fnv64=0x%016llx\n",
-                   dumped ? "ok" : "failed", path,
-                   static_cast<unsigned long long>(cpu_hash));
-        }
       }
     }
     const double scheduler_gate_wait_ms =
@@ -660,34 +575,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   // sites above -- never wrote it out. Without this, a llama.cpp parity
   // trace could only compare the single-token decode step, never any of
   // the S>1 prompt-token positions llama.cpp's own nt=S batch covers.
-  if (env_alllayers_dump_path())
-    dump_all_layers_snapshot(g, pos_base);
-  if (const char *split_dump_path = env_layer0_split_dump_path()) {
-    std::unordered_map<std::string, size_t> snapshot_occurrences;
-    for (const auto &entry : g.layer0_split_snapshots) {
-      const size_t occurrence = snapshot_occurrences[entry.first]++;
-      ggml_tensor *t = entry.second;
-      if (!t || !t->data)
-        continue;
-      const size_t n = static_cast<size_t>(ggml_nelements(t));
-      std::vector<float> values(n);
-      ggml_backend_tensor_get(t, values.data(), 0, n * sizeof(float));
-      std::string path = std::string(split_dump_path) + ".prefill." +
-                         entry.first;
-      if (occurrence != 0)
-        path += "." + std::to_string(occurrence);
-      path += ".f32";
-      if (qwen4exp_dump_f32(path.c_str(), values.data(), n))
-        LOG_INFO("[QWEN4EXP-LAYER0-SPLIT] prefill snapshot=%s elements=%zu "
-                 "fnv64=0x%016llx path=%s\n",
-                 entry.first.c_str(), n,
-                 static_cast<unsigned long long>(qwen4exp_fnv64(
-                     values.data(), n * sizeof(float))),
-                 path.c_str());
-    }
-  }
   const auto t_output_end = std::chrono::steady_clock::now();
-  dump_layer0_diag_values(g);
 
 
   g.prefill_host_state_deferred =
@@ -734,16 +622,6 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     // post-compute state so it can be compared with llama.cpp's prefill cache
     // without disturbing the state owner or adding a graph node.
     if (!g.decode_mode) {
-      if (const char *split_dump_path = env_layer0_split_dump_path()) {
-        const std::string path = std::string(split_dump_path) +
-                                 ".prefill.ple_history_after.f32";
-        qwen4exp_dump_f32(path.c_str(), dst.data(), hist_n);
-        LOG_INFO("[QWEN4EXP-LAYER0-SPLIT] prefill PLE history dump path=%s "
-                 "elements=%zu fnv64=0x%016llx\n",
-                 path.c_str(), hist_n,
-                 static_cast<unsigned long long>(qwen4exp_fnv64(
-                     dst.data(), hist_n * sizeof(float))));
-      }
     }
     engine.qwen4exp_ple_tok_hist.clear();
     const int keep = std::max(0, c.ple_ngram_size - 1);

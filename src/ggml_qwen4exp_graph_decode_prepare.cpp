@@ -74,10 +74,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // while the configured device block is loaded directly into VRAM during
   // graph construction. Models with lazy host expert ownership stay on the
   // established layered path.
-  const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
   for (int layer = 0; layer < c.n_layers; ++layer) {
-    if (narrow_layer0_diag && layer != 0)
-      continue;
     if (engine.qwen_ram_vram_only_layer(layer))
       continue;
     if (!engine.graph_ram_layer_ready(layer)) {

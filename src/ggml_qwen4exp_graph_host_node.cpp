@@ -388,30 +388,6 @@ uint64_t qwen4exp_fnv64(const void *data, size_t bytes) {
   return hash;
 }
 
-const char *env_layer13_moe_dump_path() {
-  const char *path =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_DUMP");
-  return path && path[0] ? path : nullptr;
-}
-
-const char *env_layer13_moe_input_dump_path() {
-  const char *path =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_INPUT_DUMP");
-  return path && path[0] ? path : nullptr;
-}
-
-const char *env_layer13_moe_host_input_dump_path() {
-  const char *path =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_HOST_INPUT_DUMP");
-  return path && path[0] ? path : env_layer13_moe_input_dump_path();
-}
-
-const char *env_layer13_moe_ordinary_input_dump_path() {
-  const char *path =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER13_MOE_ORDINARY_INPUT_DUMP");
-  return path && path[0] ? path : env_layer13_moe_input_dump_path();
-}
-
 bool qwen4exp_dump_f32(const char *path, const float *data,
                               size_t elements) {
   if (!path || !data)
@@ -707,46 +683,6 @@ void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data) {
                                             ctx->output_bytes),
                              std::memory_order_release);
     ctx->last_cpu_hash_valid.store(true, std::memory_order_release);
-    if (ctx->layer_index == 13) {
-      const uint64_t input_hash =
-          qwen4exp_fnv64(ctx->host_input, ctx->input_bytes);
-      const int32_t *diagnostic_ids =
-          ctx->partial_cold_only &&
-                  ctx->route_snapshot_ids.size() ==
-                      static_cast<size_t>(ctx->topk)
-              ? ctx->route_snapshot_ids.data()
-              : ctx->host_ids;
-      const float *diagnostic_weights =
-          ctx->partial_cold_only &&
-                  ctx->route_snapshot_weights.size() ==
-                      static_cast<size_t>(ctx->topk)
-              ? ctx->route_snapshot_weights.data()
-              : ctx->host_weights;
-      const uint64_t ids_hash =
-          qwen4exp_fnv64(diagnostic_ids, ctx->ids_bytes);
-      const uint64_t weights_hash =
-          qwen4exp_fnv64(diagnostic_weights, ctx->weights_bytes);
-      LOG_INFO("[QWEN4EXP-LAYER13-ROUTE-DIAG] host input_fnv64=0x%016llx "
-               "ids_fnv64=0x%016llx weights_fnv64=0x%016llx "
-               "ids=[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]\n",
-               static_cast<unsigned long long>(input_hash),
-               static_cast<unsigned long long>(ids_hash),
-               static_cast<unsigned long long>(weights_hash),
-               diagnostic_ids[0], diagnostic_ids[1], diagnostic_ids[2],
-               diagnostic_ids[3], diagnostic_ids[4], diagnostic_ids[5],
-               diagnostic_ids[6], diagnostic_ids[7], diagnostic_ids[8],
-               diagnostic_ids[9]);
-      const char *input_dump = env_layer13_moe_host_input_dump_path();
-      if (input_dump) {
-        const bool dumped = qwen4exp_dump_f32(
-            input_dump, ctx->host_input,
-            ctx->input_bytes / sizeof(float));
-        LOG_INFO("[QWEN4EXP-LAYER13-INPUT-DIAG] path=host-node "
-                 "dump=%s file=%s elements=%zu\n",
-                 dumped ? "ok" : "failed", input_dump,
-                 ctx->input_bytes / sizeof(float));
-      }
-    }
   }
   qwen_cpu_moe_diag_set_layer(-1);
   ctx->last_ok.store(ok, std::memory_order_release);

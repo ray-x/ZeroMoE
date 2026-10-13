@@ -107,9 +107,7 @@ ggml_tensor *build_qwen4exp_host_node(
   // callback runner borrows it; FullGraph remains responsible for teardown.
   node_ctx->shared_cpu_threadpool = g.cpu_threadpool;
   node_ctx->shared_cpu_threads = g.cpu_threads;
-  node_ctx->transport_diag =
-      env_host_node_transport_diag_enabled(layer) ||
-      (layer == 13 && env_layer13_moe_dump_path() != nullptr);
+  node_ctx->transport_diag = env_host_node_transport_diag_enabled(layer);
   node_ctx->projection_compact = arena->projection_compact;
   LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d allocating callback context "
            "arena=%p bytes=%zu layout=%s gate_stride=%zu up_stride=%zu "
@@ -709,28 +707,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor *fixed_route_weights,
                        ggml_tensor **route_weights_out)  {
   const auto &c = g.engine->model_file.architecture_config;
-  const bool layer13_moe_diag =
-      layer == 13 && env_layer13_moe_dump_path() != nullptr;
-  if (layer13_moe_diag)
-    g.layer13_moe_diag_enabled = true;
-  const bool layer0_diag =
-      (layer == 0 && (env_layer0_iq2_diag_enabled() ||
-                      env_layer0_split_dump_path() != nullptr)) ||
-      env_alllayers_dump_path() != nullptr;
-  if (layer0_diag) {
-    g.layer0_diag_enabled = true;
-    LOG_INFO("[QWEN4EXP-LAYER0-DIAG] graph=%p decode=%d S=%d "
-             "route_path_candidate=%s\n",
-             static_cast<void *>(&g), g.decode_mode ? 1 : 0, g.S,
-             (g.decode_mode && env_qwen4exp_host_node_enabled() &&
-              g.engine->qwen4exp_cpu_offload_layer_enabled(layer))
-                 ? "host-node-CPU"
-                 : "ordinary-ggml-dispatch");
-    log_layer0_diag_tensor("gate_weight", gate_exps);
-    log_layer0_diag_tensor("up_weight", up_exps);
-    log_layer0_diag_tensor("down_weight", down_exps);
-    log_layer0_diag_tensor("gate_up_weight", gate_up_exps);
-  }
   const moe_routed::RouterSpec rspec =
       family_router_spec(g.engine->family_ops.family, c, g.S);
   ggml_tensor *probs = nullptr;
@@ -804,28 +780,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return nullptr;
   if (route_weights_out)
     *route_weights_out = weights;
-  if (layer13_moe_diag) {
-    // These are diagnostic snapshots only. The argsort result is a strided
-    // view and ordinary intermediate buffers may be allocator-reused after
-    // the graph retires, so retain the logical values in stable host inputs.
-    ggml_tensor *diag_input = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
-    if (diag_input && diag_input->type != GGML_TYPE_F32)
-      diag_input = ggml_cast(ctx, diag_input, GGML_TYPE_F32);
-    if (diag_input)
-      diag_input = ggml_cont(ctx, diag_input);
-    g.layer13_moe_input_diag = layer13_moe_diag_snapshot(
-        g, ctx, diag_input, GGML_TYPE_F32,
-        {g.D, g.S}, "qwen_layer13_moe_input_diag");
-    g.layer13_moe_ids_diag = layer13_moe_diag_snapshot(
-        g, ctx, ids, GGML_TYPE_I32,
-        {c.topk, g.S}, "qwen_layer13_moe_ids_diag");
-    g.layer13_moe_weights_diag = layer13_moe_diag_snapshot(
-        g, ctx, weights, GGML_TYPE_F32,
-        {1, c.topk, g.S}, "qwen_layer13_moe_weights_diag");
-    if (!g.layer13_moe_input_diag || !g.layer13_moe_ids_diag ||
-        !g.layer13_moe_weights_diag)
-      return nullptr;
-  }
   ggml_build_forward_expand(g.graph, weights);
   if (routing_only) {
     // Phase 2 prefix graph: caller only wanted ids_out/probs_out for the
@@ -944,9 +898,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         build_qwen4exp_host_node(g, ctx, cur, ids, weights, layer);
     if (!host_node)
       return nullptr;
-    if (layer0_diag)
-      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] path=host-node-CPU "
-               "compute=CPU-GGML-MUL_MAT_ID (no CUDA IQ2 dot)\n");
     return host_node;
   }
   if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
@@ -958,9 +909,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
 
   ggml_tensor *input3 = ggml_reshape_3d(ctx, cur, g.D, 1, g.S);
-  if (layer13_moe_diag && input3) {
-    input3 = ggml_cont(ctx, input3);
-  }
   ggml_tensor *experts = nullptr;
 
   // Genuine per-expert split path: route IDs are remapped independently for
@@ -1185,19 +1133,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_tensor *act = ffn.act;
     ggml_tensor *down = ffn.down;
     experts = ggml_mul(ctx, down, weights);
-    if (layer0_diag) {
-      g.layer0_diag_gate = gate;
-      g.layer0_diag_up = up;
-      g.layer0_diag_act = act;
-      g.layer0_diag_down = down;
-      g.layer0_diag_gate_up = gate_up;
-      LOG_INFO("[QWEN4EXP-LAYER0-DIAG] path=ordinary-ggml-dispatch "
-               "representation=%s\n",
-               gate_up ? "merged-gate-up" : "separate-gate-up");
-      log_layer0_diag_tensor("gate_output", gate);
-      log_layer0_diag_tensor("up_output", up);
-      log_layer0_diag_tensor("down_output", down);
-    }
     if (g.layer_timing_enabled) {
       // See FullGraph::layer_timing_layer_of's own comment -- these are
       // the actual CPU-dispatched op result tensors when this layer is
@@ -1221,10 +1156,6 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
 
   ggml_tensor *out = moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
-  if (layer13_moe_diag)
-    g.layer13_moe_diag = layer13_moe_diag_snapshot(
-        g, ctx, out, GGML_TYPE_F32, {g.D, g.S},
-        "qwen_layer13_moe_output_diag");
   (void)layer;
   return out;
 }

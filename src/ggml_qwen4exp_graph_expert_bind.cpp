@@ -405,11 +405,9 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
     // the source policy visible instead of hiding an SSD read behind this
     // path.  This guard is deliberately Qwen-full-graph-only; other model
     // families have their own graph source ownership rules.
-    const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
     const bool require_preloaded_ram =
         g.engine->qwen_ram_preload_all_experts &&
-        !g.engine->qwen_ram_vram_only_layer(graph_ram_layer) &&
-        (!narrow_layer0_diag || graph_ram_layer == 0);
+        !g.engine->qwen_ram_vram_only_layer(graph_ram_layer);
     if (graph_ram_layer >= 0 && require_preloaded_ram) {
       LOG_WARN("[GGML-QWEN-FULL] refusing file-backed expert source for "
                "layer=%d: ram_preload_all_experts requires the preloaded "

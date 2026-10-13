@@ -68,12 +68,7 @@ std::unique_ptr<FullGraph> g_graph_prefill_state_owner;
 // ~13 GiB (~2.7 s). Holds only the expert arena and its address map.
 std::unique_ptr<FullGraph> g_graph_decode_arena_owner;
 
-// Standalone two-layer diagnostic owner. It is intentionally separate from
-// g_graph so enabling the diagnostic cannot alter the production full-graph
-// cache or its phase-2 sibling ownership.
-std::unique_ptr<FullGraph> g_two_layer_diag_graph;
 
-bool g_two_layer_diag_done = false;
 
 bool g_config_full_graph = false;
 
@@ -181,8 +176,6 @@ void qwen4exp_full_graph_shutdown() {
   g_graph_prefill_state_owner.reset();
   g_graph_prefill_arena_owner.reset();
   g_graph_decode_arena_owner.reset();
-  g_two_layer_diag_graph.reset();
-  g_two_layer_diag_done = false;
 }
 
 namespace qwen4exp_graph {
@@ -312,10 +305,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   const bool reuse_prefill_weight_arenas =
       env_decode_borrow_prefill_arenas() && !prefill_compact_arena_needed;
   if (engine.qwen_ram_preload_all_experts) {
-    const bool narrow_layer0_diag = env_layer0_narrow_graph_diag_enabled();
     for (int layer = 0; layer < c.n_layers; ++layer) {
-      if (narrow_layer0_diag && layer != 0)
-        continue;
       if (engine.qwen_ram_vram_only_layer(layer))
         continue;
       if (!engine.graph_ram_layer_ready(layer)) {
@@ -760,9 +750,6 @@ bool qwen4exp_full_graph_run(StreamingEngine &, float *, int, int,
 }
 bool qwen4exp_full_graph_decode_run(StreamingEngine &, float *, int,
                                     const int *, float *, int) {
-  return false;
-}
-bool qwen4exp_two_layer_s1_diag_run(StreamingEngine &, int, const int *) {
   return false;
 }
 void qwen4exp_full_graph_shutdown() {}
