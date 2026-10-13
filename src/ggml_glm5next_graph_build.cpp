@@ -3,6 +3,7 @@
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
+#include <future>
 #include "ggml_glm5next_graph_impl.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -95,6 +96,56 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
     OffloadState *o = get_offload(*g.engine);
     if (!o)
       return nullptr;
+    if (split_load_wanted() && o->store->async_loads()) {
+      // One in-flight load per lane: the lane runs its layer once per token.
+      struct InFlight {
+        moestream::offload::ExpertResidency::Plan plan;
+        std::future<moestream::offload::ExpertResidency::Ensure> result;
+        std::chrono::steady_clock::time_point t0;
+        int n = 0;
+      };
+      auto flight = std::make_shared<InFlight>();
+      lane->begin_load = [o, layer, flight](const int32_t *experts, int n, std::vector<int32_t> &pending) {
+        flight->t0 = std::chrono::steady_clock::now();
+        flight->n = n;
+        flight->plan = o->store->begin_ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
+        pending = flight->plan.to_load;
+        pending.insert(pending.end(), flight->plan.to_wait.begin(), flight->plan.to_wait.end());
+        if (pending.empty() && flight->plan.r.errors == 0) {
+          // Nothing to read: account for the hits the same way finish would.
+          flight->result = std::async(std::launch::deferred, [o, flight] {
+            return o->store->finish_ensure(flight->plan);
+          });
+          return true;
+        }
+        flight->result = std::async(std::launch::async, [o, flight] {
+          return o->store->finish_ensure(flight->plan);
+        });
+        return true;
+      };
+      lane->finish_load = [o, layer, flight]() {
+        const auto r = flight->result.get();
+        auto &ct = o->store->counters();
+        ct.calls.fetch_add(1, std::memory_order_relaxed);
+        ct.routes.fetch_add((uint64_t)flight->n, std::memory_order_relaxed);
+        ct.cold_routes.fetch_add((uint64_t)flight->n, std::memory_order_relaxed);
+        ct.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
+        ct.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
+        ct.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
+        ct.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
+        ct.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - flight->t0).count(),
+                           std::memory_order_relaxed);
+        if (r.errors > 0) {
+          ct.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
+          LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting rather than computing with "
+                    "missing experts\n", layer, r.errors);
+          o->store->report("fatal");
+          std::abort();
+        }
+        return true;
+      };
+    } else
     lane->before_compute = [o, layer](const int32_t *experts, int n) {
       const auto t0 = std::chrono::steady_clock::now();
       const auto r = o->store->ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);

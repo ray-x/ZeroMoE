@@ -98,6 +98,19 @@ class ExpertStore {
         p, [this] { return std::unique_lock<std::shared_mutex>(arena_mu_); });
   }
 
+  // The two halves of ensure() for a caller that wants to overlap the reads with
+  // other work: begin_ensure() does the bookkeeping, finish_ensure() reads and
+  // publishes (call it WITHOUT holding the arena lock; it may run on any thread).
+  ExpertResidency::Plan begin_ensure(int layer, const int32_t *ids, int n,
+                                     ExpertCache::Kind kind) {
+    std::unique_lock<std::shared_mutex> lock(arena_mu_);
+    return residency_->begin(layer, ids, n, kind);
+  }
+  ExpertResidency::Ensure finish_ensure(ExpertResidency::Plan &p) {
+    return residency_->finish(
+        p, [this] { return std::unique_lock<std::shared_mutex>(arena_mu_); });
+  }
+
   // Prefill: every expert is touched once, so it bypasses the cache.
   ExpertResidency::Ensure ensure_transient(int layer, const int32_t *ids, int n) {
     std::unique_lock<std::shared_mutex> lock(arena_mu_);

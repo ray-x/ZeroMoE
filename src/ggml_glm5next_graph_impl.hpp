@@ -92,6 +92,8 @@ bool layer_timing_env();
 int dynamic_upload_budget_override();
 double dynamic_upload_fraction();
 bool early_ready_wanted();
+// Compute the cold experts that are already in DDR while the missing ones are read from the SSD.
+bool split_load_wanted();
 OffloadState *get_offload(const StreamingEngine &engine, const std::vector<PartialExpertLayer> *partial = nullptr);
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud);
 ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);

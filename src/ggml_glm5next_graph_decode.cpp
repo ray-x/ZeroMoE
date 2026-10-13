@@ -579,6 +579,24 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   ggml_backend_sched_synchronize(g.sched);
   release_graph_vram_experts(g);
+  if (!g.early_ready.empty()) {
+    static int lane_tokens = 0;
+    if (++lane_tokens % 16 == 0) {
+      uint64_t calls = 0, split = 0;
+      int64_t wait = 0, compute = 0, stall = 0;
+      for (auto &entry : g.early_ready) {
+        calls += entry.second->calls;
+        split += entry.second->split_runs;
+        wait += entry.second->wait_us;
+        compute += entry.second->compute_us;
+        stall += entry.second->split_stall_us;
+      }
+      LOG_INFO("[GLM5NEXT-LANE] tokens=%d lane calls=%llu split=%llu wait=%.1fms/token compute=%.1fms/token "
+               "split stall=%.1fms/token\n",
+               lane_tokens, (unsigned long long)calls, (unsigned long long)split,
+               wait / 1000.0 / lane_tokens, compute / 1000.0 / lane_tokens, stall / 1000.0 / lane_tokens);
+    }
+  }
   if (op_prof_on) {
     ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
     if (++op.tokens == 30) {
