@@ -86,8 +86,37 @@ OffloadState *get_offload(const StreamingEngine &engine,
       }
     }
   }
-  sc.ddr_gib =
-      std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "40").c_str());
+  {
+    // MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=<n> fixes the pool; unset (or "auto") sizes it from the memory this
+    // process may actually use: available RAM (or the cgroup limit if lower) minus 60 GiB for the rest of the
+    // engine and the OS, at least 16 GiB. The store caps it at the total expert bytes. Measured on a 125 GB
+    // box: decode 5.3 / 7.3 / 8.2 tok/s at 32 / 48 / 58 GiB, flat beyond (everything resident).
+    const std::string v = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "auto");
+    if (v == "auto" || v.empty()) {
+      double avail_gib = 0.0;
+      if (FILE *f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f)) {
+          unsigned long long kb = 0;
+          if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            avail_gib = (double)kb / (1024.0 * 1024.0);
+            break;
+          }
+        }
+        std::fclose(f);
+      }
+      if (FILE *f = std::fopen("/sys/fs/cgroup/memory.max", "r")) {
+        unsigned long long bytes = 0;
+        if (std::fscanf(f, "%llu", &bytes) == 1)
+          avail_gib = std::min(avail_gib, (double)bytes / (1024.0 * 1024.0 * 1024.0));
+        std::fclose(f);
+      }
+      sc.ddr_gib = avail_gib > 0.0 ? std::max(16.0, avail_gib - 60.0) : 40.0;
+      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] auto DDR pool %.1f GiB (available %.1f GiB)\n", sc.ddr_gib, avail_gib);
+    } else {
+      sc.ddr_gib = std::atof(v.c_str());
+    }
+  }
   sc.policy = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg"
                   ? moestream::offload::ExpertCache::Policy::SegmentedLru
                   : moestream::offload::ExpertCache::Policy::Lru;
