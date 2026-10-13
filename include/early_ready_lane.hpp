@@ -174,6 +174,17 @@ struct EarlyReadyLane {
   // this lane owns (mask != 0, deduplicated, in route order). Return false to
   // fail the token. Used by the SSD-offload path to make them resident.
   std::function<bool(const int32_t *experts, int n)> before_compute;
+  // Overlapped variant of before_compute for the SSD-offload path. begin_load
+  // starts making the owned experts resident (in the background) and returns the
+  // ones that are not ready yet in `pending`; finish_load blocks until they are.
+  // When some owned experts are already resident the lane computes those first,
+  // while the missing ones are still being read, and the rest afterwards. Each
+  // route is independent, so the two partial outputs add up exactly.
+  std::function<bool(const int32_t *experts, int n, std::vector<int32_t> &pending)> begin_load;
+  std::function<bool()> finish_load;
+  uint64_t split_runs = 0;
+  int64_t split_stall_us = 0;  // time finish_load still blocked after phase 1
+  std::vector<float> phase1_output;
   // SwiGLU clamp applied by the private graph (0 = none); set before prepare().
   float swiglu_clamp = 0.0f;
   bool swiglu_clamp_fused = false;
@@ -468,15 +479,23 @@ struct EarlyReadyLane {
     const cudaError_t tail = cudaStreamQuery(producer_stream);
     GGML_ASSERT(tail == cudaSuccess || tail == cudaErrorNotReady);
     gpu_pending += tail == cudaErrorNotReady;
-    if (before_compute && cold_count > 0) {
-      int32_t owned[64];
-      int n_owned = 0;
+    int32_t owned[64];
+    int n_owned = 0;
+    if ((before_compute || begin_load) && cold_count > 0) {
       for (int i = 0; i < k && n_owned < 64; ++i) {
         if (cpu_mask[ids[i]] == 0.0f) continue;
         bool seen = false;
         for (int j = 0; j < n_owned; ++j) seen = seen || owned[j] == ids[i];
         if (!seen) owned[n_owned++] = ids[i];
       }
+    }
+    bool two_phase = false;
+    std::vector<int32_t> pending;
+    if (begin_load && n_owned > 0) {
+      GGML_ASSERT(begin_load(owned, n_owned, pending));
+      two_phase = !pending.empty() && static_cast<int>(pending.size()) < n_owned;
+      if (!two_phase) GGML_ASSERT(finish_load());
+    } else if (before_compute && n_owned > 0) {
       GGML_ASSERT(before_compute(owned, n_owned));
     }
     const int64_t copied = ggml_time_us();
@@ -486,6 +505,37 @@ struct EarlyReadyLane {
       // Keep the existing H2D copy and merge consuming the same output shape.
       std::memset(output->data, 0, ggml_nbytes(output));
       ++all_hot_skips;
+    } else if (two_phase) {
+      // Phase 1: owned experts that are already resident, while the rest is read.
+      const auto is_pending = [&](int32_t e) {
+        for (int32_t p : pending) if (p == e) return true;
+        return false;
+      };
+      for (int j = 0; j < n_owned; ++j)
+        if (is_pending(owned[j])) { cpu_remap[owned[j]] = -1; cpu_mask[owned[j]] = 0.0f; }
+      GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+      phase1_output.assign(static_cast<float *>(output->data),
+                           static_cast<float *>(output->data) + static_cast<size_t>(d) * k);
+      const int64_t wait0 = ggml_time_us();
+      GGML_ASSERT(finish_load());
+      split_stall_us += ggml_time_us() - wait0;
+      // Phase 2: the experts that had to be loaded.
+      for (int j = 0; j < n_owned; ++j) {
+        const int32_t e = owned[j];
+        if (is_pending(e)) {
+          cpu_remap[e] = original_remap[e]; cpu_mask[e] = original_mask[e];
+        } else {
+          cpu_remap[e] = -1; cpu_mask[e] = 0.0f;
+        }
+      }
+      GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+      float *out = static_cast<float *>(output->data);
+      for (size_t i = 0; i < phase1_output.size(); ++i) out[i] += phase1_output[i];
+      for (int j = 0; j < n_owned; ++j) {
+        cpu_remap[owned[j]] = original_remap[owned[j]];
+        cpu_mask[owned[j]] = original_mask[owned[j]];
+      }
+      ++split_runs;
     } else {
       GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
     }

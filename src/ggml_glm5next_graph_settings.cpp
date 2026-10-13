@@ -180,6 +180,15 @@ bool early_ready_wanted() {
   return on;
 }
 
+// Overlap a layer's SSD miss reads with the CPU compute of its already-resident
+// cold experts (lane only). Bit-exact: the two partial outputs are disjoint routes.
+// On by default (order-balanced A/B: 4.29 -> 4.92 tok/s, logits and tokens identical);
+// MOESTREAM_GLM5NEXT_SPLIT_LOAD=0 opts out.
+bool split_load_wanted() {
+  static const bool on = moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_SPLIT_LOAD");
+  return on;
+}
+
 } // namespace glm5next_graph
 
 #endif // MOESTREAM_USE_GGML_CUDA
