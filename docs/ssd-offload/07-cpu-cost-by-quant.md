@@ -22,3 +22,26 @@ AVX-512 VNNI), Xeon W-2235, 8 threads, decode shape (1 token, 10 routed slots), 
 The 4-8 bit types stream at 33-48 GB/s (memory-bound). The 1-3 bit codebook types (IQ1/IQ2/IQ3) are compute-bound at 11-15 GB/s: IQ3_XXS
 costs 1.8x Q2_0 and 2.2x Q4_0 per expert although it moves less data than Q4_0; IQ2_XXS (the GLM-5.3-Flash AJ file) costs 1.4x Q2_0.
 Per expert, the cheapest CPU types are Q4_0 / Q3_K / Q4_K / IQ4_NL (74-79 us) despite 1.7-2.2x the bytes of IQ2_XXS.
+
+## GLM-5.3-Flash expert shape (2026-10-13): the Qwen ranking does not transfer
+
+Same bench with `BENCH_D=4096 BENCH_F=2048 BENCH_NE=64 BENCH_TOPK=8`, 8 threads, ggml with the IQ2_XXS AVX-512VL dot (real F is 2304,
+so absolute numbers are ~12% low; the ranking holds). At 6-17 MB per expert the 4-8 bit types hit the DDR streaming limit (~55-60 GB/s):
+
+| type | MB/expert | us/expert | GB/s | note |
+|---|---|---|---|---|
+| iq1_s / iq1_m | 4.9 / 5.5 | 292 / 300 | 17-18 | compute-bound |
+| **q2_k** | 8.3 | **153** | 54 | fastest, but see noise below |
+| iq2_xxs (stored) | 6.5 | 250 | 26 | compute-bound, ~2.2x above its 114 us memory floor |
+| iq2_s | 8.1 | 328 | 25 | |
+| q3_k | 10.8 | 217 | 50 | |
+| q4_0 / iq4_nl / iq4_xs / q4_k | 13-14 | 235-265 | 53-60 | no faster than iq2_xxs |
+| q5_k | 17.3 | 286 | 60 | |
+| iq3_xxs / iq3_s | 9.6 / 10.8 | 424 / 528 | 21-23 | |
+
+Re-quantisation noise of the stored IQ2_XXS experts (`bench/requant_noise_probe.cpp`, layer 10 expert 5, RMS error relative to the
+stored weights): q2_k 0.295, q3_k 0.160, q4_0 0.124, q4_k 0.034.
+
+Consequence: a hybrid "Q4_0 on the CPU" tier buys nothing (same speed, 12% noise); Q2_K is 39% cheaper but adds ~30% noise on top of
+the IQ2 error; Q4_K is near lossless but not faster. Without an original higher-precision source there is no quant swap that is both
+faster and faithful. The remaining CPU headroom is a faster IQ2_XXS kernel (250 us vs a 114 us memory floor).
