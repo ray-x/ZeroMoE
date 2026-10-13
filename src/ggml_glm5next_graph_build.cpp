@@ -177,7 +177,10 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
       std::shared_ptr<GpuAssistShared> shared = shared_weak.lock();
       if (!shared) {
         auto s = std::make_shared<GpuAssistShared>();
-        s->be = ggml_backend_cuda_init(g.device);
+        // MOESTREAM_GLM5NEXT_ASSIST_DEVICE: CUDA device holding the ring and running the assisted experts (default: the
+        // trunk's device). Wanted when the trunk sits on the card with the slower host link.
+        const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
+        s->be = ggml_backend_cuda_init(assist_dev);
         s->slots = gpu_assist_slots();
         bool ok = s->be != nullptr;
         for (int p = 0; ok && p < 3; ++p) {

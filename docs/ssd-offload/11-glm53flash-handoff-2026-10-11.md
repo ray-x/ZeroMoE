@@ -196,3 +196,19 @@ Steady state 64.9 ms/token = **15.4 tok/s** (46 tokens, graph time; 3090-only be
 ~125 ms at 58 GiB). Noise floor for numerics: 3090-only vs dual-GPU with NO assist, teacher-forced 48 tokens, top-1 93.8 %, mean KL 0.051;
 dual + assist vs dual lane-only: 91.7 %, 0.049; 3090-only assist: 95.8 %, 0.034. So assist is within the spread of valid placements.
 GPU1 hot-expert upload at graph prepare now reads 16 experts in parallel: 21 s -> 13 s (still one-time).
+
+## Dense/trunk on the 5060 Ti (tested 2026-10-13, GLM-5.3-Flash, teacher-forced 48 tokens, 58 GiB pool)
+
+`CUDA_VISIBLE_DEVICES=1,0` with `bench/glm_swap_dense_5060.toml` (5060 Ti = core: dense 6.56 GiB + 6.05 GiB resident cache; 3090 = "GPU1"
+hot set via `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB`) and `MOESTREAM_GLM5NEXT_ASSIST_DEVICE=1` (ring on the 3090):
+
+| layout | resident experts | lane wait | lane compute | ms/token |
+|---|---|---|---|---|
+| 3090 dense, 5060 Ti hot 14.2 GiB (default) | 28.9 GiB | 20.3 | 42.3 | **67.9** |
+| 5060 Ti dense, 3090 hot 20 GiB, assist on 5060 Ti | 26.1 GiB | 25.8 | 63.0 | 95.2 |
+| same, assist ring on the 3090 | 26.1 GiB | 25.7 | 45.3 | 78.1 |
+| same, 3090 hot 22.3 GiB | 28.4 GiB | 25.9 | 43.2 | 76.1 |
+
+Total resident VRAM is the same either way; the slower card (448 vs 936 GB/s) on the trunk adds ~5.6 ms of pre-router wait and the
+assist ring needs the x16 link. Keep dense on the 3090. (The full GLM-5.3 result that favoured dense on the 5060 Ti was an
+expert-vault design where uploads, not resident compute, set the cost.)
