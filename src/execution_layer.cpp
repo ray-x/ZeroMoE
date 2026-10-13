@@ -1023,12 +1023,6 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       graph_model->run(engine, prefill_graph_request)) {
     return;
   }
-  // Run the diagnostic before the production decode graph's early return;
-  // otherwise an enabled full-graph configuration would bypass the side
-  // graph entirely. It remains one-shot and does not alter hidden_states or
-  // the live recurrent/KV owners.
-  if (S == 1 && pos_base >= 0)
-    qwen4exp_two_layer_s1_diag_run(engine, pos_base, token_ids);
   const ModelGraphRequest decode_graph_request{
       ModelGraphPhase::Decode,
       S,

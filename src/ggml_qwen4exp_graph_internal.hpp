@@ -105,10 +105,6 @@ double qwen4exp_host_node_ordinary_cpu_wait_ms_since_last();
 double qwen4exp_host_node_gate_wait_ms_since_last();
 double qwen4exp_cpu_split_enter_wait_ms_since_last();
 uint64_t qwen4exp_fnv64(const void *data, size_t bytes);
-const char *env_layer13_moe_dump_path();
-const char *env_layer13_moe_input_dump_path();
-const char *env_layer13_moe_host_input_dump_path();
-const char *env_layer13_moe_ordinary_input_dump_path();
 bool qwen4exp_dump_f32(const char *path, const float *data, size_t elements);
 void CUDART_CB qwen4exp_cuda_host_node_callback(void *user_data);
 void CUDART_CB qwen4exp_cuda_host_node_arm_direct_workers( void *user_data);
@@ -124,18 +120,8 @@ bool env_qwen4exp_host_node_enabled();
 bool env_layer_timing_verbose();
 bool env_graph_replay_timing_enabled();
 bool env_merged_gate_up_enabled();
-bool env_layer0_iq2_diag_enabled();
-const char * env_hidden01_dump_path();
-const char * env_layer0_split_dump_path();
-const char * env_alllayers_dump_path();
 int env_host_node_diag_layer();
 bool env_host_node_transport_diag_enabled(int layer);
-bool env_layer0_narrow_graph_diag_enabled();
-bool env_two_layer_s1_diag_enabled();
-const char *env_two_layer_s1_diag_dump_path();
-const char *env_two_layer_s1_common_attn_input_path();
-const char *env_two_layer_s1_common_hc_norm_path();
-const char *env_two_layer_s1_common_hc_down_silu_path();
 int env_partial_layer();
 int env_partial_layer_top_n();
 float env_partial_layer_min_coverage();
@@ -154,18 +140,9 @@ bool graph_layout_debug();
 bool has_ple_layer(const ArchitectureConfig &c);
 bool type_ok(GGUFType type);
 void verify_cuda_graphs_compiled_in(ggml_backend_t cuda_backend);
-const char *env_layer0_common_attn_input_path();
-bool load_exact_f32_file(const char *path, float *dst, size_t elements);
-void log_layer0_diag_tensor(const char *role, const ggml_tensor *t);
-void log_layer0_diag_host_values(const char *role, const float *values, size_t n);
-void dump_all_layers_snapshot(FullGraph &g, int pos);
-void dump_all_layers_snapshot_pair(const FullGraph &prefix, const FullGraph &suffix, int pos);
-void dump_layer0_diag_values(FullGraph &g);
 int layer_timing_parse_layer(const char *name);
 bool layer_timing_eval_callback(struct ggml_tensor *t, bool ask, void *user_data);
 void qwen4exp_scan_captured_graph_writes(FullGraph &g, const void *range_base, size_t range_bytes);
-ggml_tensor *layer0_diag_snapshot(FullGraph &g, ggml_context *ctx, ggml_tensor *src, const char *name);
-ggml_tensor *layer13_moe_diag_snapshot( FullGraph &g, ggml_context *ctx, ggml_tensor *src, ggml_type type, const std::vector<int64_t> &shape, const char *name);
 void qwen_probe_dump(FullGraph &g);
 void log_qwen_layout_tensor(const FullGraph &g, int layer, bool cpu_only, const char *role, const ggml_tensor *tensor);
 void dump_qwen_moe_layout(const FullGraph &g);
@@ -200,7 +177,7 @@ ggml_tensor *expert_gate_up_weight(FullGraph &g, ggml_context *ctx, int layer, b
 ggml_tensor *build_split_gpu_tensor(FullGraph &g, ggml_context *ctx, const std::string &name, const GGUFTensor &m, const std::vector<int> &hot_ids);
 SplitExpertWeight expert_weight_split(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
 ggml_tensor *dense_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
-ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *norm, ggml_tensor *down, ggml_tensor *up, ggml_tensor *inject, ggml_tensor **inject_out, int diag_layer = -1, const char *diag_tag = nullptr);
+ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *norm, ggml_tensor *down, ggml_tensor *up, ggml_tensor *inject, ggml_tensor **inject_out);
 ggml_tensor *hc_combine(FullGraph &g, ggml_context *ctx, ggml_tensor *residual, ggml_tensor *block, ggml_tensor *inject);
 ggml_tensor *build_shared(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *gate, ggml_tensor *up, ggml_tensor *down, ggml_tensor *scalar_gate);
 void gdn_state_transpose_host(float *dst, const float *src, int hd, int Hv);
@@ -239,8 +216,6 @@ extern std::atomic<uint64_t> g_full_graph_generation;
 extern std::unique_ptr<FullGraph> g_graph_prefill_arena_owner;
 extern std::unique_ptr<FullGraph> g_graph_prefill_state_owner;
 extern std::unique_ptr<FullGraph> g_graph_decode_arena_owner;
-extern std::unique_ptr<FullGraph> g_two_layer_diag_graph;
-extern bool g_two_layer_diag_done;
 extern bool g_config_full_graph;
 extern bool g_config_full_graph_decode;
 extern bool g_config_prefill_state_handoff;
@@ -503,31 +478,9 @@ struct FullGraph : moestream::graph::GraphCore {
   // Opt-in Layer-0 quantization-path diagnostic. These graph-owned
   // intermediates are retained only so the first compute can dump the
   // actual gate/up values; the normal path never populates or reads them.
-  bool layer0_diag_enabled = false;
-  bool layer0_diag_dumped = false;
-  ggml_tensor *layer0_diag_gate = nullptr;
-  ggml_tensor *layer0_diag_up = nullptr;
-  ggml_tensor *layer0_diag_act = nullptr;
-  ggml_tensor *layer0_diag_down = nullptr;
-  ggml_tensor *layer0_diag_gate_up = nullptr;
-  ggml_tensor *layer0_diag_residual_before = nullptr;
-  ggml_tensor *layer0_diag_moe_block = nullptr;
-  ggml_tensor *layer0_diag_shared = nullptr;
-  ggml_tensor *layer0_diag_moe_plus_shared = nullptr;
-  ggml_tensor *layer0_diag_residual_after = nullptr;
-  ggml_tensor *layer0_diag_next_consumer = nullptr;
-  ggml_tensor *layer0_diag_residual_before_snapshot = nullptr;
-  ggml_tensor *layer0_diag_moe_plus_shared_snapshot = nullptr;
-  ggml_tensor *layer0_diag_residual_after_snapshot = nullptr;
-  ggml_tensor *layer0_diag_next_consumer_snapshot = nullptr;
   // Actual graph-owned outputs for the two-layer S=1 diagnostic. These are
   // deliberately not independent cpy leaves: each tensor remains on the
   // Layer-0 -> Layer-1 dependency chain and is marked as a graph output.
-  bool two_layer_diag = false;
-  ggml_tensor *two_layer_l0_post_ffn = nullptr;
-  ggml_tensor *two_layer_l1_pre_attn = nullptr;
-  ggml_tensor *two_layer_l1_post_attn = nullptr;
-  ggml_tensor *two_layer_l1_post_ffn = nullptr;
   // Optional exact hidden-state snapshots at the same semantic boundary as
   // llama.cpp's l_last-0/l_last-1 callbacks: after each layer's attention and
   // FFN residual combine.  These are intentionally limited to layers 0/1.
@@ -540,21 +493,12 @@ struct FullGraph : moestream::graph::GraphCore {
   // MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP; same semantic boundary (after each
   // layer's attention+FFN residual combine) as hidden01_snapshot.
   std::vector<ggml_tensor *> all_layers_snapshot;
-  std::vector<std::pair<std::string, ggml_tensor *>> layer0_split_snapshots;
-  bool layer0_split_dumped = false;
   // Optional one-shot raw routed-MoE output dump for Layer 13. This is
   // deliberately before the shared expert and residual combine so the
   // ordinary GGML CPU path and the host-node callback are compared at the
   // same semantic boundary.
-  bool layer13_moe_diag_enabled = false;
-  bool layer13_moe_diag_dumped = false;
-  ggml_tensor *layer13_moe_diag = nullptr;
   // MOESTREAM_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
   std::vector<std::tuple<int, ggml_tensor *, ggml_tensor *>> probe_taps;
-  ggml_tensor *layer13_moe_input_diag = nullptr;
-  ggml_tensor *layer13_moe_ids_diag = nullptr;
-  ggml_tensor *layer13_moe_weights_diag = nullptr;
-  ggml_tensor *layer13_pre_ffn_residual_diag = nullptr;
   // Diagnostic (2026-09-17): cumulative time inside resident_tensor()'s own
   // cudaMemcpy H2D calls, across this ONE build_graph() call -- see memory:
   // full-graph-decode-graph-construction-5s-latency.md. Reset to 0 at the
@@ -990,11 +934,6 @@ struct FullGraph : moestream::graph::GraphCore {
     release_core(); // host buffers, context, owned host memory, counters
     cpu_threads = 0;
     ple_embedding = nullptr;
-    two_layer_diag = false;
-    two_layer_l0_post_ffn = nullptr;
-    two_layer_l1_pre_attn = nullptr;
-    two_layer_l1_post_attn = nullptr;
-    two_layer_l1_post_ffn = nullptr;
     ple_hist_out = nullptr;
     ple_hist_storage = nullptr;
     ple_hist_update = nullptr;

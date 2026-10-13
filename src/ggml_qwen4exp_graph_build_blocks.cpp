@@ -14,124 +14,15 @@ namespace qwen4exp_graph {
 
 ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *norm, ggml_tensor *down, ggml_tensor *up,
-                    ggml_tensor *inject, ggml_tensor **inject_out,
-                    int diag_layer, const char *diag_tag)  {
+                    ggml_tensor *inject, ggml_tensor **inject_out) {
   ggml_tensor *xn =
       ggml_rms_norm(ctx, x, g.engine->model_file.architecture_config.eps);
   xn = ggml_reshape_2d(ctx, xn, g.D * g.HC, g.S);
   xn = ggml_mul(ctx, xn, norm);
-  if (g.two_layer_diag && diag_layer == 0 && diag_tag &&
-      !std::strcmp(diag_tag, "attn")) {
-    if (const char *common_path = env_two_layer_s1_common_hc_norm_path()) {
-      const size_t common_n = static_cast<size_t>(g.D) * g.HC * g.S;
-      ggml_tensor *common = host_input(
-          g, ctx, GGML_TYPE_F32, {g.D * g.HC, g.S},
-          common_n * sizeof(float), "qwen_two_layer_s1_common_hc_norm");
-      if (!common || !load_exact_f32_file(
-                           common_path, static_cast<float *>(common->data),
-                           common_n)) {
-        LOG_WARN(
-            "[QWEN4EXP-TWO-LAYER-S1] common HC norm rejected: path=%s "
-            "expected_bytes=%zu\n",
-            common_path, common_n * sizeof(float));
-      } else {
-        const uint64_t hash = qwen4exp_fnv64(
-            common->data, common_n * sizeof(float));
-        LOG_INFO(
-            "[QWEN4EXP-TWO-LAYER-S1] forcing Layer-0 HC projection input "
-            "from %s elements=%zu fnv64=0x%016llx\n",
-            common_path, common_n, static_cast<unsigned long long>(hash));
-        xn = common;
-      }
-    }
-  }
-  const bool capture_projection_diag =
-      diag_layer >= 0 && diag_layer < 2 && diag_tag && g.layer0_diag_enabled &&
-      env_layer0_split_dump_path();
-  if (capture_projection_diag) {
-    const std::string down_role = std::string(diag_tag) +
-                                  "_hc_down_weight";
-    const std::string up_role = std::string(diag_tag) + "_hc_up_weight";
-    log_layer0_diag_tensor(down_role.c_str(), down);
-    log_layer0_diag_tensor(up_role.c_str(), up);
-    const std::string down_name = std::string(diag_tag) +
-                                  "_hc_down_weight";
-    const std::string up_name = std::string(diag_tag) + "_hc_up_weight";
-    g.layer0_split_snapshots.emplace_back(
-        down_name, layer0_diag_snapshot(g, ctx, down, down_name.c_str()));
-    g.layer0_split_snapshots.emplace_back(
-        up_name, layer0_diag_snapshot(g, ctx, up, up_name.c_str()));
-  }
-  if (capture_projection_diag) {
-    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
-                             "_hc_norm";
-    g.layer0_split_snapshots.emplace_back(
-        std::string(diag_tag) + "_hc_norm",
-        layer0_diag_snapshot(g, ctx, xn, name.c_str()));
-    const std::string weight_name = std::string("qwen_layer0_split_") +
-                                    diag_tag + "_hc_norm_weight";
-    g.layer0_split_snapshots.emplace_back(
-        std::string(diag_tag) + "_hc_norm_weight",
-        layer0_diag_snapshot(g, ctx, norm, weight_name.c_str()));
-  }
   ggml_tensor *lo = ggml_mul_mat(ctx, down, xn);
-  if (capture_projection_diag) {
-    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
-                             "_hc_down_raw";
-    g.layer0_split_snapshots.emplace_back(
-        std::string(diag_tag) + "_hc_down_raw",
-        layer0_diag_snapshot(g, ctx, lo, name.c_str()));
-  }
   lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / static_cast<float>(g.HC)));
-  if (g.two_layer_diag && diag_layer == 0 && diag_tag &&
-      !std::strcmp(diag_tag, "attn")) {
-    if (const char *common_path =
-            env_two_layer_s1_common_hc_down_silu_path()) {
-      const size_t common_n = static_cast<size_t>(ggml_nelements(lo));
-      ggml_tensor *common = host_input(
-          g, ctx, GGML_TYPE_F32, {lo->ne[0], lo->ne[1]},
-          common_n * sizeof(float), "qwen_two_layer_s1_common_hc_down_silu");
-      if (!common || !load_exact_f32_file(
-                           common_path, static_cast<float *>(common->data),
-                           common_n)) {
-        LOG_WARN(
-            "[QWEN4EXP-TWO-LAYER-S1] common HC down-SiLU rejected: "
-            "path=%s expected_bytes=%zu\n",
-            common_path, common_n * sizeof(float));
-      } else {
-        const uint64_t hash = qwen4exp_fnv64(
-            common->data, common_n * sizeof(float));
-        LOG_INFO(
-            "[QWEN4EXP-TWO-LAYER-S1] forcing Layer-0 HC up input from %s "
-            "elements=%zu fnv64=0x%016llx\n",
-            common_path, common_n, static_cast<unsigned long long>(hash));
-        lo = common;
-      }
-    }
-  }
-  if (capture_projection_diag) {
-    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
-                             "_hc_down_silu";
-    g.layer0_split_snapshots.emplace_back(
-        std::string(diag_tag) + "_hc_down_silu",
-        layer0_diag_snapshot(g, ctx, lo, name.c_str()));
-  }
   ggml_tensor *gate_logits = ggml_mul_mat(ctx, up, lo);
-  if (capture_projection_diag) {
-    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
-                             "_hc_up_logits";
-    g.layer0_split_snapshots.emplace_back(
-        std::string(diag_tag) + "_hc_up_logits",
-        layer0_diag_snapshot(g, ctx, gate_logits, name.c_str()));
-  }
   ggml_tensor *gate = ggml_sigmoid(ctx, gate_logits);
-  if (capture_projection_diag) {
-    const std::string name = std::string("qwen_layer0_split_") + diag_tag +
-                             "_hc_gate";
-    g.layer0_split_snapshots.emplace_back(
-        std::string(diag_tag) + "_hc_gate",
-        layer0_diag_snapshot(g, ctx, gate, name.c_str()));
-  }
   ggml_tensor *gated = ggml_mul(ctx, xn, gate);
   ggml_tensor *g3 = ggml_reshape_3d(ctx, gated, g.D, g.HC, g.S);
 
@@ -147,15 +38,6 @@ ggml_tensor *hc_mix(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
   mixed = ggml_scale(ctx, mixed, 1.0f / static_cast<float>(g.HC));
   if (inject_out) {
     *inject_out = inject ? ggml_mul_mat(ctx, inject, xn) : nullptr;
-    if (diag_layer >= 0 && diag_layer < 2 && diag_tag &&
-        g.layer0_diag_enabled &&
-        env_layer0_split_dump_path()) {
-      const std::string name = std::string("qwen_layer0_split_") + diag_tag +
-                               "_hc_inject";
-      g.layer0_split_snapshots.emplace_back(
-          std::string(diag_tag) + "_hc_inject",
-          layer0_diag_snapshot(g, ctx, *inject_out, name.c_str()));
-    }
   }
   return mixed;
 }
@@ -219,19 +101,12 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        ggml_tensor **state_out, ggml_tensor **hist_out) {
   ggml_tensor *qkv = ggml_mul_mat(ctx, w_qkv, cur);
   auto diag = [&](const char *label, ggml_tensor *value) {
-    if (layer == 0 && g.layer0_diag_enabled &&
-        env_layer0_split_dump_path()) {
-      g.layer0_split_snapshots.emplace_back(
-          label, layer0_diag_snapshot(g, ctx, value, label));
-    }
   };
   // These snapshots are deliberately taken before and inside the GDN node.
   // The existing attention-output dump only tells us that the discrepancy is
   // present after the recurrent block; these boundaries separate qkv GEMM,
   // convolution, GDN/state update, and the final output projection.
   diag("gdn_qkv", qkv);
-  if (layer == 0 && g.layer0_diag_enabled && env_layer0_split_dump_path())
-    log_layer0_diag_tensor("gdn_qkv_weight", w_qkv);
   ggml_tensor *z = ggml_mul_mat(ctx, w_gate, cur);
   ggml_tensor *alpha = ggml_mul_mat(ctx, w_alpha, cur);
   ggml_tensor *beta_raw = ggml_mul_mat(ctx, w_beta, cur);

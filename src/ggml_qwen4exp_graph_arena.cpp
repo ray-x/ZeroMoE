@@ -180,23 +180,6 @@ bool init_device_dense_arena(FullGraph &g) {
   for (const auto &[name, q] : g.engine->resident_layers) {
     if (!q.host_ptr || !graph_dense_weight_name(name))
       continue;
-    if (g.two_layer_diag) {
-      // Reserve only the dense weights consumed by blocks 0 and 1 plus the
-      // final HC projection. A two-layer diagnostic must not claim the
-      // production model's complete dense arena.
-      int layer = -1;
-      if (name.rfind("blk.", 0) == 0) {
-        char *end = nullptr;
-        const long parsed = std::strtol(name.c_str() + 4, &end, 10);
-        if (end != name.c_str() + 4 && end && *end == '.')
-          layer = static_cast<int>(parsed);
-      }
-      const bool final_hc = name == "output_hc_norm.weight" ||
-                            name == "output_hc_down.weight" ||
-                            name == "output_hc_up.weight";
-      if (!final_hc && (layer < 0 || layer >= g.n_layers))
-        continue;
-    }
     constexpr size_t kTensorSlack = 4096;
     if (bytes > SIZE_MAX - q.meta.size_bytes - kTensorSlack)
       return false;
@@ -434,8 +417,7 @@ bool init_device_expert_arena(FullGraph &g) {
   const bool partial_active =
       g.decode_mode && g.engine &&
       !g.engine->qwen4exp_partial_layer_gpu_ids.empty() &&
-      g.engine->qwen4exp_partial_layer >= 0 &&
-      (!g.two_layer_diag || g.engine->qwen4exp_partial_layer < g.n_layers);
+      g.engine->qwen4exp_partial_layer >= 0;
   // device_expert_bytes() already sizes in qwen4exp_gpu_stage_layers'
   // compact per-layer tensors (see its own comment), but this early-return
   // guard never checked for them -- with 0 preloaded layers and no Option-B

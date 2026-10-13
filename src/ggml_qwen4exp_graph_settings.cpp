@@ -111,27 +111,6 @@ bool env_merged_gate_up_enabled() {
   return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_MERGED_GATE_UP");
 }
 
-bool env_layer0_iq2_diag_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
-}
-
-const char * env_hidden01_dump_path() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HIDDEN01_DUMP");
-  return v && v[0] ? v : nullptr;
-}
-
-const char * env_layer0_split_dump_path() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_LAYER0_SPLIT_DUMP");
-  return v && v[0] ? v : nullptr;
-}
-
-// All-layer, every-decode-step hidden-state dump for a full parity trace
-// against llama.cpp -- see all_layers_snapshot's own comment.
-const char * env_alllayers_dump_path() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP");
-  return v && v[0] ? v : nullptr;
-}
-
 // Host-node transport diagnostic. The layer is selected explicitly so the
 // same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
 // applied to Layer 13 without enabling diagnostics for every callback.
@@ -147,57 +126,7 @@ int env_host_node_diag_layer() {
 }
 
 bool env_host_node_transport_diag_enabled(int layer) {
-  return (layer == 0 && env_layer0_iq2_diag_enabled()) ||
-         layer == env_host_node_diag_layer();
-}
-
-// Narrow laboratory mode for the Layer-0 host-node residual/consumer
-// diagnostic. The ordinary full graph deliberately requires a complete DDR
-// arena for every layer when ram_preload_all_experts is enabled. That is the
-// right production safety rule, but it makes a one-layer diagnostic depend on
-// having enough RAM for the whole model. In this mode only Layer 0's callback
-// boundary is required to use a complete arena; other layers keep the normal
-// graph-owned source path.
-bool env_layer0_narrow_graph_diag_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
-}
-
-bool env_two_layer_s1_diag_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DIAG");
-}
-
-const char *env_two_layer_s1_diag_dump_path() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_TWO_LAYER_S1_DUMP");
-  return v && v[0] ? v : nullptr;
-}
-
-// Controlled QKV replay input for the two-layer S=1 diagnostic.  The file
-// must contain exactly one F32 Layer-0 attention input row ([D] elements),
-// typically extracted from llama.cpp's hc_mixed dump.  This replaces only the
-// diagnostic graph's Layer-0 hc_mix result; production execution is never
-// affected.  It lets us distinguish a small upstream HC rounding difference
-// from a QKV/MMQ implementation difference using the same bytes at the GEMM
-// boundary.
-const char *env_two_layer_s1_common_attn_input_path() {
-  const char *v = moestream::graphcfg::env(
-      "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_ATTN_INPUT");
-  return v && v[0] ? v : nullptr;
-}
-
-// Optional earlier seam for the same controlled replay.  This file contains
-// the post-RMSNorm*HC-norm activation ([D*HC] for S=1), allowing the HC
-// down/up/gate projection path to be tested independently of its input
-// normalization and upstream hidden-state construction.
-const char *env_two_layer_s1_common_hc_norm_path() {
-  const char *v = moestream::graphcfg::env(
-      "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_HC_NORM");
-  return v && v[0] ? v : nullptr;
-}
-
-const char *env_two_layer_s1_common_hc_down_silu_path() {
-  const char *v = moestream::graphcfg::env(
-      "MOESTREAM_QWEN4EXP_TWO_LAYER_S1_COMMON_HC_DOWN_SILU");
-  return v && v[0] ? v : nullptr;
+  return layer == env_host_node_diag_layer();
 }
 
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
