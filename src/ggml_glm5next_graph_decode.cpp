@@ -566,6 +566,10 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     op.sched = g.sched;
     op.last = std::chrono::steady_clock::now();
   }
+  if (FILE *rt = route_trace_file()) {
+    std::fprintf(rt, "P %d\n", pos_base);
+    std::fflush(rt);
+  }
   for (auto &entry : g.early_ready)
     entry.second->completed = false;
   const auto start = std::chrono::steady_clock::now();

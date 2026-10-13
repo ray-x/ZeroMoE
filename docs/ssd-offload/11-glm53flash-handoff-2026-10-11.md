@@ -262,3 +262,19 @@ old survey): cold routes/token 188 static; 182 with 8 promotions/token, 169 with
 (~0.34 ms at 19 GB/s, sharing the link with assist), so 8/token saves ~1.5 ms of lane time for ~2.7 ms of copies: not worth building.
 The static ranking matters far more than dynamics: with the independent ranking 56% of routes are cold on these prompts, with the
 in-sample combined ranking 26%. A usage file collected from the real workload is the remaining large, data-only lever.
+
+### 5060 Ti utilisation and the ranking refit (2026-10-14)
+
+**5060 Ti is nearly idle by design**: it holds 14.2 GiB of hot experts and computes only the ones routed to them, ~3 ms/token of kernel
+time out of ~68 (nsys). As an assist device it still helps: AJ, teacher-forced 48 tokens, no assist 86.4 ms, assist=1 on the 5060 Ti
+alone (`ASSIST_DEVICE=1`) 78.9 ms (-7.5 ms), against assist=3 on the 3090 at ~68 ms. Its PCIe3 x8 link is independent of the 3090's, so
+a second assist ring on it should add on top of the 3090's (not built: the lane supports one assist backend today).
+
+**Ranking refit** (`bench/make_survey_batches.py`, `bench/glm_route_survey.sh`, `bench/ranking_holdout_eval.py`; per-token route
+trace via `MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>`): 40 corpus prompts (not among the 5 already in the ranking), 96 decode tokens each,
+graph prefill. Held-out 10 prompts, top-4700 resident, share of routes that are cold: current ranking 44.5%, + the 30 training
+prompts (weight 10) 35.9%, training prompts alone 35.8%, oracle 28.0%. On the benchmark prompt (outside all 40) it is neutral: 35.4% old vs
+36.0% new cold routes, and end-to-end 68.8 / 69.3 ms vs 69.9 / 69.0 ms (logits 91.7% top-1, KL 0.056 = placement noise). So the refit
+fixes a poor ranking on dissimilar prompts, but is no speed-up on prompts the current ranking already fits.
+`docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt` is the refit file (base + all 40 prompts at weight 10); use it with
+`pin_file` in the toml, `MOESTREAM_GLM5NEXT_OFFLOAD_USAGE` and `MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE` (`bench/glm_dual_ranking40.toml`).
