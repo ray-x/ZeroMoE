@@ -249,3 +249,16 @@ IQ3_XXS/IQ3_S/Q3_K/Q4_K. Measured on GSQ-RCO (Q4_K layers 3-5, Q3_K layers 6-8, 
 that half was never exercised. Reverted (`fd0e9e3`, `92bc697`): a 2% gain did not justify an extra flag and a per-layer type special
 case in the hot-set code. If it is wanted later, the whole change was ~15 lines in `assign_gpu1_hot`: compute a per-layer
 "has large type" flag from the gate/up/down tensor types and skip those layers' candidates.
+
+### Last-mile levers, dual GPU, 58 GiB pool, teacher-forced 48 tokens (2026-10-14)
+
+Baseline 68.1 / 68.8 ms (14.7 tok/s). THP on the arena: 67.9 / 68.1 ms, logits identical -> no effect. 5060 Ti hot set 15.0 GiB
+instead of 14.2: 67.8 ms (-0.6 ms, at the edge of noise; 2431 experts). 3090 `moe_cache_gb` 16.3 instead of 15.8: the graph's dense
+arena allocation is declined (decode silently falls back to the legacy path), so the 3090 is full at ~15.8 GB. `token_embd` is not
+in the dense arena (the graph takes host-side embeddings), so there is nothing to move there.
+
+Dynamic VRAM hot set (`bench/vram_hot_sim.py`, survey router trace, slots stay per layer, initial set = top-4700 of the independent
+old survey): cold routes/token 188 static; 182 with 8 promotions/token, 169 with 16, 123 with 32. Each promotion is a 6.5 MB H2D
+(~0.34 ms at 19 GB/s, sharing the link with assist), so 8/token saves ~1.5 ms of lane time for ~2.7 ms of copies: not worth building.
+The static ranking matters far more than dynamics: with the independent ranking 56% of routes are cold on these prompts, with the
+in-sample combined ranking 26%. A usage file collected from the real workload is the remaining large, data-only lever.
