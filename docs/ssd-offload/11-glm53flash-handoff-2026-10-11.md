@@ -239,3 +239,10 @@ GPU assist is now applied per layer only when gate, up and down are all IQ1_S/IQ
 (`gpu_assist_layer_ok`); K-quants and 4-8 bit types stay on the CPU lane. `MOESTREAM_GLM5NEXT_GPU_ASSIST_ANY_TYPE=1` lifts the filter.
 Defaults, teacher-forced 48 tokens: GSQ-RCO 70.1 ms (was 88.2 with assist 3; assist 1 alone gave 68.9), AJ IQ2_XXS 68.3 ms
 (unchanged within noise, assist active).
+
+### IQ3 experts stay off the second GPU (2026-10-13)
+
+`assign_gpu1_hot` skips layers whose routed experts are IQ3_XXS/IQ3_S, so the 5060 Ti hot set never holds the large IQ3 experts; they
+stay in the 3090 cache or on the CPU lane (GPU assist already copies only into the 3090's ring).
+`MOESTREAM_GLM5NEXT_GPU1_ALLOW_IQ3=1` lifts it. No Flash checkpoint we have uses IQ3 experts, so this is untested beyond checking that
+AJ's GPU1 set is unchanged (2302 experts, 14.20 GiB).
