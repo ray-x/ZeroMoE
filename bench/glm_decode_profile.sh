@@ -13,8 +13,9 @@ PROMPT=${PROMPT:-'Explain how a mixture-of-experts transformer routes tokens, in
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do sleep 5; done
 python3 -c '
 import os, sys
-for f in sys.argv[1:]:
-    fd = os.open(f, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
+for a in sys.argv[1:]:
+    for f in a.split(":"):
+        fd = os.open(f, os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
 ' "$MODEL" "${MODEL/-00001-of-00002/-00002-of-00002}" "$STORE"
 sed "s#^log_path *=.*#log_path = \"$out/$tag.engine.log\"#" "$TOML_SRC" > "$out/$tag.toml"
 printf '%s\n:q\n' "$PROMPT" | env -u MOESTREAM_GLM5NEXT_FULL_GRAPH \
