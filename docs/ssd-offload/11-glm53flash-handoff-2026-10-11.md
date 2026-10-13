@@ -278,3 +278,25 @@ prompts (weight 10) 35.9%, training prompts alone 35.8%, oracle 28.0%. On the be
 fixes a poor ranking on dissimilar prompts, but is no speed-up on prompts the current ranking already fits.
 `docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt` is the refit file (base + all 40 prompts at weight 10); use it with
 `pin_file` in the toml, `MOESTREAM_GLM5NEXT_OFFLOAD_USAGE` and `MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE` (`bench/glm_dual_ranking40.toml`).
+
+### Reaching 15 tok/s: recipe and what actually decides it (2026-10-14)
+
+**Decode throughput on real text is set by the ranking, not by the last-mile knobs.** The same configuration measured 16.0 tok/s
+(`dual_final`) and 13.8 tok/s (same binary and flags, re-run) because free-running text differs run to run (assist picks experts by
+readiness). Compare only on identical tokens (`bench/ranking_ab_prompt.sh`: free run writes the tokens, then teacher-forced arms).
+
+Held-out corpus prompts (not in either ranking), identical tokens, AJ IQ2_XXS, dual GPU, 58 GiB pool:
+
+| prompt | current ranking | refit ranking (`glm53flash_usage_base_plus_decode40.txt`) |
+|---|---|---|
+| 046 css flexbox navbar | 82.1 ms = 12.2 tok/s | 68.6 ms = **14.6 tok/s** |
+| 094 dockerfile flask | 82.0 ms = 12.2 tok/s | 64.5 ms = **15.5 tok/s** |
+| benchmark prompt (in-domain for the old ranking) | 14.85 tok/s | neutral |
+
+**Recipe** (all env, nothing machine-specific in code):
+`CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=15.0 MOESTREAM_GLM5NEXT_CPU_THREADS=10`, toml `pin_file` and
+`MOESTREAM_GLM5NEXT_OFFLOAD_USAGE` (and `_GPU1_HOT_USAGE`) = the refit file, GPU assist 3 on the 3090 plus the second assist ring on the
+5060 Ti (`ASSIST2_DEVICE`, auto on a dual-GPU run with a second-GPU hot set; 1 slot, keeps >= 1 expert on the CPU). On the fixed
+benchmark sequence (steady state, last 30 tokens): baseline 14.85 tok/s, with the recipe 15.05-15.10. Second assist device alone:
+-0.4 ms; threads 10 vs 8: -0.3 ms; hot set 15.0 vs 14.2 GiB: -0.6 ms (15.3 does not fit: the dense arena is declined).
+Pool: auto sizing now reserves 36 GiB instead of 60 (75.9 GiB pool on this box); the Q2_K/Q3_K GSQ-RCO file needs ~74 GiB.
