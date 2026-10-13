@@ -3,7 +3,14 @@
 write stdin files for the engine: logs/perf/survey/batch<i>.txt (+ batch<i>.ids). Stratified by category prefix."""
 import os, re, sys, collections
 root = 'tests/moe_usage_survey/prompts'
-used = {1, 33, 65, 81, 105}            # the 5 survey prompts that went into glm53flash_usage_combined_old_plus_survey5
+used = {1, 33, 65, 81, 105}
+import glob
+start_batch = 0
+if os.environ.get('SURVEY_SKIP_EXISTING') == '1':     # add batches for prompts not yet surveyed
+    for idf in glob.glob('logs/perf/survey/batch*.ids'):
+        start_batch = max(start_batch, int(re.search(r'batch(\d+)', idf).group(1)) + 1)
+        for name in open(idf).read().split():
+            used.add(int(name.split('_')[0]))            # the 5 survey prompts that went into glm53flash_usage_combined_old_plus_survey5
 n_total = int(sys.argv[1]) if len(sys.argv) > 1 else 40
 per_batch = int(sys.argv[2]) if len(sys.argv) > 2 else 10
 files = sorted(os.listdir(root))
@@ -21,11 +28,11 @@ while len(picked) < n_total and any(bycat.values()):
 os.makedirs('logs/perf/survey', exist_ok=True)
 for b in range(0, len(picked), per_batch):
     chunk = picked[b:b + per_batch]
-    with open('logs/perf/survey/batch%d.txt' % (b // per_batch), 'w') as out:
+    with open('logs/perf/survey/batch%d.txt' % (start_batch + b // per_batch), 'w') as out:
         for f in chunk:
             text = ' '.join(open(os.path.join(root, f)).read().split())[:900]
             out.write(text + '\n')
         out.write(':q\n')
-    with open('logs/perf/survey/batch%d.ids' % (b // per_batch), 'w') as ids:
+    with open('logs/perf/survey/batch%d.ids' % (start_batch + b // per_batch), 'w') as ids:
         ids.write('\n'.join(chunk) + '\n')
 print(len(picked), 'prompts;', collections.Counter(re.match(r'\d+_([a-z_+0-9]+?)__', f).group(1) for f in picked))
