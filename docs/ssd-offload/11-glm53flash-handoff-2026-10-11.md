@@ -176,3 +176,16 @@ graph computes the rest; the GPU part is merged into the lane output rows. It ne
 N=2/3/4 and pinned fraction 0.5/0.95 are all within noise (9.4-9.8). Numerics are NOT identical to the CPU path
 (Q8_1 vs Q8_K activation quantization): teacher-forced 48 tokens vs the CPU lane, top-1 agreement 95.8 %, mean KL 0.034,
 max KL 0.17. Default off until output quality has been judged on more prompts.
+
+### 6.2 Dual GPU (3090 + 5060 Ti hot 14.2 GiB) on the current code, 58 GiB pool, steady-state graph ms/token (46 tokens)
+
+| config | ms/token | tok/s | output |
+|---|---|---|---|
+| 3090 only | 98.6 | 10.1 | reference |
+| + `GPU1_HOT_GIB=14.2` (lane silently off: guard `hot1.empty()`) | 82.1 | 12.2 | differs (placement) |
+| + lane kept on GPU1 layers (`MOESTREAM_GLM5NEXT_LANE_WITH_GPU1`, default on) | 78.3 | 12.8 | identical to previous row |
+| + `GPU_ASSIST=2` | 68.1 | 14.7 | not identical (GPU rounding) |
+
+Run with `CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=14.2`. One-time cost: the first decode token takes ~21 s
+(14 GiB of experts copied to the 5060 Ti with one synchronous tensor_set per expert, from not-yet-resident pages).
+Engine-reported "decode=" over a 48-token run includes that and the graph build; use the per-token FULL-DECODE-TIME lines.

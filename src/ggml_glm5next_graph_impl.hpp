@@ -96,6 +96,8 @@ bool early_ready_wanted();
 bool split_load_wanted();
 // Number of resident cold experts per layer the lane may run on a second CUDA stream (0 = off).
 int gpu_assist_slots();
+// Keep the CPU lane on layers that also have a GPU1 hot branch (MOESTREAM_GLM5NEXT_LANE_WITH_GPU1, default on).
+bool lane_with_gpu1_wanted();
 OffloadState *get_offload(const StreamingEngine &engine, const std::vector<PartialExpertLayer> *partial = nullptr);
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud);
 ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);

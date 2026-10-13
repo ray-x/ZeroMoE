@@ -428,7 +428,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       }
     }
     EarlyReadyLane *lane = nullptr;
-    if (has_cold && early_ready_wanted() && !stage && partial->hot1.empty() &&
+    if (has_cold && early_ready_wanted() && !stage && (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
         family_supports_cpu_lane(g.engine->family_ops.family)) {
       moe_routed::ExpertWeights cold_w;
       cold_w.gate_up = gate_up;
