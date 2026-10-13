@@ -29,3 +29,10 @@ amortises expert work across tokens is verifying several tokens per pass.
 Estimated 1-2 weeks for a first version; the KDA state rollback and the S>1 lane are the risky parts. Payoff is conditional on the
 text (code-like only). Recommended first step before building: replay existing generated sequences (`logs/perf/*.tokens`, the survey
 outputs) through an n-gram/prompt-lookup drafter offline and measure acceptance a by domain (hours, no engine changes).
+
+## Measured: model-free drafting does not pay (2026-10-14, `bench/prompt_lookup_replay.py`)
+Replay of the 100 surveyed replies (96 tokens each, word-level proxy): a prompt-lookup drafter (last 2 words -> next 3 words) finds
+a draft in only 4% of passes and accepts 1.03 words/pass overall (best domain: bash 1.15, 1.09x with draft passes at 1.5x cost;
+css 1.02, html 1.03). Longer replies repeat more, but not enough to change this. Conclusion: n-gram/prompt-lookup speculation is
+not worth building for this workload; only a real draft model (none available) or an MTP head (none in the checkpoints) could
+supply useful drafts, which makes the S>1 graph/lane work unjustified today.
