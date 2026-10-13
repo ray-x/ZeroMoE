@@ -246,3 +246,10 @@ Defaults, teacher-forced 48 tokens: GSQ-RCO 70.1 ms (was 88.2 with assist 3; ass
 stay in the 3090 cache or on the CPU lane (GPU assist already copies only into the 3090's ring).
 `MOESTREAM_GLM5NEXT_GPU1_ALLOW_IQ3=1` lifts it. No Flash checkpoint we have uses IQ3 experts, so this is untested beyond checking that
 AJ's GPU1 set is unchanged (2302 experts, 14.20 GiB).
+
+### Q3_K / Q4_K also stay off the second GPU (2026-10-13)
+
+The 5060 Ti exclusion now covers IQ3_XXS, IQ3_S, Q3_K and Q4_K layers (`MOESTREAM_GLM5NEXT_GPU1_ALLOW_LARGE_TYPES=1` lifts it; the
+older `_ALLOW_IQ3` still works). GSQ-RCO, defaults, order-balanced, teacher-forced 48 tokens: excluded 67.9 / 68.8 ms (mean 68.4),
+allowed 69.4 / 70.1 ms (mean 69.8), i.e. ~1.4 ms (2%) faster; logits between the two placements agree 91.7% top-1, mean KL 0.020
+(placement noise). Layers 3-5 (Q4_K) and 6-8 (Q3_K) are the ones excluded.
