@@ -338,3 +338,10 @@ binary links the kernel (`36f489d6b`) and patch 0006 without any `LD_LIBRARY_PAT
 checkout is NOT enough: `ggml-backend.cpp` / `ggml-cuda.cu` need those uncommitted host-node edits (applied here from
 `git diff` of the integration tree). Measured with that binary, no overrides, recipe env, auto pool 76 GiB: benchmark sequence
 15.31 tok/s, held-out dockerfile 15.03, held-out css 13.19 (ranking from training prompts only).
+
+### Per-session adaptive resident set on the clean held-out prompts (2026-10-14, `bench/vram_hot_sim2.py`)
+
+Initial set = top-4700 of the train-only ranking, fresh per prompt, 10 held-out prompts, up to U promotions per token (LRU victim in
+the same layer): cold routes per token 117.0 static, 116.6 (U=4), 115.7 (U=8), 112.9 (U=16), 98.5 (U=32). U=32 would cost ~11 ms of
+copies (6.5 MB at ~19 GB/s each) for a ~16% cut in cold work (~6 ms), so adapting inside a prompt does not pay, including on the
+far-domain prompts. Routing inside one 64-96 token reply is not concentrated enough to learn. Not built.
