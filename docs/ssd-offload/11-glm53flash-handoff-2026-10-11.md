@@ -189,3 +189,10 @@ max KL 0.17. Default off until output quality has been judged on more prompts.
 Run with `CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=14.2`. One-time cost: the first decode token takes ~21 s
 (14 GiB of experts copied to the 5060 Ti with one synchronous tensor_set per expert, from not-yet-resident pages).
 Engine-reported "decode=" over a 48-token run includes that and the graph build; use the per-token FULL-DECODE-TIME lines.
+
+### 6.3 Final dual-GPU numbers, defaults on (58 GiB pool, 14.2 GiB on the 5060 Ti, GPU assist 3, lane on GPU1 layers)
+
+Steady state 64.9 ms/token = **15.4 tok/s** (46 tokens, graph time; 3090-only before this work: ~230 ms, 4.3 tok/s at the 32 GiB test pool,
+~125 ms at 58 GiB). Noise floor for numerics: 3090-only vs dual-GPU with NO assist, teacher-forced 48 tokens, top-1 93.8 %, mean KL 0.051;
+dual + assist vs dual lane-only: 91.7 %, 0.049; 3090-only assist: 95.8 %, 0.034. So assist is within the spread of valid placements.
+GPU1 hot-expert upload at graph prepare now reads 16 experts in parallel: 21 s -> 13 s (still one-time).
