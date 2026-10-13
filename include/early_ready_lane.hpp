@@ -85,6 +85,15 @@ struct GpuAssistShared {
   }
 };
 
+// MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>: "P <pos>" at the start of each decode token, then "R <layer> <ids...>" per layer.
+inline FILE *route_trace_file() {
+  static FILE *f = [] {
+    const char *path = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TRACE");
+    return path && path[0] ? std::fopen(path, "a") : nullptr;
+  }();
+  return f;
+}
+
 struct EarlyReadyLane {
   static constexpr uint64_t kMagic = 0x514541524c593133ull;
   uint64_t magic = kMagic;
@@ -130,6 +139,7 @@ struct EarlyReadyLane {
   cudaStream_t output_stream = nullptr;
   cudaEvent_t output_done = nullptr;
   int device = -1, d = 0, k = 0, n_experts = 0, expected_pos = -1;
+  int trace_layer = -1;  // layer index for MOESTREAM_GLM5NEXT_ROUTE_TRACE lines
   bool completed = false;
   bool skip_all_hot = false;
   bool async_output_copy = false;
@@ -518,6 +528,13 @@ struct EarlyReadyLane {
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(expected_pos < 0 || *position == expected_pos);
+    // MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>: one line per (decode token, layer): "pos layer id id ..." (all k routed ids).
+    if (FILE *route_trace = route_trace_file()) {
+      std::fprintf(route_trace, "R %d", trace_layer);
+      for (int i = 0; i < k; ++i) std::fprintf(route_trace, " %d", ids[i]);
+      std::fputc('\n', route_trace);
+      std::fflush(route_trace);
+    }
     const char *stage_no_request_env =
         moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_NO_REQUEST");
     const bool stage_no_request =

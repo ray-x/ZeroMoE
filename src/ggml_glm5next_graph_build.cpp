@@ -58,6 +58,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
     return nullptr;
   if (!lane->prepare(g.cpu, g.device, g.D, c.topk, cold_w, remap, mask))
     return nullptr;
+  lane->trace_layer = layer;
 
   ggml_tensor *dst = ggml_dup_tensor(ctx, cur);
   lane->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));
