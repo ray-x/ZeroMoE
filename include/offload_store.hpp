@@ -149,7 +149,7 @@ inline bool read_gguf_header(const std::string &path, GgufHeader &h, std::string
 // Bytes of one row of `ne0` elements for the ggml types that appear in MoE expert tensors (0 = unknown type).
 inline uint64_t ggml_row_bytes(uint32_t type, uint64_t ne0) {
   struct T { uint32_t type, block, bytes; };
-  static constexpr T table[] = {{0, 1, 4}, {1, 1, 2}, {2, 32, 18}, {8, 32, 34}, {12, 256, 144}, {13, 256, 176}, {14, 256, 210},
+  static constexpr T table[] = {{0, 1, 4}, {1, 1, 2}, {2, 32, 18}, {8, 32, 34}, {10, 256, 84}, {11, 256, 110}, {12, 256, 144}, {13, 256, 176}, {14, 256, 210},
                                 {16, 256, 66}, {17, 256, 74}, {18, 256, 98}, {19, 256, 50}, {20, 32, 18}, {21, 256, 110},
                                 {22, 256, 82}, {23, 256, 136}, {29, 256, 56}, {30, 1, 2}, {42, 32, 10}};
   for (const T &e : table)
