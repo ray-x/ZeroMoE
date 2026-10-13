@@ -126,7 +126,9 @@ OffloadState *get_offload(const StreamingEngine &engine,
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION", "0.25").c_str());
   sc.byte_capacity = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1";
   sc.async_loads = offload_async();
-  if (pilot_stage_k() > 0 && offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", "0") == "1") {
+  // Page-lock the arena slots (DMA straight from DDR) for staging and for the lane's GPU assist.
+  if ((pilot_stage_k() > 0 || gpu_assist_slots() > 0) &&
+      offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", gpu_assist_slots() > 0 ? "1" : "0") == "1") {
     sc.pin_fn = [](void *ptr, size_t bytes) {
       if (cudaHostRegister(ptr, bytes, cudaHostRegisterPortable) == cudaSuccess)
         return true;

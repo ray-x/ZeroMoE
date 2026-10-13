@@ -170,6 +170,41 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
       return true;
     };
   }
+  if (gpu_assist_slots() > 0 && offload_layer(layer)) {
+    if (OffloadState *o = get_offload(*g.engine)) {
+      // One backend + one ring shared by every lane of this graph; freed with the last lane.
+      static std::weak_ptr<GpuAssistShared> shared_weak;
+      std::shared_ptr<GpuAssistShared> shared = shared_weak.lock();
+      if (!shared) {
+        auto s = std::make_shared<GpuAssistShared>();
+        s->be = ggml_backend_cuda_init(g.device);
+        s->slots = gpu_assist_slots();
+        bool ok = s->be != nullptr;
+        for (int p = 0; ok && p < 3; ++p) {
+          for (int l = o->first; l < o->first + o->n_layers; ++l)
+            s->plane_cap[p] = std::max<size_t>(s->plane_cap[p], (size_t)o->arena->plane_bytes(l, p));
+          s->ring[p] = ggml_backend_alloc_buffer(s->be, s->plane_cap[p] * (size_t)s->slots + 4096);
+          ok = s->ring[p] != nullptr;
+        }
+        if (ok) {
+          shared = s;
+          shared_weak = s;
+        }
+      }
+      if (shared && lane->prepare_gpu_assist(cold_w, shared)) {
+        lane->expert_planes = [o, layer](int expert, const void *planes[3]) {
+          if (!o->residency->ready({layer, expert}) || !o->store->is_pinned(layer, expert))
+            return false;  // an unpinned slot would make the async copy a blocking staged one
+          for (int k = 0; k < 3; ++k)
+            planes[k] = o->arena->ptr(layer, expert, k);
+          return planes[0] && planes[1] && planes[2];
+        };
+      } else {
+        lane->assist.graph = nullptr;
+        LOG_WARN("[GGML-GLM5NEXT-EARLY-READY] layer=%d GPU assist unavailable\n", layer);
+      }
+    }
+  }
   EarlyReadyLane *raw = lane.get();
   g.early_ready.emplace(layer, std::move(lane));
   LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);

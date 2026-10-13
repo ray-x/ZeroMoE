@@ -189,6 +189,11 @@ bool split_load_wanted() {
   return on;
 }
 
+int gpu_assist_slots() {
+  static const int n = std::max(0, std::min(8, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU_ASSIST", 0)));
+  return n;
+}
+
 } // namespace glm5next_graph
 
 #endif // MOESTREAM_USE_GGML_CUDA
