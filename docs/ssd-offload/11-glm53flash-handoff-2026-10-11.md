@@ -322,3 +322,8 @@ left; not done here because that tree carries someone else's uncommitted `ggml-b
 Kernel micro-restructurings (`bench/kernels/iq2xxs_dot_bench.cpp` candidates F/G/H: grid rows assembled with movq+punpcklqdq, fused
 `vpdpwssd`, two blocks interleaved) give up to +8% single-thread from DRAM (4.07 vs 3.77 GB/s) but 15.36 vs 15.43 tok/s end to end
 (noise), so they were not committed to the fork. The kernel stays at ~4 GB/s/thread, load-port/latency bound, not a memory-bound one.
+
+Final recipe (`. bench/glm_recipe_env.sh`; ranking from training prompts only for the held-out rows), steady last 30 tokens, identical
+tokens: benchmark sequence 15.43 tok/s; held-out 046 css 13.27 tok/s (old ranking 11.69); held-out 094 dockerfile 15.09 tok/s (old
+12.32). Prompts far from every surveyed domain stay ~13-14 tok/s; collecting a usage file from the real workload
+(`bench/make_survey_batches.py`, `bench/glm_route_survey.sh`, `bench/ranking_holdout_eval.py --write`) is the way to move those.
