@@ -611,6 +611,29 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   }
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
+  if (g.decode_mode || qwen4exp_full_graph_decode_enabled()) {
+    ggml_tensor *lm_in = g.decode_mode
+                            ? g.output
+                            : ggml_view_2d(g.ctx, g.output, g.D, 1,
+                                           g.output->nb[1],
+                                           (g.S - 1) * g.output->nb[1]);
+    ggml_tensor *out_norm =
+        resident_tensor(g, g.ctx, "output_norm.weight");
+    if (out_norm) {
+      lm_in = ggml_mul(
+          g.ctx,
+          ggml_rms_norm(g.ctx, lm_in,
+                        g.engine->model_file.architecture_config.eps),
+          out_norm);
+    }
+    ggml_tensor *out_weight =
+        resident_tensor(g, g.ctx, "output.weight");
+    if (!out_weight)
+      return false;
+    g.logits = ggml_mul_mat(g.ctx, out_weight, lm_in);
+    ggml_set_output(g.logits);
+    ggml_build_forward_expand(g.graph, g.logits);
+  }
   }
   if (!g.decode_mode) {
     for (ggml_tensor *t : g.kv_k) {
