@@ -156,3 +156,23 @@ Measured negative (same day): pilot prefetch (K=4, copy off) feeding the overlap
 decode went 165.8 -> 168.8 ms/token (A/B x2, same sign). Not kept. Other things tried and dropped: `MOESTREAM_OFFLOAD_EVICT=free`
 (2.85 -> 2.81 ms per load, noise), CPU threads 6/10/12 vs 8 (5.16/5.21/4.73 vs 5.29 tok/s), striped vs single store with the new lane
 (5.29 vs 5.27: raw QD1 read of one 6.6 MB expert is 2.3-2.8 ms on these drives, so loads are device-latency bound).
+
+### 6.1 Decode at a 58 GiB pool (2026-10-13, 3090, IQ2_XXS, new CPU kernel + split load)
+
+| DDR pool | decode tok/s | SSD misses per 32 tokens | lane compute |
+|---|---|---|---|
+| 32 GiB | 5.25 | 936 | 134 ms/token |
+| 48 GiB | 7.26 | 222 | 90 |
+| 58 GiB | 8.18 | 14 | 73 |
+| 58 GiB + `MOESTREAM_GLM5NEXT_GPU_ASSIST=3` | 9.4-9.8 | 17-22 | 55-57 |
+
+`MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB` unset now means "auto" (available RAM minus 60 GiB, >= 16 GiB, capped at the
+expert bytes); an explicit value is unchanged.
+
+GPU assist (`early_ready_lane.hpp`, opt-in): the lane copies up to N of the layer's resident cold experts straight from
+the page-locked DDR arena into a small shared VRAM ring and runs them on a second CUDA backend (own stream) while the CPU
+graph computes the rest; the GPU part is merged into the lane output rows. It needs the arena pinned
+(`OFFLOAD_PIN`, set automatically; an unpinned slot would make the copy a blocking staged one, which was 8.1 -> 5.9 tok/s).
+N=2/3/4 and pinned fraction 0.5/0.95 are all within noise (9.4-9.8). Numerics are NOT identical to the CPU path
+(Q8_1 vs Q8_K activation quantization): teacher-forced 48 tokens vs the CPU lane, top-1 agreement 95.8 %, mean KL 0.034,
+max KL 0.17. Default off until output quality has been judged on more prompts.

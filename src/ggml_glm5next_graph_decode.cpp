@@ -582,14 +582,17 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   if (!g.early_ready.empty()) {
     static int lane_tokens = 0;
     if (++lane_tokens % 16 == 0) {
-      uint64_t calls = 0, split = 0;
-      int64_t wait = 0, compute = 0, stall = 0;
+      uint64_t calls = 0, split = 0, a_runs = 0, a_experts = 0;
+      int64_t wait = 0, compute = 0, stall = 0, a_stall = 0;
       for (auto &entry : g.early_ready) {
         calls += entry.second->calls;
         split += entry.second->split_runs;
         wait += entry.second->wait_us;
         compute += entry.second->compute_us;
         stall += entry.second->split_stall_us;
+        a_runs += entry.second->assist_runs;
+        a_experts += entry.second->assist_experts;
+        a_stall += entry.second->assist_stall_us;
       }
       uint64_t misses = 0, loads = 0, load_us = 0;
       if (OffloadState *o = g_offload.get()) {
@@ -598,6 +601,9 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
         loads = ct.loads.load();
         load_us = ct.load_us.load();
       }
+      if (a_runs)
+        LOG_INFO("[GLM5NEXT-LANE] gpu assist: %llu layer-runs, %llu experts, tail wait %.1fms/token\n",
+                 (unsigned long long)a_runs, (unsigned long long)a_experts, a_stall / 1000.0 / lane_tokens);
       LOG_INFO("[GLM5NEXT-LANE] tokens=%d lane calls=%llu split=%llu wait=%.1fms/token compute=%.1fms/token "
                "split stall=%.1fms/token | misses=%llu loads=%llu read=%.1fms/token (%.2f ms per load)\n",
                lane_tokens, (unsigned long long)calls, (unsigned long long)split,
