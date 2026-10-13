@@ -83,7 +83,7 @@ inline ModelFamily detect_model_family(const GGUFFile &model_file) {
     return ModelFamily::DeepSeek_V4;
   if (arch == "deepseek41")
     return ModelFamily::DeepSeek_V41;
-  if (arch == "glm5next")
+  if (arch == "glm5next" || arch == "glm5-next") // "glm5-next": GSQ-RCO converter spelling
     return ModelFamily::GLM5NEXT;
   if (arch == "qwen4exp")
     return ModelFamily::Qwen4Exp;
