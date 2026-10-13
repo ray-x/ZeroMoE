@@ -189,6 +189,11 @@ bool split_load_wanted() {
   return on;
 }
 
+bool lane_with_gpu1_wanted() {
+  static const bool on = moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_LANE_WITH_GPU1");
+  return on;
+}
+
 int gpu_assist_slots() {
   static const int n = std::max(0, std::min(8, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU_ASSIST", 0)));
   return n;
