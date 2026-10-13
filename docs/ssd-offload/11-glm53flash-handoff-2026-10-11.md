@@ -134,3 +134,19 @@ The real AJ file is 6.59 MB/expert, so its measured 128 ms at DDR 32 is slower t
   `~/work/moestream-graph/glm_runs/pinab/` (the toml's absolute `log_path` points there).
 * Stores: `/data/glm53flash-il` (interleaved), `/data/moestream-offload/glm53flash-stripe0.gguf` + `~/work/nvme1-store/glm53flash-stripe1.gguf`
   (striped, 37.11 GiB each), `glm53flash-aj-iq2xxs-all12096.gguf` (single full store, 80 GB).
+
+## 6. Update 2026-10-13: decode profile and two measured wins (graph-framework branch)
+
+Decode profile at DDR 32 GiB, lru, 3090 only (`bench/glm_decode_profile.sh`; ~230 ms/token before this work):
+CPU cold-expert MUL_MAT_ID (IQ2_XXS) ~93 ms, miss node (SSD reads) ~70-90 ms, GPU ops ~45 ms, readbacks 0.13 ms,
+cache update 0 ms. H2D/D2H transfers are not a lever here; the token is CPU compute plus synchronous loads.
+
+| change | where | decode tok/s (order-balanced, logits+tokens identical) |
+|---|---|---|
+| lane computes resident cold experts while missing ones load (`MOESTREAM_GLM5NEXT_SPLIT_LOAD`, default on) | `include/early_ready_lane.hpp`, `ExpertStore::begin_ensure/finish_ensure` | 4.29 / 4.28 -> 4.92 / 4.92 (+14.8%) |
+| IQ2_XXS x Q8_K dot, per-block vector sign/scale expansion (ggml fork branch `iq2xxs-avx512vl-dot`) | `ggml/src/ggml-cpu/arch/x86/quants.c` | 4.94 / 4.93 -> 5.27 / 5.23 (+6.7%) |
+
+After both: lane compute ~106 ms/token, residual load stall ~42 ms/token (about half of all layer calls split),
+id wait ~25 ms/token. Gathers (`vpgatherdq`) run 3-5x slower than scalar loads on this Cascade Lake (GDS mitigation):
+`bench/kernels/iq2xxs_dot_bench.cpp` has the exactness check and the rejected variants.
+`bench/glm_env_ab.sh` runs any two env/library setups order-balanced and compares logits + tokens.
