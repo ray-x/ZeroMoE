@@ -109,6 +109,8 @@ struct PartialExpertLayer {
   size_t vram_slot_stride = 0;
   std::vector<int> slot_last_use;
   std::vector<uint32_t> miss_count;
+  std::vector<float> heat;        // decayed re-reference score of each cold expert (MOESTREAM_GLM5NEXT_DYNAMIC_HEAT)
+  std::vector<uint64_t> heat_at;  // token clock of the last heat update
   std::vector<uint8_t> slot_in_flight;
   std::vector<uint8_t> expert_in_flight;
   uint64_t route_count = 0;

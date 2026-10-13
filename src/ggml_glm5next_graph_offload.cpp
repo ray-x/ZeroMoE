@@ -6,6 +6,8 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 
+#include <filesystem>
+
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
@@ -65,7 +67,14 @@ OffloadState *get_offload(const StreamingEngine &engine,
       return nullptr;
     }
     const size_t pos = first_shard.rfind("-00001-of-");
-    if (pos == std::string::npos) {
+    std::error_code dir_ec;
+    if (std::filesystem::is_directory(first_shard, dir_ec)) {
+      // A directory of shards (what `gguf_tool pack` writes: repacked-<name>-partNNNNN-of-NNNNN.gguf): every .gguf, sorted.
+      for (const auto &entry : std::filesystem::directory_iterator(first_shard))
+        if (entry.is_regular_file() && entry.path().extension() == ".gguf")
+          sc.model_shards.push_back(entry.path().string());
+      std::sort(sc.model_shards.begin(), sc.model_shards.end());
+    } else if (pos == std::string::npos) {
       sc.model_shards.push_back(first_shard);
     } else {
       const std::string head = first_shard.substr(0, pos);
