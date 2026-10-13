@@ -327,3 +327,14 @@ Final recipe (`. bench/glm_recipe_env.sh`; ranking from training prompts only fo
 tokens: benchmark sequence 15.43 tok/s; held-out 046 css 13.27 tok/s (old ranking 11.69); held-out 094 dockerfile 15.09 tok/s (old
 12.32). Prompts far from every surveyed domain stay ~13-14 tok/s; collecting a usage file from the real workload
 (`bench/make_survey_batches.py`, `bench/glm_route_survey.sh`, `bench/ranking_holdout_eval.py --write`) is the way to move those.
+
+### The default binary with the kernel: `build_gk` (2026-10-14)
+
+`cmake -S . -B build_gk -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 -DMOESTREAM_GGML_ROOT=<fork ggml> -DMOESTREAM_GGML_PREBUILT_DIR=
+-DMOESTREAM_ENABLE_GGML_HOST_NODE_PATCHES=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_CUDA_GRAPHS=ON` builds ggml in-tree, so the
+binary links the kernel (`36f489d6b`) and patch 0006 without any `LD_LIBRARY_PATH`. `llama.cpp-moestream-integration` is already at
+`7bd457fa1` (kernel included) with the host-node edits uncommitted in its working tree, so rebuilding
+`~/Projects/moestream-build-upstream-master` (the engine's prebuilt ggml) is all that is needed on the main tree. A clean fork
+checkout is NOT enough: `ggml-backend.cpp` / `ggml-cuda.cu` need those uncommitted host-node edits (applied here from
+`git diff` of the integration tree). Measured with that binary, no overrides, recipe env, auto pool 76 GiB: benchmark sequence
+15.31 tok/s, held-out dockerfile 15.03, held-out css 13.19 (ranking from training prompts only).
