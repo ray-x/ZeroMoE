@@ -170,7 +170,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
       return true;
     };
   }
-  if (gpu_assist_slots() > 0 && offload_layer(layer)) {
+  if (gpu_assist_slots() > 0 && offload_layer(layer) && gpu_assist_layer_ok(g, layer)) {
     if (OffloadState *o = get_offload(*g.engine)) {
       // One backend + one ring shared by every lane of this graph; freed with the last lane.
       static std::weak_ptr<GpuAssistShared> shared_weak;
@@ -185,7 +185,8 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
         bool ok = s->be != nullptr;
         for (int p = 0; ok && p < 3; ++p) {
           for (int l = o->first; l < o->first + o->n_layers; ++l)
-            s->plane_cap[p] = std::max<size_t>(s->plane_cap[p], (size_t)o->arena->plane_bytes(l, p));
+            if (gpu_assist_layer_ok(g, l))  // the ring only has to fit layers that use it
+              s->plane_cap[p] = std::max<size_t>(s->plane_cap[p], (size_t)o->arena->plane_bytes(l, p));
           s->ring[p] = ggml_backend_alloc_buffer(s->be, s->plane_cap[p] * (size_t)s->slots + 4096);
           ok = s->ring[p] != nullptr;
         }

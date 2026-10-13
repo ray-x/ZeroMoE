@@ -232,3 +232,10 @@ AJ IQ2_XXS on the same sequence: 67.9 ms. So the 3.0-bit file is at speed parity
 experts and hurts here). Zero misses with the 90 GiB pool. Quality vs AJ (teacher-forced, same tokens, assist 3 run): top-1 agreement
 77.1%, mean KL 0.35, max 1.61 -- far outside the 94% / 0.05 spread between placements of the same model, i.e. a genuinely different
 model; which is more accurate needs a task eval, not a KL.
+
+### Assist by expert type (2026-10-13)
+
+GPU assist is now applied per layer only when gate, up and down are all IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/Q2_0
+(`gpu_assist_layer_ok`); K-quants and 4-8 bit types stay on the CPU lane. `MOESTREAM_GLM5NEXT_GPU_ASSIST_ANY_TYPE=1` lifts the filter.
+Defaults, teacher-forced 48 tokens: GSQ-RCO 70.1 ms (was 88.2 with assist 3; assist 1 alone gave 68.9), AJ IQ2_XXS 68.3 ms
+(unchanged within noise, assist active).
