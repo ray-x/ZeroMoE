@@ -143,6 +143,9 @@ class ExpertStore {
              (unsigned long long)o.evictions.load(),
              (unsigned long long)o.errors.load(), o.load_us.load() / 1000.0,
              o.cb_us.load() / 1000.0, (unsigned long long)o.cold_routes.load());
+    LOG_INFO("%s %s sources: store direct=%llu store buffered=%llu model buffered=%llu\n", cfg_.log_tag, why,
+             (unsigned long long)store_.direct_reads(), (unsigned long long)store_.buffered_reads(),
+             (unsigned long long)model_.reads.load());
     if (residency_ && cfg_.async_loads)
       LOG_INFO("%s %s async: demand lookups that waited on an in-flight read=%llu wait=%.1f ms\n",
                cfg_.log_tag, why, (unsigned long long)residency_->waited_experts(),
