@@ -590,11 +590,6 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   (void)max_count;
   std::vector<std::vector<uint8_t>> is_cold((size_t)c.n_layers);
   std::vector<size_t> bytes((size_t)c.n_layers, 0);
-  // The large experts (IQ3_XXS/IQ3_S, Q3_K, Q4_K) stay off the second GPU (PCIe3 x8, half the bandwidth): they live in the
-  // primary GPU's cache or on the CPU lane. MOESTREAM_GLM5NEXT_GPU1_ALLOW_LARGE_TYPES=1 (or the older _ALLOW_IQ3) lifts it.
-  const bool allow_iq3 = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_GPU1_ALLOW_LARGE_TYPES") ||
-                         moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_GPU1_ALLOW_IQ3");
-  std::vector<uint8_t> has_iq3((size_t)c.n_layers, 0);
   for (int l = c.first_dense; l < c.n_layers; ++l) {
     PartialExpertLayer &p = g.partial_experts[(size_t)l];
     is_cold[(size_t)l].assign((size_t)c.n_experts, 0);
@@ -605,18 +600,12 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
       const GGUFTensor *m = model_tensor(*g.engine, "blk." + std::to_string(l) + "." + stem);
       if (m && c.n_experts > 0)
         bytes[(size_t)l] += (size_t)m->size_bytes / (size_t)c.n_experts;
-      if (m) {
-        const int t = static_cast<int>(m->type);
-        if (t == GGML_TYPE_IQ3_XXS || t == GGML_TYPE_IQ3_S || t == GGML_TYPE_Q3_K || t == GGML_TYPE_Q4_K)
-          has_iq3[(size_t)l] = 1;
-      }
     }
   }
   std::vector<StreamingEngine::UsageEntry> cand;
   for (const auto &e : entries)
     if (e.layer >= c.first_dense && e.layer < c.n_layers && e.expert >= 0 &&
-        e.expert < c.n_experts && e.count > 0 && is_cold[(size_t)e.layer][(size_t)e.expert] &&
-        (allow_iq3 || !has_iq3[(size_t)e.layer]))
+        e.expert < c.n_experts && e.count > 0 && is_cold[(size_t)e.layer][(size_t)e.expert])
       cand.push_back(e);
   std::sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) {
     if (a.count != b.count)

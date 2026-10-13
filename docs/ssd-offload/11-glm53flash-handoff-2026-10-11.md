@@ -240,16 +240,12 @@ GPU assist is now applied per layer only when gate, up and down are all IQ1_S/IQ
 Defaults, teacher-forced 48 tokens: GSQ-RCO 70.1 ms (was 88.2 with assist 3; assist 1 alone gave 68.9), AJ IQ2_XXS 68.3 ms
 (unchanged within noise, assist active).
 
-### IQ3 experts stay off the second GPU (2026-10-13)
+### Tried and reverted: keep large-type experts (IQ3, Q3_K, Q4_K) off the 5060 Ti (2026-10-13)
 
-`assign_gpu1_hot` skips layers whose routed experts are IQ3_XXS/IQ3_S, so the 5060 Ti hot set never holds the large IQ3 experts; they
-stay in the 3090 cache or on the CPU lane (GPU assist already copies only into the 3090's ring).
-`MOESTREAM_GLM5NEXT_GPU1_ALLOW_IQ3=1` lifts it. No Flash checkpoint we have uses IQ3 experts, so this is untested beyond checking that
-AJ's GPU1 set is unchanged (2302 experts, 14.20 GiB).
-
-### Q3_K / Q4_K also stay off the second GPU (2026-10-13)
-
-The 5060 Ti exclusion now covers IQ3_XXS, IQ3_S, Q3_K and Q4_K layers (`MOESTREAM_GLM5NEXT_GPU1_ALLOW_LARGE_TYPES=1` lifts it; the
-older `_ALLOW_IQ3` still works). GSQ-RCO, defaults, order-balanced, teacher-forced 48 tokens: excluded 67.9 / 68.8 ms (mean 68.4),
-allowed 69.4 / 70.1 ms (mean 69.8), i.e. ~1.4 ms (2%) faster; logits between the two placements agree 91.7% top-1, mean KL 0.020
-(placement noise). Layers 3-5 (Q4_K) and 6-8 (Q3_K) are the ones excluded.
+Idea: only the 3090 (PCIe4 x16, 2x the bandwidth) should hold the big experts, so `assign_gpu1_hot` skipped layers whose experts are
+IQ3_XXS/IQ3_S/Q3_K/Q4_K. Measured on GSQ-RCO (Q4_K layers 3-5, Q3_K layers 6-8, Q2_K 9-44), order-balanced, teacher-forced 48 tokens,
+90 GiB pool, default assist rule: excluded 67.9 / 68.8 ms, allowed 69.4 / 70.1 ms, i.e. ~1.4 ms (2%) faster, with 91.7% top-1 / mean KL
+0.020 between the two placements (placement noise). AJ is unaffected (no such types) and no checkpoint we have uses IQ3 experts, so
+that half was never exercised. Reverted (`fd0e9e3`, `92bc697`): a 2% gain did not justify an extra flag and a per-layer type special
+case in the hot-set code. If it is wanted later, the whole change was ~15 lines in `assign_gpu1_hot`: compute a per-layer
+"has large type" flag from the gate/up/down tensor types and skip those layers' candidates.
