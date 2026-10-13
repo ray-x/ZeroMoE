@@ -212,3 +212,23 @@ hot set via `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB`) and `MOESTREAM_GLM5NEXT_ASSIST_DE
 Total resident VRAM is the same either way; the slower card (448 vs 936 GB/s) on the trunk adds ~5.6 ms of pre-router wait and the
 assist ring needs the x16 link. Keep dense on the 3090. (The full GLM-5.3 result that favoured dense on the 5060 Ti was an
 expert-vault design where uploads, not resident compute, set the cost.)
+
+## GSQ-RCO 3.0-bit GLM-5.3-Flash (Q2_K / Q3_K / Q4_K experts) -- 2026-10-13
+
+`/data/sda/models/glm53flash/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` (117 GB, arch string `glm5-next`): experts Q2_K in layers 9-44, Q3_K 6-8,
+Q4_K 3-5; attention, shared experts, head and embedding Q8_0 (dense 9.6 GiB vs 6.8 for AJ); no imatrix keys. Needed two engine fixes
+(`glm5-next` alias in `model_family.hpp`; Q2_K/Q3_K plane sizes in `offload_store.hpp`'s `ggml_row_bytes`). Run with
+`bench/glm_gsq_rco_dual.toml` (`moe_cache_gb = 12.4` so the 8.96 GiB dense arena fits), `OFFLOAD_DDR_GIB=90`, no store (experts read
+from the model: ~190 s to seed 8,974 experts from the SATA SSD), 3090 + 5060 Ti (`GPU1_HOT_GIB=14.2`), teacher-forced 48 tokens:
+
+| GPU assist | ms/token | tok/s | lane wait / compute |
+|---|---|---|---|
+| 0 | 70.6 | 14.2 | 21.7 / 41.4 |
+| 1 | **68.9** | **14.5** | 22.7 / 39.4 |
+| 2 | 82.5 | 12.1 | 22.8 / 54.2 |
+| 3 (default) | 88.2 | 11.3 | 23.0 / 60.2 (assist tail wait 32.6 ms) |
+
+AJ IQ2_XXS on the same sequence: 67.9 ms. So the 3.0-bit file is at speed parity with assist=1 (the default of 3 is tuned for 6.5 MB
+experts and hurts here). Zero misses with the 90 GiB pool. Quality vs AJ (teacher-forced, same tokens, assist 3 run): top-1 agreement
+77.1%, mean KL 0.35, max 1.61 -- far outside the 94% / 0.05 spread between placements of the same model, i.e. a genuinely different
+model; which is more accurate needs a task eval, not a KL.
