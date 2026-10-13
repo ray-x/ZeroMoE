@@ -194,8 +194,13 @@ bool lane_with_gpu1_wanted() {
   return on;
 }
 
+// Up to N resident cold experts per layer run on a second CUDA stream while the CPU computes the rest. On by
+// default (3): 58 GiB pool 8.1 -> 9.4-9.8 tok/s, dual GPU 78.3 -> 65.2 ms/token. Numerics differ from the CPU
+// kernels by the same amount as moving an expert between valid placements (teacher-forced 48 tokens: top-1 92-96 %,
+// mean KL 0.03-0.05 for assist AND for plain 3090-only vs dual-GPU). MOESTREAM_GLM5NEXT_GPU_ASSIST=0 disables it
+// and gives bit-identical CPU-lane output.
 int gpu_assist_slots() {
-  static const int n = std::max(0, std::min(8, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU_ASSIST", 0)));
+  static const int n = std::max(0, std::min(8, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU_ASSIST", 3)));
   return n;
 }
 

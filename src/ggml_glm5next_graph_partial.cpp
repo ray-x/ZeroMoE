@@ -4,6 +4,7 @@
 // Split out of the former single-file ggml_glm5next_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
+#include <future>
 #include "ggml_glm5next_graph_impl.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -534,18 +535,31 @@ ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
   if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS)
     return nullptr;
   if (fresh) {
-    std::vector<char> stage(per_expert);
+    // Read the hot experts 16 at a time (the file is on NVMe: one blocking pread per expert ran at ~0.7 GB/s and made
+    // the first decode token take ~20 s), then upload them in order.
     const int fd = g.engine->model_file.fd_for_tensor(*m);
-    for (size_t i = 0; i < p->hot1.size(); ++i) {
-      const ssize_t got = ::pread(fd, stage.data(), per_expert,
-                                  (off_t)(m->offset + (uint64_t)p->hot1[i] * per_expert));
-      if (got != (ssize_t)per_expert) {
-        LOG_ERROR("[GGML-GLM5NEXT-GPU1-HOT] short read layer %d expert %d\n", layer, p->hot1[i]);
-        return nullptr;
+    constexpr size_t kBatch = 16;
+    std::vector<std::vector<char>> stage(kBatch, std::vector<char>(per_expert));
+    for (size_t base = 0; base < p->hot1.size(); base += kBatch) {
+      const size_t n = std::min(kBatch, p->hot1.size() - base);
+      std::vector<std::future<ssize_t>> reads;
+      for (size_t j = 0; j < n; ++j)
+        reads.push_back(std::async(std::launch::async, [&, j] {
+          return ::pread(fd, stage[j].data(), per_expert,
+                         (off_t)(m->offset + (uint64_t)p->hot1[base + j] * per_expert));
+        }));
+      for (size_t j = 0; j < n; ++j) {
+        if (reads[j].get() != (ssize_t)per_expert) {
+          LOG_ERROR("[GGML-GLM5NEXT-GPU1-HOT] short read layer %d expert %d\n", layer, p->hot1[base + j]);
+          for (size_t r = j + 1; r < n; ++r) reads[r].wait();
+          return nullptr;
+        }
       }
-      ggml_backend_tensor_set(t, stage.data(), i * per_expert, per_expert);
-      ::posix_fadvise(fd, (off_t)(m->offset + (uint64_t)p->hot1[i] * per_expert),
-                      (off_t)per_expert, POSIX_FADV_DONTNEED);
+      for (size_t j = 0; j < n; ++j) {
+        ggml_backend_tensor_set(t, stage[j].data(), (base + j) * per_expert, per_expert);
+        ::posix_fadvise(fd, (off_t)(m->offset + (uint64_t)p->hot1[base + j] * per_expert), (off_t)per_expert,
+                        POSIX_FADV_DONTNEED);
+      }
     }
     g.gpu1_bytes += ggml_nbytes(t);
   }
