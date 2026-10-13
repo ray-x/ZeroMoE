@@ -45,6 +45,11 @@ class FullGraphModel {
   // Releases scheduler buffers before the shared CUDA backend goes away.
   virtual void shutdown() const {}
 
+  // Largest prompt batch the prefill graph should be built for (0 = no limit). Its compute
+  // buffers grow with the batch, so a longer prompt runs this many tokens through the graph and
+  // the rest as S=1 steps (see generate_text).
+  virtual int max_prefill_tokens(const StreamingEngine &) const { return 0; }
+
   // Number of MoE layers whose routed experts the graph places in VRAM.
   virtual int device_expert_layers() const { return 0; }
 

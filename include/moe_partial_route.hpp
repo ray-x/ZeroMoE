@@ -182,6 +182,7 @@ private:
 
 enum class SentinelPolicy {
   Auto,       // default: negative skip when supported for this shape, else dummy 0
+  AutoBatched, // like Auto, and also negative skip for batched (S > 1) prefill when ggml advertises it
   ForceDummy, // always the valid dummy id (A/B tests, unpatched-ggml simulation)
 };
 
@@ -200,8 +201,9 @@ public:
     m.n_tokens_ = n_tokens;
     m.inactive_ = policy == SentinelPolicy::ForceDummy
                       ? 0
-                      : mmid_inactive_route_id(single_token_decode &&
-                                               n_tokens == 1);
+                      : mmid_inactive_route_id(
+                            single_token_decode && n_tokens == 1,
+                            policy == SentinelPolicy::AutoBatched);
     const size_t n = index_of_expert.size();
     m.ids_.assign(n * (size_t)n_tokens, m.inactive_);
     m.mask_.assign(n * (size_t)n_tokens, 0.0f);

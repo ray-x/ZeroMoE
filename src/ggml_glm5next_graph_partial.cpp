@@ -633,6 +633,31 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
            (double)used / (1024.0 * 1024.0 * 1024.0));
 }
 
+// Batched (S > 1) negative-id skip is guaranteed only for the quantized expert types that take
+// ggml-cuda's MMQ path (patches/ggml/0006). IQ1_M and float experts use other batched paths, so
+// those layers keep the valid-dummy-id route for prefill.
+static bool layer_experts_take_mmq(FullGraph &g, int layer) {
+  for (const char *stem :
+       {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+    const GGUFTensor *t = model_tensor(
+        *g.engine, "blk." + std::to_string(layer) + "." + stem);
+    if (!t)
+      return false;
+    switch (t->type) {
+    case GGUFType::Q4_0: case GGUFType::Q4_1: case GGUFType::Q5_0:
+    case GGUFType::Q5_1: case GGUFType::Q8_0: case GGUFType::Q2_K:
+    case GGUFType::Q3_K: case GGUFType::Q4_K: case GGUFType::Q5_K:
+    case GGUFType::Q6_K: case GGUFType::IQ2_XXS: case GGUFType::IQ2_XS:
+    case GGUFType::IQ2_S: case GGUFType::IQ3_XXS: case GGUFType::IQ3_S:
+    case GGUFType::IQ4_NL: case GGUFType::IQ4_XS: case GGUFType::IQ1_S:
+      break;
+    default:
+      return false;
+    }
+  }
+  return true;
+}
+
 ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
                          bool mask) {
   PartialExpertLayer *p = partial_layer(g, layer);
@@ -720,7 +745,9 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
       moe_partial::ExpertBranchMap::build(
           index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
           force_dummy ? moe_partial::SentinelPolicy::ForceDummy
-                      : moe_partial::SentinelPolicy::Auto);
+          : layer_experts_take_mmq(g, layer)
+              ? moe_partial::SentinelPolicy::AutoBatched
+              : moe_partial::SentinelPolicy::Auto);
   static bool logged_inactive = false;
   if (!logged_inactive) {
     logged_inactive = true;

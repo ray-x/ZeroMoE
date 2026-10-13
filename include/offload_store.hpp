@@ -688,6 +688,7 @@ public:
     Ensure r;
     for (const ExpertKey &k : transient_) arena_.evict(k.layer, k.expert);
     transient_.clear();
+    std::vector<int> to_load;
     for (int i = 0; i < n; ++i) {
       if (ids[i] < 0) continue;
       const ExpertKey key{layer, ids[i]};
@@ -696,12 +697,22 @@ public:
       for (const ExpertKey &t : transient_) if (t.layer == key.layer && t.expert == key.expert) { dup = true; break; }
       if (dup) continue;
       ++r.misses;
-      const auto t0 = std::chrono::steady_clock::now();
-      const bool ok = load(layer, ids[i]);
-      r.load_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       transient_.push_back(key);
-      if (ok) ++r.loads; else ++r.errors;
+      to_load.push_back(ids[i]);
     }
+    // A prompt batch touches most experts of the layer: read them `par` at a time so a store striped over
+    // several drives is read by all of them at once (MOESTREAM_OFFLOAD_TRANSIENT_PAR, default 8, 1 = serial).
+    static const size_t par = [] {
+      const char *e = std::getenv("MOESTREAM_OFFLOAD_TRANSIENT_PAR");
+      return static_cast<size_t>(e ? std::max(1, std::atoi(e)) : 8);
+    }();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < to_load.size(); i += par) {
+      const std::vector<int> chunk(to_load.begin() + static_cast<std::ptrdiff_t>(i),
+                                   to_load.begin() + static_cast<std::ptrdiff_t>(std::min(to_load.size(), i + par)));
+      for (char ok : load_many(layer, chunk)) { if (ok) ++r.loads; else ++r.errors; }
+    }
+    r.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return r;
   }
 

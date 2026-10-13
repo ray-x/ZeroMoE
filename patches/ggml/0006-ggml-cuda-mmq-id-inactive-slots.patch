@@ -1,0 +1,74 @@
+diff --git a/src/ggml-cuda/mmq.cu b/src/ggml-cuda/mmq.cu
+--- a/src/ggml-cuda/mmq.cu
++++ b/src/ggml-cuda/mmq.cu
+@@ -193,6 +193,15 @@
+     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
+     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+ 
++    // Inactive expert slots (negative ids, e.g. the hot/cold expert split) have no compact row, so the
++    // helper never writes some ids_src1 entries; the quantizers still visit every one of the
++    // ne12*n_expert_used rows. Initialize the map so those entries are harmless instead of
++    // uninitialized pool memory: -1 for the dedup inverse map (the scatter quantizers skip it), and 0
++    // (a valid row index) for the forward gather map (rows outside every expert's range are never
++    // consumed). Zero dst so inactive slots read as 0, as the MMVQ decode path does.
++    CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), dedup_bcast ? 0xFF : 0x00, ne_get_rows*sizeof(int32_t), stream));
++    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
++
+     {
+         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+         const int si1  = ids->nb[1] / ggml_element_size(ids);
+@@ -392,3 +401,11 @@
+ 
+     return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+ }
++
++// MoEStream: advertises that the batched (S > 1) MMQ MUL_MAT_ID path treats a negative expert id as an
++// inactive route (no compact row, output zeroed), like the CPU op and the MMVQ decode kernels. Only
++// quantized types that take the MMQ path are covered (not e.g. IQ1_M or float experts); the engine
++// checks the type. include/mmid_route_skip.hpp weak-links this symbol.
++extern "C" GGML_BACKEND_API int ggml_cuda_mul_mat_id_negative_skip_batched(void) {
++    return 1;
++}
+diff --git a/src/ggml-cuda/quantize.cu b/src/ggml-cuda/quantize.cu
+--- a/src/ggml-cuda/quantize.cu
++++ b/src/ggml-cuda/quantize.cu
+@@ -184,6 +184,9 @@
+ #pragma unroll
+                 for (int slot = 0; slot < n_expert_used; ++slot) {
+                     const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++                    if (i < 0) {
++                        continue; // inactive expert slot: no compact row (see ggml_cuda_mul_mat_q)
++                    }
+                     scale[i] = warp_amax[0];
+                 }
+             } else {
+@@ -310,6 +313,9 @@
+ #pragma unroll
+             for (int slot = 0; slot < n_expert_used; ++slot) {
+                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++                if (i < 0) {
++                    continue; // inactive expert slot: no compact row (see ggml_cuda_mul_mat_q)
++                }
+                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
+                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
+                 yqs[2 * sub + 0] = q0;
+@@ -428,6 +434,9 @@
+ #pragma unroll
+         for (int slot = 0; slot < n_expert_used; ++slot) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // inactive expert slot: no compact row (see ggml_cuda_mul_mat_q)
++            }
+             block_fp4_mmq * yb = y + (k_block * ne1 + i);
+             char2 * yqs2 = (char2 *) yb->qs;
+             if (lane_in_group == 0) {
+@@ -527,6 +536,9 @@
+         int64_t ib;
+         if constexpr (scatter) {
+             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
++            if (i < 0) {
++                continue; // inactive expert slot: no compact row (see ggml_cuda_mul_mat_q)
++            }
+             ib = k_block*ne1 + i;
+         } else {
+             const int64_t ib0 = blockIdx.z*((int64_t)gridDim.x*gridDim.y*blockDim.x/QK8_1); // first block of channel
