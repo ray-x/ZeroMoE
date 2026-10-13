@@ -31,6 +31,23 @@ Qwen3.8-Flash-Next (Q2_0, 3090 only, 96 tokens, tokens identical): baseline 29.8
 noise); GPU-trunk bound, unaffected by the GLM changes. Identity gate on the final binary: Qwen logits max KL 0.0, free-running
 tokens identical; GLM `lru` and `lane` logits and tokens identical vs the frozen baseline.
 
+## Single 3090 (no 5060 Ti), from existing logs
+Not re-measured with the final recipe: these are older-config runs (lane + GPU assist on, 58 GiB pool, 8 CPU threads, previous ranking,
+mixed ggml builds), taken from `logs/perf/sweepA_A_1`, `sweepB_*`, `assist_tf`, `assist3_*`; steady = last 30 tokens.
+
+| window | single 3090 | dual GPU (recipe) |
+|---|---|---|
+| sustained (last 30 tokens) | 12.2-13.3 tok/s | 15.0-15.4 (benchmark-like text) |
+| best 30-token stretch | 13.3 | 17.1 |
+| best 10-token stretch | 14.8 | 19.0 |
+| fastest single token | 52 ms = ~19 tok/s | ~42 ms = ~24 tok/s |
+| 3090-only without assist (older runs) | 9.9-10.6 | - |
+
+So a single 3090 exceeds 15 tok/s only over short bursts (single tokens, ~10 tokens at best 14.8) and averages ~12-13 over a reply.
+Reason: the 3090 alone keeps ~14.7 GiB of hot experts (vs 28.9 GiB with the 5060 Ti), so more routed experts go through the CPU lane
+and assist. The final recipe (refit ranking, kernel in the default binary, 10 threads) on a single 3090 has not been measured; an
+estimate of +0.5 to +1 tok/s over these numbers is a guess.
+
 ## What produced the gain (this session, GLM, dual GPU)
 | change | effect |
 |---|---|
