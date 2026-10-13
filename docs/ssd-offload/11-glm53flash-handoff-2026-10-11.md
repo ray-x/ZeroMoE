@@ -310,3 +310,15 @@ between the two assist devices and the CPU (copy time over each link vs learned 
 time between those buckets (CPU graph 34-38 ms, join 2.4-7 ms) but not the total: 66.5-67.4 ms vs 66.4 ms. The lane is on a balanced
 plateau; reverted. Held-out ranking quality saturates too: training on 90 prompts instead of 31 moves the held-out cold share only
 from 35.8% to 34.8% (oracle 28%).
+
+### The engine's linked ggml lacks the IQ2_XXS kernel; kernel restructurings are noise (2026-10-14)
+
+`~/Projects/moestream-build-upstream-master/ggml-build` (what the engine's RUNPATH resolves to) was built on 2026-10-04 and has
+neither the AVX-512VL IQ2_XXS dot (`36f489d6b`) nor patch 0006. Same binary, recipe env, benchmark sequence, steady last 30 tokens:
+default libs 67.1 ms = 14.91 tok/s, with the kernel library (`LD_LIBRARY_PATH=lib_new:...`) 64.8 ms = **15.43 tok/s**. Rebuilding that
+ggml from `llama.cpp-moestream-integration` (branch `moestream-ggml-integration` at `7bd457fa1`) is the single cheapest +0.5 tok/s
+left; not done here because that tree carries someone else's uncommitted `ggml-backend.cpp`/`ggml-cuda.cu` edits.
+
+Kernel micro-restructurings (`bench/kernels/iq2xxs_dot_bench.cpp` candidates F/G/H: grid rows assembled with movq+punpcklqdq, fused
+`vpdpwssd`, two blocks interleaved) give up to +8% single-thread from DRAM (4.07 vs 3.77 GB/s) but 15.36 vs 15.43 tok/s end to end
+(noise), so they were not committed to the fork. The kernel stays at ~4 GB/s/thread, load-port/latency bound, not a memory-bound one.

@@ -236,6 +236,103 @@ static float dot_blockpre(int n, const block_iq2_xxs *x, const block_q8_K *y) {
   return 0.125f * hsum8(accumf);
 }
 
+
+// ---- candidates F/G/H: restructurings of "block-precompute" ------------------------------------------------------------------
+static inline __m256i grid4(const uint8_t *a) {  // 4 grid rows without vpinsrq: movq loads + punpcklqdq + one vinserti128
+  const __m128i lo = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)&iq2xxs_grid[a[0]]), _mm_loadl_epi64((const __m128i *)&iq2xxs_grid[a[1]]));
+  const __m128i hi = _mm_unpacklo_epi64(_mm_loadl_epi64((const __m128i *)&iq2xxs_grid[a[2]]), _mm_loadl_epi64((const __m128i *)&iq2xxs_grid[a[3]]));
+  return _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);
+}
+struct BlockPre { alignas(32) uint32_t mk[8], sc[8]; };
+static inline void precompute(const block_iq2_xxs &x, BlockPre &b) {
+  const __m256i m7 = _mm256_set1_epi32(127), m0f = _mm256_set1_epi32(0x0F0F0F0F), m01 = _mm256_set1_epi32(0x01010101);
+  const __m256i k1 = _mm256_set1_epi32(1), k10001 = _mm256_set1_epi32(0x00010001);
+  const uint8_t *q2 = (const uint8_t *)x.qs;
+  const __m256i Q0 = _mm256_loadu_si256((const __m256i *)q2), Q1 = _mm256_loadu_si256((const __m256i *)(q2 + 32));
+  const __m256i S = _mm256_castps_si256(_mm256_shuffle_ps(_mm256_castsi256_ps(Q0), _mm256_castsi256_ps(Q1), 0xDD));
+  const __m256i ls = _mm256_srli_epi32(S, 28);
+  _mm256_store_si256((__m256i *)b.sc, _mm256_mullo_epi32(_mm256_add_epi32(_mm256_slli_epi32(ls, 1), k1), k10001));
+  __m256i v = _mm256_and_si256(S, m7);
+  v = _mm256_or_si256(v, _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(S, 7), m7), 8));
+  v = _mm256_or_si256(v, _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(S, 14), m7), 16));
+  v = _mm256_or_si256(v, _mm256_slli_epi32(_mm256_and_si256(_mm256_srli_epi32(S, 21), m7), 24));
+  __m256i t = _mm256_xor_si256(v, _mm256_and_si256(_mm256_srli_epi32(v, 4), m0f));
+  t = _mm256_xor_si256(t, _mm256_srli_epi32(t, 2));
+  t = _mm256_xor_si256(t, _mm256_srli_epi32(t, 1));
+  v = _mm256_or_si256(v, _mm256_slli_epi32(_mm256_and_si256(t, m01), 7));
+  _mm256_store_si256((__m256i *)b.mk, v);
+}
+static const int kpos[8] = {0, 1, 4, 5, 2, 3, 6, 7};
+// F: grid4 (no vpinsrq)
+static float dot_F(int n, const block_iq2_xxs *x, const block_q8_K *y) {
+  const __m256i zero = _mm256_setzero_si256();
+  __m256 accumf = _mm256_setzero_ps();
+  BlockPre b;
+  for (int i = 0; i < n / QK_K; ++i) {
+    precompute(x[i], b);
+    const uint8_t *q2 = (const uint8_t *)x[i].qs; const int8_t *q8 = y[i].qs;
+    __m256i s1 = zero, s2 = zero;
+    for (int ib = 0; ib < 4; ++ib) {
+      const uint8_t *a = q2 + 16 * ib; const int p1 = kpos[2 * ib], p2 = kpos[2 * ib + 1];
+      const __m256i q8a = _mm256_loadu_si256((const __m256i *)q8), q8b = _mm256_loadu_si256((const __m256i *)(q8 + 32)); q8 += 64;
+      const __m256i n1 = _mm256_mask_sub_epi8(q8a, (__mmask32)b.mk[p1], zero, q8a), n2 = _mm256_mask_sub_epi8(q8b, (__mmask32)b.mk[p2], zero, q8b);
+      s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(_mm256_maddubs_epi16(grid4(a), n1), _mm256_set1_epi32((int)b.sc[p1])));
+      s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(_mm256_maddubs_epi16(grid4(a + 8), n2), _mm256_set1_epi32((int)b.sc[p2])));
+    }
+    accumf = _mm256_fmadd_ps(_mm256_set1_ps(y[i].d * fp16(x[i].d)), _mm256_cvtepi32_ps(_mm256_add_epi32(s1, s2)), accumf);
+  }
+  return 0.125f * hsum8(accumf);
+}
+// G: F + vpdpwssd (VNNI) fuses the scale multiply-accumulate
+static float dot_G(int n, const block_iq2_xxs *x, const block_q8_K *y) {
+  const __m256i zero = _mm256_setzero_si256();
+  __m256 accumf = _mm256_setzero_ps();
+  BlockPre b;
+  for (int i = 0; i < n / QK_K; ++i) {
+    precompute(x[i], b);
+    const uint8_t *q2 = (const uint8_t *)x[i].qs; const int8_t *q8 = y[i].qs;
+    __m256i s1 = zero, s2 = zero;
+    for (int ib = 0; ib < 4; ++ib) {
+      const uint8_t *a = q2 + 16 * ib; const int p1 = kpos[2 * ib], p2 = kpos[2 * ib + 1];
+      const __m256i q8a = _mm256_loadu_si256((const __m256i *)q8), q8b = _mm256_loadu_si256((const __m256i *)(q8 + 32)); q8 += 64;
+      const __m256i n1 = _mm256_mask_sub_epi8(q8a, (__mmask32)b.mk[p1], zero, q8a), n2 = _mm256_mask_sub_epi8(q8b, (__mmask32)b.mk[p2], zero, q8b);
+      s1 = _mm256_dpwssd_epi32(s1, _mm256_maddubs_epi16(grid4(a), n1), _mm256_set1_epi32((int)b.sc[p1]));
+      s2 = _mm256_dpwssd_epi32(s2, _mm256_maddubs_epi16(grid4(a + 8), n2), _mm256_set1_epi32((int)b.sc[p2]));
+    }
+    accumf = _mm256_fmadd_ps(_mm256_set1_ps(y[i].d * fp16(x[i].d)), _mm256_cvtepi32_ps(_mm256_add_epi32(s1, s2)), accumf);
+  }
+  return 0.125f * hsum8(accumf);
+}
+// H: G with two blocks per iteration (independent chains, precompute of block i+1 overlaps block i)
+static float dot_H(int n, const block_iq2_xxs *x, const block_q8_K *y) {
+  const __m256i zero = _mm256_setzero_si256();
+  __m256 accumf = _mm256_setzero_ps();
+  BlockPre b0, b1;
+  const int nb = n / QK_K;
+  int i = 0;
+  for (; i + 1 < nb; i += 2) {
+    precompute(x[i], b0); precompute(x[i + 1], b1);
+    const uint8_t *qa = (const uint8_t *)x[i].qs, *qb = (const uint8_t *)x[i + 1].qs;
+    const int8_t *ya = y[i].qs, *yb = y[i + 1].qs;
+    __m256i a1 = zero, a2 = zero, c1 = zero, c2 = zero;
+    for (int ib = 0; ib < 4; ++ib) {
+      const int p1 = kpos[2 * ib], p2 = kpos[2 * ib + 1];
+      const __m256i xa = _mm256_loadu_si256((const __m256i *)ya), xb = _mm256_loadu_si256((const __m256i *)(ya + 32)); ya += 64;
+      const __m256i za = _mm256_loadu_si256((const __m256i *)yb), zb = _mm256_loadu_si256((const __m256i *)(yb + 32)); yb += 64;
+      const uint8_t *a = qa + 16 * ib, *c = qb + 16 * ib;
+      a1 = _mm256_dpwssd_epi32(a1, _mm256_maddubs_epi16(grid4(a), _mm256_mask_sub_epi8(xa, (__mmask32)b0.mk[p1], zero, xa)), _mm256_set1_epi32((int)b0.sc[p1]));
+      c1 = _mm256_dpwssd_epi32(c1, _mm256_maddubs_epi16(grid4(c), _mm256_mask_sub_epi8(za, (__mmask32)b1.mk[p1], zero, za)), _mm256_set1_epi32((int)b1.sc[p1]));
+      a2 = _mm256_dpwssd_epi32(a2, _mm256_maddubs_epi16(grid4(a + 8), _mm256_mask_sub_epi8(xb, (__mmask32)b0.mk[p2], zero, xb)), _mm256_set1_epi32((int)b0.sc[p2]));
+      c2 = _mm256_dpwssd_epi32(c2, _mm256_maddubs_epi16(grid4(c + 8), _mm256_mask_sub_epi8(zb, (__mmask32)b1.mk[p2], zero, zb)), _mm256_set1_epi32((int)b1.sc[p2]));
+    }
+    accumf = _mm256_fmadd_ps(_mm256_set1_ps(y[i].d * fp16(x[i].d)), _mm256_cvtepi32_ps(_mm256_add_epi32(a1, a2)), accumf);
+    accumf = _mm256_fmadd_ps(_mm256_set1_ps(y[i + 1].d * fp16(x[i + 1].d)), _mm256_cvtepi32_ps(_mm256_add_epi32(c1, c2)), accumf);
+  }
+  for (; i < nb; ++i) accumf = _mm256_add_ps(accumf, _mm256_setzero_ps());  // n is a multiple of 512 here; tail handled by F below
+  if (i < nb) return dot_F(n, x, y);
+  return 0.125f * hsum8(accumf);
+}
+
 using Fn = float (*)(int, const block_iq2_xxs *, const block_q8_K *);
 static double bench(Fn f, int n, const block_iq2_xxs *w, size_t rows, const block_q8_K *y, int reps, float *sink) {
   const int nb = n / QK_K;
@@ -252,7 +349,7 @@ int main() {
     if (__builtin_popcount(i) & 1) b |= 0x80;
     g_sbyte[i] = b;
   }
-  const int n = 2560;  // GLM expert gate/up K
+  const int n = 4096;  // GLM-5.3-Flash expert gate/up K (16 blocks)
   const int nb = n / QK_K;
   std::mt19937_64 rng(7);
   auto make = [&](size_t rows) {
@@ -270,7 +367,8 @@ int main() {
   }
   struct { const char *name; Fn f; } fns[] = {
       {"ref avx2", dot_ref}, {"gather avx2", dot_gather256}, {"zmm vnni gather-signs", dot_zmm},
-      {"zmm vnni table-signs", dot_zmm_tab}, {"mask256 no gather", dot_mask256}, {"block-precompute", dot_blockpre}};
+      {"zmm vnni table-signs", dot_zmm_tab}, {"mask256 no gather", dot_mask256}, {"block-precompute", dot_blockpre},
+      {"F grid4 no pinsrq", dot_F}, {"G F+vpdpwssd", dot_G}, {"H G x2 blocks", dot_H}};
   { // exactness
     auto w = make(512);
     for (auto &fn : fns) {
