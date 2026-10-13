@@ -21,7 +21,7 @@ mem_guard_stop_mb = 10240
 mem_guard_poll_ms = 500
 
 freeze_usage_stats = true
-pin_file = "/home/ray/work/moestream-graph/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt"
+pin_file = "/home/ray/Projects/MoEStream/docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt"
 prefill_pin_file = "/home/ray/work/moestream-graph/docs/ssd-offload/data/glm53flash_survey5_usage_prefill.txt"
 pin_threshold = 6
 pin_topk_per_layer = 12

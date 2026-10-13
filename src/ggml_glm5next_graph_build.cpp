@@ -173,16 +173,17 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
   }
   if (gpu_assist_slots() > 0 && offload_layer(layer) && gpu_assist_layer_ok(g, layer)) {
     if (OffloadState *o = get_offload(*g.engine)) {
-      // One backend + one ring shared by every lane of this graph; freed with the last lane.
-      static std::weak_ptr<GpuAssistShared> shared_weak;
-      std::shared_ptr<GpuAssistShared> shared = shared_weak.lock();
-      if (!shared) {
+      // One backend + one ring per assist device, shared by every lane of this graph; freed with the last lane.
+      // Device 0: MOESTREAM_GLM5NEXT_ASSIST_DEVICE (default the trunk's device), GPU_ASSIST slots. Optional device 1:
+      // MOESTREAM_GLM5NEXT_ASSIST2_DEVICE / _ASSIST2_SLOTS -- its own PCIe link, so it adds to device 0's copy bandwidth.
+      static std::weak_ptr<GpuAssistShared> shared_weak[2];
+      const auto make_ring = [&](std::weak_ptr<GpuAssistShared> &weak, int dev,
+                                 int slots) -> std::shared_ptr<GpuAssistShared> {
+        if (std::shared_ptr<GpuAssistShared> have = weak.lock())
+          return have;
         auto s = std::make_shared<GpuAssistShared>();
-        // MOESTREAM_GLM5NEXT_ASSIST_DEVICE: CUDA device holding the ring and running the assisted experts (default: the
-        // trunk's device). Wanted when the trunk sits on the card with the slower host link.
-        const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
-        s->be = ggml_backend_cuda_init(assist_dev);
-        s->slots = gpu_assist_slots();
+        s->be = ggml_backend_cuda_init(dev);
+        s->slots = slots;
         bool ok = s->be != nullptr;
         for (int p = 0; ok && p < 3; ++p) {
           for (int l = o->first; l < o->first + o->n_layers; ++l)
@@ -191,12 +192,22 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
           s->ring[p] = ggml_backend_alloc_buffer(s->be, s->plane_cap[p] * (size_t)s->slots + 4096);
           ok = s->ring[p] != nullptr;
         }
-        if (ok) {
-          shared = s;
-          shared_weak = s;
+        if (!ok)
+          return nullptr;
+        weak = s;
+        return s;
+      };
+      const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
+      std::shared_ptr<GpuAssistShared> shared = make_ring(shared_weak[0], assist_dev, gpu_assist_slots());
+      std::shared_ptr<GpuAssistShared> shared2;
+      const int assist2_dev = gpu_assist2_device();
+      if (assist2_dev >= 0 && assist2_dev != assist_dev && gpu_assist2_slots() > 0)
+        shared2 = make_ring(shared_weak[1], assist2_dev, gpu_assist2_slots());
+      if (shared && lane->prepare_gpu_assist(cold_w, shared, 0)) {
+        if (shared2 && !lane->prepare_gpu_assist(cold_w, shared2, 1)) {
+          lane->assists[1].graph = nullptr;
+          LOG_WARN("[GGML-GLM5NEXT-EARLY-READY] layer=%d second GPU assist unavailable\n", layer);
         }
-      }
-      if (shared && lane->prepare_gpu_assist(cold_w, shared)) {
         lane->expert_planes = [o, layer](int expert, const void *planes[3]) {
           if (!o->residency->ready({layer, expert}) || !o->store->is_pinned(layer, expert))
             return false;  // an unpinned slot would make the async copy a blocking staged one

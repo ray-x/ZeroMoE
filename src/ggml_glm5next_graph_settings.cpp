@@ -199,6 +199,25 @@ bool lane_with_gpu1_wanted() {
 // kernels by the same amount as moving an expert between valid placements (teacher-forced 48 tokens: top-1 92-96 %,
 // mean KL 0.03-0.05 for assist AND for plain 3090-only vs dual-GPU). MOESTREAM_GLM5NEXT_GPU_ASSIST=0 disables it
 // and gives bit-identical CPU-lane output.
+// Optional second assist device (its own ring and PCIe link): MOESTREAM_GLM5NEXT_ASSIST2_DEVICE=<cuda device> (default: device 1 on a
+// dual-GPU run with a second-GPU hot set, else off) and MOESTREAM_GLM5NEXT_ASSIST2_SLOTS=<n> (default 1).
+int gpu_assist2_device() {
+  // Unset: use CUDA device 1 when two devices are visible and the second GPU already holds a hot set; -1 turns it off.
+  static const int d = [] {
+    const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ASSIST2_DEVICE");
+    if (v && v[0])
+      return std::atoi(v);
+    int n = 0;
+    const char *hot1 = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
+    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 && hot1[0] ? 1 : -1;
+  }();
+  return d;
+}
+int gpu_assist2_slots() {
+  static const int n = std::max(0, std::min(8, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST2_SLOTS", 1)));
+  return n;
+}
+
 int gpu_assist_slots() {
   static const int n = std::max(0, std::min(8, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU_ASSIST", 3)));
   return n;

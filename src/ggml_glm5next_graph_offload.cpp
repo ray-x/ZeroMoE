@@ -88,8 +88,8 @@ OffloadState *get_offload(const StreamingEngine &engine,
   }
   {
     // MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=<n> fixes the pool; unset (or "auto") sizes it from the memory this
-    // process may actually use: available RAM (or the cgroup limit if lower) minus 60 GiB for the rest of the
-    // engine and the OS, at least 16 GiB. The store caps it at the total expert bytes. Measured on a 125 GB
+    // process may actually use: available RAM (or the cgroup limit if lower) minus 36 GiB for the rest of the
+    // engine and the OS, at least 16 GiB (60 GiB before the Q2_K/Q3_K GSQ-RCO file, whose ~74 GiB cold set needs more than 58). The store caps it at the total expert bytes. Measured on a 125 GB
     // box: decode 5.3 / 7.3 / 8.2 tok/s at 32 / 48 / 58 GiB, flat beyond (everything resident).
     const std::string v = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "auto");
     if (v == "auto" || v.empty()) {
@@ -111,7 +111,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
           avail_gib = std::min(avail_gib, (double)bytes / (1024.0 * 1024.0 * 1024.0));
         std::fclose(f);
       }
-      sc.ddr_gib = avail_gib > 0.0 ? std::max(16.0, avail_gib - 60.0) : 40.0;
+      sc.ddr_gib = avail_gib > 0.0 ? std::max(16.0, avail_gib - 36.0) : 40.0;
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] auto DDR pool %.1f GiB (available %.1f GiB)\n", sc.ddr_gib, avail_gib);
     } else {
       sc.ddr_gib = std::atof(v.c_str());

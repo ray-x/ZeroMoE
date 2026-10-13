@@ -232,7 +232,8 @@ struct EarlyReadyLane {
       if (buf) ggml_backend_buffer_free(buf);
       if (ctx) ggml_free(ctx);
     }
-  } assist;
+  } assists[2];  // [0] primary assist device, [1] optional second device (own ring and link)
+  Assist &assist = assists[0];
   // SwiGLU clamp applied by the private graph (0 = none); set before prepare().
   float swiglu_clamp = 0.0f;
   bool swiglu_clamp_fused = false;
@@ -321,8 +322,9 @@ struct EarlyReadyLane {
   }
 
   // Builds the private GPU graph for up to shared->slots cold experts. Separate gate/up/down tensors only.
-  bool prepare_gpu_assist(const moe_routed::ExpertWeights &w, std::shared_ptr<GpuAssistShared> shared) {
-    if (!shared || !shared->be || w.gate_up || !w.gate || !w.up || !w.down) return false;
+  bool prepare_gpu_assist(const moe_routed::ExpertWeights &w, std::shared_ptr<GpuAssistShared> shared, int which = 0) {
+    if (!shared || !shared->be || w.gate_up || !w.gate || !w.up || !w.down || which < 0 || which > 1) return false;
+    Assist &assist = assists[which];
     assist.keep = shared;
     assist.be = shared->be;
     assist.slots = shared->slots;
@@ -587,44 +589,59 @@ struct EarlyReadyLane {
     } else if (before_compute && n_owned > 0) {
       GGML_ASSERT(before_compute(owned, n_owned));
     }
-    // GPU assist: hand some of the experts that are ready now to the second backend.
-    int32_t assisted[8];
-    int n_assisted = 0;
-    if (assist.graph && expert_planes && n_owned > 1) {
+    // GPU assist: hand some of the experts that are ready now to the assist backend(s). Device 0 takes up to
+    // min(slots, ready/2); a second device (own ring and link) takes more, as long as one expert stays on the CPU.
+    int32_t assisted[2][8];
+    int n_assisted[2] = {0, 0};
+    if (expert_planes && n_owned > 1 && (assists[0].graph || assists[1].graph)) {
       const auto is_pending = [&](int32_t e) {
         for (int32_t p : pending) if (p == e) return true;
         return false;
       };
       int n_ready = 0;
       for (int j = 0; j < n_owned; ++j) n_ready += !is_pending(owned[j]);
-      const int want = std::min({assist.slots, n_ready / 2, 8});
-      for (int j = n_owned - 1; j >= 0 && n_assisted < want; --j) {
-        if (is_pending(owned[j])) continue;
-        const void *planes[3];
-        if (!expert_planes(owned[j], planes)) continue;
-        for (int pl = 0; pl < 3; ++pl)
-          ggml_backend_tensor_set_async(assist.be, assist.ring[pl], planes[pl],
-                                        static_cast<size_t>(n_assisted) * assist.plane[pl], assist.plane[pl]);
-        assisted[n_assisted++] = owned[j];
-      }
-      if (n_assisted > 0) {
-        int32_t slot_ids[64];
-        float slot_w[64];
-        for (int i = 0; i < k; ++i) {
-          slot_ids[i] = -1;
-          slot_w[i] = 0.0f;
-          for (int j = 0; j < n_assisted; ++j)
-            if (assisted[j] == ids[i]) {
-              slot_ids[i] = j;
-              slot_w[i] = weights[i] * original_mask[ids[i]];
-            }
+      int cursor = n_owned - 1;
+      int taken = 0;
+      for (int a = 0; a < 2; ++a) {
+        Assist &A = assists[a];
+        if (!A.graph) continue;
+        // The second device's link is slower, so it only helps while the CPU still has about as much to do as that copy
+        // takes (MOESTREAM_GLM5NEXT_ASSIST2_KEEP experts stay on the CPU, default 1).
+        static const int keep = std::max(1, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST2_KEEP", 1));
+        const int want = a == 0 ? std::min({A.slots, n_ready / 2, 8})
+                                : std::min({A.slots, std::max(0, n_ready - taken - keep), 8});
+        for (; cursor >= 0 && n_assisted[a] < want; --cursor) {
+          if (is_pending(owned[cursor])) continue;
+          const void *planes[3];
+          if (!expert_planes(owned[cursor], planes)) continue;
+          for (int pl = 0; pl < 3; ++pl)
+            ggml_backend_tensor_set_async(A.be, A.ring[pl], planes[pl],
+                                          static_cast<size_t>(n_assisted[a]) * A.plane[pl], A.plane[pl]);
+          assisted[a][n_assisted[a]++] = owned[cursor];
+          ++taken;
         }
-        ggml_backend_tensor_set_async(assist.be, assist.x, input, 0, static_cast<size_t>(d) * sizeof(float));
-        ggml_backend_tensor_set_async(assist.be, assist.ids, slot_ids, 0, k * sizeof(int32_t));
-        ggml_backend_tensor_set_async(assist.be, assist.w, slot_w, 0, k * sizeof(float));
-        GGML_ASSERT(ggml_backend_graph_compute_async(assist.be, assist.graph) == GGML_STATUS_SUCCESS);
-        // The CPU graphs below must not compute these experts.
-        for (int j = 0; j < n_assisted; ++j) { cpu_remap[assisted[j]] = -1; cpu_mask[assisted[j]] = 0.0f; }
+        if (n_assisted[a] > 0) {
+          int32_t slot_ids[64];
+          float slot_w[64];
+          for (int i = 0; i < k; ++i) {
+            slot_ids[i] = -1;
+            slot_w[i] = 0.0f;
+            for (int j = 0; j < n_assisted[a]; ++j)
+              if (assisted[a][j] == ids[i]) {
+                slot_ids[i] = j;
+                slot_w[i] = weights[i] * original_mask[ids[i]];
+              }
+          }
+          ggml_backend_tensor_set_async(A.be, A.x, input, 0, static_cast<size_t>(d) * sizeof(float));
+          ggml_backend_tensor_set_async(A.be, A.ids, slot_ids, 0, k * sizeof(int32_t));
+          ggml_backend_tensor_set_async(A.be, A.w, slot_w, 0, k * sizeof(float));
+          GGML_ASSERT(ggml_backend_graph_compute_async(A.be, A.graph) == GGML_STATUS_SUCCESS);
+          // The CPU graphs below must not compute these experts.
+          for (int j = 0; j < n_assisted[a]; ++j) {
+            cpu_remap[assisted[a][j]] = -1;
+            cpu_mask[assisted[a][j]] = 0.0f;
+          }
+        }
       }
     }
     const int64_t copied = ggml_time_us();
@@ -668,23 +685,31 @@ struct EarlyReadyLane {
     } else {
       GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
     }
-    if (n_assisted > 0) {
-      const int64_t a0 = ggml_time_us();
-      ggml_backend_synchronize(assist.be);
-      ggml_backend_tensor_get(assist.out, assist.result.data(), 0, assist.result.size() * sizeof(float));
-      assist_stall_us += ggml_time_us() - a0;
-      float *out = static_cast<float *>(output->data);
-      for (int i = 0; i < k; ++i)
-        for (int j = 0; j < n_assisted; ++j)
-          if (assisted[j] == ids[i])
-            std::memcpy(out + static_cast<size_t>(i) * d, assist.result.data() + static_cast<size_t>(i) * d,
-                        static_cast<size_t>(d) * sizeof(float));
-      for (int j = 0; j < n_assisted; ++j) {
-        cpu_remap[assisted[j]] = original_remap[assisted[j]];
-        cpu_mask[assisted[j]] = original_mask[assisted[j]];
+    {
+      int total_assisted = 0;
+      for (int a = 0; a < 2; ++a) {
+        if (n_assisted[a] == 0) continue;
+        Assist &A = assists[a];
+        const int64_t a0 = ggml_time_us();
+        ggml_backend_synchronize(A.be);
+        ggml_backend_tensor_get(A.out, A.result.data(), 0, A.result.size() * sizeof(float));
+        assist_stall_us += ggml_time_us() - a0;
+        float *out = static_cast<float *>(output->data);
+        for (int i = 0; i < k; ++i)
+          for (int j = 0; j < n_assisted[a]; ++j)
+            if (assisted[a][j] == ids[i])
+              std::memcpy(out + static_cast<size_t>(i) * d, A.result.data() + static_cast<size_t>(i) * d,
+                          static_cast<size_t>(d) * sizeof(float));
+        for (int j = 0; j < n_assisted[a]; ++j) {
+          cpu_remap[assisted[a][j]] = original_remap[assisted[a][j]];
+          cpu_mask[assisted[a][j]] = original_mask[assisted[a][j]];
+        }
+        total_assisted += n_assisted[a];
       }
-      ++assist_runs;
-      assist_experts += static_cast<uint64_t>(n_assisted);
+      if (total_assisted > 0) {
+        ++assist_runs;
+        assist_experts += static_cast<uint64_t>(total_assisted);
+      }
     }
     const int64_t done = ggml_time_us();
     for (int i = 0; i < d * k; ++i)

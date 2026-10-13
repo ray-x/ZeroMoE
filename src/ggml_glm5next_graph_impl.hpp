@@ -96,6 +96,8 @@ bool early_ready_wanted();
 bool split_load_wanted();
 // Number of resident cold experts per layer the lane may run on a second CUDA stream (0 = off).
 int gpu_assist_slots();
+int gpu_assist2_device();
+int gpu_assist2_slots();
 // True when every routed-expert plane of `layer` has a type worth assisting on the GPU (see settings).
 bool gpu_assist_layer_ok(const FullGraph &g, int layer);
 // Keep the CPU lane on layers that also have a GPU1 hot branch (MOESTREAM_GLM5NEXT_LANE_WITH_GPU1, default on).
