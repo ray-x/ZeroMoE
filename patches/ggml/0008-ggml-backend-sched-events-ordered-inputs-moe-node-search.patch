@@ -1,0 +1,90 @@
+From: ray-x <rayx.cn@gmail.com>
+Subject: [PATCH] ggml-backend: scheduler events without parallel, ordered input copies, MoE ids lookup
+
+MOESTREAM_SCHED_EVENTS=1: create the scheduler events for a single copy (waiting for a buffer's previous use is a stream
+wait, not a stream sync), copy host non-weights / host weights / cross-device inputs in that order, find the ids of a
+MUL_MAT_ID among all split inputs, and accept a MUL_MAT_ID that is not the first node of the split.
+
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1752,7 +1752,28 @@
+         }
+ 
+         // copy the input tensors to the split backend
++        // MoEStream: three passes, so that the blocking small copies come first and the asynchronous bulk weight copies are
++        // issued before anything that waits on another device: 0 = host-resident non-weights (ids, masks), 1 = host weights,
++        // 2 = everything else (cross-device activations). A blocking copy queued behind in-flight weight copies waits for them,
++        // which kept two GPUs' weight copies from running at once.
++        static const bool ms_ordered_inputs = getenv("MOESTREAM_SCHED_EVENTS") != NULL;
++        for (int pass3 = 0; pass3 < (ms_ordered_inputs ? 3 : 1); pass3++)
+         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
++            {
++                ggml_tensor * in0 = split->inputs[input_id];
++                ggml_backend_t ib0 = ggml_backend_sched_get_tensor_backend(sched, in0);
++                int cls = 2;
++                if (!(in0->flags & GGML_TENSOR_FLAG_INPUT) && in0->buffer &&
++                    ggml_backend_buffer_get_usage(in0->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++                    ggml_backend_buffer_is_host(in0->buffer)) {
++                    cls = 1;
++                } else if (ggml_backend_dev_type(ggml_backend_get_device(ib0)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
++                    cls = 0;
++                }
++                if (ms_ordered_inputs && cls != pass3) {
++                    continue;
++                }
++            }
+             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
+             struct ggml_tensor * input = split->inputs[input_id];
+             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+@@ -1774,8 +1795,27 @@
+                 }
+ 
+                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
+-                ggml_tensor * node = split->graph.nodes[0];
+-                if (split->graph.n_nodes > 0 &&
++                ggml_tensor * node = split->graph.n_nodes > 0 ? split->graph.nodes[0] : nullptr;
++                // MoEStream: the consuming MUL_MAT_ID need not be the first node of the split (a split-cold branch starts
++                // with its mask ops); accept any MUL_MAT_ID of the split whose ids are an input of the split.
++                if (node && !(node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)) {
++                    for (int ni = 1; ni < split->graph.n_nodes; ni++) {
++                        ggml_tensor * cand = split->graph.nodes[ni];
++                        if (cand->op != GGML_OP_MUL_MAT_ID || cand->src[0] != input_cpy) {
++                            continue;
++                        }
++                        for (int ii = 0; ii < split->n_inputs; ii++) {
++                            if (cand->src[2] == tensor_copy(split->inputs[ii], split_backend_id, sched->cur_copy)) {
++                                node = cand;
++                                break;
++                            }
++                        }
++                        if (node == cand) {
++                            break;
++                        }
++                    }
++                }
++                if (node && split->graph.n_nodes > 0 &&
+                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                     ggml_backend_buffer_is_host(input->buffer) && (
+                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+@@ -1797,7 +1837,9 @@
+ 
+                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
+                     // in that case, we use the original ids tensor
+-                    for (int i = input_id + 1; i < split->n_inputs; i++) {
++                    // MoEStream: search every input, not only the later ones: the ids of the 2nd/3rd expert weight of a split
++                    // were otherwise read back from the split backend, which synchronizes its whole queue (copies in flight).
++                    for (int i = ms_ordered_inputs ? 0 : input_id + 1; i < split->n_inputs; i++) {
+                         if (ids_tensor == tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy)) {
+                             ids_tensor = split->inputs[i];
+                             ids_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[i]);
+@@ -2008,7 +2050,9 @@
+         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
+         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+ 
+-        if (sched->n_copies > 1) {
++        // MoEStream: events are also created for a single copy (MOESTREAM_SCHED_EVENTS=1), so that waiting for the previous
++        // use of an input buffer is a stream wait instead of a full stream synchronize.
++        if (sched->n_copies > 1 || getenv("MOESTREAM_SCHED_EVENTS")) {
+             for (int c = 0; c < sched->n_copies; c++) {
+                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+             }

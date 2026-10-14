@@ -343,6 +343,26 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
             : -1);
   }
 
+  // First expert id of the second GPU's share of the cold experts (0 = not split). MOESTREAM_GLM5NEXT_PREFILL_SPLIT is the
+  // main GPU's share of each layer's cold experts (0.63 ~ the 3090 x16 / 5060 Ti x8 PCIe Gen3 bandwidth ratio; default 1 = off: both
+  // links do copy concurrently, but per layer attention + the miss node (~60 ms) still run before the copies, so the
+  // wall time did not drop -- it needs the expert copies prefetched ahead of the router).
+  int split_at = 0;
+  if (!g.decode_mode && g.S >= 64 && g.gpu1 && offload_layer(layer) && !gate_up && ge && ue && de) {
+    static const double ratio = [] {
+      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_SPLIT");
+      return e ? std::atof(e) : 1.0;
+    }();
+    if (const PartialExpertLayer *pl = partial_layer(g, layer); pl && ratio > 0.0 && ratio < 1.0 && pl->cold.size() >= 16) {
+      std::vector<int> sorted(pl->cold.begin(), pl->cold.end());
+      std::sort(sorted.begin(), sorted.end());
+      split_at = sorted[(size_t)(ratio * (double)sorted.size())];
+      if (split_at <= 0 || split_at >= (int)ge->ne[2])
+        split_at = 0;
+    }
+  }
+  const auto cold_split_applicable = [&](FullGraph &, int) { return true; };
+
   const auto run_branch = [&](ggml_tensor *branch_gate_up,
                               ggml_tensor *branch_gate, ggml_tensor *branch_up,
                               ggml_tensor *branch_down, ggml_tensor *branch_ids,
@@ -483,7 +503,57 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                               partial->hot_up, partial->hot_down, in.ids,
                               in.weights);
           },
-          [&](const moe_partial::BranchInputs &in) {
+          [&](const moe_partial::BranchInputs &in) -> ggml_tensor * {
+            // Batched prefill: split the cold experts of the layer between the two GPUs, so both PCIe links copy at
+            // once (the second GPU's share runs first so its weight copies are issued before the main GPU's launch).
+            if (split_at > 0 && cold_split_applicable(g, layer)) {
+              const int n_exp = (int)ge->ne[2];
+              // Every host node of the split is created and scheduled before either GPU branch, so the scheduler runs
+              // them as one CPU split and does not synchronize the first GPU branch before launching the second.
+              ggml_tensor *split_ids[2], *split_mask[2];
+              for (int h = 0; h < 2; ++h) {
+                split_ids[h] = cold_split_node(ctx, in.ids, split_at, h);
+                split_mask[h] = ggml_cast(ctx, cold_split_node(ctx, in.ids, split_at, h + 2), GGML_TYPE_F32);
+                if (!split_ids[h] || !split_mask[h])
+                  return nullptr;
+                ggml_build_forward_expand(g.graph, split_ids[h]);
+                ggml_build_forward_expand(g.graph, split_mask[h]);
+              }
+              const auto weights_of = [&](int mode) {
+                return ggml_mul(ctx, in.weights, ggml_reshape_3d(ctx, split_mask[mode - 2], 1, c.topk, g.S));
+              };
+              // The weight views are host-backend nodes too: schedule them with the other host nodes (see above).
+              ggml_tensor *views[2][3];
+              for (int h = 0; h < 2; ++h) {
+                const int lo = h ? split_at : 0, cnt = h ? n_exp - split_at : split_at;
+                int k = 0;
+                for (ggml_tensor *t : {ge, ue, de}) {
+                  views[h][k] = ggml_view_3d(ctx, t, t->ne[0], t->ne[1], cnt, t->nb[1], t->nb[2], (size_t)lo * t->nb[2]);
+                  ggml_build_forward_expand(g.graph, views[h][k++]);
+                }
+              }
+              const auto part = [&](int lo, int cnt, int id_mode, ggml_backend_t be) -> ggml_tensor * {
+                (void)lo;
+                (void)cnt;
+                moe_routed::ExpertWeights ew;
+                ew.gate = views[id_mode][0];
+                ew.up = views[id_mode][1];
+                ew.down = views[id_mode][2];
+                ggml_tensor *pid = split_ids[id_mode];
+                const moe_routed::FfnNodes ffn =
+                    moe_routed::expert_ffn(ctx, ew, input3, pid, clamp, swiglu_clamp_fused());
+                if (be && g.sched) {
+                  ggml_backend_sched_set_tensor_backend(g.sched, ffn.gate, be);
+                  ggml_backend_sched_set_tensor_backend(g.sched, ffn.up, be);
+                  ggml_backend_sched_set_tensor_backend(g.sched, ffn.down, be);
+                }
+                ggml_tensor *experts = ggml_mul(ctx, ffn.down, weights_of(id_mode + 2));
+                return moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
+              };
+              ggml_tensor *hi = part(split_at, n_exp - split_at, 1, g.gpu1);
+              ggml_tensor *lo = part(0, split_at, 0, nullptr);
+              return hi && lo ? ggml_add(ctx, hi, lo) : nullptr;
+            }
             return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
           });
     }

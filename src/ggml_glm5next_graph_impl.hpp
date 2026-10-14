@@ -106,6 +106,9 @@ OffloadState *get_offload(const StreamingEngine &engine, const std::vector<Parti
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud);
 ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
 ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer, ggml_tensor *ids);
+// Host node over [topk, S] I32 route ids. mode 0/1: ids of experts below / at-or-above `split_at` (the upper half
+// re-based to 0, everything else -1). mode 2/3: 1 where mode 0/1 holds a real id, else 0.
+ggml_tensor *cold_split_node(ggml_context *ctx, ggml_tensor *ids, int split_at, int mode);
 ggml_tensor *expert_weight_impl(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
 ggml_tensor *expert_gate_up_weight_impl(FullGraph &g, ggml_context *ctx, int layer);
 bool gpu1_layer(const FullGraph &g, int layer);

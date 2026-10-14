@@ -188,7 +188,13 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // Batched prefill: let the scheduler run the host-resident (cold) expert matmuls on the GPU by copying the weights
   // across, instead of on the CPU (MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
   const bool prefill_offload = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD");
-  g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, false, prefill_offload);
+  // The scheduler needs events (MOESTREAM_SCHED_EVENTS, set below): without them every weight-input copy first
+  // synchronizes the whole destination stream, which serializes the copies of the two GPUs. parallel=true is not an
+  // option: it multiplies the graph inputs by the number of copies (56 GB of workspace).
+  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_SCHED_EVENTS", 1) != 0)
+    setenv("MOESTREAM_SCHED_EVENTS", "1", 1);
+  const bool sched_parallel = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_SCHED_PARALLEL", 0) != 0;
+  g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, sched_parallel, prefill_offload);
   if (!g->sched)
     return false;
   if (!build_graph(*g)) {

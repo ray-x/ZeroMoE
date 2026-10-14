@@ -1,3 +1,4 @@
+#include <deque>
 // GLM5Next full graph: SSD-offload routed experts: the ExpertStore-backed miss node and
 // offload weight tensors.
 //
@@ -363,6 +364,47 @@ ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer,
   if (out)
     ggml_set_name(out, ("glm5next_offload_ids_" + std::to_string(layer)).c_str());
   return out;
+}
+
+namespace {
+struct ColdSplitSite {
+  int split_at;
+  int mode;
+};
+std::deque<ColdSplitSite> g_cold_split_sites;
+std::mutex g_cold_split_mutex;
+
+void cold_split_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud) {
+  if (ith != 0)
+    return;
+  const ColdSplitSite *site = static_cast<const ColdSplitSite *>(ud);
+  const int64_t n = ggml_nelements(a);
+  for (int64_t i = 0; i < n; ++i) {
+    const int32_t id = *(const int32_t *)((const char *)a->data + i * (int64_t)sizeof(int32_t));
+    const bool in_lo = id >= 0 && id < site->split_at;
+    const bool in_hi = id >= site->split_at;
+    int32_t v = 0;
+    switch (site->mode) {
+    case 0: v = in_lo ? id : -1; break;
+    case 1: v = in_hi ? id - site->split_at : -1; break;
+    case 2: v = in_lo ? 1 : 0; break;
+    default: v = in_hi ? 1 : 0; break;
+    }
+    *(int32_t *)((char *)dst->data + i * (int64_t)sizeof(int32_t)) = v;
+  }
+}
+} // namespace
+
+ggml_tensor *cold_split_node(ggml_context *ctx, ggml_tensor *ids, int split_at, int mode) {
+  if (!ids)
+    return nullptr;
+  ColdSplitSite *site = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(g_cold_split_mutex);
+    g_cold_split_sites.push_back({split_at, mode});
+    site = &g_cold_split_sites.back();
+  }
+  return ggml_map_custom1(ctx, ids, cold_split_cb, 1, site);
 }
 
 ggml_tensor *expert_weight_impl(FullGraph &g, ggml_context *ctx, int layer,
