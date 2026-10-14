@@ -216,3 +216,11 @@ next `MOESTREAM_GLM5NEXT_PREFILL_AHEAD` (default 2) layers' non-cached experts w
 
 AHEAD=4 and TRANSIENT_PAR=16 gave no change (72-73 at the 32 GiB pool). Needs ~1.7 GiB of free VRAM for the workspace and
 expert copy buffers, hence the smaller cache; releasing/shrinking the cache for the prefill only is still open.
+
+### Full cache + batched prefill: 100 tok/s without shrinking the cache
+
+The prefill needs ~1.7 GiB of free VRAM beyond the dense arena and cache. The legacy GPU attention mirrors
+(`attn_qabsorb_gpu`, `attn_score_gpu`; ~0.4 GiB) are unused by the full graph, so the shipped config turns them off and
+`moe_cache_gb = 15.8` (14.71 GiB aliased) stays intact: 805-token prefill 100.3 tok/s (7.9-8.0 s), greedy tokens
+identical to the CPU-cold path, no cache release/refill needed. `bench/glm_recipe_env.sh` now enables
+`MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1` and `..._PREFILL_OP_OFFLOAD=1` and the `build_native` ggml-cuda when it exists.

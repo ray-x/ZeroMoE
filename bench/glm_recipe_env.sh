@@ -15,3 +15,11 @@ export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=$GLM_RANKING MOESTREAM_GLM5NEXT_GPU1_HOT
 # layer's hot set is on one GPU: +3% on held-out prompts, neutral on the benchmark sequence.
 export MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=${MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER:-31}
 # MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB unset = auto (available RAM - 36 GiB)
+
+# Batched prefill on the GPU (805 tokens: 20 -> ~100 tok/s): cold experts are copied to VRAM per layer and read ahead by a
+# background thread. Needs the ggml-cuda carrying patches 0006/0007 (bench/build_native.sh) and a >= 58 GiB DDR pool.
+NATIVE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build_native/ggml-build/src
+if [ -f "$NATIVE/ggml-cuda/libggml-cuda.so.0" ]; then
+  export LD_LIBRARY_PATH=$GGML_KERNEL_LIBS:$NATIVE:$NATIVE/ggml-cuda
+  export MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1 MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1
+fi

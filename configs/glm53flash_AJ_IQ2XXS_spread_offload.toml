@@ -53,9 +53,11 @@ active_layer_promote_hit_threshold = 1
 active_layer_upload_worker_threads = 2
 move_on_promotion = true
 
-attn_qabsorb_gpu = true
+# Off: the full graph does its own attention; these legacy GPU mirrors only cost ~0.4 GiB of VRAM, which the batched prefill
+# (cold experts copied to the GPU, ~1.7 GiB workspace) needs at the full moe_cache_gb.
+attn_qabsorb_gpu = false
 attn_qabsorb_gpu_max_vram_gb = 2.0
-attn_score_gpu = true
+attn_score_gpu = false
 attn_score_gpu_max_vram_gb = 2.0
 attn_score_gpu_max_context = 512
 glm5next_router_gpu = true
