@@ -11,4 +11,7 @@ ORIG=$HOME/Projects/moestream-build-upstream-master/ggml-build/src
 export LD_LIBRARY_PATH=$GGML_KERNEL_LIBS:$ORIG:$ORIG/ggml-cuda${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 GLM_RANKING=${GLM_RANKING:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/ssd-offload/data/glm53flash_usage_base_plus_decode100.txt}
 export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=$GLM_RANKING MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE=$GLM_RANKING
+# The 5060 Ti holds only layers >= 31 (the 3090's pin_file ranking has those layers zeroed, pin_global_floor_per_layer = 0), so a
+# layer's hot set is on one GPU: +3% on held-out prompts, neutral on the benchmark sequence.
+export MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=${MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER:-31}
 # MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB unset = auto (available RAM - 36 GiB)

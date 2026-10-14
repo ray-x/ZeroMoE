@@ -602,9 +602,13 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
         bytes[(size_t)l] += (size_t)m->size_bytes / (size_t)c.n_experts;
     }
   }
+  // MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=L: the second GPU only holds hot experts of layers >= L. Pair it with a primary-GPU
+  // ranking whose counts are zeroed for those layers (and pin_global_floor_per_layer = 0), so each layer's hot set lives on one
+  // GPU and its trunk needs no cross-GPU hop. Measured +3% on held-out prompts (docs/ssd-offload/13-...).
+  const int gpu1_min_layer = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER", 0);
   std::vector<StreamingEngine::UsageEntry> cand;
   for (const auto &e : entries)
-    if (e.layer >= c.first_dense && e.layer < c.n_layers && e.expert >= 0 &&
+    if (e.layer >= std::max(c.first_dense, gpu1_min_layer) && e.layer < c.n_layers && e.expert >= 0 &&
         e.expert < c.n_experts && e.count > 0 && is_cold[(size_t)e.layer][(size_t)e.expert])
       cand.push_back(e);
   std::sort(cand.begin(), cand.end(), [](const auto &a, const auto &b) {

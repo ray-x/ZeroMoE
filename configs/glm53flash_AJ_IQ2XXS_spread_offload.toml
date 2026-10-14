@@ -21,12 +21,12 @@ mem_guard_stop_mb = 10240
 mem_guard_poll_ms = 500
 
 freeze_usage_stats = true
-pin_file = "/home/ray/Projects/MoEStream/docs/ssd-offload/data/glm53flash_usage_base_plus_decode100.txt"
+pin_file = "/home/ray/Projects/MoEStream/docs/ssd-offload/data/glm53flash_usage_base_plus_decode100_3090_lt31.txt"
 prefill_pin_file = "/home/ray/work/moestream-graph/docs/ssd-offload/data/glm53flash_survey5_usage_prefill.txt"
 pin_threshold = 6
 pin_topk_per_layer = 12
 pin_strategy = "global_topn"
-pin_global_floor_per_layer = 1
+pin_global_floor_per_layer = 0
 pinned_vram_capacity = 2400
 pin_vram_lru_fraction = 0.20
 pin_ram_fraction = 1.0

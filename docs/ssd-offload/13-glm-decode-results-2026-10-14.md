@@ -96,3 +96,19 @@ paid back by lane compute because the 5060 Ti's set then matches the hot experts
   the straggler, the CPU graph is. Letting staged hits assist on top of the normal share moves time back to the assist join
   (compute 46-49 ms, 74 ms/token). The lane is on a balanced plateau; prestage cannot shift it.
 - Net: no measured improvement in 5060 Ti efficiency from layout, prestage or kernels; the experiments and tools stay on the branch.
+
+## Layer split adopted: the 5060 Ti holds layers >= 31 (2026-10-14)
+Order-balanced repeats on identical tokens, last 30 tokens, tok/s, binary with the AVX-512 kernel, recipe env (hot set 15.0 GiB, 10
+threads), ranking built without the prompt:
+
+| input | current layout | 5060 Ti holds layers >= 31 | 5060 Ti holds layers >= 36 |
+|---|---|---|---|
+| benchmark sequence (n=4 / 2 / 4) | 15.37 (15.25-15.42) | 15.40 (15.38-15.43) | 15.40 (15.37-15.48) |
+| held-out css 046 (n=3 each) | 14.71 (14.70-14.71) | **15.20** (15.19-15.22), +3.4% | 14.84 |
+| held-out dockerfile 094 (n=3 each) | 15.31 (15.29-15.33) | **15.76** (15.67-15.83), +3.0% | 15.26 |
+
+Mechanism: a layer with hot experts on both GPUs pays cross-GPU copies of the hidden state inside its trunk; with the cut, layers 3-30
+are 3090-only (no hop; trunk wait 21.5 -> 19.0 ms/token) and layers 31-44 are 5060 Ti-only, at the price of a slightly worse hot-set match
+(lane compute 37.7 -> 41.7 ms). The trade is neutral for in-domain text and positive for out-of-domain text, whose routes are less
+concentrated. Shipped: `MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=31` (default in `bench/glm_recipe_env.sh`), the 3090 ranking with layers >= 31
+zeroed (`glm53flash_usage_base_plus_decode100_3090_lt31.txt`) and `pin_global_floor_per_layer = 0` in the shipped config.
