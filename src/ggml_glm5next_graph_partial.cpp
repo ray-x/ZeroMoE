@@ -463,6 +463,8 @@ bool prepare_partial_hot(FullGraph &g, ggml_context *ctx, int layer) {
   return p->hot_gate && p->hot_up && p->hot_down;
 }
 
+static bool layer_experts_take_mmq(FullGraph &g, int layer);
+
 ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer,
                               bool mask) {
   PartialExpertLayer *p = partial_layer(g, layer);
@@ -487,7 +489,8 @@ ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer,
   }
   const moe_partial::ExpertBranchMap branch_map = moe_partial::ExpertBranchMap::build(
       index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
-      moe_partial::SentinelPolicy::Auto);
+      g.S > 1 && layer_experts_take_mmq(g, layer) ? moe_partial::SentinelPolicy::AutoBatched
+                                                  : moe_partial::SentinelPolicy::Auto);
   const void *data = mask ? (const void *)branch_map.route_mask().data()
                           : (const void *)branch_map.route_ids().data();
   if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity, g.dense.used,
@@ -755,7 +758,7 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
     owned[e] = (is_hot[e] != 0) == hot ? 1 : 0;
   if (!hot && !p->hot1.empty()) {
     // hot1 experts left `cold`; decode serves them from GPU1, every other build keeps them here.
-    const bool on_gpu1 = g.decode_mode && g.gpu1;
+    const bool on_gpu1 = g.gpu1 != nullptr;
     for (int e : p->hot1) {
       if (e < 0 || (size_t)e >= n)
         continue;

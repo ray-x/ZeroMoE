@@ -351,9 +351,9 @@ ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer,
   o->sites.push_back({o, layer, g.S > 1, g.S, {}});
   if (const PartialExpertLayer *pl = partial_layer(g, layer)) {
     o->sites.back().not_cold.assign((size_t)o->n_experts, 0);
-    // hot1 (GPU1) experts are served by GPU1 only in S=1 decode; a batched graph routes them through the cold branch.
+    // hot1 (GPU1) experts are served by GPU1 whenever the graph has the second backend (decode, and batched prefill when GPU1 is enabled there).
     for (const std::vector<int> *set : {&pl->hot, &pl->hot1})
-      if (set == &pl->hot || (g.decode_mode && g.gpu1))
+      if (set == &pl->hot || g.gpu1)
         for (int e : *set)
           if (e >= 0 && e < o->n_experts)
             o->sites.back().not_cold[(size_t)e] = 1;

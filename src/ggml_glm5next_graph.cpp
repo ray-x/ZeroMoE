@@ -176,11 +176,19 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   }
   if (!init_expert_arena(*g) || !init_dense_arena(*g))
     return false;
-  ggml_backend_t backends[] = {g->cuda, g->cpu};
+  // GPU1-hot experts compute in place on the second GPU (MOESTREAM_GLM5NEXT_PREFILL_GPU1=0 routes them through the cold
+  // branch, copying each used expert to the main GPU).
+  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)
+    for (const auto &pl : g->partial_experts)
+      if (!pl.hot1.empty()) {
+        g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
+        break;
+      }
+  ggml_backend_t backends[] = {g->cuda, g->gpu1 ? g->gpu1 : g->cpu, g->cpu};
   // Batched prefill: let the scheduler run the host-resident (cold) expert matmuls on the GPU by copying the weights
   // across, instead of on the CPU (MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
   const bool prefill_offload = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD");
-  g->sched = ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, prefill_offload);
+  g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, false, prefill_offload);
   if (!g->sched)
     return false;
   if (!build_graph(*g)) {
