@@ -266,3 +266,31 @@ weight copies on the single H2D engine; queueing the copies a few experts at a t
 Code: `src/ggml_glm5next_graph_offload.cpp` (`prefetch_*`), cold-branch in `ggml_glm5next_graph_build.cpp`, scheduler events
 in `patches/ggml/0008-*`. Env: `MOESTREAM_GLM5NEXT_PREFILL_PREFETCH{,_SETS,_CHUNK}`, `PREFILL_SPLIT`, `PREFETCH_DEBUG`.
 Pool resizing after prefill was not built: with `moe_cache_gb = 17.0` the decode graph itself no longer fits (0.23 tok/s).
+
+### Prefill: the copy queue starved the compute graph (2026-10-15): 159 -> 177 tok/s, now the default
+
+Host tracing (`MOESTREAM_SCHED_TRACE2`) showed the unsplit prefill blocked 3.6 s of 5.05 s issuing weight copies (one link at
+11.8 GB/s), and with the split + pinned pool the wait moved to the miss node's input hop (107 ms per layer) with the same wall
+time. nsys of the prefetch config then showed both links idle 50% of the time: one layer's copies (~72 ms, 1.55 GiB at 21 GB/s
+over two links) are followed by ~65 ms of compute, and the compute only starts when the copies end. Microbenchmark
+(`scratchpad/lat.cu`): a small H2D (the rewritten ids, KDA history, the activations that cross between the GPUs) submitted on
+another stream while a run of weight copies is in flight is not served until the run ends, **even when only two chunks are
+queued at a time**; waiting for each chunk to finish before queueing the next empties the queue at chunk boundaries and the
+small copy then waits 0.1-0.75 ms, with the run's duration unchanged (67.5 ms).
+
+Fix: the prefetch worker waits for each chunk (`MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_DRAIN`, default 1) and queues in chunks of
+2 experts (`_CHUNK`, default 2), alternating between the two GPUs (`PREFILL_INTERLEAVE`, default 1). The whole DDR pool must be
+pinned (`OFFLOAD_PINNED=1.0`: a pageable source makes the copy synchronous, 4.82 s vs 4.55 s).
+
+| config (805 tokens, dual GPU, tokens identical) | prefill |
+|---|---|
+| plain graph prefill | 159.3 tok/s (5.05 s) |
+| prefetch 3 sets, chunk 8, pool 14.0 (previous best) | 164.7 (4.89 s) |
+| + drain, chunk 2, 3 sets, pool 14.0 | 182.5 (4.41 s) |
+| drain, chunk 2, **2 sets, pool 15.0, pinned 1.0 (shipped)** | **176.9 (4.55 s)** |
+
+The prefetch ring is now on by default when the second GPU takes part (off for a single GPU, where it does not fit next to the
+3090 pool); the shipped config uses `moe_cache_gb = 15.0` (decode within 1%: 70.1 -> 70.7 ms/token over tokens 16-32). If the
+graph does not fit with the ring it is built once more without it (previously: legacy prefill, 25 min). Remaining distance to
+the link limit (2.6 s for ~43 GB over two links): the first layers (3 only gets its experts by fixup), the 14 layers >= 31, and
+the compute chain itself.

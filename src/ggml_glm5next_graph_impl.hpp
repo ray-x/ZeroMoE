@@ -109,6 +109,9 @@ ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer, ggml_
 // Prefill speculative prefetch (MOESTREAM_GLM5NEXT_PREFILL_PREFETCH=1): device-resident, compact cold-expert weights of a
 // layer, filled ahead of the layer by a copy stream. Null when the layer is not prefetched.
 bool prefetch_layer_active(int layer);
+bool prefetch_ring_was_built();      // a ring was allocated for the graph that was just built or declined
+double prefetch_ring_main_gib();
+void prefetch_suppress_once();       // the next graph is built without a ring
 ggml_tensor *prefetch_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int part);
 // Number of compact cold slots of the layer (0 = not prefetched); *split = slots held by part 0, the rest by part 1.
 int prefetch_layer_slots(int layer, int *split);

@@ -85,6 +85,8 @@ vram_gb = 24.0
 kv_cache_gb = 1.0
 kv_bits = 4
 dense_gb = 6.5
-moe_cache_gb = 15.8
+# 15.0 rather than 15.8: the dual-GPU prefill's expert prefetch ring (1.9 GiB on the 3090) needs the 0.8 GiB; prefill 159 -> 177
+# tok/s, decode within 1%. At 15.8 the ring does not fit and the graph is built a second time without it.
+moe_cache_gb = 15.0
 active_layer_weight = 1
 active_layer_capacity_slots = 64

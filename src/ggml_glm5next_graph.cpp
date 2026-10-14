@@ -108,8 +108,23 @@ void glm5next_full_graph_shutdown() {
   g_glm5next_decode_disabled_engine = nullptr;
 }
 
-bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
-                                 const int *) {
+static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *tokens);
+
+// The speculative prefetch ring takes VRAM the batched-prefill workspace may then not find: when a graph that had a ring
+// is declined, it is built once more without it (a legacy prefill of the same prompt is ~100x slower).
+bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, const int *tokens) {
+  (void)prefetch_ring_was_built();
+  if (glm5next_full_graph_prepare_once(engine, S, pos_base, tokens))
+    return true;
+  if (!prefetch_ring_was_built())
+    return false;
+  LOG_WARN("[GGML-GLM5NEXT-FULL] graph declined with the prefetch ring (%.2f GiB on the main GPU); retrying without it\n",
+           prefetch_ring_main_gib());
+  prefetch_suppress_once();
+  return glm5next_full_graph_prepare_once(engine, S, pos_base, tokens);
+}
+
+static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *) {
   if (!env_enabled() || S <= 1 || pos_base != 0 ||
       engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;

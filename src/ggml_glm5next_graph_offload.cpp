@@ -7,6 +7,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include <future>
+#include <thread>
 #include <map>
 #include "ggml_glm5next_graph_impl.hpp"
 
@@ -216,6 +217,13 @@ OffloadState *get_offload(const StreamingEngine &engine,
   return g_offload.get();
 }
 
+extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(ggml_backend_t backend);
+
+namespace {
+bool g_prefetch_built = false, g_prefetch_suppress = false;
+double g_prefetch_main_gib = 0.0;
+} // namespace
+
 namespace {
 
 // ---- speculative expert prefetch for batched prefill ------------------------------------------------------------
@@ -253,11 +261,6 @@ struct PrefetchRing {
 
 std::unique_ptr<PrefetchRing> g_ring;
 
-bool prefetch_enabled_env() {
-  static const bool on = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH", 0) != 0;
-  return on;
-}
-
 void prefetch_copy_slot(PrefetchRing &ring, PrefetchLayer &lp, OffloadState &o, size_t k) {
   const int e = lp.experts[k];
   const int part = (int)k >= lp.split ? 1 : 0;
@@ -282,7 +285,15 @@ void prefetch_record(PrefetchRing &ring, const PrefetchLayer &lp) {
 // engine, and the activations that cross between the two GPUs are staged through the host, so they wait behind everything
 // already queued there. Queueing a layer's whole cold set at once delayed them by the full copy time.
 void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
-  static const int chunk = std::max(1, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_CHUNK", 8));
+  static const int chunk = std::max(1, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_CHUNK", 2));
+  // A copy another stream submits while a long run of weight copies is in flight is not served until the run ends (the copy
+  // engine does not interleave streams), so the small inputs of the layer that the miss node has just released (the
+  // rewritten ids, ...) would wait for the whole run. The run therefore starts after those uploads have been issued.
+  static const int delay_us = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_DELAY_US", 0);
+  if (delay_us > 0)
+    std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+  static const bool drain = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_DRAIN", 1) != 0;
+  const auto issue_t0 = std::chrono::steady_clock::now();
   struct Chunker {
     cudaEvent_t ev[2] = {nullptr, nullptr};
     int n = 0, in_chunk = 0;
@@ -292,7 +303,19 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
     cudaEventCreateWithFlags(&ch[part].ev[0], cudaEventDisableTiming);
     cudaEventCreateWithFlags(&ch[part].ev[1], cudaEventDisableTiming);
   }
-  for (size_t k = 0; k < lp->experts.size(); ++k) {
+  // Slots are issued interleaved between the two parts in the ratio of their shares, so both links copy from the start:
+  // issuing the main GPU's slots first left the second GPU's link idle until the first part was nearly done.
+  const size_t n_slots = lp->experts.size(), n_main = (size_t)lp->split, n_second = n_slots - n_main;
+  size_t next_main = 0, next_second = 0;
+  for (size_t step = 0; step < n_slots; ++step) {
+    size_t k;
+    static const bool inter = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_INTERLEAVE", 1) != 0;
+    if (!inter)
+      k = step;
+    else if (next_main < n_main && (next_second >= n_second || next_main * n_second <= next_second * n_main))
+      k = next_main++;
+    else
+      k = n_main + next_second++;
     if (lp->copied[k] || !o->residency->data_ready({lp->layer, lp->experts[k]}))
       continue;
     const int part = (int)k >= lp->split ? 1 : 0;
@@ -303,11 +326,19 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
     prefetch_copy_slot(*ring, *lp, *o, k);
     if (++c.in_chunk == chunk) {
       cudaEventRecord(c.ev[c.n % 2], ring->parts[part].stream);
+      // Waiting for the chunk just queued empties the device's copy queue at the chunk boundary, which is the only point
+      // where the small uploads of the compute graph (ids, KDA history, activations crossing between the GPUs) get served;
+      // while the queue never empties they wait for the whole layer's run (67 ms measured).
+      if (drain)
+        cudaEventSynchronize(c.ev[c.n % 2]);
       ++c.n;
       c.in_chunk = 0;
     }
   }
   prefetch_record(*ring, *lp);
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG"))
+    LOG_INFO("[GGML-GLM5NEXT-PREFETCH] issue layer %d chunk=%d chunks=%d/%d issued in %.1f ms\n", lp->layer, chunk, ch[0].n,
+             ch[1].n, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - issue_t0).count());
   for (int part = 0; part < ring->n_parts; ++part) {
     cudaSetDevice(ring->parts[part].device);
     cudaEventSynchronize(ch[part].ev[0] ? ch[part].ev[0] : nullptr); // recorded or never used: both complete
@@ -374,7 +405,15 @@ void prefetch_service(OffloadState &o, int layer, std::vector<int32_t> &ids) {
 // Builds the ring and the per-layer plans for the prompt graph being built (called when its first offload layer is built).
 bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   g_ring.reset();
-  if (!prefetch_enabled_env() || g.decode_mode || g.S < 64 || !g.cuda)
+  g_prefetch_built = false;
+  if (g_prefetch_suppress) {
+    g_prefetch_suppress = false;
+    return false;
+  }
+  // On by default when the second GPU takes part (the ring is split between the two links); off for a single GPU, where the
+  // ring would not fit next to the 3090's expert pool.
+  const char *want = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH");
+  if (!(want ? std::atoi(want) != 0 : g.gpu1 != nullptr) || g.decode_mode || g.S < 64 || !g.cuda)
     return false;
   const auto &c = g.engine->model_file.architecture_config;
   auto ring = std::make_unique<PrefetchRing>();
@@ -436,6 +475,20 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     return false;
   size_t total[2] = {0, 0};
   bool ok = true;
+  {
+    size_t want[2] = {0, 0};
+    for (int part = 0; part < 2; ++part)
+      for (int s = 0; s < ring->sets; ++s)
+        for (int p = 0; p < 3; ++p)
+          want[part] += cap[part][s][p];
+    for (int part = 0; part < ring->n_parts; ++part) {
+      size_t freeb = 0, totb = 0;
+      cudaSetDevice(ring->parts[part].device);
+      cudaMemGetInfo(&freeb, &totb);
+      LOG_INFO("[GGML-GLM5NEXT-PREFETCH] device %d: free %.3f GiB before the ring, ring %.3f GiB\n", part,
+               (double)freeb / (1024.0 * 1024.0 * 1024.0), (double)want[part] / (1024.0 * 1024.0 * 1024.0));
+    }
+  }
   for (int part = 0; part < ring->n_parts && ok; ++part) {
     ggml_backend_t be = part == 0 ? g.cuda : g.gpu1;
     for (int s = 0; s < ring->sets && ok; ++s)
@@ -483,14 +536,34 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
           g.gpu1_buffers.push_back(ring->parts[part].buf[s][p]);
   }
   cudaSetDevice(ring->parts[0].device);
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG")) {
+    unsigned long long id[4] = {0, 0, 0, 0};
+    cudaStreamGetId(ring->parts[0].stream, &id[0]);
+    if (ring->n_parts > 1)
+      cudaStreamGetId(ring->parts[1].stream, &id[1]);
+    cudaStreamGetId(moestream_ggml_backend_cuda_get_stream(g.cuda), &id[2]);
+    if (g.gpu1)
+      cudaStreamGetId(moestream_ggml_backend_cuda_get_stream(g.gpu1), &id[3]);
+    LOG_INFO("[GGML-GLM5NEXT-PREFETCH] stream ids: copy %llu/%llu backend %llu/%llu\n", id[0], id[1], id[2], id[3]);
+  }
   LOG_INFO("[GGML-GLM5NEXT-PREFETCH] %zu layers, %d sets, buffers %.2f GiB on the main GPU + %.2f GiB on the second\n",
            ring->layers.size(), ring->sets, (double)total[0] / (1024.0 * 1024.0 * 1024.0),
            (double)total[1] / (1024.0 * 1024.0 * 1024.0));
+  g_prefetch_built = true;
+  g_prefetch_main_gib = (double)total[0] / (1024.0 * 1024.0 * 1024.0);
   g_ring = std::move(ring);
   return true;
 }
 
 } // namespace
+
+bool prefetch_ring_was_built() {
+  const bool b = g_prefetch_built;
+  g_prefetch_built = false;
+  return b;
+}
+double prefetch_ring_main_gib() { return g_prefetch_main_gib; }
+void prefetch_suppress_once() { g_prefetch_suppress = true; }
 
 bool prefetch_layer_active(int layer) { return g_ring && g_ring->layers.count(layer) != 0; }
 

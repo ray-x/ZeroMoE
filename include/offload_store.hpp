@@ -668,6 +668,12 @@ public:
   double wait_ms() const { return static_cast<double>(wait_us_.load(std::memory_order_relaxed)) / 1000.0; }
   // True when the expert is resident AND its planes hold valid data (not mid-read). Caller holds the arena lock.
   bool ready(ExpertKey k) const { return cache_.resident(k) && !is_loading(k); }
+  // The planes of `k` are fully populated: a cached expert that is not mid-load, or a transient expert whose load finished.
+  bool data_ready(ExpertKey k) const {
+    if (ready(k)) return true;
+    std::lock_guard<std::mutex> g(transient_mu_);
+    return transient_ready_.count(kid(k)) != 0;
+  }
   bool is_loading(ExpertKey k) const {
     std::lock_guard<std::mutex> g(ld_mu_);
     return loading_.count(kid(k)) != 0;
@@ -695,7 +701,7 @@ public:
       std::lock_guard<std::mutex> g(transient_mu_);
       std::vector<ExpertKey> keep;
       for (const ExpertKey &k : transient_) {
-        if (k.layer < layer) arena_.evict(k.layer, k.expert);
+        if (k.layer < layer) { transient_ready_.erase(kid(k)); arena_.evict(k.layer, k.expert); }
         else keep.push_back(k);
       }
       transient_.swap(keep);
@@ -756,7 +762,12 @@ public:
                                    to_load.begin() + static_cast<std::ptrdiff_t>(std::min(to_load.size(), i + par)));
       const std::vector<char> ok = load_many(layer, chunk);
       for (size_t k = 0; k < chunk.size(); ++k) {
-        if (ok[k]) { arena_.transient_populated(layer, chunk[k]); ++r.loads; continue; }
+        if (ok[k]) {
+          arena_.transient_populated(layer, chunk[k]);
+          { std::lock_guard<std::mutex> g(transient_mu_); transient_ready_.insert(kid({layer, chunk[k]})); }
+          ++r.loads;
+          continue;
+        }
         ++r.errors;
         std::lock_guard<std::mutex> g(transient_mu_);
         for (size_t j = 0; j < transient_.size(); ++j)
@@ -827,6 +838,7 @@ private:
   VirtualArena &arena_;
   std::vector<ExpertSource *> sources_;
   std::vector<ExpertKey> transient_;
+  std::unordered_set<uint64_t> transient_ready_;   // transient experts whose planes are fully populated
   mutable std::mutex transient_mu_;   // guards transient_ (prefetch_transient runs on another thread)
   mutable std::mutex ld_mu_;          // leaf lock: never held while taking another lock
   std::condition_variable ld_cv_;
