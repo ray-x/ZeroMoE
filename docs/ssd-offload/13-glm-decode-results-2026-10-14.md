@@ -159,3 +159,18 @@ turns it off) cut the live peak 754 -> 64 MiB and the workspace 0.83 -> 0.22 GiB
 The whole 805-token prompt now fits one graph (0.62 GiB): prefill **5.7 -> 21.1 tok/s** (38 s), same output start.
 Default `MOESTREAM_GLM5NEXT_PREFILL_CHUNK` is now 1024. Graph prefill is still opt-in
 (`MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1`) and needs the ggml-cuda with patch 0006 (`bench/build_native.sh`).
+
+### Where the 38 s of whole-prompt prefill goes (S=805, `MOESTREAM_GLM5NEXT_OP_PROFILE=1`)
+
+| op | time |
+|---|---|
+| `MUL_MAT_ID(iq2_xxs)` on CPU (cold experts, 118 nodes) | 26.4 s |
+| `MAP_CUSTOM1` host nodes (offload miss loader, 42 nodes) | 8.2 s |
+| `MUL_MAT_ID(iq2_s)` on CPU | 1.7 s |
+| everything on the GPU (MMQ hot experts, attention, KDA, dense) | < 1.5 s |
+
+The GPU is idle for ~90% of prefill. Next step: run the cold experts on the GPU during prefill by uploading the used ones
+per layer into VRAM (the expert cache region can be overwritten while prefilling and refilled before decode), instead of the
+CPU `MUL_MAT_ID`. Tried: `MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (scheduler op-offload, needs ~1.7 GiB workspace and
+a smaller cache; ggml-backend needed negative-id tolerance) - the scheduler's expert copy fails with `cudaMemcpyAsync:
+invalid argument` from the offload-store host tensors, so the upload has to be done by the graph's own miss node.

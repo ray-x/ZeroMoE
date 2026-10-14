@@ -71,6 +71,35 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     return false;
   for (auto &entry : g.early_ready)
     entry.second->completed = false;
+  struct OpProf {
+    std::chrono::steady_clock::time_point last;
+    std::map<std::string, std::pair<double, int>> agg;
+    ggml_backend_sched_t sched = nullptr;
+  } op;
+  const bool op_prof_on = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
+  if (op_prof_on) {
+    // Debug: per-op wall time, attributed to the op that just finished (the callback also splits the graph per node).
+    ggml_backend_sched_set_eval_callback(
+        g.sched,
+        [](ggml_tensor *t, bool ask, void *ud) -> bool {
+          if (ask) return true;
+          auto *o = static_cast<OpProf *>(ud);
+          const auto now = std::chrono::steady_clock::now();
+          const double ms = std::chrono::duration<double, std::milli>(now - o->last).count();
+          o->last = now;
+          std::string key = ggml_op_name(t->op);
+          if (t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_MUL_MAT)
+            key += std::string("(") + ggml_type_name(t->src[0]->type) + ")/" +
+                   ggml_backend_name(ggml_backend_sched_get_tensor_backend(o->sched, t));
+          auto &e = o->agg[key];
+          e.first += ms;
+          ++e.second;
+          return true;
+        },
+        &op);
+    op.sched = g.sched;
+    op.last = std::chrono::steady_clock::now();
+  }
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
@@ -80,6 +109,14 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   }
   ggml_backend_sched_synchronize(g.sched);
   release_graph_vram_experts(g);
+  if (op_prof_on) {
+    ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
+    std::vector<std::pair<double, std::string>> rows;
+    for (auto &[k, v] : op.agg) rows.push_back({v.first, k + " n=" + std::to_string(v.second)});
+    std::sort(rows.rbegin(), rows.rend());
+    for (size_t i = 0; i < rows.size() && i < 14; ++i)
+      LOG_INFO("[GLM-PREFILL-OPPROF] %9.1f ms  %s\n", rows[i].first, rows[i].second.c_str());
+  }
   const auto synced = std::chrono::steady_clock::now();
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * S * sizeof(float));

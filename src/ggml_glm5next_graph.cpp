@@ -177,8 +177,10 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (!init_expert_arena(*g) || !init_dense_arena(*g))
     return false;
   ggml_backend_t backends[] = {g->cuda, g->cpu};
-  g->sched =
-      ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, false);
+  // Batched prefill: let the scheduler run the host-resident (cold) expert matmuls on the GPU by copying the weights
+  // across, instead of on the CPU (MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
+  const bool prefill_offload = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD");
+  g->sched = ggml_backend_sched_new(backends, nullptr, 2, kGraphSize, false, prefill_offload);
   if (!g->sched)
     return false;
   if (!build_graph(*g)) {
