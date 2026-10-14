@@ -237,3 +237,12 @@ branch serves (`OffloadSite::not_cold`).
 Dual-GPU recipe prefill (805 tokens, 76 GiB pool, 3090 + 5060 Ti): 67-69 tok/s (single 3090: 98-101). OFFLOAD_PINNED 0 / 0.5 / 1.0 =
 56.6 / 67 / 69.1 tok/s. Nothing is read ahead there (all cold experts are seeded in the pool); the time is the PCIe copy of the
 cold experts, which pinned memory speeds up.
+
+### Why the dual-GPU prefill was slow (67 vs 118 tok/s) and the fix
+
+Same config, same 76 GiB pool, 805 tokens: 3090 only 117.6 tok/s, dual 67.1 tok/s; the whole difference was the miss node
+(`MAP_CUSTOM1` 4.7 s). A batched graph has no GPU1 branch, so the 5060 Ti's hot experts (2426, not seeded in the DDR pool) go
+through the cold branch and were read inline, ~58 per layer. The read-ahead skip list wrongly treated them as VRAM-served.
+Fixed (`not_cold` = 3090 hot set only for batched graphs): dual **96.9 tok/s**, 3090 only **118.9**, greedy tokens identical
+between the two. The remaining 1.5 s is the PCIe copy of the extra ~15 GiB of experts the 5060 Ti would serve in decode.
+llama.cpp `-ncmoe 41 -ub 4096` on the same prompt: 104 tok/s.

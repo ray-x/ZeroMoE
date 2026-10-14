@@ -114,7 +114,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     std::vector<std::pair<double, std::string>> rows;
     for (auto &[k, v] : op.agg) rows.push_back({v.first, k + " n=" + std::to_string(v.second)});
     std::sort(rows.rbegin(), rows.rend());
-    for (size_t i = 0; i < rows.size() && i < 14; ++i)
+    for (size_t i = 0; i < rows.size() && i < 30; ++i)
       LOG_INFO("[GLM-PREFILL-OPPROF] %9.1f ms  %s\n", rows[i].first, rows[i].second.c_str());
   }
   const auto synced = std::chrono::steady_clock::now();
