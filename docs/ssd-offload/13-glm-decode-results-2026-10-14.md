@@ -174,3 +174,16 @@ per layer into VRAM (the expert cache region can be overwritten while prefilling
 CPU `MUL_MAT_ID`. Tried: `MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (scheduler op-offload, needs ~1.7 GiB workspace and
 a smaller cache; ggml-backend needed negative-id tolerance) - the scheduler's expert copy fails with `cudaMemcpyAsync:
 invalid argument` from the offload-store host tensors, so the upload has to be done by the graph's own miss node.
+
+### llama.cpp reference for GLM prefill (neurall fork `~/Projects/neurall/llama.cpp`, build 11401, RTX 3090, pp805, AJ IQ2_XXS)
+
+| llama-bench config | pp805 |
+|---|---|
+| `-ncmoe 45 -nopo 1` (experts on CPU, no op-offload) | 24.7 t/s |
+| `-ncmoe 45 -ub 512` (op-offload on) | 56 t/s |
+| `-ncmoe 45 -ub 4096` (op-offload on) | **95.3 t/s** |
+| `-ncmoe 41 -ub 4096` | **104.3 t/s** |
+| `-ncmoe 36` | does not fit (context creation fails) |
+
+MoEStream graph prefill (CPU cold experts) is 21 t/s: it matches llama.cpp *without* op-offload (24.7). The 4x gap is the
+per-layer copy of used experts to the GPU with the big ubatch amortising it, exactly the staging path proposed above.
