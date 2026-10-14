@@ -131,3 +131,20 @@ last-30 tok/s, identical tokens:
 | held-out dockerfile | 15.85, 15.72 (mean 15.79) | 15.88, 15.89 (mean **15.89**, +0.6%) | 18.8 -> 18.7 ms/token |
 
 The 5060 Ti's own kernels are ~3 ms/token, so most of the gain is the 3090 trunk; the native build costs one longer compile and no code change.
+
+## Prefill (805-token generic prompt, 2026-10-14)
+
+| mode | prefill |
+|---|---|
+| legacy whole-prompt (default; graph prefill is opt-in) | ~1 tok/s (killed after 9.6 min) |
+| `MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1`, chunk 128, `build_native` (has patch 0006), 3090 | **5.7 tok/s** (140 s) |
+| same, chunk 256, dual GPU | 4.6 tok/s (175 s; 1.39 GiB workspace, builds; chunk 512 is declined, OOM) |
+| same with `build_gk` / upstream-master ggml-cuda (no patch 0006) | CUDA illegal memory access in `mul_mat_q<IQ2_XXS>` |
+
+- Only the first `PREFILL_CHUNK` tokens go through the batched graph (~5 s for 128); the other ~680 run as S=1
+  decode-graph steps at 160-260 ms each (prompt tokens miss the decode-ranked hot set), which is ~95% of the time.
+- Qwen runs the whole prompt in one graph; GLM cannot (workspace ~6.5 MB/token, ~1.7 GiB free) and its graph is
+  position-zero only (`pos_base != 0` is rejected), the same as Qwen's prepare.
+- The fix is a chunked prefill graph at `pos_base > 0` (KDA state carry-in, DSA indexer + MLA over cached KV, as
+  llama.cpp does with ubatch 512). Not built yet. Quick win available: enable graph prefill by default once the
+  patched ggml-cuda is the shipped one (1 -> ~5.7 tok/s).
