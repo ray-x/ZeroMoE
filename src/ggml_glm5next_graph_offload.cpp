@@ -303,38 +303,37 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
     cudaEventCreateWithFlags(&ch[part].ev[0], cudaEventDisableTiming);
     cudaEventCreateWithFlags(&ch[part].ev[1], cudaEventDisableTiming);
   }
-  // Slots are issued interleaved between the two parts in the ratio of their shares, so both links copy from the start:
-  // issuing the main GPU's slots first left the second GPU's link idle until the first part was nearly done.
-  const size_t n_slots = lp->experts.size(), n_main = (size_t)lp->split, n_second = n_slots - n_main;
-  size_t next_main = 0, next_second = 0;
-  for (size_t step = 0; step < n_slots; ++step) {
-    size_t k;
-    static const bool inter = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_INTERLEAVE", 1) != 0;
-    if (!inter)
-      k = step;
-    else if (next_main < n_main && (next_second >= n_second || next_main * n_second <= next_second * n_main))
-      k = next_main++;
-    else
-      k = n_main + next_second++;
-    if (lp->copied[k] || !o->residency->data_ready({lp->layer, lp->experts[k]}))
-      continue;
-    const int part = (int)k >= lp->split ? 1 : 0;
+  // One thread per part: a part waits for each of its chunks (see `drain`), and a single thread doing that for both GPUs
+  // serialized the two links (120 ms per layer instead of ~90).
+  const size_t n_slots = lp->experts.size();
+  auto issue_part = [&](int part) {
+    const size_t lo = part == 0 ? 0 : (size_t)lp->split, hi = part == 0 ? (size_t)lp->split : n_slots;
     Chunker &c = ch[part];
     cudaSetDevice(ring->parts[part].device);
-    if (c.in_chunk == 0 && c.n >= 2)
-      cudaEventSynchronize(c.ev[c.n % 2]);
-    prefetch_copy_slot(*ring, *lp, *o, k);
-    if (++c.in_chunk == chunk) {
-      cudaEventRecord(c.ev[c.n % 2], ring->parts[part].stream);
-      // Waiting for the chunk just queued empties the device's copy queue at the chunk boundary, which is the only point
-      // where the small uploads of the compute graph (ids, KDA history, activations crossing between the GPUs) get served;
-      // while the queue never empties they wait for the whole layer's run (67 ms measured).
-      if (drain)
+    for (size_t k = lo; k < hi; ++k) {
+      if (lp->copied[k] || !o->residency->data_ready({lp->layer, lp->experts[k]}))
+        continue;
+      if (c.in_chunk == 0 && c.n >= 2)
         cudaEventSynchronize(c.ev[c.n % 2]);
-      ++c.n;
-      c.in_chunk = 0;
+      prefetch_copy_slot(*ring, *lp, *o, k);
+      if (++c.in_chunk == chunk) {
+        cudaEventRecord(c.ev[c.n % 2], ring->parts[part].stream);
+        // Waiting for the chunk just queued empties the device's copy queue at the chunk boundary, which is the only point
+        // where the small uploads of the compute graph (ids, KDA history, activations crossing between the GPUs) get
+        // served; while the queue never empties they wait for the whole layer's run (67 ms measured).
+        if (drain)
+          cudaEventSynchronize(c.ev[c.n % 2]);
+        ++c.n;
+        c.in_chunk = 0;
+      }
     }
-  }
+  };
+  std::thread second;
+  if (ring->n_parts > 1 && lp->split < (int)n_slots)
+    second = std::thread(issue_part, 1);
+  issue_part(0);
+  if (second.joinable())
+    second.join();
   prefetch_record(*ring, *lp);
   if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG"))
     LOG_INFO("[GGML-GLM5NEXT-PREFETCH] issue layer %d chunk=%d chunks=%d/%d issued in %.1f ms\n", lp->layer, chunk, ch[0].n,

@@ -287,10 +287,14 @@ pinned (`OFFLOAD_PINNED=1.0`: a pageable source makes the copy synchronous, 4.82
 | plain graph prefill | 159.3 tok/s (5.05 s) |
 | prefetch 3 sets, chunk 8, pool 14.0 (previous best) | 164.7 (4.89 s) |
 | + drain, chunk 2, 3 sets, pool 14.0 | 182.5 (4.41 s) |
-| drain, chunk 2, **2 sets, pool 15.0, pinned 1.0 (shipped)** | **176.9 (4.55 s)** |
+| drain, chunk 2, 2 sets, pool 15.0, pinned 1.0, one worker thread for both GPUs | 176.9 (4.55 s) |
+| same, **one worker thread per GPU (shipped)** | **178.8 (4.50 s)** |
 
 The prefetch ring is now on by default when the second GPU takes part (off for a single GPU, where it does not fit next to the
 3090 pool); the shipped config uses `moe_cache_gb = 15.0` (decode within 1%: 70.1 -> 70.7 ms/token over tokens 16-32). If the
 graph does not fit with the ring it is built once more without it (previously: legacy prefill, 25 min). Remaining distance to
 the link limit (2.6 s for ~43 GB over two links): the first layers (3 only gets its experts by fixup), the 14 layers >= 31, and
-the compute chain itself.
+the compute chain itself. With a thread per GPU the copies of a layer take 86 ms (1.55 GiB at 18 GB/s, the two links' limit) but
+the layer period of layers 4-30 is still 118 ms (65 ms for layers >= 31, whose copies take 24 ms): the miss node no longer waits
+for copies, the host waits ~77 ms per layer for the GPU chain (attention, router, cold experts on both GPUs, activations crossing
+the host). That chain, not the links, is what is left.
