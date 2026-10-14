@@ -385,7 +385,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     // The weighting and the sum over the routed experts stay on the GPU that ran the experts: left to the scheduler they ran
     // on the main GPU, so the unreduced [D, topk, S] result (105 MB for 805 tokens) crossed between the GPUs through the host
     // (56 ms per layer) instead of the [D, S] sum (13 MB).
-    if (pin_be && g.sched) {
+    static const bool pin_on = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
+    if (pin_be && g.sched && pin_on && !g.decode_mode) {
       ggml_backend_sched_set_tensor_backend(g.sched, experts, pin_be);
       ggml_backend_sched_set_tensor_backend(g.sched, summed, pin_be);
     }
@@ -558,7 +559,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                 }
                 ggml_tensor *experts = ggml_mul(ctx, ffn.down, weights_of(id_mode + 2));
                 ggml_tensor *summed = moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
-                if (be && g.sched) {
+                if (be && g.sched && !g.decode_mode) {
                   ggml_backend_sched_set_tensor_backend(g.sched, experts, be);
                   ggml_backend_sched_set_tensor_backend(g.sched, summed, be);
                 }
