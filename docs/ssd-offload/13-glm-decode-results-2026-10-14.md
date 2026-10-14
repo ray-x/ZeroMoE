@@ -187,3 +187,14 @@ invalid argument` from the offload-store host tensors, so the upload has to be d
 
 MoEStream graph prefill (CPU cold experts) is 21 t/s: it matches llama.cpp *without* op-offload (24.7). The 4x gap is the
 per-layer copy of used experts to the GPU with the big ubatch amortising it, exactly the staging path proposed above.
+
+### Cold experts on the GPU during prefill: 20.2 -> 47.8 tok/s (805 tokens, greedy tokens identical)
+
+`MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (+ `MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1`) lets the scheduler copy only the
+experts a layer's cold branch uses into VRAM and run `MUL_MAT_ID` there, like llama.cpp `-ncmoe N -ub 4096`.
+`patches/ggml/0007` makes the scheduler's expert copy safe for the virtual arena (negative ids, per-slot copies,
+zero padding instead of reading past the last expert). Per-op profile after: CUDA `MUL_MAT_ID` 7.1 s (PCIe-bound),
+miss node `MAP_CUSTOM1` 8.7 s (store/DDR -> arena), rest < 1.5 s; total 16.8 s vs llama.cpp 7.7 s (104 t/s).
+Needs ~1.7 GiB workspace, so it was run with `moe_cache_gb = 14.0` (the cache otherwise leaves 1.2 GiB free).
+Open: release/shrink the cache for the prefill (as the Qwen path releases its arena before prefill), overlap the
+miss-node load of layer L+1 with layer L compute, or read experts straight from the model mapping.

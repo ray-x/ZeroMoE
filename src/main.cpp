@@ -898,7 +898,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
   // enable_direct_io: the mapping uses its own non-O_DIRECT fd, and the
   // ordering makes that independence obvious at the call site.
   if (config.moe_prefill_stream) {
-    if (!config.moe_prefill_batched) {
+    if (!config.moe_prefill_batched && !config.glm5next_moe_prefill_gpu) {
       LOG_WARN("[CONFIG] moe_prefill_stream=true has no effect without "
                "moe_prefill_batched=true (it replaces how that path "
                "acquires weights) -- staying on the cached path.\n");

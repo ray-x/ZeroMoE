@@ -1,0 +1,53 @@
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1816,7 +1816,10 @@
+                         for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
+                             for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
+                                 int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+-                                GGML_ASSERT(id >= 0 && id < n_expert);
++                                GGML_ASSERT(id < n_expert);
++                                if (id < 0) {
++                                    continue; // MoEStream: negative id = inactive route (negative-skip), no expert to copy
++                                }
+                                 ggml_bitset_set(used_ids.data(), id);
+                             }
+                         }
+@@ -1830,18 +1833,30 @@
+                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
+                         const size_t padding = std::min<size_t>(expert_size, 512);
+                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+-
+-                        ggml_backend_tensor_set_async(split_backend,
+-                            input_cpy,
+-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+-                            // this is necessary for MMQ in the CUDA backend
+-                            expert_size_copy + padding_end);
++                        // MoEStream: the host expert tensor may be a virtual arena where the neighbouring expert's
++                        // pages are unmapped, so the padding is zero-filled instead of read from the source.
++                        static const std::vector<uint8_t> zero_pad(512, 0);
++
++                        // MoEStream: the host arena registers each expert slot separately, so a copy must not span slots
++                        for (int32_t e = first_id; e <= last_id; ++e) {
++                            ggml_backend_tensor_set_async(split_backend,
++                                input_cpy,
++                                (const uint8_t *)input->data + (size_t)e * expert_size, (size_t)e * expert_size,
++                                expert_size);
++                        }
++                        if (padding_end > 0) {
++                            // zeros after the last expert so MMQ never reads NaN padding
++                            ggml_backend_tensor_set_async(split_backend, input_cpy, zero_pad.data(),
++                                                          expert_offset + expert_size_copy, padding_end);
++                        }
+                     };
+ 
+                     int id = 0;
+-                    while (!ggml_bitset_get(used_ids.data(), id)) {
++                    while (id < n_expert && !ggml_bitset_get(used_ids.data(), id)) {
+                         id++;
++                    }
++                    if (id >= n_expert) {
++                        continue;
+                     }
+                     int32_t first_id = id;
+                     int32_t last_id = first_id;
