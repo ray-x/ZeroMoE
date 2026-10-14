@@ -217,6 +217,12 @@ ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_cont(ctx, ggml_view_3d(ctx, conv_in, g.d_conv - 1, 3 * g.d_inner, 1,
                                   conv_in->nb[1], conv_in->nb[2],
                                   ggml_row_size(conv_in->type, g.S)));
+  // The exported state/history tensors are otherwise expanded into the graph only at its end, which keeps the
+  // layer's conv input and scan output (both scale with S) live for the whole graph; schedule the copies here.
+  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_EARLY_STATE_EXPORT"); !(e && e[0] == '0')) {
+    ggml_build_forward_expand(g.graph, *hist_out);
+    ggml_build_forward_expand(g.graph, *state_out);
+  }
   (void)layer;
   return out;
 }

@@ -943,6 +943,68 @@ bool build_graph(FullGraph &g) {
       }
     }
   }
+  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_WS_DUMP")) {
+    // Debug: intermediate-tensor liveness over graph order; prints the live-set peak and its largest members.
+    const int n = ggml_graph_n_nodes(g.graph);
+    std::unordered_map<const ggml_tensor *, int> idx;
+    for (int i = 0; i < n; ++i) idx[ggml_graph_node(g.graph, i)] = i;
+    std::vector<int> last(n, -1);
+    for (int i = 0; i < n; ++i) {
+      ggml_tensor *t = ggml_graph_node(g.graph, i);
+      for (int s = 0; s < GGML_MAX_SRC; ++s) {
+        const ggml_tensor *src = t->src[s];
+        while (src && src->view_src) src = src->view_src;
+        if (!src) continue;
+        auto it = idx.find(src);
+        if (it != idx.end()) last[it->second] = std::max(last[it->second], i);
+      }
+      const ggml_tensor *v = t;
+      while (v->view_src) v = v->view_src;
+      if (v != t) { auto it = idx.find(v); if (it != idx.end()) last[it->second] = std::max(last[it->second], i); }
+    }
+    size_t live = 0, peak = 0; int peak_i = 0;
+    std::vector<std::pair<int, size_t>> ends;
+    for (int i = 0; i < n; ++i) {
+      ggml_tensor *t = ggml_graph_node(g.graph, i);
+      if (!t->view_src) { live += ggml_nbytes(t); }
+      if (live > peak) { peak = live; peak_i = i; }
+      for (int j = 0; j <= i; ++j) {}
+      // release tensors whose last use is i
+      (void)ends;
+    }
+    // second pass with releases (kept separate for clarity)
+    live = 0; peak = 0; peak_i = 0;
+    std::vector<std::vector<int>> rel(n + 1);
+    for (int i = 0; i < n; ++i) rel[std::max(last[i], i)].push_back(i);
+    for (int i = 0; i < n; ++i) {
+      ggml_tensor *t = ggml_graph_node(g.graph, i);
+      if (!t->view_src) live += ggml_nbytes(t);
+      if (live > peak) { peak = live; peak_i = i; }
+      for (int r : rel[i]) { const ggml_tensor *rt = ggml_graph_node(g.graph, r); if (!rt->view_src) live -= ggml_nbytes(rt); }
+    }
+    std::vector<std::pair<size_t, int>> members;
+    for (int i = 0; i <= peak_i; ++i) {
+      const ggml_tensor *t = ggml_graph_node(g.graph, i);
+      if (!t->view_src && std::max(last[i], i) >= peak_i) members.push_back({ggml_nbytes(t), i});
+    }
+    std::sort(members.rbegin(), members.rend());
+    LOG_INFO("[WS-DUMP] nodes=%d live-set peak=%.1f MiB at node %d (%s)\n", n, peak / 1048576.0, peak_i,
+             ggml_get_name(ggml_graph_node(g.graph, peak_i)));
+    for (size_t k = 0; k < members.size() && k < 15; ++k) {
+      const ggml_tensor *t = ggml_graph_node(g.graph, members[k].second);
+      LOG_INFO("[WS-DUMP]   %8.1f MiB  %-12s %-5s ne=%lld,%lld,%lld,%lld %s (node %d..%d)\n", members[k].first / 1048576.0,
+               ggml_op_name(t->op), ggml_type_name(t->type), (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2],
+               (long long)t->ne[3], ggml_get_name(t), members[k].second, last[members[k].second]);
+    }
+    // per-op totals of the largest single tensors across the whole graph
+    std::vector<std::pair<size_t, int>> all;
+    for (int i = 0; i < n; ++i) if (!ggml_graph_node(g.graph, i)->view_src) all.push_back({ggml_nbytes(ggml_graph_node(g.graph, i)), i});
+    std::sort(all.rbegin(), all.rend());
+    for (size_t k = 0; k < all.size() && k < 12; ++k) {
+      const ggml_tensor *t = ggml_graph_node(g.graph, all[k].second);
+      LOG_INFO("[WS-DUMP] biggest %8.1f MiB %-12s %-5s %s\n", all[k].first / 1048576.0, ggml_op_name(t->op), ggml_type_name(t->type), ggml_get_name(t));
+    }
+  }
   LOG_INFO("[GGML-GLM5NEXT-FULL] graph built layers=%d nodes=%d splits=%d "
            "workspace=%.2f GiB KDA=%zu DSA=%zu route_snapshots=%zu\n",
            g.n_layers, ggml_graph_n_nodes(g.graph),
