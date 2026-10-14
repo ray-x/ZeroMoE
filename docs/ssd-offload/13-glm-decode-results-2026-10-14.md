@@ -246,3 +246,23 @@ through the cold branch and were read inline, ~58 per layer. The read-ahead skip
 Fixed (`not_cold` = 3090 hot set only for batched graphs): dual **96.9 tok/s**, 3090 only **118.9**, greedy tokens identical
 between the two. The remaining 1.5 s is the PCIe copy of the extra ~15 GiB of experts the 5060 Ti would serve in decode.
 llama.cpp `-ncmoe 41 -ub 4096` on the same prompt: 104 tok/s.
+
+### Prefill: two-link split and speculative expert prefetch (2026-10-15, dual GPU, 805 tokens, tokens identical)
+
+Both are opt-in and **off by default** because neither beats the plain graph prefill (159 tok/s, 5.05 s).
+
+| config | prefill | note |
+|---|---|---|
+| plain graph prefill (recipe) | 159.3 tok/s (5.05 s) | reference |
+| `PREFILL_SPLIT=0.63` (37% of cold experts computed on the 5060 Ti) | 157.8 | both PCIe links copy concurrently (verified with nsys), wall time unchanged |
+| `PREFILL_PREFETCH=1`, 2 sets, pool 15.0 GiB | 155.8 | copies are complete before the layer needs them (wait 0 ms) |
+| `PREFILL_PREFETCH=1`, 3 sets, chunk 8, pool 14.0 GiB | **164.7 (4.89 s)** | +3.5%, costs 1.8 GiB of the 3090 expert pool |
+
+Findings: the miss node costs 0.2 ms; the layer period of 128-140 ms (layers 3-30; 63-70 ms for layers >= 31) is not copy-bound
+once the copies are prefetched, and the GPU kernels add up to ~26 ms per layer. The host thread sits in `cudaStreamSynchronize`
+for 60-75 ms per layer, behind the activations that cross between the GPUs (no P2P: staged through the host, queued behind the
+weight copies on the single H2D engine; queueing the copies a few experts at a time recovered only part of it). The missing
+~60-100 ms per layer is not attributed yet (nsys under 3 sets runs out of memory on the 3090).
+Code: `src/ggml_glm5next_graph_offload.cpp` (`prefetch_*`), cold-branch in `ggml_glm5next_graph_build.cpp`, scheduler events
+in `patches/ggml/0008-*`. Env: `MOESTREAM_GLM5NEXT_PREFILL_PREFETCH{,_SETS,_CHUNK}`, `PREFILL_SPLIT`, `PREFETCH_DEBUG`.
+Pool resizing after prefill was not built: with `moe_cache_gb = 17.0` the decode graph itself no longer fits (0.23 tok/s).

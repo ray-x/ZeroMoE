@@ -1,3 +1,4 @@
+#include <chrono>
 #include <deque>
 // GLM5Next full graph: SSD-offload routed experts: the ExpertStore-backed miss node and
 // offload weight tensors.
@@ -215,6 +216,318 @@ OffloadState *get_offload(const StreamingEngine &engine,
   return g_offload.get();
 }
 
+namespace {
+
+// ---- speculative expert prefetch for batched prefill ------------------------------------------------------------
+// A 805-token prompt routes to nearly every cold expert of a layer, so the layer's whole cold set can be copied to the GPU
+// before its router has run. The copies of layer L+1 are issued by the miss node of layer L on a dedicated stream (from a
+// worker thread, so pageable host memory cannot stall the graph thread), into one of `sets` device buffer sets, and the
+// miss node of L+1 waits for them. Experts that were not resident yet are copied by the miss node itself once the used
+// ones are known. The cold weights of a layer are a compact [ne0, ne1, n_cold] tensor over the buffers, indexed by the
+// rank of an expert among the layer's cold experts; the miss node rewrites the route ids accordingly.
+struct PrefetchLayer {
+  int layer = 0, set = 0;
+  int split = 0;                // compact slots [0, split) live on part 0, the rest on part 1
+  std::vector<int> experts;     // compact slot -> expert id
+  std::vector<int32_t> rank;    // expert id -> compact slot, -1 if not part of the cold set
+  std::vector<uint8_t> copied;  // per slot: the planes are on the device
+  size_t bytes[3] = {0, 0, 0};
+  bool issued = false;
+  std::future<void> worker;
+};
+
+// One device's share of the buffers: its own copy stream and one event per set.
+struct PrefetchPart {
+  int device = 0;
+  cudaStream_t stream = nullptr;
+  std::vector<cudaEvent_t> events;
+  char *base[4][3] = {};
+  ggml_backend_buffer_t buf[4][3] = {};
+};
+
+struct PrefetchRing {
+  int sets = 2, n_parts = 1;
+  PrefetchPart parts[2];
+  std::map<int, PrefetchLayer> layers;
+};
+
+std::unique_ptr<PrefetchRing> g_ring;
+
+bool prefetch_enabled_env() {
+  static const bool on = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH", 0) != 0;
+  return on;
+}
+
+void prefetch_copy_slot(PrefetchRing &ring, PrefetchLayer &lp, OffloadState &o, size_t k) {
+  const int e = lp.experts[k];
+  const int part = (int)k >= lp.split ? 1 : 0;
+  const size_t local = k - (part ? (size_t)lp.split : 0);
+  PrefetchPart &pp = ring.parts[part];
+  cudaSetDevice(pp.device);
+  for (int p = 0; p < 3; ++p)
+    cudaMemcpyAsync(pp.base[lp.set][p] + local * lp.bytes[p], o.arena->ptr(lp.layer, e, p), lp.bytes[p],
+                    cudaMemcpyHostToDevice, pp.stream);
+  lp.copied[k] = 1;
+}
+
+void prefetch_record(PrefetchRing &ring, const PrefetchLayer &lp) {
+  for (int part = 0; part < ring.n_parts; ++part) {
+    cudaSetDevice(ring.parts[part].device);
+    cudaEventRecord(ring.parts[part].events[(size_t)lp.set], ring.parts[part].stream);
+  }
+}
+
+// Copies every expert of the layer that is already populated, then records the set's events. Runs on a worker thread.
+// The copies are queued a few experts at a time (two chunks in flight per device): a GPU has a single host-to-device copy
+// engine, and the activations that cross between the two GPUs are staged through the host, so they wait behind everything
+// already queued there. Queueing a layer's whole cold set at once delayed them by the full copy time.
+void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
+  static const int chunk = std::max(1, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_CHUNK", 8));
+  struct Chunker {
+    cudaEvent_t ev[2] = {nullptr, nullptr};
+    int n = 0, in_chunk = 0;
+  } ch[2];
+  for (int part = 0; part < ring->n_parts; ++part) {
+    cudaSetDevice(ring->parts[part].device);
+    cudaEventCreateWithFlags(&ch[part].ev[0], cudaEventDisableTiming);
+    cudaEventCreateWithFlags(&ch[part].ev[1], cudaEventDisableTiming);
+  }
+  for (size_t k = 0; k < lp->experts.size(); ++k) {
+    if (lp->copied[k] || !o->residency->data_ready({lp->layer, lp->experts[k]}))
+      continue;
+    const int part = (int)k >= lp->split ? 1 : 0;
+    Chunker &c = ch[part];
+    cudaSetDevice(ring->parts[part].device);
+    if (c.in_chunk == 0 && c.n >= 2)
+      cudaEventSynchronize(c.ev[c.n % 2]);
+    prefetch_copy_slot(*ring, *lp, *o, k);
+    if (++c.in_chunk == chunk) {
+      cudaEventRecord(c.ev[c.n % 2], ring->parts[part].stream);
+      ++c.n;
+      c.in_chunk = 0;
+    }
+  }
+  prefetch_record(*ring, *lp);
+  for (int part = 0; part < ring->n_parts; ++part) {
+    cudaSetDevice(ring->parts[part].device);
+    cudaEventSynchronize(ch[part].ev[0] ? ch[part].ev[0] : nullptr); // recorded or never used: both complete
+    cudaEventDestroy(ch[part].ev[0]);
+    cudaEventDestroy(ch[part].ev[1]);
+  }
+}
+
+// Called by the miss node of `layer` with its route ids (expert ids, negative = inactive): returns once every used expert
+// is on the device, rewrites `ids` to compact slots and launches the copies of the layers after it.
+void prefetch_service(OffloadState &o, int layer, std::vector<int32_t> &ids) {
+  PrefetchRing &ring = *g_ring;
+  PrefetchLayer &lp = ring.layers.at(layer);
+  static const bool dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
+  const auto t0 = std::chrono::steady_clock::now();
+  if (lp.worker.valid())
+    lp.worker.get();
+  const auto t1 = std::chrono::steady_clock::now();
+  std::vector<uint8_t> seen(lp.experts.size(), 0);
+  bool fixed = false;
+  size_t n_fixed = 0, n_copied_before = 0;
+  for (uint8_t c : lp.copied) n_copied_before += c;
+  for (int32_t id : ids) {
+    if (id < 0)
+      continue;
+    const int32_t k = (size_t)id < lp.rank.size() ? lp.rank[(size_t)id] : -1;
+    if (k < 0) {
+      LOG_ERROR("[GGML-GLM5NEXT-PREFETCH] layer %d routed to expert %d outside its cold set\n", layer, id);
+      std::abort();
+    }
+    if (!lp.copied[(size_t)k] && !seen[(size_t)k]) {
+      seen[(size_t)k] = 1;
+      prefetch_copy_slot(ring, lp, o, (size_t)k);
+      fixed = true;
+      ++n_fixed;
+    }
+  }
+  const auto t2 = std::chrono::steady_clock::now();
+  if (lp.issued)
+    for (int part = 0; part < ring.n_parts; ++part)
+      cudaEventSynchronize(ring.parts[part].events[(size_t)lp.set]);
+  if (fixed)
+    for (int part = 0; part < ring.n_parts; ++part)
+      cudaStreamSynchronize(ring.parts[part].stream);
+  if (dbg) {
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    LOG_INFO("[GGML-GLM5NEXT-PREFETCH] layer %d slots=%zu issued=%d copied_before=%zu fixup=%zu worker_wait=%.1f scan=%.1f "
+             "event_wait=%.1f ms\n", layer, lp.experts.size(), (int)lp.issued, n_copied_before, n_fixed, ms(t0, t1),
+             ms(t1, t2), ms(t2, t3));
+  }
+  for (int32_t &id : ids)
+    if (id >= 0)
+      id = lp.rank[(size_t)id];
+  for (int d = 1; d < ring.sets; ++d) {
+    auto it = ring.layers.find(layer + d);
+    if (it == ring.layers.end() || it->second.issued)
+      continue;
+    it->second.issued = true;
+    it->second.worker = std::async(std::launch::async, prefetch_issue, &ring, &it->second, &o);
+  }
+}
+
+// Builds the ring and the per-layer plans for the prompt graph being built (called when its first offload layer is built).
+bool prefetch_prepare(FullGraph &g, OffloadState &o) {
+  g_ring.reset();
+  if (!prefetch_enabled_env() || g.decode_mode || g.S < 64 || !g.cuda)
+    return false;
+  const auto &c = g.engine->model_file.architecture_config;
+  auto ring = std::make_unique<PrefetchRing>();
+  ring->sets = std::max(2, std::min(4, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_SETS", 2)));
+  // The cold experts of a layer are split between the two GPUs in the ratio of their PCIe links (the main GPU's share is
+  // MOESTREAM_GLM5NEXT_PREFILL_SPLIT, default 0.63), so both links copy at once and each GPU needs less buffer.
+  const bool two = g.gpu1 != nullptr;
+  ring->n_parts = two ? 2 : 1;
+  double ratio = 0.63;
+  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_SPLIT"))
+    ratio = std::atof(e);
+  if (ratio <= 0.0 || ratio >= 1.0)
+    ratio = 1.0;
+  if (!two)
+    ratio = 1.0;
+  ring->parts[0].device = g.device;
+  if (two) {
+    int cur = 0;
+    cudaGetDevice(&cur);
+    ring->parts[1].device = 1; // ggml_shared_backend(1): the second visible device
+    (void)cur;
+  }
+  size_t cap[2][4][3] = {};
+  int ordinal = 0;
+  for (int l = o.first; l < c.n_layers; ++l) {
+    const PartialExpertLayer *pl = partial_layer(g, l);
+    if (!pl || pl->cold.empty() || !offload_layer(l))
+      continue;
+    std::vector<uint8_t> skip((size_t)o.n_experts, 0);
+    if (g.gpu1)
+      for (int e : pl->hot1)
+        if (e >= 0 && e < o.n_experts)
+          skip[(size_t)e] = 1;
+    PrefetchLayer lp;
+    lp.layer = l;
+    lp.set = ordinal % ring->sets;
+    lp.rank.assign((size_t)o.n_experts, -1);
+    std::vector<int> cold(pl->cold.begin(), pl->cold.end());
+    std::sort(cold.begin(), cold.end());
+    for (int e : cold)
+      if (e >= 0 && e < o.n_experts && !skip[(size_t)e]) {
+        lp.rank[(size_t)e] = (int32_t)lp.experts.size();
+        lp.experts.push_back(e);
+      }
+    if (lp.experts.empty())
+      continue;
+    const int n = (int)lp.experts.size();
+    lp.split = ratio >= 1.0 ? n : std::max(1, std::min(n - 1, (int)(ratio * n + 0.5)));
+    lp.copied.assign(lp.experts.size(), 0);
+    for (int p = 0; p < 3; ++p) {
+      lp.bytes[p] = (size_t)o.arena->plane_bytes(l, p);
+      cap[0][lp.set][p] = std::max(cap[0][lp.set][p], lp.bytes[p] * (size_t)lp.split);
+      cap[1][lp.set][p] = std::max(cap[1][lp.set][p], lp.bytes[p] * (size_t)(n - lp.split));
+    }
+    ++ordinal;
+    ring->layers.emplace(l, std::move(lp));
+  }
+  if (ring->layers.empty())
+    return false;
+  size_t total[2] = {0, 0};
+  bool ok = true;
+  for (int part = 0; part < ring->n_parts && ok; ++part) {
+    ggml_backend_t be = part == 0 ? g.cuda : g.gpu1;
+    for (int s = 0; s < ring->sets && ok; ++s)
+      for (int p = 0; p < 3; ++p) {
+        if (cap[part][s][p] == 0)
+          continue;
+        ggml_backend_buffer_t buf =
+            ggml_backend_buft_alloc_buffer(ggml_backend_get_default_buffer_type(be), cap[part][s][p] + 4096);
+        if (!buf) {
+          LOG_WARN("[GGML-GLM5NEXT-PREFETCH] device %d: %.2f GiB of buffers do not fit; prefetch off for this prompt\n",
+                   part, (double)(total[part] + cap[part][s][p]) / (1024.0 * 1024.0 * 1024.0));
+          ok = false;
+          break;
+        }
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ring->parts[part].buf[s][p] = buf;
+        ring->parts[part].base[s][p] = (char *)ggml_backend_buffer_get_base(buf);
+        total[part] += cap[part][s][p];
+      }
+  }
+  if (!ok) {
+    for (int part = 0; part < 2; ++part)
+      for (int s = 0; s < 4; ++s)
+        for (int p = 0; p < 3; ++p)
+          if (ring->parts[part].buf[s][p])
+            ggml_backend_buffer_free(ring->parts[part].buf[s][p]);
+    return false;
+  }
+  static cudaStream_t streams[2] = {nullptr, nullptr};
+  static std::vector<cudaEvent_t> events[2];
+  for (int part = 0; part < ring->n_parts; ++part) {
+    cudaSetDevice(ring->parts[part].device);
+    if (!streams[part])
+      cudaStreamCreateWithFlags(&streams[part], cudaStreamNonBlocking);
+    while ((int)events[part].size() < 4) {
+      cudaEvent_t ev = nullptr;
+      cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
+      events[part].push_back(ev);
+    }
+    ring->parts[part].stream = streams[part];
+    ring->parts[part].events = events[part];
+    for (int s = 0; s < ring->sets; ++s)
+      for (int p = 0; p < 3; ++p)
+        if (ring->parts[part].buf[s][p])
+          g.gpu1_buffers.push_back(ring->parts[part].buf[s][p]);
+  }
+  cudaSetDevice(ring->parts[0].device);
+  LOG_INFO("[GGML-GLM5NEXT-PREFETCH] %zu layers, %d sets, buffers %.2f GiB on the main GPU + %.2f GiB on the second\n",
+           ring->layers.size(), ring->sets, (double)total[0] / (1024.0 * 1024.0 * 1024.0),
+           (double)total[1] / (1024.0 * 1024.0 * 1024.0));
+  g_ring = std::move(ring);
+  return true;
+}
+
+} // namespace
+
+bool prefetch_layer_active(int layer) { return g_ring && g_ring->layers.count(layer) != 0; }
+
+int prefetch_layer_slots(int layer, int *split) {
+  if (!prefetch_layer_active(layer))
+    return 0;
+  const PrefetchLayer &lp = g_ring->layers.at(layer);
+  if (split)
+    *split = lp.split;
+  return (int)lp.experts.size();
+}
+
+ggml_tensor *prefetch_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int part) {
+  (void)g;
+  if (!prefetch_layer_active(layer) || part < 0 || part >= g_ring->n_parts)
+    return nullptr;
+  const int plane = std::strcmp(stem, "ffn_gate_exps.weight") == 0   ? 0
+                    : std::strcmp(stem, "ffn_up_exps.weight") == 0   ? 1
+                    : std::strcmp(stem, "ffn_down_exps.weight") == 0 ? 2
+                                                                     : -1;
+  const GGUFTensor *meta = model_tensor(*g.engine, "blk." + std::to_string(layer) + "." + stem);
+  if (plane < 0 || !meta || !type_ok(meta->type) || meta->shape.size() != 3)
+    return nullptr;
+  PrefetchLayer &lp = g_ring->layers.at(layer);
+  const int64_t ne0 = (int64_t)meta->shape[0], ne1 = (int64_t)meta->shape[1];
+  const size_t per_expert = ggml_row_size((ggml_type)meta->type, ne0) * (size_t)ne1;
+  const int count = part == 0 ? lp.split : (int)lp.experts.size() - lp.split;
+  PrefetchPart &pp = g_ring->parts[part];
+  if (per_expert != lp.bytes[plane] || count <= 0 || !pp.buf[lp.set][plane])
+    return nullptr;
+  ggml_tensor *t = new_tensor(ctx, (ggml_type)meta->type, {ne0, ne1, (int64_t)count});
+  if (!t || ggml_backend_tensor_alloc(pp.buf[lp.set][plane], t, pp.base[lp.set][plane]) != GGML_STATUS_SUCCESS)
+    return nullptr;
+  ggml_set_name(t, ("blk." + std::to_string(layer) + "." + stem + ".prefetch" + std::to_string(part)).c_str());
+  return t;
+}
+
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                      void *ud) {
   if (ith != 0)
@@ -292,6 +605,19 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     o.store->report("fatal");
     std::abort();
   }
+  const auto cb_t_ensured = std::chrono::steady_clock::now();
+  if (site->prefetch && g_ring)
+    prefetch_service(o, site->layer, ids);
+  static const bool cb_dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
+  if (cb_dbg && site->prefill) {
+    static auto last_cb = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    LOG_INFO("[GGML-GLM5NEXT-MISSCB] layer %d period=%.1f ensure=%.1f service=%.1f ms\n", site->layer,
+             last_cb.time_since_epoch().count() ? ms(last_cb, cb_t0) : 0.0, ms(cb_t0, cb_t_ensured),
+             ms(cb_t_ensured, now));
+    last_cb = now;
+  }
   // dst has the shape of `a` but is contiguous.
   std::memcpy(dst->data, ids.data(), ids.size() * sizeof(int32_t));
   o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -349,7 +675,10 @@ ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer,
   if (!o || !ids)
     return nullptr;
   std::lock_guard<std::mutex> lock(g_offload_mutex);
+  if (g.S >= 64 && !g.decode_mode && layer == o->first)
+    prefetch_prepare(g, *o);
   o->sites.push_back({o, layer, g.S > 1, g.S, {}});
+  o->sites.back().prefetch = prefetch_layer_active(layer);
   if (const PartialExpertLayer *pl = partial_layer(g, layer)) {
     o->sites.back().not_cold.assign((size_t)o->n_experts, 0);
     // hot1 (GPU1) experts are served by GPU1 whenever the graph has the second backend (decode, and batched prefill when GPU1 is enabled there).

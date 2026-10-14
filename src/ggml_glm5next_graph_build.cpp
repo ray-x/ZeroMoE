@@ -554,6 +554,47 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
               ggml_tensor *lo = part(0, split_at, 0, nullptr);
               return hi && lo ? ggml_add(ctx, hi, lo) : nullptr;
             }
+            if (prefetch_layer_active(layer)) {
+              // Prefetched compact weights; in.ids already hold compact slots (the miss node rewrote them). The slots
+              // are split between the two GPUs: part 1 (second GPU) first, so its copies are already in flight.
+              int split = 0;
+              const int n_slots = prefetch_layer_slots(layer, &split);
+              ggml_tensor *out_part[2] = {nullptr, nullptr};
+              ggml_tensor *pid[2], *pmask[2];
+              for (int h = 0; h < 2; ++h) {
+                pid[h] = pmask[h] = nullptr;
+                if (h == 1 && split >= n_slots)
+                  continue;
+                if (split >= n_slots) {
+                  pid[h] = in.ids;
+                  pmask[h] = nullptr;
+                } else {
+                  pid[h] = cold_split_node(ctx, in.ids, split, h);
+                  pmask[h] = ggml_cast(ctx, cold_split_node(ctx, in.ids, split, h + 2), GGML_TYPE_F32);
+                  if (!pid[h] || !pmask[h])
+                    return nullptr;
+                  ggml_build_forward_expand(g.graph, pid[h]);
+                  ggml_build_forward_expand(g.graph, pmask[h]);
+                }
+              }
+              for (int h = 1; h >= 0; --h) {
+                if (!pid[h])
+                  continue;
+                ggml_tensor *pg = prefetch_weight(g, ctx, layer, "ffn_gate_exps.weight", h);
+                ggml_tensor *pu = prefetch_weight(g, ctx, layer, "ffn_up_exps.weight", h);
+                ggml_tensor *pd = prefetch_weight(g, ctx, layer, "ffn_down_exps.weight", h);
+                if (!pg || !pu || !pd)
+                  return nullptr;
+                ggml_tensor *w = pmask[h] ? ggml_mul(ctx, in.weights, ggml_reshape_3d(ctx, pmask[h], 1, c.topk, g.S))
+                                          : in.weights;
+                out_part[h] = run_branch(nullptr, pg, pu, pd, pid[h], w);
+                if (!out_part[h])
+                  return nullptr;
+              }
+              if (out_part[0] && out_part[1])
+                return ggml_add(ctx, out_part[1], out_part[0]);
+              return out_part[0] ? out_part[0] : out_part[1];
+            }
             return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
           });
     }

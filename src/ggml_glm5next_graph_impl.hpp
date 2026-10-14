@@ -106,6 +106,12 @@ OffloadState *get_offload(const StreamingEngine &engine, const std::vector<Parti
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud);
 ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
 ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer, ggml_tensor *ids);
+// Prefill speculative prefetch (MOESTREAM_GLM5NEXT_PREFILL_PREFETCH=1): device-resident, compact cold-expert weights of a
+// layer, filled ahead of the layer by a copy stream. Null when the layer is not prefetched.
+bool prefetch_layer_active(int layer);
+ggml_tensor *prefetch_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int part);
+// Number of compact cold slots of the layer (0 = not prefetched); *split = slots held by part 0, the rest by part 1.
+int prefetch_layer_slots(int layer, int *split);
 // Host node over [topk, S] I32 route ids. mode 0/1: ids of experts below / at-or-above `split_at` (the upper half
 // re-based to 0, everything else -1). mode 2/3: 1 where mode 0/1 holds a real id, else 0.
 ggml_tensor *cold_split_node(ggml_context *ctx, ggml_tensor *ids, int split_at, int mode);
@@ -222,6 +228,9 @@ struct OffloadSite {
   int n_tokens = 1;
   // experts of this layer served by a VRAM branch (hot / hot1): never routed to the cold branch, so never read ahead
   std::vector<uint8_t> not_cold;
+  // The layer's cold experts are prefetched into device buffers (see prefetch_*): the miss node waits for the copy and
+  // rewrites the route ids to compact slot indices.
+  bool prefetch = false;
 };
 
 // The GLM graph's view of the DDR expert tier: the tier itself is
