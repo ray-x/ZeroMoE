@@ -85,3 +85,14 @@ Kernels: with the 5060 Ti busy ~3 ms/token, kernel tuning there cannot move the 
 Pin layout: assist copies run at the PCIe limits (3090 ~12 GB/s per 2 MB plane copy, 5060 Ti 6.9 GB/s), planes are separate regions,
 three copies per expert; no layout change was found that helps. Communication: cross-GPU hop removal is real (-6 ms of trunk wait) but is
 paid back by lane compute because the 5060 Ti's set then matches the hot experts worse.
+
+### Prestage: root cause of the stall, and why it still does not pay (same day, branch `assist-prestage-experiment`)
+- **Stall cause (found):** layers that have a second-GPU branch do cross-GPU peer copies (hidden to the 5060 Ti and back) inside their
+  trunk. The staged expert DMA (1-1.6 ms per layer) occupies the same copy engines/PCIe path, so those small copies queue behind it:
+  between-lane host time went 10.2 -> 38.0 ms/token (+0.67 ms per layer). Not the LM head after the arena fix, not `cudaFree` (those
+  are the legacy prefill), not `CUDA_DEVICE_MAX_CONNECTIONS`, and not the order of the lane's output upload.
+- **Mitigation:** prestage only layers without a second-GPU branch (layer-split layout): gap back to 8.1 ms, 70.1 ms vs 64.5 ms base.
+- **Why no gain:** with 61% of assisted experts pre-staged, lane compute did not fall (42.7 vs 41.4 ms): the in-window copies are not
+  the straggler, the CPU graph is. Letting staged hits assist on top of the normal share moves time back to the assist join
+  (compute 46-49 ms, 74 ms/token). The lane is on a balanced plateau; prestage cannot shift it.
+- Net: no measured improvement in 5060 Ti efficiency from layout, prestage or kernels; the experiments and tools stay on the branch.
