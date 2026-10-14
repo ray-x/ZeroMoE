@@ -116,3 +116,9 @@ trace_abort_if_nan("MY-TAG", contains_nan);
 ### Parallelism & Threading
 * **Nested OpenMP Regions:** Never call functions containing internal `#pragma omp parallel` loops from inside an outer parallel region. MoEStream runs with nested OMP disabled; nested parallel regions execute sequentially while paying thread-team spawn and barrier overhead.
 * **Batch Size Parallelism Splitting:** Parallelize across heads/experts in single outer `#pragma omp parallel for` loops. Avoid spawning OMP parallel regions inside per-token loops for $S=1$ decode steps.
+
+---
+
+## 7. Commit Rules
+
+* **No `Co-Authored-By` trailers** (and no "Generated with Claude Code" lines) in commit messages or PR descriptions. Commits carry the author's identity only.
