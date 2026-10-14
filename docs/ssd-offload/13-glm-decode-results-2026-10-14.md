@@ -298,3 +298,25 @@ the compute chain itself. With a thread per GPU the copies of a layer take 86 ms
 the layer period of layers 4-30 is still 118 ms (65 ms for layers >= 31, whose copies take 24 ms): the miss node no longer waits
 for copies, the host waits ~77 ms per layer for the GPU chain (attention, router, cold experts on both GPUs, activations crossing
 the host). That chain, not the links, is what is left.
+
+### Prefill: expert sum on the expert GPU, early first layer: 178.8 -> 251 tok/s (2026-10-15)
+
+Per-split timing (`MOESTREAM_SCHED_TRACE2` + `MOESTREAM_SCHED_SERIAL`, env-gated instrumentation in the ggml fork) showed the
+layer chain was dominated by two cross-GPU hops through the host: the activation to the 5060 Ti (13 MB, 25 ms) and the
+**unreduced** `MUL_MAT_ID` output coming back (`[D, topk, S]` = 105 MB, 56 ms). The weighting by the route weights and the sum over
+the routed experts were placed on the 3090 by the scheduler. Pinning those two nodes to the expert GPU
+(`run_branch(..., pin_be)`, prefill graphs only; `MOESTREAM_GLM5NEXT_PIN_BRANCH_SUM=0` disables) sends the 13 MB sum instead:
+
+| 805 tokens, dual GPU, tokens identical | prefill |
+|---|---|
+| copy thread per GPU, drain (previous) | 178.8 tok/s (4.50 s) |
+| + weighting and sum on the expert GPU | 244.9 (3.29 s) |
+| + first offload layer's copies start at graph prepare | **251.3 (3.20 s)** |
+
+Pinning the same nodes in the decode graph costs ~1% decode (74.9 -> 75.8 ms/token over tokens 16-96), so decode is unchanged.
+Layers 4-30 now take 85 ms each = the 1.55 GiB of cold experts of a layer over the two links (84 ms issue time, 19.8 GB/s):
+at the PCIe limit. Layers >= 31 take 45 ms for a 24 ms copy; the rest is startup (~0.35 s). 805 tokens move ~43 GB, so the copy
+floor is ~2.3 s; the measured 3.20 s is within 1.4x of it.
+
+Not fixed (separate): a 1610-token prompt prefills at 29.8 tok/s with prefetch on or off, identical tokens: only the first
+chunk of a long prompt (`pos_base == 0`) takes the graph, later chunks use the legacy path.
