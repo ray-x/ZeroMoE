@@ -157,24 +157,41 @@ OffloadState *get_offload(const StreamingEngine &engine,
         usage, o->first, o->n_layers, o->n_experts);
     if (partial) {
       // Experts that live in VRAM are served by the GPU branch; do not spend DDR on them.
-      std::vector<std::vector<uint8_t>> hot((size_t)c.n_layers);
+      // GPU1-hot experts are served by the GPU1 branch in decode, but a batched prefill graph has no such
+      // branch and runs them as cold experts. Seed them last so they only take DDR that the rest leave free
+      // (otherwise prefill reads them from the SSD, ~0.7 s inline plus ~6 s of background reads at 805 tokens).
+      const bool seed_hot1 = offload_env("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD", "0") == "1" &&
+                             offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_SEED_GPU1_HOT", "1") == "1";
+      std::vector<std::vector<uint8_t>> hot((size_t)c.n_layers), hot1((size_t)c.n_layers);
       size_t n_hot = 0;
       for (size_t l = 0; l < partial->size() && l < hot.size(); ++l) {
         hot[l].assign((size_t)o->n_experts, 0);
-        for (const std::vector<int> *set : {&(*partial)[l].hot, &(*partial)[l].hot1})
-          for (int e : *set)
-            if (e >= 0 && e < o->n_experts) {
-              hot[l][(size_t)e] = 1;
-              ++n_hot;
-            }
+        hot1[l].assign((size_t)o->n_experts, 0);
+        for (int e : (*partial)[l].hot)
+          if (e >= 0 && e < o->n_experts) {
+            hot[l][(size_t)e] = 1;
+            ++n_hot;
+          }
+        for (int e : (*partial)[l].hot1)
+          if (e >= 0 && e < o->n_experts) {
+            (seed_hot1 ? hot1 : hot)[l][(size_t)e] = 1;
+            if (!seed_hot1) ++n_hot;
+          }
       }
+      const auto in_set = [](const std::vector<std::vector<uint8_t>> &m, const moestream::offload::ExpertKey &k) {
+        return (size_t)k.layer < m.size() && !m[(size_t)k.layer].empty() && m[(size_t)k.layer][(size_t)k.expert];
+      };
+      std::vector<moestream::offload::ExpertKey> late;
       ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
                                   [&](const moestream::offload::ExpertKey &k) {
-                                    return (size_t)k.layer < hot.size() &&
-                                           !hot[(size_t)k.layer].empty() &&
-                                           hot[(size_t)k.layer][(size_t)k.expert];
+                                    if (in_set(hot1, k)) {
+                                      late.push_back(k);
+                                      return true;
+                                    }
+                                    return in_set(hot, k);
                                   }),
                    ranked.end());
+      ranked.insert(ranked.end(), late.begin(), late.end());
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] excluded %zu VRAM-hot experts from the "
                "DDR seed\n", n_hot);
     }
