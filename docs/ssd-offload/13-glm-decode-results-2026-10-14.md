@@ -1,6 +1,6 @@
 # GLM-5.3-Flash decode performance: results record (2026-10-14)
 
-Box: Xeon W-2235 (6C/12T, Cascade Lake, AVX-512 VNNI), 125 GB DDR4, RTX 3090 (PCIe4 x16) + RTX 5060 Ti (PCIe3 x8).
+Box: Xeon W-2235 (6C/12T, Cascade Lake, AVX-512 VNNI), 125 GB DDR4, RTX 3090 (PCIe Gen3 x16, ~12.2 GB/s host->device) + RTX 5060 Ti (PCIe Gen3 x8, ~6.9 GB/s); the W-2235 platform is PCIe 3.0 only, so the 3090 never runs Gen4.
 Model: GLM-5.3-Flash AJ-IQ2_XXS (87 GB), experts offloaded (SSD -> DDR pool -> VRAM hot sets), full-graph decode.
 Branch `graph-framework` (master fast-forwarded to `1842a5c`).
 
@@ -112,3 +112,10 @@ are 3090-only (no hop; trunk wait 21.5 -> 19.0 ms/token) and layers 31-44 are 50
 (lane compute 37.7 -> 41.7 ms). The trade is neutral for in-domain text and positive for out-of-domain text, whose routes are less
 concentrated. Shipped: `MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=31` (default in `bench/glm_recipe_env.sh`), the 3090 ranking with layers >= 31
 zeroed (`glm53flash_usage_base_plus_decode100_3090_lt31.txt`) and `pin_global_floor_per_layer = 0` in the shipped config.
+
+### Pin layout / PCIe links (2026-10-14, `nvidia-smi` + a standalone copy microbenchmark)
+Both links negotiate PCIe **Gen3** (`pcie.link.gen.max = 3`; 3090 x16, 5060 Ti x8); the Xeon W-2235 has no Gen4. Host->device copies of
+2.16 MB expert planes from 2 GiB of buffers: 12.2 GB/s on the 3090 and 6.9 GB/s on the 5060 Ti for every host layout tried
+(`cudaMallocHost`, anonymous 4 KiB pages + `cudaHostRegister`, 2 MiB THP + register, randomly scattered 4 KiB pages + register),
+i.e. the copy rate is the link limit and the arena's page layout / pinning method cannot improve it. Earlier notes that call the 3090
+"PCIe4" are wrong; the assist copies were already running at the Gen3 x16 limit.
