@@ -366,7 +366,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   const auto run_branch = [&](ggml_tensor *branch_gate_up,
                               ggml_tensor *branch_gate, ggml_tensor *branch_up,
                               ggml_tensor *branch_down, ggml_tensor *branch_ids,
-                              ggml_tensor *branch_weights) -> ggml_tensor * {
+                              ggml_tensor *branch_weights,
+                              ggml_backend_t pin_be = nullptr) -> ggml_tensor * {
     if (!branch_down || !branch_ids || !branch_weights ||
         (!branch_gate_up && (!branch_gate || !branch_up)))
       return nullptr;
@@ -380,7 +381,15 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     const moe_routed::FfnNodes ffn = moe_routed::expert_ffn(
         ctx, ew, input3, branch_ids, clamp, swiglu_clamp_fused());
     ggml_tensor *experts = ggml_mul(ctx, ffn.down, branch_weights);
-    return moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
+    ggml_tensor *summed = moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
+    // The weighting and the sum over the routed experts stay on the GPU that ran the experts: left to the scheduler they ran
+    // on the main GPU, so the unreduced [D, topk, S] result (105 MB for 805 tokens) crossed between the GPUs through the host
+    // (56 ms per layer) instead of the [D, S] sum (13 MB).
+    if (pin_be && g.sched) {
+      ggml_backend_sched_set_tensor_backend(g.sched, experts, pin_be);
+      ggml_backend_sched_set_tensor_backend(g.sched, summed, pin_be);
+    }
+    return summed;
   };
 
   // Shared expert FFN output (nullptr when the layer has none). With a CPU lane it is built and
@@ -548,7 +557,12 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                   ggml_backend_sched_set_tensor_backend(g.sched, ffn.down, be);
                 }
                 ggml_tensor *experts = ggml_mul(ctx, ffn.down, weights_of(id_mode + 2));
-                return moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
+                ggml_tensor *summed = moe_routed::sum_topk(ctx, experts, g.D, g.S, c.topk);
+                if (be && g.sched) {
+                  ggml_backend_sched_set_tensor_backend(g.sched, experts, be);
+                  ggml_backend_sched_set_tensor_backend(g.sched, summed, be);
+                }
+                return summed;
               };
               ggml_tensor *hi = part(split_at, n_exp - split_at, 1, g.gpu1);
               ggml_tensor *lo = part(0, split_at, 0, nullptr);
@@ -587,7 +601,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                   return nullptr;
                 ggml_tensor *w = pmask[h] ? ggml_mul(ctx, in.weights, ggml_reshape_3d(ctx, pmask[h], 1, c.topk, g.S))
                                           : in.weights;
-                out_part[h] = run_branch(nullptr, pg, pu, pd, pid[h], w);
+                out_part[h] = run_branch(nullptr, pg, pu, pd, pid[h], w, h == 1 ? g.gpu1 : nullptr);
                 if (!out_part[h])
                   return nullptr;
               }
@@ -608,7 +622,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       const moe_partial::BranchInputs in1 =
           moe_partial::make_branch_inputs(ctx, m1, k1, route_ids, weights, c.topk, g.S);
       ggml_tensor *b1 = run_branch(nullptr, partial->hot1_gate, partial->hot1_up,
-                                   partial->hot1_down, in1.ids, in1.weights);
+                                   partial->hot1_down, in1.ids, in1.weights, g.gpu1);
       if (!b1)
         return nullptr;
       out = ggml_add(ctx, out, b1);
