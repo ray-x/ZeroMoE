@@ -198,3 +198,21 @@ miss node `MAP_CUSTOM1` 8.7 s (store/DDR -> arena), rest < 1.5 s; total 16.8 s v
 Needs ~1.7 GiB workspace, so it was run with `moe_cache_gb = 14.0` (the cache otherwise leaves 1.2 GiB free).
 Open: release/shrink the cache for the prefill (as the Qwen path releases its arena before prefill), overlap the
 miss-node load of layer L+1 with layer L compute, or read experts straight from the model mapping.
+
+### Read-ahead of transient experts: 47.8 -> 98 tok/s prefill (805 tokens, greedy tokens identical)
+
+The miss node used to load a layer's cold experts on the compute path (8.7 s of 16.8 s). Now a background thread reads the
+next `MOESTREAM_GLM5NEXT_PREFILL_AHEAD` (default 2) layers' non-cached experts while the GPU computes the current one
+(`ExpertResidency::prefetch_transient`). Per run (3090, 58 GiB DDR pool, `moe_cache_gb = 14.0`, prefill graph + op-offload):
+
+| | prefill |
+|---|---|
+| CPU cold experts | 20.2 tok/s |
+| GPU cold experts (miss node loads inline), 32 GiB pool | 47.8 |
+| + read-ahead, 32 GiB pool | 74.3 |
+| + read-ahead, 58 GiB pool | **98-99** (8.1-8.2 s) |
+| + registering transient experts for DMA (`MOESTREAM_OFFLOAD_PIN_TRANSIENT=1`) | 87.5 (worse; off) |
+| llama.cpp `-ncmoe 41 -ub 4096` | 104 |
+
+AHEAD=4 and TRANSIENT_PAR=16 gave no change (72-73 at the 32 GiB pool). Needs ~1.7 GiB of free VRAM for the workspace and
+expert copy buffers, hence the smaller cache; releasing/shrinking the cache for the prefill only is still open.

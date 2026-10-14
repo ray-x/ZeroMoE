@@ -117,6 +117,10 @@ class ExpertStore {
     return residency_->ensure_transient(layer, ids, n);
   }
 
+  // Prefill read-ahead of one layer (see ExpertResidency::prefetch_transient). No arena lock: prefill has no readers
+  // and the reads only touch slots of `layer`.
+  int prefetch_transient(int layer) { return residency_->prefetch_transient(layer); }
+
   // Shared access to arena slots (a worker reading experts another thread may
   // evict). Hold it for the whole read.
   std::shared_lock<std::shared_mutex> reader_lock() {
@@ -251,6 +255,11 @@ class ExpertStore {
           pin_expert(l, x);
       };
       arena_->before_evict = [this](int l, int x) { unpin_expert(l, x); };
+      // Prefill-transient experts are registered by the read-ahead thread (off the critical path) so their host-to-device
+      // copy skips the driver's pageable bounce buffer; unregistered on evict. Opt-in (MOESTREAM_OFFLOAD_PIN_TRANSIENT=1):
+      // measured 87.5 tok/s with vs 99.0 without on the 805-token prompt (registration cost outweighs the faster copy).
+      if (const char *e = std::getenv("MOESTREAM_OFFLOAD_PIN_TRANSIENT"); e && e[0] == '1')
+        arena_->after_transient = [this](int l, int x) { pin_expert(l, x); };
     }
     return true;
   }

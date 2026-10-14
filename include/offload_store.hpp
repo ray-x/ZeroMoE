@@ -481,7 +481,10 @@ public:
   // Optional integration hooks (e.g. pinning the slot for DMA): after_populate runs once an expert's planes hold valid data,
   // before_evict runs right before its pages are returned to the OS.
   std::function<void(int, int)> after_populate, before_evict;
+  // Runs for a prefill-transient expert once its planes are valid (the read-ahead thread registers it for DMA there).
+  std::function<void(int, int)> after_transient;
   void populated(int layer, int expert) { if (after_populate) after_populate(layer, expert); }
+  void transient_populated(int layer, int expert) { if (after_transient) after_transient(layer, expert); }
   // Return one expert's pages to the OS; the slot reads as zeros until it is populated again.
   void evict(int layer, int expert) {
     if (before_evict) before_evict(layer, expert);
@@ -686,34 +689,75 @@ public:
   // next ensure_transient() call, i.e. when the following layer starts.
   Ensure ensure_transient(int layer, const int32_t *ids, int n) {
     Ensure r;
-    for (const ExpertKey &k : transient_) arena_.evict(k.layer, k.expert);
-    transient_.clear();
     std::vector<int> to_load;
-    for (int i = 0; i < n; ++i) {
-      if (ids[i] < 0) continue;
-      const ExpertKey key{layer, ids[i]};
-      if (cache_.resident(key)) continue;
-      bool dup = false;
-      for (const ExpertKey &t : transient_) if (t.layer == key.layer && t.expert == key.expert) { dup = true; break; }
-      if (dup) continue;
-      ++r.misses;
-      transient_.push_back(key);
-      to_load.push_back(ids[i]);
+    {
+      // Earlier layers' transient experts are dropped; later layers' (read ahead by prefetch_transient) are kept.
+      std::lock_guard<std::mutex> g(transient_mu_);
+      std::vector<ExpertKey> keep;
+      for (const ExpertKey &k : transient_) {
+        if (k.layer < layer) arena_.evict(k.layer, k.expert);
+        else keep.push_back(k);
+      }
+      transient_.swap(keep);
+      std::unordered_set<int> have;
+      for (const ExpertKey &t : transient_) if (t.layer == layer) have.insert(t.expert);
+      for (int i = 0; i < n; ++i) {
+        if (ids[i] < 0) continue;
+        const ExpertKey key{layer, ids[i]};
+        if (cache_.resident(key)) continue;
+        if (!have.insert(ids[i]).second) continue;
+        ++r.misses;
+        transient_.push_back(key);
+        to_load.push_back(ids[i]);
+      }
     }
-    // A prompt batch touches most experts of the layer: read them `par` at a time so a store striped over
-    // several drives is read by all of them at once (MOESTREAM_OFFLOAD_TRANSIENT_PAR, default 8, 1 = serial).
+    const auto t0 = std::chrono::steady_clock::now();
+    load_transient(layer, to_load, r);
+    r.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return r;
+  }
+
+  // Prefill read-ahead: load every expert of `layer` that is neither cached nor already transient (a prompt batch touches
+  // nearly all of them). Safe to run on another thread while ensure_transient() works on an earlier layer. Returns the
+  // number of experts that failed to load (they are forgotten, so ensure_transient() retries them).
+  int prefetch_transient(int layer) {
+    std::vector<int> to_load;
+    {
+      std::lock_guard<std::mutex> g(transient_mu_);
+      std::unordered_set<int> have;
+      for (const ExpertKey &t : transient_) if (t.layer == layer) have.insert(t.expert);
+      const int n_exp = cache_.config().n_experts;
+      for (int e = 0; e < n_exp; ++e) {
+        const ExpertKey key{layer, e};
+        if (cache_.resident(key) || have.count(e)) continue;
+        transient_.push_back(key);
+        to_load.push_back(e);
+      }
+    }
+    Ensure r;
+    load_transient(layer, to_load, r);
+    return r.errors;
+  }
+
+  // Read `experts` of `layer` `par` at a time (MOESTREAM_OFFLOAD_TRANSIENT_PAR, default 8, 1 = serial) so a store striped
+  // over several drives is read by all of them at once.
+  void load_transient(int layer, const std::vector<int> &to_load, Ensure &r) {
     static const size_t par = [] {
       const char *e = std::getenv("MOESTREAM_OFFLOAD_TRANSIENT_PAR");
       return static_cast<size_t>(e ? std::max(1, std::atoi(e)) : 8);
     }();
-    const auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < to_load.size(); i += par) {
       const std::vector<int> chunk(to_load.begin() + static_cast<std::ptrdiff_t>(i),
                                    to_load.begin() + static_cast<std::ptrdiff_t>(std::min(to_load.size(), i + par)));
-      for (char ok : load_many(layer, chunk)) { if (ok) ++r.loads; else ++r.errors; }
+      const std::vector<char> ok = load_many(layer, chunk);
+      for (size_t k = 0; k < chunk.size(); ++k) {
+        if (ok[k]) { arena_.transient_populated(layer, chunk[k]); ++r.loads; continue; }
+        ++r.errors;
+        std::lock_guard<std::mutex> g(transient_mu_);
+        for (size_t j = 0; j < transient_.size(); ++j)
+          if (transient_[j].layer == layer && transient_[j].expert == chunk[k]) { transient_.erase(transient_.begin() + static_cast<std::ptrdiff_t>(j)); break; }
+      }
     }
-    r.load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    return r;
   }
 
   // Fill an expert's three planes from the first source that has it.
@@ -778,6 +822,7 @@ private:
   VirtualArena &arena_;
   std::vector<ExpertSource *> sources_;
   std::vector<ExpertKey> transient_;
+  mutable std::mutex transient_mu_;   // guards transient_ (prefetch_transient runs on another thread)
   mutable std::mutex ld_mu_;          // leaf lock: never held while taking another lock
   std::condition_variable ld_cv_;
   std::unordered_set<uint64_t> loading_, deferred_;

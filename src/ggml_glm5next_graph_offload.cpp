@@ -4,6 +4,8 @@
 // Split out of the former single-file ggml_glm5next_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
+#include <future>
+#include <map>
 #include "ggml_glm5next_graph_impl.hpp"
 
 #include <filesystem>
@@ -217,7 +219,31 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                  (long long)a->ne[1], k);
   moestream::offload::ExpertResidency::Ensure r;
   if (site->prefill) {
+    // Experts are read ahead (MOESTREAM_GLM5NEXT_PREFILL_AHEAD layers, default 2) while the GPU computes the layers
+    // before this one; MOESTREAM_GLM5NEXT_PREFILL_AHEAD=0 loads each layer on the miss node, as before.
+    static const int ahead = [] {
+      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_AHEAD");
+      return e ? std::max(0, std::atoi(e)) : 2;
+    }();
+    static std::map<int, std::future<int>> pending;
+    static std::mutex pending_mu;
+    std::lock_guard<std::mutex> pl(pending_mu);
+    if (site->layer <= o.first) {
+      for (auto &kv : pending) kv.second.wait(); // a new prompt: drop read-ahead left from an aborted one
+      pending.clear();
+    }
+    if (auto it = pending.find(site->layer); it != pending.end()) {
+      it->second.get();
+      pending.erase(it);
+    }
     r = o.store->ensure_transient(site->layer, ids.data(), (int)ids.size());
+    const int last = o.first + o.n_layers - 1;
+    for (int a = 1; a <= ahead; ++a) {
+      const int next = site->layer + a;
+      if (next > last || pending.count(next)) continue;
+      moestream::offload::ExpertStore *store = o.store.get();
+      pending.emplace(next, std::async(std::launch::async, [store, next] { return store->prefetch_transient(next); }));
+    }
   } else {
     r = o.store->ensure(site->layer, ids.data(), (int)ids.size(),
                         moestream::offload::ExpertCache::Kind::Demand);
