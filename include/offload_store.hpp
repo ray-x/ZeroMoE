@@ -720,7 +720,7 @@ public:
   // Prefill read-ahead: load every expert of `layer` that is neither cached nor already transient (a prompt batch touches
   // nearly all of them). Safe to run on another thread while ensure_transient() works on an earlier layer. Returns the
   // number of experts that failed to load (they are forgotten, so ensure_transient() retries them).
-  int prefetch_transient(int layer) {
+  int prefetch_transient(int layer, const std::vector<uint8_t> *skip = nullptr) {
     std::vector<int> to_load;
     {
       std::lock_guard<std::mutex> g(transient_mu_);
@@ -730,12 +730,17 @@ public:
       for (int e = 0; e < n_exp; ++e) {
         const ExpertKey key{layer, e};
         if (cache_.resident(key) || have.count(e)) continue;
+        if (skip && (size_t)e < skip->size() && (*skip)[(size_t)e]) continue;
         transient_.push_back(key);
         to_load.push_back(e);
       }
     }
     Ensure r;
+    const auto t0 = std::chrono::steady_clock::now();
     load_transient(layer, to_load, r);
+    if (std::getenv("MOESTREAM_OFFLOAD_DEBUG_PREFETCH"))
+      std::fprintf(stderr, "[PREFETCH] layer=%d experts=%zu errors=%d %.1f ms\n", layer, to_load.size(), r.errors,
+                   std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return r.errors;
   }
 

@@ -216,6 +216,9 @@ struct OffloadSite {
   OffloadState *state = nullptr;
   int layer = 0;
   bool prefill = false;
+  int n_tokens = 1;
+  // experts of this layer served by a VRAM branch (hot / hot1): never routed to the cold branch, so never read ahead
+  std::vector<uint8_t> not_cold;
 };
 
 // The GLM graph's view of the DDR expert tier: the tier itself is
@@ -228,6 +231,13 @@ struct OffloadState {
   moestream::offload::VirtualArena *arena = nullptr;
   moestream::offload::ExpertResidency *residency = nullptr;
   std::deque<OffloadSite> sites;
+  // Most recently built batched (prefill) miss site of a layer, or nullptr.
+  const OffloadSite *site_for_layer(int layer) const {
+    for (auto it = sites.rbegin(); it != sites.rend(); ++it)
+      if (it->layer == layer && it->prefill)
+        return &*it;
+    return nullptr;
+  }
   bool is_pinned(int layer, int expert) const { return store->is_pinned(layer, expert); }
 };
 

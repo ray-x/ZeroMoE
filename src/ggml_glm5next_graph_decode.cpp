@@ -105,6 +105,18 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                     seed.pooled_keys.size() ==
                         (size_t)g->indexer_key_length * expected_pools;
     }
+    // The sparse selection (top_k of the context) equals dense attention until the context passes top_k, and the sparse graph
+    // costs ~6 ms/token (11 indexer layers, +693 nodes). Use it only when the prompt is long enough that generation can
+    // reach top_k: pos_base + reserve > top_k (MOESTREAM_GLM5NEXT_SPARSE_DECODE_RESERVE, default 1024 tokens; 0 = always).
+    static const int reserve = [] {
+      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_SPARSE_DECODE_RESERVE");
+      return e ? std::atoi(e) : 1024;
+    }();
+    if (seeds_match && reserve > 0 && pos_base + reserve <= g->indexer_top_k) {
+      LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] dense DSA decode: prompt=%d + reserve=%d <= top_k=%d "
+               "(sparse selection would keep every key)\n", pos_base, reserve, g->indexer_top_k);
+      seeds_match = false;
+    }
     if (seeds_match) {
       g->sparse_decode = true;
       indexer_seeds = std::move(g_graph->glm5next_indexer_seeds);
@@ -112,7 +124,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                "owners=%d top_k=%d kpool=%d prompt=%d\n",
                expected_indexer_owners, g->indexer_top_k,
                g->indexer_kpool, pos_base);
-    } else {
+    } else if (!(reserve > 0 && pos_base + reserve <= g->indexer_top_k)) {
       LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] prompt indexer seeds missing or "
                "incompatible; keeping dense DSA decode\n");
     }

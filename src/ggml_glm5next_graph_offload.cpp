@@ -238,11 +238,18 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     }
     r = o.store->ensure_transient(site->layer, ids.data(), (int)ids.size());
     const int last = o.first + o.n_layers - 1;
-    for (int a = 1; a <= ahead; ++a) {
-      const int next = site->layer + a;
+    // Read ahead only for prompts that touch most experts of a layer anyway (a small prompt would read ~2x what it uses).
+    static const int min_tokens = [] {
+      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_AHEAD_MIN_TOKENS");
+      return e ? std::atoi(e) : 64;
+    }();
+    for (int k = 1; k <= ahead && site->n_tokens >= min_tokens; ++k) {
+      const int next = site->layer + k;
       if (next > last || pending.count(next)) continue;
       moestream::offload::ExpertStore *store = o.store.get();
-      pending.emplace(next, std::async(std::launch::async, [store, next] { return store->prefetch_transient(next); }));
+      const OffloadSite *ns = o.site_for_layer(next);
+      const std::vector<uint8_t> *skip = ns ? &ns->not_cold : nullptr;
+      pending.emplace(next, std::async(std::launch::async, [store, next, skip] { return store->prefetch_transient(next, skip); }));
     }
   } else {
     r = o.store->ensure(site->layer, ids.data(), (int)ids.size(),
@@ -324,7 +331,14 @@ ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer,
   if (!o || !ids)
     return nullptr;
   std::lock_guard<std::mutex> lock(g_offload_mutex);
-  o->sites.push_back({o, layer, g.S > 1});
+  o->sites.push_back({o, layer, g.S > 1, g.S, {}});
+  if (const PartialExpertLayer *pl = partial_layer(g, layer)) {
+    o->sites.back().not_cold.assign((size_t)o->n_experts, 0);
+    for (const std::vector<int> *set : {&pl->hot, &pl->hot1})
+      for (int e : *set)
+        if (e >= 0 && e < o->n_experts)
+          o->sites.back().not_cold[(size_t)e] = 1;
+  }
   ggml_tensor *out =
       ggml_map_custom1(ctx, ids, offload_miss_cb, 1, &o->sites.back());
   if (out)

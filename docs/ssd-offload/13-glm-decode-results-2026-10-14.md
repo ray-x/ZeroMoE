@@ -224,3 +224,16 @@ The prefill needs ~1.7 GiB of free VRAM beyond the dense arena and cache. The le
 `moe_cache_gb = 15.8` (14.71 GiB aliased) stays intact: 805-token prefill 100.3 tok/s (7.9-8.0 s), greedy tokens
 identical to the CPU-cold path, no cache release/refill needed. `bench/glm_recipe_env.sh` now enables
 `MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1` and `..._PREFILL_OP_OFFLOAD=1` and the `build_native` ggml-cuda when it exists.
+
+### Regression found and fixed: graph prefill turned on sparse KPool decode (-8% decode)
+
+Same teacher-forced benchmark, dual-GPU recipe: legacy prefill 15.75-15.96 tok/s decode; graph prefill 14.1-14.5. The decode graph
+had +693 nodes (11 DSA indexer layers x 63): after a graph prefill the prompt's indexer seeds exist, so decode switched to the
+sparse KPool path, which costs ~6 ms/token and is a no-op until the context passes `top_k` (2048). It is now used only when
+`prompt + MOESTREAM_GLM5NEXT_SPARSE_DECODE_RESERVE (1024) > top_k`; decode with graph prefill is back to 15.85-15.87.
+Also: read-ahead is skipped for prompts under 64 tokens (24-token prefill 9.3 s -> 2.8 s) and never reads experts a VRAM
+branch serves (`OffloadSite::not_cold`).
+
+Dual-GPU recipe prefill (805 tokens, 76 GiB pool, 3090 + 5060 Ti): 67-69 tok/s (single 3090: 98-101). OFFLOAD_PINNED 0 / 0.5 / 1.0 =
+56.6 / 67 / 69.1 tok/s. Nothing is read ahead there (all cold experts are seeded in the pool); the time is the PCIe copy of the
+cold experts, which pinned memory speeds up.

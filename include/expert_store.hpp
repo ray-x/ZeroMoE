@@ -119,7 +119,7 @@ class ExpertStore {
 
   // Prefill read-ahead of one layer (see ExpertResidency::prefetch_transient). No arena lock: prefill has no readers
   // and the reads only touch slots of `layer`.
-  int prefetch_transient(int layer) { return residency_->prefetch_transient(layer); }
+  int prefetch_transient(int layer, const std::vector<uint8_t> *skip = nullptr) { return residency_->prefetch_transient(layer, skip); }
 
   // Shared access to arena slots (a worker reading experts another thread may
   // evict). Hold it for the whole read.
