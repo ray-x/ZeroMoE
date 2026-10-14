@@ -473,9 +473,10 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   q = ggml_permute(ctx, q, 0, 2, 1, 3);
   q = ggml_mul_mat(ctx, wkb, q);
   q = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));
+  const int64_t total_kv = (int64_t)g.pos_base + g.S;
   const int64_t kv_tokens = g.decode_mode
                                 ? g.kv_capacity
-                                : (((int64_t)g.S + 255) & ~((int64_t)255));
+                                : ((total_kv + 255) & ~((int64_t)255));
   ggml_tensor *latent = nullptr;
   ggml_tensor *kv_cache_updated = nullptr;
   if (g.decode_mode) {
@@ -489,13 +490,23 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                              g.kv_capacity);
   } else {
     latent = ggml_reshape_3d(ctx, kv, g.kv_lora, 1, g.S);
+    if (g.pos_base > 0) {
+      // Chunked prefill: the latent rows of the earlier chunks come from the engine's cache (filled before the run).
+      ggml_tensor *prev = host_input(g, ctx, GGML_TYPE_F32, {g.kv_lora, 1, g.pos_base},
+                                     (size_t)g.kv_lora * g.pos_base * sizeof(float),
+                                     ("glm5next_prev_latent_" + std::to_string(layer)).c_str());
+      if (!prev)
+        return nullptr;
+      g.dsa_prev_inputs.push_back({layer, static_cast<float *>(prev->data)});
+      latent = ggml_concat(ctx, prev, latent, 2);
+    }
   }
-  if (!g.decode_mode && kv_tokens > g.S) {
+  if (!g.decode_mode && kv_tokens > total_kv) {
     // ggml-cuda's 512-wide FATTN kernels require the KV sequence length to
     // be a multiple of FATTN_KQ_STRIDE (256).  llama.cpp's normal KV-cache path
     // already supplies a padded cache.  This standalone no-cache graph must
     // provide the same layout explicitly; zero padding is masked out below.
-    latent = ggml_pad(ctx, latent, 0, 0, (int)(kv_tokens - g.S), 0);
+    latent = ggml_pad(ctx, latent, 0, 0, (int)(kv_tokens - total_kv), 0);
   }
 
   // Keep this layout sequence identical to llama.cpp's build_attn_mha().

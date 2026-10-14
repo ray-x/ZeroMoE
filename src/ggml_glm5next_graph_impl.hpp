@@ -111,7 +111,8 @@ ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer, ggml_
 bool prefetch_layer_active(int layer);
 bool prefetch_ring_was_built();      // a ring was allocated for the graph that was just built or declined
 double prefetch_ring_main_gib();
-void prefetch_suppress_once();       // the next graph is built without a ring
+void prefetch_note_ring_failure(int S); // later graphs of at least S tokens are built without a ring
+void prefetch_suppress_prompt(bool on); // graphs are built without a ring until reset (set when a ring did not fit)
 ggml_tensor *prefetch_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int part);
 // Number of compact cold slots of the layer (0 = not prefetched); *split = slots held by part 0, the rest by part 1.
 int prefetch_layer_slots(int layer, int *split);
@@ -417,5 +418,8 @@ struct RouteTap {
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
 
+// Records what the next prefill chunk continues from (defined in ggml_glm5next_graph.cpp).
+void glm5next_publish_continuation(StreamingEngine &engine, glm5next_graph::FullGraph &g);
+
+#endif // MOESTREAM_USE_GGML_CUDA

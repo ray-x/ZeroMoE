@@ -257,6 +257,13 @@ struct FullGraph : moestream::graph::GraphCore {
   std::vector<float *> kda_state_inputs;
   std::vector<float *> kda_hist_inputs;
   std::vector<ggml_tensor *> dsa_kv_out;
+  // Chunked prefill (pos_base > 0): the tokens before this chunk, the prompt length covered once it ran, the latent rows of
+  // the earlier chunks as a host input per DSA layer, and the indexer seeds of the earlier chunks to extend.
+  int pos_base = 0;
+  int total_tokens = 0;
+  bool ran = false; // the prefill graph completed a run (its KDA/latent/indexer state is exported)
+  std::vector<std::pair<int, float *>> dsa_prev_inputs;
+  std::vector<Glm5nextIndexerSeed> prev_indexer_seeds;
   std::vector<ggml_tensor *> dsa_kv_storage;
   std::vector<ggml_tensor *> kda_state_storage;
   std::vector<ggml_tensor *> kda_hist_storage;
@@ -509,6 +516,7 @@ struct FullGraph : moestream::graph::GraphCore {
     kda_state_inputs.clear();
     kda_hist_inputs.clear();
     dsa_kv_out.clear();
+    dsa_prev_inputs.clear();
     dsa_kv_storage.clear();
     kda_state_storage.clear();
     kda_hist_storage.clear();

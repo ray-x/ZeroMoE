@@ -318,5 +318,31 @@ Layers 4-30 now take 85 ms each = the 1.55 GiB of cold experts of a layer over t
 at the PCIe limit. Layers >= 31 take 45 ms for a 24 ms copy; the rest is startup (~0.35 s). 805 tokens move ~43 GB, so the copy
 floor is ~2.3 s; the measured 3.20 s is within 1.4x of it.
 
-Not fixed (separate): a 1610-token prompt prefills at 29.8 tok/s with prefetch on or off, identical tokens: only the first
-chunk of a long prompt (`pos_base == 0`) takes the graph, later chunks use the legacy path.
+Prompts longer than the graph batch: see the next section.
+
+### Prefill of long prompts: chunks continue each other through the graph (2026-10-15)
+
+Before, a prompt longer than `MOESTREAM_GLM5NEXT_PREFILL_CHUNK` (1024) ran the first chunk through the graph and the rest as
+S=1 steps (1604 tokens: 53.7 s, 30 tok/s; 1998 tokens: 86 s). Now every chunk is a graph (`pos_base > 0`): its KDA state and
+conv history come from the engine buffers the previous chunk exported, the DSA layers get the earlier latent rows as a host input
+(`glm5next_prev_latent_<layer>`, concatenated before the chunk's own), the mask is offset by `pos_base`, and the indexer seeds
+of the chunks are concatenated (chunk boundaries are multiples of 8). The generation loop plans the chunks (last chunk >= 64
+tokens), halves the batch if the graph declines for memory, and falls back to S=1 steps for what a chunk declines.
+
+| prompt | before | now |
+|---|---|---|
+| 805 tokens | 251 tok/s | 251 |
+| 1604 | 29.8 tok/s (53.7 s) | 268.9 (5.97 s) |
+| 1998 | 23.2 (86 s) | 313.6 (6.37 s) |
+| 2403 (> top_k 2048) | - | 59.9 (40 s; the last 355 tokens are stepped) / 198.7 with `PREFILL_DENSE_BEYOND_TOPK=1` (12.1 s) |
+
+The default chunk is now 2048 (= the sparse top-k): every chunk streams all cold experts again, so a bigger chunk is faster
+(1998 tokens as 1024 + 974: 11.8 s). Chunks that continue beyond top_k would need the indexer's per-query selection; the dense
+attention used by the prefill graph is the model's attention only while the context fits top_k, so that is opt-in
+(`MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1`, not the model's exact semantics).
+
+Correctness: the hidden state of a graph prefill differs from another batch shape by relL2 ~0.1 even inside the first chunk
+(rows 100..500 of 512+293 vs 805: 0.08-0.19), so tokens of a chunked prompt can legitimately differ from the single-graph
+run (1604 tokens: chunks 800/736/68 and 1200/404 reproduce the single-graph tokens, 1024/580 does not). Zeroing the carried
+KDA state, the transposition or the earlier latent rows gives relL2 0.5-0.8, so the carry is exercised and right.
+A chunk whose pooled indexer keys or seeds do not line up (pos_base not a multiple of the pool size) is declined.

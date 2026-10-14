@@ -221,6 +221,7 @@ extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(ggml_backend_t ba
 
 namespace {
 bool g_prefetch_built = false, g_prefetch_suppress = false;
+int g_ring_fail_s = 0x7fffffff; // smallest prompt batch for which a ring was found not to fit next to the graph
 double g_prefetch_main_gib = 0.0;
 } // namespace
 
@@ -405,10 +406,8 @@ void prefetch_service(OffloadState &o, int layer, std::vector<int32_t> &ids) {
 bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   g_ring.reset();
   g_prefetch_built = false;
-  if (g_prefetch_suppress) {
-    g_prefetch_suppress = false;
+  if (g_prefetch_suppress || g.S >= g_ring_fail_s)
     return false;
-  }
   // On by default when the second GPU takes part (the ring is split between the two links); off for a single GPU, where the
   // ring would not fit next to the 3090's expert pool.
   const char *want = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH");
@@ -569,7 +568,8 @@ bool prefetch_ring_was_built() {
   return b;
 }
 double prefetch_ring_main_gib() { return g_prefetch_main_gib; }
-void prefetch_suppress_once() { g_prefetch_suppress = true; }
+void prefetch_suppress_prompt(bool on) { g_prefetch_suppress = on; }
+void prefetch_note_ring_failure(int S) { g_ring_fail_s = std::min(g_ring_fail_s, S); }
 
 bool prefetch_layer_active(int layer) { return g_ring && g_ring->layers.count(layer) != 0; }
 

@@ -110,9 +110,25 @@ void glm5next_full_graph_shutdown() {
 
 static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *tokens);
 
+// What a prefill chunk leaves for the next one. Kept apart from g_graph, which a declined attempt (or the retry without the
+// prefetch ring) has already released.
+static struct PrefillContinuation {
+  const StreamingEngine *engine = nullptr;
+  int total_tokens = 0;
+  std::vector<Glm5nextIndexerSeed> seeds;
+} g_continuation;
+
+void glm5next_publish_continuation(StreamingEngine &engine, glm5next_graph::FullGraph &g) {
+  g_continuation.engine = &engine;
+  g_continuation.total_tokens = g.total_tokens;
+  g_continuation.seeds = g.glm5next_indexer_seeds;
+}
+
 // The speculative prefetch ring takes VRAM the batched-prefill workspace may then not find: when a graph that had a ring
 // is declined, it is built once more without it (a legacy prefill of the same prompt is ~100x slower).
 bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, const int *tokens) {
+  if (pos_base == 0)
+    prefetch_suppress_prompt(false);
   (void)prefetch_ring_was_built();
   if (glm5next_full_graph_prepare_once(engine, S, pos_base, tokens))
     return true;
@@ -120,18 +136,38 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, c
     return false;
   LOG_WARN("[GGML-GLM5NEXT-FULL] graph declined with the prefetch ring (%.2f GiB on the main GPU); retrying without it\n",
            prefetch_ring_main_gib());
-  prefetch_suppress_once();
+  prefetch_suppress_prompt(true);
+  prefetch_note_ring_failure(S);
   return glm5next_full_graph_prepare_once(engine, S, pos_base, tokens);
 }
 
 static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *) {
-  if (!env_enabled() || S <= 1 || pos_base != 0 ||
+  if (!env_enabled() || S <= 1 || pos_base < 0 ||
       engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
   const auto &c = engine.model_file.architecture_config;
+  // A chunk after the first (pos_base > 0) continues the previous chunk's graph state: its KDA state and conv history, the
+  // latent rows and the indexer seeds, all of which the previous run left in the engine / the old graph. Prefill attention
+  // is dense, which equals the model's top-k selection only while the context fits in top_k.
+  if (pos_base > 0) {
+    const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
+    if (g_continuation.engine != &engine || g_continuation.total_tokens != pos_base)
+      return false;
+    if (kpool > 1 && pos_base % kpool != 0)
+      return false;
+    // Beyond top_k the model attends to a selected subset of the context, which the dense prefill attention does not
+    // reproduce; MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 accepts that for speed (default: the rest is stepped).
+    static const bool dense_beyond = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
+    if (top_k > 0 && pos_base + S > top_k && !dense_beyond)
+      return false;
+  }
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
-      g_graph->S == S)
+      g_graph->S == S && g_graph->pos_base == pos_base && !g_graph->decode_mode)
     return true;
+  std::vector<Glm5nextIndexerSeed> prev_seeds;
+  if (pos_base > 0)
+    prev_seeds = g_continuation.seeds;
+  g_continuation = PrefillContinuation{};
   g_glm5next_decode_disabled_engine = nullptr;
 
   // Keep the large source arena alive while releasing only the old
@@ -149,6 +185,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = S;
+  g->pos_base = pos_base;
+  g->total_tokens = pos_base + S;
+  g->prev_indexer_seeds = std::move(prev_seeds);
   g->D = c.hidden;
   g->HC = std::max(1, c.hc_mult);
   g->n_layers = c.n_layers;

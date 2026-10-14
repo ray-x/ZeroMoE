@@ -687,7 +687,7 @@ bool build_graph(FullGraph &g) {
                        "glm5next_full_input");
   const int64_t kv_tokens = g.decode_mode
                                 ? g.kv_capacity
-                                : (((int64_t)g.S + 255) & ~((int64_t)255));
+                                : (((int64_t)g.pos_base + g.S + 255) & ~((int64_t)255));
   g.attn_mask = host_input(g, g.ctx, GGML_TYPE_F16, {kv_tokens, g.S, 1, 1},
                            (size_t)kv_tokens * g.S * sizeof(ggml_fp16_t),
                            "glm5next_full_causal_mask");
@@ -701,8 +701,8 @@ bool build_graph(FullGraph &g) {
     for (int k = 0; k < kv_tokens; ++k)
       mask[(size_t)q * kv_tokens + k] =
           ggml_fp32_to_fp16(g.decode_mode ? -INFINITY
-                                          : (k < g.S && k <= q ? 0.0f
-                                                               : -INFINITY));
+                                          : (k < g.pos_base + g.S && k <= g.pos_base + q ? 0.0f
+                                                                                         : -INFINITY));
 
   if (g.decode_mode && g.sparse_decode) {
     if (g.indexer_kpool <= 1 || g.kv_capacity % g.indexer_kpool != 0 ||

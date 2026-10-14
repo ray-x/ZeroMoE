@@ -1018,7 +1018,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
   const ModelGraphRequest prefill_graph_request{
       ModelGraphPhase::Prefill, S, pos_base, token_ids, hidden_states};
-  if (S > 1 && pos_base == 0 && graph_model &&
+  if (S > 1 && graph_model &&
+      (pos_base == 0 || graph_model->supports_prefill_continuation(engine)) &&
       graph_model->enabled(engine, ModelGraphPhase::Prefill) &&
       graph_model->run(engine, prefill_graph_request)) {
     return;

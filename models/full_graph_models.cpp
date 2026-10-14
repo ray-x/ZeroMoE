@@ -87,16 +87,19 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   }
   bool supports_cpu_lane() const override { return true; }
 
-  // The prefill graph is position-zero only and its workspace grows ~4.5 MiB per token, so a long
-  // prompt runs the first N tokens through it. MOESTREAM_GLM5NEXT_PREFILL_CHUNK=N (default 1024,
-  // 0 = whole prompt in one graph).
+  // The prefill graph's workspace grows ~4.5 MiB per token, so a long prompt runs in chunks of N tokens, each continuing
+  // the previous one's state (up to the sparse top-k of 2048 tokens of context; beyond that the rest is stepped one token
+  // at a time). Larger chunks are faster: every chunk streams all cold experts again.
+  // MOESTREAM_GLM5NEXT_PREFILL_CHUNK=N (default 2048, 0 = whole prompt in one graph).
   int max_prefill_tokens(const StreamingEngine &) const override {
     static const int chunk = [] {
       const char *v = std::getenv("MOESTREAM_GLM5NEXT_PREFILL_CHUNK");
-      return v && v[0] ? std::atoi(v) : 1024;
+      return v && v[0] ? std::atoi(v) : 2048;
     }();
     return chunk;
   }
+
+  bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }
 
   // MTP and multi-token decode are not graph-supported.
   bool accepts(const StreamingEngine &e, const ModelGraphRequest &r) const {

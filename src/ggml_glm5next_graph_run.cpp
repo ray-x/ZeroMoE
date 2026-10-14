@@ -11,8 +11,9 @@ using namespace glm5next_graph;
 
 bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *) {
-  if (!env_enabled() || !hidden_states || S <= 1 || pos_base != 0 || !g_graph ||
-      !g_graph->ready || g_graph->engine != &engine || g_graph->S != S)
+  if (!env_enabled() || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
+      !g_graph->ready || g_graph->engine != &engine || g_graph->S != S ||
+      g_graph->pos_base != pos_base || g_graph->decode_mode)
     return false;
   FullGraph &g = *g_graph;
   const auto &c = engine.model_file.architecture_config;
@@ -26,8 +27,19 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
         engine.glm5next_recur_state[l].size() != state_n ||
         engine.glm5next_conv_history[l].size() != hist_n)
       return false;
-    std::fill(g.kda_state_inputs[i], g.kda_state_inputs[i] + state_n, 0.0f);
-    std::fill(g.kda_hist_inputs[i], g.kda_hist_inputs[i] + hist_n, 0.0f);
+    if (pos_base == 0) {
+      std::fill(g.kda_state_inputs[i], g.kda_state_inputs[i] + state_n, 0.0f);
+      std::fill(g.kda_hist_inputs[i], g.kda_hist_inputs[i] + hist_n, 0.0f);
+    } else {
+      // The previous chunk exported its state in the engine's layout; the scan kernel takes it transposed.
+      transpose_glm5next_state(g.kda_state_inputs[i], engine.glm5next_recur_state[l].data(), g.hd, g.H);
+      std::memcpy(g.kda_hist_inputs[i], engine.glm5next_conv_history[l].data(), hist_n * sizeof(float));
+    }
+  }
+  for (const auto &[layer, dst] : g.dsa_prev_inputs) {
+    if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer])
+      return false;
+    std::memcpy(dst, engine.Lc[layer], (size_t)pos_base * g.kv_lora * sizeof(float));
   }
   if (engine.hc_stream_buf.size() < (size_t)g.D * g.HC * S ||
       g.host_inputs.empty())
@@ -138,7 +150,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
       return false;
     ggml_backend_tensor_get(g.dsa_kv_out[i], kv.data(), 0,
                             kv_n * sizeof(float));
-    std::memcpy(engine.Lc[l], kv.data(), kv_n * sizeof(float));
+    std::memcpy(engine.Lc[l] + (size_t)pos_base * g.kv_lora, kv.data(), kv_n * sizeof(float));
   }
   g.glm5next_indexer_seeds.clear();
   g.glm5next_indexer_seeds.reserve(g.glm5next_indexer_layers.size());
@@ -148,22 +160,39 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
       indexer_seeds_ok = false;
       break;
     }
+    // Earlier chunks' rows come first (their pools are complete: chunk boundaries are multiples of kpool).
+    const Glm5nextIndexerSeed *prev = nullptr;
+    if (pos_base > 0) {
+      for (const Glm5nextIndexerSeed &p : g.prev_indexer_seeds)
+        if (p.layer == state.layer)
+          prev = &p;
+      if (!prev || prev->token_count != pos_base) {
+        indexer_seeds_ok = false;
+        break;
+      }
+    }
+    const size_t chunk_rows = (size_t)2 * g.indexer_key_length * g.S;
+    const int chunk_pools = g.indexer_kpool > 1 ? g.S / g.indexer_kpool : 0;
     Glm5nextIndexerSeed seed;
     seed.layer = state.layer;
-    seed.token_count = g.S;
-    seed.pool_count = g.indexer_kpool > 1 ? g.S / g.indexer_kpool : 0;
-    seed.key_gate.resize((size_t)2 * g.indexer_key_length * g.S);
-    seed.pooled_keys.resize(
-        (size_t)g.indexer_key_length * seed.pool_count);
-    ggml_backend_tensor_get(state.key_gate_out, seed.key_gate.data(), 0,
-                            seed.key_gate.size() * sizeof(float));
-    if (seed.pool_count > 0) {
+    seed.token_count = pos_base + g.S;
+    seed.pool_count = (g.indexer_kpool > 1 ? pos_base / g.indexer_kpool : 0) + chunk_pools;
+    const size_t prev_rows = prev ? prev->key_gate.size() : 0;
+    const size_t prev_pooled = prev ? prev->pooled_keys.size() : 0;
+    seed.key_gate.resize(prev_rows + chunk_rows);
+    seed.pooled_keys.resize(prev_pooled + (size_t)g.indexer_key_length * chunk_pools);
+    if (prev) {
+      std::memcpy(seed.key_gate.data(), prev->key_gate.data(), prev_rows * sizeof(float));
+      std::memcpy(seed.pooled_keys.data(), prev->pooled_keys.data(), prev_pooled * sizeof(float));
+    }
+    ggml_backend_tensor_get(state.key_gate_out, seed.key_gate.data() + prev_rows, 0, chunk_rows * sizeof(float));
+    if (chunk_pools > 0) {
       if (!state.pooled_out) {
         indexer_seeds_ok = false;
         break;
       }
-      ggml_backend_tensor_get(state.pooled_out, seed.pooled_keys.data(), 0,
-                              seed.pooled_keys.size() * sizeof(float));
+      ggml_backend_tensor_get(state.pooled_out, seed.pooled_keys.data() + prev_pooled, 0,
+                              (size_t)g.indexer_key_length * chunk_pools * sizeof(float));
     }
     g.glm5next_indexer_seeds.push_back(std::move(seed));
   }
@@ -182,8 +211,11 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   if (!g.glm5next_indexer_seeds.empty())
     LOG_INFO("[GGML-GLM5NEXT-FULL] captured KPool prompt seeds: layers=%zu "
              "tokens=%d pools=%d\n",
-             g.glm5next_indexer_seeds.size(), g.S,
-             g.S / std::max(1, g.indexer_kpool));
+             g.glm5next_indexer_seeds.size(), pos_base + g.S,
+             (pos_base + g.S) / std::max(1, g.indexer_kpool));
+  g.prev_indexer_seeds.clear();
+  g.ran = true;
+  glm5next_publish_continuation(engine, g);
   engine.glm5next_full_graph_output_ready = true;
   (void)c;
   return true;

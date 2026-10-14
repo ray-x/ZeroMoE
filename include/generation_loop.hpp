@@ -709,21 +709,34 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // rest as S=1 steps; it applies only once the graph actually built, so a failed build keeps
     // the whole-prompt fallback.
     size_t pc_n_batched = pc_n_new;
+    int pc_graph_cap = 0;
     if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill &&
         graph_model &&
         graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
         size_t pc_n_graph = pc_n_new;
-        const int cap = graph_model->max_prefill_tokens(engine);
+        int cap = graph_model->max_prefill_tokens(engine);
         if (cap > 1 && (size_t)cap < pc_n_new)
             pc_n_graph = (size_t)cap;
-        const ModelGraphRequest request{
-            ModelGraphPhase::Prefill,
-            (int)pc_n_graph,
-            (int)pc_reuse,
-            prompt_ids.data() + pc_reuse,
-            nullptr,
+        auto build_first = [&]() {
+            const ModelGraphRequest request{
+                ModelGraphPhase::Prefill,
+                (int)pc_n_graph,
+                (int)pc_reuse,
+                prompt_ids.data() + pc_reuse,
+                nullptr,
+            };
+            return graph_model->build(engine, request);
         };
-        const bool graph_built = graph_model->build(engine, request);
+        bool graph_built = build_first();
+        // A batch whose workspace does not fit is retried at half the size while the family can continue a prompt
+        // from its earlier chunk; the remaining chunks then use the smaller size too.
+        while (!graph_built && pc_n_graph > 256 && graph_model->supports_prefill_continuation(engine)) {
+            pc_n_graph = ((pc_n_graph / 2) / 8) * 8;
+            cap = (int)pc_n_graph;
+            LOG_STREAM_INFO() << "[PREFILL] graph declined; retrying with a batch of " << pc_n_graph << " tokens\n";
+            graph_built = build_first();
+        }
+        pc_graph_cap = cap;
         if (!graph_built && engine.qwen4exp_full_graph_required) {
             engine.qwen4exp_full_graph_failure =
                 "prefill graph construction failed";
@@ -828,6 +841,45 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
             // Tokens beyond the bounded graph batch: the same S=1 steps the unbatched parity mode
             // uses (the decode graph reads the KV/recurrent state the batched part just wrote).
+            // Further chunks through the graph while the family can continue from the state the previous chunk left;
+            // whatever it declines (context beyond the sparse top-k, a failed build) is stepped below.
+            if (pc_n_batched < pc_n_new && graph_model &&
+                graph_model->supports_prefill_continuation(engine)) {
+                const int cap = std::max(1, pc_graph_cap > 0 ? pc_graph_cap : graph_model->max_prefill_tokens(engine));
+                while (pc_n_batched < pc_n_new) {
+                    const size_t remaining = pc_n_new - pc_n_batched;
+                    size_t take = std::min<size_t>((size_t)cap, remaining);
+                    // Keep the last chunk at 64+ tokens (smaller graph batches take the slow cold-expert path) and every
+                    // boundary a multiple of 8 (the indexer's pooling blocks).
+                    if (remaining > (size_t)cap && remaining - (size_t)cap < 64)
+                        take = ((remaining - 64) / 8) * 8;
+                    const int n = (int)take;
+                    if (n < 64)
+                        break;
+                    const int pos = pc_reuse + (int)pc_n_batched;
+                    const ModelGraphRequest request{ModelGraphPhase::Prefill, n, pos,
+                                                    prompt_ids.data() + pos, nullptr};
+                    if (!graph_model->build(engine, request))
+                        break;
+                    float *rows = hidden_states.data() + pc_n_batched * (size_t)D;
+                    if (hc_active)
+                        hc_expand_embedding(engine, rows, n, D);
+                    layers_forward_gguf(engine, ram_mgr, prefetcher, rows, n, pos, prompt_ids.data() + pos);
+                    if (!engine.qwen4exp_full_graph_failure.empty())
+                        return;
+                    const bool graph_ran = engine.glm5next_full_graph_output_ready ||
+                                           engine.qwen4exp_full_graph_output_ready ||
+                                           engine.deepseek_v4_full_graph_output_ready;
+                    if (hc_active && !graph_ran)
+                        hc_collapse_output(engine, rows, n, D);
+                    engine.qwen4exp_full_graph_output_ready = false;
+                    engine.glm5next_full_graph_output_ready = false;
+                    engine.deepseek_v4_full_graph_output_ready = false;
+                    pc_n_batched += (size_t)n; // the chunk is done either way (layered path advances state too)
+                    if (!graph_ran)
+                        break;
+                }
+            }
             if (pc_n_batched < pc_n_new) {
                 LOG_STREAM_INFO() << "[PREFILL] graph batch covers the first " << pc_n_batched
                                   << " tokens; stepping the remaining "

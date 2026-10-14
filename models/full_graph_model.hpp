@@ -50,6 +50,10 @@ class FullGraphModel {
   // the rest as S=1 steps (see generate_text).
   virtual int max_prefill_tokens(const StreamingEngine &) const { return 0; }
 
+  // Whether a prefill chunk that starts after position 0 can run through the graph, continuing the state the earlier
+  // chunk left in the engine (build() is then asked with pos_base > 0 and may still decline a particular chunk).
+  virtual bool supports_prefill_continuation(const StreamingEngine &) const { return false; }
+
   // Number of MoE layers whose routed experts the graph places in VRAM.
   virtual int device_expert_layers() const { return 0; }
 

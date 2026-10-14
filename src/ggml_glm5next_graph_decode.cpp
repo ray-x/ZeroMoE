@@ -86,7 +86,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (g->indexer_kpool > 1 && g->indexer_top_k > 0 &&
       g->indexer_top_k % g->indexer_kpool == 0 &&
       g_graph && g_graph->ready && !g_graph->decode_mode &&
-      g_graph->engine == &engine && g_graph->S == pos_base &&
+      g_graph->engine == &engine && g_graph->total_tokens == pos_base &&
       g_graph->indexer_key_length == g->indexer_key_length &&
       g_graph->indexer_kpool == g->indexer_kpool) {
     for (int l = 0; l < g->n_layers; ++l) {
