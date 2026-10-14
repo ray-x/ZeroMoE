@@ -119,3 +119,15 @@ Both links negotiate PCIe **Gen3** (`pcie.link.gen.max = 3`; 3090 x16, 5060 Ti x
 (`cudaMallocHost`, anonymous 4 KiB pages + `cudaHostRegister`, 2 MiB THP + register, randomly scattered 4 KiB pages + register),
 i.e. the copy rate is the link limit and the arena's page layout / pinning method cannot improve it. Earlier notes that call the 3090
 "PCIe4" are wrong; the assist copies were already running at the Gen3 x16 limit.
+
+### Kernel efficiency: native SASS instead of JIT'd PTX (2026-10-14)
+The engine's ggml-cuda was built with `CMAKE_CUDA_ARCHITECTURES=75` (PTX only), so both GPUs ran code JIT-compiled from compute 7.5.
+Building `86;120` (sm_86 for the 3090, sm_120 for the 5060 Ti; `bench/build_native.sh`) with the layer-split recipe, order-balanced,
+last-30 tok/s, identical tokens:
+
+| input | PTX/JIT | native SASS | trunk wait |
+|---|---|---|---|
+| benchmark sequence | 15.50, 15.40 (mean 15.45) | 15.68, 15.66 (mean **15.67**, +1.4%) | 19.6 -> 18.9 ms/token |
+| held-out dockerfile | 15.85, 15.72 (mean 15.79) | 15.88, 15.89 (mean **15.89**, +0.6%) | 18.8 -> 18.7 ms/token |
+
+The 5060 Ti's own kernels are ~3 ms/token, so most of the gain is the 3090 trunk; the native build costs one longer compile and no code change.
