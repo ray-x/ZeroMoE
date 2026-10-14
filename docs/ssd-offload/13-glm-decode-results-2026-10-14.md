@@ -69,3 +69,19 @@ prompt-lookup speculation (1.03 words/pass), MTP (no head in either checkpoint).
   rebuilt from `llama.cpp-moestream-integration` (`7bd457fa1`).
 - Prompts far from the surveyed corpus stay at 13-14 tok/s; a usage ranking from the real workload is the remaining lever
   (`bench/make_survey_batches.py`, `bench/glm_route_survey.sh`, `bench/ranking_holdout_eval.py --write`).
+
+## 5060 Ti efficiency round (2026-10-14; code kept on branch `assist-prestage-experiment`, nothing merged)
+Where the 5060 Ti's time goes: ~3 ms/token of kernels out of ~65 (4-5% busy), its link carries ~1 assist expert per layer at 6.9 GB/s.
+Its +20% over a single 3090 is residency (28.9 vs 14.7 GiB of hot experts), not compute. Same fixed sequence, last 30 tokens, recipe env:
+
+| experiment | result |
+|---|---|
+| layer split, 5060 Ti holds only layers >= 24 / 31 / 36 (3090 the first layers) | 65.3 / 64.5 / 64.4 ms vs 65.4 (15.31 / 15.51 / 15.52 vs 15.30 tok/s); trunk wait -1.2 / -2.5 / -6.2 ms, lane compute +2.5 / +3.9 / +4.5 ms |
+| non-contiguous layer sets from an offline optimiser (15 and 19 layers incl. 3-12) | 65.1 / 64.7 ms vs 64.6 / 64.9: neutral; the model predicted 1.4-4.7 ms better, the benchmark prompt's lane cost rose by as much as the hops saved |
+| assist prestaging: pilot predicts next layer's cold experts, copied to the ring during the trunk | lane compute 38.1 -> 30.3 ms, 68% of assisted experts already in the ring, but wall 64.7 -> 95 ms (an unexplained ~0.6 ms/layer per staged expert outside the lane's wait/compute); default off |
+| first prestage build | 381 ms: the extra predictor tensors overflowed the exactly sized dense arena and the LM head silently fell back to the CPU (fixed in the experiment branch) |
+
+Kernels: with the 5060 Ti busy ~3 ms/token, kernel tuning there cannot move the total; the native-arch (sm_120) build was not tried.
+Pin layout: assist copies run at the PCIe limits (3090 ~12 GB/s per 2 MB plane copy, 5060 Ti 6.9 GB/s), planes are separate regions,
+three copies per expert; no layout change was found that helps. Communication: cross-GPU hop removal is real (-6 ms of trunk wait) but is
+paid back by lane compute because the 5060 Ti's set then matches the hot experts worse.
