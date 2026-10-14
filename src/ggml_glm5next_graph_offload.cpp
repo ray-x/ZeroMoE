@@ -551,6 +551,13 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   g_prefetch_built = true;
   g_prefetch_main_gib = (double)total[0] / (1024.0 * 1024.0 * 1024.0);
   g_ring = std::move(ring);
+  // The first layers' copies start now, while the dense layers in front of them compute (otherwise the first offload layer
+  // has nothing prefetched and the miss node copies its whole cold set itself).
+  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_EARLY", 1) != 0 && !g_ring->layers.empty()) {
+    PrefetchLayer &first = g_ring->layers.begin()->second;
+    first.issued = true;
+    first.worker = std::async(std::launch::async, prefetch_issue, g_ring.get(), &first, &o);
+  }
   return true;
 }
 
