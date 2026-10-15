@@ -45,12 +45,16 @@ bool fused_hc_op(char which) {
 
 ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base,
-                    ggml_tensor **post, ggml_tensor **comb) {
+                    ggml_tensor **post, ggml_tensor **comb,
+                    ggml_tensor **pre_gate, ggml_tensor *collapse_carry) {
   const auto &c = g.engine->model_file.architecture_config;
   const int mix_dim = (2 + g.HC) * g.HC;
   ggml_tensor *flat = ggml_reshape_2d(ctx, x, g.D * g.HC, g.S);
   ggml_tensor *flat_norm = ggml_rms_norm(ctx, flat, c.eps);
   ggml_tensor *mixes = ggml_mul_mat(ctx, fn, flat_norm);
+  if (g.engine->family_ops.family == ModelFamily::DeepSeek_V41 &&
+      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH"))
+    ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
 
   ggml_tensor *scale_pre = ggml_view_1d(ctx, scale, 1, 0);
   ggml_tensor *scale_post = ggml_view_1d(ctx, scale, 1, sizeof(float));
@@ -64,6 +68,9 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
   pre = ggml_scale_bias(
       ctx, ggml_sigmoid(ctx, hc_affine(ctx, pre, scale_pre, base_pre)), 1.0f,
       c.hc_eps);
+  if (pre_gate)
+    *pre_gate = pre;
+  ggml_tensor *collapse = collapse_carry ? collapse_carry : pre;
   *post = ggml_view_2d(ctx, mixes, g.HC, g.S, mixes->nb[1],
                        (size_t)g.HC * mixes->nb[0]);
   *post = ggml_scale(
@@ -99,14 +106,15 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
     }
   }
   if (f_pre)
-    return ggml_dsv4_hc_pre(ctx, hc_contig(ctx, x), hc_contig(ctx, pre));
+    return ggml_dsv4_hc_pre(ctx, hc_contig(ctx, x), hc_contig(ctx, collapse));
 
   ggml_tensor *result = nullptr;
   for (int h = 0; h < g.HC; ++h) {
     ggml_tensor *xh =
         ggml_view_2d(ctx, x, g.D, g.S, x->nb[2], (size_t)h * x->nb[1]);
     ggml_tensor *ph =
-        ggml_view_2d(ctx, pre, 1, g.S, pre->nb[1], (size_t)h * pre->nb[0]);
+        ggml_view_2d(ctx, collapse, 1, g.S, collapse->nb[1],
+                     (size_t)h * collapse->nb[0]);
     ggml_tensor *term = ggml_mul(ctx, xh, ph);
     result = result ? ggml_add(ctx, result, term) : term;
   }

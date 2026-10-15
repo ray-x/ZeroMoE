@@ -28,6 +28,12 @@ extern "C" void launch_dequant_q8_0_to_bf16(void* dst_bf16, const void* src_q8_0
 extern "C" bool launch_dequant_to_bf16(int ggml_type, void* dst_bf16, const void* src, int64_t n_elements);
 extern "C" void launch_f32_to_bf16(void* dst_bf16, const float* src_f32, int64_t n);
 extern "C" void launch_q2_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
+extern "C" void launch_q2_K_grouped_dot_f32(
+    float* y, const float* x, const void* weights, size_t group_stride_bytes,
+    int groups, int rank, int group_in, cudaStream_t stream);
+extern "C" void launch_q2_K_grouped_dot_f32_batch(
+    float* y, const float* x, const void* weights, size_t group_stride_bytes,
+    int groups, int rank, int group_in, int tokens, cudaStream_t stream);
 extern "C" void launch_q3_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q4_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
 extern "C" void launch_q5_K_matmul(float* y, const float* x, const void* weights, int S, int I, int O);
@@ -3354,6 +3360,45 @@ public:
         cudaMemcpyAsync(y_host, d_outproj_y, y_bytes, cudaMemcpyDeviceToHost, outproj_stream);
         cudaStreamSynchronize(outproj_stream);
         PERF_END(dense_dn, t_dense_gpu_down);
+        perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    // Quantized DeepSeek-V4.1 grouped output-A projection. WOA remains in
+    // its existing device tensor; the method uploads only the context and
+    // uses one reusable output scratch range on outproj_stream. Each group
+    // occupies `group_stride_bytes` in the original quantized tensor.
+    bool grouped_output_proj_q2k_host(
+            const void* d_WOA, size_t group_stride_bytes, int o_groups,
+            int o_rank, int group_in, const float* x_host, float* y_host,
+            int tokens = 1) {
+        if (!d_WOA || !x_host || !y_host || o_groups <= 0 || o_rank <= 0 ||
+            tokens <= 0 || tokens > 65535 ||
+            group_in <= 0 || group_in % 256 != 0 ||
+            group_stride_bytes == 0 || !outproj_stream)
+            return false;
+        const size_t x_bytes =
+            (size_t)tokens * o_groups * (size_t)group_in * sizeof(float);
+        const size_t y_bytes =
+            (size_t)tokens * o_groups * (size_t)o_rank * sizeof(float);
+        if (!ensure_outproj_buffers(x_bytes, y_bytes)) return false;
+        cudaSetDevice(device_id);
+        if (cudaMemcpyAsync(d_outproj_x, x_host, x_bytes,
+                            cudaMemcpyHostToDevice, outproj_stream) !=
+            cudaSuccess)
+            return false;
+        launch_q2_K_grouped_dot_f32_batch(
+            d_outproj_y, d_outproj_x, d_WOA, group_stride_bytes,
+            o_groups, o_rank, group_in, tokens, outproj_stream);
+        if (cudaGetLastError() != cudaSuccess) {
+            cudaStreamSynchronize(outproj_stream);
+            return false;
+        }
+        if (cudaMemcpyAsync(y_host, d_outproj_y, y_bytes,
+                            cudaMemcpyDeviceToHost, outproj_stream) !=
+            cudaSuccess)
+            return false;
+        if (cudaStreamSynchronize(outproj_stream) != cudaSuccess) return false;
         perf().n_dense_gpu_calls.fetch_add(1, std::memory_order_relaxed);
         return true;
     }

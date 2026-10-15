@@ -112,23 +112,30 @@ public:
   // its header metadata.  This keeps GGUFTokenizer usable by code paths that
   // do not hold an open ifstream themselves.
   bool load(const GGUFFile &file) {
-    std::ifstream f(file.resolved_file_path, std::ios::binary);
-    if (!f.is_open())
-      return false;
-
-    char magic[4];
-    f.read(magic, 4);
-    if (std::string(magic, 4) != "GGUF")
-      return false;
-
-    uint32_t version = 0;
-    f.read(reinterpret_cast<char *>(&version), 4);
-
-    uint64_t tensor_count = 0, kv_count = 0;
-    f.read(reinterpret_cast<char *>(&tensor_count), 8);
-    f.read(reinterpret_cast<char *>(&kv_count), 8);
-
-    return load_from_gguf_metadata(f, kv_count);
+    // Directory ordering can put a tensor-only shard before a renamed,
+    // repacked metadata shard. Resolve vocabulary independently of tensor
+    // shard order, without renaming or copying any model files.
+    std::vector<std::string> paths{file.resolved_file_path};
+    for (const auto &path : file.shard_paths)
+      if (path != file.resolved_file_path) paths.push_back(path);
+    for (const auto &path : paths) {
+      std::ifstream f(path, std::ios::binary);
+      if (!f.is_open()) continue;
+      char magic[4]{};
+      uint32_t version = 0;
+      uint64_t tensor_count = 0, kv_count = 0;
+      f.read(magic, 4);
+      f.read(reinterpret_cast<char *>(&version), 4);
+      f.read(reinterpret_cast<char *>(&tensor_count), 8);
+      f.read(reinterpret_cast<char *>(&kv_count), 8);
+      if (!f || std::string(magic, 4) != "GGUF") continue;
+      GGUFTokenizer candidate;
+      if (candidate.load_from_gguf_metadata(f, kv_count)) {
+        *this = std::move(candidate);
+        return true;
+      }
+    }
+    return false;
   }
 
   bool load_from_gguf_metadata(std::ifstream &f, uint64_t kv_count) {

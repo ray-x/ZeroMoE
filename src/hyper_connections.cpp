@@ -20,6 +20,7 @@
 // below ever touch hc_stream_buf.
 #include "engine.hpp"
 #include "dense_dispatch.hpp"
+#include "dsv41_trace.hpp"
 #include "ggml_hc_backend.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_moe_backend.hpp"
@@ -225,6 +226,11 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
       float b = base ? base[h] : 0.0f;
       pre_gate[h] = hc_sigmoid(row[h] * scale_pre + b) + c.hc_eps;
     }
+    if (s == S - 1 && S > 1 &&
+        engine.family_ops.family == ModelFamily::DeepSeek_V41)
+      dsv41_trace::save(sub_block == 0 ? "hc-attn-pre-mix"
+                                       : "hc-ffn-pre-mix",
+                        layer_idx, 0, pre_gate.data(), pre_gate.size());
     const float *collapse_mix = pre_gate.data();
     // GLM5NEXT's reference graph calls build_hc_pre() independently for
     // attention and FFN, and each call immediately collapses the current
@@ -276,6 +282,16 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
     }
     sinkhorn_normalize_comb(cb, HC, c.hc_sinkhorn_iters, c.hc_eps);
 
+    if (s == S - 1 && S > 1 &&
+        engine.family_ops.family == ModelFamily::DeepSeek_V41) {
+      const char *post_label = sub_block == 0 ? "hc-attn-post-gate"
+                                              : "hc-ffn-post-gate";
+      const char *comb_label = sub_block == 0 ? "hc-attn-comb"
+                                              : "hc-ffn-comb";
+      dsv41_trace::save(post_label, layer_idx, 0, pg, (size_t)HC);
+      dsv41_trace::save(comb_label, layer_idx, 0, cb, (size_t)HC * HC);
+    }
+
     // Real telemetry for the LAST token only (added 2026-08-09 -- this file
     // previously had zero visibility into pre_gate/post_gate/comb beyond
     // "not NaN"). pre_gate/post_gate are expected roughly in (eps,1+eps)/
@@ -316,10 +332,13 @@ void hc_pre_collapse(StreamingEngine &engine, int layer_idx, int sub_block,
       for (int d = 0; d < D; ++d) out[d] += w * stream_h[d];
     }
   }
+  if (S > 1 && engine.family_ops.family == ModelFamily::DeepSeek_V41)
+    dsv41_trace::save(sub_block == 0 ? "hc-attn-pre-seq" : "hc-ffn-pre-seq",
+                      layer_idx, 0, hidden_states, (size_t)S * D);
   check_finite_hc("hidden_states (post hc_pre_collapse)", layer_idx, hidden_states, (size_t)S * D, D);
 }
 
-void hc_post_combine(StreamingEngine &engine, int layer_idx, int /*sub_block*/,
+void hc_post_combine(StreamingEngine &engine, int layer_idx, int sub_block,
                      float *hidden_states, const float *sub_block_out, int S,
                      int D) {
   auto &c = engine.model_file.architecture_config;
@@ -354,6 +373,15 @@ void hc_post_combine(StreamingEngine &engine, int layer_idx, int /*sub_block*/,
   check_finite_hc("new_streams (post hc_post_combine, pre-move into hc_stream_buf)",
                   layer_idx, new_streams.data(), (size_t)S * HC * D, HC * D);
   engine.hc_stream_buf = std::move(new_streams);
+  if (S > 1 && engine.family_ops.family == ModelFamily::DeepSeek_V41) {
+    const char *post_label = sub_block == 0 ? "post-attn-seq" : "post-ffn-seq";
+    const char *streams_label =
+        sub_block == 0 ? "post-attn-streams-seq" : "post-ffn-streams-seq";
+    dsv41_trace::save(post_label, layer_idx, 0, hidden_states,
+                      (size_t)S * D);
+    dsv41_trace::save(streams_label, layer_idx, 0,
+                      engine.hc_stream_buf.data(), (size_t)S * HC * D);
+  }
 
   // hidden_states is left holding the collapsed single-stream value the
   // NEXT sub_block's own hc_pre_collapse will overwrite anyway -- but for

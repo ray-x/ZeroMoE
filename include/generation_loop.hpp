@@ -737,6 +737,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             graph_built = build_first();
         }
         pc_graph_cap = cap;
+        // An explicitly requested DeepSeek graph must fail visibly.
+        if (!engine.qwen4exp_full_graph_failure.empty())
+            return;
         if (!graph_built && engine.qwen4exp_full_graph_required) {
             engine.qwen4exp_full_graph_failure =
                 "prefill graph construction failed";
@@ -1094,9 +1097,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         const float* last_hidden = hidden_states.data() + ((hidden_states.size() / D - 1) * D);
         dump_prefill_final_hidden_if_enabled(step, last_hidden, (size_t)D);
 
-        // The opt-in Qwen full decode graph can publish next-token logits
-        // while it executes the trunk. Consume those once; all other models
-        // and the normal layered path retain the existing lm-head dispatch.
+        // Full decode graphs can publish next-token logits while executing
+        // the trunk. Qwen and DeepSeek V4.1 use this shared destination;
+        // consume it once before the normal layered lm-head dispatch.
         const bool have_full_graph_logits =
             engine.qwen4exp_full_graph_logits_ready;
         if (have_full_graph_logits) {
@@ -1317,8 +1320,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         if (hc_active)
             hc_expand_embedding(engine, decode_hidden.data(), 1, D);
         // This destination is valid only for the immediately following
-        // forward call. It is consumed by the Qwen-only full decode bridge;
-        // other model families ignore it.
+        // forward call. It is consumed by the Qwen and DeepSeek V4.1 full
+        // decode bridges; other model families ignore it.
         engine.qwen4exp_full_graph_logits_target = logits.data();
         engine.qwen4exp_full_graph_logits_target_size = V;
         layers_forward_gguf(engine, ram_mgr, prefetcher, decode_hidden.data(), 1, pos, &next_token);

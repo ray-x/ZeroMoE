@@ -157,6 +157,9 @@ size_t dense_arena_bytes(const FullGraph &g) {
   for (const auto &[name, q] : g.engine->resident_layers) {
     if (!q.host_ptr || !graph_dense_weight_name(name))
       continue;
+    // DeepSeek binds device-resident dense weights from the engine's pool.
+    if (g.engine->family_ops.family == ModelFamily::DeepSeek_V41 && q.device_ptr)
+      continue;
     if (name == "output.weight" && !g.decode_mode)
       continue;
     if (total > std::numeric_limits<size_t>::max() - q.meta.size_bytes - 4096)

@@ -8,10 +8,12 @@
 
 #include "engine.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
+#include "ggml_deepseek_v41_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 
 #include <cstdlib>
+#include <algorithm>
 
 namespace {
 
@@ -161,12 +163,63 @@ class DeepseekV4GraphModel final
   }
 };
 
+class DeepseekV41GraphModel final
+    : public FullGraphModelBase<DeepseekV41GraphModel> {
+ public:
+  ModelFamily family() const override { return ModelFamily::DeepSeek_V41; }
+  const char *name() const override { return "deepseek_v41"; }
+
+  bool enabled(const StreamingEngine &e, ModelGraphPhase phase) const override {
+    return !e.mtp_enabled &&
+           (phase == ModelGraphPhase::Decode
+                ? deepseek_v41_full_graph_decode_enabled()
+                : deepseek_v41_full_graph_enabled());
+  }
+  void shutdown() const override { deepseek_v41_full_graph_shutdown(); }
+  int device_expert_layers() const override {
+    return deepseek_v41_full_graph_device_expert_layers();
+  }
+  int max_prefill_tokens(const StreamingEngine &) const override {
+    static const int chunk = [] {
+      const char *v = std::getenv("MOESTREAM_DEEPSEEK_V41_PREFILL_CHUNK");
+      // Native cache-backed attention supports the whole prompt. A 128-token
+      // cap sent the rest of long prompts through serial decode.
+      return v && v[0] ? std::max(0, std::atoi(v)) : 0;
+    }();
+    return chunk;
+  }
+
+  bool accepts(const StreamingEngine &e, const ModelGraphRequest &r) const {
+    return !e.mtp_enabled &&
+           (r.phase == ModelGraphPhase::Prefill ? r.pos_base == 0
+               : r.n_tokens == 1 && r.pos_base >= 0);
+  }
+  bool prefill_prepare(StreamingEngine &e,
+                       const ModelGraphRequest &r) const {
+    return deepseek_v41_full_graph_prepare(e, r.n_tokens, r.pos_base,
+                                           r.token_ids);
+  }
+  bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return deepseek_v41_full_graph_run(e, r.hidden_states, r.n_tokens,
+                                       r.pos_base, r.token_ids);
+  }
+  bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return deepseek_v41_full_graph_decode_prepare(e, r.pos_base, r.token_ids);
+  }
+  bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return deepseek_v41_full_graph_decode_run(e, r.hidden_states, r.pos_base,
+        r.token_ids, r.logits ? r.logits : e.qwen4exp_full_graph_logits_target,
+        r.vocab > 0 ? r.vocab : e.qwen4exp_full_graph_logits_target_size);
+  }
+};
+
 } // namespace
 
 const FullGraphModel *full_graph_model(ModelFamily family) {
   static const Qwen4ExpGraphModel qwen;
   static const Glm5NextGraphModel glm;
   static const DeepseekV4GraphModel dsv4;
+  static const DeepseekV41GraphModel dsv41;
   switch (family) {
   case ModelFamily::Qwen4Exp:
     return &qwen;
@@ -174,6 +227,8 @@ const FullGraphModel *full_graph_model(ModelFamily family) {
     return &glm;
   case ModelFamily::DeepSeek_V4:
     return &dsv4;
+  case ModelFamily::DeepSeek_V41:
+    return &dsv41;
   default:
     return nullptr;
   }

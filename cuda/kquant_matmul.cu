@@ -492,17 +492,85 @@ static inline bool kquant_lane8_ok(int I) {
     return !kquant_legacy_forced() && (I / 256) >= 8 && (I % 4) == 0;
 }
 
-extern "C" void launch_q2_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
+// DeepSeek grouped output-A uses the native AVX-512 dot as its numerical
+// reference. A different reduction tree can flip a nearly tied router choice
+// several layers later. Each 16-lane group reproduces that dot's four FMA
+// accumulators and 8/4/2/1 horizontal reduction, while reading Q2_K weights
+// directly from the persistent device pool. Eight output rows share a block.
+__global__ void q2_K_grouped_dot_f32_kernel(
+    float* __restrict__ y, const float* __restrict__ x,
+    const uint8_t* __restrict__ weights, size_t group_stride_bytes,
+    int group_in, int rank, size_t x_token_stride, size_t x_group_stride,
+    size_t y_token_stride, size_t y_group_stride) {
+    const int row = blockIdx.x * 8 + threadIdx.x / 16;
+    const int group = blockIdx.y;
+    const int token = blockIdx.z;
+    if (row >= rank) return;
+    const int lane = threadIdx.x % 16;
+    const unsigned mask = __activemask();
+    const auto* w = reinterpret_cast<const block_q2_K_cu*>(
+        weights + (size_t)group * group_stride_bytes) +
+        (size_t)row * (group_in / 256);
+    const float* input = x + token * x_token_stride + group * x_group_stride;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (int i = 0; i < group_in; i += 64) {
+        const auto* block = w + i / 256;
+        const int offset = i % 256 + lane;
+        a0 = __fmaf_rn(input[i + lane],
+                       dequant_q2_K_block_coop(block, offset), a0);
+        a1 = __fmaf_rn(input[i + lane + 16],
+                       dequant_q2_K_block_coop(block, offset + 16), a1);
+        a2 = __fmaf_rn(input[i + lane + 32],
+                       dequant_q2_K_block_coop(block, offset + 32), a2);
+        a3 = __fmaf_rn(input[i + lane + 48],
+                       dequant_q2_K_block_coop(block, offset + 48), a3);
+    }
+    float sum = __fadd_rn(__fadd_rn(a0, a1), __fadd_rn(a2, a3));
+    #pragma unroll
+    for (int offset = 8; offset > 0; offset /= 2)
+        sum = __fadd_rn(sum, __shfl_down_sync(mask, sum, offset, 16));
+    if (lane == 0) y[token * y_token_stride + group * y_group_stride + row] = sum;
+}
+
+extern "C" void launch_q2_K_grouped_dot_f32_batch(
+    float* y, const float* x, const void* weights, size_t group_stride_bytes,
+    int groups, int rank, int group_in, int tokens, cudaStream_t stream) {
+    q2_K_grouped_dot_f32_kernel<<<dim3((rank + 7) / 8, groups, tokens), 128, 0, stream>>>(
+        y, x, static_cast<const uint8_t*>(weights), group_stride_bytes,
+        group_in, rank, (size_t)groups * group_in, group_in,
+        (size_t)groups * rank, rank);
+}
+
+extern "C" void launch_q2_K_grouped_dot_f32(
+    float* y, const float* x, const void* weights, size_t group_stride_bytes,
+    int groups, int rank, int group_in, cudaStream_t stream) {
+    launch_q2_K_grouped_dot_f32_batch(y, x, weights, group_stride_bytes,
+                                    groups, rank, group_in, 1, stream);
+}
+
+extern "C" void launch_q2_K_matmul_stream(float* y, const float* x,
+                                             const void* w, int S, int I,
+                                             int O, cudaStream_t stream) {
     if (kquant_lane8_ok(I))
-        q2_K_kquant_matmul_kernel_lane8<<<dim3(O, S), 256>>>(y, x, (const block_q2_K_cu*)w, S, I, O);
+        q2_K_kquant_matmul_kernel_lane8<<<dim3(O, S), 256, 0, stream>>>(
+            y, x, (const block_q2_K_cu*)w, S, I, O);
     else
-        q2_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q2_K_cu*)w, S, I, O);
+        q2_K_kquant_matmul_kernel<<<dim3(O, S), 256, 0, stream>>>(
+            y, x, (const block_q2_K_cu*)w, S, I, O);
+}
+extern "C" void launch_q2_K_matmul(float* y, const float* x, const void* w,
+                                     int S, int I, int O) {
+    launch_q2_K_matmul_stream(y, x, w, S, I, O, nullptr);
+}
+extern "C" void launch_q3_K_matmul_stream(float* y, const float* x, const void* w,
+                                            int S, int I, int O, cudaStream_t stream) {
+    if (kquant_lane8_ok(I))
+        q3_K_kquant_matmul_kernel_lane8<<<dim3(O, S), 256, 0, stream>>>(y, x, (const block_q3_K_cu*)w, S, I, O);
+    else
+        q3_K_kquant_matmul_kernel<<<dim3(O, S), 256, 0, stream>>>(y, x, (const block_q3_K_cu*)w, S, I, O);
 }
 extern "C" void launch_q3_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
-    if (kquant_lane8_ok(I))
-        q3_K_kquant_matmul_kernel_lane8<<<dim3(O, S), 256>>>(y, x, (const block_q3_K_cu*)w, S, I, O);
-    else
-        q3_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q3_K_cu*)w, S, I, O);
+    launch_q3_K_matmul_stream(y, x, w, S, I, O, nullptr);
 }
 extern "C" void launch_q4_K_matmul(float* y, const float* x, const void* w, int S, int I, int O) {
     if (kquant_lane8_ok(I))
@@ -522,3 +590,139 @@ extern "C" void launch_q6_K_matmul(float* y, const float* x, const void* w, int 
     else
         q6_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q6_K_cu*)w, S, I, O);
 }
+
+#if defined(MOESTREAM_USE_GGML_CUDA)
+#include "ggml.h"
+#include <atomic>
+#include <climits>
+
+// The optional backend hook supplies stream-ordered native F32 operations to
+// GGML. It is absent from ordinary GGML builds, which remain fully supported.
+using MoestreamF32QuantHook = bool (*)(const ggml_tensor *, const ggml_tensor *,
+                                       const ggml_tensor *, ggml_tensor *, void *, bool);
+extern "C" void ggml_cuda_set_f32_quant_matmul_hook(MoestreamF32QuantHook)
+    __attribute__((weak));
+static std::atomic<uint64_t> f32_quant_graph_launches{0};
+
+// The reduction and dequantization order matches the existing native kernel.
+// Only the weight base and source/output row are indirect. No weight staging,
+// conversion buffer, or host route-table readback is involved.
+template<int Q, bool Lane8>
+__global__ void native_f32_matmul_id(
+    float *y, const float *x, const uint8_t *weights, const uint8_t *ids,
+    int I, int O, int experts, int input_routes, size_t weight_stride,
+    size_t x_token_stride, size_t x_route_stride,
+    size_t y_token_stride, size_t y_route_stride,
+    size_t id_token_stride, size_t id_route_stride) {
+    const int row = blockIdx.x, token = blockIdx.y, route = blockIdx.z;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int expert = *reinterpret_cast<const int32_t *>(
+        ids + token * id_token_stride + route * id_route_stride);
+    float *out = y + token * y_token_stride + route * y_route_stride + row;
+    if (expert < 0 || expert >= experts) {
+        if (!tid) *out = expert < 0 ? 0.0f : nanf("");
+        return;
+    }
+    const int bpr = I / 256;
+    constexpr int block_bytes = Q == 2 ? sizeof(block_q2_K_cu) : sizeof(block_q3_K_cu);
+    const uint8_t *wrow = weights + expert * weight_stride + (size_t)row * bpr * block_bytes;
+    const float *input = x + token * x_token_stride + (route % input_routes) * x_route_stride;
+    float acc = 0.0f;
+    __shared__ int8_t scales[16];
+    if constexpr (Lane8) {
+        for (int b = warp; b < bpr; b += 8) {
+            float wv[8];
+            if constexpr (Q == 2) dequant_q2_K_lane8(reinterpret_cast<const block_q2_K_cu *>(wrow) + b, lane, wv);
+            else dequant_q3_K_lane8(reinterpret_cast<const block_q3_K_cu *>(wrow) + b, lane, wv);
+            const float *xp = input + (size_t)b * 256 + lane * 8;
+            float4 x0 = *reinterpret_cast<const float4 *>(xp);
+            float4 x1 = *reinterpret_cast<const float4 *>(xp + 4);
+            acc += wv[0]*x0.x + wv[1]*x0.y + wv[2]*x0.z + wv[3]*x0.w
+                 + wv[4]*x1.x + wv[5]*x1.y + wv[6]*x1.z + wv[7]*x1.w;
+        }
+    } else {
+        for (int b = 0; b < bpr; ++b) {
+            float wv;
+            if constexpr (Q == 2) wv = dequant_q2_K_block_coop(reinterpret_cast<const block_q2_K_cu *>(wrow) + b, tid);
+            else wv = dequant_q3_K_block_shared_scales(reinterpret_cast<const block_q3_K_cu *>(wrow) + b, tid, scales);
+            acc += input[b * 256 + tid] * wv;
+            if constexpr (Q == 3) __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off /= 2) acc += __shfl_down_sync(0xffffffff, acc, off);
+    __shared__ float partial[8];
+    if (lane == 0) partial[warp] = acc;
+    __syncthreads();
+    if (warp == 0) {
+        float value = lane < 8 ? partial[lane] : 0.0f;
+        #pragma unroll
+        for (int off = 16; off > 0; off /= 2) value += __shfl_down_sync(0xffffffff, value, off);
+        if (!lane) *out = value;
+    }
+}
+
+static bool native_f32_quant_hook(const ggml_tensor *w, const ggml_tensor *x,
+                                  const ggml_tensor *ids, ggml_tensor *y,
+                                  void *opaque_stream, bool execute) {
+    if (!w || !x || !y || (w->type != GGML_TYPE_Q2_K && w->type != GGML_TYPE_Q3_K) ||
+        x->type != GGML_TYPE_F32 || y->type != GGML_TYPE_F32 ||
+        w->ne[0] <= 0 || w->ne[0] > INT_MAX || w->ne[1] <= 0 || w->ne[1] > INT_MAX ||
+        w->ne[0] % 256 || x->nb[0] != sizeof(float) || y->nb[0] != sizeof(float))
+        return false;
+    const int I = int(w->ne[0]), O = int(w->ne[1]);
+    const size_t row = (size_t)(I / 256) * (w->type == GGML_TYPE_Q2_K ? 84 : 110);
+    if (w->nb[1] != row || x->ne[0] != I || y->ne[0] != O) return false;
+    const auto stream = static_cast<cudaStream_t>(opaque_stream);
+    if (ids) {
+        if (ids->type != GGML_TYPE_I32 || ids->nb[0] != sizeof(int32_t) ||
+            ids->ne[0] <= 0 || ids->ne[0] > 65535 || ids->ne[1] <= 0 || ids->ne[1] > 65535 ||
+            w->ne[2] > INT_MAX || w->ne[3] != 1 ||
+            (x->ne[1] != 1 && x->ne[1] != ids->ne[0]) ||
+            x->ne[2] != ids->ne[1] || x->ne[3] != 1 ||
+            y->ne[1] != ids->ne[0] || y->ne[2] != ids->ne[1] || y->ne[3] != 1)
+            return false;
+        if (!execute) return true;
+        dim3 grid(O, int(ids->ne[1]), int(ids->ne[0]));
+        #define LAUNCH_NATIVE_ID(Q, L) native_f32_matmul_id<Q,L><<<grid,256,0,stream>>>( \
+            static_cast<float *>(y->data), static_cast<const float *>(x->data), \
+            static_cast<const uint8_t *>(w->data), static_cast<const uint8_t *>(ids->data), \
+            I, O, int(w->ne[2]), int(x->ne[1]), w->nb[2], x->nb[2]/4, x->nb[1]/4, \
+            y->nb[2]/4, y->nb[1]/4, ids->nb[1], ids->nb[0])
+        if (w->type == GGML_TYPE_Q2_K) {
+            if (kquant_lane8_ok(I)) { LAUNCH_NATIVE_ID(2,true); }
+            else { LAUNCH_NATIVE_ID(2,false); }
+        } else {
+            if (kquant_lane8_ok(I)) { LAUNCH_NATIVE_ID(3,true); }
+            else { LAUNCH_NATIVE_ID(3,false); }
+        }
+        #undef LAUNCH_NATIVE_ID
+    } else if (w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+               x->ne[1] > 0 && x->ne[1] <= 65535 && y->ne[1] == x->ne[1] &&
+               x->nb[1] == (size_t)I * 4 && y->nb[1] == (size_t)O * 4) {
+        if (!execute) return true;
+        if (w->type == GGML_TYPE_Q2_K)
+            launch_q2_K_matmul_stream(static_cast<float *>(y->data), static_cast<const float *>(x->data), w->data, int(x->ne[1]), I, O, stream);
+        else launch_q3_K_matmul_stream(static_cast<float *>(y->data), static_cast<const float *>(x->data), w->data, int(x->ne[1]), I, O, stream);
+    } else if (w->type == GGML_TYPE_Q2_K && w->ne[3] == 1 &&
+               w->ne[2] > 1 && w->ne[2] <= 65535 && x->ne[2] == w->ne[2] &&
+               x->ne[3] == 1 && x->ne[1] > 0 && x->ne[1] <= 65535 &&
+               y->ne[1] == x->ne[1] && y->ne[2] == w->ne[2] && y->ne[3] == 1) {
+        if (!execute) return true;
+        q2_K_grouped_dot_f32_kernel<<<dim3((O+7)/8, int(w->ne[2]), int(x->ne[1])),128,0,stream>>>(
+            static_cast<float *>(y->data), static_cast<const float *>(x->data),
+            static_cast<const uint8_t *>(w->data), w->nb[2], I, O,
+            x->nb[1]/4, x->nb[2]/4, y->nb[1]/4, y->nb[2]/4);
+    } else return false;
+    f32_quant_graph_launches.fetch_add(1, std::memory_order_relaxed);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+extern "C" bool moestream_install_f32_quant_graph_hook() {
+    if (!ggml_cuda_set_f32_quant_matmul_hook) return false;
+    ggml_cuda_set_f32_quant_matmul_hook(native_f32_quant_hook);
+    return true;
+}
+extern "C" uint64_t moestream_f32_quant_graph_launches() {
+    return f32_quant_graph_launches.load(std::memory_order_relaxed);
+}
+#endif

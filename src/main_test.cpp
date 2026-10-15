@@ -4767,6 +4767,44 @@ bool test_compact_vram_slot_planner() {
 // This stays CPU-only: it exercises the RAM state machine and does not start
 // CUDA, allocate a VRAM pool, or read a model file.
 // ------------------------------------------------------------------
+bool test_ram_sync_promotion_capacity() {
+    std::cout << "[Test] RAM sync promotion preserves reusable slab capacity...\n";
+    StreamingEngine engine;
+    engine.layers_experts.resize(1);
+    engine.layers_experts[0].resize(1);
+    RAMSafetyManager ram;
+    ram.slots_per_layer = 1;
+    auto &slot = engine.layers_experts[0][0];
+    constexpr size_t bytes = 4096;
+    slot.slab_buffer = static_cast<uint8_t *>(calloc(1, bytes));
+    if (!slot.slab_buffer) return false;
+    slot.slab_capacity = bytes;
+    slot.expert_id = 7;
+    std::memset(slot.slab_buffer, 0x5a, bytes);
+    uint8_t *const original = slot.slab_buffer;
+    ram.preload_ram_slot(engine, 0, 7, 0);
+    ram.move_on_promotion = true;
+    ram.finish_sync_promotion(slot, 0, 7, &engine.layers_experts[0]);
+    bool ok = slot.expert_id == -1 && slot.slab_buffer == original &&
+              slot.slab_capacity == bytes;
+    engine.ensure_slab_capacity(slot, bytes);
+    ok = ok && slot.slab_buffer == original && slot.slab_capacity == bytes;
+    for (size_t i = 0; i < bytes; ++i) ok = ok && slot.slab_buffer[i] == 0x5a;
+    slot.expert_id = 8;
+    ram.preload_ram_slot(engine, 0, 8, 0);
+    ram.move_on_promotion = false;
+    ram.finish_sync_promotion(slot, 0, 8, &engine.layers_experts[0]);
+    ok = ok && slot.expert_id == 8 && slot.also_in_vram &&
+         slot.slab_buffer == original && slot.slab_capacity == bytes;
+    ram.move_on_promotion = true;
+    ram.ram_pin(slot);
+    ram.finish_sync_promotion(slot, 0, 8, &engine.layers_experts[0]);
+    ok = ok && slot.expert_id == 8 && slot.slab_capacity == bytes;
+    ram.ram_unpin(slot);
+    std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
+    return ok;
+}
+
 bool test_ram_async_source_hold() {
     std::cout << "[Test 20c] RAM ready lookup holds an async source slab...\n";
 
@@ -4820,6 +4858,7 @@ bool test_ram_async_source_hold() {
         ram.ram_unpin(*hit.slot);
 
     ok = ok && slot.ram_temp_pin_count == 0;
+    ok = test_ram_sync_promotion_capacity() && ok;
     std::cout << "  -> " << (ok ? "PASSED" : "FAILED") << "\n";
     return ok;
 }
@@ -7146,6 +7185,8 @@ bool test_exl3_cuda_kernels() {
 }
 
 int main() {
+    if (std::getenv("MOESTREAM_TEST_ONLY_RAM_PROMOTION"))
+        return test_ram_async_source_hold() ? 0 : 1;
     if (std::getenv("MOESTREAM_TEST_ONLY_EXL3_GGML_CONFIG"))
         return test_exl3_ggml_graph_capture_config() ? 0 : 1;
     if (!test_exl3_cpu_dispatch()) return 1;
