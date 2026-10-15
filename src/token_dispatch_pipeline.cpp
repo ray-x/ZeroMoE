@@ -1099,6 +1099,17 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     // were correct but the FFN itself was operating on the wrong input.
     const float *token_hidden = scratch.normed.data() + s * D;
     float *token_output = output + s * D;
+    // Cache placement must not change DeepSeek's reduction tree. Summing
+    // separately on each GPU changes the F32 result whenever an expert moves
+    // between devices, and tiny differences can flip a nearly tied router.
+    // Keep per-route activation rows, download once per GPU, and apply the
+    // native weighted FMA in k order after every expert has completed.
+    const bool ordered_routes =
+        engine.family_ops.family == ModelFamily::DeepSeek_V41;
+    bool collecting_ordered = ordered_routes;
+    static thread_local std::vector<float> ordered_route_outputs;
+    if (ordered_routes)
+      ordered_route_outputs.assign((size_t)topk * D, 0.0f);
 
     // Weighted accumulation + VERBOSE trace, shared by both the CPU path
     // (dispatch_expert_k's own synchronous fallback) and the GPU path
@@ -1121,11 +1132,16 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
           ss += (double)down_buf_ptr[d] * down_buf_ptr[d];
         LOG_STREAM_VERBOSE()
             << "[TRACE l=" << layer_idx << "] expert k=" << k
-            << " id=" << exp->expert_id
+            << " id=" << scratch.tok_topk_ids[s * topk + k]
             << " requested_id=" << scratch.tok_topk_ids[s * topk + k]
             << " |down_buf|=" << std::sqrt(ss) << "\n";
       }
 
+      if (collecting_ordered) {
+        std::memcpy(ordered_route_outputs.data() + (size_t)k * D,
+                    down_buf_ptr, (size_t)D * sizeof(float));
+        return;
+      }
       // Weighted accumulation: output += weight * expert_output
       float w = scratch.tok_topk_weights[s * topk + k];
       if (std::isnan(w) || std::isinf(w)) {
@@ -1135,7 +1151,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
                   "clean and this "
                   "still poisons token_output; check "
                   "router_logits/normalization above.\n",
-                  layer_idx, s, k, exp->expert_id, w);
+                  layer_idx, s, k, scratch.tok_topk_ids[s * topk + k], w);
       }
       __m512 v_w = _mm512_set1_ps(w);
       int i = 0;
@@ -1312,8 +1328,9 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
 
     // Decode normally routes one token through each selected expert.  Reuse
     // the same device-side scatter accumulator as the grouped prefill path so
-    // the final [D] result is downloaded once per layer/GPU instead of once
-    // per expert.  The route table is tiny at S==1, but keep it in a
+    // result is downloaded once per layer/GPU instead of once per expert.
+    // DeepSeek retains separate k rows until its fixed-order host reduction.
+    // The route table is tiny at S==1, but keep it in a
     // thread-local grow-only vector so this does not allocate on every token.
     const bool decode_gpu_accum =
         S == 1 && topk > 0 && moe_gpu_accum() && ram_mgr.vram_cache;
@@ -1324,8 +1341,9 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       decode_accum_tok.resize((size_t)topk);
       decode_accum_w.resize((size_t)topk);
       for (int k = 0; k < topk; ++k) {
-        decode_accum_tok[(size_t)k] = 0;
-        decode_accum_w[(size_t)k] = scratch.tok_topk_weights[s * topk + k];
+        decode_accum_tok[(size_t)k] = ordered_routes ? k : 0;
+        decode_accum_w[(size_t)k] =
+            ordered_routes ? 1.0f : scratch.tok_topk_weights[s * topk + k];
       }
     }
 
@@ -1344,6 +1362,11 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       // call below, ram_pin(), error-path branching).
       PERF_SCOPE(t_dispatch_expert_k_total);
       MoEExpertBlock *exp = scratch.expert_ptrs[k];
+      // A RAM block can be MOVE-promoted into the main VRAM cache while it
+      // is loaded or resolved, which clears exp->expert_id while leaving the
+      // block's projection pointers valid. Always resolve/hold by the
+      // immutable routed ID for this token, never by that mutable slot field.
+      const int routed_expert_id = scratch.tok_topk_ids[s * topk + k];
       // A shadow block (see the loading loop below) legitimately has
       // null host_ptr by design -- it's metadata-only, GPU dispatch
       // reads weight bytes from ExpertLocation::device_ptr, never
@@ -1388,7 +1411,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
             exp->gate_proj.meta, exp->up_proj.host_ptr, exp->up_proj.meta,
             exp->down_proj.host_ptr, exp->down_proj.meta,
             scratch.gate_buf.data(), scratch.up_buf.data(), 1, D, moe_inter,
-            clamp_exp, layer_idx, exp->expert_id);
+            clamp_exp, layer_idx, routed_expert_id);
         ram_mgr.ram_unpin(*exp);
         accumulate(k, exp, scratch.down_buf.data());
         return;
@@ -1397,7 +1420,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       ExpertGpuContext gpu_ctx;
       gpu_ctx.topo = ram_mgr.vram_cache;
       gpu_ctx.layer_idx = layer_idx;
-      gpu_ctx.expert_id = exp->expert_id;
+      gpu_ctx.expert_id = routed_expert_id;
       gpu_ctx.slab_buffer = exp->slab_buffer;
       // Real total, not slab_capacity -- same bug/reasoning as
       // decode_async_prewarm's own fix above (see its comment for the
@@ -1435,7 +1458,8 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
       gpu_ctx.loc = (exp->vram_shadow && scratch.vram_loc_hint[k])
                         ? scratch.vram_loc_hint[k]
                         : (ram_mgr.vram_cache ? ram_mgr.vram_cache->find_expert(
-                                                    layer_idx, exp->expert_id)
+                                                    layer_idx,
+                                                    routed_expert_id)
                                               : nullptr);
 
       bool needs_release = false;
@@ -1453,7 +1477,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
               << scratch.pending_gpu.size()
               << " gpu_pool.size()=" << scratch.gpu_pool.size()
               << " layer=" << layer_idx << " k=" << k
-              << " expert=" << exp->expert_id << " topk=" << topk << "\n";
+              << " expert=" << routed_expert_id << " topk=" << topk << "\n";
         }
         GpuExpertScratch &gs = scratch.gpu_pool[scratch.pending_gpu.size()];
         gpu_issued = expert_ffn_gpu_issue(
@@ -1517,7 +1541,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // fallback below has real bytes instead of the shadow's
         // null host_ptr.
         MoEExpertBlock *real =
-            ram_mgr.get_expert(engine, layer_idx, exp->expert_id);
+            ram_mgr.get_expert(engine, layer_idx, routed_expert_id);
         if (real && real->gate_proj.host_ptr && real->down_proj.host_ptr) {
           perf().n_shadow_race_reload_success.fetch_add(
               1, std::memory_order_relaxed);
@@ -1531,7 +1555,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
               "emergency "
               "RAM reload also failed -- skipping this expert's contribution "
               "entirely rather than read a null/stale pointer\n",
-              layer_idx, exp->expert_id);
+              layer_idx, routed_expert_id);
           return;
         }
       }
@@ -1599,7 +1623,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
             exp->gate_proj.meta, exp->up_proj.host_ptr, exp->up_proj.meta,
             exp->down_proj.host_ptr, exp->down_proj.meta,
             scratch.gate_buf.data(), scratch.up_buf.data(), 1, D, moe_inter,
-            clamp_exp, layer_idx, exp->expert_id);
+            clamp_exp, layer_idx, scratch.tok_topk_ids[s * topk + k]);
         ram_mgr.ram_unpin(*exp);
         accumulate(k, exp, scratch.down_buf.data());
       }
@@ -2490,7 +2514,8 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
               decode_accum_begun[gid])
             continue;
           decode_accum_begun[gid] = engine.gpu->expert_accum_begin(
-              gid, 1, D, decode_accum_tok.data(), decode_accum_w.data(), topk);
+              gid, ordered_routes ? topk : 1, D,
+              decode_accum_tok.data(), decode_accum_w.data(), topk);
         }
       }
 
@@ -2514,7 +2539,8 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
           if (gid >= 0 && gid < PerfCounters::PERF_MAX_GPU_SLOTS &&
               decode_accum_begun[gid]) {
             p.accumulated_on_device = engine.gpu->expert_accum_add(
-                gid, scratch.gpu_pool[pi].d_down, p.k, 1, D, 1);
+                gid, scratch.gpu_pool[pi].d_down, p.k, 1, D,
+                ordered_routes ? topk : 1);
             if (p.accumulated_on_device)
               perf().n_expert_gpu_calls.fetch_add(1, std::memory_order_relaxed);
           }
@@ -2586,15 +2612,16 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         accumulate(p.k, p.exp, scratch.down_buf.data());
       }
 
-      // One [D] download per active GPU for all device-accumulated routed
-      // experts in this token/layer.  A GPU that also had a legacy fallback
+      // One download per active GPU: [topk,D] disjoint rows for DeepSeek's
+      // ordered reduction, [D] summed output otherwise. A GPU with a fallback
       // was already synchronized above, so avoid paying a duplicate wait.
       for (int gid = 0; gid < PerfCounters::PERF_MAX_GPU_SLOTS; ++gid) {
         if (!decode_accum_begun[gid])
           continue;
         const bool already_synced = need_sync2[gid] && synced[gid];
-        if (!engine.gpu->expert_accum_end(gid, token_output, 1, D,
-                                          already_synced))
+        if (!engine.gpu->expert_accum_end(
+                gid, ordered_routes ? ordered_route_outputs.data() : token_output,
+                ordered_routes ? topk : 1, D, already_synced))
           perf().n_moe_gpu_accum_fallback.fetch_add(1,
                                                     std::memory_order_relaxed);
       }
@@ -2610,6 +2637,13 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
                                            p.loc_from_active_layer);
         ram_mgr.ram_unpin(*p.exp);
       }
+    }
+
+    if (ordered_routes) {
+      collecting_ordered = false;
+      for (int k = 0; k < topk; ++k)
+        accumulate(k, scratch.expert_ptrs[k],
+                    ordered_route_outputs.data() + (size_t)k * D);
     }
 
     bool cpu_offload_event_fenced_handled = false;

@@ -7,6 +7,8 @@
 #include "../models/full_graph_model.hpp"
 #include "expert_activation.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
+#include "ggml_deepseek_v41_graph.hpp"
+#include "dsv41_trace.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_hc_backend.hpp"
@@ -1016,13 +1018,37 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   engine.glm5next_full_graph_output_ready = false;
   engine.deepseek_v4_full_graph_output_ready = false;
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
+  if (S > 1 && pos_base == 0 &&
+      engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+      graph_model && graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
+    // Prefill and decode graphs each need a dense arena. They run in separate
+    // phases, so release the previous decode graph before building prefill;
+    // the DDR/VRAM MoE caches remain owned by the engine and are untouched.
+    deepseek_v41_full_graph_decode_shutdown();
+    if (!g_layer_scratch.resize(S, D, c.n_experts, c.moe_inter, c.topk,
+                                c.n_expert_shared, c.dense_inter))
+      return;
+    deepseek_v41_bind_graph_runtime(engine, ram_mgr, async_io_queue,
+                                    g_layer_scratch);
+  }
+  if (S == 1 && engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+      deepseek_v41_full_graph_decode_enabled()) {
+    if (!g_layer_scratch.resize(1, D, c.n_experts, c.moe_inter, c.topk,
+                                c.n_expert_shared, c.dense_inter))
+      return;
+    deepseek_v41_bind_graph_runtime(engine, ram_mgr, async_io_queue,
+                                    g_layer_scratch);
+  }
   const ModelGraphRequest prefill_graph_request{
       ModelGraphPhase::Prefill, S, pos_base, token_ids, hidden_states};
   if (S > 1 && pos_base == 0 && graph_model &&
       graph_model->enabled(engine, ModelGraphPhase::Prefill) &&
+      graph_model->build(engine, prefill_graph_request) &&
       graph_model->run(engine, prefill_graph_request)) {
     return;
   }
+  if (!engine.qwen4exp_full_graph_failure.empty())
+    return;
   const ModelGraphRequest decode_graph_request{
       ModelGraphPhase::Decode,
       S,
@@ -1121,6 +1147,8 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                              // reallocated -- always valid
     if (S == 1)
       dump_prefill_boundary("input", l, pos_base, last_tok, D);
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+      dsv41_trace::save("input", l, pos_base, last_tok, D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l
                            << "] in      |hidden|=" << l2norm(last_tok, D)
@@ -1146,6 +1174,15 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       qwen4exp_hc_prepare_host_layer_input(engine, l, S);
       fo.layer_input_fn(engine, l, S, pos_base, token_ids);
       qwen4exp_hc_commit_host_layer_input(engine, l, S);
+      if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+        dsv41_trace::save(
+            "post-input-hook", l, pos_base,
+            engine.hc_stream_buf.data() + (size_t)(S - 1) * c.hc_mult * D,
+            D);
+      if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1)
+        dsv41_trace::save("post-input-hook-seq", l, pos_base,
+                          engine.hc_stream_buf.data(),
+                          (size_t)S * c.hc_mult * D);
       // A/A diagnostic: after a sparse Qwen PLE layer has modified the
       // host HC copy and committed it back to the device-authoritative
       // runner, capture the actual wide state before hc_pre.  This is the
@@ -1189,6 +1226,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     auto diag_attn_call_start = std::chrono::high_resolution_clock::now();
     fo.attention_fn(engine, l, hidden_states, S, pos_base,
                     scratch.attn_out.data());
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+      dsv41_trace::save("attn-out", l, pos_base,
+                        scratch.attn_out.data() + (size_t)(S - 1) * D, D);
     g_diag_attn_call_ms += std::chrono::duration<double, std::milli>(
                                std::chrono::high_resolution_clock::now() -
                                diag_attn_call_start)
@@ -1259,6 +1299,15 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     for (int i = 0; i < S; ++i)
       dump_prefill_boundary("post_attn", l, pos_base + i,
                             hidden_states + (size_t)i * D, D);
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+      dsv41_trace::save("post-attn", l, pos_base,
+                        hidden_states + (size_t)(S - 1) * D, D);
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+        engine.hc_stream_buf.size() >= (size_t)S * c.hc_mult * D)
+      dsv41_trace::save(
+          "post-attn-streams", l, pos_base,
+          engine.hc_stream_buf.data() + (size_t)(S - 1) * c.hc_mult * D,
+          (size_t)c.hc_mult * D);
     if (trace)
       LOG_STREAM_VERBOSE() << "[TRACE l=" << l << "] post-attn |attn_out|="
                            << l2norm(scratch.attn_out.data() +
@@ -1366,6 +1415,9 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
         g_diag_decode_hc_ffn_pre_ms += elapsed;
       }
     }
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+      dsv41_trace::save("hc-ffn-pre", l, pos_base,
+                        hidden_states + (size_t)(S - 1) * D, D);
     if (S == 1)
       dump_prefill_device_boundary("hc_ffn_pre", l, pos_base,
                                    engine.qwen4exp_device_hc_ffn_input, D);
@@ -1426,6 +1478,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                          scratch.moe_out.data(), scratch, token_ids);
       }
     }
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+      dsv41_trace::save("moe-out", l, pos_base,
+                        scratch.moe_out.data() + (size_t)(S - 1) * D, D);
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1)
+      dsv41_trace::save("moe-out-seq", l, pos_base, scratch.moe_out.data(),
+                        (size_t)S * D);
     if (!probe_last_scores.empty() && S == 1 && (int)scratch.tok_topk_ids.size() >= c.topk) {
       static std::atomic<uint64_t> agree{0}, total{0};
       std::vector<int> idx((size_t)c.n_experts);
@@ -1566,6 +1624,38 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
                                    .count();
         g_diag_decode_hc_ms += elapsed;
         g_diag_decode_hc_post_ms += elapsed;
+      }
+    }
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41) {
+      dsv41_trace::save("post-ffn", l, pos_base,
+                        hidden_states + (size_t)(S - 1) * D, D);
+      if (engine.hc_stream_buf.size() >= (size_t)S * c.hc_mult * D)
+        dsv41_trace::save(
+            "post-ffn-streams", l, pos_base,
+            engine.hc_stream_buf.data() + (size_t)(S - 1) * c.hc_mult * D,
+            (size_t)c.hc_mult * D);
+      if (dsv41_trace::enabled(l, pos_base) &&
+          (int)scratch.tok_topk_ids.size() >= c.topk &&
+          (int)scratch.tok_topk_weights.size() >= c.topk) {
+        std::vector<float> ids((size_t)c.topk);
+        for (int k = 0; k < c.topk; ++k)
+          ids[(size_t)k] =
+              static_cast<float>(scratch.tok_topk_ids[
+                  (size_t)(S - 1) * c.topk + k]);
+        dsv41_trace::save("route-ids", l, pos_base, ids.data(), ids.size());
+        dsv41_trace::save("route-weights", l, pos_base,
+                          scratch.tok_topk_weights.data() +
+                              (size_t)(S - 1) * c.topk,
+                          c.topk);
+      }
+      if (S > 1) {
+        std::vector<float> ids((size_t)S * c.topk);
+        for (size_t i = 0; i < ids.size(); ++i)
+          ids[i] = static_cast<float>(scratch.tok_topk_ids[i]);
+        dsv41_trace::save("route-ids-seq", l, pos_base, ids.data(),
+                          ids.size());
+        dsv41_trace::save("route-weights-seq", l, pos_base,
+                          scratch.tok_topk_weights.data(), ids.size());
       }
     }
     dump_prefill_hc_streams("hc_streams_post_ffn", l, pos_base, S,

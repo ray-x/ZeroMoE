@@ -24,6 +24,7 @@
 // handed out without swapping.
 
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -66,19 +67,53 @@ inline bool host_budget_allows(size_t budget, size_t current, size_t bytes,
     return watermark_bytes <= budget - current - bytes;
 }
 
+// Physical-memory admission must also count reservations that have not
+// faulted pages in yet. posix_memalign is lazy, so MemAvailable can remain
+// unchanged while several worker threads reserve large DDR slabs. Compare
+// both the live kernel estimate and the startup snapshot minus every live
+// reservation; the smaller remaining headroom is authoritative.
+inline bool physical_host_budget_allows(size_t startup_available,
+                                        size_t live_available,
+                                        size_t reserved, size_t bytes,
+                                        size_t stop_reserve,
+                                        size_t watermark_bytes = 0) {
+    if (startup_available == 0 || bytes == 0) return bytes == 0;
+    if (stop_reserve > SIZE_MAX - watermark_bytes) return false;
+    const size_t reserve = stop_reserve + watermark_bytes;
+    if (reserved >= startup_available ||
+        reserve >= startup_available - reserved ||
+        bytes > startup_available - reserved - reserve)
+        return false;
+    if (live_available <= reserve || bytes > live_available - reserve)
+        return false;
+    return true;
+}
+
 class MemoryGuard {
 public:
+    static constexpr long kMinimumHostReserveMiB = 20 * 1024;
+    static constexpr long effective_stop_limit_mb(long requested_mb) {
+        return requested_mb < kMinimumHostReserveMiB
+            ? kMinimumHostReserveMiB : requested_mb;
+    }
     // `host_ram_gb` is the process-wide host-memory ceiling, not merely a
     // suggestion for the RAM expert cache. Resident tensors, KV/state, RAM
     // slabs, graph source, and MTP scratch all share this ledger. A value of
     // zero preserves the historical auto-detect behavior.
     static void configure_host_budget(size_t bytes) {
         host_budget_bytes_.store(bytes, std::memory_order_relaxed);
+        const long available_mb = read_available_mb();
+        const size_t available_bytes = available_mb > 0
+            ? static_cast<size_t>(available_mb) * 1024ull * 1024ull : 0;
+        startup_available_bytes_.store(available_bytes,
+                                       std::memory_order_relaxed);
         LOG_STREAM_INFO() << "[MEM-GUARD] host allocation budget: "
                           << (bytes ? (double)bytes / 1e9 : 0.0)
                           << (bytes ? " GB (hard process cap)"
                                     : " (auto; no explicit process cap)")
-                          << "\n";
+                          << "; startup MemAvailable: "
+                          << (available_bytes ? (double)available_bytes / 1e9 : 0.0)
+                          << " GB\n";
     }
 
     static size_t host_budget_bytes() {
@@ -108,8 +143,8 @@ public:
 
     void start(long warn_mb, long stop_mb, int poll_ms) {
         if (running_.load()) return;
-        warn_mb_ = warn_mb;
-        stop_mb_ = stop_mb;
+        stop_mb_ = effective_stop_limit_mb(stop_mb);
+        warn_mb_ = std::max(warn_mb, stop_mb_);
         poll_ms_ = poll_ms > 0 ? poll_ms : 500;
         stop_limit_mb_.store(stop_mb_, std::memory_order_relaxed);
         if (read_available_mb() < 0) {
@@ -141,23 +176,27 @@ public:
     // The background flag is only a low-latency early signal; a large
     // allocation must also account for its own bytes because the watchdog
     // may be one poll interval behind MemAvailable.
-    static bool allocation_allowed(size_t bytes) {
+    static bool allocation_allowed(size_t bytes,
+                                   size_t watermark_bytes = 0) {
         if (bytes == 0) return true;
         if (allocation_blocked()) return false;
         const size_t budget = host_budget_bytes();
         if (budget > 0) {
             const size_t current = reserved_host_bytes();
-            if (!host_budget_allows(budget, current, bytes))
+            if (!host_budget_allows(budget, current, bytes,
+                                    watermark_bytes))
                 return false;
         }
         const long available_mb = read_available_mb();
-        if (available_mb < 0) return true; // preserve the guard's fail-open rule
+        if (available_mb < 0) return false;
         const size_t available = static_cast<size_t>(available_mb) * 1024ull * 1024ull;
         const long stop_mb = stop_limit_mb_.load(std::memory_order_relaxed);
         const size_t reserve = stop_mb > 0
                                    ? static_cast<size_t>(stop_mb) * 1024ull * 1024ull
                                    : 0;
-        return available > reserve && bytes <= available - reserve;
+        return physical_host_budget_allows(
+            startup_available_bytes_.load(std::memory_order_relaxed),
+            available, reserved_host_bytes(), bytes, reserve, watermark_bytes);
     }
 
     // Reserve host bytes for allocations that remain live. This is used by
@@ -170,43 +209,26 @@ public:
     static bool try_reserve_host_bytes(size_t bytes,
                                        size_t watermark_bytes = 0) {
         if (bytes == 0) return true;
-        if (!allocation_allowed(bytes)) return false;
-        const long available_mb = read_available_mb();
-        if (available_mb < 0) {
-            // Preserve the historical fail-open behavior for the live system
-            // signal, but still enforce an explicit host_ram_gb admission cap
-            // when /proc/meminfo is unavailable.
-            const size_t host_budget = host_budget_bytes_.load(std::memory_order_relaxed);
-            size_t current = reserved_bytes_.load(std::memory_order_relaxed);
-            for (;;) {
-                if (host_budget > 0 &&
-                    !host_budget_allows(host_budget, current, bytes,
-                                        watermark_bytes))
-                    return false;
-                if (reserved_bytes_.compare_exchange_weak(
-                        current, current + bytes, std::memory_order_relaxed,
-                        std::memory_order_relaxed))
-                    return true;
-            }
-        }
-        const size_t available = static_cast<size_t>(available_mb) * 1024ull * 1024ull;
+        if (!allocation_allowed(bytes, watermark_bytes)) return false;
         const long stop_mb = stop_limit_mb_.load(std::memory_order_relaxed);
         const size_t stop_reserve = stop_mb > 0
                                         ? static_cast<size_t>(stop_mb) * 1024ull * 1024ull
                                         : 0;
-        if (available <= stop_reserve ||
-            watermark_bytes > available - stop_reserve)
-            return false;
-        const size_t limit = available - stop_reserve - watermark_bytes;
         size_t current = reserved_bytes_.load(std::memory_order_relaxed);
         for (;;) {
-            // `available` is the kernel's current free/reclaimable memory and
-            // already reflects the bytes represented by `current`. Do not add
-            // the ledger a second time here: the ledger's separate hard-cap
-            // check below enforces current + bytes <= host_ram_gb, while this
-            // check only asks whether the new allocation fits in today's real
-            // MemAvailable low-water budget.
-            if (bytes > limit) return false;
+            // Re-read inside the reservation CAS loop: a competing process
+            // can consume physical RAM after allocation_allowed() but before
+            // this allocation is committed to the ledger.
+            const long available_mb = read_available_mb();
+            if (available_mb < 0) return false;
+            const size_t available =
+                static_cast<size_t>(available_mb) * 1024ull * 1024ull;
+            const size_t startup_available =
+                startup_available_bytes_.load(std::memory_order_relaxed);
+            if (!physical_host_budget_allows(startup_available, available,
+                                             current, bytes, stop_reserve,
+                                             watermark_bytes))
+                return false;
             const size_t host_budget = host_budget_bytes_.load(std::memory_order_relaxed);
             if (host_budget > 0 &&
                 !host_budget_allows(host_budget, current, bytes,
@@ -288,7 +310,8 @@ private:
     static inline std::atomic<long> last_mb_{-1};
     static inline std::atomic<long> min_mb_{1L << 40};
     static inline std::atomic<uint64_t> n_block_{0};
-    static inline std::atomic<long> stop_limit_mb_{4096};
+    static inline std::atomic<long> stop_limit_mb_{20480};
     static inline std::atomic<size_t> reserved_bytes_{0};
     static inline std::atomic<size_t> host_budget_bytes_{0};
+    static inline std::atomic<size_t> startup_available_bytes_{0};
 };

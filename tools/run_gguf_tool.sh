@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build + run gguf_tool (tools/gguf_tool.cpp + gguf_pack/io/verify/plan/dma.cpp)
+# Build + run gguf_tool (tools/gguf_tool.cpp + all gguf_tool subcommands)
 # with the system C++ compiler -- NOT through CMake/CUDA, so it runs on macOS
-# as well as Linux. Single binary, subcommands: pack, io, verify, plan, dma.
+# as well as Linux. Single binary, subcommands: pack, io, verify, plan, dma, mix, offload.
 #
 # Usage:
 #   ./tools/run_gguf_tool.sh <subcommand> [args...]
@@ -22,10 +22,10 @@ cd "$(dirname "$0")/.."
 
 CXX="${CXX:-c++}"
 BIN="${BIN:-./build/gguf_tool}"
-SRCS="tools/gguf_tool.cpp tools/gguf_pack.cpp tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp tools/gguf_dma.cpp"
+SRCS="tools/gguf_tool.cpp tools/gguf_pack.cpp tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp tools/gguf_dma.cpp tools/gguf_mix.cpp tools/gguf_offload.cpp"
 
 if [ "$#" -lt 1 ]; then
-    echo "usage: $0 <subcommand> [args...]  (subcommands: pack, io, verify, plan, dma)" >&2
+    echo "usage: $0 <subcommand> [args...]  (subcommands: pack, io, verify, plan, dma, mix, offload)" >&2
     echo "  (builds $SRCS with $CXX, then runs it with the given args)" >&2
     exit 2
 fi

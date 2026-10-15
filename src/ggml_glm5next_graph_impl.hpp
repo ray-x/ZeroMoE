@@ -183,7 +183,6 @@ ggml_tensor *hc_affine(ggml_context *ctx, ggml_tensor *x, ggml_tensor *scale, gg
 ggml_tensor *hc_mean(FullGraph &g, ggml_context *ctx, ggml_tensor *x);
 ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t);
 bool fused_hc_op(char which);
-ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base, ggml_tensor **post, ggml_tensor **comb);
 ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *residual, ggml_tensor *post, ggml_tensor *comb);
 ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wq, ggml_tensor *wk, ggml_tensor *wv, ggml_tensor *cq, ggml_tensor *ck, ggml_tensor *cv, ggml_tensor *fa, ggml_tensor *fb, ggml_tensor *ga, ggml_tensor *gb, ggml_tensor *beta_w, ggml_tensor *a, ggml_tensor *dt, ggml_tensor *norm_w, ggml_tensor *out_w, ggml_tensor *hist_in, ggml_tensor *state_in, ggml_tensor **state_out, ggml_tensor **hist_out);
 Glm5nextIndexerLayer *glm5next_indexer_state(FullGraph &g, int layer);

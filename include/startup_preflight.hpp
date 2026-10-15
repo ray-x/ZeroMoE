@@ -50,7 +50,8 @@
 
 namespace preflight {
 
-// Real, current MemAvailable in GB. Returns -1.0 if unreadable (a
+// Real, current MemAvailable in decimal GB, matching host_ram_gb allocations
+// (config.host_ram_gb * 1e9). Returns -1.0 if unreadable (a
 // genuinely broken /proc -- this project only ever runs on Linux per its
 // own hard AVX-512/CUDA dependencies, so "non-Linux" isn't a real case
 // here, but a missing/unmounted /proc is still worth not hard-failing on).
@@ -63,10 +64,19 @@ inline double mem_available_gb() {
     if (line.rfind("MemAvailable:", 0) == 0) {
       long kb = 0;
       std::sscanf(line.c_str(), "MemAvailable: %ld kB", &kb);
-      return kb / 1048576.0;
+      return static_cast<double>(kb) * 1024.0 / 1.0e9;
     }
   }
   return -1.0;
+}
+
+inline double default_host_margin_gb(double required_host_ram_gb) {
+  // Preserve at least 20 GiB outside the configured process budget. The
+  // earlier 10 GiB floor was insufficient when the DeepSeek run page-locked
+  // almost all of its DDR expert cache and built the long-prompt graph.
+  constexpr double floor_gb = 20.0 * 1024.0 * 1024.0 * 1024.0 / 1.0e9;
+  const double proportional_gb = required_host_ram_gb * 0.05;
+  return proportional_gb > floor_gb ? proportional_gb : floor_gb;
 }
 
 // Scans /proc/<pid>/comm for any OTHER live process literally named
@@ -143,8 +153,8 @@ inline void release_host_admission_lock() {
 // (never silently proceeds). Returns true iff it is safe to continue.
 // `required_host_ram_gb` is this run's own resolved config.host_ram_gb
 // process-wide ceiling (MoE + resident/KV/state + graph + MTP);
-// margin_gb defaults to a real, previously-necessary headroom (max(8,
-// 5% of the budget) -- see CLAUDE.md's "host_ram_gb swap-thrashing
+// margin_gb defaults to a real, previously-necessary headroom (max(20 GiB,
+// 5% of the budget), expressed in decimal GB -- see CLAUDE.md's "host_ram_gb swap-thrashing
 // regression" entry: exactly-the-budget was already once a real,
 // measured, reboot-surviving regression on this box, not a hypothetical).
 // gpu_device_ids is this run's own resolved config.gpus[*].device_id
@@ -156,18 +166,11 @@ inline void release_host_admission_lock() {
 inline bool run(double required_host_ram_gb,
                  const std::vector<int> &gpu_device_ids, bool force,
                  double margin_gb = -1.0) {
-  // 10 GB floor, per explicit user instruction after the 2026-09-09 crash
-  // (was 8 GB): that incident's own surviving log showed the ledger sitting
-  // at 91.87/100 GB -- comfortably inside an 8 GB margin -- immediately
-  // before the machine went down hard enough to need a reboot. Raising the
-  // floor does not by itself prove sufficiency (this box's own zram swap
-  // degrades off a cliff, not a slope -- see CLAUDE.md), but it is a real,
-  // direct, low-risk response to the one concrete number this incident did
-  // produce.
+  // Preserve 20 GiB for the kernel, drivers, graph scratch, and desktop
+  // services. The previous 10 GiB floor did not protect the host during the
+  // full-DDR-page-pinned DeepSeek graph run.
   if (margin_gb < 0.0)
-    margin_gb = required_host_ram_gb * 0.05 > 10.0
-                    ? required_host_ram_gb * 0.05
-                    : 10.0;
+    margin_gb = default_host_margin_gb(required_host_ram_gb);
 
   bool ok = true;
 

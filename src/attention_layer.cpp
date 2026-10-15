@@ -1,5 +1,7 @@
 #include "cuda_manager.hpp"
 #include "dense_dispatch.hpp"
+#include "dsv41_attention.hpp"
+#include "dsv41_trace.hpp"
 #include "engine.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_glm5next_proj_backend.hpp"
@@ -3056,6 +3058,18 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
   std::vector<float> normed((size_t)S * D);
   rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(), S,
                D, c.eps);
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41) {
+    dsv41_trace::save("attn-input", layer_idx, pos_base,
+                      hidden_states + (size_t)(S - 1) * D, D);
+    if (S > 1)
+      dsv41_trace::save("attn-input-seq", layer_idx, pos_base, hidden_states,
+                        (size_t)S * D);
+    dsv41_trace::save("attn-norm", layer_idx, pos_base,
+                      normed.data() + (size_t)(S - 1) * D, D);
+    if (S > 1)
+      dsv41_trace::save("attn-norm-seq", layer_idx, pos_base, normed.data(),
+                        (size_t)S * D);
+  }
   check_finite_attn("normed (post attn_norm rmsnorm)", layer_idx, normed.data(),
                     (size_t)S * D);
   PERF_END(dsv4_norm, t_attn_norm);
@@ -3071,6 +3085,12 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
              q_lora);
   rmsnorm_proj(engine, p + "attn_q_a_norm.weight", ql_buf.data(), ql_buf.data(),
                S, q_lora, c.eps);
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+    dsv41_trace::save("q-lora", layer_idx, pos_base,
+                      ql_buf.data() + (size_t)(S - 1) * q_lora, q_lora);
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1)
+    dsv41_trace::save("q-lora-seq", layer_idx, pos_base, ql_buf.data(),
+                      ql_buf.size());
   dense_proj(engine, p + "attn_q_b.weight", ql_buf.data(), Q.data(), S, q_lora,
              H * qh);
   // FIX: this was the one stage in this function without a check (every
@@ -3108,6 +3128,12 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
                         dsv4_rope_n_ctx_orig, /*dsv4_mscale=*/compressed);
     }
   }
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+    dsv41_trace::save("query", layer_idx, pos_base,
+                      Q.data() + (size_t)(S - 1) * H * qh,
+                      (size_t)H * qh);
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1)
+    dsv41_trace::save("query-seq", layer_idx, pos_base, Q.data(), Q.size());
   check_finite_attn("Q (post RoPE)", layer_idx, Q.data(), Q.size(), H * qh);
   PERF_END(dsv4_qproj, t_attn_qproj);
 
@@ -3170,6 +3196,9 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
                         dsv4_rope_ext_factor, dsv4_rope_freq_scale,
                         dsv4_rope_attn_factor, c.rope_yarn_log_mul,
                         dsv4_rope_n_ctx_orig, /*dsv4_mscale=*/compressed);
+      if (s == S - 1 &&
+          engine.family_ops.family == ModelFamily::DeepSeek_V41)
+        dsv41_trace::save("raw-kv", layer_idx, pos_base, kv_row, qh);
       if (s == S - 1 && Logger::instance().would_log(LogLevel::VERBOSE)) {
         double sq = 0.0;
         for (int i = 0; i < qh; ++i)
@@ -3255,6 +3284,9 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
       }
     }
   }
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1)
+    dsv41_trace::save("raw-kv-sequence", layer_idx, pos_base,
+                      raw_kv_prefill.data(), raw_kv_prefill.size());
   check_finite_attn("KVc (post write)", layer_idx, engine.KVc[layer_idx],
                     (size_t)window * qh);
   PERF_END(dsv4_kvproj, t_attn_kvproj);
@@ -3511,6 +3543,13 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
   }
   check_finite_attn("head_contexts (post MQA + de-rope)", layer_idx,
                     head_contexts.data(), head_contexts.size(), H * qh);
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41)
+    dsv41_trace::save("attn-ctx", layer_idx, pos_base,
+                      head_contexts.data() + (size_t)(S - 1) * H * qh,
+                      (size_t)H * qh);
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1)
+    dsv41_trace::save("attn-ctx-seq", layer_idx, pos_base,
+                      head_contexts.data(), head_contexts.size());
   PERF_END(dsv4_score, t_attn_score);
   // The row_width=H*qh check above measures the norm of ALL H heads
   // concatenated for the last token -- NOT comparable to "KVc window max
@@ -3639,7 +3678,20 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
     // hard failure, matching this codebase's standing GPU-dispatch
     // discipline (dense_dispatch.hpp's dense_proj does the same).
     bool gpu_ok = false;
-    if (dsv4_outproj_gpu_enabled() && engine.gpu &&
+    // V4.1 graph callbacks share the original quantized dense pool. The
+    // grouped Q2_K kernel follows dot_f32_avx512's exact FMA/reduction order,
+    // so raw-SWA layers can use it too without a second dequantized weight
+    // allocation or a routing change downstream.
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+        engine.gpu && woa_it->second.device_ptr &&
+        woa_it->second.meta.type == GGUFType::Q2_K) {
+      const size_t group_stride =
+          (size_t)row_bytes(GGUFType::Q2_K, group_in) * o_rank;
+      gpu_ok = engine.gpu->grouped_output_proj_q2k_host(
+          woa_it->second.device_ptr, group_stride, o_groups, o_rank,
+          group_in, in_row, out_flat);
+    }
+    if (!gpu_ok && dsv4_outproj_gpu_enabled() && engine.gpu &&
         (int)woa_dev_cache.size() > layer_idx && woa_dev_cache[layer_idx]) {
       gpu_ok = engine.gpu->grouped_output_proj_host(woa_dev_cache[layer_idx],
                                                     o_groups, o_rank, group_in,
@@ -3658,7 +3710,15 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
       }
     }
   } else {
-    for (int s = 0; s < S; ++s) {
+    bool gpu_ok = false;
+    if (engine.family_ops.family == ModelFamily::DeepSeek_V41 && engine.gpu &&
+        woa_it->second.device_ptr && woa_it->second.meta.type == GGUFType::Q2_K) {
+      gpu_ok = engine.gpu->grouped_output_proj_q2k_host(
+          woa_it->second.device_ptr,
+          (size_t)row_bytes(GGUFType::Q2_K, group_in) * o_rank,
+          o_groups, o_rank, group_in, head_contexts.data(), grouped_out.data(), S);
+    }
+    for (int s = 0; !gpu_ok && s < S; ++s) {
       const float *in_row = head_contexts.data() + (size_t)s * H * qh;
       for (int g = 0; g < o_groups; ++g) {
         const float *in_group = in_row + (size_t)g * group_in;
@@ -3762,10 +3822,14 @@ double diag_get_dsv41_woa_dequant_calls() { return g_diag_dsv41_woa_dequant_call
 // verified V4 raw-SWA implementation. Compressed layers use V4.1's own
 // ratio-1/2 pooling and shared source-layer caches; its indexer is the direct
 // wk/k_norm path from the pooled latent (V4's overlap compressor is absent).
-void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
+static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
                           const float *hidden_states, int S, int pos_base,
-                          float *out_context) {
+                          float *out_context, const float *projected_normed,
+                          const float *projected_ql, const float *projected_q,
+                          const float *projected_kv,
+                          bool context_only) {
   const auto &c = engine.model_file.architecture_config;
+  const int D = c.hidden;
   const int ratio =
       (layer_idx >= 0 && layer_idx < (int)c.dsv4_compress_ratios.size())
           ? (int)c.dsv4_compress_ratios[(size_t)layer_idx]
@@ -3778,6 +3842,8 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   if (ratio == 0) {
     dsv4_attention_gguf(engine, layer_idx, hidden_states, S, pos_base,
                         out_context);
+    dsv41_trace::save("attn-out-projected", layer_idx, pos_base,
+                      out_context + (size_t)(S - 1) * D, D);
     return;
   }
 
@@ -3798,7 +3864,6 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   g_diag_dsv41_calls += 1.0;
 
   const int H = c.n_heads;
-  const int D = c.hidden;
   const int nope = c.qk_nope;
   const int rope = c.qk_rope;
   const int qh = nope + rope;
@@ -3807,6 +3872,8 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   const int window =
       engine.sliding_window > 0 ? engine.sliding_window : engine.max_t;
   const std::string p = "blk." + std::to_string(layer_idx) + ".";
+  if (S == 1)
+    dsv41_trace::save("attn-input", layer_idx, pos_base, hidden_states, D);
   const float rope_theta =
       engine.model_file.get_config_float("rope.freq_base", 10000.0f);
   const float rope_theta_v41 = c.dsv4_compress_rope_freq_base;
@@ -3835,17 +3902,28 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   // projection/norm + Q projection + per-head RoPE.
   const auto _dsv41_t0 = std::chrono::high_resolution_clock::now();
   std::vector<float> normed((size_t)S * D);
-  rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(), S,
-               D, c.eps);
   std::vector<float> ql((size_t)S * q_lora);
-  dense_proj(engine, p + "attn_q_a.weight", normed.data(), ql.data(), S, D,
-             q_lora);
-  rmsnorm_proj(engine, p + "attn_q_a_norm.weight", ql.data(), ql.data(), S,
-               q_lora, c.eps);
-
   std::vector<float> Q((size_t)S * H * qh);
-  dense_proj(engine, p + "attn_q_b.weight", ql.data(), Q.data(), S, q_lora,
-             H * qh);
+  if (projected_normed) {
+    std::memcpy(normed.data(), projected_normed, normed.size() * sizeof(float));
+    std::memcpy(ql.data(), projected_ql, ql.size() * sizeof(float));
+    std::memcpy(Q.data(), projected_q, Q.size() * sizeof(float));
+  } else {
+    rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(), S,
+                 D, c.eps);
+    dense_proj(engine, p + "attn_q_a.weight", normed.data(), ql.data(), S, D,
+               q_lora);
+    rmsnorm_proj(engine, p + "attn_q_a_norm.weight", ql.data(), ql.data(), S,
+                 q_lora, c.eps);
+    dense_proj(engine, p + "attn_q_b.weight", ql.data(), Q.data(), S, q_lora,
+               H * qh);
+  }
+  dsv41_trace::save("attn-norm", layer_idx, pos_base,
+                    normed.data() + (size_t)(S - 1) * D, D);
+  dsv41_trace::save("q-lora", layer_idx, pos_base,
+                    ql.data() + (size_t)(S - 1) * q_lora, q_lora);
+  dsv41_trace::save("query", layer_idx, pos_base,
+                    Q.data() + (size_t)(S - 1) * H * qh, (size_t)H * qh);
   for (int s = 0; s < S; ++s) {
     for (int h = 0; h < H; ++h) {
       float *qrow = Q.data() + ((size_t)s * H + h) * qh;
@@ -3863,9 +3941,15 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   // layer (unlike compressed KV, which is only published by owns_kv).
   const auto _dsv41_t1 = std::chrono::high_resolution_clock::now();
   std::vector<float> kv((size_t)S * qh);
-  dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D, qh);
-  rmsnorm_proj(engine, p + "attn_kv_a_norm.weight", kv.data(), kv.data(), S, qh,
-               c.eps);
+  if (projected_normed) {
+    std::memcpy(kv.data(), projected_kv, kv.size() * sizeof(float));
+  } else {
+    dense_proj(engine, p + "attn_kv.weight", normed.data(), kv.data(), S, D, qh);
+    rmsnorm_proj(engine, p + "attn_kv_a_norm.weight", kv.data(), kv.data(), S, qh,
+                 c.eps);
+  }
+  dsv41_trace::save("raw-kv", layer_idx, pos_base,
+                    kv.data() + (size_t)(S - 1) * qh, qh);
   for (int s = 0; s < S; ++s) {
     const int pos = pos_base + s;
     rope_yarn_inplace(kv.data() + (size_t)s * qh + nope, rope, pos,
@@ -4051,6 +4135,22 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
     std::memset(out_context, 0, (size_t)S * D * sizeof(float));
     return;
   }
+  if (dsv41_trace::enabled(layer_idx, pos_base + S - 1)) {
+    const auto &selected = engine.dsv41_candidate_positions[(size_t)(S - 1)];
+    std::vector<float> ids(selected.size());
+    std::vector<float> keys(selected.size() * (size_t)qh);
+    for (size_t i = 0; i < selected.size(); ++i) {
+      ids[i] = static_cast<float>(selected[i]);
+      if (selected[i] >= 0 && selected[i] < state.cache_capacity)
+        std::memcpy(keys.data() + i * (size_t)qh,
+                    state.keys.data() + (size_t)selected[i] * qh,
+                    (size_t)qh * sizeof(float));
+    }
+    dsv41_trace::save("candidate-blocks", layer_idx, pos_base + S - 1,
+                      ids.data(), ids.size());
+    dsv41_trace::save("candidate-keys", layer_idx, pos_base + S - 1,
+                      keys.data(), keys.size());
+  }
 
   const auto sinks_it = engine.resident_layers.find(p + "attn_sinks.weight");
   const float *sinks =
@@ -4127,6 +4227,13 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   }
   g_diag_dsv41_perhead_ms += std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() - _dsv41_t6).count();
+  dsv41_trace::save("attn-ctx", layer_idx, pos_base,
+                    contexts.data() + (size_t)(S - 1) * H * qh,
+                    (size_t)H * qh);
+  if (context_only) {
+    std::memcpy(out_context, contexts.data(), contexts.size() * sizeof(float));
+    return;
+  }
 
   // TEMPORARY DIAGNOSTIC (2026-09-12): phase (g) -- output projection
   // (woa_cache dequant on first use + per-group dot_f32_avx512 loop +
@@ -4140,47 +4247,45 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
   const int groups = std::max(1, c.o_group_count);
   const int rank = c.o_lora_rank;
   const int group_in = (H * qh) / groups;
-  const size_t woa_n = (size_t)groups * rank * group_in;
-  static std::unordered_map<std::string, std::vector<float>> woa_cache;
-  auto &WOA = woa_cache[engine.model_file.resolved_file_path + "#" + p +
-                        "attn_output_a.weight"];
-  if (WOA.empty()) {
-    const auto _dsv41_t8 = std::chrono::high_resolution_clock::now();
-    auto it = engine.resident_layers.find(p + "attn_output_a.weight");
-    if (it == engine.resident_layers.end() || !it->second.host_ptr) {
-      LOG_ERROR("[DSV41] layer %d missing attn_output_a\n", layer_idx);
-      std::memset(out_context, 0, (size_t)S * D * sizeof(float));
-      return;
-    }
-    WOA.resize(woa_n);
-    dequant_row(it->second.meta.type, it->second.host_ptr, WOA.data(),
-                (int)woa_n);
-    g_diag_dsv41_woa_dequant_calls += 1.0;
-    g_diag_dsv41_woa_dequant_ms += std::chrono::duration<double, std::milli>(
-        std::chrono::high_resolution_clock::now() - _dsv41_t8).count();
-  }
-  // FOUND THIS SESSION (deepseek-v41-decode-speed-session, phase (g)
-  // bisection): this loop is THE dominant cost of the whole ratio!=0
-  // branch -- [REQUEST-DIAG3] measured outproj=18.8-20.3s of a ~21-23s
-  // attn= total (~89%), with the woa_cache dequant above (a one-time
-  // per-layer cost, ~0 after the first hit) accounting for well under 1s
-  // of that. groups*rank independent dot products (S=1 for decode, so
-  // this is the only real parallelism available) were running fully
-  // serial with no OMP, same missed pattern as the per-head score loop
-  // above. Safe for the identical reason: `grouped[...]` writes are
-  // disjoint per (s,g,r), `in`/`WOA` are read-only shared data.
-  // collapse(2) instead of parallelizing `g` alone, since `groups` can be
-  // small enough on its own to leave most cores idle.
   std::vector<float> grouped((size_t)S * groups * rank);
-  for (int s = 0; s < S; ++s) {
-    const float *in = contexts.data() + (size_t)s * H * qh;
-    #pragma omp parallel for collapse(2)
-    for (int g = 0; g < groups; ++g) {
-      for (int r = 0; r < rank; ++r) {
-        grouped[((size_t)s * groups + g) * rank + r] = dot_f32_avx512(
-            in + (size_t)g * group_in,
-            WOA.data() + ((size_t)g * rank + r) * group_in, group_in);
-      }
+  bool grouped_gpu = false;
+  const auto output_a = engine.resident_layers.find(p + "attn_output_a.weight");
+  if (output_a == engine.resident_layers.end() || !output_a->second.host_ptr) {
+    LOG_ERROR("[DSV41] layer %d missing attn_output_a\n", layer_idx);
+    std::memset(out_context, 0, (size_t)S * D * sizeof(float));
+    return;
+  }
+  if (engine.gpu && output_a->second.device_ptr &&
+      output_a->second.meta.type == GGUFType::Q2_K) {
+    grouped_gpu = engine.gpu->grouped_output_proj_q2k_host(
+        output_a->second.device_ptr,
+        (size_t)row_bytes(GGUFType::Q2_K, group_in) * rank,
+        groups, rank, group_in, contexts.data(), grouped.data(), S);
+  }
+  // Only the CPU fallback needs a dequantized weight mirror. The CUDA path
+  // reads the original persistent Q2_K tensor and matches this dot exactly.
+  if (!grouped_gpu) {
+    const size_t woa_n = (size_t)groups * rank * group_in;
+    static std::unordered_map<std::string, std::vector<float>> woa_cache;
+    auto &WOA = woa_cache[engine.model_file.resolved_file_path + "#" + p +
+                          "attn_output_a.weight"];
+    if (WOA.empty()) {
+      const auto dequant_start = std::chrono::high_resolution_clock::now();
+      WOA.resize(woa_n);
+      dequant_row(output_a->second.meta.type, output_a->second.host_ptr,
+                  WOA.data(), (int)woa_n);
+      g_diag_dsv41_woa_dequant_calls += 1.0;
+      g_diag_dsv41_woa_dequant_ms += std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - dequant_start).count();
+    }
+    for (int token = 0; token < S; ++token) {
+      const float *in = contexts.data() + (size_t)token * H * qh;
+#pragma omp parallel for collapse(2)
+      for (int group = 0; group < groups; ++group)
+        for (int row = 0; row < rank; ++row)
+          grouped[((size_t)token * groups + group) * rank + row] = dot_f32_avx512(
+              in + (size_t)group * group_in,
+              WOA.data() + ((size_t)group * rank + row) * group_in, group_in);
     }
   }
   dense_proj(engine, p + "attn_output_b.weight", grouped.data(), out_context, S,
@@ -4203,6 +4308,30 @@ void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
         _old, _old + _dsv41_outproj_elapsed_s, std::memory_order_relaxed,
         std::memory_order_relaxed)) {}
   }
+}
+
+void dsv41_attention_gguf(StreamingEngine &engine, int layer_idx,
+                         const float *hidden_states, int S, int pos_base,
+                         float *out_context) {
+  dsv41_attention_impl(engine, layer_idx, hidden_states, S, pos_base,
+                       out_context, nullptr, nullptr, nullptr, nullptr,
+                       false);
+}
+
+void deepseek41_attention_projected(StreamingEngine &engine, int layer,
+                                    int pos, const float *normed,
+                                    const float *q_lora, const float *query,
+                                    const float *raw_kv, float *output) {
+  dsv41_attention_impl(engine, layer, nullptr, 1, pos, output,
+                       normed, q_lora, query, raw_kv, false);
+}
+
+void deepseek41_attention_projected_context(
+    StreamingEngine &engine, int layer, int pos, const float *normed,
+    const float *q_lora, const float *query, const float *raw_kv,
+    float *contexts) {
+  dsv41_attention_impl(engine, layer, nullptr, 1, pos, contexts,
+                       normed, q_lora, query, raw_kv, true);
 }
 
 // ============================================================

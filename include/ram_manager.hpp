@@ -709,7 +709,9 @@ private:
       blk.last_used_clock = 0;
       blk.hit_count = 0;
       blk.also_in_vram = false;
-      blk.slab_capacity = 0;
+      // MOVE retires the expert identity, not this slot's allocation. Keep
+      // its real capacity so the next load reuses the buffer instead of
+      // freeing/registering the same-sized slab again.
       blk.ram_loading = false;
       perf().n_move_on_promotion.fetch_add(1, std::memory_order_relaxed);
     } else {
