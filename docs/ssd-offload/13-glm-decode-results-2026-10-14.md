@@ -401,3 +401,10 @@ allocating; there is no non-graph prefill for Qwen under the graph-only expert p
 GLM at `context_size = 8192` (shipped config raised from 4096): 5117 tokens ran as 2048 + 2048 + 1021, all in the graph, 22.0 s
 (232 tok/s). Dense (`DENSE_BEYOND_TOPK=1`) and per-query selection continue the document with the same heading
 and agree on 11 of the first 12 tokens.
+
+### Qwen prefill: GPU expert compute (2026-10-16)
+
+The 61 tok/s Qwen prefill was `ggml_backend_sched_new(..., op_offload=false)`: cold experts on the CPU. BeeLlama on the same
+model and card gets 200-257 tok/s with op-offload on and 30.6 with it off. Turning it on with one scheduler copy needs a
+4.7 GiB reserve at 1611 tokens (the 40+ GiB seen earlier was four pipeline copies). Result: 333 / 1611 / 2033 / 3989 tokens
+at 102 / 312 / 355 / 507 tok/s, same tokens. Full numbers and configs in `docs/perf-baselines.md`.

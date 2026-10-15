@@ -275,6 +275,7 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
 }
 
 int g_qwen4exp_suggested_batch = 0;
+bool g_qwen4exp_prefill_op_offload = false;
 const StreamingEngine *g_qwen4exp_cont_engine = nullptr;
 int g_qwen4exp_cont_total = 0;
 
@@ -576,9 +577,20 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // codepath reusing this scheduler"). Device-resident expert layers are
   // unaffected either way -- their tensors are already explicitly bound to
   // the CUDA arena, independent of this flag.
+  // Prefill batches (S >= 32) run the host-resident expert matmuls on the GPU: the scheduler copies the experts a batch
+  // uses across (ggml patch 0007), as llama.cpp's default does (BeeLlama on this box, same model: 200-257 tok/s with it,
+  // 30 without). Measured here: 1611 tokens 61 -> 305 tok/s. The reserve needs one pipeline copy (4.7 GiB at 1611
+  // tokens; 44 GiB with the four copies decode uses), so prefill builds with copies=1. MOESTREAM_QWEN4EXP_PREFILL_OP_
+  // OFFLOAD=0 restores the CPU experts. Off for the paths with their own per-layer expert machinery.
+  const bool prefill_op_offload =
+      moestream::graphcfg::atoi_or("MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD", 1) != 0 &&
+      engine.qwen4exp_partial_layer < 0 && engine.qwen4exp_gpu_stage_layers.empty() && !engine.qwen4exp_cpu_offload;
+  g_qwen4exp_prefill_op_offload = prefill_op_offload;
   g->sched =
       ggml_backend_sched_new(backends, sched_bufts_ptr, 2, kGraphSize,
-                             graph_scheduler_parallel(), false);
+                             // one copy with op-offload: the four pipeline copies multiplied the expert input buffers
+                             // (measured reserve at 1611 tokens: 44 GiB with four copies, 4.7 GiB with one)
+                             prefill_op_offload ? false : graph_scheduler_parallel(), prefill_op_offload);
   if (!g->sched)
     return false;
   LOG_INFO("[GGML-QWEN-FULL] scheduler pipeline_parallel=%s copies=%d\n",

@@ -849,9 +849,13 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // before, see above), so it is refused with the batch size that would fit, which the caller retries with.
     if (!g.decode_mode && g.S > 1 && err == cudaSuccess) {
       constexpr double kGiB = 1024.0 * 1024.0 * 1024.0, kMiB = 1024.0 * 1024.0;
-      // The decode graph is built right after prefill (a batch that left ~2 GiB free made that build fail on a 3989-token
-      // prompt), so its headroom is kept out of what the prefill batch may use.
-      const double fixed = 0.3 * kGiB + 6.0 * kGiB, per_token = 8.0 * kMiB;
+      // The decode graph is built right after prefill; its workspace is ~0.12 GiB, and the allocator admission floor
+      // above is 1 GiB, so that much stays out of what the prefill batch may use. (6 GiB here refused even a 16-token
+      // batch on configs that keep many expert layers resident.)
+      // Device workspace per token: 7.8 MiB with the experts on the CPU; with GPU op-offload (one pipeline copy) 0.6 GiB +
+      // ~2.6 MiB/token (measured 0.80 / 1.57 / 2.60 / 4.67 GiB at 96 / 400 / 800 / 1611 tokens).
+      const bool oo = g_qwen4exp_prefill_op_offload;
+      const double fixed = (oo ? 0.6 : 0.3) * kGiB + 1.0 * kGiB, per_token = (oo ? 2.7 : 8.0) * kMiB;
       const double need = (fixed + per_token * g.S) * 1.05;
       const double host_avail =
           std::max(0.0, (double)MemoryGuard::read_available_mb() * kMiB);

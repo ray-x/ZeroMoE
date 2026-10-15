@@ -28,13 +28,30 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 
 Config: `configs/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`), env as in the Qwen decode
 harness: `MOESTREAM_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_LAYERS=0 ..._GRAPH_PRELOAD_TRAILING=1
-MOESTREAM_QWEN_CPU_THREADS=10 MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1`. Cold experts run on the CPU (`op_offload=false`).
+MOESTREAM_QWEN_CPU_THREADS=10 MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1`. Since 2026-10-16 the prefill scheduler runs the
+host-resident experts on the GPU (`MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD`, default 1; one pipeline copy; ggml patch 0007).
 
-| metric | value | date | notes |
+| metric | baseline | date | notes |
 |---|---|---|---|
-| prefill, 1611 tokens | 61-63 tok/s | 2026-10-16 | one graph, 25.5 s |
-| prefill, 3989 tokens | 61 tok/s | 2026-10-16 | 1448 + 1448 + 1093 |
-| prefill, 2824 tokens (recorded) | **138 tok/s** | 2026-09 | older config/path, not reproduced |
+| prefill, 333 tokens | **102 tok/s** (3.27 s) | 2026-10-16 | GPU experts |
+| prefill, 1611 tokens | **312 tok/s** (5.17 s) | 2026-10-16 | was 61-63 with CPU experts |
+| prefill, 2033 tokens | **355 tok/s** (5.72 s) | 2026-10-16 | |
+| prefill, 3989 tokens | **507 tok/s** (7.87 s) | 2026-10-16 | one graph, no batching needed |
+| prefill, 1611 tokens, CPU experts (`OP_OFFLOAD=0`) | 61-63 tok/s | 2026-10-16 | previous behaviour |
+| prefill, 2824 tokens (recorded) | 138 tok/s | 2026-09 | older "ggml MUL_MAT_ID prefill" path |
 
-**Open regression flag:** the current Qwen prefill is ~56% below the recorded 138 tok/s. Cause not established: the older
-number came from a different path ("ggml MUL_MAT_ID prefill" era). My changes do not touch the single-batch path.
+BeeLlama (`~/Projects/beellama.cpp/build-qwen38-rtx3090/bin/llama-bench`), same model file, same card,
+`CUDA_VISIBLE_DEVICES=0 -ngl 99 -fa 1 -t 10 -r 2`:
+
+| `-ncmoe` | `-ub` | pp512 | pp2048 |
+|---|---|---|---|
+| 25 | 512 | 199.6 | 204.4 |
+| 25 | 2048 | 205.4 | - |
+| 48 | 512 | 209.6 | 214.9 |
+| 48 | 2048 | 207.4 | 257.4 |
+| 48, `-nopo 1` (no op-offload) | 512 | 30.6 | 30.3 (pp1536) |
+
+The Qwen graph's prefill had been ~3x below BeeLlama because the scheduler was created with `op_offload=false` (cold experts
+on the CPU, the AVX2-width IQ1_M kernel; BeeLlama's CPU-only number is 30.6). With op-offload on and one pipeline copy the
+reserve is 0.6 GiB + ~2.6 MiB/token (4.7 GiB at 1611 tokens; 44 GiB with the four pipeline copies decode uses).
+Last-row hidden is within relL2 0.19 of the CPU-expert run, same tokens.

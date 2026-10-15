@@ -213,6 +213,7 @@ extern std::mutex g_qwen4exp_cpu_execution_mutex;
 extern thread_local bool g_qwen4exp_build_graph_retry_smaller_expert_layers;
 // Batch size the last memory pre-check worked out would fit (0 = none); read by qwen4exp_full_graph_suggested_batch().
 extern int g_qwen4exp_suggested_batch;
+extern bool g_qwen4exp_prefill_op_offload; // the prefill scheduler runs host experts on the GPU (set at prepare)
 // What a prefill batch leaves for the next one of the same prompt: the engine and the tokens covered so far.
 extern const StreamingEngine *g_qwen4exp_cont_engine;
 extern int g_qwen4exp_cont_total;
