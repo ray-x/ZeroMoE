@@ -13,6 +13,7 @@
 #endif
 #include "exllamav3_backend.hpp"
 #include "generation_loop.hpp"
+#include "graph_config.hpp"
 #include "thread_profile.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_gdn_proj_backend.hpp"
@@ -845,20 +846,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       engine.mtp_model_file.enable_direct_io();
   }
 
-  const std::string &gguf_path = engine.model_file.resolved_file_path;
-  std::ifstream metadata_stream(gguf_path, std::ios::binary);
-  // Skip GGUF header: magic(4) + version(4) + tensor_count(8) + kv_count(8) =
-  // 24 bytes
-  metadata_stream.seekg(4 + 4, std::ios::beg); // skip magic + version
-  uint64_t tensor_count_raw = 0, kv_count_raw = 0;
-  metadata_stream.read(reinterpret_cast<char *>(&tensor_count_raw), 8);
-  metadata_stream.read(reinterpret_cast<char *>(&kv_count_raw), 8);
-
-  if (!tokenizer.load_from_gguf_metadata(metadata_stream, kv_count_raw)) {
+  if (!tokenizer.load(engine.model_file)) {
     return std::unexpected(
         "Tokenizer vocabulary table completely missing from GGUF metadata");
   }
-  metadata_stream.close();
 
   if (!GGUFGraphInitializer::build_model_graph(engine, max_ctx)) {
     return std::unexpected(
@@ -1180,6 +1171,16 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         config.ram_preload_all_experts) ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&
         config.ram_preload_all_experts));
+  // DeepSeek-V4.1 graph nodes still dispatch MoE through
+  // RAMSafetyManager/GpuTopology. They own no second expert arena, so the
+  // normal usage-ranked preload must remain enabled in graph mode.
+  const bool dsv41_graph_uses_native_moe_cache =
+      graph_mode && engine.family_ops.family == ModelFamily::DeepSeek_V41;
+  // DeepSeek graph callbacks use dense_proj() for shared experts, routers,
+  // and attention projections. Keep one native device pool for those calls;
+  // the graph borrows its device_ptrs instead of making a second copy.
+  const bool graph_owns_dense =
+      graph_mode && !dsv41_graph_uses_native_moe_cache;
   const bool glm_graph_aliases_vram_cache =
       graph_mode && engine.family_ops.family == ModelFamily::GLM5NEXT &&
       glm5next_full_graph_enabled();
@@ -1297,6 +1298,16 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
            "MTP's own draft/verification pass continues to run entirely "
            "on the legacy path (see mtp_speculative.cpp's target_forward, "
            "which never calls the full graph).\n";
+  }
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+    // This path binds each complete pool as a strided MUL_MAT_ID tensor.
+    // The global LRU (already supported by GpuTopology) lets one layer's
+    // required set borrow free slots across the pool. Validate its uniform
+    // geometry again in the graph builder before exposing any CUDA view.
+    expert_layer_slab_bytes.clear();
+    LOG_INFO("[DSV41-CACHE-GRAPH] uniform native VRAM pools, stride=%zu; "
+             "graph-owned expert bytes=0\n", expert_slab_bytes);
   }
   if (!graph_mode) {
     gpu.setup_expert_cache(expert_slab_bytes, cfg.n_experts, config,
@@ -1570,9 +1581,13 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
                "active-layer area disabled (no layered decode); experts "
                "come from the static graph arena or the DDR arenas\n");
     }
+    // Allocation keys are decimal GB; the headroom calculation above is
+    // GiB. Convert before comparing or the graph cap silently removes an
+    // additional ~7% of the cache beyond its intended workspace reserve.
+    const double fallback_config_gb = fallback_gb * kBytesPerGb / 1.0e9;
     for (auto &gc : fallback_config.gpus) {
-      if (gc.moe_cache_gb > fallback_gb)
-        gc.moe_cache_gb = fallback_gb;
+      if (gc.moe_cache_gb > fallback_config_gb)
+        gc.moe_cache_gb = fallback_config_gb;
     }
     if (engine.family_ops.family == ModelFamily::GLM5NEXT &&
         glm5next_full_graph_enabled()) {
@@ -1690,6 +1705,9 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
     // reason as attn_k_b/attn_v_b. attn_output_b (the second, single
     // dense matmul stage) is NOT excluded -- it genuinely goes through
     // dense_proj, see is_attn_output below.
+    if (dsv41_graph_uses_native_moe_cache &&
+        name.find("attn_output_a.weight") != std::string::npos)
+      return true;
     if (name.find("attn_k_b.weight") != std::string::npos ||
         name.find("attn_v_b.weight") != std::string::npos ||
         name.find("attn_output_a.weight") != std::string::npos) {
@@ -2201,11 +2219,10 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
               return a->meta.size_bytes > b->meta.size_bytes;
             });
 
-  // Full-graph mode binds these weights into its own GGML CUDA arena. The
-  // main pool would be a duplicate copy that the graph cannot reference and
-  // would consume the headroom needed by the scheduler workspace.
-  bool pool_ready = graph_mode ? true : gpu.init_dense_pool(pool_bytes_needed);
-  if (graph_mode) {
+  // Graphs that own all dense compute use their GGML arena. DeepSeek's
+  // native graph callbacks and graph tensors share this persistent pool.
+  bool pool_ready = graph_owns_dense ? true : gpu.init_dense_pool(pool_bytes_needed);
+  if (graph_owns_dense) {
     LOG_STREAM_INFO() << "[CUDA] Dense pool skipped: full GGML graph owns a "
                          "GGML device arena\n";
   }
@@ -2225,7 +2242,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
 
   int offload_ok = 0, offload_failed = 0;
   size_t offload_failed_bytes = 0;
-  if (pool_ready && !graph_mode) {
+  if (pool_ready && !graph_owns_dense) {
     for (QuantizedTensor *tensor : dense_candidates) {
       if (gpu.offload_tensor_to_pool(*tensor)) {
         ++offload_ok;
@@ -2234,7 +2251,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         offload_failed_bytes += tensor->meta.size_bytes;
       }
     }
-  } else if (!graph_mode) {
+  } else if (!graph_owns_dense) {
     offload_failed = (int)dense_candidates.size();
     for (QuantizedTensor *tensor : dense_candidates)
       offload_failed_bytes += tensor->meta.size_bytes;
@@ -2243,7 +2260,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         << "all " << offload_failed << " tensor(s) staying host-resident.\n";
   }
 
-  if (graph_mode) {
+  if (graph_owns_dense) {
     LOG_STREAM_INFO() << "[CUDA] Dense offload skipped: full GGML graph owns "
                          "the device arena\n";
   } else {
@@ -2561,17 +2578,12 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
         };
   }
 
-  // The opt-in Qwen4Exp full graph needs one complete host-side expert
-  // backing set for ggml MUL_MAT_ID.  With MOESTREAM_FULL_GRAPH_USE_RAM_CACHE
-  // enabled, that set is the already-preloaded fixed-stride DDR arena and
-  // the graph aliases it directly; otherwise the graph owns one startup
-  // pread-backed DDR copy.  Running the ordinary pin/preload pipeline as
-  // well without the RAM-cache mode would allocate a second complete expert
-  // set before graph preparation (about 42 GB on UD-IQ1_M), and can push
-  // this box into swap/OOM.  If the graph declines and falls back, that
-  // fallback is intentionally visible in the log rather than silently
-  // paying this unsafe duplicate allocation.
-  if ((!graph_mode || graph_ram_cache) &&
+  // Graph families that own a separate expert source must not also build a
+  // second cache-sized preload. Qwen/GLM use that policy unless they alias
+  // the existing tiers. DeepSeek-V4.1's graph always calls the native
+  // cache-aware dispatcher, so it must keep the ordinary usage-ranked
+  // preload active in graph mode.
+  if ((!graph_mode || graph_ram_cache || dsv41_graph_uses_native_moe_cache) &&
       (!config.pin_file.empty() || config.ram_preload_all_experts) &&
       ram_mgr.vram_cache &&
       (ram_graph_cache || ram_mgr.vram_cache->expert_vram_cache_cap > 0)) {

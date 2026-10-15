@@ -3,6 +3,7 @@
 // (Does NOT require CUDA for the CPU-path tests)
 #include "direct_io.hpp" // the REAL O_DIRECT alignment-window arithmetic (no CUDA deps)
 #include "gguf_loader.hpp" // DeepSeek-V4 compression metadata validation helper
+#include "gguf_tokenizer.hpp"
 #include "dsv4_compressed_attention.hpp"
 #include "kernels_cpu.hpp" // CPU kernel backend (AVX-512 or NEON, selected by build script)
 #include "rope.hpp" // the REAL, unit-tested RoPE (no CUDA / no AVX-512 deps)
@@ -18,6 +19,7 @@
 #include "ple_hash.hpp" // the REAL PLE n-gram hash (no CUDA deps)
 #include "moe_decode_batch.hpp" // decode-gap prototype: grouped per-token expert dispatch (no CUDA deps)
 #include "memory_guard.hpp" // deterministic host-budget admission arithmetic
+#include "dsv41_router_selection.hpp"
 #include "option_b_global_hot.hpp" // Option-B global-pool hot-set selection (header-only)
 #include <algorithm>
 #include <array>
@@ -3132,12 +3134,60 @@ void test_qwen4exp_ple_hash() {
 
 void test_host_budget_admission() {
   std::cout << "[TEST] host-memory budget admission..." << std::flush;
+  assert(MemoryGuard::effective_stop_limit_mb(4096) == 20480);
+  assert(MemoryGuard::effective_stop_limit_mb(32768) == 32768);
   assert(host_budget_allows(0, 1000, 1000, 1000));
   assert(host_budget_allows(1000, 400, 500, 100));
   assert(!host_budget_allows(1000, 400, 601, 0));
   assert(!host_budget_allows(1000, 400, 500, 101));
   assert(!host_budget_allows(1000, 1001, 0, 0));
   assert(!host_budget_allows(1000, 900, 200, 0));
+  constexpr size_t MiB = 1024ull * 1024ull;
+  constexpr size_t GiB = 1024ull * MiB;
+  // Page-aligned slab allocations can remain virtual until the I/O worker
+  // faults them in. Account reservations against the startup snapshot even
+  // while current MemAvailable has not fallen yet.
+  assert(physical_host_budget_allows(8 * GiB, 8 * GiB, 0,
+                                     6 * GiB, 2 * GiB));
+  assert(!physical_host_budget_allows(8 * GiB, 8 * GiB, 1 * GiB,
+                                      6 * GiB, 2 * GiB));
+  // Also stop when another process consumes memory after our startup check.
+  assert(!physical_host_budget_allows(16 * GiB, 5 * GiB, 1 * GiB,
+                                      4 * GiB, 2 * GiB));
+  // An additional graph watermark is reserved on top of the global stop
+  // floor, and unavailable physical-memory data fails closed.
+  assert(!physical_host_budget_allows(8 * GiB, 8 * GiB, 0,
+                                      5 * GiB, 2 * GiB, 2 * GiB));
+  assert(!physical_host_budget_allows(0, 8 * GiB, 0,
+                                      1, 2 * GiB));
+  std::cout << " PASSED\n";
+}
+
+void test_dsv41_router_stable_boundary() {
+  std::cout << "[TEST] DeepSeek V4.1 stable near-tie routing..."
+            << std::flush;
+  std::vector<Dsv41RouterScore> native = {
+      {299, 12.674845695f}, {29, 12.650976181f},
+      {274, 12.420443535f}, {15, 12.419219971f},
+      {68, 12.405943871f}, {336, 12.390210152f},
+      {311, 12.390174866f}, {83, 12.387273789f}};
+  std::vector<Dsv41RouterScore> graph = native;
+  graph[5].score = 12.390183449f;
+  graph[6].score = 12.390187263f;
+  std::vector<int> native_ids, graph_ids;
+  assert(!dsv41_select_topk_stable_boundary(native, (int)native.size(), 6,
+                                            2.0e-5f, native_ids));
+  assert(dsv41_select_topk_stable_boundary(graph, (int)graph.size(), 6,
+                                           2.0e-5f, graph_ids));
+  assert(native_ids == graph_ids);
+  assert(native_ids.back() == 336);
+
+  std::vector<Dsv41RouterScore> clear_gap = {
+      {7, 1.0f}, {6, 0.9f}, {5, 0.8f}, {4, 0.7f}};
+  std::vector<int> clear_ids;
+  assert(!dsv41_select_topk_stable_boundary(clear_gap, 4, 2,
+                                            2.0e-5f, clear_ids));
+  assert((clear_ids == std::vector<int>{7, 6}));
   std::cout << " PASSED\n";
 }
 
@@ -3274,6 +3324,42 @@ void test_moe_decode_batch() {
   std::cout << " PASSED\n";
 }
 
+void test_tokenizer_metadata_shard() {
+  char dir[] = "/tmp/moestream-tokenizer-shards-XXXXXX";
+  assert(mkdtemp(dir));
+  const std::string root(dir);
+  const auto empty = root + "/00002.gguf";
+  const auto metadata = root + "/repacked-00001.gguf";
+  auto write = [](const std::string &path, bool vocabulary) {
+    std::ofstream out(path, std::ios::binary);
+    auto u32 = [&](uint32_t n) { out.write(reinterpret_cast<char *>(&n), 4); };
+    auto u64 = [&](uint64_t n) { out.write(reinterpret_cast<char *>(&n), 8); };
+    auto str = [&](const std::string &s) { u64(s.size()); out.write(s.data(), s.size()); };
+    out.write("GGUF", 4); u32(3); u64(0); u64(vocabulary ? 2 : 1);
+    str("tokenizer.ggml.eos_token_id"); u32(4); u32(vocabulary ? 2 : 99);
+    if (vocabulary) {
+      str("tokenizer.ggml.tokens"); u32(9); u32(8); u64(3);
+      str("a"); str("b"); str("c");
+    }
+  };
+  write(empty, false); write(metadata, true);
+  GGUFFile file;
+  file.resolved_file_path = empty;
+  file.shard_paths = {empty, metadata};
+  GGUFTokenizer tokenizer;
+  assert(tokenizer.load(file));
+  assert(tokenizer.id_to_token.size() == 3);
+  assert(tokenizer.id_to_token[0] == "a");
+  assert(tokenizer.eos_token_id == 2);
+  assert(std::find(tokenizer.stop_ids.begin(), tokenizer.stop_ids.end(), 99) ==
+         tokenizer.stop_ids.end()); // Failed shard metadata must not leak.
+  file.shard_paths = {empty};
+  GGUFTokenizer missing;
+  assert(!missing.load(file));
+  std::filesystem::remove_all(root);
+  std::cout << "Tokenizer metadata shard fallback PASSED.\n";
+}
+
 int main(int argc, char **argv) {
   std::cout << "=== MoEStream Component Tests ===\n";
   struct TestEntry {
@@ -3321,6 +3407,8 @@ int main(int argc, char **argv) {
       {"qwen4exp_l2_norm", test_qwen4exp_l2_norm},
       {"qwen4exp_ple_hash", test_qwen4exp_ple_hash},
       {"host_budget_admission", test_host_budget_admission},
+      {"dsv41_router_stable_boundary", test_dsv41_router_stable_boundary},
+      {"tokenizer_metadata_shard", test_tokenizer_metadata_shard},
       {"moe_decode_batch", test_moe_decode_batch},
       {"safetensors_adapter", test_safetensors_adapter},
       {"exl3_mul1_matmul", test_exl3_mul1_matmul},

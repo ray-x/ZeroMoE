@@ -177,12 +177,17 @@ void PrefillWarmupManager::prepare(MoePipelineContext &context) {
     // field's own comment for the motivation. Same candidate SET
     // either way (every expert with expert_freq>0); only the PUSH
     // ORDER changes.
-    if (engine.prefill_hint_order_by_earliest_token) {
+    const bool dsv41_grouped =
+        engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+        moe_prefill_batched();
+    // Grouped dispatch walks expert IDs, so issue its read-ahead in that
+    // same order. Candidates are already ascending here.
+    if (!dsv41_grouped && engine.prefill_hint_order_by_earliest_token) {
       std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
         return scratch.first_needed_by_token[a] <
                scratch.first_needed_by_token[b];
       });
-    } else {
+    } else if (!dsv41_grouped) {
       std::sort(candidates.begin(), candidates.end(), [&](int a, int b) {
         return scratch.expert_freq[a] > scratch.expert_freq[b];
       });
@@ -231,7 +236,7 @@ void PrefillWarmupManager::prepare(MoePipelineContext &context) {
     // page cache that mmap staging depends on, as a real A/B demonstrated.
     const bool prefill_stream_bypasses_active_prewarm =
         moe_prefill_stream() && engine.model_file.mmap_active();
-    if (!prefill_stream_bypasses_active_prewarm &&
+    if (!prefill_stream_bypasses_active_prewarm && !dsv41_grouped &&
         !moe_pipeline_detail::qwen4exp_decode_ggml_path(engine) &&
         ram_mgr.vram_cache->active_layer_capacity > 0) {
       std::vector<ExpertLocation *> active_prewarm_batch;

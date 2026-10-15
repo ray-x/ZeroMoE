@@ -534,8 +534,8 @@ struct EngineConfig {
   long vram_min_free_mb = 256;
 
   bool mem_guard = true;
-  long mem_guard_warn_mb = 4096;   // log a warning below this
-  long mem_guard_stop_mb = 4096;   // refuse new host allocations below this
+  long mem_guard_warn_mb = 32768;  // warn with 32 GiB left
+  long mem_guard_stop_mb = 20480;  // retain at least 20 GiB for the host
   int  mem_guard_poll_ms = 500;
 
   // Per-layer VRAM budget cap for attn_score_gpu's persistent KV latent

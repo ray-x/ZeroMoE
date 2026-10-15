@@ -3,6 +3,8 @@
 #include "cpu_expert_executor.hpp"
 #include "gpu_expert_executor.hpp"
 #include "dense_dispatch.hpp"
+#include "dsv41_trace.hpp"
+#include "dsv41_router_selection.hpp"
 #include "engine.hpp"
 #include "expert_activation.hpp"
 #include "ggml_deepseek_v4_graph.hpp"
@@ -1406,6 +1408,29 @@ bool MoeRouterService::route(MoePipelineContext &context) {
                        (size_t)n_experts);
         }
       }
+      if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+          dsv41_trace::enabled(layer_idx, 0)) {
+        const size_t count = (size_t)S * n_experts;
+        const float *all_probs = scratch.router_logits.data();
+        const float *last_probs = all_probs +
+                                  (size_t)(S - 1) * n_experts;
+        dsv41_trace::save("router-probs", layer_idx, 0,
+                          last_probs, (size_t)n_experts);
+        std::vector<float> selection_scores(count);
+        for (int s = 0; s < S; ++s)
+          for (int e = 0; e < n_experts; ++e)
+            selection_scores[(size_t)s * n_experts + e] =
+                all_probs[(size_t)s * n_experts + e] +
+                (bias_row ? bias_row[e] : 0.0f);
+        dsv41_trace::save("router-select-scores", layer_idx, 0,
+                          selection_scores.data() + (size_t)(S - 1) * n_experts,
+                          (size_t)n_experts);
+        if (S > 1) {
+          dsv41_trace::save("router-probs-seq", layer_idx, 0, all_probs, count);
+          dsv41_trace::save("router-select-scores-seq", layer_idx, 0,
+                            selection_scores.data(), count);
+        }
+      }
 
       // Zero output accumulator
       std::memset(output, 0, S * D * sizeof(float));
@@ -1417,6 +1442,19 @@ bool MoeRouterService::route(MoePipelineContext &context) {
       std::fill(scratch.expert_freq.begin(), scratch.expert_freq.end(), 0);
       std::fill(scratch.first_needed_by_token.begin(),
                 scratch.first_needed_by_token.end(), INT_MAX);
+      const char *dsv41_gpu_prefill_env =
+          std::getenv("MOESTREAM_DEEPSEEK_V41_GPU_PREFILL");
+      const bool stable_dsv41_boundary =
+          engine.family_ops.family == ModelFamily::DeepSeek_V41 && S > 1 &&
+          dsv41_gpu_prefill_env && std::atoi(dsv41_gpu_prefill_env) != 0;
+      constexpr float kDsv41BoundaryEpsilon = 2.0e-5f;
+      std::vector<Dsv41RouterScore> dsv41_router_scores;
+      std::vector<int> dsv41_selected_ids;
+      if (stable_dsv41_boundary) {
+        dsv41_router_scores.resize((size_t)n_experts);
+        dsv41_selected_ids.reserve((size_t)topk);
+      }
+      int dsv41_stabilized_tokens = 0;
       for (int s = 0; s < S; ++s) {
         float *token_probs = scratch.router_logits.data() + s * n_experts;
         float sum_w = 0.0f;
@@ -1527,15 +1565,30 @@ bool MoeRouterService::route(MoePipelineContext &context) {
             float sel = token_probs[e] + (bias_row ? bias_row[e] : 0.0f);
             scratch.scores[e] = {e, sel};
           }
-          std::partial_sort(scratch.scores.begin(),
-                            scratch.scores.begin() + topk,
-                            scratch.scores.begin() + n_experts,
-                            [](const ExpertScore &a, const ExpertScore &b) {
-                              return a.score > b.score;
-                            });
-          for (int k = 0; k < topk; ++k)
-            record_pick(k, scratch.scores[k].id,
-                        token_probs[scratch.scores[k].id]);
+          if (stable_dsv41_boundary) {
+            for (int e = 0; e < n_experts; ++e)
+              dsv41_router_scores[(size_t)e] =
+                  {scratch.scores[(size_t)e].id,
+                   scratch.scores[(size_t)e].score};
+            if (dsv41_select_topk_stable_boundary(
+                    dsv41_router_scores, n_experts, topk,
+                    kDsv41BoundaryEpsilon, dsv41_selected_ids))
+              ++dsv41_stabilized_tokens;
+            for (int k = 0; k < topk; ++k) {
+              const int id = dsv41_selected_ids[(size_t)k];
+              record_pick(k, id, token_probs[id]);
+            }
+          } else {
+            std::partial_sort(scratch.scores.begin(),
+                              scratch.scores.begin() + topk,
+                              scratch.scores.begin() + n_experts,
+                              [](const ExpertScore &a, const ExpertScore &b) {
+                                return a.score > b.score;
+                              });
+            for (int k = 0; k < topk; ++k)
+              record_pick(k, scratch.scores[k].id,
+                          token_probs[scratch.scores[k].id]);
+          }
         }
         if (!gpu_router_handled && c.expert_weights_norm) {
           float inv_sum = 1.0f / std::max(sum_w, 6.103515625e-5f);
@@ -1920,6 +1973,11 @@ bool MoeRouterService::route(MoePipelineContext &context) {
           }
         }
       }
+      if (dsv41_stabilized_tokens > 0)
+        LOG_INFO("[DSV41-ROUTER-TIE] layer=%d stabilized %d/%d token(s) "
+                 "at top-k boundary epsilon=%.1e, tie-break=expert-id-desc\n",
+                 layer_idx, dsv41_stabilized_tokens, S,
+                 kDsv41BoundaryEpsilon);
     } // end t_moe_topk_select scope (Phase 1)
   }
 

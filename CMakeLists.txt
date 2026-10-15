@@ -424,6 +424,8 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_glm5next_graph_stage.cpp
         src/ggml_glm5next_graph_weights.cpp
         src/ggml_deepseek_v4_graph.cpp
+        src/ggml_deepseek_v41_graph.cpp
+        src/ggml_deepseek_v41_graph_decode.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
         src/ggml_glm5next_proj_backend.cpp
@@ -546,6 +548,8 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_glm5next_graph_stage.cpp
         src/ggml_glm5next_graph_weights.cpp
         src/ggml_deepseek_v4_graph.cpp
+        src/ggml_deepseek_v41_graph.cpp
+        src/ggml_deepseek_v41_graph_decode.cpp
         src/ggml_hc_backend.cpp
         src/ggml_gdn_proj_backend.cpp
         src/ggml_glm5next_proj_backend.cpp
@@ -592,6 +596,43 @@ if(NOT MOESTREAM_CPU_ONLY)
                 src/safetensors_adapter.cpp)
             target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
         endif()
+    endif()
+
+    # Exact F32 parity for DeepSeek's quantized grouped output projection.
+    # Uses the real CPU dot and GGML quantizer/dequantizer as the oracle.
+    if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
+        add_executable(dsv41_grouped_outproj_test EXCLUDE_FROM_ALL
+            tests/test_dsv41_grouped_outproj.cpp
+            src/kernels_cpu.cpp
+            src/ggml_grids.cpp
+            cuda/kquant_matmul.cu)
+        target_include_directories(dsv41_grouped_outproj_test PRIVATE
+            ${MOESTREAM_GGML_SRC_DIR})
+        target_compile_definitions(dsv41_grouped_outproj_test PRIVATE
+            MOESTREAM_USE_GGML=1)
+        target_compile_options(dsv41_grouped_outproj_test PRIVATE
+            ${MOESTREAM_AVX512_FLAGS})
+        set_target_properties(dsv41_grouped_outproj_test PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_link_libraries(dsv41_grouped_outproj_test PRIVATE
+            CUDA::cudart ggml)
+        if(OpenMP_CXX_FOUND)
+            target_link_libraries(dsv41_grouped_outproj_test PRIVATE
+                OpenMP::OpenMP_CXX)
+        endif()
+    endif()
+
+    if(MOESTREAM_USE_GGML_CUDA)
+        add_executable(dsv41_cache_graph_test EXCLUDE_FROM_ALL
+            tests/test_dsv41_cache_graph.cpp cuda/kquant_matmul.cu)
+        target_compile_definitions(dsv41_cache_graph_test PRIVATE
+            MOESTREAM_USE_GGML_CUDA=1)
+        set_target_properties(dsv41_cache_graph_test PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
+        target_include_directories(dsv41_cache_graph_test PRIVATE
+            ${MOESTREAM_GGML_SRC_DIR})
+        target_link_libraries(dsv41_cache_graph_test PRIVATE
+            CUDA::cudart ggml ggml-cuda)
     endif()
 
     # GGML-only Qwen CPU MoE timing probe.  The same source is also compiled

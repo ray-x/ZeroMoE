@@ -6,6 +6,7 @@
 // into the resident dense pool.
 #include "engine.hpp"
 #include "dense_dispatch.hpp"
+#include "dsv41_engram.hpp"
 #include "kquant_dequant.hpp"
 
 #include <algorithm>
@@ -335,46 +336,16 @@ void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
       n_hash_cols <= 0 || head_dim <= 0)
     return;
 
-  std::vector<int64_t> hashes;
-  if (!hash_batch(engine, S, pos_base, token_ids, hashes)) {
-    LOG_ERROR("[DSV41-ENGRAM] hash metadata or token ids unavailable at layer %d\n",
-              layer_idx);
-    return;
-  }
   const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
   auto table_it = engine.model_file.tensors.find(prefix + "engram_embd.weight");
   if (table_it == engine.model_file.tensors.end()) {
     LOG_ERROR("[DSV41-ENGRAM] missing table for layer %d\n", layer_idx);
     return;
   }
-  const EngramTableMap *table = map_table(engine, table_it->second, head_dim);
-  if (!table) {
-    LOG_ERROR("[DSV41-ENGRAM] cannot map table for layer %d\n", layer_idx);
+  std::vector<float> embed;
+  if (!deepseek41_engram_embedding_rows(engine, layer_idx, S, pos_base,
+                                       token_ids, embed))
     return;
-  }
-
-  std::vector<float> embed((size_t)S * n_hash_cols * head_dim);
-  for (int s = 0; s < S; ++s) {
-    for (int col = 0; col < n_hash_cols; ++col) {
-      const int64_t row = hashes[((size_t)s * c.dsv41_engram_layer_ids.size() +
-                                  (size_t)table_id) * n_hash_cols + col];
-      if (row < 0 || (uint64_t)row >= table->n_rows) {
-        LOG_ERROR("[DSV41-ENGRAM] hash row %lld outside %llu-row table at layer %d\n",
-                  (long long)row, (unsigned long long)table->n_rows, layer_idx);
-        return;
-      }
-      float *dst = embed.data() + ((size_t)s * n_hash_cols + col) * head_dim;
-      if (!g_row_cache.get(table_id, row, head_dim, dst)) {
-        g_engram_cache_misses.fetch_add(1, std::memory_order_relaxed);
-        dequant_row(table_it->second.type,
-                    table->rows + (size_t)row * table->row_bytes, dst,
-                    head_dim);
-        g_row_cache.put(table_id, row, dst, head_dim);
-      } else {
-        g_engram_cache_hits.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-  }
 
   std::vector<float> kv((size_t)S * (HC + 1) * D);
   dense_proj(engine, prefix + "engram_wkv.weight", embed.data(), kv.data(), S,
@@ -413,4 +384,72 @@ void deepseek41_engram_layer_input(StreamingEngine &engine, int layer_idx,
       for (int d = 0; d < D; ++d) stream[d] += gate * value[d];
     }
   }
+}
+
+bool deepseek41_engram_embedding_rows(StreamingEngine &engine, int layer_idx,
+                                      int S, int pos_base,
+                                      const int *token_ids,
+                                      std::vector<float> &embedding) {
+  const auto &c = engine.model_file.architecture_config;
+  if (!dsv41_is_engram_layer(c, layer_idx)) {
+    embedding.clear();
+    return true;
+  }
+  const auto layer_it = std::find(c.dsv41_engram_layer_ids.begin(),
+                                  c.dsv41_engram_layer_ids.end(),
+                                  (int64_t)layer_idx);
+  if (layer_it == c.dsv41_engram_layer_ids.end() || S <= 0 || !token_ids)
+    return false;
+  const int table_id = (int)(layer_it - c.dsv41_engram_layer_ids.begin());
+  const int max_ngram = c.dsv41_engram_max_ngram_size;
+  const int n_heads = c.dsv41_engram_n_heads;
+  const int head_dim = c.dsv41_engram_head_dim;
+  const int n_hash_cols = (max_ngram - 1) * n_heads;
+  if (table_id < 0 || n_hash_cols <= 0 || head_dim <= 0 ||
+      (!c.dsv41_engram_num_embeddings.empty() &&
+       (size_t)table_id >= c.dsv41_engram_num_embeddings.size()))
+    return false;
+
+  std::vector<int64_t> hashes;
+  if (!hash_batch(engine, S, pos_base, token_ids, hashes)) {
+    LOG_ERROR("[DSV41-ENGRAM] hash metadata or token ids unavailable at layer %d\n",
+              layer_idx);
+    return false;
+  }
+  const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
+  auto table_it = engine.model_file.tensors.find(prefix + "engram_embd.weight");
+  if (table_it == engine.model_file.tensors.end()) {
+    LOG_ERROR("[DSV41-ENGRAM] missing table for layer %d\n", layer_idx);
+    return false;
+  }
+  const EngramTableMap *table = map_table(engine, table_it->second, head_dim);
+  if (!table) {
+    LOG_ERROR("[DSV41-ENGRAM] cannot map table for layer %d\n", layer_idx);
+    return false;
+  }
+
+  embedding.resize((size_t)S * n_hash_cols * head_dim);
+  for (int s = 0; s < S; ++s) {
+    for (int col = 0; col < n_hash_cols; ++col) {
+      const int64_t row = hashes[((size_t)s * c.dsv41_engram_layer_ids.size() +
+                                  (size_t)table_id) * n_hash_cols + col];
+      if (row < 0 || (uint64_t)row >= table->n_rows) {
+        LOG_ERROR("[DSV41-ENGRAM] hash row %lld outside %llu-row table at layer %d\n",
+                  (long long)row, (unsigned long long)table->n_rows, layer_idx);
+        embedding.clear();
+        return false;
+      }
+      float *dst = embedding.data() + ((size_t)s * n_hash_cols + col) * head_dim;
+      if (!g_row_cache.get(table_id, row, head_dim, dst)) {
+        g_engram_cache_misses.fetch_add(1, std::memory_order_relaxed);
+        dequant_row(table_it->second.type,
+                    table->rows + (size_t)row * table->row_bytes, dst,
+                    head_dim);
+        g_row_cache.put(table_id, row, dst, head_dim);
+      } else {
+        g_engram_cache_hits.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
+  return true;
 }

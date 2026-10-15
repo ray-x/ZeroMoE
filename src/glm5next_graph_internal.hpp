@@ -245,6 +245,21 @@ struct FullGraph : moestream::graph::GraphCore {
     ggml_tensor *mask = nullptr;               // [SWA + compressed + sink, S]
   };
   std::vector<Dsv4LayerTensors> dsv4_layers;
+  struct Dsv41LayerTensors {
+    int layer = -1;
+    int ratio = 0;
+    int kv_source = -1;
+    int index_source = -1;
+    ggml_tensor *raw_kv = nullptr;       // [qh, S], rotated raw SWA K==V
+    ggml_tensor *comp_kv = nullptr;      // [qh, S], source compressor output
+    ggml_tensor *comp_score = nullptr;   // [qh, S], pooling logits
+    ggml_tensor *keys = nullptr;         // [qh, floor(S/ratio)]
+    ggml_tensor *indexer_keys = nullptr; // [indexer_key_dim, floor(S/ratio)]
+  };
+  std::vector<Dsv41LayerTensors> dsv41_layers;
+  ggml_tensor *dsv41_final_pre_mix = nullptr;
+  std::vector<std::pair<int, ggml_tensor *>> dsv41_engram_embeddings;
+  std::vector<std::pair<int, std::vector<float>>> dsv41_engram_host_rows;
   std::vector<ggml_tensor *> dsv4_layer_outputs;
   // Decode-only per-layer timing marks (MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1):
   // node -> {layer, 0=after attention, 1=after FFN}.
@@ -542,6 +557,9 @@ struct FullGraph : moestream::graph::GraphCore {
     glm5next_indexer_layers.clear();
     glm5next_indexer_seeds.clear();
     dsv4_layers.clear();
+    dsv41_layers.clear();
+    dsv41_engram_embeddings.clear();
+    dsv41_engram_host_rows.clear();
     dsv4_stage_outputs.clear();
     topology = nullptr;
   }
@@ -555,13 +573,18 @@ size_t expert_source_bytes(const StreamingEngine &engine, int device_expert_laye
 size_t graph_host_live_bytes(const StreamingEngine &engine);
 bool init_expert_source(FullGraph &g, size_t source_bytes);
 bool preload_expert_source(FullGraph &g);
+bool prepare_expert_source_only(FullGraph &g, const char *tag);
 bool init_expert_arena(FullGraph &g);
 bool init_dense_arena(FullGraph &g);
 // Defined in ggml_deepseek_v4_graph.cpp, also used by the GLM builder.
 bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag);
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx, const std::string &name);
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *forced_ids);
-ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base, ggml_tensor **post, ggml_tensor **comb);
+ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
+                    ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base,
+                    ggml_tensor **post, ggml_tensor **comb,
+                    ggml_tensor **pre_gate = nullptr,
+                    ggml_tensor *collapse_carry = nullptr);
 ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *residual, ggml_tensor *post, ggml_tensor *comb);
 
 }  // namespace glm5next_graph

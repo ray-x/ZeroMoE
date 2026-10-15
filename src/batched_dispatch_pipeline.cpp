@@ -1601,6 +1601,20 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
                 "per-token path for this layer.\n",
                 layer_idx, total_pairs, S * topk);
     } else {
+      const bool ordered_prefill =
+          engine.family_ops.family == ModelFamily::DeepSeek_V41;
+      const bool cache_grouped_prefill = glm5next_grouped_prefill || ordered_prefill;
+      // DeepSeek keeps one activation row per (token,k), so grouping by
+      // expert or changing its GPU cannot change the weighted reduction.
+      static thread_local PinnedFloatBuffer ordered_outputs;
+      const size_t route_elements = (size_t)total_pairs * D;
+      if (ordered_prefill &&
+          !ordered_outputs.resize(route_elements, "dsv41_prefill_routes"))
+        return BatchedDispatchResult::Abort;
+      float *const ordered_base = ordered_prefill ? ordered_outputs.data() : nullptr;
+      if (ordered_base)
+        std::fill(ordered_base, ordered_base + route_elements, 0.0f);
+      const int accum_rows = ordered_prefill ? total_pairs : S;
       // GPU-side accumulation (EngineConfig::moe_gpu_accum): per-pair
       // destination row and router weight, uploaded ONCE per layer, so each
       // expert's scatter kernel can read its own slice at offs[e]. Without
@@ -1616,8 +1630,9 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
         w_pair.resize((size_t)total_pairs);
         for (int i = 0; i < total_pairs; ++i) {
           const int flat = slot[(size_t)i];
-          tok_pair[(size_t)i] = flat / topk;
-          w_pair[(size_t)i] = scratch.tok_topk_weights[(size_t)flat];
+          tok_pair[(size_t)i] = ordered_prefill ? flat : flat / topk;
+          w_pair[(size_t)i] = ordered_prefill
+                                    ? 1.0f : scratch.tok_topk_weights[(size_t)flat];
         }
       }
       bool accum_begun[8] = {false};
@@ -1683,7 +1698,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       bool ggml_handled = false;
       bool qwen_device_handoff = false;
       bool shared_device_handled = false;
-      if (moe_ggml_mul_mat_id() && clamp_exp == 0.0f && n_used > 0 &&
+      if (!ordered_prefill && moe_ggml_mul_mat_id() && clamp_exp == 0.0f && n_used > 0 &&
           !is_cpu_affinity_layer(layer_idx) && ram_mgr.vram_cache) {
         qwen_device_handoff =
             engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -1954,7 +1969,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       // legacy mmap streaming path is off. This bounds the number of live
       // per-expert CUDA scratch buffers and lets the accumulator synchronize
       // once per small group, while retaining GLM's normal RAM-tier source.
-      if (!stream_enabled && glm5next_grouped_prefill && n_used > 0) {
+      if (!stream_enabled && cache_grouped_prefill && n_used > 0) {
         stream_chunk =
             std::min(std::max(1, moe_prefill_stream_chunk()), n_used);
       }
@@ -1994,7 +2009,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
         const bool grouped_async =
             grouped_async_enabled &&
             ((stream_enabled && chunk_ok[(size_t)c] != 0) ||
-             (glm5next_grouped_prefill && !stream_enabled));
+             (cache_grouped_prefill && !stream_enabled));
         async_holds.clear();
         async_holds.reserve((size_t)(c1 - c0));
         async_gpu_used.fill(false);
@@ -2112,7 +2127,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
             // relative offsets.  expert_ffn_gpu_issue reads the actual bytes
             // from loc->device_ptr.  Unsupported types intentionally continue
             // to get_expert(), because their CPU fallback needs host bytes.
-            if (glm5next_grouped_prefill && ram_mgr.vram_cache) {
+            if (cache_grouped_prefill && ram_mgr.vram_cache) {
               const ExpertLocation *resident =
                   ram_mgr.vram_cache->find_expert(layer_idx, e);
               if (resident && resident->device_ptr &&
@@ -2258,15 +2273,16 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
               if (accum_gpu && gid >= 0 && gid < 8) {
                 if (!accum_begun[gid])
                   accum_begun[gid] = engine.gpu->expert_accum_begin(
-                      gid, S, D, tok_pair.data(), w_pair.data(), total_pairs);
+                      gid, accum_rows, D, tok_pair.data(), w_pair.data(), total_pairs);
                 if (accum_begun[gid]) {
                   accumulated = engine.gpu->expert_accum_add(
-                      gid, gs.d_down, offs[(size_t)e], n, D, S);
+                      gid, gs.d_down, offs[(size_t)e], n, D, accum_rows);
                   if (accumulated && grouped_async) {
                     // Keep both the VRAM hold and the RAM pin until the
                     // chunk-level synchronization below confirms that this
                     // expert's down/scatter work is complete.
-                    async_holds.push_back({needs_release ? loc : nullptr, exp,
+                    async_holds.push_back({needs_release ? loc : nullptr,
+                                           vram_shadowed ? nullptr : exp,
                                            e, needs_release, from_active});
                   } else if (accumulated) {
                     // Non-grouped path preserves the old per-expert release
@@ -2359,13 +2375,17 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
             const float w = scratch.tok_topk_weights[(size_t)flat];
             float *dst = output + (size_t)s2 * D;
             const float *src = batch_out.data() + (size_t)i2 * D;
-            for (int d = 0; d < D; ++d)
-              dst[d] += w * src[d];
+            if (ordered_prefill)
+              std::memcpy(ordered_base + (size_t)flat * D, src,
+                          (size_t)D * sizeof(float));
+            else
+              for (int d = 0; d < D; ++d)
+                dst[d] += w * src[d];
           }
 
           const bool deferred_unpin =
               grouped_async && gpu_accumulated_on_device;
-          if (exp && !deferred_unpin)
+          if (exp && !vram_shadowed && !deferred_unpin)
             ram_mgr.ram_unpin(*exp);
         } // per-expert
 
@@ -2403,9 +2423,30 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       // One [S,D] download per GPU for this whole layer, ADDED onto whatever
       // CPU-dispatched experts already wrote into `output`.
       for (int g = 0; g < 8; ++g)
-        if (accum_begun[g] && !engine.gpu->expert_accum_end(g, output, S, D))
+        if (accum_begun[g] && !engine.gpu->expert_accum_end(
+                g, ordered_prefill ? ordered_base : output, accum_rows, D))
           perf().n_moe_gpu_accum_fallback.fetch_add(1,
                                                     std::memory_order_relaxed);
+      if (ordered_prefill) {
+        const float *const route_weights = scratch.tok_topk_weights.data();
+#pragma omp parallel for schedule(static)
+        for (int token = 0; token < S; ++token) {
+          float *dst = output + (size_t)token * D;
+          for (int k = 0; k < topk; ++k) {
+            const size_t flat = (size_t)token * topk + k;
+            const float *src = ordered_base + flat * D;
+            const __m512 w = _mm512_set1_ps(route_weights[flat]);
+            int d = 0;
+            for (; d + 16 <= D; d += 16)
+              _mm512_storeu_ps(dst + d, _mm512_fmadd_ps(
+                  w, _mm512_loadu_ps(src + d), _mm512_loadu_ps(dst + d)));
+            for (; d < D; ++d) dst[d] += route_weights[flat] * src[d];
+          }
+        }
+        LOG_INFO("[DSV41-GROUPED-PREFILL] layer=%d tokens=%d experts=%d "
+                 "chunk=%d ordered_routes=1 graph-owned-MoE-bytes=0\n",
+                 layer_idx, S, n_used, stream_chunk);
+      }
 
       // The shared expert is not part of the routed expert buckets above.
       // The legacy path executes it inside its per-token loop, but the
