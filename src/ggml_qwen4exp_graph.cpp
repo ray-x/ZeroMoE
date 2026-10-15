@@ -274,7 +274,11 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
   }
 }
 
+int g_qwen4exp_suggested_batch = 0;
+
 } // namespace qwen4exp_graph
+
+int qwen4exp_full_graph_suggested_batch() { return qwen4exp_graph::g_qwen4exp_suggested_batch; }
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                                  const int *token_ids) {
@@ -741,6 +745,7 @@ bool qwen4exp_full_graph_device_expert_trailing() { return false; }
 bool qwen4exp_full_graph_prepare(StreamingEngine &, int, int, const int *) {
   return false;
 }
+int qwen4exp_full_graph_suggested_batch() { return 0; }
 bool qwen4exp_full_graph_decode_prepare(StreamingEngine &, int, const int *) {
   return false;
 }

@@ -37,6 +37,9 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S,
 bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *token_ids);
 
+// The batch size (tokens) the last declined prefill build worked out would fit in memory; 0 = none.
+int glm5next_full_graph_suggested_batch();
+
 // Build once at the first decode position (seeding from the host prefill
 // state), then reuse the same graph and device KDA/DSA state for consecutive
 // decode tokens.

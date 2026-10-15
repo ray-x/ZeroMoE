@@ -558,6 +558,7 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       config.qwen4exp_option_b_right_size_top_n;
   engine.qwen4exp_option_b_global_top_k =
       config.qwen4exp_option_b_global_top_k;
+  engine.prefill_batch_tokens = config.prefill_batch_tokens;
   engine.qwen4exp_option_b_global_floor_per_layer =
       config.qwen4exp_option_b_global_floor_per_layer;
   engine.qwen4exp_option_b_max_layers = config.qwen4exp_option_b_max_layers;

@@ -730,8 +730,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         bool graph_built = build_first();
         // A batch whose workspace does not fit is retried at half the size while the family can continue a prompt
         // from its earlier chunk; the remaining chunks then use the smaller size too.
-        while (!graph_built && pc_n_graph > 256 && graph_model->supports_prefill_continuation(engine)) {
-            pc_n_graph = ((pc_n_graph / 2) / 8) * 8;
+        while (!graph_built && pc_n_graph > 64 &&
+               (graph_model->supports_prefill_continuation(engine) ||
+                graph_model->suggested_prefill_batch(engine) >= 64)) {
+            const int hint = graph_model->suggested_prefill_batch(engine);
+            pc_n_graph = (hint >= 64 && (size_t)hint < pc_n_graph) ? (size_t)hint : ((pc_n_graph / 2) / 8) * 8;
             cap = (int)pc_n_graph;
             LOG_STREAM_INFO() << "[PREFILL] graph declined; retrying with a batch of " << pc_n_graph << " tokens\n";
             graph_built = build_first();

@@ -112,6 +112,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
 
 // What a prefill chunk leaves for the next one. Kept apart from g_graph, which a declined attempt (or the retry without the
 // prefetch ring) has already released.
+static int g_suggested_batch = 0;
+int glm5next_full_graph_suggested_batch() { return g_suggested_batch; }
+
 static struct PrefillContinuation {
   const StreamingEngine *engine = nullptr;
   int total_tokens = 0;
@@ -243,6 +246,34 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   }
   if (!init_expert_arena(*g) || !init_dense_arena(*g))
     return false;
+  // Memory pre-check: the scheduler's workspace is requested from the allocator in one piece, and a request the device
+  // cannot satisfy must never reach it. Measured workspace (graph build logs): 1.35 GiB + ~0.45 MiB per token (S=144:
+  // 1.35, 727: 1.61, 2048: 2.15 GiB); host side needs headroom above the compute floor. When the batch does not fit, the
+  // largest one that does is recorded for the caller (suggested_prefill_batch) and this prepare is declined.
+  {
+    size_t free_b = 0, total_b = 0;
+    cudaSetDevice(g->device);
+    const bool have = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0, kMiB = 1024.0 * 1024.0;
+    const double fixed = 1.35 * kGiB, per_token = 0.5 * kMiB, margin = 0.25 * kGiB;
+    const double avail_host_gb = std::max(0.0, (double)MemoryGuard::read_available_mb() / 1024.0);
+    const double host_need_gb = 12.0 + (double)S / 1024.0; // 10 GiB compute floor + slack + ~1 MiB per token
+    int fit = S;
+    if (have && fixed + per_token * S + margin > (double)free_b)
+      fit = (int)std::max(0.0, ((double)free_b - fixed - margin) / per_token);
+    if (avail_host_gb > 0 && avail_host_gb < host_need_gb)
+      fit = 0;
+    if (fit < S) {
+      fit = (fit / 8) * 8;
+      g_suggested_batch = fit >= 64 ? fit : 0;
+      LOG_WARN("[GGML-GLM5NEXT-FULL] prefill batch of %d tokens needs ~%.2f GiB of device workspace but %.2f GiB are free "
+               "(host: %.1f GiB available, %.1f needed); declining before any allocation%s\n",
+               S, (fixed + per_token * S) / kGiB, have ? (double)free_b / kGiB : -1.0, avail_host_gb, host_need_gb,
+               g_suggested_batch > 0 ? ("; " + std::to_string(g_suggested_batch) + " tokens would fit").c_str() : "");
+      return false;
+    }
+    g_suggested_batch = 0;
+  }
   // GPU1-hot experts compute in place on the second GPU (MOESTREAM_GLM5NEXT_PREFILL_GPU1=0 routes them through the cold
   // branch, copying each used expert to the main GPU).
   if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)

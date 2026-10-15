@@ -211,6 +211,8 @@ extern std::atomic<uint64_t> g_qwen4exp_host_node_ordinary_cpu_wait_ns;
 extern std::atomic<uint64_t> g_qwen4exp_cpu_split_enter_wait_ns;
 extern std::mutex g_qwen4exp_cpu_execution_mutex;
 extern thread_local bool g_qwen4exp_build_graph_retry_smaller_expert_layers;
+// Batch size the last memory pre-check worked out would fit (0 = none); read by qwen4exp_full_graph_suggested_batch().
+extern int g_qwen4exp_suggested_batch;
 extern std::unique_ptr<FullGraph> g_graph;
 extern std::atomic<uint64_t> g_full_graph_generation;
 extern std::unique_ptr<FullGraph> g_graph_prefill_arena_owner;

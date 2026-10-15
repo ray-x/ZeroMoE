@@ -29,6 +29,9 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine);
 // Number of complete early MoE layers whose expert tensors should be placed
 // in the graph CUDA weight arena. Zero keeps all routed experts host-backed.
 int qwen4exp_full_graph_device_expert_layers();
+
+// Batch size (tokens) the last declined prefill build worked out would fit in memory; 0 = none.
+int qwen4exp_full_graph_suggested_batch();
 // Whether the configured full-graph resident block is at the end of the
 // model. Used by usage-driven Option B selection so it does not steal
 // residency from the baseline's already-complete GPU layers.

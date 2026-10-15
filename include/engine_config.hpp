@@ -938,6 +938,11 @@ struct EngineConfig {
   // base cap, so nothing is granted.
   bool prefill_window_cap = false;
 
+  // Tokens per prefill graph batch (llama.cpp's n_ubatch). 0 = the model family's default (GLM 2048, Qwen whole prompt). A prompt longer than the
+  // batch runs in several batches that continue each other; a value too large for the device is reduced at startup of the
+  // prefill to what fits in VRAM and host RAM (see FullGraphModel::max_prefill_tokens and the family's prepare check).
+  int prefill_batch_tokens = 0;
+
   // Hard ceiling on TOTAL extra RAM (across ALL layers combined) the
   // window above may claim beyond the normal per-layer caps. This is the
   // safety mechanism standing in for the unbuilt P3 trim: nothing lowers
@@ -2703,6 +2708,8 @@ inline bool EngineConfig::load(const std::string &path) {
       doc.root.get_bool("prefetch_widen_all_tokens", prefetch_widen_all_tokens);
   prefill_window_cap =
       doc.root.get_bool("prefill_window_cap", prefill_window_cap);
+  prefill_batch_tokens =
+      doc.root.get_int("prefill_batch_tokens", prefill_batch_tokens);
   prefill_window_extra_gb =
       doc.root.get_double("prefill_window_extra_gb", prefill_window_extra_gb);
   prefill_retention_weight =

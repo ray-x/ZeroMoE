@@ -841,6 +841,38 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
                  mib);
       }
     }
+    // Size check against the batch: the workspace is requested in one piece and scales with the prompt (no-allocation
+    // sizing pass: 0.13 GiB at S=1, 12.38 GiB at S=1611, i.e. ~7.8 MiB per token; pinned host buffer ~1.1 MiB per token).
+    // A request the device cannot satisfy must never reach cudaMalloc (an allocator failure here has crashed the box
+    // before, see above), so it is refused with the batch size that would fit, which the caller retries with.
+    if (!g.decode_mode && g.S > 1 && err == cudaSuccess) {
+      constexpr double kGiB = 1024.0 * 1024.0 * 1024.0, kMiB = 1024.0 * 1024.0;
+      // The decode graph is built right after prefill (a batch that left ~2 GiB free made that build fail on a 3989-token
+      // prompt), so its headroom is kept out of what the prefill batch may use.
+      const double fixed = 0.3 * kGiB + 6.0 * kGiB, per_token = 8.0 * kMiB;
+      const double need = (fixed + per_token * g.S) * 1.05;
+      const double host_avail =
+          std::max(0.0, (double)MemoryGuard::read_available_mb() * kMiB);
+      const double host_need = 20.0 * kGiB + 1.2 * kMiB * g.S;
+      int fit = g.S;
+      if (need > (double)free_b)
+        fit = (int)std::max(0.0, ((double)free_b / 1.05 - fixed) / per_token);
+      if (host_avail > 0 && host_avail < host_need)
+        fit = 0;
+      if (fit < g.S) {
+        fit = (fit / 8) * 8;
+        g_qwen4exp_suggested_batch = fit >= 64 ? fit : 0;
+        LOG_ERROR("[GGML-QWEN-FULL] refusing graph allocator reserve before any allocation: a batch of %d tokens "
+                  "needs ~%.2f GiB of device workspace and %.1f GiB of host memory; %.2f GiB VRAM free, %.1f GiB "
+                  "host available%s\n",
+                  g.S, need / kGiB, host_need / kGiB, (double)free_b / kGiB, host_avail / kGiB,
+                  g_qwen4exp_suggested_batch > 0
+                      ? ("; a batch of " + std::to_string(g_qwen4exp_suggested_batch) + " tokens fits").c_str()
+                      : "");
+        return false;
+      }
+      g_qwen4exp_suggested_batch = 0;
+    }
     if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
       LOG_ERROR(
           "[GGML-QWEN-FULL] refusing graph allocator reserve: device %d "

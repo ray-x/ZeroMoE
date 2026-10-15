@@ -49,6 +49,8 @@ class FullGraphModel {
   // buffers grow with the batch, so a longer prompt runs this many tokens through the graph and
   // the rest as S=1 steps (see generate_text).
   virtual int max_prefill_tokens(const StreamingEngine &) const { return 0; }
+  // After a prefill batch was declined for memory: the batch size the family worked out would fit (0 = no suggestion).
+  virtual int suggested_prefill_batch(const StreamingEngine &) const { return 0; }
 
   // Whether a prefill chunk that starts after position 0 can run through the graph, continuing the state the earlier
   // chunk left in the engine (build() is then asked with pos_base > 0 and may still decline a particular chunk).
