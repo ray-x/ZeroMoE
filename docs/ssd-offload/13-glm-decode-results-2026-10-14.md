@@ -379,3 +379,21 @@ replayed prompt + the first 6 generated tokens as a prefill (2198 tokens, batche
 8 tokens as run 1's 7th-14th (also with `DENSE_BEYOND_TOPK=1`). The prefill's selection therefore agrees with the decode
 graph's on this sequence; it does not separate sparse from dense this close to top_k, and the stepped-prefill reference is
 itself dense beyond the seeded 2048 tokens, so it cannot be used as a trusted reference.
+
+**Size sweep (2026-10-16, merged binary, every batch through the graph, no stepped or declined continuation):**
+
+| model | prompt tokens | graph batches | prefill |
+|---|---|---|---|
+| GLM | 1152 | 1152 | 5.8 s (198 tok/s) |
+| GLM | 1689 | 1689 | 6.4 s (264) |
+| GLM | 2240 | 2048 + 192 | 11.0 s (204) |
+| GLM | 2798 | 2048 + 750 | 13.3 s (210) |
+| GLM | 3867 | 2048 + 1819 | 14.7 s (263) |
+| Qwen | 1389 | 1389 | 22.4 s (62) |
+| Qwen | 2033 | 1448 + 585 | 34.1 s (60) |
+| Qwen | 2969 | 1448 + 1448 + 73 | 51.2 s (58) |
+| Qwen | 3989 | 1448 + 1448 + 1093 | 65.6 s (61) |
+
+Bounds that remain by design: a prompt longer than `context_size` (GLM 4096, Qwen 8192 in the shipped configs) is refused with
+the value to raise, and a batch that cannot fit even at 64 tokens (VRAM taken by another process) is refused before
+allocating; there is no non-graph prefill for Qwen under the graph-only expert placement.
