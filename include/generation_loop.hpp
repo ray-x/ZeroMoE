@@ -742,11 +742,13 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // A batch whose workspace does not fit is retried at half the size while the family can continue a prompt
         // from its earlier chunk; the remaining chunks then use the smaller size too.
         int halvings = 0;
-        while (!graph_built && pc_n_graph > 64 && ++halvings <= 4 &&
+        const int min_batch = std::max(8, graph_model->min_prefill_batch());
+        while (!graph_built && pc_n_graph > (size_t)min_batch && ++halvings <= 6 &&
                (graph_model->supports_prefill_continuation(engine) ||
-                graph_model->suggested_prefill_batch(engine) >= 64)) {
+                graph_model->suggested_prefill_batch(engine) >= min_batch)) {
             const int hint = graph_model->suggested_prefill_batch(engine);
-            pc_n_graph = (hint >= 64 && (size_t)hint < pc_n_graph) ? (size_t)hint : ((pc_n_graph / 2) / 8) * 8;
+            pc_n_graph = (hint >= min_batch && (size_t)hint < pc_n_graph) ? (size_t)hint
+                                                                           : std::max<size_t>(min_batch, ((pc_n_graph / 2) / 8) * 8);
             cap = (int)pc_n_graph;
             LOG_STREAM_INFO() << "[PREFILL] graph declined; retrying with a batch of " << pc_n_graph << " tokens\n";
             graph_built = build_first();
@@ -870,10 +872,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                     size_t take = std::min<size_t>((size_t)cap, remaining);
                     // Keep the last chunk at 64+ tokens (smaller graph batches take the slow cold-expert path) and every
                     // boundary a multiple of 8 (the indexer's pooling blocks).
-                    if (remaining > (size_t)cap && remaining - (size_t)cap < 64)
-                        take = ((remaining - 64) / 8) * 8;
+                    const int min_chunk = std::max(8, graph_model->min_prefill_batch());
+                    if (remaining > (size_t)cap && remaining - (size_t)cap < (size_t)min_chunk)
+                        take = ((remaining - (size_t)min_chunk) / 8) * 8;
                     int n = (int)take;
-                    if (n < 64)
+                    if (n < min_chunk)
                         break;
                     const int pos = pc_reuse + (int)pc_n_batched;
                     const ModelGraphRequest request{ModelGraphPhase::Prefill, n, pos,
@@ -883,7 +886,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                     if (!graph_model->build(engine, request)) {
                         // The free memory moved since the first batch: retry once with the size the family now suggests.
                         const int hint = graph_model->suggested_prefill_batch(engine);
-                        if (hint < 64 || hint >= n)
+                        if (hint < min_chunk || hint >= n)
                             break;
                         n_run = hint;
                         run_request = ModelGraphRequest{ModelGraphPhase::Prefill, n_run, pos, prompt_ids.data() + pos, nullptr};

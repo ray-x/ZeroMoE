@@ -52,6 +52,7 @@ class Qwen4ExpGraphModel final : public FullGraphModelBase<Qwen4ExpGraphModel> {
     return qwen4exp_full_graph_suggested_batch();
   }
   bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }
+  int min_prefill_batch() const override { return 8; } // batches this small still fit when little VRAM is free
 
   bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
     return qwen4exp_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);

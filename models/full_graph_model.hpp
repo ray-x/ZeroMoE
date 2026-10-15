@@ -49,6 +49,8 @@ class FullGraphModel {
   // buffers grow with the batch, so a longer prompt runs this many tokens through the graph and
   // the rest as S=1 steps (see generate_text).
   virtual int max_prefill_tokens(const StreamingEngine &) const { return 0; }
+  // Smallest prefill batch worth running through the graph (a smaller one is stepped / not planned).
+  virtual int min_prefill_batch() const { return 64; }
   // After a prefill batch was declined for memory: the batch size the family worked out would fit (0 = no suggestion).
   virtual int suggested_prefill_batch(const StreamingEngine &) const { return 0; }
 

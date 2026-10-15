@@ -863,7 +863,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         fit = 0;
       if (fit < g.S) {
         fit = (int)(fit * 0.9) / 8 * 8; // headroom: later batches see slightly less free memory than this one
-        g_qwen4exp_suggested_batch = fit >= 64 ? fit : 0;
+        g_qwen4exp_suggested_batch = fit >= 8 ? fit : 0;
         LOG_ERROR("[GGML-QWEN-FULL] refusing graph allocator reserve before any allocation: a batch of %d tokens "
                   "needs ~%.2f GiB of device workspace and %.1f GiB of host memory; %.2f GiB VRAM free, %.1f GiB "
                   "host available%s\n",
