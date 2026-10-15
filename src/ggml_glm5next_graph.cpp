@@ -146,20 +146,22 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
       engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
   const auto &c = engine.model_file.architecture_config;
+  // The latent cache (engine.Lc) holds max_t rows; a chunk that would write past it is left to the caller.
+  if ((int64_t)pos_base + S > (int64_t)engine.max_t)
+    return false;
   // A chunk after the first (pos_base > 0) continues the previous chunk's graph state: its KDA state and conv history, the
   // latent rows and the indexer seeds, all of which the previous run left in the engine / the old graph. Prefill attention
   // is dense, which equals the model's top-k selection only while the context fits in top_k.
   if (pos_base > 0) {
     const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
+    if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_NO_CONTINUATION", 0) != 0)
+      return false; // A/B reference: the rest of the prompt is stepped
     if (g_continuation.engine != &engine || g_continuation.total_tokens != pos_base)
       return false;
     if (kpool > 1 && pos_base % kpool != 0)
       return false;
-    // Beyond top_k the model attends to a selected subset of the context, which the dense prefill attention does not
-    // reproduce; MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 accepts that for speed (default: the rest is stepped).
-    static const bool dense_beyond = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
-    if (top_k > 0 && pos_base + S > top_k && !dense_beyond)
-      return false;
+    // Context beyond top_k: the chunk's attention selects pools per query like the decode graph (sparse_prefill below);
+    // MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 keeps the dense attention instead (A/B only).
   }
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->S == S && g_graph->pos_base == pos_base && !g_graph->decode_mode)
@@ -188,6 +190,17 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->pos_base = pos_base;
   g->total_tokens = pos_base + S;
   g->prev_indexer_seeds = std::move(prev_seeds);
+  {
+    const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
+    static const bool dense_beyond = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
+    static const bool force_sparse = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_FORCE_SPARSE", 0) != 0; // test hook
+    if (top_k > 0 && (pos_base + S > top_k || force_sparse) && !dense_beyond) {
+      // The selection needs the pooled indexer keys of every earlier chunk (the seeds) and pool-aligned boundaries.
+      if (kpool <= 1 || top_k % kpool != 0 || (pos_base > 0 && g->prev_indexer_seeds.empty()))
+        return false;
+      g->sparse_prefill = true;
+    }
+  }
   g->D = c.hidden;
   g->HC = std::max(1, c.hc_mult);
   g->n_layers = c.n_layers;
