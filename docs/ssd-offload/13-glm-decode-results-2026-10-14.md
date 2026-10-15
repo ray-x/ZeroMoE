@@ -397,3 +397,7 @@ itself dense beyond the seeded 2048 tokens, so it cannot be used as a trusted re
 Bounds that remain by design: a prompt longer than `context_size` (GLM 4096, Qwen 8192 in the shipped configs) is refused with
 the value to raise, and a batch that cannot fit even at 64 tokens (VRAM taken by another process) is refused before
 allocating; there is no non-graph prefill for Qwen under the graph-only expert placement.
+
+GLM at `context_size = 8192` (shipped config raised from 4096): 5117 tokens ran as 2048 + 2048 + 1021, all in the graph, 22.0 s
+(232 tok/s). Dense (`DENSE_BEYOND_TOPK=1`) and per-query selection continue the document with the same heading
+and agree on 11 of the first 12 tokens.
