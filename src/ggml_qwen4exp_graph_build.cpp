@@ -3,6 +3,7 @@
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
+#include <algorithm>
 #include "ggml_qwen4exp_graph_internal.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -884,9 +885,31 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     std::vector<size_t> backend_sizes(static_cast<size_t>(n_backends), 0);
     ggml_backend_sched_reserve_size(g.sched, g.graph, backend_sizes.data());
     LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] no-allocation sizing only; "
-             "declining this graph instance (splits=%d copies=%d)\n",
-             ggml_backend_sched_get_n_splits(g.sched),
+             "declining this graph instance (S=%d splits=%d copies=%d)\n",
+             g.S, ggml_backend_sched_get_n_splits(g.sched),
              ggml_backend_sched_get_n_copies(g.sched));
+    {
+      // Largest intermediate tensors of the graph, to see what the workspace is made of.
+      std::vector<std::pair<size_t, int>> big;
+      for (int i = 0; i < ggml_graph_n_nodes(g.graph); ++i) {
+        ggml_tensor *n = ggml_graph_node(g.graph, i);
+        if (n && n->op != GGML_OP_NONE && n->op != GGML_OP_VIEW && n->op != GGML_OP_RESHAPE &&
+            n->op != GGML_OP_PERMUTE && n->op != GGML_OP_TRANSPOSE)
+          big.push_back({ggml_nbytes(n), i});
+      }
+      std::sort(big.rbegin(), big.rend());
+      double total = 0;
+      for (auto &b : big) total += (double)b.first;
+      LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] %zu non-view nodes, sum of their sizes %.2f GiB (S=%d)\n", big.size(),
+               total / (1024.0 * 1024.0 * 1024.0), g.S);
+      for (size_t k = 0; k < big.size() && k < 14; ++k) {
+        ggml_tensor *n = ggml_graph_node(g.graph, big[k].second);
+        LOG_WARN("[GGML-QWEN-FULL-RESERVE-DIAG] top%zu node %d %.3f GiB op=%s name=%s type=%s ne=[%lld,%lld,%lld,%lld] src0=%s\n", k,
+                 big[k].second, (double)big[k].first / (1024.0 * 1024.0 * 1024.0), ggml_op_name(n->op), n->name,
+                 ggml_type_name(n->type), (long long)n->ne[0], (long long)n->ne[1], (long long)n->ne[2],
+                 (long long)n->ne[3], n->src[0] ? n->src[0]->name : "-");
+      }
+    }
     for (int i = 0; i < n_backends; ++i) {
       ggml_backend_t backend = ggml_backend_sched_get_backend(g.sched, i);
       ggml_backend_buffer_type_t buft =
