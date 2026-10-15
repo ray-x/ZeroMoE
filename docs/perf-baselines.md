@@ -55,3 +55,10 @@ The Qwen graph's prefill had been ~3x below BeeLlama because the scheduler was c
 on the CPU, the AVX2-width IQ1_M kernel; BeeLlama's CPU-only number is 30.6). With op-offload on and one pipeline copy the
 reserve is 0.6 GiB + ~2.6 MiB/token (4.7 GiB at 1611 tokens; 44 GiB with the four pipeline copies decode uses).
 Last-row hidden is within relL2 0.19 of the CPU-expert run, same tokens.
+
+## Accepted scope for long-prompt prefill (owner decision, 2026-10-16)
+
+Every chunk of a long prompt runs through the graph for GLM (1152-5117 tokens tested, `context_size = 8192`) and Qwen
+(333-3989 tokens tested, `context_size = 8192`; one graph up to ~7k tokens with GPU op-offload). Accepted bounds:
+prompts past `context_size` are refused with the value to raise; Qwen has no non-graph prefill under the graph-only expert
+placement; GLM's selection beyond top-k has consistency evidence only (no independent reference in the engine).
