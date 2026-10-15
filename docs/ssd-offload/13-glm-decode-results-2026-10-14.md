@@ -372,3 +372,10 @@ expert placement the layered MoE path finds no staged expert blocks (`no RAM blo
 the memory-driven batching above covers the VRAM case. GLM's selection beyond top-k is checked only against dense
 prefill (same tokens on a 2192-token prompt), not against the decode graph, whose own beyond-top-k path is dense in the
 stepped case.
+
+**Selection beyond top-k, consistency check (2026-10-16).** Prompt of 2192 tokens (graph batches 2048 + 144, so the last
+144 queries and every decode step have more context than top_k). Run 1 generated 14 tokens with the decode graph. Run 2
+replayed prompt + the first 6 generated tokens as a prefill (2198 tokens, batches 2048 + 150) and generated 8: the same
+8 tokens as run 1's 7th-14th (also with `DENSE_BEYOND_TOPK=1`). The prefill's selection therefore agrees with the decode
+graph's on this sequence; it does not separate sparse from dense this close to top_k, and the stepped-prefill reference is
+itself dense beyond the seeded 2048 tokens, so it cannot be used as a trusted reference.
