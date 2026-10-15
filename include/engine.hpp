@@ -480,6 +480,7 @@ public:
     float qwen4exp_option_b_min_coverage = 0.80f;
     bool qwen4exp_option_b_right_size_top_n = false;
     int qwen4exp_option_b_global_top_k = 0;
+    int prefill_batch_tokens = 0; // EngineConfig::prefill_batch_tokens (0 = family default)
     int qwen4exp_option_b_global_floor_per_layer = 1;
     // Finalized selected layers after startup usage-file filtering.  This is
     // distinct from the config allow-list, which remains available to main's

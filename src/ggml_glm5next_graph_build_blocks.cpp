@@ -328,6 +328,68 @@ bool build_glm5next_indexer_prefill(FullGraph &g, ggml_context *ctx,
   return true;
 }
 
+// Prefill counterpart of the decode selection: scores every complete pool for every query of the chunk, keeps the
+// top_k / kpool best (all of them while fewer are complete) and returns the F16 [kv_tokens, S] additive attention mask.
+ggml_tensor *build_glm5next_indexer_prefill_select(FullGraph &g, ggml_context *ctx,
+                                                   ggml_tensor *cur, ggml_tensor *qr,
+                                                   int layer, int64_t kv_tokens) {
+  Glm5nextIndexerLayer *state = glm5next_indexer_state(g, layer);
+  if (!state || !g.prefill_pool_valid || !g.prefill_tail01)
+    return nullptr;
+  const std::string prefix = "blk." + std::to_string(layer) + ".";
+  ggml_tensor *w_q = resident_tensor(g, ctx, prefix + "indexer.attn_q_b.weight");
+  ggml_tensor *w_proj = resident_tensor(g, ctx, prefix + "indexer.proj.weight");
+  if (!w_q || !w_proj)
+    return nullptr;
+  const int key_length = g.indexer_key_length, kpool = g.indexer_kpool;
+  const int prev_pools = g.pos_base / kpool;
+  const int total_pools = (g.pos_base + g.S) / kpool;
+  ggml_tensor *pools = state->pooled_out; // this chunk's complete pools [key_length, S / kpool]
+  if (prev_pools > 0) {
+    ggml_tensor *prev = host_input(g, ctx, GGML_TYPE_F32, {key_length, prev_pools},
+                                   (size_t)key_length * prev_pools * sizeof(float),
+                                   ("glm5next_prev_pools_" + std::to_string(layer)).c_str());
+    if (!prev)
+      return nullptr;
+    g.indexer_prev_pool_inputs.push_back({layer, static_cast<float *>(prev->data), prev_pools});
+    pools = pools ? ggml_concat(ctx, prev, pools, 1) : prev;
+  }
+  if (!pools || pools->ne[1] != total_pools)
+    return nullptr;
+
+  ggml_tensor *q = ggml_mul_mat(ctx, w_q, qr);
+  q = ggml_reshape_2d(ctx, q, key_length, (int64_t)g.indexer_heads * g.S);
+  ggml_tensor *w = ggml_mul_mat(ctx, w_proj, cur);
+  w = ggml_scale(ctx, w, 1.0f / std::sqrt((float)key_length * g.indexer_heads));
+  w = ggml_reshape_3d(ctx, w, 1, g.indexer_heads, g.S);
+  ggml_tensor *kq = ggml_mul_mat(ctx, pools, q); // [pools, heads * S]
+  kq = ggml_reshape_3d(ctx, kq, total_pools, g.indexer_heads, g.S);
+  ggml_tensor *weighted = ggml_mul(ctx, ggml_relu(ctx, kq), w);
+  weighted = ggml_cont(ctx, ggml_permute(ctx, weighted, 1, 0, 2, 3)); // [heads, pools, S]
+  ggml_tensor *score = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, weighted), total_pools, g.S);
+  score = ggml_add(ctx, score, ggml_scale_bias(ctx, g.prefill_pool_valid, 1.0e30f, -1.0e30f));
+
+  const int n_top = std::min(total_pools, g.indexer_top_k / kpool);
+  if (n_top <= 0)
+    return nullptr;
+
+  ggml_tensor *order = ggml_argsort(ctx, score, GGML_SORT_ORDER_DESC); // [pools, S] pool ids, best first
+  ggml_tensor *kth = ggml_cont(ctx, ggml_view_2d(ctx, order, 1, g.S, order->nb[1], (size_t)(n_top - 1) * order->nb[0]));
+  ggml_tensor *thr = ggml_get_rows(ctx, ggml_reshape_3d(ctx, score, 1, total_pools, g.S), kth); // [1, 1, S]
+  thr = ggml_reshape_2d(ctx, thr, 1, g.S);
+  ggml_tensor *diff = ggml_sub(ctx, score, ggml_repeat(ctx, thr, score));
+  ggml_tensor *sel = ggml_step(ctx, ggml_scale_bias(ctx, diff, 1.0f, 1.0e-6f));
+  sel = ggml_mul(ctx, sel, g.prefill_pool_valid);
+  ggml_tensor *tok = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, sel, 1, total_pools, g.S), kpool, total_pools, g.S, 1);
+  tok = ggml_reshape_2d(ctx, ggml_cont(ctx, tok), (int64_t)kpool * total_pools, g.S);
+  if (kv_tokens > (int64_t)kpool * total_pools)
+    tok = ggml_pad(ctx, tok, (int)(kv_tokens - (int64_t)kpool * total_pools), 0, 0, 0);
+  // Selected pools and the incomplete tail are disjoint token sets: the sum is the union.
+  ggml_tensor *allowed = ggml_add(ctx, tok, g.prefill_tail01);
+  ggml_tensor *mask = ggml_scale_bias(ctx, allowed, 30000.0f, -30000.0f);
+  return ggml_cont(ctx, ggml_cast(ctx, mask, GGML_TYPE_F16));
+}
+
 bool build_glm5next_indexer_decode(FullGraph &g, ggml_context *ctx,
                                    ggml_tensor *cur, ggml_tensor *qr,
                                    int layer, ggml_tensor **sel_out,
@@ -477,6 +539,12 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (!g.decode_mode && glm5next_indexer_owner(g, layer) &&
       !build_glm5next_indexer_prefill(g, ctx, cur, layer))
     return nullptr;
+  if (!g.decode_mode && g.sparse_prefill && glm5next_indexer_owner(g, layer)) {
+    const int64_t kv_pad = (((int64_t)g.pos_base + g.S + 255) & ~((int64_t)255));
+    g.prefill_sel_mask = build_glm5next_indexer_prefill_select(g, ctx, cur, qr, layer, kv_pad);
+    if (!g.prefill_sel_mask)
+      return nullptr;
+  }
 
   q = ggml_permute(ctx, q, 0, 2, 1, 3);
   q = ggml_mul_mat(ctx, wkb, q);
@@ -571,7 +639,8 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     attn = ggml_reshape_2d(ctx, attn, g.v_head * g.H, g.S);
   } else {
     attn = ggml_flash_attn_ext(
-        ctx, q, k, v, g.attn_mask,
+        ctx, q, k, v,
+        (!g.decode_mode && g.sparse_prefill && g.prefill_sel_mask) ? g.prefill_sel_mask : g.attn_mask,
         1.0f / std::sqrt((float)(g.qk_nope > 0 ? g.qk_nope : 1)), 0.0f,
         0.0f);
   }

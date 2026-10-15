@@ -112,6 +112,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
 
 // What a prefill chunk leaves for the next one. Kept apart from g_graph, which a declined attempt (or the retry without the
 // prefetch ring) has already released.
+static int g_suggested_batch = 0;
+int glm5next_full_graph_suggested_batch() { return g_suggested_batch; }
+
 static struct PrefillContinuation {
   const StreamingEngine *engine = nullptr;
   int total_tokens = 0;
@@ -146,20 +149,22 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
       engine.family_ops.family != ModelFamily::GLM5NEXT)
     return false;
   const auto &c = engine.model_file.architecture_config;
+  // The latent cache (engine.Lc) holds max_t rows; a chunk that would write past it is left to the caller.
+  if ((int64_t)pos_base + S > (int64_t)engine.max_t)
+    return false;
   // A chunk after the first (pos_base > 0) continues the previous chunk's graph state: its KDA state and conv history, the
   // latent rows and the indexer seeds, all of which the previous run left in the engine / the old graph. Prefill attention
   // is dense, which equals the model's top-k selection only while the context fits in top_k.
   if (pos_base > 0) {
     const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
+    if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_NO_CONTINUATION", 0) != 0)
+      return false; // A/B reference: the rest of the prompt is stepped
     if (g_continuation.engine != &engine || g_continuation.total_tokens != pos_base)
       return false;
     if (kpool > 1 && pos_base % kpool != 0)
       return false;
-    // Beyond top_k the model attends to a selected subset of the context, which the dense prefill attention does not
-    // reproduce; MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 accepts that for speed (default: the rest is stepped).
-    static const bool dense_beyond = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
-    if (top_k > 0 && pos_base + S > top_k && !dense_beyond)
-      return false;
+    // Context beyond top_k: the chunk's attention selects pools per query like the decode graph (sparse_prefill below);
+    // MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 keeps the dense attention instead (A/B only).
   }
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->S == S && g_graph->pos_base == pos_base && !g_graph->decode_mode)
@@ -188,6 +193,17 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->pos_base = pos_base;
   g->total_tokens = pos_base + S;
   g->prev_indexer_seeds = std::move(prev_seeds);
+  {
+    const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
+    static const bool dense_beyond = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
+    static const bool force_sparse = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_FORCE_SPARSE", 0) != 0; // test hook
+    if (top_k > 0 && (pos_base + S > top_k || force_sparse) && !dense_beyond) {
+      // The selection needs the pooled indexer keys of every earlier chunk (the seeds) and pool-aligned boundaries.
+      if (kpool <= 1 || top_k % kpool != 0 || (pos_base > 0 && g->prev_indexer_seeds.empty()))
+        return false;
+      g->sparse_prefill = true;
+    }
+  }
   g->D = c.hidden;
   g->HC = std::max(1, c.hc_mult);
   g->n_layers = c.n_layers;
@@ -230,6 +246,34 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   }
   if (!init_expert_arena(*g) || !init_dense_arena(*g))
     return false;
+  // Memory pre-check: the scheduler's workspace is requested from the allocator in one piece, and a request the device
+  // cannot satisfy must never reach it. Device-0 consumption measured from free memory after the build: ~0.8 MiB per token (0.20 GiB left at 814
+  // tokens, 0.004 at 1065 with the ring); the scheduler's total workspace is 1.35 GiB + 0.45 MiB/token, mostly host/GPU1; host side needs headroom above the compute floor. When the batch does not fit, the
+  // largest one that does is recorded for the caller (suggested_prefill_batch) and this prepare is declined.
+  {
+    size_t free_b = 0, total_b = 0;
+    cudaSetDevice(g->device);
+    const bool have = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0, kMiB = 1024.0 * 1024.0;
+    const double fixed = 0.2 * kGiB, per_token = 0.85 * kMiB, margin = 0.15 * kGiB; // device 0, see the ring check
+    const double avail_host_gb = std::max(0.0, (double)MemoryGuard::read_available_mb() / 1024.0);
+    const double host_need_gb = 12.0 + (double)S / 1024.0; // 10 GiB compute floor + slack + ~1 MiB per token
+    int fit = S;
+    if (have && fixed + per_token * S + margin > (double)free_b)
+      fit = (int)std::max(0.0, ((double)free_b - fixed - margin) / per_token);
+    if (avail_host_gb > 0 && avail_host_gb < host_need_gb)
+      fit = 0;
+    if (fit < S) {
+      fit = (fit / 8) * 8;
+      g_suggested_batch = fit >= 64 ? fit : 0;
+      LOG_WARN("[GGML-GLM5NEXT-FULL] prefill batch of %d tokens needs ~%.2f GiB of device workspace but %.2f GiB are free "
+               "(host: %.1f GiB available, %.1f needed); declining before any allocation%s\n",
+               S, (fixed + per_token * S) / kGiB, have ? (double)free_b / kGiB : -1.0, avail_host_gb, host_need_gb,
+               g_suggested_batch > 0 ? ("; " + std::to_string(g_suggested_batch) + " tokens would fit").c_str() : "");
+      return false;
+    }
+    g_suggested_batch = 0;
+  }
   // GPU1-hot experts compute in place on the second GPU (MOESTREAM_GLM5NEXT_PREFILL_GPU1=0 routes them through the cold
   // branch, copying each used expert to the main GPU).
   if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)
@@ -257,6 +301,19 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
     return false;
   }
   g_graph = std::move(g);
+  {
+    // Free memory per device once the workspace is allocated (calibrates the pre-check above).
+    int ndev = 0;
+    cudaGetDeviceCount(&ndev);
+    for (int d = 0; d < ndev && d < 2; ++d) {
+      size_t f = 0, t = 0;
+      cudaSetDevice(d);
+      if (cudaMemGetInfo(&f, &t) == cudaSuccess)
+        LOG_INFO("[GGML-GLM5NEXT-FULL] after graph build: device %d free %.3f GiB\n", d,
+                 (double)f / (1024.0 * 1024.0 * 1024.0));
+    }
+    cudaSetDevice(g_graph->device);
+  }
   LOG_INFO("[GGML-GLM5NEXT-FULL] graph prepared for S=%d\n", S);
   return true;
 }

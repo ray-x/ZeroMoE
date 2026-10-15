@@ -40,6 +40,19 @@ class Qwen4ExpGraphModel final : public FullGraphModelBase<Qwen4ExpGraphModel> {
   }
   bool supports_cpu_lane() const override { return true; }
 
+  // Tokens per prefill graph batch: MOESTREAM_QWEN4EXP_PREFILL_CHUNK, else the toml's `prefill_batch_tokens`, else the
+  // whole prompt (0). There is no continuation for this family yet, so a prompt longer than the batch is not supported
+  // (see suggested_prefill_batch); the memory pre-check refuses an oversized batch before any allocation.
+  int max_prefill_tokens(const StreamingEngine &e) const override {
+    if (const char *v = std::getenv("MOESTREAM_QWEN4EXP_PREFILL_CHUNK"); v && v[0])
+      return std::atoi(v);
+    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 0;
+  }
+  // No retry with the suggestion: the decode graph cannot continue from a partial graph prefill (measured: 1608 graph
+  // tokens, the remaining 2381 stepped -> "decode construction failed"), so a smaller batch only wastes the prefill.
+  // The refusal log names the batch that fits; a long-prompt path needs chunked prefill for this family.
+  int suggested_prefill_batch(const StreamingEngine &) const override { return 0; }
+
   bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
     return qwen4exp_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);
   }
@@ -89,16 +102,18 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   }
   bool supports_cpu_lane() const override { return true; }
 
-  // The prefill graph's workspace grows ~4.5 MiB per token, so a long prompt runs in chunks of N tokens, each continuing
-  // the previous one's state (up to the sparse top-k of 2048 tokens of context; beyond that the rest is stepped one token
-  // at a time). Larger chunks are faster: every chunk streams all cold experts again.
-  // MOESTREAM_GLM5NEXT_PREFILL_CHUNK=N (default 2048, 0 = whole prompt in one graph).
-  int max_prefill_tokens(const StreamingEngine &) const override {
-    static const int chunk = [] {
-      const char *v = std::getenv("MOESTREAM_GLM5NEXT_PREFILL_CHUNK");
-      return v && v[0] ? std::atoi(v) : 2048;
-    }();
-    return chunk;
+  // Tokens per prefill batch (llama.cpp's n_ubatch): MOESTREAM_GLM5NEXT_PREFILL_CHUNK, else the toml's
+  // `prefill_batch_tokens`, else 2048 (every batch restreams all cold experts, so 512 prefills a 1065-token prompt at
+  // 90 tok/s against 250 for one batch). 0 = the whole prompt in one graph. Each batch continues the previous one's state
+  // (up to the sparse top-k of 2048 tokens of context). Whatever is configured is reduced by the prepare check to what
+  // fits in free VRAM / host RAM, so an oversized value cannot request memory the box does not have.
+  int max_prefill_tokens(const StreamingEngine &e) const override {
+    if (const char *v = std::getenv("MOESTREAM_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
+      return std::atoi(v);
+    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
+  }
+  int suggested_prefill_batch(const StreamingEngine &) const override {
+    return glm5next_full_graph_suggested_batch();
   }
 
   bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }

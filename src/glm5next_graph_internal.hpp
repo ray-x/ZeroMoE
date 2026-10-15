@@ -279,6 +279,19 @@ struct FullGraph : moestream::graph::GraphCore {
   bool ran = false; // the prefill graph completed a run (its KDA/latent/indexer state is exported)
   std::vector<std::pair<int, float *>> dsa_prev_inputs;
   std::vector<Glm5nextIndexerSeed> prev_indexer_seeds;
+  // Prefill chunk whose context exceeds the indexer's top-k: attention keeps, per query, the tokens of the best-scoring
+  // pools (plus the tail of the incomplete pool), as the decode graph does. The mask is built by the first indexer-owner
+  // layer and reused by the DSA layers after it.
+  bool sparse_prefill = false;
+  ggml_tensor *prefill_pool_valid = nullptr; // [pools, S] 1 where the pool is complete for that query
+  ggml_tensor *prefill_tail01 = nullptr;     // [kv_tokens, S] 1 for the tokens of the query's incomplete pool
+  ggml_tensor *prefill_sel_mask = nullptr;   // [kv_tokens, S] F16 additive attention mask
+  struct PrevPoolInput {
+    int layer = -1;
+    float *data = nullptr;
+    int pools = 0;
+  };
+  std::vector<PrevPoolInput> indexer_prev_pool_inputs;
   std::vector<ggml_tensor *> dsa_kv_storage;
   std::vector<ggml_tensor *> kda_state_storage;
   std::vector<ggml_tensor *> kda_hist_storage;
@@ -532,6 +545,8 @@ struct FullGraph : moestream::graph::GraphCore {
     kda_hist_inputs.clear();
     dsa_kv_out.clear();
     dsa_prev_inputs.clear();
+    indexer_prev_pool_inputs.clear();
+    prefill_pool_valid = prefill_tail01 = prefill_sel_mask = nullptr;
     dsa_kv_storage.clear();
     kda_state_storage.clear();
     kda_hist_storage.clear();
@@ -550,8 +565,6 @@ struct FullGraph : moestream::graph::GraphCore {
   }
 };
 
-
-bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag);
 
 // Helpers defined in ggml_glm5next_graph.cpp and used by the DeepSeek-V4 builder.
 bool type_ok(GGUFType type);

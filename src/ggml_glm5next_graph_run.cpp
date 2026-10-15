@@ -36,6 +36,16 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
       std::memcpy(g.kda_hist_inputs[i], engine.glm5next_conv_history[l].data(), hist_n * sizeof(float));
     }
   }
+  for (const auto &in : g.indexer_prev_pool_inputs) {
+    const Glm5nextIndexerSeed *seed = nullptr;
+    for (const Glm5nextIndexerSeed &p : g.prev_indexer_seeds)
+      if (p.layer == in.layer)
+        seed = &p;
+    const size_t n = (size_t)in.pools * g.indexer_key_length;
+    if (!seed || seed->pooled_keys.size() < n)
+      return false;
+    std::memcpy(in.data, seed->pooled_keys.data(), n * sizeof(float));
+  }
   for (const auto &[layer, dst] : g.dsa_prev_inputs) {
     if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer])
       return false;

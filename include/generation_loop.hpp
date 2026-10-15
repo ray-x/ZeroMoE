@@ -730,8 +730,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         bool graph_built = build_first();
         // A batch whose workspace does not fit is retried at half the size while the family can continue a prompt
         // from its earlier chunk; the remaining chunks then use the smaller size too.
-        while (!graph_built && pc_n_graph > 256 && graph_model->supports_prefill_continuation(engine)) {
-            pc_n_graph = ((pc_n_graph / 2) / 8) * 8;
+        while (!graph_built && pc_n_graph > 64 &&
+               (graph_model->supports_prefill_continuation(engine) ||
+                graph_model->suggested_prefill_batch(engine) >= 64)) {
+            const int hint = graph_model->suggested_prefill_batch(engine);
+            pc_n_graph = (hint >= 64 && (size_t)hint < pc_n_graph) ? (size_t)hint : ((pc_n_graph / 2) / 8) * 8;
             cap = (int)pc_n_graph;
             LOG_STREAM_INFO() << "[PREFILL] graph declined; retrying with a batch of " << pc_n_graph << " tokens\n";
             graph_built = build_first();
@@ -966,6 +969,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                                : 0.0)
                        << "ms\n";
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
+    if (const char *dump = std::getenv("MOESTREAM_DUMP_LAST_HIDDEN"); dump && dump[0] && hidden_states.size() >= (size_t)D) {
+        std::ofstream hf(dump, std::ios::binary | std::ios::trunc);
+        hf.write(reinterpret_cast<const char *>(hidden_states.data() + hidden_states.size() - D), (std::streamsize)D * sizeof(float));
+    }
     // Snapshot the end-of-prompt state for the next request. Saved AFTER
     // prefill and before any decode token, so the cache always corresponds to
     // exactly this prompt -- decode writes dense KV at positions >= N and

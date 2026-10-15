@@ -22,7 +22,8 @@ NATIVE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build_native/ggml-build/
 if [ -f "$NATIVE/ggml-cuda/libggml-cuda.so.0" ]; then
   export LD_LIBRARY_PATH=$GGML_KERNEL_LIBS:$NATIVE:$NATIVE/ggml-cuda
   export MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1 MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1
-  # Pin the whole DDR pool: the prefill's expert prefetch ring copies straight from it, and a pageable source makes the
-  # copy synchronous (176.9 vs 167.4 tok/s). Uses ~63 GiB of unreclaimable host RAM.
-  export MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=${MOESTREAM_GLM5NEXT_OFFLOAD_PINNED:-1.0}
+  # MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=1.0 pins the whole DDR pool (~63 GiB of unreclaimable host RAM): prefill +0.3 s
+  # faster (the prefetch ring copies straight from it), but it is the setting that overcommits the box when another large
+  # job runs (two hard reboots on 2026-10-15). Default stays at the engine's 0.5; export 1.0 only when nothing else runs.
+  :
 fi
