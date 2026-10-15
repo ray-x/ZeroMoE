@@ -247,15 +247,15 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   if (!init_expert_arena(*g) || !init_dense_arena(*g))
     return false;
   // Memory pre-check: the scheduler's workspace is requested from the allocator in one piece, and a request the device
-  // cannot satisfy must never reach it. Measured workspace (graph build logs): 1.35 GiB + ~0.45 MiB per token (S=144:
-  // 1.35, 727: 1.61, 2048: 2.15 GiB); host side needs headroom above the compute floor. When the batch does not fit, the
+  // cannot satisfy must never reach it. Device-0 consumption measured from free memory after the build: ~0.8 MiB per token (0.20 GiB left at 814
+  // tokens, 0.004 at 1065 with the ring); the scheduler's total workspace is 1.35 GiB + 0.45 MiB/token, mostly host/GPU1; host side needs headroom above the compute floor. When the batch does not fit, the
   // largest one that does is recorded for the caller (suggested_prefill_batch) and this prepare is declined.
   {
     size_t free_b = 0, total_b = 0;
     cudaSetDevice(g->device);
     const bool have = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
     constexpr double kGiB = 1024.0 * 1024.0 * 1024.0, kMiB = 1024.0 * 1024.0;
-    const double fixed = 1.35 * kGiB, per_token = 0.5 * kMiB, margin = 0.25 * kGiB;
+    const double fixed = 0.2 * kGiB, per_token = 0.85 * kMiB, margin = 0.15 * kGiB; // device 0, see the ring check
     const double avail_host_gb = std::max(0.0, (double)MemoryGuard::read_available_mb() / 1024.0);
     const double host_need_gb = 12.0 + (double)S / 1024.0; // 10 GiB compute floor + slack + ~1 MiB per token
     int fit = S;
@@ -301,6 +301,19 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
     return false;
   }
   g_graph = std::move(g);
+  {
+    // Free memory per device once the workspace is allocated (calibrates the pre-check above).
+    int ndev = 0;
+    cudaGetDeviceCount(&ndev);
+    for (int d = 0; d < ndev && d < 2; ++d) {
+      size_t f = 0, t = 0;
+      cudaSetDevice(d);
+      if (cudaMemGetInfo(&f, &t) == cudaSuccess)
+        LOG_INFO("[GGML-GLM5NEXT-FULL] after graph build: device %d free %.3f GiB\n", d,
+                 (double)f / (1024.0 * 1024.0 * 1024.0));
+    }
+    cudaSetDevice(g_graph->device);
+  }
   LOG_INFO("[GGML-GLM5NEXT-FULL] graph prepared for S=%d\n", S);
   return true;
 }

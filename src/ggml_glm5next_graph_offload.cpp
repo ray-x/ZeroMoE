@@ -485,6 +485,16 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
       cudaMemGetInfo(&freeb, &totb);
       LOG_INFO("[GGML-GLM5NEXT-PREFETCH] device %d: free %.3f GiB before the ring, ring %.3f GiB\n", part,
                (double)freeb / (1024.0 * 1024.0 * 1024.0), (double)want[part] / (1024.0 * 1024.0 * 1024.0));
+      // The graph's own workspace is allocated after the ring and grows ~0.8 MiB per token on this device (free memory
+      // after the build: 0.20 GiB at 814 tokens, 0.004 GiB at 1065, where the first compute then failed to allocate its
+      // runtime resources). The ring is only worth it when it leaves that and a small reserve free.
+      const double need = (double)want[part] + 0.85 * 1024.0 * 1024.0 * g.S + 0.15 * 1024.0 * 1024.0 * 1024.0;
+      if (need > (double)freeb) {
+        LOG_INFO("[GGML-GLM5NEXT-PREFETCH] device %d: ring + workspace for %d tokens need %.2f GiB, %.2f GiB free; "
+                 "prefetch off for this batch\n", part, g.S, need / (1024.0 * 1024.0 * 1024.0),
+                 (double)freeb / (1024.0 * 1024.0 * 1024.0));
+        return false;
+      }
     }
   }
   for (int part = 0; part < ring->n_parts && ok; ++part) {
