@@ -708,6 +708,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // bounded buffers (max_prefill_tokens) runs only the first N tokens through the graph and the
     // rest as S=1 steps; it applies only once the graph actually built, so a failed build keeps
     // the whole-prompt fallback.
+    auto supports_continuation_for_tail = [](const FullGraphModel *m, const StreamingEngine &e) {
+        return m && m->supports_prefill_continuation(e);
+    };
     size_t pc_n_batched = pc_n_new;
     int pc_graph_cap = 0;
     // The KV/state caches hold engine.max_t positions (the config's context_size). A longer prompt would write past them,
@@ -726,8 +729,15 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
         size_t pc_n_graph = pc_n_new;
         int cap = graph_model->max_prefill_tokens(engine);
-        if (cap > 1 && (size_t)cap < pc_n_new)
+        if (cap > 1 && (size_t)cap < pc_n_new) {
             pc_n_graph = (size_t)cap;
+            // A tail smaller than the family's minimum batch would be stepped one token at a time (2083 tokens at a batch
+            // of 2048: 35 stepped tokens, 14.3 s instead of ~10 s); shorten the first batch so the tail is a real batch.
+            const size_t min_tail = (size_t)std::max(8, graph_model->min_prefill_batch());
+            if (supports_continuation_for_tail(graph_model, engine) && pc_n_new - pc_n_graph < min_tail &&
+                pc_n_new > min_tail + 64)
+                pc_n_graph = ((pc_n_new - min_tail) / 8) * 8;
+        }
         auto build_first = [&]() {
             const ModelGraphRequest request{
                 ModelGraphPhase::Prefill,

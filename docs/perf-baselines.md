@@ -21,6 +21,8 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 | prefill, 1689 tokens | 264 tok/s | 2026-10-16 | one graph |
 | prefill, 3867 tokens | 263 tok/s | 2026-10-16 | 2048 + 1819 |
 | prefill, 5117 tokens | 232 tok/s | 2026-10-16 | 2048 + 2048 + 1021 |
+| prefill, 4090 tokens (peak) | **272.7 tok/s** | 2026-10-16 | full record: `docs/perf-record-2026-10-16.md` |
+| prefill, 2083 tokens | 191 tok/s (was 146: tail stepped) | 2026-10-16 | fixed: first batch shortened so the tail >= 64 |
 | decode, tokens 16-32 | 70.1 ms/token | 2026-10-15 | `moe_cache_gb` 15.8 -> 15.0: 70.7 (+0.9%) |
 | prefill, before this work | 159 tok/s (5.05 s) | 2026-10-14 | for the record |
 
@@ -37,6 +39,8 @@ host-resident experts on the GPU (`MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD`, defau
 | prefill, 1611 tokens | **312 tok/s** (5.17 s) | 2026-10-16 | was 61-63 with CPU experts |
 | prefill, 2033 tokens | **355 tok/s** (5.72 s) | 2026-10-16 | |
 | prefill, 3989 tokens | **507 tok/s** (7.87 s) | 2026-10-16 | one graph, no batching needed |
+| prefill, 5895 tokens (peak) | **548 tok/s** | 2026-10-16 | full record: `docs/perf-record-2026-10-16.md` |
+| decode, short context | 19.5 tok/s (51 ms/token) | 2026-10-16 | 16.5 tok/s at 4-6k context |
 | prefill, 1611 tokens, CPU experts (`OP_OFFLOAD=0`) | 61-63 tok/s | 2026-10-16 | previous behaviour |
 | prefill, 2824 tokens (recorded) | 138 tok/s | 2026-09 | older "ggml MUL_MAT_ID prefill" path |
 
