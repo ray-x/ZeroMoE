@@ -26,7 +26,7 @@ model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
 log_path  = "debug_qwen4exp_3090only.log"
 log_level = "INFO"
 
-context_size   = 2048
+context_size   = 8192
 max_new_tokens = 80
 temperature    = 0.0
 top_p          = 0.95
