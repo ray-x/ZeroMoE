@@ -710,6 +710,17 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // the whole-prompt fallback.
     size_t pc_n_batched = pc_n_new;
     int pc_graph_cap = 0;
+    // The KV/state caches hold engine.max_t positions (the config's context_size). A longer prompt would write past them,
+    // so it is refused here with the value to raise instead of being run.
+    if (engine.max_t > 0 && prompt_ids.size() + 1 > (size_t)engine.max_t) {
+        LOG_STREAM_ERROR() << "[PREFILL] the prompt has " << prompt_ids.size() << " tokens but the configured context_size "
+                           << "holds " << engine.max_t << " positions; raise context_size in the config (the KV/state "
+                           << "caches are sized from it). Refusing the request.\n";
+        if (!bench_silent)
+            std::cerr << "\n[ERROR] prompt of " << prompt_ids.size() << " tokens exceeds context_size="
+                      << engine.max_t << "; raise context_size in the config\n";
+        return;
+    }
     if (pc_n_new > 1 && pc_reuse == 0 && !unbatched_prefill &&
         graph_model &&
         graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
@@ -730,7 +741,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         bool graph_built = build_first();
         // A batch whose workspace does not fit is retried at half the size while the family can continue a prompt
         // from its earlier chunk; the remaining chunks then use the smaller size too.
-        while (!graph_built && pc_n_graph > 64 &&
+        int halvings = 0;
+        while (!graph_built && pc_n_graph > 64 && ++halvings <= 4 &&
                (graph_model->supports_prefill_continuation(engine) ||
                 graph_model->suggested_prefill_batch(engine) >= 64)) {
             const int hint = graph_model->suggested_prefill_batch(engine);
@@ -741,9 +753,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         }
         pc_graph_cap = cap;
         if (!graph_built && engine.qwen4exp_full_graph_required) {
-            engine.qwen4exp_full_graph_failure =
-                "prefill graph construction failed";
-            LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; aborting request\n",
+            // Smaller batches were tried above (memory); the layered forward cannot take over here: with the graph-only
+            // expert placement it finds no staged expert blocks and would silently drop their tokens.
+            engine.qwen4exp_full_graph_failure = "prefill graph construction failed";
+            LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s even with the smallest batch; aborting request\n",
                       engine.qwen4exp_full_graph_failure.c_str());
             return;
         }
@@ -856,14 +869,26 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                     // boundary a multiple of 8 (the indexer's pooling blocks).
                     if (remaining > (size_t)cap && remaining - (size_t)cap < 64)
                         take = ((remaining - 64) / 8) * 8;
-                    const int n = (int)take;
+                    int n = (int)take;
                     if (n < 64)
                         break;
                     const int pos = pc_reuse + (int)pc_n_batched;
                     const ModelGraphRequest request{ModelGraphPhase::Prefill, n, pos,
                                                     prompt_ids.data() + pos, nullptr};
-                    if (!graph_model->build(engine, request))
-                        break;
+                    int n_run = n;
+                    ModelGraphRequest run_request = request;
+                    if (!graph_model->build(engine, request)) {
+                        // The free memory moved since the first batch: retry once with the size the family now suggests.
+                        const int hint = graph_model->suggested_prefill_batch(engine);
+                        if (hint < 64 || hint >= n)
+                            break;
+                        n_run = hint;
+                        run_request = ModelGraphRequest{ModelGraphPhase::Prefill, n_run, pos, prompt_ids.data() + pos, nullptr};
+                        if (!graph_model->build(engine, run_request))
+                            break;
+                        pc_graph_cap = n_run;
+                    }
+                    n = n_run;
                     float *rows = hidden_states.data() + pc_n_batched * (size_t)D;
                     if (hc_active)
                         hc_expand_embedding(engine, rows, n, D);

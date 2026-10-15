@@ -275,6 +275,8 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
 }
 
 int g_qwen4exp_suggested_batch = 0;
+const StreamingEngine *g_qwen4exp_cont_engine = nullptr;
+int g_qwen4exp_cont_total = 0;
 
 } // namespace qwen4exp_graph
 
@@ -282,9 +284,23 @@ int qwen4exp_full_graph_suggested_batch() { return qwen4exp_graph::g_qwen4exp_su
 
 bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
                                  const int *token_ids) {
-  if (!env_enabled() || S <= 1 || pos_base != 0 ||
+  if (!env_enabled() || S <= 1 || pos_base < 0 ||
       engine.family_ops.family != ModelFamily::Qwen4Exp)
     return false;
+  // A batch after the first continues the previous batch of the same prompt (recurrent state, dense KV rows, PLE window
+  // are in the engine). The paths with their own per-layer machinery are not continued.
+  if (pos_base > 0) {
+    if (g_qwen4exp_cont_engine != &engine || g_qwen4exp_cont_total != pos_base ||
+        (int64_t)pos_base + S > (int64_t)engine.max_t || engine.qwen4exp_partial_layer >= 0 ||
+        !engine.qwen4exp_gpu_stage_layers.empty() || engine.qwen4exp_cpu_offload || engine.prompt_cache) {
+      LOG_WARN("[GGML-QWEN-FULL] prefill batch at pos_base=%d S=%d is not continued: state_engine_match=%d state_total=%d "
+               "max_t=%d partial_layer=%d stage_layers=%zu cpu_offload=%d prompt_cache=%d\n",
+               pos_base, S, g_qwen4exp_cont_engine == &engine ? 1 : 0, g_qwen4exp_cont_total, engine.max_t,
+               engine.qwen4exp_partial_layer, engine.qwen4exp_gpu_stage_layers.size(),
+               engine.qwen4exp_cpu_offload ? 1 : 0, engine.prompt_cache ? 1 : 0);
+      return false;
+    }
+  }
   // CPUOffload's prefill graph still uses the established scheduler CPU
   // branch. The host-node bridge is decode-only because its callback is a
   // single-token strided CPU contract; prefill must retain the ordinary
@@ -325,7 +341,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   if (reuse_prefill_weight_arenas)
     manage_decode_arena_for_prefill(engine, S);
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
-      g_graph->sched && !g_graph->decode_mode && g_graph->S == S) {
+      g_graph->sched && !g_graph->decode_mode && g_graph->S == S && g_graph->pos_base == pos_base) {
     // PLE rows are request data, so refresh that input when the graph shape
     // is reused for a different prompt.  The model graph itself remains
     // persistent, exactly like llama.cpp's shape cache.
@@ -350,7 +366,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       g_graph_prefill_state_owner->ready &&
       g_graph_prefill_state_owner->sched &&
       g_graph_prefill_state_owner->engine == &engine &&
-      g_graph_prefill_state_owner->S == S) {
+      g_graph_prefill_state_owner->S == S && g_graph_prefill_state_owner->pos_base == pos_base) {
     g_graph.reset();
     g_graph = std::move(g_graph_prefill_state_owner);
     LOG_INFO("[GGML-QWEN-FULL] reusing retained prefill state graph for "
@@ -371,7 +387,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       g_graph_prefill_arena_owner->sched &&
       g_graph_prefill_arena_owner->engine == &engine &&
       !g_graph_prefill_arena_owner->decode_mode &&
-      g_graph_prefill_arena_owner->S == S) {
+      g_graph_prefill_arena_owner->S == S && g_graph_prefill_arena_owner->pos_base == pos_base) {
     g_graph.reset();
     g_graph = std::move(g_graph_prefill_arena_owner);
     LOG_INFO("[GGML-QWEN-FULL] reusing retained prefill graph for matching "
@@ -398,6 +414,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->engine = &engine;
   g->device = dev;
   g->S = S;
+  g->pos_base = pos_base;
   g->D = c.hidden;
   g->HC = c.hc_mult;
   g->n_layers = c.n_layers;

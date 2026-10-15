@@ -232,6 +232,20 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
     *k_cache = k;
   if (v_cache)
     *v_cache = v;
+  if (g.pos_base > 0) {
+    // Chunked prefill: the earlier batches' K/V (already normalized and rotated, as stored in the dense cache) precede
+    // this batch's along the sequence axis; the mask is offset by pos_base.
+    const size_t bytes = (size_t)g.hd * g.Hkv * g.pos_base * sizeof(float);
+    ggml_tensor *pk = host_input(g, ctx, GGML_TYPE_F32, {g.hd, g.Hkv, g.pos_base}, bytes,
+                                 ("qwen_prev_k_" + std::to_string(layer)).c_str());
+    ggml_tensor *pv = host_input(g, ctx, GGML_TYPE_F32, {g.hd, g.Hkv, g.pos_base}, bytes,
+                                 ("qwen_prev_v_" + std::to_string(layer)).c_str());
+    if (!pk || !pv)
+      return nullptr;
+    g.prev_kv_inputs.push_back({layer, static_cast<float *>(pk->data), static_cast<float *>(pv->data)});
+    k = ggml_concat(ctx, pk, k, 2);
+    v = ggml_concat(ctx, pv, v, 2);
+  }
   q = ggml_permute(ctx, q, 0, 2, 1, 3);
   k = ggml_permute(ctx, k, 0, 2, 1, 3);
   v = ggml_permute(ctx, v, 0, 2, 1, 3);
@@ -329,7 +343,7 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
                            int pos_base, const int *token_ids) {
   const auto &c = g.engine->model_file.architecture_config;
   if (!has_ple_layer(c) || !token_ids ||
-      (pos_base != 0 && !(g.decode_mode && S == 1)))
+      (pos_base != 0 && !(g.decode_mode && S == 1) && g.decode_mode))
     return !has_ple_layer(c);
   const GGUFTensor *table =
       model_tensor(*g.engine, "per_layer_token_embd.weight");
@@ -362,7 +376,16 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
         }
       } else {
         const int j = i - s;
-        ctx[s] = j >= 0 ? token_ids[j] : eos;
+        if (j >= 0) {
+          ctx[s] = token_ids[j];
+        } else if (pos_base > 0 && g.engine->qwen4exp_ple_next_pos == pos_base) {
+          // Chunked prefill: the tokens before this batch are the previous batch's n-gram window.
+          const auto &history = g.engine->qwen4exp_ple_tok_hist;
+          const int64_t back = s - i;
+          ctx[s] = back <= static_cast<int64_t>(history.size()) ? history[history.size() - (size_t)back] : eos;
+        } else {
+          ctx[s] = eos;
+        }
       }
       if (cut || ctx[s] == eos) {
         ctx[s] = eos;

@@ -346,3 +346,29 @@ Correctness: the hidden state of a graph prefill differs from another batch shap
 run (1604 tokens: chunks 800/736/68 and 1200/404 reproduce the single-graph tokens, 1024/580 does not). Zeroing the carried
 KDA state, the transposition or the earlier latent rows gives relL2 0.5-0.8, so the carry is exercised and right.
 A chunk whose pooled indexer keys or seeds do not line up (pos_base not a multiple of the pool size) is declined.
+
+### Prefill batch size, memory pre-checks, Qwen chunked prefill (2026-10-16)
+
+**Config.** `prefill_batch_tokens` (toml, 0 = family default) is the prefill graph batch (llama.cpp's n_ubatch);
+`MOESTREAM_GLM5NEXT_PREFILL_CHUNK` / `MOESTREAM_QWEN4EXP_PREFILL_CHUNK` override. GLM defaults to 2048 (512 prefills a
+1065-token prompt at 90 tok/s against ~250: every batch restreams all cold experts), Qwen to the whole prompt.
+
+**Memory pre-check.** A batch the device cannot hold is refused before any allocation, with the size that fits, and the
+generation loop retries with it: GLM `1.0 GiB`-class estimate from measured free memory (device 0 ~0.85 MiB/token, ring
+admitted only when ring + workspace fit), Qwen 7.8 MiB/token device + 1.1 MiB/token host + 6 GiB kept for the decode graph.
+A 200000-token request on a 3343-token prompt ran as 1432-token batches (14 s). The prompt must also fit `context_size`
+(`engine.max_t`): a longer prompt is refused with the value to raise (before, the KV caches would be written past).
+
+**Qwen chunked prefill.** Batches after the first continue the previous one: recurrent state and conv history come from the
+engine buffers (transposed to the scan's layout, which the first batch hid because it starts from zeros), the earlier K/V rows
+come from the dense KV cache as a host input concatenated before the batch's own, positions and the causal mask are offset by
+`pos_base`, and the PLE n-gram window continues from the previous batch. A 1611-token prompt in 512/800/1024 batches gives
+the same tokens as one graph, last-row hidden within relL2 0.16-0.27 of it and of each other (the shape-to-shape noise level;
+the unfixed transposition gave ~1.0). A 3989-token prompt (config with `context_size = 8192`) runs as 1448 + 1448 + 1093:
+65.8 s (61 tok/s), decode works. `configs/qwen4exp_3090_only.toml` has `context_size = 2048`.
+
+**Not done.** A non-graph prefill for the case where even the smallest graph batch cannot be built: with the graph-only
+expert placement the layered MoE path finds no staged expert blocks (`no RAM block`, tokens dropped), so it is not enabled;
+the memory-driven batching above covers the VRAM case. GLM's selection beyond top-k is checked only against dense
+prefill (same tokens on a 2192-token prompt), not against the decode graph, whose own beyond-top-k path is dense in the
+stepped case.

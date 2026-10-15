@@ -213,6 +213,9 @@ extern std::mutex g_qwen4exp_cpu_execution_mutex;
 extern thread_local bool g_qwen4exp_build_graph_retry_smaller_expert_layers;
 // Batch size the last memory pre-check worked out would fit (0 = none); read by qwen4exp_full_graph_suggested_batch().
 extern int g_qwen4exp_suggested_batch;
+// What a prefill batch leaves for the next one of the same prompt: the engine and the tokens covered so far.
+extern const StreamingEngine *g_qwen4exp_cont_engine;
+extern int g_qwen4exp_cont_total;
 extern std::unique_ptr<FullGraph> g_graph;
 extern std::atomic<uint64_t> g_full_graph_generation;
 extern std::unique_ptr<FullGraph> g_graph_prefill_arena_owner;
@@ -422,6 +425,15 @@ using moestream::graph::resident;
 
 struct FullGraph : moestream::graph::GraphCore {
   FullGraph() { mem_tag = "GGML-QWEN-FULL-MEM"; }
+
+  // Chunked prefill: the tokens before this batch, and per full-attention layer the host inputs holding the K/V rows of
+  // the earlier batches (filled from the engine's dense KV cache before the run).
+  int pos_base = 0;
+  struct PrevKv {
+    int layer = -1;
+    float *k = nullptr, *v = nullptr;
+  };
+  std::vector<PrevKv> prev_kv_inputs;
 
   uint64_t graph_generation = 0;
   int Hkv = 0;

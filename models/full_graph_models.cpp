@@ -39,17 +39,17 @@ class Qwen4ExpGraphModel final : public FullGraphModelBase<Qwen4ExpGraphModel> {
   bool supports_cpu_lane() const override { return true; }
 
   // Tokens per prefill graph batch: MOESTREAM_QWEN4EXP_PREFILL_CHUNK, else the toml's `prefill_batch_tokens`, else the
-  // whole prompt (0). There is no continuation for this family yet, so a prompt longer than the batch is not supported
-  // (see suggested_prefill_batch); the memory pre-check refuses an oversized batch before any allocation.
+  // whole prompt (0). Batches continue each other (recurrent state, dense KV rows and the PLE window are carried through
+  // the engine), and the memory pre-check lowers a batch that does not fit to the one that does (suggested batch).
   int max_prefill_tokens(const StreamingEngine &e) const override {
     if (const char *v = std::getenv("MOESTREAM_QWEN4EXP_PREFILL_CHUNK"); v && v[0])
       return std::atoi(v);
     return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 0;
   }
-  // No retry with the suggestion: the decode graph cannot continue from a partial graph prefill (measured: 1608 graph
-  // tokens, the remaining 2381 stepped -> "decode construction failed"), so a smaller batch only wastes the prefill.
-  // The refusal log names the batch that fits; a long-prompt path needs chunked prefill for this family.
-  int suggested_prefill_batch(const StreamingEngine &) const override { return 0; }
+  int suggested_prefill_batch(const StreamingEngine &) const override {
+    return qwen4exp_full_graph_suggested_batch();
+  }
+  bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }
 
   bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
     return qwen4exp_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);

@@ -446,8 +446,9 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
 bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *token_ids) {
   // Prefill-only while recurrent and dense KV state writeback is validated.
-  if (!env_enabled() || !hidden_states || S <= 1 || pos_base != 0 || !g_graph ||
-      !g_graph->ready || g_graph->engine != &engine || g_graph->S != S)
+  if (!env_enabled() || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
+      !g_graph->ready || g_graph->engine != &engine || g_graph->S != S ||
+      g_graph->pos_base != pos_base || g_graph->decode_mode)
     return false;
   FullGraph &g = *g_graph;
   const auto reset_host_recurrent_state = [&]() {
@@ -472,13 +473,24 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
   // A fresh position-zero graph starts a new recurrent/KV stream.  This is
   // the same reset boundary used by the established Qwen attention path.
-  if (!g.prefill_device_state_inputs)
-    reset_host_recurrent_state();
-  std::fill(engine.qwen4exp_ple_tok_hist.begin(),
-            engine.qwen4exp_ple_tok_hist.end(),
-            static_cast<int32_t>(
-                engine.model_file.architecture_config.ple_eos_token_id));
-  engine.qwen4exp_ple_next_pos = 0;
+  // A later batch of a chunked prompt continues the recurrent state, the dense KV rows and the PLE window.
+  if (pos_base == 0) {
+    if (!g.prefill_device_state_inputs)
+      reset_host_recurrent_state();
+    std::fill(engine.qwen4exp_ple_tok_hist.begin(),
+              engine.qwen4exp_ple_tok_hist.end(),
+              static_cast<int32_t>(
+                  engine.model_file.architecture_config.ple_eos_token_id));
+    engine.qwen4exp_ple_next_pos = 0;
+  }
+  for (const auto &pk : g.prev_kv_inputs) {
+    if (pk.layer < 0 || pk.layer >= static_cast<int>(engine.Kc.size()) || !engine.Kc[pk.layer] ||
+        !engine.Vc[pk.layer])
+      return fail("dense KV cache of the earlier batches is not allocated");
+    const size_t n = static_cast<size_t>(pos_base) * g.Hkv * g.hd * sizeof(float);
+    std::memcpy(pk.k, engine.Kc[pk.layer], n);
+    std::memcpy(pk.v, engine.Vc[pk.layer], n);
+  }
 
   for (size_t i = 0; i < g.gdn_layers.size(); ++i) {
     const int l = g.gdn_layers[i];
@@ -493,8 +505,9 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
         engine.qwen4exp_conv_history[l].size() != hist_n)
       return fail("GDN state/history size mismatch");
     if (!g.prefill_device_state_inputs) {
-      std::memcpy(g.gdn_state_inputs[i], engine.qwen4exp_recur_state[l].data(),
-                  state_n * sizeof(float));
+      // The host state is in the legacy layout; the scan op takes the native (transposed) one. A first batch starts from
+      // zeros, where the layout does not matter; a later batch of a chunked prompt needs the transposition.
+      gdn_state_transpose_host(g.gdn_state_inputs[i], engine.qwen4exp_recur_state[l].data(), g.gdn_hd, g.Hv_gdn);
       std::memcpy(g.gdn_hist_inputs[i], engine.qwen4exp_conv_history[l].data(),
                   hist_n * sizeof(float));
     }
@@ -628,7 +641,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
     const int start = std::max(0, S - keep);
     for (int i = start; i < S; ++i)
       engine.qwen4exp_ple_tok_hist.push_back(token_ids[i]);
-    engine.qwen4exp_ple_next_pos = S;
+    engine.qwen4exp_ple_next_pos = pos_base + S;
   }
   if (g.partial_layer_ids_out) {
     // Phase 1 all-or-nothing partial-layer dispatch: this prompt's real
@@ -804,6 +817,8 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
       ms(t_sync_end, t_output_end), ms(t_output_end, t_state_end),
       ms(t_compute_start, t_state_end));
   engine.qwen4exp_full_graph_output_ready = true;
+  g_qwen4exp_cont_engine = &engine;
+  g_qwen4exp_cont_total = pos_base + S;
   return true;
 }
 

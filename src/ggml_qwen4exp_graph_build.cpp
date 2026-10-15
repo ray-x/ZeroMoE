@@ -80,9 +80,10 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
         static_cast<size_t>(g.Hkv) * sizeof(int32_t),
         "qwen_full_decode_kv_indices");
   } else {
+    const int64_t kv_len = (int64_t)g.pos_base + g.S;
     g.attn_mask = host_input(
-        g, g.ctx, GGML_TYPE_F16, {g.S, g.S},
-        static_cast<size_t>(g.S) * g.S * sizeof(ggml_fp16_t),
+        g, g.ctx, GGML_TYPE_F16, {kv_len, g.S},
+        static_cast<size_t>(kv_len) * g.S * sizeof(ggml_fp16_t),
         "qwen_full_causal_mask");
   }
   if (!g.input || !g.positions || !g.attn_mask ||
@@ -91,7 +92,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   auto *pos = static_cast<int32_t *>(g.positions->data);
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int i = 0; i < g.S; ++i)
-    pos[i] = i;
+    pos[i] = g.decode_mode ? i : g.pos_base + i;
   if (g.decode_mode) {
     for (int k = 0; k < g.kv_capacity; ++k)
       mask[k] = ggml_fp32_to_fp16(0.0f);
@@ -106,10 +107,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     for (int h = 0; h < g.Hkv; ++h)
       indices[h] = h * g.kv_capacity;
   } else {
+    const int kv_len = g.pos_base + g.S;
     for (int q = 0; q < g.S; ++q)
-      for (int k = 0; k < g.S; ++k)
-        mask[static_cast<size_t>(q) * g.S + k] =
-            ggml_fp32_to_fp16(k <= q ? 0.0f : -INFINITY);
+      for (int k = 0; k < kv_len; ++k)
+        mask[static_cast<size_t>(q) * kv_len + k] =
+            ggml_fp32_to_fp16(k <= g.pos_base + q ? 0.0f : -INFINITY);
   }
 
   ggml_tensor *res = g.input;
@@ -860,7 +862,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       if (host_avail > 0 && host_avail < host_need)
         fit = 0;
       if (fit < g.S) {
-        fit = (fit / 8) * 8;
+        fit = (int)(fit * 0.9) / 8 * 8; // headroom: later batches see slightly less free memory than this one
         g_qwen4exp_suggested_batch = fit >= 64 ? fit : 0;
         LOG_ERROR("[GGML-QWEN-FULL] refusing graph allocator reserve before any allocation: a batch of %d tokens "
                   "needs ~%.2f GiB of device workspace and %.1f GiB of host memory; %.2f GiB VRAM free, %.1f GiB "
