@@ -18,6 +18,15 @@
 namespace {
 using namespace glm5next_graph;
 constexpr int kDecodeNodes = 32768;
+enum DecodeTimer : size_t {
+  kAttentionHost,
+  kNativeQkv,
+  kCacheMoe,
+  kHcAndEngram,
+  kRouterPilot,
+  kLogitsHead,
+  kDecodeTimerCount,
+};
 
 struct DecodeGraph;
 struct DecodeSite { DecodeGraph *owner; int layer; };
@@ -38,11 +47,12 @@ struct DecodeGraph : FullGraph {
   uint64_t runs = 0;
   double warm_compute_ms = 0;
   double first_compute_ms = 0;
-  std::array<double, 3> node_ms_total{};
-  std::array<double, 3> warm_node_ms_total{};
-  std::array<double, 3> first_node_ms{};
+  std::array<double, kDecodeTimerCount> node_ms_total{};
+  std::array<double, kDecodeTimerCount> warm_node_ms_total{};
+  std::array<double, kDecodeTimerCount> first_node_ms{};
   std::vector<std::array<double, 3>> layer_attention_ms;
   std::vector<std::array<double, 3>> layer_moe_ms;
+  PerfCounters::Snapshot perf_at_first_run{};
 };
 std::unique_ptr<DecodeGraph> decode;
 StreamingEngine *runtime_engine = nullptr;
@@ -103,6 +113,7 @@ ggml_tensor *weight(DecodeGraph &g, const std::string &name) {
 void engram_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
                   void *ud) {
   if (ith != 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   auto &s = *static_cast<DecodeSite *>(ud);
   auto &g = *s.owner;
   auto &e = *g.engine;
@@ -111,10 +122,14 @@ void engram_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
   std::memcpy(dst->data, e.hc_stream_buf.data(), ggml_nbytes(dst));
   dsv41_trace::save("post-input-hook", s.layer, g.pos,
                     static_cast<const float *>(dst->data), g.D);
+  g.node_ms_total[kHcAndEngram] +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
 }
 
 void hc_pre_node(ggml_tensor *dst, int ith, int, void *ud) {
   if (ith != 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   auto &s = *static_cast<DecodeHcSite *>(ud);
   auto &g = *s.owner;
   auto &e = *g.engine;
@@ -129,6 +144,9 @@ void hc_pre_node(ggml_tensor *dst, int ith, int, void *ud) {
   const char *label = s.sub_block == 0 ? "hc-attn-pre" : "hc-ffn-pre";
   dsv41_trace::save(label, s.layer, g.pos,
                     static_cast<const float *>(dst->data), g.D);
+  g.node_ms_total[kHcAndEngram] +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
 }
 
 // Preserve the legacy depth-1 router lookahead inside the full graph. The
@@ -197,6 +215,7 @@ void prefetch_next_layer(DecodeGraph &g, int layer, const float *hidden) {
 
 void hc_post_node(ggml_tensor *dst, int ith, int, void *ud) {
   if (ith != 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   auto &s = *static_cast<DecodeHcSite *>(ud);
   auto &g = *s.owner;
   auto &e = *g.engine;
@@ -224,12 +243,20 @@ void hc_post_node(ggml_tensor *dst, int ith, int, void *ud) {
                     g.hc_hidden_scratch.data(), (size_t)g.D);
   dsv41_trace::save(stream_label, s.layer, g.pos, e.hc_stream_buf.data(),
                     stream_elements);
+  const auto pilot_start = std::chrono::steady_clock::now();
   if (s.sub_block == 1)
     prefetch_next_layer(g, s.layer, g.hc_hidden_scratch.data());
+  const auto finished = std::chrono::steady_clock::now();
+  g.node_ms_total[kHcAndEngram] +=
+      std::chrono::duration<double, std::milli>(pilot_start - t0).count();
+  if (s.sub_block == 1)
+    g.node_ms_total[kRouterPilot] +=
+        std::chrono::duration<double, std::milli>(finished - pilot_start).count();
 }
 
 void final_collapse_node(ggml_tensor *dst, int ith, int, void *ud) {
   if (ith != 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   auto &g = *static_cast<DecodeGraph *>(ud);
   auto &e = *g.engine;
   if (!dst->src[0] || !dst->src[0]->data ||
@@ -245,6 +272,9 @@ void final_collapse_node(ggml_tensor *dst, int ith, int, void *ud) {
     const float w = mix[h];
     for (int d = 0; d < g.D; ++d) out[d] += w * stream[d];
   }
+  g.node_ms_total[kHcAndEngram] +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
 }
 
 // Match the engine's output head: GGML's quantized MUL_MAT rounds the
@@ -252,6 +282,7 @@ void final_collapse_node(ggml_tensor *dst, int ith, int, void *ud) {
 // node in the scheduler graph and borrow the same persistent dense weights.
 void logits_node(ggml_tensor *dst, int ith, int, void *ud) {
   if (ith != 0) return;
+  const auto t0 = std::chrono::steady_clock::now();
   auto &g = *static_cast<DecodeGraph *>(ud);
   auto &e = *g.engine;
   const auto &c = e.model_file.architecture_config;
@@ -260,6 +291,9 @@ void logits_node(ggml_tensor *dst, int ith, int, void *ud) {
                1, g.D, c.eps);
   dense_proj(e, "output.weight", g.logits_normed.data(),
              static_cast<float *>(dst->data), 1, g.D, c.vocab);
+  g.node_ms_total[kLogitsHead] +=
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
 }
 
 void swa_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
@@ -275,7 +309,7 @@ void swa_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
       static_cast<float *>(dst->data));
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  g.node_ms_total[0] += ms;
+  g.node_ms_total[kAttentionHost] += ms;
   g.layer_attention_ms[(size_t)s.layer][0] += ms;
 }
 
@@ -296,7 +330,7 @@ void compressed_node(ggml_tensor *dst, int ith, int, void *ud) {
       static_cast<const float *>(kv->data), static_cast<float *>(dst->data));
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  g.node_ms_total[0] += ms;
+  g.node_ms_total[kAttentionHost] += ms;
   g.layer_attention_ms[(size_t)s.layer][0] += ms;
 }
 
@@ -318,7 +352,7 @@ void compressed_context_node(ggml_tensor *dst, int ith, int, void *ud) {
       static_cast<const float *>(kv->data), static_cast<float *>(dst->data));
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  g.node_ms_total[0] += ms;
+  g.node_ms_total[kAttentionHost] += ms;
   g.layer_attention_ms[(size_t)s.layer][0] += ms;
 }
 
@@ -391,7 +425,7 @@ void grouped_outproj_node(ggml_tensor *dst, int ith, int, void *ud) {
                     static_cast<const float *>(dst->data), g.D);
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  g.node_ms_total[0] += ms;
+  g.node_ms_total[kAttentionHost] += ms;
   g.layer_attention_ms[(size_t)s.layer][0] += ms;
 }
 
@@ -442,7 +476,7 @@ void qkv_source_node(ggml_tensor *dst, int ith, int, void *ud) {
   dsv41_trace::save("raw-kv", s.layer, g.pos, raw_kv, qh);
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  g.node_ms_total[1] += ms;
+  g.node_ms_total[kNativeQkv] += ms;
 }
 
 void moe_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
@@ -475,7 +509,7 @@ void moe_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
   }
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - t0).count();
-  g.node_ms_total[2] += ms;
+  g.node_ms_total[kCacheMoe] += ms;
   g.layer_moe_ms[(size_t)s.layer][0] += ms;
 }
 
@@ -797,6 +831,7 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
       e.hc_pending_pre_mix.size() != static_cast<size_t>(g.HC)) return false;
   g.pos = pos; g.token = *ids;
   g.ram = runtime_ram; g.prefetch = runtime_prefetch; g.scratch = runtime_scratch;
+  if (g.runs == 0) g.perf_at_first_run = perf().snapshot();
   const auto node_ms_before = g.node_ms_total;
   std::memcpy(g.input->data, e.hc_stream_buf.data(), g.D * g.HC * sizeof(float));
   const auto start = std::chrono::steady_clock::now();
@@ -826,7 +861,7 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
   e.deepseek_v4_full_graph_output_ready = true;
   const double ms = std::chrono::duration<double, std::milli>(
       std::chrono::steady_clock::now() - start).count();
-  std::array<double, 3> node_ms{};
+  std::array<double, kDecodeTimerCount> node_ms{};
   for (size_t i = 0; i < node_ms.size(); ++i) {
     node_ms[i] = g.node_ms_total[i] - node_ms_before[i];
     if (g.runs == 0) g.first_node_ms[i] = node_ms[i];
@@ -840,9 +875,10 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
              static_cast<unsigned long long>(g.runs), pos, ms);
   if (g.runs <= 2)
     LOG_INFO("[GGML-DSV41-DECODE-NODES] run=%llu attention_host=%.3f ms "
-             "native_qkv=%.3f ms cache_moe=%.3f ms\n",
+             "native_qkv=%.3f ms cache_moe=%.3f ms hc_engram=%.3f ms "
+             "router_pilot=%.3f ms logits_head=%.3f ms\n",
              static_cast<unsigned long long>(g.runs), node_ms[0], node_ms[1],
-             node_ms[2]);
+             node_ms[2], node_ms[3], node_ms[4], node_ms[5]);
   return true;
 }
 
@@ -855,7 +891,29 @@ void deepseek_v41_full_graph_decode_shutdown() {
              decode->runs > 1 ? decode->warm_compute_ms / (decode->runs - 1) : 0.0,
              static_cast<unsigned long long>(decode->runs - 1));
   if (decode && decode->runs > 0) {
-    const char *names[] = {"attention_host", "native_qkv", "cache_moe"};
+    // Snapshot deltas exclude startup and prefill. Several subphase timers
+    // overlap their enclosing dispatch timers, so report each separately.
+    const auto delta = perf().snapshot() - decode->perf_at_first_run;
+    const double ms_per_token = 1000.0 / decode->runs;
+    LOG_INFO("[GGML-DSV41-DECODE-MOE] ram_get=%.3f ms/token "
+             "ram_batch=%.3f ms/token upload_async=%.3f ms/token "
+             "active_upload=%.3f ms/token phase3=%.3f ms/token "
+             "resolve_location=%.3f ms/token ram_needed=%.3f ms/token "
+             "disk_read=%.3f ms/token disk_bytes=%.3f GB "
+             "gpu_upload_bytes=%.3f GB cache_misses=%llu\n",
+             delta.t_ram_get_expert * ms_per_token,
+             delta.t_ram_get_experts_batch * ms_per_token,
+             delta.t_upload_expert_async * ms_per_token,
+             delta.t_active_layer_upload * ms_per_token,
+             delta.t_moe_phase3_dispatch * ms_per_token,
+             delta.t_resolve_gpu_loc_total * ms_per_token,
+             delta.t_ram_needed_dispatch_total * ms_per_token,
+             delta.t_disk_read * ms_per_token,
+             delta.bytes_disk_read / 1.0e9,
+             delta.bytes_gpu_uploaded / 1.0e9,
+             static_cast<unsigned long long>(delta.n_expert_cache_miss));
+    const char *names[] = {"attention_host", "native_qkv", "cache_moe",
+                           "hc_engram", "router_pilot", "logits_head"};
     for (size_t i = 0; i < decode->warm_node_ms_total.size(); ++i)
       LOG_INFO("[GGML-DSV41-DECODE-NODES] %s first=%.3f ms warm_mean=%.3f "
                "ms per token\n", names[i], decode->first_node_ms[i],

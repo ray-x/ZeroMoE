@@ -273,3 +273,51 @@ MemAvailable of **57.35 GiB**, above the 26 GiB emergency floor; it reported
 effective config retained `ram_pinned_budget_gb=15`,
 `pin_ram_fraction=0.50`, and `move_on_promotion=true`. This validates the
 guarded short run only; it does not validate long-prompt stability or speed.
+
+## Post-merge decode profile (2026-10-16)
+
+The latest merged source was built with the GLM GGML libraries and profiled
+with native prefill, persistent full-graph decode, both GPUs, a **90 GB host
+cap**, the profile's **15 GiB page-pin limit**, and a **26 GiB emergency
+floor**. A 19-token prompt followed by 64 generated tokens completed with no
+emergency stop; the lowest sampled MemAvailable was **63.7 GiB**. Decode wall
+time was **12.342 s / 5.19 tok/s**. This single-prompt, 90 GB result is not
+directly comparable with the earlier three-prompt, fully pinned 100 GiB DDR
+result of 7.31 tok/s.
+
+New decode-only timers in `ggml_deepseek_v41_graph_decode.cpp` attribute the
+62 warm graph runs (192.4 ms each) as follows:
+
+| Stage | Mean per token |
+| --- | ---: |
+| Cache-aware MoE callback | 140.4 ms |
+| Attention host callbacks | 26.7 ms |
+| Native Q/K/V projection | 11.3 ms |
+| HC and Engram callbacks | 9.4 ms |
+| Router lookahead | 3.4 ms |
+| Logits head | 1.0 ms |
+
+The MoE callback alone exceeds the 100 ms/token budget for 10 tok/s. The run
+reported 373 real decode-time SSD fetches, and the end-of-request caches held
+2,555 VRAM and 3,611 DDR expert slots. The next decode change should target
+MoE miss resolution and transfer overlap; removing router lookahead alone
+cannot close the gap. The guarded log is under
+`/tmp/v41-decode-profile-20261016/` while temporary files remain available.
+
+A repeat guarded run measured **5.38 tok/s**, with 134.5 ms/token in MoE.
+Decode-only counter deltas show **57.1 ms/token** in batched RAM expert
+resolution, **45.9 ms/token** in active-layer uploads, and **39.5 ms/token**
+of disk reads. These counters overlap the enclosing MoE callback and each
+other; they must not be added together. The decode phase read **4.765 GB**
+and uploaded **5.419 GB** of expert data. The active-layer copy report shows
+1,663 synchronous uploads from pageable slabs over the complete request,
+versus 506 from pinned slabs. The graph's depth-1 pilot issued disk hints but
+made **zero** speculative RAM-to-VRAM promotions. The repeat log is under
+`/tmp/v41-decode-moe-breakdown-20261016/`.
+
+Controlled 90 GB A/B runs with the existing decode async prewarm switch were
+slower than the unchanged configuration: blocking prewarm **5.21 tok/s** and
+nonblocking prewarm **5.12 tok/s**, compared with **5.38 tok/s** in the
+immediately preceding baseline. All three completed without an emergency
+stop. The shipped `decode_async_prewarm=false` setting remains appropriate
+for this workload.
