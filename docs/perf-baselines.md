@@ -44,6 +44,22 @@ host-resident experts on the GPU (`MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD`, defau
 | prefill, 1611 tokens, CPU experts (`OP_OFFLOAD=0`) | 61-63 tok/s | 2026-10-16 | previous behaviour |
 | prefill, 2824 tokens (recorded) | 138 tok/s | 2026-09 | older "ggml MUL_MAT_ID prefill" path |
 
+### Qwen decode baselines by placement (measured 2026-10-16, `build_native`, 3090 only, 10 CPU threads)
+
+Env for all rows: `CUDA_VISIBLE_DEVICES=0 MOESTREAM_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_TRAILING=1`
+(`GRAPH_PRELOAD_LAYERS=40` for the split, `0` for the hybrid), `MOESTREAM_BENCH_SILENT=1 MOESTREAM_BENCH_IGNORE_STOP=1`.
+
+| placement | config | metric | baseline | notes |
+|---|---|---|---|---|
+| split: 22 layers fully on GPU, 26 fully on CPU (UD-IQ1_M) | `configs/qwen4exp_tg400_iq1m_22_26.toml` with `omp_max_threads = 10` | `[REQUEST-DECODE-WALL]`, 16-token prompt "Tell a story.", 400 tokens | **24.6 / 26.0 tok/s** | reference 26.2-26.9 (2026-10-02, quiet box, 12 threads); a Serena `clangd --background-index` was using ~1.5 cores |
+| hybrid: usage-ranked hot experts in VRAM, K = 14,554 of 24,576 (Q2_0) | `configs/qwen4exp_q2_0_option_b_global_topk48.toml`, `omp_max_threads = 10`, K via `bench/option_b_vram_probe.sh 14554` | mean `iter_total`, steps >= 3, 200 tokens | **41.3 tok/s** | arena 18.74 GiB, steady free VRAM 1.62 GiB, coherent text, no fallback; reference 39-42 (2026-10-05) |
+| partial residency + RAM tier (UD-IQ1_M) | `configs/qwen4exp_3090_only.toml` | decode | 19.5 tok/s | the config the 19.5 row above was measured on; not the fast path |
+
+Thread count matters as much as any code change here. The CPU part of the graph is OpenMP-barrier-bound, so one thread that
+shares a core with another process stalls all of them: the same split config measured **3.05 tok/s with 12 threads** while a
+background `clangd --background-index` and a niced ggml compile were running, and 24.6-26.0 tok/s with 10 threads. Run with
+`omp_max_threads` at (cores - 2) unless the box is known quiet, and check `/proc/loadavg` before a decode measurement.
+
 BeeLlama (`~/Projects/beellama.cpp/build-qwen38-rtx3090/bin/llama-bench`), same model file, same card,
 `CUDA_VISIBLE_DEVICES=0 -ngl 99 -fa 1 -t 10 -r 2`:
 
