@@ -51,8 +51,8 @@ Env for all rows: `CUDA_VISIBLE_DEVICES=0 MOESTREAM_QWEN4EXP_FULL_GRAPH=1 ..._FU
 
 | placement | config | metric | baseline | notes |
 |---|---|---|---|---|
-| split: 22 layers fully on GPU, 26 fully on CPU (UD-IQ1_M) | `configs/qwen4exp_tg400_iq1m_22_26.toml` with `omp_max_threads = 10` | `[REQUEST-DECODE-WALL]`, 16-token prompt "Tell a story.", 400 tokens | **24.6 / 26.0 tok/s** | reference 26.2-26.9 (2026-10-02, quiet box, 12 threads); a Serena `clangd --background-index` was using ~1.5 cores |
-| hybrid: usage-ranked hot experts in VRAM, K = 14,554 of 24,576 (Q2_0) | `configs/qwen4exp_q2_0_option_b_global_topk48.toml`, `omp_max_threads = 10`, K via `bench/option_b_vram_probe.sh 14554` | mean `iter_total`, steps >= 3, 200 tokens | **41.3 tok/s** | arena 18.74 GiB, steady free VRAM 1.62 GiB, coherent text, no fallback; reference 39-42 (2026-10-05) |
+| split: 22 layers fully on GPU, 26 fully on CPU (UD-IQ1_M) | `configs/qwen4exp_tg400_iq1m_22_26.toml` with `omp_max_threads = 10` | `[REQUEST-DECODE-WALL]`, 16-token prompt "Tell a story.", 400 tokens | **28.66 tok/s** (24.6 / 26.0 with an indexer using ~1.5 cores) | reference 26.2-26.9 (2026-10-02); how it was achieved: `docs/qwen-decode-baselines-2026-10-16.md`, run with `bench/qwen_decode_baselines.sh split 10 400` |
+| hybrid: usage-ranked hot experts in VRAM, K = 14,554 of 24,576 (Q2_0) | `configs/qwen4exp_q2_0_option_b_global_topk48.toml`, `omp_max_threads = 10`, K via `bench/option_b_vram_probe.sh 14554` | mean `iter_total`, steps >= 3, 200 tokens | **43.12 tok/s** (41.3 in the first run) | run with `bench/qwen_decode_baselines.sh hybrid 14554 200 10`; arena 18.74 GiB, steady free VRAM 1.62 GiB, coherent text, no fallback; reference 39-42 (2026-10-05) |
 | partial residency + RAM tier (UD-IQ1_M) | `configs/qwen4exp_3090_only.toml` | decode | 19.5 tok/s | the config the 19.5 row above was measured on; not the fast path |
 
 Thread count matters as much as any code change here. The CPU part of the graph is OpenMP-barrier-bound, so one thread that
