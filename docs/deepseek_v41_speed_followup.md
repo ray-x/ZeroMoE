@@ -321,3 +321,12 @@ nonblocking prewarm **5.12 tok/s**, compared with **5.38 tok/s** in the
 immediately preceding baseline. All three completed without an emergency
 stop. The shipped `decode_async_prewarm=false` setting remains appropriate
 for this workload.
+
+The opt-in two-GPU cache-backed decode path compiles, but its runtime graph
+build declines because this model currently uses `expert_compact_layout=1`
+with `expert_slab_size=0`. The graph's shared
+pool tensor views require a uniform expert slab, so the builder declines at
+layer 0 and falls back to native cache dispatch. A failed build is now
+remembered for the process to avoid retrying it on every token. The cache
+graph path remains default-off until its expert views can bind the compact
+per-slot layout without taking ownership of, or copying, expert storage.

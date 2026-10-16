@@ -837,16 +837,28 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
                                  const int *token_ids) {
   const auto &c = g.engine->model_file.architecture_config;
   auto &topo = g.engine->gpu->topology;
-  if (topo.expert_compact_layout || !topo.expert_slab_size || c.topk <= 0) return nullptr;
+  if (topo.expert_compact_layout || !topo.expert_slab_size || c.topk <= 0) {
+    LOG_ERROR("[DSV41-CACHE-MOE] layer=%d unsupported pool layout compact=%d stride=%zu topk=%d\n",
+              layer, topo.expert_compact_layout ? 1 : 0,
+              topo.expert_slab_size, c.topk);
+    return nullptr;
+  }
   size_t gb = 0, ub = 0, db = 0;
   const GGUFTensor *gm = nullptr, *um = nullptr, *dm = nullptr;
-  if (!g.engine->expert_geometry_for(layer, 0, gb, ub, db, gm, um, dm)) return nullptr;
+  if (!g.engine->expert_geometry_for(layer, 0, gb, ub, db, gm, um, dm)) {
+    LOG_ERROR("[DSV41-CACHE-MOE] layer=%d expert geometry unavailable\n", layer);
+    return nullptr;
+  }
   for (int expert = 1; expert < c.n_experts; ++expert) {
     size_t gx, ux, dx;
     const GGUFTensor *gt, *ut, *dt;
     if (!g.engine->expert_geometry_for(layer, expert, gx, ux, dx, gt, ut, dt) ||
         gx != gb || ux != ub || dx != db || gt->type != gm->type ||
-        ut->type != um->type || dt->type != dm->type) return nullptr;
+        ut->type != um->type || dt->type != dm->type) {
+      LOG_ERROR("[DSV41-CACHE-MOE] layer=%d expert %d has mixed geometry\n",
+                layer, expert);
+      return nullptr;
+    }
   }
   for (int other = 0; other < c.n_layers; ++other) {
     size_t gx, ux, dx;
@@ -864,7 +876,11 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
     auto &dev = topo.devices[(size_t)vi];
     if (!dev.expert_cache_pool || dev.expert_cache_size < topo.expert_slab_size) continue;
     ggml_backend_t backend = dev.id == g.device ? g.cuda : g.gpu1;
-    if (!backend) return nullptr;
+    if (!backend) {
+      LOG_ERROR("[DSV41-CACHE-MOE] layer=%d missing backend for GPU %d\n",
+                layer, dev.id);
+      return nullptr;
+    }
     auto marker = ggml_backend_alloc_buffer(backend, 256);
     if (!marker) return nullptr;
     g.gpu1_buffers.push_back(marker); // marker only; the topology owns the pool
@@ -872,7 +888,11 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
     site->pools.push_back({dev.id, backend, marker, dev.expert_cache_pool,
                           topo.expert_slab_size, int(dev.expert_cache_size / topo.expert_slab_size)});
   }
-  if (site->pools.empty()) return nullptr;
+  if (site->pools.empty()) {
+    LOG_ERROR("[DSV41-CACHE-MOE] layer=%d has no bindable GPU expert pool (vault GPUs=%zu)\n",
+              layer, topo.vault_gpus.size());
+    return nullptr;
+  }
   auto *ptr = site.get();
   g_v41_cache_sites.push_back(std::move(site));
   const int width = g.D + int(ptr->pools.size()) * 2 * c.topk;
@@ -880,7 +900,11 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
                                  &cur, 1, [](ggml_tensor *dst, int ith, int nth, void *ud) {
     v41_cache_routes_node(dst, dst->src[0], ith, nth, ud);
   }, 1, ptr);
-  if (!payload) return nullptr;
+  if (!payload) {
+    LOG_ERROR("[DSV41-CACHE-MOE] layer=%d route payload node allocation failed\n",
+              layer);
+    return nullptr;
+  }
   ggml_backend_sched_set_tensor_backend(g.sched, payload, g.cpu);
   auto *x = ggml_cont(g.ctx, ggml_view_2d(g.ctx, payload, g.D, g.S, payload->nb[1], 0));
   auto *x3 = ggml_reshape_3d(g.ctx, x, g.D, 1, g.S);
@@ -899,7 +923,11 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
     ew.gate = tensor(gm, 0, g.D, c.moe_inter);
     ew.up = tensor(um, gb, g.D, c.moe_inter);
     ew.down = tensor(dm, gb + ub, c.moe_inter, g.D);
-    if (!ew.valid()) return nullptr;
+    if (!ew.valid()) {
+      LOG_ERROR("[DSV41-CACHE-MOE] layer=%d expert weight view invalid on GPU %d\n",
+                layer, pool.device);
+      return nullptr;
+    }
     const size_t offset = (size_t)(g.D + b * 2 * c.topk) * sizeof(float);
     auto *ids = ggml_cont(g.ctx, ggml_view_2d(g.ctx, payload, c.topk, g.S, payload->nb[1], offset));
     ids = ggml_cast(g.ctx, ids, GGML_TYPE_I32);
@@ -908,7 +936,11 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
     weights = ggml_reshape_3d(g.ctx, weights, 1, c.topk, g.S);
     const float clamp = layer < (int)c.swiglu_clamp_exp.size() ? c.swiglu_clamp_exp[layer] : 0.0f;
     auto ffn = moe_routed::expert_ffn(g.ctx, ew, x3, ids, clamp, false);
-    if (!ffn.down) return nullptr;
+    if (!ffn.down) {
+      LOG_ERROR("[DSV41-CACHE-MOE] layer=%d GPU %d expert FFN node construction failed\n",
+                layer, pool.device);
+      return nullptr;
+    }
     if (v41_native_f32())
       for (auto *node : {ffn.gate, ffn.up, ffn.down})
         ggml_prec_set_src(node, GGML_PREC_F32, 1);
@@ -1162,6 +1194,24 @@ bool build_v41_graph(FullGraph &g, const int *token_ids) {
 }
 
 } // namespace
+
+void v41_cache_moe_sites_reset() {
+  for (auto &site : g_v41_cache_sites)
+    if (site)
+      site->release();
+  g_v41_cache_sites.clear();
+}
+
+void v41_cache_moe_sites_release_holds() {
+  for (auto &site : g_v41_cache_sites)
+    if (site)
+      site->release();
+}
+
+ggml_tensor *v41_build_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
+                                 const int *token_ids) {
+  return build_v41_cache_moe(g, cur, layer, token_ids);
+}
 
 } // namespace glm5next_graph
 

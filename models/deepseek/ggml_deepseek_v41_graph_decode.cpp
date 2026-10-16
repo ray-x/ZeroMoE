@@ -37,6 +37,7 @@ struct DecodeGraph : FullGraph {
   LayerScratch *scratch = nullptr;
   int pos = 0;
   int token = 0;
+  bool cache_moe_graph = false;
   std::vector<DecodeSite> sites;
   std::vector<DecodeHcSite> hc_sites;
   std::vector<float> hc_hidden_scratch;
@@ -55,6 +56,7 @@ struct DecodeGraph : FullGraph {
   PerfCounters::Snapshot perf_at_first_run{};
 };
 std::unique_ptr<DecodeGraph> decode;
+StreamingEngine *cache_moe_graph_failed_engine = nullptr;
 StreamingEngine *runtime_engine = nullptr;
 RAMSafetyManager *runtime_ram = nullptr;
 LockFreePrefetcher *runtime_prefetch = nullptr;
@@ -613,9 +615,15 @@ bool build(DecodeGraph &g) {
   if (!g.ctx) return false;
   g.graph = ggml_new_graph_custom(g.ctx, kDecodeNodes, false);
   if (!init_dense_arena(g)) return false;
-  ggml_backend_t backends[] = {g.cuda, g.cpu};
-  g.sched = ggml_backend_sched_new(backends, nullptr, 2, kDecodeNodes,
-                                   false, true);
+  ggml_backend_t backends[] = {g.cuda, g.cpu, nullptr};
+  int backend_count = 2;
+  if (g.cache_moe_graph && g.gpu1) {
+    backends[1] = g.gpu1;
+    backends[2] = g.cpu;
+    backend_count = 3;
+  }
+  g.sched = ggml_backend_sched_new(backends, nullptr, backend_count,
+                                   kDecodeNodes, false, true);
   if (!g.sched) return false;
   g.input = host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.HC, 1},
                         g.D * g.HC * sizeof(float), "dsv41_decode_streams");
@@ -664,8 +672,17 @@ bool build(DecodeGraph &g) {
     if (!cur) return false;
     ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
     mark_trace(g, "hc-ffn-pre", l, cur);
-    auto *ffn = ggml_map_custom1(g.ctx, cur, moe_node, 1, &g.sites[l]);
-    ggml_backend_sched_set_tensor_backend(g.sched, ffn, g.cpu);
+    ggml_tensor *ffn = nullptr;
+    if (g.cache_moe_graph) {
+      ffn = v41_build_cache_moe(g, cur, l, &g.token);
+      if (!ffn) {
+        LOG_ERROR("[GGML-DSV41-DECODE] cache-backed MoE graph build failed at layer %d\n", l);
+        return false;
+      }
+    } else {
+      ffn = ggml_map_custom1(g.ctx, cur, moe_node, 1, &g.sites[l]);
+      ggml_backend_sched_set_tensor_backend(g.sched, ffn, g.cpu);
+    }
     mark_trace(g, "moe-out", l, ffn);
     ggml_tensor *post_ffn_args[] = {ffn, res};
     res = ggml_custom_4d(
@@ -789,6 +806,10 @@ bool deepseek_v41_full_graph_decode_prepare(StreamingEngine &e, int pos,
   if (!deepseek_v41_full_graph_decode_enabled() || !token_ids ||
       e.mtp_enabled || e.family_ops.family != ModelFamily::DeepSeek_V41 ||
       pos < 0 || pos >= e.max_t) return false;
+  const bool cache_moe_requested = moestream::graphcfg::flag_on(
+      "MOESTREAM_DEEPSEEK_V41_CACHE_MOE_DECODE");
+  if (cache_moe_requested && cache_moe_graph_failed_engine == &e)
+    return false;
   // The caches stay engine-owned, so a new prompt/position does not rebuild
   // either tensor bindings or scheduler workspace. Only input values change.
   if (decode && decode->ready && decode->engine == &e) return true;
@@ -809,10 +830,34 @@ bool deepseek_v41_full_graph_decode_prepare(StreamingEngine &e, int pos,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (!g->cuda || !g->cpu) return false;
+  g->cache_moe_graph = cache_moe_requested;
+  if (g->cache_moe_graph) {
+    v41_cache_moe_sites_reset();
+    if (e.gpu) {
+      for (int vi : e.gpu->topology.vault_gpus) {
+        const auto &device = e.gpu->topology.devices[(size_t)vi];
+        if (device.id != g->device && device.expert_cache_pool &&
+            device.expert_cache_size >= e.gpu->topology.expert_slab_size) {
+          g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(device.id));
+          break;
+        }
+      }
+    }
+    if (!g->gpu1 && e.gpu && e.gpu->topology.vault_gpus.size() > 1) {
+      LOG_ERROR("[GGML-DSV41-DECODE] second-GPU backend unavailable for cache MoE graph\n");
+      return false;
+    }
+  }
   // One host task calls the existing OpenMP expert/attention code; avoid
   // nesting that work inside a second GGML worker team.
   ggml_backend_cpu_set_n_threads(g->cpu, 1);
-  if (!build(*g)) return false;
+  if (!build(*g)) {
+    if (g->cache_moe_graph) {
+      v41_cache_moe_sites_reset();
+      cache_moe_graph_failed_engine = &e;
+    }
+    return false;
+  }
   decode = std::move(g);
   return true;
 }
@@ -836,6 +881,8 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
   std::memcpy(g.input->data, e.hc_stream_buf.data(), g.D * g.HC * sizeof(float));
   const auto start = std::chrono::steady_clock::now();
   const auto status = ggml_backend_sched_graph_compute(g.sched, g.graph);
+  if (g.cache_moe_graph)
+    v41_cache_moe_sites_release_holds();
   if (status != GGML_STATUS_SUCCESS) {
     // Host cache nodes may already have published this token. Replaying a
     // legacy forward would apply state transitions twice: fail the request.
@@ -883,6 +930,8 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
 }
 
 void deepseek_v41_full_graph_decode_shutdown() {
+  v41_cache_moe_sites_reset();
+  v41_cache_moe_sites_reset();
   if (decode && decode->runs > 0)
     LOG_INFO("[GGML-DSV41-DECODE] summary runs=%llu first=%.3f ms "
              "warm_mean=%.3f ms (%llu runs); graph-owned MoE bytes=0\n",
