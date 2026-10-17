@@ -3818,6 +3818,34 @@ double diag_get_dsv41_outproj_ms() { return g_diag_dsv41_outproj_ms; }
 double diag_get_dsv41_woa_dequant_ms() { return g_diag_dsv41_woa_dequant_ms; }
 double diag_get_dsv41_woa_dequant_calls() { return g_diag_dsv41_woa_dequant_calls; }
 
+// out[0..qh) += sum_i w[i] * keys[i][0..qh). Accumulators stay in registers
+// across all keys (the scalar `out[d] += w*key[d]` loop re-reads and re-writes
+// `out` per key and measured ~10x slower than the dot-product pass over the
+// same keys). Sum order per dimension is unchanged (keys in order).
+static void dsv41_weighted_sum_avx512(float *out, const float *w,
+                                      const float *const *keys, size_t n,
+                                      int qh) {
+  int d = 0;
+  for (; d + 64 <= qh; d += 64) {
+    __m512 a0 = _mm512_loadu_ps(out + d), a1 = _mm512_loadu_ps(out + d + 16),
+           a2 = _mm512_loadu_ps(out + d + 32), a3 = _mm512_loadu_ps(out + d + 48);
+    for (size_t i = 0; i < n; ++i) {
+      const __m512 wv = _mm512_set1_ps(w[i]);
+      const float *k = keys[i] + d;
+      a0 = _mm512_fmadd_ps(wv, _mm512_loadu_ps(k), a0);
+      a1 = _mm512_fmadd_ps(wv, _mm512_loadu_ps(k + 16), a1);
+      a2 = _mm512_fmadd_ps(wv, _mm512_loadu_ps(k + 32), a2);
+      a3 = _mm512_fmadd_ps(wv, _mm512_loadu_ps(k + 48), a3);
+    }
+    _mm512_storeu_ps(out + d, a0);
+    _mm512_storeu_ps(out + d + 16, a1);
+    _mm512_storeu_ps(out + d + 32, a2);
+    _mm512_storeu_ps(out + d + 48, a3);
+  }
+  for (; d < qh; ++d)
+    for (size_t i = 0; i < n; ++i) out[d] += w[i] * keys[i][d];
+}
+
 // DeepSeek-V4.1 attention. Ratio-zero layers are delegated to the already
 // verified V4 raw-SWA implementation. Compressed layers use V4.1's own
 // ratio-1/2 pooling and shared source-layer caches; its indexer is the direct
@@ -4104,6 +4132,10 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
       std::vector<float> scores((size_t)visible, 0.0f);
       const float scale = 1.0f / std::sqrt((float)(c.dsv4_indexer_key_length *
                                                    c.dsv4_indexer_head_count));
+      // Blocks are independent and each keeps its own serial accumulation
+      // order, so the result is bit-identical to the serial loop (matters
+      // for near-tie top-k). Only worth a team for long prompts.
+      #pragma omp parallel for schedule(static) num_threads(attn_score_threads()) if (visible >= 64)
       for (int block = 0; block < visible; ++block) {
         const float *key = state.indexer_keys.data() +
                            (size_t)block * c.dsv4_indexer_key_length;
@@ -4188,10 +4220,17 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
     // ("Parallelize across heads/experts in single outer #pragma omp
     // parallel for loops"). Verified byte-identical single-token output
     // before/after at temperature=0 across the standard 4-prompt test.
-    #pragma omp parallel for
+    // Dedicated team (see attn_score_threads) with one scores buffer per
+    // thread: at decode context lengths the per-head work is microseconds,
+    // so spawn/barrier cost against the prefetch/IO pools dominated.
+    #pragma omp parallel num_threads(attn_score_threads())
+    {
+    std::vector<float> scores;
+    std::vector<const float *> key_ptrs;
+    #pragma omp for schedule(static)
     for (int h = 0; h < H; ++h) {
       const float *head_q = Q.data() + ((size_t)s * H + h) * qh;
-      std::vector<float> scores((size_t)past + selected.size() + 1);
+      scores.assign((size_t)past + selected.size() + 1, 0.0f);
       for (int t = 0; t < past; ++t) {
         const int abs_pos = pos - past + 1 + t;
         const float *key = raw_key(abs_pos);
@@ -4207,22 +4246,18 @@ static void dsv41_attention_impl(StreamingEngine &engine, int layer_idx,
       scores.back() = sinks ? sinks[h] : 0.0f;
       softmax_row(scores.data(), (int)scores.size());
       float *out = contexts.data() + ((size_t)s * H + h) * qh;
-      for (int t = 0; t < past; ++t) {
-        const int abs_pos = pos - past + 1 + t;
-        const float *key = raw_key(abs_pos);
-        for (int d = 0; d < qh; ++d)
-          out[d] += scores[(size_t)t] * key[d];
-      }
-      for (size_t i = 0; i < selected.size(); ++i) {
-        const float *key = compressed_keys + (size_t)selected[i] * qh;
-        const float w = scores[(size_t)past + i];
-        for (int d = 0; d < qh; ++d)
-          out[d] += w * key[d];
-      }
+      key_ptrs.resize((size_t)past + selected.size());
+      for (int t = 0; t < past; ++t)
+        key_ptrs[(size_t)t] = raw_key(pos - past + 1 + t);
+      for (size_t i = 0; i < selected.size(); ++i)
+        key_ptrs[(size_t)past + i] = compressed_keys + (size_t)selected[i] * qh;
+      dsv41_weighted_sum_avx512(out, scores.data(), key_ptrs.data(),
+                                key_ptrs.size(), qh);
       rope_yarn_inplace_inverse(out + nope, rope, pos, rope_theta_v41,
                                 c.rope_ext_factor, c.rope_freq_scale,
                                 c.rope_attn_factor, c.rope_yarn_log_mul,
                                 c.rope_n_ctx_orig, true);
+    }
     }
   }
   g_diag_dsv41_perhead_ms += std::chrono::duration<double, std::milli>(
