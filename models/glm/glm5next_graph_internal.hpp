@@ -583,7 +583,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int la
 void v41_cache_moe_sites_reset();
 void v41_cache_moe_sites_release_holds();
 ggml_tensor *v41_build_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
-                                 const int *token_ids);
+                                 const int *token_ids,
+                                 const int *decode_pos = nullptr);
 ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
                     ggml_tensor *fn, ggml_tensor *scale, ggml_tensor *base,
                     ggml_tensor **post, ggml_tensor **comb,

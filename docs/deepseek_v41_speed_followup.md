@@ -322,11 +322,93 @@ immediately preceding baseline. All three completed without an emergency
 stop. The shipped `decode_async_prewarm=false` setting remains appropriate
 for this workload.
 
-The opt-in two-GPU cache-backed decode path compiles, but its runtime graph
-build declines because this model currently uses `expert_compact_layout=1`
-with `expert_slab_size=0`. The graph's shared
-pool tensor views require a uniform expert slab, so the builder declines at
-layer 0 and falls back to native cache dispatch. A failed build is now
-remembered for the process to avoid retrying it on every token. The cache
-graph path remains default-off until its expert views can bind the compact
-per-slot layout without taking ownership of, or copying, expert storage.
+The cache graph's first compact-layout attempt used an expert-plane stride
+that was not a whole number of GGML matrix rows. The layer-0 route IDs still
+matched native decode, but its MoE output contained **5,054 NaNs** and the
+following logits diverged. The unchecked view is now rejected unless each
+layer's slot region passes bounds, contiguity, size, and row-stride checks.
+
+For the opt-in graph path, startup now rounds each compact layer's slot size
+to the alignment returned by `expert_cache_layer_stride_alignment`. This
+keeps slots in the existing GpuTopology pool and preserves its ownership;
+the cache slot count is recalculated from the padded sizes. A guarded
+64-token run with this layout completed all 40 layers, had **58.37 GiB**
+minimum MemAvailable and no emergency stop. Its decoded stdout matched the
+native path byte for byte for this prompt. Decode was **5.21 tok/s** overall
+with **191.9 ms** warm graph compute per token, so the graph is correct on
+this sequence but does not improve speed yet. Full-logit parity remains
+unverified; next work needs to cut the GPU MoE and scheduler time.
+
+## GLM-style cold-expert CPU split (2026-10-16)
+
+The non-cache-graph DeepSeek decode callback used the ordinary MoE dispatcher.
+With the current 100 GB host cap and 15 GiB pin limit it sent **19,680/19,680
+expert calls to GPU** and zero to CPU. Its decode rate was **5.76 tok/s** for
+64 generated tokens; decode-only counters reported 47.4 ms/token in batched
+RAM resolution, 45.2 ms/token in active-layer uploads, and 34.0 ms/token in
+disk reads. This is the dispatcher behavior that differed from GLM's explicit
+hot-GPU/cold-CPU lane.
+
+The existing `cpu_offload_max_experts` cap now has a DeepSeek decode policy:
+when enabled, it can send DDR-resident experts outside both persistent and
+active-layer VRAM caches to the CPU. Main-cache and active-layer hits stay on
+GPU. The policy is restricted to single-token decode so prefill retains its
+existing path. It remains opt-in; the shipped DeepSeek config still leaves the
+cap at zero.
+
+A guarded 64-token run with the cap set to eight completed without emergency
+stop, matched the native output exactly, and split **17,613 GPU / 2,067 CPU
+expert calls**. Active-layer uploads fell to zero, but decode was **5.73
+tok/s**, within noise of the all-GPU 5.76 tok/s baseline. The hybrid policy
+alone does not meet the 10 tok/s target; it needs to run cold CPU work in
+parallel with a batched GPU hot-expert branch, following GLM's early-ready
+lane. Minimum MemAvailable was **58.33 GiB**.
+
+The compact cache-graph callback's `upload_ms` is an inclusive service timer
+from route completion to payload binding. It includes DDR expert lookup,
+possible SSD loads, VRAM upload work, and cache bookkeeping; it is not a
+PCIe-only measurement. In the async 64-token graph run, the callback recorded
+1,206 routed VRAM misses (about 19 per generated token). Multiplying by the
+12.862 MB slot size gives **15.5 GB of possible payload**, not measured H2D
+bytes. Whole-process H2D counters include several upload paths and cannot be
+used as the graph callback's transfer total. A separate native-callback run
+measured **4.612 GB** of decode disk reads and **5.444 GB** of decode GPU
+uploads; those are from that run, not a direct decomposition of the graph
+callback timer.
+
+The guarded async cache-graph upload retry also completed all 40 layers with
+no emergency stop and byte-identical output to the native run. It measured
+**5.47 tok/s** versus **5.36 tok/s** in the synchronous graph run; these are
+single runs and show no material improvement yet. The async path remains
+opt-in.
+
+Batching the cache graph's DDR lookups with `get_experts_batch` improved the
+same guarded 64-token profile to **5.71 tok/s**; decoded stdout remained
+byte-identical to native and minimum MemAvailable was **53.42 GiB**. Its
+inclusive route-to-payload service timer fell from **6.52 s to 5.84 s** over
+the 63 decode steps. These are single runs; the target remains unmet.
+
+With the verified async slot-hold path enabled on top of batched DDR lookup,
+the same profile measured **5.76 tok/s**, **5.64 s** inclusive route-to-payload
+time, and **53.33 GiB** minimum MemAvailable. It matched native stdout and
+reported no emergency stop. This remains a single-run result.
+
+The first graph-level cold CPU lane (`MOESTREAM_DEEPSEEK_V41_CACHE_MOE_CPU_COLD=1`)
+starts a batched DDR lookup and per-expert CPU FFNs while the graph computes
+main-VRAM hits, then merges the CPU partial output after the GPU branch. Its
+guarded 64-token run completed all 40 layers, matched native stdout, had no
+emergency stop, and kept **53.54 GiB** minimum MemAvailable. It recorded
+**2,129 CPU / 4,560 GPU FFN calls** and measured **4.57 tok/s**, slower than
+the GPU-only cache graph's 5.47 tok/s. This scalar CPU path is a correctness
+prototype; the next iteration needs GLM's batched GGML CPU expert graph to
+reduce cold-branch compute time. A timed repeat saw 1,373 cold-lane callbacks,
+8.90 s total worker time, and 7.47 s waiting at the merge, so most cold work
+was still on the token's critical path rather than hidden behind GPU compute.
+
+The first cache-graph CPU-cold branch used an asynchronous host task for DDR
+loads and per-expert CPU FFNs, while the graph computed main-VRAM hits and
+merged both results afterward. A guarded 64-token run completed all 40 layers,
+matched native stdout, preserved **53.54 GiB** minimum MemAvailable, and had no
+emergency stop. It routed **2,129** experts to CPU and **4,560** GPU FFN calls,
+but decode fell to **4.57 tok/s**. The per-expert CPU path is too slow; the next
+implementation needs GLM's batched CPU graph execution and earlier scheduling.

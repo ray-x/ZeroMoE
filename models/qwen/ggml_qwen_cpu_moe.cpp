@@ -707,6 +707,7 @@ void GgmlQwenCpuMoeRunner::free_graph() {
   gate_type_ = up_type_ = down_type_ = 0;
   strided_mode_ = false;
   merged_gate_up_ = false;
+swiglu_clamp_ = 0.0f;
   output_per_expert_ = false;
   expert_stride_ = 0;
   up_expert_stride_ = 0;
@@ -1811,7 +1812,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
     int topk, bool strided, const void *gate_plane, const void *up_plane,
     const void *down_plane, size_t expert_stride, bool output_per_expert,
     bool merged_gate_up, size_t up_expert_stride,
-    size_t down_expert_stride) {
+size_t down_expert_stride, float swiglu_clamp) {
   const size_t effective_up_stride =
       up_expert_stride == 0 ? expert_stride : up_expert_stride;
   const size_t effective_down_stride =
@@ -1834,6 +1835,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
       up_type_ == ref.up_type && down_type_ == ref.down_type &&
       strided_mode_ == strided && output_per_expert_ == output_per_expert &&
       merged_gate_up_ == merged_gate_up &&
+swiglu_clamp_ == swiglu_clamp &&
       (!strided || (expert_stride_ == expert_stride &&
                     up_expert_stride_ == effective_up_stride &&
                     down_expert_stride_ == effective_down_stride));
@@ -2122,6 +2124,8 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
       ggml_set_name(up_out, "qwen4exp_cpu_moe_up");
   }
   ggml_tensor *act = ggml_swiglu_split(gctx, gate_out, up_out);
+  if (act && swiglu_clamp > 0.0f)
+    act = ggml_clamp(gctx, act, -swiglu_clamp, swiglu_clamp);
   if (act)
     ggml_set_name(act, "qwen4exp_cpu_moe_swiglu");
   ggml_tensor *down_out = ggml_mul_mat_id(gctx, down, act, ids);
@@ -2215,6 +2219,7 @@ bool GgmlQwenCpuMoeRunner::ensure_graph(
   down_type_ = ref.down_type;
   strided_mode_ = strided;
   merged_gate_up_ = merged_gate_up;
+swiglu_clamp_ = swiglu_clamp;
   output_per_expert_ = output_per_expert;
   expert_stride_ = strided ? expert_stride : 0;
   up_expert_stride_ = strided ? effective_up_stride : 0;
@@ -2238,7 +2243,8 @@ bool GgmlQwenCpuMoeRunner::compute_graph() {
 bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
                                const GgmlQwenCpuExpertRef *experts,
                                int n_experts, const float *router_weights,
-                               int d_model, int d_ff, int topk) {
+                               int d_model, int d_ff, int topk,
+                               float swiglu_clamp) {
   if (!input || !output || !experts || !router_weights || n_experts <= 0 ||
       n_experts != topk || d_model <= 0 || d_ff <= 0)
     return false;
@@ -2260,7 +2266,8 @@ bool GgmlQwenCpuMoeRunner::run(const float *input, float *output,
   const bool merged_gate_up = first.gate_type == first.up_type &&
                               first.gate_bytes == first.up_bytes;
   if (!ensure_graph(first, n_experts, d_model, d_ff, topk, false, nullptr,
-                    nullptr, nullptr, 0, false, merged_gate_up))
+                  nullptr, nullptr, 0, false, merged_gate_up, 0, 0,
+                  swiglu_clamp))
     return false;
 
   const size_t gate_plane =

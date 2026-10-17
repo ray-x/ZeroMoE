@@ -2015,8 +2015,10 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
         // entry (ram_was_real_fetch[i]==false) never touched disk
         // this call and is never eligible -- forcing it to CPU would
         // throw away a cache hit for no reason.
-        if (engine.cpu_offload_max_experts > 0 && !cpu_only_mode() &&
+  if (S == 1 && engine.cpu_offload_max_experts > 0 && !cpu_only_mode() &&
             !is_cpu_affinity_layer(layer_idx) && !real_fetch_overflow) {
+  const bool deepseek_cpu_cold =
+      engine.family_ops.family == ModelFamily::DeepSeek_V41;
           int budget = engine.cpu_offload_max_experts;
           for (size_t i = 0; i < ram_needed_ids.size(); ++i) {
             // A lookahead-only entry (ram_needed_k[i]==-1) isn't
@@ -2024,7 +2026,13 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
             // not -- skip before any k-indexed access.
             if (ram_needed_k[i] < 0)
               continue;
-            if (!ram_was_real_fetch[i])
+    // DeepSeek's GLM-style split sends any selected expert outside the
+    // persistent VRAM cache to the CPU DDR lane. Other families retain the
+    // established policy of CPU-offloading only genuine disk-cold misses.
+    if (!ram_was_real_fetch[i] && !deepseek_cpu_cold)
+      continue;
+    if (deepseek_cpu_cold && ram_mgr.vram_cache &&
+        ram_mgr.vram_cache->active_layer_has(layer_idx, ram_needed_ids[i]))
               continue;
             if (budget > 0) {
               force_cpu_offload_k[ram_needed_k[i]] = true;

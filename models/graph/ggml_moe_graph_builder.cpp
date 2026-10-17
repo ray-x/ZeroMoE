@@ -1,3 +1,4 @@
+#include "dense_dispatch.hpp"
 #include "ggml_moe_graph_builder.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -99,12 +100,19 @@ SharedGraphNodes build_shared_topology(
     return result;
   result.gate = ggml_mul_mat(ctx, gate_weight, input);
   result.up = ggml_mul_mat(ctx, up_weight, input);
-  result.activation =
-      result.gate && result.up
-          ? ggml_mul(ctx, ggml_silu(ctx, result.gate), result.up)
-          : nullptr;
-  if (clamp > 0.0f && result.activation)
-    result.activation = ggml_clamp(ctx, result.activation, -clamp, clamp);
+  if (clamp > 0.0f && swiglu_clamp_fused() && result.gate && result.up) {
+    // ggml_swiglu_clamp semantics: clamp gate/up before the activation.
+    result.activation =
+        ggml_mul(ctx, ggml_silu(ctx, ggml_clamp(ctx, result.gate, -INFINITY, clamp)),
+                 ggml_clamp(ctx, result.up, -clamp, clamp));
+  } else {
+    result.activation =
+        result.gate && result.up
+            ? ggml_mul(ctx, ggml_silu(ctx, result.gate), result.up)
+            : nullptr;
+    if (clamp > 0.0f && result.activation)
+      result.activation = ggml_clamp(ctx, result.activation, -clamp, clamp);
+  }
   result.shared_raw = result.activation
                           ? ggml_mul_mat(ctx, down_weight, result.activation)
                           : nullptr;

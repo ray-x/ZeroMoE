@@ -1273,6 +1273,109 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // n_upload_expert_no_victim/n_upload_expert_memcpy_fail).
       int tier1_disk_fail = 0, tier1_upload_fail = 0;
       int tier2_disk_fail = 0, tier2_upload_fail = 0;
+      // pin_global_tiers: per-layer VRAM-LRU and RAM preload counts from one
+      // global ranking of what remains after each layer's pinned prefix.
+      // The totals equal what the per-layer rule would have loaded.
+      const bool global_tiers = config.pin_global_tiers && global_topn &&
+                                !prefix_vram &&
+                                !engine.qwen4exp_option_b_committed;
+      std::unordered_map<int, int> global_lru_count, global_ram_count;
+      if (global_tiers) {
+        struct TierCand {
+          int layer, idx;
+          uint64_t count;
+        };
+        auto layer_ram_limit = [&](int layer) {
+          if (graph_ram_cache && !engine.graph_ram_layer_allocated(layer))
+            return 0;
+          return std::min(ram_mgr.cap_for_layer(layer),
+                          (int)engine.layers_experts[layer].size());
+        };
+        std::vector<int> layers;
+        for (auto &[layer, v] : by_layer)
+          if (layer >= 0 && (size_t)layer < engine.layers_experts.size() &&
+              !engine.layers_experts[(size_t)layer].empty())
+            layers.push_back(layer);
+        std::sort(layers.begin(), layers.end());
+        auto rank_remaining = [&](const std::unordered_map<int, int> &start,
+                                  const std::unordered_map<int, int> &limit,
+                                  long budget,
+                                  std::unordered_map<int, int> &out) {
+          std::vector<TierCand> cands;
+          for (int layer : layers) {
+            const auto &v = by_layer[layer];
+            const int s0 = start.count(layer) ? start.at(layer) : 0;
+            const int lim = limit.count(layer) ? limit.at(layer) : 0;
+            for (int i = s0; i < (int)v.size() && i < s0 + lim; ++i)
+              cands.push_back({layer, i, v[i].count});
+          }
+          std::stable_sort(cands.begin(), cands.end(),
+                           [](const TierCand &a, const TierCand &b) {
+                             if (a.count != b.count) return a.count > b.count;
+                             if (a.layer != b.layer) return a.layer < b.layer;
+                             return a.idx < b.idx;
+                           });
+          long taken = 0;
+          for (const auto &c : cands) {
+            if (taken >= budget) break;
+            ++out[c.layer];
+            ++taken;
+          }
+          return taken;
+        };
+        // Tier 2 (VRAM-LRU pre-warm): same total as the uniform rule.
+        std::unordered_map<int, int> pin_start, vram_room;
+        long lru_budget = 0;
+        for (int layer : layers) {
+          const int n = (int)by_layer[layer].size();
+          const int pins = std::min(layer_pin_count.count(layer)
+                                        ? layer_pin_count[layer] : 0, n);
+          pin_start[layer] = pins;
+          int room = n - pins;
+          if (!compact_layer_capacity.empty()) {
+            auto it = compact_layer_capacity.find(layer);
+            room = std::min(room, it == compact_layer_capacity.end()
+                                      ? 0 : it->second - pins);
+          }
+          room = std::max(0, room);
+          if (is_cpu_affinity_layer(layer)) room = 0;
+          vram_room[layer] = room;
+          lru_budget += std::min(vram_lru_n, room);
+        }
+        const long lru_taken =
+            rank_remaining(pin_start, vram_room, lru_budget, global_lru_count);
+        // Tier 3 (RAM preload): same total as the uniform rule, starting
+        // after each layer's VRAM entries.
+        std::unordered_map<int, int> ram_start, ram_room;
+        long ram_budget = 0;
+        for (int layer : layers) {
+          const int n = (int)by_layer[layer].size();
+          const bool aff = is_cpu_affinity_layer(layer);
+          const int s0 = aff ? 0
+                             : std::min(n, pin_start[layer] +
+                                               global_lru_count[layer]);
+          ram_start[layer] = s0;
+          const int limit = layer_ram_limit(layer);
+          ram_room[layer] = std::max(0, std::min(limit, n - s0));
+          ram_budget += config.ram_preload_all_experts
+                            ? ram_room[layer]
+                            : std::min(ram_n, ram_room[layer]);
+        }
+        const long ram_taken =
+            rank_remaining(ram_start, ram_room, ram_budget, global_ram_count);
+        int lmin = 1 << 30, lmax = 0, rmin = 1 << 30, rmax = 0;
+        for (int layer : layers) {
+          lmin = std::min(lmin, global_lru_count[layer]);
+          lmax = std::max(lmax, global_lru_count[layer]);
+          rmin = std::min(rmin, global_ram_count[layer]);
+          rmax = std::max(rmax, global_ram_count[layer]);
+        }
+        LOG_STREAM_INFO() << "[PIN] global tiers: VRAM-LRU " << lru_taken << "/"
+                          << lru_budget << " (per layer " << lmin << ".."
+                          << lmax << "), RAM preload " << ram_taken << "/"
+                          << ram_budget << " (per layer " << rmin << ".."
+                          << rmax << "), RAM starts after VRAM entries\n";
+      }
       for (auto &[layer, v] : by_layer) {
         // Defensive second barrier: all records are sanitized above,
         // but this loop is the last point before direct indexing into
@@ -1329,6 +1432,8 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         int layer_vram_lru_n =
             (cpu_affinity || prefix_vram || option_b_target) ? 0
                                                              : vram_lru_n;
+        if (global_tiers)
+          layer_vram_lru_n = cpu_affinity ? 0 : global_lru_count[layer];
         // Three-tier: enforce global pinned capacity per layer.
         // global_topn already computed a final per-layer count
         // (floor + its share of the global ranking) up front; the
@@ -1488,6 +1593,8 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
                           : std::min(ram_n, ram_layer_cap);
         if (graph_ram_cache && !engine.graph_ram_layer_allocated(layer))
           ram_cap = 0;
+        if (global_tiers)
+          ram_cap = std::min(ram_layer_cap, global_ram_count[layer]);
         // 2026-08-29 (EngineConfig::ram_pin_eager_preregister):
         // ram_n itself is a FIXED fraction of slots_per_layer
         // (pin_ram_fraction), unrelated to how much of
@@ -1549,6 +1656,8 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         // proven-safe pattern to every layer, unconditionally,
         // instead of only the cpu_affinity case.
         int ram_start_i = 0;
+        if (global_tiers && !cpu_affinity)
+          ram_start_i = std::min(n, layer_max + layer_vram_lru_n);
         int ram_count = std::min(std::max(0, n - ram_start_i), ram_cap);
         for (int off = 0; off < ram_count;) {
           int chunk_n = std::min(PRELOAD_URING_CHUNK, ram_count - off);

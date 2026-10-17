@@ -630,6 +630,12 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
     c.dsv4_indexer_top_k =
         file.get_config_int("attention.indexer.top_k", 0);
     if (fam == ModelFamily::DeepSeek_V41) {
+      // The reference graph (llama.cpp deepseek4, ggml_swiglu_clamp) clamps
+      // gate/up BEFORE the activation: min(gate,limit), clamp(up,+/-limit),
+      // silu(gate)*up. The project default (silu*up, then clamp the product)
+      // saturates products above the limit and changes expert outputs by
+      // ~1e-2 relative at layer 15. See dense_dispatch.hpp's flag comment.
+      set_swiglu_clamp_fused(true);
       c.dsv41_kv_source_layers =
           file.get_config_int_array("attention.kv_source_layers");
       c.dsv41_index_source_layers =

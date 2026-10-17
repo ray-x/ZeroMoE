@@ -934,7 +934,8 @@ class GgmlQwenCpuMoeRunner {
 
   bool run(const float *input, float *output,
            const GgmlQwenCpuExpertRef *experts, int n_experts,
-           const float *router_weights, int d_model, int d_ff, int topk);
+         const float *router_weights, int d_model, int d_ff, int topk,
+         float swiglu_clamp = 0.0f);
 
   // llama.cpp-style CPU-offload entry point. The three projection pointers are
   // the first expert's views in a complete host-RAM layer arena. `expert_stride`
@@ -1041,7 +1042,8 @@ class GgmlQwenCpuMoeRunner {
                     const void *down_plane, size_t expert_stride,
                     bool output_per_expert, bool merged_gate_up,
                     size_t up_expert_stride = 0,
-                    size_t down_expert_stride = 0);
+size_t down_expert_stride = 0,
+float swiglu_clamp = 0.0f);
   bool ensure_direct_signature(const GgmlQwenCpuExpertRef &ref,
                               int n_experts, int d_model, int d_ff, int topk,
                               size_t gate_stride, size_t up_stride,
@@ -1130,6 +1132,7 @@ class GgmlQwenCpuMoeRunner {
   int n_threads_ = 0;
   bool strided_mode_ = false;
   bool merged_gate_up_ = false;
+float swiglu_clamp_ = 0.0f;
   bool output_per_expert_ = false;
   size_t expert_stride_ = 0;
   size_t up_expert_stride_ = 0;

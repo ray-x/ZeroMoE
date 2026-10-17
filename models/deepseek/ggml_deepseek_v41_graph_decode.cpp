@@ -32,6 +32,9 @@ struct DecodeGraph;
 struct DecodeSite { DecodeGraph *owner; int layer; };
 struct DecodeHcSite { DecodeGraph *owner; int layer; int sub_block; };
 struct DecodeGraph : FullGraph {
+  // GPU hyper-connections: previous FFN pre-gate fed to the first attention
+  // collapse (host input), written back to the engine after each token.
+  ggml_tensor *hc_carry_in = nullptr;
   RAMSafetyManager *ram = nullptr;
   LockFreePrefetcher *prefetch = nullptr;
   LayerScratch *scratch = nullptr;
@@ -637,6 +640,18 @@ bool build(DecodeGraph &g) {
     g.hc_sites.push_back({&g, l, 0});
     g.hc_sites.push_back({&g, l, 1});
   }
+  // Default on; MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC=0 selects the host nodes.
+  const bool gpu_hc_decode =
+      !moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC") ||
+      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC");
+  ggml_tensor *carry = nullptr;
+  if (gpu_hc_decode) {
+    g.hc_carry_in = host_input(g, g.ctx, GGML_TYPE_F32, {g.HC, 1},
+                               g.HC * sizeof(float), "dsv41_decode_hc_carry");
+    if (!g.hc_carry_in) return false;
+    carry = g.hc_carry_in;
+    LOG_INFO("[GGML-DSV41-DECODE] hyper-connections on GPU\n");
+  }
   auto *res = g.input;
   for (int l = 0; l < g.n_layers; ++l) {
     if (MemoryGuard::allocation_blocked()) return false;
@@ -650,31 +665,57 @@ bool build(DecodeGraph &g) {
     }
     mark_trace(g, "post-input-hook", l,
                ggml_view_2d(g.ctx, res, g.D, 1, res->nb[2], 0));
-    ggml_tensor *attn_hc_args[] = {res};
-    auto *cur = ggml_custom_4d(
-        g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1, attn_hc_args, 1,
-        hc_pre_node, 1, &g.hc_sites[(size_t)l * 2]);
-    if (!cur) return false;
-    ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
-    auto *attn = attention(g, cur, l);
+    ggml_tensor *cur = nullptr, *attn = nullptr;
+    ggml_tensor *gpu_post = nullptr, *gpu_comb = nullptr, *gpu_attn_pre = nullptr;
+    // GPU hyper-connections (same ops as the prefill trunk): the host nodes
+    // below cost ~0.7 ms each x 80 per token on CPU.
+    auto gpu_hc = [&](const char *stem, ggml_tensor *input, ggml_tensor *collapse,
+                      ggml_tensor **post, ggml_tensor **comb, ggml_tensor **pre)
+        -> ggml_tensor * {
+      const std::string p = "blk." + std::to_string(l) + ".";
+      auto *fn = weight(g, p + stem + "_fn.weight");
+      auto *scale = weight(g, p + stem + "_scale.weight");
+      auto *base = weight(g, p + stem + "_base.weight");
+      if (!fn || !scale || !base) return nullptr;
+      return hc_pre(g, g.ctx, input, fn, scale, base, post, comb, pre, collapse);
+    };
+    if (gpu_hc_decode) {
+      cur = gpu_hc("hc_attn", res, carry, &gpu_post, &gpu_comb, &gpu_attn_pre);
+      if (!cur) return false;
+    } else {
+      ggml_tensor *attn_hc_args[] = {res};
+      cur = ggml_custom_4d(
+          g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1, attn_hc_args, 1,
+          hc_pre_node, 1, &g.hc_sites[(size_t)l * 2]);
+      if (!cur) return false;
+      ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
+    }
+    attn = attention(g, cur, l);
     if (!attn) return false;
-    ggml_tensor *post_attn_args[] = {attn, res};
-    res = ggml_custom_4d(
-        g.ctx, GGML_TYPE_F32, g.D, g.HC, 1, 1, post_attn_args, 2,
-        hc_post_node, 1, &g.hc_sites[(size_t)l * 2]);
-    if (!res) return false;
-    ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
+    if (gpu_hc_decode) {
+      res = hc_post(g, g.ctx, attn, res, gpu_post, gpu_comb);
+      if (!res) return false;
+      cur = gpu_hc("hc_ffn", res, gpu_attn_pre, &gpu_post, &gpu_comb, &carry);
+      if (!cur) return false;
+    } else {
+      ggml_tensor *post_attn_args[] = {attn, res};
+      res = ggml_custom_4d(
+          g.ctx, GGML_TYPE_F32, g.D, g.HC, 1, 1, post_attn_args, 2,
+          hc_post_node, 1, &g.hc_sites[(size_t)l * 2]);
+      if (!res) return false;
+      ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
 
-    ggml_tensor *ffn_hc_args[] = {res};
-    cur = ggml_custom_4d(
-        g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1, ffn_hc_args, 1,
-        hc_pre_node, 1, &g.hc_sites[(size_t)l * 2 + 1]);
-    if (!cur) return false;
-    ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
+      ggml_tensor *ffn_hc_args[] = {res};
+      cur = ggml_custom_4d(
+          g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1, ffn_hc_args, 1,
+          hc_pre_node, 1, &g.hc_sites[(size_t)l * 2 + 1]);
+      if (!cur) return false;
+      ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
+    }
     mark_trace(g, "hc-ffn-pre", l, cur);
     ggml_tensor *ffn = nullptr;
     if (g.cache_moe_graph) {
-      ffn = v41_build_cache_moe(g, cur, l, &g.token);
+      ffn = v41_build_cache_moe(g, cur, l, &g.token, &g.pos);
       if (!ffn) {
         LOG_ERROR("[GGML-DSV41-DECODE] cache-backed MoE graph build failed at layer %d\n", l);
         return false;
@@ -684,19 +725,31 @@ bool build(DecodeGraph &g) {
       ggml_backend_sched_set_tensor_backend(g.sched, ffn, g.cpu);
     }
     mark_trace(g, "moe-out", l, ffn);
-    ggml_tensor *post_ffn_args[] = {ffn, res};
-    res = ggml_custom_4d(
-        g.ctx, GGML_TYPE_F32, g.D, g.HC, 1, 1, post_ffn_args, 2,
-        hc_post_node, 1, &g.hc_sites[(size_t)l * 2 + 1]);
-    if (!res) return false;
-    ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
+    if (gpu_hc_decode) {
+      res = hc_post(g, g.ctx, ffn, res, gpu_post, gpu_comb);
+      if (!res) return false;
+    } else {
+      ggml_tensor *post_ffn_args[] = {ffn, res};
+      res = ggml_custom_4d(
+          g.ctx, GGML_TYPE_F32, g.D, g.HC, 1, 1, post_ffn_args, 2,
+          hc_post_node, 1, &g.hc_sites[(size_t)l * 2 + 1]);
+      if (!res) return false;
+      ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
+    }
   }
   g.final_streams = res;
-  ggml_tensor *collapse_args[] = {res};
-  g.output = ggml_custom_4d(g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1,
-                            collapse_args, 1, final_collapse_node, 1, &g);
+  if (gpu_hc_decode) {
+    g.output = ggml_dsv4_hc_pre(g.ctx, ggml_cont(g.ctx, res), ggml_cont(g.ctx, carry));
+    g.dsv41_final_pre_mix = carry;
+    ggml_set_output(carry);
+    ggml_build_forward_expand(g.graph, carry);
+  } else {
+    ggml_tensor *collapse_args[] = {res};
+    g.output = ggml_custom_4d(g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1,
+                              collapse_args, 1, final_collapse_node, 1, &g);
+    if (g.output) ggml_backend_sched_set_tensor_backend(g.sched, g.output, g.cpu);
+  }
   if (!g.output) return false;
-  ggml_backend_sched_set_tensor_backend(g.sched, g.output, g.cpu);
   mark_trace(g, "final-hidden", -1, g.output);
   if (!resident(*g.engine, "output_norm.weight") ||
       !resident(*g.engine, "output.weight")) return false;
@@ -879,6 +932,8 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
   if (g.runs == 0) g.perf_at_first_run = perf().snapshot();
   const auto node_ms_before = g.node_ms_total;
   std::memcpy(g.input->data, e.hc_stream_buf.data(), g.D * g.HC * sizeof(float));
+  if (g.hc_carry_in)
+    std::memcpy(g.hc_carry_in->data, e.hc_pending_pre_mix.data(), g.HC * sizeof(float));
   const auto start = std::chrono::steady_clock::now();
   const auto status = ggml_backend_sched_graph_compute(g.sched, g.graph);
   if (g.cache_moe_graph)
@@ -891,6 +946,15 @@ bool deepseek_v41_full_graph_decode_run(StreamingEngine &e, float *hidden,
   ggml_backend_tensor_get(g.output, hidden, 0, g.D * sizeof(float));
   ggml_backend_tensor_get(g.final_streams, e.hc_stream_buf.data(), 0,
                            g.D * g.HC * sizeof(float));
+  if (g.hc_carry_in && g.dsv41_final_pre_mix) {
+    // The last FFN pre-gate is both the next token's attention carry and the
+    // final collapse mix, exactly as the host hc_pre_fn leaves them.
+    e.hc_final_pre_mix.resize((size_t)g.HC);
+    ggml_backend_tensor_get(g.dsv41_final_pre_mix, e.hc_final_pre_mix.data(), 0,
+                            g.HC * sizeof(float));
+    std::memcpy(e.hc_pending_pre_mix.data(), e.hc_final_pre_mix.data(),
+                g.HC * sizeof(float));
+  }
   for (const auto &trace : g.traces) {
     if (!dsv41_trace::enabled(trace.layer, pos)) continue;
     const size_t n = (size_t)ggml_nelements(trace.value);

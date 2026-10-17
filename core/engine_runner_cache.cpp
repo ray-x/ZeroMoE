@@ -41,7 +41,12 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
         // hot experts, so every layer needs a row-aligned slot stride, not just the full-layer prefix.
         const bool glm_graph_rows = engine.family_ops.family == ModelFamily::GLM5NEXT &&
                                     glm5next_full_graph_enabled();
-        if (config.vram_cache_full_layer_prefix > l || glm_graph_rows) {
+        const bool dsv41_graph_rows =
+            engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+            (moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH") ||
+             moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_DECODE"));
+        if (config.vram_cache_full_layer_prefix > l || glm_graph_rows ||
+            dsv41_graph_rows) {
           const size_t row_alignment =
               engine.expert_cache_layer_stride_alignment(l);
           if (row_alignment == SIZE_MAX) {

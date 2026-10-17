@@ -1658,6 +1658,15 @@ struct EngineConfig {
   //     reactively during real generation).
   double pin_vram_lru_fraction = 0.0;
   double pin_ram_fraction = 0.0;
+  // pin_global_tiers: place the VRAM-LRU pre-warm and the host-RAM preload
+  // from ONE global usage ranking (like pin_strategy=global_topn already does
+  // for the pinned tier) instead of a fixed per-layer count. Same total
+  // preload budget as the per-layer rule, redistributed to the globally
+  // hottest remaining experts, bounded per layer by its VRAM region and RAM
+  // cap. The RAM preload then starts AFTER the layer's VRAM entries (disjoint
+  // tiers) instead of at rank 0. Only for graph families whose miss path
+  // skips the RAM tier for VRAM-resident experts (DeepSeek-V4.1).
+  bool pin_global_tiers = false;
 
   // Three-tier VRAM caching configuration
   // Tier overlap fix: MOVE instead of COPY on RAM→VRAM promotion
@@ -3035,6 +3044,7 @@ inline bool EngineConfig::load(const std::string &path) {
   pin_vram_lru_fraction =
       doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
   pin_ram_fraction = doc.root.get_double("pin_ram_fraction", pin_ram_fraction);
+  pin_global_tiers = doc.root.get_bool("pin_global_tiers", pin_global_tiers);
   vram_evict_demote_to_ram =
       doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
   dsv4_outproj_gpu = doc.root.get_bool("dsv4_outproj_gpu", dsv4_outproj_gpu);
