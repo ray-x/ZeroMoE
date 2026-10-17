@@ -1,0 +1,92 @@
+# DeepSeek V4.1 usage survey: collects real per-(layer,expert) routing counts.
+# Derived from the dual-GPU profile; usage frozen OFF and redirected to survey
+# files so the live pin files are not overwritten.
+# DeepSeek-V4.1-Flash dual-GPU full graph profile (context 4096, temperature 0).
+# Enable with MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1; see docs/deepseek_v41_decode.md.
+# 3090: 17 GiB main expert cache, 48 active slots, one shared native dense pool.
+# 5060 Ti: 13.5 GiB main expert cache and 16 active slots.
+# DDR: 8360 slots are an upper capacity target; physical-memory admission
+# stops growth while preserving 20 GiB for Linux, drivers, and graph scratch.
+# host_ram_gb includes expert slabs plus resident/state/scratch, in decimal GB.
+# Caches fill on demand. Graph-owned MoE weight bytes = 0; dense bindings alias
+# the engine's persistent device pool across prefill/decode graph lifetimes.
+
+model_path = "/home/ray/vllm-workspace/DeepSeek-V41-Flash"
+log_level = "INFO"
+context_size = 4096
+max_new_tokens = 128
+temperature = 0.0
+top_p = 1.0
+prompt_cache = false
+drop_pages = false
+direct_io = true
+io_uring = true
+host_ram_gb = 107.0
+mem_guard_warn_mb = 32768
+mem_guard_stop_mb = 20480
+ram_cache_total_experts = 8360
+ram_pinned_budget_gb = 15.0
+freeze_usage_stats = false
+omp_max_threads = 10
+attn_score_threads = 8
+pin_file = "/home/ray/work/moestream-deepseek-v41-flash/tests/moe_usage_survey/moestream_usage_survey_dsv41"
+prefill_pin_file = "/home/ray/work/moestream-deepseek-v41-flash/tests/moe_usage_survey/moestream_usage_survey_dsv41_prefill"
+cpu_affinity_layers = []
+ram_cache_layer_adaptive = false
+moe_ggml_mul_mat_id = false
+pin_strategy = "global_topn"
+pin_global_floor_per_layer = 1
+pin_topk_per_layer = 0
+pin_vram_lru_fraction = 0.25
+pin_ram_fraction = 0.50
+pinned_vram_capacity = 1024
+prefetch_worker_threads = 6
+expert_fetch_threads = 10
+prefetch_attn_pilot = false
+prefetch_pilot_k_adaptive = true
+prefetch_pilot_k_adaptive_threshold = 0.50
+prefetch_pilot_k_adaptive_min_samples = 30
+promote_hit_threshold = 3
+pin_threshold = 8
+active_layer_capacity = 64
+use_active_layer_area = true
+move_on_promotion = true
+expert_gpu_activation = true
+moe_gpu_accum = true
+decode_async_prewarm = false
+decode_async_prewarm_nonblocking = false
+decode_async_prewarm_max_batch = 3
+active_layer_upload_worker_threads = 2
+ram_vram_promote_top_k = 2
+ram_vram_promote_layer_gate = true
+ram_vram_promote_layer_gate_threshold = 0.65
+ram_vram_promote_layer_gate_min_samples = 30
+ram_vram_promote_layer_gate_top_fraction = 0.3
+speculative_promote_to_active_layer = true
+ram_vram_promote_adaptive = false
+vram_evict_demote_to_ram = false
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+dense_gb = 3.2
+kv_cache_gb = 2.0
+kv_bits = 4
+moe_cache_gb = 18.253611008
+active_layer_weight = 3
+active_layer_capacity_slots = 48
+
+
+[[gpus]]
+device_id = 1
+name = "NVIDIA GeForce RTX 5060 Ti"
+role = "moe"
+vram_gb = 16.0
+dense_gb = 0.0
+kv_cache_gb = 0.0
+kv_bits = 4
+moe_cache_gb = 14.495514624
+active_layer_weight = 1
+active_layer_capacity_slots = 16

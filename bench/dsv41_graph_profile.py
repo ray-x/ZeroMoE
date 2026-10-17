@@ -50,8 +50,17 @@ def main() -> None:
                         help="temporary process cap for this safe run (50..100 GB)")
     parser.add_argument("--native-reference", action="store_true",
                         help="run the host reference path for a paired trace")
+    parser.add_argument("--native-f32-graph", action="store_true",
+                        help="use the native F32 quant hook in graph kernels while keeping native prefill")
+    parser.add_argument("--quantized-graph", action="store_true",
+                        help="run graph expert/dense matmuls on the quantized kernels "
+                             "instead of the exact-F32 parity hook (speed mode)")
     parser.add_argument("--trace-layer", type=int,
                         help="save native/graph activations for one layer")
+    parser.add_argument("--trace-pos", type=int, default=0,
+                        help="save native/graph activations at this position")
+    parser.add_argument("--prompt-file", type=Path,
+                        help="use this text (one line) instead of the repeated default prompt")
     parser.add_argument("--repetitions", type=int, default=43)
     parser.add_argument("--ngen", type=int, default=1)
     parser.add_argument("--wait-seconds", type=int, default=3600)
@@ -76,6 +85,8 @@ def main() -> None:
     run_config.write_text(config)
     prompt = ("Explain how a mixture-of-experts transformer routes tokens, "
               "in a few clear paragraphs. " * args.repetitions).strip() + "\n"
+    if args.prompt_file:
+        prompt = " ".join(args.prompt_file.read_text().split()) + "\n"
     # The CLI reads one line per request. Keep the whole batch on one line.
     (output / "prompt.txt").write_text(prompt)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -88,12 +99,16 @@ def main() -> None:
                MOESTREAM_DEEPSEEK_V41_GPU_PREFILL="0" if args.native_reference else "1",
                MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH="0" if args.native_reference else "1",
                MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH="0" if args.native_reference else "1")
+    if args.native_f32_graph:
+        env["MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH"] = "1"
+    if args.quantized_graph:
+        env["MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH"] = "0"
     if args.trace_layer is not None:
         trace_dir = output / "trace"
         trace_dir.mkdir(parents=True, exist_ok=True)
         env["MOESTREAM_DEEPSEEK_V41_TRACE_DIR"] = str(trace_dir)
         env["MOESTREAM_DEEPSEEK_V41_TRACE_LAYER"] = str(args.trace_layer)
-        env["MOESTREAM_DEEPSEEK_V41_TRACE_POS"] = "0"
+        env["MOESTREAM_DEEPSEEK_V41_TRACE_POS"] = str(args.trace_pos)
     print("starting model run", flush=True)
     command = [str(args.binary.resolve()), "--config", str(run_config),
                "--raw-prompt", "--ngen", str(args.ngen)]

@@ -29,8 +29,15 @@ base = a.ggml_build.resolve() / 'src/ggml-cuda'
 target = base / 'CMakeFiles/ggml-cuda.dir'
 patch = root / 'patches/ggml/0010-native-f32-quant-graph-hook.patch'
 patched = work / 'ggml-cuda.cu'
-subprocess.run(['patch', '--batch', '--forward', '--output', str(patched),
-                str(source), str(patch)], check=True)
+applied = subprocess.run(['patch', '--batch', '--dry-run', '--reverse',
+                          '--output', '/dev/null', str(source), str(patch)],
+                         capture_output=True).returncode == 0
+if applied:
+    # The source tree already carries the hook; reuse it unchanged.
+    shutil.copyfile(source, patched)
+else:
+    subprocess.run(['patch', '--batch', '--forward', '--output', str(patched),
+                    str(source), str(patch)], check=True)
 flags = {}
 for line in (target / 'flags.make').read_text().splitlines():
     if ' = ' in line:
