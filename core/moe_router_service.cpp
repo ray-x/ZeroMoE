@@ -29,7 +29,9 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <immintrin.h>
@@ -1597,6 +1599,23 @@ bool MoeRouterService::route(MoePipelineContext &context) {
         if (!gpu_router_handled && c.expert_weights_scale != 0.0f) {
           for (int k = 0; k < topk; ++k)
             scratch.tok_topk_weights[s * topk + k] *= c.expert_weights_scale;
+        }
+
+        // Offline route log (MOESTREAM_ROUTE_LOG=<path>): one line per
+        // (layer, token) with the final top-k ids, in call order, so cache
+        // and predictor studies can replay real routing. Off by default.
+        if (const char *route_log_path = std::getenv("MOESTREAM_ROUTE_LOG");
+            route_log_path && *route_log_path) {
+          static std::mutex route_log_mutex;
+          static FILE *route_log = std::fopen(route_log_path, "w");
+          if (route_log) {
+            std::lock_guard<std::mutex> lock(route_log_mutex);
+            std::fprintf(route_log, "L%d S%d s%d", layer_idx, S, s);
+            for (int k = 0; k < topk; ++k)
+              std::fprintf(route_log, " %d", scratch.tok_topk_ids[s * topk + k]);
+            std::fputc('\n', route_log);
+            std::fflush(route_log);
+          }
         }
 
         // Router-selection trace: same VERBOSE gate as layers_forward_gguf's
