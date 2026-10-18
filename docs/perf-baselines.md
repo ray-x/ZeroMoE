@@ -95,5 +95,15 @@ placement; GLM's selection beyond top-k has consistency evidence only (no indepe
 The mirror gives about +9% decode and +1% prefill (single sample, identical output). Prefill still reads ~150 GB per 426-token prompt on
 this path; only a batched graph prefill, where each cold expert is read once per batch, can approach 10 tok/s.
 
-GLM_DSA full graph (`MOESTREAM_GLM_DSA_FULL_GRAPH=1`, branch `glm53-layered-speed`): not yet measured. The graph declines at start-up because it
-loads the whole 204 GiB expert source into DDR; it needs the SSD offload store (`gguf_tool offload`) to run in 82 GB of host RAM.
+GLM_DSA full graph (opt-in: `MOESTREAM_GLM_DSA_FULL_GRAPH=1`, `..._PREFILL=1`; branch `glm53-layered-speed`), same 426-token prompt,
+3090 only as the dense+moe device (`logs/glm53_dsa_graph.toml`, 4 GiB VRAM expert cache), SSD offload store of the 12,480 coldest experts
+(`gguf_tool offload`, 132.7 GiB on /data, byte-verified) and a 45 GiB DDR pool (`MOESTREAM_GLM5NEXT_OFFLOAD_*`, see `logs/run_dsa_graph_426.sh`):
+
+| Phase | tok/s | Note |
+|---|---|---|
+| Prefill (graph, one batch of 426) | 4.99 | 2.7x the layered 1.82; 85.4 s; disk-bound (~1.9 GB/s of cold reads) |
+| Decode (graph) | 0.69 overall, ~0.7-0.75 steady (1.3-1.5 s/token) | BELOW the layered 0.88-0.96: 32% of routes miss the 45 GiB pool |
+
+Output is coherent and the 17-token sky prompt reproduces the layered answer ("Rayleigh scattering"); a token-for-token comparison against the layered
+path is still to do. A 64 GiB pool exhausts host RAM (MemAvailable < 20 GB, decode graph declines); ~45-50 GiB is the ceiling with 14 GiB of live host data.
+The graph needs the dense weights on the same GPU as its workspace: with the 5060 Ti as the core device it had 0.14 GiB free and declined.
