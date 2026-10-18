@@ -1881,15 +1881,34 @@ public:
             // This accounts for the realloc peak (old + new), so a growth
             // cannot transiently exceed host_ram_gb even when the old buffer
             // is still protected by an async reader.
+            bool ledgered = true;
             if (!MemoryGuard::try_reserve_host_bytes(total)) {
                 perf().n_mem_guard_alloc_refused.fetch_add(1, std::memory_order_relaxed);
-                LOG_WARN("[MEM-GUARD] RAM slab growth refused: %.2f MB (reserved=%.2f GB, "
-                         "budget=%.2f GB); retaining the existing slab\n",
-                         total / 1e6,
-                         MemoryGuard::reserved_host_bytes() / 1e9,
-                         MemoryGuard::host_budget_bytes() / 1e9);
-                PERF_END(alloc, t_host_alloc);
-                return;
+                // Every caller writes `total` bytes into slab_buffer right
+                // after this returns and none can report failure, so a
+                // refused growth that keeps the old, smaller slab overruns it
+                // (SIGSEGV in a 426-token GLM-5.3 prefill). The guard's 20 GiB
+                // admission reserve is far above what a few-MB slab needs;
+                // grow outside the ledger while the kernel still has a hard
+                // 2 GiB of MemAvailable, and only keep the old slab when it
+                // is already large enough or the machine is genuinely out.
+                size_t avail_kb = 0;
+                if (FILE *mf = fopen("/proc/meminfo", "r")) {
+                    char line[128];
+                    while (fgets(line, sizeof line, mf))
+                        if (sscanf(line, "MemAvailable: %zu kB", &avail_kb) == 1)
+                            break;
+                    fclose(mf);
+                }
+                if (avail_kb < 2ull * 1024 * 1024) {
+                    LOG_ERROR("[MEM-GUARD] RAM slab growth refused: %.2f MB (reserved=%.2f GB, "
+                              "budget=%.2f GB, MemAvailable=%.2f GB); slab stays too small\n",
+                              total / 1e6, MemoryGuard::reserved_host_bytes() / 1e9,
+                              MemoryGuard::host_budget_bytes() / 1e9, avail_kb / 1e6);
+                    PERF_END(alloc, t_host_alloc);
+                    return;
+                }
+                ledgered = false;
             }
 
             // Allocate the replacement while the old slab remains valid.  If
@@ -1898,7 +1917,7 @@ public:
             void* nb = nullptr;
             const int pmerr = posix_memalign(&nb, 4096, total);
             if (pmerr != 0 || !nb) {
-                MemoryGuard::release_host_bytes(total);
+                if (ledgered) MemoryGuard::release_host_bytes(total);
                 LOG_ERROR("[RAM] posix_memalign(%.2f MB) failed (errno=%d) -- this slot is "
                           "left unchanged so the caller can keep using its old slab.\n",
                           total / 1e6, pmerr);
@@ -1940,7 +1959,7 @@ public:
                 }
                 slot.slab_buffer = static_cast<uint8_t*>(nb);
                 slot.slab_capacity = total;
-                slot.host_reservation_bytes = total;
+                slot.host_reservation_bytes = ledgered ? total : 0;
             }
             if (claimed && !claimed_deferred) {
                 free(claimed);
