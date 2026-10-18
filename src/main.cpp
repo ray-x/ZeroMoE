@@ -1104,16 +1104,34 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
       expert_layer_slab_bytes[(size_t)l] = layer_slot_bytes;
       expert_slab_bytes = std::max(expert_slab_bytes, raw_layer_bytes);
     }
-    // The direct resident-layer GGML view uses the cache's physical slot
-    // stride as the quantized tensor nb[2].  Round the model-wide maximum
-    // slot to a whole number of rows for every routed projection so
-    // mixed IQ formats (for example IQ2_XXS + IQ1_M) remain valid when
-    // viewed without a repack.  This is a small cache-capacity tradeoff;
-    // the normal compact path would not require it, but the full graph
-    // zero-repack path does.
     const size_t stride_alignment = engine.expert_cache_stride_alignment();
-    if (expert_slab_bytes > 0 && stride_alignment > 1 &&
-        stride_alignment != SIZE_MAX) {
+    if (expert_slab_bytes > 0 &&
+        engine.family_ops.family == ModelFamily::GLM_DSA) {
+      // GLM_DSA dispatches one layer/expert at a time. It never exposes
+      // active-layer slots as a zero-copy GGML MUL_MAT_ID tensor view, so
+      // the model-wide LCM of every quantized projection's row size is not
+      // required here. On GLM-5.3 UD-IQ2_M that LCM was 216 MB: applying it
+      // to 256 active-layer slots requested 55.4 GB on the 3090 and silently
+      // removed its promotion pool. 4 KiB slot alignment is sufficient for
+      // the layered CUDA execution path; keep row-compatible padding for the
+      // graph families below.
+      constexpr size_t layered_slot_alignment = 4096;
+      const size_t rem = expert_slab_bytes % layered_slot_alignment;
+      if (rem != 0 &&
+          expert_slab_bytes <= SIZE_MAX - (layered_slot_alignment - rem)) {
+        expert_slab_bytes += layered_slot_alignment - rem;
+      }
+      LOG_STREAM_INFO() << "[GPU] Expert staging/legacy stride: "
+                        << expert_slab_bytes
+                        << " bytes (GLM_DSA layered path, 4 KiB aligned; "
+                        << "skipped graph row alignment " << stride_alignment
+                        << ")\n";
+    } else if (expert_slab_bytes > 0 && stride_alignment > 1 &&
+               stride_alignment != SIZE_MAX) {
+      // The direct resident-layer GGML view uses the cache's physical slot
+      // stride as quantized tensor nb[2].  Graph families that expose these
+      // slots as zero-copy MUL_MAT_ID views need whole-row alignment for every
+      // routed projection, including mixed IQ formats.
       const size_t rem = expert_slab_bytes % stride_alignment;
       if (rem != 0)
         expert_slab_bytes += stride_alignment - rem;
