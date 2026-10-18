@@ -63,3 +63,18 @@ using the machine). Treat it as "applies and compiles per file", not "verified".
 * Everyone: nothing here touches `src/ggml_deepseek_v41_graph*.cpp`,
   `attention_layer.cpp`, `ram_manager.hpp`, `token_dispatch_pipeline.cpp`,
   `kernels_cpu.cpp`, `cuda_manager.hpp` or `engine_config.hpp`.
+
+## 4. Verification status (2026-10-18, end of day)
+
+| check | result |
+|---|---|
+| `refactor/source-split` build + link (`moestream`, `moestream_tests`) | OK |
+| Qwen decode, 64 tokens, same prompt/config as master | text identical; 26.8-27.1 vs 27.2-27.4 tok/s |
+| perf report output (757 lines) vs the old header | byte-identical |
+| `moestream_tests`, idle GPU, refactor x2 and master x1 | all three: 154 PASSED, 6 FAILED, identical test-by-test. The 6 failures are the pre-existing `qabsorb`/`wuv` batched tests; the harness stops at the first of them on both builds, so tests after it are not exercised by either. A single earlier `test_expert_gpu_accum` failure was seen only while the GPU was busy and did not recur. |
+| `integration/refactor-ds-glm-rehearsal` (tip `85309fb`) build + link | OK (`moestream`, `moestream_tests`, with the DeepSeek and GLM commits applied) |
+| integration branch run (Qwen / DSV4.1 / GLM decode) | NOT run: the GPUs were in use by the GLM session's benchmark. Owed. |
+
+DeepSeek has a seventh commit since the list above: a config-only change to
+`configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml` (`pin_ram_fraction = 1.0`). It
+touches no code, so it cherry-picks without interaction.
