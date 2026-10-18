@@ -12,6 +12,7 @@
 // Owned by the graph builder of whichever model uses it (Qwen4Exp Option-B,
 // GLM5NEXT SSD offload). Optional extras (next-layer prediction, VRAM staging)
 // are Qwen-only and left null elsewhere.
+#include "cuda_raii.hpp"
 #include "graph_config.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -114,13 +115,15 @@ struct EarlyReadyLane {
   ggml_tensor *prediction_marker = nullptr;
   int prediction_layer = -1;
   size_t expert_bytes = 0;
-  void *pinned = nullptr;
+  // RAII owners (released after the destructor body, i.e. after the ggml buffers
+  // that wrap `pinned`, on the device they were created on).
+  moestream::cuda::PinnedBuffer<uint8_t> pinned;
   float *input = nullptr, *weights = nullptr;
-  void *prediction_pinned = nullptr;
-  void *stage_pinned = nullptr;
+  moestream::cuda::PinnedBuffer<uint8_t> prediction_pinned;
+  moestream::cuda::PinnedBuffer<uint8_t> stage_pinned;
   int32_t *prediction_ids = nullptr, *stage_ids = nullptr;
   unsigned long long *prediction_epoch = nullptr;
-  cudaEvent_t prediction_ready = nullptr;
+  moestream::cuda::CudaEvent prediction_ready;
   Qwen4ExpStagePool *stage_source = nullptr, *stage_target = nullptr;
   ggml_backend_buffer_t stage_routes_buffer = nullptr;
   // stage_gpu_ids contains valid dispatch IDs for every slot (inactive slots
@@ -134,10 +137,10 @@ struct EarlyReadyLane {
   std::vector<float> original_mask;
   uint64_t staged_routes = 0;
   int32_t *ids = nullptr, *position = nullptr;
-  cudaEvent_t ready = nullptr;
+  moestream::cuda::CudaEvent ready;
   cudaStream_t producer_stream = nullptr;
-  cudaStream_t output_stream = nullptr;
-  cudaEvent_t output_done = nullptr;
+  moestream::cuda::CudaStream output_stream;
+  moestream::cuda::CudaEvent output_done;
   int device = -1, d = 0, k = 0, n_experts = 0, expected_pos = -1;
   int trace_layer = -1;  // layer index for MOESTREAM_GLM5NEXT_ROUTE_TRACE lines
   bool completed = false;
@@ -155,24 +158,17 @@ struct EarlyReadyLane {
 
   ~EarlyReadyLane() {
     if (device >= 0) cudaSetDevice(device);
-    if (ready) cudaEventDestroy(ready);
-    if (output_stream) cudaStreamDestroy(output_stream);
-    if (output_done) cudaEventDestroy(output_done);
     if (output_device_buffer) ggml_backend_buffer_free(output_device_buffer);
     if (tables_device_buffer) ggml_backend_buffer_free(tables_device_buffer);
     if (prediction_buffer) ggml_backend_buffer_free(prediction_buffer);
     if (ridge_buffer) ggml_backend_buffer_free(ridge_buffer);
     if (prediction_marker_buffer) ggml_backend_buffer_free(prediction_marker_buffer);
     if (stage_routes_buffer) ggml_backend_buffer_free(stage_routes_buffer);
-    if (prediction_ready) cudaEventDestroy(prediction_ready);
-    if (prediction_pinned) cudaFreeHost(prediction_pinned);
-    if (stage_pinned) cudaFreeHost(stage_pinned);
     if (device_buffer) ggml_backend_buffer_free(device_buffer);
     if (scratch) ggml_backend_buffer_free(scratch);
     if (pinned_buffer) ggml_backend_buffer_free(pinned_buffer);
     if (ctx) ggml_free(ctx);
     for (auto *b : extra_buffers) ggml_backend_buffer_free(b);
-    if (pinned) cudaFreeHost(pinned);
     if (reservation) MemoryGuard::release_host_bytes(reservation);
   }
 
@@ -279,17 +275,17 @@ struct EarlyReadyLane {
     const size_t out_off = pos_off + 64;
     const size_t pin_bytes = out_off + align(d * k * sizeof(float));
     cudaSetDevice(device);
-    if (cudaMallocHost(&pinned, pin_bytes) != cudaSuccess ||
-        cudaEventCreateWithFlags(&ready, cudaEventDisableTiming |
-                                       cudaEventBlockingSync) != cudaSuccess)
+    if (pinned.allocate(pin_bytes, device) != cudaSuccess ||
+        ready.create(cudaEventDisableTiming | cudaEventBlockingSync, device) !=
+            cudaSuccess)
       return false;
-    std::memset(pinned, 0, pin_bytes);
-    auto *base = static_cast<uint8_t *>(pinned);
+    std::memset(pinned.get(), 0, pin_bytes);
+    auto *base = pinned.get();
     input = reinterpret_cast<float *>(base);
     ids = reinterpret_cast<int32_t *>(base + id_off);
     weights = reinterpret_cast<float *>(base + weight_off);
     position = reinterpret_cast<int32_t *>(base + pos_off);
-    pinned_buffer = ggml_backend_cpu_buffer_from_ptr(pinned, pin_bytes);
+    pinned_buffer = ggml_backend_cpu_buffer_from_ptr(pinned.get(), pin_bytes);
     if (!pinned_buffer) return false;
     auto *x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 1, 1);
     auto *route = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, 1);
@@ -362,8 +358,8 @@ struct EarlyReadyLane {
     return output_device_buffer &&
         ggml_backend_tensor_alloc(output_device_buffer, gpu_output,
             ggml_backend_buffer_get_base(output_device_buffer)) == GGML_STATUS_SUCCESS &&
-        cudaStreamCreateWithFlags(&output_stream, cudaStreamNonBlocking) == cudaSuccess &&
-        cudaEventCreateWithFlags(&output_done, cudaEventDisableTiming) == cudaSuccess;
+        output_stream.create(cudaStreamNonBlocking, device) == cudaSuccess &&
+        output_done.create(cudaEventDisableTiming, device) == cudaSuccess;
   }
 
   bool prepare_gpu_tables(ggml_backend_t backend, ggml_context *outer_ctx,
@@ -430,13 +426,13 @@ struct EarlyReadyLane {
   }
 
   bool prepare_prediction_readback(ggml_backend_t backend, ggml_context *outer_ctx) {
-    if (cudaMallocHost(&prediction_pinned, 128 + k * sizeof(int32_t)) != cudaSuccess ||
-        cudaEventCreateWithFlags(&prediction_ready, cudaEventDisableTiming |
-                                cudaEventBlockingSync) != cudaSuccess) return false;
-    prediction_ids = static_cast<int32_t *>(prediction_pinned);
+    if (prediction_pinned.allocate(128 + k * sizeof(int32_t), device) != cudaSuccess ||
+        prediction_ready.create(cudaEventDisableTiming | cudaEventBlockingSync,
+                                device) != cudaSuccess) return false;
+    prediction_ids = reinterpret_cast<int32_t *>(prediction_pinned.get());
     prediction_epoch = reinterpret_cast<unsigned long long *>(
-        static_cast<uint8_t *>(prediction_pinned) + 64);
-    std::memset(prediction_pinned, 0, 128 + k * sizeof(int32_t));
+        prediction_pinned.get() + 64);
+    std::memset(prediction_pinned.get(), 0, 128 + k * sizeof(int32_t));
     auto *destination = ggml_dup_tensor(outer_ctx, prediction);
     prediction_marker_buffer = ggml_backend_alloc_buffer(backend, ggml_nbytes(destination));
     if (!prediction_marker_buffer || ggml_backend_tensor_alloc(prediction_marker_buffer,
@@ -460,8 +456,8 @@ struct EarlyReadyLane {
       return false;
     // Prediction storage is otherwise unused on the target; keep the mapped
     // IDs in a separate cache line from producer prediction/epoch snapshots.
-    if (cudaMallocHost(&stage_pinned, k * sizeof(int32_t)) != cudaSuccess) return false;
-    stage_ids = static_cast<int32_t *>(stage_pinned);
+    if (stage_pinned.allocate(k * sizeof(int32_t), device) != cudaSuccess) return false;
+    stage_ids = reinterpret_cast<int32_t *>(stage_pinned.get());
     return true;
   }
 

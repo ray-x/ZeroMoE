@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cuda_raii.hpp"
 #include "graph_config.hpp"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -156,8 +157,9 @@ struct Qwen4ExpStagePool {
     unsigned long long epoch = 0;
     const int32_t *predictions = nullptr;
     const unsigned long long *prediction_epoch = nullptr;
-    cudaEvent_t prediction_ready = nullptr, copied = nullptr;
-    uint8_t *bounce = nullptr;
+    cudaEvent_t prediction_ready = nullptr;  // borrowed from the EarlyReadyLane, not owned
+    moestream::cuda::CudaEvent copied;
+    moestream::cuda::PinnedBuffer<uint8_t> bounce;
     std::chrono::steady_clock::time_point copy_enqueued_at{};
   } banks[2];
   ggml_tensor *source[3] = {}, *weights[3] = {};
@@ -184,7 +186,7 @@ struct Qwen4ExpStagePool {
   unsigned int worker_delay_us = 0;
   // Cap on predicted cold experts staged per layer (0 = no cap).
   unsigned int stage_max = 0;
-  cudaStream_t copy_stream = nullptr;
+  moestream::cuda::CudaStream copy_stream;
   Qwen4ExpStageWorkService *service = nullptr;
   std::mutex mutex;
   std::condition_variable samples_finished;
@@ -212,14 +214,9 @@ struct Qwen4ExpStagePool {
 
   ~Qwen4ExpStagePool() {
     if (device >= 0) cudaSetDevice(device);
-    if (copy_stream) {
-      cudaStreamSynchronize(copy_stream);
-      cudaStreamDestroy(copy_stream);
-    }
-    for (auto &bank : banks) {
-      if (bank.copied) cudaEventDestroy(bank.copied);
-      if (bank.bounce) cudaFreeHost(bank.bounce);
-    }
+    // In-flight DMA must finish before anything it touches is freed; the stream,
+    // events and pinned bounce buffers are then released by their RAII owners.
+    if (copy_stream) cudaStreamSynchronize(copy_stream);
     for (auto buffer : buffers) if (buffer) ggml_backend_buffer_free(buffer);
     if (reference_buffer) ggml_backend_buffer_free(reference_buffer);
     if (reference_ctx) ggml_free(reference_ctx);
@@ -273,10 +270,10 @@ struct Qwen4ExpStagePool {
     epoch = reinterpret_cast<unsigned long long *>(base);
     slot_ids = reinterpret_cast<int32_t *>(base + id_offset);
     slot_epochs = reinterpret_cast<unsigned long long *>(base + ready_offset);
-    if (cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+    if (copy_stream.create(cudaStreamNonBlocking, device) != cudaSuccess) return false;
     for (auto &bank : banks) {
-      if (cudaMallocHost(reinterpret_cast<void **>(&bank.bounce), bytes) != cudaSuccess ||
-          cudaEventCreateWithFlags(&bank.copied, cudaEventDisableTiming) != cudaSuccess)
+      if (bank.bounce.allocate(bytes, device) != cudaSuccess ||
+          bank.copied.create(cudaEventDisableTiming, device) != cudaSuccess)
         return false;
     }
     return true;
@@ -481,7 +478,7 @@ struct Qwen4ExpStagePool {
         const int e = candidates[slot];
         const int gpu_slot = index * topk + slot;
         for (int p = 0; p < 3; ++p) {
-          auto *bounce = bank.bounce + plane_offsets[p] + slot * plane_bytes[p];
+          auto *bounce = bank.bounce.get() + plane_offsets[p] + slot * plane_bytes[p];
           const auto *src = static_cast<const uint8_t *>(source[p]->data) + e * source[p]->nb[2];
           const size_t row_bytes = ggml_row_size(source[p]->type, source[p]->ne[0]);
           for (int64_t row = 0; row < source[p]->ne[1]; ++row)

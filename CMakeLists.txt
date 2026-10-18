@@ -654,6 +654,11 @@ if(NOT MOESTREAM_CPU_ONLY)
             CUDA::cudart ggml ggml-cuda)
     endif()
 
+    # Unit test for include/cuda_raii.hpp (RAII device/pinned memory, events, streams).
+    add_executable(cuda_raii_test EXCLUDE_FROM_ALL tests/test_cuda_raii.cpp)
+    target_include_directories(cuda_raii_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(cuda_raii_test PRIVATE CUDA::cudart)
+
     # GGML-only Qwen CPU MoE timing probe.  The same source is also compiled
     # by bench/run_qwen_cpu_moe_compare.sh against llama.cpp's GGML shared
     # libraries, giving a layer-graph comparison without loading a model.
