@@ -1580,15 +1580,73 @@ bool MoeRouterService::route(MoePipelineContext &context) {
               record_pick(k, id, token_probs[id]);
             }
           } else {
-            std::partial_sort(scratch.scores.begin(),
-                              scratch.scores.begin() + topk,
-                              scratch.scores.begin() + n_experts,
-                              [](const ExpertScore &a, const ExpertScore &b) {
-                                return a.score > b.score;
-                              });
-            for (int k = 0; k < topk; ++k)
-              record_pick(k, scratch.scores[k].id,
-                          token_probs[scratch.scores[k].id]);
+            // Cache-aware selection (opt-in, decode only): among the best
+            // topk+12 candidates, add a small score bonus to experts already
+            // resident in VRAM (MOESTREAM_DSV41_CACHE_BONUS_VRAM) or DDR
+            // (MOESTREAM_DSV41_CACHE_BONUS_RAM) before taking the top-k, so a
+            // near-tie prefers an expert that needs no slow load. Weights still
+            // come from the unbiased router probability of whichever experts
+            // are chosen. This changes the model's output; 0 (default) = off.
+            static const float bonus_vram = [] {
+              const char *e = std::getenv("MOESTREAM_DSV41_CACHE_BONUS_VRAM");
+              return e ? (float)std::atof(e) : 0.0f;
+            }();
+            static const float bonus_ram = [] {
+              const char *e = std::getenv("MOESTREAM_DSV41_CACHE_BONUS_RAM");
+              return e ? (float)std::atof(e) : 0.0f;
+            }();
+            const bool cache_aware =
+                (bonus_vram > 0.0f || bonus_ram > 0.0f) && S == 1 &&
+                engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
+                ram_mgr.vram_cache;
+            if (cache_aware) {
+              constexpr int kExtra = 12;
+              const int nc = std::min(n_experts, topk + kExtra);
+              std::partial_sort(scratch.scores.begin(),
+                                scratch.scores.begin() + nc,
+                                scratch.scores.begin() + n_experts,
+                                [](const ExpertScore &a, const ExpertScore &b) {
+                                  return a.score > b.score;
+                                });
+              float adj[64];
+              int order[64];
+              for (int i = 0; i < nc; ++i) {
+                const int id = scratch.scores[i].id;
+                const bool in_vram = ram_mgr.vram_cache->main_layer_has(layer_idx, id);
+                const bool in_ram = !in_vram && ram_mgr.is_ram_resident(layer_idx, id);
+                adj[i] = scratch.scores[i].score + (in_vram ? bonus_vram : 0.0f) +
+                         (in_ram ? bonus_ram : 0.0f);
+                order[i] = i;
+              }
+              std::stable_sort(order, order + nc,
+                               [&](int a, int b) { return adj[a] > adj[b]; });
+              int changed = 0;
+              for (int k = 0; k < topk; ++k) {
+                const int idx = order[k];
+                if (idx >= topk) ++changed;
+                record_pick(k, scratch.scores[idx].id,
+                            token_probs[scratch.scores[idx].id]);
+              }
+              static std::atomic<uint64_t> n_calls{0}, n_changed{0};
+              n_changed.fetch_add((uint64_t)changed, std::memory_order_relaxed);
+              const uint64_t n = n_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+              if (n % 1560 == 0)
+                LOG_INFO("[DSV41-CACHE-BONUS] vram=%.3f ram=%.3f layer-tokens=%llu "
+                         "substituted experts=%llu (%.2f per token)\n",
+                         bonus_vram, bonus_ram, (unsigned long long)n,
+                         (unsigned long long)n_changed.load(),
+                         (double)n_changed.load() * 40.0 / (double)n);
+            } else {
+              std::partial_sort(scratch.scores.begin(),
+                                scratch.scores.begin() + topk,
+                                scratch.scores.begin() + n_experts,
+                                [](const ExpertScore &a, const ExpertScore &b) {
+                                  return a.score > b.score;
+                                });
+              for (int k = 0; k < topk; ++k)
+                record_pick(k, scratch.scores[k].id,
+                            token_probs[scratch.scores[k].id]);
+            }
           }
         }
         if (!gpu_router_handled && c.expert_weights_norm) {

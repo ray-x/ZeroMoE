@@ -1259,6 +1259,24 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             step < static_cast<int>(teacher_tokens.size());
         const bool skip_teacher_sampling =
             has_teacher_token && teacher_force_skip_sampling_enabled();
+        // MOESTREAM_TEACHER_FORCE_NLL=1: log -log p(forced token) under this
+        // step's raw logits (natural log), so two configs can be compared on
+        // a fixed text by mean NLL (quality) as well as by speed.
+        if (has_teacher_token) {
+            static const bool log_nll = [] {
+                const char *e = std::getenv("MOESTREAM_TEACHER_FORCE_NLL");
+                return e && e[0] == '1';
+            }();
+            const int ft = teacher_tokens[step];
+            if (log_nll && ft >= 0 && ft < V) {
+                float mx = logits[0];
+                for (int i = 1; i < V; ++i) mx = std::max(mx, logits[i]);
+                double sum = 0.0;
+                for (int i = 0; i < V; ++i) sum += std::exp((double)logits[i] - mx);
+                const double nll = (double)mx + std::log(sum) - (double)logits[ft];
+                LOG_STREAM_INFO() << "[TF-NLL] step=" << step << " nll=" << nll << "\n";
+            }
+        }
         const int sampled_token = skip_teacher_sampling
                                       ? teacher_tokens[step]
                                       : sampler.sample(logits, temperature, top_p);
