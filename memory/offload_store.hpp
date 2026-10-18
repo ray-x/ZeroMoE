@@ -28,6 +28,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <sys/stat.h>
+#include <unordered_set>
 #include <functional>
 #include <condition_variable>
 #include <future>
@@ -381,7 +384,10 @@ public:
   bool drop_page_cache = true;
   std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
   ModelReader() = default;
-  ~ModelReader() override { for (int fd : fds_) if (fd >= 0) ::close(fd); }
+  ~ModelReader() override {
+    for (int fd : fds_) if (fd >= 0) ::close(fd);
+    for (int fd : mirror_fds_) if (fd >= 0) ::close(fd);
+  }
   ModelReader(const ModelReader &) = delete;
   ModelReader &operator=(const ModelReader &) = delete;
 
@@ -401,11 +407,37 @@ public:
         const uint64_t per = ggml_row_bytes(t.type, t.dims[0]) * t.dims[1];
         if (per == 0 || t.dims[2] == 0) continue;
         Proj &p = layers_[L].p[k];
-        p = {fd, h.data_start + t.offset, per, t.dims[2]};
+        p = {fd, h.data_start + t.offset, per, t.dims[2], static_cast<int>(fds_.size()) - 1};
       }
     }
     return !layers_.empty();
   }
+  // Sparse second copy of the model on another drive (gguf_tool mirror-subset): same shard basenames and offsets, only the
+  // experts listed in <dir>/mirror_subset.tsv hold data. Those experts are read from there, all others from the main copy.
+  // Call after open(). Returns the number of experts served by the mirror (0 = unusable, main copy only).
+  size_t open_mirror(const std::string &dir, const std::vector<std::string> &shards, std::string *err = nullptr) {
+    std::ifstream idx(dir + "/mirror_subset.tsv");
+    if (!idx) { if (err) *err = "no mirror_subset.tsv in " + dir; return 0; }
+    std::vector<int> fds;
+    for (const std::string &path : shards) {
+      const size_t sl = path.find_last_of('/');
+      const std::string base = sl == std::string::npos ? path : path.substr(sl + 1);
+      const int fd = ::open((dir + "/" + base).c_str(), O_RDONLY);
+      struct stat sp, sm;
+      if (fd < 0 || ::stat(path.c_str(), &sp) || ::fstat(fd, &sm) || sp.st_size != sm.st_size) {
+        if (fd >= 0) ::close(fd);
+        for (int f : fds) if (f >= 0) ::close(f);
+        if (err) *err = "mirror shard " + base + " missing or differs in size";
+        return 0;
+      }
+      fds.push_back(fd);
+    }
+    int l, e;
+    while (idx >> l >> e) mirror_set_.insert(detail::key(l, e));
+    mirror_fds_ = std::move(fds);
+    return mirror_set_.size();
+  }
+  std::atomic<uint64_t> mirror_reads{0};
   bool contains(int layer, int expert) const override {
     auto it = layers_.find(layer);
     if (it == layers_.end()) return false;
@@ -420,13 +452,16 @@ public:
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
     reads.fetch_add(1, std::memory_order_relaxed);
     if (!contains(layer, expert)) return ReadStatus::NotFound;
+    const bool use_mirror = !mirror_fds_.empty() && mirror_set_.count(detail::key(layer, expert)) != 0;
+    if (use_mirror) mirror_reads.fetch_add(1, std::memory_order_relaxed);
     // The three planes sit at unrelated file offsets: read them concurrently (queue depth 3) instead of back to back.
     auto one = [&](int k) {
       const Proj &p = layers_.at(layer).p[k];
       const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
-      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
+      const int fd = use_mirror ? mirror_fds_[static_cast<size_t>(p.shard)] : p.fd;
+      if (!detail::pread_all(fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
       // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
-      if (drop_page_cache) ::posix_fadvise(p.fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
+      if (drop_page_cache) ::posix_fadvise(fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
       return true;
     };
     auto f1 = std::async(std::launch::async, one, 1);
@@ -439,9 +474,11 @@ public:
   }
 
 private:
-  struct Proj { int fd = -1; uint64_t offset = 0, per_expert = 0, n_experts = 0; };
+  struct Proj { int fd = -1; uint64_t offset = 0, per_expert = 0, n_experts = 0; int shard = 0; };
   struct Layer { Proj p[3]; };
   std::vector<int> fds_;
+  std::vector<int> mirror_fds_;
+  std::unordered_set<uint64_t> mirror_set_;
   std::unordered_map<int, Layer> layers_;
 };
 

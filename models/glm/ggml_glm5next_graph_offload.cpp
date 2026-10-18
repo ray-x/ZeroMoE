@@ -63,6 +63,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
     sc.plane_bytes.push_back(pb);
   }
   sc.huge_pages = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") == "1";
+  sc.mirror_dir = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MIRROR");
   sc.store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
   {
     const std::string first_shard = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
