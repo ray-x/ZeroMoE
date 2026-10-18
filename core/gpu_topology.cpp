@@ -1282,7 +1282,13 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
             // Gated on !in_prefill -- see that field's own comment
             // (gpu_topology.hpp) for why prefill NEVER promotes from the
             // active layer into the main cache, regardless of hit_count.
-            if (!in_prefill && slot.hit_count >= active_layer_promote_threshold) {
+            const bool repeat_hit = slot.hit_count >= active_layer_promote_threshold;
+            // A speculative fill that no dispatch ever touched is only a
+            // guess; every other decode slot is a real miss that was used.
+            const bool promote_miss =
+                decode_promote_all_misses && slot.upload_ready &&
+                (!slot.pilot_speculative_fill || slot.prewarm_touched);
+            if (!in_prefill && (repeat_hit || promote_miss)) {
                 // The active pool is sized by its largest slab, while the
                 // compact main cache has per-layer slab sizes. Promote only
                 // the bytes actually uploaded for this identity; using the
@@ -1292,9 +1298,16 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
                     slot.last_upload_bytes > 0
                         ? std::min(slot.last_upload_bytes, slot.size)
                         : slot.size;
-                promote_active_to_main(slot.layer_idx, slot.expert_id,
-                                       slot.device_ptr, payload_bytes, on_promoted,
-                                       slot.gpu_id);
+                if (repeat_hit) {
+                    promote_active_to_main(slot.layer_idx, slot.expert_id,
+                                           slot.device_ptr, payload_bytes, on_promoted,
+                                           slot.gpu_id);
+                } else {
+                    // COPY-style, same GPU: keep the RAM copy, no host bounce.
+                    promote_active_to_main(slot.layer_idx, slot.expert_id,
+                                           slot.device_ptr, payload_bytes, nullptr,
+                                           slot.gpu_id, /*same_gpu_victim=*/true);
+                }
             }
             // Waste accounting -- the main "swap out the one not used" path,
             // expected to catch the bulk of any real waste this feature
@@ -1528,7 +1541,8 @@ ExpertLocation* GpuTopology::find_active_expert_wait(
 ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,
                                                      const uint8_t* device_src, size_t bytes,
                                                      const std::function<void(int, int)>& on_promoted,
-                                                     int src_gpu_id) {
+                                                     int src_gpu_id,
+                                                     bool same_gpu_victim) {
     if (expert_vram_cache_cap == 0 || !device_src || bytes == 0) return nullptr;
     GPU_TOPO_TIMED_LOCK(lock);
 
@@ -1543,7 +1557,9 @@ ExpertLocation* GpuTopology::promote_active_to_main(int layer, int expert_id,
     }
 
     int old_layer = -1, old_expert = -1;
-    ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert, -1, layer);
+    ExpertLocation* slot = evict_lru(bytes, &old_layer, &old_expert,
+                                     same_gpu_victim && src_gpu_id >= 0 ? src_gpu_id : -1,
+                                     layer);
     if (!slot || !slot->device_ptr) return nullptr;
 
     // Same VRAM->RAM salvage as upload_expert() -- must run before the

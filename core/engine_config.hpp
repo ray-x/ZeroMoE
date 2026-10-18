@@ -1718,6 +1718,12 @@ struct EngineConfig {
   // narrower than the RAM tier's whole-conversation lifetime, so a repeat
   // hit here is already a comparatively strong signal.
   int active_layer_promote_hit_threshold = 1;
+  // Decode only: promote every real active-layer miss into the main VRAM cache
+  // when its layer window closes (COPY-style, same-GPU victim), instead of only
+  // those with a repeat hit -- which never happens in decode, leaving the main
+  // cache frozen at its startup contents. See GpuTopology::
+  // decode_promote_all_misses. Off by default (A/B).
+  bool decode_promote_all_misses = false;
 
   // 2026-08-26: redirect DEPTH-1/ATTN-PILOT's speculative one-layer-ahead
   // RAM->VRAM promotion (ram_vram_promote_top_k/dynamic_layer,
@@ -3159,6 +3165,8 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
       doc.root.get_bool("use_active_layer_area", use_active_layer_area);
   active_layer_promote_hit_threshold = doc.root.get_int(
       "active_layer_promote_hit_threshold", active_layer_promote_hit_threshold);
+  decode_promote_all_misses =
+      doc.root.get_bool("decode_promote_all_misses", decode_promote_all_misses);
   speculative_promote_to_active_layer =
       doc.root.get_bool("speculative_promote_to_active_layer",
                         speculative_promote_to_active_layer);

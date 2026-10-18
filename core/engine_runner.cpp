@@ -221,6 +221,7 @@ std::expected<void, std::string> EngineRunner::init_host_and_gpu() {
   ram_mgr.disk_batch_padding_evict_dup = config.disk_batch_padding_evict_dup;
   gpu.topology.active_layer_promote_threshold =
       std::max(1, config.active_layer_promote_hit_threshold);
+  gpu.topology.decode_promote_all_misses = config.decode_promote_all_misses;
   gpu.topology.speculative_active_layer_fill =
       config.speculative_promote_to_active_layer;
   // The CUDA runtime reports all physical adapters, but the TOML's

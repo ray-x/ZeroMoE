@@ -516,6 +516,17 @@ public:
     // is already a comparatively strong signal.
     int active_layer_promote_threshold = 1;
 
+    // EngineConfig::decode_promote_all_misses: at a decode layer's end, promote
+    // EVERY real active-layer miss into the main VRAM cache instead of only the
+    // ones with a repeat hit. In decode an active slot is freed when its layer
+    // window closes, long before the same expert can be touched again, so the
+    // repeat-hit rule never fires and the main cache stays frozen at its
+    // startup contents (measured: 0 hits / 0 promotions over a whole decode).
+    // Promotions are COPY-style (the RAM tier keeps its slab: on_promoted is
+    // not called) and take their victim from the SAME GPU as the active slot,
+    // so the copy is a plain device-to-device one with no host bounce.
+    bool decode_promote_all_misses = false;
+
     // Mirrors RAMSafetyManager::in_prefill (same set site, execution_layer.
     // cpp's layers_forward_gguf, S>1 = prefill). REAL-HARDWARE FINDING
     // (2026-08-12): active_layer_promote_threshold=1 means literally any
@@ -3114,7 +3125,8 @@ public:
     ExpertLocation* promote_active_to_main(int layer, int expert_id,
                                             const uint8_t* device_src, size_t bytes,
                                             const std::function<void(int, int)>& on_promoted = nullptr,
-                                            int src_gpu_id = -1);
+                                            int src_gpu_id = -1,
+                                            bool same_gpu_victim = false);
 
     // Transfer a small result vector between GPUs (e.g., expert output → core)
     void cross_device_transfer(float* dst, int dst_device,
