@@ -358,6 +358,13 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     add_executable(moestream
         src/main.cpp
+        src/engine_runner.cpp
+        src/engine_runner_model.cpp
+        src/engine_runner_cache.cpp
+        src/engine_runner_dense.cpp
+        src/engine_runner_ram.cpp
+        src/engine_runner_preload.cpp
+        src/engine_runner_session.cpp
         src/perf_report_summary.cpp
         src/perf_report_dump_a.cpp
         src/perf_report_dump_b.cpp
