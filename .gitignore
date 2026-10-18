@@ -1,0 +1,68 @@
+# --- Build outputs & compiled artifacts (NEVER commit these) ---
+build/
+build_*/
+/builds*/*
+tests/bench_outproj
+tests/test_components
+tools/dump_expert_bytes
+glm_runs/probe
+glm_runs/probe_live
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.lib
+
+# --- Model / binary data blobs ---
+*.bin
+*.pkl
+*.npy
+*.npz
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.engine
+
+# --- Logs & run outputs (NEVER commit these) ---
+*.log
+*.log.*
+*.out
+*.stdout
+*.stderr
+*.done
+*.bad
+*.bad[0-9]*
+*.bad*.*
+*.csv
+*.tsv
+.moestream_usage*
+logs/*.log
+glm_runs/*.log
+glm_runs/*.csv
+glm_runs/*.stdout
+glm_runs/*.out
+glm_runs/*.done
+
+# --- Test run outputs ---
+tests/moe_usage_survey/responses/
+tests/moe_usage_survey/index.tsv
+tests/moe_usage_survey/*.csv
+
+# --- Python caches ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# --- Tool/IDE caches ---
+.serena/
+.claude/
+.idea/
+.vscode-cache/
