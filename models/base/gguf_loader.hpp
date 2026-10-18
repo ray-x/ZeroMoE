@@ -16,6 +16,7 @@
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -473,6 +474,21 @@ public:
   std::vector<int> mirror_shard_fds;
   std::vector<bool> mirror_shard_direct_io;
 
+  // Sparse-mirror index (gguf_tool mirror-subset): when <mirror_dir>/mirror_subset.tsv exists, the mirror holds ONLY
+  // the listed (layer, expert) pairs; every other range in it is a hole. resolve_replica() then sends each expert to
+  // exactly one drive. Empty = a full mirror, and the old behaviour (including the intra-expert split) is unchanged.
+  std::unordered_set<uint64_t> mirror_subset;
+  bool mirror_is_subset = false;
+  static uint64_t mirror_key(int layer, int expert) {
+    return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert;
+  }
+  // `replica` is what the caller asked for (0 primary, 1 mirror, -1 split). With a sparse mirror the answer depends
+  // on where this expert actually lives.
+  int resolve_replica(int layer, int expert, int replica) const {
+    if (!mirror_is_subset || replica == 0) return replica;
+    return mirror_subset.count(mirror_key(layer, expert)) ? 1 : 0;
+  }
+
   // One cuFile handle per shard_fds, registered by enable_cufile() below
   // (empty/all-invalid until then). Index-matched to shard_fds/
   // shard_direct_io, same convention as everything else per-shard here.
@@ -746,6 +762,18 @@ public:
       mirror_shard_direct_io[i] = got_direct;
       register_mirror_fd(fd);  // perf_timer.hpp -- lets submit_and_wait attribute real read bytes per drive
       n_ok++;
+    }
+    mirror_subset.clear();
+    mirror_is_subset = false;
+    {
+      std::ifstream idx(mirror_dir + (mirror_dir.back() == '/' ? "" : "/") + "mirror_subset.tsv");
+      if (idx) {
+        int l, e;
+        while (idx >> l >> e) mirror_subset.insert(mirror_key(l, e));
+        mirror_is_subset = true;
+        LOG_STREAM_INFO() << "[MIRROR] Sparse mirror: " << mirror_subset.size()
+                          << " expert(s) live on the mirror; all others are read from the primary.\n";
+      }
     }
     LOG_STREAM_INFO() << "[MIRROR] Second replica: " << n_ok << "/" << shard_paths.size()
                       << " shard(s) opened from " << mirror_dir

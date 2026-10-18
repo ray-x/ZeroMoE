@@ -2160,6 +2160,8 @@ public:
                                      io_uring_backend::ReadRequest* out_reqs,
                                      int& out_n, size_t& out_total,
                                      int replica = 0) {
+        // A sparse mirror holds only some experts: pick the one drive that has this one.
+        replica = model_file.resolve_replica(layer_idx, expert_id, replica);
         // Projection-compact graph arenas have no packed per-expert slab, so
         // point the three startup requests directly at their final planes.
         // Runtime misses are not expected for a complete immutable graph

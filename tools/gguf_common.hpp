@@ -35,6 +35,7 @@ int cmd_plan(int argc, char **argv);
 int cmd_dma(int argc, char **argv);
 int cmd_mix(int argc, char **argv);
 int cmd_offload(int argc, char **argv);
+int cmd_mirror_subset(int argc, char **argv);
 
 // ---- inline helpers shared by more than one subcommand ----
 
