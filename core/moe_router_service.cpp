@@ -1617,6 +1617,116 @@ bool MoeRouterService::route(MoePipelineContext &context) {
             std::fflush(route_log);
           }
         }
+        // Offline pilot study (MOESTREAM_ROUTER_IN_LOG=<path>): binary records
+        // {int32 layer, int32 S, int32 s, float32 x[D]} holding this layer's
+        // router input, so a pilot (layer N+1's router applied to layer N's
+        // hidden state) can be replayed offline. Off by default.
+        if (const char *in_log_path = std::getenv("MOESTREAM_ROUTER_IN_LOG");
+            in_log_path && *in_log_path) {
+          static std::mutex in_log_mutex;
+          static FILE *in_log = std::fopen(in_log_path, "wb");
+          if (in_log) {
+            std::lock_guard<std::mutex> lock(in_log_mutex);
+            const int32_t hdr[3] = {layer_idx, S, s};
+            std::fwrite(hdr, sizeof(int32_t), 3, in_log);
+            std::fwrite(scratch.normed.data() + (size_t)s * D, sizeof(float),
+                        (size_t)D, in_log);
+          }
+        }
+        // DeepSeek V4.1 decode pilot (MOESTREAM_DSV41_PILOT_K=k, default off):
+        // apply layer N+1's real router to this layer's router input and push
+        // prefetch hints for the top-k experts that are in neither VRAM nor
+        // DDR. The graph decode never runs the engine's older pilots, and
+        // history-based guesses name ~0% of the cold experts, while this
+        // names about half of them at k=6 (offline replay, 5 prompts).
+        if (S == 1 &&
+            engine.family_ops.family == ModelFamily::DeepSeek_V41) {
+          static const int pilot_k = [] {
+            const char *e = std::getenv("MOESTREAM_DSV41_PILOT_K");
+            const int k = e ? std::atoi(e) : 0;
+            return std::min(std::max(k, 0), 16);
+          }();
+          const int target = layer_idx + 1;
+          if (pilot_k > 0 && target < c.n_layers) {
+            const auto wit = engine.resident_layers.find(
+                "blk." + std::to_string(target) + ".ffn_gate_inp.weight");
+            const auto bit = engine.resident_layers.find(
+                "blk." + std::to_string(target) + ".exp_probs_b.bias");
+            const bool have_w = wit != engine.resident_layers.end() &&
+                                wit->second.host_ptr &&
+                                static_cast<int>(wit->second.meta.type) == 30 &&
+                                wit->second.meta.shape.size() >= 2 &&
+                                (int)wit->second.meta.shape[0] == D &&
+                                (int)wit->second.meta.shape[1] == n_experts;
+            if (have_w && n_experts <= 512) {
+              const uint16_t *wbf = reinterpret_cast<const uint16_t *>(wit->second.host_ptr);
+              const float *bias =
+                  bit != engine.resident_layers.end() && bit->second.host_ptr &&
+                          bit->second.meta.type == GGUFType::F32
+                      ? reinterpret_cast<const float *>(bit->second.host_ptr)
+                      : nullptr;
+              const float *x = scratch.normed.data() + (size_t)s * D;
+              float score[512];
+#pragma omp parallel for schedule(static) num_threads(attn_score_threads())
+              for (int e = 0; e < n_experts; ++e) {
+                const uint16_t *row = wbf + (size_t)e * D;
+                __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+                int i = 0;
+                for (; i + 32 <= D; i += 32) {
+                  const __m512 w0 = _mm512_castsi512_ps(_mm512_slli_epi32(
+                      _mm512_cvtepu16_epi32(_mm256_loadu_si256(
+                          reinterpret_cast<const __m256i *>(row + i))), 16));
+                  const __m512 w1 = _mm512_castsi512_ps(_mm512_slli_epi32(
+                      _mm512_cvtepu16_epi32(_mm256_loadu_si256(
+                          reinterpret_cast<const __m256i *>(row + i + 16))), 16));
+                  acc0 = _mm512_fmadd_ps(w0, _mm512_loadu_ps(x + i), acc0);
+                  acc1 = _mm512_fmadd_ps(w1, _mm512_loadu_ps(x + i + 16), acc1);
+                }
+                float z = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+                for (; i < D; ++i) {
+                  uint32_t u = (uint32_t)row[i] << 16;
+                  float w; std::memcpy(&w, &u, 4);
+                  z += w * x[i];
+                }
+                const float sp = z > 0.0f ? z + std::log1p(std::exp(-z))
+                                          : std::log1p(std::exp(z));
+                score[e] = std::sqrt(sp) + (bias ? bias[e] : 0.0f);
+              }
+              int pick[16];
+              const int kk = std::min(pilot_k, 16);
+              for (int k = 0; k < kk; ++k) {
+                int best = 0;
+                float bs = -1e30f;
+                for (int e = 0; e < n_experts; ++e)
+                  if (score[e] > bs) { bs = score[e]; best = e; }
+                pick[k] = best;
+                score[best] = -1e30f;
+              }
+              static std::atomic<uint64_t> n_pred{0}, n_resident{0}, n_hinted{0};
+              for (int k = 0; k < kk; ++k) {
+                const int e = pick[k];
+                const bool in_vram =
+                    ram_mgr.vram_cache &&
+                    (ram_mgr.vram_cache->active_layer_has(target, e) ||
+                     ram_mgr.vram_cache->main_layer_has(target, e));
+                if (in_vram || ram_mgr.is_ram_resident(target, e)) {
+                  n_resident.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                  async_io_queue.push_hint(target, e);
+                  n_hinted.fetch_add(1, std::memory_order_relaxed);
+                }
+              }
+              const uint64_t n = n_pred.fetch_add(1, std::memory_order_relaxed) + 1;
+              if (n % 1560 == 0)
+                LOG_INFO("[DSV41-PILOT] k=%d predictions=%llu already-resident guesses=%llu "
+                         "hints pushed=%llu (%.1f per token)\n", pilot_k,
+                         (unsigned long long)n,
+                         (unsigned long long)n_resident.load(),
+                         (unsigned long long)n_hinted.load(),
+                         (double)n_hinted.load() * 39.0 / (double)n);
+            }
+          }
+        }
 
         // Router-selection trace: same VERBOSE gate as layers_forward_gguf's
         // [TRACE] hidden-norm dump, but for CONTENT (which experts, what
