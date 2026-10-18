@@ -31,6 +31,34 @@ Naming follows llama.cpp's flat, prefix-named style (`engine_runner_*.cpp`,
 `perf_report_*.cpp`) rather than adding directories, so `git mv` churn and merge
 conflicts with parallel sessions stay low. `include/perf/` is the one new directory.
 
+## Families and versions: one implementation per family
+
+Rule: a `ModelFamily` is one implementation; a version of that family is data, not a
+copy. Concretely:
+
+* A new version of an existing architecture (same GGUF tensors, different sizes or
+  flags) adds no enum value and no files. Differences come from GGUF metadata
+  (`ArchitectureConfig`) or, if needed, a capability flag on `FamilyOps`.
+* A new enum value is only for a genuinely different tensor layout. Its
+  `FamilyOps` row is then built from the same shared pieces as its siblings, not
+  pasted from them.
+* Files are named by family (`ggml_<family>_graph*.cpp`), never by version.
+
+How the current code measures up:
+
+| case | state |
+|---|---|
+| GLM-5.2 and GLM-5.3 (non-Flash) | One family, `GLM_DSA`, shared by both (and by `DeepSeek_V3`, which reuses the same `FamilyOps` row for its MLA core). This is the model to follow. |
+| GLM-5.3-Flash | `GLM5NEXT` is a different upstream architecture (recurrent KDA layers plus absorbed MLA), so it stays its own family, but it must reuse shared pieces instead of copies. |
+| DeepSeek-V4 vs V4.1 | Were two families with separate graph builders and attention paths: the counter-example. V4 is deprecated (commit `DEPRECATE DeepSeek-V4`); V4.1 is the DeepSeek family going forward. |
+| Hyper-connections | Was pasted into three `FamilyOps` rows (V4, V4.1, GLM5Next). Now `use_hyper_connections(ops, c)` in `models/family_ops.cpp` is the single place; V4.1 and GLM5Next call it. |
+
+Open duplication to fold into shared pieces when the owners of those paths are ready:
+the `dsv4_*` helpers still living beside the V4.1 code and used through
+`attention_layer.cpp`; the `deepseek_v4_full_graph_output_ready` flag (V4.1 sets it
+under a V4 name); and the near-identical per-family `FullGraphModel` classes in
+`models/full_graph_models.cpp`.
+
 ## Still over 3k lines (not touched)
 
 | file | lines | why left alone |

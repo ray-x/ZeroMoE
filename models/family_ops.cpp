@@ -518,6 +518,20 @@ static void alloc_qwen4exp_cache(StreamingEngine &engine,
   }
 }
 
+// Shared by every family that uses mHC hyper-connections (DeepSeek-V4.1,
+// GLM5Next): the per-layer collapse/combine hooks are the same form in all of
+// them, only the model-level collapse differs and lives in the family's own
+// code. Wired only when the GGUF actually sets hc_mult > 1; otherwise the
+// family keeps the plain residual add every other family uses.
+static void use_hyper_connections(FamilyOps &ops, const ArchitectureConfig &c) {
+  ops.uses_hyper_connections = (c.hc_mult > 1);
+  ops.hc_mult = c.hc_mult;
+  if (c.hc_mult > 1) {
+    ops.hc_pre_fn = &hc_pre_collapse;
+    ops.hc_post_fn = &hc_post_combine;
+  }
+}
+
 // ---------------------------------------------------------------------
 // resolve_family_ops -- the single ModelFamily -> FamilyOps table.
 // ---------------------------------------------------------------------
@@ -564,14 +578,9 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     ops.attn_type = AttentionType::MLA;
     ops.cache_shape = CacheShape::MLARawSWA;
     ops.default_gating = GatingFunc::SqrtSoftplus;
-    ops.uses_hyper_connections = (c.hc_mult > 1);
-    ops.hc_mult = c.hc_mult;
+    use_hyper_connections(ops, c);
     ops.attention_fn = &dsv41_attention_gguf;
     ops.alloc_cache_fn = &alloc_dsv41_swa_cache;
-    if (c.hc_mult > 1) {
-      ops.hc_pre_fn = &hc_pre_collapse;
-      ops.hc_post_fn = &hc_post_combine;
-    }
     ops.layer_input_fn = &deepseek41_engram_layer_input;
     break;
 
@@ -589,14 +598,9 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     ops.attn_type = AttentionType::MLA;
     ops.cache_shape = CacheShape::MLAAbsorbed;
     ops.default_gating = GatingFunc::Sigmoid;
-    ops.uses_hyper_connections = (c.hc_mult > 1);
-    ops.hc_mult = c.hc_mult;
+    use_hyper_connections(ops, c);
     ops.attention_fn = &glm5next_attention_gguf;
     ops.alloc_cache_fn = &alloc_glm5next_cache;
-    if (c.hc_mult > 1) {
-      ops.hc_pre_fn = &hc_pre_collapse;
-      ops.hc_post_fn = &hc_post_combine;
-    }
     break;
 
   case ModelFamily::Qwen4Exp:
