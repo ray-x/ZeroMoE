@@ -458,7 +458,18 @@ static bool ensure_wuk_wuv_cached(StreamingEngine &engine, int layer_idx) {
 // reserve is a direct, scoped fix: hold back a fixed slice BEFORE either
 // budget check runs, so d_x/d_y's later prefill-time grow has somewhere to
 // go regardless of how aggressively qabsorb/score/WUV spend the rest.
-constexpr size_t kDenseScratchReserveBytes = 256ULL * 1024 * 1024; // 256MB
+// Prefill grows d_x/d_y/d_score_combined with the batch (about 65 KB + 110 KB per token); 256MB covers decode and
+// short prompts but a 426-token GLM-5.3 prefill still failed 446 cudaMallocs and ran attn_output on the CPU
+// (outproj 131 s of 400 s). MOESTREAM_DENSE_SCRATCH_RESERVE_MB raises it.
+static size_t dense_scratch_reserve_bytes() {
+  static const size_t v = [] {
+    const char *e = std::getenv("MOESTREAM_DENSE_SCRATCH_RESERVE_MB");
+    const long mb = (e && e[0]) ? std::atol(e) : 256;
+    return (size_t)(mb > 0 ? mb : 256) * 1024ULL * 1024ULL;
+  }();
+  return v;
+}
+#define kDenseScratchReserveBytes dense_scratch_reserve_bytes()
 
 void warm_mla_absorb_cache(StreamingEngine &engine) {
   const auto &c = engine.model_file.architecture_config;
