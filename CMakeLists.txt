@@ -358,6 +358,10 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     add_executable(moestream
         src/main.cpp
+        src/perf_report_summary.cpp
+        src/perf_report_dump_a.cpp
+        src/perf_report_dump_b.cpp
+        src/perf_report_stats.cpp
         src/execution_layer.cpp
         src/exl3_cpu.cpp
         src/exl3_model_loader.cpp
