@@ -322,7 +322,7 @@ int main(int argc, char **argv) {
 
   // Prefill: process all prompt tokens at once.
   std::vector<float> hidden((size_t)input_ids.size() * D);
-  engine.qwen4exp_ple_token_history.assign(input_ids.begin(), input_ids.end());
+  engine.qwen4exp.ple_token_history.assign(input_ids.begin(), input_ids.end());
   for (size_t i = 0; i < input_ids.size(); ++i) {
     if (!cpu_embed_token(engine, input_ids[i], hidden.data() + i * D, D)) {
       std::cerr << "[CPU-MAIN] Embedding lookup failed.\n";
@@ -383,7 +383,7 @@ int main(int argc, char **argv) {
   const auto decode_start = std::chrono::steady_clock::now();
   for (int i = 0; i < engine.config.max_new_tokens; ++i) {
     generated.push_back(next_tok);
-    engine.qwen4exp_ple_token_history.push_back(next_tok);
+    engine.qwen4exp.ple_token_history.push_back(next_tok);
 
     // Decode one token.
     std::vector<float> single_hidden((size_t)D);

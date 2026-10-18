@@ -133,7 +133,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
     std::vector<float> hidden(cfg.hidden), logits(cfg.vocab);
     std::vector<double> layer_seconds(static_cast<size_t>(cfg.n_layers), 0.0);
     const auto forward = [&](int token, int position) {
-      engine.qwen4exp_ple_token_history.push_back(token);
+      engine.qwen4exp.ple_token_history.push_back(token);
       if (!cpu_embed_token(engine, token, hidden.data(), cfg.hidden))
         throw std::runtime_error("EXL3 token embedding failed");
       for (int layer = 0; layer < cfg.n_layers; ++layer) {
@@ -142,23 +142,23 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
           throw std::runtime_error("EXL3 forward failed at layer " + std::to_string(layer));
         layer_seconds[static_cast<size_t>(layer)] +=
             std::chrono::duration<double>(std::chrono::steady_clock::now() - layer_begin).count();
-        for (float value : engine.qwen4exp_hc_stream_buf)
+        for (float value : engine.qwen4exp.hc_stream_buf)
           if (!std::isfinite(value))
             throw std::runtime_error("Non-finite EXL3 layer " + std::to_string(layer));
         if (position == 0 && layer % 8 == 0)
           LOG_STREAM_INFO() << "[EXL3] Initial token layer " << layer << " complete\n";
       }
-      engine.qwen4exp_ple_next_pos = position + 1;
+      engine.qwen4exp.ple_next_pos = position + 1;
     };
     const auto start = std::chrono::steady_clock::now();
     LOG_STREAM_INFO() << "[EXL3] Prefill " << tokens.size() << " tokens\n";
     const int prefill_rows = static_cast<int>(tokens.size());
     std::vector<float> prefill_hidden(
         static_cast<size_t>(prefill_rows) * cfg.hidden);
-    engine.qwen4exp_ple_token_history.clear();
-    engine.qwen4exp_ple_token_history.reserve(tokens.size());
+    engine.qwen4exp.ple_token_history.clear();
+    engine.qwen4exp.ple_token_history.reserve(tokens.size());
     for (int position = 0; position < prefill_rows; ++position) {
-      engine.qwen4exp_ple_token_history.push_back(
+      engine.qwen4exp.ple_token_history.push_back(
           tokens[static_cast<size_t>(position)]);
       if (!cpu_embed_token(
               engine, tokens[static_cast<size_t>(position)],
@@ -176,7 +176,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
           std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                         layer_begin)
               .count();
-      for (float value : engine.qwen4exp_hc_stream_buf)
+      for (float value : engine.qwen4exp.hc_stream_buf)
         if (!std::isfinite(value))
           throw std::runtime_error("Non-finite EXL3 prefill layer " +
                                    std::to_string(layer));
@@ -188,7 +188,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
                 prefill_hidden.data() +
                     static_cast<size_t>(prefill_rows - 1) * cfg.hidden,
                 static_cast<size_t>(cfg.hidden) * sizeof(float));
-    engine.qwen4exp_ple_next_pos = prefill_rows;
+    engine.qwen4exp.ple_next_pos = prefill_rows;
     CPUSampler sampler;
     const double prefill_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     int output_tokens = 0;

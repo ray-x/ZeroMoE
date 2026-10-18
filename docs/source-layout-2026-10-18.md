@@ -31,6 +31,19 @@ Naming follows llama.cpp's flat, prefix-named style (`engine_runner_*.cpp`,
 `perf_report_*.cpp`) rather than adding directories, so `git mv` churn and merge
 conflicts with parallel sessions stay low. `include/perf/` is the one new directory.
 
+## CPU engine state
+
+`CPUEngine` carried seven Qwen4Exp members (`qwen4exp_conv_history`, `_recur_state`,
+`_hc_stream_buf`, `_hc_inject`, `_ple_conv_history`, `_ple_token_history`,
+`_ple_next_pos`). They are now one `Qwen4ExpCpuState qwen4exp;`
+(`include/qwen4exp_cpu_state.hpp`), so the next architecture adds its own small state
+struct instead of more members here. An aggregate member, not a polymorphic
+`unique_ptr<ModelExecutionState>`: the types are known at compile time, so a base class
+and casts would add indirection and no safety. Scope is `CPUEngine` only; the same names
+on `StreamingEngine` are used by ~80 sites in the graph files other sessions edit, so
+they are left alone. Touches `exl3_decode.cpp` (rename only); EXL3 is WIP and is
+verified by compiling, not running.
+
 ## Families and versions: one implementation per family
 
 Rule: a `ModelFamily` is one implementation; a version of that family is data, not a

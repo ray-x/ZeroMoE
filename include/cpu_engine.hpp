@@ -7,6 +7,7 @@
 //   * Tokenizer and generation state
 #pragma once
 
+#include "qwen4exp_cpu_state.hpp"
 #include "cpu_config.hpp"
 #include "gguf_loader.hpp"
 #include "gguf_tokenizer.hpp"
@@ -227,15 +228,8 @@ struct CPUEngine {
   uint64_t exl3_ggml_custom_ffns = 0;
   uint64_t exl3_native_gpu_fallback_ffns = 0;
 
-  // Qwen4Exp recurrent/HC state. These are allocated lazily by the CPU
-  // backend so non-Qwen models pay no memory cost.
-  std::vector<std::vector<float>> qwen4exp_conv_history;
-  std::vector<std::vector<float>> qwen4exp_recur_state;
-  std::vector<float> qwen4exp_hc_stream_buf;
-  std::vector<float> qwen4exp_hc_inject;
-  std::vector<std::vector<float>> qwen4exp_ple_conv_history;
-  std::vector<int32_t> qwen4exp_ple_token_history;
-  int qwen4exp_ple_next_pos = 0;
+  // Qwen4Exp recurrent/HC/PLE state (see qwen4exp_cpu_state.hpp).
+  Qwen4ExpCpuState qwen4exp;
 
   // Architecture shortcuts (mirrors StreamingEngine)
   int max_t = 0;

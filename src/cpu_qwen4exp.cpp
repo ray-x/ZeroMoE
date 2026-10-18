@@ -324,14 +324,14 @@ void CPUQwen4ExpBackend::hc_mix(CPUEngine &engine, int layer_idx,
   for (int s = 0; s < S; ++s)
     for (int h = 0; h < HC; ++h)
       rmsnorm(normed.data() + (static_cast<size_t>(s) * HC + h) * D,
-              engine.qwen4exp_hc_stream_buf.data() +
+              engine.qwen4exp.hc_stream_buf.data() +
                   (static_cast<size_t>(s) * HC + h) * D,
               norm_w ? norm_w + h * D : nullptr, D, c.eps);
 
-  engine.qwen4exp_hc_inject.resize(static_cast<size_t>(S) * HC);
+  engine.qwen4exp.hc_inject.resize(static_cast<size_t>(S) * HC);
   if (try_exl3_gpu_hc_mix(engine, p + base + "down.weight", p + base + "up.weight",
                            p + base + "inject.weight", normed.data(), hidden_states,
-                           engine.qwen4exp_hc_inject.data(), S, D, HC,
+                           engine.qwen4exp.hc_inject.data(), S, D, HC,
                            c.hc_low_rank, true))
     return;
 
@@ -364,7 +364,7 @@ void CPUQwen4ExpBackend::hc_mix(CPUEngine &engine, int layer_idx,
                   static_cast<float>(HC);
   }
   dense_matmul(engine, p + base + "inject.weight", normed.data(),
-               engine.qwen4exp_hc_inject.data(), S, HCD, HC);
+               engine.qwen4exp.hc_inject.data(), S, HCD, HC);
 }
 
 void CPUQwen4ExpBackend::hc_combine(CPUEngine &engine, float *hidden_states,
@@ -374,18 +374,18 @@ void CPUQwen4ExpBackend::hc_combine(CPUEngine &engine, float *hidden_states,
   const int HC = c.hc_mult;
   for (int s = 0; s < S; ++s) {
     const float *inject =
-        engine.qwen4exp_hc_inject.data() + static_cast<size_t>(s) * HC;
+        engine.qwen4exp.hc_inject.data() + static_cast<size_t>(s) * HC;
     for (int h = 0; h < HC; ++h) {
       const float weight =
           2.0f / (1.0f + std::exp(-inject[h] / static_cast<float>(HC)));
-      float *stream = engine.qwen4exp_hc_stream_buf.data() +
+      float *stream = engine.qwen4exp.hc_stream_buf.data() +
                       (static_cast<size_t>(s) * HC + h) * D;
       const float *out = sub_block_out + static_cast<size_t>(s) * D;
       for (int d = 0; d < D; ++d)
         stream[d] += weight * out[d];
     }
     std::memcpy(hidden_states + static_cast<size_t>(s) * D,
-                engine.qwen4exp_hc_stream_buf.data() +
+                engine.qwen4exp.hc_stream_buf.data() +
                     static_cast<size_t>(s) * HC * D,
                 static_cast<size_t>(D) * sizeof(float));
   }
@@ -445,7 +445,7 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
         ple_rows_ = n_rows;
       }
 
-      if (engine.qwen4exp_hc_stream_buf.size() !=
+      if (engine.qwen4exp.hc_stream_buf.size() !=
           static_cast<size_t>(S) * HC * D)
         return false;
       const std::string p = "blk." + std::to_string(layer_idx) + ".";
@@ -456,17 +456,17 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
         const int abs_pos = pos_base + s;
         const int current =
             abs_pos >= 0 &&
-                    abs_pos < static_cast<int>(engine.qwen4exp_ple_token_history.size())
-                ? engine.qwen4exp_ple_token_history[static_cast<size_t>(abs_pos)]
+                    abs_pos < static_cast<int>(engine.qwen4exp.ple_token_history.size())
+                ? engine.qwen4exp.ple_token_history[static_cast<size_t>(abs_pos)]
                 : (c.ple_image_token_id != 0 ? c.ple_image_token_id : eos);
         std::vector<int64_t> ctx(static_cast<size_t>(c.ple_ngram_size), eos);
         ctx[0] = current;
         for (int back = 1; back < c.ple_ngram_size; ++back) {
           const int prior = abs_pos - back;
           if (prior >= 0 &&
-              prior < static_cast<int>(engine.qwen4exp_ple_token_history.size()))
+              prior < static_cast<int>(engine.qwen4exp.ple_token_history.size()))
             ctx[static_cast<size_t>(back)] =
-                engine.qwen4exp_ple_token_history[static_cast<size_t>(prior)];
+                engine.qwen4exp.ple_token_history[static_cast<size_t>(prior)];
         }
         for (int n = 2; n <= c.ple_ngram_size; ++n) {
           for (int g = 0; g < c.ple_heads_per_ngram; ++g) {
@@ -525,7 +525,7 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
         return false;
       std::vector<float> kn(key.size()), query(key.size());
       grouped_norm(key.data(), nk.data(), kn.data());
-      grouped_norm(engine.qwen4exp_hc_stream_buf.data(), nq.data(), query.data());
+      grouped_norm(engine.qwen4exp.hc_stream_buf.data(), nq.data(), query.data());
       std::vector<float> gated(key.size());
       for (int s = 0; s < S; ++s) {
         for (int h = 0; h < HC; ++h) {
@@ -551,10 +551,10 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
       std::vector<float> conv_in(gated.size());
       grouped_norm(gated.data(), nc.data(), conv_in.data());
       const int hist_len = (kernel - 1) * c.ple_ngram_size;
-      if (engine.qwen4exp_ple_conv_history.size() <
+      if (engine.qwen4exp.ple_conv_history.size() <
           static_cast<size_t>(c.n_layers))
-        engine.qwen4exp_ple_conv_history.resize(static_cast<size_t>(c.n_layers));
-      auto &hist = engine.qwen4exp_ple_conv_history[static_cast<size_t>(layer_idx)];
+        engine.qwen4exp.ple_conv_history.resize(static_cast<size_t>(c.n_layers));
+      auto &hist = engine.qwen4exp.ple_conv_history[static_cast<size_t>(layer_idx)];
       if (hist.size() != static_cast<size_t>(HC * D) * hist_len)
         hist.assign(static_cast<size_t>(HC * D) * hist_len, 0.0f);
       std::vector<float> conv_out(gated.size());
@@ -583,7 +583,7 @@ bool CPUQwen4ExpBackend::ple_layer_input(CPUEngine &engine, int layer_idx,
                                        ch];
         }
       for (size_t i = 0; i < gated.size(); ++i)
-        engine.qwen4exp_hc_stream_buf[i] += gated[i] + conv_out[i];
+        engine.qwen4exp.hc_stream_buf[i] += gated[i] + conv_out[i];
       return true;
 }
 
@@ -599,12 +599,12 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
   const int conv_dim = key_dim * 2 + value_dim;
   const int kernel = c.ssm_conv_kernel;
   const std::string p = "blk." + std::to_string(layer_idx) + ".";
-  if (engine.qwen4exp_conv_history.size() <
+  if (engine.qwen4exp.conv_history.size() <
       static_cast<size_t>(c.n_layers))
-    engine.qwen4exp_conv_history.resize(static_cast<size_t>(c.n_layers));
-  if (engine.qwen4exp_recur_state.size() <
+    engine.qwen4exp.conv_history.resize(static_cast<size_t>(c.n_layers));
+  if (engine.qwen4exp.recur_state.size() <
       static_cast<size_t>(c.n_layers))
-    engine.qwen4exp_recur_state.resize(static_cast<size_t>(c.n_layers));
+    engine.qwen4exp.recur_state.resize(static_cast<size_t>(c.n_layers));
 
   std::vector<float> qkv(static_cast<size_t>(S) * conv_dim);
   std::vector<float> z(static_cast<size_t>(S) * value_dim);
@@ -624,7 +624,7 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
   const auto *conv = engine.find_layer(p + "ssm_conv1d.weight");
   if (!conv || !dequant_tensor(*conv, conv_w.data(), conv_w.size()))
     return;
-  auto &hist = engine.qwen4exp_conv_history[static_cast<size_t>(layer_idx)];
+  auto &hist = engine.qwen4exp.conv_history[static_cast<size_t>(layer_idx)];
   if (hist.size() != static_cast<size_t>(conv_dim) * (kernel - 1))
     hist.assign(static_cast<size_t>(conv_dim) * (kernel - 1), 0.0f);
   std::vector<float> conv_out(qkv.size());
@@ -654,7 +654,7 @@ void CPUQwen4ExpBackend::forward_gdn(CPUEngine &engine, int layer_idx,
     }
 
   const size_t state_size = static_cast<size_t>(Hv) * hd * hd;
-  auto &persistent = engine.qwen4exp_recur_state[static_cast<size_t>(layer_idx)];
+  auto &persistent = engine.qwen4exp.recur_state[static_cast<size_t>(layer_idx)];
   if (persistent.size() != state_size)
     persistent.assign(state_size, 0.0f);
   std::vector<float> out(static_cast<size_t>(S) * value_dim);
@@ -997,12 +997,12 @@ void CPUQwen4ExpBackend::forward_layer(CPUEngine &engine, int layer_idx,
                                        int pos_base) {
   const int D = engine.model_file.architecture_config.hidden;
   const int HC = engine.model_file.architecture_config.hc_mult;
-  if (layer_idx == 0 || engine.qwen4exp_hc_stream_buf.size() !=
+  if (layer_idx == 0 || engine.qwen4exp.hc_stream_buf.size() !=
                              static_cast<size_t>(S) * HC * D) {
-    engine.qwen4exp_hc_stream_buf.resize(static_cast<size_t>(S) * HC * D);
+    engine.qwen4exp.hc_stream_buf.resize(static_cast<size_t>(S) * HC * D);
     for (int s = 0; s < S; ++s)
       for (int h = 0; h < HC; ++h)
-        std::memcpy(engine.qwen4exp_hc_stream_buf.data() +
+        std::memcpy(engine.qwen4exp.hc_stream_buf.data() +
                         (static_cast<size_t>(s) * HC + h) * D,
                     hidden_states + static_cast<size_t>(s) * D,
                     static_cast<size_t>(D) * sizeof(float));
@@ -1032,7 +1032,7 @@ bool CPUQwen4ExpBackend::lm_head(CPUEngine &engine, const float *hidden,
   const int D = c.hidden;
   const int V = c.vocab;
   std::vector<float> tmp(static_cast<size_t>(S) * D);
-  if (c.hc_mult > 1 && engine.qwen4exp_hc_stream_buf.size() ==
+  if (c.hc_mult > 1 && engine.qwen4exp.hc_stream_buf.size() ==
                            static_cast<size_t>(S) * c.hc_mult * D) {
     const int HC = c.hc_mult;
     const int HCD = HC * D;
@@ -1041,7 +1041,7 @@ bool CPUQwen4ExpBackend::lm_head(CPUEngine &engine, const float *hidden,
     for (int s = 0; s < S; ++s)
       for (int h = 0; h < HC; ++h)
         rmsnorm(normed.data() + (static_cast<size_t>(s) * HC + h) * D,
-                engine.qwen4exp_hc_stream_buf.data() +
+                engine.qwen4exp.hc_stream_buf.data() +
                     (static_cast<size_t>(s) * HC + h) * D,
                 w ? w + h * D : nullptr, D, c.eps);
     if (!try_exl3_gpu_hc_mix(engine, "output_hc_down.weight", "output_hc_up.weight",
