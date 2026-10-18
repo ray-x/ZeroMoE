@@ -1,7 +1,11 @@
 # Picking up the 2026-10-18 source refactor (for the DeepSeek, GLM and other sessions)
 
-Branch `refactor/source-split` (worktree `~/work/moestream-refactor`), on top of the
-rewritten `master` (`703dde9`). Not merged. The merge decision is the user's.
+**MERGED into `master` on 2026-10-18** (fast-forward, master `a5d865b` at the time; the
+branch `refactor/source-split` is now equal to master). The hashes and rehearsal
+branch mentioned below (`integration/refactor-ds-glm-rehearsal`, tip `85309fb`) predate
+the final rebase and are kept only as a worked example of the hunk mapping. The GLM
+session's `5d0aacb` is on master as `84d1782` and its hunk is in
+`src/engine_runner_cache.cpp`.
 
 ## 0. First: master was rewritten, most branches are on the old history
 
@@ -52,7 +56,15 @@ Branch `integration/refactor-ds-glm-rehearsal`, worktree `~/work/rehearsal-ds`, 
 NOT done: no link, no run, no benchmark of the combined tree (both other sessions were
 using the machine). Treat it as "applies and compiles per file", not "verified".
 
-## 3. What each session does
+## 3. What each session does (after the merge)
+
+Cut a branch from the new master and cherry-pick your own commits, oldest first
+(`git cherry master <your-branch>`: `+` = still to bring over). Any commit that touches
+`src/main.cpp` will conflict there; resolve by keeping master's `main.cpp` and applying
+that commit's `main.cpp` hunks to the phase files with the `git apply --reject`
+recipe in section 1.
+
+(Notes written before the merge:)
 
 * DeepSeek V4.1 (`moestream-9f`): your 7 branch commits reduce to the 6 listed above on
   master. Pick up `integration/refactor-ds-glm-rehearsal`, or redo steps 1-2 yourself.
