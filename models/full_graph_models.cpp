@@ -7,7 +7,6 @@
 #include "full_graph_model.hpp"
 
 #include "engine.hpp"
-#include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_qwen4exp_graph.hpp"
@@ -143,42 +142,6 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   }
 };
 
-class DeepseekV4GraphModel final
-    : public FullGraphModelBase<DeepseekV4GraphModel> {
- public:
-  ModelFamily family() const override { return ModelFamily::DeepSeek_V4; }
-  const char *name() const override { return "deepseek_v4"; }
-
-  bool enabled(const StreamingEngine &, ModelGraphPhase phase) const override {
-    return phase == ModelGraphPhase::Prefill && deepseek_v4_full_graph_enabled();
-  }
-  void shutdown() const override { deepseek_v4_full_graph_shutdown(); }
-  int device_expert_layers() const override {
-    return deepseek_v4_full_graph_device_expert_layers();
-  }
-
-  // Prefill-only graph.
-  bool accepts(const StreamingEngine &, const ModelGraphRequest &r) const {
-    return r.phase == ModelGraphPhase::Prefill;
-  }
-
-  bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
-    return deepseek_v4_full_graph_prepare(e, r.n_tokens, r.pos_base,
-                                          r.token_ids);
-  }
-  bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
-    return deepseek_v4_full_graph_run(e, r.hidden_states, r.n_tokens,
-                                      r.pos_base, r.token_ids);
-  }
-  // accepts() rejects decode, so these are never reached.
-  bool decode_prepare(StreamingEngine &, const ModelGraphRequest &) const {
-    return false;
-  }
-  bool decode_run(StreamingEngine &, const ModelGraphRequest &) const {
-    return false;
-  }
-};
-
 class DeepseekV41GraphModel final
     : public FullGraphModelBase<DeepseekV41GraphModel> {
  public:
@@ -234,15 +197,12 @@ class DeepseekV41GraphModel final
 const FullGraphModel *full_graph_model(ModelFamily family) {
   static const Qwen4ExpGraphModel qwen;
   static const Glm5NextGraphModel glm;
-  static const DeepseekV4GraphModel dsv4;
   static const DeepseekV41GraphModel dsv41;
   switch (family) {
   case ModelFamily::Qwen4Exp:
     return &qwen;
   case ModelFamily::GLM5NEXT:
     return &glm;
-  case ModelFamily::DeepSeek_V4:
-    return &dsv4;
   case ModelFamily::DeepSeek_V41:
     return &dsv41;
   default:

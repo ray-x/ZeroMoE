@@ -11,7 +11,6 @@
 #include "async_prefetcher.hpp"
 #include "ggml_qwen4exp_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
-#include "ggml_deepseek_v4_graph.hpp"
 #include "mtp_speculative.hpp"
 #include "shutdown.hpp"
 #include <vector>

@@ -7,7 +7,6 @@
 #include "dsv41_router_selection.hpp"
 #include "engine.hpp"
 #include "expert_activation.hpp"
-#include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_hc_backend.hpp"

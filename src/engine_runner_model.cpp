@@ -103,6 +103,13 @@ std::expected<void, std::string> EngineRunner::load_model() {
     return std::unexpected(
         "Failure triggered during topological model graph initialization pass");
   }
+  if (engine.family_ops.family == ModelFamily::DeepSeek_V4) {
+    LOG_STREAM_WARN()
+        << "[DEPRECATED] DeepSeek-V4 (GGUF arch \"deepseek4\") is no longer "
+           "supported: its full-graph path was removed and only the slow "
+           "layer-by-layer path remains, without maintenance. Use DeepSeek-V4.1 "
+           "(arch \"deepseek41\").\n";
+  }
   engine.qwen4exp_full_graph_required =
       engine.family_ops.family == ModelFamily::Qwen4Exp &&
       qwen4exp_full_graph_decode_enabled();

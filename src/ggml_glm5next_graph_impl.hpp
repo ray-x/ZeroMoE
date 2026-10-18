@@ -8,7 +8,6 @@
 #include "graph_config.hpp"
 #include "pilot_ridge.hpp"
 #include "ggml_glm5next_graph.hpp"
-#include "ggml_deepseek_v4_graph.hpp"
 
 #include "dense_dispatch.hpp"
 #include "direct_io.hpp"

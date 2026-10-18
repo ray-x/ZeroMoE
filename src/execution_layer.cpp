@@ -6,7 +6,6 @@
 #include "engine.hpp"
 #include "../models/full_graph_model.hpp"
 #include "expert_activation.hpp"
-#include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "dsv41_trace.hpp"
 #include "ggml_gdn_proj_backend.hpp"

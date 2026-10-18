@@ -434,7 +434,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_glm5next_graph_settings.cpp
         src/ggml_glm5next_graph_stage.cpp
         src/ggml_glm5next_graph_weights.cpp
-        src/ggml_deepseek_v4_graph.cpp
+        src/ggml_graph_vram_headroom.cpp
         src/ggml_deepseek_v41_graph.cpp
         src/ggml_deepseek_v41_graph_decode.cpp
         src/ggml_hc_backend.cpp
@@ -566,7 +566,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         src/ggml_glm5next_graph_settings.cpp
         src/ggml_glm5next_graph_stage.cpp
         src/ggml_glm5next_graph_weights.cpp
-        src/ggml_deepseek_v4_graph.cpp
+        src/ggml_graph_vram_headroom.cpp
         src/ggml_deepseek_v41_graph.cpp
         src/ggml_deepseek_v41_graph_decode.cpp
         src/ggml_hc_backend.cpp

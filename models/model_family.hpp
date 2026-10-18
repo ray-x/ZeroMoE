@@ -23,7 +23,8 @@ enum class ModelFamily {
   GLM4_MOE,    // GLM-4.5 with standard attention + MoE
   Hunyuan,     // HunyuanMoE family (V1/V2/V3) — dense QKV + MoE
   DeepSeek_V3, // DeepSeek-V3 with MLA + MoE (similar to GLM-DSA)
-  DeepSeek_V4, // DeepSeek-V4/V4-Flash: no-absorption MLA + attention sinks +
+  DeepSeek_V4, // DEPRECATED (2026-10-18): graph path removed, use DeepSeek_V41.
+               // DeepSeek-V4/V4-Flash: no-absorption MLA + attention sinks +
                // grouped output projection + Hyper-Connections + sqrtsoftplus
                // MoE gating. Structurally distinct from DeepSeek_V3 despite
                // the shared name -- see models/family_ops.cpp's resolve_

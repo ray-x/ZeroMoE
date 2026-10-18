@@ -18,7 +18,6 @@
 #include "exllamav3_backend.hpp"
 #include "graph_config.hpp"
 #include "thread_profile.hpp"
-#include "ggml_deepseek_v4_graph.hpp"
 #include "ggml_gdn_proj_backend.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_glm5next_proj_backend.hpp"
