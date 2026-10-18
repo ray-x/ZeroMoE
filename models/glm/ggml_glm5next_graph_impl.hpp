@@ -203,6 +203,9 @@ ggml_tensor *glm5next_indexer_pool(ggml_context *ctx, ggml_tensor *keys, ggml_te
 bool build_glm5next_indexer_prefill(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer);
 bool build_glm5next_indexer_decode(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, ggml_tensor *qr, int layer, ggml_tensor **sel_out, ggml_tensor **mask_out);
 ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wqa, ggml_tensor *wqan, ggml_tensor *wqb, ggml_tensor *wkva, ggml_tensor *wkvan, ggml_tensor *wkb, ggml_tensor *wvb, ggml_tensor *wo, ggml_tensor **kv_out, ggml_tensor *kv_cache = nullptr, ggml_tensor **prev_indexer_selection = nullptr, ggml_tensor **prev_indexer_mask = nullptr);
+extern bool g_skip_indexer_weights; // GLM_DSA graph: the DSA indexer is not part of the (dense) graph
+inline bool glm_family(ModelFamily f) { return f == ModelFamily::GLM5NEXT || f == ModelFamily::GLM_DSA; }
+ggml_tensor *build_glm_dsa_attn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wqa, ggml_tensor *wqan, ggml_tensor *wqb, ggml_tensor *wkva, ggml_tensor *wkvan, ggml_tensor *wkb, ggml_tensor *wvb, ggml_tensor *wo, ggml_tensor **kv_out, ggml_tensor *kv_cache);
 EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer, ggml_tensor *cur, ggml_tensor *ids, ggml_tensor *weights, ggml_tensor *cold_map, ggml_tensor *cold_mask, const moe_routed::ExpertWeights &cold_w, float clamp = 0.0f);
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *forced_ids = nullptr);
 bool build_graph(FullGraph &g);

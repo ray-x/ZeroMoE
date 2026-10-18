@@ -43,9 +43,10 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 }
 
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
-  if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
+  if (!env_enabled() || !glm5next_graph::glm_family(engine.family_ops.family))
     return false;
   moestream::graphcfg::log_effective("glm5next-full-graph");
+  g_skip_indexer_weights = engine.family_ops.family == ModelFamily::GLM_DSA;
   // Build and seed the offload cache at boot, not inside the first decode token.
   FullGraph candidate;
   candidate.engine = &engine;
@@ -146,7 +147,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, c
 
 static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *) {
   if (!env_enabled() || S <= 1 || pos_base < 0 ||
-      engine.family_ops.family != ModelFamily::GLM5NEXT)
+      !glm5next_graph::glm_family(engine.family_ops.family))
     return false;
   const auto &c = engine.model_file.architecture_config;
   // The latent cache (engine.Lc) holds max_t rows; a chunk that would write past it is left to the caller.
@@ -220,6 +221,11 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->indexer_select_tail =
       engine.model_file.get_config_int("attention.indexer.kpool_select_tail", 0) != 0;
   g->v_head = c.v_head;
+  g->qk_rope = c.qk_rope;
+  g->dsa_plain = engine.family_ops.family == ModelFamily::GLM_DSA;
+  g_skip_indexer_weights = g->dsa_plain;
+  g->kv_row = g->dsa_plain ? c.kv_lora + c.qk_rope : c.kv_lora;
+  g->rope_base = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
   g->first_dense = c.first_dense;
   g->device_expert_layers = std::min(glm5next_full_graph_device_expert_layers(),
                                      std::max(0, c.n_layers - c.first_dense));
@@ -356,7 +362,8 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
 
   const int valid_rows =
       std::min(g.decode_last_pos + 1, std::max(0, engine.max_t));
-  const size_t kv_n = (size_t)valid_rows * g.kv_lora;
+  const size_t row_w = g.dsa_plain ? g.kv_row : g.kv_lora;
+  const size_t kv_n = (size_t)valid_rows * row_w;
   std::vector<ggml_fp16_t> half_cache(kv_n);
   std::vector<float> cache(kv_n);
   for (size_t i = 0; i < g.dsa_layers.size(); ++i) {
@@ -370,7 +377,17 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
                             kv_n * sizeof(ggml_fp16_t));
     for (size_t j = 0; j < kv_n; ++j)
       cache[j] = ggml_fp16_to_fp32(half_cache[j]);
-    std::memcpy(engine.Lc[layer], cache.data(), kv_n * sizeof(float));
+    if (g.dsa_plain) {
+      if (layer >= (int)engine.Rc.size() || !engine.Rc[layer])
+        return false;
+      for (int t = 0; t < valid_rows; ++t) {
+        std::memcpy(engine.Lc[layer] + (size_t)t * g.kv_lora, cache.data() + (size_t)t * row_w, g.kv_lora * sizeof(float));
+        std::memcpy(engine.Rc[layer] + (size_t)t * g.qk_rope, cache.data() + (size_t)t * row_w + g.kv_lora,
+                    g.qk_rope * sizeof(float));
+      }
+    } else {
+      std::memcpy(engine.Lc[layer], cache.data(), kv_n * sizeof(float));
+    }
   }
   return true;
 }

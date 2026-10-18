@@ -696,6 +696,14 @@ bool build_graph(FullGraph &g) {
                                   "glm5next_full_decode_kv_index");
   if (!g.input || !g.attn_mask || (g.decode_mode && !g.decode_indices))
     return false;
+  if (g.dsa_plain) {
+    g.positions = host_input(g, g.ctx, GGML_TYPE_I32, {g.S}, (size_t)g.S * sizeof(int32_t), "glm_dsa_positions");
+    if (!g.positions)
+      return false;
+    auto *pos = static_cast<int32_t *>(g.positions->data);
+    for (int i = 0; i < g.S; ++i)
+      pos[i] = g.pos_base + i;
+  }
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int q = 0; q < g.S; ++q)
     for (int k = 0; k < kv_tokens; ++k)
@@ -772,7 +780,7 @@ bool build_graph(FullGraph &g) {
             pool * g.indexer_kpool + i;
   }
 
-  ggml_tensor *res = g.input;
+  ggml_tensor *res = g.dsa_plain ? ggml_reshape_2d(g.ctx, g.input, g.D, g.S) : g.input;
   ggml_tensor *previous_indexer_selection = nullptr;
   ggml_tensor *previous_indexer_mask = nullptr;
   for (int l = 0; l < g.n_layers; ++l) {
@@ -789,20 +797,20 @@ bool build_graph(FullGraph &g) {
     const std::string p = "blk." + std::to_string(l) + ".";
     ggml_tensor *post = nullptr;
     ggml_tensor *comb = nullptr;
-    ggml_tensor *afn = resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
-    ggml_tensor *abase = resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
-    ggml_tensor *ascale = resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
-    if (!afn || !abase || !ascale)
+    ggml_tensor *afn = g.dsa_plain ? nullptr : resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
+    ggml_tensor *abase = g.dsa_plain ? nullptr : resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
+    ggml_tensor *ascale = g.dsa_plain ? nullptr : resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
+    if (!g.dsa_plain && (!afn || !abase || !ascale))
       return false;
     ggml_tensor *residual = res;
-    ggml_tensor *cur = hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
+    ggml_tensor *cur = g.dsa_plain ? res : hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
     ggml_tensor *an = resident_tensor(g, g.ctx, p + "attn_norm.weight");
     if (!an)
       return false;
     cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), an);
 
     ggml_tensor *attn = nullptr;
-    if (glm5next_is_kda_layer(c, l)) {
+    if (!g.dsa_plain && glm5next_is_kda_layer(c, l)) {
       ggml_tensor *wq = resident_tensor(g, g.ctx, p + "attn_q.weight");
       ggml_tensor *wk = resident_tensor(g, g.ctx, p + "attn_k.weight");
       ggml_tensor *wv = resident_tensor(g, g.ctx, p + "attn_v.weight");
@@ -881,7 +889,7 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *kv_cache = nullptr;
       if (g.decode_mode) {
         kv_cache = new_decode_state_tensor(
-            g, g.ctx, GGML_TYPE_F16, {g.kv_lora, g.kv_capacity},
+            g, g.ctx, GGML_TYPE_F16, {g.dsa_plain ? g.kv_row : g.kv_lora, g.kv_capacity},
             "glm5next_decode_dsa_kv");
         if (!kv_cache)
           return false;
@@ -903,28 +911,28 @@ bool build_graph(FullGraph &g) {
         }
       }
       ggml_tensor *kv = nullptr;
-      attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb,
-                       wo, &kv, kv_cache, &previous_indexer_selection,
-                       &previous_indexer_mask);
+      attn = g.dsa_plain
+                 ? build_glm_dsa_attn(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache)
+                 : build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache,
+                             &previous_indexer_selection, &previous_indexer_mask);
       if (!attn || !kv)
         return false;
       if (!g.decode_mode)
         g.dsa_kv_out.push_back(kv);
       g.dsa_layers.push_back(l);
     }
-    res = hc_post(g, g.ctx, attn, residual, post, comb);
+    res = g.dsa_plain ? ggml_add(g.ctx, residual, attn) : hc_post(g, g.ctx, attn, residual, post, comb);
     if (g.decode_mode && layer_timing_env())
       g.layer_marks[res] = {l, 0};
 
     residual = res;
     post = comb = nullptr;
-    ggml_tensor *ffn_fn = resident_tensor(g, g.ctx, p + "hc_ffn_fn.weight");
-    ggml_tensor *ffn_base = resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
-    ggml_tensor *ffn_scale =
-        resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
-    if (!ffn_fn || !ffn_base || !ffn_scale)
+    ggml_tensor *ffn_fn = g.dsa_plain ? nullptr : resident_tensor(g, g.ctx, p + "hc_ffn_fn.weight");
+    ggml_tensor *ffn_base = g.dsa_plain ? nullptr : resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
+    ggml_tensor *ffn_scale = g.dsa_plain ? nullptr : resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
+    if (!g.dsa_plain && (!ffn_fn || !ffn_base || !ffn_scale))
       return false;
-    cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
+    cur = g.dsa_plain ? res : hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
     ggml_tensor *cur_pre = cur;
     if (g.decode_mode && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
       ggml_set_output(cur_pre);
@@ -935,8 +943,10 @@ bool build_graph(FullGraph &g) {
       return false;
     cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), fn);
     ggml_build_forward_expand(g.graph, residual);
-    ggml_build_forward_expand(g.graph, post);
-    ggml_build_forward_expand(g.graph, comb);
+    if (!g.dsa_plain) {
+      ggml_build_forward_expand(g.graph, post);
+      ggml_build_forward_expand(g.graph, comb);
+    }
     if (!build_pilot_stage(g, g.ctx, cur_pre, l))
       return false;
     ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l);
@@ -946,7 +956,7 @@ bool build_graph(FullGraph &g) {
                l, g.engine->graph_ram_layer_ready(l) ? 1 : 0);
       return false;
     }
-    res = hc_post(g, g.ctx, ffn, residual, post, comb);
+    res = g.dsa_plain ? ggml_add(g.ctx, residual, ffn) : hc_post(g, g.ctx, ffn, residual, post, comb);
     if (g.decode_mode && layer_timing_env())
       g.layer_marks[res] = {l, 1};
     if (l >= c.first_dense && (l == c.first_dense || l + 1 == g.n_layers ||
@@ -963,7 +973,7 @@ bool build_graph(FullGraph &g) {
   // The surrounding generation loop applies output_norm.weight immediately
   // before the LM-head projection.  Return the same pre-norm activation as
   // the legacy layer path; applying output_norm here would normalize twice.
-  g.output = hc_mean(g, g.ctx, res);
+  g.output = g.dsa_plain ? res : hc_mean(g, g.ctx, res);
 
   ggml_set_output(g.final_streams);
   ggml_build_forward_expand(g.graph, g.final_streams);

@@ -672,6 +672,70 @@ ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   return ggml_mul_mat(ctx, wo, value);
 }
 
+// GLM_DSA absorbed MLA with interleaved RoPE (the layered path's mla_attention_absorbed_gguf, dense: context <= indexer top_k).
+// K row = [rmsnorm(latent) * kv_a_norm (kv_lora) | rope(k_rope) (qk_rope)], V = its first kv_lora values.  *kv_out is that row
+// for the current tokens, F32 [kv_row, S].
+ggml_tensor *build_glm_dsa_attn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wqa,
+                                ggml_tensor *wqan, ggml_tensor *wqb, ggml_tensor *wkva, ggml_tensor *wkvan,
+                                ggml_tensor *wkb, ggml_tensor *wvb, ggml_tensor *wo, ggml_tensor **kv_out,
+                                ggml_tensor *kv_cache) {
+  const auto &c = g.engine->model_file.architecture_config;
+  const int nope = g.qk_nope, rope = g.qk_rope, qh = nope + rope, row = g.kv_lora + rope;
+  if (!g.positions)
+    return nullptr;
+  ggml_tensor *qr = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_mul_mat(ctx, wqa, cur), c.eps), wqan);
+  ggml_tensor *q = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wqb, qr), qh, g.H, g.S);
+  ggml_tensor *q_nope = ggml_cont(ctx, ggml_view_3d(ctx, q, nope, g.H, g.S, q->nb[1], q->nb[2], 0));
+  ggml_tensor *q_rope = ggml_cont(ctx, ggml_view_3d(ctx, q, rope, g.H, g.S, q->nb[1], q->nb[2], (size_t)nope * sizeof(float)));
+  q_rope = ggml_rope_ext(ctx, q_rope, g.positions, nullptr, rope, GGML_ROPE_TYPE_NORMAL, 0, g.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+  q_nope = ggml_permute(ctx, q_nope, 0, 2, 1, 3);
+  q_nope = ggml_mul_mat(ctx, wkb, q_nope);
+  q_nope = ggml_cont(ctx, ggml_permute(ctx, q_nope, 0, 2, 1, 3)); // [kv_lora, H, S]
+  q = ggml_concat(ctx, q_nope, q_rope, 0);                         // [row, H, S]
+
+  ggml_tensor *kv = ggml_mul_mat(ctx, wkva, cur); // [row, S]
+  ggml_tensor *lat = ggml_cont(ctx, ggml_view_2d(ctx, kv, g.kv_lora, g.S, kv->nb[1], 0));
+  lat = ggml_mul(ctx, ggml_rms_norm(ctx, lat, c.eps), wkvan);
+  ggml_tensor *kr = ggml_cont(ctx, ggml_view_2d(ctx, kv, rope, g.S, kv->nb[1], (size_t)g.kv_lora * sizeof(float)));
+  kr = ggml_reshape_3d(ctx, kr, rope, 1, g.S);
+  kr = ggml_rope_ext(ctx, kr, g.positions, nullptr, rope, GGML_ROPE_TYPE_NORMAL, 0, g.rope_base, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+  ggml_tensor *kcur = ggml_concat(ctx, lat, ggml_reshape_2d(ctx, kr, rope, g.S), 0); // [row, S]
+  *kv_out = kcur;
+
+  const int64_t total_kv = (int64_t)g.pos_base + g.S;
+  const int64_t kv_tokens = g.decode_mode ? g.kv_capacity : ((total_kv + 255) & ~((int64_t)255));
+  ggml_tensor *k = nullptr;
+  if (g.decode_mode) {
+    if (!kv_cache || !g.decode_indices)
+      return nullptr;
+    ggml_tensor *updated = ggml_set_rows(ctx, kv_cache, ggml_reshape_2d(ctx, kcur, row, 1), g.decode_indices);
+    if (!updated)
+      return nullptr;
+    k = ggml_reshape_3d(ctx, updated, row, g.kv_capacity, 1);
+  } else {
+    ggml_tensor *all = ggml_reshape_3d(ctx, kcur, row, 1, g.S);
+    if (g.pos_base > 0) {
+      ggml_tensor *prev = host_input(g, ctx, GGML_TYPE_F32, {row, 1, g.pos_base}, (size_t)row * g.pos_base * sizeof(float),
+                                     ("glm_dsa_prev_kv_" + std::to_string(layer)).c_str());
+      if (!prev)
+        return nullptr;
+      g.dsa_prev_inputs.push_back({layer, static_cast<float *>(prev->data)});
+      all = ggml_concat(ctx, prev, all, 2);
+    }
+    if (kv_tokens > total_kv)
+      all = ggml_pad(ctx, all, 0, 0, (int)(kv_tokens - total_kv), 0); // FATTN needs a multiple of 256; padding is masked
+    k = ggml_cast(ctx, ggml_permute(ctx, all, 0, 2, 1, 3), GGML_TYPE_F16); // [row, kv_tokens, 1]
+  }
+  ggml_tensor *v = ggml_view_3d(ctx, k, g.kv_lora, k->ne[1], 1, k->nb[1], k->nb[2], 0);
+  q = ggml_permute(ctx, q, 0, 2, 1, 3); // [row, S, H]
+  ggml_tensor *attn = ggml_flash_attn_ext(ctx, q, k, v, g.attn_mask, 1.0f / std::sqrt((float)qh), 0.0f, 0.0f);
+  ggml_tensor *value = ggml_permute(ctx, attn, 0, 2, 1, 3);
+  value = ggml_mul_mat(ctx, wvb, value);
+  value = ggml_cont(ctx, ggml_permute(ctx, value, 0, 2, 1, 3));
+  value = ggml_reshape_2d(ctx, value, g.v_head * g.H, g.S);
+  return ggml_mul_mat(ctx, wo, value);
+}
+
 } // namespace glm5next_graph
 
 #endif // MOESTREAM_USE_GGML_CUDA

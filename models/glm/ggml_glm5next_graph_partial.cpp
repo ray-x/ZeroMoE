@@ -15,7 +15,7 @@ namespace glm5next_graph {
 
 bool configure_vram_reference_experts(FullGraph &g) {
   if (!g.topology || !g.engine ||
-      g.engine->family_ops.family != ModelFamily::GLM5NEXT)
+      !glm5next_graph::glm_family(g.engine->family_ops.family))
     return false;
   const auto &c = g.engine->model_file.architecture_config;
   if (c.n_experts <= 0 || c.n_layers <= c.first_dense) {

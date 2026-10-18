@@ -27,7 +27,11 @@ void *alloc_expert_source(FullGraph &g, size_t bytes) {
   return p;
 }
 
+bool g_skip_indexer_weights = false;
+
 bool graph_dense_weight_name(const std::string &name) {
+  if (g_skip_indexer_weights && name.find("indexer") != std::string::npos)
+    return false;
   if (name.find("_exps.weight") != std::string::npos ||
       name.find("nextn") != std::string::npos)
     return false;
@@ -242,8 +246,8 @@ bool init_decode_state_arena(FullGraph &g) {
         return false;
     } else {
       if ((size_t)g.kv_capacity >
-          SIZE_MAX / (size_t)g.kv_lora / sizeof(ggml_fp16_t) ||
-          !add_tensor((size_t)g.kv_capacity * g.kv_lora *
+          SIZE_MAX / (size_t)g.kv_row / sizeof(ggml_fp16_t) ||
+          !add_tensor((size_t)g.kv_capacity * (g.dsa_plain ? g.kv_row : g.kv_lora) *
                       sizeof(ggml_fp16_t)))
         return false;
     }

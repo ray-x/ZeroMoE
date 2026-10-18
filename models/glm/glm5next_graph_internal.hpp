@@ -184,6 +184,11 @@ struct FullGraph : moestream::graph::GraphCore {
   int qk_rope = 0;
   int kv_lora = 0;
   int v_head = 0;
+  // GLM_DSA (plain residual, roped MLA): cache/prev/export rows are kv_row = kv_lora + qk_rope floats wide.
+  bool dsa_plain = false;
+  int kv_row = 0;
+  float rope_base = 10000.0f;
+  ggml_tensor *positions = nullptr;
   int o_group_count = 0;
   int o_lora_rank = 0;
   int sliding_window = 0;

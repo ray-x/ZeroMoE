@@ -3,6 +3,16 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 
+// True when the GLM full graph (glm5next implementation) is the active execution path of this engine's family.
+static bool glm_graph_in_use(const StreamingEngine &engine) {
+  const ModelFamily f = engine.family_ops.family;
+  if (f == ModelFamily::GLM5NEXT)
+    return glm5next_full_graph_enabled();
+  const FullGraphModel *m = engine.family_ops.graph_model;
+  return f == ModelFamily::GLM_DSA && m &&
+         (m->enabled(engine, ModelGraphPhase::Prefill) || m->enabled(engine, ModelGraphPhase::Decode));
+}
+
 std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // --- Multi-GPU memory planning (from optimize.md) ---
   auto &cfg = engine.model_file.architecture_config;
@@ -39,8 +49,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
         size_t slot_alignment = COMPACT_REGION_ALIGNMENT;
         // The GLM5NEXT full graph aliases resident slots as MUL_MAT_ID views for ANY layer with
         // hot experts, so every layer needs a row-aligned slot stride, not just the full-layer prefix.
-        const bool glm_graph_rows = engine.family_ops.family == ModelFamily::GLM5NEXT &&
-                                    glm5next_full_graph_enabled();
+        const bool glm_graph_rows = glm_graph_in_use(engine);
         if (config.vram_cache_full_layer_prefix > l || glm_graph_rows) {
           const size_t row_alignment =
               engine.expert_cache_layer_stride_alignment(l);
@@ -66,7 +75,8 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
     }
     const size_t stride_alignment = engine.expert_cache_stride_alignment();
     if (expert_slab_bytes > 0 &&
-        engine.family_ops.family == ModelFamily::GLM_DSA) {
+        engine.family_ops.family == ModelFamily::GLM_DSA &&
+        !glm_graph_in_use(engine)) {
       // GLM_DSA dispatches one layer/expert at a time. It never exposes
       // active-layer slots as a zero-copy GGML MUL_MAT_ID tensor view, so
       // the model-wide LCM of every quantized projection's row size is not
@@ -145,8 +155,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   graph_ram_cache =
       graph_mode &&
       (std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
-       (engine.family_ops.family == ModelFamily::GLM5NEXT &&
-        config.ram_preload_all_experts) ||
+       (glm_graph_in_use(engine) && config.ram_preload_all_experts) ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&
         config.ram_preload_all_experts));
   // DeepSeek-V4.1 graph nodes still dispatch MoE through
@@ -160,8 +169,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   graph_owns_dense =
       graph_mode && !dsv41_graph_uses_native_moe_cache;
   glm_graph_aliases_vram_cache =
-      graph_mode && engine.family_ops.family == ModelFamily::GLM5NEXT &&
-      glm5next_full_graph_enabled();
+      graph_mode && glm_graph_in_use(engine);
   if (graph_mode && engine.family_ops.family == ModelFamily::Qwen4Exp &&
       qwen4exp_full_graph_decode_enabled()) {
     const int n_layers =
@@ -210,8 +218,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // model's last layer(s) even though real MemAvailable had room to spare --
   // see prepare_expert_source_only's "boot host admission refused" log.
   if (graph_mode && graph_ram_cache && config.ram_preload_all_experts &&
-      engine.family_ops.family == ModelFamily::GLM5NEXT &&
-      glm5next_full_graph_enabled()) {
+      glm_graph_in_use(engine)) {
     const int n_layers =
         std::max(0, engine.model_file.architecture_config.n_layers);
     const int n_experts =
@@ -268,8 +275,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
            "is disabled. The PLE table may still be mmap-backed, but MoE "
            "expert planes are not.\n";
   }
-  if (engine.mtp_enabled && engine.family_ops.family == ModelFamily::GLM5NEXT &&
-      glm5next_full_graph_enabled()) {
+  if (engine.mtp_enabled && glm_graph_in_use(engine)) {
     LOG_STREAM_INFO()
         << "[MTP] GLM NextN/MTP is enabled alongside the GLM full graph: "
            "the main generation loop's prefill uses the full graph, "
@@ -355,8 +361,7 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
     constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
 
     const bool glm_shared_expert_cache =
-        engine.family_ops.family == ModelFamily::GLM5NEXT &&
-        glm5next_full_graph_enabled();
+        glm_graph_in_use(engine);
     // GLM's graph aliases the existing cache, so it owns no additional
     // device-resident expert block to reserve ahead of cache sizing.
     const int dev_layers = !glm_shared_expert_cache && graph_model
@@ -573,8 +578,7 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
       if (gc.moe_cache_gb > fallback_config_gb)
         gc.moe_cache_gb = fallback_config_gb;
     }
-    if (engine.family_ops.family == ModelFamily::GLM5NEXT &&
-        glm5next_full_graph_enabled()) {
+    if (glm_graph_in_use(engine)) {
       // The graph aliases pinned entries in the main cache; the temporary
       // active-layer pool is outside that address space and competes with
       // the shared MoE cache for VRAM.

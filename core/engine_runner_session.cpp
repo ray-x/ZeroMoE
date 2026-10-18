@@ -65,7 +65,8 @@ std::expected<void, std::string> EngineRunner::start_workers() {
   // rereads the ~78 GiB expert set from SSD.  The source admission is
   // bounded by host_ram_gb and the memory watchdog; failure leaves the
   // established layer path available.
-  if (engine.family_ops.family == ModelFamily::GLM5NEXT)
+  if (engine.family_ops.family == ModelFamily::GLM5NEXT ||
+      engine.family_ops.family == ModelFamily::GLM_DSA)
     glm5next_full_graph_set_vram_cache(&gpu.topology);
   if (graph_mode && !graph_model->bootstrap(engine)) {
     LOG_STREAM_WARN()
