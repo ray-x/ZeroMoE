@@ -231,6 +231,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     return decline_decode_graph();
   }
 
+  // Building with a second GPU leaves it as the current device; the state tensors live on the main one.
+  cudaSetDevice(g->device);
   const size_t state_n = (size_t)g->hd * g->hd * g->H;
   const size_t hist_n = (size_t)(g->d_conv - 1) * 3 * g->d_inner;
   for (size_t i = 0; i < g->kda_layers.size(); ++i) {

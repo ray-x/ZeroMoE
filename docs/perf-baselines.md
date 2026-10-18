@@ -107,3 +107,15 @@ GLM_DSA full graph (opt-in: `MOESTREAM_GLM_DSA_FULL_GRAPH=1`, `..._PREFILL=1`; b
 Output is coherent and the 17-token sky prompt reproduces the layered answer ("Rayleigh scattering"); a token-for-token comparison against the layered
 path is still to do. A 64 GiB pool exhausts host RAM (MemAvailable < 20 GB, decode graph declines); ~45-50 GiB is the ceiling with 14 GiB of live host data.
 The graph needs the dense weights on the same GPU as its workspace: with the 5060 Ti as the core device it had 0.14 GiB free and declined.
+
+GLM_DSA full graph on BOTH GPUs (3090 = dense + graph device with a 4 GiB expert cache, 5060 Ti = 11 GiB of hot experts via `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=11`,
+45 GiB DDR pool; `logs/glm53_dsa_graph2gpu.toml`, `logs/run_dsa_graph2gpu_426.sh`), same 426-token prompt:
+
+| Phase | tok/s | Note |
+|---|---|---|
+| Prefill (graph) | 5.12 | 83.2 s; same as single GPU (4.99): disk-bound, the 5060 Ti hot set does not help |
+| Decode (graph) | 0.68 overall; 0.86 steady (mean 1160 ms/step) | the first token carries ~20 s of graph build + state seeding |
+
+Setup notes: the graph device is the one holding the dense weights (13 GiB), so with the 5060 Ti as the core device the workspace has 0.02-0.14 GiB free and every prefill batch
+declines; roles must be 3090 = dense+moe, 5060 Ti = moe. After a two-GPU build the current CUDA device is the second GPU; `decode_prepare` must `cudaSetDevice(g->device)` before it seeds
+the KV state, otherwise the seed fails and the decode graph is declined.
