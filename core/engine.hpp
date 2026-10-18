@@ -1,4 +1,5 @@
 #pragma once
+#include <unordered_set>
 #include "gguf_loader.hpp"
 #include "direct_io.hpp"
 #include "io_uring_backend.hpp"
@@ -2129,6 +2130,39 @@ public:
     // primary.
     static constexpr int REPLICA_SPLIT = -1;
 
+    // Partial mirror coverage (EngineConfig::mirror_coverage_file): the mirror
+    // may be a SPARSE copy of each shard holding only the `down` slices of the
+    // listed (layer, expert) pairs. REPLICA_SPLIT reads gate+up from the
+    // primary and down from the mirror, so it is only safe for a covered
+    // expert -- an uncovered one would read a hole (zeros) and silently return
+    // wrong weights. No coverage file configured = the mirror is a complete
+    // copy (old behavior). Once a coverage file IS configured, an unreadable
+    // or empty list means "nothing covered", never "complete": the set is
+    // keyed by (layer, expert) so it needs no model dimensions (they are not
+    // populated yet when the mirror is opened).
+    bool mirror_coverage_configured = false;
+    std::unordered_set<uint64_t> mirror_down_cover; // (layer << 32) | expert
+    bool mirror_split_allowed(int layer, int expert) const {
+        if (!mirror_coverage_configured) return true;
+        if (layer < 0 || expert < 0) return false;
+        return mirror_down_cover.count(((uint64_t)(uint32_t)layer << 32) |
+                                       (uint32_t)expert) != 0;
+    }
+    // Loads "layer expert" lines; returns the number of covered experts.
+    size_t load_mirror_coverage(const std::string &path) {
+        mirror_coverage_configured = true;
+        mirror_down_cover.clear();
+        FILE *f = std::fopen(path.c_str(), "r");
+        if (!f) return 0;
+        int l = 0, e = 0;
+        while (std::fscanf(f, "%d %d", &l, &e) == 2) {
+            if (l >= 0 && e >= 0)
+                mirror_down_cover.insert(((uint64_t)(uint32_t)l << 32) | (uint32_t)e);
+        }
+        std::fclose(f);
+        return mirror_down_cover.size();
+    }
+
     // `replica` selects which physical copy of the model to read from when a
     // mirror is configured (0 = primary, 1 = mirror on the other device --
     // see GGUFModel::open_mirror). Defaults to 0, so every existing caller
@@ -2141,6 +2175,9 @@ public:
                                      io_uring_backend::ReadRequest* out_reqs,
                                      int& out_n, size_t& out_total,
                                      int replica = 0) {
+        // A split read needs the mirror to hold this expert's down slice.
+        if (replica == REPLICA_SPLIT && !mirror_split_allowed(layer_idx, expert_id))
+            replica = 0;
         // Projection-compact graph arenas have no packed per-expert slab, so
         // point the three startup requests directly at their final planes.
         // Runtime misses are not expected for a complete immutable graph

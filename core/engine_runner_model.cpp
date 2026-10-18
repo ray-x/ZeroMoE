@@ -51,8 +51,24 @@ std::expected<void, std::string> EngineRunner::load_model() {
   // Opened AFTER enable_direct_io deliberately: open_mirror matches each
   // shard's O_DIRECT state against the primary's, which isn't decided until
   // the call above has run and verified it per shard.
-  if (!config.mirror_model_path.empty())
+  if (!config.mirror_model_path.empty()) {
     engine.model_file.open_mirror(config.mirror_model_path);
+    if (!config.mirror_coverage_file.empty()) {
+      const size_t covered =
+          engine.load_mirror_coverage(config.mirror_coverage_file);
+      if (covered == 0) {
+        // load_mirror_coverage already marked the coverage as configured, so
+        // an unreadable/empty list means "nothing covered", never "complete".
+        LOG_STREAM_WARN() << "[MIRROR] coverage file '" << config.mirror_coverage_file
+                          << "' has no usable entries -- every expert reads from the "
+                             "primary only.\n";
+      } else {
+        LOG_STREAM_INFO() << "[MIRROR] coverage: " << covered
+                          << " expert(s) have their down slice on the mirror; all "
+                             "others read from the primary only.\n";
+      }
+    }
+  }
 
   // Opt-in, only reachable when the driver actually opened above (config.
   // cuda_cufile alone doesn't guarantee that -- see cufile_driver_guard).

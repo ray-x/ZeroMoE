@@ -1501,6 +1501,11 @@ struct EngineConfig {
   // the PRIMARY's tensor offsets); GGUFModel::open_mirror enforces this with
   // a per-shard size check and refuses to stripe any shard that differs.
   std::string mirror_model_path;
+  // Optional "layer expert" list (one pair per line). When set, the mirror is
+  // treated as a SPARSE copy holding only the `down` slices of these experts
+  // (see bench/dsv41_pack_cold_mirror.py); every other expert reads from the
+  // primary alone. Empty = the mirror is a complete copy.
+  std::string mirror_coverage_file;
 
   // Log every host RAM cache HIT for the MoE expert cache (high volume —
   // one line per routed expert per token). MISS/LOAD and VRAM PROMOTE/READY
@@ -3017,6 +3022,8 @@ inline bool EngineConfig::load(const std::string &path) {
   ram_preload_all_experts = doc.root.get_bool(
       "ram_preload_all_experts", ram_preload_all_experts);
   mirror_model_path = doc.root.get_str("mirror_model_path", mirror_model_path);
+  mirror_coverage_file =
+      doc.root.get_str("mirror_coverage_file", mirror_coverage_file);
   ram_pinned_budget_gb =
       doc.root.get_double("ram_pinned_budget_gb", ram_pinned_budget_gb);
   ram_pin_eager_preregister =
