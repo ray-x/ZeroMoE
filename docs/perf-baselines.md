@@ -119,3 +119,17 @@ GLM_DSA full graph on BOTH GPUs (3090 = dense + graph device with a 4 GiB expert
 Setup notes: the graph device is the one holding the dense weights (13 GiB), so with the 5060 Ti as the core device the workspace has 0.02-0.14 GiB free and every prefill batch
 declines; roles must be 3090 = dense+moe, 5060 Ti = moe. After a two-GPU build the current CUDA device is the second GPU; `decode_prepare` must `cudaSetDevice(g->device)` before it seeds
 the KV state, otherwise the seed fails and the decode graph is declined.
+
+### GLM_DSA graph: what limits it (2026-10-19, same 426-token prompt, both GPUs, 45 GiB pool)
+
+| Variant | Prefill tok/s | Decode mean step | Note |
+|---|---|---|---|
+| baseline (2 GPU, 6 CPU threads) | 5.12 | 1160 ms | |
+| + sparse mid-tier mirror on KIOXIA (1,246 experts, 13.3 GiB) | 5.00 | 1377 ms | WORSE: KIOXIA already served ~78% of reads (store 17.9k + mirror 2.0k vs Samsung ~5.6k) |
+| + split reads (`MOESTREAM_GLM5NEXT_OFFLOAD_SPLIT=1`: store experts read gate/up-down across both drives, 3.5 ms vs 7.5 ms per read in isolation, bytes identical) | 4.89 | 1164 ms | no change: the SSDs are NOT the bottleneck |
+| + 14 CPU threads (`MOESTREAM_GLM5NEXT_CPU_THREADS=14`) | 6.18 | 1311 ms | prefill +21%, decode worse: cold-expert MUL_MAT_ID (225 nodes) runs on the CPU |
+| + `PREFILL_OP_OFFLOAD=1` | crash | | `CUDA error: invalid argument` in ggml_backend_cuda_set_tensor_async during prefill |
+
+Conclusion: drive bandwidth is not what limits the graph (halving read time changed nothing). Prefill is limited by the CPU matmuls of experts outside VRAM,
+decode by the per-token miss handling. The earlier "disk-bound" statement in this file was wrong. Levers left: a separate (higher) CPU thread count for
+prefill only, getting op-offload to work with the offload arena, and a larger VRAM-resident expert set.

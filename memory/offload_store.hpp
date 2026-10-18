@@ -339,8 +339,39 @@ public:
     return true;
   }
   // Counters (diagnostics): how many reads took the zero-copy O_DIRECT path vs the buffered fallback.
-  uint64_t direct_reads() const { return direct_reads_; }
-  uint64_t buffered_reads() const { return buffered_reads_; }
+  uint64_t direct_reads() const { return direct_reads_.load(); }
+  uint64_t buffered_reads() const { return buffered_reads_.load(); }
+
+  // Reads only the planes in `mask` (bit k = plane k: gate, up, down); each maximal run of adjacent planes is one direct preadv when the
+  // store is tight and aligned, else buffered preads.
+  ReadStatus read_planes(int layer, int expert, void *const dst[3], unsigned mask) {
+    auto it = slabs_.find(detail::key(layer, expert));
+    if (it == slabs_.end()) return ReadStatus::NotFound;
+    const Slab &s = it->second;
+    const int fd_dir = fds_dir_[static_cast<size_t>(s.file)], fd_buf = fds_buf_[static_cast<size_t>(s.file)];
+    int k = 0;
+    while (k < 3) {
+      if (!(mask >> k & 1u)) { ++k; continue; }
+      int e = k;
+      while (e + 1 < 3 && (mask >> (e + 1) & 1u) && s.off[e + 1] == s.off[e] + s.bytes[e]) ++e;
+      bool fast = fd_dir >= 0 && s.off[k] % align_ == 0;
+      for (int j = k; j <= e && fast; ++j)
+        if (reinterpret_cast<uintptr_t>(dst[j]) % align_ != 0 || s.bytes[j] % align_ != 0) fast = false;
+      bool done = false;
+      if (fast) {
+        struct iovec iov[3];
+        for (int j = k; j <= e; ++j) iov[j - k] = {dst[j], static_cast<size_t>(s.bytes[j])};
+        if (detail::preadv_all(fd_dir, iov, e - k + 1, static_cast<off_t>(s.off[k]))) { direct_reads_.fetch_add(1, std::memory_order_relaxed); done = true; }
+      }
+      if (!done) {
+        for (int j = k; j <= e; ++j)
+          if (!detail::pread_all(fd_buf, dst[j], static_cast<size_t>(s.bytes[j]), static_cast<off_t>(s.off[j]))) return ReadStatus::IoError;
+        buffered_reads_.fetch_add(1, std::memory_order_relaxed);
+      }
+      k = e + 1;
+    }
+    return ReadStatus::Ok;
+  }
 
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
     auto it = slabs_.find(detail::key(layer, expert));
@@ -352,12 +383,12 @@ public:
       if (reinterpret_cast<uintptr_t>(dst[k]) % align_ != 0 || s.bytes[k] % align_ != 0) fast = false;
     if (fast) {
       struct iovec iov[3] = {{dst[0], static_cast<size_t>(s.bytes[0])}, {dst[1], static_cast<size_t>(s.bytes[1])}, {dst[2], static_cast<size_t>(s.bytes[2])}};
-      if (detail::preadv_all(fd_dir, iov, 3, static_cast<off_t>(s.off[0]))) { ++direct_reads_; return ReadStatus::Ok; }
+      if (detail::preadv_all(fd_dir, iov, 3, static_cast<off_t>(s.off[0]))) { direct_reads_.fetch_add(1, std::memory_order_relaxed); return ReadStatus::Ok; }
       // fall through to the buffered path (O_DIRECT can refuse on some filesystems)
     }
     for (int k = 0; k < 3; ++k) // each plane at its own offset: a store need not be tight
       if (!detail::pread_all(fd_buf, dst[k], static_cast<size_t>(s.bytes[k]), static_cast<off_t>(s.off[k]))) return ReadStatus::IoError;
-    ++buffered_reads_;
+    buffered_reads_.fetch_add(1, std::memory_order_relaxed);
     return ReadStatus::Ok;
   }
 
@@ -376,7 +407,7 @@ private:
   std::unordered_map<uint64_t, Slab> slabs_;
   uint32_t align_ = 4096;
   std::vector<int> fds_dir_, fds_buf_;
-  uint64_t direct_reads_ = 0, buffered_reads_ = 0;
+  std::atomic<uint64_t> direct_reads_{0}, buffered_reads_{0};
 };
 
 class ModelReader final : public ExpertSource {
@@ -449,6 +480,28 @@ public:
     for (int k = 0; k < 3; ++k) out[k] = layers_.at(layer).p[k].per_expert;
     return true;
   }
+  // Only the planes in `mask` (bit k = plane k), concurrently.
+  ReadStatus read_planes(int layer, int expert, void *const dst[3], unsigned mask) {
+    if (!contains(layer, expert)) return ReadStatus::NotFound;
+    reads.fetch_add(1, std::memory_order_relaxed);
+    auto one = [&](int k) {
+      const Proj &p = layers_.at(layer).p[k];
+      const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
+      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
+      if (drop_page_cache) ::posix_fadvise(p.fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
+      return true;
+    };
+    std::vector<std::future<bool>> fs;
+    int last = -1;
+    for (int k = 0; k < 3; ++k) if (mask >> k & 1u) last = k;
+    bool ok = true;
+    for (int k = 0; k < 3; ++k)
+      if ((mask >> k & 1u) && k != last) fs.push_back(std::async(std::launch::async, one, k));
+    if (last >= 0) ok = one(last);
+    for (auto &f : fs) ok = f.get() && ok;
+    return ok ? ReadStatus::Ok : ReadStatus::IoError;
+  }
+
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
     reads.fetch_add(1, std::memory_order_relaxed);
     if (!contains(layer, expert)) return ReadStatus::NotFound;
@@ -480,6 +533,32 @@ private:
   std::vector<int> mirror_fds_;
   std::unordered_set<uint64_t> mirror_set_;
   std::unordered_map<int, Layer> layers_;
+};
+
+// Experts held by BOTH the offload store (one drive) and the main model (another drive): each read is split by plane across the two
+// drives so both work on every miss. Reads alternate between "gate from the model, up+down from the store" and "gate+up from the model,
+// down from the store" so each drive averages 1.5 planes per expert.
+class SplitSource final : public ExpertSource {
+public:
+  std::atomic<uint64_t> split_reads{0}, fallbacks{0};
+  SplitSource(OffloadStore &store, ModelReader &model) : store_(store), model_(model) {}
+  bool contains(int layer, int expert) const override { return store_.contains(layer, expert) && model_.contains(layer, expert); }
+  bool plane_bytes(int layer, int expert, uint64_t out[3]) const override { return store_.plane_bytes(layer, expert, out); }
+  ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
+    const unsigned model_mask = (n_.fetch_add(1, std::memory_order_relaxed) & 1u) ? 0b011u : 0b001u;
+    const unsigned store_mask = 0b111u & ~model_mask;
+    auto side = std::async(std::launch::async, [&] { return model_.read_planes(layer, expert, dst, model_mask); });
+    const ReadStatus a = store_.read_planes(layer, expert, dst, store_mask);
+    const ReadStatus b = side.get();
+    split_reads.fetch_add(1, std::memory_order_relaxed);
+    if (a == ReadStatus::Ok && b == ReadStatus::Ok) return ReadStatus::Ok;
+    fallbacks.fetch_add(1, std::memory_order_relaxed);
+    return model_.read_expert(layer, expert, dst);
+  }
+private:
+  OffloadStore &store_;
+  ModelReader &model_;
+  std::atomic<uint64_t> n_{0};
 };
 
 // ---------------------------------------------------------------------------------------------------- arena
