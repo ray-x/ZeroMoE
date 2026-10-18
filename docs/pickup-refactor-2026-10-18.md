@@ -28,6 +28,8 @@ Do not try to rebase by hash. Transplant by content:
 | `src/main_test.cpp` | `tests/native/tests_*.cpp`; `main()` and EXL3 tests stay in `main_test.cpp` |
 | `src/ggml_deepseek_v4_graph.cpp` (DeepSeek-V4, not V4.1) | deleted; `graph_alloc_vram_headroom_ok` is in `src/ggml_graph_vram_headroom.cpp` |
 | hyper-connection wiring pasted in 3 rows | `use_hyper_connections(ops, c)` in `models/family_ops.cpp` |
+| 7 `qwen4exp_*` members of `CPUEngine` (not `StreamingEngine`) | `CPUEngine::qwen4exp` (`include/qwen4exp_cpu_state.hpp`); touches only `cpu_qwen4exp.cpp`, `exl3_decode.cpp`, `cpu_main.cpp` |
+| `early_ready_lane.hpp`, `qwen4exp_stage_pool.hpp` hand-freed CUDA resources | `include/cuda_raii.hpp` owners (`DeviceBuffer`, `PinnedBuffer`, `CudaEvent`, `CudaStream`), test `cuda_raii_test` |
 
 How to move a `main.cpp` hunk: take the refactored `main.cpp`, then
 `git show <commit> -- src/main.cpp | sed 's#src/main.cpp#src/<phase file>#' | git apply --recount -C1 --whitespace=nowarn --reject`.

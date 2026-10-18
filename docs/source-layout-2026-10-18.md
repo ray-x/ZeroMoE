@@ -72,6 +72,40 @@ the `dsv4_*` helpers still living beside the V4.1 code and used through
 under a V4 name); and the near-identical per-family `FullGraphModel` classes in
 `models/full_graph_models.cpp`.
 
+## CRTP for the full-graph builders: what a survey of the code found
+
+The model boundary is already CRTP (`FullGraphModelBase<Derived>` in
+`models/full_graph_model.hpp`: validation and prefill/decode dispatch are static; only the
+registry lookup is virtual, 15 virtuals each called once per graph build or run). Pushing it
+deeper would unify what the Qwen4Exp and GLM5Next builders duplicate, so I compared the
+same-named functions after normalising family names (similarity 1.0 = identical):
+
+| function | similarity | lines (qwen / glm) |
+|---|---:|---|
+| `type_ok` | 1.00 | 3 / 3 |
+| `env_device_expert_layers` | 0.98 | 10 / 10 |
+| `expert_weight` | 0.73 | 5 / 5 |
+| `env_enabled` | 0.69 | 6 / 8 |
+| `resident_tensor` | 0.40 | 85 / 23 |
+| `load_full_weight` | 0.36 | 254 / 98 |
+| `device_expert_bytes` | 0.33 | 111 / 60 |
+| `graph_dense_weight_name` | 0.16 | 66 / 18 |
+| `build_graph` | 0.00 | 1090 / 534 |
+
+So the genuinely duplicated code is about 20 lines; everything large has diverged because
+the architectures differ (GDN layers vs KDA layers, PLE, per-layer expert placement). A
+shared `GraphBuilderBase<Derived>` skeleton would have almost nothing to hold. The earlier
+shared pieces (`GraphCore`, `moe_routed_ggml.hpp`, `expert_store.hpp`) already took the
+duplication that existed. I did not touch these files: Qwen/GLM5Next graph code is under
+active tuning and the gain would be ~20 lines.
+
+Performance: graph construction is once per request (Qwen decode setup: `graph=7.3ms` of
+`prepare_total=53ms`, about 0.24% of a 64-token request); per-token work replays the built
+graph. Static vs virtual dispatch at the build boundary therefore cannot move tokens/second.
+Not applicable here: expression templates with `static_assert` on shapes (dimensions come
+from the model file at runtime) and `index_sequence` unrolling over layers (`n_layers` is a
+runtime value; it would instantiate a separate huge function per model size).
+
 ## Still over 3k lines (not touched)
 
 | file | lines | why left alone |
