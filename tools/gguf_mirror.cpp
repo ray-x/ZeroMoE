@@ -116,7 +116,7 @@ int verify(const std::string &mirror_dir, const std::string &model, int sample) 
 namespace gguf_tool {
 
 int cmd_mirror_subset(int argc, char **argv) {
-  std::string model, mdir, usage, pusage, against;
+  std::string model, mdir, usage, pusage, against, expert_list;
   double hot_gib = -1, frac = 0.5, pw = 0.25;
   bool dry = false, do_verify = false;
   int sample = 0;
@@ -127,6 +127,7 @@ int cmd_mirror_subset(int argc, char **argv) {
     if (a == "--usage-file") usage = next();
     else if (a == "--prefill-usage-file") pusage = next();
     else if (a == "--prefill-weight") pw = atof(next().c_str());
+    else if (a == "--expert-list") expert_list = next();
     else if (a == "--hot-gib") hot_gib = atof(next().c_str());
     else if (a == "--fraction") frac = atof(next().c_str());
     else if (a == "--dry-run") dry = true;
@@ -139,7 +140,7 @@ int cmd_mirror_subset(int argc, char **argv) {
     if (pos.empty() || against.empty()) { fprintf(stderr, "usage: mirror-subset --verify <mirror_dir> --against <model> [--sample N]\n"); return 2; }
     return verify(pos[0], against, sample);
   }
-  if (pos.size() != 2 || usage.empty() || hot_gib < 0 || frac < 0 || frac > 1) {
+  if (pos.size() != 2 || (expert_list.empty() && (usage.empty() || hot_gib < 0)) || frac < 0 || frac > 1) {
     fprintf(stderr, "usage: mirror-subset <model_file_or_dir> <mirror_dir> --usage-file <u> [--prefill-usage-file <p>] "
                     "[--prefill-weight W] --hot-gib G [--fraction F] [--dry-run]\n");
     return 2;
@@ -150,8 +151,8 @@ int cmd_mirror_subset(int argc, char **argv) {
   if (!f.load_header(model)) { fprintf(stderr, "[mirror] FATAL: cannot load %s\n", model.c_str()); return 1; }
 
   std::map<std::pair<int, int>, uint64_t> use;
-  if (!load_usage(usage, use, 1.0)) { fprintf(stderr, "[mirror] FATAL: cannot read %s\n", usage.c_str()); return 1; }
-  if (!pusage.empty()) load_usage(pusage, use, pw);
+  if (expert_list.empty() && !load_usage(usage, use, 1.0)) { fprintf(stderr, "[mirror] FATAL: cannot read %s\n", usage.c_str()); return 1; }
+  if (expert_list.empty() && !pusage.empty()) load_usage(pusage, use, pw);
 
   std::vector<Expert> all;
   uint64_t total = 0;
@@ -173,15 +174,31 @@ int cmd_mirror_subset(int argc, char **argv) {
     return a.layer < b.layer;
   });
 
-  const uint64_t hot_bytes = (uint64_t)(hot_gib * 1073741824.0);
+  const uint64_t hot_bytes = (uint64_t)(std::max(hot_gib, 0.0) * 1073741824.0);
   uint64_t hot_used = 0, cold_total = 0;
   size_t first_cold = 0;
-  while (first_cold < all.size() && hot_used + all[first_cold].bytes <= hot_bytes) hot_used += all[first_cold++].bytes;
+  if (expert_list.empty())
+    while (first_cold < all.size() && hot_used + all[first_cold].bytes <= hot_bytes) hot_used += all[first_cold++].bytes;
   for (size_t i = first_cold; i < all.size(); ++i) cold_total += all[i].bytes;
 
   std::vector<Expert> chosen;
   uint64_t mirror_bytes = 0, seen = 0;
   uint64_t cold_traffic = 0, mirror_traffic = 0;
+  if (!expert_list.empty()) {
+    // Explicit set ("layer<TAB>expert" per line), e.g. the experts of an existing offload store.
+    std::set<std::pair<int, int>> want;
+    std::ifstream in(expert_list);
+    if (!in) { fprintf(stderr, "[mirror] FATAL: cannot read %s\n", expert_list.c_str()); return 1; }
+    int l, e;
+    while (in >> l >> e) want.insert({l, e});
+    for (auto &x : all)
+      if (want.count({x.layer, x.expert})) { chosen.push_back(x); mirror_bytes += x.bytes; }
+    if (chosen.size() != want.size()) {
+      fprintf(stderr, "[mirror] FATAL: %zu of %zu listed experts are not packed routed experts of this model\n",
+              want.size() - chosen.size(), want.size());
+      return 1;
+    }
+  } else
   for (size_t i = first_cold; i < all.size(); ++i) {
     seen += all[i].bytes;
     cold_traffic += all[i].score;
