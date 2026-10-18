@@ -82,3 +82,18 @@ Every chunk of a long prompt runs through the graph for GLM (1152-5117 tokens te
 (333-3989 tokens tested, `context_size = 8192`; one graph up to ~7k tokens with GPU op-offload). Accepted bounds:
 prompts past `context_size` are refused with the value to raise; Qwen has no non-graph prefill under the graph-only expert
 placement; GLM's selection beyond top-k has consistency evidence only (no independent reference in the engine).
+
+## GLM-5.3 (UD-IQ2_M, glm-dsa), layered path, 3090 + dense on 5060 Ti (2026-10-18)
+
+426-token prompt, 48 new tokens, temperature 0, `MOESTREAM_DENSE_SCRATCH_RESERVE_MB=768`. Single samples.
+
+| Setup | Decode tok/s | Prefill tok/s | Disk GB/s | Hit |
+|---|---|---|---|---|
+| one NVMe | 0.88 | 1.82 | 2.60 | 85.8% |
+| + sparse second-drive mirror (`gguf_tool mirror-subset`, 47.7 GiB, 19.6% of reads from drive 2) | 0.96 | 1.84 | 2.93 | 86.7% |
+
+The mirror gives about +9% decode and +1% prefill (single sample, identical output). Prefill still reads ~150 GB per 426-token prompt on
+this path; only a batched graph prefill, where each cold expert is read once per batch, can approach 10 tok/s.
+
+GLM_DSA full graph (`MOESTREAM_GLM_DSA_FULL_GRAPH=1`, branch `glm53-layered-speed`): not yet measured. The graph declines at start-up because it
+loads the whole 204 GiB expert source into DDR; it needs the SSD offload store (`gguf_tool offload`) to run in 82 GB of host RAM.
