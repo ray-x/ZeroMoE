@@ -495,6 +495,14 @@ if(NOT MOESTREAM_CPU_ONLY)
     # Native test harness
     add_executable(moestream_tests
         src/main_test.cpp
+        tests/native/tests_basic_cuda.cpp
+        tests/native/tests_cpu_quant.cpp
+        tests/native/tests_cpu_moe.cpp
+        tests/native/tests_gpu_attention.cpp
+        tests/native/tests_quant_proto.cpp
+        tests/native/tests_expert_cache.cpp
+        tests/native/tests_gpu_kernels.cpp
+        tests/native/tests_config.cpp
         src/exl3_cpu.cpp
         src/exl3_gpu.cpp
         src/execution_layer.cpp
