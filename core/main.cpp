@@ -1,3 +1,4 @@
+#include <malloc.h>
 #include "active_layer_upload_workers.hpp"
 #include "async_prefetcher.hpp"
 #include "cuda_manager.hpp"
@@ -379,6 +380,16 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
 }
 
 int main(int argc, char *argv[]) {
+  // Expert slabs are 3-14 MB posix_memalign blocks that the RAM tier
+  // allocates and frees constantly (prefill-window trim, slab regrow). With
+  // glibc's default dynamic mmap threshold, the first free of such a block
+  // raises the threshold to 32 MB, after which every slab comes from the
+  // heap arenas and frees are never returned to the OS: a 426-token GLM-5.3
+  // prefill grew RSS to 103 GB against a 64 GB ledger and drove MemAvailable
+  // to 2 GB. Setting the threshold explicitly pins it, so slabs stay mmap'd
+  // and give their pages back on free.
+  mallopt(M_MMAP_THRESHOLD, 1 << 20);
+  mallopt(M_TRIM_THRESHOLD, 128 << 20);
   install_shutdown_handlers(); // Ctrl-C/SIGTERM -> graceful teardown (see
                                // shutdown.hpp)
 
