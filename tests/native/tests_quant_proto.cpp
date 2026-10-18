@@ -1,4 +1,4 @@
-// Native test harness: tests_quant_proto (split from src/main_test.cpp).
+// Native test harness: tests_quant_proto (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // Gated feasibility bench (MOESTREAM_RUN_BENCH=1, same convention as the

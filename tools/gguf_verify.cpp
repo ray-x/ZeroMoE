@@ -58,7 +58,7 @@ static bool is_attention_or_norm(const std::string &suffix) {
   // neither "attn" nor "norm" and was silently NOT hard-required per
   // layer, exactly the class of gap this check exists to catch (a shard
   // that dropped one of these residual-stream-critical weights on some
-  // layer would have passed verify clean). See src/main.cpp's
+  // layer would have passed verify clean). See core/main.cpp's
   // is_dense_offload_candidate for the same "hc_" rationale.
   return suffix.find("attn") != std::string::npos ||
          suffix.find("norm") != std::string::npos ||

@@ -6,7 +6,7 @@
 // Reports:
 //   - dense (always-VRAM-resident) tensor requirement, by category, with a
 //     worst-case (nothing BF16-converted) and best-case (attn_output fully
-//     BF16-converted) GB range -- mirrors src/main.cpp's REAL categorization
+//     BF16-converted) GB range -- mirrors core/main.cpp's REAL categorization
 //     (is_dense_offload_candidate / is_attn_output / categorize_dense_tensor)
 //     byte-for-byte, so these numbers agree with what a real run's
 //     [VRAM-BREAKDOWN] log would show for the same model.
@@ -20,7 +20,7 @@
 //   - .moestream_usage summary, if present: how many (layer,expert) pairs
 //     have been seen, and per-layer top-K concentration (how much of a
 //     layer's traffic its K hottest experts cover) -- the same metric
-//     src/main.cpp's [PIN] log already computes for a live run, surfaced
+//     core/main.cpp's [PIN] log already computes for a live run, surfaced
 //     here BEFORE a run exists (or from a prior one) to size pin_topk_per_layer.
 //
 // Deliberately advisory only -- prints numbers, does not write a config
@@ -57,7 +57,7 @@ namespace gguf_tool {
 namespace {
 
 // ---- dense-tensor categorization, copied verbatim (same predicates, same
-// category names) from src/main.cpp so these numbers agree with a real
+// category names) from core/main.cpp so these numbers agree with a real
 // run's [VRAM-BREAKDOWN] log for the same model. Keep these three in sync
 // with main.cpp if the engine's own categorization ever changes. ----
 
@@ -84,7 +84,7 @@ bool is_dense_offload_candidate(const std::string &name) {
   // engram_q/engram_k/engram_wkv (DeepSeek-V4.1's Engram gate/projection
   // weights, NOT engram_embd -- that giant hash-embedding table is
   // deliberately kept mmap'd on NVMe, see deepseek41_engram.cpp) -- same
-  // gap fixed in src/main.cpp's own predicate, found investigating a real
+  // gap fixed in core/main.cpp's own predicate, found investigating a real
   // CPU-fallback cost these small resident tensors were paying.
   if (name.find("engram_wkv.weight") != std::string::npos ||
       name.find("engram_q.weight") != std::string::npos ||
@@ -92,7 +92,7 @@ bool is_dense_offload_candidate(const std::string &name) {
     return true;
   }
   // hc_ catches DeepSeek-V4's Hyper-Connections weights (6 per-layer +
-  // 3 global output_hc_*) -- see src/main.cpp's own comment on this same
+  // 3 global output_hc_*) -- see core/main.cpp's own comment on this same
   // predicate for the full rationale.
   if (name.find("hc_") != std::string::npos) return true;
   // ssm_/ple_ catch Qwen4Exp's GDN/PLE resident tensors -- see main.cpp's
@@ -238,7 +238,7 @@ void print_detected_ram() {
 
 // .moestream_usage is a plain "layer expert count" text file (one line per
 // ever-selected (layer,expert) pair, written by StreamingEngine::dump_usage
-// in include/engine.hpp). Re-implemented here rather than including
+// in core/engine.hpp). Re-implemented here rather than including
 // engine.hpp directly, to keep this tool decoupled from the engine's own
 // (CUDA-linked) headers -- same reasoning as gguf_verify.cpp's own
 // from-scratch completeness check.
@@ -284,7 +284,7 @@ void print_usage_summary(const std::string &path) {
 
   // Top-K coverage: for each layer, what fraction of that layer's TOTAL
   // recorded hits its K hottest experts account for. Same concept as
-  // src/main.cpp's [PIN] concentration log, computed here so it's visible
+  // core/main.cpp's [PIN] concentration log, computed here so it's visible
   // before pin_topk_per_layer is even chosen for a first real run.
   for (int k : {8, 11, 16}) {
     double min_cov = 1.0, max_cov = 0.0, sum_cov = 0.0;

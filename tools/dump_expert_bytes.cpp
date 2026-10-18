@@ -2,7 +2,7 @@
 // packed blk.<L>.ffn_{gate,up,down}_exps.weight tensor and write them to a
 // flat binary file.
 //
-// Built to feed src/main_test.cpp's real-expert IQ2_XXS dequant test: a live
+// Built to feed tests/native/main_test.cpp's real-expert IQ2_XXS dequant test: a live
 // VERBOSE trace on a real DeepSeek-V4-Flash decode run showed specific
 // experts producing an exactly-all-zero SiLU output on the GPU path, fully
 // deterministic across repeated runs, while that block's own dequant scale

@@ -27,7 +27,7 @@
 #include "mmid_route_skip.hpp"
 #include "moe_partial_route.hpp"
 #include "moe_partial_route_ggml.hpp"
-#include "../models/full_graph_model.hpp"
+#include "full_graph_model.hpp"
 #include "moe_routed_config.hpp"
 #include "moe_routed_ggml.hpp"
 

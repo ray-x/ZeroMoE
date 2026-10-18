@@ -1,4 +1,4 @@
-// Native test harness: tests_cpu_moe (split from src/main_test.cpp).
+// Native test harness: tests_cpu_moe (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 bool test_qwen_cpu_moe_graph() {

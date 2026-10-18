@@ -1,4 +1,4 @@
-// Unit test for include/moe_partial_route.hpp (no ggml, no model, no GPU).
+// Unit test for backends/ggml/moe_partial_route.hpp (no ggml, no model, no GPU).
 //   g++ -std=c++20 -Iinclude tests/test_moe_partial_route.cpp -o /tmp/test_moe_partial_route
 //   /tmp/test_moe_partial_route capable    # patched ggml advertises the negative-id skip
 //   /tmp/test_moe_partial_route stock      # stock ggml: capability function reports 0

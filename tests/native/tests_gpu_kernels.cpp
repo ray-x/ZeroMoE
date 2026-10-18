@@ -1,4 +1,4 @@
-// Native test harness: tests_gpu_kernels (split from src/main_test.cpp).
+// Native test harness: tests_gpu_kernels (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // 2026-09-05: dense BF16 prefill GEMM extended from Q8_0-only to Q5_K/Q6_K.
@@ -77,7 +77,7 @@ bool test_dense_bf16_kquant() {
     return all;
 }
 
-// 2026-09-05: GDN causal conv1d+SiLU GPU path (cuda/gdn_conv1d.cu,
+// 2026-09-05: GDN causal conv1d+SiLU GPU path (kernels/math/gdn_conv1d.cu,
 // EngineConfig::qwen4exp_gdn_conv_gpu). Compares the new GPU kernel
 // directly against attn_causal_conv1d_silu (the already-proven CPU
 // reference, itself already fixed once for cache-locality -- see CLAUDE.md's

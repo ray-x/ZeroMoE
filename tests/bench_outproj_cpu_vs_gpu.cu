@@ -60,7 +60,7 @@ static constexpr int WARMUP_CYCLES = 1;
     } \
 } while (0)
 
-// ---- Exact same algorithm as src/attention_layer.cpp's S==1 outproj path
+// ---- Exact same algorithm as core/attention_layer.cpp's S==1 outproj path
 // (dot_f32_avx512 per output row, one combined OMP region over all
 // (group, output) pairs) -- kept as a faithful standalone copy, not a
 // reimplementation with different tuning, so this benchmark measures

@@ -1,5 +1,5 @@
 // TEST-ONLY reference: MoEStream's original fp32 EXL3 mul1 matmul kernels.
-// Production uses upstream ExLlamaV3 (src/exl3_upstream_ops.cu); this file is
+// Production uses upstream ExLlamaV3 (backends/exl3/exl3_upstream_ops.cu); this file is
 // kept only as an independent implementation for tests/exl3_upstream_parity.cu.
 #include "exl3_cuda.hpp"
 #include "exl3_format.hpp"

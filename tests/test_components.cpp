@@ -146,7 +146,7 @@ void test_topk_selection() {
 
 
 // ============================================================
-// Option-B global pool: pooled top-K across layers (include/option_b_global_hot.hpp)
+// Option-B global pool: pooled top-K across layers (models/qwen/option_b_global_hot.hpp)
 // ============================================================
 void test_option_b_global_pool() {
   std::cout << "[TEST] Option-B Global Pool Selection..." << std::flush;
@@ -516,7 +516,7 @@ moe_cache_gb = 23.0
 // used to do NeoX rotate-half (pairs (k, k+half)). The known-answer case below
 // DISTINGUISHES the two -- rotate-half yields [cos1, 0, sin1, 0], interleaved
 // yields [cos1, sin1, 0, 0]. If rope.hpp is ever reverted to rotate-half, this
-// test fails loudly. Calls the REAL rope_yarn_inplace from include/rope.hpp
+// test fails loudly. Calls the REAL rope_yarn_inplace from models/base/rope.hpp
 // (not a copy), via #include "rope.hpp".
 void test_rope() {
   std::cout << "[TEST] RoPE convention (interleaved)..." << std::flush;
@@ -680,7 +680,7 @@ void test_dsv4_rope() {
 }
 
 // Sinkhorn normalization (DeepSeek-V4 Hyper-Connections' comb-matrix
-// mixing, include/hyper_connections.hpp). Pure math, no engine dependency
+// mixing, core/hyper_connections.hpp). Pure math, no engine dependency
 // -- see that header's own comment for how tentative the REST of the
 // Hyper-Connections reconstruction is; this specific primitive (the
 // iterative normalization procedure itself, independent of what feeds
@@ -987,7 +987,7 @@ void test_dsv4_compressed_state_helpers() {
 // ============================================================
 // Test: DeepSeek-V4 hash-routed MoE token-id -> expert-id lookup
 // ============================================================
-// The real lookup lives in src/execution_layer.cpp's moe_forward_gguf
+// The real lookup lives in core/execution_layer.cpp's moe_forward_gguf
 // (CUDA-touching, can't be built here -- see this file's header) --
 // mirrors that exact arithmetic (row offset = token_id * topk, the
 // token-id-in-[0,vocab) bounds check, and the per-expert-id-in-
@@ -1085,7 +1085,7 @@ void test_tid2eid_lookup() {
 // Test: Q2_K / Q3_K dequant LOGIC (scalar oracle vs scalar port of the
 // AVX-512 algorithm's per-group formula)
 // ============================================================
-// The real AVX-512 kernels live in src/kernels_cpu.cpp and need AVX-512
+// The real AVX-512 kernels live in backends/cpu/kernels_cpu.cpp and need AVX-512
 // hardware to build/run (this file deliberately doesn't -- see the file
 // header), so they can't be exercised here. What CAN be verified on any
 // machine is the underlying ALGORITHM: block layout offsets, scale/min
@@ -1095,13 +1095,13 @@ void test_tid2eid_lookup() {
 // below is a verbatim scalar transcription of ggml's real
 // dequantize_row_q2_K/q3_K (ggml/src/ggml-quants.c, confirmed against the
 // upstream source directly, not from memory); `candidate_*` reproduces the
-// SAME per-16-element formula src/kernels_cpu.cpp's AVX-512 functions use
+// SAME per-16-element formula backends/cpu/kernels_cpu.cpp's AVX-512 functions use
 // (unpack 2-bit code, combine with hmask for Q3_K, apply dl/ml), just as a
 // scalar loop instead of intrinsics -- the one AVX-512-specific detail this
 // can't cover is the byte-widen-before-shift technique used to avoid
 // cross-lane bit bleed in the real SIMD code, a standard, low-risk,
 // mechanical pattern. This test targets the higher-risk part: the format
-// understanding itself. See src/main_test.cpp's Test 6 for the full,
+// understanding itself. See tests/native/main_test.cpp's Test 6 for the full,
 // AVX-512-vs-ggml-reference comparison (requires the Linux+CUDA build).
 static float f16_bits_to_f32(uint16_t h) {
   uint32_t sign = (uint32_t)(h & 0x8000) << 16;
@@ -1197,7 +1197,7 @@ static void oracle_dequant_q3_K(const uint8_t *block, float *y, int64_t k) {
   }
 }
 
-// Scalar transcription of src/kernels_cpu.cpp's AVX-512 group-of-16 formula
+// Scalar transcription of backends/cpu/kernels_cpu.cpp's AVX-512 group-of-16 formula
 // (unpack_2bit_x16 + dequant_q2k_group16/dequant_q3k_group16), loop-per-
 // element instead of one SIMD call -- same block-layout offsets, same
 // nested n/j/shift bookkeeping, same integer-domain combine before the
@@ -1335,11 +1335,11 @@ static void test_q2k_q3k_dequant_logic() {
 // table's actual content, only on oracle and candidate reading the same
 // bytes the same way. `oracle_*` mirrors the reference's own pointer-cast
 // style (aux8 aliasing into aux32, matching CUDA/ggml source structure);
-// `candidate_*` mirrors src/kernels_cpu.cpp's actual memcpy-based
+// `candidate_*` mirrors backends/cpu/kernels_cpu.cpp's actual memcpy-based
 // implementation structure -- so this specifically cross-checks the
 // memcpy/offset arithmetic in the real production code against a
 // structurally-independent re-derivation of the same formula. See
-// src/main_test.cpp's Test 7 for the full AVX-512-vs-ggml-reference
+// tests/native/main_test.cpp's Test 7 for the full AVX-512-vs-ggml-reference
 // comparison with real ggml data (requires the Linux+CUDA build).
 static void test_iq2xxs_iq3xxs_dequant_logic() {
   std::cout << "[TEST] IQ2_XXS/IQ3_XXS dequant logic (oracle vs AVX-512 "
@@ -1626,7 +1626,7 @@ static void test_iq2s_dequant_logic() {
 }
 
 // Verifies the EXPERIMENTAL 16-wide dequant functions' pairing logic
-// (src/kernels_cpu.cpp's dequantize_row_iq{2_xxs,3_xxs,2_s}_avx512_wide):
+// (backends/cpu/kernels_cpu.cpp's dequantize_row_iq{2_xxs,3_xxs,2_s}_avx512_wide):
 // that batching two 8-element groups into one 16-wide op produces IDENTICAL
 // output to doing them as two separate 8-element ops. Same methodology as
 // the other dequant logic tests above (synthetic grid table, scalar
@@ -1891,7 +1891,7 @@ static void test_iq2_wide_dequant_logic() {
 // part of a careful, test-gated retry of the attn_output BF16 fast-path
 // after a real run produced NaN corruption on real hardware (see
 // CLAUDE.md's incident writeup) -- the actual GPU-side suspect there was
-// cublasGemmEx's mismatched-type dispatch (covered by src/main_test.cpp's
+// cublasGemmEx's mismatched-type dispatch (covered by tests/native/main_test.cpp's
 // Test 9, which needs real CUDA), but this rounding math is the one piece
 // of that feature that's fully portable and verifiable right here, so no
 // reason to leave it merely "reviewed, not run" when it can genuinely be
@@ -1988,7 +1988,7 @@ void test_bf16_roundtrip_logic() {
 // ============================================================
 // Test: GpuTopology::expert_index (O(1) find_expert) logic
 // ============================================================
-// include/gpu_topology.hpp's GpuTopology can't be instantiated on this
+// core/gpu_topology.hpp's GpuTopology can't be instantiated on this
 // darwin dev machine at all (deeply CUDA-entangled: cudaEvent_t members,
 // cudaSetDevice/cudaEventQuery calls) -- so this is a minimal, CUDA-free
 // reimplementation of exactly the identity-resolution logic under test
@@ -2146,7 +2146,7 @@ void test_expert_vram_index_logic() {
 // ============================================================
 // Test: direct_io::compute_aligned_window (O_DIRECT alignment arithmetic)
 // ============================================================
-// This is the REAL function used by include/direct_io.hpp's
+// This is the REAL function used by memory/direct_io.hpp's
 // pread_direct_aware -- unlike the O_DIRECT syscall behavior itself
 // (which this darwin dev machine cannot exercise at all, and which
 // tests/main_test.cpp's own CUDA-dependent tests can't reach either
@@ -2928,7 +2928,7 @@ void test_qwen4exp_layer_detection() {
   std::cout << " PASSED\n";
 }
 
-// Qwen4Exp GDN gated delta rule (include/qwen4exp_gdn.hpp's
+// Qwen4Exp GDN gated delta rule (models/qwen/qwen4exp_gdn.hpp's
 // qwen4exp_gdn_delta_chunk vs qwen4exp_gdn_delta_step: the chunked form must
 // reproduce the sequential recurrence EXACTLY (to float rounding), because it
 // is a closed-form rewrite of the same rule, not an approximation. The
@@ -3091,7 +3091,7 @@ void test_qwen4exp_l2_norm() {
   std::cout << " PASSED\n";
 }
 
-// Qwen4Exp PLE n-gram hash (include/ple_hash.hpp's ple_ngram_row, the REAL
+// Qwen4Exp PLE n-gram hash (models/qwen/ple_hash.hpp's ple_ngram_row, the REAL
 // function ple_ngram.cpp calls) against a hand-computed reference,
 // including a multiplier too wide for float32 (45-bit constants are the
 // whole reason this hash exists in int64 -- see the header comment).

@@ -20,7 +20,7 @@ cd "$(dirname "$0")/.."
 CXX="${CXX:-c++}"                 # c++ -> clang++ on macOS, g++ on most Linux
 BIN="${BIN:-./build/test_components}"
 SRC="tests/test_components.cpp"
-SUPPORT_SRCS="src/exl3_cpu.cpp src/exl3_model_loader.cpp src/safetensors_adapter.cpp"
+SUPPORT_SRCS="backends/exl3/exl3_cpu.cpp backends/exl3/exl3_model_loader.cpp models/base/safetensors_adapter.cpp"
 
 if [ ! -f "$SRC" ]; then
     echo "FATAL: $SRC not found (run from the MoEStream repo root)" >&2
@@ -36,15 +36,15 @@ EXTRA_LDFLAGS=""
 ARCH_FLAGS=""
 INC_FLAGS=""
 if [ "$ARCH" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
-    KERNEL_SRC="src/kernels_cpu_neon.cpp"
+    KERNEL_SRC="backends/cpu/kernels_cpu_neon.cpp"
     # kernels_cpu_neon.cpp calls into moestream_metal:: under #ifdef __APPLE__
-    # (src/kernels_metal.mm, an Objective-C++ TU using MPSMatrixMultiplication)
+    # (backends/cpu/kernels_metal.mm, an Objective-C++ TU using MPSMatrixMultiplication)
     # -- link it in and pull the frameworks it needs, or every test binary on
     # Apple Silicon fails at link time with undefined moestream_metal symbols.
-    EXTRA_SRCS="src/kernels_metal.mm"
+    EXTRA_SRCS="backends/cpu/kernels_metal.mm"
     EXTRA_LDFLAGS="-framework Metal -framework MetalPerformanceShaders -framework Foundation"
 else
-    KERNEL_SRC="src/kernels_cpu.cpp"
+    KERNEL_SRC="backends/cpu/kernels_cpu.cpp"
     # kernels_cpu.cpp is the AVX-512 backend and uses F16C intrinsics
     # (_cvtsh_ss) unconditionally, so it does NOT build with plain -O2 on
     # x86: gcc rejects it with "inlining failed in call to always_inline
@@ -65,12 +65,12 @@ else
     # non-AVX-512 x86 host still gets the old behaviour (and the same
     # clearer compiler error) instead of an unknown-flag failure.
     # kernels_cpu.cpp also pulls two link-time dependencies the NEON file
-    # does not: the IQ2/IQ3 grid tables (src/ggml_grids.cpp -- ms_grid_*) and
+    # does not: the IQ2/IQ3 grid tables (backends/cpu/ggml_grids.cpp -- ms_grid_*) and
     # ggml's own quantize_row_q8_K_ref (used by the ggml-port AVX2 dot
     # prototypes). libggml is only present once the CUDA build has been
     # configured, so link it opportunistically and say so if it is missing,
     # rather than failing with a wall of undefined references.
-    EXTRA_SRCS="src/ggml_grids.cpp"
+    EXTRA_SRCS="backends/cpu/ggml_grids.cpp"
     # ggml_grids.cpp includes ggml-common.h, which lives in the fetched
     # ggml source tree (not in include/), so add it to the search path.
     GGML_SRC_DIR="${GGML_SRC_DIR:-build/_deps/ggml-src/src}"
@@ -86,14 +86,14 @@ else
         GGML_FLAGS="-DMOESTREAM_USE_GGML=1"
     else
         echo "[run_components] WARNING: $GGML_LIB_DIR/libggml-base.so not found" \
-             "(run 'make build' first); src/kernels_cpu.cpp will not link."
+             "(run 'make build' first); backends/cpu/kernels_cpu.cpp will not link."
     fi
     X86_FLAGS="-mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c"
     if "$CXX" -std=c++23 $X86_FLAGS -c -x c++ /dev/null -o /dev/null 2>/dev/null; then
         ARCH_FLAGS="$X86_FLAGS"
     else
         echo "[run_components] WARNING: compiler rejects AVX-512/F16C flags;" \
-             "src/kernels_cpu.cpp likely will not build (see CLAUDE.md)."
+             "backends/cpu/kernels_cpu.cpp likely will not build (see CLAUDE.md)."
     fi
 fi
 

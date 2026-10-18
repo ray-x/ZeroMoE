@@ -20,7 +20,7 @@
 //      (opt-in) switches to the older per-expert behavior: unpacks each
 //      packed tensor (shape [a, b, n_experts]) into n_experts individual
 //      tensors (blk.N.ffn_{gate,up,down}.E.weight) -- the "legacy
-//      per-expert" layout include/engine.hpp's load_expert_slab can load
+//      per-expert" layout core/engine.hpp's load_expert_slab can load
 //      as a single combined pread per expert, but only via the slower
 //      cold path (the VRAM-shadow fast path is packed-only).
 //   2. general.alignment is set to a large value (default 4096) so every

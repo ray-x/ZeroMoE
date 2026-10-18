@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fit and export the GLM pilot ridge correction (RDG1 file, see include/pilot_ridge.hpp).
+"""Fit and export the GLM pilot ridge correction (RDG1 file, see core/pilot_ridge.hpp).
 For each layer pair l -> l+1: score(l+1) = pilot + (rms(x_l) - mu) R + c, fitted on the pilot residual (real l+1 selection score - pilot),
 standardized features, lambda picked per layer on a held-out prompt by cold-only precision of the first 3 candidates (hot set = most used
 experts of the usage file), then refit on every prompt. R is stored in raw feature space (R_std / sd).

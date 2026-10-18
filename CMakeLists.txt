@@ -282,7 +282,23 @@ endif()
 # ---------------------------------------------------------------------------
 # Common include path
 # ---------------------------------------------------------------------------
-include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Source layout (core/ memory/ models/* backends/* kernels/*): every header directory is on
+# the include path, so sources keep flat `#include "name.hpp"` lines and a file can move
+# between these directories without touching its includes. File names are unique across
+# them (checked by layout_map.py).
+set(MOESTREAM_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/core
+    ${CMAKE_CURRENT_SOURCE_DIR}/memory
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/base
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/graph
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/qwen
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/glm
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/cpu
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/cuda
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/ggml
+    ${CMAKE_CURRENT_SOURCE_DIR}/backends/exl3)
+include_directories(${MOESTREAM_INCLUDE_DIRS})
 
 # ---------------------------------------------------------------------------
 # Full engine build (Linux + CUDA Toolkit)
@@ -296,39 +312,39 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     # Engine executable
     # CUDA kernel sources (cuda/*.cu) and the GPU Qwen MoE backend
-    # (src/qwen_moe.cpp, "compiled into the main moestream binary (CUDA
+    # (models/qwen/qwen_moe.cpp, "compiled into the main moestream binary (CUDA
     # builds only)" per its own header comment) were not referenced by
     # ANY target here -- moestream/moestream_tests linked without them and
     # failed at link time with undefined references to every launch_*
     # kernel wrapper (cuda_manager.hpp) and QwenMoEBackend's vtable. Shared
-    # between both executables the same way models/model_factory.cpp
+    # between both executables the same way models/base/model_factory.cpp
     # already is, since both need the identical GPU dispatch surface.
     set(MOESTREAM_CUDA_SRCS
-        cuda/exl3_aux.cu
-        cuda/attn_score_softmax.cu
-        cuda/dsv4_score_softmax.cu
-        cuda/dequant_bf16.cu
-        cuda/expert_accum.cu
-        cuda/expert_activation.cu
-        cuda/gdn_conv1d.cu
-        cuda/glm5next_kda.cu
-        cuda/glm5next_router.cu
-        cuda/ggml_moe_pack.cu
-        cuda/iq1_dequant.cu
-        cuda/iq2_matmul.cu
-        cuda/iq3_matmul.cu
-        cuda/iq4xs_matmul.cu
-        cuda/kquant_matmul.cu
-        cuda/matmul.cu
-        cuda/mla_attention.cu
-        cuda/mxfp4_matmul.cu
-        cuda/q5_1_matmul.cu
-        cuda/qwen4exp_hc_q8.cu
-        cuda/qwen_stage_kernels.cu
-        cuda/q8_0_matmul.cu
-        cuda/q2_0_matmul.cu
-        cuda/rmsnorm.cu
-        cuda/wuv_int8_dequant.cu
+        backends/exl3/exl3_aux.cu
+        kernels/math/attn_score_softmax.cu
+        kernels/models/dsv4_score_softmax.cu
+        kernels/quant/dequant_bf16.cu
+        kernels/math/expert_accum.cu
+        kernels/math/expert_activation.cu
+        kernels/math/gdn_conv1d.cu
+        kernels/models/glm5next_kda.cu
+        kernels/models/glm5next_router.cu
+        kernels/math/ggml_moe_pack.cu
+        kernels/quant/iq1_dequant.cu
+        kernels/quant/iq2_matmul.cu
+        kernels/quant/iq3_matmul.cu
+        kernels/quant/iq4xs_matmul.cu
+        kernels/quant/kquant_matmul.cu
+        kernels/math/matmul.cu
+        kernels/math/mla_attention.cu
+        kernels/quant/mxfp4_matmul.cu
+        kernels/quant/q5_1_matmul.cu
+        kernels/models/qwen4exp_hc_q8.cu
+        kernels/models/qwen_stage_kernels.cu
+        kernels/quant/q8_0_matmul.cu
+        kernels/quant/q2_0_matmul.cu
+        kernels/math/rmsnorm.cu
+        kernels/quant/wuv_int8_dequant.cu
     )
     # The Layer-13 predictive staging spike is an optional worktree feature.
     # Keep a master checkout buildable when its files are absent, while still
@@ -341,14 +357,14 @@ if(NOT MOESTREAM_CPU_ONLY)
     # Runtime opt-out: MOESTREAM_EXL3_UPSTREAM=0 (legacy kernels).
     include(cmake/MoEStreamExl3Upstream.cmake)
     if(TARGET moestream_exl3_upstream)
-        list(APPEND MOESTREAM_CUDA_SRCS src/exl3_upstream_ops.cu)
-        set_source_files_properties(src/exl3_upstream_ops.cu PROPERTIES
+        list(APPEND MOESTREAM_CUDA_SRCS backends/exl3/exl3_upstream_ops.cu)
+        set_source_files_properties(backends/exl3/exl3_upstream_ops.cu PROPERTIES
             INCLUDE_DIRECTORIES "${MOESTREAM_EXLLAMAV3_SRC}")
-        set_source_files_properties(cuda/exl3_aux.cu src/exl3_gpu.cpp
-            src/exl3_ggml_ffn.cpp src/exl3_upstream_ops.cu
+        set_source_files_properties(backends/exl3/exl3_aux.cu backends/exl3/exl3_gpu.cpp
+            backends/exl3/exl3_ggml_ffn.cpp backends/exl3/exl3_upstream_ops.cu
             PROPERTIES COMPILE_DEFINITIONS MOESTREAM_EXL3_UPSTREAM=1)
         set(MOESTREAM_EXL3_UPSTREAM_LIB moestream_exl3_upstream)
-        set(MOESTREAM_EXL3_UPSTREAM_OPS src/exl3_upstream_ops.cu)
+        set(MOESTREAM_EXL3_UPSTREAM_OPS backends/exl3/exl3_upstream_ops.cu)
     endif()
 
     set(MOESTREAM_OPTIONAL_SRCS)
@@ -357,99 +373,99 @@ if(NOT MOESTREAM_CPU_ONLY)
     endif()
 
     add_executable(moestream
-        src/main.cpp
-        src/engine_runner.cpp
-        src/engine_runner_model.cpp
-        src/engine_runner_cache.cpp
-        src/engine_runner_dense.cpp
-        src/engine_runner_ram.cpp
-        src/engine_runner_preload.cpp
-        src/engine_runner_session.cpp
-        src/perf_report_summary.cpp
-        src/perf_report_dump_a.cpp
-        src/perf_report_dump_b.cpp
-        src/perf_report_stats.cpp
-        src/execution_layer.cpp
-        src/exl3_cpu.cpp
-        src/exl3_model_loader.cpp
-        src/exl3_decode.cpp
-        src/exl3_gpu.cpp
-        src/cpu_dense.cpp
-        src/cpu_engine.cpp
-        src/cpu_forward.cpp
-        src/cpu_model_backend.cpp
-        src/cpu_qwen_moe.cpp
-        src/cpu_qwen4exp.cpp
-        src/scratch_buffers.cpp
-        src/cuda_kernel_dispatcher.cpp
-        src/gpu_expert_executor.cpp
-        src/cpu_expert_executor.cpp
-        src/moe_router.cpp
-        src/moe_pipeline.cpp
-        src/moe_pipeline_orchestrator.cpp
-        src/moe_router_service.cpp
-        src/prefill_warmup_manager.cpp
-        src/batched_dispatch_pipeline.cpp
-        src/token_dispatch_pipeline.cpp
-        src/shared_expert_executor.cpp
+        core/main.cpp
+        core/engine_runner.cpp
+        core/engine_runner_model.cpp
+        core/engine_runner_cache.cpp
+        core/engine_runner_dense.cpp
+        core/engine_runner_ram.cpp
+        core/engine_runner_preload.cpp
+        core/engine_runner_session.cpp
+        core/perf_report_summary.cpp
+        core/perf_report_dump_a.cpp
+        core/perf_report_dump_b.cpp
+        core/perf_report_stats.cpp
+        core/execution_layer.cpp
+        backends/exl3/exl3_cpu.cpp
+        backends/exl3/exl3_model_loader.cpp
+        backends/exl3/exl3_decode.cpp
+        backends/exl3/exl3_gpu.cpp
+        backends/cpu/cpu_dense.cpp
+        backends/cpu/cpu_engine.cpp
+        backends/cpu/cpu_forward.cpp
+        backends/cpu/cpu_model_backend.cpp
+        models/qwen/cpu_qwen_moe.cpp
+        models/qwen/cpu_qwen4exp.cpp
+        memory/scratch_buffers.cpp
+        backends/cuda/cuda_kernel_dispatcher.cpp
+        core/gpu_expert_executor.cpp
+        core/cpu_expert_executor.cpp
+        core/moe_router.cpp
+        core/moe_pipeline.cpp
+        core/moe_pipeline_orchestrator.cpp
+        core/moe_router_service.cpp
+        core/prefill_warmup_manager.cpp
+        core/batched_dispatch_pipeline.cpp
+        core/token_dispatch_pipeline.cpp
+        core/shared_expert_executor.cpp
         ${MOESTREAM_OPTIONAL_SRCS}
-        src/attention_layer.cpp
-        src/graph_initializer.cpp
-        src/hyper_connections.cpp
-        src/ple_ngram.cpp
-        src/safetensors_adapter.cpp
-        src/deepseek41_engram.cpp
-        src/gpu_topology.cpp
-        src/ggml_dequant.cpp
-        src/ggml_grids.cpp
-        src/ggml_moe_backend.cpp
-        src/ggml_moe_graph_builder.cpp
-        src/ggml_moe_transfer_manager.cpp
-        src/ggml_moe_runner.cpp
-        src/ggml_router_runner.cpp
-        src/ggml_qwen_shared_runner.cpp
-        src/qwen_cpu_offload_ring.cpp
-        src/ggml_qwen_decode_scheduler.cpp
-        src/ggml_qwen_cpu_moe.cpp
-        src/ggml_qwen4exp_graph.cpp
-        src/ggml_qwen4exp_graph_arena.cpp
-        src/ggml_qwen4exp_graph_build_blocks.cpp
-        src/ggml_qwen4exp_graph_build.cpp
-        src/ggml_qwen4exp_graph_build_moe.cpp
-        src/ggml_qwen4exp_graph_decode_prepare.cpp
-        src/ggml_qwen4exp_graph_diag.cpp
-        src/ggml_qwen4exp_graph_expert_bind.cpp
-        src/ggml_qwen4exp_graph_host_node.cpp
-        src/ggml_qwen4exp_graph_placement.cpp
-        src/ggml_qwen4exp_graph_run.cpp
-        src/ggml_qwen4exp_graph_settings.cpp
-        src/ggml_glm5next_graph.cpp
-        src/ggml_glm5next_graph_arena.cpp
-        src/ggml_glm5next_graph_build.cpp
-        src/ggml_glm5next_graph_build_blocks.cpp
-        src/ggml_glm5next_graph_decode.cpp
-        src/ggml_glm5next_graph_offload.cpp
-        src/ggml_glm5next_graph_partial.cpp
-        src/ggml_glm5next_graph_run.cpp
-        src/ggml_glm5next_graph_settings.cpp
-        src/ggml_glm5next_graph_stage.cpp
-        src/ggml_glm5next_graph_weights.cpp
-        src/ggml_graph_vram_headroom.cpp
-        src/ggml_deepseek_v41_graph.cpp
-        src/ggml_deepseek_v41_graph_decode.cpp
-        src/ggml_hc_backend.cpp
-        src/ggml_gdn_proj_backend.cpp
-        src/ggml_glm5next_proj_backend.cpp
-        src/mtp_speculative.cpp
-        src/kernels_cpu.cpp
-        src/qwen_moe.cpp
-        models/model_factory.cpp
-        models/family_ops.cpp
-        models/full_graph_models.cpp
+        core/attention_layer.cpp
+        models/base/graph_initializer.cpp
+        core/hyper_connections.cpp
+        models/qwen/ple_ngram.cpp
+        models/base/safetensors_adapter.cpp
+        models/deepseek/deepseek41_engram.cpp
+        core/gpu_topology.cpp
+        backends/cpu/ggml_dequant.cpp
+        backends/cpu/ggml_grids.cpp
+        backends/ggml/ggml_moe_backend.cpp
+        models/graph/ggml_moe_graph_builder.cpp
+        backends/ggml/ggml_moe_transfer_manager.cpp
+        backends/ggml/ggml_moe_runner.cpp
+        backends/ggml/ggml_router_runner.cpp
+        models/qwen/ggml_qwen_shared_runner.cpp
+        models/qwen/qwen_cpu_offload_ring.cpp
+        models/qwen/ggml_qwen_decode_scheduler.cpp
+        models/qwen/ggml_qwen_cpu_moe.cpp
+        models/qwen/ggml_qwen4exp_graph.cpp
+        models/qwen/ggml_qwen4exp_graph_arena.cpp
+        models/qwen/ggml_qwen4exp_graph_build_blocks.cpp
+        models/qwen/ggml_qwen4exp_graph_build.cpp
+        models/qwen/ggml_qwen4exp_graph_build_moe.cpp
+        models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp
+        models/qwen/ggml_qwen4exp_graph_diag.cpp
+        models/qwen/ggml_qwen4exp_graph_expert_bind.cpp
+        models/qwen/ggml_qwen4exp_graph_host_node.cpp
+        models/qwen/ggml_qwen4exp_graph_placement.cpp
+        models/qwen/ggml_qwen4exp_graph_run.cpp
+        models/qwen/ggml_qwen4exp_graph_settings.cpp
+        models/glm/ggml_glm5next_graph.cpp
+        models/glm/ggml_glm5next_graph_arena.cpp
+        models/glm/ggml_glm5next_graph_build.cpp
+        models/glm/ggml_glm5next_graph_build_blocks.cpp
+        models/glm/ggml_glm5next_graph_decode.cpp
+        models/glm/ggml_glm5next_graph_offload.cpp
+        models/glm/ggml_glm5next_graph_partial.cpp
+        models/glm/ggml_glm5next_graph_run.cpp
+        models/glm/ggml_glm5next_graph_settings.cpp
+        models/glm/ggml_glm5next_graph_stage.cpp
+        models/glm/ggml_glm5next_graph_weights.cpp
+        models/graph/ggml_graph_vram_headroom.cpp
+        models/deepseek/ggml_deepseek_v41_graph.cpp
+        models/deepseek/ggml_deepseek_v41_graph_decode.cpp
+        backends/ggml/ggml_hc_backend.cpp
+        backends/ggml/ggml_gdn_proj_backend.cpp
+        models/glm/ggml_glm5next_proj_backend.cpp
+        core/mtp_speculative.cpp
+        backends/cpu/kernels_cpu.cpp
+        models/qwen/qwen_moe.cpp
+        models/base/model_factory.cpp
+        models/base/family_ops.cpp
+        models/graph/full_graph_models.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
     target_include_directories(moestream PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MOESTREAM_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
     )
@@ -471,7 +487,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         target_link_libraries(moestream PRIVATE ggml)
         if(MOESTREAM_USE_GGML_CUDA)
             target_link_libraries(moestream PRIVATE ggml-cuda)
-            # Gates include/ggml_moe_backend.hpp's real implementation. Without
+            # Gates backends/ggml/ggml_moe_backend.hpp's real implementation. Without
             # it that file still compiles, but every entry point returns false
             # and execution_layer.cpp falls back to its own dispatch.
             target_compile_definitions(moestream PRIVATE MOESTREAM_USE_GGML_CUDA=1)
@@ -480,9 +496,9 @@ if(NOT MOESTREAM_CPU_ONLY)
         target_include_directories(moestream PRIVATE ${MOESTREAM_GGML_SRC_DIR})
         if(MOESTREAM_USE_GGML_CUDA)
             target_sources(moestream PRIVATE
-                src/exl3_ggml_backend.cpp
-                src/exl3_ggml_ffn.cpp
-                src/exl3_ggml_model.cpp)
+                backends/exl3/exl3_ggml_backend.cpp
+                backends/exl3/exl3_ggml_ffn.cpp
+                backends/exl3/exl3_ggml_model.cpp)
             target_include_directories(moestream PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
         endif()
     endif()
@@ -501,7 +517,7 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     # Native test harness
     add_executable(moestream_tests
-        src/main_test.cpp
+        tests/native/main_test.cpp
         tests/native/tests_basic_cuda.cpp
         tests/native/tests_cpu_quant.cpp
         tests/native/tests_cpu_moe.cpp
@@ -510,78 +526,78 @@ if(NOT MOESTREAM_CPU_ONLY)
         tests/native/tests_expert_cache.cpp
         tests/native/tests_gpu_kernels.cpp
         tests/native/tests_config.cpp
-        src/exl3_cpu.cpp
-        src/exl3_gpu.cpp
-        src/execution_layer.cpp
-        src/scratch_buffers.cpp
-        src/cuda_kernel_dispatcher.cpp
-        src/gpu_expert_executor.cpp
-        src/cpu_expert_executor.cpp
-        src/moe_router.cpp
-        src/moe_pipeline.cpp
-        src/moe_pipeline_orchestrator.cpp
-        src/moe_router_service.cpp
-        src/prefill_warmup_manager.cpp
-        src/batched_dispatch_pipeline.cpp
-        src/token_dispatch_pipeline.cpp
-        src/shared_expert_executor.cpp
+        backends/exl3/exl3_cpu.cpp
+        backends/exl3/exl3_gpu.cpp
+        core/execution_layer.cpp
+        memory/scratch_buffers.cpp
+        backends/cuda/cuda_kernel_dispatcher.cpp
+        core/gpu_expert_executor.cpp
+        core/cpu_expert_executor.cpp
+        core/moe_router.cpp
+        core/moe_pipeline.cpp
+        core/moe_pipeline_orchestrator.cpp
+        core/moe_router_service.cpp
+        core/prefill_warmup_manager.cpp
+        core/batched_dispatch_pipeline.cpp
+        core/token_dispatch_pipeline.cpp
+        core/shared_expert_executor.cpp
         ${MOESTREAM_OPTIONAL_SRCS}
-        src/attention_layer.cpp
-        src/graph_initializer.cpp
-        src/hyper_connections.cpp
-        src/ple_ngram.cpp
-        src/deepseek41_engram.cpp
-        src/gpu_topology.cpp
-        src/ggml_dequant.cpp
-        src/ggml_grids.cpp
-        src/ggml_moe_backend.cpp
-        src/ggml_moe_graph_builder.cpp
-        src/ggml_moe_transfer_manager.cpp
-        src/ggml_moe_runner.cpp
-        src/ggml_router_runner.cpp
-        src/ggml_qwen_shared_runner.cpp
-        src/qwen_cpu_offload_ring.cpp
-        src/ggml_qwen_decode_scheduler.cpp
-        src/ggml_qwen_cpu_moe.cpp
-        src/ggml_qwen4exp_graph.cpp
-        src/ggml_qwen4exp_graph_arena.cpp
-        src/ggml_qwen4exp_graph_build_blocks.cpp
-        src/ggml_qwen4exp_graph_build.cpp
-        src/ggml_qwen4exp_graph_build_moe.cpp
-        src/ggml_qwen4exp_graph_decode_prepare.cpp
-        src/ggml_qwen4exp_graph_diag.cpp
-        src/ggml_qwen4exp_graph_expert_bind.cpp
-        src/ggml_qwen4exp_graph_host_node.cpp
-        src/ggml_qwen4exp_graph_placement.cpp
-        src/ggml_qwen4exp_graph_run.cpp
-        src/ggml_qwen4exp_graph_settings.cpp
-        src/ggml_glm5next_graph.cpp
-        src/ggml_glm5next_graph_arena.cpp
-        src/ggml_glm5next_graph_build.cpp
-        src/ggml_glm5next_graph_build_blocks.cpp
-        src/ggml_glm5next_graph_decode.cpp
-        src/ggml_glm5next_graph_offload.cpp
-        src/ggml_glm5next_graph_partial.cpp
-        src/ggml_glm5next_graph_run.cpp
-        src/ggml_glm5next_graph_settings.cpp
-        src/ggml_glm5next_graph_stage.cpp
-        src/ggml_glm5next_graph_weights.cpp
-        src/ggml_graph_vram_headroom.cpp
-        src/ggml_deepseek_v41_graph.cpp
-        src/ggml_deepseek_v41_graph_decode.cpp
-        src/ggml_hc_backend.cpp
-        src/ggml_gdn_proj_backend.cpp
-        src/ggml_glm5next_proj_backend.cpp
-        src/mtp_speculative.cpp
-        src/kernels_cpu.cpp
-        src/qwen_moe.cpp
-        models/model_factory.cpp
-        models/family_ops.cpp
-        models/full_graph_models.cpp
+        core/attention_layer.cpp
+        models/base/graph_initializer.cpp
+        core/hyper_connections.cpp
+        models/qwen/ple_ngram.cpp
+        models/deepseek/deepseek41_engram.cpp
+        core/gpu_topology.cpp
+        backends/cpu/ggml_dequant.cpp
+        backends/cpu/ggml_grids.cpp
+        backends/ggml/ggml_moe_backend.cpp
+        models/graph/ggml_moe_graph_builder.cpp
+        backends/ggml/ggml_moe_transfer_manager.cpp
+        backends/ggml/ggml_moe_runner.cpp
+        backends/ggml/ggml_router_runner.cpp
+        models/qwen/ggml_qwen_shared_runner.cpp
+        models/qwen/qwen_cpu_offload_ring.cpp
+        models/qwen/ggml_qwen_decode_scheduler.cpp
+        models/qwen/ggml_qwen_cpu_moe.cpp
+        models/qwen/ggml_qwen4exp_graph.cpp
+        models/qwen/ggml_qwen4exp_graph_arena.cpp
+        models/qwen/ggml_qwen4exp_graph_build_blocks.cpp
+        models/qwen/ggml_qwen4exp_graph_build.cpp
+        models/qwen/ggml_qwen4exp_graph_build_moe.cpp
+        models/qwen/ggml_qwen4exp_graph_decode_prepare.cpp
+        models/qwen/ggml_qwen4exp_graph_diag.cpp
+        models/qwen/ggml_qwen4exp_graph_expert_bind.cpp
+        models/qwen/ggml_qwen4exp_graph_host_node.cpp
+        models/qwen/ggml_qwen4exp_graph_placement.cpp
+        models/qwen/ggml_qwen4exp_graph_run.cpp
+        models/qwen/ggml_qwen4exp_graph_settings.cpp
+        models/glm/ggml_glm5next_graph.cpp
+        models/glm/ggml_glm5next_graph_arena.cpp
+        models/glm/ggml_glm5next_graph_build.cpp
+        models/glm/ggml_glm5next_graph_build_blocks.cpp
+        models/glm/ggml_glm5next_graph_decode.cpp
+        models/glm/ggml_glm5next_graph_offload.cpp
+        models/glm/ggml_glm5next_graph_partial.cpp
+        models/glm/ggml_glm5next_graph_run.cpp
+        models/glm/ggml_glm5next_graph_settings.cpp
+        models/glm/ggml_glm5next_graph_stage.cpp
+        models/glm/ggml_glm5next_graph_weights.cpp
+        models/graph/ggml_graph_vram_headroom.cpp
+        models/deepseek/ggml_deepseek_v41_graph.cpp
+        models/deepseek/ggml_deepseek_v41_graph_decode.cpp
+        backends/ggml/ggml_hc_backend.cpp
+        backends/ggml/ggml_gdn_proj_backend.cpp
+        models/glm/ggml_glm5next_proj_backend.cpp
+        core/mtp_speculative.cpp
+        backends/cpu/kernels_cpu.cpp
+        models/qwen/qwen_moe.cpp
+        models/base/model_factory.cpp
+        models/base/family_ops.cpp
+        models/graph/full_graph_models.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
     target_include_directories(moestream_tests PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MOESTREAM_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
     )
@@ -608,11 +624,11 @@ if(NOT MOESTREAM_CPU_ONLY)
         target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR})
         if(MOESTREAM_USE_GGML_CUDA)
             target_sources(moestream_tests PRIVATE
-                src/exl3_ggml_backend.cpp
-                src/exl3_ggml_ffn.cpp
-                src/exl3_ggml_model.cpp
-                src/exl3_model_loader.cpp
-                src/safetensors_adapter.cpp)
+                backends/exl3/exl3_ggml_backend.cpp
+                backends/exl3/exl3_ggml_ffn.cpp
+                backends/exl3/exl3_ggml_model.cpp
+                backends/exl3/exl3_model_loader.cpp
+                models/base/safetensors_adapter.cpp)
             target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
         endif()
     endif()
@@ -622,9 +638,9 @@ if(NOT MOESTREAM_CPU_ONLY)
     if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
         add_executable(dsv41_grouped_outproj_test EXCLUDE_FROM_ALL
             tests/test_dsv41_grouped_outproj.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp
-            cuda/kquant_matmul.cu)
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            kernels/quant/kquant_matmul.cu)
         target_include_directories(dsv41_grouped_outproj_test PRIVATE
             ${MOESTREAM_GGML_SRC_DIR})
         target_compile_definitions(dsv41_grouped_outproj_test PRIVATE
@@ -643,7 +659,7 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     if(MOESTREAM_USE_GGML_CUDA)
         add_executable(dsv41_cache_graph_test EXCLUDE_FROM_ALL
-            tests/test_dsv41_cache_graph.cpp cuda/kquant_matmul.cu)
+            tests/test_dsv41_cache_graph.cpp kernels/quant/kquant_matmul.cu)
         target_compile_definitions(dsv41_cache_graph_test PRIVATE
             MOESTREAM_USE_GGML_CUDA=1)
         set_target_properties(dsv41_cache_graph_test PROPERTIES
@@ -654,9 +670,9 @@ if(NOT MOESTREAM_CPU_ONLY)
             CUDA::cudart ggml ggml-cuda)
     endif()
 
-    # Unit test for include/cuda_raii.hpp (RAII device/pinned memory, events, streams).
+    # Unit test for backends/cuda/cuda_raii.hpp (RAII device/pinned memory, events, streams).
     add_executable(cuda_raii_test EXCLUDE_FROM_ALL tests/test_cuda_raii.cpp)
-    target_include_directories(cuda_raii_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(cuda_raii_test PRIVATE ${MOESTREAM_INCLUDE_DIRS})
     target_link_libraries(cuda_raii_test PRIVATE CUDA::cudart)
 
     # GGML-only Qwen CPU MoE timing probe.  The same source is also compiled
@@ -674,10 +690,10 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     add_executable(exl3_kernel_bench EXCLUDE_FROM_ALL
         bench/exl3_kernel_bench.cu
-        cuda/exl3_aux.cu
+        backends/exl3/exl3_aux.cu
         ${MOESTREAM_EXL3_UPSTREAM_OPS})
     target_include_directories(exl3_kernel_bench PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${MOESTREAM_INCLUDE_DIRS})
     set_target_properties(exl3_kernel_bench PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86)
@@ -686,10 +702,10 @@ if(NOT MOESTREAM_CPU_ONLY)
     if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
         add_executable(exl3_ggml_custom_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_custom_bench.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_custom_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR})
         target_compile_definitions(exl3_ggml_custom_bench PRIVATE
             MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
@@ -700,11 +716,11 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_adapter_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_adapter_bench.cpp
-            src/exl3_ggml_backend.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_adapter_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_adapter_bench PRIVATE
@@ -716,16 +732,16 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_real_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_real_bench.cpp
-            src/exl3_ggml_backend.cpp
-            src/exl3_model_loader.cpp
-            src/safetensors_adapter.cpp
-            src/exl3_cpu.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_model_loader.cpp
+            models/base/safetensors_adapter.cpp
+            backends/exl3/exl3_cpu.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_real_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_real_bench PRIVATE
@@ -743,18 +759,18 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_real_ffn_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_real_ffn_bench.cpp
-            src/exl3_ggml_backend.cpp
-            src/exl3_ggml_ffn.cpp
-            src/exl3_gpu.cpp
-            src/exl3_model_loader.cpp
-            src/safetensors_adapter.cpp
-            src/exl3_cpu.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_ggml_ffn.cpp
+            backends/exl3/exl3_gpu.cpp
+            backends/exl3/exl3_model_loader.cpp
+            models/base/safetensors_adapter.cpp
+            backends/exl3/exl3_cpu.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_real_ffn_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_real_ffn_bench PRIVATE
@@ -773,18 +789,18 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_real_routed_ffn_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_real_routed_ffn_bench.cpp
-            src/exl3_ggml_backend.cpp
-            src/exl3_ggml_ffn.cpp
-            src/exl3_gpu.cpp
-            src/exl3_model_loader.cpp
-            src/safetensors_adapter.cpp
-            src/exl3_cpu.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_ggml_ffn.cpp
+            backends/exl3/exl3_gpu.cpp
+            backends/exl3/exl3_model_loader.cpp
+            models/base/safetensors_adapter.cpp
+            backends/exl3/exl3_cpu.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
@@ -803,19 +819,19 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_cache_graph_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_cache_graph_bench.cpp
-            src/exl3_ggml_backend.cpp
-            src/exl3_ggml_ffn.cpp
-            src/exl3_gpu.cpp
-            src/exl3_model_loader.cpp
-            src/safetensors_adapter.cpp
-            src/exl3_cpu.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_ggml_backend.cpp
+            backends/exl3/exl3_ggml_ffn.cpp
+            backends/exl3/exl3_gpu.cpp
+            backends/exl3/exl3_model_loader.cpp
+            models/base/safetensors_adapter.cpp
+            backends/exl3/exl3_cpu.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS}
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_cache_graph_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_cache_graph_bench PRIVATE
@@ -835,10 +851,10 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_fused_ffn_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_fused_ffn_bench.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_fused_ffn_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_fused_ffn_bench PRIVATE
@@ -850,10 +866,10 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_ggml_cuda_moe_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_moe_bench.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_moe_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_moe_bench PRIVATE
@@ -867,11 +883,11 @@ if(NOT MOESTREAM_CPU_ONLY)
     if(MOESTREAM_USE_GGML AND OpenMP_CXX_FOUND)
         add_executable(exl3_cpu_bench EXCLUDE_FROM_ALL
             bench/exl3_cpu_bench.cpp
-            src/exl3_cpu.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp)
+            backends/exl3/exl3_cpu.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp)
         target_include_directories(exl3_cpu_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_options(exl3_cpu_bench PRIVATE ${MOESTREAM_AVX512_FLAGS})
@@ -880,14 +896,14 @@ if(NOT MOESTREAM_CPU_ONLY)
 
         add_executable(exl3_hc_bench EXCLUDE_FROM_ALL
             bench/exl3_hc_bench.cpp
-            src/exl3_gpu.cpp
-            src/exl3_cpu.cpp
-            src/kernels_cpu.cpp
-            src/ggml_grids.cpp
-            cuda/exl3_aux.cu
+            backends/exl3/exl3_gpu.cpp
+            backends/exl3/exl3_cpu.cpp
+            backends/cpu/kernels_cpu.cpp
+            backends/cpu/ggml_grids.cpp
+            backends/exl3/exl3_aux.cu
             ${MOESTREAM_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_hc_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
         target_compile_options(exl3_hc_bench PRIVATE
@@ -906,7 +922,7 @@ if(NOT MOESTREAM_CPU_ONLY)
     if(MOESTREAM_USE_GGML_CUDA)
         add_executable(qwen_iq2_cpu_cuda_probe
             bench/qwen_iq2_cpu_cuda_probe.cpp
-            src/ggml_grids.cpp)
+            backends/cpu/ggml_grids.cpp)
         target_include_directories(qwen_iq2_cpu_cuda_probe PRIVATE
             ${MOESTREAM_GGML_SRC_DIR}
             ${MOESTREAM_GGML_SRC_DIR}/src)
@@ -928,12 +944,12 @@ if(NOT MOESTREAM_CPU_ONLY)
        "${CMAKE_CURRENT_SOURCE_DIR}/bench/qwen4exp_pointer_spike.cu")
         add_executable(qwen4exp_pointer_spike
             bench/qwen4exp_pointer_spike.cu
-            cuda/iq1_dequant.cu
-            cuda/iq4xs_matmul.cu
-            cuda/expert_activation.cu
-            src/ggml_grids.cpp)
+            kernels/quant/iq1_dequant.cu
+            kernels/quant/iq4xs_matmul.cu
+            kernels/math/expert_activation.cu
+            backends/cpu/ggml_grids.cpp)
         target_include_directories(qwen4exp_pointer_spike PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cuda
             ${MOESTREAM_GGML_SRC_DIR})
         set_target_properties(qwen4exp_pointer_spike PROPERTIES
@@ -947,12 +963,12 @@ if(NOT MOESTREAM_CPU_ONLY)
         # indirect production kernels before any runtime dispatch change.
         add_executable(qwen4exp_staging_spike
             bench/qwen4exp_staging_spike.cu
-            cuda/iq1_dequant.cu
-            cuda/iq4xs_matmul.cu
-            cuda/expert_activation.cu
-            src/ggml_grids.cpp)
+            kernels/quant/iq1_dequant.cu
+            kernels/quant/iq4xs_matmul.cu
+            kernels/math/expert_activation.cu
+            backends/cpu/ggml_grids.cpp)
         target_include_directories(qwen4exp_staging_spike PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${MOESTREAM_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cuda
             ${MOESTREAM_GGML_SRC_DIR})
         set_target_properties(qwen4exp_staging_spike PROPERTIES
@@ -973,13 +989,13 @@ if(NOT MOESTREAM_CPU_ONLY)
     target_link_libraries(qwen_cpu_offload_graph_sandbox PRIVATE CUDA::cudart)
 
     # CPUOffload ring wait-latency microbenchmark (Tier 1). Exercises the
-    # REAL QwenCpuOffloadRing class (src/qwen_cpu_offload_ring.cpp) with a
+    # REAL QwenCpuOffloadRing class (models/qwen/qwen_cpu_offload_ring.cpp) with a
     # synthetic CPU worker thread standing in for GgmlQwenCpuMoeRunner, to
     # isolate MOESTREAM_QWEN4EXP_RING_SPIN_US's effect on wait latency from
     # decode-loop noise. No GGML/model dependency.
     add_executable(qwen_cpu_offload_ring_spin_bench
         bench/qwen_cpu_offload_ring_spin_bench.cpp
-        src/qwen_cpu_offload_ring.cpp)
+        models/qwen/qwen_cpu_offload_ring.cpp)
     set_target_properties(qwen_cpu_offload_ring_spin_bench PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86)
@@ -998,31 +1014,31 @@ else()
 
     # Choose the right CPU kernel backend.
     set(MOESTREAM_CPU_KERNEL_SRCS)
-    # src/safetensors_adapter.cpp was never registered here even though
+    # models/base/safetensors_adapter.cpp was never registered here even though
     # tests/test_components.cpp's test_safetensors_adapter() calls it
     # directly -- test_components (and any other target linking
     # kernels_cpu) failed to link with undefined SafetensorsAdapter symbols
     # regardless of platform, unrelated to Apple Silicon vs x86 below.
     list(APPEND MOESTREAM_CPU_KERNEL_SRCS
-        src/exl3_cpu.cpp
-        src/exl3_model_loader.cpp
-        src/safetensors_adapter.cpp)
+        backends/exl3/exl3_cpu.cpp
+        backends/exl3/exl3_model_loader.cpp
+        models/base/safetensors_adapter.cpp)
     if(MOESTREAM_APPLE_SILICON)
-        list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/kernels_cpu_neon.cpp)
+        list(APPEND MOESTREAM_CPU_KERNEL_SRCS backends/cpu/kernels_cpu_neon.cpp)
         message(STATUS "MoEStream: using ARM NEON CPU kernel backend")
         if(MOESTREAM_METAL)
-            list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/kernels_metal.mm)
+            list(APPEND MOESTREAM_CPU_KERNEL_SRCS backends/cpu/kernels_metal.mm)
             message(STATUS "MoEStream: Metal/MPS dispatch enabled (falls back to NEON)")
         endif()
     else()
-        list(APPEND MOESTREAM_CPU_KERNEL_SRCS src/kernels_cpu.cpp)
+        list(APPEND MOESTREAM_CPU_KERNEL_SRCS backends/cpu/kernels_cpu.cpp)
         message(STATUS "MoEStream: using x86 AVX-512 CPU kernel backend")
     endif()
 
     add_library(kernels_cpu STATIC ${MOESTREAM_CPU_KERNEL_SRCS})
     target_compile_options(kernels_cpu PRIVATE ${MOESTREAM_AVX512_FLAGS})
     target_include_directories(kernels_cpu PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MOESTREAM_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
     )
     if(OpenMP_CXX_FOUND)
@@ -1040,7 +1056,7 @@ else()
         endif()
         target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_ARM_NEON=1)
         if(MOESTREAM_METAL)
-            set_source_files_properties(src/kernels_metal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+            set_source_files_properties(backends/cpu/kernels_metal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
             find_library(METAL_FRAMEWORK Metal REQUIRED)
             find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
             target_link_libraries(kernels_cpu PUBLIC ${METAL_FRAMEWORK} ${MPS_FRAMEWORK})
@@ -1049,7 +1065,7 @@ else()
     endif()
 
     if(MOESTREAM_USE_GGML)
-        target_sources(kernels_cpu PRIVATE src/ggml_dequant.cpp)
+        target_sources(kernels_cpu PRIVATE backends/cpu/ggml_dequant.cpp)
         target_link_libraries(kernels_cpu PUBLIC ggml)
         target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_USE_GGML=1)
         target_include_directories(kernels_cpu PUBLIC ${MOESTREAM_GGML_SRC_DIR})
@@ -1064,17 +1080,17 @@ else()
 
     # CPU-only inference binary (moestream_cpu)
     add_executable(moestream_cpu
-        src/cpu_main.cpp
-        src/exl3_decode.cpp
-        src/cpu_dense.cpp
-        src/cpu_engine.cpp
-        src/cpu_forward.cpp
-        src/cpu_model_backend.cpp
-        src/cpu_qwen_moe.cpp
-        src/cpu_qwen4exp.cpp
+        backends/cpu/cpu_main.cpp
+        backends/exl3/exl3_decode.cpp
+        backends/cpu/cpu_dense.cpp
+        backends/cpu/cpu_engine.cpp
+        backends/cpu/cpu_forward.cpp
+        backends/cpu/cpu_model_backend.cpp
+        models/qwen/cpu_qwen_moe.cpp
+        models/qwen/cpu_qwen4exp.cpp
     )
     target_include_directories(moestream_cpu PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${MOESTREAM_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
     )
     target_link_libraries(moestream_cpu PRIVATE kernels_cpu)
@@ -1098,7 +1114,7 @@ endif()
 
 message(STATUS "MoEStream: configure done")
 
-# EXL3 bench targets compile src/exl3_upstream_ops.cu directly and need the
+# EXL3 bench targets compile backends/exl3/exl3_upstream_ops.cu directly and need the
 # upstream kernel library plus the torch stub include path.
 if(TARGET moestream_exl3_upstream)
     foreach(_exl3_target

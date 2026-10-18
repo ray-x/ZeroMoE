@@ -3,7 +3,7 @@
 usage histogram (the pin_file format: "layer expert count" per line).
 
 Approach (config-only, no new engine code -- see pin_strategy="global_topn"
-in include/engine_config.hpp):
+in core/engine_config.hpp):
   1. Rank layers by how many experts they need for TARGET_COVERAGE of their
      own traffic ("flatness"). The N flattest go to cpu_affinity_layers --
      pinning barely helps them anyway, so their miss cost is unavoidable

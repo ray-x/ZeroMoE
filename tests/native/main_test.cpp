@@ -1,4 +1,4 @@
-#include "../tests/native/native_tests.hpp"
+#include "native_tests.hpp"
 
 bool test_exl3_ggml_graph_capture_config() {
     std::cout << "[Test] EXL3 GGML graph-capture config...\n";

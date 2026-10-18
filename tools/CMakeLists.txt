@@ -19,7 +19,7 @@ add_executable(gguf_tool
 
 add_executable(exl3_tool
     exl3_tool.cpp
-    ../src/safetensors_adapter.cpp
+    ../models/base/safetensors_adapter.cpp
 )
 target_include_directories(exl3_tool PRIVATE ../include)
 set_target_properties(exl3_tool PROPERTIES

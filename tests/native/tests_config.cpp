@@ -1,4 +1,4 @@
-// Native test harness: tests_config (split from src/main_test.cpp).
+// Native test harness: tests_config (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // Test 32: a config allow-list must prevent an omitted physical adapter from

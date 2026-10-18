@@ -1,4 +1,4 @@
-// Native test harness: tests_basic_cuda (split from src/main_test.cpp).
+// Native test harness: tests_basic_cuda (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // ------------------------------------------------------------------
@@ -194,7 +194,7 @@ static bool run_fused_kernel_case(CudaManager& gpu, GGUFType type, int I, int O,
     // fast path vs exact reference" ambiguity to worry about the way
     // Q6_K/Q8_0's own comment above documents) -- ggml_dequant_row already
     // dispatches both correctly (dequantize_row_iq1_s/_iq1_m, confirmed via
-    // src/ggml_dequant.cpp), so the exact dequant+naive-dot path is both
+    // backends/cpu/ggml_dequant.cpp), so the exact dequant+naive-dot path is both
     // the simplest and the only correct reference available here.
     if (type == GGUFType::Q6_K || type == GGUFType::Q8_0 ||
         type == GGUFType::IQ1_S || type == GGUFType::IQ1_M) {
@@ -305,7 +305,7 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q6_K,    512, 8, 3);
 
     // 2026-09-01: the five cases above all use I=512 -> bpr = I/256 = 2, which
-    // sits BELOW kquant_lane8_ok()'s `bpr >= 8` gate (cuda/kquant_matmul.cu) --
+    // sits BELOW kquant_lane8_ok()'s `bpr >= 8` gate (kernels/quant/kquant_matmul.cu) --
     // so before these were added, Test 5 exercised ONLY the cooperative path
     // and had literally zero coverage of the lane8 kernels, despite lane8
     // being what every real GLM-5.3 dense tensor actually dispatches to
@@ -324,7 +324,7 @@ bool test_cuda_fused_kernels() {
     // confirmed to index x_row correctly per row, not just at s=0.
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q5_K,    6144, 32, 3);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q6_K,    6144, 32, 3);
-    // Q8_0 (cuda/q8_0_matmul.cu): pre-existing gap in this suite -- the
+    // Q8_0 (kernels/quant/q8_0_matmul.cu): pre-existing gap in this suite -- the
     // tolerance handling above (line ~254) was already prepared for this
     // type but no case ever actually exercised it. Closed while touching
     // this exact kernel to add a reuse-across-S variant (launch_q8_0_matmul
@@ -339,7 +339,7 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    4096, 4, 2);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::Q8_0,    2048, 16384, 1);
 
-    // Q5_1 (cuda/q5_1_matmul.cu, new 2026-09-04). No lossy CPU fast path
+    // Q5_1 (kernels/quant/q5_1_matmul.cu, new 2026-09-04). No lossy CPU fast path
     // exists for this type in cpu_quant_matmul, so the default comparison
     // above is already exact-vs-exact (ggml's own dequantize_row_q5_1 +
     // naive dot) -- no exact-reference special case needed the way Q6_K/
@@ -372,7 +372,7 @@ bool test_cuda_fused_kernels() {
     // ggml's dequantize_row_iq1_s, real 2048-entry grid codebook) replaced
     // this project's pre-existing but WRONG "iq1_matmul_kernel_optimized"
     // (found this session to decode flat sign bits with no grid lookup, no
-    // per-group scale, no delta -- see cuda/iq1_dequant.cu's own comment).
+    // per-group scale, no delta -- see kernels/quant/iq1_dequant.cu's own comment).
     // Real motivation: GLM-5.3's Unsloth "UD-IQ1_S" release keeps gate/up at
     // this type for a real subset of MoE layers. Small shape first, then
     // this model's real per-expert gate/up dims (I=2048, O=6144, confirmed
@@ -414,7 +414,7 @@ bool test_cuda_fused_kernels() {
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ2_XXS, 4096, 4, 2);
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ3_XXS, 4096, 4, 2);
     // IQ4_XS: down-projection on this checkpoint's ~4-5 previously-CPU-only
-    // layers (cuda/iq4xs_matmul.cu). Fixed 16-entry lookup table + linear
+    // layers (kernels/quant/iq4xs_matmul.cu). Fixed 16-entry lookup table + linear
     // scale, structurally closer to the K-quant cases above than to its
     // IQ2/IQ3 variable-grid siblings despite the similar name.
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_XS,  512, 8, 3);
@@ -441,7 +441,7 @@ bool test_cuda_fused_kernels() {
     // block-index or grid-dimension range) that the earlier, smaller test
     // shapes were never able to catch.
     all_pass &= run_fused_kernel_case(gpu, GGUFType::IQ4_XS,  2048, 6144, 1);
-    // MXFP4: NEW, currently DORMANT kernel (cuda/mxfp4_matmul.cu) -- see
+    // MXFP4: NEW, currently DORMANT kernel (kernels/quant/mxfp4_matmul.cu) -- see
     // kquant_dequant.hpp's gpu_type_supported() comment. This IS the
     // real-hardware verification gate that must pass BEFORE that function
     // is flipped to enable live GPU dispatch for this type. Fixed 16-entry

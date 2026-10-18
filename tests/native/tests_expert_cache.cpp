@@ -1,4 +1,4 @@
-// Native test harness: tests_expert_cache (split from src/main_test.cpp).
+// Native test harness: tests_expert_cache (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // ------------------------------------------------------------------
@@ -648,7 +648,7 @@ bool test_upload_async_already_pinned_src() {
 
 
 
-// 2026-09-04: GPU-side routed-expert accumulation (cuda/expert_accum.cu).
+// 2026-09-04: GPU-side routed-expert accumulation (kernels/math/expert_accum.cu).
 // An end-to-end output diff CANNOT validate this: the engine is already
 // non-deterministic run-to-run (cache-state-dependent dispatch), AND the
 // feature legitimately changes summation order (device-accumulated experts are

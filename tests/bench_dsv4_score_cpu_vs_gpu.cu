@@ -18,7 +18,7 @@
 // toolchain. Run this on your Linux/CUDA box BEFORE enabling
 // dsv4_score_gpu=true in production. If correctness fails, the bug is most
 // likely in this file's GPU reimplementation OR in cuda_manager.hpp's
-// dsv4_score_gpu_batched_host / cuda/dsv4_score_softmax.cu (which this file
+// dsv4_score_gpu_batched_host / kernels/models/dsv4_score_softmax.cu (which this file
 // mirrors but does not directly call) -- diff the two once you have a
 // concrete failing case.
 //
@@ -122,7 +122,7 @@ static void cpu_reference(
 }
 
 // ---- GPU softmax kernel: byte-for-byte mirrors
-// cuda/dsv4_score_softmax.cu's dsv4_score_softmax_kernel. Duplicated here
+// kernels/models/dsv4_score_softmax.cu's dsv4_score_softmax_kernel. Duplicated here
 // (not #included) to keep this bench standalone per the project's existing
 // bench_score_cpu_vs_gpu.cu convention -- if you change one, change both,
 // or better, diff them after any edit to either.

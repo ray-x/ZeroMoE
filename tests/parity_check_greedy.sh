@@ -7,7 +7,7 @@
 # path (embed -> 79x MLA/MoE -> lm_head -> greedy argmax) is correct by checking
 # that greedy-decoded output matches llama.cpp token-for-token.
 #
-# Before the interleaved-RoPE fix (include/rope.hpp): output was garbage that
+# Before the interleaved-RoPE fix (models/base/rope.hpp): output was garbage that
 # ignored the prompt. After the fix: should match llama.cpp closely (exact on
 # early tokens; small divergence later is expected from quant-path / FP-order
 # differences, NOT from the RoPE bug).

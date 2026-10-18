@@ -1,4 +1,4 @@
-// Unit + acceptance tests for the dynamic DDR expert cache (include/expert_cache.hpp, include/offload_store.hpp).
+// Unit + acceptance tests for the dynamic DDR expert cache (memory/expert_cache.hpp, memory/offload_store.hpp).
 //
 // Build/run: tests/run_components.sh does this; by hand from the repo root:
 //   c++ -std=c++20 -O2 -pthread -Iinclude -o /tmp/t tests/test_expert_dram_cache.cpp && /tmp/t

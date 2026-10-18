@@ -1,4 +1,4 @@
-// Native test harness: tests_gpu_attention (split from src/main_test.cpp).
+// Native test harness: tests_gpu_attention (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // ------------------------------------------------------------------
@@ -460,7 +460,7 @@ bool test_bf16_batched_qabsorb() {
 // 13. MLA Score GPU Path (EngineConfig::attn_score_gpu) -- 3 plain GEMMs
 //     (no strided-batching needed, unlike qabsorb: MLA's latent K/V is
 //     SHARED across every head) + a combine-scale-softmax kernel
-//     (cuda/attn_score_softmax.cu), replacing the CPU AVX-512 per-head
+//     (kernels/math/attn_score_softmax.cu), replacing the CPU AVX-512 per-head
 //     score loop (attention_layer.cpp). See tests/bench_score_cpu_vs_gpu.cu
 //     for the real-hardware feasibility numbers (5x-51x speedup, growing
 //     with context length) this is based on.

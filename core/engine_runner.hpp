@@ -6,7 +6,7 @@
 #include "async_prefetcher.hpp"
 #include "cuda_manager.hpp"
 #include "engine.hpp"
-#include "../models/full_graph_model.hpp"
+#include "full_graph_model.hpp"
 #include "option_b_global_hot.hpp"
 #include "engine_config.hpp"
 #include "exl3_cpu.hpp"

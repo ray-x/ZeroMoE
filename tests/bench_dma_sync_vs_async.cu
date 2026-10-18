@@ -1,7 +1,7 @@
 // bench_dma_sync_vs_async.cu — standalone, isolated microbenchmark.
 //
 // Answers: for the decode-time cold-miss RAM->VRAM upload path
-// (expert_ffn_resolve_gpu_loc -> dispatch_expert_k, src/execution_layer.cpp),
+// (expert_ffn_resolve_gpu_loc -> dispatch_expert_k, core/execution_layer.cpp),
 // which today issues N experts' H2D copies as N SEQUENTIAL BLOCKING
 // cudaMemcpy calls (upload_expert_active's real current code,
 // gpu_topology.cpp), how much wall-clock time would batching them as N
@@ -103,7 +103,7 @@
 //
 // Wiring history, for the record:
 //
-//   ROUND 1 (REVERTED): wired straight into src/execution_layer.cpp's
+//   ROUND 1 (REVERTED): wired straight into core/execution_layer.cpp's
 //   Phase-3 dispatch loop, batching a WHOLE token's ram_needed_k set (up to
 //   ~topk, e.g. 8) into one async-issue-then-sync group, unconditionally
 //   on. Caused a REAL PRODUCTION INCIDENT on real hardware: host RAM

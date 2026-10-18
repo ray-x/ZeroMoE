@@ -1,6 +1,6 @@
 #pragma once
 // Shared includes, external linkage declarations and forward declarations for the native
-// test harness (split from src/main_test.cpp).
+// test harness (split from tests/native/main_test.cpp).
 #include "graph_config.hpp"
 #include "qwen4exp_gdn.hpp"   // qwen4exp_gdn_delta_chunk (CPU oracle for Test 25)
 #include "ggml_gdn_proj_backend.hpp"  // GgmlGdnProjRunner (Test 29)
@@ -45,7 +45,7 @@
 #include <unistd.h>
 #endif
 
-// Defined (non-static) in src/attention_layer.cpp specifically so Test 28
+// Defined (non-static) in core/attention_layer.cpp specifically so Test 28
 // can compare qwen4exp_conv1d_silu_gpu_host's GPU kernel directly against
 // this already-proven CPU reference. No header declares it (it's an
 // internal helper, not part of any public API), so it's forward-declared
@@ -61,7 +61,7 @@ extern void rmsnorm_row(float* out, const float* x, const float* w, int D, float
 extern void softmax_row(float* x, int size);
 extern void extract_gguf_row_q4_0(const QuantizedTensor& tensor, int row_idx, float* __restrict__ out_f32);
 
-// Encodes real ggml-valid quantized bytes from f32 input (src/ggml_dequant.cpp).
+// Encodes real ggml-valid quantized bytes from f32 input (backends/cpu/ggml_dequant.cpp).
 // Returns 1 if this type has a reference quantizer wired up, 0 otherwise.
 extern "C" int ggml_quantize_row_ref(uint32_t type, const float* src, void* dst, int64_t n);
 extern "C" int ggml_dequant_row(uint32_t type, const void* src, float* out, int n);

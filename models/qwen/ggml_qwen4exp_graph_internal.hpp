@@ -8,7 +8,7 @@
 // full-graph implementation.
 
 #include "graph_config.hpp"
-#include "../models/full_graph_model.hpp"
+#include "full_graph_model.hpp"
 #include "moe_routed_config.hpp"
 #include "moe_routed_ggml.hpp"
 #include "ggml_qwen4exp_graph.hpp"

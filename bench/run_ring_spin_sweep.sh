@@ -5,7 +5,7 @@ set -euo pipefail
 # qwen_cpu_offload_ring_spin_bench to measure its effect on
 # QwenCpuOffloadRing's wait-detection latency in isolation, with no model
 # load and no decode-loop noise. The env var is cached on first read inside
-# src/qwen_cpu_offload_ring.cpp, so this script launches one process per
+# models/qwen/qwen_cpu_offload_ring.cpp, so this script launches one process per
 # value -- that caching is why the values can't be swept within one run.
 #
 # Usage: bench/run_ring_spin_sweep.sh [iterations] [d_model] [slots] [cpu_compute_us]

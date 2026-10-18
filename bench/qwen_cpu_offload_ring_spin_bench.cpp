@@ -3,7 +3,7 @@
 // Isolates the effect of MOESTREAM_QWEN4EXP_RING_SPIN_US on how quickly the
 // decode thread notices a completed CPU-offload slot, independent of decode-
 // loop noise (model load, GPU dense/attention work, prompt variance). Links
-// the REAL src/qwen_cpu_offload_ring.cpp -- no GGML/model dependency -- and
+// the REAL models/qwen/qwen_cpu_offload_ring.cpp -- no GGML/model dependency -- and
 // stands a plain std::thread in for GgmlQwenCpuMoeRunner's worker.
 //
 // MOESTREAM_QWEN4EXP_RING_SPIN_US is cached on first read inside

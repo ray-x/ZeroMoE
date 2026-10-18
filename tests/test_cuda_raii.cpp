@@ -1,4 +1,4 @@
-// Unit test for include/cuda_raii.hpp. Needs one CUDA device (uses device 0 only,
+// Unit test for backends/cuda/cuda_raii.hpp. Needs one CUDA device (uses device 0 only,
 // a few MiB). Build: cmake --build <dir> --target test_cuda_raii
 #include "cuda_raii.hpp"
 

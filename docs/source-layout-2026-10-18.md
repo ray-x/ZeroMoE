@@ -16,6 +16,44 @@ All three are mechanical: bodies are verbatim, and each commit message states th
 check used (identical report output for the counters; identical multiset of source
 lines for the other two).
 
+## Folder layout (reorganised 2026-10-18)
+
+```
+core/              orchestration: engine, EngineRunner phases, execution/dispatch pipelines, MoE router,
+                   GPU topology, layered attention, MTP, perf counters (core/perf/), logger, main.cpp
+memory/            expert caches and resource management: ram_manager, expert_cache/store, scratch buffers,
+                   offload store, direct_io/io_uring/cufile, prefill streaming, prefetcher
+models/base/       model_base/family/factory, family_ops, GGUF + safetensors loaders, tokenizer, graph_initializer
+models/graph/      shared full-graph framework: graph_core, graph_config, early_ready_lane, routed-MoE builders
+models/qwen/       Qwen4Exp + Qwen MoE: cpu_qwen4exp, ggml_qwen4exp_graph*, stage pool, PLE, GDN, offload ring
+models/glm/        GLM5Next (Flash) graph files, glm_dsa.hpp, GLM projection backend
+models/deepseek/   DeepSeek-V4.1 graph, engram, attention helpers
+backends/cpu/      CPU engine, CPU model backend, kernels_cpu (+neon/metal), dequant, ggml grids
+backends/cuda/     CudaManager, kernel dispatcher, cublas, cuda_raii
+backends/ggml/     ggml MoE backend/runner/transfer manager, HC and GDN runners, resource guards
+backends/exl3/     EXL3 (WIP; moved as-is, only compile-checked)
+kernels/quant/     per-quant matmul/dequant .cu
+kernels/math/      generic .cu (matmul, rmsnorm, expert accum/activation, attention score, MLA, GDN conv)
+kernels/models/    model-specific .cu (GLM KDA/router, Qwen HC/stage, DSV4 score)
+tests/native/      native harness incl. main_test.cpp (moved from src/)
+tools/ bench/ tests/ configs/ patches/ third_party/ docs/ cmake/   unchanged
+```
+
+Rules: headers live next to their sources. `CMakeLists.txt` defines `MOESTREAM_INCLUDE_DIRS`
+(every header directory above) and uses it for all targets, so `#include "name.hpp"` lines
+are unchanged and a file can move between these folders without editing the files that include
+it. File names are unique across the tree (a prerequisite, checked when the move was made).
+The move changed no file content except 8 include lines that were path-qualified
+(`"../models/full_graph_model.hpp"` and similar): 241 of 249 moves are exact (100%) renames in
+git, the rest 98-99%. Old path -> new path for every moved file: `docs/layout-map-2026-10-18.tsv`.
+
+Differences from the sketch that was proposed: files named there that do not exist
+(`engine.cpp`, `ram_manager.cpp`, `expert_cache.cpp`, `offload_store.cpp`, `qwen4exp_attn.cu`,
+`ggml_deepseek_v4_graph.cpp`, `qwen4exp_layer13_staging.cpp`) were not invented; `ram_manager`,
+`expert_cache`, `engine` and `offload_store` are header-only here. Added `models/graph/`
+(the shared full-graph framework is used by Qwen, GLM and DeepSeek, so it belongs to none of
+them), `core/perf/`, and `tests/native/`.
+
 ## How this maps to llama.cpp
 
 | llama.cpp | MoEStream |

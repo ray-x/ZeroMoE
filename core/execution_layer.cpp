@@ -4,7 +4,7 @@
 #include "gpu_expert_executor.hpp"
 #include "dense_dispatch.hpp"
 #include "engine.hpp"
-#include "../models/full_graph_model.hpp"
+#include "full_graph_model.hpp"
 #include "expert_activation.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "dsv41_trace.hpp"

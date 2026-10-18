@@ -1,4 +1,4 @@
-// Native test harness: tests_cpu_quant (split from src/main_test.cpp).
+// Native test harness: tests_cpu_quant (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
 // ------------------------------------------------------------------

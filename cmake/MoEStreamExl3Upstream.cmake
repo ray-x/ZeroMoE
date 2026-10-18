@@ -31,7 +31,7 @@ if(MOESTREAM_EXLLAMAV3_SRC AND NOT TARGET moestream_exl3_upstream)
         "${_ext}/quant/exl3_kernel_map.cu"
         "${_ext}/quant/coop_autotune.cu"
         "${_ext}/quant/exl3_moe_coop.cu"
-        "${MOESTREAM_REPO_DIR}/src/exl3_upstream_stream.cpp")
+        "${MOESTREAM_REPO_DIR}/backends/exl3/exl3_upstream_stream.cpp")
     target_include_directories(moestream_exl3_upstream
         PUBLIC "${MOESTREAM_REPO_DIR}/third_party/exl3_torch_stub"
         PRIVATE "${_ext}")

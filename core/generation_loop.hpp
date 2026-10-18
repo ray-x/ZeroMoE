@@ -1,6 +1,6 @@
 #pragma once
 #include "engine.hpp"
-#include "../models/full_graph_model.hpp"
+#include "full_graph_model.hpp"
 #include "tensor_trace.hpp"
 #include "ram_manager.hpp"
 #include "kernels_cpu.hpp"

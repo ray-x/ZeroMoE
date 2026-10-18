@@ -4,7 +4,7 @@
 #include "exl3_decode.hpp"
 #include "exllamav3_backend.hpp"
 #include "logger.hpp"
-#include "models/model_family.hpp"
+#include "model_family.hpp"
 
 #include <algorithm>
 #include <chrono>

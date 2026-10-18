@@ -17,7 +17,7 @@
 //      style blk.N.ffn_{gate,up,down}_exps.weight, shape
 //      [a, b, n_experts]) is unpacked into n_experts individual tensors
 //      (blk.N.ffn_{gate,up,down}.E.weight) -- exactly the "legacy
-//      per-expert" layout include/engine.hpp's load_expert_slab already
+//      per-expert" layout core/engine.hpp's load_expert_slab already
 //      knows how to load as a single combined pread per expert.
 //   2. general.alignment is set to a large value (default 4096) so every
 //      tensor -- including each newly-unpacked expert -- starts at a
