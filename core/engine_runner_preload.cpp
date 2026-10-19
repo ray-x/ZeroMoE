@@ -211,10 +211,10 @@ std::vector<StreamingEngine::UsageEntry> EngineRunner::sanitize_usage_entries(
 std::expected<void, std::string> EngineRunner::preload_experts() {
   // Graph families that own a separate expert source must not also build a
   // second cache-sized preload. Qwen/GLM use that policy unless they alias
-  // the existing tiers. DeepSeek-V4.1's graph always calls the native
-  // cache-aware dispatcher, so it must keep the ordinary usage-ranked
-  // preload active in graph mode.
-  if ((!graph_mode || graph_ram_cache || dsv41_graph_uses_native_moe_cache) &&
+  // the existing tiers. DeepSeek-V4.1 and opt-in Ling native graphs call the
+  // cache-aware dispatcher, so they keep the ordinary usage-ranked preload
+  // active in graph mode.
+  if ((!graph_mode || graph_ram_cache || graph_uses_native_moe_cache) &&
       (!config.pin_file.empty() || config.ram_preload_all_experts) &&
       ram_mgr.vram_cache &&
       (ram_graph_cache || ram_mgr.vram_cache->expert_vram_cache_cap > 0)) {

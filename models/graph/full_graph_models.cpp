@@ -7,6 +7,7 @@
 #include "full_graph_model.hpp"
 
 #include "engine.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_qwen4exp_graph.hpp"
@@ -153,10 +154,19 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
             phase == ModelGraphPhase::Decode);
   }
   bool bootstrap(StreamingEngine &engine) const override {
-    return glm5next_full_graph_bootstrap(engine);
+    return bailingmoe3_native_graph_enabled()
+               ? true
+               : glm5next_full_graph_bootstrap(engine);
   }
-  void shutdown() const override { glm5next_full_graph_shutdown(); }
-  bool supports_cpu_lane() const override { return true; }
+  void shutdown() const override {
+    if (bailingmoe3_native_graph_enabled())
+      bailingmoe3_native_graph_shutdown();
+    else
+      glm5next_full_graph_shutdown();
+  }
+  bool supports_cpu_lane() const override {
+    return !bailingmoe3_native_graph_enabled();
+  }
   int max_prefill_tokens(const StreamingEngine &e) const override {
     if (const char *v = std::getenv("MOESTREAM_LING_PREFILL_CHUNK"); v && v[0])
       return std::atoi(v);
@@ -167,18 +177,32 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
     return true;
   }
   bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
-    return glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_prepare(e, r.n_tokens, r.pos_base,
+                                                 r.token_ids)
+               : glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base,
+                                             r.token_ids);
   }
   bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
-    return glm5next_full_graph_run(e, r.hidden_states, r.n_tokens, r.pos_base,
-                                   r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_run(e, r.hidden_states, r.n_tokens,
+                                              r.pos_base, r.token_ids)
+               : glm5next_full_graph_run(e, r.hidden_states, r.n_tokens,
+                                         r.pos_base, r.token_ids);
   }
   bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
-    return glm5next_full_graph_decode_prepare(e, r.pos_base, r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_prepare(e, 1, r.pos_base,
+                                                 r.token_ids)
+               : glm5next_full_graph_decode_prepare(e, r.pos_base,
+                                                    r.token_ids);
   }
   bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
-    return glm5next_full_graph_decode_run(e, r.hidden_states, r.pos_base,
-                                          r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_run(e, r.hidden_states, 1,
+                                              r.pos_base, r.token_ids)
+               : glm5next_full_graph_decode_run(e, r.hidden_states,
+                                                r.pos_base, r.token_ids);
   }
 };
 

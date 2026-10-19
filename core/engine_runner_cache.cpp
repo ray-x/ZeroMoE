@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 
 std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // --- Multi-GPU memory planning (from optimize.md) ---
@@ -149,16 +150,19 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
         config.ram_preload_all_experts) ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&
         config.ram_preload_all_experts));
-  // DeepSeek-V4.1 graph nodes still dispatch MoE through
-  // RAMSafetyManager/GpuTopology. They own no second expert arena, so the
-  // normal usage-ranked preload must remain enabled in graph mode.
-  dsv41_graph_uses_native_moe_cache =
-      graph_mode && engine.family_ops.family == ModelFamily::DeepSeek_V41;
-  // DeepSeek graph callbacks use dense_proj() for shared experts, routers,
-  // and attention projections. Keep one native device pool for those calls;
-  // the graph borrows its device_ptrs instead of making a second copy.
+  // DeepSeek-V4.1 and opt-in Ling graph nodes dispatch MoE through the
+  // RAMSafetyManager/GpuTopology caches. They own no second expert arena, so
+  // keep the ordinary usage-ranked preload enabled in graph mode.
+  graph_uses_native_moe_cache =
+      graph_mode &&
+      (engine.family_ops.family == ModelFamily::DeepSeek_V41 ||
+       (engine.family_ops.family == ModelFamily::BailingMoE3 &&
+        bailingmoe3_native_graph_enabled()));
+  // Native-cache graph callbacks use the existing resident dense weights as
+  // well. Keep one native device pool for those calls; the graph borrows its
+  // device_ptrs instead of making a second copy.
   graph_owns_dense =
-      graph_mode && !dsv41_graph_uses_native_moe_cache;
+      graph_mode && !graph_uses_native_moe_cache;
   glm_graph_aliases_vram_cache =
       graph_mode && engine.family_ops.family == ModelFamily::GLM5NEXT &&
       glm5next_full_graph_enabled();

@@ -444,6 +444,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         models/glm/ggml_glm5next_graph_build.cpp
         models/glm/ggml_glm5next_graph_build_blocks.cpp
         models/glm/ggml_glm5next_graph_decode.cpp
+        models/glm/ggml_bailingmoe3_graph.cpp
         models/glm/ggml_glm5next_graph_offload.cpp
         models/glm/ggml_glm5next_graph_partial.cpp
         models/glm/ggml_glm5next_graph_run.cpp
@@ -576,6 +577,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         models/glm/ggml_glm5next_graph_build.cpp
         models/glm/ggml_glm5next_graph_build_blocks.cpp
         models/glm/ggml_glm5next_graph_decode.cpp
+        models/glm/ggml_bailingmoe3_graph.cpp
         models/glm/ggml_glm5next_graph_offload.cpp
         models/glm/ggml_glm5next_graph_partial.cpp
         models/glm/ggml_glm5next_graph_run.cpp

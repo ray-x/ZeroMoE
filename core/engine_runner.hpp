@@ -99,7 +99,7 @@ private:
   std::vector<size_t> expert_layer_slab_bytes;
   bool graph_mode = false;
   bool graph_ram_cache = false;
-  bool dsv41_graph_uses_native_moe_cache = false;
+  bool graph_uses_native_moe_cache = false;
   bool graph_owns_dense = false;
   bool glm_graph_aliases_vram_cache = false;
   bool qwen_cpu_ram_cache = false;
