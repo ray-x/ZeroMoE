@@ -787,16 +787,13 @@ public:
   }
 
   // Opt-in: reopen every shard's fd with O_DIRECT, one shard at a time,
-  // ONLY if (a) this platform supports O_DIRECT at all (Linux; this
-  // project's only supported build target per CLAUDE.md, but guarded
-  // anyway rather than assumed) and (b) this file's own
-  // general.alignment KV value (written by tools/gguf_tool pack,
-  // defaults to 32 for any file that was never repacked) is at least
-  // `min_alignment` -- a plain, un-repacked GGUF has 32-byte tensor
-  // offsets, which can never satisfy O_DIRECT's block-alignment
-  // requirement, so direct I/O is refused outright for such a file
-  // rather than silently attempting misaligned reads. Even when the
-  // alignment check passes, each shard gets a real test read (not just
+  // ONLY if this platform supports O_DIRECT (Linux; guarded rather
+  // than assumed). When allow_unaligned_ranges is true, GGUF tensor
+  // offsets need not meet O_DIRECT's block alignment:
+  // pread_direct_aware and io_uring_backend round each read window to
+  // min_alignment and stage only the requested bytes. Keep this false
+  // for cuFile, whose device-read path has separate offset constraints.
+  // Each shard gets a real test read (not just
   // a successful open()) before being trusted -- some filesystems
   // (network mounts, some overlay/container filesystems, tmpfs) accept
   // O_DIRECT at open() but reject the actual read with EINVAL; a shard
@@ -806,7 +803,8 @@ public:
   // caller should have to work around if it doesn't pan out for a
   // given filesystem. Returns the number of shards that ended up with
   // real O_DIRECT active.
-  int enable_direct_io(uint64_t min_alignment = 4096) {
+  int enable_direct_io(uint64_t min_alignment = 4096,
+                       bool allow_unaligned_ranges = false) {
     shard_direct_io.assign(shard_fds.size(), false);
 #ifndef __linux__
     (void)min_alignment; // only referenced in the Linux branch below
@@ -817,17 +815,21 @@ public:
 #else
     auto it = kv_uint.find("general.alignment");
     uint64_t file_alignment = (it != kv_uint.end()) ? it->second : 32;
-    if (file_alignment < min_alignment) {
-      LOG_STREAM_WARN() << "[DIRECT-IO] This model's general.alignment="
-                        << file_alignment << " is below the required "
-                        << min_alignment
-                        << " bytes -- this file was "
-                           "never repacked with tools/gguf_tool pack (or used "
-                           "a smaller --align). "
-                           "Direct I/O disabled, all reads stay buffered.\n";
+    direct_io_alignment = min_alignment;
+    if (file_alignment < min_alignment && !allow_unaligned_ranges) {
+      LOG_STREAM_WARN()
+          << "[DIRECT-IO] GGUF tensor alignment=" << file_alignment
+          << " is below the required " << min_alignment
+          << " bytes for this read path; direct I/O disabled.\n";
       return 0;
     }
-    direct_io_alignment = file_alignment;
+    if (file_alignment < min_alignment) {
+      LOG_STREAM_INFO()
+          << "[DIRECT-IO] GGUF tensor alignment=" << file_alignment
+          << " bytes; using " << direct_io_alignment
+          << "-byte aligned read windows with scratch staging for unaligned "
+             "tensor ranges.\n";
+    }
 
     void *test_buf = nullptr;
     if (posix_memalign(&test_buf, (size_t)direct_io_alignment,

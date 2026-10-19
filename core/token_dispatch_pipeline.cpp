@@ -1336,6 +1336,11 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     static thread_local std::vector<int> decode_accum_tok;
     static thread_local std::vector<float> decode_accum_w;
     bool decode_accum_begun[PerfCounters::PERF_MAX_GPU_SLOTS] = {};
+    // All selected experts in this token/layer use the same hidden-state
+    // input. Reuse one uploaded device copy per participating GPU instead of
+    // copying it once into every expert's private output scratch buffer.
+    std::array<const float *, PerfCounters::PERF_MAX_GPU_SLOTS>
+        shared_input_by_gpu{};
     if (decode_gpu_accum) {
       decode_accum_tok.resize((size_t)topk);
       decode_accum_w.resize((size_t)topk);
@@ -1479,10 +1484,17 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
               << " expert=" << routed_expert_id << " topk=" << topk << "\n";
         }
         GpuExpertScratch &gs = scratch.gpu_pool[scratch.pending_gpu.size()];
+        const int gpu_id = resolved->gpu_id;
+        const bool gpu_id_valid =
+            gpu_id >= 0 && gpu_id < PerfCounters::PERF_MAX_GPU_SLOTS;
+        const float *shared_input =
+            gpu_id_valid ? shared_input_by_gpu[(size_t)gpu_id] : nullptr;
         gpu_issued = expert_ffn_gpu_issue(
             gs, resolved, token_hidden, exp->gate_proj.meta, exp->up_proj.meta,
-            1, D, moe_inter, gpu_ctx.topo);
+            1, D, moe_inter, gpu_ctx.topo, shared_input);
         if (gpu_issued) {
+          if (gpu_id_valid && !shared_input)
+            shared_input_by_gpu[(size_t)gpu_id] = gs.d_x;
           scratch.pending_gpu.push_back({k, exp, resolved, needs_release,
                                          loc_from_active_layer,
                                          gpu_ctx.expert_id});

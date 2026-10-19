@@ -1487,10 +1487,11 @@ public:
         if (file_align < ALIGN) {
             std::ostringstream o;
             o << "[ALIGN-WARN] general.alignment=" << file_align << " (< " << ALIGN
-              << "): O_DIRECT will be DISABLED for every shard, so all expert reads fall back to "
-                 "BUFFERED I/O through the page cache -- slower, and it makes the page cache compete "
-                 "with the host RAM expert tier for memory. Fix: repack with "
-                 "`tools/gguf_tool pack --align 4096`.\n";
+              << "): tensor ranges need aligned-window staging for O_DIRECT; "
+                 "the Ling bailingmoe3 loader can use it when cuFile is off, "
+                 "while other architectures keep the aligned-file gate. "
+                 "Repacking with `tools/gguf_tool pack --align 4096` can "
+                 "remove staging copies.\n";
             emit(o.str());
         }
 

@@ -41,13 +41,20 @@ std::expected<void, std::string> EngineRunner::load_model() {
     return std::unexpected(
         "Failed to parse GGUF file or map descriptor tree structure");
   }
+  const auto allow_unaligned_direct_io = [this](const GGUFFile &file) {
+    if (config.cuda_cufile)
+      return false;
+    const auto arch = file.kv_string.find("general.architecture");
+    return arch != file.kv_string.end() && arch->second == "bailingmoe3";
+  };
   // Opt-in only (config.direct_io, default false) -- see GGUFFile::
-  // enable_direct_io's own comment for the alignment check + per-shard
-  // test-read verification this does before trusting O_DIRECT on any
+  // enable_direct_io's Ling-only aligned-window staging and per-shard
+  // test-read verification before trusting O_DIRECT on any
   // shard. Called right after load_header (all shard fds + KV metadata
   // are populated by then) and before anything starts reading experts.
   if (config.direct_io)
-    engine.model_file.enable_direct_io();
+    engine.model_file.enable_direct_io(
+        4096, allow_unaligned_direct_io(engine.model_file));
   // Opened AFTER enable_direct_io deliberately: open_mirror matches each
   // shard's O_DIRECT state against the primary's, which isn't decided until
   // the call above has run and verified it per shard.
@@ -77,7 +84,8 @@ std::expected<void, std::string> EngineRunner::load_model() {
     }
     engine.has_dense_model = true;
     if (config.direct_io)
-      engine.dense_model_file.enable_direct_io();
+      engine.dense_model_file.enable_direct_io(
+          4096, allow_unaligned_direct_io(engine.dense_model_file));
   }
 
   // Optional standalone "shared" MTP/NextN checkpoint (Qwen4Exp convention
@@ -91,7 +99,8 @@ std::expected<void, std::string> EngineRunner::load_model() {
     }
     engine.has_mtp_model = true;
     if (config.direct_io)
-      engine.mtp_model_file.enable_direct_io();
+      engine.mtp_model_file.enable_direct_io(
+          4096, allow_unaligned_direct_io(engine.mtp_model_file));
   }
 
   if (!tokenizer.load(engine.model_file)) {
