@@ -272,3 +272,10 @@ Same config (54 GiB pool, pilot stage 8, UD-IQ2_M, 426-token prompt, 48 new toke
 
 Differences are inside run-to-run noise; the 1.4 cores freed from buffered reads are not what limits decode. Left opt-in (default off). Decode stays ~0.9-1.0 tok/s;
 1.7 tok/s (590 ms/step) is not reached. Note a pre-existing exit-time CUDA abort in `~StageRuntime` after the run (harmless to results).
+
+### Provenance of the "1.7 tok/s last recorded peak" (2026-10-19)
+
+Searching every log in `logs/` for decode >= 1.6 tok/s finds exactly one line: `logs/check/short_layered.log`, "decode=1.74 tok/s (2 tokens / 1.15s)", the old layered
+path with an 18-token prompt (the answer "Paris" plus end-of-generation). That is a 2-token sample, not a steady rate. The same layered path on the 399-token prompt
+measured 0.98 tok/s (4 tokens / 4.07 s), and every multi-token run on any path is 0.77-1.18 tok/s. The full-graph path's best steady decode (848 ms/step, 1.18 tok/s)
+is therefore at or above the layered path's real rate; 1.7 tok/s has never been measured over a meaningful number of tokens.
