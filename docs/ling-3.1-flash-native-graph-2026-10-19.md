@@ -108,3 +108,39 @@ Cache sizing and preload policy are no longer the main source of the gap to
 DeepSeek-V4.1. The request profile still attributes significant time to RAM
 lookups and reads, Ling attention, and the output projection. The target is
 still unmet.
+
+## MLA GPU fast-path follow-up
+
+With the same 90 GiB DDR configuration, enabling `attn_qabsorb_gpu` with a
+1 GiB cap uploaded the BF16 WUK cache for 9 of 72 layers (0.0755 GB; the
+remaining layers lacked those weights or did not fit the live VRAM budget).
+The run measured **1.81 tok/s decode**, **1.51 tok/s prefill**, **1.77 tok/s
+first-to-last output**, and **1.68 tok/s overall**, with 82.23 GB reported
+RSS. Sampled cgroup usage remained below 89 GB / 100 GB and
+`memory.swap.current=0`. This is the current best same-prompt result, a small
+gain over the 90 GiB baseline.
+
+The separate MLA score GPU trial reached 1.80 tok/s decode but slowed the
+short prefill to 1.39 tok/s. Forcing legacy CPU score during prefill restored
+1.48 tok/s prefill but measured 1.76 tok/s decode, so this score path is not
+part of the current best config. Neither attention fast-path trial closes
+the 10/20 target.
+
+
+## Attention-path A/B and dispatch diagnostic
+
+With the same 90 GiB DDR pool, enabling the MLA Q-absorb GPU path (1 GiB
+cap; score GPU path off) uploaded WUK weights for 9 of 72 layers using
+0.0755 GB. It measured **1.81 tok/s decode** and **1.51 tok/s prefill**,
+which remains the best normal-log-level result. Enabling the MLA score GPU
+path alone measured 1.80 / 1.39 tok/s (decode/prefill); forcing legacy CPU
+score for prefill measured 1.76 / 1.48. Neither score-GPU variant was kept
+in the test config.
+
+A DEBUG diagnostic confirmed that the 1.97 GB “embedding + LM head” dense
+category is part of the 3090's GPU dense pool; it did not log the CPU
+`dense_proj` fallback for `output.weight`. The reported ~4.1 s LM-head timer
+therefore includes the GPU dispatch path and may also include synchronization
+with earlier asynchronous work. The next execution-path investigation must
+separate that wait from the output projection itself. The diagnostic run was
+not used as a throughput result.
