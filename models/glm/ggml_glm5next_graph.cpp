@@ -234,7 +234,10 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    // Prefill runs the cold-expert matmuls on the CPU for a whole batch: it has its own thread count.
+    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_CPU_THREADS");
+    if (!e || !e[0])
+      e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)

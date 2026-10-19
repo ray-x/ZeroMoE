@@ -133,3 +133,21 @@ the KV state, otherwise the seed fails and the decode graph is declined.
 Conclusion: drive bandwidth is not what limits the graph (halving read time changed nothing). Prefill is limited by the CPU matmuls of experts outside VRAM,
 decode by the per-token miss handling. The earlier "disk-bound" statement in this file was wrong. Levers left: a separate (higher) CPU thread count for
 prefill only, getting op-offload to work with the offload arena, and a larger VRAM-resident expert set.
+
+### GLM_DSA graph prefill: 12.2 tok/s with GPU op-offload (2026-10-19)
+
+Per-op profile of the 6.2 tok/s prefill: 61 of 69 s were `MUL_MAT_ID` on the CPU (iq2_xxs 41.2 s, iq3_xxs 18.8 s); everything on the GPUs was under 1 s. Letting the
+scheduler run the host-resident expert matmuls on the GPU (`MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1`) removes that:
+
+| Prefill, 426 tokens, both GPUs, 45 GiB pool | tok/s | Wall |
+|---|---|---|
+| CPU expert matmuls, 6 threads | 5.12 | 82 s |
+| CPU expert matmuls, 10-14 threads | 6.2 | 69 s |
+| GPU op-offload (this) | **12.16** | **35 s** |
+
+Output text identical to the CPU-matmul run (181 chars compared). Decode is unchanged (0.66 tok/s overall, mean step 1131 ms, 6 threads).
+
+It needs a ggml that has (a) `patches/ggml/0006` (batched MMQ treats negative ids as inactive; the prebuilt `moestream-build-upstream-master` ggml-cuda dates from Oct 4, before it, and
+crashes with `illegal memory access`) and (b) `patches/ggml/0007` (arena-safe expert copy; without it: `CUDA error: invalid argument`, or `GGML_ASSERT(id >= 0 ...)` on the -1 route ids). The in-tree build
+did not apply 0007 by itself; it was applied by hand to a private copy of the committed integration source (`~/work/ggml-0006-src`), built as `build_g6`
+(`cmake -S . -B build_g6 -DMOESTREAM_GGML_ROOT=<that ggml> -DCMAKE_CUDA_ARCHITECTURES="86;120" ...` with no PREBUILT dir). Run with `logs/run_dsa_graph2gpu_426.sh`.
