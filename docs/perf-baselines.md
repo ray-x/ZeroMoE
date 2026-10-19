@@ -222,3 +222,17 @@ Config: 3090 dense+moe, 5060 Ti moe, PREFILL_GPU1=0, GPU1_HOT_GIB=11, pilot stag
 - Pilot precision by rank (K=8): r1 96%, r2 87%, r3 76%, r4 64%, r5 52%, r6 41%, r7 32%, r8 26%.
 - Per decoded token: about 250 pilot-prefetch loads (prefetch_loads/jobs, about 30 tokens) plus about 90 demand loads (rough, from cumulative counters), about 340 loads. At 10.9 MB per expert (store size / expert count) that is roughly 3.7 GB per token over about 1 s, i.e. about 3-4 GB/s, which is the SSD ceiling measured earlier (2.7-4.8 GB/s).
 - Conclusion: decode is SSD-bandwidth-bound. Prefetch depth only moves loads around. Reaching 590 ms per step needs about 40% fewer bytes read per token, i.e. a lower cold miss rate (about 50% now), from a bigger DDR pool or a better eviction policy, not deeper prefetch.
+
+### GLM-5.3 DSA full graph: segmented LRU vs LRU (2026-10-19)
+
+Same config as above (K=8, 54 GiB pool, 426-token prompt, 35 steady steps), run alone on the box.
+
+| policy | mean decode step | tok/s | demand misses at the last progress line |
+|---|---|---|---|
+| lru (default) | about 970 ms | about 1.0 | 3892 (different run length, not directly comparable) |
+| seg, probation 0.25 | 1055 ms | 0.95 | 3200 |
+| seg, probation 0.10 | 1069 ms | 0.94 | 3207 |
+
+- Segmented LRU is about 8-10% slower even though it records fewer demand misses, so the demand-miss count alone does not predict step time. Likely it displaces prefetched experts, which are inserted as Prefetch kind. Not diagnosed further.
+- The first attempt at this A/B was invalid: another session's engine (ling-3.1-flash worktree) was running on the GPU and the script read a stale log. Those numbers were discarded.
+- Keep the default LRU.
