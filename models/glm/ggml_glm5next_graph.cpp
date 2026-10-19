@@ -5,6 +5,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -46,6 +47,11 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!graph_enabled_for(engine))
     return false;
   moestream::graphcfg::log_effective("glm5next-full-graph");
+  if (bailingmoe3_hybrid_cuda_graph_enabled()) {
+    LOG_INFO("[GGML-LING-HYBRID] native expert cache owns DDR/VRAM; "
+             "skipping graph-owned expert preload\n");
+    return true;
+  }
   // Build and seed the offload cache at boot, not inside the first decode token.
   FullGraph candidate;
   candidate.engine = &engine;
@@ -186,6 +192,7 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g_graph.reset();
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
+  g->native_moe_cache = bailingmoe3_hybrid_cuda_graph_enabled();
   g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = S;
@@ -222,9 +229,12 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
       engine.model_file.get_config_int("attention.indexer.kpool_select_tail", 0) != 0;
   g->v_head = c.v_head;
   g->first_dense = c.first_dense;
-  g->device_expert_layers = std::min(glm5next_full_graph_device_expert_layers(),
-                                     std::max(0, c.n_layers - c.first_dense));
-  if (configure_partial_experts(*g))
+  g->device_expert_layers =
+      g->native_moe_cache
+          ? 0
+          : std::min(glm5next_full_graph_device_expert_layers(),
+                     std::max(0, c.n_layers - c.first_dense));
+  if (!g->native_moe_cache && configure_partial_experts(*g))
     g->device_expert_layers = 0;
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
@@ -235,17 +245,19 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   if (!g->cuda || !g->cpu)
     return false;
 
-  if (g_glm5next_source &&
+  if (!g->native_moe_cache && g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, *g)) {
     if (!g_glm5next_source->move_expert_source_to(*g))
       return false;
     LOG_INFO("[GGML-GLM5NEXT-FULL] reusing boot expert source: %.2f GiB DDR; "
              "no SSD reload for prompt S=%d\n",
              (double)g->expert_source_used / (1024.0 * 1024.0 * 1024.0), S);
-  } else if (!prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL")) {
+  } else if (!g->native_moe_cache &&
+             !prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL")) {
     return false;
   }
-  if (!init_expert_arena(*g) || !init_dense_arena(*g))
+  if ((!g->native_moe_cache && !init_expert_arena(*g)) ||
+      !init_dense_arena(*g))
     return false;
   // Memory pre-check: the scheduler's workspace is requested from the allocator in one piece, and a request the device
   // cannot satisfy must never reach it. Device-0 consumption measured from free memory after the build: ~0.8 MiB per token (0.20 GiB left at 814

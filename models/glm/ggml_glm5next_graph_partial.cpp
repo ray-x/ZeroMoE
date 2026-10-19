@@ -1501,7 +1501,17 @@ ggml_tensor *static_full_weight(FullGraph &g, ggml_context *ctx,
                                 const std::string &name) {
   // DSA's attn_k_b and attn_v_b are intentionally absent from the legacy
   // resident manifest because that path builds CPU WUK/WUV caches.  In this
-  // graph they are ordinary static device weights.
+  // graph they are ordinary static weights. Ling's native-cache graph keeps
+  // these tensors in resident_layers on the host for the existing MLA path;
+  // bind that source directly instead of trying to copy it into the graph's
+  // 1 MiB dense marker arena.
+  if (g.native_moe_cache) {
+    if (ggml_tensor *t = resident_tensor(g, ctx, name))
+      return t;
+    LOG_WARN("[GGML-LING-HYBRID] static weight is not resident: %s; "
+             "trying the legacy graph-owned loader\n",
+             name.c_str());
+  }
   return load_full_weight(g, ctx, name, false);
 }
 

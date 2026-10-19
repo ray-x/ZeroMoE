@@ -57,6 +57,12 @@ namespace glm5next_graph {
 constexpr int kGraphSize = 60000;
 constexpr size_t kTensorContextBytes = 192ull * 1024ull * 1024ull;
 
+struct FullGraph;
+struct NativeMoeSite {
+  FullGraph *owner = nullptr;
+  int layer = -1;
+};
+
 
 struct DynamicUploadCopy {
   const void *source = nullptr;
@@ -178,6 +184,8 @@ using moestream::graph::resident;
 struct FullGraph : moestream::graph::GraphCore {
   FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
 
+  bool native_moe_cache = false;
+  std::vector<NativeMoeSite> native_moe_sites;
   GpuTopology *topology = nullptr;
   int d_inner = 0;
   int qk_nope = 0;

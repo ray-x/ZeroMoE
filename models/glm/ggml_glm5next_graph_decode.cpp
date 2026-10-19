@@ -4,6 +4,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -49,6 +50,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
+  g->native_moe_cache = bailingmoe3_hybrid_cuda_graph_enabled();
   g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = 1;
@@ -74,10 +76,12 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       engine.model_file.get_config_int("attention.indexer.kpool_select_tail", 0) != 0;
   g->v_head = c.v_head;
   g->first_dense = c.first_dense;
-  g->device_expert_layers = std::min(
-      glm5next_full_graph_device_expert_layers(),
-      std::max(0, c.n_layers - c.first_dense));
-  if (configure_partial_experts(*g))
+  g->device_expert_layers =
+      g->native_moe_cache
+          ? 0
+          : std::min(glm5next_full_graph_device_expert_layers(),
+                     std::max(0, c.n_layers - c.first_dense));
+  if (!g->native_moe_cache && configure_partial_experts(*g))
     g->device_expert_layers = 0;
 
   // Sparse decode requires prompt-computed indexer keys and complete KPool
@@ -135,12 +139,12 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // Preserve the large, reusable DDR expert source while replacing the
   // prompt-shaped graph with the fixed S=1 decode topology.
   bool source_transferred = false;
-  if (g_graph && g_graph->has_expert_source() &&
+  if (!g->native_moe_cache && g_graph && g_graph->has_expert_source() &&
       source_configuration_matches(*g_graph, *g)) {
     if (!g_graph->move_expert_source_to(*g))
       return false;
     source_transferred = true;
-  } else if (g_glm5next_source &&
+  } else if (!g->native_moe_cache && g_glm5next_source &&
              source_configuration_matches(*g_glm5next_source, *g)) {
     if (!g_glm5next_source->move_expert_source_to(*g))
       return false;
@@ -185,16 +189,17 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   }
   if (!g->cuda || !g->cpu)
     return decline_decode_graph();
-  if (!source_transferred && g_glm5next_source &&
+  if (!g->native_moe_cache && !source_transferred && g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, *g)) {
     if (!g_glm5next_source->move_expert_source_to(*g))
       return decline_decode_graph();
     source_transferred = true;
   }
-  if (!source_transferred &&
+  if (!g->native_moe_cache && !source_transferred &&
       !prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL-DECODE"))
     return decline_decode_graph();
-  if (!init_expert_arena(*g) || !init_dense_arena(*g) ||
+  if ((!g->native_moe_cache && !init_expert_arena(*g)) ||
+      !init_dense_arena(*g) ||
       !init_decode_state_arena(*g)) {
     return decline_decode_graph();
   }

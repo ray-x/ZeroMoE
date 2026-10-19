@@ -154,12 +154,16 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
             phase == ModelGraphPhase::Decode);
   }
   bool bootstrap(StreamingEngine &engine) const override {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_bootstrap(engine);
     return bailingmoe3_native_graph_enabled()
                ? true
                : glm5next_full_graph_bootstrap(engine);
   }
   void shutdown() const override {
-    if (bailingmoe3_native_graph_enabled())
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      glm5next_full_graph_shutdown();
+    else if (bailingmoe3_native_graph_enabled())
       bailingmoe3_native_graph_shutdown();
     else
       glm5next_full_graph_shutdown();
@@ -177,6 +181,9 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
     return true;
   }
   bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base,
+                                         r.token_ids);
     return bailingmoe3_native_graph_enabled()
                ? bailingmoe3_native_graph_prepare(e, r.n_tokens, r.pos_base,
                                                  r.token_ids)
@@ -184,6 +191,9 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
                                              r.token_ids);
   }
   bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_run(e, r.hidden_states, r.n_tokens,
+                                     r.pos_base, r.token_ids);
     return bailingmoe3_native_graph_enabled()
                ? bailingmoe3_native_graph_run(e, r.hidden_states, r.n_tokens,
                                               r.pos_base, r.token_ids)
@@ -191,6 +201,8 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
                                          r.pos_base, r.token_ids);
   }
   bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_decode_prepare(e, r.pos_base, r.token_ids);
     return bailingmoe3_native_graph_enabled()
                ? bailingmoe3_native_graph_prepare(e, 1, r.pos_base,
                                                  r.token_ids)
@@ -198,6 +210,9 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
                                                     r.token_ids);
   }
   bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_decode_run(e, r.hidden_states, r.pos_base,
+                                           r.token_ids);
     return bailingmoe3_native_graph_enabled()
                ? bailingmoe3_native_graph_run(e, r.hidden_states, 1,
                                               r.pos_base, r.token_ids)

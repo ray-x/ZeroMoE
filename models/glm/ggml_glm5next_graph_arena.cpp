@@ -78,7 +78,18 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
   ggml_tensor *t = new_tensor(ctx, (ggml_type)q->meta.type, shape);
   if (!t || q->meta.size_bytes < ggml_nbytes(t))
     return nullptr;
-  if (graph_dense_weight_name(name)) {
+  if (g.native_moe_cache && q->device_ptr) {
+    // The Ling hybrid graph uses the engine's existing dense pool. The small
+    // marker buffer supplies GGML's CUDA backend identity; the actual weight
+    // address remains owned by CudaManager.
+    t->data = q->device_ptr;
+    t->buffer = g.dense.buffer;
+    ++g.dense.tensors;
+  } else if (g.native_moe_cache) {
+    if (!bind_host(g, t, q->host_ptr, q->meta.size_bytes,
+                   GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
+      return nullptr;
+  } else if (graph_dense_weight_name(name)) {
     if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity,
                      g.dense.used, t, q->host_ptr, q->meta.size_bytes))
       return nullptr;
@@ -202,6 +213,30 @@ size_t dense_arena_bytes(const FullGraph &g) {
 }
 
 bool init_dense_arena(FullGraph &g) {
+  if (g.native_moe_cache) {
+    constexpr size_t kMarkerBytes = 1ull << 20;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaSetDevice(g.device) != cudaSuccess ||
+        cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        free_bytes < kMarkerBytes + (512ull << 20)) {
+      LOG_WARN("[GGML-LING-HYBRID] insufficient checked VRAM for CUDA graph "
+               "marker (free=%.2f GiB); declining hybrid graph\n",
+               (double)free_bytes / (1024.0 * 1024.0 * 1024.0));
+      return false;
+    }
+    auto buft = ggml_backend_get_default_buffer_type(g.cuda);
+    g.dense.buffer = ggml_backend_buft_alloc_buffer(buft, kMarkerBytes);
+    if (!g.dense.buffer)
+      return false;
+    ggml_backend_buffer_set_usage(g.dense.buffer,
+                                  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    g.dense.base = ggml_backend_buffer_get_base(g.dense.buffer);
+    g.dense.capacity = ggml_backend_buffer_get_size(g.dense.buffer);
+    LOG_INFO("[GGML-LING-HYBRID] using native dense pool; CUDA marker "
+             "allocated=%.3f MiB\n",
+             (double)g.dense.capacity / (1024.0 * 1024.0));
+    return true;
+  }
   const size_t bytes = dense_arena_bytes(g);
   if (bytes == 0)
     return false;

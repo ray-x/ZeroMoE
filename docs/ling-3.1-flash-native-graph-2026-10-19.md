@@ -144,3 +144,54 @@ therefore includes the GPU dispatch path and may also include synchronization
 with earlier asynchronous work. The next execution-path investigation must
 separate that wait from the output projection itself. The diagnostic run was
 not used as a throughput result.
+
+## Hybrid CUDA graph A/B (2026-10-19)
+
+The opt-in Ling hybrid path now builds the KDA/MLA attention graph while each
+MoE layer calls the existing native expert cache. It reuses the engine's dense
+weight pool and keeps the usage-ranked DDR/VRAM cache ownership. The graph
+borrows the host-resident MLA WUK/WUV tensors through `resident_tensor`; this
+avoids loading them into the 1 MiB native dense marker arena. No CUDA kernel
+source changed.
+
+The 32-token A/B used the same raw two-token `Hi there` prompt that generated
+the fixed usage profile, `/tmp/ling-3.1-flash-usage-fullgraph.pin` (5,879
+records). The profile was left unchanged. Context was 64, generation was
+greedy, and the opt-in flags were
+`MOESTREAM_LING_FULL_GRAPH=1`, `MOESTREAM_LING_NATIVE_GRAPH=1`, and
+`MOESTREAM_LING_HYBRID_CUDA_GRAPH=1`.
+
+The test used `host_ram_gb=90`, `MemoryMax=100G`, and `MemorySwapMax=0`.
+Startup admitted 116.9 GB available against the engine's 111.5 GB requirement.
+The GPU cache budget was moved from the 3090 to the 5060 Ti to leave graph
+workspace on the core device: 3.0 GB on the 3090 and 14.4 GB on the 5060 Ti.
+The two-GPU active pools remained 24 slots / 1.2729 GB and 8 slots / 0.4243 GB.
+The engine logged 17.753 GB of dense weights on the 3090 and 37.66 GB total
+allocated across both devices after cache setup. Expert residency at shutdown
+was 66.7741 GB in DDR and 15.1398 GB in the persistent GPU caches.
+
+Both graph shapes built successfully:
+
+- Prefill: 72 layers, 4,073 nodes, 172 splits, 0.27 GiB workspace.
+- Decode: 72 layers, 4,139 nodes, 173 splits, 0.27 GiB workspace.
+
+The request measured:
+
+- Prefill: 2 tokens in 1.51866 s, **1.31695 tok/s**.
+- Decode: 32 tokens in 12.834 s, **2.49 tok/s** request-wall rate and
+  **2.44 tok/s** first-to-last output rate.
+- Overall: 32 generated tokens in 14.36 s, **2.23 tok/s**.
+
+The expert cache reported 7,532 hits and 2,593 misses (74.4% hit rate).
+Cache promotions transferred 33.53 GB H2D in 3.679 s (9.11 GB/s). The profile
+was not surveyed again. Compared with the previous 1.81 tok/s decode result,
+the hybrid graph improved decode by about 38%; its short two-token prefill
+measured below the earlier 1.51 tok/s result. The 10/20 tok/s target remains
+unmet.
+
+A `host_ram_gb=100` run was not admitted: its startup requirement is about
+121.5 GB available, above the host's observed 114-117 GB idle range. The
+34 GiB figure should be treated as total board use; 34 GiB of expert cache
+alone cannot fit alongside the dense weights on these cards. The measured
+37.66 GB device allocation includes the dense pool, expert caches, and other
+runtime allocations. See the run log `/tmp/ling-3.1-flash-hybrid-full32-cache-split-90g.log`.

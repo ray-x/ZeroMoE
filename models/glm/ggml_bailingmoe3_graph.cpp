@@ -87,7 +87,6 @@ void ling_layer_node(ggml_tensor *dst, const ggml_tensor *src, int ith, int,
       !g_runtime.scratch)
     throw std::runtime_error("Ling native graph cache runtime is not bound");
 
-  const auto &c = engine.model_file.architecture_config;
   const size_t bytes = (size_t)g.S * (size_t)g.D * sizeof(float);
   if (!src || !src->data || !dst || !dst->data || ggml_nbytes(src) != bytes ||
       ggml_nbytes(dst) != bytes)
@@ -109,16 +108,8 @@ void ling_layer_node(ggml_tensor *dst, const ggml_tensor *src, int ith, int,
                                scratch.attn_out.data(), g.S, g.D);
 
   engine.family_ops.hc_pre_fn(engine, site.layer, 1, hidden, g.S, g.D);
-  if (site.layer < c.first_dense) {
-    dense_ffn_gguf(engine, site.layer, hidden, g.S, scratch.moe_out.data(),
-                   scratch);
-  } else {
-    if (g_runtime.ram->vram_cache)
-      g_runtime.ram->vram_cache->prefill_current_layer = site.layer;
-    moe_forward_gguf(engine, *g_runtime.ram, *g_runtime.prefetch, site.layer,
-                     hidden, g.S, scratch.moe_out.data(), scratch,
-                     g.token_ids.data());
-  }
+  bailingmoe3_native_graph_ffn(engine, site.layer, hidden, g.S,
+                               scratch.moe_out.data(), g.token_ids.data());
   engine.family_ops.hc_post_fn(engine, site.layer, 1, hidden,
                                scratch.moe_out.data(), g.S, g.D);
 }
@@ -197,6 +188,15 @@ bool bailingmoe3_native_graph_enabled() {
 #endif
 }
 
+bool bailingmoe3_hybrid_cuda_graph_enabled() {
+#if defined(MOESTREAM_USE_GGML_CUDA)
+  return bailingmoe3_native_graph_enabled() &&
+         moestream::graphcfg::flag_on("MOESTREAM_LING_HYBRID_CUDA_GRAPH");
+#else
+  return false;
+#endif
+}
+
 void bailingmoe3_native_graph_bind_runtime(StreamingEngine &engine,
                                            RAMSafetyManager &ram,
                                            LockFreePrefetcher &prefetch,
@@ -208,6 +208,41 @@ void bailingmoe3_native_graph_bind_runtime(StreamingEngine &engine,
   (void)ram;
   (void)prefetch;
   (void)scratch;
+#endif
+}
+
+void bailingmoe3_native_graph_ffn(StreamingEngine &engine, int layer_idx,
+                                 const float *hidden_states, int S,
+                                 float *output, const int *token_ids) {
+#if defined(MOESTREAM_USE_GGML_CUDA)
+  if (g_runtime.engine != &engine || !g_runtime.ram || !g_runtime.prefetch ||
+      !g_runtime.scratch)
+    throw std::runtime_error("Ling native MoE runtime is not bound");
+  if (!hidden_states || !output || S <= 0 || layer_idx < 0 ||
+      layer_idx >= engine.model_file.architecture_config.n_layers)
+    throw std::runtime_error("Ling native MoE callback input is invalid");
+
+  auto &scratch = *g_runtime.scratch;
+  const auto &c = engine.model_file.architecture_config;
+  const size_t elements = (size_t)S * (size_t)c.hidden;
+  if (scratch.moe_out.size() < elements)
+    throw std::runtime_error("Ling native MoE scratch is not sized for input");
+  if (layer_idx < c.first_dense) {
+    dense_ffn_gguf(engine, layer_idx, hidden_states, S, output, scratch);
+  } else {
+    if (g_runtime.ram->vram_cache)
+      g_runtime.ram->vram_cache->prefill_current_layer = layer_idx;
+    moe_forward_gguf(engine, *g_runtime.ram, *g_runtime.prefetch, layer_idx,
+                     hidden_states, S, output, scratch, token_ids);
+  }
+#else
+  (void)engine;
+  (void)layer_idx;
+  (void)hidden_states;
+  (void)S;
+  (void)output;
+  (void)token_ids;
+  throw std::runtime_error("Ling native MoE graph requires GGML CUDA");
 #endif
 }
 
