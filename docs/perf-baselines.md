@@ -220,5 +220,5 @@ Config: 3090 dense+moe, 5060 Ti moe, PREFILL_GPU1=0, GPU1_HOT_GIB=11, pilot stag
 | 8 | about 970 ms | about 1.0 |
 
 - Pilot precision by rank (K=8): r1 96%, r2 87%, r3 76%, r4 64%, r5 52%, r6 41%, r7 32%, r8 26%.
-- Per decoded token: about 240 pilot-prefetch loads plus about 68 demand misses, about 310 loads. At 10.9 MB per expert that is about 3.4 GB per token, about 3 GB/s over about 1 s, which is the SSD ceiling measured earlier (2.7-4.8 GB/s).
+- Per decoded token: about 250 pilot-prefetch loads (prefetch_loads/jobs, about 30 tokens) plus about 90 demand loads (rough, from cumulative counters), about 340 loads. At 10.9 MB per expert (store size / expert count) that is roughly 3.7 GB per token over about 1 s, i.e. about 3-4 GB/s, which is the SSD ceiling measured earlier (2.7-4.8 GB/s).
 - Conclusion: decode is SSD-bandwidth-bound. Prefetch depth only moves loads around. Reaching 590 ms per step needs about 40% fewer bytes read per token, i.e. a lower cold miss rate (about 50% now), from a bigger DDR pool or a better eviction policy, not deeper prefetch.

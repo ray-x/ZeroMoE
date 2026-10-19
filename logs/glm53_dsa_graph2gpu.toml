@@ -16,7 +16,7 @@
 model_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align"
 mirror_model_path = "/data/glm53_mirror_cold50"
 # dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
-log_path = "/home/ray/work/moestream-glm53/logs/glm53_dsa_graph2gpu_d.log"
+log_path = "/home/ray/work/moestream-glm53/logs/glm53_dsa_graph2gpu_util.log"
 # log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 log_level = "INFO"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 # Was DEBUG + verbose_moe_log=true for the pin_topk_per_layer A/B test below --
@@ -328,7 +328,7 @@ prefetch_pilot_k_depth2 = 1
 # SECOND time this exact value has silently drifted back to 115 with no
 # accompanying comment explaining why -- worth treating any future
 # unexplained change to this specific line with real suspicion.
-host_ram_gb = 90.0
+host_ram_gb = 82.0
 # 2026-08-16 RETEST under the corrected host_ram_gb=108 -- REGRESSED, worse
 # than the original 40GB/host_ram_gb=120 test despite a much smaller 15GB
 # budget: overall 0.62->0.57 tok/s, hit rate 71.9%->67.0% (-4.9pp, bigger
