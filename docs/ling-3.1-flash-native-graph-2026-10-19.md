@@ -27,7 +27,7 @@ No CUDA kernel source changed in this work. The engine was rebuilt to compile
 the C++ graph adapter and cache integration; the graph invokes existing
 attention and MoE kernels through native callbacks.
 
-## Benchmark configuration
+## Initial 80 GiB benchmark configuration
 
 - Model: `/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf`
 - Usage profile: `/tmp/ling-3.1-flash-usage-fullgraph.pin` (5,879 expert records)
@@ -54,7 +54,7 @@ attention and MoE kernels through native callbacks.
 
 ## Result and limits
 
-The best measured run built both graph shapes and produced:
+The initial 80 GiB run built both graph shapes and produced:
 
 - Prefill: 2 tokens in 1.40983 s, **1.42 tok/s**
 - Decode: 32 tokens in 18.525 s, **1.73 tok/s** request wall rate
@@ -82,3 +82,29 @@ DeepSeek-style global top-N and adaptive cache settings. These results
 validate the native-cache graph integration, but do not meet the 10/20
 performance target. The remaining gap requires work in Ling's attention and
 expert execution path, beyond cache sizing alone.
+
+
+## Latest DDR-capacity follow-up
+
+The same config and prompt were rerun with a host RAM budget of 90 GiB,
+`MemoryMax=100G`, and `MemorySwapMax=0`. Startup admitted 117.3 GB available
+against a requirement of 111.5 GB. The byte-aware DDR pool grew to 19,040
+expert slots / 67.4824 GB; it held 66.9739 GB after decode. The run evicted
+1,464 DDR experts during decode, down from 1,844 with the 80 GiB pool. A
+sampled cgroup reading was 84.9 / 100 GiB with `memory.swap.current=0`.
+
+This is the best same-prompt result so far:
+
+- Prefill: 2 tokens in 1.34774 s, **1.48 tok/s**
+- Decode: 32 tokens in 18.108 s, **1.77 tok/s** request wall rate
+- First-to-last output interval: **1.72 tok/s**
+- Overall request rate: **1.64 tok/s**
+- Reported RSS at shutdown: **82.15 GB**
+- Expert residency at shutdown: **66.97 GB DDR** and **15.15 GB** in the
+  persistent GPU expert caches
+
+The change from the 80 GiB pool was small: about 2% decode and 4% prefill.
+Cache sizing and preload policy are no longer the main source of the gap to
+DeepSeek-V4.1. The request profile still attributes significant time to RAM
+lookups and reads, Ling attention, and the output projection. The target is
+still unmet.
