@@ -275,14 +275,14 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
   const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (rs % 4704 == 0)
+  if (rs % 1176 == 0)
     LOG_INFO("[GGML-GLM5NEXT-STAGE] progress: jobs=%llu experts_copied=%llu resolves=%llu staged_routes=%llu/%llu not_resident=%llu "
              "wait=%.1f ms direct_pieces=%llu prefetch_loads=%llu prefetch=%.1f ms\n",
              (unsigned long long)st->jobs.load(), (unsigned long long)st->copied.load(), (unsigned long long)rs,
              (unsigned long long)st->staged_routes.load(), (unsigned long long)st->routes_seen.load(),
              (unsigned long long)st->skipped_not_resident.load(), st->wait_us.load() / 1000.0, (unsigned long long)st->direct.load(),
              (unsigned long long)st->prefetch_loads.load(), st->prefetch_us.load() / 1000.0);
-  if (rs % 4704 == 0) {
+  if (rs % 1176 == 0) {
     std::string pr = "pilot precision by rank:", ps = "by score bucket (<.01 <.02 <.05 <.1 <.2 <.4 <.8 <1.6 >=1.6):";
     char buf[64];
     for (int j = 0; j < 8; ++j)

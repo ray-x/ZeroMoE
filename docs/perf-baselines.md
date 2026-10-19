@@ -210,3 +210,15 @@ Config: 3090 dense+moe, 5060 Ti moe, PREFILL_GPU1=0, GPU1_HOT_GIB=11, pilot stag
 - Steady decode step: 875-1270 ms (mean about 970 ms, about 1.0 tok/s), the same as the layered path (0.88-0.96 tok/s over 48 tokens).
 - The lower "overall" decode figure (0.69-0.71 tok/s) is this one-time 17 s hot-expert upload amortised over a short run, not a slower steady state.
 - GPU utilisation 3%/1% is expected: per step about 400 ms is the SSD-miss callback, about 350 ms CPU expert matmuls, about 75 ms GPU compute.
+
+### GLM-5.3 DSA full graph: pilot depth sweep and I/O budget (2026-10-19)
+
+| pilot stage/prefetch K | mean decode step (35 steps) | tok/s |
+|---|---|---|
+| 4 | 998 ms | 1.00 |
+| 6 | 1009 ms | 0.99 |
+| 8 | about 970 ms | about 1.0 |
+
+- Pilot precision by rank (K=8): r1 96%, r2 87%, r3 76%, r4 64%, r5 52%, r6 41%, r7 32%, r8 26%.
+- Per decoded token: about 240 pilot-prefetch loads plus about 68 demand misses, about 310 loads. At 10.9 MB per expert that is about 3.4 GB per token, about 3 GB/s over about 1 s, which is the SSD ceiling measured earlier (2.7-4.8 GB/s).
+- Conclusion: decode is SSD-bandwidth-bound. Prefetch depth only moves loads around. Reaching 590 ms per step needs about 40% fewer bytes read per token, i.e. a lower cold miss rate (about 50% now), from a bigger DDR pool or a better eviction policy, not deeper prefetch.
