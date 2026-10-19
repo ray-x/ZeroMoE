@@ -414,11 +414,17 @@ class ModelReader final : public ExpertSource {
 public:
   bool drop_page_cache = true;
   std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
-  ModelReader() = default;
+  ModelReader() { if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_MODEL_DIRECT")) use_direct = e[0] == '1'; }
   ~ModelReader() override {
     for (int fd : fds_) if (fd >= 0) ::close(fd);
+    for (int fd : fds_dir_) if (fd >= 0) ::close(fd);
     for (int fd : mirror_fds_) if (fd >= 0) ::close(fd);
+    for (int fd : mirror_fds_dir_) if (fd >= 0) ::close(fd);
   }
+  // Planes whose file offset, size and destination are 4096-aligned bypass the page cache (O_DIRECT): the same bandwidth as the
+  // buffered path for ~1/6 of the CPU, which matters because the CPU expert matmuls run at the same time.
+  bool use_direct = false; // opt-in via MOESTREAM_GLM5NEXT_MODEL_DIRECT=1: no decode gain measured
+  std::atomic<uint64_t> direct_planes{0}, buffered_planes{0};
   ModelReader(const ModelReader &) = delete;
   ModelReader &operator=(const ModelReader &) = delete;
 
@@ -429,6 +435,7 @@ public:
       const int fd = ::open(path.c_str(), O_RDONLY);
       if (fd < 0) { if (err) *err = "cannot open " + path; return false; }
       fds_.push_back(fd);
+      fds_dir_.push_back(::open(path.c_str(), O_RDONLY | O_DIRECT));
       for (const GgufTensorInfo &t : h.tensors) {
         int L = 0;
         char kind[8] = {0};
@@ -463,6 +470,10 @@ public:
       }
       fds.push_back(fd);
     }
+    for (const std::string &path : shards) {
+      const size_t sl = path.find_last_of('/');
+      mirror_fds_dir_.push_back(::open((dir + "/" + (sl == std::string::npos ? path : path.substr(sl + 1))).c_str(), O_RDONLY | O_DIRECT));
+    }
     int l, e;
     while (idx >> l >> e) mirror_set_.insert(detail::key(l, e));
     mirror_fds_ = std::move(fds);
@@ -487,9 +498,7 @@ public:
     auto one = [&](int k) {
       const Proj &p = layers_.at(layer).p[k];
       const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
-      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
-      if (drop_page_cache) ::posix_fadvise(p.fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
-      return true;
+      return read_plane(p.fd, fds_dir_[static_cast<size_t>(p.shard)], dst[k], static_cast<size_t>(p.per_expert), off);
     };
     std::vector<std::future<bool>> fs;
     int last = -1;
@@ -512,10 +521,8 @@ public:
       const Proj &p = layers_.at(layer).p[k];
       const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
       const int fd = use_mirror ? mirror_fds_[static_cast<size_t>(p.shard)] : p.fd;
-      if (!detail::pread_all(fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
-      // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
-      if (drop_page_cache) ::posix_fadvise(fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
-      return true;
+      const int fdd = use_mirror ? mirror_fds_dir_[static_cast<size_t>(p.shard)] : fds_dir_[static_cast<size_t>(p.shard)];
+      return read_plane(fd, fdd, dst[k], static_cast<size_t>(p.per_expert), off);
     };
     auto f1 = std::async(std::launch::async, one, 1);
     auto f2 = std::async(std::launch::async, one, 2);
@@ -527,10 +534,22 @@ public:
   }
 
 private:
+  // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
+  bool read_plane(int fd, int fd_dir, void *dst, size_t len, off_t off) {
+    if (use_direct && fd_dir >= 0 && len % 4096 == 0 && static_cast<uint64_t>(off) % 4096 == 0 && reinterpret_cast<uintptr_t>(dst) % 4096 == 0 &&
+        detail::pread_all(fd_dir, dst, len, off)) {
+      direct_planes.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (!detail::pread_all(fd, dst, len, off)) return false;
+    buffered_planes.fetch_add(1, std::memory_order_relaxed);
+    if (drop_page_cache) ::posix_fadvise(fd, off, static_cast<off_t>(len), POSIX_FADV_DONTNEED);
+    return true;
+  }
   struct Proj { int fd = -1; uint64_t offset = 0, per_expert = 0, n_experts = 0; int shard = 0; };
   struct Layer { Proj p[3]; };
-  std::vector<int> fds_;
-  std::vector<int> mirror_fds_;
+  std::vector<int> fds_, fds_dir_;
+  std::vector<int> mirror_fds_, mirror_fds_dir_;
   std::unordered_set<uint64_t> mirror_set_;
   std::unordered_map<int, Layer> layers_;
 };

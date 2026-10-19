@@ -165,6 +165,8 @@ class ExpertStore {
     LOG_INFO("%s %s sources: store direct=%llu store buffered=%llu model buffered=%llu\n", cfg_.log_tag, why,
              (unsigned long long)store_.direct_reads(), (unsigned long long)store_.buffered_reads(),
              (unsigned long long)model_.reads.load());
+    LOG_INFO("%s %s model planes: direct=%llu buffered=%llu\n", cfg_.log_tag, why, (unsigned long long)model_.direct_planes.load(),
+             (unsigned long long)model_.buffered_planes.load());
     if (split_)
       LOG_INFO("%s split reads: %llu (fallbacks %llu)\n", cfg_.log_tag, (unsigned long long)split_->split_reads.load(),
                (unsigned long long)split_->fallbacks.load());

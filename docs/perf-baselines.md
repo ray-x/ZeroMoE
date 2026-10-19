@@ -255,3 +255,20 @@ Leave-one-prompt-out, fraction of routed experts inside the top-N ranked set (ba
 Gain is ~+3 points (~6% fewer misses at best), far from -40%. Each prompt touches 8-9k of 19.2k experts; routing is prompt-specific.
 Not A/B'd end to end (the DDR pool is LRU-managed; seeding only affects the initial fill). Closed negative.
 Decode stays ~1.0 tok/s (~970 ms/step, SSD-bound); 1.7 tok/s is not reached.
+
+### GLM-5.3 (glm-dsa) decode: O_DIRECT model-side reads do not help (2026-10-19)
+
+Standalone random reads of 3.6 MB on the two drives (concurrent): O_DIRECT 3.3 GB/s (model drive, ~0.15 cores) + 2.85 GB/s (store drive);
+buffered+fadvise reaches the same 3.35 GB/s but burns ~1.44 cores. The engine only achieves ~3-3.7 GB/s combined, so `ModelReader` was made to
+read aligned planes with O_DIRECT (`MOESTREAM_GLM5NEXT_MODEL_DIRECT=1`; counter `model planes: direct=54533 buffered=0` confirms it is taken).
+
+Same config (54 GiB pool, pilot stage 8, UD-IQ2_M, 426-token prompt, 48 new tokens, preflight-gated, cold cache):
+
+| run | model reads | steady decode step |
+|---|---|---|
+| A | buffered | 887 ms |
+| B/D/E | direct | 924 / 925 / 862 ms (D and E each showed one 57 s / 37 s stall mid-run; cause not established, buffered runs' full logs were overwritten so not comparable) |
+| C | buffered | 940 ms (first 13 steps) |
+
+Differences are inside run-to-run noise; the 1.4 cores freed from buffered reads are not what limits decode. Left opt-in (default off). Decode stays ~0.9-1.0 tok/s;
+1.7 tok/s (590 ms/step) is not reached. Note a pre-existing exit-time CUDA abort in `~StageRuntime` after the run (harmless to results).
