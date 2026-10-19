@@ -3,6 +3,7 @@
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
+#include <chrono>
 #include <future>
 #include "ggml_glm5next_graph_impl.hpp"
 
@@ -660,6 +661,11 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
 
 bool build_graph(FullGraph &g) {
   const auto &c = g.engine->model_file.architecture_config;
+  const auto bp_start = std::chrono::steady_clock::now();
+  double bp_attn = 0, bp_ffn = 0, bp_pilot = 0;
+  const auto bp_ms = [](std::chrono::steady_clock::time_point a) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+  };
   ggml_init_params ip = {};
   ip.mem_size = kTensorContextBytes;
   ip.no_alloc = true;
@@ -911,10 +917,12 @@ bool build_graph(FullGraph &g) {
         }
       }
       ggml_tensor *kv = nullptr;
+      const auto bp_t0 = std::chrono::steady_clock::now();
       attn = g.dsa_plain
                  ? build_glm_dsa_attn(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache)
                  : build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache,
                              &previous_indexer_selection, &previous_indexer_mask);
+      bp_attn += bp_ms(bp_t0);
       if (!attn || !kv)
         return false;
       if (!g.decode_mode)
@@ -947,9 +955,13 @@ bool build_graph(FullGraph &g) {
       ggml_build_forward_expand(g.graph, post);
       ggml_build_forward_expand(g.graph, comb);
     }
+    const auto bp_t1 = std::chrono::steady_clock::now();
     if (!build_pilot_stage(g, g.ctx, cur_pre, l))
       return false;
+    bp_pilot += bp_ms(bp_t1);
+    const auto bp_t2 = std::chrono::steady_clock::now();
     ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l);
+    bp_ffn += bp_ms(bp_t2);
     if (!ffn) {
       LOG_WARN("[GGML-GLM5NEXT-FULL] build_ffn failed at layer=%d "
                "graph_ram_ready=%d\n",
@@ -1024,10 +1036,14 @@ bool build_graph(FullGraph &g) {
       }
     }
   }
+  const double bp_layers = bp_ms(bp_start);
+  const auto bp_t3 = std::chrono::steady_clock::now();
   if (!graph_alloc_vram_headroom_ok(g, "[GGML-GLM5NEXT-FULL]"))
     return false;
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
     return false;
+  LOG_INFO("[GLM-BUILD-PROFILE] %s: layer loop %.0f ms (attn weights+graph %.0f, pilot %.0f, ffn incl. expert/hot uploads %.0f), sched alloc %.0f ms\n",
+           g.decode_mode ? "decode" : "prefill", bp_layers, bp_attn, bp_pilot, bp_ffn, bp_ms(bp_t3));
   g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
 
   int cuda_nodes = 0, cpu_nodes = 0, other_nodes = 0, transitions = 0;

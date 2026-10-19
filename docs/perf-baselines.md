@@ -201,3 +201,12 @@ compute in the batched prefill graph is wrong for this model (cause not yet foun
 
 **GPU utilisation** (`nvidia-smi dmon`, 1 s samples, correct config): prefill 3090 46% avg (max 68%), 5060 Ti 0%; first-token graph build 14% / 10%; **decode 3% (max 6%) on the 3090 and 1% (max 2%) on the 5060 Ti**.
 Decode is >95% waiting on CPU expert matmuls and the SSD-miss callback, which is why GPU count, hot-set size and thread tuning barely moved it.
+
+## GLM-5.3 DSA full graph: decode vs layered profile (2026-10-19)
+
+Config: 3090 dense+moe, 5060 Ti moe, PREFILL_GPU1=0, GPU1_HOT_GIB=11, pilot stage 8 / prefetch 8 / lookahead 2, DDR pool 54 GiB, 426-token prompt.
+
+- Decode graph build (first token only): layer loop 17.0 s = attn 1 ms + pilot 128 ms + FFN incl. expert/hot uploads 14.8 s; sched alloc 11 ms. Prefill graph build: 2.7 s.
+- Steady decode step: 875-1270 ms (mean about 970 ms, about 1.0 tok/s), the same as the layered path (0.88-0.96 tok/s over 48 tokens).
+- The lower "overall" decode figure (0.69-0.71 tok/s) is this one-time 17 s hot-expert upload amortised over a short run, not a slower steady state.
+- GPU utilisation 3%/1% is expected: per step about 400 ms is the SSD-miss callback, about 350 ms CPU expert matmuls, about 75 ms GPU compute.
