@@ -167,3 +167,16 @@ Decode profile before prefetch (per token): SSD-miss callback 649 ms (169 misses
 
 Best config: `logs/ab_pilot.sh` env minus the swept knobs. Target 1.7 tok/s decode is not reached; 590 ms/token would be needed. Remaining per-token cost at the best config: ~417 ms miss
 callback, ~350 ms CPU expert matmuls, ~75 ms GPU. Known issue: `CUDA error: driver shutting down` at process exit after the pilot stage runs (output complete; teardown order).
+
+### GLM_DSA graph: DDR pool size and GPU1 hot set (2026-10-19, best pilot config, 426-token prompt, single runs)
+
+| Pool GiB | GPU1 hot GiB | Mean decode step | Decode tok/s (overall) | Prefill tok/s | MEM-GUARD blocks |
+|---|---|---|---|---|---|
+| 45 | 11 | 934 ms | 0.75 | 12.2 | 0 |
+| 54 | 11 | 888 ms | 0.75 | 12.5 | 0 |
+| 45 | 14 | 964 ms | 0.68 | 12.1 | 0 |
+| 60 | 11 | 848 ms | 0.77 | 12.8 | 4 |
+| 64 | 11 | 824 ms | 0.76 | 9.4 | 5 |
+
+A bigger pool buys ~10% on the decode step up to 60 GiB; at 64 GiB host memory hits the 20 GB stop threshold and prefill drops 26%. More GPU1 hot experts do not help. 54 GiB is the safe setting
+(no guard events); 60 GiB is the edge. Steady-state decode at 848 ms is ~1.18 tok/s; the 1.7 tok/s target (590 ms/token) is not reached by pool size alone.
