@@ -247,3 +247,22 @@ recorded 39,940 `cudaMemcpyAsync` calls (3.212 s cumulative API time), 32,091
 time. The small graph-launch total makes per-expert compute, memory movement,
 and synchronization better targets than graph-launch overhead alone. The
 capture is `/tmp/ling-3.1-flash-hybrid-trace.nsys-rep`.
+
+## Shared-input A/B admission (2026-10-19)
+
+A follow-up code change reuses one hidden-state H2D input per GPU per
+layer/token instead of copying the same input into every expert scratch
+buffer. The change builds successfully and does not modify CUDA kernels.
+
+The first 32-token A/B attempt used the same prompt/profile, the 90 GiB host
+config, a 100 GiB cgroup cap, and `MemorySwapMax=0`. Engine startup admitted
+114.1 GB against its 111.5 GB requirement, but the systemd scope ended with
+`Result=oom-kill` during DDR preload, before a request was run. Its recorded
+scope peak was 64.5 GB, below the child scope's 100 GiB `MemoryMax`; the
+external cause is unknown. This produced no throughput result and does not
+verify the shared-input code.
+
+The A/B watcher now requires at least 116.5 GB available, no competing model
+or build process, an idle GPU pair, and a free admission lock. The benchmark
+itself remains capped at `MemoryMax=100G`, `MemorySwapMax=0`. The shared-input
+change remains uncommitted until a clean 32-token request measures its effect.
