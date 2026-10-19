@@ -792,7 +792,7 @@ bool build_graph(FullGraph &g) {
     ggml_tensor *afn = resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
     ggml_tensor *abase = resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
     ggml_tensor *ascale = resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
-    if (!afn || !abase || !ascale)
+    if (g.HC > 1 && (!afn || !abase || !ascale))
       return false;
     ggml_tensor *residual = res;
     ggml_tensor *cur = hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
@@ -802,7 +802,7 @@ bool build_graph(FullGraph &g) {
     cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), an);
 
     ggml_tensor *attn = nullptr;
-    if (glm5next_is_kda_layer(c, l)) {
+    if (hybrid_is_kda_layer(c, l)) {
       ggml_tensor *wq = resident_tensor(g, g.ctx, p + "attn_q.weight");
       ggml_tensor *wk = resident_tensor(g, g.ctx, p + "attn_k.weight");
       ggml_tensor *wv = resident_tensor(g, g.ctx, p + "attn_v.weight");
@@ -818,7 +818,9 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *dt = resident_tensor(g, g.ctx, p + "ssm_dt.bias");
       ggml_tensor *nm = resident_tensor(g, g.ctx, p + "ssm_norm.weight");
       ggml_tensor *ow = resident_tensor(g, g.ctx, p + "attn_output.weight");
-      if (!wq || !wk || !wv || !cq || !ck || !cv || !fa || !fb || !ga || !gb ||
+      const bool bailing = g.engine->family_ops.family == ModelFamily::BailingMoE3;
+      if (!wq || !wk || !wv || !cq || !ck || !cv || !fa ||
+          (!bailing && !fb) || !ga || (!bailing && !gb) ||
           !be || !aa || !dt || !nm || !ow)
         return false;
       const int hist = g.d_conv - 1;
@@ -867,6 +869,8 @@ bool build_graph(FullGraph &g) {
       }
       g.kda_layers.push_back(l);
     } else {
+      const bool bailing =
+          g.engine->family_ops.family == ModelFamily::BailingMoE3;
       ggml_tensor *wqa = resident_tensor(g, g.ctx, p + "attn_q_a.weight");
       ggml_tensor *wqan = resident_tensor(g, g.ctx, p + "attn_q_a_norm.weight");
       ggml_tensor *wqb = resident_tensor(g, g.ctx, p + "attn_q_b.weight");
@@ -876,12 +880,16 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *wkb = static_full_weight(g, g.ctx, p + "attn_k_b.weight");
       ggml_tensor *wvb = static_full_weight(g, g.ctx, p + "attn_v_b.weight");
       ggml_tensor *wo = resident_tensor(g, g.ctx, p + "attn_output.weight");
-      if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo)
+      ggml_tensor *wgate =
+          bailing ? resident_tensor(g, g.ctx, p + "attn_gate.weight")
+                  : nullptr;
+      if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo ||
+          (bailing && !wgate))
         return false;
       ggml_tensor *kv_cache = nullptr;
       if (g.decode_mode) {
         kv_cache = new_decode_state_tensor(
-            g, g.ctx, GGML_TYPE_F16, {g.kv_lora, g.kv_capacity},
+            g, g.ctx, GGML_TYPE_F16, {g.kv_cache_width, g.kv_capacity},
             "glm5next_decode_dsa_kv");
         if (!kv_cache)
           return false;
@@ -903,9 +911,14 @@ bool build_graph(FullGraph &g) {
         }
       }
       ggml_tensor *kv = nullptr;
-      attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb,
-                       wo, &kv, kv_cache, &previous_indexer_selection,
-                       &previous_indexer_mask);
+      if (bailing) {
+        attn = build_bailing_mla(g, g.ctx, cur, l, wqa, wqan, wqb, wkva,
+                                 wkvan, wkb, wvb, wo, wgate, &kv, kv_cache);
+      } else {
+        attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb,
+                         wvb, wo, &kv, kv_cache, &previous_indexer_selection,
+                         &previous_indexer_mask);
+      }
       if (!attn || !kv)
         return false;
       if (!g.decode_mode)
@@ -922,7 +935,7 @@ bool build_graph(FullGraph &g) {
     ggml_tensor *ffn_base = resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
     ggml_tensor *ffn_scale =
         resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
-    if (!ffn_fn || !ffn_base || !ffn_scale)
+    if (g.HC > 1 && (!ffn_fn || !ffn_base || !ffn_scale))
       return false;
     cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
     ggml_tensor *cur_pre = cur;

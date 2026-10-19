@@ -9,6 +9,9 @@ class GpuTopology;
 
 // Enabled by default for GLM5NEXT; MOESTREAM_GLM5NEXT_FULL_GRAPH=0 selects the legacy layered path.
 bool glm5next_full_graph_enabled();
+// Ling uses the shared KDA/MLA graph implementation behind an explicit
+// opt-in while its full-graph parity is being established.
+bool ling_full_graph_enabled();
 
 // Load the graph's host expert source arena during engine startup.  This is
 // independent of prompt length; the graph topology is still built lazily for

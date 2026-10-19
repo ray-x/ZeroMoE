@@ -24,6 +24,8 @@ struct RouterSpec {
   int n_experts = 0;
   int topk = 0;
   int n_tokens = 1;
+  int n_groups = 0;
+  int n_groups_used = 0;
   bool weights_norm = false;  // divide by the sum of the selected weights
   float weights_scale = 0.0f; // 0 or 1 = no scaling
 };
@@ -48,6 +50,28 @@ inline ggml_tensor *select_ids(ggml_context *ctx, const RouterSpec &spec,
                                ggml_tensor *probs, ggml_tensor *selection_bias) {
   ggml_tensor *selection =
       selection_bias ? ggml_add(ctx, probs, selection_bias) : probs;
+  if (spec.n_groups > 1 && spec.n_groups_used > 0 &&
+      spec.n_groups_used < spec.n_groups &&
+      spec.n_experts % spec.n_groups == 0) {
+    const int experts_per_group = spec.n_experts / spec.n_groups;
+    ggml_tensor *groups = ggml_reshape_3d(
+        ctx, selection, experts_per_group, spec.n_groups, spec.n_tokens);
+    ggml_tensor *top2_ids = ggml_argsort_top_k(ctx, groups, 2);
+    ggml_tensor *group_rows = ggml_reshape_4d(
+        ctx, groups, 1, experts_per_group, spec.n_groups, spec.n_tokens);
+    ggml_tensor *top2 = ggml_get_rows(ctx, group_rows, top2_ids);
+    ggml_tensor *scores = ggml_reshape_3d(
+        ctx, top2, top2->ne[1], top2->ne[2], top2->ne[3]);
+    scores = ggml_sum_rows(ctx, scores);
+    scores = ggml_reshape_2d(ctx, scores, spec.n_groups, spec.n_tokens);
+    ggml_tensor *group_ids =
+        ggml_argsort_top_k(ctx, scores, spec.n_groups_used);
+    ggml_tensor *selected = ggml_get_rows(ctx, groups, group_ids);
+    selection = ggml_set_rows(
+        ctx, ggml_fill(ctx, groups, -INFINITY), selected, group_ids);
+    selection =
+        ggml_reshape_2d(ctx, selection, spec.n_experts, spec.n_tokens);
+  }
   return ggml_argsort_top_k(ctx, selection, spec.topk);
 }
 

@@ -306,6 +306,11 @@ struct ArchitectureConfig {
   // this key, since it's array-typed here). Empty for every other family;
   // glm5next_is_kda_layer() below is the only correct way to read it.
   std::vector<int64_t> glm5next_head_count_kv;
+  // BailingMoE3 uses the same 0=KDA / nonzero=MLA layer map, with a
+  // distinct KDA projection layout and a per-head gate after MLA.
+  std::vector<int64_t> bailingmoe3_head_count_kv;
+  int expert_group_count = 0;
+  int expert_group_used_count = 0;
   int ssm_conv_kernel = 0;        // ssm.conv_kernel (KDA short-conv width)
   int kda_head_dim = 0;           // kda.head_dim (per-head KDA dim)
   float kda_gate_lower_bound = 0.0f; // kda.gate_lower_bound (required, < 0;
@@ -390,6 +395,18 @@ inline bool glm5next_is_kda_layer(const ArchitectureConfig &config, int layer_id
   return layer_idx >= 0 &&
          (size_t)layer_idx < config.glm5next_head_count_kv.size() &&
          config.glm5next_head_count_kv[(size_t)layer_idx] == 0;
+}
+
+inline bool bailingmoe3_is_kda_layer(const ArchitectureConfig &config, int layer_idx) {
+  return layer_idx >= 0 &&
+         (size_t)layer_idx < config.bailingmoe3_head_count_kv.size() &&
+         config.bailingmoe3_head_count_kv[(size_t)layer_idx] == 0;
+}
+
+inline bool hybrid_is_kda_layer(const ArchitectureConfig &config, int layer_idx) {
+  return config.bailingmoe3_head_count_kv.empty()
+             ? glm5next_is_kda_layer(config, layer_idx)
+             : bailingmoe3_is_kda_layer(config, layer_idx);
 }
 
 // Qwen4Exp layer-type query: true when layer l is a recurrent GDN layer,

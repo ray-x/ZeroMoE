@@ -43,7 +43,7 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 }
 
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
-  if (!env_enabled() || engine.family_ops.family != ModelFamily::GLM5NEXT)
+  if (!graph_enabled_for(engine))
     return false;
   moestream::graphcfg::log_effective("glm5next-full-graph");
   // Build and seed the offload cache at boot, not inside the first decode token.
@@ -145,8 +145,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, c
 }
 
 static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *) {
-  if (!env_enabled() || S <= 1 || pos_base < 0 ||
-      engine.family_ops.family != ModelFamily::GLM5NEXT)
+  if (!graph_enabled_for(engine) || S <= 1 || pos_base < 0)
     return false;
   const auto &c = engine.model_file.architecture_config;
   // The latent cache (engine.Lc) holds max_t rows; a chunk that would write past it is left to the caller.
@@ -212,7 +211,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->d_inner = g->H * g->hd;
   g->d_conv = c.ssm_conv_kernel;
   g->qk_nope = c.qk_nope;
+  g->qk_rope = c.qk_rope;
   g->kv_lora = c.kv_lora;
+  g->kv_cache_width = c.kv_lora + c.qk_rope;
   g->indexer_heads = c.glm5next_indexer_head_count;
   g->indexer_key_length = c.glm5next_indexer_key_length;
   g->indexer_top_k = c.glm5next_indexer_top_k;
@@ -356,12 +357,14 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
 
   const int valid_rows =
       std::min(g.decode_last_pos + 1, std::max(0, engine.max_t));
-  const size_t kv_n = (size_t)valid_rows * g.kv_lora;
+  const size_t kv_n = (size_t)valid_rows * g.kv_cache_width;
   std::vector<ggml_fp16_t> half_cache(kv_n);
   std::vector<float> cache(kv_n);
   for (size_t i = 0; i < g.dsa_layers.size(); ++i) {
     const int layer = g.dsa_layers[i];
     if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        (g.qk_rope > 0 &&
+         (layer >= (int)engine.Rc.size() || !engine.Rc[layer])) ||
         i >= g.dsa_kv_storage.size())
       return false;
     if (kv_n == 0)
@@ -370,7 +373,15 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
                             kv_n * sizeof(ggml_fp16_t));
     for (size_t j = 0; j < kv_n; ++j)
       cache[j] = ggml_fp16_to_fp32(half_cache[j]);
-    std::memcpy(engine.Lc[layer], cache.data(), kv_n * sizeof(float));
+    for (int t = 0; t < valid_rows; ++t) {
+      std::memcpy(engine.Lc[layer] + (size_t)t * g.kv_lora,
+                  cache.data() + (size_t)t * g.kv_cache_width,
+                  (size_t)g.kv_lora * sizeof(float));
+      if (g.qk_rope > 0)
+        std::memcpy(engine.Rc[layer] + (size_t)t * g.qk_rope,
+                    cache.data() + (size_t)t * g.kv_cache_width + g.kv_lora,
+                    (size_t)g.qk_rope * sizeof(float));
+    }
   }
   return true;
 }
@@ -379,6 +390,7 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
 
 #else
 
+bool ling_full_graph_enabled() { return false; }
 bool glm5next_full_graph_enabled() { return false; }
 bool glm5next_full_graph_bootstrap(StreamingEngine &) { return false; }
 void glm5next_full_graph_set_vram_cache(GpuTopology *) {}

@@ -20,18 +20,29 @@ bool env_enabled() {
   return enabled;
 }
 
+bool graph_enabled_for(const StreamingEngine &engine) {
+  if (engine.family_ops.family == ModelFamily::BailingMoE3)
+    return ling_full_graph_enabled();
+  return engine.family_ops.family == ModelFamily::GLM5NEXT && env_enabled();
+}
+
 // MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
-    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
+    return moestream::graphcfg::flag_on("MOESTREAM_LING_OFFLOAD_ASYNC") ||
+           moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
   }();
   return on;
 }
 
 int offload_first_layer() {
   static const int first = [] {
-    return moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER", -1);
+    const char *ling = moestream::graphcfg::env("MOESTREAM_LING_OFFLOAD_FIRST_LAYER");
+    return ling && ling[0]
+               ? std::atoi(ling)
+               : moestream::graphcfg::atoi_or(
+                     "MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER", -1);
   }();
   return first;
 }
@@ -42,6 +53,14 @@ bool offload_layer(int layer) {
 }
 
 std::string offload_env(const char *name, const char *dflt)  {
+  constexpr const char *prefix = "MOESTREAM_GLM5NEXT_";
+  if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+    const std::string ling_name =
+        std::string("MOESTREAM_LING_") + (name + std::strlen(prefix));
+    const char *ling = moestream::graphcfg::env(ling_name.c_str());
+    if (ling && ling[0])
+      return ling;
+  }
   const char *v = moestream::graphcfg::env(name);
   return v && v[0] ? v : dflt;
 }
@@ -256,5 +275,9 @@ bool gpu_assist_layer_ok(const FullGraph &g, int layer) {
 }
 
 } // namespace glm5next_graph
+
+bool ling_full_graph_enabled() {
+  return moestream::graphcfg::flag_on("MOESTREAM_LING_FULL_GRAPH");
+}
 
 #endif // MOESTREAM_USE_GGML_CUDA

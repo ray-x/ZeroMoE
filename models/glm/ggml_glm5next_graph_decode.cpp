@@ -11,8 +11,8 @@ using namespace glm5next_graph;
 
 bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                         const int *) {
-  if (!env_enabled() || engine.mtp_enabled || pos_base < 0 ||
-      engine.family_ops.family != ModelFamily::GLM5NEXT || engine.max_t <= 0 ||
+  if (!graph_enabled_for(engine) || engine.mtp_enabled || pos_base < 0 ||
+      engine.max_t <= 0 ||
       pos_base >= engine.max_t)
     return false;
   if (g_glm5next_decode_disabled_engine == &engine)
@@ -63,7 +63,9 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->d_inner = g->H * g->hd;
   g->d_conv = c.ssm_conv_kernel;
   g->qk_nope = c.qk_nope;
+  g->qk_rope = c.qk_rope;
   g->kv_lora = c.kv_lora;
+  g->kv_cache_width = c.kv_lora + c.qk_rope;
   g->indexer_heads = c.glm5next_indexer_head_count;
   g->indexer_key_length = c.glm5next_indexer_key_length;
   g->indexer_top_k = c.glm5next_indexer_top_k;
@@ -90,7 +92,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       g_graph->indexer_key_length == g->indexer_key_length &&
       g_graph->indexer_kpool == g->indexer_kpool) {
     for (int l = 0; l < g->n_layers; ++l) {
-      if (!glm5next_is_kda_layer(c, l) && glm5next_indexer_owner(*g, l))
+      if (!hybrid_is_kda_layer(c, l) && glm5next_indexer_owner(*g, l))
         ++expected_indexer_owners;
     }
     bool seeds_match = expected_indexer_owners > 0 &&
@@ -251,6 +253,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   for (size_t i = 0; i < g->dsa_layers.size(); ++i) {
     const int layer = g->dsa_layers[i];
     if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        (g->qk_rope > 0 &&
+         (layer >= (int)engine.Rc.size() || !engine.Rc[layer])) ||
         i >= g->dsa_kv_storage.size()) {
       return decline_decode_graph();
     }
@@ -258,12 +262,17 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (cudaMemset(cache->data, 0, ggml_nbytes(cache)) != cudaSuccess) {
       return decline_decode_graph();
     }
-    const size_t seed_rows = (size_t)pos_base * g->kv_lora;
+    const size_t seed_rows = (size_t)pos_base * g->kv_cache_width;
     if (seed_rows > 0) {
       std::vector<ggml_fp16_t> half_cache(seed_rows);
-      const float *src = engine.Lc[layer];
-      for (size_t j = 0; j < seed_rows; ++j)
-        half_cache[j] = ggml_fp32_to_fp16(src[j]);
+      for (int t = 0; t < pos_base; ++t) {
+        for (int d = 0; d < g->kv_lora; ++d)
+          half_cache[(size_t)t * g->kv_cache_width + d] =
+              ggml_fp32_to_fp16(engine.Lc[layer][(size_t)t * g->kv_lora + d]);
+        for (int d = 0; d < g->qk_rope; ++d)
+          half_cache[(size_t)t * g->kv_cache_width + g->kv_lora + d] =
+              ggml_fp32_to_fp16(engine.Rc[layer][(size_t)t * g->qk_rope + d]);
+      }
       ggml_backend_tensor_set(cache, half_cache.data(), 0,
                               seed_rows * sizeof(ggml_fp16_t));
     }
@@ -307,7 +316,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 bool glm5next_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *) {
-  if (!env_enabled() || !hidden_states || pos_base < 0 || !g_graph ||
+  if (!graph_enabled_for(engine) || !hidden_states || pos_base < 0 || !g_graph ||
       !g_graph->ready || !g_graph->decode_mode || g_graph->engine != &engine ||
       g_graph->S != 1 || pos_base >= g_graph->kv_capacity ||
       g_graph->decode_last_pos + 1 != pos_base)
@@ -449,11 +458,14 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     g_glm5next_decode_disabled_engine = &engine;
     return false;
   }
-  if (engine.hc_stream_buf.size() < (size_t)g.D * g.HC ||
+  const bool plain_residual = engine.family_ops.family == ModelFamily::BailingMoE3;
+  if ((!plain_residual &&
+       engine.hc_stream_buf.size() < (size_t)g.D * g.HC) ||
       !g.input || !g.attn_mask || !g.decode_indices)
     return false;
 
-  std::memcpy(g.input->data, engine.hc_stream_buf.data(),
+  std::memcpy(g.input->data,
+              plain_residual ? hidden_states : engine.hc_stream_buf.data(),
               (size_t)g.D * g.HC * sizeof(float));
   *static_cast<int32_t *>(g.decode_indices->data) = pos_base;
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);

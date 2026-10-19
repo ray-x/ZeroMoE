@@ -168,7 +168,7 @@ size_t dense_arena_bytes(const FullGraph &g) {
   }
   const auto &c = g.engine->model_file.architecture_config;
   for (int l = 0; l < c.n_layers; ++l) {
-    if (glm5next_is_kda_layer(c, l))
+    if (hybrid_is_kda_layer(c, l))
       continue;
     for (const char *stem : {"attn_k_b.weight", "attn_v_b.weight"}) {
       const std::string name = "blk." + std::to_string(l) + "." + stem;
@@ -232,7 +232,7 @@ bool init_decode_state_arena(FullGraph &g) {
     return true;
   };
   for (int l = 0; l < g.n_layers; ++l) {
-    if (glm5next_is_kda_layer(c, l)) {
+    if (hybrid_is_kda_layer(c, l)) {
       const size_t state_n = (size_t)g.hd * g.hd * g.H;
       const size_t hist_n = (size_t)(g.d_conv - 1) * 3 * g.d_inner;
       if (state_n > SIZE_MAX / sizeof(float) ||
@@ -242,8 +242,8 @@ bool init_decode_state_arena(FullGraph &g) {
         return false;
     } else {
       if ((size_t)g.kv_capacity >
-          SIZE_MAX / (size_t)g.kv_lora / sizeof(ggml_fp16_t) ||
-          !add_tensor((size_t)g.kv_capacity * g.kv_lora *
+          SIZE_MAX / (size_t)g.kv_cache_width / sizeof(ggml_fp16_t) ||
+          !add_tensor((size_t)g.kv_capacity * g.kv_cache_width *
                       sizeof(ggml_fp16_t)))
         return false;
     }
@@ -259,7 +259,7 @@ bool init_decode_state_arena(FullGraph &g) {
         key_length > SIZE_MAX / sizeof(float) / pool_count)
       return false;
     for (int l = 0; l < g.n_layers; ++l) {
-      if (glm5next_is_kda_layer(c, l))
+      if (hybrid_is_kda_layer(c, l))
         continue;
       const std::string prefix = "blk." + std::to_string(l) + ".";
       if (!model_tensor(*g.engine, prefix + "indexer.proj.weight"))

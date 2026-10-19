@@ -183,6 +183,7 @@ struct FullGraph : moestream::graph::GraphCore {
   int qk_nope = 0;
   int qk_rope = 0;
   int kv_lora = 0;
+  int kv_cache_width = 0; // absorbed latent plus rotary key dimensions
   int v_head = 0;
   int o_group_count = 0;
   int o_lora_rank = 0;

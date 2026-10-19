@@ -142,6 +142,46 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   }
 };
 
+class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphModel> {
+ public:
+  ModelFamily family() const override { return ModelFamily::BailingMoE3; }
+  const char *name() const override { return "ling-3.1-flash"; }
+  bool enabled(const StreamingEngine &engine,
+               ModelGraphPhase phase) const override {
+    return !engine.mtp_enabled && ling_full_graph_enabled() &&
+           (phase == ModelGraphPhase::Prefill ||
+            phase == ModelGraphPhase::Decode);
+  }
+  bool bootstrap(StreamingEngine &engine) const override {
+    return glm5next_full_graph_bootstrap(engine);
+  }
+  void shutdown() const override { glm5next_full_graph_shutdown(); }
+  bool supports_cpu_lane() const override { return true; }
+  int max_prefill_tokens(const StreamingEngine &e) const override {
+    if (const char *v = std::getenv("MOESTREAM_LING_PREFILL_CHUNK"); v && v[0])
+      return std::atoi(v);
+    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
+  }
+  int min_prefill_batch() const override { return 2; }
+  bool supports_prefill_continuation(const StreamingEngine &) const override {
+    return true;
+  }
+  bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);
+  }
+  bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_run(e, r.hidden_states, r.n_tokens, r.pos_base,
+                                   r.token_ids);
+  }
+  bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_decode_prepare(e, r.pos_base, r.token_ids);
+  }
+  bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_decode_run(e, r.hidden_states, r.pos_base,
+                                          r.token_ids);
+  }
+};
+
 class DeepseekV41GraphModel final
     : public FullGraphModelBase<DeepseekV41GraphModel> {
  public:
@@ -197,12 +237,15 @@ class DeepseekV41GraphModel final
 const FullGraphModel *full_graph_model(ModelFamily family) {
   static const Qwen4ExpGraphModel qwen;
   static const Glm5NextGraphModel glm;
+  static const Ling31FlashGraphModel ling;
   static const DeepseekV41GraphModel dsv41;
   switch (family) {
   case ModelFamily::Qwen4Exp:
     return &qwen;
   case ModelFamily::GLM5NEXT:
     return &glm;
+  case ModelFamily::BailingMoE3:
+    return &ling;
   case ModelFamily::DeepSeek_V41:
     return &dsv41;
   default:
