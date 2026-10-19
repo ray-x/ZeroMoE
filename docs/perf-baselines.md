@@ -180,3 +180,24 @@ callback, ~350 ms CPU expert matmuls, ~75 ms GPU. Known issue: `CUDA error: driv
 
 A bigger pool buys ~10% on the decode step up to 60 GiB; at 64 GiB host memory hits the 20 GB stop threshold and prefill drops 26%. More GPU1 hot experts do not help. 54 GiB is the safe setting
 (no guard events); 60 GiB is the edge. Steady-state decode at 848 ms is ~1.18 tok/s; the 1.7 tok/s target (590 ms/token) is not reached by pool size alone.
+
+### GLM_DSA graph: correctness check against layered, corrected numbers, GPU utilisation (2026-10-19)
+
+**Correctness.** Greedy (temp 0) comparison with the layered path (`logs/check/`): "What is the capital of France?" -> `Paris`; a 399-token prompt with a planted code -> `7391`
+(recalled from the middle of the context). The graph with 11 GiB of hot experts on the 5060 Ti prepends an extra `</think>` token on both prompts and in every earlier 2-GPU run; the graph
+with `GPU1_HOT_GIB=0`, or with `MOESTREAM_GLM5NEXT_PREFILL_GPU1=0` (hot experts computed through the cold branch during prefill), matches layered exactly. So the in-place GPU1 hot-expert
+compute in the batched prefill graph is wrong for this model (cause not yet found; decode with GPU1 hot experts is fine). **All earlier 2-GPU numbers in this file that did not set
+`PREFILL_GPU1=0` ran with that defect** (prefill 12.2-12.8 tok/s; they are speed-only, the text diverged from layered).
+
+**Correct configuration** (`PREFILL_GPU1=0 GPU1_HOT_GIB=11 PILOT_STAGE=8 OFFLOAD_ASYNC=1 PILOT_PREFETCH=8 PILOT_COPY=0 PILOT_LOOKAHEAD=2`, 54 GiB pool, 426-token prompt):
+
+| Run | Prefill tok/s | Decode mean step | Decode tok/s overall |
+|---|---|---|---|
+| final1 | 12.02 | 973 ms | 0.69 |
+| util | 11.85 | n/a | 0.71 |
+| GPU1 hot = 0 | 11.93 | 1025 ms | 0.85 |
+
+(the hot=0 run's higher overall decode figure is a shorter first-token build, not a faster steady state.) Steady decode is ~1.0 tok/s; layered is 0.88-0.96.
+
+**GPU utilisation** (`nvidia-smi dmon`, 1 s samples, correct config): prefill 3090 46% avg (max 68%), 5060 Ti 0%; first-token graph build 14% / 10%; **decode 3% (max 6%) on the 3090 and 1% (max 2%) on the 5060 Ti**.
+Decode is >95% waiting on CPU expert matmuls and the SSD-miss callback, which is why GPU count, hot-set size and thread tuning barely moved it.
