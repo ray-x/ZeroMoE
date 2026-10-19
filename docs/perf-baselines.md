@@ -279,3 +279,10 @@ Searching every log in `logs/` for decode >= 1.6 tok/s finds exactly one line: `
 path with an 18-token prompt (the answer "Paris" plus end-of-generation). That is a 2-token sample, not a steady rate. The same layered path on the 399-token prompt
 measured 0.98 tok/s (4 tokens / 4.07 s), and every multi-token run on any path is 0.77-1.18 tok/s. The full-graph path's best steady decode (848 ms/step, 1.18 tok/s)
 is therefore at or above the layered path's real rate; 1.7 tok/s has never been measured over a meaningful number of tokens.
+
+### GLM-5.3 (glm-dsa) decode: posting the next-layer pilot job before the demand load does not help (2026-10-19)
+
+Tried moving `stage_post_job()` for the next layer ahead of the blocking `ensure(Demand)` in `stage_miss_cb`, so the prefetch worker's reads overlap the demand reads
+(drives are at ~3-3.7 of ~6.4 GB/s). ABAB, same config (54 GiB pool, pilot stage 8, 426-token prompt, 48 new tokens, preflight-gated), steady step:
+off 913 ms, on 907 ms, off 910 ms, on 910 ms. No effect; change reverted. Decode stays ~1.1 tok/s (~910 ms/step); 1.7 tok/s (590 ms/step) not reached.
+Prefetch is already issued one layer ahead (lookahead 2); the demand misses that remain are experts the pilot did not predict, so there is nothing earlier to overlap them with.
