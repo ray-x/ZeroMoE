@@ -151,3 +151,19 @@ It needs a ggml that has (a) `patches/ggml/0006` (batched MMQ treats negative id
 crashes with `illegal memory access`) and (b) `patches/ggml/0007` (arena-safe expert copy; without it: `CUDA error: invalid argument`, or `GGML_ASSERT(id >= 0 ...)` on the -1 route ids). The in-tree build
 did not apply 0007 by itself; it was applied by hand to a private copy of the committed integration source (`~/work/ggml-0006-src`), built as `build_g6`
 (`cmake -S . -B build_g6 -DMOESTREAM_GGML_ROOT=<that ggml> -DCMAKE_CUDA_ARCHITECTURES="86;120" ...` with no PREBUILT dir). Run with `logs/run_dsa_graph2gpu_426.sh`.
+
+### GLM_DSA graph decode: pilot prefetch (2026-10-19, 426-token prompt, 48 new tokens, both GPUs, 45 GiB pool, single runs)
+
+Decode profile before prefetch (per token): SSD-miss callback 649 ms (169 misses/token, 1.9 GB read at ~3.4 GB/s = both drives' bandwidth), CPU expert matmuls ~350 ms
+(`iq2_xxs` 190 + `iq3_xxs` 152), everything on the GPUs ~75 ms. Decode is miss-bandwidth-bound; the earlier "disk is not the bottleneck" holds for prefill only.
+
+| Decode config | Mean step | Misses/token | Decode tok/s (48 tok, incl. ~20 s first-token graph build) |
+|---|---|---|---|
+| baseline | 1131 ms | 169 | 0.66 |
+| `OFFLOAD_ASYNC=1 PILOT_PREFETCH=8 PILOT_COPY=0 PILOT_LOOKAHEAD=2` only (pilot stage NOT active: needs `PILOT_STAGE`>0) | 1059 ms | 168 | 0.71 |
+| + `PILOT_STAGE=8` (**best**) | **934 ms** | **67** | **0.75** (steady ~1.07 tok/s) |
+| same, `PILOT_LOOKAHEAD=3` | 1019 ms | | 0.69 |
+| same, lookahead 2, 8 CPU threads, `OFFLOAD_THP=1` | 1049 ms | | 0.66 |
+
+Best config: `logs/ab_pilot.sh` env minus the swept knobs. Target 1.7 tok/s decode is not reached; 590 ms/token would be needed. Remaining per-token cost at the best config: ~417 ms miss
+callback, ~350 ms CPU expert matmuls, ~75 ms GPU. Known issue: `CUDA error: driver shutting down` at process exit after the pilot stage runs (output complete; teardown order).

@@ -10,5 +10,5 @@ export MOESTREAM_GLM5NEXT_OFFLOAD_STORE=/data/glm53_offload.gguf
 export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=/home/ray/vllm-workspace/GLM-5.3-GGUF-align
 export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=/home/ray/Projects/MoEStream/.moestream_usage_glm53_ud_iq2m
 export MOESTREAM_GLM5NEXT_GRAPH_STRICT=1
-(printf "%s\n:q\n" "$P" | timeout 1500 ${MOESTREAM_BIN:-./build/moestream} --config logs/glm53_dsa_graph2gpu.toml --ngen 48 --temp 0 > logs/glm53_dsa_graph2gpu_g6d.stdout 2>&1)
-grep -E "Rates:|OFFLOAD|FULL-DECODE|WARN|ERROR" logs/glm53_dsa_graph2gpu_g6d.log | cut -c1-220 | head -40
+(printf "%s\n:q\n" "$P" | timeout 1500 ${MOESTREAM_BIN:-./build/moestream} --config logs/glm53_dsa_graph2gpu.toml --ngen 48 --temp 0 > logs/glm53_dsa_graph2gpu_la2t8.stdout 2>&1)
+grep -E "Rates:|OFFLOAD|FULL-DECODE|WARN|ERROR" logs/glm53_dsa_graph2gpu_la2t8.log | cut -c1-220 | head -40
