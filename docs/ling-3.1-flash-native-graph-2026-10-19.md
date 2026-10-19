@@ -195,3 +195,55 @@ A `host_ram_gb=100` run was not admitted: its startup requirement is about
 alone cannot fit alongside the dense weights on these cards. The measured
 37.66 GB device allocation includes the dense pool, expert caches, and other
 runtime allocations. See the run log `/tmp/ling-3.1-flash-hybrid-full32-cache-split-90g.log`.
+
+## Transfer and cache A/B follow-up (2026-10-19)
+
+All runs below kept the raw two-token `Hi there` prompt and the existing
+5,879-record usage profile unchanged; no full survey was run. They used the
+90 GiB DDR pool, 3.0/14.4 GiB expert-cache budgets on the 3090/5060 Ti,
+32 output tokens, and a 100 GiB `MemoryMax` with `MemorySwapMax=0`.
+
+### VRAM pin-count sweep
+
+| Pinned VRAM experts | Decode tok/s | Prefill tok/s | Cache hits | Cache-promotion H2D |
+|---:|---:|---:|---:|---:|
+| 1,024 | 2.49 | 1.29 | 75.5% | 29.60 GB |
+| 2,048 | 2.49, repeat 2.54 | 1.32, repeat 1.29 | 74.4% | 33.53 GB |
+| 3,072 | 2.70 | 1.32 | 72.5% | 35.36 GB |
+| 4,096 | 2.40 | 1.35 | 71.1% | 36.18 GB |
+
+The pin-count sweep did not produce a monotonic speed or hit-rate gain. The
+single 3,072-pin result was fastest but also had the lowest hit rate among the
+first three settings and the most H2D traffic; the 2,048-pin repeat stayed
+close to its original result. Keep 2,048 pins for now; do not treat the single
+3,072-pin measurement as a settled improvement.
+
+### Decode asynchronous prewarm
+
+Enabling `decode_async_prewarm` and `decode_async_prewarm_nonblocking` with a
+three-expert batch measured 2.48 tok/s decode and 1.30 tok/s prefill. It
+reported 74.3% cache hits and 33.12 GB H2D. The report also showed 3,171 of
+8,207 prewarmed slots reclaimed before use (38.6%, 168.18 GB cumulative
+traffic) and 3,173 duplicate synchronous fallback transfers (10.79 GB).
+Leave decode prewarm disabled for this configuration.
+
+### Persistent host-page pin budget
+
+A 20 GiB `ram_pinned_budget_gb` attempt passed startup admission at 114.1 GB
+available / 111.5 GB required, but its process exited with status 137 during
+expert preload before a request result was produced. It ran with
+`MemoryMax=100G` and `MemorySwapMax=0`; this is not a throughput result. Keep
+the tested 15 GiB pin budget under the current host-memory headroom.
+
+### Nsight request-window profile
+
+A separate Nsight Systems capture of the 2,048-pin hybrid run was instrumented
+and is not a throughput measurement. In the decode request window, it recorded
+31.149 GB H2D (3.250 s device time), 0.419 GB D2H (0.095 s), 31,248 IQ1_S
+matmul kernels (2.703 s), and 15,624 IQ2_XXS matmul kernels (0.767 s). It also
+recorded 39,940 `cudaMemcpyAsync` calls (3.212 s cumulative API time), 32,091
+`cudaStreamSynchronize` calls (2.455 s), and 2,610 `cudaGraphLaunch` calls
+(0.178 s). These API durations overlap; they are not additive request-wall
+time. The small graph-launch total makes per-expert compute, memory movement,
+and synchronization better targets than graph-launch overhead alone. The
+capture is `/tmp/ling-3.1-flash-hybrid-trace.nsys-rep`.
