@@ -1,0 +1,4 @@
+Write a Python function that parses a CSV file with quoted fields and returns a list of dictionaries. Explain the edge cases you handle and give two unit tests.
+Explain how the Treaty of Westphalia in 1648 changed the structure of European politics, and compare its consequences with those of the Congress of Vienna in 1815.
+Describe the Krebs cycle step by step, including the enzymes involved, and explain how its regulation is linked to the energy state of the cell.
+Write a short story about a lighthouse keeper who discovers that the light she tends is guiding something other than ships. Use vivid, atmospheric language.

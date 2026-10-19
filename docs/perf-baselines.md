@@ -236,3 +236,22 @@ Same config as above (K=8, 54 GiB pool, 426-token prompt, 35 steady steps), run 
 - Segmented LRU is about 8-10% slower even though it records fewer demand misses, so the demand-miss count alone does not predict step time. Likely it displaces prefetched experts, which are inserted as Prefetch kind. Not diagnosed further.
 - The first attempt at this A/B was invalid: another session's engine (ling-3.1-flash worktree) was running on the GPU and the script read a stale log. Those numbers were discarded.
 - Keep the default LRU.
+
+## GLM-5.3 (glm-dsa) decode route survey: ranking refit does not help (2026-10-19)
+
+Hypothesis: the DSA usage file (`.moestream_usage_glm53_ud_iq2m`, 35,400 counts) is thin, so a decode-only route survey
+(`MOESTREAM_GLM5NEXT_ROUTE_TRACE`, 4 prompts x 47 decode tokens x 75 MoE layers, `logs/survey_dsa_all.sh`) could raise the
+resident-set hit rate and cut SSD bytes/token (needed: ~-40% for 1.7 tok/s).
+
+Leave-one-prompt-out, fraction of routed experts inside the top-N ranked set (base = existing file; refit = base + 3 training prompts):
+
+| N resident | base | refit (w=1) |
+|-----------:|-----:|------------:|
+| 2000 | 28.6% | 30.2% |
+| 4000 | 41.3% | 43.7% |
+| 5300 | 47.6% | 50.8% |
+| 7000 | 56.2% | 59.4% |
+
+Gain is ~+3 points (~6% fewer misses at best), far from -40%. Each prompt touches 8-9k of 19.2k experts; routing is prompt-specific.
+Not A/B'd end to end (the DDR pool is LRU-managed; seeding only affects the initial fill). Closed negative.
+Decode stays ~1.0 tok/s (~970 ms/step, SSD-bound); 1.7 tok/s is not reached.
