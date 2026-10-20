@@ -6,14 +6,24 @@
 # regress another. Each model is run once with the recipe recorded in
 # docs/models/<model>.md; the decode rate is compared to a frozen [min,max] band.
 #
+# WHEN TO RUN (tiered policy — a full run is ~15 min and is NOT needed for every change):
+#   * Non-graph change (tokenizer, config parsing, API server, docs, CPU-only kernels
+#     unrelated to the graph): no regression gate. Run `make test-components` instead.
+#   * Graph change in ONE model (model A): before merge, run at least ONE OTHER model as
+#     a witness — cross-model regression is the risk, and one witness catches shared-
+#     machinery breakage cheaply. Fast witnesses: `--models qwen38` (single 3090) or
+#     `--models ling31`.
+#   * Major change / release candidate: run all five (the default).
+#
 # Usage:
 #   bench/regression_gate.sh [BIN] [--models qwen38,glm53flash,ling31,dsv41,glm53]
+#   bench/regression_gate.sh [BIN] --help
 #
 #   BIN        defaults to ./build_master/moestream (the merged-master release build;
 #              must link the prebuilt ggml with the host-node hook — see docs/models/README.md)
-#   --models   comma-separated subset; default is all five. Every selected model is
-#              REQUIRED: a launch error or a missing decode measurement is a FAIL, not
-#              a skip.
+#   --models   comma-separated subset (test only these models); default is all five.
+#              Every selected model is REQUIRED: a launch error or a missing decode
+#              measurement is a FAIL, not a skip.
 #
 # Preconditions (enforced by the individual run scripts where they exist):
 #   * no other moestream / llama.cpp process, GPUs idle
@@ -27,19 +37,34 @@
 # bench/graph_framework_glm_gate.sh) for a stronger correctness check.
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: bench/regression_gate.sh [BIN] [--models a,b,...] [--help]
+
+Tiered policy (a full run is ~15 min; not needed for every change):
+  * Non-graph change (tokenizer/config/docs/CPU-only kernels): no gate — run `make test-components`.
+  * Graph change in one model: before merge, run ONE OTHER model as a witness.
+    Fast witnesses: --models qwen38 (single 3090) or --models ling31.
+  * Major change / release candidate: run all five (default).
+
+Models: qwen38, glm53flash, ling31, dsv41, glm53
+EOF
+}
+
 cd "$(dirname "$0")/.."   # repository root
 
-BIN="${1:-./build_master/moestream}"
-BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
-shift || true
-
+BIN="${GATE_BIN:-./build_master/moestream}"
 MODELS="${MODELS:-qwen38,glm53flash,ling31,dsv41,glm53}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --bin) BIN="${2:?--bin needs a path}"; shift 2 ;;
     --models) MODELS="${2:?--models needs a comma list}"; shift 2 ;;
-    *) echo "unknown arg: $1" >&2; exit 2 ;;
+    -*) echo "unknown flag: $1 (use --help)" >&2; exit 2 ;;
+    *) BIN="$1"; shift ;;   # first non-flag positional is the candidate binary
   esac
 done
+BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 
 LOG_DIR="${GATE_LOG_DIR:-logs/regression_gate}"
 mkdir -p "$LOG_DIR"
