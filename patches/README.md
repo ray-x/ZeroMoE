@@ -29,6 +29,8 @@ it does not carry a modified copy of ggml.
 | `0003-ggml-cuda-graph-capture` | cuda-stream-bridge, cuda-conditional-graph-harvest, cuda-graph-first-call-capture | `ggml-cuda/ggml-cuda.cu` |
 | `0004-ggml-cuda-external-pointer-padding` | (unchanged) | `ggml-cuda.cu`, `mmq.cu`, `mmvq.cu` |
 | `0005-ggml-backend-static-weight-copy` | backend-static-weight-copy-count | `ggml-backend.cpp` |
+| `0009-ggml-cpu-iq2-xxs-avx512bwvl` | `36f489d6b` AVX-512BW/VL IQ2_XXS dot kernel | `arch/x86/quants.c` |
+| `0013-ggml-cpu-iq1-s-avx512vnni` | AVX-512 VNNI IQ1_S × Q8_K dot kernel | `arch/x86/quants.c` |
 | `0011-ggml-cuda-mestream-bridge-compat` | bridge-only compatibility hunk for newer upstream context | `ggml-cuda/ggml-cuda.cu` |
 | `0012-ggml-impl-export-graph-view` | export graph view from shared ggml | `ggml-impl.h` |
 

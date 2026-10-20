@@ -61,6 +61,10 @@
 
 namespace glm5next_graph {
 
+// Immutable dense-weight arena shared by prefill/decode graphs.  Defined in
+// ggml_glm5next_graph.cpp and released in glm5next_full_graph_shutdown().
+extern std::unique_ptr<DenseArenaOwner> g_glm5next_dense_owner;
+
 // ---- forward declarations of the types below ----
 struct OffloadState;
 struct OffloadSite;
@@ -115,6 +119,7 @@ bool prefetch_ring_was_built();      // a ring was allocated for the graph that 
 double prefetch_ring_main_gib();
 void prefetch_note_ring_failure(int S); // later graphs of at least S tokens are built without a ring
 void prefetch_suppress_prompt(bool on); // graphs are built without a ring until reset (set when a ring did not fit)
+void prefetch_ring_join(); // stop and drain the ring's copy workers before freeing their buffers
 ggml_tensor *prefetch_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int part);
 // Number of compact cold slots of the layer (0 = not prefetched); *split = slots held by part 0, the rest by part 1.
 int prefetch_layer_slots(int layer, int *split);
@@ -141,8 +146,13 @@ bool graph_dense_weight_name(const std::string &name);
 bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity, size_t &used, ggml_tensor *t, const void *src, size_t src_bytes);
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx, const std::string &name);
 ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx, const std::string &name);
+// Binds a dense-weight descriptor to the shared owner's address for `name`.
+// With src == nullptr only an existing cached address is accepted.
+bool dense_weight_bind(FullGraph &g, ggml_tensor *t, const std::string &name,
+                       const void *src, size_t src_bytes);
 size_t device_expert_bytes(const FullGraph &g);
 size_t dense_arena_bytes(const FullGraph &g);
+size_t dense_scratch_bytes(const FullGraph &g);
 bool init_dense_arena(FullGraph &g);
 bool init_decode_state_arena(FullGraph &g);
 ggml_tensor *new_decode_state_tensor(FullGraph &g, ggml_context *ctx, ggml_type type, const std::vector<int64_t> &shape, const char *name);
@@ -178,7 +188,8 @@ bool preload_expert_source(FullGraph &g);
 bool configure_vram_reference_experts(FullGraph &g);
 bool configure_partial_experts_base(FullGraph &g);
 bool configure_partial_experts(FullGraph &g);
-ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
+ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer,
+                                  const char *stem, int gpu_id = -1);
 bool prepare_partial_hot(FullGraph &g, ggml_context *ctx, int layer);
 ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer, bool mask);
 ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int plane);

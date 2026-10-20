@@ -1,7 +1,12 @@
 # Ling reference audit inputs
 
-See `docs/ling-3.1-flash-performance-audit-2026-10-20.md` for findings,
-timing definitions, reference worktrees, and the failed diagnostic.
+See [the benchmark method](../../../docs/ling-3.1-flash-benchmark-method.md)
+for the current measurement contract, exact commands, timing definitions, and
+recorded results. The 2026-10-20 handoff remains a historical working-state
+note.
+
+See `docs/ling-3.1-flash-performance-audit-2026-10-20.md` for the earlier
+findings, reference worktrees, and the failed diagnostic.
 
 - `prompt.txt`: exact raw prompt, `Hi there`.
 - `baseline.pin`: original 10,396-entry usage file from the earlier runs.
@@ -20,11 +25,15 @@ python3 bench/ling/reference-audit/monitor.py
 ```
 
 The runner checks other inference/build processes and physical memory,
-then uses `run_capped.sh` with `MemorySwapMax=0`. Its default is the audited
-72 GiB DDR / 110 GiB cgroup baseline, GPU hot sets 3+12.5 GiB, CPU lane 10
-threads, GPU assist 5+2, and pinned fraction 0.2. The monitor records memory
-and GPU samples and stops only its own model if the memory floor is crossed.
-It must run outside the restricted sandbox to observe the actual host.
+then uses `run_capped.sh` with `MemorySwapMax=0`. Its default is a 64 GiB DDR
+pool with a 95 GiB cgroup cap, GPU hot sets 3+12.5 GiB, CPU lane 10 threads,
+GPU assist 3+1, pinned fraction 0.5, and 3700 pinned VRAM slots. The short
+benchmark below passes `LING_DDR_GIB=72` explicitly; after master enabled
+page-reusing eviction, 72 GiB long-prompt runs reached the 95 GiB cgroup cap,
+so the safe runner default is 64 GiB. Its prefill pin profile is empty unless
+`LING_PREFILL_USAGE_FILE` is set. The monitor records memory and GPU samples
+and stops only its own model if the memory floor is crossed. It must run
+outside the restricted sandbox to observe the actual host.
 
 An identical-token comparison with the trace-derived ranking:
 
@@ -38,7 +47,10 @@ python3 bench/ling/reference-audit/monitor.py
 Omit `LING_TOKEN_FILE` for the required free-running check. Do not report a
 forced-sequence improvement as an established free-running speed gain.
 
-The selected-copy GPU-prefill diagnostic was verified with a smaller pool:
+The selected-copy GPU-prefill diagnostic was verified with a smaller pool.
+The command below is historical: the current no-copy runner caps memory at
+95 GiB and disables prefill op offload. Use the handoff command for current
+performance work.
 
 ```bash
 LING_DDR_GIB=64 LING_CAP_GIB=96 LING_STOP_GIB=26 LING_GPU_PREFILL=1 \
@@ -60,3 +72,20 @@ against `libggml-cpu` and `libggml-base` in `build-ling/ggml-build/src`.
 It checks negative IDs, duplicate IDs, a consumer after the first graph
 node, padding, and reset between graph executions. `results-2026-10-20.json`
 also records the successful guarded copy run and the rejected pre-fix run.
+
+For a longer prefill measurement, `run.sh` accepts `LING_PROMPT_FILE` and
+`LING_CONTEXT_SIZE`. The runner logs the prompt path and SHA-256. To build a
+prompt-matched usage profile, choose new output paths for `LING_USAGE_FILE`
+and `LING_PREFILL_USAGE_FILE`, set `LING_FREEZE_USAGE_STATS=0`, and run once
+with the prompt. Then run again with the same prompt and profile paths using
+the default frozen statistics. This keeps the prompt used for profile
+collection and measurement identical; the free-running decode check should
+still omit `LING_TOKEN_FILE`.
+
+`prompt-long-20261020.txt` and the preserved long route profile
+`prefill-long64-ring-r05-20261020.pin` are the long-prompt inputs used for the
+current 10 tok/s prefill result. `results-current-2026-10-21.json` records the
+logs, hashes, and measured rates. `prefill-hi-there.pin` is a local generated
+artifact and is not a stable short-prompt benchmark profile; check its entry
+count before using it. Long prompts automatically enable the patched negative
+route skip; see the method page for the crash this prevents.

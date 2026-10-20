@@ -55,6 +55,17 @@
 
 namespace glm5next_graph {
 
+// Stop and drain the speculative prefill ring's copy workers.  Defined in
+// ggml_glm5next_graph_offload.cpp; called before the owning graph frees the
+// GPU1 buffers those workers copy into.
+void prefetch_ring_join();
+
+// True when a prompt graph of this size should try the speculative ring.
+// The Ling cache-borrow path uses the same predicate so it detaches the
+// main-GPU cache only when the ring is actually wanted (and has not been
+// suppressed after an earlier allocation failure).
+bool prefetch_ring_candidate(int S, bool decode_mode, int device);
+
 constexpr int kGraphSize = 60000;
 constexpr size_t kTensorContextBytes = 192ull * 1024ull * 1024ull;
 
@@ -114,6 +125,11 @@ struct PartialExpertLayer {
   uint8_t *vram_layer_base = nullptr;
   size_t vram_layer_slots = 0;
   size_t vram_slot_stride = 0;
+  // Ling's second-GPU experts are borrowed from the same topology cache.
+  std::vector<int32_t> hot1_vram_slot_by_expert;
+  uint8_t *hot1_vram_layer_base = nullptr;
+  size_t hot1_vram_layer_slots = 0;
+  size_t hot1_vram_slot_stride = 0;
   std::vector<int> slot_last_use;
   std::vector<uint32_t> miss_count;
   std::vector<float> heat;        // decayed re-reference score of each cold expert (MOESTREAM_GLM5NEXT_DYNAMIC_HEAT)
@@ -182,14 +198,46 @@ using moestream::graph::model_tensor;
 using moestream::graph::new_tensor;
 using moestream::graph::resident;
 
+// Process-wide owner of the immutable dense-weight arena.  A prompt graph and
+// the decode graph that follows it request the same weights by name; keeping
+// the buffer and the name->address map here lets the second graph bind fresh
+// descriptors to the already-uploaded bytes instead of allocating a second
+// arena and copying ~16 GiB again.  Mutable tensors (partial-route maps, stage
+// masks) deliberately live in FullGraph::scratch, not here.
+struct DenseArenaOwner {
+  DeviceArena arena;
+  struct Entry {
+    void *addr = nullptr;
+    size_t bytes = 0;
+  };
+  std::unordered_map<std::string, Entry> addrs;
+  const StreamingEngine *engine = nullptr;
+  int device = -1;
+  double upload_ms = 0.0;
+  size_t uploads = 0;
+  size_t cache_hits = 0;
+  ~DenseArenaOwner() { arena.free_buffer(); }
+};
+
 struct FullGraph : moestream::graph::GraphCore {
   moestream::ggmlcopy::ExpertCopy expert_copy;
+  ggml_backend_buffer_t expert1_buffer = nullptr; // 1 MiB descriptor only
   FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
 
   bool native_moe_cache = false;
   std::vector<NativeMoeSite> native_moe_sites;
   GpuTopology *topology = nullptr;
   std::unordered_map<std::string, ggml_tensor *> resident_cache;
+  // Non-owning view of DenseArenaOwner::arena.  Null for the native expert
+  // cache path, whose 1 MiB marker buffer is graph-owned.
+  DenseArenaOwner *dense_owner = nullptr;
+  // Per-graph mutable dense tensors (partial-route maps and stage masks).
+  // Refreshed on every build so they neither grow without bound nor overlap
+  // the immutable weight bump region.
+  DeviceArena scratch;
+  double dense_upload_ms = 0.0;
+  size_t dense_uploads = 0;
+  size_t dense_cache_hits = 0;
   int d_inner = 0;
   int qk_nope = 0;
   int qk_rope = 0;
@@ -315,6 +363,7 @@ struct FullGraph : moestream::graph::GraphCore {
   std::vector<ggml_tensor *> kda_hist_updates;
   std::vector<int> dsa_layers;
   std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
+  std::vector<std::pair<int, ggml_tensor *>> prefill_route_ids;
   // CPU lanes (MOESTREAM_GLM5NEXT_EARLY_READY): one per layer whose cold experts
   // run concurrently with that layer's GPU work.
   struct VramExpertHold {
@@ -472,6 +521,10 @@ struct FullGraph : moestream::graph::GraphCore {
   ~FullGraph() { destroy(); }
 
   void destroy() {
+    // The speculative ring's async copies write into gpu1_buffers owned by
+    // this graph.  Join and drain them before any of those buffers are
+    // released, including the retry path after a declined graph build.
+    prefetch_ring_join();
     early_ready.clear();
     if (dynamic_upload) {
       {
@@ -516,14 +569,25 @@ struct FullGraph : moestream::graph::GraphCore {
       ggml_backend_buffer_free(expert.buffer);
       expert.buffer = nullptr;
     }
+    if (expert1_buffer) {
+      ggml_backend_buffer_free(expert1_buffer);
+      expert1_buffer = nullptr;
+    }
     if (state.buffer) {
       ggml_backend_buffer_free(state.buffer);
       state.buffer = nullptr;
     }
-    if (dense.buffer) {
+    if (dense.buffer && !dense_owner) {
+      // Native expert-cache marker buffer: this graph owns it.  Borrowed
+      // dense weights are released only by DenseArenaOwner.
       ggml_backend_buffer_free(dense.buffer);
-      dense.buffer = nullptr;
     }
+    dense.forget();
+    dense_owner = nullptr;
+    scratch.free_buffer();
+    dense_upload_ms = 0.0;
+    dense_uploads = 0;
+    dense_cache_hits = 0;
     partial_expert_residency = false;
     dynamic_expert_cache = false;
     dynamic_upload_disabled = false;
@@ -570,6 +634,7 @@ struct FullGraph : moestream::graph::GraphCore {
     kda_hist_updates.clear();
     dsa_layers.clear();
     moe_route_ids.clear();
+  prefill_route_ids.clear();
     glm5next_indexer_layers.clear();
     glm5next_indexer_seeds.clear();
     dsv4_layers.clear();
@@ -577,6 +642,11 @@ struct FullGraph : moestream::graph::GraphCore {
     dsv41_engram_embeddings.clear();
     dsv41_engram_host_rows.clear();
     dsv4_stage_outputs.clear();
+    // The prompt graph may have borrowed the main GPU's expert-cache pool
+    // for its speculative ring.  All graph-owned buffers (including the
+    // ring) are gone by now, so the cache can safely reclaim that VRAM.
+    if (topology)
+      topology->restore_detached_cache();
     topology = nullptr;
   }
 };

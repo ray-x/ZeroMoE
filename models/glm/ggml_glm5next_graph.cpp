@@ -20,6 +20,10 @@ std::unique_ptr<FullGraph> g_graph;
 // before the first prompt arrives.
 std::unique_ptr<FullGraph> g_glm5next_source;
 
+// Immutable dense weights shared across prompt-shaped and S=1 graphs.  It
+// outlives g_graph; shutdown releases it only after every borrower is gone.
+std::unique_ptr<DenseArenaOwner> g_glm5next_dense_owner;
+
 GpuTopology *g_glm5next_vram_cache = nullptr;
 
 StreamingEngine *g_glm5next_decode_disabled_engine = nullptr;
@@ -63,7 +67,11 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
       std::min(glm5next_full_graph_device_expert_layers(),
                std::max(0, engine.model_file.architecture_config.n_layers -
                                candidate.first_dense));
-  if (configure_partial_experts(candidate))
+  const bool partial_configured = configure_partial_experts(candidate);
+  if (engine.family_ops.family == ModelFamily::BailingMoE3 &&
+      !partial_configured)
+    return false;
+  if (partial_configured)
     candidate.device_expert_layers = 0;
   if (offload_first_layer() >= 0 &&
       !get_offload(engine, candidate.partial_expert_residency
@@ -114,6 +122,8 @@ void glm5next_full_graph_shutdown() {
     ggml_backend_buffer_free(kv.second);
   g_hot1_buffers.clear();
   g_glm5next_source.reset();
+  // All graph borrowers are gone; release the shared dense weights last.
+  g_glm5next_dense_owner.reset();
   g_glm5next_decode_disabled_engine = nullptr;
 }
 
@@ -154,6 +164,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, c
 }
 
 static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *) {
+  const auto prepare_start = std::chrono::steady_clock::now();
   if (!graph_enabled_for(engine) || S <= 1 || pos_base < 0)
     return false;
   const auto &c = engine.model_file.architecture_config;
@@ -241,7 +252,15 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
           ? 0
           : std::min(glm5next_full_graph_device_expert_layers(),
                      std::max(0, c.n_layers - c.first_dense));
-  if (!g->native_moe_cache && configure_partial_experts(*g))
+  if (!g->native_moe_cache) {
+    const bool partial_configured = configure_partial_experts(*g);
+    if (engine.family_ops.family == ModelFamily::BailingMoE3 &&
+        !partial_configured)
+      return false;
+    if (partial_configured)
+      g->device_expert_layers = 0;
+  }
+  if (engine.family_ops.family == ModelFamily::BailingMoE3)
     g->device_expert_layers = 0;
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
@@ -299,7 +318,10 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   }
   // GPU1-hot experts compute in place on the second GPU (MOESTREAM_GLM5NEXT_PREFILL_GPU1=0 routes them through the cold
   // branch, copying each used expert to the main GPU).
-  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)
+  const bool ling_cache_alias =
+      g->engine->family_ops.family == ModelFamily::BailingMoE3;
+  if (ling_cache_alias ||
+      moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)
     for (const auto &pl : g->partial_experts)
       if (!pl.hot1.empty()) {
         g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
@@ -308,7 +330,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   ggml_backend_t backends[] = {g->cuda, g->gpu1 ? g->gpu1 : g->cpu, g->cpu};
   // Batched prefill: let the scheduler run the host-resident (cold) expert matmuls on the GPU by copying the weights
   // across, instead of on the CPU (MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
-  const bool prefill_offload = moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD");
+  const bool prefill_offload =
+      g->engine->family_ops.family != ModelFamily::BailingMoE3 &&
+      moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD");
   // The scheduler needs events (MOESTREAM_SCHED_EVENTS, set below): without them every weight-input copy first
   // synchronizes the whole destination stream, which serializes the copies of the two GPUs. parallel=true is not an
   // option: it multiplies the graph inputs by the number of copies (56 GB of workspace).
@@ -318,7 +342,8 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, sched_parallel, prefill_offload);
   if (!g->sched)
     return false;
-  if (g->expert_copy.attach(g->sched))
+  if (g->engine->family_ops.family != ModelFamily::BailingMoE3 &&
+      g->expert_copy.attach(g->sched))
     LOG_INFO("[GGML-GLM5NEXT-FULL] selective expert weight-copy callback installed\n");
   if (!build_graph(*g)) {
     LOG_WARN("[GGML-GLM5NEXT-FULL] graph construction declined; using legacy "
@@ -339,7 +364,11 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
     }
     cudaSetDevice(g_graph->device);
   }
-  LOG_INFO("[GGML-GLM5NEXT-FULL] graph prepared for S=%d\n", S);
+  const double prepare_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - prepare_start)
+                                .count();
+  LOG_INFO("[GGML-GLM5NEXT-FULL] graph prepared for S=%d in %.0f ms\n", S,
+           prepare_ms);
   return true;
 }
 

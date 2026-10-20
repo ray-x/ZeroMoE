@@ -765,6 +765,18 @@ public:
     // no unpin() exists in this codebase.
     std::vector<size_t> unpinned_slot_indices;
 
+    // Prefill ring time-shares the main GPU's expert cache.  The cache is
+    // copied to host and its CUDA pool is freed before the prompt-shaped
+    // graph allocates the speculative ring; FullGraph::destroy restores it
+    // after the ring buffers are released, so decode still gets the full
+    // configured cache.  Keeping the copy on the host is what lets the ring
+    // use the cache's VRAM without permanently growing either allocation.
+    int detached_cache_device = -1;
+    size_t detached_cache_bytes = 0;
+    void *detached_cache_host = nullptr;
+    bool detached_cache_host_reserved = false;
+    std::vector<std::pair<size_t, ExpertLocation>> detached_cache_slots;
+
     // Pinned host buffer for cross-device transfers
     float* h_xfer_pinned = nullptr;
     size_t h_xfer_cap = 0;
@@ -973,6 +985,14 @@ public:
         reap_pending_host_unregisters();
         for (auto& p : pending_host_unregisters) cudaHostUnregister(p.host_ptr);
         pending_host_unregisters.clear();
+        if (detached_cache_host) {
+            cudaFreeHost(detached_cache_host);
+            detached_cache_host = nullptr;
+        }
+        if (detached_cache_host_reserved) {
+            MemoryGuard::release_host_bytes(detached_cache_bytes);
+            detached_cache_host_reserved = false;
+        }
         for (auto& loc : expert_vram_cache) {
             if (loc.upload_event) { cudaSetDevice(loc.gpu_id); cudaEventDestroy(loc.upload_event); }
         }
@@ -1528,6 +1548,206 @@ public:
         LOG_STREAM_INFO() << "[GPU] Expert VRAM cache: " << expert_vram_cache_cap
                   << " slots (" << total_cache_bytes / 1e9 << " GB total) across "
                   << vault_gpus.size() << " GPU(s)\n";
+    }
+
+    // Rebuild the two lookup structures after the slot set changes.  Only
+    // slots that still own a device pointer are indexable; detached slots
+    // intentionally stay in expert_vram_cache so restoring them preserves
+    // their original slot indices and identities.
+    void rebuild_cache_indices() {
+        expert_index.clear();
+        unpinned_slot_indices.clear();
+        unpinned_slot_indices.reserve(expert_vram_cache.size());
+        for (size_t i = 0; i < expert_vram_cache.size(); ++i) {
+            ExpertLocation &loc = expert_vram_cache[i];
+            if (!loc.device_ptr) continue;
+            if (loc.layer_idx >= 0 && loc.expert_id >= 0)
+                expert_index[swap_key(loc.layer_idx, loc.expert_id)] = i;
+            if (!loc.pinned) unpinned_slot_indices.push_back(i);
+        }
+    }
+
+    // Copy one GPU's resident expert cache to host and free its CUDA pool.
+    // The prompt graph's ring is built while the pool is gone; the bytes are
+    // copied back by restore_detached_cache() after the ring is freed.
+    // Returns true when the cache is (already) detached.
+    bool detach_cache_for_prefill(int device_id) {
+        GPU_TOPO_TIMED_LOCK(lock);
+        if (detached_cache_device >= 0)
+            return detached_cache_device == device_id;
+
+        GpuDevice *dev = nullptr;
+        for (auto &d : devices)
+            if (d.id == device_id) {
+                dev = &d;
+                break;
+            }
+        if (!dev || !dev->expert_cache_pool || dev->expert_cache_size == 0)
+            return false;
+        const size_t bytes = dev->expert_cache_size;
+        if (!MemoryGuard::try_reserve_host_bytes(bytes)) {
+            LOG_STREAM_WARN() << "[GPU] prefill cache borrow: host reservation refused for "
+                              << bytes / 1e9 << " GB on GPU " << dev->id << "\n";
+            return false;
+        }
+
+        cudaSetDevice(dev->id);
+        void *host = nullptr;
+        cudaError_t err = cudaHostAlloc(&host, bytes, cudaHostAllocDefault);
+        if (err != cudaSuccess || !host) {
+            MemoryGuard::release_host_bytes(bytes);
+            LOG_STREAM_WARN() << "[GPU] prefill cache borrow: pinned host copy failed on GPU "
+                              << dev->id << " (" << bytes / 1e9 << " GB): "
+                              << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+        err = cudaMemcpy(host, dev->expert_cache_pool, bytes,
+                         cudaMemcpyDeviceToHost);
+        if (err != cudaSuccess) {
+            cudaFreeHost(host);
+            MemoryGuard::release_host_bytes(bytes);
+            LOG_STREAM_WARN() << "[GPU] prefill cache borrow: D2H copy failed on GPU "
+                              << dev->id << ": " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+
+        std::vector<std::pair<size_t, ExpertLocation>> saved;
+        saved.reserve(expert_vram_cache.size());
+        for (size_t i = 0; i < expert_vram_cache.size(); ++i) {
+            if (expert_vram_cache[i].gpu_id != dev->id) continue;
+            saved.emplace_back(i, expert_vram_cache[i]);
+        }
+
+        if (dev->cufile_pool_registered) {
+            cufile_io::deregister_buffer(dev->expert_cache_pool);
+            dev->cufile_pool_registered = false;
+        }
+        err = cudaFree(dev->expert_cache_pool);
+        if (err != cudaSuccess) {
+            // The slot pointers are still valid; keep the cache usable.
+            if (cufile_io::available())
+                dev->cufile_pool_registered =
+                    cufile_io::register_buffer(dev->expert_cache_pool,
+                                               dev->expert_cache_size);
+            cudaFreeHost(host);
+            MemoryGuard::release_host_bytes(bytes);
+            LOG_STREAM_WARN() << "[GPU] prefill cache borrow: cudaFree failed on GPU "
+                              << dev->id << ": " << cudaGetErrorString(err) << "\n";
+            return false;
+        }
+
+        for (auto &entry : saved) {
+            ExpertLocation &loc = expert_vram_cache[entry.first];
+            loc.device_ptr = nullptr;
+            loc.layer_idx = -1;
+            loc.expert_id = -1;
+            loc.upload_ready = true;
+        }
+        dev->expert_cache_pool = nullptr;
+        dev->expert_cache_size = 0;
+        dev->available_vram += bytes;
+
+        detached_cache_device = dev->id;
+        detached_cache_bytes = bytes;
+        detached_cache_host = host;
+        detached_cache_host_reserved = true;
+        detached_cache_slots = std::move(saved);
+        rebuild_cache_indices();
+
+        LOG_STREAM_INFO() << "[GPU] prefill cache borrow: detached GPU " << dev->id
+                          << " expert cache (" << bytes / 1e9 << " GB, "
+                          << detached_cache_slots.size()
+                          << " slots) to host for the prompt ring\n";
+        return true;
+    }
+
+    // Restore the cache detached by detach_cache_for_prefill().  Must run
+    // only after the prompt graph (including its ring buffers) is gone.
+    bool restore_detached_cache() {
+        GPU_TOPO_TIMED_LOCK(lock);
+        if (detached_cache_device < 0)
+            return true;
+
+        GpuDevice *dev = nullptr;
+        for (auto &d : devices)
+            if (d.id == detached_cache_device) {
+                dev = &d;
+                break;
+            }
+        if (!dev) {
+            LOG_STREAM_WARN() << "[GPU] prefill cache borrow: detached device "
+                              << detached_cache_device << " disappeared\n";
+            return false;
+        }
+
+        cudaSetDevice(dev->id);
+        void *pool = nullptr;
+        cudaError_t err = cudaMalloc(&pool, detached_cache_bytes);
+        if (err != cudaSuccess || !pool) {
+            LOG_STREAM_WARN() << "[GPU] prefill cache borrow: restore cudaMalloc failed on GPU "
+                              << dev->id << " (" << detached_cache_bytes / 1e9
+                              << " GB): " << cudaGetErrorString(err)
+                              << "; decode keeps the smaller cache\n";
+            return false;
+        }
+        if (detached_cache_host) {
+            err = cudaMemcpy(pool, detached_cache_host, detached_cache_bytes,
+                             cudaMemcpyHostToDevice);
+            if (err != cudaSuccess) {
+                cudaFree(pool);
+                LOG_STREAM_WARN() << "[GPU] prefill cache borrow: restore H2D failed on GPU "
+                                  << dev->id << ": " << cudaGetErrorString(err)
+                                  << "; decode keeps the smaller cache\n";
+                return false;
+            }
+        }
+
+        for (auto &entry : detached_cache_slots) {
+            ExpertLocation loc = entry.second;
+            if (loc.offset > detached_cache_bytes ||
+                loc.size > detached_cache_bytes - loc.offset) {
+                LOG_STREAM_WARN() << "[GPU] prefill cache borrow: invalid slot offset "
+                                  << loc.offset << " size " << loc.size
+                                  << " during restore\n";
+                continue;
+            }
+            loc.device_ptr = (uint8_t *)pool + loc.offset;
+            loc.upload_ready = true;
+            expert_vram_cache[entry.first] = loc;
+        }
+
+        dev->expert_cache_pool = (uint8_t *)pool;
+        dev->expert_cache_size = detached_cache_bytes;
+        dev->available_vram = dev->available_vram > detached_cache_bytes
+                                  ? dev->available_vram - detached_cache_bytes
+                                  : 0;
+        if (cufile_io::available())
+            dev->cufile_pool_registered =
+                cufile_io::register_buffer(dev->expert_cache_pool,
+                                           dev->expert_cache_size);
+
+        if (detached_cache_host) {
+            cudaFreeHost(detached_cache_host);
+            detached_cache_host = nullptr;
+        }
+        if (detached_cache_host_reserved) {
+            MemoryGuard::release_host_bytes(detached_cache_bytes);
+            detached_cache_host_reserved = false;
+        }
+        rebuild_cache_indices();
+
+        const size_t slots = detached_cache_slots.size();
+        LOG_STREAM_INFO() << "[GPU] prefill cache borrow: restored GPU " << dev->id
+                          << " expert cache (" << detached_cache_bytes / 1e9
+                          << " GB, " << slots << " slots)\n";
+        detached_cache_device = -1;
+        detached_cache_bytes = 0;
+        detached_cache_slots.clear();
+        return true;
+    }
+
+    bool cache_detached_for_prefill() const {
+        return detached_cache_device >= 0;
     }
 
     // Give a device that's NOT already a pure ExpertVault (typically the
