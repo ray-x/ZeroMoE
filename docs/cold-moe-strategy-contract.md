@@ -76,6 +76,28 @@ This is deliberately a **superset** of the callbacks `EarlyReadyLane` already ex
 (`begin_load` / `finish_load` / `expert_planes`); the lane becomes one implementation of the
 strategy, and `ggml_moe_runner` + `RAMSafetyManager`/`GpuTopology` become another.
 
+### Positioning within `ExecutionPolicy`
+
+`ColdMoEStrategy` is the `MoEExecutionStrategy` component of the broader `ExecutionPolicy` from
+`docs/graph-design-optimization-plan.md` §4.7 — the *last* of five independently selectable
+policies, all of which live under the "execution plan" layer and vary independently of the model's
+mathematics:
+
+```
+ExecutionPolicy
+├── CachePolicy          (admission / eviction)
+├── Predictor            (future experts + confidence + target layer)
+├── PrefetchPolicy       (spend bandwidth/memory on predictions)
+├── PromotionPolicy      (move experts into faster storage)
+└── MoEExecutionStrategy (resident/staged/CPU → combined)   ← this contract
+```
+
+The four siblings are specified alongside this contract (their seams already exist: the expert
+store + admission in `offload_store.hpp`/`expert_cache.hpp`, the predictor in the ridge/pilot
+tables, prefetch in `async_prefetcher.hpp`, promotion in `GpuTopology`). `MoEExecutionStrategy`
+depends on the capabilities those siblings expose, so the interfaces are kept narrow and the
+supported combinations are validated explicitly.
+
 ---
 
 ## 3. The invariants
