@@ -1,0 +1,92 @@
+[
+  {
+    "tag": "audit",
+    "log": "/tmp/ling-reference-audit-route-2026-10-20.log",
+    "log_sha256": "0848d47dbbd8f598f8be65a5d38b56ce56ba3ac0cf5558337448e6af7053dded",
+    "steps": 31,
+    "mean_step_ms": 149.24148387096773,
+    "min_available_gib": 23.986656188964844,
+    "peak_cgroup_gib": 99.53192138671875,
+    "peak_swap_bytes": 0,
+    "rate_lines": [
+      " guidance[17:48:21.208] [GLM5NEXT-LANE] gpu assist: 616 layer-runs, 973 experts, tail wait 3.0ms/token",
+      "[17:48:21.208] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=184 wait=46.3ms/token compute=81.3ms/token split stall=31.2ms/token | misses=541 loads=336 read=64.0ms/token (3.05 ms per load)",
+      "[17:48:23.524] [REQUEST-DECODE-WALL] tokens=32 wall=18.985s rate=1.69 tok/s (starts immediately after PREFILL-DONE; includes one-time decode-graph setup)",
+      "[17:48:23.588] Rates:               overall=1.31 tok/s | decode=1.36 tok/s (32 tokens / 23.55s) | prefill=2.40 tok/s (2 tokens / 0.83s)"
+    ]
+  },
+  {
+    "tag": "rerank-forced",
+    "log": "/tmp/ling-reference-rerank-forced-2026-10-20.log",
+    "log_sha256": "31a29af3fce2361e52ef88d1a7b5ca36c8d5687ca8de752bd4c6dc67ed540d1b",
+    "steps": 31,
+    "mean_step_ms": 98.3787741935484,
+    "min_available_gib": 23.958984375,
+    "peak_cgroup_gib": 100.54998779296875,
+    "peak_swap_bytes": 0,
+    "rate_lines": [
+      " guidance[17:51:24.262] [GLM5NEXT-LANE] gpu assist: 127 layer-runs, 171 experts, tail wait 0.6ms/token",
+      "[17:51:24.262] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=91 wait=44.1ms/token compute=39.7ms/token split stall=14.6ms/token | misses=428 loads=175 read=51.4ms/token (4.70 ms per load)",
+      "[17:51:25.708] [REQUEST-DECODE-WALL] tokens=32 wall=17.086s rate=1.87 tok/s (starts immediately after PREFILL-DONE; includes one-time decode-graph setup)",
+      "[17:51:25.771] Rates:               overall=1.41 tok/s | decode=1.47 tok/s (32 tokens / 21.74s) | prefill=2.04 tok/s (2 tokens / 0.98s)"
+    ]
+  },
+  {
+    "tag": "rerank-free",
+    "log": "/tmp/ling-reference-rerank-free-2026-10-20.log",
+    "log_sha256": "8a2d9ac568694e3a6389dc92b42a3c6b762d290d7483553629c50bef476b84e7",
+    "steps": 31,
+    "mean_step_ms": 191.50274193548387,
+    "min_available_gib": 24.07636260986328,
+    "peak_cgroup_gib": 100.65581512451172,
+    "peak_swap_bytes": 0,
+    "rate_lines": [
+      " traditional[17:54:09.618] [GLM5NEXT-LANE] gpu assist: 289 layer-runs, 596 experts, tail wait 2.7ms/token",
+      "[17:54:09.618] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=217 wait=44.6ms/token compute=128.4ms/token split stall=53.8ms/token | misses=808 loads=555 read=93.4ms/token (2.69 ms per load)",
+      "[17:54:12.517] [REQUEST-DECODE-WALL] tokens=32 wall=20.050s rate=1.60 tok/s (starts immediately after PREFILL-DONE; includes one-time decode-graph setup)",
+      "[17:54:12.610] Rates:               overall=1.24 tok/s | decode=1.29 tok/s (32 tokens / 24.73s) | prefill=2.00 tok/s (2 tokens / 1.00s)"
+    ]
+  },
+  {
+    "tag": "gpu-prefill",
+    "log": "/tmp/ling-reference-gpu-prefill-2026-10-20.log",
+    "log_sha256": "64948537f5514a3a5b9eef0d021a3d0ab038c8ee5f5463af15fcbbdd848aa5ab",
+    "steps": 31,
+    "mean_step_ms": 98.58896774193548,
+    "min_available_gib": 24.028148651123047,
+    "peak_cgroup_gib": 100.72647476196289,
+    "peak_swap_bytes": 0,
+    "rate_lines": [
+      " guidance[17:57:20.912] [GLM5NEXT-LANE] gpu assist: 127 layer-runs, 171 experts, tail wait 0.6ms/token",
+      "[17:57:20.912] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=91 wait=44.2ms/token compute=40.1ms/token split stall=14.9ms/token | misses=428 loads=175 read=50.4ms/token (4.61 ms per load)",
+      "[17:57:22.356] [REQUEST-DECODE-WALL] tokens=32 wall=17.143s rate=1.87 tok/s (starts immediately after PREFILL-DONE; includes one-time decode-graph setup)",
+      "[17:57:22.419] Rates:               overall=1.41 tok/s | decode=1.47 tok/s (32 tokens / 21.77s) | prefill=2.09 tok/s (2 tokens / 0.96s)"
+    ]
+  },
+  {
+    "tag": "gpu-prefill-smallbatch",
+    "log": "/tmp/ling-reference-gpu-prefill-smallbatch-2026-10-20.log",
+    "log_sha256": "b1159cc117dc4e8ad4680f3518aa0a9b216d26ef4f74c992e51fc809abd0ee9d",
+    "steps": 0,
+    "mean_step_ms": null,
+    "min_available_gib": 11.393688201904297,
+    "peak_cgroup_gib": 108.52766418457031,
+    "peak_swap_bytes": 0,
+    "rate_lines": []
+  },
+  {
+    "tag": "selected-copy64",
+    "log": "/tmp/ling-reference-selected-copy64-2026-10-20.log",
+    "log_sha256": "a3764da08c66936a14b4e4e239e7031d0a834919a867adf45945631ebc442952",
+    "steps": 31,
+    "mean_step_ms": 108.44290322580645,
+    "min_available_gib": 31.318012237548828,
+    "peak_cgroup_gib": 89.24034881591797,
+    "peak_swap_bytes": 0,
+    "rate_lines": [
+      "[Prefill] Processing 2 tokens...[18:17:13.733] [GGML-GLM5NEXT-EXPERT-COPY] 2022 plane copies, 2.231 GiB weight payload",
+      "[18:17:31.572] [REQUEST-DECODE-WALL] tokens=32 wall=17.807s rate=1.80 tok/s (starts immediately after PREFILL-DONE; includes one-time decode-graph setup)",
+      "[18:17:31.636] Rates:               overall=1.37 tok/s | decode=1.43 tok/s (32 tokens / 22.38s) | prefill=1.89 tok/s (2 tokens / 1.06s)"
+    ]
+  }
+]

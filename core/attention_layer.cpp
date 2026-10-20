@@ -458,7 +458,18 @@ static bool ensure_wuk_wuv_cached(StreamingEngine &engine, int layer_idx) {
 // reserve is a direct, scoped fix: hold back a fixed slice BEFORE either
 // budget check runs, so d_x/d_y's later prefill-time grow has somewhere to
 // go regardless of how aggressively qabsorb/score/WUV spend the rest.
-constexpr size_t kDenseScratchReserveBytes = 256ULL * 1024 * 1024; // 256MB
+// Prefill grows d_x/d_y/d_score_combined with the batch (about 65 KB + 110 KB per token); 256MB covers decode and
+// short prompts but a 426-token GLM-5.3 prefill still failed 446 cudaMallocs and ran attn_output on the CPU
+// (outproj 131 s of 400 s). MOESTREAM_DENSE_SCRATCH_RESERVE_MB raises it.
+static size_t dense_scratch_reserve_bytes() {
+  static const size_t v = [] {
+    const char *e = std::getenv("MOESTREAM_DENSE_SCRATCH_RESERVE_MB");
+    const long mb = (e && e[0]) ? std::atol(e) : 256;
+    return (size_t)(mb > 0 ? mb : 256) * 1024ULL * 1024ULL;
+  }();
+  return v;
+}
+#define kDenseScratchReserveBytes dense_scratch_reserve_bytes()
 
 void warm_mla_absorb_cache(StreamingEngine &engine) {
   const auto &c = engine.model_file.architecture_config;
@@ -1266,6 +1277,18 @@ void mla_attention_absorbed_gguf(StreamingEngine &engine, int layer_idx,
     }
   } // !score_gpu_ok
 
+  if (engine.family_ops.family == ModelFamily::BailingMoE3) {
+    // BailingMoE3 gates each attention head before the output projection.
+    std::vector<float> gates((size_t)S * H);
+    dense_proj(engine, p + "attn_gate.weight", normed.data(), gates.data(),
+               S, D, H);
+    for (int s = 0; s < S; ++s)
+      for (int h = 0; h < H; ++h) {
+        const float gate = 1.0f / (1.0f + std::exp(-gates[(size_t)s * H + h]));
+        float *head = head_contexts.data() + ((size_t)s * H + h) * vh;
+        for (int i = 0; i < vh; ++i) head[i] *= gate;
+      }
+  }
   check_finite_attn("head_contexts (post absorbed attention loop)", layer_idx,
                     head_contexts.data(), head_contexts.size(), H * vh);
   PERF_END(attn_score, t_attn_score);
@@ -1571,6 +1594,7 @@ static void glm5next_kda_gguf(StreamingEngine &engine, int layer_idx,
   const int d_inner = H * hd;
   const int d_conv = c.ssm_conv_kernel;
   const float lb = c.kda_gate_lower_bound;
+  const bool bailing = engine.family_ops.family == ModelFamily::BailingMoE3;
   const std::string p = "blk." + std::to_string(layer_idx) + ".";
   (void)pos_base; // KDA is recurrent -- no positions, no RoPE, no KV cache
 
@@ -1627,7 +1651,7 @@ static void glm5next_kda_gguf(StreamingEngine &engine, int layer_idx,
   std::vector<float> qkv((size_t)S * 3 * d_inner);
   std::vector<float> fused_q, fused_k, fused_v, fused_f_b, fused_beta,
       fused_g_b;
-  const bool fused_kda_proj = glm5next_kda_proj_fused(
+  const bool fused_kda_proj = !bailing && glm5next_kda_proj_fused(
       engine, layer_idx, p, D, H, hd, d_inner, S, normed.data(), fused_q,
       fused_k, fused_v, fused_f_b, fused_beta, fused_g_b);
   {
@@ -1754,12 +1778,14 @@ static void glm5next_kda_gguf(StreamingEngine &engine, int layer_idx,
 
   // ---- 5. decay gate g and beta (both read the LAYER INPUT, not the
   // convolved q/k/v -- glm5next.cpp's `inp`) ----
-  // f = f_b(f_a(normed)) + dt_bias            [S, d_inner]
-  // g = lb * sigmoid(-(f * ssm_a[h]))         [S, H, hd] (negative log-decay)
+  // GLM uses f_b(f_a(normed)); Bailing projects directly to d_inner.
   std::vector<float> g_log((size_t)S * d_inner);
   {
     if (fused_kda_proj)
       g_log = fused_f_b;
+    else if (bailing)
+      dense_proj(engine, p + "ssm_f_a.weight", normed.data(), g_log.data(),
+                 S, D, d_inner);
     else {
       std::vector<float> fa((size_t)S * hd);
       dense_proj(engine, p + "ssm_f_a.weight", normed.data(), fa.data(), S, D,
@@ -1781,7 +1807,8 @@ static void glm5next_kda_gguf(StreamingEngine &engine, int layer_idx,
         for (int i = 0; i < hd; ++i) {
           const int idx = h * hd + i;
           const float f = (g_s[idx] + dt_bias[idx]) * a_h;
-          g_s[idx] = lb / (1.0f + std::exp(f)); // lb * sigmoid(-f)
+          g_s[idx] = bailing ? lb / (1.0f + std::exp(-f))
+                               : lb / (1.0f + std::exp(f));
         }
       }
     }
@@ -1825,6 +1852,9 @@ static void glm5next_kda_gguf(StreamingEngine &engine, int layer_idx,
   std::vector<float> gate((size_t)S * d_inner);
   if (fused_kda_proj) {
     gate = fused_g_b;
+  } else if (bailing) {
+    dense_proj(engine, p + "ssm_g_a.weight", normed.data(), gate.data(),
+               S, D, d_inner);
   } else {
     std::vector<float> ga((size_t)S * hd);
     dense_proj(engine, p + "ssm_g_a.weight", normed.data(), ga.data(), S, D,
@@ -1881,6 +1911,17 @@ void glm5next_attention_gguf(StreamingEngine &engine, int layer_idx,
     mla_attention_absorbed_gguf(engine, layer_idx, hidden_states, S, pos_base,
                                 out_context);
   }
+}
+
+void bailingmoe3_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                const float *hidden_states, int S, int pos_base,
+                                float *out_context) {
+  if (bailingmoe3_is_kda_layer(engine.model_file.architecture_config, layer_idx))
+    glm5next_kda_gguf(engine, layer_idx, hidden_states, S, pos_base,
+                      out_context);
+  else
+    mla_attention_absorbed_gguf(engine, layer_idx, hidden_states, S, pos_base,
+                                out_context);
 }
 
 // ---------------------------------------------------------------------------

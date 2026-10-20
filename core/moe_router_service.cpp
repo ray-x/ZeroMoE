@@ -1566,6 +1566,33 @@ bool MoeRouterService::route(MoePipelineContext &context) {
             float sel = token_probs[e] + (bias_row ? bias_row[e] : 0.0f);
             scratch.scores[e] = {e, sel};
           }
+          if (c.expert_group_count > 1) {
+            const int group_size = n_experts / c.expert_group_count;
+            std::vector<ExpertScore> groups;
+            groups.reserve(c.expert_group_count);
+            for (int g = 0; g < c.expert_group_count; ++g) {
+              float first = -std::numeric_limits<float>::infinity();
+              float second = first;
+              for (int j = 0; j < group_size; ++j) {
+                const float score = scratch.scores[g * group_size + j].score;
+                if (score > first) { second = first; first = score; }
+                else if (score > second) second = score;
+              }
+              groups.push_back({g, first + second});
+            }
+            std::partial_sort(groups.begin(),
+                              groups.begin() + c.expert_group_used_count,
+                              groups.end(),
+                              [](const ExpertScore &a, const ExpertScore &b) {
+                                return a.score > b.score;
+                              });
+            std::vector<bool> selected(c.expert_group_count, false);
+            for (int g = 0; g < c.expert_group_used_count; ++g)
+              selected[groups[g].id] = true;
+            for (int e = 0; e < n_experts; ++e)
+              if (!selected[e / group_size])
+                scratch.scores[e].score = -std::numeric_limits<float>::infinity();
+          }
           if (stable_dsv41_boundary) {
             for (int e = 0; e < n_experts; ++e)
               dsv41_router_scores[(size_t)e] =

@@ -1,0 +1,23 @@
+diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
+--- a/src/ggml-cuda/ggml-cuda.cu
++++ b/src/ggml-cuda/ggml-cuda.cu
+@@ -6228,1 +6228,19 @@
+ GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
++
++extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
++    ggml_backend_t backend) {
++    if (!backend || backend->iface.graph_compute != ggml_backend_cuda_graph_compute) return nullptr;
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    return ctx ? ctx->stream() : nullptr;
++}
++
++#ifdef USE_CUDA_GRAPH
++extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(
++    ggml_backend_t backend, const ggml_tensor * first_node) {
++    if (!backend || backend->iface.graph_compute != ggml_backend_cuda_graph_compute || !first_node) return nullptr;
++    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
++    if (!ctx) return nullptr;
++    ggml_cuda_graph * graph = ctx->cuda_graph(first_node);
++    return graph ? graph->graph : nullptr;
++}
++#endif

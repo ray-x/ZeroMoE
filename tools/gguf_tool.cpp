@@ -62,6 +62,8 @@ int usage(const char *prog) {
           "'offload --verify <store> --against <model>'\n"
           "          byte-compares a store with its source via O_DIRECT reads.\n"
           "\n"
+          "  mirror-subset <model> <mirror_dir> --usage-file <u> --hot-gib G [--fraction F] [--dry-run]\n"
+          "          sparse second-drive copy holding a share of the cold experts (see gguf_mirror.cpp)\n"
           "Run '%s <subcommand>' with no further args for that "
           "subcommand's full usage.\n",
           prog, prog);
@@ -92,6 +94,8 @@ int main(int argc, char **argv) {
     return gguf_tool::cmd_mix(argc - 1, argv + 1);
   if (sub == "offload")
     return gguf_tool::cmd_offload(argc - 1, argv + 1);
+  if (sub == "mirror-subset")
+    return gguf_tool::cmd_mirror_subset(argc - 1, argv + 1);
   if (sub == "-h" || sub == "--help") {
     usage(argv[0]);
     return 0;

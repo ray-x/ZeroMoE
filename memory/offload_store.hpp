@@ -28,12 +28,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
+#include <sys/stat.h>
+#include <unordered_set>
 #include <functional>
 #include <condition_variable>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+#include <cmath>
+#include <thread>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -336,8 +341,39 @@ public:
     return true;
   }
   // Counters (diagnostics): how many reads took the zero-copy O_DIRECT path vs the buffered fallback.
-  uint64_t direct_reads() const { return direct_reads_; }
-  uint64_t buffered_reads() const { return buffered_reads_; }
+  uint64_t direct_reads() const { return direct_reads_.load(); }
+  uint64_t buffered_reads() const { return buffered_reads_.load(); }
+
+  // Reads only the planes in `mask` (bit k = plane k: gate, up, down); each maximal run of adjacent planes is one direct preadv when the
+  // store is tight and aligned, else buffered preads.
+  ReadStatus read_planes(int layer, int expert, void *const dst[3], unsigned mask) {
+    auto it = slabs_.find(detail::key(layer, expert));
+    if (it == slabs_.end()) return ReadStatus::NotFound;
+    const Slab &s = it->second;
+    const int fd_dir = fds_dir_[static_cast<size_t>(s.file)], fd_buf = fds_buf_[static_cast<size_t>(s.file)];
+    int k = 0;
+    while (k < 3) {
+      if (!(mask >> k & 1u)) { ++k; continue; }
+      int e = k;
+      while (e + 1 < 3 && (mask >> (e + 1) & 1u) && s.off[e + 1] == s.off[e] + s.bytes[e]) ++e;
+      bool fast = fd_dir >= 0 && s.off[k] % align_ == 0;
+      for (int j = k; j <= e && fast; ++j)
+        if (reinterpret_cast<uintptr_t>(dst[j]) % align_ != 0 || s.bytes[j] % align_ != 0) fast = false;
+      bool done = false;
+      if (fast) {
+        struct iovec iov[3];
+        for (int j = k; j <= e; ++j) iov[j - k] = {dst[j], static_cast<size_t>(s.bytes[j])};
+        if (detail::preadv_all(fd_dir, iov, e - k + 1, static_cast<off_t>(s.off[k]))) { direct_reads_.fetch_add(1, std::memory_order_relaxed); done = true; }
+      }
+      if (!done) {
+        for (int j = k; j <= e; ++j)
+          if (!detail::pread_all(fd_buf, dst[j], static_cast<size_t>(s.bytes[j]), static_cast<off_t>(s.off[j]))) return ReadStatus::IoError;
+        buffered_reads_.fetch_add(1, std::memory_order_relaxed);
+      }
+      k = e + 1;
+    }
+    return ReadStatus::Ok;
+  }
 
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
     auto it = slabs_.find(detail::key(layer, expert));
@@ -349,12 +385,12 @@ public:
       if (reinterpret_cast<uintptr_t>(dst[k]) % align_ != 0 || s.bytes[k] % align_ != 0) fast = false;
     if (fast) {
       struct iovec iov[3] = {{dst[0], static_cast<size_t>(s.bytes[0])}, {dst[1], static_cast<size_t>(s.bytes[1])}, {dst[2], static_cast<size_t>(s.bytes[2])}};
-      if (detail::preadv_all(fd_dir, iov, 3, static_cast<off_t>(s.off[0]))) { ++direct_reads_; return ReadStatus::Ok; }
+      if (detail::preadv_all(fd_dir, iov, 3, static_cast<off_t>(s.off[0]))) { direct_reads_.fetch_add(1, std::memory_order_relaxed); return ReadStatus::Ok; }
       // fall through to the buffered path (O_DIRECT can refuse on some filesystems)
     }
     for (int k = 0; k < 3; ++k) // each plane at its own offset: a store need not be tight
       if (!detail::pread_all(fd_buf, dst[k], static_cast<size_t>(s.bytes[k]), static_cast<off_t>(s.off[k]))) return ReadStatus::IoError;
-    ++buffered_reads_;
+    buffered_reads_.fetch_add(1, std::memory_order_relaxed);
     return ReadStatus::Ok;
   }
 
@@ -373,15 +409,24 @@ private:
   std::unordered_map<uint64_t, Slab> slabs_;
   uint32_t align_ = 4096;
   std::vector<int> fds_dir_, fds_buf_;
-  uint64_t direct_reads_ = 0, buffered_reads_ = 0;
+  std::atomic<uint64_t> direct_reads_{0}, buffered_reads_{0};
 };
 
 class ModelReader final : public ExpertSource {
 public:
   bool drop_page_cache = true;
   std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
-  ModelReader() = default;
-  ~ModelReader() override { for (int fd : fds_) if (fd >= 0) ::close(fd); }
+  ModelReader() { if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_MODEL_DIRECT")) use_direct = e[0] == '1'; }
+  ~ModelReader() override {
+    for (int fd : fds_) if (fd >= 0) ::close(fd);
+    for (int fd : fds_dir_) if (fd >= 0) ::close(fd);
+    for (int fd : mirror_fds_) if (fd >= 0) ::close(fd);
+    for (int fd : mirror_fds_dir_) if (fd >= 0) ::close(fd);
+  }
+  // Planes whose file offset, size and destination are 4096-aligned bypass the page cache (O_DIRECT): the same bandwidth as the
+  // buffered path for ~1/6 of the CPU, which matters because the CPU expert matmuls run at the same time.
+  bool use_direct = false; // opt-in via MOESTREAM_GLM5NEXT_MODEL_DIRECT=1: no decode gain measured
+  std::atomic<uint64_t> direct_planes{0}, buffered_planes{0};
   ModelReader(const ModelReader &) = delete;
   ModelReader &operator=(const ModelReader &) = delete;
 
@@ -392,6 +437,7 @@ public:
       const int fd = ::open(path.c_str(), O_RDONLY);
       if (fd < 0) { if (err) *err = "cannot open " + path; return false; }
       fds_.push_back(fd);
+      fds_dir_.push_back(::open(path.c_str(), O_RDONLY | O_DIRECT));
       for (const GgufTensorInfo &t : h.tensors) {
         int L = 0;
         char kind[8] = {0};
@@ -401,11 +447,41 @@ public:
         const uint64_t per = ggml_row_bytes(t.type, t.dims[0]) * t.dims[1];
         if (per == 0 || t.dims[2] == 0) continue;
         Proj &p = layers_[L].p[k];
-        p = {fd, h.data_start + t.offset, per, t.dims[2]};
+        p = {fd, h.data_start + t.offset, per, t.dims[2], static_cast<int>(fds_.size()) - 1};
       }
     }
     return !layers_.empty();
   }
+  // Sparse second copy of the model on another drive (gguf_tool mirror-subset): same shard basenames and offsets, only the
+  // experts listed in <dir>/mirror_subset.tsv hold data. Those experts are read from there, all others from the main copy.
+  // Call after open(). Returns the number of experts served by the mirror (0 = unusable, main copy only).
+  size_t open_mirror(const std::string &dir, const std::vector<std::string> &shards, std::string *err = nullptr) {
+    std::ifstream idx(dir + "/mirror_subset.tsv");
+    if (!idx) { if (err) *err = "no mirror_subset.tsv in " + dir; return 0; }
+    std::vector<int> fds;
+    for (const std::string &path : shards) {
+      const size_t sl = path.find_last_of('/');
+      const std::string base = sl == std::string::npos ? path : path.substr(sl + 1);
+      const int fd = ::open((dir + "/" + base).c_str(), O_RDONLY);
+      struct stat sp, sm;
+      if (fd < 0 || ::stat(path.c_str(), &sp) || ::fstat(fd, &sm) || sp.st_size != sm.st_size) {
+        if (fd >= 0) ::close(fd);
+        for (int f : fds) if (f >= 0) ::close(f);
+        if (err) *err = "mirror shard " + base + " missing or differs in size";
+        return 0;
+      }
+      fds.push_back(fd);
+    }
+    for (const std::string &path : shards) {
+      const size_t sl = path.find_last_of('/');
+      mirror_fds_dir_.push_back(::open((dir + "/" + (sl == std::string::npos ? path : path.substr(sl + 1))).c_str(), O_RDONLY | O_DIRECT));
+    }
+    int l, e;
+    while (idx >> l >> e) mirror_set_.insert(detail::key(l, e));
+    mirror_fds_ = std::move(fds);
+    return mirror_set_.size();
+  }
+  std::atomic<uint64_t> mirror_reads{0};
   bool contains(int layer, int expert) const override {
     auto it = layers_.find(layer);
     if (it == layers_.end()) return false;
@@ -417,17 +493,38 @@ public:
     for (int k = 0; k < 3; ++k) out[k] = layers_.at(layer).p[k].per_expert;
     return true;
   }
+  // Only the planes in `mask` (bit k = plane k), concurrently.
+  ReadStatus read_planes(int layer, int expert, void *const dst[3], unsigned mask) {
+    if (!contains(layer, expert)) return ReadStatus::NotFound;
+    reads.fetch_add(1, std::memory_order_relaxed);
+    auto one = [&](int k) {
+      const Proj &p = layers_.at(layer).p[k];
+      const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
+      return read_plane(p.fd, fds_dir_[static_cast<size_t>(p.shard)], dst[k], static_cast<size_t>(p.per_expert), off);
+    };
+    std::vector<std::future<bool>> fs;
+    int last = -1;
+    for (int k = 0; k < 3; ++k) if (mask >> k & 1u) last = k;
+    bool ok = true;
+    for (int k = 0; k < 3; ++k)
+      if ((mask >> k & 1u) && k != last) fs.push_back(std::async(std::launch::async, one, k));
+    if (last >= 0) ok = one(last);
+    for (auto &f : fs) ok = f.get() && ok;
+    return ok ? ReadStatus::Ok : ReadStatus::IoError;
+  }
+
   ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
     reads.fetch_add(1, std::memory_order_relaxed);
     if (!contains(layer, expert)) return ReadStatus::NotFound;
+    const bool use_mirror = !mirror_fds_.empty() && mirror_set_.count(detail::key(layer, expert)) != 0;
+    if (use_mirror) mirror_reads.fetch_add(1, std::memory_order_relaxed);
     // The three planes sit at unrelated file offsets: read them concurrently (queue depth 3) instead of back to back.
     auto one = [&](int k) {
       const Proj &p = layers_.at(layer).p[k];
       const off_t off = static_cast<off_t>(p.offset + static_cast<uint64_t>(expert) * p.per_expert);
-      if (!detail::pread_all(p.fd, dst[k], static_cast<size_t>(p.per_expert), off)) return false;
-      // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
-      if (drop_page_cache) ::posix_fadvise(p.fd, off, static_cast<off_t>(p.per_expert), POSIX_FADV_DONTNEED);
-      return true;
+      const int fd = use_mirror ? mirror_fds_[static_cast<size_t>(p.shard)] : p.fd;
+      const int fdd = use_mirror ? mirror_fds_dir_[static_cast<size_t>(p.shard)] : fds_dir_[static_cast<size_t>(p.shard)];
+      return read_plane(fd, fdd, dst[k], static_cast<size_t>(p.per_expert), off);
     };
     auto f1 = std::async(std::launch::async, one, 1);
     auto f2 = std::async(std::launch::async, one, 2);
@@ -439,10 +536,50 @@ public:
   }
 
 private:
-  struct Proj { int fd = -1; uint64_t offset = 0, per_expert = 0, n_experts = 0; };
+  // The arena is the DDR tier; keeping the same bytes in the page cache would double-count them and evict it.
+  bool read_plane(int fd, int fd_dir, void *dst, size_t len, off_t off) {
+    if (use_direct && fd_dir >= 0 && len % 4096 == 0 && static_cast<uint64_t>(off) % 4096 == 0 && reinterpret_cast<uintptr_t>(dst) % 4096 == 0 &&
+        detail::pread_all(fd_dir, dst, len, off)) {
+      direct_planes.fetch_add(1, std::memory_order_relaxed);
+      return true;
+    }
+    if (!detail::pread_all(fd, dst, len, off)) return false;
+    buffered_planes.fetch_add(1, std::memory_order_relaxed);
+    if (drop_page_cache) ::posix_fadvise(fd, off, static_cast<off_t>(len), POSIX_FADV_DONTNEED);
+    return true;
+  }
+  struct Proj { int fd = -1; uint64_t offset = 0, per_expert = 0, n_experts = 0; int shard = 0; };
   struct Layer { Proj p[3]; };
-  std::vector<int> fds_;
+  std::vector<int> fds_, fds_dir_;
+  std::vector<int> mirror_fds_, mirror_fds_dir_;
+  std::unordered_set<uint64_t> mirror_set_;
   std::unordered_map<int, Layer> layers_;
+};
+
+// Experts held by BOTH the offload store (one drive) and the main model (another drive): each read is split by plane across the two
+// drives so both work on every miss. Reads alternate between "gate from the model, up+down from the store" and "gate+up from the model,
+// down from the store" so each drive averages 1.5 planes per expert.
+class SplitSource final : public ExpertSource {
+public:
+  std::atomic<uint64_t> split_reads{0}, fallbacks{0};
+  SplitSource(OffloadStore &store, ModelReader &model) : store_(store), model_(model) {}
+  bool contains(int layer, int expert) const override { return store_.contains(layer, expert) && model_.contains(layer, expert); }
+  bool plane_bytes(int layer, int expert, uint64_t out[3]) const override { return store_.plane_bytes(layer, expert, out); }
+  ReadStatus read_expert(int layer, int expert, void *const dst[3]) override {
+    const unsigned model_mask = (n_.fetch_add(1, std::memory_order_relaxed) & 1u) ? 0b011u : 0b001u;
+    const unsigned store_mask = 0b111u & ~model_mask;
+    auto side = std::async(std::launch::async, [&] { return model_.read_planes(layer, expert, dst, model_mask); });
+    const ReadStatus a = store_.read_planes(layer, expert, dst, store_mask);
+    const ReadStatus b = side.get();
+    split_reads.fetch_add(1, std::memory_order_relaxed);
+    if (a == ReadStatus::Ok && b == ReadStatus::Ok) return ReadStatus::Ok;
+    fallbacks.fetch_add(1, std::memory_order_relaxed);
+    return model_.read_expert(layer, expert, dst);
+  }
+private:
+  OffloadStore &store_;
+  ModelReader &model_;
+  std::atomic<uint64_t> n_{0};
 };
 
 // ---------------------------------------------------------------------------------------------------- arena
@@ -486,6 +623,38 @@ public:
   void populated(int layer, int expert) { if (after_populate) after_populate(layer, expert); }
   void transient_populated(int layer, int expert) { if (after_transient) after_transient(layer, expert); }
   // Return one expert's pages to the OS; the slot reads as zeros until it is populated again.
+  // Default on (MOESTREAM_OFFLOAD_RETARGET=0 disables): hand a victim's already-populated pages to the expert that replaces it instead of
+  // freeing them (madvise) and faulting + zeroing fresh ones. mremap(MREMAP_DONTUNMAP) moves the page-table entries of each plane to
+  // the new expert's address and leaves an empty anonymous mapping (same VMA flags, e.g. NOHUGEPAGE) behind. The caller holds the
+  // arena lock exactly as for evict(). Returns false (nothing moved, nothing freed) when a plane cannot be moved.
+  bool retarget(int from_layer, int from_expert, int to_layer, int to_expert) {
+#ifdef MREMAP_DONTUNMAP
+    for (int k = 0; k < 3; ++k) {
+      const Map &a = map(from_layer, k), &b = map(to_layer, k);
+      if (!a.base || !b.base) return false;
+    }
+    if (before_evict) before_evict(from_layer, from_expert);
+    for (int k = 0; k < 3; ++k) {
+      const Map &a = map(from_layer, k), &b = map(to_layer, k);
+      char *src = a.base + static_cast<uint64_t>(from_expert) * a.stride;
+      char *dst = b.base + static_cast<uint64_t>(to_expert) * b.stride;
+      const size_t len = static_cast<size_t>(std::min(a.stride, b.stride)); // planes of different layers can differ in size (mixed quants)
+      void *r = ::mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, dst);
+      if (r != dst) { // this plane and the rest: free the victim's pages so the invariant (non-resident = no pages) holds
+        for (int j = k; j < 3; ++j) {
+          const Map &m = map(from_layer, j);
+          ::madvise(m.base + static_cast<uint64_t>(from_expert) * m.stride, static_cast<size_t>(m.stride), MADV_DONTNEED);
+        }
+        return true;
+      }
+      if (a.stride > len) ::madvise(src + len, static_cast<size_t>(a.stride) - len, MADV_DONTNEED);
+    }
+    return true;
+#else
+    (void)from_layer; (void)from_expert; (void)to_layer; (void)to_expert;
+    return false;
+#endif
+  }
   void evict(int layer, int expert) {
     if (before_evict) before_evict(layer, expert);
     // MOESTREAM_OFFLOAD_EVICT=free: MADV_FREE instead of MADV_DONTNEED. The pages stay mapped until the kernel needs them, so the next
@@ -576,6 +745,10 @@ public:
     int layer = 0;
   };
 
+  // Page-reusing eviction (see docs/offload-retarget.md). Default on: this class only exists when SSD offload is active.
+  // MOESTREAM_OFFLOAD_RETARGET=0 restores madvise(DONTNEED) eviction.
+  bool retarget_ = [] { const char *e = std::getenv("MOESTREAM_OFFLOAD_RETARGET"); return !(e && e[0] == '0'); }();
+
   // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
   Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
     Plan p;
@@ -595,8 +768,12 @@ public:
       }
       ++p.r.misses;
       if (cache_.config().policy == ExpertCache::Policy::Static) { ++p.r.not_cached; continue; }
+      bool paired = false;
       for (const ExpertKey &v : a.victims) {
-        if (!defer_evict_if_loading(v)) arena_.evict(v.layer, v.expert);
+        if (!defer_evict_if_loading(v)) {
+          if (retarget_ && a.inserted && !paired && arena_.retarget(v.layer, v.expert, layer, ids[i])) paired = true;
+          else arena_.evict(v.layer, v.expert);
+        }
         ++p.r.evictions;
       }
       if (!a.inserted) { ++p.r.errors; continue; }

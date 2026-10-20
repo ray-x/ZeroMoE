@@ -16,6 +16,7 @@
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
@@ -306,6 +307,11 @@ struct ArchitectureConfig {
   // this key, since it's array-typed here). Empty for every other family;
   // glm5next_is_kda_layer() below is the only correct way to read it.
   std::vector<int64_t> glm5next_head_count_kv;
+  // BailingMoE3 uses the same 0=KDA / nonzero=MLA layer map, with a
+  // distinct KDA projection layout and a per-head gate after MLA.
+  std::vector<int64_t> bailingmoe3_head_count_kv;
+  int expert_group_count = 0;
+  int expert_group_used_count = 0;
   int ssm_conv_kernel = 0;        // ssm.conv_kernel (KDA short-conv width)
   int kda_head_dim = 0;           // kda.head_dim (per-head KDA dim)
   float kda_gate_lower_bound = 0.0f; // kda.gate_lower_bound (required, < 0;
@@ -392,6 +398,18 @@ inline bool glm5next_is_kda_layer(const ArchitectureConfig &config, int layer_id
          config.glm5next_head_count_kv[(size_t)layer_idx] == 0;
 }
 
+inline bool bailingmoe3_is_kda_layer(const ArchitectureConfig &config, int layer_idx) {
+  return layer_idx >= 0 &&
+         (size_t)layer_idx < config.bailingmoe3_head_count_kv.size() &&
+         config.bailingmoe3_head_count_kv[(size_t)layer_idx] == 0;
+}
+
+inline bool hybrid_is_kda_layer(const ArchitectureConfig &config, int layer_idx) {
+  return config.bailingmoe3_head_count_kv.empty()
+             ? glm5next_is_kda_layer(config, layer_idx)
+             : bailingmoe3_is_kda_layer(config, layer_idx);
+}
+
 // Qwen4Exp layer-type query: true when layer l is a recurrent GDN layer,
 // false for a full-attention layer. Prefers the GGUF's explicit
 // attention.recurrent_layers array; falls back to the
@@ -472,6 +490,21 @@ public:
   // completion handling.
   std::vector<int> mirror_shard_fds;
   std::vector<bool> mirror_shard_direct_io;
+
+  // Sparse-mirror index (gguf_tool mirror-subset): when <mirror_dir>/mirror_subset.tsv exists, the mirror holds ONLY
+  // the listed (layer, expert) pairs; every other range in it is a hole. resolve_replica() then sends each expert to
+  // exactly one drive. Empty = a full mirror, and the old behaviour (including the intra-expert split) is unchanged.
+  std::unordered_set<uint64_t> mirror_subset;
+  bool mirror_is_subset = false;
+  static uint64_t mirror_key(int layer, int expert) {
+    return ((uint64_t)(uint32_t)layer << 32) | (uint32_t)expert;
+  }
+  // `replica` is what the caller asked for (0 primary, 1 mirror, -1 split). With a sparse mirror the answer depends
+  // on where this expert actually lives.
+  int resolve_replica(int layer, int expert, int replica) const {
+    if (!mirror_is_subset || replica == 0) return replica;
+    return mirror_subset.count(mirror_key(layer, expert)) ? 1 : 0;
+  }
 
   // One cuFile handle per shard_fds, registered by enable_cufile() below
   // (empty/all-invalid until then). Index-matched to shard_fds/
@@ -747,6 +780,18 @@ public:
       register_mirror_fd(fd);  // perf_timer.hpp -- lets submit_and_wait attribute real read bytes per drive
       n_ok++;
     }
+    mirror_subset.clear();
+    mirror_is_subset = false;
+    {
+      std::ifstream idx(mirror_dir + (mirror_dir.back() == '/' ? "" : "/") + "mirror_subset.tsv");
+      if (idx) {
+        int l, e;
+        while (idx >> l >> e) mirror_subset.insert(mirror_key(l, e));
+        mirror_is_subset = true;
+        LOG_STREAM_INFO() << "[MIRROR] Sparse mirror: " << mirror_subset.size()
+                          << " expert(s) live on the mirror; all others are read from the primary.\n";
+      }
+    }
     LOG_STREAM_INFO() << "[MIRROR] Second replica: " << n_ok << "/" << shard_paths.size()
                       << " shard(s) opened from " << mirror_dir
                       << " -- expert reads can now stripe across both devices "
@@ -770,16 +815,13 @@ public:
   }
 
   // Opt-in: reopen every shard's fd with O_DIRECT, one shard at a time,
-  // ONLY if (a) this platform supports O_DIRECT at all (Linux; this
-  // project's only supported build target per CLAUDE.md, but guarded
-  // anyway rather than assumed) and (b) this file's own
-  // general.alignment KV value (written by tools/gguf_tool pack,
-  // defaults to 32 for any file that was never repacked) is at least
-  // `min_alignment` -- a plain, un-repacked GGUF has 32-byte tensor
-  // offsets, which can never satisfy O_DIRECT's block-alignment
-  // requirement, so direct I/O is refused outright for such a file
-  // rather than silently attempting misaligned reads. Even when the
-  // alignment check passes, each shard gets a real test read (not just
+  // ONLY if this platform supports O_DIRECT (Linux; guarded rather
+  // than assumed). When allow_unaligned_ranges is true, GGUF tensor
+  // offsets need not meet O_DIRECT's block alignment:
+  // pread_direct_aware and io_uring_backend round each read window to
+  // min_alignment and stage only the requested bytes. Keep this false
+  // for cuFile, whose device-read path has separate offset constraints.
+  // Each shard gets a real test read (not just
   // a successful open()) before being trusted -- some filesystems
   // (network mounts, some overlay/container filesystems, tmpfs) accept
   // O_DIRECT at open() but reject the actual read with EINVAL; a shard
@@ -789,7 +831,8 @@ public:
   // caller should have to work around if it doesn't pan out for a
   // given filesystem. Returns the number of shards that ended up with
   // real O_DIRECT active.
-  int enable_direct_io(uint64_t min_alignment = 4096) {
+  int enable_direct_io(uint64_t min_alignment = 4096,
+                       bool allow_unaligned_ranges = false) {
     shard_direct_io.assign(shard_fds.size(), false);
 #ifndef __linux__
     (void)min_alignment; // only referenced in the Linux branch below
@@ -800,17 +843,21 @@ public:
 #else
     auto it = kv_uint.find("general.alignment");
     uint64_t file_alignment = (it != kv_uint.end()) ? it->second : 32;
-    if (file_alignment < min_alignment) {
-      LOG_STREAM_WARN() << "[DIRECT-IO] This model's general.alignment="
-                        << file_alignment << " is below the required "
-                        << min_alignment
-                        << " bytes -- this file was "
-                           "never repacked with tools/gguf_tool pack (or used "
-                           "a smaller --align). "
-                           "Direct I/O disabled, all reads stay buffered.\n";
+    direct_io_alignment = min_alignment;
+    if (file_alignment < min_alignment && !allow_unaligned_ranges) {
+      LOG_STREAM_WARN()
+          << "[DIRECT-IO] GGUF tensor alignment=" << file_alignment
+          << " is below the required " << min_alignment
+          << " bytes for this read path; direct I/O disabled.\n";
       return 0;
     }
-    direct_io_alignment = file_alignment;
+    if (file_alignment < min_alignment) {
+      LOG_STREAM_INFO()
+          << "[DIRECT-IO] GGUF tensor alignment=" << file_alignment
+          << " bytes; using " << direct_io_alignment
+          << "-byte aligned read windows with scratch staging for unaligned "
+             "tensor ranges.\n";
+    }
 
     void *test_buf = nullptr;
     if (posix_memalign(&test_buf, (size_t)direct_io_alignment,

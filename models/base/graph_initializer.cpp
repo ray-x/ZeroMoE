@@ -130,9 +130,13 @@ static void verify_tensor_dimensions(StreamingEngine &engine) {
   // NONE of the absorbed-MLA tensors below -- every check would silently
   // skip (absent-tensor branch), defeating the audit. Pick the first DSA
   // (full-attention) layer instead.
-  if (detect_model_family(file) == ModelFamily::GLM5NEXT) {
+  if (detect_model_family(file) == ModelFamily::GLM5NEXT ||
+      detect_model_family(file) == ModelFamily::BailingMoE3) {
     for (int i = 0; i < c.n_layers; ++i) {
-      if (!glm5next_is_kda_layer(c, i)) { l = i; break; }
+      const bool kda = detect_model_family(file) == ModelFamily::GLM5NEXT
+                           ? glm5next_is_kda_layer(c, i)
+                           : bailingmoe3_is_kda_layer(c, i);
+      if (!kda) { l = i; break; }
     }
   }
   std::string p = "blk." + std::to_string(l) + ".";
@@ -811,6 +815,69 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
                       << " key_length=" << c.glm5next_indexer_key_length
                       << " top_k=" << c.glm5next_indexer_top_k
                       << " kpool=" << c.glm5next_indexer_kpool << "\n";
+  }
+
+  if (fam == ModelFamily::BailingMoE3) {
+    c.bailingmoe3_head_count_kv = file.get_config_int_array("attention.head_count_kv");
+    if (c.bailingmoe3_head_count_kv.size() < static_cast<size_t>(n_layer_all)) {
+      LOG_STREAM_ERROR() << "[BAILINGMOE3] attention.head_count_kv must have "
+                         << n_layer_all << " entries, got "
+                         << c.bailingmoe3_head_count_kv.size() << "\n";
+      return false;
+    }
+    int n_kda = 0;
+    for (int l = 0; l < c.n_layers; ++l)
+      if (bailingmoe3_is_kda_layer(c, l)) ++n_kda;
+    if (n_kda == 0) {
+      LOG_STREAM_ERROR() << "[BAILINGMOE3] expected at least one KDA layer\n";
+      return false;
+    }
+    c.ssm_conv_kernel = file.get_config_int("ssm.conv_kernel", 0);
+    c.kda_head_dim = file.get_config_int("kda.head_dim", 0);
+    c.kda_gate_lower_bound = file.get_config_float("kda.gate_lower_bound", 0.0f);
+    c.expert_group_count = file.get_config_int("expert_group_count", 0);
+    c.expert_group_used_count = file.get_config_int("expert_group_used_count", 0);
+    if (c.ssm_conv_kernel <= 1 || c.kda_head_dim <= 0 ||
+        !(c.kda_gate_lower_bound < 0.0f) ||
+        file.get_config_int("kda.safe_gate", 0) != 1 ||
+        c.hidden <= 0 || c.n_heads <= 0 || c.qk_nope <= 0 ||
+        c.qk_rope <= 0 || c.kv_lora <= 0 || c.v_head <= 0 ||
+        c.topk <= 0 || c.topk > c.n_experts ||
+        c.expert_group_count <= 0 ||
+        c.n_experts % c.expert_group_count != 0 ||
+        c.expert_group_used_count <= 0 ||
+        c.expert_group_used_count > c.expert_group_count) {
+      LOG_STREAM_ERROR() << "[BAILINGMOE3] invalid KDA or expert group metadata\n";
+      return false;
+    }
+    for (int l = 0; l < c.n_layers; ++l) {
+      const std::string p = "blk." + std::to_string(l) + ".";
+      const bool kda = bailingmoe3_is_kda_layer(c, l);
+      const std::vector<const char *> names = kda
+          ? std::vector<const char *>{"attn_q.weight", "attn_k.weight",
+                                      "attn_v.weight", "ssm_conv1d_q.weight",
+                                      "ssm_conv1d_k.weight", "ssm_conv1d_v.weight",
+                                      "ssm_f_a.weight", "ssm_g_a.weight",
+                                      "ssm_beta.weight", "ssm_a", "ssm_dt.bias",
+                                      "ssm_norm.weight", "attn_output.weight"}
+          : std::vector<const char *>{"attn_q_a.weight", "attn_q_a_norm.weight",
+                                      "attn_q_b.weight", "attn_kv_a_mqa.weight",
+                                      "attn_kv_a_norm.weight", "attn_k_b.weight",
+                                      "attn_v_b.weight", "attn_gate.weight",
+                                      "attn_output.weight"};
+      for (const char *name : names) {
+        if (!file.tensors.count(p + name)) {
+          LOG_STREAM_ERROR() << "[BAILINGMOE3] missing tensor " << p << name
+                             << "\n";
+          return false;
+        }
+      }
+    }
+    set_swiglu_clamp_fused(true);
+    LOG_STREAM_INFO() << "[BAILINGMOE3] " << n_kda << " KDA and "
+                      << c.n_layers - n_kda << " MLA layers; "
+                      << c.expert_group_used_count << "/"
+                      << c.expert_group_count << " expert groups\n";
   }
 
   // ---------- Qwen4Exp (Qwen3.8-Flash-Next): hybrid GDN + full-attention
@@ -1732,6 +1799,23 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         dense_preload_manifest.push_back(p + "ple_norm_query.weight");
         dense_preload_manifest.push_back(p + "ple_norm_conv.weight");
         dense_preload_manifest.push_back(p + "ple_conv1d.weight");
+      }
+    } else if (fam == ModelFamily::BailingMoE3) {
+      if (bailingmoe3_is_kda_layer(c, l)) {
+        for (const char *name : {"attn_q.weight", "attn_k.weight",
+                                 "attn_v.weight", "ssm_conv1d_q.weight",
+                                 "ssm_conv1d_k.weight", "ssm_conv1d_v.weight",
+                                 "ssm_f_a.weight", "ssm_g_a.weight",
+                                 "ssm_beta.weight", "ssm_a", "ssm_dt.bias",
+                                 "ssm_norm.weight", "attn_output.weight"})
+          dense_preload_manifest.push_back(p + name);
+      } else {
+        for (const char *name : {"attn_q_a.weight", "attn_q_a_norm.weight",
+                                 "attn_q_b.weight", "attn_kv_a_mqa.weight",
+                                 "attn_kv_a_norm.weight", "attn_k_b.weight",
+                                 "attn_v_b.weight", "attn_gate.weight",
+                                 "attn_output.weight"})
+          dense_preload_manifest.push_back(p + name);
       }
     } else if (fam == ModelFamily::GLM5NEXT) {
       // GLM 5.3 Flash hybrid: per-layer tensor set depends on the layer

@@ -43,7 +43,8 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
                           const ExpertLocation *location, const float *input,
                           const GGUFTensor &gate_meta,
                           const GGUFTensor &up_meta, int S, int D,
-                          int moe_inter, GpuTopology *topology);
+                          int moe_inter, GpuTopology *topology,
+                          const float *shared_device_input = nullptr);
 
 void expert_ffn_gpu_finish_stage1(
     GpuExpertScratch &scratch, const ExpertLocation *location,

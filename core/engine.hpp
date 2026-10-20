@@ -1488,10 +1488,11 @@ public:
         if (file_align < ALIGN) {
             std::ostringstream o;
             o << "[ALIGN-WARN] general.alignment=" << file_align << " (< " << ALIGN
-              << "): O_DIRECT will be DISABLED for every shard, so all expert reads fall back to "
-                 "BUFFERED I/O through the page cache -- slower, and it makes the page cache compete "
-                 "with the host RAM expert tier for memory. Fix: repack with "
-                 "`tools/gguf_tool pack --align 4096`.\n";
+              << "): tensor ranges need aligned-window staging for O_DIRECT; "
+                 "the Ling bailingmoe3 loader can use it when cuFile is off, "
+                 "while other architectures keep the aligned-file gate. "
+                 "Repacking with `tools/gguf_tool pack --align 4096` can "
+                 "remove staging copies.\n";
             emit(o.str());
         }
 
@@ -1882,15 +1883,34 @@ public:
             // This accounts for the realloc peak (old + new), so a growth
             // cannot transiently exceed host_ram_gb even when the old buffer
             // is still protected by an async reader.
+            bool ledgered = true;
             if (!MemoryGuard::try_reserve_host_bytes(total)) {
                 perf().n_mem_guard_alloc_refused.fetch_add(1, std::memory_order_relaxed);
-                LOG_WARN("[MEM-GUARD] RAM slab growth refused: %.2f MB (reserved=%.2f GB, "
-                         "budget=%.2f GB); retaining the existing slab\n",
-                         total / 1e6,
-                         MemoryGuard::reserved_host_bytes() / 1e9,
-                         MemoryGuard::host_budget_bytes() / 1e9);
-                PERF_END(alloc, t_host_alloc);
-                return;
+                // Every caller writes `total` bytes into slab_buffer right
+                // after this returns and none can report failure, so a
+                // refused growth that keeps the old, smaller slab overruns it
+                // (SIGSEGV in a 426-token GLM-5.3 prefill). The guard's 20 GiB
+                // admission reserve is far above what a few-MB slab needs;
+                // grow outside the ledger while the kernel still has a hard
+                // 2 GiB of MemAvailable, and only keep the old slab when it
+                // is already large enough or the machine is genuinely out.
+                size_t avail_kb = 0;
+                if (FILE *mf = fopen("/proc/meminfo", "r")) {
+                    char line[128];
+                    while (fgets(line, sizeof line, mf))
+                        if (sscanf(line, "MemAvailable: %zu kB", &avail_kb) == 1)
+                            break;
+                    fclose(mf);
+                }
+                if (avail_kb < 2ull * 1024 * 1024) {
+                    LOG_ERROR("[MEM-GUARD] RAM slab growth refused: %.2f MB (reserved=%.2f GB, "
+                              "budget=%.2f GB, MemAvailable=%.2f GB); slab stays too small\n",
+                              total / 1e6, MemoryGuard::reserved_host_bytes() / 1e9,
+                              MemoryGuard::host_budget_bytes() / 1e9, avail_kb / 1e6);
+                    PERF_END(alloc, t_host_alloc);
+                    return;
+                }
+                ledgered = false;
             }
 
             // Allocate the replacement while the old slab remains valid.  If
@@ -1899,7 +1919,7 @@ public:
             void* nb = nullptr;
             const int pmerr = posix_memalign(&nb, 4096, total);
             if (pmerr != 0 || !nb) {
-                MemoryGuard::release_host_bytes(total);
+                if (ledgered) MemoryGuard::release_host_bytes(total);
                 LOG_ERROR("[RAM] posix_memalign(%.2f MB) failed (errno=%d) -- this slot is "
                           "left unchanged so the caller can keep using its old slab.\n",
                           total / 1e6, pmerr);
@@ -1941,7 +1961,7 @@ public:
                 }
                 slot.slab_buffer = static_cast<uint8_t*>(nb);
                 slot.slab_capacity = total;
-                slot.host_reservation_bytes = total;
+                slot.host_reservation_bytes = ledgered ? total : 0;
             }
             if (claimed && !claimed_deferred) {
                 free(claimed);
@@ -2175,9 +2195,13 @@ public:
                                      io_uring_backend::ReadRequest* out_reqs,
                                      int& out_n, size_t& out_total,
                                      int replica = 0) {
-        // A split read needs the mirror to hold this expert's down slice.
+        // A down-only mirror (mirror_coverage_file) can serve a split read only for the
+        // experts whose down slice it holds.
         if (replica == REPLICA_SPLIT && !mirror_split_allowed(layer_idx, expert_id))
             replica = 0;
+        // A whole-expert sparse mirror (mirror_subset.tsv) holds only some experts: pick the
+        // one drive that has this one.
+        replica = model_file.resolve_replica(layer_idx, expert_id, replica);
         // Projection-compact graph arenas have no packed per-expert slab, so
         // point the three startup requests directly at their final planes.
         // Runtime misses are not expected for a complete immutable graph

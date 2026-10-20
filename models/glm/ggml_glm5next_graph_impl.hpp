@@ -73,6 +73,7 @@ struct RouteTap;
 
 // ---- function declarations (defined in ggml_qwen4exp_graph_*.cpp) ----
 bool env_enabled();
+bool graph_enabled_for(const StreamingEngine &engine);
 bool offload_async();
 int offload_first_layer();
 bool offload_layer(int layer);
@@ -95,7 +96,9 @@ bool early_ready_wanted();
 bool split_load_wanted();
 // Number of resident cold experts per layer the lane may run on a second CUDA stream (0 = off).
 int gpu_assist_slots();
-int gpu_assist2_device();
+// The CUDA device that is not the trunk (core) device: hot experts and the second assist ring live there.
+int second_gpu_device(int core_device);
+int gpu_assist2_device(int core_device);
 int gpu_assist2_slots();
 // True when every routed-expert plane of `layer` has a type worth assisting on the GPU (see settings).
 bool gpu_assist_layer_ok(const FullGraph &g, int layer);
@@ -132,10 +135,12 @@ ggml_tensor *stage_hot_mask(FullGraph &g, ggml_context *ctx, int layer);
 bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, int l);
 ggml_tensor *stage_ring_tensor(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, int plane);
 ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, ggml_tensor *cold_ids, ggml_tensor *route_ids);
+ggml_tensor *stage_post_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, ggml_tensor *route_ids);
 void *alloc_expert_source(FullGraph &g, size_t bytes);
 bool graph_dense_weight_name(const std::string &name);
 bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity, size_t &used, ggml_tensor *t, const void *src, size_t src_bytes);
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx, const std::string &name);
+ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx, const std::string &name);
 size_t device_expert_bytes(const FullGraph &g);
 size_t dense_arena_bytes(const FullGraph &g);
 bool init_dense_arena(FullGraph &g);
@@ -179,6 +184,7 @@ ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer, bool m
 ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int plane);
 bool prepare_partial_hot1(FullGraph &g, ggml_context *ctx, int layer);
 void assign_gpu1_hot(FullGraph &g, double gib);
+bool preload_partial_hot1(FullGraph &g);
 ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot, bool mask);
 bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p);
 bool ensure_dynamic_upload_worker(FullGraph &g);
@@ -195,6 +201,14 @@ ggml_tensor *hc_affine(ggml_context *ctx, ggml_tensor *x, ggml_tensor *scale, gg
 ggml_tensor *hc_mean(FullGraph &g, ggml_context *ctx, ggml_tensor *x);
 ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t);
 bool fused_hc_op(char which);
+ggml_tensor *build_bailing_mla(FullGraph &g, ggml_context *ctx,
+                                ggml_tensor *cur, int layer,
+                                ggml_tensor *wqa, ggml_tensor *wqan,
+                                ggml_tensor *wqb, ggml_tensor *wkva,
+                                ggml_tensor *wkvan, ggml_tensor *wkb,
+                                ggml_tensor *wvb, ggml_tensor *wo,
+                                ggml_tensor *wgate, ggml_tensor **kv_out,
+                                ggml_tensor *kv_cache);
 ggml_tensor *hc_post(FullGraph &g, ggml_context *ctx, ggml_tensor *x, ggml_tensor *residual, ggml_tensor *post, ggml_tensor *comb);
 ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wq, ggml_tensor *wk, ggml_tensor *wv, ggml_tensor *cq, ggml_tensor *ck, ggml_tensor *cv, ggml_tensor *fa, ggml_tensor *fb, ggml_tensor *ga, ggml_tensor *gb, ggml_tensor *beta_w, ggml_tensor *a, ggml_tensor *dt, ggml_tensor *norm_w, ggml_tensor *out_w, ggml_tensor *hist_in, ggml_tensor *state_in, ggml_tensor **state_out, ggml_tensor **hist_out);
 Glm5nextIndexerLayer *glm5next_indexer_state(FullGraph &g, int layer);
@@ -203,6 +217,9 @@ ggml_tensor *glm5next_indexer_pool(ggml_context *ctx, ggml_tensor *keys, ggml_te
 bool build_glm5next_indexer_prefill(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer);
 bool build_glm5next_indexer_decode(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, ggml_tensor *qr, int layer, ggml_tensor **sel_out, ggml_tensor **mask_out);
 ggml_tensor *build_dsa(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wqa, ggml_tensor *wqan, ggml_tensor *wqb, ggml_tensor *wkva, ggml_tensor *wkvan, ggml_tensor *wkb, ggml_tensor *wvb, ggml_tensor *wo, ggml_tensor **kv_out, ggml_tensor *kv_cache = nullptr, ggml_tensor **prev_indexer_selection = nullptr, ggml_tensor **prev_indexer_mask = nullptr);
+extern bool g_skip_indexer_weights; // GLM_DSA graph: the DSA indexer is not part of the (dense) graph
+inline bool glm_family(ModelFamily f) { return f == ModelFamily::GLM5NEXT || f == ModelFamily::GLM_DSA; }
+ggml_tensor *build_glm_dsa_attn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *wqa, ggml_tensor *wqan, ggml_tensor *wqb, ggml_tensor *wkva, ggml_tensor *wkvan, ggml_tensor *wkb, ggml_tensor *wvb, ggml_tensor *wo, ggml_tensor **kv_out, ggml_tensor *kv_cache);
 EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer, ggml_tensor *cur, ggml_tensor *ids, ggml_tensor *weights, ggml_tensor *cold_map, ggml_tensor *cold_mask, const moe_routed::ExpertWeights &cold_w, float clamp = 0.0f);
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur, int layer, ggml_tensor *forced_ids = nullptr);
 bool build_graph(FullGraph &g);

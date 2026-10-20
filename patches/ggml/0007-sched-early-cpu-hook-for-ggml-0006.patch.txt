@@ -1,0 +1,57 @@
+--- a/src/ggml-backend.cpp	2026-10-19 10:58:23.186804892 +1100
++++ b/src/ggml-backend.cpp	2026-10-19 16:48:27.313685455 +1100
+@@ -1692,6 +1692,17 @@
+     return true;
+ }
+ 
++#if defined(__GNUC__) && !defined(_WIN32)
++extern "C" int moestream_ggml_sched_early_cpu(
++    ggml_backend_t, ggml_cgraph *, int64_t *, int64_t *) __attribute__((weak));
++extern "C" {
++GGML_BACKEND_API int ggml_backend_sched_early_cpu_supported();
++int ggml_backend_sched_early_cpu_supported() {
++    return moestream_ggml_sched_early_cpu != nullptr ? 1 : 0;
++}
++}
++#endif
++
+ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+     GGML_ASSERT(sched);
+     struct ggml_backend_sched_split * splits = sched->splits;
+@@ -1707,9 +1718,25 @@
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        // Private-buffer early-ready CPU graphs start as soon as their input
++        // event is ready, without draining unrelated work on the previous
++        // backend; the callback owns the CPU graph and publishes its result.
++        bool early_cpu = false;
++#if defined(__GNUC__) && !defined(_WIN32)
++        if (!sched->callback_eval && split->n_inputs == 0 &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) ==
++                GGML_BACKEND_DEVICE_TYPE_CPU &&
++            moestream_ggml_sched_early_cpu != nullptr) {
++            int64_t early_wait_us = 0, early_compute_us = 0;
++            early_cpu = moestream_ggml_sched_early_cpu(
++                split_backend, &split->graph, &early_wait_us,
++                &early_compute_us) == 1;
++        }
++#endif
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        if (!early_cpu && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+@@ -1860,7 +1887,8 @@
+         }
+ 
+         if (!sched->callback_eval) {
+-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            enum ggml_status ec = early_cpu ? GGML_STATUS_SUCCESS :
++                ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }

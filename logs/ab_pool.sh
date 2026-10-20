@@ -1,0 +1,10 @@
+#!/bin/bash
+cd /home/ray/work/moestream-glm53
+run() { local N=$1; shift
+  sed -i "s/glm53_dsa_graph2gpu_[a-z0-9]*\./glm53_dsa_graph2gpu_$N./g" logs/glm53_dsa_graph2gpu.toml logs/run_dsa_graph2gpu_426.sh
+  env MOESTREAM_GLM5NEXT_PILOT_STAGE=8 MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1 MOESTREAM_GLM5NEXT_PILOT_PREFETCH=8 MOESTREAM_GLM5NEXT_PILOT_COPY=0 MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD=2 "$@" ./logs/run_dsa_graph2gpu_426.sh > logs/glm53_dsa_graph2gpu_$N.run.out 2>&1
+  local L=logs/glm53_dsa_graph2gpu_$N.log
+  echo "$N: $(grep -h 'Rates:' $L | cut -c26-190) | step $(grep 'FULL-DECODE-TIME' $L | awk -F'total=' '{split($2,a," "); if(NR>1){s+=a[1]; n++}} END {if(n) printf "%.0f ms", s/n}') | $(grep -cE 'MEM-GUARD.*BLOCKING' $L) memguard blocks"
+}
+run pool60 OFFLOAD_DDR_GIB=60
+run pool64 OFFLOAD_DDR_GIB=64

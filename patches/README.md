@@ -29,6 +29,8 @@ it does not carry a modified copy of ggml.
 | `0003-ggml-cuda-graph-capture` | cuda-stream-bridge, cuda-conditional-graph-harvest, cuda-graph-first-call-capture | `ggml-cuda/ggml-cuda.cu` |
 | `0004-ggml-cuda-external-pointer-padding` | (unchanged) | `ggml-cuda.cu`, `mmq.cu`, `mmvq.cu` |
 | `0005-ggml-backend-static-weight-copy` | backend-static-weight-copy-count | `ggml-backend.cpp` |
+| `0011-ggml-cuda-mestream-bridge-compat` | bridge-only compatibility hunk for newer upstream context | `ggml-cuda/ggml-cuda.cu` |
+| `0012-ggml-impl-export-graph-view` | export graph view from shared ggml | `ggml-impl.h` |
 
 `ggml-host-node/0001-ggml-cuda-host-node` = cuda-host-node-bridge + cuda-host-node-parallel.
 `ggml-host-node/0002-ggml-cuda-host-node-parallel-gate` = the prefill-safe gate, re-derived from the integration fork's

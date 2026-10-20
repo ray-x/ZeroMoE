@@ -39,6 +39,8 @@ struct ExpertStoreConfig {
   std::vector<std::array<uint64_t, 3>> plane_bytes;
   std::string store_path;                 // optional expert-contiguous store
   std::vector<std::string> model_shards;  // fallback source, required
+  bool split_reads = false;               // split each read of an expert held by both the store and the model across the two drives
+  std::string mirror_dir;                 // optional sparse second copy of the model on another drive (mirror-subset)
   double ddr_gib = 40.0;
   ExpertCache::Policy policy = ExpertCache::Policy::Lru;
   double pinned_fraction = 0.5;
@@ -163,6 +165,13 @@ class ExpertStore {
     LOG_INFO("%s %s sources: store direct=%llu store buffered=%llu model buffered=%llu\n", cfg_.log_tag, why,
              (unsigned long long)store_.direct_reads(), (unsigned long long)store_.buffered_reads(),
              (unsigned long long)model_.reads.load());
+    LOG_INFO("%s %s model planes: direct=%llu buffered=%llu\n", cfg_.log_tag, why, (unsigned long long)model_.direct_planes.load(),
+             (unsigned long long)model_.buffered_planes.load());
+    if (split_)
+      LOG_INFO("%s split reads: %llu (fallbacks %llu)\n", cfg_.log_tag, (unsigned long long)split_->split_reads.load(),
+               (unsigned long long)split_->fallbacks.load());
+    if (!cfg_.mirror_dir.empty())
+      LOG_INFO("%s model reads served by the mirror: %llu\n", cfg_.log_tag, (unsigned long long)model_.mirror_reads.load());
     if (residency_ && cfg_.async_loads)
       LOG_INFO("%s %s async: demand lookups that waited on an in-flight read=%llu wait=%.1f ms\n",
                cfg_.log_tag, why, (unsigned long long)residency_->waited_experts(),
@@ -219,6 +228,17 @@ class ExpertStore {
       return fail("no model shards given");
     if (!model_.open(cfg_.model_shards, &e))
       return fail("model reader: " + e);
+    if (!cfg_.mirror_dir.empty()) {
+      std::string me;
+      const size_t n = model_.open_mirror(cfg_.mirror_dir, cfg_.model_shards, &me);
+      if (n) LOG_INFO("%s second-drive mirror %s: %zu experts read from it\n", cfg_.log_tag, cfg_.mirror_dir.c_str(), n);
+      else LOG_WARN("%s mirror %s unusable (%s); main copy only\n", cfg_.log_tag, cfg_.mirror_dir.c_str(), me.c_str());
+    }
+    if (cfg_.split_reads && store_open_) {
+      split_ = std::make_unique<SplitSource>(store_, model_);
+      sources.insert(sources.begin(), split_.get());
+      LOG_INFO("%s split reads: experts in the store are read across both drives (store + model)\n", cfg_.log_tag);
+    }
     sources.push_back(&model_);
 
     ExpertCache::Config cc;
@@ -301,6 +321,7 @@ class ExpertStore {
   OffloadStore store_;
   bool store_open_ = false;
   ModelReader model_;
+  std::unique_ptr<SplitSource> split_;
   std::unique_ptr<ExpertResidency> residency_;
   std::shared_mutex arena_mu_;
   bool pin_slots_ = false;

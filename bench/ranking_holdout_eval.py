@@ -4,17 +4,19 @@ Reads logs/perf/survey/b*.trace ("P pos" per decode token, "R layer ids..." per 
 Splits prompts into TRAIN and TEST by index (every 4th prompt is held out); builds
   base   = glm53flash_usage_combined_old_plus_survey5 (what the engine ranks with today)
   refit  = base + TRAIN decode counts (scaled by --weight)
-and reports the fraction of routes (layers 3-44) that fall outside the top-N set for each ranking on the TEST prompts."""
+and reports the fraction of routes (layers --layers) that fall outside the top-N set for each ranking on the TEST prompts."""
 import argparse, collections, glob, re
 ap = argparse.ArgumentParser()
 ap.add_argument('--n', type=int, default=4700)           # resident experts (3090 cache + 5060 Ti)
 ap.add_argument('--weight', type=float, default=1.0)
 ap.add_argument('--test-first', type=int, default=0, help='hold out every Nth prompt only among the first K prompts; all later prompts train')
+ap.add_argument('--base', default='docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt', help='usage file the engine ranks with today')
+ap.add_argument('--layers', default='3-44', help='first-last routed layer, e.g. 3-77 for GLM-5.3')
 ap.add_argument('--holdout-every', type=int, default=4)
 ap.add_argument('--write', help='write base + surveyed prompts (weight --weight) as a usage file')
 ap.add_argument('--write-train-only', action='store_true', help='with --write: use only the training split (keeps the test prompts out of the file)')
 a = ap.parse_args()
-D = 'docs/ssd-offload/data/'
+L0, L1 = (int(x) for x in a.layers.split('-'))
 def load_usage(path):
     c = collections.Counter()
     for l in open(path):
@@ -47,10 +49,10 @@ def counts(ps):
             for L, ids in tok.items():
                 for e in ids: c[(L, e)] += 1
     return c
-base = load_usage(D + 'glm53flash_usage_combined_old_plus_survey5.txt')
+base = load_usage(a.base)
 tr = counts(train)
 tot_base = sum(base.values()); tot_tr = sum(tr.values()) or 1
-def top(c): return set(k for k, _ in sorted(((k, v) for k, v in c.items() if 3 <= k[0] <= 44), key=lambda kv: -kv[1])[:a.n])
+def top(c): return set(k for k, _ in sorted(((k, v) for k, v in c.items() if L0 <= k[0] <= L1), key=lambda kv: -kv[1])[:a.n])
 refit = collections.Counter(base)
 for k, v in tr.items(): refit[k] += a.weight * v * tot_base / tot_tr   # same total mass as the base file
 test_c = counts(test); tt = sum(test_c.values())

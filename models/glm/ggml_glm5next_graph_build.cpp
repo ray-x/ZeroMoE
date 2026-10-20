@@ -3,7 +3,9 @@
 // Split out of the former single-file ggml_qwen4exp_graph.cpp; shared
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
+#include <chrono>
 #include <future>
+#include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_glm5next_graph_impl.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
@@ -200,7 +202,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
       const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
       std::shared_ptr<GpuAssistShared> shared = make_ring(shared_weak[0], assist_dev, gpu_assist_slots());
       std::shared_ptr<GpuAssistShared> shared2;
-      const int assist2_dev = gpu_assist2_device();
+      const int assist2_dev = gpu_assist2_device(g.device);
       if (assist2_dev >= 0 && assist2_dev != assist_dev && gpu_assist2_slots() > 0)
         shared2 = make_ring(shared_weak[1], assist2_dev, gpu_assist2_slots());
       if (shared && lane->prepare_gpu_assist(cold_w, shared, 0)) {
@@ -227,6 +229,21 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
   return raw;
 }
 
+static void bailing_native_moe_node(ggml_tensor *dst, const ggml_tensor *src,
+                                    int ith, int, void *userdata) {
+  if (ith != 0)
+    return;
+  const auto &site = *static_cast<NativeMoeSite *>(userdata);
+  FullGraph &g = *site.owner;
+  const size_t bytes = (size_t)g.S * (size_t)g.D * sizeof(float);
+  if (!src || !src->data || !dst || !dst->data ||
+      ggml_nbytes(src) != bytes || ggml_nbytes(dst) != bytes)
+    throw std::runtime_error("Ling native-cache FFN tensor shape mismatch");
+  bailingmoe3_native_graph_ffn(*g.engine, site.layer,
+                               static_cast<const float *>(src->data), g.S,
+                               static_cast<float *>(dst->data), nullptr);
+}
+
 ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                        int layer, ggml_tensor *forced_ids)  {
   const std::string p = "blk." + std::to_string(layer) + ".";
@@ -241,6 +258,17 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_tensor *b = ggml_mul_mat(ctx, up, cur);
     ggml_tensor *act = ggml_swiglu_split(ctx, a, b);
     return ggml_mul_mat(ctx, down, act);
+  }
+
+  if (g.native_moe_cache) {
+    if (g.engine->family_ops.family != ModelFamily::BailingMoE3 ||
+        layer < 0 || (size_t)layer >= g.native_moe_sites.size())
+      return nullptr;
+    auto *ffn = ggml_map_custom1(ctx, cur, bailing_native_moe_node, 1,
+                                  &g.native_moe_sites[(size_t)layer]);
+    if (ffn && g.sched)
+      ggml_backend_sched_set_tensor_backend(g.sched, ffn, g.cpu);
+    return ffn;
   }
 
   ggml_tensor *router = resident_tensor(g, ctx, p + "ffn_gate_inp.weight");
@@ -444,6 +472,15 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                                                weights, c.topk, g.S);
     }
     StageRuntime *stage = (has_cold && stage_layer_active(g, layer) && g.stage_pred.count(layer)) ? get_stage(g) : nullptr;
+    // Prefetch-only pilot (PILOT_COPY=0) does not need the staged-route node, so the CPU lane can coexist with it: the lane keeps
+    // its own demand loads and a small CPU node only posts the next pilot job.
+    const bool lane_wanted = has_cold && early_ready_wanted() && (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
+                             family_supports_cpu_lane(g.engine->family_ops.family);
+    StageRuntime *post_stage = nullptr;
+    if (lane_wanted && stage && !pilot_copy_on()) {
+      post_stage = stage;
+      stage = nullptr;
+    }
     ggml_tensor *stage_slots = nullptr, *stage_m = nullptr;
     if (has_cold) {
       ggml_tensor *cold_map = partial_map(g, ctx, layer, false, false);
@@ -474,8 +511,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       }
     }
     EarlyReadyLane *lane = nullptr;
-    if (has_cold && early_ready_wanted() && !stage && (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
-        family_supports_cpu_lane(g.engine->family_ops.family)) {
+    if (lane_wanted && !stage) {
       moe_routed::ExpertWeights cold_w;
       cold_w.gate_up = gate_up;
       cold_w.gate = ge;
@@ -484,6 +520,10 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       lane = make_cold_lane(g, ctx, layer, cur, ids, weights,
                             partial_map(g, ctx, layer, false, false),
                             partial_map(g, ctx, layer, false, true), cold_w, clamp);
+    }
+    if (lane && post_stage) {
+      if (ggml_tensor *post = stage_post_node(g, ctx, *post_stage, layer, route_ids))
+        ggml_build_forward_expand(g.graph, post);
     }
     if (lane) {
       // fork -> hot GPU work -> shared expert -> CPU lane marker -> merge. The marker
@@ -660,6 +700,11 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
 
 bool build_graph(FullGraph &g) {
   const auto &c = g.engine->model_file.architecture_config;
+  const auto bp_start = std::chrono::steady_clock::now();
+  double bp_attn = 0, bp_ffn = 0, bp_pilot = 0;
+  const auto bp_ms = [](std::chrono::steady_clock::time_point a) {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+  };
   ggml_init_params ip = {};
   ip.mem_size = kTensorContextBytes;
   ip.no_alloc = true;
@@ -681,6 +726,11 @@ bool build_graph(FullGraph &g) {
   g.graph = ggml_new_graph_custom(g.ctx, kGraphSize, false);
   if (!g.graph)
     return false;
+  if (g.native_moe_cache) {
+    g.native_moe_sites.resize((size_t)g.n_layers);
+    for (int layer = 0; layer < g.n_layers; ++layer)
+      g.native_moe_sites[(size_t)layer] = {&g, layer};
+  }
 
   g.input = host_input(g, g.ctx, GGML_TYPE_F32, {g.D, g.HC, g.S},
                        (size_t)g.D * g.HC * g.S * sizeof(float),
@@ -696,6 +746,14 @@ bool build_graph(FullGraph &g) {
                                   "glm5next_full_decode_kv_index");
   if (!g.input || !g.attn_mask || (g.decode_mode && !g.decode_indices))
     return false;
+  if (g.dsa_plain) {
+    g.positions = host_input(g, g.ctx, GGML_TYPE_I32, {g.S}, (size_t)g.S * sizeof(int32_t), "glm_dsa_positions");
+    if (!g.positions)
+      return false;
+    auto *pos = static_cast<int32_t *>(g.positions->data);
+    for (int i = 0; i < g.S; ++i)
+      pos[i] = g.pos_base + i;
+  }
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int q = 0; q < g.S; ++q)
     for (int k = 0; k < kv_tokens; ++k)
@@ -772,7 +830,7 @@ bool build_graph(FullGraph &g) {
             pool * g.indexer_kpool + i;
   }
 
-  ggml_tensor *res = g.input;
+  ggml_tensor *res = g.dsa_plain ? ggml_reshape_2d(g.ctx, g.input, g.D, g.S) : g.input;
   ggml_tensor *previous_indexer_selection = nullptr;
   ggml_tensor *previous_indexer_mask = nullptr;
   for (int l = 0; l < g.n_layers; ++l) {
@@ -792,17 +850,27 @@ bool build_graph(FullGraph &g) {
     ggml_tensor *afn = resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
     ggml_tensor *abase = resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
     ggml_tensor *ascale = resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
-    if (!afn || !abase || !ascale)
+    if (g.HC > 1 && (!afn || !abase || !ascale)) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d attention HC weights "
+                 "unavailable fn=%d base=%d scale=%d HC=%d\n",
+                 l, afn != nullptr, abase != nullptr, ascale != nullptr, g.HC);
       return false;
+    }
     ggml_tensor *residual = res;
-    ggml_tensor *cur = hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
+    ggml_tensor *cur = g.dsa_plain ? res : hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
     ggml_tensor *an = resident_tensor(g, g.ctx, p + "attn_norm.weight");
-    if (!an)
+    if (!cur || !an) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d attention input unavailable "
+                 "cur=%d norm=%d\n",
+                 l, cur != nullptr, an != nullptr);
       return false;
+    }
     cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), an);
 
     ggml_tensor *attn = nullptr;
-    if (glm5next_is_kda_layer(c, l)) {
+    if (!g.dsa_plain && hybrid_is_kda_layer(c, l)) {
       ggml_tensor *wq = resident_tensor(g, g.ctx, p + "attn_q.weight");
       ggml_tensor *wk = resident_tensor(g, g.ctx, p + "attn_k.weight");
       ggml_tensor *wv = resident_tensor(g, g.ctx, p + "attn_v.weight");
@@ -818,9 +886,20 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *dt = resident_tensor(g, g.ctx, p + "ssm_dt.bias");
       ggml_tensor *nm = resident_tensor(g, g.ctx, p + "ssm_norm.weight");
       ggml_tensor *ow = resident_tensor(g, g.ctx, p + "attn_output.weight");
-      if (!wq || !wk || !wv || !cq || !ck || !cv || !fa || !fb || !ga || !gb ||
-          !be || !aa || !dt || !nm || !ow)
+      const bool bailing = g.engine->family_ops.family == ModelFamily::BailingMoE3;
+      if (!wq || !wk || !wv || !cq || !ck || !cv || !fa ||
+      (!bailing && !fb) || !ga || (!bailing && !gb) ||
+      !be || !aa || !dt || !nm || !ow) {
+    if (g.native_moe_cache)
+      LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA weights unavailable "
+               "q=%d k=%d v=%d cq=%d ck=%d cv=%d fa=%d ga=%d beta=%d "
+               "a=%d dt=%d norm=%d out=%d\n",
+               l, wq != nullptr, wk != nullptr, wv != nullptr, cq != nullptr,
+               ck != nullptr, cv != nullptr, fa != nullptr, ga != nullptr,
+               be != nullptr, aa != nullptr, dt != nullptr, nm != nullptr,
+               ow != nullptr);
         return false;
+  }
       const int hist = g.d_conv - 1;
       ggml_tensor *hi = nullptr;
       ggml_tensor *si = nullptr;
@@ -844,8 +923,13 @@ bool build_graph(FullGraph &g) {
             g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
             (size_t)g.hd * g.hd * g.H * sizeof(float), "glm5next_kda_state");
       }
-      if (!hi || !si)
+      if (!hi || !si) {
+        if (g.native_moe_cache)
+          LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA state allocation failed "
+                   "history=%d recurrent=%d\n",
+                   l, hi != nullptr, si != nullptr);
         return false;
+      }
       if (!g.decode_mode) {
         g.kda_hist_inputs.push_back((float *)hi->data);
         g.kda_state_inputs.push_back((float *)si->data);
@@ -854,19 +938,30 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *ho = nullptr;
       attn = build_kda(g, g.ctx, cur, l, wq, wk, wv, cq, ck, cv, fa, fb, ga, gb,
                        be, aa, dt, nm, ow, hi, si, &so, &ho);
-      if (!attn || !so || !ho)
+  if (!attn || !so || !ho) {
+    if (g.native_moe_cache)
+      LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA graph build failed "
+               "attn=%d state=%d history=%d\n",
+               l, attn != nullptr, so != nullptr, ho != nullptr);
         return false;
+  }
       if (g.decode_mode) {
         g.kda_state_updates.push_back(ggml_cpy(g.ctx, so, si));
         g.kda_hist_updates.push_back(ggml_cpy(g.ctx, ho, hi));
-        if (!g.kda_state_updates.back() || !g.kda_hist_updates.back())
+        if (!g.kda_state_updates.back() || !g.kda_hist_updates.back()) {
+          if (g.native_moe_cache)
+            LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA state copy build failed\n",
+                     l);
           return false;
+        }
       } else {
         g.kda_state_out.push_back(so);
         g.kda_hist_out.push_back(ho);
       }
       g.kda_layers.push_back(l);
     } else {
+      const bool bailing =
+          g.engine->family_ops.family == ModelFamily::BailingMoE3;
       ggml_tensor *wqa = resident_tensor(g, g.ctx, p + "attn_q_a.weight");
       ggml_tensor *wqan = resident_tensor(g, g.ctx, p + "attn_q_a_norm.weight");
       ggml_tensor *wqb = resident_tensor(g, g.ctx, p + "attn_q_b.weight");
@@ -876,15 +971,31 @@ bool build_graph(FullGraph &g) {
       ggml_tensor *wkb = static_full_weight(g, g.ctx, p + "attn_k_b.weight");
       ggml_tensor *wvb = static_full_weight(g, g.ctx, p + "attn_v_b.weight");
       ggml_tensor *wo = resident_tensor(g, g.ctx, p + "attn_output.weight");
-      if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo)
+      ggml_tensor *wgate =
+          bailing ? resident_tensor(g, g.ctx, p + "attn_gate.weight")
+                  : nullptr;
+      if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo ||
+          (bailing && !wgate)) {
+        if (g.native_moe_cache)
+          LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA weights unavailable "
+                   "qa=%d qan=%d qb=%d kva=%d kvan=%d kb=%d vb=%d out=%d "
+                   "gate=%d\n",
+                   l, wqa != nullptr, wqan != nullptr, wqb != nullptr,
+                   wkva != nullptr, wkvan != nullptr, wkb != nullptr,
+                   wvb != nullptr, wo != nullptr, wgate != nullptr);
         return false;
+      }
       ggml_tensor *kv_cache = nullptr;
       if (g.decode_mode) {
         kv_cache = new_decode_state_tensor(
-            g, g.ctx, GGML_TYPE_F16, {g.kv_lora, g.kv_capacity},
+            g, g.ctx, GGML_TYPE_F16, {g.kv_cache_width, g.kv_capacity},
             "glm5next_decode_dsa_kv");
-        if (!kv_cache)
+        if (!kv_cache) {
+          if (g.native_moe_cache)
+            LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA KV cache allocation failed\n",
+                     l);
           return false;
+        }
         g.dsa_kv_storage.push_back(kv_cache);
         if (g.sparse_decode && glm5next_indexer_owner(g, l)) {
           Glm5nextIndexerLayer indexer_state;
@@ -897,22 +1008,46 @@ bool build_graph(FullGraph &g) {
               g, g.ctx, GGML_TYPE_F32,
               {g.indexer_key_length, g.kv_capacity / g.indexer_kpool},
               "glm5next_decode_indexer_pooled_keys");
-          if (!indexer_state.key_gate_cache || !indexer_state.pooled_cache)
+          if (!indexer_state.key_gate_cache || !indexer_state.pooled_cache) {
+            if (g.native_moe_cache)
+              LOG_WARN("[GGML-LING-HYBRID] layer=%d indexer state allocation "
+                       "failed key_gate=%d pooled=%d\n",
+                       l, indexer_state.key_gate_cache != nullptr,
+                       indexer_state.pooled_cache != nullptr);
             return false;
+          }
           g.glm5next_indexer_layers.push_back(indexer_state);
         }
       }
       ggml_tensor *kv = nullptr;
-      attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb,
-                       wo, &kv, kv_cache, &previous_indexer_selection,
-                       &previous_indexer_mask);
-      if (!attn || !kv)
+      const auto bp_t0 = std::chrono::steady_clock::now();
+      if (g.dsa_plain) {
+        attn = build_glm_dsa_attn(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache);
+      } else if (bailing) {
+        attn = build_bailing_mla(g, g.ctx, cur, l, wqa, wqan, wqb, wkva,
+                                 wkvan, wkb, wvb, wo, wgate, &kv, kv_cache);
+      } else {
+        attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb,
+                         wvb, wo, &kv, kv_cache, &previous_indexer_selection,
+                         &previous_indexer_mask);
+      }
+      bp_attn += bp_ms(bp_t0);
+  if (!attn || !kv) {
+    if (g.native_moe_cache)
+      LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA graph build failed "
+               "attn=%d kv=%d q_a=%d q_a_norm=%d q_b=%d kv_a=%d "
+               "kv_a_norm=%d k_b=%d v_b=%d out=%d gate=%d\n",
+               l, attn != nullptr, kv != nullptr, wqa != nullptr,
+               wqan != nullptr, wqb != nullptr, wkva != nullptr,
+               wkvan != nullptr, wkb != nullptr, wvb != nullptr,
+               wo != nullptr, wgate != nullptr);
         return false;
+  }
       if (!g.decode_mode)
         g.dsa_kv_out.push_back(kv);
       g.dsa_layers.push_back(l);
     }
-    res = hc_post(g, g.ctx, attn, residual, post, comb);
+    res = g.dsa_plain ? ggml_add(g.ctx, residual, attn) : hc_post(g, g.ctx, attn, residual, post, comb);
     if (g.decode_mode && layer_timing_env())
       g.layer_marks[res] = {l, 0};
 
@@ -922,31 +1057,51 @@ bool build_graph(FullGraph &g) {
     ggml_tensor *ffn_base = resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
     ggml_tensor *ffn_scale =
         resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
-    if (!ffn_fn || !ffn_base || !ffn_scale)
+    if (g.HC > 1 && (!ffn_fn || !ffn_base || !ffn_scale)) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d FFN HC weights unavailable "
+                 "fn=%d base=%d scale=%d HC=%d\n",
+                 l, ffn_fn != nullptr, ffn_base != nullptr,
+                 ffn_scale != nullptr, g.HC);
       return false;
+    }
     cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
+    if (!cur) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d FFN hyper-connection input "
+                 "unavailable\n",
+                 l);
+      return false;
+    }
     ggml_tensor *cur_pre = cur;
     if (g.decode_mode && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
       ggml_set_output(cur_pre);
       g.probe_x.push_back({l, cur_pre});
     }
     ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
-    if (!fn)
+    if (!fn) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d missing FFN norm\n", l);
       return false;
+    }
     cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), fn);
     ggml_build_forward_expand(g.graph, residual);
     ggml_build_forward_expand(g.graph, post);
     ggml_build_forward_expand(g.graph, comb);
-    if (!build_pilot_stage(g, g.ctx, cur_pre, l))
+    const auto bp_t1 = std::chrono::steady_clock::now();
+    if (!g.native_moe_cache && !build_pilot_stage(g, g.ctx, cur_pre, l))
       return false;
+    bp_pilot += bp_ms(bp_t1);
+    const auto bp_t2 = std::chrono::steady_clock::now();
     ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l);
+    bp_ffn += bp_ms(bp_t2);
     if (!ffn) {
       LOG_WARN("[GGML-GLM5NEXT-FULL] build_ffn failed at layer=%d "
                "graph_ram_ready=%d\n",
                l, g.engine->graph_ram_layer_ready(l) ? 1 : 0);
       return false;
     }
-    res = hc_post(g, g.ctx, ffn, residual, post, comb);
+    res = g.dsa_plain ? ggml_add(g.ctx, residual, ffn) : hc_post(g, g.ctx, ffn, residual, post, comb);
     if (g.decode_mode && layer_timing_env())
       g.layer_marks[res] = {l, 1};
     if (l >= c.first_dense && (l == c.first_dense || l + 1 == g.n_layers ||
@@ -963,7 +1118,7 @@ bool build_graph(FullGraph &g) {
   // The surrounding generation loop applies output_norm.weight immediately
   // before the LM-head projection.  Return the same pre-norm activation as
   // the legacy layer path; applying output_norm here would normalize twice.
-  g.output = hc_mean(g, g.ctx, res);
+  g.output = g.dsa_plain ? res : hc_mean(g, g.ctx, res);
 
   ggml_set_output(g.final_streams);
   ggml_build_forward_expand(g.graph, g.final_streams);
@@ -1014,10 +1169,14 @@ bool build_graph(FullGraph &g) {
       }
     }
   }
+  const double bp_layers = bp_ms(bp_start);
+  const auto bp_t3 = std::chrono::steady_clock::now();
   if (!graph_alloc_vram_headroom_ok(g, "[GGML-GLM5NEXT-FULL]"))
     return false;
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
     return false;
+  LOG_INFO("[GLM-BUILD-PROFILE] %s: layer loop %.0f ms (attn weights+graph %.0f, pilot %.0f, ffn incl. expert/hot uploads %.0f), sched alloc %.0f ms\n",
+           g.decode_mode ? "decode" : "prefill", bp_layers, bp_attn, bp_pilot, bp_ffn, bp_ms(bp_t3));
   g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
 
   int cuda_nodes = 0, cpu_nodes = 0, other_nodes = 0, transitions = 0;

@@ -17,6 +17,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "ggml_moe_backend.hpp"
+#include "ggml_expert_copy.hpp"
 #include "gpu_topology.hpp"
 #include "kquant_dequant.hpp"
 #include "logger.hpp"
@@ -56,6 +57,12 @@ namespace glm5next_graph {
 
 constexpr int kGraphSize = 60000;
 constexpr size_t kTensorContextBytes = 192ull * 1024ull * 1024ull;
+
+struct FullGraph;
+struct NativeMoeSite {
+  FullGraph *owner = nullptr;
+  int layer = -1;
+};
 
 
 struct DynamicUploadCopy {
@@ -176,14 +183,23 @@ using moestream::graph::new_tensor;
 using moestream::graph::resident;
 
 struct FullGraph : moestream::graph::GraphCore {
+  moestream::ggmlcopy::ExpertCopy expert_copy;
   FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
 
+  bool native_moe_cache = false;
+  std::vector<NativeMoeSite> native_moe_sites;
   GpuTopology *topology = nullptr;
+  std::unordered_map<std::string, ggml_tensor *> resident_cache;
   int d_inner = 0;
   int qk_nope = 0;
   int qk_rope = 0;
   int kv_lora = 0;
+  int kv_cache_width = 0; // absorbed latent plus rotary key dimensions
   int v_head = 0;
+  // GLM_DSA (plain residual, roped MLA): cache/prev/export rows are kv_cache_width = kv_lora + qk_rope floats wide.
+  bool dsa_plain = false;
+  float rope_base = 10000.0f;
+  ggml_tensor *positions = nullptr;
   int o_group_count = 0;
   int o_lora_rank = 0;
   int sliding_window = 0;

@@ -15,7 +15,7 @@ namespace glm5next_graph {
 
 bool configure_vram_reference_experts(FullGraph &g) {
   if (!g.topology || !g.engine ||
-      g.engine->family_ops.family != ModelFamily::GLM5NEXT)
+      !glm5next_graph::glm_family(g.engine->family_ops.family))
     return false;
   const auto &c = g.engine->model_file.architecture_config;
   if (c.n_experts <= 0 || c.n_layers <= c.first_dense) {
@@ -336,7 +336,7 @@ bool configure_partial_experts_base(FullGraph &g) {
 bool configure_partial_experts(FullGraph &g) {
   if (!configure_partial_experts_base(g))
     return false;
-  if (g.partial_expert_residency && ggml_shared_backend(1)) {
+  if (g.partial_expert_residency && ggml_shared_backend(second_gpu_device(g.device))) {
     const char *gh = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
     if (gh && gh[0])
       assign_gpu1_hot(g, std::atof(gh));
@@ -592,6 +592,43 @@ bool prepare_partial_hot1(FullGraph &g, ggml_context *ctx, int layer) {
   return p->hot1_gate && p->hot1_up && p->hot1_down;
 }
 
+// Upload every layer's hot-set planes into the persistent GPU1 buffers at boot, so the first decode graph build finds
+// them resident instead of reading them inside the first token.
+bool preload_partial_hot1(FullGraph &g) {
+  if (!g.partial_expert_residency)
+    return true;
+  auto *backend = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g.device)));
+  if (!backend)
+    return true;
+  const auto t0 = std::chrono::steady_clock::now();
+  size_t layers = 0;
+  for (size_t layer = 0; layer < g.partial_experts.size(); ++layer) {
+    if (g.partial_experts[layer].hot1.empty())
+      continue;
+    ggml_init_params ip = {};
+    ip.mem_size = ggml_tensor_overhead() * 8;
+    ip.no_alloc = true;
+    ggml_context *ctx = ggml_init(ip);
+    if (!ctx)
+      return false;
+    ggml_backend_t saved = g.gpu1;
+    g.gpu1 = backend;
+    const bool ok = hot1_weight(g, ctx, (int)layer, "ffn_gate_exps.weight", 0) &&
+                    hot1_weight(g, ctx, (int)layer, "ffn_up_exps.weight", 1) &&
+                    hot1_weight(g, ctx, (int)layer, "ffn_down_exps.weight", 2);
+    g.gpu1 = saved;
+    ggml_free(ctx);
+    if (!ok)
+      return false;
+    ++layers;
+  }
+  if (layers)
+    LOG_INFO("[GGML-GLM5NEXT-GPU1-HOT] preloaded %zu layers (%.2f GiB) to device %d at boot in %.1f s\n", layers,
+             (double)g.gpu1_bytes / (1024.0 * 1024.0 * 1024.0), second_gpu_device(g.device),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  return true;
+}
+
 // Move the next-hottest cold experts (by usage) into the GPU1 hot set until `gib` of expert bytes is reached.
 void assign_gpu1_hot(FullGraph &g, double gib) {
   if (gib <= 0.0 || g.partial_experts.empty())
@@ -774,11 +811,18 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
   static const bool force_dummy =
       moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
+  // Batched MMQ negative-id skipping regressed Ling's short-prompt prefill
+  // (13.2 s vs 1.4 s for the same two-token input). Keep batched Ling routes
+  // on the valid dummy id; the single-token decode path still uses MMVQ's
+  // negative-id skip through SentinelPolicy::Auto.
+  const bool allow_batched_negative_skip =
+      g.engine->family_ops.family != ModelFamily::BailingMoE3 &&
+      layer_experts_take_mmq(g, layer);
   const moe_partial::ExpertBranchMap branch_map =
       moe_partial::ExpertBranchMap::build(
           index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
           force_dummy ? moe_partial::SentinelPolicy::ForceDummy
-          : layer_experts_take_mmq(g, layer)
+          : allow_batched_negative_skip
               ? moe_partial::SentinelPolicy::AutoBatched
               : moe_partial::SentinelPolicy::Auto);
   static bool logged_inactive = false;
@@ -1494,7 +1538,17 @@ ggml_tensor *static_full_weight(FullGraph &g, ggml_context *ctx,
                                 const std::string &name) {
   // DSA's attn_k_b and attn_v_b are intentionally absent from the legacy
   // resident manifest because that path builds CPU WUK/WUV caches.  In this
-  // graph they are ordinary static device weights.
+  // graph they are ordinary static weights. Ling's native-cache graph keeps
+  // these tensors in resident_layers on the host for the existing MLA path;
+  // bind that source directly instead of trying to copy it into the graph's
+  // 1 MiB dense marker arena.
+  if (g.native_moe_cache) {
+    if (ggml_tensor *t = resident_tensor(g, ctx, name))
+      return t;
+    LOG_WARN("[GGML-LING-HYBRID] static weight is not resident: %s; "
+             "trying the legacy graph-owned loader\n",
+             name.c_str());
+  }
   return load_full_weight(g, ctx, name, false);
 }
 

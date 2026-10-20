@@ -20,18 +20,29 @@ bool env_enabled() {
   return enabled;
 }
 
+bool graph_enabled_for(const StreamingEngine &engine) {
+  if (engine.family_ops.family == ModelFamily::BailingMoE3)
+    return ling_full_graph_enabled();
+  return glm5next_graph::glm_family(engine.family_ops.family) && env_enabled();
+}
+
 // MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1: the arena lock covers only bookkeeping; expert reads run outside it (see
 // ExpertResidency::begin/finish), so a background prefetch and a demand miss overlap instead of serializing on I/O.
 bool offload_async() {
   static const bool on = [] {
-    return moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
+    return moestream::graphcfg::flag_on("MOESTREAM_LING_OFFLOAD_ASYNC") ||
+           moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC");
   }();
   return on;
 }
 
 int offload_first_layer() {
   static const int first = [] {
-    return moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER", -1);
+    const char *ling = moestream::graphcfg::env("MOESTREAM_LING_OFFLOAD_FIRST_LAYER");
+    return ling && ling[0]
+               ? std::atoi(ling)
+               : moestream::graphcfg::atoi_or(
+                     "MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER", -1);
   }();
   return first;
 }
@@ -42,6 +53,14 @@ bool offload_layer(int layer) {
 }
 
 std::string offload_env(const char *name, const char *dflt)  {
+  constexpr const char *prefix = "MOESTREAM_GLM5NEXT_";
+  if (std::strncmp(name, prefix, std::strlen(prefix)) == 0) {
+    const std::string ling_name =
+        std::string("MOESTREAM_LING_") + (name + std::strlen(prefix));
+    const char *ling = moestream::graphcfg::env(ling_name.c_str());
+    if (ling && ling[0])
+      return ling;
+  }
   const char *v = moestream::graphcfg::env(name);
   return v && v[0] ? v : dflt;
 }
@@ -201,15 +220,17 @@ bool lane_with_gpu1_wanted() {
 // and gives bit-identical CPU-lane output.
 // Optional second assist device (its own ring and PCIe link): MOESTREAM_GLM5NEXT_ASSIST2_DEVICE=<cuda device> (default: device 1 on a
 // dual-GPU run with a second-GPU hot set, else off) and MOESTREAM_GLM5NEXT_ASSIST2_SLOTS=<n> (default 1).
-int gpu_assist2_device() {
-  // Unset: use CUDA device 1 when two devices are visible and the second GPU already holds a hot set; -1 turns it off.
-  static const int d = [] {
+int second_gpu_device(int core_device) { return core_device == 0 ? 1 : 0; }
+
+int gpu_assist2_device(int core_device) {
+  // Unset: use the non-core CUDA device when two devices are visible and the second GPU already holds a hot set; -1 turns it off.
+  static const int d = [core_device] {
     const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ASSIST2_DEVICE");
     if (v && v[0])
       return std::atoi(v);
     int n = 0;
     const char *hot1 = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
-    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 && hot1[0] ? 1 : -1;
+    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 && hot1[0] ? second_gpu_device(core_device) : -1;
   }();
   return d;
 }
@@ -256,5 +277,9 @@ bool gpu_assist_layer_ok(const FullGraph &g, int layer) {
 }
 
 } // namespace glm5next_graph
+
+bool ling_full_graph_enabled() {
+  return moestream::graphcfg::flag_on("MOESTREAM_LING_FULL_GRAPH");
+}
 
 #endif // MOESTREAM_USE_GGML_CUDA

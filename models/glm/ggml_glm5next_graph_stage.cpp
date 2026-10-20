@@ -198,6 +198,17 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   int staged = 0;
   int32_t staged_ids[8] = {};
   StageResult &res = st->result[site->layer];
+  // MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>: one "R <layer> <ids...>" line per decode token and layer (all routed ids).
+  if (const char *tp = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TRACE"); tp && tp[0]) {
+    static FILE *tf = std::fopen(tp, "a");
+    if (tf) {
+      std::fprintf(tf, "R %d", site->layer);
+      for (int i = 0; i < n; ++i)
+        std::fprintf(tf, " %d", *(const int32_t *)((const char *)b->data + i * b->nb[0]));
+      std::fputc('\n', tf);
+      std::fflush(tf);
+    }
+  }
   {
     StageRuntime::Cand &cd = st->cand[site->layer];
     for (int j = 0; j < cd.n; ++j) {
@@ -275,14 +286,14 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   o.store->counters().cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - cb_t0).count(),
                     std::memory_order_relaxed);
   const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (rs % 4704 == 0)
+  if (rs % 1176 == 0)
     LOG_INFO("[GGML-GLM5NEXT-STAGE] progress: jobs=%llu experts_copied=%llu resolves=%llu staged_routes=%llu/%llu not_resident=%llu "
              "wait=%.1f ms direct_pieces=%llu prefetch_loads=%llu prefetch=%.1f ms\n",
              (unsigned long long)st->jobs.load(), (unsigned long long)st->copied.load(), (unsigned long long)rs,
              (unsigned long long)st->staged_routes.load(), (unsigned long long)st->routes_seen.load(),
              (unsigned long long)st->skipped_not_resident.load(), st->wait_us.load() / 1000.0, (unsigned long long)st->direct.load(),
              (unsigned long long)st->prefetch_loads.load(), st->prefetch_us.load() / 1000.0);
-  if (rs % 4704 == 0) {
+  if (rs % 1176 == 0) {
     std::string pr = "pilot precision by rank:", ps = "by score bucket (<.01 <.02 <.05 <.1 <.2 <.4 <.8 <1.6 >=1.6):";
     char buf[64];
     for (int j = 0; j < 8; ++j)
@@ -471,6 +482,66 @@ ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, 
     out->nb[1] = out->nb[2] = out->nb[3] = (size_t)(3 * n) * sizeof(int32_t);
     ggml_set_name(out, ("glm5next_stage_miss_" + std::to_string(layer)).c_str());
   }
+  return out;
+}
+
+// Prefetch-only pilot next to the CPU lane: records the pilot's precision for this layer and posts the SSD->DDR prefetch job for
+// layer+lookahead. a, b: real routed ids [topk,1]; c: pilot ids of the target layer.
+static void stage_post_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *, const ggml_tensor *c, int ith, int, void *ud) {
+  if (ith != 0)
+    return;
+  StageMissSite *site = static_cast<StageMissSite *>(ud);
+  StageRuntime *st = g_stage.get();
+  const int n = (int)a->ne[0];
+  {
+    StageRuntime::Cand &cd = st->cand[site->layer];
+    for (int j = 0; j < cd.n; ++j) {
+      bool used = false;
+      for (int i = 0; i < n; ++i)
+        used = used || *(const int32_t *)((const char *)a->data + i * a->nb[0]) == cd.ids[j];
+      st->rank_n[j].fetch_add(1, std::memory_order_relaxed);
+      if (used)
+        st->rank_hit[j].fetch_add(1, std::memory_order_relaxed);
+    }
+    cd.n = 0;
+  }
+  std::memcpy(dst->data, a->data, ggml_nbytes(dst));
+  if (site->next_layer >= 0)
+    stage_post_job(st, site->next_layer, site->next_set, c);
+  const uint64_t rs = st->resolves.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (rs % 1176 == 0) {
+    std::string pr = "pilot precision by rank:";
+    char buf[64];
+    for (int j = 0; j < 8; ++j)
+      if (st->rank_n[j].load() > 0) {
+        std::snprintf(buf, sizeof buf, " r%d %.0f%%(%llu)", j + 1, 100.0 * (double)st->rank_hit[j].load() / (double)st->rank_n[j].load(),
+                      (unsigned long long)st->rank_n[j].load());
+        pr += buf;
+      }
+    LOG_INFO("[GGML-GLM5NEXT-STAGE] lane post: jobs=%llu prefetch_loads=%llu prefetch=%.1f ms\n[GGML-GLM5NEXT-STAGE] %s\n",
+             (unsigned long long)st->jobs.load(), (unsigned long long)st->prefetch_loads.load(), st->prefetch_us.load() / 1000.0, pr.c_str());
+  }
+}
+
+ggml_tensor *stage_post_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, ggml_tensor *route_ids) {
+  if (!route_ids)
+    return nullptr;
+  const int target = layer + pilot_lookahead();
+  if (!stage_layer_active(g, target))
+    return nullptr;
+  auto it = g.stage_pred.find(target);
+  if (it == g.stage_pred.end())
+    return nullptr;
+  std::lock_guard<std::mutex> lock(g_offload_mutex);
+  StageMissSite ms;
+  ms.layer = layer;
+  ms.set = layer % StageRuntime::kSets;
+  ms.next_layer = target;
+  ms.next_set = target % StageRuntime::kSets;
+  st.miss_sites.push_back(ms);
+  ggml_tensor *out = ggml_map_custom3(ctx, route_ids, route_ids, it->second, stage_post_cb, 1, &st.miss_sites.back());
+  if (out)
+    ggml_set_name(out, ("glm5next_stage_post_" + std::to_string(layer)).c_str());
   return out;
 }
 

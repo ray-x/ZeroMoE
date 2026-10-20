@@ -7,6 +7,7 @@
 #include "full_graph_model.hpp"
 
 #include "engine.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_qwen4exp_graph.hpp"
@@ -142,6 +143,134 @@ class Glm5NextGraphModel final : public FullGraphModelBase<Glm5NextGraphModel> {
   }
 };
 
+// GLM-5.x "glm-dsa" (absorbed MLA with RoPE, plain residual, routed MoE).  Shares the glm5next graph implementation; the
+// DSA indexer is not part of it (dense attention, as the layered path).  Opt-in: MOESTREAM_GLM_DSA_FULL_GRAPH=1 enables the
+// decode graph, MOESTREAM_GLM_DSA_FULL_GRAPH_PREFILL=1 the batched prefill graph.
+class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
+ public:
+  ModelFamily family() const override { return ModelFamily::GLM_DSA; }
+  const char *name() const override { return "glm_dsa"; }
+
+  bool enabled(const StreamingEngine &engine, ModelGraphPhase phase) const override {
+    if (engine.mtp_enabled)
+      return false;
+    const char *v = std::getenv(phase == ModelGraphPhase::Prefill ? "MOESTREAM_GLM_DSA_FULL_GRAPH_PREFILL"
+                                                                  : "MOESTREAM_GLM_DSA_FULL_GRAPH");
+    return v && v[0] == '1';
+  }
+  bool bootstrap(StreamingEngine &engine) const override { return glm5next_full_graph_bootstrap(engine); }
+  void shutdown() const override { glm5next_full_graph_shutdown(); }
+  int device_expert_layers() const override { return glm5next_full_graph_device_expert_layers(); }
+  bool supports_cpu_lane() const override {
+    const char *v = std::getenv("MOESTREAM_GLM_DSA_CPU_LANE");
+    return v && v[0] == '1';
+  }
+
+  int max_prefill_tokens(const StreamingEngine &e) const override {
+    if (const char *v = std::getenv("MOESTREAM_GLM5NEXT_PREFILL_CHUNK"); v && v[0])
+      return std::atoi(v);
+    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
+  }
+  int suggested_prefill_batch(const StreamingEngine &) const override { return glm5next_full_graph_suggested_batch(); }
+  bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }
+
+  bool accepts(const StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (e.mtp_enabled)
+      return false;
+    return r.phase != ModelGraphPhase::Decode || (r.n_tokens == 1 && r.pos_base >= 0);
+  }
+  bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);
+  }
+  bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_run(e, r.hidden_states, r.n_tokens, r.pos_base, r.token_ids);
+  }
+  bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_decode_prepare(e, r.pos_base, r.token_ids);
+  }
+  bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return glm5next_full_graph_decode_run(e, r.hidden_states, r.pos_base, r.token_ids);
+  }
+};
+
+class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphModel> {
+ public:
+  ModelFamily family() const override { return ModelFamily::BailingMoE3; }
+  const char *name() const override { return "ling-3.1-flash"; }
+  bool enabled(const StreamingEngine &engine,
+               ModelGraphPhase phase) const override {
+    return !engine.mtp_enabled && ling_full_graph_enabled() &&
+           (phase == ModelGraphPhase::Prefill ||
+            phase == ModelGraphPhase::Decode);
+  }
+  bool bootstrap(StreamingEngine &engine) const override {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_bootstrap(engine);
+    return bailingmoe3_native_graph_enabled()
+               ? true
+               : glm5next_full_graph_bootstrap(engine);
+  }
+  void shutdown() const override {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      glm5next_full_graph_shutdown();
+    else if (bailingmoe3_native_graph_enabled())
+      bailingmoe3_native_graph_shutdown();
+    else
+      glm5next_full_graph_shutdown();
+  }
+  bool supports_cpu_lane() const override {
+    return !bailingmoe3_native_graph_enabled();
+  }
+  int max_prefill_tokens(const StreamingEngine &e) const override {
+    if (const char *v = std::getenv("MOESTREAM_LING_PREFILL_CHUNK"); v && v[0])
+      return std::atoi(v);
+    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
+  }
+  int min_prefill_batch() const override { return 2; }
+  bool supports_prefill_continuation(const StreamingEngine &) const override {
+    return true;
+  }
+  bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base,
+                                         r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_prepare(e, r.n_tokens, r.pos_base,
+                                                 r.token_ids)
+               : glm5next_full_graph_prepare(e, r.n_tokens, r.pos_base,
+                                             r.token_ids);
+  }
+  bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_run(e, r.hidden_states, r.n_tokens,
+                                     r.pos_base, r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_run(e, r.hidden_states, r.n_tokens,
+                                              r.pos_base, r.token_ids)
+               : glm5next_full_graph_run(e, r.hidden_states, r.n_tokens,
+                                         r.pos_base, r.token_ids);
+  }
+  bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_decode_prepare(e, r.pos_base, r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_prepare(e, 1, r.pos_base,
+                                                 r.token_ids)
+               : glm5next_full_graph_decode_prepare(e, r.pos_base,
+                                                    r.token_ids);
+  }
+  bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    if (bailingmoe3_hybrid_cuda_graph_enabled())
+      return glm5next_full_graph_decode_run(e, r.hidden_states, r.pos_base,
+                                           r.token_ids);
+    return bailingmoe3_native_graph_enabled()
+               ? bailingmoe3_native_graph_run(e, r.hidden_states, 1,
+                                              r.pos_base, r.token_ids)
+               : glm5next_full_graph_decode_run(e, r.hidden_states,
+                                                r.pos_base, r.token_ids);
+  }
+};
+
 class DeepseekV41GraphModel final
     : public FullGraphModelBase<DeepseekV41GraphModel> {
  public:
@@ -197,12 +326,18 @@ class DeepseekV41GraphModel final
 const FullGraphModel *full_graph_model(ModelFamily family) {
   static const Qwen4ExpGraphModel qwen;
   static const Glm5NextGraphModel glm;
+  static const GlmDsaGraphModel glm_dsa;
+  static const Ling31FlashGraphModel ling;
   static const DeepseekV41GraphModel dsv41;
   switch (family) {
   case ModelFamily::Qwen4Exp:
     return &qwen;
   case ModelFamily::GLM5NEXT:
     return &glm;
+  case ModelFamily::GLM_DSA:
+    return &glm_dsa;
+  case ModelFamily::BailingMoE3:
+    return &ling;
   case ModelFamily::DeepSeek_V41:
     return &dsv41;
   default:

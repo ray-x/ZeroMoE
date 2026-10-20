@@ -68,6 +68,11 @@ std::unique_ptr<ModelBackend> ModelBackend::create(const GGUFFile &model_file) {
                  "engine path.\n";
     return nullptr;
 
+  case ModelFamily::BailingMoE3:
+    std::cerr << "[MODEL] Detected: Ling 3.1 Flash (bailingmoe3) -- "
+                 "use the main moestream engine path.\n";
+    return nullptr;
+
   default:
     // Default to GLM-DSA for unknown architectures with kv_lora_rank > 0
     if (model_file.get_config_int("attention.kv_lora_rank") > 0) {

@@ -27,7 +27,11 @@ void *alloc_expert_source(FullGraph &g, size_t bytes) {
   return p;
 }
 
+bool g_skip_indexer_weights = false;
+
 bool graph_dense_weight_name(const std::string &name) {
+  if (g_skip_indexer_weights && name.find("indexer") != std::string::npos)
+    return false;
   if (name.find("_exps.weight") != std::string::npos ||
       name.find("nextn") != std::string::npos)
     return false;
@@ -69,6 +73,20 @@ bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity,
 
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name) {
+  const bool cacheable = ctx == g.ctx;
+  if (cacheable) {
+    auto it = g.resident_cache.find(name);
+    if (it != g.resident_cache.end())
+      return it->second;
+  }
+  ggml_tensor *r = resident_tensor_uncached(g, ctx, name);
+  if (cacheable && r)
+    g.resident_cache.emplace(name, r);
+  return r;
+}
+
+ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx,
+                                      const std::string &name) {
   const QuantizedTensor *q = resident(*g.engine, name);
   if (!q || !type_ok(q->meta.type))
     return nullptr;
@@ -78,7 +96,18 @@ ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
   ggml_tensor *t = new_tensor(ctx, (ggml_type)q->meta.type, shape);
   if (!t || q->meta.size_bytes < ggml_nbytes(t))
     return nullptr;
-  if (graph_dense_weight_name(name)) {
+  if (g.native_moe_cache && q->device_ptr) {
+    // The Ling hybrid graph uses the engine's existing dense pool. The small
+    // marker buffer supplies GGML's CUDA backend identity; the actual weight
+    // address remains owned by CudaManager.
+    t->data = q->device_ptr;
+    t->buffer = g.dense.buffer;
+    ++g.dense.tensors;
+  } else if (g.native_moe_cache) {
+    if (!bind_host(g, t, q->host_ptr, q->meta.size_bytes,
+                   GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
+      return nullptr;
+  } else if (graph_dense_weight_name(name)) {
     if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity,
                      g.dense.used, t, q->host_ptr, q->meta.size_bytes))
       return nullptr;
@@ -168,7 +197,7 @@ size_t dense_arena_bytes(const FullGraph &g) {
   }
   const auto &c = g.engine->model_file.architecture_config;
   for (int l = 0; l < c.n_layers; ++l) {
-    if (glm5next_is_kda_layer(c, l))
+    if (hybrid_is_kda_layer(c, l))
       continue;
     for (const char *stem : {"attn_k_b.weight", "attn_v_b.weight"}) {
       const std::string name = "blk." + std::to_string(l) + "." + stem;
@@ -202,6 +231,30 @@ size_t dense_arena_bytes(const FullGraph &g) {
 }
 
 bool init_dense_arena(FullGraph &g) {
+  if (g.native_moe_cache) {
+    constexpr size_t kMarkerBytes = 1ull << 20;
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaSetDevice(g.device) != cudaSuccess ||
+        cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        free_bytes < kMarkerBytes + (512ull << 20)) {
+      LOG_WARN("[GGML-LING-HYBRID] insufficient checked VRAM for CUDA graph "
+               "marker (free=%.2f GiB); declining hybrid graph\n",
+               (double)free_bytes / (1024.0 * 1024.0 * 1024.0));
+      return false;
+    }
+    auto buft = ggml_backend_get_default_buffer_type(g.cuda);
+    g.dense.buffer = ggml_backend_buft_alloc_buffer(buft, kMarkerBytes);
+    if (!g.dense.buffer)
+      return false;
+    ggml_backend_buffer_set_usage(g.dense.buffer,
+                                  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    g.dense.base = ggml_backend_buffer_get_base(g.dense.buffer);
+    g.dense.capacity = ggml_backend_buffer_get_size(g.dense.buffer);
+    LOG_INFO("[GGML-LING-HYBRID] using native dense pool; CUDA marker "
+             "allocated=%.3f MiB\n",
+             (double)g.dense.capacity / (1024.0 * 1024.0));
+    return true;
+  }
   const size_t bytes = dense_arena_bytes(g);
   if (bytes == 0)
     return false;
@@ -232,7 +285,7 @@ bool init_decode_state_arena(FullGraph &g) {
     return true;
   };
   for (int l = 0; l < g.n_layers; ++l) {
-    if (glm5next_is_kda_layer(c, l)) {
+    if (hybrid_is_kda_layer(c, l)) {
       const size_t state_n = (size_t)g.hd * g.hd * g.H;
       const size_t hist_n = (size_t)(g.d_conv - 1) * 3 * g.d_inner;
       if (state_n > SIZE_MAX / sizeof(float) ||
@@ -242,8 +295,8 @@ bool init_decode_state_arena(FullGraph &g) {
         return false;
     } else {
       if ((size_t)g.kv_capacity >
-          SIZE_MAX / (size_t)g.kv_lora / sizeof(ggml_fp16_t) ||
-          !add_tensor((size_t)g.kv_capacity * g.kv_lora *
+          SIZE_MAX / (size_t)g.kv_cache_width / sizeof(ggml_fp16_t) ||
+          !add_tensor((size_t)g.kv_capacity * g.kv_cache_width *
                       sizeof(ggml_fp16_t)))
         return false;
     }
@@ -259,7 +312,7 @@ bool init_decode_state_arena(FullGraph &g) {
         key_length > SIZE_MAX / sizeof(float) / pool_count)
       return false;
     for (int l = 0; l < g.n_layers; ++l) {
-      if (glm5next_is_kda_layer(c, l))
+      if (hybrid_is_kda_layer(c, l))
         continue;
       const std::string prefix = "blk." + std::to_string(l) + ".";
       if (!model_tensor(*g.engine, prefix + "indexer.proj.weight"))
