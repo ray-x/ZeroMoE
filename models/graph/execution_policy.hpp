@@ -50,11 +50,19 @@ class CachePolicy {
 };
 
 // ---------------------------------------------------------------------------
-// Predictor — future routed experts.
+// Predictor — future routed experts (speculation with reconciliation).
 // ---------------------------------------------------------------------------
 // Owns the prediction of which experts the NEXT layer will route to, from this layer's hidden
-// state. Speculative by definition: real routing decides the required work, and demand loading
-// must complete correctly when the prediction misses.
+// state. This is the expert-level counterpart of MTP token drafting: both speculate ahead of the
+// authoritative answer, and both define exactly what happens when the prediction is wrong.
+//
+//   Predicts:   the experts likely to be needed, ranked by confidence.
+//   Verifies:   the layer's real router — its top-k output is authoritative and always wins.
+//   Reconciles: demand loading supplies whatever the router actually selected; predicted-but-unused
+//               prefetch is wasted work reclaimed by CachePolicy's eviction (bounded, not an error).
+//
+// A predictor must never change the model's mathematical definition: a wrong prediction costs
+// wasted prefetch, never a wrong result.
 struct Prediction {
   int target_layer = -1;           // the layer being predicted
   std::vector<int32_t> experts;    // predicted expert ids, ranked by score
