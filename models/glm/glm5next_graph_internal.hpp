@@ -17,6 +17,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "ggml_moe_backend.hpp"
+#include "ggml_expert_copy.hpp"
 #include "gpu_topology.hpp"
 #include "kquant_dequant.hpp"
 #include "logger.hpp"
@@ -182,6 +183,7 @@ using moestream::graph::new_tensor;
 using moestream::graph::resident;
 
 struct FullGraph : moestream::graph::GraphCore {
+  moestream::ggmlcopy::ExpertCopy expert_copy;
   FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
 
   bool native_moe_cache = false;

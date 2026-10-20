@@ -308,6 +308,8 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, sched_parallel, prefill_offload);
   if (!g->sched)
     return false;
+  if (g->expert_copy.attach(g->sched))
+    LOG_INFO("[GGML-GLM5NEXT-FULL] selective expert weight-copy callback installed\n");
   if (!build_graph(*g)) {
     LOG_WARN("[GGML-GLM5NEXT-FULL] graph construction declined; using legacy "
              "path\n");

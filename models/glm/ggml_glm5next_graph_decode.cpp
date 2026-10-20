@@ -227,6 +227,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     backends[1] = g->cpu;
   g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2,
                                     kGraphSize, false, false);
+  if (g->sched)
+    g->expert_copy.attach(g->sched);
   if (!g->sched || !build_graph(*g)) {
     LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] graph construction declined; "
              "using legacy decode\n");
@@ -601,6 +603,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   for (auto &entry : g.early_ready)
     entry.second->completed = false;
+  g.expert_copy.reset();
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
