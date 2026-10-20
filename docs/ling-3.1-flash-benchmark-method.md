@@ -77,7 +77,7 @@ For a prompt-matched long run:
 LING_PROMPT_FILE="$PWD/bench/ling/reference-audit/prompt-long-20261020.txt" \
 LING_CONTEXT_SIZE=256 \
 LING_PREFILL_USAGE_FILE="$PWD/bench/ling/reference-audit/prefill-long64-ring-r05-20261020.pin" \
-LING_DDR_GIB=72 LING_CAP_GIB=95 LING_STOP_GIB=20 \
+LING_DDR_GIB=64 LING_CAP_GIB=95 LING_STOP_GIB=20 \
 LING_GPU0_CACHE_GIB=3.0 LING_GPU1_CACHE_GIB=12.5 \
 LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 \
 LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 LING_CPU_THREADS=10 \
@@ -131,22 +131,28 @@ reported, not only a forced-token run.
 ## Recorded results
 
 All rows use the 95 GiB cap, zero cgroup swap, and the 20 GiB stop floor. The
-short rows use the exact 3700-pin configuration above. The long rows are
-different cache/ring configurations and are not an A/B of prompt content
-alone.
+short rows use the exact 3700-pin configuration above with the 72 GiB short
+pool. The long rows use a 64 GiB DDR pool: after master made page-reusing
+eviction the default, a 72 GiB long run reached the 95 GiB cgroup cap and was
+killed while the prefill graph was being prepared. The runner therefore
+defaults to 64 GiB; the short command above passes 72 explicitly.
 
 | Run | Graph prepared | Prefill pass | Prefill incl. setup | Decode output | Decode wall | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | short, historical dense reuse | 2113 ms | 1.024 s (2 tokens) | 0.63 tok/s | **10.03 tok/s** | **9.96 tok/s** | 31 intervals, 3.092 s; `usage-hi-there-robust4.pin`; 3700 pins |
 | short, clean empty prefill profile | 2203 ms | 1.078 s (2 tokens) | 0.61 tok/s | **9.84 tok/s** | **9.78 tok/s** | current 3700-pin layout; empty prefill profile |
-| long, ring r05, no borrow | 2291 ms | **17.695 s (10.00 tok/s)** | **8.85 tok/s** | 3.33 tok/s | 3.40 tok/s | 177 prompt tokens; ring 2.888 GiB GPU0 + 1.709 GiB GPU1 |
-| long, cache borrow 3.0 GiB | 3262 ms | 19.591 s (9.03 tok/s) | 7.75 tok/s | 4.54 tok/s | 4.61 tok/s | 3.0 GiB GPU0 cache detached to host; 3700 pins; restore before decode |
+| short, final rebase (72 GiB) | 2176 ms | 1.075 s (2 tokens) | 0.62 tok/s | **10.15 tok/s** | **10.08 tok/s** | default 3700-pin config; no CUDA error |
+| long, ring r05, no borrow | 2291 ms | **17.695 s (10.00 tok/s)** | **8.85 tok/s** | 3.33 tok/s | 3.40 tok/s | 177 tokens; 64 GiB; ring 2.888 GiB GPU0 + 1.709 GiB GPU1 |
+| long, cache borrow 3.0 GiB | 3262 ms | 19.591 s (9.03 tok/s) | 7.75 tok/s | 4.54 tok/s | 4.61 tok/s | 64 GiB; 3.0 GiB GPU0 cache detached; 3700 pins |
+| long, final rebase (64 GiB) | 3167 ms | 18.714 s (9.46 tok/s) | 8.09 tok/s | 4.82 tok/s | 4.88 tok/s | 64 GiB; cache borrow + restore completed after master merge |
 
-The short history reached 10.03 tok/s output / 9.96 tok/s wall, but the latest
-clean run with the current pin layout is 9.84 / 9.78. That 0.19 tok/s gap is
-below the stated target and must not be rounded up to 10. The long-prefill
-target is far away: 10.00 tok/s prefill pass / 8.85 tok/s including setup
-against 20 tok/s.
+The short history reached 10.03 tok/s output / 9.96 tok/s wall, and the final
+rebase run reached 10.15 / 10.08: the decode target is met in this single
+free-running run, but there is no margin for a sustained claim. The long
+prefill target is still far away: 10.00 tok/s prefill pass / 8.85 tok/s
+including setup against 20 tok/s. A 72 GiB long run after the master merge was
+killed at the 95 GiB cgroup cap during graph preparation; do not treat that
+configuration as supported without a larger cap or retarget disabled.
 
 The long ring run copies the cold experts of every layer into two reusable
 ring sets, not only the experts selected by the prompt. At 177 tokens that is
@@ -169,9 +175,11 @@ fallback, is the next proposed optimization; it has not been measured yet.
 
 ## Current status
 
-- Best short decode: **10.03 tok/s output / 9.96 tok/s wall** (historical);
-  latest clean **9.84 / 9.78**.
+- Best short decode: **10.15 tok/s output / 10.08 tok/s wall** (final rebase
+  smoke, 72 GiB); historical **10.03 / 9.96**; clean empty-profile **9.84 / 9.78**.
 - Best long prefill: **10.00 tok/s pass / 8.85 tok/s including setup**.
 - Target: **10 tok/s decode / 20 tok/s prefill including setup**.
-- Status: objective not met; no merge has been performed. The branch is
-  committed and rebased for review, but the 20 tok/s prefill gate remains open.
+- Status: objective not met. Decode is at the threshold in the latest single
+  run; prefill is about half of the target. The branch is committed and
+  rebased as an explicit checkpoint; merging it is not a claim that the
+  20 tok/s prefill gate is complete.

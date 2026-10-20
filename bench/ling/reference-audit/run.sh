@@ -12,7 +12,7 @@ config=$(mktemp /tmp/ling-reference-config.XXXXXX.toml)
 python3 - "$worktree/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$context_size" <<'CONFIG'
 from pathlib import Path
 import json, os, re, sys
-pool=int(os.environ.get('LING_DDR_GIB','72')); cap=int(os.environ.get('LING_CAP_GIB','95'))
+pool=int(os.environ.get('LING_DDR_GIB','64')); cap=int(os.environ.get('LING_CAP_GIB','95'))
 stop=float(os.environ.get('LING_STOP_GIB','20'))
 cpu_threads=int(os.environ.get('LING_CPU_THREADS','10'))
 offload_pinned=float(os.environ.get('LING_OFFLOAD_PINNED','0.5'))
@@ -117,7 +117,7 @@ export MOESTREAM_GLM5NEXT_EARLY_READY=${LING_EARLY_READY:-1}
 export MOESTREAM_LING_OFFLOAD_FIRST_LAYER=4
 export MOESTREAM_LING_OFFLOAD_MODEL=/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf
 export MOESTREAM_LING_OFFLOAD_USAGE="$profile"
-export MOESTREAM_LING_OFFLOAD_DDR_GIB=${LING_DDR_GIB:-72}
+export MOESTREAM_LING_OFFLOAD_DDR_GIB=${LING_DDR_GIB:-64}
 export MOESTREAM_LING_OFFLOAD_PINNED=${LING_OFFLOAD_PINNED:-0.5}
 export MOESTREAM_LING_OFFLOAD_BYTE_CAP=1
 export MOESTREAM_LING_OFFLOAD_PIN=1
@@ -137,7 +137,7 @@ else
 fi
 unset MOESTREAM_LING_NATIVE_GRAPH MOESTREAM_LING_HYBRID_CUDA_GRAPH MOESTREAM_LING_CPU_COLD_MISSES MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER MOESTREAM_GLM5NEXT_OFFLOAD_MODEL MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB MOESTREAM_GLM5NEXT_OFFLOAD_POLICY MOESTREAM_GLM5NEXT_OFFLOAD_PINNED MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP MOESTREAM_GLM5NEXT_OFFLOAD_PIN MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC MOESTREAM_GLM5NEXT_OFFLOAD_USAGE MOESTREAM_GLM5NEXT_OFFLOAD_THP MOESTREAM_GLM5NEXT_OFFLOAD_STORE MOESTREAM_GLM5NEXT_GPU1_HOT_GIB MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE MOESTREAM_FULL_GRAPH_RESIDENT_GB MOESTREAM_FULL_GRAPH_USE_RAM_CACHE MOESTREAM_LING_FULL_GRAPH_DDR_PREFETCH_GIB
 prompt_sha256=$(sha256sum -- "$prompt_file" | awk '{print $1}')
-printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-72}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
+printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
 export MOESTREAM_GLM5NEXT_ROUTE_TRACE="${log%.log}.routes"
 export MOESTREAM_GENERATED_TOKEN_FILE="${log%.log}.tokens"
 unset MOESTREAM_TEACHER_FORCE_TOKEN_FILE MOESTREAM_LING_PREFILL_OP_OFFLOAD GGML_OP_OFFLOAD_MIN_BATCH

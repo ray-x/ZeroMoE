@@ -25,13 +25,15 @@ python3 bench/ling/reference-audit/monitor.py
 ```
 
 The runner checks other inference/build processes and physical memory,
-then uses `run_capped.sh` with `MemorySwapMax=0`. Its default is the audited
-72 GiB DDR / 95 GiB cgroup baseline, GPU hot sets 3+12.5 GiB, CPU lane 10
-threads, GPU assist 3+1, pinned fraction 0.5, and 3700 pinned VRAM slots. Its
-prefill pin profile is empty unless `LING_PREFILL_USAGE_FILE` is set. The
-monitor records memory and GPU samples and stops only its own model if the
-memory floor is crossed. It must run outside the restricted sandbox to observe
-the actual host.
+then uses `run_capped.sh` with `MemorySwapMax=0`. Its default is a 64 GiB DDR
+pool with a 95 GiB cgroup cap, GPU hot sets 3+12.5 GiB, CPU lane 10 threads,
+GPU assist 3+1, pinned fraction 0.5, and 3700 pinned VRAM slots. The short
+benchmark below passes `LING_DDR_GIB=72` explicitly; after master enabled
+page-reusing eviction, 72 GiB long-prompt runs reached the 95 GiB cgroup cap,
+so the safe runner default is 64 GiB. Its prefill pin profile is empty unless
+`LING_PREFILL_USAGE_FILE` is set. The monitor records memory and GPU samples
+and stops only its own model if the memory floor is crossed. It must run
+outside the restricted sandbox to observe the actual host.
 
 An identical-token comparison with the trace-derived ranking:
 
