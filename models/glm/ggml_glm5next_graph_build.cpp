@@ -227,10 +227,12 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
   }
   EarlyReadyLane *raw = lane.get();
   // Install the strategy view of this lane (adapter-first migration): build the family's
-  // residency callbacks into the lane through the ColdMoEStrategy interface, so future steps
-  // (threading generation + State) go through the strategy instead of the raw members.
+  // residency callbacks into the lane through the ColdMoEStrategy interface. The invocation here
+  // is the build-time install (callbacks only); per-token state()/finish()/release() key off
+  // lane->calls as the generation (§3.8).
   raw->strategy = std::make_unique<moestream::graph::EarlyReadyLaneStrategy>(raw);
   moestream::graph::ColdMoEInvocation inv;
+  inv.layer = layer;
   raw->strategy->begin(inv, adapter);
   g.early_ready.emplace(layer, std::move(lane));
   LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);

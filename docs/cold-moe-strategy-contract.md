@@ -149,6 +149,37 @@ backend it borrows from, on the device that created it. *Broken today:* the beni
 (`CUDA error: driver shutting down` in `DenseArenaOwner`/`StageRuntime` destructors) is exactly a
 violation. The strategy's `release()`/`shutdown()` must encode this order.
 
+### 3.8 State/lifetime contract (generation + Pending/Ready/Error)
+
+The strategy is the single place that makes a per-token invocation's **generation** and **state**
+visible. Both paths (lane and cache-backed) expose the same three states, keyed by generation:
+
+- **Pending** — the invocation's cold experts are not yet all resident; compute must not read them.
+- **Ready** — every owned expert is resident and valid; compute may proceed.
+- **Error** — residency failed unrecoverably, *or* the invocation's generation no longer matches the
+  path's current epoch (a route classified at generation `g` must never bind to a slot reused at `g+1`).
+
+Generation source:
+- **Lane (full-graph):** `EarlyReadyLane::calls`, advanced once per token at the end of `run()`; the
+  staging epoch is `calls + 1`. `completed` is reset to false in the decode loop and set true at the
+  end of `run()`, so `completed` *is* the Pending→Ready transition.
+- **Cache-backed:** (defined when that path is wired; the `RAMSafetyManager`/`GpuTopology` epoch).
+
+Rules, all paths:
+1. `state(inv)` must be consulted before any compute reads an owned expert's planes; **Ready** is the
+   only state in which compute may proceed.
+2. `finish(inv)` blocks until Ready (lane: no-op — `run()` already drove residency on the scheduler
+   bridge; cache-backed: waits on residency). It fails, rather than reporting Ready, on a stale
+   invocation.
+3. `release(inv)` is idempotent, and a no-op once the generation has advanced (a stale release after a
+   slot reuse must not free a live buffer).
+
+*Partial today:* the lane enforces "never compute against a missing expert" through `finish_load()`
+blocking + `std::abort()` on load error, but it does not yet expose that as the strategy's
+`Pending/Ready/Error`. The generation cross-check (`inv.generation != lane_->calls`) is the first
+visible thread; wiring per-token `state()`/`finish()` into the decode loops is the remaining part of
+migration step 2.
+
 ---
 
 ## 4. Migration (incremental, adapters first)

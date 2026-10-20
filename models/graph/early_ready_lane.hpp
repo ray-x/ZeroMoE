@@ -120,7 +120,7 @@ struct EarlyReadyLane {
   // Buffers owned on behalf of the builder (e.g. host copies of routing tables).
   std::vector<ggml_backend_buffer_t> extra_buffers;
   size_t reservation = 0;
-  uint64_t calls = 0, early_calls = 0, gpu_pending = 0;
+  uint64_t calls = 0, early_calls = 0, gpu_pending = 0;  // `calls` is the per-token generation (§3.8)
   uint64_t all_hot_visits = 0, all_hot_skips = 0;
   uint64_t output_uploads = 0;
   int64_t wait_us = 0, compute_us = 0;
