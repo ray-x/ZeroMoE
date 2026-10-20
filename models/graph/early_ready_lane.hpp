@@ -23,6 +23,7 @@
 #include "qwen4exp_stage_pool.hpp"
 #include "moe_routed_ggml.hpp"
 #include "pilot_ridge.hpp"
+#include "cold_moe_strategy.hpp"  // the lane's strategy view (adapter-first migration)
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -177,6 +178,10 @@ struct EarlyReadyLane {
   // rest. The copy reads the expert straight from the host arena; `expert_planes` returns its three plane
   // pointers. Results differ from the CPU kernels only by float rounding.
   std::function<bool(int expert, const void *planes[3])> expert_planes;
+  // The strategy view of this lane (adapter-first migration). EarlyReadyLaneStrategy forwards the
+  // adapter's callbacks to the members above and re-expresses `completed` as the strategy state
+  // machine. It owns no CUDA resources and is destroyed (trivially) with the lane.
+  std::unique_ptr<moestream::graph::ColdMoEStrategy> strategy;
   uint64_t assist_runs = 0, assist_experts = 0;
   int64_t assist_stall_us = 0;
   uint64_t split_runs = 0;

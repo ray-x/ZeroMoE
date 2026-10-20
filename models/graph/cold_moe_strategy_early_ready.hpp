@@ -27,8 +27,8 @@ class EarlyReadyLaneStrategy final : public ColdMoEStrategy {
     // The adapter IS the lane's residency callbacks; forward them unchanged.
     lane_->begin_load = adapter.begin_load;
     lane_->finish_load = adapter.finish_load;
+    lane_->before_compute = adapter.before_compute;
     lane_->expert_planes = adapter.expert_planes;
-    lane_->before_compute = nullptr;  // the split-load path uses begin_load/finish_load
     return true;
   }
 

@@ -7,6 +7,7 @@
 #include <future>
 #include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_glm5next_graph_impl.hpp"
+#include "cold_moe_strategy_early_ready.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -95,6 +96,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
   ggml_set_name(lane->gpu_output, ("glm5next_early_ready_output_l" + std::to_string(layer)).c_str());
   ggml_backend_sched_set_tensor_backend(g.sched, lane->gpu_output, g.cuda);
 
+  moestream::graph::ColdMoEAdapter adapter;
   if (offload_layer(layer)) {
     OffloadState *o = get_offload(*g.engine);
     if (!o)
@@ -108,7 +110,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
         int n = 0;
       };
       auto flight = std::make_shared<InFlight>();
-      lane->begin_load = [o, layer, flight](const int32_t *experts, int n, std::vector<int32_t> &pending) {
+      adapter.begin_load = [o, layer, flight](const int32_t *experts, int n, std::vector<int32_t> &pending) {
         flight->t0 = std::chrono::steady_clock::now();
         flight->n = n;
         flight->plan = o->store->begin_ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
@@ -126,7 +128,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
         });
         return true;
       };
-      lane->finish_load = [o, layer, flight]() {
+      adapter.finish_load = [o, layer, flight]() {
         const auto r = flight->result.get();
         auto &ct = o->store->counters();
         ct.calls.fetch_add(1, std::memory_order_relaxed);
@@ -149,7 +151,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
         return true;
       };
     } else
-    lane->before_compute = [o, layer](const int32_t *experts, int n) {
+    adapter.before_compute = [o, layer](const int32_t *experts, int n) {
       const auto t0 = std::chrono::steady_clock::now();
       const auto r = o->store->ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
       auto &ct = o->store->counters();
@@ -210,7 +212,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
           lane->assists[1].graph = nullptr;
           LOG_WARN("[GGML-GLM5NEXT-EARLY-READY] layer=%d second GPU assist unavailable\n", layer);
         }
-        lane->expert_planes = [o, layer](int expert, const void *planes[3]) {
+        adapter.expert_planes = [o, layer](int expert, const void *planes[3]) {
           if (!o->residency->ready({layer, expert}) || !o->store->is_pinned(layer, expert))
             return false;  // an unpinned slot would make the async copy a blocking staged one
           for (int k = 0; k < 3; ++k)
@@ -224,6 +226,12 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
     }
   }
   EarlyReadyLane *raw = lane.get();
+  // Install the strategy view of this lane (adapter-first migration): build the family's
+  // residency callbacks into the lane through the ColdMoEStrategy interface, so future steps
+  // (threading generation + State) go through the strategy instead of the raw members.
+  raw->strategy = std::make_unique<moestream::graph::EarlyReadyLaneStrategy>(raw);
+  moestream::graph::ColdMoEInvocation inv;
+  raw->strategy->begin(inv, adapter);
   g.early_ready.emplace(layer, std::move(lane));
   LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);
   return raw;

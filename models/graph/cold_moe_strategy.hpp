@@ -31,6 +31,11 @@ struct ColdMoEInvocation {
 };
 
 // The adapter a family supplies. Addressing only — owns no cache/staging/lane machinery.
+//
+// Exactly the union of EarlyReadyLane's residency callbacks, so the lane is one implementation:
+// the split-load path supplies begin_load/finish_load (background residency, returns the still
+// pending experts); the synchronous path supplies before_compute (block until resident); the
+// GPU-assist path supplies expert_planes. A family supplies whichever it supports.
 struct ColdMoEAdapter {
   // Plane pointers (gate/up/down) for `expert`; false when this family cannot address it.
   std::function<bool(int expert, const void *planes[3])> expert_planes;
@@ -38,6 +43,9 @@ struct ColdMoEAdapter {
   std::function<bool(const int32_t *experts, int n, std::vector<int32_t> &pending)> begin_load;
   // Block until every expert handed to begin_load is ready.
   std::function<bool()> finish_load;
+  // Block until `experts` are resident (synchronous, non-split path). Mutually exclusive with
+  // begin_load/finish_load.
+  std::function<bool(const int32_t *experts, int n)> before_compute;
 };
 
 // The shared backend. One instance per family (or shared across compatible families); it owns
