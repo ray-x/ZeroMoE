@@ -670,3 +670,9 @@ Recipe for the best numbers: `MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5
 Cleanup note: after Trial 47 the measurement-only code was removed (evict/lock timers, retarget counters, `EVICT=none`, balanced split mode, split timing, read chunking, async-eviction); the per-token lane breakdown log line stays. Re-verified on the cleaned build: retarget on 2.09 first-to-last (Rates 1.96) vs off 1.78 (1.68). Memory at peak and the config/scripts are in `docs/GLM5.3-baseline.md` and `bench/glm53/`.
 
 Update (2026-10-20): `MOESTREAM_OFFLOAD_RETARGET` is now on by default whenever SSD offload is active; `=0` disables. See `docs/offload-retarget.md`.
+
+## DeepSeek V4.1 Flash (2026-10-21)
+3090 + 5060 Ti, Release, coherent chat-template text at temp 0.8, `configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml`:
+decode about 4.0-4.5 tok/s (about 230 ms/token), up from 0.88 -> 1.30 -> 3.5 over earlier sessions. 10 tok/s target not met.
+Prefill about 29 tok/s on 817 tokens (older measurement). Details, switches and verification:
+`docs/deepseek_v41_changelog_2026-10-21.md`.
