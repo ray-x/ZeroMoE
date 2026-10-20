@@ -26,6 +26,9 @@ extern void mla_attention_absorbed_gguf(StreamingEngine &engine,
                                          int layer_idx,
                                          const float *hidden_states, int S,
                                          int pos_base, float *out_context);
+extern void bailingmoe3_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                      const float *hidden_states, int S,
+                                      int pos_base, float *out_context);
 extern void dense_attention_gguf(StreamingEngine &engine, int layer_idx,
                                   const float *hidden_states, int S,
                                   int pos_base, float *out_context);
@@ -356,8 +359,13 @@ static void alloc_glm5next_cache(StreamingEngine &engine,
   engine.glm5next_recur_state.resize(c.n_layers);
   size_t total_bytes = 0;
   int n_kda = 0;
+  const auto is_kda = [&](int l) {
+    return !c.bailingmoe3_head_count_kv.empty()
+               ? bailingmoe3_is_kda_layer(c, l)
+               : glm5next_is_kda_layer(c, l);
+  };
   for (int l = 0; l < c.n_layers; ++l) {
-    if (!glm5next_is_kda_layer(c, l)) continue;
+    if (!is_kda(l)) continue;
     ++n_kda;
     total_bytes += ((size_t)3 * d_inner * hist + (size_t)H * hd * hd) * sizeof(float);
   }
@@ -367,7 +375,7 @@ static void alloc_glm5next_cache(StreamingEngine &engine,
     return;
   }
   for (int l = 0; l < c.n_layers; ++l) {
-    if (!glm5next_is_kda_layer(c, l)) continue;
+    if (!is_kda(l)) continue;
     engine.glm5next_conv_history[l].assign((size_t)3 * d_inner * hist, 0.0f);
     engine.glm5next_recur_state[l].assign((size_t)H * hd * hd, 0.0f);
   }
@@ -600,6 +608,14 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     ops.default_gating = GatingFunc::Sigmoid;
     use_hyper_connections(ops, c);
     ops.attention_fn = &glm5next_attention_gguf;
+    ops.alloc_cache_fn = &alloc_glm5next_cache;
+    break;
+
+  case ModelFamily::BailingMoE3:
+    ops.attn_type = AttentionType::MLA;
+    ops.cache_shape = CacheShape::MLAAbsorbed;
+    ops.default_gating = GatingFunc::Sigmoid;
+    ops.attention_fn = &bailingmoe3_attention_gguf;
     ops.alloc_cache_fn = &alloc_glm5next_cache;
     break;
 

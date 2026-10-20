@@ -6,6 +6,7 @@
 #include "engine.hpp"
 #include "full_graph_model.hpp"
 #include "expert_activation.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_deepseek_v41_graph.hpp"
 #include "dsv41_trace.hpp"
 #include "ggml_gdn_proj_backend.hpp"
@@ -1037,6 +1038,14 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       return;
     deepseek_v41_bind_graph_runtime(engine, ram_mgr, async_io_queue,
                                     g_layer_scratch);
+  }
+  if (engine.family_ops.family == ModelFamily::BailingMoE3 &&
+      bailingmoe3_native_graph_enabled()) {
+    if (!g_layer_scratch.resize(S, D, c.n_experts, c.moe_inter, c.topk,
+                                c.n_expert_shared, c.dense_inter))
+      return;
+    bailingmoe3_native_graph_bind_runtime(engine, ram_mgr, async_io_queue,
+                                          g_layer_scratch);
   }
   const ModelGraphRequest prefill_graph_request{
       ModelGraphPhase::Prefill, S, pos_base, token_ids, hidden_states};

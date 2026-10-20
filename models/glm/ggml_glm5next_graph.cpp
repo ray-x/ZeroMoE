@@ -5,6 +5,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -43,10 +44,15 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 }
 
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
-  if (!env_enabled() || !glm5next_graph::glm_family(engine.family_ops.family))
+  if (!graph_enabled_for(engine))
     return false;
   moestream::graphcfg::log_effective("glm5next-full-graph");
   g_skip_indexer_weights = engine.family_ops.family == ModelFamily::GLM_DSA;
+  if (bailingmoe3_hybrid_cuda_graph_enabled()) {
+    LOG_INFO("[GGML-LING-HYBRID] native expert cache owns DDR/VRAM; "
+             "skipping graph-owned expert preload\n");
+    return true;
+  }
   // Build and seed the offload cache at boot, not inside the first decode token.
   FullGraph candidate;
   candidate.engine = &engine;
@@ -148,8 +154,7 @@ bool glm5next_full_graph_prepare(StreamingEngine &engine, int S, int pos_base, c
 }
 
 static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int pos_base, const int *) {
-  if (!env_enabled() || S <= 1 || pos_base < 0 ||
-      !glm5next_graph::glm_family(engine.family_ops.family))
+  if (!graph_enabled_for(engine) || S <= 1 || pos_base < 0)
     return false;
   const auto &c = engine.model_file.architecture_config;
   // The latent cache (engine.Lc) holds max_t rows; a chunk that would write past it is left to the caller.
@@ -190,6 +195,7 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g_graph.reset();
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
+  g->native_moe_cache = bailingmoe3_hybrid_cuda_graph_enabled();
   g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = S;
@@ -215,7 +221,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->d_inner = g->H * g->hd;
   g->d_conv = c.ssm_conv_kernel;
   g->qk_nope = c.qk_nope;
+  g->qk_rope = c.qk_rope;
   g->kv_lora = c.kv_lora;
+  g->kv_cache_width = c.kv_lora + c.qk_rope;
   g->indexer_heads = c.glm5next_indexer_head_count;
   g->indexer_key_length = c.glm5next_indexer_key_length;
   g->indexer_top_k = c.glm5next_indexer_top_k;
@@ -226,12 +234,14 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->qk_rope = c.qk_rope;
   g->dsa_plain = engine.family_ops.family == ModelFamily::GLM_DSA;
   g_skip_indexer_weights = g->dsa_plain;
-  g->kv_row = g->dsa_plain ? c.kv_lora + c.qk_rope : c.kv_lora;
   g->rope_base = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
   g->first_dense = c.first_dense;
-  g->device_expert_layers = std::min(glm5next_full_graph_device_expert_layers(),
-                                     std::max(0, c.n_layers - c.first_dense));
-  if (configure_partial_experts(*g))
+  g->device_expert_layers =
+      g->native_moe_cache
+          ? 0
+          : std::min(glm5next_full_graph_device_expert_layers(),
+                     std::max(0, c.n_layers - c.first_dense));
+  if (!g->native_moe_cache && configure_partial_experts(*g))
     g->device_expert_layers = 0;
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
@@ -245,17 +255,19 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   if (!g->cuda || !g->cpu)
     return false;
 
-  if (g_glm5next_source &&
+  if (!g->native_moe_cache && g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, *g)) {
     if (!g_glm5next_source->move_expert_source_to(*g))
       return false;
     LOG_INFO("[GGML-GLM5NEXT-FULL] reusing boot expert source: %.2f GiB DDR; "
              "no SSD reload for prompt S=%d\n",
              (double)g->expert_source_used / (1024.0 * 1024.0 * 1024.0), S);
-  } else if (!prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL")) {
+  } else if (!g->native_moe_cache &&
+             !prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL")) {
     return false;
   }
-  if (!init_expert_arena(*g) || !init_dense_arena(*g))
+  if ((!g->native_moe_cache && !init_expert_arena(*g)) ||
+      !init_dense_arena(*g))
     return false;
   // Memory pre-check: the scheduler's workspace is requested from the allocator in one piece, and a request the device
   // cannot satisfy must never reach it. Device-0 consumption measured from free memory after the build: ~0.8 MiB per token (0.20 GiB left at 814
@@ -367,13 +379,14 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
 
   const int valid_rows =
       std::min(g.decode_last_pos + 1, std::max(0, engine.max_t));
-  const size_t row_w = g.dsa_plain ? g.kv_row : g.kv_lora;
-  const size_t kv_n = (size_t)valid_rows * row_w;
+  const size_t kv_n = (size_t)valid_rows * g.kv_cache_width;
   std::vector<ggml_fp16_t> half_cache(kv_n);
   std::vector<float> cache(kv_n);
   for (size_t i = 0; i < g.dsa_layers.size(); ++i) {
     const int layer = g.dsa_layers[i];
     if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        (g.qk_rope > 0 &&
+         (layer >= (int)engine.Rc.size() || !engine.Rc[layer])) ||
         i >= g.dsa_kv_storage.size())
       return false;
     if (kv_n == 0)
@@ -382,16 +395,14 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
                             kv_n * sizeof(ggml_fp16_t));
     for (size_t j = 0; j < kv_n; ++j)
       cache[j] = ggml_fp16_to_fp32(half_cache[j]);
-    if (g.dsa_plain) {
-      if (layer >= (int)engine.Rc.size() || !engine.Rc[layer])
-        return false;
-      for (int t = 0; t < valid_rows; ++t) {
-        std::memcpy(engine.Lc[layer] + (size_t)t * g.kv_lora, cache.data() + (size_t)t * row_w, g.kv_lora * sizeof(float));
-        std::memcpy(engine.Rc[layer] + (size_t)t * g.qk_rope, cache.data() + (size_t)t * row_w + g.kv_lora,
-                    g.qk_rope * sizeof(float));
-      }
-    } else {
-      std::memcpy(engine.Lc[layer], cache.data(), kv_n * sizeof(float));
+    for (int t = 0; t < valid_rows; ++t) {
+      std::memcpy(engine.Lc[layer] + (size_t)t * g.kv_lora,
+                  cache.data() + (size_t)t * g.kv_cache_width,
+                  (size_t)g.kv_lora * sizeof(float));
+      if (g.qk_rope > 0)
+        std::memcpy(engine.Rc[layer] + (size_t)t * g.qk_rope,
+                    cache.data() + (size_t)t * g.kv_cache_width + g.kv_lora,
+                    (size_t)g.qk_rope * sizeof(float));
     }
   }
   return true;
@@ -401,6 +412,7 @@ bool sync_glm5next_decode_state_to_host(FullGraph &g) {
 
 #else
 
+bool ling_full_graph_enabled() { return false; }
 bool glm5next_full_graph_enabled() { return false; }
 bool glm5next_full_graph_bootstrap(StreamingEngine &) { return false; }
 void glm5next_full_graph_set_vram_cache(GpuTopology *) {}

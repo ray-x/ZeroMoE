@@ -88,6 +88,7 @@ public:
   // (a system turn with the reasoning-effort instructions precedes it; see
   // the model's tokenizer_config.json chat_template).
   int im_start_id = -1, im_end_id = -1;
+  int bailing_role_end_id = -1;
 
   GGUFTokenizer() { init_byte_unicode(); }
 
@@ -99,6 +100,7 @@ public:
   // roles are plain text after <|im_start|>.
   bool has_chatml_template() const { return im_start_id >= 0 && im_end_id >= 0;
   }
+  bool has_bailing_template() const { return bailing_role_end_id >= 0; }
   bool is_loaded() const { return !id_to_token.empty(); }
 
   bool is_stop_token(int id) const {
@@ -255,6 +257,7 @@ public:
     ds_think_end_id = find("</think>");
     im_start_id = find("<|im_start|>");
     im_end_id = find("<|im_end|>");
+    bailing_role_end_id = find("<|role_end|>");
 
     // GLM-5.2's real HF config.json has THREE eos_token_id entries:
     // <|endoftext|>, <|user|>, <|observation|>
@@ -301,7 +304,9 @@ public:
   std::vector<int> encode(const std::string &text) {
     std::vector<int> out;
     for (const auto &chunk :
-         (pre_type == "glm4" ? pretokenize_glm4(text) : pretokenize(text))) {
+         ((pre_type == "glm4" || pre_type == "bailingmoe2")
+              ? pretokenize_glm4(text, pre_type == "bailingmoe2" ? 1 : 3)
+              : pretokenize(text))) {
       if (chunk.empty())
         continue;
       std::vector<std::string> symbols = to_unicode_symbols(chunk);
@@ -461,7 +466,8 @@ private:
   //   (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
   //   ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
   // \p{L} is approximated by ASCII letters plus any non-ASCII byte, \p{N} by ASCII digits, \s by ASCII whitespace.
-  static std::vector<std::string> pretokenize_glm4(const std::string &text) {
+  static std::vector<std::string> pretokenize_glm4(const std::string &text,
+                                                   size_t digit_span = 3) {
     const size_t n = text.size();
     auto is_ws = [&](size_t k) { return k < n && std::isspace((unsigned char)text[k]); };
     auto is_nl = [&](size_t k) { return k < n && (text[k] == '\r' || text[k] == '\n'); };
@@ -493,7 +499,7 @@ private:
       // \p{N}{1,3}
       if (is_digit(i)) {
         size_t k = i;
-        while (k < n && k - i < 3 && is_digit(k)) ++k;
+        while (k < n && k - i < digit_span && is_digit(k)) ++k;
         out.push_back(text.substr(i, k - i)); i = k; continue;
       }
       // ' ?[^\s\p{L}\p{N}]+[\r\n]*'

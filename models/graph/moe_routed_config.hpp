@@ -17,6 +17,8 @@ inline RouterSpec router_spec(const ArchitectureConfig &c, int n_tokens,
   s.n_experts = c.n_experts;
   s.topk = c.topk;
   s.n_tokens = n_tokens;
+  s.n_groups = c.expert_group_count;
+  s.n_groups_used = c.expert_group_used_count;
   s.weights_norm = c.expert_weights_norm;
   s.weights_scale = c.expert_weights_scale;
   if (honor_gating_func) {

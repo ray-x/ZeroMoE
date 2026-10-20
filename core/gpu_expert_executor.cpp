@@ -173,7 +173,8 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
                           const ExpertLocation *location, const float *input,
                           const GGUFTensor &gate_meta,
                           const GGUFTensor &up_meta, int S, int D,
-                          int moe_inter, GpuTopology *topology) {
+                          int moe_inter, GpuTopology *topology,
+                          const float *shared_device_input) {
   PERF_SCOPE(t_gpu_issue_total);
   cudaSetDevice(location->gpu_id);
   const uint8_t *gate_device = location->device_ptr;
@@ -313,18 +314,22 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
 
   if (!scratch.ensure(S, D, moe_inter, location->gpu_id))
     return false;
-  PERF_START(upload);
-  cudaMemcpyAsync(
-      scratch.d_x, input, static_cast<size_t>(S) * D * sizeof(float),
-      cudaMemcpyHostToDevice,
-      topology && location->gpu_id >= 0 &&
-              static_cast<size_t>(location->gpu_id) < topology->devices.size()
-          ? topology->devices[location->gpu_id].compute_stream
-          : nullptr);
-  PERF_END(upload, t_expert_gpu_upload);
-  CudaKernelDispatcher::matmul(gate_meta.type, scratch.d_gate, scratch.d_x,
+  const float *device_input = shared_device_input;
+  if (!device_input) {
+    PERF_START(upload);
+    cudaMemcpyAsync(
+        scratch.d_x, input, static_cast<size_t>(S) * D * sizeof(float),
+        cudaMemcpyHostToDevice,
+        topology && location->gpu_id >= 0 &&
+                static_cast<size_t>(location->gpu_id) < topology->devices.size()
+            ? topology->devices[location->gpu_id].compute_stream
+            : nullptr);
+    PERF_END(upload, t_expert_gpu_upload);
+    device_input = scratch.d_x;
+  }
+  CudaKernelDispatcher::matmul(gate_meta.type, scratch.d_gate, device_input,
                                gate_device, S, D, moe_inter);
-  CudaKernelDispatcher::matmul(up_meta.type, scratch.d_up, scratch.d_x,
+  CudaKernelDispatcher::matmul(up_meta.type, scratch.d_up, device_input,
                                up_device, S, D, moe_inter);
   return true;
 }

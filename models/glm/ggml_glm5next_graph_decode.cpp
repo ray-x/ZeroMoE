@@ -4,6 +4,7 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -11,8 +12,8 @@ using namespace glm5next_graph;
 
 bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                         const int *) {
-  if (!env_enabled() || engine.mtp_enabled || pos_base < 0 ||
-      !glm5next_graph::glm_family(engine.family_ops.family) || engine.max_t <= 0 ||
+  if (!graph_enabled_for(engine) || engine.mtp_enabled || pos_base < 0 ||
+      engine.max_t <= 0 ||
       pos_base >= engine.max_t)
     return false;
   if (g_glm5next_decode_disabled_engine == &engine)
@@ -49,6 +50,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   auto g = std::make_unique<FullGraph>();
   g->engine = &engine;
+  g->native_moe_cache = bailingmoe3_hybrid_cuda_graph_enabled();
   g->topology = g_glm5next_vram_cache;
   g->device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
   g->S = 1;
@@ -63,7 +65,9 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->d_inner = g->H * g->hd;
   g->d_conv = c.ssm_conv_kernel;
   g->qk_nope = c.qk_nope;
+  g->qk_rope = c.qk_rope;
   g->kv_lora = c.kv_lora;
+  g->kv_cache_width = c.kv_lora + c.qk_rope;
   g->indexer_heads = c.glm5next_indexer_head_count;
   g->indexer_key_length = c.glm5next_indexer_key_length;
   g->indexer_top_k = c.glm5next_indexer_top_k;
@@ -74,13 +78,14 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->qk_rope = c.qk_rope;
   g->dsa_plain = engine.family_ops.family == ModelFamily::GLM_DSA;
   g_skip_indexer_weights = g->dsa_plain;
-  g->kv_row = g->dsa_plain ? c.kv_lora + c.qk_rope : c.kv_lora;
   g->rope_base = engine.model_file.get_config_float("rope.freq_base", 10000.0f);
   g->first_dense = c.first_dense;
-  g->device_expert_layers = std::min(
-      glm5next_full_graph_device_expert_layers(),
-      std::max(0, c.n_layers - c.first_dense));
-  if (configure_partial_experts(*g))
+  g->device_expert_layers =
+      g->native_moe_cache
+          ? 0
+          : std::min(glm5next_full_graph_device_expert_layers(),
+                     std::max(0, c.n_layers - c.first_dense));
+  if (!g->native_moe_cache && configure_partial_experts(*g))
     g->device_expert_layers = 0;
 
   // Sparse decode requires prompt-computed indexer keys and complete KPool
@@ -95,7 +100,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       g_graph->indexer_key_length == g->indexer_key_length &&
       g_graph->indexer_kpool == g->indexer_kpool) {
     for (int l = 0; l < g->n_layers; ++l) {
-      if (!glm5next_is_kda_layer(c, l) && glm5next_indexer_owner(*g, l))
+      if (!hybrid_is_kda_layer(c, l) && glm5next_indexer_owner(*g, l))
         ++expected_indexer_owners;
     }
     bool seeds_match = expected_indexer_owners > 0 &&
@@ -138,12 +143,12 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   // Preserve the large, reusable DDR expert source while replacing the
   // prompt-shaped graph with the fixed S=1 decode topology.
   bool source_transferred = false;
-  if (g_graph && g_graph->has_expert_source() &&
+  if (!g->native_moe_cache && g_graph && g_graph->has_expert_source() &&
       source_configuration_matches(*g_graph, *g)) {
     if (!g_graph->move_expert_source_to(*g))
       return false;
     source_transferred = true;
-  } else if (g_glm5next_source &&
+  } else if (!g->native_moe_cache && g_glm5next_source &&
              source_configuration_matches(*g_glm5next_source, *g)) {
     if (!g_glm5next_source->move_expert_source_to(*g))
       return false;
@@ -188,16 +193,17 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   }
   if (!g->cuda || !g->cpu)
     return decline_decode_graph();
-  if (!source_transferred && g_glm5next_source &&
+  if (!g->native_moe_cache && !source_transferred && g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, *g)) {
     if (!g_glm5next_source->move_expert_source_to(*g))
       return decline_decode_graph();
     source_transferred = true;
   }
-  if (!source_transferred &&
+  if (!g->native_moe_cache && !source_transferred &&
       !prepare_expert_source_only(*g, "GGML-GLM5NEXT-FULL-DECODE"))
     return decline_decode_graph();
-  if (!init_expert_arena(*g) || !init_dense_arena(*g) ||
+  if ((!g->native_moe_cache && !init_expert_arena(*g)) ||
+      !init_dense_arena(*g) ||
       !init_decode_state_arena(*g)) {
     return decline_decode_graph();
   }
@@ -258,6 +264,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   for (size_t i = 0; i < g->dsa_layers.size(); ++i) {
     const int layer = g->dsa_layers[i];
     if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        (g->qk_rope > 0 &&
+         (layer >= (int)engine.Rc.size() || !engine.Rc[layer])) ||
         i >= g->dsa_kv_storage.size()) {
       return decline_decode_graph();
     }
@@ -265,23 +273,18 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     if (cudaMemset(cache->data, 0, ggml_nbytes(cache)) != cudaSuccess) {
       return decline_decode_graph();
     }
-    const size_t seed_rows = (size_t)pos_base * g->kv_row;
+    const size_t seed_rows = (size_t)pos_base * g->kv_cache_width;
     if (seed_rows > 0) {
       std::vector<ggml_fp16_t> half_cache(seed_rows);
-      if (g->dsa_plain) {
-        if (layer >= (int)engine.Rc.size() || !engine.Rc[layer])
-          return decline_decode_graph();
-        for (int t = 0; t < pos_base; ++t) {
-          ggml_fp16_t *dst = half_cache.data() + (size_t)t * g->kv_row;
-          for (int j = 0; j < g->kv_lora; ++j)
-            dst[j] = ggml_fp32_to_fp16(engine.Lc[layer][(size_t)t * g->kv_lora + j]);
-          for (int j = 0; j < g->qk_rope; ++j)
-            dst[g->kv_lora + j] = ggml_fp32_to_fp16(engine.Rc[layer][(size_t)t * g->qk_rope + j]);
-        }
-      } else {
-        const float *src = engine.Lc[layer];
-        for (size_t j = 0; j < seed_rows; ++j)
-          half_cache[j] = ggml_fp32_to_fp16(src[j]);
+      if (g->qk_rope > 0 && (layer >= (int)engine.Rc.size() || !engine.Rc[layer]))
+        return decline_decode_graph();
+      for (int t = 0; t < pos_base; ++t) {
+        for (int d = 0; d < g->kv_lora; ++d)
+          half_cache[(size_t)t * g->kv_cache_width + d] =
+              ggml_fp32_to_fp16(engine.Lc[layer][(size_t)t * g->kv_lora + d]);
+        for (int d = 0; d < g->qk_rope; ++d)
+          half_cache[(size_t)t * g->kv_cache_width + g->kv_lora + d] =
+              ggml_fp32_to_fp16(engine.Rc[layer][(size_t)t * g->qk_rope + d]);
       }
       ggml_backend_tensor_set(cache, half_cache.data(), 0,
                               seed_rows * sizeof(ggml_fp16_t));
@@ -326,7 +329,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 bool glm5next_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *) {
-  if (!env_enabled() || !hidden_states || pos_base < 0 || !g_graph ||
+  if (!graph_enabled_for(engine) || !hidden_states || pos_base < 0 || !g_graph ||
       !g_graph->ready || !g_graph->decode_mode || g_graph->engine != &engine ||
       g_graph->S != 1 || pos_base >= g_graph->kv_capacity ||
       g_graph->decode_last_pos + 1 != pos_base)
@@ -468,16 +471,18 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     g_glm5next_decode_disabled_engine = &engine;
     return false;
   }
-  if ((!g.dsa_plain && engine.hc_stream_buf.size() < (size_t)g.D * g.HC) ||
+  const bool plain_residual = g.dsa_plain ||
+                              engine.family_ops.family == ModelFamily::BailingMoE3;
+  if ((!plain_residual &&
+       engine.hc_stream_buf.size() < (size_t)g.D * g.HC) ||
       !g.input || !g.attn_mask || !g.decode_indices)
     return false;
 
-  if (g.dsa_plain) {
-    std::memcpy(g.input->data, hidden_states, (size_t)g.D * sizeof(float));
+  if (g.dsa_plain)
     *static_cast<int32_t *>(g.positions->data) = pos_base;
-  } else {
-    std::memcpy(g.input->data, engine.hc_stream_buf.data(), (size_t)g.D * g.HC * sizeof(float));
-  }
+  std::memcpy(g.input->data,
+              plain_residual ? hidden_states : engine.hc_stream_buf.data(),
+              (size_t)g.D * g.HC * sizeof(float));
   *static_cast<int32_t *>(g.decode_indices->data) = pos_base;
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);
   for (int k = 0; k < g.kv_capacity; ++k)

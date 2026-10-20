@@ -66,7 +66,8 @@ std::expected<void, std::string> EngineRunner::start_workers() {
   // bounded by host_ram_gb and the memory watchdog; failure leaves the
   // established layer path available.
   if (engine.family_ops.family == ModelFamily::GLM5NEXT ||
-      engine.family_ops.family == ModelFamily::GLM_DSA)
+      engine.family_ops.family == ModelFamily::GLM_DSA ||
+      engine.family_ops.family == ModelFamily::BailingMoE3)
     glm5next_full_graph_set_vram_cache(&gpu.topology);
   if (graph_mode && !graph_model->bootstrap(engine)) {
     LOG_STREAM_WARN()
@@ -168,9 +169,35 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     // very likely the real explanation for "the same output regardless
     // of prompt": the input to the model WAS identical every time.
     std::vector<int> prompt_tokens;
-    if (!config.raw_prompt &&
-        engine.family_ops.family == ModelFamily::GLM5NEXT &&
-        tokenizer.has_chat_template()) {
+  if (!config.raw_prompt &&
+      engine.family_ops.family == ModelFamily::BailingMoE3 &&
+      tokenizer.has_bailing_template()) {
+    auto append_text = [&](const std::string &text) {
+      auto ids = tokenizer.encode(text);
+      prompt_tokens.insert(prompt_tokens.end(), ids.begin(), ids.end());
+    };
+    append_text("<role>SYSTEM</role>");
+    if (!config.system_prompt.empty())
+      append_text(config.system_prompt + "\n");
+    append_text(config.enable_thinking ? "detailed thinking on"
+                                       : "detailed thinking off");
+    prompt_tokens.push_back(tokenizer.bailing_role_end_id);
+    append_text("<role>HUMAN</role>" + user_input);
+    prompt_tokens.push_back(tokenizer.bailing_role_end_id);
+    append_text("<role>ASSISTANT</role>\n");
+    if (tokenizer.ds_think_start_id >= 0)
+      prompt_tokens.push_back(tokenizer.ds_think_start_id);
+    else
+      append_text("<think>");
+    if (!config.enable_thinking) {
+      if (tokenizer.ds_think_end_id >= 0)
+        prompt_tokens.push_back(tokenizer.ds_think_end_id);
+      else
+        append_text("</think>");
+    }
+  } else if (!config.raw_prompt &&
+             engine.family_ops.family == ModelFamily::GLM5NEXT &&
+             tokenizer.has_chat_template()) {
       // GLM-5.3-Flash's real template is distinct from the older GLM
       // template even though both use [gMASK], <sop>, <|user|>, and
       // <|assistant|>. It has no newline after role tags. Thinking is

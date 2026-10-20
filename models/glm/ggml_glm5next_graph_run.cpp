@@ -11,7 +11,7 @@ using namespace glm5next_graph;
 
 bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *) {
-  if (!env_enabled() || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
+  if (!graph_enabled_for(engine) || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
       !g_graph->ready || g_graph->engine != &engine || g_graph->S != S ||
       g_graph->pos_base != pos_base || g_graph->decode_mode)
     return false;
@@ -47,29 +47,28 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     std::memcpy(in.data, seed->pooled_keys.data(), n * sizeof(float));
   }
   for (const auto &[layer, dst] : g.dsa_prev_inputs) {
-    if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer])
+    if (layer < 0 || layer >= (int)engine.Lc.size() || !engine.Lc[layer] ||
+        (g.qk_rope > 0 &&
+         (layer >= (int)engine.Rc.size() || !engine.Rc[layer])))
       return false;
-    if (g.dsa_plain) {
-      if (layer >= (int)engine.Rc.size() || !engine.Rc[layer])
-        return false;
-      for (int t = 0; t < pos_base; ++t) {
-        std::memcpy(dst + (size_t)t * g.kv_row, engine.Lc[layer] + (size_t)t * g.kv_lora, g.kv_lora * sizeof(float));
-        std::memcpy(dst + (size_t)t * g.kv_row + g.kv_lora, engine.Rc[layer] + (size_t)t * g.qk_rope,
-                    g.qk_rope * sizeof(float));
-      }
-    } else {
-      std::memcpy(dst, engine.Lc[layer], (size_t)pos_base * g.kv_lora * sizeof(float));
+    for (int t = 0; t < pos_base; ++t) {
+      std::memcpy(dst + (size_t)t * g.kv_cache_width,
+                  engine.Lc[layer] + (size_t)t * g.kv_lora,
+                  (size_t)g.kv_lora * sizeof(float));
+      if (g.qk_rope > 0)
+        std::memcpy(dst + (size_t)t * g.kv_cache_width + g.kv_lora,
+                    engine.Rc[layer] + (size_t)t * g.qk_rope,
+                    (size_t)g.qk_rope * sizeof(float));
     }
   }
-  if (g.host_inputs.empty())
+  const bool plain_residual = g.dsa_plain || engine.family_ops.family == ModelFamily::BailingMoE3;
+  if ((!plain_residual &&
+       engine.hc_stream_buf.size() < (size_t)g.D * g.HC * S) ||
+      g.host_inputs.empty())
     return false;
-  if (g.dsa_plain) {
-    std::memcpy(g.host_inputs[0], hidden_states, (size_t)g.D * S * sizeof(float));
-  } else {
-    if (engine.hc_stream_buf.size() < (size_t)g.D * g.HC * S)
-      return false;
-    std::memcpy(g.host_inputs[0], engine.hc_stream_buf.data(), (size_t)g.D * g.HC * S * sizeof(float));
-  }
+  std::memcpy(g.host_inputs[0],
+              plain_residual ? hidden_states : engine.hc_stream_buf.data(),
+              (size_t)g.D * g.HC * S * sizeof(float));
 
   // Real-hardware incident (2026-09-09): a 480-token prompt crashed the
   // whole machine (hard reboot required, no surviving kernel/OOM log --
@@ -166,25 +165,26 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                             engine.glm5next_conv_history[l].data(), 0,
                             hist_n * sizeof(float));
   }
-  const size_t kv_n = (size_t)g.S * (g.dsa_plain ? g.kv_row : g.kv_lora);
+  const size_t kv_n = (size_t)g.S * g.kv_cache_width;
   std::vector<float> kv(kv_n);
   for (size_t i = 0; i < g.dsa_layers.size(); ++i) {
     const int l = g.dsa_layers[i];
-    if (l < 0 || l >= (int)engine.Lc.size() || !engine.Lc[l])
+    if (l < 0 || l >= (int)engine.Lc.size() || !engine.Lc[l] ||
+        (g.qk_rope > 0 &&
+         (l >= (int)engine.Rc.size() || !engine.Rc[l])))
       return false;
     ggml_backend_tensor_get(g.dsa_kv_out[i], kv.data(), 0,
                             kv_n * sizeof(float));
-    if (g.dsa_plain) {
-      if (l >= (int)engine.Rc.size() || !engine.Rc[l])
-        return false;
-      for (int t = 0; t < g.S; ++t) {
-        std::memcpy(engine.Lc[l] + (size_t)(pos_base + t) * g.kv_lora, kv.data() + (size_t)t * g.kv_row,
-                    g.kv_lora * sizeof(float));
-        std::memcpy(engine.Rc[l] + (size_t)(pos_base + t) * g.qk_rope, kv.data() + (size_t)t * g.kv_row + g.kv_lora,
-                    g.qk_rope * sizeof(float));
-      }
-    } else {
-      std::memcpy(engine.Lc[l] + (size_t)pos_base * g.kv_lora, kv.data(), kv_n * sizeof(float));
+    if (g.qk_rope > 0 && (l >= (int)engine.Rc.size() || !engine.Rc[l]))
+      return false;
+    for (int t = 0; t < g.S; ++t) {
+      std::memcpy(engine.Lc[l] + (size_t)(pos_base + t) * g.kv_lora,
+                  kv.data() + (size_t)t * g.kv_cache_width,
+                  (size_t)g.kv_lora * sizeof(float));
+      if (g.qk_rope > 0)
+        std::memcpy(engine.Rc[l] + (size_t)(pos_base + t) * g.qk_rope,
+                    kv.data() + (size_t)t * g.kv_cache_width + g.kv_lora,
+                    (size_t)g.qk_rope * sizeof(float));
     }
   }
   g.glm5next_indexer_seeds.clear();

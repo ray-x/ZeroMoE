@@ -61,7 +61,7 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
     // reason as attn_k_b/attn_v_b. attn_output_b (the second, single
     // dense matmul stage) is NOT excluded -- it genuinely goes through
     // dense_proj, see is_attn_output below.
-    if (dsv41_graph_uses_native_moe_cache &&
+    if (graph_uses_native_moe_cache &&
         name.find("attn_output_a.weight") != std::string::npos)
       return true;
     if (name.find("attn_k_b.weight") != std::string::npos ||

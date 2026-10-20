@@ -811,11 +811,18 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
   static const bool force_dummy =
       moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
+  // Batched MMQ negative-id skipping regressed Ling's short-prompt prefill
+  // (13.2 s vs 1.4 s for the same two-token input). Keep batched Ling routes
+  // on the valid dummy id; the single-token decode path still uses MMVQ's
+  // negative-id skip through SentinelPolicy::Auto.
+  const bool allow_batched_negative_skip =
+      g.engine->family_ops.family != ModelFamily::BailingMoE3 &&
+      layer_experts_take_mmq(g, layer);
   const moe_partial::ExpertBranchMap branch_map =
       moe_partial::ExpertBranchMap::build(
           index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
           force_dummy ? moe_partial::SentinelPolicy::ForceDummy
-          : layer_experts_take_mmq(g, layer)
+          : allow_batched_negative_skip
               ? moe_partial::SentinelPolicy::AutoBatched
               : moe_partial::SentinelPolicy::Auto);
   static bool logged_inactive = false;
@@ -1531,7 +1538,17 @@ ggml_tensor *static_full_weight(FullGraph &g, ggml_context *ctx,
                                 const std::string &name) {
   // DSA's attn_k_b and attn_v_b are intentionally absent from the legacy
   // resident manifest because that path builds CPU WUK/WUV caches.  In this
-  // graph they are ordinary static device weights.
+  // graph they are ordinary static weights. Ling's native-cache graph keeps
+  // these tensors in resident_layers on the host for the existing MLA path;
+  // bind that source directly instead of trying to copy it into the graph's
+  // 1 MiB dense marker arena.
+  if (g.native_moe_cache) {
+    if (ggml_tensor *t = resident_tensor(g, ctx, name))
+      return t;
+    LOG_WARN("[GGML-LING-HYBRID] static weight is not resident: %s; "
+             "trying the legacy graph-owned loader\n",
+             name.c_str());
+  }
   return load_full_weight(g, ctx, name, false);
 }
 
