@@ -201,15 +201,17 @@ bool lane_with_gpu1_wanted() {
 // and gives bit-identical CPU-lane output.
 // Optional second assist device (its own ring and PCIe link): MOESTREAM_GLM5NEXT_ASSIST2_DEVICE=<cuda device> (default: device 1 on a
 // dual-GPU run with a second-GPU hot set, else off) and MOESTREAM_GLM5NEXT_ASSIST2_SLOTS=<n> (default 1).
-int gpu_assist2_device() {
-  // Unset: use CUDA device 1 when two devices are visible and the second GPU already holds a hot set; -1 turns it off.
-  static const int d = [] {
+int second_gpu_device(int core_device) { return core_device == 0 ? 1 : 0; }
+
+int gpu_assist2_device(int core_device) {
+  // Unset: use the non-core CUDA device when two devices are visible and the second GPU already holds a hot set; -1 turns it off.
+  static const int d = [core_device] {
     const char *v = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ASSIST2_DEVICE");
     if (v && v[0])
       return std::atoi(v);
     int n = 0;
     const char *hot1 = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
-    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 && hot1[0] ? 1 : -1;
+    return cudaGetDeviceCount(&n) == cudaSuccess && n >= 2 && hot1 && hot1[0] ? second_gpu_device(core_device) : -1;
   }();
   return d;
 }

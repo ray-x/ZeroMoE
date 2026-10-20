@@ -24,6 +24,7 @@
 // handed out without swapping.
 
 #pragma once
+#include <cstdlib>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -144,6 +145,11 @@ public:
     void start(long warn_mb, long stop_mb, int poll_ms) {
         if (running_.load()) return;
         stop_mb_ = effective_stop_limit_mb(stop_mb);
+        // Experiment-only override (MOESTREAM_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 20 GiB default.
+        if (const char *e = std::getenv("MOESTREAM_MEM_GUARD_FLOOR_MB")) {
+            const long v = std::atol(e);
+            if (v >= 8 * 1024) stop_mb_ = v;
+        }
         warn_mb_ = std::max(warn_mb, stop_mb_);
         poll_ms_ = poll_ms > 0 ? poll_ms : 500;
         stop_limit_mb_.store(stop_mb_, std::memory_order_relaxed);

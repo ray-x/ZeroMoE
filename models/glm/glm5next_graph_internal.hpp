@@ -179,6 +179,7 @@ struct FullGraph : moestream::graph::GraphCore {
   FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
 
   GpuTopology *topology = nullptr;
+  std::unordered_map<std::string, ggml_tensor *> resident_cache;
   int d_inner = 0;
   int qk_nope = 0;
   int qk_rope = 0;

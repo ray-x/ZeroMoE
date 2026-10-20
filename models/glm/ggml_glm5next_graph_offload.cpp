@@ -433,7 +433,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   if (two) {
     int cur = 0;
     cudaGetDevice(&cur);
-    ring->parts[1].device = 1; // ggml_shared_backend(1): the second visible device
+    ring->parts[1].device = second_gpu_device(g.device);
     (void)cur;
   }
   size_t cap[2][4][3] = {};

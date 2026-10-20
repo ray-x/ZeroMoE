@@ -155,6 +155,7 @@ struct EarlyReadyLane {
   uint64_t all_hot_visits = 0, all_hot_skips = 0;
   uint64_t output_uploads = 0;
   int64_t wait_us = 0, compute_us = 0;
+  int64_t begin_us = 0, p1_us = 0, p2_us = 0, plain_us = 0; // lane breakdown: begin_load, phase-1 graph, phase-2 graph, unsplit graph
 
   ~EarlyReadyLane() {
     if (device >= 0) cudaSetDevice(device);
@@ -579,7 +580,9 @@ struct EarlyReadyLane {
     bool two_phase = false;
     std::vector<int32_t> pending;
     if (begin_load && n_owned > 0) {
+      const int64_t b0 = ggml_time_us();
       GGML_ASSERT(begin_load(owned, n_owned, pending));
+      begin_us += ggml_time_us() - b0;
       two_phase = !pending.empty() && static_cast<int>(pending.size()) < n_owned;
       if (!two_phase) GGML_ASSERT(finish_load());
     } else if (before_compute && n_owned > 0) {
@@ -655,7 +658,9 @@ struct EarlyReadyLane {
       };
       for (int j = 0; j < n_owned; ++j)
         if (is_pending(owned[j])) { cpu_remap[owned[j]] = -1; cpu_mask[owned[j]] = 0.0f; }
+      const int64_t g1 = ggml_time_us();
       GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+      p1_us += ggml_time_us() - g1;
       phase1_output.assign(static_cast<float *>(output->data),
                            static_cast<float *>(output->data) + static_cast<size_t>(d) * k);
       const int64_t wait0 = ggml_time_us();
@@ -670,7 +675,9 @@ struct EarlyReadyLane {
           cpu_remap[e] = -1; cpu_mask[e] = 0.0f;
         }
       }
+      const int64_t g2 = ggml_time_us();
       GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+      p2_us += ggml_time_us() - g2;
       float *out = static_cast<float *>(output->data);
       for (size_t i = 0; i < phase1_output.size(); ++i) out[i] += phase1_output[i];
       for (int j = 0; j < n_owned; ++j) {
@@ -679,7 +686,9 @@ struct EarlyReadyLane {
       }
       ++split_runs;
     } else {
+      const int64_t g0 = ggml_time_us();
       GGML_ASSERT(ggml_backend_graph_compute(cpu, graph) == GGML_STATUS_SUCCESS);
+      plain_us += ggml_time_us() - g0;
     }
     {
       int total_assisted = 0;

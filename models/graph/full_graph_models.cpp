@@ -160,6 +160,10 @@ class GlmDsaGraphModel final : public FullGraphModelBase<GlmDsaGraphModel> {
   bool bootstrap(StreamingEngine &engine) const override { return glm5next_full_graph_bootstrap(engine); }
   void shutdown() const override { glm5next_full_graph_shutdown(); }
   int device_expert_layers() const override { return glm5next_full_graph_device_expert_layers(); }
+  bool supports_cpu_lane() const override {
+    const char *v = std::getenv("MOESTREAM_GLM_DSA_CPU_LANE");
+    return v && v[0] == '1';
+  }
 
   int max_prefill_tokens(const StreamingEngine &e) const override {
     if (const char *v = std::getenv("MOESTREAM_GLM5NEXT_PREFILL_CHUNK"); v && v[0])

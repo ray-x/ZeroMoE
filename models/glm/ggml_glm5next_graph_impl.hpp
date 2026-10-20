@@ -95,7 +95,9 @@ bool early_ready_wanted();
 bool split_load_wanted();
 // Number of resident cold experts per layer the lane may run on a second CUDA stream (0 = off).
 int gpu_assist_slots();
-int gpu_assist2_device();
+// The CUDA device that is not the trunk (core) device: hot experts and the second assist ring live there.
+int second_gpu_device(int core_device);
+int gpu_assist2_device(int core_device);
 int gpu_assist2_slots();
 // True when every routed-expert plane of `layer` has a type worth assisting on the GPU (see settings).
 bool gpu_assist_layer_ok(const FullGraph &g, int layer);
@@ -132,10 +134,12 @@ ggml_tensor *stage_hot_mask(FullGraph &g, ggml_context *ctx, int layer);
 bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, int l);
 ggml_tensor *stage_ring_tensor(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, int plane);
 ggml_tensor *stage_miss_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, ggml_tensor *cold_ids, ggml_tensor *route_ids);
+ggml_tensor *stage_post_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, int layer, ggml_tensor *route_ids);
 void *alloc_expert_source(FullGraph &g, size_t bytes);
 bool graph_dense_weight_name(const std::string &name);
 bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity, size_t &used, ggml_tensor *t, const void *src, size_t src_bytes);
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx, const std::string &name);
+ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx, const std::string &name);
 size_t device_expert_bytes(const FullGraph &g);
 size_t dense_arena_bytes(const FullGraph &g);
 bool init_dense_arena(FullGraph &g);
@@ -179,6 +183,7 @@ ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer, bool m
 ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem, int plane);
 bool prepare_partial_hot1(FullGraph &g, ggml_context *ctx, int layer);
 void assign_gpu1_hot(FullGraph &g, double gib);
+bool preload_partial_hot1(FullGraph &g);
 ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot, bool mask);
 bool upload_partial_maps(FullGraph &g, PartialExpertLayer &p);
 bool ensure_dynamic_upload_worker(FullGraph &g);

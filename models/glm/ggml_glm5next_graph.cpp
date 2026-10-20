@@ -64,6 +64,8 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
                                ? &candidate.partial_experts
                                : nullptr))
     return false;
+  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU1_HOT_PRELOAD", 1) != 0 && !preload_partial_hot1(candidate))
+    LOG_WARN("[GGML-GLM5NEXT-GPU1-HOT] boot preload failed; hot experts will upload at the first decode build\n");
 
   if (g_glm5next_source &&
       source_configuration_matches(*g_glm5next_source, candidate)) {
@@ -288,7 +290,7 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)
     for (const auto &pl : g->partial_experts)
       if (!pl.hot1.empty()) {
-        g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
+        g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
         break;
       }
   ggml_backend_t backends[] = {g->cuda, g->gpu1 ? g->gpu1 : g->cpu, g->cpu};

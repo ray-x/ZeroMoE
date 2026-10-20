@@ -204,7 +204,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
     int a = -1, b = -2;
     if (std::sscanf(e, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a) {
-      g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
+      g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
       if (g->gpu1) {
         g->gpu1_first = a;
         g->gpu1_last = b;
@@ -216,7 +216,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // GPU1 hot experts (MOESTREAM_GLM5NEXT_GPU1_HOT_GIB) need the second backend even without whole GPU1 layers.
     for (const auto &pl : g->partial_experts)
       if (!pl.hot1.empty()) {
-        g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(1));
+        g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
         break;
       }
   }
@@ -622,7 +622,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     static int lane_tokens = 0;
     if (++lane_tokens % 16 == 0) {
       uint64_t calls = 0, split = 0, a_runs = 0, a_experts = 0;
-      int64_t wait = 0, compute = 0, stall = 0, a_stall = 0;
+      int64_t wait = 0, compute = 0, stall = 0, a_stall = 0, b_us = 0, p1 = 0, p2 = 0, pl = 0;
       for (auto &entry : g.early_ready) {
         calls += entry.second->calls;
         split += entry.second->split_runs;
@@ -632,6 +632,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
         a_runs += entry.second->assist_runs;
         a_experts += entry.second->assist_experts;
         a_stall += entry.second->assist_stall_us;
+        b_us += entry.second->begin_us; p1 += entry.second->p1_us; p2 += entry.second->p2_us; pl += entry.second->plain_us;
       }
       uint64_t misses = 0, loads = 0, load_us = 0;
       if (OffloadState *o = g_offload.get()) {
@@ -643,6 +644,9 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
       if (a_runs)
         LOG_INFO("[GLM5NEXT-LANE] gpu assist: %llu layer-runs, %llu experts, tail wait %.1fms/token\n",
                  (unsigned long long)a_runs, (unsigned long long)a_experts, a_stall / 1000.0 / lane_tokens);
+      LOG_INFO("[GLM5NEXT-LANE] breakdown ms/token: begin_load=%.1f phase1_graph=%.1f phase2_graph=%.1f unsplit_graph=%.1f assist_wait=%.1f\n",
+               b_us / 1000.0 / lane_tokens, p1 / 1000.0 / lane_tokens, p2 / 1000.0 / lane_tokens, pl / 1000.0 / lane_tokens,
+               a_stall / 1000.0 / lane_tokens);
       LOG_INFO("[GLM5NEXT-LANE] tokens=%d lane calls=%llu split=%llu wait=%.1fms/token compute=%.1fms/token "
                "split stall=%.1fms/token | misses=%llu loads=%llu read=%.1fms/token (%.2f ms per load)\n",
                lane_tokens, (unsigned long long)calls, (unsigned long long)split,

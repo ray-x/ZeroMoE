@@ -336,7 +336,7 @@ bool configure_partial_experts_base(FullGraph &g) {
 bool configure_partial_experts(FullGraph &g) {
   if (!configure_partial_experts_base(g))
     return false;
-  if (g.partial_expert_residency && ggml_shared_backend(1)) {
+  if (g.partial_expert_residency && ggml_shared_backend(second_gpu_device(g.device))) {
     const char *gh = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
     if (gh && gh[0])
       assign_gpu1_hot(g, std::atof(gh));
@@ -590,6 +590,43 @@ bool prepare_partial_hot1(FullGraph &g, ggml_context *ctx, int layer) {
   p->hot1_up = hot1_weight(g, ctx, layer, "ffn_up_exps.weight", 1);
   p->hot1_down = hot1_weight(g, ctx, layer, "ffn_down_exps.weight", 2);
   return p->hot1_gate && p->hot1_up && p->hot1_down;
+}
+
+// Upload every layer's hot-set planes into the persistent GPU1 buffers at boot, so the first decode graph build finds
+// them resident instead of reading them inside the first token.
+bool preload_partial_hot1(FullGraph &g) {
+  if (!g.partial_expert_residency)
+    return true;
+  auto *backend = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g.device)));
+  if (!backend)
+    return true;
+  const auto t0 = std::chrono::steady_clock::now();
+  size_t layers = 0;
+  for (size_t layer = 0; layer < g.partial_experts.size(); ++layer) {
+    if (g.partial_experts[layer].hot1.empty())
+      continue;
+    ggml_init_params ip = {};
+    ip.mem_size = ggml_tensor_overhead() * 8;
+    ip.no_alloc = true;
+    ggml_context *ctx = ggml_init(ip);
+    if (!ctx)
+      return false;
+    ggml_backend_t saved = g.gpu1;
+    g.gpu1 = backend;
+    const bool ok = hot1_weight(g, ctx, (int)layer, "ffn_gate_exps.weight", 0) &&
+                    hot1_weight(g, ctx, (int)layer, "ffn_up_exps.weight", 1) &&
+                    hot1_weight(g, ctx, (int)layer, "ffn_down_exps.weight", 2);
+    g.gpu1 = saved;
+    ggml_free(ctx);
+    if (!ok)
+      return false;
+    ++layers;
+  }
+  if (layers)
+    LOG_INFO("[GGML-GLM5NEXT-GPU1-HOT] preloaded %zu layers (%.2f GiB) to device %d at boot in %.1f s\n", layers,
+             (double)g.gpu1_bytes / (1024.0 * 1024.0 * 1024.0), second_gpu_device(g.device),
+             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+  return true;
 }
 
 // Move the next-hottest cold experts (by usage) into the GPU1 hot set until `gib` of expert bytes is reached.

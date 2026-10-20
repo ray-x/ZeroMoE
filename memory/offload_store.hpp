@@ -37,6 +37,8 @@
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+#include <cmath>
+#include <thread>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -621,6 +623,38 @@ public:
   void populated(int layer, int expert) { if (after_populate) after_populate(layer, expert); }
   void transient_populated(int layer, int expert) { if (after_transient) after_transient(layer, expert); }
   // Return one expert's pages to the OS; the slot reads as zeros until it is populated again.
+  // Opt-in (MOESTREAM_OFFLOAD_RETARGET=1): hand a victim's already-populated pages to the expert that replaces it instead of
+  // freeing them (madvise) and faulting + zeroing fresh ones. mremap(MREMAP_DONTUNMAP) moves the page-table entries of each plane to
+  // the new expert's address and leaves an empty anonymous mapping (same VMA flags, e.g. NOHUGEPAGE) behind. The caller holds the
+  // arena lock exactly as for evict(). Returns false (nothing moved, nothing freed) when a plane cannot be moved.
+  bool retarget(int from_layer, int from_expert, int to_layer, int to_expert) {
+#ifdef MREMAP_DONTUNMAP
+    for (int k = 0; k < 3; ++k) {
+      const Map &a = map(from_layer, k), &b = map(to_layer, k);
+      if (!a.base || !b.base) return false;
+    }
+    if (before_evict) before_evict(from_layer, from_expert);
+    for (int k = 0; k < 3; ++k) {
+      const Map &a = map(from_layer, k), &b = map(to_layer, k);
+      char *src = a.base + static_cast<uint64_t>(from_expert) * a.stride;
+      char *dst = b.base + static_cast<uint64_t>(to_expert) * b.stride;
+      const size_t len = static_cast<size_t>(std::min(a.stride, b.stride)); // planes of different layers can differ in size (mixed quants)
+      void *r = ::mremap(src, len, len, MREMAP_MAYMOVE | MREMAP_FIXED | MREMAP_DONTUNMAP, dst);
+      if (r != dst) { // this plane and the rest: free the victim's pages so the invariant (non-resident = no pages) holds
+        for (int j = k; j < 3; ++j) {
+          const Map &m = map(from_layer, j);
+          ::madvise(m.base + static_cast<uint64_t>(from_expert) * m.stride, static_cast<size_t>(m.stride), MADV_DONTNEED);
+        }
+        return true;
+      }
+      if (a.stride > len) ::madvise(src + len, static_cast<size_t>(a.stride) - len, MADV_DONTNEED);
+    }
+    return true;
+#else
+    (void)from_layer; (void)from_expert; (void)to_layer; (void)to_expert;
+    return false;
+#endif
+  }
   void evict(int layer, int expert) {
     if (before_evict) before_evict(layer, expert);
     // MOESTREAM_OFFLOAD_EVICT=free: MADV_FREE instead of MADV_DONTNEED. The pages stay mapped until the kernel needs them, so the next
@@ -711,6 +745,8 @@ public:
     int layer = 0;
   };
 
+  bool retarget_ = [] { const char *e = std::getenv("MOESTREAM_OFFLOAD_RETARGET"); return e && e[0] == '1'; }();
+
   // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
   Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
     Plan p;
@@ -730,8 +766,12 @@ public:
       }
       ++p.r.misses;
       if (cache_.config().policy == ExpertCache::Policy::Static) { ++p.r.not_cached; continue; }
+      bool paired = false;
       for (const ExpertKey &v : a.victims) {
-        if (!defer_evict_if_loading(v)) arena_.evict(v.layer, v.expert);
+        if (!defer_evict_if_loading(v)) {
+          if (retarget_ && a.inserted && !paired && arena_.retarget(v.layer, v.expert, layer, ids[i])) paired = true;
+          else arena_.evict(v.layer, v.expert);
+        }
         ++p.r.evictions;
       }
       if (!a.inserted) { ++p.r.errors; continue; }

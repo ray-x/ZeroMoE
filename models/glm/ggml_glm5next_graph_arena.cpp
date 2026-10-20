@@ -73,6 +73,20 @@ bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity,
 
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name) {
+  const bool cacheable = ctx == g.ctx;
+  if (cacheable) {
+    auto it = g.resident_cache.find(name);
+    if (it != g.resident_cache.end())
+      return it->second;
+  }
+  ggml_tensor *r = resident_tensor_uncached(g, ctx, name);
+  if (cacheable && r)
+    g.resident_cache.emplace(name, r);
+  return r;
+}
+
+ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx,
+                                      const std::string &name) {
   const QuantizedTensor *q = resident(*g.engine, name);
   if (!q || !type_ok(q->meta.type))
     return nullptr;

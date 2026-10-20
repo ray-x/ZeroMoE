@@ -16,7 +16,7 @@
 model_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align"
 mirror_model_path = "/data/glm53_mirror_cold50"
 # dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
-log_path = "/home/ray/work/moestream-glm53/logs/glm53_dsa_graph2gpu_util.log"
+log_path = "/home/ray/work/moestream-glm53/logs/glm53_dsa_graph2gpu_tke.log"
 # log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 log_level = "INFO"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 # Was DEBUG + verbose_moe_log=true for the pin_topk_per_layer A/B test below --

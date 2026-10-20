@@ -201,7 +201,7 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
       const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
       std::shared_ptr<GpuAssistShared> shared = make_ring(shared_weak[0], assist_dev, gpu_assist_slots());
       std::shared_ptr<GpuAssistShared> shared2;
-      const int assist2_dev = gpu_assist2_device();
+      const int assist2_dev = gpu_assist2_device(g.device);
       if (assist2_dev >= 0 && assist2_dev != assist_dev && gpu_assist2_slots() > 0)
         shared2 = make_ring(shared_weak[1], assist2_dev, gpu_assist2_slots());
       if (shared && lane->prepare_gpu_assist(cold_w, shared, 0)) {
@@ -445,6 +445,15 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                                                weights, c.topk, g.S);
     }
     StageRuntime *stage = (has_cold && stage_layer_active(g, layer) && g.stage_pred.count(layer)) ? get_stage(g) : nullptr;
+    // Prefetch-only pilot (PILOT_COPY=0) does not need the staged-route node, so the CPU lane can coexist with it: the lane keeps
+    // its own demand loads and a small CPU node only posts the next pilot job.
+    const bool lane_wanted = has_cold && early_ready_wanted() && (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
+                             family_supports_cpu_lane(g.engine->family_ops.family);
+    StageRuntime *post_stage = nullptr;
+    if (lane_wanted && stage && !pilot_copy_on()) {
+      post_stage = stage;
+      stage = nullptr;
+    }
     ggml_tensor *stage_slots = nullptr, *stage_m = nullptr;
     if (has_cold) {
       ggml_tensor *cold_map = partial_map(g, ctx, layer, false, false);
@@ -475,8 +484,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       }
     }
     EarlyReadyLane *lane = nullptr;
-    if (has_cold && early_ready_wanted() && !stage && (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
-        family_supports_cpu_lane(g.engine->family_ops.family)) {
+    if (lane_wanted && !stage) {
       moe_routed::ExpertWeights cold_w;
       cold_w.gate_up = gate_up;
       cold_w.gate = ge;
@@ -485,6 +493,10 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       lane = make_cold_lane(g, ctx, layer, cur, ids, weights,
                             partial_map(g, ctx, layer, false, false),
                             partial_map(g, ctx, layer, false, true), cold_w, clamp);
+    }
+    if (lane && post_stage) {
+      if (ggml_tensor *post = stage_post_node(g, ctx, *post_stage, layer, route_ids))
+        ggml_build_forward_expand(g.graph, post);
     }
     if (lane) {
       // fork -> hot GPU work -> shared expert -> CPU lane marker -> merge. The marker
