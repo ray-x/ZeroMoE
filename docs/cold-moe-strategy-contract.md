@@ -187,8 +187,19 @@ migration step 2.
 1. **Adapters over the existing paths** — do not rewrite either stack. Wrap
    `EarlyReadyLane` (full-graph) and `ggml_moe_runner` + `RAMSafetyManager`/`GpuTopology`
    (cache-backed) behind `ColdMoEStrategy`; the adapters call the existing code unchanged.
+
+   The cache-backed path's residency is **split across two phases in two files** (grounded in
+   `cold_moe_strategy_cache_backed.hpp`): RAM claim in `core/execution_layer.cpp`'s `ram_needed_k`
+   loop (`claim_or_wait` → `Hit`/`Loading`/`Claimed`, then `wait_for_ram_slot`), and VRAM hold +
+   transfer + compute in `core/batched_dispatch_pipeline.cpp`'s `run_ggml_moe_layer`
+   (`hold_for_compute` → `begin_layer` → `run_layer*` → `release_hold`/`defer_vram_hold`). The
+   adapter therefore wraps **both** phases and needs the `StreamingEngine` + per-layer dispatch
+   context, not just `(runner, ram, topology)` — that gap is threaded in at the wiring step.
+
 2. **Thread generation + State through the graph** — make `Pending/Ready/Error` and the
-   generation visible to both paths; this is the correctness-critical step.
+   generation visible to both paths; this is the correctness-critical step. State mapping for the
+   cache-backed path: `RamClaimStatus::Hit` → Ready; `Loading`/`Claimed` → Pending; load error →
+   Error (abort today).
 3. **Unify residency + transfer** — collapse the two transfer paths (pinned bounce vs staging
    ring) into one bounded-pool implementation, then unify residency.
 4. **Fix shutdown ordering** — encode release-before-backend order (also fixes the teardown crash).
