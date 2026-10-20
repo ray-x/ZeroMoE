@@ -135,6 +135,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     op.sched = g.sched;
     op.last = std::chrono::steady_clock::now();
   }
+  g.expert_copy.reset();
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=
       GGML_STATUS_SUCCESS) {
@@ -144,6 +145,10 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   }
   ggml_backend_sched_synchronize(g.sched);
   release_graph_vram_experts(g);
+  if (g.expert_copy.attached)
+    LOG_INFO("[GGML-GLM5NEXT-EXPERT-COPY] %llu plane copies, %.3f GiB weight payload\n",
+             (unsigned long long)g.expert_copy.plane_copies,
+             g.expert_copy.bytes / (1024.0 * 1024.0 * 1024.0));
   if (op_prof_on) {
     ggml_backend_sched_set_eval_callback(g.sched, nullptr, nullptr);
     std::vector<std::pair<double, std::string>> rows;
