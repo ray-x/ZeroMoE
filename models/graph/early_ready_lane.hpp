@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include "qwen4exp_stage_pool.hpp"
 #include "moe_routed_ggml.hpp"
+#include "pilot_ridge.hpp"
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -33,45 +34,12 @@ extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
 // Optional learned correction for the next-layer pilot (bench/qwen_ridge_export.py):
 // scores = softmax(router x) + (x - mu) R + c. Loaded once from
 // MOESTREAM_QWEN_EARLY_READY_RIDGE; a missing/invalid file leaves the plain pilot.
-struct Qwen4ExpRidgeTable {
-  struct Record { std::vector<float> mu, c; std::vector<uint16_t> r; };
-  std::map<int, Record> by_layer;
-  int d = 0, e = 0;
-  static const Qwen4ExpRidgeTable &get() {
-    static const Qwen4ExpRidgeTable table = load();
-    return table;
-  }
-  const Record *find(int layer) const {
-    const auto it = by_layer.find(layer);
-    return it == by_layer.end() ? nullptr : &it->second;
-  }
-  static Qwen4ExpRidgeTable load() {
-    Qwen4ExpRidgeTable t;
-    const char *path = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_RIDGE");
-    if (!path || !path[0]) return t;
-    FILE *f = std::fopen(path, "rb");
-    if (!f) { std::fprintf(stderr, "[QWEN-RIDGE] cannot open %s\n", path); return t; }
-    int32_t hdr[4];
-    bool ok = std::fread(hdr, 4, 4, f) == 4 && hdr[0] == 0x31474452 && hdr[1] > 0 && hdr[2] > 0;
-    if (ok) {
-      t.d = hdr[1]; t.e = hdr[2];
-      for (int i = 0; ok && i < hdr[3]; ++i) {
-        int32_t layer;
-        Record rec;
-        rec.mu.resize(t.d); rec.c.resize(t.e); rec.r.resize(size_t(t.d) * t.e);
-        ok = std::fread(&layer, 4, 1, f) == 1 &&
-             std::fread(rec.mu.data(), 4, t.d, f) == size_t(t.d) &&
-             std::fread(rec.r.data(), 2, rec.r.size(), f) == rec.r.size() &&
-             std::fread(rec.c.data(), 4, t.e, f) == size_t(t.e);
-        if (ok) t.by_layer.emplace(layer, std::move(rec));
-      }
-    }
-    std::fclose(f);
-    if (!ok) { std::fprintf(stderr, "[QWEN-RIDGE] invalid file %s\n", path); t.by_layer.clear(); }
-    else std::fprintf(stderr, "[QWEN-RIDGE] loaded %zu layer corrections from %s\n", t.by_layer.size(), path);
-    return t;
-  }
-};
+// The table format and loader are shared with GLM5NEXT via PilotRidgeTable.
+inline const PilotRidgeTable &qwen4exp_ridge() {
+  static const PilotRidgeTable table =
+      PilotRidgeTable::load("MOESTREAM_QWEN_EARLY_READY_RIDGE", "QWEN-RIDGE");
+  return table;
+}
 
 // One second CUDA backend (own stream) and one VRAM ring of `slots` experts per plane, shared by the GPU-assist
 // graphs of every layer of a model: layers run one after another, so they can reuse the same slots.
@@ -393,7 +361,7 @@ struct EarlyReadyLane {
                           ggml_tensor *router, ggml_tensor *bias, int target) {
     auto *probs = ggml_soft_max(outer_ctx, ggml_mul_mat(outer_ctx, router, gpu_input));
     ggml_tensor *selection = probs;
-    const auto &ridge = Qwen4ExpRidgeTable::get();
+    const auto &ridge = qwen4exp_ridge();
     if (const auto *rec = ridge.find(target); rec && ridge.d == int(gpu_input->ne[0]) &&
                                                 ridge.e == int(router->ne[1])) {
       auto *mu_t = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_F32, ridge.d, 1);
