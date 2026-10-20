@@ -668,3 +668,5 @@ Long generation (22-token prompt, NGEN=300, 64 GiB pool, retarget on): 1.91 Rate
 Recipe for the best numbers: `MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 MOESTREAM_OFFLOAD_RETARGET=1` (long prompts additionally need the guard-floor override and a 74 GiB pool).
 
 Cleanup note: after Trial 47 the measurement-only code was removed (evict/lock timers, retarget counters, `EVICT=none`, balanced split mode, split timing, read chunking, async-eviction); the per-token lane breakdown log line stays. Re-verified on the cleaned build: retarget on 2.09 first-to-last (Rates 1.96) vs off 1.78 (1.68). Memory at peak and the config/scripts are in `docs/GLM5.3-baseline.md` and `bench/glm53/`.
+
+Update (2026-10-20): `MOESTREAM_OFFLOAD_RETARGET` is now on by default whenever SSD offload is active; `=0` disables. See `docs/offload-retarget.md`.

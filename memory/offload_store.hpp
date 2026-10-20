@@ -623,7 +623,7 @@ public:
   void populated(int layer, int expert) { if (after_populate) after_populate(layer, expert); }
   void transient_populated(int layer, int expert) { if (after_transient) after_transient(layer, expert); }
   // Return one expert's pages to the OS; the slot reads as zeros until it is populated again.
-  // Opt-in (MOESTREAM_OFFLOAD_RETARGET=1): hand a victim's already-populated pages to the expert that replaces it instead of
+  // Default on (MOESTREAM_OFFLOAD_RETARGET=0 disables): hand a victim's already-populated pages to the expert that replaces it instead of
   // freeing them (madvise) and faulting + zeroing fresh ones. mremap(MREMAP_DONTUNMAP) moves the page-table entries of each plane to
   // the new expert's address and leaves an empty anonymous mapping (same VMA flags, e.g. NOHUGEPAGE) behind. The caller holds the
   // arena lock exactly as for evict(). Returns false (nothing moved, nothing freed) when a plane cannot be moved.
@@ -745,7 +745,9 @@ public:
     int layer = 0;
   };
 
-  bool retarget_ = [] { const char *e = std::getenv("MOESTREAM_OFFLOAD_RETARGET"); return e && e[0] == '1'; }();
+  // Page-reusing eviction (see docs/offload-retarget.md). Default on: this class only exists when SSD offload is active.
+  // MOESTREAM_OFFLOAD_RETARGET=0 restores madvise(DONTNEED) eviction.
+  bool retarget_ = [] { const char *e = std::getenv("MOESTREAM_OFFLOAD_RETARGET"); return !(e && e[0] == '0'); }();
 
   // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
   Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {

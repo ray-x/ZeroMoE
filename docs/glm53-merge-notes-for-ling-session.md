@@ -8,7 +8,7 @@ Two merges of master into the branch were needed (`5671ae7`, then `9d9a8d8`); th
 
 GLM-5.3 UD-IQ2_M decode on 3090 + 5060 Ti: 2.04-2.09 tok/s first-to-last (peak, short prompt), 1.92 on the Rates line,
 up from 1.74-1.78 without the page-reuse eviction. Details: `docs/GLM5.3-baseline.md`, `bench/glm53/`.
-Main changes: page-reusing eviction (`MOESTREAM_OFFLOAD_RETARGET=1`, opt-in), graph LM head, lane timers, and an
+Main changes: page-reusing eviction (`MOESTREAM_OFFLOAD_RETARGET`, on by default for any SSD-offload run, `=0` disables; see `docs/offload-retarget.md`), graph LM head, lane timers, and an
 opt-in memory-guard floor override (`MOESTREAM_MEM_GUARD_FLOOR_MB`, default behaviour unchanged).
 
 ## Shared code the Ling session should know about
@@ -24,7 +24,7 @@ These files are used by both families. Review them if Ling behaves differently a
 | `models/glm/ggml_glm5next_graph_build_blocks.cpp` | `build_glm_dsa_attn` added; `build_bailing_mla` kept | none |
 | `models/glm/ggml_glm5next_graph_{decode,run}.cpp` | `plain_residual = g.dsa_plain \|\| family == BailingMoE3`; `kv_cache_width` loops kept; null guards on `Rc` when `qk_rope > 0` | Ling uses the same `kv_cache_width` path as before |
 | `core/engine_runner_session.cpp` | `glm5next_full_graph_set_vram_cache` now also for `GLM_DSA` (Ling already had it) | none |
-| `memory/offload_store.hpp` | `VirtualArena::retarget` (mremap DONTUNMAP), gated by `MOESTREAM_OFFLOAD_RETARGET=1` | off by default |
+| `memory/offload_store.hpp` | `VirtualArena::retarget` (mremap DONTUNMAP), default on when the offload store is active (`MOESTREAM_OFFLOAD_RETARGET=0` disables) | **on for any model that uses this store, including Ling if it does** |
 | `memory/memory_guard.hpp` | opt-in `MOESTREAM_MEM_GUARD_FLOOR_MB` (>= 8192) | off by default |
 | `models/glm/glm5next_graph_internal.hpp` | `kv_row` removed (master's `kv_cache_width` kept) | none |
 
@@ -50,4 +50,4 @@ These files are used by both families. Review them if Ling behaves differently a
 2. The Ling smoke ran against the first merge only. The second merge (`7bda5da`, expert-transfer fix and perf audit) had no
    conflicts and the tree builds, but Ling was not rerun on it.
 3. If you rebase a Ling branch onto this master, expect conflicts only in the files in the table above.
-4. `MOESTREAM_OFFLOAD_RETARGET` is not enabled for Ling. It was only tested on GLM.
+4. `MOESTREAM_OFFLOAD_RETARGET` is now on by default wherever the offload store is used. It was only tested on GLM. If Ling uses the store and misbehaves, set `MOESTREAM_OFFLOAD_RETARGET=0` to compare.

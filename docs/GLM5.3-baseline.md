@@ -4,7 +4,7 @@ Recorded 2026-10-20. Reference point for further GLM-5.3 work. Config, scripts a
 The full trial log (Trials 1-47, including every negative result) is `docs/perf-baselines.md`.
 
 **Headline:** short-prompt decode **2.00-2.09 tok/s** first-to-last output (1.88-1.96 on the shutdown `Rates:` line), from 1.74-1.78 (Rates 1.65-1.68) with the same recipe and
-`MOESTREAM_OFFLOAD_RETARGET` off. A 300-token generation holds **1.91 tok/s** (Rates). A 426-token prompt decodes at **1.45-1.52 tok/s** (Rates; 1.52-1.59 first-to-last)
+`MOESTREAM_OFFLOAD_RETARGET=0`. Page-reusing eviction is now on by default whenever SSD offload is active (`docs/offload-retarget.md`). A 300-token generation holds **1.91 tok/s** (Rates). A 426-token prompt decodes at **1.45-1.52 tok/s** (Rates; 1.52-1.59 first-to-last)
 with a 74 GiB pool. Prefill 12.4-13.5 tok/s on the 426-token prompt (target 10). Lossless: no expert pruning, same experts computed as before.
 
 ## 1. Hardware / software
@@ -34,7 +34,7 @@ Environment recipe (set by `bench/glm53/run_ab.sh` + `run_dsa_graph2gpu.sh`):
 | `OFFLOAD_DDR_GIB` | 64 (74 for long prompts) | DDR expert pool |
 | `MOESTREAM_GLM5NEXT_PILOT_PREFETCH` / `_STAGE` | 3 / 3 | layer-ahead pilot depth |
 | `MOESTREAM_GLM5NEXT_MODEL_DIRECT` | 1 | O_DIRECT reads on the model drive |
-| **`MOESTREAM_OFFLOAD_RETARGET`** | **1** | **hand an evicted expert's populated pages to the incoming expert (`mremap(MREMAP_DONTUNMAP)`) instead of `madvise(DONTNEED)` + refault** |
+| **`MOESTREAM_OFFLOAD_RETARGET`** | **on (default; `0` disables)** | **hand an evicted expert's populated pages to the incoming expert (`mremap(MREMAP_DONTUNMAP)`) instead of `madvise(DONTNEED)` + refault** |
 | `MOESTREAM_MEM_GUARD_FLOOR_MB` | 16384 (long prompts only) | lowers the 20 GiB MemAvailable stop floor so a 74 GiB pool fits after a long prefill; default floor unchanged |
 | `MOESTREAM_GLM5NEXT_CPU_THREADS` | 6 | lane threads (5-8 flat, 12 is 24% slower) |
 | `MOESTREAM_GLM5NEXT_ASSIST_*` | device 0 / second device 1, 3 slots | GPU-assist ring (slot count is flat) |
@@ -116,6 +116,6 @@ asynchronous eviction (46), balanced drive split (-12%), larger 3090 hot set (do
 
     bench/glm53/run_ab.sh <tag> MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
       MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
-      MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 MOESTREAM_OFFLOAD_RETARGET=1
+      MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 # MOESTREAM_OFFLOAD_RETARGET is on by default
 
 Check `nvidia-smi`/`pgrep` first (`bench/glm53/preflight.sh` does it), run under `systemd-run --scope -p MemorySwapMax=0`, and judge text coherence as well as tok/s.
