@@ -322,8 +322,12 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // every other layer keeps GGML's normal biased top-k node.
   ggml_tensor *ids =
       forced_ids ? forced_ids : moe_routed::select_ids(ctx, rspec, probs, bias);
-  if (route_stats_enabled() && g.decode_mode &&
-      g.partial_expert_residency && ids) {
+  const bool capture_decode_routes = route_stats_enabled() && g.decode_mode &&
+                                    g.partial_expert_residency && ids;
+  const bool capture_prefill_routes =
+      !g.decode_mode && ids &&
+      moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE");
+  if (capture_decode_routes || capture_prefill_routes) {
     // Keep a graph output copy of each layer's IDs.  The scheduler may
     // recycle the original intermediate after MUL_MAT_ID consumes it, so
     // reading `ids` after the whole graph finishes can otherwise return
@@ -341,7 +345,10 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     if (g.sched && ggml_backend_supports_op(g.cuda, snapshot))
       ggml_backend_sched_set_tensor_backend(g.sched, snapshot, g.cuda);
     ggml_build_forward_expand(g.graph, snapshot);
-    g.moe_route_ids.emplace_back(layer, snapshot);
+    if (g.decode_mode)
+      g.moe_route_ids.emplace_back(layer, snapshot);
+    else
+      g.prefill_route_ids.emplace_back(layer, snapshot);
   }
   ggml_tensor *weights = moe_routed::route_weights(ctx, rspec, probs, ids);
   ggml_build_forward_expand(g.graph, weights);
@@ -702,6 +709,9 @@ bool build_graph(FullGraph &g) {
   const auto &c = g.engine->model_file.architecture_config;
   const auto bp_start = std::chrono::steady_clock::now();
   double bp_attn = 0, bp_ffn = 0, bp_pilot = 0;
+  g.dense_upload_ms = 0.0;
+  g.dense_uploads = 0;
+  g.dense_cache_hits = 0;
   const auto bp_ms = [](std::chrono::steady_clock::time_point a) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
   };
@@ -1138,6 +1148,18 @@ bool build_graph(FullGraph &g) {
       ggml_build_forward_expand(g.graph, g.logits);
     }
   }
+  if (!g.decode_mode && !g.native_moe_cache && g.dense_owner &&
+      !moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
+    // Prefill does not need the LM head, but the decode graph built right
+    // after it does.  Materialize those two weights into the shared owner
+    // before the first output so the prompt->decode transition does not pay
+    // their upload (measured ~130 ms for ~1.2 GiB) between token 1 and 2.
+    for (const char *name : {"output_norm.weight", "output.weight"}) {
+      if (resident(*g.engine, name) && !resident_tensor(g, g.ctx, name))
+        LOG_WARN("[GGML-GLM5NEXT-FULL] decode LM-head preload failed: %s\n",
+                 name);
+    }
+  }
   if (g.decode_mode) {
     for (ggml_tensor *t : g.kda_state_updates)
       ggml_build_forward_expand(g.graph, t);
@@ -1175,8 +1197,9 @@ bool build_graph(FullGraph &g) {
     return false;
   if (!ggml_backend_sched_alloc_graph(g.sched, g.graph))
     return false;
-  LOG_INFO("[GLM-BUILD-PROFILE] %s: layer loop %.0f ms (attn weights+graph %.0f, pilot %.0f, ffn incl. expert/hot uploads %.0f), sched alloc %.0f ms\n",
-           g.decode_mode ? "decode" : "prefill", bp_layers, bp_attn, bp_pilot, bp_ffn, bp_ms(bp_t3));
+  LOG_INFO("[GLM-BUILD-PROFILE] %s: layer loop %.0f ms (attn weights+graph %.0f, pilot %.0f, ffn incl. expert/hot uploads %.0f, dense upload %.0f over %zu tensors, dense cache hits %zu), sched alloc %.0f ms\n",
+           g.decode_mode ? "decode" : "prefill", bp_layers, bp_attn, bp_pilot, bp_ffn,
+           g.dense_upload_ms, g.dense_uploads, g.dense_cache_hits, bp_ms(bp_t3));
   g.graph_workspace_bytes = ggml_backend_sched_get_buffer_size(g.sched, g.cuda);
 
   int cuda_nodes = 0, cpu_nodes = 0, other_nodes = 0, transitions = 0;
@@ -1322,13 +1345,17 @@ bool build_graph(FullGraph &g) {
            (double)g.graph_workspace_bytes / (1024.0 * 1024.0 * 1024.0),
            g.kda_layers.size(), g.dsa_layers.size(), g.moe_route_ids.size());
   LOG_INFO(
-      "[GGML-GLM5NEXT-FULL] dense arena=%.2f/%.2f GiB tensors=%d; "
+      "[GGML-GLM5NEXT-FULL] dense arena=%.2f/%.2f GiB tensors=%d "
+      "scratch=%.2f/%.2f MiB tensors=%d; "
       "graph-owned expert weights=%.2f/%.2f GiB; VRAM cache aliases=%.2f "
       "GiB (included in cache, not additional); host source=%.2f GiB, "
       "DDR refs=%.2f GiB (not additional), pinned=%.2f GiB "
       "pin_failures=%zu\n",
       (double)g.dense.used / (1024.0 * 1024.0 * 1024.0),
       (double)g.dense.capacity / (1024.0 * 1024.0 * 1024.0), g.dense.tensors,
+      (double)g.scratch.used / (1024.0 * 1024.0),
+      (double)g.scratch.capacity / (1024.0 * 1024.0),
+      g.scratch.tensors,
       (double)g.expert.used / (1024.0 * 1024.0 * 1024.0),
       (double)g.expert.capacity / (1024.0 * 1024.0 * 1024.0),
       (double)g.vram_reference_bytes / (1024.0 * 1024.0 * 1024.0),

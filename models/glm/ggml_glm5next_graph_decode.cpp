@@ -12,6 +12,7 @@ using namespace glm5next_graph;
 
 bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                                         const int *) {
+  const auto prepare_start = std::chrono::steady_clock::now();
   if (!graph_enabled_for(engine) || engine.mtp_enabled || pos_base < 0 ||
       engine.max_t <= 0 ||
       pos_base >= engine.max_t)
@@ -85,7 +86,23 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
           ? 0
           : std::min(glm5next_full_graph_device_expert_layers(),
                      std::max(0, c.n_layers - c.first_dense));
-  if (!g->native_moe_cache && configure_partial_experts(*g))
+  // The prompt pass is over.  Release its speculative ring now (the copy
+  // workers are drained and the device buffers are freed) and give the
+  // borrowed main-GPU cache back BEFORE configure_partial_experts() aliases
+  // it into the decode graph.  Doing this only in FullGraph::destroy is too
+  // late: the decode graph's partial-expert layout is built first.
+  prefetch_ring_join();
+  if (g_glm5next_vram_cache)
+    g_glm5next_vram_cache->restore_detached_cache();
+  if (!g->native_moe_cache) {
+    const bool partial_configured = configure_partial_experts(*g);
+    if (engine.family_ops.family == ModelFamily::BailingMoE3 &&
+        !partial_configured)
+      return false;
+    if (partial_configured)
+      g->device_expert_layers = 0;
+  }
+  if (engine.family_ops.family == ModelFamily::BailingMoE3)
     g->device_expert_layers = 0;
 
   // Sparse decode requires prompt-computed indexer keys and complete KPool
@@ -231,7 +248,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     backends[1] = g->cpu;
   g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2,
                                     kGraphSize, false, false);
-  if (g->sched)
+  if (g->sched &&
+      engine.family_ops.family != ModelFamily::BailingMoE3)
     g->expert_copy.attach(g->sched);
   if (!g->sched || !build_graph(*g)) {
     LOG_WARN("[GGML-GLM5NEXT-FULL-DECODE] graph construction declined; "
@@ -241,6 +259,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   // Building with a second GPU leaves it as the current device; the state tensors live on the main one.
   cudaSetDevice(g->device);
+  const auto state_start = std::chrono::steady_clock::now();
   const size_t state_n = (size_t)g->hd * g->hd * g->H;
   const size_t hist_n = (size_t)(g->d_conv - 1) * 3 * g->d_inner;
   for (size_t i = 0; i < g->kda_layers.size(); ++i) {
@@ -319,12 +338,19 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                               seed->pooled_keys.size() * sizeof(float));
   }
 
+  const double state_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - state_start)
+                              .count();
+  const double prepare_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - prepare_start)
+                                .count();
   g->ready = true;
   g_graph = std::move(g);
   LOG_INFO("[GGML-GLM5NEXT-FULL-DECODE] reusable graph prepared: "
-           "position=%d capacity=%d KDA=%zu DSA=%zu\n",
+           "position=%d capacity=%d KDA=%zu DSA=%zu state-seed=%.0f ms "
+           "total=%.0f ms\n",
            pos_base, capacity, g_graph->kda_layers.size(),
-           g_graph->dsa_layers.size());
+           g_graph->dsa_layers.size(), state_ms, prepare_ms);
   return true;
 }
 

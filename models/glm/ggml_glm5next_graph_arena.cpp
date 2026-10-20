@@ -71,6 +71,90 @@ bool arena_alloc(ggml_backend_buffer_t buffer, void *base, size_t capacity,
   return true;
 }
 
+// Binds a dense-weight descriptor to the shared owner's address for `name`,
+// or appends and uploads it once.  The owner's bump pointer only ever holds
+// immutable weights; mutable route maps use g.scratch instead.
+bool dense_weight_bind(FullGraph &g, ggml_tensor *t,
+                       const std::string &name, const void *src,
+                       size_t src_bytes) {
+  DenseArenaOwner *owner = g.dense_owner;
+  if (!owner || !owner->arena.buffer || !owner->arena.base || !t)
+    return false;
+
+  auto it = owner->addrs.find(name);
+  if (it != owner->addrs.end()) {
+    if (it->second.bytes != ggml_nbytes(t)) {
+      LOG_ERROR("[GGML-GLM5NEXT-FULL] dense reuse shape mismatch name=%s "
+                "cached=%zu requested=%zu\n",
+                name.c_str(), it->second.bytes, ggml_nbytes(t));
+      return false;
+    }
+    if (ggml_backend_tensor_alloc(owner->arena.buffer, t, it->second.addr) !=
+        GGML_STATUS_SUCCESS) {
+      LOG_ERROR("[GGML-GLM5NEXT-FULL] dense reuse bind failed name=%s\n",
+                name.c_str());
+      return false;
+    }
+    ++owner->cache_hits;
+    ++g.dense_cache_hits;
+    g.dense.used = owner->arena.used;
+    ++g.dense.tensors;
+    return true;
+  }
+
+  if (!src || src_bytes < ggml_nbytes(t))
+    return false;
+
+  const auto buft = ggml_backend_buffer_get_type(owner->arena.buffer);
+  const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, t);
+  const size_t align =
+      std::max<size_t>(256, ggml_backend_buft_get_alignment(buft));
+  const size_t off = (owner->arena.used + align - 1) & ~(align - 1);
+  if (off > owner->arena.capacity ||
+      alloc_size > owner->arena.capacity - off) {
+    LOG_ERROR("[GGML-GLM5NEXT-FULL] dense owner capacity exhausted name=%s "
+              "used=%zu capacity=%zu need=%zu\n",
+              name.c_str(), owner->arena.used, owner->arena.capacity,
+              alloc_size);
+    return false;
+  }
+  if (src_bytes > alloc_size) {
+    LOG_ERROR("[GGML-GLM5NEXT-FULL] dense upload exceeds tensor allocation "
+              "name=%s src=%zu alloc=%zu\n",
+              name.c_str(), src_bytes, alloc_size);
+    return false;
+  }
+  void *addr = static_cast<uint8_t *>(owner->arena.base) + off;
+  if (ggml_backend_tensor_alloc(owner->arena.buffer, t, addr) !=
+      GGML_STATUS_SUCCESS) {
+    LOG_ERROR("[GGML-GLM5NEXT-FULL] dense arena bind failed name=%s\n",
+              name.c_str());
+    return false;
+  }
+  const auto upload_start = std::chrono::steady_clock::now();
+  const cudaError_t err =
+      cudaMemcpy(addr, src, src_bytes, cudaMemcpyHostToDevice);
+  const double upload_ms = std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - upload_start)
+                               .count();
+  g.dense_upload_ms += upload_ms;
+  owner->upload_ms += upload_ms;
+  ++g.dense_uploads;
+  ++owner->uploads;
+  if (err != cudaSuccess) {
+    LOG_ERROR("[GGML-GLM5NEXT-FULL] dense upload failed name=%s: %s\n",
+              name.c_str(), cudaGetErrorString(err));
+    return false;
+  }
+  owner->arena.used = off + alloc_size;
+  ++owner->arena.tensors;
+  owner->addrs.emplace(
+      name, DenseArenaOwner::Entry{addr, ggml_nbytes(t)});
+  g.dense.used = owner->arena.used;
+  ++g.dense.tensors;
+  return true;
+}
+
 ggml_tensor *resident_tensor(FullGraph &g, ggml_context *ctx,
                              const std::string &name) {
   const bool cacheable = ctx == g.ctx;
@@ -108,10 +192,8 @@ ggml_tensor *resident_tensor_uncached(FullGraph &g, ggml_context *ctx,
                    GGML_BACKEND_BUFFER_USAGE_WEIGHTS))
       return nullptr;
   } else if (graph_dense_weight_name(name)) {
-    if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity,
-                     g.dense.used, t, q->host_ptr, q->meta.size_bytes))
+    if (!dense_weight_bind(g, t, name, q->host_ptr, q->meta.size_bytes))
       return nullptr;
-    ++g.dense.tensors;
   } else if (!bind_host(g, t, q->host_ptr, q->meta.size_bytes,
                         GGML_BACKEND_BUFFER_USAGE_WEIGHTS)) {
     return nullptr;
@@ -189,8 +271,9 @@ size_t dense_arena_bytes(const FullGraph &g) {
     // DeepSeek binds device-resident dense weights from the engine's pool.
     if (g.engine->family_ops.family == ModelFamily::DeepSeek_V41 && q.device_ptr)
       continue;
-    if (name == "output.weight" && !g.decode_mode)
-      continue;
+    // The owner serves both phases, so reserve the union: output.weight is
+    // decode-only in the old phase-sized arena, but a prefill graph may
+    // materialize it too and must never append past the allocation.
     if (total > std::numeric_limits<size_t>::max() - q.meta.size_bytes - 4096)
       return 0;
     total += q.meta.size_bytes + 4096;
@@ -215,19 +298,65 @@ size_t dense_arena_bytes(const FullGraph &g) {
       }
     }
   }
-  if (g.partial_expert_residency) {
-    // Two I32 ID maps and two F32 masks per MoE layer.  They are tiny, but
-    // account for them explicitly so a nearly-full CUDA dense arena does not
-    // rely on its generic slack by accident.
-    const size_t per_layer = (size_t)c.n_experts * (size_t)g.S *
-                             (2 * sizeof(int32_t) + 2 * sizeof(float));
-    if ((size_t)std::max(0, c.n_layers - c.first_dense) >
-        (SIZE_MAX - total) / (per_layer + 4096))
-      return 0;
-    total +=
-        (size_t)std::max(0, c.n_layers - c.first_dense) * (per_layer + 4096);
-  }
   return total + (1ull << 20);
+}
+
+// Per-graph mutable tensors that used to share the dense-weight bump arena:
+// hot/cold + GPU1-hot route maps and masks, plus pilot-stage hot masks.
+// Keeping them in a separate arena means a rebuild refreshes them without
+// either overwriting immutable weights or appending a new set forever.
+size_t dense_scratch_bytes(const FullGraph &g) {
+  const auto &c = g.engine->model_file.architecture_config;
+  if (c.n_experts <= 0 || g.S <= 0)
+    return 1ull << 20;
+  size_t total = 1ull << 20;
+  const size_t map_bytes = (size_t)c.n_experts * (size_t)g.S * sizeof(int32_t);
+  auto add = [&total](size_t count, size_t unit) {
+    if (unit != 0 && count > (SIZE_MAX - total) / unit)
+      return false;
+    total += count * unit;
+    return true;
+  };
+  const size_t moe_layers =
+      (size_t)std::max(0, c.n_layers - c.first_dense);
+  if (g.partial_expert_residency || g.vram_reference_experts) {
+    // hot_map/hot_mask/cold_map/cold_mask
+    if (!add(moe_layers * 4, map_bytes + 4096))
+      return 0;
+    // hot1_map/hot1_mask (conservatively for every MoE layer)
+    if (!add(moe_layers * 2, map_bytes + 4096))
+      return 0;
+  }
+  // stage_hot_mask: one [n_experts] F32 tensor per active pilot layer.
+  if (!add((size_t)c.n_layers, (size_t)c.n_experts * sizeof(float) + 4096))
+    return 0;
+  return total;
+}
+
+static bool init_scratch_arena(FullGraph &g) {
+  const size_t bytes = dense_scratch_bytes(g);
+  if (bytes == 0)
+    return false;
+  const auto buft = ggml_backend_get_default_buffer_type(g.cuda);
+  g.scratch.buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+  if (!g.scratch.buffer) {
+    LOG_WARN("[GGML-GLM5NEXT-FULL] scratch arena allocation declined: %.2f "
+             "MiB\n",
+             (double)bytes / (1024.0 * 1024.0));
+    return false;
+  }
+  // Keep the historical WEIGHTS hint: ggml's scheduler assigns an op from a
+  // source buffer's usage, and the route maps must stay on GPU0 with the cold
+  // branch.  COMPUTE here moved ~2,230 nodes to the second GPU and raised the
+  // decode split count from 273 to 477.  These tensors are refreshed between
+  // graph executions, not written concurrently with compute.
+  ggml_backend_buffer_set_usage(g.scratch.buffer,
+                                GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+  g.scratch.base = ggml_backend_buffer_get_base(g.scratch.buffer);
+  g.scratch.capacity = ggml_backend_buffer_get_size(g.scratch.buffer);
+  g.scratch.used = 0;
+  g.scratch.tensors = 0;
+  return true;
 }
 
 bool init_dense_arena(FullGraph &g) {
@@ -253,22 +382,77 @@ bool init_dense_arena(FullGraph &g) {
     LOG_INFO("[GGML-LING-HYBRID] using native dense pool; CUDA marker "
              "allocated=%.3f MiB\n",
              (double)g.dense.capacity / (1024.0 * 1024.0));
-    return true;
+    return init_scratch_arena(g);
   }
-  const size_t bytes = dense_arena_bytes(g);
-  if (bytes == 0)
-    return false;
-  const auto buft = ggml_backend_get_default_buffer_type(g.cuda);
-  g.dense.buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
-  if (!g.dense.buffer) {
-    LOG_WARN("[GGML-GLM5NEXT-FULL] dense arena allocation declined: %.2f GiB\n",
-             (double)bytes / (1024.0 * 1024.0 * 1024.0));
-    return false;
+
+  // The old graph has already been released by the caller before this point,
+  // so an owner from a different engine/device cannot have live borrowers.
+  if (g_glm5next_dense_owner &&
+      (g_glm5next_dense_owner->engine != g.engine ||
+       g_glm5next_dense_owner->device != g.device)) {
+    LOG_INFO("[GGML-GLM5NEXT-FULL] releasing dense owner for a different "
+             "engine/device\n");
+    g_glm5next_dense_owner.reset();
   }
-  ggml_backend_buffer_set_usage(g.dense.buffer,
-                                GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-  g.dense.base = ggml_backend_buffer_get_base(g.dense.buffer);
-  g.dense.capacity = ggml_backend_buffer_get_size(g.dense.buffer);
+  if (!g_glm5next_dense_owner) {
+    const size_t bytes = dense_arena_bytes(g);
+    if (bytes == 0)
+      return false;
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaSetDevice(g.device);
+    const bool have_free =
+        cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
+    constexpr size_t kAdmissionSlack = 256ull << 20;
+    if (have_free && free_bytes < bytes + kAdmissionSlack) {
+      LOG_WARN("[GGML-GLM5NEXT-FULL] dense owner declined before allocation: "
+               "need %.2f GiB + %.2f GiB slack, free %.2f GiB\n",
+               (double)bytes / (1024.0 * 1024.0 * 1024.0),
+               (double)kAdmissionSlack / (1024.0 * 1024.0 * 1024.0),
+               (double)free_bytes / (1024.0 * 1024.0 * 1024.0));
+      return false;
+    }
+    auto owner = std::make_unique<DenseArenaOwner>();
+    owner->engine = g.engine;
+    owner->device = g.device;
+    const auto buft = ggml_backend_get_default_buffer_type(g.cuda);
+    owner->arena.buffer = ggml_backend_buft_alloc_buffer(buft, bytes);
+    if (!owner->arena.buffer) {
+      LOG_WARN("[GGML-GLM5NEXT-FULL] dense owner allocation declined: %.2f "
+               "GiB\n",
+               (double)bytes / (1024.0 * 1024.0 * 1024.0));
+      return false;
+    }
+    ggml_backend_buffer_set_usage(owner->arena.buffer,
+                                  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    owner->arena.base = ggml_backend_buffer_get_base(owner->arena.buffer);
+    owner->arena.capacity = ggml_backend_buffer_get_size(owner->arena.buffer);
+    owner->arena.used = 0;
+    owner->arena.tensors = 0;
+    LOG_INFO("[GGML-GLM5NEXT-FULL] dense owner arena=%.2f GiB (union, includes "
+             "output.weight); free before=%.2f GiB\n",
+             (double)owner->arena.capacity / (1024.0 * 1024.0 * 1024.0),
+             have_free ? (double)free_bytes / (1024.0 * 1024.0 * 1024.0) : -1.0);
+    g_glm5next_dense_owner = std::move(owner);
+  }
+
+  DenseArenaOwner *owner = g_glm5next_dense_owner.get();
+  g.dense_owner = owner;
+  g.dense.buffer = owner->arena.buffer;
+  g.dense.base = owner->arena.base;
+  g.dense.capacity = owner->arena.capacity;
+  g.dense.used = owner->arena.used;
+  g.dense.tensors = 0;
+  g.dense_upload_ms = 0.0;
+  g.dense_uploads = 0;
+  g.dense_cache_hits = 0;
+  if (!init_scratch_arena(g))
+    return false;
+  LOG_INFO("[GGML-GLM5NEXT-FULL] dense owner bound: arena=%.2f/%.2f GiB "
+           "weights=%zu, scratch=%.2f MiB\n",
+           (double)g.dense.used / (1024.0 * 1024.0 * 1024.0),
+           (double)g.dense.capacity / (1024.0 * 1024.0 * 1024.0),
+           owner->addrs.size(),
+           (double)g.scratch.capacity / (1024.0 * 1024.0));
   return true;
 }
 
@@ -372,32 +556,82 @@ bool init_expert_arena(FullGraph &g) {
   if (!g.partial_expert_residency && g.device_expert_layers <= 0)
     return true;
   if (g.vram_reference_experts) {
-    const bool has_hot_refs = std::any_of(
+    const bool ling = g.engine &&
+                      g.engine->family_ops.family == ModelFamily::BailingMoE3;
+    const bool has_primary_refs = std::any_of(
         g.partial_experts.begin(), g.partial_experts.end(),
         [](const PartialExpertLayer &p) { return !p.hot.empty(); });
-    if (!has_hot_refs)
+    const bool has_secondary_refs =
+        ling && std::any_of(g.partial_experts.begin(), g.partial_experts.end(),
+                            [](const PartialExpertLayer &p) {
+                              return !p.hot1.empty();
+                            });
+    if (!has_primary_refs && !has_secondary_refs)
       return true;
-    // GGML needs a CUDA buffer handle to classify these immutable source
-    // tensors, but their data pointers belong to GpuTopology's cache pool.
-    // This tiny owned allocation is metadata/handle backing only; no expert
-    // weights are copied into it.
+
+    // GGML requires a CUDA buffer handle to classify an aliased expert tensor.
+    // These tiny descriptors carry no expert weights; data points directly to
+    // GpuTopology's resident cache slots. Check free VRAM on each device first.
     constexpr size_t kReferenceBufferBytes = 1ull << 20;
-    const auto buft = ggml_backend_get_default_buffer_type(g.cuda);
-    g.expert.buffer = ggml_backend_buft_alloc_buffer(
-        buft, kReferenceBufferBytes);
-    if (!g.expert.buffer) {
-      LOG_WARN("[GGML-GLM5NEXT-FULL] could not create CUDA buffer handle for "
-               "VRAM expert references\n");
-      return false;
+    constexpr size_t kFreeMargin = 512ull << 20;
+    const auto allocate_descriptor = [&](int device, ggml_backend_t backend,
+                                         ggml_backend_buffer_t &buffer) {
+      if (!backend)
+        return false;
+      int previous_device = -1;
+      if (cudaGetDevice(&previous_device) != cudaSuccess ||
+          cudaSetDevice(device) != cudaSuccess)
+        return false;
+      size_t free_bytes = 0, total_bytes = 0;
+      const bool have_memory =
+          cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess;
+      (void)total_bytes;
+      if (!have_memory || free_bytes < kReferenceBufferBytes + kFreeMargin) {
+        LOG_WARN("[GGML-LING-CACHE] descriptor declined on GPU%d: free="
+                 "%.2f GiB, require %.2f GiB including margin\n",
+                 device, (double)free_bytes / (1024.0 * 1024.0 * 1024.0),
+                 (double)(kReferenceBufferBytes + kFreeMargin) /
+                     (1024.0 * 1024.0 * 1024.0));
+        if (previous_device != device)
+          cudaSetDevice(previous_device);
+        return false;
+      }
+      buffer = ggml_backend_buft_alloc_buffer(
+          ggml_backend_get_default_buffer_type(backend),
+          kReferenceBufferBytes);
+      if (previous_device != device)
+        cudaSetDevice(previous_device);
+      if (!buffer)
+        return false;
+      ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+      return true;
+    };
+
+    if (has_primary_refs) {
+      if (!allocate_descriptor(g.device, g.cuda, g.expert.buffer))
+        return false;
+      g.expert.base = ggml_backend_buffer_get_base(g.expert.buffer);
+      g.expert.capacity = ggml_backend_buffer_get_size(g.expert.buffer);
     }
-    ggml_backend_buffer_set_usage(g.expert.buffer,
-                                  GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    g.expert.base = ggml_backend_buffer_get_base(g.expert.buffer);
-    g.expert.capacity = ggml_backend_buffer_get_size(g.expert.buffer);
-      LOG_INFO("[GGML-GLM5NEXT-FULL] VRAM expert weights are aliased from "
-               "resident cache slots; graph-owned weight bytes=0, descriptor "
-             "buffer=%.2f MiB\n",
-             (double)g.expert.capacity / (1024.0 * 1024.0));
+    if (has_secondary_refs) {
+      const int gpu1_id = second_gpu_device(g.device);
+      auto gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(gpu1_id));
+      if (!allocate_descriptor(gpu1_id, gpu1, g.expert1_buffer))
+        return false;
+    }
+    LOG_INFO("[GGML-%s-CACHE] resident MoE weights are aliased; "
+             "graph-owned MoE weight bytes=0, descriptors GPU%d=%.2f MiB "
+             "GPU%d=%.2f MiB\n",
+             ling ? "LING" : "GLM5NEXT", g.device,
+             g.expert.buffer
+                 ? (double)ggml_backend_buffer_get_size(g.expert.buffer) /
+                       (1024.0 * 1024.0)
+                 : 0.0,
+             second_gpu_device(g.device),
+             g.expert1_buffer
+                 ? (double)ggml_backend_buffer_get_size(g.expert1_buffer) /
+                       (1024.0 * 1024.0)
+                 : 0.0);
     return true;
   }
   const size_t bytes = device_expert_bytes(g);

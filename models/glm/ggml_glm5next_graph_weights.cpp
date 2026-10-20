@@ -24,6 +24,15 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
   ggml_tensor *t = new_tensor(ctx, (ggml_type)m->type, shape);
   if (!t)
     return nullptr;
+  const bool dense_weight =
+      !device_expert && !routed_expert && graph_dense_weight_name(name);
+  if (dense_weight &&
+      dense_weight_bind(g, t, name, nullptr, ggml_nbytes(t))) {
+    // The shared dense owner already holds this weight: bind a new descriptor
+    // without reading the file or uploading it again.
+    ggml_set_name(t, name.c_str());
+    return t;
+  }
   const size_t bytes = (size_t)m->size_bytes;
   const size_t required = std::max(bytes, ggml_nbytes(t));
   // Device-resident graph layers use a short-lived aligned read buffer:
@@ -78,11 +87,8 @@ ggml_tensor *load_full_weight(FullGraph &g, ggml_context *ctx,
       std::free(p);
     if (transient_host_reserved)
       MemoryGuard::release_host_bytes(required);
-  } else if (graph_dense_weight_name(name)) {
-    ok = arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity,
-                     g.dense.used, t, p, bytes);
-    if (ok)
-      ++g.dense.tensors;
+  } else if (dense_weight) {
+    ok = dense_weight_bind(g, t, name, p, bytes);
   } else {
     ok = bind_host(g, t, p, required, GGML_BACKEND_BUFFER_USAGE_WEIGHTS) !=
          nullptr;
@@ -657,6 +663,14 @@ size_t expert_source_bytes(const StreamingEngine &engine,
 size_t expert_source_bytes(const FullGraph &g) {
   if (!g.partial_expert_residency)
     return expert_source_bytes(*g.engine, g.device_expert_layers);
+
+  // Ling borrows hot weights from GpuTopology and cold weights from the
+  // existing DDR/OffloadStore owner. Never construct a second graph-owned MoE
+  // source arena; if neither external owner can serve a route, decline graph
+  // construction instead of copying expert weights into it.
+  if (g.vram_reference_experts && g.engine &&
+      g.engine->family_ops.family == ModelFamily::BailingMoE3)
+    return 0;
 
   // Neurall-style dynamic caching keeps the original expert records in the
   // host source arena while hot copies come and go in VRAM. This avoids the

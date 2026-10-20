@@ -145,6 +145,28 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   }
   ggml_backend_sched_synchronize(g.sched);
   release_graph_vram_experts(g);
+  if (moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE")) {
+    size_t captured_routes = 0;
+    for (const auto &[layer, snapshot] : g.prefill_route_ids) {
+      if (!snapshot || snapshot->type != GGML_TYPE_I32 || layer < 0)
+        continue;
+      const int64_t n = ggml_nelements(snapshot);
+      if (n <= 0)
+        continue;
+      std::vector<int32_t> ids((size_t)n);
+      ggml_backend_tensor_get(snapshot, ids.data(), 0,
+                              ids.size() * sizeof(int32_t));
+      for (int32_t expert : ids) {
+        if (expert < 0)
+          continue;
+        engine.bump_route_freq_prefill(layer, expert);
+        ++captured_routes;
+      }
+    }
+    LOG_INFO("[GGML-LING-PREFILL-ROUTES] captured %zu layer/expert selections\n",
+             captured_routes);
+    g.prefill_route_ids.clear();
+  }
   if (g.expert_copy.attached)
     LOG_INFO("[GGML-GLM5NEXT-EXPERT-COPY] %llu plane copies, %.3f GiB weight payload\n",
              (unsigned long long)g.expert_copy.plane_copies,

@@ -337,8 +337,9 @@ ggml_tensor *stage_hot_mask(FullGraph &g, ggml_context *ctx, int layer) {
         if (e >= 0 && e < c.n_experts)
           m[(size_t)e] = -1e9f;
   }
-  if (!arena_alloc(g.dense.buffer, g.dense.base, g.dense.capacity, g.dense.used, t, m.data(), ggml_nbytes(t)))
+  if (!arena_alloc(g.scratch.buffer, g.scratch.base, g.scratch.capacity, g.scratch.used, t, m.data(), ggml_nbytes(t)))
     return nullptr;
+  ++g.scratch.tensors;
   ggml_set_name(t, ("glm5next_stage_hot_mask_" + std::to_string(layer)).c_str());
   return t;
 }

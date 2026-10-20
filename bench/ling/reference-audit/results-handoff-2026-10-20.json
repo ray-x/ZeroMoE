@@ -1,0 +1,184 @@
+{
+  "created_utc": "2026-10-20T11:10:25.171698+00:00",
+  "worktree": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy",
+  "branch": "ling-3.1-flash-nocopy",
+  "base_head": "9c69ceaa08ea963889532a9186b45080433ae830",
+  "master_at_handoff": "04e2f6042f2dfa5138f894e91fa73784fb9c7307",
+  "objective_complete": false,
+  "config": {
+    "prompt_file": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/bench/ling/reference-audit/prompt.txt",
+    "prompt_sha256": "ba9d5a6258cef659c36fc0193a6c8c0d33a47762ff99798b01662e306f3ab942",
+    "context_size": 64,
+    "new_tokens": 32,
+    "temperature": 0,
+    "ddr_pool_gib": 72,
+    "cgroup_cap_gib": 95,
+    "stop_available_gib": 20,
+    "gpu_cache_gib": [
+      3,
+      12.5
+    ],
+    "pinned_vram_capacity": 3700,
+    "ddr_pinned_fraction": 0.5,
+    "gpu_assist_slots": [
+      3,
+      1
+    ],
+    "cpu_threads": 10,
+    "early_ready": true,
+    "cpu_offload": true,
+    "full_graph_prefill": true,
+    "full_graph_decode": true,
+    "graph_owned_moe_weights_bytes": 0,
+    "profile": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/bench/ling/reference-audit/usage-hi-there-robust4.pin",
+    "profile_sha256": "2b03d9a89e51de25eee8a64b90fed2f104745dd207b74ebf4931e450c5b49259",
+    "profile_entries": 9943,
+    "profile_count_sum": 67456
+  },
+  "runtime_files": [
+    {
+      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/build-ling/moestream",
+      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy/build-ling/moestream",
+      "sha256": "b6f53db2e4cb2a61040babe0d9ddf1b4387acd2c4d8b3f72c4acc8ae9c88c42b"
+    },
+    {
+      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml.so.0",
+      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml.so.0.27.0",
+      "sha256": "0cda6ae45eb6a23951d28960741d1998bc2287e686493a8d27d6872221b2f60c"
+    },
+    {
+      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-base.so.0",
+      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-base.so.0.27.0",
+      "sha256": "e24a110d7dbb2dc24124fbec78e0e8ab05fb70a117bd62ac553e653bd266b7ef"
+    },
+    {
+      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-cpu.so.0",
+      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/libggml-cpu.so.0.27.0",
+      "sha256": "a7af7d04f215aafc51f84e9998c502e163bee42488b05b742eaf61a733f531f9"
+    },
+    {
+      "path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/ggml-cuda/libggml-cuda.so.0",
+      "resolved_path": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash/build-ling/ggml-build/src/ggml-cuda/libggml-cuda.so.0.27.0",
+      "sha256": "002fd9cd90579eb4c4e60b995eb8c80316e40ae89041b5e5b7bc4cdf3cfe0e01"
+    }
+  ],
+  "runs": [
+    {
+      "tag": "pin3700-original",
+      "log": "/tmp/ling-nocopy-cache3_12p5-pin3700-ddr72-2026-10-20.log",
+      "log_sha256": "30784e09c2d00f27b9020476971b6ecfd809600419cf40f4296acd02918feadd",
+      "decode_graph_steps": 31,
+      "decode_graph_mean_ms": 92.29206451612903,
+      "decode_graph_rate_tps": 10.835167738882244,
+      "first_to_last_output_seconds": 5.544219,
+      "first_to_last_output_tps": 5.59,
+      "output_wall_minus_graph_steps_seconds": 2.683165,
+      "build_layer_loop_ms": {
+        "prefill": 2004,
+        "decode": 2084
+      },
+      "evidence_lines": [
+        "[21:37:39.142] [GGML-GLM5NEXT-FULL] dense arena=15.30/15.31 GiB tensors=1396; graph-owned expert weights=0.00/0.00 GiB; VRAM cache aliases=12.34 GiB (included in cache, not additional); host source=0.07 GiB, DDR refs=0.00 GiB (not additional), pinned=0.00 GiB pin_failures=0",
+        "[21:37:42.790] [GGML-GLM5NEXT-FULL] dense arena=16.50/16.51 GiB tensors=1398; graph-owned expert weights=0.00/0.00 GiB; VRAM cache aliases=12.34 GiB (included in cache, not additional); host source=0.07 GiB, DDR refs=0.00 GiB (not additional), pinned=0.00 GiB pin_failures=0",
+        " from[21:37:44.403] [GLM5NEXT-LANE] gpu assist: 410 layer-runs, 490 experts, tail wait 1.1ms/token",
+        "[21:37:44.403] [GLM5NEXT-LANE] breakdown ms/token: begin_load=0.8 phase1_graph=1.1 phase2_graph=1.1 unsplit_graph=23.0 assist_wait=1.1",
+        "[21:37:44.403] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=38 wait=39.3ms/token compute=31.8ms/token split stall=5.3ms/token | misses=232 loads=64 read=24.6ms/token (6.16 ms per load)",
+        "[21:37:45.869] Rates:               overall=3.67 tok/s | decode=4.16 tok/s (32 tokens / 7.69s) | prefill=1.93 tok/s (2 tokens / 1.04s)",
+        "[21:37:45.869] RSS:                 92.30 GB"
+      ],
+      "tokens": {
+        "path": "/tmp/ling-nocopy-cache3_12p5-pin3700-ddr72-2026-10-20.tokens",
+        "sha256": "18f887437d19ce39e2b2b2defba547a5771edd39f458c699b2ce2bb0209d1500"
+      },
+      "routes": {
+        "path": "/tmp/ling-nocopy-cache3_12p5-pin3700-ddr72-2026-10-20.routes",
+        "sha256": "482dac00aa79017b7874a8e06f21cd27e63cc089054c55834540fe3919520147"
+      }
+    },
+    {
+      "tag": "pin3600",
+      "log": "/tmp/ling-nocopy-cache3_12p5-pin3600-ddr72-2026-10-20.log",
+      "log_sha256": "356944a0cff065b8b142c3af8b129ce724b8eae1f5daf946420603c22d694086",
+      "decode_graph_steps": 31,
+      "decode_graph_mean_ms": 138.42283870967742,
+      "decode_graph_rate_tps": 7.224241384742588,
+      "first_to_last_output_seconds": 6.915562,
+      "first_to_last_output_tps": 4.48,
+      "output_wall_minus_graph_steps_seconds": 2.624454,
+      "build_layer_loop_ms": {
+        "prefill": 2005,
+        "decode": 2059
+      },
+      "evidence_lines": [
+        "[21:47:41.523] [GGML-GLM5NEXT-FULL] dense arena=15.30/15.31 GiB tensors=1396; graph-owned expert weights=0.00/0.00 GiB; VRAM cache aliases=12.02 GiB (included in cache, not additional); host source=0.07 GiB, DDR refs=0.00 GiB (not additional), pinned=0.00 GiB pin_failures=0",
+        "[21:47:45.139] [GGML-GLM5NEXT-FULL] dense arena=16.50/16.51 GiB tensors=1398; graph-owned expert weights=0.00/0.00 GiB; VRAM cache aliases=12.02 GiB (included in cache, not additional); host source=0.07 GiB, DDR refs=0.00 GiB (not additional), pinned=0.00 GiB pin_failures=0",
+        " from[21:47:47.182] [GLM5NEXT-LANE] gpu assist: 442 layer-runs, 606 experts, tail wait 1.2ms/token",
+        "[21:47:47.182] [GLM5NEXT-LANE] breakdown ms/token: begin_load=2.5 phase1_graph=3.9 phase2_graph=4.9 unsplit_graph=25.8 assist_wait=1.2",
+        "[21:47:47.182] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=117 wait=40.6ms/token compute=58.7ms/token split stall=22.4ms/token | misses=385 loads=218 read=42.8ms/token (3.14 ms per load)",
+        "[21:47:49.625] Rates:               overall=3.17 tok/s | decode=3.53 tok/s (32 tokens / 9.07s) | prefill=1.95 tok/s (2 tokens / 1.03s)",
+        "[21:47:49.625] RSS:                 92.30 GB"
+      ],
+      "tokens": {
+        "path": "/tmp/ling-nocopy-cache3_12p5-pin3600-ddr72-2026-10-20.tokens",
+        "sha256": "b89c3c010262d3d60f43853b87e43e62cdd2bafb59ea6494d34d7150b13b9de9"
+      },
+      "routes": {
+        "path": "/tmp/ling-nocopy-cache3_12p5-pin3600-ddr72-2026-10-20.routes",
+        "sha256": "06407f20cb2d95fad7b3761942511d2a38cd71b08619c868454152ffdfe910ab"
+      }
+    },
+    {
+      "tag": "pin3700-repeat-host",
+      "log": "/tmp/ling-focus-pin3700-repeat-20261020.log",
+      "log_sha256": "1f154e464d2b0fe5d22ec9bbf2b4e8db9c240cd1cf03c8547576756a11c5057c",
+      "decode_graph_steps": 31,
+      "decode_graph_mean_ms": 120.06919354838709,
+      "decode_graph_rate_tps": 8.32853099489676,
+      "first_to_last_output_seconds": 6.467273,
+      "first_to_last_output_tps": 4.79,
+      "output_wall_minus_graph_steps_seconds": 2.745128,
+      "build_layer_loop_ms": {
+        "prefill": 1987,
+        "decode": 2159
+      },
+      "evidence_lines": [
+        "[22:03:31.417] [GGML-GLM5NEXT-FULL] dense arena=15.30/15.31 GiB tensors=1396; graph-owned expert weights=0.00/0.00 GiB; VRAM cache aliases=12.34 GiB (included in cache, not additional); host source=0.07 GiB, DDR refs=0.00 GiB (not additional), pinned=0.00 GiB pin_failures=0",
+        "[22:03:35.216] [GGML-GLM5NEXT-FULL] dense arena=16.50/16.51 GiB tensors=1398; graph-owned expert weights=0.00/0.00 GiB; VRAM cache aliases=12.34 GiB (included in cache, not additional); host source=0.07 GiB, DDR refs=0.00 GiB (not additional), pinned=0.00 GiB pin_failures=0",
+        " from[22:03:37.690] [GLM5NEXT-LANE] gpu assist: 410 layer-runs, 490 experts, tail wait 1.2ms/token",
+        "[22:03:37.690] [GLM5NEXT-LANE] breakdown ms/token: begin_load=0.9 phase1_graph=2.0 phase2_graph=1.9 unsplit_graph=52.4 assist_wait=1.2",
+        "[22:03:37.690] [GLM5NEXT-LANE] tokens=16 lane calls=1088 split=38 wait=56.4ms/token compute=64.2ms/token split stall=6.5ms/token | misses=232 loads=64 read=28.0ms/token (7.00 ms per load)",
+        "[22:03:39.149] Rates:               overall=3.30 tok/s | decode=3.72 tok/s (32 tokens / 8.59s) | prefill=1.79 tok/s (2 tokens / 1.12s)",
+        "[22:03:39.149] RSS:                 92.22 GB"
+      ],
+      "tokens": {
+        "path": "/tmp/ling-focus-pin3700-repeat-20261020.tokens",
+        "sha256": "18f887437d19ce39e2b2b2defba547a5771edd39f458c699b2ce2bb0209d1500"
+      },
+      "routes": {
+        "path": "/tmp/ling-focus-pin3700-repeat-20261020.routes",
+        "sha256": "482dac00aa79017b7874a8e06f21cd27e63cc089054c55834540fe3919520147"
+      },
+      "memory": {
+        "monitor": "/tmp/ling-focus-pin3700-repeat-20261020.memory.jsonl",
+        "sha256": "901be1d2bffa30fb2d8c986e6c0b973560dc06ceec5c7681f9d79e3da44444e8",
+        "min_available_gib": 23.867034912109375,
+        "peak_cgroup_gib": 95.0,
+        "max_swap_bytes": 0,
+        "cgroup_memory_events_max": {
+          "low": 0,
+          "high": 0,
+          "max": 21016,
+          "oom": 0,
+          "oom_kill": 0,
+          "oom_group_kill": 0,
+          "sock_throttled": 0
+        },
+        "gpu_sampled_max_mib": {
+          "0": 21234,
+          "1": 12208
+        }
+      }
+    }
+  ],
+  "original_and_repeat_tokens_identical": true
+}

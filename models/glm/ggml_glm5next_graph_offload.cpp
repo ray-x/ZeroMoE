@@ -406,7 +406,10 @@ void prefetch_service(OffloadState &o, int layer, std::vector<int32_t> &ids) {
 
 // Builds the ring and the per-layer plans for the prompt graph being built (called when its first offload layer is built).
 bool prefetch_prepare(FullGraph &g, OffloadState &o) {
-  g_ring.reset();
+  // Any previous ring must be drained and freed before its buffers can be
+  // replaced; g_ring owns them now (they are no longer graph-owned).
+  if (g_ring)
+    prefetch_ring_join();
   g_prefetch_built = false;
   if (g_prefetch_suppress || g.S >= g_ring_fail_s)
     return false;
@@ -490,7 +493,16 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
       // The graph's own workspace is allocated after the ring and grows ~0.8 MiB per token on this device (free memory
       // after the build: 0.20 GiB at 814 tokens, 0.004 GiB at 1065, where the first compute then failed to allocate its
       // runtime resources). The ring is only worth it when it leaves that and a small reserve free.
-      const double need = (double)want[part] + 0.85 * 1024.0 * 1024.0 * g.S + 0.15 * 1024.0 * 1024.0 * 1024.0;
+      // The graph's scheduler allocation runs after this ring and refuses to
+      // proceed below its own free-VRAM floor.  Reserve that floor on the main
+      // GPU as well as the ring and its workspace; otherwise a ring can be
+      // built only to have the graph declined, forcing the retry path.
+      size_t floor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
+      if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
+        floor_bytes = (size_t)std::max(0, std::atoi(e)) << 20;
+      const double need = (double)want[part] + 0.85 * 1024.0 * 1024.0 * g.S +
+                          0.15 * 1024.0 * 1024.0 * 1024.0 +
+                          (part == 0 ? (double)floor_bytes : 0.0);
       if (need > (double)freeb) {
         LOG_INFO("[GGML-GLM5NEXT-PREFETCH] device %d: ring + workspace for %d tokens need %.2f GiB, %.2f GiB free; "
                  "prefetch off for this batch\n", part, g.S, need / (1024.0 * 1024.0 * 1024.0),
@@ -540,10 +552,6 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     }
     ring->parts[part].stream = streams[part];
     ring->parts[part].events = events[part];
-    for (int s = 0; s < ring->sets; ++s)
-      for (int p = 0; p < 3; ++p)
-        if (ring->parts[part].buf[s][p])
-          g.gpu1_buffers.push_back(ring->parts[part].buf[s][p]);
   }
   cudaSetDevice(ring->parts[0].device);
   if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG")) {
@@ -579,8 +587,47 @@ bool prefetch_ring_was_built() {
   g_prefetch_built = false;
   return b;
 }
+
+bool prefetch_ring_candidate(int S, bool decode_mode, int device) {
+  if (decode_mode || S < 64 || g_prefetch_suppress || S >= g_ring_fail_s)
+    return false;
+  const char *want = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH");
+  if (want)
+    return std::atoi(want) != 0;
+  return second_gpu_device(device) >= 0;
+}
 double prefetch_ring_main_gib() { return g_prefetch_main_gib; }
 void prefetch_suppress_prompt(bool on) { g_prefetch_suppress = on; }
+void prefetch_ring_join() {
+  if (!g_ring)
+    return;
+  for (auto &kv : g_ring->layers) {
+    if (kv.second.worker.valid())
+      kv.second.worker.wait();
+  }
+  // A worker's final event record does not wait for the queued copies.  Drain
+  // both copy streams before the owning graph frees the destination buffers.
+  for (int part = 0; part < g_ring->n_parts; ++part) {
+    if (g_ring->parts[part].stream) {
+      cudaSetDevice(g_ring->parts[part].device);
+      cudaStreamSynchronize(g_ring->parts[part].stream);
+    }
+  }
+  // The ring owns its buffers now.  Free them as soon as the copy workers
+  // are drained; this is also what releases the main GPU's VRAM early
+  // enough for the decode graph to reclaim the borrowed expert cache.
+  for (int part = 0; part < g_ring->n_parts; ++part) {
+    for (int s = 0; s < g_ring->sets; ++s)
+      for (int p = 0; p < 3; ++p) {
+        if (g_ring->parts[part].buf[s][p])
+          ggml_backend_buffer_free(g_ring->parts[part].buf[s][p]);
+        g_ring->parts[part].buf[s][p] = nullptr;
+        g_ring->parts[part].base[s][p] = nullptr;
+      }
+  }
+  g_ring.reset();
+  g_prefetch_built = false;
+}
 void prefetch_note_ring_failure(int S) { g_ring_fail_s = std::min(g_ring_fail_s, S); }
 
 bool prefetch_layer_active(int layer) { return g_ring && g_ring->layers.count(layer) != 0; }
@@ -832,8 +879,16 @@ ggml_tensor *expert_weight_impl(FullGraph &g, ggml_context *ctx, int layer,
   if (offload_layer(layer))
     return offload_weight(g, ctx, layer, stem);
   if (partial_layer(g, layer) &&
-      !(g.vram_reference_experts && partial_layer_ram_ready(g, layer)))
+      !(g.vram_reference_experts && partial_layer_ram_ready(g, layer))) {
+    if (g.vram_reference_experts && g.engine &&
+        g.engine->family_ops.family == ModelFamily::BailingMoE3) {
+      LOG_WARN("[GGML-LING-CACHE] no DDR-backed expert arena for layer=%d; "
+               "declining rather than copying cold MoE weights into the graph\n",
+               layer);
+      return nullptr;
+    }
     return load_cold_weight(g, ctx, layer, stem);
+  }
   if (partial_layer_ram_ready(g, layer)) {
     if (ggml_tensor *t = graph_ram_weight(g, ctx, layer, stem))
       return t;
@@ -850,8 +905,16 @@ ggml_tensor *expert_gate_up_weight_impl(FullGraph &g, ggml_context *ctx,
     return nullptr; // separate projection planes inside the offload arena
   if (g.vram_reference_experts && partial_layer_ram_ready(g, layer))
     return nullptr;
-  if (partial_layer(g, layer))
+  if (partial_layer(g, layer)) {
+    if (g.vram_reference_experts && g.engine &&
+        g.engine->family_ops.family == ModelFamily::BailingMoE3) {
+      LOG_WARN("[GGML-LING-CACHE] no DDR-backed expert arena for layer=%d; "
+               "declining rather than copying cold gate/up weights into the graph\n",
+               layer);
+      return nullptr;
+    }
     return load_gate_up_weight(g, ctx, layer, false);
+  }
   // The shared RAM arena stores gate and up as separate planes inside each
   // expert slice. Force the separate projection views so expert e's gate and
   // up bytes are addressed with the same fixed stride.

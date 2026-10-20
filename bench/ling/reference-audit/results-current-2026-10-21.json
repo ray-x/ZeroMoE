@@ -1,0 +1,137 @@
+{
+  "created_utc": "2026-10-21T00:00:00Z",
+  "worktree": "/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash-nocopy",
+  "branch": "ling-3.1-flash-nocopy",
+  "base_head": "9c69ceaa08ea963889532a9186b45080433ae830",
+  "master_at_record": "04e2f6042f2dfa5138f894e91fa73784fb9c7307",
+  "objective": {
+    "decode_tok_s": 10.0,
+    "prefill_tok_s_including_graph_setup": 20.0,
+    "complete": false
+  },
+  "method": "docs/ling-3.1-flash-benchmark-method.md",
+  "common_config": {
+    "prompt_tokens_short": 2,
+    "prompt_tokens_long": 177,
+    "new_tokens": 32,
+    "temperature": 0,
+    "ddr_pool_gib": 72,
+    "cgroup_cap_gib": 95,
+    "stop_available_gib": 20,
+    "gpu_cache_gib": [3.0, 12.5],
+    "pinned_vram_capacity": 3700,
+    "ddr_pinned_fraction": 0.5,
+    "gpu_assist_slots": [3, 1],
+    "cpu_threads": 10,
+    "early_ready": true,
+    "full_graph_prefill": true,
+    "full_graph_decode": true,
+    "graph_owned_moe_weight_bytes": 0
+  },
+  "inputs": {
+    "prompt_short": {
+      "path": "bench/ling/reference-audit/prompt.txt",
+      "sha256": "ba9d5a6258cef659c36fc0193a6c8c0d33a47762ff99798b01662e306f3ab942"
+    },
+    "prompt_long": {
+      "path": "bench/ling/reference-audit/prompt-long-20261020.txt",
+      "sha256": "cabf427daba5ff2f072a5ebb91fa1a2e437f858fddabda609649576ad90daa07"
+    },
+    "usage_profile": {
+      "path": "bench/ling/reference-audit/usage-hi-there-robust4.pin",
+      "sha256": "2b03d9a89e51de25eee8a64b90fed2f104745dd207b74ebf4931e450c5b49259",
+      "entries": 9943,
+      "count_sum": 67456
+    },
+    "long_prefill_profile": {
+      "path": "bench/ling/reference-audit/prefill-long64-ring-r05-20261020.pin",
+      "sha256": "8a26fc3145ea4710f6673ed934e0a0721e5792da072f436ca16fba26fc22e26c"
+    }
+  },
+  "runtime": {
+    "binary": "build-ling/moestream",
+    "binary_sha256": "cb86d718154424fa8b0833bced1cf36296ea0b9a79a96d4717d4efdf7575d1da"
+  },
+  "runs": [
+    {
+      "tag": "short-clean-empty-prefill",
+      "status": "ok",
+      "log": "/tmp/ling-short-cleanprefill-20261021.log",
+      "log_sha256": "2862cbfab01785deb9eb369723d389eb08bd7700f2c78141c5e4aa31bbd1fb58",
+      "prompt_file": "bench/ling/reference-audit/prompt.txt",
+      "prefill_profile": "empty",
+      "graph_prepared_ms": 2203,
+      "prefill_tokens": 2,
+      "prefill_seconds": 1.07766,
+      "prefill_tok_s": 1.85587,
+      "prefill_including_setup_tok_s": 0.61,
+      "decode_graph_steps": 31,
+      "decode_graph_mean_ms": null,
+      "decode_output_seconds": 3.150345,
+      "decode_output_tok_s": 9.84,
+      "decode_wall_seconds": 3.272,
+      "decode_wall_tok_s": 9.78,
+      "tokens": {
+        "path": "/tmp/ling-short-cleanprefill-20261021.tokens",
+        "sha256": "18f887437d19ce39e2b2b2defba547a5771edd39f458c699b2ce2bb0209d1500"
+      },
+      "routes": {
+        "path": "/tmp/ling-short-cleanprefill-20261021.routes",
+        "sha256": "482dac00aa79017b7874a8e06f21cd27e63cc089054c55834540fe3919520147"
+      },
+      "memory_note": "runner saw a MemAvailable warning below 32768 MiB; no complete monitor minimum in this log"
+    },
+    {
+      "tag": "long-ring-r05-no-borrow",
+      "status": "ok",
+      "log": "/tmp/ling-long-prefill-ring-r05-ddr64-20261020.log",
+      "log_sha256": "1cc67f9f0fff8cc2c47640e02ff711f11b0d5eeefa40d21954186acd0e8e6e55",
+      "prompt_file": "bench/ling/reference-audit/prompt-long-20261020.txt",
+      "prefill_profile": "empty at run time",
+      "graph_prepared_ms": 2291,
+      "prefill_tokens": 177,
+      "prefill_seconds": 17.6947,
+      "prefill_tok_s": 10.003,
+      "prefill_including_setup_tok_s": 8.85,
+      "decode_graph_steps": 31,
+      "decode_output_seconds": 9.301599,
+      "decode_output_tok_s": 3.33,
+      "decode_wall_seconds": 9.424,
+      "decode_wall_tok_s": 3.40
+    },
+    {
+      "tag": "long-cache-borrow-3g",
+      "status": "ok",
+      "log": "/tmp/ling-long-borrow-skip-20261021.log",
+      "log_sha256": "56c66a24de9d6098c9d0f627d6edd4b6317a823fae7f447664e82000c1c80932",
+      "prompt_file": "bench/ling/reference-audit/prompt-long-20261020.txt",
+      "prefill_profile": "bench/ling/reference-audit/prefill-long64-ring-r05-20261020.pin",
+      "graph_prepared_ms": 3262,
+      "prefill_tokens": 177,
+      "prefill_seconds": 19.5908,
+      "prefill_tok_s": 9.03487,
+      "prefill_including_setup_tok_s": 7.75,
+      "decode_graph_steps": 31,
+      "decode_output_seconds": 6.824105,
+      "decode_output_tok_s": 4.54,
+      "decode_wall_seconds": 6.946,
+      "decode_wall_tok_s": 4.61,
+      "cache_borrow": {
+        "detached_gpu": 0,
+        "detached_gib": 3.0,
+        "detached_slots": 844,
+        "restored_before_decode_config": true
+      },
+      "note": "long prompt used MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1; this fixed the earlier illegal-access failure"
+    }
+  ],
+  "conclusion": {
+    "best_decode_output_tok_s": 10.03,
+    "best_decode_wall_tok_s": 9.96,
+    "best_prefill_tok_s": 10.003,
+    "best_prefill_including_setup_tok_s": 8.85,
+    "targets_met": false,
+    "merge_performed": false,
+    "remaining_blocker": "prefill is about half of the 20 tok/s target; ring copies all cold experts instead of prompt-used experts"
+  }
+}
