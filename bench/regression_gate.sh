@@ -54,7 +54,7 @@ EOF
 cd "$(dirname "$0")/.."   # repository root
 
 BIN="${GATE_BIN:-./build_master/moestream}"
-MODELS="${MODELS:-qwen38,glm53flash,ling31,dsv41,glm53}"
+MODELS="${MODELS-qwen38,glm53flash,ling31,dsv41,glm53}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -68,7 +68,7 @@ BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")"
 
 LOG_DIR="${GATE_LOG_DIR:-logs/regression_gate}"
 mkdir -p "$LOG_DIR"
-STAMP="$(date +%Y%m%d_%H%M%S)"
+STAMP="$(date +%Y%m%d_%H%M%S)_$$"
 
 # Frozen baseline bands: [min, max] decode tok/s, measured on the merged master
 # (see docs/models/README.md for the full provenance and how to re-baseline).
@@ -82,8 +82,23 @@ MIN[glm53]=1.8 ; MAX[glm53]=2.4           # 2.14 measured; doc 2.00-2.09
 # Known model names (must match the run_* functions below). A typo in --models must fail
 # the gate loudly, never silently select nothing and report a successful empty run.
 KNOWN_MODELS=(qwen38 glm53flash ling31 dsv41 glm53)
+if [[ -z "$MODELS" ]]; then
+  echo "FAIL  no models selected (--models is empty)" >&2
+  exit 2
+fi
+# `read` drops a trailing empty field, so check the raw list shape explicitly; otherwise
+# `--models qwen38,` would silently run only qwen38 instead of rejecting the empty element.
+if [[ "$MODELS" == ,* || "$MODELS" == *, || "$MODELS" == *,,* ]]; then
+  echo "FAIL  empty model name in --models '$MODELS' (comma list has an empty element)" >&2
+  exit 2
+fi
+IFS=',' read -r -a MODEL_LIST <<< "$MODELS"
 SELECTED=0
-for m in ${MODELS//,/ }; do
+for m in "${MODEL_LIST[@]}"; do
+  if [[ -z "$m" ]]; then
+    echo "FAIL  empty model name in --models '$MODELS' (comma list has an empty element)" >&2
+    exit 2
+  fi
   ok=0
   for k in "${KNOWN_MODELS[@]}"; do
     [[ "$m" == "$k" ]] && { ok=1; break; }
@@ -94,6 +109,10 @@ for m in ${MODELS//,/ }; do
   fi
   SELECTED=$((SELECTED+1))
 done
+if [[ "$SELECTED" -eq 0 ]]; then
+  echo "FAIL  no models selected by --models '$MODELS'" >&2
+  exit 2
+fi
 
 PASS=0; FAIL=0
 
@@ -110,23 +129,47 @@ grab_rate() {
   echo "${r:-0}"
 }
 
-# name rate exit_code [log-with-stderr]
+# Completion evidence: whole-request generated-token count. Prints "0" when nothing matches.
+grab_tokens() {
+  local f="$1" t=""
+  t="$(sed -nE 's/.*\[REQUEST-DECODE-WALL\].*tokens=([0-9]+).*/\1/p' "$f" 2>/dev/null | tail -1)"
+  [[ -z "$t" ]] && t="$(sed -nE 's/.*\[REQUEST-DECODE-OUTPUT\].*tokens=([0-9]+).*/\1/p' "$f" 2>/dev/null | tail -1)"
+  echo "${t:-0}"
+}
+
+# name rate rc teardown-log tokens expected_tokens
 report() {
-  local name="$1" rate="$2" rc="$3" log="${4:-}"
+  local name="$1" rate="$2" rc="$3" log="${4:-}" tokens="${5:-0}" expected="${6:-0}"
   if [[ "$rate" == "0" ]]; then
     printf "FAIL  %-12s no decode rate measured (launch/parse error, rc=%s)\n" "$name" "$rc"
     FAIL=$((FAIL+1)); return
   fi
   local lo="${MIN[$name]}" hi="${MAX[$name]}" note=""
   if [[ "$rc" != "0" ]]; then
+    # Termination statuses are never benign: 124 = timeout(1), >=128 = killed by a signal
+    # (137 = SIGKILL was the two-token false PASS this gate must reject).
+    if [[ "$rc" == "124" || "$rc" -ge 128 ]]; then
+      printf "FAIL  %-12s %6.2f tok/s  (rc=%s: timeout/signal termination)\n" "$name" "$rate" "$rc"
+      FAIL=$((FAIL+1)); return
+    fi
     # A nonzero exit is tolerable ONLY when it is the specifically recognized teardown
-    # crash (§3.7 "CUDA error: driver shutting down" in destructors AFTER generation
-    # completed). Anything else — SIGKILL, an abort mid-generation, OOM — is a real
-    # failure even when a rate line happened to print.
-    if [[ -n "$log" ]] && grep -q "driver shutting down" "$log" 2>/dev/null; then
-      note="  [rc=$rc: benign teardown crash]"
+    # crash (§3.7 "driver shutting down") AFTER generation completed: the log must carry
+    # that signature AND the request summary must show the expected token count. A partial
+    # result plus the teardown string is still a FAIL.
+    if [[ -n "$log" ]] && grep -q "driver shutting down" "$log" 2>/dev/null \
+       && (( expected > 0 && tokens >= expected )); then
+      note="  [rc=$rc: benign teardown crash, $tokens/$expected tokens]"
     else
-      printf "FAIL  %-12s %6.2f tok/s  (rc=%s, not a recognized teardown crash)\n" "$name" "$rate" "$rc"
+      printf "FAIL  %-12s %6.2f tok/s  (rc=%s, not completed generation + teardown evidence; %s/%s tokens)\n" \
+        "$name" "$rate" "$rc" "$tokens" "$expected"
+      FAIL=$((FAIL+1)); return
+    fi
+  else
+    # A zero exit is not by itself evidence of completion either: reject a rate measured
+    # over a partial generation (the failure mode behind the two-token false PASS).
+    if (( expected > 0 && tokens < expected )); then
+      printf "FAIL  %-12s %6.2f tok/s  (incomplete generation: %s/%s tokens)\n" \
+        "$name" "$rate" "$tokens" "$expected"
       FAIL=$((FAIL+1)); return
     fi
   fi
@@ -144,7 +187,12 @@ wants() { [[ ",$MODELS," == *",$1,"* ]]; }
 # A neutral-named symlink to BIN: bench/glm53/preflight.sh greps process command
 # lines for the literal string "moestream", so a wrapper that spells the path
 # ./build_master/moestream trips its own guard. Run through a symlink instead.
-NBIN="/tmp/moestream-gate-bin"
+# Keep it in an invocation-private directory: a shared /tmp name lets a concurrent
+# gate replace the link mid-run, so gate A would execute candidate B while reporting
+# candidate A's hash.
+GATE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/moestream-gate.XXXXXX")"
+trap 'rm -rf "$GATE_TMP"' EXIT
+NBIN="$GATE_TMP/moestream-gate-bin"
 ln -sfn "$BIN" "$NBIN"
 
 echo "== MoEStream regression gate ($STAMP) =="
@@ -159,25 +207,26 @@ echo
 # qwen38 — Qwen 3.8 Flash (Qwen4Exp), split 22 GPU / 26 CPU layers, single 3090.
 # ---------------------------------------------------------------------------
 run_qwen38() {
-  local log="$LOG_DIR/qwen38.$STAMP.log" rc=0
+  local log="$LOG_DIR/qwen38.$STAMP.log" eng="logs/qwen_decode_split_$STAMP.engine.log" rc=0
   echo "--- qwen38: split 22/26, 400 tokens (single 3090) ---"
   MOESTREAM_BIN="$BIN" QWN_STAMP="$STAMP" bench/qwen_decode_baselines.sh split 10 400 > "$log" 2>&1 || rc=$?
-  report qwen38 "$(grab_rate "$log")" "$rc" "$log"
+  report qwen38 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 400
 }
 
 # ---------------------------------------------------------------------------
 # glm53flash — GLM 5.3 Flash (GLM5NEXT), whole-layer placement, single 3090.
 # ---------------------------------------------------------------------------
 run_glm53flash() {
-  local log="$LOG_DIR/glm53flash.$STAMP.log" rc=0
+  local log="$LOG_DIR/glm53flash.$STAMP.log" eng="$LOG_DIR/glm53flash.$STAMP.engine.log" rc=0
   echo "--- glm53flash: wholelayer8, 150 tokens (single 3090) ---"
   echo "Explain the difference between CPU and GPU architecture in terms of parallelism, memory hierarchy and scheduling, in detail." \
     | env CUDA_VISIBLE_DEVICES=0 MOESTREAM_GLM5NEXT_FULL_GRAPH=1 \
         MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512 MOESTREAM_GLM5NEXT_CPU_THREADS=6 \
         scripts/run_capped.sh -- "$BIN" \
         --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
+        --log-path "$eng" \
         --temp 0 --ngen 150 --force-start > "$log" 2>&1 || rc=$?
-  report glm53flash "$(grab_rate "$log")" "$rc" "$log"
+  report glm53flash "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 150
 }
 
 # ---------------------------------------------------------------------------
@@ -193,21 +242,22 @@ run_ling31() {
   LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" \
   LING_LOG="$eng" LING_BIN="$BIN" \
   bench/ling/reference-audit/run.sh > "$log" 2>&1 || rc=$?
-  report ling31 "$(grab_rate "$eng")" "$rc" "$log"
+  report ling31 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 32
 }
 
 # ---------------------------------------------------------------------------
 # dsv41 — DeepSeek V4.1 Flash (DeepSeek_V41), cache-backed graph, dual GPU.
 # ---------------------------------------------------------------------------
 run_dsv41() {
-  local log="$LOG_DIR/dsv41.$STAMP.log" rc=0
+  local log="$LOG_DIR/dsv41.$STAMP.log" eng="$LOG_DIR/dsv41.$STAMP.engine.log" rc=0
   echo "--- dsv41: DNS prompt, 64 tokens (dual GPU) ---"
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
     | env CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1 \
         scripts/run_capped.sh -- "$BIN" \
         --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
+        --log-path "$eng" \
         --temp 0 --ngen 64 --force-start > "$log" 2>&1 || rc=$?
-  report dsv41 "$(grab_rate "$log")" "$rc" "$log"
+  report dsv41 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64
 }
 
 # ---------------------------------------------------------------------------
@@ -215,15 +265,18 @@ run_dsv41() {
 # ---------------------------------------------------------------------------
 run_glm53() {
   local tag="gate-$STAMP" log="$LOG_DIR/glm53.$STAMP.log" rc=0
+  local eng="logs/split_ab_$tag.log" teardown="logs/split_ab_$tag.stdout"
   echo "--- glm53: SSD offload, 80 tokens (dual GPU) ---"
-  rm -f "logs/split_ab_$tag.log"
+  rm -f "logs/split_ab_$tag.log" "$teardown"
   systemd-run --user --scope -p MemorySwapMax=0 \
     env MOESTREAM_BIN="$NBIN" \
     bench/glm53/run_ab.sh "$tag" \
     MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
     MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
     MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 > "$log" 2>&1 || rc=$?
-  report glm53 "$(grab_rate "logs/split_ab_$tag.log")" "$rc" "$log"
+  # The engine log carries the request summary; the .stdout capture carries the
+  # ggml/CUDA teardown text (the wrapper itself only greps selected lines).
+  report glm53 "$(grab_rate "$eng")" "$rc" "$teardown" "$(grab_tokens "$eng")" 80
 }
 
 wants qwen38      && run_qwen38

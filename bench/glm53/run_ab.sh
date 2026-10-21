@@ -7,6 +7,10 @@ for kv in "$@"; do export "$kv"; done
 export MOESTREAM_BIN=${MOESTREAM_BIN:-./build/moestream} TOML=${TOML:-bench/glm53/glm53_dsa_core5060_retarget.toml} NGEN=${NGEN:-80} OFFLOAD_DDR_GIB=${OFFLOAD_DDR_GIB:-54}
 export PROMPT_TEXT="${PROMPT_TEXT:-Explain in detail how a transformer language model generates text, step by step.}"
 rm -f logs/glm53_dsa_graph2gpu_tke.log
-./bench/glm53/run_dsa_graph2gpu.sh > logs/split_ab_$tag.out 2>&1
+rc=0
+./bench/glm53/run_dsa_graph2gpu.sh > logs/split_ab_$tag.out 2>&1 || rc=$?
 test -f logs/glm53_dsa_graph2gpu_tke.log && cp logs/glm53_dsa_graph2gpu_tke.log logs/split_ab_$tag.log
 test -f logs/glm53_dsa_graph2gpu_tke.stdout && cp logs/glm53_dsa_graph2gpu_tke.stdout logs/split_ab_$tag.stdout
+# Preserve the engine's status through this wrapper (the gate checks completion and
+# termination; a grep/copy must never overwrite a nonzero engine exit with success).
+exit "$rc"

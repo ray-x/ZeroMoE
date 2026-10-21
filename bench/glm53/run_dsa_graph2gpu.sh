@@ -11,4 +11,8 @@ export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=/home/ray/vllm-workspace/GLM-5.3-GGUF-al
 export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=${MOESTREAM_GLM5NEXT_OFFLOAD_USAGE:-/home/ray/Projects/MoEStream/.moestream_usage_glm53_ud_iq2m}
 export MOESTREAM_GLM5NEXT_GRAPH_STRICT=1
 (printf "%s\n:q\n" "$P" | timeout 1500 ${MOESTREAM_BIN:-./build/moestream} --config ${TOML:-bench/glm53/glm53_dsa_core5060_retarget.toml} --ngen ${NGEN:-48} --temp 0 > logs/glm53_dsa_graph2gpu_tke.stdout 2>&1)
-grep -E "Rates:|OFFLOAD|FULL-DECODE|WARN|ERROR" logs/glm53_dsa_graph2gpu_tke.log | cut -c1-220 | head -40
+engine_rc=$?
+grep -E "Rates:|OFFLOAD|FULL-DECODE|WARN|ERROR" logs/glm53_dsa_graph2gpu_tke.log | cut -c1-220 | head -40 || true
+# Propagate the engine status: the gate must never treat a crashed candidate as a pass
+# just because the wrapper's grep succeeded. (124 = timeout, 137 = SIGKILL, ...)
+exit "$engine_rc"
