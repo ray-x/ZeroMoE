@@ -54,11 +54,17 @@ class ColdMoEStrategy {
  public:
   enum class State : uint8_t { Pending, Ready, Error };
 
-  // Classify + begin residency for the invocation. False only on an unrecoverable error.
-  virtual bool begin(const ColdMoEInvocation &inv, const ColdMoEAdapter &adapter) = 0;
+  // Build-time: install the family's addressing callbacks (ColdMoEAdapter). Called once per
+  // strategy instance, before any per-token invocation. False only if the adapter is unusable.
+  virtual bool install(const ColdMoEAdapter &adapter) = 0;
+
+  // Per-invocation: begin residency for the invocation and record its (layer, generation)
+  // identity so state()/finish()/release() can detect stale or wrong-layer invocations.
+  // False only on an unrecoverable error.
+  virtual bool begin(const ColdMoEInvocation &inv) = 0;
 
   // Pending until every owned route's expert is fully resident and valid; Ready when
-  // computable; Error when unrecoverable (§3.3).
+  // computable; Error when unrecoverable or when the invocation is stale / wrong-layer (§3.3).
   virtual State state(const ColdMoEInvocation &inv) const = 0;
 
   // Block until Ready (or return false on Error). Re-entrant on the decode thread (§3.3).

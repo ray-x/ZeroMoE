@@ -113,6 +113,8 @@ struct EarlyReadyLane {
   int device = -1, d = 0, k = 0, n_experts = 0, expected_pos = -1;
   int trace_layer = -1;  // layer index for MOESTREAM_GLM5NEXT_ROUTE_TRACE lines
   bool completed = false;
+  bool residency_ready = false;  // residency complete (owned experts resident, safe to compute) —
+                                 // distinct from `completed`, which marks run() finished (§3.8)
   bool skip_all_hot = false;
   bool async_output_copy = false;
   bool resident_tables = false;
@@ -179,8 +181,8 @@ struct EarlyReadyLane {
   // pointers. Results differ from the CPU kernels only by float rounding.
   std::function<bool(int expert, const void *planes[3])> expert_planes;
   // The strategy view of this lane (adapter-first migration). EarlyReadyLaneStrategy forwards the
-  // adapter's callbacks to the members above and re-expresses `completed` as the strategy state
-  // machine. It owns no CUDA resources and is destroyed (trivially) with the lane.
+  // adapter's callbacks to the members above and re-expresses `residency_ready` (residency complete)
+  // as the strategy state machine. It owns no CUDA resources and is destroyed (trivially) with the lane.
   std::unique_ptr<moestream::graph::ColdMoEStrategy> strategy;
   uint64_t assist_runs = 0, assist_experts = 0;
   int64_t assist_stall_us = 0;
@@ -561,6 +563,10 @@ struct EarlyReadyLane {
     } else if (before_compute && n_owned > 0) {
       GGML_ASSERT(before_compute(owned, n_owned));
     }
+    // Residency is complete (every owned expert resident) unless the split-load path still has
+    // experts pending; the two-phase branch flips `residency_ready` after its second finish_load().
+    if (!two_phase)
+      residency_ready = true;
     // GPU assist: hand some of the experts that are ready now to the assist backend(s). Device 0 takes up to
     // min(slots, ready/2); a second device (own ring and link) takes more, as long as one expert stays on the CPU.
     int32_t assisted[2][8];
@@ -638,6 +644,7 @@ struct EarlyReadyLane {
                            static_cast<float *>(output->data) + static_cast<size_t>(d) * k);
       const int64_t wait0 = ggml_time_us();
       GGML_ASSERT(finish_load());
+      residency_ready = true;  // all owned experts resident after the second-phase load
       split_stall_us += ggml_time_us() - wait0;
       // Phase 2: the experts that had to be loaded.
       for (int j = 0; j < n_owned; ++j) {

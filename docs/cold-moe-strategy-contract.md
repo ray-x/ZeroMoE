@@ -52,6 +52,9 @@ struct ColdMoEAdapter {
   // experts that are not ready yet. finish_load() blocks until they are.
   std::function<bool(const int32_t *experts, int n, std::vector<int32_t> &pending)> begin_load;
   std::function<bool()> finish_load;
+  // Block until `experts` are resident (synchronous, non-split path). Mutually exclusive with
+  // begin_load/finish_load.
+  std::function<bool(const int32_t *experts, int n)> before_compute;
 };
 
 class ColdMoEStrategy {
@@ -60,10 +63,13 @@ class ColdMoEStrategy {
   // fully resident and valid, Ready when computable, Error when unrecoverable.
   enum class State : uint8_t { Pending, Ready, Error };
 
-  // Classify + begin residency. Returns false only on an unrecoverable error.
-  virtual bool begin(const ColdMoEInvocation &, const ColdMoEAdapter &) = 0;
-  // True once every owned route is Ready (or the invocation has failed).
-  virtual bool ready(const ColdMoEInvocation &) const = 0;
+  // Build-time: install the family's addressing callbacks. Called once per instance.
+  virtual bool install(const ColdMoEAdapter &) = 0;
+  // Per-invocation: begin residency and record the (layer, generation) identity.
+  virtual bool begin(const ColdMoEInvocation &) = 0;
+  // Residency state: Pending until resident, Ready when computable, Error when unrecoverable
+  // or when the invocation is stale / wrong-layer (§3.8).
+  virtual State state(const ColdMoEInvocation &) const = 0;
   // Wait for readiness; returns false on error. Re-entrant on the decode thread.
   virtual bool finish(const ColdMoEInvocation &) = 0;
   // Free the invocation's held buffers; callable after the last consumer.
@@ -161,8 +167,11 @@ visible. Both paths (lane and cache-backed) expose the same three states, keyed 
 
 Generation source:
 - **Lane (full-graph):** `EarlyReadyLane::calls`, advanced once per token at the end of `run()`; the
-  staging epoch is `calls + 1`. `completed` is reset to false in the decode loop and set true at the
-  end of `run()`, so `completed` *is* the Pending→Ready transition.
+  staging epoch is `calls + 1`. Residency readiness and execution completion are two SEPARATE flags,
+  both reset in the decode loop: `ready` is set in `run()` once the owned experts are resident (the
+  Pending→Ready transition, *before* the CPU graph runs), and `completed` is set at the end of
+  `run()` (compute finished). `state()` reads `ready`, never `completed` — Ready means "resident and
+  safe to compute", not "compute already done".
 - **Cache-backed:** (defined when that path is wired; the `RAMSafetyManager`/`GpuTopology` epoch).
 
 Rules, all paths:
@@ -176,9 +185,10 @@ Rules, all paths:
 
 *Partial today:* the lane enforces "never compute against a missing expert" through `finish_load()`
 blocking + `std::abort()` on load error, but it does not yet expose that as the strategy's
-`Pending/Ready/Error`. The generation cross-check (`inv.generation != lane_->calls`) is the first
-visible thread; wiring per-token `state()`/`finish()` into the decode loops is the remaining part of
-migration step 2.
+`Pending/Ready/Error`. The strategy now validates the invocation identity — the layer and generation
+recorded by `begin()`, held stable until `release()` — so a stale or wrong-layer invocation reports
+`Error`; wiring per-token `begin()`/`state()`/`finish()` into the decode loops is the remaining part
+of migration step 2.
 
 ---
 

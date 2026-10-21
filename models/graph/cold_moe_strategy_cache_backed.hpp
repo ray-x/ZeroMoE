@@ -58,8 +58,14 @@ class CacheBackedStrategy final : public ColdMoEStrategy {
                       GpuTopology *topology)
       : runner_(runner), ram_(ram), topology_(topology) {}
 
-  bool begin(const ColdMoEInvocation & /*inv*/,
-             const ColdMoEAdapter & /*adapter*/) override {
+  bool install(const ColdMoEAdapter & /*adapter*/) override {
+    // The cache-backed path addresses experts through RAMSafetyManager/GpuTopology, not the
+    // lane's callbacks, so the family's adapter is unused here. The strategy is usable only
+    // when its three backends are present.
+    return runner_ && ram_ && topology_;
+  }
+
+  bool begin(const ColdMoEInvocation & /*inv*/) override {
     // TODO(wiring): Phase A over inv.routes' owned experts — ram->claim_or_wait(engine, layer,
     // expert, who, ...); on Loading, ram->wait_for_ram_slot(...); on Claimed, load + publish.
     // Then Phase B — topo->hold_for_compute(layer, e, device_ptr, from_active_layer) for each
@@ -79,7 +85,9 @@ class CacheBackedStrategy final : public ColdMoEStrategy {
   bool finish(const ColdMoEInvocation & /*inv*/) override {
     // TODO(wiring): runner->run_layer*(x, ids, w, out) — the per-layer transfer + compute. The
     // runner syncs its own H2D/D2D inside run_layer, so this is the Ready->done barrier.
-    return true;
+    // Fail-closed until wired: returning true here would claim compute completed without having
+    // driven residency or compute, so an unwired/null backend would silently "succeed".
+    return false;
   }
 
   void release(const ColdMoEInvocation & /*inv*/) override {
