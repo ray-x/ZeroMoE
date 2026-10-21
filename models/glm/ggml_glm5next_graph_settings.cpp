@@ -192,11 +192,15 @@ double dynamic_upload_fraction() {
 
 // Run each layer's cold (CPU) experts on a private lane that starts as soon as the
 // routed ids reach the host, instead of after the layer's GPU work. Decode only.
-bool early_ready_wanted() {
-  // On by default (4-pair A/B: +1.9% decode, logits identical);
-  // MOESTREAM_GLM5NEXT_EARLY_READY=0 opts out.
-  static const bool on = moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_EARLY_READY");
-  return on;
+bool early_ready_wanted(bool has_overlap_work) {
+  // The accepted lane gain was measured with offload / GPU-hot work to overlap.
+  // A fully RAM-resident CPU-only branch runs faster in the ordinary graph.
+  // Preserve the explicit flag's legacy semantics; an unset flag selects per layer.
+  static const int override_mode = [] {
+    const char *value = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_EARLY_READY");
+    return value ? (value[0] == '0' ? 0 : 1) : -1;
+  }();
+  return override_mode < 0 ? has_overlap_work : override_mode != 0;
 }
 
 // Overlap a layer's SSD miss reads with the CPU compute of its already-resident

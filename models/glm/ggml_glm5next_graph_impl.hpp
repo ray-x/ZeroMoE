@@ -95,7 +95,7 @@ bool type_ok(GGUFType type);
 bool layer_timing_env();
 int dynamic_upload_budget_override();
 double dynamic_upload_fraction();
-bool early_ready_wanted();
+bool early_ready_wanted(bool has_overlap_work);
 // Compute the cold experts that are already in DDR while the missing ones are read from the SSD.
 bool split_load_wanted();
 // Number of resident cold experts per layer the lane may run on a second CUDA stream (0 = off).

@@ -489,8 +489,11 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     StageRuntime *stage = (has_cold && stage_layer_active(g, layer) && g.stage_pred.count(layer)) ? get_stage(g) : nullptr;
     // Prefetch-only pilot (PILOT_COPY=0) does not need the staged-route node, so the CPU lane can coexist with it: the lane keeps
     // its own demand loads and a small CPU node only posts the next pilot job.
-    const bool lane_wanted = has_cold && early_ready_wanted() && (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
-                             family_supports_cpu_lane(g.engine->family_ops.family);
+    const bool has_overlap_work = offload_layer(layer) || has_hot || !partial->hot1.empty();
+    const bool lane_wanted =
+        has_cold && early_ready_wanted(has_overlap_work) &&
+        (partial->hot1.empty() || lane_with_gpu1_wanted()) &&
+        family_supports_cpu_lane(g.engine->family_ops.family);
     StageRuntime *post_stage = nullptr;
     if (lane_wanted && stage && !pilot_copy_on()) {
       post_stage = stage;
