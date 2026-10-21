@@ -635,6 +635,14 @@ if(NOT MOESTREAM_CPU_ONLY)
         endif()
     endif()
 
+    # Pure-header lifecycle contract test for the R2 strategy migration. It has
+    # no ggml/GPU dependencies; build it explicitly with:
+    #   cmake --build <build-dir> --target strategy_lifecycle_test
+    add_executable(strategy_lifecycle_test EXCLUDE_FROM_ALL
+        tests/test_strategy_lifecycle.cpp)
+    target_include_directories(strategy_lifecycle_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
+
     # Exact F32 parity for DeepSeek's quantized grouped output projection.
     # Uses the real CPU dot and GGML quantizer/dequantizer as the oracle.
     if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
