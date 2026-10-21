@@ -70,14 +70,39 @@ LOG_DIR="${GATE_LOG_DIR:-logs/regression_gate}"
 mkdir -p "$LOG_DIR"
 STAMP="$(date +%Y%m%d_%H%M%S)_$$"
 
-# Frozen baseline bands: [min, max] decode tok/s, measured on the merged master
-# (see docs/models/README.md for the full provenance and how to re-baseline).
-declare -A MIN MAX
-MIN[qwen38]=22.0 ; MAX[qwen38]=30.0       # 26.03 measured; doc 28.66, spread 24.6-28.7
-MIN[glm53flash]=6.5 ; MAX[glm53flash]=8.5 # 7.50 measured; doc 7.26
-MIN[ling31]=9.0 ; MAX[ling31]=11.5        # 10.23 measured; doc 10.15
-MIN[dsv41]=1.8 ; MAX[dsv41]=3.2           # 2.18 measured; doc 2.90 cold / 4.0-4.5 steady
-MIN[glm53]=1.8 ; MAX[glm53]=2.4           # 2.14 measured; doc 2.00-2.09
+# Frozen baseline bands: [min, max] decode tok/s.
+#
+# Baseline policy: each floor comes from the median of the current best run(s),
+# not from the latest passing run. Never lower a floor to admit a regression;
+# re-baseline deliberately with a recorded measurement (date, commit, config,
+# N runs). Models without an explicit metric below keep the historical
+# whole-request output rate; glm53flash uses the steady-state median so its
+# floor is directly comparable to docs/GLM5.3-Flash-baseline.md.
+declare -A MIN MAX METRIC BASELINE TOL
+MIN[ling31]=9.0 ; MAX[ling31]=11.5        # request output; 10.23 measured; doc 10.15
+MIN[dsv41]=1.8 ; MAX[dsv41]=3.2           # request output; 2.18 measured; doc 2.90 cold / 4.0-4.5 steady
+MIN[glm53]=1.8 ; MAX[glm53]=2.4           # request output; 2.14 measured; doc 2.00-2.09
+
+# qwen38: request output, split 22/26. Long-tested 27-28 tok/s; idle ABBA
+# (2026-10-21) 26.47-26.81. Baseline 27.0 with a 3% noise allowance -> 26.19.
+# The 25.83 run occurred at loadavg 2.19 and must fail, not silently pass.
+METRIC[qwen38]=request
+BASELINE[qwen38]=27.0
+TOL[qwen38]=0.03
+MIN[qwen38]=$(awk -v b="${BASELINE[qwen38]}" -v t="${TOL[qwen38]}" \
+  'BEGIN{printf "%.2f", b*(1-t)}')
+MAX[qwen38]=30.0
+
+# glm53flash: steady median, steps >= 20. Current best runs are 7.29 and 7.26
+# tok/s (lane-off/automatic normal graph); baseline 7.275, 4% noise allowance.
+# The fixed automatic 300-token run measured 7.19; the lane-on regression was
+# 6.49-6.51, which this floor must reject.
+METRIC[glm53flash]=steady
+BASELINE[glm53flash]=7.275
+TOL[glm53flash]=0.04
+MIN[glm53flash]=$(awk -v b="${BASELINE[glm53flash]}" -v t="${TOL[glm53flash]}" \
+  'BEGIN{printf "%.2f", b*(1-t)}')
+MAX[glm53flash]=8.5
 
 # Known model names (must match the run_* functions below). A typo in --models must fail
 # the gate loudly, never silently select nothing and report a successful empty run.
@@ -116,6 +141,30 @@ fi
 
 PASS=0; FAIL=0
 
+# Grab the steady-state decode rate (tok/s): median of [TOKEN-LOOP-DIAG]
+# iter_total over steps >= start. This is the metric used in the model baselines
+# (e.g. docs/GLM5.3-Flash-baseline.md); it excludes the first-token/setup ramp
+# that makes a short whole-request average look slower and noisier.
+# Prints "0" when nothing matches.
+grab_steady_rate() {
+  local f="$1" start="${2:-20}"
+  awk -v start="$start" '
+    {
+      line=$0
+      if (match(line, /\[TOKEN-LOOP-DIAG\] step=[0-9]+ iter_total=[0-9.]+ms/)) {
+        s=line; sub(/.*\[TOKEN-LOOP-DIAG\] step=/, "", s); sub(/ .*/, "", s); step=s+0
+        t=line; sub(/.*iter_total=/, "", t); sub(/ms.*/, "", t); ms=t+0
+        if (step >= start) a[++n]=ms
+      }
+    }
+    END {
+      if (n==0) { print "0"; exit }
+      for (i=1;i<=n;i++) for (j=i+1;j<=n;j++) if (a[j]<a[i]) { tmp=a[i]; a[i]=a[j]; a[j]=tmp }
+      med=(n%2) ? a[(n+1)/2] : (a[n/2]+a[n/2+1])/2
+      printf "%.2f\n", 1000/med
+    }' "$f"
+}
+
 # Grab the decode rate (tok/s) from a log. Tries, in order:
 #   [REQUEST-DECODE-OUTPUT] ... rate=N   (first output to last output; excludes one-time setup)
 #   [REQUEST-DECODE-WALL]   ... rate=N   (includes one-time decode-graph setup)
@@ -135,6 +184,18 @@ grab_tokens() {
   t="$(sed -nE 's/.*\[REQUEST-DECODE-WALL\].*tokens=([0-9]+).*/\1/p' "$f" 2>/dev/null | tail -1)"
   [[ -z "$t" ]] && t="$(sed -nE 's/.*\[REQUEST-DECODE-OUTPUT\].*tokens=([0-9]+).*/\1/p' "$f" 2>/dev/null | tail -1)"
   echo "${t:-0}"
+}
+
+# Select the metric declared for the model. Models without an explicit metric
+# keep the historical whole-request output rate; glm53flash uses the steady
+# median so the documented 7.26 tok/s baseline is directly comparable.
+grab_metric() {
+  local name="$1" f="$2"
+  if [[ "${METRIC[$name]:-request}" == "steady" ]]; then
+    grab_steady_rate "$f" 20
+  else
+    grab_rate "$f"
+  fi
 }
 
 # name rate rc teardown-log tokens expected_tokens
@@ -220,14 +281,16 @@ run_qwen38() {
 run_glm53flash() {
   local log="$LOG_DIR/glm53flash.$STAMP.log" eng="$LOG_DIR/glm53flash.$STAMP.engine.log" rc=0
   echo "--- glm53flash: wholelayer8, 150 tokens (single 3090) ---"
+  echo "    metric: steady median (TOKEN-LOOP-DIAG, steps >= 20); baseline 7.275, floor 6.98"
   echo "Explain the difference between CPU and GPU architecture in terms of parallelism, memory hierarchy and scheduling, in detail." \
     | env CUDA_VISIBLE_DEVICES=0 MOESTREAM_GLM5NEXT_FULL_GRAPH=1 \
         MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512 MOESTREAM_GLM5NEXT_CPU_THREADS=6 \
+        MOESTREAM_TOKEN_LOOP_DIAG=1 \
         scripts/run_capped.sh -- "$BIN" \
         --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
         --log-path "$eng" \
         --temp 0 --ngen 150 --force-start > "$log" 2>&1 || rc=$?
-  report glm53flash "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 150
+  report glm53flash "$(grab_metric glm53flash "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 150
 }
 
 # ---------------------------------------------------------------------------
