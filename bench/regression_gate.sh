@@ -146,19 +146,20 @@ report() {
   fi
   local lo="${MIN[$name]}" hi="${MAX[$name]}" note=""
   if [[ "$rc" != "0" ]]; then
-    # Termination statuses are never benign: 124 = timeout(1), >=128 = killed by a signal
-    # (137 = SIGKILL was the two-token false PASS this gate must reject).
-    if [[ "$rc" == "124" || "$rc" -ge 128 ]]; then
+    # 124 = timeout(1); >=128 = killed by a signal. 134 (SIGABRT) is the one exception:
+    # ggml's CUDA teardown calls abort(), so it may be admitted only by the completion
+    # evidence below. 137 (SIGKILL) and every other signal status remain failures.
+    if [[ "$rc" == "124" || ( "$rc" -ge 128 && "$rc" != "134" ) ]]; then
       printf "FAIL  %-12s %6.2f tok/s  (rc=%s: timeout/signal termination)\n" "$name" "$rate" "$rc"
       FAIL=$((FAIL+1)); return
     fi
-    # A nonzero exit is tolerable ONLY when it is the specifically recognized teardown
-    # crash (§3.7 "driver shutting down") AFTER generation completed: the log must carry
-    # that signature AND the request summary must show the expected token count. A partial
-    # result plus the teardown string is still a FAIL.
+    # A nonzero exit is tolerable ONLY when it is the recognized teardown
+    # abort/crash (§3.7 "driver shutting down") AFTER generation completed: the log must
+    # carry that signature AND the request summary must show the expected token count.
+    # A partial result plus the teardown string is still a FAIL.
     if [[ -n "$log" ]] && grep -q "driver shutting down" "$log" 2>/dev/null \
        && (( expected > 0 && tokens >= expected )); then
-      note="  [rc=$rc: benign teardown crash, $tokens/$expected tokens]"
+      note="  [rc=$rc: recognized teardown abort after $tokens/$expected tokens]"
     else
       printf "FAIL  %-12s %6.2f tok/s  (rc=%s, not completed generation + teardown evidence; %s/%s tokens)\n" \
         "$name" "$rate" "$rc" "$tokens" "$expected"
