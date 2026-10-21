@@ -66,6 +66,10 @@ class CacheBackedStrategy final : public ColdMoEStrategy {
     return runner_ && ram_ && topology_;
   }
 
+  // Owns the Phase A/B residency lifecycle by contract once wired; fail-closed until then
+  // (begin() records identity, state() stays Pending, finish() stays false).
+  bool drives_residency() const override { return true; }
+
   bool begin(const ColdMoEInvocation &inv) override {
     if (!runner_ || !ram_ || !topology_)
       return false;

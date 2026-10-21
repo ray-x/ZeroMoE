@@ -13,6 +13,7 @@
 //   * residency Failed          -> Error (load error)
 //   * release is idempotent and a no-op once the generation advances
 //   * `completed` is deliberately absent — Ready is derived from residency only
+//   * drives_residency() defaults to true and is explicitly overridable (observation-only)
 
 #include "invocation_state.hpp"
 
@@ -31,8 +32,28 @@ using moestream::graph::InvocationState;
 using State = InvocationState::State;
 using Residency = InvocationState::Residency;
 
+// Minimal strategies that pin the capability contract only; the operational methods are inert
+// because this test exercises the lifecycle helper, not a backend.
+struct DrivingStrategy : moestream::graph::ColdMoEStrategy {
+  bool install(const moestream::graph::ColdMoEAdapter &) override { return true; }
+  bool begin(const moestream::graph::ColdMoEInvocation &) override { return true; }
+  State state(const moestream::graph::ColdMoEInvocation &) const override { return State::Pending; }
+  bool finish(const moestream::graph::ColdMoEInvocation &) override { return false; }
+  void release(const moestream::graph::ColdMoEInvocation &) override {}
+};
+
+struct ObservingStrategy : DrivingStrategy {
+  bool drives_residency() const override { return false; }
+};
+
 int main() {
   InvocationState g;
+
+  // ---- capability: a driver must know whether finish() is a barrier or a query ---------------
+  DrivingStrategy driving;
+  ObservingStrategy observing;
+  CHECK(driving.drives_residency(), "a strategy drives residency by default");
+  CHECK(!observing.drives_residency(), "observation-only is explicit");
 
   // ---- no active invocation: anything is Error -----------------------------------------------
   CHECK(g.inactive(), "fresh gate has no active invocation");

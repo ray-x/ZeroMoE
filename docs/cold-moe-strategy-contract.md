@@ -190,12 +190,20 @@ delegate to it, so there is one tested state machine rather than two hand-rolled
 regression test is `tests/test_strategy_lifecycle.cpp` (pure C++; covers stale generation, wrong
 layer, load error, idempotent/stale release, and that `completed` is never consulted).
 
-*Partial today:* the lane enforces "never compute against a missing expert" through `finish_load()`
-blocking + `std::abort()` on load error, but it does not yet expose that as the strategy's
-`Pending/Ready/Error`. The strategy now validates the invocation identity — the layer and generation
-recorded by `begin()`, held stable until `release()` — so a stale or wrong-layer invocation reports
-`Error`; wiring per-token `begin()`/`state()`/`finish()` into the decode loops is the remaining part
-of migration step 2.
+Who drives residency is explicit: `ColdMoEStrategy::drives_residency()`. The full-graph lane
+adapter returns **false** — it is observation-only because `run()` starts and waits for residency
+itself, so its `finish()` is a non-blocking readiness query, not a barrier. The cache-backed
+adapter returns **true** by contract (once wired, `begin()` starts the Phase A/B claim and
+`finish()` blocks). A generic driver must check this capability before treating `finish()` as a
+barrier; the GLM scheduler bridge asserts the lane adapter is observation-only.
+
+*Wired for the GLM full-graph lane:* `moestream_ggml_sched_early_cpu` calls `begin()` before the
+lane's `run()`, `run()` consults `state()` before its compute branches (the split-load path asserts
+`Ready` after its second `finish_load()`; phase 1 computes only the already-resident subset with the
+pending experts masked out, per §3.3), and `finish()` + `release()` close the invocation after
+`run()`. The lane still enforces "never compute against a missing expert" through `finish_load()`
+blocking + `std::abort()` on load error, so it never reports `Error`; a stale or wrong-layer
+invocation does. Qwen and the cache-backed path still need the same per-token wiring.
 
 ---
 

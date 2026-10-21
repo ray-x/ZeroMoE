@@ -58,16 +58,26 @@ class ColdMoEStrategy {
   // strategy instance, before any per-token invocation. False only if the adapter is unusable.
   virtual bool install(const ColdMoEAdapter &adapter) = 0;
 
+  // Capability: true when this strategy owns the residency lifecycle — begin() starts it,
+  // finish() blocks until Ready, release() frees it. False for an observation-only adapter
+  // (the full-graph lane, whose own run() drives residency): there begin()/state()/finish()/
+  // release() are a view of an externally driven lifecycle, and finish() must not be used as
+  // a barrier — it reports true only when the invocation is already Ready.
+  virtual bool drives_residency() const { return true; }
+
   // Per-invocation: begin residency for the invocation and record its (layer, generation)
   // identity so state()/finish()/release() can detect stale or wrong-layer invocations.
-  // False only on an unrecoverable error.
+  // For an observation-only strategy this records identity only; the external driver owns
+  // residency. False only on an unrecoverable error.
   virtual bool begin(const ColdMoEInvocation &inv) = 0;
 
   // Pending until every owned route's expert is fully resident and valid; Ready when
   // computable; Error when unrecoverable or when the invocation is stale / wrong-layer (§3.3).
   virtual State state(const ColdMoEInvocation &inv) const = 0;
 
-  // Block until Ready (or return false on Error). Re-entrant on the decode thread (§3.3).
+  // If drives_residency(): block until Ready; false on Error or a stale invocation.
+  // Otherwise (observation-only): a non-blocking readiness query — true only if the
+  // invocation is already Ready. It never starts or waits for residency.
   virtual bool finish(const ColdMoEInvocation &inv) = 0;
 
   // Free the invocation's held buffers after the last consumer (§3.4). The strategy's own

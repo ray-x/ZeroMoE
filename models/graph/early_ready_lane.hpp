@@ -495,6 +495,17 @@ struct EarlyReadyLane {
     return true;
   }
 
+  // §3.8 rule 1: before compute reads an owned expert's planes, the strategy must report Ready.
+  // The split-load path is the one exception — phase 1 computes only the already-resident subset
+  // with the pending experts masked out — so it asserts Ready after its second finish_load().
+  bool strategy_ready() const {
+    if (!strategy) return true;
+    moestream::graph::ColdMoEInvocation inv;
+    inv.layer = trace_layer;
+    inv.generation = calls + 1;
+    return strategy->state(inv) == moestream::graph::ColdMoEStrategy::State::Ready;
+  }
+
   void run() {
     GGML_ASSERT(!completed);
     const int64_t start = ggml_time_us();
@@ -565,8 +576,10 @@ struct EarlyReadyLane {
     }
     // Residency is complete (every owned expert resident) unless the split-load path still has
     // experts pending; the two-phase branch flips `residency_ready` after its second finish_load().
-    if (!two_phase)
+    if (!two_phase) {
       residency_ready = true;
+      GGML_ASSERT(strategy_ready());
+    }
     // GPU assist: hand some of the experts that are ready now to the assist backend(s). Device 0 takes up to
     // min(slots, ready/2); a second device (own ring and link) takes more, as long as one expert stays on the CPU.
     int32_t assisted[2][8];
@@ -645,6 +658,7 @@ struct EarlyReadyLane {
       const int64_t wait0 = ggml_time_us();
       GGML_ASSERT(finish_load());
       residency_ready = true;  // all owned experts resident after the second-phase load
+      GGML_ASSERT(strategy_ready());
       split_stall_us += ggml_time_us() - wait0;
       // Phase 2: the experts that had to be loaded.
       for (int j = 0; j < n_owned; ++j) {

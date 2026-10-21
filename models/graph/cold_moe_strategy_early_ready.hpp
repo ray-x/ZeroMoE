@@ -16,8 +16,10 @@
 // safe to compute" (§3.8). A stale invocation (generation advanced) or a wrong-layer invocation is
 // Error, never Ready.
 //
-// state()/finish()/release() are not yet consulted per token by the decode path (the lane still
-// drives residency through run()); this adapter makes the lifecycle correct as a representation.
+// state()/finish()/release() are driven per token by the scheduler bridge for the GLM lane
+// (`moestream_ggml_sched_early_cpu`: begin before run(), state()/finish()/release() around it).
+// This adapter is OBSERVATION-ONLY (`drives_residency()` is false): the lane's own run() starts
+// and waits for residency, so finish() is a readiness query and must not be used as a barrier.
 
 #include "cold_moe_strategy.hpp"
 #include "early_ready_lane.hpp"
@@ -39,6 +41,12 @@ class EarlyReadyLaneStrategy final : public ColdMoEStrategy {
     lane_->expert_planes = adapter.expert_planes;
     return true;
   }
+
+  // Observation-only: EarlyReadyLane::run() starts and waits for residency internally (the
+  // scheduler bridge invokes the lane's own begin_load/finish_load), so this adapter cannot
+  // start a load from finish(). Callers must consult state() after their own residency step;
+  // finish() is a readiness query here, not a barrier.
+  bool drives_residency() const override { return false; }
 
   bool begin(const ColdMoEInvocation &inv) override {
     if (!lane_)
