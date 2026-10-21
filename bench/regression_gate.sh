@@ -79,6 +79,22 @@ MIN[ling31]=9.0 ; MAX[ling31]=11.5        # 10.23 measured; doc 10.15
 MIN[dsv41]=1.8 ; MAX[dsv41]=3.2           # 2.18 measured; doc 2.90 cold / 4.0-4.5 steady
 MIN[glm53]=1.8 ; MAX[glm53]=2.4           # 2.14 measured; doc 2.00-2.09
 
+# Known model names (must match the run_* functions below). A typo in --models must fail
+# the gate loudly, never silently select nothing and report a successful empty run.
+KNOWN_MODELS=(qwen38 glm53flash ling31 dsv41 glm53)
+SELECTED=0
+for m in ${MODELS//,/ }; do
+  ok=0
+  for k in "${KNOWN_MODELS[@]}"; do
+    [[ "$m" == "$k" ]] && { ok=1; break; }
+  done
+  if [[ "$ok" != "1" ]]; then
+    echo "FAIL  unknown model '$m' (known: ${KNOWN_MODELS[*]})" >&2
+    exit 2
+  fi
+  SELECTED=$((SELECTED+1))
+done
+
 PASS=0; FAIL=0
 
 # Grab the decode rate (tok/s) from a log. Tries, in order:
@@ -94,15 +110,26 @@ grab_rate() {
   echo "${r:-0}"
 }
 
-# name rate exit_code
+# name rate exit_code [log-with-stderr]
 report() {
-  local name="$1" rate="$2" rc="$3"
+  local name="$1" rate="$2" rc="$3" log="${4:-}"
   if [[ "$rate" == "0" ]]; then
     printf "FAIL  %-12s no decode rate measured (launch/parse error, rc=%s)\n" "$name" "$rc"
     FAIL=$((FAIL+1)); return
   fi
   local lo="${MIN[$name]}" hi="${MAX[$name]}" note=""
-  [[ "$rc" != "0" ]] && note="  [rc=$rc: likely benign teardown crash]"
+  if [[ "$rc" != "0" ]]; then
+    # A nonzero exit is tolerable ONLY when it is the specifically recognized teardown
+    # crash (§3.7 "CUDA error: driver shutting down" in destructors AFTER generation
+    # completed). Anything else — SIGKILL, an abort mid-generation, OOM — is a real
+    # failure even when a rate line happened to print.
+    if [[ -n "$log" ]] && grep -q "driver shutting down" "$log" 2>/dev/null; then
+      note="  [rc=$rc: benign teardown crash]"
+    else
+      printf "FAIL  %-12s %6.2f tok/s  (rc=%s, not a recognized teardown crash)\n" "$name" "$rate" "$rc"
+      FAIL=$((FAIL+1)); return
+    fi
+  fi
   if awk -v r="$rate" -v a="$lo" -v b="$hi" 'BEGIN{exit !(r>=a && r<=b)}'; then
     printf "PASS  %-12s %6.2f tok/s  (band %.1f-%.1f)%s\n" "$name" "$rate" "$lo" "$hi" "$note"
     PASS=$((PASS+1))
@@ -134,8 +161,8 @@ echo
 run_qwen38() {
   local log="$LOG_DIR/qwen38.$STAMP.log" rc=0
   echo "--- qwen38: split 22/26, 400 tokens (single 3090) ---"
-  MOESTREAM_BIN="$BIN" bench/qwen_decode_baselines.sh split 10 400 > "$log" 2>&1 || rc=$?
-  report qwen38 "$(grab_rate "$log")" "$rc"
+  MOESTREAM_BIN="$BIN" QWN_STAMP="$STAMP" bench/qwen_decode_baselines.sh split 10 400 > "$log" 2>&1 || rc=$?
+  report qwen38 "$(grab_rate "$log")" "$rc" "$log"
 }
 
 # ---------------------------------------------------------------------------
@@ -150,7 +177,7 @@ run_glm53flash() {
         scripts/run_capped.sh -- "$BIN" \
         --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
         --temp 0 --ngen 150 --force-start > "$log" 2>&1 || rc=$?
-  report glm53flash "$(grab_rate "$log")" "$rc"
+  report glm53flash "$(grab_rate "$log")" "$rc" "$log"
 }
 
 # ---------------------------------------------------------------------------
@@ -166,7 +193,7 @@ run_ling31() {
   LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" \
   LING_LOG="$eng" LING_BIN="$BIN" \
   bench/ling/reference-audit/run.sh > "$log" 2>&1 || rc=$?
-  report ling31 "$(grab_rate "$eng")" "$rc"
+  report ling31 "$(grab_rate "$eng")" "$rc" "$log"
 }
 
 # ---------------------------------------------------------------------------
@@ -180,7 +207,7 @@ run_dsv41() {
         scripts/run_capped.sh -- "$BIN" \
         --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
         --temp 0 --ngen 64 --force-start > "$log" 2>&1 || rc=$?
-  report dsv41 "$(grab_rate "$log")" "$rc"
+  report dsv41 "$(grab_rate "$log")" "$rc" "$log"
 }
 
 # ---------------------------------------------------------------------------
@@ -196,7 +223,7 @@ run_glm53() {
     MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
     MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
     MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 > "$log" 2>&1 || rc=$?
-  report glm53 "$(grab_rate "logs/split_ab_$tag.log")" "$rc"
+  report glm53 "$(grab_rate "logs/split_ab_$tag.log")" "$rc" "$log"
 }
 
 wants qwen38      && run_qwen38
@@ -207,4 +234,9 @@ wants glm53       && run_glm53
 
 echo
 echo "== summary: $PASS passed, $FAIL failed =="
+# Every selected model must produce a result: an empty or short run is a FAIL, not a pass.
+if [[ $((PASS + FAIL)) -ne "$SELECTED" ]]; then
+  echo "FAIL  selected $SELECTED model(s) but only $((PASS + FAIL)) produced a result" >&2
+  exit 1
+fi
 [[ "$FAIL" -eq 0 ]] || exit 1

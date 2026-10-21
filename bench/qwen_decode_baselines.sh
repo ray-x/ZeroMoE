@@ -8,7 +8,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE=${1:?usage: $0 split|hybrid ...}
-STAMP=$(date +%Y%m%d_%H%M)
+# Unique (second-resolution) stamp, overridable so the gate can pass its own per-run stamp and
+# never reuse a same-minute log from a prior invocation (stale-rate false PASS).
+STAMP=${QWN_STAMP:-$(date +%Y%m%d_%H%M%S)}
 mkdir -p logs
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 BIN=${MOESTREAM_BIN:-./build_native/moestream}
@@ -20,16 +22,22 @@ case "$MODE" in
   split)
     THREADS=${2:-10}; NTOK=${3:-400}
     LOG=logs/qwen_decode_split_$STAMP
+    rm -f "$LOG.log" "$LOG.engine.log"
     # context 416 = 16-token prompt + 400 tokens; a longer prompt+gen pushes the last token onto the legacy path and fakes a gap
     sed -E "s/^omp_max_threads.*/omp_max_threads = $THREADS/; s/^max_new_tokens.*/max_new_tokens = $NTOK/; s#^log_path.*#log_path = \"$LOG.engine.log\"#" \
       configs/qwen4exp_tg400_iq1m_22_26.toml > "$TMP/cfg.toml"
     # "Tell a story." is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)
+    rc=0
     printf 'Tell a story.\n:q\n' | env CUDA_VISIBLE_DEVICES=0 \
       MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
       MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
       MOESTREAM_BENCH_SILENT=1 MOESTREAM_BENCH_IGNORE_STOP=1 \
-      timeout 900 "$BIN" --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || true
-    grep -E "PREFILL-DONE\] 16|REQUEST-DECODE-WALL" "$LOG.engine.log" | cut -c1-170
+      timeout 900 "$BIN" --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
+    grep -E "PREFILL-DONE\] 16|REQUEST-DECODE-WALL" "$LOG.engine.log" | cut -c1-170 || true
+    # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather
+    # than treat any nonzero exit as benign.
+    grep -m1 "driver shutting down" "$LOG.log" || true
+    exit "$rc"
     ;;
   hybrid)
     K=${2:-14554}; NGEN=${3:-200}; THREADS=${4:-10}
