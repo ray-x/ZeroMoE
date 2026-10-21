@@ -42,7 +42,7 @@ everything that determines the execution config, and nothing more.
 
 | Dimension | Fields | Source |
 |---|---|---|
-| Hardware | GPU model/VRAM, device count, PCIe link class, host RAM | `GpuTopology::devices` + `cudaMemGetInfo` |
+| Hardware | **per-device** GPU model/VRAM + **PCIe gen × width**, host RAM | `GpuTopology::devices` + `cudaMemGetInfo` |
 | Model dimensions | `n_layers`, `d_model`, `moe_inter`, `n_experts`, `topk` | `ArchitectureConfig` |
 | Quant signature | `gate_type`, `up_type`, `down_type` | `ArchitectureConfig` / GGUF |
 | Budgets | DDR residency bytes, VRAM cache bytes, pinned bytes | `EngineConfig` + preflight |
@@ -51,6 +51,14 @@ everything that determines the execution config, and nothing more.
 The quant signature matters because it selects the MoE runner and kernels
 (`GgmlMoeRunner::instance_for(gate_type, up_type, down_type)` already keys on exactly this). The
 hardware/VRAM matters because it selects the placement (resident-GPU vs offload vs CPU lane).
+
+**PCIe link class is per-device, not per-system.** A box can mix generations and widths (the
+baseline box is already exactly this: an RTX 3090 on PCIe 4 ×16 alongside a 5060 Ti on PCIe 3 ×8,
+~12.3 GB/s vs ~6.8 GB/s H2D). Because link bandwidth decides the H2D ceiling and therefore whether
+a `copy_expert_h2d`-style resident layer or a D2D reuse path wins, the key records a **vector of
+per-device specs** (`gpu`, `vram`, `pcie_gen`, `pcie_width`) rather than a single system-wide
+scalar. Two runs differ in the key if they differ on *any* device's link class, even when the GPU
+models are identical.
 
 ## 4. The profile body
 
@@ -72,6 +80,11 @@ diffable, and independent of the `ExecutionPolicy` headers.
 2. Look up a profile by key.
 3. **Hit → reuse** the profile's config. No tuning.
 4. **Miss → contribute** a new profile with the model's initial config, then validate and freeze it.
+
+**Profiles are immutable once frozen.** `contribute_profile` on an existing key is rejected; a
+re-tune must go through an explicit `--rebaseline`, which rewrites the profile only after the
+change passes the gate and the new baseline is recorded in `docs/models/`. A frozen profile is
+never silently mutated by another model's run.
 
 This is the rule that makes onboarding a *bounded task* (§4.6 of the plan): a new model reuses
 existing strategy implementations and contributes only the delta where its key genuinely differs.
@@ -125,10 +138,20 @@ band has drifted is a regression, not a new profile.
 
 ```cpp
 // models/graph/execution_profile.hpp  (design sketch; not yet wired)
+// Serialised as TOML (matches the existing *.toml run configs, stays human-diffable).
+
+struct DeviceSpec {                 // per-device; order = the model's device order
+  std::string gpu;                  // e.g. "rtx3090", "rtx5060ti"
+  size_t vram_bytes = 0;
+  int pcie_gen = 0;                 // 3 | 4  (a mixed 3.0+4.0 box differs per device)
+  int pcie_width = 0;               // 8 | 16
+  bool operator==(const DeviceSpec&) const = default;
+};
 
 struct ProfileKey {
-  // hardware
-  std::string gpu; int devices = 0; size_t vram_bytes = 0, ram_bytes = 0;
+  // hardware (per-device, so mixed PCIe generations/widths are captured)
+  std::vector<DeviceSpec> devices;
+  size_t ram_bytes = 0;
   // model dimensions
   int n_layers = 0, d_model = 0, moe_inter = 0, n_experts = 0, topk = 0;
   // quant signature
@@ -165,16 +188,20 @@ Resolution lives behind a small registry:
 
 ```cpp
 const ExecutionProfile *resolve_profile(const ProfileKey &key);  // hit -> reuse
-void contribute_profile(ExecutionProfile profile);               // miss -> validate + freeze
+// miss -> validate + freeze. Refuses (returns error) when the key already exists:
+// a frozen profile is immutable; re-tune only via an explicit rebaseline path.
+bool contribute_profile(ExecutionProfile profile);
+bool rebaseline_profile(ExecutionProfile profile);              // gated rewrite of a frozen key
 ```
 
-## 10. Open questions (to settle at implementation time)
+## 10. Decisions
 
-1. **Serialisation format** — a typed file (TOML/JSON) vs. generated C++ defaults. TOML is
-   preferred: it matches the existing `*.toml` run configs and stays human-diffable.
-2. **Key granularity** — is `(gpu, vram)` enough, or must the key include PCIe link class (x16 vs
-   x8) after the 5060 Ti finding in `run_ggml_moe_layer`? Leaning: include it; it changed the
-   selected device once already.
-3. **Contribute vs override** — when a key matches but the owner wants to re-tune, does
-   `contribute_profile` refuse (immutable) or record a new revision? Leaning: immutable once frozen,
-   with an explicit `--rebaseline` to rewrite after a validated change.
+1. **Serialisation: TOML.** Matches the existing `*.toml` run configs and stays human-diffable;
+   the C++ type above is the in-memory form only.
+2. **Key granularity: include PCIe link class, per device.** The link class changed the selected
+   device once already (the 5060 Ti finding in `run_ggml_moe_layer`). Because a box can mix
+   generations/widths (e.g. PCIe 4 ×16 + PCIe 3 ×8), the class is recorded **per device**
+   (`DeviceSpec.pcie_gen`/`pcie_width`), not as a single system-wide scalar.
+3. **Contribute vs override: immutable once frozen.** `contribute_profile` refuses on an existing
+   key; re-tuning goes through `rebaseline_profile`, which only rewrites after the change passes
+   the gate and its new baseline lands in `docs/models/`.
