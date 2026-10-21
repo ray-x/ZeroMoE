@@ -260,6 +260,10 @@ Shared code alone does not preserve tuning knowledge. Each model's profile recor
 - validated on **short prompts, long prompts and chunk continuation**, not one decode length.
 
 These profiles are the frozen baselines the gate compares against, and live in `docs/models/`.
+The *machine-loadable* half of the same knowledge — the selected strategy + tunables as data the
+engine loads — is the reusable **execution profile**, specced in `docs/execution-profile-spec.md`
+(R4). The two stay in lock-step: a `docs/models/*.md` recipe freezes the measurement; the execution
+profile carries the config that produced it.
 
 ---
 
@@ -307,4 +311,6 @@ not yet exist — only its ridge-table dedup does.
 - `docs/source-layout-2026-10-18.md` — folder split, "one family = one implementation" rule.
 - `docs/graph-design-conformance-2026-10-08.md` — six-requirement design audit.
 - `docs/handoff-2026-10-11-graph-framework-refactor.md` — the last big refactor's commits + gates.
+- `docs/execution-profile-spec.md` — R4: machine-loadable execution profiles (keyed by hardware /
+  shapes / quant / budgets / workload; the data that selects + parameterises `ExecutionPolicy`).
 - `docs/models/README.md` — per-model playbook and the frozen baseline bands.
