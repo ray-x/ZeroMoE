@@ -34,7 +34,7 @@
 //   begin()   -> the Phase A claim loop over the invocation's owned experts (claim_or_wait +
 //                wait_for_ram_slot), then the Phase B VRAM holds (hold_for_compute).
 //   state()   -> Ready once every owned expert is a cache hit AND its VRAM slot is held;
-//                Pending while any is Loading/Claimed or not yet held.
+//                Pending while any is Loading/Claimed or not yet held; Error on a failed load.
 //   finish()  -> runner->run_layer* (the per-layer sync — it waits for its own H2D/D2D).
 //   release() -> topo->release_hold(...) after the last consumer.
 //
@@ -44,6 +44,7 @@
 // the three backends below are the only handle this adapter needs.
 
 #include "cold_moe_strategy.hpp"
+#include "invocation_state.hpp"
 
 class RAMSafetyManager;
 class GpuTopology;
@@ -65,40 +66,44 @@ class CacheBackedStrategy final : public ColdMoEStrategy {
     return runner_ && ram_ && topology_;
   }
 
-  bool begin(const ColdMoEInvocation & /*inv*/) override {
+  bool begin(const ColdMoEInvocation &inv) override {
+    if (!runner_ || !ram_ || !topology_)
+      return false;
+    gate_.begin(inv.layer, inv.generation);
     // TODO(wiring): Phase A over inv.routes' owned experts — ram->claim_or_wait(engine, layer,
     // expert, who, ...); on Loading, ram->wait_for_ram_slot(...); on Claimed, load + publish.
     // Then Phase B — topo->hold_for_compute(layer, e, device_ptr, from_active_layer) for each
     // resident expert. Store the (layer, expert, device_ptr, from_active_layer) tuples for
     // release(). The adapter's begin_load/finish_load are the lane's callbacks and are unused
     // here (the cache-backed path claims directly through RAMSafetyManager).
-    return runner_ && ram_ && topology_;
+    return true;
   }
 
-  State state(const ColdMoEInvocation & /*inv*/) const override {
-    // TODO(wiring): Ready once every owned expert is a cache hit (RamClaimStatus::Hit) and its
-    // VRAM slot is held; Pending while any is Loading/Claimed; Error on a failed load.
-    // (§3.8: consult before compute; Ready is the only compute-permitted state.)
-    return State::Pending;
+  State state(const ColdMoEInvocation &inv) const override {
+    // TODO(wiring): map RamClaimStatus -> Residency (Hit -> Ready, Loading/Claimed -> InProgress,
+    // load error -> Failed). Until wired, residency is never confirmed, so an active invocation
+    // stays Pending and a stale/wrong invocation is Error (fail-closed per §3.8).
+    return gate_.state(inv.layer, inv.generation, InvocationState::Residency::InProgress);
   }
 
-  bool finish(const ColdMoEInvocation & /*inv*/) override {
+  bool finish(const ColdMoEInvocation &inv) override {
     // TODO(wiring): runner->run_layer*(x, ids, w, out) — the per-layer transfer + compute. The
     // runner syncs its own H2D/D2D inside run_layer, so this is the Ready->done barrier.
-    // Fail-closed until wired: returning true here would claim compute completed without having
-    // driven residency or compute, so an unwired/null backend would silently "succeed".
-    return false;
+    // Fail-closed until wired: residency is never Ready, so this never claims compute completed.
+    return gate_.finish(inv.layer, inv.generation, InvocationState::Residency::InProgress);
   }
 
-  void release(const ColdMoEInvocation & /*inv*/) override {
+  void release(const ColdMoEInvocation &inv) override {
     // TODO(wiring): topo->release_hold(layer, expert, device_ptr, from_active_layer) for every
     // tuple held in begin(); a stale release (generation advanced) is a no-op (§3.8 rule 3).
+    gate_.release(inv.layer, inv.generation);
   }
 
  private:
   moe::GgmlMoeRunner *runner_ = nullptr;
   RAMSafetyManager *ram_ = nullptr;
   GpuTopology *topology_ = nullptr;
+  InvocationState gate_;
 };
 
 }  // namespace moestream::graph

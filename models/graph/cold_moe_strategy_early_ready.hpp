@@ -10,16 +10,18 @@
 // state machine.
 //
 // Per-invocation begin()/state()/finish()/release() key off the invocation's (layer, generation)
-// identity (§3.5/§3.8), held stable from begin() until release(). state() reports the lane's
-// residency-readiness flag `residency_ready`, NOT its `completed` flag — `completed` marks run()
-// finished (compute already done), whereas Ready means "resident and safe to compute" (§3.8). A
-// stale invocation (generation advanced) or a wrong-layer invocation is Error, never Ready.
+// identity (§3.5/§3.8), held stable from begin() until release() by a shared InvocationState.
+// state() reports the lane's residency-readiness flag `residency_ready`, NOT its `completed` flag
+// — `completed` marks run() finished (compute already done), whereas Ready means "resident and
+// safe to compute" (§3.8). A stale invocation (generation advanced) or a wrong-layer invocation is
+// Error, never Ready.
 //
 // state()/finish()/release() are not yet consulted per token by the decode path (the lane still
 // drives residency through run()); this adapter makes the lifecycle correct as a representation.
 
 #include "cold_moe_strategy.hpp"
 #include "early_ready_lane.hpp"
+#include "invocation_state.hpp"
 
 namespace moestream::graph {
 
@@ -43,45 +45,44 @@ class EarlyReadyLaneStrategy final : public ColdMoEStrategy {
       return false;
     // Record the invocation identity so state()/finish()/release() can key off it, and a route
     // classified at generation g never binds to a slot reused at g+1 (§3.5/§3.8).
-    layer_ = inv.layer;
-    generation_ = inv.generation;
+    gate_.begin(inv.layer, inv.generation);
     return true;
   }
 
   State state(const ColdMoEInvocation &inv) const override {
     if (!lane_)
       return State::Error;
-    // Identity cross-check: the invocation must be the ACTIVE one (same layer, same generation).
-    // A stale invocation (generation advanced past it) or a wrong-layer invocation is Error,
-    // never Ready (§3.8).
-    if (inv.layer != layer_ || inv.generation != generation_)
-      return State::Error;
-    // Residency readiness is the lane's `residency_ready` flag, set once the owned experts are
-    // resident and before the CPU graph runs. It is deliberately NOT `completed` (compute done).
-    return lane_->residency_ready ? State::Ready : State::Pending;
+    return gate_.state(inv.layer, inv.generation, residency());
   }
 
   bool finish(const ColdMoEInvocation &inv) override {
     // The lane's run() already drove residency + compute on the scheduler bridge, so there is
     // nothing to wait on. Fail (rather than report Ready) on a stale or wrong-layer invocation
     // so a stale route never computes (§3.8 rule 2).
-    if (!lane_ || inv.layer != layer_ || inv.generation != generation_)
+    if (!lane_)
       return false;
-    return lane_->residency_ready;
+    return gate_.finish(inv.layer, inv.generation, residency());
   }
 
   void release(const ColdMoEInvocation &inv) override {
     // The lane owns its buffers; nothing to free. A stale release (generation advanced past this
     // invocation) must be a no-op so it cannot free a live slot (§3.8 rule 3). Idempotent.
-    if (lane_ && inv.layer == layer_ && inv.generation == generation_)
-      generation_ = kNoGeneration;
+    if (!lane_)
+      return;
+    gate_.release(inv.layer, inv.generation);
   }
 
  private:
-  static constexpr uint64_t kNoGeneration = ~0ull;
+  // Residency readiness is the lane's `residency_ready` flag (set once the owned experts are
+  // resident, before the CPU graph runs). The lane has no recoverable load-error state: a failed
+  // load aborts today, so it never reports Residency::Failed.
+  InvocationState::Residency residency() const {
+    return lane_->residency_ready ? InvocationState::Residency::Ready
+                                  : InvocationState::Residency::InProgress;
+  }
+
   ::EarlyReadyLane *lane_ = nullptr;
-  int layer_ = -1;
-  uint64_t generation_ = kNoGeneration;
+  InvocationState gate_;
 };
 
 }  // namespace moestream::graph

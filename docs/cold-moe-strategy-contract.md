@@ -183,6 +183,13 @@ Rules, all paths:
 3. `release(inv)` is idempotent, and a no-op once the generation has advanced (a stale release after a
    slot reuse must not free a live buffer).
 
+Shared implementation: `models/graph/invocation_state.hpp`'s `InvocationState` owns the identity
+tracking (`begin` / `matches` / `release`) and the residency→state mapping
+(`InProgress`→Pending, `Ready`→Ready, `Failed`→Error, identity mismatch→Error). Both adapters
+delegate to it, so there is one tested state machine rather than two hand-rolled copies. Its
+regression test is `tests/test_strategy_lifecycle.cpp` (pure C++; covers stale generation, wrong
+layer, load error, idempotent/stale release, and that `completed` is never consulted).
+
 *Partial today:* the lane enforces "never compute against a missing expert" through `finish_load()`
 blocking + `std::abort()` on load error, but it does not yet expose that as the strategy's
 `Pending/Ready/Error`. The strategy now validates the invocation identity — the layer and generation
