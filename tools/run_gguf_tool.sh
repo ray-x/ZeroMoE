@@ -22,7 +22,7 @@ cd "$(dirname "$0")/.."
 
 CXX="${CXX:-c++}"
 BIN="${BIN:-./build/gguf_tool}"
-SRCS="tools/gguf_tool.cpp tools/gguf_pack.cpp tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp tools/gguf_dma.cpp tools/gguf_mix.cpp tools/gguf_offload.cpp"
+SRCS="tools/gguf_tool.cpp tools/gguf_pack.cpp tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp tools/gguf_dma.cpp tools/gguf_mix.cpp tools/gguf_mirror.cpp tools/gguf_offload.cpp"
 
 if [ "$#" -lt 1 ]; then
     echo "usage: $0 <subcommand> [args...]  (subcommands: pack, io, verify, plan, dma, mix, offload)" >&2
@@ -31,8 +31,8 @@ if [ "$#" -lt 1 ]; then
 fi
 
 mkdir -p "$(dirname "$BIN")"
-echo "[run_gguf_tool] $CXX -std=c++23 -O2 -Iinclude $SRCS -> $BIN"
-"$CXX" -std=c++23 -O2 -Iinclude -o "$BIN" $SRCS
+echo "[run_gguf_tool] $CXX -std=c++23 -O2 -Imodels/base -Imemory -Icore $SRCS -> $BIN"
+"$CXX" -std=c++23 -O2 -Imodels/base -Imemory -Icore -o "$BIN" $SRCS
 
 echo "[run_gguf_tool] running: $BIN $*"
 exec "$BIN" "$@"
