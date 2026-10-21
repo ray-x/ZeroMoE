@@ -59,6 +59,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   }
   for (auto &entry : g.early_ready) {
     entry.second->expected_pos = pos_base;
+    entry.second->residency_ready = false;
     entry.second->completed = false;
   }
   const auto start = std::chrono::steady_clock::now();

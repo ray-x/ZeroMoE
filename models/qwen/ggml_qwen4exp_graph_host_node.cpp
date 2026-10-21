@@ -735,7 +735,24 @@ extern "C" int moestream_ggml_sched_early_cpu(
   }
   if (!context || context->cpu != backend) return 0;
   const int64_t w = context->wait_us, c = context->compute_us;
-  context->run(); ++context->early_calls;
+  if (context->strategy) {
+    // One complete invocation through the lifecycle (§3.8): begin() records the (layer,
+    // generation) identity, run() consults state() before compute, finish() checks the
+    // completed residency barrier and release() drops the identity. The lane strategy is
+    // observation-only — run() owns residency — so the driving-strategy path is rejected.
+    GGML_ASSERT(!context->strategy->drives_residency());
+    // Captured before run(), because run() advances `calls`; Qwen lanes have no strategy yet
+    // and take the plain path unchanged.
+    moestream::graph::ColdMoEInvocation inv;
+    inv.layer = context->trace_layer;
+    inv.generation = context->calls + 1;
+    GGML_ASSERT(context->strategy->begin(inv));
+    context->run(); ++context->early_calls;
+    GGML_ASSERT(context->strategy->finish(inv));
+    context->strategy->release(inv);
+  } else {
+    context->run(); ++context->early_calls;
+  }
   *wait_us = context->wait_us - w; *compute_us = context->compute_us - c;
   return 1;
 }

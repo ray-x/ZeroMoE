@@ -22,6 +22,8 @@
 #include <cuda_runtime.h>
 #include "qwen4exp_stage_pool.hpp"
 #include "moe_routed_ggml.hpp"
+#include "pilot_ridge.hpp"
+#include "cold_moe_strategy.hpp"  // the lane's strategy view (adapter-first migration)
 #include <cstdio>
 #include <functional>
 #include <map>
@@ -33,45 +35,12 @@ extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
 // Optional learned correction for the next-layer pilot (bench/qwen_ridge_export.py):
 // scores = softmax(router x) + (x - mu) R + c. Loaded once from
 // MOESTREAM_QWEN_EARLY_READY_RIDGE; a missing/invalid file leaves the plain pilot.
-struct Qwen4ExpRidgeTable {
-  struct Record { std::vector<float> mu, c; std::vector<uint16_t> r; };
-  std::map<int, Record> by_layer;
-  int d = 0, e = 0;
-  static const Qwen4ExpRidgeTable &get() {
-    static const Qwen4ExpRidgeTable table = load();
-    return table;
-  }
-  const Record *find(int layer) const {
-    const auto it = by_layer.find(layer);
-    return it == by_layer.end() ? nullptr : &it->second;
-  }
-  static Qwen4ExpRidgeTable load() {
-    Qwen4ExpRidgeTable t;
-    const char *path = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_RIDGE");
-    if (!path || !path[0]) return t;
-    FILE *f = std::fopen(path, "rb");
-    if (!f) { std::fprintf(stderr, "[QWEN-RIDGE] cannot open %s\n", path); return t; }
-    int32_t hdr[4];
-    bool ok = std::fread(hdr, 4, 4, f) == 4 && hdr[0] == 0x31474452 && hdr[1] > 0 && hdr[2] > 0;
-    if (ok) {
-      t.d = hdr[1]; t.e = hdr[2];
-      for (int i = 0; ok && i < hdr[3]; ++i) {
-        int32_t layer;
-        Record rec;
-        rec.mu.resize(t.d); rec.c.resize(t.e); rec.r.resize(size_t(t.d) * t.e);
-        ok = std::fread(&layer, 4, 1, f) == 1 &&
-             std::fread(rec.mu.data(), 4, t.d, f) == size_t(t.d) &&
-             std::fread(rec.r.data(), 2, rec.r.size(), f) == rec.r.size() &&
-             std::fread(rec.c.data(), 4, t.e, f) == size_t(t.e);
-        if (ok) t.by_layer.emplace(layer, std::move(rec));
-      }
-    }
-    std::fclose(f);
-    if (!ok) { std::fprintf(stderr, "[QWEN-RIDGE] invalid file %s\n", path); t.by_layer.clear(); }
-    else std::fprintf(stderr, "[QWEN-RIDGE] loaded %zu layer corrections from %s\n", t.by_layer.size(), path);
-    return t;
-  }
-};
+// The table format and loader are shared with GLM5NEXT via PilotRidgeTable.
+inline const PilotRidgeTable &qwen4exp_ridge() {
+  static const PilotRidgeTable table =
+      PilotRidgeTable::load("MOESTREAM_QWEN_EARLY_READY_RIDGE", "QWEN-RIDGE");
+  return table;
+}
 
 // One second CUDA backend (own stream) and one VRAM ring of `slots` experts per plane, shared by the GPU-assist
 // graphs of every layer of a model: layers run one after another, so they can reuse the same slots.
@@ -144,6 +113,8 @@ struct EarlyReadyLane {
   int device = -1, d = 0, k = 0, n_experts = 0, expected_pos = -1;
   int trace_layer = -1;  // layer index for MOESTREAM_GLM5NEXT_ROUTE_TRACE lines
   bool completed = false;
+  bool residency_ready = false;  // residency complete (owned experts resident, safe to compute) —
+                                 // distinct from `completed`, which marks run() finished (§3.8)
   bool skip_all_hot = false;
   bool async_output_copy = false;
   bool resident_tables = false;
@@ -151,7 +122,7 @@ struct EarlyReadyLane {
   // Buffers owned on behalf of the builder (e.g. host copies of routing tables).
   std::vector<ggml_backend_buffer_t> extra_buffers;
   size_t reservation = 0;
-  uint64_t calls = 0, early_calls = 0, gpu_pending = 0;
+  uint64_t calls = 0, early_calls = 0, gpu_pending = 0;  // `calls` is the per-token generation (§3.8)
   uint64_t all_hot_visits = 0, all_hot_skips = 0;
   uint64_t output_uploads = 0;
   int64_t wait_us = 0, compute_us = 0;
@@ -209,6 +180,10 @@ struct EarlyReadyLane {
   // rest. The copy reads the expert straight from the host arena; `expert_planes` returns its three plane
   // pointers. Results differ from the CPU kernels only by float rounding.
   std::function<bool(int expert, const void *planes[3])> expert_planes;
+  // The strategy view of this lane (adapter-first migration). EarlyReadyLaneStrategy forwards the
+  // adapter's callbacks to the members above and re-expresses `residency_ready` (residency complete)
+  // as the strategy state machine. It owns no CUDA resources and is destroyed (trivially) with the lane.
+  std::unique_ptr<moestream::graph::ColdMoEStrategy> strategy;
   uint64_t assist_runs = 0, assist_experts = 0;
   int64_t assist_stall_us = 0;
   uint64_t split_runs = 0;
@@ -393,7 +368,7 @@ struct EarlyReadyLane {
                           ggml_tensor *router, ggml_tensor *bias, int target) {
     auto *probs = ggml_soft_max(outer_ctx, ggml_mul_mat(outer_ctx, router, gpu_input));
     ggml_tensor *selection = probs;
-    const auto &ridge = Qwen4ExpRidgeTable::get();
+    const auto &ridge = qwen4exp_ridge();
     if (const auto *rec = ridge.find(target); rec && ridge.d == int(gpu_input->ne[0]) &&
                                                 ridge.e == int(router->ne[1])) {
       auto *mu_t = ggml_new_tensor_2d(outer_ctx, GGML_TYPE_F32, ridge.d, 1);
@@ -520,6 +495,17 @@ struct EarlyReadyLane {
     return true;
   }
 
+  // §3.8 rule 1: before compute reads an owned expert's planes, the strategy must report Ready.
+  // The split-load path is the one exception — phase 1 computes only the already-resident subset
+  // with the pending experts masked out — so it asserts Ready after its second finish_load().
+  bool strategy_ready() const {
+    if (!strategy) return true;
+    moestream::graph::ColdMoEInvocation inv;
+    inv.layer = trace_layer;
+    inv.generation = calls + 1;
+    return strategy->state(inv) == moestream::graph::ColdMoEStrategy::State::Ready;
+  }
+
   void run() {
     GGML_ASSERT(!completed);
     const int64_t start = ggml_time_us();
@@ -587,6 +573,12 @@ struct EarlyReadyLane {
       if (!two_phase) GGML_ASSERT(finish_load());
     } else if (before_compute && n_owned > 0) {
       GGML_ASSERT(before_compute(owned, n_owned));
+    }
+    // Residency is complete (every owned expert resident) unless the split-load path still has
+    // experts pending; the two-phase branch flips `residency_ready` after its second finish_load().
+    if (!two_phase) {
+      residency_ready = true;
+      GGML_ASSERT(strategy_ready());
     }
     // GPU assist: hand some of the experts that are ready now to the assist backend(s). Device 0 takes up to
     // min(slots, ready/2); a second device (own ring and link) takes more, as long as one expert stays on the CPU.
@@ -665,6 +657,8 @@ struct EarlyReadyLane {
                            static_cast<float *>(output->data) + static_cast<size_t>(d) * k);
       const int64_t wait0 = ggml_time_us();
       GGML_ASSERT(finish_load());
+      residency_ready = true;  // all owned experts resident after the second-phase load
+      GGML_ASSERT(strategy_ready());
       split_stall_us += ggml_time_us() - wait0;
       // Phase 2: the experts that had to be loaded.
       for (int j = 0; j < n_owned; ++j) {

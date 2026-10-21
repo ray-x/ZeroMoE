@@ -104,8 +104,10 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
 
   if (!hold_graph_vram_experts(g))
     return false;
-  for (auto &entry : g.early_ready)
+  for (auto &entry : g.early_ready) {
+    entry.second->residency_ready = false;
     entry.second->completed = false;
+  }
   struct OpProf {
     std::chrono::steady_clock::time_point last;
     std::map<std::string, std::pair<double, int>> agg;

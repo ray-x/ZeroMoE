@@ -638,8 +638,10 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
     std::fprintf(rt, "P %d\n", pos_base);
     std::fflush(rt);
   }
-  for (auto &entry : g.early_ready)
+  for (auto &entry : g.early_ready) {
+    entry.second->residency_ready = false;
     entry.second->completed = false;
+  }
   g.expert_copy.reset();
   const auto start = std::chrono::steady_clock::now();
   if (ggml_backend_sched_graph_compute_async(g.sched, g.graph) !=

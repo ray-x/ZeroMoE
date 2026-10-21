@@ -192,11 +192,24 @@ double dynamic_upload_fraction() {
 
 // Run each layer's cold (CPU) experts on a private lane that starts as soon as the
 // routed ids reach the host, instead of after the layer's GPU work. Decode only.
-bool early_ready_wanted() {
-  // On by default (4-pair A/B: +1.9% decode, logits identical);
-  // MOESTREAM_GLM5NEXT_EARLY_READY=0 opts out.
-  static const bool on = moestream::graphcfg::flag_unless_off("MOESTREAM_GLM5NEXT_EARLY_READY");
-  return on;
+// MOESTREAM_GLM5NEXT_EARLY_READY controls execution, not which experts occupy VRAM:
+//   unset: select per layer; enable for offload work or a GPU hot-expert branch
+//          to overlap, otherwise use the ordinary graph for RAM-only CPU experts.
+//   0: disable the lane; 1: force it wherever the lane is supported.
+// Performance depends on the workload. The original offload A/B gained ~1.9%,
+// but the lane's extra handoff/private-graph work can outweigh the overlap for
+// fully RAM-resident CPU-only branches. On GLM 5.3 Flash AJ-IQ2_XXS (3090, six CPU
+// threads, eight routed-expert layers in VRAM), a RAM-only ABBA on 2026-10-21
+// measured 7.26-7.29 steady-median tok/s with the lane off versus 6.49-6.51 on
+// (~11% slower). These are steady medians, not whole-request throughput.
+// See docs/glm53flash-ram-decode-regression-2026-10-21.md for the recipe/results.
+bool early_ready_wanted(bool has_overlap_work) {
+  // Preserve the explicit flag's legacy first-character semantics.
+  static const int override_mode = [] {
+    const char *value = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_EARLY_READY");
+    return value ? (value[0] == '0' ? 0 : 1) : -1;
+  }();
+  return override_mode < 0 ? has_overlap_work : override_mode != 0;
 }
 
 // Overlap a layer's SSD miss reads with the CPU compute of its already-resident

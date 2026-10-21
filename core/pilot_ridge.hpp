@@ -3,6 +3,8 @@
 // score = pilot score + (x - mu) R + c, one record per target layer. File: int32 magic 'RDG1' (0x31474452), D, E, n; per record
 // int32 target layer, f32 mu[D], f16 R^T [E][D], f32 c[E]. Loaded once per environment variable; a missing or invalid file leaves the
 // plain pilot.
+#include "graph_config.hpp"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,7 +22,7 @@ struct PilotRidgeTable {
   }
   static PilotRidgeTable load(const char *env_name, const char *tag) {
     PilotRidgeTable t;
-    const char *path = std::getenv(env_name);
+    const char *path = moestream::graphcfg::env(env_name);
     if (!path || !path[0]) return t;
     FILE *f = std::fopen(path, "rb");
     if (!f) { std::fprintf(stderr, "[%s] cannot open %s\n", tag, path); return t; }

@@ -1,6 +1,21 @@
 #!/bin/bash
 # Refuse to start if another inference engine is running; then drop the page cache of the model/store/mirror files.
-bad=$(ps -eo pid,user,cmd | grep -E "moestream|llama-(server|cli|bench)|llama\.cpp|vllm|ollama|exllama|ggml" | grep -vE "grep|preflight|claude|codex|serena|headroom|cmake|make |nvcc|cc1plus|g\+\+|cicc|ptxas|fatbinary|cudafe" )
+# Ignore this script's launcher ancestors: the gate's own command line can name the candidate
+# binary (e.g. ./build_r2/moestream) even though it runs the private symlink. The Ling runner
+# uses the same ancestor exclusion.
+ancestors=" $$ "
+p=$$
+while :; do
+  p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+  [[ -z "$p" || "$p" -le 1 ]] && break
+  ancestors+=" $p "
+done
+bad=$(ps -eo pid=,user=,cmd= | grep -E "moestream|llama-(server|cli|bench)|llama\.cpp|vllm|ollama|exllama|ggml" | grep -vE "grep|preflight|claude|codex|serena|headroom|cmake|make |nvcc|cc1plus|g\+\+|cicc|ptxas|fatbinary|cudafe" | while read -r pid user cmd; do
+  case " $ancestors " in
+    *" $pid "*) ;;
+    *) echo "$pid $user $cmd" ;;
+  esac
+done )
 if [ -n "$bad" ]; then echo "PREFLIGHT FAIL: other engine process(es) running:"; echo "$bad" | cut -c1-160; exit 1; fi
 if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then echo "PREFLIGHT FAIL: GPU in use:"; nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader; exit 1; fi
 sync

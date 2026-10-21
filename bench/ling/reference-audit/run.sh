@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 worktree=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+# Binary override: LING_BIN lets the regression gate certify a specific candidate
+# instead of the hardcoded worktree build.
+bin=${LING_BIN:-$worktree/build-ling/moestream}
 profile=${LING_USAGE_FILE:-$worktree/bench/ling/reference-audit/usage-hi-there-robust4.pin}
 # Empty by default: use an explicit prompt-matched profile for prefill pinning.
 prefill_profile=${LING_PREFILL_USAGE_FILE-}
@@ -45,7 +48,7 @@ assert n_pin == 1, f'Expected one pinned_vram_capacity entry, got {n_pin}'
 Path(sys.argv[2]).write_text(s)
 CONFIG
 minimum_kb=120500000
-[[ -x "$worktree/build-ling/moestream" ]]
+[[ -x "$bin" ]]
 [[ -r "$prompt_file" && -s "$prompt_file" ]]
 if [[ ! "$freeze_usage_stats" =~ ^(0|false|no)$ ]]; then
   [[ -s "$profile" ]]
@@ -148,4 +151,4 @@ else
   unset MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE
 fi
 export MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=0
-exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$worktree/build-ling/moestream" --config "$config" --ngen 32 --temp 0 < "$prompt_file"
+exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" --config "$config" --ngen 32 --temp 0 < "$prompt_file"
