@@ -11,6 +11,8 @@
 #include "ggml_deepseek_v41_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "ggml_qwen4exp_graph.hpp"
+#include "ggml_mimo2_graph.hpp"
+#include "graph_config.hpp"
 
 #include <cstdlib>
 #include <algorithm>
@@ -321,6 +323,44 @@ class DeepseekV41GraphModel final
   }
 };
 
+class MiMo2GraphModel final : public FullGraphModelBase<MiMo2GraphModel> {
+ public:
+  ModelFamily family() const override { return ModelFamily::MiMo2; }
+  const char *name() const override { return "mimo2"; }
+  bool enabled(const StreamingEngine &e, ModelGraphPhase) const override {
+    return !e.mtp_enabled && mimo2_full_graph_enabled();
+  }
+  bool uses_native_moe_cache() const override { return true; }
+  // In-graph hot/cold MoE with the shared early-ready CPU lane (decode).
+  bool supports_cpu_lane() const override { return true; }
+  // Later prompt chunks must run as batches too; the default minimum (64) made every chunk
+  // after the first fall back to one-token steps.
+  int min_prefill_batch() const override { return 8; }
+  bool graph_only() const override { return true; }
+  void bind_runtime(StreamingEngine &e, RAMSafetyManager &r,
+                      LockFreePrefetcher &p, LayerScratch &s) const override {
+    mimo2_bind_runtime(e, r, p, s);
+  }
+  void shutdown() const override { mimo2_full_graph_shutdown(); }
+  int max_prefill_tokens(const StreamingEngine &) const override {
+    return int(std::clamp<long>(moestream::graphcfg::integer("MOESTREAM_MIMO2_PREFILL_CHUNK", 512), 1, 512));
+  }
+  bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }
+  bool prefill_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return mimo2_full_graph_prepare(e, r.n_tokens, r.pos_base, r.token_ids);
+  }
+  bool prefill_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return mimo2_full_graph_run(e, r.hidden_states, r.n_tokens, r.pos_base, r.token_ids);
+  }
+  bool decode_prepare(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return r.n_tokens == 1 && mimo2_full_graph_prepare(e, 1, r.pos_base, r.token_ids);
+  }
+  bool decode_run(StreamingEngine &e, const ModelGraphRequest &r) const {
+    return mimo2_full_graph_run(e, r.hidden_states, 1, r.pos_base, r.token_ids,
+        r.logits ? r.logits : e.qwen4exp_full_graph_logits_target,
+        r.vocab > 0 ? r.vocab : e.qwen4exp_full_graph_logits_target_size);
+  }
+};
 } // namespace
 
 const FullGraphModel *full_graph_model(ModelFamily family) {
@@ -329,7 +369,10 @@ const FullGraphModel *full_graph_model(ModelFamily family) {
   static const GlmDsaGraphModel glm_dsa;
   static const Ling31FlashGraphModel ling;
   static const DeepseekV41GraphModel dsv41;
+  static const MiMo2GraphModel mimo;
   switch (family) {
+  case ModelFamily::MiMo2:
+    return &mimo;
   case ModelFamily::Qwen4Exp:
     return &qwen;
   case ModelFamily::GLM5NEXT:

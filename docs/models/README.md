@@ -19,6 +19,10 @@ decode throughput, peak memory, and the selected strategy**.
 
 ## Baseline provenance
 
+MiMo V2.6 Flash RL onboarding is tracked in
+[`mimo26-flash.md`](mimo26-flash.md). It has no frozen baseline yet; correctness
+parity and a regression witness remain pending.
+
 The decode bands above were measured once on the merged master (`1f17a99`), 2026-10-21, on the
 box in `docs/GLM5.3-baseline.md` §1: Xeon W-2235 (6C/12T, AVX-512 VNNI), 125 GiB RAM, RTX 3090
 (24 GiB, PCIe 4) + RTX 5060 Ti (16 GiB, PCIe 3), two NVMe. The binary is `build_master/moestream`,

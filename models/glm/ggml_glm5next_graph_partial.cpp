@@ -11,6 +11,8 @@
 
 using namespace glm5next_graph;
 
+#include "aliased_expert_placement.hpp"
+
 namespace glm5next_graph {
 
 static bool configure_ling_vram_reference_experts(FullGraph &g) {
@@ -32,63 +34,6 @@ static bool configure_ling_vram_reference_experts(FullGraph &g) {
   }
 
   g.partial_experts.assign((size_t)c.n_layers, {});
-  std::unique_lock<std::recursive_mutex> lock(g.topology->cache_mutex);
-  struct CacheRegion {
-    uint8_t *base = nullptr;
-    size_t first_offset = 0;
-    size_t slots = 0;
-    size_t stride = 0;
-    std::vector<const ExpertLocation *> locations;
-    bool valid = false;
-  };
-  const auto find_region = [&](int layer, int gpu_id, size_t raw_stride) {
-    CacheRegion region;
-    if (!g.topology->expert_compact_layout || raw_stride == 0)
-      return region;
-    for (const ExpertLocation &loc : g.topology->expert_vram_cache) {
-      if (loc.pool_layer == layer && loc.gpu_id == gpu_id)
-        region.locations.push_back(&loc);
-    }
-    if (region.locations.empty())
-      return region;
-    std::sort(region.locations.begin(), region.locations.end(),
-              [](const ExpertLocation *a, const ExpertLocation *b) {
-                return a->offset < b->offset;
-              });
-    region.stride = region.locations.front()->size;
-    if (region.stride < raw_stride || region.stride == 0)
-      return region;
-    for (const ExpertLocation *loc : region.locations) {
-      if (!loc->device_ptr || loc->size != region.stride)
-        return region;
-    }
-    region.first_offset = region.locations.front()->offset;
-    region.slots = region.locations.size();
-    if (region.slots > SIZE_MAX / region.stride ||
-        region.first_offset > SIZE_MAX - region.slots * region.stride ||
-        region.slots > (size_t)INT32_MAX)
-      return region;
-    const uintptr_t first =
-        reinterpret_cast<uintptr_t>(region.locations.front()->device_ptr);
-    if (first < region.first_offset)
-      return region;
-    const uintptr_t base = first - region.first_offset;
-    for (size_t slot = 0; slot < region.slots; ++slot) {
-      const size_t offset = region.first_offset + slot * region.stride;
-      if (base > std::numeric_limits<uintptr_t>::max() - offset ||
-          region.locations[slot]->offset != offset ||
-          reinterpret_cast<uintptr_t>(region.locations[slot]->device_ptr) !=
-              base + offset)
-        return region;
-    }
-    // The graph tensor has a layer-local slot index (0..region.slots), so
-    // its data pointer must start at this layer's first cache slot rather
-    // than the beginning of the whole per-device pool.
-    region.base = reinterpret_cast<uint8_t *>(base + region.first_offset);
-    region.valid = true;
-    return region;
-  };
-
   const int gpu1_id = second_gpu_device(g.device);
   const bool disable_all_alias =
       moestream::graphcfg::flag_on("MOESTREAM_LING_NO_VRAM_CACHE_ALIAS");
@@ -97,69 +42,33 @@ static bool configure_ling_vram_reference_experts(FullGraph &g) {
   const bool have_gpu1 = !disable_all_alias && !disable_gpu1_alias &&
                          gpu1_id >= 0 &&
                          ggml_shared_backend(gpu1_id) != nullptr;
-  size_t gpu0_records = 0;
-  size_t gpu1_records = 0;
-  size_t aliased_bytes = 0;
+  moestream::graph::AliasedExpertPlacement aliased;
+  moestream::graph::AliasedPlacementOptions alias_opt;
+  alias_opt.device = g.device;
+  alias_opt.alias_primary = !disable_all_alias;
+  alias_opt.secondary_device = have_gpu1 ? gpu1_id : -1;
+  if (!aliased.configure(*g.engine, *g.topology, alias_opt))
+    return false;
+  const size_t gpu0_records = aliased.primary_records();
+  const size_t gpu1_records = aliased.secondary_records();
+  const size_t aliased_bytes = aliased.aliased_bytes();
+  g.vram_expert_holds.clear();
+  for (const auto &h : aliased.holds())
+    g.vram_expert_holds.push_back({h.layer, h.expert, h.device_ptr});
   for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
     PartialExpertLayer &p = g.partial_experts[(size_t)layer];
-    p.vram_slot_by_expert.assign((size_t)c.n_experts, -1);
-    p.hot1_vram_slot_by_expert.assign((size_t)c.n_experts, -1);
-    const size_t raw_stride = g.engine->compute_expert_slab_bytes(layer);
-    CacheRegion primary = disable_all_alias
-                              ? CacheRegion{}
-                              : find_region(layer, g.device, raw_stride);
-    CacheRegion secondary = have_gpu1
-                                ? find_region(layer, gpu1_id, raw_stride)
-                                : CacheRegion{};
-    if (primary.valid) {
-      p.vram_layer_base = primary.base;
-      p.vram_layer_slots = primary.slots;
-      p.vram_slot_stride = primary.stride;
-    }
-    if (secondary.valid) {
-      p.hot1_vram_layer_base = secondary.base;
-      p.hot1_vram_layer_slots = secondary.slots;
-      p.hot1_vram_slot_stride = secondary.stride;
-    }
-
-    std::vector<uint8_t> cached((size_t)c.n_experts, 0);
-    const auto add_region = [&](const CacheRegion &region, bool on_gpu1) {
-      if (!region.valid)
-        return;
-      for (const ExpertLocation *loc : region.locations) {
-        if (loc->layer_idx != layer || loc->expert_id < 0 ||
-            loc->expert_id >= c.n_experts || !loc->upload_ready)
-          continue;
-        const size_t slot =
-            (loc->offset - region.first_offset) / region.stride;
-        const size_t expert = (size_t)loc->expert_id;
-        if (slot >= region.slots || cached[expert])
-          continue;
-        cached[expert] = 1;
-        if (on_gpu1) {
-          p.hot1_vram_slot_by_expert[expert] = (int32_t)slot;
-          p.hot1.push_back((int)expert);
-          ++gpu1_records;
-        } else {
-          p.vram_slot_by_expert[expert] = (int32_t)slot;
-          p.hot.push_back((int)expert);
-          ++gpu0_records;
-        }
-        g.vram_expert_holds.push_back({layer, (int)expert, loc->device_ptr});
-        if (aliased_bytes <= SIZE_MAX - region.stride)
-          aliased_bytes += region.stride;
-      }
-    };
-    add_region(primary, false);
-    add_region(secondary, true);
-    if ((!primary.locations.empty() && !primary.valid) ||
-        (!secondary.locations.empty() && !secondary.valid)) {
-      LOG_WARN("[GGML-LING-CACHE] invalid compact cache region at layer=%d; "
-               "unaliased experts stay on the DDR path\n", layer);
-    }
-    for (int expert = 0; expert < c.n_experts; ++expert)
-      if (!cached[(size_t)expert])
-        p.cold.push_back(expert);
+    const moestream::graph::AliasedLayerPlacement &src = *aliased.layer(layer);
+    p.hot = src.primary.experts;
+    p.vram_slot_by_expert = src.primary.slot_by_expert;
+    p.vram_layer_base = src.primary.base;
+    p.vram_layer_slots = src.primary.slots;
+    p.vram_slot_stride = src.primary.stride;
+    p.hot1 = src.secondary.experts;
+    p.hot1_vram_slot_by_expert = src.secondary.slot_by_expert;
+    p.hot1_vram_layer_base = src.secondary.base;
+    p.hot1_vram_layer_slots = src.secondary.slots;
+    p.hot1_vram_slot_stride = src.secondary.stride;
+    p.cold = src.cold;
     p.slot_last_use.assign(p.hot.size(), 0);
     p.slot_in_flight.assign(p.hot.size(), 0);
     p.miss_count.assign((size_t)c.n_experts, 0);
@@ -536,82 +445,14 @@ ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer,
   if (!p)
     return nullptr;
   const bool on_gpu1 = gpu_id >= 0 && gpu_id != g.device;
-  const std::vector<int> &hot = on_gpu1 ? p->hot1 : p->hot;
-  uint8_t *layer_base = on_gpu1 ? p->hot1_vram_layer_base
-                                : p->vram_layer_base;
-  const size_t layer_slots = on_gpu1 ? p->hot1_vram_layer_slots
-                                     : p->vram_layer_slots;
-  const size_t slot_stride = on_gpu1 ? p->hot1_vram_slot_stride
-                                     : p->vram_slot_stride;
-  ggml_backend_buffer_t descriptor =
-      on_gpu1 ? g.expert1_buffer : g.expert.buffer;
-  if (hot.empty() || !layer_base || layer_slots == 0 || slot_stride == 0 ||
-      !descriptor)
-    return nullptr;
-  const std::string name = "blk." + std::to_string(layer) + "." + stem;
-  const GGUFTensor *meta = model_tensor(*g.engine, name);
-  const size_t n_experts =
-      (size_t)g.engine->model_file.architecture_config.n_experts;
-  if (!meta || meta->shape.size() != 3 || n_experts == 0 ||
-      meta->size_bytes % n_experts != 0)
-    return nullptr;
-  size_t offset = 0;
-  if (std::strcmp(stem, "ffn_up_exps.weight") == 0) {
-    const GGUFTensor *gate = model_tensor(
-        *g.engine, "blk." + std::to_string(layer) + ".ffn_gate_exps.weight");
-    if (!gate || gate->size_bytes % n_experts != 0)
-      return nullptr;
-    offset = (size_t)gate->size_bytes / n_experts;
-  } else if (std::strcmp(stem, "ffn_down_exps.weight") == 0) {
-    const GGUFTensor *gate = model_tensor(
-        *g.engine, "blk." + std::to_string(layer) + ".ffn_gate_exps.weight");
-    const GGUFTensor *up = model_tensor(
-        *g.engine, "blk." + std::to_string(layer) + ".ffn_up_exps.weight");
-    if (!gate || !up || gate->size_bytes % n_experts != 0 ||
-        up->size_bytes % n_experts != 0)
-      return nullptr;
-    const size_t gate_bytes = (size_t)gate->size_bytes / n_experts;
-    const size_t up_bytes = (size_t)up->size_bytes / n_experts;
-    if (gate_bytes > SIZE_MAX - up_bytes)
-      return nullptr;
-    offset = gate_bytes + up_bytes;
-  } else if (std::strcmp(stem, "ffn_gate_exps.weight") != 0) {
-    return nullptr;
-  }
-  const size_t per_expert_bytes = (size_t)meta->size_bytes / n_experts;
-  if (offset > slot_stride ||
-      per_expert_bytes > slot_stride - offset ||
-      layer_slots > SIZE_MAX / slot_stride)
-    return nullptr;
-  std::vector<int64_t> shape;
-  for (uint64_t dim : meta->shape)
-    shape.push_back((int64_t)dim);
-  shape[2] = (int64_t)layer_slots;
-  ggml_tensor *t = new_tensor(ctx, (ggml_type)meta->type, shape);
-  if (!t)
-    return nullptr;
-  if (slot_stride % ggml_row_size(t->type, t->ne[0]) != 0 ||
-      offset % 2 != 0) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      LOG_STREAM_WARN() << "[GLM5NEXT-GRAPH] VRAM alias row-stride check failed "
-                        << "(GPU=" << gpu_id << " stride=" << slot_stride
-                        << " offset=" << offset << " row_size="
-                        << ggml_row_size(t->type, t->ne[0]) << " type="
-                        << ggml_type_name(t->type) << ")\n";
-    }
-    return nullptr;
-  }
-  t->nb[2] = slot_stride;
-  t->nb[3] = t->nb[2] * (size_t)t->ne[2];
-  t->data = layer_base + offset;
-  // The data points into GpuTopology's existing expert cache. This buffer
-  // only tags the tensor for GGML's CUDA backend and contains no MoE weights.
-  t->buffer = descriptor;
-  ggml_set_name(t, (name + (on_gpu1 ? ".gpu1_vram_cache_ref"
-                                    : ".vram_cache_ref")).c_str());
-  return t;
+  moestream::graph::AliasedHotSet set;
+  set.experts = on_gpu1 ? p->hot1 : p->hot;
+  set.base = on_gpu1 ? p->hot1_vram_layer_base : p->vram_layer_base;
+  set.slots = on_gpu1 ? p->hot1_vram_layer_slots : p->vram_layer_slots;
+  set.stride = on_gpu1 ? p->hot1_vram_slot_stride : p->vram_slot_stride;
+  return moestream::graph::make_alias_weight(
+      *g.engine, ctx, layer, stem, set,
+      on_gpu1 ? g.expert1_buffer : g.expert.buffer, gpu_id, on_gpu1);
 }
 
 bool prepare_partial_hot(FullGraph &g, ggml_context *ctx, int layer) {
@@ -684,10 +525,25 @@ ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer,
       owned[(size_t)e] = 1;
     }
   }
-  const moe_partial::ExpertBranchMap branch_map = moe_partial::ExpertBranchMap::build(
-      index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
-      g.S > 1 && layer_experts_take_mmq(g, layer) ? moe_partial::SentinelPolicy::AutoBatched
-                                                  : moe_partial::SentinelPolicy::Auto);
+  const moe_partial::SentinelPolicy hot1_policy =
+      g.S > 1 && layer_experts_take_mmq(g, layer)
+          ? moe_partial::SentinelPolicy::AutoBatched
+          : moe_partial::SentinelPolicy::Auto;
+  moe_partial::ExpertBranchMap branch_map;
+  if (ling_vram_alias) {
+    moestream::graph::AliasedLayerPlacement lp;
+    lp.secondary.experts = p->hot1;
+    lp.secondary.slot_by_expert = p->hot1_vram_slot_by_expert;
+    moestream::graph::AliasedMapRequest req;
+    req.n_experts = (int)n;
+    req.n_tokens = g.S;
+    req.decode = g.decode_mode;
+    req.policy = hot1_policy;
+    moestream::graph::build_secondary_map(lp, req, &branch_map);
+  } else {
+    branch_map = moe_partial::ExpertBranchMap::build(
+        index_of_expert, g.S, g.decode_mode && g.S == 1, owned, hot1_policy);
+  }
   const void *data = mask ? (const void *)branch_map.route_mask().data()
                           : (const void *)branch_map.route_ids().data();
   if (!arena_alloc(g.scratch.buffer, g.scratch.base, g.scratch.capacity,
@@ -973,31 +829,13 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   // (negative-id skip for single-token decode on a capable ggml, valid dummy id
   // otherwise) -- see include/moe_partial_route.hpp.
   std::vector<int32_t> index_of_expert(n, -1);
+  bool use_alias = false;
   if (g.dynamic_expert_cache && !hot) {
     for (size_t expert = 0; expert < n; ++expert)
       if (!is_hot[expert])
         index_of_expert[expert] = (int32_t)expert;
   } else if (g.vram_reference_experts) {
-    if (hot) {
-      for (int expert : p->hot) {
-        if (expert < 0 || (size_t)expert >= n ||
-            (size_t)expert >= p->vram_slot_by_expert.size())
-          continue;
-        const int32_t physical_slot = p->vram_slot_by_expert[(size_t)expert];
-        if (physical_slot < 0)
-          return nullptr;
-        index_of_expert[(size_t)expert] = physical_slot;
-      }
-    } else {
-      int32_t cold_slot = 0;
-      const bool full_ddr_view =
-          offload_layer(layer) || partial_layer_ram_ready(g, layer);
-      for (int expert : p->cold) {
-        if (expert < 0 || (size_t)expert >= n)
-          return nullptr;
-        index_of_expert[(size_t)expert] = full_ddr_view ? expert : cold_slot++;
-      }
-    }
+    use_alias = true; // addressing comes from moestream::graph::build_*_map below
   } else {
     const auto &ids = hot ? p->hot : p->cold;
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -1041,13 +879,32 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
        moestream::graphcfg::atoi_or(
            "MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP", 0) != 0) &&
       layer_experts_take_mmq(g, layer);
-  const moe_partial::ExpertBranchMap branch_map =
-      moe_partial::ExpertBranchMap::build(
-          index_of_expert, g.S, g.decode_mode && g.S == 1, owned,
-          force_dummy ? moe_partial::SentinelPolicy::ForceDummy
-          : allow_batched_negative_skip
-              ? moe_partial::SentinelPolicy::AutoBatched
-              : moe_partial::SentinelPolicy::Auto);
+  const moe_partial::SentinelPolicy policy =
+      force_dummy ? moe_partial::SentinelPolicy::ForceDummy
+      : allow_batched_negative_skip ? moe_partial::SentinelPolicy::AutoBatched
+                                    : moe_partial::SentinelPolicy::Auto;
+  moe_partial::ExpertBranchMap branch_map;
+  if (use_alias) {
+    moestream::graph::AliasedLayerPlacement lp;
+    lp.primary.experts = p->hot;
+    lp.primary.slot_by_expert = p->vram_slot_by_expert;
+    lp.secondary.experts = p->hot1;
+    lp.cold = p->cold;
+    moestream::graph::AliasedMapRequest req;
+    req.n_experts = (int)n;
+    req.n_tokens = g.S;
+    req.decode = g.decode_mode;
+    // Only the cold branch consults RAM readiness (it caches one snapshot per build).
+    req.full_ddr_view = !hot && (offload_layer(layer) || partial_layer_ram_ready(g, layer));
+    req.secondary_active = g.gpu1 != nullptr;
+    req.policy = policy;
+    if (!(hot ? moestream::graph::build_primary_map(lp, req, &branch_map)
+              : moestream::graph::build_cold_map(lp, req, &branch_map)))
+      return nullptr;
+  } else {
+    branch_map = moe_partial::ExpertBranchMap::build(
+        index_of_expert, g.S, g.decode_mode && g.S == 1, owned, policy);
+  }
   static bool logged_inactive = false;
   if (!logged_inactive) {
     logged_inactive = true;

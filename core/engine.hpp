@@ -7,6 +7,7 @@
 #include "logger.hpp"
 #include "memory_guard.hpp"  // MemoryGuard::allocation_blocked() -- see ensure_slab_capacity
 #include "family_ops.hpp" // FamilyOps -- see StreamingEngine::family_ops below
+#include "moe_execution_strategy.hpp"
 #include "dsv4_compressed_attention.hpp" // Dsv4CompressedLayerState -- see StreamingEngine::dsv4_compressed below
 #include <cuda_runtime.h>
 #include <sys/mman.h>
@@ -401,6 +402,11 @@ public:
     // from instead of the old scattered is_mla-bool/arch-string-literal
     // checks. See family_ops.hpp for the full rationale.
     FamilyOps family_ops;
+    moestream::graph::MoEPlacementSummary moe_placement;
+    moestream::graph::MoEExecutionKind moe_prefill_execution =
+        moestream::graph::MoEExecutionKind::CacheBacked;
+    moestream::graph::MoEExecutionKind moe_decode_execution =
+        moestream::graph::MoEExecutionKind::CacheBacked;
 
     std::unordered_map<std::string, QuantizedTensor> resident_layers;
     std::vector<std::vector<MoEExpertBlock>> layers_experts;
@@ -727,6 +733,8 @@ public:
     // [S,D] buffer.  The generation loop must not run the legacy HC collapse
     // a second time for that result.
     bool qwen4exp_full_graph_output_ready = false;
+    // Generic completion flag for graph families without historical per-family flags.
+    bool full_graph_output_ready = false;
     // Set after model-family detection when Qwen full-graph decode is the
     // effective policy. A graph failure is surfaced to the request loop;
     // execution_layer must not continue into the layered token loop.

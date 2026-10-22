@@ -43,71 +43,65 @@
 // route), not just (runner, ram, topology). Those are threaded in at the wiring step; until then
 // the three backends below are the only handle this adapter needs.
 
-#include "cold_moe_strategy.hpp"
-#include "invocation_state.hpp"
+#include "moe_execution_strategy.hpp"
+#include "moe_pipeline.hpp"
+#include "ram_manager.hpp"
+#include "scratch_buffers.hpp"
 
-class RAMSafetyManager;
-class GpuTopology;
-class StreamingEngine;
-namespace moe { class GgmlMoeRunner; }
+#include <cmath>
 
 namespace moestream::graph {
 
-class CacheBackedStrategy final : public ColdMoEStrategy {
+class CacheBackedStrategy final : public MoEExecutionStrategy {
  public:
-  CacheBackedStrategy(moe::GgmlMoeRunner *runner, RAMSafetyManager *ram,
-                      GpuTopology *topology)
-      : runner_(runner), ram_(ram), topology_(topology) {}
-
-  bool install(const ColdMoEAdapter & /*adapter*/) override {
-    // The cache-backed path addresses experts through RAMSafetyManager/GpuTopology, not the
-    // lane's callbacks, so the family's adapter is unused here. The strategy is usable only
-    // when its three backends are present.
-    return runner_ && ram_ && topology_;
+  MoEExecutionKind kind() const override {
+    return MoEExecutionKind::CacheBacked;
   }
+  const char *name() const override { return "cache-backed"; }
 
-  // Owns the Phase A/B residency lifecycle by contract once wired; fail-closed until then
-  // (begin() records identity, state() stays Pending, finish() stays false).
-  bool drives_residency() const override { return true; }
-
-  bool begin(const ColdMoEInvocation &inv) override {
-    if (!runner_ || !ram_ || !topology_)
+  bool bind(const MoERuntimeResources &resources,
+            std::string *reason = nullptr) override {
+    resources_ = resources;
+    if (!resources_.engine || !resources_.ram || !resources_.prefetch ||
+        !resources_.scratch) {
+      if (reason) *reason = "cache-backed runtime resources are incomplete";
       return false;
-    gate_.begin(inv.layer, inv.generation);
-    // TODO(wiring): Phase A over inv.routes' owned experts — ram->claim_or_wait(engine, layer,
-    // expert, who, ...); on Loading, ram->wait_for_ram_slot(...); on Claimed, load + publish.
-    // Then Phase B — topo->hold_for_compute(layer, e, device_ptr, from_active_layer) for each
-    // resident expert. Store the (layer, expert, device_ptr, from_active_layer) tuples for
-    // release(). The adapter's begin_load/finish_load are the lane's callbacks and are unused
-    // here (the cache-backed path claims directly through RAMSafetyManager).
+    }
     return true;
   }
 
-  State state(const ColdMoEInvocation &inv) const override {
-    // TODO(wiring): map RamClaimStatus -> Residency (Hit -> Ready, Loading/Claimed -> InProgress,
-    // load error -> Failed). Until wired, residency is never confirmed, so an active invocation
-    // stays Pending and a stale/wrong invocation is Error (fail-closed per §3.8).
-    return gate_.state(inv.layer, inv.generation, InvocationState::Residency::InProgress);
-  }
-
-  bool finish(const ColdMoEInvocation &inv) override {
-    // TODO(wiring): runner->run_layer*(x, ids, w, out) — the per-layer transfer + compute. The
-    // runner syncs its own H2D/D2D inside run_layer, so this is the Ready->done barrier.
-    // Fail-closed until wired: residency is never Ready, so this never claims compute completed.
-    return gate_.finish(inv.layer, inv.generation, InvocationState::Residency::InProgress);
-  }
-
-  void release(const ColdMoEInvocation &inv) override {
-    // TODO(wiring): topo->release_hold(layer, expert, device_ptr, from_active_layer) for every
-    // tuple held in begin(); a stale release (generation advanced) is a no-op (§3.8 rule 3).
-    gate_.release(inv.layer, inv.generation);
+  bool execute(const MoEBlockSpec &spec, const MoEExecutionRequest &request,
+               std::string *reason = nullptr) override {
+    if (!resources_.engine || !resources_.ram || !resources_.prefetch ||
+        !resources_.scratch || !request.input || !request.output ||
+        !request.token_ids || request.n_tokens <= 0 || request.layer < 0) {
+      if (reason) *reason = "invalid cache-backed MoE request";
+      return false;
+    }
+    const auto &c = resources_.engine->model_file.architecture_config;
+    if (spec.d_model != c.hidden || spec.d_ff != c.moe_inter ||
+        spec.n_experts != c.n_experts || spec.topk != c.topk) {
+      if (reason) *reason = "MoE block specification does not match model";
+      return false;
+    }
+    if (resources_.ram->vram_cache)
+      resources_.ram->vram_cache->prefill_current_layer = request.layer;
+    moe_forward_gguf(*resources_.engine, *resources_.ram,
+                     *resources_.prefetch, request.layer, request.input,
+                     request.n_tokens, request.output, *resources_.scratch,
+                     request.token_ids);
+    const size_t n = (size_t)request.n_tokens * (size_t)spec.d_model;
+    for (size_t i = 0; i < n; ++i) {
+      if (!std::isfinite(request.output[i])) {
+        if (reason) *reason = "cache-backed MoE produced non-finite output";
+        return false;
+      }
+    }
+    return true;
   }
 
  private:
-  moe::GgmlMoeRunner *runner_ = nullptr;
-  RAMSafetyManager *ram_ = nullptr;
-  GpuTopology *topology_ = nullptr;
-  InvocationState gate_;
+  MoERuntimeResources resources_;
 };
 
 }  // namespace moestream::graph

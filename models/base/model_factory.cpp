@@ -9,6 +9,9 @@ std::unique_ptr<ModelBackend> ModelBackend::create(const GGUFFile &model_file) {
   ModelFamily fam = detect_model_family(model_file);
 
   switch (fam) {
+  case ModelFamily::MiMo2:
+    std::cerr << "[MODEL] Detected: MiMo V2 -- use the registered full-graph engine path.\n";
+    return nullptr;
   case ModelFamily::GLM_DSA:
   case ModelFamily::DeepSeek_V3: // DeepSeek-V3 shares MLA architecture
     std::cerr << "[MODEL] Detected: GLM-DSA / DeepSeek-V3 (MLA attention)\n";

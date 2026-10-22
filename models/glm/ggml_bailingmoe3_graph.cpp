@@ -1,6 +1,7 @@
 #include "ggml_bailingmoe3_graph.hpp"
 
 #include "async_prefetcher.hpp"
+#include "cache_backed_moe.hpp"
 #include "dense_dispatch.hpp"
 #include "engine.hpp"
 #include "family_ops.hpp"
@@ -71,6 +72,7 @@ struct LingNativeRuntime {
   RAMSafetyManager *ram = nullptr;
   LockFreePrefetcher *prefetch = nullptr;
   LayerScratch *scratch = nullptr;
+  moestream::graph::CacheBackedMoeRuntime moe;
 };
 
 LingNativeRuntime g_runtime;
@@ -203,6 +205,7 @@ void bailingmoe3_native_graph_bind_runtime(StreamingEngine &engine,
                                            LayerScratch &scratch) {
 #if defined(MOESTREAM_USE_GGML_CUDA)
   g_runtime = {&engine, &ram, &prefetch, &scratch};
+  g_runtime.moe.bind(engine, ram, prefetch, scratch);
 #else
   (void)engine;
   (void)ram;
@@ -230,10 +233,7 @@ void bailingmoe3_native_graph_ffn(StreamingEngine &engine, int layer_idx,
   if (layer_idx < c.first_dense) {
     dense_ffn_gguf(engine, layer_idx, hidden_states, S, output, scratch);
   } else {
-    if (g_runtime.ram->vram_cache)
-      g_runtime.ram->vram_cache->prefill_current_layer = layer_idx;
-    moe_forward_gguf(engine, *g_runtime.ram, *g_runtime.prefetch, layer_idx,
-                     hidden_states, S, output, scratch, token_ids);
+    g_runtime.moe.run(layer_idx, hidden_states, S, output, token_ids);
   }
 #else
   (void)engine;

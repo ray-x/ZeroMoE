@@ -2,6 +2,7 @@
 #include "kquant_dequant.hpp" // gpu_type_supported
 #include "dense_dispatch.hpp" // set_swiglu_clamp_fused (GLM5Next)
 #include "logger.hpp"
+#include "mimo2_spec.hpp"
 #include <algorithm>
 #include <cstring>
 #include <cuda_runtime.h>
@@ -578,6 +579,14 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
   // below now read instead of the old scattered is_mla-bool checks. See
   // family_ops.hpp for the full rationale.
   ModelFamily fam = detect_model_family(file);
+  if (fam == ModelFamily::MiMo2) {
+    std::string reason;
+    if (!configure_mimo2(file, c, reason)) {
+      LOG_ERROR("[MIMO2] invalid model: %s\n", reason.c_str());
+      return false;
+    }
+    first_dense = c.first_dense;
+  }
 
   // ---------- DeepSeek-V4 (Hyper-Connections, grouped output projection,
   // attention sinks, raw SWA plus CSA/HCA compressed attention) ----------
@@ -1800,6 +1809,16 @@ bool GGUFGraphInitializer::build_model_graph(StreamingEngine &engine,
         dense_preload_manifest.push_back(p + "ple_norm_conv.weight");
         dense_preload_manifest.push_back(p + "ple_conv1d.weight");
       }
+    } else if (fam == ModelFamily::MiMo2) {
+      if (file.tensors.count(p + "attn_qkv.weight")) {
+        dense_preload_manifest.push_back(p + "attn_qkv.weight");
+      } else {
+        for (const char *name : {"attn_q.weight", "attn_k.weight", "attn_v.weight"})
+          dense_preload_manifest.push_back(p + name);
+      }
+      dense_preload_manifest.push_back(p + "attn_output.weight");
+      if (file.tensors.count(p + "attn_sinks.weight"))
+        dense_preload_manifest.push_back(p + "attn_sinks.weight");
     } else if (fam == ModelFamily::BailingMoE3) {
       if (bailingmoe3_is_kda_layer(c, l)) {
         for (const char *name : {"attn_q.weight", "attn_k.weight",

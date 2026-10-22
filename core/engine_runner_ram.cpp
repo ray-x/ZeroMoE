@@ -2,6 +2,152 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "execution_policy.hpp"
+
+#include <limits>
+
+std::expected<void, std::string> EngineRunner::validate_expert_placement() {
+  const auto &c = engine.model_file.architecture_config;
+  if (c.n_experts <= 0 || cache_layers <= 0 || !ram_mgr.vram_cache)
+    return {};
+
+  uint64_t total_slots = 0;
+  uint64_t ram_slots = 0;
+  uint64_t total_bytes = 0;
+  uint64_t ram_bytes = 0;
+  int moe_layers = 0;
+  auto add_bytes = [](uint64_t &dst, uint64_t count, uint64_t bytes) {
+    if (count != 0 && bytes > (std::numeric_limits<uint64_t>::max() - dst) / count)
+      dst = std::numeric_limits<uint64_t>::max();
+    else
+      dst += count * bytes;
+  };
+  for (int layer = 0; layer < cache_layers; ++layer) {
+    const size_t bytes = engine.compute_expert_slab_bytes(layer);
+    if (bytes == 0)
+      continue;
+    ++moe_layers;
+    total_slots += (uint64_t)c.n_experts;
+    const uint64_t layer_ram = (uint64_t)std::min(
+        c.n_experts, std::max(0, ram_mgr.cap_for_layer(layer)));
+    ram_slots += layer_ram;
+    add_bytes(total_bytes, (uint64_t)c.n_experts, (uint64_t)bytes);
+    add_bytes(ram_bytes, layer_ram, (uint64_t)bytes);
+  }
+  if (total_slots == 0)
+    return {};
+
+  uint64_t vram_slots = 0;
+  uint64_t vram_bytes = 0;
+  for (const auto &slot : ram_mgr.vram_cache->expert_vram_cache) {
+    if (slot.pool_layer < 0 || slot.pool_layer >= cache_layers || slot.size == 0)
+      continue;
+    ++vram_slots;
+    if (vram_bytes > std::numeric_limits<uint64_t>::max() - slot.size)
+      vram_bytes = std::numeric_limits<uint64_t>::max();
+    else
+      vram_bytes += (uint64_t)slot.size;
+  }
+  // Uniform (non-compact) pools do not assign a fixed pool_layer until a
+  // slot is populated. Their physical capacity is still exact at this point.
+  if (vram_slots == 0 && ram_mgr.vram_cache->expert_vram_cache_cap > 0) {
+    vram_slots = (uint64_t)ram_mgr.vram_cache->expert_vram_cache_cap;
+    add_bytes(vram_bytes, vram_slots, (uint64_t)expert_slab_bytes);
+  }
+
+  const uint64_t max_unique_slots =
+      std::min(total_slots, ram_slots + vram_slots);
+  const char *placement =
+      vram_slots >= total_slots
+          ? "all-vram"
+          : (vram_slots > 0 && ram_slots > 0
+                 ? "mixed-vram-ddr"
+                 : (ram_slots > 0 ? "ddr-only" : "storage-backed"));
+  const double gib = 1024.0 * 1024.0 * 1024.0;
+  engine.moe_placement = {
+      .placement = vram_slots >= total_slots
+                       ? moestream::graph::ExpertPlacementClass::AllVram
+                       : (vram_slots > 0 && ram_slots > 0
+                              ? moestream::graph::ExpertPlacementClass::MixedVramDdr
+                              : (ram_slots > 0
+                                     ? moestream::graph::ExpertPlacementClass::DdrOnly
+                                     : moestream::graph::ExpertPlacementClass::StorageBacked)),
+      .model_slots = total_slots,
+      .ddr_slots = ram_slots,
+      .vram_slots = vram_slots,
+      .model_bytes = total_bytes,
+      .ddr_bytes = ram_bytes,
+      .vram_bytes = vram_bytes,
+      .complete_if_disjoint = max_unique_slots == total_slots,
+  };
+  const FullGraphModel *graph_model = engine.family_ops.graph_model;
+  const auto capabilities =
+      graph_model ? graph_model->moe_execution_capabilities()
+                  : moestream::graph::MoEExecutionCapabilities{};
+  const auto prefill_policy = moestream::graph::resolve_execution_policy(
+      engine.moe_placement, capabilities, ModelGraphPhase::Prefill);
+  const auto decode_policy = moestream::graph::resolve_execution_policy(
+      engine.moe_placement, capabilities, ModelGraphPhase::Decode);
+  engine.moe_prefill_execution = prefill_policy.moe;
+  engine.moe_decode_execution = decode_policy.moe;
+  LOG_STREAM_INFO()
+      << "[PLACEMENT-PREFLIGHT] class=" << placement
+      << " model_experts=" << total_slots << " across " << moe_layers
+      << " layer(s), model_bytes=" << (double)total_bytes / gib << " GiB; "
+      << "VRAM=" << vram_slots << " slots/" << (double)vram_bytes / gib
+      << " GiB; DDR=" << ram_slots << " slots/" << (double)ram_bytes / gib
+      << " GiB; maximum disjoint coverage=" << max_unique_slots << "/"
+      << total_slots << " ("
+      << (100.0 * (double)max_unique_slots / (double)total_slots) << "%)\n";
+  LOG_STREAM_INFO() << "[EXECUTION-POLICY] prefill="
+                    << prefill_policy.reason << "; decode="
+                    << decode_policy.reason << "\n";
+
+  const bool mixed = vram_slots > 0 && ram_slots > 0 &&
+                     vram_slots < total_slots;
+  const bool early_ready_capable =
+      graph_mode && graph_model && graph_model->supports_cpu_lane();
+  if (mixed && graph_mode && !early_ready_capable) {
+    LOG_STREAM_WARN()
+        << "[PLACEMENT-WARN] mixed VRAM+DDR experts require concurrent hot-GPU "
+           "and cold-CPU/offload execution, but graph model '"
+        << (graph_model ? graph_model->name() : "none")
+        << "' does not advertise a common early-ready CPU lane. Decode will "
+           "serialize branches or use synchronous callbacks; performance may "
+           "be far below the model-size target.\n";
+  }
+  if (max_unique_slots < total_slots) {
+    LOG_STREAM_WARN()
+        << "[PLACEMENT-WARN] DDR+VRAM can cover at most " << max_unique_slots
+        << "/" << total_slots
+        << " expert identities even with disjoint tiers; decode-time storage "
+           "reads are unavoidable unless budgets or placement change.\n";
+  } else if (mixed && !config.pin_global_tiers) {
+    LOG_STREAM_WARN()
+        << "[PLACEMENT-WARN] DDR+VRAM can cover the model only if their hot "
+           "sets are substantially disjoint, but pin_global_tiers=false. "
+           "Measure [TIER-OVERLAP]; duplicated identities can turn a nominally "
+           "resident model into decode-time storage misses.\n";
+  }
+  if (ram_slots > 0 && !config.ram_preload_all_experts &&
+      config.pin_ram_fraction <= 0.0) {
+    LOG_STREAM_WARN()
+        << "[PLACEMENT-WARN] the DDR tier has capacity for " << ram_slots
+        << " experts, but ram_preload_all_experts=false and "
+           "pin_ram_fraction=0; it starts empty and the first requests will "
+           "populate it through demand reads.\n";
+  }
+  if (vram_slots > 0 &&
+      (config.pinned_vram_capacity <= 0 ||
+       (uint64_t)config.pinned_vram_capacity >= vram_slots)) {
+    LOG_STREAM_WARN()
+        << "[PLACEMENT-WARN] pinned_vram_capacity="
+        << config.pinned_vram_capacity << " for " << vram_slots
+        << " physical slots leaves no guaranteed reactive VRAM headroom. "
+           "Reserve unpinned slots or use a separate bounded assist ring.\n";
+  }
+  return {};
+}
 
 std::expected<void, std::string> EngineRunner::init_ram_tier() {
   auto &cfg = engine.model_file.architecture_config;

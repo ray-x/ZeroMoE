@@ -74,6 +74,7 @@ private:
   std::expected<void, std::string> setup_vram_expert_cache();
   std::expected<void, std::string> offload_dense_tensors();
   std::expected<void, std::string> init_ram_tier();
+  std::expected<void, std::string> validate_expert_placement();
   std::expected<void, std::string> preload_experts();
   std::expected<void, std::string> start_workers();
   std::expected<void, std::string> run_repl();

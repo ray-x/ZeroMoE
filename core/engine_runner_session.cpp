@@ -1,6 +1,7 @@
 // EngineRunner phases: start_workers, run_repl, shutdown_and_report.
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
+#include "ggml_mimo2_graph.hpp"
 #include "engine_runner.hpp"
 #include "generation_loop.hpp"
 
@@ -69,6 +70,8 @@ std::expected<void, std::string> EngineRunner::start_workers() {
       engine.family_ops.family == ModelFamily::GLM_DSA ||
       engine.family_ops.family == ModelFamily::BailingMoE3)
     glm5next_full_graph_set_vram_cache(&gpu.topology);
+  if (engine.family_ops.family == ModelFamily::MiMo2)
+    mimo2_full_graph_set_vram_cache(&gpu.topology);
   if (graph_mode && !graph_model->bootstrap(engine)) {
     LOG_STREAM_WARN()
         << "[GRAPH] graph bootstrap unavailable; "
@@ -298,6 +301,35 @@ std::expected<void, std::string> EngineRunner::run_repl() {
       prompt_tokens.push_back(tokenizer.ds_assistant_id);
       if (tokenizer.ds_think_end_id >= 0)
         prompt_tokens.push_back(tokenizer.ds_think_end_id);
+    } else if (!config.raw_prompt &&
+               engine.family_ops.family == ModelFamily::MiMo2 &&
+               tokenizer.has_chatml_template()) {
+      // MiMo's embedded text template has no newline between messages and
+      // uses exactly <think></think> to request a direct answer. In particular,
+      // Qwen's reasoning instruction and whitespace are not interchangeable.
+      auto push_text = [&](const std::string &text) {
+        auto ids = tokenizer.encode(text);
+        prompt_tokens.insert(prompt_tokens.end(), ids.begin(), ids.end());
+      };
+      auto message = [&](const std::string &role, const std::string &body) {
+        prompt_tokens.push_back(tokenizer.im_start_id);
+        push_text(role + "\n" + body);
+        prompt_tokens.push_back(tokenizer.im_end_id);
+      };
+      if (!config.system_prompt.empty()) message("system", config.system_prompt);
+      message("user", user_input);
+      prompt_tokens.push_back(tokenizer.im_start_id);
+      push_text("assistant\n");
+      if (!config.enable_thinking) {
+        if (tokenizer.ds_think_start_id >= 0)
+          prompt_tokens.push_back(tokenizer.ds_think_start_id);
+        else
+          push_text("<think>");
+        if (tokenizer.ds_think_end_id >= 0)
+          prompt_tokens.push_back(tokenizer.ds_think_end_id);
+        else
+          push_text("</think>");
+      }
     } else if (!config.raw_prompt && tokenizer.has_chatml_template()) {
       // ChatML (Qwen3.8-Flash-Next / qwen4exp), per the
       // model's tokenizer_config.json chat_template:

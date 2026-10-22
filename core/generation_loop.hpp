@@ -839,10 +839,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                                     prompt_ids.data() + pc_reuse + t);
                 if (!engine.qwen4exp_full_graph_failure.empty())
                     return;
-                if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+                if (hc_active && !engine.full_graph_output_ready && !engine.qwen4exp_full_graph_output_ready &&
                     !engine.glm5next_full_graph_output_ready &&
                     !engine.deepseek_v4_full_graph_output_ready)
                     hc_collapse_output(engine, row, 1, D);
+                engine.full_graph_output_ready = false;
                 engine.qwen4exp_full_graph_output_ready = false;
                 engine.glm5next_full_graph_output_ready = false;
                 engine.deepseek_v4_full_graph_output_ready = false;
@@ -861,10 +862,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             engine.qwen4exp_full_graph_logits_target_size = 0;
             if (!engine.qwen4exp_full_graph_failure.empty())
                 return;
-            if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+            if (hc_active && !engine.full_graph_output_ready && !engine.qwen4exp_full_graph_output_ready &&
                 !engine.glm5next_full_graph_output_ready &&
                 !engine.deepseek_v4_full_graph_output_ready)
                 hc_collapse_output(engine, hidden_states.data(), (int)pc_n_batched, D);
+            engine.full_graph_output_ready = false;
             engine.qwen4exp_full_graph_output_ready = false;
             engine.glm5next_full_graph_output_ready = false;
             engine.deepseek_v4_full_graph_output_ready = false;
@@ -910,11 +912,12 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                     layers_forward_gguf(engine, ram_mgr, prefetcher, rows, n, pos, prompt_ids.data() + pos);
                     if (!engine.qwen4exp_full_graph_failure.empty())
                         return;
-                    const bool graph_ran = engine.glm5next_full_graph_output_ready ||
+                    const bool graph_ran = engine.full_graph_output_ready || engine.glm5next_full_graph_output_ready ||
                                            engine.qwen4exp_full_graph_output_ready ||
                                            engine.deepseek_v4_full_graph_output_ready;
                     if (hc_active && !graph_ran)
                         hc_collapse_output(engine, rows, n, D);
+                    engine.full_graph_output_ready = false;
                     engine.qwen4exp_full_graph_output_ready = false;
                     engine.glm5next_full_graph_output_ready = false;
                     engine.deepseek_v4_full_graph_output_ready = false;
@@ -936,10 +939,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                                         prompt_ids.data() + pc_reuse + t);
                     if (!engine.qwen4exp_full_graph_failure.empty())
                         return;
-                    if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+                    if (hc_active && !engine.full_graph_output_ready && !engine.qwen4exp_full_graph_output_ready &&
                         !engine.glm5next_full_graph_output_ready &&
                         !engine.deepseek_v4_full_graph_output_ready)
                         hc_collapse_output(engine, row, 1, D);
+                    engine.full_graph_output_ready = false;
                     engine.qwen4exp_full_graph_output_ready = false;
                     engine.glm5next_full_graph_output_ready = false;
                     engine.deepseek_v4_full_graph_output_ready = false;
@@ -1391,7 +1395,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         engine.qwen4exp_full_graph_logits_target_size = 0;
         if (!engine.qwen4exp_full_graph_failure.empty())
             return;
-        if (hc_active && !engine.qwen4exp_full_graph_output_ready &&
+        if (hc_active && !engine.full_graph_output_ready && !engine.qwen4exp_full_graph_output_ready &&
             !engine.glm5next_full_graph_output_ready &&
             !engine.deepseek_v4_full_graph_output_ready)
             hc_collapse_output(engine, decode_hidden.data(), 1, D);

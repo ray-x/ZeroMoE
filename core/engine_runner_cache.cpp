@@ -3,6 +3,7 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
+#include "ggml_mimo2_graph.hpp"
 
 // True when the GLM full graph (glm5next implementation) is the active execution path of this engine's family.
 static bool glm_graph_in_use(const StreamingEngine &engine) {
@@ -67,7 +68,10 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
         // views for ANY layer with hot experts, so every layer needs a
         // row-aligned slot stride, not just the full-layer prefix.  The
         // DeepSeek cache-backed graph has the same requirement.
-        const bool graph_cache_rows = shared_glm_ling_graph_in_use(engine);
+        const bool graph_cache_rows =
+            shared_glm_ling_graph_in_use(engine) ||
+            (engine.family_ops.family == ModelFamily::MiMo2 &&
+             mimo2_ingraph_moe_enabled());
         const bool dsv41_graph_rows =
             engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
             (moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH") ||
@@ -187,7 +191,8 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // keep the ordinary usage-ranked preload enabled in graph mode.
   graph_uses_native_moe_cache =
       graph_mode &&
-      (engine.family_ops.family == ModelFamily::DeepSeek_V41 ||
+      (graph_model->uses_native_moe_cache() ||
+       engine.family_ops.family == ModelFamily::DeepSeek_V41 ||
        (engine.family_ops.family == ModelFamily::BailingMoE3 &&
         bailingmoe3_native_graph_enabled()));
   // Native-cache graph callbacks use the existing resident dense weights as

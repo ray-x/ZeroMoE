@@ -41,11 +41,12 @@ extern "C" void launch_expert_scatter_add(
 bool GgmlMoeRunner::compiled_in() { return true; }
 
 namespace {
-constexpr int kMoeRunnerPoolSize = 4;
-// Slot 0 is the legacy/default runner used by non-Qwen callers. Slots 1..3
-// are keyed by the projection quantization signature. The model currently
-// needs two, but leaving one spare keeps this dispatch safe for a future
-// mixed-quant model without returning to a graph rebuild on every transition.
+constexpr int kMoeRunnerPoolSize = 12;
+// Slot 0 is the legacy/default runner. The remaining slots are keyed by the
+// projection quantization signature. MiMo V2.6's dynamic 3-bit export uses
+// ten real (gate, up, down) combinations across its 47 MoE layers; retaining
+// all ten prevents the default runner from rebuilding its graph and weight
+// buffers at almost every layer boundary.
 uint32_t g_moe_runner_keys[kMoeRunnerPoolSize][3] = {};
 bool g_moe_runner_key_valid[kMoeRunnerPoolSize] = {};
 int g_active_moe_runner = 0;

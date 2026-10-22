@@ -18,6 +18,8 @@ std::expected<void, std::string> EngineRunner::run() {
     return result;
   if (auto result = init_ram_tier(); !result)
     return result;
+  if (auto result = validate_expert_placement(); !result)
+    return result;
   if (auto result = preload_experts(); !result)
     return result;
   if (auto result = start_workers(); !result)

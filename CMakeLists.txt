@@ -293,6 +293,7 @@ set(MOESTREAM_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/models/graph
     ${CMAKE_CURRENT_SOURCE_DIR}/models/qwen
     ${CMAKE_CURRENT_SOURCE_DIR}/models/glm
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/mimo
     ${CMAKE_CURRENT_SOURCE_DIR}/models/deepseek
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/cpu
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/cuda
@@ -462,6 +463,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         models/qwen/qwen_moe.cpp
         models/base/model_factory.cpp
         models/base/family_ops.cpp
+        models/mimo/ggml_mimo2_graph.cpp
         models/graph/full_graph_models.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
@@ -595,6 +597,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         models/qwen/qwen_moe.cpp
         models/base/model_factory.cpp
         models/base/family_ops.cpp
+        models/mimo/ggml_mimo2_graph.cpp
         models/graph/full_graph_models.cpp
         ${MOESTREAM_CUDA_SRCS}
     )
@@ -642,6 +645,15 @@ if(NOT MOESTREAM_CPU_ONLY)
         tests/test_strategy_lifecycle.cpp)
     target_include_directories(strategy_lifecycle_test PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
+
+    # R2.1 gate: family graphs may not own expert execution.
+    add_custom_target(moe_conformance
+        COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check_moe_conformance.sh
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        VERBATIM)
+
+    add_executable(mimo2_spec_test EXCLUDE_FROM_ALL tests/test_mimo2_spec.cpp)
+    target_include_directories(mimo2_spec_test PRIVATE ${MOESTREAM_INCLUDE_DIRS})
 
     # Exact F32 parity for DeepSeek's quantized grouped output projection.
     # Uses the real CPU dot and GGML quantizer/dequantizer as the oracle.

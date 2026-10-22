@@ -10,6 +10,7 @@
 #include <thread>
 #include <map>
 #include "ggml_glm5next_graph_impl.hpp"
+#include "offload_expert_provider.hpp"
 
 #include <filesystem>
 
@@ -34,65 +35,17 @@ OffloadState *get_offload(const StreamingEngine &engine,
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] bad first layer %d\n", o->first);
     return nullptr;
   }
-  moestream::offload::ExpertStoreConfig sc;
-  sc.first_layer = o->first;
-  sc.n_layers = o->n_layers;
-  sc.n_experts = o->n_experts;
-  sc.log_tag = "[GGML-GLM5NEXT-OFFLOAD]";
-  for (int l = o->first; l < c.n_layers; ++l) {
-    std::array<uint64_t, 3> pb{};
-    int k = 0;
-    for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight",
-                             "ffn_down_exps.weight"}) {
-      const GGUFTensor *m =
-          model_tensor(engine, "blk." + std::to_string(l) + "." + stem);
-      if (!m || m->size_bytes % (uint64_t)o->n_experts != 0) {
-        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d %s missing/uneven\n", l,
-                  stem);
-        return nullptr;
-      }
-      pb[(size_t)k] = m->size_bytes / (uint64_t)o->n_experts;
-      if (pb[(size_t)k] % 4096 != 0) {
-        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d %s per-expert %llu is not "
-                  "a multiple of 4096\n",
-                  l, stem, (unsigned long long)pb[(size_t)k]);
-        return nullptr;
-      }
-      ++k;
-    }
-    sc.plane_bytes.push_back(pb);
-  }
-  sc.huge_pages = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") == "1";
-  sc.mirror_dir = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MIRROR");
-  sc.split_reads = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_SPLIT", "0") == "1";
-  sc.store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
-  {
-    const std::string first_shard = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
-    if (first_shard.empty()) {
-      LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] MOESTREAM_GLM5NEXT_OFFLOAD_MODEL "
-                "(first shard) is required\n");
-      return nullptr;
-    }
-    const size_t pos = first_shard.rfind("-00001-of-");
-    std::error_code dir_ec;
-    if (std::filesystem::is_directory(first_shard, dir_ec)) {
-      // A directory of shards (what `gguf_tool pack` writes: repacked-<name>-partNNNNN-of-NNNNN.gguf): every .gguf, sorted.
-      for (const auto &entry : std::filesystem::directory_iterator(first_shard))
-        if (entry.is_regular_file() && entry.path().extension() == ".gguf")
-          sc.model_shards.push_back(entry.path().string());
-      std::sort(sc.model_shards.begin(), sc.model_shards.end());
-    } else if (pos == std::string::npos) {
-      sc.model_shards.push_back(first_shard);
-    } else {
-      const std::string head = first_shard.substr(0, pos);
-      const int total = std::atoi(first_shard.c_str() + pos + 10);
-      char buf[64];
-      for (int i = 1; i <= std::max(1, total); ++i) {
-        std::snprintf(buf, sizeof buf, "-%05d-of-%05d.gguf", i, total);
-        sc.model_shards.push_back(head + buf);
-      }
-    }
-  }
+  // The family only translates its environment into a plain profile; geometry,
+  // shard discovery, pool sizing and the store configuration come from the
+  // shared provider.
+  moestream::graph::OffloadProfile profile;
+  profile.first_layer = o->first;
+  profile.log_tag = "[GGML-GLM5NEXT-OFFLOAD]";
+  profile.huge_pages = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") == "1";
+  profile.mirror_dir = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MIRROR");
+  profile.split_reads = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_SPLIT", "0") == "1";
+  profile.store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
+  profile.model_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
   {
     // MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=<n> fixes the pool; unset (or "auto") sizes it from the memory this
     // process may actually use: available RAM (or the cgroup limit if lower) minus 36 GiB for the rest of the
@@ -100,49 +53,36 @@ OffloadState *get_offload(const StreamingEngine &engine,
     // box: decode 5.3 / 7.3 / 8.2 tok/s at 32 / 48 / 58 GiB, flat beyond (everything resident).
     const std::string v = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "auto");
     if (v == "auto" || v.empty()) {
-      double avail_gib = 0.0;
-      if (FILE *f = std::fopen("/proc/meminfo", "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof line, f)) {
-          unsigned long long kb = 0;
-          if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
-            avail_gib = (double)kb / (1024.0 * 1024.0);
-            break;
-          }
-        }
-        std::fclose(f);
-      }
-      if (FILE *f = std::fopen("/sys/fs/cgroup/memory.max", "r")) {
-        unsigned long long bytes = 0;
-        if (std::fscanf(f, "%llu", &bytes) == 1)
-          avail_gib = std::min(avail_gib, (double)bytes / (1024.0 * 1024.0 * 1024.0));
-        std::fclose(f);
-      }
-      sc.ddr_gib = avail_gib > 0.0 ? std::max(16.0, avail_gib - 36.0) : 40.0;
-      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] auto DDR pool %.1f GiB (available %.1f GiB)\n", sc.ddr_gib, avail_gib);
+      profile.ddr_gib = moestream::graph::auto_ddr_gib();
+      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] auto DDR pool %.1f GiB\n", profile.ddr_gib);
     } else {
-      sc.ddr_gib = std::atof(v.c_str());
+      profile.ddr_gib = std::atof(v.c_str());
     }
   }
-  sc.policy = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg"
-                  ? moestream::offload::ExpertCache::Policy::SegmentedLru
-                  : moestream::offload::ExpertCache::Policy::Lru;
-  sc.pinned_fraction =
+  profile.lru_segmented = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg";
+  profile.pinned_fraction =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PINNED", "0.5").c_str());
-  sc.probation_fraction =
+  profile.probation_fraction =
       std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION", "0.25").c_str());
-  sc.byte_capacity = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1";
-  sc.async_loads = offload_async();
+  profile.byte_capacity = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1";
+  profile.async_loads = offload_async();
   // Page-lock the arena slots (DMA straight from DDR) for staging and for the lane's GPU assist.
   if ((pilot_stage_k() > 0 || gpu_assist_slots() > 0) &&
       offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", gpu_assist_slots() > 0 ? "1" : "0") == "1") {
-    sc.pin_fn = [](void *ptr, size_t bytes) {
+    profile.pin_for_dma = true;
+    profile.pin_fn = [](void *ptr, size_t bytes) {
       if (cudaHostRegister(ptr, bytes, cudaHostRegisterPortable) == cudaSuccess)
         return true;
       cudaGetLastError();
       return false;
     };
-    sc.unpin_fn = [](void *ptr) { cudaHostUnregister(ptr); };
+    profile.unpin_fn = [](void *ptr) { cudaHostUnregister(ptr); };
+  }
+  moestream::offload::ExpertStoreConfig sc;
+  std::string cfg_err;
+  if (!moestream::graph::make_store_config(engine, profile, &sc, &cfg_err)) {
+    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s\n", cfg_err.c_str());
+    return nullptr;
   }
 
   std::string err;
@@ -157,9 +97,8 @@ OffloadState *get_offload(const StreamingEngine &engine,
 
   const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
   if (!usage.empty()) {
-    const auto t0 = std::chrono::steady_clock::now();
-    auto ranked = moestream::offload::rank_hottest_first(
-        usage, o->first, o->n_layers, o->n_experts);
+    moestream::graph::SeedExclusions excl;
+    const moestream::graph::SeedExclusions *excl_ptr = nullptr;
     if (partial) {
       // Experts that live in VRAM are served by the GPU branch; do not spend DDR on them.
       // GPU1-hot experts are served by the GPU1 branch in decode, but a batched prefill graph has no such
@@ -167,48 +106,26 @@ OffloadState *get_offload(const StreamingEngine &engine,
       // (otherwise prefill reads them from the SSD, ~0.7 s inline plus ~6 s of background reads at 805 tokens).
       const bool seed_hot1 = offload_env("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD", "0") == "1" &&
                              offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_SEED_GPU1_HOT", "1") == "1";
-      std::vector<std::vector<uint8_t>> hot((size_t)c.n_layers), hot1((size_t)c.n_layers);
-      size_t n_hot = 0;
-      for (size_t l = 0; l < partial->size() && l < hot.size(); ++l) {
-        hot[l].assign((size_t)o->n_experts, 0);
-        hot1[l].assign((size_t)o->n_experts, 0);
+      excl.resident.resize((size_t)c.n_layers);
+      excl.deferred.resize((size_t)c.n_layers);
+      for (size_t l = 0; l < partial->size() && l < excl.resident.size(); ++l) {
+        excl.resident[l].assign((size_t)o->n_experts, 0);
+        excl.deferred[l].assign((size_t)o->n_experts, 0);
         for (int e : (*partial)[l].hot)
           if (e >= 0 && e < o->n_experts) {
-            hot[l][(size_t)e] = 1;
-            ++n_hot;
+            excl.resident[l][(size_t)e] = 1;
+            ++excl.excluded;
           }
         for (int e : (*partial)[l].hot1)
           if (e >= 0 && e < o->n_experts) {
-            (seed_hot1 ? hot1 : hot)[l][(size_t)e] = 1;
-            if (!seed_hot1) ++n_hot;
+            (seed_hot1 ? excl.deferred : excl.resident)[l][(size_t)e] = 1;
+            if (!seed_hot1) ++excl.excluded;
           }
       }
-      const auto in_set = [](const std::vector<std::vector<uint8_t>> &m, const moestream::offload::ExpertKey &k) {
-        return (size_t)k.layer < m.size() && !m[(size_t)k.layer].empty() && m[(size_t)k.layer][(size_t)k.expert];
-      };
-      std::vector<moestream::offload::ExpertKey> late;
-      ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
-                                  [&](const moestream::offload::ExpertKey &k) {
-                                    if (in_set(hot1, k)) {
-                                      late.push_back(k);
-                                      return true;
-                                    }
-                                    return in_set(hot, k);
-                                  }),
-                   ranked.end());
-      ranked.insert(ranked.end(), late.begin(), late.end());
-      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] excluded %zu VRAM-hot experts from the "
-               "DDR seed\n", n_hot);
+      excl_ptr = &excl;
     }
-    const size_t failed = o->store->seed(ranked);
-    if (o->store->pinning())
-      LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] pinned %llu experts (%llu failed) for direct DMA\n",
-               (unsigned long long)o->store->pin_calls(), (unsigned long long)o->store->pin_failures());
-    LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] seeded %zu/%zu experts (%zu failed) in "
-             "%.1f s\n",
-             o->cache->size(), o->store->capacity(), failed,
-             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
-                 .count());
+    moestream::graph::seed_store(*o->store, usage, o->first, o->n_layers,
+                                 o->n_experts, excl_ptr, "[GGML-GLM5NEXT-OFFLOAD]");
   }
   LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] layers %d..%d, capacity %zu experts "
            "(%.1f GiB), pinned %.2f, store=%s\n",
@@ -772,39 +689,10 @@ ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer,
   OffloadState *o = get_offload(*g.engine);
   if (!o)
     return nullptr;
-  const int plane = std::strcmp(stem, "ffn_gate_exps.weight") == 0   ? 0
-                    : std::strcmp(stem, "ffn_up_exps.weight") == 0   ? 1
-                    : std::strcmp(stem, "ffn_down_exps.weight") == 0 ? 2
-                                                                     : -1;
-  const std::string name = "blk." + std::to_string(layer) + "." + stem;
-  const GGUFTensor *meta = model_tensor(*g.engine, name);
-  if (plane < 0 || !meta || !type_ok(meta->type) || meta->shape.size() != 3)
-    return nullptr;
-  std::vector<int64_t> shape;
-  for (uint64_t d : meta->shape)
-    shape.push_back((int64_t)d);
-  ggml_tensor *t = new_tensor(ctx, (ggml_type)meta->type, shape);
-  if (!t || t->nb[2] != o->arena->stride(layer, plane) ||
-      (uint64_t)t->ne[2] != (uint64_t)o->n_experts) {
-    LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s: tensor stride %zu != arena stride\n",
-              name.c_str(), t ? t->nb[2] : (size_t)0);
-    return nullptr;
-  }
-  const size_t len = (size_t)t->nb[2] * (size_t)t->ne[2];
-  ggml_backend_buffer_t buffer =
-      ggml_backend_cpu_buffer_from_ptr(o->arena->ptr(layer, 0, plane), len);
-  if (!buffer)
-    return nullptr;
-  ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-  t->data = o->arena->ptr(layer, 0, plane);
-  t->buffer = buffer;
-  if (ggml_backend_buffer_init_tensor(buffer, t) != GGML_STATUS_SUCCESS) {
-    ggml_backend_buffer_free(buffer);
-    return nullptr;
-  }
-  g.host_buffers.push_back(buffer);
-  ggml_set_name(t, (name + ".offload").c_str());
-  return t;
+  return moestream::graph::make_plane_tensor(
+      *g.engine, *o->arena, o->n_experts, ctx, layer, stem,
+      [](GGUFType t) { return type_ok(t); }, &g.host_buffers,
+      "[GGML-GLM5NEXT-OFFLOAD]");
 }
 
 ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer,

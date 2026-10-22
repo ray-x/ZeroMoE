@@ -20,9 +20,10 @@
 // ridge+pilot tables / async_prefetcher) become implementations/adapters of these interfaces
 // during the migration, exactly like EarlyReadyLaneStrategy does for MoEExecutionStrategy.
 
-#include "cold_moe_strategy.hpp"
+#include "moe_execution_strategy.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -47,6 +48,18 @@ class CachePolicy {
   // store applies the evictions and performs the load.
   virtual void admit(int layer, int expert, std::vector<ExpertRef> &evict_out) const = 0;
   virtual ~CachePolicy() = default;
+};
+
+class DelegatingCachePolicy final : public CachePolicy {
+ public:
+  using AdmitFn = std::function<void(int, int, std::vector<ExpertRef> &)>;
+  explicit DelegatingCachePolicy(AdmitFn fn) : fn_(std::move(fn)) {}
+  void admit(int layer, int expert,
+             std::vector<ExpertRef> &evict_out) const override {
+    if (fn_) fn_(layer, expert, evict_out);
+  }
+ private:
+  AdmitFn fn_;
 };
 
 // ---------------------------------------------------------------------------
@@ -76,6 +89,18 @@ class Predictor {
   virtual ~Predictor() = default;
 };
 
+class DelegatingPredictor final : public Predictor {
+ public:
+  using PredictFn = std::function<bool(int, const float *, int, Prediction &)>;
+  explicit DelegatingPredictor(PredictFn fn) : fn_(std::move(fn)) {}
+  bool predict(int layer, const float *hidden, int dim,
+               Prediction &out) const override {
+    return fn_ && fn_(layer, hidden, dim, out);
+  }
+ private:
+  PredictFn fn_;
+};
+
 // ---------------------------------------------------------------------------
 // PrefetchPolicy — spend bandwidth/memory on predictions.
 // ---------------------------------------------------------------------------
@@ -90,6 +115,20 @@ class PrefetchPolicy {
   virtual ~PrefetchPolicy() = default;
 };
 
+class RankedPrefetchPolicy final : public PrefetchPolicy {
+ public:
+  void plan(const std::vector<Prediction> &predictions,
+            size_t budget_experts,
+            std::vector<ExpertRef> &out) const override {
+    for (const Prediction &p : predictions) {
+      for (int32_t expert : p.experts) {
+        if (out.size() >= budget_experts) return;
+        if (expert >= 0) out.push_back({p.target_layer, expert});
+      }
+    }
+  }
+};
+
 // ---------------------------------------------------------------------------
 // PromotionPolicy — move experts into faster storage.
 // ---------------------------------------------------------------------------
@@ -102,18 +141,26 @@ class PromotionPolicy {
   virtual ~PromotionPolicy() = default;
 };
 
+class HitThresholdPromotionPolicy final : public PromotionPolicy {
+ public:
+  explicit HitThresholdPromotionPolicy(uint32_t threshold)
+      : threshold_(threshold) {}
+  bool should_promote(int, int, uint32_t hits) const override {
+    return threshold_ > 0 && hits >= threshold_;
+  }
+ private:
+  uint32_t threshold_ = 0;
+};
+
 // ---------------------------------------------------------------------------
 // ExecutionPolicy — the aggregate of all five policies.
 // ---------------------------------------------------------------------------
-// MoEExecutionStrategy is the fifth policy; it is ColdMoEStrategy today.
-using MoEExecutionStrategy = ColdMoEStrategy;
-
 struct ExecutionPolicy {
-  std::unique_ptr<CachePolicy> cache;
-  std::unique_ptr<Predictor> predictor;
-  std::unique_ptr<PrefetchPolicy> prefetch;
-  std::unique_ptr<PromotionPolicy> promotion;
-  std::unique_ptr<MoEExecutionStrategy> moe;
+  std::shared_ptr<CachePolicy> cache;
+  std::shared_ptr<Predictor> predictor;
+  std::shared_ptr<PrefetchPolicy> prefetch;
+  std::shared_ptr<PromotionPolicy> promotion;
+  std::shared_ptr<MoEExecutionStrategy> moe;
 
   // Validate the combination. Some policies depend on capabilities the others supply; an
   // unsupported combination returns false and sets `reason`. Keep the structural rules here and
@@ -137,5 +184,40 @@ struct ExecutionPolicy {
     return true;
   }
 };
+
+struct ExecutionPolicyDecision {
+  MoEExecutionKind moe = MoEExecutionKind::CacheBacked;
+  const char *reason = "safe cache-backed fallback";
+};
+
+inline ExecutionPolicyDecision resolve_execution_policy(
+    const MoEPlacementSummary &placement,
+    const MoEExecutionCapabilities &caps,
+    ModelGraphPhase phase) {
+  (void)phase; // phase-specific implementations can refine this decision.
+  if (placement.placement == ExpertPlacementClass::AllVram &&
+      caps.resident_gpu)
+    return {MoEExecutionKind::ResidentGpu,
+            "all expert identities fit in VRAM"};
+  if (placement.placement == ExpertPlacementClass::MixedVramDdr &&
+      caps.early_ready)
+    return {MoEExecutionKind::EarlyReadyOffload,
+            "mixed VRAM+DDR placement supports concurrent branches"};
+  if (placement.placement == ExpertPlacementClass::StorageBacked &&
+      caps.early_ready)
+    return {MoEExecutionKind::EarlyReadyOffload,
+            "storage misses overlap CPU work and asynchronous demand loads"};
+  if (placement.placement == ExpertPlacementClass::DdrOnly &&
+      caps.early_ready && caps.prefer_overlap)
+    return {MoEExecutionKind::EarlyReadyOffload,
+            "overlap lane forced for DDR-resident experts"};
+  if (placement.placement == ExpertPlacementClass::DdrOnly &&
+      caps.cpu_resident)
+    return {MoEExecutionKind::CpuResident,
+            "DDR-resident CPU execution avoids lane overhead"};
+  return {MoEExecutionKind::CacheBacked,
+          caps.cache_backed ? "cache-backed fallback selected"
+                            : "no compatible optimized strategy"};
+}
 
 }  // namespace moestream::graph

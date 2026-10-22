@@ -7,7 +7,11 @@
 #include <future>
 #include "ggml_bailingmoe3_graph.hpp"
 #include "ggml_glm5next_graph_impl.hpp"
-#include "cold_moe_strategy_early_ready.hpp"
+#include "early_ready_offload_strategy.hpp"
+#include "early_ready_graph_builder.hpp"
+#include "moe_block.hpp"
+#include "offload_expert_provider.hpp"
+#include "offload_residency_adapter.hpp"
 
 #if defined(MOESTREAM_USE_GGML_CUDA)
 
@@ -15,165 +19,23 @@ using namespace glm5next_graph;
 
 namespace glm5next_graph {
 
-// Builds the lane for one layer's cold experts and the graph nodes around it:
-// the fork (activation snapshot + route readback) is added to the graph here;
-// the caller consumes lane->gpu_input as the hot branches' input and lane->gpu_output
-// as the cold branch's per-route weighted output, and must expand lane->cpu_marker
-// after the layer's GPU work and before the merge. Returns nullptr when not applicable.
-EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
-                               ggml_tensor *cur, ggml_tensor *ids,
-                               ggml_tensor *weights, ggml_tensor *cold_map,
-                               ggml_tensor *cold_mask,
-                               const moe_routed::ExpertWeights &cold_w,
-                               float clamp)  {
-  if (!g.decode_mode || g.S != 1 || !g.sched || !g.cuda || !g.cpu ||
-      !cold_w.valid() || !cold_map || !cold_mask || cur->type != GGML_TYPE_F32)
+// Adopts a lane built by the shared MoE block for one layer's cold experts: wires the
+// family's residency callbacks and GPU-assist rings into it and registers it with the
+// graph. Returns the stable lane pointer, or nullptr when the lane must be rejected.
+EarlyReadyLane *adopt_cold_lane(FullGraph &g, int layer,
+                                const moe_routed::ExpertWeights &cold_w,
+                                std::unique_ptr<EarlyReadyLane> lane) {
+  if (!lane)
     return nullptr;
-  if (!ggml_backend_sched_early_cpu_supported ||
-      ggml_backend_sched_early_cpu_supported() != 1) {
-    LOG_WARN("[GGML-GLM5NEXT-EARLY-READY] layer %d: linked ggml has no early-CPU scheduler hook\n", layer);
-    return nullptr;
-  }
-  const auto &c = g.engine->model_file.architecture_config;
-  auto lane = std::make_unique<EarlyReadyLane>();
-  lane->swiglu_clamp = clamp;
-  lane->swiglu_clamp_fused = swiglu_clamp_fused();
-  // The lane reads its routing tables on the host: copy them out of the graph's
-  // (device-resident) constant tensors once, at build time.
-  const auto host_table = [&](ggml_tensor *src) -> ggml_tensor * {
-    ggml_tensor *t = ggml_new_tensor_3d(ctx, src->type, src->ne[0], src->ne[1], src->ne[2]);
-    if (!t)
-      return nullptr;
-    ggml_backend_buffer_t buf = ggml_backend_alloc_buffer(g.cpu, ggml_nbytes(t));
-    if (!buf)
-      return nullptr;
-    lane->extra_buffers.push_back(buf);
-    if (ggml_backend_tensor_alloc(buf, t, ggml_backend_buffer_get_base(buf)) != GGML_STATUS_SUCCESS)
-      return nullptr;
-    std::vector<uint8_t> tmp(ggml_nbytes(t));
-    ggml_backend_tensor_get(src, tmp.data(), 0, tmp.size());
-    ggml_backend_tensor_set(t, tmp.data(), 0, tmp.size());
-    return t;
-  };
-  ggml_tensor *remap = host_table(cold_map);
-  ggml_tensor *mask = host_table(cold_mask);
-  if (!remap || !mask)
-    return nullptr;
-  if (!lane->prepare(g.cpu, g.device, g.D, c.topk, cold_w, remap, mask))
-    return nullptr;
-  lane->trace_layer = layer;
-
-  ggml_tensor *dst = ggml_dup_tensor(ctx, cur);
-  lane->device_buffer = ggml_backend_alloc_buffer(g.cuda, ggml_nbytes(dst));
-  if (!lane->device_buffer ||
-      ggml_backend_tensor_alloc(lane->device_buffer, dst,
-                                ggml_backend_buffer_get_base(lane->device_buffer)) != GGML_STATUS_SUCCESS)
-    return nullptr;
-  ggml_tensor *fork = ggml_cpy(ctx, cur, dst);
-  fork->src[2] = ggml_cont(ctx, ids);
-  fork->src[3] = ggml_cont(ctx, weights);
-  fork->src[4] = nullptr;  // no positions tensor: skip the staleness check
-  fork->extra = lane.get();
-  ggml_set_name(fork, ("glm5next_early_ready_fork_l" + std::to_string(layer)).c_str());
-  ggml_backend_sched_set_tensor_backend(g.sched, dst, g.cuda);
-  ggml_backend_sched_set_tensor_backend(g.sched, fork, g.cuda);
-  lane->gpu_input = fork;
-  ggml_build_forward_expand(g.graph, fork);
-
-  ggml_tensor *cold_leaf = ggml_dup_tensor(ctx, lane->output);
-  cold_leaf->buffer = lane->output->buffer;
-  cold_leaf->data = lane->output->data;
-  ggml_tensor *marker = ggml_map_custom1_inplace(ctx, cold_leaf, EarlyReadyLane::fallback, 1, lane.get());
-  marker->extra = lane.get();
-  ggml_set_name(marker, ("glm5next_early_ready_cold_l" + std::to_string(layer)).c_str());
-  ggml_backend_sched_set_tensor_backend(g.sched, cold_leaf, g.cpu);
-  ggml_backend_sched_set_tensor_backend(g.sched, marker, g.cpu);
-  if (!lane->async_output_copy)
-    return nullptr;  // the GLM merge consumes the uploaded copy
-  lane->cpu_marker = marker;
-  if (!lane->prepare_gpu_output(g.cuda, ctx))
-    return nullptr;
-  ggml_set_name(lane->gpu_output, ("glm5next_early_ready_output_l" + std::to_string(layer)).c_str());
-  ggml_backend_sched_set_tensor_backend(g.sched, lane->gpu_output, g.cuda);
 
   moestream::graph::ColdMoEAdapter adapter;
   if (offload_layer(layer)) {
     OffloadState *o = get_offload(*g.engine);
     if (!o)
       return nullptr;
-    if (split_load_wanted() && o->store->async_loads()) {
-      // One in-flight load per lane: the lane runs its layer once per token.
-      struct InFlight {
-        moestream::offload::ExpertResidency::Plan plan;
-        std::future<moestream::offload::ExpertResidency::Ensure> result;
-        std::chrono::steady_clock::time_point t0;
-        int n = 0;
-      };
-      auto flight = std::make_shared<InFlight>();
-      adapter.begin_load = [o, layer, flight](const int32_t *experts, int n, std::vector<int32_t> &pending) {
-        flight->t0 = std::chrono::steady_clock::now();
-        flight->n = n;
-        flight->plan = o->store->begin_ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
-        pending = flight->plan.to_load;
-        pending.insert(pending.end(), flight->plan.to_wait.begin(), flight->plan.to_wait.end());
-        if (pending.empty() && flight->plan.r.errors == 0) {
-          // Nothing to read: account for the hits the same way finish would.
-          flight->result = std::async(std::launch::deferred, [o, flight] {
-            return o->store->finish_ensure(flight->plan);
-          });
-          return true;
-        }
-        flight->result = std::async(std::launch::async, [o, flight] {
-          return o->store->finish_ensure(flight->plan);
-        });
-        return true;
-      };
-      adapter.finish_load = [o, layer, flight]() {
-        const auto r = flight->result.get();
-        auto &ct = o->store->counters();
-        ct.calls.fetch_add(1, std::memory_order_relaxed);
-        ct.routes.fetch_add((uint64_t)flight->n, std::memory_order_relaxed);
-        ct.cold_routes.fetch_add((uint64_t)flight->n, std::memory_order_relaxed);
-        ct.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
-        ct.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
-        ct.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
-        ct.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
-        ct.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-                               std::chrono::steady_clock::now() - flight->t0).count(),
-                           std::memory_order_relaxed);
-        if (r.errors > 0) {
-          ct.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
-          LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting rather than computing with "
-                    "missing experts\n", layer, r.errors);
-          o->store->report("fatal");
-          std::abort();
-        }
-        return true;
-      };
-    } else
-    adapter.before_compute = [o, layer](const int32_t *experts, int n) {
-      const auto t0 = std::chrono::steady_clock::now();
-      const auto r = o->store->ensure(layer, experts, n, moestream::offload::ExpertCache::Kind::Demand);
-      auto &ct = o->store->counters();
-      ct.calls.fetch_add(1, std::memory_order_relaxed);
-      ct.routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
-      ct.cold_routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
-      ct.misses.fetch_add((uint64_t)r.misses, std::memory_order_relaxed);
-      ct.loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
-      ct.evictions.fetch_add((uint64_t)r.evictions, std::memory_order_relaxed);
-      ct.load_us.fetch_add((uint64_t)(r.load_ms * 1000.0), std::memory_order_relaxed);
-      ct.cb_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
-                             std::chrono::steady_clock::now() - t0).count(),
-                         std::memory_order_relaxed);
-      if (r.errors > 0) {
-        ct.errors.fetch_add((uint64_t)r.errors, std::memory_order_relaxed);
-        LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] layer %d: %d expert load error(s); aborting rather than computing with "
-                  "missing experts\n", layer, r.errors);
-        o->store->report("fatal");
-        std::abort();
-      }
-      return true;
-    };
+    adapter = moestream::graph::make_offload_residency_adapter(
+        *o->store, layer, split_load_wanted(),
+        "[GGML-GLM5NEXT-OFFLOAD]");
   }
   if (gpu_assist_slots() > 0 && offload_layer(layer) && gpu_assist_layer_ok(g, layer)) {
     if (OffloadState *o = get_offload(*g.engine)) {
@@ -185,20 +47,11 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
                                  int slots) -> std::shared_ptr<GpuAssistShared> {
         if (std::shared_ptr<GpuAssistShared> have = weak.lock())
           return have;
-        auto s = std::make_shared<GpuAssistShared>();
-        s->be = ggml_backend_cuda_init(dev);
-        s->slots = slots;
-        bool ok = s->be != nullptr;
-        for (int p = 0; ok && p < 3; ++p) {
-          for (int l = o->first; l < o->first + o->n_layers; ++l)
-            if (gpu_assist_layer_ok(g, l))  // the ring only has to fit layers that use it
-              s->plane_cap[p] = std::max<size_t>(s->plane_cap[p], (size_t)o->arena->plane_bytes(l, p));
-          s->ring[p] = ggml_backend_alloc_buffer(s->be, s->plane_cap[p] * (size_t)s->slots + 4096);
-          ok = s->ring[p] != nullptr;
-        }
-        if (!ok)
-          return nullptr;
-        weak = s;
+        auto s = moestream::graph::make_assist_ring(
+            *o->arena, o->first, o->n_layers, dev, slots,
+            [&](int l) { return gpu_assist_layer_ok(g, l); });  // the ring only has to fit layers that use it
+        if (s)
+          weak = s;
         return s;
       };
       const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
@@ -230,8 +83,9 @@ EarlyReadyLane *make_cold_lane(FullGraph &g, ggml_context *ctx, int layer,
   // residency callbacks into the lane through the ColdMoEStrategy interface. This is the
   // build-time install (callbacks only); per-token begin()/state()/finish()/release() are wired
   // in migration step 2 and key off the invocation's (layer, generation) identity (§3.8).
-  raw->strategy = std::make_unique<moestream::graph::EarlyReadyLaneStrategy>(raw);
-  raw->strategy->install(adapter);
+  raw->strategy =
+      std::make_unique<moestream::graph::EarlyReadyOffloadStrategy>(raw,
+                                                                    adapter);
   g.early_ready.emplace(layer, std::move(lane));
   LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);
   return raw;
@@ -466,6 +320,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return ggml_mul_mat(ctx, sd, a);
   };
   ggml_tensor *shared_out = nullptr;
+  bool shared_added = false;
 
   ggml_tensor *out = nullptr;
   // Offloaded layers: the miss node wraps the ids that reach the CPU (cold) MUL_MAT_IDs, so
@@ -474,17 +329,17 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (PartialExpertLayer *partial = partial_layer(g, layer)) {
     const bool has_hot = !partial->hot.empty();
     const bool has_cold = !partial->cold.empty();
-    // Route inputs and the hot+cold merge come from the shared adapter
-    // (include/moe_partial_route_ggml.hpp) so every model gets the same
-    // inactive-route default.
-    moe_partial::BranchInputs hot_in, cold_in;
+    moestream::graph::MoEBranch hot_b, cold_b;
     if (has_hot) {
-      ggml_tensor *hot_map = partial_map(g, ctx, layer, true, false);
-      ggml_tensor *hot_mask = partial_map(g, ctx, layer, true, true);
-      if (!hot_map || !hot_mask)
+      hot_b.weights.gate_up = partial->hot_gate_up;
+      hot_b.weights.gate = partial->hot_gate;
+      hot_b.weights.up = partial->hot_up;
+      hot_b.weights.down = partial->hot_down;
+      hot_b.route_map = partial_map(g, ctx, layer, true, false);
+      hot_b.route_mask = partial_map(g, ctx, layer, true, true);
+      hot_b.present = true;
+      if (!hot_b.route_map || !hot_b.route_mask)
         return nullptr;
-      hot_in = moe_partial::make_branch_inputs(ctx, hot_map, hot_mask, route_ids,
-                                               weights, c.topk, g.S);
     }
     StageRuntime *stage = (has_cold && stage_layer_active(g, layer) && g.stage_pred.count(layer)) ? get_stage(g) : nullptr;
     // Prefetch-only pilot (PILOT_COPY=0) does not need the staged-route node, so the CPU lane can coexist with it: the lane keeps
@@ -501,77 +356,89 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     }
     ggml_tensor *stage_slots = nullptr, *stage_m = nullptr;
     if (has_cold) {
-      ggml_tensor *cold_map = partial_map(g, ctx, layer, false, false);
-      ggml_tensor *cold_mask = partial_map(g, ctx, layer, false, true);
-      if (!cold_map || !cold_mask)
+      cold_b.weights.gate_up = gate_up;
+      cold_b.weights.gate = ge;
+      cold_b.weights.up = ue;
+      cold_b.weights.down = de;
+      cold_b.route_map = partial_map(g, ctx, layer, false, false);
+      cold_b.route_mask = partial_map(g, ctx, layer, false, true);
+      cold_b.present = true;
+      if (!cold_b.route_map || !cold_b.route_mask)
         return nullptr;
-      cold_in = moe_partial::make_branch_inputs(ctx, cold_map, cold_mask, route_ids,
-                                                weights, c.topk, g.S);
-      if (offload_layer(layer)) {
-        if (stage) {
-          // Packed result [cold ids | slots | staged flags]: views feed the CPU branch (cold ids, keep-weights) and the ring branch.
-          ggml_tensor *packed = stage_miss_node(g, ctx, *stage, layer, cold_in.ids, route_ids);
-          if (!packed)
-            return nullptr;
-          const int64_t k = c.topk;
-          const size_t row = (size_t)(3 * k) * sizeof(int32_t);
-          cold_in.ids = ggml_view_2d(ctx, packed, k, 1, row, 0);
-          stage_slots = ggml_view_2d(ctx, packed, k, 1, row, (size_t)k * sizeof(int32_t));
-          ggml_tensor *flags = ggml_view_2d(ctx, packed, k, 1, row, (size_t)(2 * k) * sizeof(int32_t));
-          stage_m = ggml_reshape_3d(ctx, ggml_cast(ctx, flags, GGML_TYPE_F32), 1, k, 1);
-          // Zero the weights of routes the ring serves. This runs on the GPU, after the CPU cold chain, so it adds no scheduler split.
-          cold_in.weights = ggml_mul(ctx, cold_in.weights, ggml_scale_bias(ctx, stage_m, -1.0f, 1.0f));
-        } else {
-          cold_in.ids = offload_miss_node(g, ctx, layer, cold_in.ids);
-          if (!cold_in.ids)
-            return nullptr;
-        }
+    }
+
+    // The execution strategy is resolved from the placement, not chosen here.
+    moestream::graph::MoEPlacementSummary placement;
+    placement.placement = has_hot && has_cold
+        ? moestream::graph::ExpertPlacementClass::MixedVramDdr
+        : (offload_layer(layer) ? moestream::graph::ExpertPlacementClass::StorageBacked
+                                : moestream::graph::ExpertPlacementClass::DdrOnly);
+    moestream::graph::MoEExecutionCapabilities caps;
+    caps.early_ready = lane_wanted;
+    caps.prefer_overlap = lane_wanted;
+    const auto decision = moestream::graph::resolve_execution_policy(
+        placement, caps,
+        g.decode_mode ? ModelGraphPhase::Decode : ModelGraphPhase::Prefill);
+
+    const moestream::graph::MoEBlockSpec spec = moestream::graph::moe_block_spec(c);
+    moestream::graph::MoEBlockGraph bg;
+    bg.ctx = ctx;
+    bg.graph = g.graph;
+    bg.sched = g.sched;
+    bg.cuda = g.cuda;
+    bg.cpu = g.cpu;
+    bg.device = g.device;
+    bg.decode = g.decode_mode;
+    bg.n_tokens = g.S;
+    bg.name_prefix = "glm5next";
+    bg.pin_prefill_branch_sums =
+        moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
+    moestream::graph::MoEBlockLayer bl;
+    bl.layer = layer;
+    bl.input = cur;
+    bl.route_ids = route_ids;
+    bl.route_weights = weights;
+    bl.swiglu_clamp = clamp;
+    bl.swiglu_clamp_fused = swiglu_clamp_fused();
+
+    moestream::graph::MoEBlockHooks hooks;
+    hooks.build_shared = build_shared;
+    EarlyReadyLane *adopted = nullptr;
+    hooks.adopt_lane = [&](std::unique_ptr<EarlyReadyLane> lane) {
+      // Lanes only exist without staging (the stage node already rewrote the cold ids).
+      if (stage)
+        return (EarlyReadyLane *)nullptr;
+      adopted = adopt_cold_lane(g, layer, cold_b.weights, std::move(lane));
+      return adopted;
+    };
+    hooks.before_marker = [&](EarlyReadyLane &) {
+      if (post_stage)
+        if (ggml_tensor *post = stage_post_node(g, ctx, *post_stage, layer, route_ids))
+          ggml_build_forward_expand(g.graph, post);
+    };
+    hooks.adjust_cold_inputs = [&](moe_partial::BranchInputs &cold_in) -> bool {
+      if (!offload_layer(layer))
+        return true;
+      if (stage) {
+        // Packed result [cold ids | slots | staged flags]: views feed the CPU branch (cold ids, keep-weights) and the ring branch.
+        ggml_tensor *packed = stage_miss_node(g, ctx, *stage, layer, cold_in.ids, route_ids);
+        if (!packed)
+          return false;
+        const int64_t k = c.topk;
+        const size_t row = (size_t)(3 * k) * sizeof(int32_t);
+        cold_in.ids = ggml_view_2d(ctx, packed, k, 1, row, 0);
+        stage_slots = ggml_view_2d(ctx, packed, k, 1, row, (size_t)k * sizeof(int32_t));
+        ggml_tensor *flags = ggml_view_2d(ctx, packed, k, 1, row, (size_t)(2 * k) * sizeof(int32_t));
+        stage_m = ggml_reshape_3d(ctx, ggml_cast(ctx, flags, GGML_TYPE_F32), 1, k, 1);
+        // Zero the weights of routes the ring serves. This runs on the GPU, after the CPU cold chain, so it adds no scheduler split.
+        cold_in.weights = ggml_mul(ctx, cold_in.weights, ggml_scale_bias(ctx, stage_m, -1.0f, 1.0f));
+        return true;
       }
-    }
-    EarlyReadyLane *lane = nullptr;
-    if (lane_wanted && !stage) {
-      moe_routed::ExpertWeights cold_w;
-      cold_w.gate_up = gate_up;
-      cold_w.gate = ge;
-      cold_w.up = ue;
-      cold_w.down = de;
-      lane = make_cold_lane(g, ctx, layer, cur, ids, weights,
-                            partial_map(g, ctx, layer, false, false),
-                            partial_map(g, ctx, layer, false, true), cold_w, clamp);
-    }
-    if (lane && post_stage) {
-      if (ggml_tensor *post = stage_post_node(g, ctx, *post_stage, layer, route_ids))
-        ggml_build_forward_expand(g.graph, post);
-    }
-    if (lane) {
-      // fork -> hot GPU work -> shared expert -> CPU lane marker -> merge. The marker
-      // is expanded after everything the GPU can do without the cold result.
-      input3 = ggml_reshape_3d(ctx, lane->gpu_input, g.D, 1, g.S);
-      ggml_tensor *hot_out = nullptr;
-      if (has_hot) {
-        hot_out = run_branch(partial->hot_gate_up, partial->hot_gate,
-                             partial->hot_up, partial->hot_down, hot_in.ids,
-                             hot_in.weights);
-        if (!hot_out)
-          return nullptr;
-        ggml_build_forward_expand(g.graph, hot_out);
-      }
-      shared_out = build_shared();
-      if (shared_out)
-        ggml_build_forward_expand(g.graph, shared_out);
-      ggml_build_forward_expand(g.graph, lane->cpu_marker);
-      ggml_tensor *cold_out =
-          moe_routed::sum_topk(ctx, lane->gpu_output, g.D, g.S, c.topk);
-      out = hot_out ? ggml_add(ctx, hot_out, cold_out) : cold_out;
-    } else {
-      out = moe_partial::combine_hot_cold(
-          ctx, has_hot, has_cold, hot_in, cold_in,
-          [&](const moe_partial::BranchInputs &in) {
-            return run_branch(partial->hot_gate_up, partial->hot_gate,
-                              partial->hot_up, partial->hot_down, in.ids,
-                              in.weights);
-          },
-          [&](const moe_partial::BranchInputs &in) -> ggml_tensor * {
+      cold_in.ids = offload_miss_node(g, ctx, layer, cold_in.ids);
+      return cold_in.ids != nullptr;
+    };
+    hooks.run_cold = [&](const moe_partial::BranchInputs &in,
+                         const moestream::graph::BranchRunFn &run) -> ggml_tensor * {
             // Batched prefill: split the cold experts of the layer between the two GPUs, so both PCIe links copy at
             // once (the second GPU's share runs first so its weight copies are issued before the main GPU's launch).
             if (split_at > 0 && cold_split_applicable(g, layer)) {
@@ -660,7 +527,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                   return nullptr;
                 ggml_tensor *w = pmask[h] ? ggml_mul(ctx, in.weights, ggml_reshape_3d(ctx, pmask[h], 1, c.topk, g.S))
                                           : in.weights;
-                out_part[h] = run_branch(nullptr, pg, pu, pd, pid[h], w, h == 1 ? g.gpu1 : nullptr);
+                out_part[h] = run(moe_routed::ExpertWeights{nullptr, pg, pu, pd}, pid[h], w, h == 1 ? g.gpu1 : nullptr);
                 if (!out_part[h])
                   return nullptr;
               }
@@ -668,35 +535,45 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                 return ggml_add(ctx, out_part[1], out_part[0]);
               return out_part[0] ? out_part[0] : out_part[1];
             }
-            return run_branch(gate_up, ge, ue, de, in.ids, in.weights);
-          });
-    }
+      return run(cold_b.weights, in.ids, in.weights, nullptr);
+    };
+    hooks.extra_branches = [&](ggml_tensor *out_in) -> ggml_tensor * {
+      ggml_tensor *o = out_in;
+      // With a lane, every GPU branch reads the fork's activation snapshot.
+      if (adopted)
+        input3 = ggml_reshape_3d(ctx, adopted->gpu_input, g.D, 1, g.S);
+      if (partial->hot1_down) {
+        ggml_tensor *m1 = partial_map_hot1(g, ctx, layer, false);
+        ggml_tensor *k1 = partial_map_hot1(g, ctx, layer, true);
+        if (!m1 || !k1)
+          return nullptr;
+        const moe_partial::BranchInputs in1 =
+            moe_partial::make_branch_inputs(ctx, m1, k1, route_ids, weights, c.topk, g.S);
+        ggml_tensor *b1 = run_branch(nullptr, partial->hot1_gate, partial->hot1_up,
+                                     partial->hot1_down, in1.ids, in1.weights, g.gpu1);
+        if (!b1)
+          return nullptr;
+        o = ggml_add(ctx, o, b1);
+      }
+      if (stage_slots) {
+        ggml_tensor *rg = stage_ring_tensor(g, ctx, *stage, layer, 0);
+        ggml_tensor *ru = stage_ring_tensor(g, ctx, *stage, layer, 1);
+        ggml_tensor *rd = stage_ring_tensor(g, ctx, *stage, layer, 2);
+        if (!rg || !ru || !rd)
+          return nullptr;
+        ggml_tensor *bs = run_branch(nullptr, rg, ru, rd, stage_slots, ggml_mul(ctx, weights, stage_m));
+        if (!bs)
+          return nullptr;
+        o = ggml_add(ctx, o, bs);
+      }
+      return o;
+    };
+    const moestream::graph::MoEBlockResult block = moestream::graph::build_moe_block(
+        spec, bg, bl, hot_b, cold_b, lane_wanted && !stage, decision, hooks);
+    out = block.out;
     if (!out)
       return nullptr;
-    if (partial->hot1_down) {
-      ggml_tensor *m1 = partial_map_hot1(g, ctx, layer, false);
-      ggml_tensor *k1 = partial_map_hot1(g, ctx, layer, true);
-      if (!m1 || !k1)
-        return nullptr;
-      const moe_partial::BranchInputs in1 =
-          moe_partial::make_branch_inputs(ctx, m1, k1, route_ids, weights, c.topk, g.S);
-      ggml_tensor *b1 = run_branch(nullptr, partial->hot1_gate, partial->hot1_up,
-                                   partial->hot1_down, in1.ids, in1.weights, g.gpu1);
-      if (!b1)
-        return nullptr;
-      out = ggml_add(ctx, out, b1);
-    }
-    if (stage_slots) {
-      ggml_tensor *rg = stage_ring_tensor(g, ctx, *stage, layer, 0);
-      ggml_tensor *ru = stage_ring_tensor(g, ctx, *stage, layer, 1);
-      ggml_tensor *rd = stage_ring_tensor(g, ctx, *stage, layer, 2);
-      if (!rg || !ru || !rd)
-        return nullptr;
-      ggml_tensor *bs = run_branch(nullptr, rg, ru, rd, stage_slots, ggml_mul(ctx, weights, stage_m));
-      if (!bs)
-        return nullptr;
-      out = ggml_add(ctx, out, bs);
-    }
+    shared_added = true; // the block already added the shared expert
   } else {
     ggml_tensor *branch_ids = route_ids;
     if (offload_layer(layer)) {
@@ -709,10 +586,11 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       return nullptr;
   }
 
-  if (!shared_out)
+  if (!shared_added) {
     shared_out = build_shared();
-  if (shared_out)
-    out = ggml_add(ctx, out, shared_out);
+    if (shared_out)
+      out = ggml_add(ctx, out, shared_out);
+  }
   return out;
 }
 

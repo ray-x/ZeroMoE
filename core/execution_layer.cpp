@@ -1018,6 +1018,15 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   engine.glm5next_full_graph_output_ready = false;
   engine.deepseek_v4_full_graph_output_ready = false;
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
+  engine.full_graph_output_ready = false;
+  if (graph_model && graph_model->uses_native_moe_cache()) {
+    if (!g_layer_scratch.resize(S, D, c.n_experts, c.moe_inter, c.topk,
+                                c.n_expert_shared, c.dense_inter)) {
+      engine.qwen4exp_full_graph_failure = "native graph runtime scratch allocation failed";
+      return;
+    }
+    graph_model->bind_runtime(engine, ram_mgr, async_io_queue, g_layer_scratch);
+  }
   if (S > 1 && pos_base == 0 &&
       engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
       graph_model && graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
@@ -1112,6 +1121,12 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     return;
   }
 
+  if (graph_model && graph_model->graph_only()) {
+    if (engine.qwen4exp_full_graph_failure.empty())
+      engine.qwen4exp_full_graph_failure =
+          std::string(graph_model->name()) + " graph build/run failed; layered fallback is unsupported";
+    return;
+  }
   if (S == 1 && engine.family_ops.family == ModelFamily::Qwen4Exp &&
       !qwen4exp_full_graph_sync_state_to_host(engine)) {
     LOG_STREAM_ERROR() << "[GGML-QWEN-FULL] cannot materialize device state "

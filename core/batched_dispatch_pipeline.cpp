@@ -2463,7 +2463,7 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
     }
   }
 
-  // Qwen4Exp decode-only grouped routed FFN. The ordinary grouped path above
+  // Decode-only grouped routed FFN. The ordinary grouped path above
   // is intentionally prefill-only because its expert-major buckets are built
   // for many source rows. For S==1, the same GGML MUL_MAT_ID graph is still
   // valuable: it collapses this token's up-to-topk expert cache lookup,
@@ -2474,7 +2474,8 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
   // with the already-computed host HC activation. That costs one small input
   // upload and result readback per layer, but avoids the old per-expert GPU
   // dispatch/synchronization sequence. This remains explicitly Qwen-only;
-  // other model families and the legacy Qwen path are unchanged.
+  // MiMo uses the host-input form directly: it has no HC or shared expert,
+  // so the runner copies the final routed sum back into `output` itself.
   const bool qwen_decode_grouped_device =
       engine.qwen4exp_decode_ggml_moe &&
       engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -2485,8 +2486,12 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
       engine.family_ops.family == ModelFamily::Qwen4Exp &&
       engine.family_ops.uses_hyper_connections && !qwen_decode_grouped_device &&
       moe_ggml_mul_mat_id();
+  const bool mimo_decode_grouped_host =
+      engine.family_ops.family == ModelFamily::MiMo2 &&
+      moe_ggml_mul_mat_id();
   if (!batched_handled && S == 1 && topk > 0 && n_experts > 0 &&
-      (qwen_decode_grouped_device || qwen_decode_grouped_host) &&
+      (qwen_decode_grouped_device || qwen_decode_grouped_host ||
+       mimo_decode_grouped_host) &&
       clamp_exp == 0.0f && !is_cpu_affinity_layer(layer_idx) &&
       ram_mgr.vram_cache &&
       !engine.qwen4exp_option_b_layer_enabled(layer_idx) &&
@@ -2511,7 +2516,10 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
               ? &grouped_moe_output
               : nullptr,
           grouped_device_input, nullptr, nullptr,
-          /*allow_active_layer_sources=*/true, &scratch.moe_device_runner);
+          /*allow_active_layer_sources=*/true,
+          (qwen_decode_grouped_device || qwen_decode_grouped_host)
+              ? &scratch.moe_device_runner
+              : nullptr);
       if (handled) {
         bool shared_device_handled = false;
         if (qwen_decode_grouped_device || qwen_decode_grouped_host) {
@@ -2603,10 +2611,16 @@ BatchedDispatchResult BatchedDispatchPipeline::run(
         batched_handled = true;
         static bool logged_qwen_decode_graph_device = false;
         static bool logged_qwen_decode_graph_host = false;
+        static bool logged_mimo_decode_graph_host = false;
+        if (mimo_decode_grouped_host && !logged_mimo_decode_graph_host) {
+          LOG_INFO("[GGML-MOE] MiMo2 grouped decode graph active (S=1, "
+                   "host input/output)\n");
+          logged_mimo_decode_graph_host = true;
+        }
         bool &logged = qwen_decode_grouped_device
                            ? logged_qwen_decode_graph_device
                            : logged_qwen_decode_graph_host;
-        if (!logged) {
+        if (!mimo_decode_grouped_host && !logged) {
           LOG_INFO("[GGML-MOE] Qwen4Exp grouped decode graph active (S=1, "
                    "%s HC input)\n",
                    qwen_decode_grouped_device ? "device" : "host");

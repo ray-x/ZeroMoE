@@ -56,6 +56,7 @@ enum class ModelFamily {
                // qwen4exp/qwen3.8-flash-next (src/models/qwen4exp.cpp,
                // conversion/qwen4exp.py).
   BailingMoE3, // Ling 3.1 Flash (GGUF arch "bailingmoe3"): KDA + gated MLA.
+  MiMo2,      // MiMo V2 family: mixed full/SWA GQA, sigmoid-routed MoE.
   Llama,       // Llama-family (dense FFN, standard attention)
   Qwen, // Qwen MoE family (Qwen3.6-35B-A3B and later) — hybrid SSM + DenseQKV
         // + MoE
@@ -91,6 +92,8 @@ inline ModelFamily detect_model_family(const GGUFFile &model_file) {
     return ModelFamily::Qwen4Exp;
   if (arch == "bailingmoe3")
     return ModelFamily::BailingMoE3;
+  if (arch == "mimo2")
+    return ModelFamily::MiMo2;
   if (arch == "llama")
     return ModelFamily::Llama;
   if (arch == "qwen" || arch == "qwen2" || arch == "qwen2moe" ||

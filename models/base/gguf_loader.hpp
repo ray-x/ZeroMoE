@@ -185,6 +185,7 @@ enum class CacheShape {
                // (GLM-5.2/DeepSeek-V3, absorbed WUK/WUV)
   MLARawSWA,   // KVc: per-layer [sliding_window, n_embd_head] ring buffer,
                // no absorption matrices (DeepSeek-V4).
+  GraphOwnedKV, // Family graph owns device KV; no duplicate engine-side cache.
 };
 
 enum class GatingFunc {
@@ -264,6 +265,10 @@ struct ArchitectureConfig {
   int o_lora_rank = 0;          // attention.output_lora_rank
   int hash_layer_count = 0;     // hash_layer_count; 0 = no hash-routed layers
   int sliding_window = 0;       // attention.sliding_window; 0 = SWA inactive
+  std::vector<int64_t> mimo2_head_count_kv;
+  std::vector<int64_t> mimo2_sliding_window_pattern;
+  float mimo2_rope_freq_base_swa = 10000.0f;
+  float mimo2_value_scale = 0.0f;
   // Per-layer DeepSeek-V4 attention compression. A zero ratio selects raw
   // SWA; 4 selects CSA + Lightning Indexer; 128 selects HCA.
   std::vector<int64_t> dsv4_compress_ratios;

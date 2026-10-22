@@ -19,8 +19,12 @@
 #include "family_ops.hpp"
 #include "model_family.hpp"
 #include "moe_routed_config.hpp"
+#include "moe_execution_strategy.hpp"
 
 struct StreamingEngine;
+class RAMSafetyManager;
+class LockFreePrefetcher;
+struct LayerScratch;
 
 class FullGraphModel {
  public:
@@ -44,6 +48,12 @@ class FullGraphModel {
                    const ModelGraphRequest &request) const = 0;
   // Releases scheduler buffers before the shared CUDA backend goes away.
   virtual void shutdown() const {}
+  // Native-cache graph sites borrow the engine runtime rather than owning a
+  // second expert store. New families bind it through this shared lifecycle hook.
+  virtual bool uses_native_moe_cache() const { return false; }
+  virtual bool graph_only() const { return false; }
+  virtual void bind_runtime(StreamingEngine &, RAMSafetyManager &,
+                             LockFreePrefetcher &, LayerScratch &) const {}
 
   // Largest prompt batch the prefill graph should be built for (0 = no limit). Its compute
   // buffers grow with the batch, so a longer prompt runs this many tokens through the graph and
@@ -69,6 +79,13 @@ class FullGraphModel {
   // Whether a layer's cold experts may run on a private CPU lane concurrently
   // with the layer's GPU work.
   virtual bool supports_cpu_lane() const { return false; }
+  virtual moestream::graph::MoEExecutionCapabilities
+  moe_execution_capabilities() const {
+    moestream::graph::MoEExecutionCapabilities caps;
+    caps.early_ready = supports_cpu_lane();
+    caps.gpu_assist = caps.early_ready;
+    return caps;
+  }
 };
 
 // CRTP base: owns the request validation and the prefill/decode dispatch that

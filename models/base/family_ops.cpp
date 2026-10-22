@@ -16,6 +16,7 @@
 #include <cstring>
 #include <immintrin.h>
 #include <limits>
+#include <stdexcept>
 
 // Real attention functions (attention_layer.cpp). No shared header declares
 // these today -- execution_layer.cpp itself reaches them the same way, via
@@ -540,6 +541,11 @@ static void use_hyper_connections(FamilyOps &ops, const ArchitectureConfig &c) {
   }
 }
 
+static void graph_owned_cache(StreamingEngine &, const ArchitectureConfig &, int) {}
+static void graph_only_attention(StreamingEngine &, int, const float *, int, int, float *) {
+  throw std::runtime_error("this family requires its registered full graph");
+}
+
 // ---------------------------------------------------------------------
 // resolve_family_ops -- the single ModelFamily -> FamilyOps table.
 // ---------------------------------------------------------------------
@@ -549,6 +555,13 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
   ops.family = fam;
   ops.graph_model = full_graph_model(fam);
   switch (fam) {
+  case ModelFamily::MiMo2:
+    ops.attn_type = AttentionType::DenseQKV;
+    ops.cache_shape = CacheShape::GraphOwnedKV;
+    ops.default_gating = GatingFunc::Sigmoid;
+    ops.attention_fn = &graph_only_attention;
+    ops.alloc_cache_fn = &graph_owned_cache;
+    break;
   case ModelFamily::GLM_DSA:
   case ModelFamily::DeepSeek_V3: // DeepSeek-V3 shares GLM-5.2's MLA core
     ops.attn_type = AttentionType::MLA;
