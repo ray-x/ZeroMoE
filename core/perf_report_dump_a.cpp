@@ -824,6 +824,11 @@ void PerfCounters::dump_report_part3(double session_elapsed_s) const {
              (unsigned long)n_move_on_promotion.load(),
              (unsigned long)n_copy_on_promotion.load(),
              (unsigned long)n_copy_reclaimed_threshold.load());
+    if (uint64_t demand_async = n_active_layer_uploads_demand_async.load()) {
+        LOG_INFO("Active-layer demand async uploads: %llu (fenced on the "
+                 "consumer stream)\n",
+                 (unsigned long long)demand_async);
+    }
     {
         uint64_t samples = active_layer_decode_occupancy_samples.load();
         if (samples > 0) {

@@ -26,6 +26,21 @@ extern "C" void launch_expert_swiglu(float *, const float *, const float *, int,
 
 namespace {
 constexpr int kGpuColdBatchThreshold = 4;
+
+// 2026-10-22: demand-time active-layer uploads are async by default. The
+// copy is issued on GpuTopology::active_layer_demand_stream (non-blocking)
+// and expert_ffn_gpu_issue fences only its own compute stream on the slot's
+// upload_event, so the decode thread can resolve/load the next expert while
+// this expert's H2D is still draining. A/B on usage-survey prompt 061 showed
+// 3/3 wins and byte-identical output (4.31 vs 4.24 output tok/s, +1.7%).
+// MOESTREAM_ACTIVE_DEMAND_ASYNC=0 restores the old fully-synchronous path.
+bool active_demand_async_enabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("MOESTREAM_ACTIVE_DEMAND_ASYNC");
+    return !value || std::atoi(value) != 0;
+  }();
+  return enabled;
+}
 } // namespace
 
 const ExpertLocation *expert_ffn_resolve_gpu_loc(
@@ -86,15 +101,36 @@ const ExpertLocation *expert_ffn_resolve_gpu_loc(
           context->layer_idx, context->expert_id, location->hit_count,
           promoted_to_main ? " (promoted to main cache)" : "");
     } else {
-      location = context->topo->upload_expert_active(
-          context->layer_idx, context->expert_id, context->slab_buffer,
-          context->slab_capacity);
+      // Demand-time async H2D: issue on the dedicated non-blocking stream,
+      // then let expert_ffn_gpu_issue fence its compute stream on this
+      // slot's event. This keeps the decode thread free to resolve/load the
+      // next expert while the DMA drains. Fall back to the existing
+      // synchronous upload if the async slot/stream is unavailable.
+      if (active_demand_async_enabled() && S == 1) {
+        location = context->topo->upload_expert_active_async(
+            context->layer_idx, context->expert_id, context->slab_buffer,
+            context->slab_capacity, /*speculative=*/false, /*target_gpu_id=*/-1,
+            /*qwen_pilot_prediction_ns=*/-1, /*demand=*/true);
+        if (location) {
+          perf().n_active_layer_uploads_demand_async.fetch_add(
+              1, std::memory_order_relaxed);
+        }
+      }
+      if (!location) {
+        location = context->topo->upload_expert_active(
+            context->layer_idx, context->expert_id, context->slab_buffer,
+            context->slab_capacity);
+      }
       resident = location && location->device_ptr;
       if (resident) {
         from_active_layer = true;
         LOG_DEBUG("[MOE-VRAM]  ACTIVE-LAYER layer=%d expert=%d -> temporary "
-                  "upload (no LRU eviction)\n",
-                  context->layer_idx, context->expert_id);
+                  "%s upload (no LRU eviction)\n",
+                  context->layer_idx, context->expert_id,
+                  (active_demand_async_enabled() && S == 1 &&
+                   location->demand_async_pending)
+                      ? "async-demand"
+                      : "sync");
       } else {
         location = context->topo->upload_expert(
             context->layer_idx, context->expert_id, context->slab_buffer,
@@ -158,6 +194,19 @@ const ExpertLocation *expert_ffn_resolve_gpu_loc(
             context->layer_idx, context->expert_id, location->device_ptr,
             from_active_layer)) {
       perf().n_hold_for_compute_fail.fetch_add(1, std::memory_order_relaxed);
+      // A demand async slot already owns an in-flight DMA and its own
+      // temp_pin_count hold. This failure is rare (identity changed under
+      // us), but leaving the slot unpublished would leak the hold forever;
+      // finish that one transfer and let release_hold's demand branch
+      // publish it. The extra host wait is acceptable on this error path.
+      if (from_active_layer && location->demand_async_pending) {
+        cudaSetDevice(location->gpu_id);
+        if (location->upload_event)
+          cudaEventSynchronize(location->upload_event);
+        cudaGetLastError();
+        context->topo->release_hold(context->layer_idx, context->expert_id,
+                                    location->device_ptr, true);
+      }
       LOG_WARN("[MOE-VRAM] layer=%d expert=%d: hold_for_compute failed; "
                "falling back to CPU\n",
                context->layer_idx, context->expert_id);
@@ -312,8 +361,19 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
                          << "/" << S * D << "\n";
   }
 
-  if (!scratch.ensure(S, D, moe_inter, location->gpu_id))
+  if (!scratch.ensure(S, D, moe_inter, location->gpu_id)) {
+    // No compute will consume this demand upload. The caller immediately
+    // calls release_hold(), which publishes the slot; wait for the DMA here
+    // so that publication cannot expose partially-written weights. Snapshot
+    // allocation failure is rare, so this host wait is acceptable.
+    if (location->demand_async_pending) {
+      cudaSetDevice(location->gpu_id);
+      if (location->upload_event)
+        cudaEventSynchronize(location->upload_event);
+      cudaGetLastError();
+    }
     return false;
+  }
   const float *device_input = shared_device_input;
   if (!device_input) {
     PERF_START(upload);
@@ -326,6 +386,32 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
             : nullptr);
     PERF_END(upload, t_expert_gpu_upload);
     device_input = scratch.d_x;
+  }
+  // Demand async H2D: CudaKernelDispatcher and launch_expert_swiglu below
+  // enqueue on the legacy default stream, so a device-side wait there is
+  // sufficient: it orders the gate/up/down kernels after this expert's own
+  // DMA without blocking the host. Later experts can keep resolving and
+  // issuing their copies while this one drains.
+  if (location->demand_async_pending) {
+    if (!location->upload_event) {
+      perf().n_active_layer_upload_fail.fetch_add(1, std::memory_order_relaxed);
+      LOG_WARN("[MOE-VRAM] demand async slot has no upload_event; "
+               "falling back to CPU for layer=%d expert=%d\n",
+               location->layer_idx, location->expert_id);
+      return false;
+    }
+    cudaError_t wait_err =
+        cudaStreamWaitEvent(nullptr, location->upload_event, 0);
+    if (wait_err != cudaSuccess) {
+      LOG_WARN("[MOE-VRAM] cudaStreamWaitEvent(demand upload) failed: %s; "
+               "falling back to CPU for layer=%d expert=%d\n",
+               cudaGetErrorString(wait_err), location->layer_idx,
+               location->expert_id);
+      cudaGetLastError();
+      cudaEventSynchronize(location->upload_event);
+      cudaGetLastError();
+      return false;
+    }
   }
   CudaKernelDispatcher::matmul(gate_meta.type, scratch.d_gate, device_input,
                                gate_device, S, D, moe_inter);

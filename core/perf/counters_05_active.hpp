@@ -359,6 +359,11 @@ struct PerfCountersPart05 : PerfCountersPart04 {
 
     // Three-tier caching performance counters
     std::atomic<uint64_t> n_active_layer_uploads{0};    // uploads to active layer area (temporary workspace)
+    // Subset of n_active_layer_uploads issued through the opt-in demand
+    // async path (upload_expert_active_async(demand=true)). Kept separate
+    // so a run log can prove the new path actually engaged; does NOT
+    // include prefill/speculative/worker prewarm traffic.
+    std::atomic<uint64_t> n_active_layer_uploads_demand_async{0};
     std::atomic<uint64_t> n_active_layer_hits{0};      // cache hits served from active layer area
     // 2026-08-26: a find_active_expert lookup matched a slot by identity
     // but its async DMA (upload_expert_active_async) hadn't landed yet --

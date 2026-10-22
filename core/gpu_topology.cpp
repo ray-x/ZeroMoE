@@ -233,6 +233,7 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
                 // poll and this call -- cheap fast path, no wait needed.
                 slot.last_used_clock = ++cache_clock;
                 slot.prewarm_touched = true;
+                slot.demand_async_pending = false;
                 perf().n_active_layer_wait_on_inflight_ready.fetch_add(1, std::memory_order_relaxed);
                 return &slot;
             }
@@ -285,6 +286,7 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
         GPU_TOPO_TIMED_LOCK(postwait_lock);
         if (inflight_slot->layer_idx == layer && inflight_slot->expert_id == expert_id) {
             inflight_slot->upload_ready = true;
+            inflight_slot->demand_async_pending = false;
             if (inflight_slot->temp_pin_count > 0) inflight_slot->temp_pin_count--;
             inflight_slot->last_used_clock = ++cache_clock;
             inflight_slot->prewarm_touched = true;
@@ -515,6 +517,8 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
     victim->last_used_clock = ++cache_clock;
     victim->hit_count = 0;  // fresh identity in this slot -- find_active_expert accumulates from here
     victim->upload_ready = true;
+    victim->copy_dispatched = true;
+    victim->demand_async_pending = false;
     if (speculative) {
         // Pilot one-layer-ahead prediction (RAMSafetyManager::promote_ram_
         // to_active_layer), NOT a confirmed real need yet -- mirrors
@@ -562,7 +566,8 @@ ExpertLocation* GpuTopology::upload_expert_active(int layer, int expert_id,
 ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id,
                                                           const uint8_t* host_data, size_t bytes,
                                                           bool speculative, int target_gpu_id,
-                                                          int64_t qwen_pilot_prediction_ns) {
+                                                          int64_t qwen_pilot_prediction_ns,
+                                                          bool demand) {
     if (active_layer_pool == nullptr || active_layer_capacity == 0) {
         return nullptr;
     }
@@ -701,7 +706,20 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     // which no stream reorganization can route around. speculative_
     // prefetch_stream2/speculative_stream_rr are left in place (harmless,
     // unused) rather than deleted, in case a future revisit wants them.
-    cudaStream_t issue_stream = speculative ? dev.speculative_prefetch_stream : dev.active_layer_stream;
+    // Demand uploads get the dedicated non-blocking stream so their DMA can
+    // overlap with the CPU resolving the next expert and with default-stream
+    // compute; expert_ffn_gpu_issue fences only on this slot's own event.
+    // Prewarm/speculative traffic keeps its existing streams unchanged.
+    cudaStream_t issue_stream =
+        speculative ? dev.speculative_prefetch_stream
+                    : (demand ? dev.active_layer_demand_stream
+                              : dev.active_layer_stream);
+    if (!issue_stream) {
+        LOG_STREAM_ERROR() << "[GPU] Active-layer async upload has no stream"
+                           << " (demand=" << demand << ", speculative="
+                           << speculative << ")\n";
+        return nullptr;
+    }
     // 2026-08-26: diagnostic ONLY, speculative path specifically -- directly
     // tests the leading hypothesis for why active_layer_prewarm_issue grew
     // more than the ~5% wrong-guess rate alone would predict: even a
@@ -814,15 +832,21 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     victim->last_used_clock = ++cache_clock;
     victim->hit_count = 0;
     victim->upload_ready = false;
+    victim->copy_dispatched = true;
+    victim->demand_async_pending = demand;
     if (speculative) {
         // Pilot one-layer-ahead prediction -- own flag/counter pair, see
         // upload_expert_active's own (sync) speculative branch and
         // ExpertLocation::pilot_speculative_fill's comment for why this is
         // kept separate from was_async_prewarmed.
         victim->pilot_speculative_fill = true;
-    } else {
+    } else if (!demand) {
         victim->was_async_prewarmed = true;
     }
+    // A demand upload is a confirmed need, not a pre-warm: leave
+    // was_async_prewarmed/pilot_speculative_fill false and do NOT skip its
+    // first real hit's promotion increment. `demand` callers are the exact
+    // same reactive cold-miss population upload_expert_active serves.
     // The whole point of this flag -- see its own comment in
     // gpu_topology.hpp for the real-hardware regression this closes.
     // Applies to the non-speculative (decode_async_prewarm) source
@@ -842,10 +866,17 @@ ExpertLocation* GpuTopology::upload_expert_active_async(int layer, int expert_id
     // hit_threshold needs. Default false preserves the exact prior
     // behavior; when true, skip this speculative fill's confirmation.
     victim->prewarm_skip_next_promote =
-        speculative ? !speculative_active_layer_promote_on_confirm_enabled() : true;
+        speculative ? !speculative_active_layer_promote_on_confirm_enabled()
+                    : !demand;
 
     if (speculative) {
         perf().n_pilot_active_fill_attempted.fetch_add(1, std::memory_order_relaxed);
+    } else if (demand) {
+        // Real, already-dispatched need, not batch pre-warm: count it with
+        // upload_expert_active's own population so the active-layer
+        // "uploads vs promoted" ratio stays meaningful and the prewarm
+        // waste counters stay prewarm-only.
+        perf().n_active_layer_uploads.fetch_add(1, std::memory_order_relaxed);
     } else {
         perf().n_active_layer_uploads_async_issued.fetch_add(1, std::memory_order_relaxed);
     }
@@ -913,6 +944,7 @@ ExpertLocation* GpuTopology::claim_active_layer_slot_for_worker(int layer, int e
     victim->hit_count = 0;
     victim->upload_ready = false;
     victim->copy_dispatched = false;
+    victim->demand_async_pending = false;
     if (speculative) {
         victim->pilot_speculative_fill = true;
     } else {
@@ -1020,6 +1052,7 @@ ExpertLocation *GpuTopology::upload_expert_active_projections_async(
     victim->last_used_clock = ++cache_clock;
     victim->hit_count = 0;
     victim->upload_ready = false;
+    victim->demand_async_pending = false;
     victim->was_async_prewarmed = false;
     victim->pilot_speculative_fill = false;
     victim->prewarm_skip_next_promote = true;
@@ -1081,6 +1114,15 @@ void GpuTopology::sync_active_layer_batch(const std::vector<ExpertLocation*>& vi
     for (int gpu_id : distinct_gpus) {
         cudaSetDevice(gpu_id);
         cudaStreamSynchronize(devices[gpu_id].active_layer_stream);
+        // Normally this batch contains only prewarm/speculative slots, but
+        // keep the completion contract correct if a demand slot ever joins:
+        // its DMA is on the separate non-blocking demand stream.
+        for (auto* v : victims) {
+            if (v && v->gpu_id == gpu_id && v->demand_async_pending) {
+                cudaStreamSynchronize(devices[gpu_id].active_layer_demand_stream);
+                break;
+            }
+        }
     }
     PERF_END(active_layer_batch_sync, t_active_layer_batch_sync);
 
@@ -1099,6 +1141,7 @@ void GpuTopology::sync_active_layer_batch(const std::vector<ExpertLocation*>& vi
     GPU_TOPO_TIMED_LOCK(lock);
     for (auto* v : victims) {
         v->upload_ready = true;
+        v->demand_async_pending = false;
         if (v->temp_pin_count > 0) v->temp_pin_count--;
     }
     perf().n_active_layer_uploads_async_synced.fetch_add((uint64_t)victims.size(), std::memory_order_relaxed);
@@ -1325,6 +1368,8 @@ void GpuTopology::cleanup_active_layer_area(int current_layer_idx,
             slot.last_used_clock = 0;
             slot.hit_count = 0;
             slot.upload_ready = true;
+            slot.demand_async_pending = false;
+            slot.copy_dispatched = true;
             slot.temp_pin_count = 0;
             slot.prewarm_skip_next_promote = false;
             slots_freed++;
@@ -1374,6 +1419,7 @@ ExpertLocation* GpuTopology::find_active_expert(int layer, int expert_id,
                 if (slot.upload_event && cudaEventQuery(slot.upload_event) == cudaSuccess) {
                     record_active_layer_upload_event_timing(slot, false);
                     slot.upload_ready = true;
+                    slot.demand_async_pending = false;
                     // Release the async-issue's own hold now that its DMA is
                     // confirmed complete -- exactly what sync_active_layer_
                     // batch would have done for this slot, just triggered by
