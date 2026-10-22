@@ -80,7 +80,12 @@ STAMP="$(date +%Y%m%d_%H%M%S)_$$"
 # floor is directly comparable to docs/GLM5.3-Flash-baseline.md.
 declare -A MIN MAX METRIC BASELINE TOL
 MIN[ling31]=9.0 ; MAX[ling31]=11.5        # request output; 10.23 measured; doc 10.15
-MIN[dsv41]=1.8 ; MAX[dsv41]=3.2           # request output; 2.18 measured; doc 2.90 cold / 4.0-4.5 steady
+# dsv41 re-baselined 2026-10-22 after 0c0b422 (async demand H2D), on the
+# canonical +10 GB mirror config: 64-token DNS gate prompt, 1 async + 1 sync
+# run = 4.04 / 3.96 tok/s; 150-token prompt 061, 3 interleaved pairs =
+# 4.31 / 4.24. Floor is ~13% below the slower 64-token measurement; the old
+# 3.2 ceiling was below the documented 4.0-4.5 steady range.
+MIN[dsv41]=3.5 ; MAX[dsv41]=4.6           # request output; 4.04 async / 3.96 sync measured; doc 4.0-4.5 steady
 MIN[glm53]=1.8 ; MAX[glm53]=2.4           # request output; 2.14 measured; doc 2.00-2.09
 
 # qwen38: request output, split 22/26. Long-tested 27-28 tok/s; idle ABBA
