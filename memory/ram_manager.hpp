@@ -4432,3 +4432,20 @@ public:
     }
   }
 };
+
+// Shared pilot -> active-layer promotion contract. The caller owns the
+// prediction policy (including any accuracy gate); this helper owns the
+// existing speculative-fill policy, rank cutoff, multi-GPU routing, and the
+// cache-side residency/upload checks. The graph never owns the slot lifetime:
+// RAMSafetyManager/GpuTopology remain the single cache authority.
+inline void promote_pilot_prediction_to_active_layer(
+    StreamingEngine &engine, RAMSafetyManager &ram, int layer, int expert_id,
+    int rank, int max_k) {
+  if (!speculative_promote_to_active_layer_enabled() || max_k <= 0 ||
+      rank < 0 || rank >= max_k)
+    return;
+  const int routed_gpu = active_layer_multi_gpu_enabled()
+                             ? route_active_layer_gpu(rank, max_k)
+                             : -1;
+  ram.promote_ram_to_active_layer(engine, layer, expert_id, routed_gpu);
+}
