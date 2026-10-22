@@ -1719,11 +1719,19 @@ bool MoeRouterService::route(MoePipelineContext &context) {
           }
         }
         // DeepSeek V4.1 decode pilot (MOESTREAM_DSV41_PILOT_K=k, default off):
-        // apply layer N+1's real router to this layer's router input and push
-        // prefetch hints for the top-k experts that are in neither VRAM nor
-        // DDR. The graph decode never runs the engine's older pilots, and
-        // history-based guesses name ~0% of the cold experts, while this
+        // apply layer N+1's real norm + router to layer N's pre-FFN residual
+        // and push prefetch hints for the top-k experts that are in neither
+        // VRAM nor DDR. The graph decode never runs the engine's older pilots,
+        // and history-based guesses name ~0% of the cold experts, while this
         // names about half of them at k=6 (offline replay, 5 prompts).
+        //
+        // The next-layer norm is load-bearing: scratch.normed is layer N's
+        // input after layer N's ffn_norm, not the vector layer N+1's router
+        // was trained on. GLM-5.3-Flash's pilot work found the same class of
+        // input-freshness bug (a stale snapshot cost ~33 points of recall);
+        // here the analogous error is applying the target router to the wrong
+        // normalization. Keep the old behavior as a fallback only when the
+        // target norm is not resident/available.
         if (S == 1 &&
             engine.family_ops.family == ModelFamily::DeepSeek_V41) {
           static const int pilot_k = [] {
@@ -1731,12 +1739,28 @@ bool MoeRouterService::route(MoePipelineContext &context) {
             const int k = e ? std::atoi(e) : 0;
             return std::min(std::max(k, 0), 16);
           }();
+          // Cold-only candidate ranking (GLM-5.3-Flash lesson): rank the
+          // non-resident experts directly instead of taking the top-k
+          // overall and hoping some are cold. 0 keeps the historical
+          // top-k-overall behavior for A/B.
+          static const int cold_k = [] {
+            const char *e = std::getenv("MOESTREAM_DSV41_PILOT_COLD_K");
+            const int k = e ? std::atoi(e) : 0;
+            return std::min(std::max(k, 0), 8);
+          }();
           const int target = layer_idx + 1;
-          if (pilot_k > 0 && target < c.n_layers) {
+          if ((pilot_k > 0 || cold_k > 0) && target < c.n_layers) {
             const auto wit = engine.resident_layers.find(
                 "blk." + std::to_string(target) + ".ffn_gate_inp.weight");
             const auto bit = engine.resident_layers.find(
                 "blk." + std::to_string(target) + ".exp_probs_b.bias");
+            const auto nit = engine.resident_layers.find(
+                "blk." + std::to_string(target) + ".ffn_norm.weight");
+            const bool have_norm =
+                nit != engine.resident_layers.end() && nit->second.host_ptr &&
+                nit->second.meta.type == GGUFType::F32 &&
+                static_cast<int>(nit->second.meta.shape.size()) >= 1 &&
+                (int)nit->second.meta.shape[0] == D;
             const bool have_w = wit != engine.resident_layers.end() &&
                                 wit->second.host_ptr &&
                                 static_cast<int>(wit->second.meta.type) == 30 &&
@@ -1750,7 +1774,15 @@ bool MoeRouterService::route(MoePipelineContext &context) {
                           bit->second.meta.type == GGUFType::F32
                       ? reinterpret_cast<const float *>(bit->second.host_ptr)
                       : nullptr;
-              const float *x = scratch.normed.data() + (size_t)s * D;
+              if (have_norm) {
+                rmsnorm_row(
+                    scratch.pilot_nrm.data(), hidden_states + (size_t)s * D,
+                    reinterpret_cast<const float *>(nit->second.host_ptr), D,
+                    c.eps);
+              }
+              const float *x = have_norm
+                                   ? scratch.pilot_nrm.data()
+                                   : scratch.normed.data() + (size_t)s * D;
               float score[512];
 #pragma omp parallel for schedule(static) num_threads(attn_score_threads())
               for (int e = 0; e < n_experts; ++e) {
@@ -1778,36 +1810,153 @@ bool MoeRouterService::route(MoePipelineContext &context) {
                 score[e] = std::sqrt(sp) + (bias ? bias[e] : 0.0f);
               }
               int pick[16];
-              const int kk = std::min(pilot_k, 16);
-              for (int k = 0; k < kk; ++k) {
-                int best = 0;
-                float bs = -1e30f;
-                for (int e = 0; e < n_experts; ++e)
-                  if (score[e] > bs) { bs = score[e]; best = e; }
-                pick[k] = best;
-                score[best] = -1e30f;
+              int kk = cold_k > 0 ? std::min(cold_k, 8)
+                                  : std::min(pilot_k, 16);
+              if (cold_k > 0) {
+                bool resident[512];
+                for (int e = 0; e < n_experts; ++e) {
+                  const bool in_vram =
+                      ram_mgr.vram_cache &&
+                      (ram_mgr.vram_cache->active_layer_has(target, e) ||
+                       ram_mgr.vram_cache->main_layer_has(target, e));
+                  resident[e] = in_vram || ram_mgr.is_ram_resident(target, e);
+                }
+                for (int k = 0; k < kk; ++k) {
+                  int best = -1;
+                  float bs = -1e30f;
+                  for (int e = 0; e < n_experts; ++e)
+                    if (!resident[e] && score[e] > bs) {
+                      bs = score[e];
+                      best = e;
+                    }
+                  if (best < 0) { kk = k; break; }
+                  pick[k] = best;
+                  resident[best] = true; // never emit the same expert twice
+                }
+              } else {
+                for (int k = 0; k < kk; ++k) {
+                  int best = 0;
+                  float bs = -1e30f;
+                  for (int e = 0; e < n_experts; ++e)
+                    if (score[e] > bs) { bs = score[e]; best = e; }
+                  pick[k] = best;
+                  score[best] = -1e30f;
+                }
               }
-              static std::atomic<uint64_t> n_pred{0}, n_resident{0}, n_hinted{0};
+
+              // Confidence-gated policy (2026-10-21, adapted from the
+              // GLM-5.3-Flash cold-only pilot work):
+              //   SSD -> DDR  only when this (target layer, rank) has a
+              //               measured hit rate >= 50%;
+              //   DDR -> VRAM only when it is >= 90%; otherwise leave the
+              //               prediction to the real dispatch/LRU path.
+              // The counters are the same per-layer/per-rank recall table
+              // the [PILOT-BY-LAYER] report uses, populated by the recall
+              // check below one layer later. Before min_samples, keep the
+              // old allow-all behavior so a cold start is not starved.
+              static const bool gate_enabled = [] {
+                const char *e = std::getenv("MOESTREAM_DSV41_PILOT_GATE");
+                return !e || std::atoi(e) != 0;
+              }();
+              static const double ddr_threshold = [] {
+                const char *e = std::getenv("MOESTREAM_DSV41_PILOT_DDR_THRESHOLD");
+                return e ? std::atof(e) : 0.50;
+              }();
+              static const double vram_threshold = [] {
+                const char *e = std::getenv("MOESTREAM_DSV41_PILOT_VRAM_THRESHOLD");
+                return e ? std::atof(e) : 0.90;
+              }();
+              static const int gate_min_samples = [] {
+                const char *e = std::getenv("MOESTREAM_DSV41_PILOT_GATE_MIN_SAMPLES");
+                return e ? std::max(std::atoi(e), 1) : 30;
+              }();
+              const int active_fill_k =
+                  std::min(kk, speculative_active_layer_max_k_value());
+              // 0=off, 1=main VRAM LRU promotion, 2=active-layer fill.
+              // The historical active-layer path is kept for A/B only: at
+              // 77-90% predicted accuracy it is net-negative on decode.
+              static const int promote_mode = [] {
+                const char *e = std::getenv("MOESTREAM_DSV41_PILOT_PROMOTE_MODE");
+                if (!e || !*e) return 0;
+                if (!std::strcmp(e, "main")) return 1;
+                if (!std::strcmp(e, "active")) return 2;
+                return 0;
+              }();
+              // Two different populations, exactly as the docs:
+              //   hints are judged by fetch-worthy precision;
+              //   DDR->VRAM is judged by RAM-only precision.
+              // Global per-rank counters are more stable than one layer's
+              // small sample; the per-layer table remains the diagnostic.
+              auto rank_accuracy = [&](int rank, bool ram_only) {
+                if (!gate_enabled)
+                  return 1.0;
+                const int r = std::min(std::max(rank, 0), 7);
+                const uint32_t checks =
+                    (ram_only ? perf().n_pilot_ram_only_checks_by_rank[r]
+                              : perf().n_pilot_recall_hint_checks_by_rank[r])
+                        .load(std::memory_order_relaxed);
+                if (checks < (uint32_t)gate_min_samples)
+                  return 1.0; // cold-start: allow, same as the adaptive gates
+                const uint32_t hits =
+                    (ram_only ? perf().n_pilot_ram_only_hits_by_rank[r]
+                              : perf().n_pilot_recall_hint_hits_by_rank[r])
+                        .load(std::memory_order_relaxed);
+                return (double)hits / (double)checks;
+              };
+
+              static std::atomic<uint64_t> n_pred{0}, n_resident{0}, n_hinted{0},
+                  n_promoted{0}, n_gated_ddr{0}, n_gated_vram{0};
+              const int track_k = std::min(kk, 8);
+              scratch.pilot_pred_count = track_k;
+              scratch.pilot_pred_layer = target;
               for (int k = 0; k < kk; ++k) {
                 const int e = pick[k];
                 const bool in_vram =
                     ram_mgr.vram_cache &&
                     (ram_mgr.vram_cache->active_layer_has(target, e) ||
                      ram_mgr.vram_cache->main_layer_has(target, e));
-                if (in_vram || ram_mgr.is_ram_resident(target, e)) {
+                const bool in_ram = ram_mgr.is_ram_resident(target, e);
+                const bool was_hint = !in_vram && !in_ram;
+                if (k < track_k) {
+                  scratch.pilot_pred_ids[(size_t)k] = e;
+                  scratch.pilot_pred_was_hint[(size_t)k] = was_hint;
+                  scratch.pilot_pred_was_ram_only[(size_t)k] =
+                      in_ram && !in_vram;
+                }
+                if (in_vram) {
                   n_resident.fetch_add(1, std::memory_order_relaxed);
-                } else {
+                } else if (in_ram) {
+                  n_resident.fetch_add(1, std::memory_order_relaxed);
+                  const double acc = rank_accuracy(k, /*ram_only=*/true);
+                  if (k < active_fill_k && acc >= vram_threshold &&
+                      promote_mode != 0) {
+                    if (promote_mode == 1)
+                      ram_mgr.promote_ram_to_vram(engine, target, e);
+                    else
+                      promote_pilot_prediction_to_active_layer(
+                          engine, ram_mgr, target, e, k, active_fill_k);
+                    n_promoted.fetch_add(1, std::memory_order_relaxed);
+                  } else {
+                    n_gated_vram.fetch_add(1, std::memory_order_relaxed);
+                  }
+                } else if (rank_accuracy(k, /*ram_only=*/false) >=
+                           ddr_threshold) {
                   async_io_queue.push_hint(target, e);
                   n_hinted.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                  n_gated_ddr.fetch_add(1, std::memory_order_relaxed);
                 }
               }
               const uint64_t n = n_pred.fetch_add(1, std::memory_order_relaxed) + 1;
               if (n % 1560 == 0)
-                LOG_INFO("[DSV41-PILOT] k=%d predictions=%llu already-resident guesses=%llu "
-                         "hints pushed=%llu (%.1f per token)\n", pilot_k,
-                         (unsigned long long)n,
+                LOG_INFO("[DSV41-PILOT] k=%d cold_k=%d predictions=%llu already-resident guesses=%llu "
+                         "hints pushed=%llu gated ddr=%llu vram=%llu active fills=%llu (%.1f hints/token)\n",
+                         pilot_k, cold_k, (unsigned long long)n,
                          (unsigned long long)n_resident.load(),
                          (unsigned long long)n_hinted.load(),
+                         (unsigned long long)n_gated_ddr.load(),
+                         (unsigned long long)n_gated_vram.load(),
+                         (unsigned long long)n_promoted.load(),
                          (double)n_hinted.load() * 39.0 / (double)n);
             }
           }

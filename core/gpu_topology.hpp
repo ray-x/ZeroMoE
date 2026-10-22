@@ -160,6 +160,17 @@ struct GpuDevice {
     // See CLAUDE.md for the real A/B result.
     cudaStream_t active_layer_sync_fallback_stream = nullptr;
 
+    // 2026-10-22: dedicated NON-BLOCKING stream for demand-time active-layer
+    // uploads (upload_expert_active_async's `demand` mode). The existing
+    // synchronous fallback blocks the decode thread inside
+    // cudaStreamSynchronize; this stream lets the DMA run while the CPU
+    // resolves the next expert, with expert_ffn_gpu_issue fencing only the
+    // default compute stream on this slot's own upload_event. It MUST be
+    // created non-blocking: every other stream here is a legacy blocking
+    // stream, and a blocking demand stream would make the default stream
+    // implicitly wait for every queued demand H2D, defeating the overlap.
+    cudaStream_t active_layer_demand_stream = nullptr;
+
     // Persistent VRAM allocations
     uint8_t* expert_cache_pool = nullptr;  // For ExpertVault role
     size_t expert_cache_size = 0;
@@ -200,6 +211,19 @@ struct ExpertLocation {
     // compute yet (device_ptr contents are only partially written).
     bool upload_ready = true;
     cudaEvent_t upload_event = nullptr;
+
+    // True only while a DEMAND-time active-layer H2D issued by
+    // upload_expert_active_async(demand=true) is still pending. Unlike a
+    // speculative/prefill prewarm, this copy is needed by a real dispatch
+    // that is already being queued: expert_ffn_gpu_issue inserts a
+    // cudaStreamWaitEvent on the consumer stream before its matmuls, so the
+    // CPU can keep resolving later experts while the DMA runs. The async
+    // issue's own temp_pin_count hold keeps the slot alive until compute has
+    // consumed it; release_hold() publishes upload_ready and drops that hold
+    // after the compute synchronization. Cleared by every readiness path
+    // (find_active_expert's poll, sync_active_layer_batch, explicit
+    // completion) so it can never outlive the transfer.
+    bool demand_async_pending = false;
 
     // Persistent per-active-slot CUDA events used to measure the actual H2D
     // interval.  They are never created in the per-transfer path.  The main
@@ -945,6 +969,9 @@ public:
             cudaStreamCreate(&dev.speculative_prefetch_stream);
             cudaStreamCreate(&dev.speculative_prefetch_stream2);
             cudaStreamCreate(&dev.active_layer_sync_fallback_stream);
+            // Non-blocking by construction -- see this field's own comment.
+            cudaStreamCreateWithFlags(&dev.active_layer_demand_stream,
+                                      cudaStreamNonBlocking);
         }
 
         // Allocate pinned host transfer buffer (256 KB for small cross-GPU
@@ -1009,6 +1036,7 @@ public:
             if (dev.speculative_prefetch_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.speculative_prefetch_stream); }
             if (dev.speculative_prefetch_stream2) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.speculative_prefetch_stream2); }
             if (dev.active_layer_sync_fallback_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.active_layer_sync_fallback_stream); }
+            if (dev.active_layer_demand_stream) { cudaSetDevice(dev.id); cudaStreamDestroy(dev.active_layer_demand_stream); }
             if (dev.expert_cache_pool) {
                 cudaSetDevice(dev.id);
                 if (dev.cufile_pool_registered) cufile_io::deregister_buffer(dev.expert_cache_pool);
@@ -2215,6 +2243,20 @@ public:
         if (from_active_layer) {
             for (auto& loc : active_layer_slots) {
                 if (loc.layer_idx == layer && loc.expert_id == expert_id && loc.device_ptr == device_ptr) {
+                    // A demand async upload owns TWO holds: the async issue's
+                    // (+1, released here only after the consumer's compute
+                    // has synchronized) and this compute hold's (+1). Publish
+                    // the slot once both are gone. find_active_expert's poll
+                    // may already have released the async hold and cleared
+                    // the flag; in that case this decrement releases only
+                    // the compute hold. This method is called only after
+                    // compute completion by contract, so the DMA is
+                    // guaranteed complete here as well.
+                    if (loc.demand_async_pending) {
+                        loc.demand_async_pending = false;
+                        loc.upload_ready = true;
+                        if (loc.temp_pin_count > 0) loc.temp_pin_count--;
+                    }
                     if (loc.temp_pin_count > 0) loc.temp_pin_count--;
                     return;
                 }
@@ -2253,6 +2295,11 @@ public:
         for (auto& loc : active_layer_slots) {
             if (loc.layer_idx == layer && loc.expert_id == expert_id &&
                 loc.device_ptr == device_ptr) {
+                if (loc.demand_async_pending) {
+                    loc.demand_async_pending = false;
+                    loc.upload_ready = true;
+                    if (loc.temp_pin_count > 0) loc.temp_pin_count--;
+                }
                 if (loc.temp_pin_count > 0) loc.temp_pin_count--;
                 return;
             }
@@ -3121,10 +3168,22 @@ public:
     // returned slot, same contract as every other caller.
     // target_gpu_id: same meaning as upload_expert_active's own parameter
     // of the same name -- see its comment.
+    // demand (2026-10-22, default true in the executor): a real decode-time cold miss that
+    // is about to be dispatched THIS call, not a batch pre-warm. The copy is
+    // issued on active_layer_demand_stream (non-blocking) instead of
+    // active_layer_stream, the slot is marked demand_async_pending, and the
+    // caller must let expert_ffn_gpu_issue fence its compute stream on
+    // upload_event before reading the slot. Unlike the prewarm modes this
+    // does NOT set was_async_prewarmed/prewarm_skip_next_promote: this is a
+    // confirmed need, so its first real touch keeps the normal promotion
+    // semantics. The existing async-batch contract (upload_ready=false and
+    // one temp_pin_count hold) still applies; release_hold() publishes the
+    // slot after the consumer's compute has completed.
     ExpertLocation* upload_expert_active_async(int layer, int expert_id,
                                                 const uint8_t* host_data, size_t bytes,
                                                 bool speculative = false, int target_gpu_id = -1,
-                                                int64_t qwen_pilot_prediction_ns = -1);
+                                                int64_t qwen_pilot_prediction_ns = -1,
+                                                bool demand = false);
 
     // Single-slot Layer-13 proof path.  The graph-RAM arena is projection
     // compact, so the three pinned DDR planes are copied into one active
