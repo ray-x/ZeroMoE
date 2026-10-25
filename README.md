@@ -125,13 +125,6 @@ cmake --build build -j$(nproc)
 decode path executes and interact with each other (host-node mode automatically selects a blocking CUDA wait, +24%). Values,
 defaults, measurements and recommended combinations are in [docs/runtime-settings.md](docs/runtime-settings.md).
 
-For the validated Q2_0 Option-B 0/44/4 scheduler profile on the RTX 3090,
-source `configs/qwen4exp_q2_0_option_b_scheduler.env` and use the matching TOML.
-The opt-in early-ready bridge, resident routing tables and asynchronous cold
-output measured 31.85 → 33.87 tok/s (+6.36%) over six balanced repetitions,
-with identical 64-token logits. It requires the patched GGML integration
-build. Commands, scope and retained experiments are in
-[the graph refactor worklog](docs/option-b-graph-refactor-steps-2026-10-04.md).
 
 ### Qwen EXL3 safetensors decode
 

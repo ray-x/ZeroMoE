@@ -521,15 +521,41 @@ int main(int argc, char *argv[]) {
 
   EngineConfig config;
 
+  // Public configs carry a placeholder model_path ("/path/to/model-or-shard-directory"). Resolve the model here:
+  // --model wins; otherwise a real model_path in the config; otherwise ZEROMOE_MODEL_PATH; otherwise stop.
+  auto is_placeholder_model_path = [](const std::string &p) {
+    return p.empty() || p.rfind("/path/to/", 0) == 0 || p.rfind("path_to_", 0) == 0;
+  };
+  auto resolve_model_path = [&](std::string &target) -> bool {
+    if (!model_path.empty()) {
+      target = model_path;
+      return true;
+    }
+    if (!is_placeholder_model_path(target))
+      return true;
+    const char *env_model = std::getenv("ZEROMOE_MODEL_PATH");
+    if (env_model && *env_model) {
+      target = env_model;
+      return true;
+    }
+    std::cerr << "[CONFIG] model_path is not set. Pass --model <file>, set ZEROMOE_MODEL_PATH, "
+                 "or edit model_path in the config.\n";
+    return false;
+  };
+
   if (!config_path.empty()) {
     // Load from config file
     if (!config.load(config_path))
       return 1;
+    if (!resolve_model_path(config.model_path))
+      return 1;
     if (!config.validate())
       return 1;
-  } else if (!model_path.empty()) {
-    // Build config from CLI arguments (backward compat)
+  } else if (!model_path.empty() || std::getenv("ZEROMOE_MODEL_PATH")) {
+    // Build config from CLI arguments (backward compat), or from ZEROMOE_MODEL_PATH when no --model is given
     config.model_path = model_path;
+    if (!resolve_model_path(config.model_path))
+      return 1;
     config.context_size = max_ctx;
     config.max_new_tokens = max_new_tokens;
     config.drop_pages = drop_pages;
