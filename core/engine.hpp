@@ -2978,20 +2978,25 @@ public:
                 }
             }
 
-            // Do not register the graph-RAM expert arena by default.  These
-            // are large CPU-resident expert weights, not activation staging
-            // buffers; pinning the complete arena consumes the host pin
-            // budget without helping the CPU MUL_MAT_ID path.  The scheduler
-            // separately uses CUDA_Host for its small CPU-only activation,
-            // route-ID, and output buffers.  Keep a deliberate opt-in for a
-            // future A/B that wants to measure pinned expert weights, and
-            // retain the old NO_REGISTER switch as a compatibility override.
+            // Register the Qwen graph-RAM expert arena by default; other
+            // families keep it opt-in (ZEROMOE_QWEN_GRAPH_REGISTER=1).  The
+            // CPU MUL_MAT_ID does not read faster from pinned memory, but the
+            // decode split arena is re-uploaded from these arenas after every
+            // prefill that needs its VRAM, and a pageable source copies at
+            // about 4.9 GB/s against 10.6 GB/s pinned (RTX 3090, PCIe 3.0
+            // x16: 3.8 s -> 1.9 s per request, steady decode unchanged).  The
+            // arenas (31.6 GiB for Qwen 3.8 Flash Q2_0) must fit the pinned
+            // budget or the layer stays pageable.  ZEROMOE_QWEN_GRAPH_REGISTER=0
+            // and the older ZEROMOE_QWEN_GRAPH_NO_REGISTER=1 turn it off.
             const char * graph_register =
                 std::getenv("ZEROMOE_QWEN_GRAPH_REGISTER");
             const char * graph_no_register =
                 std::getenv("ZEROMOE_QWEN_GRAPH_NO_REGISTER");
+            const bool graph_register_default =
+                family_ops.family == ModelFamily::Qwen4Exp;
             const bool graph_register_enabled =
-                graph_register && std::atoi(graph_register) != 0 &&
+                (graph_register ? std::atoi(graph_register) != 0
+                                : graph_register_default) &&
                 !(graph_no_register && std::atoi(graph_no_register) != 0);
             if (ram_pinned_budget_bytes > 0 && graph_register_enabled) {
                 const size_t previous =
@@ -3015,9 +3020,9 @@ public:
             }
             if (!graph_register_enabled && layer == 0) {
                 LOG_STREAM_INFO()
-                    << "[GRAPH-RAM] expert-arena cudaHostRegister disabled by "
-                       "default; set ZEROMOE_QWEN_GRAPH_REGISTER=1 for an "
-                       "explicit A/B\n";
+                    << "[GRAPH-RAM] expert-arena cudaHostRegister off; set "
+                       "ZEROMOE_QWEN_GRAPH_REGISTER=1 to pin it (default "
+                       "for Qwen)\n";
             }
 
             for (int expert = 0; expert < n_experts; ++expert) {
