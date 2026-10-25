@@ -232,14 +232,25 @@ if(ZEROMOE_USE_GGML)
                 message(STATUS "ZeroMoE: third_party/llama.cpp missing; fetching ${ZEROMOE_GGML_COMMIT} ...")
                 set(_zeromoe_fetch "${CMAKE_BINARY_DIR}/_deps/llama-fetch")
                 file(MAKE_DIRECTORY "${_zeromoe_fetch}")
-                foreach(_cmd "init -q" "fetch -q --depth 1 https://github.com/ggml-org/llama.cpp ${ZEROMOE_GGML_COMMIT}" "checkout -q FETCH_HEAD")
+                file(REMOVE_RECURSE "${_zeromoe_fetch}")
+                file(MAKE_DIRECTORY "${_zeromoe_fetch}")
+                # Shallow, blob-less, sparse: only ggml/ is downloaded (about 5 MB, not the 390 MB whole tree).
+                foreach(_cmd "init -q"
+                              "remote add origin https://github.com/ggml-org/llama.cpp"
+                              "config extensions.partialClone origin"
+                              "config remote.origin.promisor true"
+                              "config remote.origin.partialclonefilter blob:none"
+                              "sparse-checkout init --no-cone"
+                              "sparse-checkout set /ggml/"
+                              "fetch -q --depth 1 --filter=blob:none origin ${ZEROMOE_GGML_COMMIT}"
+                              "checkout -q FETCH_HEAD")
                     separate_arguments(_args UNIX_COMMAND "${_cmd}")
                     execute_process(COMMAND git ${_args} WORKING_DIRECTORY "${_zeromoe_fetch}"
                         RESULT_VARIABLE _rc ERROR_VARIABLE _err OUTPUT_QUIET)
                     if(NOT _rc EQUAL 0)
                         message(FATAL_ERROR
                             "ggml source not found: third_party/llama.cpp is empty and the fetch failed (${_err}). "
-                            "Run: git submodule update --init third_party/llama.cpp, or set ZEROMOE_GGML_ROOT.")
+                            "Run: scripts/init_ggml.sh (fetches only ggml/, about 5 MB), or set ZEROMOE_GGML_ROOT.")
                     endif()
                 endforeach()
                 file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
