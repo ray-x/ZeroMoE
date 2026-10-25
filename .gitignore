@@ -19,8 +19,6 @@ tests/bench_outproj
 !/configs/glm53-dsa.toml
 !/configs/mimo26-flash.toml
 !/configs/single_gpu.toml
-!/configs/dual_gpu.toml
-!/configs/triple_gpu.toml
 
 # Local benchmark profiles are generated per prompt/run. Keep the committed
 # reference inputs explicit; everything else stays on the host.
