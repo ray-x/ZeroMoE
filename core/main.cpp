@@ -278,6 +278,7 @@ void print_usage() {
       << "  --bench          Benchmark: run --bench-prompt files in one process, report per-request speeds\n"
       << "                   (--bench-prompt <file> repeatable, --bench-ngen N, --bench-reps N, --bench-warmup N,\n"
       << "                    --bench-long N, --bench-out <file>; see core/bench_mode.hpp)\n"
+      << "                   llama-bench style random tokens: --bench-random-pp N, --bench-random-tg N, --bench-seed S\n"
       << "  --stats-file <path>  Append one JSON line per finished request (also ZEROMOE_STATS_FILE)\n"
       << "  --force-start    Bypass the startup safety checks (concurrent "
          "zeromoe\n"
@@ -544,6 +545,12 @@ int main(int argc, char *argv[]) {
       zeromoe::bench::plan().warmup = std::stoi(argv[++i]);
     else if (arg == "--bench-long" && i + 1 < argc)
       zeromoe::bench::plan().long_ngen = std::stoi(argv[++i]);
+    else if (arg == "--bench-random-pp" && i + 1 < argc)
+      zeromoe::bench::plan().random_pp.push_back(std::stoi(argv[++i]));
+    else if (arg == "--bench-random-tg" && i + 1 < argc)
+      zeromoe::bench::plan().random_tg.push_back(std::stoi(argv[++i]));
+    else if (arg == "--bench-seed" && i + 1 < argc)
+      zeromoe::bench::plan().seed = static_cast<unsigned>(std::stoul(argv[++i]));
     else if (arg == "--bench-out" && i + 1 < argc)
       zeromoe::bench::plan().out = argv[++i];
     else if (arg == "--stats-file" && i + 1 < argc)

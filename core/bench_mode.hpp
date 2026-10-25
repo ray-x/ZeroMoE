@@ -17,6 +17,13 @@
 // no per-token printing or VRAM sampling (ZEROMOE_BENCH_SILENT, as llama-bench does) and no prompt-state cache (a
 // repeated prompt must be prefilled every time).
 //
+// Random-token mode (llama-bench's tests): --bench-random-pp N (repeatable) processes a prompt of N random token ids;
+// --bench-random-tg N (repeatable) starts from one random token and generates N tokens, feeding a random token at every
+// step instead of the sampled one (teacher forcing, no sampling). Ids come from a fixed seed (--bench-seed, default 1),
+// so runs are reproducible and comparable with `llama-bench -p N -n N`. The two modes cannot be mixed in one process.
+// Random ids route to random experts, which a hot-expert placement tuned on real text does not favour, so these
+// numbers are far below real-text numbers for a MoE model; report both.
+//
 // The process does not watch the machine. A caller that needs a quiet-machine guarantee (tools/perf_report.py)
 // checks the wall-clock instants in each request record against its own load samples.
 #pragma once
@@ -30,6 +37,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <random>
+#include <unistd.h>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -44,6 +53,8 @@ struct Plan {
   int warmup = 1;
   int long_ngen = 0;
   int long_reps = 2;
+  std::vector<int> random_pp, random_tg;
+  unsigned seed = 1;
   std::string out;
 };
 
@@ -61,9 +72,53 @@ class Session {
   bool enabled() const { return plan_.enabled; }
 
   // Reads the prompt files and builds the queue. Returns an empty string on success, an error message otherwise.
-  std::string prepare(bool &prompt_cache_flag) {
-    if (plan_.prompt_files.empty()) return "--bench needs at least one --bench-prompt FILE";
+  std::string prepare(bool &prompt_cache_flag, int vocab) {
+    random_ = !plan_.random_pp.empty() || !plan_.random_tg.empty();
+    if (random_ && !plan_.prompt_files.empty()) return "--bench-random-* cannot be combined with --bench-prompt";
+    if (!random_ && plan_.prompt_files.empty())
+      return "--bench needs --bench-prompt FILE (real text) or --bench-random-pp/-tg N (random tokens)";
     if (plan_.ngen < 8 || plan_.reps < 1) return "--bench-ngen must be at least 8 and --bench-reps at least 1";
+    if (random_) {
+      if (vocab < 2) return "the model vocabulary size is unknown; cannot draw random tokens";
+      dir_ = (std::filesystem::temp_directory_path() / ("zeromoe_bench_" + std::to_string(getpid()))).string();
+      std::filesystem::create_directories(dir_);
+      std::mt19937 rng(plan_.seed);
+      std::uniform_int_distribution<int> pick(0, vocab - 1);
+      auto draw = [&](int n) {
+        std::vector<int> v(n);
+        for (auto &t : v) t = pick(rng);
+        return v;
+      };
+      std::vector<Item> tests;
+      for (int n : plan_.random_pp) {
+        if (n < 8) return "--bench-random-pp N needs N >= 8";
+        for (int r = 1; r <= plan_.reps; ++r) tests.push_back({"pp" + std::to_string(n), Kind::Test, r, "x", 2, draw(n), draw(2)});
+      }
+      for (int n : plan_.random_tg) {
+        if (n < 8) return "--bench-random-tg N needs N >= 8";
+        for (int r = 1; r <= plan_.reps; ++r) tests.push_back({"tg" + std::to_string(n), Kind::Test, r, "x", n, draw(1), draw(n)});
+      }
+      for (int i = 0; i < plan_.warmup; ++i) {
+        Item w = tests.front();
+        w.kind = Kind::Warmup;
+        w.rep = 0;
+        queue_.push_back(w);
+      }
+      for (auto &t : tests) {
+        if (labels_.empty() || std::find(labels_.begin(), labels_.end(), t.label) == labels_.end()) labels_.push_back(t.label);
+        queue_.push_back(std::move(t));
+      }
+      // The engine reads a per-request token stream from <dir>/request-<k>.tokens (k counts requests from 0) and
+      // skips sampling for forced steps.
+      setenv("ZEROMOE_TEACHER_FORCE_REQUEST_DIR", dir_.c_str(), 1);
+      setenv("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING", "1", 1);
+      setenv("ZEROMOE_BENCH_IGNORE_STOP", "1", 1);
+      setenv("ZEROMOE_BENCH_SILENT", "1", 1);
+      prompt_cache_flag = false;
+      startup_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_process_start).count();
+      total_ = queue_.size();
+      return "";
+    }
     for (const auto &file : plan_.prompt_files) {
       std::ifstream f(file);
       if (!f) return "cannot read bench prompt " + file;
@@ -74,6 +129,7 @@ class Session {
         if (c != '\n' && c != '\r') text += c;  // one turn per line, as the REPL reads them
       if (text.empty()) return "bench prompt is empty: " + file;
       prompts_.push_back({std::filesystem::path(file).stem().string(), text});
+      labels_.push_back(prompts_.back().label);
     }
     setenv("ZEROMOE_BENCH_IGNORE_STOP", "1", 1);
     setenv("ZEROMOE_BENCH_SILENT", "1", 1);
@@ -96,6 +152,12 @@ class Session {
     queue_.pop_front();
     text = current_.text;
     ngen = current_.ngen;
+    if (random_) {
+      write_ids(dir_ + "/prompt.txt", current_.prompt_ids);
+      write_ids(dir_ + "/request-" + std::to_string(handed_out_) + ".tokens", current_.force_ids);
+      setenv("ZEROMOE_PROMPT_TOKEN_INPUT_FILE", (dir_ + "/prompt.txt").c_str(), 1);
+    }
+    ++handed_out_;
     std::cout << "\n[BENCH] request " << (total_ - queue_.size()) << "/" << total_ << ": " << current_.label
               << " rep " << current_.rep << ", " << current_.ngen << " tokens\n";
     return true;
@@ -107,8 +169,9 @@ class Session {
     Done d{current_, {}, false};
     if (zeromoe::stats::Sink::instance().last(r)) {
       d.stats = r;
-      d.valid = r.status == "ok" && r.generated_tokens == current_.ngen && r.prompt_cached_tokens == 0 &&
-                r.step_ms.size() > zeromoe::stats::kSkipSteps;
+      const bool prompt_ok = current_.prompt_ids.empty() || r.prompt_tokens == static_cast<int>(current_.prompt_ids.size());
+      d.valid = r.status == "ok" && r.generated_tokens == current_.ngen && r.prompt_cached_tokens == 0 && prompt_ok &&
+                (current_.ngen <= 8 || r.step_ms.size() > zeromoe::stats::kSkipSteps);
     }
     done_.push_back(std::move(d));
   }
@@ -132,6 +195,8 @@ class Session {
     int rep;
     std::string text;
     int ngen;
+    std::vector<int> prompt_ids = {};  // random mode: exact prompt token ids
+    std::vector<int> force_ids = {};   // random mode: token fed at each decode step
   };
   struct Prompt {
     std::string label, text;
@@ -159,6 +224,11 @@ class Session {
     if (s.back() != '{') s += ',';
     s += b;
   }
+  static void write_ids(const std::string &path, const std::vector<int> &ids) {
+    std::ofstream f(path);
+    for (size_t i = 0; i < ids.size(); ++i) f << (i ? " " : "") << ids[i];
+    f << '\n';
+  }
   static std::string quote(const std::string &in) { return "\"" + zeromoe::stats::detail::escape(in) + "\""; }
 
   // Per-bucket decode speed over the steps after the warm-up steps.
@@ -179,6 +249,8 @@ class Session {
     std::string s = "{";
     zeromoe::stats::detail::put_int(s, "schema", zeromoe::stats::kSchema);
     zeromoe::stats::detail::put_str(s, "kind", "bench");
+    zeromoe::stats::detail::put_str(s, "mode", random_ ? "random" : "text");
+    if (random_) zeromoe::stats::detail::put_int(s, "seed", plan_.seed);
     zeromoe::stats::detail::put_num(s, "startup_s", startup_s_, 1);
     s += ",\"bench\":{";
     zeromoe::stats::detail::put_int(s, "ngen", plan_.ngen);
@@ -188,11 +260,11 @@ class Session {
     s += "},\"tests\":[";
     std::vector<double> medians;
     bool first_test = true;
-    for (const auto &p : prompts_) {
+    for (const auto &label : labels_) {
       std::vector<double> pre, dec, peak, ttft, setup, wall, p50, p95;
       int n = 0, invalid = 0, prompt_tokens = 0;
       for (const auto &d : done_) {
-        if (d.item.kind != Kind::Test || d.item.label != p.label) continue;
+        if (d.item.kind != Kind::Test || d.item.label != label) continue;
         if (!d.valid) { ++invalid; continue; }
         ++n;
         prompt_tokens = d.stats.prompt_tokens;
@@ -208,7 +280,7 @@ class Session {
       if (!first_test) s += ',';
       first_test = false;
       std::string t = "{";
-      zeromoe::stats::detail::put_str(t, "label", p.label);
+      zeromoe::stats::detail::put_str(t, "label", label);
       zeromoe::stats::detail::put_int(t, "prompt_tokens", prompt_tokens);
       zeromoe::stats::detail::put_int(t, "n", n);
       zeromoe::stats::detail::put_int(t, "invalid", invalid);
@@ -223,7 +295,7 @@ class Session {
       t += "}";
       s += t;
       const Spread sp = spread(pre);
-      if (sp.median >= 0) medians.push_back(sp.median);
+      if (sp.median >= 0 && prompt_tokens >= 8) medians.push_back(sp.median);
     }
     s += "]";
     if (!medians.empty()) {
@@ -287,11 +359,11 @@ class Session {
 
   void print_table() const {
     std::cout << "\n[BENCH] label        prompt  prefill tok/s   decode tok/s (min-max)   peak   ttft ms   setup ms   n/invalid\n";
-    for (const auto &p : prompts_) {
+    for (const auto &label : labels_) {
       std::vector<double> pre, dec, peak, ttft, setup;
       int n = 0, invalid = 0, tokens = 0;
       for (const auto &d : done_) {
-        if (d.item.kind != Kind::Test || d.item.label != p.label) continue;
+        if (d.item.kind != Kind::Test || d.item.label != label) continue;
         if (!d.valid) { ++invalid; continue; }
         ++n;
         tokens = d.stats.prompt_tokens;
@@ -302,9 +374,19 @@ class Session {
         setup.push_back(d.stats.decode_setup_ms);
       }
       const Spread a = spread(pre), b = spread(dec), c = spread(peak), t = spread(ttft), u = spread(setup);
+      // "-" where a figure does not apply (decode of a 2-token pp run, prefill of a 1-token tg prompt)
+      auto f = [](double v, const char *fmt) {
+        char buf[32];
+        if (v < 0) return std::string("-");
+        std::snprintf(buf, sizeof buf, fmt, v);
+        return std::string(buf);
+      };
+      const std::string pre_s = tokens >= 8 ? f(a.median, "%.1f") : "-";
+      const std::string dec_s = b.median < 0 ? "-" : f(b.median, "%.2f") + " (" + f(b.min, "%.2f") + "-" + f(b.max, "%.2f") + ")";
       char line[256];
-      std::snprintf(line, sizeof line, "[BENCH] %-12s %6d  %13.1f   %8.2f (%.2f-%.2f)   %5.1f   %7.0f   %8.0f   %d/%d\n",
-                    p.label.c_str(), tokens, a.median, b.median, b.min, b.max, c.median, t.median, u.median, n, invalid);
+      std::snprintf(line, sizeof line, "[BENCH] %-12s %6d  %13s   %-24s   %5s   %7s   %8s   %d/%d\n", label.c_str(), tokens,
+                    pre_s.c_str(), dec_s.c_str(), f(c.median, "%.1f").c_str(), f(t.median, "%.0f").c_str(),
+                    f(u.median, "%.0f").c_str(), n, invalid);
       std::cout << line;
     }
     std::cout << std::flush;
@@ -312,6 +394,10 @@ class Session {
 
   Plan plan_;
   std::vector<Prompt> prompts_;
+  std::vector<std::string> labels_;
+  bool random_ = false;
+  std::string dir_;
+  size_t handed_out_ = 0;
   std::deque<Item> queue_;
   Item current_{};
   std::vector<Done> done_;

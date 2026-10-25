@@ -115,7 +115,7 @@ int main(int argc, char **argv) {
     p.out = argc > 1 ? argv[1] : "/tmp/bench_summary.json";
     bench::Session s(p);
     bool prompt_cache = true;
-    CHECK(s.prepare(prompt_cache).empty());
+    CHECK(s.prepare(prompt_cache, 1000).empty());
     CHECK(!prompt_cache);                             // bench mode must switch the prompt-state cache off
     CHECK(std::string(std::getenv("ZEROMOE_BENCH_SILENT")) == "1");
     std::string text;
@@ -141,6 +141,63 @@ int main(int argc, char **argv) {
     CHECK(json.find("\"bucket_tok_s\":[") != std::string::npos);
     CHECK(json.find("\"last_vs_first_pct\":-") != std::string::npos);   // the long run slows down
     CHECK(json.find("\"kind\":\"warmup\"") != std::string::npos);
+  }
+  // --- random-token mode (llama-bench's tests)
+  {
+    bench::Plan p;
+    p.enabled = true;
+    p.random_pp = {64};
+    p.random_tg = {32};
+    p.reps = 2;
+    p.warmup = 1;
+    p.seed = 7;
+    p.out = "/tmp/bench_random_summary.json";
+    bench::Session s(p);
+    bool prompt_cache = true;
+    CHECK(s.prepare(prompt_cache, 1000).empty());
+    CHECK(!prompt_cache);
+    CHECK(std::string(std::getenv("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING")) == "1");
+    const std::string dir = std::getenv("ZEROMOE_TEACHER_FORCE_REQUEST_DIR");
+    std::string text;
+    int ngen = 0, k = 0;
+    std::vector<int> prompt_sizes, ngens;
+    auto &sink = stats::Sink::instance();
+    auto count_ids = [](const std::string &path) {
+      std::ifstream f(path);
+      int n = 0, v = 0, mx = -1;
+      while (f >> v) { ++n; mx = std::max(mx, v); }
+      return std::pair<int, int>(n, mx);
+    };
+    while (s.next(text, ngen)) {
+      const auto prompt = count_ids(std::string(std::getenv("ZEROMOE_PROMPT_TOKEN_INPUT_FILE")));
+      const auto forced = count_ids(dir + "/request-" + std::to_string(k) + ".tokens");
+      CHECK(forced.first == ngen);                     // one forced token per decode step
+      CHECK(prompt.second < 1000 && forced.second < 1000);   // ids stay inside the vocabulary
+      prompt_sizes.push_back(prompt.first);
+      ngens.push_back(ngen);
+      stats::RequestStats r = make(prompt.first, 100.0, ngen, 20.f);
+      sink.publish(r);
+      s.record();
+      ++k;
+    }
+    CHECK(k == 1 + 2 + 2);                             // warmup + pp64 x2 + tg32 x2
+    CHECK((prompt_sizes == std::vector<int>{64, 64, 64, 1, 1}));
+    CHECK((ngens == std::vector<int>{2, 2, 2, 32, 32}));
+    s.finish();
+    std::ifstream f(p.out);
+    std::string json((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    CHECK(json.find("\"mode\":\"random\"") != std::string::npos);
+    CHECK(json.find("\"seed\":7") != std::string::npos);
+    CHECK(json.find("\"label\":\"pp64\"") != std::string::npos);
+    CHECK(json.find("\"label\":\"tg32\"") != std::string::npos);
+    CHECK(json.find("\"valid\":false") == std::string::npos);
+    // the same seed gives the same ids
+    bench::Session s2(p);
+    bool pc2 = true;
+    CHECK(s2.prepare(pc2, 1000).empty());
+    s2.next(text, ngen);
+    const auto again = count_ids(std::string(std::getenv("ZEROMOE_PROMPT_TOKEN_INPUT_FILE")));
+    CHECK(again.first == 64);
   }
   std::printf(g_fail ? "request_stats_test: %d FAILED\n" : "request_stats_test: all passed\n", g_fail);
   return g_fail ? 1 : 0;
