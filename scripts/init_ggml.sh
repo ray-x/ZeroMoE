@@ -29,6 +29,7 @@ if [[ -n $(ls -A "$SUB" 2>/dev/null) ]]; then
 fi
 
 mkdir -p "$SUB"
+git submodule init -- "$SUB" >/dev/null   # register it, so "git submodule status" reports it normally
 git -C "$SUB" init -q
 git -C "$SUB" remote add origin "$URL"
 git -C "$SUB" config extensions.partialClone origin
