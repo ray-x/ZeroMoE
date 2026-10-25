@@ -141,7 +141,7 @@ find_package(OpenMP)
 if(ZEROMOE_USE_GGML)
     # Default to a stable, verified ggml tag in the ggerganov/ggml repo.
     # (The old "b3923" string was not a valid tag in either ggml or llama.cpp.)
-    set(ZEROMOE_GGML_TAG "v0.9.11" CACHE STRING "ggml git tag to fetch")
+    set(ZEROMOE_GGML_COMMIT "8baabd53b77d1c48c6ef8d3b620436292f3f6231" CACHE STRING "llama.cpp commit whose ggml/ directory is built (used when the third_party/llama.cpp submodule is absent)")
     set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
 
     # Provide a deprecated alias for configs that still set it.
@@ -150,8 +150,7 @@ if(ZEROMOE_USE_GGML)
         message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
     endif()
     if(ZEROMOE_LLAMA_CPP_TAG)
-        set(ZEROMOE_GGML_TAG "${ZEROMOE_LLAMA_CPP_TAG}" CACHE STRING "" FORCE)
-        message(WARNING "ZEROMOE_LLAMA_CPP_TAG is deprecated; use ZEROMOE_GGML_TAG")
+        message(WARNING "ZEROMOE_LLAMA_CPP_TAG is no longer used; pin ZEROMOE_GGML_COMMIT instead")
     endif()
 
     # Disable everything we do not need for a CPU decode assistant, except the
@@ -219,29 +218,32 @@ if(ZEROMOE_USE_GGML)
     endif()
 
     if(NOT ZEROMOE_GGML_ROOT)
-        # Use a direct shell clone instead of FetchContent's ExternalProject.
-        # Some sandboxed CMake environments fail to detect git version and
-        # abort before cloning; running git from the shell works around that.
+        # Default: ggml/ from the pinned llama.cpp submodule (third_party/llama.cpp, commit ZEROMOE_GGML_COMMIT).
+        # It is copied into the build tree before the patch series is applied, so the submodule is never modified.
         set(_zeromoe_ggml_src "${CMAKE_BINARY_DIR}/_deps/ggml-src")
+        set(_zeromoe_ggml_submodule "${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml")
         if(NOT EXISTS "${_zeromoe_ggml_src}/CMakeLists.txt")
-            message(STATUS "ZeroMoE: cloning ggml tag ${ZEROMOE_GGML_TAG} ...")
-            # Avoid sandbox/gitconfig permission issues on some hosts.
-            set(ENV{GIT_CONFIG_GLOBAL} "/dev/null")
-            set(ENV{GIT_CONFIG_NOSYSTEM} "1")
-            execute_process(
-                COMMAND git clone --depth 1 --branch ${ZEROMOE_GGML_TAG}
-                        https://github.com/ggerganov/ggml.git
-                        "${_zeromoe_ggml_src}"
-                RESULT_VARIABLE _zeromoe_ggml_clone_result
-                ERROR_VARIABLE  _zeromoe_ggml_clone_err
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-                ERROR_STRIP_TRAILING_WHITESPACE
-            )
-            if(NOT _zeromoe_ggml_clone_result EQUAL 0)
-                message(FATAL_ERROR
-                    "Failed to clone ggml (git returned ${_zeromoe_ggml_clone_result}).\n"
-                    "Error: ${_zeromoe_ggml_clone_err}\n"
-                    "Set ZEROMOE_GGML_ROOT to a local checkout, or verify network/git access.")
+            if(EXISTS "${_zeromoe_ggml_submodule}/CMakeLists.txt")
+                message(STATUS "ZeroMoE: copying ggml from third_party/llama.cpp/ggml into the build tree")
+                file(COPY "${_zeromoe_ggml_submodule}/" DESTINATION "${_zeromoe_ggml_src}"
+                     PATTERN ".git" EXCLUDE)
+            else()
+                # Submodule not initialised: fetch the same commit into the build tree.
+                message(STATUS "ZeroMoE: third_party/llama.cpp missing; fetching ${ZEROMOE_GGML_COMMIT} ...")
+                set(_zeromoe_fetch "${CMAKE_BINARY_DIR}/_deps/llama-fetch")
+                file(MAKE_DIRECTORY "${_zeromoe_fetch}")
+                foreach(_cmd "init -q" "fetch -q --depth 1 https://github.com/ggml-org/llama.cpp ${ZEROMOE_GGML_COMMIT}" "checkout -q FETCH_HEAD")
+                    separate_arguments(_args UNIX_COMMAND "${_cmd}")
+                    execute_process(COMMAND git ${_args} WORKING_DIRECTORY "${_zeromoe_fetch}"
+                        RESULT_VARIABLE _rc ERROR_VARIABLE _err OUTPUT_QUIET)
+                    if(NOT _rc EQUAL 0)
+                        message(FATAL_ERROR
+                            "ggml source not found: third_party/llama.cpp is empty and the fetch failed (${_err}). "
+                            "Run: git submodule update --init third_party/llama.cpp, or set ZEROMOE_GGML_ROOT.")
+                    endif()
+                endforeach()
+                file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
+                endif()
             endif()
         endif()
         set(ZEROMOE_GGML_ROOT "${_zeromoe_ggml_src}")

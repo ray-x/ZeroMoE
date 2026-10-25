@@ -17,14 +17,23 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 OUT=$(realpath -m "${1:?usage: build_ggml.sh <out-dir>}")
-GGML_REPO=${GGML_REPO:-/home/ray/Projects/llama.cpp}
-GGML_COMMIT=${GGML_COMMIT:-8baabd53b}
+# Default: the llama.cpp submodule (third_party/llama.cpp, commit 8baabd53b), whose ggml/ directory is built.
+# A standalone ggml repository also works (its root is the ggml root).
+GGML_REPO=${GGML_REPO:-$ROOT/third_party/llama.cpp}
+GGML_COMMIT=${GGML_COMMIT:-HEAD}
 CUDA_ARCH=${CUDA_ARCH:-86}
 SRC=$OUT/ggml-src
 
 if [[ -e $SRC ]]; then echo "$SRC exists; remove it first (the patches are applied once)"; exit 1; fi
 mkdir -p "$SRC"
-git -C "$GGML_REPO" archive "$GGML_COMMIT" ggml | tar -x -C "$SRC"
+if git -C "$GGML_REPO" cat-file -e "$GGML_COMMIT:ggml/CMakeLists.txt" 2>/dev/null; then
+  # llama.cpp checkout: ggml lives in its ggml/ subdirectory.
+  git -C "$GGML_REPO" archive "$GGML_COMMIT" ggml | tar -x -C "$SRC"
+else
+  # Standalone ggml repository: the ggml root is the repository root.
+  mkdir -p "$SRC/ggml"
+  git -C "$GGML_REPO" archive "$GGML_COMMIT" | tar -x -C "$SRC/ggml"
+fi
 echo "ggml source: $GGML_REPO @ $GGML_COMMIT" > "$OUT/ggml-src.txt"
 
 # The series (patches/ggml, then patches/ggml-host-node) is written for the upstream commit above. GNU patch
