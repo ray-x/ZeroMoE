@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include "request_stats.hpp"
 
 extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
 extern void rmsnorm_row(float* out, const float* x, const float* w, int D, float eps);
@@ -473,6 +474,32 @@ inline float zeromoe_repetition_penalty() {
 // LockFreePrefetcher::active_prefetch's own claim_or_wait calls into the
 // RAM tier) makes hints and claims all flow through one prefetcher talking
 // to one RAM tier.
+// Fills one zeromoe::stats::RequestStats for the request and publishes it when the request leaves generate_text(),
+// by any path. A request that returns early (error, refused graph) is published with status "error".
+struct RequestStatsScope {
+    zeromoe::stats::RequestStats s;
+    std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
+    explicit RequestStatsScope(const std::string &family) {
+        auto &sink = zeromoe::stats::Sink::instance();
+        sink.take_notes();  // drop notes left by startup work; only this request's notes belong in its record
+        s.seq = sink.next_seq();
+        s.start_unix_ms = zeromoe::stats::unix_ms_now();
+        s.model = sink.model();
+        s.family = family;
+    }
+    ~RequestStatsScope() {
+        auto &sink = zeromoe::stats::Sink::instance();
+        if (s.total_ms < 0)
+            s.total_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - start).count();
+        s.end_unix_ms = zeromoe::stats::unix_ms_now();
+        s.extra = sink.take_notes();
+        const std::string json = sink.publish(s);
+        LOG_INFO("[STATS] %s\n", json.c_str());
+    }
+    RequestStatsScope(const RequestStatsScope &) = delete;
+    RequestStatsScope &operator=(const RequestStatsScope &) = delete;
+};
+
 void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFTokenizer& tokenizer,
                    LockFreePrefetcher& prefetcher,
                    const std::vector<int>& prompt_ids, int max_new_tokens, int eos_id,
@@ -548,6 +575,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // request finishes (see bottom of function).
     auto request_snap_start = perf().snapshot();
     auto request_wall_start = std::chrono::high_resolution_clock::now();
+    RequestStatsScope stats_scope(engine.family_ops.graph_model ? engine.family_ops.graph_model->name() : "");
 
     // ---- Prompt (prefix) state cache -------------------------------------
     // Restricted to the two families whose carried state is fully enumerated
@@ -1054,6 +1082,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // subtracts t_prefill_total from the whole request wall time, which also
     // contains prompt embedding and full-graph setup before PERF_START.
     const auto decode_boundary_start = std::chrono::high_resolution_clock::now();
+    stats_scope.s.prompt_tokens = static_cast<int>(prompt_ids.size());
+    stats_scope.s.prompt_cached_tokens = pc_reuse;
+    stats_scope.s.prefill_ms = prefill_wall_s * 1000.0;
+    stats_scope.s.decode_start_unix_ms = zeromoe::stats::unix_ms_now();
     LOG_STREAM_INFO() << "[PREFILL-DONE] " << prompt_ids.size() << " tokens in " << prefill_wall_s
                        << "s (" << ((prefill_wall_s > 0.0) ? (prompt_ids.size() / prefill_wall_s) : 0.0)
                        << " tok/s) -- this request's own prefill pass only, matches the 'prefill=' figure "
@@ -1345,7 +1377,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             const ModelGraphRequest first_decode_request{
                 ModelGraphPhase::Decode, 1, static_cast<int>(prompt_ids.size()),
                 &next_token, decode_hidden.data(), logits.data(), V};
-            if (!graph_model->build(engine, first_decode_request) &&
+            const auto decode_setup_start = std::chrono::high_resolution_clock::now();
+            const bool decode_graph_built = graph_model->build(engine, first_decode_request);
+            stats_scope.s.decode_setup_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - decode_setup_start).count();
+            if (!decode_graph_built &&
                 engine.qwen4exp_full_graph_required) {
                 engine.qwen4exp_full_graph_failure =
                     "decode graph construction failed before first token";
@@ -1374,8 +1410,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
         if (!is_stop_now) {
             last_token_output = std::chrono::steady_clock::now();
-            if (timed_output_tokens++ == 0)
+            if (timed_output_tokens++ == 0) {
                 first_token_output = last_token_output;
+                stats_scope.s.ttft_ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::high_resolution_clock::now() - request_wall_start).count();
+            }
         }
 
         if (is_stop_now || step + 1 >= max_new_tokens)
@@ -1444,6 +1483,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
         double diag_loop_iter_ms = std::chrono::duration<double, std::milli>(
             std::chrono::high_resolution_clock::now() - diag_loop_iter_start).count();
+        stats_scope.s.step_ms.push_back(static_cast<float>(diag_loop_iter_ms));
         double diag_vramlog_delta_ms = diag_vramlog_ms - diag_vramlog_ms_prev;
         diag_vramlog_ms_prev = diag_vramlog_ms;
         if (token_loop_diag_enabled && !bench_silent) {
@@ -1473,6 +1513,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     PerfCounters::print_summary("REQUEST", request_wall_ms, (int)request_delta.n_tokens_generated, request_delta);
     const double decode_boundary_s = std::chrono::duration<double>(
         std::chrono::high_resolution_clock::now() - decode_boundary_start).count();
+    stats_scope.s.generated_tokens = static_cast<int>(request_delta.n_tokens_generated);
+    stats_scope.s.decode_wall_ms = decode_boundary_s * 1000.0;
+    stats_scope.s.total_ms = request_wall_ms;
+    stats_scope.s.status = "ok";
     if (request_delta.n_tokens_generated > 0 && decode_boundary_s > 0.0) {
         LOG_INFO("[REQUEST-DECODE-WALL] tokens=%lu wall=%.3fs rate=%.2f tok/s "
                  "(starts immediately after PREFILL-DONE; includes one-time "

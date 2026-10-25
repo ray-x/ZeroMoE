@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "request_stats.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -288,6 +289,7 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
           break;
         freed += got;
       }
+      zeromoe::stats::note("soft_released_gib", static_cast<double>(freed) / (1024.0 * 1024.0 * 1024.0));
       LOG_INFO("[GGML-QWEN-FULL] released %.2f GiB of the soft expert tier before a prefill (S=%d needs ~%.2f GiB, "
                "%.2f GiB was free); the next decode re-uploads only that part\n",
                static_cast<double>(freed) / (1024.0 * 1024.0 * 1024.0), S,
@@ -299,6 +301,8 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
   // Destroy the decode borrower first (it aliases the arena), then the arena itself.
   if (g_graph && g_graph->decode_mode)
     g_graph.reset();
+  if (g_graph_decode_arena_owner)
+    zeromoe::stats::note("arena_released_whole", 1.0);
   if (g_graph_decode_arena_owner) {
     g_graph_decode_arena_owner.reset();
     LOG_INFO("[GGML-QWEN-FULL] released the per-expert split arena before a "
