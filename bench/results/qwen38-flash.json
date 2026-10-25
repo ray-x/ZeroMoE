@@ -42,7 +42,7 @@
   "cuda_toolkit": "13.3"
  },
  "build": {
-  "zeromoe_commit": "1b73df3",
+  "zeromoe_commit": "ca0c144",
   "repo_head": "1b73df3e797b",
   "zeromoe_tree_dirty": null,
   "ggml_commit": "8baabd53b77d",

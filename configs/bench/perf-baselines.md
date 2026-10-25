@@ -116,7 +116,7 @@ Random ids route to random experts, which the hot-expert placement (tuned on rea
 does not favour, so decode is about 41% below the real-text figure above. Report both when comparing with llama.cpp.
 
 Setup: Xeon W-2235 (6 cores / 12 threads, AVX-512 with VNNI, no VBMI), 125 GiB DDR4, RTX 3090 24 GiB on PCIe Gen3 x16 (350 W),
-CachyOS, CUDA 13.3, ggml `8baabd53b` with the patch series, binary from commit `1b73df3`. The RTX 5060 Ti was hidden
+CachyOS, CUDA 13.3, ggml `8baabd53b` with the patch series, binary from commit `ca0c144`. The RTX 5060 Ti was hidden
 (`CUDA_VISIBLE_DEVICES=0`).
 
 *Method change:* the first version of this record (taken before `zeromoe --bench` existed) started a new process per request
