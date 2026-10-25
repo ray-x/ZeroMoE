@@ -1,0 +1,1 @@
+Explain briefly the key concepts of neural networks and gradient descent in plain English.

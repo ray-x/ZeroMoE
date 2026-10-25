@@ -76,6 +76,67 @@ on the CPU, the AVX2-width IQ1_M kernel; BeeLlama's CPU-only number is 30.6). Wi
 reserve is 0.6 GiB + ~2.6 MiB/token (4.7 GiB at 1611 tokens; 44 GiB with the four pipeline copies decode uses).
 Last-row hidden is within relL2 0.19 of the CPU-expert run, same tokens.
 
+## Qwen 3.8 Flash (Q2_0), hybrid recipe, single RTX 3090 (measured 2026-10-26)
+
+The default Qwen recipe: usage-ranked hot experts of all 48 layers in VRAM (`qwen4exp_option_b_global_top_k = 14000` of
+24,576), the rest in pinned host RAM computed by the CPU. `configs/qwen38-flash.toml` plus the four full-graph variables
+in `docs/env-vars.md`, 10 CPU threads (`omp_max_threads=10`, the config default is 12), `context_size=2048`. The 22/26
+layer split (`configs/bench/qwen4exp_tg400_iq1m_22_26.toml`) is only the CPU/GPU comparison recipe against llama.cpp.
+
+The full record, with the hardware, build, model files, config and environment it was taken with, is
+`bench/results/qwen38-flash.json`. Reproduce it with `bench/perf_report.py` (usage in its docstring); render it with
+`bench/perf_report.py render bench/results/qwen38-flash.json`. Each figure is the median of 3 accepted runs on a quiet
+machine (a run counts only if it produced all its tokens and nothing else used the CPU during decode). Decode speed is
+1000 / mean(iter_total ms) over steps >= 3; peak is the best 32-step window; prompts are the fixed files in
+`bench/prompts/`, 200 generated tokens.
+
+| Prompt | Prefill tok/s | Decode avg tok/s (range) | Decode peak tok/s | First-request setup | Second-request setup | Decode incl. setup tok/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 28 tokens | 23.8 (23.3-23.8) | 45.3 (44.4-45.7) | 48.4 | 1.9 s | 0.11 s | 43.7 |
+| 743 tokens | 211.5 (210.1-211.6) | 42.1 (41.7-44.2) | 47.2 | 1.9 s | 0.39 s | 38.6 |
+| 1,707 tokens | 425.4 (424.3-426.3) | 43.8 (42.5-44.3) | 50.2 | 1.9 s | 0.69 s | 37.7 |
+
+Prefill average over the three lengths: 220.2 tok/s (compare models by the per-length numbers; the 28-token prompt takes the
+decode-style path, not the batched prefill).
+
+**Long decode** (28-token prompt, 1,500 generated tokens, 2 runs): average 41.1 tok/s. Per 250 tokens: 42.5 / 40.5 / 45.6 /
+43.6 / 39.6 / 36.4. The two runs generate identical text, so this spread comes from what is generated (which experts it
+routes to) as well as from the growing context; the last 250 tokens are 14% slower than the first. Read it as a spread of
+36-46 tok/s around 41, not as a steady trend.
+
+Setup: Xeon W-2235 (6 cores / 12 threads, AVX-512 with VNNI, no VBMI), 125 GiB DDR4, RTX 3090 24 GiB on PCIe Gen3 x16 (350 W),
+CachyOS, CUDA 13.3, ggml `8baabd53b` with the patch series, binary from commit `b1dd830` (its Qwen source is identical to the
+current `master`). The RTX 5060 Ti was hidden (`CUDA_VISIBLE_DEVICES=0`).
+
+### Soft expert tier and pinned arenas (measured 2026-10-25, 18 accepted runs, 3 per cell, medians)
+
+Per-request cost after a prefill that needs VRAM: the decode graph's expert arena is released and re-uploaded. Pinning the
+host arenas (`ZEROMOE_QWEN_GRAPH_REGISTER`, default on for Qwen) doubles the copy rate (about 10.6 against 4.9 GB/s on this
+PCIe Gen3 box) and the soft tier (`ZEROMOE_QWEN_SOFT_PIN_GIB`, default 6) lets the prefill free only the segments it needs.
+
+| Prompt | Soft tier | Steady decode tok/s (range) | Second decode setup | Decode incl. setup tok/s | Released |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 28 tokens | on | 45.7 (42.2-45.9) | 0.10 s | 44.2 | none, arena kept |
+| 28 tokens | off | 45.5 (42.6-46.0) | 0.10 s | 43.9 | none |
+| 743 tokens | on | 44.3 (40.7-44.5) | **0.39 s** | **37.3** | 2.49 GiB |
+| 743 tokens | off | 44.1 (41.4-44.3) | 2.00 s | 23.2 | whole arena |
+| 1,707 tokens | on | 41.7 (39.7-41.9) | **0.69 s** | **31.9** | 4.86 GiB |
+| 1,707 tokens | off | 41.7 (41.6-41.8) | 2.06 s | 22.2 | whole arena |
+
+Steady decode is a tie within noise and the generated text is byte-identical with the tier on and off, for all three prompts.
+The gain is in the request: 61% (743 tokens) and 44% (1,707 tokens) higher decode rate including setup. The first run of each
+prompt block was 2-4 tok/s slower in both arms (possibly a cold page cache); the medians absorb it.
+Pinned against pageable arenas, short prompt, 3 alternating pairs: steady decode 46.3-46.6 against 46.2-46.6 tok/s; first
+decode setup 1.9 s against 3.8 s.
+
+### Qwen hot-set size and prefill chunking (measured 2026-10-24, before the repository loss; the raw logs were lost and these were not re-run)
+
+- Hot-set size K, steady decode against K=14,554 (28-token prompt, quiet machine): 14,000 -1.8%; 13,500 -5%; 13,000 -7%;
+  12,000 -11%. K=14,554 with pinned arenas leaves 0.98 GiB free after a long prompt, below the decode graph's 1.00 GiB
+  floor, so the benchmark default is K=14,000.
+- Capping the prefill batch to keep the arena resident is not viable: a 1,693-token prompt prefilled at 428 tok/s in one
+  batch and at 125 / 75 / 40 tok/s with chunks of 512 / 256 / 128 tokens, because every batch re-streams the experts.
+
 ## Accepted scope for long-prompt prefill (owner decision, 2026-10-16)
 
 Every chunk of a long prompt runs through the graph for GLM (1152-5117 tokens tested, `context_size = 8192`) and Qwen

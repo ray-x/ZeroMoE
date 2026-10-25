@@ -90,3 +90,8 @@ venv/
 .claude/
 .idea/
 .vscode-cache/
+
+# perf_report.py working files (the .json records are kept)
+bench/results/*.logs/
+bench/results/*.attempts.jsonl
+bench/results/*.runs.jsonl
