@@ -611,7 +611,82 @@ bool init_device_expert_arena(FullGraph &g) {
       }
       return false;
     }
-    const size_t capacity = bytes + tensor_slack + kArenaSlack;
+    size_t capacity = bytes + tensor_slack + kArenaSlack;
+    // Soft tier (ZEROMOE_QWEN_SOFT_PIN_GIB > 0, decode split arenas only): the split tensors of the last layers get
+    // their own ~1 GiB buffers, so a prefill that needs VRAM can free some of them and the next decode build re-uploads
+    // just those instead of the whole arena. The hard buffer shrinks by the same payload; total VRAM is unchanged.
+    for (auto &seg : g.expert_soft)
+      if (seg.buffer)
+        ggml_backend_buffer_free(seg.buffer);
+    g.expert_soft.clear();
+    g.expert_soft_of_layer.clear();
+    g.expert_buft = buft;
+    if (split_active && g.decode_mode && g.engine) {
+      const char *soft_env = std::getenv("ZEROMOE_QWEN_SOFT_PIN_GIB");
+      const double soft_gib = soft_env ? std::atof(soft_env) : 0.0;
+      const size_t soft_target =
+          soft_gib > 0.0 ? static_cast<size_t>(soft_gib * 1024.0 * 1024.0 * 1024.0) : 0;
+      constexpr size_t kSoftSegmentBytes = 1ull << 30;
+      if (soft_target > 0) {
+        std::vector<int> layers;
+        for (const auto &[layer, ids] : g.split_gpu_expert_ids)
+          if (!ids.empty())
+            layers.push_back(layer);
+        std::sort(layers.rbegin(), layers.rend());
+        size_t soft_payload = 0, current = 0;
+        FullGraph::ExpertSoftSegment seg;
+        for (int layer : layers) {
+          if (soft_payload >= soft_target)
+            break;
+          const size_t per_expert = g.engine->compute_expert_slab_bytes(layer);
+          const size_t layer_payload =
+              per_expert * g.split_gpu_expert_ids[layer].size() + 3 * kAlignment;
+          seg.layers.push_back(layer);
+          current += layer_payload;
+          soft_payload += layer_payload;
+          if (current >= kSoftSegmentBytes) {
+            seg.capacity = current + kArenaSlack;
+            g.expert_soft.push_back(std::move(seg));
+            seg = FullGraph::ExpertSoftSegment{};
+            current = 0;
+          }
+        }
+        if (!seg.layers.empty()) {
+          seg.capacity = current + kArenaSlack;
+          g.expert_soft.push_back(std::move(seg));
+        }
+        bool soft_ok = soft_payload < capacity;
+        for (size_t i = 0; soft_ok && i < g.expert_soft.size(); ++i) {
+          auto &sg = g.expert_soft[i];
+          sg.buffer = ggml_backend_buft_alloc_buffer(buft, sg.capacity);
+          if (!sg.buffer) {
+            soft_ok = false;
+            break;
+          }
+          ggml_backend_buffer_set_usage(sg.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+          sg.base = ggml_backend_buffer_get_base(sg.buffer);
+          sg.used = 0;
+        }
+        if (!soft_ok) {
+          LOG_WARN("[GGML-QWEN-FULL] soft expert tier of %.2f GiB could not be allocated; "
+                   "using one arena\n", static_cast<double>(soft_payload) / (1024.0 * 1024.0 * 1024.0));
+          for (auto &sg : g.expert_soft)
+            if (sg.buffer)
+              ggml_backend_buffer_free(sg.buffer);
+          g.expert_soft.clear();
+        } else {
+          for (size_t i = 0; i < g.expert_soft.size(); ++i)
+            for (int layer : g.expert_soft[i].layers)
+              g.expert_soft_of_layer[layer] = static_cast<int>(i);
+          capacity -= soft_payload;
+          LOG_INFO("[GGML-QWEN-FULL] soft expert tier: %zu segment(s), %.2f GiB (layers %d down to %d); hard arena %.2f GiB\n",
+                   g.expert_soft.size(), static_cast<double>(soft_payload) / (1024.0 * 1024.0 * 1024.0),
+                   g.expert_soft.front().layers.front(),
+                   g.expert_soft.back().layers.back(),
+                   static_cast<double>(capacity) / (1024.0 * 1024.0 * 1024.0));
+        }
+      }
+    }
     g.expert.buffer = ggml_backend_buft_alloc_buffer(buft, capacity);
     if (g.expert.buffer)
       {

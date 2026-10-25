@@ -206,6 +206,11 @@ std::unique_ptr<FullGraph> extract_decode_arena_owner(
   owner->expert.capacity = g.expert.capacity;
   owner->expert.used = g.expert.used;
   owner->expert_addrs = std::move(g.expert_addrs);
+  owner->expert_soft = std::move(g.expert_soft);
+  owner->expert_soft_of_layer = std::move(g.expert_soft_of_layer);
+  owner->expert_buft = g.expert_buft;
+  g.expert_soft.clear();
+  g.expert_soft_of_layer.clear();
   owner->split_gpu_expert_ids = g.split_gpu_expert_ids;
   owner->device_expert_layers = g.device_expert_layers;
   owner->device_expert_trailing = g.device_expert_trailing;
@@ -251,8 +256,42 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
     }
     return;
   }
-  // The prefill needs the space: destroy the decode borrower first (it aliases
-  // the arena), then the arena itself.
+  // The prefill needs the space. With a soft tier, free only as many soft segments as it takes (the next decode build
+  // then re-uploads just those); otherwise destroy the arena.
+  FullGraph *soft_owner = g_graph_decode_arena_owner.get();
+  if (!soft_owner && live_owned && !g_graph->expert_soft.empty())
+    soft_owner = g_graph.get();
+  if (soft_owner && !soft_owner->expert_soft.empty() &&
+      free_bytes + live_credit + expert_soft_bytes_allocated(*soft_owner) >= need) {
+    if (!g_graph_decode_arena_owner && live_owned) {
+      auto owner = extract_decode_arena_owner(*g_graph, engine);
+      g_graph.reset(); // borrower-free: owns no arena any more
+      if (owner)
+        g_graph_decode_arena_owner = std::move(owner);
+    } else if (g_graph && g_graph->decode_mode) {
+      g_graph.reset(); // the decode borrower aliases the arena
+    }
+    if (g_graph_decode_arena_owner) {
+      size_t freed = 0;
+      for (int guard = 0; guard < 64; ++guard) {
+        size_t now_free = 0, now_total = 0;
+        cudaMemGetInfo(&now_free, &now_total);
+        if (now_free >= need)
+          break;
+        const size_t got = release_expert_soft_segments(*g_graph_decode_arena_owner, need - now_free);
+        if (got == 0)
+          break;
+        freed += got;
+      }
+      LOG_INFO("[GGML-QWEN-FULL] released %.2f GiB of the soft expert tier before a prefill (S=%d needs ~%.2f GiB, "
+               "%.2f GiB was free); the next decode re-uploads only that part\n",
+               static_cast<double>(freed) / (1024.0 * 1024.0 * 1024.0), S,
+               static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0),
+               static_cast<double>(free_bytes) / (1024.0 * 1024.0 * 1024.0));
+      return;
+    }
+  }
+  // Destroy the decode borrower first (it aliases the arena), then the arena itself.
   if (g_graph && g_graph->decode_mode)
     g_graph.reset();
   if (g_graph_decode_arena_owner) {

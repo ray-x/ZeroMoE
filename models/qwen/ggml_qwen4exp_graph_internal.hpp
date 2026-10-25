@@ -157,6 +157,11 @@ bool graph_expert_projection_resident(const FullGraph &g, int layer, const char 
 bool init_device_expert_arena(FullGraph &g);
 std::string expert_ptr_text(const void *ptr);
 FullGraph *expert_arena_owner(FullGraph &g);
+// Soft tier of the per-expert split arena: the last layers' split tensors live in their own buffers so that a prefill
+// that needs VRAM can free just those (release_expert_soft_segments) and the next decode build re-uploads only them.
+ggml_backend_buffer_t expert_buffer_for_addr(FullGraph &owner, const void *addr);
+size_t release_expert_soft_segments(FullGraph &owner, size_t want_bytes);
+size_t expert_soft_bytes_allocated(const FullGraph &owner);
 std::string device_expert_single_key(const void *host, size_t bytes, const std::string &source_tag);
 void *alloc_registered_host(FullGraph &g, size_t bytes);
 void plan_expert_vram_split(FullGraph &g);
@@ -593,6 +598,20 @@ struct FullGraph : zeromoe::graph::GraphCore {
   // or compact gate/up tensor depending on the graph path.
   FullGraph *expert_source_graph = nullptr;
   std::unordered_map<std::string, void *> expert_addrs;
+  // Soft tier (owner graph only; empty = the whole split arena is one buffer, `expert`). A segment's buffer is null while
+  // released. Layers map to a segment through expert_soft_of_layer; expert_alloc_layer names the layer whose split tensors
+  // are being bound (set by expert_weight_split) so bind_or_allocate_expert picks the right segment.
+  struct ExpertSoftSegment {
+    ggml_backend_buffer_t buffer = nullptr;
+    void *base = nullptr;
+    size_t capacity = 0;
+    size_t used = 0;
+    std::vector<int> layers;
+  };
+  std::vector<ExpertSoftSegment> expert_soft;
+  std::unordered_map<int, int> expert_soft_of_layer;
+  ggml_backend_buffer_type_t expert_buft = nullptr;
+  int expert_alloc_layer = -1;
   // Layer-13 staging proof. The graph keeps fixed compact GPU tensors; each
   // decode token refreshes one or more cold expert records from the
   // active-layer pool before graph replay.
@@ -896,6 +915,14 @@ struct FullGraph : zeromoe::graph::GraphCore {
     if (expert.buffer && !expert_source_graph) {
       ggml_backend_buffer_free(expert.buffer);
     }
+    if (!expert_source_graph) {
+      for (auto &seg : expert_soft)
+        if (seg.buffer)
+          ggml_backend_buffer_free(seg.buffer);
+    }
+    expert_soft.clear();
+    expert_soft_of_layer.clear();
+    expert_buft = nullptr;
     expert.buffer = nullptr;
     expert.base = nullptr;
     expert.capacity = 0;
