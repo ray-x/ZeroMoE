@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Build the ZeroMoE-patched ggml from source into a self-contained directory. Rules and the reason for
+# every step: docs/build-ggml.md.
+#
+#   scripts/build_ggml.sh <out-dir>
+#
+# Produces <out-dir>/ggml-src/ggml    the patched ggml sources (headers ZeroMoE compiles against)
+#          <out-dir>/ggml-build       libggml*.so (src/lib*.so, src/ggml-cuda/libggml-cuda.so)
+#
+# Environment:
+#   GGML_REPO     git repo holding upstream llama.cpp   (default /home/ray/Projects/llama.cpp)
+#   GGML_COMMIT   upstream commit to build              (default 8baabd53b, ggml 0.27.0)
+#   CUDA_ARCH     default 86. Native SASS for sm_86 plus embedded PTX, which is what lets the sm_120
+#                 GPU JIT the kernels; a build without PTX fails on that GPU with "no kernel image".
+#   EXTRA_PATCH_DIRS  more patch directories to apply after the series, space separated
+set -euo pipefail
+cd "$(dirname "$0")/.."
+ROOT=$PWD
+OUT=$(realpath -m "${1:?usage: build_ggml.sh <out-dir>}")
+GGML_REPO=${GGML_REPO:-/home/ray/Projects/llama.cpp}
+GGML_COMMIT=${GGML_COMMIT:-8baabd53b}
+CUDA_ARCH=${CUDA_ARCH:-86}
+SRC=$OUT/ggml-src
+
+if [[ -e $SRC ]]; then echo "$SRC exists; remove it first (the patches are applied once)"; exit 1; fi
+mkdir -p "$SRC"
+git -C "$GGML_REPO" archive "$GGML_COMMIT" ggml | tar -x -C "$SRC"
+echo "ggml source: $GGML_REPO @ $GGML_COMMIT" > "$OUT/ggml-src.txt"
+
+# The series (patches/ggml, then patches/ggml-host-node) is written for the upstream commit above. GNU patch
+# applies it with fuzz 0: hunks may move (offset) but their context must match exactly, so a hunk that
+# no longer fits fails the build instead of landing in the wrong function. (Not `git apply`: inside a
+# checkout of another repository, which this script's output directory may be, it silently skips files
+# outside the current directory.) Patches for an older upstream live in patches/obsolete and are never applied.
+apply_dir() {
+  local dir=$1
+  for p in $(ls "$ROOT/$dir"/0*.patch 2>/dev/null | sort); do
+    local n; n=$(basename "$p")
+    if (cd "$SRC/ggml" && patch -p1 -F0 --dry-run -s < "$p" >/dev/null 2>&1); then
+      (cd "$SRC/ggml" && patch -p1 -F0 --no-backup-if-mismatch -s < "$p") && echo "applied $dir/$n"
+    else
+      echo "FAILED  $dir/$n does not apply to $GGML_COMMIT"; exit 1
+    fi
+  done
+}
+apply_dir patches/ggml
+apply_dir patches/ggml-host-node
+for d in ${EXTRA_PATCH_DIRS:-}; do apply_dir "$d"; done
+
+# Guard against a silent no-op: the series must have left its marks.
+grep -q zeromoe_mmid_negative_skip "$SRC/ggml/src/ggml-cuda/mmvq.cu" || { echo "patches were not applied"; exit 1; }
+grep -q zeromoe_ggml_backend_cuda_get_stream "$SRC/ggml/src/ggml-cuda/ggml-cuda.cu" || { echo "bridge patch missing"; exit 1; }
+
+# ggml's CMakeLists configures ggml.pc.in, which a plain `git archive` of llama.cpp's ggml/ does not contain.
+[[ -f $SRC/ggml/ggml.pc.in ]] || printf 'Name: ggml\nDescription: ggml\nVersion: @GGML_VERSION@\n' > "$SRC/ggml/ggml.pc.in"
+
+cmake -S "$SRC/ggml" -B "$OUT/ggml-build" \
+  -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+  -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_OPENMP=ON \
+  -DCMAKE_CUDA_ARCHITECTURES="$CUDA_ARCH" -DCMAKE_CUDA_COMPILER=/opt/cuda/bin/nvcc \
+  -DGGML_BUILD_TESTS=OFF -DGGML_BUILD_EXAMPLES=OFF
+cmake --build "$OUT/ggml-build" -j"$(nproc)"
+
+echo "ggml built: $OUT/ggml-build"
+echo "PTX images in libggml-cuda: $(cuobjdump --list-ptx "$OUT/ggml-build/src/ggml-cuda/libggml-cuda.so" 2>/dev/null | grep -c 'PTX file')"
