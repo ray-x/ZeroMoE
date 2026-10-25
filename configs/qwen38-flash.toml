@@ -1,0 +1,117 @@
+# Qwen 3.8 Flash starter profile: Q2_0 global expert hotset, single 3090.
+# The benchmark-specific profile and measured results are in configs/bench/.
+#
+# Same as qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml except that the hot set is
+# chosen from the pool of ALL layers' experts instead of 256 per layer in 44 layers:
+#   * all 48 layers are split layers (no plain-CPU layers), each keeps >= 1 hot expert
+#   * the top 14,000 experts of the survey ranking are VRAM-resident:
+#     experts the right-sized 0/44/4 config commits (10.84 GiB), so VRAM is equal; concentrated
+#     layers get more hot experts, flat layers fewer (survey: 132-246 per layer before)
+#   * qwen4exp_option_b_min_coverage / right_size_top_n are ignored in this mode
+# See include/option_b_global_hot.hpp. Survey-expected hit rate at equal VRAM: 73.4% -> 76.3%.
+# The card has ~3.7 GiB more free: K = 11264 (14.5 GiB) gives an expected 86.0%.
+# This is a hardware-tuned starting point, not a universal VRAM budget.
+# See configs/bench/perf-baselines.md for measured conditions and alternatives.
+#
+# REQUIRES these env vars at launch (device_expert_layers has no TOML key --
+# it is env-var only):
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+#
+# Requested device_expert_layers=0; all 48 layers receive static hot/cold
+# splits (0/48/0), including layers 0,1,2,22 that remain CPU in config A.
+# Configure model_path and use a matching supported ggml build.
+model_path = "/path/to/model-or-shard-directory"
+
+cpu_affinity_layers = []
+log_path = "logs/qwen4exp_q2_0_option_b_global_topk48.log"
+log_level = "INFO"
+
+context_size = 2048
+max_new_tokens = 40
+temperature = 0.0
+top_p = 0.95
+raw_prompt = false
+enable_thinking = false
+
+direct_io = false
+io_uring = false
+drop_pages = true
+
+host_ram_gb = 90
+ram_preload_all_experts = true
+ram_pinned_budget_gb = 45.0
+pinned_vram_capacity = 128
+expert_fetch_threads = 10
+omp_max_threads = 12
+prefetch_worker_threads = 4
+
+pin_file           = "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
+prefill_pin_file   = "tests/moe_usage_survey/zeromoe_usage_survey_prefill"
+freeze_usage_stats = true
+
+qwen4exp_option_b_layer = -1
+qwen4exp_option_b_selected_layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
+qwen4exp_option_b_top_n = 512          # per-layer ceiling only in global-pool mode (512 = no ceiling)
+qwen4exp_option_b_min_coverage = 0.80
+qwen4exp_option_b_right_size_top_n = false
+qwen4exp_option_b_stage_expert = -1
+qwen4exp_option_b_stage_count = 1
+# Global pool: rank every (layer, expert) of the 48 selected layers together and keep the
+# top K of the pool, spent where the survey says the traffic is.
+qwen4exp_option_b_global_top_k = 14000
+qwen4exp_option_b_global_floor_per_layer = 1
+
+qwen4exp_full_graph = true
+qwen4exp_full_graph_decode = true
+qwen4exp_cpu_gpu_overlap = true
+qwen4exp_cpu_gpu_overlap_max_layers = 0
+
+qwen4exp_decode_device_hc = true
+qwen4exp_decode_gpu_router = false
+qwen4exp_decode_ggml_moe = true
+qwen4exp_cpu_ggml_moe = true
+qwen4exp_cpu_strided_grouped = true
+qwen4exp_cpu_fused_grouped = true
+moe_ggml_mul_mat_id = true
+moe_ggml_shared_expert = true
+moe_ggml_planar_copies = true
+moe_ggml_gpu_router = true
+moe_ggml_device = 0
+qwen4exp_cpu_shared_device = true
+hc_ggml = true
+gdn_full_ggml = true
+gdn_proj_ggml = true
+qwen4exp_attn_gpu = true
+qwen4exp_gdn_gpu = true
+qwen4exp_gdn_conv_gpu = true
+dense_bf16_prefill_gemm = true
+dense_bf16_kquant = true
+moe_gpu_accum = true
+expert_gpu_activation = true
+
+use_active_layer_area = true
+active_layer_capacity = 10
+decode_async_prewarm = false
+prefetch_pilot_depth = 1
+prefetch_pilot_k = 10
+pin_vram_lru_fraction = 0.1
+pin_ram_fraction = 0.9
+
+qwen4exp_gpu_stage_enabled = false
+qwen4exp_gpu_stage_layers = []
+qwen4exp_track_router_usage = false
+
+qwen4exp_cpu_offload = false
+qwen4exp_cpu_offload_layers = []
+
+[[gpus]]
+device_id = 0
+name = "RTX 3090"
+role = "dense+moe"
+dense_gb = 4.1
+kv_cache_gb = 2.0
+moe_cache_gb = 11.5
+kv_bits = 4

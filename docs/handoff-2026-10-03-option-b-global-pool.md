@@ -23,7 +23,7 @@ Last commit of mine: `b5e97c9` (host-node GPU weighted reduce). Uncommitted, **m
 | `src/main.cpp` | startup Option-B pass uses the helper in global mode (hot masks, committed layers, coverage); VRAM estimate uses it too |
 | `src/ggml_qwen4exp_graph.cpp` | `plan_expert_vram_split` Option-B branch uses the helper; coverage gate, right-sizing and fill_vram are skipped in global mode |
 | `tests/test_components.cpp` | `test_option_b_global_pool` (passes: `make test-components ARGS="option_b_global_pool"`) |
-| `configs/qwen4exp_q2_0_option_b_global_topk48.toml` (new) | all 48 layers selected, `top_n=512` (per-layer ceiling = none), `global_top_k=8421` |
+| `configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml` (new) | all 48 layers selected, `top_n=512` (per-layer ceiling = none), `global_top_k=8421` |
 | `bench/option_b_global_pool_ab.sh` (new) | 4-way A/B (see section 3) |
 
 Other modified files in `git status` (bench/*, other configs, safetensors_adapter, tools/*, glm5next, batched_dispatch) are **not mine**: do not

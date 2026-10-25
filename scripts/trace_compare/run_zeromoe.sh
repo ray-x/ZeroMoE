@@ -13,7 +13,7 @@
 # appear in the output, check the config isn't pinning log_level below VERBOSE.
 set -euo pipefail
 
-CONFIG="${ZEROMOE_CONFIG:-configs/glm52_dual.toml}"   # <-- the GLM-5.2 config you run with
+CONFIG="${ZEROMOE_CONFIG:-configs/testing/glm52_dual.toml}"   # <-- the GLM-5.2 config you run with
 BINARY="${ZEROMOE_BIN:-./build/zeromoe}"
 PROMPT="${1:-Hello}"
 OUT="${2:-ms_trace.log}"

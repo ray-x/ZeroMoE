@@ -1,0 +1,34 @@
+# Ling 3.1 Flash starter profile for short parity/smoke runs, not throughput
+# benchmarking. See configs/bench/ and docs/models/ling31-flash.md for the
+# validated performance recipe and its runtime settings.
+model_path = "/path/to/model-or-shard-directory"
+context_size = 64
+max_new_tokens = 2
+temperature = 0.0
+top_p = 1.0
+host_ram_gb = 32.0
+# One slot per MoE layer keeps the legacy expert cache small; the full graph
+# has its own 8 GiB offload cache for routed experts.
+ram_cache_total_experts = 68
+ram_pinned_budget_gb = 4.0
+ram_preload_all_experts = false
+freeze_usage_stats = true
+pin_file = "ling-fullgraph-unused.pin"
+prefill_pin_file = "ling-fullgraph-unused-prefill.pin"
+pin_threshold = 0
+expert_fetch_threads = 2
+prefetch_worker_threads = 2
+omp_max_threads = 8
+drop_pages = true
+io_uring = false
+active_layer_capacity = 16
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+kv_cache_gb = 0.5
+kv_bits = 4
+dense_gb = 12.0
+moe_cache_gb = 1.5

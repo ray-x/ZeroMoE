@@ -1,7 +1,7 @@
 # Qwen4Exp: early-ready (no conditional nodes) vs staged Phase-2 (conditional composition), 2026-10-09
 
 Harness `bench/option_b_early_ready_check.py`, binary `build_acc/zeromoe` (accepted ggml), config
-`configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml` (Q2_0, 8,421 resident experts), 64 tokens, 10 threads, six
+`configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml` (Q2_0, 8,421 resident experts), 64 tokens, 10 threads, six
 order-balanced pairs, no dumps. Baseline = early-ready + resident tables + async output (no conditional nodes). Candidate =
 staged GPU child + storage service + completion graph + master graph (conditional node at layer 13, `PARTIAL_LAYER_PHASE2=1`).
 

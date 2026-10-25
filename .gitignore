@@ -7,6 +7,21 @@ build_*/
 /.exl3-runtime/
 tests/bench_outproj
 
+# Keep the published starter profiles and generic templates in Git. Other
+# root-level profiles remain local; benchmark profiles live under configs/bench.
+/configs/*.toml
+/configs/obsolete/
+/configs/testing/
+!/configs/qwen38-flash.toml
+!/configs/glm53-flash.toml
+!/configs/ling31-flash.toml
+!/configs/deepseek41-flash.toml
+!/configs/glm53-dsa.toml
+!/configs/mimo26-flash.toml
+!/configs/single_gpu.toml
+!/configs/dual_gpu.toml
+!/configs/triple_gpu.toml
+
 # Local benchmark profiles are generated per prompt/run. Keep the committed
 # reference inputs explicit; everything else stays on the host.
 /bench/ling/reference-audit/usage-*.pin

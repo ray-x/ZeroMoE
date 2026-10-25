@@ -1,8 +1,0 @@
-model_path = "/path/to/model-or-shard-directory"
-model_format = "exl3"
-model_load_only = true
-
-log_path = ""
-log_level = "INFO"
-context_size = 256
-max_new_tokens = 0

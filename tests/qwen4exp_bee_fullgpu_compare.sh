@@ -5,7 +5,7 @@ cd "$(dirname "$0")/.."
 engine="${1:-./build/zeromoe}"
 bee="${2:-logs/qwen4exp_perf_gap/bee_forced/llama-bench}"
 output_dir="${3:-logs/qwen4exp_bee_fullgpu_compare}"
-config=configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
+config=configs/testing/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
 model=/data/sda/models/qwen3.8-flash-next/GSQ-RCO-IQ2_XS_RCO50/Qwen3.8-Flash-Next-GSQ-RCO-IQ2_XS-RCO50-IQ1M-boundary-00001-of-00002.gguf
 prompt_tokens="$PWD/tests/qwen4exp_state_handoff_prompt_tokens.txt"
 bee_libraries="$PWD/build-bee-instrumented/bin"

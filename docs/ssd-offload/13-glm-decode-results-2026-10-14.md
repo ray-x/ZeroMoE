@@ -365,7 +365,7 @@ come from the dense KV cache as a host input concatenated before the batch's own
 `pos_base`, and the PLE n-gram window continues from the previous batch. A 1611-token prompt in 512/800/1024 batches gives
 the same tokens as one graph, last-row hidden within relL2 0.16-0.27 of it and of each other (the shape-to-shape noise level;
 the unfixed transposition gave ~1.0). A 3989-token prompt (config with `context_size = 8192`) runs as 1448 + 1448 + 1093:
-65.8 s (61 tok/s), decode works. `configs/qwen4exp_3090_only.toml` has `context_size = 2048`.
+65.8 s (61 tok/s), decode works. `configs/testing/qwen4exp_3090_only.toml` has `context_size = 2048`.
 
 **Not done.** A non-graph prefill for the case where even the smallest graph batch cannot be built: with the graph-only
 expert placement the layered MoE path finds no staged expert blocks (`no RAM block`, tokens dropped), so it is not enabled;
@@ -407,4 +407,4 @@ and agree on 11 of the first 12 tokens.
 The 61 tok/s Qwen prefill was `ggml_backend_sched_new(..., op_offload=false)`: cold experts on the CPU. BeeLlama on the same
 model and card gets 200-257 tok/s with op-offload on and 30.6 with it off. Turning it on with one scheduler copy needs a
 4.7 GiB reserve at 1611 tokens (the 40+ GiB seen earlier was four pipeline copies). Result: 333 / 1611 / 2033 / 3989 tokens
-at 102 / 312 / 355 / 507 tok/s, same tokens. Full numbers and configs in `docs/perf-baselines.md`.
+at 102 / 312 / 355 / 507 tok/s, same tokens. Full numbers and configs in `configs/bench/perf-baselines.md`.

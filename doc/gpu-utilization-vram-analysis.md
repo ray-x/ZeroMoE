@@ -1,6 +1,6 @@
 # GPU utilization / VRAM analysis: RTX 3090 (ExpertVault) vs RTX 5060 Ti (CoreEngine)
 
-Investigation date: 2026-08-16. Config under test: `configs/glm52_3090_5060_sdd2.toml` (GLM-5.2,
+Investigation date: 2026-08-16. Config under test: `configs/obsolete/glm52_3090_5060_sdd2.toml` (GLM-5.2,
 `UD-IQ2_M_align`). Observed symptom: GPU 0 (3090) runs noticeably busier than GPU 1 (5060 Ti)
 during generation (~45% vs ~20% utilization by casual `nvidia-smi` observation).
 

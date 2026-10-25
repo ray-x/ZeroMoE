@@ -31,7 +31,8 @@ ZeroMoE/
 ├── tools/                         # GGUF tools
 ├── tests/                         # Native and CPU component tests
 ├── bench/                         # Benchmark scripts and fixtures
-├── configs/                       # TOML runtime profiles
+├── configs/                       # One portable starter profile per supported model
+│   └── bench/                     # Benchmark-only profiles and published measurements
 ├── scripts/                       # Build and validation helpers
 ├── patches/                       # ggml patch series
 ├── docs/                          # Design notes and model recipes
@@ -68,6 +69,11 @@ Before inference, edit a profile's `model_path` and any related model,
 mirror, expert-store, or usage-profile paths for resources available on your
 machine. Model weights are not included; example profiles use placeholders.
 Keep model files and generated stores outside the repository.
+
+The top-level `configs/` directory contains one starter profile per supported
+model. Benchmark-specific profiles and the consolidated performance report
+are in [`configs/bench/`](configs/bench/README.md). Additional local tuning
+profiles may remain in `configs/` on your machine; they are ignored by Git.
 
 ### macOS / CPU-only build
 
@@ -129,9 +135,13 @@ build. Commands, scope and retained experiments are in
 
 ### Qwen EXL3 safetensors decode
 
+EXL3 is experimental and its example TOML profiles are maintainer-local files
+under the ignored `configs/testing/` directory; they are not included in the
+public repository. Supply your own EXL3 profile to run these examples.
+
 To reuse ExLlamaV3's **complete optimized execution backend**, including its
 GPU attention/cache/decode and AVX-512/VNNI CPU expert worker, use
-`configs/qwen4exp_exllamav3_26_22.toml`. Setup, metadata requirements, and
+`configs/testing/qwen4exp_exllamav3_26_22.toml`. Setup, metadata requirements, and
 same-split benchmarking are documented in [docs/exllamav3-backend.md](docs/exllamav3-backend.md).
 The native EXL3 path described below remains available as the default.
 
@@ -146,15 +156,15 @@ This checkpoint directory has no HF `config.json`, so the provided profile uses
 Qwen GGUF. Its GGUF weight payloads are not used for EXL3 inference.
 
 ```bash
-./build_ggmlcuda/zeromoe --config configs/qwen4exp_exl3_decode.toml \
+./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exl3_decode.toml \
     --prompt "Hello" --ngen 8
 ```
 
-`configs/qwen4exp_exl3_load.toml` retains the catalog/payload smoke mode.
-For GPU projections, use a CUDA build and `configs/qwen4exp_exl3_gpu.toml`:
+`configs/testing/qwen4exp_exl3_load.toml` retains the catalog/payload smoke mode.
+For GPU projections, use a CUDA build and `configs/testing/qwen4exp_exl3_gpu.toml`:
 
 ```bash
-./build_ggmlcuda/zeromoe --config configs/qwen4exp_exl3_gpu.toml \
+./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exl3_gpu.toml \
     --prompt "Hello" --ngen 8
 ```
 
@@ -222,7 +232,7 @@ HyperConnection down/up/injection weights:
 the low-rank SiLU activation, sigmoid gate and stream mixing stay on the GPU.
 The block and output-head paths retain their respective division orders.
 `hc_mixes` in the GPU statistics confirms that this path is selected.
-The default is false. `configs/qwen4exp_exl3_gpu_hc_experiment.toml` enables
+The default is false. `configs/testing/qwen4exp_exl3_gpu_hc_experiment.toml` enables
 the chain with the same 26/22 expert split. A 128-token checkpoint run used
 the chain but first diverged from the previous greedy token sequence at
 step 37; model-level accuracy assessment remains required before enabling
@@ -519,7 +529,7 @@ bench/regression_gate.sh <binary> --models qwen38,glm53flash,ling31,dsv41,glm53 
 ### 5. Recording the result
 
 Put the oracle comparison (prompt, steps, cosine range, first divergence) and the gate numbers in
-`docs/models/<model>.md`, and update `docs/perf-baselines.md` when a number improves or a band moves.
+`docs/models/<model>.md`, and update `configs/bench/perf-baselines.md` when a number improves or a band moves.
 
 ## License
 

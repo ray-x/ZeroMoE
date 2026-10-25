@@ -13,7 +13,7 @@ from compare_decode_logits import compare
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = os.environ.get("ZEROMOE_EXL3_MODEL")
-DEFAULT_CONFIG = ROOT / "configs/qwen4exp_iq1m_fullgraph_22_26.toml"
+DEFAULT_CONFIG = ROOT / "configs/testing/qwen4exp_iq1m_fullgraph_22_26.toml"
 
 
 def require_idle(min_ram_gib):

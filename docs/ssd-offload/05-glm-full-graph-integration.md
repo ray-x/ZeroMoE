@@ -40,7 +40,7 @@ Knobs: `..._OFFLOAD_DDR_GIB` (expert DDR budget, default 40), `..._OFFLOAD_PINNE
 
 ## Update: no whole-layer VRAM, spread hot experts + DDR/SSD for every layer (10 tok/s)
 
-Config `configs/glm53flash_AJ_IQ2XXS_spread_offload.toml` (no `cpu_affinity_layers`, `vram_preload_prefix_layers = 0`,
+Config `configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml` (no `cpu_affinity_layers`, `vram_preload_prefix_layers = 0`,
 `host_ram_gb = 16`), launcher `docs/ssd-offload/run_spread_offload.sh`. Every MoE layer (3..44) is offloaded
 (`OFFLOAD_FIRST_LAYER=3`); VRAM holds each layer's hottest experts instead of whole layers.
 

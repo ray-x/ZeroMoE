@@ -22,7 +22,7 @@ DeepSeek-V4, ...) still use the shared layered machinery; do not delete it for t
 
 ## 3. Findings
 
-**F1. The legacy VRAM expert cache was 6.44 GiB of dead VRAM.** Config A (`configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml`) had
+**F1. The legacy VRAM expert cache was 6.44 GiB of dead VRAM.** Config A (`configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml`) had
 `moe_cache_gb = 11.5` (inherited from the older non-graph config); the engine capped it to the leftover VRAM, a 4,650-slot "compact expert VRAM
 cache" (6.43796 GB; configured as a pinned-by-ranking tier plus an LRU part, `pin_vram_lru_fraction = 0.1`: the exact slot split was not checked in the code). Engine logs of that run: `[PIN] Preloaded 0 VRAM-pinned + 0
 VRAM-unpinned`, `[VRAM-SLOTS] 0 / 4650 slots filled` after prefill and at shutdown, `Expert cache: 0 hit / 0 miss`. The only reference to it

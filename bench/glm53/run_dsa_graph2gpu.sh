@@ -15,7 +15,7 @@ export ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=$
 export ZEROMOE_GLM5NEXT_OFFLOAD_STORE=$GLM_STORE
 export ZEROMOE_GLM5NEXT_OFFLOAD_MODEL=$GLM_MODEL
 export ZEROMOE_GLM5NEXT_GRAPH_STRICT=1
-config=${TOML:-bench/glm53/glm53_dsa_core5060_retarget.toml}
+config=${TOML:-configs/bench/glm53/glm53_dsa_core5060_retarget.toml}
 run_config=$(mktemp "${TMPDIR:-/tmp}/zeromoe-glm53.XXXXXX.toml")
 trap 'rm -f "$run_config"' EXIT
 python3 - "$config" "$run_config" "$GLM_MODEL" <<'PY'

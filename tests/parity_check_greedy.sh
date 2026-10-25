@@ -23,7 +23,7 @@ set -euo pipefail
 MODEL="${PARITY_MODEL:?set PARITY_MODEL to the gguf dir/file}"
 LLAMA_CLI="${LLAMA_CLI_CLI:-./llama-cli}"        # TODO: path to llama.cpp's llama-cli
 ZEROMOE="./build/zeromoe"                     # TODO: path to ZeroMoE binary
-CONFIG="${PARITY_CONFIG:-configs/glm52_dual.toml}"
+CONFIG="${PARITY_CONFIG:-configs/testing/glm52_dual.toml}"
 PROMPT="${PROMPT:-Hello, who are you?}"
 N="${N:-64}"                                       # tokens to generate
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT

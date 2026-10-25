@@ -9,7 +9,7 @@ root=$(cd "$(dirname "$0")/.." && pwd); out=$root/logs/perf; mkdir -p "$out"
 MODEL=${GLM_MODEL:?set GLM_MODEL to the model file or first shard}
 STORE=${GLM_STORE:?set GLM_STORE to the expert-store file}
 USAGE=${GLM_USAGE:-$root/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt}
-TOML_SRC=${GLM_TOML:-$root/configs/glm53flash_AJ_IQ2XXS_spread_offload.toml}
+TOML_SRC=${GLM_TOML:-$root/configs/testing/glm53flash_AJ_IQ2XXS_spread_offload.toml}
 PROMPT=${PROMPT:-'Explain how a mixture-of-experts transformer routes tokens, in a few clear paragraphs.'}
 while [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; do sleep 5; done
 if [ "${NO_DROP:-0}" != 1 ]; then python3 -c '

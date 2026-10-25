@@ -11,5 +11,5 @@ new=$root/docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt
 tok=$root/logs/perf/${tag}.tokens
 PROMPT="$P" GLM_TOML=$root/logs/perf/dual_final.toml NGEN=64 bench/glm_decode_profile.sh "$bin" ${tag}_gen "${common[@]}" ZEROMOE_GENERATED_TOKEN_FILE=$tok > /dev/null 2>&1
 PROMPT="$P" GLM_TOML=$root/logs/perf/dual_final.toml NGEN=64 bench/glm_decode_profile.sh "$bin" ${tag}_old "${common[@]}" ZEROMOE_TEACHER_FORCE_TOKEN_FILE=$tok > /dev/null 2>&1
-PROMPT="$P" GLM_TOML=$root/bench/glm_dual_ranking40.toml GLM_USAGE=$new NGEN=64 bench/glm_decode_profile.sh "$bin" ${tag}_new "${common[@]}" ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE=$new ZEROMOE_TEACHER_FORCE_TOKEN_FILE=$tok > /dev/null 2>&1
+PROMPT="$P" GLM_TOML=$root/configs/testing/glm_dual_ranking40.toml GLM_USAGE=$new NGEN=64 bench/glm_decode_profile.sh "$bin" ${tag}_new "${common[@]}" ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE=$new ZEROMOE_TEACHER_FORCE_TOKEN_FILE=$tok > /dev/null 2>&1
 touch logs/perf/${tag}.done

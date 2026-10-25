@@ -63,13 +63,13 @@ def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=No
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZEROMOE_")}
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
     if model == "mimo":
-        text = (ROOT / "configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml").read_text()
+        text = (ROOT / "configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml").read_text()
         profile = ROOT / "bench/profiles/mimo26_combined.usage"
         env.update(ZEROMOE_DISABLE_ROUTER_BF16="1", ZEROMOE_MIMO2_OFFLOAD_DDR_GIB="100",
                    ZEROMOE_MIMO2_OFFLOAD_USAGE=str(profile), ZEROMOE_MIMO2_PREFILL_CHUNK="512")
         cap = 110
     else:
-        text = (ROOT / "bench/ling/reference-audit/config.toml").read_text()
+        text = (ROOT / "configs/bench/ling/reference-audit/config.toml").read_text()
         profile = ROOT / "bench/ling/reference-audit/usage-hi-there-robust4.pin"
         text = re.sub(r"^pinned_vram_capacity = .*", "pinned_vram_capacity = 3700", text, flags=re.M)
         env.update(ZEROMOE_LING_FULL_GRAPH="1", ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL="1",

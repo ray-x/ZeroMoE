@@ -73,7 +73,7 @@ rows; the nonzero logit deltas are retained here rather than described as
 bit-exact parity. The comparison covers one short prompt and the first decode
 step; it does not establish long-context or broad prompt parity.
 
-The run configuration is [ling-3.1-flash-fullgraph.toml](../configs/ling-3.1-flash-fullgraph.toml).
+The run configuration is [ling-3.1-flash-fullgraph.toml](../configs/ling31-flash.toml).
 It used GPU 0 (RTX 3090), a 1.5 GiB persistent expert cache, 16 active-layer
 slots, host budget 32 GiB, and the 8 GiB full-graph offload cache. It was run
 as a transient systemd service with `MemorySwapMax=0` and `MemoryMax=40G`; the

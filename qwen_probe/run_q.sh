@@ -5,7 +5,7 @@ cd $W
 rm -rf qwen_probe/d$N; mkdir -p qwen_probe/d$N
 python3 - <<PY
 import re
-t=open('configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml').read()
+t=open('configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml').read()
 t=re.sub(r'(?m)^log_path\s*=.*$','log_path = "$W/qwen_probe/q$N.engine.log"',t) if re.search(r'(?m)^log_path',t) else 'log_path = "$W/qwen_probe/q$N.engine.log"\n'+t
 t=re.sub(r'(?m)^max_new_tokens\s*=.*$','max_new_tokens = 64',t)
 open('qwen_probe/q$N.toml','w').write(t)

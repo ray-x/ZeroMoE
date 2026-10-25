@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 binary="${1:-./build_fork_diag/zeromoe}"
-config="${2:-configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml}"
+config="${2:-configs/testing/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml}"
 output_dir="${3:-logs/qwen4exp_state_handoff_ab}"
 prompt_tokens="${ZEROMOE_HANDOFF_PROMPT_TOKENS:-tests/qwen4exp_state_handoff_prompt_tokens.txt}"
 prompt_length="$(wc -w < "$prompt_tokens")"

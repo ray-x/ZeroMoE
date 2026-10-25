@@ -18,8 +18,8 @@ from pathlib import Path
 from compare_decode_logits import compare, records
 
 ROOT = Path(__file__).resolve().parents[1]
-A = ROOT / "configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml"
-B = ROOT / "configs/qwen4exp_q2_0_option_b_global_topk48.toml"
+A = ROOT / "configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml"
+B = ROOT / "configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml"
 
 
 def setting(config, key, value):

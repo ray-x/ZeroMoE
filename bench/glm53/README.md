@@ -21,4 +21,4 @@ Set `GLM_MODEL` to the model file or shard directory and `GLM_STORE` to the expe
 the TOML and scripts use tracked usage profiles by default. Keep model weights and generated stores outside the repository.
 
 Earlier-iteration scripts and configs (the `*_426.sh` runners, survey/route-trace scripts, `ab_pilot.sh`, `check/`, the first `glm53_dsa_graph*.toml`) are archived in
-`obsolete/glm53-logs-scripts/`. They use the old `MOESTREAM_*` env vars and `./build/moestream`, and are kept as the record behind `docs/perf-baselines.md`.
+`obsolete/glm53-logs-scripts/`. They use the old `MOESTREAM_*` env vars and `./build/moestream`, and are kept as the record behind `configs/bench/perf-baselines.md`.

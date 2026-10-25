@@ -4,7 +4,7 @@ set -u
 W=/home/ray/work/moestream-graph; cd $W
 OUT=$W/qwen_runs/$1; mkdir -p $OUT; shift
 ENG=$W/build_acc/zeromoe
-BASE=$W/configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+BASE=$W/configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
 for p in nvtop htop; do pgrep -x $p >/dev/null && { echo "ABORT: $p running"; exit 2; }; done
 for job in "$@"; do
   arm=${job%%:*}; rep=${job##*:}; tag=${arm}_r${rep}; cfg=$OUT/$tag.toml

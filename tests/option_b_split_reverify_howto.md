@@ -63,7 +63,7 @@ tests unexpectedly report `Skipped (GGML CUDA backend not compiled)`.
 the `X` in `X/split/plainCPU` naming) has **no TOML key**; it is env-var
 only (`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS` /
 `ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1`). Everything else about the
-split lives in the TOML. See `configs/qwen4exp_option_b_rightsize_split44_x0.toml`
+split lives in the TOML. See `configs/testing/qwen4exp_option_b_rightsize_split44_x0.toml`
 in the main repo for a complete worked example; the load-bearing keys are:
 
 ```toml
@@ -191,7 +191,7 @@ path can produce a *faster*, not slower, number.
 
 Build used: `ZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-integration/ggml`
 (not beellama's ggml as in step 2), `build dir ../moestream-build-upstream-master`.
-Result for `configs/qwen4exp_option_b_rightsize_split44_x0_baseline.toml`, prompt
+Result for `configs/testing/qwen4exp_option_b_rightsize_split44_x0_baseline.toml`, prompt
 "write a python program to print hello world", `--ngen 40`: **34.9-35.8 tok/s**
 (8+ runs), same output text as the recorded baseline; hot-set hit rate ~90%.
 

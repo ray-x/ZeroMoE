@@ -117,7 +117,7 @@
 // and zero Xid faults, across 4 separate runs after the fix -- three
 // two-prompt sessions and one three-prompt session, each confirmed via
 // `journalctl -k` showing nothing new. Settled default: active_layer_
-// upload_worker_threads = 2 (see configs/glm52_3090_5060_sdd2.toml).
+// upload_worker_threads = 2 (see configs/obsolete/glm52_3090_5060_sdd2.toml).
 //
 // Throughput: decode-only tok/s (40 tokens / (request_wall - prefill_wall)
 // -- NOT the raw [REQUEST] line's own combined prefill+decode rate, which

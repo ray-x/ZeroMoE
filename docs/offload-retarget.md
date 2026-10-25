@@ -1,7 +1,7 @@
 # Page-reusing expert eviction (`ZEROMOE_OFFLOAD_RETARGET`)
 
 Code: `memory/offload_store.hpp` (`VirtualArena::retarget`, `ExpertResidency::begin`).
-Results: `docs/GLM5.3-baseline.md`, `docs/perf-baselines.md` (Trial 47).
+Results: `docs/GLM5.3-baseline.md`, `configs/bench/perf-baselines.md` (Trial 47).
 
 ## What it does
 

@@ -88,5 +88,5 @@ recipe in section 1.
 | integration branch run (Qwen / DSV4.1 / GLM decode) | NOT run: the GPUs were in use by the GLM session's benchmark. Owed. |
 
 DeepSeek has a seventh commit since the list above: a config-only change to
-`configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml` (`pin_ram_fraction = 1.0`). It
+`configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml` (`pin_ram_fraction = 1.0`). It
 touches no code, so it cherry-picks without interaction.

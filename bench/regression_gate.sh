@@ -297,7 +297,7 @@ run_glm53flash() {
         ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
         ZEROMOE_TOKEN_LOOP_DIAG=1 \
         scripts/run_capped.sh -- "$BIN" \
-        --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
+        --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
         --log-path "$eng" \
         --temp 0 --ngen 150 --force-start > "$log" 2>&1 || rc=$?
   report glm53flash "$(grab_metric glm53flash "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 150
@@ -332,7 +332,7 @@ run_mimo26() {
   if [[ ! -r "$model" ]]; then
     printf "FAIL  %-12s model file not readable: %s\n" mimo26 "$model"; FAIL=$((FAIL+1)); return
   fi
-  python3 - "configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml" "$config" "$model" <<'PY'
+  python3 - "configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml" "$config" "$model" <<'PY'
 import json
 import re
 import sys
@@ -383,7 +383,7 @@ run_dsv41() {
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
     | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
         scripts/run_capped.sh -- "$BIN" \
-        --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
+        --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
         --log-path "$eng" \
         --temp 0 --ngen 64 --force-start > "$log" 2>&1 || rc=$?
   report dsv41 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64

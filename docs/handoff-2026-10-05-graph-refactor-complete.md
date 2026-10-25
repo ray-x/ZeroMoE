@@ -109,7 +109,7 @@ From the repository root, in a shell without benchmark-only overrides:
 ```bash
 source configs/qwen4exp_q2_0_option_b_scheduler.env
 ../moestream-build-upstream-master/moestream \
-  --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+  --config configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
 ```
 
 The integration checkout is `../llama.cpp-moestream-integration`. The saved

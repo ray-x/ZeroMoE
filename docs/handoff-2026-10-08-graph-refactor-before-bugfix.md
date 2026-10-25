@@ -127,7 +127,7 @@ max `1.31e-3`); the user's llama.cpp prefill gate remains unmet.
    checkout, unless intentionally testing the later `cleanup/ggml-exl3-only`
    commits. Preserve unrelated ExLlamaV3 and generated files.
 2. Keep the accepted early-ready path as the comparison baseline. Use the
-   exact `configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml`
+   exact `configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml`
    placement for both arms; it is 8,421 experts / 10.842 GiB.
 3. Re-establish stable CUDA discovery before inference. The most recent target
    build completed with `-j10`, but its launch returned

@@ -15,7 +15,7 @@ context_size=${LING_CONTEXT_SIZE:-64}
 freeze_usage_stats=${LING_FREEZE_USAGE_STATS:-1}
 log=${LING_LOG:-/tmp/ling-reference-$(date -u +%Y%m%dT%H%M%S).log}
 config=$(mktemp /tmp/ling-reference-config.XXXXXX.toml)
-python3 - "$worktree/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$context_size" "$model" <<'CONFIG'
+python3 - "$worktree/configs/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$context_size" "$model" <<'CONFIG'
 from pathlib import Path
 import json, os, re, sys
 pool=int(os.environ.get('LING_DDR_GIB','64')); cap=int(os.environ.get('LING_CAP_GIB','95'))

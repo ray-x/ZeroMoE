@@ -389,7 +389,7 @@ existing TOML and the patched upstream integration build:
 ```bash
 source configs/qwen4exp_q2_0_option_b_scheduler.env
 ../moestream-build-upstream-master/moestream \
-  --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+  --config configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
 ```
 
 This preserves the 8,421 static VRAM experts (10.84 GiB). The refactor adds
