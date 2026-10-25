@@ -23,7 +23,7 @@
 #
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
 
-log_path  = "/tmp/moestream-usage-pinned512-20260907.log"
+log_path  = "/tmp/zeromoe-usage-pinned512-20260907.log"
 log_level = "INFO"
 
 context_size   = 2048
@@ -57,7 +57,7 @@ expert_fetch_threads = 10
 omp_max_threads      = 12
 prefetch_worker_threads = 4
 
-# Model-specific usage/pin files. MUST NOT be .moestream_usage -- that one
+# Model-specific usage/pin files. MUST NOT be .zeromoe_usage -- that one
 # is GLM-5.3's (75 layers vs this model's 48).
 pin_file           = "bench_tmp/.qwen4exp_readme_usage_20260907"
 prefill_pin_file   = "bench_tmp/.qwen4exp_readme_usage_20260907_prefill"
@@ -125,7 +125,7 @@ moe_expert_bf16_gemm = true
 # three GGML_OP_MUL_MAT_ID nodes instead of Phase 3b's per-expert-bucket
 # loop, so the token-to-expert grouping happens on the GPU (ggml-cuda sorts
 # rows and derives expert bounds itself) instead of once per expert on the
-# host. Needs a build with -DMOESTREAM_USE_GGML_CUDA=ON.
+# host. Needs a build with -DZEROMOE_USE_GGML_CUDA=ON.
 #
 # MEASURED 2026-09-05, qwen4exp UD-IQ1_M, 441-token prefill, same binary,
 # only this flag varied:
@@ -304,7 +304,7 @@ mem_guard_poll_ms  = 500
 # VRAM headroom for DYNAMIC (grow-at-runtime) buffers: keep at least this much
 # free on each GPU. NOTE this is a free-memory FLOOR, not llama.cpp's
 # fraction-of-total watermark -- that form was tried and is wrong here:
-# MoEStream deliberately fills VRAM (expert cache ~23.7/24 GB by design), so a
+# ZeroMoE deliberately fills VRAM (expert cache ~23.7/24 GB by design), so a
 # 90%-of-total test reads "already over budget" and refused 11,632 dynamic
 # allocations, permanently disabling the BF16/attention/GDN fast paths and
 # costing 2.6x throughput (14.97 -> 5.79 tok/s). llama.cpp applies 0.9 at model

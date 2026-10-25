@@ -474,7 +474,7 @@ KQUANT_MATMUL_KERNEL_LANE8(q6_K, block_q6_K_cu, dequant_q6_K_lane8)
 //                cuda/q8_0_matmul.cu carries a comment about a real Xid 13
 //                "Misaligned Address" GPU exception from exactly this class
 //                of bug -- hence an explicit gate rather than an assumption.
-// MOESTREAM_KQUANT_LEGACY=1 forces the cooperative path even where lane8
+// ZEROMOE_KQUANT_LEGACY=1 forces the cooperative path even where lane8
 // applies. Read once into a function-local static (the same idiom as
 // dense_dispatch.hpp's cpu_only_flag()), so this costs one predictable branch,
 // not a getenv, on the dispatch path. Exists so a lane8-vs-coop A/B can be run
@@ -483,7 +483,7 @@ KQUANT_MATMUL_KERNEL_LANE8(q6_K, block_q6_K_cu, dequant_q6_K_lane8)
 // comparing against a previously-recorded baseline from another session can
 // chase drift rather than the change under test.
 static inline bool kquant_legacy_forced() {
-    static const bool forced = [](){ const char* e = getenv("MOESTREAM_KQUANT_LEGACY");
+    static const bool forced = [](){ const char* e = getenv("ZEROMOE_KQUANT_LEGACY");
                                      return e && e[0] == '1'; }();
     return forced;
 }
@@ -591,16 +591,16 @@ extern "C" void launch_q6_K_matmul(float* y, const float* x, const void* w, int 
         q6_K_kquant_matmul_kernel<<<dim3(O, S), 256>>>(y, x, (const block_q6_K_cu*)w, S, I, O);
 }
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include "ggml.h"
 #include <atomic>
 #include <climits>
 
 // The optional backend hook supplies stream-ordered native F32 operations to
 // GGML. It is absent from ordinary GGML builds, which remain fully supported.
-using MoestreamF32QuantHook = bool (*)(const ggml_tensor *, const ggml_tensor *,
+using ZeroMoEF32QuantHook = bool (*)(const ggml_tensor *, const ggml_tensor *,
                                        const ggml_tensor *, ggml_tensor *, void *, bool);
-extern "C" void ggml_cuda_set_f32_quant_matmul_hook(MoestreamF32QuantHook)
+extern "C" void ggml_cuda_set_f32_quant_matmul_hook(ZeroMoEF32QuantHook)
     __attribute__((weak));
 static std::atomic<uint64_t> f32_quant_graph_launches{0};
 
@@ -717,12 +717,12 @@ static bool native_f32_quant_hook(const ggml_tensor *w, const ggml_tensor *x,
     f32_quant_graph_launches.fetch_add(1, std::memory_order_relaxed);
     return cudaPeekAtLastError() == cudaSuccess;
 }
-extern "C" bool moestream_install_f32_quant_graph_hook() {
+extern "C" bool zeromoe_install_f32_quant_graph_hook() {
     if (!ggml_cuda_set_f32_quant_matmul_hook) return false;
     ggml_cuda_set_f32_quant_matmul_hook(native_f32_quant_hook);
     return true;
 }
-extern "C" uint64_t moestream_f32_quant_graph_launches() {
+extern "C" uint64_t zeromoe_f32_quant_graph_launches() {
     return f32_quant_graph_launches.load(std::memory_order_relaxed);
 }
 #endif

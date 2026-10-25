@@ -10,7 +10,7 @@ NOT proven: the planned synthetic-poller control batch was not run.
 ## Setup (all runs)
 - Build: copy of the cleanup/ggml-exl3-only working tree linked to the accepted ggml
   (llama.cpp-moestream-integration/ggml), HEAD 11c6100 content; Q2_0 split-44 config, 28-token prompt,
-  64 teacher-forced tokens, `MOESTREAM_QWEN_CPU_THREADS=10`, early-ready recipe on (ALL_SPLIT, RESIDENT_TABLES,
+  64 teacher-forced tokens, `ZEROMOE_QWEN_CPU_THREADS=10`, early-ready recipe on (ALL_SPLIT, RESIDENT_TABLES,
   ASYNC_OUTPUT = 1), both bench arms identical, 12 alternating pairs per batch. GPU guard clean in every batch.
 - Host: Xeon W-2235 (6 cores/12 threads, governor powersave via intel_pstate), RTX 3090, THP=always.
 

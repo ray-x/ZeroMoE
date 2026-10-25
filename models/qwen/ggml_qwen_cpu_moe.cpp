@@ -35,7 +35,7 @@
 #include <sstream>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
 
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -70,7 +70,7 @@ namespace {
 thread_local int qwen_cpu_diag_layer = -1;
 
 bool qwen_cpu_diag_enabled() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2");
   return v && v[0] == '1' && qwen_cpu_diag_layer == 0;
 }
 
@@ -107,7 +107,7 @@ void dump_qwen_cpu_diag_tensor(const char *role, const ggml_tensor *tensor) {
   // comparable with llama.cpp's per-expert dumps.  Keep this opt-in and write only
   // the first instance of each role: a diagnostic prefill may execute many
   // S=1 positions, but position 0 is the parity boundary we are auditing.
-  const char *dump_dir = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_DIAG_DUMP_DIR");
+  const char *dump_dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DIAG_DUMP_DIR");
   if (dump_dir && dump_dir[0]) {
     static std::atomic<bool> dumped_down_input{false};
     static std::atomic<bool> dumped_down_output{false};
@@ -154,7 +154,7 @@ int default_cpu_threads() {
   // competes for the same LLC.  Keep the existing process-wide default, but
   // allow a Qwen-only A/B override without changing any other model family or
   // the application's global OpenMP setting.
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_THREADS");
+  const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_THREADS");
   if (env && env[0]) {
     char *end = nullptr;
     const long requested = std::strtol(env, &end, 10);
@@ -164,9 +164,9 @@ int default_cpu_threads() {
 
   // The host-node runner is a second GGML CPU execution context that may
   // overlap the scheduler's ordinary CPU backend.  Keep its cap separate
-  // from MOESTREAM_QWEN_CPU_THREADS so contention can be diagnosed without
+  // from ZEROMOE_QWEN_CPU_THREADS so contention can be diagnosed without
   // changing the A/B baseline CPU split configuration.
-  const char *host_env = moestream::graphcfg::env("MOESTREAM_QWEN_HOST_NODE_THREADS");
+  const char *host_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_HOST_NODE_THREADS");
   if (host_env && host_env[0]) {
     char *end = nullptr;
     const long requested = std::strtol(host_env, &end, 10);
@@ -182,7 +182,7 @@ bool type_is_valid(uint32_t type) {
 
 // Optional decode-only timing for the persistent Qwen CPU graph.  The normal
 // production path does not pay for extra clocks or atomics.  Set
-// MOESTREAM_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS to the expected number of
+// ZEROMOE_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS to the expected number of
 // decode graph calls (for example 3840 for 48 CPU layers x 80 tokens) to get
 // one aggregate split at the end of that window.  This is deliberately kept
 // in the Qwen runner instead of the generic PerfCounters so other model
@@ -204,7 +204,7 @@ QwenCpuGraphTiming &qwen_cpu_graph_timing() {
   static std::once_flag once;
   std::call_once(once, [] {
     const char *env =
-        moestream::graphcfg::env("MOESTREAM_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS");
+        zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_GRAPH_TIMING_REPORT_CALLS");
     if (!env || !env[0])
       return;
     char *end = nullptr;
@@ -254,7 +254,7 @@ void qwen_cpu_graph_timing_report(QwenCpuGraphTiming &state,
 bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
                        const void *gate_plane, const void *up_plane) {
   static const bool disabled = [] {
-    return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DISABLE_MERGED_GATE_UP");
+    return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DISABLE_MERGED_GATE_UP");
   }();
   if (disabled)
     return false;
@@ -265,19 +265,19 @@ bool can_merge_gate_up(const GgmlQwenCpuExpertRef &ref,
 }
 
 bool qwen_cpu_direct_pool_env_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_POOL");
 }
 
 bool qwen_cpu_direct_ephemeral_env_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_EPHEMERAL");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_EPHEMERAL");
 }
 
 bool qwen_cpu_direct_timing_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_TIMING");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_TIMING");
 }
 
 bool qwen_cpu_direct_fused_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_FUSED");
 }
 
 // Direct workers must remain scheduler-free while a request is active, but a
@@ -286,11 +286,11 @@ bool qwen_cpu_direct_fused_enabled() {
 // input/gate-up/down/reduce phases still use the generation counter and
 // _mm_pause() exclusively.
 bool qwen_cpu_direct_idle_wait_enabled() {
-  return moestream::graphcfg::flag_unless_off("MOESTREAM_QWEN_CPU_DIRECT_IDLE_WAIT");
+  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN_CPU_DIRECT_IDLE_WAIT");
 }
 
 bool qwen_cpu_direct_caller_worker_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_CALLER_WORKER");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_CALLER_WORKER");
 }
 
 int qwen_cpu_direct_worker_count() {
@@ -303,7 +303,7 @@ int qwen_cpu_direct_worker_count() {
   // thread may still run on an SMT sibling, but it no longer competes with a
   // permanently runnable worker while the pool is idle.
   const int max_workers = grouped;
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_THREADS");
+  const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_THREADS");
   if (env && env[0]) {
     char *end = nullptr;
     const long requested = std::strtol(env, &end, 10);
@@ -322,11 +322,11 @@ int qwen_cpu_direct_worker_count() {
 }
 
 bool qwen_cpu_direct_prefetch_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_PREFETCH");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_PREFETCH");
 }
 
 bool qwen_cpu_direct_diag_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN_CPU_DIRECT_DIAG");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN_CPU_DIRECT_DIAG");
 }
 
 enum : int {
@@ -477,10 +477,10 @@ void qwen_cpu_direct_sample_end(GgmlQwenDirectWorkerSample &sample,
 
 void qwen_cpu_direct_pin_thread(int worker_index) {
 #if defined(__linux__)
-  if (moestream_thread_profile_enabled()) {
+  if (zeromoe_thread_profile_enabled()) {
     configure_current_thread({
         .name = "MOE-WORKER-" + std::to_string(worker_index),
-        .cpu_ids = moestream_thread_profile_physical_core(worker_index),
+        .cpu_ids = zeromoe_thread_profile_physical_core(worker_index),
         .use_rt = false,
         .rt_priority = 0,
         .nice_value = -15,
@@ -488,7 +488,7 @@ void qwen_cpu_direct_pin_thread(int worker_index) {
     });
     return;
   }
-  const char *env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_PIN");
+  const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_PIN");
   if (!env || env[0] != '1')
     return;
 
@@ -2524,7 +2524,7 @@ bool GgmlQwenCpuMoeRunner::run_strided_planes(
   if (!ensure_graph(layer, n_experts, d_model, d_ff, topk, true,
                     gate_plane, up_plane, down_plane, gate_stride, false,
                     false, up_stride, down_stride)) {
-    const char *sched_debug = moestream::graphcfg::env("MOESTREAM_QWEN_DECODE_SCHED_DEBUG");
+    const char *sched_debug = zeromoe::graphcfg::env("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
     if (sched_debug && sched_debug[0] == '1')
       LOG_WARN("[QWEN-CPU-PLANES] ensure_graph failed types=%u/%u/%u "
                "bytes=%zu/%zu/%zu strides=%zu/%zu/%zu n=%d D=%d FF=%d K=%d\n",

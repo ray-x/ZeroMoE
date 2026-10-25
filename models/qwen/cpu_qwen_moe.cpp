@@ -11,14 +11,14 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Opt-in per-layer hidden-state tracing (set MOESTREAM_DEBUG_LAYERS=1) to
+// Opt-in per-layer hidden-state tracing (set ZEROMOE_DEBUG_LAYERS=1) to
 // localize where a numerical/permutation bug first shows up, without
 // touching normal-run performance or log volume. Reports the RMS and first
 // few values of the LAST sequence position only -- during prefill that's
 // the position the LM head actually reads, and during decode S is always 1
 // anyway, so this is the one row worth watching every call.
 static bool debug_layers_enabled() {
-  static bool enabled = std::getenv("MOESTREAM_DEBUG_LAYERS") != nullptr;
+  static bool enabled = std::getenv("ZEROMOE_DEBUG_LAYERS") != nullptr;
   return enabled;
 }
 
@@ -773,7 +773,7 @@ void CPUQwenMoEBackend::forward_linear_attention(CPUEngine &engine,
       // magnitude (mean(x^2) only ~5e-5), right where eps should matter --
       // confirmed via real cross-engine trace: attn_output (pre-gate, straight
       // out of gated_delta_rule) matched llama.cpp almost exactly, but
-      // final_output (post this gated-RMSNorm) was ~24% too large on MoEStream.
+      // final_output (post this gated-RMSNorm) was ~24% too large on ZeroMoE.
       double msq = 0.0;
       for (int i = 0; i < v_dim; ++i)
         msq += static_cast<double>(x[i]) * x[i];

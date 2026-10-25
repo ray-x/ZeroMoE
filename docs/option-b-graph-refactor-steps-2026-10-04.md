@@ -33,7 +33,7 @@ measurements; retry only invalidated samples.
 
 ## Step 1 implementation
 
-`MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT=1` selects the new path. The context
+`ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT=1` selects the new path. The context
 copies the static cold mask at construction. Every replay counts its cold
 routes from the already-read IDs, and zeros the weighted cold output if the
 count is zero. Original H2D and merge remain. Diagnostic counters distinguish
@@ -57,8 +57,8 @@ python3 bench/option_b_early_ready_check.py \
   --prompt-ids logs/quant_decode_compare_chat_20261004/prompt.tokens \
   --continuation logs/quant_decode_compare_chat_20261004/Q2.tokens \
   --reps 6 --all-split --wait-idle 300 \
-  --baseline-env MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1 \
-  --candidate-env MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT=1
+  --baseline-env ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1 \
+  --candidate-env ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT=1
 ```
 
 Step 1 completed: native suite passed (`logs/option_b_step1_all_hot_native.log`).
@@ -71,7 +71,7 @@ Results: `logs/option_b_step1_all_hot_perf/summary.json` and its manifest/logs.
 
 ## Step 2a: asynchronous cold-output join
 
-`MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT=1` owns a fixed GPU cold-output buffer
+`ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT=1` owns a fixed GPU cold-output buffer
 per layer. The CPU marker uploads the identical weighted cold result from its
 pinned output on a nonblocking stream, records completion and queues a wait on
 the producer stream before the GPU merge. The marker remains explicitly
@@ -99,7 +99,7 @@ samples were retained and retried by `/tmp/run_graph_ab_retry.py`.
 
 The main graph uses immutable remap/mask tables created through `host_input`,
 which marks them as user inputs. The scheduler repeats input copies and waits
-for these tables on every token. `MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES=1`
+for these tables on every token. `ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1`
 uploads those tables once to a fixed GPU buffer. The prepared CPU graph still
 reads the original host tables. This is a separate A/B with asynchronous output
 and all-hot skipping off, so the measured effect belongs to table residency.
@@ -144,14 +144,14 @@ routes and all 64 numerical records matched exactly.
 
 ## Step 3: predictor probe
 
-`MOESTREAM_QWEN_EARLY_READY_PREDICT=1` projects each split layer's FFN input
+`ZEROMOE_QWEN_EARLY_READY_PREDICT=1` projects each split layer's FFN input
 through the next split layer's existing router and bias to forecast its top-K.
 This is a proxy input, not a claim that it matches the next layer's actual
 post-attention input. The auxiliary GPU work is ordered after the early input
 fork and before hot/shared work, so it can overlap current cold CPU work.
-`MOESTREAM_QWEN_EARLY_READY_PREDICT_LAYER` can restrict the target.
+`ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER` can restrict the target.
 
-`MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE=path` records static cold masks and
+`ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE=path` records static cold masks and
 actual/predicted IDs after replay synchronization. Trace I/O is excluded from
 throughput. Static cold usage and previous-token routes will be controls at
 matched cold-candidate counts; measure forecast overhead before staging.
@@ -207,10 +207,10 @@ the one disagreement had a 0.0109 baseline margin. Treat this as unresolved
 until an independent GPU reference confirms exact staged outputs and forced
 late-transfer fallback preserves the original CPU/GPU placement.
 
-`MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY=1` snapshots staged weighted output
+`ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY=1` snapshots staged weighted output
 and compares it with a separate GPU graph freshly loaded from the immutable
 DDR planes for the actual staged route IDs. Verification timing is excluded.
-`MOESTREAM_QWEN_EARLY_READY_STAGE_DELAY_US` injects a bounded copy-stream delay
+`ZEROMOE_QWEN_EARLY_READY_STAGE_DELAY_US` injects a bounded copy-stream delay
 for fallback/epoch/bank-reuse checks. Both controls default off.
 
 Latest build with GPU-reference verification and delayed-transfer injection
@@ -327,7 +327,7 @@ assertions, but does not prove all routes take CPU fallback:
 `logs/option_b_stage_all_late/` reports two staged routes at the 32-visit
 diagnostic. Forty-two GPU delay kernels slow the decoder enough that some
 transfers meet their consumer deadline. Retain this as a contention test.
-The new debug-only `MOESTREAM_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US` delays
+The new debug-only `ZEROMOE_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US` delays
 the worker after snapshotting its prediction, before packing/queuing DMA.
 It avoids occupying GPU resources and will support a strict all-late fallback
 check. Normal execution has both delay controls off.

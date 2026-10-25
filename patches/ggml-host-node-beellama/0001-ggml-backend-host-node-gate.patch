@@ -9,9 +9,9 @@ diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
  #include <sys/sysctl.h>
  #endif
  
-+// Optional MoEStream hook.  The weak declaration keeps ggml-backend usable
-+// by applications which do not link the MoEStream host-node implementation.
-+extern "C" void moestream_qwen4exp_host_node_cpu_wait(void)
++// Optional ZeroMoE hook.  The weak declaration keeps ggml-backend usable
++// by applications which do not link the ZeroMoE host-node implementation.
++extern "C" void zeromoe_qwen4exp_host_node_cpu_wait(void)
 +    __attribute__((weak));
 +
  static bool ggml_copy_call_trace_enabled() {
@@ -23,8 +23,8 @@ diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
 +        // the fast path without callback_eval, while that callback is active.
 +        // The weak hook is null for ordinary GGML applications.
 +        if (ggml_backend_sched_profile_is_cpu(split_backend) &&
-+            moestream_qwen4exp_host_node_cpu_wait != nullptr) {
-+            moestream_qwen4exp_host_node_cpu_wait();
++            zeromoe_qwen4exp_host_node_cpu_wait != nullptr) {
++            zeromoe_qwen4exp_host_node_cpu_wait();
 +        }
          if (!sched->callback_eval) {
              enum ggml_status ec;

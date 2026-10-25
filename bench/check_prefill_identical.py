@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact prefill equality check between two MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP directories.
+"""Exact prefill equality check between two ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP directories.
 
 Compares the batched prefill snapshot (state.step0.f32, layer-major, `sequence` positions per layer) element for
 element. Exit 0 if every position of every layer is bit-identical, 1 otherwise, printing the first differing layer

@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
               << " iterations=" << iterations << '\n'
               << "omp_threads=" << omp_threads
               << " omp_wait_policy=" << (std::getenv("OMP_WAIT_POLICY") ? std::getenv("OMP_WAIT_POLICY") : "default")
-              << " cuda_schedule=" << (std::getenv("MOESTREAM_CUDA_SCHEDULE") ? std::getenv("MOESTREAM_CUDA_SCHEDULE") : "default")
+              << " cuda_schedule=" << (std::getenv("ZEROMOE_CUDA_SCHEDULE") ? std::getenv("ZEROMOE_CUDA_SCHEDULE") : "default")
               << " cpu_prime=" << cpu_prime[0] << '\n'
               << "baseline_ms=" << baseline_ms << " fused_ms=" << fused_ms
               << " speedup=" << baseline_ms / fused_ms

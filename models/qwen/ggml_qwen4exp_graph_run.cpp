@@ -5,7 +5,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -70,7 +70,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   const auto replay_submit_end = std::chrono::steady_clock::now();
   if (g.stage_enabled && g.stage_compute_end_event) {
     cudaStream_t graph_stream =
-        moestream_ggml_backend_cuda_get_stream(g.cuda_raw);
+        zeromoe_ggml_backend_cuda_get_stream(g.cuda_raw);
     if (!graph_stream ||
         cudaEventRecord(g.stage_compute_end_event, graph_stream) !=
             cudaSuccess)
@@ -89,7 +89,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
       early.stage_target->verify(early.input, early.weights, early.ids, early.stage_ids);
     }
   }
-  const char *route_trace = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE");
+  const char *route_trace = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE");
   if (route_trace && route_trace[0] && !g.early_ready.empty()) {
     if (!g.early_route_trace) {
       g.early_route_trace = std::make_unique<std::ofstream>(route_trace);
@@ -272,7 +272,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   // and recorded at enqueue time (qwen4exp_cuda_gpu_stage_node_enqueue) but
   // never queried anywhere; add that here, mirroring the host-node ledger
   // immediately above, so a real per-op breakdown exists instead of only
-  // the callback body's own wall-clock (MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING).
+  // the callback body's own wall-clock (ZEROMOE_QWEN4EXP_GPU_STAGE_TIMING).
   if (!g.gpu_stage_contexts.empty()) {
     float d2h_ms = 0.0f;
     float h2d_ms = 0.0f;
@@ -413,7 +413,7 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
         host_node_h2d_ms, host_node_all_ok ? 1 : 0, ordinary_cpu_compute_ms,
         ordinary_cpu_gap_ms, ordinary_cpu_compute_ms + ordinary_cpu_gap_ms);
   }
-  // Per-layer/per-op CPU timing (env: MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING=1)
+  // Per-layer/per-op CPU timing (env: ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING=1)
   // -- emitted every 10 tokens (not every token) to avoid log spam; see
   // memory: full-graph-per-layer-timing-instrumentation-plan.md for why
   // this exists and what it answers that nsys/DEBUG counters cannot.
@@ -803,7 +803,7 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
              !partial_prefill_capture_enabled()) {
     LOG_INFO("[PARTIAL-LAYER] layer=%d prefill routing capture skipped "
              "(Phase 2 routes per token; the capture would perturb prefill "
-             "numerics -- set MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 "
+             "numerics -- set ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 "
              "to force it)\n",
              engine.qwen4exp_partial_layer);
   }
@@ -823,4 +823,4 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
   return true;
 }
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

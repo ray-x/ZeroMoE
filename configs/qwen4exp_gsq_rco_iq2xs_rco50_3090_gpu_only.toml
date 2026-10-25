@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next GSQ-RCO IQ2_XS RCO50 fit check on one RTX 3090.
 #
 # Run with:
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-#   ./build/moestream --config configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+#   ./build/zeromoe --config configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
 #
 # This deliberately has no CPU expert offload. The GGUF directory must pass
 # `./build/gguf_tool verify` before launching this profile.

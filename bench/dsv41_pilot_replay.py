@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Offline accuracy of a DeepSeek V4.1 expert 'pilot' (next-layer router on the
-current layer's hidden state), from MOESTREAM_ROUTER_IN_LOG + MOESTREAM_ROUTE_LOG.
+current layer's hidden state), from ZEROMOE_ROUTER_IN_LOG + ZEROMOE_ROUTE_LOG.
 
 For each decode token and layer L:
   actual(L)      = the experts the engine really picked at layer L

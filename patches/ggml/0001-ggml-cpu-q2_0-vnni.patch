@@ -1,17 +1,5 @@
-diff --git a/src/ggml-cpu/arch-fallback.h b/src/ggml-cpu/arch-fallback.h
-index 2b9a42657..aa224899a 100644
---- a/src/ggml-cpu/arch-fallback.h
-+++ b/src/ggml-cpu/arch-fallback.h
-@@ -83,7 +83,6 @@
- #define ggml_gemm_q2_K_8x8_q8_K_generic ggml_gemm_q2_K_8x8_q8_K
- #elif defined(__x86_64__) || defined(__i386__) || defined(_M_IX86) || defined(_M_X64)
- // quants.c
--#define ggml_vec_dot_q2_0_q8_0_generic ggml_vec_dot_q2_0_q8_0
- // repack.cpp
- #define ggml_quantize_mat_q8_0_4x4_generic ggml_quantize_mat_q8_0_4x4
- #define ggml_quantize_mat_q8_K_4x4_generic ggml_quantize_mat_q8_K_4x4
 diff --git a/src/ggml-cpu/arch/x86/quants.c b/src/ggml-cpu/arch/x86/quants.c
-index ea54cfe44..61e032f42 100644
+index 21cd631..6caeb51 100644
 --- a/src/ggml-cpu/arch/x86/quants.c
 +++ b/src/ggml-cpu/arch/x86/quants.c
 @@ -13,6 +13,7 @@
@@ -22,16 +10,16 @@ index ea54cfe44..61e032f42 100644
  
  #define GROUP_MAX_EPS 1e-15f
  #define GROUP_MAX_EPS_IQ3_XXS 1e-8f
-@@ -22,6 +23,193 @@
+@@ -22,6 +23,192 @@
  
  #define UNUSED GGML_UNUSED
  
 +#if defined(__GNUC__) || defined(__clang__)
-+#define MOESTREAM_Q2_0_VNNI_TARGET \
++#define ZEROMOE_Q2_0_VNNI_TARGET \
 +    __attribute__((target("avx2,avx512f,avx512bw,avx512vl,avx512vnni")))
 +
-+static MOESTREAM_Q2_0_VNNI_TARGET __m256i
-+moestream_ggml_q2_0_unpack_half_vnni(const uint8_t *packed) {
++static ZEROMOE_Q2_0_VNNI_TARGET __m256i
++zeromoe_ggml_q2_0_unpack_half_vnni(const uint8_t *packed) {
 +    const __m128i bytes = _mm_loadl_epi64((const __m128i *) packed);
 +    const __m256i q = _mm256_inserti128_si256(
 +        _mm256_castsi128_si256(bytes), _mm_srli_si128(bytes, 4), 1);
@@ -45,16 +33,16 @@ index ea54cfe44..61e032f42 100644
 +    return _mm256_unpacklo_epi16(q01, q23);
 +}
 +
-+static MOESTREAM_Q2_0_VNNI_TARGET float
-+moestream_ggml_q2_0_dot_vnni(const block_q2_0 *weights,
++static ZEROMOE_Q2_0_VNNI_TARGET float
++zeromoe_ggml_q2_0_dot_vnni(const block_q2_0 *weights,
 +                             const block_q8_0 *activations, int n) {
 +    __m512 accum = _mm512_setzero_ps();
 +    const int blocks = n / QK2_0;
 +    for (int b = 0; b < blocks; ++b) {
 +        const block_q2_0 *wb = &weights[b];
 +        const float wd = GGML_CPU_FP16_TO_FP32(wb->d);
-+        const __m256i w0 = moestream_ggml_q2_0_unpack_half_vnni(wb->qs);
-+        const __m256i w1 = moestream_ggml_q2_0_unpack_half_vnni(wb->qs + 8);
++        const __m256i w0 = zeromoe_ggml_q2_0_unpack_half_vnni(wb->qs);
++        const __m256i w1 = zeromoe_ggml_q2_0_unpack_half_vnni(wb->qs + 8);
 +        const block_q8_0 *x0 = &activations[2 * b];
 +        const block_q8_0 *x1 = &activations[2 * b + 1];
 +        const __m512i wv = _mm512_inserti64x4(_mm512_castsi256_si512(w0), w1, 1);
@@ -75,8 +63,8 @@ index ea54cfe44..61e032f42 100644
 +    return _mm512_reduce_add_ps(accum);
 +}
 +
-+static MOESTREAM_Q2_0_VNNI_TARGET void
-+moestream_ggml_q2_0_dot_vnni_4rows(float *output,
++static ZEROMOE_Q2_0_VNNI_TARGET void
++zeromoe_ggml_q2_0_dot_vnni_4rows(float *output,
 +                                   const block_q2_0 *weights,
 +                                   size_t weight_row_bytes,
 +                                   const block_q8_0 *activations, int n) {
@@ -108,17 +96,17 @@ index ea54cfe44..61e032f42 100644
 +            ((const char *) weights + 3 * weight_row_bytes) + b;
 +
 +        const __m512i wv0 = _mm512_inserti64x4(
-+            _mm512_castsi256_si512(moestream_ggml_q2_0_unpack_half_vnni(w0->qs)),
-+            moestream_ggml_q2_0_unpack_half_vnni(w0->qs + 8), 1);
++            _mm512_castsi256_si512(zeromoe_ggml_q2_0_unpack_half_vnni(w0->qs)),
++            zeromoe_ggml_q2_0_unpack_half_vnni(w0->qs + 8), 1);
 +        const __m512i wv1 = _mm512_inserti64x4(
-+            _mm512_castsi256_si512(moestream_ggml_q2_0_unpack_half_vnni(w1->qs)),
-+            moestream_ggml_q2_0_unpack_half_vnni(w1->qs + 8), 1);
++            _mm512_castsi256_si512(zeromoe_ggml_q2_0_unpack_half_vnni(w1->qs)),
++            zeromoe_ggml_q2_0_unpack_half_vnni(w1->qs + 8), 1);
 +        const __m512i wv2 = _mm512_inserti64x4(
-+            _mm512_castsi256_si512(moestream_ggml_q2_0_unpack_half_vnni(w2->qs)),
-+            moestream_ggml_q2_0_unpack_half_vnni(w2->qs + 8), 1);
++            _mm512_castsi256_si512(zeromoe_ggml_q2_0_unpack_half_vnni(w2->qs)),
++            zeromoe_ggml_q2_0_unpack_half_vnni(w2->qs + 8), 1);
 +        const __m512i wv3 = _mm512_inserti64x4(
-+            _mm512_castsi256_si512(moestream_ggml_q2_0_unpack_half_vnni(w3->qs)),
-+            moestream_ggml_q2_0_unpack_half_vnni(w3->qs + 8), 1);
++            _mm512_castsi256_si512(zeromoe_ggml_q2_0_unpack_half_vnni(w3->qs)),
++            zeromoe_ggml_q2_0_unpack_half_vnni(w3->qs + 8), 1);
 +
 +        const __m512i corrected0 = _mm512_sub_epi32(
 +            _mm512_dpbusd_epi32(_mm512_setzero_si512(), wv0, xv), sx32);
@@ -162,12 +150,12 @@ index ea54cfe44..61e032f42 100644
 +    output[3] = _mm512_reduce_add_ps(accum3);
 +}
 +
-+static int moestream_ggml_q2_0_vnni_dispatch_enabled(void) {
++static int zeromoe_ggml_q2_0_vnni_dispatch_enabled(void) {
 +    static int cached = -1;
 +    int enabled = __atomic_load_n(&cached, __ATOMIC_RELAXED);
 +    if (enabled < 0) {
 +        __builtin_cpu_init();
-+        const char *disable = getenv("MOESTREAM_GGML_Q2_0_DISABLE_VNNI");
++        const char *disable = getenv("ZEROMOE_GGML_Q2_0_DISABLE_VNNI");
 +        const int detected = (!disable || disable[0] != '1') &&
 +            __builtin_cpu_supports("avx512vnni");
 +        int expected = -1;
@@ -179,23 +167,25 @@ index ea54cfe44..61e032f42 100644
 +}
 +#endif
 +
-+void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs,
++// ZeroMoE: AVX-512 VNNI Q2_0 dot (1 and 4 rows) and the multi-row loop. Returns 1 when it handled the call;
++// the single-row non-VNNI case falls through to the AVX2 kernel below.
++static int zeromoe_ggml_vec_dot_q2_0_q8_0_vnni(int n, float * GGML_RESTRICT s, size_t bs,
 +                           const void * GGML_RESTRICT vx, size_t bx,
 +                           const void * GGML_RESTRICT vy, size_t by, int nrc) {
 +#if defined(__GNUC__) || defined(__clang__)
 +    if (nrc == 4 && by == 0 && bs == sizeof(float) &&
-+        moestream_ggml_q2_0_vnni_dispatch_enabled()) {
++        zeromoe_ggml_q2_0_vnni_dispatch_enabled()) {
 +        assert(n % QK2_0 == 0);
-+        moestream_ggml_q2_0_dot_vnni_4rows(
++        zeromoe_ggml_q2_0_dot_vnni_4rows(
 +            s, vx, bx, vy, n);
-+        return;
++        return 1;
 +    }
-+    if (nrc == 1 && moestream_ggml_q2_0_vnni_dispatch_enabled()) {
++    if (nrc == 1 && zeromoe_ggml_q2_0_vnni_dispatch_enabled()) {
 +        assert(n % QK2_0 == 0);
 +        const block_q2_0 * GGML_RESTRICT x = vx;
 +        const block_q8_0 * GGML_RESTRICT y = vy;
-+        *s = moestream_ggml_q2_0_dot_vnni(x, y, n);
-+        return;
++        *s = zeromoe_ggml_q2_0_dot_vnni(x, y, n);
++        return 1;
 +    }
 +#endif
 +    if (nrc > 1) {
@@ -205,22 +195,29 @@ index ea54cfe44..61e032f42 100644
 +                (const char *) vx + row * bx, 0,
 +                (const char *) vy + row * by, 0, 1);
 +        }
-+        return;
++        return 1;
 +    }
-+    UNUSED(bs);
-+    UNUSED(bx);
-+    UNUSED(by);
-+    ggml_vec_dot_q2_0_q8_0_generic(n, s, bs, vx, bx, vy, by, nrc);
++    return 0;
 +}
 +
  // some compilers don't provide _mm256_set_m128i, e.g. gcc 7
  #define MM256_SET_M128I(a, b) _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
  
+@@ -732,6 +919,9 @@ static inline __m256 q2_0_acc_block_avx2(const block_q2_0 * x, const block_q8_0
+ #endif
+ 
+ void ggml_vec_dot_q2_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
++    if (zeromoe_ggml_vec_dot_q2_0_q8_0_vnni(n, s, bs, vx, bx, vy, by, nrc)) {
++        return;
++    }
+ #if defined(__AVX2__)
+     assert(n % QK2_0 == 0);
+     assert(nrc == 1);
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 8bb0ff7bc..0138469a9 100644
+index ab82e3d..e8876a7 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1529,8 +1529,22 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+@@ -1533,8 +1533,22 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
  
                  float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
  

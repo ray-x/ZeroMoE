@@ -105,7 +105,7 @@ inline void gdn_scale(float *y, float a, int n) {
 // WHY: llama.cpp runs two different algorithms for Gated DeltaNet --
 // build_delta_net_autoregressive (sequential) ONLY when n_tokens == 1, and
 // build_delta_net_chunking (chunk size 64) for prefill
-// (buun-llama-cpp/src/models/delta-net-base.cpp:483). MoEStream uses the
+// (buun-llama-cpp/src/models/delta-net-base.cpp:483). ZeroMoE uses the
 // sequential form for both, so a 3,189-token prefill performs 3,189
 // dependent state updates per head instead of ~50 chunk matmuls. Measured
 // cost of that: 101.57s, 28% of a long prefill, the single largest bucket.

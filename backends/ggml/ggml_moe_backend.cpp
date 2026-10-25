@@ -22,7 +22,7 @@
 #include <numeric>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cuda_runtime.h>
 
@@ -99,7 +99,7 @@ bool type_supported(uint32_t t) {
 
 bool qwen_decode_sched_debug() {
   static const bool enabled = [] {
-    const char *e = std::getenv("MOESTREAM_QWEN_DECODE_SCHED_DEBUG");
+    const char *e = std::getenv("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
     return e && e[0] == '1';
   }();
   return enabled;
@@ -188,7 +188,7 @@ bool copy_router_tensor_to_host(int device, const ggml_tensor *tensor,
 
 bool backend_stream_copy_override = false;
 
-// H2D-queued-on-shared-GGML-stream mode (MOESTREAM_GGML_BACKEND_
+// H2D-queued-on-shared-GGML-stream mode (ZEROMOE_GGML_BACKEND_
 // STREAM_COPY=1 or the override flag above). TRIED earlier this session:
 // gave no measurable improvement over the plain copy_stream_ path (61.70 vs
 // 62.72 tok/s baseline) -- left OFF by default. RE-VERIFIED 2026-09-10
@@ -201,7 +201,7 @@ bool backend_stream_copy_override = false;
 // effect, confirmed against the current baseline too.
 bool use_backend_stream_copies() {
   static const bool env_enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_BACKEND_STREAM_COPY");
+    const char *env = std::getenv("ZEROMOE_GGML_BACKEND_STREAM_COPY");
     return env && env[0] == '1';
   }();
   return env_enabled || backend_stream_copy_override;
@@ -216,7 +216,7 @@ bool use_backend_stream_copies() {
 // Qwen prefill.
 bool use_direct_router_input() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_ROUTER_DIRECT_INPUT");
+    const char *env = std::getenv("ZEROMOE_GGML_ROUTER_DIRECT_INPUT");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -229,7 +229,7 @@ bool moe_ggml_planar_copies_override = false;
 // be bisected without rebuilding the engine or changing the GGML graph.
 bool use_packed_transfer() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_PLANAR_COPIES");
+    const char *env = std::getenv("ZEROMOE_GGML_PLANAR_COPIES");
     return !(env && env[0] == '1');
   }();
   return enabled && !moe_ggml_planar_copies_override;
@@ -237,7 +237,7 @@ bool use_packed_transfer() {
 
 bool trace_pure_h2d() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_TRACE_PURE_H2D");
+    const char *env = std::getenv("ZEROMOE_TRACE_PURE_H2D");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -255,7 +255,7 @@ bool async_moe_graph_reuse_override = false;
 // real Qwen prompt; the default remains the established conservative path.
 bool use_async_moe_graph_reuse() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_MOE_ASYNC_GRAPH_REUSE");
+    const char *env = std::getenv("ZEROMOE_GGML_MOE_ASYNC_GRAPH_REUSE");
     return env && env[0] == '1';
   }();
   return enabled || async_moe_graph_reuse_override;
@@ -271,7 +271,7 @@ bool use_async_moe_graph_reuse() {
 // the default follows the already opt-in async graph-reuse setting.
 bool use_direct_shared_inputs() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_SHARED_DIRECT_INPUT");
+    const char *env = std::getenv("ZEROMOE_GGML_SHARED_DIRECT_INPUT");
     if (env) return env[0] == '1';
     return use_async_moe_graph_reuse();
   }();
@@ -287,7 +287,7 @@ bool use_direct_shared_inputs() {
 // Qwen device-HC handoff; raw-pointer callers retain their existing path.
 bool use_direct_moe_input() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_MOE_DIRECT_INPUT");
+    const char *env = std::getenv("ZEROMOE_GGML_MOE_DIRECT_INPUT");
     if (env) return env[0] == '1';
     return use_async_moe_graph_reuse();
   }();
@@ -296,7 +296,7 @@ bool use_direct_moe_input() {
 
 bool debug_sync_route_inputs() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_DEBUG_SYNC_ROUTE");
+    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_SYNC_ROUTE");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -304,7 +304,7 @@ bool debug_sync_route_inputs() {
 
 bool debug_device_sync() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_DEBUG_DEVICE_SYNC");
+    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_DEVICE_SYNC");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -312,7 +312,7 @@ bool debug_device_sync() {
 
 bool debug_copy_sync() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_DEBUG_COPY_SYNC");
+    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_COPY_SYNC");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -320,7 +320,7 @@ bool debug_copy_sync() {
 
 bool trace_backend_calls() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_TRACE_BACKEND_CALLS");
+    const char *env = std::getenv("ZEROMOE_GGML_TRACE_BACKEND_CALLS");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -328,7 +328,7 @@ bool trace_backend_calls() {
 
 bool debug_check_device_output() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_DEBUG_CHECK_DEVICE_OUTPUT");
+    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_CHECK_DEVICE_OUTPUT");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -424,7 +424,7 @@ bool ggml_moe_test_download_tensor(int device, const void *tensor,
 }
 
 // ---------------------------------------------------------------------------
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 void set_moe_ggml_planar_copies(bool) {}
 void set_ggml_moe_async_graph_reuse(bool) {}
 
@@ -438,4 +438,4 @@ bool ggml_moe_test_download_tensor(int, const void *, float *, size_t) {
 }
 
 void *ggml_shared_backend(int) { return nullptr; }
-#endif  // MOESTREAM_USE_GGML_CUDA
+#endif  // ZEROMOE_USE_GGML_CUDA

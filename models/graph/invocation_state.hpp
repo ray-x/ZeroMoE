@@ -13,7 +13,7 @@
 
 #include <cstdint>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 class InvocationState {
  public:
@@ -70,4 +70,4 @@ class InvocationState {
   uint64_t generation_ = kNoGeneration;
 };
 
-}  // namespace moestream::graph
+}  // namespace zeromoe::graph

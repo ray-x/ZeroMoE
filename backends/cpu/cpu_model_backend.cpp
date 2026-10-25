@@ -29,12 +29,12 @@ CPUModelBackend::create(const GGUFFile &model_file) {
   case ModelFamily::GLM_DSA:
   case ModelFamily::DeepSeek_V3:
     std::cerr << "[CPU-MODEL] MLA backend (GLM-DSA/DeepSeek-V3) not yet "
-                 "implemented for moestream_cpu.\n";
+                 "implemented for zeromoe_cpu.\n";
     return nullptr;
 
   case ModelFamily::GLM5NEXT:
     std::cerr << "[CPU-MODEL] GLM 5.3 Flash (glm5next, hybrid KDA+DSA) not yet "
-                 "implemented for moestream_cpu -- use the main moestream "
+                 "implemented for zeromoe_cpu -- use the main zeromoe "
                  "engine path.\n";
     return nullptr;
 
@@ -63,7 +63,7 @@ CPUModelBackend::create(const GGUFFile &model_file) {
   case ModelFamily::GLM4_MOE:
   case ModelFamily::Llama:
     std::cerr << "[CPU-MODEL] DenseQKV backend (Hunyuan/Llama) not yet "
-                 "implemented for moestream_cpu.\n";
+                 "implemented for zeromoe_cpu.\n";
     return nullptr;
 
   default:

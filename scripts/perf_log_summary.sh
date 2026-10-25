@@ -5,7 +5,7 @@
 #
 # Usage:
 #   scripts/perf_summary.sh debug.log
-#   ./build/moestream --config configs/foo.toml ... 2>&1 | scripts/perf_summary.sh
+#   ./build/zeromoe --config configs/foo.toml ... 2>&1 | scripts/perf_summary.sh
 set -euo pipefail
 
 if [ "$#" -gt 1 ]; then

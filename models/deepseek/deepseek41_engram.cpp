@@ -230,7 +230,7 @@ bool hash_batch(StreamingEngine &engine, int S, int pos_base,
       c.dsv41_engram_multipliers.size() < (size_t)n_layers * max_ngram)
     return false;
 
-  // Position zero starts a new request in MoEStream; do not reuse a cached
+  // Position zero starts a new request in ZeroMoE; do not reuse a cached
   // batch from the previous request even though its position also was zero.
   if (pos_base != 0 && engine.dsv41_engram_hash_pos_base == pos_base &&
       engine.dsv41_engram_hash_batch == S &&

@@ -50,7 +50,7 @@
 #include <unistd.h>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cuda_runtime.h>
 
@@ -62,11 +62,11 @@
 #include <omp.h>
 #endif
 
-extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+extern "C" cudaStream_t zeromoe_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
-extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(
+extern "C" cudaGraph_t zeromoe_ggml_cuda_get_captured_graph(
     ggml_backend_t backend, const ggml_tensor *first_node);
-extern "C" void *moestream_qwen4exp_unpack_staged_payload_kernel_ptr();
+extern "C" void *zeromoe_qwen4exp_unpack_staged_payload_kernel_ptr();
 
 namespace qwen4exp_graph {
 
@@ -415,16 +415,16 @@ struct Qwen4ExpHostNodeCpuActivityGuard {
 };
 
 
-using moestream::graph::DeviceArena;
-using moestream::graph::HostAllocation;
-using moestream::graph::alloc_host;
-using moestream::graph::bind_host;
-using moestream::graph::host_input;
-using moestream::graph::model_tensor;
-using moestream::graph::new_tensor;
-using moestream::graph::resident;
+using zeromoe::graph::DeviceArena;
+using zeromoe::graph::HostAllocation;
+using zeromoe::graph::alloc_host;
+using zeromoe::graph::bind_host;
+using zeromoe::graph::host_input;
+using zeromoe::graph::model_tensor;
+using zeromoe::graph::new_tensor;
+using zeromoe::graph::resident;
 
-struct FullGraph : moestream::graph::GraphCore {
+struct FullGraph : zeromoe::graph::GraphCore {
   FullGraph() { mem_tag = "GGML-QWEN-FULL-MEM"; }
 
   // Chunked prefill: the tokens before this batch, and per full-attention layer the host inputs holding the K/V rows of
@@ -453,7 +453,7 @@ struct FullGraph : moestream::graph::GraphCore {
   std::unique_ptr<std::ofstream> early_route_trace;
   std::unique_ptr<Qwen4ExpStageShapeClassPool> early_stage_shapes;
   std::vector<std::unique_ptr<Qwen4ExpStagePool>> early_stage_pools;
-  // Per-layer CPU timing instrumentation (env: MOESTREAM_QWEN4EXP_GRAPH_
+  // Per-layer CPU timing instrumentation (env: ZEROMOE_QWEN4EXP_GRAPH_
   // LAYER_TIMING=1). Uses ggml_backend_sched_set_eval_callback, which fires
   // synchronously around each CPU-backend node's real compute (ggml-cpu has
   // no async concept) -- gives real per-layer/per-op CPU time that neither
@@ -474,7 +474,7 @@ struct FullGraph : moestream::graph::GraphCore {
   bool layer_timing_have_last_ask_false = false;
   double layer_timing_gap_ms_total = 0.0;
   long layer_timing_gap_count = 0;
-  // One-shot verbose node/backend dump (env: MOESTREAM_QWEN4EXP_GRAPH_
+  // One-shot verbose node/backend dump (env: ZEROMOE_QWEN4EXP_GRAPH_
   // LAYER_TIMING_VERBOSE=1) -- see env_layer_timing_verbose()'s comment.
   bool layer_timing_verbose_enabled = false;
   bool layer_timing_verbose_dumped = false;
@@ -505,14 +505,14 @@ struct FullGraph : moestream::graph::GraphCore {
   // step (not one-shot) -- for a full layer-by-layer, token-by-token parity
   // trace against llama.cpp when hidden01's 2-layer window isn't enough
   // to localize where two engines' outputs first diverge. Gated by
-  // MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP; same semantic boundary (after each
+  // ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP; same semantic boundary (after each
   // layer's attention+FFN residual combine) as hidden01_snapshot.
   std::vector<ggml_tensor *> all_layers_snapshot;
   // Optional one-shot raw routed-MoE output dump for Layer 13. This is
   // deliberately before the shared expert and residual combine so the
   // ordinary GGML CPU path and the host-node callback are compared at the
   // same semantic boundary.
-  // MOESTREAM_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
+  // ZEROMOE_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
   std::vector<std::tuple<int, ggml_tensor *, ggml_tensor *>> probe_taps;
   // Diagnostic (2026-09-17): cumulative time inside resident_tensor()'s own
   // cudaMemcpy H2D calls, across this ONE build_graph() call -- see memory:
@@ -560,7 +560,7 @@ struct FullGraph : moestream::graph::GraphCore {
   // START (layers [0, N)). Added specifically to match llama.cpp's own
   // `-ncmoe N` convention: llama-bench forces layers 0..N-1 to CPU via
   // llm_ffn_block_regex(i, ...) for i in [0,N), which leaves the LAST
-  // n_layers-N layers GPU-resident -- the opposite end from MoEStream's
+  // n_layers-N layers GPU-resident -- the opposite end from ZeroMoE's
   // historical leading-N convention. Every same-N comparison run before
   // this flag existed compared GPU residency on genuinely different
   // layers between the two engines, not just a different count. See
@@ -1017,5 +1017,5 @@ struct ExpertSplitTables {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA
 

@@ -3,12 +3,60 @@
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
 
+std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
+  const FullGraphModel *model = engine.family_ops.graph_model;
+  if (!model)
+    return {};
+  const GraphRuntimeTuning tuning = model->runtime_tuning(engine);
+  if (tuning.requires_preloaded_ddr_experts &&
+      !config.ram_preload_all_experts) {
+    if (config.ram_preload_all_experts_explicit) {
+      return std::unexpected(
+          std::string(model->name()) +
+          " graph decode requires ram_preload_all_experts=true; the explicit false value cannot seed its DDR expert arenas");
+    }
+    config.ram_preload_all_experts = true;
+    engine.qwen_ram_preload_all_experts = true;
+    LOG_INFO("[GRAPH-TUNING] %s enabled complete DDR expert preload because its decode graph requires host expert arenas\n",
+             model->name());
+  }
+  if (tuning.default_ram_pin_fraction >= 0.0 &&
+      !config.pin_ram_fraction_explicit) {
+    config.pin_ram_fraction = tuning.default_ram_pin_fraction;
+    LOG_INFO("[GRAPH-TUNING] %s RAM pin fraction defaulted to %.0f%%\n",
+             model->name(), 100.0 * config.pin_ram_fraction);
+  } else if (tuning.default_ram_pin_fraction > 0.0 &&
+             config.pin_ram_fraction < 0.5) {
+    LOG_WARN("[GRAPH-TUNING] %s explicitly leaves most DDR expert arenas pageable (pin_ram_fraction=%.2f); expert transfer throughput can be much lower\n",
+             model->name(), config.pin_ram_fraction);
+  }
+  if (tuning.default_ram_pinned_budget_gb >= 0.0 &&
+      !config.ram_pinned_budget_gb_explicit) {
+    config.ram_pinned_budget_gb = tuning.default_ram_pinned_budget_gb;
+    LOG_INFO("[GRAPH-TUNING] %s RAM pin budget defaulted to %.1f GiB\n",
+             model->name(), config.ram_pinned_budget_gb);
+  } else if (tuning.default_ram_pinned_budget_gb > 0.0 &&
+             config.ram_pinned_budget_gb <= 0.0) {
+    LOG_WARN("[GRAPH-TUNING] %s has no RAM pin budget; pin_ram_fraction cannot provide pinned expert arenas without ram_pinned_budget_gb\n",
+             model->name());
+  }
+  if (model->graph_only() && model->device_expert_layers(engine) <= 0) {
+    LOG_WARN("[GRAPH-TUNING] %s has no VRAM expert layers; all routed experts use DDR execution/transfer\n",
+             model->name());
+  }
+  engine.ram_pinned_budget_bytes = static_cast<size_t>(
+      config.ram_pinned_budget_gb * 1024.0 * 1024.0 * 1024.0);
+  return {};
+}
+
 std::expected<void, std::string> EngineRunner::run() {
   if (auto result = apply_engine_config(); !result)
     return result;
   if (auto result = init_host_and_gpu(); !result)
     return result;
   if (auto result = load_model(); !result)
+    return result;
+  if (auto result = apply_graph_tuning(); !result)
     return result;
   if (auto result = plan_expert_cache(); !result)
     return result;

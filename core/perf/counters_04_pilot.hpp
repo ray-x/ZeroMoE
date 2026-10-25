@@ -342,7 +342,7 @@ struct PerfCountersPart04 : PerfCountersPart03 {
     // async_io_queue.push_hint or publish_pilot_confirmed_resident, so
     // these counters have zero effect on cache behavior or dispatch --
     // they exist purely to get a real per-token answer to "is depth-2
-    // worth building at all" instead of the aggregate .moestream_usage
+    // worth building at all" instead of the aggregate .zeromoe_usage
     // proxy check.
     std::atomic<uint64_t> n_pilot2_recall_hits{0};
     std::atomic<uint64_t> n_pilot2_recall_checks{0};

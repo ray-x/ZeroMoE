@@ -13,8 +13,8 @@ touch ~/work/.no-arms; trap 'rm -f ~/work/.no-arms' EXIT
 inputs=logs/graph_framework/inputs; out=logs/graph_framework/$name; mkdir -p "$out"
 common=(--engine "$bin" --baseline-engine "$base" --prompt-ids $inputs/prompt.tokens
         --continuation $inputs/Q2.tokens --all-split --wait-idle "${WAIT_IDLE:-900}"
-        --baseline-env MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1
-        --candidate-env MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1)
+        --baseline-env ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1
+        --candidate-env ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1)
 python3 bench/option_b_early_ready_check.py "${common[@]}" --out-dir "$out/correctness" \
     --reps 1 --dump-logits > "$out/correctness.driver.log" 2>&1
 python3 bench/option_b_early_ready_check.py "${common[@]}" --out-dir "$out/free" \

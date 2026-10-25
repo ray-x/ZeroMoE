@@ -56,10 +56,10 @@ bool exl3_cuda_matmul_packed(float *output, const float *input,
                             int output_features);
 
 // Upstream ExLlamaV3 backed internals (src/exl3_upstream_ops.cu, built when
-// MOESTREAM_EXLLAMAV3_SRC is set). The public launch_exl3_mul1_* functions above
+// ZEROMOE_EXLLAMAV3_SRC is set). The public launch_exl3_mul1_* functions above
 // are implemented on top of them; without the option they return
 // cudaErrorNotSupported (cuda/exl3_aux.cu).
-#ifdef MOESTREAM_EXL3_UPSTREAM
+#ifdef ZEROMOE_EXL3_UPSTREAM
 bool exl3_upstream_moe_coop_enabled();
 cudaError_t exl3_upstream_matmul(const Exl3CudaMatrixView &matrix,
                                  const float *input, float *output,

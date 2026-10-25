@@ -4,7 +4,7 @@ time/token = L*t_fixed + TOPK*L*[p_cpu * t_cpu] with t_cpu = MB/eff_GBps (VRAM-r
 t_fixed is fitted to the measured early-ready decode (33.0 tok/s with 8,421 experts resident in VRAM).
 usage: qwen_capacity_model.py"""
 import sys
-USAGE = 'tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap'
+USAGE = 'tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap'
 L, TOPK, NE = 48, 10, 512
 MB, GBPS = 1.40, 14.8               # Q2_0 expert, effective CPU GB/s from the quant benchmark (937 us per 10 experts)
 counts = []

@@ -31,7 +31,7 @@ bool test_gpu_device_allowlist() {
 
 bool test_qwen_prefill_state_handoff_config() {
     std::cout << "[Test] Qwen prefill state handoff config...\n";
-    char config_path[] = "/tmp/moestream_state_handoff_config_XXXXXX";
+    char config_path[] = "/tmp/zeromoe_state_handoff_config_XXXXXX";
     const int config_fd = mkstemp(config_path);
     if (config_fd < 0)
         return false;
@@ -62,8 +62,8 @@ bool test_qwen_prefill_state_handoff_config() {
 
 bool test_graph_config() {
     std::cout << "[Test] graph_config env readers and registry...\n";
-    namespace gc = moestream::graphcfg;
-    const char *k = "MOESTREAM_TEST_GRAPH_CONFIG_KNOB";
+    namespace gc = zeromoe::graphcfg;
+    const char *k = "ZEROMOE_TEST_GRAPH_CONFIG_KNOB";
     unsetenv(k);
     bool ok = !gc::present(k) && !gc::flag_on(k) && gc::flag_unless_off(k) &&
               gc::integer(k, 7) == 7 && gc::real(k, 1.5) == 1.5 &&

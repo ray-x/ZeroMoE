@@ -5,7 +5,7 @@
 - Worktree: `ling-3.1-flash`, based on `master` at `c03d677`.
 - Model: `/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf` and its three companion shards.
 - Reference implementation: `/home/ray/Projects/llama.cpp/src/models/bailingmoe3.cpp`.
-- Existing MoEStream references: Qwen3.8 Flash Next (`qwen4exp`) and GLM5Next.
+- Existing ZeroMoE references: Qwen3.8 Flash Next (`qwen4exp`) and GLM5Next.
 
 This records the integration and a full-checkpoint full-graph comparison
 against llama.cpp. The parity run used the prompt `Hi there`, with matching
@@ -20,7 +20,7 @@ router filters to the four selected expert groups before top eight selection.
 The tokenizer recognizes the `bailingmoe2` pre-tokenizer's single-digit split,
 and the interactive prompt path renders Bailing V3's system, human, and
 assistant tags. `Ling31FlashGraphModel` enables the 72-layer GGML graph for
-both prefill and decode when `MOESTREAM_LING_FULL_GRAPH=1`. It reuses the
+both prefill and decode when `ZEROMOE_LING_FULL_GRAPH=1`. It reuses the
 GLM5Next graph lifecycle and router graph operations with Ling's own KDA,
 RoPE-split MLA, and attention-gate equations. The offload aliases configure
 layers 4–71 to read routed experts from the four GGUF shards, with an 8 GiB
@@ -32,8 +32,8 @@ The run generated two tokens, with no CUDA allocation failure or graph
 fallback.
 
 The changed C++ translation units compiled against headers from the local
-llama.cpp GGML tree. Its prebuilt GGML libraries lacked MoEStream's stream and
-captured-graph bridge symbols; an older MoEStream GGML build lacked precision
+llama.cpp GGML tree. Its prebuilt GGML libraries lacked ZeroMoE's stream and
+captured-graph bridge symbols; an older ZeroMoE GGML build lacked precision
 API used by existing GLM and DeepSeek code. The final local build used a
 temporary copy of current GGML with the bridge exports and `ggml_graph_view`
 visibility change. Patches 0011 and 0012 track those compatibility edits.
@@ -58,8 +58,8 @@ The `attention.head_count_kv` array determines the layer type: zero selects KDA 
 
 ## Full-checkpoint parity
 
-The `IQ1_S` full checkpoint was evaluated in both llama.cpp and MoEStream.
-Both used the raw prompt `Hi there`, tokenized as `[10754, 947]`. The MoEStream
+The `IQ1_S` full checkpoint was evaluated in both llama.cpp and ZeroMoE.
+Both used the raw prompt `Hi there`, tokenized as `[10754, 947]`. The ZeroMoE
 prompt-token dump matches llama.cpp. Greedy continuation IDs were `11` and
 `331` in both runtimes.
 
@@ -77,7 +77,7 @@ The run configuration is [ling-3.1-flash-fullgraph.toml](../configs/ling-3.1-fla
 It used GPU 0 (RTX 3090), a 1.5 GiB persistent expert cache, 16 active-layer
 slots, host budget 32 GiB, and the 8 GiB full-graph offload cache. It was run
 as a transient systemd service with `MemorySwapMax=0` and `MemoryMax=40G`; the
-MoEStream process reported 20.78 GB peak RSS. The run log reached layer 72/72
+ZeroMoE process reported 20.78 GB peak RSS. The run log reached layer 72/72
 in prefill and decode, and the decode graph reported 63 KDA plus 9 MLA layers.
 
 ## Build note

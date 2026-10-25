@@ -1,0 +1,4 @@
+Explain the difference between supervised and unsupervised learning with two examples each.
+Write a JavaScript function that debounces another function, and explain when to use it.
+Describe how vaccines train the immune system.
+What were the main causes of the 2008 financial crisis?

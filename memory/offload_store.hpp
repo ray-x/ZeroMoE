@@ -17,6 +17,7 @@
 #if !defined(__linux__)
 #error "offload_store.hpp needs Linux (O_DIRECT, preadv, mincore)"
 #endif
+#include "quant_table.hpp"
 #include "expert_cache.hpp"
 
 #include <array>
@@ -47,7 +48,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace moestream::offload {
+namespace zeromoe::offload {
 
 enum class ReadStatus { Ok, NotFound, SizeMismatch, IoError, ShortRead };
 inline const char *to_string(ReadStatus s) {
@@ -73,7 +74,7 @@ struct GgufHeader {
   std::string architecture;
   uint64_t data_start = 0, file_size = 0;
   std::vector<GgufTensorInfo> tensors;
-  std::vector<uint32_t> offload_layer, offload_expert; // moestream.offload.layer/expert
+  std::vector<uint32_t> offload_layer, offload_expert; // zeromoe.offload.layer/expert
 };
 
 namespace detail {
@@ -128,8 +129,8 @@ inline bool read_gguf_header(const std::string &path, GgufHeader &h, std::string
     if (!r.str(key) || !r.get(t)) return fail("truncated kv");
     if (key == "general.alignment" && t == 4) { if (!r.get(h.alignment)) return fail("truncated kv"); }
     else if (key == "general.architecture" && t == 8) { if (!r.str(h.architecture)) return fail("truncated kv"); }
-    else if (key == "moestream.offload.layer") { if (!detail::skip_value(r, t, &h.offload_layer)) return fail("bad kv"); }
-    else if (key == "moestream.offload.expert") { if (!detail::skip_value(r, t, &h.offload_expert)) return fail("bad kv"); }
+    else if (key == "zeromoe.offload.layer") { if (!detail::skip_value(r, t, &h.offload_layer)) return fail("bad kv"); }
+    else if (key == "zeromoe.offload.expert") { if (!detail::skip_value(r, t, &h.offload_expert)) return fail("bad kv"); }
     else if (!detail::skip_value(r, t, nullptr)) return fail("unsupported kv type");
   }
   h.tensors.clear();
@@ -151,16 +152,8 @@ inline bool read_gguf_header(const std::string &path, GgufHeader &h, std::string
   return true;
 }
 
-// Bytes of one row of `ne0` elements for the ggml types that appear in MoE expert tensors (0 = unknown type).
-inline uint64_t ggml_row_bytes(uint32_t type, uint64_t ne0) {
-  struct T { uint32_t type, block, bytes; };
-  static constexpr T table[] = {{0, 1, 4}, {1, 1, 2}, {2, 32, 18}, {8, 32, 34}, {10, 256, 84}, {11, 256, 110}, {12, 256, 144}, {13, 256, 176}, {14, 256, 210},
-                                {16, 256, 66}, {17, 256, 74}, {18, 256, 98}, {19, 256, 50}, {20, 32, 18}, {21, 256, 110},
-                                {22, 256, 82}, {23, 256, 136}, {29, 256, 56}, {30, 1, 2}, {39, 32, 17}, {42, 32, 10}};
-  for (const T &e : table)
-    if (e.type == type) return (ne0 / e.block) * e.bytes;
-  return 0;
-}
+// Bytes of one row of `ne0` elements (0 = unknown type). The table is shared: memory/quant_table.hpp.
+inline uint64_t ggml_row_bytes(uint32_t type, uint64_t ne0) { return zeromoe::quant::row_bytes(type, ne0); }
 
 // ---------------------------------------------------------------------------------------------------- sources
 class ExpertSource {
@@ -205,7 +198,7 @@ public:
     GgufHeader h;
     if (!read_gguf_header(path, h, err)) return false;
     auto fail = [&](const std::string &m) { if (err) *err = m + ": " + path; return false; };
-    if (h.architecture != "moestream-offload") return fail("not an offload store (architecture '" + h.architecture + "')");
+    if (h.architecture != "zeromoe-offload") return fail("not an offload store (architecture '" + h.architecture + "')");
     align_ = h.alignment;
     if (align_ == 0 || (align_ & (align_ - 1))) return fail("bad alignment");
     struct Part { uint64_t off[3] = {0, 0, 0}, bytes[3] = {0, 0, 0}; int seen = 0; };
@@ -284,7 +277,7 @@ public:
     return true;
   }
 
-  // Open either a stand-alone store (architecture moestream-offload) or the shards of a model that embeds the blocks. `path` may be a
+  // Open either a stand-alone store (architecture zeromoe-offload) or the shards of a model that embeds the blocks. `path` may be a
   // file or a directory of shards.
   // `path` may also be a ':'-separated list of files/directories (a store striped over several drives: each expert lives in exactly one
   // of them, e.g. alternate layers on two NVMes so a demand miss and the next layer's prefetch read from different devices).
@@ -319,7 +312,7 @@ public:
       return open_embedded(files, err, try_direct);
     }
     GgufHeader h;
-    if (read_gguf_header(path, h, nullptr) && h.architecture == "moestream-offload") return open(path, err, try_direct);
+    if (read_gguf_header(path, h, nullptr) && h.architecture == "zeromoe-offload") return open(path, err, try_direct);
     return open_embedded({path}, err, try_direct);
   }
 
@@ -416,7 +409,7 @@ class ModelReader final : public ExpertSource {
 public:
   bool drop_page_cache = true;
   std::atomic<uint64_t> reads{0}; // experts served from the main model (buffered per-plane preads)
-  ModelReader() { if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_MODEL_DIRECT")) use_direct = e[0] == '1'; }
+  ModelReader() { if (const char *e = std::getenv("ZEROMOE_GLM5NEXT_MODEL_DIRECT")) use_direct = e[0] == '1'; }
   ~ModelReader() override {
     for (int fd : fds_) if (fd >= 0) ::close(fd);
     for (int fd : fds_dir_) if (fd >= 0) ::close(fd);
@@ -425,7 +418,7 @@ public:
   }
   // Planes whose file offset, size and destination are 4096-aligned bypass the page cache (O_DIRECT): the same bandwidth as the
   // buffered path for ~1/6 of the CPU, which matters because the CPU expert matmuls run at the same time.
-  bool use_direct = false; // opt-in via MOESTREAM_GLM5NEXT_MODEL_DIRECT=1: no decode gain measured
+  bool use_direct = false; // opt-in via ZEROMOE_GLM5NEXT_MODEL_DIRECT=1: no decode gain measured
   std::atomic<uint64_t> direct_planes{0}, buffered_planes{0};
   ModelReader(const ModelReader &) = delete;
   ModelReader &operator=(const ModelReader &) = delete;
@@ -623,7 +616,7 @@ public:
   void populated(int layer, int expert) { if (after_populate) after_populate(layer, expert); }
   void transient_populated(int layer, int expert) { if (after_transient) after_transient(layer, expert); }
   // Return one expert's pages to the OS; the slot reads as zeros until it is populated again.
-  // Default on (MOESTREAM_OFFLOAD_RETARGET=0 disables): hand a victim's already-populated pages to the expert that replaces it instead of
+  // Default on (ZEROMOE_OFFLOAD_RETARGET=0 disables): hand a victim's already-populated pages to the expert that replaces it instead of
   // freeing them (madvise) and faulting + zeroing fresh ones. mremap(MREMAP_DONTUNMAP) moves the page-table entries of each plane to
   // the new expert's address and leaves an empty anonymous mapping (same VMA flags, e.g. NOHUGEPAGE) behind. The caller holds the
   // arena lock exactly as for evict(). Returns false (nothing moved, nothing freed) when a plane cannot be moved.
@@ -657,11 +650,11 @@ public:
   }
   void evict(int layer, int expert) {
     if (before_evict) before_evict(layer, expert);
-    // MOESTREAM_OFFLOAD_EVICT=free: MADV_FREE instead of MADV_DONTNEED. The pages stay mapped until the kernel needs them, so the next
+    // ZEROMOE_OFFLOAD_EVICT=free: MADV_FREE instead of MADV_DONTNEED. The pages stay mapped until the kernel needs them, so the next
     // read into the slot skips the page fault and zero-fill (measured ~0.5 ms of CPU and ~20% of the read time per 7 MB expert), at
     // the price of a soft memory budget: freed slots are reclaimed under pressure, not immediately.
     static const int advice = [] {
-      const char *v = std::getenv("MOESTREAM_OFFLOAD_EVICT");
+      const char *v = std::getenv("ZEROMOE_OFFLOAD_EVICT");
 #ifdef MADV_FREE
       if (v && std::strcmp(v, "free") == 0) return static_cast<int>(MADV_FREE);
 #endif
@@ -746,8 +739,8 @@ public:
   };
 
   // Page-reusing eviction (see docs/offload-retarget.md). Default on: this class only exists when SSD offload is active.
-  // MOESTREAM_OFFLOAD_RETARGET=0 restores madvise(DONTNEED) eviction.
-  bool retarget_ = [] { const char *e = std::getenv("MOESTREAM_OFFLOAD_RETARGET"); return !(e && e[0] == '0'); }();
+  // ZEROMOE_OFFLOAD_RETARGET=0 restores madvise(DONTNEED) eviction.
+  bool retarget_ = [] { const char *e = std::getenv("ZEROMOE_OFFLOAD_RETARGET"); return !(e && e[0] == '0'); }();
 
   // Phase 1. The caller holds the arena lock exclusively. Bookkeeping only, no I/O.
   Plan begin(int layer, const int32_t *ids, int n, ExpertCache::Kind kind = ExpertCache::Kind::Demand) {
@@ -921,17 +914,17 @@ public:
     Ensure r;
     const auto t0 = std::chrono::steady_clock::now();
     load_transient(layer, to_load, r);
-    if (std::getenv("MOESTREAM_OFFLOAD_DEBUG_PREFETCH"))
+    if (std::getenv("ZEROMOE_OFFLOAD_DEBUG_PREFETCH"))
       std::fprintf(stderr, "[PREFETCH] layer=%d experts=%zu errors=%d %.1f ms\n", layer, to_load.size(), r.errors,
                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return r.errors;
   }
 
-  // Read `experts` of `layer` `par` at a time (MOESTREAM_OFFLOAD_TRANSIENT_PAR, default 8, 1 = serial) so a store striped
+  // Read `experts` of `layer` `par` at a time (ZEROMOE_OFFLOAD_TRANSIENT_PAR, default 8, 1 = serial) so a store striped
   // over several drives is read by all of them at once.
   void load_transient(int layer, const std::vector<int> &to_load, Ensure &r) {
     static const size_t par = [] {
-      const char *e = std::getenv("MOESTREAM_OFFLOAD_TRANSIENT_PAR");
+      const char *e = std::getenv("ZEROMOE_OFFLOAD_TRANSIENT_PAR");
       return static_cast<size_t>(e ? std::max(1, std::atoi(e)) : 8);
     }();
     for (size_t i = 0; i < to_load.size(); i += par) {
@@ -971,12 +964,12 @@ public:
   }
 
   // Load every currently resident (seeded) expert; returns how many could not be loaded (they are dropped).
-  // Reads run `par` at a time (MOESTREAM_OFFLOAD_SEED_PAR, default 8, 1 = serial) so a store striped over several drives
+  // Reads run `par` at a time (ZEROMOE_OFFLOAD_SEED_PAR, default 8, 1 = serial) so a store striped over several drives
   // is read by all of them at once.
   size_t populate_resident() {
     size_t failed = 0;
     int par = 8;
-    if (const char *e = std::getenv("MOESTREAM_OFFLOAD_SEED_PAR")) par = std::max(1, std::atoi(e));
+    if (const char *e = std::getenv("ZEROMOE_OFFLOAD_SEED_PAR")) par = std::max(1, std::atoi(e));
     const ExpertCache::Config &c = cache_.config();
     std::vector<int> batch;
     for (int L = c.first_layer; L < c.first_layer + c.n_layers; ++L) {
@@ -1023,4 +1016,4 @@ private:
   std::atomic<uint64_t> waited_{0}, wait_us_{0};
 };
 
-} // namespace moestream::offload
+} // namespace zeromoe::offload

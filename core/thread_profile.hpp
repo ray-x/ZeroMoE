@@ -1,7 +1,7 @@
 #pragma once
 
 // Opt-in thread naming/placement for decode diagnostics.  This helper is
-// deliberately inert unless MOESTREAM_THREAD_PROFILE=1 is set: changing
+// deliberately inert unless ZEROMOE_THREAD_PROFILE=1 is set: changing
 // affinity or scheduling policy globally would make an A/B benchmark invalid
 // and can make a production process harder to recover.
 
@@ -36,24 +36,24 @@ struct ThreadProfile {
   bool apply_nice = false;
 };
 
-inline bool moestream_thread_profile_enabled() {
-  const char *value = std::getenv("MOESTREAM_THREAD_PROFILE");
+inline bool zeromoe_thread_profile_enabled() {
+  const char *value = std::getenv("ZEROMOE_THREAD_PROFILE");
   return value && (value[0] == '1' || value[0] == 'y' || value[0] == 'Y' ||
                    value[0] == 't' || value[0] == 'T');
 }
 
-inline bool moestream_thread_profile_rt_enabled() {
-  const char *value = std::getenv("MOESTREAM_THREAD_PROFILE_RT");
+inline bool zeromoe_thread_profile_rt_enabled() {
+  const char *value = std::getenv("ZEROMOE_THREAD_PROFILE_RT");
   return value && value[0] == '1';
 }
 
-inline bool moestream_thread_profile_nice_enabled() {
-  const char *value = std::getenv("MOESTREAM_THREAD_PROFILE_APPLY_NICE");
+inline bool zeromoe_thread_profile_nice_enabled() {
+  const char *value = std::getenv("ZEROMOE_THREAD_PROFILE_APPLY_NICE");
   return value && value[0] == '1';
 }
 
 #if defined(__linux__)
-namespace moestream_thread_profile_detail {
+namespace zeromoe_thread_profile_detail {
 
 inline bool read_int_file(const std::string &path, int &value) {
   std::ifstream input(path);
@@ -111,13 +111,13 @@ inline bool set_nice_for_current_thread(int value) {
   return setpriority(PRIO_PROCESS, tid, value) == 0;
 }
 
-} // namespace moestream_thread_profile_detail
+} // namespace zeromoe_thread_profile_detail
 #endif
 
 inline std::vector<int>
-moestream_thread_profile_physical_core(int physical_core_index) {
+zeromoe_thread_profile_physical_core(int physical_core_index) {
 #if defined(__linux__)
-  return moestream_thread_profile_detail::physical_core_cpus(
+  return zeromoe_thread_profile_detail::physical_core_cpus(
       physical_core_index);
 #else
   (void)physical_core_index;
@@ -126,7 +126,7 @@ moestream_thread_profile_physical_core(int physical_core_index) {
 }
 
 inline void configure_current_thread(const ThreadProfile &profile) {
-  if (!moestream_thread_profile_enabled())
+  if (!zeromoe_thread_profile_enabled())
     return;
 
 #if defined(__linux__)
@@ -154,7 +154,7 @@ inline void configure_current_thread(const ThreadProfile &profile) {
   }
 
   bool rt_applied = false;
-  if (profile.use_rt && moestream_thread_profile_rt_enabled()) {
+  if (profile.use_rt && zeromoe_thread_profile_rt_enabled()) {
     sched_param param{};
     param.sched_priority = std::clamp(profile.rt_priority, 1, 99);
     const int rc = pthread_setschedparam(thread, SCHED_FIFO, &param);
@@ -172,8 +172,8 @@ inline void configure_current_thread(const ThreadProfile &profile) {
   // after an explicitly requested RT policy failed.  A failed negative nice
   // request is reported, never treated as a silent success.
   if (!rt_applied &&
-      (profile.apply_nice || moestream_thread_profile_nice_enabled())) {
-    if (moestream_thread_profile_detail::set_nice_for_current_thread(
+      (profile.apply_nice || zeromoe_thread_profile_nice_enabled())) {
+    if (zeromoe_thread_profile_detail::set_nice_for_current_thread(
             profile.nice_value)) {
       LOG_INFO("[THREAD-PROFILE] %s: nice=%d\n", profile.name.c_str(),
                profile.nice_value);
@@ -188,7 +188,7 @@ inline void configure_current_thread(const ThreadProfile &profile) {
            profile.name.c_str(), profile.cpu_ids.size(),
            rt_applied ? "SCHED_FIFO" : "off",
            (!rt_applied &&
-            (profile.apply_nice || moestream_thread_profile_nice_enabled()))
+            (profile.apply_nice || zeromoe_thread_profile_nice_enabled()))
                ? "requested"
                : "off");
 #else

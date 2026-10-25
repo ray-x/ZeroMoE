@@ -3,7 +3,7 @@
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 
 cpu_affinity_layers = [0, 1, 2, 3, 4, 5, 6, 7, 14, 20, 21, 22, 24, 28, 30, 33, 34, 36, 38, 40, 41, 42, 43, 44, 45, 46]
-log_path = "/tmp/moestream_qwen4exp_tg400_iq1m.log"
+log_path = "/tmp/zeromoe_qwen4exp_tg400_iq1m.log"
 log_level = "INFO"
 
 context_size = 416
@@ -25,8 +25,8 @@ expert_fetch_threads = 10
 omp_max_threads = 12
 prefetch_worker_threads = 4
 
-pin_file = "tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap"
-prefill_pin_file = "tests/moe_usage_survey/moestream_usage_survey_prefill"
+pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
+prefill_pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_prefill"
 freeze_usage_stats = true
 
 qwen4exp_option_b_layer = -1

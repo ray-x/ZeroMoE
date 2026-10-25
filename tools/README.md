@@ -2,11 +2,11 @@ ld
 
 # tools/
 
-`gguf_tool` — a standalone utility that ships alongside MoEStream but builds
+`gguf_tool` — a standalone utility that ships alongside ZeroMoE but builds
 independently of it. Pure file I/O — no CUDA, no ggml, no OpenMP — so it
 builds and runs on any machine with a C++20/23 compiler, including one
 without a GPU (this is how it was developed and tested: on a darwin/Apple
-Silicon box that can't build the main `moestream` engine at all).
+Silicon box that can't build the main `zeromoe` engine at all).
 
 One binary, four subcommands:
 
@@ -15,7 +15,7 @@ One binary, four subcommands:
 | [`pack`](#pack--align-or-unpack-a-gguf-model-for-o_direct-streaming) | Re-align (default) or unpack GGUF tensors for `O_DIRECT` streaming.      |
 | [`verify`](#verify--pre-flight-completeness--byte-compare-gate)      | Pre-flight completeness gate + optional byte-compare between two models. |
 | [`io`](#io--crossplatform-per-expert-read-pattern-ab-benchmark)      | A/B per-expert read-throughput benchmark, original vs repacked.          |
-| [`plan`](#plan--dense-moe--system-sizing-advisor)                     | Read-only sizing advisor: dense/MoE VRAM requirement, detected GPU/RAM, `.moestream_usage` summary. |
+| [`plan`](#plan--dense-moe--system-sizing-advisor)                     | Read-only sizing advisor: dense/MoE VRAM requirement, detected GPU/RAM, `.zeromoe_usage` summary. |
 
 > **Prerequisite — MoE model only.** These tools only apply to
 > Mixture-of-Experts models whose GGUF files contain Unsloth-style packed
@@ -137,7 +137,7 @@ to `general.alignment` (4096 bytes by default) and copies every tensor
 byte-for-byte, **including packed `*_exps` tensors, unchanged**. This is
 the recommended, engine-safe mode:
 
-- Keeps the packed `*_exps` format MoEStream's engine natively loads and
+- Keeps the packed `*_exps` format ZeroMoE's engine natively loads and
   whose VRAM expert fast-path (`populate_vram_shadow`/`packed_slab_geometry`)
   requires — **zero engine changes needed**.
 - Makes every expert slice start at a block-aligned offset, the
@@ -160,7 +160,7 @@ expert with one coalesced `pread`.
 
 #### Automatic Interleaved Read Detection
 
-MoEStream's engine **automatically detects** contiguous per-expert layouts
+ZeroMoE's engine **automatically detects** contiguous per-expert layouts
 (as produced by `--unpack`) and optimizes the read strategy:
 
 - **Contiguous experts detected**: single coalesced `pread` fetches all
@@ -241,7 +241,7 @@ usage during a full-model conversion is "one source shard + its output,"
 not "the whole model, twice."
 
 Verification is mandatory in spirit even though `--verify-samples 0` is
-technically allowed: it reloads the just-written output with MoEStream's
+technically allowed: it reloads the just-written output with ZeroMoE's
 own real GGUF loader and confirms tensor counts plus a byte-exact
 comparison against the source for the sampled (or, with `--verify-all`,
 every) tensor. Read its output before trusting a repacked file, and never
@@ -390,7 +390,7 @@ detection) and this machine's config to print:
   `nvidia-smi`, best-effort — silently skipped, not an error, on a
   no-NVIDIA/macOS box) and total system RAM (`/proc/meminfo` on Linux,
   `sysctl` on macOS).
-- **`.moestream_usage` summary**, if the file exists — how many
+- **`.zeromoe_usage` summary**, if the file exists — how many
   `(layer,expert)` pairs have real routing history, and per-layer top-K
   traffic concentration (for K=8/11/16) so `pin_topk_per_layer` can be
   chosen from real data instead of a guess, even before a first real run
@@ -410,5 +410,5 @@ check a real run's own `"[GRAPH] KV cache: ... GB"` log line for that.
 gguf_tool plan <model_file_or_dir> [--usage-file <path>]
 ## sample
 ./build/gguf_tool plan /path/to/model/
-./build/gguf_tool plan /path/to/model/ --usage-file /path/to/.moestream_usage
+./build/gguf_tool plan /path/to/model/ --usage-file /path/to/.zeromoe_usage
 ```

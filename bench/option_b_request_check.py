@@ -28,15 +28,15 @@ def main():
     requests = [PROMPTS['code'], PROMPTS['creative'], PROMPTS['code']]
     (out / 'requests.txt').write_text('\n'.join(requests) + '\n:q\n')
     hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (engine, A)}
-    env = {k: v for k, v in os.environ.items() if not k.startswith('MOESTREAM_')}
+    env = {k: v for k, v in os.environ.items() if not k.startswith('ZEROMOE_')}
     for name in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(name, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-        MOESTREAM_QWEN4EXP_FULL_GRAPH='1', MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE='1',
-        MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0', MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
-        MOESTREAM_QWEN_CPU_THREADS='10', MOESTREAM_BENCH_IGNORE_STOP='0',
-        MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT='1', MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES='1',
-        MOESTREAM_QWEN_EARLY_READY_PREDICT='1')
+        ZEROMOE_QWEN4EXP_FULL_GRAPH='1', ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE='1',
+        ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0', ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
+        ZEROMOE_QWEN_CPU_THREADS='10', ZEROMOE_BENCH_IGNORE_STOP='0',
+        ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT='1', ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES='1',
+        ZEROMOE_QWEN_EARLY_READY_PREDICT='1')
     results = {}
     (out / 'manifest.json').write_text(json.dumps({'hashes': hashes, 'ngen': args.ngen,
         'requests': requests, 'timing_valid': False}, indent=2) + '\n')
@@ -49,8 +49,8 @@ def main():
         config.write_text(setting(A.read_text(), 'log_path', json.dumps(str(log))))
         runtime = dict(env)
         if arm == 'staging':
-            runtime.update(MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER='all',
-                           MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY='1')
+            runtime.update(ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER='all',
+                           ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY='1')
         print(f'Running {arm}: three natural-stop requests', flush=True)
         with (out / f'{arm}.stdout').open('w') as output:
             subprocess.run([str(engine), '--config', str(config), '--ngen', str(args.ngen)],

@@ -6,7 +6,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -161,7 +161,7 @@ bool packed_gate_up_meta(const StreamingEngine &engine, int layer,
 }
 
 double full_graph_resident_gb(const char *name) {
-  const char *v = moestream::graphcfg::env(name);
+  const char *v = zeromoe::graphcfg::env(name);
   if (!v || !v[0])
     return 0.0;
   char *end = nullptr;
@@ -216,12 +216,12 @@ size_t graph_host_live_bytes(const StreamingEngine &engine) {
 }
 
 std::string partial_usage_path(const FullGraph &g) {
-  const char *env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_USAGE_FILE");
+  const char *env = zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_USAGE_FILE");
   if (env && env[0])
     return env;
   return g.engine->family_ops.family == ModelFamily::DeepSeek_V4
-             ? ".moestream_ds4_usage_prefill"
-             : ".moestream_usage_prefill_glm53flash";
+             ? ".zeromoe_ds4_usage_prefill"
+             : ".zeromoe_usage_prefill_glm53flash";
 }
 
 PartialExpertLayer *partial_layer(FullGraph &g, int layer) {
@@ -988,7 +988,7 @@ bool preload_expert_source(FullGraph &g) {
   // This is boot-time I/O, so cap the default at two; an explicit override is
   // available for a machine with more headroom.
   unsigned read_threads = 2;
-  if (const char *env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_READ_THREADS")) {
+  if (const char *env = zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_READ_THREADS")) {
     char *end = nullptr;
     const long n = std::strtol(env, &end, 10);
     if (end != env && *end == '\0' && n > 0)
@@ -1076,11 +1076,11 @@ bool preload_expert_source(FullGraph &g) {
   // slices once, preserving the graph's single arena and avoiding a second
   // full-size host allocation.  The default cap is deliberately below the
   // 10--30 GiB aggregate registration failure range observed on this box;
-  // callers can lower or raise it with MOESTREAM_FULL_GRAPH_PIN_GB, while a
+  // callers can lower or raise it with ZEROMOE_FULL_GRAPH_PIN_GB, while a
   // registration failure stops the pass and leaves the remaining slices
   // pageable rather than retrying until the machine is under pressure.
   size_t pin_budget = g.engine->ram_pinned_budget_bytes;
-  const char *pin_env = moestream::graphcfg::env("MOESTREAM_FULL_GRAPH_PIN_GB");
+  const char *pin_env = zeromoe::graphcfg::env("ZEROMOE_FULL_GRAPH_PIN_GB");
   if (pin_env && pin_env[0]) {
     char *end = nullptr;
     const double gb = std::strtod(pin_env, &end);
@@ -1194,4 +1194,4 @@ bool preload_expert_source(FullGraph &g) {
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# tests/parity_check_greedy.sh — end-to-end confirmation that MoEStream's MLA
+# tests/parity_check_greedy.sh — end-to-end confirmation that ZeroMoE's MLA
 # forward path matches the reference (llama.cpp) on the SAME gguf + prompt.
 #
 # This is the high-fidelity companion to tests/test_components.cpp::test_rope:
@@ -22,7 +22,7 @@ set -euo pipefail
 
 MODEL="${PARITY_MODEL:?set PARITY_MODEL to the gguf dir/file}"
 LLAMA_CLI="${LLAMA_CLI_CLI:-./llama-cli}"        # TODO: path to llama.cpp's llama-cli
-MOESTREAM="./build/moestream"                     # TODO: path to MoEStream binary
+ZEROMOE="./build/zeromoe"                     # TODO: path to ZeroMoE binary
 CONFIG="${PARITY_CONFIG:-configs/glm52_dual.toml}"
 PROMPT="${PROMPT:-Hello, who are you?}"
 N="${N:-64}"                                       # tokens to generate
@@ -37,20 +37,20 @@ echo ">> generating $N greedy tokens from each engine (temp=0)..."
 "$LLAMA_CLI" -m "$MODEL" -p "$PROMPT" --temp 0 -n "$N" --no-display-prompt \
     >"$TMP/llama.txt" 2>"$TMP/llama_err.txt" || true
 
-# --- MoEStream (greedy). Pipe the prompt into the REPL; --temp 0 = greedy. ---
-# TODO: if moestream lacks a non-interactive prompt mode, this pipes one line
+# --- ZeroMoE (greedy). Pipe the prompt into the REPL; --temp 0 = greedy. ---
+# TODO: if zeromoe lacks a non-interactive prompt mode, this pipes one line
 # then ':q'. Strip the "Output:" / banner lines to get raw generation.
-printf '%s\n:q\n' "$PROMPT" | "$MOESTREAM" --config "$CONFIG" --temp 0 --ngen "$N" \
+printf '%s\n:q\n' "$PROMPT" | "$ZEROMOE" --config "$CONFIG" --temp 0 --ngen "$N" \
     >"$TMP/moe.raw" 2>"$TMP/moe_err.txt" || true
 
-# Normalize: keep only the generated text (drop MoEStream banner/log lines).
+# Normalize: keep only the generated text (drop ZeroMoE banner/log lines).
 grep -A9999 '^Output:' "$TMP/moe.raw" | tail -n +2 > "$TMP/moe.txt" || cp "$TMP/moe.raw" "$TMP/moe.txt"
 
 echo
 echo "==== llama.cpp (reference) ===="
 cat "$TMP/llama.txt"
 echo
-echo "==== MoEStream ===="
+echo "==== ZeroMoE ===="
 cat "$TMP/moe.txt"
 echo
 echo "==== first-token / prefix comparison ===="

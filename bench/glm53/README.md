@@ -11,10 +11,13 @@ Files:
 Peak recipe (short prompt, 64 GiB DDR pool):
 
     systemd-run --user --scope -p MemorySwapMax=0 bench/glm53/run_ab.sh peak \
-      MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
-      MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
-      MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 # MOESTREAM_OFFLOAD_RETARGET is on by default (=0 disables)
+      ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
+      ZEROMOE_GLM5NEXT_PILOT_PREFETCH=3 ZEROMOE_GLM5NEXT_PILOT_STAGE=3 \
+      ZEROMOE_GLM5NEXT_MODEL_DIRECT=1 # ZEROMOE_OFFLOAD_RETARGET is on by default (=0 disables)
 
-Long prompt (426 tokens): `PROMPT_TEXT=<prompt> OFFLOAD_DDR_GIB=74 MOESTREAM_MEM_GUARD_FLOOR_MB=16384` plus the recipe above.
-Needs MOESTREAM_BIN (default `./build/moestream`) built Release with the ggml tree that carries patches 0006/0007, and the paths in the
+Long prompt (426 tokens): `PROMPT_TEXT=<prompt> OFFLOAD_DDR_GIB=74 ZEROMOE_MEM_GUARD_FLOOR_MB=16384` plus the recipe above.
+Needs ZEROMOE_BIN (default `./build/zeromoe`) built Release with the ggml tree that carries patches 0006/0007, and the paths in the
 toml / scripts (model dir, offload store `/data/glm53_offload.gguf`, usage files) adjusted for your machine.
+
+Earlier-iteration scripts and configs (the `*_426.sh` runners, survey/route-trace scripts, `ab_pilot.sh`, `check/`, the first `glm53_dsa_graph*.toml`) are archived in
+`obsolete/glm53-logs-scripts/`. They use the old `MOESTREAM_*` env vars and `./build/moestream`, and are kept as the record behind `docs/perf-baselines.md`.

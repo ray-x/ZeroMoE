@@ -20,7 +20,7 @@
 #include <mutex>
 #include <unordered_map>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 class OffloadExpertRuntime;
 
@@ -47,8 +47,8 @@ class OffloadExpertRuntime {
   int first_layer() const { return first_; }
   int n_layers() const { return n_layers_; }
   int n_experts() const { return n_experts_; }
-  moestream::offload::ExpertStore &store() { return *store_; }
-  moestream::offload::VirtualArena &arena() { return *arena_; }
+  zeromoe::offload::ExpertStore &store() { return *store_; }
+  zeromoe::offload::VirtualArena &arena() { return *arena_; }
   bool covers(int layer) const {
     return layer >= first_ && layer < first_ + n_layers_;
   }
@@ -58,10 +58,10 @@ class OffloadExpertRuntime {
               const std::string &usage_file, const SeedExclusions *exclusions,
               std::string *err) {
     const auto &c = engine.model_file.architecture_config;
-    moestream::offload::ExpertStoreConfig sc;
+    zeromoe::offload::ExpertStoreConfig sc;
     if (!make_store_config(engine, profile, &sc, err))
       return false;
-    store_ = moestream::offload::ExpertStore::create(sc, err);
+    store_ = zeromoe::offload::ExpertStore::create(sc, err);
     if (!store_)
       return false;
     arena_ = &store_->arena();
@@ -167,12 +167,12 @@ class OffloadExpertRuntime {
       for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
         ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
                                          i0 * a->nb[0]));
-    moestream::offload::ExpertResidency::Ensure r;
+    zeromoe::offload::ExpertResidency::Ensure r;
     if (site->prefill)
       r = store.ensure_transient(site->layer, ids.data(), (int)ids.size());
     else
       r = store.ensure(site->layer, ids.data(), (int)ids.size(),
-                       moestream::offload::ExpertCache::Kind::Demand);
+                       zeromoe::offload::ExpertCache::Kind::Demand);
     auto &ct = store.counters();
     ct.calls.fetch_add(1, std::memory_order_relaxed);
     ct.routes.fetch_add(ids.size(), std::memory_order_relaxed);
@@ -203,8 +203,8 @@ class OffloadExpertRuntime {
         std::memory_order_relaxed);
   }
 
-  std::unique_ptr<moestream::offload::ExpertStore> store_;
-  moestream::offload::VirtualArena *arena_ = nullptr;
+  std::unique_ptr<zeromoe::offload::ExpertStore> store_;
+  zeromoe::offload::VirtualArena *arena_ = nullptr;
   int first_ = 0, n_layers_ = 0, n_experts_ = 0;
   const char *tag_ = "[OFFLOAD]";
   std::deque<OffloadMissSite> sites_;
@@ -212,4 +212,4 @@ class OffloadExpertRuntime {
   std::weak_ptr<GpuAssistShared> rings_[2];
 };
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

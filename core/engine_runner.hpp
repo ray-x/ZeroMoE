@@ -12,7 +12,7 @@
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_decode.hpp"
-#if defined(MOESTREAM_EXL3_CUDA)
+#if defined(ZEROMOE_EXL3_CUDA)
 #include "exl3_gpu.hpp"
 #endif
 #include "exllamav3_backend.hpp"
@@ -33,7 +33,7 @@
 #include "shutdown.hpp"
 #include "startup_preflight.hpp"
 #include "tensor_trace.hpp"
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
 #include "ggml.h"
 #endif
 #include <algorithm>
@@ -70,6 +70,7 @@ private:
   std::expected<void, std::string> apply_engine_config();
   std::expected<void, std::string> init_host_and_gpu();
   std::expected<void, std::string> load_model();
+  std::expected<void, std::string> apply_graph_tuning();
   std::expected<void, std::string> plan_expert_cache();
   std::expected<void, std::string> setup_vram_expert_cache();
   std::expected<void, std::string> offload_dense_tensors();
@@ -83,7 +84,9 @@ private:
       const std::string &path, const char *source,
       std::vector<StreamingEngine::UsageEntry> raw);
 
-  const EngineConfig &config;
+  // Keep an owned copy: model-resolved graph tuning can fill defaults after
+  // the GGUF architecture is known without mutating the caller's config.
+  EngineConfig config;
   const bool cufile_driver_opened;
   // Long-lived subsystems (formerly locals of run_engine, same declaration order).
   StreamingEngine engine;

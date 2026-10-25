@@ -16,7 +16,7 @@ class RAMSafetyManager;
 class LockFreePrefetcher;
 struct LayerScratch;
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 enum class ExpertPlacementClass : uint8_t {
   AllVram,
@@ -115,4 +115,4 @@ inline MoEBlockSpec moe_block_spec(const ArchitectureConfig &c) {
           .n_shared_experts = c.n_expert_shared};
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

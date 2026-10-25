@@ -179,7 +179,7 @@ static-pinning switch:
 ```toml
 qwen4exp_cpu_offload = true
 qwen4exp_cpu_offload_layers = [13]
-qwen4exp_cpu_offload_hot_source = ".moestream_usage_qwen4exp_7prompts_isolated"
+qwen4exp_cpu_offload_hot_source = ".zeromoe_usage_qwen4exp_7prompts_isolated"
 qwen4exp_cpu_offload_hot_fraction = 0.50
 qwen4exp_cpu_offload_max_cold = 10
 qwen4exp_cpu_offload_event_fence = false

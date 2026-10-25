@@ -1,6 +1,6 @@
 # Narrow Layer-0 host-node residual/consumer diagnostic.
-# Use MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2=1 for tensor snapshots and
-# MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL=1 for the diagnostic-only one-layer
+# Use ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2=1 for tensor snapshots and
+# ZEROMOE_QWEN4EXP_DIAG_LAYER0_RESIDUAL=1 for the diagnostic-only one-layer
 # DDR-arena admission used with this profile.
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
 log_path = "logs/qwen4exp_cpu_offload_layer0_residual_diag.log"
@@ -24,8 +24,8 @@ expert_fetch_threads = 10
 omp_max_threads = 12
 prefetch_worker_threads = 4
 
-pin_file = ".moestream_usage_qwen4exp_7prompts_isolated"
-prefill_pin_file = ".moestream_usage_qwen4exp_prefill_7prompts_isolated"
+pin_file = ".zeromoe_usage_qwen4exp_7prompts_isolated"
+prefill_pin_file = ".zeromoe_usage_qwen4exp_prefill_7prompts_isolated"
 freeze_usage_stats = true
 move_on_promotion = false
 

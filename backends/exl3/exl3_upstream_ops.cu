@@ -106,7 +106,7 @@ cudaError_t gemm(Workspace &w, const Exl3CudaMatrixView &m, const float *input,
       Tensor(w.had, {rows, m.input_features}, at::kHalf, device);
   c10::optional<Tensor> svh = Tensor(const_cast<uint16_t *>(m.svh),
                                      {m.output_features / 16}, at::kHalf, device);
-  moestream_exl3::set_current_stream(stream);
+  zeromoe_exl3::set_current_stream(stream);
   try {
     exl3_gemm(A, B, C, suh, had, svh, 0, false, true, 0);
   } catch (const c10::Error &) {
@@ -123,10 +123,10 @@ cudaError_t gemm(Workspace &w, const Exl3CudaMatrixView &m, const float *input,
 } // namespace
 
 // Fused exl3_moe_coop routed FFN (two launches per layer). Opt-out for A/B:
-// MOESTREAM_EXL3_MOE_COOP=0 uses one upstream exl3_gemm sequence per expert.
+// ZEROMOE_EXL3_MOE_COOP=0 uses one upstream exl3_gemm sequence per expert.
 bool exl3_upstream_moe_coop_enabled() {
   static const bool active = [] {
-    const char *v = std::getenv("MOESTREAM_EXL3_MOE_COOP");
+    const char *v = std::getenv("ZEROMOE_EXL3_MOE_COOP");
     return !v || v[0] != '0';
   }();
   return active;
@@ -330,7 +330,7 @@ cudaError_t exl3_upstream_routed_ffn(
   p.runs = p.ctr_b + p.ctr_b_len;
   p.out = output; p.out_stride = hidden;
   try {
-    moestream_exl3::set_current_stream(stream);
+    zeromoe_exl3::set_current_stream(stream);
     exl3_moe_coop_launch(p, static_cast<float>(bits_gu), static_cast<float>(bits_d),
                          /*cb=mul1*/ 2, device, stream);
   } catch (const c10::Error &) {

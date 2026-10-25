@@ -54,7 +54,7 @@ inline void check_hidden_finite(const char* label, const float* data, size_t n) 
 // absolute logit delta instead of relying only on sampled text.
 inline void dump_decode_logits_if_enabled(int step, const float *logits,
                                           size_t n) {
-    static const char *path = std::getenv("MOESTREAM_DECODE_LOGITS_DUMP");
+    static const char *path = std::getenv("ZEROMOE_DECODE_LOGITS_DUMP");
     if (!path || !path[0] || !logits || n == 0)
         return;
 
@@ -76,7 +76,7 @@ inline void dump_decode_logits_if_enabled(int step, const float *logits,
 // output-projection-only difference during llama.cpp parity checks.
 inline void dump_prefill_final_hidden_if_enabled(int step, const float *hidden,
                                                   size_t n) {
-    static const char *path = std::getenv("MOESTREAM_PREFILL_FINAL_HIDDEN_DUMP");
+    static const char *path = std::getenv("ZEROMOE_PREFILL_FINAL_HIDDEN_DUMP");
     if (step != 0 || !path || !path[0] || !hidden || n == 0)
         return;
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -105,7 +105,7 @@ inline uint64_t decode_logits_fnv64(const float *logits, size_t n) {
 
 inline bool decode_logits_hash_enabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("MOESTREAM_DECODE_LOGITS_HASH");
+        const char *value = std::getenv("ZEROMOE_DECODE_LOGITS_HASH");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -119,7 +119,7 @@ inline bool decode_logits_hash_enabled() {
 // with llama.cpp launched using -b 1 -ub 1.
 inline bool prefill_unbatched_enabled() {
     static const bool enabled = [] {
-        const char *value = std::getenv("MOESTREAM_PREFILL_UNBATCHED");
+        const char *value = std::getenv("ZEROMOE_PREFILL_UNBATCHED");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -136,13 +136,13 @@ inline void log_decode_logits_hash(int step, uint64_t hash, int sampled_token,
 }
 
 // Diagnostic-only teacher-forcing support.  A baseline run can write the
-// sampled token sequence with MOESTREAM_GENERATED_TOKEN_FILE; a comparison
+// sampled token sequence with ZEROMOE_GENERATED_TOKEN_FILE; a comparison
 // run can then consume that sequence through
-// MOESTREAM_TEACHER_FORCE_TOKEN_FILE.  The forward pass still produces and
+// ZEROMOE_TEACHER_FORCE_TOKEN_FILE.  The forward pass still produces and
 // dumps its own logits, but the next input token is taken from the reference
 // sequence so autoregressive divergence cannot hide a numerical mismatch.
 inline void dump_generated_token_if_enabled(int step, int token) {
-    static const char *path = std::getenv("MOESTREAM_GENERATED_TOKEN_FILE");
+    static const char *path = std::getenv("ZEROMOE_GENERATED_TOKEN_FILE");
     if (!path || !path[0]) {
         return;
     }
@@ -153,10 +153,27 @@ inline void dump_generated_token_if_enabled(int step, int token) {
     }
 }
 
-inline const std::vector<int> & teacher_force_tokens_if_enabled() {
+inline const std::vector<int> & teacher_force_tokens_if_enabled(int step) {
+    // A multi-request diagnostic needs a distinct authoritative token stream
+    // per prompt. The original single-file mode remains unchanged.
+    static const char *directory = std::getenv("ZEROMOE_TEACHER_FORCE_REQUEST_DIR");
+    if (directory && directory[0]) {
+        static size_t request = 0;
+        static std::vector<int> request_tokens;
+        if (step == 0) {
+            const std::string path = std::string(directory) + "/request-" + std::to_string(request++) + ".tokens";
+            std::ifstream in(path);
+            if (!in) throw std::runtime_error("cannot open teacher-forced request tokens: " + path);
+            request_tokens.clear();
+            int token = 0;
+            while (in >> token) request_tokens.push_back(token);
+            if (request_tokens.empty()) throw std::runtime_error("empty teacher-forced request: " + path);
+        }
+        return request_tokens;
+    }
     static const std::vector<int> tokens = [] {
         std::vector<int> result;
-        const char *path = std::getenv("MOESTREAM_TEACHER_FORCE_TOKEN_FILE");
+        const char *path = std::getenv("ZEROMOE_TEACHER_FORCE_TOKEN_FILE");
         if (!path || !path[0]) {
             return result;
         }
@@ -174,7 +191,7 @@ inline const std::vector<int> & teacher_force_tokens_if_enabled() {
 inline bool teacher_force_skip_sampling_enabled() {
     static const bool enabled = [] {
         const char *value =
-            std::getenv("MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING");
+            std::getenv("ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING");
         return value && value[0] == '1';
     }();
     return enabled;
@@ -407,7 +424,7 @@ public:
 // token, so it must not be silently mixed into a llama.cpp parity comparison.
 // This is intentionally an environment override rather than a model-wide
 // default/config change: existing models retain exactly the old behavior.
-inline float moestream_repetition_penalty() {
+inline float zeromoe_repetition_penalty() {
     static const float penalty = [] {
         // Default matches llama.cpp's official `repeat_penalty` behavior.
         // default (1.0 == disabled). The prior default (1.3) does not exist
@@ -417,24 +434,24 @@ inline float moestream_repetition_penalty() {
         // tokens, so a common word merely appearing once in the user's own
         // question (e.g. "and") got its logit suppressed in later decode
         // steps -- confirmed via raw pre-penalty logit dumps
-        // (MOESTREAM_DECODE_LOGITS_DUMP) showing the correct English
+        // (ZEROMOE_DECODE_LOGITS_DUMP) showing the correct English
         // continuation winning by a clear margin pre-penalty, then losing to
         // a non-English token post-penalty, and via llama.cpp itself
         // (same weights, same quant, same prompt, temp=0) staying coherent
-        // throughout where MoEStream did not. Still available and
-        // configurable via MOESTREAM_REPETITION_PENALTY for anyone who wants
+        // throughout where ZeroMoE did not. Still available and
+        // configurable via ZEROMOE_REPETITION_PENALTY for anyone who wants
         // the old anti-loop behavior back.
         constexpr float default_penalty = 1.0f;
-        const char* text = std::getenv("MOESTREAM_REPETITION_PENALTY");
+        const char* text = std::getenv("ZEROMOE_REPETITION_PENALTY");
         if (!text || !*text) return default_penalty;
 
         char* end = nullptr;
         const float value = std::strtof(text, &end);
         if (end == text || *end != '\0' || !std::isfinite(value) || value <= 0.0f) {
-            LOG_WARN("[GEN] ignoring invalid MOESTREAM_REPETITION_PENALTY='%s'\n", text);
+            LOG_WARN("[GEN] ignoring invalid ZEROMOE_REPETITION_PENALTY='%s'\n", text);
             return default_penalty;
         }
-        LOG_INFO("[GEN] MOESTREAM_REPETITION_PENALTY=%.6g (default=%.6g)\n",
+        LOG_INFO("[GEN] ZEROMOE_REPETITION_PENALTY=%.6g (default=%.6g)\n",
                  value, default_penalty);
         return value;
     }();
@@ -470,27 +487,27 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // configured decode length.  This is opt-in, applies to the normal
     // non-MTP loop only, and leaves normal inference behavior unchanged.
     const bool bench_ignore_stop = [] {
-        const char *env = std::getenv("MOESTREAM_BENCH_IGNORE_STOP");
+        const char *env = std::getenv("ZEROMOE_BENCH_IGNORE_STOP");
         return env && env[0] == '1';
     }();
     // llama-bench measures token generation without decoding/printing every
     // token or sampling device memory on every step. This opt-in mode keeps
-    // MoEStream's compute path and request summary while removing that CLI
+    // ZeroMoE's compute path and request summary while removing that CLI
     // streaming work from apples-to-apples throughput measurements.
     const bool bench_silent = [] {
-        const char *env = std::getenv("MOESTREAM_BENCH_SILENT");
+        const char *env = std::getenv("ZEROMOE_BENCH_SILENT");
         return env && env[0] == '1';
     }();
     const bool token_loop_diag_enabled = [] {
-        const char *env = std::getenv("MOESTREAM_TOKEN_LOOP_DIAG");
+        const char *env = std::getenv("ZEROMOE_TOKEN_LOOP_DIAG");
         return env && env[0] == '1';
     }();
     if (bench_ignore_stop) {
-        LOG_STREAM_INFO() << "[BENCH] MOESTREAM_BENCH_IGNORE_STOP=1: "
+        LOG_STREAM_INFO() << "[BENCH] ZEROMOE_BENCH_IGNORE_STOP=1: "
                              "EOS/stop tokens will not end this bounded decode\n";
     }
     if (bench_silent) {
-        LOG_STREAM_INFO() << "[BENCH] MOESTREAM_BENCH_SILENT=1: token text output, "
+        LOG_STREAM_INFO() << "[BENCH] ZEROMOE_BENCH_SILENT=1: token text output, "
                              "per-token VRAM sampling, and token diagnostics are disabled\n";
     }
 
@@ -766,11 +783,13 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // An explicitly requested DeepSeek graph must fail visibly.
         if (!engine.qwen4exp_full_graph_failure.empty())
             return;
-        if (!graph_built && engine.qwen4exp_full_graph_required) {
+        if (!graph_built &&
+            (engine.qwen4exp_full_graph_required || graph_model->graph_only())) {
             // Smaller batches were tried above (memory); the layered forward cannot take over here: with the graph-only
             // expert placement it finds no staged expert blocks and would silently drop their tokens.
-            engine.qwen4exp_full_graph_failure = "prefill graph construction failed";
-            LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s even with the smallest batch; aborting request\n",
+            engine.qwen4exp_full_graph_failure =
+                std::string(graph_model->name()) + " prefill graph construction failed";
+            LOG_ERROR("[GRAPH-POLICY] %s even with the smallest batch; aborting request\n",
                       engine.qwen4exp_full_graph_failure.c_str());
             return;
         }
@@ -791,7 +810,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
 
     if (!bench_silent) {
         std::cout << "\n[Prefill] Processing " << prompt_ids.size() << " tokens..." << std::flush;
-        if (const char *dump = std::getenv("MOESTREAM_DUMP_PROMPT_TOKENS"); dump && dump[0]) {
+        if (const char *dump = std::getenv("ZEROMOE_DUMP_PROMPT_TOKENS"); dump && dump[0]) {
             std::ofstream pf(dump, std::ios::trunc);
             for (auto id : prompt_ids) pf << id << '\n';
         }
@@ -824,7 +843,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // the existing S==1 path.  This preserves the normal recurrent/KV
         // update order while avoiding the batched HC projection and batched
         // activation-quantization kernels.  The default prompt path below is
-        // unchanged when MOESTREAM_PREFILL_UNBATCHED is not enabled.
+        // unchanged when ZEROMOE_PREFILL_UNBATCHED is not enabled.
         if (unbatched_prefill && pc_n_new > 1) {
             LOG_STREAM_INFO() << "[PREFILL] unbatched parity mode: "
                               << pc_n_new << " x S=1 forward calls\n";
@@ -1010,7 +1029,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                                : 0.0)
                        << "ms\n";
     check_hidden_finite("after prefill", hidden_states.data(), hidden_states.size());
-    if (const char *dump = std::getenv("MOESTREAM_DUMP_LAST_HIDDEN"); dump && dump[0] && hidden_states.size() >= (size_t)D) {
+    if (const char *dump = std::getenv("ZEROMOE_DUMP_LAST_HIDDEN"); dump && dump[0] && hidden_states.size() >= (size_t)D) {
         std::ofstream hf(dump, std::ios::binary | std::ios::trunc);
         hf.write(reinterpret_cast<const char *>(hidden_states.data() + hidden_states.size() - D), (std::streamsize)D * sizeof(float));
     }
@@ -1243,9 +1262,9 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // the model for wanting to reuse a word the USER's own question
         // happened to contain -- confirmed as the real mechanism behind a
         // reproducible switch-to-non-English defect (see
-        // moestream_repetition_penalty's own comment). Only tokens the
+        // zeromoe_repetition_penalty's own comment). Only tokens the
         // model itself generated should ever be penalized.
-        if (const float repetition_penalty = moestream_repetition_penalty();
+        if (const float repetition_penalty = zeromoe_repetition_penalty();
             repetition_penalty != 1.0f) {
             constexpr int REPETITION_WINDOW = 64;
             int start = std::max((int)prompt_ids.size(),
@@ -1258,17 +1277,17 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             }
         }
 
-        const auto &teacher_tokens = teacher_force_tokens_if_enabled();
+        const auto &teacher_tokens = teacher_force_tokens_if_enabled(step);
         const bool has_teacher_token =
             step < static_cast<int>(teacher_tokens.size());
         const bool skip_teacher_sampling =
             has_teacher_token && teacher_force_skip_sampling_enabled();
-        // MOESTREAM_TEACHER_FORCE_NLL=1: log -log p(forced token) under this
+        // ZEROMOE_TEACHER_FORCE_NLL=1: log -log p(forced token) under this
         // step's raw logits (natural log), so two configs can be compared on
         // a fixed text by mean NLL (quality) as well as by speed.
         if (has_teacher_token) {
             static const bool log_nll = [] {
-                const char *e = std::getenv("MOESTREAM_TEACHER_FORCE_NLL");
+                const char *e = std::getenv("ZEROMOE_TEACHER_FORCE_NLL");
                 return e && e[0] == '1';
             }();
             const int ft = teacher_tokens[step];
@@ -1292,7 +1311,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             if (step == 0) {
                 LOG_STREAM_INFO() << "[TEACHER-FORCE] using " << teacher_tokens.size()
                                   << " reference decode token(s) from "
-                                  << "MOESTREAM_TEACHER_FORCE_TOKEN_FILE\n";
+                                  << "ZEROMOE_TEACHER_FORCE_TOKEN_FILE\n";
             }
         }
         log_decode_logits_hash(step, raw_logits_hash, sampled_token, next_token);
@@ -1311,7 +1330,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // token second, so a real, correctly-detected stop token's own
         // string (e.g. "<|im_end|>", "<|endoftext|>") was echoed to the
         // user right as generation correctly ended -- confirmed via
-        // MOESTREAM_GENERATED_TOKEN_FILE (dump_generated_token_if_enabled)
+        // ZEROMOE_GENERATED_TOKEN_FILE (dump_generated_token_if_enabled)
         // showing the model's actual last sampled token WAS the genuine
         // stop-token ID, not ordinary vocabulary tokens that merely spell
         // out that text. The model was stopping correctly; only the

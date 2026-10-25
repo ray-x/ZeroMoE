@@ -25,9 +25,9 @@ parity and a regression witness remain pending.
 
 The decode bands above were measured once on the merged master (`1f17a99`), 2026-10-21, on the
 box in `docs/GLM5.3-baseline.md` §1: Xeon W-2235 (6C/12T, AVX-512 VNNI), 125 GiB RAM, RTX 3090
-(24 GiB, PCIe 4) + RTX 5060 Ti (16 GiB, PCIe 3), two NVMe. The binary is `build_master/moestream`,
-built Release with `MOESTREAM_GGML_ROOT=/home/ray/Projects/llama.cpp/ggml` and
-`MOESTREAM_GGML_PREBUILT_DIR=.worktrees/ling-3.1-flash/build-ling/ggml-build` (the prebuilt ggml
+(24 GiB, PCIe 4) + RTX 5060 Ti (16 GiB, PCIe 3), two NVMe. The binary is `build_master/zeromoe`,
+built Release with `ZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp/ggml` and
+`ZEROMOE_GGML_PREBUILT_DIR=.worktrees/ling-3.1-flash/build-ling/ggml-build` (the prebuilt ggml
 that carries the early-CPU scheduler host-node hook — **an in-tree ggml build against the
 manually-edited fork silently drops this hook and disables the CPU lane**, see the "gotchas").
 
@@ -50,9 +50,9 @@ Fast witnesses: `--models qwen38` (single 3090) or `--models ling31`.
 ## How to re-baseline / run the gate
 
 ```bash
-bench/regression_gate.sh ./build_master/moestream                  # all five (~15 min)
-bench/regression_gate.sh ./build_master/moestream --models qwen38,ling31
-bench/regression_gate.sh ./build_master/moestream --models ling31   # one specific model
+bench/regression_gate.sh ./build_master/zeromoe                  # all five (~15 min)
+bench/regression_gate.sh ./build_master/zeromoe --models qwen38,ling31
+bench/regression_gate.sh ./build_master/zeromoe --models ling31   # one specific model
 bench/regression_gate.sh --help
 ```
 
@@ -63,7 +63,7 @@ missing measurement or an out-of-band rate. Coherence is *not* auto-checked — 
 ## Common gotchas (all models)
 
 - **Build must link the host-node hook.** See the note above; verify with
-  `nm -D build_master/moestream | grep sched_early_cpu`.
+  `nm -D build_master/zeromoe | grep sched_early_cpu`.
 - **Preflight RAM margin.** `startup_preflight` needs `host_ram_gb + 21.5 GiB` of `MemAvailable`;
   several recipes exceed it on a 125 GiB box, so the gate runs them under `scripts/run_capped.sh`
   with `--force-start` (kernel `MemoryMax` + `MemorySwapMax=0` bounds the risk).

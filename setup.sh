@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# setup.sh — MoEStream Engine Installation and Automated Build Script
+# setup.sh — ZeroMoE Engine Installation and Automated Build Script
 set -e
 
-echo "  MoEStream Engine — Setup and Compilation"
+echo "  ZeroMoE Engine — Setup and Compilation"
 echo "----------------------------------------"
 
 # 1. Dependency Toolchain Verification
@@ -44,15 +44,15 @@ cd build
 
 # Full engine builds require ggml.  Fetch a stable llama.cpp release by default
 # unless the caller opts out (e.g. they provide their own ggml install).
-GGML_FLAG="${MOESTREAM_USE_GGML:-${MOESTREAM_USE_LLAMA_CPP:-ON}}"
-cmake -DCMAKE_BUILD_TYPE=Release -DMOESTREAM_USE_GGML="$GGML_FLAG" ..
+GGML_FLAG="${ZEROMOE_USE_GGML:-${ZEROMOE_USE_LLAMA_CPP:-ON}}"
+cmake -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML="$GGML_FLAG" ..
 echo "[4/4] Compiling high-performance target binary..."
 make -j$(nproc)
 cd ..
 
 echo "----------------------------------------"
-echo "  MoEStream compilation complete!"
-echo "  -> Engine Core Executable: ./build/moestream"
+echo "  ZeroMoE compilation complete!"
+echo "  -> Engine Core Executable: ./build/zeromoe"
 echo "  -> API Gateway: ./api/api_server.py"
 echo ""
 echo "To serve the Anthropic API endpoint, execute:"

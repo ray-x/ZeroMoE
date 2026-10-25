@@ -58,7 +58,7 @@ std::unique_ptr<ModelBackend> ModelBackend::create(const GGUFFile &model_file) {
     // ModelBackend subclass implements the hybrid KDA+DSA forward.
     std::cerr << "[MODEL] Detected: GLM 5.3 Flash (glm5next, hybrid KDA+DSA) -- "
                  "not supported by the legacy ModelBackend hierarchy; use the "
-                 "main moestream engine path.\n";
+                 "main zeromoe engine path.\n";
     return nullptr;
 
   case ModelFamily::Qwen4Exp:
@@ -67,13 +67,13 @@ std::unique_ptr<ModelBackend> ModelBackend::create(const GGUFFile &model_file) {
     // ModelBackend subclass implements the hybrid GDN+full-attention forward.
     std::cerr << "[MODEL] Detected: Qwen3.8-Flash-Next (qwen4exp, hybrid "
                  "GDN+full-attention + low-rank HC + PLE) -- not supported by "
-                 "the legacy ModelBackend hierarchy; use the main moestream "
+                 "the legacy ModelBackend hierarchy; use the main zeromoe "
                  "engine path.\n";
     return nullptr;
 
   case ModelFamily::BailingMoE3:
     std::cerr << "[MODEL] Detected: Ling 3.1 Flash (bailingmoe3) -- "
-                 "use the main moestream engine path.\n";
+                 "use the main zeromoe engine path.\n";
     return nullptr;
 
   default:

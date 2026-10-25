@@ -67,18 +67,18 @@ def main():
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
         raise RuntimeError("resume settings or engine differ from saved run")
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith("MOESTREAM_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("ZEROMOE_")}
     for key in ("OMP_WAIT_POLICY", "GOMP_SPINCOUNT", "OMP_PROC_BIND", "OMP_PLACES"):
         env.pop(key, None)
     env.update({
         "CUDA_VISIBLE_DEVICES": "0",
-        "MOESTREAM_QWEN4EXP_FULL_GRAPH": "1",
-        "MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE": "1",
-        "MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
-        "MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
-        "MOESTREAM_QWEN_CPU_THREADS": str(args.threads),
-        "MOESTREAM_TOKEN_LOOP_DIAG": "1",
-        "MOESTREAM_BENCH_IGNORE_STOP": "1",
+        "ZEROMOE_QWEN4EXP_FULL_GRAPH": "1",
+        "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE": "1",
+        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
+        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
+        "ZEROMOE_QWEN_CPU_THREADS": str(args.threads),
+        "ZEROMOE_TOKEN_LOOP_DIAG": "1",
+        "ZEROMOE_BENCH_IGNORE_STOP": "1",
     })
     env["GGML_CUDA_BF16_MMVF_CUBLAS"] = "1" if args.bf16_cublas else "0"
     base = A.read_text()
@@ -97,7 +97,7 @@ def main():
             gpu_procs = subprocess.check_output([
                 "nvidia-smi", "--id=0", "--query-compute-apps=pid,process_name",
                 "--format=csv,noheader"], text=True).strip()
-            competing = subprocess.run(["pgrep", "-x", "-a", "moestream"], capture_output=True, text=True).stdout.strip()
+            competing = subprocess.run(["pgrep", "-x", "-a", "zeromoe"], capture_output=True, text=True).stdout.strip()
             if not gpu_procs and not competing:
                 break
             print(f"Waiting for competing inference: {gpu_procs or competing}", flush=True)
@@ -109,22 +109,22 @@ def main():
         cfg.write_text(config)
         runtime = env.copy()
         if args.prompt_ids:
-            runtime["MOESTREAM_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
+            runtime["ZEROMOE_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
         elif not prompt_ids.exists():
-            runtime["MOESTREAM_PROMPT_TOKEN_FILE"] = str(prompt_ids)
+            runtime["ZEROMOE_PROMPT_TOKEN_FILE"] = str(prompt_ids)
         else:
-            runtime["MOESTREAM_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
+            runtime["ZEROMOE_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
         if rep == "warm":
-            runtime["MOESTREAM_GENERATED_TOKEN_FILE"] = str(out / f"{name}.tokens")
+            runtime["ZEROMOE_GENERATED_TOKEN_FILE"] = str(out / f"{name}.tokens")
         elif args.teacher_force:
             if args.continuation:
-                runtime["MOESTREAM_TEACHER_FORCE_TOKEN_FILE"] = str(args.continuation.resolve())
+                runtime["ZEROMOE_TEACHER_FORCE_TOKEN_FILE"] = str(args.continuation.resolve())
             else:
                 history = name if args.history == "own" else args.history
-                runtime["MOESTREAM_TEACHER_FORCE_TOKEN_FILE"] = str(out / f"{history}.tokens")
+                runtime["ZEROMOE_TEACHER_FORCE_TOKEN_FILE"] = str(out / f"{history}.tokens")
             # Keep sampling enabled: the normal sampler cost remains in both arms.
         if args.dump_logits and rep != "warm":
-            runtime["MOESTREAM_DECODE_LOGITS_DUMP"] = str(out / f"{tag}.logits")
+            runtime["ZEROMOE_DECODE_LOGITS_DUMP"] = str(out / f"{tag}.logits")
         print(f"{'Reusing' if reuse else 'Running'} {tag}...", flush=True)
         started = time.monotonic()
         if not reuse:

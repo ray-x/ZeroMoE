@@ -7,9 +7,9 @@ quiet() {
     sleep 20
   done
 }
-export MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1
+export ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC=1
 quiet
-env POLICY=lru PREFETCH=1 MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD=1 ./run_seg_ab.sh cf_k1_p1
+env POLICY=lru PREFETCH=1 ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD=1 ./run_seg_ab.sh cf_k1_p1
 quiet
-env POLICY=lru PREFETCH=2 MOESTREAM_GLM5NEXT_PILOT_LOOKAHEAD=2 ./run_seg_ab.sh cf_k2_p2
+env POLICY=lru PREFETCH=2 ZEROMOE_GLM5NEXT_PILOT_LOOKAHEAD=2 ./run_seg_ab.sh cf_k2_p2
 echo CFDONE > pinab/cf.done

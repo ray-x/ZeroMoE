@@ -50,7 +50,7 @@
 #include <vector>
 #include <cuda_runtime.h>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 
 namespace glm5next_graph {
@@ -132,7 +132,7 @@ struct PartialExpertLayer {
   size_t hot1_vram_slot_stride = 0;
   std::vector<int> slot_last_use;
   std::vector<uint32_t> miss_count;
-  std::vector<float> heat;        // decayed re-reference score of each cold expert (MOESTREAM_GLM5NEXT_DYNAMIC_HEAT)
+  std::vector<float> heat;        // decayed re-reference score of each cold expert (ZEROMOE_GLM5NEXT_DYNAMIC_HEAT)
   std::vector<uint64_t> heat_at;  // token clock of the last heat update
   std::vector<uint8_t> slot_in_flight;
   std::vector<uint8_t> expert_in_flight;
@@ -150,7 +150,7 @@ struct PartialExpertLayer {
   ggml_tensor *hot_map = nullptr;
   ggml_tensor *cold_mask = nullptr;
   ggml_tensor *hot_mask = nullptr;
-  // Second-GPU hot set (MOESTREAM_GLM5NEXT_GPU1_HOT_GIB): experts moved out of `cold` that decode serves from the
+  // Second-GPU hot set (ZEROMOE_GLM5NEXT_GPU1_HOT_GIB): experts moved out of `cold` that decode serves from the
   // 5060 Ti. Prefill / no-GPU1 builds fold them back into the cold branch (identity-indexed full arena).
   std::vector<int> hot1;
   ggml_tensor *hot1_gate = nullptr;
@@ -189,14 +189,14 @@ struct Glm5nextIndexerLayer {
   ggml_tensor *pooled_cache = nullptr;   // decode: [key_length, capacity/kpool]
 };
 
-using moestream::graph::DeviceArena;
-using moestream::graph::HostAllocation;
-using moestream::graph::alloc_host;
-using moestream::graph::bind_host;
-using moestream::graph::host_input;
-using moestream::graph::model_tensor;
-using moestream::graph::new_tensor;
-using moestream::graph::resident;
+using zeromoe::graph::DeviceArena;
+using zeromoe::graph::HostAllocation;
+using zeromoe::graph::alloc_host;
+using zeromoe::graph::bind_host;
+using zeromoe::graph::host_input;
+using zeromoe::graph::model_tensor;
+using zeromoe::graph::new_tensor;
+using zeromoe::graph::resident;
 
 // Process-wide owner of the immutable dense-weight arena.  A prompt graph and
 // the decode graph that follows it request the same weights by name; keeping
@@ -219,8 +219,8 @@ struct DenseArenaOwner {
   ~DenseArenaOwner() { arena.free_buffer(); }
 };
 
-struct FullGraph : moestream::graph::GraphCore {
-  moestream::ggmlcopy::ExpertCopy expert_copy;
+struct FullGraph : zeromoe::graph::GraphCore {
+  zeromoe::ggmlcopy::ExpertCopy expert_copy;
   ggml_backend_buffer_t expert1_buffer = nullptr; // 1 MiB descriptor only
   FullGraph() { mem_tag = "GGML-GLM5NEXT-FULL-MEM"; }
 
@@ -257,7 +257,7 @@ struct FullGraph : moestream::graph::GraphCore {
   std::vector<ggml_backend_buffer_t> gpu1_buffers;
   std::unordered_map<int, ggml_tensor *> stage_pred; // layer -> pilot ids predicted for it (built one layer earlier)
   std::vector<ggml_backend_buffer_t> ridge_buffers;   // device copies of the pilot ridge corrections (one per corrected layer)
-  std::vector<std::pair<int, ggml_tensor *>> probe_x;  // MOESTREAM_GLM5NEXT_PROBE_DUMP: (layer, pre-FFN hidden) read back after every decode token
+  std::vector<std::pair<int, ggml_tensor *>> probe_x;  // ZEROMOE_GLM5NEXT_PROBE_DUMP: (layer, pre-FFN hidden) read back after every decode token
   size_t gpu1_bytes = 0;
   int indexer_heads = 0;
   int indexer_key_length = 0;
@@ -325,7 +325,7 @@ struct FullGraph : moestream::graph::GraphCore {
   std::vector<std::pair<int, ggml_tensor *>> dsv41_engram_embeddings;
   std::vector<std::pair<int, std::vector<float>>> dsv41_engram_host_rows;
   std::vector<ggml_tensor *> dsv4_layer_outputs;
-  // Decode-only per-layer timing marks (MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1):
+  // Decode-only per-layer timing marks (ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING=1):
   // node -> {layer, 0=after attention, 1=after FFN}.
   std::unordered_map<const ggml_tensor *, std::pair<int, int>> layer_marks;
   std::vector<std::pair<std::string, ggml_tensor *>> dsv4_stage_outputs;
@@ -364,7 +364,7 @@ struct FullGraph : moestream::graph::GraphCore {
   std::vector<int> dsa_layers;
   std::vector<std::pair<int, ggml_tensor *>> moe_route_ids;
   std::vector<std::pair<int, ggml_tensor *>> prefill_route_ids;
-  // CPU lanes (MOESTREAM_GLM5NEXT_EARLY_READY): one per layer whose cold experts
+  // CPU lanes (ZEROMOE_GLM5NEXT_EARLY_READY): one per layer whose cold experts
   // run concurrently with that layer's GPU work.
   struct VramExpertHold {
     int layer = -1;

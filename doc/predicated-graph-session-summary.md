@@ -20,7 +20,7 @@ real hardware first.
 ## What was validated in isolation first
 
 A standalone project, **`/home/ray/Projects/predicated-graph-poc`**
-(separate from MoEStream, no shared code), built up the mechanism
+(separate from ZeroMoE, no shared code), built up the mechanism
 incrementally, each step verified on this box's actual RTX 3090 before
 trusting it:
 
@@ -58,7 +58,7 @@ a ggml version bump.
 
 ## Critical risk found and avoided
 
-Before touching real MoEStream code, investigated `src/ggml_qwen4exp_graph.cpp`'s
+Before touching real ZeroMoE code, investigated `src/ggml_qwen4exp_graph.cpp`'s
 actual `prefix -> read ids -> host branch -> sgpu or scpu` dispatch
 (`qwen4exp_full_graph_decode_run_phase2`). Found that **`scpu`'s
 `ggml_backend_sched_t` is genuinely multi-backend** (`{cuda, cpu}`, and it
@@ -80,15 +80,15 @@ bigger scope, deliberately deferred.
 
 | File | Status | What |
 |---|---|---|
-| `beellama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu` | modified (not committed there either) | New `moestream_ggml_cuda_get_captured_graph()` accessor, same pattern as the existing `moestream_ggml_backend_cuda_get_stream` bridge. |
+| `beellama.cpp/ggml/src/ggml-cuda/ggml-cuda.cu` | modified (not committed there either) | New `zeromoe_ggml_cuda_get_captured_graph()` accessor, same pattern as the existing `zeromoe_ggml_backend_cuda_get_stream` bridge. |
 | `patches/ggml-cuda-conditional-graph-harvest.patch` | new | Checked-in patch capturing the above, for the fetch+patch flow. Verified it applies cleanly, in sequence, on top of a fresh vanilla ggml + the two existing patches. |
 | `CMakeLists.txt` | modified | Wires the new patch into the existing apply-once flow (same idempotent check pattern as the stream-bridge patch); adds `cuda/qwen4exp_master_graph.cu` to the source list. |
 | `cuda/qwen4exp_master_graph.cu` | new | Device-side predicate kernel — replaces the host `std::unordered_set` membership check with a GPU-resident hot-set bitmap lookup, driving `cudaGraphSetConditional`. |
 | `src/ggml_qwen4exp_graph.cpp` | modified | New `qwen4exp_master_graph` namespace (safety check via `ggml_backend_sched_get_n_splits`, hot-bitmap upload/cache, master-graph build/cache/launch) + the per-token dispatch block rewritten to try the fast path first, falling back to the original code otherwise. |
-| `bench/qwen_cpu_moe_ggml_bench.cpp` | modified (earlier in session) | `d_model`/`d_ff`/`topk` made env-overridable (`MOESTREAM_QWEN_CPU_BENCH_D_MODEL`/`_D_FF`/`_TOPK`), defaults unchanged — used to get real GLM-shape (2048x4096) CPU FFN numbers instead of only the hardcoded Qwen4Exp shape. |
+| `bench/qwen_cpu_moe_ggml_bench.cpp` | modified (earlier in session) | `d_model`/`d_ff`/`topk` made env-overridable (`ZEROMOE_QWEN_CPU_BENCH_D_MODEL`/`_D_FF`/`_TOPK`), defaults unchanged — used to get real GLM-shape (2048x4096) CPU FFN numbers instead of only the hardcoded Qwen4Exp shape. |
 
 **Safety properties baked into the new code:**
-- Fully opt-in: `MOESTREAM_QWEN4EXP_MASTER_GRAPH` env var, unset by default.
+- Fully opt-in: `ZEROMOE_QWEN4EXP_MASTER_GRAPH` env var, unset by default.
   Existing decode path is byte-for-byte unchanged unless explicitly enabled.
 - Self-disabling: checks `ggml_backend_sched_get_n_splits(sched) == 1` for
   both `prefix` and `sgpu` before ever trusting the fast path. If either is
@@ -98,14 +98,14 @@ bigger scope, deliberately deferred.
   back permanently for that session — never guesses.
 - `scpu` dispatch is completely untouched.
 
-**Build status:** full `moestream` target builds clean (`cmake --build
-build_ggmlcuda --target moestream`), binary runs (`--help` verified). The
+**Build status:** full `zeromoe` target builds clean (`cmake --build
+build_ggmlcuda --target zeromoe`), binary runs (`--help` verified). The
 host-node follow-up below includes the subsequent real-model decode result.
 
 ## Host-node parallel follow-up
 
 The deferred CPU-offload path was exercised on the real Qwen decode engine with
-`MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL=1`. Two small opt-in patches were added:
+`ZEROMOE_QWEN4EXP_HOST_NODE_PARALLEL=1`. Two small opt-in patches were added:
 
 | File | Purpose |
 |---|---|
@@ -149,7 +149,7 @@ merged or shared.
    to justify a production rollout. Do not enable it by default.
 2. **Oracle-parity check (do this first, before anything else).** Pick a
    fixed prompt, `temp=0` (greedy), run once with
-   `MOESTREAM_QWEN4EXP_MASTER_GRAPH` unset (baseline) and once with it set,
+   `ZEROMOE_QWEN4EXP_MASTER_GRAPH` unset (baseline) and once with it set,
    diff the generated token sequence exactly. Watch for the
    `[QWEN4EXP-MASTER-GRAPH] enabled: ...` log line to confirm the safety
    check actually passed (vs. silently falling back to the old path every

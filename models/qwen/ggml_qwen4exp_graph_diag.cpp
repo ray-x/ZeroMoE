@@ -6,14 +6,14 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
 namespace qwen4exp_graph {
 
 // Runtime guard (2026-09-19): CMakeLists.txt already documents that a plain
-// MOESTREAM_USE_GGML_CUDA build can silently compile out ggml-cuda's CUDA
+// ZEROMOE_USE_GGML_CUDA build can silently compile out ggml-cuda's CUDA
 // graph capture/replay path (GGML_CUDA_USE_GRAPHS never defined) -- this
 // exact failure mode cost an entire investigation before it was found once
 // already (full-graph decode 20 tok/s -> 8 tok/s, mistaken for a
@@ -54,7 +54,7 @@ void verify_cuda_graphs_compiled_in(ggml_backend_t cuda_backend) {
              "run every node as an individual cudaLaunchKernel instead of "
              "one batched cudaGraphLaunch per token -- previously measured "
              "cost: ~20 tok/s -> ~8 tok/s on this same decode path. Rebuild "
-             "with -DMOESTREAM_ENABLE_CUDA_GRAPHS=ON (the CMakeLists.txt "
+             "with -DZEROMOE_ENABLE_CUDA_GRAPHS=ON (the CMakeLists.txt "
              "default) and verify with a fresh 'cmake -B <dir>' configure, "
              "not just an incremental build in a stale build directory.\n");
   }
@@ -209,9 +209,9 @@ void qwen4exp_scan_captured_graph_writes(FullGraph &g,
     if (!backend)
       continue;
     cudaGraph_t captured =
-        moestream_ggml_cuda_get_captured_graph(backend, tensor);
+        zeromoe_ggml_cuda_get_captured_graph(backend, tensor);
     if (!captured && backend != g.cuda)
-      captured = moestream_ggml_cuda_get_captured_graph(g.cuda, tensor);
+      captured = zeromoe_ggml_cuda_get_captured_graph(g.cuda, tensor);
     if (captured)
       captured_graphs.insert(captured);
   }
@@ -392,7 +392,7 @@ void qwen4exp_scan_captured_graph_writes(FullGraph &g,
 }
 
 void qwen_probe_dump(FullGraph &g) {
-  const char *dir = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PROBE_DUMP");
+  const char *dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
   if (!dir || !dir[0] || g.probe_taps.empty())
     return;
   for (auto &[l, x, p] : g.probe_taps) {
@@ -482,4 +482,4 @@ void dump_qwen_moe_layout(const FullGraph &g) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

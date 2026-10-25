@@ -15,19 +15,10 @@ static bool glm_graph_in_use(const StreamingEngine &engine) {
          (m->enabled(engine, ModelGraphPhase::Prefill) || m->enabled(engine, ModelGraphPhase::Decode));
 }
 
-// Ling uses the shared GLM graph implementation with its own enable gate.
-// Keep GLM-only behavior separate while sharing cache sizing/ownership.
-static bool ling_graph_in_use(const StreamingEngine &engine) {
-  if (engine.family_ops.family != ModelFamily::BailingMoE3)
-    return false;
+// What the family's graph asks of cache sizing (defaults off; see GraphEngineCaps).
+static GraphEngineCaps graph_engine_caps(const StreamingEngine &engine) {
   const FullGraphModel *model = engine.family_ops.graph_model;
-  return model &&
-         (model->enabled(engine, ModelGraphPhase::Prefill) ||
-          model->enabled(engine, ModelGraphPhase::Decode));
-}
-
-static bool shared_glm_ling_graph_in_use(const StreamingEngine &engine) {
-  return glm_graph_in_use(engine) || ling_graph_in_use(engine);
+  return model ? model->engine_caps(engine) : GraphEngineCaps{};
 }
 
 std::expected<void, std::string> EngineRunner::plan_expert_cache() {
@@ -69,13 +60,11 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
         // row-aligned slot stride, not just the full-layer prefix.  The
         // DeepSeek cache-backed graph has the same requirement.
         const bool graph_cache_rows =
-            shared_glm_ling_graph_in_use(engine) ||
-            (engine.family_ops.family == ModelFamily::MiMo2 &&
-             mimo2_ingraph_moe_enabled());
+            graph_engine_caps(engine).aliases_vram_cache;
         const bool dsv41_graph_rows =
             engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
-            (moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH") ||
-             moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_DECODE"));
+            (zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH") ||
+             zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_DECODE"));
         if (config.vram_cache_full_layer_prefix > l || graph_cache_rows ||
             dsv41_graph_rows) {
           const size_t row_alignment =
@@ -181,8 +170,8 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // their own source-ownership policy behind the explicit environment flag.
   graph_ram_cache =
       graph_mode &&
-      (std::getenv("MOESTREAM_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
-       (shared_glm_ling_graph_in_use(engine) &&
+      (std::getenv("ZEROMOE_FULL_GRAPH_USE_RAM_CACHE") != nullptr ||
+       (graph_engine_caps(engine).ram_cache_with_preload &&
         config.ram_preload_all_experts) ||
        (engine.family_ops.family == ModelFamily::Qwen4Exp &&
         config.ram_preload_all_experts));
@@ -192,27 +181,27 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   graph_uses_native_moe_cache =
       graph_mode &&
       (graph_model->uses_native_moe_cache() ||
-       engine.family_ops.family == ModelFamily::DeepSeek_V41 ||
-       (engine.family_ops.family == ModelFamily::BailingMoE3 &&
-        bailingmoe3_native_graph_enabled()));
+       engine.family_ops.family == ModelFamily::DeepSeek_V41);
   // Native-cache graph callbacks use the existing resident dense weights as
   // well. Keep one native device pool for those calls; the graph borrows its
   // device_ptrs instead of making a second copy.
   graph_owns_dense =
       graph_mode && !graph_uses_native_moe_cache;
   glm_graph_aliases_vram_cache =
-      graph_mode && shared_glm_ling_graph_in_use(engine);
-  if (graph_mode && engine.family_ops.family == ModelFamily::Qwen4Exp &&
-      qwen4exp_full_graph_decode_enabled()) {
+      graph_mode && graph_engine_caps(engine).aliases_vram_cache;
+const bool qwen_hybrid_graph_placement =
+    (engine.family_ops.family == ModelFamily::Qwen4Exp &&
+     qwen4exp_full_graph_decode_enabled());
+if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
     const int n_layers =
         std::max(0, engine.model_file.architecture_config.n_layers);
     const int n_experts =
         std::max(0, engine.model_file.architecture_config.n_experts);
     const int device_layers = std::min(
-        std::max(0, qwen4exp_full_graph_device_expert_layers()), n_layers);
+        std::max(0, graph_model->device_expert_layers(engine)), n_layers);
     if (device_layers > 0) {
       engine.qwen_ram_vram_only_layers.assign((size_t)n_layers, 0);
-      const bool trailing = qwen4exp_full_graph_device_expert_trailing();
+      const bool trailing = graph_model->device_expert_trailing();
       const int first_layer = trailing ? n_layers - device_layers : 0;
       size_t vram_only_bytes = 0;
       int vram_only_layer_count = 0;
@@ -243,7 +232,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
   // device_expert_layers) were previously invisible to this arena-request
   // loop: only Qwen4Exp populated qwen_ram_vram_only_layers, so GLM always
   // requested a complete host-RAM arena for every non-dense layer even when
-  // MOESTREAM_GLM5NEXT_GRAPH_PRELOAD_LAYERS asked for some of them to live
+  // ZEROMOE_GLM5NEXT_GRAPH_PRELOAD_LAYERS asked for some of them to live
   // in VRAM instead. That silently doubled down on host RAM (the graph's
   // per-layer arena reservation is on top of the RAM tier's own preload)
   // and could exhaust the MemoryGuard ledger's watermark headroom for the
@@ -316,7 +305,7 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
            "which never calls the full graph).\n";
   }
   if (engine.family_ops.family == ModelFamily::DeepSeek_V41 &&
-      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
     // This path binds each complete pool as a strided MUL_MAT_ID tensor.
     // The global LRU (already supported by GpuTopology) lets one layer's
     // required set borrow free slots across the pool. Validate its uniform
@@ -342,7 +331,7 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
     // family full graphs only handle S>1 prefill. GLM5NEXT now also has a
     // reusable S=1 decode graph, but this legacy cache remains the safe
     // fallback if either graph is declined. The old code skipped the legacy
-    // cache completely whenever MOESTREAM_FULL_GRAPH_USE_RAM_CACHE was unset,
+    // cache completely whenever ZEROMOE_FULL_GRAPH_USE_RAM_CACHE was unset,
     // which for
     // qwen4exp/deepseek_v4 (neither of which implement the RAM-arena
     // dedup that env var was designed to gate -- that's GLM5NEXT-only)
@@ -352,7 +341,7 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
     // no cache slot to upload into at all.
     //
     // Incident B (why the cache size can't just be a flat 4GB either):
-    // setting MOESTREAM_FULL_GRAPH_USE_RAM_CACHE (the old workaround for
+    // setting ZEROMOE_FULL_GRAPH_USE_RAM_CACHE (the old workaround for
     // Incident A) reinstated a flat 4GB fallback cache regardless of how
     // much VRAM a graph's own device-resident expert arena
     // (device_expert_layers) already committed. At device_expert_layers=
@@ -393,11 +382,11 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
     constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
 
     const bool glm_shared_expert_cache =
-        shared_glm_ling_graph_in_use(engine);
+        graph_engine_caps(engine).aliases_vram_cache;
     // GLM's graph aliases the existing cache, so it owns no additional
     // device-resident expert block to reserve ahead of cache sizing.
     const int dev_layers = !glm_shared_expert_cache && graph_model
-                               ? graph_model->device_expert_layers()
+                               ? graph_model->device_expert_layers(engine)
                                : 0;
 
     double est_device_expert_gb = 0.0;
@@ -610,7 +599,7 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
       if (gc.moe_cache_gb > fallback_config_gb)
         gc.moe_cache_gb = fallback_config_gb;
     }
-    if (shared_glm_ling_graph_in_use(engine)) {
+    if (graph_engine_caps(engine).replaces_active_layer_area) {
       // The graph aliases pinned entries in the main cache; the temporary
       // active-layer pool is outside that address space and competes with
       // the shared MoE cache for VRAM.
@@ -622,7 +611,7 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
     LOG_STREAM_INFO()
         << "[GPU] VRAM expert cache capacity: capped at <=" << fallback_gb
         << " GiB/GPU ("
-        << (glm_shared_expert_cache ? "shared with GLM graph; " : "")
+        << (glm_shared_expert_cache ? "aliased by the graph; " : "")
         << "sized from free="
         << free_gb
         << " GiB - graph_expert_layers(" << dev_layers << ")~="

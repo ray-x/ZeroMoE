@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include "ggml-backend.h"
 #include "ggml.h"

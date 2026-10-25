@@ -130,7 +130,7 @@ def model_view(settings):
     for name, source in sources.items():
         if not source.is_file():
             raise ValueError(f"Missing or broken model file: {name}")
-    with tempfile.TemporaryDirectory(prefix="moestream-exllamav3-") as directory:
+    with tempfile.TemporaryDirectory(prefix="zeromoe-exllamav3-") as directory:
         view = Path(directory)
         for name, source in sources.items():
             (view / name).symlink_to(source.resolve())
@@ -206,13 +206,13 @@ def require_idle_gpus():
 
 
 @contextlib.contextmanager
-def host_admission(lock_path="/tmp/moestream-host-admission.lock"):
+def host_admission(lock_path="/tmp/zeromoe-host-admission.lock"):
     descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
-            raise RuntimeError("Another MoEStream runtime holds the host-admission lock") from error
+            raise RuntimeError("Another ZeroMoE runtime holds the host-admission lock") from error
         yield
     finally:
         os.close(descriptor)

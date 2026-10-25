@@ -16,9 +16,9 @@ output read for coherence before a timing was trusted, page cache dropped before
 
 | item | value |
 |---|---|
-| decode | full graph (default; `MOESTREAM_GLM5NEXT_FULL_GRAPH=0` opts out, `GRAPH_STRICT=1` fails a declined graph) |
+| decode | full graph (default; `ZEROMOE_GLM5NEXT_FULL_GRAPH=0` opts out, `GRAPH_STRICT=1` fails a declined graph) |
 | placement | "spread": VRAM holds every layer's hottest experts (`moe_cache_gb=15.8`, `dense_gb=6.5`, `vram_cache_full_layer_prefix=0`, `pin_strategy=global_topn`, `pin_topk_per_layer=12`, `pinned_vram_capacity=2400`); all layers 3..44 offloaded (`OFFLOAD_FIRST_LAYER=3`) |
-| DDR MoE pool | `MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB` (virtual arena; 32 default in tests; 46 for a 64 GiB machine) |
+| DDR MoE pool | `ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB` (virtual arena; 32 default in tests; 46 for a 64 GiB machine) |
 | cache policy | `OFFLOAD_POLICY=lru`, `OFFLOAD_PINNED=0.5` (half the pool pinned by usage ranking), `OFFLOAD_ASYNC=1` |
 | prefetch | off (`PILOT_STAGE` unset) |
 | store | embedded expert blocks in an interleaved model, or a store striped over both NVMes: `OFFLOAD_STORE=/data/moestream-offload/glm53flash-stripe0.gguf:/home/ray/work/nvme1-store/glm53flash-stripe1.gguf` |
@@ -143,7 +143,7 @@ cache update 0 ms. H2D/D2H transfers are not a lever here; the token is CPU comp
 
 | change | where | decode tok/s (order-balanced, logits+tokens identical) |
 |---|---|---|
-| lane computes resident cold experts while missing ones load (`MOESTREAM_GLM5NEXT_SPLIT_LOAD`, default on) | `include/early_ready_lane.hpp`, `ExpertStore::begin_ensure/finish_ensure` | 4.29 / 4.28 -> 4.92 / 4.92 (+14.8%) |
+| lane computes resident cold experts while missing ones load (`ZEROMOE_GLM5NEXT_SPLIT_LOAD`, default on) | `include/early_ready_lane.hpp`, `ExpertStore::begin_ensure/finish_ensure` | 4.29 / 4.28 -> 4.92 / 4.92 (+14.8%) |
 | IQ2_XXS x Q8_K dot, per-block vector sign/scale expansion (ggml fork branch `iq2xxs-avx512vl-dot`) | `ggml/src/ggml-cpu/arch/x86/quants.c` | 4.94 / 4.93 -> 5.27 / 5.23 (+6.7%) |
 
 After both: lane compute ~106 ms/token, residual load stall ~42 ms/token (about half of all layer calls split),
@@ -153,7 +153,7 @@ id wait ~25 ms/token. Gathers (`vpgatherdq`) run 3-5x slower than scalar loads o
 
 Measured negative (same day): pilot prefetch (K=4, copy off) feeding the overlapped lane. Demand misses fell 41%
 (936 -> 552 per 32 tokens) but each load got slower under contention (2.8 -> 3.9 ms), the residual stall did not move and steady-state
-decode went 165.8 -> 168.8 ms/token (A/B x2, same sign). Not kept. Other things tried and dropped: `MOESTREAM_OFFLOAD_EVICT=free`
+decode went 165.8 -> 168.8 ms/token (A/B x2, same sign). Not kept. Other things tried and dropped: `ZEROMOE_OFFLOAD_EVICT=free`
 (2.85 -> 2.81 ms per load, noise), CPU threads 6/10/12 vs 8 (5.16/5.21/4.73 vs 5.29 tok/s), striped vs single store with the new lane
 (5.29 vs 5.27: raw QD1 read of one 6.6 MB expert is 2.3-2.8 ms on these drives, so loads are device-latency bound).
 
@@ -164,9 +164,9 @@ decode went 165.8 -> 168.8 ms/token (A/B x2, same sign). Not kept. Other things 
 | 32 GiB | 5.25 | 936 | 134 ms/token |
 | 48 GiB | 7.26 | 222 | 90 |
 | 58 GiB | 8.18 | 14 | 73 |
-| 58 GiB + `MOESTREAM_GLM5NEXT_GPU_ASSIST=3` | 9.4-9.8 | 17-22 | 55-57 |
+| 58 GiB + `ZEROMOE_GLM5NEXT_GPU_ASSIST=3` | 9.4-9.8 | 17-22 | 55-57 |
 
-`MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB` unset now means "auto" (available RAM minus 60 GiB, >= 16 GiB, capped at the
+`ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB` unset now means "auto" (available RAM minus 60 GiB, >= 16 GiB, capped at the
 expert bytes); an explicit value is unchanged.
 
 GPU assist (`early_ready_lane.hpp`, opt-in): the lane copies up to N of the layer's resident cold experts straight from
@@ -183,10 +183,10 @@ max KL 0.17. Default off until output quality has been judged on more prompts.
 |---|---|---|---|
 | 3090 only | 98.6 | 10.1 | reference |
 | + `GPU1_HOT_GIB=14.2` (lane silently off: guard `hot1.empty()`) | 82.1 | 12.2 | differs (placement) |
-| + lane kept on GPU1 layers (`MOESTREAM_GLM5NEXT_LANE_WITH_GPU1`, default on) | 78.3 | 12.8 | identical to previous row |
+| + lane kept on GPU1 layers (`ZEROMOE_GLM5NEXT_LANE_WITH_GPU1`, default on) | 78.3 | 12.8 | identical to previous row |
 | + `GPU_ASSIST=2` | 68.1 | 14.7 | not identical (GPU rounding) |
 
-Run with `CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=14.2`. One-time cost: the first decode token takes ~21 s
+Run with `CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=14.2`. One-time cost: the first decode token takes ~21 s
 (14 GiB of experts copied to the 5060 Ti with one synchronous tensor_set per expert, from not-yet-resident pages).
 Engine-reported "decode=" over a 48-token run includes that and the graph build; use the per-token FULL-DECODE-TIME lines.
 
@@ -200,7 +200,7 @@ GPU1 hot-expert upload at graph prepare now reads 16 experts in parallel: 21 s -
 ## Dense/trunk on the 5060 Ti (tested 2026-10-13, GLM-5.3-Flash, teacher-forced 48 tokens, 58 GiB pool)
 
 `CUDA_VISIBLE_DEVICES=1,0` with `bench/glm_swap_dense_5060.toml` (5060 Ti = core: dense 6.56 GiB + 6.05 GiB resident cache; 3090 = "GPU1"
-hot set via `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB`) and `MOESTREAM_GLM5NEXT_ASSIST_DEVICE=1` (ring on the 3090):
+hot set via `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB`) and `ZEROMOE_GLM5NEXT_ASSIST_DEVICE=1` (ring on the 3090):
 
 | layout | resident experts | lane wait | lane compute | ms/token |
 |---|---|---|---|---|
@@ -236,7 +236,7 @@ model; which is more accurate needs a task eval, not a KL.
 ### Assist by expert type (2026-10-13)
 
 GPU assist is now applied per layer only when gate, up and down are all IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/IQ3_XXS/IQ3_S/Q2_0
-(`gpu_assist_layer_ok`); K-quants and 4-8 bit types stay on the CPU lane. `MOESTREAM_GLM5NEXT_GPU_ASSIST_ANY_TYPE=1` lifts the filter.
+(`gpu_assist_layer_ok`); K-quants and 4-8 bit types stay on the CPU lane. `ZEROMOE_GLM5NEXT_GPU_ASSIST_ANY_TYPE=1` lifts the filter.
 Defaults, teacher-forced 48 tokens: GSQ-RCO 70.1 ms (was 88.2 with assist 3; assist 1 alone gave 68.9), AJ IQ2_XXS 68.3 ms
 (unchanged within noise, assist active).
 
@@ -271,13 +271,13 @@ alone (`ASSIST_DEVICE=1`) 78.9 ms (-7.5 ms), against assist=3 on the 3090 at ~68
 a second assist ring on it should add on top of the 3090's (not built: the lane supports one assist backend today).
 
 **Ranking refit** (`bench/make_survey_batches.py`, `bench/glm_route_survey.sh`, `bench/ranking_holdout_eval.py`; per-token route
-trace via `MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>`): 40 corpus prompts (not among the 5 already in the ranking), 96 decode tokens each,
+trace via `ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>`): 40 corpus prompts (not among the 5 already in the ranking), 96 decode tokens each,
 graph prefill. Held-out 10 prompts, top-4700 resident, share of routes that are cold: current ranking 44.5%, + the 30 training
 prompts (weight 10) 35.9%, training prompts alone 35.8%, oracle 28.0%. On the benchmark prompt (outside all 40) it is neutral: 35.4% old vs
 36.0% new cold routes, and end-to-end 68.8 / 69.3 ms vs 69.9 / 69.0 ms (logits 91.7% top-1, KL 0.056 = placement noise). So the refit
 fixes a poor ranking on dissimilar prompts, but is no speed-up on prompts the current ranking already fits.
 `docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt` is the refit file (base + all 40 prompts at weight 10); use it with
-`pin_file` in the toml, `MOESTREAM_GLM5NEXT_OFFLOAD_USAGE` and `MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE` (`bench/glm_dual_ranking40.toml`).
+`pin_file` in the toml, `ZEROMOE_GLM5NEXT_OFFLOAD_USAGE` and `ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE` (`bench/glm_dual_ranking40.toml`).
 
 ### Reaching 15 tok/s: recipe and what actually decides it (2026-10-14)
 
@@ -294,8 +294,8 @@ Held-out corpus prompts (not in either ranking), identical tokens, AJ IQ2_XXS, d
 | benchmark prompt (in-domain for the old ranking) | 14.85 tok/s | neutral |
 
 **Recipe** (all env, nothing machine-specific in code):
-`CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=15.0 MOESTREAM_GLM5NEXT_CPU_THREADS=10`, toml `pin_file` and
-`MOESTREAM_GLM5NEXT_OFFLOAD_USAGE` (and `_GPU1_HOT_USAGE`) = the refit file, GPU assist 3 on the 3090 plus the second assist ring on the
+`CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=15.0 ZEROMOE_GLM5NEXT_CPU_THREADS=10`, toml `pin_file` and
+`ZEROMOE_GLM5NEXT_OFFLOAD_USAGE` (and `_GPU1_HOT_USAGE`) = the refit file, GPU assist 3 on the 3090 plus the second assist ring on the
 5060 Ti (`ASSIST2_DEVICE`, auto on a dual-GPU run with a second-GPU hot set; 1 slot, keeps >= 1 expert on the CPU). On the fixed
 benchmark sequence (steady state, last 30 tokens): baseline 14.85 tok/s, with the recipe 15.05-15.10. Second assist device alone:
 -0.4 ms; threads 10 vs 8: -0.3 ms; hot set 15.0 vs 14.2 GiB: -0.6 ms (15.3 does not fit: the dense arena is declined).
@@ -316,7 +316,7 @@ from 35.8% to 34.8% (oracle 28%).
 `~/Projects/moestream-build-upstream-master/ggml-build` (what the engine's RUNPATH resolves to) was built on 2026-10-04 and has
 neither the AVX-512VL IQ2_XXS dot (`36f489d6b`) nor patch 0006. Same binary, recipe env, benchmark sequence, steady last 30 tokens:
 default libs 67.1 ms = 14.91 tok/s, with the kernel library (`LD_LIBRARY_PATH=lib_new:...`) 64.8 ms = **15.43 tok/s**. Rebuilding that
-ggml from `llama.cpp-moestream-integration` (branch `moestream-ggml-integration` at `7bd457fa1`) is the single cheapest +0.5 tok/s
+ggml from `llama.cpp-moestream-integration` (branch `zeromoe-ggml-integration` at `7bd457fa1`) is the single cheapest +0.5 tok/s
 left; not done here because that tree carries someone else's uncommitted `ggml-backend.cpp`/`ggml-cuda.cu` edits.
 
 Kernel micro-restructurings (`bench/kernels/iq2xxs_dot_bench.cpp` candidates F/G/H: grid rows assembled with movq+punpcklqdq, fused
@@ -330,8 +330,8 @@ tokens: benchmark sequence 15.43 tok/s; held-out 046 css 13.27 tok/s (old rankin
 
 ### The default binary with the kernel: `build_gk` (2026-10-14)
 
-`cmake -S . -B build_gk -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 -DMOESTREAM_GGML_ROOT=<fork ggml> -DMOESTREAM_GGML_PREBUILT_DIR=
--DMOESTREAM_ENABLE_GGML_HOST_NODE_PATCHES=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_CUDA_GRAPHS=ON` builds ggml in-tree, so the
+`cmake -S . -B build_gk -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 -DZEROMOE_GGML_ROOT=<fork ggml> -DZEROMOE_GGML_PREBUILT_DIR=
+-DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=ON -DGGML_AVX512=ON -DGGML_AVX512_VNNI=ON -DGGML_CUDA_GRAPHS=ON` builds ggml in-tree, so the
 binary links the kernel (`36f489d6b`) and patch 0006 without any `LD_LIBRARY_PATH`. `llama.cpp-moestream-integration` is already at
 `7bd457fa1` (kernel included) with the host-node edits uncommitted in its working tree, so rebuilding
 `~/Projects/moestream-build-upstream-master` (the engine's prebuilt ggml) is all that is needed on the main tree. A clean fork

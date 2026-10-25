@@ -21,7 +21,7 @@
 #include <vector>
 #include <sched.h>
 
-extern "C" cudaGraph_t moestream_ggml_cuda_get_captured_graph(ggml_backend_t, const ggml_tensor *);
+extern "C" cudaGraph_t zeromoe_ggml_cuda_get_captured_graph(ggml_backend_t, const ggml_tensor *);
 extern "C" int ggml_cpu_mul_mat_id_negative_skip(void);
 
 namespace {
@@ -216,7 +216,7 @@ public:
             if(ggml_backend_graph_compute(gpu,hot->graph)!=GGML_STATUS_SUCCESS)
                 throw std::runtime_error("GPU graph warmup failed");
         }
-        const auto child=moestream_ggml_cuda_get_captured_graph(gpu,ggml_graph_node(hot->graph,0));
+        const auto child=zeromoe_ggml_cuda_get_captured_graph(gpu,ggml_graph_node(hot->graph,0));
         if(!child)throw std::runtime_error("integration GGML graph-harvest bridge returned no graph");
         build(child,false,serial,serial_exec);
         build(child,true,forked,forked_exec);

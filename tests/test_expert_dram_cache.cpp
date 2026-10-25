@@ -3,7 +3,7 @@
 // Build/run: tests/run_components.sh does this; by hand from the repo root:
 //   c++ -std=c++20 -O2 -pthread -Iinclude -o /tmp/t tests/test_expert_dram_cache.cpp && /tmp/t
 //
-// Temp files go to $MOESTREAM_TEST_DIR, else /var/tmp (a real filesystem, so O_DIRECT is exercised; /tmp is tmpfs on
+// Temp files go to $ZEROMOE_TEST_DIR, else /var/tmp (a real filesystem, so O_DIRECT is exercised; /tmp is tmpfs on
 // many systems and refuses O_DIRECT, which only tests the buffered fallback).
 #include "offload_store.hpp"
 
@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-using namespace moestream::offload;
+using namespace zeromoe::offload;
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond)                                                                                   \
@@ -58,9 +58,9 @@ struct RefLru {
 };
 
 static std::string test_dir() {
-  const char *e = std::getenv("MOESTREAM_TEST_DIR");
+  const char *e = std::getenv("ZEROMOE_TEST_DIR");
   std::string base = e && *e ? e : (::access("/var/tmp", W_OK) == 0 ? "/var/tmp" : "/tmp");
-  std::string t = base + "/moestream-cache-test.XXXXXX";
+  std::string t = base + "/zeromoe-cache-test.XXXXXX";
   std::vector<char> b(t.begin(), t.end());
   b.push_back('\0');
   if (!::mkdtemp(b.data())) { std::perror("mkdtemp"); std::exit(2); }
@@ -563,13 +563,13 @@ struct Wr {
 static std::vector<uint64_t> plane_dims(uint64_t plane) { return {1024, plane / 4096}; }
 
 static void write_store(const std::string &path, const std::vector<ExpertKey> &experts, const std::map<int, uint64_t> &plane_of_layer, bool break_tightness = false,
-                        const std::string &arch = "moestream-offload") {
+                        const std::string &arch = "zeromoe-offload") {
   Wr w(path);
   w.o.write("GGUF", 4); w.put<uint32_t>(3); w.put<uint64_t>(experts.size() * 3); w.put<uint64_t>(4);
   w.str("general.alignment"); w.put<uint32_t>(4); w.put<uint32_t>(4096);
   w.str("general.architecture"); w.put<uint32_t>(8); w.str(arch);
   for (int which = 0; which < 2; ++which) {
-    w.str(which == 0 ? "moestream.offload.layer" : "moestream.offload.expert"); w.put<uint32_t>(9); w.put<uint32_t>(4); w.put<uint64_t>(experts.size());
+    w.str(which == 0 ? "zeromoe.offload.layer" : "zeromoe.offload.expert"); w.put<uint32_t>(9); w.put<uint32_t>(4); w.put<uint64_t>(experts.size());
     for (const ExpertKey &k : experts) w.put<uint32_t>(static_cast<uint32_t>(which == 0 ? k.layer : k.expert));
   }
   uint64_t off = 0;
@@ -931,7 +931,7 @@ static void test_trace_replay_matches_simulator() {
 }
 
 // ------------------------------------------------------------------------------------------ optional: real store + model
-// MOESTREAM_TEST_STORE=<store.gguf> MOESTREAM_TEST_MODEL=<shard1.gguf>[,<shard2.gguf>...] [MOESTREAM_TEST_SAMPLE=N]
+// ZEROMOE_TEST_STORE=<store.gguf> ZEROMOE_TEST_MODEL=<shard1.gguf>[,<shard2.gguf>...] [ZEROMOE_TEST_SAMPLE=N]
 
 // The offload.* blocks that `gguf_tool pack --expert-interleave` embeds in model shards are read in place: several shards, one
 // preadv per expert, tensors of the shard that are not offload.* are ignored, and open_auto picks the right mode.
@@ -1000,15 +1000,15 @@ static void test_embedded_store(const std::string &dir) {
 }
 
 static void test_real_store() {
-  const char *sp = std::getenv("MOESTREAM_TEST_STORE"), *mp = std::getenv("MOESTREAM_TEST_MODEL");
-  if (!sp || !mp) { std::fprintf(stderr, "  real store/model test SKIPPED (set MOESTREAM_TEST_STORE and MOESTREAM_TEST_MODEL)\n"); return; }
+  const char *sp = std::getenv("ZEROMOE_TEST_STORE"), *mp = std::getenv("ZEROMOE_TEST_MODEL");
+  if (!sp || !mp) { std::fprintf(stderr, "  real store/model test SKIPPED (set ZEROMOE_TEST_STORE and ZEROMOE_TEST_MODEL)\n"); return; }
   std::vector<std::string> shards; { std::stringstream ss(mp); std::string t; while (std::getline(ss, t, ',')) if (!t.empty()) shards.push_back(t); }
   OffloadStore st; ModelReader model; std::string err;
   CHECK(st.open(sp, &err));
   CHECK(model.open(shards, &err));
   if (g_failed) { std::fprintf(stderr, "  real open failed: %s\n", err.c_str()); return; }
   auto keys = st.keys();
-  const char *sm = std::getenv("MOESTREAM_TEST_SAMPLE");
+  const char *sm = std::getenv("ZEROMOE_TEST_SAMPLE");
   const size_t stride = sm && std::atoi(sm) > 0 ? std::max<size_t>(1, keys.size() / static_cast<size_t>(std::atoi(sm))) : 1;
   size_t n = 0, bad = 0; double read_ms = 0; uint64_t bytes = 0;
   for (size_t i = 0; i < keys.size(); i += stride) {

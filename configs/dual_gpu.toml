@@ -1,4 +1,4 @@
-# MoEStream — Dual GPU Configuration (Profile B)
+# ZeroMoE — Dual GPU Configuration (Profile B)
 # RTX 5060 Ti (dense + KV) + RTX 3090 (expert vault)
 
 model_path = "/models/GLM-5.2-UD-IQ2_M/"
@@ -10,7 +10,7 @@ top_p          = 0.95
 drop_pages     = false
 
 promote_hit_threshold = 2
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Capped (was 0/auto-fill-available-capacity): a real run showed auto-fill
 # pinning 1579/1642 VRAM slots (96%) at startup from a prior run's usage

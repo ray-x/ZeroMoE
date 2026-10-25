@@ -1,12 +1,12 @@
 # CLAUDE.md
 
-This file provides detailed architectural guidance, operational rules, hardware considerations, and historical pitfall documentation for working with the MoEStream codebase.
+This file provides detailed architectural guidance, operational rules, hardware considerations, and historical pitfall documentation for working with the ZeroMoE codebase.
 
 ---
 
 ## 1. Overview and Architecture
 
-MoEStream is a zero-dependency C++23 / CUDA17 inference engine built to stream Mixture-of-Experts (MoE) GGUF models (e.g., GLM-5.2, DeepSeek-V3, DeepSeek-V4 MLA, Hunyuan, Llama) on consumer hardware.
+ZeroMoE is a zero-dependency C++23 / CUDA17 inference engine built to stream Mixture-of-Experts (MoE) GGUF models (e.g., GLM-5.2, DeepSeek-V3, DeepSeek-V4 MLA, Hunyuan, Llama) on consumer hardware.
 
 * **Core Paradigm:** Persistent dense layers are held in VRAM/RAM, while massive routed expert matrices are streamed on-demand from NVMe storage through a tiered cache.
 * **MLA Absorbed Attention:** Folds value projection into query projections to compute attention scores in a low-rank latent space, reducing the operational footprint to $O(\text{Context} \times \text{kv\_lora})$.
@@ -22,19 +22,22 @@ MoEStream is a zero-dependency C++23 / CUDA17 inference engine built to stream M
 * **Apple Silicon / Non-CUDA Limitations:** Will not build or run on macOS/Apple Silicon due to hard NVCC and x86 AVX-512 dependencies.
 
 ### Commands
-* **Standard Build:** `./setup.sh` or `make` to configure and compile `./build/moestream`.
-* **Testing:** `make test` executes the native test harness (`src/main_test.cpp`). CPU-only components can be tested cross-platform via `make test-components` (`tests/test_components.cpp`).
-* **Execution:** `./build/moestream --config configs/single_gpu.toml` (preferred over legacy CLI flags).
-* **API Gateway:** `source api/venv/bin/activate && python3 api/api_server.py` to launch the Anthropic-compatible ASGI Python server.
+* **Standard Build:** `./setup.sh` or `make` to configure and compile `./build/zeromoe`.
+* **Testing:** `make test` executes the native test harness (`tests/native/main_test.cpp`). CPU-only components can be tested cross-platform via `make test-components` (`tests/test_components.cpp`).
+* **Execution:** `./build/zeromoe --config configs/single_gpu.toml` (preferred over legacy CLI flags).
+* **API Gateway:** `api/` currently holds only a `venv`; the Anthropic-compatible ASGI server script (`api_server.py`) is not in the tree.
+
+### Source Layout
+There is no `src/` or `include/` tree. Sources and headers live side by side in: `core/` (engine config, `tensor_trace.hpp`), `memory/` (`direct_io.hpp`, `io_uring_backend.hpp`, RAM/VRAM caches), `models/{base,graph,qwen,glm,mimo,deepseek}/`, `backends/{cpu,cuda,ggml,exl3}/`, `kernels/` (CUDA quant kernels), `tests/` (`tests/native/` is the native harness). `ZEROMOE_INCLUDE_DIRS` in `CMakeLists.txt` is the include-path list; `tests/run_components.sh` mirrors it.
 
 ### GPU Co-existence Guard
-Before launching any run or benchmark, check for competing GPU processes using `nvidia-smi` and `pgrep -af` (e.g., `llama.cpp`, `llama-bench`, `ollama`, `vllm`). MoEStream computes its internal VRAM budgets (`moe_cache_gb`, active-layer pool, dual-role slice) once at startup based on `cudaMemGetInfo`. External processes consuming VRAM during or before startup induce hard-to-diagnose OOMs and cache thrashing.
+Before launching any run or benchmark, check for competing GPU processes using `nvidia-smi` and `pgrep -af` (e.g., `llama.cpp`, `llama-bench`, `ollama`, `vllm`). ZeroMoE computes its internal VRAM budgets (`moe_cache_gb`, active-layer pool, dual-role slice) once at startup based on `cudaMemGetInfo`. External processes consuming VRAM during or before startup induce hard-to-diagnose OOMs and cache thrashing.
 
 ### Non-CUDA / macOS Dev Iteration Workarounds
 Building directly on non-CUDA hosts hard-fails at `find_package(CUDAToolkit REQUIRED)`. Instead of CMake, perform syntax checks using LLVM standalone tools:
-* `/opt/homebrew/opt/llvm/bin/clang-check <file> -- -std=c++23 -Iinclude -ferror-limit=0`
+* `/opt/homebrew/opt/llvm/bin/clang-check <file> -- -std=c++23 -Icore -Imemory -Imodels/base -Imodels/graph -ferror-limit=0`
   * *Crucial:* Always pass `-ferror-limit=0` to prevent early diagnostic truncation caused by missing CUDA headers.
-* `/opt/homebrew/opt/llvm/bin/clang-tidy -checks='bugprone-*,performance-*' <file> -- -std=c++23 -Iinclude`
+* `/opt/homebrew/opt/llvm/bin/clang-tidy -checks='bugprone-*,performance-*' <file> -- -std=c++23 -Icore -Imemory -Imodels/base -Imodels/graph`
 * Disregard expected `cuda_runtime.h file not found` and x86 `immintrin.h` errors on ARM hosts; filter diagnostics to code changes. Full compilation must still be verified on the Linux/CUDA host.
 
 ---
@@ -56,7 +59,7 @@ Routed experts are loaded per-token through a strict caching hierarchy:
 ### Key Tuning & Configuration Options
 * **Pin Strategy (`pin_strategy`):**
   * `"per_layer_topk"` (default): Assigns a fixed pin count (`pin_topk_per_layer`) to every layer regardless of routing concentration.
-  * `"global_topn"`: Pools all expert routing counts from `.moestream_usage` into a single global ranking and pins the hottest experts across the entire model, subject to a minimum floor per layer (`pin_global_floor_per_layer`, default 1).
+  * `"global_topn"`: Pools all expert routing counts from `.zeromoe_usage` into a single global ranking and pins the hottest experts across the entire model, subject to a minimum floor per layer (`pin_global_floor_per_layer`, default 1).
 * **TOML Scoping Rule:** In configuration TOML files, place all root-level configuration keys **before** the first `[[gpus]]` table header. Keys placed after a `[[gpus]]` header are parsed as fields of that GPU entry.
 * **CPU-Affinity Layers (`cpu_affinity_layers`):** Array of layer indices (e.g., `cpu_affinity_layers = [4, 5, 7]`) that permanently pins specified layers to CPU dispatch. Prevents VRAM uploads and preloading for layers where NVMe reads dwarf compute savings.
 
@@ -64,7 +67,7 @@ Routed experts are loaded per-token through a strict caching hierarchy:
 
 ## 4. Execution Dispatch & Quantization
 
-MoEStream utilizes a hybrid execution model, favoring the GPU but falling back to AVX-512 CPU execution for unsupported types.
+ZeroMoE utilizes a hybrid execution model, favoring the GPU but falling back to AVX-512 CPU execution for unsupported types.
 
 * **GPU Fused Kernels:** Supported for `Q4_0`, `IQ2_M`, and `IQ4_XS`. Operates asynchronously on `copy_stream` to allow Pass A / Pass B overlapping.
 * **CPU AVX-512 Fallback:** Optimized SIMD dequantization routines exist for `IQ2_XXS`, `IQ3_XXS`, and `IQ2_S`. Execution speed is bound by SIMD dequantization throughput.
@@ -75,7 +78,7 @@ MoEStream utilizes a hybrid execution model, favoring the GPU but falling back t
 
 ## 5. Debugging & Tensor Tracing
 
-`include/tensor_trace.hpp` provides unified VERBOSE tracing and NaN detection across model layers.
+`core/tensor_trace.hpp` provides unified VERBOSE tracing and NaN detection across model layers.
 
 ### Usage & Setup
 * **Enable:** Set `log_level = "VERBOSE"` in the TOML configuration.
@@ -114,7 +117,7 @@ trace_abort_if_nan("MY-TAG", contains_nan);
 * **Host Memory Registration Overhead:** Calling `cudaHostRegister` dynamically on short-lived host buffers during runtime adds high per-call driver overhead. For persistent scratch buffers (e.g., `LayerScratch`), allocate directly via `cudaMallocHost` (`PinnedFloatBuffer`) rather than registering `std::vector` allocations on the fly.
 
 ### Parallelism & Threading
-* **Nested OpenMP Regions:** Never call functions containing internal `#pragma omp parallel` loops from inside an outer parallel region. MoEStream runs with nested OMP disabled; nested parallel regions execute sequentially while paying thread-team spawn and barrier overhead.
+* **Nested OpenMP Regions:** Never call functions containing internal `#pragma omp parallel` loops from inside an outer parallel region. ZeroMoE runs with nested OMP disabled; nested parallel regions execute sequentially while paying thread-team spawn and barrier overhead.
 * **Batch Size Parallelism Splitting:** Parallelize across heads/experts in single outer `#pragma omp parallel for` loops. Avoid spawning OMP parallel regions inside per-token loops for $S=1$ decode steps.
 
 ---
@@ -122,3 +125,32 @@ trace_abort_if_nan("MY-TAG", contains_nan);
 ## 7. Commit Rules
 
 * **No `Co-Authored-By` trailers** (and no "Generated with Claude Code" lines) in commit messages or PR descriptions. Commits carry the author's identity only.
+
+---
+
+## 8. Supported Models, Builds and Validation (as of 2026-10-23)
+
+### Models and where they are documented
+Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `docs/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. Full graph only: a graph that fails to build fails the request, there is no layered fallback.
+
+### Builds
+* Always configure with `-DCMAKE_BUILD_TYPE=Release` (an unset build type compiles without `-O`).
+* Builds that use the unmodified ggml series live in the main checkout: `build_master` (engine) and `build_master_ggml` (patched ggml). Builds that need branch-only ggml patches live in the worktree that carries the patches and may be deleted after it is merged. A worktree build links its ggml libraries by absolute path, so copying the binary out of it does not work; rebuild in the main checkout instead.
+* The ggml patch recipe is `docs/build-ggml.md`, `scripts/build_ggml.sh`, `scripts/build_with_ggml.sh`. `patches/ggml`, `patches/ggml-host-node` and `patches/debug` are applied; `patches/experimental` and `patches/obsolete` never are.
+* The first run after a fresh ggml build JIT-compiles for sm_120 and is far slower; take performance numbers from a warm run.
+
+### Defaults that affect VRAM and DDR
+* `embedding_device` (`auto|cpu|gpu`) defaults to CPU/DDR for every model unless a config forces GPU. A graph that uploads its own resident tensors (MiMo) must skip `token_embd.weight` too.
+* `moe_cache_reserve_gb` fits the expert cache to the free VRAM left after dense weights; an exhausted budget disables the cache, it does not mean "auto". Prefill-VRAM reuse is a common policy.
+* Phase cache (`ZEROMOE_PHASE_CACHE_MIB`, default 0, reserve `ZEROMOE_PHASE_CACHE_RESERVE_MIB`): an optional, separately releasable decode-hot extension (`models/graph/phase_expert_cache.hpp`, design in `docs/design/phase-cache.md`). Validate with `bench/phase_cache_transition.py`. Validated on MiMo; on Ling it costs about 2.5-3% decode and is not enabled by default.
+
+### Validating a model or an FFN change
+* Compare decode logits with llama.cpp: README section "Validating a new model, or a change to a model's FFN flow" and `scripts/validate_vs_llama.sh`. Teacher-forced, per-frame comparisons are required; a first-step match proves nothing about decode.
+* Teacher forcing through `bench/ling/reference-audit/gate.sh`/`run.sh` needs the token file in `LING_TOKEN_FILE` (the script unsets `ZEROMOE_TEACHER_FORCE_TOKEN_FILE`); `bench/phase_cache_transition.py` forces tokens per request and compares every decode frame. Never compare two free-running runs: one expert flip changes the text and every later measurement (the apparent 22% phase-cache slowdown on Ling came from two free-running runs whose routes diverged at the first decode step; with tokens forced per request the cost was about 2.5-3%).
+* Kernel-level check, free of model noise: `scripts/check_kernel_numerics.sh` (aliased expert views bitwise equal to contiguous tensors; CPU and CUDA within 1e-4 of float64 on exactly representable inputs).
+* Per-model gates: MiMo keeps cosine >= 0.999 against its control placement. Ling is gated by the kernel check plus a bitwise-identical repeated request instead (decision of 2026-10-23), because moving Ling's experts between CPU and GPU changes logits by cosine 0.95-0.99 even in stock llama.cpp: the CPU rounds activations to 8 bits in 256-value blocks (Q8_K) and CUDA in 32-value blocks (Q8_1), and Ling's spiky swiglu output makes the CPU error about twice as large. The kernels themselves are exact. Details and a rejected fix (+7-8% on the CPU expert op) are in `docs/experiments/ggml-cpu-activation-rounding.md`; CPU expert-path performance is more important than placement-invariant numerics.
+* `run.sh` refuses to start when `MemAvailable` is below `host_ram_gb + 21.5 GiB`. After a big run, drop the model files from the page cache with `posix_fadvise(POSIX_FADV_DONTNEED)` instead of root's `drop_caches`.
+
+### Git workflow
+* Work in a worktree, not in the main checkout. Master's history was rewritten during the source refactor, so `git rev-list master..branch` counts are meaningless for old branches; judge "merged" with `git cherry master <branch>` (patch content) and by checking that the code exists in master under the new paths.
+* The project was renamed MoEStream -> ZeroMoE: the engine binary is `zeromoe`, env vars are `ZEROMOE_*`, usage files are `.zeromoe_usage*` (gitignored). Do not add new `moestream`/`MOESTREAM_*` names or absolute `/home/ray/Projects/MoEStream` paths. Remaining legacy references are deliberate: `patches/obsolete`, dated `docs/` handoffs, `glm_runs/`, `logs/`, and `bench/`/`configs/`/`tests/` scripts that point at real external directories still named `moestream-*` on disk (e.g. `~/Projects/moestream-build-upstream-master`, `~/work/moestream-graph`, `/data/moestream-offload`). Rename those references only together with the directories.

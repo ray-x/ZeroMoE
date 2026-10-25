@@ -23,7 +23,7 @@ moe::GgmlMoeTransferManager::~GgmlMoeTransferManager() {
   reset_transfer_state(-1);
 }
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #include "gpu_topology.hpp"
 #include "ggml.h"
@@ -1106,7 +1106,7 @@ void GgmlMoeRunner::defer_host_release(std::function<void()> release) {
   if (release)
     deferred_host_releases_.push_back(std::move(release));
 }
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 void moe::GgmlMoeTransferManager::reset_transfer_state(int) noexcept {}
 
 bool GgmlMoeRunner::ensure_stage_buffers(size_t) { return false; }
@@ -1145,4 +1145,4 @@ void GgmlMoeRunner::finish_h2d() {}
 void GgmlMoeRunner::defer_vram_hold(void *, int, int, const uint8_t *) {}
 
 void GgmlMoeRunner::release_completed_vram_holds() {}
-#endif  // MOESTREAM_USE_GGML_CUDA
+#endif  // ZEROMOE_USE_GGML_CUDA

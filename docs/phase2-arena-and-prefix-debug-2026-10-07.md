@@ -127,7 +127,7 @@ coherence loss.
 The existing coarse P2 timer grouped storage waiting, payload upload,
 conditional dispatch, and the tail replay under `suffix_submit_sync`; on the
 staged path `route_decision` also remained zero. With
-`MOESTREAM_QWEN4EXP_GRAPH_PHASE_TIMING=1`, the source now emits a
+`ZEROMOE_QWEN4EXP_GRAPH_PHASE_TIMING=1`, the source now emits a
 `GGML-QWEN-FULL-DECODE-P2-STAGED-PHASES` ledger for each completed token. It
 separates storage request wall time and service queue/service measurements,
 payload preparation and H2D, both split-child scheduler replays, event-wait
@@ -135,7 +135,7 @@ enqueue costs, the three-way conditional's host and CUDA-event spans, the tail
 replay, and upload-event synchronization. The staged route timer now includes
 its route graph replay and host classification instead of reporting zero.
 
-`cmake --build build_ggmlcuda -j2 --target moestream` passed with this
+`cmake --build build_ggmlcuda -j2 --target zeromoe` passed with this
 instrumentation. The retained bounded attempt is
 `logs/phase2_layer3_up_weight_verify_20261007/run32_phase_breakdown_8tok/`.
 It did not reach model inference: the baseline process reported
@@ -225,7 +225,7 @@ with the run artifacts.
 ## 2026-10-07 Phase-2 early-ready composition experiment
 
 To test whether the staged tail could retain the accepted private CPU graphs,
-the worktree adds an opt-in `MOESTREAM_QWEN4EXP_PHASE2_EARLY_READY=1` path for
+the worktree adds an opt-in `ZEROMOE_QWEN4EXP_PHASE2_EARLY_READY=1` path for
 non-split layers in Prefix and Tail. A matching scheduler hook patch lives in
 `patches/ggml-host-node-beellama/0004-ggml-scheduler-early-ready-private-cpu.patch`.
 The test build applied it to a copy of the Beellama GGML tree under `/tmp` and
@@ -275,7 +275,7 @@ The direct CPU-only unit checks for route classification (all-hot,
 all-cold, mixed and duplicate slots), storage Ready/Error generations,
 staged/adaptive boundaries, the adaptive policy, and the shared shape-class
 staging registry all pass. They were compiled directly to avoid the aggregate
-component script's unrelated EXL3 support sources. The current `moestream`
+component script's unrelated EXL3 support sources. The current `zeromoe`
 target also builds successfully with the added opt-in timing and Phase-2
 early-ready code.
 
@@ -283,7 +283,7 @@ early-ready code.
 
 The staged request path previously waited indefinitely for the storage worker
 after submitting a generation-tagged request. It now uses
-`MOESTREAM_QWEN4EXP_STORAGE_TIMEOUT_MS` (default 100 ms, clamped to 30 s).
+`ZEROMOE_QWEN4EXP_STORAGE_TIMEOUT_MS` (default 100 ms, clamped to 30 s).
 On timeout the current token takes the existing exact CPU suffix. The storage
 read itself is not cancelled; when its worker completes, it discards the late
 result and releases that generation's bounded slot. This prevents a late
@@ -317,7 +317,7 @@ bitmap empty; the same parent graph still runs any resident routes and sends
 the cold remainder through the CPU callback. Resident child-handle warm-up is
 queued after the storage request so it can overlap the read.
 
-The `moestream` target builds, and direct CPU tests for exact-once route
+The `zeromoe` target builds, and direct CPU tests for exact-once route
 classification, storage generations/timeouts, and adaptive timing pass. The
 current `nvidia-smi` preflight returned a driver communication error, so this
 new graph composition has not had a GPU replay or post-change A/B. Keep the

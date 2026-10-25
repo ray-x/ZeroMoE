@@ -3,7 +3,7 @@ set -euo pipefail
 worktree=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
 # Binary override: LING_BIN lets the regression gate certify a specific candidate
 # instead of the hardcoded worktree build.
-bin=${LING_BIN:-$worktree/build-ling/moestream}
+bin=${LING_BIN:-$worktree/build-ling/zeromoe}
 profile=${LING_USAGE_FILE:-$worktree/bench/ling/reference-audit/usage-hi-there-robust4.pin}
 # Empty by default: use an explicit prompt-matched profile for prefill pinning.
 prefill_profile=${LING_PREFILL_USAGE_FILE-}
@@ -56,7 +56,7 @@ fi
 [[ -r /home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf ]]
 grep -q 'MemorySwapMax=0' "$worktree/scripts/run_capped.sh"
 exec > >(tee "$log") 2>&1
-exec 9>/tmp/moestream-host-admission.lock
+exec 9>/tmp/zeromoe-host-admission.lock
 if ! flock -n 9; then
   echo '[PREFLIGHT] shared admission lock is held; not starting.'
   exit 31
@@ -65,7 +65,7 @@ python3 - "$minimum_kb" <<'PY'
 from pathlib import Path
 import os, sys, time
 minimum_kb=int(sys.argv[1])
-# Ignore this script, the checker, and their launcher ancestors. MoEStream
+# Ignore this script, the checker, and their launcher ancestors. ZeroMoE
 # acquires the same admission lock before model initialization.
 ancestors=set()
 pid=os.getpid()
@@ -75,7 +75,7 @@ while pid > 1:
         fields=Path(f'/proc/{pid}/stat').read_text().split()
         pid=int(fields[3])
     except (OSError,ValueError,IndexError): break
-names={'moestream','llama-server','llama-cli','llama-bench','llama-mtmd-cli',
+names={'zeromoe','llama-server','llama-cli','llama-bench','llama-mtmd-cli',
        'llama-completion','llama-simple','llama-parallel','llama-quantize',
        'llama-gguf-split','llama-gguf-surgery','abrun.sh',
        'run_split_queue58.sh','run_dsa_graph2g.sh'}
@@ -90,15 +90,15 @@ for p in Path('/proc').iterdir():
     joined=' '.join(args).lower()
     if comm in names or (comm.startswith('llama-')):
         blocked.append(f'{p.name} {comm}: {joined[:260]}')
-    elif comm in builders and any(x in joined for x in ('/home/ray/projects/moestream','/home/ray/projects/llama.cpp')):
+    elif comm in builders and any(x in joined for x in ('/home/ray/projects/zeromoe','/home/ray/projects/llama.cpp')):
         blocked.append(f'{p.name} {comm}: {joined[:260]}')
-    elif comm in {'bash','sh','systemd-run','flock'} and any(x in joined for x in ('build-ling/moestream','build_g7/moestream','llama-server','llama-cli','llama-bench','abrun.sh','run_split_queue58.sh','run_dsa_graph2g.sh')):
+    elif comm in {'bash','sh','systemd-run','flock'} and any(x in joined for x in ('build-ling/zeromoe','build_g7/zeromoe','llama-server','llama-cli','llama-bench','abrun.sh','run_split_queue58.sh','run_dsa_graph2g.sh')):
         blocked.append(f'{p.name} {comm}: {joined[:260]}')
 if blocked:
     print('[PREFLIGHT] model/build/sweep process detected; waiting for it to finish:')
     print('\n'.join(blocked))
     raise SystemExit(32)
-print('[PREFLIGHT] no MoEStream/llama.cpp model, build, or sweep process detected')
+print('[PREFLIGHT] no ZeroMoE/llama.cpp model, build, or sweep process detected')
 for i in range(1,4):
     available=int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')))
     if available < minimum_kb:
@@ -109,22 +109,22 @@ for i in range(1,4):
 print('[PREFLIGHT] host swap may be in use by unrelated processes; this run is confined to MemorySwapMax=0')
 PY
 flock -u 9
-export MOESTREAM_LING_FULL_GRAPH=1
-export MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1
-export MOESTREAM_FULL_GRAPH_USAGE_FILE="$profile"
-export MOESTREAM_GLM5NEXT_DYNAMIC_CACHE=0
-export MOESTREAM_GLM5NEXT_GPU_ASSIST=${LING_GPU_ASSIST:-3}
-export MOESTREAM_GLM5NEXT_ASSIST2_SLOTS=${LING_ASSIST2_SLOTS:-1}
-export MOESTREAM_GLM5NEXT_CPU_THREADS=${LING_CPU_THREADS:-10}
-export MOESTREAM_GLM5NEXT_EARLY_READY=${LING_EARLY_READY:-1}
-export MOESTREAM_LING_OFFLOAD_FIRST_LAYER=4
-export MOESTREAM_LING_OFFLOAD_MODEL=/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf
-export MOESTREAM_LING_OFFLOAD_USAGE="$profile"
-export MOESTREAM_LING_OFFLOAD_DDR_GIB=${LING_DDR_GIB:-64}
-export MOESTREAM_LING_OFFLOAD_PINNED=${LING_OFFLOAD_PINNED:-0.5}
-export MOESTREAM_LING_OFFLOAD_BYTE_CAP=1
-export MOESTREAM_LING_OFFLOAD_PIN=1
-export MOESTREAM_LING_OFFLOAD_ASYNC=1
+export ZEROMOE_LING_FULL_GRAPH=1
+export ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1
+export ZEROMOE_FULL_GRAPH_USAGE_FILE="$profile"
+export ZEROMOE_GLM5NEXT_DYNAMIC_CACHE=0
+export ZEROMOE_GLM5NEXT_GPU_ASSIST=${LING_GPU_ASSIST:-3}
+export ZEROMOE_GLM5NEXT_ASSIST2_SLOTS=${LING_ASSIST2_SLOTS:-1}
+export ZEROMOE_GLM5NEXT_CPU_THREADS=${LING_CPU_THREADS:-10}
+export ZEROMOE_GLM5NEXT_EARLY_READY=${LING_EARLY_READY:-1}
+export ZEROMOE_LING_OFFLOAD_FIRST_LAYER=4
+export ZEROMOE_LING_OFFLOAD_MODEL=/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf
+export ZEROMOE_LING_OFFLOAD_USAGE="$profile"
+export ZEROMOE_LING_OFFLOAD_DDR_GIB=${LING_DDR_GIB:-64}
+export ZEROMOE_LING_OFFLOAD_PINNED=${LING_OFFLOAD_PINNED:-0.5}
+export ZEROMOE_LING_OFFLOAD_BYTE_CAP=1
+export ZEROMOE_LING_OFFLOAD_PIN=1
+export ZEROMOE_LING_OFFLOAD_ASYNC=1
 # Ling's batched prefill needs the patched negative-id skip once the prompt
 # grows past the two-token smoke case: the valid-dummy fallback aliases many
 # tokens onto expert 0 and ggml's batched id compaction then over-runs that
@@ -132,23 +132,23 @@ export MOESTREAM_LING_OFFLOAD_ASYNC=1
 # long-prompt runs (context > 64) opt into the patched path.  Override with
 # LING_BATCHED_NEGATIVE_SKIP=0/1 for an A/B.
 if [[ -n "${LING_BATCHED_NEGATIVE_SKIP:-}" ]]; then
-  export MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP="$LING_BATCHED_NEGATIVE_SKIP"
+  export ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP="$LING_BATCHED_NEGATIVE_SKIP"
 elif (( context_size > 64 )); then
-  export MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1
+  export ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1
 else
-  export MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP=0
+  export ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=0
 fi
-unset MOESTREAM_LING_NATIVE_GRAPH MOESTREAM_LING_HYBRID_CUDA_GRAPH MOESTREAM_LING_CPU_COLD_MISSES MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER MOESTREAM_GLM5NEXT_OFFLOAD_MODEL MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB MOESTREAM_GLM5NEXT_OFFLOAD_POLICY MOESTREAM_GLM5NEXT_OFFLOAD_PINNED MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP MOESTREAM_GLM5NEXT_OFFLOAD_PIN MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC MOESTREAM_GLM5NEXT_OFFLOAD_USAGE MOESTREAM_GLM5NEXT_OFFLOAD_THP MOESTREAM_GLM5NEXT_OFFLOAD_STORE MOESTREAM_GLM5NEXT_GPU1_HOT_GIB MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE MOESTREAM_FULL_GRAPH_RESIDENT_GB MOESTREAM_FULL_GRAPH_USE_RAM_CACHE MOESTREAM_LING_FULL_GRAPH_DDR_PREFETCH_GIB
+unset ZEROMOE_LING_NATIVE_GRAPH ZEROMOE_LING_HYBRID_CUDA_GRAPH ZEROMOE_LING_CPU_COLD_MISSES ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER ZEROMOE_GLM5NEXT_OFFLOAD_MODEL ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB ZEROMOE_GLM5NEXT_OFFLOAD_POLICY ZEROMOE_GLM5NEXT_OFFLOAD_PINNED ZEROMOE_GLM5NEXT_OFFLOAD_PROBATION ZEROMOE_GLM5NEXT_OFFLOAD_BYTE_CAP ZEROMOE_GLM5NEXT_OFFLOAD_PIN ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC ZEROMOE_GLM5NEXT_OFFLOAD_USAGE ZEROMOE_GLM5NEXT_OFFLOAD_THP ZEROMOE_GLM5NEXT_OFFLOAD_STORE ZEROMOE_GLM5NEXT_GPU1_HOT_GIB ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE ZEROMOE_FULL_GRAPH_RESIDENT_GB ZEROMOE_FULL_GRAPH_USE_RAM_CACHE ZEROMOE_LING_FULL_GRAPH_DDR_PREFETCH_GIB
 prompt_sha256=$(sha256sum -- "$prompt_file" | awk '{print $1}')
-printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
-export MOESTREAM_GLM5NEXT_ROUTE_TRACE="${log%.log}.routes"
-export MOESTREAM_GENERATED_TOKEN_FILE="${log%.log}.tokens"
-unset MOESTREAM_TEACHER_FORCE_TOKEN_FILE MOESTREAM_LING_PREFILL_OP_OFFLOAD GGML_OP_OFFLOAD_MIN_BATCH
-if [[ -n "${LING_TOKEN_FILE:-}" ]]; then export MOESTREAM_TEACHER_FORCE_TOKEN_FILE="$LING_TOKEN_FILE"; fi
+printf '[RUN] prompt_file=%s; prompt_sha256=%s; context=%s; ngen=32; temp=0; config=%s; usage=%s; DDR=%s GiB OffloadStore; GPU cache=%s+%s GiB; pinned VRAM slots=%s; pinned DDR fraction=%s; GPU assist slots=%s+%s; early-ready=%s; batched-negative-skip=%s; MoE tensors alias cache; CPU threads=%s\n' "$prompt_file" "$prompt_sha256" "$context_size" "$config" "$profile" "${LING_DDR_GIB:-64}" "${LING_GPU0_CACHE_GIB:-3.0}" "${LING_GPU1_CACHE_GIB:-12.5}" "${LING_PINNED_VRAM_CAPACITY:-3700}" "${LING_OFFLOAD_PINNED:-0.5}" "${LING_GPU_ASSIST:-3}" "${LING_ASSIST2_SLOTS:-1}" "${LING_EARLY_READY:-1}" "${ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP}" "${LING_CPU_THREADS:-10}"
+export ZEROMOE_GLM5NEXT_ROUTE_TRACE="${log%.log}.routes"
+export ZEROMOE_GENERATED_TOKEN_FILE="${log%.log}.tokens"
+unset ZEROMOE_TEACHER_FORCE_TOKEN_FILE ZEROMOE_LING_PREFILL_OP_OFFLOAD GGML_OP_OFFLOAD_MIN_BATCH
+if [[ -n "${LING_TOKEN_FILE:-}" ]]; then export ZEROMOE_TEACHER_FORCE_TOKEN_FILE="$LING_TOKEN_FILE"; fi
 if [[ "$freeze_usage_stats" =~ ^(0|false|no)$ ]]; then
-  export MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE=1
+  export ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE=1
 else
-  unset MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE
+  unset ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE
 fi
-export MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=0
+export ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=${LING_PREFILL_OP_OFFLOAD:-0}
 exec "$worktree/scripts/run_capped.sh" --limit-gb "${LING_CAP_GIB:-95}" "$bin" --config "$config" --ngen 32 --temp 0 < "$prompt_file"

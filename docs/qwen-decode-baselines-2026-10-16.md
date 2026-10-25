@@ -25,9 +25,9 @@ the hybrid is small, so it is less sensitive).
 | RAM | 125 GB (118 GB available at start), zram swap only |
 | GPU | RTX 3090 24 GB, PCIe Gen3 x16, power limit 350 W; the 5060 Ti is hidden with `CUDA_VISIBLE_DEVICES=0` |
 | source | `graph-framework` at `e0fc5f2` (the binary was built 2026-10-16 03:01:57, the commit is 03:03:33; later commits are docs and the script only) |
-| binary | `build_native/moestream` (Release, CUDA, `GGML_AVX512=ON`, `GGML_AVX512_VNNI=ON`, `GGML_AVX2=OFF`, OpenMP on) |
-| ggml | `MOESTREAM_GGML_ROOT=/home/ray/work/ggml-iq2xxs/ggml` at `7bd457fa1` plus uncommitted env-gated trace code (inactive unless `SCHED_TRACE2`/`SERIAL` are set) |
-| engine rule | one `moestream` at a time; the script waits for no `moestream` / `llama-bench` process |
+| binary | `build_native/zeromoe` (Release, CUDA, `GGML_AVX512=ON`, `GGML_AVX512_VNNI=ON`, `GGML_AVX2=OFF`, OpenMP on) |
+| ggml | `ZEROMOE_GGML_ROOT=/home/ray/work/ggml-iq2xxs/ggml` at `7bd457fa1` plus uncommitted env-gated trace code (inactive unless `SCHED_TRACE2`/`SERIAL` are set) |
+| engine rule | one `zeromoe` at a time; the script waits for no `zeromoe` / `llama-bench` process |
 
 ## Split: 22 layers fully on the GPU, 26 fully on the CPU
 
@@ -52,12 +52,12 @@ Environment (all set by the script):
 
 ```text
 CUDA_VISIBLE_DEVICES=0
-MOESTREAM_QWEN4EXP_FULL_GRAPH=1
-MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
-MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40      # "as many layers as fit"; the 22 non-affinity layers become the 17.74 GiB device arena
-MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
-MOESTREAM_BENCH_SILENT=1                         # no token printing / per-token VRAM sampling in the timed path
-MOESTREAM_BENCH_IGNORE_STOP=1                    # generate all 400 tokens
+ZEROMOE_QWEN4EXP_FULL_GRAPH=1
+ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40      # "as many layers as fit"; the 22 non-affinity layers become the 17.74 GiB device arena
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+ZEROMOE_BENCH_SILENT=1                         # no token printing / per-token VRAM sampling in the timed path
+ZEROMOE_BENCH_IGNORE_STOP=1                    # generate all 400 tokens
 ```
 
 Input: stdin `Tell a story.` then `:q`; with the chat template that is 16 tokens (`[PREFILL-DONE] 16 tokens`). Greedy
@@ -86,7 +86,7 @@ Model: `/data/sdb/models/qwen3.8-flash-next/Q2_0` (directory). Config: `configs/
 | `qwen4exp_option_b_global_floor_per_layer` | `1` | every layer gets at least one hot expert |
 | `qwen4exp_option_b_top_n` / `..._right_size_top_n` | `512` / `false` | per-layer ceiling off in global mode |
 | `qwen4exp_option_b_min_coverage` | `0.80` | |
-| `pin_file`, `prefill_pin_file` | `tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap`, `..._survey_prefill` | the usage rankings; `freeze_usage_stats = true` |
+| `pin_file`, `prefill_pin_file` | `tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap`, `..._survey_prefill` | the usage rankings; `freeze_usage_stats = true` |
 | `cpu_affinity_layers` | `[]` | no layer is CPU-pinned; cold experts of every layer run on the CPU |
 | `qwen4exp_full_graph`, `..._full_graph_decode` | `true` | |
 | `host_ram_gb` | `90` | `ram_preload_all_experts = true` |
@@ -97,12 +97,12 @@ Environment (all set by the script):
 
 ```text
 CUDA_VISIBLE_DEVICES=0
-MOESTREAM_QWEN4EXP_FULL_GRAPH=1
-MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
-MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0        # expert residency comes from the global pool, not from a layer count
-MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
-MOESTREAM_TOKEN_LOOP_DIAG=1                      # per-step iter_total, the metric source
-MOESTREAM_BENCH_IGNORE_STOP=1
+ZEROMOE_QWEN4EXP_FULL_GRAPH=1
+ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0        # expert residency comes from the global pool, not from a layer count
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+ZEROMOE_TOKEN_LOOP_DIAG=1                      # per-step iter_total, the metric source
+ZEROMOE_BENCH_IGNORE_STOP=1
 ```
 
 Input: `Explain briefly the key concepts of neural networks and gradient descent in plain English.` on stdin, `--ngen 200`.
@@ -111,7 +111,7 @@ and gradient descent using an analogy." (coherent).
 
 Measured resources: expert arena 18.74 GiB; steady GPU memory used 22.38 GiB, free 1.62 GiB (minimum free 1.46 GiB, 250 ms
 `nvidia-smi` samples); no fallback to layered decode; survey-predicted hot-set coverage 93.3%. Graph admission needs >= 1.00 GiB
-free when the decode graph is built: K above ~14,729 fails on a 24 GiB card unless `MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512`
+free when the decode graph is built: K above ~14,729 fails on a 24 GiB card unless `ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512`
 is set (then K = 14,746 builds; do not use that for the baseline). A refusal means the run silently decodes all-CPU at ~835 ms/token,
 which the script reports as `FELL BACK TO LAYERED DECODE: True`. The engine releases the expert arena before a prefill that needs
 more workspace than is free and rebuilds it for decode (about 4 s once); this baseline is the decode figure, not first-request latency.
@@ -124,7 +124,7 @@ measured **3.05 tok/s** (400 tokens) and 1.49 tok/s in a 40-token layer-timing r
 cores) and a niced ggml compile from another session were running. At 10 threads, with the indexer still running, it measured
 24.6 and 26.0; with the box quieter (loadavg 1.06) 28.66. The hybrid's CPU share is small, so it is much less affected.
 Rule: set `omp_max_threads` to (hardware threads - 2) unless the machine is known idle, and read `/proc/loadavg` before a decode
-measurement (the script prints it). The per-layer timing that showed it: `MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING=1` printed `cpu_total=338 ms` per token
+measurement (the script prints it). The per-layer timing that showed it: `ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING=1` printed `cpu_total=338 ms` per token
 under contention (I did not capture a quiet-run value for comparison).
 
 ## What does not reach these numbers
@@ -137,4 +137,4 @@ a decode-tuned placement.
 
 `logs/qwen_decode_split_20261016_1841.{log,engine.log}`, `logs/qwen_decode_hybrid_K14554_20261016_1841.{log,engine.log,csv}`,
 earlier same-day runs `logs/qwen_decode_split22_26_*.log`, `logs/optb_probe_K14554.*`. The engine log of the split run with 12
-threads is `/tmp/moestream_qwen4exp_tg400_iq1m.log` (overwritten by later runs of the stock config).
+threads is `/tmp/zeromoe_qwen4exp_tg400_iq1m.log` (overwritten by later runs of the stock config).

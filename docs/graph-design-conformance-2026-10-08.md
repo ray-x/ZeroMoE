@@ -8,7 +8,7 @@ asynchronous SSD execution system with globally shared storage pools.
 
 ## Audit scope and version distinction
 
-Inspected `/home/ray/Projects/MoEStream`, branch `cleanup/ggml-exl3-only`, HEAD
+Inspected `/home/ray/Projects/ZeroMoE`, branch `cleanup/ggml-exl3-only`, HEAD
 `a28b4616f10d7f28501aa32aadf515a135cec525`, including its uncommitted files.
 This checkout differs from the isolated `521d67a` bug-fix worktrees. No engine
 code was changed and no new GPU run was launched for this audit.

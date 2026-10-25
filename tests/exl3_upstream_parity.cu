@@ -1,4 +1,4 @@
-// Synthetic parity: MoEStream's own EXL3 mul1 matmul vs upstream ExLlamaV3's
+// Synthetic parity: ZeroMoE's own EXL3 mul1 matmul vs upstream ExLlamaV3's
 // exl3_gemm (compiled through the torch-free stub). Random trellis words are
 // valid EXL3 data, so no checkpoint is needed.
 #include "exl3_cuda.hpp"
@@ -68,7 +68,7 @@ int run(int bits, int k, int n, int rows) {
   c10::optional<Tensor> osuh = Tensor(d_suh, {k / 16}, at::kHalf, 0);
   c10::optional<Tensor> ohad = Tensor(d_had, {rows, k}, at::kHalf, 0);
   c10::optional<Tensor> osvh = Tensor(d_svh, {n / 16}, at::kHalf, 0);
-  moestream_exl3::set_current_stream(nullptr);
+  zeromoe_exl3::set_current_stream(nullptr);
   const int shape = exl3_gemm(A, B, C, osuh, ohad, osvh, 0, false, true, 0);
   CK(cudaDeviceSynchronize());
 

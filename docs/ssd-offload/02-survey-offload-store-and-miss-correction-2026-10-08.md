@@ -8,7 +8,7 @@
 - the file ends padded to 4096; `general.alignment` = 4096; tensors are named `offload.blk.<L>.ffn_<k>.<E>.weight`
   (deliberately not the unpacked-model names, because the engine requires an unpacked layer to be complete and a
   partial store must never be merged into the model by a directory scan); the (layer, expert) index is in the
-  KV arrays `moestream.offload.layer/expert`. Pure byte copy, no requantization.
+  KV arrays `zeromoe.offload.layer/expert`. Pure byte copy, no requantization.
 - `gguf_tool offload --verify <store> --against <model>` reads every expert back with O_DIRECT and byte-compares it
   with the source (also checks alignment and tightness).
 

@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -46,7 +46,7 @@ void plan_expert_vram_split(FullGraph &g) {
     const auto &c = g.engine->model_file.architecture_config;
 
     const std::string path = g.engine->qwen4exp_graph_pin_file.empty()
-                                 ? std::string(".moestream_usage")
+                                 ? std::string(".zeromoe_usage")
                                  : g.engine->qwen4exp_graph_pin_file;
     auto [entries, maxc] = StreamingEngine::load_usage(path);
     (void)maxc;
@@ -246,7 +246,7 @@ void plan_expert_vram_split(FullGraph &g) {
     return; // feature off -- identical to today, zero planning cost
 
   const std::string path = g.engine->qwen4exp_graph_pin_file.empty()
-                               ? std::string(".moestream_usage")
+                               ? std::string(".zeromoe_usage")
                                : g.engine->qwen4exp_graph_pin_file;
   auto [entries, maxc] = StreamingEngine::load_usage(path);
   (void)maxc;
@@ -351,7 +351,7 @@ void plan_partial_layer(StreamingEngine &engine) {
     return;
 
   const std::string path = engine.qwen4exp_graph_pin_file.empty()
-                               ? std::string(".moestream_usage")
+                               ? std::string(".zeromoe_usage")
                                : engine.qwen4exp_graph_pin_file;
   auto [entries, maxc] = StreamingEngine::load_usage(path);
   (void)maxc;
@@ -607,4 +607,4 @@ size_t device_expert_bytes(const FullGraph &g) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

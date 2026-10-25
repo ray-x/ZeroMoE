@@ -104,7 +104,7 @@ static void run(int device, int D, int I, int S, int N, int K) {
     ggml_set_input(x);ggml_set_input(routes);ggml_set_input(rw);
     moe_routed::ExpertWeights ew;ew.gate=wg;ew.up=wu;ew.down=wd;
     auto ffn=moe_routed::expert_ffn(ctx,ew,x,routes);
-    const uint64_t before = moestream_f32_quant_graph_launches();
+    const uint64_t before = zeromoe_f32_quant_graph_launches();
     if (native_mode) {
       // Keep the input alive for the standalone oracle after graph compute;
       // GGML may otherwise reuse its allocation for the final routed sum.
@@ -125,7 +125,7 @@ static void run(int device, int D, int I, int S, int N, int K) {
     results[layout].resize((size_t)D*S);
     ggml_backend_tensor_get(out,results[layout].data(),0,results[layout].size()*sizeof(float));
     if (native_mode) {
-      require(moestream_f32_quant_graph_launches() >= before+3, "native hook was bypassed");
+      require(zeromoe_f32_quant_graph_launches() >= before+3, "native hook was bypassed");
       // Compare each projection to the original standalone native kernel.
       // Inputs/weights are identical, so these comparisons must be bitwise.
       for (int matrix=0;matrix<3;++matrix) {
@@ -222,9 +222,9 @@ static void grouped_graph(int device, int I, int O, int S, int G) {
   auto alloc=ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
   require(ggml_gallocr_alloc_graph(alloc,graph),"grouped graph allocation");
   ggml_backend_tensor_set(raw,input.data(),0,input.size()*sizeof(float));
-  const auto before=moestream_f32_quant_graph_launches();
+  const auto before=zeromoe_f32_quant_graph_launches();
   require(ggml_backend_graph_compute(be,graph)==GGML_STATUS_SUCCESS,"grouped graph compute");
-  require(moestream_f32_quant_graph_launches()>before,"grouped native hook bypassed");
+  require(zeromoe_f32_quant_graph_launches()>before,"grouped native hook bypassed");
   launch_q2_K_grouped_dot_f32_batch(reference,static_cast<const float *>(raw->data),pool,stride,G,O,I,S,nullptr);
   std::vector<float> expected((size_t)S*G*O),actual(expected.size());
   cuda_check(cudaMemcpy(expected.data(),reference,expected.size()*sizeof(float),cudaMemcpyDeviceToHost));
@@ -241,9 +241,9 @@ static void grouped_graph(int device, int I, int O, int S, int G) {
 
 int main() {
   try {
-    const char *mode=std::getenv("MOESTREAM_TEST_NATIVE_F32");
+    const char *mode=std::getenv("ZEROMOE_TEST_NATIVE_F32");
     native_mode=mode && mode[0]=='1';
-    if(native_mode)require(moestream_install_f32_quant_graph_hook(),"GGML F32 hook unavailable");
+    if(native_mode)require(zeromoe_install_f32_quant_graph_hook(),"GGML F32 hook unavailable");
     std::printf("native_f32=%d\n",int(native_mode));std::fflush(stdout);
     int count=0;cuda_check(cudaGetDeviceCount(&count));require(count>=2,"both GPUs required");
     for(int dev=0;dev<2;++dev) {

@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cuda/ggml-cuda.cu b/src/ggml-cuda/ggml-cuda.cu
-index b42bf4132..91d551bbb 100644
+index 83cf708..4a61525 100644
 --- a/src/ggml-cuda/ggml-cuda.cu
 +++ b/src/ggml-cuda/ggml-cuda.cu
-@@ -765,7 +765,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+@@ -823,7 +823,8 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
          const size_t original_size = ggml_nbytes(tensor);
          const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
  
@@ -10,13 +10,13 @@ index b42bf4132..91d551bbb 100644
 +        if (padded_size > original_size &&
 +            padded_size <= ggml_backend_buffer_get_size(buffer)) {
              ggml_cuda_set_device(ctx->device);
-             CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
-         }
+             CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+             CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 diff --git a/src/ggml-cuda/mmq.cu b/src/ggml-cuda/mmq.cu
-index b13b34ee9..c9f132313 100644
+index 46efdfe..a976cf6 100644
 --- a/src/ggml-cuda/mmq.cu
 +++ b/src/ggml-cuda/mmq.cu
-@@ -110,7 +110,8 @@ void ggml_cuda_mul_mat_q(
+@@ -162,7 +162,8 @@ void ggml_cuda_mul_mat_q(
      if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
          const size_t size_data  = ggml_nbytes(src0);
          const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
@@ -27,10 +27,10 @@ index b13b34ee9..c9f132313 100644
              GGML_ASSERT(!src0->view_src);
              CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
 diff --git a/src/ggml-cuda/mmvq.cu b/src/ggml-cuda/mmvq.cu
-index 0bf1b5093..7db3ca840 100644
+index 53ceb31..8ee1452 100644
 --- a/src/ggml-cuda/mmvq.cu
 +++ b/src/ggml-cuda/mmvq.cu
-@@ -1491,7 +1491,8 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1558,7 +1558,8 @@ void ggml_cuda_mul_mat_vec_q(
      if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
          const size_t size_data  = ggml_nbytes(src0);
          const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);

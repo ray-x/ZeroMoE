@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #include "gpu_topology.hpp"
 #include "ggml.h"
@@ -697,7 +697,7 @@ bool GgmlMoeRunner::begin_layer(const GgmlMoeLayerPlan &plan) {
 
   // Setting the device here (not just inside ggml) matters: every raw CUDA
   // call below -- cudaMallocHost, the stream, the events, the H2D copies --
-  // targets the CURRENT device, and MoEStream legitimately leaves GPU 1
+  // targets the CURRENT device, and ZeroMoE legitimately leaves GPU 1
   // current between layers (attention/dense work runs there).
   cudaSetDevice(plan.device_id);
   if (!ensure_backend(plan.device_id)) return false;
@@ -1610,7 +1610,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
   // unbatched Qwen replay is layer 0; export the native GGML intermediates so
   // the routed FFN can be compared against llama.cpp's ffn_moe_down dump.  This is
   // intentionally synchronizing and never runs without the diagnostic flag.
-  if (const char *dump_base = std::getenv("MOESTREAM_GGML_MOE_DUMP")) {
+  if (const char *dump_base = std::getenv("ZEROMOE_GGML_MOE_DUMP")) {
     static std::atomic<bool> dumped_first_runner{false};
     bool expected = false;
     if (dumped_first_runner.compare_exchange_strong(
@@ -1648,7 +1648,7 @@ bool GgmlMoeRunner::run_layer_device_impl(const float *host_x,
   // discover CUDA failures at a later API call; this opt-in sync pins the
   // error to the first MoE graph that produced it.
   static const bool debug_sync = [] {
-    const char *env = std::getenv("MOESTREAM_GGML_DEBUG_SYNC");
+    const char *env = std::getenv("ZEROMOE_GGML_DEBUG_SYNC");
     return env && env[0] == '1';
   }();
   if (debug_sync || debug_device_sync() || (backend_stream_copies_ &&
@@ -2168,7 +2168,7 @@ bool GgmlMoeRunner::run_layer(const float *x, const int32_t *ids,
 
   return true;
 }
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 bool GgmlMoeRunner::compiled_in() { return false; }
 GgmlMoeRunner &GgmlMoeRunner::instance() {
   static GgmlMoeRunner r;
@@ -2227,4 +2227,4 @@ bool GgmlMoeRunner::copy_device_output_to_host(const void *, float *) {
   return false;
 }
 void GgmlMoeRunner::defer_host_release(std::function<void()>) {}
-#endif  // MOESTREAM_USE_GGML_CUDA
+#endif  // ZEROMOE_USE_GGML_CUDA

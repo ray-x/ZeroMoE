@@ -6,7 +6,7 @@
 // cuda_runtime.h wall on a machine with no CUDA Toolkit (CLAUDE.md's
 // documented, pre-existing limitation for every file that reaches
 // engine.hpp; not a new gap this file introduces). Compiled into both the
-// moestream and moestream_tests targets, alongside models/model_factory.cpp
+// zeromoe and zeromoe_tests targets, alongside models/model_factory.cpp
 // (CMakeLists.txt).
 #include "family_ops.hpp"
 #include "engine.hpp"

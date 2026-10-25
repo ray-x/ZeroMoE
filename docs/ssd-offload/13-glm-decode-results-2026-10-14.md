@@ -7,7 +7,7 @@ Branch `graph-framework` (master fast-forwarded to `1842a5c`).
 ## Method (how the numbers were taken)
 - tok/s = 1000 / mean wall-clock ms per token over the **last 30 decoded tokens**, from consecutive `FULL-DECODE-TIME` log lines.
   Averages over all 40-48 tokens include slow warm-up tokens and read ~0.3-0.5 tok/s lower.
-- Compared configurations always decode **identical tokens** (teacher forcing: `MOESTREAM_TEACHER_FORCE_TOKEN_FILE`;
+- Compared configurations always decode **identical tokens** (teacher forcing: `ZEROMOE_TEACHER_FORCE_TOKEN_FILE`;
   `bench/data_glm_tf48.tokens`, or tokens from a free run of the same prompt via `bench/ranking_ab_prompt.sh`).
   Free-running text alone moves the same configuration between 13.8 and 16.0 tok/s.
 - Held-out = prompt not in the ranking file used (train-only file `usage_train30`); benchmark sequence = "Explain how a
@@ -110,7 +110,7 @@ threads), ranking built without the prompt:
 Mechanism: a layer with hot experts on both GPUs pays cross-GPU copies of the hidden state inside its trunk; with the cut, layers 3-30
 are 3090-only (no hop; trunk wait 21.5 -> 19.0 ms/token) and layers 31-44 are 5060 Ti-only, at the price of a slightly worse hot-set match
 (lane compute 37.7 -> 41.7 ms). The trade is neutral for in-domain text and positive for out-of-domain text, whose routes are less
-concentrated. Shipped: `MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=31` (default in `bench/glm_recipe_env.sh`), the 3090 ranking with layers >= 31
+concentrated. Shipped: `ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER=31` (default in `bench/glm_recipe_env.sh`), the 3090 ranking with layers >= 31
 zeroed (`glm53flash_usage_base_plus_decode100_3090_lt31.txt`) and `pin_global_floor_per_layer = 0` in the shipped config.
 
 ### Pin layout / PCIe links (2026-10-14, `nvidia-smi` + a standalone copy microbenchmark)
@@ -137,7 +137,7 @@ The 5060 Ti's own kernels are ~3 ms/token, so most of the gain is the 3090 trunk
 | mode | prefill |
 |---|---|
 | legacy whole-prompt (default; graph prefill is opt-in) | ~1 tok/s (killed after 9.6 min) |
-| `MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1`, chunk 128, `build_native` (has patch 0006), 3090 | **5.7 tok/s** (140 s) |
+| `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`, chunk 128, `build_native` (has patch 0006), 3090 | **5.7 tok/s** (140 s) |
 | same, chunk 256, dual GPU | 4.6 tok/s (175 s; 1.39 GiB workspace, builds; chunk 512 is declined, OOM) |
 | same with `build_gk` / upstream-master ggml-cuda (no patch 0006) | CUDA illegal memory access in `mul_mat_q<IQ2_XXS>` |
 
@@ -151,16 +151,16 @@ The 5060 Ti's own kernels are ~3 ms/token, so most of the gain is the 3090 trunk
 
 ### Prefill workspace breakdown and fix
 
-`MOESTREAM_GLM5NEXT_WS_DUMP=1` prints the intermediate live-set peak at graph build. At S=128 the peak was 754 MiB, of
+`ZEROMOE_GLM5NEXT_WS_DUMP=1` prints the intermediate live-set peak at graph build. At S=128 the peak was 754 MiB, of
 which ~420 MiB were the 34 KDA layers' conv-input concats (`[S+3, 24576]` f32, 12.3 MiB each): the exported conv-history
 and state copies were expanded into the graph only at its end, which kept each layer's conv input and scan output live for
-the whole graph. Expanding them right after the layer (`ggml_build_forward_expand`, `MOESTREAM_GLM5NEXT_EARLY_STATE_EXPORT=0`
+the whole graph. Expanding them right after the layer (`ggml_build_forward_expand`, `ZEROMOE_GLM5NEXT_EARLY_STATE_EXPORT=0`
 turns it off) cut the live peak 754 -> 64 MiB and the workspace 0.83 -> 0.22 GiB at S=128 (6.5 -> ~0.8 MB/token).
 The whole 805-token prompt now fits one graph (0.62 GiB): prefill **5.7 -> 21.1 tok/s** (38 s), same output start.
-Default `MOESTREAM_GLM5NEXT_PREFILL_CHUNK` is now 1024. Graph prefill is still opt-in
-(`MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1`) and needs the ggml-cuda with patch 0006 (`bench/build_native.sh`).
+Default `ZEROMOE_GLM5NEXT_PREFILL_CHUNK` is now 1024. Graph prefill is still opt-in
+(`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) and needs the ggml-cuda with patch 0006 (`bench/build_native.sh`).
 
-### Where the 38 s of whole-prompt prefill goes (S=805, `MOESTREAM_GLM5NEXT_OP_PROFILE=1`)
+### Where the 38 s of whole-prompt prefill goes (S=805, `ZEROMOE_GLM5NEXT_OP_PROFILE=1`)
 
 | op | time |
 |---|---|
@@ -171,7 +171,7 @@ Default `MOESTREAM_GLM5NEXT_PREFILL_CHUNK` is now 1024. Graph prefill is still o
 
 The GPU is idle for ~90% of prefill. Next step: run the cold experts on the GPU during prefill by uploading the used ones
 per layer into VRAM (the expert cache region can be overwritten while prefilling and refilled before decode), instead of the
-CPU `MUL_MAT_ID`. Tried: `MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (scheduler op-offload, needs ~1.7 GiB workspace and
+CPU `MUL_MAT_ID`. Tried: `ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (scheduler op-offload, needs ~1.7 GiB workspace and
 a smaller cache; ggml-backend needed negative-id tolerance) - the scheduler's expert copy fails with `cudaMemcpyAsync:
 invalid argument` from the offload-store host tensors, so the upload has to be done by the graph's own miss node.
 
@@ -185,12 +185,12 @@ invalid argument` from the offload-store host tensors, so the upload has to be d
 | `-ncmoe 41 -ub 4096` | **104.3 t/s** |
 | `-ncmoe 36` | does not fit (context creation fails) |
 
-MoEStream graph prefill (CPU cold experts) is 21 t/s: it matches llama.cpp *without* op-offload (24.7). The 4x gap is the
+ZeroMoE graph prefill (CPU cold experts) is 21 t/s: it matches llama.cpp *without* op-offload (24.7). The 4x gap is the
 per-layer copy of used experts to the GPU with the big ubatch amortising it, exactly the staging path proposed above.
 
 ### Cold experts on the GPU during prefill: 20.2 -> 47.8 tok/s (805 tokens, greedy tokens identical)
 
-`MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (+ `MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1`) lets the scheduler copy only the
+`ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1` (+ `ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1`) lets the scheduler copy only the
 experts a layer's cold branch uses into VRAM and run `MUL_MAT_ID` there, like llama.cpp `-ncmoe N -ub 4096`.
 `patches/ggml/0007` makes the scheduler's expert copy safe for the virtual arena (negative ids, per-slot copies,
 zero padding instead of reading past the last expert). Per-op profile after: CUDA `MUL_MAT_ID` 7.1 s (PCIe-bound),
@@ -202,7 +202,7 @@ miss-node load of layer L+1 with layer L compute, or read experts straight from 
 ### Read-ahead of transient experts: 47.8 -> 98 tok/s prefill (805 tokens, greedy tokens identical)
 
 The miss node used to load a layer's cold experts on the compute path (8.7 s of 16.8 s). Now a background thread reads the
-next `MOESTREAM_GLM5NEXT_PREFILL_AHEAD` (default 2) layers' non-cached experts while the GPU computes the current one
+next `ZEROMOE_GLM5NEXT_PREFILL_AHEAD` (default 2) layers' non-cached experts while the GPU computes the current one
 (`ExpertResidency::prefetch_transient`). Per run (3090, 58 GiB DDR pool, `moe_cache_gb = 14.0`, prefill graph + op-offload):
 
 | | prefill |
@@ -211,7 +211,7 @@ next `MOESTREAM_GLM5NEXT_PREFILL_AHEAD` (default 2) layers' non-cached experts w
 | GPU cold experts (miss node loads inline), 32 GiB pool | 47.8 |
 | + read-ahead, 32 GiB pool | 74.3 |
 | + read-ahead, 58 GiB pool | **98-99** (8.1-8.2 s) |
-| + registering transient experts for DMA (`MOESTREAM_OFFLOAD_PIN_TRANSIENT=1`) | 87.5 (worse; off) |
+| + registering transient experts for DMA (`ZEROMOE_OFFLOAD_PIN_TRANSIENT=1`) | 87.5 (worse; off) |
 | llama.cpp `-ncmoe 41 -ub 4096` | 104 |
 
 AHEAD=4 and TRANSIENT_PAR=16 gave no change (72-73 at the 32 GiB pool). Needs ~1.7 GiB of free VRAM for the workspace and
@@ -223,14 +223,14 @@ The prefill needs ~1.7 GiB of free VRAM beyond the dense arena and cache. The le
 (`attn_qabsorb_gpu`, `attn_score_gpu`; ~0.4 GiB) are unused by the full graph, so the shipped config turns them off and
 `moe_cache_gb = 15.8` (14.71 GiB aliased) stays intact: 805-token prefill 100.3 tok/s (7.9-8.0 s), greedy tokens
 identical to the CPU-cold path, no cache release/refill needed. `bench/glm_recipe_env.sh` now enables
-`MOESTREAM_GLM5NEXT_FULL_GRAPH_PREFILL=1` and `..._PREFILL_OP_OFFLOAD=1` and the `build_native` ggml-cuda when it exists.
+`ZEROMOE_GLM5NEXT_FULL_GRAPH_PREFILL=1` and `..._PREFILL_OP_OFFLOAD=1` and the `build_native` ggml-cuda when it exists.
 
 ### Regression found and fixed: graph prefill turned on sparse KPool decode (-8% decode)
 
 Same teacher-forced benchmark, dual-GPU recipe: legacy prefill 15.75-15.96 tok/s decode; graph prefill 14.1-14.5. The decode graph
 had +693 nodes (11 DSA indexer layers x 63): after a graph prefill the prompt's indexer seeds exist, so decode switched to the
 sparse KPool path, which costs ~6 ms/token and is a no-op until the context passes `top_k` (2048). It is now used only when
-`prompt + MOESTREAM_GLM5NEXT_SPARSE_DECODE_RESERVE (1024) > top_k`; decode with graph prefill is back to 15.85-15.87.
+`prompt + ZEROMOE_GLM5NEXT_SPARSE_DECODE_RESERVE (1024) > top_k`; decode with graph prefill is back to 15.85-15.87.
 Also: read-ahead is skipped for prompts under 64 tokens (24-token prefill 9.3 s -> 2.8 s) and never reads experts a VRAM
 branch serves (`OffloadSite::not_cold`).
 
@@ -264,12 +264,12 @@ for 60-75 ms per layer, behind the activations that cross between the GPUs (no P
 weight copies on the single H2D engine; queueing the copies a few experts at a time recovered only part of it). The missing
 ~60-100 ms per layer is not attributed yet (nsys under 3 sets runs out of memory on the 3090).
 Code: `src/ggml_glm5next_graph_offload.cpp` (`prefetch_*`), cold-branch in `ggml_glm5next_graph_build.cpp`, scheduler events
-in `patches/ggml/0008-*`. Env: `MOESTREAM_GLM5NEXT_PREFILL_PREFETCH{,_SETS,_CHUNK}`, `PREFILL_SPLIT`, `PREFETCH_DEBUG`.
+in `patches/ggml/0008-*`. Env: `ZEROMOE_GLM5NEXT_PREFILL_PREFETCH{,_SETS,_CHUNK}`, `PREFILL_SPLIT`, `PREFETCH_DEBUG`.
 Pool resizing after prefill was not built: with `moe_cache_gb = 17.0` the decode graph itself no longer fits (0.23 tok/s).
 
 ### Prefill: the copy queue starved the compute graph (2026-10-15): 159 -> 177 tok/s, now the default
 
-Host tracing (`MOESTREAM_SCHED_TRACE2`) showed the unsplit prefill blocked 3.6 s of 5.05 s issuing weight copies (one link at
+Host tracing (`ZEROMOE_SCHED_TRACE2`) showed the unsplit prefill blocked 3.6 s of 5.05 s issuing weight copies (one link at
 11.8 GB/s), and with the split + pinned pool the wait moved to the miss node's input hop (107 ms per layer) with the same wall
 time. nsys of the prefetch config then showed both links idle 50% of the time: one layer's copies (~72 ms, 1.55 GiB at 21 GB/s
 over two links) are followed by ~65 ms of compute, and the compute only starts when the copies end. Microbenchmark
@@ -278,7 +278,7 @@ another stream while a run of weight copies is in flight is not served until the
 queued at a time**; waiting for each chunk to finish before queueing the next empties the queue at chunk boundaries and the
 small copy then waits 0.1-0.75 ms, with the run's duration unchanged (67.5 ms).
 
-Fix: the prefetch worker waits for each chunk (`MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_DRAIN`, default 1) and queues in chunks of
+Fix: the prefetch worker waits for each chunk (`ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DRAIN`, default 1) and queues in chunks of
 2 experts (`_CHUNK`, default 2), alternating between the two GPUs (`PREFILL_INTERLEAVE`, default 1). The whole DDR pool must be
 pinned (`OFFLOAD_PINNED=1.0`: a pageable source makes the copy synchronous, 4.82 s vs 4.55 s).
 
@@ -301,11 +301,11 @@ the host). That chain, not the links, is what is left.
 
 ### Prefill: expert sum on the expert GPU, early first layer: 178.8 -> 251 tok/s (2026-10-15)
 
-Per-split timing (`MOESTREAM_SCHED_TRACE2` + `MOESTREAM_SCHED_SERIAL`, env-gated instrumentation in the ggml fork) showed the
+Per-split timing (`ZEROMOE_SCHED_TRACE2` + `ZEROMOE_SCHED_SERIAL`, env-gated instrumentation in the ggml fork) showed the
 layer chain was dominated by two cross-GPU hops through the host: the activation to the 5060 Ti (13 MB, 25 ms) and the
 **unreduced** `MUL_MAT_ID` output coming back (`[D, topk, S]` = 105 MB, 56 ms). The weighting by the route weights and the sum over
 the routed experts were placed on the 3090 by the scheduler. Pinning those two nodes to the expert GPU
-(`run_branch(..., pin_be)`, prefill graphs only; `MOESTREAM_GLM5NEXT_PIN_BRANCH_SUM=0` disables) sends the 13 MB sum instead:
+(`run_branch(..., pin_be)`, prefill graphs only; `ZEROMOE_GLM5NEXT_PIN_BRANCH_SUM=0` disables) sends the 13 MB sum instead:
 
 | 805 tokens, dual GPU, tokens identical | prefill |
 |---|---|
@@ -322,7 +322,7 @@ Prompts longer than the graph batch: see the next section.
 
 ### Prefill of long prompts: chunks continue each other through the graph (2026-10-15)
 
-Before, a prompt longer than `MOESTREAM_GLM5NEXT_PREFILL_CHUNK` (1024) ran the first chunk through the graph and the rest as
+Before, a prompt longer than `ZEROMOE_GLM5NEXT_PREFILL_CHUNK` (1024) ran the first chunk through the graph and the rest as
 S=1 steps (1604 tokens: 53.7 s, 30 tok/s; 1998 tokens: 86 s). Now every chunk is a graph (`pos_base > 0`): its KDA state and
 conv history come from the engine buffers the previous chunk exported, the DSA layers get the earlier latent rows as a host input
 (`glm5next_prev_latent_<layer>`, concatenated before the chunk's own), the mask is offset by `pos_base`, and the indexer seeds
@@ -339,7 +339,7 @@ tokens), halves the batch if the graph declines for memory, and falls back to S=
 The default chunk is now 2048 (= the sparse top-k): every chunk streams all cold experts again, so a bigger chunk is faster
 (1998 tokens as 1024 + 974: 11.8 s). Chunks that continue beyond top_k would need the indexer's per-query selection; the dense
 attention used by the prefill graph is the model's attention only while the context fits top_k, so that is opt-in
-(`MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1`, not the model's exact semantics).
+(`ZEROMOE_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1`, not the model's exact semantics).
 
 Correctness: the hidden state of a graph prefill differs from another batch shape by relL2 ~0.1 even inside the first chunk
 (rows 100..500 of 512+293 vs 805: 0.08-0.19), so tokens of a chunked prompt can legitimately differ from the single-graph
@@ -350,7 +350,7 @@ A chunk whose pooled indexer keys or seeds do not line up (pos_base not a multip
 ### Prefill batch size, memory pre-checks, Qwen chunked prefill (2026-10-16)
 
 **Config.** `prefill_batch_tokens` (toml, 0 = family default) is the prefill graph batch (llama.cpp's n_ubatch);
-`MOESTREAM_GLM5NEXT_PREFILL_CHUNK` / `MOESTREAM_QWEN4EXP_PREFILL_CHUNK` override. GLM defaults to 2048 (512 prefills a
+`ZEROMOE_GLM5NEXT_PREFILL_CHUNK` / `ZEROMOE_QWEN4EXP_PREFILL_CHUNK` override. GLM defaults to 2048 (512 prefills a
 1065-token prompt at 90 tok/s against ~250: every batch restreams all cold experts), Qwen to the whole prompt.
 
 **Memory pre-check.** A batch the device cannot hold is refused before any allocation, with the size that fits, and the

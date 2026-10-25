@@ -54,13 +54,13 @@ __global__ void qwen_stage_delay_kernel(unsigned int microseconds) {
 
 } // namespace
 
-extern "C" cudaError_t moestream_qwen_stage_begin(
+extern "C" cudaError_t zeromoe_qwen_stage_begin(
     unsigned long long *epoch, cudaStream_t stream) {
     qwen_stage_begin_kernel<<<1, 1, 0, stream>>>(epoch);
     return cudaPeekAtLastError();
 }
 
-extern "C" cudaError_t moestream_qwen_stage_publish(int *slot_ids,
+extern "C" cudaError_t zeromoe_qwen_stage_publish(int *slot_ids,
     unsigned long long *slot_epochs, int slot, int expert,
     unsigned long long epoch, cudaStream_t stream) {
     qwen_stage_publish_kernel<<<1, 1, 0, stream>>>(slot_ids, slot_epochs,
@@ -68,7 +68,7 @@ extern "C" cudaError_t moestream_qwen_stage_publish(int *slot_ids,
     return cudaPeekAtLastError();
 }
 
-extern "C" cudaError_t moestream_qwen_stage_map(const int *actual_ids,
+extern "C" cudaError_t zeromoe_qwen_stage_map(const int *actual_ids,
     const unsigned long long *epoch, const int *slot_ids,
     unsigned long long *slot_epochs, int *dispatch_ids, int *stage_slots,
     float *stage_mask,
@@ -78,7 +78,7 @@ extern "C" cudaError_t moestream_qwen_stage_map(const int *actual_ids,
     return cudaPeekAtLastError();
 }
 
-extern "C" cudaError_t moestream_qwen_stage_delay(unsigned int microseconds,
+extern "C" cudaError_t zeromoe_qwen_stage_delay(unsigned int microseconds,
                                                 cudaStream_t stream) {
     qwen_stage_delay_kernel<<<1, 1, 0, stream>>>(microseconds);
     return cudaPeekAtLastError();

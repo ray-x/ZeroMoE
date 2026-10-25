@@ -31,7 +31,7 @@
 // over with no shuffle, and ggml_rms_norm's own "normalise over ne0" is the
 // per-(stream, token) norm the CPU code writes by hand.
 //
-// Always compilable: without MOESTREAM_USE_GGML_CUDA every entry point returns
+// Always compilable: without ZEROMOE_USE_GGML_CUDA every entry point returns
 // false and the caller runs the existing CPU path unchanged.
 // ---------------------------------------------------------------------------
 
@@ -240,7 +240,7 @@ class GgmlHcRunner {
     void *ctx = nullptr;    // ggml_context*
     void *graph = nullptr;  // ggml_cgraph*
     // Opt-in numerical audit handles for the pre-mix graph's internal F32
-    // intermediates. Read only when MOESTREAM_GGML_HC_INTERNAL_DUMP is set.
+    // intermediates. Read only when ZEROMOE_GGML_HC_INTERNAL_DUMP is set.
     void *diag_normed = nullptr;
     void *diag_lowrank_silu = nullptr;
     void *diag_gate = nullptr;

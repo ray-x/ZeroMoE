@@ -44,7 +44,7 @@ namespace {
 // isolates the HC pre-mix device output from the post-combine graph.
 static bool force_hc_gdn_pre_host() {
     static const bool enabled = [] {
-        const char *v = std::getenv("MOESTREAM_GGML_FORCE_HC_GDN_PRE_HOST");
+        const char *v = std::getenv("ZEROMOE_GGML_FORCE_HC_GDN_PRE_HOST");
         return v && v[0] == '1';
     }();
     return enabled;
@@ -52,7 +52,7 @@ static bool force_hc_gdn_pre_host() {
 
 static bool dual_hc_gdn_pre_output() {
     static const bool enabled = [] {
-        const char *v = std::getenv("MOESTREAM_GGML_HC_DUAL_GDN_PRE_OUTPUT");
+        const char *v = std::getenv("ZEROMOE_GGML_HC_DUAL_GDN_PRE_OUTPUT");
         return v && v[0] == '1';
     }();
     return enabled;
@@ -463,7 +463,7 @@ void qwen4exp_hc_mix_impl(StreamingEngine &engine,
   // env var is unset.
   const bool sub0 = norm_name.find("hc_attn_") != std::string::npos;
   const bool sub1 = norm_name.find("hc_ffn_") != std::string::npos;
-  const char *internal_dump_base = std::getenv("MOESTREAM_GGML_HC_INTERNAL_DUMP");
+  const char *internal_dump_base = std::getenv("ZEROMOE_GGML_HC_INTERNAL_DUMP");
   const bool dump_this_call = internal_dump_base && S == 1 && trace_layer >= 0 &&
                               trace_layer < 2 && (sub0 || sub1);
   const int dump_sub = sub0 ? 0 : 1;
@@ -770,7 +770,7 @@ void qwen4exp_hc_pre_mix(StreamingEngine &engine, int layer_idx,
 
   engine.qwen4exp_hc_inject.resize((size_t)S * HC);
   static const bool compare_decode_hc = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_HC_COMPARE");
+    const char *e = std::getenv("ZEROMOE_GGML_HC_COMPARE");
     return e && e[0] == '1';
   }();
   const bool compare_this_call =
@@ -993,7 +993,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
                                       int sub_block, int S, int D,
                                       const void *device_sub_block_out,
                                       const void *producer_event) {
-  if (std::getenv("MOESTREAM_HC_PATH_TRACE")) {
+  if (std::getenv("ZEROMOE_HC_PATH_TRACE")) {
     LOG_ERROR("[HC-PATH-TRACE] entry layer=%d sub=%d S=%d g_hc_ggml_live=%d "
               "device_out=%p producer_event=%p\n",
               layer_idx, sub_block, S, g_hc_ggml_live ? 1 : 0,
@@ -1008,7 +1008,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
   // stream mul/add/copy chain. The producer_event is intentionally required;
   // without it, stream 0 could race the shared GGML backend stream.
   static const bool disable_fused_post = [] {
-    const char *v = std::getenv("MOESTREAM_QWEN_HC_DISABLE_FUSED_POST");
+    const char *v = std::getenv("ZEROMOE_QWEN_HC_DISABLE_FUSED_POST");
     return v && v[0] == '1';
   }();
   {
@@ -1019,7 +1019,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
                          layer_idx, /*runner_sub_block=*/0, S,
                          device_sub_block_out, producer_event);
     if (layer_idx == 11 && sub_block == 1 &&
-        std::getenv("MOESTREAM_HC_PATH_TRACE")) {
+        std::getenv("ZEROMOE_HC_PATH_TRACE")) {
       LOG_ERROR("[HC-PATH-TRACE] layer=%d sub=%d S=%d try_fused=%d "
                 "fused_ok=%d\n",
                 layer_idx, sub_block, S, try_fused ? 1 : 0, fused_ok ? 1 : 0);
@@ -1042,7 +1042,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
   // layers; it deliberately pays the D2H synchronizations only in that
   // diagnostic run, never in the production path.
   static const bool compare_post = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_HC_COMPARE");
+    const char *e = std::getenv("ZEROMOE_GGML_HC_COMPARE");
     return e && e[0] == '1';
   }();
   const bool compare_this_call = compare_post && S == 1 && layer_idx == 0;
@@ -1087,7 +1087,7 @@ bool qwen4exp_hc_post_combine_device(StreamingEngine &engine, int layer_idx,
       before_streams.clear();
       inject.clear();
       sub_out.clear();
-    } else if (const char *dump_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP")) {
+    } else if (const char *dump_base = std::getenv("ZEROMOE_GGML_HC_COMPARE_DUMP")) {
       dump_hc_compare_vector(dump_base, "before_streams", layer_idx,
                              sub_block, compare_call, before_streams);
       dump_hc_compare_vector(dump_base, "inject", layer_idx, sub_block,

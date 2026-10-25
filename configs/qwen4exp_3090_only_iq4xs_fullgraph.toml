@@ -13,14 +13,14 @@
 #   2. VRAM budget re-sized for IQ4_XS: this quant's routed-expert bytes are
 #      ~2x IQ1_M's (3.48 MB/expert max slab vs 1.77 MB, confirmed via
 #      gguf_tool plan), so far fewer layers can be fully GPU-resident under
-#      MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS. llama.cpp's own --fit-target
+#      ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS. llama.cpp's own --fit-target
 #      independently found ~10-11 layers fit in ~22GB total (dense+kv+
 #      resident layers) on this exact card/quant -- start there.
 #
 # Launch with:
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=10 \
-#   ./build/moestream --config configs/qwen4exp_3090_only_iq4xs_fullgraph.toml
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=10 \
+#   ./build/zeromoe --config configs/qwen4exp_3090_only_iq4xs_fullgraph.toml
 
 model_path = "/data/models/qwen3.8-flash-next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
 
@@ -46,8 +46,8 @@ expert_fetch_threads = 0
 omp_max_threads = 12
 prefetch_worker_threads = 0
 
-pin_file           = ".moestream_usage_qwen4exp_4prompts40"
-prefill_pin_file   = ".moestream_usage_qwen4exp_prefill_4prompts40"
+pin_file           = ".zeromoe_usage_qwen4exp_4prompts40"
+prefill_pin_file   = ".zeromoe_usage_qwen4exp_prefill_4prompts40"
 freeze_usage_stats = true
 
 # Enable the master full-graph decode path (no Option-B split -- deferred).

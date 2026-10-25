@@ -10,11 +10,13 @@
 #include <thread>
 #include <map>
 #include "ggml_glm5next_graph_impl.hpp"
+#include "graph_health.hpp"
+#include "graph_settings_global.hpp"
 #include "offload_expert_provider.hpp"
 
 #include <filesystem>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -38,37 +40,36 @@ OffloadState *get_offload(const StreamingEngine &engine,
   // The family only translates its environment into a plain profile; geometry,
   // shard discovery, pool sizing and the store configuration come from the
   // shared provider.
-  moestream::graph::OffloadProfile profile;
+  zeromoe::graph::OffloadProfile profile;
   profile.first_layer = o->first;
   profile.log_tag = "[GGML-GLM5NEXT-OFFLOAD]";
-  profile.huge_pages = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_THP", "0") == "1";
-  profile.mirror_dir = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MIRROR");
-  profile.split_reads = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_SPLIT", "0") == "1";
-  profile.store_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_STORE");
-  profile.model_path = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_MODEL");
+  // Every tunable below comes from the settings resolver (graph_settings.hpp); the env names are its aliases.
+  const auto &st = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).tun;
+  profile.huge_pages = st.offload_thp.value == 1;
+  profile.mirror_dir = st.offload_mirror.value;
+  profile.split_reads = st.offload_split_reads.value == 1;
+  profile.store_path = st.offload_store.value;
+  profile.model_path = st.offload_model.value;
   {
-    // MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=<n> fixes the pool; unset (or "auto") sizes it from the memory this
+    // ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=<n> fixes the pool; unset (or "auto") sizes it from the memory this
     // process may actually use: available RAM (or the cgroup limit if lower) minus 36 GiB for the rest of the
     // engine and the OS, at least 16 GiB (60 GiB before the Q2_K/Q3_K GSQ-RCO file, whose ~74 GiB cold set needs more than 58). The store caps it at the total expert bytes. Measured on a 125 GB
     // box: decode 5.3 / 7.3 / 8.2 tok/s at 32 / 48 / 58 GiB, flat beyond (everything resident).
-    const std::string v = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB", "auto");
-    if (v == "auto" || v.empty()) {
-      profile.ddr_gib = moestream::graph::auto_ddr_gib();
+    if (st.offload_ddr_gib.src == zeromoe::graphsettings::Source::Default || st.offload_ddr_gib.value < 0) {
+      profile.ddr_gib = zeromoe::graph::auto_ddr_gib();
       LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] auto DDR pool %.1f GiB\n", profile.ddr_gib);
     } else {
-      profile.ddr_gib = std::atof(v.c_str());
+      profile.ddr_gib = st.offload_ddr_gib.value;
     }
   }
-  profile.lru_segmented = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_POLICY", "lru") == "seg";
-  profile.pinned_fraction =
-      std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PINNED", "0.5").c_str());
-  profile.probation_fraction =
-      std::atof(offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION", "0.25").c_str());
-  profile.byte_capacity = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP", "0") == "1";
+  profile.lru_segmented = st.offload_policy.value == "seg";
+  profile.pinned_fraction = st.offload_pinned_fraction.value;
+  profile.probation_fraction = st.offload_probation_fraction.value;
+  profile.byte_capacity = st.offload_byte_cap.value == 1;
   profile.async_loads = offload_async();
   // Page-lock the arena slots (DMA straight from DDR) for staging and for the lane's GPU assist.
-  if ((pilot_stage_k() > 0 || gpu_assist_slots() > 0) &&
-      offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_PIN", gpu_assist_slots() > 0 ? "1" : "0") == "1") {
+  const bool pin_dma = st.offload_pin_dma.value < 0 ? gpu_assist_slots() > 0 : st.offload_pin_dma.value == 1;
+  if ((pilot_stage_k() > 0 || gpu_assist_slots() > 0) && pin_dma) {
     profile.pin_for_dma = true;
     profile.pin_fn = [](void *ptr, size_t bytes) {
       if (cudaHostRegister(ptr, bytes, cudaHostRegisterPortable) == cudaSuccess)
@@ -78,15 +79,15 @@ OffloadState *get_offload(const StreamingEngine &engine,
     };
     profile.unpin_fn = [](void *ptr) { cudaHostUnregister(ptr); };
   }
-  moestream::offload::ExpertStoreConfig sc;
+  zeromoe::offload::ExpertStoreConfig sc;
   std::string cfg_err;
-  if (!moestream::graph::make_store_config(engine, profile, &sc, &cfg_err)) {
+  if (!zeromoe::graph::make_store_config(engine, profile, &sc, &cfg_err)) {
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s\n", cfg_err.c_str());
     return nullptr;
   }
 
   std::string err;
-  o->store = moestream::offload::ExpertStore::create(sc, &err);
+  o->store = zeromoe::offload::ExpertStore::create(sc, &err);
   if (!o->store) {
     LOG_ERROR("[GGML-GLM5NEXT-OFFLOAD] %s\n", err.c_str());
     return nullptr;
@@ -95,17 +96,16 @@ OffloadState *get_offload(const StreamingEngine &engine,
   o->arena = &o->store->arena();
   o->residency = &o->store->residency();
 
-  const std::string usage = offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
+  const std::string usage = st.offload_usage_file.value;
   if (!usage.empty()) {
-    moestream::graph::SeedExclusions excl;
-    const moestream::graph::SeedExclusions *excl_ptr = nullptr;
+    zeromoe::graph::SeedExclusions excl;
+    const zeromoe::graph::SeedExclusions *excl_ptr = nullptr;
     if (partial) {
       // Experts that live in VRAM are served by the GPU branch; do not spend DDR on them.
       // GPU1-hot experts are served by the GPU1 branch in decode, but a batched prefill graph has no such
       // branch and runs them as cold experts. Seed them last so they only take DDR that the rest leave free
       // (otherwise prefill reads them from the SSD, ~0.7 s inline plus ~6 s of background reads at 805 tokens).
-      const bool seed_hot1 = offload_env("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD", "0") == "1" &&
-                             offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_SEED_GPU1_HOT", "1") == "1";
+      const bool seed_hot1 = st.prefill_op_offload.value == 1 && st.offload_seed_gpu1_hot.value == 1;
       excl.resident.resize((size_t)c.n_layers);
       excl.deferred.resize((size_t)c.n_layers);
       for (size_t l = 0; l < partial->size() && l < excl.resident.size(); ++l) {
@@ -124,7 +124,7 @@ OffloadState *get_offload(const StreamingEngine &engine,
       }
       excl_ptr = &excl;
     }
-    moestream::graph::seed_store(*o->store, usage, o->first, o->n_layers,
+    zeromoe::graph::seed_store(*o->store, usage, o->first, o->n_layers,
                                  o->n_experts, excl_ptr, "[GGML-GLM5NEXT-OFFLOAD]");
   }
   LOG_INFO("[GGML-GLM5NEXT-OFFLOAD] layers %d..%d, capacity %zu experts "
@@ -132,11 +132,26 @@ OffloadState *get_offload(const StreamingEngine &engine,
            o->first, c.n_layers - 1, o->store->capacity(), sc.ddr_gib,
            sc.pinned_fraction,
            sc.store_path.empty() ? "<none>" : sc.store_path.c_str());
+  {
+    const auto coverage = zeromoe::graph::measure_expert_coverage(o->first, o->n_layers, o->n_experts,
+        [&](int l, int e) {
+          if (!partial || size_t(l) >= partial->size()) return false;
+          const auto &p = (*partial)[size_t(l)];
+          return std::find(p.hot.begin(), p.hot.end(), e) != p.hot.end() ||
+                 std::find(p.hot1.begin(), p.hot1.end(), e) != p.hot1.end();
+        },
+        [&](int l, int e) { return o->store->residency().ready({l, e}); });
+    LOG_INFO("[MOE-COVERAGE] glm-graph %s; DDR capacity=%zu\n",
+             zeromoe::graph::coverage_summary(coverage).c_str(), o->store->capacity());
+    zeromoe::graphsettings::report_preflight(
+        "glm-graph", zeromoe::graphsettings::Family::GlmGraph,
+        zeromoe::graph::coverage_finding(coverage));
+  }
   g_offload = std::move(o);
   return g_offload.get();
 }
 
-extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(ggml_backend_t backend);
+extern "C" cudaStream_t zeromoe_ggml_backend_cuda_get_stream(ggml_backend_t backend);
 
 namespace {
 bool g_prefetch_built = false, g_prefetch_suppress = false;
@@ -205,14 +220,14 @@ void prefetch_record(PrefetchRing &ring, const PrefetchLayer &lp) {
 // engine, and the activations that cross between the two GPUs are staged through the host, so they wait behind everything
 // already queued there. Queueing a layer's whole cold set at once delayed them by the full copy time.
 void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
-  static const int chunk = std::max(1, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_CHUNK", 2));
+  static const int chunk = std::max(1, zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_CHUNK", 2));
   // A copy another stream submits while a long run of weight copies is in flight is not served until the run ends (the copy
   // engine does not interleave streams), so the small inputs of the layer that the miss node has just released (the
   // rewritten ids, ...) would wait for the whole run. The run therefore starts after those uploads have been issued.
-  static const int delay_us = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_DELAY_US", 0);
+  static const int delay_us = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DELAY_US", 0);
   if (delay_us > 0)
     std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
-  static const bool drain = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_DRAIN", 1) != 0;
+  static const bool drain = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_DRAIN", 1) != 0;
   const auto issue_t0 = std::chrono::steady_clock::now();
   struct Chunker {
     cudaEvent_t ev[2] = {nullptr, nullptr};
@@ -255,7 +270,7 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
   if (second.joinable())
     second.join();
   prefetch_record(*ring, *lp);
-  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG"))
+  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG"))
     LOG_INFO("[GGML-GLM5NEXT-PREFETCH] issue layer %d chunk=%d chunks=%d/%d issued in %.1f ms\n", lp->layer, chunk, ch[0].n,
              ch[1].n, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - issue_t0).count());
   for (int part = 0; part < ring->n_parts; ++part) {
@@ -271,7 +286,7 @@ void prefetch_issue(PrefetchRing *ring, PrefetchLayer *lp, OffloadState *o) {
 void prefetch_service(OffloadState &o, int layer, std::vector<int32_t> &ids) {
   PrefetchRing &ring = *g_ring;
   PrefetchLayer &lp = ring.layers.at(layer);
-  static const bool dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
+  static const bool dbg = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
   const auto t0 = std::chrono::steady_clock::now();
   if (lp.worker.valid())
     lp.worker.get();
@@ -332,18 +347,18 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     return false;
   // On by default when the second GPU takes part (the ring is split between the two links); off for a single GPU, where the
   // ring would not fit next to the 3090's expert pool.
-  const char *want = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH");
+  const char *want = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH");
   if (!(want ? std::atoi(want) != 0 : g.gpu1 != nullptr) || g.decode_mode || g.S < 64 || !g.cuda)
     return false;
   const auto &c = g.engine->model_file.architecture_config;
   auto ring = std::make_unique<PrefetchRing>();
-  ring->sets = std::max(2, std::min(4, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_SETS", 2)));
+  ring->sets = std::max(2, std::min(4, zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_SETS", 2)));
   // The cold experts of a layer are split between the two GPUs in the ratio of their PCIe links (the main GPU's share is
-  // MOESTREAM_GLM5NEXT_PREFILL_SPLIT, default 0.63), so both links copy at once and each GPU needs less buffer.
+  // ZEROMOE_GLM5NEXT_PREFILL_SPLIT, default 0.63), so both links copy at once and each GPU needs less buffer.
   const bool two = g.gpu1 != nullptr;
   ring->n_parts = two ? 2 : 1;
   double ratio = 0.63;
-  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_SPLIT"))
+  if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_SPLIT"))
     ratio = std::atof(e);
   if (ratio <= 0.0 || ratio >= 1.0)
     ratio = 1.0;
@@ -415,7 +430,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
       // GPU as well as the ring and its workspace; otherwise a ring can be
       // built only to have the graph declined, forcing the retry path.
       size_t floor_bytes = 2ull * 1024ull * 1024ull * 1024ull;
-      if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
+      if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB"))
         floor_bytes = (size_t)std::max(0, std::atoi(e)) << 20;
       const double need = (double)want[part] + 0.85 * 1024.0 * 1024.0 * g.S +
                           0.15 * 1024.0 * 1024.0 * 1024.0 +
@@ -471,14 +486,14 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
     ring->parts[part].events = events[part];
   }
   cudaSetDevice(ring->parts[0].device);
-  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG")) {
+  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG")) {
     unsigned long long id[4] = {0, 0, 0, 0};
     cudaStreamGetId(ring->parts[0].stream, &id[0]);
     if (ring->n_parts > 1)
       cudaStreamGetId(ring->parts[1].stream, &id[1]);
-    cudaStreamGetId(moestream_ggml_backend_cuda_get_stream(g.cuda), &id[2]);
+    cudaStreamGetId(zeromoe_ggml_backend_cuda_get_stream(g.cuda), &id[2]);
     if (g.gpu1)
-      cudaStreamGetId(moestream_ggml_backend_cuda_get_stream(g.gpu1), &id[3]);
+      cudaStreamGetId(zeromoe_ggml_backend_cuda_get_stream(g.gpu1), &id[3]);
     LOG_INFO("[GGML-GLM5NEXT-PREFETCH] stream ids: copy %llu/%llu backend %llu/%llu\n", id[0], id[1], id[2], id[3]);
   }
   LOG_INFO("[GGML-GLM5NEXT-PREFETCH] %zu layers, %d sets, buffers %.2f GiB on the main GPU + %.2f GiB on the second\n",
@@ -489,7 +504,7 @@ bool prefetch_prepare(FullGraph &g, OffloadState &o) {
   g_ring = std::move(ring);
   // The first layers' copies start now, while the dense layers in front of them compute (otherwise the first offload layer
   // has nothing prefetched and the miss node copies its whole cold set itself).
-  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH_EARLY", 1) != 0 && !g_ring->layers.empty()) {
+  if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH_EARLY", 1) != 0 && !g_ring->layers.empty()) {
     PrefetchLayer &first = g_ring->layers.begin()->second;
     first.issued = true;
     first.worker = std::async(std::launch::async, prefetch_issue, g_ring.get(), &first, &o);
@@ -508,7 +523,7 @@ bool prefetch_ring_was_built() {
 bool prefetch_ring_candidate(int S, bool decode_mode, int device) {
   if (decode_mode || S < 64 || g_prefetch_suppress || S >= g_ring_fail_s)
     return false;
-  const char *want = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_PREFETCH");
+  const char *want = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_PREFETCH");
   if (want)
     return std::atoi(want) != 0;
   return second_gpu_device(device) >= 0;
@@ -596,19 +611,19 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     for (int64_t i0 = 0; i0 < a->ne[0]; ++i0)
       ids.push_back(*(const int32_t *)((const char *)a->data + i1 * a->nb[1] +
                                        i0 * a->nb[0]));
-  static const bool dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
+  static const bool dbg = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OFFLOAD_DEBUG") != nullptr;
   static std::atomic<int> dbg_lines{0};
   if (dbg && !site->prefill)
     for (size_t k = 0; k < ids.size(); ++k)
       if (ids[k] >= 0 && !o.cache->resident({site->layer, ids[k]}) && dbg_lines.fetch_add(1) < 40)
         LOG_INFO("[OFFLOAD-DEBUG] miss layer=%d expert=%d S=%lld k=%zu\n", site->layer, ids[k],
                  (long long)a->ne[1], k);
-  moestream::offload::ExpertResidency::Ensure r;
+  zeromoe::offload::ExpertResidency::Ensure r;
   if (site->prefill) {
-    // Experts are read ahead (MOESTREAM_GLM5NEXT_PREFILL_AHEAD layers, default 2) while the GPU computes the layers
-    // before this one; MOESTREAM_GLM5NEXT_PREFILL_AHEAD=0 loads each layer on the miss node, as before.
+    // Experts are read ahead (ZEROMOE_GLM5NEXT_PREFILL_AHEAD layers, default 2) while the GPU computes the layers
+    // before this one; ZEROMOE_GLM5NEXT_PREFILL_AHEAD=0 loads each layer on the miss node, as before.
     static const int ahead = [] {
-      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_AHEAD");
+      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_AHEAD");
       return e ? std::max(0, std::atoi(e)) : 2;
     }();
     static std::map<int, std::future<int>> pending;
@@ -626,20 +641,20 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
     const int last = o.first + o.n_layers - 1;
     // Read ahead only for prompts that touch most experts of a layer anyway (a small prompt would read ~2x what it uses).
     static const int min_tokens = [] {
-      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_AHEAD_MIN_TOKENS");
+      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_AHEAD_MIN_TOKENS");
       return e ? std::atoi(e) : 64;
     }();
     for (int k = 1; k <= ahead && site->n_tokens >= min_tokens; ++k) {
       const int next = site->layer + k;
       if (next > last || pending.count(next)) continue;
-      moestream::offload::ExpertStore *store = o.store.get();
+      zeromoe::offload::ExpertStore *store = o.store.get();
       const OffloadSite *ns = o.site_for_layer(next);
       const std::vector<uint8_t> *skip = ns ? &ns->not_cold : nullptr;
       pending.emplace(next, std::async(std::launch::async, [store, next, skip] { return store->prefetch_transient(next, skip); }));
     }
   } else {
     r = o.store->ensure(site->layer, ids.data(), (int)ids.size(),
-                        moestream::offload::ExpertCache::Kind::Demand);
+                        zeromoe::offload::ExpertCache::Kind::Demand);
   }
   o.store->counters().calls.fetch_add(1, std::memory_order_relaxed);
   o.store->counters().routes.fetch_add(ids.size(), std::memory_order_relaxed);
@@ -663,7 +678,7 @@ void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
   const auto cb_t_ensured = std::chrono::steady_clock::now();
   if (site->prefetch && g_ring)
     prefetch_service(o, site->layer, ids);
-  static const bool cb_dbg = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
+  static const bool cb_dbg = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFETCH_DEBUG") != nullptr;
   if (cb_dbg && site->prefill) {
     static auto last_cb = std::chrono::steady_clock::time_point{};
     const auto now = std::chrono::steady_clock::now();
@@ -689,7 +704,7 @@ ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer,
   OffloadState *o = get_offload(*g.engine);
   if (!o)
     return nullptr;
-  return moestream::graph::make_plane_tensor(
+  return zeromoe::graph::make_plane_tensor(
       *g.engine, *o->arena, o->n_experts, ctx, layer, stem,
       [](GGUFType t) { return type_ok(t); }, &g.host_buffers,
       "[GGML-GLM5NEXT-OFFLOAD]");
@@ -813,7 +828,7 @@ ggml_tensor *expert_gate_up_weight_impl(FullGraph &g, ggml_context *ctx,
   return load_gate_up_weight(g, ctx, layer, on_device);
 }
 
-// Optional second-GPU expert residency (env MOESTREAM_GLM5NEXT_GPU1_LAYERS,
+// Optional second-GPU expert residency (env ZEROMOE_GLM5NEXT_GPU1_LAYERS,
 // "first-last"): decode-graph expert tensors of those layers are copied to a
 // CUDA buffer on device 1 so the scheduler runs their MUL_MAT_ID there.
 bool gpu1_layer(const FullGraph &g, int layer) {
@@ -857,4 +872,4 @@ ggml_tensor *move_expert_to_gpu1(FullGraph &g, ggml_context *ctx, int layer,
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

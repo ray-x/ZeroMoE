@@ -1,8 +1,8 @@
 diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
-index 0138469a9..5fd7876f2 100644
+index e8876a7..46fb238 100644
 --- a/src/ggml-cpu/ggml-cpu.c
 +++ b/src/ggml-cpu/ggml-cpu.c
-@@ -1644,15 +1644,31 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1642,15 +1642,31 @@ static void ggml_compute_forward_mul_mat_id(
              }
          }
  #else
@@ -15,17 +15,17 @@ index 0138469a9..5fd7876f2 100644
 -                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
 -                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
 -                               (ne10_block_end - ne10_block_start) * bs);
-+        // MoEStream: for a small src1 (decode: a handful of rows) quantize it on thread 0 only. Splitting
++        // ZeroMoE: for a small src1 (decode: a handful of rows) quantize it on thread 0 only. Splitting
 +        // ~2.5k floats into per-thread block ranges and having every thread then read the whole buffer costs
 +        // far more than the quantization itself (measured: 12 threads 123-278 us vs 26 us serial for a
 +        // gate-shaped 2-expert MUL_MAT_ID). The barrier after the row grouping below publishes wdata, and
-+        // the bytes are identical (quantization is per block). MOESTREAM_MMID_PARALLEL_QUANT=1 restores the
++        // the bytes are identical (quantization is per block). ZEROMOE_MMID_PARALLEL_QUANT=1 restores the
 +        // per-thread ranges.
-+        static int moestream_mmid_parallel_quant = -1; // lazily read; every thread computes the same value
-+        if (moestream_mmid_parallel_quant < 0) {
-+            moestream_mmid_parallel_quant = getenv("MOESTREAM_MMID_PARALLEL_QUANT") != NULL;
++        static int zeromoe_mmid_parallel_quant = -1; // lazily read; every thread computes the same value
++        if (zeromoe_mmid_parallel_quant < 0) {
++            zeromoe_mmid_parallel_quant = getenv("ZEROMOE_MMID_PARALLEL_QUANT") != NULL;
 +        }
-+        const bool serial_quant = !moestream_mmid_parallel_quant && nth > 1 &&
++        const bool serial_quant = !zeromoe_mmid_parallel_quant && nth > 1 &&
 +                                  ggml_nelements(src1) <= 16384;
 +        const int quant_ith = serial_quant ? 0 : ith;
 +        const int quant_nth = serial_quant ? 1 : nth;
@@ -43,11 +43,11 @@ index 0138469a9..5fd7876f2 100644
                  }
              }
          }
-@@ -1668,6 +1684,12 @@ static void ggml_compute_forward_mul_mat_id(
+@@ -1666,6 +1682,12 @@ static void ggml_compute_forward_mul_mat_id(
              for (int id = 0; id < n_ids; ++id) {
                  const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
  
-+                // moestream_mmid_negative_skip: a negative expert id marks an inactive route slot; emit zeros, no work
++                // zeromoe_mmid_negative_skip: a negative expert id marks an inactive route slot; emit zeros, no work
 +                if (i02 < 0) {
 +                    memset((char *) dst->data + id*nb1 + iid1*nb2, 0, ne0*sizeof(float));
 +                    continue;
@@ -56,12 +56,12 @@ index 0138469a9..5fd7876f2 100644
                  assert(i02 >= 0 && i02 < n_as);
  
                  MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-@@ -3694,6 +3716,15 @@ int ggml_cpu_has_avx512_vbmi(void) {
+@@ -3692,6 +3714,15 @@ int ggml_cpu_has_avx512_vbmi(void) {
  #endif
  }
  
-+// MoEStream: advertises that GGML_OP_MUL_MAT_ID treats a negative expert id as an inactive route
-+// (CPU: zero the output row, read no weights -- see moestream_mmid_negative_skip above; CUDA: the
++// ZeroMoE: advertises that GGML_OP_MUL_MAT_ID treats a negative expert id as an inactive route
++// (CPU: zero the output row, read no weights -- see zeromoe_mmid_negative_skip above; CUDA: the
 +// MMVQ decode kernels do the same). include/mmid_route_skip.hpp weak-links this symbol: when it is
 +// absent the split-layer graph builders fall back to a dummy expert id + mask and every branch
 +// computes all top-k routes.
@@ -73,14 +73,14 @@ index 0138469a9..5fd7876f2 100644
  #if defined(__AVX512VNNI__)
      return 1;
 diff --git a/src/ggml-cuda/mmvq.cu b/src/ggml-cuda/mmvq.cu
-index 6305230b1..0bf1b5093 100644
+index 930f1ad..53ceb31 100644
 --- a/src/ggml-cuda/mmvq.cu
 +++ b/src/ggml-cuda/mmvq.cu
-@@ -620,6 +620,15 @@ static __global__ void mul_mat_vec_q(
+@@ -664,6 +664,15 @@ static __global__ void mul_mat_vec_q(
      channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
      sample_dst = blockIdx.z;
  
-+    // moestream_mmid_negative_skip: a negative expert id marks an inactive route slot; write zeros and do no work
++    // zeromoe_mmid_negative_skip: a negative expert id marks an inactive route slot; write zeros and do no work
 +    if (ncols_dst == 1 && ids && (int32_t) channel_x < 0) {
 +        if (threadIdx.y == 0 && threadIdx.x < rows_per_cuda_block &&
 +            (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
@@ -92,11 +92,11 @@ index 6305230b1..0bf1b5093 100644
      const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
      const uint32_t sample_y    = sample_dst;
  
-@@ -891,6 +900,14 @@ static __global__ void mul_mat_vec_q_moe(
-     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
+@@ -943,6 +952,14 @@ static __global__ void mul_mat_vec_q_moe(
+     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
      const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
  
-+    // moestream_mmid_negative_skip: a negative expert id marks an inactive route slot; write zeros and do no work
++    // zeromoe_mmid_negative_skip: a negative expert id marks an inactive route slot; write zeros and do no work
 +    if ((int32_t) channel_x < 0) {
 +        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
 +            dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;

@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next GSQ-RCO IQ2_XS RCO50 on the RTX 5060 Ti.
 # Run with CUDA_VISIBLE_DEVICES=1 and trailing full-graph placement:
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=27 \
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-#   MOESTREAM_QWEN4EXP_GRAPH_PARALLEL=1 \
-#   CUDA_VISIBLE_DEVICES=1 ./build/moestream --config <this file>
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=27 \
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+#   ZEROMOE_QWEN4EXP_GRAPH_PARALLEL=1 \
+#   CUDA_VISIBLE_DEVICES=1 ./build/zeromoe --config <this file>
 # The trailing 27 MoE layers are placed on GPU; the first 21 use CPU/DDR.
 # Keep event-backed CPU/GPU handoffs enabled; GRAPH_PARALLEL=0 is a blocking-sync
 # diagnostic mode, not the recommended benchmark setting.

@@ -1,4 +1,4 @@
-# MoEStream — GLM-5.2 single-GPU config (RTX 3090 only, dense+moe combined)
+# ZeroMoE — GLM-5.2 single-GPU config (RTX 3090 only, dense+moe combined)
 #
 # For when only one GPU is physically available -- unlike
 # glm52_3090_5060.toml's split (a full separate card dedicated to the
@@ -64,7 +64,7 @@ prefetch_staging_slots = 128
 verbose_moe_log        = false
 promote_hit_threshold  = 2
 
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Sized against the ~400-slot pool this config's moe_cache_gb (6.0 GB /
 # ~14.75 MB per expert slab) is expected to produce -- 3/layer x 75 layers =

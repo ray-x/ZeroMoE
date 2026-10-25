@@ -96,7 +96,7 @@ enum class PilotSource : uint8_t { Other, Depth2, AttnPilot };
 // followed by the same size gap, not genuinely higher SUSTAINED
 // concurrency. This is a different, harder problem than per-submission
 // batch size. Reverted to the original one-hint-at-a-time design below;
-// kept as a marker (see [[moestream-io-pipeline-findings]] memory) so a
+// kept as a marker (see [[zeromoe-io-pipeline-findings]] memory) so a
 // future session doesn't re-propose the identical idea without this
 // evidence. If revisited, the real lever is probably closing the CPU-side
 // gaps between bursts (e.g. a worker claiming/prepping its NEXT hint while

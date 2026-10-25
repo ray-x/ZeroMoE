@@ -9,7 +9,7 @@
 #include "exl3_cpu.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_decode.hpp"
-#if defined(MOESTREAM_EXL3_CUDA)
+#if defined(ZEROMOE_EXL3_CUDA)
 #include "exl3_gpu.hpp"
 #endif
 #include "exllamav3_backend.hpp"
@@ -32,7 +32,7 @@
 #include "startup_preflight.hpp"
 #include "tensor_trace.hpp"
 
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
 #include "ggml.h"
 #endif
 
@@ -173,16 +173,16 @@ load_exl3_model_only(const std::string &path) {
   return {};
 }
 
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
 // The ggml tree used by the CUDA build is also shared with llama.cpp and emits
-// CUDA-graph reuse diagnostics through GGML_LOG_DEBUG.  At MoEStream's
+// CUDA-graph reuse diagnostics through GGML_LOG_DEBUG.  At ZeroMoE's
 // normal INFO/WARN/ERROR levels those messages are not useful, but a full
 // Qwen decode graph can hit the call site hundreds of times per token.  The
 // default ggml callback ignores severity and prints them anyway, turning a
 // diagnostic into a measurable serialization/stdio bottleneck.  Preserve
 // all non-debug ggml messages and retain debug output when the user explicitly
 // asks for DEBUG or VERBOSE logging.
-static void moestream_ggml_log_callback(enum ggml_log_level level,
+static void zeromoe_ggml_log_callback(enum ggml_log_level level,
                                         const char *text, void *user_data) {
   const bool allow_debug =
       user_data && *static_cast<const bool *>(user_data);
@@ -195,9 +195,9 @@ static void moestream_ggml_log_callback(enum ggml_log_level level,
 
 void print_usage() {
   std::cout
-      << "Usage: ./moestream --config <config.toml>\n"
-      << "       ./moestream --model <path_to_gguf> [options]\n"
-      << "       ./moestream --gen-config [output.toml]\n\n"
+      << "Usage: ./zeromoe --config <config.toml>\n"
+      << "       ./zeromoe --model <path_to_gguf> [options]\n"
+      << "       ./zeromoe --gen-config [output.toml]\n\n"
       << "Options:\n"
       << "  --config <file>  Load engine config from TOML file\n"
       << "  --gen-config     Generate a sample config file and exit\n"
@@ -236,7 +236,7 @@ void print_usage() {
       << "  --pin-threshold <N>  VRAM-resident hit_count before pinning (never "
          "evicted; default: 8, 0=off)\n"
       << "  --pin-file <file>  Usage-frequency file for VRAM hot-set preload "
-         "(default: .moestream_usage)\n"
+         "(default: .zeromoe_usage)\n"
       << "  --expert-fetch-threads <N>  OMP threads for parallel disk reads of "
          "a layer's topk cache misses (default: 4)\n"
       << "  --raw-prompt     Skip the chat-template wrap; tokenize stdin "
@@ -249,7 +249,7 @@ void print_usage() {
          "user turn\n"
       << "                   (chat-template modes only; ignored with "
          "--raw-prompt). Empty by\n"
-      << "                   default -- MoEStream never invents one on its "
+      << "                   default -- ZeroMoE never invents one on its "
          "own; e.g. use this\n"
       << "                   to steer response language: --system-prompt "
          "\"Respond in English.\"\n"
@@ -274,7 +274,7 @@ void print_usage() {
       << "  --collect-usage-stats  Override freeze_usage_stats and write the "
          "usage files at shutdown\n"
       << "  --force-start    Bypass the startup safety checks (concurrent "
-         "moestream\n"
+         "zeromoe\n"
       << "                   instance, real RAM headroom, free VRAM) -- only "
          "use when\n"
       << "                   certain it's safe; see startup_preflight.hpp\n"
@@ -434,9 +434,9 @@ int main(int argc, char *argv[]) {
   bool collect_usage_stats_cli = false;
   float temp_cli = -1.0f, top_p_cli = -1.0f; // -1 sentinel = "not given" (0.0
                                              // is a valid greedy-decode value)
-  // 2026-09: real incident -- a second moestream instance (a separate
+  // 2026-09: real incident -- a second zeromoe instance (a separate
   // one-off smoke test) was started while this box already had another
-  // moestream benchmark running; the two together drove the box into
+  // zeromoe benchmark running; the two together drove the box into
   // swap thrashing hard enough to force a reboot. See
   // startup_preflight.hpp's own header comment. --force-start bypasses
   // the resulting startup checks for a deliberate, known-safe case
@@ -452,7 +452,7 @@ int main(int argc, char *argv[]) {
     else if (arg == "--gen-config") {
       gen_config_path = (i + 1 < argc && argv[i + 1][0] != '-')
                             ? argv[++i]
-                            : "moestream_config.toml";
+                            : "zeromoe_config.toml";
     } else if (arg == "--model" && i + 1 < argc)
       model_path = argv[++i];
     else if (arg == "--ram" && i + 1 < argc)
@@ -606,22 +606,22 @@ int main(int argc, char *argv[]) {
   // Initialize the logger before anything else logs — empty log_path keeps
   // everything on stderr exactly as before.
   Logger::instance().init(config.log_path, config.log_level);
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
   bool allow_ggml_debug = config.log_level == "DEBUG" ||
                           config.log_level == "VERBOSE";
-  ggml_log_set(moestream_ggml_log_callback, &allow_ggml_debug);
+  ggml_log_set(zeromoe_ggml_log_callback, &allow_ggml_debug);
 #endif
   TraceFilter::instance().configure(config.trace_filter,
                                     config.trace_abort_on_nan);
 
-  std::cout << "  MoEStream Engine initializing (C++23 mode)...\n";
+  std::cout << "  ZeroMoE Engine initializing (C++23 mode)...\n";
   std::cout << "----------------------------------------\n";
   config.print();
 
   // Real, cheap startup safety checks -- BEFORE any RAM-tier allocation,
   // [PIN] preload, or GPU VRAM pool allocation begins. See
   // startup_preflight.hpp's own header comment for the real incident
-  // this exists to prevent (two moestream instances driving this box
+  // this exists to prevent (two zeromoe instances driving this box
   // into swap thrashing / a hard crash). Fail-closed: refuses to start
   // rather than silently proceeding into a repeat of that incident.
   {
@@ -637,7 +637,7 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // cpu_only (TOML `cpu_only = true` or MOESTREAM_CPU_ONLY env var) forces all
+  // cpu_only (TOML `cpu_only = true` or ZEROMOE_CPU_ONLY env var) forces all
   // compute onto the CPU reference path. Enable it BEFORE run_engine so every
   // dense_proj / rmsnorm_proj / expert_ffn dispatch sees the flag.
   if (config.exl3_backend == "exllamav3") {

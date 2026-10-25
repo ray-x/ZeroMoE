@@ -1,4 +1,4 @@
-# MoEStream — Single GPU Configuration (Profile A)
+# ZeroMoE — Single GPU Configuration (Profile A)
 # Everything on one RTX 3090: dense + KV + expert cache
 # Context reduced to 64k to fit in 24 GB
 
@@ -11,7 +11,7 @@ top_p          = 0.95
 drop_pages     = false
 
 promote_hit_threshold = 2
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Capped (was 0/auto-fill-available-capacity) -- see glm52_3090_5060.toml's
 # comment / CLAUDE.md for the real-run regression this fixes.

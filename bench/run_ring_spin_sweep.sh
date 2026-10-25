@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Sweeps MOESTREAM_QWEN4EXP_RING_SPIN_US against
+# Sweeps ZEROMOE_QWEN4EXP_RING_SPIN_US against
 # qwen_cpu_offload_ring_spin_bench to measure its effect on
 # QwenCpuOffloadRing's wait-detection latency in isolation, with no model
 # load and no decode-loop noise. The env var is cached on first read inside
@@ -29,7 +29,7 @@ printf "%-10s %-8s %-10s %-10s %-10s %-10s\n" \
     "spin_us" "n" "mean_us" "p50_us" "p90_us" "max_us"
 
 for spin in "${spin_values[@]}"; do
-    out="$(MOESTREAM_QWEN4EXP_RING_SPIN_US="${spin}" "${bin}" \
+    out="$(ZEROMOE_QWEN4EXP_RING_SPIN_US="${spin}" "${bin}" \
         "${iterations}" "${d_model}" "${slots}" "${cpu_compute_us}" \
         2>/dev/null)"
     line="$(printf '%s\n' "${out}" | grep 'detect_latency')"

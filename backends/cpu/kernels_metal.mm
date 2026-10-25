@@ -1,6 +1,6 @@
 // src/kernels_metal.mm — Apple Metal Performance Shaders dispatch.
 //
-// Compiled as Objective-C++ only when MOESTREAM_METAL=ON on Apple Silicon.
+// Compiled as Objective-C++ only when ZEROMOE_METAL=ON on Apple Silicon.
 // Uses ARC (-fobjc-arc).  All entry points are synchronous and return false
 // on failure so the caller can fall back to NEON.
 
@@ -17,7 +17,7 @@
 #include <cstring>
 #include <mutex>
 
-namespace moestream_metal {
+namespace zeromoe_metal {
 
 static id<MTLDevice> g_device = nil;
 static id<MTLCommandQueue> g_queue = nil;
@@ -144,6 +144,6 @@ bool matmul_f32(float *y, const float *x, const float *W, int S, int I, int O) {
   }
 }
 
-} // namespace moestream_metal
+} // namespace zeromoe_metal
 
 #endif // __APPLE__

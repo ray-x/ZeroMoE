@@ -1,4 +1,4 @@
-# MoEStream — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
+# ZeroMoE — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
 #
 # NOTE: UD-IQ2_M is a COMPLETE GLM-5.2 model (dense at Q5_K/Q6_K/Q8_0, routed
 # experts at gate=up=IQ2_XXS / down=IQ3_XXS for 71/76 MoE layers, packed as
@@ -48,7 +48,7 @@ promote_hit_threshold = 2
 # Fixed by explicitly capping pin_topk_per_layer instead of leaving it at
 # 0/auto -- 8/layer bounds the worst-case startup preload to ~608 slots
 # (76 layers x 8) instead of nearly the whole 1642-slot cache.
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 pin_topk_per_layer = 8
 

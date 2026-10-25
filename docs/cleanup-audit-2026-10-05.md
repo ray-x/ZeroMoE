@@ -56,7 +56,7 @@ Verification (build_ggmlcuda, `configs/qwen4exp_tg400_iq1m_22_26.toml`,
 - decode-wall: before 23.20 (cold, first run) / 25.13 (warm rerun); after 25.63 tok/s
   => no regression; the 23.2 was run-order warm-up, not a difference
 - `attn=0.00s` in the baseline: this config never entered the removed paths
-- `moestream_tests`: exit 0, 0 failures
+- `zeromoe_tests`: exit 0, 0 failures
 - NOT covered: layered (non-graph) Qwen decode no longer has a GPU attention
   path; policy says graph failure aborts the request, so that is intended.
 Logs: `logs/qwen_flash_decode_{baseline,after}_*_2026-10-05.log`,

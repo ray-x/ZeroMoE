@@ -1,4 +1,4 @@
-// cpu_config.hpp — Minimal runtime configuration for moestream_cpu.
+// cpu_config.hpp — Minimal runtime configuration for zeromoe_cpu.
 //
 // This is a deliberately stripped-down, CUDA-free config loader for the
 // CPU-only inference binary.  It reuses the same TOML syntax as the full
@@ -200,7 +200,7 @@ struct CPUConfig {
   // Host-side expert cache (the pin + LRU working set).
   double host_ram_gb = 4.0;
   int promote_hit_threshold = 2;
-  std::string pin_file = ".moestream_usage";
+  std::string pin_file = ".zeromoe_usage";
   int pin_threshold = 4;
   int pin_topk_per_layer = 2;
   int expert_fetch_threads = 4;
@@ -210,7 +210,7 @@ struct CPUConfig {
   bool raw_prompt = false;
   // Optional system-role message, prepended ahead of the user turn when a
   // chat template is in use (see GGUFTokenizer::has_chat_template /
-  // has_deepseek_chat_template). Empty by default -- MoEStream never
+  // has_deepseek_chat_template). Empty by default -- ZeroMoE never
   // synthesizes a system prompt on its own, matching what the real
   // DeepSeek-V4 jinja template produces when no "system" message is passed
   // in (confirmed byte-for-byte against

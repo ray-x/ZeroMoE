@@ -303,7 +303,7 @@ struct PerfCountersPart03 : PerfCountersPart02 {
     std::atomic<uint64_t> n_qwen_pilot_pred_already_vram{0};
     std::atomic<uint64_t> n_qwen_pilot_pred_needs_fetch{0};
     // Predictive Partial Pinning empirical filter (2026-09-19): for the
-    // ONE configured partial layer (MOESTREAM_QWEN4EXP_PARTIAL_LAYER),
+    // ONE configured partial layer (ZEROMOE_QWEN4EXP_PARTIAL_LAYER),
     // per real decode token, M = |E_routed \ (S_pinned U E_staged)| --
     // the count of routed experts NOT covered by the static usage-ranked
     // VRAM pin set even after adding the pilot's own top-K predicted

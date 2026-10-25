@@ -1,13 +1,13 @@
 // src/cpu_engine.cpp — Host-only engine: dense-weight loading, expert LRU,
-// KV cache, and tokenizer setup for moestream_cpu.
+// KV cache, and tokenizer setup for zeromoe_cpu.
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
 #include "exl3_model_loader.hpp"
 #include "exl3_cpu.hpp"
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
 #include "exl3_gpu.hpp"
 #include "exl3_format.hpp"
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include "exl3_ggml_model.hpp"
 #endif
 #endif
@@ -17,7 +17,7 @@
 #include <cstring>
 #include <numeric>
 
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
 #endif
@@ -52,7 +52,7 @@ static bool densify_tensor(CPUQuantizedTensor &qt) {
       }
     }
   } else {
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
     // Quantized row-major weight [I, O]; dequantize one output row at a time.
     int I = static_cast<int>(qt.meta.shape[0]);
     int O = static_cast<int>(ne / I);
@@ -73,7 +73,7 @@ static bool densify_tensor(CPUQuantizedTensor &qt) {
     }
 #else
     std::cerr << "[CPU-ENGINE] Quantized dense tensor requires ggml (set "
-                 "MOESTREAM_USE_GGML=ON) or a F32/F16/BF16 model.\n";
+                 "ZEROMOE_USE_GGML=ON) or a F32/F16/BF16 model.\n";
     free(f32_buf);
     return false;
 #endif
@@ -137,7 +137,7 @@ bool CPUExpertCache::init(const GGUFFile &model, double ram_gb,
   }
   if (!has_packed) {
     std::cerr << "[CPU-CACHE] Packed *_exps.weight tensors not found; "
-                 "per-expert format not yet supported by moestream_cpu.\n";
+                 "per-expert format not yet supported by zeromoe_cpu.\n";
     return false;
   }
   size_t slab_size = max_gb + max_ub + max_db;
@@ -647,7 +647,7 @@ bool CPUEngine::exl3_expert(int layer, int expert, const float *input, float *ou
   const auto project = [&](const char *suffix, const float *source, float *target,
                             int input_dim, int output_dim) {
     bool gpu_expert = false;
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
     gpu_expert = exl3_gpu && layer >= exl3_gpu_expert_layer_begin;
     auto expert_executor = exl3_gpu_secondary && layer >= exl3_gpu_expert_split_layer
         ? exl3_gpu_secondary : exl3_gpu;
@@ -682,7 +682,7 @@ bool CPUEngine::exl3_expert(int layer, int expert, const float *input, float *ou
     }
     if (!load_exl3_mul1_matrix(exl3_model, found->second, packed, error))
       throw std::runtime_error(error);
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
     if (gpu_expert) {
       expert_executor->matmul(prefix + suffix, static_cast<uint32_t>(GGUFType::EXL3),
                         packed.data(), packed.size(), source, target, 1,
@@ -707,7 +707,7 @@ bool CPUEngine::exl3_routed_ffn(int layer, const int *experts, const float *weig
 bool CPUEngine::exl3_routed_ffn_batch(int layer, const int *experts,
                                      const float *weights, int rows,
                                      const float *input, float *output) {
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
   if (!exl3_gpu || layer < exl3_gpu_expert_layer_begin) return false;
   const auto &cfg = model_file.architecture_config;
   const int topk = std::min(cfg.topk, cfg.n_experts);
@@ -742,7 +742,7 @@ bool CPUEngine::exl3_routed_ffn_batch(int layer, const int *experts,
     return packed;
   };
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   const bool secondary = executor == exl3_gpu_secondary;
   auto &graphs = secondary ? exl3_ggml_gpu_secondary_graphs
                            : exl3_ggml_gpu_graphs;
@@ -925,7 +925,7 @@ bool CPUEngine::exl3_cpu_routed_ffn_batch(
     if (experts[route] < 0 || experts[route] >= cfg.n_experts)
       throw std::runtime_error("EXL3 CPU batch expert ID out of range");
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   auto &graph = exl3_ggml_cpu_graphs[rows];
   if (!graph) {
     auto candidate = std::make_shared<Exl3GgmlCpuRoutedFfnGraph>();

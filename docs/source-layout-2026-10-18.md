@@ -39,7 +39,7 @@ tests/native/      native harness incl. main_test.cpp (moved from src/)
 tools/ bench/ tests/ configs/ patches/ third_party/ docs/ cmake/   unchanged
 ```
 
-Rules: headers live next to their sources. `CMakeLists.txt` defines `MOESTREAM_INCLUDE_DIRS`
+Rules: headers live next to their sources. `CMakeLists.txt` defines `ZEROMOE_INCLUDE_DIRS`
 (every header directory above) and uses it for all targets, so `#include "name.hpp"` lines
 are unchanged and a file can move between these folders without editing the files that include
 it. File names are unique across the tree (a prerequisite, checked when the move was made).
@@ -56,7 +56,7 @@ them), `core/perf/`, and `tests/native/`.
 
 ## How this maps to llama.cpp
 
-| llama.cpp | MoEStream |
+| llama.cpp | ZeroMoE |
 |---|---|
 | `llama_model` / `llama_model_loader` | `StreamingEngine::model_file`, `gguf_loader.hpp`, `GGUFGraphInitializer` |
 | `llama_context` (owns backends, sched, memory, run loop) | `EngineRunner` (new): owns engine, RAM tier, GPU topology, prefetcher; one method per phase |

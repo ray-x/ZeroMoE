@@ -6,7 +6,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -41,9 +41,9 @@ void stage_worker_main(StageRuntime *st) {
       }
       if (nm > 0) {
         const auto t0 = std::chrono::steady_clock::now();
-        const moestream::offload::ExpertResidency::Ensure r =
+        const zeromoe::offload::ExpertResidency::Ensure r =
             o->store->ensure(job.layer, missing, nm,
-                             moestream::offload::ExpertCache::Kind::Prefetch);
+                             zeromoe::offload::ExpertCache::Kind::Prefetch);
         st->prefetch_loads.fetch_add((uint64_t)r.loads, std::memory_order_relaxed);
         st->prefetch_us.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count(),
                                   std::memory_order_relaxed);
@@ -198,8 +198,8 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   int staged = 0;
   int32_t staged_ids[8] = {};
   StageResult &res = st->result[site->layer];
-  // MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>: one "R <layer> <ids...>" line per decode token and layer (all routed ids).
-  if (const char *tp = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TRACE"); tp && tp[0]) {
+  // ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>: one "R <layer> <ids...>" line per decode token and layer (all routed ids).
+  if (const char *tp = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ROUTE_TRACE"); tp && tp[0]) {
     static FILE *tf = std::fopen(tp, "a");
     if (tf) {
       std::fprintf(tf, "R %d", site->layer);
@@ -266,8 +266,8 @@ void stage_miss_cb(ggml_tensor *dst, const ggml_tensor *a, const ggml_tensor *b,
   }
   st->staged_routes.fetch_add(hit, std::memory_order_relaxed);
   st->routes_seen.fetch_add((uint64_t)n, std::memory_order_relaxed);
-  const moestream::offload::ExpertResidency::Ensure r =
-      o.store->ensure(site->layer, ids.data(), n, moestream::offload::ExpertCache::Kind::Demand);
+  const zeromoe::offload::ExpertResidency::Ensure r =
+      o.store->ensure(site->layer, ids.data(), n, zeromoe::offload::ExpertCache::Kind::Demand);
   o.store->counters().calls.fetch_add(1, std::memory_order_relaxed);
   o.store->counters().routes.fetch_add((uint64_t)n, std::memory_order_relaxed);
   o.store->counters().cold_routes.fetch_add((uint64_t)std::count_if(ids.begin(), ids.end(), [](int32_t v) { return v >= 0; }), std::memory_order_relaxed);
@@ -377,8 +377,8 @@ bool build_pilot_stage(FullGraph &g, ggml_context *ctx, ggml_tensor *cur_pre, in
     break;
   }
   ggml_tensor *score = bias ? ggml_add(ctx, probs, bias) : probs;
-  // Learned correction (MOESTREAM_GLM5NEXT_PILOT_RIDGE): score += (rms(x) - mu) R + c, fitted offline on the pilot's residual.
-  static const PilotRidgeTable ridge = PilotRidgeTable::load("MOESTREAM_GLM5NEXT_PILOT_RIDGE", "GLM-PILOT-RIDGE");
+  // Learned correction (ZEROMOE_GLM5NEXT_PILOT_RIDGE): score += (rms(x) - mu) R + c, fitted offline on the pilot's residual.
+  static const PilotRidgeTable ridge = PilotRidgeTable::load("ZEROMOE_GLM5NEXT_PILOT_RIDGE", "GLM-PILOT-RIDGE");
   if (const PilotRidgeTable::Record *rec = ridge.find(next);
       rec && ridge.d == (int)rn->ne[0] && ridge.e == (int)router->ne[1] && g.cuda) {
     ggml_tensor *mu_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ridge.d, 1);
@@ -548,4 +548,4 @@ ggml_tensor *stage_post_node(FullGraph &g, ggml_context *ctx, StageRuntime &st, 
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

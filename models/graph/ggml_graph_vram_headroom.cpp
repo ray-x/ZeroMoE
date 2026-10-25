@@ -3,7 +3,7 @@
 
 #include "glm5next_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 namespace glm5next_graph {
 
@@ -30,7 +30,7 @@ bool graph_alloc_vram_headroom_ok(const FullGraph &g, const char *log_tag) {
     cudaSetDevice(prev_device);
   size_t kMinGraphAllocHeadroomBytes =
       2ull * 1024ull * 1024ull * 1024ull; // 2 GiB
-  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB"))
+  if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB"))
     kMinGraphAllocHeadroomBytes = (size_t)std::max(0, std::atoi(e)) << 20;
   if (err != cudaSuccess || free_b < kMinGraphAllocHeadroomBytes) {
     LOG_ERROR("%s refusing graph allocator reserve: device %d free=%.2f GiB "

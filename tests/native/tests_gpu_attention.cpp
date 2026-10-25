@@ -1101,7 +1101,7 @@ bool test_wuv_int8_batched_gpu() {
     return pass;
 }
 
-// Gated throughput bench (MOESTREAM_RUN_BENCH=1, same convention as
+// Gated throughput bench (ZEROMOE_RUN_BENCH=1, same convention as
 // bench_cpu_dequant_matmul/Test 8) for the qabsorb BF16 batched GPU path,
 // at GLM-5.2's REAL dims (H=64 nope=192 kvl=512, read directly off a real
 // run's own "[MLA] attn_k_b.weight ... config nope*kvl*H=6291456" debug.log

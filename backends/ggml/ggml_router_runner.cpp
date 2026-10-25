@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #include "gpu_topology.hpp"
 #include "ggml.h"
@@ -199,7 +199,7 @@ bool GgmlRouterRunner::build_graph(int layer) {
   ggml_set_output(route.ids);
   ggml_set_output(route.weights);
   static const bool compare_logits = [] {
-    const char *e = std::getenv("MOESTREAM_QWEN_ROUTER_COMPARE");
+    const char *e = std::getenv("ZEROMOE_QWEN_ROUTER_COMPARE");
     return e && e[0] == '1';
   }();
   if (compare_logits) ggml_set_output(route.logits);
@@ -580,7 +580,7 @@ bool GgmlRouterRunner::copy_logits_to_host(int layer, float *logits) {
 }
 
 // ---------------------------------------------------------------------------
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 bool GgmlRouterRunner::compiled_in() { return false; }
 GgmlRouterRunner &GgmlRouterRunner::instance() {
   static GgmlRouterRunner r;
@@ -618,4 +618,4 @@ bool GgmlRouterRunner::copy_route_to_host(int, int32_t *, float *) {
 }
 bool GgmlRouterRunner::queue_route_to_host(int) { return false; }
 bool GgmlRouterRunner::copy_logits_to_host(int, float *) { return false; }
-#endif  // MOESTREAM_USE_GGML_CUDA
+#endif  // ZEROMOE_USE_GGML_CUDA

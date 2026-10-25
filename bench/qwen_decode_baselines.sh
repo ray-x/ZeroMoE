@@ -13,9 +13,9 @@ MODE=${1:?usage: $0 split|hybrid ...}
 STAMP=${QWN_STAMP:-$(date +%Y%m%d_%H%M%S)}
 mkdir -p logs
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-BIN=${MOESTREAM_BIN:-./build_native/moestream}
+BIN=${ZEROMOE_BIN:-./build_native/zeromoe}
 
-while pgrep -x moestream >/dev/null || pgrep -x llama-bench >/dev/null; do sleep 3; done
+while pgrep -x zeromoe >/dev/null || pgrep -x llama-bench >/dev/null; do sleep 3; done
 echo "loadavg before: $(cut -d' ' -f1-3 /proc/loadavg)  (a decode run is barrier-bound; >2 means something else is using cores)"
 
 case "$MODE" in
@@ -29,9 +29,9 @@ case "$MODE" in
     # "Tell a story." is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)
     rc=0
     printf 'Tell a story.\n:q\n' | env CUDA_VISIBLE_DEVICES=0 \
-      MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-      MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-      MOESTREAM_BENCH_SILENT=1 MOESTREAM_BENCH_IGNORE_STOP=1 \
+      ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+      ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+      ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
       timeout 900 "$BIN" --config "$TMP/cfg.toml" > "$LOG.log" 2>&1 || rc=$?
     grep -E "PREFILL-DONE\] 16|REQUEST-DECODE-WALL" "$LOG.engine.log" | cut -c1-170 || true
     # Emit teardown evidence so the gate can recognize a benign teardown crash (§3.7) rather
@@ -47,9 +47,9 @@ case "$MODE" in
     nvidia-smi --id=0 --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "$LOG.csv" &
     SP=$!
     echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env CUDA_VISIBLE_DEVICES=0 \
-      MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-      MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-      MOESTREAM_TOKEN_LOOP_DIAG=1 MOESTREAM_BENCH_IGNORE_STOP=1 \
+      ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+      ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+      ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
       "$BIN" --config "$TMP/cfg.toml" --ngen "$NGEN" > "$LOG.log" 2>&1 || true
     kill $SP 2>/dev/null || true
     python3 - "$LOG" <<'EOF'

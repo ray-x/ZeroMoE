@@ -1,4 +1,4 @@
-# MoEStream — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
+# ZeroMoE — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
 #
 # NOTE: UD-IQ2_M is a COMPLETE GLM-5.2 model (dense at Q5_K/Q6_K/Q8_0, experts at
 # Q2_K/Q3_K packed as *_exps). Run it alone — dense_model_path is commented
@@ -100,7 +100,7 @@ omp_max_threads = 8
 # Re-enabled for testing (was pin_file="" / pin_threshold=0 -- see
 # glm52_dual.toml's history for why it had been turned off, and re-verify
 # hit rate before/after on this checkpoint given that prior result).
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Capped (was 0/auto-fill-available-capacity): a real run showed auto-fill
 # pinning 1579/1642 VRAM slots (96%) at startup from a prior run's usage
@@ -113,7 +113,7 @@ pin_threshold = 6
 # A/B test at 13 (975/1642 slots, ~59% of the VRAM cache) showed hit rate
 # went slightly DOWN (52.3% vs. 53.4-53.9% at 8/layer), not up, while
 # Pinned residents grew to ~60% of the whole cache -- no measured benefit
-# from pinning more given how thin .moestream_usage's history still is
+# from pinning more given how thin .zeromoe_usage's history still is
 # (max count ~24-25). Reverted back to 8, with a note not to raise it again
 # until the usage file has a much richer history.
 #
@@ -154,7 +154,7 @@ pin_threshold = 6
 # BEST hit rate (50.9%) came from the HIGHEST pinned fraction tried so far
 # (1199/1464 = 82%) -- the OPPOSITE of the old historical A/B result a few
 # entries up, which found more pinning hurt. That old test ran when
-# .moestream_usage had max count ~24-25; it's now 75 (a much richer
+# .zeromoe_usage had max count ~24-25; it's now 75 (a much richer
 # signal), so a reversal is plausible, not suspicious. Raised to 11/layer
 # x 75 = 825 (~79% of the 1043-slot pool), matching the fraction that
 # worked best. Re-check hit rate against this run's 32.3% (and the

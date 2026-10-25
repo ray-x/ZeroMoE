@@ -36,7 +36,7 @@
 #include <string>
 #include <vector>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 struct OffloadProfile {
   int first_layer = 0;
@@ -117,7 +117,7 @@ inline std::vector<std::string> expand_model_shards(const std::string &path) {
 // (with `err`) when a layer's planes are missing, uneven, or not 4096-aligned.
 inline bool make_store_config(const StreamingEngine &engine,
                               const OffloadProfile &profile,
-                              moestream::offload::ExpertStoreConfig *out,
+                              zeromoe::offload::ExpertStoreConfig *out,
                               std::string *err) {
   const auto &c = engine.model_file.architecture_config;
   const int n_layers = c.n_layers - profile.first_layer;
@@ -130,7 +130,7 @@ inline bool make_store_config(const StreamingEngine &engine,
   if (profile.model_path.empty() && profile.model_shards.empty())
     return fail("offload model path (first shard) is required");
 
-  moestream::offload::ExpertStoreConfig sc;
+  zeromoe::offload::ExpertStoreConfig sc;
   sc.first_layer = profile.first_layer;
   sc.n_layers = n_layers;
   sc.n_experts = c.n_experts;
@@ -161,8 +161,8 @@ inline bool make_store_config(const StreamingEngine &engine,
                         : profile.model_shards;
   sc.ddr_gib = profile.ddr_gib > 0.0 ? profile.ddr_gib : auto_ddr_gib();
   sc.policy = profile.lru_segmented
-                  ? moestream::offload::ExpertCache::Policy::SegmentedLru
-                  : moestream::offload::ExpertCache::Policy::Lru;
+                  ? zeromoe::offload::ExpertCache::Policy::SegmentedLru
+                  : zeromoe::offload::ExpertCache::Policy::Lru;
   sc.pinned_fraction = profile.pinned_fraction;
   sc.probation_fraction = profile.probation_fraction;
   sc.byte_capacity = profile.byte_capacity;
@@ -185,21 +185,21 @@ struct SeedExclusions {
 };
 
 // Seeds the store hottest-first from a usage file. Returns experts that failed.
-inline size_t seed_store(moestream::offload::ExpertStore &store,
+inline size_t seed_store(zeromoe::offload::ExpertStore &store,
                          const std::string &usage_file, int first_layer,
                          int n_layers, int n_experts,
                          const SeedExclusions *exclusions, const char *tag) {
-  auto ranked = moestream::offload::rank_hottest_first(usage_file, first_layer,
+  auto ranked = zeromoe::offload::rank_hottest_first(usage_file, first_layer,
                                                        n_layers, n_experts);
   if (exclusions) {
     const auto in_set = [](const std::vector<std::vector<uint8_t>> &m,
-                           const moestream::offload::ExpertKey &k) {
+                           const zeromoe::offload::ExpertKey &k) {
       return (size_t)k.layer < m.size() && !m[(size_t)k.layer].empty() &&
              m[(size_t)k.layer][(size_t)k.expert];
     };
-    std::vector<moestream::offload::ExpertKey> late;
+    std::vector<zeromoe::offload::ExpertKey> late;
     ranked.erase(std::remove_if(ranked.begin(), ranked.end(),
-                                [&](const moestream::offload::ExpertKey &k) {
+                                [&](const zeromoe::offload::ExpertKey &k) {
                                   if (in_set(exclusions->deferred, k)) {
                                     late.push_back(k);
                                     return true;
@@ -228,7 +228,7 @@ inline size_t seed_store(moestream::offload::ExpertStore &store,
 // 0 gate / 1 up / 2 down. The backing CPU buffer handle is appended to
 // `buffers_out` so the caller controls its lifetime.
 inline ggml_tensor *make_plane_tensor(
-    const StreamingEngine &engine, moestream::offload::VirtualArena &arena,
+    const StreamingEngine &engine, zeromoe::offload::VirtualArena &arena,
     int n_experts, ggml_context *ctx, int layer, const char *stem,
     const std::function<bool(GGUFType)> &type_supported,
     std::vector<ggml_backend_buffer_t> *buffers_out, const char *tag) {
@@ -273,7 +273,7 @@ inline ggml_tensor *make_plane_tensor(
 // ring is shared by every lane and freed with the last one. `layer_ok` selects
 // which layers have to fit (the ring is sized to the largest).
 inline std::shared_ptr<GpuAssistShared> make_assist_ring(
-    moestream::offload::VirtualArena &arena, int first_layer, int n_layers,
+    zeromoe::offload::VirtualArena &arena, int first_layer, int n_layers,
     int device, int slots, const std::function<bool(int)> &layer_ok) {
   auto s = std::make_shared<GpuAssistShared>();
   s->be = ggml_backend_cuda_init(device);
@@ -291,4 +291,4 @@ inline std::shared_ptr<GpuAssistShared> make_assist_ring(
   return ok ? s : nullptr;
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

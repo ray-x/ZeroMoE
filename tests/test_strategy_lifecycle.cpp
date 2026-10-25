@@ -28,18 +28,18 @@ static int g_failures = 0;
     }                                                                          \
   } while (0)
 
-using moestream::graph::InvocationState;
+using zeromoe::graph::InvocationState;
 using State = InvocationState::State;
 using Residency = InvocationState::Residency;
 
 // Minimal strategies that pin the capability contract only; the operational methods are inert
 // because this test exercises the lifecycle helper, not a backend.
-struct DrivingStrategy : moestream::graph::ColdMoEStrategy {
-  bool install(const moestream::graph::ColdMoEAdapter &) override { return true; }
-  bool begin(const moestream::graph::ColdMoEInvocation &) override { return true; }
-  State state(const moestream::graph::ColdMoEInvocation &) const override { return State::Pending; }
-  bool finish(const moestream::graph::ColdMoEInvocation &) override { return false; }
-  void release(const moestream::graph::ColdMoEInvocation &) override {}
+struct DrivingStrategy : zeromoe::graph::ColdMoEStrategy {
+  bool install(const zeromoe::graph::ColdMoEAdapter &) override { return true; }
+  bool begin(const zeromoe::graph::ColdMoEInvocation &) override { return true; }
+  State state(const zeromoe::graph::ColdMoEInvocation &) const override { return State::Pending; }
+  bool finish(const zeromoe::graph::ColdMoEInvocation &) override { return false; }
+  void release(const zeromoe::graph::ColdMoEInvocation &) override {}
 };
 
 struct ObservingStrategy : DrivingStrategy {

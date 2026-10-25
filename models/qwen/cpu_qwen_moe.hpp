@@ -417,7 +417,7 @@ inline void CPUQwenMoEBackend::forward_moe_ffn(CPUEngine &engine, int layer_idx,
 // Dequantize one row of a quantized weight matrix and multiply by x.
 // This is a minimal helper used only by the CPU MoE path; full-engine builds
 // use kquant_dequant.hpp which pulls engine.hpp (CUDA).
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
 #endif
@@ -470,7 +470,7 @@ inline void CPUQwenMoEBackend::dequant_matmul(GGUFType type, const uint8_t *w,
   int ok_rows = 0;
   for (int o = 0; o < O; ++o) {
     int ok = 0;
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
     ok = ggml_dequant_row((uint32_t)type, w + (size_t)o * row_bytes,
                           wf.data() + o * I, I);
 #else

@@ -1,4 +1,4 @@
-// tests/test_components.cpp — Unit tests for MoEStream components
+// tests/test_components.cpp — Unit tests for ZeroMoE components
 // Build: g++ -std=c++23 -O2 -I../include -o test_components test_components.cpp
 // (Does NOT require CUDA for the CPU-path tests)
 #include "direct_io.hpp" // the REAL O_DIRECT alignment-window arithmetic (no CUDA deps)
@@ -2377,7 +2377,7 @@ void test_route_usage() {
   assert(pins.count((1ull << 32) | 3u) == 1u);
 
   // Dump/load round-trip with merge.
-  std::string tmp = "/tmp/moestream_test_usage.txt";
+  std::string tmp = "/tmp/zeromoe_test_usage.txt";
   assert(usage.dump(tmp));
 
   RouteUsage loaded;
@@ -2520,7 +2520,7 @@ void test_safetensors_adapter() {
 void test_exl3_ngram_reader() {
   std::cout << "[TEST] EXL3 indexed ngram reads/cache/symlinks..." << std::flush;
   for (int bits = 1; bits <= 8; ++bits) {
-    char path[] = "/tmp/moestream_exl3_ngram_XXXXXX";
+    char path[] = "/tmp/zeromoe_exl3_ngram_XXXXXX";
     const int descriptor = mkstemp(path);
     assert(descriptor >= 0);
     close(descriptor);
@@ -2614,9 +2614,9 @@ void test_exllamav3_backend_launch() {
   assert(arguments[5] == prompt);
   const auto path_python = exllamav3_backend_arguments(config_path.string(), "python3", "/runner.py", {});
   assert(path_python[0] == "python3" && path_python[1] == "/runner.py");
-  assert(!exec_exllamav3_backend(config_path.string(), "/nonexistent-moestream-python", "/runner.py", {}));
+  assert(!exec_exllamav3_backend(config_path.string(), "/nonexistent-zeromoe-python", "/runner.py", {}));
   assert(!exec_exllamav3_backend(config_path.string(), "", "/runner.py", {}));
-  char path[] = "/tmp/moestream_exllamav3_config_XXXXXX";
+  char path[] = "/tmp/zeromoe_exllamav3_config_XXXXXX";
   const int descriptor = mkstemp(path);
   assert(descriptor >= 0);
   close(descriptor);
@@ -2674,7 +2674,7 @@ void test_exl3_cpu_matrix_cache() {
 
 void test_exl3_parallel_shard_reader() {
   std::cout << "[TEST] EXL3 concurrent shard reads/symlink..." << std::flush;
-  char path[] = "/tmp/moestream_exl3_shard_XXXXXX";
+  char path[] = "/tmp/zeromoe_exl3_shard_XXXXXX";
   const int descriptor = mkstemp(path);
   assert(descriptor >= 0);
   std::array<uint8_t, 256> source{};
@@ -3325,7 +3325,7 @@ void test_moe_decode_batch() {
 }
 
 void test_tokenizer_metadata_shard() {
-  char dir[] = "/tmp/moestream-tokenizer-shards-XXXXXX";
+  char dir[] = "/tmp/zeromoe-tokenizer-shards-XXXXXX";
   assert(mkdtemp(dir));
   const std::string root(dir);
   const auto empty = root + "/00002.gguf";
@@ -3361,7 +3361,7 @@ void test_tokenizer_metadata_shard() {
 }
 
 int main(int argc, char **argv) {
-  std::cout << "=== MoEStream Component Tests ===\n";
+  std::cout << "=== ZeroMoE Component Tests ===\n";
   struct TestEntry {
     const char *name;
     void (*fn)();

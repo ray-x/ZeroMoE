@@ -2,7 +2,7 @@
 #include "exl3_gpu.hpp"
 #include "logger.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include "exl3_cuda.hpp"
 #include "exl3_cpu.hpp"
@@ -394,7 +394,7 @@ ggml_tensor *exl3_ggml_map_routed_ffn(ggml_context *ctx, ggml_tensor *input,
 
 Exl3GgmlCachedRoutedFfnState::~Exl3GgmlCachedRoutedFfnState() {
   if (route_readback_calls != 0 &&
-      std::getenv("MOESTREAM_EXL3_GGML_ROUTE_TIMING")) {
+      std::getenv("ZEROMOE_EXL3_GGML_ROUTE_TIMING")) {
     LOG_INFO("[EXL3-GGML-ROUTE] layer=%d readbacks=%llu bytes=%zu "
              "sync_ms=%.3f avg_us=%.2f resolve_ms=%.3f "
              "enqueue_ms=%.3f row_wait_ms=%.3f\n",
@@ -519,7 +519,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
       throw std::runtime_error("invalid EXL3 device-route tensors");
     device_route_weights = static_cast<const float *>(node->src[2]->data);
     const bool measure_route_readback =
-        std::getenv("MOESTREAM_EXL3_GGML_ROUTE_TIMING") != nullptr;
+        std::getenv("ZEROMOE_EXL3_GGML_ROUTE_TIMING") != nullptr;
     const auto route_readback_start =
         measure_route_readback ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -552,7 +552,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
     device_route_weights = reinterpret_cast<const float *>(
         route_bytes + ids_bytes);
     const bool measure_route_readback =
-        std::getenv("MOESTREAM_EXL3_GGML_ROUTE_TIMING") != nullptr;
+        std::getenv("ZEROMOE_EXL3_GGML_ROUTE_TIMING") != nullptr;
     const auto route_readback_start =
         measure_route_readback ? std::chrono::steady_clock::now()
                                : std::chrono::steady_clock::time_point{};
@@ -582,7 +582,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
     if (!state->matrix_loader)
       throw std::runtime_error("EXL3 external GPU cache needs a matrix loader");
     const bool measure_external_timing =
-        std::getenv("MOESTREAM_EXL3_GGML_ROUTE_TIMING") != nullptr;
+        std::getenv("ZEROMOE_EXL3_GGML_ROUTE_TIMING") != nullptr;
     const size_t routes_per_row = static_cast<size_t>(state->topk);
     const size_t maximum_batch_rows =
         state->external_matrix_slot_capacity >= routes_per_row * 3
@@ -597,7 +597,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
       const size_t batch_route_count =
           static_cast<size_t>(batch_rows) * routes_per_row;
       const bool use_cpu_reference_output =
-          std::getenv("MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT") != nullptr;
+          std::getenv("ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT") != nullptr;
       if (use_cpu_reference_output && !state->verify_cpu_reference)
         throw std::runtime_error(
             "EXL3 CPU reference output requires CPU parity checking");
@@ -650,7 +650,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
           row_input, row_output, batch_rows, state->topk, state->hidden,
           state->intermediate, stream);
       if (measure_external_timing &&
-          std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+          std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
         std::fprintf(stderr,
                      "[EXL3-GRAPH-TRACE] callback enqueued layer=%d row=%d\n",
                      state->model_layer, first_row);
@@ -675,14 +675,14 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
                   .count();
       }
       if (state->verify_cpu_reference) {
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity wait layer=%d row=%d\n",
                        state->model_layer, first_row);
         check(cudaStreamSynchronize(stream),
               "complete EXL3 routed FFN before CPU parity readback");
         (void)state->gpu_executor->stats();
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity stream complete layer=%d "
                        "row=%d\n",
@@ -693,18 +693,18 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
                          actual.size() * sizeof(float),
                          cudaMemcpyDeviceToHost),
               "read EXL3 bridge output for CPU parity");
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity output copied layer=%d "
                        "row=%d\n",
                        state->model_layer, first_row);
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity vectors count=%zu "
                        "batch_rows=%d first_route=%zu\n",
                        actual.size(), batch_rows, first_route);
         std::vector<float> expected(actual.size(), 0.0f);
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity expected allocated "
                        "layer=%d\n",
@@ -717,7 +717,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
                 first_route + static_cast<size_t>(batch_row) * state->topk +
                 route;
             const int32_t expert_id = state->route_ids_host[route_index];
-            if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+            if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
               std::fprintf(stderr,
                            "[EXL3-GRAPH-TRACE] parity CPU route=%d expert=%d "
                            "layer=%d\n",
@@ -751,7 +751,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
                     state->intermediate, state->hidden))
               throw std::runtime_error(
                   "EXL3 bridge CPU parity down projection failed");
-            if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+            if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
               std::fprintf(stderr,
                            "[EXL3-GRAPH-TRACE] parity CPU projections done "
                            "expert=%d layer=%d\n",
@@ -761,14 +761,14 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
             for (int index = 0; index < state->hidden; ++index)
               expected[row_offset + static_cast<size_t>(index)] +=
                   route_weight * down_value[static_cast<size_t>(index)];
-            if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+            if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
               std::fprintf(stderr,
                            "[EXL3-GRAPH-TRACE] parity accumulated expert=%d "
                            "weight=%g layer=%d\n",
                            expert_id, route_weight, state->model_layer);
           }
         }
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity expected complete "
                        "layer=%d values=%zu\n",
@@ -777,7 +777,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
         float max_expected = 0.0f;
         size_t max_error_index = 0;
         const bool trace_parity =
-            std::getenv("MOESTREAM_EXL3_GRAPH_TRACE") != nullptr;
+            std::getenv("ZEROMOE_EXL3_GRAPH_TRACE") != nullptr;
         if (trace_parity)
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity compare begin actual=%p "
@@ -807,7 +807,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
         // output peak after the gate/up/down chain), so their tolerance is
         // wider than the fp32-activation legacy kernels'.
         float relative_tolerance = 1e-3f;
-#ifdef MOESTREAM_EXL3_UPSTREAM
+#ifdef ZEROMOE_EXL3_UPSTREAM
         relative_tolerance = 2e-2f;
 #endif
         if (max_abs_error > 1e-3f + relative_tolerance * max_expected) {
@@ -827,7 +827,7 @@ void Exl3GgmlCachedRoutedFfnState::compute(ggml_backend_t cuda_backend,
               " host_weight0=" +
               std::to_string(state->route_weights_host[first_route]));
         }
-        if (std::getenv("MOESTREAM_EXL3_GRAPH_TRACE"))
+        if (std::getenv("ZEROMOE_EXL3_GRAPH_TRACE"))
           std::fprintf(stderr,
                        "[EXL3-GRAPH-TRACE] parity compare complete "
                        "layer=%d max_error=%g\n",

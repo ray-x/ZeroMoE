@@ -91,21 +91,21 @@ expert_fetch_threads = 10
 omp_max_threads      = 12
 prefetch_worker_threads = 4
 
-# Model-specific usage/pin files. MUST NOT be .moestream_usage -- that one
+# Model-specific usage/pin files. MUST NOT be .zeromoe_usage -- that one
 # is GLM-5.3's (75 layers vs this model's 48).
 #
 # 2026-09-10 (decode fork): switched from the "_480" files back to the
-# original (no-suffix) .moestream_usage_qwen4exp[_prefill]. The "_480"
+# original (no-suffix) .zeromoe_usage_qwen4exp[_prefill]. The "_480"
 # files (used by the prefill sibling) were regenerated from a SINGLE
 # 480-token PREFILL run -- pure prefill routing data, zero real decode
-# traffic. This file (.moestream_usage_qwen4exp, 23967 layer/expert/count
+# traffic. This file (.zeromoe_usage_qwen4exp, 23967 layer/expert/count
 # rows across all 48 layers) was built from ~25 real prompts / 18723
 # DECODE pairs (see qwen4exp_3090_5060.toml's own header comment) -- the
 # genuinely decode-representative histogram pin_strategy=global_topn
 # needs to rank real decode hotness instead of prefill's. Using the wrong
 # file was silently defeating global_topn's whole purpose for this fork.
-pin_file           = ".moestream_usage_qwen4exp"
-prefill_pin_file   = ".moestream_usage_qwen4exp_prefill"
+pin_file           = ".zeromoe_usage_qwen4exp"
+prefill_pin_file   = ".zeromoe_usage_qwen4exp_prefill"
 freeze_usage_stats = true
 pin_topk_per_layer   = 1
 pinned_vram_capacity = 7680
@@ -190,7 +190,7 @@ moe_expert_bf16_gemm = true
 # legacy per-token dispatch below, which is what the three knobs above
 # actually affect) -- kept ON here because it does not cost decode
 # anything by being enabled, not because it helps decode.
-# Needs a build with -DMOESTREAM_USE_GGML_CUDA=ON.
+# Needs a build with -DZEROMOE_USE_GGML_CUDA=ON.
 moe_ggml_mul_mat_id = true
 moe_ggml_shared_expert = true
 moe_ggml_device     = 0

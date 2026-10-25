@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace moestream::offload {
+namespace zeromoe::offload {
 
 struct ExpertStoreConfig {
   int first_layer = 0;
@@ -276,9 +276,9 @@ class ExpertStore {
       };
       arena_->before_evict = [this](int l, int x) { unpin_expert(l, x); };
       // Prefill-transient experts are registered by the read-ahead thread (off the critical path) so their host-to-device
-      // copy skips the driver's pageable bounce buffer; unregistered on evict. Opt-in (MOESTREAM_OFFLOAD_PIN_TRANSIENT=1):
+      // copy skips the driver's pageable bounce buffer; unregistered on evict. Opt-in (ZEROMOE_OFFLOAD_PIN_TRANSIENT=1):
       // measured 87.5 tok/s with vs 99.0 without on the 805-token prompt (registration cost outweighs the faster copy).
-      if (const char *e = std::getenv("MOESTREAM_OFFLOAD_PIN_TRANSIENT"); e && e[0] == '1')
+      if (const char *e = std::getenv("ZEROMOE_OFFLOAD_PIN_TRANSIENT"); e && e[0] == '1')
         arena_->after_transient = [this](int l, int x) { pin_expert(l, x); };
     }
     return true;
@@ -330,4 +330,4 @@ class ExpertStore {
   Counters counters_;
 };
 
-}  // namespace moestream::offload
+}  // namespace zeromoe::offload

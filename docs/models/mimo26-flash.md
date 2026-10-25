@@ -38,8 +38,8 @@ not a performance recommendation. Expert reads use the model's backing file;
 no separate offload store is created.
 
 ```bash
-MOESTREAM_DISABLE_ROUTER_BF16=1 CUDA_VISIBLE_DEVICES=0,1 \
-  scripts/run_capped.sh --limit-gb 100 -- build_mimo/moestream \
+ZEROMOE_DISABLE_ROUTER_BF16=1 CUDA_VISIBLE_DEVICES=0,1 \
+  scripts/run_capped.sh --limit-gb 100 -- build_mimo/zeromoe \
   --config configs/mimo26_flash_gsq_rco_3bit.toml --ngen 16
 ```
 
@@ -48,9 +48,9 @@ native execution path, `--prompt` alone does not submit a REPL request.
 Check for competing model processes before running. The kernel cap includes
 `MemorySwapMax=0`; do not replace it with a RAM-only cap.
 
-`MOESTREAM_MIMO2_FULL_GRAPH=0` disables this family graph and fails the request;
+`ZEROMOE_MIMO2_FULL_GRAPH=0` disables this family graph and fails the request;
 there is no compatible layered attention fallback.
-`MOESTREAM_MIMO2_PREFILL_CHUNK` sets the graph's maximum prompt chunk
+`ZEROMOE_MIMO2_PREFILL_CHUNK` sets the graph's maximum prompt chunk
 (default 16, range 1–256). Larger chunks increase workspace and cold expert
 fan-out; changing this is a tuning experiment after correctness validation.
 The BF16-router override above preserves original F32 routing for the initial
@@ -97,7 +97,8 @@ but the result remains far below the 10 tok/s target.
 The benchmark history contains one water-cycle prompt, not a representative
 survey. The profile is still experimental; these numbers are diagnostic, not
 a frozen baseline. They show that DDR preload alone does not solve MiMo's
-decode path. MiMo currently calls the generic synchronous
+decode path. *(Superseded 2026-10-22: MiMo now runs its routed experts in the graph with the early-ready lane, see
+"Status" and the measured results; the text below is the history of the first cache-backed bring-up.)* MiMo then called the generic synchronous
 `moe_forward_gguf` path from 47 graph callbacks. Ling's 10 tok/s path instead
 splits resident GPU work from cold CPU/offload work, runs them concurrently,
 and uses small GPU-assist rings. Reusing that strategy is the primary path to
@@ -124,6 +125,11 @@ check. A ring cache remains future work. MTP is absent from this GGUF and is
 not enabled.
 
 ## What R2 made reusable, and what remains
+
+> **Superseded in part (2026-10-23).** The paragraphs below describe the first, cache-backed bring-up. MiMo's
+> default path is now the in-graph hot/cold MoE on the shared `build_moe_block` (`models/graph/moe_ingraph.hpp`,
+> the aliased-placement and offload providers), not `CacheBackedMoeRuntime`; the synchronous callback remains as the
+> fallback when `ZEROMOE_MIMO2_INGRAPH_MOE=0`. R2's `CacheBackedStrategy` is still an unwired specification.
 
 MiMo reuses `FullGraphModel` registration/lifecycle, `GraphCore`, the engine's
 resident dense weights, and the live `moe_forward_gguf` pipeline. Routing,
@@ -177,7 +183,7 @@ Pitfalls found while bringing it up:
 - The offload store's row-size table needed MXFP4 (ggml type 39).
 - Aliased cache slots need row-aligned strides (engine pads them when MiMo's in-graph
   MoE is enabled); the engine RAM tier must not preload on top of the offload tier.
-- `MOESTREAM_MIMO2_NODE_TRACE=1|2|3|4` are debug aids; trace modes install an eval
+- `ZEROMOE_MIMO2_NODE_TRACE=1|2|3|4` are debug aids; trace modes install an eval
   callback that disables the early-ready bridge, so never use them for timing.
 
 Next: run the dual-GPU config, freeze a surveyed usage profile, A/B the GPU-assist ring.
@@ -186,7 +192,7 @@ Next: run the dual-GPU config, freeze a surveyed usage profile, A/B the GPU-assi
 
 Config `configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` (12 GiB / 14.5 GiB expert caches =
 1,317 + 1,592 hot experts), 80 GiB offload DDR tier, assist ring off, 10 CPU threads. Run via
-`MOESTREAM_MIMO2_*` env (see ggml_mimo2_graph.cpp). Placement preflight: coverage 12032/12032.
+`ZEROMOE_MIMO2_*` env (see ggml_mimo2_graph.cpp). Placement preflight: coverage 12032/12032.
 
 | Prompt tokens | Prefill tok/s | Path | Decode tok/s (64 tok) |
 |---:|---:|---|---:|
@@ -197,7 +203,7 @@ Config `configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` (12 GiB / 14.5 GiB 
 
 Decode: 0 store misses / 0 loads over the run (no SSD reads); the CPU lane's compute is ~40 ms/token.
 Prefill: GPU op-offload copies ~52 GiB of experts per chunk (nearly constant per chunk), so it pays
-off from ~256 tokens (auto threshold, `MOESTREAM_MIMO2_PREFILL_OFFLOAD_MIN`).
+off from ~256 tokens (auto threshold, `ZEROMOE_MIMO2_PREFILL_OFFLOAD_MIN`).
 
 Measured graph VRAM (`[MIMO2-VRAM]`): compute buffers ~0.004 GiB per GPU, KV 0.1 GiB at 512 context;
 the engine's fixed 6 GiB "graph overhead reserve" only affects automatic cache sizing.
@@ -210,3 +216,85 @@ Not yet done: llama.cpp parity (GPU and CPU expert kernels differ numerically), 
 profile (the profile used knows only 7,099 of 12,032 experts), assist-ring A/B, Ling regression rerun
 after the final shared edits. One unexplained anomaly: a 146-token prompt once stepped at ~900 ms/token
 for ~2 minutes (not reproduced; no competing process seen in the next runs).
+
+## 2026-10-23: 3090 cache 12 -> 15 GiB
+
+The new idle-VRAM preflight check found 5.4 GiB free on the 3090 after the graph was built (with the unused
+active-layer pool dropped). Raising `moe_cache_gb` for GPU 0 to 15 GiB in
+`configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` leaves 2.6 GiB free (5060 Ti unchanged at 1.7 GiB) and
+gave decode 13.86 / 15.65 / 15.84 / 15.33 tok/s (was 13.43 / 15.05 / 15.43 / 14.73) and prefill
+25.8 / 43.8 / 76.8 / 80.2 tok/s (was 24.9 / 41.4 / 74.7 / 77.8). The generated tokens differ from the
+12 GiB run from token 13 of the first prompt (a different hot set moves experts between the GPU and CPU
+kernels); the text is coherent in both.
+
+## Open (2026-10-23)
+
+- llama.cpp parity passed on one short prompt (above); a long-prompt run (past the sliding window) has not been done.
+- The usage file knows 7,099 of 12,032 routed experts; a surveyed profile only changes the VRAM-hot set,
+  because the DDR tier covers every expert (0 SSD reads in decode).
+- One 146-token prompt once stepped at ~900 ms/token and one S=12 tail chunk took 3.3 s during bring-up; neither
+  reproduced in more than a dozen later runs.
+
+### Parity against llama.cpp, 2026-10-23 (passed)
+
+Prompt `The capital of France is` (ids 785 6722 315 9625 374), 8 greedy steps, `--raw-prompt --temp 0`. ZeroMoE:
+dual-GPU in-graph config (3090 cache 12 GiB), `build_master`-era tree; llama.cpp `b9739`-class unpatched CPU build
+(`build_mimo/mimo26-llama-logits`, `tools/compare_logits.py`; recipe in README, "Validating a new model").
+
+| step | max_abs | rmse | cosine | top-1 (ZeroMoE / llama.cpp) |
+|---:|---:|---:|---:|---|
+| 0 (prompt's last token) | 0.461 | 0.0799 | 0.99987 | 12095 / 12095 |
+| 1 | 0.697 | 0.1066 | 0.99950 | 13 / 13 |
+| 2 | 0.942 | 0.1215 | 0.99967 | 1084 / 1084 |
+| 3 | 0.739 | 0.1364 | 0.99964 | 374 / 374 |
+| 4 | 0.492 | 0.0887 | 0.99987 | 7407 / 7407 |
+| 5 | 0.711 | 0.1378 | 0.99968 | 304 / 304 |
+| 6 | 0.851 | 0.1362 | 0.99974 | 279 / 279 |
+| 7 | 0.467 | 0.0820 | 0.99985 | 10200 / 10200 |
+
+All eight tokens are identical and the cosine never drops below 0.9995, so attention, routing, the shared expert and the
+Q2_K/Q3_K/MXFP4 expert paths agree with llama.cpp up to kernel rounding. One short prompt: a longer one and a second
+prompt would test sliding-window layers beyond the window (4096 on this model is far above this prompt).
+
+## Surveying the usage profile (2026-10-23)
+
+The in-graph path bypasses the engine's usage statistics (`freeze_usage_stats = false` records nothing there), so the
+profile is recorded from the graph: `bench/mimo_survey.sh survey <profile> <binary>` runs 20 varied prompts
+(`bench/mimo_survey_prompts.txt`) with `ZEROMOE_MIMO2_USAGE_RECORD`, a side tap that leaves the real route ids
+alone and counts decode and prefill separately (`<profile>` is decode, `<profile>.prefill` is prefill; a 512-token
+prefill chunk has far more route slots than a decode step and would dominate a combined file).
+`bench/mimo_survey.sh eval <profile>` runs four held-out prompts (`bench/mimo_eval_prompts.txt`) for an A/B.
+The tap adds a CPU node per layer: use it for surveys, not timing. Coverage and the A/B result are below.
+
+### Surveyed profile A/B (2026-10-23, held-out prompts, dual GPU, 3090 cache 15 GiB)
+
+Profiles in `bench/profiles/`: `mimo26_decode.usage` (decode routes), `mimo26_prefill.usage`, `mimo26_combined.usage`
+(sum). The earlier profile covered 7,099 of 12,032 experts; the survey saw 11,385 (decode) and 9,852 (prefill).
+
+| Profile | Decode, 4 prompts (tok/s) | Short-prompt prefill, 4 prompts (tok/s) |
+|---|---|---|
+| earlier (`.zeromoe_usage_mimo26_gsq_rco3`) | 15.35 / 13.82 / 15.39 / 14.57 and 15.29 / 14.23 / 15.86 / 14.69 | 28.8 / 32.7 / 36.9 / 35.5 and 28.5 / 33.3 / 37.9 / 35.9 |
+| decode-only | 16.72 / 14.76 / 16.66 / 16.23 and 16.67 / 14.62 / 16.69 / 16.17 | 23.5 / 28.2 / 27.1 / 30.0 and 23.4 / 27.6 / 27.1 / 29.9 |
+| combined | 15.31 / 11.58 / 16.53 / 16.20 and 16.99 / 14.73 / 16.37 / 16.23 | 25.2 / 32.0 / 33.1 / 35.7 and 27.5 / 33.6 / 33.7 / 36.0 |
+
+Why decode-only slows short prefill: with the same configuration, the same 3,239 hot experts and 0 store misses, a ~25-token
+prefill runs its cold experts on the CPU, and replaying the surveyed routes against each hot set gives decode-route
+coverage 52 % (earlier) / 67 % (decode-only) / 65 % (combined) and prefill-route coverage 67 % / 55 % / 68 %. The earlier
+profile came from prefill-heavy runs, so it favoured prefill. The combined profile is adopted (decode about +8 %, short
+prefill level with the earlier one).
+
+**Long prompts do not care which experts are hot.** 600- and 1,000-token prompts (`bench/mimo_survey.sh long`), prefill
+tok/s decode-only / prefill-only / combined: 54.1 / 53.3 / 54.5 and 63.7 / 62.5 / 63.3. A 512-token chunk touches
+nearly every expert in every layer, so the copy volume (about 60 GiB per chunk, 21-22k expert copies, 7.2-7.4 s) depends
+on how many experts are cold, not which. A prefill-specific hot set, or swapping hot sets between prefill and decode,
+would not speed up long prefill; what does is fewer cold bytes per token, i.e. a larger chunk (the copy volume per chunk
+is the same, so tokens per chunk is the lever) or more VRAM.
+
+### GPU utilisation and where VRAM goes
+
+A test run is ~90 % loading (1 min 46 s VRAM pin preload + 3 min 47 s DDR seed from the USB SSD at ~0.35 GB/s, GPUs idle,
+iowait 35 %) and ~40 s of compute. In decode the GPUs wait on the CPU cold-expert lane (62 ms/token: ~36 ms CPU lane,
+~16 ms GPU wait). VRAM per GPU: 3090 dense 6.5 GB + cache 15 GB + 0.3 GB context + 0.4 GB KV, 2.5 GiB free at decode but
+only 1.25 GiB at a 512-token prefill (compute and copy buffers 1.19 GiB); 5060 Ti cache 14.5 GB, 1.6 GiB free. Experts
+hold about 70 % of VRAM. Decode-route coverage vs experts in VRAM (surveyed): 3,239 -> 66.6 %, 3,519 -> 69.5 %, 4,000 -> 73.9 %,
+5,000 -> 81.7 %, 6,500 -> 90.2 % (estimated decode 16 / 17 / 18.5 / 22 / 27 tok/s on a 26 ms fixed + 36 ms cold model).

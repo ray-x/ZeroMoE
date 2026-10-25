@@ -117,7 +117,7 @@ read short-circuit, but a matched A/B of that version has not completed.
 The residual step-27 top-1 flip had a reference margin of about 0.00398 and
 also appeared in an early-ready-only Option-B noise-floor sweep. This weakens
 the stale-state/corruption hypothesis, but staged-GPU coherence is not proven
-when the staged branch never publishes. Separately, MoEStream prefill still
+when the staged branch never publishes. Separately, ZeroMoE prefill still
 differs from standard llama.cpp GPU-dense prefill at layer 0 (RMS `2.11e-5`,
 max `1.31e-3`); the user's llama.cpp prefill gate remains unmet.
 

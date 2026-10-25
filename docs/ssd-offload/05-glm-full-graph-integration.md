@@ -2,7 +2,7 @@
 
 ## What runs
 
-`MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=11` (layers 11..44 offloaded; layers 3..10 stay VRAM-resident, as in the
+`ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=11` (layers 11..44 offloaded; layers 3..10 stay VRAM-resident, as in the
 baseline config) turns on, inside `src/ggml_glm5next_graph.cpp`:
 
 * a per-projection virtual arena (`VirtualArena`, slot = expert id) bound as the CPU `MUL_MAT_ID` weights, so no id
@@ -46,8 +46,8 @@ Config `configs/glm53flash_AJ_IQ2XXS_spread_offload.toml` (no `cpu_affinity_laye
 
 Changes: row-aligned VRAM slot stride on every layer under the GLM graph (hot aliasing needs it, so the full-layer prefix is
 no longer required); the miss node wraps only the cold-branch ids and the DDR seed skips VRAM-hot experts; model plane
-reads and per-call expert loads run concurrently (miss 4.6 -> 2.9 ms); `MOESTREAM_GLM5NEXT_OFFLOAD_THP=1` (huge pages on
-the arena, -22 ms/token of CPU matmul TLB cost); `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB` puts the next-hottest experts of every
+reads and per-call expert loads run concurrently (miss 4.6 -> 2.9 ms); `ZEROMOE_GLM5NEXT_OFFLOAD_THP=1` (huge pages on
+the arena, -22 ms/token of CPU matmul TLB cost); `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` puts the next-hottest experts of every
 layer on the second GPU (third MUL_MAT_ID branch), assigned inside `configure_partial_experts` so every graph builder sees
 the same split.
 
@@ -67,7 +67,7 @@ Steady-state decode (RTX 3090 + 5060 Ti, 8 CPU threads, page cache dropped befor
 summation order), and from the whole-layer baseline at token 1 (the legacy prefill uses a different hot set).
 Below ~48 GiB of expert DDR the loads show up directly (2.9 ms each); hiding them behind a prefetch is the next lever.
 
-### Logits check (teacher-forced on the whole-layer baseline's 96 tokens; `MOESTREAM_DECODE_LOGITS_DUMP`, `docs/ssd-offload/cmp_logits.py`)
+### Logits check (teacher-forced on the whole-layer baseline's 96 tokens; `ZEROMOE_DECODE_LOGITS_DUMP`, `docs/ssd-offload/cmp_logits.py`)
 
 | comparison | top-1 kept | step-0 max abs logit delta | median / max delta |
 |---|---|---|---|
@@ -87,7 +87,7 @@ Below ~48 GiB of expert DDR the loads show up directly (2.9 ms each); hiding the
   2.2 at 2,100+), the same direction and scale as the GPU-vs-CPU gap above; text stays coherent. This is consistent with
   arithmetic noise but is NOT proof of correctness against an independent reference (e.g. llama.cpp on the same tokens).
 
-**GPU1 branch verified.** `MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0=1` puts the same hot1 expert set (0.6 GiB, 3090 cache shrunk to
+**GPU1 branch verified.** `ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0=1` puts the same hot1 expert set (0.6 GiB, 3090 cache shrunk to
 make room) on the main GPU instead of the 5060 Ti, so the identical kernels run on a different device. Teacher-forced over 24
 steps the logits are bit-identical (max abs delta 0.000, top-1 24/24). The map, mask, weight-ordering and accumulation of the
 third branch are therefore correct; the delta against the CPU-cold placement is GPU-vs-CPU quantized-matmul arithmetic.
@@ -103,17 +103,17 @@ that for new graph nodes plus a thread-safe prefetch path around the cache and a
 
 ### Strict full-graph mode
 
-`MOESTREAM_GLM5NEXT_GRAPH_STRICT=1` turns a declined decode graph into a hard error ("failing the request") instead of the
+`ZEROMOE_GLM5NEXT_GRAPH_STRICT=1` turns a declined decode graph into a hard error ("failing the request") instead of the
 silent fallback to the layered path. Checked both ways: the best configuration runs normally under it (97.1 ms/token over 39
 tokens), and an oversized GPU1 hot set (15.5 GiB, which the graph declines) aborts with the error. It is opt-in because
 prefill still uses the layered path; making it the default needs a graph-only prefill first.
 
 ### Independent check against llama.cpp (neurall's llama-server, same GGUF, `--n-cpu-moe 99`)
 
-Teacher-forced on the same 96 tokens with the engine's own prompt ids (`MOESTREAM_DUMP_PROMPT_TOKENS`), comparing
-log-softmax of MoEStream's raw logits with llama.cpp's top-40 log-probs (`glm_runs/llama_ref.py`, `cmp_llama.py`):
+Teacher-forced on the same 96 tokens with the engine's own prompt ids (`ZEROMOE_DUMP_PROMPT_TOKENS`), comparing
+log-softmax of ZeroMoE's raw logits with llama.cpp's top-40 log-probs (`glm_runs/llama_ref.py`, `cmp_llama.py`):
 
-| MoEStream configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta (llama's top 10) |
+| ZeroMoE configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta (llama's top 10) |
 |---|---|---|
 | original whole-layer baseline | 74/96 | 1.222 |
 | spread hot experts, no offload | 79/96 | 1.222 |
@@ -121,7 +121,7 @@ log-softmax of MoEStream's raw logits with llama.cpp's top-40 log-probs (`glm_ru
 
 The offload and GPU1 branch do not move the engine further from the independent reference; the best configuration sits at the
 same distance as the original baseline, and at step 0 the spread variants pick `#` like llama.cpp while the whole-layer baseline
-picks `A`. The ~1.2 logprob gap to llama.cpp is common to all of them (a MoEStream-vs-llama.cpp difference, not introduced here).
+picks `A`. The ~1.2 logprob gap to llama.cpp is common to all of them (a ZeroMoE-vs-llama.cpp difference, not introduced here).
 
 **Tokenizer finding.** For the test prompt the engine tokenizes "mixture-of-experts" as `' mixture' '-' 'of' '-' 'exp' 'erts'`
 (20933 12 1055 12 4580 15534) whereas llama.cpp produces `' mixture' '-of' '-exp' 'erts'` (20933 8667 18347 15534). The engine's
@@ -131,7 +131,7 @@ BPE misses merges, so the two engines never saw identical prompts before this co
 mixed whitespace, tokenize identically to llama.cpp, so the 24 prompt ids are the same in both engines). Teacher-forced on the
 fixed whole-layer baseline's 96 tokens, `glm_runs/v2/`:
 
-| MoEStream configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta |
+| ZeroMoE configuration | steps where top-1 == llama.cpp | median mean-abs logprob delta |
 |---|---|---|
 | original whole-layer baseline | 87/96 | 1.220 |
 | spread + DDR/SSD offload + GPU1 hot (best config, 9.57 tok/s on this prompt) | 84/96 | 1.250 |
@@ -168,7 +168,7 @@ residual stream. History-only predictors are much worse (`bench/next_layer_predi
 co-occurrence from the current layer's routed set gives precision@4 = 20.1% (15.6% on cold experts), a static usage prior 5.4%
 (random is 2.8%).
 
-### Corrected: next-layer prediction from exact hidden states (probe dump, `MOESTREAM_PROBE_DUMP`)
+### Corrected: next-layer prediction from exact hidden states (probe dump, `ZEROMOE_PROBE_DUMP`)
 
 The engine's own pilot statistic (above, ~55% precision@4) turns out to be far below what the model's routing allows. Dumping the real
 post-attention residual of each layer and the real router scores of every layer (6 prompts, ~3.2k tokens per layer; code/docs prompts,
@@ -201,7 +201,7 @@ old snapshot on the same layers and token.
 
 ### Qwen3.8-Flash-Next (Q2_0): pilot and pilot + ridge
 
-Probe taps in the Qwen full graph (`MOESTREAM_QWEN4EXP_PROBE_DUMP`: FFN input of every layer and its router probabilities), 6 prompts (~580-890 tokens, 64 decode
+Probe taps in the Qwen full graph (`ZEROMOE_QWEN4EXP_PROBE_DUMP`: FFN input of every layer and its router probabilities), 6 prompts (~580-890 tokens, 64 decode
 tokens each) on the accepted early-ready profile; pilot = layer l+1's router applied to layer l's FFN input, precision vs the real top-10 of layer l+1,
 leave-one-prompt-out, 47 layer pairs (`bench/next_layer_probe_fit_qwen.py`):
 
@@ -220,7 +220,7 @@ In the 48 GiB / GPU1-hot configuration 43.7% of routed experts are cold (17,131 
 ~0.45 ms on the CPU). Restricting the pilot to non-hot experts (hot set approximated from the usage ranking at the same budget), staging the top-k:
 top-2 82.1% precision / 37% of cold routes, top-3 73.9% / 50%, top-4 66.1% / 60%, top-6 52.8% / 72%.
 
-### In-graph pilot + VRAM staging ring (`MOESTREAM_GLM5NEXT_PILOT_STAGE=K`, default off)
+### In-graph pilot + VRAM staging ring (`ZEROMOE_GLM5NEXT_PILOT_STAGE=K`, default off)
 
 Built in `src/ggml_glm5next_graph.cpp`. In decode, layer l's graph ranks layer l+1's COLD experts (next layer's norm + router + bias on layer l's
 pre-FFN activation, VRAM-hot experts masked with -1e9, `argsort_top_k` K) and ONE custom CPU node per layer (`stage_miss_cb`) does everything that needs the
@@ -252,7 +252,7 @@ bookkeeping) or a faster link. Output stays coherent; staging is left opt-in.
 ABBA (warm-up, none, K=1, K=1, none; same config, 100-token steady state): none 101.6 / 101.9 ms, K=1 100.9 / 100.6 ms, i.e. -1.0 ms (-1.0%), consistent but
 within what this box's run-to-run spread allows (100.7-102.4 ms for identical no-staging runs). Staging at K=1 is neutral, not a speedup.
 
-Pinned-arena variant (`MOESTREAM_GLM5NEXT_OFFLOAD_PIN=1`, now opt-in; `cudaHostRegister` on every populated expert slot, unregister before eviction, the staging
+Pinned-arena variant (`ZEROMOE_GLM5NEXT_OFFLOAD_PIN=1`, now opt-in; `cudaHostRegister` on every populated expert slot, unregister before eviction, the staging
 worker DMAs straight from the arena with no CPU copy; all 3 planes of every seeded expert registered, 0 failures): works functionally (`direct_pieces` > 0), but at
 DDR=16 GiB it raised host memory in use from 57 GB to 80 GB (+23 GB for 2,607 pinned experts = 17.5 GB of data) at identical process RSS, and an earlier 48 GiB
 run drove the box to 124 GB used / 39 GB swap before I killed it. A pinned arena of the 48 GiB size does not fit next to the engine's other memory on this 125 GB host,

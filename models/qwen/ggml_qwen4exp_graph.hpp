@@ -6,9 +6,9 @@
 
 struct StreamingEngine;
 
-// Enabled only when MOESTREAM_QWEN4EXP_FULL_GRAPH=1 is present.  The mode is
-// The prefill graph is enabled by MOESTREAM_QWEN4EXP_FULL_GRAPH=1.  Decode
-// additionally requires MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1, keeping the
+// Enabled only when ZEROMOE_QWEN4EXP_FULL_GRAPH=1 is present.  The mode is
+// The prefill graph is enabled by ZEROMOE_QWEN4EXP_FULL_GRAPH=1.  Decode
+// additionally requires ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1, keeping the
 // established layered decode path as the default and as the fallback.
 bool qwen4exp_full_graph_enabled();
 bool qwen4exp_full_graph_decode_enabled();
@@ -21,9 +21,9 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine);
 
 // Startup warmup that loads prompt-independent static weight arenas before the
 // first request. Enabled by default for full-graph decode; set
-// MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP=0 to keep lazy preparation. The prompt
+// ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP=0 to keep lazy preparation. The prompt
 // shape defaults to 16 and can be set with
-// MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS.
+// ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS.
 bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine);
 
 // Number of complete early MoE layers whose expert tensors should be placed

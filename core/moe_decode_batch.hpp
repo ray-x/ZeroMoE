@@ -1,7 +1,7 @@
 // moe_decode_batch.hpp — prototype: grouped, low-overhead decode-time (S==1)
 // routed-expert FFN dispatch.
 //
-// CONTEXT (2026-09-10 decode-gap investigation): MoEStream's real decode
+// CONTEXT (2026-09-10 decode-gap investigation): ZeroMoE's real decode
 // bottleneck is NOT expert compute -- a live measurement on qwen4exp found
 // the `expert` bucket at ~77% of decode wall time while the actual GPU
 // matmul time inside it (`gpu=[up/cmp/dn]`) was only ~7% of that bucket.

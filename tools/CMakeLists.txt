@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(MoEStreamTools LANGUAGES CXX)
+project(ZeroMoETools LANGUAGES CXX)
 
 # The parent CMakeLists sets the global C++ standard; do not override it here.
 if(NOT CMAKE_CXX_STANDARD)

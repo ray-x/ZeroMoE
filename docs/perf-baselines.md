@@ -29,9 +29,9 @@ Prefetch ring on (2 sets, drain, chunk 2), DDR pool 60-76 GiB, batch default 204
 ## Qwen 3.8 Flash (UD-IQ1_M), single 3090
 
 Config: `configs/qwen4exp_3090_only.toml` (`moe_cache_gb = 11.5`, `context_size = 8192`), env as in the Qwen decode
-harness: `MOESTREAM_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_LAYERS=0 ..._GRAPH_PRELOAD_TRAILING=1
-MOESTREAM_QWEN_CPU_THREADS=10 MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1`. Since 2026-10-16 the prefill scheduler runs the
-host-resident experts on the GPU (`MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD`, default 1; one pipeline copy; ggml patch 0007).
+harness: `ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_LAYERS=0 ..._GRAPH_PRELOAD_TRAILING=1
+ZEROMOE_QWEN_CPU_THREADS=10 ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1`. Since 2026-10-16 the prefill scheduler runs the
+host-resident experts on the GPU (`ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD`, default 1; one pipeline copy; ggml patch 0007).
 
 | metric | baseline | date | notes |
 |---|---|---|---|
@@ -46,8 +46,8 @@ host-resident experts on the GPU (`MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD`, defau
 
 ### Qwen decode baselines by placement (measured 2026-10-16, `build_native`, 3090 only, 10 CPU threads)
 
-Env for all rows: `CUDA_VISIBLE_DEVICES=0 MOESTREAM_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_TRAILING=1`
-(`GRAPH_PRELOAD_LAYERS=40` for the split, `0` for the hybrid), `MOESTREAM_BENCH_SILENT=1 MOESTREAM_BENCH_IGNORE_STOP=1`.
+Env for all rows: `CUDA_VISIBLE_DEVICES=0 ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ..._FULL_GRAPH_DECODE=1 ..._GRAPH_PRELOAD_TRAILING=1`
+(`GRAPH_PRELOAD_LAYERS=40` for the split, `0` for the hybrid), `ZEROMOE_BENCH_SILENT=1 ZEROMOE_BENCH_IGNORE_STOP=1`.
 
 | placement | config | metric | baseline | notes |
 |---|---|---|---|---|
@@ -85,7 +85,7 @@ placement; GLM's selection beyond top-k has consistency evidence only (no indepe
 
 ## GLM-5.3 (UD-IQ2_M, glm-dsa), layered path, 3090 + dense on 5060 Ti (2026-10-18)
 
-426-token prompt, 48 new tokens, temperature 0, `MOESTREAM_DENSE_SCRATCH_RESERVE_MB=768`. Single samples.
+426-token prompt, 48 new tokens, temperature 0, `ZEROMOE_DENSE_SCRATCH_RESERVE_MB=768`. Single samples.
 
 | Setup | Decode tok/s | Prefill tok/s | Disk GB/s | Hit |
 |---|---|---|---|---|
@@ -95,9 +95,9 @@ placement; GLM's selection beyond top-k has consistency evidence only (no indepe
 The mirror gives about +9% decode and +1% prefill (single sample, identical output). Prefill still reads ~150 GB per 426-token prompt on
 this path; only a batched graph prefill, where each cold expert is read once per batch, can approach 10 tok/s.
 
-GLM_DSA full graph (opt-in: `MOESTREAM_GLM_DSA_FULL_GRAPH=1`, `..._PREFILL=1`; branch `glm53-layered-speed`), same 426-token prompt,
-3090 only as the dense+moe device (`logs/glm53_dsa_graph.toml`, 4 GiB VRAM expert cache), SSD offload store of the 12,480 coldest experts
-(`gguf_tool offload`, 132.7 GiB on /data, byte-verified) and a 45 GiB DDR pool (`MOESTREAM_GLM5NEXT_OFFLOAD_*`, see `logs/run_dsa_graph_426.sh`):
+GLM_DSA full graph (opt-in: `ZEROMOE_GLM_DSA_FULL_GRAPH=1`, `..._PREFILL=1`; branch `glm53-layered-speed`), same 426-token prompt,
+3090 only as the dense+moe device (`obsolete/glm53-logs-scripts/glm53_dsa_graph.toml`, 4 GiB VRAM expert cache), SSD offload store of the 12,480 coldest experts
+(`gguf_tool offload`, 132.7 GiB on /data, byte-verified) and a 45 GiB DDR pool (`ZEROMOE_GLM5NEXT_OFFLOAD_*`, see `obsolete/glm53-logs-scripts/run_dsa_graph_426.sh`):
 
 | Phase | tok/s | Note |
 |---|---|---|
@@ -108,8 +108,8 @@ Output is coherent and the 17-token sky prompt reproduces the layered answer ("R
 path is still to do. A 64 GiB pool exhausts host RAM (MemAvailable < 20 GB, decode graph declines); ~45-50 GiB is the ceiling with 14 GiB of live host data.
 The graph needs the dense weights on the same GPU as its workspace: with the 5060 Ti as the core device it had 0.14 GiB free and declined.
 
-GLM_DSA full graph on BOTH GPUs (3090 = dense + graph device with a 4 GiB expert cache, 5060 Ti = 11 GiB of hot experts via `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=11`,
-45 GiB DDR pool; `logs/glm53_dsa_graph2gpu.toml`, `logs/run_dsa_graph2gpu_426.sh`), same 426-token prompt:
+GLM_DSA full graph on BOTH GPUs (3090 = dense + graph device with a 4 GiB expert cache, 5060 Ti = 11 GiB of hot experts via `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=11`,
+45 GiB DDR pool; `obsolete/glm53-logs-scripts/glm53_dsa_graph2gpu.toml`, `obsolete/glm53-logs-scripts/run_dsa_graph2gpu_426.sh`), same 426-token prompt:
 
 | Phase | tok/s | Note |
 |---|---|---|
@@ -126,8 +126,8 @@ the KV state, otherwise the seed fails and the decode graph is declined.
 |---|---|---|---|
 | baseline (2 GPU, 6 CPU threads) | 5.12 | 1160 ms | |
 | + sparse mid-tier mirror on KIOXIA (1,246 experts, 13.3 GiB) | 5.00 | 1377 ms | WORSE: KIOXIA already served ~78% of reads (store 17.9k + mirror 2.0k vs Samsung ~5.6k) |
-| + split reads (`MOESTREAM_GLM5NEXT_OFFLOAD_SPLIT=1`: store experts read gate/up-down across both drives, 3.5 ms vs 7.5 ms per read in isolation, bytes identical) | 4.89 | 1164 ms | no change: the SSDs are NOT the bottleneck |
-| + 14 CPU threads (`MOESTREAM_GLM5NEXT_CPU_THREADS=14`) | 6.18 | 1311 ms | prefill +21%, decode worse: cold-expert MUL_MAT_ID (225 nodes) runs on the CPU |
+| + split reads (`ZEROMOE_GLM5NEXT_OFFLOAD_SPLIT=1`: store experts read gate/up-down across both drives, 3.5 ms vs 7.5 ms per read in isolation, bytes identical) | 4.89 | 1164 ms | no change: the SSDs are NOT the bottleneck |
+| + 14 CPU threads (`ZEROMOE_GLM5NEXT_CPU_THREADS=14`) | 6.18 | 1311 ms | prefill +21%, decode worse: cold-expert MUL_MAT_ID (225 nodes) runs on the CPU |
 | + `PREFILL_OP_OFFLOAD=1` | crash | | `CUDA error: invalid argument` in ggml_backend_cuda_set_tensor_async during prefill |
 
 Conclusion: drive bandwidth is not what limits the graph (halving read time changed nothing). Prefill is limited by the CPU matmuls of experts outside VRAM,
@@ -137,7 +137,7 @@ prefill only, getting op-offload to work with the offload arena, and a larger VR
 ### GLM_DSA graph prefill: 12.2 tok/s with GPU op-offload (2026-10-19)
 
 Per-op profile of the 6.2 tok/s prefill: 61 of 69 s were `MUL_MAT_ID` on the CPU (iq2_xxs 41.2 s, iq3_xxs 18.8 s); everything on the GPUs was under 1 s. Letting the
-scheduler run the host-resident expert matmuls on the GPU (`MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1`) removes that:
+scheduler run the host-resident expert matmuls on the GPU (`ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1`) removes that:
 
 | Prefill, 426 tokens, both GPUs, 45 GiB pool | tok/s | Wall |
 |---|---|---|
@@ -150,7 +150,7 @@ Output text identical to the CPU-matmul run (181 chars compared). Decode is unch
 It needs a ggml that has (a) `patches/ggml/0006` (batched MMQ treats negative ids as inactive; the prebuilt `moestream-build-upstream-master` ggml-cuda dates from Oct 4, before it, and
 crashes with `illegal memory access`) and (b) `patches/ggml/0007` (arena-safe expert copy; without it: `CUDA error: invalid argument`, or `GGML_ASSERT(id >= 0 ...)` on the -1 route ids). The in-tree build
 did not apply 0007 by itself; it was applied by hand to a private copy of the committed integration source (`~/work/ggml-0006-src`), built as `build_g6`
-(`cmake -S . -B build_g6 -DMOESTREAM_GGML_ROOT=<that ggml> -DCMAKE_CUDA_ARCHITECTURES="86;120" ...` with no PREBUILT dir). Run with `logs/run_dsa_graph2gpu_426.sh`.
+(`cmake -S . -B build_g6 -DZEROMOE_GGML_ROOT=<that ggml> -DCMAKE_CUDA_ARCHITECTURES="86;120" ...` with no PREBUILT dir). Run with `obsolete/glm53-logs-scripts/run_dsa_graph2gpu_426.sh`.
 
 ### GLM_DSA graph decode: pilot prefetch (2026-10-19, 426-token prompt, 48 new tokens, both GPUs, 45 GiB pool, single runs)
 
@@ -165,7 +165,7 @@ Decode profile before prefetch (per token): SSD-miss callback 649 ms (169 misses
 | same, `PILOT_LOOKAHEAD=3` | 1019 ms | | 0.69 |
 | same, lookahead 2, 8 CPU threads, `OFFLOAD_THP=1` | 1049 ms | | 0.66 |
 
-Best config: `logs/ab_pilot.sh` env minus the swept knobs. Target 1.7 tok/s decode is not reached; 590 ms/token would be needed. Remaining per-token cost at the best config: ~417 ms miss
+Best config: `obsolete/glm53-logs-scripts/ab_pilot.sh` env minus the swept knobs. Target 1.7 tok/s decode is not reached; 590 ms/token would be needed. Remaining per-token cost at the best config: ~417 ms miss
 callback, ~350 ms CPU expert matmuls, ~75 ms GPU. Known issue: `CUDA error: driver shutting down` at process exit after the pilot stage runs (output complete; teardown order).
 
 ### GLM_DSA graph: DDR pool size and GPU1 hot set (2026-10-19, best pilot config, 426-token prompt, single runs)
@@ -183,9 +183,9 @@ A bigger pool buys ~10% on the decode step up to 60 GiB; at 64 GiB host memory h
 
 ### GLM_DSA graph: correctness check against layered, corrected numbers, GPU utilisation (2026-10-19)
 
-**Correctness.** Greedy (temp 0) comparison with the layered path (`logs/check/`): "What is the capital of France?" -> `Paris`; a 399-token prompt with a planted code -> `7391`
+**Correctness.** Greedy (temp 0) comparison with the layered path (`obsolete/glm53-logs-scripts/check/`): "What is the capital of France?" -> `Paris`; a 399-token prompt with a planted code -> `7391`
 (recalled from the middle of the context). The graph with 11 GiB of hot experts on the 5060 Ti prepends an extra `</think>` token on both prompts and in every earlier 2-GPU run; the graph
-with `GPU1_HOT_GIB=0`, or with `MOESTREAM_GLM5NEXT_PREFILL_GPU1=0` (hot experts computed through the cold branch during prefill), matches layered exactly. So the in-place GPU1 hot-expert
+with `GPU1_HOT_GIB=0`, or with `ZEROMOE_GLM5NEXT_PREFILL_GPU1=0` (hot experts computed through the cold branch during prefill), matches layered exactly. So the in-place GPU1 hot-expert
 compute in the batched prefill graph is wrong for this model (cause not yet found; decode with GPU1 hot experts is fine). **All earlier 2-GPU numbers in this file that did not set
 `PREFILL_GPU1=0` ran with that defect** (prefill 12.2-12.8 tok/s; they are speed-only, the text diverged from layered).
 
@@ -239,8 +239,8 @@ Same config as above (K=8, 54 GiB pool, 426-token prompt, 35 steady steps), run 
 
 ## GLM-5.3 (glm-dsa) decode route survey: ranking refit does not help (2026-10-19)
 
-Hypothesis: the DSA usage file (`.moestream_usage_glm53_ud_iq2m`, 35,400 counts) is thin, so a decode-only route survey
-(`MOESTREAM_GLM5NEXT_ROUTE_TRACE`, 4 prompts x 47 decode tokens x 75 MoE layers, `logs/survey_dsa_all.sh`) could raise the
+Hypothesis: the DSA usage file (`.zeromoe_usage_glm53_ud_iq2m`, 35,400 counts) is thin, so a decode-only route survey
+(`ZEROMOE_GLM5NEXT_ROUTE_TRACE`, 4 prompts x 47 decode tokens x 75 MoE layers, `obsolete/glm53-logs-scripts/survey_dsa_all.sh`) could raise the
 resident-set hit rate and cut SSD bytes/token (needed: ~-40% for 1.7 tok/s).
 
 Leave-one-prompt-out, fraction of routed experts inside the top-N ranked set (base = existing file; refit = base + 3 training prompts):
@@ -260,7 +260,7 @@ Decode stays ~1.0 tok/s (~970 ms/step, SSD-bound); 1.7 tok/s is not reached.
 
 Standalone random reads of 3.6 MB on the two drives (concurrent): O_DIRECT 3.3 GB/s (model drive, ~0.15 cores) + 2.85 GB/s (store drive);
 buffered+fadvise reaches the same 3.35 GB/s but burns ~1.44 cores. The engine only achieves ~3-3.7 GB/s combined, so `ModelReader` was made to
-read aligned planes with O_DIRECT (`MOESTREAM_GLM5NEXT_MODEL_DIRECT=1`; counter `model planes: direct=54533 buffered=0` confirms it is taken).
+read aligned planes with O_DIRECT (`ZEROMOE_GLM5NEXT_MODEL_DIRECT=1`; counter `model planes: direct=54533 buffered=0` confirms it is taken).
 
 Same config (54 GiB pool, pilot stage 8, UD-IQ2_M, 426-token prompt, 48 new tokens, preflight-gated, cold cache):
 
@@ -291,8 +291,8 @@ Prefetch is already issued one layer ahead (lookahead 2); the demand misses that
 
 Config `logs/glm53_dsa_core5060.toml` (5060 Ti `dense+moe`, 3090 `moe`, MLA qabsorb/score GPU caches off, 5060 `moe_cache_gb = 0`), 45 GiB DDR pool, 426-token prompt, `PREFILL_GPU1=0`, `GPU1_HOT_GIB=19`.
 
-**OOM cause and fix.** Dense arena (~13 GiB) + CUDA context + the legacy MLA qabsorb/WUV/mirror GPU caches (~2.4 GB) left 0.02-0.13 GiB free on the 5060 Ti, so every prefill batch declined; later the 2 GiB graph-allocator floor (`graph_alloc_vram_headroom_ok`) refused the build at 1.33 GiB free. Fixed by turning the legacy MLA GPU caches off in the config and running with `MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=768` (0.40 GiB left on the 5060 Ti after the build, so there is no margin for a bigger batch or longer KV).
-The graph's hardcoded "second GPU = device 1" is now `second_gpu_device(core)` (backend, hot-expert buffers, offload ring, assist device). Hot experts are now preloaded onto the non-core GPU at boot (`MOESTREAM_GLM5NEXT_GPU1_HOT_PRELOAD=0` turns it off): 19 GiB in 17.5 s, previously uploaded during the first decode graph build.
+**OOM cause and fix.** Dense arena (~13 GiB) + CUDA context + the legacy MLA qabsorb/WUV/mirror GPU caches (~2.4 GB) left 0.02-0.13 GiB free on the 5060 Ti, so every prefill batch declined; later the 2 GiB graph-allocator floor (`graph_alloc_vram_headroom_ok`) refused the build at 1.33 GiB free. Fixed by turning the legacy MLA GPU caches off in the config and running with `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=768` (0.40 GiB left on the 5060 Ti after the build, so there is no margin for a bigger batch or longer KV).
+The graph's hardcoded "second GPU = device 1" is now `second_gpu_device(core)` (backend, hot-expert buffers, offload ring, assist device). Hot experts are now preloaded onto the non-core GPU at boot (`ZEROMOE_GLM5NEXT_GPU1_HOT_PRELOAD=0` turns it off): 19 GiB in 17.5 s, previously uploaded during the first decode graph build.
 
 | Layout | Prefill tok/s | Steady decode | Decode tok/s (40 tok, incl. build) |
 |---|---|---|---|
@@ -311,12 +311,12 @@ Same config (`glm53_dsa_core5060.toml`, 426-token prompt, NGEN 40, `PREFILL_GPU1
 |---|---|---|---|---|
 | 5 | no pilot, hot 11 GiB, 45 GiB pool | 11.40 | 1095 | 0.82 |
 | 6 | pilot stage 8 / prefetch 8 / copy 0 / lookahead 2, hot 16, 54 GiB | 11.76 | 1083 | 0.78 |
-| 7 | + `MOESTREAM_GLM_DSA_CPU_LANE=1`, build_g6 (ggml without the early-CPU hook, lane could not build), hot 11 | 11.39 | 927 | 0.88 |
+| 7 | + `ZEROMOE_GLM_DSA_CPU_LANE=1`, build_g6 (ggml without the early-CPU hook, lane could not build), hot 11 | 11.39 | 927 | 0.88 |
 | 8 | same as 7 on build_g7 (ggml-0006 + early-CPU hook): lane enabled, GPU assist engaged | 8.44 | 872 | 0.93 |
 | 9 | build_g7, lane off (CPU_LANE unset) | 11.64 | 900 | 0.91 |
 
 Findings:
-- `GlmDsaGraphModel::supports_cpu_lane()` was missing (the lane never existed for GLM_DSA); it is now gated by `MOESTREAM_GLM_DSA_CPU_LANE=1`. The lane also needs a ggml with the `moestream_ggml_sched_early_cpu` scheduler hook (`/home/ray/work/ggml-0006-early`, `build_g7`).
+- `GlmDsaGraphModel::supports_cpu_lane()` was missing (the lane never existed for GLM_DSA); it is now gated by `ZEROMOE_GLM_DSA_CPU_LANE=1`. The lane also needs a ggml with the `zeromoe_ggml_sched_early_cpu` scheduler hook (`/home/ray/work/ggml-0006-early`, `build_g7`).
 - With the lane on, the GPU-assist ring runs only ~1.6 experts/token (14 layer-runs per 16 tokens), so the gain over lane-off is ~3% (872 vs 900 ms), within noise. Trial 8's prefill (8.44) is 27% below trials 7/9 (11.4-11.6); not diagnosed (lane on only in 8; variance or a lane side effect). Lane stays off by default.
 - Prediction (pilot l+1 precision by rank): r1 96-97%, r2 89-90%, r3 81-82%, r4 66-69%, r5 56-57%, r6 41-45%, r7 33-34%, r8 25-27%. Misses are already under 1 per layer (~62 SSD loads/token at ~5.2 ms, ~306 ms/token of reads); the rest of the ~900 ms step is CPU cold-expert MUL_MAT_ID plus ~75 ms GPU. GPU utilisation 1-6%. Better prediction is not the lever at this point.
 - The 3090 holds only the 11 GiB hot set (preloaded at boot, 11-12 s); `[VRAM-SLOTS] 0 / 349` in graph mode, i.e. the old usage-ranked pinned/LRU VRAM fill at boot is not replicated.
@@ -349,7 +349,7 @@ Prefetch 5 is the best setting so far (+7% over 8). Prefetch 3 loses too many pr
 
 Trial 15 (PREFETCH=5, GPU1_HOT_GIB 11 -> 15): prefill 11.75, decode 0.86 tok/s (-17% vs trial 13). Lane compute 700 ms/token, split stall 341, SSD read 522 ms/token (misses 106/token). Boot preload took 122 s (vs 12.5 s), so host memory was under pressure; a larger hot set did not pay. Keep GPU1_HOT_GIB=11. Best config remains trial 13 (1.04 decode / 11.62 prefill).
 
-Trial 16 (trial 13 config, MOESTREAM_GLM5NEXT_CPU_THREADS 6 -> 10): prefill 11.35, decode 0.92 tok/s (-12% vs trial 13). Lane compute rose 614 -> 742 ms/token and SSD read per load 5.2 -> 6.0 ms: extra decode threads contend with the prefetch/IO workers rather than speeding the expert kernels. Keep CPU_THREADS=6.
+Trial 16 (trial 13 config, ZEROMOE_GLM5NEXT_CPU_THREADS 6 -> 10): prefill 11.35, decode 0.92 tok/s (-12% vs trial 13). Lane compute rose 614 -> 742 ms/token and SSD read per load 5.2 -> 6.0 ms: extra decode threads contend with the prefetch/IO workers rather than speeding the expert kernels. Keep CPU_THREADS=6.
 
 Summary of lossless levers tried on the dense-on-5060 Ti config (426-token prompt, NGEN=40): best is trial 13 (PILOT_PREFETCH=PILOT_STAGE=5, LOOKAHEAD=2, PILOT_COPY=0, lane on, GPU1_HOT_GIB=11, CPU_THREADS=6) = 1.04 decode / 11.62 prefill. Target 1.7 decode (~590 ms/step) is not reached; remaining cost is CPU cold-expert compute (~610 ms/token) + split stall (~270 ms/token) + SSD reads (~436 ms/token, overlapped).
 
@@ -357,7 +357,7 @@ Trial 17 (trial 13 config, CPU_THREADS=4): prefill 11.59, decode 0.96 tok/s (-8%
 
 Trial 18 (trial 13 config + second GPU assist on the 5060 Ti, ASSIST2_DEVICE=1, 3 slots): prefill 11.56, decode 1.07 tok/s (+3% vs trial 13, inside run-to-run noise). Assisted experts rose 3004 -> 3455 per 32 tokens (~94 -> 108/token) and lane compute fell 614 -> 602 ms/token, split stall 267 -> 253, but the SSD read (427 ms/token, 5.1 ms per load) and the CPU compute that remains still set the step. Best decode so far 1.04-1.07 tok/s; target 1.7 not reached.
 
-Trial 19 (trial 18 config, same shape as the old layered 1.18 run: 22-token prompt, NGEN=80): decode 1.11 tok/s by the Rates line (80 tokens / 71.9 s), 1.15 tok/s first-to-last output, prefill 1.76 tok/s (22 tokens). Old layered engine (MoEStream_v18/v19 `CLAUDE.v4.md`, `perf-tuning-prefetch.md`): 1.10-1.12 on the same 80-token shape, 1.16-1.18 on the shorter 40-token A/B. So on an identical shape the full graph is at parity with the layered engine, not better. Lane compute 570-620 ms/token, split stall ~300, and the cold-start SSD read falls from 770 to 534 ms/token over the run (10.9 -> 6.4 ms per load as the pool warms), so short runs under-state steady state.
+Trial 19 (trial 18 config, same shape as the old layered 1.18 run: 22-token prompt, NGEN=80): decode 1.11 tok/s by the Rates line (80 tokens / 71.9 s), 1.15 tok/s first-to-last output, prefill 1.76 tok/s (22 tokens). Old layered engine (ZeroMoE_v18/v19 `CLAUDE.v4.md`, `perf-tuning-prefetch.md`): 1.10-1.12 on the same 80-token shape, 1.16-1.18 on the shorter 40-token A/B. So on an identical shape the full graph is at parity with the layered engine, not better. Lane compute 570-620 ms/token, split stall ~300, and the cold-start SSD read falls from 770 to 534 ms/token over the run (10.9 -> 6.4 ms per load as the pool warms), so short runs under-state steady state.
 
 Trial 19 follow-up (SSD split A/B, 22-token prompt, NGEN=80, run under `systemd-run --user --scope -p MemorySwapMax=0`, swap 0 B at the end; opt-in knobs in `memory/offload_store.hpp`, default off): default plane alternation decode 1.08-1.09 tok/s (clean control: compute 633, split stall 311, read 543 ms/token, 6.57 ms per load). `SPLIT_MODE=balanced` byte-share split at 0.55: 1.05 (clean) / 1.01 (earlier); at 0.40: 1.02. Both are -3% to -7% vs the default: read rises to 603-630 ms/token and lane compute to ~690 ms/token (more IO contention on the CPU lane). `MODEL_CHUNK_KB=512` parallel chunked model-side preads: 0.90 (measured with swap in use, suspect, but not promising). The mirrored two-NVMe read (store drive + model drive per missed expert) is already what `SplitSource` does; the per-miss latency (~6.5 ms) rather than drive bandwidth (~1.7 of ~6.7 GB/s used) limits it, so re-balancing bytes does not help. Regression >5% for balanced@0.55 noted for the owner; defaults unchanged. Runs with swap in use drifted slower arm over arm (compute 615 -> 785 ms/token), so swap must stay off for benchmarks.
 
@@ -434,7 +434,7 @@ Config as trial 25: 22-token prompt, NGEN=80, 22 GiB 3090 hot set, 64 GiB pool, 
 
 Five worker threads each carry about 7.5% libgomp, 6.3% ggml-cpu and 0.7% ggml-base. The main thread has 6.0% ggml-cpu and 3.6% libcuda. The libgomp samples are one `pause` / counter / compare loop at 0x2c7b0 (27.5% of all samples, objdump of the system libgomp), which is OpenMP barrier spin-wait. IQ3_XXS is 15.8% of samples, so a 1.23x kernel saves at most about 3% of CPU time; that matches the 1.2% observed in trial 25.
 
-Lane thread count (`MOESTREAM_GLM5NEXT_CPU_THREADS`), one run each:
+Lane thread count (`ZEROMOE_GLM5NEXT_CPU_THREADS`), one run each:
 
 | Threads | Decode tok/s | compute ms/token | split stall | read ms/token |
 |---|---|---|---|---|
@@ -485,7 +485,7 @@ Both drives together (qd2 each): about 3.05 + 3.47 = 6.5 GB/s. The Samsung's PCI
 
 Correction: earlier in this session I estimated 1.7 GB/s per load using 10.9 MB per expert, a figure from an older note. The `[GGML-GLM5NEXT-STAGE] ring ready` log line gives plane sizes 4030464/4030464/6684672 bytes (14.7 MB per expert, assuming those are one expert's gate/up/down). At 14.7 MB and 6.2-6.5 ms per load that is about 2.3-2.4 GB/s per load, the same as one drive at queue depth 1. About 56 loads per token is about 825 MB per token.
 
-### Trial 29: MADV_FREE eviction (MOESTREAM_OFFLOAD_EVICT=free), interleaved A/B x2
+### Trial 29: MADV_FREE eviction (ZEROMOE_OFFLOAD_EVICT=free), interleaved A/B x2
 
 Standalone, reading 6.5 MB O_DIRECT into freshly faulted pages is 25-40% slower than into warm pages (store drive 1.87-1.92 vs 2.64-2.66 GB/s; model drive 1.63-2.24 vs 2.75), which suggested the engine's MADV_DONTNEED eviction costs read bandwidth. End to end it does not: 22-token prompt, NGEN=80, 64 GiB pool, swap-free.
 
@@ -522,13 +522,13 @@ Cutting speculative reads shortens each demand read (6.4 -> 4.6 ms) but converts
 |---|---|---|---|---|
 | prefetch/stage 3 (Trial 31) | 1.50 | 404 | 183 | 5.6 |
 | prefetch/stage 3 repeat | 1.50 | 404 | 183 | 5.6 |
-| prefetch/stage 3 + MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 | 1.53 | 390 | 168 | 5.4 |
+| prefetch/stage 3 + ZEROMOE_GLM5NEXT_MODEL_DIRECT=1 | 1.53 | 390 | 168 | 5.4 |
 
 The 3/3 result reproduces exactly (1.50 twice vs 1.43-1.44 for the default 5/5 in three runs), so about +4% is probably real, not noise. O_DIRECT on the model drive adds about +2% on top (single run). Both are small; together about 1.53 tok/s, still 10% short of 1.7. Neither is made default yet.
 
 Coherence check (last run's stdout, prefetch 3/3): the 22-token prompt continues as a coherent, well-formed transformer-generation explanation ("# How a Transformer Language Model Generates Text ..."). Prefetch depth and O_DIRECT only change when bytes are read, not which experts are computed, so the other arms are lossless by construction; only the final arm's text was inspected because the shared stdout file is overwritten each run.
 
-### Trial 33: per-side split read timing (MOESTREAM_SPLIT_TIMING=1, default off), prefetch 3/3, decode 1.49 tok/s
+### Trial 33: per-side split read timing (ZEROMOE_SPLIT_TIMING=1, default off), prefetch 3/3, decode 1.49 tok/s
 
 Cumulative mean over the first 11000 split reads (includes prefill and prefetch reads, so it is a contention-inflated figure, not the demand-only latency): store drive side 6.0 ms, model drive side 7.5 ms, whole read (join of both) 8.3 ms. The model side is the slower one (buffered reads by default; O_DIRECT was +2% in Trial 32), and the join pays for the slower side on every read.
 
@@ -545,7 +545,7 @@ Why pipelining per-expert compute is not the next lever: most layers have 0-1 pe
 
 Chunking and MADV_FREE are within run-to-run spread (about +-0.03). Balanced split is a -12% regression (>5%): it puts more bytes on the slower model drive. All three knobs are closed; the best recipe is prefetch/stage 3 + MODEL_DIRECT=1, about 1.53 tok/s (+7% over the 1.43-1.44 default).
 
-Note (queue27): `MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1` aborts this graph at `early_ready_lane.hpp:728` ("early-ready marker requires the scheduler bridge"), so it cannot be used to profile the full-graph lane path. Known out-of-lane cost: LM head about 50 ms/token (3.98 s / 80 tokens).
+Note (queue27): `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING=1` aborts this graph at `early_ready_lane.hpp:728` ("early-ready marker requires the scheduler bridge"), so it cannot be used to profile the full-graph lane path. Known out-of-lane cost: LM head about 50 ms/token (3.98 s / 80 tokens).
 
 ### Trial 35: recipe (prefetch/stage 3 + MODEL_DIRECT=1) vs default, 56 GiB pool, NGEN=48, swap-free
 
@@ -605,9 +605,9 @@ Prefetch reads waited (bounded 30 ms) while a demand read was pending (opt-in en
 
 Short prompt, recipe: 66 GiB 1.64, 68 GiB 1.73 (loads/64 tok 3880 / 3747 vs 3904 at 64 GiB). The load reduction is about 4% and the throughput change is inside the noise band. Both fit the 20 GiB MEM-GUARD on the short prompt. The 20 GiB floor is `MemoryGuard::kMinimumHostReserveMiB` (unit-tested); not lowered. Pool size beyond 64 GiB is worth at most about +2-3%.
 
-Note: `/tmp/abrun.sh` is the A/B wrapper; a copy is at `logs/abrun.sh`, but run it from /tmp because `logs/preflight.sh` matches "moestream" in process command lines and flags a wrapper under `moestream-glm53/`.
+Note: `/tmp/abrun.sh` is the A/B wrapper; a copy is at `logs/abrun.sh`, but run it from /tmp because `bench/glm53/preflight.sh` matches "zeromoe" in process command lines and flags a wrapper under `zeromoe-glm53/`.
 
-### Trial 41: bigger DDR pool on the 426-token prompt, MemoryGuard floor 16 GiB (MOESTREAM_MEM_GUARD_FLOOR_MB=16384, experiment-only env)
+### Trial 41: bigger DDR pool on the 426-token prompt, MemoryGuard floor 16 GiB (ZEROMOE_MEM_GUARD_FLOOR_MB=16384, experiment-only env)
 
 Recipe, 22 GiB hot set, c06/c07 toml (host_ram_gb 92/100, pinned budget 70/80), swap-free, NGEN=80, computing-history 426-token prompt. Default floor stays 20 GiB.
 
@@ -627,7 +627,7 @@ At decode with a 64 GiB pool the process held 84.5 GiB anonymous memory plus a 3
 
 ### Trial 43: prompt-adaptive resident set, oracle upper bound (negative)
 
-25-token computing-history prompt, recipe, 64 GiB pool, 22 GiB hot set, swap-free, NGEN=80. Baseline run with `MOESTREAM_GLM5NEXT_ROUTE_TRACE` (80 tokens x 75 layers; 9270 distinct (layer, expert) pairs routed, more than the ~7900 resident): 1.44 tok/s (Rates), 1.50 first-to-last, loads 5752/64 tok, split stall 206 ms/tok. Then a usage file built from that same trace (base counts + 3x trace counts, in-sample = best case for any adaptive scheme): 1.55 (Rates), 1.63 first-to-last, loads 4206 (-27%), but split stall 216 ms/tok (unchanged). Result: a 27% cut in SSD loads is worth +7.6% decode; split stall tracks the number of layers with a pending miss times single-miss latency, not the load count. A real prompt-adaptive scheme would gain less than +7.6%, so with the 78 GiB pool (1.37 long) it cannot reach 1.5. Dynamic VRAM promotion not built.
+25-token computing-history prompt, recipe, 64 GiB pool, 22 GiB hot set, swap-free, NGEN=80. Baseline run with `ZEROMOE_GLM5NEXT_ROUTE_TRACE` (80 tokens x 75 layers; 9270 distinct (layer, expert) pairs routed, more than the ~7900 resident): 1.44 tok/s (Rates), 1.50 first-to-last, loads 5752/64 tok, split stall 206 ms/tok. Then a usage file built from that same trace (base counts + 3x trace counts, in-sample = best case for any adaptive scheme): 1.55 (Rates), 1.63 first-to-last, loads 4206 (-27%), but split stall 216 ms/tok (unchanged). Result: a 27% cut in SSD loads is worth +7.6% decode; split stall tracks the number of layers with a pending miss times single-miss latency, not the load count. A real prompt-adaptive scheme would gain less than +7.6%, so with the 78 GiB pool (1.37 long) it cannot reach 1.5. Dynamic VRAM promotion not built.
 
 ### Trial 44: confidence-based pilot prefetch width (negative, removed)
 
@@ -641,11 +641,11 @@ nsys 12 s window of steady decode (22 tokens), `--cuda-graph-trace=node`, 22-tok
 
 New per-token lane breakdown (22-token prompt, recipe, 64 GiB pool, 1.68-1.72 tok/s): begin_load 50 ms, phase-1 graph 87, phase-2 graph 51, unsplit graph 64, assist wait 15, split stall 157-163. begin_load is host bookkeeping, but 65 ms/token of `madvise(MADV_DONTNEED)` eviction runs (142 evictions/token across lane and prefetch worker) and 15 ms/token of arena-lock wait. Async eviction (victims marked loading, freed by a background task after the read is published; env-gated, removed) was a wash: begin_load 50 -> 17 ms but phase-2 and unsplit graph time rose by about the same (madvise now runs beside the math; TLB-shootdown IPIs hit the compute threads): 1.66 / 1.68 vs 1.68 off.
 
-Upper bound via an experiment-only `MOESTREAM_OFFLOAD_EVICT=none` (never return pages; memory grows, so short runs and small pools only): pool 40 GiB, NGEN=32: 1.32 / 1.28 (default) vs 1.67 / 1.67 (none), +28%; pool 50 GiB, NGEN=24: 1.42 vs 1.91, +34%; begin_load 68 -> 4 ms/token, lane wait 106 -> 29. Process kernel CPU time over 10 s of decode at 50 GiB: 14.4 CPU-s (default) vs 7.5 (none); user time 47 vs 28. At 64 GiB `none` cannot run because prefill's frees are skipped too and the memory guard trips. Evictions per token fall from ~295 (50 GiB) to ~142 (64 GiB), so the gain at 64 GiB should be smaller than +34% but is likely still >10%.
+Upper bound via an experiment-only `ZEROMOE_OFFLOAD_EVICT=none` (never return pages; memory grows, so short runs and small pools only): pool 40 GiB, NGEN=32: 1.32 / 1.28 (default) vs 1.67 / 1.67 (none), +28%; pool 50 GiB, NGEN=24: 1.42 vs 1.91, +34%; begin_load 68 -> 4 ms/token, lane wait 106 -> 29. Process kernel CPU time over 10 s of decode at 50 GiB: 14.4 CPU-s (default) vs 7.5 (none); user time 47 vs 28. At 64 GiB `none` cannot run because prefill's frees are skipped too and the memory guard trips. Evictions per token fall from ~295 (50 GiB) to ~142 (64 GiB), so the gain at 64 GiB should be smaller than +34% but is likely still >10%.
 
 Why it is not simply fixable: the arena is expert-indexed (address = layer base + expert x stride) and eviction bounds RSS by returning pages; the prefill graph also needs that layout. Recycling slots instead of freeing pages needs an expert->slot indirection (lane remap tables, GPU assist, stage worker, pin hooks, hot-set copy, prefill read-in-place), a multi-hour refactor. THP is already disabled for the arena (MADV_NOHUGEPAGE), MADV_FREE was slower (Trial 29), async eviction is a wash. No change adopted; diagnostics (lane breakdown, evict timing) and the `EVICT=none` knob stay (experiment only).
 
-### Trial 47: page-reusing eviction (`MOESTREAM_OFFLOAD_RETARGET=1`) -- peak 2.05 tok/s, long output 1.91 tok/s
+### Trial 47: page-reusing eviction (`ZEROMOE_OFFLOAD_RETARGET=1`) -- peak 2.05 tok/s, long output 1.91 tok/s
 
 Change (`VirtualArena::retarget`, used by `ExpertResidency::begin`): when a miss inserts an expert and the cache evicts a victim, the victim's already-populated pages are moved to the new expert's address with `mremap(MREMAP_MAYMOVE|MREMAP_FIXED|MREMAP_DONTUNMAP)` instead of `madvise(MADV_DONTNEED)` + fresh page faults and zeroing. The vacated range stays an empty anonymous mapping with the same VMA flags (NOHUGEPAGE). Planes of different size move their common prefix and free the tail; any mremap failure falls back to freeing the victim's remaining planes. Prefill (transient path) is untouched. Opt-in via env; 0 failed plane moves in all runs.
 
@@ -661,18 +661,32 @@ Lane breakdown (ms/token) on vs off: begin_load 14 vs 48, lane wait 26 vs 62, sp
 
 Coherence: c_on_a is character-identical to c_off_b (420 chars); other pairs diverge only late (chars 318-410 of ~420), the same near-tie divergence that two retarget-off runs show against each other. 300-token output reads coherently, no repetition.
 
-Long prompt (426-token computing-history prompt, 16 GiB guard floor override, MOESTREAM_MEM_GUARD_FLOOR_MB=16384, host_ram_gb 100): 74 GiB pool: 1.45 and 1.52 Rates (1.52 and 1.59 first-to-last) vs 1.31 without retarget (Trial 41). 78 GiB is refused by the 16 GiB floor, as before.
+Long prompt (426-token computing-history prompt, 16 GiB guard floor override, ZEROMOE_MEM_GUARD_FLOOR_MB=16384, host_ram_gb 100): 74 GiB pool: 1.45 and 1.52 Rates (1.52 and 1.59 first-to-last) vs 1.31 without retarget (Trial 41). 78 GiB is refused by the 16 GiB floor, as before.
 
 Long generation (22-token prompt, NGEN=300, 64 GiB pool, retarget on): 1.91 Rates, 1.94 first-to-last (1.80 overall), lane stall flat at ~178 ms/token to the end, 35k mappings at token 80 (bounded by one mapping per (layer, expert, plane), about 115k worst case vs vm.max_map_count 1,048,576).
 
-Recipe for the best numbers: `MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 MOESTREAM_OFFLOAD_RETARGET=1` (long prompts additionally need the guard-floor override and a 74 GiB pool).
+Recipe for the best numbers: `ZEROMOE_GLM5NEXT_PILOT_PREFETCH=3 ZEROMOE_GLM5NEXT_PILOT_STAGE=3 ZEROMOE_GLM5NEXT_MODEL_DIRECT=1 ZEROMOE_OFFLOAD_RETARGET=1` (long prompts additionally need the guard-floor override and a 74 GiB pool).
 
 Cleanup note: after Trial 47 the measurement-only code was removed (evict/lock timers, retarget counters, `EVICT=none`, balanced split mode, split timing, read chunking, async-eviction); the per-token lane breakdown log line stays. Re-verified on the cleaned build: retarget on 2.09 first-to-last (Rates 1.96) vs off 1.78 (1.68). Memory at peak and the config/scripts are in `docs/GLM5.3-baseline.md` and `bench/glm53/`.
 
-Update (2026-10-20): `MOESTREAM_OFFLOAD_RETARGET` is now on by default whenever SSD offload is active; `=0` disables. See `docs/offload-retarget.md`.
+Update (2026-10-20): `ZEROMOE_OFFLOAD_RETARGET` is now on by default whenever SSD offload is active; `=0` disables. See `docs/offload-retarget.md`.
 
 ## DeepSeek V4.1 Flash (2026-10-21)
 3090 + 5060 Ti, Release, coherent chat-template text at temp 0.8, `configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml`:
 decode about 4.0-4.5 tok/s (about 230 ms/token), up from 0.88 -> 1.30 -> 3.5 over earlier sessions. 10 tok/s target not met.
 Prefill about 29 tok/s on 817 tokens (older measurement). Details, switches and verification:
 `docs/deepseek_v41_changelog_2026-10-21.md`.
+
+## MiMo V2.6 Flash and the Ling gate (2026-10-23, RTX 3090 + RTX 5060 Ti, ggml 0.27 patched build)
+
+| Metric | Baseline | Notes |
+|---|---|---|
+| MiMo decode, 64 tokens, 4 prompts | 13.4–15.7 tok/s | dual-GPU config, 3090 cache 15 GiB + 5060 Ti 14.5 GiB, DDR 100 GiB, 0 SSD reads in decode; `docs/models/mimo26-flash.md` |
+| MiMo prefill, 21 / 146 / 516 / 1022 tokens | 24.6 / 43.8 / 77.0 / 80.4 tok/s | 512-token chunks, op-offload from 256 tokens |
+| Ling short decode (`[REQUEST-DECODE-OUTPUT]`, 32 tokens) | 10.07 tok/s (10.1–10.4 measured) | gate: `bench/ling/reference-audit/run.sh`, tokens compared within the same tree |
+
+Numbers are warm: the first run after a fresh ggml build JIT-compiles for the sm_120 GPU (Ling 4.5 tok/s,
+MiMo's first prefill 45 s). Build and patch recipe: `docs/build-ggml.md`.
+
+Ling long-prompt prefill (1,771 tokens, 64 GiB DDR pool, 2026-10-23): 22.2 tok/s as one graph, 21.4 tok/s in 512-token
+chunks, 21.6 tok/s with chunks and `PREFILL_OP_OFFLOAD=1` (no effect: the Ling graph does not engage op-offload).

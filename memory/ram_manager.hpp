@@ -310,7 +310,7 @@ public:
 
   // Per-layer, pre-sorted-descending-by-historical-count expert ID
   // ranking, used as disk_batch_padding's candidate source. Populated
-  // ONCE at startup by main.cpp from the SAME .moestream_usage-derived
+  // ONCE at startup by main.cpp from the SAME .zeromoe_usage-derived
   // `by_layer` ranking [PIN] preload itself already computes and trusts
   // (including its prefill_pin_file per-layer override, if configured) --
   // deliberately NOT StreamingEngine::route_freq, which is zero-
@@ -1575,8 +1575,8 @@ public:
 
     // 2026-08-31: trim COLDEST-FIRST, not by slot index.
     //
-    // Real measurement motivating this (current .moestream_usage vs
-    // .moestream_usage_prefill): prefill's and decode's expert sets are
+    // Real measurement motivating this (current .zeromoe_usage vs
+    // .zeromoe_usage_prefill): prefill's and decode's expert sets are
     // only PARTIALLY correlated -- 47.9% overlap, r=0.655 on shared
     // entries -- but crucially **59.0% of decode's real traffic is
     // covered by experts prefill already touched**. So the experts this
@@ -4322,7 +4322,7 @@ public:
   // and the VRAM cache simultaneously, right now. Unlike alternatives (whose
   // VRAM-pinned tier and RAM-LRU tier are architecturally exclusive --
   // CUDA_RELEASE_HOST frees an expert's host copy once it's VRAM-
-  // uploaded), MoEStream's tiers are NOT exclusive by design:
+  // uploaded), ZeroMoE's tiers are NOT exclusive by design:
   // moe_forward_gguf's per-token dispatch calls
   // RAMSafetyManager::get_experts_batch UNCONDITIONALLY for every routed
   // expert (execution_layer.cpp) to obtain its MoEExpertBlock metadata/

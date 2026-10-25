@@ -502,9 +502,9 @@ bool test_qwen_cpu_moe_iq2_strided_graph() {
 // synthetic arena is enough to exercise MUL_MAT_ID and keeps this diagnostic
 // runnable without allocating a full 512-expert model layer; the selected
 // expert work is identical.  Run in isolation with
-// MOESTREAM_TEST_ONLY_QWEN_CPU_BENCH=1 and vary OMP_NUM_THREADS to measure
+// ZEROMOE_TEST_ONLY_QWEN_CPU_BENCH=1 and vary OMP_NUM_THREADS to measure
 // physical-core versus hyperthread scaling.  Set
-// MOESTREAM_QWEN_CPU_BENCH_TYPE=iq2_xxs to measure the other production type.
+// ZEROMOE_QWEN_CPU_BENCH_TYPE=iq2_xxs to measure the other production type.
 bool bench_qwen_cpu_moe() {
     std::cout << "\n[BENCH] Qwen CPU strided GGML MoE path (informational)\n";
     if (!GgmlQwenCpuMoeRunner::compiled_in()) {
@@ -516,7 +516,7 @@ bool bench_qwen_cpu_moe() {
     constexpr int FF = 640;
     constexpr int N = 32;
     constexpr int TOPK = 10;
-    const char *type_env = std::getenv("MOESTREAM_QWEN_CPU_BENCH_TYPE");
+    const char *type_env = std::getenv("ZEROMOE_QWEN_CPU_BENCH_TYPE");
     const bool use_iq2 = type_env &&
                          (std::strcmp(type_env, "iq2") == 0 ||
                           std::strcmp(type_env, "iq2_xxs") == 0 ||
@@ -587,7 +587,7 @@ bool bench_qwen_cpu_moe() {
         weights[(size_t)k] = 1.0f / (float)TOPK;
     }
 
-    const char *iter_env = std::getenv("MOESTREAM_QWEN_CPU_BENCH_ITERS");
+    const char *iter_env = std::getenv("ZEROMOE_QWEN_CPU_BENCH_ITERS");
     const int iterations = std::max(1, iter_env ? std::atoi(iter_env) : 12);
     auto &runner = GgmlQwenCpuMoeRunner::instance();
     if (!runner.run_strided(input.data(), output.data(), ref, gate_raw, up_raw,
@@ -634,7 +634,7 @@ bool bench_qwen_cpu_moe() {
     // projection so an AVX-512 improvement is not hidden by down/IQ4_NL or
     // graph scheduling time.  It is opt-in because it adds a second timed
     // experiment to this diagnostic benchmark.
-    if (!use_iq2 && std::getenv("MOESTREAM_QWEN_CPU_BENCH_AVX512")) {
+    if (!use_iq2 && std::getenv("ZEROMOE_QWEN_CPU_BENCH_AVX512")) {
         std::vector<const uint8_t *> gate_weights((size_t)TOPK);
         std::vector<std::vector<float>> ggml_out(
             (size_t)TOPK, std::vector<float>((size_t)FF));
@@ -696,7 +696,7 @@ bool bench_qwen_cpu_moe() {
     // this isolates the gate/up pair's single quantization/team launch from
     // the rest of the CPU MoE graph.
     if (!use_iq2 &&
-        std::getenv("MOESTREAM_QWEN_CPU_BENCH_DIRECT_GROUPED")) {
+        std::getenv("ZEROMOE_QWEN_CPU_BENCH_DIRECT_GROUPED")) {
         constexpr int DIRECT_M = TOPK;
         const int direct_rb = row_bytes(GGUFType::IQ1_M, D);
         std::vector<std::vector<uint8_t>> direct_weights(
@@ -896,7 +896,7 @@ void bench_q3k_cpu_only() {
             quantize_row_q8_K(x.data(), x_q8.data(), hidden);
         const double quant_us = std::chrono::duration<double, std::micro>(
             std::chrono::high_resolution_clock::now() - start).count() / iterations;
-        std::cout << "  threads=" << nthreads << " MoEStream-FP32=" << std::fixed
+        std::cout << "  threads=" << nthreads << " ZeroMoE-FP32=" << std::fixed
                   << std::setprecision(3) << moe_ms << " ms, GGML-Q8_K-dot="
                   << ggml_ms << " ms (+ activation quant " << quant_us
                   << " us), speedup=" << (moe_ms / ggml_ms)

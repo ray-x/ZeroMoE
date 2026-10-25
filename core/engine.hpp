@@ -402,11 +402,11 @@ public:
     // from instead of the old scattered is_mla-bool/arch-string-literal
     // checks. See family_ops.hpp for the full rationale.
     FamilyOps family_ops;
-    moestream::graph::MoEPlacementSummary moe_placement;
-    moestream::graph::MoEExecutionKind moe_prefill_execution =
-        moestream::graph::MoEExecutionKind::CacheBacked;
-    moestream::graph::MoEExecutionKind moe_decode_execution =
-        moestream::graph::MoEExecutionKind::CacheBacked;
+    zeromoe::graph::MoEPlacementSummary moe_placement;
+    zeromoe::graph::MoEExecutionKind moe_prefill_execution =
+        zeromoe::graph::MoEExecutionKind::CacheBacked;
+    zeromoe::graph::MoEExecutionKind moe_decode_execution =
+        zeromoe::graph::MoEExecutionKind::CacheBacked;
 
     std::unordered_map<std::string, QuantizedTensor> resident_layers;
     std::vector<std::vector<MoEExpertBlock>> layers_experts;
@@ -2922,12 +2922,12 @@ public:
             }
 
             // llama.cpp's CPU-mapped GGUF tensors are normally offset by 32 bytes
-            // from their mmap page base.  MoEStream's graph arenas are
+            // from their mmap page base.  ZeroMoE's graph arenas are
             // allocated separately, so reproduce that host pointer phase by
             // default; the logical tensor layout is unchanged.  Set
-            // MOESTREAM_QWEN_GRAPH_HOST_OFFSET=0 for the page-aligned A/B.
+            // ZEROMOE_QWEN_GRAPH_HOST_OFFSET=0 for the page-aligned A/B.
             size_t host_offset = 32;
-            if (const char *v = std::getenv("MOESTREAM_QWEN_GRAPH_HOST_OFFSET")) {
+            if (const char *v = std::getenv("ZEROMOE_QWEN_GRAPH_HOST_OFFSET")) {
                 char *end = nullptr;
                 const long parsed = std::strtol(v, &end, 10);
                 if (end != v && *end == '\0' && parsed >= 0 && parsed <= 4096)
@@ -2962,13 +2962,13 @@ public:
             arena.host_reservation_bytes = bytes;
 
             // llama.cpp's fast CPU path uses mmap+mlock for its host expert source.
-            // Keep MoEStream's explicit preloaded DDR arena as the default,
+            // Keep ZeroMoE's explicit preloaded DDR arena as the default,
             // but expose the same page-residency property as a controlled A/B.
             // This is deliberately opt-in: locking the complete graph-RAM
             // set consumes the process's memlock allowance and should not be
             // enabled without an explicit host-memory budget.
             const char *graph_mlock =
-                std::getenv("MOESTREAM_QWEN_GRAPH_MLOCK");
+                std::getenv("ZEROMOE_QWEN_GRAPH_MLOCK");
             if (graph_mlock && std::atoi(graph_mlock) != 0) {
                 if (mlock(arena.allocation_base, arena.allocation_bytes) == 0) {
                     arena.mlocked = true;
@@ -2987,9 +2987,9 @@ public:
             // future A/B that wants to measure pinned expert weights, and
             // retain the old NO_REGISTER switch as a compatibility override.
             const char * graph_register =
-                std::getenv("MOESTREAM_QWEN_GRAPH_REGISTER");
+                std::getenv("ZEROMOE_QWEN_GRAPH_REGISTER");
             const char * graph_no_register =
-                std::getenv("MOESTREAM_QWEN_GRAPH_NO_REGISTER");
+                std::getenv("ZEROMOE_QWEN_GRAPH_NO_REGISTER");
             const bool graph_register_enabled =
                 graph_register && std::atoi(graph_register) != 0 &&
                 !(graph_no_register && std::atoi(graph_no_register) != 0);
@@ -3016,7 +3016,7 @@ public:
             if (!graph_register_enabled && layer == 0) {
                 LOG_STREAM_INFO()
                     << "[GRAPH-RAM] expert-arena cudaHostRegister disabled by "
-                       "default; set MOESTREAM_QWEN_GRAPH_REGISTER=1 for an "
+                       "default; set ZEROMOE_QWEN_GRAPH_REGISTER=1 for an "
                        "explicit A/B\n";
             }
 

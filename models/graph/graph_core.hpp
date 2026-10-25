@@ -11,7 +11,7 @@
 // lives here once.
 //
 // Requires ggml and the CUDA runtime; include it only from translation units
-// compiled with MOESTREAM_USE_GGML_CUDA.
+// compiled with ZEROMOE_USE_GGML_CUDA.
 
 #include <cmath>
 
@@ -34,7 +34,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 // A graph-owned host allocation (posix_memalign), optionally registered for
 // DMA, with the MemoryGuard reservation that was charged for it.
@@ -83,6 +83,8 @@ struct GraphCore {
   int hd = 0;
   int d_conv = 0;
   bool decode_mode = false;
+  uint64_t placement_generation = 0;
+  std::shared_ptr<const uint64_t> placement_lease;
   int kv_capacity = 0;
   int decode_last_pos = -1;
   int device_expert_layers = 0;
@@ -292,4 +294,4 @@ inline ggml_tensor *host_input(GraphCore &g, ggml_context *ctx, ggml_type type,
   return g.host_input(ctx, type, shape, bytes, name);
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

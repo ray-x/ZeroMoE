@@ -17,7 +17,7 @@
 #      same "SURVEY: dedicated file" convention as survey_config.toml (GLM).
 #   3. max_new_tokens lowered to 120 as a config-level default; the actual
 #      run drives generation length via run_survey.py's --ngen flag
-#      combined with MOESTREAM_BENCH_IGNORE_STOP=1 (see
+#      combined with ZEROMOE_BENCH_IGNORE_STOP=1 (see
 #      generation_loop.hpp's bench_ignore_stop), which forces EXACTLY
 #      max_new_tokens output tokens per prompt instead of stopping at the
 #      model's own EOS/turn-boundary token. This is required because the
@@ -28,7 +28,7 @@
 
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 
-log_path  = "/home/ray/Projects/MoEStream/logs/qwen4exp_survey_106prompts_120tokens.log"
+log_path  = "/home/ray/Projects/ZeroMoE/logs/qwen4exp_survey_106prompts_120tokens.log"
 log_level = "INFO"
 
 context_size   = 2048
@@ -53,8 +53,8 @@ prefetch_worker_threads = 4
 # SURVEY: dedicated usage files, not the live production/tuning pin files
 # used by configs/qwen4exp_3090_only.toml. freeze_usage_stats=false so this
 # 106-prompt run actually accumulates fresh (layer,expert) hit counts.
-pin_file           = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey_qwen4exp"
-prefill_pin_file   = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey_qwen4exp_prefill"
+pin_file           = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp"
+prefill_pin_file   = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_prefill"
 freeze_usage_stats = false
 pin_topk_per_layer   = 1
 pinned_vram_capacity = 9977

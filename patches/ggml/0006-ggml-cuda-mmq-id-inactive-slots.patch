@@ -22,7 +22,7 @@ diff --git a/src/ggml-cuda/mmq.cu b/src/ggml-cuda/mmq.cu
      return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
  }
 +
-+// MoEStream: advertises that the batched (S > 1) MMQ MUL_MAT_ID path treats a negative expert id as an
++// ZeroMoE: advertises that the batched (S > 1) MMQ MUL_MAT_ID path treats a negative expert id as an
 +// inactive route (no compact row, output zeroed), like the CPU op and the MMVQ decode kernels. Only
 +// quantized types that take the MMQ path are covered (not e.g. IQ1_M or float experts); the engine
 +// checks the type. include/mmid_route_skip.hpp weak-links this symbol.

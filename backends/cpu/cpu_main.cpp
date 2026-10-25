@@ -1,4 +1,4 @@
-// src/cpu_main.cpp — Host-only inference entry point for moestream_cpu.
+// src/cpu_main.cpp — Host-only inference entry point for zeromoe_cpu.
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
 #include "exl3_decode.hpp"

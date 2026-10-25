@@ -2,12 +2,12 @@
 +++ b/ggml/src/ggml-backend.cpp
 @@ -1701,6 +1701,17 @@
  };
- static moestream_sched_prof g_sprof;
+ static zeromoe_sched_prof g_sprof;
 
 +// Private-buffer CPU markers may run after an application-owned input event.
 +// The hook must reject every ordinary split; those retain allocator barriers.
 +#if defined(__GNUC__) && !defined(_WIN32)
-+extern "C" int moestream_ggml_sched_early_cpu(
++extern "C" int zeromoe_ggml_sched_early_cpu(
 +    ggml_backend_t, ggml_cgraph *, int64_t *, int64_t *) __attribute__((weak));
 +extern "C" {
 +GGML_BACKEND_API int ggml_backend_sched_early_cpu_supported();
@@ -27,8 +27,8 @@
 +#if defined(__GNUC__) && !defined(_WIN32)
 +        if (!sched->callback_eval && split->n_inputs == 0 &&
 +            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
-+            moestream_ggml_sched_early_cpu) {
-+            early_cpu = moestream_ggml_sched_early_cpu(split_backend, &split->graph,
++            zeromoe_ggml_sched_early_cpu) {
++            early_cpu = zeromoe_ggml_sched_early_cpu(split_backend, &split->graph,
 +                &early_wait_us, &early_compute_us) == 1;
 +        }
 +#endif

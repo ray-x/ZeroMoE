@@ -1,12 +1,12 @@
 // Tier-1 microbenchmark for QwenCpuOffloadRing's wait latency.
 //
-// Isolates the effect of MOESTREAM_QWEN4EXP_RING_SPIN_US on how quickly the
+// Isolates the effect of ZEROMOE_QWEN4EXP_RING_SPIN_US on how quickly the
 // decode thread notices a completed CPU-offload slot, independent of decode-
 // loop noise (model load, GPU dense/attention work, prompt variance). Links
 // the REAL models/qwen/qwen_cpu_offload_ring.cpp -- no GGML/model dependency -- and
 // stands a plain std::thread in for GgmlQwenCpuMoeRunner's worker.
 //
-// MOESTREAM_QWEN4EXP_RING_SPIN_US is cached on first read inside
+// ZEROMOE_QWEN4EXP_RING_SPIN_US is cached on first read inside
 // qwen_cpu_offload_ring.cpp, so one process observes exactly one value.
 // Sweep it externally (see bench/run_ring_spin_sweep.sh), one process launch
 // per value.
@@ -120,9 +120,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  const char *spin_env = std::getenv("MOESTREAM_QWEN4EXP_RING_SPIN_US");
+  const char *spin_env = std::getenv("ZEROMOE_QWEN4EXP_RING_SPIN_US");
   std::printf("[RING-SPIN-BENCH] iterations=%d d_model=%d slots=%d "
-              "cpu_compute_us=%d MOESTREAM_QWEN4EXP_RING_SPIN_US=%s\n",
+              "cpu_compute_us=%d ZEROMOE_QWEN4EXP_RING_SPIN_US=%s\n",
               iterations, d_model, slots, cpu_compute_us,
               spin_env ? spin_env : "(unset)");
 

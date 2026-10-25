@@ -65,7 +65,7 @@ offload/pilot/lane machinery. Concrete symptoms (each a copy a new model re-deri
 1. **Two cold-MoE execution stacks** — full-graph (`EarlyReadyLane` + `ExpertStore`) vs
    cache-backed (`backends/ggml/ggml_moe_runner.cpp` + `moe::` builders).
 2. **Three pilot/prefetch implementations** — GLM (`PilotRidgeTable`), Qwen
-   (`Qwen4ExpRidgeTable`), DeepSeek (`MOESTREAM_DSV41_PILOT_K`).
+   (`Qwen4ExpRidgeTable`), DeepSeek (`ZEROMOE_DSV41_PILOT_K`).
 3. **Two shared MoE topology builders** — `moe_routed_ggml.hpp` vs `ggml_moe_graph_builder.cpp`.
 
 ---
@@ -223,8 +223,8 @@ After GLM/DeepSeek/Ling were merged into master, the duplication got *more* conc
 - **Registry grew to five classes** — added `GlmDsaGraphModel` (a copy of `Glm5NextGraphModel`).
 - **Second cold-MoE stack landed** in `backends/ggml/` (cache-backed: `ggml_moe_runner` ~96 KB,
   `ggml_moe_backend` ~67 KB, `ggml_moe_transfer_manager` ~46 KB, `ggml_router_runner` ~24 KB).
-- **Third pilot** in DeepSeek (`MOESTREAM_DSV41_PILOT_K`).
-- **Page-reusing eviction** (`MOESTREAM_OFFLOAD_RETARGET`, `mremap MREMAP_DONTUNMAP`) landed at
+- **Third pilot** in DeepSeek (`ZEROMOE_DSV41_PILOT_K`).
+- **Page-reusing eviction** (`ZEROMOE_OFFLOAD_RETARGET`, `mremap MREMAP_DONTUNMAP`) landed at
   the *page* level; the VRAM-slot dynamic promotion ("topology retarget") is still not built
   (`docs/offload-retarget.md`, `docs/ssd-offload/10-*.md` §6).
 
@@ -275,7 +275,7 @@ Every structural change must pass, before it lands:
 - **GLM:** `ARMS="lru lane" bench/graph_framework_glm_gate.sh <name> <candidate>`.
 - **Throughput band (all models):** `bench/regression_gate.sh <candidate>` — decode tok/s within
   the frozen band in that script (and `docs/models/README.md`).
-- **Native suite:** `moestream_tests` (the six pre-existing `qabsorb`/`wuv` failures documented
+- **Native suite:** `zeromoe_tests` (the six pre-existing `qabsorb`/`wuv` failures documented
   in `docs/pickup-refactor-2026-10-18.md` are expected).
 
 Structural rule enforced throughout: **node-creation order inside a graph must stay bit-for-bit

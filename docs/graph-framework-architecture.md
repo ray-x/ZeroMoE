@@ -57,7 +57,7 @@ declarations. The `.cpp` files include only that header.
    `models/model_factory.cpp`; read its hyper-parameters into
    `ArchitectureConfig` *before* `resolve_family_ops()` (see CLAUDE.md,
    initialization-order guard).
-2. **Graph state**: declare `struct FullGraph : moestream::graph::GraphCore` in
+2. **Graph state**: declare `struct FullGraph : zeromoe::graph::GraphCore` in
    your family's internal header. Add only family-specific members; use
    `dense`, `expert`, `state` for arenas and `alloc_host` / `host_input` for
    host inputs. Call `release_core()` last in `destroy()`.
@@ -81,7 +81,7 @@ project memory); adding a new CUDA-backed global means adding it there.
 
 ## Verification
 
-- Build: `cmake --build build_base --target moestream` and `moestream_tests`.
+- Build: `cmake --build build_base --target zeromoe` and `zeromoe_tests`.
 - Qwen correctness gate: `bench/graph_framework_step.sh` (logits byte-identical,
   free-running tokens identical).
 - GLM gate: `ARMS="lru lane" bench/graph_framework_glm_gate.sh`.

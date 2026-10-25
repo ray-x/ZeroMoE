@@ -2,7 +2,7 @@
 # Order-balanced A/B of one GLM-5.3-Flash offload decode setup, logits + tokens compared.
 #   bench/glm_env_ab.sh <engine> <tag> "<A: VAR=val ...>" "<B: VAR=val ...>" [rounds]
 # Arm A and B are space-separated env assignments (use "" for none), e.g. a switch
-# ("MOESTREAM_GLM5NEXT_SPLIT_LOAD=0" vs "MOESTREAM_GLM5NEXT_SPLIT_LOAD=1") or a library override
+# ("ZEROMOE_GLM5NEXT_SPLIT_LOAD=0" vs "ZEROMOE_GLM5NEXT_SPLIT_LOAD=1") or a library override
 # ("LD_LIBRARY_PATH=/x/lib_ctrl" vs "LD_LIBRARY_PATH=/x/lib_new").
 # Output: logs/perf/<tag>_{A,B}_<n>.{engine.log,logits,tokens}; prints decode tok/s per run.
 set -uo pipefail
@@ -14,7 +14,7 @@ for r in $(seq 1 "$rounds"); do
   for arm in $order; do
     t=${tag}_${arm}_$r
     if [ "$arm" = A ]; then extra=($a); else extra=($b); fi
-    extra+=(MOESTREAM_DECODE_LOGITS_DUMP="$out/$t.logits" MOESTREAM_GENERATED_TOKEN_FILE="$out/$t.tokens")
+    extra+=(ZEROMOE_DECODE_LOGITS_DUMP="$out/$t.logits" ZEROMOE_GENERATED_TOKEN_FILE="$out/$t.tokens")
     echo "== $t: ${extra[*]}"; "$here/glm_decode_profile.sh" "$bin" "$t" "${extra[@]}" | tail -1
   done
 done

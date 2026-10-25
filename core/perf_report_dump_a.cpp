@@ -8,7 +8,7 @@ void PerfCounters::dump_report_part1(double session_elapsed_s) const {
     // promotion slab uploads were bleeding into this "expert_ffn only"
     // total, inflating the reported per-call GPU upload figure).
     double gpu_round_trip = t_expert_gpu_upload + t_gpu_compute + t_gpu_download;
-    LOG_INFO("\n========== MoEStream Performance Report ==========\n");
+    LOG_INFO("\n========== ZeroMoE Performance Report ==========\n");
     LOG_INFO("Dense load (init):   %8.3f s\n", t_dense_load.load());
     // 2026-08-18: the plain "bytes_disk_read / t_disk_read" figure below
     // is real-demand-only bandwidth, kept exactly as it always was (see

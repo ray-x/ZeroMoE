@@ -4,7 +4,7 @@
 //
 // A route can be made free ("skipped") by giving GGML_OP_MUL_MAT_ID a NEGATIVE expert id: the CPU op
 // zeroes the output and reads no weights, and the CUDA MMVQ decode kernels do the same. That is only
-// guaranteed by the MoEStream ggml fork (moestream_mmid_negative_skip) and only for single-token
+// guaranteed by the ZeroMoE ggml fork (zeromoe_mmid_negative_skip) and only for single-token
 // decode; prefill's mmq/mmf/sorted CUDA paths and any unpatched ggml need a VALID dummy id (0) plus a
 // 0/1 mask, at the price of every branch computing all top-k routes.
 //
@@ -18,10 +18,10 @@
 extern "C" int ggml_cpu_mul_mat_id_negative_skip(void) __attribute__((weak));
 
 // True when the linked ggml advertises negative-id skipping (and the user has not opted out with
-// MOESTREAM_MMID_NO_NEGATIVE_SKIP=1).
+// ZEROMOE_MMID_NO_NEGATIVE_SKIP=1).
 inline bool mmid_negative_skip_available() {
   static const bool available = [] {
-    if (const char *e = std::getenv("MOESTREAM_MMID_NO_NEGATIVE_SKIP"))
+    if (const char *e = std::getenv("ZEROMOE_MMID_NO_NEGATIVE_SKIP"))
       if (e[0] && e[0] != '0')
         return false;
     return &ggml_cpu_mul_mat_id_negative_skip != nullptr &&
@@ -38,7 +38,7 @@ extern "C" int ggml_cuda_mul_mat_id_negative_skip_batched(void) __attribute__((w
 
 inline bool mmid_negative_skip_batched_available() {
   static const bool available = [] {
-    if (const char *e = std::getenv("MOESTREAM_MMID_NO_BATCHED_NEGATIVE_SKIP"))
+    if (const char *e = std::getenv("ZEROMOE_MMID_NO_BATCHED_NEGATIVE_SKIP"))
       if (e[0] && e[0] != '0')
         return false;
     return &ggml_cuda_mul_mat_id_negative_skip_batched != nullptr &&

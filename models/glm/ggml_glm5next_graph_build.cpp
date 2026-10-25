@@ -10,10 +10,14 @@
 #include "early_ready_offload_strategy.hpp"
 #include "early_ready_graph_builder.hpp"
 #include "moe_block.hpp"
+#include "graph_settings_global.hpp"
+#include "layer_plan.hpp"
+#include "graph_route_survey.hpp"
+#include "moe_ingraph.hpp"
 #include "offload_expert_provider.hpp"
 #include "offload_residency_adapter.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -28,33 +32,33 @@ EarlyReadyLane *adopt_cold_lane(FullGraph &g, int layer,
   if (!lane)
     return nullptr;
 
-  moestream::graph::ColdMoEAdapter adapter;
+  zeromoe::graph::ColdMoEAdapter adapter;
   if (offload_layer(layer)) {
     OffloadState *o = get_offload(*g.engine);
     if (!o)
       return nullptr;
-    adapter = moestream::graph::make_offload_residency_adapter(
+    adapter = zeromoe::graph::make_offload_residency_adapter(
         *o->store, layer, split_load_wanted(),
         "[GGML-GLM5NEXT-OFFLOAD]");
   }
   if (gpu_assist_slots() > 0 && offload_layer(layer) && gpu_assist_layer_ok(g, layer)) {
     if (OffloadState *o = get_offload(*g.engine)) {
       // One backend + one ring per assist device, shared by every lane of this graph; freed with the last lane.
-      // Device 0: MOESTREAM_GLM5NEXT_ASSIST_DEVICE (default the trunk's device), GPU_ASSIST slots. Optional device 1:
-      // MOESTREAM_GLM5NEXT_ASSIST2_DEVICE / _ASSIST2_SLOTS -- its own PCIe link, so it adds to device 0's copy bandwidth.
+      // Device 0: ZEROMOE_GLM5NEXT_ASSIST_DEVICE (default the trunk's device), GPU_ASSIST slots. Optional device 1:
+      // ZEROMOE_GLM5NEXT_ASSIST2_DEVICE / _ASSIST2_SLOTS -- its own PCIe link, so it adds to device 0's copy bandwidth.
       static std::weak_ptr<GpuAssistShared> shared_weak[2];
       const auto make_ring = [&](std::weak_ptr<GpuAssistShared> &weak, int dev,
                                  int slots) -> std::shared_ptr<GpuAssistShared> {
         if (std::shared_ptr<GpuAssistShared> have = weak.lock())
           return have;
-        auto s = moestream::graph::make_assist_ring(
+        auto s = zeromoe::graph::make_assist_ring(
             *o->arena, o->first, o->n_layers, dev, slots,
             [&](int l) { return gpu_assist_layer_ok(g, l); });  // the ring only has to fit layers that use it
         if (s)
           weak = s;
         return s;
       };
-      const int assist_dev = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST_DEVICE", g.device);
+      const int assist_dev = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_ASSIST_DEVICE", g.device);
       std::shared_ptr<GpuAssistShared> shared = make_ring(shared_weak[0], assist_dev, gpu_assist_slots());
       std::shared_ptr<GpuAssistShared> shared2;
       const int assist2_dev = gpu_assist2_device(g.device);
@@ -84,7 +88,7 @@ EarlyReadyLane *adopt_cold_lane(FullGraph &g, int layer,
   // build-time install (callbacks only); per-token begin()/state()/finish()/release() are wired
   // in migration step 2 and key off the invocation's (layer, generation) identity (§3.8).
   raw->strategy =
-      std::make_unique<moestream::graph::EarlyReadyOffloadStrategy>(raw,
+      std::make_unique<zeromoe::graph::EarlyReadyOffloadStrategy>(raw,
                                                                     adapter);
   g.early_ready.emplace(layer, std::move(lane));
   LOG_INFO("[GGML-GLM5NEXT-EARLY-READY] layer=%d private CPU lane enabled\n", layer);
@@ -162,7 +166,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (partial_weights && !partial_weights->cold.empty() &&
       ((!gate_up && (!ge || !ue)) || !de))
     return nullptr;
-  if (partial_weights && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_PARTIAL")) {
     const bool ready = partial_layer_ram_ready(g, layer);
     LOG_WARN(
         "[PARTIAL-DEBUG] layer=%d n_experts=%d hot=%zu cold=%zu ready=%d "
@@ -184,11 +188,18 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // every other layer keeps GGML's normal biased top-k node.
   ggml_tensor *ids =
       forced_ids ? forced_ids : moe_routed::select_ids(ctx, rspec, probs, bias);
+  if (ids && layer >= c.first_dense) {
+    // Survey mode only (usage_record_file): count the layer's routes, hot or cold, without touching them.
+    zeromoe::graph::GraphRouteSurvey::get().configure(
+        zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph).diag.usage_record_file.value,
+        c.n_layers, c.first_dense, c.n_experts);
+    zeromoe::graph::GraphRouteSurvey::get().tap(ctx, g.graph, g.sched, g.cpu, ids, layer, g.decode_mode);
+  }
   const bool capture_decode_routes = route_stats_enabled() && g.decode_mode &&
                                     g.partial_expert_residency && ids;
   const bool capture_prefill_routes =
       !g.decode_mode && ids &&
-      moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE");
+      zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE");
   if (capture_decode_routes || capture_prefill_routes) {
     // Keep a graph output copy of each layer's IDs.  The scheduler may
     // recycle the original intermediate after MUL_MAT_ID consumes it, so
@@ -223,7 +234,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     return nullptr;
   if (g.partial_expert_residency && !prepare_partial_hot1(g, ctx, layer))
     return nullptr;
-  if (partial_weights && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL")) {
+  if (partial_weights && zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_PARTIAL")) {
     LOG_WARN(
         "[PARTIAL-DEBUG-HOT] layer=%d hot=%zu vram_slots=%zu "
         "hot_gate_ne2=%lld hot_up_ne2=%lld hot_down_ne2=%lld "
@@ -240,14 +251,14 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
             : -1);
   }
 
-  // First expert id of the second GPU's share of the cold experts (0 = not split). MOESTREAM_GLM5NEXT_PREFILL_SPLIT is the
+  // First expert id of the second GPU's share of the cold experts (0 = not split). ZEROMOE_GLM5NEXT_PREFILL_SPLIT is the
   // main GPU's share of each layer's cold experts (0.63 ~ the 3090 x16 / 5060 Ti x8 PCIe Gen3 bandwidth ratio; default 1 = off: both
   // links do copy concurrently, but per layer attention + the miss node (~60 ms) still run before the copies, so the
   // wall time did not drop -- it needs the expert copies prefetched ahead of the router).
   int split_at = 0;
   if (!g.decode_mode && g.S >= 64 && g.gpu1 && offload_layer(layer) && !gate_up && ge && ue && de) {
     static const double ratio = [] {
-      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_SPLIT");
+      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_SPLIT");
       return e ? std::atof(e) : 1.0;
     }();
     if (const PartialExpertLayer *pl = partial_layer(g, layer); pl && ratio > 0.0 && ratio < 1.0 && pl->cold.size() >= 16) {
@@ -282,7 +293,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     // The weighting and the sum over the routed experts stay on the GPU that ran the experts: left to the scheduler they ran
     // on the main GPU, so the unreduced [D, topk, S] result (105 MB for 805 tokens) crossed between the GPUs through the host
     // (56 ms per layer) instead of the [D, S] sum (13 MB).
-    static const bool pin_on = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
+    static const bool pin_on = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
     if (pin_be && g.sched && pin_on && !g.decode_mode) {
       ggml_backend_sched_set_tensor_backend(g.sched, experts, pin_be);
       ggml_backend_sched_set_tensor_backend(g.sched, summed, pin_be);
@@ -329,7 +340,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   if (PartialExpertLayer *partial = partial_layer(g, layer)) {
     const bool has_hot = !partial->hot.empty();
     const bool has_cold = !partial->cold.empty();
-    moestream::graph::MoEBranch hot_b, cold_b;
+    zeromoe::graph::MoEBranch hot_b, cold_b;
     if (has_hot) {
       hot_b.weights.gate_up = partial->hot_gate_up;
       hot_b.weights.gate = partial->hot_gate;
@@ -367,21 +378,23 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         return nullptr;
     }
 
-    // The execution strategy is resolved from the placement, not chosen here.
-    moestream::graph::MoEPlacementSummary placement;
-    placement.placement = has_hot && has_cold
-        ? moestream::graph::ExpertPlacementClass::MixedVramDdr
-        : (offload_layer(layer) ? moestream::graph::ExpertPlacementClass::StorageBacked
-                                : moestream::graph::ExpertPlacementClass::DdrOnly);
-    moestream::graph::MoEExecutionCapabilities caps;
-    caps.early_ready = lane_wanted;
-    caps.prefer_overlap = lane_wanted;
-    const auto decision = moestream::graph::resolve_execution_policy(
-        placement, caps,
-        g.decode_mode ? ModelGraphPhase::Decode : ModelGraphPhase::Prefill);
-
-    const moestream::graph::MoEBlockSpec spec = moestream::graph::moe_block_spec(c);
-    moestream::graph::MoEBlockGraph bg;
+    // The execution strategy is resolved from the placement, not chosen here (moe_ingraph.hpp).
+    zeromoe::graph::MoEIngraphPlan plan;
+    plan.spec = zeromoe::graph::moe_block_spec(c);
+    plan.hot = std::move(hot_b);
+    plan.cold = std::move(cold_b);
+    plan.placement = zeromoe::graph::classify_expert_placement(
+        has_hot, has_cold,
+        offload_layer(layer) ? zeromoe::graph::ExpertPlacementClass::StorageBacked
+                             : zeromoe::graph::ExpertPlacementClass::DdrOnly,
+        offload_layer(layer) ? zeromoe::graph::ExpertPlacementClass::StorageBacked
+                             : zeromoe::graph::ExpertPlacementClass::DdrOnly);
+    plan.caps.early_ready = lane_wanted;
+    plan.caps.prefer_overlap = lane_wanted;
+    plan.lane_wanted = lane_wanted && !stage;
+    plan.tag = "[GLM5NEXT-GRAPH]";
+    zeromoe::graph::MoEBlockGraph &bg = plan.graph;
+    bg.phase_cache = g_phase_cache.get(); bg.engine = g.engine;
     bg.ctx = ctx;
     bg.graph = g.graph;
     bg.sched = g.sched;
@@ -392,8 +405,8 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     bg.n_tokens = g.S;
     bg.name_prefix = "glm5next";
     bg.pin_prefill_branch_sums =
-        moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
-    moestream::graph::MoEBlockLayer bl;
+        zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PIN_BRANCH_SUM", 1) != 0;
+    zeromoe::graph::MoEBlockLayer &bl = plan.layer;
     bl.layer = layer;
     bl.input = cur;
     bl.route_ids = route_ids;
@@ -401,14 +414,14 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     bl.swiglu_clamp = clamp;
     bl.swiglu_clamp_fused = swiglu_clamp_fused();
 
-    moestream::graph::MoEBlockHooks hooks;
+    zeromoe::graph::MoEBlockHooks &hooks = plan.hooks;
     hooks.build_shared = build_shared;
     EarlyReadyLane *adopted = nullptr;
     hooks.adopt_lane = [&](std::unique_ptr<EarlyReadyLane> lane) {
       // Lanes only exist without staging (the stage node already rewrote the cold ids).
       if (stage)
         return (EarlyReadyLane *)nullptr;
-      adopted = adopt_cold_lane(g, layer, cold_b.weights, std::move(lane));
+      adopted = adopt_cold_lane(g, layer, plan.cold.weights, std::move(lane));
       return adopted;
     };
     hooks.before_marker = [&](EarlyReadyLane &) {
@@ -438,7 +451,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       return cold_in.ids != nullptr;
     };
     hooks.run_cold = [&](const moe_partial::BranchInputs &in,
-                         const moestream::graph::BranchRunFn &run) -> ggml_tensor * {
+                         const zeromoe::graph::BranchRunFn &run) -> ggml_tensor * {
             // Batched prefill: split the cold experts of the layer between the two GPUs, so both PCIe links copy at
             // once (the second GPU's share runs first so its weight copies are issued before the main GPU's launch).
             if (split_at > 0 && cold_split_applicable(g, layer)) {
@@ -535,7 +548,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                 return ggml_add(ctx, out_part[1], out_part[0]);
               return out_part[0] ? out_part[0] : out_part[1];
             }
-      return run(cold_b.weights, in.ids, in.weights, nullptr);
+      return run(plan.cold.weights, in.ids, in.weights, nullptr);
     };
     hooks.extra_branches = [&](ggml_tensor *out_in) -> ggml_tensor * {
       ggml_tensor *o = out_in;
@@ -568,8 +581,7 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       }
       return o;
     };
-    const moestream::graph::MoEBlockResult block = moestream::graph::build_moe_block(
-        spec, bg, bl, hot_b, cold_b, lane_wanted && !stage, decision, hooks);
+    const zeromoe::graph::MoEBlockResult block = zeromoe::graph::build_moe_ingraph(plan);
     out = block.out;
     if (!out)
       return nullptr;
@@ -593,6 +605,345 @@ ggml_tensor *build_ffn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   }
   return out;
 }
+
+
+// ---- the GLM/Ling graph's per-layer blocks (interfaces: models/graph/layer_plan.hpp) ---------
+static double bp_ms_since(std::chrono::steady_clock::time_point a) {
+  return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+}
+
+// Attention of one layer: KDA (linear attention) or MLA/DSA, with its per-layer state. Returns the
+// attention output (before the residual) or nullptr when the layer cannot be built.
+struct GlmAttention final : zeromoe::graph::AttentionBlock {
+  GlmAttention(FullGraph &graph, double &attn_ms) : g(graph), bp_attn(attn_ms) {}
+  FullGraph &g;
+  double &bp_attn;
+  ggml_tensor *previous_indexer_selection = nullptr;
+  ggml_tensor *previous_indexer_mask = nullptr;
+  // The masks and indexer tables are declared by build_graph before the layer loop.
+  bool declare_inputs() override { return true; }
+  void set_inputs(int) override {}
+  ggml_tensor *build(ggml_tensor *cur, int l) override {
+    const auto &c = g.engine->model_file.architecture_config;
+    const std::string p = "blk." + std::to_string(l) + ".";
+    ggml_tensor *an = resident_tensor(g, g.ctx, p + "attn_norm.weight");
+    if (!cur || !an) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d attention input unavailable "
+                 "cur=%d norm=%d\n",
+                 l, cur != nullptr, an != nullptr);
+      return nullptr;
+    }
+    cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), an);
+    ggml_tensor *attn = nullptr;
+    if (!g.dsa_plain && hybrid_is_kda_layer(c, l)) {
+      ggml_tensor *wq = resident_tensor(g, g.ctx, p + "attn_q.weight");
+      ggml_tensor *wk = resident_tensor(g, g.ctx, p + "attn_k.weight");
+      ggml_tensor *wv = resident_tensor(g, g.ctx, p + "attn_v.weight");
+      ggml_tensor *cq = resident_tensor(g, g.ctx, p + "ssm_conv1d_q.weight");
+      ggml_tensor *ck = resident_tensor(g, g.ctx, p + "ssm_conv1d_k.weight");
+      ggml_tensor *cv = resident_tensor(g, g.ctx, p + "ssm_conv1d_v.weight");
+      ggml_tensor *fa = resident_tensor(g, g.ctx, p + "ssm_f_a.weight");
+      ggml_tensor *fb = resident_tensor(g, g.ctx, p + "ssm_f_b.weight");
+      ggml_tensor *ga = resident_tensor(g, g.ctx, p + "ssm_g_a.weight");
+      ggml_tensor *gb = resident_tensor(g, g.ctx, p + "ssm_g_b.weight");
+      ggml_tensor *be = resident_tensor(g, g.ctx, p + "ssm_beta.weight");
+      ggml_tensor *aa = resident_tensor(g, g.ctx, p + "ssm_a");
+      ggml_tensor *dt = resident_tensor(g, g.ctx, p + "ssm_dt.bias");
+      ggml_tensor *nm = resident_tensor(g, g.ctx, p + "ssm_norm.weight");
+      ggml_tensor *ow = resident_tensor(g, g.ctx, p + "attn_output.weight");
+      const bool bailing = g.engine->family_ops.family == ModelFamily::BailingMoE3;
+      if (!wq || !wk || !wv || !cq || !ck || !cv || !fa ||
+      (!bailing && !fb) || !ga || (!bailing && !gb) ||
+      !be || !aa || !dt || !nm || !ow) {
+    if (g.native_moe_cache)
+      LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA weights unavailable "
+               "q=%d k=%d v=%d cq=%d ck=%d cv=%d fa=%d ga=%d beta=%d "
+               "a=%d dt=%d norm=%d out=%d\n",
+               l, wq != nullptr, wk != nullptr, wv != nullptr, cq != nullptr,
+               ck != nullptr, cv != nullptr, fa != nullptr, ga != nullptr,
+               be != nullptr, aa != nullptr, dt != nullptr, nm != nullptr,
+               ow != nullptr);
+        return nullptr;
+  }
+      const int hist = g.d_conv - 1;
+      ggml_tensor *hi = nullptr;
+      ggml_tensor *si = nullptr;
+      if (g.decode_mode) {
+        hi = new_decode_state_tensor(
+            g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
+            "glm5next_decode_kda_history");
+        si = new_decode_state_tensor(
+            g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
+            "glm5next_decode_kda_state");
+        if (hi && si) {
+          g.kda_hist_storage.push_back(hi);
+          g.kda_state_storage.push_back(si);
+        }
+      } else {
+        hi = host_input(
+            g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
+            (size_t)hist * 3 * g.d_inner * sizeof(float),
+            "glm5next_kda_history");
+        si = host_input(
+            g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
+            (size_t)g.hd * g.hd * g.H * sizeof(float), "glm5next_kda_state");
+      }
+      if (!hi || !si) {
+        if (g.native_moe_cache)
+          LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA state allocation failed "
+                   "history=%d recurrent=%d\n",
+                   l, hi != nullptr, si != nullptr);
+        return nullptr;
+      }
+      if (!g.decode_mode) {
+        g.kda_hist_inputs.push_back((float *)hi->data);
+        g.kda_state_inputs.push_back((float *)si->data);
+      }
+      ggml_tensor *so = nullptr;
+      ggml_tensor *ho = nullptr;
+      attn = build_kda(g, g.ctx, cur, l, wq, wk, wv, cq, ck, cv, fa, fb, ga, gb,
+                       be, aa, dt, nm, ow, hi, si, &so, &ho);
+  if (!attn || !so || !ho) {
+    if (g.native_moe_cache)
+      LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA graph build failed "
+               "attn=%d state=%d history=%d\n",
+               l, attn != nullptr, so != nullptr, ho != nullptr);
+        return nullptr;
+  }
+      if (g.decode_mode) {
+        g.kda_state_updates.push_back(ggml_cpy(g.ctx, so, si));
+        g.kda_hist_updates.push_back(ggml_cpy(g.ctx, ho, hi));
+        if (!g.kda_state_updates.back() || !g.kda_hist_updates.back()) {
+          if (g.native_moe_cache)
+            LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA state copy build failed\n",
+                     l);
+          return nullptr;
+        }
+      } else {
+        g.kda_state_out.push_back(so);
+        g.kda_hist_out.push_back(ho);
+      }
+      g.kda_layers.push_back(l);
+    } else {
+      const bool bailing =
+          g.engine->family_ops.family == ModelFamily::BailingMoE3;
+      ggml_tensor *wqa = resident_tensor(g, g.ctx, p + "attn_q_a.weight");
+      ggml_tensor *wqan = resident_tensor(g, g.ctx, p + "attn_q_a_norm.weight");
+      ggml_tensor *wqb = resident_tensor(g, g.ctx, p + "attn_q_b.weight");
+      ggml_tensor *wkva = resident_tensor(g, g.ctx, p + "attn_kv_a_mqa.weight");
+      ggml_tensor *wkvan =
+          resident_tensor(g, g.ctx, p + "attn_kv_a_norm.weight");
+      ggml_tensor *wkb = static_full_weight(g, g.ctx, p + "attn_k_b.weight");
+      ggml_tensor *wvb = static_full_weight(g, g.ctx, p + "attn_v_b.weight");
+      ggml_tensor *wo = resident_tensor(g, g.ctx, p + "attn_output.weight");
+      ggml_tensor *wgate =
+          bailing ? resident_tensor(g, g.ctx, p + "attn_gate.weight")
+                  : nullptr;
+      if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo ||
+          (bailing && !wgate)) {
+        if (g.native_moe_cache)
+          LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA weights unavailable "
+                   "qa=%d qan=%d qb=%d kva=%d kvan=%d kb=%d vb=%d out=%d "
+                   "gate=%d\n",
+                   l, wqa != nullptr, wqan != nullptr, wqb != nullptr,
+                   wkva != nullptr, wkvan != nullptr, wkb != nullptr,
+                   wvb != nullptr, wo != nullptr, wgate != nullptr);
+        return nullptr;
+      }
+      ggml_tensor *kv_cache = nullptr;
+      if (g.decode_mode) {
+        kv_cache = new_decode_state_tensor(
+            g, g.ctx, GGML_TYPE_F16, {g.kv_cache_width, g.kv_capacity},
+            "glm5next_decode_dsa_kv");
+        if (!kv_cache) {
+          if (g.native_moe_cache)
+            LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA KV cache allocation failed\n",
+                     l);
+          return nullptr;
+        }
+        g.dsa_kv_storage.push_back(kv_cache);
+        if (g.sparse_decode && glm5next_indexer_owner(g, l)) {
+          Glm5nextIndexerLayer indexer_state;
+          indexer_state.layer = l;
+          indexer_state.key_gate_cache = new_decode_state_tensor(
+              g, g.ctx, GGML_TYPE_F32,
+              {2 * g.indexer_key_length, g.kv_capacity},
+              "glm5next_decode_indexer_key_gate");
+          indexer_state.pooled_cache = new_decode_state_tensor(
+              g, g.ctx, GGML_TYPE_F32,
+              {g.indexer_key_length, g.kv_capacity / g.indexer_kpool},
+              "glm5next_decode_indexer_pooled_keys");
+          if (!indexer_state.key_gate_cache || !indexer_state.pooled_cache) {
+            if (g.native_moe_cache)
+              LOG_WARN("[GGML-LING-HYBRID] layer=%d indexer state allocation "
+                       "failed key_gate=%d pooled=%d\n",
+                       l, indexer_state.key_gate_cache != nullptr,
+                       indexer_state.pooled_cache != nullptr);
+            return nullptr;
+          }
+          g.glm5next_indexer_layers.push_back(indexer_state);
+        }
+      }
+      ggml_tensor *kv = nullptr;
+      const auto bp_t0 = std::chrono::steady_clock::now();
+      if (g.dsa_plain) {
+        attn = build_glm_dsa_attn(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache);
+      } else if (bailing) {
+        attn = build_bailing_mla(g, g.ctx, cur, l, wqa, wqan, wqb, wkva,
+                                 wkvan, wkb, wvb, wo, wgate, &kv, kv_cache);
+      } else {
+        attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb,
+                         wvb, wo, &kv, kv_cache, &previous_indexer_selection,
+                         &previous_indexer_mask);
+      }
+      bp_attn += bp_ms_since(bp_t0);
+  if (!attn || !kv) {
+    if (g.native_moe_cache)
+      LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA graph build failed "
+               "attn=%d kv=%d q_a=%d q_a_norm=%d q_b=%d kv_a=%d "
+               "kv_a_norm=%d k_b=%d v_b=%d out=%d gate=%d\n",
+               l, attn != nullptr, kv != nullptr, wqa != nullptr,
+               wqan != nullptr, wqb != nullptr, wkva != nullptr,
+               wkvan != nullptr, wkb != nullptr, wvb != nullptr,
+               wo != nullptr, wgate != nullptr);
+        return nullptr;
+  }
+      if (!g.decode_mode)
+        g.dsa_kv_out.push_back(kv);
+      g.dsa_layers.push_back(l);
+    }
+    return attn;
+  }
+};
+
+// FFN of one layer: its pre-norm, the pilot staging node and the (hot/cold) MoE or dense FFN. The plan
+// sets residual/post/comb so the nodes it already built are scheduled before the FFN, as before.
+struct GlmFfn final : zeromoe::graph::FfnBlock {
+  GlmFfn(FullGraph &graph, double &pilot_ms, double &ffn_ms) : g(graph), bp_pilot(pilot_ms), bp_ffn(ffn_ms) {}
+  FullGraph &g;
+  double &bp_pilot, &bp_ffn;
+  ggml_tensor *residual = nullptr, *post = nullptr, *comb = nullptr;
+  ggml_tensor *build(ggml_tensor *cur, int l) override {
+    const auto &c = g.engine->model_file.architecture_config;
+    const std::string p = "blk." + std::to_string(l) + ".";
+    ggml_tensor *cur_pre = cur;
+    if (g.decode_mode && zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PROBE_DUMP")) {
+      ggml_set_output(cur_pre);
+      g.probe_x.push_back({l, cur_pre});
+    }
+    ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
+    if (!fn) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d missing FFN norm\n", l);
+      return nullptr;
+    }
+    cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), fn);
+    ggml_build_forward_expand(g.graph, residual);
+    ggml_build_forward_expand(g.graph, post);
+    ggml_build_forward_expand(g.graph, comb);
+    const auto bp_t1 = std::chrono::steady_clock::now();
+    if (!g.native_moe_cache && !build_pilot_stage(g, g.ctx, cur_pre, l))
+      return nullptr;
+    bp_pilot += bp_ms_since(bp_t1);
+    const auto bp_t2 = std::chrono::steady_clock::now();
+    ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l);
+    bp_ffn += bp_ms_since(bp_t2);
+    if (!ffn) {
+      LOG_WARN("[GGML-GLM5NEXT-FULL] build_ffn failed at layer=%d "
+               "graph_ram_ready=%d\n",
+               l, g.engine->graph_ram_layer_ready(l) ? 1 : 0);
+      return nullptr;
+    }
+    return ffn;
+  }
+};
+
+// Residual structure: hyper-connections (HC streams, hc_pre/hc_post around each block), or the plain
+// residual for GLM-DSA. This is the structure the LayerPlan interface exists for.
+struct GlmHcPlan final : zeromoe::graph::LayerPlan {
+  GlmHcPlan(FullGraph &graph, GlmAttention &attention, GlmFfn &ffn_block)
+      : g(graph), attn(attention), ffn(ffn_block) {}
+  FullGraph &g;
+  GlmAttention &attn;
+  GlmFfn &ffn;
+  // Returns the streams after layer l, or nullptr when the layer cannot be built.
+  ggml_tensor *build_layer(ggml_tensor *res, int l) override {
+    const auto &c = g.engine->model_file.architecture_config;
+    // The graph owns a complete DDR source arena, so this is a coarse
+    // per-layer admission point rather than a check on every tensor/alloc.
+    // If the background guard sees the host watermark crossed, decline the
+    // experimental graph and let the caller use the bounded legacy path.
+    if (MemoryGuard::allocation_blocked()) {
+      LOG_WARN("[GGML-GLM5NEXT-FULL] graph build stopped at layer %d/%d: "
+               "host memory watermark reached (MemAvailable=%ld MiB)\n",
+               l, g.n_layers, MemoryGuard::last_available_mb());
+      return nullptr;
+    }
+    const std::string p = "blk." + std::to_string(l) + ".";
+    ggml_tensor *post = nullptr;
+    ggml_tensor *comb = nullptr;
+    ggml_tensor *afn = resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
+    ggml_tensor *abase = resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
+    ggml_tensor *ascale = resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
+    if (g.HC > 1 && (!afn || !abase || !ascale)) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d attention HC weights "
+                 "unavailable fn=%d base=%d scale=%d HC=%d\n",
+                 l, afn != nullptr, abase != nullptr, ascale != nullptr, g.HC);
+      return nullptr;
+    }
+    ggml_tensor *residual = res;
+    ggml_tensor *cur = g.dsa_plain ? res : hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
+    ggml_tensor *attn_out = attn.build(cur, l);
+    if (!attn_out)
+      return nullptr;
+    res = g.dsa_plain ? ggml_add(g.ctx, residual, attn_out) : hc_post(g, g.ctx, attn_out, residual, post, comb);
+    if (g.decode_mode && layer_timing_env())
+      g.layer_marks[res] = {l, 0};
+
+    residual = res;
+    post = comb = nullptr;
+    ggml_tensor *ffn_fn = resident_tensor(g, g.ctx, p + "hc_ffn_fn.weight");
+    ggml_tensor *ffn_base = resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
+    ggml_tensor *ffn_scale =
+        resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
+    if (g.HC > 1 && (!ffn_fn || !ffn_base || !ffn_scale)) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d FFN HC weights unavailable "
+                 "fn=%d base=%d scale=%d HC=%d\n",
+                 l, ffn_fn != nullptr, ffn_base != nullptr,
+                 ffn_scale != nullptr, g.HC);
+      return nullptr;
+    }
+    cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
+    if (!cur) {
+      if (g.native_moe_cache)
+        LOG_WARN("[GGML-LING-HYBRID] layer=%d FFN hyper-connection input "
+                 "unavailable\n",
+                 l);
+      return nullptr;
+    }
+    ffn.residual = residual;
+    ffn.post = post;
+    ffn.comb = comb;
+    ggml_tensor *ffn_out = ffn.build(cur, l);
+    if (!ffn_out)
+      return nullptr;
+    res = g.dsa_plain ? ggml_add(g.ctx, residual, ffn_out) : hc_post(g, g.ctx, ffn_out, residual, post, comb);
+    if (g.decode_mode && layer_timing_env())
+      g.layer_marks[res] = {l, 1};
+    if (l >= c.first_dense && (l == c.first_dense || l + 1 == g.n_layers ||
+                               ((l - c.first_dense + 1) % 4) == 0)) {
+      LOG_INFO("[GGML-GLM5NEXT-FULL] graph source progress layer=%d/%d "
+               "expert_source=%.2f GiB MemAvailable=%ld MiB\n",
+               l + 1, g.n_layers,
+               (double)g.expert_source_used / (1024.0 * 1024.0 * 1024.0),
+               MemoryGuard::last_available_mb());
+    }
+    return res;
+  }
+};
 
 bool build_graph(FullGraph &g) {
   const auto &c = g.engine->model_file.architecture_config;
@@ -730,287 +1081,13 @@ bool build_graph(FullGraph &g) {
   }
 
   ggml_tensor *res = g.dsa_plain ? ggml_reshape_2d(g.ctx, g.input, g.D, g.S) : g.input;
-  ggml_tensor *previous_indexer_selection = nullptr;
-  ggml_tensor *previous_indexer_mask = nullptr;
+  GlmAttention attention_block(g, bp_attn);
+  GlmFfn ffn_block(g, bp_pilot, bp_ffn);
+  GlmHcPlan plan(g, attention_block, ffn_block);
   for (int l = 0; l < g.n_layers; ++l) {
-    // The graph owns a complete DDR source arena, so this is a coarse
-    // per-layer admission point rather than a check on every tensor/alloc.
-    // If the background guard sees the host watermark crossed, decline the
-    // experimental graph and let the caller use the bounded legacy path.
-    if (MemoryGuard::allocation_blocked()) {
-      LOG_WARN("[GGML-GLM5NEXT-FULL] graph build stopped at layer %d/%d: "
-               "host memory watermark reached (MemAvailable=%ld MiB)\n",
-               l, g.n_layers, MemoryGuard::last_available_mb());
+    res = plan.build_layer(res, l);
+    if (!res)
       return false;
-    }
-    const std::string p = "blk." + std::to_string(l) + ".";
-    ggml_tensor *post = nullptr;
-    ggml_tensor *comb = nullptr;
-    ggml_tensor *afn = resident_tensor(g, g.ctx, p + "hc_attn_fn.weight");
-    ggml_tensor *abase = resident_tensor(g, g.ctx, p + "hc_attn_base.weight");
-    ggml_tensor *ascale = resident_tensor(g, g.ctx, p + "hc_attn_scale.weight");
-    if (g.HC > 1 && (!afn || !abase || !ascale)) {
-      if (g.native_moe_cache)
-        LOG_WARN("[GGML-LING-HYBRID] layer=%d attention HC weights "
-                 "unavailable fn=%d base=%d scale=%d HC=%d\n",
-                 l, afn != nullptr, abase != nullptr, ascale != nullptr, g.HC);
-      return false;
-    }
-    ggml_tensor *residual = res;
-    ggml_tensor *cur = g.dsa_plain ? res : hc_pre(g, g.ctx, res, afn, ascale, abase, &post, &comb);
-    ggml_tensor *an = resident_tensor(g, g.ctx, p + "attn_norm.weight");
-    if (!cur || !an) {
-      if (g.native_moe_cache)
-        LOG_WARN("[GGML-LING-HYBRID] layer=%d attention input unavailable "
-                 "cur=%d norm=%d\n",
-                 l, cur != nullptr, an != nullptr);
-      return false;
-    }
-    cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), an);
-
-    ggml_tensor *attn = nullptr;
-    if (!g.dsa_plain && hybrid_is_kda_layer(c, l)) {
-      ggml_tensor *wq = resident_tensor(g, g.ctx, p + "attn_q.weight");
-      ggml_tensor *wk = resident_tensor(g, g.ctx, p + "attn_k.weight");
-      ggml_tensor *wv = resident_tensor(g, g.ctx, p + "attn_v.weight");
-      ggml_tensor *cq = resident_tensor(g, g.ctx, p + "ssm_conv1d_q.weight");
-      ggml_tensor *ck = resident_tensor(g, g.ctx, p + "ssm_conv1d_k.weight");
-      ggml_tensor *cv = resident_tensor(g, g.ctx, p + "ssm_conv1d_v.weight");
-      ggml_tensor *fa = resident_tensor(g, g.ctx, p + "ssm_f_a.weight");
-      ggml_tensor *fb = resident_tensor(g, g.ctx, p + "ssm_f_b.weight");
-      ggml_tensor *ga = resident_tensor(g, g.ctx, p + "ssm_g_a.weight");
-      ggml_tensor *gb = resident_tensor(g, g.ctx, p + "ssm_g_b.weight");
-      ggml_tensor *be = resident_tensor(g, g.ctx, p + "ssm_beta.weight");
-      ggml_tensor *aa = resident_tensor(g, g.ctx, p + "ssm_a");
-      ggml_tensor *dt = resident_tensor(g, g.ctx, p + "ssm_dt.bias");
-      ggml_tensor *nm = resident_tensor(g, g.ctx, p + "ssm_norm.weight");
-      ggml_tensor *ow = resident_tensor(g, g.ctx, p + "attn_output.weight");
-      const bool bailing = g.engine->family_ops.family == ModelFamily::BailingMoE3;
-      if (!wq || !wk || !wv || !cq || !ck || !cv || !fa ||
-      (!bailing && !fb) || !ga || (!bailing && !gb) ||
-      !be || !aa || !dt || !nm || !ow) {
-    if (g.native_moe_cache)
-      LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA weights unavailable "
-               "q=%d k=%d v=%d cq=%d ck=%d cv=%d fa=%d ga=%d beta=%d "
-               "a=%d dt=%d norm=%d out=%d\n",
-               l, wq != nullptr, wk != nullptr, wv != nullptr, cq != nullptr,
-               ck != nullptr, cv != nullptr, fa != nullptr, ga != nullptr,
-               be != nullptr, aa != nullptr, dt != nullptr, nm != nullptr,
-               ow != nullptr);
-        return false;
-  }
-      const int hist = g.d_conv - 1;
-      ggml_tensor *hi = nullptr;
-      ggml_tensor *si = nullptr;
-      if (g.decode_mode) {
-        hi = new_decode_state_tensor(
-            g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
-            "glm5next_decode_kda_history");
-        si = new_decode_state_tensor(
-            g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
-            "glm5next_decode_kda_state");
-        if (hi && si) {
-          g.kda_hist_storage.push_back(hi);
-          g.kda_state_storage.push_back(si);
-        }
-      } else {
-        hi = host_input(
-            g, g.ctx, GGML_TYPE_F32, {hist, 3 * g.d_inner, 1},
-            (size_t)hist * 3 * g.d_inner * sizeof(float),
-            "glm5next_kda_history");
-        si = host_input(
-            g, g.ctx, GGML_TYPE_F32, {g.hd, g.hd, g.H, 1},
-            (size_t)g.hd * g.hd * g.H * sizeof(float), "glm5next_kda_state");
-      }
-      if (!hi || !si) {
-        if (g.native_moe_cache)
-          LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA state allocation failed "
-                   "history=%d recurrent=%d\n",
-                   l, hi != nullptr, si != nullptr);
-        return false;
-      }
-      if (!g.decode_mode) {
-        g.kda_hist_inputs.push_back((float *)hi->data);
-        g.kda_state_inputs.push_back((float *)si->data);
-      }
-      ggml_tensor *so = nullptr;
-      ggml_tensor *ho = nullptr;
-      attn = build_kda(g, g.ctx, cur, l, wq, wk, wv, cq, ck, cv, fa, fb, ga, gb,
-                       be, aa, dt, nm, ow, hi, si, &so, &ho);
-  if (!attn || !so || !ho) {
-    if (g.native_moe_cache)
-      LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA graph build failed "
-               "attn=%d state=%d history=%d\n",
-               l, attn != nullptr, so != nullptr, ho != nullptr);
-        return false;
-  }
-      if (g.decode_mode) {
-        g.kda_state_updates.push_back(ggml_cpy(g.ctx, so, si));
-        g.kda_hist_updates.push_back(ggml_cpy(g.ctx, ho, hi));
-        if (!g.kda_state_updates.back() || !g.kda_hist_updates.back()) {
-          if (g.native_moe_cache)
-            LOG_WARN("[GGML-LING-HYBRID] layer=%d KDA state copy build failed\n",
-                     l);
-          return false;
-        }
-      } else {
-        g.kda_state_out.push_back(so);
-        g.kda_hist_out.push_back(ho);
-      }
-      g.kda_layers.push_back(l);
-    } else {
-      const bool bailing =
-          g.engine->family_ops.family == ModelFamily::BailingMoE3;
-      ggml_tensor *wqa = resident_tensor(g, g.ctx, p + "attn_q_a.weight");
-      ggml_tensor *wqan = resident_tensor(g, g.ctx, p + "attn_q_a_norm.weight");
-      ggml_tensor *wqb = resident_tensor(g, g.ctx, p + "attn_q_b.weight");
-      ggml_tensor *wkva = resident_tensor(g, g.ctx, p + "attn_kv_a_mqa.weight");
-      ggml_tensor *wkvan =
-          resident_tensor(g, g.ctx, p + "attn_kv_a_norm.weight");
-      ggml_tensor *wkb = static_full_weight(g, g.ctx, p + "attn_k_b.weight");
-      ggml_tensor *wvb = static_full_weight(g, g.ctx, p + "attn_v_b.weight");
-      ggml_tensor *wo = resident_tensor(g, g.ctx, p + "attn_output.weight");
-      ggml_tensor *wgate =
-          bailing ? resident_tensor(g, g.ctx, p + "attn_gate.weight")
-                  : nullptr;
-      if (!wqa || !wqan || !wqb || !wkva || !wkvan || !wkb || !wvb || !wo ||
-          (bailing && !wgate)) {
-        if (g.native_moe_cache)
-          LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA weights unavailable "
-                   "qa=%d qan=%d qb=%d kva=%d kvan=%d kb=%d vb=%d out=%d "
-                   "gate=%d\n",
-                   l, wqa != nullptr, wqan != nullptr, wqb != nullptr,
-                   wkva != nullptr, wkvan != nullptr, wkb != nullptr,
-                   wvb != nullptr, wo != nullptr, wgate != nullptr);
-        return false;
-      }
-      ggml_tensor *kv_cache = nullptr;
-      if (g.decode_mode) {
-        kv_cache = new_decode_state_tensor(
-            g, g.ctx, GGML_TYPE_F16, {g.kv_cache_width, g.kv_capacity},
-            "glm5next_decode_dsa_kv");
-        if (!kv_cache) {
-          if (g.native_moe_cache)
-            LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA KV cache allocation failed\n",
-                     l);
-          return false;
-        }
-        g.dsa_kv_storage.push_back(kv_cache);
-        if (g.sparse_decode && glm5next_indexer_owner(g, l)) {
-          Glm5nextIndexerLayer indexer_state;
-          indexer_state.layer = l;
-          indexer_state.key_gate_cache = new_decode_state_tensor(
-              g, g.ctx, GGML_TYPE_F32,
-              {2 * g.indexer_key_length, g.kv_capacity},
-              "glm5next_decode_indexer_key_gate");
-          indexer_state.pooled_cache = new_decode_state_tensor(
-              g, g.ctx, GGML_TYPE_F32,
-              {g.indexer_key_length, g.kv_capacity / g.indexer_kpool},
-              "glm5next_decode_indexer_pooled_keys");
-          if (!indexer_state.key_gate_cache || !indexer_state.pooled_cache) {
-            if (g.native_moe_cache)
-              LOG_WARN("[GGML-LING-HYBRID] layer=%d indexer state allocation "
-                       "failed key_gate=%d pooled=%d\n",
-                       l, indexer_state.key_gate_cache != nullptr,
-                       indexer_state.pooled_cache != nullptr);
-            return false;
-          }
-          g.glm5next_indexer_layers.push_back(indexer_state);
-        }
-      }
-      ggml_tensor *kv = nullptr;
-      const auto bp_t0 = std::chrono::steady_clock::now();
-      if (g.dsa_plain) {
-        attn = build_glm_dsa_attn(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb, wvb, wo, &kv, kv_cache);
-      } else if (bailing) {
-        attn = build_bailing_mla(g, g.ctx, cur, l, wqa, wqan, wqb, wkva,
-                                 wkvan, wkb, wvb, wo, wgate, &kv, kv_cache);
-      } else {
-        attn = build_dsa(g, g.ctx, cur, l, wqa, wqan, wqb, wkva, wkvan, wkb,
-                         wvb, wo, &kv, kv_cache, &previous_indexer_selection,
-                         &previous_indexer_mask);
-      }
-      bp_attn += bp_ms(bp_t0);
-  if (!attn || !kv) {
-    if (g.native_moe_cache)
-      LOG_WARN("[GGML-LING-HYBRID] layer=%d MLA graph build failed "
-               "attn=%d kv=%d q_a=%d q_a_norm=%d q_b=%d kv_a=%d "
-               "kv_a_norm=%d k_b=%d v_b=%d out=%d gate=%d\n",
-               l, attn != nullptr, kv != nullptr, wqa != nullptr,
-               wqan != nullptr, wqb != nullptr, wkva != nullptr,
-               wkvan != nullptr, wkb != nullptr, wvb != nullptr,
-               wo != nullptr, wgate != nullptr);
-        return false;
-  }
-      if (!g.decode_mode)
-        g.dsa_kv_out.push_back(kv);
-      g.dsa_layers.push_back(l);
-    }
-    res = g.dsa_plain ? ggml_add(g.ctx, residual, attn) : hc_post(g, g.ctx, attn, residual, post, comb);
-    if (g.decode_mode && layer_timing_env())
-      g.layer_marks[res] = {l, 0};
-
-    residual = res;
-    post = comb = nullptr;
-    ggml_tensor *ffn_fn = resident_tensor(g, g.ctx, p + "hc_ffn_fn.weight");
-    ggml_tensor *ffn_base = resident_tensor(g, g.ctx, p + "hc_ffn_base.weight");
-    ggml_tensor *ffn_scale =
-        resident_tensor(g, g.ctx, p + "hc_ffn_scale.weight");
-    if (g.HC > 1 && (!ffn_fn || !ffn_base || !ffn_scale)) {
-      if (g.native_moe_cache)
-        LOG_WARN("[GGML-LING-HYBRID] layer=%d FFN HC weights unavailable "
-                 "fn=%d base=%d scale=%d HC=%d\n",
-                 l, ffn_fn != nullptr, ffn_base != nullptr,
-                 ffn_scale != nullptr, g.HC);
-      return false;
-    }
-    cur = hc_pre(g, g.ctx, res, ffn_fn, ffn_scale, ffn_base, &post, &comb);
-    if (!cur) {
-      if (g.native_moe_cache)
-        LOG_WARN("[GGML-LING-HYBRID] layer=%d FFN hyper-connection input "
-                 "unavailable\n",
-                 l);
-      return false;
-    }
-    ggml_tensor *cur_pre = cur;
-    if (g.decode_mode && moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP")) {
-      ggml_set_output(cur_pre);
-      g.probe_x.push_back({l, cur_pre});
-    }
-    ggml_tensor *fn = resident_tensor(g, g.ctx, p + "ffn_norm.weight");
-    if (!fn) {
-      if (g.native_moe_cache)
-        LOG_WARN("[GGML-LING-HYBRID] layer=%d missing FFN norm\n", l);
-      return false;
-    }
-    cur = ggml_mul(g.ctx, ggml_rms_norm(g.ctx, cur, c.eps), fn);
-    ggml_build_forward_expand(g.graph, residual);
-    ggml_build_forward_expand(g.graph, post);
-    ggml_build_forward_expand(g.graph, comb);
-    const auto bp_t1 = std::chrono::steady_clock::now();
-    if (!g.native_moe_cache && !build_pilot_stage(g, g.ctx, cur_pre, l))
-      return false;
-    bp_pilot += bp_ms(bp_t1);
-    const auto bp_t2 = std::chrono::steady_clock::now();
-    ggml_tensor *ffn = build_ffn(g, g.ctx, cur, l);
-    bp_ffn += bp_ms(bp_t2);
-    if (!ffn) {
-      LOG_WARN("[GGML-GLM5NEXT-FULL] build_ffn failed at layer=%d "
-               "graph_ram_ready=%d\n",
-               l, g.engine->graph_ram_layer_ready(l) ? 1 : 0);
-      return false;
-    }
-    res = g.dsa_plain ? ggml_add(g.ctx, residual, ffn) : hc_post(g, g.ctx, ffn, residual, post, comb);
-    if (g.decode_mode && layer_timing_env())
-      g.layer_marks[res] = {l, 1};
-    if (l >= c.first_dense && (l == c.first_dense || l + 1 == g.n_layers ||
-                               ((l - c.first_dense + 1) % 4) == 0)) {
-      LOG_INFO("[GGML-GLM5NEXT-FULL] graph source progress layer=%d/%d "
-               "expert_source=%.2f GiB MemAvailable=%ld MiB\n",
-               l + 1, g.n_layers,
-               (double)g.expert_source_used / (1024.0 * 1024.0 * 1024.0),
-               MemoryGuard::last_available_mb());
-    }
   }
 
   g.final_streams = res;
@@ -1023,7 +1100,7 @@ bool build_graph(FullGraph &g) {
   ggml_build_forward_expand(g.graph, g.final_streams);
   ggml_set_output(g.output);
   ggml_build_forward_expand(g.graph, g.output);
-  if (g.decode_mode && !moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
+  if (g.decode_mode && !zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_LM_HEAD")) {
     ggml_tensor *out_norm = resident_tensor(g, g.ctx, "output_norm.weight");
     ggml_tensor *out_w = resident_tensor(g, g.ctx, "output.weight");
     if (out_norm && out_w) {
@@ -1038,7 +1115,7 @@ bool build_graph(FullGraph &g) {
     }
   }
   if (!g.decode_mode && !g.native_moe_cache && g.dense_owner &&
-      !moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_LM_HEAD")) {
+      !zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_LM_HEAD")) {
     // Prefill does not need the LM head, but the decode graph built right
     // after it does.  Materialize those two weights into the shared owner
     // before the first output so the prompt->decode transition does not pay
@@ -1143,7 +1220,7 @@ bool build_graph(FullGraph &g) {
     }
     LOG_INFO("[GGML-GLM5NEXT-FULL] non-CUDA nodes: %s\n", detail.c_str());
   }
-  if (const char *dl = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_SPLIT_DUMP")) {
+  if (const char *dl = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_SPLIT_DUMP")) {
     // Debug: print the backend of every node of one MoE layer (from the previous layer's end to this layer's end).
     const std::string tag = std::string("_") + dl; // node names of the layer end with _<layer>
     int first = -1, last = -1;
@@ -1165,7 +1242,7 @@ bool build_graph(FullGraph &g) {
       }
     }
   }
-  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_WS_DUMP")) {
+  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_WS_DUMP")) {
     // Debug: intermediate-tensor liveness over graph order; prints the live-set peak and its largest members.
     const int n = ggml_graph_n_nodes(g.graph);
     std::unordered_map<const ggml_tensor *, int> idx;
@@ -1270,4 +1347,4 @@ bool build_graph(FullGraph &g) {
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

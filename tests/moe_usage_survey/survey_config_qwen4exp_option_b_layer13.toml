@@ -5,11 +5,11 @@
 # ~27-28 tok/s steady-state decode, verified coherent).
 #
 # Launch with (matches the verified recipe exactly):
-#   MOESTREAM_SURVEY_BINARY=build_ggmlcuda/moestream
-#   CUDA_VISIBLE_DEVICES=0 MOESTREAM_CUDA_SCHEDULE=auto
-#   MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
-#   MOESTREAM_BENCH_IGNORE_STOP=1 (forces exactly --ngen tokens/response --
+#   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
+#   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
+#   ZEROMOE_BENCH_IGNORE_STOP=1 (forces exactly --ngen tokens/response --
 #   verified coherent continuation on this fixed build, not the degenerate
 #   collapse seen before the HC bugfix)
 #
@@ -22,13 +22,13 @@
 #      a real per-(layer,expert) routing histogram instead of reusing the
 #      frozen 7-prompt tuning file.
 #   3. max_new_tokens raised to 150 (matches --ngen below; with
-#      MOESTREAM_BENCH_IGNORE_STOP=1 this guarantees >=120 output
+#      ZEROMOE_BENCH_IGNORE_STOP=1 this guarantees >=120 output
 #      tokens/question, the original survey requirement).
 
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 
 cpu_affinity_layers = []
-log_path = "/home/ray/Projects/MoEStream/logs/qwen4exp_survey_106prompts_option_b_layer13.log"
+log_path = "/home/ray/Projects/ZeroMoE/logs/qwen4exp_survey_106prompts_option_b_layer13.log"
 log_level = "INFO"
 
 context_size = 2048
@@ -53,8 +53,8 @@ prefetch_worker_threads = 4
 # SURVEY: dedicated usage files, not the frozen 7-prompt tuning file the
 # scratch original ships with. freeze_usage_stats=false so this 106-prompt
 # run actually accumulates fresh (layer,expert) hit counts.
-pin_file           = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey_qwen4exp_option_b_layer13"
-prefill_pin_file   = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey_qwen4exp_option_b_layer13_prefill"
+pin_file           = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_option_b_layer13"
+prefill_pin_file   = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_option_b_layer13_prefill"
 freeze_usage_stats = false
 
 qwen4exp_option_b_layer = 13

@@ -63,15 +63,15 @@ formats are not.
 Build and run the isolated correctness/benchmark test:
 
 ```bash
-cmake --build build -j2 --target moestream_tests
-MOESTREAM_TEST_ONLY_Q2_0_VNNI=1 ./build/moestream_tests
+cmake --build build -j2 --target zeromoe_tests
+ZEROMOE_TEST_ONLY_Q2_0_VNNI=1 ./build/zeromoe_tests
 ```
 
 VNNI is now the default on supported CPUs. To force the GGML fallback with the
 same test:
 
 ```bash
-MOESTREAM_TEST_ONLY_Q2_0_VNNI=1 MOESTREAM_Q2_0_DISABLE_VNNI=1 ./build/moestream_tests
+ZEROMOE_TEST_ONLY_Q2_0_VNNI=1 ZEROMOE_Q2_0_DISABLE_VNNI=1 ./build/zeromoe_tests
 ```
 
 Unsupported CPUs always use the linked GGML dot. The focused test also checks

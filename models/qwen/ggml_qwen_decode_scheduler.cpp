@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #include "gpu_topology.hpp"
 #include "ggml.h"
@@ -173,7 +173,7 @@ bool GgmlQwenDecodeGraphRunner::ensure(int device, int d_model,
   }
   // llama.cpp's whole-model scheduler explicitly gives its CPU backend the same
   // decode threadpool as the rest of the inference graph.  Without this,
-  // MoEStream's opt-in Qwen topology silently executes CPU MUL_MAT_ID with
+  // ZeroMoE's opt-in Qwen topology silently executes CPU MUL_MAT_ID with
   // the backend default (effectively one worker), which is why the first
   // scheduler A/B measured only 1.7 tok/s despite placing the nodes on CPU.
   // Keep this entirely inside the Qwen-only, config-gated runner; the normal
@@ -846,7 +846,7 @@ bool GgmlQwenDecodeGraphRunner::run(
 }
 
 // ---------------------------------------------------------------------------
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 bool GgmlQwenDecodeGraphRunner::compiled_in() { return false; }
 GgmlQwenDecodeGraphRunner &GgmlQwenDecodeGraphRunner::instance() {
   static GgmlQwenDecodeGraphRunner r;
@@ -867,4 +867,4 @@ bool GgmlQwenDecodeGraphRunner::run(const void *, const GgmlQwenDecodeGraphRef &
   return false;
 }
 void GgmlQwenDecodeGraphRunner::shutdown() {}
-#endif  // MOESTREAM_USE_GGML_CUDA
+#endif  // ZEROMOE_USE_GGML_CUDA

@@ -5,22 +5,22 @@
 # full-graph's throughput (smoke-tested: ~0.012ms callback overhead/token,
 # steady-state decode unchanged at ~34-36ms/token).
 #
-# Launch with (adds MOESTREAM_QWEN4EXP_FULL_GRAPH=1 vs the older
+# Launch with (adds ZEROMOE_QWEN4EXP_FULL_GRAPH=1 vs the older
 # gpu_stage_test.toml recipe -- decode's full graph requires prefill to have
 # ALSO run through full graph first, to seed GDN/KV/PLE state; this also
 # turns out to give route_freq_prefill real data for free, via the existing
 # pilot-router prefetch pass, which still runs through the legacy
 # moe_router_service.cpp path even when full-graph prefill is on):
-#   MOESTREAM_SURVEY_BINARY=build_ggmlcuda/moestream
-#   CUDA_VISIBLE_DEVICES=0 MOESTREAM_CUDA_SCHEDULE=auto
-#   MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
-#   MOESTREAM_BENCH_IGNORE_STOP=1
+#   ZEROMOE_SURVEY_BINARY=build_ggmlcuda/zeromoe
+#   CUDA_VISIBLE_DEVICES=0 ZEROMOE_CUDA_SCHEDULE=auto
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=22
+#   ZEROMOE_BENCH_IGNORE_STOP=1
 
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
 
 cpu_affinity_layers = []
-log_path = "/home/ray/Projects/MoEStream/logs/qwen4exp_survey_106prompts_usage_tap.log"
+log_path = "/home/ray/Projects/ZeroMoE/logs/qwen4exp_survey_106prompts_usage_tap.log"
 log_level = "INFO"
 
 context_size = 2048
@@ -46,8 +46,8 @@ prefetch_worker_threads = 4
 # came out empty -- see qwen4exp_track_router_usage's own comment for why).
 # freeze_usage_stats=false so this 106-prompt run actually accumulates fresh
 # (layer,expert) hit counts.
-pin_file           = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap"
-prefill_pin_file   = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap_prefill"
+pin_file           = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
+prefill_pin_file   = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap_prefill"
 freeze_usage_stats = false
 
 qwen4exp_option_b_layer = -1

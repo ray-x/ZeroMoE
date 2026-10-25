@@ -1,4 +1,4 @@
-# MoEStream — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
+# ZeroMoE — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
 #
 # NOTE: UD-IQ2_M is a COMPLETE GLM-5.2 model (dense at Q5_K/Q6_K/Q8_0, experts at
 # Q2_K/Q3_K packed as *_exps). Run it alone — dense_model_path is commented
@@ -11,7 +11,7 @@ model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_pack"
 # dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
 log_path = "debug.log"   # empty (default) = stderr
 log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
-prefill_pin_file = ".moestream_usage_prefill"
+prefill_pin_file = ".zeromoe_usage_prefill"
 # Was DEBUG + verbose_moe_log=true for the pin_topk_per_layer A/B test below --
 # both are high-volume (one line per routed expert per token) and cost real
 # throughput; switched back to real-run defaults. Re-enable only when actively
@@ -103,7 +103,7 @@ omp_max_threads = 8
 # Re-enabled for testing (was pin_file="" / pin_threshold=0 -- see
 # glm52_dual.toml's history for why it had been turned off, and re-verify
 # hit rate before/after on this checkpoint given that prior result).
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Capped (was 0/auto-fill-available-capacity): a real run showed auto-fill
 # pinning 1579/1642 VRAM slots (96%) at startup from a prior run's usage
@@ -116,7 +116,7 @@ pin_threshold = 6
 # A/B test at 13 (975/1642 slots, ~59% of the VRAM cache) showed hit rate
 # went slightly DOWN (52.3% vs. 53.4-53.9% at 8/layer), not up, while
 # Pinned residents grew to ~60% of the whole cache -- no measured benefit
-# from pinning more given how thin .moestream_usage's history still is
+# from pinning more given how thin .zeromoe_usage's history still is
 # (max count ~24-25). Reverted back to 8, with a note not to raise it again
 # until the usage file has a much richer history.
 #

@@ -35,12 +35,12 @@ run() { # name rep
   while :; do
     local competing
     competing=$(nvidia-smi --id="$GPU" --query-compute-apps=pid,process_name --format=csv,noheader)
-    if ! pgrep -x moestream >/dev/null && [[ -z "$competing" ]]; then break; fi
+    if ! pgrep -x zeromoe >/dev/null && [[ -z "$competing" ]]; then break; fi
     sleep 3
   done
-  echo "$PROMPT" | env CUDA_VISIBLE_DEVICES=$GPU MOESTREAM_QWEN4EXP_FULL_GRAPH=1 \
-    MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
-    MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 MOESTREAM_TOKEN_LOOP_DIAG=1 MOESTREAM_BENCH_IGNORE_STOP=1 \
+  echo "$PROMPT" | env CUDA_VISIBLE_DEVICES=$GPU ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
+    ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 \
+    ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
     ../moestream-build-upstream-master/moestream --config "$cfg" --ngen "$NGEN" > "logs/$tag.stdout" 2>&1
   grep TOKEN-LOOP-DIAG "logs/$tag.engine.log" 2>/dev/null |
     sed -E 's/.*step=([0-9]+) iter_total=([0-9.]+)ms.*/\1 \2/' |

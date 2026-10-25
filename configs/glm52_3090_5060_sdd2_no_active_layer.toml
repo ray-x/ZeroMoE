@@ -50,7 +50,7 @@ vram_evict_demote_to_ram = true
 expert_fetch_threads = 8
 omp_max_threads = 8
 
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 pin_topk_per_layer = 12
 pin_strategy = "global_topn"

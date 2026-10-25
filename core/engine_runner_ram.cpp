@@ -66,12 +66,12 @@ std::expected<void, std::string> EngineRunner::validate_expert_placement() {
   const double gib = 1024.0 * 1024.0 * 1024.0;
   engine.moe_placement = {
       .placement = vram_slots >= total_slots
-                       ? moestream::graph::ExpertPlacementClass::AllVram
+                       ? zeromoe::graph::ExpertPlacementClass::AllVram
                        : (vram_slots > 0 && ram_slots > 0
-                              ? moestream::graph::ExpertPlacementClass::MixedVramDdr
+                              ? zeromoe::graph::ExpertPlacementClass::MixedVramDdr
                               : (ram_slots > 0
-                                     ? moestream::graph::ExpertPlacementClass::DdrOnly
-                                     : moestream::graph::ExpertPlacementClass::StorageBacked)),
+                                     ? zeromoe::graph::ExpertPlacementClass::DdrOnly
+                                     : zeromoe::graph::ExpertPlacementClass::StorageBacked)),
       .model_slots = total_slots,
       .ddr_slots = ram_slots,
       .vram_slots = vram_slots,
@@ -83,10 +83,10 @@ std::expected<void, std::string> EngineRunner::validate_expert_placement() {
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
   const auto capabilities =
       graph_model ? graph_model->moe_execution_capabilities()
-                  : moestream::graph::MoEExecutionCapabilities{};
-  const auto prefill_policy = moestream::graph::resolve_execution_policy(
+                  : zeromoe::graph::MoEExecutionCapabilities{};
+  const auto prefill_policy = zeromoe::graph::resolve_execution_policy(
       engine.moe_placement, capabilities, ModelGraphPhase::Prefill);
-  const auto decode_policy = moestream::graph::resolve_execution_policy(
+  const auto decode_policy = zeromoe::graph::resolve_execution_policy(
       engine.moe_placement, capabilities, ModelGraphPhase::Decode);
   engine.moe_prefill_execution = prefill_policy.moe;
   engine.moe_decode_execution = decode_policy.moe;
@@ -224,7 +224,7 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
   // source-backed fallback and retain normal lazy cache behavior.
   if (ram_graph_cache) {
     const char *layer0_diag_env =
-        std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
+        std::getenv("ZEROMOE_QWEN4EXP_DIAG_LAYER0_RESIDUAL");
     const bool narrow_layer0_diag =
         layer0_diag_env && layer0_diag_env[0] == '1';
     std::vector<int> graph_ram_full_layers;
@@ -266,11 +266,11 @@ std::expected<void, std::string> EngineRunner::init_ram_tier() {
       // explicit opt-out for A/B comparisons; it changes only the DDR arena
       // layout, not layer placement or graph topology.
       const char *compact_env = std::getenv(
-          "MOESTREAM_QWEN4EXP_GRAPH_PROJECTION_COMPACT");
+          "ZEROMOE_QWEN4EXP_GRAPH_PROJECTION_COMPACT");
       const bool projection_compact_enabled =
           !(compact_env && compact_env[0] == '0');
       const char *host_node_env =
-          std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+          std::getenv("ZEROMOE_QWEN4EXP_HOST_NODE");
       const bool host_node_enabled = host_node_env && host_node_env[0] == '1';
       // The legacy scheduler CPUOffload path still uses the single-stride
       // runner, so retain its interleaved arena. The opt-in host-node path

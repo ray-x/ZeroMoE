@@ -1,7 +1,7 @@
 # Option-B VRAM budget, legacy cache removal and expert-pool sizing (2026-10-05)
 
 Qwen3.8-Flash-Next **Q2_0** (`/data/sdb/models/qwen3.8-flash-next/Q2_0`, verified with `gguf_tool verify`), RTX 3090 24 GiB (220 W power limit),
-Xeon W-2235, 10 CPU threads, single-GPU full-graph decode (`MOESTREAM_QWEN4EXP_FULL_GRAPH=1`, `..._DECODE=1`, `GRAPH_PRELOAD_LAYERS=0`),
+Xeon W-2235, 10 CPU threads, single-GPU full-graph decode (`ZEROMOE_QWEN4EXP_FULL_GRAPH=1`, `..._DECODE=1`, `GRAPH_PRELOAD_LAYERS=0`),
 engine `../moestream-build-upstream-master/moestream` built from this tree. Decode speed = mean of `TOKEN-LOOP-DIAG iter_total`, steps >= 3.
 Related: `docs/handoff-2026-10-03-option-b-global-pool.md` (global pool and the teacher-forced numerics), `docs/runtime-settings.md`.
 
@@ -18,7 +18,7 @@ DeepSeek-V4, ...) still use the shared layered machinery; do not delete it for t
 | `99fd1ac` | Option-B global expert-pool selection, off by default (`qwen4exp_option_b_global_top_k`, `..._global_floor_per_layer`) |
 | `4d97b26` | Qwen4Exp full graph: legacy VRAM expert cache and active-layer area are never created when the decode graph is on |
 | `2138f09`, `2cc77bf` | Fixes: partial staging had mis-ordered `main.cpp` (use before declaration) and mis-placed the unit test in `tests/test_components.cpp`; both verified by compiling an exported clean HEAD tree |
-| **uncommitted** | `MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB` override in `src/ggml_qwen4exp_graph.cpp` (default unchanged); `bench/option_b_vram_probe.sh`, `bench/option_b_vram_stress.sh`, `bench/option_b_survey_coverage.py`, this document |
+| **uncommitted** | `ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB` override in `src/ggml_qwen4exp_graph.cpp` (default unchanged); `bench/option_b_vram_probe.sh`, `bench/option_b_vram_stress.sh`, `bench/option_b_survey_coverage.py`, this document |
 
 ## 3. Findings
 
@@ -50,7 +50,7 @@ Single runs; run-to-run spread is a few percent. Coverage is predicted from the 
 **F4. Admission floor and the all-CPU fallback.** The graph allocator refuses to reserve when free VRAM < 1.00 GiB. At K = 14,746 the decode-graph build saw 0.98 GiB free:
 `refusing graph allocator reserve: device 0 free=0.98 GiB < 1.00 GiB safety floor ... falling back to the legacy path`, then `graph construction declined; layered decode
 remains active`: the run decoded **all-CPU at ~835 ms/token** (the legacy cache was gone, F1). By arithmetic K <= ~14,729 passes the default floor. The code comment says the measured S=1
-decode workspace is ~0.13 GiB, so the floor is conservative for decode; `MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512` (opt-in, 64..4096) lets K = 14,746 build and decode (steady free 1.38 GiB, min 1.22).
+decode workspace is ~0.13 GiB, so the floor is conservative for decode; `ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512` (opt-in, 64..4096) lets K = 14,746 build and decode (steady free 1.38 GiB, min 1.22).
 This is exactly the silent-slow-fallback the full-graph-only policy forbids: stage 2 should turn it into a hard error.
 
 **F5. Stress sessions (`bench/option_b_vram_stress.sh`: one process, 5 requests SHORT/LONG/SHORT/LONG/SHORT = 28/402/28/402/28 tokens, 48 new tokens each).**
@@ -74,13 +74,13 @@ Not yet run at K >= 13,100.
 
 ## 4. How to reproduce
 
-Prerequisites: idle 3090 (the scripts wait for it), quiet CPU, `../moestream-build-upstream-master/moestream` built from this tree (`make -j6 moestream` in that directory),
+Prerequisites: idle 3090 (the scripts wait for it), quiet CPU, `../moestream-build-upstream-master/moestream` built from this tree (`make -j6 zeromoe` in that directory),
 model verified: `../moestream-build-upstream-master/gguf_tool verify /data/sdb/models/qwen3.8-flash-next/Q2_0`. Run from the repo root. Each script writes under `logs/` and exits non-zero on fallback/error.
 
 ```bash
 python3 bench/option_b_survey_coverage.py                       # F3 sizing and coverage table (needs no GPU)
 bench/option_b_vram_probe.sh 14554                              # F3: steady VRAM + decode tok/s for K=14554 (~1 min)
-MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512 bench/option_b_vram_probe.sh 14746   # F4: K above the default floor
+ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512 bench/option_b_vram_probe.sh 14746   # F4: K above the default floor
 bench/option_b_vram_stress.sh 14554                             # F5: 5-request session (~3 min)
 bench/option_b_global_pool_ab.sh 0 7 128                        # F2: A/B/C/D, 7 order-balanced reps (A = right-sized baseline)
 python3 bench/option_b_global_pool_check.py --prompt-file <single-line prompt> --out-dir logs/<dir> --ngen 64   # F6

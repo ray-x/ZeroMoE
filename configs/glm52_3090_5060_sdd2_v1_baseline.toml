@@ -13,7 +13,7 @@
 # skipped, falling back to the pre-existing main-cache promotion path).
 # === END V1 BASELINE NOTE ===
 #
-# MoEStream — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
+# ZeroMoE — GLM-5.2 dual-GPU config (RTX 5060 Ti core + RTX 3090 vault)
 #
 # NOTE: UD-IQ2_M is a COMPLETE GLM-5.2 model (dense at Q5_K/Q6_K/Q8_0, experts at
 # Q2_K/Q3_K packed as *_exps). Run it alone — dense_model_path is commented
@@ -200,7 +200,7 @@ disk_batch_padding_target = 8
 # also_in_vram=true at promotion time (a pre-existing gap, see CLAUDE.md),
 # so the population this feature draws from is nearly always empty in
 # practice. Turned off here (not just numerically inert but removed as a
-# variable entirely) while isolating the MoEStream_8.2 reference-vs-current
+# variable entirely) while isolating the ZeroMoE_8.2 reference-vs-current
 # gap to a single-variable A/B -- re-enable only after the also_in_vram gap
 # is fixed and there's a real population for it to reclaim from.
 disk_batch_padding_evict_dup = false
@@ -479,10 +479,10 @@ omp_max_threads = 10
 # Re-enabled for testing (was pin_file="" / pin_threshold=0 -- see
 # glm52_dual.toml's history for why it had been turned off, and re-verify
 # hit rate before/after on this checkpoint given that prior result).
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # prefill_pin_file: NEVER set in this config until now -- confirmed via a
-# filesystem-wide search that .moestream_usage_prefill has never existed
+# filesystem-wide search that .zeromoe_usage_prefill has never existed
 # anywhere on this box, for GLM or DeepSeek, in this tree OR the 8.2/8.3_pb
 # reference trees (dump_usage_prefill() no-ops when this is empty). So this
 # is NOT part of the decode-throughput gap chased against the 8.2 reference
@@ -504,7 +504,7 @@ pin_threshold = 6
 # watch `prefill=X tok/s` and the `[PIN] prefill_pin_file (...)` startup log
 # line specifically, not the decode/overall numbers this session has mostly
 # been tracking so far.
-prefill_pin_file = ".moestream_usage_prefill"
+prefill_pin_file = ".zeromoe_usage_prefill"
 # 2026-08-12 finding: prefill_pin_file's merge fix correctly bounds prefill's
 # GUARANTEED share of pinned VRAM to pin_global_floor_per_layer (=1 below,
 # 75 slots total) -- real evidence: "Prefill warm-up: N attempted" in the
@@ -547,7 +547,7 @@ prefill_opportunistic_promote = false
 # A/B test at 13 (975/1642 slots, ~59% of the VRAM cache) showed hit rate
 # went slightly DOWN (52.3% vs. 53.4-53.9% at 8/layer), not up, while
 # Pinned residents grew to ~60% of the whole cache -- no measured benefit
-# from pinning more given how thin .moestream_usage's history still is
+# from pinning more given how thin .zeromoe_usage's history still is
 # (max count ~24-25). Reverted back to 8, with a note not to raise it again
 # until the usage file has a much richer history.
 #
@@ -754,7 +754,7 @@ speculative_promote_to_active_layer = false
 # narrower of the two.
 speculative_active_layer_max_k = 8
 
-# Reverted to true for a controlled A/B against the MoEStream_8.2 reference
+# Reverted to true for a controlled A/B against the ZeroMoE_8.2 reference
 # (0.75 decode tok/s, 79% hit, host_ram_gb=120/pinned_vram_capacity=1300,
 # move_on_promotion=true) -- COPY semantics + ram_copy_reclaim_threshold was
 # never validated as a win for GLM specifically (only DeepSeek), and was

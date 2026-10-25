@@ -85,7 +85,7 @@ struct PerfCountersPart08 : PerfCountersPart07 {
     // (routinely the single largest cost bucket in this project), and any
     // cold-cache disk-bound expert loading triggered by the FIRST-ever
     // visit to every layer. On a cold-cache run (thin/absent
-    // .moestream_usage history) that one prefill call can be dominated by
+    // .zeromoe_usage history) that one prefill call can be dominated by
     // disk I/O across all 78 layers -- exactly the kind of large, real,
     // non-attention cost that was silently inflating "Attention (MLA)" in
     // dump_report() and made a genuine, still-partially-open GPU-stall

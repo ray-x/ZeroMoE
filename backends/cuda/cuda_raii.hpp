@@ -20,7 +20,7 @@
 #include <limits>
 #include <utility>
 
-namespace moestream::cuda {
+namespace zeromoe::cuda {
 
 // Makes `device` current for the lifetime of the scope; a no-op if it already is
 // or if device < 0. Restores the previous device on exit.
@@ -325,4 +325,4 @@ class CudaStream {
   int device_ = -1;
 };
 
-}  // namespace moestream::cuda
+}  // namespace zeromoe::cuda

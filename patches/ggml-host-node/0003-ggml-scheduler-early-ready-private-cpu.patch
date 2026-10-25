@@ -1,0 +1,57 @@
+--- a/src/ggml-backend.cpp
++++ b/src/ggml-backend.cpp
+@@ -23,6 +23,17 @@
+ #include <unordered_map>
+ #include <vector>
+ 
++#if defined(__GNUC__) && !defined(_WIN32)
++extern "C" int zeromoe_ggml_sched_early_cpu(
++    ggml_backend_t, ggml_cgraph *, int64_t *, int64_t *) __attribute__((weak));
++extern "C" {
++GGML_API int ggml_backend_sched_early_cpu_supported();
++int ggml_backend_sched_early_cpu_supported() {
++    return zeromoe_ggml_sched_early_cpu != nullptr ? 1 : 0;
++}
++}
++#endif
++
+ #ifdef __APPLE__
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+@@ -1873,9 +1884,25 @@
+         int split_backend_id = split->backend_id;
+         ggml_backend_t split_backend = sched->backends[split_backend_id];
+ 
++        // Run a private CPU marker as soon as its CUDA input event is ready.
++        // Ordinary CPU splits keep the existing synchronization and compute path.
++        bool early_cpu = false;
++        int64_t early_wait_us = 0;
++        int64_t early_compute_us = 0;
++#if defined(__GNUC__) && !defined(_WIN32)
++        if (!sched->callback_eval && split->n_inputs == 0 &&
++            ggml_backend_dev_type(ggml_backend_get_device(split_backend)) ==
++                GGML_BACKEND_DEVICE_TYPE_CPU &&
++            zeromoe_ggml_sched_early_cpu != nullptr) {
++            early_cpu = zeromoe_ggml_sched_early_cpu(
++                split_backend, &split->graph, &early_wait_us,
++                &early_compute_us) == 1;
++        }
++#endif
++
+         // ensure the previous split's async work has completed before we start
+         // this split, the allocator may have reused buffer regions across splits
+-        if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
++        if (!early_cpu && split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
+                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+             } else {
+@@ -1897,7 +1924,8 @@
+         }
+ 
+         if (!sched->callback_eval) {
+-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
++            enum ggml_status ec = early_cpu ? GGML_STATUS_SUCCESS :
++                ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }

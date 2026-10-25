@@ -30,7 +30,7 @@ bool test_unpacked_format_relaxed_check() {
     std::cout << "[Test 19] sanity_check_unpacked_format() relaxation (mixed-size layer accepted, "
                  "geometry shortcut refuses)...\n";
 
-    const std::string mixed_path = "/tmp/moestream_test_mixed_layer0.gguf";
+    const std::string mixed_path = "/tmp/zeromoe_test_mixed_layer0.gguf";
     StreamingEngine engine;
     if (!engine.model_file.load_header(mixed_path)) {
         std::cout << "  -> SKIPPED (Test 18's mixed-layer file not found -- did it run first?)\n";
@@ -141,7 +141,7 @@ bool test_compute_expert_slab_bytes_max() {
         }
     }
 
-    std::string out_path = "/tmp/moestream_test_mixed_layer0_swapped.gguf";
+    std::string out_path = "/tmp/zeromoe_test_mixed_layer0_swapped.gguf";
     {
         FILE* out = fopen(out_path.c_str(), "wb");
         if (!out) { std::cout << "  -> FAILED (cannot write " << out_path << ")\n"; return false; }
@@ -547,12 +547,12 @@ bool test_vram_cache_mixed_sizes() {
 // (src_already_pinned=true) -- the permanent regression guard, always runs,
 // expected to be sanitizer-clean.
 //
-// Set MOESTREAM_REPRO_SANITIZER_ISSUE=1 to ALSO run a second, deliberate
+// Set ZEROMOE_REPRO_SANITIZER_ISSUE=1 to ALSO run a second, deliberate
 // call with the hint omitted (src_already_pinned=false, the pre-fix shape)
 // -- this is what actually reproduces the flagged-but-harmless
 // cudaErrorHostMemoryAlreadyRegistered under compute-sanitizer (confirmed:
-// `MOESTREAM_REPRO_SANITIZER_ISSUE=1 compute-sanitizer --tool memcheck
-// ./moestream_tests` -> exactly 2 errors, both attributed to this call, 0
+// `ZEROMOE_REPRO_SANITIZER_ISSUE=1 compute-sanitizer --tool memcheck
+// ./zeromoe_tests` -> exactly 2 errors, both attributed to this call, 0
 // anywhere else). Off by default so a normal `compute-sanitizer` pass over
 // this whole suite stays a trustworthy "0 errors" signal -- this
 // demonstration call is not itself a bug, it's the OLD, still-correct
@@ -617,13 +617,13 @@ bool test_upload_async_already_pinned_src() {
     // the flagged sanitizer error, since host_data is already registered by
     // this test above and upload_expert_async will still try
     // cudaHostRegister on it speculatively when not told otherwise.
-    if (std::getenv("MOESTREAM_REPRO_SANITIZER_ISSUE")) {
+    if (std::getenv("ZEROMOE_REPRO_SANITIZER_ISSUE")) {
         src_a = make_registered_buf(1001);
         if (src_a.empty()) return true;  // setup skip already logged
         ExpertLocation* loc_a = gpu.topology.upload_expert_async(0, 0, src_a.data(), buf_bytes);
         all_ok &= verify_upload("no-hint call (expect a flagged-but-harmless sanitizer error above)", loc_a, src_a);
     } else {
-        std::cout << "  no-hint demonstration: SKIPPED by default (set MOESTREAM_REPRO_SANITIZER_ISSUE=1 "
+        std::cout << "  no-hint demonstration: SKIPPED by default (set ZEROMOE_REPRO_SANITIZER_ISSUE=1 "
                      "to reproduce the flagged-but-harmless sanitizer error this test's fix removes)\n";
     }
 

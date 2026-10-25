@@ -9,9 +9,9 @@ parameterises them.
 
 A model's execution configuration today is scattered across three disconnected places:
 
-1. **`MOESTREAM_*` env vars** read through `models/graph/graph_config.hpp` (`graphcfg::flag_on` /
-   `integer` / `atoi_or` / …): e.g. `MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB`,
-   `MOESTREAM_GLM5NEXT_EARLY_READY`, `MOESTREAM_DSV41_PILOT_K`.
+1. **`ZEROMOE_*` env vars** read through `models/graph/graph_config.hpp` (`graphcfg::flag_on` /
+   `integer` / `atoi_or` / …): e.g. `ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB`,
+   `ZEROMOE_GLM5NEXT_EARLY_READY`, `ZEROMOE_DSV41_PILOT_K`.
 2. **Per-family constants and `static` decision lambdas** inside the graph builders.
 3. **`docs/models/*.md` recipes** — human-readable, not loadable by the engine.
 
@@ -19,7 +19,7 @@ Three consequences, all of which the design review flagged:
 
 - **Tune-from-zero.** Adding a model means re-deriving every knob from first principles.
 - **Clobbering.** The knobs are a flat namespace, so running model B can silently inherit or
-  override model A's tuning (`MOESTREAM_GLM5NEXT_*` vs `MOESTREAM_DSV41_*` is a convention, not a
+  override model A's tuning (`ZEROMOE_GLM5NEXT_*` vs `ZEROMOE_DSV41_*` is a convention, not a
   mechanism).
 - **The selected strategy is not a datum.** It is implicit in *which* env vars happen to be set,
   so "what strategy ran" cannot be read off, diffed, or versioned.
@@ -81,10 +81,20 @@ diffable, and independent of the `ExecutionPolicy` headers.
 3. **Hit → reuse** the profile's config. No tuning.
 4. **Miss → contribute** a new profile with the model's initial config, then validate and freeze it.
 
-**Profiles are immutable once frozen.** `contribute_profile` on an existing key is rejected; a
-re-tune must go through an explicit `--rebaseline`, which rewrites the profile only after the
-change passes the gate and the new baseline is recorded in `docs/models/`. A frozen profile is
-never silently mutated by another model's run.
+**A frozen profile pins only what it measured** (amended 2026-10-23, see
+`docs/design/settings-resolver.md` §4). The profile body stores a sparse set of pinned fields; every other
+setting follows the live common defaults, so a change to a common default reaches every model that did not
+measure that field. Pinned fields are immutable: `contribute_profile` on an existing key is rejected, and a
+re-tune must go through an explicit `--rebaseline`, which rewrites the pins only after the change passes the
+gate and the new baseline is recorded in `docs/models/`. A frozen profile is never silently mutated by
+another model's run.
+
+To keep inheritance from changing a frozen profile's behaviour unseen, the profile also records
+`baseline_default_hash` (a hash of the table of common defaults when it was frozen) and the baseline value
+of every unpinned field. At startup, if the live defaults hash differs, the resolver compares each unpinned
+field and reports the ones that changed (`prefill_chunk 128 -> 512`): a warning in development, a failure in
+performance mode, until the profile is re-measured (`--accept-baseline`) or the field is pinned. Diagnostic
+settings are a separate struct and never enter the hash.
 
 This is the rule that makes onboarding a *bounded task* (§4.6 of the plan): a new model reuses
 existing strategy implementations and contributes only the delta where its key genuinely differs.
@@ -110,17 +120,17 @@ exhaustive — the full list comes from `graph_config.hpp`'s `log_consulted()` o
 
 | Profile field | Today's knob (or constant) |
 |---|---|
-| `moe` = lane vs cache-backed | `MOESTREAM_GLM5NEXT_EARLY_READY` (+ which stack the family builds) |
-| `offload_first_layer` | `MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER` |
-| `ddr_budget` | `MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB` |
-| `pinned_fraction` | `MOESTREAM_GLM5NEXT_OFFLOAD_PINNED` |
-| `cache` (admission/eviction) | `MOESTREAM_GLM5NEXT_OFFLOAD_POLICY` (lru/static/segmented) |
-| `pilot_k` | `MOESTREAM_DSV41_PILOT_K` |
-| `pilot_prefetch` / `pilot_stage` / `pilot_copy` | `MOESTREAM_GLM5NEXT_PILOT_PREFETCH` / `_PILOT_STAGE` / `_PILOT_COPY` |
-| `predictor` (ridge/pilot) | `MOESTREAM_QWEN_EARLY_READY_RIDGE` + `pilot_ridge.hpp` |
-| `assist_slots` / `assist2` | `MOESTREAM_GLM5NEXT_ASSIST2_SLOTS` / `_ASSIST2_DEVICE` / `_ASSIST2_KEEP` |
+| `moe` = lane vs cache-backed | `ZEROMOE_GLM5NEXT_EARLY_READY` (+ which stack the family builds) |
+| `offload_first_layer` | `ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER` |
+| `ddr_budget` | `ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB` |
+| `pinned_fraction` | `ZEROMOE_GLM5NEXT_OFFLOAD_PINNED` |
+| `cache` (admission/eviction) | `ZEROMOE_GLM5NEXT_OFFLOAD_POLICY` (lru/static/segmented) |
+| `pilot_k` | `ZEROMOE_DSV41_PILOT_K` |
+| `pilot_prefetch` / `pilot_stage` / `pilot_copy` | `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` / `_PILOT_STAGE` / `_PILOT_COPY` |
+| `predictor` (ridge/pilot) | `ZEROMOE_QWEN_EARLY_READY_RIDGE` + `pilot_ridge.hpp` |
+| `assist_slots` / `assist2` | `ZEROMOE_GLM5NEXT_ASSIST2_SLOTS` / `_ASSIST2_DEVICE` / `_ASSIST2_KEEP` |
 | `pin_threshold` / `promote_hit_threshold` | `RAMSafetyManager` fields (hard-coded today) |
-| `moe` device / chunk pipeline | `MOESTREAM_GGML_MOE_DEVICE` / `MOESTREAM_GGML_CHUNK_PIPELINE` |
+| `moe` device / chunk pipeline | `ZEROMOE_GGML_MOE_DEVICE` / `ZEROMOE_GGML_CHUNK_PIPELINE` |
 
 `graph_config.hpp`'s knob registry (`Registry::snapshot()`) is the natural migration path: it
 already records *which* knobs a run consults, so the profile can be populated by replaying a
@@ -189,7 +199,7 @@ Resolution lives behind a small registry:
 ```cpp
 const ExecutionProfile *resolve_profile(const ProfileKey &key);  // hit -> reuse
 // miss -> validate + freeze. Refuses (returns error) when the key already exists:
-// a frozen profile is immutable; re-tune only via an explicit rebaseline path.
+// a frozen profile's pinned fields are immutable; re-tune only via an explicit rebaseline path.
 bool contribute_profile(ExecutionProfile profile);
 bool rebaseline_profile(ExecutionProfile profile);              // gated rewrite of a frozen key
 ```
@@ -202,6 +212,7 @@ bool rebaseline_profile(ExecutionProfile profile);              // gated rewrite
    device once already (the 5060 Ti finding in `run_ggml_moe_layer`). Because a box can mix
    generations/widths (e.g. PCIe 4 ×16 + PCIe 3 ×8), the class is recorded **per device**
    (`DeviceSpec.pcie_gen`/`pcie_width`), not as a single system-wide scalar.
-3. **Contribute vs override: immutable once frozen.** `contribute_profile` refuses on an existing
-   key; re-tuning goes through `rebaseline_profile`, which only rewrites after the change passes
-   the gate and its new baseline lands in `docs/models/`.
+3. **Contribute vs override: pinned fields are immutable once frozen** (amended 2026-10-23: a profile pins
+   only the fields it measured; the rest follow live defaults, guarded by `baseline_default_hash`, see §5).
+   `contribute_profile` refuses on an existing key; re-tuning goes through `rebaseline_profile`, which only
+   rewrites after the change passes the gate and its new baseline lands in `docs/models/`.

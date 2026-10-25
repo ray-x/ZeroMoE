@@ -18,10 +18,10 @@ DEFAULT_CONFIG = ROOT / "configs/qwen4exp_iq1m_fullgraph_22_26.toml"
 
 def require_idle(min_ram_gib):
     competing = subprocess.run(
-        ["pgrep", "-x", "moestream"], capture_output=True, text=True
+        ["pgrep", "-x", "zeromoe"], capture_output=True, text=True
     ).stdout.strip()
     if competing:
-        raise RuntimeError(f"another MoEStream process is active (PID {competing})")
+        raise RuntimeError(f"another ZeroMoE process is active (PID {competing})")
     try:
         subprocess.run(
             ["nvidia-smi", "-L"], check=True, capture_output=True, text=True
@@ -60,15 +60,15 @@ def run_decode(engine, config, out_dir, label, prompt, tokens, extra_env,
     print(f"Running {label} inference ({tokens} token(s))...", flush=True)
     env = os.environ.copy()
     for key in (
-        "MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER",
-        "MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT",
-        "MOESTREAM_TEACHER_FORCE_TOKEN_FILE",
-        "MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING",
-        "MOESTREAM_DECODE_LOGITS_DUMP",
-        "MOESTREAM_GENERATED_TOKEN_FILE",
+        "ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER",
+        "ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT",
+        "ZEROMOE_TEACHER_FORCE_TOKEN_FILE",
+        "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING",
+        "ZEROMOE_DECODE_LOGITS_DUMP",
+        "ZEROMOE_GENERATED_TOKEN_FILE",
     ):
         env.pop(key, None)
-    env["MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS"] = "0"
+    env["ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS"] = "0"
     env.update(extra_env)
     log_path = out_dir / f"{label}.log"
     stdout_path = out_dir / f"{label}.stdout"
@@ -90,7 +90,7 @@ def run_decode(engine, config, out_dir, label, prompt, tokens, extra_env,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--engine", type=Path, default=ROOT / "build_ggmlcuda/moestream")
+    parser.add_argument("--engine", type=Path, default=ROOT / "build_ggmlcuda/zeromoe")
     parser.add_argument("--base-config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--out-dir", type=Path, required=True)
@@ -110,7 +110,7 @@ def main():
     token_path = args.out_dir / "teacher.tokens"
     run_decode(
         args.engine, config, args.out_dir, "seed", args.prompt, args.tokens,
-        {"MOESTREAM_GENERATED_TOKEN_FILE": str(token_path)}, args.min_ram_gib,
+        {"ZEROMOE_GENERATED_TOKEN_FILE": str(token_path)}, args.min_ram_gib,
     )
     teacher_tokens = [int(value) for value in token_path.read_text().split()]
     if not teacher_tokens:
@@ -119,13 +119,13 @@ def main():
 
     for label, reference_output in (("cpu_reference", True), ("gpu_bridge", False)):
         extra_env = {
-            "MOESTREAM_TEACHER_FORCE_TOKEN_FILE": str(token_path),
-            "MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING": "1",
-            "MOESTREAM_DECODE_LOGITS_DUMP": str(args.out_dir / f"{label}.logits"),
+            "ZEROMOE_TEACHER_FORCE_TOKEN_FILE": str(token_path),
+            "ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING": "1",
+            "ZEROMOE_DECODE_LOGITS_DUMP": str(args.out_dir / f"{label}.logits"),
         }
         if reference_output:
-            extra_env["MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER"] = "all"
-            extra_env["MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT"] = "1"
+            extra_env["ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER"] = "all"
+            extra_env["ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT"] = "1"
         run_decode(
             args.engine, config, args.out_dir, label, args.prompt,
             len(teacher_tokens), extra_env, args.min_ram_gib,

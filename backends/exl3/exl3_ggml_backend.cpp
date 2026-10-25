@@ -1,6 +1,6 @@
 #include "exl3_ggml_backend.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
@@ -14,7 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
-extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+extern "C" cudaStream_t zeromoe_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
 
 namespace {
@@ -270,7 +270,7 @@ enum ggml_status run_captured_segment(ggml_backend_t backend,
     return GGML_STATUS_SUCCESS;
   }
   const cudaStream_t stream =
-      moestream_ggml_backend_cuda_get_stream(adapter->cuda_backend);
+      zeromoe_ggml_backend_cuda_get_stream(adapter->cuda_backend);
   if (!stream)
     return GGML_STATUS_FAILED;
   if (!capture) {
@@ -457,7 +457,7 @@ ggml_tensor *exl3_ggml_map_custom3(ggml_context *ctx, ggml_tensor *input,
 }
 
 cudaStream_t exl3_ggml_cuda_stream(ggml_backend_t cuda_backend) {
-  return cuda_backend ? moestream_ggml_backend_cuda_get_stream(cuda_backend)
+  return cuda_backend ? zeromoe_ggml_backend_cuda_get_stream(cuda_backend)
                       : nullptr;
 }
 

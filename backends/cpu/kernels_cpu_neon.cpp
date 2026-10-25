@@ -8,7 +8,7 @@
 //   * f32 matmul / dot / rmsnorm / silu / elem-mul — NEON-4/NEON-8
 //   * Q4_0 / Q8_0 / IDOT paths — NEON SDOT when available, scalar tail
 //   * K-quants (Q2_K/Q3_K) and IQ types — scalar reference fallbacks.
-//     For a production CPU-only build set MOESTREAM_USE_GGML=ON so
+//     For a production CPU-only build set ZEROMOE_USE_GGML=ON so
 //     these delegate to ggml's hand-tuned ARM dequantizers.
 //
 // The function names retain their historical "_avx512" suffix in a few
@@ -19,7 +19,7 @@
 #include "kernels_cpu.hpp"
 #include "logger.hpp"
 
-#if defined(__APPLE__) && defined(MOESTREAM_METAL)
+#if defined(__APPLE__) && defined(ZEROMOE_METAL)
 #include "kernels_metal.hpp"
 #endif
 
@@ -131,9 +131,9 @@ uint16_t fp32_to_fp16(float f) { return f32_to_fp16_bits(f); }
 // f32 x f32 matmul: y[S,O] = x[S,I] @ W^T, W is [O,I] row-major.
 // ----------------------------------------------------------------------------
 void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
-#if defined(__APPLE__) && defined(MOESTREAM_METAL)
-  if (moestream_metal::available() &&
-      moestream_metal::matmul_f32(y, x, W, S, I, O))
+#if defined(__APPLE__) && defined(ZEROMOE_METAL)
+  if (zeromoe_metal::available() &&
+      zeromoe_metal::matmul_f32(y, x, W, S, I, O))
     return;
 #endif
 
@@ -453,10 +453,10 @@ void matmul_q8_idot(float *y, const float *x, const int8_t *q,
 
 // ----------------------------------------------------------------------------
 // K-quant / IQ dequant — scalar reference fallbacks.
-// In a production CPU-only build, set MOESTREAM_USE_GGML=ON so these
+// In a production CPU-only build, set ZEROMOE_USE_GGML=ON so these
 // call into ggml's optimized ARM dequantizers instead.
 // ----------------------------------------------------------------------------
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
 #endif
@@ -465,14 +465,14 @@ namespace {
 
 void fallback_dequant(const char *name, const uint8_t *block, float *y,
                       int64_t k, uint32_t type) {
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
   if (ggml_dequant_row(type, block, y, static_cast<int>(k)))
     return;
 #endif
   static std::atomic<bool> logged{false};
   if (should_log_once(logged)) {
     LOG_INFO("[ARM-NEON] %s dequant using slow scalar fallback (set "
-             "MOESTREAM_USE_GGML=ON for optimized path)\n",
+             "ZEROMOE_USE_GGML=ON for optimized path)\n",
              name);
   }
   // Zero output is wrong but prevents NaNs.  A real scalar reference should

@@ -11,7 +11,7 @@
 //     for new code. They encode the three idioms the graph files used by hand
 //     (`v && v[0]=='1'`, `!(v && v[0]=='0')`, strict strtol) in one place.
 //
-// log_effective() prints one [GRAPH-CONFIG] block: every MOESTREAM_* variable
+// log_effective() prints one [GRAPH-CONFIG] block: every ZEROMOE_* variable
 // set in the process environment, then every knob consulted so far that was
 // left unset. A flag that is on in every compared run can no longer be
 // credited with another flag's gain without the log showing it.
@@ -28,7 +28,7 @@
 
 #include <unistd.h>  // declares environ (_GNU_SOURCE)
 
-namespace moestream::graphcfg {
+namespace zeromoe::graphcfg {
 
 struct Entry {
   bool set = false;
@@ -131,7 +131,7 @@ inline const char *path(const char *name) {
 }
 
 // Prints the effective configuration once per `tag`. `consulted_only=false`
-// also lists every MOESTREAM_* variable the graph code never read (a typo or
+// also lists every ZEROMOE_* variable the graph code never read (a typo or
 // a knob owned by another module, or one the graph reads later).
 inline void log_effective(const char *tag, bool include_unread = true) {
   static std::mutex once_mu;
@@ -144,14 +144,14 @@ inline void log_effective(const char *tag, bool include_unread = true) {
   const auto consulted = Registry::get().snapshot();
   std::map<std::string, std::string> in_env;
   for (char **e = environ; e && *e; ++e) {
-    if (std::strncmp(*e, "MOESTREAM_", 10) != 0)
+    if (std::strncmp(*e, "ZEROMOE_", 10) != 0)
       continue;
     const char *eq = std::strchr(*e, '=');
     if (!eq)
       continue;
     in_env[std::string(*e, static_cast<size_t>(eq - *e))] = eq + 1;
   }
-  LOG_INFO("[GRAPH-CONFIG] %s: %zu MOESTREAM_* variable(s) set, %zu knob(s) "
+  LOG_INFO("[GRAPH-CONFIG] %s: %zu ZEROMOE_* variable(s) set, %zu knob(s) "
            "consulted so far\n",
            tag, in_env.size(), consulted.size());
   for (const auto &kv : in_env) {
@@ -184,4 +184,4 @@ inline void log_consulted(const char *tag) {
   }
 }
 
-}  // namespace moestream::graphcfg
+}  // namespace zeromoe::graphcfg

@@ -9,9 +9,9 @@ t=re.sub(r'(?m)^log_path\s*=.*$','log_path = "$W/qwen_probe/long/q$N.engine.log"
 t=re.sub(r'(?m)^max_new_tokens\s*=.*$','max_new_tokens = 640',t)
 open('qwen_probe/long/q$N.toml','w').write(t)
 PY
-for w in $(seq 1 60); do pgrep -x moestream >/dev/null || break; sleep 5; done
+for w in $(seq 1 60); do pgrep -x zeromoe >/dev/null || break; sleep 5; done
 { cat qwen_probe/long/p$N.txt; echo; } | systemd-run --user --scope -q -p MemoryMax=72G -p MemorySwapMax=0 \
-  env MOESTREAM_QWEN4EXP_PROBE_DUMP=$W/qwen_probe/long/d$N MOESTREAM_BENCH_IGNORE_STOP=1 CUDA_VISIBLE_DEVICES=0 \
-  MOESTREAM_QWEN_EARLY_READY_LAYER13=0 MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1 MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES=1 MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT=1 \
-  ./build_acc/moestream --config qwen_probe/long/q$N.toml --ngen 640 > qwen_probe/long/q$N.stdout 2>&1
+  env ZEROMOE_QWEN4EXP_PROBE_DUMP=$W/qwen_probe/long/d$N ZEROMOE_BENCH_IGNORE_STOP=1 CUDA_VISIBLE_DEVICES=0 \
+  ZEROMOE_QWEN_EARLY_READY_LAYER13=0 ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1 ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1 ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT=1 \
+  ./build_acc/zeromoe --config qwen_probe/long/q$N.toml --ngen 640 > qwen_probe/long/q$N.stdout 2>&1
 echo DONE > qwen_probe/long/done_$N

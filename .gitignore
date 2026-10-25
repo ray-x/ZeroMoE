@@ -49,7 +49,7 @@ glm_runs/probe_live
 *.bad*.*
 *.csv
 *.tsv
-.moestream_usage*
+.zeromoe_usage*
 logs/*.log
 glm_runs/*.log
 glm_runs/*.csv

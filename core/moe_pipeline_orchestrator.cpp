@@ -189,10 +189,10 @@ uint64_t diag_get_decode_qwen_cpu_offload_fence_failures() {
 // counters once per layer call, so leaving it enabled in a production decode
 // would measure the instrumentation itself (and can materially lower the
 // single-token throughput).  Enable it only for a diagnostic run with
-// MOESTREAM_QWEN_DECODE_LAYER_TIMING=1.
+// ZEROMOE_QWEN_DECODE_LAYER_TIMING=1.
 static bool qwen4exp_decode_layer_timing_enabled() {
   static const bool enabled = [] {
-    const char *e = std::getenv("MOESTREAM_QWEN_DECODE_LAYER_TIMING");
+    const char *e = std::getenv("ZEROMOE_QWEN_DECODE_LAYER_TIMING");
     return e && e[0] == '1';
   }();
   return enabled;

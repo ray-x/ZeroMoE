@@ -33,7 +33,7 @@ def competing_cpu(exclude=None):
             continue
         pid, name = int(fields[0]), fields[1]
         if pid != exclude and (name in names or name.startswith(
-                ('moestream', 'llama-', 'exl3_', 'qwen_cpu_')) or '_bench' in name):
+                ('zeromoe', 'llama-', 'exl3_', 'qwen_cpu_')) or '_bench' in name):
             busy.append(row.strip())
     return busy
 
@@ -96,22 +96,22 @@ def main():
     ngen = len(args.continuation.read_text().split())
     if ngen < 4 or args.reps < 1:
         p.error('need at least four continuation tokens and one repeat')
-    env = {k: v for k, v in os.environ.items() if not k.startswith('MOESTREAM_')}
+    env = {k: v for k, v in os.environ.items() if not k.startswith('ZEROMOE_')}
     for key in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(key, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-               MOESTREAM_QWEN4EXP_FULL_GRAPH='1',
-               MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE='1',
-               MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
-               MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
-               MOESTREAM_QWEN_CPU_THREADS=str(args.threads),
-               MOESTREAM_BENCH_IGNORE_STOP='1', MOESTREAM_TOKEN_LOOP_DIAG='1',
-               MOESTREAM_PROMPT_TOKEN_INPUT_FILE=str(args.prompt_ids.resolve()))
-    env.pop('MOESTREAM_DECODE_LOGITS_DUMP', None)
-    env.pop('MOESTREAM_TEACHER_FORCE_TOKEN_FILE', None)
-    env.pop('MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING', None)
+               ZEROMOE_QWEN4EXP_FULL_GRAPH='1',
+               ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE='1',
+               ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
+               ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1',
+               ZEROMOE_QWEN_CPU_THREADS=str(args.threads),
+               ZEROMOE_BENCH_IGNORE_STOP='1', ZEROMOE_TOKEN_LOOP_DIAG='1',
+               ZEROMOE_PROMPT_TOKEN_INPUT_FILE=str(args.prompt_ids.resolve()))
+    env.pop('ZEROMOE_DECODE_LOGITS_DUMP', None)
+    env.pop('ZEROMOE_TEACHER_FORCE_TOKEN_FILE', None)
+    env.pop('ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING', None)
     if not args.free_running:
-        env['MOESTREAM_TEACHER_FORCE_TOKEN_FILE'] = str(args.continuation.resolve())
+        env['ZEROMOE_TEACHER_FORCE_TOKEN_FILE'] = str(args.continuation.resolve())
     hashes = {str(f): hashlib.sha256(f.read_bytes()).hexdigest()
               for f in (engine, baseline_engine, A, args.prompt_ids, args.continuation)}
     def check_inputs():
@@ -191,16 +191,16 @@ def main():
                         previous.rename(discard / f'{previous.name}.{time.time_ns()}')
             cfg.write_text(setting(A.read_text(), 'log_path', json.dumps(str(log))))
             runtime = dict(env,
-                MOESTREAM_QWEN_EARLY_READY_LAYER13='1' if arm != 'baseline' and not args.all_split else '0',
-                MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT='1' if arm != 'baseline' and args.all_split else '0')
+                ZEROMOE_QWEN_EARLY_READY_LAYER13='1' if arm != 'baseline' and not args.all_split else '0',
+                ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT='1' if arm != 'baseline' and args.all_split else '0')
             overrides = {'baseline': args.baseline_env, 'early': args.candidate_env,
                          'extra': args.third_env}[arm]
             for value in overrides:
                 name, value = value.split('=', 1)
                 runtime[name] = value
             if args.dump_logits:
-                runtime['MOESTREAM_DECODE_LOGITS_DUMP'] = str(out / f'{tag}.logits')
-            runtime['MOESTREAM_GENERATED_TOKEN_FILE'] = str(out / f'{tag}.tokens')
+                runtime['ZEROMOE_DECODE_LOGITS_DUMP'] = str(out / f'{tag}.logits')
+            runtime['ZEROMOE_GENERATED_TOKEN_FILE'] = str(out / f'{tag}.tokens')
             print(f'Running {tag}', flush=True)
             with (out / f'{tag}.stdout').open('w') as output:
                 run_engine = baseline_engine if arm == 'baseline' else engine
@@ -237,7 +237,7 @@ def main():
                 raise RuntimeError(f'{tag}: incomplete timing')
             if arm != 'baseline':
                 staged_three_way = any(
-                    value == 'MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED=1'
+                    value == 'ZEROMOE_QWEN4EXP_MASTER_GRAPH_STAGED=1'
                     for value in args.candidate_env)
                 if staged_three_way:
                     route_modes = re.findall(

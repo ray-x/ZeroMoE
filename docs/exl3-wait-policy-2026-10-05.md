@@ -1,6 +1,6 @@
 # Native EXL3 decoder waiting-policy comparison
 
-This report covers MoEStream's native `exl3_gpu=true` decoder, not the
+This report covers ZeroMoE's native `exl3_gpu=true` decoder, not the
 delegated upstream ExLlamaV3 model/cache/generator backend documented in
 [`exllamav3-backend.md`](exllamav3-backend.md).
 
@@ -42,8 +42,8 @@ Passive waiting saves host work despite slightly slower CPU matmuls.
 Use this launch environment for the measured EXL3 hybrid profile:
 
 ```bash
-env -u GOMP_SPINCOUNT OMP_WAIT_POLICY=PASSIVE MOESTREAM_CUDA_SCHEDULE=auto \
-  ./build_ggmlcuda/moestream --config configs/qwen4exp_exl3_gpu.toml \
+env -u GOMP_SPINCOUNT OMP_WAIT_POLICY=PASSIVE ZEROMOE_CUDA_SCHEDULE=auto \
+  ./build_ggmlcuda/zeromoe --config configs/qwen4exp_exl3_gpu.toml \
   --prompt "Write a detailed, continuous explanation of how a small garden changes through the seasons. Keep going with practical details and examples, and do not conclude early." \
   --ngen 128
 ```

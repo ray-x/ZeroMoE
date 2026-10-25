@@ -10,7 +10,7 @@ qwen4exp_prefill_state_handoff = true
 
 The handoff defaults to **false**. The IQ2_XS RCO50 3090 GPU-only profile enables
 it; the 5060 Ti profile leaves it disabled. The environment override
-`MOESTREAM_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` takes precedence.
+`ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` takes precedence.
 
 When enabled, completed prefill GDN state and convolution history stay in
 VRAM. Fresh prefills read immutable GPU zero-state inputs, avoiding repeated
@@ -31,28 +31,28 @@ option. Matching prompt shapes can reuse the retained prefill graph.
 
 ## Reproduce
 
-The standard `build/moestream` binary is updated from the validated
+The standard `build/zeromoe` binary is updated from the validated
 `build_fork_diag` build. The prior binary is retained as
-`build/moestream.before-state-handoff`. The updated binary resolves its ggml
+`build/zeromoe.before-state-handoff`. The updated binary resolves its ggml
 libraries from `build_fork_diag`; keep that directory.
 
 ```bash
 ./build_fork_diag/gguf_tool verify /data/sda/models/qwen3.8-flash-next/GSQ-RCO-IQ2_XS_RCO50
-MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
-MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-./build/moestream --config configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
+ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+./build/zeromoe --config configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
 ```
 
 For matched warm measurements, the script runs six identical 23-token requests
 per mode and discards the first. All 48 expert layers stay on GPU; no CPU expert
 offload is configured. The checked-in token IDs preserve the exact prompt used
-in the earlier Bee comparison. Override `MOESTREAM_HANDOFF_PROMPT_TOKENS` for a
+in the earlier Bee comparison. Override `ZEROMOE_HANDOFF_PROMPT_TOKENS` for a
 different model/tokenizer.
 
 ```bash
-bash tests/qwen4exp_state_handoff_ab.sh ./build/moestream
-MOESTREAM_HANDOFF_CHECK_LOGITS=1 \
-bash tests/qwen4exp_state_handoff_ab.sh ./build/moestream \
+bash tests/qwen4exp_state_handoff_ab.sh ./build/zeromoe
+ZEROMOE_HANDOFF_CHECK_LOGITS=1 \
+bash tests/qwen4exp_state_handoff_ab.sh ./build/zeromoe \
   configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml \
   logs/qwen4exp_state_handoff_correctness
 ```
@@ -66,9 +66,9 @@ forward is omitted. Rebuild the validated dependency selection with:
 
 ```bash
 cmake -S . -B build_fork_diag -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_CUDA_ARCHITECTURES=86 -DMOESTREAM_USE_GGML=ON \
-  -DMOESTREAM_USE_GGML_CUDA=ON -DMOESTREAM_ENABLE_CUDA_GRAPHS=ON \
-  -DMOESTREAM_GGML_ROOT="$PWD/.ggml-fork-diag/ggml"
+  -DCMAKE_CUDA_ARCHITECTURES=86 -DZEROMOE_USE_GGML=ON \
+  -DZEROMOE_USE_GGML_CUDA=ON -DZEROMOE_ENABLE_CUDA_GRAPHS=ON \
+  -DZEROMOE_GGML_ROOT="$PWD/.ggml-fork-diag/ggml"
 cmake --build build_fork_diag -j10
 ```
 
@@ -110,14 +110,14 @@ The standard binary is updated to the verified fast path. On RTX 3090, all
 48 expert layers and all three projections stay resident in CUDA (16.94 GiB
 of expert weights). Decode has 6,512 CUDA nodes, zero CPU nodes, one scheduler
 split, and CUDA graph replay enabled. Mixed CPU/GPU profiles preserve their
-existing staging path. `MOESTREAM_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY=1`
+existing staging path. `ZEROMOE_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY=1`
 restores the artificial CPU staging node for diagnostics;
-`MOESTREAM_QWEN4EXP_PREFILL_DEVICE_STATE=0` restores host zero-state inputs.
+`ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE=0` restores host zero-state inputs.
 
 Five warm repetitions, same 23 prefill IDs, identical 128 decode inputs, no
 logit dumping during performance measurement:
 
-| Phase | Bee | MoEStream |
+| Phase | Bee | ZeroMoE |
 | --- | ---: | ---: |
 | Prefill / pp23 | 409.68 tok/s | 431.25 tok/s |
 | Decode / tg128 | 70.52 tok/s | 69.21 tok/s |
@@ -126,7 +126,7 @@ The current-tree rerun has prefill 5.3% faster; decode differs by **1.86%**,
 meeting the <3% target. The earlier isolated run measured 361.81/375.82 tok/s
 prefill and 62.18/61.31 tok/s decode (1.40% difference); use paired results,
 not numbers taken from different runs.
-Both prefills include the output projection. MoEStream uses 129 emitted tokens
+Both prefills include the output projection. ZeroMoE uses 129 emitted tokens
 to measure 128 first-to-last intervals, excludes setup before the first output,
 and performs no unused forward after the last output. Teacher forcing skips
 sampling so the comparison matches Bee's inference-only benchmark.

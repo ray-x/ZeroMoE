@@ -1,6 +1,6 @@
 // src/qwen_moe.cpp — GPU Qwen MoE backend scaffold.
 //
-// This file is compiled into the main moestream binary (CUDA builds only).
+// This file is compiled into the main zeromoe binary (CUDA builds only).
 // It currently wires Qwen detection into the GPU backend hierarchy.  The
 // dense QKV + MoE FFN paths reuse the existing HY-V3 / GLM-DSA kernels;
 // the hybrid SSM layers are a planned extension that will call dedicated

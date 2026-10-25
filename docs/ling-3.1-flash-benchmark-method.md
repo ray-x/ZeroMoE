@@ -52,7 +52,7 @@ the prefill profile empty unless `LING_PREFILL_USAGE_FILE` is set.
 
 ## Exact short-decode command
 
-Run from the repository root on the host, with no other MoEStream, llama.cpp,
+Run from the repository root on the host, with no other ZeroMoE, llama.cpp,
 build, or sweep process running:
 
 ```bash
@@ -87,7 +87,7 @@ bench/ling/reference-audit/run.sh
 ```
 
 Long prompts (`LING_CONTEXT_SIZE > 64`) automatically set
-`MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1`. Without the patched negative-id
+`ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1`. Without the patched negative-id
 skip, the valid-dummy route fallback aliases many prompt tokens onto expert 0
 and the batched id compaction over-runs that expert's row range; the observed
 failure was `CUDA error: an illegal memory access was encountered` in

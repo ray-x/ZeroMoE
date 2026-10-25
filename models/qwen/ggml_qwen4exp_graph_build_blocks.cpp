@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -443,4 +443,4 @@ bool prepare_ple_embedding(FullGraph &g, std::vector<float> &embedding, int S,
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

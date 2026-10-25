@@ -6,7 +6,7 @@
 #include <algorithm>
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -403,7 +403,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     ggml_tensor *bias = resident_tensor(g, g.ctx, p + "exp_probs_b.bias");
     if (!router)
       return false;
-    if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PROBE_DUMP")) {
+    if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP")) {
       ggml_tensor *tap_x = ggml_cont(g.ctx, ffn_in);
       ggml_tensor *tap_p = ggml_soft_max(g.ctx, ggml_mul_mat(g.ctx, router, ffn_in));
       ggml_set_output(tap_x);
@@ -832,14 +832,14 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
     // Option-B arena that leaves 0.5-1 GiB free can still build; the caller
     // owns the risk of the allocator reserve itself running out of memory.
     if (const char *floor_env =
-            moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB")) {
+            zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB")) {
       char *end = nullptr;
       const long mib = std::strtol(floor_env, &end, 10);
       if (end != floor_env && *end == '\0' && mib >= 64 && mib <= 4096) {
         kMinGraphAllocHeadroomBytes =
             static_cast<size_t>(mib) * 1024ull * 1024ull;
         LOG_WARN("[GGML-QWEN-FULL] graph allocator admission floor overridden "
-                 "to %ld MiB by MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB\n",
+                 "to %ld MiB by ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB\n",
                  mib);
       }
     }
@@ -912,7 +912,7 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
   // the owning prepare path destroy it. This is intentionally opt-in because
   // it disables the full-graph instance for the diagnostic run.
   const char *reserve_diag =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_RESERVE_DIAG");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_RESERVE_DIAG");
   const bool reserve_diag_enabled =
       reserve_diag &&
       ((std::strcmp(reserve_diag, "1") == 0 ||
@@ -1269,4 +1269,4 @@ bool prepare_prefill_state_handoff(FullGraph &source) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

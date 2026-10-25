@@ -5,16 +5,17 @@
 #include "ggml_deepseek_v41_graph.hpp"
 #include "dsv41_attention.hpp"
 #include "glm5next_graph_internal.hpp"
-#include "moe_pipeline.hpp"
+#include "cache_backed_moe.hpp"
 #include "ram_manager.hpp"
 #include "async_prefetcher.hpp"
 #include "scratch_buffers.hpp"
 #include "dsv41_trace.hpp"
+#include "layer_plan.hpp"
 #include "dense_dispatch.hpp"
 #include "moe_router.hpp"
 #include <stdexcept>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 namespace {
 using namespace glm5next_graph;
 constexpr int kDecodeNodes = 32768;
@@ -62,13 +63,14 @@ std::unique_ptr<DecodeGraph> decode;
 StreamingEngine *cache_moe_graph_failed_engine = nullptr;
 StreamingEngine *runtime_engine = nullptr;
 RAMSafetyManager *runtime_ram = nullptr;
+zeromoe::graph::CacheBackedMoeRuntime runtime_moe;
 LockFreePrefetcher *runtime_prefetch = nullptr;
 LayerScratch *runtime_scratch = nullptr;
 
 bool v41_grouped_outproj_gpu_enabled() {
   static const bool enabled = [] {
     const char *value =
-        std::getenv("MOESTREAM_DEEPSEEK_V41_OUTPROJ_GPU");
+        std::getenv("ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU");
     return !value || value[0] != '0';
   }();
   return enabled;
@@ -492,12 +494,9 @@ void moe_node(ggml_tensor *dst, const ggml_tensor *a, int ith, int,
   // No model_tensor(), mmap(), expert_source(), malloc(), or weight copy
   // belongs here. The dispatcher acquires DDR claims/VRAM compute holds and
   // resolves packed or unpacked disk offsets only on a genuine cache miss.
-  if (g.ram->vram_cache)
-    g.ram->vram_cache->prefill_current_layer = s.layer;
   const auto t0 = std::chrono::steady_clock::now();
-  moe_forward_gguf(*g.engine, *g.ram, *g.prefetch, s.layer,
-      static_cast<const float *>(a->data), 1, static_cast<float *>(dst->data),
-      *g.scratch, &g.token);
+  runtime_moe.run(s.layer, static_cast<const float *>(a->data), 1,
+                  static_cast<float *>(dst->data), &g.token);
   if (dsv41_trace::enabled(s.layer, g.pos) &&
       (int)g.scratch->tok_topk_ids.size() >=
           g.engine->model_file.architecture_config.topk &&
@@ -640,10 +639,10 @@ bool build(DecodeGraph &g) {
     g.hc_sites.push_back({&g, l, 0});
     g.hc_sites.push_back({&g, l, 1});
   }
-  // Default on; MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC=0 selects the host nodes.
+  // Default on; ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC=0 selects the host nodes.
   const bool gpu_hc_decode =
-      !moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC") ||
-      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC");
+      !zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC") ||
+      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC");
   ggml_tensor *carry = nullptr;
   if (gpu_hc_decode) {
     g.hc_carry_in = host_input(g, g.ctx, GGML_TYPE_F32, {g.HC, 1},
@@ -652,9 +651,48 @@ bool build(DecodeGraph &g) {
     carry = g.hc_carry_in;
     LOG_INFO("[GGML-DSV41-DECODE] hyper-connections on GPU\n");
   }
-  auto *res = g.input;
-  for (int l = 0; l < g.n_layers; ++l) {
-    if (MemoryGuard::allocation_blocked()) return false;
+  // The layer loop runs on the shared interfaces (layer_plan.hpp): DsvAttention and DsvFfn are the blocks,
+  // DsvHcPlan is the DeepSeek-V4.1 residual structure (hyper-connection streams with a carried pre-mix, GPU
+  // nodes or host nodes, and the engram hook at the start of a layer).
+  struct DsvAttention final : zeromoe::graph::AttentionBlock {
+    explicit DsvAttention(DecodeGraph &graph) : g(graph) {}
+    DecodeGraph &g;
+    bool declare_inputs() override { return true; }
+    void set_inputs(int) override {}
+    ggml_tensor *build(ggml_tensor *cur, int l) override { return attention(g, cur, l); }
+  };
+  struct DsvFfn final : zeromoe::graph::FfnBlock {
+    explicit DsvFfn(DecodeGraph &graph) : g(graph) {}
+    DecodeGraph &g;
+    ggml_tensor *build(ggml_tensor *cur, int l) override {
+      mark_trace(g, "hc-ffn-pre", l, cur);
+      ggml_tensor *ffn = nullptr;
+      if (g.cache_moe_graph) {
+        ffn = v41_build_cache_moe(g, cur, l, &g.token, &g.pos);
+        if (!ffn) {
+          LOG_ERROR("[GGML-DSV41-DECODE] cache-backed MoE graph build failed at layer %d\n", l);
+          return nullptr;
+        }
+      } else {
+        ffn = ggml_map_custom1(g.ctx, cur, moe_node, 1, &g.sites[l]);
+        ggml_backend_sched_set_tensor_backend(g.sched, ffn, g.cpu);
+      }
+      mark_trace(g, "moe-out", l, ffn);
+      return ffn;
+    }
+  };
+  struct DsvHcPlan final : zeromoe::graph::LayerPlan {
+    DsvHcPlan(DecodeGraph &graph, const ArchitectureConfig &cfg, DsvAttention &attention, DsvFfn &ffn_block,
+              bool gpu, ggml_tensor *carry_in)
+        : g(graph), c(cfg), attn(attention), ffn(ffn_block), gpu_hc_decode(gpu), carry(carry_in) {}
+    DecodeGraph &g;
+    const ArchitectureConfig &c;
+    DsvAttention &attn;
+    DsvFfn &ffn;
+    bool gpu_hc_decode;
+    ggml_tensor *carry;  // the pre-mix carried between layers (GPU hyper-connections); read after the loop
+    ggml_tensor *build_layer(ggml_tensor *res, int l) override {
+    if (MemoryGuard::allocation_blocked()) return nullptr;
     mark_trace(g, "input", l,
                ggml_view_2d(g.ctx, res, g.D, 1, res->nb[2], 0));
     if (std::find(c.dsv41_engram_layer_ids.begin(),
@@ -665,7 +703,7 @@ bool build(DecodeGraph &g) {
     }
     mark_trace(g, "post-input-hook", l,
                ggml_view_2d(g.ctx, res, g.D, 1, res->nb[2], 0));
-    ggml_tensor *cur = nullptr, *attn = nullptr;
+    ggml_tensor *cur = nullptr, *attn_out = nullptr;
     ggml_tensor *gpu_post = nullptr, *gpu_comb = nullptr, *gpu_attn_pre = nullptr;
     // GPU hyper-connections (same ops as the prefill trunk): the host nodes
     // below cost ~0.7 ms each x 80 per token on CPU.
@@ -681,62 +719,62 @@ bool build(DecodeGraph &g) {
     };
     if (gpu_hc_decode) {
       cur = gpu_hc("hc_attn", res, carry, &gpu_post, &gpu_comb, &gpu_attn_pre);
-      if (!cur) return false;
+      if (!cur) return nullptr;
     } else {
       ggml_tensor *attn_hc_args[] = {res};
       cur = ggml_custom_4d(
           g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1, attn_hc_args, 1,
           hc_pre_node, 1, &g.hc_sites[(size_t)l * 2]);
-      if (!cur) return false;
+      if (!cur) return nullptr;
       ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
     }
-    attn = attention(g, cur, l);
-    if (!attn) return false;
+    attn_out = attn.build(cur, l);
+    if (!attn_out) return nullptr;
     if (gpu_hc_decode) {
-      res = hc_post(g, g.ctx, attn, res, gpu_post, gpu_comb);
-      if (!res) return false;
+      res = hc_post(g, g.ctx, attn_out, res, gpu_post, gpu_comb);
+      if (!res) return nullptr;
       cur = gpu_hc("hc_ffn", res, gpu_attn_pre, &gpu_post, &gpu_comb, &carry);
-      if (!cur) return false;
+      if (!cur) return nullptr;
     } else {
-      ggml_tensor *post_attn_args[] = {attn, res};
+      ggml_tensor *post_attn_args[] = {attn_out, res};
       res = ggml_custom_4d(
           g.ctx, GGML_TYPE_F32, g.D, g.HC, 1, 1, post_attn_args, 2,
           hc_post_node, 1, &g.hc_sites[(size_t)l * 2]);
-      if (!res) return false;
+      if (!res) return nullptr;
       ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
 
       ggml_tensor *ffn_hc_args[] = {res};
       cur = ggml_custom_4d(
           g.ctx, GGML_TYPE_F32, g.D, 1, 1, 1, ffn_hc_args, 1,
           hc_pre_node, 1, &g.hc_sites[(size_t)l * 2 + 1]);
-      if (!cur) return false;
+      if (!cur) return nullptr;
       ggml_backend_sched_set_tensor_backend(g.sched, cur, g.cpu);
     }
-    mark_trace(g, "hc-ffn-pre", l, cur);
-    ggml_tensor *ffn = nullptr;
-    if (g.cache_moe_graph) {
-      ffn = v41_build_cache_moe(g, cur, l, &g.token, &g.pos);
-      if (!ffn) {
-        LOG_ERROR("[GGML-DSV41-DECODE] cache-backed MoE graph build failed at layer %d\n", l);
-        return false;
-      }
-    } else {
-      ffn = ggml_map_custom1(g.ctx, cur, moe_node, 1, &g.sites[l]);
-      ggml_backend_sched_set_tensor_backend(g.sched, ffn, g.cpu);
-    }
-    mark_trace(g, "moe-out", l, ffn);
+    ggml_tensor *ffn_out = ffn.build(cur, l);
+    if (!ffn_out) return nullptr;
     if (gpu_hc_decode) {
-      res = hc_post(g, g.ctx, ffn, res, gpu_post, gpu_comb);
-      if (!res) return false;
+      res = hc_post(g, g.ctx, ffn_out, res, gpu_post, gpu_comb);
+      if (!res) return nullptr;
     } else {
-      ggml_tensor *post_ffn_args[] = {ffn, res};
+      ggml_tensor *post_ffn_args[] = {ffn_out, res};
       res = ggml_custom_4d(
           g.ctx, GGML_TYPE_F32, g.D, g.HC, 1, 1, post_ffn_args, 2,
           hc_post_node, 1, &g.hc_sites[(size_t)l * 2 + 1]);
-      if (!res) return false;
+      if (!res) return nullptr;
       ggml_backend_sched_set_tensor_backend(g.sched, res, g.cpu);
     }
+    return res;
+    }
+  };
+  DsvAttention attention_block(g);
+  DsvFfn ffn_block(g);
+  DsvHcPlan plan(g, c, attention_block, ffn_block, gpu_hc_decode, carry);
+  auto *res = g.input;
+  for (int l = 0; l < g.n_layers; ++l) {
+    res = plan.build_layer(res, l);
+    if (!res) return false;
   }
+  carry = plan.carry;
   g.final_streams = res;
   if (gpu_hc_decode) {
     g.output = ggml_dsv4_hc_pre(g.ctx, ggml_cont(g.ctx, res), ggml_cont(g.ctx, carry));
@@ -778,13 +816,14 @@ bool build(DecodeGraph &g) {
 } // namespace
 
 bool deepseek_v41_full_graph_decode_enabled() {
-  if (moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V41_FULL_GRAPH_DECODE"))
-    return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_FULL_GRAPH_DECODE");
-  return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_FULL_GRAPH");
+  if (zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE"))
+    return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH");
 }
 
 void deepseek_v41_bind_graph_runtime(StreamingEngine &e, RAMSafetyManager &r,
                                      LockFreePrefetcher &p, LayerScratch &s) {
+  runtime_moe.bind(e, r, p, s);
   runtime_engine = &e; runtime_ram = &r;
   runtime_prefetch = &p; runtime_scratch = &s;
 }
@@ -808,10 +847,7 @@ void deepseek_v41_full_graph_moe_forward(StreamingEngine &e, int layer,
       runtime_scratch->tok_topk_ids.size() < (size_t)S *
           e.model_file.architecture_config.topk)
     throw std::runtime_error("DeepSeek-V4.1 graph MoE runtime is not ready");
-  if (runtime_ram->vram_cache)
-    runtime_ram->vram_cache->prefill_current_layer = layer;
-  moe_forward_gguf(e, *runtime_ram, *runtime_prefetch, layer, input, S,
-                   output, *runtime_scratch, token_ids);
+  runtime_moe.run(layer, input, S, output, token_ids);
   if (dsv41_trace::enabled(layer, pos_base)) {
     const size_t last = (size_t)(S - 1) * e.model_file.architecture_config.hidden;
     dsv41_trace::save("hc-ffn-pre", layer, pos_base, input + last,
@@ -859,8 +895,8 @@ bool deepseek_v41_full_graph_decode_prepare(StreamingEngine &e, int pos,
   if (!deepseek_v41_full_graph_decode_enabled() || !token_ids ||
       e.mtp_enabled || e.family_ops.family != ModelFamily::DeepSeek_V41 ||
       pos < 0 || pos >= e.max_t) return false;
-  const bool cache_moe_requested = moestream::graphcfg::flag_on(
-      "MOESTREAM_DEEPSEEK_V41_CACHE_MOE_DECODE");
+  const bool cache_moe_requested = zeromoe::graphcfg::flag_on(
+      "ZEROMOE_DEEPSEEK_V41_CACHE_MOE_DECODE");
   if (cache_moe_requested && cache_moe_graph_failed_engine == &e)
     return false;
   // The caches stay engine-owned, so a new prompt/position does not rebuild

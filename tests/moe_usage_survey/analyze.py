@@ -4,7 +4,7 @@
 Read-only, no engine/model touched."""
 import collections
 
-USAGE_FILE = "/home/ray/Projects/MoEStream/tests/moe_usage_survey/moestream_usage_survey"
+USAGE_FILE = "/home/ray/Projects/ZeroMoE/tests/moe_usage_survey/zeromoe_usage_survey"
 
 # Real per-expert byte sizes, confirmed this session (gguf_tool dma / probe_slab).
 GATE_UP_CURRENT = 3244032   # IQ2_XXS, bytes/expert (layer 8 is IQ2_S=3936KB but

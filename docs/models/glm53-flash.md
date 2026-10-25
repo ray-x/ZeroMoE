@@ -9,13 +9,13 @@
 ## Canonical recipe
 
 ```bash
-echo "<prompt>" | CUDA_VISIBLE_DEVICES=0 MOESTREAM_GLM5NEXT_FULL_GRAPH=1 \
-  MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512 MOESTREAM_GLM5NEXT_CPU_THREADS=6 \
-  scripts/run_capped.sh -- ./build_master/moestream \
+echo "<prompt>" | CUDA_VISIBLE_DEVICES=0 ZEROMOE_GLM5NEXT_FULL_GRAPH=1 \
+  ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
+  scripts/run_capped.sh -- ./build_master/zeromoe \
   --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --temp 0 --ngen 150 --force-start
 ```
 
-`MOESTREAM_GLM5NEXT_FULL_GRAPH=1` is REQUIRED — without it the legacy per-layer path runs ~6× slower.
+`ZEROMOE_GLM5NEXT_FULL_GRAPH=1` is REQUIRED — without it the legacy per-layer path runs ~6× slower.
 
 ## Frozen baseline
 
@@ -34,6 +34,6 @@ echo "<prompt>" | CUDA_VISIBLE_DEVICES=0 MOESTREAM_GLM5NEXT_FULL_GRAPH=1 \
 
 - `host_ram_gb=106` needs `106 + 21.5 = 127.5 GiB` of `MemAvailable`; on a 125 GiB box preflight
   refuses, so run under `run_capped.sh` with `--force-start`.
-- `MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512` is required or the dense arena refuses and decode
+- `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512` is required or the dense arena refuses and decode
   silently falls back to legacy.
 - A fresh binary's first run spends ~67 s in CUDA JIT (sm_75 PTX on sm_86); warm it once.

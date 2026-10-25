@@ -16,8 +16,8 @@ remaining 34 MoE layers' experts on the CPU. neurall's llama.cpp on the identica
 | GPU not used | RTX 5060 Ti 16 GB (idle in this baseline; see section 8) |
 | Storage | model on NVMe (`/home/ray/vllm-workspace`, nvme1n1p3) |
 | Driver / CUDA | 610.57.04 / CUDA 13.3 (nvcc), OS Linux 7.2 |
-| MoEStream | commit `2a06c0a` plus uncommitted working-tree changes (see section 9) |
-| ggml (recommended) | `/home/ray/Projects/llama.cpp-moestream-b11401`, branch `moestream-ggml-b11401`, HEAD `9fe8a156f` (neurall's b11401 + MoEStream fork commit + negative-id-skip commit) |
+| ZeroMoE | commit `2a06c0a` plus uncommitted working-tree changes (see section 9) |
+| ggml (recommended) | `/home/ray/Projects/llama.cpp-moestream-b11401`, branch `zeromoe-ggml-b11401`, HEAD `9fe8a156f` (neurall's b11401 + ZeroMoE fork commit + negative-id-skip commit) |
 | ggml (older, ~1% slower) | `/home/ray/Projects/llama.cpp-moestream-integration`, b11062 + fork commit |
 
 ## 2. Model file
@@ -44,16 +44,16 @@ Per token the scheduler runs 34 CPU splits and 35 GPU splits. The GPU is idle ab
 
 ```
 cmake -S . -B build_b11401 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75 \
-  -DMOESTREAM_USE_GGML=ON -DMOESTREAM_USE_GGML_CUDA=ON -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON \
-  -DMOESTREAM_ENABLE_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DMOESTREAM_GGML_OPENMP=ON \
+  -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON -DGGML_CUDA=ON -DGGML_CUDA_GRAPHS=ON \
+  -DZEROMOE_ENABLE_CUDA_GRAPHS=ON -DGGML_NATIVE=ON -DGGML_OPENMP=ON -DZEROMOE_GGML_OPENMP=ON \
   -DGGML_CUDA_FA_QUANTS="q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16" \
-  -DMOESTREAM_ENABLE_GGML_HOST_NODE_PATCHES=OFF -DMOESTREAM_ENABLE_AVX512_VNNI=OFF \
-  -DMOESTREAM_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml
-cmake --build build_b11401 --target moestream -j12
+  -DZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES=OFF -DZEROMOE_ENABLE_AVX512_VNNI=OFF \
+  -DZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml
+cmake --build build_b11401 --target zeromoe -j12
 ```
 
 - `HOST_NODE_PATCHES` must be OFF (the host-node scheduler-gate patch does not apply to b11401).
-- Do NOT point `MOESTREAM_GGML_ROOT` at another project's tree (neurall): CMake applies patches to it in place.
+- Do NOT point `ZEROMOE_GGML_ROOT` at another project's tree (neurall): CMake applies patches to it in place.
 - Compile flags match neurall's: `-O3 -DNDEBUG -march=native`, Release, LTO off, OpenMP on. `GGML_LLAMAFILE` is OFF
   (tested ON: 0-1% slower, no benefit).
 - The first run of a freshly built binary spends about 67 s in CUDA JIT in step 0; discard that run for timing.
@@ -74,7 +74,7 @@ Keys that define this baseline:
 | `moe_cache_gb` (gpus[0]) | 15.8 | fits 8 whole layers (2304 slots, 15.55 GB) |
 | `pin_strategy` | `global_topn` | usage-ranked preload for the RAM tier (unused for GPU layers here) |
 | `freeze_usage_stats` | true | usage files are read, never updated |
-| `pin_file` / `prefill_pin_file` | `.moestream_usage_glm53flash` / `.moestream_usage_prefill_glm53flash` | routing counts, last written 2026-09-08 |
+| `pin_file` / `prefill_pin_file` | `.zeromoe_usage_glm53flash` / `.zeromoe_usage_prefill_glm53flash` | routing counts, last written 2026-09-08 |
 | `host_ram_gb` | 106 | do not reduce; tied to a 2026-09-09 crash (also keep `mem_guard_stop_mb = 10240`) |
 | `ram_preload_all_experts` | true | ~80 GB of experts resident in RAM |
 | `mtp_enabled` | false | the reusable full graph is disabled when MTP is on |
@@ -84,29 +84,29 @@ Environment variables:
 
 | Variable | Value | Effect |
 |---|---|---|
-| `MOESTREAM_GLM5NEXT_FULL_GRAPH` | `1` | REQUIRED. Without it the legacy per-layer decode runs (about 1.2-2.8 tok/s) |
-| `MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB` | `512` | AJ needs it: dense arena 6.65 GiB leaves 0.87 GiB free, below the 1 GiB / 2 GiB defaults, so the graph is declined and decode silently falls back to legacy. Real graph workspace is 0.15 GiB |
-| `MOESTREAM_GLM5NEXT_CPU_THREADS` | `6` | ggml CPU threads. 6 and 8 are equal; 10 is slower; default was 4 |
-| `MOESTREAM_GLM5NEXT_UNFUSED_HC` | unset | fused hyper-connection ops are the default (graph 6,131 nodes vs 31,061) |
-| `MOESTREAM_GLM5NEXT_CPU_LM_HEAD` | unset | set to 1 to put the LM head back on the CPU (about -48 ms/token) |
-| `MOESTREAM_GLM5NEXT_GPU1_LAYERS` | unset | e.g. `11-17` uploads those layers' experts to the 5060 Ti (not part of this baseline) |
+| `ZEROMOE_GLM5NEXT_FULL_GRAPH` | `1` | REQUIRED. Without it the legacy per-layer decode runs (about 1.2-2.8 tok/s) |
+| `ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB` | `512` | AJ needs it: dense arena 6.65 GiB leaves 0.87 GiB free, below the 1 GiB / 2 GiB defaults, so the graph is declined and decode silently falls back to legacy. Real graph workspace is 0.15 GiB |
+| `ZEROMOE_GLM5NEXT_CPU_THREADS` | `6` | ggml CPU threads. 6 and 8 are equal; 10 is slower; default was 4 |
+| `ZEROMOE_GLM5NEXT_UNFUSED_HC` | unset | fused hyper-connection ops are the default (graph 6,131 nodes vs 31,061) |
+| `ZEROMOE_GLM5NEXT_CPU_LM_HEAD` | unset | set to 1 to put the LM head back on the CPU (about -48 ms/token) |
+| `ZEROMOE_GLM5NEXT_GPU1_LAYERS` | unset | e.g. `11-17` uploads those layers' experts to the 5060 Ti (not part of this baseline) |
 | `GGML_SCHED_PROF` | optional `1` | neurall-fork scheduler profiler; logs a per-graph CPU/GPU/copy breakdown |
-| `MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING` | optional `1` | per-layer attention/FFN timing every 100 tokens (adds sync overhead) |
+| `ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING` | optional `1` | per-layer attention/FFN timing every 100 tokens (adds sync overhead) |
 
 ## 6. How to run
 
 The engine reads the prompt from stdin.
 
 ```
-cd /home/ray/Projects/MoEStream
-nvidia-smi; pgrep -af moestream     # GPU co-existence guard: nothing else on the GPU
-export MOESTREAM_GLM5NEXT_FULL_GRAPH=1 MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512 MOESTREAM_GLM5NEXT_CPU_THREADS=6
+cd /home/ray/Projects/ZeroMoE
+nvidia-smi; pgrep -af zeromoe     # GPU co-existence guard: nothing else on the GPU
+export ZEROMOE_GLM5NEXT_FULL_GRAPH=1 ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6
 echo "Write an extremely long and detailed 4000-word essay about the history, mathematics and engineering of mixture of experts models. Do not stop early." \
-  | ./build_b11401/moestream --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --ngen 1500 \
+  | ./build_b11401/zeromoe --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --ngen 1500 \
   > logs/glm53flash_aj_run.log 2>&1
 ```
 
-- Engine log: `/tmp/moestream_glm53flash_aj.log` (`log_path`). Copy it into `logs/` after the run.
+- Engine log: `/tmp/zeromoe_glm53flash_aj.log` (`log_path`). Copy it into `logs/` after the run.
 - Startup takes about 112 s (open shards, preload experts to RAM and the 8 layers to VRAM, build the graph); decode of 700 tokens about 100 s.
 - Healthy start: `graph built layers=45 nodes=6131 splits=69` and `[EXPERT-TIER-MAP]` showing `vram=288` for layers 3-10 and `vram=0` for 11+.
   If you see `graph construction declined; using legacy decode`, decode will be about 6x slower (check the allocator-floor variable).
@@ -129,7 +129,7 @@ Reference (neurall llama.cpp b11401, same file, `CUDA_VISIBLE_DEVICES=0`, `-ngl 
 
 Per-token breakdown (ms), same profiler categories:
 
-| Category | MoEStream | neurall |
+| Category | ZeroMoE | neurall |
 |---|---|---|
 | CPU compute (34 CPU splits, experts) | 118.4-118.6 (117.8 on b11062) | 115.6-116.6 |
 | Wait + input copy before CPU splits (exposed GPU attention/routing) | 17.6-18.1 | 18.1 |
@@ -142,7 +142,7 @@ Per layer (fused HC): attention 0.27 ms x 45; FFN 0.26 ms on a GPU-resident laye
 CPU experts move 54 MB/layer in about 3.46 ms (about 15.6 GB/s; single-core IQ2_XXS dot microbenchmark 3.05 GB/s/core).
 
 Other file for reference, `GLM-5.3-Flash-UD-IQ1_S` (93 GB, `configs/glm53flash_IQ1_wholelayer8_cpu.toml`, allocator floor 1024):
-MoEStream 6.87 tok/s over 1,500 tokens vs neurall 6.99 +/- 0.03. With 7 more layers on the 5060 Ti: 6.85 tok/s at 1,500 tokens (the 5060 Ti helps because more
+ZeroMoE 6.87 tok/s over 1,500 tokens vs neurall 6.99 +/- 0.03. With 7 more layers on the 5060 Ti: 6.85 tok/s at 1,500 tokens (the 5060 Ti helps because more
 layers leave the CPU; single-GPU comparisons were requested for the record).
 
 History on this file/box: 2.70 tok/s (first working full-graph decode) -> 4.7 (LM head into graph, CPU threads 4 -> 6) ->
@@ -156,7 +156,7 @@ History on this file/box: 2.70 tok/s (first working full-graph decode) -> 4.7 (L
   visible amounts (near-tied expert flips) although each op matches its reference to 1e-7. Judge by long-run coherence.
 - Never `GGML_CUDA_DISABLE_GRAPHS` A/B without checking; CUDA graphs already replay about 98% of splits.
 
-## 9. Code and config changes behind this baseline (uncommitted in the MoEStream repo)
+## 9. Code and config changes behind this baseline (uncommitted in the ZeroMoE repo)
 
 - `src/ggml_glm5next_graph.cpp`: LM head (`output_norm` + `output.weight`) inside the decode graph; fused hyper-connections (comb/pre/post) default on;
   CPU thread setting; allocator-floor override; optional 5060 Ti expert path (`GPU1_LAYERS`); layer-timing instrumentation; VRAM-reference expert
@@ -172,12 +172,12 @@ Same VRAM budget as the 8-whole-layer baseline (15.8 GB = 2,341 slots), spent as
 the most concentrated layers in the fresh routing profile).
 
 - Config: `configs/glm53flash_AJ_IQ2XXS_7full_2half.toml` (`vram_cache_full_layer_prefix = 10` so only layers 0-9 get whole regions, `cpu_affinity_layers` = 10-17 and 20-44,
-  `pin_file = .moestream_usage_glm53flash_aj_tap`).
+  `pin_file = .zeromoe_usage_glm53flash_aj_tap`).
 - Result (quiet-machine ABBA, median ms/token): 8 whole layers 139.4 / 140.4 (7.15 tok/s) vs 7 whole + 2 half **136.75 / 136.79 (7.31 tok/s), 2.2% faster**.
 - Requires the `-1` sentinel fix in `partial_map` (`src/ggml_glm5next_graph.cpp`): routes a branch does not own used to map to expert 0 (computed then masked), so the CPU cold
-  branch always did full work and the same layout measured 1.0% SLOWER. Output is bit-identical with the fix. `MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1` restores the old behavior.
-- Hit rates on unseen prompts: about 76% (essay) to 83-89% (code review) per route. Usage tap tooling: `MOESTREAM_GLM5NEXT_ROUTE_TAP=<file>` with `MOESTREAM_GLM5NEXT_CACHE_STATS=1`
-  writes per-layer expert counts (usage-file format) and logs `[GLM5NEXT-PARTIAL-HIT]`. The old `.moestream_usage_glm53flash` was far too optimistic (predicted 99% for layer 18, real ~60%).
+  branch always did full work and the same layout measured 1.0% SLOWER. Output is bit-identical with the fix. `ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1` restores the old behavior.
+- Hit rates on unseen prompts: about 76% (essay) to 83-89% (code review) per route. Usage tap tooling: `ZEROMOE_GLM5NEXT_ROUTE_TAP=<file>` with `ZEROMOE_GLM5NEXT_CACHE_STATS=1`
+  writes per-layer expert counts (usage-file format) and logs `[GLM5NEXT-PARTIAL-HIT]`. The old `.zeromoe_usage_glm53flash` was far too optimistic (predicted 99% for layer 18, real ~60%).
 - CPU model (standalone, no model load): a `MUL_MAT_ID` node costs about 0.16 ms fixed (if any id is valid) plus 0.122 ms per valid id on 6 threads with cold experts.
 
 ## 10. Where the time goes and the remaining levers

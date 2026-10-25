@@ -41,7 +41,7 @@ int main() {
   ggml_build_forward_expand(graph, ggml_mul_mat_id(ctx, dst, x, ids));
   ggml_backend_t cpu = ggml_backend_cpu_init();
   assert(cpu);
-  moestream::ggmlcopy::ExpertCopy copy;
+  zeromoe::ggmlcopy::ExpertCopy copy;
   assert(copy.copy(cpu, src, dst, graph, &copy));
   assert(copy.plane_copies == 2 && copy.bytes == 2 * payload);
   for (int e : {0, 2})

@@ -71,9 +71,9 @@ throughput. Usage statistics stay frozen during comparisons.
   4.95 to 5.54 tok/s with identical token IDs, before the final reduction fix.
 
 The output projection is enabled by default. Set
-`MOESTREAM_DEEPSEEK_V41_OUTPROJ_GPU=0` to compare its native fallback.
-`MOESTREAM_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` selects native decode while
-`MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1` keeps graph prefill enabled.
+`ZEROMOE_DEEPSEEK_V41_OUTPROJ_GPU=0` to compare its native fallback.
+`ZEROMOE_DEEPSEEK_V41_FULL_GRAPH_DECODE=0` selects native decode while
+`ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1` keeps graph prefill enabled.
 
 ## Memory contract
 
@@ -113,9 +113,9 @@ expert stride alignment remains a possible later I/O optimization.
 For the configured build used during this investigation:
 
 ```sh
-cmake --build /tmp/moestream-v41-build --target moestream -j4
-CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1 \
-  /tmp/moestream-v41-build/moestream \
+cmake --build /tmp/zeromoe-v41-build --target zeromoe -j4
+CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
+  /tmp/zeromoe-v41-build/zeromoe \
   --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml
 ```
 
@@ -126,13 +126,13 @@ outputs matched bitwise, output guards stayed intact, and device weight bytes
 were unchanged. The test passed on both the 3090 and 5060 Ti.
 
 ```sh
-cmake --build /tmp/moestream-v41-build --target dsv41_grouped_outproj_test -j4
-/tmp/moestream-v41-build/dsv41_grouped_outproj_test
+cmake --build /tmp/zeromoe-v41-build --target dsv41_grouped_outproj_test -j4
+/tmp/zeromoe-v41-build/dsv41_grouped_outproj_test
 GGML_SRC_DIR=/home/ray/Projects/llama.cpp-moestream-b11401/ggml/src \
-GGML_LIB_DIR=/home/ray/Projects/MoEStream/build_b11401/ggml-build/src \
-BIN=/tmp/moestream-v41-build/test_components make test-components
-cmake --build /tmp/moestream-v41-build --target moestream_tests -j4
-/tmp/moestream-v41-build/moestream_tests
+GGML_LIB_DIR=/home/ray/Projects/ZeroMoE/build_b11401/ggml-build/src \
+BIN=/tmp/zeromoe-v41-build/test_components make test-components
+cmake --build /tmp/zeromoe-v41-build --target zeromoe_tests -j4
+/tmp/zeromoe-v41-build/zeromoe_tests
 ```
 
 `make test-components` passed all 45 component cases, the three route-policy
@@ -140,7 +140,7 @@ modes, the dynamic cache checks (1,017,845 checks, zero failures), and the
 shared shape-pool check. A fresh `gguf_tool verify` passed for the model.
 
 `make test` built the full native harness, then stopped at the existing EXL3
-CUDA matmul/reconstruction/cache test. `MOESTREAM_EXLLAMAV3_SRC` is unset in
+CUDA matmul/reconstruction/cache test. `ZEROMOE_EXLLAMAV3_SRC` is unset in
 this build, and `cuda/exl3_aux.cu` therefore returns `cudaErrorNotSupported`
 for EXL3 matmuls. This is not a full native-suite pass. The DeepSeek model
 comparisons and dedicated grouped-projection test passed separately.

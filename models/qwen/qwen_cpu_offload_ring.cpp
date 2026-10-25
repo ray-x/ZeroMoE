@@ -24,7 +24,7 @@ namespace {
 
 int ring_spin_budget_us() {
   static const int budget = [] {
-    const char *value = std::getenv("MOESTREAM_QWEN4EXP_RING_SPIN_US");
+    const char *value = std::getenv("ZEROMOE_QWEN4EXP_RING_SPIN_US");
     if (!value || !value[0])
       return 0;
     char *end = nullptr;

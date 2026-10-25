@@ -6,6 +6,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "memory_guard.hpp"
+#include <cmath>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <array>
@@ -20,12 +21,12 @@
 #include <thread>
 #include <vector>
 
-extern "C" cudaError_t moestream_qwen_stage_begin(unsigned long long *, cudaStream_t);
-extern "C" cudaError_t moestream_qwen_stage_publish(int *, unsigned long long *, int,
+extern "C" cudaError_t zeromoe_qwen_stage_begin(unsigned long long *, cudaStream_t);
+extern "C" cudaError_t zeromoe_qwen_stage_publish(int *, unsigned long long *, int,
                                                     int, unsigned long long, cudaStream_t);
-extern "C" cudaError_t moestream_qwen_stage_map(const int *, const unsigned long long *,
+extern "C" cudaError_t zeromoe_qwen_stage_map(const int *, const unsigned long long *,
     const int *, unsigned long long *, int *, int *, float *, int, int, cudaStream_t);
-extern "C" cudaError_t moestream_qwen_stage_delay(unsigned int, cudaStream_t);
+extern "C" cudaError_t zeromoe_qwen_stage_delay(unsigned int, cudaStream_t);
 
 // Shared host worker service for all staged layers. A single queue avoids one
 // sleeping/waking thread per layer; each submitted closure still owns the
@@ -158,8 +159,8 @@ struct Qwen4ExpStagePool {
     const int32_t *predictions = nullptr;
     const unsigned long long *prediction_epoch = nullptr;
     cudaEvent_t prediction_ready = nullptr;  // borrowed from the EarlyReadyLane, not owned
-    moestream::cuda::CudaEvent copied;
-    moestream::cuda::PinnedBuffer<uint8_t> bounce;
+    zeromoe::cuda::CudaEvent copied;
+    zeromoe::cuda::PinnedBuffer<uint8_t> bounce;
     std::chrono::steady_clock::time_point copy_enqueued_at{};
   } banks[2];
   ggml_tensor *source[3] = {}, *weights[3] = {};
@@ -186,7 +187,7 @@ struct Qwen4ExpStagePool {
   unsigned int worker_delay_us = 0;
   // Cap on predicted cold experts staged per layer (0 = no cap).
   unsigned int stage_max = 0;
-  moestream::cuda::CudaStream copy_stream;
+  zeromoe::cuda::CudaStream copy_stream;
   Qwen4ExpStageWorkService *service = nullptr;
   std::mutex mutex;
   std::condition_variable samples_finished;
@@ -232,12 +233,12 @@ struct Qwen4ExpStagePool {
     device = dev; topk = k; slots = 2 * k; cold_mask = mask; this->backend = backend;
     service = shared_service;
     if (!service) return false;
-    const char *verify = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY");
+    const char *verify = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY");
     verify_enabled = verify && verify[0] == '1';
-    const char *delay = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_DELAY_US");
+    const char *delay = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_DELAY_US");
     if (delay) delay_us = std::min<unsigned long>(1000000, std::strtoul(delay, nullptr, 10));
-    const char *worker_delay = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US");
-    const char *stage_cap = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_MAX");
+    const char *worker_delay = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_WORKER_DELAY_US");
+    const char *stage_cap = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_MAX");
     if (stage_cap) stage_max = std::min<unsigned long>(32, std::strtoul(stage_cap, nullptr, 10));
     if (worker_delay)
       worker_delay_us = std::min<unsigned long>(1000000, std::strtoul(worker_delay, nullptr, 10));
@@ -473,7 +474,7 @@ struct Qwen4ExpStagePool {
       if (worker_delay_us && !candidates.empty())
         std::this_thread::sleep_for(std::chrono::microseconds(worker_delay_us));
       if (delay_us && !candidates.empty())
-        GGML_ASSERT(moestream_qwen_stage_delay(delay_us, copy_stream) == cudaSuccess);
+        GGML_ASSERT(zeromoe_qwen_stage_delay(delay_us, copy_stream) == cudaSuccess);
       for (size_t slot = 0; slot < candidates.size(); ++slot) {
         const int e = candidates[slot];
         const int gpu_slot = index * topk + slot;
@@ -487,7 +488,7 @@ struct Qwen4ExpStagePool {
           GGML_ASSERT(cudaMemcpyAsync(dst, bounce, plane_bytes[p], cudaMemcpyHostToDevice,
                                      copy_stream) == cudaSuccess);
         }
-        GGML_ASSERT(moestream_qwen_stage_publish(slot_ids, slot_epochs, gpu_slot, e,
+        GGML_ASSERT(zeromoe_qwen_stage_publish(slot_ids, slot_epochs, gpu_slot, e,
                                                  bank.epoch, copy_stream) == cudaSuccess);
         ++uploaded;
       }

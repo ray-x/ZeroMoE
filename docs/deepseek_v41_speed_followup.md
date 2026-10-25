@@ -65,7 +65,7 @@ the 10 tok/s target.
 The first 817-token prefill experiment measured **6.14 cold / 6.28 warm tok/s**.
 Its log exposed that only 128 tokens used batched prefill; the remaining 689
 were processed as single-token forward calls. The DeepSeek adapter now defaults
-to the whole prompt (`MOESTREAM_DEEPSEEK_V41_PREFILL_CHUNK=0`). The old indexed
+to the whole prompt (`ZEROMOE_DEEPSEEK_V41_PREFILL_CHUNK=0`). The old indexed
 attention limit also no longer applies to the native attention callback.
 
 ## GPU graph migration (experimental, not validated for adoption)
@@ -73,10 +73,10 @@ attention limit also no longer applies to the native attention callback.
 The GLM design requires GPU graph nodes for the numerical trunk, rather than
 wrapping the native host forward in CPU graph callbacks. New opt-ins:
 
-- `MOESTREAM_DEEPSEEK_V41_GPU_PREFILL=1`: GPU Engram projections, HC,
+- `ZEROMOE_DEEPSEEK_V41_GPU_PREFILL=1`: GPU Engram projections, HC,
   compressed attention and dense projections. The reference callback path
   remains available with this unset. GPU graph build failure stops the request.
-- `MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH=1`: gate/up/SwiGLU/down and branch
+- `ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH=1`: gate/up/SwiGLU/down and branch
   weighting/sums run as GPU graph nodes on both GPUs. Bind existing native
   VRAM pools as strided weight tensors; allocate **zero graph expert bytes**.
   Startup selects the existing uniform native cache layout, using the model's
@@ -118,7 +118,7 @@ correctness.
 isolated output directory from the recent GLM GGML object files, and applies
 [the local hook patch](../patches/ggml/0010-native-f32-quant-graph-hook.patch).
 It does not change either shared GGML source tree. The opt-in
-`MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH=1` uses the original quantized dense
+`ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH=1` uses the original quantized dense
 and expert weights, with F32 activations, and allocates no graph expert pool.
 A model run requires both this patched backend and
 `NVIDIA_TF32_OVERRIDE=0`; build or runtime failure stops the request instead of
@@ -169,12 +169,12 @@ focused targets with:
 
 ```bash
 cmake -S . -B <build-dir> \
-  -DMOESTREAM_USE_GGML=ON -DMOESTREAM_USE_GGML_CUDA=ON \
-  -DMOESTREAM_ENABLE_CUDA_GRAPHS=ON \
-  -DMOESTREAM_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml \
-  -DMOESTREAM_GGML_PREBUILT_DIR=/home/ray/Projects/MoEStream/build_b11401/ggml-build \
+  -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON \
+  -DZEROMOE_ENABLE_CUDA_GRAPHS=ON \
+  -DZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp-moestream-b11401/ggml \
+  -DZEROMOE_GGML_PREBUILT_DIR=/home/ray/Projects/ZeroMoE/build_b11401/ggml-build \
   -DCMAKE_CUDA_ARCHITECTURES=86
-cmake --build <build-dir> --target moestream moestream_tests \
+cmake --build <build-dir> --target zeromoe zeromoe_tests \
   dsv41_cache_graph_test dsv41_grouped_outproj_test -j4
 ```
 
@@ -187,7 +187,7 @@ python3 bench/build_dsv41_f32_backend.py \
   --ggml-build /home/ray/work/moestream-graph-framework/build_native/ggml-build \
   --out <isolated-backend-dir>
 CUDA_VISIBLE_DEVICES=0,1 NVIDIA_TF32_OVERRIDE=0 \
-  LD_LIBRARY_PATH=<isolated-backend-dir> MOESTREAM_TEST_NATIVE_F32=1 \
+  LD_LIBRARY_PATH=<isolated-backend-dir> ZEROMOE_TEST_NATIVE_F32=1 \
   <build-dir>/dsv41_cache_graph_test
 ```
 
@@ -205,7 +205,7 @@ Run it after building the isolated backend above:
 
 ```bash
 python3 bench/dsv41_graph_profile.py \
-  --binary /tmp/moestream-v41-build/moestream \
+  --binary /tmp/zeromoe-v41-build/zeromoe \
   --backend /tmp/v41-ggml-f32-libs \
   --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
   --output logs/perf/deepseek_v41_graph_818_20261015
@@ -393,7 +393,7 @@ the same profile measured **5.76 tok/s**, **5.64 s** inclusive route-to-payload
 time, and **53.33 GiB** minimum MemAvailable. It matched native stdout and
 reported no emergency stop. This remains a single-run result.
 
-The first graph-level cold CPU lane (`MOESTREAM_DEEPSEEK_V41_CACHE_MOE_CPU_COLD=1`)
+The first graph-level cold CPU lane (`ZEROMOE_DEEPSEEK_V41_CACHE_MOE_CPU_COLD=1`)
 starts a batched DDR lookup and per-expert CPU FFNs while the graph computes
 main-VRAM hits, then merges the CPU partial output after the GPU branch. Its
 guarded 64-token run completed all 40 layers, matched native stdout, had no

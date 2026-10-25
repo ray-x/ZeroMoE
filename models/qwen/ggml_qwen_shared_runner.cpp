@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #include "gpu_topology.hpp"
 #include "ggml.h"
@@ -36,7 +36,7 @@
 #endif
 using namespace moe::detail;
 
-extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+extern "C" cudaStream_t zeromoe_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
 
 // Qwen4Exp shared expert
@@ -301,7 +301,7 @@ bool GgmlQwenSharedRunner::ensure_layer(
     const GgmlSharedWeightRef &up, const GgmlSharedWeightRef &down,
     const GgmlSharedWeightRef *gate_inp) {
   const bool debug = [] {
-    return moestream::graphcfg::flag_on("MOESTREAM_GGML_SHARED_DEBUG");
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_SHARED_DEBUG");
   }();
   auto fail = [&](const char *reason) {
     if (debug)
@@ -474,7 +474,7 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
                                const void *routed_output,
                                const void **combined_output) {
   const bool debug = [] {
-    return moestream::graphcfg::flag_on("MOESTREAM_GGML_SHARED_DEBUG");
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_SHARED_DEBUG");
   }();
   auto fail = [&](const char *reason, const ggml_tensor *input,
                   const ggml_tensor *routed_src) {
@@ -553,7 +553,7 @@ bool GgmlQwenSharedRunner::run(int layer, const void *device_x,
   // Opt-in A/A diagnostic for the first FFN boundary.  The routed tensor is
   // the output of GgmlMoeRunner; the combined tensor is the result of this
   // shared+routed graph.  Keep this synchronizing path strictly diagnostic.
-  const char *dump_base = moestream::graphcfg::env("MOESTREAM_GGML_HC_COMPARE_DUMP");
+  const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
   const bool dump_ffn = dump_base && n_tokens_ == 1 && layer < 3;
   auto dump_device_f32 = [&](const char *label, const ggml_tensor *tensor) {
     if (!dump_ffn || !tensor || !tensor->data) return;
@@ -684,7 +684,7 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
                                            const float *host_routed,
                                            const void **combined_output) {
   const bool debug = [] {
-    return moestream::graphcfg::flag_on("MOESTREAM_GGML_SHARED_DEBUG");
+    return zeromoe::graphcfg::flag_on("ZEROMOE_GGML_SHARED_DEBUG");
   }();
   if (combined_output)
     *combined_output = nullptr;
@@ -744,7 +744,7 @@ bool GgmlQwenSharedRunner::run_host_routed(int layer, const void *device_x,
   // same opt-in shared-expert snapshots on this production entry point so an
   // A/A comparison cannot accidentally observe only the host fallback.
   if (n_tokens_ == 1 && layer < 3) {
-    const char *dump_base = moestream::graphcfg::env("MOESTREAM_GGML_HC_COMPARE_DUMP");
+    const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
     if (dump_base) {
       cudaSetDevice(device_);
       if (cudaDeviceSynchronize() == cudaSuccess) {
@@ -905,7 +905,7 @@ bool GgmlQwenSharedRunner::run_device_routed_add(
   // add before the combine graph runs.  This is deliberately a synchronizing
   // path and is never enabled during normal inference.
   if (n_tokens_ == 1 && layer < 3) {
-    const char *dump_base = moestream::graphcfg::env("MOESTREAM_GGML_HC_COMPARE_DUMP");
+    const char *dump_base = zeromoe::graphcfg::env("ZEROMOE_GGML_HC_COMPARE_DUMP");
     if (dump_base) {
       cudaSetDevice(device_);
       cudaDeviceSynchronize();
@@ -949,14 +949,14 @@ void *GgmlQwenSharedRunner::backend_stream() const {
   if (!backend_)
     return nullptr;
   return reinterpret_cast<void *>(
-      moestream_ggml_backend_cuda_get_stream((ggml_backend_t)backend_));
+      zeromoe_ggml_backend_cuda_get_stream((ggml_backend_t)backend_));
 }
 
 bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
                                                float *host_out) {
   if (!backend_ || !graph_ready_ || !combined_output || !host_out ||
       (combined_output != output_ && combined_output != overlap_combined_)) {
-    const char *diag = moestream::graphcfg::env("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+    const char *diag = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
     if (diag) {
       LOG_ERROR("[GGML-SHARED-DIAG] output copy rejected backend=%d ready=%d "
                 "arg=%p output=%p overlap=%p host=%p\n",
@@ -972,7 +972,7 @@ bool GgmlQwenSharedRunner::copy_output_to_host(const void *combined_output,
       tensor->ne[0] != d_model_ || tensor->ne[1] < n_tokens_ ||
       tensor->nb[0] != sizeof(float) ||
       tensor->nb[1] != (size_t)d_model_ * sizeof(float)) {
-    const char *diag = moestream::graphcfg::env("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+    const char *diag = zeromoe::graphcfg::env("ZEROMOE_PREFILL_BOUNDARY_DUMP");
     if (diag) {
       LOG_ERROR("[GGML-SHARED-DIAG] output tensor rejected data=%p type=%u "
                 "ne=%lld,%lld nb=%zu,%zu expected=%d,%d,%zu\n",
@@ -1187,7 +1187,7 @@ bool GgmlQwenDeviceCombineRunner::run(const float *host_expert_output,
   *device_output = output_;
   return true;
 }
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 bool GgmlQwenSharedRunner::compiled_in() { return false; }
 GgmlQwenSharedRunner &GgmlQwenSharedRunner::instance() {
   static GgmlQwenSharedRunner r;
@@ -1243,4 +1243,4 @@ bool GgmlQwenDeviceCombineRunner::run(const float *, const float *,
   return false;
 }
 void GgmlQwenDeviceCombineRunner::shutdown() {}
-#endif  // MOESTREAM_USE_GGML_CUDA
+#endif  // ZEROMOE_USE_GGML_CUDA

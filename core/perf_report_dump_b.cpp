@@ -298,7 +298,7 @@ void PerfCounters::dump_report_part4(double session_elapsed_s) const {
         // over from the same-day int8-persistent WUV format experiment
         // that was tried and reverted (see CLAUDE.md). 2026-09-02
         // UPDATE: that path is no longer dead -- it is reachable via the
-        // opt-in MOESTREAM_WUV_INT8=1 toggle (wuv_int8_enabled(),
+        // opt-in ZEROMOE_WUV_INT8=1 toggle (wuv_int8_enabled(),
         // attention_layer.cpp), and when enabled it increments the very
         // counters printed below, since both formats share one call
         // site. The int8-only counter (t_wuv_int8_dequant) is broken out

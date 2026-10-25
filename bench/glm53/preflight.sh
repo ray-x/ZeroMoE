@@ -1,7 +1,7 @@
 #!/bin/bash
 # Refuse to start if another inference engine is running; then drop the page cache of the model/store/mirror files.
 # Ignore this script's launcher ancestors: the gate's own command line can name the candidate
-# binary (e.g. ./build_r2/moestream) even though it runs the private symlink. The Ling runner
+# binary (e.g. ./build_r2/zeromoe) even though it runs the private symlink. The Ling runner
 # uses the same ancestor exclusion.
 ancestors=" $$ "
 p=$$
@@ -10,7 +10,7 @@ while :; do
   [[ -z "$p" || "$p" -le 1 ]] && break
   ancestors+=" $p "
 done
-bad=$(ps -eo pid=,user=,cmd= | grep -E "moestream|llama-(server|cli|bench)|llama\.cpp|vllm|ollama|exllama|ggml" | grep -vE "grep|preflight|claude|codex|serena|headroom|cmake|make |nvcc|cc1plus|g\+\+|cicc|ptxas|fatbinary|cudafe" | while read -r pid user cmd; do
+bad=$(ps -eo pid=,user=,cmd= | grep -E "zeromoe|llama-(server|cli|bench)|llama\.cpp|vllm|ollama|exllama|ggml" | grep -vE "grep|preflight|claude|codex|serena|headroom|cmake|make |nvcc|cc1plus|g\+\+|cicc|ptxas|fatbinary|cudafe" | while read -r pid user cmd; do
   case " $ancestors " in
     *" $pid "*) ;;
     *) echo "$pid $user $cmd" ;;
@@ -29,5 +29,5 @@ for f in files:
     except OSError: pass
 print("dropped page cache of",n,"files")
 PY
-rm -f /dev/shm/moestream* 2>/dev/null
+rm -f /dev/shm/zeromoe* 2>/dev/null
 echo "PREFLIGHT OK: $(grep MemAvailable /proc/meminfo | awk '{printf "%.1f GB", $2/1048576}') available, $(df -h /dev/shm /tmp 2>/dev/null | awk 'NR>1 && $3!="0" {printf "%s used on %s; ", $3, $6}')"

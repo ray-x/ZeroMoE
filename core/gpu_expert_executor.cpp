@@ -33,10 +33,10 @@ constexpr int kGpuColdBatchThreshold = 4;
 // upload_event, so the decode thread can resolve/load the next expert while
 // this expert's H2D is still draining. A/B on usage-survey prompt 061 showed
 // 3/3 wins and byte-identical output (4.31 vs 4.24 output tok/s, +1.7%).
-// MOESTREAM_ACTIVE_DEMAND_ASYNC=0 restores the old fully-synchronous path.
+// ZEROMOE_ACTIVE_DEMAND_ASYNC=0 restores the old fully-synchronous path.
 bool active_demand_async_enabled() {
   static const bool enabled = []() {
-    const char *value = std::getenv("MOESTREAM_ACTIVE_DEMAND_ASYNC");
+    const char *value = std::getenv("ZEROMOE_ACTIVE_DEMAND_ASYNC");
     return !value || std::atoi(value) != 0;
   }();
   return enabled;
@@ -324,14 +324,14 @@ bool expert_ffn_gpu_issue(GpuExpertScratch &scratch,
   {
     static std::atomic<bool> activation_dumped{false};
     if (!activation_dumped.load(std::memory_order_relaxed)) {
-      const char *layer = std::getenv("MOESTREAM_DUMP_ACTIVATION_LAYER");
-      const char *expert = std::getenv("MOESTREAM_DUMP_ACTIVATION_EXPERT");
+      const char *layer = std::getenv("ZEROMOE_DUMP_ACTIVATION_LAYER");
+      const char *expert = std::getenv("ZEROMOE_DUMP_ACTIVATION_EXPERT");
       if (layer && expert && location->layer_idx == std::atoi(layer) &&
           location->expert_id == std::atoi(expert)) {
         bool expected = false;
         if (activation_dumped.compare_exchange_strong(expected, true)) {
           const char *configured =
-              std::getenv("MOESTREAM_DUMP_ACTIVATION_OUT");
+              std::getenv("ZEROMOE_DUMP_ACTIVATION_OUT");
           const std::string path =
               configured ? configured : "/tmp/real_activation.bin";
           std::ofstream file(path, std::ios::binary);

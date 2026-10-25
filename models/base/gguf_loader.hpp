@@ -1,6 +1,7 @@
 #pragma once
 #include <cstdio>
 #include "cufile_io.hpp"
+#include "quant_table.hpp"
 #include "logger.hpp"
 #include "perf_timer.hpp"  // register_mirror_fd -- per-drive read-byte attribution
 #include <algorithm>
@@ -640,7 +641,7 @@ public:
   // best-effort hint: the mmap path remains correct if the kernel ignores
   // it, and the caller still validates the range through mmap_bytes().
   // Per-range hints matter here because the batched route can have every
-  // expert resident in MoEStream's RAM tier already, so the prefetcher does
+  // expert resident in ZeroMoE's RAM tier already, so the prefetcher does
   // not perform the reads that would otherwise warm these same mmap pages.
   bool mmap_willneed(const GGUFTensor &t, uint64_t off, size_t len) const {
 #ifdef __linux__
@@ -1687,92 +1688,9 @@ private:
     }
   }
 
+  // Block sizes and bytes per block live in memory/quant_table.hpp (one table for the loader, the
+  // offload store and the MMQ checks). Types not in it count one byte per element, as before.
   uint64_t calculate_size(uint64_t numel, GGUFType type) {
-    uint32_t t = (uint32_t)type;
-    // Block size and type_size from ggml (block_size=32 for Q4/Q5/Q8_0, 256 for
-    // K-quants)
-    if (t == 0)
-      return numel * 4; // F32
-    if (t == 1)
-      return numel * 2; // F16
-    if (t == 2)
-      return (numel / 32) * 18; // Q4_0: 2+16
-    if (t == 3)
-      return (numel / 32) * 20; // Q4_1: 2+2+16
-    if (t == 6)
-      return (numel / 32) * 22; // Q5_0: 2+4+16
-    if (t == 7)
-      return (numel / 32) * 24; // Q5_1: 2+2+4+16
-    if (t == 8)
-      return (numel / 32) * 34; // Q8_0: 2+32
-    if (t == 9)
-      return (numel / 32) * 36; // Q8_1: 4+32 (with sum)
-    if (t == 10)
-      return (numel / 256) * 84; // Q2_K
-    if (t == 11)
-      return (numel / 256) * 110; // Q3_K
-    if (t == 12)
-      return (numel / 256) * 144; // Q4_K
-    if (t == 13)
-      return (numel / 256) * 176; // Q5_K
-    if (t == 14)
-      return (numel / 256) * 210; // Q6_K
-    if (t == 15)
-      return (numel / 256) * 292; // Q8_K
-    if (t == 16)
-      return (numel / 256) * 66; // IQ2_XXS
-    if (t == 17)
-      return (numel / 256) * 74; // IQ2_XS
-    if (t == 18)
-      return (numel / 256) * 98; // IQ3_XXS
-    if (t == 19)
-      return (numel / 256) * 50; // IQ1_S
-    if (t == 20)
-      return (numel / 32) * 18; // IQ4_NL (block size 32, not 256 — like Q4_0;
-                                // was (numel/256)*132, ~20% too small)
-    if (t == 21)
-      return (numel / 256) * 110; // IQ3_S
-    if (t == 22)
-      return (numel / 256) * 82; // IQ2_S
-    if (t == 23)
-      return (numel / 256) * 136; // IQ4_XS
-    if (t == 26)
-      return numel * 4; // I32 -- raw 32-bit ints, 4 bytes/element, no block
-                        // packing. Needed for DeepSeek-V4's
-                        // ffn_gate_tid2eid.weight (hash-routed MoE
-                        // token-id->expert-id lookup table) -- without this
-                        // case it fell through to the `return numel;`
-                        // fallback below (1 byte/element, 4x too small),
-                        // which would have both truncated this tensor's own
-                        // read AND corrupted every subsequent tensor's
-                        // sequential offset in the same shard.
-    if (t == 27)
-      return numel * 8; // I64 -- see the enum's own comment for why this
-                        // case exists defensively alongside I32.
-    // FIX: these 4 cases used the SAME stale numbering the GGUFType enum
-    // itself just got corrected for (see that enum's own comment) -- t==24/
-    // 25/29/30 matched real ggml's I8/I16/IQ1_M/BF16, not IQ1_M/BF16/
-    // TQ1_0/TQ2_0. Real values now (confirmed against build-metal/_deps/
-    // ggml-src/include/ggml.h directly): IQ1_M=29, BF16=30, TQ1_0=34,
-    // TQ2_0=35. The per-element byte formulas themselves are unchanged --
-    // only which raw type id triggers each one.
-    if (t == 29)
-      return (numel / 256) * 56; // IQ1_M
-    if (t == 30)
-      return numel * 2; // BF16
-    if (t == 34)
-      return (numel / 256) * 54; // TQ1_0
-    if (t == 35)
-      return (numel / 256) * 66; // TQ2_0
-    if (t == 39)
-      return (numel / 32) * 17; // MXFP4: block=32 elements, 1(e)+16(qs) bytes
-    if (t == 40)
-      return (numel / 64) * 36; // NVFP4: block=64 elements, 4(d)+32(qs) bytes
-    if (t == 42)
-      return (numel / 64) * 18; // Q2_0: block=64 elements, 2(d)+16(qs) bytes
-                                // -- see block_q2_0 in ggml-common.h
-    // IQ2_M: no real GGML_TYPE_* slot in the currently-linked ggml at all
-    // (see the enum's own comment) -- no formula to assign a number to.
-    return numel;                // fallback: 1 byte per element
+    return zeromoe::quant::tensor_bytes(static_cast<uint32_t>(type), numel);
   }
 };

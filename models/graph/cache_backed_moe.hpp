@@ -4,7 +4,7 @@
 #include "execution_policy.hpp"
 #include <stdexcept>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 // A graph callback adapter to the live native MoE backend. Residency, cache
 // holds, transfers and expert kernels stay in the existing shared pipeline.
@@ -50,4 +50,4 @@ struct CacheBackedMoeRuntime {
       throw std::runtime_error(reason);
   }
 };
-} // namespace moestream::graph
+} // namespace zeromoe::graph

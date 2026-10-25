@@ -16,7 +16,7 @@ All peer worktrees were read without modification.
 | GLM 5.3, non-Flash | `/home/ray/work/moestream-glm53`, committed HEAD `4e5c8ce`; `docs/GLM5.3-baseline.md`, `bench/glm53/`, and the committed implementation. The working tree has an unfinished merge, so its conflicted files are not treated as a runnable baseline. |
 | GLM 5.3 Flash | `/home/ray/work/moestream-graph-framework`, HEAD `7344dfa`; `bench/glm_recipe_env.sh`, `docs/ssd-offload/11-glm53flash-handoff-2026-10-11.md`, and `13-glm-decode-results-2026-10-14.md`. Also checked the older `/home/ray/work/moestream-graph` tree. |
 | DeepSeek V4.1 Flash | `/home/ray/work/moestream-deepseek-v41-flash`, HEAD `a03a879`, and `/home/ray/work/moestream-dsv41-on-master`, HEAD `0737a17`; configs, graph implementation, decode report and speed follow-up. |
-| Ling | `/home/ray/Projects/MoEStream/.worktrees/ling-3.1-flash`, base `10cc7ec`, plus the in-progress changes. |
+| Ling | `/home/ray/Projects/ZeroMoE/.worktrees/ling-3.1-flash`, base `10cc7ec`, plus the in-progress changes. |
 
 The GLM Flash report measures the last 30 decoded steps on identical
 teacher-forced tokens. Its typical sustained result is 13–15 tok/s, with
@@ -99,12 +99,12 @@ The older GLM GGML fork implements selected-expert copies inside the
 scheduler, hardened by patches 0007 and 0008: skip negative routes, find
 the consuming `MUL_MAT_ID` beyond the first node, copy each registered
 expert separately, and supply padding without reading adjacent empty
-source slots. Matching patch filenames in MoEStream do not prove those
+source slots. Matching patch filenames in ZeroMoE do not prove those
 edits applied to the newer, rewritten scheduler. Ling had no application
 copy callback registered.
 
 Also, `GGML_OP_OFFLOAD_MIN_BATCH` defaults to 32. Consequently setting
-`MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1` alone still leaves the two-token
+`ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1` alone still leaves the two-token
 expert matmuls on CPU. Lowering the threshold to 2 places them on CUDA
 (GPU workspace 1.22 GiB versus 0.27 GiB), exposing the missing selective
 copy behavior. The uncorrected diagnostic failed in `cudaMemcpyAsync`
@@ -145,7 +145,7 @@ automatically accelerate IQ1_S gate/up. This is a CPU-library rebuild,
 not a reason to rebuild CUDA kernels.
 
 The latest non-Flash GLM commit also implements opt-in
-`MOESTREAM_OFFLOAD_RETARGET=1` page-reusing eviction. Ling's current
+`ZEROMOE_OFFLOAD_RETARGET=1` page-reusing eviction. Ling's current
 `memory/offload_store.hpp` lacks it. The GLM controlled result improved
 roughly 1.75 to 2.05 tok/s by avoiding page discard/refault costs. It is
 relevant to Ling's measured misses, but must be ported and measured,

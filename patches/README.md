@@ -1,11 +1,11 @@
 # ggml patch series
 
-MoEStream builds against **upstream ggml-org/llama.cpp** plus the patches here;
+ZeroMoE builds against **upstream ggml-org/llama.cpp** plus the patches here;
 it does not carry a modified copy of ggml.
 
 - Upstream base: `3cf03257f` ("CUDA: enable sparse fa for qwen4 (#28770)").
 - Patch paths are relative to the `ggml/` directory (`a/src/ggml-cuda/...`).
-- Applied automatically at configure time by `cmake/MoEStreamGgmlPatches.cmake`
+- Applied automatically at configure time by `cmake/ZeroMoEGgmlPatches.cmake`
   (idempotent: a patch that already applies in reverse is skipped).
 - Manual: `cd <llama.cpp>/ggml && for p in <repo>/patches/ggml/*.patch; do patch -p1 < $p; done`
 
@@ -14,9 +14,9 @@ it does not carry a modified copy of ggml.
 | Directory | Applied by CMake | Purpose |
 |---|---|---|
 | `ggml/` | always (required) | Core series |
-| `ggml-host-node/` | `MOESTREAM_ENABLE_GGML_HOST_NODE_PATCHES` (default ON), required | CUDA-graph host-node bridge for the Qwen4Exp CPU/GPU split |
+| `ggml-host-node/` | `ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES` (default ON), required | CUDA-graph host-node bridge for the Qwen4Exp CPU/GPU split |
 | `ggml-host-node-beellama/` | same option, best effort | Needs beellama-only scheduler profiling helpers (`ggml_backend_sched_profile_is_cpu`, ...); **does not apply to plain upstream** — see "Pending port" |
-| `debug/` | `MOESTREAM_GGML_DEBUG_PATCHES` (default OFF) | Profiling / logging / bench instrumentation. Not part of the main series |
+| `debug/` | `ZEROMOE_GGML_DEBUG_PATCHES` (default OFF) | Profiling / logging / bench instrumentation. Not part of the main series |
 | `experimental/` | never | Spikes and A/B experiments |
 | `obsolete/` | never | Superseded or stale; kept for reference |
 
@@ -47,7 +47,7 @@ clean checkout of the base give **byte-identical trees** (git tree
 `fb8762929ed58d27e41751cc4669b501821b47ae`). A configure against a pristine
 upstream checkout applies all seven, and a second configure applies none.
 With the gate patch added, the resulting tree is `9b04e2d634ff2645caf8ef08dfd4ffa60c6530fc`; a full
-`moestream` build against it succeeds (0 errors).
+`zeromoe` build against it succeeds (0 errors).
 
 ## Patches that did not make the main series
 
@@ -57,15 +57,16 @@ With the gate patch added, the resulting tree is `9b04e2d634ff2645caf8ef08dfd4ff
   `ggml_backend_sched_profile_is_cpu(...)` checks as `ggml_backend_is_cpu(...)`
   and rebase. Until then, a plain-upstream build runs without host-node
   scheduler coordination.
-- `debug/ggml-cpu-moe-node-profile` — `MOESTREAM_QWEN4EXP_CPU_CALLBACK_BREAKDOWN`
+- `debug/ggml-cpu-moe-node-profile` — `ZEROMOE_QWEN4EXP_CPU_CALLBACK_BREAKDOWN`
   profiling; needs the same beellama base.
 - `debug/bee-bench-exact-decode-and-phase-timing` — patches beellama's
   `llama-bench` (exact-decode token files, phase timing). For the comparison
-  benchmark, not for MoEStream.
+  benchmark, not for ZeroMoE.
 - `experimental/ggml-bf16-mmvf-cublas-experiment` — env-gated BF16 matvec via cuBLAS.
 - `experimental/ggml-scheduler-early-ready-layer13` — Layer-13 predictive staging spike.
+- `experimental/ggml-cpu-act32-*.diff` — CPU activation-rounding experiment (32-value `Q8_0` blocks for IQ-quant expert dot products). Rejected on performance (+7-8% on the CPU expert op); see `docs/experiments/ggml-cpu-activation-rounding.md`. Not applied by any build.
 - `obsolete/ggml-cuda-cccl-iterators` — upstream now includes `<cuda/iterator>`
   inside its own CCCL guard; the CUDA-11 guard it added is irrelevant on CUDA 13.
 - `obsolete/exl3-runtime-cmake`, `obsolete/exl3-cuda-runtime-cmake` — edits to
-  MoEStream's own old `CMakeLists.txt`; no longer apply (the sources they added
+  ZeroMoE's own old `CMakeLists.txt`; no longer apply (the sources they added
   are in the CMake file already).

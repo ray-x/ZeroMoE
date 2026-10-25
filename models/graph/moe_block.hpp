@@ -18,7 +18,8 @@
 #include <functional>
 #include <memory>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
+class PhaseExpertCache;
 
 // One expert branch: compact expert tensors plus the constant maps that translate
 // the model's expert ids into branch-local ids / ownership mask.
@@ -30,6 +31,8 @@ struct MoEBranch {
 };
 
 struct MoEBlockGraph {
+  PhaseExpertCache *phase_cache = nullptr;
+  const StreamingEngine *engine = nullptr;
   ggml_context *ctx = nullptr;
   ggml_cgraph *graph = nullptr;
   ggml_backend_sched_t sched = nullptr;
@@ -201,4 +204,4 @@ inline MoEBlockResult build_moe_block(const MoEBlockSpec &spec,
   return res;
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

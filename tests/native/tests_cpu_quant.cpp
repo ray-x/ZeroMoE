@@ -137,7 +137,7 @@ bool test_avx512_dequant_iq() {
 // 7b. CPU IQ matmul paths and grouped-wrapper consistency
 // ------------------------------------------------------------------
 // The decode path uses three different CPU contracts here:
-//   * IQ2_XXS/IQ3_XXS default to MoEStream's exact dequant+F32 dot path;
+//   * IQ2_XXS/IQ3_XXS default to ZeroMoE's exact dequant+F32 dot path;
 //   * IQ1_M optionally uses ggml's production IQ1_M x Q8_K dot path;
 //   * the Qwen grouped wrappers must produce the same result as their
 //     one-matrix form, regardless of whether the caller has one or many
@@ -400,8 +400,8 @@ bool test_qwen_q2_0_vnni_kernel() {
 
     // Exercise the actual direct Qwen dispatch with this measured all-Q2_0
     // signature. This is the opt-in CPU host route used by the smoke config.
-    setenv("MOESTREAM_QWEN_CPU_DIRECT_POOL", "1", 1);
-    setenv("MOESTREAM_QWEN_CPU_DIRECT_FUSED", "1", 1);
+    setenv("ZEROMOE_QWEN_CPU_DIRECT_POOL", "1", 1);
+    setenv("ZEROMOE_QWEN_CPU_DIRECT_FUSED", "1", 1);
     GgmlQwenCpuExpertRef ref{
         gate_ptrs[0], up_ptrs[0], down_ptrs[0],
         (size_t)FF * input_row_bytes, (size_t)FF * input_row_bytes,

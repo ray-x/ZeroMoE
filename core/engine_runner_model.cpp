@@ -11,7 +11,7 @@ public:
 std::expected<void, std::string> EngineRunner::load_model() {
   const std::string &model_path = config.model_path;
   int max_ctx = config.context_size;
-#if defined(MOESTREAM_EXL3_CUDA) && defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_EXL3_CUDA) && defined(ZEROMOE_USE_GGML_CUDA)
   if (!engine.exl3_ggml_bridge_model_path.empty()) {
     const size_t cache_bytes = static_cast<size_t>(
         config.exl3_gpu_cache_gb * 1024.0 * 1024.0 * 1024.0);

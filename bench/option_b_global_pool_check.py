@@ -79,7 +79,7 @@ def main():
         "ngen": args.ngen, "gpu": args.gpu, "cpu_threads": args.cpu_threads,
         "no_negative_skip": args.no_negative_skip,
         "base_configs_sha256": [hashlib.sha256(p.read_bytes()).hexdigest() for p in (A, B)],
-        "usage_sha256": hashlib.sha256((ROOT / "tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap").read_bytes()).hexdigest(),
+        "usage_sha256": hashlib.sha256((ROOT / "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap").read_bytes()).hexdigest(),
     }
     manifest_path = args.out_dir / "manifest.json"
     if manifest_path.exists() and json.loads(manifest_path.read_text()) != manifest:
@@ -88,20 +88,20 @@ def main():
     env = os.environ.copy()
     # Prevent ambient diagnostics from changing the token history or placement.
     for key in list(env):
-        if key.startswith("MOESTREAM_"):
+        if key.startswith("ZEROMOE_"):
             del env[key]
     env.update({
         "CUDA_VISIBLE_DEVICES": args.gpu,
-        "MOESTREAM_QWEN4EXP_FULL_GRAPH": "1",
-        "MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE": "1",
-        "MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
-        "MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
-        "MOESTREAM_QWEN_CPU_THREADS": str(args.cpu_threads),
-        "MOESTREAM_BENCH_IGNORE_STOP": "1",
-        "MOESTREAM_TOKEN_LOOP_DIAG": "1",
+        "ZEROMOE_QWEN4EXP_FULL_GRAPH": "1",
+        "ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE": "1",
+        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS": "0",
+        "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING": "1",
+        "ZEROMOE_QWEN_CPU_THREADS": str(args.cpu_threads),
+        "ZEROMOE_BENCH_IGNORE_STOP": "1",
+        "ZEROMOE_TOKEN_LOOP_DIAG": "1",
     })
     if args.no_negative_skip:
-        env["MOESTREAM_MMID_NO_NEGATIVE_SKIP"] = "1"
+        env["ZEROMOE_MMID_NO_NEGATIVE_SKIP"] = "1"
     prompt_ids = args.out_dir / "prompt.tokens"
     teacher = args.out_dir / "A.tokens"
     summary_path = args.out_dir / "summary.json"
@@ -116,15 +116,15 @@ def main():
         cfg.write_text(config)
         run_env = env.copy()
         if name.endswith("_dummy"):
-            run_env["MOESTREAM_MMID_NO_NEGATIVE_SKIP"] = "1"
-        run_env["MOESTREAM_DECODE_LOGITS_DUMP"] = str(logits)
-        run_env["MOESTREAM_GENERATED_TOKEN_FILE"] = str(captured)
+            run_env["ZEROMOE_MMID_NO_NEGATIVE_SKIP"] = "1"
+        run_env["ZEROMOE_DECODE_LOGITS_DUMP"] = str(logits)
+        run_env["ZEROMOE_GENERATED_TOKEN_FILE"] = str(captured)
         if name == "A":
-            run_env["MOESTREAM_PROMPT_TOKEN_FILE"] = str(prompt_ids)
+            run_env["ZEROMOE_PROMPT_TOKEN_FILE"] = str(prompt_ids)
         else:
-            run_env["MOESTREAM_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
-            run_env["MOESTREAM_TEACHER_FORCE_TOKEN_FILE"] = str(teacher)
-            run_env["MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING"] = "1"
+            run_env["ZEROMOE_PROMPT_TOKEN_INPUT_FILE"] = str(prompt_ids)
+            run_env["ZEROMOE_TEACHER_FORCE_TOKEN_FILE"] = str(teacher)
+            run_env["ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING"] = "1"
         if not (args.resume and logits.exists() and captured.exists()):
             # Recheck before every launch: another session can start after A.
             deadline = time.monotonic() + args.wait_idle
@@ -133,7 +133,7 @@ def main():
                 gpu_procs = subprocess.check_output([
                     "nvidia-smi", f"--id={args.gpu}", "--query-compute-apps=pid,process_name",
                     "--format=csv,noheader"], text=True).strip()
-                engines = subprocess.run(["pgrep", "-x", "-a", "moestream"],
+                engines = subprocess.run(["pgrep", "-x", "-a", "zeromoe"],
                                          capture_output=True, text=True).stdout.strip()
                 if not gpu_procs and not engines:
                     break

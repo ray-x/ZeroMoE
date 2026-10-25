@@ -5,7 +5,7 @@
 // attention_layer.cpp -- the QK^T-over-cached-latent + softmax + weighted-V
 // step), at GLM-5.2's real dims, across a sweep of context lengths (score's
 // cost genuinely grows with context, unlike qabsorb which is context-
-// independent)? Does NOT touch moestream's real inference path.
+// independent)? Does NOT touch zeromoe's real inference path.
 //
 // Why this maps to GPU more cleanly than qabsorb did: MLA's latent K/V
 // (Lc/Rc) is SHARED across every head (that's the whole point of the

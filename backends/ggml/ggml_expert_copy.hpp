@@ -17,7 +17,7 @@ extern "C" void ggml_backend_sched_set_copy_callback(
     void *) __attribute__((weak));
 #endif
 
-namespace moestream::ggmlcopy {
+namespace zeromoe::ggmlcopy {
 
 struct ExpertCopy {
   const ggml_tensor *last_ids = nullptr;
@@ -110,4 +110,4 @@ struct ExpertCopy {
   }
 };
 
-} // namespace moestream::ggmlcopy
+} // namespace zeromoe::ggmlcopy

@@ -28,7 +28,7 @@ extern void dense_ffn_gguf(StreamingEngine &engine, int layer_idx,
 
 namespace {
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 constexpr size_t kLingGraphContextBytes = 8ull << 20;
 constexpr int kLingGraphNodes = 1024;
@@ -72,7 +72,7 @@ struct LingNativeRuntime {
   RAMSafetyManager *ram = nullptr;
   LockFreePrefetcher *prefetch = nullptr;
   LayerScratch *scratch = nullptr;
-  moestream::graph::CacheBackedMoeRuntime moe;
+  zeromoe::graph::CacheBackedMoeRuntime moe;
 };
 
 LingNativeRuntime g_runtime;
@@ -177,23 +177,23 @@ std::unique_ptr<LingNativeGraph> build_graph(StreamingEngine &engine, int S,
   return g;
 }
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA
 
 } // namespace
 
 bool bailingmoe3_native_graph_enabled() {
-#if defined(MOESTREAM_USE_GGML_CUDA)
-  return moestream::graphcfg::flag_on("MOESTREAM_LING_FULL_GRAPH") &&
-         moestream::graphcfg::flag_on("MOESTREAM_LING_NATIVE_GRAPH");
+#if defined(ZEROMOE_USE_GGML_CUDA)
+  return zeromoe::graphcfg::flag_on("ZEROMOE_LING_FULL_GRAPH") &&
+         zeromoe::graphcfg::flag_on("ZEROMOE_LING_NATIVE_GRAPH");
 #else
   return false;
 #endif
 }
 
 bool bailingmoe3_hybrid_cuda_graph_enabled() {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   return bailingmoe3_native_graph_enabled() &&
-         moestream::graphcfg::flag_on("MOESTREAM_LING_HYBRID_CUDA_GRAPH");
+         zeromoe::graphcfg::flag_on("ZEROMOE_LING_HYBRID_CUDA_GRAPH");
 #else
   return false;
 #endif
@@ -203,7 +203,7 @@ void bailingmoe3_native_graph_bind_runtime(StreamingEngine &engine,
                                            RAMSafetyManager &ram,
                                            LockFreePrefetcher &prefetch,
                                            LayerScratch &scratch) {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   g_runtime = {&engine, &ram, &prefetch, &scratch};
   g_runtime.moe.bind(engine, ram, prefetch, scratch);
 #else
@@ -217,7 +217,7 @@ void bailingmoe3_native_graph_bind_runtime(StreamingEngine &engine,
 void bailingmoe3_native_graph_ffn(StreamingEngine &engine, int layer_idx,
                                  const float *hidden_states, int S,
                                  float *output, const int *token_ids) {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   if (g_runtime.engine != &engine || !g_runtime.ram || !g_runtime.prefetch ||
       !g_runtime.scratch)
     throw std::runtime_error("Ling native MoE runtime is not bound");
@@ -248,7 +248,7 @@ void bailingmoe3_native_graph_ffn(StreamingEngine &engine, int layer_idx,
 
 bool bailingmoe3_native_graph_prepare(StreamingEngine &engine, int S,
                                       int pos_base, const int *token_ids) {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   if (!bailingmoe3_native_graph_enabled() || !token_ids || S <= 0 ||
       pos_base < 0 || pos_base + S > engine.max_t)
     return false;
@@ -271,7 +271,7 @@ bool bailingmoe3_native_graph_prepare(StreamingEngine &engine, int S,
 
 bool bailingmoe3_native_graph_run(StreamingEngine &engine, float *hidden, int S,
                                   int pos_base, const int *token_ids) {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   if (!g_graph || g_graph->engine != &engine || !hidden || S != g_graph->S ||
       !bailingmoe3_native_graph_prepare(engine, S, pos_base, token_ids))
     return false;
@@ -295,7 +295,7 @@ bool bailingmoe3_native_graph_run(StreamingEngine &engine, float *hidden, int S,
 }
 
 void bailingmoe3_native_graph_shutdown() {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   g_graph.reset();
   g_runtime = {};
 #endif

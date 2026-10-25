@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen4Exp (Qwen3.8-Flash-Next) version of next_layer_probe_fit.py. Dumps from MOESTREAM_QWEN4EXP_PROBE_DUMP: L<l>.x.bin = FFN input of layer l
+"""Qwen4Exp (Qwen3.8-Flash-Next) version of next_layer_probe_fit.py. Dumps from ZEROMOE_QWEN4EXP_PROBE_DUMP: L<l>.x.bin = FFN input of layer l
 (HC-mixed activation the router consumes, [N,D]), L<l>.s.bin = router softmax probs of layer l ([N,E]). Qwen has no selection bias in this GGUF,
 so the real selection is top-k of the probs. Pilot = softmax(W_{l+1} x_l) (what the engine's early-ready predictor computes)."""
 import sys, glob, os

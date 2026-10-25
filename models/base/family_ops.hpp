@@ -122,7 +122,7 @@ using LayerInputFn = void (*)(StreamingEngine &engine, int layer_idx, int S,
 //
 // The layer loop and the whole-model GGML graph are two execution strategies
 // for the same model family.  Keep the lifecycle common even though the graph
-// topology remains family-specific.  This is the MoEStream equivalent of
+// topology remains family-specific.  This is the ZeroMoE equivalent of
 // llama.cpp's model.build_graph()/set_inputs()/run_graph() boundary: the
 // caller owns the request, while the selected family owns graph construction,
 // state binding, and its scheduler-backed execution.

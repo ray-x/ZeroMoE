@@ -6,7 +6,7 @@
 #include <cstring>
 #include <vector>
 
-using namespace moestream::cuda;
+using namespace zeromoe::cuda;
 
 static int g_failures = 0;
 #define CHECK(cond)                                                          \

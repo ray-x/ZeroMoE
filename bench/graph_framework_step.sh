@@ -23,8 +23,8 @@ mkdir -p "$out"
 common=(--engine "$cand" --baseline-engine "$base"
         --prompt-ids "$inputs/prompt.tokens" --continuation "$inputs/Q2.tokens"
         --all-split --wait-idle "${WAIT_IDLE:-900}"
-        --baseline-env MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1
-        --candidate-env MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1)
+        --baseline-env ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1
+        --candidate-env ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1)
 
 echo "== $step: correctness (teacher-forced logits)"
 python3 bench/option_b_early_ready_check.py "${common[@]}" \

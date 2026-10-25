@@ -180,7 +180,7 @@ struct PerfCountersPart01 {
     // the grouped GGML kernels do not expose their internal per-worker split,
     // and the useful question here is which whole stage delays the decode
     // thread (gate/up, SwiGLU, down, or weighted combine).  The counters stay
-    // zero unless MOESTREAM_QWEN_CPU_STAGE_TIMING=1 is set, so the normal
+    // zero unless ZEROMOE_QWEN_CPU_STAGE_TIMING=1 is set, so the normal
     // path pays no extra clock reads.
     std::atomic<double> t_qwen_cpu_grouped_gate_up{0};
     std::atomic<double> t_qwen_cpu_grouped_swiglu{0};

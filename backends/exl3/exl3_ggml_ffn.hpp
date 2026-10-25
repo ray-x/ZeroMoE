@@ -1,6 +1,6 @@
 #pragma once
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include "exl3_format.hpp"
 #include "exl3_ggml_backend.hpp"

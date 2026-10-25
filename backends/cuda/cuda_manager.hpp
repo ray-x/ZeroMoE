@@ -383,7 +383,7 @@ public:
     size_t dense_pool_used = 0;
 
     // Reports actual driver-reported free/used/total VRAM for every known
-    // device (not MoEStream's own bookkeeping — this is ground truth from
+    // device (not ZeroMoE's own bookkeeping — this is ground truth from
     // cudaMemGetInfo, so it reflects everything on the GPU including
     // whatever else is running on the machine). Call at checkpoints around
     // allocation-heavy steps to see exactly where headroom runs out, rather
@@ -467,7 +467,7 @@ public:
     }
 
     // Free bytes on the core GPU right now (ground truth via cudaMemGetInfo,
-    // not MoEStream's own bookkeeping). Used to size the dense-tensor pool
+    // not ZeroMoE's own bookkeeping). Used to size the dense-tensor pool
     // when the full requested size doesn't fit — see main.cpp's backoff.
     size_t core_free_vram_bytes() {
         cudaSetDevice(device_id);
@@ -1161,7 +1161,7 @@ public:
     // layout contract.
     //
     // STATUS (2026-09-02): reachable in production ONLY via the opt-in
-    // MOESTREAM_WUV_INT8=1 environment toggle -- see that toggle's own full
+    // ZEROMOE_WUV_INT8=1 environment toggle -- see that toggle's own full
     // write-up in attention_layer.cpp (wuv_int8_enabled) for the real
     // hardware A/B numbers and the reasoning behind leaving it OFF. Short
     // version: it works and is correct (0 errors across 4 real runs; the
@@ -1254,7 +1254,7 @@ public:
     // active" line whenever t_wuv_int8_dequant is nonzero. Do not re-derive
     // the "the dequant must be eating it" argument; it has been measured.
     //
-    // Opt-in only (MOESTREAM_WUV_INT8=1) -- see wuv_int8_enabled() in
+    // Opt-in only (ZEROMOE_WUV_INT8=1) -- see wuv_int8_enabled() in
     // attention_layer.cpp for the full A/B and the OFF-by-default rationale.
     bool wuv_int8_batched_host(int layer_idx, const float* x_host, float* y_host,
                                 int H, int kvl, int vh, int S = 1) {
@@ -2510,7 +2510,7 @@ public:
         // Keep command-line A/B runs independent of a temporary config edit.
         // An explicit environment override is useful for regression checks;
         // absent the variable, the config remains authoritative.
-        if (const char *override_value = std::getenv("MOESTREAM_DENSE_ASYNC_COPIES")) {
+        if (const char *override_value = std::getenv("ZEROMOE_DENSE_ASYNC_COPIES")) {
             dense_async_copies_enabled = (override_value[0] == '1' ||
                                           override_value[0] == 'y' ||
                                           override_value[0] == 'Y' ||

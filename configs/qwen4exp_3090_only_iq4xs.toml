@@ -8,11 +8,11 @@
 #   28110.09 + 41360.56 = 69470.65 MiB. i.e. ~21.95 GB resident on the 3090,
 #   ~67.85 GB served from host RAM/disk via mmap. llama.cpp does this as a
 #   static, whole-tensor CPU/GPU split (roughly the first ~10-11 of 48 MoE
-#   layers fully GPU-resident, the rest fully CPU); MoEStream instead spreads
+#   layers fully GPU-resident, the rest fully CPU); ZeroMoE instead spreads
 #   partial per-expert residency across ALL 48 layers via its VRAM LRU/pin
 #   cache, so this is not a literal layer-for-layer copy of llama.cpp's split
 #   -- it is a matching TOTAL VRAM budget for the MoE tier, produced the
-#   MoEStream way.
+#   ZeroMoE way.
 #
 # Real per-tensor census for THIS checkpoint (gguf_tool plan, 2026-09-27):
 #   48 layers, 512 experts/layer, expert slab (gate+up+down) 3.48 MB max
@@ -62,8 +62,8 @@ expert_fetch_threads = 10
 omp_max_threads      = 12
 prefetch_worker_threads = 4
 
-pin_file           = ".moestream_usage_qwen4exp_4prompts40"
-prefill_pin_file   = ".moestream_usage_qwen4exp_prefill_4prompts40"
+pin_file           = ".zeromoe_usage_qwen4exp_4prompts40"
+prefill_pin_file   = ".zeromoe_usage_qwen4exp_prefill_4prompts40"
 freeze_usage_stats = true
 pin_topk_per_layer   = 1
 pinned_vram_capacity = 3880

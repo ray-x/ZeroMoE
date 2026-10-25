@@ -11,7 +11,7 @@
 // projection subgraph.
 //
 // This header deliberately has no ggml dependency. Without
-// MOESTREAM_USE_GGML_CUDA every method returns false, so callers retain the
+// ZEROMOE_USE_GGML_CUDA every method returns false, so callers retain the
 // existing dense_proj implementation unchanged.
 // ---------------------------------------------------------------------------
 

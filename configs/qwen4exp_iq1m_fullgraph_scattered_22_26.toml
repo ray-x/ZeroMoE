@@ -1,9 +1,9 @@
 # IQ1_M scatter-placement comparison: the same 26 CPU / 22 GPU expert layers
 # as beellama's historical scattered mask. Launch with:
-#   MOESTREAM_QWEN4EXP_FULL_GRAPH=1
-#   MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=40
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
 # The candidate GPU range is [8,48); cpu_affinity_layers excludes the 18
 # scattered CPU layers inside it, leaving the same 22 GPU layers as the mask.
 model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
@@ -31,8 +31,8 @@ expert_fetch_threads = 10
 omp_max_threads = 12
 prefetch_worker_threads = 4
 
-pin_file = "tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap"
-prefill_pin_file = "tests/moe_usage_survey/moestream_usage_survey_prefill"
+pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
+prefill_pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_prefill"
 freeze_usage_stats = true
 
 qwen4exp_option_b_layer = -1

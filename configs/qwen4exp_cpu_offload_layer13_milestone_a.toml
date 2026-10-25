@@ -28,8 +28,8 @@ expert_fetch_threads = 10
 omp_max_threads = 12
 prefetch_worker_threads = 4
 
-pin_file = ".moestream_usage_qwen4exp_7prompts_isolated"
-prefill_pin_file = ".moestream_usage_qwen4exp_prefill_7prompts_isolated"
+pin_file = ".zeromoe_usage_qwen4exp_7prompts_isolated"
+prefill_pin_file = ".zeromoe_usage_qwen4exp_prefill_7prompts_isolated"
 freeze_usage_stats = true
 move_on_promotion = false
 

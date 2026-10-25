@@ -3,7 +3,7 @@
 //
 // Same spirit as bench_score_cpu_vs_gpu.cu (GLM-5.2's MLA score bench) but
 // for DeepSeek-V4's raw-SWA/HCA score phase (attention_layer.cpp's
-// dsv4_attention_gguf, decode S==1 only). Does NOT touch moestream's real
+// dsv4_attention_gguf, decode S==1 only). Does NOT touch zeromoe's real
 // inference path or link cuda_manager.hpp -- both the CPU reference and the
 // GPU implementation below are self-contained reimplementations, kept as
 // close as practical to the production math so a divergence here is a real

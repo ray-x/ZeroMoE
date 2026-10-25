@@ -9,7 +9,7 @@
 //     compatibility shim while the codebase is being modernized.
 //
 // CMake controls which implementation file is compiled:
-//   - MOESTREAM_CPU_ONLY=ON forces the CPU-only path (auto-set on macOS).
+//   - ZEROMOE_CPU_ONLY=ON forces the CPU-only path (auto-set on macOS).
 //   - On arm64 Apple, kernels_cpu_neon.cpp is selected.
 //   - Otherwise kernels_cpu.cpp (AVX-512) is selected.
 
@@ -167,7 +167,7 @@ void matmul_iq3_xxs_ggml_avx2(float *y, const float *x, const uint8_t *W_quantiz
 // quantized-activation path.  Kept as a separate opt-in symbol so GLM and
 // other model CPU paths remain unchanged.
 // Returns the effective team size used by Qwen's direct grouped kernels;
-// MOESTREAM_QWEN_CPU_THREADS is a Qwen-only diagnostic override.
+// ZEROMOE_QWEN_CPU_THREADS is a Qwen-only diagnostic override.
 int qwen_cpu_grouped_threads();
 bool matmul_iq1_m_ggml_q8k(float *y, const float *x, const uint8_t *W_quantized,
                            int S, int I, int O);
@@ -250,7 +250,7 @@ bool matmul_qwen_q4_0_q4_0_fused(
     const float *x, const uint8_t *const *gate_weights,
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
-// Qwen-only fused Q2_0 path. Uses MoEStream's AVX-512 VNNI dot when explicitly
+// Qwen-only fused Q2_0 path. Uses ZeroMoE's AVX-512 VNNI dot when explicitly
 // enabled at runtime and the linked GGML CPU dot as its fallback.
 bool matmul_qwen_q2_0_q2_0_fused(
     float *const *gate_y, float *const *up_y, float *const *down_y,
@@ -258,7 +258,7 @@ bool matmul_qwen_q2_0_q2_0_fused(
     const uint8_t *const *up_weights, const uint8_t *const *down_weights,
     int n_matrices, int I, int gate_O, int down_O, int n_threads = 0);
 // Q2_0 AVX-512 VNNI is enabled by default when supported by the CPU.
-// MOESTREAM_Q2_0_DISABLE_VNNI=1 selects GGML's CPU dot instead.
+// ZEROMOE_Q2_0_DISABLE_VNNI=1 selects GGML's CPU dot instead.
 bool q2_0_vnni_enabled();
 // The batched kernel additionally requires AVX-512 VBMI.
 bool q2_0_vbmi_enabled();

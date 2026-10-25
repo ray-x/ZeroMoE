@@ -3,18 +3,18 @@
 #include <cstddef>
 #include <utility>
 
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
 #include "ggml.h"
 #include "ggml-backend.h"
 #endif
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include <cuda_runtime.h>
 #endif
 
 namespace moe {
 
-#if defined(MOESTREAM_USE_GGML)
+#if defined(ZEROMOE_USE_GGML)
 
 class GgmlContextGuard {
  public:
@@ -114,7 +114,7 @@ class GgmlBackendEventGuard {
 
 #endif
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 class CudaEventGuard {
  public:

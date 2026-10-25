@@ -66,10 +66,10 @@ recipe in section 1.
 
 (Notes written before the merge:)
 
-* DeepSeek V4.1 (`moestream-9f`): your 7 branch commits reduce to the 6 listed above on
+* DeepSeek V4.1 (`zeromoe-9f`): your 7 branch commits reduce to the 6 listed above on
   master. Pick up `integration/refactor-ds-glm-rehearsal`, or redo steps 1-2 yourself.
   Either way, your future `main.cpp` edits go into the phase files above.
-* GLM-5.3 (`moestream-cc`): `5d0aacb` is already on the new history; its single hunk
+* GLM-5.3 (`zeromoe-cc`): `5d0aacb` is already on the new history; its single hunk
   lands in `engine_runner_cache.cpp` (see the rehearsal). New counters: last
   `include/perf/counters_NN` slice + the matching `perf_report_dump_*` section.
 * Everyone: nothing here touches `src/ggml_deepseek_v41_graph*.cpp`,
@@ -80,11 +80,11 @@ recipe in section 1.
 
 | check | result |
 |---|---|
-| `refactor/source-split` build + link (`moestream`, `moestream_tests`) | OK |
+| `refactor/source-split` build + link (`zeromoe`, `zeromoe_tests`) | OK |
 | Qwen decode, 64 tokens, same prompt/config as master | text identical; 26.8-27.1 vs 27.2-27.4 tok/s |
 | perf report output (757 lines) vs the old header | byte-identical |
-| `moestream_tests`, idle GPU, refactor x2 and master x1 | all three: 154 PASSED, 6 FAILED, identical test-by-test. The 6 failures are the pre-existing `qabsorb`/`wuv` batched tests; the harness stops at the first of them on both builds, so tests after it are not exercised by either. A single earlier `test_expert_gpu_accum` failure was seen only while the GPU was busy and did not recur. |
-| `integration/refactor-ds-glm-rehearsal` (tip `85309fb`) build + link | OK (`moestream`, `moestream_tests`, with the DeepSeek and GLM commits applied) |
+| `zeromoe_tests`, idle GPU, refactor x2 and master x1 | all three: 154 PASSED, 6 FAILED, identical test-by-test. The 6 failures are the pre-existing `qabsorb`/`wuv` batched tests; the harness stops at the first of them on both builds, so tests after it are not exercised by either. A single earlier `test_expert_gpu_accum` failure was seen only while the GPU was busy and did not recur. |
+| `integration/refactor-ds-glm-rehearsal` (tip `85309fb`) build + link | OK (`zeromoe`, `zeromoe_tests`, with the DeepSeek and GLM commits applied) |
 | integration branch run (Qwen / DSV4.1 / GLM decode) | NOT run: the GPUs were in use by the GLM session's benchmark. Owed. |
 
 DeepSeek has a seventh commit since the list above: a config-only change to

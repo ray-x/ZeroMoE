@@ -16,7 +16,7 @@
 // the RAM-mediated path when a RAM copy already exists.
 //
 // Zero-dependency by DEFAULT: this header is compiled two ways.
-//   - MOESTREAM_HAVE_CUFILE defined (CMakeLists.txt found cufile.h/libcufile
+//   - ZEROMOE_HAVE_CUFILE defined (CMakeLists.txt found cufile.h/libcufile
 //     at configure time -- see that file's own comment on why this can never
 //     be a REQUIRED find_package): real implementation below, wraps the
 //     documented cuFile API (cuFileDriverOpen/Close, cuFileHandleRegister/
@@ -30,7 +30,7 @@
 //
 // UNTESTED on real hardware from this development environment (macOS, no
 // CUDA, no cufile.h at all -- this file could not even be lint-checked here,
-// let alone compiled with MOESTREAM_HAVE_CUFILE defined). The function
+// let alone compiled with ZEROMOE_HAVE_CUFILE defined). The function
 // signatures/struct shapes below follow NVIDIA's documented, stable public
 // cuFile API (GPUDirect Storage API Reference Guide) as accurately as
 // available documentation allows, but treat this exactly the way this
@@ -44,13 +44,13 @@
 #include <cstddef>
 #include <sys/types.h>
 
-#ifdef MOESTREAM_HAVE_CUFILE
+#ifdef ZEROMOE_HAVE_CUFILE
 #include <cufile.h>
 #endif
 
 namespace cufile_io {
 
-#ifdef MOESTREAM_HAVE_CUFILE
+#ifdef ZEROMOE_HAVE_CUFILE
 
 // Non-owning wrapper around a registered cuFile handle for one open (O_DIRECT)
 // file descriptor. `valid` mirrors every other optional-backend's own
@@ -127,10 +127,10 @@ inline ssize_t read(const FileHandle& h, void* device_ptr, size_t len,
 
 inline bool available() { return true; }
 
-#else // !MOESTREAM_HAVE_CUFILE
+#else // !ZEROMOE_HAVE_CUFILE
 
 // Stub: every function fails/no-ops, so callers never need their own
-// #ifdef MOESTREAM_HAVE_CUFILE -- identical in spirit to
+// #ifdef ZEROMOE_HAVE_CUFILE -- identical in spirit to
 // io_uring_backend::Ring's non-Linux stub.
 struct FileHandle {
     bool valid = false;
@@ -144,6 +144,6 @@ inline void deregister_buffer(void*) {}
 inline ssize_t read(const FileHandle&, void*, size_t, off_t, off_t = 0) { return -1; }
 inline bool available() { return false; }
 
-#endif // MOESTREAM_HAVE_CUFILE
+#endif // ZEROMOE_HAVE_CUFILE
 
 } // namespace cufile_io

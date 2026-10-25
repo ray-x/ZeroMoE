@@ -1,7 +1,7 @@
 #include "dense_dispatch.hpp"
 #include "ggml_moe_graph_builder.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cmath>
 #include <utility>

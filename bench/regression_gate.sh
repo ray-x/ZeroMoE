@@ -16,17 +16,17 @@
 #   * Major change / release candidate: run all five (the default).
 #
 # Usage:
-#   bench/regression_gate.sh [BIN] [--models qwen38,glm53flash,ling31,dsv41,glm53]
+#   bench/regression_gate.sh [BIN] [--models qwen38,glm53flash,ling31,dsv41,glm53,mimo26]
 #   bench/regression_gate.sh [BIN] --help
 #
-#   BIN        defaults to ./build_master/moestream (the merged-master release build;
+#   BIN        defaults to ./build_master/zeromoe (the merged-master release build;
 #              must link the prebuilt ggml with the host-node hook — see docs/models/README.md)
 #   --models   comma-separated subset (test only these models); default is all five.
 #              Every selected model is REQUIRED: a launch error or a missing decode
 #              measurement is a FAIL, not a skip.
 #
 # Preconditions (enforced by the individual run scripts where they exist):
-#   * no other moestream / llama.cpp process, GPUs idle
+#   * no other zeromoe / llama.cpp process, GPUs idle
 #   * enough free RAM (some recipes need host_ram_gb + 21.5 GiB margin; the gate uses
 #     --force-start under scripts/run_capped.sh where the conservative margin would refuse)
 #
@@ -47,14 +47,14 @@ Tiered policy (a full run is ~15 min; not needed for every change):
     Fast witnesses: --models qwen38 (single 3090) or --models ling31.
   * Major change / release candidate: run all five (default).
 
-Models: qwen38, glm53flash, ling31, dsv41, glm53
+Models: qwen38, glm53flash, ling31, dsv41, glm53, mimo26
 EOF
 }
 
 cd "$(dirname "$0")/.."   # repository root
 
-BIN="${GATE_BIN:-./build_master/moestream}"
-MODELS="${MODELS-qwen38,glm53flash,ling31,dsv41,glm53}"
+BIN="${GATE_BIN:-./build_master/zeromoe}"
+MODELS="${MODELS-qwen38,glm53flash,ling31,dsv41,glm53,mimo26}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
@@ -87,6 +87,10 @@ MIN[ling31]=9.0 ; MAX[ling31]=11.5        # request output; 10.23 measured; doc 
 # 3.2 ceiling was below the documented 4.0-4.5 steady range.
 MIN[dsv41]=3.5 ; MAX[dsv41]=4.6           # request output; 4.04 async / 3.96 sync measured; doc 4.0-4.5 steady
 MIN[glm53]=1.8 ; MAX[glm53]=2.4           # request output; 2.14 measured; doc 2.00-2.09
+# mimo26 (2026-10-23): mean over the held-out prompts 13.4-16.7 tok/s decode, 0 SSD reads. Floor 12.0 is ~10% under the
+# slowest measured prompt; ceiling is loose. Extra gates in run_mimo26: 0 decode store misses/loads, no coverage
+# preflight finding, prefill >= 20 tok/s on the short prompt.
+MIN[mimo26]=12.0 ; MAX[mimo26]=19.0
 
 # qwen38: request output, split 22/26. Long-tested 27-28 tok/s; idle ABBA
 # (2026-10-21) 26.47-26.81. Baseline 27.0 with a 3% noise allowance -> 26.19.
@@ -111,7 +115,7 @@ MAX[glm53flash]=8.5
 
 # Known model names (must match the run_* functions below). A typo in --models must fail
 # the gate loudly, never silently select nothing and report a successful empty run.
-KNOWN_MODELS=(qwen38 glm53flash ling31 dsv41 glm53)
+KNOWN_MODELS=(qwen38 glm53flash ling31 dsv41 glm53 mimo26)
 if [[ -z "$MODELS" ]]; then
   echo "FAIL  no models selected (--models is empty)" >&2
   exit 2
@@ -252,17 +256,17 @@ report() {
 wants() { [[ ",$MODELS," == *",$1,"* ]]; }
 
 # A neutral-named symlink to BIN: bench/glm53/preflight.sh greps process command
-# lines for the literal string "moestream", so a wrapper that spells the path
-# ./build_master/moestream trips its own guard. Run through a symlink instead.
+# lines for the literal string "zeromoe", so a wrapper that spells the path
+# ./build_master/zeromoe trips its own guard. Run through a symlink instead.
 # Keep it in an invocation-private directory: a shared /tmp name lets a concurrent
 # gate replace the link mid-run, so gate A would execute candidate B while reporting
 # candidate A's hash.
-GATE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/moestream-gate.XXXXXX")"
+GATE_TMP="$(mktemp -d "${TMPDIR:-/tmp}/zeromoe-gate.XXXXXX")"
 trap 'rm -rf "$GATE_TMP"' EXIT
-NBIN="$GATE_TMP/moestream-gate-bin"
+NBIN="$GATE_TMP/zeromoe-gate-bin"
 ln -sfn "$BIN" "$NBIN"
 
-echo "== MoEStream regression gate ($STAMP) =="
+echo "== ZeroMoE regression gate ($STAMP) =="
 echo "   binary: $BIN  sha256=$(sha256sum "$BIN" | awk '{print $1}')"
 echo "   git:    $(git rev-parse --abbrev-ref HEAD) $(git rev-parse --short HEAD)"
 echo "   models: $MODELS"
@@ -276,7 +280,7 @@ echo
 run_qwen38() {
   local log="$LOG_DIR/qwen38.$STAMP.log" eng="logs/qwen_decode_split_$STAMP.engine.log" rc=0
   echo "--- qwen38: split 22/26, 400 tokens (single 3090) ---"
-  MOESTREAM_BIN="$BIN" QWN_STAMP="$STAMP" bench/qwen_decode_baselines.sh split 10 400 > "$log" 2>&1 || rc=$?
+  ZEROMOE_BIN="$BIN" QWN_STAMP="$STAMP" bench/qwen_decode_baselines.sh split 10 400 > "$log" 2>&1 || rc=$?
   report qwen38 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 400
 }
 
@@ -288,9 +292,9 @@ run_glm53flash() {
   echo "--- glm53flash: wholelayer8, 150 tokens (single 3090) ---"
   echo "    metric: steady median (TOKEN-LOOP-DIAG, steps >= 20); baseline 7.275, floor 6.98"
   echo "Explain the difference between CPU and GPU architecture in terms of parallelism, memory hierarchy and scheduling, in detail." \
-    | env CUDA_VISIBLE_DEVICES=0 MOESTREAM_GLM5NEXT_FULL_GRAPH=1 \
-        MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512 MOESTREAM_GLM5NEXT_CPU_THREADS=6 \
-        MOESTREAM_TOKEN_LOOP_DIAG=1 \
+    | env CUDA_VISIBLE_DEVICES=0 ZEROMOE_GLM5NEXT_FULL_GRAPH=1 \
+        ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6 \
+        ZEROMOE_TOKEN_LOOP_DIAG=1 \
         scripts/run_capped.sh -- "$BIN" \
         --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml \
         --log-path "$eng" \
@@ -315,13 +319,51 @@ run_ling31() {
 }
 
 # ---------------------------------------------------------------------------
+# mimo26 — MiMo V2.6 Flash, in-graph hot/cold MoE, dual GPU, 100 GiB DDR tier (needs the model drive mounted).
+# One fixed prompt, 64 greedy tokens. Beyond the decode band it fails on: any expert load during decode, a coverage
+# or idle-VRAM preflight finding, or prefill under 20 tok/s.
+# ---------------------------------------------------------------------------
+run_mimo26() {
+  local log="$LOG_DIR/mimo26.$STAMP.log" eng="$LOG_DIR/mimo26.$STAMP.engine.log" rc=0
+  echo "--- mimo26: DNS prompt, 64 tokens (dual GPU, 100 GiB DDR) ---"
+  if [[ ! -r /mnt/usb-ssd/@/home/ray/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf ]]; then
+    printf "FAIL  %-12s model file not readable (is the model drive mounted?)\n" mimo26; FAIL=$((FAIL+1)); return
+  fi
+  echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
+    | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DISABLE_ROUTER_BF16=1 ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100 \
+        ZEROMOE_MIMO2_OFFLOAD_USAGE="$PWD/bench/profiles/mimo26_combined.usage" \
+        scripts/run_capped.sh --limit-gb 110 -- "$BIN" \
+        --config configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml \
+        --log-path "$eng" --temp 0 --ngen 64 > "$log" 2>&1 || rc=$?
+  local before=$FAIL
+  report mimo26 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64
+  (( FAIL > before )) && return
+  local loads prefill
+  loads="$(sed -nE 's/.*\[MIMO2-LANE\].*loads=([0-9]+).*/\1/p' "$eng" | tail -1)"
+  if [[ -z "$loads" || "$loads" != "0" ]]; then
+    printf "FAIL  %-12s decode-time expert loads = %s (expected 0: the DDR tier must cover the working set)\n" mimo26 "${loads:-unknown}"
+    PASS=$((PASS-1)); FAIL=$((FAIL+1)); return
+  fi
+  if grep -q '\[PREFLIGHT\] mimo2:' "$eng"; then
+    printf "FAIL  %-12s preflight finding: %s\n" mimo26 "$(grep -m1 '\[PREFLIGHT\] mimo2:' "$eng" | sed 's/.*mimo2: //')"
+    PASS=$((PASS-1)); FAIL=$((FAIL+1)); return
+  fi
+  prefill="$(sed -nE 's/.*\[PREFILL-DONE\] [0-9]+ tokens in [0-9.]+s \(([0-9.]+) tok\/s\).*/\1/p' "$eng" | head -1)"
+  if [[ -z "$prefill" ]] || ! awk -v p="$prefill" 'BEGIN{exit !(p>=20.0)}'; then
+    printf "FAIL  %-12s prefill %s tok/s (floor 20)\n" mimo26 "${prefill:-unknown}"
+    PASS=$((PASS-1)); FAIL=$((FAIL+1)); return
+  fi
+  echo "      mimo26: 0 decode loads, no preflight findings, prefill ${prefill} tok/s"
+}
+
+# ---------------------------------------------------------------------------
 # dsv41 — DeepSeek V4.1 Flash (DeepSeek_V41), cache-backed graph, dual GPU.
 # ---------------------------------------------------------------------------
 run_dsv41() {
   local log="$LOG_DIR/dsv41.$STAMP.log" eng="$LOG_DIR/dsv41.$STAMP.engine.log" rc=0
   echo "--- dsv41: DNS prompt, 64 tokens (dual GPU) ---"
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
-    | env CUDA_VISIBLE_DEVICES=0,1 MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1 \
+    | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
         scripts/run_capped.sh -- "$BIN" \
         --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
         --log-path "$eng" \
@@ -338,11 +380,11 @@ run_glm53() {
   echo "--- glm53: SSD offload, 80 tokens (dual GPU) ---"
   rm -f "logs/split_ab_$tag.log" "$teardown"
   systemd-run --user --scope -p MemorySwapMax=0 \
-    env MOESTREAM_BIN="$NBIN" \
+    env ZEROMOE_BIN="$NBIN" \
     bench/glm53/run_ab.sh "$tag" \
-    MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
-    MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
-    MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 > "$log" 2>&1 || rc=$?
+    ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
+    ZEROMOE_GLM5NEXT_PILOT_PREFETCH=3 ZEROMOE_GLM5NEXT_PILOT_STAGE=3 \
+    ZEROMOE_GLM5NEXT_MODEL_DIRECT=1 > "$log" 2>&1 || rc=$?
   # The engine log carries the request summary; the .stdout capture carries the
   # ggml/CUDA teardown text (the wrapper itself only greps selected lines).
   report glm53 "$(grab_rate "$eng")" "$rc" "$teardown" "$(grab_tokens "$eng")" 80
@@ -352,6 +394,7 @@ wants qwen38      && run_qwen38
 wants glm53flash  && run_glm53flash
 wants ling31      && run_ling31
 wants dsv41       && run_dsv41
+wants mimo26      && run_mimo26
 wants glm53       && run_glm53
 
 echo

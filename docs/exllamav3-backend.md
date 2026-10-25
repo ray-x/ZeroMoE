@@ -3,7 +3,7 @@
 The `exllamav3` backend delegates the complete EXL3 inference pipeline to the
 local ExLlamaV3 checkout: model construction, attention/GDN, HyperConnections,
 KV and recurrent caches, routing, GPU experts, CPU experts, and generation.
-MoEStream's native EXL3 kernels are not called on this path. The CLI replaces
+ZeroMoE's native EXL3 kernels are not called on this path. The CLI replaces
 itself with the configured Python process, using argv rather than a shell.
 
 To enable the upstream backend, use an EXL3 TOML profile with
@@ -28,7 +28,7 @@ exllamav3_cuda_schedule = "blocking"
 
 Set `model_path` to the safetensors checkpoint and supply metadata/tokenizer
 paths when the model folder lacks the Hugging Face config files. Context,
-generation length, prompt, and sampling options remain ordinary MoEStream
+generation length, prompt, and sampling options remain ordinary ZeroMoE
 config entries. The profiles in `configs/` provide complete, tested examples.
 
 On the Xeon W-2235 with the RTX 3090 and RTX 5060 Ti, six CPU-worker threads
@@ -125,10 +125,10 @@ python3 tools/run_exllamav3.py \
 This does **not** prove tensor completeness, successful loading, or inference
 correctness. Those require the upstream runtime to load and execute the model.
 
-After rebuilding MoEStream, normal inference can use the same config entrypoint:
+After rebuilding ZeroMoE, normal inference can use the same config entrypoint:
 
 ```bash
-./build_ggmlcuda/moestream \
+./build_ggmlcuda/zeromoe \
     --config configs/qwen4exp_exllamav3_26_22.toml --prompt "Hello" --ngen 8
 ```
 
@@ -147,7 +147,7 @@ match the native 128-token/127-interval comparison. The JSON includes token
 IDs, completion text, source revision, PyTorch version, and observed layer
 placement. Benchmark mode omits per-token console output. Normal inference
 honors upstream EOS tokens. Both modes reject existing GPU compute processes
-and hold MoEStream's shared host-admission lock throughout loading and inference.
+and hold ZeroMoE's shared host-admission lock throughout loading and inference.
 
 ## Measured results
 
@@ -159,14 +159,14 @@ On 2026-10-05, fixed 128-token runs used the same prompt and verified 26 CPU /
 | 12 | Auto | Fixed output | 15.99 | 7.944 s |
 | 6 | Auto | Fixed output | 26.39 | 4.813 s |
 | 6 | Blocking | Fixed output | 26.86 | 4.728 s |
-| 6 | Blocking | MoEStream CLI, streamed output | 26.61 | 4.773 s |
+| 6 | Blocking | ZeroMoE CLI, streamed output | 26.61 | 4.773 s |
 | 7 | Blocking | Fixed output | 24.68 | 5.147 s |
 | 5 | Auto | Fixed output | 25.98 | 4.888 s |
 | 4 | Auto | Fixed output | 22.44 | 5.661 s |
 
 The six-thread run is a 65% increase over twelve threads. Those two runs
 produced identical prompt and generated token IDs across all 128 tokens. The
-six-thread/blocking profile measures 26.61 tok/s through the MoEStream CLI.
+six-thread/blocking profile measures 26.61 tok/s through the ZeroMoE CLI.
 Fixed-length output measures 26.86 tok/s. The 28 tok/s target remains unmet.
 The upstream worker reports `avx512-vnni`; this Xeon
 does not expose `avx512_vbmi`. Profiling shows most CPU expert time in gate/up
@@ -177,7 +177,7 @@ See the individual logs and JSON under `logs/exllamav3_runtime/`.
 
 The full-checkpoint runs verify loading, coherent output, and the requested
 26/22 placement. CPU experts stay RAM-resident in the upstream worker rather
-than using MoEStream's native on-demand CPU LRU. The 28 tok/s target remains
+than using ZeroMoE's native on-demand CPU LRU. The 28 tok/s target remains
 unmet; the measured peak is 26.86 tok/s. MTP is opt-in and measured slower.
 
 ## User-supplied 2.05bpw checkpoint
@@ -211,7 +211,7 @@ Verify the pack, then run the first profile on an otherwise idle host:
 
 ```bash
 ./build_ggmlcuda/exl3_tool verify /mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw
-./build_ggmlcuda/moestream --config configs/qwen4exp_exllamav3_2bpw_0_44_4.toml \
+./build_ggmlcuda/zeromoe --config configs/qwen4exp_exllamav3_2bpw_0_44_4.toml \
     --ngen 128
 ```
 
@@ -416,7 +416,7 @@ with finite output.
 The production Qwen full-graph builder has an opt-in selected-layer hook. It
 replaces the selected GGML expert subtree with one cache-backed `MAP_CUSTOM3`
 node. The node consumes device-resident activations and a packed route table.
-The full-graph path resolves its packed EXL3 projections into MoEStream's
+The full-graph path resolves its packed EXL3 projections into ZeroMoE's
 already allocated `GpuTopology` expert-cache slots (one slot per projection),
 using negative cache IDs to keep them separate from GGUF expert identities.
 It holds those slots until the graph stream completes; EXL3 eviction IDs are
@@ -436,8 +436,8 @@ LRU and `Exl3CpuMatrixCache`; the cache-graph benchmark below also tests that
 executor-owned cache path, not the full-graph topology adapter.
 
 ```bash
-export MOESTREAM_EXL3_GGML_BRIDGE_MODEL_PATH=/data/sdb/models/qwen3.8-flash-next/exl3_3bpw
-export MOESTREAM_EXL3_GGML_BRIDGE_LAYER=3
+export ZEROMOE_EXL3_GGML_BRIDGE_MODEL_PATH=/data/sdb/models/qwen3.8-flash-next/exl3_3bpw
+export ZEROMOE_EXL3_GGML_BRIDGE_LAYER=3
 ```
 
 The full-graph bridge requires a complete preloaded DDR arena for each selected
@@ -487,13 +487,13 @@ safe slot reuse. Route readback keeps the routed FFN callback itself outside
 CUDA graph capture. The adapter captures static GGML spans before and after
 that callback; it checks the graph's
 node signature before replay so changed graphs do not reuse stale segments.
-Set `MOESTREAM_EXL3_GGML_ROUTE_TIMING=1` to log per-layer route-readback count,
+Set `ZEROMOE_EXL3_GGML_ROUTE_TIMING=1` to log per-layer route-readback count,
 bytes, cumulative host wait, and average synchronization time at teardown.
 The external path now computes the gate and up rotated matmuls in one CUDA
 kernel, staging both trellises and their input transforms together. This
 reduces the per-route sequence from five launches to four; SwiGLU/output
 transforms and weighted down projection remain separate. The updated kernel
-compiles, and `moestream_tests` includes a 3-bit gate / 5-bit up parity case.
+compiles, and `zeromoe_tests` includes a 3-bit gate / 5-bit up parity case.
 The external-pointer routed FFN and mixed-bit gate/up tests both pass on GPUs 0
 and 1 after this change. A capture-enabled full-graph smoke is measured below;
 it is not a stable performance comparison. A real full-graph attempt found
@@ -508,9 +508,9 @@ graph. It referenced the existing 904,396,800-byte DDR arena (512
 1,766,400-byte slots) and GPU expert pool; shutdown reported 46 of 2,193 GPU
 slots filled. Decode measured **3.79 tok/s**.
 
-Set `MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER` to a layer number (for example `3`)
+Set `ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER` to a layer number (for example `3`)
 to compare one layer, or to `all` to compare every bridged layer, against the
-CPU EXL3 reference. With `MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER=3`, the same
+CPU EXL3 reference. With `ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER=3`, the same
 full-graph custom node compared topology-slot GPU outputs against the CPU EXL3
 reference on all 13 prefill rows. Maximum absolute error was **7.83e-8**. This
 verifies the real Safetensors -> existing DDR slot -> existing GPU slot ->
@@ -538,7 +538,7 @@ adapter test confirms two static segments execute around an eager custom
 callback.
 
 The current direct-route path passed an all-layer run with
-`MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER=all`: 144 custom FFN checks across all 48
+`ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER=all`: 144 custom FFN checks across all 48
 layers, with maximum absolute error `2.75671e-7`. The three-token prompt and
 three generated tokens completed with capture enabled. The parity callback now
 waits for the asynchronous final FFN batch before reading its output. CPU
@@ -561,7 +561,7 @@ logit-parity check.
 
 The all-layer smoke used `exl3_ggml_bridge_layers = [0, ..., 47]`,
 `ram_preload_all_experts = true`, and
-`MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0` so every layer retained its DDR
+`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0` so every layer retained its DDR
 arena for EXL3 slots. Reproduce with a Qwen4Exp GGUF metadata/model config,
 the EXL3 Safetensors path, and a short prompt; the rest of the model's dense
 and attention weights remain GGUF in this mixed-format integration test.
@@ -578,20 +578,20 @@ was `3.85 tok/s`, too short for a stable performance claim. It verifies routed
 FFN outputs, not end-to-end logits against an all-EXL3 model.
 
 For an end-to-end same-history comparison, set
-`MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER=all` and
-`MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT=1` on the reference run. Each bridge
+`ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER=all` and
+`ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT=1` on the reference run. Each bridge
 callback still checks GPU FFN parity, then substitutes that callback's CPU
 reference output into the same full graph. Dump logits in both the ordinary
 GPU-output run and this CPU-reference-output run with
-`MOESTREAM_DECODE_LOGITS_DUMP`; use `MOESTREAM_GENERATED_TOKEN_FILE` on a
-deterministic warmup and `MOESTREAM_TEACHER_FORCE_TOKEN_FILE` plus
-`MOESTREAM_TEACHER_FORCE_SKIP_SAMPLING=1` for both compared runs so every
+`ZEROMOE_DECODE_LOGITS_DUMP`; use `ZEROMOE_GENERATED_TOKEN_FILE` on a
+deterministic warmup and `ZEROMOE_TEACHER_FORCE_TOKEN_FILE` plus
+`ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1` for both compared runs so every
 decode step sees the same token history. Compare the dumps with
 `python3 bench/compare_decode_logits.py`. The CPU-reference substitution has
 passed the focused routed-FFN benchmark, but a full-model logits comparison
 has not yet been run. The end-to-end sequence is automated by
 `python3 bench/exl3_ggml_logits_parity.py --out-dir /tmp/exl3-logit-parity`;
-it fails fast if another `moestream` process is running or less than 110 GiB
+it fails fast if another `zeromoe` process is running or less than 110 GiB
 of RAM is available, and verifies `nvidia-smi` is responsive before each run;
 it then writes both logits and a comparison report there.
 The CPU-reference-output hook was exercised on the RTX 5060 Ti with a single
@@ -658,7 +658,7 @@ nonzero output buffer and checks that the second result does not accumulate the
 first call's output.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 MOESTREAM_EXL3_GGML_ROUTE_TIMING=1 \
+CUDA_VISIBLE_DEVICES=1 ZEROMOE_EXL3_GGML_ROUTE_TIMING=1 \
   ./build_ggmlcuda/exl3_ggml_cuda_cache_graph_bench \
   /data/sdb/models/qwen3.8-flash-next/exl3_3bpw 2 0 1 --external 10
 ```
@@ -849,7 +849,7 @@ How to run a split:
 ```bash
 # 1. GPUs must be idle (the runner refuses otherwise)
 nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader
-pgrep -af 'llama|ollama|vllm|moestream'
+pgrep -af 'llama|ollama|vllm|zeromoe'
 # 2. Validate the config without CUDA
 .exl3-runtime/bin/python tools/run_exllamav3.py --config <cfg>.toml --check
 # 3. Benchmark; the JSON records placement, footprint and token ids
@@ -891,33 +891,33 @@ performance work is complete.
 ## Upstream ExLlamaV3 kernels for the in-graph EXL3 path (no libtorch)
 
 All EXL3 matmuls in the native path (`exl3_gpu`, the GGML custom-op bridge) run
-on ExLlamaV3's own CUDA kernels; MoEStream no longer carries its own EXL3
+on ExLlamaV3's own CUDA kernels; ZeroMoE no longer carries its own EXL3
 matmul kernels. Build with the upstream extension sources:
 
 ```bash
 cmake -S . -B build_ggmlcuda \
-    -DMOESTREAM_EXLLAMAV3_SRC=/home/ray/Projects/exllamav3/exllamav3/exllamav3_ext
+    -DZEROMOE_EXLLAMAV3_SRC=/home/ray/Projects/exllamav3/exllamav3/exllamav3_ext
 ```
 
 - Upstream `exl3_gemm` / `exl3_gemv` / `exl3_moe_coop` are compiled unmodified
-  as `moestream_exl3_upstream`. `third_party/exl3_torch_stub` stands in for the
+  as `zeromoe_exl3_upstream`. `third_party/exl3_torch_stub` stands in for the
   few ATen/c10 symbols their launchers use; libtorch is not required.
 - `src/exl3_upstream_ops.cu` implements the `launch_exl3_mul1_*` API on
   `exl3_gemm` and the external routed FFN on `exl3_moe_coop` (two launches per
   layer for up to 8 rows / 256 route slots). Larger or mixed-bit-width batches,
   and biased matrices, use one upstream `exl3_gemm` sequence per expert.
-- Without `MOESTREAM_EXLLAMAV3_SRC` the matmul entry points return
+- Without `ZEROMOE_EXLLAMAV3_SRC` the matmul entry points return
   `cudaErrorNotSupported` (`cuda/exl3_aux.cu`); the GPU EXL3 path is then
   unavailable. `cuda/exl3_aux.cu` also holds the hyper-connection, SwiGLU and
   accumulate helper kernels.
-- `MOESTREAM_EXL3_MOE_COOP=0` disables the fused routed-FFN path (A/B).
+- `ZEROMOE_EXL3_MOE_COOP=0` disables the fused routed-FFN path (A/B).
   Upstream also defaults to an int8-activation GEMV for one row and K <= 5 on
   Ampere; `EXL3_INT8_GEMV=0` disables it.
 - Upstream kernels take fp16 activations (about 5e-4 relative RMS against fp32;
   ~7e-3 on the int8 GEMV path), so tolerances against the fp32 CPU reference
   are wider than they were: 2e-2 of the output peak per routed FFN in the
   bridge parity check, 2e-2 relative RMS in the in-tree matmul test.
-- `tests/exl3_reference_matmul.cu` keeps MoEStream's original fp32 kernels as a
+- `tests/exl3_reference_matmul.cu` keeps ZeroMoE's original fp32 kernels as a
   test-only independent reference. `tests/exl3_upstream` (standalone CMake
   project) builds `exl3_upstream_parity`, which compares it with upstream
   `exl3_gemm` on random matrices without a model.

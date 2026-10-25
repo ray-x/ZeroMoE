@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(MoEStream CXX)
+project(ZeroMoE CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,13 +8,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
-option(MOESTREAM_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
-option(MOESTREAM_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels" OFF)
-option(MOESTREAM_USE_GGML_CUDA
+option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
+option(ZEROMOE_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels" OFF)
+option(ZEROMOE_USE_GGML_CUDA
        "Build/link ggml-cuda for the experimental MUL_MAT_ID prefill backend"
        OFF)
 # ggml's own default for this is OFF outside llama.cpp (its option() comment
-# literally says "llama.cpp only") -- a plain MOESTREAM_USE_GGML_CUDA=ON build
+# literally says "llama.cpp only") -- a plain ZEROMOE_USE_GGML_CUDA=ON build
 # silently never defines GGML_CUDA_USE_GRAPHS, so ggml-cuda's CUDA graph
 # capture/replay path (ggml_backend_cuda_graph_compute in ggml-cuda.cu) is
 # compiled out entirely: every decode-graph node gets its own individual
@@ -24,60 +24,60 @@ option(MOESTREAM_USE_GGML_CUDA
 # to ~8 tok/s (graphs silently absent) on identical hardware/model/config --
 # this was mistaken for a correctness or scheduling regression for an entire
 # investigation before the missing compile define was found. Default ON here
-# so any MOESTREAM_USE_GGML_CUDA build gets it without the caller having to
+# so any ZEROMOE_USE_GGML_CUDA build gets it without the caller having to
 # know this ggml-specific gotcha; still overridable with -DGGML_CUDA_GRAPHS=OFF.
-option(MOESTREAM_ENABLE_CUDA_GRAPHS
+option(ZEROMOE_ENABLE_CUDA_GRAPHS
        "Enable ggml CUDA graph capture/replay (GGML_CUDA_GRAPHS) for full-graph decode/prefill"
        ON)
-option(MOESTREAM_ENABLE_AVX512_VNNI
-       "Compile MoEStream and ggml CPU kernels with AVX-512 VNNI (set OFF on CPUs without VNNI)"
+option(ZEROMOE_ENABLE_AVX512_VNNI
+       "Compile ZeroMoE and ggml CPU kernels with AVX-512 VNNI (set OFF on CPUs without VNNI)"
        ON)
-option(MOESTREAM_GGML_OPENMP
+option(ZEROMOE_GGML_OPENMP
        "Build ggml's CPU backend with OpenMP (OFF uses its persistent threadpool)"
        ON)
-option(MOESTREAM_ENABLE_GGML_HOST_NODE_PATCHES
+option(ZEROMOE_ENABLE_GGML_HOST_NODE_PATCHES
        "Apply GGML CUDA/CPUOffload host-node integration patches"
        ON)
-option(MOESTREAM_GGML_DEBUG_PATCHES
+option(ZEROMOE_GGML_DEBUG_PATCHES
        "Also apply the debug/profiling ggml patches in patches/debug (not part of the main series)"
        OFF)
-option(MOESTREAM_USE_LLAMA_CPP "Deprecated alias for MOESTREAM_USE_GGML" OFF)
-option(MOESTREAM_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
+option(ZEROMOE_USE_LLAMA_CPP "Deprecated alias for ZEROMOE_USE_GGML" OFF)
+option(ZEROMOE_METAL "Enable Apple Metal GPU backend (requires ggml)" OFF)
 
 # On macOS the CPU-only binary is the only usable engine, and real MoE models
 # are almost always quantized.  Default ggml fetch to ON here; users can still
-# override with -DMOESTREAM_USE_GGML=OFF.
+# override with -DZEROMOE_USE_GGML=OFF.
 if(APPLE)
-    set(MOESTREAM_USE_GGML ON CACHE BOOL "Fetch ggml for quantized CPU decode" FORCE)
-    message(STATUS "MoEStream: Apple platform auto-enabling MOESTREAM_USE_GGML=ON")
+    set(ZEROMOE_USE_GGML ON CACHE BOOL "Fetch ggml for quantized CPU decode" FORCE)
+    message(STATUS "ZeroMoE: Apple platform auto-enabling ZEROMOE_USE_GGML=ON")
 endif()
 
 # macOS has no NVIDIA CUDA SDK, so the full engine cannot build there.
 if(APPLE)
-    set(MOESTREAM_CPU_ONLY ON CACHE BOOL "macOS has no CUDA SDK; force CPU-only build" FORCE)
-    message(STATUS "MoEStream: Apple platform detected — forcing MOESTREAM_CPU_ONLY=ON")
+    set(ZEROMOE_CPU_ONLY ON CACHE BOOL "macOS has no CUDA SDK; force CPU-only build" FORCE)
+    message(STATUS "ZeroMoE: Apple platform detected — forcing ZEROMOE_CPU_ONLY=ON")
 endif()
 
 # The full engine links ggml for reference dequantizers.  If you already have
 # a ggml install somewhere else, point CMake to it and set this OFF; otherwise
 # setting this ON fetches a stable llama.cpp release and builds ggml in-tree.
-if(MOESTREAM_USE_LLAMA_CPP AND NOT MOESTREAM_USE_GGML)
-    set(MOESTREAM_USE_GGML ON CACHE BOOL "" FORCE)
-    message(WARNING "MOESTREAM_USE_LLAMA_CPP is deprecated; use MOESTREAM_USE_GGML=ON")
+if(ZEROMOE_USE_LLAMA_CPP AND NOT ZEROMOE_USE_GGML)
+    set(ZEROMOE_USE_GGML ON CACHE BOOL "" FORCE)
+    message(WARNING "ZEROMOE_USE_LLAMA_CPP is deprecated; use ZEROMOE_USE_GGML=ON")
 endif()
-if(NOT MOESTREAM_CPU_ONLY AND NOT MOESTREAM_USE_GGML)
+if(NOT ZEROMOE_CPU_ONLY AND NOT ZEROMOE_USE_GGML)
     message(FATAL_ERROR
-        "Full engine builds require ggml. Either set MOESTREAM_USE_GGML=ON "
+        "Full engine builds require ggml. Either set ZEROMOE_USE_GGML=ON "
         "to fetch ggml automatically, or provide your own ggml and link it.")
 endif()
 
 # Detect Apple Silicon (M1/M2/M3/M4/M5 all share arm64; M3+ specific flags are
 # applied below when the compiler supports them).
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "arm64")
-    set(MOESTREAM_APPLE_SILICON ON)
-    message(STATUS "MoEStream: Apple Silicon (arm64) detected")
+    set(ZEROMOE_APPLE_SILICON ON)
+    message(STATUS "ZeroMoE: Apple Silicon (arm64) detected")
 else()
-    set(MOESTREAM_APPLE_SILICON OFF)
+    set(ZEROMOE_APPLE_SILICON OFF)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -101,32 +101,32 @@ endif()
 # assume. Checked as one combined flag string (not assumed) so a
 # non-AVX-512 x86 host still configures cleanly; CLAUDE.md documents
 # AVX-512 as a hard requirement for these files, so
-# MOESTREAM_AVX512_FLAGS staying empty here just means the build fails
+# ZEROMOE_AVX512_FLAGS staying empty here just means the build fails
 # later at these exact source files with a clearer compiler error instead
 # of a silent miscompile. Deliberately NOT -mavx512vnni: the source
 # already compile-time-gates its VNNI fast path (#if
 # defined(__AVX512VNNI__)).  Keep VNNI opt-in because forcing that flag here
 # would risk a SIGILL at runtime on a real AVX-512 CPU that lacks VNNI
 # specifically (some early Skylake-X/Cascade Lake parts).
-set(MOESTREAM_AVX512_FLAGS "")
-if(NOT MOESTREAM_APPLE_SILICON)
+set(ZEROMOE_AVX512_FLAGS "")
+if(NOT ZEROMOE_APPLE_SILICON)
     include(CheckCXXCompilerFlag)
-    check_cxx_compiler_flag("-mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c" MOESTREAM_HAS_AVX512_FLAGS)
-    if(MOESTREAM_HAS_AVX512_FLAGS)
-        set(MOESTREAM_AVX512_FLAGS -mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c)
+    check_cxx_compiler_flag("-mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c" ZEROMOE_HAS_AVX512_FLAGS)
+    if(ZEROMOE_HAS_AVX512_FLAGS)
+        set(ZEROMOE_AVX512_FLAGS -mavx512f -mavx512cd -mavx512bw -mavx512dq -mavx512vl -mf16c)
     else()
-        message(WARNING "MoEStream: compiler does not accept AVX-512/F16C flags -- "
+        message(WARNING "ZeroMoE: compiler does not accept AVX-512/F16C flags -- "
                          "kernels_cpu.cpp/attention_layer.cpp/execution_layer.cpp require "
                          "AVX-512 (see CLAUDE.md) and may fail to build without them")
     endif()
-    if(MOESTREAM_ENABLE_AVX512_VNNI)
-        check_cxx_compiler_flag("-mavx512vnni" MOESTREAM_HAS_AVX512_VNNI_FLAG)
-        if(NOT MOESTREAM_HAS_AVX512_VNNI_FLAG)
+    if(ZEROMOE_ENABLE_AVX512_VNNI)
+        check_cxx_compiler_flag("-mavx512vnni" ZEROMOE_HAS_AVX512_VNNI_FLAG)
+        if(NOT ZEROMOE_HAS_AVX512_VNNI_FLAG)
             message(FATAL_ERROR
-                    "MoEStream: MOESTREAM_ENABLE_AVX512_VNNI=ON, but the compiler "
+                    "ZeroMoE: ZEROMOE_ENABLE_AVX512_VNNI=ON, but the compiler "
                     "does not accept -mavx512vnni")
         endif()
-        list(APPEND MOESTREAM_AVX512_FLAGS -mavx512vnni)
+        list(APPEND ZEROMOE_AVX512_FLAGS -mavx512vnni)
     endif()
 endif()
 
@@ -138,36 +138,36 @@ find_package(OpenMP)
 # ---------------------------------------------------------------------------
 # ggml integration (optional)
 # ---------------------------------------------------------------------------
-if(MOESTREAM_USE_GGML)
+if(ZEROMOE_USE_GGML)
     # Default to a stable, verified ggml tag in the ggerganov/ggml repo.
     # (The old "b3923" string was not a valid tag in either ggml or llama.cpp.)
-    set(MOESTREAM_GGML_TAG "v0.9.11" CACHE STRING "ggml git tag to fetch")
-    set(MOESTREAM_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
+    set(ZEROMOE_GGML_TAG "v0.9.11" CACHE STRING "ggml git tag to fetch")
+    set(ZEROMOE_GGML_ROOT "" CACHE PATH "Path to a local ggml checkout (fetched automatically if empty)")
 
     # Provide a deprecated alias for configs that still set it.
-    if(MOESTREAM_LLAMA_CPP_ROOT AND NOT MOESTREAM_GGML_ROOT)
-        set(MOESTREAM_GGML_ROOT "${MOESTREAM_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
-        message(WARNING "MOESTREAM_LLAMA_CPP_ROOT is deprecated; use MOESTREAM_GGML_ROOT")
+    if(ZEROMOE_LLAMA_CPP_ROOT AND NOT ZEROMOE_GGML_ROOT)
+        set(ZEROMOE_GGML_ROOT "${ZEROMOE_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
+        message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
     endif()
-    if(MOESTREAM_LLAMA_CPP_TAG)
-        set(MOESTREAM_GGML_TAG "${MOESTREAM_LLAMA_CPP_TAG}" CACHE STRING "" FORCE)
-        message(WARNING "MOESTREAM_LLAMA_CPP_TAG is deprecated; use MOESTREAM_GGML_TAG")
+    if(ZEROMOE_LLAMA_CPP_TAG)
+        set(ZEROMOE_GGML_TAG "${ZEROMOE_LLAMA_CPP_TAG}" CACHE STRING "" FORCE)
+        message(WARNING "ZEROMOE_LLAMA_CPP_TAG is deprecated; use ZEROMOE_GGML_TAG")
     endif()
 
     # Disable everything we do not need for a CPU decode assistant, except the
     # explicit experimental CUDA backend option. GGML_CUDA must be set BEFORE
     # the subproject is configured.
-    set(GGML_CUDA        ${MOESTREAM_USE_GGML_CUDA} CACHE BOOL "" FORCE)
-    set(GGML_CUDA_GRAPHS ${MOESTREAM_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
+    set(GGML_CUDA        ${ZEROMOE_USE_GGML_CUDA} CACHE BOOL "" FORCE)
+    set(GGML_CUDA_GRAPHS ${ZEROMOE_ENABLE_CUDA_GRAPHS} CACHE BOOL "" FORCE)
     # Loud, impossible-to-miss configure-time confirmation of the exact
     # setting that silently regressed full-graph decode from ~20 tok/s to
-    # ~8 tok/s once already (see MOESTREAM_ENABLE_CUDA_GRAPHS's own comment
+    # ~8 tok/s once already (see ZEROMOE_ENABLE_CUDA_GRAPHS's own comment
     # above). A default is not a guarantee -- print the resolved value on
     # every configure, and fail outright if CUDA is on but graphs got
     # turned off without an explicit, informed override.
-    if(MOESTREAM_USE_GGML_CUDA AND NOT MOESTREAM_ENABLE_CUDA_GRAPHS)
+    if(ZEROMOE_USE_GGML_CUDA AND NOT ZEROMOE_ENABLE_CUDA_GRAPHS)
         message(WARNING
-            "MOESTREAM_USE_GGML_CUDA=ON but MOESTREAM_ENABLE_CUDA_GRAPHS=OFF: "
+            "ZEROMOE_USE_GGML_CUDA=ON but ZEROMOE_ENABLE_CUDA_GRAPHS=OFF: "
             "full-graph decode will silently run WITHOUT CUDA graph capture/"
             "replay (every node becomes an individual cudaLaunchKernel). "
             "This previously cost ~20 tok/s -> ~8 tok/s and was mistaken for "
@@ -176,107 +176,107 @@ if(MOESTREAM_USE_GGML)
             "[CUDA-GRAPHS-CHECK] log line will also confirm this at every "
             "process start regardless of this setting.")
     else()
-        message(STATUS "MoEStream: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} "
+        message(STATUS "ZeroMoE: GGML_CUDA_GRAPHS=${GGML_CUDA_GRAPHS} "
                        "(verified again at runtime via [CUDA-GRAPHS-CHECK])")
     endif()
     set(GGML_HIPBLAS     OFF CACHE BOOL "" FORCE)
     set(GGML_VULKAN      OFF CACHE BOOL "" FORCE)
     set(GGML_SYCL        OFF CACHE BOOL "" FORCE)
-    if(MOESTREAM_GGML_OPENMP AND NOT OpenMP_CXX_FOUND)
-        message(WARNING "MOESTREAM_GGML_OPENMP=ON requested, but OpenMP was not found; ggml CPU backend will use its native threadpool")
+    if(ZEROMOE_GGML_OPENMP AND NOT OpenMP_CXX_FOUND)
+        message(WARNING "ZEROMOE_GGML_OPENMP=ON requested, but OpenMP was not found; ggml CPU backend will use its native threadpool")
     endif()
-    set(GGML_OPENMP      ${MOESTREAM_GGML_OPENMP} CACHE BOOL "" FORCE)
-    message(STATUS "MoEStream: GGML_OPENMP=${GGML_OPENMP} (MOESTREAM_GGML_OPENMP=${MOESTREAM_GGML_OPENMP})")
-    # Keep ggml's CPU backend on the same ISA choice as MoEStream's CPU
+    set(GGML_OPENMP      ${ZEROMOE_GGML_OPENMP} CACHE BOOL "" FORCE)
+    message(STATUS "ZeroMoE: GGML_OPENMP=${GGML_OPENMP} (ZEROMOE_GGML_OPENMP=${ZEROMOE_GGML_OPENMP})")
+    # Keep ggml's CPU backend on the same ISA choice as ZeroMoE's CPU
     # kernels.  This is the single opt-out for older CPUs: setting
-    # MOESTREAM_ENABLE_AVX512_VNNI=OFF also disables VNNI in ggml, including
+    # ZEROMOE_ENABLE_AVX512_VNNI=OFF also disables VNNI in ggml, including
     # when reconfiguring a build directory that previously had it enabled.
-    set(GGML_AVX512_VNNI ${MOESTREAM_ENABLE_AVX512_VNNI} CACHE BOOL "" FORCE)
-    if(MOESTREAM_ENABLE_AVX512_VNNI)
+    set(GGML_AVX512_VNNI ${ZEROMOE_ENABLE_AVX512_VNNI} CACHE BOOL "" FORCE)
+    if(ZEROMOE_ENABLE_AVX512_VNNI)
         set(GGML_AVX512       ON CACHE BOOL "" FORCE)
     endif()
     message(STATUS
-        "MoEStream: AVX-512 VNNI=${MOESTREAM_ENABLE_AVX512_VNNI} (MoEStream and ggml CPU kernels)")
+        "ZeroMoE: AVX-512 VNNI=${ZEROMOE_ENABLE_AVX512_VNNI} (ZeroMoE and ggml CPU kernels)")
 
-    if(MOESTREAM_METAL AND APPLE)
+    if(ZEROMOE_METAL AND APPLE)
         # ggml's Metal backend requires the offline shader compiler (metal,
         # metallib), which Apple only ships inside the full Xcode.app.  Our
         # own MPS dispatch uses the runtime Metal Performance Shaders API and
         # does NOT need those tools.  If the compiler is missing, keep our MPS
         # path alive but turn off ggml Metal to avoid a configure/build failure.
-        find_program(_MOESTREAM_METALC metal)
-        find_program(_MOESTREAM_METALLIB metallib)
-        if(_MOESTREAM_METALC AND _MOESTREAM_METALLIB)
+        find_program(_ZEROMOE_METALC metal)
+        find_program(_ZEROMOE_METALLIB metallib)
+        if(_ZEROMOE_METALC AND _ZEROMOE_METALLIB)
             set(GGML_METAL ON CACHE BOOL "" FORCE)
-            message(STATUS "MoEStream: ggml Metal backend enabled (metal/metallib found)")
+            message(STATUS "ZeroMoE: ggml Metal backend enabled (metal/metallib found)")
         else()
             set(GGML_METAL OFF CACHE BOOL "" FORCE)
-            message(STATUS "MoEStream: ggml Metal backend disabled (full Xcode not installed); "
+            message(STATUS "ZeroMoE: ggml Metal backend disabled (full Xcode not installed); "
                             "custom MPS dispatch still enabled")
         endif()
     else()
         set(GGML_METAL OFF CACHE BOOL "" FORCE)
     endif()
 
-    if(NOT MOESTREAM_GGML_ROOT)
+    if(NOT ZEROMOE_GGML_ROOT)
         # Use a direct shell clone instead of FetchContent's ExternalProject.
         # Some sandboxed CMake environments fail to detect git version and
         # abort before cloning; running git from the shell works around that.
-        set(_moestream_ggml_src "${CMAKE_BINARY_DIR}/_deps/ggml-src")
-        if(NOT EXISTS "${_moestream_ggml_src}/CMakeLists.txt")
-            message(STATUS "MoEStream: cloning ggml tag ${MOESTREAM_GGML_TAG} ...")
+        set(_zeromoe_ggml_src "${CMAKE_BINARY_DIR}/_deps/ggml-src")
+        if(NOT EXISTS "${_zeromoe_ggml_src}/CMakeLists.txt")
+            message(STATUS "ZeroMoE: cloning ggml tag ${ZEROMOE_GGML_TAG} ...")
             # Avoid sandbox/gitconfig permission issues on some hosts.
             set(ENV{GIT_CONFIG_GLOBAL} "/dev/null")
             set(ENV{GIT_CONFIG_NOSYSTEM} "1")
             execute_process(
-                COMMAND git clone --depth 1 --branch ${MOESTREAM_GGML_TAG}
+                COMMAND git clone --depth 1 --branch ${ZEROMOE_GGML_TAG}
                         https://github.com/ggerganov/ggml.git
-                        "${_moestream_ggml_src}"
-                RESULT_VARIABLE _moestream_ggml_clone_result
-                ERROR_VARIABLE  _moestream_ggml_clone_err
+                        "${_zeromoe_ggml_src}"
+                RESULT_VARIABLE _zeromoe_ggml_clone_result
+                ERROR_VARIABLE  _zeromoe_ggml_clone_err
                 OUTPUT_STRIP_TRAILING_WHITESPACE
                 ERROR_STRIP_TRAILING_WHITESPACE
             )
-            if(NOT _moestream_ggml_clone_result EQUAL 0)
+            if(NOT _zeromoe_ggml_clone_result EQUAL 0)
                 message(FATAL_ERROR
-                    "Failed to clone ggml (git returned ${_moestream_ggml_clone_result}).\n"
-                    "Error: ${_moestream_ggml_clone_err}\n"
-                    "Set MOESTREAM_GGML_ROOT to a local checkout, or verify network/git access.")
+                    "Failed to clone ggml (git returned ${_zeromoe_ggml_clone_result}).\n"
+                    "Error: ${_zeromoe_ggml_clone_err}\n"
+                    "Set ZEROMOE_GGML_ROOT to a local checkout, or verify network/git access.")
             endif()
         endif()
-        set(MOESTREAM_GGML_ROOT "${_moestream_ggml_src}")
+        set(ZEROMOE_GGML_ROOT "${_zeromoe_ggml_src}")
     endif()
 
-    # Apply MoEStream's ggml patch series (patches/README.md).  Idempotent:
+    # Apply ZeroMoE's ggml patch series (patches/README.md).  Idempotent:
     # already-applied patches are detected by a reverse apply check.
     # Link an already-built ggml instead of compiling it in-tree. The prebuilt tree must come
-    # from the same MOESTREAM_GGML_ROOT (its headers are used) and ggml patches are NOT re-applied.
-    set(MOESTREAM_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (skips building ggml)")
-    if(MOESTREAM_GGML_PREBUILT_DIR)
+    # from the same ZEROMOE_GGML_ROOT (its headers are used) and ggml patches are NOT re-applied.
+    set(ZEROMOE_GGML_PREBUILT_DIR "" CACHE PATH "Directory holding prebuilt libggml*.so (skips building ggml)")
+    if(ZEROMOE_GGML_PREBUILT_DIR)
         foreach(_lib ggml ggml-base ggml-cpu)
             add_library(${_lib} SHARED IMPORTED GLOBAL)
             set_target_properties(${_lib} PROPERTIES
-                IMPORTED_LOCATION "${MOESTREAM_GGML_PREBUILT_DIR}/src/lib${_lib}.so"
-                INTERFACE_INCLUDE_DIRECTORIES "${MOESTREAM_GGML_ROOT}/include")
+                IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/lib${_lib}.so"
+                INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include")
         endforeach()
         set_property(TARGET ggml PROPERTY INTERFACE_LINK_LIBRARIES "ggml-cpu;ggml-base")
         set_property(TARGET ggml-cpu PROPERTY INTERFACE_LINK_LIBRARIES "ggml-base")
         add_library(ggml-cuda SHARED IMPORTED GLOBAL)
         set_target_properties(ggml-cuda PROPERTIES
-            IMPORTED_LOCATION "${MOESTREAM_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
-            INTERFACE_INCLUDE_DIRECTORIES "${MOESTREAM_GGML_ROOT}/include"
+            IMPORTED_LOCATION "${ZEROMOE_GGML_PREBUILT_DIR}/src/ggml-cuda/libggml-cuda.so"
+            INTERFACE_INCLUDE_DIRECTORIES "${ZEROMOE_GGML_ROOT}/include"
             INTERFACE_LINK_LIBRARIES "ggml-base")
-        message(STATUS "MoEStream: linking PREBUILT ggml from ${MOESTREAM_GGML_PREBUILT_DIR} (no ggml compile)")
+        message(STATUS "ZeroMoE: linking PREBUILT ggml from ${ZEROMOE_GGML_PREBUILT_DIR} (no ggml compile)")
     else()
-        include(cmake/MoEStreamGgmlPatches.cmake)
-        moestream_apply_ggml_patches("${MOESTREAM_GGML_ROOT}")
-        add_subdirectory("${MOESTREAM_GGML_ROOT}" ggml-build)
+        include(cmake/ZeroMoEGgmlPatches.cmake)
+        zeromoe_apply_ggml_patches("${ZEROMOE_GGML_ROOT}")
+        add_subdirectory("${ZEROMOE_GGML_ROOT}" ggml-build)
     endif()
-    message(STATUS "MoEStream: using ggml at ${MOESTREAM_GGML_ROOT}")
+    message(STATUS "ZeroMoE: using ggml at ${ZEROMOE_GGML_ROOT}")
 
     # ggml-quants.h lives in ggml/src/, not in the public include/ directory.
     # Expose it to our bridge translation unit.
-    set(MOESTREAM_GGML_SRC_DIR "${MOESTREAM_GGML_ROOT}/src")
+    set(ZEROMOE_GGML_SRC_DIR "${ZEROMOE_GGML_ROOT}/src")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -286,7 +286,7 @@ endif()
 # the include path, so sources keep flat `#include "name.hpp"` lines and a file can move
 # between these directories without touching its includes. File names are unique across
 # them (checked by layout_map.py).
-set(MOESTREAM_INCLUDE_DIRS
+set(ZEROMOE_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/memory
     ${CMAKE_CURRENT_SOURCE_DIR}/models/base
@@ -299,12 +299,12 @@ set(MOESTREAM_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/cuda
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/ggml
     ${CMAKE_CURRENT_SOURCE_DIR}/backends/exl3)
-include_directories(${MOESTREAM_INCLUDE_DIRS})
+include_directories(${ZEROMOE_INCLUDE_DIRS})
 
 # ---------------------------------------------------------------------------
 # Full engine build (Linux + CUDA Toolkit)
 # ---------------------------------------------------------------------------
-if(NOT MOESTREAM_CPU_ONLY)
+if(NOT ZEROMOE_CPU_ONLY)
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -313,14 +313,14 @@ if(NOT MOESTREAM_CPU_ONLY)
 
     # Engine executable
     # CUDA kernel sources (cuda/*.cu) and the GPU Qwen MoE backend
-    # (models/qwen/qwen_moe.cpp, "compiled into the main moestream binary (CUDA
+    # (models/qwen/qwen_moe.cpp, "compiled into the main zeromoe binary (CUDA
     # builds only)" per its own header comment) were not referenced by
-    # ANY target here -- moestream/moestream_tests linked without them and
+    # ANY target here -- zeromoe/zeromoe_tests linked without them and
     # failed at link time with undefined references to every launch_*
     # kernel wrapper (cuda_manager.hpp) and QwenMoEBackend's vtable. Shared
     # between both executables the same way models/base/model_factory.cpp
     # already is, since both need the identical GPU dispatch surface.
-    set(MOESTREAM_CUDA_SRCS
+    set(ZEROMOE_CUDA_SRCS
         backends/exl3/exl3_aux.cu
         kernels/math/attn_score_softmax.cu
         kernels/models/dsv4_score_softmax.cu
@@ -351,29 +351,29 @@ if(NOT MOESTREAM_CPU_ONLY)
     # Keep a master checkout buildable when its files are absent, while still
     # compiling them automatically on the preserved spike branch.
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/cuda/qwen4exp_layer13_staging.cu")
-        list(APPEND MOESTREAM_CUDA_SRCS cuda/qwen4exp_layer13_staging.cu)
+        list(APPEND ZEROMOE_CUDA_SRCS cuda/qwen4exp_layer13_staging.cu)
     endif()
 
     # Upstream ExLlamaV3 EXL3 kernels behind the launch_exl3_mul1_* API.
-    # Runtime opt-out: MOESTREAM_EXL3_UPSTREAM=0 (legacy kernels).
-    include(cmake/MoEStreamExl3Upstream.cmake)
-    if(TARGET moestream_exl3_upstream)
-        list(APPEND MOESTREAM_CUDA_SRCS backends/exl3/exl3_upstream_ops.cu)
+    # Runtime opt-out: ZEROMOE_EXL3_UPSTREAM=0 (legacy kernels).
+    include(cmake/ZeroMoEExl3Upstream.cmake)
+    if(TARGET zeromoe_exl3_upstream)
+        list(APPEND ZEROMOE_CUDA_SRCS backends/exl3/exl3_upstream_ops.cu)
         set_source_files_properties(backends/exl3/exl3_upstream_ops.cu PROPERTIES
-            INCLUDE_DIRECTORIES "${MOESTREAM_EXLLAMAV3_SRC}")
+            INCLUDE_DIRECTORIES "${ZEROMOE_EXLLAMAV3_SRC}")
         set_source_files_properties(backends/exl3/exl3_aux.cu backends/exl3/exl3_gpu.cpp
             backends/exl3/exl3_ggml_ffn.cpp backends/exl3/exl3_upstream_ops.cu
-            PROPERTIES COMPILE_DEFINITIONS MOESTREAM_EXL3_UPSTREAM=1)
-        set(MOESTREAM_EXL3_UPSTREAM_LIB moestream_exl3_upstream)
-        set(MOESTREAM_EXL3_UPSTREAM_OPS backends/exl3/exl3_upstream_ops.cu)
+            PROPERTIES COMPILE_DEFINITIONS ZEROMOE_EXL3_UPSTREAM=1)
+        set(ZEROMOE_EXL3_UPSTREAM_LIB zeromoe_exl3_upstream)
+        set(ZEROMOE_EXL3_UPSTREAM_OPS backends/exl3/exl3_upstream_ops.cu)
     endif()
 
-    set(MOESTREAM_OPTIONAL_SRCS)
+    set(ZEROMOE_OPTIONAL_SRCS)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/qwen4exp_layer13_staging.cpp")
-        list(APPEND MOESTREAM_OPTIONAL_SRCS src/qwen4exp_layer13_staging.cpp)
+        list(APPEND ZEROMOE_OPTIONAL_SRCS src/qwen4exp_layer13_staging.cpp)
     endif()
 
-    add_executable(moestream
+    add_executable(zeromoe
         core/main.cpp
         core/engine_runner.cpp
         core/engine_runner_model.cpp
@@ -409,7 +409,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         core/batched_dispatch_pipeline.cpp
         core/token_dispatch_pipeline.cpp
         core/shared_expert_executor.cpp
-        ${MOESTREAM_OPTIONAL_SRCS}
+        ${ZEROMOE_OPTIONAL_SRCS}
         core/attention_layer.cpp
         models/base/graph_initializer.cpp
         core/hyper_connections.cpp
@@ -465,61 +465,61 @@ if(NOT MOESTREAM_CPU_ONLY)
         models/base/family_ops.cpp
         models/mimo/ggml_mimo2_graph.cpp
         models/graph/full_graph_models.cpp
-        ${MOESTREAM_CUDA_SRCS}
+        ${ZEROMOE_CUDA_SRCS}
     )
-    target_include_directories(moestream PRIVATE
-        ${MOESTREAM_INCLUDE_DIRS}
+    target_include_directories(zeromoe PRIVATE
+        ${ZEROMOE_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
     )
-    target_compile_options(moestream PRIVATE ${MOESTREAM_AVX512_FLAGS})
-    target_compile_definitions(moestream PRIVATE MOESTREAM_EXL3_CUDA=1)
-    set_target_properties(moestream PROPERTIES
+    target_compile_options(zeromoe PRIVATE ${ZEROMOE_AVX512_FLAGS})
+    target_compile_definitions(zeromoe PRIVATE ZEROMOE_EXL3_CUDA=1)
+    set_target_properties(zeromoe PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86        # Ampere; adjust via -DCMAKE_CUDA_ARCHITECTURES
     )
-    target_link_libraries(moestream PRIVATE ${MOESTREAM_EXL3_UPSTREAM_LIB}
+    target_link_libraries(zeromoe PRIVATE ${ZEROMOE_EXL3_UPSTREAM_LIB}
         CUDA::cudart
         CUDA::cublas
         CUDA::cublasLt
     )
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(moestream PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(zeromoe PRIVATE OpenMP::OpenMP_CXX)
     endif()
-    if(MOESTREAM_USE_GGML)
-        target_link_libraries(moestream PRIVATE ggml)
-        if(MOESTREAM_USE_GGML_CUDA)
-            target_link_libraries(moestream PRIVATE ggml-cuda)
+    if(ZEROMOE_USE_GGML)
+        target_link_libraries(zeromoe PRIVATE ggml)
+        if(ZEROMOE_USE_GGML_CUDA)
+            target_link_libraries(zeromoe PRIVATE ggml-cuda)
             # Gates backends/ggml/ggml_moe_backend.hpp's real implementation. Without
             # it that file still compiles, but every entry point returns false
             # and execution_layer.cpp falls back to its own dispatch.
-            target_compile_definitions(moestream PRIVATE MOESTREAM_USE_GGML_CUDA=1)
+            target_compile_definitions(zeromoe PRIVATE ZEROMOE_USE_GGML_CUDA=1)
         endif()
-        target_compile_definitions(moestream PRIVATE MOESTREAM_USE_GGML=1)
-        target_include_directories(moestream PRIVATE ${MOESTREAM_GGML_SRC_DIR})
-        if(MOESTREAM_USE_GGML_CUDA)
-            target_sources(moestream PRIVATE
+        target_compile_definitions(zeromoe PRIVATE ZEROMOE_USE_GGML=1)
+        target_include_directories(zeromoe PRIVATE ${ZEROMOE_GGML_SRC_DIR})
+        if(ZEROMOE_USE_GGML_CUDA)
+            target_sources(zeromoe PRIVATE
                 backends/exl3/exl3_ggml_backend.cpp
                 backends/exl3/exl3_ggml_ffn.cpp
                 backends/exl3/exl3_ggml_model.cpp)
-            target_include_directories(moestream PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
+            target_include_directories(zeromoe PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
         endif()
     endif()
 
     # Synthetic parity: legacy EXL3 kernel vs upstream exl3_gemm (no model needed).
-    if(TARGET moestream_exl3_upstream)
+    if(TARGET zeromoe_exl3_upstream)
         add_executable(exl3_upstream_parity EXCLUDE_FROM_ALL
             tests/exl3_upstream_parity.cu
             tests/exl3_reference_matmul.cu)
         target_include_directories(exl3_upstream_parity PRIVATE
-            include "${MOESTREAM_EXLLAMAV3_SRC}")
+            include "${ZEROMOE_EXLLAMAV3_SRC}")
         target_link_libraries(exl3_upstream_parity PRIVATE
-            moestream_exl3_upstream CUDA::cudart)
+            zeromoe_exl3_upstream CUDA::cudart)
         set_target_properties(exl3_upstream_parity PROPERTIES CUDA_STANDARD 17)
     endif()
 
     # Native test harness
-    add_executable(moestream_tests
+    add_executable(zeromoe_tests
         tests/native/main_test.cpp
         tests/native/tests_basic_cuda.cpp
         tests/native/tests_cpu_quant.cpp
@@ -544,7 +544,7 @@ if(NOT MOESTREAM_CPU_ONLY)
         core/batched_dispatch_pipeline.cpp
         core/token_dispatch_pipeline.cpp
         core/shared_expert_executor.cpp
-        ${MOESTREAM_OPTIONAL_SRCS}
+        ${ZEROMOE_OPTIONAL_SRCS}
         core/attention_layer.cpp
         models/base/graph_initializer.cpp
         core/hyper_connections.cpp
@@ -599,42 +599,42 @@ if(NOT MOESTREAM_CPU_ONLY)
         models/base/family_ops.cpp
         models/mimo/ggml_mimo2_graph.cpp
         models/graph/full_graph_models.cpp
-        ${MOESTREAM_CUDA_SRCS}
+        ${ZEROMOE_CUDA_SRCS}
     )
-    target_include_directories(moestream_tests PRIVATE
-        ${MOESTREAM_INCLUDE_DIRS}
+    target_include_directories(zeromoe_tests PRIVATE
+        ${ZEROMOE_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
         ${CMAKE_CURRENT_SOURCE_DIR}/cuda
     )
-    target_compile_options(moestream_tests PRIVATE ${MOESTREAM_AVX512_FLAGS})
-    set_target_properties(moestream_tests PROPERTIES
+    target_compile_options(zeromoe_tests PRIVATE ${ZEROMOE_AVX512_FLAGS})
+    set_target_properties(zeromoe_tests PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86
     )
-    target_link_libraries(moestream_tests PRIVATE ${MOESTREAM_EXL3_UPSTREAM_LIB}
+    target_link_libraries(zeromoe_tests PRIVATE ${ZEROMOE_EXL3_UPSTREAM_LIB}
         CUDA::cudart
         CUDA::cublas
         CUDA::cublasLt
     )
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(moestream_tests PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(zeromoe_tests PRIVATE OpenMP::OpenMP_CXX)
     endif()
-    if(MOESTREAM_USE_GGML)
-        target_link_libraries(moestream_tests PRIVATE ggml)
-        if(MOESTREAM_USE_GGML_CUDA)
-            target_link_libraries(moestream_tests PRIVATE ggml-cuda)
-            target_compile_definitions(moestream_tests PRIVATE MOESTREAM_USE_GGML_CUDA=1)
+    if(ZEROMOE_USE_GGML)
+        target_link_libraries(zeromoe_tests PRIVATE ggml)
+        if(ZEROMOE_USE_GGML_CUDA)
+            target_link_libraries(zeromoe_tests PRIVATE ggml-cuda)
+            target_compile_definitions(zeromoe_tests PRIVATE ZEROMOE_USE_GGML_CUDA=1)
         endif()
-        target_compile_definitions(moestream_tests PRIVATE MOESTREAM_USE_GGML=1)
-        target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR})
-        if(MOESTREAM_USE_GGML_CUDA)
-            target_sources(moestream_tests PRIVATE
+        target_compile_definitions(zeromoe_tests PRIVATE ZEROMOE_USE_GGML=1)
+        target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR})
+        if(ZEROMOE_USE_GGML_CUDA)
+            target_sources(zeromoe_tests PRIVATE
                 backends/exl3/exl3_ggml_backend.cpp
                 backends/exl3/exl3_ggml_ffn.cpp
                 backends/exl3/exl3_ggml_model.cpp
                 backends/exl3/exl3_model_loader.cpp
                 models/base/safetensors_adapter.cpp)
-            target_include_directories(moestream_tests PRIVATE ${MOESTREAM_GGML_SRC_DIR}/src)
+            target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
         endif()
     endif()
 
@@ -652,23 +652,52 @@ if(NOT MOESTREAM_CPU_ONLY)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         VERBATIM)
 
+    if(ZEROMOE_USE_GGML AND ZEROMOE_USE_GGML_CUDA)
+        add_executable(phase_alias_numerics_test EXCLUDE_FROM_ALL tests/test_phase_alias_numerics.cpp)
+        target_include_directories(phase_alias_numerics_test PRIVATE ${ZEROMOE_GGML_ROOT}/include ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(phase_alias_numerics_test PRIVATE ggml ggml-cuda CUDA::cudart)
+    add_executable(real_tensor_numerics_test EXCLUDE_FROM_ALL tests/test_real_tensor_numerics.cpp)
+    target_include_directories(real_tensor_numerics_test PRIVATE ${ZEROMOE_GGML_ROOT}/include ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(real_tensor_numerics_test PRIVATE ggml ggml-cuda CUDA::cudart)
+    endif()
+    if(ZEROMOE_USE_GGML)
+        add_executable(layer_plan_test EXCLUDE_FROM_ALL tests/test_layer_plan.cpp)
+        target_include_directories(layer_plan_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR})
+        target_include_directories(layer_plan_test PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        target_compile_definitions(layer_plan_test PRIVATE ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
+        target_link_libraries(layer_plan_test PRIVATE ggml CUDA::cudart)
+    endif()
+    if(ZEROMOE_USE_GGML)
+        add_executable(quant_table_test EXCLUDE_FROM_ALL tests/test_quant_table.cpp)
+        target_include_directories(quant_table_test PRIVATE ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR})
+        target_link_libraries(quant_table_test PRIVATE ggml)
+    endif()
+    add_executable(graph_settings_test EXCLUDE_FROM_ALL tests/test_graph_settings.cpp)
+    target_include_directories(graph_settings_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
+    add_executable(resident_memory_policy_test EXCLUDE_FROM_ALL tests/test_resident_memory_policy.cpp)
+    target_include_directories(resident_memory_policy_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
+    add_executable(phase_route_test EXCLUDE_FROM_ALL tests/test_phase_routes.cpp)
+    target_include_directories(phase_route_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
+
     add_executable(mimo2_spec_test EXCLUDE_FROM_ALL tests/test_mimo2_spec.cpp)
-    target_include_directories(mimo2_spec_test PRIVATE ${MOESTREAM_INCLUDE_DIRS})
+    target_include_directories(mimo2_spec_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
 
     # Exact F32 parity for DeepSeek's quantized grouped output projection.
     # Uses the real CPU dot and GGML quantizer/dequantizer as the oracle.
-    if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML AND ZEROMOE_USE_GGML_CUDA)
         add_executable(dsv41_grouped_outproj_test EXCLUDE_FROM_ALL
             tests/test_dsv41_grouped_outproj.cpp
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp
             kernels/quant/kquant_matmul.cu)
         target_include_directories(dsv41_grouped_outproj_test PRIVATE
-            ${MOESTREAM_GGML_SRC_DIR})
+            ${ZEROMOE_GGML_SRC_DIR})
         target_compile_definitions(dsv41_grouped_outproj_test PRIVATE
-            MOESTREAM_USE_GGML=1)
+            ZEROMOE_USE_GGML=1)
         target_compile_options(dsv41_grouped_outproj_test PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         set_target_properties(dsv41_grouped_outproj_test PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(dsv41_grouped_outproj_test PRIVATE
@@ -679,58 +708,58 @@ if(NOT MOESTREAM_CPU_ONLY)
         endif()
     endif()
 
-    if(MOESTREAM_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML_CUDA)
         add_executable(dsv41_cache_graph_test EXCLUDE_FROM_ALL
             tests/test_dsv41_cache_graph.cpp kernels/quant/kquant_matmul.cu)
         target_compile_definitions(dsv41_cache_graph_test PRIVATE
-            MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(dsv41_cache_graph_test PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_include_directories(dsv41_cache_graph_test PRIVATE
-            ${MOESTREAM_GGML_SRC_DIR})
+            ${ZEROMOE_GGML_SRC_DIR})
         target_link_libraries(dsv41_cache_graph_test PRIVATE
             CUDA::cudart ggml ggml-cuda)
     endif()
 
     # Unit test for backends/cuda/cuda_raii.hpp (RAII device/pinned memory, events, streams).
     add_executable(cuda_raii_test EXCLUDE_FROM_ALL tests/test_cuda_raii.cpp)
-    target_include_directories(cuda_raii_test PRIVATE ${MOESTREAM_INCLUDE_DIRS})
+    target_include_directories(cuda_raii_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     target_link_libraries(cuda_raii_test PRIVATE CUDA::cudart)
 
     # GGML-only Qwen CPU MoE timing probe.  The same source is also compiled
     # by bench/run_qwen_cpu_moe_compare.sh against llama.cpp's GGML shared
     # libraries, giving a layer-graph comparison without loading a model.
-    if(MOESTREAM_USE_GGML)
+    if(ZEROMOE_USE_GGML)
         add_executable(qwen_cpu_moe_ggml_bench
             bench/qwen_cpu_moe_ggml_bench.cpp)
         target_include_directories(qwen_cpu_moe_ggml_bench PRIVATE
-            ${MOESTREAM_GGML_SRC_DIR})
+            ${ZEROMOE_GGML_SRC_DIR})
         target_compile_options(qwen_cpu_moe_ggml_bench PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         target_link_libraries(qwen_cpu_moe_ggml_bench PRIVATE ggml)
     endif()
 
     add_executable(exl3_kernel_bench EXCLUDE_FROM_ALL
         bench/exl3_kernel_bench.cu
         backends/exl3/exl3_aux.cu
-        ${MOESTREAM_EXL3_UPSTREAM_OPS})
+        ${ZEROMOE_EXL3_UPSTREAM_OPS})
     target_include_directories(exl3_kernel_bench PRIVATE
-        ${MOESTREAM_INCLUDE_DIRS})
+        ${ZEROMOE_INCLUDE_DIRS})
     set_target_properties(exl3_kernel_bench PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
         CUDA_ARCHITECTURES 86)
     target_link_libraries(exl3_kernel_bench PRIVATE CUDA::cudart)
 
-    if(MOESTREAM_USE_GGML AND MOESTREAM_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML AND ZEROMOE_USE_GGML_CUDA)
         add_executable(exl3_ggml_custom_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_custom_bench.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_custom_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR})
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR})
         target_compile_definitions(exl3_ggml_custom_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_custom_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_custom_bench PRIVATE
@@ -740,13 +769,13 @@ if(NOT MOESTREAM_CPU_ONLY)
             bench/exl3_ggml_cuda_adapter_bench.cpp
             backends/exl3/exl3_ggml_backend.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_adapter_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_adapter_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_adapter_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_adapter_bench PRIVATE
@@ -761,15 +790,15 @@ if(NOT MOESTREAM_CPU_ONLY)
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_real_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_real_bench PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_real_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_real_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_real_bench PRIVATE
@@ -790,16 +819,16 @@ if(NOT MOESTREAM_CPU_ONLY)
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_real_ffn_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_real_ffn_bench PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_real_ffn_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
-            MOESTREAM_EXL3_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1
+            ZEROMOE_EXL3_CUDA=1)
         set_target_properties(exl3_ggml_cuda_real_ffn_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_real_ffn_bench PRIVATE
@@ -820,16 +849,16 @@ if(NOT MOESTREAM_CPU_ONLY)
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
-            MOESTREAM_EXL3_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1
+            ZEROMOE_EXL3_CUDA=1)
         set_target_properties(exl3_ggml_cuda_real_routed_ffn_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_real_routed_ffn_bench PRIVATE
@@ -850,22 +879,22 @@ if(NOT MOESTREAM_CPU_ONLY)
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS}
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS}
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_cache_graph_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_ggml_cuda_cache_graph_bench PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         target_compile_definitions(exl3_ggml_cuda_cache_graph_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1
-            MOESTREAM_EXL3_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1
+            ZEROMOE_EXL3_CUDA=1)
         set_target_properties(exl3_ggml_cuda_cache_graph_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_cache_graph_bench PRIVATE
             CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda
-            ${MOESTREAM_EXL3_UPSTREAM_LIB})
+            ${ZEROMOE_EXL3_UPSTREAM_LIB})
         if(OpenMP_CXX_FOUND)
             target_link_libraries(exl3_ggml_cuda_cache_graph_bench PRIVATE
                 OpenMP::OpenMP_CXX)
@@ -874,13 +903,13 @@ if(NOT MOESTREAM_CPU_ONLY)
         add_executable(exl3_ggml_cuda_fused_ffn_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_fused_ffn_bench.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_fused_ffn_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_fused_ffn_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_fused_ffn_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_fused_ffn_bench PRIVATE
@@ -889,31 +918,31 @@ if(NOT MOESTREAM_CPU_ONLY)
         add_executable(exl3_ggml_cuda_moe_bench EXCLUDE_FROM_ALL
             bench/exl3_ggml_cuda_moe_bench.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_ggml_cuda_moe_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_definitions(exl3_ggml_cuda_moe_bench PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
         set_target_properties(exl3_ggml_cuda_moe_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_ggml_cuda_moe_bench PRIVATE
             CUDA::cudart CUDA::cublas CUDA::cublasLt ggml ggml-cuda)
     endif()
 
-    if(MOESTREAM_USE_GGML AND OpenMP_CXX_FOUND)
+    if(ZEROMOE_USE_GGML AND OpenMP_CXX_FOUND)
         add_executable(exl3_cpu_bench EXCLUDE_FROM_ALL
             bench/exl3_cpu_bench.cpp
             backends/exl3/exl3_cpu.cpp
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp)
         target_include_directories(exl3_cpu_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
-        target_compile_options(exl3_cpu_bench PRIVATE ${MOESTREAM_AVX512_FLAGS})
-        target_compile_definitions(exl3_cpu_bench PRIVATE MOESTREAM_USE_GGML=1)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
+        target_compile_options(exl3_cpu_bench PRIVATE ${ZEROMOE_AVX512_FLAGS})
+        target_compile_definitions(exl3_cpu_bench PRIVATE ZEROMOE_USE_GGML=1)
         target_link_libraries(exl3_cpu_bench PRIVATE ggml OpenMP::OpenMP_CXX)
 
         add_executable(exl3_hc_bench EXCLUDE_FROM_ALL
@@ -923,14 +952,14 @@ if(NOT MOESTREAM_CPU_ONLY)
             backends/cpu/kernels_cpu.cpp
             backends/cpu/ggml_grids.cpp
             backends/exl3/exl3_aux.cu
-            ${MOESTREAM_EXL3_UPSTREAM_OPS})
+            ${ZEROMOE_EXL3_UPSTREAM_OPS})
         target_include_directories(exl3_hc_bench PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_INCLUDE_DIRS}
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(exl3_hc_bench PRIVATE
-            "$<$<COMPILE_LANGUAGE:CXX>:${MOESTREAM_AVX512_FLAGS}>")
-        target_compile_definitions(exl3_hc_bench PRIVATE MOESTREAM_USE_GGML=1)
+            "$<$<COMPILE_LANGUAGE:CXX>:${ZEROMOE_AVX512_FLAGS}>")
+        target_compile_definitions(exl3_hc_bench PRIVATE ZEROMOE_USE_GGML=1)
         set_target_properties(exl3_hc_bench PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
         target_link_libraries(exl3_hc_bench PRIVATE
@@ -941,19 +970,19 @@ if(NOT MOESTREAM_CPU_ONLY)
     # separate opt-in executable: it reports the CPU Q8_K and CUDA Q8_1
     # activation quantization contracts plus the actual ggml_mul_mat_id
     # result, without changing the production dispatch path.
-    if(MOESTREAM_USE_GGML_CUDA)
+    if(ZEROMOE_USE_GGML_CUDA)
         add_executable(qwen_iq2_cpu_cuda_probe
             bench/qwen_iq2_cpu_cuda_probe.cpp
             backends/cpu/ggml_grids.cpp)
         target_include_directories(qwen_iq2_cpu_cuda_probe PRIVATE
-            ${MOESTREAM_GGML_SRC_DIR}
-            ${MOESTREAM_GGML_SRC_DIR}/src)
+            ${ZEROMOE_GGML_SRC_DIR}
+            ${ZEROMOE_GGML_SRC_DIR}/src)
         target_compile_options(qwen_iq2_cpu_cuda_probe PRIVATE
-            ${MOESTREAM_AVX512_FLAGS})
+            ${ZEROMOE_AVX512_FLAGS})
         target_link_libraries(qwen_iq2_cpu_cuda_probe PRIVATE
             ggml ggml-cuda CUDA::cudart)
         target_compile_definitions(qwen_iq2_cpu_cuda_probe PRIVATE
-            MOESTREAM_USE_GGML=1 MOESTREAM_USE_GGML_CUDA=1)
+            ZEROMOE_USE_GGML=1 ZEROMOE_USE_GGML_CUDA=1)
     endif()
 
     # Layer-13 pointer-indirection Phase-1 laboratory.  This target links
@@ -962,7 +991,7 @@ if(NOT MOESTREAM_CPU_ONLY)
     # does not link the engine or mutate runtime dispatch; see the benchmark
     # source for the VRAM/mapped/H2D-stage conditions and M=1/3/6 contention
     # protocol.
-    if(MOESTREAM_USE_GGML AND EXISTS
+    if(ZEROMOE_USE_GGML AND EXISTS
        "${CMAKE_CURRENT_SOURCE_DIR}/bench/qwen4exp_pointer_spike.cu")
         add_executable(qwen4exp_pointer_spike
             bench/qwen4exp_pointer_spike.cu
@@ -971,9 +1000,9 @@ if(NOT MOESTREAM_CPU_ONLY)
             kernels/math/expert_activation.cu
             backends/cpu/ggml_grids.cpp)
         target_include_directories(qwen4exp_pointer_spike PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
+            ${ZEROMOE_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cuda
-            ${MOESTREAM_GGML_SRC_DIR})
+            ${ZEROMOE_GGML_SRC_DIR})
         set_target_properties(qwen4exp_pointer_spike PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF
             CUDA_ARCHITECTURES 86)
@@ -990,9 +1019,9 @@ if(NOT MOESTREAM_CPU_ONLY)
             kernels/math/expert_activation.cu
             backends/cpu/ggml_grids.cpp)
         target_include_directories(qwen4exp_staging_spike PRIVATE
-            ${MOESTREAM_INCLUDE_DIRS}
+            ${ZEROMOE_INCLUDE_DIRS}
             ${CMAKE_CURRENT_SOURCE_DIR}/cuda
-            ${MOESTREAM_GGML_SRC_DIR})
+            ${ZEROMOE_GGML_SRC_DIR})
         set_target_properties(qwen4exp_staging_spike PROPERTIES
             CUDA_SEPARABLE_COMPILATION OFF
             CUDA_ARCHITECTURES 86)
@@ -1013,7 +1042,7 @@ if(NOT MOESTREAM_CPU_ONLY)
     # CPUOffload ring wait-latency microbenchmark (Tier 1). Exercises the
     # REAL QwenCpuOffloadRing class (models/qwen/qwen_cpu_offload_ring.cpp) with a
     # synthetic CPU worker thread standing in for GgmlQwenCpuMoeRunner, to
-    # isolate MOESTREAM_QWEN4EXP_RING_SPIN_US's effect on wait latency from
+    # isolate ZEROMOE_QWEN4EXP_RING_SPIN_US's effect on wait latency from
     # decode-loop noise. No GGML/model dependency.
     add_executable(qwen_cpu_offload_ring_spin_bench
         bench/qwen_cpu_offload_ring_spin_bench.cpp
@@ -1032,35 +1061,35 @@ if(NOT MOESTREAM_CPU_ONLY)
 # CPU-only build (macOS, or Linux without CUDA)
 # ---------------------------------------------------------------------------
 else()
-    message(STATUS "MoEStream: CPU-only build path selected")
+    message(STATUS "ZeroMoE: CPU-only build path selected")
 
     # Choose the right CPU kernel backend.
-    set(MOESTREAM_CPU_KERNEL_SRCS)
+    set(ZEROMOE_CPU_KERNEL_SRCS)
     # models/base/safetensors_adapter.cpp was never registered here even though
     # tests/test_components.cpp's test_safetensors_adapter() calls it
     # directly -- test_components (and any other target linking
     # kernels_cpu) failed to link with undefined SafetensorsAdapter symbols
     # regardless of platform, unrelated to Apple Silicon vs x86 below.
-    list(APPEND MOESTREAM_CPU_KERNEL_SRCS
+    list(APPEND ZEROMOE_CPU_KERNEL_SRCS
         backends/exl3/exl3_cpu.cpp
         backends/exl3/exl3_model_loader.cpp
         models/base/safetensors_adapter.cpp)
-    if(MOESTREAM_APPLE_SILICON)
-        list(APPEND MOESTREAM_CPU_KERNEL_SRCS backends/cpu/kernels_cpu_neon.cpp)
-        message(STATUS "MoEStream: using ARM NEON CPU kernel backend")
-        if(MOESTREAM_METAL)
-            list(APPEND MOESTREAM_CPU_KERNEL_SRCS backends/cpu/kernels_metal.mm)
-            message(STATUS "MoEStream: Metal/MPS dispatch enabled (falls back to NEON)")
+    if(ZEROMOE_APPLE_SILICON)
+        list(APPEND ZEROMOE_CPU_KERNEL_SRCS backends/cpu/kernels_cpu_neon.cpp)
+        message(STATUS "ZeroMoE: using ARM NEON CPU kernel backend")
+        if(ZEROMOE_METAL)
+            list(APPEND ZEROMOE_CPU_KERNEL_SRCS backends/cpu/kernels_metal.mm)
+            message(STATUS "ZeroMoE: Metal/MPS dispatch enabled (falls back to NEON)")
         endif()
     else()
-        list(APPEND MOESTREAM_CPU_KERNEL_SRCS backends/cpu/kernels_cpu.cpp)
-        message(STATUS "MoEStream: using x86 AVX-512 CPU kernel backend")
+        list(APPEND ZEROMOE_CPU_KERNEL_SRCS backends/cpu/kernels_cpu.cpp)
+        message(STATUS "ZeroMoE: using x86 AVX-512 CPU kernel backend")
     endif()
 
-    add_library(kernels_cpu STATIC ${MOESTREAM_CPU_KERNEL_SRCS})
-    target_compile_options(kernels_cpu PRIVATE ${MOESTREAM_AVX512_FLAGS})
+    add_library(kernels_cpu STATIC ${ZEROMOE_CPU_KERNEL_SRCS})
+    target_compile_options(kernels_cpu PRIVATE ${ZEROMOE_AVX512_FLAGS})
     target_include_directories(kernels_cpu PUBLIC
-        ${MOESTREAM_INCLUDE_DIRS}
+        ${ZEROMOE_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
     )
     if(OpenMP_CXX_FOUND)
@@ -1069,28 +1098,28 @@ else()
 
     # Apple Silicon tuning: prefer the Apple-specific CPU tuning when the
     # toolchain supports it.  This benefits M3/M4/M5 (and is harmless on M1/M2).
-    if(MOESTREAM_APPLE_SILICON)
+    if(ZEROMOE_APPLE_SILICON)
         include(CheckCXXCompilerFlag)
-        check_cxx_compiler_flag("-mcpu=apple-m3" MOESTREAM_HAS_APPLE_M3_FLAG)
-        if(MOESTREAM_HAS_APPLE_M3_FLAG)
+        check_cxx_compiler_flag("-mcpu=apple-m3" ZEROMOE_HAS_APPLE_M3_FLAG)
+        if(ZEROMOE_HAS_APPLE_M3_FLAG)
             target_compile_options(kernels_cpu PRIVATE -mcpu=apple-m3)
-            message(STATUS "MoEStream: applied -mcpu=apple-m3 to CPU kernels")
+            message(STATUS "ZeroMoE: applied -mcpu=apple-m3 to CPU kernels")
         endif()
-        target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_ARM_NEON=1)
-        if(MOESTREAM_METAL)
+        target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_ARM_NEON=1)
+        if(ZEROMOE_METAL)
             set_source_files_properties(backends/cpu/kernels_metal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
             find_library(METAL_FRAMEWORK Metal REQUIRED)
             find_library(MPS_FRAMEWORK MetalPerformanceShaders REQUIRED)
             target_link_libraries(kernels_cpu PUBLIC ${METAL_FRAMEWORK} ${MPS_FRAMEWORK})
-            target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_METAL=1)
+            target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_METAL=1)
         endif()
     endif()
 
-    if(MOESTREAM_USE_GGML)
+    if(ZEROMOE_USE_GGML)
         target_sources(kernels_cpu PRIVATE backends/cpu/ggml_dequant.cpp)
         target_link_libraries(kernels_cpu PUBLIC ggml)
-        target_compile_definitions(kernels_cpu PUBLIC MOESTREAM_USE_GGML=1)
-        target_include_directories(kernels_cpu PUBLIC ${MOESTREAM_GGML_SRC_DIR})
+        target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_USE_GGML=1)
+        target_include_directories(kernels_cpu PUBLIC ${ZEROMOE_GGML_SRC_DIR})
     endif()
 
     # CPU-only component tests (cross-platform, no CUDA)
@@ -1100,8 +1129,8 @@ else()
         target_link_libraries(test_components PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
-    # CPU-only inference binary (moestream_cpu)
-    add_executable(moestream_cpu
+    # CPU-only inference binary (zeromoe_cpu)
+    add_executable(zeromoe_cpu
         backends/cpu/cpu_main.cpp
         backends/exl3/exl3_decode.cpp
         backends/cpu/cpu_dense.cpp
@@ -1111,41 +1140,41 @@ else()
         models/qwen/cpu_qwen_moe.cpp
         models/qwen/cpu_qwen4exp.cpp
     )
-    target_include_directories(moestream_cpu PRIVATE
-        ${MOESTREAM_INCLUDE_DIRS}
+    target_include_directories(zeromoe_cpu PRIVATE
+        ${ZEROMOE_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
     )
-    target_link_libraries(moestream_cpu PRIVATE kernels_cpu)
+    target_link_libraries(zeromoe_cpu PRIVATE kernels_cpu)
 
     # When the kernel backend contains Objective-C++ (Metal dispatch), the
     # final executable must link the Objective-C runtime / Foundation so the
     # linker resolves ARC/runtime symbols from the static library objects.
-    if(MOESTREAM_METAL AND MOESTREAM_APPLE_SILICON)
+    if(ZEROMOE_METAL AND ZEROMOE_APPLE_SILICON)
         find_library(FOUNDATION_FRAMEWORK Foundation REQUIRED)
-        foreach(_tgt test_components moestream_cpu)
+        foreach(_tgt test_components zeromoe_cpu)
             target_link_libraries(${_tgt} PRIVATE ${FOUNDATION_FRAMEWORK})
         endforeach()
     endif()
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(moestream_cpu PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(zeromoe_cpu PRIVATE OpenMP::OpenMP_CXX)
     endif()
 
     # Tools
     add_subdirectory(tools)
 endif()
 
-message(STATUS "MoEStream: configure done")
+message(STATUS "ZeroMoE: configure done")
 
 # EXL3 bench targets compile backends/exl3/exl3_upstream_ops.cu directly and need the
 # upstream kernel library plus the torch stub include path.
-if(TARGET moestream_exl3_upstream)
+if(TARGET zeromoe_exl3_upstream)
     foreach(_exl3_target
             exl3_kernel_bench exl3_ggml_custom_bench exl3_ggml_cuda_adapter_bench
             exl3_ggml_cuda_real_bench exl3_ggml_cuda_real_ffn_bench
             exl3_ggml_cuda_real_routed_ffn_bench exl3_ggml_cuda_fused_ffn_bench
             exl3_ggml_cuda_moe_bench exl3_hc_bench)
         if(TARGET ${_exl3_target})
-            target_link_libraries(${_exl3_target} PRIVATE moestream_exl3_upstream)
+            target_link_libraries(${_exl3_target} PRIVATE zeromoe_exl3_upstream)
         endif()
     endforeach()
 endif()

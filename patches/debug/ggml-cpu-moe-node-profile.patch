@@ -5,7 +5,7 @@ diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
  static inline bool ggml_cpu_profile_moe_nodes_enabled(void) {
      const char * value = getenv("BEE_GGML_PROFILE_CPU_NODES");
 -    return value != NULL && value[0] == '1';
-+    const char * breakdown = getenv("MOESTREAM_QWEN4EXP_CPU_CALLBACK_BREAKDOWN");
++    const char * breakdown = getenv("ZEROMOE_QWEN4EXP_CPU_CALLBACK_BREAKDOWN");
 +    return (value != NULL && value[0] == '1') ||
 +        (breakdown != NULL && breakdown[0] == '1');
  }
@@ -19,7 +19,7 @@ diff --git a/src/ggml-cpu/ggml-cpu.c b/src/ggml-cpu/ggml-cpu.c
 +    if (node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_GLU) {
 +        return true;
 +    }
-+    const char * breakdown = getenv("MOESTREAM_QWEN4EXP_CPU_CALLBACK_BREAKDOWN");
++    const char * breakdown = getenv("ZEROMOE_QWEN4EXP_CPU_CALLBACK_BREAKDOWN");
 +    return breakdown != NULL && breakdown[0] == '1' &&
 +        (node->op == GGML_OP_MUL || node->op == GGML_OP_ADD ||
 +         node->op == GGML_OP_CONT) &&

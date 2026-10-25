@@ -26,7 +26,7 @@ cost model that fixes how big the problem is before any graph code is written.
   competes with the DDR tier. A CPU MoE layer costs about 3.5 ms (118 ms / 34 layers), so one miss is about as
   expensive as a whole layer if exposed, but fits inside it if issued at routing time.
 
-## 2. Miss estimates from `.moestream_usage_glm53flash` (layers 11-44, global_topn ranking)
+## 2. Miss estimates from `.zeromoe_usage_glm53flash` (layers 11-44, global_topn ranking)
 Ranking from half the survey hits, misses measured on the other half (random split: optimistic, a floor).
 A Good-Turing estimate of mass on never-seen experts is 0.73% of routes (about 2 of 272 per token).
 

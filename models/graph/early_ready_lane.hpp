@@ -34,11 +34,11 @@ extern "C" int ggml_backend_sched_early_cpu_supported() __attribute__((weak));
 
 // Optional learned correction for the next-layer pilot (bench/qwen_ridge_export.py):
 // scores = softmax(router x) + (x - mu) R + c. Loaded once from
-// MOESTREAM_QWEN_EARLY_READY_RIDGE; a missing/invalid file leaves the plain pilot.
+// ZEROMOE_QWEN_EARLY_READY_RIDGE; a missing/invalid file leaves the plain pilot.
 // The table format and loader are shared with GLM5NEXT via PilotRidgeTable.
 inline const PilotRidgeTable &qwen4exp_ridge() {
   static const PilotRidgeTable table =
-      PilotRidgeTable::load("MOESTREAM_QWEN_EARLY_READY_RIDGE", "QWEN-RIDGE");
+      PilotRidgeTable::load("ZEROMOE_QWEN_EARLY_READY_RIDGE", "QWEN-RIDGE");
   return table;
 }
 
@@ -55,10 +55,10 @@ struct GpuAssistShared {
   }
 };
 
-// MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>: "P <pos>" at the start of each decode token, then "R <layer> <ids...>" per layer.
+// ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>: "P <pos>" at the start of each decode token, then "R <layer> <ids...>" per layer.
 inline FILE *route_trace_file() {
   static FILE *f = [] {
-    const char *path = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TRACE");
+    const char *path = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ROUTE_TRACE");
     return path && path[0] ? std::fopen(path, "a") : nullptr;
   }();
   return f;
@@ -86,13 +86,13 @@ struct EarlyReadyLane {
   size_t expert_bytes = 0;
   // RAII owners (released after the destructor body, i.e. after the ggml buffers
   // that wrap `pinned`, on the device they were created on).
-  moestream::cuda::PinnedBuffer<uint8_t> pinned;
+  zeromoe::cuda::PinnedBuffer<uint8_t> pinned;
   float *input = nullptr, *weights = nullptr;
-  moestream::cuda::PinnedBuffer<uint8_t> prediction_pinned;
-  moestream::cuda::PinnedBuffer<uint8_t> stage_pinned;
+  zeromoe::cuda::PinnedBuffer<uint8_t> prediction_pinned;
+  zeromoe::cuda::PinnedBuffer<uint8_t> stage_pinned;
   int32_t *prediction_ids = nullptr, *stage_ids = nullptr;
   unsigned long long *prediction_epoch = nullptr;
-  moestream::cuda::CudaEvent prediction_ready;
+  zeromoe::cuda::CudaEvent prediction_ready;
   Qwen4ExpStagePool *stage_source = nullptr, *stage_target = nullptr;
   ggml_backend_buffer_t stage_routes_buffer = nullptr;
   // stage_gpu_ids contains valid dispatch IDs for every slot (inactive slots
@@ -106,12 +106,12 @@ struct EarlyReadyLane {
   std::vector<float> original_mask;
   uint64_t staged_routes = 0;
   int32_t *ids = nullptr, *position = nullptr;
-  moestream::cuda::CudaEvent ready;
+  zeromoe::cuda::CudaEvent ready;
   cudaStream_t producer_stream = nullptr;
-  moestream::cuda::CudaStream output_stream;
-  moestream::cuda::CudaEvent output_done;
+  zeromoe::cuda::CudaStream output_stream;
+  zeromoe::cuda::CudaEvent output_done;
   int device = -1, d = 0, k = 0, n_experts = 0, expected_pos = -1;
-  int trace_layer = -1;  // layer index for MOESTREAM_GLM5NEXT_ROUTE_TRACE lines
+  int trace_layer = -1;  // layer index for ZEROMOE_GLM5NEXT_ROUTE_TRACE lines
   bool completed = false;
   bool residency_ready = false;  // residency complete (owned experts resident, safe to compute) —
                                  // distinct from `completed`, which marks run() finished (§3.8)
@@ -183,7 +183,7 @@ struct EarlyReadyLane {
   // The strategy view of this lane (adapter-first migration). EarlyReadyLaneStrategy forwards the
   // adapter's callbacks to the members above and re-expresses `residency_ready` (residency complete)
   // as the strategy state machine. It owns no CUDA resources and is destroyed (trivially) with the lane.
-  std::unique_ptr<moestream::graph::ColdMoEStrategy> strategy;
+  std::unique_ptr<zeromoe::graph::ColdMoEStrategy> strategy;
   uint64_t assist_runs = 0, assist_experts = 0;
   int64_t assist_stall_us = 0;
   uint64_t split_runs = 0;
@@ -225,13 +225,13 @@ struct EarlyReadyLane {
     expert_bytes = ggml_row_size(gate->type, gate->ne[0]) * gate->ne[1] +
                    (up ? ggml_row_size(up->type, up->ne[0]) * up->ne[1] : 0) +
                    ggml_row_size(down->type, down->ne[0]) * down->ne[1];
-    const char *skip = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_SKIP_ALL_HOT");
+    const char *skip = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_SKIP_ALL_HOT");
     skip_all_hot = skip && skip[0] == '1';
-    const char *copy = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT");
+    const char *copy = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT");
     // Accepted production profile (early-ready + immutable resident route tables +
     // asynchronous cold-output upload): on unless explicitly disabled with =0.
     async_output_copy = !(copy && copy[0] == '0');
-    const char *tables = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES");
+    const char *tables = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES");
     resident_tables = !(tables && tables[0] == '0');
     cold_mask.resize(n_experts);
     for (int e = 0; e < n_experts; ++e)
@@ -462,9 +462,9 @@ struct EarlyReadyLane {
         GGML_ABORT("early-ready %s: %s", operation, cudaGetErrorString(status));
     };
     if (stage_source)
-      checked(moestream_qwen_stage_begin(stage_source->epoch, stream), "stage epoch");
+      checked(zeromoe_qwen_stage_begin(stage_source->epoch, stream), "stage epoch");
     if (stage_target) {
-      checked(moestream_qwen_stage_map(static_cast<const int *>(node->src[2]->data),
+      checked(zeromoe_qwen_stage_map(static_cast<const int *>(node->src[2]->data),
           stage_target->epoch, stage_target->slot_ids, stage_target->slot_epochs,
           static_cast<int *>(stage_gpu_ids->data),
           static_cast<int *>(stage_gpu_slots->data),
@@ -500,10 +500,10 @@ struct EarlyReadyLane {
   // with the pending experts masked out — so it asserts Ready after its second finish_load().
   bool strategy_ready() const {
     if (!strategy) return true;
-    moestream::graph::ColdMoEInvocation inv;
+    zeromoe::graph::ColdMoEInvocation inv;
     inv.layer = trace_layer;
     inv.generation = calls + 1;
-    return strategy->state(inv) == moestream::graph::ColdMoEStrategy::State::Ready;
+    return strategy->state(inv) == zeromoe::graph::ColdMoEStrategy::State::Ready;
   }
 
   void run() {
@@ -513,7 +513,7 @@ struct EarlyReadyLane {
     if (status != cudaSuccess)
       GGML_ABORT("early-ready input event: %s", cudaGetErrorString(status));
     GGML_ASSERT(expected_pos < 0 || *position == expected_pos);
-    // MOESTREAM_GLM5NEXT_ROUTE_TRACE=<file>: one line per (decode token, layer): "pos layer id id ..." (all k routed ids).
+    // ZEROMOE_GLM5NEXT_ROUTE_TRACE=<file>: one line per (decode token, layer): "pos layer id id ..." (all k routed ids).
     if (FILE *route_trace = route_trace_file()) {
       std::fprintf(route_trace, "R %d", trace_layer);
       for (int i = 0; i < k; ++i) std::fprintf(route_trace, " %d", ids[i]);
@@ -521,7 +521,7 @@ struct EarlyReadyLane {
       std::fflush(route_trace);
     }
     const char *stage_no_request_env =
-        moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_NO_REQUEST");
+        zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_NO_REQUEST");
     const bool stage_no_request =
         stage_no_request_env && stage_no_request_env[0] == '1';
     if (stage_source && !stage_no_request)
@@ -597,8 +597,8 @@ struct EarlyReadyLane {
         Assist &A = assists[a];
         if (!A.graph) continue;
         // The second device's link is slower, so it only helps while the CPU still has about as much to do as that copy
-        // takes (MOESTREAM_GLM5NEXT_ASSIST2_KEEP experts stay on the CPU, default 1).
-        static const int keep = std::max(1, moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_ASSIST2_KEEP", 1));
+        // takes (ZEROMOE_GLM5NEXT_ASSIST2_KEEP experts stay on the CPU, default 1).
+        static const int keep = std::max(1, zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_ASSIST2_KEEP", 1));
         const int want = a == 0 ? std::min({A.slots, n_ready / 2, 8})
                                 : std::min({A.slots, std::max(0, n_ready - taken - keep), 8});
         for (; cursor >= 0 && n_assisted[a] < want; --cursor) {
@@ -765,5 +765,5 @@ struct EarlyReadyLane {
 // Scheduler hook (weak symbol in the patched ggml). Defined once, in
 // ggml_qwen4exp_graph.cpp: an `inline` definition is not emitted unless the
 // TU uses it, which silently disables early-ready.
-extern "C" int moestream_ggml_sched_early_cpu(ggml_backend_t backend, ggml_cgraph *graph,
+extern "C" int zeromoe_ggml_sched_early_cpu(ggml_backend_t backend, ggml_cgraph *graph,
                                               int64_t *wait_us, int64_t *compute_us);

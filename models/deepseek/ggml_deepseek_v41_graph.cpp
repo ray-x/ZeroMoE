@@ -19,10 +19,10 @@
 #include <future>
 #include <stdexcept>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 extern "C" cudaStream_t
-moestream_ggml_backend_cuda_get_stream(ggml_backend_t backend);
+zeromoe_ggml_backend_cuda_get_stream(ggml_backend_t backend);
 
 namespace glm5next_graph {
 
@@ -186,7 +186,7 @@ void v41_hc_post_node(ggml_tensor *dst, int ith, int, void *ud) {
 }
 
 bool v41_gpu_prefill_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_GPU_PREFILL");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_GPU_PREFILL");
 }
 
 // Dense tensors already uploaded by the engine are non-owning graph views.
@@ -209,12 +209,12 @@ ggml_tensor *v41_weight(FullGraph &g, ggml_context *ctx,
 }
 
 bool v41_env_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_FULL_GRAPH");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_FULL_GRAPH");
 }
 
 int v41_device_expert_layers() {
-  const char *v = moestream::graphcfg::env(
-      "MOESTREAM_DEEPSEEK_V41_GRAPH_PRELOAD_LAYERS");
+  const char *v = zeromoe::graphcfg::env(
+      "ZEROMOE_DEEPSEEK_V41_GRAPH_PRELOAD_LAYERS");
   if (!v || !v[0])
     return 0;
   char *end = nullptr;
@@ -228,10 +228,10 @@ int v41_device_expert_layers() {
 // Cast only dense tensors into reusable graph scratch; expert storage remains
 // the original quantized native cache, with no graph expert allocation.
 bool v41_native_f32() {
-  return moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH");
 }
 bool v41_prefill_f32() {
-  return v41_native_f32() || moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_PREFILL_F32");
+  return v41_native_f32() || zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_PREFILL_F32");
 }
 ggml_tensor *v41_matmul(ggml_context *ctx, ggml_tensor *w, ggml_tensor *x) {
   if (v41_prefill_f32() && !v41_native_f32() && ggml_is_quantized(w->type))
@@ -780,7 +780,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
     }
   } ram_pins(*ram, (size_t)c.n_experts);
   const bool async_upload = !site.cpu_cold_graph &&
-      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_ASYNC_UPLOAD");
+      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_ASYNC_UPLOAD");
   std::vector<ExpertLocation *> pending_locations((size_t)c.n_experts, nullptr);
   std::vector<ExpertLocation *> held_locations((size_t)c.n_experts, nullptr);
   site.cpu_experts.clear();
@@ -934,7 +934,7 @@ void v41_cache_routes_node(ggml_tensor *dst, const ggml_tensor *src,
       if (!has_pending) continue;
       cudaSetDevice(pool.device);
       cudaStream_t graph_stream =
-          moestream_ggml_backend_cuda_get_stream(pool.backend);
+          zeromoe_ggml_backend_cuda_get_stream(pool.backend);
       if (!graph_stream)
         throw std::runtime_error("DeepSeek async cache graph stream is unavailable");
       for (int expert = 0; expert < c.n_experts; ++expert) {
@@ -1194,7 +1194,7 @@ ggml_tensor *build_v41_cache_moe(FullGraph &g, ggml_tensor *cur, int layer,
   site->g = &g; site->layer = layer; site->tokens = token_ids;
   site->decode_pos = decode_pos;
   site->cpu_cold_graph = g.decode_mode && g.S == 1 &&
-      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_CPU_COLD");
+      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_CPU_COLD");
   for (int vi : topo.vault_gpus) {
     auto &dev = topo.devices[(size_t)vi];
     if (!dev.expert_cache_pool) continue;
@@ -1424,7 +1424,7 @@ bool build_v41_gpu_trunk(FullGraph &g, const int *token_ids) {
     if (!cur) return false;
     v41_mark_trace(g, "hc-ffn-pre", l, cur);
     ggml_tensor *ffn = nullptr;
-    if (moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+    if (zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
       ffn = build_v41_cache_moe(g, cur, l, token_ids);
     } else {
       ffn = ggml_map_custom1(g.ctx, cur, v41_moe_node, 1, site);
@@ -1587,7 +1587,7 @@ bool build_v41_graph(FullGraph &g, const int *token_ids) {
            g.n_layers, ggml_graph_n_nodes(g.graph),
            ggml_backend_sched_get_n_splits(g.sched),
            (double)g.graph_workspace_bytes / (1024.0 * 1024.0 * 1024.0),
-           moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH")
+           zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")
                && v41_gpu_prefill_enabled() ? 0 : g.n_layers,
            g.dsv41_engram_embeddings.size(),
            std::count_if(c.dsv41_engram_layer_ids.begin(),
@@ -1678,13 +1678,13 @@ bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
     const char *threads =
-        moestream::graphcfg::env("MOESTREAM_DEEPSEEK_V41_CPU_THREADS");
+        zeromoe::graphcfg::env("ZEROMOE_DEEPSEEK_V41_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu,
                                    threads ? std::max(1, std::atoi(threads)) : 6);
   }
   if (!g->cuda || !g->cpu)
     return false;
-  if (v41_native_f32() && !moestream_install_f32_quant_graph_hook()) {
+  if (v41_native_f32() && !zeromoe_install_f32_quant_graph_hook()) {
     engine.qwen4exp_full_graph_failure = "Native F32 graph needs the optional GGML CUDA F32 quant hook";
     LOG_ERROR("[DSV41-GPU-PREFILL] %s\n", engine.qwen4exp_full_graph_failure.c_str());
     return false;
@@ -1694,7 +1694,7 @@ bool deepseek_v41_full_graph_prepare(StreamingEngine &engine, int S,
   // callback path remains available as the numerical reference.
   std::vector<ggml_backend_t> backends{g->cuda};
   if (v41_gpu_prefill_enabled() &&
-      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
+      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH")) {
     for (int vi : engine.gpu->topology.vault_gpus) {
       const auto &dev = engine.gpu->topology.devices[(size_t)vi];
       if (dev.id != g->device && dev.expert_cache_pool) {

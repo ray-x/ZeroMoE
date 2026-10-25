@@ -759,13 +759,13 @@ static double g_diag_decode_layer_input_ms = 0.0;
 // writes exact F32 rows for one selected layer and prompt position. It is
 // disabled by default and intended only for A/A diagnosis.
 static const char *prefill_boundary_dump_base() {
-  static const char *value = std::getenv("MOESTREAM_PREFILL_BOUNDARY_DUMP");
+  static const char *value = std::getenv("ZEROMOE_PREFILL_BOUNDARY_DUMP");
   return value && *value ? value : nullptr;
 }
 
 static int prefill_boundary_dump_last_pos() {
   static const int value = [] {
-    const char *env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAST_POS");
+    const char *env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAST_POS");
     return env && *env ? std::atoi(env) : -1;
   }();
   return value;
@@ -773,7 +773,7 @@ static int prefill_boundary_dump_last_pos() {
 
 static int prefill_boundary_dump_first_pos() {
   static const int value = [] {
-    const char *env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_FIRST_POS");
+    const char *env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_FIRST_POS");
     return env && *env ? std::atoi(env) : 0;
   }();
   return value;
@@ -781,7 +781,7 @@ static int prefill_boundary_dump_first_pos() {
 
 static int prefill_boundary_dump_layer() {
   static const int value = [] {
-    const char *env = std::getenv("MOESTREAM_PREFILL_BOUNDARY_LAYER");
+    const char *env = std::getenv("ZEROMOE_PREFILL_BOUNDARY_LAYER");
     return env && *env ? std::atoi(env) : 0;
   }();
   return value;
@@ -1061,8 +1061,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   if (S > 1 && graph_model &&
       (pos_base == 0 || graph_model->supports_prefill_continuation(engine)) &&
       graph_model->enabled(engine, ModelGraphPhase::Prefill) &&
-      (engine.family_ops.family != ModelFamily::DeepSeek_V41 ||
-       graph_model->build(engine, prefill_graph_request)) &&
+      graph_model->build(engine, prefill_graph_request) &&
       graph_model->run(engine, prefill_graph_request)) {
     return;
   }
@@ -1213,7 +1212,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // runner, capture the actual wide state before hc_pre.  This is the
       // exact boundary that must equal llama.cpp's previous l_last plus its PLE
       // gated-value and causal-convolution outputs.  The helper is fully
-      // gated by MOESTREAM_PREFILL_BOUNDARY_DUMP and is a no-op normally.
+      // gated by ZEROMOE_PREFILL_BOUNDARY_DUMP and is a no-op normally.
       dump_prefill_hc_streams("hc_streams_post_layer_input", l, pos_base, S,
                               c.hc_mult, D);
       if (S == 1)
@@ -1451,7 +1450,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // GPU dispatch inside dense_ffn_gguf/moe_forward_gguf could return
     // before the work is really done, making t_moe_expert under-report
     // vs. this wall-clock measurement of the same call).
-    // MOESTREAM_PROBE_DUMP=<dir>: training data for a learned next-layer expert predictor (diagnostic only). For every
+    // ZEROMOE_PROBE_DUMP=<dir>: training data for a learned next-layer expert predictor (diagnostic only). For every
     // MoE layer l, append the post-attention residual rows x_l (S x D, f32) and layer l's REAL selection scores s_l
     // (S x n_experts, f32: gate(logits)+bias, what the router ranks) so x_l can be paired with s_{l+1} offline.
     // Re-take the ATTN-PILOT snapshot right before the FFN. The copy taken as soon as attention returns (above) precedes the point
@@ -1460,7 +1459,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     if (S >= 1 && !scratch.pilot_attn_snapshot.empty())
       std::memcpy(scratch.pilot_attn_snapshot.data(), hidden_states + (size_t)(S - 1) * D, (size_t)D * sizeof(float));
     std::vector<float> probe_last_scores; // layer l's score row of the last token (route-agreement check)
-    if (static const char *probe_dir = std::getenv("MOESTREAM_PROBE_DUMP");
+    if (static const char *probe_dir = std::getenv("ZEROMOE_PROBE_DUMP");
         probe_dir && probe_dir[0] && l >= c.first_dense && c.n_experts > 0 &&
         engine.family_ops.family != ModelFamily::Qwen4Exp) {
       const std::string norm_key = "blk." + std::to_string(l) + ".ffn_norm.weight";
@@ -1536,7 +1535,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
     // A/A prefill diagnostic: capture the plain routed FFN result before HC
       // post-combine.  llama.cpp's qwen4exp graph exposes the corresponding
     // ffn_moe_out tensor, so this separates CPU-MoE math from the subsequent
-    // HC reduction.  Opt-in through MOESTREAM_PREFILL_BOUNDARY_DUMP; the
+    // HC reduction.  Opt-in through ZEROMOE_PREFILL_BOUNDARY_DUMP; the
     // normal path does no dump or extra device copy.
     if (S == 1)
       dump_prefill_boundary("moe_out_host", l, pos_base,
@@ -1614,7 +1613,7 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       // 48-layer pass. Read it back right here instead, so a NaN at collapse
       // can be attributed to this exact point instead of "somewhere in 48
       // layers".
-      if (l == c.n_layers - 1 && std::getenv("MOESTREAM_LAST_LAYER_HC_TRACE")) {
+      if (l == c.n_layers - 1 && std::getenv("ZEROMOE_LAST_LAYER_HC_TRACE")) {
         std::vector<float> probe((size_t)S * D * c.hc_mult);
         if (GgmlHcRunner::instance().download_streams(probe.data(), S)) {
           size_t nan_count = 0;

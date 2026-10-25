@@ -9,7 +9,7 @@
 #include <map>
 #include <random>
 #include <thread>
-using namespace moestream::offload;
+using namespace zeromoe::offload;
 using clk = std::chrono::steady_clock;
 static double secs(clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); }
 int main(int argc, char **argv) {

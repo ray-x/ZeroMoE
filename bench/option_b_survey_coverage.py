@@ -3,7 +3,7 @@
 
 usage: bench/option_b_survey_coverage.py [K ...]      (default: the K values in docs/option-b-vram-budget-2026-10-05.md)
 
-Reads tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap (text lines "layer expert count"; every layer routes the
+Reads tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap (text lines "layer expert count"; every layer routes the
 same total, 159,000, so counts compare across layers) and prints, for each K: the share of all 24,576 experts, the expert arena size
 (1,382,400 bytes per expert), the free VRAM at decode predicted from the MEASURED baseline (K=8421 -> 9.36 GiB free once the legacy
 cache is off), and the survey coverage = share of routed traffic whose expert is in the top-K pool. Coverage is a prediction from
@@ -13,7 +13,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SURVEY = ROOT / "tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap"
+SURVEY = ROOT / "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
 SLAB_BYTES = 1_382_400            # per-expert slab (Q2_0, gate+up+down), ~1.318 MiB
 BASELINE_K, BASELINE_FREE_GIB = 8421, 9.36   # measured: right-sized 0/44/4, legacy cache off, steady-state decode
 LAYERS, EXPERTS = 48, 512

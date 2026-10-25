@@ -23,15 +23,15 @@ Sizes: `ggml_qwen4exp_graph.cpp` 16,097 -> ~11,200 lines; `ggml_glm5next_graph.c
 
 ## Behaviour changes to know about
 
-- **GLM CPU lane is ON by default** (`MOESTREAM_GLM5NEXT_EARLY_READY=0` opts out). Four interleaved pairs, same binary:
+- **GLM CPU lane is ON by default** (`ZEROMOE_GLM5NEXT_EARLY_READY=0` opts out). Four interleaved pairs, same binary:
   4.53 -> 4.62 tok/s (+1.9%, 4/4 wins), logits and tokens identical. Applies only to offloaded GLM layers on
   families whose `FamilySpec::supports_cpu_lane()` is true; declines when pilot staging is active or `hot1` is non-empty.
 - **Removed features** (all were off by default): CUDA conditional-node master graph, Phase 2 (3-graph per-token GPU/CPU dispatch),
   completion-staged/storage-service path, Phase 1 static partial-layer GPU commit (`qwen4exp_partial_layer_committed` is now unused),
   `cuda/qwen4exp_master_graph.cu` (its staging-ring kernels live in `cuda/qwen_stage_kernels.cu`),
-  `MOESTREAM_QWEN4EXP_STORAGE_SERVICE` / `COMPLETION_GRAPH` / `PARTIAL_LAYER_PHASE2` env knobs.
+  `ZEROMOE_QWEN4EXP_STORAGE_SERVICE` / `COMPLETION_GRAPH` / `PARTIAL_LAYER_PHASE2` env knobs.
   Tag `gf-before-phase2-removal` marks the tree before removal (it predates steps 2-4; use `7a78079` + `git show` for the old code).
-- `moestream_ggml_sched_early_cpu` is now defined once in `ggml_qwen4exp_graph.cpp`. An `inline` definition in the shared header is not
+- `zeromoe_ggml_sched_early_cpu` is now defined once in `ggml_qwen4exp_graph.cpp`. An `inline` definition in the shared header is not
   emitted unless used and silently disables early-ready (this broke the first Step 4 build; the Qwen gate caught it).
 
 ## Not done / open
@@ -48,15 +48,15 @@ Sizes: `ggml_qwen4exp_graph.cpp` 16,097 -> ~11,200 lines; `ggml_glm5next_graph.c
 ## How to re-run the gates
 
 - Frozen baseline binary: `~/work/gf-baseline/moestream-master-b8cf7ff` (built from master `b8cf7ff` against the prebuilt accepted ggml
-  `~/Projects/moestream-build-upstream-master/ggml-build`, `-DMOESTREAM_GGML_PREBUILT_DIR=...`, CUDA arch 75).
+  `~/Projects/moestream-build-upstream-master/ggml-build`, `-DZEROMOE_GGML_PREBUILT_DIR=...`, CUDA arch 75).
 - Qwen: `bench/graph_framework_step.sh <name> <candidate-binary>` -> `logs/graph_framework/<name>/{correctness,free,perf}`;
   needs `logs/graph_framework/inputs/{prompt,Q2}.tokens` (copied from `logs/quant_decode_compare_chat_20261004/`).
 - GLM: `ARMS="lru lane" bench/graph_framework_glm_gate.sh <name> <candidate-binary>`; set `WAIT_IDLE` (seconds) for the Qwen harness.
 - Both need the 3090 free of other compute processes and hold `~/work/.no-arms` while running (the prefetch session's queue yields to it).
   A foreign process appearing mid-run aborts the Qwen harness; re-run.
 - Noise floor: about +-2.4% per six-pair mean (baseline binary against itself: 32.6 vs 33.4).
-- Native suite: configure a tests tree with `-DMOESTREAM_EXLLAMAV3_SRC=~/Projects/exllamav3/exllamav3/exllamav3_ext -DCMAKE_CUDA_ARCHITECTURES=86`
-  and run `moestream_tests`; without the EXL3 source the EXL3 CUDA test fails (build-config gap, not a code bug).
+- Native suite: configure a tests tree with `-DZEROMOE_EXLLAMAV3_SRC=~/Projects/exllamav3/exllamav3/exllamav3_ext -DCMAKE_CUDA_ARCHITECTURES=86`
+  and run `zeromoe_tests`; without the EXL3 source the EXL3 CUDA test fails (build-config gap, not a code bug).
 
 ## Gotchas hit
 

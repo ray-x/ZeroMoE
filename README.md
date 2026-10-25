@@ -1,8 +1,8 @@
-# MoeStream
+# ZeroMoE
 
-MoeStream is an ultra-fast, zero-dependency inference engine written from the ground up in native C++ and CUDA. It is specifically designed to stream frontier-class Mixture-of-Experts (MoE) GGUF models on consumer-grade hardware.
+ZeroMoE is an ultra-fast, zero-dependency inference engine written from the ground up in native C++ and CUDA. It is specifically designed to stream frontier-class Mixture-of-Experts (MoE) GGUF models on consumer-grade hardware.
 
-By implementing strict graph-level memory isolation, MoeStream maps and holds core persistent network blocks directly in physical VRAM and RAM, while dynamically streaming massive routed expert matrices directly from NVMe storage on an on-demand basis.
+By implementing strict graph-level memory isolation, ZeroMoE maps and holds core persistent network blocks directly in physical VRAM and RAM, while dynamically streaming massive routed expert matrices directly from NVMe storage on an on-demand basis.
 
 ---
 
@@ -19,7 +19,7 @@ By implementing strict graph-level memory isolation, MoeStream maps and holds co
 ## 📂 Repository Layout Tree
 
 ```text
-MoeStream/
+ZeroMoE/
 ├── CMakeLists.txt                 # Unified C++/CUDA compiler configuration
 ├── setup.sh                       # Automated installation and toolchain builder
 ├── README.md                      # Engine configuration documentation
@@ -68,12 +68,12 @@ cmake --build build -j$(nproc)
 
 AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
 AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
-failure. Configure with `-DMOESTREAM_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
-both MoEStream and ggml CPU kernels.
+failure. Configure with `-DZEROMOE_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
+both ZeroMoE and ggml CPU kernels.
 
 ### macOS / CPU-only build
 
-The main `moestream` engine requires NVIDIA CUDA and cannot build on macOS.
+The main `zeromoe` engine requires NVIDIA CUDA and cannot build on macOS.
 However, the root `CMakeLists.txt` automatically detects Apple platforms and
 switches to a CPU-only build that compiles:
 
@@ -100,24 +100,24 @@ SDOT for the f32 and integer-dot-product paths.  For optimized quantized
 (MOE) expert decoding on macOS, build with ggml integration:
 
 ```bash
-cmake -S . -B build -DMOESTREAM_USE_GGML=ON -DMOESTREAM_GGML_TAG=b3923
+cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_GGML_TAG=b3923
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
 #### ggml-cuda / full-graph decode build
 
-The experimental ggml-backed full-graph prefill/decode path (`MOESTREAM_QWEN4EXP_FULL_GRAPH*` env vars at runtime) requires linking ggml's CUDA backend:
+The experimental ggml-backed full-graph prefill/decode path (`ZEROMOE_QWEN4EXP_FULL_GRAPH*` env vars at runtime) requires linking ggml's CUDA backend:
 
 ```bash
-cmake -S . -B build -DMOESTREAM_USE_GGML=ON -DMOESTREAM_USE_GGML_CUDA=ON
+cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
 cmake --build build -j$(nproc)
 ```
 
-`MOESTREAM_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `MOESTREAM_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DMOESTREAM_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
+`ZEROMOE_ENABLE_CUDA_GRAPHS` (default **ON**) enables ggml's CUDA graph capture/replay for this path. ggml's own default for `GGML_CUDA_GRAPHS` is OFF for any consumer other than llama.cpp itself, so without this, a plain `ZEROMOE_USE_GGML_CUDA=ON` build silently compiles out CUDA graph capture — every decode step then falls back to launching each graph node's kernel individually instead of replaying one captured graph per split. Measured impact on this project's Qwen4Exp full-graph decode: **~20 tok/s with graphs enabled vs. ~8 tok/s silently disabled**, on identical hardware/model/config. Opt out with `-DZEROMOE_ENABLE_CUDA_GRAPHS=OFF` if you need to A/B against the non-graph path.
 
 #### Runtime settings (host-node mode, CPU threads, CUDA schedule)
 
-`MOESTREAM_QWEN4EXP_HOST_NODE`, `MOESTREAM_QWEN_CPU_THREADS` and `MOESTREAM_CUDA_SCHEDULE` change how the Qwen4Exp CPU/GPU
+`ZEROMOE_QWEN4EXP_HOST_NODE`, `ZEROMOE_QWEN_CPU_THREADS` and `ZEROMOE_CUDA_SCHEDULE` change how the Qwen4Exp CPU/GPU
 decode path executes and interact with each other (host-node mode automatically selects a blocking CUDA wait, +24%). Values,
 defaults, measurements and recommended combinations are in [docs/runtime-settings.md](docs/runtime-settings.md).
 
@@ -148,7 +148,7 @@ This checkpoint directory has no HF `config.json`, so the provided profile uses
 Qwen GGUF. Its GGUF weight payloads are not used for EXL3 inference.
 
 ```bash
-./build_ggmlcuda/moestream --config configs/qwen4exp_exl3_decode.toml \
+./build_ggmlcuda/zeromoe --config configs/qwen4exp_exl3_decode.toml \
     --prompt "Hello" --ngen 8
 ```
 
@@ -156,7 +156,7 @@ Qwen GGUF. Its GGUF weight payloads are not used for EXL3 inference.
 For GPU projections, use a CUDA build and `configs/qwen4exp_exl3_gpu.toml`:
 
 ```bash
-./build_ggmlcuda/moestream --config configs/qwen4exp_exl3_gpu.toml \
+./build_ggmlcuda/zeromoe --config configs/qwen4exp_exl3_gpu.toml \
     --prompt "Hello" --ngen 8
 ```
 
@@ -199,7 +199,7 @@ A warmed comparison on the current standard 26/22 profile measured 6.39 and
 6.41 tok/s with default OpenMP waiting, versus 7.10 tok/s with
 `OMP_WAIT_POLICY=PASSIVE` and CUDA `auto`. All 128 token IDs and printed
 selected-token logits matched. Use the passive launch environment for
-MoEStream's native EXL3 hybrid profile; it does not apply to the delegated
+ZeroMoE's native EXL3 hybrid profile; it does not apply to the delegated
 ExLlamaV3 backend. [The waiting-policy report](docs/exl3-wait-policy-2026-10-05.md)
 contains raw logs and the cold-cache result excluded from the comparison.
 
@@ -239,7 +239,7 @@ parity tests cover integer bitrates 1–8, multiple rows, optional bias and cach
 eviction. To run just those tests:
 
 ```bash
-MOESTREAM_TEST_EXL3_ONLY=1 OMP_NUM_THREADS=4 ./build_ggmlcuda/moestream_tests
+ZEROMOE_TEST_EXL3_ONLY=1 OMP_NUM_THREADS=4 ./build_ggmlcuda/zeromoe_tests
 ```
 
 To benchmark the EXL3 CUDA kernels without opening a model, use synthetic
@@ -278,7 +278,7 @@ make bench-exl3-hc BUILD_DIR=build_ggmlcuda ARGS="--device 0 --blocks 97 --itera
 ```
 
 Add `--omp-threads 12` to prime an OpenMP team before each GPU dispatch and
-compare `OMP_WAIT_POLICY` and `MOESTREAM_CUDA_SCHEDULE` settings. The latter
+compare `OMP_WAIT_POLICY` and `ZEROMOE_CUDA_SCHEDULE` settings. The latter
 is now honored by the EXL3 executor as well as the GGUF path.
 
 The resident 97-block working set measured 16.910 ms for separate projection
@@ -315,9 +315,9 @@ path still runs through the CPU decoder rather than Bee's full GPU graph.
 Launch the standalone engine directly by pointing it at your local GGUF model, either via a TOML config (preferred) or legacy CLI flags:
 
 ```bash
-./build/moestream --config configs/single_gpu.toml
+./build/zeromoe --config configs/single_gpu.toml
 # or, legacy CLI flags:
-./build/moestream --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx 4096
+./build/zeromoe --model /nvme/glm-5.2-iq2_m.gguf --ram 48.0 --ctx 4096
 ```
 
 #### Command-Line Arguments
@@ -330,7 +330,7 @@ test, plus reusable GPU zero-state buffers; size depends on prompt shape and
 placement). Fresh prefills use immutable CUDA zero-state inputs instead of
 clearing and uploading recurrent state on every request. KV and PLE host snapshots remain
 available. Prompt caching, MTP, and compact expert staging use the host path.
-`MOESTREAM_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` overrides the TOML setting.
+`ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF=0` or `1` overrides the TOML setting.
 See [the state-handoff A/B guide](tests/qwen4exp_state_handoff_howto.md) for
 reproduction commands, measured timings, and the memory tradeoff.
 Full-GPU Qwen graphs omit the artificial CPU staging node and compute the
@@ -340,7 +340,7 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | Flag | Description |
 | --- | --- |
 | `--config <file>` | Load engine config from a TOML file (preferred over legacy CLI flags). |
-| `--gen-config [output.toml]` | Generate a sample config file (default `moestream_config.toml`) and exit. |
+| `--gen-config [output.toml]` | Generate a sample config file (default `zeromoe_config.toml`) and exit. |
 | `--model <path>` | Path to a GGUF model file or directory (legacy CLI mode, used without `--config`). |
 | `--ram <GB>` | Strict RAM budget in GB (default: auto-detect 88% of free system memory). |
 | `--ctx <N>` | Maximum context size / token window (default: 4096). |
@@ -355,10 +355,10 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--verbose-moe` | Log every MoE host-cache hit (high volume, debug only). |
 | `--promote-threshold <N>` | Number of host re-hits before an async host→device (H2D) promote (default: 1). |
 | `--pin-threshold <N>` | VRAM-resident hit-count before permanently pinning an expert (never evicted; default: 8, `0` = off). |
-| `--pin-file <file>` | Usage-frequency file for VRAM hot-set preload at startup (default: `.moestream_usage`). |
+| `--pin-file <file>` | Usage-frequency file for VRAM hot-set preload at startup (default: `.zeromoe_usage`). |
 | `--expert-fetch-threads <N>` | OMP threads for parallel disk reads of a layer's top-k cache misses (default: 4). |
 | `--raw-prompt` | Skip the chat-template wrap; tokenize stdin verbatim. Needed by `api_server.py` (which already applies its own formatting) and useful for token-count-fair benchmarking against other engines. |
-| `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — MoEStream never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
+| `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — ZeroMoE never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
 | `--log-path <file>` | Redirect logging to a file instead of stderr. |
 | `--log-level <lvl>` | `VERBOSE` \| `DEBUG` \| `INFO` (default) \| `WARN` \| `ERROR`. |
 | `--trace-filter <tags>` | Comma-separated tag prefixes (e.g. `HC,MLA`) restricting VERBOSE tensor tracing to just those checkpoints; requires `--log-level VERBOSE`. Empty (default) traces everything. See `include/tensor_trace.hpp` / CLAUDE.md §5. |
@@ -369,7 +369,7 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 
 ### Deploying the Anthropic-Compatible API
 
-MoeStream includes a production-grade FastAPI wrapper that maps external HTTP network streams straight into your local executable's stdin/stdout pipe channels. It matches the native Anthropic `/v1/messages` format scheme, serving Server-Sent Events (SSE) token chunks asynchronously.
+ZeroMoE includes a production-grade FastAPI wrapper that maps external HTTP network streams straight into your local executable's stdin/stdout pipe channels. It matches the native Anthropic `/v1/messages` format scheme, serving Server-Sent Events (SSE) token chunks asynchronously.
 
 To spin up the network gateway, activate your virtual workspace environment and run the application server:
 
@@ -395,7 +395,7 @@ curl -X POST http://localhost:8000/v1/messages \
 
 ## Testing
 
-MoeStream ships two test harnesses, split by what hardware they need.
+ZeroMoE ships two test harnesses, split by what hardware they need.
 
 ### Full engine suite (Linux + CUDA + AVX-512)
 
@@ -461,6 +461,84 @@ engine at it — it's the pre-flight completeness gate (see `tools/README.md`).
 ---
 
 ⚙️ Advanced 2-Bit Quantization (IQ2_M)
-MoeStream includes dedicated lookup vectors built explicitly to unlock and execute heavily compressed 2-bit IQ2_M model variations.
+ZeroMoE includes dedicated lookup vectors built explicitly to unlock and execute heavily compressed 2-bit IQ2_M model variations.
 
 Rather than running heavy tensor conversions across your PCIe boundaries, the engine reads packed index fields directly from your storage blocks, unpacks scale registers inside memory-aligned cache steps, and feeds your execution pipelines with minimal latency.
+
+## Validating a new model, or a change to a model's FFN flow
+
+Throughput numbers say nothing about correctness: a broken graph can look faster. Check correctness first, then
+speed. Use the layers below from cheapest to most expensive; a change to attention, routing, the MoE/FFN block,
+quant handling or expert placement should pass all that apply.
+
+### 1. Unit and structure checks (seconds, no model)
+
+```bash
+make quant_table_test graph_settings_test layer_plan_test    # in your build dir
+./quant_table_test && ./graph_settings_test tests/graph_settings_defaults.snapshot && ./layer_plan_test
+make moe_conformance                                         # shared-code rules (no family checks, no direct env reads)
+```
+
+### 2. Logits against llama.cpp (the oracle for a new model)
+
+llama.cpp runs the same GGUF on the CPU; ZeroMoE dumps the raw decode logits (before repetition penalty and
+sampling) with `ZEROMOE_DECODE_LOGITS_DUMP`. `tools/ling_llama_logits.cpp` is the reference harness (greedy,
+one logits row per step, same binary row format) and `tools/compare_logits.py` compares the two files.
+
+```bash
+scripts/validate_vs_llama.sh <model.gguf> <zeromoe.toml> "The capital of France is" 8 ./build_master/zeromoe
+# env: LLAMA_SRC, LLAMA_BUILD (an UNPATCHED llama.cpp build), DEVS, MS_ENV="ZEROMOE_X=..." for model-specific knobs
+```
+
+It builds the harness once (`build_logits_ref`), runs llama.cpp, then ZeroMoE with `--raw-prompt --temp 0`, and
+prints one line per step:
+
+```
+step=3 vocab=152576 max_abs=0.41 rmse=0.07 cosine=0.99981 top1=374/374 top1_match=True
+```
+
+How to read it:
+- **Step 0 is the prompt's last-token logits**: it isolates prefill + the whole stack, with no accumulated error.
+  Steps 1+ follow each engine's own greedy choices, so once the two pick different tokens the rows are no longer
+  comparable. Stop reading at the first `top1_match=False`.
+- **Pass:** `top1_match=True` for every step before any divergence and `cosine` above about 0.999. `max_abs` and
+  `rmse` are not zero: different kernels, different summation order, and (for quantized experts) different
+  CPU/GPU quant paths. A cosine near 0.9 or a wrong first token is a real bug (wrong RoPE, router, scale, shared
+  expert, or a quant type with the wrong block size).
+- A near-tie can flip top-1 legitimately. Compare the logit gap of the two candidates in the dump before calling
+  it a bug, and check a second prompt.
+- Keep both prompts short at first (5-20 tokens) so a mismatch points at the stack, not at chunking.
+- The machine must be idle: llama.cpp loads the whole model into RAM on the CPU.
+
+### 3. Bisecting a mismatch
+
+- Same graph, different placement: run once with everything on one GPU and once with the hot/cold split. If only
+  one differs, the bug is in placement or the cold path, not the math (the MiMo NaN from a repeated placeholder id
+  was found this way).
+- `ZEROMOE_MIMO2_NODE_TRACE=2` (MiMo) reports the first non-finite node; `trace_abort_on_nan = true` in the TOML
+  (see `include/tensor_trace.hpp`) does it for the layered path. Do not time a run with a trace mode on: it
+  disables the early-ready bridge.
+- Check tensor sizes first: `./quant_table_test` and the `[PREFLIGHT]` lines at startup flag a tensor type that is
+  missing from `memory/quant_table.hpp`.
+
+### 4. Before/after a change to an existing model (the regression witness)
+
+For a change inside one model's FFN or MoE flow, compare your tree against `master` on the **same prompt, greedy,
+same hardware**, and require the generated tokens to match (`ZEROMOE_GENERATED_TOKEN_FILE=<file>` writes them):
+
+```bash
+bench/ling/reference-audit/gate.sh <binary> <tag>     # Ling: 32 tokens, [REQUEST-DECODE-OUTPUT] rate (baseline 10.07 tok/s)
+bench/regression_gate.sh <binary> --models dsv41      # DeepSeek-V4.1, 64 tokens (band 3.5-4.6 tok/s)
+bench/regression_gate.sh <binary> --models qwen38,glm53flash,ling31,dsv41,glm53   # all five, ~15 min
+```
+
+- Tokens must be identical when only structure changed (refactor). When the numerics changed on purpose (a new
+  kernel, a different hot set), tokens may diverge after some steps; then read the text and run step 2.
+- Speed: the first run after a fresh ggml build JIT-compiles for the sm_120 GPU and is 2-10x slow; use a warm run
+  and an ABBA order (A, B, B, A), because the box's load moves results by several percent.
+- Compare tokens only between binaries built from the same tree and ggml (`docs/build-ggml.md`).
+
+### 5. Recording the result
+
+Put the oracle comparison (prompt, steps, cosine range, first divergence) and the gate numbers in
+`docs/models/<model>.md`, and update `docs/perf-baselines.md` when a number improves or a band moves.

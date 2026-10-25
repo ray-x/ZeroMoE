@@ -20,10 +20,10 @@ KV/GDN/PLE storage. The current dirty workspace already contains this
 
 ## Verification on the isolated 521d67a branch
 
-The branch binary built with `cmake --build build_ggmlcuda --target moestream
+The branch binary built with `cmake --build build_ggmlcuda --target zeromoe
 -j10`. To avoid recompiling an unchanged GGML CUDA backend, this temporary
 build linked the existing GGML 0.22 libraries built from the matching
-Beellama source; the MoEStream target itself compiled and linked in the
+Beellama source; the ZeroMoE target itself compiled and linked in the
 isolated worktree. GGML CUDA graph support was confirmed active in the runtime
 log.
 
@@ -55,7 +55,7 @@ not establish that the staged-GPU path is ready to become the default.
 ## Reproduction artifacts
 
 All generated logs and hidden-state files were retained in
-`/tmp/moestream_bugfix_521d67a_20261007/logs/`:
+`/tmp/zeromoe_bugfix_521d67a_20261007/logs/`:
 
 - `phase2_bugfix_hidden_pair_20261007_r5/` is the pre-state-sharing reference.
 - `phase2_bugfix_hidden_pair_20261007_r7/` has the post-fix 64-token logits,

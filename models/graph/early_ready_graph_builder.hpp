@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 struct EarlyReadyGraphBuildSpec {
   ggml_backend_sched_t sched = nullptr;
@@ -120,4 +120,4 @@ inline std::unique_ptr<EarlyReadyLane> build_early_ready_graph_lane(
   return lane;
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

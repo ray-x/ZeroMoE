@@ -3,7 +3,7 @@
 ## Implementation
 
 Ling 3.1 Flash (`bailingmoe3`) has an opt-in full-graph path through
-`MOESTREAM_LING_FULL_GRAPH=1 MOESTREAM_LING_NATIVE_GRAPH=1`. It builds one
+`ZEROMOE_LING_FULL_GRAPH=1 ZEROMOE_LING_NATIVE_GRAPH=1`. It builds one
 CPU callback node per layer and delegates attention, dense FFN, and MoE work
 to the existing `FamilyOps`, `dense_ffn_gguf`, and `moe_forward_gguf` paths.
 The graph owns no expert storage. RAM and VRAM expert ownership stays with
@@ -19,7 +19,7 @@ expert IDs and does not bind layer ranges to devices.
 Graph startup now treats this Ling path as a native-cache graph: it retains
 the usage-ranked preload and uses the existing dense-weight pool instead of
 allocating a graph-owned copy. The older GLM-derived graph remains available
-when `MOESTREAM_LING_NATIVE_GRAPH` is unset. Ling's legacy partial graph also
+when `ZEROMOE_LING_NATIVE_GRAPH` is unset. Ling's legacy partial graph also
 keeps batched MMQ negative-route skipping disabled because that policy
 regressed this model's short prefill; the single-token MMVQ skip remains.
 
@@ -158,8 +158,8 @@ The 32-token A/B used the same raw two-token `Hi there` prompt that generated
 the fixed usage profile, `/tmp/ling-3.1-flash-usage-fullgraph.pin` (5,879
 records). The profile was left unchanged. Context was 64, generation was
 greedy, and the opt-in flags were
-`MOESTREAM_LING_FULL_GRAPH=1`, `MOESTREAM_LING_NATIVE_GRAPH=1`, and
-`MOESTREAM_LING_HYBRID_CUDA_GRAPH=1`.
+`ZEROMOE_LING_FULL_GRAPH=1`, `ZEROMOE_LING_NATIVE_GRAPH=1`, and
+`ZEROMOE_LING_HYBRID_CUDA_GRAPH=1`.
 
 The test used `host_ram_gb=90`, `MemoryMax=100G`, and `MemorySwapMax=0`.
 Startup admitted 116.9 GB available against the engine's 111.5 GB requirement.

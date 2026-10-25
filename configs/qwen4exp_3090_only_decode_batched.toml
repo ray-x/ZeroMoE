@@ -38,8 +38,8 @@ expert_fetch_threads = 10
 omp_max_threads      = 12
 prefetch_worker_threads = 4
 
-pin_file           = ".moestream_usage_qwen4exp_480"
-prefill_pin_file   = ".moestream_usage_qwen4exp_prefill_480"
+pin_file           = ".zeromoe_usage_qwen4exp_480"
+prefill_pin_file   = ".zeromoe_usage_qwen4exp_prefill_480"
 freeze_usage_stats = true
 pin_topk_per_layer   = 1
 pinned_vram_capacity = 7680

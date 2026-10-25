@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-diff_trace.py — localize where MoEStream's residual-stream |hidden| norm
+diff_trace.py — localize where ZeroMoE's residual-stream |hidden| norm
 diverges from colibri's, per layer and per sub-block.
 
 Both engines emit, at log_level VERBOSE, one line per (layer, stage):
@@ -8,21 +8,21 @@ Both engines emit, at log_level VERBOSE, one line per (layer, stage):
     [TRACE l=N] post-attn|hidden|=X        # residual after the attn residual-add
     [TRACE l=N] post-ffn |hidden|=X        # residual after the FFN/MoE residual-add
 
-colibri and MoEStream print the SAME lines (colibri lacks the |attn_out|/|moe_out|
+colibri and ZeroMoE print the SAME lines (colibri lacks the |attn_out|/|moe_out|
 inner magnitudes, but the |hidden| field is in the same place). So a single regex
 parses both. We take the FIRST occurrence of each (layer, stage) — i.e. the
 PREFILL pass of the shared prompt — so sampling divergence later in decode
 doesn't pollute the comparison.
 
 Usage:
-    ./diff_trace.py <moestream_verbose.log> <colibri_trace.log>
+    ./diff_trace.py <zeromoe_verbose.log> <colibri_trace.log>
 
-Output: a per-layer table of |hidden| for each stage + the MoEStream/colibri
+Output: a per-layer table of |hidden| for each stage + the ZeroMoE/colibri
 ratio, and the layer indices where the ratio first crosses 2x / 5x / 10x / 30x
 (in either direction — colibri larger counts too).
 
 CAVEAT: the two engines use DIFFERENT weight quantizations of the same base
-model (MoEStream = GGUF IQ2_M; colibri = its own int4 requant of the FP8
+model (ZeroMoE = GGUF IQ2_M; colibri = its own int4 requant of the FP8
 checkpoint). So residual norms will NOT be bit-identical even with correct math
 — expect per-layer ratios to wander within ~0.5x–2x. A SUSTAINED, ACCELERATING
 drift toward 10x–30x is the bug signal (the colibri author's prior observation:
@@ -32,8 +32,8 @@ import re
 import sys
 
 STAGES = ["in", "post-attn", "post-ffn"]
-# Matches both MoEStream "[VERBOSE] [TRACE l=N] ..." and colibri "[TRACE l=N] ...".
-# Note: MoEStream's post-attn/post-ffn lines carry an inner magnitude BEFORE
+# Matches both ZeroMoE "[VERBOSE] [TRACE l=N] ..." and colibri "[TRACE l=N] ...".
+# Note: ZeroMoE's post-attn/post-ffn lines carry an inner magnitude BEFORE
 # |hidden| (e.g. "... post-ffn  |moe_out|=0 |hidden|=0.31"), so we can't use
 # [^|]* between the stage and |hidden| — use non-greedy .*? anchored on |hidden|=.
 LINE = re.compile(
@@ -70,12 +70,12 @@ def main():
         sys.exit(f"no [TRACE] lines found in {sys.argv[2]}")
 
     layers = sorted(set(l for (l, _) in ms) | set(l for (l, _) in co))
-    print(f"MoEStream layers: {min(l for l,_ in ms)}–{max(l for l,_ in ms)} "
+    print(f"ZeroMoE layers: {min(l for l,_ in ms)}–{max(l for l,_ in ms)} "
           f"({len(set(l for l,_ in ms))} layers)")
     print(f"colibri    layers: {min(l for l,_ in co)}–{max(l for l,_ in co)} "
           f"({len(set(l for l,_ in co))} layers)")
     print()
-    print(f"{'layer':>5} {'stage':>9} {'moestream':>12} {'colibri':>12} {'ratio MS/co':>12}")
+    print(f"{'layer':>5} {'stage':>9} {'zeromoe':>12} {'colibri':>12} {'ratio MS/co':>12}")
     print("-" * 54)
 
     thresholds = {2.0: None, 5.0: None, 10.0: None, 30.0: None}  # first layer crossing

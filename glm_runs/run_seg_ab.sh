@@ -1,10 +1,10 @@
 #!/bin/bash
 # usage: [POLICY=lru|seg] [PREFETCH=0..8] [PINNED=0.5] [BYTECAP=0|1] [PROBATION=0.25] [DDR=32] run_seg_ab.sh NAME
 # GLM-5.3-Flash SSD offload, 3090 only, 5 prompt/decode rounds with different topics in one session. Refuses to run
-# while nvtop/htop or another moestream is up (they perturb timing).
+# while nvtop/htop or another zeromoe is up (they perturb timing).
 B=$(cd "$(dirname "$0")" && pwd); N=$1; cd "$(dirname "$B")"
 if [ -z "$ALLOW_MONITORS" ] && { pgrep -x nvtop >/dev/null || pgrep -x htop >/dev/null; }; then echo "refusing: nvtop/htop running" >&2; exit 3; fi
-for w in $(seq 1 120); do pgrep -x moestream >/dev/null || break; sleep 5; done
+for w in $(seq 1 120); do pgrep -x zeromoe >/dev/null || break; sleep 5; done
 python3 - <<'PY'
 import os,glob
 for f in glob.glob('/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-*.gguf')+['/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf']:
@@ -13,22 +13,22 @@ PY
 sed "s#baseline.engine.log#pinab/$N.engine.log#" $B/spread_off.toml > $B/pinab/$N.toml
 if [ -n "$HOSTRAM" ]; then sed -i "s#^host_ram_gb *=.*#host_ram_gb = $HOSTRAM#; s#^ram_pinned_budget_gb *=.*#ram_pinned_budget_gb = $HOSTRAM#" $B/pinab/$N.toml; fi
 [ -n "$MODEL_DIR" ] && sed -i "s#^model_path *=.*#model_path = \"$MODEL_DIR\"#" $B/pinab/$N.toml
-export MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=${DDR:-32}
-export MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=${PINNED:-0.5} MOESTREAM_GLM5NEXT_OFFLOAD_POLICY=${POLICY:-lru}
-export MOESTREAM_GLM5NEXT_OFFLOAD_PROBATION=${PROBATION:-0.25} MOESTREAM_GLM5NEXT_OFFLOAD_BYTE_CAP=${BYTECAP:-0}
-export MOESTREAM_GLM5NEXT_OFFLOAD_STORE=${STORE:-/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf}
-export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=${MODEL_DIR:-/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf}
-export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=$(dirname "$B")/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
-export MOESTREAM_GLM5NEXT_OFFLOAD_THP=${THP:-0}
-[ -n "$LAYER_TIMING" ] && export MOESTREAM_GLM5NEXT_GRAPH_LAYER_TIMING=1
+export ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=${DDR:-32}
+export ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=${PINNED:-0.5} ZEROMOE_GLM5NEXT_OFFLOAD_POLICY=${POLICY:-lru}
+export ZEROMOE_GLM5NEXT_OFFLOAD_PROBATION=${PROBATION:-0.25} ZEROMOE_GLM5NEXT_OFFLOAD_BYTE_CAP=${BYTECAP:-0}
+export ZEROMOE_GLM5NEXT_OFFLOAD_STORE=${STORE:-/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf}
+export ZEROMOE_GLM5NEXT_OFFLOAD_MODEL=${MODEL_DIR:-/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf}
+export ZEROMOE_GLM5NEXT_OFFLOAD_USAGE=$(dirname "$B")/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
+export ZEROMOE_GLM5NEXT_OFFLOAD_THP=${THP:-0}
+[ -n "$LAYER_TIMING" ] && export ZEROMOE_GLM5NEXT_GRAPH_LAYER_TIMING=1
 if [ "${PREFETCH:-0}" != "0" ]; then
-  export MOESTREAM_GLM5NEXT_PILOT_STAGE=1 MOESTREAM_GLM5NEXT_PILOT_PREFETCH=$PREFETCH MOESTREAM_GLM5NEXT_PILOT_COPY=0
-else unset MOESTREAM_GLM5NEXT_PILOT_STAGE MOESTREAM_GLM5NEXT_PILOT_PREFETCH MOESTREAM_GLM5NEXT_PILOT_COPY; fi
-unset MOESTREAM_GLM5NEXT_FULL_GRAPH; export MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=${FLOOR:-512}
-export MOESTREAM_GLM5NEXT_CPU_THREADS=8 CUDA_VISIBLE_DEVICES=0 MOESTREAM_BENCH_IGNORE_STOP=1
+  export ZEROMOE_GLM5NEXT_PILOT_STAGE=1 ZEROMOE_GLM5NEXT_PILOT_PREFETCH=$PREFETCH ZEROMOE_GLM5NEXT_PILOT_COPY=0
+else unset ZEROMOE_GLM5NEXT_PILOT_STAGE ZEROMOE_GLM5NEXT_PILOT_PREFETCH ZEROMOE_GLM5NEXT_PILOT_COPY; fi
+unset ZEROMOE_GLM5NEXT_FULL_GRAPH; export ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=${FLOOR:-512}
+export ZEROMOE_GLM5NEXT_CPU_THREADS=8 CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1
 # CPU sampler: process utime/stime ticks once a second (system time is where page zeroing and I/O syscalls show up)
 ( while true; do
-    pid=$(pgrep -f "pinab/$N.toml" | while read p; do [ "$(readlink /proc/$p/exe 2>/dev/null | grep -c moestream)" = 1 ] && echo $p && break; done)
+    pid=$(pgrep -f "pinab/$N.toml" | while read p; do [ "$(readlink /proc/$p/exe 2>/dev/null | grep -c zeromoe)" = 1 ] && echo $p && break; done)
     if [ -n "$pid" ] && [ -r /proc/$pid/stat ]; then
       awk -v t="$(date +%s.%N)" '{print t, $14, $15}' /proc/$pid/stat >> $B/pinab/$N.cpu.csv 2>/dev/null
       # contamination watch: compile jobs or other GPU/engine processes running next to the arm
@@ -45,6 +45,6 @@ printf '%s\n' \
  "Explain how TCP congestion control works, covering slow start and congestion avoidance." \
  "Write a bash script that finds the ten largest files under a directory and prints their sizes." \
  ":q" | systemd-run --user --scope -q -p MemoryMax=${MEMMAX:-80G} -p MemorySwapMax=0 \
-   ${BIN:-./build_pf/moestream} --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
+   ${BIN:-./build_pf/zeromoe} --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
 kill $SAMPLER 2>/dev/null
 echo DONE > $B/pinab/$N.done

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Learned next-layer expert predictor ("probe"): predict layer l+1's router selection scores from the post-attention residual of
-layer l, using dumps written by MOESTREAM_PROBE_DUMP (L<l>.x.bin = x_l rows f32 [N,D]; L<l>.s.bin = layer-l selection scores [N,E]).
+layer l, using dumps written by ZEROMOE_PROBE_DUMP (L<l>.x.bin = x_l rows f32 [N,D]; L<l>.s.bin = layer-l selection scores [N,E]).
 Compares (a) the pilot (layer l+1's own norm+router applied to x_l), (b) a ridge probe z->s_{l+1}, (c) pilot + ridge correction.
 Precision@k = mean over tokens of |predicted top-k intersect real top-8| / k, leave-one-prompt-out."""
 import sys, os, glob, math

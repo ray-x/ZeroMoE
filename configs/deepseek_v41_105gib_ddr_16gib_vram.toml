@@ -4,7 +4,7 @@
 # The host budget includes dense weights, KV/state, and scratch space:
 # 120.6 GB = 112.318 GiB total. Keep startup admission checks enabled.
 # This sets cache capacity; it does not eagerly populate every DDR slot.
-# Enable the current prefill graph with MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1.
+# Enable the current prefill graph with ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1.
 
 model_path = "/home/ray/vllm-workspace/DeepSeek-V41-Flash"
 log_level = "INFO"
@@ -20,8 +20,8 @@ host_ram_gb = 120.6
 ram_cache_total_experts = 8800
 ram_pinned_budget_gb = 15.0
 freeze_usage_stats = true
-pin_file = "/home/ray/Projects/MoEStream/.moestream_deepseek-v41_usage"
-prefill_pin_file = "/home/ray/Projects/MoEStream/.moestream_deepseek-v41_usage_prefill"
+pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_deepseek-v41_usage"
+prefill_pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_deepseek-v41_usage_prefill"
 cpu_affinity_layers = []
 ram_cache_layer_adaptive = false
 moe_ggml_mul_mat_id = false

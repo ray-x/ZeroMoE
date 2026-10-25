@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -22,14 +22,14 @@ namespace qwen4exp_graph {
 // 26 CPU layers that request is approximately the full 26-layer expert
 // footprint (~88 GiB), instead of a small activation workspace.
 void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
-  static int moestream_bind_diag = -1;
-  if (moestream_bind_diag < 0) {
-    const char *e = moestream::graphcfg::env("MOESTREAM_BIND_HOST_DIAG");
-    moestream_bind_diag = (e && e[0] == '1') ? 1 : 0;
+  static int zeromoe_bind_diag = -1;
+  if (zeromoe_bind_diag < 0) {
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_BIND_HOST_DIAG");
+    zeromoe_bind_diag = (e && e[0] == '1') ? 1 : 0;
   }
-  if (moestream_bind_diag) {
+  if (zeromoe_bind_diag) {
     LOG_WARN(
-        "[MOESTREAM-BIND-DIAG] name=%s sched=%p cpu=%p t=%p t->buffer=%p "
+        "[ZEROMOE-BIND-DIAG] name=%s sched=%p cpu=%p t=%p t->buffer=%p "
         "is_host=%d\n",
         t ? ggml_get_name(t) : "(null)", (void *)g.sched, (void *)g.cpu,
         (void *)t, t ? (void *)t->buffer : nullptr,
@@ -37,8 +37,8 @@ void bind_host_expert_scheduler_backend(FullGraph &g, ggml_tensor *t) {
   }
   if (!g.sched || !g.cpu || !t || !t->buffer ||
       !ggml_backend_buffer_is_host(t->buffer)) {
-    if (moestream_bind_diag)
-      LOG_WARN("[MOESTREAM-BIND-DIAG] SKIPPED pin for name=%s\n",
+    if (zeromoe_bind_diag)
+      LOG_WARN("[ZEROMOE-BIND-DIAG] SKIPPED pin for name=%s\n",
                t ? ggml_get_name(t) : "(null)");
     return;
   }
@@ -756,4 +756,4 @@ void *alloc_registered_host(FullGraph &g, size_t bytes) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

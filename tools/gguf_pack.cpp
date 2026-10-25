@@ -396,7 +396,7 @@ int process_one_shard(const std::string &input_path,
     // Default (--align-only): do NOT unpack. Every tensor -- packed *_exps
     // included -- passes through the passthrough loop below, re-aligned to
     // `alignment` but otherwise byte-identical. This keeps the packed format
-    // MoEStream natively runs (so its VRAM expert fast-path, prefetcher, RAM
+    // ZeroMoE natively runs (so its VRAM expert fast-path, prefetcher, RAM
     // manager all still work) AND makes each expert slice start at a block-
     // aligned offset -- the prerequisite for O_DIRECT expert reads (engine
     // config direct_io=true). --unpack switches to the per-expert interleaved
@@ -781,7 +781,7 @@ int process_one_shard(const std::string &input_path,
   // processing: separate invocations of this tool, one per source
   // shard, must never produce colliding output filenames (both would
   // otherwise independently start numbering at "00001" and overwrite
-  // each other). MoEStream's own loader doesn't care about output
+  // each other). ZeroMoE's own loader doesn't care about output
   // filenames beyond the .gguf extension -- it globs every .gguf file
   // in the output directory regardless of name -- so this tag only
   // needs to be unique across invocations, not meaningful in any other way.
@@ -828,7 +828,7 @@ int process_one_shard(const std::string &input_path,
     shard_kv_out.push_back(
         make_uint32_kv("general.alignment", (uint32_t)alignment));
     if (expert_interleave && !unpack)
-      shard_kv_out.push_back(make_uint32_kv("moestream.expert_interleave", 1));
+      shard_kv_out.push_back(make_uint32_kv("zeromoe.expert_interleave", 1));
     shard_kv_out.push_back(
         make_uint16_kv("split.count", (uint16_t)n_out_shards));      // UINT16
     shard_kv_out.push_back(make_uint16_kv("split.no", (uint16_t)s)); // UINT16
@@ -1166,7 +1166,7 @@ int cmd_pack(int argc, char **argv) {
             "\n"
             "DEFAULT (--align-only): re-align every tensor to `--align` bytes "
             "WITHOUT unpacking.\n"
-            "  Keeps the packed *_exps format MoEStream natively runs AND makes "
+            "  Keeps the packed *_exps format ZeroMoE natively runs AND makes "
             "expert slices\n"
             "  O_DIRECT-eligible -- set the engine's direct_io=true for DMA "
             "expert reads, with\n"

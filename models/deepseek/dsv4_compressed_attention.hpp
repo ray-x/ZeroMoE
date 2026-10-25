@@ -8,7 +8,7 @@
 // CPU-side cache bookkeeping shared by DeepSeek-V4 CSA/HCA attention and the
 // CPU-only component tests. This implementation intentionally represents one
 // contiguous sequence; llama.cpp's multi-sequence snapshot/rollback protocol
-// is outside MoEStream's single-sequence generation model.
+// is outside ZeroMoE's single-sequence generation model.
 inline constexpr int kDsv4CsaRatio = 4;
 inline constexpr int kDsv4HcaRatio = 128;
 

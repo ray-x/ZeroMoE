@@ -407,7 +407,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
             // Stage 2 (positional bug, found while investigating
             // why prefill's OWN throughput never improved even
             // after stage 1 -- real per-layer concentration
-            // check on .moestream_usage_prefill showed EVERY
+            // check on .zeromoe_usage_prefill showed EVERY
             // layer's prefill routing is close to flat, 3.4%-
             // 11.4% top-1 share, nowhere near "an obvious
             // winner"): stage 1 still put ALL prefill-exclusive
@@ -791,7 +791,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // override) for RAMSafetyManager's runtime disk_batch_padding
       // to use as its candidate source -- see that member's own
       // comment (ram_manager.hpp) for why the persisted, cross-run
-      // .moestream_usage signal is used here instead of live
+      // .zeromoe_usage signal is used here instead of live
       // StreamingEngine::route_freq. Cheap: at most a few thousand
       // ints total, copied once at startup, never touched again.
       for (auto &[layer, v] : by_layer) {
@@ -1231,7 +1231,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // disabled batch ring exercises the original one-expert loader
       // without changing runtime inference behavior.
       const bool disable_preload_batch =
-          std::getenv("MOESTREAM_DISABLE_PRELOAD_BATCH") != nullptr;
+          std::getenv("ZEROMOE_DISABLE_PRELOAD_BATCH") != nullptr;
       bool preload_ring_ok = !disable_preload_batch && preload_ring.init();
       if (preload_ring_ok) {
         preload_ring.register_iowq_workers(
@@ -1640,7 +1640,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         // reappeared), a later one lost 7632 (24528->16896, cache
         // 100%->74%, 3.12 GB of real NVMe reads, prefill 74.18->
         // 22.53 tok/s, a 3.3x regression) purely from this.
-        // Root cause: MoEStream's own RAM and VRAM tiers serve
+        // Root cause: ZeroMoE's own RAM and VRAM tiers serve
         // mostly DIFFERENT consumers here (this session's own
         // investigation found qwen4exp's prefill dispatch path
         // sources almost everything from the RAM tier via

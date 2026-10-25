@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+extern "C" cudaStream_t zeromoe_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
 
 namespace {
@@ -254,7 +254,7 @@ int main(int argc, char **argv) {
     ggml_backend_tensor_set(opaque, packed.data(), 0, packed.size());
     auto state = std::make_unique<FusedState>();
     state->capture = capture;
-    state->stream = moestream_ggml_backend_cuda_get_stream(cuda_backend);
+    state->stream = zeromoe_ggml_backend_cuda_get_stream(cuda_backend);
     state->offsets[0] = 0;
     state->offsets[1] = up_offset;
     state->offsets[2] = down_offset;

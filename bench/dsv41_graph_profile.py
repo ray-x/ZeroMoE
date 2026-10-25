@@ -20,7 +20,7 @@ def wait_idle(seconds: int, required_host_gb: float,
         gpu = subprocess.run(
             ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"],
             capture_output=True, text=True)
-        processes = subprocess.run(["pgrep", "-x", "moestream"],
+        processes = subprocess.run(["pgrep", "-x", "zeromoe"],
                                    capture_output=True, text=True)
         available = next(
             (int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
@@ -95,20 +95,20 @@ def main() -> None:
     env = dict(os.environ,
                CUDA_VISIBLE_DEVICES="0,1", NVIDIA_TF32_OVERRIDE="0",
                LD_LIBRARY_PATH=str(args.backend.resolve()),
-               MOESTREAM_DEEPSEEK_V41_FULL_GRAPH="1",
-               MOESTREAM_DEEPSEEK_V41_GPU_PREFILL="0" if args.native_reference else "1",
-               MOESTREAM_DEEPSEEK_V41_CACHE_MOE_GRAPH="0" if args.native_reference else "1",
-               MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH="0" if args.native_reference else "1")
+               ZEROMOE_DEEPSEEK_V41_FULL_GRAPH="1",
+               ZEROMOE_DEEPSEEK_V41_GPU_PREFILL="0" if args.native_reference else "1",
+               ZEROMOE_DEEPSEEK_V41_CACHE_MOE_GRAPH="0" if args.native_reference else "1",
+               ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH="0" if args.native_reference else "1")
     if args.native_f32_graph:
-        env["MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH"] = "1"
+        env["ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH"] = "1"
     if args.quantized_graph:
-        env["MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH"] = "0"
+        env["ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH"] = "0"
     if args.trace_layer is not None:
         trace_dir = output / "trace"
         trace_dir.mkdir(parents=True, exist_ok=True)
-        env["MOESTREAM_DEEPSEEK_V41_TRACE_DIR"] = str(trace_dir)
-        env["MOESTREAM_DEEPSEEK_V41_TRACE_LAYER"] = str(args.trace_layer)
-        env["MOESTREAM_DEEPSEEK_V41_TRACE_POS"] = str(args.trace_pos)
+        env["ZEROMOE_DEEPSEEK_V41_TRACE_DIR"] = str(trace_dir)
+        env["ZEROMOE_DEEPSEEK_V41_TRACE_LAYER"] = str(args.trace_layer)
+        env["ZEROMOE_DEEPSEEK_V41_TRACE_POS"] = str(args.trace_pos)
     print("starting model run", flush=True)
     command = [str(args.binary.resolve()), "--config", str(run_config),
                "--raw-prompt", "--ngen", str(args.ngen)]

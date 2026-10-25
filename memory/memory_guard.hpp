@@ -41,7 +41,7 @@
 // NOTE ON llama.cpp's 0.9: that fraction is applied at MODEL LOAD to decide
 // how many layers to offload. Applying the same fraction-of-TOTAL per dynamic
 // allocation does not work in this engine and was measured making things 2.6x
-// SLOWER (14.97 -> 5.79 tok/s): MoEStream deliberately fills VRAM -- the
+// SLOWER (14.97 -> 5.79 tok/s): ZeroMoE deliberately fills VRAM -- the
 // expert cache alone (moe_cache_gb) sits at ~23.7 of 24 GB by design -- so a
 // 90%-of-total test reads "already over budget" and refuses EVERY dynamic
 // allocation forever (11,632 refusals in one run), permanently disabling the
@@ -145,8 +145,8 @@ public:
     void start(long warn_mb, long stop_mb, int poll_ms) {
         if (running_.load()) return;
         stop_mb_ = effective_stop_limit_mb(stop_mb);
-        // Experiment-only override (MOESTREAM_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 20 GiB default.
-        if (const char *e = std::getenv("MOESTREAM_MEM_GUARD_FLOOR_MB")) {
+        // Experiment-only override (ZEROMOE_MEM_GUARD_FLOOR_MB): lets an A/B run use a lower host reserve than the 20 GiB default.
+        if (const char *e = std::getenv("ZEROMOE_MEM_GUARD_FLOOR_MB")) {
             const long v = std::atol(e);
             if (v >= 8 * 1024) stop_mb_ = v;
         }

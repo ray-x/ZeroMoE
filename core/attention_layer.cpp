@@ -53,16 +53,16 @@ void invalidate_glm5next_kda_gpu_states(StreamingEngine &engine) {
 }
 
 // A/B control for the S>1 (prefill) score GPU path ONLY. Set
-// MOESTREAM_SCORE_PREFILL_LEGACY=1 to force prefill back through the CPU
+// ZEROMOE_SCORE_PREFILL_LEGACY=1 to force prefill back through the CPU
 // AVX-512 score loop while leaving decode (S==1) on the GPU path exactly as
 // before -- i.e. it reproduces the pre-2026-09-02 gate from the SAME binary,
 // so an A/B can be run interleaved in one session instead of against a
 // baseline recorded earlier (this project has already been burned once by
 // trusting a cross-session reference number; see CLAUDE.md's "GLM-5.2 is much
 // slower than a week-old reference build" entry). Same function-local-static
-// idiom as kquant_matmul.cu's own MOESTREAM_KQUANT_LEGACY.
+// idiom as kquant_matmul.cu's own ZEROMOE_KQUANT_LEGACY.
 // ---------------------------------------------------------------------------
-// MOESTREAM_WUV_INT8=1  --  int8-persistent WUV storage (OFF by default)
+// ZEROMOE_WUV_INT8=1  --  int8-persistent WUV storage (OFF by default)
 // ---------------------------------------------------------------------------
 // Stores the MLA score down-projection weights (WUV) as int8 + one f32 scale
 // per output row instead of BF16, roughly HALVING their per-layer VRAM cost:
@@ -119,7 +119,7 @@ void invalidate_glm5next_kda_gpu_states(StreamingEngine &engine) {
 // anti-aliasing check the S=1 test structurally cannot perform).
 static bool wuv_int8_enabled() {
   static const bool on = [] {
-    const char *e = std::getenv("MOESTREAM_WUV_INT8");
+    const char *e = std::getenv("ZEROMOE_WUV_INT8");
     return e && e[0] == '1';
   }();
   return on;
@@ -127,7 +127,7 @@ static bool wuv_int8_enabled() {
 
 static bool score_prefill_legacy_forced() {
   static const bool forced = [] {
-    const char *e = std::getenv("MOESTREAM_SCORE_PREFILL_LEGACY");
+    const char *e = std::getenv("ZEROMOE_SCORE_PREFILL_LEGACY");
     return e && e[0] == '1';
   }();
   return forced;
@@ -141,7 +141,7 @@ static bool score_prefill_legacy_forced() {
 // changing model weights or routing.
 static bool force_gdn_full_host() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_FORCE_GDN_FULL_HOST");
+    const char *v = std::getenv("ZEROMOE_GGML_FORCE_GDN_FULL_HOST");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -149,7 +149,7 @@ static bool force_gdn_full_host() {
 
 static bool gdn_full_stats_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_GDN_FULL_STATS");
+    const char *v = std::getenv("ZEROMOE_GGML_GDN_FULL_STATS");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -460,10 +460,10 @@ static bool ensure_wuk_wuv_cached(StreamingEngine &engine, int layer_idx) {
 // go regardless of how aggressively qabsorb/score/WUV spend the rest.
 // Prefill grows d_x/d_y/d_score_combined with the batch (about 65 KB + 110 KB per token); 256MB covers decode and
 // short prompts but a 426-token GLM-5.3 prefill still failed 446 cudaMallocs and ran attn_output on the CPU
-// (outproj 131 s of 400 s). MOESTREAM_DENSE_SCRATCH_RESERVE_MB raises it.
+// (outproj 131 s of 400 s). ZEROMOE_DENSE_SCRATCH_RESERVE_MB raises it.
 static size_t dense_scratch_reserve_bytes() {
   static const size_t v = [] {
-    const char *e = std::getenv("MOESTREAM_DENSE_SCRATCH_RESERVE_MB");
+    const char *e = std::getenv("ZEROMOE_DENSE_SCRATCH_RESERVE_MB");
     const long mb = (e && e[0]) ? std::atol(e) : 256;
     return (size_t)(mb > 0 ? mb : 256) * 1024ULL * 1024ULL;
   }();
@@ -1997,11 +1997,11 @@ static void qwen4exp_gdn_delta_rule(const float *Q, const float *K,
   // compute the same rule; qwen4exp_gdn_delta_chunk is verified against
   // qwen4exp_gdn_delta_step itself in tests/test_components.cpp
   // ("qwen4exp GDN chunked vs sequential", max diff ~9e-8, i.e. float
-  // rounding). Opt-in for now via MOESTREAM_GDN_CHUNKED=1 so the two can be
+  // rounding). Opt-in for now via ZEROMOE_GDN_CHUNKED=1 so the two can be
   // A/B'd on real hardware before it becomes the default; same env-flag
-  // precedent as MOESTREAM_KQUANT_LEGACY / MOESTREAM_WUV_INT8.
+  // precedent as ZEROMOE_KQUANT_LEGACY / ZEROMOE_WUV_INT8.
   static const bool gdn_chunked = [] {
-    const char *e = std::getenv("MOESTREAM_GDN_CHUNKED");
+    const char *e = std::getenv("ZEROMOE_GDN_CHUNKED");
     return e && e[0] == '1';
   }();
   // 64 matches llama.cpp's own CS for the non-KDA (GDN) branch.
@@ -2341,7 +2341,7 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
         // that pre_mix intentionally left on the device before
         // trying it; hidden_states is not authoritative in this
         // device-input form.  The same recovery is deliberately
-        // used by MOESTREAM_GGML_FORCE_GDN_FULL_HOST=1 so this
+        // used by ZEROMOE_GGML_FORCE_GDN_FULL_HOST=1 so this
         // diagnostic changes only the GDN execution side.
         if (!GgmlHcRunner::instance().copy_pre_mix_to_host(
                 engine.qwen4exp_device_hc_input,
@@ -3054,7 +3054,7 @@ void dsv4_attention_gguf(StreamingEngine &engine, int layer_idx,
     std::memset(out_context, 0, (size_t)S * D * sizeof(float));
     return;
   }
-  // MoEStream starts each request at position zero. Its cache model is a
+  // ZeroMoE starts each request at position zero. Its cache model is a
   // single contiguous sequence, so reset this layer's compressor state at
   // that boundary rather than retaining llama.cpp-style sequence snapshots.
   if (compressed && pos_base == 0)

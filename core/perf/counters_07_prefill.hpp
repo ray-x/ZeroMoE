@@ -384,12 +384,12 @@ struct PerfCountersPart07 : PerfCountersPart06 {
     // Diagnostic pair added specifically because a real run showed BOTH
     // n_pad_reads_issued AND n_pad_no_free_slot stay at exactly 0 for a
     // whole 40-token run despite route_rank_by_layer confirmed populated
-    // (100+ entries/layer in .moestream_usage) -- meaning the candidate
+    // (100+ entries/layer in .zeromoe_usage) -- meaning the candidate
     // list (`ranked`) itself was empty every single call, not just short
     // of free slots. These two counters distinguish the two ways that can
     // happen: no_ranking_for_layer fires if route_rank_by_layer had NO
     // entry at all for that layer (population bug, or a layer-numbering
-    // mismatch between .moestream_usage and get_experts_batch's own
+    // mismatch between .zeromoe_usage and get_experts_batch's own
     // `layer` parameter); no_candidates_after_filter fires if the ranking
     // DID exist but every single entry got excluded (this-token's-own-set
     // / RAM-resident / VRAM-resident) before `want` candidates were found.

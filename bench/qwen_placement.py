@@ -32,9 +32,9 @@ def read_usage(path):
         p = line.split()
         if len(p) == 3 and int(p[0]) < LAYERS: c[int(p[0]), int(p[1])] = float(p[2])
     return c
-tap = read_usage(USAGE + 'moestream_usage_survey_qwen4exp_usage_tap')
-pre = read_usage(USAGE + 'moestream_usage_survey_prefill')
-dec = read_usage(USAGE + 'moestream_usage_survey')
+tap = read_usage(USAGE + 'zeromoe_usage_survey_qwen4exp_usage_tap')
+pre = read_usage(USAGE + 'zeromoe_usage_survey_prefill')
+dec = read_usage(USAGE + 'zeromoe_usage_survey')
 
 routes = []   # per prompt: [LAYERS] list of bool [rows,E] np arrays; counts [LAYERS,E]
 counts = []

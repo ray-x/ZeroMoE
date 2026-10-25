@@ -26,7 +26,7 @@
 
 // Diagnostic kill-switch: forces every dense matmul, norm, and expert FFN onto
 // the CPU reference path (libggml dequant + f32 matmul), bypassing ALL GPU
-// dispatch. Enabled by EITHER the MOESTREAM_CPU_ONLY env var OR a TOML
+// dispatch. Enabled by EITHER the ZEROMOE_CPU_ONLY env var OR a TOML
 // `cpu_only = true` (main.cpp calls enable_cpu_only_mode() after config load).
 // Used to isolate whether garbage output comes from a GPU-side issue
 // (async-upload race, device/stream, offload corruption, a fused kernel) vs a
@@ -34,7 +34,7 @@
 // culprit; if still garbage, the bug is in the CPU math (attention/MoE/
 // embedding) and is independent of where compute runs.
 inline bool& cpu_only_flag() {
-    static bool v = (std::getenv("MOESTREAM_CPU_ONLY") != nullptr);
+    static bool v = (std::getenv("ZEROMOE_CPU_ONLY") != nullptr);
     return v;
 }
 inline bool cpu_only_mode() { return cpu_only_flag(); }
@@ -86,7 +86,7 @@ inline void set_moe_prefill_batched(bool v) { moe_prefill_batched_flag() = v; }
 
 // --- moe_decode_batched (EngineConfig, default OFF) -----------------------
 // Decode-time (S==1) counterpart to moe_prefill_batched, from the
-// MoEStream-vs-llama.cpp decode-gap investigation (2026-09-10). A live
+// ZeroMoE-vs-llama.cpp decode-gap investigation (2026-09-10). A live
 // measurement found the `expert` dispatch bucket at ~77% of decode wall
 // time, with the actual GPU matmul inside it only ~7% of that bucket --
 // the rest is dispatch_expert_k's per-expert VRAM-cache bookkeeping
@@ -189,7 +189,7 @@ inline int moe_prefill_stream_chunk() { return moe_prefill_stream_chunk_flag(); 
 // stays inside one graph, so this flag is the A/B for how much that remaining
 // host orchestration actually costs.
 //
-// Requires moe_prefill_batched, a build with MOESTREAM_USE_GGML_CUDA, and a
+// Requires moe_prefill_batched, a build with ZEROMOE_USE_GGML_CUDA, and a
 // layer whose gate/up/down quant
 // types are uniform across its experts. Any of those failing falls back to
 // the existing path for that layer, never to a wrong result.
@@ -199,7 +199,7 @@ inline bool& moe_ggml_mul_mat_id_flag() {
 }
 inline bool moe_ggml_mul_mat_id() {
   static const bool env = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_MUL_MAT_ID");
+    const char *e = std::getenv("ZEROMOE_GGML_MUL_MAT_ID");
     return e && e[0] == '1';
   }();
   return env || moe_ggml_mul_mat_id_flag();
@@ -215,7 +215,7 @@ inline void set_moe_ggml_mul_mat_id(bool v) { moe_ggml_mul_mat_id_flag() = v; }
 inline bool &moe_ggml_shared_expert_flag() { static bool v = false; return v; }
 inline bool moe_ggml_shared_expert() {
   static const bool env = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_SHARED_EXPERT");
+    const char *e = std::getenv("ZEROMOE_GGML_SHARED_EXPERT");
     return e && e[0] == '1';
   }();
   return env || moe_ggml_shared_expert_flag();
@@ -239,7 +239,7 @@ inline bool moe_ggml_gpu_router() {
   // router without making a temporary config copy.  The override is scoped
   // to this Qwen-only feature; other model routers do not consult it.
   static const int env_override = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_GPU_ROUTER");
+    const char *e = std::getenv("ZEROMOE_GGML_GPU_ROUTER");
     if (!e || !e[0]) return -1;
     return e[0] == '1' ? 1 : 0;
   }();
@@ -255,7 +255,7 @@ inline void set_moe_ggml_gpu_router(bool v) { moe_ggml_gpu_router_flag() = v; }
 // qwen4exp: same run, GPU 1 -> 10.22s prefill, GPU 0 -> 9.24s. Set this
 // explicitly (and leave the chosen card ~700 MB of headroom via its own
 // moe_cache_gb) rather than relying on the automatic choice.
-// MOESTREAM_GGML_MOE_DEVICE overrides both, for A/B without a config edit.
+// ZEROMOE_GGML_MOE_DEVICE overrides both, for A/B without a config edit.
 inline int& moe_ggml_device_flag() {
   static int v = -1;
   return v;
@@ -271,7 +271,7 @@ inline void set_moe_ggml_device(int v) { moe_ggml_device_flag() = v; }
 // 18.1 MB `xn`/`gate` tensors across PCIe six times per layer (5.3 GB per
 // prefill). Both costs only go away together, which needs the intermediates
 // to stay in VRAM -- see include/ggml_hc_backend.hpp.
-// Requires a build with MOESTREAM_USE_GGML_CUDA. Falls back to the CPU path
+// Requires a build with ZEROMOE_USE_GGML_CUDA. Falls back to the CPU path
 // for the whole forward pass if anything fails, never per bracket (a partial
 // switch would leave the host and device copies of hc_stream_buf divergent).
 inline bool& hc_ggml_flag() {
@@ -280,7 +280,7 @@ inline bool& hc_ggml_flag() {
 }
 inline bool hc_ggml() {
   static const bool env = [] {
-    const char *e = std::getenv("MOESTREAM_HC_GGML");
+    const char *e = std::getenv("ZEROMOE_HC_GGML");
     return e && e[0] == '1';
   }();
   return env || hc_ggml_flag();
@@ -296,7 +296,7 @@ inline void set_hc_ggml(bool v) { hc_ggml_flag() = v; }
 // include/ggml_gdn_proj_backend.hpp for the measurement and the deliberately
 // narrow scope (conv1d/L2-norm/delta-rule/output-norm are untouched -- they
 // already have their own real fast paths).
-// Requires a build with MOESTREAM_USE_GGML_CUDA. Falls back to the existing
+// Requires a build with ZEROMOE_USE_GGML_CUDA. Falls back to the existing
 // per-call dense_proj path for the whole call if anything fails.
 inline bool& gdn_proj_ggml_flag() {
   static bool v = false;
@@ -304,7 +304,7 @@ inline bool& gdn_proj_ggml_flag() {
 }
 inline bool gdn_proj_ggml() {
   static const bool env = [] {
-    const char *e = std::getenv("MOESTREAM_GDN_PROJ_GGML");
+    const char *e = std::getenv("ZEROMOE_GDN_PROJ_GGML");
     return e && e[0] == '1';
   }();
   return env || gdn_proj_ggml_flag();
@@ -320,14 +320,14 @@ inline bool& gdn_full_ggml_flag() {
 }
 inline bool gdn_full_ggml() {
   static const bool env = [] {
-    const char *e = std::getenv("MOESTREAM_GDN_FULL_GGML");
+    const char *e = std::getenv("ZEROMOE_GDN_FULL_GGML");
     return e && e[0] == '1';
   }();
   return env || gdn_full_ggml_flag();
 }
 inline void set_gdn_full_ggml(bool v) { gdn_full_ggml_flag() = v; }
 
-// MOESTREAM_EXPERT_STREAM_NOSYNC=1 drops the per-expert
+// ZEROMOE_EXPERT_STREAM_NOSYNC=1 drops the per-expert
 // cudaStreamSynchronize when moe_gpu_accum makes it unnecessary (the
 // accumulate kernel is stream-ordered behind the down-proj, so nothing
 // crosses back to the host). MEASURED 2026-09-05 as a REGRESSION on
@@ -355,7 +355,7 @@ inline void set_gdn_full_ggml(bool v) { gdn_full_ggml_flag() = v; }
 // Default OFF because it is a real PRECISION change, not just a speed one:
 // BF16 has ~8 mantissa bits, which is enough to flip a close greedy
 // argmax, so generated text can differ from the fused path (verified
-// coherent and on-topic, but not token-identical). MOESTREAM_EXPERT_BF16_
+// coherent and on-topic, but not token-identical). ZEROMOE_EXPERT_BF16_
 // GEMM=1 still forces it on for A/B without touching a config.
 inline bool& moe_expert_bf16_gemm_flag() {
   static bool v = false;
@@ -363,7 +363,7 @@ inline bool& moe_expert_bf16_gemm_flag() {
 }
 inline bool moe_expert_bf16_gemm() {
   static const bool env = [] {
-    const char *e = std::getenv("MOESTREAM_EXPERT_BF16_GEMM");
+    const char *e = std::getenv("ZEROMOE_EXPERT_BF16_GEMM");
     return e && e[0] == '1';
   }();
   return env || moe_expert_bf16_gemm_flag();
@@ -372,7 +372,7 @@ inline void set_moe_expert_bf16_gemm(bool v) { moe_expert_bf16_gemm_flag() = v; 
 
 inline bool expert_stream_no_sync() {
   static const bool v = [] {
-    const char *e = std::getenv("MOESTREAM_EXPERT_STREAM_NOSYNC");
+    const char *e = std::getenv("ZEROMOE_EXPERT_STREAM_NOSYNC");
     return e && *e == '1';
   }();
   return v;
@@ -398,7 +398,7 @@ inline void set_moe_prefill_stream_chunk(int v) {
 // is GLM5NEXT; read on the expert-FFN hot path with no locking (never
 // mutated after startup), same discipline as cpu_only_flag() above.
 // NOTE: the reference routes DEEPSEEK4 through the fused op too, but
-// MoEStream's DeepSeek-V4 currently uses the product-clamp order (verified
+// ZeroMoE's DeepSeek-V4 currently uses the product-clamp order (verified
 // coherent on real hardware before this discrepancy was catalogued) --
 // reconciling DSV4 is a separate, hardware-A/B-gated decision, deliberately
 // not bundled into the GLM5Next bring-up.
@@ -1248,11 +1248,11 @@ inline void dense_proj(StreamingEngine& engine, const std::string& wname,
       wname == "blk.1.ple_key.weight" ||
       wname == "blk.1.ple_value.weight";
   const char* ple_diag_env =
-      std::getenv("MOESTREAM_QWEN4EXP_PLE_PATH_DIAG");
+      std::getenv("ZEROMOE_QWEN4EXP_PLE_PATH_DIAG");
   const bool ple_path_diag = ple_projection && ple_diag_env &&
                              ple_diag_env[0] == '1';
   const char* ple_cpu_env =
-      std::getenv("MOESTREAM_QWEN4EXP_PLE_FORCE_CPU");
+      std::getenv("ZEROMOE_QWEN4EXP_PLE_FORCE_CPU");
   const bool ple_force_cpu = ple_path_diag && ple_cpu_env &&
                              ple_cpu_env[0] == '1';
   if (ple_path_diag) {

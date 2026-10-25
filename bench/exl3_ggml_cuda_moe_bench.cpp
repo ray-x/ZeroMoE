@@ -22,7 +22,7 @@
 #include <utility>
 #include <vector>
 
-extern "C" cudaStream_t moestream_ggml_backend_cuda_get_stream(
+extern "C" cudaStream_t zeromoe_ggml_backend_cuda_get_stream(
     ggml_backend_t backend);
 
 namespace {
@@ -292,7 +292,7 @@ int main(int argc, char **argv) {
       input_host[index] = 0.1f * std::sin(index * 0.071f);
     ggml_backend_tensor_set(input, input_host.data(), 0,
                             input_host.size() * sizeof(float));
-    cudaStream_t stream = moestream_ggml_backend_cuda_get_stream(cuda_backend);
+    cudaStream_t stream = zeromoe_ggml_backend_cuda_get_stream(cuda_backend);
     for (int layer = 0; layer < layers; ++layer) {
       ggml_backend_tensor_set(opaque[layer], payloads[layer].bytes.data(), 0,
                               payloads[layer].bytes.size());

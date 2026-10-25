@@ -41,7 +41,7 @@
 //                      it was a net LOSS at very high call-frequency -- so
 //                      this isn't a foregone conclusion either way).
 //
-// Does NOT touch moestream's real inference path -- completely standalone,
+// Does NOT touch zeromoe's real inference path -- completely standalone,
 // zero risk to correctness of the live model/engine. Runs a one-time D2H
 // readback + memcmp correctness check per device/size for B and C before
 // trusting either's timing number.
@@ -135,7 +135,7 @@
 //   See EngineConfig::decode_async_prewarm's own comment (engine_config.hpp)
 //   for the full writeup, and CLAUDE.md.
 //
-//   STATUS: build clean, full moestream_tests suite green. UNVERIFIED ON
+//   STATUS: build clean, full zeromoe_tests suite green. UNVERIFIED ON
 //   REAL HARDWARE END TO END as a live generation run -- default OFF, so
 //   enabling it for the first time should be done deliberately, with real
 //   host_ram_gb headroom, watching [SLOW-HOST-ALLOC]/[SLOW-PICKUP] for any

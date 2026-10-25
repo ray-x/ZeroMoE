@@ -119,7 +119,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
   // clamped Qwen variant through it until its clamp semantics are represented
   // in the graph; the established CPU path remains the safe fallback.
   static const int cpu_graph_mode = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_GRAPH");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_GRAPH");
     if (env && env[0] == '0')
       return 0; // force the established path
     if (env && env[0] == '2')
@@ -147,7 +147,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
     }
     std::vector<float> graph_output((size_t)D, 0.0f);
     const bool cpu_diag = [] {
-      const char *env = std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+      const char *env = std::getenv("ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2");
       return env && env[0] == '1';
     }();
     if (cpu_diag)
@@ -217,7 +217,7 @@ static bool expert_ffn_cpu_qwen_grouped_quantized(
   // exact GGUF rows.  The validated default remains the old down projection;
   // gate/up grouping is independent and remains enabled below.
   static const bool enable_grouped_iq4_nl = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN4EXP_GROUPED_IQ4_NL");
+    const char *env = std::getenv("ZEROMOE_QWEN4EXP_GROUPED_IQ4_NL");
     return env && env[0] == '1';
   }();
   if (enable_grouped_iq4_nl && down_type == GGUFType::IQ4_NL) {
@@ -333,7 +333,7 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
                                              : arena->stride;
   out.down_stride = arena->projection_compact ? arena->down_stride
                                                : arena->stride;
-  if (const char *debug = std::getenv("MOESTREAM_QWEN_DECODE_SCHED_DEBUG");
+  if (const char *debug = std::getenv("ZEROMOE_QWEN_DECODE_SCHED_DEBUG");
       debug && debug[0] == '1' && layer_idx == 0) {
     LOG_WARN("[QWEN-CPU-ARENA] layer=%d compact=%d arena_stride=%zu "
              "planes=%p/%p/%p strides=%zu/%zu/%zu\n",
@@ -346,7 +346,7 @@ bool qwen4exp_ram_cpu_moe_layer(const StreamingEngine &engine,
 
 static bool qwen_cpu_compact_graph_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_COMPACT_GRAPH");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_COMPACT_GRAPH");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -354,7 +354,7 @@ static bool qwen_cpu_compact_graph_enabled() {
 
 static bool qwen_cpu_direct_gpu_overlap_probe() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_DIRECT_GPU_OVERLAP");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_DIRECT_GPU_OVERLAP");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -362,7 +362,7 @@ static bool qwen_cpu_direct_gpu_overlap_probe() {
 
 static bool qwen_cpu_strided_grouped_enabled(const StreamingEngine &engine) {
   static const int env_override = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_STRIDED_GROUPED");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_STRIDED_GROUPED");
     if (!env || !env[0])
       return -1;
     return env[0] == '0' ? 0 : (env[0] == '1' ? 1 : -1);
@@ -376,7 +376,7 @@ static bool qwen_cpu_strided_grouped_enabled(const StreamingEngine &engine) {
 
 static bool qwen_cpu_gpu_combine_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_GPU_COMBINE");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_GPU_COMBINE");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -391,7 +391,7 @@ static bool qwen_cpu_gpu_combine_enabled() {
 // A/B proves it; no other model family can reach this helper.
 static bool qwen_cpu_stage_timing_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_STAGE_TIMING");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_STAGE_TIMING");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -399,7 +399,7 @@ static bool qwen_cpu_stage_timing_enabled() {
 
 static bool qwen_cpu_fused_iq1_iq4_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_IQ1_IQ4");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_FUSED_IQ1_IQ4");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -407,7 +407,7 @@ static bool qwen_cpu_fused_iq1_iq4_enabled() {
 
 static bool qwen_cpu_fused_grouped_enabled(const StreamingEngine &engine) {
   static const int env_override = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_GROUPED");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_FUSED_GROUPED");
     if (!env || !env[0])
       return -1;
     return env[0] == '0' ? 0 : (env[0] == '1' ? 1 : -1);
@@ -418,7 +418,7 @@ static bool qwen_cpu_fused_grouped_enabled(const StreamingEngine &engine) {
 
 static bool qwen_cpu_fused_iq2_iq4_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_IQ2_IQ4");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_FUSED_IQ2_IQ4");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -426,7 +426,7 @@ static bool qwen_cpu_fused_iq2_iq4_enabled() {
 
 static bool qwen_cpu_fused_q4_0_enabled() {
   static const bool enabled = [] {
-    const char *env = std::getenv("MOESTREAM_QWEN_CPU_FUSED_Q4_0");
+    const char *env = std::getenv("ZEROMOE_QWEN_CPU_FUSED_Q4_0");
     return env && env[0] == '1';
   }();
   return enabled;
@@ -852,7 +852,7 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
                      scratch.normed.data(), static_cast<size_t>(D));
         const bool cpu_diag = [] {
           const char *env =
-              std::getenv("MOESTREAM_QWEN4EXP_DIAG_LAYER0_IQ2");
+              std::getenv("ZEROMOE_QWEN4EXP_DIAG_LAYER0_IQ2");
           return env && env[0] == '1';
         }();
         if (cpu_diag)

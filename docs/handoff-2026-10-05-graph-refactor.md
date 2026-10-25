@@ -83,7 +83,7 @@ Two fixes were applied after that attempt:
 
 The updated engine build succeeded:
 `logs/option_b_stage_mailbox_shared_reference_build.log` (`[100%] Built target
-moestream`). Python syntax checks succeeded for
+zeromoe`). Python syntax checks succeeded for
 `bench/option_b_topic_check.py` and `bench/analyze_qwen_route_prediction.py`.
 The updated binary has not yet run on the GPU. The last observed environment
 check reported that `nvidia-smi` could not communicate with the NVIDIA driver;

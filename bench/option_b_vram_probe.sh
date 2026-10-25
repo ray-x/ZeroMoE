@@ -3,8 +3,8 @@
 #
 # usage: bench/option_b_vram_probe.sh K [ngen=200] [gpu=0]
 #   K    number of experts kept in VRAM (qwen4exp_option_b_global_top_k). 8421 = the right-sized 0/44/4 count.
-#   env  anything exported as MOESTREAM_* is passed through, e.g.
-#        MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512   (needed for K above ~14,729 on a 24 GiB card)
+#   env  anything exported as ZEROMOE_* is passed through, e.g.
+#        ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512   (needed for K above ~14,729 on a 24 GiB card)
 # Writes logs/optb_probe_K<K>.{csv,stdout,engine.log}. Needs an idle GPU and ../moestream-build-upstream-master/moestream.
 # Reports: steady-state GPU memory used/free (nvidia-smi, 250 ms samples, "steady" = samples above 90% of the peak),
 # decode tok/s (TOKEN-LOOP-DIAG iter_total, steps >= 3), whether the graph fell back to layered decode (that is a FAILURE:
@@ -18,13 +18,13 @@ TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 sed -E "s/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = $K/; s#^log_path *=.*#log_path = \"logs/$TAG.engine.log\"#" \
   configs/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
 mkdir -p logs
-while pgrep -x moestream >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-compute-apps=pid --format=csv,noheader)" ]]; do sleep 3; done
+while pgrep -x zeromoe >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-compute-apps=pid --format=csv,noheader)" ]]; do sleep 3; done
 nvidia-smi --id="$GPU" --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "logs/$TAG.csv" &
 SP=$!
 echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env \
-  CUDA_VISIBLE_DEVICES=$GPU MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-  MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-  MOESTREAM_TOKEN_LOOP_DIAG=1 MOESTREAM_BENCH_IGNORE_STOP=1 \
+  CUDA_VISIBLE_DEVICES=$GPU ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+  ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+  ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
   ../moestream-build-upstream-master/moestream --config "$TMP/cfg.toml" --ngen "$NGEN" > "logs/$TAG.stdout" 2>&1 || true
 kill $SP 2>/dev/null || true
 python3 - "$TAG" <<'EOF'

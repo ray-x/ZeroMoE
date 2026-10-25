@@ -66,7 +66,7 @@ io_uring = true
 # toward 80 rather than trusting this number blindly.
 # DROPPED to 75 (2026-09-12, later still): exactly the contention this
 # comment warned about recurred -- concurrent llama-bench (36.7GB RSS) and
-# earlier a moestream test from a background bisection agent, both real,
+# earlier a zeromoe test from a background bisection agent, both real,
 # both confirmed via `ps --sort=-rss`. A 100 attempt hit a real preflight
 # refusal (only 85.5GB available at launch time vs 110GB needed). Cache-fit
 # ratio is not the active bottleneck right now anyway -- see the "gap:
@@ -77,8 +77,8 @@ host_ram_gb = 75.0
 # Usage history is model-specific learned state.  The first run creates these
 # files at shutdown; later runs use them for ranked preload.
 freeze_usage_stats = false
-pin_file = "/home/ray/Projects/MoEStream/.moestream_deepseek-v41_usage"
-prefill_pin_file = "/home/ray/Projects/MoEStream/.moestream_deepseek-v41_usage_prefill"
+pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_deepseek-v41_usage"
+prefill_pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_deepseek-v41_usage_prefill"
 # cpu_affinity_layers (2026-09-13): TESTED on the 10 flattest layers
 # (0,1,15,19,27,30,33,36,38,39 -- see git history/memory for the real
 # per-layer concentration data this was picked from). REAL RESULT: cache

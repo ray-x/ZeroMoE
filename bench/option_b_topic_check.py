@@ -32,7 +32,7 @@ def wait_idle(seconds):
     deadline = time.monotonic() + seconds
     while True:
         busy = []
-        for name in ('moestream', 'moestream_tests', 'test_components', 'llama-server',
+        for name in ('zeromoe', 'zeromoe_tests', 'test_components', 'llama-server',
                      'llama-cli', 'llama-bench', 'cc1plus', 'nvcc'):
             busy.extend(subprocess.run(['pgrep', '-x', '-a', name], text=True,
                                        capture_output=True).stdout.splitlines())
@@ -60,15 +60,15 @@ def main():
     engine = args.engine.resolve()
     out = args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=args.resume)
-    env = {k: v for k, v in os.environ.items() if not k.startswith('MOESTREAM_')}
+    env = {k: v for k, v in os.environ.items() if not k.startswith('ZEROMOE_')}
     for name in ('OMP_WAIT_POLICY', 'GOMP_SPINCOUNT', 'OMP_PROC_BIND', 'OMP_PLACES'):
         env.pop(name, None)
     env.update(CUDA_VISIBLE_DEVICES='0', GGML_CUDA_BF16_MMVF_CUBLAS='0',
-        MOESTREAM_QWEN4EXP_FULL_GRAPH='1', MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE='1',
-        MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
-        MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1', MOESTREAM_QWEN_CPU_THREADS='10',
-        MOESTREAM_BENCH_IGNORE_STOP='1', MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT='1',
-        MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES='1', MOESTREAM_QWEN_EARLY_READY_PREDICT='1')
+        ZEROMOE_QWEN4EXP_FULL_GRAPH='1', ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE='1',
+        ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS='0',
+        ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING='1', ZEROMOE_QWEN_CPU_THREADS='10',
+        ZEROMOE_BENCH_IGNORE_STOP='1', ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT='1',
+        ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES='1', ZEROMOE_QWEN_EARLY_READY_PREDICT='1')
     manifest = {
         'engine': str(engine), 'engine_sha256': hashlib.sha256(engine.read_bytes()).hexdigest(),
         'config_sha256': hashlib.sha256(A.read_bytes()).hexdigest(),
@@ -91,9 +91,9 @@ def main():
         (directory / 'prompt.txt').write_text(prompt + '\n')
         config = directory / 'capture.toml'
         config.write_text(setting(A.read_text(), 'log_path', json.dumps(str(directory / 'capture.engine.log'))))
-        run_env = dict(env, MOESTREAM_PROMPT_TOKEN_FILE=str(directory / 'prompt.tokens'),
-            MOESTREAM_GENERATED_TOKEN_FILE=str(directory / 'continuation.tokens'),
-            MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE=str(directory / 'capture.routes.jsonl'))
+        run_env = dict(env, ZEROMOE_PROMPT_TOKEN_FILE=str(directory / 'prompt.tokens'),
+            ZEROMOE_GENERATED_TOKEN_FILE=str(directory / 'continuation.tokens'),
+            ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE=str(directory / 'capture.routes.jsonl'))
         if args.resume and (directory / 'prediction_scores.json').exists():
             scores = json.loads((directory / 'prediction_scores.json').read_text())
             print(f'Reusing captured {topic}', flush=True)
@@ -105,22 +105,22 @@ def main():
                     input=prompt + '\n:q\n', text=True, cwd=ROOT, env=run_env,
                     stdout=output, stderr=subprocess.STDOUT, check=True)
             scores = analyze(directory / 'capture.routes.jsonl',
-                ROOT / 'tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap', 12.3e9)
+                ROOT / 'tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap', 12.3e9)
             (directory / 'prediction_scores.json').write_text(json.dumps(scores, indent=2) + '\n')
         command = [sys.executable, str(ROOT / 'bench/option_b_early_ready_check.py'),
             '--engine', str(engine), '--out-dir', str(directory / 'comparison'),
             '--prompt-ids', str(directory / 'prompt.tokens'),
             '--continuation', str(directory / 'continuation.tokens'), '--reps', '1',
             '--all-split', '--dump-logits', '--allow-busy-correctness', '--wait-idle', str(args.wait_idle),
-            '--baseline-env', 'MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1',
-            '--baseline-env', 'MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES=1',
-            '--baseline-env', 'MOESTREAM_QWEN_EARLY_READY_PREDICT=1',
-            '--candidate-env', 'MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES=1',
-            '--candidate-env', 'MOESTREAM_QWEN_EARLY_READY_PREDICT=1',
-            '--candidate-env', f'MOESTREAM_QWEN_EARLY_READY_ROUTE_TRACE={directory / "staging.routes.jsonl"}',
-            '--candidate-env', f'MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER={args.stage_layer}']
+            '--baseline-env', 'ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1',
+            '--baseline-env', 'ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1',
+            '--baseline-env', 'ZEROMOE_QWEN_EARLY_READY_PREDICT=1',
+            '--candidate-env', 'ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1',
+            '--candidate-env', 'ZEROMOE_QWEN_EARLY_READY_PREDICT=1',
+            '--candidate-env', f'ZEROMOE_QWEN_EARLY_READY_ROUTE_TRACE={directory / "staging.routes.jsonl"}',
+            '--candidate-env', f'ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER={args.stage_layer}']
         if args.verify:
-            command += ['--candidate-env', 'MOESTREAM_QWEN_EARLY_READY_STAGE_VERIFY=1']
+            command += ['--candidate-env', 'ZEROMOE_QWEN_EARLY_READY_STAGE_VERIFY=1']
         if args.free_running:
             command += ['--free-running']
         if args.resume and (directory / 'comparison/manifest.json').exists():
@@ -128,7 +128,7 @@ def main():
         with (directory / 'comparison.log').open('a' if args.resume else 'w') as output:
             subprocess.run(command, cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, check=True)
         staged_scores = analyze(directory / 'staging.routes.jsonl',
-            ROOT / 'tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap', 12.3e9)
+            ROOT / 'tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap', 12.3e9)
         (directory / 'staging_scores.json').write_text(json.dumps(staged_scores, indent=2) + '\n')
         print(f'Completed {topic}; cold recall={scores["summary"]["proxy"]["cold_recall"]:.3%}', flush=True)
 

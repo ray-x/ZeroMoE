@@ -8,7 +8,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).with_name('run.sh'))
-BINARY = str(ROOT / 'build-ling/moestream')
+BINARY = str(ROOT / 'build-ling/zeromoe')
 PREFIX = sys.argv[2] if len(sys.argv) > 2 else '/tmp/ling-reference-monitor-' + str(time.time_ns())
 OUT = Path(PREFIX + '.memory.jsonl')
 FLOOR_KIB = int(os.environ.get('LING_STOP_GIB', '20')) * 1024 * 1024

@@ -2,7 +2,7 @@
 #include "exl3_cpu.hpp"
 #include "cpu_model_backend.hpp"
 #include "exl3_model_loader.hpp"
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
 #include "exl3_gpu.hpp"
 #endif
 
@@ -34,7 +34,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
     if (options.cpu_expert_int8_vnni && !exl3_cpu_vnni_available())
       return std::unexpected("exl3_cpu_expert_int8_vnni requires AVX-512 VNNI");
     if (options.gpu) {
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
       if (!std::isfinite(options.gpu_cache_gb) || options.gpu_cache_gb <= 0.0 ||
           options.gpu_cache_gb > 1024.0)
         return std::unexpected("exl3_gpu_cache_gb must be in (0, 1024]");
@@ -58,7 +58,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
       engine.exl3_gpu = std::make_shared<Exl3GpuExecutor>(
           options.gpu_device, static_cast<size_t>(options.gpu_cache_gb * 1024.0 * 1024.0 * 1024.0));
 #else
-      return std::unexpected("EXL3 GPU dispatch requires a CUDA-enabled MoEStream build");
+      return std::unexpected("EXL3 GPU dispatch requires a CUDA-enabled ZeroMoE build");
 #endif
     }
     if (!engine.build_from_exl3(options.model_path, options.metadata_model_path,
@@ -71,14 +71,14 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
       if (!engine.exl3_gpu || options.gpu_expert_split_layer <= options.gpu_expert_layer_begin ||
           options.gpu_expert_split_layer >= layer_count)
         return std::unexpected("EXL3 GPU split layer must divide the GPU expert range");
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
       engine.exl3_gpu_secondary = std::make_shared<Exl3GpuExecutor>(
           options.gpu_split_device,
           static_cast<size_t>(options.gpu_split_cache_gb * 1024.0 * 1024.0 * 1024.0));
       engine.exl3_gpu_expert_split_layer = options.gpu_expert_split_layer;
 #endif
     }
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
     if (engine.exl3_gpu) {
       LOG_STREAM_INFO() << "[EXL3-GPU] HC device chain: "
                         << (options.gpu_hc ? "enabled" : "disabled") << "\n";
@@ -194,7 +194,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
     int output_tokens = 0;
     auto first_output = std::chrono::steady_clock::now();
     auto last_output = first_output;
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
     Exl3GpuStats first_output_stats;
     Exl3GpuStats last_output_stats;
     const auto gpu_profile = [&] {
@@ -244,7 +244,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
       last_cpu_matmul_seconds = engine.exl3_cpu_matmul_seconds;
       last_cpu_weight_load_seconds = engine.exl3_cpu_weight_load_seconds;
       last_layer_seconds = layer_seconds;
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
       if (engine.exl3_gpu) last_output_stats = gpu_profile();
 #endif
       if (output_tokens++ == 0) {
@@ -253,7 +253,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
         first_cpu_matmul_seconds = last_cpu_matmul_seconds;
         first_cpu_weight_load_seconds = last_cpu_weight_load_seconds;
         first_layer_seconds = last_layer_seconds;
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
         first_output_stats = last_output_stats;
 #endif
       }
@@ -315,7 +315,7 @@ std::expected<void, std::string> run_exl3_decode(const Exl3DecodeOptions &option
     LOG_STREAM_INFO() << "[EXL3] Decode completed in "
                       << std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count()
                       << " s; resident tensors=" << engine.resident_layers.size() << "\n";
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
     if (engine.exl3_gpu) {
       const auto stats = gpu_profile();
       if (intervals > 0) {

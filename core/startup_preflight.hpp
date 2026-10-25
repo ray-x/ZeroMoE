@@ -2,8 +2,8 @@
 //
 // Real, cheap sanity checks run once at startup, BEFORE any RAM-tier
 // allocation, [PIN] preload, or GPU VRAM pool allocation begins -- direct
-// response to a real incident: a second moestream instance was launched
-// (a mixed-precision smoke test) while an existing, independent moestream
+// response to a real incident: a second zeromoe instance was launched
+// (a mixed-precision smoke test) while an existing, independent zeromoe
 // benchmark was already running, and the box crashed hard enough to force
 // a reboot. Both processes assumed they each owned the FULL configured
 // host_ram_gb/VRAM budget; running two together drove the box into swap
@@ -15,7 +15,7 @@
 //
 // Three checks, all fail-closed (refuse to start rather than silently
 // proceed and risk repeating the incident):
-//   1. Another live process literally named "moestream" -- the single
+//   1. Another live process literally named "zeromoe" -- the single
 //      most direct, surgical signal for the exact incident above.
 //   2. Real host RAM headroom (/proc/meminfo's MemAvailable, the kernel's
 //      own "how much could actually be allocated right now without
@@ -80,14 +80,14 @@ inline double default_host_margin_gb(double required_host_ram_gb) {
 }
 
 // Scans /proc/<pid>/comm for any OTHER live process literally named
-// "moestream" (this binary's own comm name -- confirmed via /proc, not
+// "zeromoe" (this binary's own comm name -- confirmed via /proc, not
 // argv[0], since argv[0] can be an arbitrary invocation path while comm
 // is the kernel's own 15-byte task name, stable regardless of how the
 // binary was invoked). own_pid is excluded so this process is never
 // self-flagged. A read failing for an individual /proc/<pid> entry (the
 // process exited between readdir() and the open, a normal race) is
 // silently skipped, not treated as a match.
-inline std::vector<int> find_other_moestream_pids(pid_t own_pid) {
+inline std::vector<int> find_other_zeromoe_pids(pid_t own_pid) {
   std::vector<int> found;
   DIR *d = opendir("/proc");
   if (!d)
@@ -102,7 +102,7 @@ inline std::vector<int> find_other_moestream_pids(pid_t own_pid) {
       continue;
     std::ifstream f("/proc/" + std::string(entry->d_name) + "/comm");
     std::string comm;
-    if (f && std::getline(f, comm) && comm == "moestream")
+    if (f && std::getline(f, comm) && comm == "zeromoe")
       found.push_back((int)pid);
   }
   closedir(d);
@@ -119,7 +119,7 @@ inline int host_admission_lock_fd = -1;
 
 inline bool acquire_host_admission_lock() {
   if (host_admission_lock_fd >= 0) return true;
-  constexpr const char *kLockPath = "/tmp/moestream-host-admission.lock";
+  constexpr const char *kLockPath = "/tmp/zeromoe-host-admission.lock";
   const int fd = open(kLockPath, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
   if (fd < 0) {
     fprintf(stderr,
@@ -130,7 +130,7 @@ inline bool acquire_host_admission_lock() {
   }
   if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
     fprintf(stderr,
-            "[PREFLIGHT] FATAL: another MoEStream process currently holds "
+            "[PREFLIGHT] FATAL: another ZeroMoE process currently holds "
             "the host admission lock; refusing concurrent startup. Stop it "
             "first, or pass --force-start only when the workloads are known "
             "to be safe and disjoint (%s).\n",
@@ -160,7 +160,7 @@ inline void release_host_admission_lock() {
 // gpu_device_ids is this run's own resolved config.gpus[*].device_id
 // list. `force` (wired to a new --force-start CLI flag, main.cpp-local,
 // not a TOML config field) lets an operator proceed anyway when they are
-// certain it's safe -- e.g. two moestream instances deliberately using
+// certain it's safe -- e.g. two zeromoe instances deliberately using
 // disjoint GPU sets -- but always after seeing every real number that
 // would otherwise have blocked the start.
 inline bool run(double required_host_ram_gb,
@@ -175,10 +175,10 @@ inline bool run(double required_host_ram_gb,
   bool ok = true;
 
   pid_t self = getpid();
-  auto others = find_other_moestream_pids(self);
+  auto others = find_other_zeromoe_pids(self);
   if (!others.empty()) {
     fprintf(stderr,
-            "[PREFLIGHT] FATAL: %zu other moestream process(es) already "
+            "[PREFLIGHT] FATAL: %zu other zeromoe process(es) already "
             "running (pid",
             others.size());
     for (int p : others)
@@ -213,7 +213,7 @@ inline bool run(double required_host_ram_gb,
               "this box's own zram swap is already confirmed pathological "
               "for this workload (real CPU cost, ~1.0x compression on "
               "already-quantized expert weights -- zero real capacity "
-              "gained). Free memory (check for another moestream or "
+              "gained). Free memory (check for another zeromoe or "
               "otherwise heavy process), or lower host_ram_gb, and "
               "retry -- or pass --force-start if you are certain this is "
               "safe.\n",

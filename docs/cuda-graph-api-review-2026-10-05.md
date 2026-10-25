@@ -1,4 +1,4 @@
-# CUDA graph API review for MoEStream
+# CUDA graph API review for ZeroMoE
 
 This review checks the proposed stream-priority, capture, graph-memory, TMA,
 and host-event ideas against the engine's current GGML graph boundary and

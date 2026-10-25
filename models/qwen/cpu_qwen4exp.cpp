@@ -5,10 +5,10 @@
 #include "ple_hash.hpp"
 #include "rope.hpp"
 #include "exl3_cpu.hpp"
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
 #include "exl3_gpu.hpp"
 #endif
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include "exl3_ggml_model.hpp"
 #endif
 #include <stdexcept>
@@ -22,7 +22,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
 #endif
@@ -41,7 +41,7 @@ bool try_exl3_gpu_hc_mix(const CPUEngine &engine,
                           const std::string &inject_name, const float *normed,
                           float *hidden, float *injection, int rows, int width,
                           int streams, int rank, bool divide_each_stream) {
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
   if (!engine.exl3_gpu || !engine.config.exl3_gpu_hc) return false;
   const auto *down = engine.find_layer(down_name);
   const auto *up = engine.find_layer(up_name);
@@ -128,7 +128,7 @@ bool CPUQwen4ExpBackend::dequant_row(const CPUQuantizedTensor &t, int row,
       out[i] = bf16_to_float(p[i]);
     return true;
   }
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
   return ggml_dequant_row(static_cast<uint32_t>(t.meta.type), src, out, n) !=
          0;
 #else
@@ -167,9 +167,9 @@ bool CPUQwen4ExpBackend::dense_matmul(CPUEngine &engine,
       (t->meta.shape.size() != 2 || t->meta.shape[0] != static_cast<uint64_t>(I) ||
        t->meta.shape[1] != static_cast<uint64_t>(O)))
     throw std::runtime_error("EXL3 projection shape mismatch: " + name);
-#ifdef MOESTREAM_EXL3_CUDA
+#ifdef ZEROMOE_EXL3_CUDA
   if (engine.exl3_gpu) {
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
     const std::string graph_key = std::to_string(S) + ":" +
                                   std::to_string(I) + ":" +
                                   std::to_string(O);
@@ -928,7 +928,7 @@ void CPUQwen4ExpBackend::forward_moe(CPUEngine &engine, int layer_idx,
           for (int i = 0; i < n; ++i) dst[i] = bf16_to_float(p[i]);
           return true;
         }
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
         return ggml_dequant_row(static_cast<uint32_t>(type), src, dst, n) != 0;
 #else
         return false;

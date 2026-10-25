@@ -7,8 +7,8 @@ languages, CS fundamentals, code review/debug/explain with real embedded
 code, daily-life/general questions, and one resume-improvement prompt)
 against the real production GLM-5.3 model (mirror_model_path stays enabled,
 freeze_usage_stats disabled) so RamSafetyManager/GpuTopology's routing
-histogram (.moestream_usage-equivalent, redirected to a dedicated
-`moestream_usage_survey` file so this doesn't pollute the live production
+histogram (.zeromoe_usage-equivalent, redirected to a dedicated
+`zeromoe_usage_survey` file so this doesn't pollute the live production
 usage file) accumulates real per-(layer,expert) hit counts across a
 realistic prompt mix. Purpose: identify genuinely infrequently-used experts
 as real candidates for a future IQ1_S conversion, instead of guessing.
@@ -20,7 +20,7 @@ run's own debug log to responses/NNN_slug.log. index.tsv accumulates one
 row per prompt with status/timing so progress can be checked at any point
 without waiting for the whole batch.
 
-Runs strictly sequentially (one moestream process at a time -- this engine
+Runs strictly sequentially (one zeromoe process at a time -- this engine
 owns the GPUs exclusively). Designed to be safe to re-run: if index.tsv
 already has a COMPLETED row for a given id, that prompt is skipped, so an
 interrupted batch can just be restarted.
@@ -37,33 +37,33 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
-MOESTREAM = Path(os.environ.get("MOESTREAM_SURVEY_BINARY",
-                               str(REPO / "build" / "moestream")))
-CONFIG = Path(os.environ.get("MOESTREAM_SURVEY_CONFIG",
+ZEROMOE = Path(os.environ.get("ZEROMOE_SURVEY_BINARY",
+                               str(REPO / "build" / "zeromoe")))
+CONFIG = Path(os.environ.get("ZEROMOE_SURVEY_CONFIG",
                             str(HERE / "survey_config.toml")))
-PROMPTS_DIR = Path(os.environ.get("MOESTREAM_SURVEY_PROMPTS_DIR",
+PROMPTS_DIR = Path(os.environ.get("ZEROMOE_SURVEY_PROMPTS_DIR",
                                   str(HERE / "prompts")))
-RESPONSES_DIR = Path(os.environ.get("MOESTREAM_SURVEY_RESPONSES_DIR",
+RESPONSES_DIR = Path(os.environ.get("ZEROMOE_SURVEY_RESPONSES_DIR",
                                    str(HERE / "responses")))
-INDEX_TSV = Path(os.environ.get("MOESTREAM_SURVEY_INDEX",
+INDEX_TSV = Path(os.environ.get("ZEROMOE_SURVEY_INDEX",
                                str(HERE / "index.tsv")))
-SURVEY_LOG = Path(os.environ.get("MOESTREAM_SURVEY_LOG",
+SURVEY_LOG = Path(os.environ.get("ZEROMOE_SURVEY_LOG",
                                 str(HERE / "survey_debug.log")))
-USAGE_FILE = Path(os.environ.get("MOESTREAM_SURVEY_USAGE_FILE",
-                               str(HERE / "moestream_usage_survey")))
-ENGINE_LOG_PATH = os.environ.get("MOESTREAM_SURVEY_ENGINE_LOG_PATH", "")
-USE_GDB = os.environ.get("MOESTREAM_SURVEY_GDB", "0") == "1"
+USAGE_FILE = Path(os.environ.get("ZEROMOE_SURVEY_USAGE_FILE",
+                               str(HERE / "zeromoe_usage_survey")))
+ENGINE_LOG_PATH = os.environ.get("ZEROMOE_SURVEY_ENGINE_LOG_PATH", "")
+USE_GDB = os.environ.get("ZEROMOE_SURVEY_GDB", "0") == "1"
 
-NGEN = int(os.environ.get("MOESTREAM_SURVEY_NGEN", "128"))
-FORCE_RERUN = os.environ.get("MOESTREAM_SURVEY_FORCE_RERUN", "0") == "1"
-PERSISTENT = os.environ.get("MOESTREAM_SURVEY_PERSISTENT", "0") == "1"
+NGEN = int(os.environ.get("ZEROMOE_SURVEY_NGEN", "128"))
+FORCE_RERUN = os.environ.get("ZEROMOE_SURVEY_FORCE_RERUN", "0") == "1"
+PERSISTENT = os.environ.get("ZEROMOE_SURVEY_PERSISTENT", "0") == "1"
 PER_PROMPT_TIMEOUT_S = 900  # generous margin above the ~200-250s expected
 
 
 def engine_env():
     """Return the child environment, including an explicit CUDA mask if set."""
     env = os.environ.copy()
-    visible = os.environ.get("MOESTREAM_SURVEY_CUDA_VISIBLE_DEVICES")
+    visible = os.environ.get("ZEROMOE_SURVEY_CUDA_VISIBLE_DEVICES")
     if visible is not None:
         env["CUDA_VISIBLE_DEVICES"] = visible
     return env
@@ -410,7 +410,7 @@ def run_one(idx, category, slug, text):
     stdout_text = ""
     try:
         command = [
-            str(MOESTREAM),
+            str(ZEROMOE),
             "--config",
             str(CONFIG),
             "--ngen",
@@ -419,7 +419,7 @@ def run_one(idx, category, slug, text):
         ]
         if ENGINE_LOG_PATH:
             command += ["--log-path", ENGINE_LOG_PATH]
-        survey_pin_file = os.environ.get("MOESTREAM_SURVEY_PIN_FILE")
+        survey_pin_file = os.environ.get("ZEROMOE_SURVEY_PIN_FILE")
         if survey_pin_file:
             command += ["--pin-file", survey_pin_file]
         command = wrap_engine_command(command)
@@ -478,7 +478,7 @@ def run_persistent(items):
         prompt_lines.append(text.replace("\n", "\\n"))
 
     command = [
-        str(MOESTREAM),
+        str(ZEROMOE),
         "--config",
         str(CONFIG),
         "--ngen",
@@ -487,7 +487,7 @@ def run_persistent(items):
     ]
     if ENGINE_LOG_PATH:
         command += ["--log-path", ENGINE_LOG_PATH]
-    survey_pin_file = os.environ.get("MOESTREAM_SURVEY_PIN_FILE")
+    survey_pin_file = os.environ.get("ZEROMOE_SURVEY_PIN_FILE")
     if survey_pin_file:
         command += ["--pin-file", survey_pin_file]
     command = wrap_engine_command(command)
@@ -624,8 +624,8 @@ def main():
     CONFIG = Path(args.config).resolve()
     NGEN = args.ngen
 
-    if not MOESTREAM.exists():
-        print(f"ERROR: {MOESTREAM} not found — build it first (cmake --build build --target moestream)", file=sys.stderr)
+    if not ZEROMOE.exists():
+        print(f"ERROR: {ZEROMOE} not found — build it first (cmake --build build --target zeromoe)", file=sys.stderr)
         sys.exit(1)
 
     PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -672,7 +672,7 @@ def main():
                     layer, expert, count = int(parts[0]), int(parts[1]), int(parts[2])
                     entries.append((layer, expert, count))
         entries.sort(key=lambda e: e[2])
-        print(f"\n.moestream_usage_survey: {len(entries)} (layer,expert) pairs recorded.")
+        print(f"\n.zeromoe_usage_survey: {len(entries)} (layer,expert) pairs recorded.")
         print("Coldest 20:")
         for layer, expert, count in entries[:20]:
             print(f"  layer={layer} expert={expert} count={count}")

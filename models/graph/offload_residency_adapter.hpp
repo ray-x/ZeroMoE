@@ -12,18 +12,18 @@
 #include <memory>
 #include <string>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 struct OffloadResidencyFlight {
-  moestream::offload::ExpertResidency::Plan plan;
-  std::future<moestream::offload::ExpertResidency::Ensure> result;
+  zeromoe::offload::ExpertResidency::Plan plan;
+  std::future<zeromoe::offload::ExpertResidency::Ensure> result;
   std::chrono::steady_clock::time_point started;
   int routes = 0;
 };
 
 inline void account_offload_ensure(
-    moestream::offload::ExpertStore &store, int routes,
-    const moestream::offload::ExpertResidency::Ensure &result,
+    zeromoe::offload::ExpertStore &store, int routes,
+    const zeromoe::offload::ExpertResidency::Ensure &result,
     std::chrono::steady_clock::time_point started) {
   auto &ct = store.counters();
   ct.calls.fetch_add(1, std::memory_order_relaxed);
@@ -45,7 +45,7 @@ inline void account_offload_ensure(
 }
 
 inline ColdMoEAdapter make_offload_residency_adapter(
-    moestream::offload::ExpertStore &store, int layer, bool split_load,
+    zeromoe::offload::ExpertStore &store, int layer, bool split_load,
     std::string log_tag = "[MOE-OFFLOAD]") {
   ColdMoEAdapter adapter;
   if (split_load && store.async_loads()) {
@@ -56,7 +56,7 @@ inline ColdMoEAdapter make_offload_residency_adapter(
       flight->routes = n;
       flight->plan = store.begin_ensure(
           layer, experts, n,
-          moestream::offload::ExpertCache::Kind::Demand);
+          zeromoe::offload::ExpertCache::Kind::Demand);
       pending = flight->plan.to_load;
       pending.insert(pending.end(), flight->plan.to_wait.begin(),
                      flight->plan.to_wait.end());
@@ -86,7 +86,7 @@ inline ColdMoEAdapter make_offload_residency_adapter(
       const auto started = std::chrono::steady_clock::now();
       const auto result = store.ensure(
           layer, experts, n,
-          moestream::offload::ExpertCache::Kind::Demand);
+          zeromoe::offload::ExpertCache::Kind::Demand);
       account_offload_ensure(store, n, result, started);
       if (result.errors > 0) {
         LOG_ERROR("%s layer %d: %d expert load error(s); refusing compute\n",
@@ -100,4 +100,4 @@ inline ColdMoEAdapter make_offload_residency_adapter(
   return adapter;
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

@@ -42,7 +42,13 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   // HC/GDN GGML runners borrow their weight pointers from this shared dense
   // pool, avoiding a second private CUDA copy. Host copies remain in
   // resident_layers for registration and CPU fallback.
+  const FullGraphModel *gm = engine.family_ops.graph_model;
+  const bool embedding_on_gpu = zeromoe::memory::embedding_on_gpu(
+      config.embedding_device, gm && gm->embedding_on_gpu());
+  LOG_STREAM_INFO() << "[CUDA] token_embd.weight stays on the " << (embedding_on_gpu ? "GPU (dense pool)" : "CPU (host copy only)")
+                    << " (embedding_device=" << config.embedding_device << ")\n";
   auto is_dense_offload_candidate = [&](const std::string &name) {
+    if (name == "token_embd.weight" && !embedding_on_gpu) return false;
     // attn_k_b/attn_v_b are dequantized ONCE, CPU-side, straight from
     // host_ptr into the MLA absorption cache (wuk_cache/wuv_cache,
     // attention_layer.cpp's mla_attention_absorbed_gguf) -- dense_proj
@@ -195,7 +201,7 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
   int gate_inp_scheduler_kept = 0;
   size_t gate_inp_bf16_bytes_used = 0, gate_inp_f32_equivalent_bytes = 0;
   const bool disable_router_bf16 = [] {
-    const char *value = std::getenv("MOESTREAM_DISABLE_ROUTER_BF16");
+    const char *value = std::getenv("ZEROMOE_DISABLE_ROUTER_BF16");
     return value && value[0] == '1';
   }();
   // llama.cpp's CPU-MoE topology keeps the router projection on CUDA and moves only
@@ -666,39 +672,35 @@ std::expected<void, std::string> EngineRunner::offload_dense_tensors() {
       std::find(gpu.topology.vault_gpus.begin(), gpu.topology.vault_gpus.end(),
                 gpu.topology.core_gpu) != gpu.topology.vault_gpus.end();
   double core_moe_cache_gb_cfg = 0.0;
+  double core_moe_cache_reserve_gb = 0.0;
   for (auto &gc : config.gpus) {
     if (gc.device_id == gpu.device_id) {
       core_moe_cache_gb_cfg = gc.moe_cache_gb;
+      core_moe_cache_reserve_gb = gc.moe_cache_reserve_gb;
       break;
     }
   }
-  if (!already_primary_vault && core_moe_cache_gb_cfg > 0.0 &&
-      expert_slab_bytes > 0) {
-    // Same 1 GB margin style as FAST_PATH_SAFETY_MARGIN above -- leaves
-    // room for CUDA context growth, cuBLAS workspace, and prefill-time
-    // scratch buffer growth (d_x/d_y/d_x_bf16) that hasn't happened yet
-    // at this point in startup.
-    constexpr size_t CORE_VAULT_SAFETY_MARGIN = (size_t)1 << 30;
-    size_t requested_bytes = (size_t)(core_moe_cache_gb_cfg * 1e9);
-    size_t real_free = gpu.core_free_vram_bytes();
-    size_t safe_cap = (real_free > CORE_VAULT_SAFETY_MARGIN)
-                          ? (real_free - CORE_VAULT_SAFETY_MARGIN)
-                          : 0;
-    size_t cap_bytes = std::min(requested_bytes, safe_cap);
-    if (cap_bytes >= expert_slab_bytes) {
-      gpu.topology.add_dual_role_expert_cache(gpu.topology.core_gpu, cap_bytes,
-                                              expert_slab_bytes);
-      gpu.report_vram_usage("after CoreEngine dual-role expert cache");
-      gpu.report_vram_breakdown("after CoreEngine dual-role expert cache",
-                                fast_bytes_used, fast_converted);
+  if (!already_primary_vault && expert_slab_bytes > 0 &&
+      (core_moe_cache_gb_cfg > 0.0 || core_moe_cache_reserve_gb > 0.0)) {
+    const bool fit = core_moe_cache_reserve_gb > 0.0;
+    const size_t real_free = gpu.core_free_vram_bytes();
+    const size_t reserve = fit ? size_t(core_moe_cache_reserve_gb * 1e9) : (size_t(1) << 30);
+    const auto budget = zeromoe::memory::expert_cache_budget(
+        real_free, real_free, size_t(core_moe_cache_gb_cfg * 1e9), reserve, fit, true);
+    if (fit) {
+      LOG_STREAM_INFO() << "[VRAM-FIT] device " << gpu.device_id << ": " << real_free / 1e9
+                        << " GB free after dense, reserve " << core_moe_cache_reserve_gb
+                        << " GB -> expert cache " << budget.bytes / 1e9
+                        << " GB (moe_cache_gb=" << core_moe_cache_gb_cfg << " ignored)\n";
+    }
+    if (budget.bytes >= expert_slab_bytes) {
+      gpu.topology.add_dual_role_expert_cache(gpu.topology.core_gpu,
+                                            budget.bytes, expert_slab_bytes);
+      gpu.report_vram_usage("after CoreEngine dual-role MoE cache alloc");
+      gpu.report_vram_breakdown("after CoreEngine dual-role MoE cache alloc", fast_bytes_used, fast_converted);
     } else {
-      LOG_STREAM_WARN()
-          << "[GPU] CoreEngine dual-role expert cache requested ("
-          << core_moe_cache_gb_cfg << " GB) but only " << safe_cap / 1e9
-          << " GB safely free after reserving "
-          << CORE_VAULT_SAFETY_MARGIN / 1e9
-          << " GB margin -- skipped (need at least one expert slab, "
-          << expert_slab_bytes / 1e9 << " GB).\n";
+      LOG_STREAM_WARN() << "[GPU] CoreEngine expert cache disabled: " << real_free / 1e9
+                        << " GB free, " << reserve / 1e9 << " GB reserved\n";
     }
   }
 

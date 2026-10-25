@@ -15,6 +15,7 @@
 #include "expert_cache.hpp"
 #include "early_ready_lane.hpp"
 #include "expert_store.hpp"
+#include "phase_expert_cache.hpp"
 #include "offload_store.hpp"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -53,7 +54,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cuda_runtime.h>
 
@@ -106,13 +107,13 @@ int gpu_assist2_device(int core_device);
 int gpu_assist2_slots();
 // True when every routed-expert plane of `layer` has a type worth assisting on the GPU (see settings).
 bool gpu_assist_layer_ok(const FullGraph &g, int layer);
-// Keep the CPU lane on layers that also have a GPU1 hot branch (MOESTREAM_GLM5NEXT_LANE_WITH_GPU1, default on).
+// Keep the CPU lane on layers that also have a GPU1 hot branch (ZEROMOE_GLM5NEXT_LANE_WITH_GPU1, default on).
 bool lane_with_gpu1_wanted();
 OffloadState *get_offload(const StreamingEngine &engine, const std::vector<PartialExpertLayer> *partial = nullptr);
 void offload_miss_cb(ggml_tensor *dst, const ggml_tensor *a, int ith, int, void *ud);
 ggml_tensor *offload_weight(FullGraph &g, ggml_context *ctx, int layer, const char *stem);
 ggml_tensor *offload_miss_node(FullGraph &g, ggml_context *ctx, int layer, ggml_tensor *ids);
-// Prefill speculative prefetch (MOESTREAM_GLM5NEXT_PREFILL_PREFETCH=1): device-resident, compact cold-expert weights of a
+// Prefill speculative prefetch (ZEROMOE_GLM5NEXT_PREFILL_PREFETCH=1): device-resident, compact cold-expert weights of a
 // layer, filled ahead of the layer by a copy stream. Null when the layer is not prefetched.
 bool prefetch_layer_active(int layer);
 bool prefetch_ring_was_built();      // a ring was allocated for the graph that was just built or declined
@@ -243,6 +244,7 @@ extern std::unique_ptr<FullGraph> g_glm5next_source;
 extern GpuTopology *g_glm5next_vram_cache;
 extern StreamingEngine *g_glm5next_decode_disabled_engine;
 extern std::unique_ptr<OffloadState> g_offload;
+extern std::unique_ptr<zeromoe::graph::PhaseExpertCache> g_phase_cache;
 extern std::mutex g_offload_mutex;
 extern std::unique_ptr<StageRuntime> g_stage;
 extern bool g_stage_failed;
@@ -264,14 +266,14 @@ struct OffloadSite {
 };
 
 // The GLM graph's view of the DDR expert tier: the tier itself is
-// moestream::offload::ExpertStore; this adds the per-site records the miss
+// zeromoe::offload::ExpertStore; this adds the per-site records the miss
 // nodes point at and short aliases for the store's parts.
 struct OffloadState {
   int first = 0, n_layers = 0, n_experts = 0;
-  std::unique_ptr<moestream::offload::ExpertStore> store;
-  moestream::offload::ExpertCache *cache = nullptr;
-  moestream::offload::VirtualArena *arena = nullptr;
-  moestream::offload::ExpertResidency *residency = nullptr;
+  std::unique_ptr<zeromoe::offload::ExpertStore> store;
+  zeromoe::offload::ExpertCache *cache = nullptr;
+  zeromoe::offload::VirtualArena *arena = nullptr;
+  zeromoe::offload::ExpertResidency *residency = nullptr;
   std::deque<OffloadSite> sites;
   // Most recently built batched (prefill) miss site of a layer, or nullptr.
   const OffloadSite *site_for_layer(int layer) const {
@@ -429,10 +431,10 @@ struct PackedGateUpMeta {
   size_t bytes = 0;
 };
 
-// MOESTREAM_GLM5NEXT_ROUTE_TAP=<file>: accumulate per-(layer,expert) decode
+// ZEROMOE_GLM5NEXT_ROUTE_TAP=<file>: accumulate per-(layer,expert) decode
 // routing counts and rewrite <file> ("layer expert count" lines, the same
-// format as the .moestream_usage files) every 25 tokens.  Needs
-// MOESTREAM_GLM5NEXT_CACHE_STATS=1 (which creates the per-layer id snapshots).
+// format as the .zeromoe_usage files) every 25 tokens.  Needs
+// ZEROMOE_GLM5NEXT_CACHE_STATS=1 (which creates the per-layer id snapshots).
 // Existing counts in <file> are loaded first so runs accumulate.
 struct RouteTap {
   std::string path;
@@ -448,4 +450,4 @@ struct RouteTap {
 // Records what the next prefill chunk continues from (defined in ggml_glm5next_graph.cpp).
 void glm5next_publish_continuation(StreamingEngine &engine, glm5next_graph::FullGraph &g);
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

@@ -1,4 +1,4 @@
-# MoEStream — GLM-5.2 CPU-ONLY config (all compute on CPU, no GPU dispatch)
+# ZeroMoE — GLM-5.2 CPU-ONLY config (all compute on CPU, no GPU dispatch)
 #
 # This is the "Run B" isolation config for the random-text investigation: it is
 # glm52_dual.toml with `cpu_only = true` added. With that flag set, dense_proj /
@@ -8,11 +8,11 @@
 # whether the garbage output comes from a GPU-side bug (async-upload race,
 # device/stream, a fused kernel) vs a CPU math bug.
 #
-#   Compare against:  ./build/moestream --config configs/glm52_dual.toml        (GPU on)
-#   This run:         ./build/moestream --config configs/glm52_cpuonly.toml     (GPU off)
+#   Compare against:  ./build/zeromoe --config configs/glm52_dual.toml        (GPU on)
+#   This run:         ./build/zeromoe --config configs/glm52_cpuonly.toml     (GPU off)
 #
 # Equivalent one-liner without a new config (env var, same effect):
-#   MOESTREAM_CPU_ONLY=1 ./build/moestream --config configs/glm52_dual.toml
+#   ZEROMOE_CPU_ONLY=1 ./build/zeromoe --config configs/glm52_dual.toml
 #
 # NOTE: much slower than GPU (experts dequant+matmul on CPU every token). That's
 # expected -- correctness isolation, not throughput.
@@ -33,7 +33,7 @@ cpu_only = true
 host_ram_gb          = 60.0
 verbose_moe_log      = false
 promote_hit_threshold = 2
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Capped (was 0/auto-fill-available-capacity) -- see glm52_3090_5060.toml's
 # comment / CLAUDE.md for the real-run regression this fixes.

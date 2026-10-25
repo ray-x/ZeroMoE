@@ -1,4 +1,4 @@
-# Where MoEStream still uses CUDA directly (not through ggml)
+# Where ZeroMoE still uses CUDA directly (not through ggml)
 
 Audit of 2026-10-18 on `master` (`703dde9`). Method: static references only
 (`git grep` of the exported entry points of every `cuda/*.cu`, and of raw
@@ -31,7 +31,7 @@ candidate for replacement.
 | `rmsnorm.cu` | 78 | `cuda_manager.hpp` | layered |
 | `wuv_int8_dequant.cu` | 80 | `cuda_manager.hpp`, `attention_layer.cpp` | layered MLA |
 | `matmul.cu`, `dequant_bf16.cu`, `iq1_dequant.cu`, `iq2/3/4xs_matmul.cu`, `mxfp4_matmul.cu`, `q2_0/q5_1/q8_0_matmul.cu` | 128 to 404 each | `cuda_manager.hpp`, `cuda_kernel_dispatcher.cpp`, `kquant_dequant.hpp`, `main_test.cpp` | layered dense GEMV/dequant for every quant type |
-| `kquant_matmul.cu` | 728 | `ggml_f32_quant_backend.hpp`, `ggml_deepseek_v41_graph.cpp`, DSV4.1 tests (NOT `cuda_manager.hpp`) | **DSV4.1 graph, kind 2**: `moestream_install_f32_quant_graph_hook()` routes ggml ops to q2_K/q3_K kernels |
+| `kquant_matmul.cu` | 728 | `ggml_f32_quant_backend.hpp`, `ggml_deepseek_v41_graph.cpp`, DSV4.1 tests (NOT `cuda_manager.hpp`) | **DSV4.1 graph, kind 2**: `zeromoe_install_f32_quant_graph_hook()` routes ggml ops to q2_K/q3_K kernels |
 | `expert_accum.cu` | 60 | `cuda_manager.hpp`, `ggml_moe_backend.cpp`, `ggml_moe_runner.cpp` | kind 2 and 3 |
 | `expert_activation.cu` | 70 | `gpu_expert_executor.cpp` | layered expert FFN |
 | `ggml_moe_pack.cu` | 179 | `ggml_moe_backend.cpp`, `ggml_moe_transfer_manager.cpp` | kind 2 |
@@ -52,7 +52,7 @@ candidate for replacement.
   `tests_gpu_attention.cpp`. Deleting them is a separate change that needs the user's
   go-ahead because the same file also serves GLM.
 * GLM5Next (Flash) still has layered kernels (`glm5next_kda`, `glm5next_router`)
-  because its full graph is opt-in (`MOESTREAM_GLM5NEXT_FULL_GRAPH`) and not yet
+  because its full graph is opt-in (`ZEROMOE_GLM5NEXT_FULL_GRAPH`) and not yet
   required for every request shape.
 * GLM-5.3 (non-Flash) and older DeepSeek paths depend on all of kind 3. Replacing it
   means building a full graph for that family first, which is the GLM work planned in

@@ -22,7 +22,7 @@ struct PilotRidgeTable {
   }
   static PilotRidgeTable load(const char *env_name, const char *tag) {
     PilotRidgeTable t;
-    const char *path = moestream::graphcfg::env(env_name);
+    const char *path = zeromoe::graphcfg::env(env_name);
     if (!path || !path[0]) return t;
     FILE *f = std::fopen(path, "rb");
     if (!f) { std::fprintf(stderr, "[%s] cannot open %s\n", tag, path); return t; }

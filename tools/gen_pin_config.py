@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a cpu_affinity_layers / pin_strategy TOML block from a MoEStream
+"""Generate a cpu_affinity_layers / pin_strategy TOML block from a ZeroMoE
 usage histogram (the pin_file format: "layer expert count" per line).
 
 Approach (config-only, no new engine code -- see pin_strategy="global_topn"

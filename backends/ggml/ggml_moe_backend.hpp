@@ -16,7 +16,7 @@
 // GGML_OP_MUL_MAT_ID nodes in one backend graph; ggml-cuda sorts token rows by
 // expert ON THE GPU (get_rows into a sorted scratch buffer), derives expert
 // bounds, and dispatches one grouped matmul per expert without ever returning
-// to C++. This adapter builds that same graph against MoEStream's own streamed
+// to C++. This adapter builds that same graph against ZeroMoE's own streamed
 // weights so the two execution models can be compared directly. When a routed
 // expert already has a persistent page-locked RAM-tier slab, its three
 // projection planes are copied directly on the copy stream; otherwise the
@@ -49,7 +49,7 @@
 // Removing that final transfer/compute serialization requires a chunk-level
 // graph, which is deliberately left out of this correctness-first change.
 //
-// This header is ALWAYS compilable. Without MOESTREAM_USE_GGML_CUDA every
+// This header is ALWAYS compilable. Without ZEROMOE_USE_GGML_CUDA every
 // entry point returns false/zero and the caller falls back to its own
 // dispatch, so execution_layer.cpp needs no #ifdef at the call sites.
 // ---------------------------------------------------------------------------
@@ -77,7 +77,7 @@ void set_ggml_moe_async_graph_reuse(bool enabled);
 // both cheaper than a backend per subsystem and the precondition for ever
 // fusing these graphs into a single per-layer graph. Returns a ggml_backend_t
 // as void* so this header stays includable without ggml's own headers.
-// Returns nullptr when built without MOESTREAM_USE_GGML_CUDA.
+// Returns nullptr when built without ZEROMOE_USE_GGML_CUDA.
 void *ggml_shared_backend(int device);
 
 // GPU router for Qwen4Exp's device-resident HC output.  The runner mirrors
@@ -344,7 +344,7 @@ class GgmlQwenSharedRunner {
 // resident [ne0,ne1] F32 tensor matching exactly what GgmlQwenSharedRunner::
 // run()'s device_x/routed_output parameters expect (type/ne/nb/data/buffer
 // all checked there), without main_test.cpp needing its own raw ggml.h
-// includes. Returns false/no-op without MOESTREAM_USE_GGML_CUDA. Caller
+// includes. Returns false/no-op without ZEROMOE_USE_GGML_CUDA. Caller
 // owns *out_ctx/*out_buf and must free them via
 // ggml_moe_test_free_device_tensor once done with *out_tensor.
 bool ggml_moe_test_make_device_tensor(int device, int64_t ne0, int64_t ne1,
@@ -375,7 +375,7 @@ struct GgmlMoeLayerPlan {
   // source_tokens at zero and use n_tokens for both dimensions.
   int source_tokens = 0;
   bool chunked = false;
-  // GGUFType numeric values. MoEStream's GGUFType is ggml's own numbering
+  // GGUFType numeric values. ZeroMoE's GGUFType is ggml's own numbering
   // (see include/gguf_loader.hpp's enum, which documents the 2026 renumbering
   // it was corrected against), so these are cast straight to ggml_type.
   uint32_t gate_type = 0;
@@ -482,7 +482,7 @@ class GgmlMoeRunner : private moe::GgmlMoeTransferManager {
   static constexpr int NWEIGHT_EVENTS =
       moe::GgmlMoeTransferManager::kWeightEvents;
 
-  // False when built without MOESTREAM_USE_GGML_CUDA. Checked before anything
+  // False when built without ZEROMOE_USE_GGML_CUDA. Checked before anything
   // else so the flag can be left set in a config that is also used by a build
   // without the backend.
   static bool compiled_in();
@@ -996,7 +996,7 @@ class GgmlQwenCpuMoeRunner {
   bool wait_strided_async();
 
   // Actual GGML worker count for diagnostics. This may differ from the
-  // process-wide OpenMP maximum when MOESTREAM_QWEN_CPU_THREADS is used.
+  // process-wide OpenMP maximum when ZEROMOE_QWEN_CPU_THREADS is used.
   int thread_count() const { return n_threads_; }
 
   // Start the pre-sized direct team during graph construction, before graph

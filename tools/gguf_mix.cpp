@@ -3,7 +3,7 @@
 // gguf_tool mix: builds a real per-expert MIXED-PRECISION MoE model from
 // TWO separately-quantized source models (a "hot"/baseline model and a
 // "cold" model whose gate/up/down are quantized smaller) plus a real
-// .moestream_usage-style per-(layer,expert) traffic survey. For every
+// .zeromoe_usage-style per-(layer,expert) traffic survey. For every
 // eligible layer (one where the cold source actually provides its own
 // ffn_gate_exps/ffn_up_exps/ffn_down_exps), the coldest N% of that
 // layer's experts (ranked by real traffic in --usage-file, ascending)
@@ -134,7 +134,7 @@ std::string gguf_type_name(GGUFType t) {
   }
 }
 
-// .moestream_usage-style "layer expert count" text file, one line per
+// .zeromoe_usage-style "layer expert count" text file, one line per
 // ever-selected (layer,expert) pair. Same format/parser as gguf_plan.cpp's
 // own load_usage_file -- re-implemented here rather than shared, matching
 // this project's existing per-subcommand-local-helper convention

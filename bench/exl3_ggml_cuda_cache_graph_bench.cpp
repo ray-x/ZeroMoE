@@ -117,7 +117,7 @@ int main(int argc, char **argv) {
     const int topk = argc > 6 ? std::atoi(argv[6]) : 2;
     const bool graph_capture = argc > 7 && std::string(argv[7]) == "--graph";
     const bool repeat_route_set =
-        std::getenv("MOESTREAM_EXL3_GRAPH_REPEAT_ROUTE") != nullptr;
+        std::getenv("ZEROMOE_EXL3_GRAPH_REPEAT_ROUTE") != nullptr;
     int previous_device = 0;
     const cudaError_t current_device_status = cudaGetDevice(&previous_device);
     if (current_device_status != cudaSuccess)
@@ -415,9 +415,9 @@ int main(int argc, char **argv) {
                               result.size() * sizeof(float));
     };
     const bool verify_external_parity =
-        external && !std::getenv("MOESTREAM_EXL3_SKIP_INTERNAL_PARITY");
+        external && !std::getenv("ZEROMOE_EXL3_SKIP_INTERNAL_PARITY");
     const bool cpu_reference_output =
-        std::getenv("MOESTREAM_EXL3_GGML_CPU_REFERENCE_OUTPUT") != nullptr;
+        std::getenv("ZEROMOE_EXL3_GGML_CPU_REFERENCE_OUTPUT") != nullptr;
     state->verify_cpu_reference = verify_external_parity || cpu_reference_output;
     state->model_layer = 0;
     run(route_ids, route_weights, output);

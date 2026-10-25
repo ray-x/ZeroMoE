@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare MOESTREAM_DECODE_LOGITS_DUMP files on identical token histories.
+"""Compare ZEROMOE_DECODE_LOGITS_DUMP files on identical token histories.
 
 Each record is native-endian uint32 step, uint32 vocabulary size, then float32
 logits. Dumps include step 0 (the prefill prediction), before sampler penalties.

@@ -149,7 +149,7 @@ not the user's throughput acceptance result.
 
 ## Opt-in Layer-13 engine proof
 
-The engine now has `MOESTREAM_QWEN_EARLY_READY_LAYER13=1` for single-token
+The engine now has `ZEROMOE_QWEN_EARLY_READY_LAYER13=1` for single-token
 full-graph decode in the ordinary (non-Phase-2) Option-B split path. It is off
 by default and currently requires the scheduler bridge in
 [`patches/ggml-scheduler-early-ready-layer13.patch`](../patches/ggml-scheduler-early-ready-layer13.patch).
@@ -232,7 +232,7 @@ invalidates the run.
 
 ## Extension to all split layers
 
-`MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1` extends the same bridge to every
+`ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1` extends the same bridge to every
 planned split layer in single-token, ordinary full-graph decode. Each layer
 owns its own private buffers and ready event and borrows the same CPU
 backend/threadpool. The four plain-CPU layers in the cov80 layout retain their

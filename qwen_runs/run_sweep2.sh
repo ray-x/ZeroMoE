@@ -2,7 +2,7 @@
 # 3090-ONLY Qwen resident-expert sweep (CUDA_VISIBLE_DEVICES=0). Never add GPU1.
 set -u
 W=/home/ray/work/moestream-graph; cd $W
-OUT=$W/qwen_runs/${SUB:-run_x}; mkdir -p $OUT; ENG=$W/build_acc/moestream
+OUT=$W/qwen_runs/${SUB:-run_x}; mkdir -p $OUT; ENG=$W/build_acc/zeromoe
 BASE=${BASEFILE:-$W/configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml}
 for p in nvtop htop; do pgrep -x $p >/dev/null && { echo "ABORT: $p running"; exit 2; }; done
 [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && { echo "ABORT: GPU busy"; exit 2; }
@@ -16,11 +16,11 @@ for N in ${@:-191 96 48 280 191}; do
         -e "s#^log_path *=.*#log_path = \"$OUT/$tag.log\"#" $BASE > $cfg
     echo "== $tag"
     printf 'Explain briefly the key concepts of neural networks and gradient descent in plain English.\n:q\n' | \
-    env -u MOESTREAM_GLM5NEXT_FULL_GRAPH CUDA_VISIBLE_DEVICES=0 GGML_CUDA_BF16_MMVF_CUBLAS=0 \
-      MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-      MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-      MOESTREAM_QWEN_CPU_THREADS=10 MOESTREAM_TOKEN_LOOP_DIAG=1 MOESTREAM_BENCH_IGNORE_STOP=1 \
-      MOESTREAM_GENERATED_TOKEN_FILE=$OUT/$tag.tokens \
+    env -u ZEROMOE_GLM5NEXT_FULL_GRAPH CUDA_VISIBLE_DEVICES=0 GGML_CUDA_BF16_MMVF_CUBLAS=0 \
+      ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+      ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
+      ZEROMOE_QWEN_CPU_THREADS=10 ZEROMOE_TOKEN_LOOP_DIAG=1 ZEROMOE_BENCH_IGNORE_STOP=1 \
+      ZEROMOE_GENERATED_TOKEN_FILE=$OUT/$tag.tokens \
       $ENG --config $cfg --ngen 64 > $OUT/$tag.stdout 2>&1
     python3 - "$OUT/$tag.log" "$tag" <<'PY'
 import re,sys,statistics as s

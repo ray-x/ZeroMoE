@@ -1,4 +1,4 @@
-# Page-reusing expert eviction (`MOESTREAM_OFFLOAD_RETARGET`)
+# Page-reusing expert eviction (`ZEROMOE_OFFLOAD_RETARGET`)
 
 Code: `memory/offload_store.hpp` (`VirtualArena::retarget`, `ExpertResidency::begin`).
 Results: `docs/GLM5.3-baseline.md`, `docs/perf-baselines.md` (Trial 47).
@@ -8,7 +8,7 @@ Results: `docs/GLM5.3-baseline.md`, `docs/perf-baselines.md` (Trial 47).
 With SSD offload, routed experts live in a DDR pool (`OFFLOAD_DDR_GIB`). When a needed expert is missing and the pool is full, the
 cache evicts a victim and loads the new expert into its slot.
 
-| | Without (`MOESTREAM_OFFLOAD_RETARGET=0`) | With (default) |
+| | Without (`ZEROMOE_OFFLOAD_RETARGET=0`) | With (default) |
 |---|---|---|
 | Victim's pages | released with `madvise(MADV_DONTNEED)` | moved to the incoming expert with `mremap(MREMAP_MAYMOVE\|MREMAP_FIXED\|MREMAP_DONTUNMAP)` |
 | Incoming expert | page-faults fresh pages; the kernel zero-fills them | reads straight into pages that are already populated |
@@ -34,7 +34,7 @@ cost: every miss paid a `madvise`, a fault, a zero-fill and a round of TLB shoot
 ## Default and scope
 
 - **On by default.** `ExpertResidency` only exists when SSD offload is active, so the setting reaches only models that use the
-  offload store. Set `MOESTREAM_OFFLOAD_RETARGET=0` to turn it off, for example for an A/B.
+  offload store. Set `ZEROMOE_OFFLOAD_RETARGET=0` to turn it off, for example for an A/B.
 - Models not using the offload store (Qwen, DeepSeek and others) never reach this code.
 
 | Model | Status |
@@ -47,11 +47,11 @@ The gain is largest with a small pool and a high miss rate. A model whose expert
 
 ## How to verify on a new model
 
-1. Run the same recipe twice, with `MOESTREAM_OFFLOAD_RETARGET=0` and with it unset, swap-free and warmed.
+1. Run the same recipe twice, with `ZEROMOE_OFFLOAD_RETARGET=0` and with it unset, swap-free and warmed.
 2. Compare first-to-last tok/s (`REQUEST-DECODE-OUTPUT`) and the lane line `[GLM5NEXT-LANE] breakdown`. `begin_load` and `phase2_graph` drop.
 3. Read the output text. Run-to-run spread is about +-0.05-0.07 tok/s, so only a larger gap counts.
 
 ## Default-on check (2026-10-20)
 
-Peak recipe, 80 tokens, 64 GiB pool, swap-free, `MOESTREAM_OFFLOAD_RETARGET` unset: 2.08 tok/s first-to-last, Rates decode 1.95,
+Peak recipe, 80 tokens, 64 GiB pool, swap-free, `ZEROMOE_OFFLOAD_RETARGET` unset: 2.08 tok/s first-to-last, Rates decode 1.95,
 output text coherent (`logs/split_ab_default_on.*`).

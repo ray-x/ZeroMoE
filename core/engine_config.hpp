@@ -1,10 +1,12 @@
-// engine_config.hpp — Runtime configuration for MoEStream multi-GPU inference
+// engine_config.hpp — Runtime configuration for ZeroMoE multi-GPU inference
 // Loaded from TOML config files. Specifies model paths, GPU roles, memory
 // layout.
 #pragma once
 #include "logger.hpp"
+#include "resident_memory_policy.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <fstream>
@@ -26,6 +28,12 @@ struct GpuConfig {
   double kv_cache_gb = 0.0;  // GB reserved for KV cache
   int kv_bits = 4;           // KV cache quantization (4 or 32)
   double moe_cache_gb = 0.0; // GB reserved for expert LRU cache
+  // > 0: size the cache to FILL the VRAM that dense weights, KV and graph workspace do not claim, ignoring
+  // moe_cache_gb (so a copied or stale config cannot waste memory). Dual-role GPU: cache = free VRAM after the
+  // dense weights are resident - this many GB. Vault GPU: cache = total VRAM - this many GB (it includes the
+  // driver's ~1 GB). Set it to what the graph needs after the cache plus a margin: the startup log prints the
+  // resulting free VRAM and the graph's own measured peak ([MIMO2-VRAM]).
+  double moe_cache_reserve_gb = 0.0;
 
   // 2026-08-28 (multi-GPU active-layer pool, see EngineConfig::
   // active_layer_routing_policy's own comment for the full design):
@@ -630,7 +638,7 @@ struct EngineConfig {
   // generalizes cpu_affinity_layers/device_expert_layers' whole-layer
   // residency choice into a genuine PER-EXPERT split within a layer. When
   // >0, the graph builder reads the existing usage-ranking data (pin_file,
-  // the same ".moestream_usage" histogram pin_topk_per_layer/global_topn
+  // the same ".zeromoe_usage" histogram pin_topk_per_layer/global_topn
   // already consult) and greedily spends this many GB of VRAM on the
   // globally hottest routed experts, across every layer NOT already
   // claimed by cpu_affinity_layers or device_expert_layers/
@@ -1209,7 +1217,7 @@ struct EngineConfig {
   // opens -- validated below, not silently assumed) AND the machine
   // actually having NVIDIA GPUDirect Storage + the nvidia-fs kernel module
   // installed (a SEPARATE install from the base CUDA Toolkit -- see
-  // CMakeLists.txt's MOESTREAM_HAVE_CUFILE detection). Requesting this
+  // CMakeLists.txt's ZEROMOE_HAVE_CUFILE detection). Requesting this
   // without GDS installed (or on a non-Linux/no-cuFile build) logs a
   // warning and silently falls back to the existing RAM-mediated upload
   // path -- never a hard failure, same contract as direct_io/io_uring.
@@ -1389,6 +1397,7 @@ struct EngineConfig {
   // miss for an expert with no usage history. Default false preserves the
   // usage-ranked preload behavior.
   bool ram_preload_all_experts = false;
+  bool ram_preload_all_experts_explicit = false;
 
   // Persistent RAM-slab pinning budget, in GB. 0 (default) = OFF, every
   // slab stays plain pageable memory (pre-2026-08-15 behavior).
@@ -1415,6 +1424,7 @@ struct EngineConfig {
   // drop, then raise. Registration costs ~11 GB/s, one time, during
   // preload -- a large budget adds seconds to startup, not to any request.
   double ram_pinned_budget_gb = 0.0;
+  bool ram_pinned_budget_gb_explicit = false;
 
   // 2026-08-29 (default off, UNVERIFIED ON REAL HARDWARE -- new this
   // session, SECOND implementation after a first attempt was tried,
@@ -1460,7 +1470,7 @@ struct EngineConfig {
   // (hit_count * FREQ_BONUS_TICKS) is the ONLY thing that keeps a hot
   // expert from being evicted as easily as a cold one -- but hit_count only
   // ever grows from RE-HITS WITHIN THIS SESSION, so a genuinely
-  // popular expert that just got preloaded from .moestream_usage looks
+  // popular expert that just got preloaded from .zeromoe_usage looks
   // identical to a marginal one until it happens to get touched twice
   // during THIS request. A real 2026-09-04 run showed the RAM tier turning
   // over almost exactly once per request (5925 evictions / 5702 slots)
@@ -1530,7 +1540,7 @@ struct EngineConfig {
   // written at shutdown for a future run). pin_topk_per_layer=0 auto-sizes
   // to fill available VRAM expert-cache capacity instead of a fixed
   // per-layer count.
-  std::string pin_file = ".moestream_usage";
+  std::string pin_file = ".zeromoe_usage";
   int pin_topk_per_layer = 0;
 
   // Separate usage file tracking ONLY prefill-phase (S > 1) routing
@@ -1553,7 +1563,7 @@ struct EngineConfig {
   // confirmed on real hardware to genuinely drift the startup pin/
   // preload ranking run-to-run even under a literally identical,
   // temperature=0 prompt (two runs a few minutes apart logged
-  // .moestream_usage growing from 12958 to 12988 known experts, +45 on
+  // .zeromoe_usage growing from 12958 to 12988 known experts, +45 on
   // the single hottest entry's count -- GPU reduction order isn't
   // bit-exact call-to-call, and this model's IQ2_XXS routing margins are
   // thin enough for that jitter to occasionally flip a close top-8 tie).
@@ -1564,6 +1574,12 @@ struct EngineConfig {
   // files, and only the variable actually under test can explain a
   // result. Default false (unchanged accumulate-forever behavior).
   bool freeze_usage_stats = false;
+
+  // Where token_embd.weight lives. The embedding lookup is a one-row read done on the CPU from the host copy
+  // (embed_token, MTP, the CPU fallbacks), so a VRAM copy is only dead weight unless the family's graph embeds on the
+  // GPU. "auto" = CPU/DDR for every model unless its graph says otherwise (frees ~0.7 GB on a 150k-vocab Q8_0 model);
+  // "gpu" forces the device copy; "cpu" forces the host-only placement.
+  std::string embedding_device = "auto";
 
   // How the pinned_vram_capacity budget gets DISTRIBUTED across layers at
   // startup preload. Two options, both driven by the same pin_file usage
@@ -1663,6 +1679,7 @@ struct EngineConfig {
   //     reactively during real generation).
   double pin_vram_lru_fraction = 0.0;
   double pin_ram_fraction = 0.0;
+  bool pin_ram_fraction_explicit = false;
   // pin_global_tiers: place the VRAM-LRU pre-warm and the host-RAM preload
   // from ONE global usage ranking (like pin_strategy=global_topn already does
   // for the pinned tier) instead of a fixed per-layer count. Same total
@@ -1978,7 +1995,7 @@ struct EngineConfig {
 
   // Run the routed-expert FFN through ggml's MUL_MAT_ID CUDA backend instead
   // of Phase 3b's per-expert-bucket loop. Requires moe_prefill_batched and a
-  // build with MOESTREAM_USE_GGML_CUDA; resident RAM slabs are preferred and
+  // build with ZEROMOE_USE_GGML_CUDA; resident RAM slabs are preferred and
   // mmap is used only when the optional stream path is enabled. Falls back
   // per layer whenever any precondition fails. See
   // include/ggml_moe_backend.hpp and dense_dispatch.hpp's own accessor.
@@ -2116,7 +2133,7 @@ struct EngineConfig {
   // a shared one -- DEPTH-1 and ATTN-PILOT can (and do) disagree on
   // which layers they're each reliable at. Self-calibrating and per-
   // session, like ram_vram_promote_adaptive above -- no static per-model
-  // profile to keep in sync with a changing .moestream_usage file.
+  // profile to keep in sync with a changing .zeromoe_usage file.
   // Deliberately only ever NARROWS what the top_k/adaptive layer above
   // already allowed, never widens it past that ceiling -- "do less for
   // unreliable layers", not "do more for reliable ones", the safer of
@@ -2214,7 +2231,7 @@ struct EngineConfig {
   // (uniform slots_per_layer * n_layers) across layers proportional to
   // each layer's real historical need instead of splitting it evenly.
   // Motivated by direct measurement on this project's own accumulated
-  // .moestream_usage file (75 layers, 672 selections/layer after
+  // .zeromoe_usage file (75 layers, 672 selections/layer after
   // several sessions): the most routing-concentrated layer needed only
   // 31 of its own top-ranked experts to cover 80% of its traffic, the
   // flattest needed 92 -- a ~3x range the uniform per-layer split
@@ -3027,11 +3044,14 @@ inline bool EngineConfig::load(const std::string &path) {
       "ram_cache_total_experts", ram_cache_total_experts);
   ram_preload_all_experts = doc.root.get_bool(
       "ram_preload_all_experts", ram_preload_all_experts);
+  ram_preload_all_experts_explicit =
+      doc.root.has("ram_preload_all_experts");
   mirror_model_path = doc.root.get_str("mirror_model_path", mirror_model_path);
   mirror_coverage_file =
       doc.root.get_str("mirror_coverage_file", mirror_coverage_file);
   ram_pinned_budget_gb =
       doc.root.get_double("ram_pinned_budget_gb", ram_pinned_budget_gb);
+  ram_pinned_budget_gb_explicit = doc.root.has("ram_pinned_budget_gb");
   ram_pin_eager_preregister =
       doc.root.get_bool("ram_pin_eager_preregister", ram_pin_eager_preregister);
   ram_preload_seed_hit_count = doc.root.get_bool(
@@ -3044,6 +3064,7 @@ inline bool EngineConfig::load(const std::string &path) {
   prefill_pin_file = doc.root.get_str("prefill_pin_file", prefill_pin_file);
   freeze_usage_stats =
       doc.root.get_bool("freeze_usage_stats", freeze_usage_stats);
+  embedding_device = doc.root.get_str("embedding_device", embedding_device);
   pin_topk_per_layer =
       doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
   pin_strategy = doc.root.get_str("pin_strategy", pin_strategy);
@@ -3057,6 +3078,7 @@ inline bool EngineConfig::load(const std::string &path) {
   pin_vram_lru_fraction =
       doc.root.get_double("pin_vram_lru_fraction", pin_vram_lru_fraction);
   pin_ram_fraction = doc.root.get_double("pin_ram_fraction", pin_ram_fraction);
+  pin_ram_fraction_explicit = doc.root.has("pin_ram_fraction");
   pin_global_tiers = doc.root.get_bool("pin_global_tiers", pin_global_tiers);
   vram_evict_demote_to_ram =
       doc.root.get_bool("vram_evict_demote_to_ram", vram_evict_demote_to_ram);
@@ -3206,6 +3228,7 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
     gc.kv_cache_gb = gt.get_double("kv_cache_gb");
     gc.kv_bits = gt.get_int("kv_bits", 4);
     gc.moe_cache_gb = gt.get_double("moe_cache_gb");
+    gc.moe_cache_reserve_gb = gt.get_double("moe_cache_reserve_gb");
     gc.active_layer_weight = gt.get_int("active_layer_weight", 0);
     gc.active_layer_capacity_slots =
         gt.get_int("active_layer_capacity_slots", 0);
@@ -3223,6 +3246,17 @@ gdn_proj_ggml = doc.root.get_bool("gdn_proj_ggml", gdn_proj_ggml);
 }
 
 inline bool EngineConfig::validate() {
+  if (!zeromoe::memory::valid_embedding_device(embedding_device)) {
+    std::cerr << "[CONFIG] embedding_device must be auto, cpu or gpu\n";
+    return false;
+  }
+  for (const auto &gc : gpus) {
+    if (!std::isfinite(gc.moe_cache_reserve_gb) || gc.moe_cache_reserve_gb < 0.0 ||
+        gc.moe_cache_reserve_gb >= double(SIZE_MAX) / 1e9) {
+      std::cerr << "[CONFIG] moe_cache_reserve_gb must be finite, non-negative and representable in bytes\n";
+      return false;
+    }
+  }
   if (exllamav3_cuda_schedule != "auto" && exllamav3_cuda_schedule != "spin" &&
       exllamav3_cuda_schedule != "yield" && exllamav3_cuda_schedule != "blocking") {
     std::cerr << "[CONFIG] exllamav3_cuda_schedule must be auto, spin, yield or blocking\n";
@@ -4008,7 +4042,7 @@ inline void EngineConfig::print() const {
 
 inline void EngineConfig::write_sample(const std::string &path) {
   std::ofstream f(path);
-  f << R"(# MoEStream Engine Configuration
+  f << R"(# ZeroMoE Engine Configuration
 # See configs/ for example profiles (single_gpu, dual_gpu, triple_gpu)
 
 model_path = "/models/GLM-5.2-UD-IQ2_M/"
@@ -4418,7 +4452,7 @@ pin_threshold = 8
 # pin_file: usage-frequency file (written at shutdown, read at next startup)
 # used to preload the measured hot set into VRAM before the first prompt.
 # Empty string disables preload (a usage file is still written at shutdown).
-pin_file = ".moestream_usage"
+pin_file = ".zeromoe_usage"
 # prefill_pin_file: separate usage file tracking ONLY prefill-phase routing
 # selections, not decode's. Decode contributes far more routing volume per
 # request than prefill does, so in the combined pin_file histogram a
@@ -4426,7 +4460,7 @@ pin_file = ".moestream_usage"
 # this file, when set, is preferred for prefill's own preload ranking
 # (falling back to pin_file per-layer where this file has no data yet).
 # Empty (default) = not used, falls back entirely to pin_file.
-# prefill_pin_file = ".moestream_usage_prefill"
+# prefill_pin_file = ".zeromoe_usage_prefill"
 # freeze_usage_stats: debug/A-B-testing aid. When true, pin_file and
 # prefill_pin_file are both still READ at startup exactly as configured,
 # but NEITHER is overwritten at shutdown -- stops the additive

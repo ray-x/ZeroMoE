@@ -1,10 +1,10 @@
-// src/cpu_forward.cpp — Generic CPU forward helpers used by moestream_cpu.
+// src/cpu_forward.cpp — Generic CPU forward helpers used by zeromoe_cpu.
 #include "cpu_engine.hpp"
 #include "cpu_model_backend.hpp"
 
 #include <cstring>
 
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
 extern "C" int ggml_dequant_row(uint32_t type, const void *src, float *out,
                                 int n);
 #endif
@@ -36,7 +36,7 @@ bool cpu_embed_token(CPUEngine &engine, int tok, float *out, int D) {
         }
         return true;
       }
-#ifdef MOESTREAM_USE_GGML
+#ifdef ZEROMOE_USE_GGML
       return ggml_dequant_row(static_cast<uint32_t>(emb->meta.type), src,
                               out, D) != 0;
 #endif

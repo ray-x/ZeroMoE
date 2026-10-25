@@ -38,7 +38,7 @@ struct block_mxfp4_cu { uint8_t e; uint8_t qs[QK_MXFP4 / 2]; }; // 17 bytes
 // data-derived, so (unlike IQ4_XS's externally-shared kvalues_iq4nl) it's
 // safe to statically initialize directly in __constant__ memory here: no
 // cudaMemcpyToSymbol/host-accessor indirection needed, and this table isn't
-// reused anywhere else in MoEStream's own code (the CPU dequant path calls
+// reused anywhere else in ZeroMoE's own code (the CPU dequant path calls
 // straight into libggml — see src/ggml_dequant.cpp).
 __constant__ int8_t c_kvalues_mxfp4[16] = {
     0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12

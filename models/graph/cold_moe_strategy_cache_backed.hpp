@@ -1,47 +1,12 @@
 #pragma once
 
-// CacheBackedStrategy — the cache-backed implementation of ColdMoEStrategy.
-//
-// The cache-backed path (DeepSeek-V4.1, Ling native) runs each MoE layer through one host
-// callback that dispatches to GgmlMoeRunner (transfer + compute) over the native expert caches
-// (RAMSafetyManager = DDR tier, GpuTopology = VRAM tier). It is synchronous per layer, unlike
-// the full-graph lane's fork + concurrent CPU graph.
-//
-// This adapter re-expresses that synchronous path as the strategy state machine. It is a
-// SPEC at this step: the class holds the existing pieces and documents the grounded mapping,
-// but the method bodies are filled in during the wiring step (docs/cold-moe-strategy-contract.md
-// §4 step 1). Nothing calls this adapter yet, so behavior is unchanged by construction.
-//
-// The residency is SPLIT across two phases in two files — this is the single most important
-// thing to get right when wiring, because it means the adapter is not a self-contained class:
-//
-//   Phase A — RAM residency (make cold experts resident in DDR), driven in
-//             core/execution_layer.cpp's `ram_needed_k` dispatch loop:
-//               RamClaimResult r = ram->claim_or_wait(engine, layer, expert, who, ...);
-//               // r.status: Hit (already resident) | Loading (someone else loading) |
-//               //           Claimed (this thread claimed; must load then publish)
-//               // Loading -> ram->wait_for_ram_slot(engine, layer, expert, ...) to block.
-//             State: Hit -> Ready; Loading/Claimed -> Pending; load error -> Error (abort today).
-//
-//   Phase B — VRAM hold + transfer + compute, driven in
-//             core/batched_dispatch_pipeline.cpp's run_ggml_moe_layer:
-//               topo->hold_for_compute(layer, e, device_ptr, from_active_layer)   // hold VRAM slot
-//               runner->begin_layer(plan)                                        // set up layer
-//               runner->run_layer*(x, ids, w, out)                               // H2D/D2D + compute (syncs)
-//               topo->release_hold(...) / runner->defer_vram_hold(...)           // release after compute
-//
-// Mapping (to be wired):
-//   begin()   -> the Phase A claim loop over the invocation's owned experts (claim_or_wait +
-//                wait_for_ram_slot), then the Phase B VRAM holds (hold_for_compute).
-//   state()   -> Ready once every owned expert is a cache hit AND its VRAM slot is held;
-//                Pending while any is Loading/Claimed or not yet held; Error on a failed load.
-//   finish()  -> runner->run_layer* (the per-layer sync — it waits for its own H2D/D2D).
-//   release() -> topo->release_hold(...) after the last consumer.
-//
-// Constructor gap: Phase A needs the StreamingEngine (for claim_or_wait's `engine` + the per-layer
-// expert geometry) and the per-layer dispatch context (used/ids/weights/normed/output/device
-// route), not just (runner, ram, topology). Those are threaded in at the wiring step; until then
-// the three backends below are the only handle this adapter needs.
+// Synchronous MoEExecutionStrategy used through CacheBackedMoeRuntime by
+// MiMo's fallback, Ling-native and DeepSeek-V4.1's prefill/decode callbacks.
+// execute() calls the existing shared MoE pipeline once; that pipeline owns
+// RAM claims, VRAM compute holds, transfers, kernels and release. This adapter
+// does not duplicate eviction or implement ColdMoEStrategy's asynchronous
+// begin/state/finish/release lifecycle. Extracting that lifecycle remains a
+// separate migration; the adapter is live, not an unwired specification.
 
 #include "moe_execution_strategy.hpp"
 #include "moe_pipeline.hpp"
@@ -50,7 +15,7 @@
 
 #include <cmath>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 class CacheBackedStrategy final : public MoEExecutionStrategy {
  public:
@@ -104,4 +69,4 @@ class CacheBackedStrategy final : public MoEExecutionStrategy {
   MoERuntimeResources resources_;
 };
 
-}  // namespace moestream::graph
+}  // namespace zeromoe::graph

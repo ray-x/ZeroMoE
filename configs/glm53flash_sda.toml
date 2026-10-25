@@ -1,7 +1,7 @@
 # GLM-5.3 Flash (glm5next), UD-IQ4_XS -- dual-GPU starting profile.
 #
 # The model directory contains five GGUF shards. Keep model_path pointed at
-# the UD-IQ1_XS directory itself; MoEStream scans that directory for shards
+# the UD-IQ1_XS directory itself; ZeroMoE scans that directory for shards
 # and does not recurse into child directories.
 #
 # This profile assumes:
@@ -54,8 +54,8 @@ mem_guard_poll_ms = 500
 # layer history from another GLM model and must not be used for this 45-layer
 # checkpoint.
 freeze_usage_stats = false
-pin_file = ".moestream_usage_glm53flash"
-prefill_pin_file = ".moestream_usage_prefill_glm53flash"
+pin_file = ".zeromoe_usage_glm53flash"
+prefill_pin_file = ".zeromoe_usage_prefill_glm53flash"
 pin_threshold = 6
 pin_topk_per_layer = 12
 pin_strategy = "global_topn"

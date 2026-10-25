@@ -2,7 +2,7 @@
 model_path = "/data/sdb/models/GLM-5.3-Flash"
 reasoning_effort = "low"
 enable_thinking = false
-log_path = "/tmp/moestream_glm53flash_mtp_on.log"
+log_path = "/tmp/zeromoe_glm53flash_mtp_on.log"
 log_level = "INFO"
 context_size = 4096
 max_new_tokens = 12
@@ -21,8 +21,8 @@ mem_guard_stop_mb = 10240
 mem_guard_poll_ms = 500
 
 freeze_usage_stats = true
-pin_file = ".moestream_usage_glm53flash"
-prefill_pin_file = ".moestream_usage_prefill_glm53flash"
+pin_file = ".zeromoe_usage_glm53flash"
+prefill_pin_file = ".zeromoe_usage_prefill_glm53flash"
 pin_threshold = 6
 pin_topk_per_layer = 12
 pin_strategy = "global_topn"

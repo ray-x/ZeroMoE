@@ -8,7 +8,7 @@
 #   lru        offload, lru, no pilot            (miss node + store + async loads)
 #   prefetch   pilot prefetch K=4, no VRAM copy  (stage worker + store.ensure(Prefetch))
 #   stage      pilot staging K=1 + VRAM ring     (stage worker + reader_lock + ring)
-#   lane       MOESTREAM_GLM5NEXT_EARLY_READY=1  (CPU lane, only the candidate binary has it)
+#   lane       ZEROMOE_GLM5NEXT_EARLY_READY=1  (CPU lane, only the candidate binary has it)
 # ARMS="lane" selects arms.
 # For each arm the decode logits dump and generated tokens must be byte-identical
 # between the two binaries. Decode tok/s is reported from the engine log.
@@ -54,21 +54,21 @@ run_one() {  # arm binary-label binary
   wait_idle || return 1
   drop_cache
   sed "s#^log_path *=.*#log_path = \"$out/$tag.engine.log\"#" "$TOML_SRC" > "$out/$tag.toml"
-  local env=(MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=32
-             MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=0.5 MOESTREAM_GLM5NEXT_OFFLOAD_POLICY=lru
-             MOESTREAM_GLM5NEXT_OFFLOAD_STORE="$STORE" MOESTREAM_GLM5NEXT_OFFLOAD_MODEL="$MODEL"
-             MOESTREAM_GLM5NEXT_OFFLOAD_USAGE="$USAGE" MOESTREAM_GLM5NEXT_OFFLOAD_ASYNC=1
-             MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512 MOESTREAM_GLM5NEXT_CPU_THREADS=8
-             CUDA_VISIBLE_DEVICES=0 MOESTREAM_BENCH_IGNORE_STOP=1
-             MOESTREAM_DECODE_LOGITS_DUMP="$out/$tag.logits"
-             MOESTREAM_GENERATED_TOKEN_FILE="$out/$tag.tokens")
+  local env=(ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=32
+             ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=0.5 ZEROMOE_GLM5NEXT_OFFLOAD_POLICY=lru
+             ZEROMOE_GLM5NEXT_OFFLOAD_STORE="$STORE" ZEROMOE_GLM5NEXT_OFFLOAD_MODEL="$MODEL"
+             ZEROMOE_GLM5NEXT_OFFLOAD_USAGE="$USAGE" ZEROMOE_GLM5NEXT_OFFLOAD_ASYNC=1
+             ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=8
+             CUDA_VISIBLE_DEVICES=0 ZEROMOE_BENCH_IGNORE_STOP=1
+             ZEROMOE_DECODE_LOGITS_DUMP="$out/$tag.logits"
+             ZEROMOE_GENERATED_TOKEN_FILE="$out/$tag.tokens")
   case $arm in
     lru) ;;
-    prefetch) env+=(MOESTREAM_GLM5NEXT_PILOT_STAGE=1 MOESTREAM_GLM5NEXT_PILOT_PREFETCH=4 MOESTREAM_GLM5NEXT_PILOT_COPY=0) ;;
-    stage) env+=(MOESTREAM_GLM5NEXT_PILOT_STAGE=1) ;;
-    lane) env+=(MOESTREAM_GLM5NEXT_EARLY_READY=1) ;;  # CPU lane (step 4); baseline binary ignores it
+    prefetch) env+=(ZEROMOE_GLM5NEXT_PILOT_STAGE=1 ZEROMOE_GLM5NEXT_PILOT_PREFETCH=4 ZEROMOE_GLM5NEXT_PILOT_COPY=0) ;;
+    stage) env+=(ZEROMOE_GLM5NEXT_PILOT_STAGE=1) ;;
+    lane) env+=(ZEROMOE_GLM5NEXT_EARLY_READY=1) ;;  # CPU lane (step 4); baseline binary ignores it
   esac
-  printf '%s\n:q\n' "$PROMPT" | env -u MOESTREAM_GLM5NEXT_FULL_GRAPH "${env[@]}" \
+  printf '%s\n:q\n' "$PROMPT" | env -u ZEROMOE_GLM5NEXT_FULL_GRAPH "${env[@]}" \
       systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
       "$bin" --config "$out/$tag.toml" --ngen 48 > "$out/$tag.stdout" 2>&1
   echo "$tag exit=$?"

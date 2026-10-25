@@ -7,7 +7,7 @@
 #include "cold_moe_strategy_early_ready.hpp"
 #include "moe_execution_strategy.hpp"
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 class EarlyReadyOffloadStrategy final : public MoEExecutionStrategy,
                                          public ColdMoEStrategy {
@@ -64,4 +64,4 @@ class EarlyReadyOffloadStrategy final : public MoEExecutionStrategy,
   bool installed_ = false;
 };
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

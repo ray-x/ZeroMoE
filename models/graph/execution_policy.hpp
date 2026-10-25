@@ -28,7 +28,7 @@
 #include <string>
 #include <vector>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 // A (layer, expert) addressing key. Local to this header so the policy interfaces stay free of
 // the storage headers that define the full ExpertKey.
@@ -220,4 +220,4 @@ inline ExecutionPolicyDecision resolve_execution_policy(
                             : "no compatible optimized strategy"};
 }
 
-}  // namespace moestream::graph
+}  // namespace zeromoe::graph

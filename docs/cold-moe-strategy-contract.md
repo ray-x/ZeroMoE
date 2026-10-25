@@ -197,7 +197,7 @@ adapter returns **true** by contract (once wired, `begin()` starts the Phase A/B
 `finish()` blocks). A generic driver must check this capability before treating `finish()` as a
 barrier; the GLM scheduler bridge asserts the lane adapter is observation-only.
 
-*Wired for the GLM full-graph lane:* `moestream_ggml_sched_early_cpu` calls `begin()` before the
+*Wired for the GLM full-graph lane:* `zeromoe_ggml_sched_early_cpu` calls `begin()` before the
 lane's `run()`, `run()` consults `state()` before its compute branches (the split-load path asserts
 `Ready` after its second `finish_load()`; phase 1 computes only the already-resident subset with the
 pending experts masked out, per §3.3), and `finish()` + `release()` close the invocation after

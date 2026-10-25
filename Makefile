@@ -3,9 +3,9 @@
 #
 # On Linux with the NVIDIA CUDA Toolkit, this builds the full engine and the
 # native CUDA test harness.  On macOS the root CMakeLists.txt automatically
-# switches to MOESTREAM_CPU_ONLY=ON and builds the tools plus the CPU-only
+# switches to ZEROMOE_CPU_ONLY=ON and builds the tools plus the CPU-only
 # component tests (no CUDA required).  The CPU-only path also works on Linux
-# by passing MOESTREAM_CPU_ONLY=ON to CMake manually.
+# by passing ZEROMOE_CPU_ONLY=ON to CMake manually.
 BUILD_TYPE ?= Release
 JOBS       := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
@@ -37,19 +37,19 @@ reconfigure: clean
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=$(BUILD_TYPE)
 
 # Default build: all targets CMake knows about for this platform.
-# On Linux+CUDA that is moestream + moestream_tests + gguf_tool.
+# On Linux+CUDA that is zeromoe + zeromoe_tests + gguf_tool.
 # On macOS that is test_components + gguf_tool.
 build: configure
 	cmake --build $(BUILD_DIR) -j$(JOBS)
 
 # Native test harness: builds and runs whichever test binary CMake produced
-# for this platform. On Linux+CUDA that is moestream_tests; on macOS/CPU-only
+# for this platform. On Linux+CUDA that is zeromoe_tests; on macOS/CPU-only
 # that is test_components. Exit code propagates, so `make test` fails the same
 # way any other failing recipe does.
 test: build
-	@if [ -f "$(BUILD_DIR)/moestream_tests" ]; then \
-		cmake --build $(BUILD_DIR) --target moestream_tests -j$(JOBS); \
-		./$(BUILD_DIR)/moestream_tests; \
+	@if [ -f "$(BUILD_DIR)/zeromoe_tests" ]; then \
+		cmake --build $(BUILD_DIR) --target zeromoe_tests -j$(JOBS); \
+		./$(BUILD_DIR)/zeromoe_tests; \
 	elif [ -f "$(BUILD_DIR)/test_components" ]; then \
 		cmake --build $(BUILD_DIR) --target test_components -j$(JOBS); \
 		./$(BUILD_DIR)/test_components; \

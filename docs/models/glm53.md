@@ -12,15 +12,15 @@
 
 ```bash
 systemd-run --user --scope -p MemorySwapMax=0 \
-  env MOESTREAM_BIN=/tmp/msbin \
+  env ZEROMOE_BIN=/tmp/msbin \
   bench/glm53/run_ab.sh baseline \
-  MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
-  MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
-  MOESTREAM_GLM5NEXT_MODEL_DIRECT=1
+  ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
+  ZEROMOE_GLM5NEXT_PILOT_PREFETCH=3 ZEROMOE_GLM5NEXT_PILOT_STAGE=3 \
+  ZEROMOE_GLM5NEXT_MODEL_DIRECT=1
 ```
 
 (`/tmp/msbin` is a neutral-named symlink to the binary — `bench/glm53/preflight.sh` greps command
-lines for the literal `moestream` and would false-positive on a spelled-out path.)
+lines for the literal `zeromoe` and would false-positive on a spelled-out path.)
 
 ## Frozen baseline
 
@@ -32,16 +32,16 @@ lines for the literal `moestream` and would false-positive on a spelled-out path
 
 ## Tricks applied (why)
 
-- **Page-reusing eviction (`MOESTREAM_OFFLOAD_RETARGET`, default on)**: `mremap(MREMAP_DONTUNMAP)`
+- **Page-reusing eviction (`ZEROMOE_OFFLOAD_RETARGET`, default on)**: `mremap(MREMAP_DONTUNMAP)`
   hands an evicted expert's populated pages to the incoming expert instead of
   `madvise(DONTNEED)` + refault — the single biggest win on this file (+17-19 %,
   `docs/offload-retarget.md`).
-- **CPU lane** (`MOESTREAM_GLM_DSA_CPU_LANE=1`) runs cold experts concurrently with GPU work; needs
+- **CPU lane** (`ZEROMOE_GLM_DSA_CPU_LANE=1`) runs cold experts concurrently with GPU work; needs
   the host-node hook.
 - **Graph LM head** removes a ~50 ms/token CPU round-trip.
 
 ## Gotchas
 
 - Requires the host-node hook; without it the lane is silently disabled and decode drops ~3×.
-- `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22` is the ceiling (23 GiB does not fit).
+- `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=22` is the ceiling (23 GiB does not fit).
 - Benign teardown crash (`CUDA error: driver shutting down`) after metrics print — pre-existing.

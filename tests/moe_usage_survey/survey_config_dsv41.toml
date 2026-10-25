@@ -2,7 +2,7 @@
 # Derived from the dual-GPU profile; usage frozen OFF and redirected to survey
 # files so the live pin files are not overwritten.
 # DeepSeek-V4.1-Flash dual-GPU full graph profile (context 4096, temperature 0).
-# Enable with MOESTREAM_DEEPSEEK_V41_FULL_GRAPH=1; see docs/deepseek_v41_decode.md.
+# Enable with ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1; see docs/deepseek_v41_decode.md.
 # 3090: 17 GiB main expert cache, 48 active slots, one shared native dense pool.
 # 5060 Ti: 13.5 GiB main expert cache and 16 active slots.
 # DDR: 8360 slots are an upper capacity target; physical-memory admission
@@ -29,8 +29,8 @@ ram_pinned_budget_gb = 15.0
 freeze_usage_stats = false
 omp_max_threads = 10
 attn_score_threads = 8
-pin_file = "/home/ray/work/moestream-deepseek-v41-flash/tests/moe_usage_survey/moestream_usage_survey_dsv41"
-prefill_pin_file = "/home/ray/work/moestream-deepseek-v41-flash/tests/moe_usage_survey/moestream_usage_survey_dsv41_prefill"
+pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_dsv41"
+prefill_pin_file = "tests/moe_usage_survey/zeromoe_usage_survey_dsv41_prefill"
 cpu_affinity_layers = []
 ram_cache_layer_adaptive = false
 moe_ggml_mul_mat_id = false

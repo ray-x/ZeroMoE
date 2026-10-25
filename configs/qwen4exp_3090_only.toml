@@ -57,15 +57,15 @@ expert_fetch_threads = 10
 omp_max_threads      = 12
 prefetch_worker_threads = 4
 
-# Model-specific usage/pin files. MUST NOT be .moestream_usage -- that one
+# Model-specific usage/pin files. MUST NOT be .zeromoe_usage -- that one
 # is GLM-5.3's (75 layers vs this model's 48).
 # 2026-09-11: freshly regenerated from four isolated Qwen prompts. Each run
 # used --ngen 64 and produced 61, 61, 61, and 40 output tokens; the files
 # therefore contain real prefill plus >=40-token decode traffic, rather than
 # the stale accumulated *_480 history. The old *_480 files are retained for
 # comparison, but are no longer used by this profile.
-pin_file           = ".moestream_usage_qwen4exp_4prompts40"
-prefill_pin_file   = ".moestream_usage_qwen4exp_prefill_4prompts40"
+pin_file           = ".zeromoe_usage_qwen4exp_4prompts40"
+prefill_pin_file   = ".zeromoe_usage_qwen4exp_prefill_4prompts40"
 freeze_usage_stats = true
 pin_topk_per_layer   = 1
 # Keep the complete MoE expert set in DDR for the GGML prefill path. One
@@ -174,7 +174,7 @@ moe_expert_bf16_gemm = true
 # three GGML_OP_MUL_MAT_ID nodes instead of Phase 3b's per-expert-bucket
 # loop, so the token-to-expert grouping happens on the GPU (ggml-cuda sorts
 # rows and derives expert bounds itself) instead of once per expert on the
-# host. Needs a build with -DMOESTREAM_USE_GGML_CUDA=ON.
+# host. Needs a build with -DZEROMOE_USE_GGML_CUDA=ON.
 #
 # MEASURED 2026-09-05, qwen4exp UD-IQ1_M, 441-token prefill, same binary,
 # only this flag varied:
@@ -235,7 +235,7 @@ qwen4exp_cpu_ggml_moe = true
 # dereferencing device_x as a ggml_tensor* (matching routed_output) instead
 # of memcpy'ing the wrong bytes. Test 35 passes deterministically (worst
 # rel=3.7e-07) across 6+ repeated runs, isolated from the full model via
-# `MOESTREAM_TEST_ONLY_35=1 ./build_ggmlcuda/moestream_tests`. The earlier
+# `ZEROMOE_TEST_ONLY_35=1 ./build_ggmlcuda/zeromoe_tests`. The earlier
 # ggml_backend_synchronize() addition to run() was independently correct
 # hardening and stays regardless (unrelated race it guards against is real,
 # just wasn't this bug).
@@ -243,7 +243,7 @@ qwen4exp_cpu_ggml_moe = true
 # decode runs with --trace-abort-on-nan never actually exercise this path,
 # because run_qwen4exp_shared_device() is only reached when gpu_route_device
 # is true, which itself requires the undocumented, off-by-default env var
-# MOESTREAM_QWEN4EXP_DEVICE_ROUTE=1 PLUS every expert of that layer already
+# ZEROMOE_QWEN4EXP_DEVICE_ROUTE=1 PLUS every expert of that layer already
 # VRAM-resident (all_experts_device_resident) PLUS S>1 -- a combination this
 # config's real model/layer structure never naturally satisfies (traced with
 # temporary gate-logging, since reverted). Even with the env var forced on,
@@ -306,8 +306,8 @@ gdn_proj_ggml       = true
 # MEASURED, 488-token real-text prefill, same prompt/config otherwise:
 #   off -> 62.72 tok/s, attn=1.90s
 #   on  -> 74.56 tok/s, attn=0.58s (+18.9% prefill, attn bucket -69.5%)
-# VERIFIED correct, not just fast: MOESTREAM_GGML_FORCE_GDN_FULL_HOST=1 +
-# MOESTREAM_GGML_GDN_FULL_STATS=1 + trace_abort_on_nan=true forces the
+# VERIFIED correct, not just fast: ZEROMOE_GGML_FORCE_GDN_FULL_HOST=1 +
+# ZEROMOE_GGML_GDN_FULL_STATS=1 + trace_abort_on_nan=true forces the
 # host-readback path (the device-tensor fast path above skips all host-side
 # checks) -- 72/72 GDN-FULL-STATS lines (36 layers x input+output, all 36
 # GDN layers) read bad=0, max_abs across every layer bounded at 37.59, no
@@ -500,7 +500,7 @@ mem_guard_poll_ms  = 500
 # VRAM headroom for DYNAMIC (grow-at-runtime) buffers: keep at least this much
 # free on each GPU. NOTE this is a free-memory FLOOR, not llama.cpp's
 # fraction-of-total watermark -- that form was tried and is wrong here:
-# MoEStream deliberately fills VRAM (expert cache ~23.7/24 GB by design), so a
+# ZeroMoE deliberately fills VRAM (expert cache ~23.7/24 GB by design), so a
 # 90%-of-total test reads "already over budget" and refused 11,632 dynamic
 # allocations, permanently disabling the BF16/attention/GDN fast paths and
 # costing 2.6x throughput (14.97 -> 5.79 tok/s). llama.cpp applies 0.9 at model

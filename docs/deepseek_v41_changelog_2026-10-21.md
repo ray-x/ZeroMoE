@@ -16,7 +16,7 @@ NOT reached; honest steady-state decode is about 4.0-4.5 tok/s.
 ## Performance features (default behaviour changed)
 - AVX-512 weighted sum in per-head attention and parallel indexer scoring (e3eed9d): decode +53-120%
   (the scalar loop was the top bucket, 206 of 430 ms/token).
-- GPU hyper-connections in decode, default on, `MOESTREAM_DEEPSEEK_V41_DECODE_GPU_HC=0` opts out
+- GPU hyper-connections in decode, default on, `ZEROMOE_DEEPSEEK_V41_DECODE_GPU_HC=0` opts out
   (260a2d9): +21% decode (hc_engram 59 -> about 2 ms/token). Text differs from the host path at about
   token 7 through a near-tie top-k flip, not a bug.
 - `pin_global_tiers` (EngineConfig, default off, on in the DeepSeek config): VRAM-LRU and DDR tiers use
@@ -30,9 +30,9 @@ NOT reached; honest steady-state decode is about 4.0-4.5 tok/s.
 |---|---|---|
 | `mirror_model_path` + `mirror_coverage_file` (down-only sparse mirror on a 2nd NVMe; built by `bench/dsv41_pack_cold_mirror.py`) | dba16ce | disk time -10..-31%, decode about +2% |
 | `decode_promote_all_misses` | 5650d2f | +1.6% decode |
-| `MOESTREAM_DSV41_PILOT_K=k` (next-layer router prefetch) | f82d3ac | disk -30%, decode +2-4% |
-| `MOESTREAM_DSV41_CACHE_BONUS_VRAM/_RAM` (cache-aware expert selection) | 0737a17 | 3.62 -> 5.9 (b=0.40) .. 7.64 tok/s on one teacher-forced text. **Changes the output; quality cost not yet measured.** |
-| `MOESTREAM_ROUTE_LOG`, `MOESTREAM_ROUTER_IN_LOG`, `MOESTREAM_TEACHER_FORCE_NLL` | 00150ef, f82d3ac, 0737a17 | instrumentation |
+| `ZEROMOE_DSV41_PILOT_K=k` (next-layer router prefetch) | f82d3ac | disk -30%, decode +2-4% |
+| `ZEROMOE_DSV41_CACHE_BONUS_VRAM/_RAM` (cache-aware expert selection) | 0737a17 | 3.62 -> 5.9 (b=0.40) .. 7.64 tok/s on one teacher-forced text. **Changes the output; quality cost not yet measured.** |
+| `ZEROMOE_ROUTE_LOG`, `ZEROMOE_ROUTER_IN_LOG`, `ZEROMOE_TEACHER_FORCE_NLL` | 00150ef, f82d3ac, 0737a17 | instrumentation |
 
 Tools: `bench/dsv41_graph_profile.py` (`--quantized-graph`, `--prompt-file`), `bench/dsv41_mirror_io_bench.py`,
 `bench/dsv41_pilot_replay.py`, usage-survey config.
@@ -48,7 +48,7 @@ all picks (about 25-27 per token).
 - Down-only mirror IO bench: split read 1.58-1.61x per expert. Whole-expert alternating placement is
   1.00x at k=1 and about 1.8x at k>=2, but 80-85% of cold layer-steps have exactly one miss, so it gains
   little. The hybrid layout is not built.
-- The cache-backed decode graph (`MOESTREAM_DEEPSEEK_V41_CACHE_MOE_DECODE=1`) is worse (3.3-3.75 tok/s).
+- The cache-backed decode graph (`ZEROMOE_DEEPSEEK_V41_CACHE_MOE_DECODE=1`) is worse (3.3-3.75 tok/s).
 - Prefill is storage-bound (about 29 tok/s on 817 tokens, measured before the Release build and DDR fill;
   not re-measured).
 

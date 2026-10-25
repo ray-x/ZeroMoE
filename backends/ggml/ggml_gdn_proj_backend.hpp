@@ -26,7 +26,7 @@
 // OMP-parallel L2 norm, a dedicated GPU chunkwise kernel for the recurrence,
 // an OMP-parallel output norm) and this is not trying to replace them.
 //
-// This header is ALWAYS compilable. Without MOESTREAM_USE_GGML_CUDA every
+// This header is ALWAYS compilable. Without ZEROMOE_USE_GGML_CUDA every
 // entry point returns false and the caller falls back to its own dispatch.
 // ---------------------------------------------------------------------------
 

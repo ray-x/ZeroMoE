@@ -1,4 +1,4 @@
-# MoEStream — Triple GPU Configuration (Profile C)
+# ZeroMoE — Triple GPU Configuration (Profile C)
 # RTX 5060 Ti (dense) + 2x RTX 3090 (expert vault)
 # Full 128k context with Q4 KV cache
 
@@ -12,7 +12,7 @@ top_p          = 0.95
 drop_pages     = false
 
 promote_hit_threshold = 2
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 6
 # Capped (was 0/auto-fill-available-capacity) -- see glm52_3090_5060.toml's
 # comment / CLAUDE.md for the real-run regression this fixes.

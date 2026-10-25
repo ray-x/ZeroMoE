@@ -20,7 +20,7 @@
 
 #ifdef __APPLE__
 
-namespace moestream_metal {
+namespace zeromoe_metal {
 
 // Initialize the Metal device and command queue.  Safe to call multiple times.
 bool init();
@@ -33,6 +33,6 @@ bool available();
 // Returns false on failure (caller should fall back to NEON/CPU).
 bool matmul_f32(float *y, const float *x, const float *W, int S, int I, int O);
 
-} // namespace moestream_metal
+} // namespace zeromoe_metal
 
 #endif // __APPLE__

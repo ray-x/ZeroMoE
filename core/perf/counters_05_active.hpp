@@ -60,7 +60,7 @@ struct PerfCountersPart05 : PerfCountersPart04 {
     // help" before committing to that (much larger, much riskier)
     // restructuring of moe_forward_gguf's Phase 3 per-token dispatch loop.
     // llama.cpp/ggml's ggml_mul_mat_id groups every (token,k) pair by
-    // expert id and issues ONE batched GEMM per expert -- MoEStream's own
+    // expert id and issues ONE batched GEMM per expert -- ZeroMoE's own
     // Phase 3 loop instead calls dispatch_expert_k once per (token,k), even
     // though scratch.expert_freq (Phase 1, already computed for the WHOLE
     // layer's S-token batch) already has everything needed to answer this

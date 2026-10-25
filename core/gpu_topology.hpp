@@ -471,7 +471,7 @@ public:
 
     // Optional allow-list supplied by EngineConfig. CUDA still enumerates all
     // physical adapters (the runtime requires that), but only these device
-    // IDs may receive a MoEStream role or allocation. An entry omitted from
+    // IDs may receive a ZeroMoE role or allocation. An entry omitted from
     // the TOML is therefore genuinely unused rather than silently becoming
     // an ExpertVault through the old hardware-count heuristic. Empty keeps
     // the legacy "use every adapter" behavior for callers that do not use a
@@ -921,7 +921,7 @@ public:
             // (many synchronous cudaStreamSynchronize calls interleaved with
             // CPU-contended OMP dequant work), and that finding still holds
             // there. But on the full-graph Qwen4Exp decode path (ggml CUDA
-            // graph capture/replay, see MOESTREAM_ENABLE_CUDA_GRAPHS),
+            // graph capture/replay, see ZEROMOE_ENABLE_CUDA_GRAPHS),
             // BlockingSync's per-call OS wake-up/context-switch latency
             // (~40us median) was directly measured -- via nsys cuda_api_sum,
             // matched 22/48-GPU-resident-layer config against llama.cpp's own
@@ -935,16 +935,16 @@ public:
             // llama.cpp itself never overrides CUDA scheduling mode at all,
             // i.e. its equivalent is already cudaDeviceScheduleAuto.
             // Defaulting to Auto here matches that and wins on the now-
-            // primary full-graph path; MOESTREAM_CUDA_SCHEDULE=blocking
+            // primary full-graph path; ZEROMOE_CUDA_SCHEDULE=blocking
             // remains available for anyone who needs to A/B the legacy path
             // against the old default.
-            const char * schedule_env = std::getenv("MOESTREAM_CUDA_SCHEDULE");
-            // Host-node mode (MOESTREAM_QWEN4EXP_HOST_NODE=1) runs the CPU MoE from a CUDA host callback while the
+            const char * schedule_env = std::getenv("ZEROMOE_CUDA_SCHEDULE");
+            // Host-node mode (ZEROMOE_QWEN4EXP_HOST_NODE=1) runs the CPU MoE from a CUDA host callback while the
             // generation thread waits in cudaStreamSynchronize. With the Auto (spin) schedule that waiting thread
             // burns a logical CPU the 12-thread OpenMP team needs, stalling every barrier: measured 18.2 vs 22.6
             // tok/s (+24%) with a blocking wait (see tests/option_b_split_reverify_howto.md section 16). An explicit
-            // MOESTREAM_CUDA_SCHEDULE still wins; every other mode keeps Auto.
-            const char * host_node_env = std::getenv("MOESTREAM_QWEN4EXP_HOST_NODE");
+            // ZEROMOE_CUDA_SCHEDULE still wins; every other mode keeps Auto.
+            const char * host_node_env = std::getenv("ZEROMOE_QWEN4EXP_HOST_NODE");
             if ((!schedule_env || !schedule_env[0]) && host_node_env && std::strcmp(host_node_env, "1") == 0)
                 schedule_env = "blocking";
             unsigned schedule_flags = cudaDeviceScheduleAuto;
@@ -1296,7 +1296,6 @@ public:
             auto& dev = devices[vi];
             // Reserve 1 GB for driver overhead
             size_t reserve = 1ULL << 30;
-            size_t hw_cap = (dev.total_vram > reserve) ? dev.total_vram - reserve : 0;
 
             // Real, ENFORCED cap: honor this GPU's configured moe_cache_gb
             // if a matching [[gpus]] entry set one, clamped to what's
@@ -1317,6 +1316,7 @@ public:
             // grab behavior unchanged (safe default for any caller that
             // doesn't pass config, e.g. tests).
             size_t requested_bytes = 0;
+            bool fit_cache = false;
             bool matched_config = false;
             if (config) {
                 for (auto& gc : config->gpus) {
@@ -1324,6 +1324,17 @@ public:
                         matched_config = true;
                         if (gc.moe_cache_gb > 0)
                             requested_bytes = (size_t)(gc.moe_cache_gb * 1e9);
+                        if (gc.moe_cache_reserve_gb > 0) {
+                            fit_cache = true;
+                            // Auto-fit: cache = total VRAM - reserve (which includes the driver's ~1 GB).
+                            const size_t reserve_bytes = (size_t)(gc.moe_cache_reserve_gb * 1e9);
+                            const size_t fit = dev.total_vram > reserve_bytes ? dev.total_vram - reserve_bytes : 0;
+                            LOG_STREAM_INFO() << "[VRAM-FIT] device " << dev.id << ": total " << dev.total_vram / 1e9
+                                              << " GB, reserve " << gc.moe_cache_reserve_gb << " GB -> expert cache "
+                                              << fit / 1e9 << " GB (moe_cache_gb=" << gc.moe_cache_gb << " ignored)\n";
+                            reserve = reserve_bytes;
+                            requested_bytes = fit;
+                        }
                         break;
                     }
                 }
@@ -1338,15 +1349,25 @@ public:
             // allocator before it is built.
             const bool explicitly_disabled = disable_auto_cache &&
                 (matched_config || config != nullptr) && requested_bytes == 0;
-            size_t cache_bytes = explicitly_disabled
-                ? 0
-                : (requested_bytes > 0 ? std::min(requested_bytes, hw_cap) : hw_cap);
+            cudaSetDevice(dev.id);
+            size_t free_bytes = 0, total_bytes = 0;
+            if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) {
+                LOG_STREAM_ERROR() << "[GPU] Unable to measure free VRAM on device " << dev.id << "\n";
+                continue;
+            }
+            const auto budget = zeromoe::memory::expert_cache_budget(
+                dev.total_vram, free_bytes, requested_bytes, reserve, fit_cache, explicitly_disabled);
+            size_t cache_bytes = budget.bytes;
+            if (budget.clamped)
+                LOG_STREAM_WARN() << "[VRAM-FIT] device " << dev.id
+                                  << ": cache limited to " << cache_bytes / 1e9
+                                  << " GB by measured free VRAM (" << free_bytes / 1e9 << " GB)\n";
 
-            if (explicitly_disabled) {
+            if (cache_bytes == 0) {
                 dev.expert_cache_pool = nullptr;
                 dev.expert_cache_size = 0;
                 LOG_STREAM_INFO() << "[GPU] Expert cache disabled on " << dev.name
-                                  << " (explicit graph fallback budget is 0 GB)\n";
+                                  << " (no budget remains after reservations)\n";
                 continue;
             }
 

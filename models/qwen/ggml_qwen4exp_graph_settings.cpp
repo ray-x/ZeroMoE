@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -14,16 +14,16 @@ namespace qwen4exp_graph {
 
 bool env_prefill_state_handoff_enabled() {
   const char *value =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PREFILL_STATE_HANDOFF");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_STATE_HANDOFF");
   if (value && value[0])
     return value[0] == '1';
   return g_config_prefill_state_handoff;
 }
 
 bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
-  const char *value = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PREFILL_DEVICE_STATE");
+  const char *value = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PREFILL_DEVICE_STATE");
   const char *phase2 =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PHASE2");
   const bool phase2_enabled = phase2 && phase2[0] == '1';
   return !(value && value[0] == '0') && env_prefill_state_handoff_enabled() &&
          !engine.prompt_cache && !engine.mtp_enabled &&
@@ -32,7 +32,7 @@ bool prefill_device_state_inputs_enabled(const StreamingEngine &engine) {
 }
 
 bool env_enabled() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_FULL_GRAPH");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_FULL_GRAPH");
   if (v && v[0])
     return v[0] == '1';
   return g_config_full_graph;
@@ -40,12 +40,12 @@ bool env_enabled() {
 
 bool env_decode_borrow_prefill_arenas() {
   const char *v =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_DECODE_RECREATE_GRAPH_ARENA");
   return !(v && std::strcmp(v, "1") == 0);
 }
 
 int env_device_expert_layers() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS");
   if (!v || !v[0])
     return 0;
   char *end = nullptr;
@@ -56,15 +56,15 @@ int env_device_expert_layers() {
 }
 
 // Matches llama.cpp's `-ncmoe N` convention (GPU-resident block at the END
-// of the model) instead of MoEStream's historical leading-N convention.
+// of the model) instead of ZeroMoE's historical leading-N convention.
 // See FullGraph::device_expert_trailing's own comment.
 bool env_device_expert_trailing() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING");
 }
 
 // See FullGraph::layer_timing_enabled's own comment.
 bool env_layer_timing_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING");
 }
 
 // Decode phase ledger for the Phase-2/master-graph A/B.  This is deliberately
@@ -72,7 +72,7 @@ bool env_layer_timing_enabled() {
 // scheduler submission, route decision/readback, suffix submission, output
 // readback, and (for the master path) the actual device graph span.
 bool env_phase_timing_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_PHASE_TIMING");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_PHASE_TIMING");
 }
 
 // Phase 4 host-node integration is deliberately a separate opt-in from the
@@ -80,7 +80,7 @@ bool env_phase_timing_enabled() {
 // configured CPU MoE nodes with the fused CPY markers; an unset variable must
 // retain the proven scheduler-split path byte-for-byte.
 bool env_qwen4exp_host_node_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_HOST_NODE");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE");
 }
 
 // One-shot diagnostic (2026-09-19): dumps EVERY node the scheduler visits
@@ -92,14 +92,14 @@ bool env_qwen4exp_host_node_enabled() {
 // qwen4exp-phase2-gpu-branch-slower-than-cpu.md's own "not yet diagnosed"
 // note and the live investigation this answers.
 bool env_layer_timing_verbose() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_LAYER_TIMING_VERBOSE");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_LAYER_TIMING_VERBOSE");
 }
 
 // Opt-in ledger for the CUDA graph replay boundary and ordinary GGML CPU
 // backend work.  Keep this disabled by default because it adds steady_clock
 // reads to the replay path.
 bool env_graph_replay_timing_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_REPLAY_TIMING");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_REPLAY_TIMING");
 }
 
 // The merged gate/up representation is intentionally runtime-switchable while
@@ -108,14 +108,14 @@ bool env_graph_replay_timing_enabled() {
 // matches the separate projection path; setting this to 1 enables it without
 // changing placement or routing.
 bool env_merged_gate_up_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_GRAPH_MERGED_GATE_UP");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_MERGED_GATE_UP");
 }
 
 // Host-node transport diagnostic. The layer is selected explicitly so the
 // same pre-H2D/post-H2D proof used for the historical Layer-0 IQ2 check can be
 // applied to Layer 13 without enabling diagnostics for every callback.
 int env_host_node_diag_layer() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_DIAG_LAYER");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE_DIAG_LAYER");
   if (!v || !v[0])
     return -1;
   char *end = nullptr;
@@ -132,7 +132,7 @@ bool env_host_node_transport_diag_enabled(int layer) {
 // Phase 1 "all-or-nothing" partial-layer GPU dispatch (see
 // engine.hpp's qwen4exp_partial_layer field group for the full contract).
 int env_partial_layer() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER");
   if (!v || !v[0])
     return -1;
   char *end = nullptr;
@@ -143,7 +143,7 @@ int env_partial_layer() {
 }
 
 int env_partial_layer_top_n() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_TOP_N");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_TOP_N");
   if (!v || !v[0])
     return 256;
   char *end = nullptr;
@@ -162,7 +162,7 @@ int env_partial_layer_top_n() {
 // build_moe_partial_gpu's own comment. Lower this only to experiment; it
 // trades a small, measured accuracy risk for a higher commit rate.
 float env_partial_layer_min_coverage() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_MIN_COVERAGE");
   if (!v || !v[0])
     return 1.0f;
   char *end = nullptr;
@@ -179,7 +179,7 @@ float env_partial_layer_min_coverage() {
 // qwen4exp_partial_layer is configured; this flag opts into the dynamic
 // per-token variant instead for a direct A/B against Phase 1.
 bool env_partial_layer_phase2_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PHASE2");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PHASE2");
 }
 
 // The payload-backed staged child is a separate opt-in from the validated
@@ -192,9 +192,9 @@ bool env_partial_layer_phase2_enabled() {
 // position diverges from early-ready from layer ~35, RMS 2.4e-2 at layer 47, while
 // skipping the capture is bit-identical). Phase 2 routes per token in decode and never
 // consumes the Phase-1 gate, so under Phase 2 the capture is skipped. Set
-// MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 to force the old behaviour.
+// ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE=1 to force the old behaviour.
 bool partial_prefill_capture_enabled() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_LAYER_PREFILL_CAPTURE");
   if (v && v[0])
     return v[0] == '1';
   return !env_partial_layer_phase2_enabled();
@@ -209,7 +209,7 @@ std::chrono::milliseconds env_storage_wait_timeout() {
   constexpr long kDefaultMs = 100;
   constexpr long kMaximumMs = 30000;
   const char *value =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_STORAGE_TIMEOUT_MS");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_STORAGE_TIMEOUT_MS");
   if (!value || !value[0])
     return std::chrono::milliseconds(kDefaultMs);
   char *end = nullptr;
@@ -220,18 +220,18 @@ std::chrono::milliseconds env_storage_wait_timeout() {
 }
 
 bool env_adaptive_completion_policy_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY");
 }
 
 bool env_decode_enabled() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE");
   if (v && v[0])
     return v[0] == '1';
   return g_config_full_graph_decode;
 }
 
 int env_decode_kv_capacity(int max_t, int required) {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE_KV_CAPACITY");
   int requested = 2048;
   if (v && v[0]) {
     char *end = nullptr;
@@ -248,11 +248,11 @@ int env_decode_kv_capacity(int max_t, int required) {
 // (standalone repro, tests/option_b_split_reverify_howto.md section 19). Pinning thread i to
 // the i-th allowed CPU recovers most of it: host-node 22.75 -> 25.37 tok/s. Applied only in
 // host-node mode (binding hurts the plain scheduler-split modes);
-// MOESTREAM_QWEN4EXP_HOST_NODE_PIN=0 disables it.
+// ZEROMOE_QWEN4EXP_HOST_NODE_PIN=0 disables it.
 void pin_host_node_threads(ggml_threadpool_params &p, int n_threads) {
   if (!env_qwen4exp_host_node_enabled())
     return;
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_HOST_NODE_PIN");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_HOST_NODE_PIN");
   if (v && v[0] == '0')
     return;
   cpu_set_t allowed;
@@ -290,7 +290,7 @@ int graph_cpu_threads() {
   const int available = std::max(
       1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
 #endif
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_THREADS");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_THREADS");
   if (v && v[0]) {
     char *end = nullptr;
     const long parsed = std::strtol(v, &end, 10);
@@ -319,9 +319,9 @@ int graph_cpu_threads() {
 // forcing a blocking stream-sync every CPU/GPU transition instead of a
 // cheap event wait), previously verified at ~15.7->18.5-18.9 tok/s and
 // accidentally undone by that commit. Default back to true; set
-// MOESTREAM_QWEN4EXP_GRAPH_PARALLEL=0 for the blocking-sync A/B.
+// ZEROMOE_QWEN4EXP_GRAPH_PARALLEL=0 for the blocking-sync A/B.
 bool graph_scheduler_parallel() {
-  return moestream::graphcfg::flag_unless_off("MOESTREAM_QWEN4EXP_GRAPH_PARALLEL");
+  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_GRAPH_PARALLEL");
 }
 
 // llama.cpp gives the CPU scheduler slot the CUDA device's host buffer type. That
@@ -330,12 +330,12 @@ bool graph_scheduler_parallel() {
 // path. This is the normal full-graph mode; set the environment variable to
 // 0 for an explicit pageable-buffer A/B.
 bool graph_cuda_host_buffers() {
-  return moestream::graphcfg::flag_unless_off("MOESTREAM_QWEN4EXP_GRAPH_CUDA_HOST_BUFFERS");
+  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_GRAPH_CUDA_HOST_BUFFERS");
 }
 
 bool graph_match_llama_cpp_topology(const FullGraph &graph) {
   const char *v =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_MATCH_LLAMA_CPP_TOPOLOGY");
   if (v && v[0])
     return v[0] != '0';
   return device_expert_resident_layer_count(graph) < graph.n_layers;
@@ -345,7 +345,7 @@ bool graph_match_llama_cpp_topology(const FullGraph &graph) {
 // LLAMA_CPP_GGML_PROFILE_LAYOUT switch is consumed by llama.cpp's GGML scheduler so the
 // two implementations can be compared without changing their execution.
 bool graph_layout_debug() {
-  return moestream::graphcfg::flag_on("LLAMA_CPP_GGML_PROFILE_LAYOUT");
+  return zeromoe::graphcfg::flag_on("LLAMA_CPP_GGML_PROFILE_LAYOUT");
 }
 
 bool has_ple_layer(const ArchitectureConfig &c) {
@@ -359,4 +359,4 @@ bool type_ok(GGUFType type) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

@@ -7,7 +7,7 @@
 #include <future>
 #include "ggml_glm5next_graph_impl.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -36,14 +36,14 @@ static bool configure_ling_vram_reference_experts(FullGraph &g) {
   g.partial_experts.assign((size_t)c.n_layers, {});
   const int gpu1_id = second_gpu_device(g.device);
   const bool disable_all_alias =
-      moestream::graphcfg::flag_on("MOESTREAM_LING_NO_VRAM_CACHE_ALIAS");
+      zeromoe::graphcfg::flag_on("ZEROMOE_LING_NO_VRAM_CACHE_ALIAS");
   const bool disable_gpu1_alias =
-      moestream::graphcfg::flag_on("MOESTREAM_LING_NO_GPU1_CACHE_ALIAS");
+      zeromoe::graphcfg::flag_on("ZEROMOE_LING_NO_GPU1_CACHE_ALIAS");
   const bool have_gpu1 = !disable_all_alias && !disable_gpu1_alias &&
                          gpu1_id >= 0 &&
                          ggml_shared_backend(gpu1_id) != nullptr;
-  moestream::graph::AliasedExpertPlacement aliased;
-  moestream::graph::AliasedPlacementOptions alias_opt;
+  zeromoe::graph::AliasedExpertPlacement aliased;
+  zeromoe::graph::AliasedPlacementOptions alias_opt;
   alias_opt.device = g.device;
   alias_opt.alias_primary = !disable_all_alias;
   alias_opt.secondary_device = have_gpu1 ? gpu1_id : -1;
@@ -57,7 +57,7 @@ static bool configure_ling_vram_reference_experts(FullGraph &g) {
     g.vram_expert_holds.push_back({h.layer, h.expert, h.device_ptr});
   for (int layer = c.first_dense; layer < c.n_layers; ++layer) {
     PartialExpertLayer &p = g.partial_experts[(size_t)layer];
-    const moestream::graph::AliasedLayerPlacement &src = *aliased.layer(layer);
+    const zeromoe::graph::AliasedLayerPlacement &src = *aliased.layer(layer);
     p.hot = src.primary.experts;
     p.vram_slot_by_expert = src.primary.slot_by_expert;
     p.vram_layer_base = src.primary.base;
@@ -216,7 +216,7 @@ bool configure_vram_reference_experts(FullGraph &g) {
       aliased_bytes += stride;
     }
 
-    if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
+    if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_PARTIAL") && layer < 8) {
       size_t n_pool = 0, n_ready = 0, n_ptr = 0, n_size = 0, n_gpu = 0;
       for (const ExpertLocation &l2 : g.topology->expert_vram_cache) {
         if (l2.pool_layer != layer) continue;
@@ -269,7 +269,7 @@ bool configure_partial_experts_base(FullGraph &g) {
       g.engine->family_ops.family == ModelFamily::BailingMoE3)
     return false;
   const double requested_gb =
-      full_graph_resident_gb("MOESTREAM_FULL_GRAPH_RESIDENT_GB");
+      full_graph_resident_gb("ZEROMOE_FULL_GRAPH_RESIDENT_GB");
   if (requested_gb <= 0.0)
     return false;
   const auto &c = g.engine->model_file.architecture_config;
@@ -432,7 +432,7 @@ bool configure_partial_experts(FullGraph &g) {
   if (g.engine->family_ops.family != ModelFamily::BailingMoE3 &&
       g.partial_expert_residency &&
       ggml_shared_backend(second_gpu_device(g.device))) {
-    const char *gh = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_GIB");
+    const char *gh = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_GIB");
     if (gh && gh[0])
       assign_gpu1_hot(g, std::atof(gh));
   }
@@ -445,12 +445,12 @@ ggml_tensor *make_vram_ref_weight(FullGraph &g, ggml_context *ctx, int layer,
   if (!p)
     return nullptr;
   const bool on_gpu1 = gpu_id >= 0 && gpu_id != g.device;
-  moestream::graph::AliasedHotSet set;
+  zeromoe::graph::AliasedHotSet set;
   set.experts = on_gpu1 ? p->hot1 : p->hot;
   set.base = on_gpu1 ? p->hot1_vram_layer_base : p->vram_layer_base;
   set.slots = on_gpu1 ? p->hot1_vram_layer_slots : p->vram_layer_slots;
   set.stride = on_gpu1 ? p->hot1_vram_slot_stride : p->vram_slot_stride;
-  return moestream::graph::make_alias_weight(
+  return zeromoe::graph::make_alias_weight(
       *g.engine, ctx, layer, stem, set,
       on_gpu1 ? g.expert1_buffer : g.expert.buffer, gpu_id, on_gpu1);
 }
@@ -531,15 +531,15 @@ ggml_tensor *partial_map_hot1(FullGraph &g, ggml_context *ctx, int layer,
           : moe_partial::SentinelPolicy::Auto;
   moe_partial::ExpertBranchMap branch_map;
   if (ling_vram_alias) {
-    moestream::graph::AliasedLayerPlacement lp;
+    zeromoe::graph::AliasedLayerPlacement lp;
     lp.secondary.experts = p->hot1;
     lp.secondary.slot_by_expert = p->hot1_vram_slot_by_expert;
-    moestream::graph::AliasedMapRequest req;
+    zeromoe::graph::AliasedMapRequest req;
     req.n_experts = (int)n;
     req.n_tokens = g.S;
     req.decode = g.decode_mode;
     req.policy = hot1_policy;
-    moestream::graph::build_secondary_map(lp, req, &branch_map);
+    zeromoe::graph::build_secondary_map(lp, req, &branch_map);
   } else {
     branch_map = moe_partial::ExpertBranchMap::build(
         index_of_expert, g.S, g.decode_mode && g.S == 1, owned, hot1_policy);
@@ -577,9 +577,9 @@ ggml_tensor *hot1_weight(FullGraph &g, ggml_context *ctx, int layer,
   auto it = g_hot1_buffers.find(key);
   const bool fresh = it == g_hot1_buffers.end();
   if (fresh) {
-    // MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0=1 is a verification aid: same branch, buffers on the main GPU, so its
+    // ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0=1 is a verification aid: same branch, buffers on the main GPU, so its
     // logits can be compared against the GPU1 placement with identical kernels.
-    static const bool on_gpu0 = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
+    static const bool on_gpu0 = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_ON_GPU0") != nullptr;
     buf = ggml_backend_buft_alloc_buffer(
         ggml_backend_get_default_buffer_type(on_gpu0 ? g.cuda : g.gpu1), ggml_nbytes(t) + 4096);
     if (!buf)
@@ -706,10 +706,10 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
   if (gib <= 0.0 || g.partial_experts.empty())
     return;
   const auto &c = g.engine->model_file.architecture_config;
-  const char *uenv = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_HOT_USAGE");
+  const char *uenv = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE");
   const std::string usage_path = uenv && uenv[0]
                                      ? std::string(uenv)
-                                     : offload_env("MOESTREAM_GLM5NEXT_OFFLOAD_USAGE");
+                                     : offload_env("ZEROMOE_GLM5NEXT_OFFLOAD_USAGE");
   auto [entries, max_count] = StreamingEngine::load_usage(usage_path);
   (void)max_count;
   std::vector<std::vector<uint8_t>> is_cold((size_t)c.n_layers);
@@ -726,10 +726,10 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
         bytes[(size_t)l] += (size_t)m->size_bytes / (size_t)c.n_experts;
     }
   }
-  // MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER=L: the second GPU only holds hot experts of layers >= L. Pair it with a primary-GPU
+  // ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER=L: the second GPU only holds hot experts of layers >= L. Pair it with a primary-GPU
   // ranking whose counts are zeroed for those layers (and pin_global_floor_per_layer = 0), so each layer's hot set lives on one
   // GPU and its trunk needs no cross-GPU hop. Measured +3% on held-out prompts (docs/ssd-offload/13-...).
-  const int gpu1_min_layer = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU1_MIN_LAYER", 0);
+  const int gpu1_min_layer = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_GPU1_MIN_LAYER", 0);
   std::vector<StreamingEngine::UsageEntry> cand;
   for (const auto &e : entries)
     if (e.layer >= std::max(c.first_dense, gpu1_min_layer) && e.layer < c.n_layers && e.expert >= 0 &&
@@ -762,7 +762,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
                                 [&](int e) { return !is_cold[(size_t)l][(size_t)e]; }),
                  p.cold.end());
   }
-  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OFFLOAD_DEBUG")) {
+  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OFFLOAD_DEBUG")) {
     for (int l : {3, 4}) {
       std::string a, b;
       for (int e : g.partial_experts[(size_t)l].hot1) a += std::to_string(e) + ",";
@@ -779,25 +779,7 @@ void assign_gpu1_hot(FullGraph &g, double gib) {
 // ggml-cuda's MMQ path (patches/ggml/0006). IQ1_M and float experts use other batched paths, so
 // those layers keep the valid-dummy-id route for prefill.
 static bool layer_experts_take_mmq(FullGraph &g, int layer) {
-  for (const char *stem :
-       {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
-    const GGUFTensor *t = model_tensor(
-        *g.engine, "blk." + std::to_string(layer) + "." + stem);
-    if (!t)
-      return false;
-    switch (t->type) {
-    case GGUFType::Q4_0: case GGUFType::Q4_1: case GGUFType::Q5_0:
-    case GGUFType::Q5_1: case GGUFType::Q8_0: case GGUFType::Q2_K:
-    case GGUFType::Q3_K: case GGUFType::Q4_K: case GGUFType::Q5_K:
-    case GGUFType::Q6_K: case GGUFType::IQ2_XXS: case GGUFType::IQ2_XS:
-    case GGUFType::IQ2_S: case GGUFType::IQ3_XXS: case GGUFType::IQ3_S:
-    case GGUFType::IQ4_NL: case GGUFType::IQ4_XS: case GGUFType::IQ1_S:
-      break;
-    default:
-      return false;
-    }
-  }
-  return true;
+  return zeromoe::graph::layer_experts_take_mmq(*g.engine, layer);
 }
 
 ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
@@ -835,7 +817,7 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
       if (!is_hot[expert])
         index_of_expert[expert] = (int32_t)expert;
   } else if (g.vram_reference_experts) {
-    use_alias = true; // addressing comes from moestream::graph::build_*_map below
+    use_alias = true; // addressing comes from zeromoe::graph::build_*_map below
   } else {
     const auto &ids = hot ? p->hot : p->cold;
     for (size_t i = 0; i < ids.size(); ++i) {
@@ -862,9 +844,9 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
     }
   }
 
-  // MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
+  // ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL=1 forces the valid dummy id (A/B tests).
   static const bool force_dummy =
-      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
+      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PARTIAL_ZERO_SENTINEL") != nullptr;
   // Batched MMQ negative-id skipping regressed Ling's short-prompt prefill
   // (13.2 s vs 1.4 s for the same two-token input). Keep batched Ling routes
   // on the valid dummy id; the single-token decode path still uses MMVQ's
@@ -876,8 +858,8 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
   // patched path for those runs.
   const bool allow_batched_negative_skip =
       (g.engine->family_ops.family != ModelFamily::BailingMoE3 ||
-       moestream::graphcfg::atoi_or(
-           "MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP", 0) != 0) &&
+       zeromoe::graphcfg::atoi_or(
+           "ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP", 0) != 0) &&
       layer_experts_take_mmq(g, layer);
   const moe_partial::SentinelPolicy policy =
       force_dummy ? moe_partial::SentinelPolicy::ForceDummy
@@ -885,12 +867,12 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
                                     : moe_partial::SentinelPolicy::Auto;
   moe_partial::ExpertBranchMap branch_map;
   if (use_alias) {
-    moestream::graph::AliasedLayerPlacement lp;
+    zeromoe::graph::AliasedLayerPlacement lp;
     lp.primary.experts = p->hot;
     lp.primary.slot_by_expert = p->vram_slot_by_expert;
     lp.secondary.experts = p->hot1;
     lp.cold = p->cold;
-    moestream::graph::AliasedMapRequest req;
+    zeromoe::graph::AliasedMapRequest req;
     req.n_experts = (int)n;
     req.n_tokens = g.S;
     req.decode = g.decode_mode;
@@ -898,8 +880,8 @@ ggml_tensor *partial_map(FullGraph &g, ggml_context *ctx, int layer, bool hot,
     req.full_ddr_view = !hot && (offload_layer(layer) || partial_layer_ram_ready(g, layer));
     req.secondary_active = g.gpu1 != nullptr;
     req.policy = policy;
-    if (!(hot ? moestream::graph::build_primary_map(lp, req, &branch_map)
-              : moestream::graph::build_cold_map(lp, req, &branch_map)))
+    if (!(hot ? zeromoe::graph::build_primary_map(lp, req, &branch_map)
+              : zeromoe::graph::build_cold_map(lp, req, &branch_map)))
       return nullptr;
   } else {
     branch_map = moe_partial::ExpertBranchMap::build(
@@ -1259,7 +1241,7 @@ bool publish_dynamic_uploads(FullGraph &g) {
 RouteTap &route_tap() {
   static RouteTap t = [] {
     RouteTap r;
-    if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_ROUTE_TAP"))
+    if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_ROUTE_TAP"))
       r.path = e;
     return r;
   }();
@@ -1277,19 +1259,19 @@ void route_tap_flush(RouteTap &t) {
   std::fclose(f);
 }
 
-// MOESTREAM_GLM5NEXT_DYNAMIC_HEAT=theta (> 0): promote a cold expert into VRAM only when its decayed re-reference score (+1 per route,
+// ZEROMOE_GLM5NEXT_DYNAMIC_HEAT=theta (> 0): promote a cold expert into VRAM only when its decayed re-reference score (+1 per route,
 // halved every DYNAMIC_HEAT_HALFLIFE tokens, default 30) is >= theta, instead of the cumulative "missed twice" rule. Admission by reuse:
 // an upload costs about one CPU compute, so it only pays for experts that come back.
 float dynamic_heat_threshold() {
   static const float v = [] {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_HEAT");
+    const char *e = std::getenv("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT");
     return e && e[0] ? (float)std::atof(e) : 0.0f;
   }();
   return v;
 }
 float dynamic_heat_halflife() {
   static const float v = [] {
-    const char *e = std::getenv("MOESTREAM_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE");
+    const char *e = std::getenv("ZEROMOE_GLM5NEXT_DYNAMIC_HEAT_HALFLIFE");
     const float h = e && e[0] ? (float)std::atof(e) : 30.0f;
     return h > 0.5f ? h : 30.0f;
   }();
@@ -1719,4 +1701,4 @@ ggml_tensor *graph_ram_weight(FullGraph &g, ggml_context *ctx, int layer,
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

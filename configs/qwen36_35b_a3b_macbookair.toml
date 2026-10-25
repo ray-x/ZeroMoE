@@ -1,10 +1,10 @@
-# MoEStream — Qwen3.6-35B-A3B-UD CPU-ONLY config for MacBook Air
+# ZeroMoE — Qwen3.6-35B-A3B-UD CPU-ONLY config for MacBook Air
 #
 # Model: /Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD
 # Format: UD-IQ2_M (12 GB file, ~1.10 MB per routed expert slab)
 #
 # This config targets a MacBook Air (Apple Silicon, no CUDA).  The root
-# CMakeLists.txt already forces MOESTREAM_CPU_ONLY=ON on macOS, so the engine
+# CMakeLists.txt already forces ZEROMOE_CPU_ONLY=ON on macOS, so the engine
 # will run the CPU dequant + matmul path for every layer if/when the full
 # CPU-only decode path is wired up.  Until then this file documents the
 # intended settings for 4 GB of host-side expert cache.
@@ -47,7 +47,7 @@ promote_hit_threshold = 2
 
 # Persisted usage histogram used by startup preload to decide which experts to
 # pin.  Will be created automatically on first run.
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 4
 
 # Number of experts per layer to pin/preload from the usage file.  With 40 MoE

@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -237,9 +237,9 @@ ggml_tensor *build_qwen4exp_host_node(
     LOG_WARN("[QWEN4EXP-HOST-NODE] layer=%d CPU plan warm-up failed\n", layer);
     return nullptr;
   }
-  const char *direct_pool_env = moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+  const char *direct_pool_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_POOL");
   const char *direct_fused_env =
-      moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_FUSED");
   const bool direct_fused_requested =
       direct_fused_env && direct_fused_env[0] == '1';
   const bool direct_pool_requested =
@@ -357,7 +357,7 @@ ggml_tensor *build_qwen4exp_host_node(
 // immediately before graph replay -- which only works because it forces a
 // fixed route (build_moe's g.stage_route_ids branch) -- this uses the SAME
 // CUDA-graph host-node-callback technique qwen4exp_cuda_host_node_callback/
-// moestream_qwen4exp_cuda_host_node_enqueue already prove works mid-replay
+// zeromoe_qwen4exp_cuda_host_node_enqueue already prove works mid-replay
 // with REAL per-token data: a captured D2H(ids)->host-callback(gather)->
 // H2D(compact planes) sequence that re-executes on every cudaGraphLaunch
 // replay with that token's real routed ids.
@@ -578,7 +578,7 @@ int build_gpu_stage_node(FullGraph &g, ggml_context *ctx, ggml_tensor *ids,
 }
 
 // `safe_dummy_fill`: a literal -1 ("skip this route") id is only honored on
-// stock ggml when the MoEStream negative-skip patch is applied
+// stock ggml when the ZeroMoE negative-skip patch is applied
 // (patches/ggml-mul-mat-id-negative-skip.patch, CPU op + CUDA MMVQ decode
 // kernels). Unpatched, ggml-cuda's mul_mat_vec_q reads `ids[channel_dst]` as
 // an unsigned offset (illegal memory access, reproduced 2026-09-29) and the
@@ -658,8 +658,8 @@ bool exl3_ggml_bridge_requested(const FullGraph &g, int layer,
     model_path = g.engine->exl3_ggml_bridge_model_path;
     return true;
   }
-  const char *path = moestream::graphcfg::env("MOESTREAM_EXL3_GGML_BRIDGE_MODEL_PATH");
-  const char *layer_text = moestream::graphcfg::env("MOESTREAM_EXL3_GGML_BRIDGE_LAYER");
+  const char *path = zeromoe::graphcfg::env("ZEROMOE_EXL3_GGML_BRIDGE_MODEL_PATH");
+  const char *layer_text = zeromoe::graphcfg::env("ZEROMOE_EXL3_GGML_BRIDGE_LAYER");
   if (!path || !path[0] || !layer_text || !layer_text[0])
     return false;
   char *end = nullptr;
@@ -927,8 +927,8 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ExpertSplitTables tab = build_expert_split_tables(
         g, ctx, c.n_experts, *split_gpu_ids, /*safe_dummy_fill=*/g.S != 1);
     if (tab.remap_gpu && tab.remap_cpu && tab.mask_gpu && tab.mask_cpu) {
-      const char *early_env = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_LAYER13");
-      const char *all_early_env = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT");
+      const char *early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_LAYER13");
+      const char *all_early_env = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT");
       const bool early_requested =
           ((early_env && early_env[0] == '1' && layer == 13) ||
            (!all_early_env || all_early_env[0] != '0')) &&
@@ -958,7 +958,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
           for (auto *table : early->gpu_tables)
             ggml_backend_sched_set_tensor_backend(g.sched, table, g.cuda);
         }
-        const char *stage = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *stage = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER");
         if (stage && g.split_gpu_expert_ids.count(layer - 1) &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer)) {
           if (!g.early_stage_shapes)
@@ -1032,9 +1032,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
         early->gpu_input = fork;
         input3 = ggml_reshape_3d(ctx, fork, g.D, 1, 1);
         ggml_build_forward_expand(g.graph, fork);
-        const char *predict = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_PREDICT");
-        const char *target = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_PREDICT_LAYER");
-        const char *stage = moestream::graphcfg::env("MOESTREAM_QWEN_EARLY_READY_STAGE_LAYER");
+        const char *predict = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT");
+        const char *target = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_PREDICT_LAYER");
+        const char *stage = zeromoe::graphcfg::env("ZEROMOE_QWEN_EARLY_READY_STAGE_LAYER");
         const bool stage_next = stage &&
             (std::strcmp(stage, "all") == 0 || std::atoi(stage) == layer + 1);
         const bool predict_this_layer = !target || std::atoi(target) == layer + 1;
@@ -1171,4 +1171,4 @@ bool qwen_moe_layer_cpu_only(const FullGraph &g, int layer) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

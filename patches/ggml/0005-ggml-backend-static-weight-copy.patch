@@ -7,7 +7,7 @@ index 20bf96501..b7e339fa1 100644
                      if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                          ggml_backend_t backend = sched->backends[cur_backend_id];
 -                        for (int c = 0; c < sched->n_copies; c++) {
-+                        // MOESTREAM FIX 2026-09-25: a cross-backend copy only
++                        // ZEROMOE FIX 2026-09-25: a cross-backend copy only
 +                        // needs sched->n_copies independent destination
 +                        // buffers when its VALUE can legitimately differ
 +                        // between overlapping in-flight submissions -- i.e.
@@ -33,7 +33,7 @@ index 20bf96501..b7e339fa1 100644
 +                        // for 26 *_exps.weight tensors x 4 copies on a real
 +                        // qwen4exp full-graph decode session with
 +                        // op_offload=true (the actual root cause, since
-+                        // fixed on the MoEStream side to keep op_offload
++                        // fixed on the ZeroMoE side to keep op_offload
 +                        // false -- see ggml_qwen4exp_graph.cpp's
 +                        // qwen4exp_full_graph_prepare). Kept as an
 +                        // independent hardening fix regardless: give a
@@ -41,7 +41,7 @@ index 20bf96501..b7e339fa1 100644
 +                        // mirroring the SAME distinction ggml already makes
 +                        // for same-backend inputs a few lines above. The
 +                        // matching leaf-registration loop below (search
-+                        // "MOESTREAM FIX" again) must stay consistent with
++                        // "ZEROMOE FIX" again) must stay consistent with
 +                        // this same per-tensor copy count.
 +                        const int n_copies_for_src =
 +                            (src->flags & GGML_TENSOR_FLAG_INPUT) ? sched->n_copies : 1;
@@ -64,9 +64,9 @@ index 20bf96501..b7e339fa1 100644
                  struct ggml_tensor * input = split->inputs[j];
                  size_t id = hash_id(input);
 -                for (int c = 0; c < sched->n_copies; c++) {
-+                // MOESTREAM FIX 2026-09-25: mirror the reduced per-tensor
++                // ZEROMOE FIX 2026-09-25: mirror the reduced per-tensor
 +                // copy count used when these copies were created (see
-+                // "MOESTREAM FIX" above, in the cross-backend-copy creation
++                // "ZEROMOE FIX" above, in the cross-backend-copy creation
 +                // site). A static (non-INPUT-flagged) source only ever
 +                // populated copy slot 0; iterating the full sched->n_copies
 +                // here would push NULL leaves (slots 1..n_copies-1 stay

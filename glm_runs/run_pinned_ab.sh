@@ -2,21 +2,21 @@
 # usage: run_pinned_ab.sh NAME PINNED_FRACTION [DDR_GIB=32]   GLM-5.3-Flash SSD offload, 3090 only, 5 prompt/decode rounds in one session
 B=$(cd "$(dirname "$0")" && pwd); N=$1; PF=$2; DDR=${3:-32}
 cd "$(dirname "$B")"
-for w in $(seq 1 120); do pgrep -x moestream >/dev/null || break; sleep 5; done
+for w in $(seq 1 120); do pgrep -x zeromoe >/dev/null || break; sleep 5; done
 python3 - <<'PY'
 import os,glob
 for f in glob.glob('/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-*.gguf')+['/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf']:
     fd=os.open(f,os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)
 PY
 sed "s#baseline.engine.log#pinab/$N.engine.log#" $B/spread_off.toml > $B/pinab/$N.toml
-export MOESTREAM_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 MOESTREAM_GLM5NEXT_OFFLOAD_DDR_GIB=$DDR MOESTREAM_GLM5NEXT_OFFLOAD_PINNED=$PF
-export MOESTREAM_GLM5NEXT_OFFLOAD_STORE=/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf
-export MOESTREAM_GLM5NEXT_OFFLOAD_MODEL=/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf
-export MOESTREAM_GLM5NEXT_OFFLOAD_USAGE=$(dirname "$B")/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
-export MOESTREAM_GLM5NEXT_OFFLOAD_THP=0
-unset MOESTREAM_GLM5NEXT_FULL_GRAPH; export MOESTREAM_GLM5NEXT_ALLOC_FLOOR_MIB=512
-export MOESTREAM_GLM5NEXT_CPU_THREADS=8 CUDA_VISIBLE_DEVICES=0
-export MOESTREAM_GENERATED_TOKEN_FILE=$B/pinab/$N.tokens MOESTREAM_BENCH_IGNORE_STOP=1
+export ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=$DDR ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=$PF
+export ZEROMOE_GLM5NEXT_OFFLOAD_STORE=/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf
+export ZEROMOE_GLM5NEXT_OFFLOAD_MODEL=/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf
+export ZEROMOE_GLM5NEXT_OFFLOAD_USAGE=$(dirname "$B")/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt
+export ZEROMOE_GLM5NEXT_OFFLOAD_THP=0
+unset ZEROMOE_GLM5NEXT_FULL_GRAPH; export ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512
+export ZEROMOE_GLM5NEXT_CPU_THREADS=8 CUDA_VISIBLE_DEVICES=0
+export ZEROMOE_GENERATED_TOKEN_FILE=$B/pinab/$N.tokens ZEROMOE_BENCH_IGNORE_STOP=1
 printf '%s\n' \
  "Explain how a mixture-of-experts transformer routes tokens, in a few clear paragraphs." \
  "Write a Python function that parses a CSV file and returns the average of a numeric column, with error handling." \
@@ -24,5 +24,5 @@ printf '%s\n' \
  "Explain how TCP congestion control works, covering slow start and congestion avoidance." \
  "Explain how a mixture-of-experts transformer routes tokens, in a few clear paragraphs." \
  ":q" | systemd-run --user --scope -q -p MemoryMax=80G -p MemorySwapMax=0 \
-   ./build_pf/moestream --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
+   ./build_pf/zeromoe --config $B/pinab/$N.toml --ngen 96 > $B/pinab/$N.stdout 2>&1
 echo DONE > $B/pinab/$N.done

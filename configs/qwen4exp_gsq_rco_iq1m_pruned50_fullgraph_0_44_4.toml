@@ -22,8 +22,8 @@ expert_fetch_threads = 10
 omp_max_threads = 12
 prefetch_worker_threads = 4
 
-pin_file = ".moestream_usage_qwen4exp_pruned50"
-prefill_pin_file = ".moestream_usage_qwen4exp_pruned50"
+pin_file = ".zeromoe_usage_qwen4exp_pruned50"
+prefill_pin_file = ".zeromoe_usage_qwen4exp_pruned50"
 freeze_usage_stats = true
 pinned_vram_capacity = 128
 pin_vram_lru_fraction = 0.1

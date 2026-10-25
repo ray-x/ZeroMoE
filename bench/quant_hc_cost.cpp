@@ -14,7 +14,7 @@
 #include <vector>
 
 int main() {
-    const char *dump_path = std::getenv("MOESTREAM_HC_OUTPUT_DUMP");
+    const char *dump_path = std::getenv("ZEROMOE_HC_OUTPUT_DUMP");
     std::ofstream dump;
     if(dump_path && dump_path[0]) {
         dump.open(dump_path,std::ios::binary|std::ios::trunc);

@@ -5,7 +5,7 @@
 #include <chrono>
 #include <random>
 #include <thread>
-using namespace moestream::offload;
+using namespace zeromoe::offload;
 using clk = std::chrono::steady_clock;
 int main(int argc, char **argv) {
   if (argc < 2) return 2;

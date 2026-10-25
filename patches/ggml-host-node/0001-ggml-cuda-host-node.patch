@@ -6,10 +6,10 @@ index 91d551bbb..84f45d704 100644
          nb1, nb2, nb3, stream);
  }
  
-+// Optional strong implementation is supplied by MoEStream's Qwen graph
++// Optional strong implementation is supplied by ZeroMoE's Qwen graph
 +// bridge. Undefined weak symbols resolve to null, preserving ordinary ggml
 +// CPY behavior for every other application.
-+extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
++extern "C" bool zeromoe_qwen4exp_cuda_host_node_enqueue(
 +    const ggml_tensor * node, cudaStream_t stream) __attribute__((weak));
 +
  static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -19,12 +19,12 @@ index 91d551bbb..84f45d704 100644
              ggml_cuda_dup(ctx, dst);
              break;
          case GGML_OP_CPY:
-+            // MoEStream's opt-in CPUOffload Phase 4 marker is represented as
++            // ZeroMoE's opt-in CPUOffload Phase 4 marker is represented as
 +            // a normal CPY node so the scheduler keeps it in the CUDA
 +            // capture. The strong bridge expands it to explicit D2H, host
 +            // callback, and H2D operations.
-+            if (dst->extra && moestream_qwen4exp_cuda_host_node_enqueue &&
-+                moestream_qwen4exp_cuda_host_node_enqueue(
++            if (dst->extra && zeromoe_qwen4exp_cuda_host_node_enqueue &&
++                zeromoe_qwen4exp_cuda_host_node_enqueue(
 +                    dst, ctx.stream())) {
 +                break;
 +            }
@@ -35,17 +35,17 @@ index 91d551bbb..84f45d704 100644
                 node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE;
      };
  
-+    // MoEStream's host-node branch is enabled together with the existing
++    // ZeroMoE's host-node branch is enabled together with the existing
 +    // GGML_CUDA_GRAPH_OPT switch. It only recognizes the explicit
 +    // qwen4exp_host_moe_marker -> shared-expert -> add topology.
-+    if (getenv("MOESTREAM_QWEN4EXP_HOST_NODE_PARALLEL") != nullptr) {
-+        const auto & is_moestream_host_marker = [](const ggml_tensor * node) {
++    if (getenv("ZEROMOE_QWEN4EXP_HOST_NODE_PARALLEL") != nullptr) {
++        const auto & is_zeromoe_host_marker = [](const ggml_tensor * node) {
 +            return node != nullptr && node->op == GGML_OP_CPY &&
 +                   strstr(node->name, "qwen4exp_host_moe_marker_l") != nullptr;
 +        };
 +        for (int marker_idx = 0; marker_idx < cgraph->n_nodes; ++marker_idx) {
 +            const ggml_tensor * marker = cgraph->nodes[marker_idx];
-+            if (!is_moestream_host_marker(marker)) {
++            if (!is_zeromoe_host_marker(marker)) {
 +                continue;
 +            }
 +            int join_idx = -1;
@@ -65,7 +65,7 @@ index 91d551bbb..84f45d704 100644
 +                }
 +            }
 +            if (join_idx < 0) {
-+                GGML_LOG_DEBUG("Skipping MoEStream host marker %s: no direct join\n", marker->name);
++                GGML_LOG_DEBUG("Skipping ZeroMoE host marker %s: no direct join\n", marker->name);
 +                continue;
 +            }
 +            int fork_idx = marker_idx - 1;
@@ -83,7 +83,7 @@ index 91d551bbb..84f45d704 100644
 +                }
 +            }
 +            if (!only_noops_before_marker || join_idx <= marker_idx + 1) {
-+                GGML_LOG_DEBUG("Skipping MoEStream host marker %s: non-contiguous fork/join interval\n", marker->name);
++                GGML_LOG_DEBUG("Skipping ZeroMoE host marker %s: non-contiguous fork/join interval\n", marker->name);
 +                continue;
 +            }
 +            ggml_cuda_concurrent_event event(2);
@@ -95,7 +95,7 @@ index 91d551bbb..84f45d704 100644
 +                event.stream_mapping[node] = (i == marker_idx) ? 1 : 2;
 +            }
 +            if (!event.is_valid()) {
-+                GGML_LOG_DEBUG("Skipping MoEStream host marker %s: branch validation failed\n", marker->name);
++                GGML_LOG_DEBUG("Skipping ZeroMoE host marker %s: branch validation failed\n", marker->name);
 +                continue;
 +            }
 +            auto & events = cuda_ctx->stream_context().concurrent_events;
@@ -103,7 +103,7 @@ index 91d551bbb..84f45d704 100644
 +                continue;
 +            }
 +            events.emplace(cgraph->nodes[fork_idx], std::move(event));
-+            GGML_LOG_INFO("MoEStream: parallel host-node branch marker=%s fork=%s join=%s\n", marker->name, cgraph->nodes[fork_idx]->name, cgraph->nodes[join_idx]->name);
++            GGML_LOG_INFO("ZeroMoE: parallel host-node branch marker=%s fork=%s join=%s\n", marker->name, cgraph->nodes[fork_idx]->name, cgraph->nodes[join_idx]->name);
 +        }
 +    }
      const auto & depends_on = [](const ggml_tensor * dst, const ggml_tensor * src) -> bool {

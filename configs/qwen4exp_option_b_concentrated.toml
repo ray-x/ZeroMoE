@@ -32,8 +32,8 @@ omp_max_threads = 12
 prefetch_worker_threads = 4
 
 # Decode usage is both the layer-selection and expert-ranking source.
-pin_file = ".moestream_usage_qwen4exp_7prompts_isolated"
-prefill_pin_file = ".moestream_usage_qwen4exp_prefill_7prompts_isolated"
+pin_file = ".zeromoe_usage_qwen4exp_7prompts_isolated"
+prefill_pin_file = ".zeromoe_usage_qwen4exp_prefill_7prompts_isolated"
 freeze_usage_stats = true
 qwen4exp_option_b_layer = -1
 qwen4exp_option_b_concentrated_only = true

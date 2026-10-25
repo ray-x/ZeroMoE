@@ -5,15 +5,18 @@
 // declarations live in ggml_glm5next_graph_impl.hpp.
 
 #include "ggml_glm5next_graph_impl.hpp"
+#include "graph_health.hpp"
+#include "graph_settings_global.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
 namespace glm5next_graph {
 
 std::unique_ptr<FullGraph> g_graph;
+std::unique_ptr<zeromoe::graph::PhaseExpertCache> g_phase_cache;
 
 // The large host expert source is independent of prompt length.  Keep it in
 // a source-only container while the prompt-shaped GGML graph is rebuilt or
@@ -50,7 +53,7 @@ void glm5next_full_graph_set_vram_cache(GpuTopology *topology) {
 bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
   if (!graph_enabled_for(engine))
     return false;
-  moestream::graphcfg::log_effective("glm5next-full-graph");
+  zeromoe::graphcfg::log_effective("glm5next-full-graph");
   g_skip_indexer_weights = engine.family_ops.family == ModelFamily::GLM_DSA;
   if (bailingmoe3_hybrid_cuda_graph_enabled()) {
     LOG_INFO("[GGML-LING-HYBRID] native expert cache owns DDR/VRAM; "
@@ -78,7 +81,7 @@ bool glm5next_full_graph_bootstrap(StreamingEngine &engine) {
                                ? &candidate.partial_experts
                                : nullptr))
     return false;
-  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_GPU1_HOT_PRELOAD", 1) != 0 && !preload_partial_hot1(candidate))
+  if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_GPU1_HOT_PRELOAD", 1) != 0 && !preload_partial_hot1(candidate))
     LOG_WARN("[GGML-GLM5NEXT-GPU1-HOT] boot preload failed; hot experts will upload at the first decode build\n");
 
   if (g_glm5next_source &&
@@ -116,8 +119,10 @@ int glm5next_full_graph_device_expert_layers() {
 }
 
 void glm5next_full_graph_shutdown() {
-  moestream::graphcfg::log_consulted("glm5next-full-graph");
+  zeromoe::graphcfg::log_consulted("glm5next-full-graph");
   g_graph.reset();
+  g_phase_cache.reset();
+  if (g_offload && g_offload->store) g_offload->store->report("shutdown");
   for (auto &kv : g_hot1_buffers)
     ggml_backend_buffer_free(kv.second);
   g_hot1_buffers.clear();
@@ -176,17 +181,18 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   // is dense, which equals the model's top-k selection only while the context fits in top_k.
   if (pos_base > 0) {
     const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
-    if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_NO_CONTINUATION", 0) != 0)
+    if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_NO_CONTINUATION", 0) != 0)
       return false; // A/B reference: the rest of the prompt is stepped
     if (g_continuation.engine != &engine || g_continuation.total_tokens != pos_base)
       return false;
     if (kpool > 1 && pos_base % kpool != 0)
       return false;
     // Context beyond top_k: the chunk's attention selects pools per query like the decode graph (sparse_prefill below);
-    // MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 keeps the dense attention instead (A/B only).
+    // ZEROMOE_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK=1 keeps the dense attention instead (A/B only).
   }
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
-      g_graph->S == S && g_graph->pos_base == pos_base && !g_graph->decode_mode)
+      g_graph->S == S && g_graph->pos_base == pos_base && !g_graph->decode_mode &&
+      (!g_phase_cache || g_graph->placement_generation == g_phase_cache->generation()))
     return true;
   std::vector<Glm5nextIndexerSeed> prev_seeds;
   if (pos_base > 0)
@@ -205,6 +211,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   }
   g_graph.reset();
   auto g = std::make_unique<FullGraph>();
+  if (g_phase_cache && !g_phase_cache->release())
+    throw std::runtime_error("phase cache release failed before prefill");
+  if (g_phase_cache) g_phase_cache->bind(*g);
   g->engine = &engine;
   g->native_moe_cache = bailingmoe3_hybrid_cuda_graph_enabled();
   g->topology = g_glm5next_vram_cache;
@@ -215,8 +224,8 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->prev_indexer_seeds = std::move(prev_seeds);
   {
     const int kpool = c.glm5next_indexer_kpool, top_k = c.glm5next_indexer_top_k;
-    static const bool dense_beyond = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
-    static const bool force_sparse = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_FORCE_SPARSE", 0) != 0; // test hook
+    static const bool dense_beyond = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_DENSE_BEYOND_TOPK", 0) != 0;
+    static const bool force_sparse = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_FORCE_SPARSE", 0) != 0; // test hook
     if (top_k > 0 && (pos_base + S > top_k || force_sparse) && !dense_beyond) {
       // The selection needs the pooled indexer keys of every earlier chunk (the seeds) and pool-aligned boundaries.
       if (kpool <= 1 || top_k % kpool != 0 || (pos_base > 0 && g->prev_indexer_seeds.empty()))
@@ -266,9 +275,9 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
     // Prefill runs the cold-expert matmuls on the CPU for a whole batch: it has its own thread count.
-    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PREFILL_CPU_THREADS");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PREFILL_CPU_THREADS");
     if (!e || !e[0])
-      e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
+      e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
@@ -316,12 +325,12 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
     }
     g_suggested_batch = 0;
   }
-  // GPU1-hot experts compute in place on the second GPU (MOESTREAM_GLM5NEXT_PREFILL_GPU1=0 routes them through the cold
+  // GPU1-hot experts compute in place on the second GPU (ZEROMOE_GLM5NEXT_PREFILL_GPU1=0 routes them through the cold
   // branch, copying each used expert to the main GPU).
   const bool ling_cache_alias =
       g->engine->family_ops.family == ModelFamily::BailingMoE3;
   if (ling_cache_alias ||
-      moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_GPU1", 1) != 0)
+      zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_GPU1", 1) != 0)
     for (const auto &pl : g->partial_experts)
       if (!pl.hot1.empty()) {
         g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
@@ -329,16 +338,16 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
       }
   ggml_backend_t backends[] = {g->cuda, g->gpu1 ? g->gpu1 : g->cpu, g->cpu};
   // Batched prefill: let the scheduler run the host-resident (cold) expert matmuls on the GPU by copying the weights
-  // across, instead of on the CPU (MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
+  // across, instead of on the CPU (ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD=1).
   const bool prefill_offload =
       g->engine->family_ops.family != ModelFamily::BailingMoE3 &&
-      moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_OP_OFFLOAD");
-  // The scheduler needs events (MOESTREAM_SCHED_EVENTS, set below): without them every weight-input copy first
+      zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD");
+  // The scheduler needs events (ZEROMOE_SCHED_EVENTS, set below): without them every weight-input copy first
   // synchronizes the whole destination stream, which serializes the copies of the two GPUs. parallel=true is not an
   // option: it multiplies the graph inputs by the number of copies (56 GB of workspace).
-  if (moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_SCHED_EVENTS", 1) != 0)
-    setenv("MOESTREAM_SCHED_EVENTS", "1", 1);
-  const bool sched_parallel = moestream::graphcfg::atoi_or("MOESTREAM_GLM5NEXT_PREFILL_SCHED_PARALLEL", 0) != 0;
+  if (zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_SCHED_EVENTS", 1) != 0)
+    setenv("ZEROMOE_SCHED_EVENTS", "1", 1);
+  const bool sched_parallel = zeromoe::graphcfg::atoi_or("ZEROMOE_GLM5NEXT_PREFILL_SCHED_PARALLEL", 0) != 0;
   g->sched = ggml_backend_sched_new(backends, nullptr, g->gpu1 ? 3 : 2, kGraphSize, sched_parallel, prefill_offload);
   if (!g->sched)
     return false;
@@ -358,9 +367,14 @@ static bool glm5next_full_graph_prepare_once(StreamingEngine &engine, int S, int
     for (int d = 0; d < ndev && d < 2; ++d) {
       size_t f = 0, t = 0;
       cudaSetDevice(d);
-      if (cudaMemGetInfo(&f, &t) == cudaSuccess)
+      if (cudaMemGetInfo(&f, &t) == cudaSuccess) {
         LOG_INFO("[GGML-GLM5NEXT-FULL] after graph build: device %d free %.3f GiB\n", d,
                  (double)f / (1024.0 * 1024.0 * 1024.0));
+        if (g_graph->decode_mode)
+          zeromoe::graphsettings::report_preflight(
+              "glm-graph", zeromoe::graphsettings::Family::GlmGraph,
+              zeromoe::graph::idle_vram_finding(d, (double)f / (1024.0 * 1024.0 * 1024.0)));
+      }
     }
     cudaSetDevice(g_graph->device);
   }

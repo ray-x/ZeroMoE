@@ -6,7 +6,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -30,14 +30,14 @@ ggml_tensor *hc_contig(ggml_context *ctx, ggml_tensor *t) {
   return t && !ggml_is_contiguous(t) ? ggml_cont(ctx, t) : t;
 }
 
-// MOESTREAM_GLM5NEXT_FUSED_HC: unset/"1" = all fused ops; otherwise any of
+// ZEROMOE_GLM5NEXT_FUSED_HC: unset/"1" = all fused ops; otherwise any of
 // the letters c (hc_comb), p (hc_pre sum), o (hc_post) enables just those.
 bool fused_hc_op(char which) {
-  // Default ON. MOESTREAM_GLM5NEXT_UNFUSED_HC=1 restores the composed-op path.
-  static const bool off = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_UNFUSED_HC") != nullptr;
+  // Default ON. ZEROMOE_GLM5NEXT_UNFUSED_HC=1 restores the composed-op path.
+  static const bool off = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_UNFUSED_HC") != nullptr;
   if (off)
     return false;
-  static const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_FUSED_HC");
+  static const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_FUSED_HC");
   if (!e || e[0] == '1')
     return true;
   return std::strchr(e, which) != nullptr;
@@ -58,7 +58,7 @@ ggml_tensor *hc_pre(FullGraph &g, ggml_context *ctx, ggml_tensor *x,
   ggml_tensor *flat_norm = ggml_rms_norm(ctx, flat, c.eps);
   ggml_tensor *mixes = ggml_mul_mat(ctx, fn, flat_norm);
   if (g.engine->family_ops.family == ModelFamily::DeepSeek_V41 &&
-      moestream::graphcfg::flag_on("MOESTREAM_DEEPSEEK_V41_NATIVE_F32_GRAPH"))
+      zeromoe::graphcfg::flag_on("ZEROMOE_DEEPSEEK_V41_NATIVE_F32_GRAPH"))
     ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
 
   ggml_tensor *scale_pre = ggml_view_1d(ctx, scale, 1, 0);
@@ -241,7 +241,7 @@ ggml_tensor *build_kda(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
                                   ggml_row_size(conv_in->type, g.S)));
   // The exported state/history tensors are otherwise expanded into the graph only at its end, which keeps the
   // layer's conv input and scan output (both scale with S) live for the whole graph; schedule the copies here.
-  if (const char *e = std::getenv("MOESTREAM_GLM5NEXT_EARLY_STATE_EXPORT"); !(e && e[0] == '0')) {
+  if (const char *e = std::getenv("ZEROMOE_GLM5NEXT_EARLY_STATE_EXPORT"); !(e && e[0] == '0')) {
     ggml_build_forward_expand(g.graph, *hist_out);
     ggml_build_forward_expand(g.graph, *state_out);
   }
@@ -890,4 +890,4 @@ ggml_tensor *build_bailing_mla(FullGraph &g, ggml_context *ctx,
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

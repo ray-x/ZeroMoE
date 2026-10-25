@@ -6,7 +6,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -806,4 +806,4 @@ bool prepare_expert_source_only(FullGraph &g, const char *tag) {
 
 } // namespace glm5next_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

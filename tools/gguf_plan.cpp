@@ -17,7 +17,7 @@
 //     `nvidia-smi`, best-effort -- absent on macOS / no-NVIDIA boxes, not an
 //     error) and total system RAM (/proc/meminfo on Linux, `sysctl` on
 //     macOS).
-//   - .moestream_usage summary, if present: how many (layer,expert) pairs
+//   - .zeromoe_usage summary, if present: how many (layer,expert) pairs
 //     have been seen, and per-layer top-K concentration (how much of a
 //     layer's traffic its K hottest experts cover) -- the same metric
 //     core/main.cpp's [PIN] log already computes for a live run, surfaced
@@ -39,6 +39,7 @@
 //
 // Build: see gguf_common.hpp (compiled together with the other gguf_*.cpp).
 #include "gguf_common.hpp"
+#include "../memory/resident_memory_policy.hpp"
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -61,7 +62,8 @@ namespace {
 // run's [VRAM-BREAKDOWN] log for the same model. Keep these three in sync
 // with main.cpp if the engine's own categorization ever changes. ----
 
-bool is_dense_offload_candidate(const std::string &name) {
+bool is_dense_offload_candidate(const std::string &name, bool embedding_gpu) {
+  if (name == "token_embd.weight" && !embedding_gpu) return false;
   // attn_output_a (DeepSeek-V4's grouped output projection, first stage)
   // gets the SAME treatment as attn_k_b/attn_v_b in the real engine
   // (dsv4_attention_gguf, attention_layer.cpp): dequant_row'd once into a
@@ -236,7 +238,7 @@ void print_detected_ram() {
          "worked) -- check manually (free -h / top).\n");
 }
 
-// .moestream_usage is a plain "layer expert count" text file (one line per
+// .zeromoe_usage is a plain "layer expert count" text file (one line per
 // ever-selected (layer,expert) pair, written by StreamingEngine::dump_usage
 // in core/engine.hpp). Re-implemented here rather than including
 // engine.hpp directly, to keep this tool decoupled from the engine's own
@@ -324,12 +326,12 @@ void print_usage_summary(const std::string &path) {
 int cmd_plan(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
-            "Usage: %s <model_file_or_dir> [--usage-file <path>]\n"
+            "Usage: %s <model_file_or_dir> [--usage-file <path>] [--embedding-device auto|cpu|gpu]\n"
             "\n"
             "Read-only sizing advisor: prints dense-tensor VRAM requirement\n"
             "(by category, worst/best-case BF16 range), MoE expert slab\n"
             "size + a GB->slots table, this machine's detected GPU(s) and\n"
-            "system RAM, and (if present) a .moestream_usage summary --\n"
+            "system RAM, and (if present) a .zeromoe_usage summary --\n"
             "everything needed to pick dense_gb / moe_cache_gb /\n"
             "pinned_vram_capacity / pin_topk_per_layer for a NEW model\n"
             "without trial-and-error real runs. Does not write a config\n"
@@ -338,11 +340,14 @@ int cmd_plan(int argc, char **argv) {
     return 2;
   }
   std::string model = argv[1];
-  std::string usage_file = ".moestream_usage";
+  std::string usage_file = ".zeromoe_usage";
+  std::string embedding_device = "auto";
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--usage-file" && i + 1 < argc)
       usage_file = argv[++i];
+    else if (a == "--embedding-device" && i + 1 < argc)
+      embedding_device = argv[++i];
     else {
       fprintf(stderr, "[plan] unknown arg: %s\n", a.c_str());
       return 2;
@@ -350,6 +355,11 @@ int cmd_plan(int argc, char **argv) {
   }
 
   GGUFFile M;
+  if (!zeromoe::memory::valid_embedding_device(embedding_device)) {
+    fprintf(stderr, "[plan] embedding device must be auto, cpu or gpu\n");
+    return 2;
+  }
+  const bool embedding_gpu = zeromoe::memory::embedding_on_gpu(embedding_device, false);
   if (!M.load_header(model)) {
     fprintf(stderr, "[plan] FAIL: cannot load model %s\n", model.c_str());
     return 1;
@@ -451,7 +461,7 @@ int cmd_plan(int argc, char **argv) {
     int L;
     if (parse_blk_layer(name, L) && (L < min_layer || L > last_real_layer))
       continue;
-    if (!is_dense_offload_candidate(name))
+    if (!is_dense_offload_candidate(name, embedding_gpu))
       continue;
     auto &cat = categories[categorize_dense_tensor(name)];
     cat.bytes += t.size_bytes;
@@ -497,6 +507,14 @@ int cmd_plan(int argc, char **argv) {
          "kv_bits.\n\n");
 
   // ---- MoE / routed-expert requirement ----
+  const auto embedding = M.tensors.find("token_embd.weight");
+  const size_t embedding_bytes = embedding == M.tensors.end() ? 0 : embedding->second.size_bytes;
+  const size_t reclaimed_bytes = embedding_gpu ? 0 : embedding_bytes;
+  printf("[EMBEDDING-PLAN] device=%s host_bytes=%zu reclaimed_vram_bytes=%zu additional_expert_slots=%zu\n",
+         embedding_gpu ? "gpu" : "cpu", embedding_bytes, reclaimed_bytes,
+         max_slab_bytes > 0 ? reclaimed_bytes / max_slab_bytes : 0);
+  printf("  Extra slots are a sizing estimate, not a recommendation to pin every slot. Preserve KV/prefill "
+         "workspace and an eviction/staging budget; explicit cache sizes do not grow automatically.\n\n");
   if (max_slab_bytes > 0) {
     printf("MoE routed-expert requirement:\n");
     printf("  One expert's slab (gate+up+down, largest across layers): "
@@ -531,8 +549,8 @@ int cmd_plan(int argc, char **argv) {
   print_detected_ram();
   printf("\n");
 
-  // ---- .moestream_usage summary ----
-  printf(".moestream_usage summary (%s):\n", usage_file.c_str());
+  // ---- .zeromoe_usage summary ----
+  printf(".zeromoe_usage summary (%s):\n", usage_file.c_str());
   print_usage_summary(usage_file);
 
   return 0;

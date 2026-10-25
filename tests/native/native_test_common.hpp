@@ -19,7 +19,7 @@
 #include "cuda_kernel_dispatcher.hpp"
 #include "exl3_format.hpp"
 #include "exl3_model_loader.hpp"
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 #include "exl3_ggml_ffn.hpp"
 #endif
 

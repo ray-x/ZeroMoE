@@ -2,7 +2,7 @@
 # Multi-request VRAM stress session for the Q2_0 Option-B global-pool config at expert budget K.
 #
 # usage: bench/option_b_vram_stress.sh K [ngen=48] [gpu=0]
-#   env: MOESTREAM_* variables are passed through (e.g. MOESTREAM_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512 for K > ~14,729).
+#   env: ZEROMOE_* variables are passed through (e.g. ZEROMOE_QWEN4EXP_GRAPH_ALLOC_FLOOR_MIB=512 for K > ~14,729).
 # One engine process receives five single-line requests on stdin: SHORT, LONG, SHORT, LONG, SHORT (each line is an
 # independent request; the engine does not accumulate history between them). SHORT = the 28-token neural-networks question,
 # LONG = a 402-token prompt (first 1,100 chars of docs/runtime-settings.md at commit b5e97c9 + a summarize question; built into
@@ -31,12 +31,12 @@ sed -E "s/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = 
   configs/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
 LONG=$(cat "$LONGFILE")
 SHORT="Explain briefly the key concepts of neural networks and gradient descent in plain English."
-while pgrep -x moestream >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-compute-apps=pid --format=csv,noheader)" ]]; do sleep 3; done
+while pgrep -x zeromoe >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-compute-apps=pid --format=csv,noheader)" ]]; do sleep 3; done
 nvidia-smi --id="$GPU" --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "logs/$TAG.csv" &
 SP=$!
 printf '%s\n%s\n%s\n%s\n%s\n:q\n' "$SHORT" "$LONG" "$SHORT" "$LONG" "$SHORT" | env \
-  CUDA_VISIBLE_DEVICES=$GPU MOESTREAM_QWEN4EXP_FULL_GRAPH=1 MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-  MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 MOESTREAM_TOKEN_LOOP_DIAG=1 \
+  CUDA_VISIBLE_DEVICES=$GPU ZEROMOE_QWEN4EXP_FULL_GRAPH=1 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+  ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 ZEROMOE_TOKEN_LOOP_DIAG=1 \
   ../moestream-build-upstream-master/moestream --config "$TMP/cfg.toml" --ngen "$NGEN" > "logs/$TAG.stdout" 2>&1 || true
 kill $SP 2>/dev/null || true
 python3 - "$TAG" <<'EOF'

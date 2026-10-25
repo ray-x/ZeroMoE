@@ -2,7 +2,7 @@
 //
 // This is the ONLY translation unit that includes ggml-quants.h (which pulls
 // the block struct definitions and the IQ lookup grids from ggml-common.h).
-// That isolation is deliberate: the rest of MoEStream defines its own
+// That isolation is deliberate: the rest of ZeroMoE defines its own
 // block_q4_0 in kernels_cpu.hpp, which would collide with ggml's. We LINK
 // libggml for these functions — no dequant code is copied.
 //

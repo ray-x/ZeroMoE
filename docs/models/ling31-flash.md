@@ -14,7 +14,7 @@ LING_GPU0_CACHE_GIB=3.0 LING_GPU1_CACHE_GIB=12.5 \
 LING_PINNED_VRAM_CAPACITY=3700 LING_OFFLOAD_PINNED=0.5 \
 LING_GPU_ASSIST=3 LING_ASSIST2_SLOTS=1 LING_CPU_THREADS=10 \
 LING_USAGE_FILE="$PWD/bench/ling/reference-audit/usage-hi-there-robust4.pin" \
-LING_LOG=/tmp/ling-short.log LING_BIN=./build_master/moestream \
+LING_LOG=/tmp/ling-short.log LING_BIN=./build_master/zeromoe \
 bench/ling/reference-audit/run.sh
 ```
 
@@ -32,7 +32,7 @@ Metric: `[REQUEST-DECODE-OUTPUT]` (first output to last output), *not* the shutd
 
 - **No-copy offload graph**: the graph aliases existing VRAM slots and streams cold experts from
   the DDR pool; no MoE weights are copied into the graph.
-- **`MOESTREAM_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1`** for prompts >64 tokens (patched negative-id
+- **`ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP=1`** for prompts >64 tokens (patched negative-id
   skip) — without it the valid-dummy fallback aliases tokens onto expert 0 and over-runs its row
   range (`CUDA error: illegal memory access` at layer 4).
 
@@ -40,5 +40,5 @@ Metric: `[REQUEST-DECODE-OUTPUT]` (first output to last output), *not* the shutd
 
 - The decode target (10 tok/s) is met only at the threshold with no margin; treat a drop below 9.0
   as a regression.
-- `LING_BIN` must point at the candidate binary — the runner otherwise hardcodes `build-ling/moestream`.
+- `LING_BIN` must point at the candidate binary — the runner otherwise hardcodes `build-ling/zeromoe`.
 - Requires the host-node hook (early-CPU lane) or decode falls to ~3 tok/s.

@@ -2,7 +2,7 @@
 //   g++ -std=c++20 -Iinclude tests/test_moe_partial_route.cpp -o /tmp/test_moe_partial_route
 //   /tmp/test_moe_partial_route capable    # patched ggml advertises the negative-id skip
 //   /tmp/test_moe_partial_route stock      # stock ggml: capability function reports 0
-//   /tmp/test_moe_partial_route optout     # capable ggml but MOESTREAM_MMID_NO_NEGATIVE_SKIP=1
+//   /tmp/test_moe_partial_route optout     # capable ggml but ZEROMOE_MMID_NO_NEGATIVE_SKIP=1
 //   /tmp/test_moe_partial_route missing    # capability symbol absent is covered by the weak link (compile check only)
 // The capability result is cached once per process, so each mode runs in its own process.
 
@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
     g_capability = 0;
   } else if (!std::strcmp(mode, "optout")) {
     g_capability = 1;
-    setenv("MOESTREAM_MMID_NO_NEGATIVE_SKIP", "1", 1);
+    setenv("ZEROMOE_MMID_NO_NEGATIVE_SKIP", "1", 1);
   } else {
     std::fprintf(stderr, "unknown mode %s\n", mode);
     return 2;

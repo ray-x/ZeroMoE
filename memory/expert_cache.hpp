@@ -31,7 +31,7 @@
 #include <string>
 #include <vector>
 
-namespace moestream::offload {
+namespace zeromoe::offload {
 
 struct ExpertKey {
   int32_t layer = -1;
@@ -323,4 +323,4 @@ inline std::vector<ExpertKey> rank_hottest_first(const std::string &usage_file, 
   return keys;
 }
 
-} // namespace moestream::offload
+} // namespace zeromoe::offload

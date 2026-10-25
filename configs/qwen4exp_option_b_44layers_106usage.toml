@@ -39,7 +39,7 @@ prefetch_worker_threads = 4
 # The 106-prompt Qwen decode histogram is the sole ranking source.  An empty
 # prefill_pin_file makes the loader fall back to pin_file rather than using a
 # stale 7-prompt prefill histogram.
-pin_file = ".moestream_usage_qwen4exp_106prompts_100tokens"
+pin_file = ".zeromoe_usage_qwen4exp_106prompts_100tokens"
 prefill_pin_file = ""
 freeze_usage_stats = true
 

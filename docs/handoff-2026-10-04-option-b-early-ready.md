@@ -1,12 +1,12 @@
 # Handoff: Option-B early-ready graph scheduling
 
 **Date:** 2026-10-04
-**Workspace:** `/home/ray/Projects/MoEStream`
+**Workspace:** `/home/ray/Projects/ZeroMoE`
 **State:** all-split prototype implemented and validated; uncommitted; paused at the user's request.
 
 ## Result
 
-The all-split early-ready scheduler path is opt-in through `MOESTREAM_QWEN_EARLY_READY_ALL_SPLIT=1`. It starts the GPU hot/shared work, copies each split layer's activation and route IDs into private buffers, then runs a prepared cold-expert GGML graph on the main thread after an input-ready CUDA event. Private buffers prevent the outer GGML allocator from reusing memory still in flight. The normal scheduler barriers and arithmetic paths remain in use when the flag is unset. The Layer-13-only proof remains available as `MOESTREAM_QWEN_EARLY_READY_LAYER13=1`.
+The all-split early-ready scheduler path is opt-in through `ZEROMOE_QWEN_EARLY_READY_ALL_SPLIT=1`. It starts the GPU hot/shared work, copies each split layer's activation and route IDs into private buffers, then runs a prepared cold-expert GGML graph on the main thread after an input-ready CUDA event. Private buffers prevent the outer GGML allocator from reusing memory still in flight. The normal scheduler barriers and arithmetic paths remain in use when the flag is unset. The Layer-13-only proof remains available as `ZEROMOE_QWEN_EARLY_READY_LAYER13=1`.
 
 On the Q2_0 checkpoint and RTX 3090, with the right-sized 0/44/4 layout and 10 CPU threads, six guarded, order-balanced pairs measured:
 

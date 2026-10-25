@@ -18,6 +18,7 @@
 #include "graph_core.hpp"
 #include "logger.hpp"
 #include "moe_partial_route.hpp"
+#include "quant_table.hpp"
 
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -33,7 +34,7 @@
 #include <string>
 #include <vector>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 // One GPU's hot set inside a layer: the cache region it aliases plus the
 // expert -> physical-slot table.
@@ -380,16 +381,7 @@ inline bool layer_experts_take_mmq(const StreamingEngine &engine, int layer) {
   for (const char *stem : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
     const GGUFTensor *t = model_tensor(engine, "blk." + std::to_string(layer) + "." + stem);
     if (!t) return false;
-    switch (t->type) {
-    case GGUFType::Q4_0: case GGUFType::Q4_1: case GGUFType::Q5_0: case GGUFType::Q5_1:
-    case GGUFType::Q8_0: case GGUFType::Q2_K: case GGUFType::Q3_K: case GGUFType::Q4_K:
-    case GGUFType::Q5_K: case GGUFType::Q6_K: case GGUFType::IQ2_XXS: case GGUFType::IQ2_XS:
-    case GGUFType::IQ2_S: case GGUFType::IQ3_XXS: case GGUFType::IQ3_S: case GGUFType::IQ4_NL:
-    case GGUFType::IQ4_XS: case GGUFType::IQ1_S: case GGUFType::MXFP4:
-      break;
-    default:
-      return false;
-    }
+    if (!zeromoe::quant::takes_mmq(static_cast<uint32_t>(t->type))) return false;
   }
   return true;
 }
@@ -476,4 +468,4 @@ inline bool build_secondary_map(const AliasedLayerPlacement &p,
   return true;
 }
 
-} // namespace moestream::graph
+} // namespace zeromoe::graph

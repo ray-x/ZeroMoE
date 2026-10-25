@@ -3,10 +3,10 @@
 #
 # REQUIRES these env vars at launch (device_expert_layers has no TOML key --
 # it is env-var only):
-#   MOESTREAM_QWEN4EXP_FULL_GRAPH=1
-#   MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0
-#   MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1
+#   ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0
+#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
 #
 # Requested device_expert_layers=0 -> engine's internal VRAM retry lands on
 # final device_expert_layers=0, 45 of 48 requested Option-B
@@ -42,8 +42,8 @@ expert_fetch_threads = 10
 omp_max_threads = 12
 prefetch_worker_threads = 4
 
-pin_file           = "tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap"
-prefill_pin_file   = "tests/moe_usage_survey/moestream_usage_survey_prefill"
+pin_file           = "tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap"
+prefill_pin_file   = "tests/moe_usage_survey/zeromoe_usage_survey_prefill"
 freeze_usage_stats = true
 
 qwen4exp_option_b_layer = -1

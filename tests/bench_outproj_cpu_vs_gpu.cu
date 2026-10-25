@@ -8,7 +8,7 @@
 // resident in CPU cache across calls, matching the real forward pass where
 // 42 OTHER layers' work happens between two calls to the same layer).
 //
-// Does NOT touch moestream's real inference path -- completely standalone,
+// Does NOT touch zeromoe's real inference path -- completely standalone,
 // zero risk to correctness of the live model. Verifies CPU and GPU produce
 // numerically matching output for a small case before trusting either
 // timing number.

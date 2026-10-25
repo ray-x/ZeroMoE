@@ -15,7 +15,7 @@ contemporaneous three-arm run measured +4.54% with resident route tables and
 next production placement.
 
 The user's current architecture rule is full-graph execution for every model
-MoEStream continues to support; layered execution is not a future support
+ZeroMoE continues to support; layered execution is not a future support
 path. Qwen full-graph prefill/decode now default on, and an enabled Qwen graph
 failure is returned as a request error instead of silently entering the layer
 loop. Native tests passed after this change. This enforcement is currently
@@ -64,7 +64,7 @@ handoff probe; the runtime parity gate is still failing. `make test-components`
 passes all 44 tests and the CUDA engine target builds successfully after the
 allocator/publication changes.
 
-The opt-in `MOESTREAM_QWEN4EXP_PHASE2_STATE_TRACE=1` probe hashes recurrent and
+The opt-in `ZEROMOE_QWEN4EXP_PHASE2_STATE_TRACE=1` probe hashes recurrent and
 KV storage after each synchronized replay. It first exposed post-split GDN
 state writes stuck at their initial value; explicit phase-2 state terminals and
 host mirrors now make those source and destination hashes change. The phase-2
@@ -211,16 +211,16 @@ CUDA_VISIBLE_DEVICES=0 /tmp/test_qwen4exp_conditional_graph
 The payload-backed staged A/B is enabled only for an explicit experiment:
 
 ```bash
-MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1 \
-MOESTREAM_QWEN4EXP_COMPLETION_GRAPH=1 \
-MOESTREAM_QWEN4EXP_COMPLETION_STAGED=1 \
-MOESTREAM_QWEN4EXP_MASTER_GRAPH_STAGED=1 \
-MOESTREAM_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL=1 \
-MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1 \
-MOESTREAM_QWEN4EXP_PARTIAL_LAYER=13 \
-MOESTREAM_QWEN4EXP_FULL_GRAPH=1 \
-MOESTREAM_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-./build_ggmlcuda/moestream --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+ZEROMOE_QWEN4EXP_STORAGE_SERVICE=1 \
+ZEROMOE_QWEN4EXP_COMPLETION_GRAPH=1 \
+ZEROMOE_QWEN4EXP_COMPLETION_STAGED=1 \
+ZEROMOE_QWEN4EXP_MASTER_GRAPH_STAGED=1 \
+ZEROMOE_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL=1 \
+ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY=1 \
+ZEROMOE_QWEN4EXP_PARTIAL_LAYER=13 \
+ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
+ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
+./build_ggmlcuda/zeromoe --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
 ```
 
 The prefix runs once, the storage worker loads the exact route slots with
@@ -267,9 +267,9 @@ python3 bench/option_b_early_ready_check.py \
   --prompt-ids logs/quant_decode_compare_chat_20261004/prompt.tokens \
   --continuation logs/quant_decode_compare_chat_20261004/Q2.tokens \
   --reps 6 --all-split --wait-idle 300 \
-  --candidate-env MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES=1 \
-  --third-env MOESTREAM_QWEN_EARLY_READY_RESIDENT_TABLES=1 \
-  --third-env MOESTREAM_QWEN_EARLY_READY_ASYNC_OUTPUT=1
+  --candidate-env ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1 \
+  --third-env ZEROMOE_QWEN_EARLY_READY_RESIDENT_TABLES=1 \
+  --third-env ZEROMOE_QWEN_EARLY_READY_ASYNC_OUTPUT=1
 ```
 
 The three arms are the original scheduler, early-ready plus resident tables,
@@ -342,8 +342,8 @@ D2H IDs/weights or the graph's immutable remap/mask tables.
 
 ## Milestone 2: DDR-only partial-layer graph prototype
 
-An opt-in prototype now uses `MOESTREAM_QWEN4EXP_PARTIAL_GRAPH=1` together
-with `MOESTREAM_QWEN4EXP_PARTIAL_GRAPH_LAYER=13`. It keeps the static resident
+An opt-in prototype now uses `ZEROMOE_QWEN4EXP_PARTIAL_GRAPH=1` together
+with `ZEROMOE_QWEN4EXP_PARTIAL_GRAPH_LAYER=13`. It keeps the static resident
 CUDA branch and inserts a bounded `cudaLaunchHostFunc` callback for the DDR
 complement. The callback uses a prepared GGML CPU graph with immutable CPU
 route tables, then uploads a per-route weighted cold result for the graph
@@ -487,10 +487,10 @@ The optional runtime owner is created after graph-RAM preload, before the
 prefetch workers start. It reads packed or unpacked expert planes with
 generation-safe `pread` requests into the shared payload and preserves the same
 Ready/Error generation contract. Enable
-`MOESTREAM_QWEN4EXP_STORAGE_SERVICE=1` and, for a one-request Ready/Error
-check, `MOESTREAM_QWEN4EXP_STORAGE_SELFTEST=1`. Add
-`MOESTREAM_QWEN4EXP_COMPLETION_GRAPH=1` prepares a persistent payload arena
-before Qwen graph bootstrap, and `MOESTREAM_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1`
+`ZEROMOE_QWEN4EXP_STORAGE_SERVICE=1` and, for a one-request Ready/Error
+check, `ZEROMOE_QWEN4EXP_STORAGE_SELFTEST=1`. Add
+`ZEROMOE_QWEN4EXP_COMPLETION_GRAPH=1` prepares a persistent payload arena
+before Qwen graph bootstrap, and `ZEROMOE_QWEN4EXP_COMPLETION_GRAPH_SELFTEST=1`
 captures and launches the stable-address H2D completion graph and joins its
 consumer event. These remain opt-in and do not change the production profile;
 the continuation graph now unpacks the prepared payload in the staged
@@ -501,7 +501,7 @@ and a separate generation-tagged `error=1 error_code=404` record in
 `logs/qwen4exp_q2_0_option_b_split44_x0_cov80.log`.
 
 `include/qwen4exp_adaptive_policy.hpp` contains the opt-in decision rule. With
-`MOESTREAM_QWEN4EXP_ADAPTIVE_POLICY=1`, four CPU suffix executions seed the
+`ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY=1`, four CPU suffix executions seed the
 baseline. The first staged route is then run as a calibration sample; later
 decisions use those measurements before submitting storage work, so choosing
 CPU skips that request's SSD read. Storage queue/service come from the matching
@@ -528,7 +528,7 @@ banks and epoch metadata remain per layer to preserve consumer lifetimes.
 ## Experimental staged-graph memory telemetry
 
 The staged graph now has an opt-in memory trace controlled by
-`MOESTREAM_QWEN4EXP_MEMORY_TRACE=1`. It records CUDA free/total VRAM,
+`ZEROMOE_QWEN4EXP_MEMORY_TRACE=1`. It records CUDA free/total VRAM,
 `MemAvailable`, process RSS/peak RSS, cgroup memory usage, graph-construction
 mode, storage completion, completion-graph submission, conditional graph
 instantiation and graph launch. CUDA allocation, graph-instantiation and
@@ -575,7 +575,7 @@ against the compact-arena estimate plus a 768 MiB margin; the reproduced case
 now declines cleanly at 8.95 GiB free (`need=10.92 GiB`) before `cudaMalloc`
 and aborts the experimental request without a driver fault. The risky
 allocation can be explicitly forced for diagnosis with
-`MOESTREAM_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC=1`.
+`ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC=1`.
 
 The diagnostic then compared the same Prefix/Route handoff with a debug CPU
 suffix. The CPU suffix produced the same wrong next token as the staged path,
@@ -626,11 +626,11 @@ reading it after replay can observe storage reused by other graph outputs.
 This is a plausible cause of the split-boundary mismatch, not yet a proven
 sole cause. The diagnostic now marks the persistent destination as an output,
 removes an extra source-residual output that produced all-NaN probes, and adds
-`MOESTREAM_QWEN4EXP_P2_GRAPH_HANDOFF_ONLY=1` to test the graph-written buffer
+`ZEROMOE_QWEN4EXP_P2_GRAPH_HANDOFF_ONLY=1` to test the graph-written buffer
 without the post-replay overwrite. A read-only pre-refresh dump is enabled by
-`MOESTREAM_QWEN4EXP_STAGED_DEBUG=1`. The modified graph translation unit
+`ZEROMOE_QWEN4EXP_STAGED_DEBUG=1`. The modified graph translation unit
 compiles successfully. The current full target now also builds successfully:
-`cmake --build build_ggmlcuda -j2 --target moestream`. No new inference run has
+`cmake --build build_ggmlcuda -j2 --target zeromoe`. No new inference run has
 been made, so handoff parity remains unverified; the early-ready scheduler
 remains the default.
 
@@ -642,7 +642,7 @@ VRAM was initially 23.3 GiB free, so this was not a Linux OOM or measured CUDA
 allocation failure. The mixed-object probe is not correctness evidence. The
 full target now builds, but subsequent idle `nvidia-smi` checks have
 intermittently failed to contact the driver; no inference was retried. The next
-parity check must use the consistent `build_ggmlcuda/moestream` binary and the
+parity check must use the consistent `build_ggmlcuda/zeromoe` binary and the
 previously successful bounded Phase-2 configuration after driver health is
 stable.
 

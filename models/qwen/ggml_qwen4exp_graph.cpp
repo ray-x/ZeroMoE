@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -163,7 +163,7 @@ bool qwen4exp_full_graph_sync_state_to_host(StreamingEngine &engine) {
 }
 
 void qwen4exp_full_graph_shutdown() {
-  moestream::graphcfg::log_consulted("qwen4exp-full-graph");
+  zeromoe::graphcfg::log_consulted("qwen4exp-full-graph");
   // Explicit, EARLY teardown (before the CUDA driver itself starts
   // shutting down) is why this function exists at all -- see g_graph's
   // own destroy()'s comment. The two Phase 2 suffix globals are exactly
@@ -433,7 +433,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
       std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
   g->device_expert_trailing = env_device_expert_trailing();
   const char *partial_gate_up =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
   // partial_gate_up's boundary math (layer==device_expert_layers, the
   // first CPU layer just past a LEADING block) has no trailing-mode
   // equivalent yet -- force it off rather than apply leading-only math
@@ -580,10 +580,10 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   // Prefill batches (S >= 32) run the host-resident expert matmuls on the GPU: the scheduler copies the experts a batch
   // uses across (ggml patch 0007), as llama.cpp's default does (BeeLlama on this box, same model: 200-257 tok/s with it,
   // 30 without). Measured here: 1611 tokens 61 -> 305 tok/s. The reserve needs one pipeline copy (4.7 GiB at 1611
-  // tokens; 44 GiB with the four copies decode uses), so prefill builds with copies=1. MOESTREAM_QWEN4EXP_PREFILL_OP_
+  // tokens; 44 GiB with the four copies decode uses), so prefill builds with copies=1. ZEROMOE_QWEN4EXP_PREFILL_OP_
   // OFFLOAD=0 restores the CPU experts. Off for the paths with their own per-layer expert machinery.
   const bool prefill_op_offload =
-      moestream::graphcfg::atoi_or("MOESTREAM_QWEN4EXP_PREFILL_OP_OFFLOAD", 1) != 0 &&
+      zeromoe::graphcfg::atoi_or("ZEROMOE_QWEN4EXP_PREFILL_OP_OFFLOAD", 1) != 0 &&
       engine.qwen4exp_partial_layer < 0 && engine.qwen4exp_gpu_stage_layers.empty() && !engine.qwen4exp_cpu_offload;
   g_qwen4exp_prefill_op_offload = prefill_op_offload;
   g->sched =
@@ -627,9 +627,9 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
 }
 
 bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
-  moestream::graphcfg::log_effective("qwen4exp-full-graph");
+  zeromoe::graphcfg::log_effective("qwen4exp-full-graph");
   const char *bootstrap =
-      moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP");
   // Build and retain the prompt-independent dense/expert arenas during
   // startup. Graph construction must not hide a multi-second GGUF read and
   // VRAM upload inside the first prefill. Keep the old lazy behavior as an
@@ -666,7 +666,7 @@ bool qwen4exp_full_graph_bootstrap(StreamingEngine &engine) {
   }
   int bootstrap_tokens = std::min(16, engine.max_t);
   if (const char *value =
-          moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS")) {
+          zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_BOOTSTRAP_TOKENS")) {
     char *end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     if (end == value || *end != '\0' || parsed < 2 ||

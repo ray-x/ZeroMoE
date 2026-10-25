@@ -11,7 +11,7 @@
 #include <cstring>
 #include <fstream>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cuda_runtime.h>
 
@@ -35,7 +35,7 @@ bool type_ok(uint32_t t) {
 // runtime behaviour.
 bool debug_sync_full_gdn() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_DEBUG_SYNC_FULL_GDN");
+    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_SYNC_FULL_GDN");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -43,7 +43,7 @@ bool debug_sync_full_gdn() {
 
 bool debug_device_sync_full_gdn() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_DEBUG_DEVICE_SYNC_FULL_GDN");
+    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_DEVICE_SYNC_FULL_GDN");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -51,7 +51,7 @@ bool debug_device_sync_full_gdn() {
 
 bool gdn_diag_enabled() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const char *v = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
     return v && v[0] != '\0' && v[0] != '0';
   }();
   return enabled;
@@ -67,14 +67,14 @@ int &gdn_diag_call_counter() {
 // a rebuild every time; unset env vars keep the original hardcoded 10/11.
 int gdn_diag_first_pos() {
   static const int v = [] {
-    const char *e = std::getenv("MOESTREAM_GDN_DIAG_FIRST_POS");
+    const char *e = std::getenv("ZEROMOE_GDN_DIAG_FIRST_POS");
     return e ? std::atoi(e) : 10;
   }();
   return v;
 }
 int gdn_diag_last_pos() {
   static const int v = [] {
-    const char *e = std::getenv("MOESTREAM_GDN_DIAG_LAST_POS");
+    const char *e = std::getenv("ZEROMOE_GDN_DIAG_LAST_POS");
     return e ? std::atoi(e) : 11;
   }();
   return v;
@@ -1215,7 +1215,7 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
     // These graph inputs alias caller-owned recurrent state/history. Snapshot
     // them before the graph's in-place state/history stores can overwrite them.
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
     const int position = gdn_diag_call_counter() + 1;
     gdn_diag_dump_at(base, "gdn_input", layer, S, position, x);
     gdn_diag_dump_at(base, "conv_history_in", layer, S, position, hist_in);
@@ -1240,7 +1240,7 @@ bool GgmlGdnProjRunner::run_full(int layer, const float *hidden_states, int S,
                                 history_bytes);
   ggml_backend_synchronize((ggml_backend_t)backend_);
   if (diag) {
-    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
     gdn_diag_dump(base, "qkv", layer, S, qkv);
     gdn_diag_dump(base, "z", layer, S, z);
     gdn_diag_dump(base, "conv_silu", layer, S, conv_silu);
@@ -1444,7 +1444,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
   // For the opt-in Layer-0 parity audit, retain the internal GDN tensors as
   // additional roots so the allocator cannot recycle their storage before we
   // read them back after the one-token graph completes.  This path is
-  // deliberately disabled unless MOESTREAM_GDN_DIAG_DUMP is set.
+  // deliberately disabled unless ZEROMOE_GDN_DIAG_DUMP is set.
   const bool diag = gdn_diag_enabled() && layer == 0 && S == 1;
   ggml_set_output(out_store);
   ggml_set_output(state_store);
@@ -1528,7 +1528,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     // true incoming state before replay rather than after their storage has
     // become the outgoing state.
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
     const int position = gdn_diag_call_counter() + 1;
     gdn_diag_dump_at(base, "gdn_input", layer, S, position, x);
     gdn_diag_dump_at(base, "conv_history_in", layer, S, position, hist_in);
@@ -1563,7 +1563,7 @@ bool GgmlGdnProjRunner::run_full_device_impl(
     // The extra roots make these reads valid even though the ordinary path
     // keeps the graph asynchronous and returns the device output immediately.
     ggml_backend_synchronize((ggml_backend_t)backend_);
-    const char *base = std::getenv("MOESTREAM_GDN_DIAG_DUMP");
+    const char *base = std::getenv("ZEROMOE_GDN_DIAG_DUMP");
     gdn_diag_dump(base, "qkv", layer, S, qkv);
     gdn_diag_dump(base, "z", layer, S, z);
     gdn_diag_dump(base, "conv_silu", layer, S, conv_silu);
@@ -1633,7 +1633,7 @@ bool GgmlGdnProjRunner::copy_full_output_to_host(const void *device_output,
   return true;
 }
 
-#else // !MOESTREAM_USE_GGML_CUDA
+#else // !ZEROMOE_USE_GGML_CUDA
 
 bool GgmlGdnProjRunner::compiled_in() { return false; }
 GgmlGdnProjRunner &GgmlGdnProjRunner::instance() {

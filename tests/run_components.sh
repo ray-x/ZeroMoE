@@ -23,7 +23,7 @@ SRC="tests/test_components.cpp"
 SUPPORT_SRCS="backends/exl3/exl3_cpu.cpp backends/exl3/exl3_model_loader.cpp models/base/safetensors_adapter.cpp"
 
 if [ ! -f "$SRC" ]; then
-    echo "FATAL: $SRC not found (run from the MoEStream repo root)" >&2
+    echo "FATAL: $SRC not found (run from the ZeroMoE repo root)" >&2
     exit 2
 fi
 
@@ -37,10 +37,10 @@ ARCH_FLAGS=""
 INC_FLAGS=""
 if [ "$ARCH" = "arm64" ] && [ "$(uname -s)" = "Darwin" ]; then
     KERNEL_SRC="backends/cpu/kernels_cpu_neon.cpp"
-    # kernels_cpu_neon.cpp calls into moestream_metal:: under #ifdef __APPLE__
+    # kernels_cpu_neon.cpp calls into zeromoe_metal:: under #ifdef __APPLE__
     # (backends/cpu/kernels_metal.mm, an Objective-C++ TU using MPSMatrixMultiplication)
     # -- link it in and pull the frameworks it needs, or every test binary on
-    # Apple Silicon fails at link time with undefined moestream_metal symbols.
+    # Apple Silicon fails at link time with undefined zeromoe_metal symbols.
     EXTRA_SRCS="backends/cpu/kernels_metal.mm"
     EXTRA_LDFLAGS="-framework Metal -framework MetalPerformanceShaders -framework Foundation"
 else
@@ -57,7 +57,7 @@ else
     # qwen4exp CPU tests (GDN delta step / PLE hash / layer detection) on
     # the Linux box.
     #
-    # Flag set mirrors CMakeLists.txt's MOESTREAM_AVX512_FLAGS exactly,
+    # Flag set mirrors CMakeLists.txt's ZEROMOE_AVX512_FLAGS exactly,
     # including its deliberate omission of -mavx512vnni (the source
     # compile-time-gates its own VNNI path with #if defined(__AVX512VNNI__);
     # forcing the flag risks SIGILL on an AVX-512 CPU without VNNI). Probed
@@ -83,7 +83,7 @@ else
         # fallback used by the CPU components build) are guarded by this
         # feature define. The standalone test command links GGML manually,
         # so mirror the CMake target's compile definition when GGML is present.
-        GGML_FLAGS="-DMOESTREAM_USE_GGML=1"
+        GGML_FLAGS="-DZEROMOE_USE_GGML=1"
     else
         echo "[run_components] WARNING: $GGML_LIB_DIR/libggml-base.so not found" \
              "(run 'make build' first); backends/cpu/kernels_cpu.cpp will not link."
@@ -111,7 +111,7 @@ mkdir -p "$(dirname "$BIN")"
 echo "[run_components] $CXX -std=c++23 -O2 -Iinclude $INC_FLAGS $GGML_FLAGS $ARCH_FLAGS $OMP_FLAGS $SRC $SUPPORT_SRCS $KERNEL_SRC $EXTRA_SRCS $EXTRA_LDFLAGS -> $BIN"
 "$CXX" -std=c++23 -O2 -Iinclude $INC_FLAGS $GGML_FLAGS $ARCH_FLAGS $OMP_FLAGS -o "$BIN" "$SRC" $SUPPORT_SRCS "$KERNEL_SRC" $EXTRA_SRCS $EXTRA_LDFLAGS
 
-ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/moestream-route-test.XXXXXX")"
+ROUTE_TEST_DIR="$(mktemp -d "${TMPDIR:-/tmp}/zeromoe-route-test.XXXXXX")"
 trap 'rm -rf "$ROUTE_TEST_DIR"' EXIT
 ROUTE_TEST_BIN="$ROUTE_TEST_DIR/test_moe_partial_route"
 echo "[run_components] compiling allocation-free route classification tests"
@@ -123,7 +123,7 @@ done
 
 # Dynamic DDR expert cache (residency bitmap, LRU, seeding, aligned O_DIRECT store reader, virtual arena) and its
 # acceptance replay of the GLM-5.3-Flash router trace against the offline simulator's results. Linux only (O_DIRECT,
-# preadv, mincore). Optional real-data check: MOESTREAM_TEST_STORE=<store.gguf> MOESTREAM_TEST_MODEL=<shard,...>.
+# preadv, mincore). Optional real-data check: ZEROMOE_TEST_STORE=<store.gguf> ZEROMOE_TEST_MODEL=<shard,...>.
 if [ "$(uname -s)" = "Linux" ]; then
     CACHE_TEST_BIN="$ROUTE_TEST_DIR/test_expert_dram_cache"
     echo "[run_components] compiling dynamic expert cache tests"

@@ -2,7 +2,7 @@
 """Compare per-layer Qwen hidden-state dumps from two decode runs.
 
 Each directory contains ``<prefix>.step<position>.f32`` files and adjacent
-``.json`` metadata written by ``MOESTREAM_QWEN4EXP_ALLLAYERS_DUMP``. The tool
+``.json`` metadata written by ``ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP``. The tool
 reports the earliest layer and token position whose hidden states exceed the
 requested RMS or max-absolute tolerance. It uses only the Python standard
 library.

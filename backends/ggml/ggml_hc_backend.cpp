@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cuda_runtime.h>
 
@@ -50,7 +50,7 @@ bool type_ok(uint32_t t) {
 // acceptable for Qwen4Exp HC: the low-rank gate feeds the next router and a
 // small projection error can change the selected expert IDs.  Dequantize the
 // small HC matrices once and let the persistent graph use an F32 matmul,
-// matching MoEStream's existing exact-F32-activation Q8_0 dense path.
+// matching ZeroMoE's existing exact-F32-activation Q8_0 dense path.
 bool dequant_q8_0_rows(const GgmlHcWeightRef &src,
                        std::vector<float> &dst) {
   if (!src.exact_f32_q8 || src.type != (uint32_t)GGML_TYPE_Q8_0 ||
@@ -77,7 +77,7 @@ bool dequant_q8_0_rows(const GgmlHcWeightRef &src,
 // without changing the established fallback behaviour.
 bool async_graph_reuse() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_ASYNC_GRAPH_REUSE");
+    const char *v = std::getenv("ZEROMOE_GGML_ASYNC_GRAPH_REUSE");
     return v && v[0] == '1';
   }();
   return enabled || async_graph_reuse_override;
@@ -88,7 +88,7 @@ bool async_graph_reuse() {
 // a missing dependency/lifetime edge from a numerical problem in the HC math.
 bool debug_sync_hc() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_DEBUG_SYNC_HC");
+    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_SYNC_HC");
     return v && v[0] == '1';
   }();
   return qwen_hc_async_readback_override || enabled;
@@ -96,7 +96,7 @@ bool debug_sync_hc() {
 
 bool debug_check_hc_state() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_DEBUG_CHECK_HC_STATE");
+    const char *v = std::getenv("ZEROMOE_GGML_DEBUG_CHECK_HC_STATE");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -108,7 +108,7 @@ bool debug_check_hc_state() {
 // reuse enabled.
 bool debug_rebuild_pre_graph_each_call() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_GGML_HC_REBUILD_EACH_CALL");
+    const char *v = std::getenv("ZEROMOE_GGML_HC_REBUILD_EACH_CALL");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -116,7 +116,7 @@ bool debug_rebuild_pre_graph_each_call() {
 
 bool hc_no_external_weights() {
   static const bool disabled = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_HC_NO_EXTERNAL");
+    const char *e = std::getenv("ZEROMOE_GGML_HC_NO_EXTERNAL");
     return e && e[0] == '1';
   }();
   return disabled;
@@ -124,7 +124,7 @@ bool hc_no_external_weights() {
 
 bool debug_external_weight_rebind() {
   static const bool enabled = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_HC_DIAG_EXTERNAL");
+    const char *e = std::getenv("ZEROMOE_GGML_HC_DIAG_EXTERNAL");
     return e && e[0] == '1';
   }();
   return enabled;
@@ -146,7 +146,7 @@ uint64_t fnv64_bytes(const void *data, size_t bytes) {
 // their existing synchronization behavior even if they reuse this class.
 bool qwen_hc_async_readback() {
   static const bool enabled = [] {
-    const char *v = std::getenv("MOESTREAM_QWEN_HC_ASYNC_READBACK");
+    const char *v = std::getenv("ZEROMOE_QWEN_HC_ASYNC_READBACK");
     return v && v[0] == '1';
   }();
   return enabled;
@@ -656,7 +656,7 @@ bool GgmlHcRunner::ensure_pre_graph(int S, const Bracket &b, int layer,
       return false;
     }
     static const bool keep_internal_dump_outputs = [] {
-      const char *env = std::getenv("MOESTREAM_GGML_HC_INTERNAL_DUMP");
+      const char *env = std::getenv("ZEROMOE_GGML_HC_INTERNAL_DUMP");
       return env && env[0] != '\0';
     }();
     if (keep_internal_dump_outputs && S == 1 && layer < 2) {
@@ -1066,7 +1066,7 @@ bool GgmlHcRunner::ensure_weights(int layer, int sub_block,
   const size_t weight_bytes = ggml_nbytes(tn) + ggml_nbytes(td) +
                               ggml_nbytes(tu) + ggml_nbytes(ti);
   static const bool log_types = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_HC_DEBUG_TYPES");
+    const char *e = std::getenv("ZEROMOE_GGML_HC_DEBUG_TYPES");
     return e && e[0] == '1';
   }();
   if (log_types) {
@@ -1246,7 +1246,7 @@ bool GgmlHcRunner::pre_mix(int layer, int sub_block, int S, float *out_hidden,
   // upstream state delta. They intentionally synchronize and are restricted
   // to S=1 / Layers 0-1; the normal path is unchanged when the env var is unset.
   static const char *internal_dump_base = [] {
-    return std::getenv("MOESTREAM_GGML_HC_INTERNAL_DUMP");
+    return std::getenv("ZEROMOE_GGML_HC_INTERNAL_DUMP");
   }();
   if (internal_dump_base && S == 1 && layer < 2 && !b.custom_q8 &&
       active_pre_graph_) {
@@ -1447,7 +1447,7 @@ bool GgmlHcRunner::post_combine_device_fused(
   // TEMP DIAGNOSTIC: is sub_out already NaN at its last element (d=D-1) for
   // every token BEFORE this kernel ever touches it? Distinguishes "upstream
   // FFN producer never wrote D-1" from "this kernel corrupts D-1 itself".
-  if (std::getenv("MOESTREAM_HC_POST_FUSED_SRC_TRACE")) {
+  if (std::getenv("ZEROMOE_HC_POST_FUSED_SRC_TRACE")) {
     cudaStreamSynchronize(0);
     std::vector<float> probe((size_t)S * d_model_);
     const cudaError_t e = cudaMemcpy(probe.data(), src->data,
@@ -1531,7 +1531,7 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
   // TEMP DIAGNOSTIC: is device_sub_block_out already NaN at its last element
   // (d=D-1) for every token, before this function does anything with it?
   if (device_sub_block_out && layer == 11 && sub_block == 1 &&
-      std::getenv("MOESTREAM_HC_POST_SRC_TRACE")) {
+      std::getenv("ZEROMOE_HC_POST_SRC_TRACE")) {
     cudaStreamSynchronize(0);
     ggml_backend_synchronize((ggml_backend_t)backend_);
     std::vector<float> probe((size_t)S * d_model_);
@@ -1680,7 +1680,7 @@ bool GgmlHcRunner::post_combine_impl(int layer, int sub_block, int S,
   return true;
 }
 
-#else  // !MOESTREAM_USE_GGML_CUDA
+#else  // !ZEROMOE_USE_GGML_CUDA
 
 void set_ggml_hc_async_graph_reuse(bool) {}
 void set_qwen_hc_async_readback(bool) {}

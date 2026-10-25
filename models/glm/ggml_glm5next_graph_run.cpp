@@ -5,7 +5,7 @@
 
 #include "ggml_glm5next_graph_impl.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -13,7 +13,8 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
                              int S, int pos_base, const int *) {
   if (!graph_enabled_for(engine) || !hidden_states || S <= 1 || pos_base < 0 || !g_graph ||
       !g_graph->ready || g_graph->engine != &engine || g_graph->S != S ||
-      g_graph->pos_base != pos_base || g_graph->decode_mode)
+      g_graph->pos_base != pos_base || g_graph->decode_mode ||
+      (g_phase_cache && g_graph->placement_generation != g_phase_cache->generation()))
     return false;
   FullGraph &g = *g_graph;
   const auto &c = engine.model_file.architecture_config;
@@ -113,7 +114,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
     std::map<std::string, std::pair<double, int>> agg;
     ggml_backend_sched_t sched = nullptr;
   } op;
-  const bool op_prof_on = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
+  const bool op_prof_on = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OP_PROFILE") != nullptr;
   if (op_prof_on) {
     // Debug: per-op wall time, attributed to the op that just finished (the callback also splits the graph per node).
     ggml_backend_sched_set_eval_callback(
@@ -147,7 +148,7 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   }
   ggml_backend_sched_synchronize(g.sched);
   release_graph_vram_experts(g);
-  if (moestream::graphcfg::flag_on("MOESTREAM_GLM5NEXT_PREFILL_ROUTE_CAPTURE")) {
+  if (zeromoe::graphcfg::flag_on("ZEROMOE_GLM5NEXT_PREFILL_ROUTE_CAPTURE")) {
     size_t captured_routes = 0;
     for (const auto &[layer, snapshot] : g.prefill_route_ids) {
       if (!snapshot || snapshot->type != GGML_TYPE_I32 || layer < 0)
@@ -285,4 +286,4 @@ bool glm5next_full_graph_run(StreamingEngine &engine, float *hidden_states,
   return true;
 }
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

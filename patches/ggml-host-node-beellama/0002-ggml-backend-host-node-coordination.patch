@@ -2,11 +2,11 @@ diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
 --- a/src/ggml-backend.cpp
 +++ b/src/ggml-backend.cpp
 @@ -31,4 +31,8 @@
- extern "C" void moestream_qwen4exp_host_node_cpu_wait(void)
+ extern "C" void zeromoe_qwen4exp_host_node_cpu_wait(void)
      __attribute__((weak));
-+extern "C" void moestream_qwen4exp_cpu_split_enter(void)
++extern "C" void zeromoe_qwen4exp_cpu_split_enter(void)
 +    __attribute__((weak));
-+extern "C" void moestream_qwen4exp_cpu_split_exit(void)
++extern "C" void zeromoe_qwen4exp_cpu_split_exit(void)
 +    __attribute__((weak));
  
  static bool ggml_copy_call_trace_enabled() {
@@ -14,36 +14,36 @@ diff --git a/src/ggml-backend.cpp b/src/ggml-backend.cpp
          }
  
          const auto profile_graph_start = std::chrono::steady_clock::now();
-+        const bool moestream_cpu_split_hooks =
++        const bool zeromoe_cpu_split_hooks =
 +            ggml_backend_sched_profile_is_cpu(split_backend) &&
-+            moestream_qwen4exp_cpu_split_enter != nullptr &&
-+            moestream_qwen4exp_cpu_split_exit != nullptr;
++            zeromoe_qwen4exp_cpu_split_enter != nullptr &&
++            zeromoe_qwen4exp_cpu_split_exit != nullptr;
          // A CUDA graph host node may execute CPU MoE work concurrently with
          // this scheduler thread.  Gate every ordinary CPU split, including
          // the fast path without callback_eval, while that callback is active.
 @@ -2730,5 +2730,7 @@
-             moestream_qwen4exp_host_node_cpu_wait();
+             zeromoe_qwen4exp_host_node_cpu_wait();
          }
          if (!sched->callback_eval) {
-+            if (moestream_cpu_split_hooks)
-+                moestream_qwen4exp_cpu_split_enter();
++            if (zeromoe_cpu_split_hooks)
++                zeromoe_qwen4exp_cpu_split_enter();
              enum ggml_status ec;
              if (moe_trace_level > 0) {
 @@ -2740,6 +2752,8 @@
              } else {
                  ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
              }
-+            if (moestream_cpu_split_hooks)
-+                moestream_qwen4exp_cpu_split_exit();
++            if (zeromoe_cpu_split_hooks)
++                zeromoe_qwen4exp_cpu_split_exit();
              if (ec != GGML_STATUS_SUCCESS) {
                  return ec;
              }
 @@ -2769,4 +2769,8 @@
-+                if (moestream_cpu_split_hooks)
-+                    moestream_qwen4exp_cpu_split_enter();
++                if (zeromoe_cpu_split_hooks)
++                    zeromoe_qwen4exp_cpu_split_enter();
                  enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
-+                if (moestream_cpu_split_hooks)
-+                    moestream_qwen4exp_cpu_split_exit();
++                if (zeromoe_cpu_split_hooks)
++                    zeromoe_qwen4exp_cpu_split_exit();
                  if (ec != GGML_STATUS_SUCCESS) {
                      return ec;
                  }

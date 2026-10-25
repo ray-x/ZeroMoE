@@ -66,12 +66,10 @@ std::expected<void, std::string> EngineRunner::start_workers() {
   // rereads the ~78 GiB expert set from SSD.  The source admission is
   // bounded by host_ram_gb and the memory watchdog; failure leaves the
   // established layer path available.
-  if (engine.family_ops.family == ModelFamily::GLM5NEXT ||
-      engine.family_ops.family == ModelFamily::GLM_DSA ||
-      engine.family_ops.family == ModelFamily::BailingMoE3)
-    glm5next_full_graph_set_vram_cache(&gpu.topology);
-  if (engine.family_ops.family == ModelFamily::MiMo2)
-    mimo2_full_graph_set_vram_cache(&gpu.topology);
+  if (graph_model) {
+    graph_model->bind_vram_cache(&gpu.topology);
+    log_graph_capabilities(*graph_model, engine);
+  }
   if (graph_mode && !graph_model->bootstrap(engine)) {
     LOG_STREAM_WARN()
         << "[GRAPH] graph bootstrap unavailable; "
@@ -80,7 +78,7 @@ std::expected<void, std::string> EngineRunner::start_workers() {
   }
 
   std::cout << "----------------------------------------\n";
-  std::cout << "  MoEStream engine online and ready. Enter prompt below.\n";
+  std::cout << "  ZeroMoE engine online and ready. Enter prompt below.\n";
   std::cout << "Use ':q' to exit execution loop cleanly.\n\n";
 
   // Configure only after all startup worker pools have been created.  New
@@ -408,7 +406,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     // wrapper differences. The normal text prompt path is unchanged when
     // this variable is absent.
     if (const char *token_input =
-            std::getenv("MOESTREAM_PROMPT_TOKEN_INPUT_FILE")) {
+            std::getenv("ZEROMOE_PROMPT_TOKEN_INPUT_FILE")) {
       std::ifstream input(token_input);
       std::vector<int> exact_tokens;
       long long value = 0;
@@ -428,7 +426,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
                           << " exact token IDs from " << token_input << "\n";
       }
     }
-    if (std::getenv("MOESTREAM_MOE_SET_TRACE") != nullptr) {
+    if (std::getenv("ZEROMOE_MOE_SET_TRACE") != nullptr) {
       uint64_t hash = 1469598103934665603ULL;
       for (int token : prompt_tokens) {
         uint32_t value = (uint32_t)token;
@@ -440,7 +438,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
       LOG_STREAM_INFO() << "[MOE-PROMPT] tokens=" << prompt_tokens.size()
                         << " fnv64=0x" << std::hex << hash << std::dec << "\n";
     }
-    if (const char *token_path = std::getenv("MOESTREAM_PROMPT_TOKEN_FILE")) {
+    if (const char *token_path = std::getenv("ZEROMOE_PROMPT_TOKEN_FILE")) {
       std::ofstream output(token_path);
       if (!output) {
         LOG_STREAM_ERROR()
@@ -454,14 +452,17 @@ std::expected<void, std::string> EngineRunner::run_repl() {
       }
     }
 
-    std::cout << "\n  MoEStream * ";
+    std::cout << "\n  ZeroMoE * ";
     generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens,
                   max_new_tokens, tokenizer.eos_token_id, config.temperature,
                   config.top_p);
     if (!engine.qwen4exp_full_graph_failure.empty()) {
       const std::string reason = engine.qwen4exp_full_graph_failure;
       engine.qwen4exp_full_graph_failure.clear();
-      request_failure = "Qwen4Exp full-graph request failed: " + reason;
+      const FullGraphModel *graph_model = engine.family_ops.graph_model;
+      request_failure =
+          std::string(graph_model ? graph_model->name() : "model") +
+          " full-graph request failed: " + reason;
       std::cout << "\n";
       LOG_STREAM_ERROR() << request_failure << "\n";
       // Leave through the normal teardown path below so the prefetch worker

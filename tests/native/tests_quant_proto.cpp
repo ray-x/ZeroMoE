@@ -1,7 +1,7 @@
 // Native test harness: tests_quant_proto (split from tests/native/main_test.cpp).
 #include "native_tests.hpp"
 
-// Gated feasibility bench (MOESTREAM_RUN_BENCH=1, same convention as the
+// Gated feasibility bench (ZEROMOE_RUN_BENCH=1, same convention as the
 // others above) for dot_iq2_xxs_vnni_prototype (kernels_cpu.cpp) -- answers
 // "does a VNNI int8 dot beat the existing dot_iq2_xxs_f32_avx512 FMA path"
 // BEFORE committing to a real production kernel (see CLAUDE.md's
@@ -244,29 +244,29 @@ void bench_iq3xxs_avx2_prototype() {
 bool test_real_expert_iq2xxs_dequant() {
     std::cout << "[Test 11] Real-Data IQ2_XXS Dequant: GPU vs CPU on actual suspect expert bytes...\n";
 
-    const char* path = std::getenv("MOESTREAM_REAL_EXPERT_BIN");
+    const char* path = std::getenv("ZEROMOE_REAL_EXPERT_BIN");
     if (!path) {
-        std::cout << "  -> SKIPPED (set MOESTREAM_REAL_EXPERT_BIN to a raw-bytes dump produced by "
+        std::cout << "  -> SKIPPED (set ZEROMOE_REAL_EXPERT_BIN to a raw-bytes dump produced by "
                      "tools/dump_expert_bytes.cpp, e.g.:\n"
                      "       g++ -std=c++23 -O2 -Iinclude tools/dump_expert_bytes.cpp -o /tmp/dump_expert_bytes\n"
                      "       /tmp/dump_expert_bytes model.gguf 0 199 gate /tmp/e199_gate.bin\n"
-                     "       MOESTREAM_REAL_EXPERT_BIN=/tmp/e199_gate.bin MOESTREAM_REAL_EXPERT_D=4096 "
-                     "MOESTREAM_REAL_EXPERT_O=2048 ./build/moestream_test\n"
-                     "     to run this test. Additionally set MOESTREAM_REAL_ACTIVATION_BIN (a raw D-float "
+                     "       ZEROMOE_REAL_EXPERT_BIN=/tmp/e199_gate.bin ZEROMOE_REAL_EXPERT_D=4096 "
+                     "ZEROMOE_REAL_EXPERT_O=2048 ./build/zeromoe_test\n"
+                     "     to run this test. Additionally set ZEROMOE_REAL_ACTIVATION_BIN (a raw D-float "
                      "capture from a real run, see execution_layer.cpp's [ACTIVATION-DUMP] instrumentation, "
-                     "env vars MOESTREAM_DUMP_ACTIVATION_LAYER/_EXPERT/_OUT) to test against the REAL "
+                     "env vars ZEROMOE_DUMP_ACTIVATION_LAYER/_EXPERT/_OUT) to test against the REAL "
                      "activation instead of a synthetic random vector)\n";
         return true;
     }
-    const char* d_env = std::getenv("MOESTREAM_REAL_EXPERT_D");
-    const char* o_env = std::getenv("MOESTREAM_REAL_EXPERT_O");
+    const char* d_env = std::getenv("ZEROMOE_REAL_EXPERT_D");
+    const char* o_env = std::getenv("ZEROMOE_REAL_EXPERT_O");
     // Defaults match this investigation's own model: blk.0.ffn_gate_exps.weight [4096, 2048, 256].
     const int D = d_env ? std::atoi(d_env) : 4096;
     const int moe_inter = o_env ? std::atoi(o_env) : 2048;
 
     std::ifstream f(path, std::ios::binary);
     if (!f.good()) {
-        std::cout << "  -> FAILED (couldn't open MOESTREAM_REAL_EXPERT_BIN=" << path << ")\n";
+        std::cout << "  -> FAILED (couldn't open ZEROMOE_REAL_EXPERT_BIN=" << path << ")\n";
         return false;
     }
     std::vector<uint8_t> w_bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -276,34 +276,34 @@ bool test_real_expert_iq2xxs_dequant() {
     if (w_bytes.size() != expected_bytes) {
         std::cout << "  -> FAILED (dump is " << w_bytes.size() << " bytes, expected " << expected_bytes
                   << " for D=" << D << " O=" << moe_inter << " IQ2_XXS -- wrong expert/tensor, or set "
-                     "MOESTREAM_REAL_EXPERT_D/_O to match the real shape)\n";
+                     "ZEROMOE_REAL_EXPERT_D/_O to match the real shape)\n";
         return false;
     }
 
     // x defaults to a synthetic random vector (this test's original mode --
     // proves/disproves an UNCONDITIONAL dequant bug, independent of any
-    // particular activation). Set MOESTREAM_REAL_ACTIVATION_BIN to instead
+    // particular activation). Set ZEROMOE_REAL_ACTIVATION_BIN to instead
     // load the ACTUAL runtime activation vector captured at the real
     // all-zero decode step (via execution_layer.cpp's [ACTIVATION-DUMP]
-    // instrumentation -- see MOESTREAM_DUMP_ACTIVATION_LAYER/_EXPERT/_OUT
+    // instrumentation -- see ZEROMOE_DUMP_ACTIVATION_LAYER/_EXPERT/_OUT
     // there), closing the gap the synthetic vector can't: if THIS run comes
     // back nonzero on both CPU and GPU while the live decode trace showed
     // all-zero, that's strong evidence of a caching/pipeline bug feeding
     // stale/wrong bytes during real decode, not a genuine data property.
-    const char* real_x_path = std::getenv("MOESTREAM_REAL_ACTIVATION_BIN");
+    const char* real_x_path = std::getenv("ZEROMOE_REAL_ACTIVATION_BIN");
     std::vector<float> x(D);
     bool using_real_x = false;
     if (real_x_path) {
         std::ifstream xf(real_x_path, std::ios::binary);
         if (!xf.good()) {
-            std::cout << "  -> FAILED (couldn't open MOESTREAM_REAL_ACTIVATION_BIN=" << real_x_path << ")\n";
+            std::cout << "  -> FAILED (couldn't open ZEROMOE_REAL_ACTIVATION_BIN=" << real_x_path << ")\n";
             return false;
         }
         xf.read(reinterpret_cast<char*>(x.data()), (std::streamsize)(x.size() * sizeof(float)));
         if ((size_t)xf.gcount() != x.size() * sizeof(float)) {
-            std::cout << "  -> FAILED (MOESTREAM_REAL_ACTIVATION_BIN=" << real_x_path << " is "
+            std::cout << "  -> FAILED (ZEROMOE_REAL_ACTIVATION_BIN=" << real_x_path << " is "
                       << xf.gcount() << " bytes, expected " << x.size() * sizeof(float)
-                      << " for D=" << D << " -- wrong capture, or set MOESTREAM_REAL_EXPERT_D to match)\n";
+                      << " for D=" << D << " -- wrong capture, or set ZEROMOE_REAL_EXPERT_D to match)\n";
             return false;
         }
         using_real_x = true;
@@ -386,7 +386,7 @@ bool test_real_expert_iq2xxs_dequant() {
             std::cout << "  -> PASSED: both CPU and GPU independently dequantize this real expert to "
                          "all-zero -- two separate implementations agreeing is strong evidence this is a "
                          "genuine property of the trained/quantized weight data, not a kernel bug. Re-run "
-                         "with MOESTREAM_REAL_ACTIVATION_BIN set to confirm this holds for the ACTUAL "
+                         "with ZEROMOE_REAL_ACTIVATION_BIN set to confirm this holds for the ACTUAL "
                          "activation vector from the real failing decode step, not just synthetic random "
                          "input.\n";
         }
@@ -479,7 +479,7 @@ bool test_mixed_precision_layer() {
     // gguf_loader.hpp's tensor-table parsing directly, not the full
     // StreamingEngine/architecture-discovery pipeline, which doesn't need
     // any KV keys to exercise what's under test here).
-    std::string out_path = "/tmp/moestream_test_mixed_layer0.gguf";
+    std::string out_path = "/tmp/zeromoe_test_mixed_layer0.gguf";
     {
         FILE* out = fopen(out_path.c_str(), "wb");
         if (!out) { std::cout << "  -> FAILED (cannot write " << out_path << ")\n"; return false; }

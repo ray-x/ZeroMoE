@@ -3,7 +3,7 @@
 This note records the bounded CUDA checks used to locate the first correctness
 and decode-cost regressions without touching the main checkout. Native
 `git worktree add` was unavailable because this environment exposes `.git` as
-read-only, so the checks used an isolated clone under `/tmp/moestream-bisect`.
+read-only, so the checks used an isolated clone under `/tmp/zeromoe-bisect`.
 The clone received only the historical EXL3 source files needed to make old
 commits link; those files are unrelated to the Qwen graph result.
 
@@ -68,7 +68,7 @@ step-1 parity are fixed and rechecked against the same early-ready reference.
 The last currently verified good source checkpoint is commit
 `c9685b9fd4471e2c7fb1d6e718165c806c0f71b8` (`c9685b9`). Its short Phase-2 run
 produced the expected first four tokens (`8160, 369, 264, 4145`). The temporary
-checkout used for that run (`/tmp/moestream-known-good-phase2-20261006`) is no
+checkout used for that run (`/tmp/zeromoe-known-good-phase2-20261006`) is no
 longer present in the current environment, but the commit object remains
 reachable from the current repository history. Treat it as the last verified
 good checkpoint, not as proof that every later commit is bad.
@@ -87,7 +87,7 @@ A two-token staged smoke is retained at
 child construction, a Ready payload completion, and tokens `8160, 369` (one
 decode step). Its manifest's engine SHA256 is
 `6b1070556d2ddc60cb2bb4197cb6a503a9b6cf4eaa8919d05d14d28993d54299`, which
-matches neither the current `build_ggmlcuda/moestream`
+matches neither the current `build_ggmlcuda/zeromoe`
 (`e8ecea9c1b12f881ca6f762ac6e0fa0eaf013d0c734235dc8ff89b5f939ec805`) nor the
 currently present upstream-master binary (`033e4ef3e00168ecb5723a6a5407322d4b4b8239f7e051b87c9cb7de8786332e`). Its TOML comment labels it an upstream-master build, but the exact binary path and source revision are absent. This smoke proves only that an unidentified binary ran one staged decode step; it is not evidence that any post-`c9685b9` commit built or decoded. The later 64-token matched run from the dirty current worktree built and reached decode but diverged at step 1.
 
@@ -202,7 +202,7 @@ A lower-priority source-level question is the current uncommitted Phase-2
 state-publication change in `src/ggml_qwen4exp_graph.cpp`: it marks GDN state
 CPY nodes as `GGML_TENSOR_FLAG_OUTPUT` in every non-Off graph, including Prefix.
 GGML CUDA has a GDN/cache fusion pass that rejects fusion when the immediately
-following state CPY is an output node. However, MoEStream expands the Prefix's
+following state CPY is an output node. However, ZeroMoE expands the Prefix's
 route and handoff roots before appending the state-update CPYs, while the fusion
 requires the CPY to be the next real node after GDN in one CUDA graph split.
 No saved log shows that fusion firing in the ordinary graph, and the current
@@ -234,7 +234,7 @@ Pre-existing dirty changes are untouched.
 A build trace after `ggml_backend_sched_alloc_graph` found exactly one CPY
 node whose `src[1]` is the persistent handoff. The CPY output and destination
 retain the expected persistent address and are assigned to `CUDA0`. A
-two-token run with `MOESTREAM_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL` unset
+two-token run with `ZEROMOE_GGML_CUDA_GRAPH_CAPTURE_ON_FIRST_CALL` unset
 logged no first-call capture and showed the same failure: the graph-owned
 handoff was poison, the source-to-handoff D2D copy was byte-exact, the source
 and destination were both `CUDA0` buffers, and the candidate still produced

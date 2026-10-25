@@ -2,7 +2,7 @@
 
 bool test_exl3_ggml_graph_capture_config() {
     std::cout << "[Test] EXL3 GGML graph-capture config...\n";
-    char config_path[] = "/tmp/moestream_exl3_graph_capture_config_XXXXXX";
+    char config_path[] = "/tmp/zeromoe_exl3_graph_capture_config_XXXXXX";
     const int config_fd = mkstemp(config_path);
     if (config_fd < 0)
         return false;
@@ -779,24 +779,24 @@ bool test_exl3_cuda_kernels() {
 }
 
 int main() {
-    if (std::getenv("MOESTREAM_TEST_ONLY_RAM_PROMOTION"))
+    if (std::getenv("ZEROMOE_TEST_ONLY_RAM_PROMOTION"))
         return test_ram_async_source_hold() ? 0 : 1;
-    if (std::getenv("MOESTREAM_TEST_ONLY_EXL3_GGML_CONFIG"))
+    if (std::getenv("ZEROMOE_TEST_ONLY_EXL3_GGML_CONFIG"))
         return test_exl3_ggml_graph_capture_config() ? 0 : 1;
     if (!test_exl3_cpu_dispatch()) return 1;
     if (!test_exl3_cpu_matrix_cache()) return 1;
-    if (std::getenv("MOESTREAM_TEST_EXL3_CPU_ONLY")) return 0;
+    if (std::getenv("ZEROMOE_TEST_EXL3_CPU_ONLY")) return 0;
     if (!test_graph_config()) return 1;
     if (!test_exl3_cuda_kernels()) return 1;
-    if (std::getenv("MOESTREAM_TEST_EXL3_ONLY")) return 0;
+    if (std::getenv("ZEROMOE_TEST_EXL3_ONLY")) return 0;
     std::cout << "========================================\n";
-    std::cout << "  MoeStream Native Test Harness\n";
+    std::cout << "  ZeroMoE Native Test Harness\n";
     std::cout << "========================================\n";
 
-    if (std::getenv("MOESTREAM_TEST_ONLY_Q2_0_VNNI")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_Q2_0_VNNI")) {
         return test_qwen_q2_0_vnni_kernel() ? 0 : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_QWEN_STATE_HANDOFF_CONFIG")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_QWEN_STATE_HANDOFF_CONFIG")) {
         return test_qwen_prefill_state_handoff_config() ? 0 : 1;
     }
 
@@ -804,33 +804,33 @@ int main() {
     // isolation so compute-sanitizer's overhead is tractable -- the full
     // suite's CPU-only tests dominate wall time and add nothing to a
     // race-condition investigation scoped to GgmlQwenSharedRunner.
-    if (std::getenv("MOESTREAM_TEST_ONLY_35")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_35")) {
         bool ok = test_qwen_shared_expert_runner();
         return ok ? 0 : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_36")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_36")) {
         bool ok = test_qwen_hc_runner();
         return ok ? 0 : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_37")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_37")) {
         bool ok = test_qwen_hc_runner_q8_exact();
         return ok ? 0 : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_QWEN_CPU_BENCH")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_QWEN_CPU_BENCH")) {
         bool ok = bench_qwen_cpu_moe();
         return ok ? 0 : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_Q3K_CPU_BENCH")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_Q3K_CPU_BENCH")) {
         bench_q3k_cpu_only();
         return 0;
     }
 #ifdef __linux__
-    if (std::getenv("MOESTREAM_TEST_ONLY_Q3K_THP_BENCH")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_Q3K_THP_BENCH")) {
         bench_q3k_thp_cpu_only();
         return 0;
     }
 #endif
-    if (std::getenv("MOESTREAM_TEST_ONLY_CPU_IQ")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_CPU_IQ")) {
         // Keep both diagnostics independent.  In particular, an IQ1_M
         // failure must not hide the Qwen graph test, and a graph failure must
         // not hide the lower-level quantized-kernel result.
@@ -844,10 +844,10 @@ int main() {
                    ? 0
                    : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_CUDA_FUSED")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_CUDA_FUSED")) {
         return test_cuda_fused_kernels() ? 0 : 1;
     }
-    if (std::getenv("MOESTREAM_TEST_ONLY_COMPACT_CACHE")) {
+    if (std::getenv("ZEROMOE_TEST_ONLY_COMPACT_CACHE")) {
         return test_compact_vram_slot_planner() ? 0 : 1;
     }
 
@@ -870,15 +870,15 @@ int main() {
     // slowest thing in this binary, and irrelevant to every other test's
     // pass/fail verdict. Skipped by default so a normal `make test`/targeted
     // re-run (e.g. Test 11's real-expert comparison via
-    // MOESTREAM_REAL_EXPERT_BIN/MOESTREAM_REAL_ACTIVATION_BIN) stays fast;
-    // set MOESTREAM_RUN_BENCH=1 to opt back into the throughput numbers.
-    if (std::getenv("MOESTREAM_RUN_BENCH")) {
+    // ZEROMOE_REAL_EXPERT_BIN/ZEROMOE_REAL_ACTIVATION_BIN) stays fast;
+    // set ZEROMOE_RUN_BENCH=1 to opt back into the throughput numbers.
+    if (std::getenv("ZEROMOE_RUN_BENCH")) {
         bench_cpu_dequant_matmul();
         bench_qabsorb_cpu_vs_gpu();
         bench_iq2xxs_vnni_prototype();
         bench_iq3xxs_avx2_prototype();
     } else {
-        std::cout << "\n[Test 8] SKIPPED by default (set MOESTREAM_RUN_BENCH=1 to run the throughput bench)\n";
+        std::cout << "\n[Test 8] SKIPPED by default (set ZEROMOE_RUN_BENCH=1 to run the throughput bench)\n";
     }
     bool bf16_dense_ok = test_bf16_cublas_dense_matmul();
     bool bf16_matched_dense_ok = test_bf16_matched_cublas_dense_matmul();

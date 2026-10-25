@@ -592,7 +592,7 @@ int process_one_shard(const std::string &input_path,
   // processing: separate invocations of this tool, one per source
   // shard, must never produce colliding output filenames (both would
   // otherwise independently start numbering at "00001" and overwrite
-  // each other). MoEStream's own loader doesn't care about output
+  // each other). ZeroMoE's own loader doesn't care about output
   // filenames beyond the .gguf extension -- it globs every .gguf file
   // in the output directory regardless of name -- so this tag only
   // needs to be unique across invocations, not meaningful in any other way.

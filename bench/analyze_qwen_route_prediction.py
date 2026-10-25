@@ -109,7 +109,7 @@ def analyze(path, usage_path, bandwidth):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('trace', type=Path)
-    p.add_argument('--usage', type=Path, default=Path('tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap'))
+    p.add_argument('--usage', type=Path, default=Path('tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap'))
     p.add_argument('--pcie-gbps', type=float, default=12.3)
     p.add_argument('--out', type=Path, required=True)
     args = p.parse_args()

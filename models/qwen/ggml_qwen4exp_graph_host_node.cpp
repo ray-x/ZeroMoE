@@ -6,7 +6,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -15,10 +15,10 @@ namespace qwen4exp_graph {
 // Opt-in memory telemetry for the experimental partial/staged graph.  This
 // intentionally samples both CUDA and Linux memory at the same boundary so a
 // failure can distinguish VRAM exhaustion from host/cgroup pressure.  It is
-// disabled unless MOESTREAM_QWEN4EXP_MEMORY_TRACE=1 is present; production
+// disabled unless ZEROMOE_QWEN4EXP_MEMORY_TRACE=1 is present; production
 // execution therefore pays no /proc or cudaMemGetInfo overhead.
 bool qwen4exp_memory_trace_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_MEMORY_TRACE");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_MEMORY_TRACE");
 }
 
 long qwen4exp_proc_kb(const char *path, const char *key) {
@@ -154,7 +154,7 @@ qwen4exp_cuda_gpu_stage_callback(void *user_data) {
                                  t_end - start)
                                  .count();
   ctx->last_callback_ms.store(callback_ms, std::memory_order_release);
-  if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GPU_STAGE_TIMING"))
+  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GPU_STAGE_TIMING"))
     LOG_INFO("[QWEN4EXP-GPU-STAGE-TIMING] layer=%d gate_ms=%.4f up_ms=%.4f "
              "down_ms=%.4f callback_body_ms=%.4f\n",
              ctx->layer_index, gate_ms, up_ms, down_ms, callback_ms);
@@ -166,7 +166,7 @@ qwen4exp_cuda_gpu_stage_callback(void *user_data) {
 
 // Enqueues the D2H/callback/H2D sequence for a GPU-stage marker while a CUDA
 // stream is being captured -- same technique as
-// moestream_qwen4exp_cuda_host_node_enqueue below, called from the SAME weak
+// zeromoe_qwen4exp_cuda_host_node_enqueue below, called from the SAME weak
 // hook (dispatch is by ctx->magic, see that function's own top).
 bool qwen4exp_cuda_gpu_stage_node_enqueue(const ggml_tensor *node,
                                                  cudaStream_t stream) {
@@ -216,7 +216,7 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
       !ctx->host_ids)
     return;
   const auto start = std::chrono::steady_clock::now();
-  const bool hit_log = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
+  const bool hit_log = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_ROUTE_HIT_LOG") != nullptr;
   std::string hit_line;
   for (int l = 0; l < ctx->n_layers; ++l) {
     int hits = 0;
@@ -241,13 +241,13 @@ void CUDART_CB qwen4exp_cuda_usage_track_callback(void *user_data) {
                         std::chrono::steady_clock::now() - start)
                         .count();
   ctx->last_callback_ms.store(ms, std::memory_order_release);
-  if (moestream::graphcfg::env("MOESTREAM_QWEN4EXP_USAGE_TRACK_TIMING"))
+  if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_USAGE_TRACK_TIMING"))
     LOG_INFO("[QWEN4EXP-USAGE-TRACK-TIMING] callback_body_ms=%.4f\n", ms);
 }
 
 // Enqueues the single D2H + host-callback sequence for the usage-track flush
 // marker while a CUDA stream is being captured -- same technique as
-// moestream_qwen4exp_cuda_host_node_enqueue below, dispatched by magic. No
+// zeromoe_qwen4exp_cuda_host_node_enqueue below, dispatched by magic. No
 // H2D write-back: this marker is a pure read-only observer of already-real
 // routing, it never feeds back into the compute graph.
 bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
@@ -267,18 +267,18 @@ bool qwen4exp_cuda_usage_track_node_enqueue(const ggml_tensor *node,
 }
 
 bool env_host_node_gpu_reduce() {
-  return moestream::graphcfg::flag_unless_off("MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE");
+  return zeromoe::graphcfg::flag_unless_off("ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE");
 }
 
 bool env_host_node_skip_cpu() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_HOST_NODE_SKIP_CPU");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE_SKIP_CPU");
 }
 
 // Experimental milestone-2 graph: one static split layer keeps its resident
 // GPU branch in the graph and sends the complement through a bounded DDR host
 // callback. It is deliberately separate from the validated early-ready path.
 int env_partial_graph_layer() {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH_LAYER");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_GRAPH_LAYER");
   if (!v || !v[0]) return -1;
   char *end = nullptr;
   const long layer = std::strtol(v, &end, 10);
@@ -288,7 +288,7 @@ int env_partial_graph_layer() {
 }
 
 bool env_partial_graph_enabled(int layer) {
-  const char *v = moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PARTIAL_GRAPH");
+  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PARTIAL_GRAPH");
   return v && v[0] == '1' && env_partial_graph_layer() == layer;
 }
 
@@ -297,20 +297,20 @@ bool env_partial_graph_enabled(int layer) {
 // lets A/B runs separate the prologue/backend-edge cost from host-callback
 // CPU contention without changing the default host-node topology.
 bool env_host_node_keep_cpu_prologue() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_HOST_NODE_KEEP_CPU_PROLOGUE");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE_KEEP_CPU_PROLOGUE");
 }
 
 bool qwen4exp_host_node_timing_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_HOST_NODE_TIMING");
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE_TIMING");
 }
 
 } // namespace qwen4exp_graph
 
-extern "C" bool moestream_qwen4exp_cpu_offload_coordination_enabled() {
-  return moestream::graphcfg::flag_on("MOESTREAM_QWEN4EXP_HOST_NODE");
+extern "C" bool zeromoe_qwen4exp_cpu_offload_coordination_enabled() {
+  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_HOST_NODE");
 }
 
-extern "C" void moestream_qwen4exp_host_node_cpu_wait() {
+extern "C" void zeromoe_qwen4exp_host_node_cpu_wait() {
   if (g_qwen4exp_host_node_cpu_active.load(std::memory_order_acquire) == 0)
     return;
 
@@ -340,7 +340,7 @@ extern "C" void moestream_qwen4exp_host_node_cpu_wait() {
 // idle host callback immediately before the callback publishes itself active.
 // This keeps the callback worker pool from competing with an already-running
 // ordinary GGML CPU split without taking a mutex on the normal path.
-extern "C" void moestream_qwen4exp_cpu_split_enter() {
+extern "C" void zeromoe_qwen4exp_cpu_split_enter() {
   const auto wait_start = std::chrono::steady_clock::now();
   g_qwen4exp_cpu_execution_mutex.lock();
   g_qwen4exp_cpu_split_enter_wait_ns.fetch_add(
@@ -351,7 +351,7 @@ extern "C" void moestream_qwen4exp_cpu_split_enter() {
   g_qwen4exp_ordinary_cpu_active.fetch_add(1, std::memory_order_acq_rel);
 }
 
-extern "C" void moestream_qwen4exp_cpu_split_exit() {
+extern "C" void zeromoe_qwen4exp_cpu_split_exit() {
   g_qwen4exp_ordinary_cpu_active.fetch_sub(1, std::memory_order_acq_rel);
   g_qwen4exp_cpu_execution_mutex.unlock();
 }
@@ -719,7 +719,7 @@ void CUDART_CB qwen4exp_cuda_host_node_arm_direct_workers(
 // Called by the opt-in CUDA backend bridge while a CUDA stream is being
 // captured.  All CUDA work is enqueued here, outside the callback itself;
 // the callback only runs the synchronous CPU GGML MoE and returns.
-extern "C" int moestream_ggml_sched_early_cpu(
+extern "C" int zeromoe_ggml_sched_early_cpu(
     ggml_backend_t backend, ggml_cgraph *graph,
     int64_t *wait_us, int64_t *compute_us) {
   EarlyReadyLane *context = nullptr;
@@ -743,7 +743,7 @@ extern "C" int moestream_ggml_sched_early_cpu(
     GGML_ASSERT(!context->strategy->drives_residency());
     // Captured before run(), because run() advances `calls`; Qwen lanes have no strategy yet
     // and take the plain path unchanged.
-    moestream::graph::ColdMoEInvocation inv;
+    zeromoe::graph::ColdMoEInvocation inv;
     inv.layer = context->trace_layer;
     inv.generation = context->calls + 1;
     GGML_ASSERT(context->strategy->begin(inv));
@@ -757,7 +757,7 @@ extern "C" int moestream_ggml_sched_early_cpu(
   return 1;
 }
 
-extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
+extern "C" bool zeromoe_qwen4exp_cuda_host_node_enqueue(
     const ggml_tensor *node, cudaStream_t stream) {
   if (!node || node->op != GGML_OP_CPY || !node->extra || !stream)
     return false;
@@ -806,9 +806,9 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
 
   ctx->device_output = node->data;
   const char *direct_pool_env =
-      moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_POOL");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_POOL");
   const char *direct_fused_env =
-      moestream::graphcfg::env("MOESTREAM_QWEN_CPU_DIRECT_FUSED");
+      zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_DIRECT_FUSED");
   const bool direct_pool_requested =
       direct_pool_env && direct_pool_env[0] == '1' &&
       !(direct_fused_env && direct_fused_env[0] == '1');
@@ -844,4 +844,4 @@ extern "C" bool moestream_qwen4exp_cuda_host_node_enqueue(
   return true;
 }
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

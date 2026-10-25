@@ -1,6 +1,6 @@
 // Bit-exactness check for MUL_MAT_ID across thread counts / env modes (real random quantized weights and activations,
 // 4 quant types incl. ne11=10). Dump outputs per mode and `cmp` them, e.g.:
-//   for n in 1 4 12; do MOESTREAM_MMID_PARALLEL_QUANT=1 ./mmid_exact_check $n old_$n.bin; ./mmid_exact_check $n new_$n.bin; cmp old_$n.bin new_$n.bin; done
+//   for n in 1 4 12; do ZEROMOE_MMID_PARALLEL_QUANT=1 ./mmid_exact_check $n old_$n.bin; ./mmid_exact_check $n new_$n.bin; cmp old_$n.bin new_$n.bin; done
 // Build: same flags as mmid_decode_scaling_bench.cpp.
 // Run a decode-shaped MUL_MAT_ID with real random quantized weights/activations, dump the output; compare across env modes.
 #include "ggml.h"

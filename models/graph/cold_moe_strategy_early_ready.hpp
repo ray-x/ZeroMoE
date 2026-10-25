@@ -17,7 +17,7 @@
 // Error, never Ready.
 //
 // state()/finish()/release() are driven per token by the scheduler bridge for the GLM lane
-// (`moestream_ggml_sched_early_cpu`: begin before run(), state()/finish()/release() around it).
+// (`zeromoe_ggml_sched_early_cpu`: begin before run(), state()/finish()/release() around it).
 // This adapter is OBSERVATION-ONLY (`drives_residency()` is false): the lane's own run() starts
 // and waits for residency, so finish() is a readiness query and must not be used as a barrier.
 
@@ -25,7 +25,7 @@
 #include "early_ready_lane.hpp"
 #include "invocation_state.hpp"
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 class EarlyReadyLaneStrategy final : public ColdMoEStrategy {
  public:
@@ -93,4 +93,4 @@ class EarlyReadyLaneStrategy final : public ColdMoEStrategy {
   InvocationState gate_;
 };
 
-}  // namespace moestream::graph
+}  // namespace zeromoe::graph

@@ -4,7 +4,7 @@
 * `pack --align 4096` keeps the packed `blk.L.ffn_{gate,up,down}_exps.weight` tensors and re-bases every tensor on a 4 KiB boundary (this alone
   removes the engine's "not 4096-aligned" warning and the buffered fallback).
 * `--expert-interleave` (align-only mode) additionally writes, per MoE layer, one tight `[gate|up|down]` block per expert under the offload-store
-  names `offload.blk.<L>.ffn_<k>.<E>.weight`, each block starting on `--align`, plus the marker KV `moestream.expert_interleave=1`. The packed
+  names `offload.blk.<L>.ffn_<k>.<E>.weight`, each block starting on `--align`, plus the marker KV `zeromoe.expert_interleave=1`. The packed
   tensors are untouched, so every existing loader keeps working; `OffloadStore::open_embedded/open_auto` read the blocks straight from the model
   shards (several files, directory accepted) with one `preadv(O_DIRECT)` per expert. Output grows by the routed-expert bytes.
 * Mixed quant types need nothing special: each plane keeps its own byte size (GLM-5.3-Flash: 2,162,688 / 2,162,688 / 2,686,976 B), and the
@@ -67,7 +67,7 @@ A 64 GiB machine fits a pool of about 46 GiB: 14,639 -> 4,838 demand loads and -
 host cap: 2 and 6 GiB refuse the dense tensors and produce empty outputs; 16 GiB works). At 58 GiB almost every miss is gone; the remaining 125 ms/token
 is CPU cold-expert compute and the graph, which prefetch and read layout cannot touch.
 
-Dynamic VRAM promotion (MOESTREAM_GLM5NEXT_DYNAMIC_CACHE, DYNAMIC_HEAT) is a no-op in this configuration: the aliased-VRAM path hard-sets
+Dynamic VRAM promotion (ZEROMOE_GLM5NEXT_DYNAMIC_CACHE, DYNAMIC_HEAT) is a no-op in this configuration: the aliased-VRAM path hard-sets
 dynamic_expert_cache=false, so those arms (196.5-198 ms) are run-to-run noise (about 4%).
 
 ## 6. Why dynamic VRAM promotion was not wired into the aliased path (decision, 2026-10-11)
@@ -88,7 +88,7 @@ Not implemented. If it is ever picked up, start with the topology retarget opera
 
 ## 7. Parallel boot seeding (2026-10-11)
 `ExpertResidency::populate_resident()` read the seeded experts one at a time, so on a striped store one NVMe idled at boot. It now keeps
-`MOESTREAM_OFFLOAD_SEED_PAR` reads in flight (default 8; 1 = the old serial behaviour), a chunk of one layer at a time through `load_many`.
+`ZEROMOE_OFFLOAD_SEED_PAR` reads in flight (default 8; 1 = the old serial behaviour), a chunk of one layer at a time through `load_many`.
 
 Striped store, DDR 32 GiB, 5,215 seeded experts, same 5-round / 475-token traffic (`glm_runs/run_seed_queue.sh`, alternating arms):
 

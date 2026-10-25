@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare MoEStream and llama.cpp raw decode-logit dumps."""
+"""Compare ZeroMoE and llama.cpp raw decode-logit dumps."""
 
 import argparse
 import math
@@ -24,12 +24,12 @@ def load(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("moestream")
+    parser.add_argument("zeromoe")
     parser.add_argument("llama")
     args = parser.parse_args()
-    a, b = load(args.moestream), load(args.llama)
+    a, b = load(args.zeromoe), load(args.llama)
     if len(a) != len(b):
-        raise SystemExit(f"row count differs: moestream={len(a)} llama={len(b)}")
+        raise SystemExit(f"row count differs: zeromoe={len(a)} llama={len(b)}")
     for (sa, x), (sb, y) in zip(a, b):
         if sa != sb or len(x) != len(y):
             raise SystemExit(f"row layout differs at {sa}/{sb}: {len(x)}/{len(y)}")

@@ -1,6 +1,6 @@
 #include "exl3_ggml_model.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 #include <cuda_runtime.h>
 #include "ggml-cuda.h"
@@ -259,7 +259,7 @@ bool Exl3GgmlBridgeLayer::initialize(
     return decline("cached routed-FFN node state initialization failed");
   ffn_state->model_layer = model_layer;
   const char *verify_layer_text =
-      std::getenv("MOESTREAM_EXL3_GGML_VERIFY_CPU_LAYER");
+      std::getenv("ZEROMOE_EXL3_GGML_VERIFY_CPU_LAYER");
   if (verify_layer_text && verify_layer_text[0]) {
     if (std::strcmp(verify_layer_text, "all") == 0) {
       ffn_state->verify_cpu_reference = true;

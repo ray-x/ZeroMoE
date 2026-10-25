@@ -133,25 +133,25 @@ inline Tensor empty(std::vector<int64_t> sizes, const TensorOptions &o) {
 
 } // namespace at
 
-namespace moestream_exl3 {
+namespace zeromoe_exl3 {
 template <class... Args> std::string cat(const Args &...args) {
   std::ostringstream os;
   (os << ... << args);
   return os.str();
 }
-} // namespace moestream_exl3
+} // namespace zeromoe_exl3
 
 #define TORCH_CHECK(cond, ...)                                                \
   if (!(cond)) {                                                              \
-    throw c10::Error("exl3: " + moestream_exl3::cat(__VA_ARGS__));            \
+    throw c10::Error("exl3: " + zeromoe_exl3::cat(__VA_ARGS__));            \
   }
 #define TORCH_WARN(...)                                                       \
   std::fprintf(stderr, "[exl3 warn] %s\n",                                    \
-               moestream_exl3::cat(__VA_ARGS__).c_str())
+               zeromoe_exl3::cat(__VA_ARGS__).c_str())
 
-// Per-thread stream the upstream launchers enqueue on. MoEStream's custom node
+// Per-thread stream the upstream launchers enqueue on. ZeroMoE's custom node
 // sets this to the ggml backend's CUDA stream before each call.
-namespace moestream_exl3 {
+namespace zeromoe_exl3 {
 cudaStream_t current_stream();
 void set_current_stream(cudaStream_t stream);
-} // namespace moestream_exl3
+} // namespace zeromoe_exl3

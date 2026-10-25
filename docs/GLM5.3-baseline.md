@@ -4,7 +4,7 @@ Recorded 2026-10-20. Reference point for further GLM-5.3 work. Config, scripts a
 The full trial log (Trials 1-47, including every negative result) is `docs/perf-baselines.md`.
 
 **Headline:** short-prompt decode **2.00-2.09 tok/s** first-to-last output (1.88-1.96 on the shutdown `Rates:` line), from 1.74-1.78 (Rates 1.65-1.68) with the same recipe and
-`MOESTREAM_OFFLOAD_RETARGET=0`. Page-reusing eviction is now on by default whenever SSD offload is active (`docs/offload-retarget.md`). A 300-token generation holds **1.91 tok/s** (Rates). A 426-token prompt decodes at **1.45-1.52 tok/s** (Rates; 1.52-1.59 first-to-last)
+`ZEROMOE_OFFLOAD_RETARGET=0`. Page-reusing eviction is now on by default whenever SSD offload is active (`docs/offload-retarget.md`). A 300-token generation holds **1.91 tok/s** (Rates). A 426-token prompt decodes at **1.45-1.52 tok/s** (Rates; 1.52-1.59 first-to-last)
 with a 74 GiB pool. Prefill 12.4-13.5 tok/s on the 426-token prompt (target 10). Lossless: no expert pruning, same experts computed as before.
 
 ## 1. Hardware / software
@@ -13,12 +13,12 @@ with a 74 GiB pool. Prefill 12.4-13.5 tok/s on the 426-token prompt (target 10).
 |---|---|
 | CPU | Intel Xeon W-2235 @ 3.80 GHz, 6 cores / 12 threads, AVX-512 (VNNI), Skylake-E platform (PCIe Gen3 root ports) |
 | RAM | 125 GB (`host_ram_gb = 100`, DDR expert pool 64 GiB; long prompts 74 GiB) |
-| GPU 0 | RTX 3090 24 GB: ExpertVault (22 GiB hot-expert set on the second device slot, see `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB`) |
+| GPU 0 | RTX 3090 24 GB: ExpertVault (22 GiB hot-expert set on the second device slot, see `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB`) |
 | GPU 1 | RTX 5060 Ti 16 GB: core engine (dense layers, attention, KV, LM head), plus GPU-assist ring |
 | Storage | KIOXIA 1 TB (`/data`, offload store) + Samsung 980 PRO 2 TB (model dir); both PCIe Gen3 x4 (platform limit), about 6.5 GB/s combined raw read |
 | Model | GLM-5.3 UD-IQ2_M, `/home/ray/vllm-workspace/GLM-5.3-GGUF-align` (6 shards), 78 layers, 75 routed-expert layers |
 | Offload store | `/data/glm53_offload.gguf` (routed experts, first layer 3); experts also read from the model files (split reads across both drives) |
-| ggml | `ggml-0006-early` with patches `0006` + `0007` (early CPU hook), MoEStream built Release (`build_g7`) |
+| ggml | `ggml-0006-early` with patches `0006` + `0007` (early CPU hook), ZeroMoE built Release (`build_g7`) |
 | Swap | runs launched with `systemd-run --user --scope -p MemorySwapMax=0` |
 
 ## 2. Configuration
@@ -28,16 +28,16 @@ Environment recipe (set by `bench/glm53/run_ab.sh` + `run_dsa_graph2gpu.sh`):
 
 | Variable | Value | Role |
 |---|---|---|
-| `MOESTREAM_GLM_DSA_FULL_GRAPH`, `_PREFILL` | 1 | full ggml graph for decode and prefill (strict: a failed graph fails the request) |
-| `MOESTREAM_GLM_DSA_CPU_LANE` | 1 | CPU lane runs the cold experts while the GPU runs the rest |
-| `MOESTREAM_GLM5NEXT_GPU1_HOT_GIB` | 22 | VRAM hot-expert set (23 GiB does not fit; Trial 37) |
+| `ZEROMOE_GLM_DSA_FULL_GRAPH`, `_PREFILL` | 1 | full ggml graph for decode and prefill (strict: a failed graph fails the request) |
+| `ZEROMOE_GLM_DSA_CPU_LANE` | 1 | CPU lane runs the cold experts while the GPU runs the rest |
+| `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB` | 22 | VRAM hot-expert set (23 GiB does not fit; Trial 37) |
 | `OFFLOAD_DDR_GIB` | 64 (74 for long prompts) | DDR expert pool |
-| `MOESTREAM_GLM5NEXT_PILOT_PREFETCH` / `_STAGE` | 3 / 3 | layer-ahead pilot depth |
-| `MOESTREAM_GLM5NEXT_MODEL_DIRECT` | 1 | O_DIRECT reads on the model drive |
-| **`MOESTREAM_OFFLOAD_RETARGET`** | **on (default; `0` disables)** | **hand an evicted expert's populated pages to the incoming expert (`mremap(MREMAP_DONTUNMAP)`) instead of `madvise(DONTNEED)` + refault** |
-| `MOESTREAM_MEM_GUARD_FLOOR_MB` | 16384 (long prompts only) | lowers the 20 GiB MemAvailable stop floor so a 74 GiB pool fits after a long prefill; default floor unchanged |
-| `MOESTREAM_GLM5NEXT_CPU_THREADS` | 6 | lane threads (5-8 flat, 12 is 24% slower) |
-| `MOESTREAM_GLM5NEXT_ASSIST_*` | device 0 / second device 1, 3 slots | GPU-assist ring (slot count is flat) |
+| `ZEROMOE_GLM5NEXT_PILOT_PREFETCH` / `_STAGE` | 3 / 3 | layer-ahead pilot depth |
+| `ZEROMOE_GLM5NEXT_MODEL_DIRECT` | 1 | O_DIRECT reads on the model drive |
+| **`ZEROMOE_OFFLOAD_RETARGET`** | **on (default; `0` disables)** | **hand an evicted expert's populated pages to the incoming expert (`mremap(MREMAP_DONTUNMAP)`) instead of `madvise(DONTNEED)` + refault** |
+| `ZEROMOE_MEM_GUARD_FLOOR_MB` | 16384 (long prompts only) | lowers the 20 GiB MemAvailable stop floor so a 74 GiB pool fits after a long prefill; default floor unchanged |
+| `ZEROMOE_GLM5NEXT_CPU_THREADS` | 6 | lane threads (5-8 flat, 12 is 24% slower) |
+| `ZEROMOE_GLM5NEXT_ASSIST_*` | device 0 / second device 1, 3 slots | GPU-assist ring (slot count is flat) |
 
 ## 3. Results
 
@@ -114,8 +114,8 @@ asynchronous eviction (46), balanced drive split (-12%), larger 3090 hot set (do
 
 ## 7. Reproduce
 
-    bench/glm53/run_ab.sh <tag> MOESTREAM_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
-      MOESTREAM_GLM5NEXT_PILOT_PREFETCH=3 MOESTREAM_GLM5NEXT_PILOT_STAGE=3 \
-      MOESTREAM_GLM5NEXT_MODEL_DIRECT=1 # MOESTREAM_OFFLOAD_RETARGET is on by default
+    bench/glm53/run_ab.sh <tag> ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=22 OFFLOAD_DDR_GIB=64 NGEN=80 \
+      ZEROMOE_GLM5NEXT_PILOT_PREFETCH=3 ZEROMOE_GLM5NEXT_PILOT_STAGE=3 \
+      ZEROMOE_GLM5NEXT_MODEL_DIRECT=1 # ZEROMOE_OFFLOAD_RETARGET is on by default
 
 Check `nvidia-smi`/`pgrep` first (`bench/glm53/preflight.sh` does it), run under `systemd-run --scope -p MemorySwapMax=0`, and judge text coherence as well as tok/s.

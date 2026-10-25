@@ -11,7 +11,7 @@ cpu_only = true
 
 host_ram_gb = 4.0
 promote_hit_threshold = 2
-pin_file      = ".moestream_usage"
+pin_file      = ".zeromoe_usage"
 pin_threshold = 4
 pin_topk_per_layer = 2
 

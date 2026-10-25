@@ -1,4 +1,4 @@
-// cpu_engine.hpp — Host-only inference engine for moestream_cpu.
+// cpu_engine.hpp — Host-only inference engine for zeromoe_cpu.
 //
 // No CUDA headers, no VRAM, no GPU dispatch.  Manages:
 //   * Host-resident dense weights (loaded once at startup)
@@ -208,7 +208,7 @@ struct CPUEngine {
   std::unordered_map<std::string, std::string> exl3_raw_names;
   std::shared_ptr<Exl3GpuExecutor> exl3_gpu;
   std::shared_ptr<Exl3GpuExecutor> exl3_gpu_secondary;
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
   std::unordered_map<int, std::shared_ptr<Exl3GgmlRoutedFfnGraph>>
       exl3_ggml_gpu_graphs;
   std::unordered_map<int, std::shared_ptr<Exl3GgmlRoutedFfnGraph>>

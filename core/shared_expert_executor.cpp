@@ -87,13 +87,13 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
               .count());
   };
   static const bool debug = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_SHARED_DEBUG");
+    const char *e = std::getenv("ZEROMOE_GGML_SHARED_DEBUG");
     return e && e[0] == '1';
   }();
   if (combined_output)
     *combined_output = nullptr;
   static const bool force_host_decode = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_SHARED_FORCE_HOST_DECODE");
+    const char *e = std::getenv("ZEROMOE_GGML_SHARED_FORCE_HOST_DECODE");
     return e && e[0] == '1';
   }();
   if (force_host_decode && S == 1)
@@ -113,7 +113,7 @@ bool run_qwen4exp_shared_device(StreamingEngine &engine, int layer_idx,
   const std::string prefix = "blk." + std::to_string(layer_idx) + ".";
   const int shared_device = moe_ggml_device() >= 0 ? moe_ggml_device() : 0;
   static const bool no_external_weights = [] {
-    const char *e = std::getenv("MOESTREAM_GGML_SHARED_NO_EXTERNAL");
+    const char *e = std::getenv("ZEROMOE_GGML_SHARED_NO_EXTERNAL");
     return e && e[0] == '1';
   }();
   auto make_ref = [&](const std::string &name, int64_t ne0,
@@ -249,7 +249,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   // the real host-shared fallback path because that is the path used when the
   // optional device shared graph is unavailable.  Normal execution does not
   // allocate or copy anything here.
-  const char *diag_base = std::getenv("MOESTREAM_GGML_HC_COMPARE_DUMP");
+  const char *diag_base = std::getenv("ZEROMOE_GGML_HC_COMPARE_DUMP");
   static std::atomic<bool> diag_dumped{false};
   const bool diag = diag_base && layer_idx == 0 && S == 1 &&
                     !diag_dumped.load(std::memory_order_relaxed);
@@ -297,7 +297,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   // Qwen-only and falls back to the old self-contained call for every
   // unsupported weight/path.
   static const bool reuse_shared_input = [] {
-    const char *e = std::getenv("MOESTREAM_QWEN_SHARED_INPUT_REUSE");
+    const char *e = std::getenv("ZEROMOE_QWEN_SHARED_INPUT_REUSE");
     return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
                  e[0] == 't' || e[0] == 'T');
   }();
@@ -324,7 +324,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
        original_gpu_projection(gate_inp_name));
   const bool reuse_this_call = reuse_shared_input && reuse_capable;
   const bool force_cpu_shared = [] {
-    const char *e = std::getenv("MOESTREAM_QWEN_SHARED_CPU_ORACLE");
+    const char *e = std::getenv("ZEROMOE_QWEN_SHARED_CPU_ORACLE");
     return e && (e[0] == '1' || e[0] == 'y' || e[0] == 'Y' ||
                  e[0] == 't' || e[0] == 'T');
   }();
@@ -410,7 +410,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
   dump_diag("host_shared_combined", output, (size_t)S * D);
   if (diag)
     diag_dumped.store(true, std::memory_order_relaxed);
-  if (std::getenv("MOESTREAM_QWEN_SHARED_REUSE_DEBUG") && S == 1) {
+  if (std::getenv("ZEROMOE_QWEN_SHARED_REUSE_DEBUG") && S == 1) {
     auto checksum = [](const float *p, size_t n) {
       double sum = 0.0;
       double abs_sum = 0.0;
@@ -430,7 +430,7 @@ void run_qwen4exp_shared_host(StreamingEngine &engine, int layer_idx,
              nrm.first, nrm.second, gb.first, gb.second, ub.first, ub.second,
              db.first, db.second, gate.empty() ? 1.0f : gate[0]);
   }
-  if (std::getenv("MOESTREAM_GGML_SHARED_DEBUG") && S == 1) {
+  if (std::getenv("ZEROMOE_GGML_SHARED_DEBUG") && S == 1) {
     double l2 = 0.0;
     for (int d = 0; d < D; ++d)
       l2 += (double)output[d] * output[d];

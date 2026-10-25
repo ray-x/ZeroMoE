@@ -6,7 +6,7 @@
 #include "ggml_glm5next_graph_impl.hpp"
 #include "ggml_bailingmoe3_graph.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace glm5next_graph;
 
@@ -28,7 +28,8 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
 
   if (g_graph && g_graph->ready && g_graph->engine == &engine &&
       g_graph->decode_mode && g_graph->kv_capacity >= pos_base + 1 &&
-      g_graph->decode_last_pos + 1 == pos_base)
+      g_graph->decode_last_pos + 1 == pos_base &&
+      (!g_phase_cache || g_graph->placement_generation == g_phase_cache->generation()))
     return true;
 
   if (g_graph && g_graph->ready && g_graph->decode_mode &&
@@ -134,9 +135,9 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     }
     // The sparse selection (top_k of the context) equals dense attention until the context passes top_k, and the sparse graph
     // costs ~6 ms/token (11 indexer layers, +693 nodes). Use it only when the prompt is long enough that generation can
-    // reach top_k: pos_base + reserve > top_k (MOESTREAM_GLM5NEXT_SPARSE_DECODE_RESERVE, default 1024 tokens; 0 = always).
+    // reach top_k: pos_base + reserve > top_k (ZEROMOE_GLM5NEXT_SPARSE_DECODE_RESERVE, default 1024 tokens; 0 = always).
     static const int reserve = [] {
-      const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_SPARSE_DECODE_RESERVE");
+      const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_SPARSE_DECODE_RESERVE");
       return e ? std::atoi(e) : 1024;
     }();
     if (seeds_match && reserve > 0 && pos_base + reserve <= g->indexer_top_k) {
@@ -187,12 +188,12 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                 "source after graph decline\n");
   };
   auto decline_decode_graph = [&]() {
-    // Design policy: a GLM5NEXT request is served by the full graph or it fails. MOESTREAM_GLM5NEXT_GRAPH_STRICT=1
+    // Design policy: a GLM5NEXT request is served by the full graph or it fails. ZEROMOE_GLM5NEXT_GRAPH_STRICT=1
     // turns the legacy-decode fallback into a hard error (default stays permissive until prefill is graph-only too).
-    if (const char *strict = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GRAPH_STRICT");
+    if (const char *strict = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GRAPH_STRICT");
         strict && strict[0] == '1') {
       LOG_ERROR("[GGML-GLM5NEXT-FULL-DECODE] decode graph declined and "
-                "MOESTREAM_GLM5NEXT_GRAPH_STRICT=1: failing the request "
+                "ZEROMOE_GLM5NEXT_GRAPH_STRICT=1: failing the request "
                 "instead of falling back to the layered path\n");
       std::fflush(nullptr);
       std::abort();
@@ -205,7 +206,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
   g->cuda = static_cast<ggml_backend_t>(ggml_shared_backend(g->device));
   g->cpu = ggml_backend_cpu_init();
   if (g->cpu) {
-    const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_CPU_THREADS");
+    const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_CPU_THREADS");
     ggml_backend_cpu_set_n_threads(g->cpu, e ? std::max(1, std::atoi(e)) : 6);
   }
   if (!g->cuda || !g->cpu)
@@ -224,7 +225,21 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !init_decode_state_arena(*g)) {
     return decline_decode_graph();
   }
-  if (const char *e = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_GPU1_LAYERS")) {
+  const auto phase_options = zeromoe::graph::phase_cache_options();
+  if (phase_options.bytes && !g->native_moe_cache && g_offload && g_offload->store) {
+    if (!g_phase_cache) g_phase_cache = std::make_unique<zeromoe::graph::PhaseExpertCache>();
+    const auto &st = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::GlmGraph);
+    g_phase_cache->prepare_decode(engine, *g_offload->store, g->cuda, g->device,
+        phase_options.bytes, phase_options.reserve_bytes, st.tun.offload_usage_file.value,
+        [&](int l, int expert) {
+          if (size_t(l) >= g->partial_experts.size()) return false;
+          const auto &p = g->partial_experts[size_t(l)];
+          return std::find(p.hot.begin(), p.hot.end(), expert) != p.hot.end() ||
+                 std::find(p.hot1.begin(), p.hot1.end(), expert) != p.hot1.end();
+        });
+  }
+  if (g_phase_cache) g_phase_cache->bind(*g);
+  if (const char *e = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_GPU1_LAYERS")) {
     int a = -1, b = -2;
     if (std::sscanf(e, "%d-%d", &a, &b) == 2 && a >= 0 && b >= a) {
       g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
@@ -236,7 +251,7 @@ bool glm5next_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     }
   }
   if (!g->gpu1) {
-    // GPU1 hot experts (MOESTREAM_GLM5NEXT_GPU1_HOT_GIB) need the second backend even without whole GPU1 layers.
+    // GPU1 hot experts (ZEROMOE_GLM5NEXT_GPU1_HOT_GIB) need the second backend even without whole GPU1 layers.
     for (const auto &pl : g->partial_experts)
       if (!pl.hot1.empty()) {
         g->gpu1 = static_cast<ggml_backend_t>(ggml_shared_backend(second_gpu_device(g->device)));
@@ -360,7 +375,8 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   if (!graph_enabled_for(engine) || !hidden_states || pos_base < 0 || !g_graph ||
       !g_graph->ready || !g_graph->decode_mode || g_graph->engine != &engine ||
       g_graph->S != 1 || pos_base >= g_graph->kv_capacity ||
-      g_graph->decode_last_pos + 1 != pos_base)
+      g_graph->decode_last_pos + 1 != pos_base ||
+      (g_phase_cache && g_graph->placement_generation != g_phase_cache->generation()))
     return false;
   FullGraph &g = *g_graph;
   struct NanProbe {
@@ -369,7 +385,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static NanProbe probe;
   const bool nan_probe_on =
-      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
+      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_NAN_NODES") != nullptr &&
       probe.reported == 0;
   if (nan_probe_on) {
     probe.seen = 0;
@@ -602,7 +618,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   };
   static OpProf op;
   static const bool op_prof_env =
-      moestream::graphcfg::env("MOESTREAM_GLM5NEXT_OP_PROFILE") != nullptr;
+      zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_OP_PROFILE") != nullptr;
   const bool op_prof_on = op_prof_env && !layer_timing_on && !nan_probe_on &&
                           op.tokens < 30;
   if (op_prof_on) {
@@ -732,7 +748,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   if (!g.probe_x.empty()) {
     // Training/diagnostic tap: the exact pilot input (pre-FFN hidden, f32 [D]) of every layer for this decode token.
-    const char *dir = moestream::graphcfg::env("MOESTREAM_GLM5NEXT_PROBE_DUMP");
+    const char *dir = zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_PROBE_DUMP");
     std::vector<float> row((size_t)g.D);
     for (const auto &lx : g.probe_x) {
       if (!dir || lx.second->type != GGML_TYPE_F32 || (size_t)lx.second->ne[0] != (size_t)g.D)
@@ -759,7 +775,7 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   }
   ggml_backend_tensor_get(g.output, hidden_states, 0,
                           (size_t)g.D * sizeof(float));
-  if (moestream::graphcfg::env("MOESTREAM_GLM5NEXT_DEBUG_DECODE_OUT")) {
+  if (zeromoe::graphcfg::env("ZEROMOE_GLM5NEXT_DEBUG_DECODE_OUT")) {
     size_t bad = 0;
     double sum = 0.0, mx = 0.0;
     for (int i = 0; i < g.D; ++i) {
@@ -791,4 +807,4 @@ bool glm5next_full_graph_decode_run(StreamingEngine &engine,
   return true;
 }
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

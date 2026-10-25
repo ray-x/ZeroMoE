@@ -18,7 +18,7 @@
 // aligned O_DIRECT read of [gate start, down end) fetches the whole expert. The file ends padded to `align`.
 // Tensors are named offload.blk.<L>.ffn_{gate,up,down}.<E>.weight -- deliberately NOT the unpacked model names
 // (blk.<L>.ffn_*.<E>.weight): the engine requires an unpacked layer to be complete, and a partial store must never
-// be merged into the model by a directory scan. KV metadata carries the index (moestream.offload.layer/expert).
+// be merged into the model by a directory scan. KV metadata carries the index (zeromoe.offload.layer/expert).
 // Pure byte copy, no requantization.
 #include "gguf_common.hpp"
 #include <algorithm>
@@ -128,8 +128,8 @@ Store read_store(const std::string &path) {
   for (uint64_t i = 0; i < nk; ++i) {
     std::string k = r.str(); uint32_t t = r.get<uint32_t>();
     if (k == "general.alignment") { s.align = r.get<uint32_t>(); continue; }
-    if (k == "moestream.offload.layer") { skip_val(r, t, &s.layer_idx); continue; }
-    if (k == "moestream.offload.expert") { skip_val(r, t, &s.expert_idx); continue; }
+    if (k == "zeromoe.offload.layer") { skip_val(r, t, &s.layer_idx); continue; }
+    if (k == "zeromoe.offload.expert") { skip_val(r, t, &s.expert_idx); continue; }
     skip_val(r, t);
   }
   for (uint64_t i = 0; i < nt; ++i) {
@@ -313,13 +313,13 @@ int cmd_offload(int argc, char **argv) {
   try {
     out.write("GGUF", 4); w32(out, 3); w64(out, plan.size()); w64(out, 8);
     kv_u32(out, "general.alignment", (uint32_t)align);
-    kv_str(out, "general.architecture", "moestream-offload");
-    kv_u32(out, "moestream.offload.version", 1);
-    kv_str(out, "moestream.offload.source", fs::path(model).filename().string());
-    kv_u64(out, "moestream.offload.count", n);
-    kv_u64(out, "moestream.offload.slab_bytes_first", plan.size() >= 3 ? plan[0].size + plan[1].size + plan[2].size : 0);
-    kv_arr_u32(out, "moestream.offload.layer", idx_l);
-    kv_arr_u32(out, "moestream.offload.expert", idx_e);
+    kv_str(out, "general.architecture", "zeromoe-offload");
+    kv_u32(out, "zeromoe.offload.version", 1);
+    kv_str(out, "zeromoe.offload.source", fs::path(model).filename().string());
+    kv_u64(out, "zeromoe.offload.count", n);
+    kv_u64(out, "zeromoe.offload.slab_bytes_first", plan.size() >= 3 ? plan[0].size + plan[1].size + plan[2].size : 0);
+    kv_arr_u32(out, "zeromoe.offload.layer", idx_l);
+    kv_arr_u32(out, "zeromoe.offload.expert", idx_e);
     for (auto &t : plan) {
       wstr(out, t.name); w32(out, (uint32_t)t.shape.size());
       for (auto d : t.shape) w64(out, d);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_capped.sh -- launch moestream under a REAL, kernel-enforced memory cap.
+# run_capped.sh -- launch zeromoe under a REAL, kernel-enforced memory cap.
 #
 # WHY THIS EXISTS: a 2026-09-09 incident. A 480-token full-graph prefill on
 # this box crashed the WHOLE MACHINE hard enough to need a reboot (no
@@ -31,7 +31,7 @@
 # other is worse than neither (it hides the failure instead of catching it).
 #
 # USAGE:
-#   scripts/run_capped.sh [--limit-gb N] -- <moestream args...>
+#   scripts/run_capped.sh [--limit-gb N] -- <zeromoe args...>
 #
 # Defaults to 10 GB above whatever host_ram_gb the target config declares
 # (parsed with a plain grep -- good enough for this project's own simple

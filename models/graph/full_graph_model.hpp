@@ -22,9 +22,34 @@
 #include "moe_execution_strategy.hpp"
 
 struct StreamingEngine;
+class GpuTopology;
 class RAMSafetyManager;
 class LockFreePrefetcher;
 struct LayerScratch;
+
+// What the engine must know about a graph to size and place its caches. Every flag
+// defaults to off: a family opts in, and the startup [GRAPH-CAPS] line prints what it
+// resolved to, so an inherited advanced behaviour is never silent.
+struct GraphEngineCaps {
+  // Hot experts are ggml tensors aliasing the VRAM cache slots in place: slots need a
+  // row-aligned stride, and the graph owns no extra device-resident expert block.
+  bool aliases_vram_cache = false;
+  // With ram_preload_all_experts the graph reads experts through the RAM cache.
+  bool ram_cache_with_preload = false;
+  // The temporary active-layer pool is dropped: it lives outside the aliased address
+  // space and competes with the cache for VRAM.
+  bool replaces_active_layer_area = false;
+};
+
+// Family-specific performance requirements applied after GGUF discovery but
+// before cache sizing and preload. Keep required resource setup next to the
+// graph adapter so a graph-only model cannot silently inherit unsuitable
+// global defaults.
+struct GraphRuntimeTuning {
+  bool requires_preloaded_ddr_experts = false;
+  double default_ram_pin_fraction = -1.0; // negative = honor engine config
+  double default_ram_pinned_budget_gb = -1.0;
+};
 
 class FullGraphModel {
  public:
@@ -52,6 +77,17 @@ class FullGraphModel {
   // second expert store. New families bind it through this shared lifecycle hook.
   virtual bool uses_native_moe_cache() const { return false; }
   virtual bool graph_only() const { return false; }
+  // Whether the dense VRAM pool should hold token_embd.weight. Every embedding lookup in the engine reads the host
+  // copy (one row per token), so the default is CPU/DDR; a family whose graph embeds on the GPU overrides this to true.
+  // EngineConfig::embedding_device = "gpu" forces the device copy for any model.
+  virtual bool embedding_on_gpu() const { return false; }
+  virtual GraphEngineCaps engine_caps(const StreamingEngine &) const { return {}; }
+  // These are deliberate adapter declarations, not safe-to-inherit defaults:
+  // a graph may be correct yet unusably slow when placement or CPU fallback
+  // is silently left at zero/off.
+  virtual GraphRuntimeTuning runtime_tuning(const StreamingEngine &) const = 0;
+  // Hands the graph the VRAM expert cache it aliases (no-op for graphs that do not).
+  virtual void bind_vram_cache(GpuTopology *) const {}
   virtual void bind_runtime(StreamingEngine &, RAMSafetyManager &,
                              LockFreePrefetcher &, LayerScratch &) const {}
 
@@ -69,7 +105,14 @@ class FullGraphModel {
   virtual bool supports_prefill_continuation(const StreamingEngine &) const { return false; }
 
   // Number of MoE layers whose routed experts the graph places in VRAM.
-  virtual int device_expert_layers() const { return 0; }
+  virtual int device_expert_layers() const = 0;
+  virtual int device_expert_layers(const StreamingEngine &) const {
+    return device_expert_layers();
+  }
+  // Whether that block is selected from the end of the trunk. Sharing this
+  // placement policy lets model adapters carry measured residency defaults
+  // into the common cache/preload planning path.
+  virtual bool device_expert_trailing() const = 0;
 
   // ---- policy ---------------------------------------------------------------
   virtual moe_routed::RouterSpec router_spec(const ArchitectureConfig &c,
@@ -78,10 +121,10 @@ class FullGraphModel {
   }
   // Whether a layer's cold experts may run on a private CPU lane concurrently
   // with the layer's GPU work.
-  virtual bool supports_cpu_lane() const { return false; }
-  virtual moestream::graph::MoEExecutionCapabilities
+  virtual bool supports_cpu_lane() const = 0;
+  virtual zeromoe::graph::MoEExecutionCapabilities
   moe_execution_capabilities() const {
-    moestream::graph::MoEExecutionCapabilities caps;
+    zeromoe::graph::MoEExecutionCapabilities caps;
     caps.early_ready = supports_cpu_lane();
     caps.gpu_assist = caps.early_ready;
     return caps;
@@ -129,6 +172,9 @@ class FullGraphModelBase : public FullGraphModel {
  private:
   const Derived &self() const { return static_cast<const Derived &>(*this); }
 };
+
+// Logs every resolved capability of `model` once, at startup (the [GRAPH-CAPS] line).
+void log_graph_capabilities(const FullGraphModel &model, const StreamingEngine &engine);
 
 // The model for `family`, or nullptr when the family has no whole-model graph
 // (it then uses the layer-by-layer path).

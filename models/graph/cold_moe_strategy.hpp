@@ -19,7 +19,7 @@
 #include <functional>
 #include <vector>
 
-namespace moestream::graph {
+namespace zeromoe::graph {
 
 // One token's routing for one MoE layer. Immutable for the lifetime of the invocation;
 // produced once, consumed by every branch, released after the last consumer.
@@ -87,4 +87,4 @@ class ColdMoEStrategy {
   virtual ~ColdMoEStrategy() = default;
 };
 
-}  // namespace moestream::graph
+}  // namespace zeromoe::graph

@@ -79,7 +79,7 @@ step. Global selection over the original 44 layers has substantially less
 drift. This is consistent with sensitivity to which routes execute on CPU
 versus GPU; it does not prove the source of every numerical difference.
 
-`MOESTREAM_MMID_NO_NEGATIVE_SKIP=1` makes both branches compute valid dummy
+`ZEROMOE_MMID_NO_NEGATIVE_SKIP=1` makes both branches compute valid dummy
 routes and then mask foreign contributions. B and floor1 each produced
 **byte-identical full logit dumps** with this control on and off. Negative
 skipping therefore does not explain their differences from A in this test.
@@ -103,7 +103,7 @@ history; those forced texts are not independent quality tests.
 | V1 | 62/64 | 0.00078662 |
 
 Artifacts: `logs/option_b_teacher_chat_20261003/`. This matrix used a saved
-binary in `logs/option_b_validation_engine_20261003/moestream`, after the
+binary in `logs/option_b_validation_engine_20261003/zeromoe`, after the
 native build incorporated concurrent state-handoff changes (disabled in
 these configs). Each matrix has its own engine hash; comparisons never mix
 reference and candidate engines within a matrix.

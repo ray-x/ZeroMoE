@@ -5,7 +5,7 @@
 
 #include "ggml_qwen4exp_graph_internal.hpp"
 
-#if defined(MOESTREAM_USE_GGML_CUDA)
+#if defined(ZEROMOE_USE_GGML_CUDA)
 
 using namespace qwen4exp_graph;
 
@@ -45,7 +45,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       !env_qwen4exp_host_node_enabled()) {
     LOG_ERROR(
         "[GGML-QWEN-FULL-DECODE] refusing decode: CPUOffload layers require "
-        "MOESTREAM_QWEN4EXP_HOST_NODE=1 under the full-graph-only Qwen policy\n");
+        "ZEROMOE_QWEN4EXP_HOST_NODE=1 under the full-graph-only Qwen policy\n");
     return false;
   }
   const auto &c = engine.model_file.architecture_config;
@@ -278,7 +278,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
                         device_expert_layers_shrink);
     g->device_expert_trailing = env_device_expert_trailing();
     const char *partial_gate_up =
-        moestream::graphcfg::env("MOESTREAM_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
+        zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
     // partial_gate_up's boundary math (layer==device_expert_layers, the
     // first CPU layer just past a LEADING block) has no trailing-mode
     // equivalent yet -- force it off rather than apply leading-only math
@@ -309,13 +309,13 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
     // Ruled out via THROUGHPUT: all four values landed within noise of each
     // other (11.76-12.37 tok/s at device_expert_layers=20).
     // TEMPORARY re-test (2026-09-15, same day): now that the ELEVENTH ROUND
-    // per-op gap instrumentation exists (MOESTREAM_QWEN4EXP_GRAPH_LAYER_
+    // per-op gap instrumentation exists (ZEROMOE_QWEN4EXP_GRAPH_LAYER_
     // TIMING=1), re-checking whether .poll moves the GAP time specifically
     // (a real but small effect could have been lost in the earlier
     // throughput-only measurement's noise). Remove this override again if
     // inconclusive, per the original decision record's own discipline.
     if (const char *poll_env =
-            moestream::graphcfg::env("MOESTREAM_QWEN4EXP_CPU_POLL_RETEST")) {
+            zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_CPU_POLL_RETEST")) {
       char *end = nullptr;
       const long v = std::strtol(poll_env, &end, 10);
       if (end != poll_env && v >= 0 && v <= 100)
@@ -359,7 +359,7 @@ bool qwen4exp_full_graph_decode_prepare(StreamingEngine &engine, int pos_base,
       constexpr size_t kPhase2ArenaMargin = 768ull * 1024ull * 1024ull;
       const size_t expert_need = device_expert_bytes(*g);
       const bool risky_override =
-          moestream::graphcfg::env("MOESTREAM_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC") != nullptr;
+          zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PHASE2_ALLOW_RISKY_ALLOC") != nullptr;
       const bool insufficient =
           mem_status != cudaSuccess ||
           expert_need > SIZE_MAX - kPhase2ArenaMargin ||
@@ -719,7 +719,7 @@ bool qwen4exp_stage_layer13_before_graph(FullGraph &g, int pos_base) {
   g.stage_slot = g.stage_slots.front();
 
   cudaStream_t graph_stream =
-      moestream_ggml_backend_cuda_get_stream(g.cuda_raw);
+      zeromoe_ggml_backend_cuda_get_stream(g.cuda_raw);
   if (!graph_stream) {
     LOG_WARN("[OPTION-B-STAGE] ggml CUDA stream bridge unavailable\n");
     return false;
@@ -766,4 +766,4 @@ bool qwen4exp_stage_layer13_before_graph(FullGraph &g, int pos_base) {
 
 } // namespace qwen4exp_graph
 
-#endif // MOESTREAM_USE_GGML_CUDA
+#endif // ZEROMOE_USE_GGML_CUDA

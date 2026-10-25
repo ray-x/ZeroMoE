@@ -1,7 +1,7 @@
 // Apples-to-apples Qwen CPU MoE graph benchmark.
 //
 // This deliberately depends only on GGML's public CPU/backend API so the same
-// source can be linked against MoEStream's and llama.cpp's ggml libraries:
+// source can be linked against ZeroMoE's and llama.cpp's ggml libraries:
 //
 //   bench/run_qwen_cpu_moe_compare.sh
 //
@@ -68,7 +68,7 @@ int env_int(const char *name, int fallback) {
 }
 
 ggml_type bench_gate_up_type() {
-    const char *value = std::getenv("MOESTREAM_QWEN_CPU_BENCH_GATE_UP_TYPE");
+    const char *value = std::getenv("ZEROMOE_QWEN_CPU_BENCH_GATE_UP_TYPE");
     if (value && (std::strcmp(value, "IQ2_XXS") == 0 ||
                   std::strcmp(value, "iq2_xxs") == 0))
         return GGML_TYPE_IQ2_XXS;
@@ -127,7 +127,7 @@ void fill_selected_expert_weights(uint8_t *gate_plane, uint8_t *up_plane,
 }
 
 Stage env_stage() {
-    const char *value = std::getenv("MOESTREAM_QWEN_CPU_BENCH_STAGE");
+    const char *value = std::getenv("ZEROMOE_QWEN_CPU_BENCH_STAGE");
     if (value && (std::strcmp(value, "gate_up") == 0 ||
                   std::strcmp(value, "gateup") == 0))
         return Stage::GateUp;
@@ -342,7 +342,7 @@ bool make_graph(Graph &result, Stage stage, int threads, int n_experts,
     result.topk = topk;
     result.gate_up_stride = gate_up_stride;
     result.down_stride = down_stride;
-    if (std::getenv("MOESTREAM_QWEN_CPU_BENCH_GRAPH_DEBUG")) {
+    if (std::getenv("ZEROMOE_QWEN_CPU_BENCH_GRAPH_DEBUG")) {
         std::cerr << "graph stage=" << stage_name(stage)
                   << " nodes=" << ggml_graph_n_nodes(result.graph) << " output="
                   << result.output->ne[0] << "x" << result.output->ne[1]
@@ -367,7 +367,7 @@ bool run_graph(Graph &graph, const float *input, const int32_t *ids,
     // The engine's persistent Qwen runner uses graph_plan_compute().  Keep a
     // switch for comparison with the ordinary backend path because it also
     // exposes any stale-plan/data-pointer issue in this standalone probe.
-    if (std::getenv("MOESTREAM_QWEN_CPU_BENCH_NO_PLAN"))
+    if (std::getenv("ZEROMOE_QWEN_CPU_BENCH_NO_PLAN"))
         return ggml_backend_graph_compute(graph.backend, graph.graph) ==
                GGML_STATUS_SUCCESS;
     return ggml_backend_graph_plan_compute(graph.backend, graph.plan) ==
@@ -451,18 +451,18 @@ bool run_stage(Stage stage, int threads, int n_experts, int d_model, int d_ff,
 } // namespace
 
 int main() {
-    const int d_model = env_int("MOESTREAM_QWEN_CPU_BENCH_D_MODEL", 2560);
-    const int d_ff = env_int("MOESTREAM_QWEN_CPU_BENCH_D_FF", 640);
-    const int topk = env_int("MOESTREAM_QWEN_CPU_BENCH_TOPK", 10);
-    const int n_experts = env_int("MOESTREAM_QWEN_CPU_BENCH_EXPERTS", 512);
+    const int d_model = env_int("ZEROMOE_QWEN_CPU_BENCH_D_MODEL", 2560);
+    const int d_ff = env_int("ZEROMOE_QWEN_CPU_BENCH_D_FF", 640);
+    const int topk = env_int("ZEROMOE_QWEN_CPU_BENCH_TOPK", 10);
+    const int n_experts = env_int("ZEROMOE_QWEN_CPU_BENCH_EXPERTS", 512);
     const int threads = env_int(
-        "MOESTREAM_QWEN_CPU_BENCH_THREADS",
+        "ZEROMOE_QWEN_CPU_BENCH_THREADS",
         env_int("OMP_NUM_THREADS",
                 static_cast<int>(std::max(1u, std::thread::hardware_concurrency()))));
-    const int warmup = env_int("MOESTREAM_QWEN_CPU_BENCH_WARMUP", 2);
-    const int iterations = env_int("MOESTREAM_QWEN_CPU_BENCH_ITERS", 8);
+    const int warmup = env_int("ZEROMOE_QWEN_CPU_BENCH_WARMUP", 2);
+    const int iterations = env_int("ZEROMOE_QWEN_CPU_BENCH_ITERS", 8);
     const int route_variety = env_int(
-        "MOESTREAM_QWEN_CPU_BENCH_ROUTE_VARIETY", 0);
+        "ZEROMOE_QWEN_CPU_BENCH_ROUTE_VARIETY", 0);
     const ggml_type gate_up_type = bench_gate_up_type();
     if (n_experts < topk) {
         std::cerr << "experts must be >= topk\n";
@@ -477,7 +477,7 @@ int main() {
     const size_t raw_stride = gate_bytes + up_bytes + down_bytes;
     const size_t stride = (raw_stride + 4095) & ~static_cast<size_t>(4095);
     const bool packed = [] {
-        const char *value = std::getenv("MOESTREAM_QWEN_CPU_BENCH_PACKED");
+        const char *value = std::getenv("ZEROMOE_QWEN_CPU_BENCH_PACKED");
         return value && value[0] == '1';
     }();
     const size_t gate_up_stride = packed ? gate_bytes + up_bytes : stride;
@@ -530,7 +530,7 @@ int main() {
               << ",AVX512_VNNI:" << ggml_cpu_has_avx512_vnni() << "\n";
 
     bool ok = true;
-    if (std::getenv("MOESTREAM_QWEN_CPU_BENCH_STAGE")) {
+    if (std::getenv("ZEROMOE_QWEN_CPU_BENCH_STAGE")) {
         ok = run_stage(selected, threads, n_experts, d_model, d_ff, topk,
                        gate_up_type, warmup, iterations, gate_plane,
                        up_plane, down_plane, gate_up_stride, down_stride,

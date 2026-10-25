@@ -27,12 +27,12 @@ Last commit of mine: `b5e97c9` (host-node GPU weighted reduce). Uncommitted, **m
 | `bench/option_b_global_pool_ab.sh` (new) | 4-way A/B (see section 3) |
 
 Other modified files in `git status` (bench/*, other configs, safetensors_adapter, tools/*, glm5next, batched_dispatch) are **not mine**: do not
-commit them with this work. Built into `../moestream-build-upstream-master` (`make -j6 moestream`).
+commit them with this work. Built into `../moestream-build-upstream-master` (`make -j6 zeromoe`).
 
 ## 2. What the global pool is, and the prediction
 
 Option-B per-layer mode gives each selected layer its own top-N. Global mode ranks every (layer, expert) pair of the selected layers by survey
-usage (`tests/moe_usage_survey/moestream_usage_survey_qwen4exp_usage_tap`, text lines `layer expert count`; every layer routes 159,000 so counts compare
+usage (`tests/moe_usage_survey/zeromoe_usage_survey_qwen4exp_usage_tap`, text lines `layer expert count`; every layer routes 159,000 so counts compare
 across layers) and keeps the top K. Each layer with usage keeps >= 1 expert, so listing all 48 layers gives 0/48/0.
 
 **Important correction to the premise.** The current "0/44/4" config is *right-sized*, not 50% per layer: `right_size_top_n=true` trims each layer to the
@@ -58,20 +58,20 @@ whether to raise the default budgets.
 ## 4. OPEN: correctness of the global layouts (do this first)
 
 - On a 402-token mid-sentence prompt ("summarize" of an env-var-heavy doc fragment), configs **B and D (and layer 2 added to the 44-layer set) produced the identical degraded
-  summary** (`MOESTREAM_MOESTREAM_...`), while A, C, V1 (global over the original 44 layers), +layer 0, +1, +22, +1&2 quoted `MOESTREAM_QWEN4EXP_HOST_NODE` correctly.
+  summary** (`ZEROMOE_ZEROMOE_...`), while A, C, V1 (global over the original 44 layers), +layer 0, +1, +22, +1&2 quoted `ZEROMOE_QWEN4EXP_HOST_NODE` correctly.
   Non-monotonic in the layer set, all layers are plain Q2_0, so layer 2 is not structurally special. Could be a numerical near-tie flip in a 2-bit model, or a real split-path defect
   that shows when layers 0/1/2/22 (flat routing, few hot experts) become split layers. **Not resolved.**
 - The 128-token chat prompt was coherent for all four configs. The 8-prompt exact-identifier copy test I tried is **saturated at ~5% for every config including the baseline**
   (the model truncates long identifiers), so it cannot discriminate; do not reuse it.
-- Needed: a teacher-forced comparison (`MOESTREAM_TEACHER_FORCE_TOKEN_FILE`, see `docs/qwen4exp-tg400-state-handoff.md`) of top-1 agreement / KL against config A (or the all-CPU path)
+- Needed: a teacher-forced comparison (`ZEROMOE_TEACHER_FORCE_TOKEN_FILE`, see `docs/qwen4exp-tg400-state-handoff.md`) of top-1 agreement / KL against config A (or the all-CPU path)
   on real text, for B, D and V1; plus a check of a split layer with very few hot experts (floor=1) for an edge case in the compact-tensor / negative-id-skip path. Until then, treat B/D as unvalidated.
 - Long prompts: a 402-token prompt crosses the arena-release boundary for both A (needs ~4.44 GiB, 2.66 free) and D (2.40 free); no CUDA/OOM errors, decode rebuilds the arena. A ~2,000-token
   prompt takes many minutes to prefill on this path (about 30 s per layer) and was abandoned: also note context_size=2048 is too small for a 1,987-token prompt plus generation.
 
 ## 5. Earlier work this session (all committed unless noted)
 
-- Host-node GPU reduce: `MOESTREAM_QWEN4EXP_HOST_NODE_GPU_REDUCE` (default on) +1.65% (commit `b5e97c9`; documented in `docs/runtime-settings.md` and howto s20).
-- **12 OpenMP threads collapse (3-25x) under any other CPU load** (MoEStream, llama.cpp, any spinning pool). With a background job use `MOESTREAM_QWEN_CPU_THREADS=10|11`.
+- Host-node GPU reduce: `ZEROMOE_QWEN4EXP_HOST_NODE_GPU_REDUCE` (default on) +1.65% (commit `b5e97c9`; documented in `docs/runtime-settings.md` and howto s20).
+- **12 OpenMP threads collapse (3-25x) under any other CPU load** (ZeroMoE, llama.cpp, any spinning pool). With a background job use `ZEROMOE_QWEN_CPU_THREADS=10|11`.
   `PRELOAD_LAYERS=0` fails on the 5060 Ti (dense arena declined -> legacy path, 0.26 tok/s): use 1.
 - CPU kernel cost by quant (my benchmark `bench/expert_cost_by_quant_bench.cpp`; the mixed gate/up+down variant is only in the session scratchpad): codebook types
   (IQ1/IQ2/IQ3) stream 12-20 GB/s on this Xeon, K-quants/Q4/Q5/Q6/Q8 30-47 GB/s; page size (THP), thread count 10 vs 12 and cache are not factors. Engine ~= benchmark + shared-expert/routing nodes.
@@ -81,7 +81,7 @@ whether to raise the default budgets.
 - 5060 Ti baseline (pruned checkpoint, 27 GPU / 21 CPU layers): 25.2 tok/s with threads 10-11. 47 CPU layers: 15.8 tok/s. llama.cpp all-experts-CPU (`-ncmoe 48`): UD-IQ1_M 17.3, Q2_0 16.9 tok/s; GLM-5.3-Flash 3.0bit
   (110 GB, needs neurall's llama.cpp for `glm5-next`): 9.8-10.0 tok/s.
 - `/home/ray/Projects/Strata` (same model family) compared: its `run.md`/`bench_inference.py` 42-47 tok/s is inflated (repeated truncated prompt + suffix-draft speculation; `--spec 4` without `--mtp` still drafts);
-  real chat decode 29-30 tok/s vs MoEStream Q2_0 0/44/4 29.4-29.8 (same prompt): **equal**. Strata is GPU-bound (util 89.5%, mean 201 W at the 220 W cap, mem util 20%), MoEStream CPU-bound (util 41.7%).
+  real chat decode 29-30 tok/s vs ZeroMoE Q2_0 0/44/4 29.4-29.8 (same prompt): **equal**. Strata is GPU-bound (util 89.5%, mean 201 W at the 220 W cap, mem util 20%), ZeroMoE CPU-bound (util 41.7%).
   Strata's paper numbers need MTP and a Ryzen 5 7600 + DDR5. User decided to set the Strata comparison aside and **not** to test MTP (adds noise).
   Ideas not taken from Strata that fit our design: adaptive expert swapping, doorbell handoff, parallel PCIe share.
 
@@ -97,7 +97,7 @@ The overlap lever now has a [standalone real-kernel graph experiment and integra
 ## 7. Files and logs (untracked unless noted)
 
 `logs/ms_cmp_matrix*_20261003.log`, `logs/ms_cmp_*_r*.{stdout,engine.log}` (the 7-rep A/B), `logs/ms_mid_*_M.stdout` (402-token texts), `logs/ms_copy_*` (saturated copy test),
-`logs/moestream_q2_0_3090_run.sh` and `logs/moestream_global_matrix*.sh` (scratch runners), `logs/strata_pcie_frac_20261003.log`, `logs/glm53flash_neurall_allcpu_20261003.log`.
+`logs/zeromoe_q2_0_3090_run.sh` and `logs/zeromoe_global_matrix*.sh` (scratch runners), `logs/strata_pcie_frac_20261003.log`, `logs/glm53flash_neurall_allcpu_20261003.log`.
 Scratch configs for the variants are regenerated by `bench/option_b_global_pool_ab.sh`. Memory notes (in `~/.claude/projects/-home-ray-Projects-MoEStream/memory/`):
 `pcie-gen3-limits-expert-staging-5060ti-baseline.md`, `strata-bench-inflated-by-suffix-drafts-and-garbled-pcie-frac.md`.
 

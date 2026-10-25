@@ -109,8 +109,8 @@ cudaError_t launch_exl3_scale_device_weight(float *output, const float *weight,
   return cudaGetLastError();
 }
 
-#ifndef MOESTREAM_EXL3_UPSTREAM
-// Built without MOESTREAM_EXLLAMAV3_SRC: the EXL3 matmuls are unavailable.
+#ifndef ZEROMOE_EXL3_UPSTREAM
+// Built without ZEROMOE_EXLLAMAV3_SRC: the EXL3 matmuls are unavailable.
 cudaError_t launch_exl3_mul1_matmul(const Exl3CudaMatrixView &, const float *,
                                     float *, int, float *, cudaStream_t) {
   return cudaErrorNotSupported;
