@@ -622,10 +622,11 @@ bool init_device_expert_arena(FullGraph &g) {
     g.expert_soft_of_layer.clear();
     g.expert_buft = buft;
     if (split_active && g.decode_mode && g.engine) {
-      const char *soft_env = std::getenv("ZEROMOE_QWEN_SOFT_PIN_GIB");
-      const double soft_gib = soft_env ? std::atof(soft_env) : 0.0;
+      // Default 6 GiB (prompts up to ~2,300 tokens at K=14,000 re-upload only what the prefill displaced); 0 turns the tier
+      // off. Capped at half of the split payload so a small arena keeps a real hard part.
+      const double soft_gib = zeromoe::graphcfg::atof_or("ZEROMOE_QWEN_SOFT_PIN_GIB", 6.0);
       const size_t soft_target =
-          soft_gib > 0.0 ? static_cast<size_t>(soft_gib * 1024.0 * 1024.0 * 1024.0) : 0;
+          soft_gib > 0.0 ? std::min(static_cast<size_t>(soft_gib * 1024.0 * 1024.0 * 1024.0), bytes / 2) : 0;
       constexpr size_t kSoftSegmentBytes = 1ull << 30;
       if (soft_target > 0) {
         std::vector<int> layers;

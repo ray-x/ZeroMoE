@@ -228,6 +228,11 @@ std::unique_ptr<FullGraph> extract_decode_arena_owner(
 // decode graph after a long prompt), release it before a prefill that needs the
 // space. Called before the prefill graph is built.
 void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
+  // The generation loop and the execution layer both prepare a prefill batch, so this can run again for a shape whose prefill
+  // graph is already built. That decision was taken when the graph was built, and the graph's own workspace now makes the
+  // free VRAM look small: re-deciding would release more of the arena (or all of it) for nothing.
+  if (g_graph && g_graph->ready && !g_graph->decode_mode && g_graph->engine == &engine && g_graph->S == S)
+    return;
   const bool live_owned =
       g_graph && g_graph->decode_mode && g_graph->expert.buffer &&
       !g_graph->expert_source_graph && g_graph->expert.capacity > 0;
