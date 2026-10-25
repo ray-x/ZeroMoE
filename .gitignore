@@ -3,7 +3,22 @@ build/
 build_*/
 /build-ling/
 /builds*/*
+/.worktrees/
+/.exl3-runtime/
 tests/bench_outproj
+
+# Keep the published starter profiles and generic templates in Git. Other
+# root-level profiles remain local; benchmark profiles live under configs/bench.
+/configs/*.toml
+/configs/obsolete/
+/configs/testing/
+!/configs/qwen38-flash.toml
+!/configs/glm53-flash.toml
+!/configs/ling31-flash.toml
+!/configs/deepseek41-flash.toml
+!/configs/glm53-dsa.toml
+!/configs/mimo26-flash.toml
+!/configs/single_gpu.toml
 
 # Local benchmark profiles are generated per prompt/run. Keep the committed
 # reference inputs explicit; everything else stays on the host.
@@ -49,8 +64,9 @@ glm_runs/probe_live
 *.bad*.*
 *.csv
 *.tsv
-.zeromoe_usage*
-logs/*.log
+.zeromoe_*usage*
+/bench_tmp/
+/logs/
 glm_runs/*.log
 glm_runs/*.csv
 glm_runs/*.stdout

@@ -40,7 +40,7 @@ libraries from `build_fork_diag`; keep that directory.
 ./build_fork_diag/gguf_tool verify /data/sda/models/qwen3.8-flash-next/GSQ-RCO-IQ2_XS_RCO50
 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=48 \
 ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1 \
-./build/zeromoe --config configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
+./build/zeromoe --config configs/testing/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml
 ```
 
 For matched warm measurements, the script runs six identical 23-token requests
@@ -53,7 +53,7 @@ different model/tokenizer.
 bash tests/qwen4exp_state_handoff_ab.sh ./build/zeromoe
 ZEROMOE_HANDOFF_CHECK_LOGITS=1 \
 bash tests/qwen4exp_state_handoff_ab.sh ./build/zeromoe \
-  configs/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml \
+  configs/testing/qwen4exp_gsq_rco_iq2xs_rco50_3090_gpu_only.toml \
   logs/qwen4exp_state_handoff_correctness
 ```
 

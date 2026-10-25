@@ -12,7 +12,7 @@ bench/qwen_decode_baselines.sh hybrid 14554 200 10  # usage-ranked hot experts i
 | split 22/26, UD-IQ1_M | **28.66 tok/s** (400 tokens, 13.96 s) | 24.6, 26.0 (clangd indexer using ~1.5 cores) | 26.2-26.9 on 2026-10-02 |
 | hybrid K=14,554 of 24,576, Q2_0 | **43.12 tok/s** (196 steps) | 41.28 | 39-42 on 2026-10-05 |
 
-Both beat their earlier references; these are the new baselines in `docs/perf-baselines.md`. Single runs: the spread between
+Both beat their earlier references; these are the new baselines in `configs/bench/perf-baselines.md`. Single runs: the spread between
 runs of the same config today was 24.6-28.7 (split) and 41.3-43.1 (hybrid), so treat a drop under ~5% as noise and above it
 as worth investigating. Loadavg at the start of the 28.66 run was 1.06; at the start of the 43.12 run 5.38 (the CPU part of
 the hybrid is small, so it is less sensitive).
@@ -32,7 +32,7 @@ the hybrid is small, so it is less sensitive).
 ## Split: 22 layers fully on the GPU, 26 fully on the CPU
 
 Model: `/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf`.
-Config: `configs/qwen4exp_tg400_iq1m_22_26.toml`, with three lines changed by the script (`omp_max_threads = 10`,
+Config: `configs/bench/qwen4exp_tg400_iq1m_22_26.toml`, with three lines changed by the script (`omp_max_threads = 10`,
 `max_new_tokens = 400`, `log_path`). Settings that define the placement and the fast path:
 
 | key | value | meaning |
@@ -76,7 +76,7 @@ Expected engine-log lines (check them before trusting a number):
 
 ## Hybrid: usage-ranked hot experts in VRAM
 
-Model: `/data/sdb/models/qwen3.8-flash-next/Q2_0` (directory). Config: `configs/qwen4exp_q2_0_option_b_global_topk48.toml`, with
+Model: `/data/sdb/models/qwen3.8-flash-next/Q2_0` (directory). Config: `configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml`, with
 `qwen4exp_option_b_global_top_k = 14554`, `omp_max_threads = 10`, `log_path` set by the script.
 
 | key | value | meaning |
@@ -129,8 +129,8 @@ under contention (I did not capture a quiet-run value for comparison).
 
 ## What does not reach these numbers
 
-`configs/qwen4exp_3090_only.toml` (the prefill benchmark config: partial residency plus the RAM tier, UD-IQ1_M) decodes at
-19.5 tok/s. It was the config used for the Qwen prefill work and for the 19.5 figure in `docs/perf-baselines.md`; it is not
+`configs/testing/qwen4exp_3090_only.toml` (the prefill benchmark config: partial residency plus the RAM tier, UD-IQ1_M) decodes at
+19.5 tok/s. It was the config used for the Qwen prefill work and for the 19.5 figure in `configs/bench/perf-baselines.md`; it is not
 a decode-tuned placement.
 
 ## Raw logs (not committed; `logs/` is untracked)

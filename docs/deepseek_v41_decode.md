@@ -29,7 +29,7 @@ are excluded. The code prompt remains below 5 tok/s; the target is reached
 for the combined workload, not guaranteed for every prompt. Prefill speed
 has not been optimized in this decode-focused work.
 
-Use `configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml`. It retains the
+Use `configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml`. It retains the
 3090's 17 GiB main expert pool and approximately 100 GiB DDR capacity, adds
 the 5060 Ti's 13.5 GiB main expert pool, and splits the existing 64 active
 slots into 48 on the 3090 and 16 on the 5060 Ti. Decode async prewarm is off:
@@ -116,7 +116,7 @@ For the configured build used during this investigation:
 cmake --build /tmp/zeromoe-v41-build --target zeromoe -j4
 CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DEEPSEEK_V41_FULL_GRAPH=1 \
   /tmp/zeromoe-v41-build/zeromoe \
-  --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml
+  --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml
 ```
 
 The standalone numerical regression test uses the real CPU AVX-512 dot and

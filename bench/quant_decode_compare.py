@@ -18,8 +18,8 @@ from pathlib import Path
 from option_b_global_pool_check import ROOT, A, setting
 
 MODELS = {
-    "Q2": "/data/sdb/models/qwen3.8-flash-next/Q2_0",
-    "IQ1": "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+    "Q2": os.environ.get("ZEROMOE_QWEN_Q2_MODEL"),
+    "IQ1": os.environ.get("ZEROMOE_QWEN_IQ1_MODEL"),
 }
 
 
@@ -48,6 +48,11 @@ def main():
     args = p.parse_args()
     if args.reps < 1 or args.ngen < 4:
         p.error("need positive reps and at least 4 generated tokens")
+    missing_models = [name for name in args.models if not MODELS[name]]
+    if missing_models:
+        p.error("set " + " and ".join(
+            f"ZEROMOE_QWEN_{name}_MODEL" for name in missing_models
+        ))
     out = args.out_dir.resolve()
     out.mkdir(parents=True, exist_ok=args.resume)
     engine = args.engine.resolve()

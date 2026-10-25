@@ -60,7 +60,7 @@ cmake --build build_b11401 --target zeromoe -j12
 
 ## 5. Configuration
 
-Config file: `configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml`. Root keys must stay before the first `[[gpus]]` table.
+Config file: `configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml`. Root keys must stay before the first `[[gpus]]` table.
 
 Keys that define this baseline:
 
@@ -102,7 +102,7 @@ cd /home/ray/Projects/ZeroMoE
 nvidia-smi; pgrep -af zeromoe     # GPU co-existence guard: nothing else on the GPU
 export ZEROMOE_GLM5NEXT_FULL_GRAPH=1 ZEROMOE_GLM5NEXT_ALLOC_FLOOR_MIB=512 ZEROMOE_GLM5NEXT_CPU_THREADS=6
 echo "Write an extremely long and detailed 4000-word essay about the history, mathematics and engineering of mixture of experts models. Do not stop early." \
-  | ./build_b11401/zeromoe --config configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --ngen 1500 \
+  | ./build_b11401/zeromoe --config configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml --ngen 1500 \
   > logs/glm53flash_aj_run.log 2>&1
 ```
 
@@ -141,7 +141,7 @@ Per-token breakdown (ms), same profiler categories:
 Per layer (fused HC): attention 0.27 ms x 45; FFN 0.26 ms on a GPU-resident layer, about 3.6 ms on a CPU-expert layer.
 CPU experts move 54 MB/layer in about 3.46 ms (about 15.6 GB/s; single-core IQ2_XXS dot microbenchmark 3.05 GB/s/core).
 
-Other file for reference, `GLM-5.3-Flash-UD-IQ1_S` (93 GB, `configs/glm53flash_IQ1_wholelayer8_cpu.toml`, allocator floor 1024):
+Other file for reference, `GLM-5.3-Flash-UD-IQ1_S` (93 GB, `configs/testing/glm53flash_IQ1_wholelayer8_cpu.toml`, allocator floor 1024):
 ZeroMoE 6.87 tok/s over 1,500 tokens vs neurall 6.99 +/- 0.03. With 7 more layers on the 5060 Ti: 6.85 tok/s at 1,500 tokens (the 5060 Ti helps because more
 layers leave the CPU; single-GPU comparisons were requested for the record).
 
@@ -162,7 +162,7 @@ History on this file/box: 2.70 tok/s (first working full-graph decode) -> 4.7 (L
   CPU thread setting; allocator-floor override; optional 5060 Ti expert path (`GPU1_LAYERS`); layer-timing instrumentation; VRAM-reference expert
   stride/offset fixes.
 - `include/gpu_topology.hpp`: `compact_layer_slot_counts` now skips dense layers (slab size 0) instead of `break`, so `vram_cache_full_layer_prefix` works.
-- Configs: `configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml` (baseline), `configs/glm53flash_IQ1_wholelayer8_cpu.toml` and friends.
+- Configs: `configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml` (baseline), `configs/testing/glm53flash_IQ1_wholelayer8_cpu.toml` and friends.
 - Not done: the reusable-graph 12 tok/s target and the Qwen conditional CUDA node (neurall itself reaches about 7.4 tok/s on this file and hardware);
   the Qwen4Exp smoke test on the rebased ggml.
 
@@ -171,7 +171,7 @@ History on this file/box: 2.70 tok/s (first working full-graph decode) -> 4.7 (L
 Same VRAM budget as the 8-whole-layer baseline (15.8 GB = 2,341 slots), spent as 7 whole layers (3-9) plus two half layers (18 and 19, about 162 experts each,
 the most concentrated layers in the fresh routing profile).
 
-- Config: `configs/glm53flash_AJ_IQ2XXS_7full_2half.toml` (`vram_cache_full_layer_prefix = 10` so only layers 0-9 get whole regions, `cpu_affinity_layers` = 10-17 and 20-44,
+- Config: `configs/testing/glm53flash_AJ_IQ2XXS_7full_2half.toml` (`vram_cache_full_layer_prefix = 10` so only layers 0-9 get whole regions, `cpu_affinity_layers` = 10-17 and 20-44,
   `pin_file = .zeromoe_usage_glm53flash_aj_tap`).
 - Result (quiet-machine ABBA, median ms/token): 8 whole layers 139.4 / 140.4 (7.15 tok/s) vs 7 whole + 2 half **136.75 / 136.79 (7.31 tok/s), 2.2% faster**.
 - Requires the `-1` sentinel fix in `partial_map` (`src/ggml_glm5next_graph.cpp`): routes a branch does not own used to map to expert 0 (computed then masked), so the CPU cold

@@ -38,7 +38,7 @@ layer indices where the ratio first crosses 2× / 5× / 10× / 30×.
 ## Prerequisites (set once)
 
 1. **ZeroMoE built** on the Linux+CUDA box: `./build/zeromoe` exists.
-   Know which config you normally run (e.g. `configs/glm52_dual.toml`).
+   Know which config you normally run (e.g. `configs/testing/glm52_dual.toml`).
 2. **colibri built (CPU)**: `cd /path/to/colibri/c && make glm`. CPU-only is the
    default (`CUDA=0`); do NOT set `COLI_CUDA=1` on a CPU-only binary.
 3. **colibri's int4 model**: HF `jlnsrk/GLM-5.2-colibri-int4` on disk, with
@@ -47,10 +47,10 @@ layer indices where the ratio first crosses 2× / 5× / 10× / 30×.
 Set the paths via env vars (defaults are placeholders you must override):
 
 ```bash
-export ZEROMOE_CONFIG=configs/glm52_dual.toml
+export ZEROMOE_CONFIG=configs/testing/glm52_dual.toml
 export ZEROMOE_BIN=./build/zeromoe
 export COLIBRI_SNAP=/path/to/GLM-5.2-colibri-int4
-export COLIBRI_GLM=/Users/rayxu/project/colibri/c/glm
+export COLIBRI_GLM=/path/to/colibri/c/glm
 ```
 
 ## Run it

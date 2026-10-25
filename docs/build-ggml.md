@@ -44,11 +44,11 @@ op-offloaded prefill sets it, effect unmeasured), 0011 (bridge-only variant of 0
 Verified: every `ggml_*`, `gguf_*` and `zeromoe_*` symbol the branch's binary imports is present in the
 patched sources.
 
-## Other ggml trees on this machine (not used)
+## Choosing a ggml source tree
 
-`build_ggmlcuda` (beellama ggml 0.22.0) lacks `ggml_prec_set_src`, `ggml_prec_set_acc`, the f32 quant hook
-and the negative-skip symbols; `llama.cpp-moestream-integration` has the negative-skip work natively but no
-copy callback; `/var/tmp/dsv41_env/f32-libs` belongs to another session.
+Build from a clean upstream llama.cpp checkout at the pinned commit. Do not reuse
+an unrelated or previously patched ggml tree unless its revision and patch state
+have been verified.
 
 ## Verified (2026-10-23, binary `build_mimo` linked to `build_ggml`)
 
@@ -63,7 +63,7 @@ copy callback; `/var/tmp/dsv41_env/f32-libs` belongs to another session.
 
 ## Master build (2026-10-23)
 
-`scripts/build_ggml.sh /home/ray/Projects/ZeroMoE/build_master_ggml` then
+`GGML_REPO=/path/to/llama.cpp scripts/build_ggml.sh build_master_ggml` then
 `GGML_ROOT=build_master_ggml/ggml-src/ggml GGML_PREBUILT=build_master_ggml/ggml-build scripts/build_with_ggml.sh build_master`
 in the main checkout, from the merged series: `build_master/zeromoe` (RUNPATH inside the main checkout).
 Ling short decode on it: 10.39 tok/s warm (4.49 on the first, JIT, run), tokens identical.

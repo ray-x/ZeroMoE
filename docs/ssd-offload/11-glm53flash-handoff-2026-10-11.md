@@ -24,7 +24,7 @@ output read for coherence before a timing was trusted, page cache dropped before
 | store | embedded expert blocks in an interleaved model, or a store striped over both NVMes: `OFFLOAD_STORE=/data/moestream-offload/glm53flash-stripe0.gguf:/home/ray/work/nvme1-store/glm53flash-stripe1.gguf` |
 | usage file | `docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt` |
 | other | `host_ram_gb=16` (>= ~16 needed for the dense tensors), `THP=0`, `CPU_THREADS=8`, `ALLOC_FLOOR_MIB=512`, `CUDA_VISIBLE_DEVICES=0`, `--ngen 96`, 5 topic-shifting prompts in one session |
-| older whole-layer baseline | `configs/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml` (8 MoE layers fully in VRAM, rest on CPU), 7.26 tok/s |
+| older whole-layer baseline | `configs/bench/glm53flash_AJ_IQ2XXS_wholelayer8_cpu.toml` (8 MoE layers fully in VRAM, rest on CPU), 7.26 tok/s |
 
 Layout/tools: `gguf_tool pack --expert-interleave` (4 KiB-aligned embedded `offload.blk.*` blocks, one preadv per expert; the engine reads
 the original GGUF or the packed one), `gguf_tool offload --expert-mod/--expert-rem` (store striped by expert parity over several drives;
@@ -199,7 +199,7 @@ GPU1 hot-expert upload at graph prepare now reads 16 experts in parallel: 21 s -
 
 ## Dense/trunk on the 5060 Ti (tested 2026-10-13, GLM-5.3-Flash, teacher-forced 48 tokens, 58 GiB pool)
 
-`CUDA_VISIBLE_DEVICES=1,0` with `bench/glm_swap_dense_5060.toml` (5060 Ti = core: dense 6.56 GiB + 6.05 GiB resident cache; 3090 = "GPU1"
+`CUDA_VISIBLE_DEVICES=1,0` with `configs/testing/glm_swap_dense_5060.toml` (5060 Ti = core: dense 6.56 GiB + 6.05 GiB resident cache; 3090 = "GPU1"
 hot set via `ZEROMOE_GLM5NEXT_GPU1_HOT_GIB`) and `ZEROMOE_GLM5NEXT_ASSIST_DEVICE=1` (ring on the 3090):
 
 | layout | resident experts | lane wait | lane compute | ms/token |
@@ -218,7 +218,7 @@ expert-vault design where uploads, not resident compute, set the cost.)
 `/data/sda/models/glm53flash/GLM-5.3-Flash-GSQ-RCO-3.0bit.gguf` (117 GB, arch string `glm5-next`): experts Q2_K in layers 9-44, Q3_K 6-8,
 Q4_K 3-5; attention, shared experts, head and embedding Q8_0 (dense 9.6 GiB vs 6.8 for AJ); no imatrix keys. Needed two engine fixes
 (`glm5-next` alias in `model_family.hpp`; Q2_K/Q3_K plane sizes in `offload_store.hpp`'s `ggml_row_bytes`). Run with
-`bench/glm_gsq_rco_dual.toml` (`moe_cache_gb = 12.4` so the 8.96 GiB dense arena fits), `OFFLOAD_DDR_GIB=90`, no store (experts read
+`configs/testing/glm_gsq_rco_dual.toml` (`moe_cache_gb = 12.4` so the 8.96 GiB dense arena fits), `OFFLOAD_DDR_GIB=90`, no store (experts read
 from the model: ~190 s to seed 8,974 experts from the SATA SSD), 3090 + 5060 Ti (`GPU1_HOT_GIB=14.2`), teacher-forced 48 tokens:
 
 | GPU assist | ms/token | tok/s | lane wait / compute |
@@ -277,7 +277,7 @@ prompts (weight 10) 35.9%, training prompts alone 35.8%, oracle 28.0%. On the be
 36.0% new cold routes, and end-to-end 68.8 / 69.3 ms vs 69.9 / 69.0 ms (logits 91.7% top-1, KL 0.056 = placement noise). So the refit
 fixes a poor ranking on dissimilar prompts, but is no speed-up on prompts the current ranking already fits.
 `docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt` is the refit file (base + all 40 prompts at weight 10); use it with
-`pin_file` in the toml, `ZEROMOE_GLM5NEXT_OFFLOAD_USAGE` and `ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE` (`bench/glm_dual_ranking40.toml`).
+`pin_file` in the toml, `ZEROMOE_GLM5NEXT_OFFLOAD_USAGE` and `ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE` (`configs/testing/glm_dual_ranking40.toml`).
 
 ### Reaching 15 tok/s: recipe and what actually decides it (2026-10-14)
 

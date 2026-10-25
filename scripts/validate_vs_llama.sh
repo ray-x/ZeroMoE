@@ -4,7 +4,7 @@
 #
 #   scripts/validate_vs_llama.sh <model.gguf> <zeromoe.toml> ["prompt"] [steps] [zeromoe-binary]
 #
-# Env: LLAMA_SRC   llama.cpp source tree        (default /home/ray/Projects/llama.cpp)
+# Env: LLAMA_SRC   llama.cpp source tree        (default ../llama.cpp)
 #      LLAMA_BUILD llama.cpp build with the libs (default $LLAMA_SRC/build-avx512-stock, an UNPATCHED build)
 #      DEVS        CUDA_VISIBLE_DEVICES for ZeroMoE (default 0,1)
 #      MS_ENV      extra env for ZeroMoE, e.g. "ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100"
@@ -13,7 +13,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 MODEL=${1:?model.gguf} CONFIG=${2:?zeromoe.toml} PROMPT=${3:-The capital of France is} STEPS=${4:-8}
 BIN=${5:-./build_master/zeromoe}
-LLAMA_SRC=${LLAMA_SRC:-/home/ray/Projects/llama.cpp}
+LLAMA_SRC=${LLAMA_SRC:-../llama.cpp}
 LLAMA_BUILD=${LLAMA_BUILD:-$LLAMA_SRC/build-avx512-stock}
 OUT=${OUT:-logs/validate_$(date +%Y%m%d_%H%M%S)}
 mkdir -p "$(dirname "$OUT")"

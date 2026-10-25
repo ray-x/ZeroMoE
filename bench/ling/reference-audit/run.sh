@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
+# Set LING_MODEL to the model file or shard directory before running.
 set -euo pipefail
 worktree=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
+model=${LING_MODEL:?set LING_MODEL to the model file or shard directory}
+[[ -r "$model" ]] || { echo "Ling model path is not readable: $model" >&2; exit 2; }
 # Binary override: LING_BIN lets the regression gate certify a specific candidate
 # instead of the hardcoded worktree build.
 bin=${LING_BIN:-$worktree/build-ling/zeromoe}
@@ -12,7 +15,7 @@ context_size=${LING_CONTEXT_SIZE:-64}
 freeze_usage_stats=${LING_FREEZE_USAGE_STATS:-1}
 log=${LING_LOG:-/tmp/ling-reference-$(date -u +%Y%m%dT%H%M%S).log}
 config=$(mktemp /tmp/ling-reference-config.XXXXXX.toml)
-python3 - "$worktree/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$context_size" <<'CONFIG'
+python3 - "$worktree/configs/bench/ling/reference-audit/config.toml" "$config" "$profile" "$prefill_profile" "$freeze_usage_stats" "$context_size" "$model" <<'CONFIG'
 from pathlib import Path
 import json, os, re, sys
 pool=int(os.environ.get('LING_DDR_GIB','64')); cap=int(os.environ.get('LING_CAP_GIB','95'))
@@ -32,6 +35,9 @@ assert early_ready in (0, 1), 'LING_EARLY_READY must be 0 or 1'
 assert 0.0 < gpu0_cache <= 8.0 and 0.0 < gpu1_cache <= 14.0, 'GPU cache requests must be in range (0,8] + (0,14] GiB'
 assert 0 <= pinned_vram_capacity <= 6000, 'LING_PINNED_VRAM_CAPACITY must be between 0 and 6000'
 s=Path(sys.argv[1]).read_text()
+model_path=Path(sys.argv[7]).resolve()
+s,n_model=re.subn(r'^model_path = .*$', 'model_path = '+json.dumps(str(model_path)), s, count=1, flags=re.M)
+assert n_model == 1, 'Expected one model_path entry'
 context_size=int(sys.argv[6])
 assert 64 <= context_size <= 131072, 'LING_CONTEXT_SIZE must be between 64 and 131072'
 s=re.sub(r'^pin_file = .*$', 'pin_file = '+json.dumps(str(Path(sys.argv[3]).resolve())), s, flags=re.M)
@@ -53,7 +59,6 @@ minimum_kb=120500000
 if [[ ! "$freeze_usage_stats" =~ ^(0|false|no)$ ]]; then
   [[ -s "$profile" ]]
 fi
-[[ -r /home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf ]]
 grep -q 'MemorySwapMax=0' "$worktree/scripts/run_capped.sh"
 exec > >(tee "$log") 2>&1
 exec 9>/tmp/zeromoe-host-admission.lock
@@ -61,10 +66,12 @@ if ! flock -n 9; then
   echo '[PREFLIGHT] shared admission lock is held; not starting.'
   exit 31
 fi
-python3 - "$minimum_kb" <<'PY'
+python3 - "$minimum_kb" "$worktree" <<'PY'
 from pathlib import Path
 import os, sys, time
 minimum_kb=int(sys.argv[1])
+project_root=str(Path(sys.argv[2]).resolve()).lower()
+llama_root=str(Path(os.environ.get('LLAMA_SRC', Path(sys.argv[2]).resolve().parent/'llama.cpp')).resolve()).lower()
 # Ignore this script, the checker, and their launcher ancestors. ZeroMoE
 # acquires the same admission lock before model initialization.
 ancestors=set()
@@ -90,7 +97,7 @@ for p in Path('/proc').iterdir():
     joined=' '.join(args).lower()
     if comm in names or (comm.startswith('llama-')):
         blocked.append(f'{p.name} {comm}: {joined[:260]}')
-    elif comm in builders and any(x in joined for x in ('/home/ray/projects/zeromoe','/home/ray/projects/llama.cpp')):
+    elif comm in builders and any(x in joined for x in (project_root, llama_root)):
         blocked.append(f'{p.name} {comm}: {joined[:260]}')
     elif comm in {'bash','sh','systemd-run','flock'} and any(x in joined for x in ('build-ling/zeromoe','build_g7/zeromoe','llama-server','llama-cli','llama-bench','abrun.sh','run_split_queue58.sh','run_dsa_graph2g.sh')):
         blocked.append(f'{p.name} {comm}: {joined[:260]}')
@@ -118,7 +125,7 @@ export ZEROMOE_GLM5NEXT_ASSIST2_SLOTS=${LING_ASSIST2_SLOTS:-1}
 export ZEROMOE_GLM5NEXT_CPU_THREADS=${LING_CPU_THREADS:-10}
 export ZEROMOE_GLM5NEXT_EARLY_READY=${LING_EARLY_READY:-1}
 export ZEROMOE_LING_OFFLOAD_FIRST_LAYER=4
-export ZEROMOE_LING_OFFLOAD_MODEL=/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf
+export ZEROMOE_LING_OFFLOAD_MODEL="$model"
 export ZEROMOE_LING_OFFLOAD_USAGE="$profile"
 export ZEROMOE_LING_OFFLOAD_DDR_GIB=${LING_DDR_GIB:-64}
 export ZEROMOE_LING_OFFLOAD_PINNED=${LING_OFFLOAD_PINNED:-0.5}

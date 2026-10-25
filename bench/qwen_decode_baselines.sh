@@ -25,7 +25,7 @@ case "$MODE" in
     rm -f "$LOG.log" "$LOG.engine.log"
     # context 416 = 16-token prompt + 400 tokens; a longer prompt+gen pushes the last token onto the legacy path and fakes a gap
     sed -E "s/^omp_max_threads.*/omp_max_threads = $THREADS/; s/^max_new_tokens.*/max_new_tokens = $NTOK/; s#^log_path.*#log_path = \"$LOG.engine.log\"#" \
-      configs/qwen4exp_tg400_iq1m_22_26.toml > "$TMP/cfg.toml"
+      configs/bench/qwen4exp_tg400_iq1m_22_26.toml > "$TMP/cfg.toml"
     # "Tell a story." is 4 tokens; with the chat template the prompt is 16 tokens ([PREFILL-DONE] must say 16)
     rc=0
     printf 'Tell a story.\n:q\n' | env CUDA_VISIBLE_DEVICES=0 \
@@ -41,11 +41,12 @@ case "$MODE" in
     ;;
   hybrid)
     # K=14000, not the 14554 of docs/qwen-decode-baselines-2026-10-16.md: with the pinned graph-RAM arenas (the Qwen default)
-    # 14554 leaves 0.98 GiB free after a long prefill and the decode graph is refused (floor 1.00 GiB). See docs/perf-baselines.md.
+    # 14554 leaves 0.98 GiB free after a long prefill and the decode graph is refused (floor 1.00 GiB). See configs/bench/perf-baselines.md.
     K=${2:-14000}; NGEN=${3:-200}; THREADS=${4:-10}
+    : "${ZEROMOE_MODEL_PATH:?set ZEROMOE_MODEL_PATH to the Qwen3.8-Flash-Next Q2_0 model directory (the configs ship a placeholder)}"
     LOG=logs/qwen_decode_hybrid_K${K}_$STAMP
     sed -E "s/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = $K/; s/^omp_max_threads.*/omp_max_threads = $THREADS/; s#^log_path *=.*#log_path = \"$LOG.engine.log\"#" \
-      configs/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
+      configs/qwen38-flash.toml > "$TMP/cfg.toml"
     nvidia-smi --id=0 --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "$LOG.csv" &
     SP=$!
     echo "Explain briefly the key concepts of neural networks and gradient descent in plain English." | env CUDA_VISIBLE_DEVICES=0 \

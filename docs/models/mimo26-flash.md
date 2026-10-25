@@ -32,7 +32,7 @@ direct answer.
 
 ## Initial recipe
 
-`configs/mimo26_flash_gsq_rco_3bit.toml` uses a 2048-token context, bounded
+`configs/mimo26-flash.toml` uses a 2048-token context, bounded
 native DDR/VRAM expert caches and two GPUs. It is a correctness profile,
 not a performance recommendation. Expert reads use the model's backing file;
 no separate offload store is created.
@@ -40,7 +40,7 @@ no separate offload store is created.
 ```bash
 ZEROMOE_DISABLE_ROUTER_BF16=1 CUDA_VISIBLE_DEVICES=0,1 \
   scripts/run_capped.sh --limit-gb 100 -- build_mimo/zeromoe \
-  --config configs/mimo26_flash_gsq_rco_3bit.toml --ngen 16
+  --config configs/mimo26-flash.toml --ngen 16
 ```
 
 Enter a prompt through stdin/the REPL, then `:q` to exit. In this engine's
@@ -168,7 +168,7 @@ Recommended next framework work:
 
 MiMo's routed MoE runs through the shared `build_moe_block` (hot experts alias
 the VRAM expert cache, cold experts come from the shared offload DDR tier, with
-the early-ready CPU lane for decode). Config: `configs/mimo26_flash_gsq_rco_3bit_ingraph_3090.toml`
+the early-ready CPU lane for decode). Config: `configs/testing/mimo26_flash_gsq_rco_3bit_ingraph_3090.toml`
 (one GPU) and `..._ingraph_dual.toml` (3090 + 5060 Ti second hot set, untested).
 
 Measured (3090 only, 15 GiB cache = 1,647 hot experts, 80 GiB offload DDR, assist off,
@@ -190,7 +190,7 @@ Next: run the dual-GPU config, freeze a surveyed usage profile, A/B the GPU-assi
 
 ## Measured results (2026-10-22, dual GPU: RTX 3090 + RTX 5060 Ti)
 
-Config `configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` (12 GiB / 14.5 GiB expert caches =
+Config `configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` (12 GiB / 14.5 GiB expert caches =
 1,317 + 1,592 hot experts), 80 GiB offload DDR tier, assist ring off, 10 CPU threads. Run via
 `ZEROMOE_MIMO2_*` env (see ggml_mimo2_graph.cpp). Placement preflight: coverage 12032/12032.
 
@@ -221,7 +221,7 @@ for ~2 minutes (not reproduced; no competing process seen in the next runs).
 
 The new idle-VRAM preflight check found 5.4 GiB free on the 3090 after the graph was built (with the unused
 active-layer pool dropped). Raising `moe_cache_gb` for GPU 0 to 15 GiB in
-`configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` leaves 2.6 GiB free (5060 Ti unchanged at 1.7 GiB) and
+`configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml` leaves 2.6 GiB free (5060 Ti unchanged at 1.7 GiB) and
 gave decode 13.86 / 15.65 / 15.84 / 15.33 tok/s (was 13.43 / 15.05 / 15.43 / 14.73) and prefill
 25.8 / 43.8 / 76.8 / 80.2 tok/s (was 24.9 / 41.4 / 74.7 / 77.8). The generated tokens differ from the
 12 GiB run from token 13 of the first prompt (a different hot set moves experts between the GPU and CPU

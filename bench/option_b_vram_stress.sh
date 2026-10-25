@@ -28,7 +28,7 @@ open(sys.argv[1], "w").write(text[:1100] + " Question: summarize the text above 
 EOF
 fi
 sed -E "s/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = $K/; s#^log_path *=.*#log_path = \"logs/$TAG.engine.log\"#" \
-  configs/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
+  configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
 LONG=$(cat "$LONGFILE")
 SHORT="Explain briefly the key concepts of neural networks and gradient descent in plain English."
 while pgrep -x zeromoe >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-compute-apps=pid --format=csv,noheader)" ]]; do sleep 3; done

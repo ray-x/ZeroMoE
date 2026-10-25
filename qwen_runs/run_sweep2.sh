@@ -3,7 +3,7 @@
 set -u
 W=/home/ray/work/moestream-graph; cd $W
 OUT=$W/qwen_runs/${SUB:-run_x}; mkdir -p $OUT; ENG=$W/build_acc/zeromoe
-BASE=${BASEFILE:-$W/configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml}
+BASE=${BASEFILE:-$W/configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml}
 for p in nvtop htop; do pgrep -x $p >/dev/null && { echo "ABORT: $p running"; exit 2; }; done
 [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ] && { echo "ABORT: GPU busy"; exit 2; }
 for N in ${@:-191 96 48 280 191}; do

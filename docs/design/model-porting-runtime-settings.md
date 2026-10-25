@@ -105,7 +105,7 @@ Keep the complete launch command with each baseline. For example, a Qwen4Exp gra
 CUDA_VISIBLE_DEVICES=0 \
 ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-./build/zeromoe --config configs/qwen4exp_3090_only_decode_batched.toml --ngen 8
+./build/zeromoe --config configs/testing/qwen4exp_3090_only_decode_batched.toml --ngen 8
 ```
 
 That command illustrates feature-gate handling, not a portable placement or memory recipe. Choose the profile and placement values for the target hardware, then verify the resolved values and actual arena in the logs.

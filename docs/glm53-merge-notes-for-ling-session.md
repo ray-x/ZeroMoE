@@ -33,7 +33,7 @@ These files are used by both families. Review them if Ling behaves differently a
 - Build: Release, `zeromoe` and `zeromoe_tests`, clean on the final tree.
 - GLM, final tree (80 tokens, no swap, retarget on, 64 GiB pool): 2.04 tok/s first-to-last, Rates decode 1.92; text coherent
   ("How a Transformer Language Model Generates Text ..."). Log: `logs/split_ab_final.*` in the worktree.
-- Ling smoke (first merge, before `7bda5da`), `configs/ling-3.1-flash-fullgraph.toml`, `--ngen 12 --temp 0`, prompt "Hi there":
+- Ling smoke (first merge, before `7bda5da`), `configs/ling31-flash.toml`, `--ngen 12 --temp 0`, prompt "Hi there":
 
   | Build | Decode | First-to-last |
   |---|---|---|

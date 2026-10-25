@@ -50,7 +50,7 @@ branch in `execution_layer.cpp`; `device_full_attn_input` in
 
 Kept: `qwen4exp_conv1d_silu_gpu_host` + `gdn_conv1d.cu` (also used by GLM KDA).
 
-Verification (build_ggmlcuda, `configs/qwen4exp_tg400_iq1m_22_26.toml`,
+Verification (build_ggmlcuda, `configs/bench/qwen4exp_tg400_iq1m_22_26.toml`,
 `--ngen 64`, prompt "Tell a story.", greedy):
 - generated text byte-identical before/after
 - decode-wall: before 23.20 (cold, first run) / 25.13 (warm rerun); after 25.63 tok/s

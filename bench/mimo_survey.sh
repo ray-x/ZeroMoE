@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 MODE=${1:?survey|eval|long} PROFILE=${2:?profile path}
 BIN=${3:-./build_master/zeromoe}
-CONFIG=configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml
+CONFIG=configs/bench/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml
 BASE_PROFILE=.zeromoe_usage_mimo26_gsq_rco3
 COMMON=(ZEROMOE_DISABLE_ROUTER_BF16=1 CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100)
 mkdir -p logs

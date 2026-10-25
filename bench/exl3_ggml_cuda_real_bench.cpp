@@ -137,8 +137,11 @@ const Exl3LinearInfo *select_matrix(const Exl3Contract &contract) {
 
 int main(int argc, char **argv) {
   try {
+    const char *model_env = std::getenv("ZEROMOE_EXL3_MODEL");
     const std::string model_path =
-        argc > 1 ? argv[1] : "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw";
+        argc > 1 ? argv[1] : (model_env ? model_env : "");
+    if (model_path.empty())
+      throw std::runtime_error("pass <model_dir> or set ZEROMOE_EXL3_MODEL");
     const int iterations = argc > 2 ? std::atoi(argv[2]) : 100;
     const int device = argc > 3 ? std::atoi(argv[3]) : 0;
     bool capture = false;

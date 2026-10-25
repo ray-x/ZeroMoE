@@ -8,7 +8,9 @@
 set -uo pipefail
 bin=$(readlink -f "$1"); tag=$2; a=$3; b=$4; rounds=${5:-2}
 here=$(cd "$(dirname "$0")" && pwd); out=$here/../logs/perf; mkdir -p "$out"
-touch ~/work/.no-arms; trap 'rm -f ~/work/.no-arms' EXIT
+flag=${NO_ARMS_FLAG:-${TMPDIR:-/tmp}/zeromoe-no-arms}
+export NO_ARMS_FLAG=$flag
+touch "$flag"; trap 'rm -f "$flag"' EXIT
 for r in $(seq 1 "$rounds"); do
   if [ $((r % 2)) = 1 ]; then order="A B"; else order="B A"; fi
   for arm in $order; do

@@ -16,7 +16,7 @@ K=${1:?usage: $0 K [ngen] [gpu]}; NGEN=${2:-200}; GPU=${3:-0}
 TAG=optb_probe_K$K
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 sed -E "s/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = $K/; s#^log_path *=.*#log_path = \"logs/$TAG.engine.log\"#" \
-  configs/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
+  configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
 mkdir -p logs
 while pgrep -x zeromoe >/dev/null || [[ -n "$(nvidia-smi --id="$GPU" --query-compute-apps=pid --format=csv,noheader)" ]]; do sleep 3; done
 nvidia-smi --id="$GPU" --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 250 > "logs/$TAG.csv" &

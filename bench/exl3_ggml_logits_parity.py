@@ -12,8 +12,8 @@ from compare_decode_logits import compare
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
-DEFAULT_CONFIG = ROOT / "configs/qwen4exp_iq1m_fullgraph_22_26.toml"
+DEFAULT_MODEL = os.environ.get("ZEROMOE_EXL3_MODEL")
+DEFAULT_CONFIG = ROOT / "configs/testing/qwen4exp_iq1m_fullgraph_22_26.toml"
 
 
 def require_idle(min_ram_gib):
@@ -100,6 +100,8 @@ def main():
     args = parser.parse_args()
     if args.tokens <= 0:
         parser.error("--tokens must be positive")
+    if not args.model:
+        parser.error("pass --model or set ZEROMOE_EXL3_MODEL")
     if not args.engine.is_file() or not args.base_config.is_file():
         parser.error("engine or base config does not exist")
 

@@ -1,0 +1,89 @@
+# MiMo V2.6 Flash 3-bit, in-graph hot/cold MoE, RTX 3090 (trunk) + RTX 5060 Ti (second hot set) (R2.1 conformance run).
+# Hot experts alias the 3090's VRAM expert cache; the rest live in the offload DDR tier
+# (ZEROMOE_MIMO2_OFFLOAD_DDR_GIB / _USAGE). The engine RAM tier stays small like Ling's.
+# MiMo throughput investigation profile, modeled on GLM 5.3 Flash's
+# no-decode-time-SSD whole-layer baseline: fill DDR from the GGUF at startup,
+# keep only a bounded surveyed hot set pinned in VRAM, and leave VRAM LRU room.
+# This is not a separate SSD offload store.
+model_path = "/path/to/model-or-shard-directory"
+context_size = 2048
+max_new_tokens = 96
+temperature = 0.0
+top_p = 1.0
+enable_thinking = false
+reasoning_effort = "low"
+mtp_enabled = false
+prompt_cache = false
+log_level = "INFO"
+
+# With this model, the measured GLM-like sizing requires checking actual RAM
+# admission and the cgroup limit before raising either value further.
+host_ram_gb = 99.0
+ram_pinned_budget_gb = 8.0
+ram_preload_all_experts = false
+freeze_usage_stats = true
+pin_file = "bench/profiles/mimo26_combined.usage"
+prefill_pin_file = "bench/profiles/mimo26_prefill.usage"
+# embedding_device = "auto"  (CPU/DDR for every model; "gpu" forces the VRAM copy)
+pin_topk_per_layer = 0
+pin_strategy = "global_topn"
+pin_global_floor_per_layer = 1
+# Leave 605 of 2205 cache slots available for reactive residency/promotion.
+pinned_vram_capacity = 0
+pin_vram_lru_fraction = 0.0
+pin_ram_fraction = 0.0
+# The Mimo graph uses the native miss path: VRAM-resident expert bytes are
+# consumed directly, so use a global disjoint ranking for the DDR tier too.
+pin_global_tiers = true
+vram_evict_demote_to_ram = true
+
+direct_io = false
+io_uring = true
+drop_pages = true
+omp_max_threads = 6
+attn_score_threads = 6
+expert_fetch_threads = 4
+prefetch_worker_threads = 2
+# prefill_batch_tokens: unset = the graph's chunk (512, family override); a value here sets the chunk for this run.
+moe_prefill_batched = true
+# Group the eight decode experts into one GGML routed graph per layer. The
+# implementation is shared with the established grouped runner; MiMo uses the
+# simple host-input/output form because it has no HC or shared expert.
+moe_ggml_mul_mat_id = true
+moe_ggml_device = 0
+expert_gpu_activation = true
+moe_gpu_accum = true
+glm5next_router_gpu = false
+use_active_layer_area = true
+active_layer_capacity = 16
+active_layer_promote_hit_threshold = 1
+active_layer_upload_worker_threads = 1
+move_on_promotion = true
+ram_cache_total_experts = 0
+
+[[gpus]]
+device_id = 0
+name = "NVIDIA GeForce RTX 3090"
+role = "dense+moe"
+vram_gb = 24.0
+kv_cache_gb = 1.0
+dense_gb = 7.0
+moe_cache_gb = 15.0
+# VRAM fit: the cache fills what dense, KV and the graph leave; moe_cache_gb above is then ignored. 2.65 GB = the
+# graph's measured post-cache need on this GPU (KV, ring, 512-token prefill buffers: 2.15 GB) + 0.5 GB margin.
+moe_cache_reserve_gb = 2.65
+active_layer_weight = 1
+active_layer_capacity_slots = 16
+
+[[gpus]]
+device_id = 1
+name = "NVIDIA GeForce RTX 5060 Ti"
+role = "moe"
+vram_gb = 16.0
+kv_cache_gb = 0.0
+dense_gb = 0.0
+moe_cache_gb = 14.5
+# 1.0 GB outside the cache (driver ~1 GB included): measured peak need after the cache is 0.3 GB.
+moe_cache_reserve_gb = 1.0
+active_layer_weight = 1
+active_layer_capacity_slots = 16

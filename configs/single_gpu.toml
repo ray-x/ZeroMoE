@@ -2,7 +2,7 @@
 # Everything on one RTX 3090: dense + KV + expert cache
 # Context reduced to 64k to fit in 24 GB
 
-model_path = "/models/GLM-5.2-UD-IQ2_M/"
+model_path = "/path/to/model-or-shard-directory"
 
 context_size   = 65536
 max_new_tokens = 2048

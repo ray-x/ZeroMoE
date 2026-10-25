@@ -9,19 +9,20 @@ The profile fields follow the design review: key by **hardware, model dimensions
 memory budgets and execution phase**, and record **prefill throughput, time-to-first-token,
 decode throughput, peak memory, and the selected strategy**.
 
-| Model | Family (GGUF arch) | Quant | Decode band (tok/s) | File |
-|---|---|---|---|---|
-| Qwen 3.8 Flash | `Qwen4Exp` (`qwen4exp`) | UD-IQ1_M | 22.0 – 30.0 | [`qwen38-flash.md`](qwen38-flash.md) |
-| GLM 5.3 Flash | `GLM5NEXT` (`glm5next`) | AJ-IQ2_XXS | 6.5 – 8.5 | [`glm53-flash.md`](glm53-flash.md) |
-| Ling 3.1 Flash | `BailingMoE3` (`bailingmoe3`) | AD-IQ1_S | 9.0 – 11.5 | [`ling31-flash.md`](ling31-flash.md) |
-| DeepSeek 4.1 Flash | `DeepSeek_V41` (`deepseek41`) | Q2_K | 1.8 – 3.2 | [`deepseek41-flash.md`](deepseek41-flash.md) |
-| GLM 5.3 | `GLM_DSA` (`glm-dsa`) | UD-IQ2_M | 1.8 – 2.4 | [`glm53.md`](glm53.md) |
+| Model | Family (GGUF arch) | Quant | Decode band (tok/s) | Starter profile | Model notes |
+|---|---|---|---|---|---|
+| Qwen 3.8 Flash | `Qwen4Exp` (`qwen4exp`) | Q2_0 | 39 – 43 | [`qwen38-flash.toml`](../../configs/qwen38-flash.toml) | [`qwen38-flash.md`](qwen38-flash.md) |
+| GLM 5.3 Flash | `GLM5NEXT` (`glm5next`) | AJ-IQ2_XXS | 6.5 – 8.5 | [`glm53-flash.toml`](../../configs/glm53-flash.toml) | [`glm53-flash.md`](glm53-flash.md) |
+| Ling 3.1 Flash | `BailingMoE3` (`bailingmoe3`) | AD-IQ1_S | 9.0 – 11.5 | [`ling31-flash.toml`](../../configs/ling31-flash.toml) | [`ling31-flash.md`](ling31-flash.md) |
+| DeepSeek 4.1 Flash | `DeepSeek_V41` (`deepseek41`) | Q2_K | 1.8 – 3.2 | [`deepseek41-flash.toml`](../../configs/deepseek41-flash.toml) | [`deepseek41-flash.md`](deepseek41-flash.md) |
+| GLM 5.3 | `GLM_DSA` (`glm-dsa`) | UD-IQ2_M | 1.8 – 2.4 | [`glm53-dsa.toml`](../../configs/glm53-dsa.toml) | [`glm53.md`](glm53.md) |
+| MiMo V2.6 Flash RL | `mimo2` (`mimo2`) | GSQ-RCO 3-bit | Not frozen | [`mimo26-flash.toml`](../../configs/mimo26-flash.toml) (experimental) | [`mimo26-flash.md`](mimo26-flash.md) |
 
 ## Baseline provenance
 
-MiMo V2.6 Flash RL onboarding is tracked in
-[`mimo26-flash.md`](mimo26-flash.md). It has no frozen baseline yet; correctness
-parity and a regression witness remain pending.
+MiMo V2.6 Flash RL is experimental: it has no frozen baseline yet, and
+correctness parity and a regression witness remain pending. The top-level
+profile is a correctness starter, not a performance recommendation.
 
 The decode bands above were measured once on the merged master (`1f17a99`), 2026-10-21, on the
 box in `docs/GLM5.3-baseline.md` §1: Xeon W-2235 (6C/12T, AVX-512 VNNI), 125 GiB RAM, RTX 3090
@@ -30,6 +31,9 @@ built Release with `ZEROMOE_GGML_ROOT=/home/ray/Projects/llama.cpp/ggml` and
 `ZEROMOE_GGML_PREBUILT_DIR=.worktrees/ling-3.1-flash/build-ling/ggml-build` (the prebuilt ggml
 that carries the early-CPU scheduler host-node hook — **an in-tree ggml build against the
 manually-edited fork silently drops this hook and disables the CPU lane**, see the "gotchas").
+
+The consolidated measurements and benchmark-only profiles are in
+[`configs/bench/perf-baselines.md`](../../configs/bench/perf-baselines.md).
 
 The bands are deliberately wide (≈±15 %) because the models are **not bit-deterministic** under
 near-tie routing and single-run decode spread is real (e.g. Qwen 24.6–28.7 tok/s). A regression is
@@ -43,14 +47,14 @@ A full run is ~15 min, so it is not needed for every change:
 |---|---|
 | Non-graph (tokenizer, config parsing, API server, docs, CPU-only kernels unrelated to the graph) | none — run `make test-components` |
 | Graph change in one model (model A) | before merge, run **one other model** as a witness (catches shared-machinery breakage cheaply) |
-| Major change / release candidate | run **all five** |
+| Major change / release candidate | run **all six** |
 
 Fast witnesses: `--models qwen38` (single 3090) or `--models ling31`.
 
 ## How to re-baseline / run the gate
 
 ```bash
-bench/regression_gate.sh ./build_master/zeromoe                  # all five (~15 min)
+bench/regression_gate.sh ./build_master/zeromoe                  # all six (~15 min)
 bench/regression_gate.sh ./build_master/zeromoe --models qwen38,ling31
 bench/regression_gate.sh ./build_master/zeromoe --models ling31   # one specific model
 bench/regression_gate.sh --help

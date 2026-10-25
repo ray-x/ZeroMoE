@@ -62,7 +62,7 @@ Key retained reference artifacts:
 
 ## Matched Option-B performance setup
 
-Use `configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml` as the baseline config. It right-sizes the static Option-B set to **8,421 resident experts / 10.842 GiB**. Both arms must use this exact set, independent of reported VRAM percentage. The legacy cache was a 6.44 GiB allocation with `0/4650` slots filled; it is dead VRAM, not resident MoE work. The accepted early-ready run can decode around 33.8 tok/s with the legacy cache off and this same 8,421-expert plan at roughly 15.4 GiB peak on the 3090 (~63%). Do not force 90% VRAM allocation just to match an old empty cache.
+Use `configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml` as the baseline config. It right-sizes the static Option-B set to **8,421 resident experts / 10.842 GiB**. Both arms must use this exact set, independent of reported VRAM percentage. The legacy cache was a 6.44 GiB allocation with `0/4650` slots filled; it is dead VRAM, not resident MoE work. The accepted early-ready run can decode around 33.8 tok/s with the legacy cache off and this same 8,421-expert plan at roughly 15.4 GiB peak on the 3090 (~63%). Do not force 90% VRAM allocation just to match an old empty cache.
 
 A prior branch-local, no-logit-dump six-pair A/B on binary hash `b2449d6e...` used the same config and logged 8,421 hot experts per graph, 10.842 GiB, and `0/0` legacy slots. It measured early-ready **17.77 tok/s** versus staged **15.06 tok/s**, `-15.25%`, zero staged wins. This is evidence for that exact build snapshot; rerun after the clean-folder build because the current r7 binary has a different hash.
 

@@ -1,7 +1,7 @@
 # GLM-5.3 decode baseline (RTX 3090 + RTX 5060 Ti, UD-IQ2_M, SSD-offloaded experts)
 
 Recorded 2026-10-20. Reference point for further GLM-5.3 work. Config, scripts and run recipe: `bench/glm53/`.
-The full trial log (Trials 1-47, including every negative result) is `docs/perf-baselines.md`.
+The full trial log (Trials 1-47, including every negative result) is `configs/bench/perf-baselines.md`.
 
 **Headline:** short-prompt decode **2.00-2.09 tok/s** first-to-last output (1.88-1.96 on the shutdown `Rates:` line), from 1.74-1.78 (Rates 1.65-1.68) with the same recipe and
 `ZEROMOE_OFFLOAD_RETARGET=0`. Page-reusing eviction is now on by default whenever SSD offload is active (`docs/offload-retarget.md`). A 300-token generation holds **1.91 tok/s** (Rates). A 426-token prompt decodes at **1.45-1.52 tok/s** (Rates; 1.52-1.59 first-to-last)
@@ -23,7 +23,7 @@ with a 74 GiB pool. Prefill 12.4-13.5 tok/s on the 426-token prompt (target 10).
 
 ## 2. Configuration
 
-Config file: `bench/glm53/glm53_dsa_core5060_retarget.toml` (`host_ram_gb = 100.0`, `ram_pinned_budget_gb = 80.0`, `freeze_usage_stats = true`, global_topn pin strategy).
+Config file: `configs/bench/glm53/glm53_dsa_core5060_retarget.toml` (`host_ram_gb = 100.0`, `ram_pinned_budget_gb = 80.0`, `freeze_usage_stats = true`, global_topn pin strategy).
 Environment recipe (set by `bench/glm53/run_ab.sh` + `run_dsa_graph2gpu.sh`):
 
 | Variable | Value | Role |
@@ -106,7 +106,7 @@ reclaimable cache; memory-mapping the dense weights (Trial 42) freed 10 GiB of a
   same late point (near-tie routing; ms/token and text vary run to run). The 300-token output is coherent.
 - Retarget moves only already-populated pages between slots that the cache has just evicted, under the arena lock; a failed `mremap` falls back to freeing the victim's pages.
 
-## 6. What does not help (measured, see `docs/perf-baselines.md`)
+## 6. What does not help (measured, see `configs/bench/perf-baselines.md`)
 
 Prefetch depth (3/3 is best, 8/8 is -17%), wider or confidence-based pilot (Trial 44, slower), demand-priority gate for reads (39), pool size beyond 64 GiB on short prompts (40),
 OMP binding/wait policy/thread count (26-27), IQ3 AVX-512VL dot (25, +1%), ranking refit (22, 38b), prompt-adaptive resident set oracle (+7.6% at best, 43), mapping dense weights (42),

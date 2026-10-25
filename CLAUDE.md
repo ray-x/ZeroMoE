@@ -131,7 +131,7 @@ trace_abort_if_nan("MY-TAG", contains_nan);
 ## 8. Supported Models, Builds and Validation (as of 2026-10-23)
 
 ### Models and where they are documented
-Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `docs/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. Full graph only: a graph that fails to build fails the request, there is no layered fallback.
+Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `configs/bench/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. Full graph only: a graph that fails to build fails the request, there is no layered fallback.
 
 ### Builds
 * Always configure with `-DCMAKE_BUILD_TYPE=Release` (an unset build type compiles without `-O`).

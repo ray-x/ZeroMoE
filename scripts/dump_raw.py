@@ -1,5 +1,9 @@
 import struct
-p='/Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD/Qwen3.6-35B-A3B-UD-IQ2_M.gguf'
+import sys
+
+p = sys.argv[1] if len(sys.argv) > 1 else None
+if not p:
+    raise SystemExit(f"usage: {sys.argv[0]} <model.gguf>")
 with open(p,'rb') as f:
     f.read(4); f.read(4); n_tensors,n_kv=struct.unpack('<QQ',f.read(16))
     def read_u64(): return struct.unpack('<Q',f.read(8))[0]

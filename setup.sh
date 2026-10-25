@@ -22,20 +22,20 @@ fi
 echo "  -> cmake: $(cmake --version | head -n 1)"
 echo "  -> g++: $(g++ -dumpversion)"
 
-# 2. Python Environment Setup for API Gateway
-echo "[2/4] Setting up Python virtual environment for Anthropic API..."
-if [ ! -d "api/venv" ]; then
-    python3 -m venv api/venv
-    source api/venv/bin/activate
-    if [ ! -f "api/requirements.txt" ]; then
-        echo -e "fastapi>=0.100.0\nuvicorn>=0.22.0\nsse-starlette>=1.6.0\npydantic>=2.0.0" > api/requirements.txt
+# 2. Optional Python environment for the API gateway
+if [ -f "api/api_server.py" ] && [ -f "api/requirements.txt" ]; then
+    echo "[2/4] Setting up Python virtual environment for the API..."
+    if [ ! -d "api/venv" ]; then
+        python3 -m venv api/venv
+        api/venv/bin/pip install --quiet --upgrade pip
+        api/venv/bin/pip install --quiet -r api/requirements.txt
+        echo "  -> Python virtual environment created and packages installed successfully."
+    else
+        echo "  -> Python virtual environment already exists. Skipping environment creation."
     fi
-    api/venv/bin/pip install --quiet --upgrade pip
-    api/venv/bin/pip install --quiet -r api/requirements.txt
-    echo "  -> Python virtual environment created and packages installed successfully."
 else
-    echo "  -> Python virtual environment already exists. Skipping environment creation."
-fi # Fixed missing fi statements
+    echo "[2/4] API server or requirements not present; skipping optional Python setup."
+fi
 
 # 3. C++/CUDA Binary Compilation via CMake
 echo "[3/4] Triggering CMake build pipeline..."
@@ -53,7 +53,9 @@ cd ..
 echo "----------------------------------------"
 echo "  ZeroMoE compilation complete!"
 echo "  -> Engine Core Executable: ./build/zeromoe"
-echo "  -> API Gateway: ./api/api_server.py"
-echo ""
-echo "To serve the Anthropic API endpoint, execute:"
-echo "  python3 api/api_server.py"
+if [ -f "api/api_server.py" ]; then
+    echo "  -> API Gateway: ./api/api_server.py"
+    echo ""
+    echo "To serve the Anthropic API endpoint, execute:"
+    echo "  python3 api/api_server.py"
+fi

@@ -152,7 +152,7 @@ The selected Q2_0 RTX 3090 profile is Option-B 0/44/4:
 - SSD/GDS integration and dynamic staged-GPU execution are disabled.
 
 Source `configs/qwen4exp_q2_0_option_b_scheduler.env` together with
-`configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml` when using the
+`configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml` when using the
 patched `../moestream-build-upstream-master` binary.
 
 ## Graph changes in this commit
@@ -220,7 +220,7 @@ ZEROMOE_QWEN4EXP_ADAPTIVE_POLICY=1 \
 ZEROMOE_QWEN4EXP_PARTIAL_LAYER=13 \
 ZEROMOE_QWEN4EXP_FULL_GRAPH=1 \
 ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1 \
-./build_ggmlcuda/zeromoe --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
 ```
 
 The prefix runs once, the storage worker loads the exact route slots with
@@ -281,7 +281,7 @@ and launch the configured engine:
 ```bash
 source configs/qwen4exp_q2_0_option_b_scheduler.env
 ../moestream-build-upstream-master/moestream \
-  --config configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+  --config configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
 ```
 
 The rejected experiments remain recorded:

@@ -273,7 +273,7 @@ bool test_gdn_conv_fused() {
 }
 
 // Test 35: GgmlQwenSharedRunner (moe_ggml_shared_expert, EXPERIMENTAL, kept
-// OFF in every shipped config -- see configs/qwen4exp_3090_only.toml's own
+// OFF in every shipped config -- see configs/testing/qwen4exp_3090_only.toml's own
 // comment). Written 2026-09-10 to isolate a real, confirmed correctness bug
 // found on real hardware: 100% NaN corruption end to end (hidden_states
 // 1249280/1249280 NaN, logits 248320/248320 NaN), traced via VERBOSE tracing

@@ -207,7 +207,7 @@ Run it after building the isolated backend above:
 python3 bench/dsv41_graph_profile.py \
   --binary /tmp/zeromoe-v41-build/zeromoe \
   --backend /tmp/v41-ggml-f32-libs \
-  --config configs/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
+  --config configs/bench/deepseek_v41_100gib_ddr_17gib_vram_dual_gpu.toml \
   --output logs/perf/deepseek_v41_graph_818_20261015
 ```
 

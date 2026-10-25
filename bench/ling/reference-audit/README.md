@@ -67,7 +67,7 @@ No CUDA kernel rebuild was needed. The callback regression test is
 to catch accidental whole-arena reads.
 
 The regression was compiled with `g++ -std=c++17 -O2`, include paths
-`backends/ggml` and `/home/ray/Projects/llama.cpp/ggml/include`, and linked
+`backends/ggml` and `$LLAMA_SRC/ggml/include`, and linked
 against `libggml-cpu` and `libggml-base` in `build-ling/ggml-build/src`.
 It checks negative IDs, duplicate IDs, a consumer after the first graph
 node, padding, and reset between graph executions. `results-2026-10-20.json`

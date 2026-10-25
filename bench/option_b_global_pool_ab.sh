@@ -1,8 +1,8 @@
 #!/bin/bash
 # Four-way A/B for the Option-B global expert pool (Q2_0, one GPU, plain decode, chat prompt).
 #
-#   A  right-sized per-layer 0/44/4   (configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml)  ~10.84 GiB
-#   B  global pool, same VRAM as A    (configs/qwen4exp_q2_0_option_b_global_topk48.toml, K=8421)      ~10.84 GiB
+#   A  right-sized per-layer 0/44/4   (configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml)  ~10.84 GiB
+#   B  global pool, same VRAM as A    (configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml, K=8421)      ~10.84 GiB
 #   C  per-layer top-256 x 44 layers  (A with right_size_top_n=false)                                    ~14.5 GiB
 #   D  global pool, same VRAM as C    (B with K=11264)                                                   ~14.5 GiB
 #
@@ -22,8 +22,8 @@ GPU=${1:-0}; REPS=${2:-5}; NGEN=${3:-128}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p logs
-A=configs/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
-B=configs/qwen4exp_q2_0_option_b_global_topk48.toml
+A=configs/testing/qwen4exp_q2_0_option_b_rightsize_split44_x0_cov80.toml
+B=configs/testing/qwen4exp_q2_0_option_b_global_topk48.toml
 cp "$A" "$TMP/A.toml"; cp "$B" "$TMP/B.toml"
 sed -E 's/^qwen4exp_option_b_right_size_top_n *=.*/qwen4exp_option_b_right_size_top_n = false/' "$A" > "$TMP/C.toml"
 sed -E 's/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = 11264/' "$B" > "$TMP/D.toml"

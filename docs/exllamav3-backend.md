@@ -9,9 +9,10 @@ itself with the configured Python process, using argv rather than a shell.
 To enable the upstream backend, use an EXL3 TOML profile with
 `model_format = "exl3"`, `exl3_backend = "exllamav3"`, the upstream source
 directory, the isolated Python executable, and the desired CPU expert-layer
-boundary. The checked-in 4bpw 26/22 and 2.05bpw 44/4 and 26/22 profiles are
-working examples;
-the `README.md` EXL3 section links to this guide.
+boundary. Example profiles referenced below are maintainer-local files under
+the ignored `configs/testing/` directory and are not included in the public
+repository. Supply your own EXL3 profile to run the examples; the `README.md`
+EXL3 section links to this guide.
 
 The minimal backend-specific settings are:
 
@@ -29,7 +30,8 @@ exllamav3_cuda_schedule = "blocking"
 Set `model_path` to the safetensors checkpoint and supply metadata/tokenizer
 paths when the model folder lacks the Hugging Face config files. Context,
 generation length, prompt, and sampling options remain ordinary ZeroMoE
-config entries. The profiles in `configs/` provide complete, tested examples.
+config entries. The local test profiles in `configs/testing/` provide complete
+examples; they are not distributed with the public repository.
 
 On the Xeon W-2235 with the RTX 3090 and RTX 5060 Ti, six CPU-worker threads
 are the measured default. Twelve threads contend with GPU submission and
@@ -44,7 +46,7 @@ The checkpoint includes an MTP draft head. Benchmark it with `--mtp`; the
 report records its added load time and accepted draft-token count. Baseline
 throughput does not use draft tokens.
 
-`configs/qwen4exp_exllamav3_26_22.toml` requests the first 26 routed-expert
+`configs/testing/qwen4exp_exllamav3_26_22.toml` requests the first 26 routed-expert
 layers on ExLlamaV3's CPU worker and the remaining 22 on GPU. Actual per-layer
 placement is checked after loading; ineligible offload silently falling back
 to GPU is rejected. Dense/attention work remains on GPU. ExLlamaV3 autosplits
@@ -119,7 +121,7 @@ Validate configuration and model-view paths without importing CUDA:
 
 ```bash
 python3 tools/run_exllamav3.py \
-    --config configs/qwen4exp_exllamav3_26_22.toml --check
+    --config configs/testing/qwen4exp_exllamav3_26_22.toml --check
 ```
 
 This does **not** prove tensor completeness, successful loading, or inference
@@ -129,14 +131,14 @@ After rebuilding ZeroMoE, normal inference can use the same config entrypoint:
 
 ```bash
 ./build_ggmlcuda/zeromoe \
-    --config configs/qwen4exp_exllamav3_26_22.toml --prompt "Hello" --ngen 8
+    --config configs/testing/qwen4exp_exllamav3_26_22.toml --prompt "Hello" --ngen 8
 ```
 
 For a fixed-length, greedy benchmark without early EOS stopping:
 
 ```bash
 .exl3-runtime/bin/python tools/run_exllamav3.py \
-    --config configs/qwen4exp_exllamav3_26_22.toml \
+    --config configs/testing/qwen4exp_exllamav3_26_22.toml \
     --benchmark --warmup-tokens 8 \
     --output-json logs/exllamav3_runtime/benchmark_26_22.json
 ```
@@ -197,9 +199,9 @@ Three verified-config profiles are available:
 
 | Profile | CPU routed layers | GPU routed layers |
 | --- | ---: | ---: |
-| `configs/qwen4exp_exllamav3_2bpw_0_44_4.toml` | 44 | 4 |
-| `configs/qwen4exp_exllamav3_2bpw_0_43_5.toml` | 43 | 5 |
-| `configs/qwen4exp_exllamav3_2bpw_26_22.toml` | 26 | 22 |
+| `configs/testing/qwen4exp_exllamav3_2bpw_0_44_4.toml` | 44 | 4 |
+| `configs/testing/qwen4exp_exllamav3_2bpw_0_43_5.toml` | 43 | 5 |
+| `configs/testing/qwen4exp_exllamav3_2bpw_26_22.toml` | 26 | 22 |
 
 For ExLlamaV3 whole-layer offload, these names mean layers `0..43` or `0..42`
 run routed experts on the CPU worker, and the tail four or five layers run them
@@ -211,7 +213,7 @@ Verify the pack, then run the first profile on an otherwise idle host:
 
 ```bash
 ./build_ggmlcuda/exl3_tool verify /mnt/usb-ssd/Qwen3.8_flash/exl3_2bpw
-./build_ggmlcuda/zeromoe --config configs/qwen4exp_exllamav3_2bpw_0_44_4.toml \
+./build_ggmlcuda/zeromoe --config configs/testing/qwen4exp_exllamav3_2bpw_0_44_4.toml \
     --ngen 128
 ```
 
@@ -238,7 +240,7 @@ For a repeatable fixed-length run of this profile, use the same runner as the
 
 ```bash
 .exl3-runtime/bin/python tools/run_exllamav3.py \
-    --config configs/qwen4exp_exllamav3_2bpw_0_44_4.toml \
+    --config configs/testing/qwen4exp_exllamav3_2bpw_0_44_4.toml \
     --benchmark --warmup-tokens 8 \
     --output-json logs/exllamav3_runtime/benchmark_2bpw_0_44_4.json
 ```
@@ -265,7 +267,7 @@ Repeat the fixed-length measurement with:
 
 ```bash
 .exl3-runtime/bin/python tools/run_exllamav3.py \
-    --config configs/qwen4exp_exllamav3_2bpw_26_22.toml \
+    --config configs/testing/qwen4exp_exllamav3_2bpw_26_22.toml \
     --benchmark --warmup-tokens 8 \
     --output-json logs/exllamav3_runtime/benchmark_2bpw_26_22_repeat.json
 ```
@@ -788,7 +790,7 @@ vary between 28.48 and 26.86 tok/s. Setting `exllamav3_cpu_expert_swap = false`
 | Mean | ~28.20 tok/s |
 
 All three trials clear 28 tok/s. This split with static placement is the
-recommended 4bpw profile: `configs/qwen4exp_exllamav3_4bpw_cpu_split_278.toml`.
+recommended 4bpw profile: `configs/testing/qwen4exp_exllamav3_4bpw_cpu_split_278.toml`.
 The key defaults to `true` (upstream dynamic swapping) when omitted.
 
 ### 2.05bpw expert-split sweep (VRAM-first notation)
@@ -871,7 +873,7 @@ exllamav3_gpu_memory_gb = [23.0, 0.0]  # [3090, 5060 Ti]; 0 keeps the test 3090-
 (`moe_cpu_mixed` / `EXL3_MOE_CPU_MIXED` in `exllamav3/model/config.py` and
 `modules/block_sparse_mlp_cpu.py`) that lifts the offload-versus-split
 exclusion; the first N eligible layers go wholly to the CPU and later layers
-get the split. Configs are `configs/qwen4exp_exllamav3_2bpw_*.toml`
+get the split. Local configs are `configs/testing/qwen4exp_exllamav3_2bpw_*.toml`
 (`mixed_0_44_4`, `mixed_0_45_3`, `mixed_0_46_2`, `mixed_0_47_1`,
 `split_256_48_0`, `split_240_48_0`, `split_224_48_0`, `split_208_48_0`,
 `split_216_48_0_3090only`); logs and JSON are in `logs/exllamav3_runtime/`.

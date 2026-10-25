@@ -2,8 +2,8 @@
 
 This note records the Q2_0 and IQ1_M decode-setup optimization measured on
 2026-10-02. The reproducibility profiles are
-`configs/qwen4exp_tg400_q2_0_22_26.toml` and
-`configs/qwen4exp_tg400_iq1m_22_26.toml`.
+`configs/testing/qwen4exp_tg400_q2_0_22_26.toml` and
+`configs/bench/qwen4exp_tg400_iq1m_22_26.toml`.
 
 ## Machine and build
 
@@ -127,7 +127,7 @@ The ZeroMoE measured-run shape is:
   ZEROMOE_TEACHER_FORCE_SKIP_SAMPLING=1 \
   ZEROMOE_BENCH_SILENT=1 \
   ZEROMOE_BENCH_IGNORE_STOP=1 \
-  ./build-tg400/zeromoe --config configs/qwen4exp_tg400_q2_0_22_26.toml
+  ./build-tg400/zeromoe --config configs/testing/qwen4exp_tg400_q2_0_22_26.toml
 ```
 
 Decode borrows the completed prefill graph's dense/expert arenas by default.
