@@ -1117,7 +1117,9 @@ else()
     endif()
 
     if(ZEROMOE_USE_GGML)
-        target_sources(kernels_cpu PRIVATE backends/cpu/ggml_dequant.cpp)
+        target_sources(kernels_cpu PRIVATE
+            backends/cpu/ggml_dequant.cpp
+            backends/cpu/ggml_grids.cpp)
         target_link_libraries(kernels_cpu PUBLIC ggml)
         target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_USE_GGML=1)
         target_include_directories(kernels_cpu PUBLIC ${ZEROMOE_GGML_SRC_DIR})

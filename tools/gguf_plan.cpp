@@ -1,52 +1,28 @@
 // tools/gguf_plan.cpp
 //
-// gguf_tool plan: a read-only sizing advisor for a GGUF model + the local
-// machine, so a user can pick dense_gb / moe_cache_gb / pinned_vram_capacity
-// / pin_topk_per_layer for a NEW model without trial-and-error real runs.
-// Reports:
-//   - dense (always-VRAM-resident) tensor requirement, by category, with a
-//     worst-case (nothing BF16-converted) and best-case (attn_output fully
-//     BF16-converted) GB range -- mirrors core/main.cpp's REAL categorization
-//     (is_dense_offload_candidate / is_attn_output / categorize_dense_tensor)
-//     byte-for-byte, so these numbers agree with what a real run's
-//     [VRAM-BREAKDOWN] log would show for the same model.
-//   - MoE routed-expert requirement: per-expert slab bytes (gate+up+down),
-//     computed the same way as engine.hpp's compute_expert_slab_bytes, plus
-//     a GB->slots quick-reference table.
-//   - detected system config: GPU name + total VRAM per device (via
-//     `nvidia-smi`, best-effort -- absent on macOS / no-NVIDIA boxes, not an
-//     error) and total system RAM (/proc/meminfo on Linux, `sysctl` on
-//     macOS).
-//   - .zeromoe_usage summary, if present: how many (layer,expert) pairs
-//     have been seen, and per-layer top-K concentration (how much of a
-//     layer's traffic its K hottest experts cover) -- the same metric
-//     core/main.cpp's [PIN] log already computes for a live run, surfaced
-//     here BEFORE a run exists (or from a prior one) to size pin_topk_per_layer.
+// gguf_tool plan: size a GGUF against local RAM/VRAM and optionally write a
+// reviewable starting TOML profile. Dense weight totals mirror the engine's
+// tensor categorization; MoE bytes are summed per layer; KV is a conservative
+// F32 estimate at the requested context. The generated GPU profile reserves
+// dense/KV/workspace budgets first, then assigns the remaining safe VRAM to
+// the expert pool. Runtime pin_all_experts_if_fit fills that pool completely
+// when the actual per-layer regions can hold every expert; otherwise it uses
+// .zeromoe_usage as a hot-set ranking. All estimates are advisory and the
+// runtime's startup report remains authoritative.
 //
-// Deliberately advisory only -- prints numbers, does not write a config
-// file. Different models (this tool's whole reason to exist) need
-// different dense_gb/moe_cache_gb; a generated TOML would need to guess at
-// things this tool has no way to know (how many GPUs the user wants,
-// which role goes where, KV cache target context) -- see CLAUDE.md's GPU
-// role-assignment findings for why that decision needs a human anyway.
-// KV cache sizing is intentionally NOT estimated here: it depends on
-// architecture constants (kv_lora/qk_rope for MLA, or head_dim/n_head_kv for
-// dense attention) that live in GGUF metadata KVs this lightweight,
-// name-pattern-only tool doesn't parse (see graph_initializer.cpp, which is
-// engine-side and intentionally not linked into this zero-dependency
-// binary) -- check a real run's own "[GRAPH] KV cache: ... GB" log line
-// instead.
-//
+// Build: see gguf_common.hpp (compiled together with the gguf_*.cpp files).
 // Build: see gguf_common.hpp (compiled together with the other gguf_*.cpp).
 #include "gguf_common.hpp"
 #include "../memory/resident_memory_policy.hpp"
 #include <algorithm>
 #include <array>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <map>
 #include <set>
 #include <sstream>
@@ -184,58 +160,140 @@ std::vector<std::string> split_csv(const std::string &line) {
   return out;
 }
 
-void print_detected_gpus() {
-  std::string out = run_capture(
-      "nvidia-smi --query-gpu=index,name,memory.total "
+struct DetectedGpu {
+  int index = -1;
+  std::string name;
+  double total_gb = 0.0;
+  double free_gb = 0.0;
+};
+
+std::vector<DetectedGpu> detect_gpus() {
+  const std::string output = run_capture(
+      "nvidia-smi --query-gpu=index,name,memory.total,memory.free "
       "--format=csv,noheader,nounits");
-  if (out.empty()) {
-    printf("  nvidia-smi not found or no GPUs reported -- run this on the "
-           "target machine, or size manually from known card specs.\n");
-    return;
-  }
-  std::stringstream ss(out);
+  std::vector<DetectedGpu> result;
+  std::stringstream rows(output);
   std::string line;
-  while (std::getline(ss, line)) {
-    if (line.empty())
+  while (std::getline(rows, line)) {
+    const auto fields = split_csv(line);
+    if (fields.size() < 4)
       continue;
-    auto f = split_csv(line);
-    if (f.size() < 3)
-      continue;
-    double mib = std::atof(f[2].c_str());
-    printf("  GPU %s: %-30s %.1f GB total VRAM\n", f[0].c_str(),
-           f[1].c_str(), mib / 1024.0);
+    DetectedGpu gpu;
+    gpu.index = std::atoi(fields[0].c_str());
+    gpu.name = fields[1];
+    // nvidia-smi reports MiB. Its memory.total/free values track the
+    // driver's usable budget closely enough for a draft profile; the engine
+    // re-queries CUDA properties and runs its normal startup preflight.
+    gpu.total_gb = std::atof(fields[2].c_str()) / 1000.0;
+    gpu.free_gb = std::atof(fields[3].c_str()) / 1000.0;
+    result.push_back(std::move(gpu));
   }
+  return result;
 }
 
-void print_detected_ram() {
-  // Linux: /proc/meminfo's MemTotal is in kB.
+struct DetectedRam {
+  double total_gb = 0.0;
+  double available_gb = 0.0;
+};
+
+DetectedRam detect_ram() {
+  DetectedRam result;
   std::ifstream meminfo("/proc/meminfo");
   if (meminfo) {
     std::string line;
     while (std::getline(meminfo, line)) {
-      if (line.rfind("MemTotal:", 0) == 0) {
-        unsigned long long kb = 0;
-        std::sscanf(line.c_str(), "MemTotal: %llu kB", &kb);
-        if (kb > 0) {
-          printf("  System RAM: %.1f GB total (from /proc/meminfo)\n",
-                 kb / 1e6);
-          return;
-        }
-      }
+      unsigned long long kb = 0;
+      if (line.rfind("MemTotal:", 0) == 0 &&
+          std::sscanf(line.c_str(), "MemTotal: %llu kB", &kb) == 1)
+        result.total_gb = (double)kb / 1e6;
+      else if (line.rfind("MemAvailable:", 0) == 0 &&
+               std::sscanf(line.c_str(), "MemAvailable: %llu kB", &kb) == 1)
+        result.available_gb = (double)kb / 1e6;
+    }
+    if (result.total_gb > 0.0)
+      return result;
+  }
+  const std::string output = run_capture("sysctl -n hw.memsize");
+  if (!output.empty()) {
+    const double bytes = std::atof(output.c_str());
+    if (bytes > 0.0) {
+      result.total_gb = bytes / 1e9;
+      // sysctl exposes total RAM, not current free RAM. Leave a conservative
+      // quarter for macOS and applications already running.
+      result.available_gb = result.total_gb * 0.75;
     }
   }
-  // macOS fallback: sysctl hw.memsize is in bytes.
-  std::string out = run_capture("sysctl -n hw.memsize");
-  if (!out.empty()) {
-    double bytes = std::atof(out.c_str());
-    if (bytes > 0) {
-      printf("  System RAM: %.1f GB total (from sysctl hw.memsize)\n",
-             bytes / 1e9);
-      return;
-    }
+  return result;
+}
+
+void print_detected_gpus() {
+  const auto gpus = detect_gpus();
+  if (gpus.empty()) {
+    printf("  nvidia-smi not found or no GPUs reported -- run this on "
+           "the target machine, or size manually from known card specs.\n");
+    return;
+  }
+  for (const auto &gpu : gpus)
+    printf("  GPU %d: %-30s %.1f GB total, %.1f GB free VRAM\n",
+           gpu.index, gpu.name.c_str(), gpu.total_gb, gpu.free_gb);
+}
+
+void print_detected_ram() {
+  const DetectedRam ram = detect_ram();
+  if (ram.total_gb > 0.0) {
+    printf("  System RAM: %.1f GB total, %.1f GB available\n",
+           ram.total_gb, ram.available_gb);
+    return;
   }
   printf("  System RAM: could not detect (neither /proc/meminfo nor sysctl "
          "worked) -- check manually (free -h / top).\n");
+}
+
+size_t estimate_kv_bytes(const GGUFFile &model, int context_size) {
+  const int layers = std::max(0, model.get_config_int("block_count", 0) -
+                                      model.get_config_int("nextn_predict_layers", 0));
+  if (layers <= 0 || context_size <= 0) return 0;
+  const int kv_lora = model.get_config_int("attention.kv_lora_rank", 0);
+  if (kv_lora > 0) {
+    const int rope = model.get_config_int(
+        "attention.qk_rope_head_dim",
+        model.get_config_int("rope.dimension_count", 0));
+    return (size_t)layers * (size_t)context_size *
+           (size_t)(kv_lora + std::max(0, rope)) * sizeof(float);
+  }
+  int full_layers = layers;
+  const auto recurrent = model.get_config_int_array("attention.recurrent_layers");
+  if (recurrent.size() >= (size_t)layers) {
+    full_layers = 0;
+    for (int i = 0; i < layers; ++i)
+      if (recurrent[(size_t)i] == 0) ++full_layers;
+  } else if (model.get_config_int("ssm.state_size", 0) > 0) {
+    const int interval = model.get_config_int("full_attention_interval", 0);
+    if (interval > 0) full_layers = layers / interval;
+  }
+  const int heads = model.get_config_int(
+      "attention.head_count_kv",
+      model.get_config_int("attention.head_count", 1));
+  const int head_count = std::max(1, model.get_config_int("attention.head_count", 1));
+  const int key_dim = model.get_config_int(
+      "attention.key_length",
+      std::max(1, model.get_config_int("embedding_length", 1) / head_count));
+  const int value_dim = model.get_config_int("attention.value_length", key_dim);
+  return (size_t)full_layers * (size_t)context_size * (size_t)std::max(1, heads) *
+         (size_t)(std::max(1, key_dim) + std::max(1, value_dim)) * sizeof(float);
+}
+
+std::string toml_quote(const std::string &value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 2);
+  escaped.push_back('"');
+  for (char c : value) {
+    if (c == '\\' || c == '"') escaped.push_back('\\');
+    if (c == '\n' || c == '\r') escaped.push_back(' ');
+    else escaped.push_back(c);
+  }
+  escaped.push_back('"');
+  return escaped;
 }
 
 // .zeromoe_usage is a plain "layer expert count" text file (one line per
@@ -327,27 +385,40 @@ int cmd_plan(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr,
             "Usage: %s <model_file_or_dir> [--usage-file <path>] [--embedding-device auto|cpu|gpu]\n"
-            "\n"
-            "Read-only sizing advisor: prints dense-tensor VRAM requirement\n"
-            "(by category, worst/best-case BF16 range), MoE expert slab\n"
-            "size + a GB->slots table, this machine's detected GPU(s) and\n"
-            "system RAM, and (if present) a .zeromoe_usage summary --\n"
-            "everything needed to pick dense_gb / moe_cache_gb /\n"
-            "pinned_vram_capacity / pin_topk_per_layer for a NEW model\n"
-            "without trial-and-error real runs. Does not write a config\n"
-            "file -- prints numbers only.\n",
-            argv[0]);
+"       [--write-config <path>] [--gpu-id <n>|--cpu-only]\n"
+"       [--context-size <n>] [--max-new-tokens <n>]\n"
+"\n"
+"Sizes GGUF dense and per-layer MoE tensors against detected RAM/VRAM.\n"
+"With --write-config, emits a reviewable TOML profile sized from actual\n"
+"tensor bytes; it enables full expert preload automatically when the set\n"
+"fits the selected GPU's configured expert pool.\n",
+argv[0]);
     return 2;
   }
   std::string model = argv[1];
   std::string usage_file = ".zeromoe_usage";
   std::string embedding_device = "auto";
+  std::string write_config_path;
+  int selected_gpu_id = -1;
+  int context_size = 4096;
+  int max_new_tokens = 256;
+  bool force_cpu_only = false;
   for (int i = 2; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--usage-file" && i + 1 < argc)
       usage_file = argv[++i];
     else if (a == "--embedding-device" && i + 1 < argc)
       embedding_device = argv[++i];
+    else if (a == "--write-config" && i + 1 < argc)
+      write_config_path = argv[++i];
+    else if (a == "--gpu-id" && i + 1 < argc)
+      selected_gpu_id = std::atoi(argv[++i]);
+    else if (a == "--context-size" && i + 1 < argc)
+      context_size = std::atoi(argv[++i]);
+    else if (a == "--max-new-tokens" && i + 1 < argc)
+      max_new_tokens = std::atoi(argv[++i]);
+    else if (a == "--cpu-only")
+      force_cpu_only = true;
     else {
       fprintf(stderr, "[plan] unknown arg: %s\n", a.c_str());
       return 2;
@@ -364,6 +435,13 @@ int cmd_plan(int argc, char **argv) {
     fprintf(stderr, "[plan] FAIL: cannot load model %s\n", model.c_str());
     return 1;
   }
+  if (context_size <= 0 || max_new_tokens < 0) {
+    fprintf(stderr, "[plan] context-size must be positive and max-new-tokens nonnegative\n");
+    return 2;
+  }
+  size_t model_total_bytes = 0;
+  for (const auto &tensor : M.tensors)
+    model_total_bytes += tensor.second.size_bytes;
   printf("[plan] Loaded %zu tensor(s) across %zu shard(s) from %s\n\n",
          M.tensors.size(), M.shard_paths.size(), model.c_str());
 
@@ -372,6 +450,7 @@ int cmd_plan(int argc, char **argv) {
   std::set<int> layers_with_experts;
   int n_experts = -1;
   std::map<int, size_t> layer_slab_bytes; // layer -> gate+up+down / n_experts
+std::map<int, int> layer_expert_counts;
 
   for (auto &kv : M.tensors) {
     int L;
@@ -429,6 +508,7 @@ int cmd_plan(int argc, char **argv) {
         layer_slab_bytes[L] = gE->second.size_bytes / ne +
                                uE->second.size_bytes / ne +
                                dE->second.size_bytes / ne;
+layer_expert_counts[L] = ne;
       }
     }
   }
@@ -438,6 +518,13 @@ int cmd_plan(int argc, char **argv) {
   size_t max_slab_bytes = 0;
   for (auto &kv : layer_slab_bytes)
     max_slab_bytes = std::max(max_slab_bytes, kv.second);
+size_t full_expert_slots = 0;
+size_t full_expert_bytes = 0;
+for (const auto &[layer, slab_bytes] : layer_slab_bytes) {
+const size_t count = (size_t)layer_expert_counts.at(layer);
+full_expert_slots += count;
+full_expert_bytes += slab_bytes * count;
+}
 
   printf("Layers blk.%d..blk.%d (%d total), %d with routed experts, %d "
          "leading dense-only.\n",
@@ -484,11 +571,13 @@ int cmd_plan(int argc, char **argv) {
            cat.bytes / 1e9, cat.count);
     dense_total_native += cat.bytes;
   }
+  size_t dense_total_best = dense_total_native;
   printf("  %-45s %8.3f GB\n", "TOTAL (native quant, nothing BF16-converted)",
          dense_total_native / 1e9);
   if (attn_output_count > 0) {
     size_t best_case_total =
         dense_total_native - attn_output_quantized_total + attn_output_bf16_estimate;
+    dense_total_best = best_case_total;
     printf("  If all %d attn_output layer(s) BF16-convert (engine's "
            "matched-type cuBLAS fast-path, VRAM-availability permitting): "
            "%.3f GB quantized -> %.3f GB BF16, TOTAL becomes ~%.3f GB\n",
@@ -501,10 +590,9 @@ int cmd_plan(int argc, char **argv) {
            std::min(dense_total_native, best_case_total) / 1e9 + 0.5,
            std::max(dense_total_native, best_case_total) / 1e9 + 0.5);
   }
-  printf("  KV cache is NOT estimated here (needs architecture constants "
-         "this lightweight tool doesn't parse) -- check a real run's own "
-         "\"[GRAPH] KV cache: ... GB\" log line for your target context/"
-         "kv_bits.\n\n");
+  printf("  KV estimate: %.3f GB for the requested context (conservative F32 "
+         "cache estimate; check the runtime's [GRAPH] KV cache line).\n\n",
+         (double)estimate_kv_bytes(M, context_size) / 1e9);
 
   // ---- MoE / routed-expert requirement ----
   const auto embedding = M.tensors.find("token_embd.weight");
@@ -513,17 +601,20 @@ int cmd_plan(int argc, char **argv) {
   printf("[EMBEDDING-PLAN] device=%s host_bytes=%zu reclaimed_vram_bytes=%zu additional_expert_slots=%zu\n",
          embedding_gpu ? "gpu" : "cpu", embedding_bytes, reclaimed_bytes,
          max_slab_bytes > 0 ? reclaimed_bytes / max_slab_bytes : 0);
-  printf("  Extra slots are a sizing estimate, not a recommendation to pin every slot. Preserve KV/prefill "
-         "workspace and an eviction/staging budget; explicit cache sizes do not grow automatically.\n\n");
+  printf("  Compare the exact full-residency byte sum with the expert-pool "
+         "budget left after dense weights, KV, and workspace. A conservative "
+         "largest-slab bound is also reported.\n\n");
   if (max_slab_bytes > 0) {
     printf("MoE routed-expert requirement:\n");
     printf("  One expert's slab (gate+up+down, largest across layers): "
            "%.4f GB (%.2f MB)\n",
            max_slab_bytes / 1e9, max_slab_bytes / 1e6);
-    size_t total_expert_slots = (size_t)n_moe_layers * (size_t)n_experts;
-    printf("  Full residency (every expert, every MoE layer, all at once): "
-           "%zu slots = %.2f GB\n",
-           total_expert_slots, total_expert_slots * max_slab_bytes / 1e9);
+    printf("  Full residency (exact sum of each MoE layer's packed expert "
+           "bytes): %zu slots = %.2f GB\n",
+           full_expert_slots, full_expert_bytes / 1e9);
+    printf("  Conservative bound using the largest expert slab in every "
+           "layer: %.2f GB\n",
+           full_expert_slots * max_slab_bytes / 1e9);
     printf("  GB -> slots quick reference (this model's slab size):\n");
     for (double gb : {2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0}) {
       size_t slots = (size_t)((gb * 1e9) / max_slab_bytes);
@@ -531,11 +622,12 @@ int cmd_plan(int argc, char **argv) {
              "layer(s))\n",
              gb, slots, (double)slots / n_moe_layers, n_moe_layers);
     }
-    printf("  -> moe_cache_gb translates directly via this table; "
-           "pin_topk_per_layer x n_moe_layers should stay at roughly 50-60%%\n"
-           "     of the slot count your chosen moe_cache_gb yields (see "
-           "CLAUDE.md -- overshooting this floods \"evict_lru found NO "
-           "victim\" for the whole run).\n\n");
+    printf("  Onboarding: compare the exact full-residency size with the "
+           "selected expert-pool budget after dense weights, KV, and "
+           "workspace. With pin_all_experts_if_fit=true and "
+           "pin_topk_per_layer=0 (default), startup checks actual per-layer "
+           "capacity and loads every expert when they fit; otherwise it uses "
+           ".zeromoe_usage to rank the resident hot set.\n\n");
   } else {
     printf("MoE routed-expert requirement: no packed *_exps tensors found "
            "(unpacked/per-expert layout, or a dense-only model) -- expert "
@@ -552,6 +644,141 @@ int cmd_plan(int argc, char **argv) {
   // ---- .zeromoe_usage summary ----
   printf(".zeromoe_usage summary (%s):\n", usage_file.c_str());
   print_usage_summary(usage_file);
+
+  if (!write_config_path.empty()) {
+    const DetectedRam ram = detect_ram();
+    const auto detected = detect_gpus();
+    const DetectedGpu *gpu = nullptr;
+    if (!force_cpu_only && !detected.empty()) {
+      if (selected_gpu_id >= 0) {
+        for (const auto &candidate : detected)
+          if (candidate.index == selected_gpu_id)
+            gpu = &candidate;
+        if (!gpu) {
+          fprintf(stderr, "[plan] requested GPU id %d was not detected\n",
+                  selected_gpu_id);
+          return 2;
+        }
+      } else {
+        gpu = &*std::max_element(
+            detected.begin(), detected.end(),
+            [](const DetectedGpu &a, const DetectedGpu &b) {
+              return a.free_gb < b.free_gb;
+            });
+      }
+    } else if (selected_gpu_id >= 0) {
+      fprintf(stderr, "[plan] --gpu-id cannot be used without a detected NVIDIA GPU\n");
+      return 2;
+    }
+
+    const double model_gb = (double)model_total_bytes / 1e9;
+    double host_ram_gb = 0.0;
+    if (ram.available_gb > 0.0) {
+      if (gpu) {
+        // Keep the engine's Linux startup-preflight margin (~21.5 GB) and
+        // cap the expert host tier so a fresh config does not claim all DDR.
+        host_ram_gb = std::max(1.0, std::min(32.0, ram.available_gb - 22.0));
+      } else {
+        // CPU inference needs a dense host copy plus an expert working set.
+        // Leave a few GB for the OS and let the user raise this on large-RAM
+        // machines if they want a bigger CPU expert cache.
+        host_ram_gb =
+            std::max(1.0, std::min(32.0, ram.available_gb - model_gb - 4.0));
+      }
+    }
+
+    const double dense_required_gb =
+        (double)std::max(dense_total_native, dense_total_best) / 1e9;
+    const auto ceil_tenth = [](double x) {
+      return std::ceil(x * 10.0) / 10.0;
+    };
+    const double dense_gb = ceil_tenth(dense_required_gb + 0.5);
+    const double kv_required_gb =
+        (double)estimate_kv_bytes(M, context_size) / 1e9;
+    const double kv_cache_gb =
+        ceil_tenth(std::max(0.25, kv_required_gb * 1.25 + 0.25));
+    double moe_cache_gb = 0.0;
+    double usable_vram_gb = 0.0;
+    double pool_budget_gb = 0.0;
+    if (gpu && n_moe_layers > 0) {
+      // Account for other current GPU users, the driver, and graph/scratch
+      // workspace before assigning the remaining budget to expert slots.
+      usable_vram_gb =
+          std::max(0.0, std::min(gpu->total_gb - 1.0, gpu->free_gb - 0.5));
+      pool_budget_gb =
+          std::max(0.0, usable_vram_gb - dense_gb - kv_cache_gb - 1.0);
+      const double full_expert_gb = (double)full_expert_bytes / 1e9;
+      if (pool_budget_gb >= full_expert_gb + 0.25)
+        moe_cache_gb = ceil_tenth(full_expert_gb + 0.25);
+      else
+        moe_cache_gb = std::max(0.1, std::floor(pool_budget_gb * 10.0) / 10.0);
+    }
+
+    std::ofstream config_out(write_config_path);
+    if (!config_out) {
+      fprintf(stderr, "[plan] could not write config: %s\n",
+              write_config_path.c_str());
+      return 1;
+    }
+    config_out << "# Generated by gguf_tool plan. Review context and memory budgets.\n"
+               << "model_path = " << toml_quote(model) << "\n"
+               << "context_size = " << context_size << "\n"
+               << "max_new_tokens = " << max_new_tokens << "\n"
+               << "temperature = 0.7\n"
+               << "top_p = 0.95\n"
+               << "raw_prompt = false\n"
+               << "enable_thinking = false\n"
+               << "host_ram_gb = " << std::fixed << std::setprecision(1)
+               << host_ram_gb << "\n";
+    if (!gpu)
+      config_out << "# CPU-only profile; run with zeromoe_cpu --config.\n";
+    if (gpu) {
+      config_out << "pin_all_experts_if_fit = true\n"
+                 << "pin_topk_per_layer = 0\n";
+    }
+    config_out << "pin_file = \".zeromoe_usage\"\n";
+    if (gpu) {
+      config_out << "# VRAM sizing uses the free-memory snapshot from planning time.\n"
+                 << "\n[[gpus]]\n"
+                 << "device_id = " << gpu->index << "\n"
+                 << "name = " << toml_quote(gpu->name) << "\n"
+                 << "role = \"dense+moe\"\n"
+                 << "vram_gb = " << std::fixed << std::setprecision(1)
+                 << gpu->total_gb << "\n"
+                 << "dense_gb = " << dense_gb << "\n"
+                 << "kv_cache_gb = " << kv_cache_gb << "\n"
+                 << "moe_cache_gb = " << moe_cache_gb << "\n"
+                 << "kv_bits = 4\n";
+    }
+    config_out.close();
+    printf("[plan] wrote %s profile %s\n",
+           gpu ? "CUDA" : "CPU", write_config_path.c_str());
+    printf("[plan] estimated dense=%.1f GB, KV=%.1f GB, MoE pool=%.1f GB, "
+           "host RAM budget=%.1f GB",
+           dense_gb, kv_cache_gb, moe_cache_gb, host_ram_gb);
+    if (gpu) {
+      printf(" on GPU %d (%s; %.1f GB free at planning time)",
+             gpu->index, gpu->name.c_str(), gpu->free_gb);
+      if (full_expert_bytes > 0 &&
+          moe_cache_gb * 1e9 >= (double)full_expert_bytes)
+        printf("; full MoE set fits");
+      else if (full_expert_bytes > 0)
+        printf("; usage-ranked partial MoE residency");
+    }
+    printf("\n");
+    if (gpu && n_moe_layers > 0 &&
+        pool_budget_gb + 1e-6 < (double)full_expert_bytes / 1e9)
+      printf("[plan] note: full MoE residency exceeds this GPU pool budget; "
+             "the generated config will use the usage-ranked hot set.\n");
+    if (gpu && ram.available_gb > 0.0 &&
+        host_ram_gb + 21.5 > ram.available_gb)
+      printf("[plan] warning: host RAM headroom may fail ZeroMoE startup "
+             "preflight; lower host_ram_gb or free DDR first.\n");
+    if (!gpu && ram.available_gb > 0.0 &&
+        host_ram_gb + model_gb > ram.available_gb)
+      printf("[plan] warning: CPU model plus host expert-cache budget exceeds "
+             "detected available RAM; lower host_ram_gb or use a GPU profile.\n");
+  }
 
   return 0;
 }

@@ -381,28 +381,39 @@ detection) and this machine's config to print:
   and best-case (every `attn_output` layer BF16-converted) GB range, so
   these numbers agree with what the engine will actually report for the
   same model.
-- **MoE routed-expert requirement** — one expert's slab size (gate+up+down,
-  the exact formula `engine.hpp`'s `compute_expert_slab_bytes` uses), full
-  everything-resident size, and a GB→slots quick-reference table so a
-  candidate `moe_cache_gb` translates directly to a slot count without
-  waiting for a real run's `[GPU] Expert VRAM cache: N slots` log line.
+- **MoE routed-expert requirement** — per-layer expert slab sizes
+  (gate+up+down, using the exact `compute_expert_slab_bytes` formula), the
+  exact sum for full residency, a conservative largest-slab bound, and a
+  GB→slots quick-reference table.
 - **Detected system config** — GPU name + total VRAM per device (via
   `nvidia-smi`, best-effort — silently skipped, not an error, on a
   no-NVIDIA/macOS box) and total system RAM (`/proc/meminfo` on Linux,
   `sysctl` on macOS).
 - **`.zeromoe_usage` summary**, if the file exists — how many
   `(layer,expert)` pairs have real routing history, and per-layer top-K
-  traffic concentration (for K=8/11/16) so `pin_topk_per_layer` can be
-  chosen from real data instead of a guess, even before a first real run
-  finishes.
+  traffic concentration (for K=8/11/16). This ranking chooses a hot set only
+  when the complete expert set does not fit the configured VRAM pool.
 
-Deliberately **advisory only** — prints numbers, never writes a config
-file. It also does NOT estimate KV cache size: that needs architecture
-constants (`kv_lora`/`qk_rope` for MLA, or `head_dim`/`n_head_kv` for dense
-attention) that live in GGUF metadata KVs, which this lightweight,
-name-pattern-only tool doesn't parse (that's `graph_initializer.cpp`,
-engine-side, intentionally not linked into this zero-dependency binary) —
-check a real run's own `"[GRAPH] KV cache: ... GB"` log line for that.
+By default, `plan` is advisory and only prints sizing data. With
+`--write-config <path>`, it also writes a reviewable TOML profile using
+detected system RAM/VRAM, the model's exact per-layer dense/expert bytes, the
+requested context, and a conservative F32 KV estimate. It selects the GPU
+with the most free VRAM, or accepts an explicit `--gpu-id`; use
+`--cpu-only` to write a CPU profile.
+
+For a new model:
+
+```bash
+./build/gguf_tool plan /path/to/model.gguf --write-config ./configs/new-model.toml \
+  --gpu-id 1 --context-size 4096 --max-new-tokens 256
+```
+
+The generated profile leaves `pin_all_experts_if_fit = true` and
+`pin_topk_per_layer = 0`. At startup, ZeroMoE checks actual per-layer cache
+regions and preloads every expert if the complete set fits. If it does not
+fit, usage history ranks the hot set within the generated VRAM pool. Use
+`--cpu-only` to generate a profile for `zeromoe_cpu`; on a machine without
+NVIDIA GPUs, CPU profile generation is automatic.
 
 ### Usage
 

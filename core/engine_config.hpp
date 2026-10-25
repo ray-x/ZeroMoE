@@ -1542,6 +1542,11 @@ struct EngineConfig {
   // per-layer count.
   std::string pin_file = ".zeromoe_usage";
   int pin_topk_per_layer = 0;
+  // If the complete routed-expert set fits in the allocated VRAM expert pool,
+  // preload and pin every expert when pin_topk_per_layer is automatic (0).
+  // Otherwise retain the usage-ranked hot-set policy. Set false to keep a
+  // bounded hot set even when the full model fits.
+  bool pin_all_experts_if_fit = true;
 
   // Separate usage file tracking ONLY prefill-phase (S > 1) routing
   // selections -- see StreamingEngine::route_freq_prefill's own comment
@@ -3067,6 +3072,8 @@ inline bool EngineConfig::load(const std::string &path) {
   embedding_device = doc.root.get_str("embedding_device", embedding_device);
   pin_topk_per_layer =
       doc.root.get_int("pin_topk_per_layer", pin_topk_per_layer);
+  pin_all_experts_if_fit =
+      doc.root.get_bool("pin_all_experts_if_fit", pin_all_experts_if_fit);
   pin_strategy = doc.root.get_str("pin_strategy", pin_strategy);
   pin_global_floor_per_layer = doc.root.get_int("pin_global_floor_per_layer",
                                                 pin_global_floor_per_layer);
@@ -3782,6 +3789,9 @@ inline void EngineConfig::print() const {
   LOG_STREAM_INFO() << "[CONFIG] Pin threshold: " << pin_threshold
                     << (pin_threshold > 0 ? " hits" : " (pinning disabled)")
                     << "\n";
+  LOG_STREAM_INFO() << "[CONFIG] Full expert preload when model fits: "
+                    << (pin_all_experts_if_fit ? "ON" : "off")
+                    << " (pin_topk_per_layer=0 only)\n";
   if (!prefill_pin_file.empty())
     LOG_STREAM_INFO() << "[CONFIG] Prefill pin file: " << prefill_pin_file
                       << " (preferred for prefill-time preload ranking; falls "
@@ -4478,6 +4488,9 @@ freeze_usage_stats = false
 # 0 = auto-size to fill available VRAM expert-cache capacity. Only used when
 # pin_strategy="per_layer_topk" below.
 pin_topk_per_layer = 0
+# When the complete routed-expert set fits the configured VRAM pool, preload
+# and pin all experts automatically. Set false to use the usage-ranked hot set.
+pin_all_experts_if_fit = true
 # pin_strategy: how pinned_vram_capacity gets DISTRIBUTED across layers.
 #   "per_layer_topk" (default): every layer gets the same topk count
 #     (pin_topk_per_layer above). Safe -- no layer ever gets zero pins --
