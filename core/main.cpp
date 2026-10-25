@@ -545,6 +545,8 @@ int main(int argc, char *argv[]) {
       zeromoe::bench::plan().warmup = std::stoi(argv[++i]);
     else if (arg == "--bench-long" && i + 1 < argc)
       zeromoe::bench::plan().long_ngen = std::stoi(argv[++i]);
+    else if (arg == "--bench-long-reps" && i + 1 < argc)
+      zeromoe::bench::plan().long_reps = std::stoi(argv[++i]);
     else if (arg == "--bench-random-pp" && i + 1 < argc)
       zeromoe::bench::plan().random_pp.push_back(std::stoi(argv[++i]));
     else if (arg == "--bench-random-tg" && i + 1 < argc)

@@ -95,3 +95,4 @@ venv/
 bench/results/*.logs/
 bench/results/*.attempts.jsonl
 bench/results/*.runs.jsonl
+bench/results/*.rejected.jsonl

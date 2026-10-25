@@ -90,6 +90,19 @@ struct RequestStats {
     std::sort(v.begin(), v.end());
     return v[std::min(v.size() - 1, static_cast<size_t>(q * (v.size() - 1) + 0.5))];
   }
+  // Decode speed in n equal consecutive parts of the steps after warm-up; empty unless each part has >= 20 steps.
+  std::vector<double> decode_buckets(int n) const {
+    std::vector<double> out;
+    const size_t usable = step_ms.size() > kSkipSteps ? step_ms.size() - kSkipSteps : 0;
+    const size_t per = n > 0 ? usable / static_cast<size_t>(n) : 0;
+    if (per < 20) return out;
+    for (int b = 0; b < n; ++b) {
+      double sum = 0;
+      for (size_t i = 0; i < per; ++i) sum += step_ms[kSkipSteps + b * per + i];
+      out.push_back(sum > 0 ? per * 1000.0 / sum : -1);
+    }
+    return out;
+  }
   double decode_wall_tok_s() const {
     return (decode_wall_ms > 0 && generated_tokens > 0) ? generated_tokens * 1000.0 / decode_wall_ms : -1;
   }
@@ -153,6 +166,16 @@ inline std::string RequestStats::to_json() const {
   detail::put_num(s, "start_unix_ms", start_unix_ms, 0);
   detail::put_num(s, "decode_start_unix_ms", decode_start_unix_ms, 0);
   detail::put_num(s, "end_unix_ms", end_unix_ms, 0);
+  const auto buckets = decode_buckets(6);
+  if (!buckets.empty()) {
+    s += ",\"decode_bucket_tok_s\":[";
+    for (size_t i = 0; i < buckets.size(); ++i) {
+      char b[32];
+      std::snprintf(b, sizeof b, "%s%.2f", i ? "," : "", buckets[i]);
+      s += b;
+    }
+    s += "]";
+  }
   s += ",\"extra\":{";
   bool first = true;
   for (const auto &[k, v] : extra) {

@@ -100,6 +100,7 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | --- | --- |
 | `ZEROMOE_BENCH_IGNORE_STOP` | Benchmark runs ignore end-of-sequence tokens, so every run generates its full token count. Set to `1` in bench scripts. |
 | `ZEROMOE_BENCH_SILENT` | Suppress per-token printing and per-token VRAM sampling in the timed path. |
+| `ZEROMOE_STATS_FILE` | Append one JSON line per finished request (same as `--stats-file PATH`): prompt and generated tokens, prefill and decode speed, time to first token, decode setup. Fields: [performance-measurement.md](performance-measurement.md). |
 | `ZEROMOE_GENERATED_TOKEN_FILE` | Write each generated token id to this file, one per line (truncated at step 0). For numerical comparisons. |
 | `ZEROMOE_DECODE_LOGITS_DUMP` | Dump decode logits to this file. Diagnostic. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |

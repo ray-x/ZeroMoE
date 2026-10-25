@@ -231,19 +231,7 @@ class Session {
   }
   static std::string quote(const std::string &in) { return "\"" + zeromoe::stats::detail::escape(in) + "\""; }
 
-  // Per-bucket decode speed over the steps after the warm-up steps.
-  static std::vector<double> buckets(const zeromoe::stats::RequestStats &r, int n_buckets) {
-    std::vector<double> out;
-    const size_t usable = r.step_ms.size() > zeromoe::stats::kSkipSteps ? r.step_ms.size() - zeromoe::stats::kSkipSteps : 0;
-    const size_t per = usable / n_buckets;
-    if (per < 20) return out;
-    for (int b = 0; b < n_buckets; ++b) {
-      double sum = 0;
-      for (size_t i = 0; i < per; ++i) sum += r.step_ms[zeromoe::stats::kSkipSteps + b * per + i];
-      out.push_back(sum > 0 ? per * 1000.0 / sum : -1);
-    }
-    return out;
-  }
+  static std::vector<double> buckets(const zeromoe::stats::RequestStats &r, int n_buckets) { return r.decode_buckets(n_buckets); }
 
   std::string summary_json() const {
     std::string s = "{";
