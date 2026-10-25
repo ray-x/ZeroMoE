@@ -245,7 +245,6 @@ if(ZEROMOE_USE_GGML)
                 file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
                 endif()
             endif()
-        endif()
         set(ZEROMOE_GGML_ROOT "${_zeromoe_ggml_src}")
     endif()
 
