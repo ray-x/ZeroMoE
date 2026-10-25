@@ -104,7 +104,7 @@ SDOT for the f32 and integer-dot-product paths.  For optimized quantized
 (MOE) expert decoding on macOS, build with ggml integration:
 
 ```bash
-cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_GGML_TAG=b3923
+cmake -S . -B build -DZEROMOE_USE_GGML=ON
 cmake --build build -j$(sysctl -n hw.ncpu)
 ```
 
@@ -468,7 +468,7 @@ one logits row per step, same binary row format) and `tools/compare_logits.py` c
 
 ```bash
 scripts/validate_vs_llama.sh <model.gguf> <zeromoe.toml> "The capital of France is" 8 ./build_master/zeromoe
-# env: LLAMA_SRC, LLAMA_BUILD (an UNPATCHED llama.cpp build), DEVS, MS_ENV="ZEROMOE_X=..." for model-specific knobs
+# env: LLAMA_SRC, LLAMA_BUILD (an UNPATCHED llama.cpp build), DEVS, MS_ENV="ZEROMOE_<NAME>=..." for model-specific knobs
 ```
 
 It builds the harness once (`build_logits_ref`), runs llama.cpp, then ZeroMoE with `--raw-prompt --temp 0`, and
