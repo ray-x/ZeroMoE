@@ -198,7 +198,18 @@ bool prepare_prefill_state_handoff(FullGraph &source);
 ggml_backend_t full_graph_cuda_scheduler_backend(FullGraph &g);
 bool engine_plans_decode_expert_split(const StreamingEngine &engine);
 std::unique_ptr<FullGraph> extract_decode_arena_owner( FullGraph &g, StreamingEngine &engine);
-size_t estimate_prefill_workspace_bytes(int S);
+// Device bytes a prefill batch of S tokens needs beyond the resident arenas, as the allocator's admission check
+// (build_graph) measures it: a fixed part (0.6 GiB with GPU op-offload, 0.3 GiB without, plus the 1 GiB admission floor)
+// and a per-token part (2.7 MiB with op-offload, 8 MiB without), 5% margin. Measured with op-offload: 0.80 / 1.57 / 2.60 /
+// 4.67 GiB at 96 / 400 / 800 / 1611 tokens. manage_decode_arena_for_prefill uses the same numbers to decide whether the
+// decode arena can stay resident, so the two cannot disagree.
+inline double prefill_fixed_bytes(bool op_offload) {
+  return ((op_offload ? 0.6 : 0.3) + 1.0) * 1024.0 * 1024.0 * 1024.0;
+}
+inline double prefill_per_token_bytes(bool op_offload) { return (op_offload ? 2.7 : 8.0) * 1024.0 * 1024.0; }
+inline size_t estimate_prefill_workspace_bytes(int S, bool op_offload) {
+  return static_cast<size_t>((prefill_fixed_bytes(op_offload) + prefill_per_token_bytes(op_offload) * S) * 1.05);
+}
 void manage_decode_arena_for_prefill(StreamingEngine &engine, int S);
 bool feed_decode_common_inputs(FullGraph &g, int pos_base);
 bool qwen4exp_stage_layer13_before_graph(FullGraph &g, int pos_base);

@@ -217,14 +217,6 @@ std::unique_ptr<FullGraph> extract_decode_arena_owner(
   return owner;
 }
 
-// Prefill workspace grows with the prompt: measured 0.69 GiB at S=20 and
-// 13.18 GiB at S=1747 on Qwen3.8-Flash-Next (scheduler activation copies), i.e.
-// roughly 0.5 GiB + 7.5 MiB per token (slightly conservative).
-size_t estimate_prefill_workspace_bytes(int S) {
-  return (static_cast<size_t>(512) << 20) +
-         static_cast<size_t>(S) * (static_cast<size_t>(15) << 19);
-}
-
 // The retained per-expert split arena (~13 GiB) makes the next decode graph
 // cheap to build, but it competes with the prefill workspace for VRAM. Keep it
 // resident for prompts whose workspace fits (and recover it from the live
@@ -242,8 +234,7 @@ void manage_decode_arena_for_prefill(StreamingEngine &engine, int S) {
   // graph is built, so credit its small footprint.
   const size_t live_credit =
       (g_graph && g_graph->decode_mode) ? (static_cast<size_t>(512) << 20) : 0;
-  const size_t need =
-      estimate_prefill_workspace_bytes(S) + (static_cast<size_t>(1) << 30);
+  const size_t need = estimate_prefill_workspace_bytes(S, g_qwen4exp_prefill_op_offload);
   const bool keep = free_bytes + live_credit >= need;
   if (keep) {
     if (!g_graph_decode_arena_owner && live_owned) {
