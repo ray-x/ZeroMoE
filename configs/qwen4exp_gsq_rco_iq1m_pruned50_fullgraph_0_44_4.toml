@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next GSQ-RCO IQ1_M full-graph decode profile.
 # Option-B splits 44 layers; the complementary layers 0, 1, 2, and 22 stay
 # on the CPU/DDR path. Launch with GRAPH_PRELOAD_LAYERS=0 and TRAILING=1.
-model_path = "/data/models/qwen3.8-flash-next/GSQ-RCO-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 
-log_path = "/tmp/qwen4exp_gsq_rco_iq1m_pruned50_fullgraph_0_44_4.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 512

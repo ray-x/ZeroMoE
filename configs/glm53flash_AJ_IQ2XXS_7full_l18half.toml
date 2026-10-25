@@ -1,8 +1,8 @@
 # Deterministic GLM-5.3 Flash MTP control profile. Test-only.
-model_path = "/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf"
+model_path = "/path/to/model-or-shard-directory"
 reasoning_effort = "low"
 enable_thinking = false
-log_path = "/tmp/zeromoe_glm53flash_aj_l18.log"
+log_path = "run.log"
 log_level = "INFO"
 context_size = 4096
 max_new_tokens = 12

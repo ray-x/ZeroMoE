@@ -108,8 +108,11 @@ const Exl3LinearInfo &find_linear(
 
 int main(int argc, char **argv) {
   try {
+    const char *model_env = std::getenv("ZEROMOE_EXL3_MODEL");
     const std::string model_path =
-        argc > 1 ? argv[1] : "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw";
+        argc > 1 ? argv[1] : (model_env ? model_env : "");
+    if (model_path.empty())
+      throw std::runtime_error("pass <model_dir> or set ZEROMOE_EXL3_MODEL");
     const int iterations = argc > 2 ? std::max(1, std::atoi(argv[2])) : 8;
     const int device = argc > 3 ? std::atoi(argv[3]) : 0;
     const int rows = argc > 4 ? std::max(1, std::atoi(argv[4])) : 2;

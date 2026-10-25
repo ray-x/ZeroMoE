@@ -10,7 +10,7 @@
 # measures the requested fixed 50% placement without filling the remaining
 # arena opportunistically.
 
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_option_b_44layers_106usage.log"
 log_level = "INFO"

@@ -3,6 +3,8 @@ build/
 build_*/
 /build-ling/
 /builds*/*
+/.worktrees/
+/.exl3-runtime/
 tests/bench_outproj
 
 # Local benchmark profiles are generated per prompt/run. Keep the committed
@@ -49,8 +51,9 @@ glm_runs/probe_live
 *.bad*.*
 *.csv
 *.tsv
-.zeromoe_usage*
-logs/*.log
+.zeromoe_*usage*
+/bench_tmp/
+/logs/
 glm_runs/*.log
 glm_runs/*.csv
 glm_runs/*.stdout

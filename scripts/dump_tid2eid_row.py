@@ -1,5 +1,10 @@
+import os
 import sys
-sys.path.insert(0, "/Users/rayxu/github/llama.cpp/gguf-py")
+
+llama_src = os.environ.get("LLAMA_SRC")
+if not llama_src:
+    raise SystemExit("set LLAMA_SRC to the llama.cpp source tree")
+sys.path.insert(0, os.path.join(llama_src, "gguf-py"))
 from gguf.gguf_reader import GGUFReader
 import numpy as np
 

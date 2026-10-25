@@ -6,10 +6,10 @@
 #   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
 # The candidate GPU range is [8,48); cpu_affinity_layers excludes the 18
 # scattered CPU layers inside it, leaving the same 22 GPU layers as the mask.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = [0, 1, 2, 3, 4, 5, 6, 7, 14, 20, 21, 22, 24, 28, 30, 33, 34, 36, 38, 40, 41, 42, 43, 44, 45, 46]
-log_path = "/tmp/qwen4exp_iq1m_fullgraph_scattered_22_26.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 2048

@@ -20,8 +20,18 @@ if [ -n "$bad" ]; then echo "PREFLIGHT FAIL: other engine process(es) running:";
 if [ -n "$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)" ]; then echo "PREFLIGHT FAIL: GPU in use:"; nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader; exit 1; fi
 sync
 python3 - <<'PY'
-import os,glob
-files=glob.glob('/home/ray/vllm-workspace/GLM-5.3-GGUF-align/*.gguf')+glob.glob('/data/glm53_offload.gguf')+glob.glob('/data/glm53_mirror_*/*.gguf')+glob.glob('/data/glm53_mirror_cold50/*.gguf')
+import glob
+import os
+
+files = []
+for value in (os.environ.get("GLM_MODEL", ""), os.environ.get("GLM_STORE", ""),
+              os.environ.get("GLM_MIRROR_GLOB", "")):
+    if not value:
+        continue
+    if os.path.isdir(value):
+        files.extend(glob.glob(os.path.join(value, "*.gguf")))
+    else:
+        files.extend(glob.glob(value))
 n=0
 for f in files:
     try:

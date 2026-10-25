@@ -14,7 +14,7 @@
 # split (indices excluding 0,1,2,22 -- 4 layers plain-CPU-only), matching the
 # IQ1_M "0/44/4" naming. Built against moestream-build-upstream-master (the
 # only binary with the Q2_0 VNNI + full-graph/host-node ggml changes).
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_q2_0_option_b_split44_x0.log"

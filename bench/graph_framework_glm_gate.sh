@@ -17,16 +17,16 @@
 set -uo pipefail
 step=${1:?step name}
 cand=$(readlink -f "${2:?candidate engine}")
-base=$(readlink -f "${3:-$HOME/work/gf-baseline/moestream-master-b8cf7ff}")
+base=$(readlink -f "${3:-${BASELINE_ENGINE:?pass baseline-engine or set BASELINE_ENGINE}}")
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/logs/graph_framework/$step/glm
 mkdir -p "$out"
 cd "$root"
 
-MODEL=${GLM_MODEL:-/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf}
-STORE=${GLM_STORE:-/data/moestream-offload/glm53flash-aj-iq2xxs-cold3173.gguf}
-USAGE=${GLM_USAGE:-$HOME/work/moestream-prefetch/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt}
-TOML_SRC=${GLM_TOML:-$HOME/work/moestream-prefetch/glm_runs/spread_off.toml}
+MODEL=${GLM_MODEL:?set GLM_MODEL to the model file or first shard}
+STORE=${GLM_STORE:?set GLM_STORE to the expert-store file}
+USAGE=${GLM_USAGE:-$root/docs/ssd-offload/data/glm53flash_usage_combined_old_plus_survey5.txt}
+TOML_SRC=${GLM_TOML:-$root/configs/glm53flash_AJ_IQ2XXS_spread_offload.toml}
 PROMPT='Explain how a mixture-of-experts transformer routes tokens, in a few clear paragraphs.'
 
 wait_idle() {
@@ -53,7 +53,23 @@ run_one() {  # arm binary-label binary
   local arm=$1 label=$2 bin=$3 tag="$1_$2"
   wait_idle || return 1
   drop_cache
-  sed "s#^log_path *=.*#log_path = \"$out/$tag.engine.log\"#" "$TOML_SRC" > "$out/$tag.toml"
+  python3 - "$TOML_SRC" "$out/$tag.toml" "$MODEL" "$out/$tag.engine.log" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+text, model_count = re.subn(r"^model_path = .*$",
+                            f"model_path = {json.dumps(sys.argv[3])}",
+                            text, count=1, flags=re.M)
+text, log_count = re.subn(r"^log_path *=.*$",
+                          f"log_path = {json.dumps(sys.argv[4])}",
+                          text, count=1, flags=re.M)
+if model_count != 1 or log_count != 1:
+    raise SystemExit("config must contain one model_path and one log_path")
+Path(sys.argv[2]).write_text(text)
+PY
   local env=(ZEROMOE_GLM5NEXT_OFFLOAD_FIRST_LAYER=3 ZEROMOE_GLM5NEXT_OFFLOAD_DDR_GIB=32
              ZEROMOE_GLM5NEXT_OFFLOAD_PINNED=0.5 ZEROMOE_GLM5NEXT_OFFLOAD_POLICY=lru
              ZEROMOE_GLM5NEXT_OFFLOAD_STORE="$STORE" ZEROMOE_GLM5NEXT_OFFLOAD_MODEL="$MODEL"
@@ -77,7 +93,7 @@ run_one() {  # arm binary-label binary
 # The prefetch session's queued arms (glm_runs/run_clean.sh) start whenever the box is
 # quiet and yield to this file; hold it for the duration of the gate so the two
 # do not race for the GPU. Only removed if this script created it.
-flag=$HOME/work/.no-arms
+flag=${NO_ARMS_FLAG:-${TMPDIR:-/tmp}/zeromoe-no-arms}
 if [ ! -e "$flag" ]; then
   echo "gf-glm-gate $step pid $$ $(date -Is)" > "$flag"
   trap 'rm -f "$flag"' EXIT

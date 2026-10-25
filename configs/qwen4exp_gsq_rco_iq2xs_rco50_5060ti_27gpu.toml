@@ -8,8 +8,8 @@
 # Keep event-backed CPU/GPU handoffs enabled; GRAPH_PARALLEL=0 is a blocking-sync
 # diagnostic mode, not the recommended benchmark setting.
 
-model_path = "/data/sda/models/qwen3.8-flash-next/GSQ-RCO-IQ2_XS_RCO50"
-log_path = "/tmp/qwen4exp_gsq_rco_iq2xs_rco50_5060ti_27gpu.log"
+model_path = "/path/to/model-or-shard-directory"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 416

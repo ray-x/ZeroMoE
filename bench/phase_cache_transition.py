@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Targeted phase-transition correctness/memory test, not the frozen performance gate.
 
-Run on an idle CUDA host: python3 bench/phase_cache_transition.py --model mimo|ling
+Run on an idle CUDA host: python3 bench/phase_cache_transition.py --model mimo|ling --model-path <model.gguf>
 Runs a short, chunked long, then repeated short request in each configuration.
 Captures logits before submitting the next request, so prompt resets and state
 survival across graph rebuilds are checked without autoregressive divergence.
@@ -59,7 +59,7 @@ def compare_requests(a, b):
             "max_abs": max(x["max_abs"] for x in steps)}
 
 
-def prepare(model, directory, isolate_assist=False, gpu0_cache_gb=None):
+def prepare(model, model_path, directory, isolate_assist=False, gpu0_cache_gb=None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ZEROMOE_")}
     env["CUDA_VISIBLE_DEVICES"] = "0,1"
     if model == "mimo":
@@ -81,12 +81,19 @@ def prepare(model, directory, isolate_assist=False, gpu0_cache_gb=None):
                    ZEROMOE_LING_OFFLOAD_PIN="1", ZEROMOE_LING_OFFLOAD_ASYNC="1",
                    ZEROMOE_LING_OFFLOAD_USAGE=str(profile), ZEROMOE_LING_PREFILL_CHUNK="256",
                    ZEROMOE_GLM5NEXT_BATCHED_NEGATIVE_SKIP="1", ZEROMOE_GLM5NEXT_PREFILL_OP_OFFLOAD="0",
-                   ZEROMOE_LING_OFFLOAD_MODEL="/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf")
+                   ZEROMOE_LING_OFFLOAD_MODEL=str(model_path.resolve()))
         cap = 95
         if isolate_assist:
             env["ZEROMOE_GLM5NEXT_GPU_ASSIST"] = "0"
             env["ZEROMOE_GLM5NEXT_ASSIST2_SLOTS"] = "0"
             text = "# phase-validation: adaptive GPU assist disabled in both reference and candidate\n" + text
+    text, n_model = re.subn(
+        r"^model_path = .*$",
+        f"model_path = {json.dumps(str(model_path.resolve()))}",
+        text, count=1, flags=re.M,
+    )
+    if n_model != 1:
+        raise AssertionError("cannot find model_path in the base config")
     if gpu0_cache_gb is not None:
         # Equivalent-placement control: the same experts the extension would hold live in the permanent GPU 0 cache.
         text, n = re.subn(r"^moe_cache_gb = [0-9.]+", f"moe_cache_gb = {gpu0_cache_gb}", text, count=1, flags=re.M)
@@ -102,7 +109,7 @@ def prepare(model, directory, isolate_assist=False, gpu0_cache_gb=None):
 def run_case(args, name, cache_mib, prompts, teacher_source=None, gpu0_cache_gb=None):
     directory = args.output / name
     directory.mkdir(parents=True, exist_ok=True)
-    env, config, cap = prepare(args.model, directory, args.isolate_assist, gpu0_cache_gb)
+    env, config, cap = prepare(args.model, args.model_path, directory, args.isolate_assist, gpu0_cache_gb)
     env.update(ZEROMOE_PHASE_CACHE_MIB=str(cache_mib), ZEROMOE_PHASE_CACHE_RESERVE_MIB="512",
                ZEROMOE_DECODE_LOGITS_DUMP=str(directory / "current.bin"),
                ZEROMOE_GENERATED_TOKEN_FILE=str(directory / "current.tokens"))
@@ -185,6 +192,8 @@ def run_case(args, name, cache_mib, prompts, teacher_source=None, gpu0_cache_gb=
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", choices=("mimo", "ling"), required=True)
+    parser.add_argument("--model-path", type=Path, required=True,
+                        help="model file or shard directory for the selected model")
     parser.add_argument("--binary", type=Path, default=ROOT / "build_mimo/zeromoe")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache-mib", type=int, default=1024)
@@ -202,6 +211,9 @@ def main():
                         help="With --control-output: run only the equivalent-placement control and compare it to the control")
     args = parser.parse_args()
     args.binary = args.binary.resolve(); args.output = args.output.resolve()
+    args.model_path = args.model_path.resolve()
+    if not args.model_path.exists():
+        parser.error(f"model path does not exist: {args.model_path}")
     args.output.mkdir(parents=True, exist_ok=False)
     short = "Explain why the sky appears blue in one sentence."
     long = ("The red parcel belongs to Ada. The blue parcel belongs to Ben. " * 48 +
@@ -212,7 +224,7 @@ def main():
         control = args.control_output.resolve()
         check = args.output / "control-config-check"
         check.mkdir()
-        _, config, _ = prepare(args.model, check, args.isolate_assist)
+        _, config, _ = prepare(args.model, args.model_path, check, args.isolate_assist)
         if config.read_text() != (control / "test.toml").read_text():
             raise AssertionError("reused control has a different model/workload configuration")
         for index in range(2):

@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash Q2_K smoke/runtime profile.
 # The model directory contains the seven GGUF shards on the local NVMe drive;
 # V4.1 is selected from GGUF metadata.
-model_path = "/home/ray/vllm-workspace/DeepSeek-V41-Flash"
+model_path = "/path/to/model-or-shard-directory"
 log_level = "INFO"
 context_size = 1024
 max_new_tokens = 40
@@ -77,8 +77,8 @@ host_ram_gb = 75.0
 # Usage history is model-specific learned state.  The first run creates these
 # files at shutdown; later runs use them for ranked preload.
 freeze_usage_stats = false
-pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_deepseek-v41_usage"
-prefill_pin_file = "/home/ray/Projects/ZeroMoE/.zeromoe_deepseek-v41_usage_prefill"
+pin_file = ".zeromoe_deepseek-v41_usage"
+prefill_pin_file = ".zeromoe_deepseek-v41_usage_prefill"
 # cpu_affinity_layers (2026-09-13): TESTED on the 10 flattest layers
 # (0,1,15,19,27,30,33,36,38,39 -- see git history/memory for the real
 # per-layer concentration data this was picked from). REAL RESULT: cache

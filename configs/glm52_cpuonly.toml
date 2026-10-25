@@ -17,7 +17,7 @@
 # NOTE: much slower than GPU (experts dequant+matmul on CPU every token). That's
 # expected -- correctness isolation, not throughput.
 
-model_path = "/data/models/GLM-5.2-GGUF/UD-IQ2_M"
+model_path = "/path/to/model-or-shard-directory"
 
 context_size   = 32768
 max_new_tokens = 2048

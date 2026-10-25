@@ -1,9 +1,9 @@
 # Matched IQ1_M baseline for the 22 GPU / 26 DDR full-graph decode split.
 # Launch with GRAPH_PRELOAD_LAYERS=22 and GRAPH_PRELOAD_TRAILING=1.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
-log_path = "/tmp/qwen4exp_iq1m_fullgraph_22_26.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 2048

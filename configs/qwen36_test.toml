@@ -1,5 +1,5 @@
 # Qwen3.6-35B-A3B-UD quick CPU test config (8 tokens, small context)
-model_path = "/Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD"
+model_path = "/path/to/model-or-shard-directory"
 
 context_size   = 512
 max_new_tokens = 16

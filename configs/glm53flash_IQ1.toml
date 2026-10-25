@@ -8,7 +8,7 @@
 # vault). Only the listed [[gpus]] devices are eligible for ZeroMoE roles;
 # the RTX 5060 is intentionally excluded.
 
-model_path = "/data/sdb/models/GLM-5.3-Flash"
+model_path = "/path/to/model-or-shard-directory"
 reasoning_effort = "low"
 enable_thinking = true
 

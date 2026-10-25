@@ -1,6 +1,6 @@
 # Initial correctness profile: native bounded DDR/VRAM expert caches, no second
 # graph-owned expert arena. Raise context/batching only after parity validation.
-model_path = "/mnt/usb-ssd/@/home/ray/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf"
+model_path = "/path/to/model-or-shard-directory"
 context_size = 2048
 max_new_tokens = 16
 temperature = 0.0

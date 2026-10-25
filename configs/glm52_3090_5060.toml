@@ -6,9 +6,9 @@
 # caused "blk.13 missing". Re-enable dense_model_path only with a matching
 # GLM-5.2 (79-layer) dense file.
 
-# model_path = "/data/models/GLM-5.2-GGUF/UD-IQ2_M"
-model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_pack"
-# dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
+# model_path = "/path/to/local-resource"
+model_path = "/path/to/model-or-shard-directory"
+# dense_model_path = "/path/to/local-resource"
 log_path = "debug.log"   # empty (default) = stderr
 log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 prefill_pin_file = ".zeromoe_usage_prefill"

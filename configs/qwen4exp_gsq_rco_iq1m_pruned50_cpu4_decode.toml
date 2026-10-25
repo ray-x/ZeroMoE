@@ -1,10 +1,10 @@
 # Qwen3.8-Flash-Next GSQ-RCO IQ1_M decode benchmark with four CPU-offloaded
 # MoE layers. Layers 0-3 stay in host RAM and never dispatch routed experts
 # to the GPU; all other layers retain the normal GPU path.
-model_path = "/data/models/qwen3.8-flash-next/GSQ-RCO-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 cpu_affinity_layers = [0, 1, 2, 3]
 
-log_path = "/tmp/qwen4exp_gsq_rco_iq1m_pruned50_cpu4_decode.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 512

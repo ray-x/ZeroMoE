@@ -21,9 +21,9 @@
 #   worse than the dual-GPU one. This config is for PREFILL comparison;
 #   re-tune moe_cache_gb if decode is also measured here.
 #
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 
-log_path  = "/tmp/zeromoe-usage-pinned512-20260907.log"
+log_path  = "run.log"
 log_level = "INFO"
 
 context_size   = 2048
@@ -33,7 +33,7 @@ top_p          = 0.95
 enable_thinking = false
 
 # --- I/O ---------------------------------------------------------------
-# /data/sda is ntfs3 and this checkpoint has NOT been through
+# /path/to/local-resource is ntfs3 and this checkpoint has NOT been through
 # `gguf_tool pack` (no 4096-byte tensor alignment), so O_DIRECT/io_uring
 # are off for bring-up: one variable at a time. Revisit after correctness.
 direct_io  = false

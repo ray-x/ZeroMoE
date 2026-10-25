@@ -21,9 +21,9 @@
 # caused "blk.13 missing". Re-enable dense_model_path only with a matching
 # GLM-5.2 (79-layer) dense file.
 
-# model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_pack"
-model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_align"
-# dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
+# model_path = "/path/to/local-resource"
+model_path = "/path/to/model-or-shard-directory"
+# dense_model_path = "/path/to/local-resource"
 log_path = "debug.log"   # empty (default) = stderr
 # log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 log_level = "INFO"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
@@ -297,7 +297,7 @@ prefetch_pilot_k_depth2 = 1
 # ram_pinned_budget_gb increase below, so that experiment starts from a
 # clean, known-safe memory baseline instead of stacking on undocumented drift.
 host_ram_gb          = 108.0
-mirror_model_path = "/data/models/UD-IQ2_M_align"   # 2026-08-15: 2nd copy on the OTHER NVMe (KIOXIA). Stripes expert reads across both devices.
+mirror_model_path = "/path/to/mirror-model-directory"# 2026-08-15: 2nd copy on the OTHER NVMe (KIOXIA). Stripes expert reads across both devices.
 # 2026-08-16 RETEST under the corrected host_ram_gb=108 -- REGRESSED, worse
 # than the original 40GB/host_ram_gb=120 test despite a much smaller 15GB
 # budget: overall 0.62->0.57 tok/s, hit rate 71.9%->67.0% (-4.9pp, bigger

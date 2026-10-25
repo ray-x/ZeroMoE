@@ -10,17 +10,17 @@
 #   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0 ./build_ggmlcuda/zeromoe \
 #       --config configs/qwen4exp_exl3_bridge_all48.toml --raw-prompt
 # Correctness check: bench/exl3_ggml_logits_parity.py
-exl3_ggml_bridge_model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
+exl3_ggml_bridge_model_path = "/path/to/exl3-model-directory"
 exl3_ggml_bridge_layers = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
 exl3_gpu_cache_gb = 8.0
 exl3_cpu_expert_cache_gb = 0.0
 
 # Matched IQ1_M baseline for the 22 GPU / 26 DDR full-graph decode split.
 # Launch with GRAPH_PRELOAD_LAYERS=22 and GRAPH_PRELOAD_TRAILING=1.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
-log_path = "/tmp/qwen4exp_iq1m_fullgraph_22_26.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 2048

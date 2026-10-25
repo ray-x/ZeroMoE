@@ -9,7 +9,7 @@
 #   GPU 1: GeForce RTX 5060 Ti (dense layers + KV cache)
 # Adjust the [[gpus]] blocks if the device IDs or available VRAM differ.
 
-model_path = "/data/sda/models/glm53flash/UD-IQ4_XS"
+model_path = "/path/to/model-or-shard-directory"
 reasoning_effort = "max"
 enable_thinking = true
 

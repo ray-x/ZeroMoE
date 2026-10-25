@@ -1,6 +1,6 @@
 # ZeroMoE — Qwen3.6-35B-A3B-UD CPU-ONLY config for MacBook Air
 #
-# Model: /Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD
+# Model: /path/to/local-resource
 # Format: UD-IQ2_M (12 GB file, ~1.10 MB per routed expert slab)
 #
 # This config targets a MacBook Air (Apple Silicon, no CUDA).  The root
@@ -22,7 +22,7 @@
 # point is pin_topk_per_layer ~2-3 (80-120 pinned experts total), leaving the
 # rest of the 4 GB budget for dynamic LRU hits.
 
-model_path = "/Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD"
+model_path = "/path/to/model-or-shard-directory"
 
 context_size   = 4096
 max_new_tokens = 10

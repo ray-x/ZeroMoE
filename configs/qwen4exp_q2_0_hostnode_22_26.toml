@@ -1,8 +1,8 @@
 # Matched 22 GPU / 26 DDR Q2_0 profile using the opt-in full CPU host-node path.
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
-log_path = "/tmp/qwen4exp_q2_0_hostnode_22_26.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 2048

@@ -59,7 +59,7 @@
 # off; global_topn's 5000 pins reach ~79.8% coverage. Rebuild the files (set
 # freeze_usage_stats=false and run varied prompts) if you change model file.
 #
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 
 log_path  = "debug_qwen4exp.log"
 log_level = "INFO"
@@ -71,7 +71,7 @@ top_p          = 0.95
 enable_thinking = false
 
 # --- I/O ---------------------------------------------------------------
-# /data/sda is ntfs3 and this checkpoint has NOT been through
+# /path/to/local-resource is ntfs3 and this checkpoint has NOT been through
 # `gguf_tool pack` (no 4096-byte tensor alignment), so O_DIRECT/io_uring
 # are off for bring-up: one variable at a time. Revisit after correctness.
 direct_io  = false

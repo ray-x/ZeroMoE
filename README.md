@@ -23,26 +23,19 @@ ZeroMoE/
 ├── CMakeLists.txt                 # Unified C++/CUDA compiler configuration
 ├── setup.sh                       # Automated installation and toolchain builder
 ├── README.md                      # Engine configuration documentation
-├── include/                       # Core Architecture Headers
-│   ├── engine.hpp                 # Memory allocation & expert slab managers
-│   ├── gguf_loader.hpp            # Binary parsing & architecture discovery
-│   ├── kernels_cpu.hpp            # AVX-512 block structures & primitives
-│   ├── iq2_m_decoder.hpp          # 2-bit IQ2_M codebook dequantizers
-│   ├── gguf_tokenizer.hpp         # Embedded vocabulary metadata extractor
-│   ├── cuda_manager.hpp           # RTX Host-to-Device memory bridge
-│   ├── async_prefetcher.hpp       # Lock-free SPSC prefetch queue
-│   └── ram_manager.hpp            # MemAvailable monitor & LRU manager
-├── src/                           # Core Implementation Units
-│   ├── main.cpp                   # Entry point and interactive terminal CLI
-│   ├── execution_layer.cpp        # Layer forward lookahead orchestration
-│   ├── attention_layer.cpp        # Absorbed attention matrix calculation
-│   ├── graph_initializer.cpp      # Topological parameter mapping core
-│   ├── kernels_cpu.cpp            # x86 AVX-512 CPU kernel backend
-│   └── kernels_cpu_neon.cpp       # Apple Silicon ARM NEON CPU kernel backend
-├── cuda/                          # GPU Optimization Stack
-│   └── gguf_cuda.cu               # Ampere __dp4a dynamic quantization kernels
-└── api/                           # Production Network Gateways
-    └── api_server.py              # Anthropic-compatible ASGI Python server
+├── core/                          # Engine configuration, scheduling and execution
+├── memory/                        # I/O, RAM and VRAM cache tiers
+├── models/                        # Shared graph and model-family builders
+├── backends/                      # CPU, CUDA, ggml and EXL3 backends
+├── kernels/                       # CUDA kernels
+├── tools/                         # GGUF tools
+├── tests/                         # Native and CPU component tests
+├── bench/                         # Benchmark scripts and fixtures
+├── configs/                       # TOML runtime profiles
+├── scripts/                       # Build and validation helpers
+├── patches/                       # ggml patch series
+├── docs/                          # Design notes and model recipes
+└── api/                           # Optional API gateway (not included in this snapshot)
 
 ```
 
@@ -50,9 +43,9 @@ ZeroMoE/
 
 ### Linux + CUDA (full engine)
 
-Run the automated environment setup tool. This script validates your system
-compilers (`g++`, `nvcc`), prepares an isolated Python virtual environment,
-installs ASGI gateway dependencies, and runs CMake to build the full engine:
+Run the automated setup tool. It validates the required compilers (`g++`,
+`nvcc`) and builds the engine. Optional API dependencies are installed only
+when the API server and its requirements file are present:
 
 ```bash
 chmod +x setup.sh
@@ -62,7 +55,7 @@ chmod +x setup.sh
 Or manually:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML=ON
 cmake --build build -j$(nproc)
 ```
 
@@ -70,6 +63,11 @@ AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
 AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
 failure. Configure with `-DZEROMOE_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
 both ZeroMoE and ggml CPU kernels.
+
+Before inference, edit a profile's `model_path` and any related model,
+mirror, expert-store, or usage-profile paths for resources available on your
+machine. Model weights are not included; example profiles use placeholders.
+Keep model files and generated stores outside the repository.
 
 ### macOS / CPU-only build
 
@@ -361,37 +359,17 @@ checks warm prefill and matched first-to-last decode performance against Bee.
 | `--system-prompt <text>` | Prepend a system-role message ahead of the user turn (chat-template modes only; ignored with `--raw-prompt`). Empty by default — ZeroMoE never invents one on its own. Use this to steer behavior/language, e.g. `--system-prompt "Respond in English unless asked otherwise."` |
 | `--log-path <file>` | Redirect logging to a file instead of stderr. |
 | `--log-level <lvl>` | `VERBOSE` \| `DEBUG` \| `INFO` (default) \| `WARN` \| `ERROR`. |
-| `--trace-filter <tags>` | Comma-separated tag prefixes (e.g. `HC,MLA`) restricting VERBOSE tensor tracing to just those checkpoints; requires `--log-level VERBOSE`. Empty (default) traces everything. See `include/tensor_trace.hpp` / CLAUDE.md §5. |
+| `--trace-filter <tags>` | Comma-separated tag prefixes (e.g. `HC,MLA`) restricting VERBOSE tensor tracing to just those checkpoints; requires `--log-level VERBOSE`. Empty (default) traces everything. See `core/tensor_trace.hpp` / CLAUDE.md §5. |
 | `--trace-abort-on-nan` | Abort the process at the first NaN/Inf caught by a tensor-trace checkpoint, instead of continuing. Off by default. |
 | `--help`, `-h` | Show the CLI help interface. |
 
 > Most of these flags have a matching TOML key of the same name (e.g. `raw_prompt`, `system_prompt`, `pin_threshold`) for use with `--config`; a config file's values are used unless the equivalent CLI flag is also passed, in which case the CLI flag wins. Run `--gen-config` to see the full set of TOML-only options (e.g. `unpacked_expert_format`, `cuda_cufile`, `pin_strategy`) that have no CLI-flag equivalent.
 
-### Deploying the Anthropic-Compatible API
+### Optional API gateway
 
-ZeroMoE includes a production-grade FastAPI wrapper that maps external HTTP network streams straight into your local executable's stdin/stdout pipe channels. It matches the native Anthropic `/v1/messages` format scheme, serving Server-Sent Events (SSE) token chunks asynchronously.
-
-To spin up the network gateway, activate your virtual workspace environment and run the application server:
-
-```Bash
-source api/venv/bin/activate
-python3 api/api_server.py
-```
-
-Query the live inference endpoint utilizing standard cURL connection patterns:
-
-```Bash
-curl -X POST http://localhost:8000/v1/messages \
- -H "Content-Type: application/json" \
- -d '{
-"model": "glm-5.2",
-"max_tokens": 1024,
-"temperature": 0.7,
-"messages": [
-{"role": "user", "content": "Explain the difference between thread concurrency and parallelism."}
-]
-}'
-```
+The API server is not included in this repository snapshot. `setup.sh` skips
+API dependency installation unless both `api/api_server.py` and
+`api/requirements.txt` are present.
 
 ## Testing
 
@@ -542,3 +520,8 @@ bench/regression_gate.sh <binary> --models qwen38,glm53flash,ling31,dsv41,glm53 
 
 Put the oracle comparison (prompt, steps, cosine range, first divergence) and the gate numbers in
 `docs/models/<model>.md`, and update `docs/perf-baselines.md` when a number improves or a band moves.
+
+## License
+
+ZeroMoE is licensed under the GNU General Public License, version 3 only.
+See [LICENSE](LICENSE) for the complete terms.

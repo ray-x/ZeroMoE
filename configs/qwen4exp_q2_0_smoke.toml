@@ -2,7 +2,7 @@
 # (blk.N.ffn_down_exps.weight is Q2_0 on every MoE layer, the routed-expert
 # down projection -- previously entirely unsupported by this engine).
 # Minimal config: correctness/coherence check, not a tuned throughput config.
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 log_path  = "debug_qwen4exp_q2_0_smoke.log"
 log_level = "INFO"

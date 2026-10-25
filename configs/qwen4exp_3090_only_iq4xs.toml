@@ -38,7 +38,7 @@
 # architecture and routing weights, only quantization differs) as a starting
 # point. Rebuild if routing coverage looks off for this quant.
 
-model_path = "/data/models/qwen3.8-flash-next/UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 log_path  = "logs/qwen4exp_3090only_iq4xs.log"
 log_level = "INFO"

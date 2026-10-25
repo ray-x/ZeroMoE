@@ -1,4 +1,4 @@
-model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
+model_path = "/path/to/model-or-shard-directory"
 model_format = "exl3"
 model_load_only = true
 

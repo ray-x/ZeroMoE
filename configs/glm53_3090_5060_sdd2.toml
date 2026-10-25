@@ -6,15 +6,15 @@
 # caused "blk.13 missing". Re-enable dense_model_path only with a matching
 # GLM-5.2 (79-layer) dense file.
 
-# model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_pack"
+# model_path = "/path/to/local-resource"
 # 2026-08-29: primary copy restored after the GLM-5.3 migration at a
 # DIFFERENT path than before -- flat "GLM-5.2-GGUF_align/<shard>.gguf"
-# (matching the mirror's own flat layout at /data/models/UD-IQ2_M_align),
+# (matching the mirror's own flat layout at /path/to/local-resource),
 # not the old "GLM-5.2-GGUF/UD-IQ2_M_align/<shard>.gguf" nesting. The old
 # path is gone; this one is what the user actually copied the 223GB back
 # to. Confirmed real (223GB, matches mirror_model_path's own size exactly).
-model_path = "/home/ray/vllm-workspace/GLM-5.3-GGUF-align"
-# dense_model_path = "/data/models/GLM-5.2-GGUF/UD-IQ4_XS"
+model_path = "/path/to/model-or-shard-directory"
+# dense_model_path = "/path/to/local-resource"
 log_path = "debug.log"   # empty (default) = stderr
 # log_level = "DEBUG"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
 log_level = "INFO"        # VERBOSE | DEBUG | INFO (default) | WARN | ERROR
@@ -328,7 +328,7 @@ prefetch_pilot_k_depth2 = 1
 # accompanying comment explaining why -- worth treating any future
 # unexplained change to this specific line with real suspicion.
 host_ram_gb          = 108.0  # 2026-08-29 RE-CONFIRMED: also tested 115 directly (real 3-turn A/B) -- mean decode-only 0.991 tok/s (0.992/1.022/0.959), 18GB free after 3 turns, 0 swap. No clear throughput edge over 108 (both land in the same ~0.95-1.03 noise band on this hardware) while using more of the real margin. 108 stays the settled value. See CLAUDE.md.
-mirror_model_path = "/data/models/GLM-5.3-GGUF-align"   # 2026-08-15: 2nd copy on the OTHER NVMe (KIOXIA). Stripes expert reads across both devices.
+mirror_model_path = "/path/to/mirror-model-directory"# 2026-08-15: 2nd copy on the OTHER NVMe (KIOXIA). Stripes expert reads across both devices.
 # 2026-08-16 RETEST under the corrected host_ram_gb=108 -- REGRESSED, worse
 # than the original 40GB/host_ram_gb=120 test despite a much smaller 15GB
 # budget: overall 0.62->0.57 tok/s, hit rate 71.9%->67.0% (-4.9pp, bigger

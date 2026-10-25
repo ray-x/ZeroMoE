@@ -1,8 +1,8 @@
 # Deterministic GLM-5.3 Flash MTP comparison profile. Test-only.
-model_path = "/data/sdb/models/GLM-5.3-Flash"
+model_path = "/path/to/model-or-shard-directory"
 reasoning_effort = "low"
 enable_thinking = false
-log_path = "/tmp/zeromoe_glm53flash_mtp_on.log"
+log_path = "run.log"
 log_level = "INFO"
 context_size = 4096
 max_new_tokens = 12

@@ -2,12 +2,13 @@
 # Source this (". bench/glm_recipe_env.sh") before launching the engine for the 15 tok/s GLM-5.3-Flash dual-GPU recipe.
 #   GGML_KERNEL_LIBS  directory holding libggml-cpu.so.0 with the AVX-512VL IQ2_XXS dot (ggml fork 36f489d6b or later);
 #                     the engine's default linked ggml (built 2026-10-04) does not have it: 14.91 -> 15.43 tok/s.
+#                     Required; GGML_BASE_LIBS optionally points at the matching ggml build's src directory.
 #   GLM_RANKING       usage file used for both the 3090 cache (toml pin_file) and the 5060 Ti hot set.
 export CUDA_VISIBLE_DEVICES=0,1
 export ZEROMOE_GLM5NEXT_GPU1_HOT_GIB=${ZEROMOE_GLM5NEXT_GPU1_HOT_GIB:-15.0}
 export ZEROMOE_GLM5NEXT_CPU_THREADS=${ZEROMOE_GLM5NEXT_CPU_THREADS:-10}
-GGML_KERNEL_LIBS=${GGML_KERNEL_LIBS:-$HOME/work/ggml-iq2xxs/lib_new}
-ORIG=$HOME/Projects/moestream-build-upstream-master/ggml-build/src
+GGML_KERNEL_LIBS=${GGML_KERNEL_LIBS:?set GGML_KERNEL_LIBS to the directory containing the required libggml-cpu.so.0}
+ORIG=${GGML_BASE_LIBS:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build_ggmlcuda/ggml-build/src}
 export LD_LIBRARY_PATH=$GGML_KERNEL_LIBS:$ORIG:$ORIG/ggml-cuda${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 GLM_RANKING=${GLM_RANKING:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docs/ssd-offload/data/glm53flash_usage_base_plus_decode100.txt}
 export ZEROMOE_GLM5NEXT_OFFLOAD_USAGE=$GLM_RANKING ZEROMOE_GLM5NEXT_GPU1_HOT_USAGE=$GLM_RANKING

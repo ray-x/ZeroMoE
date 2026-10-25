@@ -1,5 +1,9 @@
 import struct
-p='/Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD/Qwen3.6-35B-A3B-UD-IQ2_M.gguf'
+import sys
+
+p = sys.argv[1] if len(sys.argv) > 1 else None
+if not p:
+    raise SystemExit(f"usage: {sys.argv[0]} <model.gguf>")
 with open(p,'rb') as f:
     print('magic',f.read(4))
     ver=struct.unpack('<I',f.read(4))[0]

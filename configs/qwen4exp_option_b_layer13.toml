@@ -5,7 +5,7 @@
 # other routed layers remain complete in the DDR graph arenas. No Phase-1
 # predictive staging, mapped-pointer shim, or staging arena is enabled.
 
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 
 # Preserve the baseline full-graph topology. The 22 complete GPU-resident
 # layers are selected at launch with:

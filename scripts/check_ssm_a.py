@@ -2,8 +2,11 @@
 import gguf
 import numpy as np
 from pathlib import Path
+import sys
 
-p = Path('/Users/rayxu/.lmstudio/models/Qwen/Qwen3.6-35B-A3B-UD/Qwen3.6-35B-A3B-UD-IQ2_M.gguf')
+p = Path(sys.argv[1]) if len(sys.argv) > 1 else None
+if p is None:
+    raise SystemExit(f"usage: {sys.argv[0]} <model.gguf>")
 reader = gguf.GGUFReader(p)
 
 for l in [0, 33, 34, 39]:

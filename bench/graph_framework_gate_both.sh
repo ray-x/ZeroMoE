@@ -4,12 +4,13 @@
 #
 #   bench/graph_framework_gate_both.sh <candidate-engine> <step-name>
 #
-# Holds ~/work/.no-arms while running. Needs logs/graph_framework/inputs/.
+# Holds a shared no-arms flag while running. Needs logs/graph_framework/inputs/.
 set -u
 bin=$(readlink -f "${1:?candidate engine}"); name=${2:?step name}
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
-base=${BASELINE_ENGINE:-$HOME/work/gf-baseline/moestream-master-b8cf7ff}
-touch ~/work/.no-arms; trap 'rm -f ~/work/.no-arms' EXIT
+base=${BASELINE_ENGINE:?set BASELINE_ENGINE to the reference engine}
+flag=${NO_ARMS_FLAG:-${TMPDIR:-/tmp}/zeromoe-no-arms}
+touch "$flag"; trap 'rm -f "$flag"' EXIT
 inputs=logs/graph_framework/inputs; out=logs/graph_framework/$name; mkdir -p "$out"
 common=(--engine "$bin" --baseline-engine "$base" --prompt-ids $inputs/prompt.tokens
         --continuation $inputs/Q2.tokens --all-split --wait-idle "${WAIT_IDLE:-900}"

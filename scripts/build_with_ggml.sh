@@ -5,7 +5,7 @@
 #
 # Environment:
 #   GGML_ROOT      ggml source tree (headers; patched in place when GGML_PREBUILT is empty)
-#                  default: /home/ray/Projects/beellama.cpp/ggml
+#                  default: <main-checkout>/build_ggmlcuda/ggml-src/ggml
 #   GGML_PREBUILT  directory holding the already built libggml*.so (<dir>/src/lib*.so,
 #                  <dir>/src/ggml-cuda/libggml-cuda.so). Default: the master-level build kept in the
 #                  main checkout. Set to "" to compile ggml from GGML_ROOT and apply patches/ggml
@@ -16,8 +16,8 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 BUILD=${1:?usage: build_with_ggml.sh <build-dir> [cmake --build args]}
 shift || true
-GGML_ROOT=${GGML_ROOT:-/home/ray/Projects/beellama.cpp/ggml}
 MAIN=$(git rev-parse --path-format=absolute --git-common-dir | sed 's|/\.git$||')
+GGML_ROOT=${GGML_ROOT:-$MAIN/build_ggmlcuda/ggml-src/ggml}
 GGML_PREBUILT=${GGML_PREBUILT-$MAIN/build_ggmlcuda/ggml-build}
 CUDA_ARCH=${CUDA_ARCH:-86}
 

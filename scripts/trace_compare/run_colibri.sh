@@ -11,9 +11,10 @@
 # TEMP=0 = greedy.
 set -euo pipefail
 
-# <-- SET THESE TWO for your machine:
-SNAP="${COLIBRI_SNAP:-/path/to/GLM-5.2-colibri-int4}"            # HF: jlnsrk/GLM-5.2-colibri-int4
-GLM_BIN="${COLIBRI_GLM:-/Users/rayxu/project/colibri/c/glm}"
+# Set COLIBRI_SNAP to the model snapshot and COLIBRI_GLM to the colibri binary
+# (or its intended output path if the script should build it).
+SNAP="${COLIBRI_SNAP:?set COLIBRI_SNAP to the model snapshot directory}"
+GLM_BIN="${COLIBRI_GLM:?set COLIBRI_GLM to the colibri binary path}"
 
 PROMPT="${1:-Hello}"
 OUT="${2:-colibri_trace.log}"

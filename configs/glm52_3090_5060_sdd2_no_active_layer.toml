@@ -22,7 +22,7 @@
 # See CLAUDE.md's "Active Layer Area (Three-Tier Caching)" entry for what
 # this mechanism is for.
 
-model_path = "/home/ray/vllm-workspace/GLM-5.2-GGUF/UD-IQ2_M_align"
+model_path = "/path/to/model-or-shard-directory"
 log_path = "debug.log"
 log_level = "INFO"
 

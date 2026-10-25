@@ -45,7 +45,7 @@
 # dense+moe WORK CORRECTLY (moe_cache_gb is no longer silently nullified),
 # not FAST. If a second GPU is ever available, prefer the dual-GPU config.
 
-model_path = "/data/models/GLM-5.2-GGUF/UD-IQ2_M"
+model_path = "/path/to/model-or-shard-directory"
 log_path = "debug_single_3090.log"
 log_level = "DEBUG"
 

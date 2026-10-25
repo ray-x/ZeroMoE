@@ -29,6 +29,7 @@
 #   * no other zeromoe / llama.cpp process, GPUs idle
 #   * enough free RAM (some recipes need host_ram_gb + 21.5 GiB margin; the gate uses
 #     --force-start under scripts/run_capped.sh where the conservative margin would refuse)
+#   * set MIMO26_MODEL when selecting the mimo26 recipe
 #
 # Coherence is NOT auto-checked: these models are non-deterministic under near-tie
 # routing (a tiny numeric change flips an expert and the text diverges while staying
@@ -325,15 +326,32 @@ run_ling31() {
 # ---------------------------------------------------------------------------
 run_mimo26() {
   local log="$LOG_DIR/mimo26.$STAMP.log" eng="$LOG_DIR/mimo26.$STAMP.engine.log" rc=0
+  local model=${MIMO26_MODEL:?set MIMO26_MODEL to the MiMo model file or shard directory}
+  local config="$LOG_DIR/mimo26.$STAMP.toml"
   echo "--- mimo26: DNS prompt, 64 tokens (dual GPU, 100 GiB DDR) ---"
-  if [[ ! -r /mnt/usb-ssd/@/home/ray/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf ]]; then
-    printf "FAIL  %-12s model file not readable (is the model drive mounted?)\n" mimo26; FAIL=$((FAIL+1)); return
+  if [[ ! -r "$model" ]]; then
+    printf "FAIL  %-12s model file not readable: %s\n" mimo26 "$model"; FAIL=$((FAIL+1)); return
   fi
+  python3 - "configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml" "$config" "$model" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text()
+text, count = re.subn(r"^model_path = .*$",
+                      f"model_path = {json.dumps(sys.argv[3])}",
+                      text, count=1, flags=re.M)
+if count != 1:
+    raise SystemExit("config must contain exactly one model_path")
+Path(sys.argv[2]).write_text(text)
+PY
   echo "Explain what DNS is and how a domain name gets resolved to an IP address." \
     | env CUDA_VISIBLE_DEVICES=0,1 ZEROMOE_DISABLE_ROUTER_BF16=1 ZEROMOE_MIMO2_OFFLOAD_DDR_GIB=100 \
+        ZEROMOE_MIMO2_OFFLOAD_MODEL="$model" \
         ZEROMOE_MIMO2_OFFLOAD_USAGE="$PWD/bench/profiles/mimo26_combined.usage" \
         scripts/run_capped.sh --limit-gb 110 -- "$BIN" \
-        --config configs/mimo26_flash_gsq_rco_3bit_ingraph_dual.toml \
+        --config "$config" \
         --log-path "$eng" --temp 0 --ngen 64 > "$log" 2>&1 || rc=$?
   local before=$FAIL
   report mimo26 "$(grab_rate "$eng")" "$rc" "$log" "$(grab_tokens "$eng")" 64

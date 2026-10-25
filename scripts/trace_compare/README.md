@@ -50,7 +50,7 @@ Set the paths via env vars (defaults are placeholders you must override):
 export ZEROMOE_CONFIG=configs/glm52_dual.toml
 export ZEROMOE_BIN=./build/zeromoe
 export COLIBRI_SNAP=/path/to/GLM-5.2-colibri-int4
-export COLIBRI_GLM=/Users/rayxu/project/colibri/c/glm
+export COLIBRI_GLM=/path/to/colibri/c/glm
 ```
 
 ## Run it

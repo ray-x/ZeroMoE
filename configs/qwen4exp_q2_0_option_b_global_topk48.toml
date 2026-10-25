@@ -24,7 +24,7 @@
 # Requested device_expert_layers=0; all 48 layers receive static hot/cold
 # splits (0/48/0), including layers 0,1,2,22 that remain CPU in config A.
 # Build against the upstream integration ggml in moestream-build-upstream-master.
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_q2_0_option_b_global_topk48.log"

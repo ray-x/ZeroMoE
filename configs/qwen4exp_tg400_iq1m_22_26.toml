@@ -1,9 +1,9 @@
 # Reproduction profile for the IQ1_M TG400 full-graph comparison.
 # Use with the runtime environment documented in docs/qwen4exp-tg400-state-handoff.md.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = [0, 1, 2, 3, 4, 5, 6, 7, 14, 20, 21, 22, 24, 28, 30, 33, 34, 36, 38, 40, 41, 42, 43, 44, 45, 46]
-log_path = "/tmp/zeromoe_qwen4exp_tg400_iq1m.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 416

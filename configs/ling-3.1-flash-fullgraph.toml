@@ -1,6 +1,6 @@
 # Ling 3.1 Flash full-graph parity run. The command also applies a
 # per-process no-swap cgroup and a 40 GiB RAM ceiling.
-model_path = "/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf"
+model_path = "/path/to/model-or-shard-directory"
 context_size = 64
 max_new_tokens = 2
 temperature = 0.0
@@ -12,8 +12,8 @@ ram_cache_total_experts = 68
 ram_pinned_budget_gb = 4.0
 ram_preload_all_experts = false
 freeze_usage_stats = true
-pin_file = "/tmp/ling-fullgraph-unused.pin"
-prefill_pin_file = "/tmp/ling-fullgraph-unused-prefill.pin"
+pin_file = "ling-fullgraph-unused.pin"
+prefill_pin_file = "ling-fullgraph-unused-prefill.pin"
 pin_threshold = 0
 expert_fetch_threads = 2
 prefetch_worker_threads = 2

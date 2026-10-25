@@ -1,7 +1,7 @@
 # Copy of qwen4exp_option_b_rightsize_split44_x0_retest.toml, only log_path
 # changed, used to verify the est_option_b_gb VRAM-headroom fix in main.cpp
 # (2026-09-29) against the IQ1_M 0/44/4 split.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_extreme_0_44_fixverify_2026-09-29.log"

@@ -8,7 +8,7 @@
 #          <out-dir>/ggml-build       libggml*.so (src/lib*.so, src/ggml-cuda/libggml-cuda.so)
 #
 # Environment:
-#   GGML_REPO     git repo holding upstream llama.cpp   (default /home/ray/Projects/llama.cpp)
+#   GGML_REPO     git repo holding upstream llama.cpp   (required)
 #   GGML_COMMIT   upstream commit to build              (default 8baabd53b, ggml 0.27.0)
 #   CUDA_ARCH     default 86. Native SASS for sm_86 plus embedded PTX, which is what lets the sm_120
 #                 GPU JIT the kernels; a build without PTX fails on that GPU with "no kernel image".
@@ -17,7 +17,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 OUT=$(realpath -m "${1:?usage: build_ggml.sh <out-dir>}")
-GGML_REPO=${GGML_REPO:-/home/ray/Projects/llama.cpp}
+GGML_REPO=${GGML_REPO:?set GGML_REPO to the upstream llama.cpp checkout}
+[[ -d "$GGML_REPO/.git" || -f "$GGML_REPO/.git" ]] || { echo "GGML_REPO is not a git checkout: $GGML_REPO" >&2; exit 1; }
 GGML_COMMIT=${GGML_COMMIT:-8baabd53b}
 CUDA_ARCH=${CUDA_ARCH:-86}
 SRC=$OUT/ggml-src

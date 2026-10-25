@@ -1,7 +1,7 @@
-model_path = "/data/sdb/models/qwen3.8-flash-next/exl3_3bpw"
+model_path = "/path/to/model-or-shard-directory"
 model_format = "exl3"
 model_load_only = false
-metadata_model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+metadata_model_path = "/path/to/metadata-model.gguf"
 prompt = "Hello"
 context_size = 256
 max_new_tokens = 8

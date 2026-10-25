@@ -1,7 +1,7 @@
 # ZeroMoE — Dual GPU Configuration (Profile B)
 # RTX 5060 Ti (dense + KV) + RTX 3090 (expert vault)
 
-model_path = "/models/GLM-5.2-UD-IQ2_M/"
+model_path = "/path/to/model-or-shard-directory"
 
 context_size   = 131072
 max_new_tokens = 4096

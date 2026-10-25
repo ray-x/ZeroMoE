@@ -2,7 +2,7 @@
 # no-decode-time-SSD whole-layer baseline: fill DDR from the GGUF at startup,
 # keep only a bounded surveyed hot set pinned in VRAM, and leave VRAM LRU room.
 # This is not a separate SSD offload store.
-model_path = "/mnt/usb-ssd/@/home/ray/models/MiMo-V2.6-Flash-RL-GSQ-RCO-3bit.gguf"
+model_path = "/path/to/model-or-shard-directory"
 context_size = 2048
 max_new_tokens = 96
 temperature = 0.0

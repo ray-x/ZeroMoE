@@ -5,7 +5,7 @@
 # sends one selected route slot to the persistent DDR-backed CPU worker while
 # the other routed work and the shared expert stay on CUDA.
 
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 log_path = "logs/qwen4exp_cpu_offload_layer13_milestone_a.log"
 log_level = "INFO"
 

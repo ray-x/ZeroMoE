@@ -4,8 +4,9 @@
 set -uo pipefail
 bin=$(readlink -f "${1:?engine}"); shift
 root=$(cd "$(dirname "$0")/.." && pwd); cd "$root"
-ORIG=$HOME/Projects/moestream-build-upstream-master/ggml-build/src
-LP=$HOME/work/ggml-iq2xxs/lib_cuda:$HOME/work/ggml-iq2xxs/lib_new:$ORIG:$ORIG/ggml-cuda
+root_libs=${GGML_BASE_LIBS:-$root/build_ggmlcuda/ggml-build/src}
+kernel_libs=${GGML_KERNEL_LIBS:?set GGML_KERNEL_LIBS to the required ggml kernel library directories}
+LP=${GGML_CUDA_LIBS:-$kernel_libs}:$kernel_libs:$root_libs:$root_libs/ggml-cuda
 for b in "${@:-0 1 2 3}"; do
   head -n -1 logs/perf/survey/batch$b.txt > logs/perf/survey/p$b.txt
   rm -f logs/perf/survey/b$b.trace

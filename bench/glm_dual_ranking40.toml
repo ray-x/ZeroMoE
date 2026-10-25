@@ -1,8 +1,8 @@
 # Deterministic GLM-5.3 Flash MTP control profile. Test-only.
-model_path = "/home/ray/vllm-workspace/GLM-5.3-Flash/GLM-5.3-Flash-AJ-IQ2_XXS-00001-of-00002.gguf"
+model_path = "/path/to/model-or-shard-directory"
 reasoning_effort = "low"
 enable_thinking = false
-log_path = "/home/ray/work/moestream-graph-framework/logs/perf/dual_final.engine.log"
+log_path = "run.log"
 log_level = "INFO"
 context_size = 4096
 max_new_tokens = 12
@@ -21,8 +21,8 @@ mem_guard_stop_mb = 10240
 mem_guard_poll_ms = 500
 
 freeze_usage_stats = true
-pin_file = "/home/ray/work/moestream-graph-framework/docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt"
-prefill_pin_file = "/home/ray/work/moestream-graph/docs/ssd-offload/data/glm53flash_survey5_usage_prefill.txt"
+pin_file = "docs/ssd-offload/data/glm53flash_usage_base_plus_decode40.txt"
+prefill_pin_file = "docs/ssd-offload/data/glm53flash_survey5_usage_prefill.txt"
 pin_threshold = 6
 pin_topk_per_layer = 12
 pin_strategy = "global_topn"

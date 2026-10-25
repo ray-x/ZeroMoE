@@ -1,9 +1,9 @@
 # Matched Q2_0 comparison for the 22 GPU / 26 DDR full-graph decode split.
 # Keep every runtime setting aligned with qwen4exp_iq1m_fullgraph_22_26.toml.
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
-log_path = "/tmp/qwen4exp_q2_0_fullgraph_22_26.log"
+log_path = "run.log"
 log_level = "INFO"
 
 context_size = 2048

@@ -2,7 +2,7 @@
 # This is identical to milestone_a except that the CPU result is copied from
 # pinned DDR into a fixed device slot and consumed after a CUDA event fence.
 
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 log_path = "logs/qwen4exp_cpu_offload_layer13_milestone_b.log"
 log_level = "INFO"
 

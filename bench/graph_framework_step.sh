@@ -14,7 +14,7 @@
 set -euo pipefail
 step=${1:?step name}
 cand=$(readlink -f "${2:?candidate engine}")
-base=$(readlink -f "${3:-$HOME/work/gf-baseline/moestream-master-b8cf7ff}")
+base=$(readlink -f "${3:-${BASELINE_ENGINE:?pass baseline-engine or set BASELINE_ENGINE}}")
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 inputs=logs/graph_framework/inputs

@@ -1,7 +1,7 @@
 # VNNI A/B comparison for Q2_0 CPU dot products, 22 GPU / 26 DDR full-graph split.
 # Same as qwen4exp_q2_0_fullgraph_22_26.toml, but with more decode tokens so the
 # warm steady-state rate isn't swamped by graph-construction/prefill overhead.
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_q2_0_vnni_ab_22_26.log"

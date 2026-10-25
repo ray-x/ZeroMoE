@@ -4,7 +4,7 @@
 # bridge performs the D2H -> synchronous CPU GGML MoE -> H2D sequence; layers
 # 26..47 remain fully device-resident.  This is intentionally opt-in and is
 # separate from the Layer-13 proof config.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M"
+model_path = "/path/to/model-or-shard-directory"
 log_path = "logs/qwen4exp_cpu_offload_all_host_nodes_phase4.log"
 log_level = "INFO"
 

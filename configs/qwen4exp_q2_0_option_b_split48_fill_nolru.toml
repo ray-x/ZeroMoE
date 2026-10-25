@@ -13,7 +13,7 @@
 # Requested device_expert_layers=0; Option-B can commit up to 48 MoE layers.
 # The explicitly disabled legacy LRU has no GPU-resident fallback if graph
 # execution is declined. The Q2_0 full-graph/host-node ggml build is required.
-model_path = "/data/sdb/models/qwen3.8-flash-next/Q2_0"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_q2_0_option_b_split48_fill_nolru.log"

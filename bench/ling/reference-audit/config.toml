@@ -1,5 +1,5 @@
 # Rebuild the Ling routing histogram from the exact benchmark prompt.
-model_path = "/home/ray/vllm-workspace/ling-3.1-flash/Ling-3.1-flash-AD-IQ1_S-00001-of-00004.gguf"
+model_path = "/path/to/model-or-shard-directory"
 context_size = 64
 max_new_tokens = 32
 raw_prompt = true

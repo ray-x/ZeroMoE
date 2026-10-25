@@ -2,7 +2,7 @@
 # RTX 5060 Ti (dense) + 2x RTX 3090 (expert vault)
 # Full 128k context with Q4 KV cache
 
-model_path = "/models/GLM-5.2-UD-IQ2_M/"
+model_path = "/path/to/model-or-shard-directory"
 # dense_model_path = "/models/GLM-5.2-Q4_K/"
 
 context_size   = 131072

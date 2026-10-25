@@ -1,7 +1,7 @@
 # IQ1_M 44-layer fill/no-LRU comparison variant derived from the cov80 baseline.
 # Same layer candidates and model settings; disables the unused legacy cache and
 # lets Option B use the available graph VRAM for more experts.
-model_path = "/data/sdb/models/qwen3.8-flash-next/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+model_path = "/path/to/model-or-shard-directory"
 
 cpu_affinity_layers = []
 log_path = "logs/qwen4exp_extreme_0_44_fill_nolru_cov80_2026-09-30.log"

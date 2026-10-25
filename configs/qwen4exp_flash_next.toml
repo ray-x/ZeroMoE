@@ -19,7 +19,7 @@
 #  - MoE routing: softmax gating + a sigmoid-gated shared expert
 #    (ffn_gate_inp_shexp); 512 experts, top-10.
 
-model_path = "/Volumes/Untitled/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.1.gguf"
+model_path = "/path/to/model-or-shard-directory"
 # mirror_model_path = ""   # optional second-drive copy (striped reads)
 
 log_path = "debug.log"

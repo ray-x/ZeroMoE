@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Offline placement study: which experts live in VRAM / DDR-static / SSD under byte budgets (real per-layer expert
 sizes of the given GGUF), evaluated on the real routing of the probe prompts' decode rows.
-usage: qwen_placement.py <probe_dump_dir> <model_for_sizes shard1> [vram_gib=9] [ddr_gib=26]"""
+usage: qwen_placement.py <probe_dump_dir> <model_for_sizes shard1> [vram_gib=9] [ddr_gib=26] [usage_dir]"""
 import sys, glob, os, json
 import numpy as np, torch
 sys.path.insert(0, os.path.dirname(__file__))
@@ -13,7 +13,10 @@ VRAM = float(sys.argv[3]) if len(sys.argv) > 3 else 9.0
 DDR = float(sys.argv[4]) if len(sys.argv) > 4 else 26.0
 GIB = 1 << 30; E = 512; LAYERS = 48; DECODE = 64; TOPK = 10
 PLAIN = [0, 1, 2, 22]
-USAGE = '/home/ray/work/moestream-graph/tests/moe_usage_survey/'
+USAGE = sys.argv[5] if len(sys.argv) > 5 else os.environ.get("ZEROMOE_QWEN_USAGE_DIR")
+if not USAGE:
+    raise SystemExit("pass usage_dir or set ZEROMOE_QWEN_USAGE_DIR")
+USAGE = os.path.join(USAGE, "")
 
 shards = sorted(glob.glob(model.replace('00001-of', '0000*-of')))
 size = {}   # layer -> bytes per expert (gate+up+down)
