@@ -2,7 +2,7 @@
 # Qwen 3.8 Flash decode baselines on a single RTX 3090 (see docs/qwen-decode-baselines-2026-10-16.md).
 #
 # usage: bench/qwen_decode_baselines.sh split [threads=10] [ntok=400]   # 22 GPU layers + 26 CPU layers, UD-IQ1_M
-#        bench/qwen_decode_baselines.sh hybrid [K=14554] [ntok=200] [threads=10]   # usage-ranked hot experts in VRAM, Q2_0
+#        bench/qwen_decode_baselines.sh hybrid [K=14000] [ntok=200] [threads=10]   # usage-ranked hot experts in VRAM, Q2_0
 # Writes logs/qwen_decode_<mode>_<stamp>.log (stdout) and logs/qwen_decode_<mode>_<stamp>.engine.log (engine log).
 # Waits for an idle engine/GPU first. Prints the rate line; read the text/log before trusting it.
 set -euo pipefail
@@ -40,7 +40,9 @@ case "$MODE" in
     exit "$rc"
     ;;
   hybrid)
-    K=${2:-14554}; NGEN=${3:-200}; THREADS=${4:-10}
+    # K=14000, not the 14554 of docs/qwen-decode-baselines-2026-10-16.md: with the pinned graph-RAM arenas (the Qwen default)
+    # 14554 leaves 0.98 GiB free after a long prefill and the decode graph is refused (floor 1.00 GiB). See docs/perf-baselines.md.
+    K=${2:-14000}; NGEN=${3:-200}; THREADS=${4:-10}
     LOG=logs/qwen_decode_hybrid_K${K}_$STAMP
     sed -E "s/^qwen4exp_option_b_global_top_k *=.*/qwen4exp_option_b_global_top_k = $K/; s/^omp_max_threads.*/omp_max_threads = $THREADS/; s#^log_path *=.*#log_path = \"$LOG.engine.log\"#" \
       configs/qwen4exp_q2_0_option_b_global_topk48.toml > "$TMP/cfg.toml"
