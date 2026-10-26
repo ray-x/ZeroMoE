@@ -340,9 +340,27 @@ Known limits: verification is one token per target step, so MTP currently costs
 extra target steps for rejected drafts and gives no speedup; batched
 verification (an S = k+1 continuation graph at position > 0) is the next step.
 Teacher-forced per-frame comparison against llama.cpp for the target is not
-covered here (the equivalence above is ZeroMoE-vs-ZeroMoE). Acceptance (30-62%)
-was measured only with the UD-IQ1_M trunk and the Q4_K_M sidecar; another trunk
-quantization will change it.
+covered here (the equivalence above is ZeroMoE-vs-ZeroMoE). Acceptance depends strongly on the text. 64 greedy tokens, UD-IQ1_M trunk,
+Q4_K_M sidecar, output identical to plain decoding in all 15 runs:
+
+| drafts | story | Python code | history | mean | tokens/cycle (mean) |
+|---|---|---|---|---|---|
+| 1 | 77% | 97% | 88% | 87% | 1.89 |
+| 2 | 65% | 95% | 74% | 78% | 2.55 |
+| 3 | 54% | 90% | 71% | 72% | 3.12 |
+| 4 | 50% | 81% | 55% | 62% | 3.41 |
+| 5 | 40% | 72% | 51% | 54% | 3.62 |
+
+The draft is not the limit: on identical inputs ZeroMoE's draft and
+llama.cpp's pick the same top token on 63/63 rows, and llama.cpp's own
+`llama-speculative-simple --spec-type draft-mtp` accepted 88% (23/26) on the
+story prompt. An earlier 62% reading came from one 48-token run and was noise.
+
+Projected speed at a 42 tok/s baseline (model, not measured; 6 ms draft step):
+the current one-token-per-step verification is slower than plain decoding at
+every K (17-37 tok/s). Batched verification could reach about 1.35-1.42x at
+K = 2-3 only if an extra token in a batch costs ~0.15 of a step (GPU-resident);
+at the 0.76 measured on the CPU-split 3090 setup it stays below 1x.
 
 ## Standalone implementation and reproduction
 

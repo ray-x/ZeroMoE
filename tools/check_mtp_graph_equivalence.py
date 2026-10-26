@@ -108,7 +108,8 @@ def main():
         ok = ok and same
         print(f"{'ok  ' if same else 'FAIL'} k={k}: identical to plain={same}, "
               f"drafted={drafted} accepted={accepted} "
-              f"({100.0 * accepted / drafted if drafted else 0:.1f}%), restores={restores}")
+              f"({100.0 * accepted / drafted if drafted else 0:.1f}%), "
+              f"tokens/cycle={a.tokens / cycles:.2f}, restores={restores}")
         if not same:
             i = next((i for i, (x, y) in enumerate(zip(text, results["plain"])) if x != y),
                      min(len(text), len(results["plain"])))
