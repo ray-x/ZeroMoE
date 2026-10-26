@@ -35,7 +35,6 @@ extern "C" void launch_qwen4exp_hc_q8_post(
 
 namespace {
 constexpr int kMaxLayers = 256;
-bool async_graph_reuse_override = false;
 bool qwen_hc_async_readback_override = false;
 
 bool type_ok(uint32_t t) {
@@ -67,20 +66,6 @@ bool dequant_q8_0_rows(const GgmlHcWeightRef &src,
                         dst.data() + row * (size_t)src.ne0, src.ne0);
   }
   return true;
-}
-
-// All HC graphs use the same shared CUDA backend.  Its main stream is ordered,
-// so resetting the allocator and reusing its temporary addresses is safe when
-// the next graph is queued after the previous one.  The conservative event
-// waits remain the default; this opt-in is used while validating the
-// device-resident multi-layer pipeline and makes the dependency model explicit
-// without changing the established fallback behaviour.
-bool async_graph_reuse() {
-  static const bool enabled = [] {
-    const char *v = std::getenv("ZEROMOE_GGML_ASYNC_GRAPH_REUSE");
-    return v && v[0] == '1';
-  }();
-  return enabled || async_graph_reuse_override;
 }
 
 // Diagnostic only.  The normal path relies on the shared backend stream and
@@ -162,8 +147,9 @@ size_t count_nonfinite(const std::vector<T> &values) {
 }
 }  // namespace
 
-void set_ggml_hc_async_graph_reuse(bool enabled) {
-  async_graph_reuse_override = enabled;
+void set_ggml_hc_async_graph_reuse(bool) {
+  // HC graphs always keep the conservative per-graph event waits; the knob is
+  // consumed by the routed-MoE graphs (set_ggml_moe_async_graph_reuse).
 }
 
 void set_qwen_hc_async_readback(bool enabled) {

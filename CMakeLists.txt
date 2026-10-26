@@ -200,9 +200,6 @@ if(ZEROMOE_USE_GGML)
         set(ZEROMOE_GGML_ROOT "${ZEROMOE_LLAMA_CPP_ROOT}" CACHE PATH "" FORCE)
         message(WARNING "ZEROMOE_LLAMA_CPP_ROOT is deprecated; use ZEROMOE_GGML_ROOT")
     endif()
-    if(ZEROMOE_LLAMA_CPP_TAG)
-        message(WARNING "ZEROMOE_LLAMA_CPP_TAG is no longer used; pin ZEROMOE_GGML_COMMIT instead")
-    endif()
 
     # Disable everything we do not need for a CPU decode assistant, except the
     # explicit experimental CUDA backend option. GGML_CUDA must be set BEFORE
@@ -1214,7 +1211,6 @@ else()
             target_compile_options(kernels_cpu PRIVATE -mcpu=apple-m3)
             message(STATUS "ZeroMoE: applied -mcpu=apple-m3 to CPU kernels")
         endif()
-        target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_ARM_NEON=1)
         if(ZEROMOE_METAL)
             set_source_files_properties(backends/cpu/kernels_metal.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
             find_library(METAL_FRAMEWORK Metal REQUIRED)

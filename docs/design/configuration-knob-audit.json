@@ -1779,8 +1779,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "obsolete warning-only build compatibility; actual dependency pin is separate. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Preserve the capability/intent through the proposed replacement.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: deleted the warning-only CMake compatibility input; the real dependency pin remains ZEROMOE_GGML_COMMIT.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0016"
     },
@@ -16969,8 +16969,8 @@
       "member_name_occurrences": [],
       "affected_if_removed": "full-graph construction/replay, scheduler bindings and state handoff. Removing only the parser makes old overrides ineffective; removing the behavior is a separate change. Supply the replacement policy first; do not freeze an arbitrary zero/false default.",
       "required_validation": "Trace all consumers and family/feature guards; compare resolved behavior with current validated recipe. Exercise pending DMA/buffer lifetime, graph capture/rebuild and memory-pressure boundaries.",
-      "review_decision": "",
-      "removal_status": "NOT STARTED",
+      "review_decision": "REMOVED 2026-10-27: async_graph_reuse() had no call sites and the HC override it read was write-only. Deleted the env reader, function and override. The setter remains a documented no-op because the shared ggml_async_graph_reuse TOML key is consumed by routed-MoE graphs.",
+      "removal_status": "REMOVED",
       "read_context_status": "Occurrence and source excerpts verified by extraction; semantic recommendation remains a review candidate.",
       "id": "K0162"
     },

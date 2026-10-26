@@ -1,14 +1,85 @@
 # Configuration knob removal inventory
 
-Planning snapshot, 2026-10-26. **No controls removed by this report.**
-This preserves the work so removal can resume after worktree integration.
+Planning snapshot, 2026-10-26. This preserves the work so removal can resume
+after worktree integration. The removals that were actually applied are listed
+in [Removal log](#removal-log); everything else remains a proposal.
+
+## Integration status
+
+The uncommitted settings worktree was merged into `master` in `6e247ed`
+(2026-10-27). That merge brought the typed resolver, root `graph_*` TOML layer,
+legacy-alias warnings, startup `[SETTINGS]` binding, concise/advanced help,
+Release presets, configuration guide and the settings tests into the active
+checkout. CPU build, resolver tests and the Qwen migration inventory check pass
+on the merged tree.
+
+The inventory below still describes the pre-merge snapshots. Re-run the
+inventory against the integrated checkout before deleting any row, and record
+decisions in the JSON `review_decision` field rather than editing generated
+counts by hand.
+
+## Removal log
+
+Scope agreed for this pass: environment variables and compile-time macros only
+(no CLI or TOML surface changes), limited to controls that are provably
+unreachable rather than merely unused-looking. Each entry names the evidence
+that made the deletion behavior-neutral.
+
+### 2026-10-27 — safe dead-knob batch
+
+| Control | Surface | Evidence | Change |
+| --- | --- | --- | --- |
+| `ZEROMOE_LLAMA_CPP_TAG` (K0016) | CMake input | The only reference was an `if()` that emitted "no longer used"; it never set a cache entry, path or definition. The real pin is `ZEROMOE_GGML_COMMIT`. | Deleted the warning block from `CMakeLists.txt`; `removal_status=REMOVED` in the JSON. |
+| `ZEROMOE_GGML_ASYNC_GRAPH_REUSE` (K0162) | environment | Read only by `async_graph_reuse()` in `backends/ggml/ggml_hc_backend.cpp`, which had no call sites in the tree. The value it returned also OR'd a file-local `async_graph_reuse_override` that only `set_ggml_hc_async_graph_reuse()` wrote and nothing read. | Deleted the reader, the function and the write-only override. `set_ggml_hc_async_graph_reuse()` stays as a documented no-op because the shared `ggml_async_graph_reuse` TOML key is live for routed-MoE graphs (`set_ggml_moe_async_graph_reuse`). |
+| `ZEROMOE_ARM_NEON` | compile definition | Defined `PUBLIC` on `kernels_cpu` for Apple Silicon, but no source, header or tool in the tree tests it. NEON kernel selection is done by CMake source selection, not by this macro. | Deleted the `target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_ARM_NEON=1)` line. No consumer existed, so no build input changes meaning. |
+
+Verification for this batch:
+
+- `zeromoe_cpu`, `graph_settings_test` and `graph_settings_binding_test` build
+  with `-DZEROMOE_CPU_ONLY=ON -DZEROMOE_USE_GGML=ON`.
+- `ctest -R '^graph_settings'` passes 2/2 and
+  `python3 tools/config_inventory.py --check` passes.
+- `backends/ggml/ggml_hc_backend.cpp` is CUDA-only, so it is not part of the
+  CPU build; it was host-syntax-checked with the CUDA build's exact defines and
+  include paths (`g++ -fsyntax-only`), which is the same host compiler pass the
+  real CUDA target performs for this `.cpp`.
+- `python3 -c 'json.load(...)'` validates the updated
+  `configuration-knob-audit.json`.
+
+### Findings deliberately left in place
+
+These look dead but changing them would either alter a supported feature or
+require a product decision, so they are not safe deletions for this batch:
+
+- **`ZEROMOE_HAVE_CUFILE` is never defined.** `memory/cufile_io.hpp` and
+  `core/engine_config.hpp` describe a CMake detection step, but
+  `CMakeLists.txt` and `cmake/` contain no `CUFILE`/`ZEROMOE_HAVE_CUFILE`
+  logic, so the GPUDirect Storage path is always compiled out and
+  `cuda_cufile` requests can never succeed. Fixing this means adding library
+  detection; deleting it means removing a whole I/O feature. Both are separate
+  changes.
+- **`ZEROMOE_QWEN4EXP_ALLLAYERS_DUMP` has no reader.** The name survives only
+  in a comment above `all_layers_snapshot` in
+  `models/qwen/ggml_qwen4exp_graph_internal.hpp`, a field that is never
+  written or read, plus the `bench/` dump-diff tools that expect its output.
+  This is an abandoned diagnostic, not a user-visible knob; removing the field
+  and the tool expectations should be its own diagnostics cleanup.
+- **`LOG_VERBOSE` is defined but unused.** Call sites use
+  `LogStream(LogLevel::VERBOSE)`/`would_log()`. Keeping the macro preserves a
+  symmetric logging API; it is unrelated to configuration onboarding.
+- **`ZEROMOE_USE_LLAMA_CPP` / `ZEROMOE_LLAMA_CPP_ROOT`** are deprecated but
+  live CMake aliases: they are still parsed and remapped. Deleting them is a
+  compatibility break, not a dead-code removal.
+- **`ZEROMOE_MIMO2_OFFLOAD_MODEL`** is set by `bench/regression_gate.sh` but
+  has no engine reader. It belongs to the benchmark harness, not the runtime
+  configuration surface.
 
 ## How to use
 
 The tables contain one row per **surface/name**, not one independent behavior. The same behavior may have TOML, environment, CLI and graph aliases.
 IDs are snapshot-local; track decisions by `surface` + `name` when regenerating after a merge.
 Every row includes when it is read, a proposed keep/remove/combine decision, affected feature and change risk.
-The companion [JSON](configuration-knob-audit.json) includes source excerpts, declaration comments/initializers, file hashes, all discovered worktree references, member-name occurrence candidates, validation requirements and blank `review_decision` fields.
+The companion [JSON](configuration-knob-audit.json) includes source excerpts, declaration comments/initializers, file hashes, all discovered worktree references, member-name occurrence candidates, validation requirements and `review_decision` fields (filled in for reviewed rows).
 **Recommendations are source-linked candidates, not individually proven safe deletions.** A lexical occurrence cannot prove a knob obsolete or a runtime branch reachable. Exact enclosing predicates/defaults must be checked before edits.
 `when used` means execution phase, not introduction date or observed recent use. No history/benchmark reachability claims are made.
 
@@ -65,6 +136,7 @@ Build-cache rows include `CACHE ... FORCE` assignments that are already internal
 
 These totals are deliberately broader than the earlier settings-only scan: they include other worktrees, non-ZEROMOE environment reads, extra table-presence checks and separate tooling names.
 Do not add these totals and call them independent user decisions. Tool references/forwarded arguments and capability macros are not necessarily configurable engine controls.
+The table is the pre-merge snapshot; the [removal log](#removal-log) lists the rows already deleted, so the current-tree inventory is smaller (399 environment names after `ZEROMOE_GGML_ASYNC_GRAPH_REUSE`, and no `build_legacy_input` row after `ZEROMOE_LLAMA_CPP_TAG`).
 
 ## Manually checked exceptions
 
@@ -131,7 +203,7 @@ The reference column gives a primary path/line. Use the JSON for exact worktree 
 
 | ID / control | Worktrees | When used | Proposed action / owner | Affected if removed | Risk | Evidence |
 |---|---|---|---|---|---|---|
-| K0016 `ZEROMOE_LLAMA_CPP_TAG` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | REMOVE obsolete warning-only build input; retain actual internal dependency pin | obsolete warning-only build compatibility; actual dependency pin is separate. Preserve behavior in replacement; full impact/owner in JSON. | LOW | `CMakeLists.txt:90` |
+| K0016 `ZEROMOE_LLAMA_CPP_TAG` | api, mtp, original, settings | Configure/build time, not per-request. Exact predicates are in linked evidence. | **REMOVED 2026-10-27** — was: remove the warning-only build input; the real pin stays `ZEROMOE_GGML_COMMIT`. | obsolete warning-only build compatibility; actual dependency pin is separate. Preserve behavior in replacement; full impact/owner in JSON. | LOW | `CMakeLists.txt:90` |
 
 ### build_option
 
@@ -297,7 +369,7 @@ The reference column gives a primary path/line. Use the JSON for exact worktree 
 | K0159 `ZEROMOE_GDN_FULL_GGML` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near gdn_full_ggml() (lexical context). Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | model graph equations/operator implementation and routing. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `core/dense_dispatch.hpp:323` |
 | K0160 `ZEROMOE_GDN_PROJ_GGML` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near gdn_proj_ggml() (lexical context). Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | model graph equations/operator implementation and routing. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `core/dense_dispatch.hpp:307` |
 | K0161 `ZEROMOE_GENERATED_TOKEN_FILE` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near dump_generated_token_if_enabled() (lexical context). Exact predicates are in linked evidence. | COMBINE explicit developer validation/replay controls; KEEP required reference capability | tokenization, request semantics, generation and sampling. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/generation_loop.hpp:146` |
-| K0162 `ZEROMOE_GGML_ASYNC_GRAPH_REUSE` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near async_graph_reuse() (lexical context). Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | full-graph construction/replay, scheduler bindings and state handoff. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/ggml/ggml_hc_backend.cpp:80` |
+| K0162 `ZEROMOE_GGML_ASYNC_GRAPH_REUSE` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near async_graph_reuse() (lexical context). Exact predicates are in linked evidence. | **REMOVED 2026-10-27** — dead reader/function, no call sites; the shared TOML key stays live for routed-MoE. | full-graph construction/replay, scheduler bindings and state handoff. Preserve behavior in replacement; full impact/owner in JSON. | HIGH | `backends/ggml/ggml_hc_backend.cpp:80` |
 | K0163 `ZEROMOE_GGML_BACKEND_STREAM_COPY` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near mode() (lexical context). Exact predicates are in linked evidence. | INTERNALIZE validated implementation choice; retain DEV experiment only with active evidence | expert storage, I/O and CPU/GPU transfer pipeline. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `backends/ggml/ggml_moe_backend.cpp:204` |
 | K0164 `ZEROMOE_GGML_CHUNK_PIPELINE` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once. Exact predicates are in linked evidence. | INTERNALIZE startup/runtime policy; remove external tuning input after replacement exists | prompt batching/prefill execution. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `core/batched_dispatch_pipeline.cpp:526` |
 | K0165 `ZEROMOE_GGML_DEBUG_CHECK_DEVICE_OUTPUT` | api, mtp, original, settings | Environment read when the referenced function/path runs; some readers cache once; near debug_check_device_output() (lexical context). Exact predicates are in linked evidence. | COMBINE scoped logging/profiling; preserve explicit costly measurements | diagnostics, numerical inspection and performance reporting. Preserve behavior in replacement; full impact/owner in JSON. | MEDIUM | `backends/ggml/ggml_moe_backend.cpp:331` |

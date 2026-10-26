@@ -39,10 +39,8 @@
 #include <cstdint>
 #include <vector>
 
-// The HC/GDN/MoE runners share one GGML CUDA backend stream. When enabled,
-// graph temporaries are reused by stream order instead of waiting on a host
-// event before every bracket. The default remains conservative; callers must
-// opt in after validating the complete device-resident pipeline.
+// Retained for the shared `ggml_async_graph_reuse` config key. HC graphs keep
+// the conservative per-graph event waits; routed-MoE graphs consume the value.
 void set_ggml_hc_async_graph_reuse(bool enabled);
 
 // Qwen-only opt-in for the pinned host staging/readback path used when a
