@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 
 extern void layers_forward_gguf(StreamingEngine &engine,
@@ -180,6 +181,17 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
 
   qwen4exp_mtp::Options options;
   options.device = engine.gpu_device_id >= 0 ? engine.gpu_device_id : 0;
+  // The draft can live on a different GPU than the target (it takes ~2 GiB,
+  // which a nearly full target card cannot spare). Index is the CUDA-visible one.
+  if (const char *dev = std::getenv("ZEROMOE_MTP_DRAFT_DEVICE"); dev && dev[0]) {
+    char *end = nullptr;
+    const long v = std::strtol(dev, &end, 10);
+    if (end == dev || *end != '\0' || v < 0 || v > 15) {
+      error = "invalid ZEROMOE_MTP_DRAFT_DEVICE";
+      return false;
+    }
+    options.device = int(v);
+  }
   options.capacity = max_position;
   options.device_budget = kDraftBudgetBytes;
   // The engine outlives this call; the draft only borrows it.
