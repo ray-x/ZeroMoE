@@ -5,6 +5,8 @@
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 #include "ggml_qwen4exp_graph.hpp"
+#include "mtp_graph_draft.hpp"
+#include "mtp_graph_report.hpp"
 #include "mtp_graph_runtime.hpp"
 #include "mtp_speculation.hpp"
 #include "qwen4exp_mtp_graph.hpp"
@@ -107,32 +109,6 @@ class GraphTarget final : public SpecTarget {
   std::vector<float> hidden_;
 };
 
-class GraphDraft final : public SpecDraft {
- public:
-  GraphDraft(std::unique_ptr<MtpGraphRuntime> runtime, const MtpSpeculator &embedder,
-             size_t D)
-      : runtime_(std::move(runtime)), embedder_(embedder), embedding_(D) {}
-
-  bool step(int token, int position, std::span<const float> hidden,
-            std::span<float> next_hidden, std::span<float> logits,
-            std::string &error) override {
-    if (!embedder_.embed(token, embedding_.data())) {
-      error = "draft token embedding failed";
-      return false;
-    }
-    return runtime_->replay({position, embedding_, hidden, next_hidden, logits}, error);
-  }
-  bool rewind(int position, std::string &error) override {
-    return runtime_->rewind(position, error);
-  }
-  int next_position() const override { return runtime_->next_position(); }
-
- private:
-  std::unique_ptr<MtpGraphRuntime> runtime_;
-  const MtpSpeculator &embedder_;
-  std::vector<float> embedding_;
-};
-
 }  // namespace
 
 bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
@@ -188,7 +164,9 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
   if (!runtime) return false;
 
   GraphTarget target(engine, ram_mgr, prefetcher, base);
-  GraphDraft draft(std::move(runtime), base, D);
+  GraphMtpDraft draft(
+      std::move(runtime),
+      [&base](int token, float *out) { return base.embed(token, out); }, D);
 
   SpecPrompt prompt;
   prompt.tokens = prompt_ids;
@@ -202,18 +180,7 @@ bool qwen4exp_graph_mtp_run(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       [&](int token) { return base.emit_token(sequence, token, eos_id, emit); },
       stats, error);
 
-  perf().n_mtp_cycles.fetch_add(stats.cycles, std::memory_order_relaxed);
-  perf().n_mtp_drafts_proposed.fetch_add(stats.drafted, std::memory_order_relaxed);
-  perf().n_mtp_drafts_accepted.fetch_add(stats.accepted, std::memory_order_relaxed);
-  perf().n_mtp_tokens_emitted.fetch_add(stats.emitted, std::memory_order_relaxed);
-  LOG_INFO("[MTP-GRAPH] cycles=%llu drafted=%llu accepted=%llu (%.1f%%) emitted=%llu "
-           "target_steps=%llu draft_steps=%llu restores=%llu%s\n",
-           (unsigned long long)stats.cycles, (unsigned long long)stats.drafted,
-           (unsigned long long)stats.accepted,
-           stats.drafted ? 100.0 * double(stats.accepted) / double(stats.drafted) : 0.0,
-           (unsigned long long)stats.emitted, (unsigned long long)stats.target_steps,
-           (unsigned long long)stats.draft_steps, (unsigned long long)stats.restores,
-           stats.truncated ? " (truncated at context capacity)" : "");
+  mtp_graph_report(stats);
   return ok;
 }
 
