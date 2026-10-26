@@ -53,6 +53,10 @@ static int parse_int_arg(int argc, char **argv, const std::string &flag,
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+    print_usage(argv[0]);
+    return 0;
+  }
   bool serve = false;
   for (int i = 1; i < argc; ++i) if (std::string(argv[i]) == "--serve") serve = true;
 #ifndef ZEROMOE_BUILD_SERVER

@@ -1,0 +1,43 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {"major": 3, "minor": 25, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "cpu",
+      "displayName": "CPU inference (Release)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-cpu",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ZEROMOE_CPU_ONLY": "ON",
+        "ZEROMOE_USE_GGML": "ON"
+      }
+    },
+    {
+      "name": "cuda",
+      "displayName": "Linux CUDA full-graph inference (Release)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-cuda",
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"},
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ZEROMOE_CPU_ONLY": "OFF",
+        "ZEROMOE_USE_GGML": "ON",
+        "ZEROMOE_USE_GGML_CUDA": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "cpu", "configurePreset": "cpu", "targets": ["zeromoe_cpu"]},
+    {"name": "cuda", "configurePreset": "cuda", "targets": ["zeromoe"]},
+    {"name": "settings-tests", "configurePreset": "cpu", "targets": ["graph_settings_test", "graph_settings_binding_test"]}
+  ],
+  "testPresets": [
+    {
+      "name": "settings-tests",
+      "configurePreset": "cpu",
+      "filter": {"include": {"name": "^graph_settings"}},
+      "output": {"outputOnFailure": true}
+    }
+  ]
+}

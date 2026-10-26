@@ -195,7 +195,28 @@ static void zeromoe_ggml_log_callback(enum ggml_log_level level,
 }
 #endif
 
-void print_usage() {
+void print_usage(bool all = false) {
+  if (!all) {
+    std::cout
+        << "Usage: zeromoe --config <model.toml> [options]\n"
+        << "       zeromoe --model <model.gguf> [options]\n\n"
+        << "  --config <file>       Load a model recipe (recommended)\n"
+        << "  --model <path>        Override the model file/directory\n"
+        << "  --prompt <text>       Run one prompt instead of interactive input\n"
+        << "  --ctx <tokens>        Context window\n"
+        << "  --ngen <tokens>       Maximum generated tokens\n"
+        << "  --ram <GiB>           Host expert-memory budget\n"
+        << "  --gpu <id>            GPU for single-device mode\n"
+        << "  --temp <number>       Temperature; 0 selects greedy sampling\n"
+        << "  --top_p <number>      Nucleus sampling threshold\n"
+        << "  --system-prompt <s>   Conversation instructions\n"
+        << "  --log-level <level>   INFO (default), WARN, ERROR, DEBUG, VERBOSE\n"
+        << "  --gen-config [file]   Write a configuration template\n"
+        << "  --help-all            Advanced tuning, diagnostics and benchmarks\n"
+        << "  --help-settings       Canonical graph settings and legacy aliases\n\n"
+        << "Model recipes: configs/; configuration guide: docs/configuration.md\n";
+    return;
+  }
   std::cout
       << "Usage: ./zeromoe --config <config.toml>\n"
       << "       ./zeromoe --model <path_to_gguf> [options]\n"
@@ -583,7 +604,13 @@ int main(int argc, char *argv[]) {
       zeromoe::stats::Sink::instance().set_file(argv[++i]);
     else if (arg == "--force-start")
       force_start_cli = true;
-    else if (arg == "--help" || arg == "-h") {
+    else if (arg == "--help-settings") {
+      std::cout << zeromoe::graphsettings::settings_reference();
+      return 0;
+    } else if (arg == "--help-all") {
+      print_usage(true);
+      return 0;
+    } else if (arg == "--help" || arg == "-h") {
       print_usage();
       return 0;
     }

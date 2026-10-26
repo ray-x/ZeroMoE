@@ -5,6 +5,20 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Resolver/default/binding tests need neither CUDA nor model weights.
+enable_testing()
+add_executable(graph_settings_test tests/test_graph_settings.cpp)
+target_include_directories(graph_settings_test PRIVATE core models/graph backends/cpu)
+add_test(NAME graph_settings COMMAND graph_settings_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_settings_defaults.snapshot")
+add_executable(graph_settings_binding_test tests/test_graph_settings_binding.cpp)
+target_include_directories(graph_settings_binding_test PRIVATE core models/graph)
+find_package(Threads REQUIRED)
+target_link_libraries(graph_settings_binding_test PRIVATE Threads::Threads)
+add_test(NAME graph_settings_binding COMMAND graph_settings_binding_test)
+set_tests_properties(graph_settings_binding PROPERTIES ENVIRONMENT_MODIFICATION
+    "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=unset:;ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=unset:;ZEROMOE_PHASE_CACHE_MIB=unset:")
+
 add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
     tests/test_mtp_graph_contract.cpp)
 target_include_directories(mtp_graph_contract_test PRIVATE

@@ -13,12 +13,9 @@
 # This is a hardware-tuned starting point, not a universal VRAM budget.
 # See configs/bench/perf-baselines.md for measured conditions and alternatives.
 #
-# REQUIRES these env vars at launch (device_expert_layers has no TOML key --
-# it is env-var only):
-#   ZEROMOE_QWEN4EXP_FULL_GRAPH=1
-#   ZEROMOE_QWEN4EXP_FULL_GRAPH_DECODE=1
-#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=0
-#   ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=1
+# No environment flags are required. Full-graph prefill/decode are enabled by
+# the engine defaults; expert placement is configured below. Advanced tuning
+# and compatibility aliases: docs/configuration.md and --help-settings.
 #
 # Requested device_expert_layers=0; all 48 layers receive static hot/cold
 # splits (0/48/0), including layers 0,1,2,22 that remain CPU in config A.
@@ -64,8 +61,8 @@ qwen4exp_option_b_stage_count = 1
 qwen4exp_option_b_global_top_k = 14000
 qwen4exp_option_b_global_floor_per_layer = 1
 
-qwen4exp_full_graph = true
-qwen4exp_full_graph_decode = true
+graph_device_expert_layers = 0
+graph_device_expert_trailing = true
 qwen4exp_cpu_gpu_overlap = true
 qwen4exp_cpu_gpu_overlap_max_layers = 0
 

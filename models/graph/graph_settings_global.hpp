@@ -8,26 +8,48 @@
 #include "graph_settings.hpp"
 
 #include <mutex>
+#include <array>
 
 namespace zeromoe::graphsettings {
 
+struct SettingsBinding {
+  std::mutex mutex;
+  ConfigValues config;
+  std::array<ResolvedSettings, 5> cache;
+  std::array<bool, 5> done{};
+};
+
+inline SettingsBinding &settings_binding() {
+  static SettingsBinding binding;
+  return binding;
+}
+
+inline void configure_settings(const ConfigValues &config) {
+  auto &b = settings_binding();
+  std::lock_guard lock(b.mutex);
+  if (std::any_of(b.done.begin(), b.done.end(), [](bool done) { return done; }))
+    throw std::logic_error("graph settings must be configured before graph initialization");
+  b.config = config;
+}
+
 inline const ResolvedSettings &settings_for(Family fam) {
-  static std::mutex mu;
-  static ResolvedSettings cache[4];
-  static bool done[4] = {false, false, false, false};
-  std::lock_guard<std::mutex> lock(mu);
+  auto &b = settings_binding();
+  auto &cache = b.cache;
+  auto &done = b.done;
+  std::lock_guard<std::mutex> lock(b.mutex);
   const size_t i = static_cast<size_t>(fam);
   if (!done[i]) {
     std::string err;
     cache[i] = resolve_settings(
-        fam, [](const char *n) { return zeromoe::graphcfg::env(n); }, &err);
+        fam, [](const char *n) { return zeromoe::graphcfg::env(n); }, &err, b.config);
+    if (!err.empty()) throw std::invalid_argument("invalid graph settings:\n" + err);
     done[i] = true;
-    static const char *const names[] = {"other", "mimo2", "ling", "glm-graph"};
+    static const char *const names[] = {"other", "mimo2", "ling", "glm-graph", "qwen"};
     LOG_INFO("[SETTINGS] family=%s defaults_hash=%016llx\n%s", names[i],
              static_cast<unsigned long long>(defaults_hash()),
              format_settings(cache[i]).c_str());
-    if (!err.empty())
-      LOG_ERROR("[SETTINGS] invalid family overrides:\n%s", err.c_str());
+    for (const auto &warning : cache[i].warnings)
+      LOG_WARN("[SETTINGS] %s\n", warning.c_str());
     for (const std::string &f : settings_findings(cache[i]))
       LOG_WARN("[PREFLIGHT] %s: %s\n", names[i], f.c_str());
     if (cache[i].diag.preflight_strict.value && !settings_findings(cache[i]).empty()) {

@@ -5,6 +5,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "graph_settings_global.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -45,21 +46,16 @@ bool env_decode_borrow_prefill_arenas() {
 }
 
 int env_device_expert_layers() {
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS");
-  if (!v || !v[0])
-    return 0;
-  char *end = nullptr;
-  long n = std::strtol(v, &end, 10);
-  if (end == v || *end != '\0' || n <= 0)
-    return 0;
-  return static_cast<int>(std::min<long>(n, 48));
+  const auto &s = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen);
+  return static_cast<int>(std::clamp(s.tun.device_expert_layers.value, 0L, 48L));
 }
 
 // Matches llama.cpp's `-ncmoe N` convention (GPU-resident block at the END
 // of the model) instead of ZeroMoE's historical leading-N convention.
 // See FullGraph::device_expert_trailing's own comment.
 bool env_device_expert_trailing() {
-  return zeromoe::graphcfg::flag_on("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING");
+  return zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
+      .tun.device_expert_trailing.value != 0;
 }
 
 // See FullGraph::layer_timing_enabled's own comment.
@@ -290,13 +286,9 @@ int graph_cpu_threads() {
   const int available = std::max(
       1, static_cast<int>(hw_threads == 0 ? 1 : hw_threads));
 #endif
-  const char *v = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_THREADS");
-  if (v && v[0]) {
-    char *end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end != v && *end == '\0' && parsed > 0)
-      return std::min(available, static_cast<int>(parsed));
-  }
+  const long cap = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
+                       .tun.cpu_threads_decode.value;
+  if (cap > 0) return static_cast<int>(std::min<long>(available, cap));
   return available;
 }
 

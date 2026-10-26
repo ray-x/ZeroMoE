@@ -1,6 +1,9 @@
 #include "graph_health.hpp"
 #include "graph_settings.hpp"
+#include "graph_settings_config.hpp"
+#include "cpu_config.hpp"
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -19,6 +22,133 @@ static EnvView env_of(std::map<std::string, std::string> m) {
 
 int main(int argc, char **argv) {
   std::string err;
+  {
+    const auto reference = settings_reference();
+    each_field([&](const auto &field) {
+      CHECK(reference.find("\ngraph_" + std::string(field.name) + " [") != std::string::npos);
+      for (Family family : {Family::Other, Family::MiMo2, Family::Ling, Family::GlmGraph, Family::Qwen}) {
+        if (!applies(field, family)) continue;
+        auto defaults = resolve_settings(family, env_of({}));
+        auto value = setting_value(field, field.ref(defaults).value);
+        if (value.starts_with('"')) value = value.substr(1, value.size() - 2);
+        auto configured = resolve_settings(family, env_of({}), nullptr, {{field.name, value}});
+        CHECK(field.ref(defaults).value == field.ref(configured).value);
+      }
+    });
+    CHECK(reference.find("mimo2=512") != std::string::npos);
+    CHECK(reference.find("qwen4exp=0") != std::string::npos);
+    std::string error;
+    resolve_settings(Family::MiMo2, env_of({}), &error, {{"cpu_threads_decode", "0"}});
+    CHECK(!error.empty());
+    CHECK(resolve_settings(Family::Qwen, env_of({}), nullptr,
+                           {{"cpu_threads_decode", "0"}}).tun.cpu_threads_decode.value == 0);
+    error.clear();
+    resolve_settings(Family::MiMo2, env_of({}), &error, {{"prefill_chunk", "513"}});
+    CHECK(!error.empty());
+    error.clear();
+    CHECK(!validate_config({{"cpu_threads_decode", "0"}}, {Family::Other, Family::MiMo2}, error));
+    error.clear();
+    CHECK(!validate_config({{"prefill_chunk", "513"}}, {Family::Other, Family::MiMo2}, error));
+    auto chunk = resolve_settings(Family::MiMo2, env_of({}));
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 128, 512) == 128);
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 0, 512) == 512);
+    chunk = resolve_settings(Family::MiMo2, env_of({}), nullptr, {{"prefill_chunk", "256"}});
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 128, 512) == 256);
+    chunk = resolve_settings(Family::MiMo2, env_of({}), nullptr, {{"prefill_chunk", "0"}});
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 128, 512) == 128);
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 0, 512) == 512);
+    chunk = resolve_settings(Family::Ling, env_of({}), nullptr, {{"prefill_chunk", "0"}});
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 0, 2048) == 2048);
+    chunk = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_PREFILL_CHUNK", "0"}}));
+    CHECK(prefill_chunk_value(chunk.tun.prefill_chunk, 128, 512) == 0);
+    for (const auto &value : {"auto", "true", "false"}) {
+      ConfigValues values;
+      error.clear();
+      const std::string toml = std::string("graph_offload_pin_dma = ") +
+                              (std::string(value) == "auto" ? "\"auto\"" : value);
+      CHECK(collect_config(cpu_toml::parse(toml), values, error));
+      auto configured = resolve_settings(Family::GlmGraph, env_of({}), nullptr, values);
+      CHECK(configured.tun.offload_pin_dma.value ==
+            (std::string(value) == "auto" ? -1 : std::string(value) == "true" ? 1 : 0));
+    }
+  }
+  {
+    ConfigValues config{{"cpu_threads_decode", "12"}, {"prefill_chunk", "256"},
+                        {"offload_pin", "false"}, {"offload_ddr_gib", "24.5"}};
+    auto r = resolve_settings(Family::MiMo2, env_of({}), nullptr, config);
+    CHECK(r.tun.cpu_threads_decode.value == 12 && r.tun.cpu_threads_decode.src == Source::Toml);
+    CHECK(r.tun.prefill_chunk.value == 256 && r.tun.offload_pin.value == 0);
+    CHECK(r.tun.offload_ddr_gib.value == 24.5);
+    CHECK(r.tun.cpu_threads_decode.origin == "graph_cpu_threads_decode");
+    auto legacy = resolve_settings(Family::MiMo2, env_of({{"ZEROMOE_MIMO2_CPU_THREADS", "8"}}), nullptr, config);
+    CHECK(legacy.tun.cpu_threads_decode.value == 8 && legacy.tun.cpu_threads_decode.src == Source::Env);
+    CHECK(legacy.warnings.size() == 1 && legacy.warnings[0].find("precedence") != std::string::npos);
+    CHECK(r.warnings.empty());
+    CHECK(format_settings(r).find("toml:graph_cpu_threads_decode") != std::string::npos);
+    for (const auto &value : {"12x", "-1", "1.5", "99999999999999999999999999"}) {
+      std::string error;
+      resolve_settings(Family::MiMo2, env_of({}), &error, {{"cpu_threads_decode", value}});
+      CHECK(!error.empty());
+    }
+    for (const auto &value : {"nan", "inf", "0.5x", "-5"}) {
+      std::string error;
+      resolve_settings(Family::MiMo2, env_of({}), &error, {{"offload_ddr_gib", value}});
+      CHECK(!error.empty());
+    }
+    std::string error;
+    CHECK(!validate_config({{"not_a_setting", "1"}}, {Family::MiMo2}, error));
+    error.clear();
+    CHECK(!validate_config({{"device_expert_layers", "3"}}, {Family::MiMo2}, error));
+    error.clear();
+    CHECK(!validate_config({{"offload_policy", "seg"}}, {Family::Other, Family::Ling}, error));
+    error.clear();
+    CHECK(validate_config({{"offload_policy", "seg"}}, {Family::Other, Family::Ling, Family::GlmGraph}, error));
+    error.clear();
+    CHECK(validate_config(config, {Family::MiMo2}, error));
+    auto q = resolve_settings(Family::Qwen, env_of({}));
+    CHECK(q.tun.cpu_threads_decode.value == 0);
+    CHECK(q.tun.device_expert_layers.value == 0 && q.tun.device_expert_trailing.value == 0);
+    CHECK(settings_findings(q).empty());
+    q = resolve_settings(Family::Qwen, env_of({}), nullptr,
+                         {{"device_expert_layers", "8"}, {"device_expert_trailing", "true"}});
+    CHECK(q.tun.device_expert_layers.value == 8 && q.tun.device_expert_trailing.value == 1);
+    auto old = resolve_settings(Family::Qwen, env_of({{"ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS", "8"},
+        {"ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING", "1"}}));
+    CHECK(q.tun.device_expert_layers.value == old.tun.device_expert_layers.value);
+    CHECK(q.tun.device_expert_trailing.value == old.tun.device_expert_trailing.value);
+    for (const auto &contents : {
+        "graph_cpu_threads_decode = 12x", "graph_cpu_threads_decode = true",
+        "graph_device_expert_layers = 49", "graph_device_expert_trailing = 1",
+        "graph_offload_pin = \"false\"", "graph_prefill_op_offload = 1",
+        "graph_typo = 1", "graph_offload_pin_dma = 1",
+        "graph_offload_pin_dma = \"true\"", "[[gpus]]\ngraph_cpu_threads_decode = 4"}) {
+      ConfigValues values;
+      std::string failure;
+      CHECK(!collect_config(cpu_toml::parse(contents), values, failure));
+      CHECK(!failure.empty());
+    }
+    if (argc > 1) {
+      const auto snapshot = std::filesystem::path(argv[1]);
+      const auto recipe = snapshot.parent_path().parent_path() / "configs/qwen38-flash.toml";
+      ConfigValues values;
+      std::string error;
+      CHECK(collect_config(cpu_toml::parse_file(recipe.string()), values, error));
+      CHECK(validate_config(values, {Family::Other, Family::Qwen}, error));
+      auto settings = resolve_settings(Family::Qwen, env_of({}), nullptr, values);
+      CHECK(settings.tun.device_expert_layers.value == 0);
+      CHECK(settings.tun.device_expert_trailing.value == 1);
+    }
+    ConfigValues values;
+    error.clear();
+    CHECK(collect_config(cpu_toml::parse(
+        "graph_cpu_threads_decode = 12\ngraph_offload_pin = false\n"
+        "graph_prefill_op_offload = \"auto\"\ngraph_offload_ddr_gib = \"auto\"\n"
+        "graph_offload_usage_file = \"/tmp/usage\"\n"), values, error));
+    r = resolve_settings(Family::MiMo2, env_of({}), nullptr, values);
+    CHECK(r.tun.cpu_threads_decode.value == 12 && r.tun.offload_pin.value == 0);
+    CHECK(r.tun.prefill_op_offload.value == -1 && r.tun.offload_ddr_gib.value == -1);
+    CHECK(r.tun.offload_usage_file.value == "/tmp/usage");
+  }
   for (Family f : {Family::Other, Family::MiMo2, Family::GlmGraph, Family::Ling}) {
     auto defaults = resolve_settings(f, env_of({}));
     CHECK(defaults.tun.phase_cache_mib.value == 0);

@@ -2,6 +2,7 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_settings_global.hpp"
 #include <cstdlib>
 
 std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
@@ -189,6 +190,18 @@ std::expected<void, std::string> EngineRunner::run() {
 }
 
 std::expected<void, std::string> EngineRunner::apply_engine_config() {
+  if (!config.graph_settings.empty()) {
+#if !defined(ZEROMOE_USE_GGML_CUDA)
+    return std::unexpected("graph_* settings require a build with ZEROMOE_USE_GGML_CUDA=ON");
+#endif
+    if (config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY"))
+      return std::unexpected("graph_* settings require CUDA graph execution, not CPU-only mode");
+  }
+  try {
+    zeromoe::graphsettings::configure_settings(config.graph_settings);
+  } catch (const std::exception &e) {
+    return std::unexpected(e.what());
+  }
   engine.drop_expert_pages = config.drop_pages;
   engine.unpacked_expert_format = config.unpacked_expert_format;
   engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;

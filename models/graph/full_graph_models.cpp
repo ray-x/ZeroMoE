@@ -578,9 +578,7 @@ class Ling31FlashGraphModel final : public FullGraphModelBase<Ling31FlashGraphMo
   }
   int max_prefill_tokens(const StreamingEngine &e) const override {
     const auto &chunk = settings().tun.prefill_chunk;
-    if (chunk.src == zeromoe::graphsettings::Source::Env)
-      return int(chunk.value);
-    return e.prefill_batch_tokens > 0 ? e.prefill_batch_tokens : 2048;
+    return int(zeromoe::graphsettings::prefill_chunk_value(chunk, e.prefill_batch_tokens, 2048));
   }
   int min_prefill_batch() const override { return int(settings().tun.prefill_min_batch.value); }
   bool supports_prefill_continuation(const StreamingEngine &) const override {
@@ -712,10 +710,9 @@ class MiMo2GraphModel final : public FullGraphModelBase<MiMo2GraphModel> {
   }
   void shutdown() const override { mimo2_full_graph_shutdown(); }
   int max_prefill_tokens(const StreamingEngine &e) const override {
-    // One prefill-chunk model for graph families: env > the TOML's prefill_batch_tokens > family override > default.
+    // Compatibility env > canonical graph key > engine chunk > family default.
     const auto &chunk = settings().tun.prefill_chunk;
-    const long v = (chunk.src == zeromoe::graphsettings::Source::Env || e.prefill_batch_tokens <= 0)
-                       ? chunk.value : e.prefill_batch_tokens;
+    const long v = zeromoe::graphsettings::prefill_chunk_value(chunk, e.prefill_batch_tokens, 512);
     return int(std::clamp<long>(v, 1, 512));
   }
   bool supports_prefill_continuation(const StreamingEngine &) const override { return true; }

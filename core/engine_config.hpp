@@ -4,6 +4,7 @@
 #pragma once
 #include "logger.hpp"
 #include "resident_memory_policy.hpp"
+#include "graph_settings_config.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -64,6 +65,8 @@ struct GpuConfig {
 
 // Full engine configuration
 struct EngineConfig {
+  // Root graph_* keys, collected verbatim and validated by the typed resolver.
+  zeromoe::graphsettings::ConfigValues graph_settings;
   bool serve_api = false;
   std::string api_host = "127.0.0.1";
   int api_port = 8080;
@@ -2605,6 +2608,11 @@ inline Document parse_file(const std::string &path) {
 // ============================================================
 inline bool EngineConfig::load(const std::string &path) {
   auto doc = toml::parse_file(path);
+  std::string settings_error;
+  if (!zeromoe::graphsettings::collect_config(doc, graph_settings, settings_error)) {
+    std::cerr << "[CONFIG] " << settings_error;
+    return false;
+  }
 
   model_path = doc.root.get_str("model_path");
   model_format = doc.root.get_str("model_format", model_format);

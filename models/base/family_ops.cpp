@@ -662,6 +662,7 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
   case ModelFamily::Hunyuan:
   case ModelFamily::Llama:
   case ModelFamily::GLM4_MOE:
+  case ModelFamily::Qwen:
   case ModelFamily::GemmaMoE:
   case ModelFamily::KimiMoE:
   case ModelFamily::Unknown:

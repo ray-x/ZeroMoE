@@ -6,6 +6,7 @@
 // present.
 #pragma once
 #include "logger.hpp"
+#include "graph_settings_config.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
@@ -232,6 +233,17 @@ struct CPUConfig {
     auto doc = cpu_toml::parse_file(path);
     if (doc.root.values.empty() && doc.gpu_tables.empty())
       return false;
+    zeromoe::graphsettings::ConfigValues graph;
+    std::string graph_error;
+    if (!zeromoe::graphsettings::collect_config(doc, graph, graph_error)) {
+      std::cerr << "[CPU-CONFIG] " << graph_error;
+      return false;
+    }
+    if (!graph.empty()) {
+      std::cerr << "[CPU-CONFIG] graph_* settings configure CUDA full-graph adapters, not zeromoe_cpu; "
+                   "use omp_max_threads for CPU worker limits\n";
+      return false;
+    }
 
     model_path = doc.root.get_str("model_path", model_path);
     model_format = doc.root.get_str("model_format", model_format);

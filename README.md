@@ -60,6 +60,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DZEROMOE_USE_GGML=ON
 cmake --build build -j$(nproc)
 ```
 
+For the smaller configuration surface (Release CPU/CUDA presets, normal versus
+advanced help, canonical `graph_*` keys and legacy compatibility), start with
+the [configuration guide](docs/configuration.md).
+
 AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
 AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
 failure. Configure with `-DZEROMOE_ENABLE_AVX512_VNNI=OFF` to disable VNNI in

@@ -7,6 +7,7 @@
 // MUL_MAT_ID graph at complete host-RAM expert arenas.
 
 #include "graph_config.hpp"
+#include "graph_settings_global.hpp"
 #include "ggml_moe_backend.hpp"
 
 #include "kernels_cpu.hpp"
@@ -154,13 +155,10 @@ int default_cpu_threads() {
   // competes for the same LLC.  Keep the existing process-wide default, but
   // allow a Qwen-only A/B override without changing any other model family or
   // the application's global OpenMP setting.
-  const char *env = zeromoe::graphcfg::env("ZEROMOE_QWEN_CPU_THREADS");
-  if (env && env[0]) {
-    char *end = nullptr;
-    const long requested = std::strtol(env, &end, 10);
-    if (end != env && *end == '\0' && requested > 0)
-      return std::min(available, static_cast<int>(requested));
-  }
+  const long requested = zeromoe::graphsettings::settings_for(zeromoe::graphsettings::Family::Qwen)
+                             .tun.cpu_threads_decode.value;
+  if (requested > 0)
+    return static_cast<int>(std::min<long>(available, requested));
 
   // The host-node runner is a second GGML CPU execution context that may
   // overlap the scheduler's ordinary CPU backend.  Keep its cap separate
