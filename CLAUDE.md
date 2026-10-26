@@ -17,50 +17,21 @@ ZeroMoE is a zero-dependency C++23 / CUDA17 inference engine built to stream Mix
 
 ## 2. Build & Execution Rules
 
-### CUDA MoE onboarding invariant
+### CUDA MoE onboarding: required stop/go workflow
+CUDA MoE support requires a registered `FullGraphModel` adapter on the shared graph runtime. Do not onboard a family through the legacy layer-by-layer expert executor. Before coding, trace the exact GGUF architecture through `detect_model_family()`, `resolve_family_ops()`, and `full_graph_model()`. Record the architecture/topology checks and llama.cpp source path/commit.
 
-CUDA MoE support means a registered `FullGraphModel` using the shared graph
-runtime. Do not add a new model through the legacy layer-by-layer expert
-executor. Trace GGUF family detection through `resolve_family_ops()` and
-`full_graph_model()` before touching CUDA dispatch; if no graph adapter exists,
-the model is not CUDA-supported and startup must reject it.
+Map each llama.cpp block stage to the ZeroMoE adapter before implementation, including tensor shape/layout, dtype, normalization function and epsilon, scale placement, projection/activation order, residual order, router behavior, and state handoff. Preserve the reference operation sequence. Do not use an algebraically equivalent operation or fuse/reorder work without a same-input boundary-trace A/B; small rounding changes can alter routed experts downstream.
 
-`FullGraphModel::plan_decode_memory()` is the adapter's memory plan. Layered
-decode is permitted only when it reports
-`Insufficient` with required device bytes greater than available bytes and a
-reason. `Fits` and `Unknown` both require graph decode; build/run failure must
-fail the request. A full-fit onboarding run must pass
-`python3 tools/check_full_graph_moe_run.py <run.log> --full-fit`. See
-`AGENTS.md` and `docs/design/full-graph-model-onboarding.md` for the durable
-contract.
+Gate order is mandatory:
+1. Implement and register an adapter that whitelists the exact GGUF architecture and validates tensor topology before large allocation.
+2. Obtain a decode memory plan. `Fits` requires positive required/available bytes with required <= available and mandates graph decode. `Unknown` also requires graph decode. Only `Insufficient` with required > available and a logged reason may permit layered fallback; graph-only models cannot fall back. `Unsupported` fails startup and never means memory fallback.
+3. On a full-fit run, pass `python3 tools/check_full_graph_moe_run.py <run.log> --full-fit`. For Qwen3.5/Qwen3.6 also require `--require-all-expert-layers-on-device --require-full-graph-prefill`. Graph build/run failure is fatal; never silently enter layered or legacy expert execution.
+4. Teacher-force the same prompt and decode tokens through llama.cpp and ZeroMoE. Compare per-layer pre-MoE hidden states and routed expert IDs/weights; trace the first divergent boundary before optimizing.
+5. Benchmark only the validated graph path on the same GGUF, physical GPU, context, active prompt length, generated token count, and thread count. Require at least 90% of llama.cpp by default and any user-set absolute floor via `--minimum-tps`. Keep the model in progress below either bar.
 
-`Unsupported` rejects a GGUF architecture or tensor topology at startup. It
-never authorizes a memory fallback.
+Report prefill, graph construction/upload, steady decode, and end-to-end rates separately. Enforce the relative/absolute bar with `tools/check_full_graph_moe_perf.py`. Record both project commits, upstream GGML base/version, applied GGML patch manifest, CUDA toolkit/driver, compiler, and native GPU targets. Verify copied build trees report the upstream `GGML_COMMIT`; keep benchmark artifacts and complete runtime bundles in persistent storage, not only `/tmp`. A toolchain, base revision, or GPU-target mismatch makes the ratio provisional until the reference is rebuilt to match. Project patches are part of the measured product, so do not call the builds kernel-identical.
 
-Coherent output is only a smoke check. Before marking a new model supported,
-compare teacher-forced pre-layer hidden states and per-layer expert routing
-against llama.cpp. Without a user-set throughput target, steady-state decode
-must reach at least 90% of a same-GGUF, same-GPU llama.cpp run; report prefill,
-graph build/upload, steady decode, and end-to-end separately. A lower result
-keeps onboarding in progress for further profiling and optimization.
-Enforce that bar with `tools/check_full_graph_moe_perf.py` after the
-full-fit graph gate passes. Port llama.cpp's exact operation sequence first;
-record its source path/commit and the matching tensor boundaries, norm
-epsilon, scale placement, activation, residual order, and state handoff. Treat
-a mathematically equivalent op substitution or fusion as an optimization that
-needs a same-input boundary-trace A/B, since rounding changes can propagate
-through quantized FFNs into near-tie expert choices.
-Compare the exact decode workload: same GGUF, GPU, active prompt length,
-generated token count, context, and thread count. For ZeroMoE's
-`--bench-random-tg N` one-token prompt, use llama-bench `-pg 1,N`; the rate
-checker verifies the prompt lengths. Record source commits, shared upstream
-GGML base revision/version, ZeroMoE's GGML patch manifest, CUDA toolkit and
-driver, compiler, and native GPU code targets. ZeroMoE-only patches are part
-of the implementation being measured, so do not call the builds
-kernel-identical. Mark the ratio provisional if the upstream base, toolchain,
-or GPU target differs. Use `--minimum-tps` with the relative bar for an
-absolute user-set target. For copied GGML trees, check that `GGML_COMMIT`
-identifies the GGML base revision, not the enclosing ZeroMoE checkout.
+The authoritative workflow and memory-fallback contract are in `docs/design/full-graph-model-onboarding.md`.
 
 ### System Requirements & Constraints
 * **Platform:** Linux, NVIDIA CUDA Toolkit, GCC (C++23 support), Python 3, and an AVX-512 capable CPU. 
