@@ -2,7 +2,9 @@
 # The model adapter plans all 40 routed-expert layers as device resident when
 # the measured full-graph footprint fits. Do not add a hot-expert subset here.
 # 2026-10-26: 8-token full-fit graph gate passed on RTX 5060 Ti.
-# Latest 400-token repeat: 109.82 tok/s, 89.2% of llama.cpp; below the 90% gate.
+# 2026-10-26: 400-token, 3-rep median 112.39 tok/s; graph-only 112.95 tok/s
+# (92.0% of llama.cpp). Full-graph/performance gates pass; layer-3 RoPE parity
+# is still under investigation, so model support is not yet accepted.
 
 model_path = "/home/ray/vllm-workspace/Qwen3.6-35B-A3B-UD-IQ2_M.gguf"
 log_path = "logs/qwen36_35b_a3b_iq2m_5060.log"
