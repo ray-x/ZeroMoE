@@ -15,9 +15,11 @@
 //    processed. The draft pairs y with the target hidden of the position
 //    before it, then feeds its own residual back for later drafts.
 //  * Verification has two modes. Stepwise (always available): the target
-//    steps one token at a time over y, d1..dk with a state checkpoint before
-//    every step after the first, so a rejection at draft a restores exactly
-//    the state after processing d_a without replaying anything. Batched (a
+//    steps one token at a time over y, d1..dk and judges each draft as soon as
+//    the step that yields its distribution has run, stopping at the first
+//    rejection. The live state then already stands after processing d_a, so
+//    no checkpoint, restore or wasted step is needed (target steps == tokens
+//    processed == tokens emitted). Batched (a
 //    target that reports supports_batch()): one checkpoint, then y, d1..dk in a
 //    single pass; a rejection at draft a < k restores the checkpoint and
 //    replays y..d_a (one pass, or one step when a == 0) so the live state is
@@ -250,53 +252,27 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
     }
     stats.drafted += drafts.size();
 
-    // ---- verify y, d1..dk ----
+    // ---- verify y, d1..dk and accept / correct ----
+    // p[j] is the target distribution after y, d1..dj; it judges draft d_{j+1}
+    // (j < k) or yields the bonus token (j == k).
     const bool batched = cfg.batch_verify && k >= 1 && target.supports_batch();
     detail::CheckpointSet checkpoints(target);
-    std::vector<float> wides(size_t(k + 1) * W), plogits(size_t(k + 1) * V);
-    if (batched) {
-      int handle = 0;
-      if (!target.save(handle, error)) return false;
-      checkpoints.handles.push_back(handle);  // handles[0] = state before y
-      std::vector<int> tokens;
-      tokens.push_back(seq.back());
-      tokens.insert(tokens.end(), drafts.begin(), drafts.end());
-      ++stats.target_batches;
-      stats.target_batch_tokens += tokens.size();
-      if (!target.step_batch(tokens, pos, wides, plogits, error)) return false;
-    } else {
-      for (int j = 0; j <= k; ++j) {
-        if (j >= 1) {
-          int handle = 0;
-          if (!target.save(handle, error)) return false;
-          checkpoints.handles.push_back(handle);  // handles[j-1] = state before step j
-        }
-        const int token = j == 0 ? seq.back() : drafts[size_t(j - 1)];
-        ++stats.target_steps;
-        if (!target.step(token, pos + j,
-                         std::span<float>(wides.data() + size_t(j) * W, W),
-                         std::span<float>(plogits.data() + size_t(j) * V, V), error))
-          return false;
-      }
-    }
-
+    std::vector<float> wides(size_t(k + 1) * W);
     std::vector<std::vector<float>> p(size_t(k + 1));
-    for (int j = 0; j <= k; ++j) {
-      std::vector<int> context = seq;
-      context.insert(context.end(), drafts.begin(), drafts.begin() + j);
-      if (!make_probs(std::span<const float>(plogits.data() + size_t(j) * V, V),
-                      context, p[size_t(j)]))
-        return false;
-    }
-
-    // ---- exact speculative-sampling accept / correct ----
     int accepted = 0, correction = -1;
     std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-    for (int j = 0; j < k; ++j) {
+    const auto distribution_after = [&](int j, std::span<const float> logits) {
+      std::vector<int> context = seq;
+      context.insert(context.end(), drafts.begin(), drafts.begin() + j);
+      return make_probs(logits, context, p[size_t(j)]);
+    };
+    // Exact speculative sampling for draft d_{j+1}: true when accepted,
+    // otherwise `correction` holds the resampled token.
+    const auto judge = [&](int j) {
       const size_t d = size_t(drafts[size_t(j)]);
       const float qp = q[size_t(j)][d], pp = p[size_t(j)][d];
       const float accept = qp > 0.0f ? std::min(1.0f, pp / qp) : (pp > 0.0f ? 1.0f : 0.0f);
-      if (uniform(rng) <= accept) { ++accepted; continue; }
+      if (uniform(rng) <= accept) return true;
       std::vector<float> residual(V);
       double sum = 0.0;
       for (size_t v = 0; v < V; ++v) {
@@ -306,42 +282,76 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
       if (sum > 0.0) for (float &r : residual) r = static_cast<float>(r / sum);
       else residual = p[size_t(j)];
       correction = detail::sample_probs(residual, rng);
-      break;
-    }
-    if (accepted == k) correction = detail::sample_probs(p[size_t(k)], rng);
-    if (correction < 0) { error = "correction distribution has no mass"; return false; }
-    stats.accepted += accepted;
+      return false;
+    };
 
-    // ---- reconcile target state: it must stand after processing d_accepted ----
-    if (accepted < k) {
-      if (!batched) {
-        if (!target.restore(checkpoints.handles[size_t(accepted)], error)) return false;
-        ++stats.restores;
-      } else {
+    if (batched) {
+      // One checkpoint, one pass over everything, then judge all drafts.
+      std::vector<float> plogits(size_t(k + 1) * V);
+      int handle = 0;
+      if (!target.save(handle, error)) return false;
+      checkpoints.handles.push_back(handle);  // state before y
+      std::vector<int> tokens;
+      tokens.push_back(seq.back());
+      tokens.insert(tokens.end(), drafts.begin(), drafts.end());
+      ++stats.target_batches;
+      stats.target_batch_tokens += tokens.size();
+      if (!target.step_batch(tokens, pos, wides, plogits, error)) return false;
+      for (int j = 0; j <= k; ++j)
+        if (!distribution_after(j, std::span<const float>(plogits.data() + size_t(j) * V, V)))
+          return false;
+      bool rejected = false;
+      for (int j = 0; j < k && !rejected; ++j) {
+        if (judge(j)) ++accepted; else rejected = true;
+      }
+      if (!rejected) correction = detail::sample_probs(p[size_t(k)], rng);
+      if (correction < 0) { error = "correction distribution has no mass"; return false; }
+
+      if (accepted < k) {
         // Roll back to before y and replay y..d_accepted. The replay's rows are
         // the true ones for the live state, so they feed the draft rebuild.
         if (!target.restore(checkpoints.handles[0], error)) return false;
         ++stats.restores;
         const size_t m = size_t(accepted) + 1;
-        std::vector<int> tokens;
-        tokens.push_back(seq.back());
-        tokens.insert(tokens.end(), drafts.begin(), drafts.begin() + accepted);
+        std::vector<int> replay;
+        replay.push_back(seq.back());
+        replay.insert(replay.end(), drafts.begin(), drafts.begin() + accepted);
         std::vector<float> replay_logits(m * V);
         stats.replay_tokens += m;
         if (m == 1) {
           ++stats.target_steps;
-          if (!target.step(tokens[0], pos, std::span<float>(wides.data(), W),
+          if (!target.step(replay[0], pos, std::span<float>(wides.data(), W),
                            std::span<float>(replay_logits.data(), V), error))
             return false;
         } else {
           ++stats.target_batches;
           stats.target_batch_tokens += m;
-          if (!target.step_batch(tokens, pos, std::span<float>(wides.data(), m * W),
+          if (!target.step_batch(replay, pos, std::span<float>(wides.data(), m * W),
                                  replay_logits, error))
             return false;
         }
       }
+    } else {
+      // Stepwise and lazy: judge each draft as soon as the step that yields its
+      // distribution has run, and stop at the first rejection. The live state
+      // then already stands after y, d1..d_accepted, so there is nothing to
+      // restore and no step is spent past the rejected draft.
+      std::vector<float> logits_j(V);
+      bool rejected = false;
+      for (int j = 0; j <= k && !rejected; ++j) {
+        const int token = j == 0 ? seq.back() : drafts[size_t(j - 1)];
+        ++stats.target_steps;
+        if (!target.step(token, pos + j, std::span<float>(wides.data() + size_t(j) * W, W),
+                         logits_j, error))
+          return false;
+        if (!distribution_after(j, logits_j)) return false;
+        if (j == k) break;
+        if (judge(j)) ++accepted; else rejected = true;
+      }
+      if (!rejected) correction = detail::sample_probs(p[size_t(k)], rng);
+      if (correction < 0) { error = "correction distribution has no mass"; return false; }
     }
+    stats.accepted += accepted;
 
     // ---- rebuild the draft rows for t_0..t_accepted from true target hiddens ----
     if (draft.next_position() > pos + 1 && !draft.rewind(pos + 1, error)) return false;

@@ -39,7 +39,7 @@ void model_logits(uint32_t h, size_t V, std::span<float> out, uint32_t noise_sal
 struct FakeTarget : SpecTarget {
   size_t V;
   uint32_t h = 12345;
-  int steps = 0, live = 0, next_handle = 1, fail_at = -1, restores = 0;
+  int steps = 0, live = 0, next_handle = 1, fail_at = -1, restores = 0, saves = 0;
   std::map<int, uint32_t> checkpoints;
   explicit FakeTarget(size_t vocab) : V(vocab) {}
   bool supports_batch() const override { return g_batch; }
@@ -64,6 +64,7 @@ struct FakeTarget : SpecTarget {
   }
   bool save(int &handle, std::string &) override {
     handle = next_handle++;
+    ++saves;
     checkpoints[handle] = h;
     ++live;
     return true;
@@ -224,9 +225,16 @@ int run_all(bool batch) {
           no_leak = no_leak && target.live == 0;
           ordered = ordered && !draft.order_violation && int(got.size()) <= max_new;
           // Tokens processed beyond replays are exactly y plus every draft.
-          steps_ok = steps_ok && stats.target_steps + stats.target_batch_tokens -
-                                         stats.replay_tokens == stats.cycles + stats.drafted;
-          if (!batch) steps_ok = steps_ok && stats.target_batches == 0 && stats.replay_tokens == 0;
+          if (batch)
+            steps_ok = steps_ok && stats.target_steps + stats.target_batch_tokens -
+                                           stats.replay_tokens == stats.cycles + stats.drafted;
+          if (!batch) {
+            // Lazy stepwise verification: one step per token processed (y plus
+            // each accepted draft), no checkpoints, no restores, no waste.
+            steps_ok = steps_ok && stats.target_batches == 0 && stats.replay_tokens == 0 &&
+                       stats.restores == 0 && target.saves == 0 && target.restores == 0 &&
+                       stats.target_steps == stats.cycles + stats.accepted;
+          }
           if (batch) {
             batch_passes += stats.target_batches;
             replays += stats.replay_tokens;
@@ -283,7 +291,8 @@ int run_all(bool batch) {
       if (uint32_t(draft.row_hidden0[size_t(p)]) != true_h[size_t(p - 1)]) paired = false;
     }
     check(paired, "draft rows hold committed tokens paired with true target hidden");
-    check(stats.restores > 0, "rollback path exercised");
+    check(batch ? stats.restores > 0 : stats.restores == 0 && target.saves == 0,
+          batch ? "rollback path exercised" : "stepwise verification needs no rollback");
   }
 
   // 3) Sampling is exact: the joint of the first three tokens matches the

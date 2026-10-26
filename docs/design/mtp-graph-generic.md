@@ -37,10 +37,13 @@ model supplies a target, a draft runtime and an embedding lookup.
 
 The target is authoritative either way; output is exact. They differ in cost.
 
-* **Stepwise** costs one target step per token processed: `y, d1..dk` plus the
-  redo of nothing (a checkpoint before every step makes rollback free). MTP
-  can never be faster than plain decoding in this mode; it is the correctness
-  reference and the fallback.
+* **Stepwise** (default) judges each draft as soon as the step that yields its
+  distribution has run and stops at the first rejection. The live state then
+  already stands after the accepted prefix, so there is no checkpoint, no
+  restore and no wasted step: target steps equal emitted tokens. MTP in this
+  mode costs plain decoding plus the draft and a fixed setup, so it can match
+  but never beat plain decoding; it is the correctness reference and the
+  fallback.
 * **Batched** costs one pass over `k+1` tokens plus, on a rejection at `a < k`,
   a restore and a replay of `y..d_a`.
 
@@ -61,7 +64,21 @@ help. It helps when the routed experts are device resident.
 |---|---|
 | plain decode | 48 tok/s |
 | MTP stepwise, host-CPU draft head | 18.7 tok/s |
-| MTP stepwise, GPU draft head | 32 tok/s |
+| MTP stepwise, GPU draft head, verify all then restore | 32 tok/s |
+| MTP stepwise, lazy verify (no waste, no restore) | **36.8 tok/s** (199 target steps for 200 tokens) |
 
-Draft step 14 ms -> 1.3 ms; target step 20-22 ms; checkpoint save/restore
-0.45 ms; ~1 s one-time setup. Acceptance is 78-90% depending on prompt/length.
+Draft step 14 ms -> 1.3 ms; target step 20-22 ms; ~0.8-1 s one-time setup.
+Acceptance 74-94% by draft count (k=1 94%, k=3 80%, k=4 74%); rate is ~36
+tok/s for k=1..4 because the floor is plain decoding plus draft and setup.
+
+## Why batching does not help the 3090 hybrid recipe (measured)
+
+Router ids of a 199-token plain run (`ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP`-style
+tap, 13,000 hot experts): 0.82 of the 10 routed experts per layer are
+CPU-resident per token, and consecutive tokens barely share them. Distinct
+CPU experts per layer for a window of 1/2/3/4/5 tokens: 0.82/1.49/2.09/2.67/3.23,
+so a 4-token pass needs 3.25x the CPU expert work of one token. Even if only
+half of a step is CPU expert time, the expected MTP speedup is <= 1.03x
+(k=1) and falls with larger k; at 90% CPU share it is 0.68-0.84x. No local
+configuration keeps the routed experts on the GPU (models are 62-70 GB, the
+3090 has 24 GB), so batched verification is not built for Qwen4Exp.
