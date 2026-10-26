@@ -640,9 +640,13 @@ bool qwen4exp_full_graph_run(StreamingEngine &engine, float *hidden_states,
                             wide_n * sizeof(float));
   }
   if (g.logits && engine.qwen4exp_full_graph_logits_target) {
+    // Standard Qwen builds logits for every prompt row; Qwen4Exp builds them
+    // for the last row only. Read the last column that actually exists.
+    const size_t last_column =
+        static_cast<size_t>(std::max<int64_t>(g.logits->ne[1], 1) - 1);
     ggml_backend_tensor_get(g.logits,
                             engine.qwen4exp_full_graph_logits_target,
-                            static_cast<size_t>(S - 1) * g.logits->nb[1],
+                            last_column * g.logits->nb[1],
                             static_cast<size_t>(g.logits->ne[0]) * sizeof(float));
     engine.qwen4exp_full_graph_logits_ready = true;
   }

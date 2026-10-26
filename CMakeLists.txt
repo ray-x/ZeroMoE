@@ -10,6 +10,11 @@ add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
 target_include_directories(mtp_graph_contract_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
 
+add_executable(mtp_speculation_test EXCLUDE_FROM_ALL
+    tests/test_mtp_speculation.cpp)
+target_include_directories(mtp_speculation_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
+
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
@@ -507,6 +512,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/ggml/ggml_gdn_proj_backend.cpp
         models/glm/ggml_glm5next_proj_backend.cpp
         core/mtp_speculative.cpp
+        core/qwen4exp_graph_mtp.cpp
         backends/cpu/kernels_cpu.cpp
         models/qwen/qwen_moe.cpp
         models/base/model_factory.cpp
@@ -644,6 +650,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/ggml/ggml_gdn_proj_backend.cpp
         models/glm/ggml_glm5next_proj_backend.cpp
         core/mtp_speculative.cpp
+        core/qwen4exp_graph_mtp.cpp
         backends/cpu/kernels_cpu.cpp
         models/qwen/qwen_moe.cpp
         models/base/model_factory.cpp

@@ -330,6 +330,8 @@ std::expected<void, std::string> EngineRunner::apply_engine_config() {
   engine.glm5next_moe_prefill_gpu = config.glm5next_moe_prefill_gpu;
   engine.glm5next_dense_prefill_fusion = config.glm5next_dense_prefill_fusion;
   engine.mtp_enabled = config.mtp_enabled;
+  engine.mtp_graph_native = config.mtp_graph && config.mtp_enabled;
+  engine.qwen4exp_wide_export = engine.mtp_graph_native;
   engine.mtp_draft_tokens = config.mtp_draft_tokens;
   engine.prompt_cache = config.prompt_cache;
   return {};

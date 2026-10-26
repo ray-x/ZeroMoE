@@ -932,6 +932,9 @@ public:
     // accidentally enable MTP for Qwen/DeepSeek.
     bool mtp_enabled = false;
     int mtp_draft_tokens = 3;
+    // Graph-native Qwen4Exp MTP (EngineConfig::mtp_graph). Implies
+    // qwen4exp_wide_export so the full graph publishes the draft's inputs.
+    bool mtp_graph_native = false;
 
     // Set from EngineConfig::cpu_offload_max_experts at startup (main.cpp).
     // 0 = off (default). See that field's own extensive comment

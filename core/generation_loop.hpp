@@ -12,6 +12,7 @@
 #include "ggml_qwen4exp_graph.hpp"
 #include "ggml_glm5next_graph.hpp"
 #include "mtp_speculative.hpp"
+#include "qwen4exp_graph_mtp.hpp"
 #include "shutdown.hpp"
 #include <vector>
 #include <string>
@@ -358,14 +359,22 @@ public:
     std::mt19937 rng;
     Sampler() { rng.seed(std::random_device{}()); }
 
-    int sample(std::vector<float>& logits, float temperature, float top_p) {
+    // The distribution sample() draws from: one-hot on the first maximum at
+    // temperature <= 0, otherwise softmax(logits / T) truncated to top_p.
+    // Shared with speculative decoding so that verified drafts are accepted
+    // against exactly the distribution ordinary decoding would sample.
+    static void probabilities(const std::vector<float>& logits, float temperature,
+                              float top_p, std::vector<float>& probs) {
         int V = logits.size();
         if (temperature <= 0.0f) {
-            return std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+            probs.assign(V, 0.0f);
+            probs[std::distance(logits.begin(),
+                                std::max_element(logits.begin(), logits.end()))] = 1.0f;
+            return;
         }
 
         float max_logit = *std::max_element(logits.begin(), logits.end());
-        std::vector<float> probs(V);
+        probs.resize(V);
         float sum_probs = 0.0f;
         float inv_temp = 1.0f / std::max(temperature, 1e-4f);
 
@@ -395,6 +404,15 @@ public:
             for (int i = 0; i < keep_count; ++i) new_sum += probs[indices[i]];
             for (int i = 0; i < keep_count; ++i) probs[indices[i]] /= new_sum;
         }
+    }
+
+    int sample(std::vector<float>& logits, float temperature, float top_p) {
+        int V = logits.size();
+        if (temperature <= 0.0f) {
+            return std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+        }
+        std::vector<float> probs;
+        probabilities(logits, temperature, top_p, probs);
 
         std::uniform_real_distribution<float> dist(0.0f, 1.0f);
         float target = dist(rng);
@@ -1186,7 +1204,47 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         // is hc_dim wide, not n_embd wide, and GLM's MtpSpeculator is kept
         // untouched by this family's own, separately-verified path (see
         // Qwen4ExpMtpSpeculator's own header comment).
-        if (engine.family_ops.family == ModelFamily::Qwen4Exp) {
+        if (engine.mtp_graph_native) {
+            // Graph-native: the target stays on the full graph and every token
+            // is verified by it. A failure fails the request; there is no
+            // fallback to the layered speculator or to plain decoding once
+            // generation has started.
+            std::string mtp_error;
+            // Exactly the distribution the ordinary decode loop samples from:
+            // the optional repetition penalty (generated tokens only), then
+            // temperature / top-p.
+            const zeromoe::graph::SpecDistribution mtp_distribution =
+                [&](std::span<const float> step_logits,
+                    const std::vector<int> &context, std::vector<float> &probs) {
+                    std::vector<float> work(step_logits.begin(), step_logits.end());
+                    if (const float penalty = zeromoe_repetition_penalty();
+                        penalty != 1.0f) {
+                        constexpr int REPETITION_WINDOW = 64;
+                        const int start =
+                            std::max((int)prompt_ids.size(),
+                                     (int)context.size() - REPETITION_WINDOW);
+                        for (int i = start; i < (int)context.size(); ++i) {
+                            const int tok = context[i];
+                            if (tok < 0 || tok >= (int)work.size()) continue;
+                            float &l = work[tok];
+                            l = (l > 0.0f) ? (l / penalty) : (l * penalty);
+                        }
+                    }
+                    Sampler::probabilities(work, temperature, top_p, probs);
+                    return true;
+                };
+            mtp_started = qwen4exp_graph_mtp_run(
+                engine, ram_mgr, prefetcher, prompt_ids, logits, max_new_tokens,
+                eos_id, mtp_distribution, sequence, sampler.rng, emit_mtp,
+                mtp_error);
+            if (!mtp_started) {
+                engine.qwen4exp_full_graph_failure =
+                    "graph-native MTP failed: " + mtp_error;
+                LOG_ERROR("[MTP-GRAPH] %s\n",
+                          engine.qwen4exp_full_graph_failure.c_str());
+                return;
+            }
+        } else if (engine.family_ops.family == ModelFamily::Qwen4Exp) {
             Qwen4ExpMtpSpeculator mtp(engine, ram_mgr, prefetcher);
             mtp_started = mtp.run(prompt_ids, hidden_states, max_new_tokens,
                                   eos_id, temperature, top_p, sequence,

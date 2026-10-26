@@ -503,6 +503,10 @@ struct EngineConfig {
   // validated draft block.
   bool mtp_enabled = false;
   int mtp_draft_tokens = 3;
+  // Qwen4Exp only: run MTP on the full-graph target with a graph-native draft
+  // and target-verified speculation (requires mtp_enabled and mtp_model_path).
+  // Replaces the layered Qwen4ExpMtpSpeculator; never falls back to it.
+  bool mtp_graph = false;
 
   // moe_gpu_accum: accumulate routed-expert outputs on the DEVICE and download
   // one [S,D] per layer, instead of downloading every expert's [n,D] output so
@@ -2991,6 +2995,7 @@ inline bool EngineConfig::load(const std::string &path) {
     qwen4exp_cpu_offload_ring_slots = 4;
   prompt_cache = doc.root.get_bool("prompt_cache", prompt_cache);
   mtp_enabled = doc.root.get_bool("mtp_enabled", mtp_enabled);
+  mtp_graph = doc.root.get_bool("mtp_graph", mtp_graph);
   mtp_draft_tokens = (int)doc.root.get_int("mtp_draft_tokens", mtp_draft_tokens);
   if (mtp_draft_tokens < 1) mtp_draft_tokens = 1;
   if (mtp_draft_tokens > 8) {

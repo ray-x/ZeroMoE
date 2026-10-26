@@ -144,7 +144,8 @@ std::expected<void, std::string> EngineRunner::load_model() {
         "Qwen4Exp full-graph decode is enabled but full-graph prefill is "
         "disabled; configure both graph phases or explicitly exempt this run");
   }
-  if (engine.qwen4exp_full_graph_required && engine.mtp_enabled) {
+  if (engine.qwen4exp_full_graph_required && engine.mtp_enabled &&
+      !engine.mtp_graph_native) {
     return std::unexpected(
         "Qwen4Exp MTP is not integrated with the full-graph-only trunk; "
         "disable MTP explicitly or use a graph-enabled MTP implementation");

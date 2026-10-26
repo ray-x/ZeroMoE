@@ -1,8 +1,12 @@
 # Graph-native MTP: shared runtime, Qwen4Exp adapter
 
-Status: experimental standalone draft path. This is not end-to-end speculative
-generation support. Keep the full-graph MTP startup rejection until target
-verification and state reconciliation are implemented and validated.
+Status: the standalone draft graph is parity-validated against llama.cpp, and
+target-verified speculative generation is available as an **opt-in**
+(`mtp_graph = true`), correctness-validated path on the Qwen4Exp full graph.
+It is exact (output identical to plain decoding) but **not yet faster**: the
+target verifies one token per step. The startup rejection of `mtp_enabled`
+with the full-graph-only trunk stays for every configuration that does not set
+`mtp_graph`.
 
 ## Real-weight runtime smoke (2026-10-26)
 
@@ -284,6 +288,61 @@ the draft owns only K/V.
 This proves the loop, not the model integration: the Qwen target adapter
 (wide-residual export from decode, device state checkpoints) and the GPU
 teacher-forced validation remain, and the production startup guard stays.
+
+## Graph-native generation (2026-10-27)
+
+Enable with `mtp_enabled = true`, `mtp_graph = true`, `mtp_model_path`, and
+`mtp_draft_tokens` in the TOML, with the full graph required as usual. The
+pieces:
+
+- `core/qwen4exp_graph_mtp.cpp` adapts the engine to the driver in
+  `models/graph/mtp_speculation.hpp`: `GraphTarget` runs one token through the
+  production decode path (embedding, HC expand, `layers_forward_gguf`) and
+  reads back logits and the wide pre-head residual; `GraphDraft` wraps
+  `MtpGraphRuntime`. Anything that is not the full graph is an error: there is
+  no fallback to the layered speculator or to plain decoding once generation
+  has started.
+- `qwen4exp_wide_export` (set by `mtp_graph`) makes the decode graph read back
+  `D*HC` floats per step and the prefill graph one row per prompt token.
+- `qwen4exp_full_graph_state_save/restore/release` checkpoint the decode
+  graph's GDN state, conv history and PLE history device-to-device, plus the
+  host PLE window. KV is not copied: each step writes only row `position` and
+  reads are masked to `<= position`. A rebuilt graph (for example KV capacity
+  growth) invalidates checkpoints and fails the request with a message.
+- Speculation uses the ordinary decode sampler (`Sampler::probabilities`,
+  optional repetition penalty on generated tokens only), so verified drafts are
+  accepted against exactly the distribution plain decoding samples. The older
+  `MtpSpeculator::make_distribution` hard-codes a 1.3 penalty and is not used.
+
+Admission order: the target decode graph is built first, then the draft is
+admitted against the remaining device memory (about 2 GiB of NextN weights, K/V
+and workspace). With 22 resident expert layers on a 24 GiB card the draft does
+not fit and the request fails with a clear error; give the target fewer device
+expert layers (`ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS`, 18 was used). Creating
+the draft first starves the decode build, which is then declined, and the
+target runs in a different configuration with different numerics.
+
+Validation (Qwen3.8-Flash-Next UD-IQ1_M target, shared Q4_K_M MTP sidecar,
+RTX 3090, greedy, 48 tokens, 18 resident expert layers):
+
+- Output is byte-identical to plain decoding for `mtp_draft_tokens` = 1, 2, 3,
+  4 and 5 (acceptance 62%, 49%, 36%, 31%, 30%; 11-18 state restores per run).
+- Logits fingerprints: every position on the committed path is bit-identical to
+  plain decoding for K = 1, 3, 5. `plain` is reproducible run to run.
+- `tools/check_mtp_graph_equivalence.py` repeats this check on hardware.
+
+Fixed on the way: `qwen4exp_full_graph_run` read prefill logits at column
+`S-1`, which is out of bounds for Qwen4Exp (it builds logits for the last row
+only) and aborted every full-graph Qwen3.8 prefill with a logits target. It now
+reads the last column that exists.
+
+Known limits: verification is one token per target step, so MTP currently costs
+extra target steps for rejected drafts and gives no speedup; batched
+verification (an S = k+1 continuation graph at position > 0) is the next step.
+Teacher-forced per-frame comparison against llama.cpp for the target is not
+covered here (the equivalence above is ZeroMoE-vs-ZeroMoE). Acceptance (30-62%)
+was measured only with the UD-IQ1_M trunk and the Q4_K_M sidecar; another trunk
+quantization will change it.
 
 ## Standalone implementation and reproduction
 
