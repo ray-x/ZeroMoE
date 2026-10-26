@@ -73,8 +73,8 @@ tok/s for k=1..4 because the floor is plain decoding plus draft and setup.
 
 ## Why batching does not help the 3090 hybrid recipe (measured)
 
-Router ids of a 199-token plain run (`ZEROMOE_QWEN4EXP_ROUTE_IDS_DUMP`-style
-tap, 13,000 hot experts): 0.82 of the 10 routed experts per layer are
+Router ids of a 199-token plain run (a temporary per-token id dump added to the
+router-usage tap in `qwen4exp_cuda_usage_track_callback`, not committed; 13,000 hot experts): 0.82 of the 10 routed experts per layer are
 CPU-resident per token, and consecutive tokens barely share them. Distinct
 CPU experts per layer for a window of 1/2/3/4/5 tokens: 0.82/1.49/2.09/2.67/3.23,
 so a 4-token pass needs 3.25x the CPU expert work of one token. Even if only
