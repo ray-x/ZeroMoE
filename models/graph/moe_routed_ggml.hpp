@@ -150,7 +150,15 @@ inline FfnNodes expert_ffn(ggml_context *ctx, const ExpertWeights &w,
 inline ggml_tensor *sum_topk(ggml_context *ctx, ggml_tensor *experts, int64_t d,
                              int64_t n_tokens, int topk) {
   ggml_tensor *out =
-      ggml_cont(ctx, ggml_view_2d(ctx, experts, d, n_tokens, experts->nb[2], 0));
+      ggml_view_2d(ctx, experts, d, n_tokens, experts->nb[2], 0);
+  // Keep the first expert as a VIEW when topk > 1. ggml-cuda recognizes
+  // MUL(expert_outputs, router_weights) -> expert views -> ADD reduction as
+  // one weighted-MoE reduction kernel. Materializing view 0 with CONT inserts
+  // a node between the MUL and view/add chain, disables that fusion, and
+  // launches one small broadcast-add kernel for each remaining top-k route.
+  // This matches llama.cpp's build_moe_ffn aggregation order.
+  if (topk <= 1)
+    return ggml_cont(ctx, out);
   for (int k = 1; k < topk; ++k)
     out = ggml_add(ctx, out,
                    ggml_view_2d(ctx, experts, d, n_tokens, experts->nb[2],

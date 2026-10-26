@@ -87,8 +87,21 @@ static ggml_tensor *build_qwen35moe_graph_layer(FullGraph &g,
     if (!attn_out || !state_out || !hist_out)
       return nullptr;
     if (decode) {
-      g.gdn_state_updates.push_back(
-          ggml_cpy(g.ctx, state_out, g.gdn_state_storage.back()));
+      const int64_t state_elements =
+          static_cast<int64_t>(g.gdn_hd) * g.gdn_hd * g.Hv_gdn;
+      const size_t state_row = ggml_row_size(GGML_TYPE_F32, state_elements);
+      ggml_tensor *state_cache_view = ggml_view_3d(
+          g.ctx, g.gdn_state_storage.back(), state_elements, 1, 1, state_row,
+          state_row, 0);
+      ggml_tensor *state_update =
+          ggml_cpy(g.ctx, state_out, state_cache_view);
+      if (!state_update)
+        return nullptr;
+      g.gdn_state_updates.push_back(state_update);
+      // Put the state-cache CPY directly after GDN's output views. ggml-cuda
+      // can then fuse the snapshot write into GATED_DELTA_NET instead of
+      // materializing the 2 MiB state tensor and copying it back every token.
+      ggml_build_forward_expand(g.graph, state_update);
       g.gdn_hist_updates.push_back(
           ggml_cpy(g.ctx, hist_out, g.gdn_hist_storage.back()));
     } else {

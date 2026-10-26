@@ -1512,7 +1512,13 @@ inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GG
         if (!bench_silent) {
             PerfCounters::print_delta(token_label, token_wall_ms, token_snap_after - token_snap_before);
         }
-        check_hidden_finite(token_label, decode_hidden.data(), decode_hidden.size());
+        const bool qwen_graph_kept_hidden_device_side =
+            engine.family_ops.family == ModelFamily::Qwen &&
+            engine.qwen4exp_full_graph_logits_ready && !engine.mtp_enabled &&
+            !trace_gate("HIDDEN") &&
+            !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
+        if (!qwen_graph_kept_hidden_device_side)
+            check_hidden_finite(token_label, decode_hidden.data(), decode_hidden.size());
         // Real per-GPU VRAM usage (cudaMemGetInfo), sampled once per token
         // to track actual usage over the run -- distinct from the one-time
         // startup topology dump and from the logical cache-fill heatmaps

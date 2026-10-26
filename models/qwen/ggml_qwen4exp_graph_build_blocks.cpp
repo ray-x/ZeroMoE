@@ -78,6 +78,7 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
     ggml_build_forward_expand(g.graph, value);
     g.gdn_probe_taps.emplace_back(layer, label, value);
   };
+  diag("gdn_input", cur);
   // These snapshots are deliberately taken before and inside the GDN node.
   // The existing attention-output dump only tells us that the discrepancy is
   // present after the recurrent block; these boundaries separate qkv GEMM,
@@ -118,6 +119,7 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   diag("gdn_v", v);
   glog = ggml_reshape_4d(ctx, glog, 1, g.Hv_gdn, g.S, 1);
   beta = ggml_reshape_4d(ctx, beta, 1, g.Hv_gdn, g.S, 1);
+  diag("gdn_state_in", state_in);
   ggml_tensor *gdn =
       ggml_gated_delta_net(ctx, q, k, v, glog, beta, state_in, 1);
   diag("gdn_output", gdn);
@@ -142,7 +144,16 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_view_4d(ctx, gdn, g.gdn_hd, g.gdn_hd, g.Hv_gdn, 1, hd_row, state_row,
                    state_row * g.Hv_gdn,
                    static_cast<size_t>(g.value_dim) * g.S * sizeof(float));
-  *state_out = ggml_cont(ctx, state_raw);
+  // Qwen's decode graph can feed this contiguous snapshot view directly to a
+  // cache CPY. ggml-cuda recognizes the GATED_DELTA_NET -> VIEW -> CPY pattern
+  // and writes the recurrent snapshot into the persistent state buffer from
+  // the GDN kernel. Wrapping it in CONT forces an extra full-state D2D copy
+  // and prevents that fusion. Keep the historical materialization for the
+  // Qwen4Exp/HC path, which also exposes this state to host consumers.
+  *state_out = g.engine->family_ops.family == ModelFamily::Qwen
+                   ? state_raw
+                   : ggml_cont(ctx, state_raw);
+  diag("gdn_state_out", *state_out);
   ggml_tensor *norm = ggml_mul(
       ctx,
       ggml_rms_norm(ctx, core, g.engine->model_file.architecture_config.eps),
@@ -160,10 +171,18 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   ggml_tensor *out_input = ggml_reshape_2d(ctx, gated, g.value_dim, g.S);
   ggml_tensor *out = ggml_mul_mat(ctx, w_out, out_input);
   diag("gdn_output_projection", out);
-  *hist_out =
-      ggml_cont(ctx, ggml_view_3d(ctx, conv_in, g.d_conv - 1, g.conv_dim, 1,
-                                  conv_in->nb[1], conv_in->nb[2],
-                                  ggml_row_size(conv_in->type, g.S)));
+  ggml_tensor *history_view =
+      ggml_view_3d(ctx, conv_in, g.d_conv - 1, g.conv_dim, 1,
+                   conv_in->nb[1], conv_in->nb[2],
+                   ggml_row_size(conv_in->type, g.S));
+  // Qwen cache writeback copies this strided history view directly into its
+  // persistent CUDA state tensor, matching llama.cpp's build_conv_state path.
+  // CONT followed by CPY materializes the same 96 KiB history twice per GDN
+  // layer and decode token.
+  *hist_out = g.engine->family_ops.family == ModelFamily::Qwen &&
+                      g.decode_mode
+                  ? history_view
+                  : ggml_cont(ctx, history_view);
   (void)layer;
   return out;
 }
@@ -175,19 +194,35 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
                                   ggml_tensor *w_o, ggml_tensor **k_cache,
                                   ggml_tensor **v_cache) {
   ggml_tensor *qfull = ggml_mul_mat(ctx, w_q, cur);
+  auto diag = [&](const char *label, ggml_tensor *value) {
+    if (!value || !g.graph ||
+        !zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP"))
+      return;
+    const std::string name = "qwen35_" + std::string(label) + "_" +
+                             std::to_string(layer);
+    ggml_set_name(value, name.c_str());
+    ggml_set_output(value);
+    ggml_build_forward_expand(g.graph, value);
+    g.gdn_probe_taps.emplace_back(layer, label, value);
+  };
+  diag("full_qg_proj", qfull);
   ggml_tensor *q =
       ggml_view_3d(ctx, qfull, g.hd, g.H, g.S, sizeof(float) * g.hd * 2,
                    sizeof(float) * g.hd * 2 * g.H, 0);
+  diag("full_q_view", q);
   q = ggml_mul(
       ctx, ggml_rms_norm(ctx, q, g.engine->model_file.architecture_config.eps),
       w_qn);
+  diag("full_q_norm", q);
   ggml_tensor *k =
       ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_k, cur), g.hd, g.Hkv, g.S);
   k = ggml_mul(
       ctx, ggml_rms_norm(ctx, k, g.engine->model_file.architecture_config.eps),
       w_kn);
+  diag("full_k_norm", k);
   ggml_tensor *v =
       ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_v, cur), g.hd, g.Hkv, g.S);
+  diag("full_v", v);
   const int n_rot = g.engine->model_file.architecture_config.rope_n_rot > 0
                         ? g.engine->model_file.architecture_config.rope_n_rot
                         : g.hd;
@@ -214,6 +249,8 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
                      rope_c.rope_n_ctx_orig, rope_freq_base,
                      rope_c.rope_freq_scale, rope_c.rope_ext_factor,
                      rope_c.rope_attn_factor, 32.0f, 1.0f);
+  diag("full_q_rope", q);
+  diag("full_k_rope", k);
   // The host dense KV cache stores the same normalized and rotated K/V values
   // that llama.cpp's graph writes to its cache.  Keep these F32 tensors before the
   // layout-only permute/cast used by flash attention.
@@ -248,15 +285,22 @@ ggml_tensor *build_full_attention(FullGraph &g, ggml_context *ctx,
   ggml_tensor *attn = ggml_flash_attn_ext(
       ctx, q, k, v, g.attn_mask, 1.0f / std::sqrt(static_cast<float>(g.hd)),
       0.0f, 0.0f);
+  diag("full_attn", attn);
   ggml_tensor *gate =
       ggml_view_3d(ctx, qfull, g.hd, g.H, g.S, sizeof(float) * g.hd * 2,
                    sizeof(float) * g.hd * 2 * g.H, sizeof(float) * g.hd);
   gate = ggml_reshape_3d(ctx, ggml_cont_2d(ctx, gate, g.H * g.hd, g.S), g.hd,
                          g.H, g.S);
-  attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+  diag("full_gate", gate);
+  ggml_tensor *gate_sigmoid = ggml_sigmoid(ctx, gate);
+  diag("full_gate_sigmoid", gate_sigmoid);
+  attn = ggml_mul(ctx, attn, gate_sigmoid);
+  diag("full_attn_gated", attn);
   attn = ggml_reshape_2d(ctx, attn, g.H * g.hd, g.S);
   (void)layer;
-  return ggml_mul_mat(ctx, w_o, attn);
+  ggml_tensor *out = ggml_mul_mat(ctx, w_o, attn);
+  diag("full_output_projection", out);
+  return out;
 }
 
 // Decode variant of build_full_attention().  K/V are appended directly to a

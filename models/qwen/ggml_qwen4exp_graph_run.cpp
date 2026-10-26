@@ -4,6 +4,7 @@
 // declarations live in ggml_qwen4exp_graph_internal.hpp.
 
 #include "ggml_qwen4exp_graph_internal.hpp"
+#include "tensor_trace.hpp"
 
 #if defined(ZEROMOE_USE_GGML_CUDA)
 
@@ -351,8 +352,18 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
     g.stage_slots.clear();
     g.stage_slot = nullptr;
   }
-  ggml_backend_tensor_get(g.output, hidden_states, 0,
-                          static_cast<size_t>(g.D) * sizeof(float));
+  // Standard Qwen's full decode graph also computes and returns next-token
+  // logits. The host hidden row is not consumed by the next step (the next
+  // token embedding replaces it), and reading it back adds a synchronous
+  // device-to-host transfer every token. Preserve it for graph modes whose
+  // host path consumes hidden states, speculative decoding, or diagnostics.
+  const bool need_host_hidden =
+      !standard_qwen || !logits || engine.mtp_enabled ||
+      trace_gate("HIDDEN") ||
+      zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
+  if (need_host_hidden)
+    ggml_backend_tensor_get(g.output, hidden_states, 0,
+                            static_cast<size_t>(g.D) * sizeof(float));
   if (g.stage_enabled) {
     double l1 = 0.0;
     bool finite = true;

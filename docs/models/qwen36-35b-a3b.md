@@ -2,12 +2,12 @@
 
 ## Status
 
-The Qwen full-graph adapter builds with CUDA, and its decode graph passed the
-full-fit hardware gate on an RTX 5060 Ti on 2026-10-26 using an 8-token smoke
-run. The subsequent required full-graph prefill path exposed a logits
-destination-size error before graph execution. Source now copies only the last
-prompt-token logits, as generation requires, but this fix has not yet been
-verified on the GPU. No 400-token performance result is accepted yet.
+The Qwen full-graph adapter builds with CUDA. The 5060 Ti full-fit request path
+passes graph-prefill, graph-decode, and all-expert-placement gates. Performance
+has varied across repeated runs: one run passed the 90% llama.cpp bar, while
+the latest repeat reached 89.2%. Teacher-forced parity is still in progress:
+GDN matches llama.cpp, but the first full-attention layer (layer 3) currently
+diverges after RoPE, so the model is not yet accepted as supported.
 
 ## GGUF architecture
 
@@ -66,24 +66,46 @@ cache.
 The prepared profile is
 [`qwen36_35b_a3b_iq2m_5060.toml`](../../configs/bench/qwen36_35b_a3b_iq2m_5060.toml).
 
-The next full-fit verification must pass
+Full-fit verification must pass
 `--full-fit --require-all-expert-layers-on-device --require-full-graph-prefill`.
-The earlier run reported `required_device_bytes=14007948866` and
-`available_device_bytes=16338780160`; placement was 40/40 expert layers and
-`graph_decode_runs=1`, with layered/legacy dispatch counters zero. It reported
-prefill capability but did not record a successful full-graph prefill. That
-decode-only smoke does not establish a full request-path pass. The 400-token
-performance result remains outstanding.
+The 400-token benchmark passed with `graph_prefill_runs=4`,
+`graph_decode_runs=1204`, 40/40 expert layers on-device, and zero
+layered/legacy calls. The planner reported `required_device_bytes=14007948866`
+and `available_device_bytes=16338780160`.
 
-For the performance measurement, run 400 generated tokens and preserve the
-log with graph-use and all-expert placement evidence:
+Reproduce the measured 16-prompt/400-decode benchmark and preserve its JSON:
 
 ```sh
-<CUDA_BUILD>/zeromoe --config configs/bench/qwen36_35b_a3b_iq2m_5060.toml --ngen 400
+CUDA_VISIBLE_DEVICES=0,1 <CUDA_BUILD>/zeromoe \
+  --config configs/bench/qwen36_35b_a3b_iq2m_5060.toml --bench \
+  --bench-random-pp 16 --bench-random-tg 400 --bench-reps 3 \
+  --bench-warmup 1 --bench-seed 1 \
+  --bench-out logs/qwen36_fullgraph_pg16_tg400_moe_fusion.json
 python3 tools/check_full_graph_moe_run.py logs/qwen36_35b_a3b_iq2m_5060.log \
   --full-fit --require-all-expert-layers-on-device --require-full-graph-prefill
 ```
 
-Record steady decode speed separately from prefill and first-graph setup.
-Compare with llama.cpp using the same GGUF, context, prompt, generated-token
-count, GPU, and thread count. No comparison number is frozen here yet.
+One three-repetition 400-token run measured a median of 112.39 tok/s
+(8.896 ms/token p50, 8.932 ms/token p95), or 91.6% of the matching llama.cpp
+benchmark at 122.73 tok/s. A later repeat on the pending changes measured
+109.82 tok/s median (9.106 ms/token p50, 9.136 ms/token p95); its graph-only
+counter was 109.44 tok/s, or 89.2% of llama.cpp, so that repeat failed the
+default 90% performance gate. Both runs passed the full-fit graph execution
+gate. This performance variation and the outstanding layer-3 RoPE parity
+failure keep onboarding in progress. The passing-run ZeroMoE bench JSON is
+`logs/qwen36_fullgraph_pg16_tg400_moe_fusion.json`; llama.cpp JSON is
+`logs/qwen36_llama_bench_pg16_tg400_cuda1.json`.
+The repeat artifacts are `logs/qwen36_fullgraph_pg16_tg400_repeat_20261026.json`
+and `logs/qwen36_fullgraph_pg16_tg400_repeat_20261026.log`.
+
+The main graph-runtime optimizations measured during this work were:
+
+- GDN state snapshots now feed ggml-cuda's fused GDN-to-cache writeback. This
+  removed 60 two-MiB device copies per decode replay.
+- Qwen decode copies the strided convolution-history view directly into its
+  cache; prefill still materializes contiguous history for the host handoff.
+- The shared routed-MoE top-k reducer keeps its first expert as a view, allowing
+  ggml-cuda to fuse the weighted expert reduction instead of launching one
+  broadcast-add kernel per remaining route.
+- Standard Qwen skips the unused final hidden-state D2H readback when graph
+  logits are available and MTP or hidden-state diagnostics are disabled.
