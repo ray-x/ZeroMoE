@@ -89,6 +89,20 @@ For each accepted measurement, record both project commits, the shared upstream 
 
 Keep binaries, adjacent runtime libraries, benchmark JSON, gate logs, and compact parity evidence in persistent workspace storage. A build under `/tmp` is temporary; copy the complete runtime bundle back and make its library lookup relocatable before relying on it. If upstream base, toolchain, or GPU target differs, mark the ratio provisional and rebuild a matched reference before acceptance.
 
+## Definition of done
+
+Call onboarding complete only for the explicit validated scope: exact GGUF architecture and quantization, device/GPU, context range, and exercised input path. Do not generalize a text-only or single-quant result to untested multimodal paths, other quants, or other devices. Record whether MTP or other optional paths were exercised.
+
+All applicable evidence below must be saved in the model note and persistent run artifacts before changing its status to supported:
+
+- **Architecture:** the exact GGUF architecture resolves to a registered adapter; topology validation passes before large allocation.
+- **Memory and execution:** the live planner reports positive required and available bytes. For `Fits`, `check_full_graph_moe_run.py --full-fit` passes with graph decode enabled and zero layered/per-expert dispatches. A graph build or execution failure is fatal. If the plan is `Insufficient`, only the documented memory fallback may be accepted; record that scope as memory-limited and do not claim full-fit support. `Unknown` is never an acceptance result.
+- **Correctness:** teacher-forced per-layer pre-MoE hidden states and routed expert IDs/weights match llama.cpp for the same prompt and forced tokens. Stateful models also match the recurrent-state and prefill-to-decode handoff boundaries. Resolve any mismatch before acceptance.
+- **Performance:** the full-fit graph gate passes, then repeated matched decode measurements pass both the default 90% llama.cpp ratio and any user-set `--minimum-tps`. Record sample range and compare the same GGUF, device, context, prompt/generation lengths, and thread count.
+- **Report and provenance:** report prefill, graph construction/upload, steady decode, and end-to-end rates separately. Record both project revisions, GGML base/version and applied patch manifest, CUDA toolkit/driver, compiler, and native GPU targets. Keep the benchmark logs, JSON, parity summary, and runnable binary/runtime bundle in persistent storage.
+
+A coherent response, successful compilation, one successful graph replay, or passing only one gate is not completion. If any required evidence is missing or fails, leave the model in progress and state the exact missing gate. Mark it supported only after the complete evidence set passes for the declared scope.
+
 ## Shared runtime and code boundaries
 
 `FullGraphModel` in `models/graph/full_graph_model.hpp` owns graph enablement, bootstrap, build, run, and shutdown. `FullGraphModelBase` centralizes request validation and prefill/decode dispatch. The registry boundary is `full_graph_model()` in `models/graph/full_graph_models.cpp`.

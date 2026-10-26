@@ -18,7 +18,7 @@ ZeroMoE is a zero-dependency C++23 / CUDA17 inference engine built to stream Mix
 ## 2. Build & Execution Rules
 
 ### CUDA MoE onboarding: required stop/go workflow
-CUDA MoE support requires a registered `FullGraphModel` adapter on the shared graph runtime. Do not onboard a family through the legacy layer-by-layer expert executor. Before coding, trace the exact GGUF architecture through `detect_model_family()`, `resolve_family_ops()`, and `full_graph_model()`. Record the architecture/topology checks and llama.cpp source path/commit.
+CUDA MoE support requires a registered `FullGraphModel` adapter on the shared graph runtime. Do not onboard a family through the legacy layer-by-layer expert executor. Before coding, trace the exact GGUF architecture through `detect_model_family()`, `resolve_family_ops()`, and `full_graph_model()`. Record architecture/topology checks and the llama.cpp source path/commit.
 
 Map each llama.cpp block stage to the ZeroMoE adapter before implementation, including tensor shape/layout, dtype, normalization function and epsilon, scale placement, projection/activation order, residual order, router behavior, and state handoff. Preserve the reference operation sequence. Do not use an algebraically equivalent operation or fuse/reorder work without a same-input boundary-trace A/B; small rounding changes can alter routed experts downstream.
 
@@ -29,9 +29,17 @@ Gate order is mandatory:
 4. Teacher-force the same prompt and decode tokens through llama.cpp and ZeroMoE. Compare per-layer pre-MoE hidden states and routed expert IDs/weights; trace the first divergent boundary before optimizing.
 5. Benchmark only the validated graph path on the same GGUF, physical GPU, context, active prompt length, generated token count, and thread count. Require at least 90% of llama.cpp by default and any user-set absolute floor via `--minimum-tps`. Keep the model in progress below either bar.
 
-Report prefill, graph construction/upload, steady decode, and end-to-end rates separately. Enforce the relative/absolute bar with `tools/check_full_graph_moe_perf.py`. Record both project commits, upstream GGML base/version, applied GGML patch manifest, CUDA toolkit/driver, compiler, and native GPU targets. Verify copied build trees report the upstream `GGML_COMMIT`; keep benchmark artifacts and complete runtime bundles in persistent storage, not only `/tmp`. A toolchain, base revision, or GPU-target mismatch makes the ratio provisional until the reference is rebuilt to match. Project patches are part of the measured product, so do not call the builds kernel-identical.
+#### When onboarding is finished
 
-The authoritative workflow and memory-fallback contract are in `docs/design/full-graph-model-onboarding.md`.
+Mark a model supported only for the scope actually tested: exact GGUF architecture/quantization, device, context, and input path. Require all of the following evidence:
+
+- Exact architecture registration and topology validation pass.
+- A valid live memory plan and the full-fit graph gate pass; no layered or legacy per-expert dispatch occurs when the plan fits.
+- Teacher-forced pre-layer hidden states and routed IDs/weights match llama.cpp across layers; stateful models also compare state handoff.
+- Repeated matched performance measurements pass the 90% llama.cpp bar and any user-set `--minimum-tps` target.
+- Prefill, graph build/upload, steady decode, and end-to-end rates are reported separately, with source/toolchain/GGML provenance and persistent logs/results.
+
+Passing compilation, coherent output, or only one of the graph/performance gates is not enough. An `Insufficient`-memory fallback may be documented as memory-limited support for that scope, but does not establish full-fit support; `Unknown` is never acceptance. State untested quantizations, devices, multimodal paths, and optional features instead of implying support for them. The full checklist is in `docs/design/full-graph-model-onboarding.md`.
 
 ### System Requirements & Constraints
 * **Platform:** Linux, NVIDIA CUDA Toolkit, GCC (C++23 support), Python 3, and an AVX-512 capable CPU. 
