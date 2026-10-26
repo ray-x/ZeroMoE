@@ -846,6 +846,16 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   std::vector<ggml_tensor *> kv_state_v;
   std::vector<ggml_tensor *> gdn_state_storage;
   std::vector<ggml_tensor *> gdn_hist_storage;
+  // Decode window (S > 1): per-token recurrent snapshots so a prefix of the
+  // window can be kept without replaying it. window_gdn_states[j][i] is GDN
+  // layer j's state after window token i (i < S-1; the last one is what the
+  // graph already writes to gdn_state_storage); window_conv_in[j] and
+  // window_ple_padded hold the conv/PLE histories shifted by the kept count.
+  std::vector<std::vector<ggml_tensor *>> window_gdn_states;
+  std::vector<ggml_tensor *> window_conv_in;
+  ggml_tensor *window_ple_padded = nullptr;
+  std::vector<int> window_tokens;
+  int window_pos = -1;
   std::vector<ggml_tensor *> gdn_state_updates;
   std::vector<ggml_tensor *> gdn_hist_updates;
   std::vector<int> gdn_layers;
@@ -1027,6 +1037,11 @@ std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
     kv_state_v.clear();
     gdn_state_storage.clear();
     gdn_hist_storage.clear();
+  window_gdn_states.clear();
+  window_conv_in.clear();
+  window_ple_padded = nullptr;
+  window_tokens.clear();
+  window_pos = -1;
     gdn_state_updates.clear();
     gdn_hist_updates.clear();
     gdn_layers.clear();

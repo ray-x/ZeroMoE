@@ -62,6 +62,16 @@ class SpecTarget {
   // after tokens[i]). Afterwards the live state stands after the last token.
   // Row i must be what step() would produce for the same state, up to the
   // numerics of a batched kernel.
+  // Optional: after step_batch, keep only the first `m` tokens (1 <= m <=
+  // tokens.size()) so the live state stands after exactly those. A target that
+  // can do this cheaply (per-token state snapshots) spares the driver the
+  // checkpoint, restore and replay of the generic batched path.
+  virtual bool supports_prefix_commit() const { return false; }
+  virtual bool commit_prefix(int m, std::string &error) {
+    (void)m;
+    error = "target does not support prefix commit";
+    return false;
+  }
   virtual bool supports_batch() const { return false; }
   virtual bool step_batch(std::span<const int> tokens, int position,
                           std::span<float> wide, std::span<float> logits,
@@ -286,11 +296,15 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
     };
 
     if (batched) {
-      // One checkpoint, one pass over everything, then judge all drafts.
+      // One pass over everything, then judge all drafts. Without a prefix
+      // commit one checkpoint is taken first so a rejection can roll back.
       std::vector<float> plogits(size_t(k + 1) * V);
-      int handle = 0;
-      if (!target.save(handle, error)) return false;
-      checkpoints.handles.push_back(handle);  // state before y
+      const bool prefix_commit = target.supports_prefix_commit();
+      if (!prefix_commit) {
+        int handle = 0;
+        if (!target.save(handle, error)) return false;
+        checkpoints.handles.push_back(handle);  // state before y
+      }
       std::vector<int> tokens;
       tokens.push_back(seq.back());
       tokens.insert(tokens.end(), drafts.begin(), drafts.end());
@@ -307,7 +321,10 @@ inline bool speculate(SpecTarget &target, SpecDraft &draft,
       if (!rejected) correction = detail::sample_probs(p[size_t(k)], rng);
       if (correction < 0) { error = "correction distribution has no mass"; return false; }
 
-      if (accepted < k) {
+      if (prefix_commit) {
+        if (!target.commit_prefix(accepted + 1, error)) return false;
+        if (accepted < k) ++stats.restores;
+      } else if (accepted < k) {
         // Roll back to before y and replay y..d_accepted. The replay's rows are
         // the true ones for the live state, so they feed the draft rebuild.
         if (!target.restore(checkpoints.handles[0], error)) return false;

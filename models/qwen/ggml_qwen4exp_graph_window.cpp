@@ -66,22 +66,80 @@ bool qwen4exp_full_graph_window_run(StreamingEngine &engine, int S, int pos_base
                           static_cast<size_t>(S) * vocab * sizeof(float));
   ggml_backend_tensor_get(g.final_streams, wide, 0, W * static_cast<size_t>(S) * sizeof(float));
 
-  g.decode_last_pos = pos_base + S - 1;
-  g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
-  if (has_ple_layer(engine.model_file.architecture_config)) {
-    auto &hist = engine.qwen4exp_ple_tok_hist;
-    for (int i = 0; i < S; ++i)
-      hist.push_back(token_ids[i]);
-    const int keep = std::max(0, engine.model_file.architecture_config.ple_ngram_size - 1);
-    if (static_cast<int>(hist.size()) > keep)
-      hist.erase(hist.begin(), hist.end() - keep);
-    engine.qwen4exp_ple_next_pos = pos_base + S;
-  }
+  // The graph has advanced the device state past the whole window. Host
+  // metadata (PLE token window, positions) is applied by the commit below, so
+  // a caller keeping only a prefix never sees the rejected tokens.
+  g.window_tokens.assign(token_ids, token_ids + S);
+  g.window_pos = pos_base;
   engine.qwen4exp_full_graph_output_ready = true;
   const double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start).count();
   if (zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_WINDOW_TIMING"))
     LOG_INFO("[QWEN4EXP-WINDOW] pos=%d S=%d compute+readback=%.3f ms\n", pos_base, S, ms);
+  return true;
+}
+
+// Keep the first `m` tokens of the window last run: make the device state the
+// state after exactly those tokens and advance the host metadata to match.
+// m == S is free (the graph already left the full-window state live).
+bool qwen4exp_full_graph_window_commit(StreamingEngine &engine, int m) {
+  if (!g_graph || !g_graph->ready || !g_graph->decode_mode ||
+      g_graph->engine != &engine)
+    return false;
+  FullGraph &g = *g_graph;
+  const int S = g.S;
+  if (m < 1 || m > S || g.window_pos < 0 ||
+      static_cast<int>(g.window_tokens.size()) != S)
+    return false;
+  if (m < S) {
+    if (g.window_gdn_states.size() != g.gdn_state_storage.size() ||
+        g.window_conv_in.size() != g.gdn_hist_storage.size() ||
+        cudaSetDevice(g.device) != cudaSuccess)
+      return false;
+    cudaStream_t stream = zeromoe_ggml_backend_cuda_get_stream(g.cuda_raw);
+    const size_t state_bytes = static_cast<size_t>(g.gdn_hd) * g.gdn_hd *
+                               g.Hv_gdn * sizeof(float);
+    const size_t hist_w = static_cast<size_t>(g.d_conv - 1) * sizeof(float);
+    for (size_t j = 0; j < g.gdn_state_storage.size(); ++j) {
+      const ggml_tensor *snap = g.window_gdn_states[j][static_cast<size_t>(m - 1)];
+      const ggml_tensor *conv_in = g.window_conv_in[j];
+      if (!snap || !snap->data || !conv_in || !conv_in->data ||
+          cudaMemcpyAsync(g.gdn_state_storage[j]->data, snap->data, state_bytes,
+                          cudaMemcpyDefault, stream) != cudaSuccess ||
+          cudaMemcpy2DAsync(g.gdn_hist_storage[j]->data, hist_w,
+                            static_cast<const char *>(conv_in->data) +
+                                static_cast<size_t>(m) * sizeof(float),
+                            conv_in->nb[1], hist_w, g.conv_dim,
+                            cudaMemcpyDefault, stream) != cudaSuccess)
+        return false;
+    }
+    if (g.window_ple_padded && g.ple_hist_storage) {
+      const size_t ple_w = static_cast<size_t>(
+          (engine.model_file.architecture_config.ple_conv_kernel - 1) *
+          engine.model_file.architecture_config.ple_ngram_size) * sizeof(float);
+      if (cudaMemcpy2DAsync(g.ple_hist_storage->data, ple_w,
+                            static_cast<const char *>(g.window_ple_padded->data) +
+                                static_cast<size_t>(m) * sizeof(float),
+                            g.window_ple_padded->nb[1], ple_w,
+                            static_cast<size_t>(g.D) * g.HC, cudaMemcpyDefault,
+                            stream) != cudaSuccess)
+        return false;
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess)
+      return false;
+  }
+  g.decode_last_pos = g.window_pos + m - 1;
+  g.decode_host_state_dirty = env_prefill_state_handoff_enabled();
+  if (has_ple_layer(engine.model_file.architecture_config)) {
+    auto &hist = engine.qwen4exp_ple_tok_hist;
+    for (int i = 0; i < m; ++i)
+      hist.push_back(g.window_tokens[static_cast<size_t>(i)]);
+    const int keep = std::max(0, engine.model_file.architecture_config.ple_ngram_size - 1);
+    if (static_cast<int>(hist.size()) > keep)
+      hist.erase(hist.begin(), hist.end() - keep);
+    engine.qwen4exp_ple_next_pos = g.window_pos + m;
+  }
+  g.window_pos = -1;
   return true;
 }
 

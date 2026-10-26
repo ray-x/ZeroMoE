@@ -552,6 +552,11 @@ bool build_graph(FullGraph &g, const std::vector<float> *ple_embedding) {
       conv_out =
           ggml_reshape_3d(g.ctx, ggml_silu(g.ctx, conv_out), g.D, g.HC, g.S);
       res = ggml_add(g.ctx, res, ggml_add(g.ctx, gated, conv_out));
+      if (g.decode_mode && g.S > 1) {
+        ggml_set_output(padded);
+        ggml_build_forward_expand(g.graph, padded);
+        g.window_ple_padded = padded;
+      }
       g.ple_hist_out = ggml_cont(
           g.ctx, ggml_view_3d(g.ctx, padded, hist, g.D * g.HC, 1, padded->nb[1],
                               padded->nb[2], ggml_row_size(padded->type, g.S)));
