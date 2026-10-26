@@ -31,6 +31,10 @@ def main() -> int:
         "--minimum-ratio", type=float, default=0.90,
         help="minimum ZeroMoE steady-state decode / llama.cpp decode rate (default: 0.90)",
     )
+    parser.add_argument(
+        "--minimum-tps", type=float,
+        help="optional absolute minimum ZeroMoE steady-state decode rate in tokens/s",
+    )
     args = parser.parse_args()
 
     try:
@@ -45,6 +49,27 @@ def main() -> int:
     if not model_lines:
         return fail("ZeroMoE log has no model path")
     zero_model = model_lines[-1].split("[CONFIG] Model:", 1)[1].strip()
+    decode_prompt_lengths: list[int] = []
+    for line in lines:
+        marker = "[STATS] "
+        if marker not in line:
+            continue
+        try:
+            sample = json.loads(line.split(marker, 1)[1])
+            if sample.get("status") == "ok" and int(sample.get("generated_tokens", 0)) >= args.n_gen:
+                decode_prompt_lengths.append(int(sample["prompt_tokens"]))
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            continue
+    if not decode_prompt_lengths:
+        return fail(
+            f"ZeroMoE log has no successful decode request with at least "
+            f"{args.n_gen} generated tokens"
+        )
+    if any(prompt != args.n_prompt for prompt in decode_prompt_lengths):
+        return fail(
+            f"ZeroMoE decode prompt lengths {sorted(set(decode_prompt_lengths))} "
+            f"do not match --n-prompt {args.n_prompt}"
+        )
     try:
         if gate.get("policy") != "required" or gate.get("memory_plan") != "fits":
             return fail("performance acceptance requires policy=required and memory_plan=fits")
@@ -100,6 +125,14 @@ def main() -> int:
         f"llama.cpp: {reference_tps:.2f} tok/s; ratio={ratio:.3f} "
         f"(required >= {args.minimum_ratio:.3f})"
     )
+    if args.minimum_tps is not None:
+        if args.minimum_tps <= 0:
+            return fail("--minimum-tps must be positive")
+        if zeromoe_tps < args.minimum_tps:
+            return fail(
+                f"ZeroMoE steady-state decode {zeromoe_tps:.2f} tok/s is below "
+                f"the absolute target {args.minimum_tps:.2f} tok/s"
+            )
     if ratio < args.minimum_ratio:
         return fail("performance bar not met; keep model onboarding in progress")
     print("PASS: full-fit steady decode meets the llama.cpp performance bar")

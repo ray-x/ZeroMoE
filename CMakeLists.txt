@@ -319,6 +319,25 @@ if(ZEROMOE_USE_GGML)
     else()
         include(cmake/ZeroMoEGgmlPatches.cmake)
         zeromoe_apply_ggml_patches("${ZEROMOE_GGML_ROOT}")
+        # The common build-tree copy has no .git directory. Without an
+        # explicit revision, ggml's version probe can walk up to ZeroMoE's
+        # repository and stamp the application commit as GGML_COMMIT.
+        set(_zeromoe_ggml_build_commit "")
+        if(EXISTS "${ZEROMOE_GGML_ROOT}/.git")
+            execute_process(
+                COMMAND git -C "${ZEROMOE_GGML_ROOT}" rev-parse --short HEAD
+                OUTPUT_VARIABLE _zeromoe_ggml_build_commit
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+        endif()
+        if(NOT _zeromoe_ggml_build_commit AND ZEROMOE_GGML_COMMIT)
+            set(_zeromoe_ggml_build_commit "${ZEROMOE_GGML_COMMIT}")
+        endif()
+        if(NOT _zeromoe_ggml_build_commit)
+            set(_zeromoe_ggml_build_commit "unknown")
+        endif()
+        set(GGML_BUILD_COMMIT "${_zeromoe_ggml_build_commit}")
+        message(STATUS "ZeroMoE: GGML source revision=${GGML_BUILD_COMMIT}")
         add_subdirectory("${ZEROMOE_GGML_ROOT}" ggml-build)
     endif()
     message(STATUS "ZeroMoE: using ggml at ${ZEROMOE_GGML_ROOT}")

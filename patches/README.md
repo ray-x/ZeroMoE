@@ -3,7 +3,7 @@
 ZeroMoE builds against **upstream ggml-org/llama.cpp** plus the patches here;
 it does not carry a modified copy of ggml.
 
-- Upstream base: `3cf03257f` ("CUDA: enable sparse fa for qwen4 (#28770)").
+- Upstream base: `8baabd53b77d1c48c6ef8d3b620436292f3f6231`.
 - Patch paths are relative to the `ggml/` directory (`a/src/ggml-cuda/...`).
 - Applied automatically at configure time by `cmake/ZeroMoEGgmlPatches.cmake`
   (idempotent: a patch that already applies in reverse is skipped).
@@ -31,6 +31,7 @@ it does not carry a modified copy of ggml.
 | `0005-ggml-backend-static-weight-copy` | backend-static-weight-copy-count | `ggml-backend.cpp` |
 | `0009-ggml-cpu-iq2-xxs-avx512bwvl` | `36f489d6b` AVX-512BW/VL IQ2_XXS dot kernel | `arch/x86/quants.c` |
 | `0013-ggml-cpu-iq1-s-avx512vnni` | AVX-512 VNNI IQ1_S × Q8_K dot kernel | `arch/x86/quants.c` |
+| `0014-ggml-build-commit-provenance` | preserve the pinned GGML base revision in copied build trees without `.git` | `CMakeLists.txt` |
 | `0011-ggml-cuda-mestream-bridge-compat` | bridge-only compatibility hunk for newer upstream context | `ggml-cuda/ggml-cuda.cu` |
 | `0012-ggml-impl-export-graph-view` | export graph view from shared ggml | `ggml-impl.h` |
 
@@ -40,7 +41,7 @@ it does not carry a modified copy of ggml.
 
 Originals of every merged patch are in `obsolete/superseded-by-merge/`.
 
-### Verification of the merge (2026-10-05)
+### Historical patch merge verification (2026-10-05; base `3cf03257f`)
 
 Applying the original 11 patches in sequence and applying the merged series to a
 clean checkout of the base give **byte-identical trees** (git tree
@@ -48,6 +49,15 @@ clean checkout of the base give **byte-identical trees** (git tree
 upstream checkout applies all seven, and a second configure applies none.
 With the gate patch added, the resulting tree is `9b04e2d634ff2645caf8ef08dfd4ffa60c6530fc`; a full
 `zeromoe` build against it succeeds (0 errors).
+
+### GGML build revision metadata (2026-10-27)
+
+The GGML CMake project normally discovers `GGML_COMMIT` by walking up from its
+source directory. A copied build tree without `.git` could therefore inherit
+ZeroMoE's commit and mislabel a performance baseline. Patch `0014` preserves
+the revision supplied by ZeroMoE CMake. A configure against a temporary copy
+of the pinned `8baabd53b77d1c48c6ef8d3b620436292f3f6231` source, with `.git`
+removed, generated `ggml-version.h` containing that GGML revision.
 
 ## Patches that did not make the main series
 

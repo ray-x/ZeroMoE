@@ -112,8 +112,16 @@ ggml_tensor *build_gdn(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       ggml_view_4d(ctx, conv, g.gdn_hd, g.Hv_gdn, g.S, 1,
                    ggml_row_size(GGML_TYPE_F32, g.gdn_hd), row, row * g.S,
                    ggml_row_size(GGML_TYPE_F32, 2 * g.key_dim));
-  q = ggml_l2_norm(ctx, q, g.engine->model_file.architecture_config.eps);
-  k = ggml_l2_norm(ctx, k, g.engine->model_file.architecture_config.eps);
+  // Match llama.cpp's build_gdn_l2_norm op sequence. The mathematically
+  // equivalent GGML_OP_L2_NORM has a different reduction/rounding path and
+  // introduces a small Q/K drift before the routed expert matmuls.
+  const float eps = g.engine->model_file.architecture_config.eps;
+  const float q_norm_n = static_cast<float>(q->ne[0]);
+  const float k_norm_n = static_cast<float>(k->ne[0]);
+  q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps / q_norm_n),
+                 1.0f / std::sqrt(q_norm_n));
+  k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps / k_norm_n),
+                 1.0f / std::sqrt(k_norm_n));
   diag("gdn_q_norm", q);
   diag("gdn_k_norm", k);
   diag("gdn_v", v);

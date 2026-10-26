@@ -38,6 +38,10 @@ Coherent output is only a smoke check; it is never an onboarding acceptance
 criterion. Before marking a model supported, teacher-force the same token
 sequence through llama.cpp and ZeroMoE, compare pre-layer hidden states and
 per-layer routed expert IDs/weights, and record decode correctness evidence.
+A full-graph or performance gate does not prove numerical parity. When an
+intermediate differs, teacher-force the same inputs through both systems and
+trace the first divergent boundary before tuning later layers. A rewrite to a
+mathematically equivalent operation sequence requires its own measured A/B.
 
 If the user has not set a model-specific performance target, the default
 steady-state decode bar is at least 90% of llama.cpp on the same GGUF, GPU,
@@ -49,12 +53,31 @@ full-graph execution gate. If llama.cpp cannot provide a comparable baseline,
 record the limitation and establish a quantitative model-specific bar before
 calling onboarding complete.
 
-For a reproducible combined prompt/decode baseline, save `llama-bench` JSON
-for the same GGUF and device, then run:
+Compare the exact decode workload: same GGUF, GPU, active prompt length,
+generated token count, context, and thread count. The performance checker
+verifies that a successful ZeroMoE decode request has the requested prompt
+length and that the llama-bench row has the same prompt and generation sizes.
+For ZeroMoE `--bench-random-tg N`, the decode case starts with one prompt token;
+compare it with llama-bench `-pg 1,N`. Measure `--bench-random-pp P` prefill
+separately against llama-bench `-p P`.
+
+Record both project commits, the shared upstream GGML base revision/version,
+ZeroMoE's applied GGML patch manifest, CUDA toolkit and driver, compiler, and
+native GPU code targets. Project-only patches are part of the implementation
+being measured; do not describe the runs as kernel-identical. If the upstream
+base, toolchain, or GPU target differs, label the ratio provisional and rebuild
+a matched reference before accepting performance. For an explicit user-set
+absolute target, pass `--minimum-tps` alongside the default relative-ratio
+check; both thresholds must pass.
+For copied GGML source trees, verify the generated `GGML_COMMIT` is the pinned
+GGML base revision rather than the enclosing ZeroMoE commit.
+
+For a reproducible decode baseline matching the one-token ZeroMoE TG case, save
+`llama-bench` JSON for the same GGUF and device, then run:
 
 ```sh
 python3 tools/check_full_graph_moe_perf.py run.log llama-bench.json \
-  --n-prompt 16 --n-gen 400 --device CUDA1
+  --n-prompt 1 --n-gen 400 --device CUDA1
 ```
 
 The performance gate uses graph-run time only, so graph construction and
@@ -72,11 +95,18 @@ A family whose output depends on recurrent state must carry that state across pr
 ## Adding a family
 
 1. Inspect the GGUF architecture, metadata, tensor names, and auxiliary blocks. Compare tensor equations with the reference implementation. Model branding or lineage does not determine the executable architecture.
+Before coding the adapter, write an operation map for each block type from the
+reference source commit/path to the intended graph nodes. Include tensor shape
+and layout, dtype, normalization op and epsilon, scale placement, activation,
+residual order, and recurrent-state inputs/outputs. Implement that exact
+sequence first; do not assume an algebraically equivalent GGML graph has the
+same floating-point or quantized behavior.
+
 2. Trace the detected family through `resolve_family_ops()` to `full_graph_model()`. If the family has no graph adapter, implement one before adding CUDA support; do not continue through the generic layer dispatcher.
    `ModelFamily` may group multiple `general.architecture` identifiers. The adapter must explicitly whitelist each supported identifier in both its capability and memory-planner paths; registering one architecture must not imply support for the others.
 3. Add exact family detection and a topology validator. Check trunk versus auxiliary layer counts, per-layer attention kind, dimensions, required tensor shapes, and quant types before allocating large caches.
 4. Reuse `GraphCore`, shared routing, cache strategies, layer-layout helpers, and common state handoff where the model equations permit it. Keep model-specific validation and equations beside that model.
-5. Implement graph state, weight binding, graph construction, cache handoff, expert placement, prefill, decode, and shutdown. Preserve reference operation order, residual paths, normalization, router behavior, and gate activations.
+5. Implement graph state, weight binding, graph construction, cache handoff, expert placement, prefill, decode, and shutdown. Preserve the reference operation sequence, residual paths, normalization, router behavior, and gate activations. A mathematically equivalent rewrite is an optimization that requires a same-input boundary-trace A/B first.
 6. Register a `FullGraphModelBase` adapter. Explicitly declare its decode memory plan, device expert layer count and placement direction, CPU-lane support, host DDR requirements, RAM pin defaults, cache ownership, and prefill limits. A `Fits` plan must report positive required and available device bytes with required <= available. An `Insufficient` plan must report required > available and a reason. Leave the plan `Unknown` only while graph execution remains mandatory; unknown never authorizes fallback.
 7. Validate continuation, context reset, cache bounds, and state handoff. Compare layer outputs or logits with the reference implementation before tuning throughput. Record prefill and decode separately, including prompt shape, resident expert range, host-memory mode, and CPU/CUDA graph node counts. A CUDA MoE onboarding is incomplete until `python3 tools/check_full_graph_moe_run.py <run.log> --full-fit` passes on hardware where the full graph fits. The gate requires an enabled graph, a successful decode replay, and zero one-token layered forwards or legacy expert dispatches.
 

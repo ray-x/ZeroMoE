@@ -44,7 +44,23 @@ must reach at least 90% of a same-GGUF, same-GPU llama.cpp run; report prefill,
 graph build/upload, steady decode, and end-to-end separately. A lower result
 keeps onboarding in progress for further profiling and optimization.
 Enforce that bar with `tools/check_full_graph_moe_perf.py` after the
-full-fit graph gate passes.
+full-fit graph gate passes. Port llama.cpp's exact operation sequence first;
+record its source path/commit and the matching tensor boundaries, norm
+epsilon, scale placement, activation, residual order, and state handoff. Treat
+a mathematically equivalent op substitution or fusion as an optimization that
+needs a same-input boundary-trace A/B, since rounding changes can propagate
+through quantized FFNs into near-tie expert choices.
+Compare the exact decode workload: same GGUF, GPU, active prompt length,
+generated token count, context, and thread count. For ZeroMoE's
+`--bench-random-tg N` one-token prompt, use llama-bench `-pg 1,N`; the rate
+checker verifies the prompt lengths. Record source commits, shared upstream
+GGML base revision/version, ZeroMoE's GGML patch manifest, CUDA toolkit and
+driver, compiler, and native GPU code targets. ZeroMoE-only patches are part
+of the implementation being measured, so do not call the builds
+kernel-identical. Mark the ratio provisional if the upstream base, toolchain,
+or GPU target differs. Use `--minimum-tps` with the relative bar for an
+absolute user-set target. For copied GGML trees, check that `GGML_COMMIT`
+identifies the GGML base revision, not the enclosing ZeroMoE checkout.
 
 ### System Requirements & Constraints
 * **Platform:** Linux, NVIDIA CUDA Toolkit, GCC (C++23 support), Python 3, and an AVX-512 capable CPU. 
