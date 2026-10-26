@@ -959,11 +959,8 @@ bool MoeRouterService::route(MoePipelineContext &context) {
   //   6) optionally scale by expert_weights_scale
   {
     PERF_SCOPE(t_moe_route);
-    const bool qwen35moe_route_input =
-        engine.family_ops.family == ModelFamily::Qwen;
-    std::string norm_key = "blk." + std::to_string(layer_idx) +
-        (qwen35moe_route_input ? ".post_attention_norm.weight"
-                               : ".ffn_norm.weight");
+    std::string norm_key =
+        "blk." + std::to_string(layer_idx) + ".ffn_norm.weight";
     auto norm_it = engine.resident_layers.find(norm_key);
     // Qwen4Exp's hyper-connection pre-mix already applies hc_ffn_norm and
     // produces the exact [S,D] input consumed by both the router and the

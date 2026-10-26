@@ -72,6 +72,7 @@ private:
   std::expected<void, std::string> load_model();
   std::expected<void, std::string> apply_graph_tuning();
   std::expected<void, std::string> plan_expert_cache();
+  std::expected<void, std::string> resolve_cuda_moe_graph_policy();
   std::expected<void, std::string> setup_vram_expert_cache();
   std::expected<void, std::string> offload_dense_tensors();
   std::expected<void, std::string> init_ram_tier();
@@ -79,6 +80,7 @@ private:
   std::expected<void, std::string> preload_experts();
   std::expected<void, std::string> start_workers();
   std::expected<void, std::string> run_repl();
+  std::expected<void, std::string> run_api();
   std::expected<void, std::string> shutdown_and_report();
   std::vector<StreamingEngine::UsageEntry> sanitize_usage_entries(
       const std::string &path, const char *source,

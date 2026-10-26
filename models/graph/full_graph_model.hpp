@@ -21,6 +21,10 @@
 #include "moe_routed_config.hpp"
 #include "moe_execution_strategy.hpp"
 
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
 struct StreamingEngine;
 class GpuTopology;
 class RAMSafetyManager;
@@ -39,6 +43,9 @@ struct GraphEngineCaps {
   // The temporary active-layer pool is dropped: it lives outside the aliased address
   // space and competes with the cache for VRAM.
   bool replaces_active_layer_area = false;
+  // The graph binds its own routed-expert arena and must not allocate a
+  // duplicate legacy VRAM MoE cache when graph execution is required.
+  bool owns_expert_storage = false;
 };
 
 // Family-specific performance requirements applied after GGUF discovery but
@@ -49,6 +56,29 @@ struct GraphRuntimeTuning {
   bool requires_preloaded_ddr_experts = false;
   double default_ram_pin_fraction = -1.0; // negative = honor engine config
   double default_ram_pinned_budget_gb = -1.0;
+};
+
+// Capacity decision for a complete one-token decode graph. Layered decode is
+// authorized only for an explicit Insufficient result with a reason from the
+// model's memory planner. Unknown is deliberately fail-closed: a missing or
+// incomplete plan must not silently select the legacy per-layer executor.
+enum class GraphMemoryFit : std::uint8_t {
+  Unknown,
+  Fits,
+  Insufficient,
+  Unsupported,
+};
+
+struct GraphMemoryPlan {
+  GraphMemoryFit fit = GraphMemoryFit::Unknown;
+  size_t required_device_bytes = 0;
+  size_t available_device_bytes = 0;
+  // Device-resident MoE layer block selected by the planner, if the family
+  // uses a graph-owned expert arena. Cache-aliasing/native-cache graphs may
+  // leave this at zero and report that capability separately.
+  int device_expert_layers = -1;
+  bool device_expert_trailing = false;
+  std::string reason;
 };
 
 class FullGraphModel {
@@ -62,10 +92,17 @@ class FullGraphModel {
   // Whether this phase may use the graph at all (environment gate, MTP, ...).
   virtual bool enabled(const StreamingEngine &engine,
                        ModelGraphPhase phase) const = 0;
+  // The adapter's planner accounts for the full decode graph's device
+  // requirements, including weights, KV/state, and graph workspace. Only an
+  // Insufficient result with a concrete reason may authorize layered decode.
+  virtual GraphMemoryPlan plan_decode_memory(const StreamingEngine &) const {
+    return {};
+  }
   // Optional work done once at engine start (expert source preload, ...).
   // Returns false only when startup must fail.
   virtual bool bootstrap(StreamingEngine &) const { return true; }
-  // Builds or reuses the graph for `request`; false = caller falls back.
+  // Builds or reuses the graph for `request`. A false result is a graph
+  // failure; it does not itself authorize layered execution.
   virtual bool build(StreamingEngine &engine,
                      const ModelGraphRequest &request) const = 0;
   // Executes the built graph and writes the request's outputs.
@@ -76,6 +113,12 @@ class FullGraphModel {
   // Native-cache graph sites borrow the engine runtime rather than owning a
   // second expert store. New families bind it through this shared lifecycle hook.
   virtual bool uses_native_moe_cache() const { return false; }
+  // Whether this model has no semantically valid layered implementation.
+  // Even when false, CUDA MoE layered fallback still requires an explicit
+  // Insufficient result from plan_decode_memory(). Unsupported is an explicit
+  // architecture/topology rejection and fails startup; it never authorizes a
+  // memory fallback. Unknown means the model is supported but capacity could
+  // not be established, so graph execution remains mandatory.
   virtual bool graph_only() const { return false; }
   // Whether the dense VRAM pool should hold token_embd.weight. Every embedding lookup in the engine reads the host
   // copy (one row per token), so the default is CPU/DDR; a family whose graph embeds on the GPU overrides this to true.
@@ -176,8 +219,9 @@ class FullGraphModelBase : public FullGraphModel {
 // Logs every resolved capability of `model` once, at startup (the [GRAPH-CAPS] line).
 void log_graph_capabilities(const FullGraphModel &model, const StreamingEngine &engine);
 
-// The model for `family`, or nullptr when the family has no whole-model graph
-// (it then uses the layer-by-layer path).
+// The graph adapter for `family`, or nullptr when none is registered. A CUDA
+// MoE family with a missing adapter is rejected at startup; nullptr remains
+// available to CPU/reference paths and non-MoE families.
 const FullGraphModel *full_graph_model(ModelFamily family);
 
 // Router description for `family`; families without a graph model use the

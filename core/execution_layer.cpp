@@ -1075,49 +1075,68 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       hidden_states,
       engine.qwen4exp_full_graph_logits_target,
       engine.qwen4exp_full_graph_logits_target_size};
-  if (engine.qwen4exp_full_graph_required) {
+  const bool require_decode_graph =
+      engine.cuda_moe_full_graph_decode_required ||
+      (engine.qwen4exp_full_graph_required &&
+       engine.cuda_moe_layered_fallback_reason.empty());
+  if ((S == 1 && require_decode_graph) ||
+      (S > 1 && engine.qwen4exp_full_graph_required)) {
     auto fail_graph = [&engine](const char *reason) {
       engine.qwen4exp_full_graph_failure = reason;
-      LOG_ERROR("[QWEN4EXP-GRAPH-POLICY] %s; layered execution is disabled\n",
+      LOG_ERROR("[MOE-GRAPH-POLICY] %s; layered execution is disabled\n",
                 reason);
     };
     if (S == 1 && pos_base >= 0) {
       if (!graph_model ||
           !graph_model->enabled(engine, ModelGraphPhase::Decode)) {
-        fail_graph("Qwen4Exp full-graph decode adapter is unavailable");
+        fail_graph("required full-graph decode adapter is unavailable");
         return;
       }
       if (!graph_model->build(engine, decode_graph_request)) {
-        fail_graph("Qwen4Exp full-graph decode construction failed");
+        fail_graph("required full-graph decode construction failed");
         return;
       }
+      const auto graph_run_started = std::chrono::steady_clock::now();
       if (!graph_model->run(engine, decode_graph_request)) {
-        fail_graph("Qwen4Exp full-graph decode execution failed");
+        fail_graph("required full-graph decode execution failed");
         return;
       }
+      engine.full_graph_decode_run_ns += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - graph_run_started)
+              .count());
+      ++engine.full_graph_decode_runs;
       return;
     }
     if (S > 1) {
       if (pos_base != 0 || !graph_model ||
           !graph_model->enabled(engine, ModelGraphPhase::Prefill)) {
-        fail_graph("Qwen4Exp full-graph prefill adapter is unavailable for "
+        fail_graph("required full-graph prefill adapter is unavailable for "
                    "this request shape");
         return;
       }
       if (!graph_model->run(engine, prefill_graph_request)) {
-        fail_graph("Qwen4Exp full-graph prefill execution failed");
+        fail_graph("required full-graph prefill execution failed");
         return;
       }
       return;
     }
-    fail_graph("Qwen4Exp full-graph received an unsupported token shape");
+    fail_graph("required full graph received an unsupported token shape");
     return;
   }
-  if (S == 1 && pos_base >= 0 && graph_model &&
+  if (S == 1 && pos_base >= 0 &&
+      engine.cuda_moe_layered_fallback_reason.empty() && graph_model &&
       graph_model->enabled(engine, ModelGraphPhase::Decode) &&
-      graph_model->build(engine, decode_graph_request) &&
-      graph_model->run(engine, decode_graph_request)) {
-    return;
+      graph_model->build(engine, decode_graph_request)) {
+    const auto graph_run_started = std::chrono::steady_clock::now();
+    if (graph_model->run(engine, decode_graph_request)) {
+      engine.full_graph_decode_run_ns += static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - graph_run_started)
+              .count());
+      ++engine.full_graph_decode_runs;
+      return;
+    }
   }
 
   if (graph_model && graph_model->graph_only()) {
@@ -1125,6 +1144,19 @@ void layers_forward_gguf(StreamingEngine &engine, RAMSafetyManager &ram_mgr,
       engine.qwen4exp_full_graph_failure =
           std::string(graph_model->name()) + " graph build/run failed; layered fallback is unsupported";
     return;
+  }
+  if (S == 1 && c.n_experts > 0) {
+    if (engine.cuda_moe_full_graph_decode_required) {
+      engine.qwen4exp_full_graph_failure =
+          "required CUDA MoE graph reached the layered execution path";
+      LOG_ERROR("[MOE-GRAPH-POLICY] %s; aborting request\n",
+                engine.qwen4exp_full_graph_failure.c_str());
+      return;
+    }
+    if (engine.cuda_moe_graph_policy_applies &&
+        !engine.cuda_moe_layered_fallback_reason.empty()) {
+      ++engine.layered_moe_s1_forwards;
+    }
   }
   if (S == 1 && engine.family_ops.family == ModelFamily::Qwen4Exp &&
       !qwen4exp_full_graph_sync_state_to_host(engine)) {

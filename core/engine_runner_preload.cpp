@@ -221,19 +221,12 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
     ram_mgr.vram_cache->startup_preload_phase = true;
     auto [entries, maxc] = StreamingEngine::load_usage(config.pin_file);
     const bool usage_file_had_entries = !entries.empty();
-  const bool attempt_auto_full_residency =
-      config.pin_all_experts_if_fit && config.pin_topk_per_layer <= 0 &&
-      config.vram_preload_prefix_layers <= 0 &&
-      config.qwen4exp_option_b_top_n <= 0 && !graph_mode &&
-      ram_mgr.vram_cache &&
-      ram_mgr.vram_cache->expert_vram_cache_cap > 0;
     entries =
         sanitize_usage_entries(config.pin_file, "pin_file", std::move(entries));
     maxc = 0;
     for (const auto &entry : entries)
       maxc = std::max(maxc, entry.count);
-  if (entries.empty() && !config.ram_preload_all_experts &&
-      !attempt_auto_full_residency) {
+    if (entries.empty() && !config.ram_preload_all_experts) {
       if (usage_file_had_entries) {
         LOG_STREAM_WARN()
             << "[PIN] No model-compatible records remain in " << config.pin_file
@@ -794,92 +787,6 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         }
       }
 
-      // When auto mode is selected, compare the complete expert set with the
-      // actual per-layer VRAM regions. A usage file ranks experts, but is not a
-      // complete model manifest: it can omit experts on a first run or after a
-      // quant/layout change.
-      std::unordered_map<int, int> compact_layer_capacity;
-      if (ram_mgr.vram_cache->expert_compact_layout) {
-        for (const auto &loc : ram_mgr.vram_cache->expert_vram_cache) {
-          if (loc.pool_layer >= 0)
-            ++compact_layer_capacity[loc.pool_layer];
-        }
-      }
-      bool auto_full_vram_residency = false;
-      int auto_full_vram_experts = 0;
-      int auto_full_vram_max_layer_experts = 0;
-      if (attempt_auto_full_residency) {
-        bool full_set_fits = true;
-        int total_experts = 0;
-        int max_layer_experts = 0;
-        int gpu_moe_layers = 0;
-        for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
-          if (is_cpu_affinity_layer(layer) ||
-              engine.compute_expert_slab_bytes(layer) == 0)
-            continue;
-          const int layer_experts =
-              (int)engine.layers_experts[(size_t)layer].size();
-          if (layer_experts <= 0)
-            continue;
-          ++gpu_moe_layers;
-          total_experts += layer_experts;
-          max_layer_experts = std::max(max_layer_experts, layer_experts);
-          if (!compact_layer_capacity.empty()) {
-            const auto cap = compact_layer_capacity.find(layer);
-            if (cap == compact_layer_capacity.end() ||
-                cap->second < layer_experts)
-              full_set_fits = false;
-          }
-        }
-        if (compact_layer_capacity.empty() &&
-            total_experts > (int)ram_mgr.vram_cache->expert_vram_cache_cap)
-          full_set_fits = false;
-
-        if (gpu_moe_layers > 0 && full_set_fits) {
-          auto_full_vram_residency = true;
-          auto_full_vram_experts = total_experts;
-          auto_full_vram_max_layer_experts = max_layer_experts;
-          size_t added = 0;
-          for (int layer = 0; layer < (int)engine.layers_experts.size(); ++layer) {
-            if (is_cpu_affinity_layer(layer) ||
-                engine.compute_expert_slab_bytes(layer) == 0)
-              continue;
-            const int layer_experts =
-                (int)engine.layers_experts[(size_t)layer].size();
-            if (layer_experts <= 0)
-              continue;
-            auto &ranked = by_layer[layer];
-            std::vector<uint8_t> present((size_t)layer_experts, 0);
-            for (const auto &entry : ranked) {
-              if (entry.expert >= 0 && entry.expert < layer_experts)
-                present[(size_t)entry.expert] = 1;
-            }
-            for (int expert = 0; expert < layer_experts; ++expert) {
-              if (present[(size_t)expert])
-                continue;
-              ranked.push_back({layer, expert, 0});
-              ++added;
-            }
-            std::stable_sort(ranked.begin(), ranked.end(),
-                             [](const auto &a, const auto &b) {
-                               if (a.count != b.count)
-                                 return a.count > b.count;
-                               return a.expert < b.expert;
-                             });
-          }
-          LOG_STREAM_INFO()
-              << "[PIN] Full-fit auto residency: " << total_experts
-              << " experts across " << gpu_moe_layers
-              << " GPU-executed layer(s) fit in the allocated VRAM pool; "
-              << "preloading the complete set (added " << added
-              << " experts absent from usage history)\n";
-        } else if (entries.empty() && !config.ram_preload_all_experts) {
-          LOG_STREAM_WARN()
-              << "[PIN] No usage history and full expert set does not fit "
-                 "the allocated VRAM pool; cache will fill reactively.\n";
-        }
-      }
-
       // Persist this SAME final ranking (post prefill_pin_file
       // override) for RAMSafetyManager's runtime disk_batch_padding
       // to use as its candidate source -- see that member's own
@@ -933,9 +840,7 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // Three-tier caching: Use explicit pinned_vram_capacity instead of
       // implicit pin_topk_per_layer calculation. This allows precise control
       // over the pinned tier (targeting 1024 experts vs. current ~600).
-      int max_pinned_total = auto_full_vram_residency
-                                 ? auto_full_vram_experts
-                                 : config.pinned_vram_capacity;
+      int max_pinned_total = config.pinned_vram_capacity;
       bool global_topn = (config.pin_strategy == "global_topn");
       if (max_pinned_total > 0 && !global_topn) {
         // Adjust topk per layer to respect the global pinned cap
@@ -943,12 +848,9 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
         // The physical compact-layer cap below trims the few layers whose
         // region is smaller, allowing the preload loop to consume the final
         // remainder slots instead of stranding one slot per layer.
-        if (auto_full_vram_residency)
-          topk = auto_full_vram_max_layer_experts;
-        else if (config.pin_topk_per_layer <= 0)
+        if (config.pin_topk_per_layer <= 0)
           topk = std::max(topk, (int)std::ceil(avg_vram_slots_per_layer));
-        if (!auto_full_vram_residency)
-          topk = std::min(topk, max_pinned_total / vram_moe_layers);
+        topk = std::min(topk, max_pinned_total / vram_moe_layers);
         LOG_STREAM_INFO() << "[PIN] Three-tier: capped per-layer topk to "
                           << topk << " (global cap: " << max_pinned_total
                           << " experts across " << vram_moe_layers
@@ -975,6 +877,13 @@ std::expected<void, std::string> EngineRunner::preload_experts() {
       // without knowing that compact VRAM has independent per-layer
       // regions, so a hot layer could consume more than its region and
       // lose the excess as a no-victim upload rejection.
+      std::unordered_map<int, int> compact_layer_capacity;
+      if (ram_mgr.vram_cache->expert_compact_layout) {
+        for (const auto &loc : ram_mgr.vram_cache->expert_vram_cache) {
+          if (loc.pool_layer >= 0)
+            ++compact_layer_capacity[loc.pool_layer];
+        }
+      }
 
       // Graph paths that own separate expert storage deliberately avoid a
       // second VRAM expert pool. GLM is the exception: its reusable graph

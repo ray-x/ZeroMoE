@@ -25,6 +25,7 @@
 #include <fstream>
 #include <limits>
 #include "request_stats.hpp"
+#include "generation_control.hpp"
 
 extern void matmul(float* y, const float* x, const float* W, int S, int I, int O);
 extern void rmsnorm_row(float* out, const float* x, const float* w, int D, float eps);
@@ -500,10 +501,18 @@ struct RequestStatsScope {
     RequestStatsScope &operator=(const RequestStatsScope &) = delete;
 };
 
-void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFTokenizer& tokenizer,
+inline void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFTokenizer& tokenizer,
                    LockFreePrefetcher& prefetcher,
                    const std::vector<int>& prompt_ids, int max_new_tokens, int eos_id,
-                   float temperature = 0.7f, float top_p = 0.90f) {
+                   float temperature = 0.7f, float top_p = 0.90f,
+                   GenerationControl *control = nullptr) {
+    auto cancelled = [&] {
+        const bool stop = g_shutdown_requested.load(std::memory_order_relaxed) ||
+                          (control && control->cancelled());
+        if (stop && control) control->interrupted = true;
+        return stop;
+    };
+    if (cancelled()) return;
     engine.qwen4exp_full_graph_failure.clear();
     int max_ctx = prompt_ids.size() + max_new_tokens;
     ram_mgr.calculate_safe_cache_capacity(engine, max_ctx);
@@ -521,7 +530,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // token or sampling device memory on every step. This opt-in mode keeps
     // ZeroMoE's compute path and request summary while removing that CLI
     // streaming work from apples-to-apples throughput measurements.
-    const bool bench_silent = [] {
+    const bool bench_silent = control || [] {
         const char *env = std::getenv("ZEROMOE_BENCH_SILENT");
         return env && env[0] == '1';
     }();
@@ -645,6 +654,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     } else if (engine.prompt_cache && pc_supported) {
         perf().n_prompt_cache_misses.fetch_add(1, std::memory_order_relaxed);
     }
+    if (control) control->cached_tokens = pc_reuse;
 
     std::vector<int> sequence = prompt_ids;
     Sampler sampler;
@@ -724,6 +734,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         LOG_STREAM_INFO() << "[EMBED] token_embd.weight type=" << (unsigned)emb_it->second.meta.type
                            << " (" << gpu_type_name(emb_it->second.meta.type) << ")\n";
         for (size_t t = 0; t < pc_n_new; ++t) {
+            if (cancelled()) return;
             int tok = prompt_ids[(size_t)pc_reuse + t];
             if (tok >= 0 && tok < V) {
                 embed_token(engine, tok, D, hidden_states.data() + t * D);
@@ -876,6 +887,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             LOG_STREAM_INFO() << "[PREFILL] unbatched parity mode: "
                               << pc_n_new << " x S=1 forward calls\n";
             for (size_t t = 0; t < pc_n_new; ++t) {
+                if (cancelled()) return;
                 float *row = hidden_states.data() + t * (size_t)D;
                 if (hc_active)
                     hc_expand_embedding(engine, row, 1, D);
@@ -926,6 +938,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                 graph_model->supports_prefill_continuation(engine)) {
                 const int cap = std::max(1, pc_graph_cap > 0 ? pc_graph_cap : graph_model->max_prefill_tokens(engine));
                 while (pc_n_batched < pc_n_new) {
+                    if (cancelled()) return;
                     const size_t remaining = pc_n_new - pc_n_batched;
                     size_t take = std::min<size_t>((size_t)cap, remaining);
                     // Keep the last chunk at 64+ tokens (smaller graph batches take the slow cold-expert path) and every
@@ -978,6 +991,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                                   << " tokens; stepping the remaining "
                                   << (pc_n_new - pc_n_batched) << " one token at a time\n";
                 for (size_t t = pc_n_batched; t < pc_n_new; ++t) {
+                    if (cancelled()) return;
                     float *row = hidden_states.data() + t * (size_t)D;
                     if (hc_active)
                         hc_expand_embedding(engine, row, 1, D);
@@ -1065,6 +1079,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     // prefill and before any decode token, so the cache always corresponds to
     // exactly this prompt -- decode writes dense KV at positions >= N and
     // advances the recurrent state, neither of which may be folded in here.
+    if (cancelled()) return;
     if (engine.prompt_cache && pc_supported) {
         pc_save(prompt_ids);
         engine.prompt_state_cache.last_hidden.assign(
@@ -1138,12 +1153,21 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         !prompt_ids.empty() && !bench_ignore_stop;
     if (mtp_context_ready) {
         auto emit_mtp = [&](int next_token) {
+            if (cancelled()) return false;
             perf().n_tokens_generated.fetch_add(1, std::memory_order_relaxed);
             // Same ordering fix as the main decode loop above: check for a
             // stop token before printing its decoded text, so a correctly-
             // detected stop token's own string isn't echoed to the user.
             const bool is_stop =
                 next_token == eos_id || tokenizer.is_stop_token(next_token);
+            if (control) {
+                ++control->generated_tokens;
+                if (is_stop) control->stopped = true;
+                else if (control->emit && !control->emit(tokenizer.decode(next_token))) {
+                    control->stopped = true;
+                    return false;
+                }
+            }
             if (!is_stop && !bench_silent) {
                 std::string token_str = tokenizer.decode(next_token);
                 int parse_result = reasoning.feed(token_str);
@@ -1155,7 +1179,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             }
             if (is_stop)
                 return false;
-            return !g_shutdown_requested.load(std::memory_order_relaxed);
+            return !cancelled();
         };
         // Qwen4Exp's "shared" MTP checkpoint needs its own driver
         // (Qwen4ExpMtpSpeculator, mtp_speculative.cpp) -- its NextN state
@@ -1179,6 +1203,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         }
     }
 
+    if (control && !mtp_started && control->generated_tokens > 0) {
+        engine.qwen4exp_full_graph_failure = "MTP failed after emitting output";
+        return;
+    }
     if (!mtp_started) for (int step = 0; step < max_new_tokens; ++step) {
         auto diag_loop_iter_start = std::chrono::high_resolution_clock::now();
         // Cooperative shutdown checkpoint: a decode step can take many
@@ -1188,8 +1216,8 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // same report cleanup below as a normal EOS stop, so callers don't
         // need special-casing. (The prefetcher itself is caller-owned now --
         // see the header comment above -- so there's nothing to stop here.)
-        if (g_shutdown_requested.load(std::memory_order_relaxed)) {
-            std::cout << "\n[Interrupted]\n";
+        if (cancelled()) {
+            if (!control) std::cout << "\n[Interrupted]\n";
             break;
         }
 
@@ -1208,7 +1236,13 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             // its low-rank HC output mixer is already the final collapse.
             auto norm_it = engine.resident_layers.find("output_norm.weight");
             auto lm_it = engine.resident_layers.find("output.weight");
-            if (lm_it == engine.resident_layers.end()) break;
+            if (lm_it == engine.resident_layers.end()) {
+                if (control) {
+                    engine.qwen4exp_full_graph_failure = "output.weight is missing";
+                    return;
+                }
+                break;
+            }
 
             auto diag_lmhead_start = std::chrono::high_resolution_clock::now();
             const float* lm_in = last_hidden;
@@ -1238,6 +1272,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
                 else if (std::isinf(v)) ++inf_count;
             }
             if (nan_count > 0 || inf_count > 0) {
+                if (control) {
+                    engine.qwen4exp_full_graph_failure = "non-finite generation logits";
+                    return;
+                }
                 LOG_ERROR("[SAMPLER] step=%d: logits corrupted -- %d/%d NaN, %d/%d Inf. "
                           "Sampler will silently fall back to token V-1 for every NaN case. "
                           "Root cause is upstream of sampling (attention, expert FFN, or the "
@@ -1369,6 +1407,10 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
         // display was wrong.
         const bool is_stop_now = !bench_ignore_stop &&
             (next_token == eos_id || tokenizer.is_stop_token(next_token));
+        if (control) {
+            ++control->generated_tokens;
+            control->stopped = is_stop_now;
+        }
 
         if (step == 0 && !is_stop_now && max_new_tokens > 1 &&
             engine.family_ops.family == ModelFamily::Qwen4Exp &&
@@ -1391,6 +1433,11 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
             }
         }
 
+        if (!is_stop_now && control && control->emit &&
+            !control->emit(tokenizer.decode(next_token))) {
+            control->stopped = true;
+            break;
+        }
         if (!is_stop_now && !bench_silent) {
             // Reasoning-aware output: decode to real text, then parse
             // <think>...</think> tags out of the decoded stream (the tag
@@ -1517,6 +1564,7 @@ void generate_text(StreamingEngine& engine, RAMSafetyManager& ram_mgr, GGUFToken
     stats_scope.s.decode_wall_ms = decode_boundary_s * 1000.0;
     stats_scope.s.total_ms = request_wall_ms;
     stats_scope.s.status = "ok";
+    if (control) control->completed = !control->interrupted;
     if (request_delta.n_tokens_generated > 0 && decode_boundary_s > 0.0) {
         LOG_INFO("[REQUEST-DECODE-WALL] tokens=%lu wall=%.3fs rate=%.2f tok/s "
                  "(starts immediately after PREFILL-DONE; includes one-time "

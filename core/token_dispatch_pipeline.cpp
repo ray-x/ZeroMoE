@@ -1352,6 +1352,8 @@ void TokenDispatchPipeline::run(MoePipelineContext &context) {
     }
 
     auto dispatch_expert_k = [&](int k) {
+      if (S == 1 && engine.cuda_moe_graph_policy_applies)
+        ++engine.legacy_moe_s1_expert_dispatches;
       if (cpu_offload_worker_started && k >= 0 && k < topk &&
           scratch.qwen_cpu_offload_cold_slots[(size_t)k])
         return;

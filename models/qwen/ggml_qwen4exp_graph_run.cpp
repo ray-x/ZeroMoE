@@ -13,14 +13,17 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
                                     float *hidden_states, int pos_base,
                                     const int *token_ids, float *logits,
                                     int vocab) {
-  if (!qwen4exp_full_graph_decode_enabled() || !hidden_states || pos_base < 0 ||
+  if (!full_graph_decode_enabled_for_engine(engine) || !hidden_states ||
+      pos_base < 0 ||
       !g_graph || !g_graph->ready || !g_graph->decode_mode ||
       g_graph->engine != &engine || g_graph->S != 1 ||
       pos_base >= g_graph->kv_capacity ||
       ((logits == nullptr) != (vocab <= 0)))
     return false;
   FullGraph &g = *g_graph;
-  if (engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC)
+  const bool standard_qwen = engine.family_ops.family == ModelFamily::Qwen;
+  if (!standard_qwen &&
+      engine.hc_stream_buf.size() < static_cast<size_t>(g.D) * g.HC)
     return false;
   if (has_ple_layer(engine.model_file.architecture_config) &&
       (!g.ple_embedding || !token_ids))
@@ -32,7 +35,10 @@ bool qwen4exp_full_graph_decode_run(StreamingEngine &engine,
   if (logits && (!g.logits || ggml_nelements(g.logits) < vocab))
     return false;
 
-  std::memcpy(g.input->data, engine.hc_stream_buf.data(),
+  const float *graph_input = standard_qwen
+                                 ? hidden_states
+                                 : engine.hc_stream_buf.data();
+  std::memcpy(g.input->data, graph_input,
               static_cast<size_t>(g.D) * g.HC * sizeof(float));
   static_cast<int32_t *>(g.positions->data)[0] = pos_base;
   auto *mask = static_cast<ggml_fp16_t *>(g.attn_mask->data);

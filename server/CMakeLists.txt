@@ -1,0 +1,37 @@
+cmake_minimum_required(VERSION 3.25)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    project(ZeroMoEServer CXX)
+    set(CMAKE_CXX_STANDARD 23)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    enable_testing()
+endif()
+
+include(FetchContent)
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+    URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d)
+set(HTTPLIB_COMPILE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_NON_BLOCKING_GETADDRINFO OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_REQUIRE_OPENSSL OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG 5bcfea7b90575c80a3e54a6967b11b39afa60d5c)
+FetchContent_MakeAvailable(json httplib)
+find_package(Threads REQUIRED)
+
+add_library(zeromoe_server STATIC protocol.cpp output_parser.cpp server.cpp chat_template.cpp)
+target_include_directories(zeromoe_server PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(zeromoe_server PUBLIC nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+target_compile_features(zeromoe_server PUBLIC cxx_std_23)
+option(ZEROMOE_SERVER_TESTS "Build CPU-only API tests" ON)
+if(ZEROMOE_SERVER_TESTS)
+    add_executable(server_tests tests.cpp)
+    target_link_libraries(server_tests PRIVATE zeromoe_server)
+    add_test(NAME server_tests COMMAND server_tests)
+    set_tests_properties(server_tests PROPERTIES TIMEOUT 30)
+endif()

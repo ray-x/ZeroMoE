@@ -2212,8 +2212,7 @@ static bool gdn_full_ggml_register(StreamingEngine &engine, int layer_idx,
 
 static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
                               const float *hidden_states, int S, int pos_base,
-                              float *out_context,
-                              bool silu_output_gate = false) {
+                              float *out_context) {
   PERF_SCOPE(t_attn);
   const auto &c = engine.model_file.architecture_config;
   const int D = c.hidden;
@@ -2561,12 +2560,8 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
       for (int i = 0; i < hd; ++i)
         msq += (double)x[i] * x[i];
       const float inv = 1.0f / std::sqrt((float)(msq / hd) + c.eps);
-      for (int i = 0; i < hd; ++i) {
-        const float sigmoid_gate = 1.0f / (1.0f + std::exp(-z_h[i]));
-        const float output_gate =
-            silu_output_gate ? z_h[i] * sigmoid_gate : sigmoid_gate;
-        g_out[i] = x[i] * inv * norm_w[i] * output_gate;
-      }
+      for (int i = 0; i < hd; ++i)
+        g_out[i] = x[i] * inv * norm_w[i] / (1.0f + std::exp(-z_h[i]));
     }
   }
   check_finite_attn("GDN gated (post norm*sigmoid-gate)", layer_idx, gated,
@@ -2599,11 +2594,9 @@ static void qwen4exp_gdn_gguf(StreamingEngine &engine, int layer_idx,
 // to a normal full-attention trunk layer). See attention_layer.hpp (or the
 // extern declaration at the qwen4exp_mtp_forward call site) for the
 // signature.
-static void qwen_full_attention_gguf_impl(StreamingEngine &engine,
-                                          int layer_idx,
-                                          const float *hidden_states, int S,
-                                          int pos_base, float *out_context,
-                                          bool neox_rope) {
+void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
+                                  const float *hidden_states, int S,
+                                  int pos_base, float *out_context) {
   PERF_SCOPE(t_attn);
   const auto &c = engine.model_file.architecture_config;
   const int D = c.hidden;
@@ -2703,48 +2696,18 @@ static void qwen_full_attention_gguf_impl(StreamingEngine &engine,
       for (int h = 0; h < H; ++h) {
         float *q_h = Q.data() + ((size_t)s * H + h) * hd;
         rmsnorm_row(q_h, q_h, qn_w.data(), hd, c.eps);
-        if (n_rot > 0) {
-          if (neox_rope) {
-            const int half = n_rot / 2;
-            for (int i = 0; i < half; ++i) {
-              const int j = i + half;
-              const float inv_freq =
-                  1.0f / std::pow(rope_theta, 2.0f * i / n_rot);
-              const float angle = (float)pos * inv_freq;
-              const float cs = std::cos(angle), sn = std::sin(angle);
-              const float x0 = q_h[i], x1 = q_h[j];
-              q_h[i] = x0 * cs - x1 * sn;
-              q_h[j] = x0 * sn + x1 * cs;
-            }
-          } else {
-            rope_yarn_inplace(q_h, n_rot, pos, rope_theta,
-                              /*rope_ext_factor=*/0.0f, /*freq_scale=*/1.0f,
-                              /*attn_factor=*/1.0f, /*yarn_log_mul=*/0.0f,
-                              /*n_ctx_orig=*/0);
-          }
-        }
+        if (n_rot > 0)
+          rope_yarn_inplace(q_h, n_rot, pos, rope_theta,
+                            /*rope_ext_factor=*/0.0f, /*freq_scale=*/1.0f,
+                            /*attn_factor=*/1.0f, /*yarn_log_mul=*/0.0f,
+                            /*n_ctx_orig=*/0);
       }
       for (int h = 0; h < Hkv; ++h) {
         float *k_h = K.data() + ((size_t)s * Hkv + h) * hd;
         rmsnorm_row(k_h, k_h, kn_w.data(), hd, c.eps);
-        if (n_rot > 0) {
-          if (neox_rope) {
-            const int half = n_rot / 2;
-            for (int i = 0; i < half; ++i) {
-              const int j = i + half;
-              const float inv_freq =
-                  1.0f / std::pow(rope_theta, 2.0f * i / n_rot);
-              const float angle = (float)pos * inv_freq;
-              const float cs = std::cos(angle), sn = std::sin(angle);
-              const float x0 = k_h[i], x1 = k_h[j];
-              k_h[i] = x0 * cs - x1 * sn;
-              k_h[j] = x0 * sn + x1 * cs;
-            }
-          } else {
-            rope_yarn_inplace(k_h, n_rot, pos, rope_theta, 0.0f, 1.0f, 1.0f,
-                              0.0f, 0);
-          }
-        }
+        if (n_rot > 0)
+          rope_yarn_inplace(k_h, n_rot, pos, rope_theta, 0.0f, 1.0f, 1.0f, 0.0f,
+                            0);
       }
     }
   }
@@ -2865,13 +2828,6 @@ bool qwen4exp_copy_gdn_device_output_to_host(const void *device_output,
 // Qwen4Exp hybrid per-layer dispatch: the recurrent-layer map (GGUF
 // attention.recurrent_layers, or the full_attention_interval fallback) is
 // the layer-type switch -- GDN (recurrent) vs dense full attention.
-void qwen4exp_full_attention_gguf(StreamingEngine &engine, int layer_idx,
-                                  const float *hidden_states, int S,
-                                  int pos_base, float *out_context) {
-  qwen_full_attention_gguf_impl(engine, layer_idx, hidden_states, S, pos_base,
-                                out_context, /*neox_rope=*/false);
-}
-
 void qwen4exp_attention_gguf(StreamingEngine &engine, int layer_idx,
                              const float *hidden_states, int S, int pos_base,
                              float *out_context) {
@@ -2883,30 +2839,6 @@ void qwen4exp_attention_gguf(StreamingEngine &engine, int layer_idx,
     PERF_SCOPE(t_attn_qwen_dense);
     qwen4exp_full_attention_gguf(engine, layer_idx, hidden_states, S, pos_base,
                                  out_context);
-  }
-}
-
-// Qwen3.6 uses the same recurrent GDN and gated full-attention tensor
-// layouts as Qwen4Exp, but keeps standard per-layer RMSNorms and residuals.
-// Normalize here before delegating; the shared implementations return the
-// attention result only, and the generic layer pipeline applies residuals.
-void qwen35moe_attention_gguf(StreamingEngine &engine, int layer_idx,
-                              const float *hidden_states, int S, int pos_base,
-                              float *out_context) {
-  const auto &c = engine.model_file.architecture_config;
-  const int D = c.hidden;
-  const std::string p = "blk." + std::to_string(layer_idx) + ".";
-  static thread_local std::vector<float> normed;
-  normed.resize((size_t)S * D);
-  rmsnorm_proj(engine, p + "attn_norm.weight", hidden_states, normed.data(),
-               S, D, c.eps);
-  if (qwen35moe_is_gdn_layer(c, layer_idx)) {
-    qwen4exp_gdn_gguf(engine, layer_idx, normed.data(), S, pos_base,
-                      out_context, /*silu_output_gate=*/true);
-  } else {
-    qwen_full_attention_gguf_impl(engine, layer_idx, normed.data(), S,
-                                  pos_base, out_context,
-                                  /*neox_rope=*/true);
   }
 }
 

@@ -17,6 +17,35 @@ ZeroMoE is a zero-dependency C++23 / CUDA17 inference engine built to stream Mix
 
 ## 2. Build & Execution Rules
 
+### CUDA MoE onboarding invariant
+
+CUDA MoE support means a registered `FullGraphModel` using the shared graph
+runtime. Do not add a new model through the legacy layer-by-layer expert
+executor. Trace GGUF family detection through `resolve_family_ops()` and
+`full_graph_model()` before touching CUDA dispatch; if no graph adapter exists,
+the model is not CUDA-supported and startup must reject it.
+
+`FullGraphModel::plan_decode_memory()` is the adapter's memory plan. Layered
+decode is permitted only when it reports
+`Insufficient` with required device bytes greater than available bytes and a
+reason. `Fits` and `Unknown` both require graph decode; build/run failure must
+fail the request. A full-fit onboarding run must pass
+`python3 tools/check_full_graph_moe_run.py <run.log> --full-fit`. See
+`AGENTS.md` and `docs/design/full-graph-model-onboarding.md` for the durable
+contract.
+
+`Unsupported` rejects a GGUF architecture or tensor topology at startup. It
+never authorizes a memory fallback.
+
+Coherent output is only a smoke check. Before marking a new model supported,
+compare teacher-forced pre-layer hidden states and per-layer expert routing
+against llama.cpp. Without a user-set throughput target, steady-state decode
+must reach at least 90% of a same-GGUF, same-GPU llama.cpp run; report prefill,
+graph build/upload, steady decode, and end-to-end separately. A lower result
+keeps onboarding in progress for further profiling and optimization.
+Enforce that bar with `tools/check_full_graph_moe_perf.py` after the
+full-fit graph gate passes.
+
 ### System Requirements & Constraints
 * **Platform:** Linux, NVIDIA CUDA Toolkit, GCC (C++23 support), Python 3, and an AVX-512 capable CPU. 
 * **Apple Silicon / Non-CUDA Limitations:** Will not build or run on macOS/Apple Silicon due to hard NVCC and x86 AVX-512 dependencies.
@@ -131,13 +160,24 @@ trace_abort_if_nan("MY-TAG", contains_nan);
 ## 8. Supported Models, Builds and Validation (as of 2026-10-23)
 
 ### Models and where they are documented
-Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `configs/bench/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. Full graph only: a graph that fails to build fails the request, there is no layered fallback.
+Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `configs/bench/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. CUDA MoE decode is full-graph only when the adapter planner reports Fits or Unknown. A graph failure aborts the request. Layered fallback is allowed only for an explicit Insufficient plan with required > available bytes and a logged reason.
+
+Qwen3.5/Qwen3.6 GGUFs use the generic `Qwen` family and `qwen35moe`
+architecture. An initial full-graph decode adapter now reuses the shared
+Qwen GDN, full-attention, and routed-MoE operators while building the standard
+Qwen norm/residual block. It plans all weights plus KV/GDN state and workspace,
+and requires every expert layer to be device-resident on a full-fit plan.
+Do not call this CUDA onboarding complete until a hardware run passes
+`tools/check_full_graph_moe_run.py --full-fit
+--require-all-expert-layers-on-device`; the adapter has not yet been
+fully built or performance-validated. Ornith uses this same architecture, but its
+previous run still needs a captured gate log for verification.
 
 ### Builds
 * Always configure with `-DCMAKE_BUILD_TYPE=Release` (an unset build type compiles without `-O`).
 * Builds that use the unmodified ggml series live in the main checkout: `build_master` (engine) and `build_master_ggml` (patched ggml). Builds that need branch-only ggml patches live in the worktree that carries the patches and may be deleted after it is merged. A worktree build links its ggml libraries by absolute path, so copying the binary out of it does not work; rebuild in the main checkout instead.
 * The ggml patch recipe is `docs/build-ggml.md`, `scripts/build_ggml.sh`, `scripts/build_with_ggml.sh`. `patches/ggml`, `patches/ggml-host-node` and `patches/debug` are applied; `patches/experimental` and `patches/obsolete` never are.
-* The first run after a fresh ggml build JIT-compiles for sm_120 and is far slower; take performance numbers from a warm run.
+* Benchmark only a binary with native CUDA kernels for the target GPU (for an RTX 5060 Ti, verify `sm_120a` with `cuobjdump --list-elf`); a build containing only `sm_86` is not a valid 5060 performance result. Separate first graph build/upload from steady decode timing.
 
 ### Defaults that affect VRAM and DDR
 * `embedding_device` (`auto|cpu|gpu`) defaults to CPU/DDR for every model unless a config forces GPU. A graph that uploads its own resident tensors (MiMo) must skip `token_embd.weight` too.

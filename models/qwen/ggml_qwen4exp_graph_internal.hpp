@@ -70,6 +70,15 @@ extern "C" void *zeromoe_qwen4exp_unpack_staged_payload_kernel_ptr();
 
 namespace qwen4exp_graph {
 
+inline bool full_graph_decode_enabled_for_engine(const StreamingEngine &engine) {
+  // The CUDA MoE onboarding planner is the sole gate for generic Qwen:
+  // once its full-fit plan is selected, Qwen3.5/Qwen3.6 decode is required
+  // regardless of Qwen4Exp's opt-in environment switches.
+  if (engine.family_ops.family == ModelFamily::Qwen)
+    return engine.cuda_moe_full_graph_decode_required;
+  return qwen4exp_full_graph_decode_enabled();
+}
+
 // ---- forward declarations of the types below ----
 struct Qwen4ExpCudaHostNodeContext;
 struct Qwen4ExpGpuStageContext;
@@ -530,6 +539,10 @@ struct FullGraph : zeromoe::graph::GraphCore {
   // same semantic boundary.
   // ZEROMOE_QWEN4EXP_PROBE_DUMP: per-layer (FFN input, router probs) taps for offline next-layer predictor studies.
   std::vector<std::tuple<int, ggml_tensor *, ggml_tensor *>> probe_taps;
+// Optional input hidden state at each layer boundary, emitted alongside the
+// router-probability probes so it can be compared with llama.cpp's
+// t_layer_inp[il] for the same teacher-forced token.
+std::vector<std::tuple<int, ggml_tensor *>> layer_input_taps;
   // Diagnostic (2026-09-17): cumulative time inside resident_tensor()'s own
   // cudaMemcpy H2D calls, across this ONE build_graph() call -- see memory:
   // full-graph-decode-graph-construction-5s-latency.md. Reset to 0 at the

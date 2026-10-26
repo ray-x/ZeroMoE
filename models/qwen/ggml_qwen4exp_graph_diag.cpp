@@ -393,7 +393,8 @@ void qwen4exp_scan_captured_graph_writes(FullGraph &g,
 
 void qwen_probe_dump(FullGraph &g) {
   const char *dir = zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_PROBE_DUMP");
-  if (!dir || !dir[0] || g.probe_taps.empty())
+  if (!dir || !dir[0] ||
+      (g.probe_taps.empty() && g.layer_input_taps.empty()))
     return;
   for (auto &[l, x, p] : g.probe_taps) {
     std::vector<float> a((size_t)ggml_nelements(x)), b((size_t)ggml_nelements(p));
@@ -404,6 +405,16 @@ void qwen_probe_dump(FullGraph &g) {
     xo.write(reinterpret_cast<const char *>(a.data()), (std::streamsize)(a.size() * sizeof(float)));
     std::ofstream so(base + ".s.bin", std::ios::binary | std::ios::app);
     so.write(reinterpret_cast<const char *>(b.data()), (std::streamsize)(b.size() * sizeof(float)));
+  }
+  for (auto &[l, hidden] : g.layer_input_taps) {
+    std::vector<float> values((size_t)ggml_nelements(hidden));
+    ggml_backend_tensor_get(hidden, values.data(), 0,
+                            values.size() * sizeof(float));
+    const std::string path = std::string(dir) + "/L" +
+                             std::to_string(l) + ".h.bin";
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    out.write(reinterpret_cast<const char *>(values.data()),
+              static_cast<std::streamsize>(values.size() * sizeof(float)));
   }
 }
 

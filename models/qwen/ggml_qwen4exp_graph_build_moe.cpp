@@ -831,6 +831,7 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   // (see build_gpu_stage_node's own comment on why that would desync the
   // real combine weights from real routing).
   if (g.decode_mode && g.S == 1 && g.engine &&
+      g.engine->family_ops.family == ModelFamily::Qwen4Exp &&
       g.engine->qwen4exp_gpu_stage_layer_enabled(layer)) {
     const int stage_idx = build_gpu_stage_node(g, ctx, ids, layer);
     if (stage_idx >= 0) {
@@ -886,7 +887,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
   const bool split_planned_for_layer =
       split_gpu_ids && !split_gpu_ids->empty() && gate_exps_gpu &&
       up_exps_gpu && down_exps_gpu;
-  if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+  if (g.decode_mode &&
+      g.engine->family_ops.family == ModelFamily::Qwen4Exp &&
+      env_qwen4exp_host_node_enabled() &&
       g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
       !split_planned_for_layer) {
     // The marker returns the already weighted/reduced routed result, so it
@@ -900,7 +903,9 @@ ggml_tensor *build_moe(FullGraph &g, ggml_context *ctx, ggml_tensor *cur,
       return nullptr;
     return host_node;
   }
-  if (g.decode_mode && env_qwen4exp_host_node_enabled() &&
+  if (g.decode_mode &&
+      g.engine->family_ops.family == ModelFamily::Qwen4Exp &&
+      env_qwen4exp_host_node_enabled() &&
       g.engine->qwen4exp_cpu_offload_layer_enabled(layer) &&
       split_planned_for_layer && qwen4exp_host_node_timing_enabled()) {
     LOG_INFO("[QWEN4EXP-HOST-NODE] layer=%d bypassed whole-layer marker "

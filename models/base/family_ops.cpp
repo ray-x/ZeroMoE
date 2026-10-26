@@ -63,9 +63,6 @@ extern void glm5next_attention_gguf(StreamingEngine &engine, int layer_idx,
 extern void qwen4exp_attention_gguf(StreamingEngine &engine, int layer_idx,
                                      const float *hidden_states, int S,
                                      int pos_base, float *out_context);
-extern void qwen35moe_attention_gguf(StreamingEngine &engine, int layer_idx,
-                                     const float *hidden_states, int S,
-                                     int pos_base, float *out_context);
 // Qwen4Exp's low-rank hyper-connection bracket hooks (hyper_connections.cpp)
 // -- a DIFFERENT HC variant from DeepSeek-V4's Sinkhorn form (norm/down/up/
 // inject tensors, gated mean-collapse, no comb matrix).
@@ -530,25 +527,6 @@ static void alloc_qwen4exp_cache(StreamingEngine &engine,
   }
 }
 
-// Qwen3.6 has Qwen4Exp-compatible GDN state but no PLE/HC state.
-static void alloc_qwen35moe_cache(StreamingEngine &engine,
-                                  const ArchitectureConfig &c, int max_ctx) {
-  alloc_dense_kv_cache(engine, c, max_ctx);
-  const size_t conv_dim = (size_t)2 * c.ssm_group_count * c.ssm_state_size +
-                          c.ssm_inner_size;
-  const size_t hist = (size_t)c.ssm_conv_kernel - 1;
-  const size_t heads = (size_t)c.ssm_time_step_rank;
-  const size_t state_elems = heads * (size_t)c.ssm_state_size *
-                             (size_t)c.ssm_state_size;
-  engine.qwen4exp_conv_history.resize(c.n_layers);
-  engine.qwen4exp_recur_state.resize(c.n_layers);
-  for (int l = 0; l < c.n_layers; ++l) {
-    if (!qwen35moe_is_gdn_layer(c, l)) continue;
-    engine.qwen4exp_conv_history[l].assign(conv_dim * hist, 0.0f);
-    engine.qwen4exp_recur_state[l].assign(state_elems, 0.0f);
-  }
-}
-
 // Shared by every family that uses mHC hyper-connections (DeepSeek-V4.1,
 // GLM5Next): the per-layer collapse/combine hooks are the same form in all of
 // them, only the model-level collapse differs and lives in the family's own
@@ -681,15 +659,6 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     }
     break;
 
-  case ModelFamily::Qwen:
-    // Qwen3.6-35B-A3B: ordinary residual/norms around hybrid GDN and
-    // gated full-attention blocks; router weights use softmax gating.
-    ops.attn_type = AttentionType::SSM;
-    ops.cache_shape = CacheShape::DenseKV;
-    ops.default_gating = GatingFunc::Softmax;
-    ops.attention_fn = &qwen35moe_attention_gguf;
-    ops.alloc_cache_fn = &alloc_qwen35moe_cache;
-    break;
   case ModelFamily::Hunyuan:
   case ModelFamily::Llama:
   case ModelFamily::GLM4_MOE:
@@ -713,6 +682,27 @@ FamilyOps resolve_family_ops(ModelFamily fam, const ArchitectureConfig &c) {
     ops.attention_fn = &dense_attention_gguf;
     ops.alloc_cache_fn = &alloc_dense_kv_cache;
     break;
+case ModelFamily::Qwen:
+// The qwen35moe architecture is a hybrid GDN/full-attention model. Its
+// exact architecture parser populates the shared Qwen layer map and SSM
+// dimensions before family resolution. Keep ordinary Qwen architectures on
+// the dense path unless that topology evidence is present.
+if (c.ssm_conv_kernel > 1 && c.ssm_state_size > 0 &&
+    c.ssm_inner_size > 0 && c.ssm_time_step_rank > 0 &&
+    c.ssm_group_count > 0 && c.qwen4exp_full_attention_interval > 1) {
+  ops.attn_type = AttentionType::SSM;
+  ops.cache_shape = CacheShape::DenseKV;
+  ops.default_gating = GatingFunc::Softmax;
+  ops.attention_fn = &qwen4exp_attention_gguf;
+  ops.alloc_cache_fn = &alloc_qwen4exp_cache;
+} else {
+  ops.attn_type = AttentionType::DenseQKV;
+  ops.cache_shape = CacheShape::DenseKV;
+  ops.default_gating = GatingFunc::Softmax;
+  ops.attention_fn = &dense_attention_gguf;
+  ops.alloc_cache_fn = &alloc_dense_kv_cache;
+}
+break;
   }
   return ops;
 }

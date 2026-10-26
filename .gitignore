@@ -1,5 +1,7 @@
 # --- Build outputs & compiled artifacts (NEVER commit these) ---
 build/
+build-api/
+build-api-asan/
 build_*/
 /build-ling/
 /builds*/*

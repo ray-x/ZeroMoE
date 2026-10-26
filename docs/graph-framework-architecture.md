@@ -21,7 +21,9 @@ src/ggml_<family>_graph*.cpp    the family's graph implementation, split by topi
    engine talks to: `enabled / bootstrap / build / run / shutdown`,
    `device_expert_layers`, and the policy hooks `router_spec` and
    `supports_cpu_lane`. It is reached through
-   `engine.family_ops.graph_model` (nullptr = layer-by-layer path).
+`engine.family_ops.graph_model`. A CUDA MoE with a null graph adapter is an
+onboarding error and startup rejects it; the legacy layer path is not an
+implicit CUDA fallback.
 2. **`FullGraphModelBase<Derived>`** (CRTP) owns the request validation and the
    prefill/decode dispatch every family used to repeat. A family implements
    `prefill_prepare / prefill_run / decode_prepare / decode_run` and may hide

@@ -456,7 +456,7 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->S = S;
   g->pos_base = pos_base;
   g->D = c.hidden;
-  g->HC = c.hc_mult;
+  g->HC = engine.family_ops.family == ModelFamily::Qwen ? 1 : c.hc_mult;
   g->n_layers = c.n_layers;
   g->H = c.n_heads;
   g->Hkv = std::max(1, c.n_head_kv);
@@ -468,9 +468,16 @@ bool qwen4exp_full_graph_prepare(StreamingEngine &engine, int S, int pos_base,
   g->value_dim = c.ssm_inner_size;
   g->conv_dim = 2 * g->key_dim + g->value_dim;
   g->d_conv = c.ssm_conv_kernel;
-  g->device_expert_layers =
-      std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
-  g->device_expert_trailing = env_device_expert_trailing();
+  if (engine.family_ops.family == ModelFamily::Qwen) {
+    g->device_expert_layers = std::clamp(
+        engine.cuda_moe_graph_device_expert_layers, 0, c.n_layers);
+    g->device_expert_trailing =
+        engine.cuda_moe_graph_device_expert_trailing;
+  } else {
+    g->device_expert_layers =
+        std::min(qwen4exp_full_graph_device_expert_layers(), c.n_layers);
+    g->device_expert_trailing = env_device_expert_trailing();
+  }
   const char *partial_gate_up =
       zeromoe::graphcfg::env("ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_PARTIAL_GATE_UP");
   // partial_gate_up's boundary math (layer==device_expert_layers, the

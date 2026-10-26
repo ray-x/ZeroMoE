@@ -442,8 +442,11 @@ bool init_device_expert_arena(FullGraph &g) {
   // full graph. Per-expert split allocations (and the partial-layer compact
   // tensor, same rationale) remain strict until their own budget is made
   // independently retryable.
-  const bool allow_layer_clamp =
-      requested_layers > 0 && !split_active && !partial_active;
+  const bool required_full_fit_qwen =
+      g.engine && g.engine->family_ops.family == ModelFamily::Qwen &&
+      g.engine->cuda_moe_full_graph_decode_required;
+  const bool allow_layer_clamp = requested_layers > 0 && !split_active &&
+                                 !partial_active && !required_full_fit_qwen;
 
   auto sync_option_b_hot_masks = [&]() {
     if (!g.engine || !g.engine->qwen4exp_option_b_fill_vram)

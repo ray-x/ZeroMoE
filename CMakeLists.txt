@@ -5,10 +5,16 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+add_executable(mtp_graph_contract_test EXCLUDE_FROM_ALL
+    tests/test_mtp_graph_contract.cpp)
+target_include_directories(mtp_graph_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/models/graph)
+
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
 option(ZEROMOE_CPU_ONLY "Disable CUDA and build CPU-only components" OFF)
+option(ZEROMOE_BUILD_SERVER "Build the optional C++ OpenAI/Anthropic API server" OFF)
 option(ZEROMOE_USE_GGML "Use ggml (via llama.cpp source tree) for quantized CPU kernels" OFF)
 option(ZEROMOE_USE_GGML_CUDA
        "Build/link ggml-cuda for the experimental MUL_MAT_ID prefill backend"
@@ -317,6 +323,16 @@ include_directories(${ZEROMOE_INCLUDE_DIRS})
 # Full engine build (Linux + CUDA Toolkit)
 # ---------------------------------------------------------------------------
 if(NOT ZEROMOE_CPU_ONLY)
+    # Unless the user provides an architecture list, build for the CUDA
+    # devices visible at configure time. Keep the engine's own .cu kernels
+    # aligned with ggml-cuda's native selection (e.g. sm_86 + sm_120a on a
+    # 3090 + 5060 Ti host). For GPU-less build hosts, pass an explicit list
+    # such as -DCMAKE_CUDA_ARCHITECTURES='86;120a'.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR
+       CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+        set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING
+            "CUDA architectures for devices visible at configure time" FORCE)
+    endif()
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -394,6 +410,7 @@ if(NOT ZEROMOE_CPU_ONLY)
         core/engine_runner_ram.cpp
         core/engine_runner_preload.cpp
         core/engine_runner_session.cpp
+        core/engine_runner_api.cpp
         core/perf_report_summary.cpp
         core/perf_report_dump_a.cpp
         core/perf_report_dump_b.cpp
@@ -433,6 +450,8 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/cpu/ggml_grids.cpp
         backends/ggml/ggml_moe_backend.cpp
         models/graph/ggml_moe_graph_builder.cpp
+        models/graph/mtp_graph_runtime.cpp
+        models/qwen/qwen4exp_mtp_graph.cpp
         backends/ggml/ggml_moe_transfer_manager.cpp
         backends/ggml/ggml_moe_runner.cpp
         backends/ggml/ggml_router_runner.cpp
@@ -488,7 +507,7 @@ if(NOT ZEROMOE_CPU_ONLY)
     target_compile_definitions(zeromoe PRIVATE ZEROMOE_EXL3_CUDA=1)
     set_target_properties(zeromoe PROPERTIES
         CUDA_SEPARABLE_COMPILATION OFF
-        CUDA_ARCHITECTURES 86        # Ampere; adjust via -DCMAKE_CUDA_ARCHITECTURES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
     target_link_libraries(zeromoe PRIVATE ${ZEROMOE_EXL3_UPSTREAM_LIB}
         CUDA::cudart
@@ -567,6 +586,8 @@ if(NOT ZEROMOE_CPU_ONLY)
         backends/cpu/ggml_grids.cpp
         backends/ggml/ggml_moe_backend.cpp
         models/graph/ggml_moe_graph_builder.cpp
+        models/graph/mtp_graph_runtime.cpp
+        models/qwen/qwen4exp_mtp_graph.cpp
         backends/ggml/ggml_moe_transfer_manager.cpp
         backends/ggml/ggml_moe_runner.cpp
         backends/ggml/ggml_router_runner.cpp
@@ -648,6 +669,24 @@ if(NOT ZEROMOE_CPU_ONLY)
                 models/base/safetensors_adapter.cpp)
             target_include_directories(zeromoe_tests PRIVATE ${ZEROMOE_GGML_SRC_DIR}/src)
         endif()
+    endif()
+
+    if(ZEROMOE_USE_GGML_CUDA)
+        # Reuse engine linkage without changing its production entry point.
+        get_target_property(MTP_ENGINE_SOURCES zeromoe SOURCES)
+        list(REMOVE_ITEM MTP_ENGINE_SOURCES core/main.cpp)
+        add_executable(qwen4exp_mtp_parity EXCLUDE_FROM_ALL
+            tests/mtp/zeromoe_mtp_parity.cpp ${MTP_ENGINE_SOURCES})
+        target_include_directories(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,INCLUDE_DIRECTORIES>)
+        target_compile_definitions(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,COMPILE_DEFINITIONS>)
+        target_compile_options(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,COMPILE_OPTIONS>)
+        target_link_libraries(qwen4exp_mtp_parity PRIVATE
+            $<TARGET_PROPERTY:zeromoe,LINK_LIBRARIES>)
+        set_target_properties(qwen4exp_mtp_parity PROPERTIES
+            CUDA_SEPARABLE_COMPILATION OFF CUDA_ARCHITECTURES 86)
     endif()
 
     # Pure-header lifecycle contract test for the R2 strategy migration. It has
@@ -1144,8 +1183,7 @@ else()
     endif()
 
     # CPU-only inference binary (zeromoe_cpu)
-    add_executable(zeromoe_cpu
-        backends/cpu/cpu_main.cpp
+    add_library(zeromoe_cpu_runtime STATIC
         backends/exl3/exl3_decode.cpp
         backends/cpu/cpu_dense.cpp
         backends/cpu/cpu_engine.cpp
@@ -1154,11 +1192,15 @@ else()
         models/qwen/cpu_qwen_moe.cpp
         models/qwen/cpu_qwen4exp.cpp
     )
-    target_include_directories(zeromoe_cpu PRIVATE
+    target_include_directories(zeromoe_cpu_runtime PUBLIC
         ${ZEROMOE_INCLUDE_DIRS}
         ${CMAKE_CURRENT_SOURCE_DIR}/models
     )
-    target_link_libraries(zeromoe_cpu PRIVATE kernels_cpu)
+    target_link_libraries(zeromoe_cpu_runtime PUBLIC kernels_cpu)
+    add_executable(zeromoe_cpu backends/cpu/cpu_main.cpp)
+    if(NOT ZEROMOE_BUILD_SERVER)
+        target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_runtime)
+    endif()
 
     # When the kernel backend contains Objective-C++ (Metal dispatch), the
     # final executable must link the Objective-C runtime / Foundation so the
@@ -1170,7 +1212,7 @@ else()
         endforeach()
     endif()
     if(OpenMP_CXX_FOUND)
-        target_link_libraries(zeromoe_cpu PRIVATE OpenMP::OpenMP_CXX)
+        target_link_libraries(zeromoe_cpu_runtime PUBLIC OpenMP::OpenMP_CXX)
     endif()
 
     # Tools
@@ -1178,6 +1220,25 @@ else()
 endif()
 
 message(STATUS "ZeroMoE: configure done")
+
+if(ZEROMOE_BUILD_SERVER)
+    enable_testing()
+    add_subdirectory(server)
+    if(TARGET zeromoe)
+        target_link_libraries(zeromoe PRIVATE zeromoe_server)
+        target_compile_definitions(zeromoe PRIVATE ZEROMOE_BUILD_SERVER=1)
+    else()
+        add_library(zeromoe_cpu_api STATIC backends/cpu/cpu_api.cpp)
+        target_link_libraries(zeromoe_cpu_api PUBLIC zeromoe_cpu_runtime zeromoe_server)
+        target_link_libraries(zeromoe_cpu PRIVATE zeromoe_cpu_api)
+        target_compile_definitions(zeromoe_cpu PRIVATE ZEROMOE_BUILD_SERVER=1)
+        if(ZEROMOE_SERVER_TESTS)
+            add_executable(cpu_api_tests tests/cpu_api_test.cpp)
+            target_link_libraries(cpu_api_tests PRIVATE zeromoe_cpu_api)
+            add_test(NAME cpu_api_tests COMMAND cpu_api_tests)
+        endif()
+    endif()
+endif()
 
 # EXL3 bench targets compile backends/exl3/exl3_upstream_ops.cu directly and need the
 # upstream kernel library plus the torch stub include path.

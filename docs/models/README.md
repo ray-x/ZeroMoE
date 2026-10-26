@@ -35,6 +35,13 @@ manually-edited fork silently drops this hook and disables the CPU lane**, see t
 The consolidated measurements and benchmark-only profiles are in
 [`configs/bench/perf-baselines.md`](../../configs/bench/perf-baselines.md).
 
+## In progress
+
+Qwen3.6-35B-A3B UD-IQ2_M has an initial generic-Qwen full-graph decode adapter
+and a 5060 Ti validation profile. It is not a supported CUDA model until the
+full-fit graph and all-expert placement gate passes on hardware. See
+[`qwen36-35b-a3b.md`](qwen36-35b-a3b.md).
+
 The bands are deliberately wide (≈±15 %) because the models are **not bit-deterministic** under
 near-tie routing and single-run decode spread is real (e.g. Qwen 24.6–28.7 tok/s). A regression is
 a *sustained* drop below the band, not a single low run.

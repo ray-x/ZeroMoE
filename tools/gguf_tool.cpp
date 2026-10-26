@@ -7,9 +7,13 @@
 // (argc-1, argv+1) so each subcommand parses its own args starting at its
 // own argv[0] == the subcommand name.
 //
-// Build (no CMake / no CUDA -- macOS and Linux):
-//   c++ -std=c++23 -O2 -Iinclude tools/gguf_tool.cpp tools/gguf_pack.cpp \
-//       tools/gguf_io.cpp tools/gguf_verify.cpp tools/gguf_plan.cpp -o build/gguf_tool
+// Standalone build (no CMake, CUDA, or llama.cpp submodule):
+//   c++ -std=c++23 -O2 -Iinclude -Icore -Imodels/base -Imemory \
+//     -Imodels/graph -Ibackends/ggml -Ibackends/cpu -Icuda \
+//     tools/gguf_tool.cpp tools/gguf_pack.cpp tools/gguf_io.cpp \
+//     tools/gguf_verify.cpp tools/gguf_plan.cpp tools/gguf_offload.cpp \
+//     tools/gguf_dma.cpp tools/gguf_mix.cpp tools/gguf_mirror.cpp \
+//     -o /tmp/gguf_tool
 #include "gguf_common.hpp"
 #include <cstdio>
 #include <cstring>
@@ -32,10 +36,12 @@ int usage(const char *prog) {
           "          Pre-flight completeness gate (architecture-aware "
           "per-layer attention/norm checks) + optional exhaustive byte-compare "
           "against another model.\n"
-          "  plan    <model_file_or_dir> [--usage-file <path>] "
-          "[--write-config <path>] [options]\n"
-          "          Sizes GGUF tensors against RAM/VRAM; optionally writes "
-          "a reviewable model config.\n"
+          "  plan    <model_file_or_dir> [--usage-file <path>] [--embedding-device auto|cpu|gpu]\n"
+          "          Read-only sizing advisor: dense/MoE VRAM requirement, "
+          "detected GPU/RAM, and a\n"
+          "          .zeromoe_usage summary -- for picking dense_gb / "
+          "moe_cache_gb / pinned_vram_capacity\n"
+          "          on a new model without trial-and-error real runs.\n"
           "  dma     <model.gguf|dir> [<model2> ...] [--experts N[,N2,...]] "
           "[--submissions M]\n"
           "          A/B of the REAL production io_uring/O_DIRECT read path: "

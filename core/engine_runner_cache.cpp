@@ -191,7 +191,9 @@ std::expected<void, std::string> EngineRunner::plan_expert_cache() {
       graph_mode && graph_engine_caps(engine).aliases_vram_cache;
 const bool qwen_hybrid_graph_placement =
     (engine.family_ops.family == ModelFamily::Qwen4Exp &&
-     qwen4exp_full_graph_decode_enabled());
+     qwen4exp_full_graph_decode_enabled()) ||
+    (engine.family_ops.family == ModelFamily::Qwen &&
+     engine.cuda_moe_full_graph_decode_required);
 if (graph_mode && qwen_hybrid_graph_placement && graph_model) {
     const int n_layers =
         std::max(0, engine.model_file.architecture_config.n_layers);
@@ -573,10 +575,14 @@ std::expected<void, std::string> EngineRunner::setup_vram_expert_cache() {
     const bool qwen_full_graph_decode =
         engine.family_ops.family == ModelFamily::Qwen4Exp &&
         qwen4exp_full_graph_decode_enabled();
+    const bool graph_owns_expert_storage =
+        engine.cuda_moe_full_graph_decode_required &&
+        graph_engine_caps(engine).owns_expert_storage;
     const bool exl3_ggml_bridge_enabled =
         !engine.exl3_ggml_bridge_model_path.empty();
     const bool option_b_disable_legacy_cache =
-        (qwen_full_graph_decode && !exl3_ggml_bridge_enabled) ||
+        ((qwen_full_graph_decode || graph_owns_expert_storage) &&
+         !exl3_ggml_bridge_enabled) ||
         (config.qwen4exp_option_b_disable_legacy_cache &&
          config.qwen4exp_option_b_top_n > 0 &&
          engine.family_ops.family == ModelFamily::Qwen4Exp);

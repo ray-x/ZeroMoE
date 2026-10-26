@@ -36,7 +36,7 @@ ZeroMoE/
 ├── scripts/                       # Build and validation helpers
 ├── patches/                       # ggml patch series
 ├── docs/                          # Design notes and model recipes
-└── api/                           # Optional API gateway (not included in this snapshot)
+└── server/                        # Optional native C++ OpenAI/Anthropic API server
 
 ```
 
@@ -45,8 +45,8 @@ ZeroMoE/
 ### Linux + CUDA (full engine)
 
 Run the automated setup tool. It validates the required compilers (`g++`,
-`nvcc`) and builds the engine. Optional API dependencies are installed only
-when the API server and its requirements file are present:
+`nvcc`) and builds the engine. Enable the native C++ HTTP server separately
+with `-DZEROMOE_BUILD_SERVER=ON`:
 
 ```bash
 chmod +x setup.sh
@@ -64,6 +64,16 @@ AVX-512 VNNI is enabled by default for CPU performance. On a CPU without
 AVX-512 VNNI, compiling with it enabled may cause an illegal-instruction
 failure. Configure with `-DZEROMOE_ENABLE_AVX512_VNNI=OFF` to disable VNNI in
 both ZeroMoE and ggml CPU kernels.
+
+### OpenAI and Anthropic APIs
+
+The optional C++ server exposes Chat Completions and Messages, including SSE,
+Qwen tool calls, cancellation, and bounded request queues. It runs in the engine
+process with one inference owner; no Python gateway is needed.
+
+See [API server](docs/api-server.md) for CPU/CUDA build commands, authentication,
+examples, feature limits, and the experimental opt-in CPU prompt-state cache.
+Native CUDA prompt caching is not yet available for API requests.
 
 Before inference, edit a profile's `model_path` and any related model,
 mirror, expert-store, or usage-profile paths for resources available on your
@@ -451,6 +461,45 @@ Rather than running heavy tensor conversions across your PCIe boundaries, the en
 Throughput numbers say nothing about correctness: a broken graph can look faster. Check correctness first, then
 speed. Use the layers below from cheapest to most expensive; a change to attention, routing, the MoE/FFN block,
 quant handling or expert placement should pass all that apply.
+
+### 0. CUDA MoE graph-selection gate
+
+Before implementing CUDA kernels for a new MoE, trace its exact GGUF
+architecture through `resolve_family_ops()` to the `FullGraphModel` registry.
+The adapter's `plan_decode_memory()` must reject unsupported architectures or
+tensor topologies before large allocations. Only an `Insufficient` result with
+required/available byte counts and a reason permits layered decode; `Unknown`
+requires graph decode, and `Unsupported` fails startup. Graph build/run failure
+is not a memory plan.
+
+For a full-fit hardware run, require graph decode to be enabled and exercised,
+with zero legacy one-token forwards or per-expert dispatches:
+
+```bash
+python3 tools/check_full_graph_moe_run.py <run.log> --full-fit
+```
+
+For Qwen3.5/Qwen3.6 full-fit runs, also pass
+`--require-all-expert-layers-on-device` to require the graph's placement proof
+to report all expert layers resident on the device.
+
+Coherent output is a smoke check, not a performance pass. For a same-GGUF,
+same-GPU combined prompt/decode reference, save `llama-bench` JSON and enforce
+the default 90% steady-decode bar with:
+
+```bash
+llama-bench -m /path/to/model.gguf -pg 16,400 -ngl 99 -dev CUDA1 \
+    -mg 0 -sm none -t 10 -r 3 -o json > llama-bench.json
+python3 tools/check_full_graph_moe_perf.py <run.log> llama-bench.json \
+    --n-prompt 16 --n-gen 400 --device CUDA1
+```
+
+The ZeroMoE gate uses time spent in graph decode replays and reports graph
+construction/upload separately. A result below the bar keeps onboarding in
+progress; it is not accepted because generated text happens to look coherent.
+
+Use `--allow-memory-fallback` only for a run whose log records an explicit
+insufficient-memory plan and its reason.
 
 ### 1. Unit and structure checks (seconds, no model)
 
