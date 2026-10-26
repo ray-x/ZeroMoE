@@ -1,4 +1,6 @@
 cpu_threads_decode=10
+device_expert_layers=0
+device_expert_trailing=0
 dynamic_cache=0
 early_ready=-1
 gpu_assist2_slots=1

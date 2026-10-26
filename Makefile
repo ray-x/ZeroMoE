@@ -19,7 +19,7 @@ else
     BUILD_DIR ?= build
 endif
 
-.PHONY: all build test check clean clean-all configure reconfigure test-components bench-io bench-exl3 bench-exl3-cpu bench-exl3-hc gguf-tool qwen4exp-pointer-spike bench-pointer-spike qwen4exp-staging-spike bench-staging-spike qwen-cpu-offload-graph-sandbox bench-cpu-offload-graph-sandbox
+.PHONY: all build test check clean clean-all configure reconfigure test-components test-settings inventory-settings bench-io bench-exl3 bench-exl3-cpu bench-exl3-hc gguf-tool qwen4exp-pointer-spike bench-pointer-spike qwen4exp-staging-spike bench-staging-spike qwen-cpu-offload-graph-sandbox bench-cpu-offload-graph-sandbox
 
 all: build
 
@@ -66,6 +66,14 @@ check: test
 # Optional substring filters: make test-components ARGS="rope dequant".
 test-components:
 	tests/run_components.sh $(ARGS)
+
+test-settings: configure
+	cmake --build $(BUILD_DIR) --target graph_settings_test graph_settings_binding_test -j$(JOBS)
+	ctest --test-dir $(BUILD_DIR) -R '^graph_settings' --output-on-failure
+	python3 tools/config_inventory.py --check
+
+inventory-settings:
+	python3 tools/config_inventory.py $(ARGS)
 
 # gguf_tool (tools/gguf_tool.cpp + gguf_pack/io/verify.cpp) -- cross-platform
 # (macOS + Linux), no CMake/CUDA. One binary, three subcommands: pack, io,

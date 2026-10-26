@@ -35,6 +35,12 @@ shared, makes defaults inherited, and makes divergence explicit and visible.
 2. A specific model can be tuned without touching shared code.
 3. A change to the common setup applies to all models by default.
 4. A model can override the common setup — explicitly, with a recorded reason.
+5. CUDA MoE decode uses the shared full-graph runtime. A family-specific graph
+   adapter is required; model-specific equations belong in the adapter, not in
+   a parallel layer-by-layer CUDA executor. Layered decode is available only
+   when the graph memory planner reports insufficient capacity with byte counts
+   and a reason. See `docs/design/full-graph-model-onboarding.md` for the
+   required graph gate.
 
 ## 3. What exists today
 

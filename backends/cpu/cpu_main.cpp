@@ -44,6 +44,10 @@ static int parse_int_arg(int argc, char **argv, const std::string &flag,
 }
 
 int main(int argc, char **argv) {
+  if (argc == 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+    print_usage(argv[0]);
+    return 0;
+  }
   std::string config_path = parse_arg(argc, argv, "--config", "");
   if (config_path.empty()) {
     print_usage(argv[0]);

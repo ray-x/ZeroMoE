@@ -17,6 +17,22 @@ ZeroMoE is a zero-dependency C++23 / CUDA17 inference engine built to stream Mix
 
 ## 2. Build & Execution Rules
 
+### CUDA MoE onboarding invariant
+
+CUDA MoE support means a registered `FullGraphModel` using the shared graph
+runtime. Do not add a new model through the legacy layer-by-layer expert
+executor. Trace GGUF family detection through `resolve_family_ops()` and
+`full_graph_model()` before touching CUDA dispatch; if no graph adapter exists,
+the model is not CUDA-supported and startup must reject it.
+
+Layered decode is permitted only when the adapter's memory planner reports
+`Insufficient` with required device bytes greater than available bytes and a
+reason. `Fits` and `Unknown` both require graph decode; build/run failure must
+fail the request. A full-fit onboarding run must pass
+`python3 tools/check_full_graph_moe_run.py <run.log> --full-fit`. See
+`AGENTS.md` and `docs/design/full-graph-model-onboarding.md` for the durable
+contract.
+
 ### System Requirements & Constraints
 * **Platform:** Linux, NVIDIA CUDA Toolkit, GCC (C++23 support), Python 3, and an AVX-512 capable CPU. 
 * **Apple Silicon / Non-CUDA Limitations:** Will not build or run on macOS/Apple Silicon due to hard NVCC and x86 AVX-512 dependencies.
@@ -131,7 +147,11 @@ trace_abort_if_nan("MY-TAG", contains_nan);
 ## 8. Supported Models, Builds and Validation (as of 2026-10-23)
 
 ### Models and where they are documented
-Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `configs/bench/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. Full graph only: a graph that fails to build fails the request, there is no layered fallback.
+Full-graph model families: Qwen 3.8 Flash, GLM-5.3 / GLM-5.3 Flash, Ling 3.1 Flash, DeepSeek-V4.1 Flash, MiMo V2.6 Flash. Each has a recipe and frozen baseline in `docs/models/<model>.md`; measured numbers live in `configs/bench/perf-baselines.md` (update it on a gain, and tell the owner of any drop above 5%). The shared MoE/model-family framework is described in `docs/design/model-family-framework.md`; settings resolution (defaults, family overrides, environment) in `docs/design/settings-resolver.md`. CUDA MoE decode is full-graph only when the adapter planner reports Fits or Unknown. A graph failure aborts the request. Layered fallback is allowed only for an explicit Insufficient plan with required > available bytes and a logged reason.
+
+Qwen3.5/Ornith models whose GGUF resolves to the generic `Qwen` family are
+not CUDA-supported until a full-graph adapter is registered. The runtime now
+rejects that path rather than using the legacy layered executor.
 
 ### Builds
 * Always configure with `-DCMAKE_BUILD_TYPE=Release` (an unset build type compiles without `-O`).

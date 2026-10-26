@@ -5,6 +5,19 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+enable_testing()
+add_executable(graph_settings_test tests/test_graph_settings.cpp)
+target_include_directories(graph_settings_test PRIVATE core models/graph backends/cpu)
+add_test(NAME graph_settings COMMAND graph_settings_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_settings_defaults.snapshot")
+add_executable(graph_settings_binding_test tests/test_graph_settings_binding.cpp)
+target_include_directories(graph_settings_binding_test PRIVATE core models/graph)
+find_package(Threads REQUIRED)
+target_link_libraries(graph_settings_binding_test PRIVATE Threads::Threads)
+add_test(NAME graph_settings_binding COMMAND graph_settings_binding_test)
+set_tests_properties(graph_settings_binding PROPERTIES ENVIRONMENT_MODIFICATION
+    "ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_LAYERS=unset:;ZEROMOE_QWEN4EXP_GRAPH_PRELOAD_TRAILING=unset:;ZEROMOE_PHASE_CACHE_MIB=unset:")
+
 # ---------------------------------------------------------------------------
 # Build options
 # ---------------------------------------------------------------------------
@@ -232,14 +245,25 @@ if(ZEROMOE_USE_GGML)
                 message(STATUS "ZeroMoE: third_party/llama.cpp missing; fetching ${ZEROMOE_GGML_COMMIT} ...")
                 set(_zeromoe_fetch "${CMAKE_BINARY_DIR}/_deps/llama-fetch")
                 file(MAKE_DIRECTORY "${_zeromoe_fetch}")
-                foreach(_cmd "init -q" "fetch -q --depth 1 https://github.com/ggml-org/llama.cpp ${ZEROMOE_GGML_COMMIT}" "checkout -q FETCH_HEAD")
+                file(REMOVE_RECURSE "${_zeromoe_fetch}")
+                file(MAKE_DIRECTORY "${_zeromoe_fetch}")
+                # Shallow, blob-less, sparse: only ggml/ is downloaded (about 5 MB, not the 390 MB whole tree).
+                foreach(_cmd "init -q"
+                              "remote add origin https://github.com/ggml-org/llama.cpp"
+                              "config extensions.partialClone origin"
+                              "config remote.origin.promisor true"
+                              "config remote.origin.partialclonefilter blob:none"
+                              "sparse-checkout init --no-cone"
+                              "sparse-checkout set /ggml/"
+                              "fetch -q --depth 1 --filter=blob:none origin ${ZEROMOE_GGML_COMMIT}"
+                              "checkout -q FETCH_HEAD")
                     separate_arguments(_args UNIX_COMMAND "${_cmd}")
                     execute_process(COMMAND git ${_args} WORKING_DIRECTORY "${_zeromoe_fetch}"
                         RESULT_VARIABLE _rc ERROR_VARIABLE _err OUTPUT_QUIET)
                     if(NOT _rc EQUAL 0)
                         message(FATAL_ERROR
                             "ggml source not found: third_party/llama.cpp is empty and the fetch failed (${_err}). "
-                            "Run: git submodule update --init third_party/llama.cpp, or set ZEROMOE_GGML_ROOT.")
+                            "Run: scripts/init_ggml.sh (fetches only ggml/, about 5 MB), or set ZEROMOE_GGML_ROOT.")
                     endif()
                 endforeach()
                 file(COPY "${_zeromoe_fetch}/ggml/" DESTINATION "${_zeromoe_ggml_src}")
@@ -675,8 +699,6 @@ if(NOT ZEROMOE_CPU_ONLY)
             ${ZEROMOE_GGML_SRC_DIR})
         target_link_libraries(quant_table_test PRIVATE ggml)
     endif()
-    add_executable(graph_settings_test EXCLUDE_FROM_ALL tests/test_graph_settings.cpp)
-    target_include_directories(graph_settings_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(resident_memory_policy_test EXCLUDE_FROM_ALL tests/test_resident_memory_policy.cpp)
     target_include_directories(resident_memory_policy_test PRIVATE ${ZEROMOE_INCLUDE_DIRS})
     add_executable(phase_route_test EXCLUDE_FROM_ALL tests/test_phase_routes.cpp)
@@ -1117,9 +1139,7 @@ else()
     endif()
 
     if(ZEROMOE_USE_GGML)
-        target_sources(kernels_cpu PRIVATE
-            backends/cpu/ggml_dequant.cpp
-            backends/cpu/ggml_grids.cpp)
+        target_sources(kernels_cpu PRIVATE backends/cpu/ggml_dequant.cpp)
         target_link_libraries(kernels_cpu PUBLIC ggml)
         target_compile_definitions(kernels_cpu PUBLIC ZEROMOE_USE_GGML=1)
         target_include_directories(kernels_cpu PUBLIC ${ZEROMOE_GGML_SRC_DIR})

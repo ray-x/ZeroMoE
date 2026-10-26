@@ -1,15 +1,23 @@
 # Environment variables
 
+Prefer the model recipe and canonical root `graph_*` TOML keys for migrated
+graph settings. See [configuration and precedence](configuration.md), or run
+`zeromoe --help-settings` for effects, actual family defaults and aliases.
+Legacy aliases still work and override TOML, but now log migration warnings.
+Many experimental controls remain environment-only; this is a staged migration.
+
 This page lists the `ZEROMOE_*` settings a user is expected to see: the ones the README and the shipped configs
 refer to, plus the model-path fallback. Internal benchmark and diagnostic knobs that no public config uses are not
 listed here; they live in the source (`grep -rn ZEROMOE_ core models memory backends`).
 
-Two reading rules apply to every variable below:
+Legacy readers differ; do not treat environment values as TOML:
 
-- **Flags** come in two forms. `flag_on` is enabled only when the value starts with `1`; any other value,
-  including `true`, is off. `flag_unless_off` is enabled unless the value starts with `0`.
-- **Integers** (`atoi_or`) use the leading number of the value, so `10x` reads as 10. Empty or non-numeric values
-  fall back to the default.
+- **Flags:** `flag_on` requires a leading `1`; `flag_unless_off` is enabled unless the
+  value starts with `0`; other readers require exactly `"1"` or accept nonempty
+  nonzero strings. The relevant reader determines the result, not a common parser.
+- **Integers:** some readers use a leading number (`10x` becomes 10), while strict
+  readers reject it and retain the prior value. Preserve existing scripts, but use
+  typed TOML values when migrating.
 
 Settings are read when the process starts, and graph settings are cached per model family. Set them before launching
 `zeromoe`. Changing them while the process runs has no effect.
@@ -33,8 +41,10 @@ Settings are read when the process starts, and graph settings are cached per mod
 
 ## Qwen 3.8 Flash full graph
 
-Configs that run the validated Qwen recipe set these. The values shown are the ones in
-`configs/qwen38-flash.toml`.
+The shipped Qwen recipe no longer requires these variables. Full-graph prefill/decode
+default to enabled; placement uses `graph_device_expert_layers` and
+`graph_device_expert_trailing`. The table retains the historical launch values for
+existing scripts.
 
 | Variable | Set to | Effect |
 | --- | --- | --- |
@@ -100,6 +110,7 @@ These are model-specific. The model's own document (`docs/models/<model>.md`) is
 | --- | --- |
 | `ZEROMOE_BENCH_IGNORE_STOP` | Benchmark runs ignore end-of-sequence tokens, so every run generates its full token count. Set to `1` in bench scripts. |
 | `ZEROMOE_BENCH_SILENT` | Suppress per-token printing and per-token VRAM sampling in the timed path. |
+| `ZEROMOE_STATS_FILE` | Append one JSON line per finished request (same as `--stats-file PATH`): prompt and generated tokens, prefill and decode speed, time to first token, decode setup. Fields: [performance-measurement.md](performance-measurement.md). |
 | `ZEROMOE_GENERATED_TOKEN_FILE` | Write each generated token id to this file, one per line (truncated at step 0). For numerical comparisons. |
 | `ZEROMOE_DECODE_LOGITS_DUMP` | Dump decode logits to this file. Diagnostic. |
 | `ZEROMOE_WUV_INT8` | Attention value-projection int8 path (`1` enables). Diagnostic; read in `core/attention_layer.cpp`. |

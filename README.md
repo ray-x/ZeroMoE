@@ -42,6 +42,10 @@ ZeroMoE/
 
 ## Build and Installation Pipeline
 
+For a smaller configuration surface, start with the
+[configuration guide](docs/configuration.md): Release CPU/CUDA build presets,
+normal versus advanced help, canonical graph keys, and legacy compatibility.
+
 ### Linux + CUDA (full engine)
 
 Run the automated setup tool. It validates the required compilers (`g++`,
@@ -110,7 +114,9 @@ cmake --build build -j$(sysctl -n hw.ncpu)
 
 #### ggml-cuda / full-graph decode build
 
-The experimental ggml-backed full-graph prefill/decode path (`ZEROMOE_QWEN4EXP_FULL_GRAPH*` env vars at runtime) requires linking ggml's CUDA backend:
+The ggml-backed full-graph prefill/decode path requires linking ggml's CUDA backend.
+The Qwen recipe enables it through engine defaults; legacy
+`ZEROMOE_QWEN4EXP_FULL_GRAPH*` environment overrides remain supported:
 
 ```bash
 cmake -S . -B build -DZEROMOE_USE_GGML=ON -DZEROMOE_USE_GGML_CUDA=ON
@@ -451,6 +457,25 @@ Rather than running heavy tensor conversions across your PCIe boundaries, the en
 Throughput numbers say nothing about correctness: a broken graph can look faster. Check correctness first, then
 speed. Use the layers below from cheapest to most expensive; a change to attention, routing, the MoE/FFN block,
 quant handling or expert placement should pass all that apply.
+
+### 0. CUDA MoE graph-selection gate
+
+Before implementing CUDA kernels for a new MoE, trace its GGUF family through
+`resolve_family_ops()` to the `FullGraphModel` registry. A CUDA MoE without a
+registered graph adapter is unsupported; do not route it through the legacy
+layer-by-layer expert executor. Layered decode is allowed only when the graph
+memory planner reports insufficient capacity with required/available byte
+counts and a reason. A graph build/run failure is not a memory plan.
+
+For a full-fit hardware run, require graph decode to be enabled and exercised,
+with zero legacy one-token forwards or per-expert dispatches:
+
+```bash
+python3 tools/check_full_graph_moe_run.py <run.log> --full-fit
+```
+
+Use `--allow-memory-fallback` only for a run whose log records an explicit
+insufficient-memory plan and its reason.
 
 ### 1. Unit and structure checks (seconds, no model)
 

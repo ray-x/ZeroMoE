@@ -26,7 +26,11 @@
 #include <string>
 #include <unordered_set>
 
-#include <unistd.h>  // declares environ (_GNU_SOURCE)
+#if defined(__APPLE__)
+#include <crt_externs.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace zeromoe::graphcfg {
 
@@ -143,7 +147,12 @@ inline void log_effective(const char *tag, bool include_unread = true) {
   }
   const auto consulted = Registry::get().snapshot();
   std::map<std::string, std::string> in_env;
-  for (char **e = environ; e && *e; ++e) {
+#if defined(__APPLE__)
+  char **process_env = *_NSGetEnviron();
+#else
+  char **process_env = environ;
+#endif
+  for (char **e = process_env; e && *e; ++e) {
     if (std::strncmp(*e, "ZEROMOE_", 10) != 0)
       continue;
     const char *eq = std::strchr(*e, '=');

@@ -1,6 +1,8 @@
 # --- Build outputs & compiled artifacts (NEVER commit these) ---
 build/
 build_*/
+/build-cpu/
+/build-cuda/
 /build-ling/
 /builds*/*
 /.worktrees/
@@ -95,3 +97,4 @@ venv/
 bench/results/*.logs/
 bench/results/*.attempts.jsonl
 bench/results/*.runs.jsonl
+bench/results/*.rejected.jsonl

@@ -50,6 +50,25 @@ Build from a clean upstream llama.cpp checkout at the pinned commit. Do not reus
 an unrelated or previously patched ggml tree unless its revision and patch state
 have been verified.
 
+### Getting the sources: `scripts/init_ggml.sh`
+
+The pinned commit is the gitlink for `third_party/llama.cpp`. Fetch it with
+
+```sh
+scripts/init_ggml.sh
+```
+
+and not with `git submodule update --init`. The build reads only the `ggml/` directory (23 MB), but a plain submodule
+checkout downloads the whole llama.cpp tree at that commit: about 390 MB of git objects and a 180 MB working tree, which
+every fresh clone and every CI job would pay. The script makes a shallow, blob-less, sparse checkout instead: about 5 MB
+in `.git`, 26 MB checked out, a few seconds. Its `ggml/` has the same git tree hash as the full checkout
+(`090b01e56f56`), so the build is the same. CMake does the same slim fetch into the build tree if the submodule is
+absent.
+
+The build copies `ggml/` into the build directory and patches the copy, so `third_party/llama.cpp` stays unmodified.
+If `git -C third_party/llama.cpp status` shows changes, someone patched the checkout in place; builds from that
+checkout are not the pinned ggml.
+
 ## Verified (2026-10-23, binary `build_mimo` linked to `build_ggml`)
 
 - Ling short decode (`[REQUEST-DECODE-OUTPUT]`): 10.31 tok/s, tokens identical to the earlier runs

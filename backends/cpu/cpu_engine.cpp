@@ -15,6 +15,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <numeric>
 
 #ifdef ZEROMOE_USE_GGML

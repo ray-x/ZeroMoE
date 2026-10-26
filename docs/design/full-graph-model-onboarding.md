@@ -1,5 +1,32 @@
 # Full graph model design and onboarding
 
+## Required CUDA MoE contract
+
+CUDA MoE support is full-graph support. A family with routed experts must have
+a registered `FullGraphModel` adapter before it can run on CUDA. A CUDA MoE
+family with no adapter is unsupported and startup fails; adding kernels to the
+legacy layer-by-layer executor is not an onboarding path.
+
+The adapter's `decode_memory_plan()` is the only authority that can permit
+layered decode. `Fits` requires graph decode; graph disablement, decode graph
+build failure, or execution failure is fatal. `Unknown` is fail-closed and also
+requires graph decode. Layered decode fallback is permitted only for an
+`Insufficient` result with required bytes greater than available bytes and a
+human-readable reason. The planner must include the graph's weights, KV/recurrent
+state, and workspace, not just the GGUF file size or MoE cache. A graph-only
+adapter cannot authorize a layered fallback.
+
+For a full-fit onboarding run, use:
+
+```sh
+python3 tools/check_full_graph_moe_run.py run.log --full-fit
+```
+
+The gate requires an enabled decode adapter, a `Fits` memory plan, at least one
+successful graph decode, and zero layered decode tokens or legacy per-expert
+dispatches. If the planner proves the graph cannot fit, validate the explicit
+fallback separately with `--allow-memory-fallback` and its logged reason.
+
 ## Execution path
 
 1. `GGUFFile::load_header` reads model metadata and tensor locations. `detect_model_family` in `models/base/model_family.hpp` selects a family.
@@ -7,16 +34,17 @@
 3. `FullGraphModel` in `models/graph/full_graph_model.hpp` owns the graph lifecycle: enable, bootstrap, build, run, and shutdown. `FullGraphModelBase` centralizes request validation and prefill/decode dispatch. `full_graph_model()` in `models/graph/full_graph_models.cpp` is the registry boundary.
 4. The engine reads graph capabilities and runtime tuning before cache planning and preload. It then plans expert ownership and cache sizes. The generation loop asks the adapter to build and run prompt batches or one-token decode graphs. Graph builders bind ggml tensors, schedule GPU and CPU work, and connect routed experts to cache or offload providers. Shared runtime machinery belongs under `models/graph`.
 
-A family whose output depends on recurrent state must carry that state across prefill and decode. Cache ownership, expert placement, host-memory requirements, and CPU-lane support must be declared by the adapter. If `build` can decline, the caller may fall back to layer-by-layer execution; set `graph_only()` when that path cannot reproduce the model.
+A family whose output depends on recurrent state must carry that state across prefill and decode. Cache ownership, expert placement, host-memory requirements, CPU-lane support, and the decode memory plan must be declared by the adapter. A failed decode graph build or run does not authorize layered decode: only the pre-run memory plan can do that.
 
 ## Adding a family
 
 1. Inspect the GGUF architecture, metadata, tensor names, and auxiliary blocks. Compare tensor equations with the reference implementation. Model branding or lineage does not determine the executable architecture.
-2. Add exact family detection and a topology validator. Check trunk versus auxiliary layer counts, per-layer attention kind, dimensions, required tensor shapes, and quant types before allocating large caches.
-3. Reuse `GraphCore`, shared routing, cache strategies, layer-layout helpers, and common state handoff where the model equations permit it. Keep model-specific validation and equations beside that model.
-4. Implement graph state, weight binding, graph construction, cache handoff, expert placement, prefill, decode, and shutdown. Preserve reference operation order, residual paths, normalization, router behavior, and gate activations.
-5. Register a `FullGraphModelBase` adapter. Explicitly declare device expert layer count and placement direction, CPU-lane support, host DDR requirements, RAM pin defaults, cache ownership, prefill limits, and whether the graph is the only correct path. Do not rely on default performance values.
-6. Validate continuation, context reset, cache bounds, and state handoff. Compare layer outputs or logits with the reference implementation before tuning throughput. Record prefill and decode separately, including prompt shape, resident expert range, host-memory mode, and CPU/CUDA graph node counts.
+2. Trace the detected family through `resolve_family_ops()` to `full_graph_model()`. If the family has no graph adapter, implement one before adding CUDA support; do not continue through the generic layer dispatcher.
+3. Add exact family detection and a topology validator. Check trunk versus auxiliary layer counts, per-layer attention kind, dimensions, required tensor shapes, and quant types before allocating large caches.
+4. Reuse `GraphCore`, shared routing, cache strategies, layer-layout helpers, and common state handoff where the model equations permit it. Keep model-specific validation and equations beside that model.
+5. Implement graph state, weight binding, graph construction, cache handoff, expert placement, prefill, decode, and shutdown. Preserve reference operation order, residual paths, normalization, router behavior, and gate activations.
+6. Register a `FullGraphModelBase` adapter. Explicitly declare its decode memory plan, device expert layer count and placement direction, CPU-lane support, host DDR requirements, RAM pin defaults, cache ownership, and prefill limits. A `Fits` plan must report positive required and available device bytes with required <= available. An `Insufficient` plan must report required > available and a reason. Leave the plan `Unknown` only while graph execution remains mandatory; unknown never authorizes fallback.
+7. Validate continuation, context reset, cache bounds, and state handoff. Compare layer outputs or logits with the reference implementation before tuning throughput. Record prefill and decode separately, including prompt shape, resident expert range, host-memory mode, and CPU/CUDA graph node counts. A CUDA MoE onboarding is incomplete until `python3 tools/check_full_graph_moe_run.py <run.log> --full-fit` passes on hardware where the full graph fits. The gate requires an enabled graph, a successful decode replay, and zero one-token layered forwards or legacy expert dispatches.
 
 ## Runtime performance contract
 

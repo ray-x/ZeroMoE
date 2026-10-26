@@ -2,11 +2,27 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_settings_global.hpp"
+#include <cstdlib>
 
 std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
   const FullGraphModel *model = engine.family_ops.graph_model;
-  if (!model)
+  const bool cpu_only = config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY");
+  const bool cuda_moe = !cpu_only && !gpu.topology.devices.empty() &&
+                        engine.model_file.architecture_config.n_experts > 0;
+  engine.cuda_moe_graph_policy_applies = cuda_moe;
+  if (!model) {
+    if (cuda_moe) {
+      const auto arch_it = engine.model_file.kv_string.find("general.architecture");
+      const std::string architecture =
+          arch_it == engine.model_file.kv_string.end() ? "unknown"
+                                                       : arch_it->second;
+      return std::unexpected(
+          "CUDA MoE architecture '" + architecture +
+          "' has no registered FullGraphModel adapter; layered CUDA decode is not a supported onboarding path");
+    }
     return {};
+  }
   const GraphRuntimeTuning tuning = model->runtime_tuning(engine);
   if (tuning.requires_preloaded_ddr_experts &&
       !config.ram_preload_all_experts) {
@@ -49,6 +65,68 @@ std::expected<void, std::string> EngineRunner::apply_graph_tuning() {
   return {};
 }
 
+std::expected<void, std::string>
+EngineRunner::resolve_cuda_moe_graph_policy() {
+  if (!engine.cuda_moe_graph_policy_applies)
+    return {};
+
+  const FullGraphModel *model = engine.family_ops.graph_model;
+  if (!model) {
+    return std::unexpected(
+        "CUDA MoE graph policy lost its FullGraphModel adapter after planning");
+  }
+
+  const GraphMemoryPlan plan = model->decode_memory_plan(engine);
+  engine.cuda_moe_graph_memory_plan =
+      plan.fit == GraphMemoryFit::Fits
+          ? "fits"
+          : plan.fit == GraphMemoryFit::Insufficient ? "insufficient" : "unknown";
+  engine.cuda_moe_graph_device_expert_layers = plan.device_expert_layers;
+  engine.cuda_moe_graph_device_expert_trailing =
+      plan.device_expert_trailing;
+
+  if (plan.fit == GraphMemoryFit::Insufficient) {
+    if (plan.reason.empty() || plan.required_device_bytes == 0 ||
+        plan.available_device_bytes == 0 ||
+        plan.required_device_bytes <= plan.available_device_bytes) {
+      return std::unexpected(
+          std::string(model->name()) +
+          " planner reported insufficient graph memory without a concrete required>available byte plan and reason; refusing layered fallback");
+    }
+    if (model->graph_only()) {
+      return std::unexpected(
+          std::string(model->name()) + " is graph-only, but its memory planner reports insufficient capacity: " +
+          plan.reason);
+    }
+    engine.cuda_moe_layered_fallback_reason = plan.reason;
+    LOG_WARN("[MOE-GRAPH-POLICY] family=%s policy=memory-fallback memory_plan=insufficient required_vram_bytes=%zu available_vram_bytes=%zu reason=%s\n",
+             model->name(), plan.required_device_bytes,
+             plan.available_device_bytes, plan.reason.c_str());
+    return {};
+  }
+
+  if (plan.fit == GraphMemoryFit::Fits &&
+      (plan.required_device_bytes == 0 || plan.available_device_bytes == 0 ||
+       plan.required_device_bytes > plan.available_device_bytes)) {
+    return std::unexpected(
+        std::string(model->name()) +
+        " planner reported graph memory fits without a valid required<=available byte plan");
+  }
+
+  // Unknown is fail-closed. A family may authorize layered execution only
+  // when its graph memory planner explicitly reports insufficient capacity.
+  engine.cuda_moe_full_graph_decode_required = true;
+  if (!model->enabled(engine, ModelGraphPhase::Decode)) {
+    return std::unexpected(
+        std::string(model->name()) +
+        " is a CUDA MoE family, but graph decode is disabled and no memory planner authorized layered fallback");
+  }
+  LOG_INFO("[MOE-GRAPH-POLICY] family=%s policy=required memory_plan=%s required_vram_bytes=%zu available_vram_bytes=%zu\n",
+           model->name(), engine.cuda_moe_graph_memory_plan.c_str(),
+           plan.required_device_bytes, plan.available_device_bytes);
+  return {};
+}
+
 std::expected<void, std::string> EngineRunner::run() {
   if (auto result = apply_engine_config(); !result)
     return result;
@@ -57,6 +135,8 @@ std::expected<void, std::string> EngineRunner::run() {
   if (auto result = load_model(); !result)
     return result;
   if (auto result = apply_graph_tuning(); !result)
+    return result;
+  if (auto result = resolve_cuda_moe_graph_policy(); !result)
     return result;
   if (auto result = plan_expert_cache(); !result)
     return result;
@@ -80,6 +160,18 @@ std::expected<void, std::string> EngineRunner::run() {
 }
 
 std::expected<void, std::string> EngineRunner::apply_engine_config() {
+  if (!config.graph_settings.empty()) {
+#if !defined(ZEROMOE_USE_GGML_CUDA)
+    return std::unexpected("graph_* settings require a build with ZEROMOE_USE_GGML_CUDA=ON");
+#endif
+    if (config.cpu_only || std::getenv("ZEROMOE_CPU_ONLY"))
+      return std::unexpected("graph_* settings require CUDA graph execution, not CPU-only mode");
+  }
+  try {
+    zeromoe::graphsettings::configure_settings(config.graph_settings);
+  } catch (const std::exception &e) {
+    return std::unexpected(e.what());
+  }
   engine.drop_expert_pages = config.drop_pages;
   engine.unpacked_expert_format = config.unpacked_expert_format;
   engine.prefill_warm_via_prefetcher = config.prefill_warm_via_prefetcher;

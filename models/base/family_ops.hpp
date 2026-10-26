@@ -141,8 +141,8 @@ struct ModelGraphRequest {
   int vocab = 0;
 };
 
-// The family's whole-model graph (models/full_graph_model.hpp); nullptr means
-// the family uses the established layer-by-layer path.
+// The family's whole-model graph (models/full_graph_model.hpp). CUDA MoE
+// startup rejects nullptr; non-MoE and CPU/reference paths may leave it unset.
 class FullGraphModel;
 
 struct FamilyOps {

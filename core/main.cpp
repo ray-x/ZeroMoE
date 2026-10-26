@@ -56,6 +56,8 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+#include "request_stats.hpp"
+#include "bench_mode.hpp"
 
 class GGUFGraphInitializer {
 public:
@@ -193,7 +195,28 @@ static void zeromoe_ggml_log_callback(enum ggml_log_level level,
 }
 #endif
 
-void print_usage() {
+void print_usage(bool all = false) {
+  if (!all) {
+    std::cout
+        << "Usage: zeromoe --config <model.toml> [options]\n"
+        << "       zeromoe --model <model.gguf> [options]\n\n"
+        << "  --config <file>       Load a model recipe (recommended)\n"
+        << "  --model <path>        Override the model file/directory\n"
+        << "  --prompt <text>       Run one prompt instead of interactive input\n"
+        << "  --ctx <tokens>        Context window\n"
+        << "  --ngen <tokens>       Maximum generated tokens\n"
+        << "  --ram <GiB>           Host expert-memory budget\n"
+        << "  --gpu <id>            GPU for single-device mode\n"
+        << "  --temp <number>       Temperature; 0 selects greedy sampling\n"
+        << "  --top_p <number>      Nucleus sampling threshold\n"
+        << "  --system-prompt <s>   Conversation instructions\n"
+        << "  --log-level <level>   INFO (default), WARN, ERROR, DEBUG, VERBOSE\n"
+        << "  --gen-config [file]   Write a configuration template\n"
+        << "  --help-all            Advanced tuning, diagnostics and benchmarks\n"
+        << "  --help-settings       Canonical graph settings and legacy aliases\n\n"
+        << "Model recipes: configs/; configuration guide: docs/configuration.md\n";
+    return;
+  }
   std::cout
       << "Usage: ./zeromoe --config <config.toml>\n"
       << "       ./zeromoe --model <path_to_gguf> [options]\n"
@@ -273,6 +296,11 @@ void print_usage() {
          "testing\n"
       << "  --collect-usage-stats  Override freeze_usage_stats and write the "
          "usage files at shutdown\n"
+      << "  --bench          Benchmark: run --bench-prompt files in one process, report per-request speeds\n"
+      << "                   (--bench-prompt <file> repeatable, --bench-ngen N, --bench-reps N, --bench-warmup N,\n"
+      << "                    --bench-long N, --bench-out <file>; see core/bench_mode.hpp)\n"
+      << "                   llama-bench style random tokens: --bench-random-pp N, --bench-random-tg N, --bench-seed S\n"
+      << "  --stats-file <path>  Append one JSON line per finished request (also ZEROMOE_STATS_FILE)\n"
       << "  --force-start    Bypass the startup safety checks (concurrent "
          "zeromoe\n"
       << "                   instance, real RAM headroom, free VRAM) -- only "
@@ -373,6 +401,27 @@ std::expected<void, std::string> run_engine(const EngineConfig &config) {
              "cuFile not compiled in) -- cuda_cufile falls back to the "
              "RAM-mediated upload path for this entire run.\n";
     }
+  }
+
+  {
+    auto &sink = zeromoe::stats::Sink::instance();
+    // Name of the model for the stats records: the file name, or for a shard directory its first .gguf without the
+    // "-00001-of-0000N" suffix (the directory itself is often just "Q2_0").
+    std::filesystem::path mp(config.model_path);
+    while (!mp.empty() && mp.filename().empty())
+      mp = mp.parent_path();
+    std::string model_name = mp.filename().string();
+    std::error_code ec;
+    if (std::filesystem::is_directory(mp, ec)) {
+      std::vector<std::string> ggufs;
+      for (const auto &e : std::filesystem::directory_iterator(mp, ec))
+        if (e.path().extension() == ".gguf")
+          ggufs.push_back(e.path().stem().string());
+      std::sort(ggufs.begin(), ggufs.end());
+      if (!ggufs.empty())
+        model_name = std::regex_replace(ggufs.front(), std::regex(R"(-0*1-of-0*[0-9]+$)"), "");
+    }
+    sink.set_model(model_name);
   }
 
   EngineRunner runner(config, cufile_driver_guard.opened);
@@ -505,9 +554,39 @@ int main(int argc, char *argv[]) {
       temp_cli = std::stof(argv[++i]);
     else if (arg == "--top_p" && i + 1 < argc)
       top_p_cli = std::stof(argv[++i]);
+    else if (arg == "--bench")
+      zeromoe::bench::plan().enabled = true;
+    else if (arg == "--bench-prompt" && i + 1 < argc)
+      zeromoe::bench::plan().prompt_files.push_back(argv[++i]);
+    else if (arg == "--bench-ngen" && i + 1 < argc)
+      zeromoe::bench::plan().ngen = std::stoi(argv[++i]);
+    else if (arg == "--bench-reps" && i + 1 < argc)
+      zeromoe::bench::plan().reps = std::stoi(argv[++i]);
+    else if (arg == "--bench-warmup" && i + 1 < argc)
+      zeromoe::bench::plan().warmup = std::stoi(argv[++i]);
+    else if (arg == "--bench-long" && i + 1 < argc)
+      zeromoe::bench::plan().long_ngen = std::stoi(argv[++i]);
+    else if (arg == "--bench-long-reps" && i + 1 < argc)
+      zeromoe::bench::plan().long_reps = std::stoi(argv[++i]);
+    else if (arg == "--bench-random-pp" && i + 1 < argc)
+      zeromoe::bench::plan().random_pp.push_back(std::stoi(argv[++i]));
+    else if (arg == "--bench-random-tg" && i + 1 < argc)
+      zeromoe::bench::plan().random_tg.push_back(std::stoi(argv[++i]));
+    else if (arg == "--bench-seed" && i + 1 < argc)
+      zeromoe::bench::plan().seed = static_cast<unsigned>(std::stoul(argv[++i]));
+    else if (arg == "--bench-out" && i + 1 < argc)
+      zeromoe::bench::plan().out = argv[++i];
+    else if (arg == "--stats-file" && i + 1 < argc)
+      zeromoe::stats::Sink::instance().set_file(argv[++i]);
     else if (arg == "--force-start")
       force_start_cli = true;
-    else if (arg == "--help" || arg == "-h") {
+    else if (arg == "--help-settings") {
+      std::cout << zeromoe::graphsettings::settings_reference();
+      return 0;
+    } else if (arg == "--help-all") {
+      print_usage(true);
+      return 0;
+    } else if (arg == "--help" || arg == "-h") {
       print_usage();
       return 0;
     }

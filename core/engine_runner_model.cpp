@@ -2,6 +2,8 @@
 // Split from the former run_engine() in src/main.cpp; bodies are unchanged except where
 // a former local became an EngineRunner member of the same name.
 #include "engine_runner.hpp"
+#include "graph_settings_global.hpp"
+#include "ggml_bailingmoe3_graph.hpp"
 
 class GGUFGraphInitializer {
 public:
@@ -40,6 +42,26 @@ std::expected<void, std::string> EngineRunner::load_model() {
   if (!engine.model_file.load_header(model_path)) {
     return std::unexpected(
         "Failed to parse GGUF file or map descriptor tree structure");
+  }
+  {
+    using namespace zeromoe::graphsettings;
+    std::vector<Family> families{Family::Other};
+    switch (detect_model_family(engine.model_file)) {
+    case ModelFamily::Qwen4Exp: families.push_back(Family::Qwen); break;
+    case ModelFamily::MiMo2: families.push_back(Family::MiMo2); break;
+    case ModelFamily::BailingMoE3:
+      families.push_back(Family::Ling);
+      if (!bailingmoe3_native_graph_enabled() || bailingmoe3_hybrid_cuda_graph_enabled())
+        families.push_back(Family::GlmGraph);
+      break;
+    case ModelFamily::GLM5NEXT:
+    case ModelFamily::GLM_DSA: families.push_back(Family::GlmGraph); break;
+    default: break;
+    }
+    // Other is used separately by the shared phase cache, not an adapter.
+    std::string error;
+    if (!validate_config(config.graph_settings, families, error))
+      return std::unexpected(error);
   }
   const auto allow_unaligned_direct_io = [this](const GGUFFile &file) {
     if (config.cuda_cufile)

@@ -72,6 +72,7 @@ private:
   std::expected<void, std::string> load_model();
   std::expected<void, std::string> apply_graph_tuning();
   std::expected<void, std::string> plan_expert_cache();
+  std::expected<void, std::string> resolve_cuda_moe_graph_policy();
   std::expected<void, std::string> setup_vram_expert_cache();
   std::expected<void, std::string> offload_dense_tensors();
   std::expected<void, std::string> init_ram_tier();

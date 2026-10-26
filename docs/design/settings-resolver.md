@@ -1,7 +1,11 @@
 # Settings resolver and sparse profile pins
 
-Status: **sparse-pin rule adopted; step 1 implemented** (defaults + family overrides + env; profile
-pins, TOML and CLI layers and capabilities are not built yet). Code: `models/graph/graph_settings.hpp`
+Status: **defaults, family overrides, canonical root TOML and compatibility environment
+aliases implemented**. Qwen whole-layer placement and shared CPU thread caps also use
+the resolver. Profile pins, a generic CLI layer and capability negotiation remain
+design proposals. User-facing behavior and commands: [configuration guide](../configuration.md).
+The sections below describe the broader target design, not all shipped behavior.
+Code: `models/graph/graph_settings.hpp`
 (pure), `graph_settings_global.hpp` (real env + `[SETTINGS]` log), `tests/test_graph_settings.cpp`. Detail for rollout steps 0–1 of
 `docs/design/model-family-framework.md` (§4.2, §5). Assumes the sparse-pin proposal: a profile stores
 only measured fields, everything else follows live defaults, and a version-plus-hash drift check
@@ -202,7 +206,9 @@ a rebase pass over all profiles.
   unit test. The drift check against a profile is not built (no profiles exist yet).
 * `moe_conformance` now fails on a direct `ZEROMOE_MIMO2_/LING_` tunable read in the MiMo graph and
   `full_graph_models.cpp`.
-* Run `make graph_settings_test && ./graph_settings_test tests/graph_settings_defaults.snapshot`.
+* Run `make test-settings BUILD_DIR=build-cpu` after configuring a CPU build, or
+  `cmake --build --preset settings-tests && ctest --preset settings-tests` after
+  `cmake --preset cpu`.
 
 ### Added after step 1
 

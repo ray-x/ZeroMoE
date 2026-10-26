@@ -740,6 +740,18 @@ public:
     // execution_layer must not continue into the layered token loop.
     bool qwen4exp_full_graph_required = false;
     std::string qwen4exp_full_graph_failure;
+    // CUDA MoE graph policy is family-generic. A configured CUDA MoE must have
+    // a registered FullGraphModel. Unknown/Fits memory plans require graph
+    // decode; only an explicit Insufficient plan permits layered fallback.
+    bool cuda_moe_graph_policy_applies = false;
+    bool cuda_moe_full_graph_decode_required = false;
+    std::string cuda_moe_graph_memory_plan = "not-applicable";
+    int cuda_moe_graph_device_expert_layers = 0;
+    bool cuda_moe_graph_device_expert_trailing = false;
+    std::string cuda_moe_layered_fallback_reason;
+    uint64_t full_graph_decode_runs = 0;
+    uint64_t layered_moe_s1_forwards = 0;
+    uint64_t legacy_moe_s1_expert_dispatches = 0;
     // The Qwen full decode graph may also produce the next-token logits in
     // the same one-submission graph.  The generation loop consumes this once
     // on the following sampling iteration to avoid a separate lm-head H2D/D2H

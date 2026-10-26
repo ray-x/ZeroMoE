@@ -4,6 +4,7 @@
 #include "ggml_mimo2_graph.hpp"
 #include "engine_runner.hpp"
 #include "generation_loop.hpp"
+#include "bench_mode.hpp"
 
 std::expected<void, std::string> EngineRunner::start_workers() {
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
@@ -110,12 +111,25 @@ std::expected<void, std::string> EngineRunner::run_repl() {
   session_start = std::chrono::high_resolution_clock::now();
 
   std::string user_input;
+  // --bench: the turns come from a scripted queue instead of stdin; everything after the turn is read is the
+  // normal request path (see core/bench_mode.hpp).
+  zeromoe::bench::Session bench(zeromoe::bench::plan());
+  if (bench.enabled()) {
+    const std::string err = bench.prepare(engine.prompt_cache, engine.model_file.architecture_config.vocab);
+    if (!err.empty())
+      return std::unexpected(err);
+  }
   while (true) {
     if (g_shutdown_requested.load(std::memory_order_relaxed))
       break;
 
-    std::cout << "\n  User > ";
-    std::getline(std::cin, user_input);
+    if (bench.enabled()) {
+      if (!bench.next(user_input, max_new_tokens))
+        break;
+    } else {
+      std::cout << "\n  User > ";
+      std::getline(std::cin, user_input);
+    }
 
     // Multi-line input support (2026-09): this loop reads exactly one
     // getline() per turn, so a genuinely multi-line message piped via
@@ -154,7 +168,7 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     // failed read — as "time to shut down" rather than looping forever
     // on an unusable stream.
     if (g_shutdown_requested.load(std::memory_order_relaxed) ||
-        std::cin.eof() || std::cin.fail()) {
+        (!bench.enabled() && (std::cin.eof() || std::cin.fail()))) {
       break;
     }
 
@@ -456,6 +470,8 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     generate_text(engine, ram_mgr, tokenizer, prefetcher, prompt_tokens,
                   max_new_tokens, tokenizer.eos_token_id, config.temperature,
                   config.top_p);
+    if (bench.enabled())
+      bench.record();
     if (!engine.qwen4exp_full_graph_failure.empty()) {
       const std::string reason = engine.qwen4exp_full_graph_failure;
       engine.qwen4exp_full_graph_failure.clear();
@@ -474,31 +490,13 @@ std::expected<void, std::string> EngineRunner::run_repl() {
     std::cout << "\n";
   }
 
+  if (bench.enabled())
+    bench.finish();
   return {};
 }
 
 std::expected<void, std::string> EngineRunner::shutdown_and_report() {
   const FullGraphModel *graph_model = engine.family_ops.graph_model;
-  std::string graph_gate_failure;
-  if (engine.cuda_moe_graph_policy_applies) {
-    LOG_INFO("[MOE-GRAPH-GATE] family=%s policy=%s memory_plan=%s graph_decode_runs=%llu layered_s1_forwards=%llu legacy_s1_expert_dispatches=%llu\n",
-             graph_model ? graph_model->name() : "missing",
-             engine.cuda_moe_full_graph_decode_required ? "required"
-                 : "memory-fallback",
-             engine.cuda_moe_graph_memory_plan.c_str(),
-             (unsigned long long)engine.full_graph_decode_runs,
-             (unsigned long long)engine.layered_moe_s1_forwards,
-             (unsigned long long)engine.legacy_moe_s1_expert_dispatches);
-    if (!engine.cuda_moe_layered_fallback_reason.empty())
-      LOG_INFO("[MOE-GRAPH-FALLBACK] planner_reason=%s\n",
-               engine.cuda_moe_layered_fallback_reason.c_str());
-    if (engine.cuda_moe_full_graph_decode_required &&
-        (engine.layered_moe_s1_forwards != 0 ||
-         engine.legacy_moe_s1_expert_dispatches != 0)) {
-      graph_gate_failure =
-          "full-graph-required CUDA MoE run entered the legacy layered expert path";
-    }
-  }
   prefetcher.stop();
   // The selected full graph owns a GGML scheduler and CUDA workspace
   // buffers. Release it through the model graph contract while CudaManager
@@ -593,7 +591,5 @@ std::expected<void, std::string> EngineRunner::shutdown_and_report() {
   perf().dump_report(session_elapsed_s);
   if (!request_failure.empty())
     return std::unexpected(request_failure);
-  if (!graph_gate_failure.empty())
-    return std::unexpected(graph_gate_failure);
   return {};
 }
