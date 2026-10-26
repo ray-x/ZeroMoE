@@ -71,14 +71,26 @@ Draft step 14 ms -> 1.3 ms; target step 20-22 ms; ~0.8-1 s one-time setup.
 Acceptance 74-94% by draft count (k=1 94%, k=3 80%, k=4 74%); rate is ~36
 tok/s for k=1..4 because the floor is plain decoding plus draft and setup.
 
-## Why batching does not help the 3090 hybrid recipe (measured)
+## What a verify window costs (CPU-resident experts)
 
-Router ids of a 199-token plain run (a temporary per-token id dump added to the
-router-usage tap in `qwen4exp_cuda_usage_track_callback`, not committed; 13,000 hot experts): 0.82 of the 10 routed experts per layer are
-CPU-resident per token, and consecutive tokens barely share them. Distinct
-CPU experts per layer for a window of 1/2/3/4/5 tokens: 0.82/1.49/2.09/2.67/3.23,
-so a 4-token pass needs 3.25x the CPU expert work of one token. Even if only
-half of a step is CPU expert time, the expected MTP speedup is <= 1.03x
-(k=1) and falls with larger k; at 90% CPU share it is 0.68-0.84x. No local
-configuration keeps the routed experts on the GPU (models are 62-70 GB, the
-3090 has 24 GB), so batched verification is not built for Qwen4Exp.
+Do not model a window as "k+1 times the CPU work". Per layer the GPU work and
+the CPU work of the missed experts run at the same time and the layer waits for
+the slower of the two. The GPU reads the dense weights once per window, so its
+time barely grows with tokens; only the CPU half grows (every extra token
+routes to its own experts; consecutive tokens share almost none: distinct cold
+experts per layer for 1/2/3/4/5-token windows on Qwen4Exp at 13,000 hot
+experts are 0.82/1.49/2.09/2.67/3.23). With a small cold fraction the CPU half
+stays hidden under the GPU half.
+
+Reference point (Strata paper, `/home/ray/Projects/Strata/docs/paper`, Table 5
+and finding 2; RTX 5070, Q2_0, 4K context): plain decoding 47-57 tok/s, a
+window of up to 4 tokens takes 34 ms (GPU 14.6, CPU experts 13.4, drafting 2.0,
+other 4.3) and yields 3.2 tokens, i.e. 82-92 tok/s, a 1.6-1.8x speedup, with
+output identical to plain greedy decoding.
+
+An earlier version of this section concluded that batching could not help on
+the Qwen4Exp 3090 hybrid recipe. That rested on an assumed CPU share of at
+least half a step, which was never measured; it is retracted. The quantity to
+measure is T(k+1)/T(1) of a real window on the target placement, which needs a
+multi-token decode pass (Qwen4Exp has none yet; its prefill graph cannot attend
+to cached KV).
